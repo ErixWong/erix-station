@@ -273,6 +273,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 字段 | 说明 |
 |---|---|
 | `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9][a-z0-9-]{0,62}` |
+| `repo_url` | 仓库地址，**仅作记录/展示元数据**：平台不 clone、不物化该目录、不下发 git 凭据；clone 与 git 凭据由 FDE 在容器内自行配置（规格 §7.2/§12.2，决策者 2026-09，issue #3 评论） |
 | `slot` | 项目端口块序号（决定 `4000 + slot*8` 起始端口，规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
 
@@ -319,6 +320,8 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 409 | `name_conflict` | 同名项目已存在 |
 | 409 | `port_quota_exceeded` | 用户端口总配额超限（规格 §8.2：**明确报错**而非静默漂移） |
 | 503 | `container_unreachable` | 需要落 `.erix/ports.json` 时容器不可达（§6.3） |
+
+> **边界（决策者 2026-09，issue #3 评论）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 只是登记元数据。**平台不负责 clone，也不下发 git 凭据**——仓库目录由 FDE 在容器内自行 `git clone` 并配置凭据（等同他自己的开发机，规格 §7.2/§12.2）。
 
 ### 3.4 `GET /api/projects/:id`
 
@@ -591,6 +594,8 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 2. portal 从 DB 补发该 session 中 **`seq` 大于该值**的全部历史事件，再切到实时流。
 3. 无 `Last-Event-ID`（首次连接）：**不补发历史**，只推连接之后的新事件——历史消息/状态由 `GET /api/sessions/:id`（含 `last_seq` 与消息列表）获取；前端如需从某点重放，可显式带 `Last-Event-ID` 或查询参数 `?last_event_id=<seq>`（两者等价，查询参数供非 `EventSource` 客户端使用）。
 4. `Last-Event-ID` 大于当前 `last_seq`（如 session 已删）→ `404 not_found`；小于最小保留 seq（事件归档后）→ `410 Gone` + `{"error":{"code":"replay_unavailable", ...}}`，前端应回退到 `GET /api/sessions/:id` 全量拉取。
+
+> ⚠️ 与归档策略的对应（model.md §4，决策者 2026-09，issue #3 评论）：**事件冷存导出暂不实施（P1/P2 不删除事件）**，因此 `410 replay_unavailable` **保留定义但当前不会触发**；前端仍应实现该回退分支以兼容将来启用归档。
 
 > 也可用该端点做**事件重放**（P2 验收「断线重连不漏事件」即依赖本节语义）。
 
