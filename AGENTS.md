@@ -20,14 +20,21 @@
 2. **ingress 是唯一的路**：任何「绕过 Traefik 也能访问」的设计都是 bug
 3. **DB 是状态真相**：容器是牲口，重建后必须能从 DB + 卷恢复
 
-## 3. 代码结构（规划）
+## 3. 代码与文档结构（规划）
 
 ```
 portal/     # 管理平台服务：用户/项目/端口/容器生命周期/事件/LLM 网关
 runner/     # 容器内 agent worker（接 erix-agent，跑 runToolLoop）
 deploy/     # compose、traefik 配置模板、FDE 容器模板
-docs/       # 设计文档 + ADR
+docs/       # 文档地图（docs/README.md）+ design/ + 待建 api/ data/ decisions/ ops/
 ```
+
+**动手前先读三份文档**：
+1. `docs/README.md` —— 文档地图与待补齐清单（实现者入口）
+2. `docs/design/fde-platform.md` —— 主规格（是什么）
+3. `docs/design/principles.md` —— 设计原理与被否决方案（为什么；未覆盖场景按它推导）
+
+**文档纪律**：规格未覆盖时按原理推导，不与规格冲突就写进文档；冲突则提 issue，**不自行改设计**。
 
 ## 4. 开发命令（随实现补齐）
 
