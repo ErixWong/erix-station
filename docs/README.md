@@ -15,6 +15,10 @@
 | [`../AGENTS.md`](../AGENTS.md) | 项目特有规则（边界/结构/端口/流程/已定决策） | ✅ |
 | [`design/fde-platform.md`](design/fde-platform.md) | **主规格**：拓扑、网络与隔离、访问控制、账号生命周期、端口分配、数据模型、事件流、LLM 接入、容器模板、部署、分期、决策 D1~D10 | ✅ |
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
+| [`env.md`](env.md) | **部署参数清单**：参数定义 + 参考实例 A + 目标环境探测 checklist（非单机环境事实） | ✅ |
+| [`api/portal.md`](api/portal.md) | **portal API 契约**：认证、端点请求/响应 schema、SSE 事件信封类型清单、错误语义 | ✅ |
+| [`data/schema.sql`](data/schema.sql) | **可执行建表 DDL**：约束/索引/外键齐全，postgres:16 空库实测 `psql -f` 可执行 | ✅ |
+| [`data/model.md`](data/model.md) | **数据模型说明**：表用途、字段语义、状态机、三份数据边界、归档与记账口径 | ✅ |
 
 ---
 
@@ -22,7 +26,9 @@
 
 > 每项给出「必须包含」与「验收标准」。**未决问题未定时，先按 `principles.md §4` 的当前倾向写，并显式标注 `⚠️ 待决策者确认`**——不要留空，也不要自行改变设计。
 
-### D1. `docs/env.md` —— 环境事实清单 ⚠️ 阻塞 P1
+### D1. `docs/env.md` —— 部署参数清单（原「环境事实清单」）✅ 已完成
+
+> **状态**：✅ 已完成，交付于 [`env.md`](env.md)。实际定位为「参数清单 + 参考实例 A + 目标环境探测 checklist」，**不是单机环境事实**。以下「必须包含 / 验收 / 依赖」保留作验收依据。
 
 **为什么**：规格全文用 `<base>` 等占位符；没有环境事实就写不出能跑的 Traefik / compose 配置。
 
@@ -41,7 +47,9 @@
 
 ---
 
-### D2. `docs/api/portal.md` —— portal API 契约 ⚠️ 阻塞 P1 并行开发
+### D2. `docs/api/portal.md` —— portal API 契约 ✅ 已完成
+
+> **状态**：✅ 已完成，交付于 [`api/portal.md`](api/portal.md)。以下「必须包含 / 验收 / 依赖」保留作验收依据。
 
 **为什么**：没有契约，前端与后端并行必然打架。
 
@@ -58,7 +66,9 @@
 
 ---
 
-### D3. `docs/data/schema.sql` + `docs/data/model.md` —— 数据模型 ⚠️ 阻塞 P1
+### D3. `docs/data/schema.sql` + `docs/data/model.md` —— 数据模型 ✅ 已完成
+
+> **状态**：✅ 已完成，交付于 [`data/schema.sql`](data/schema.sql) + [`data/model.md`](data/model.md)；`psql -f` 已在 postgres:16 空库实测可执行。以下「必须包含 / 验收 / 依赖」保留作验收依据。
 
 **为什么**：规格 §9.1 是表名 + 字段草图，不是可执行 DDL。
 
@@ -132,14 +142,14 @@
 ## 三、建议补齐顺序
 
 ```
-D4 (ADR，无依赖)
-  └─ D1 (env，需你提供事实) ─┬─ D5 (testing)
-                             └─ D6 (runbook)
-  └─ D2 (API 契约，需 Q7)
-  └─ D3 (schema，需 Q1/Q4)
+✅ D1 (env) ─┬─ D5 (testing，阻塞 P1 交付)
+             └─ D6 (runbook，P2 前置)
+✅ D2 (API 契约)
+✅ D3 (schema)
+D4 (ADR，无依赖，可随时补)
 ```
 
-**最小可开工集** = **D1 + D2 + D3**（P1 的前置）。D4/D5/D6 可在 P1 期间并行补。
+**最小可开工集** = **D1 + D2 + D3** —— 已就绪 ✅（P1 可开工）。下一步：D4/D5/D6 可在 P1 期间并行补。
 
 ---
 
