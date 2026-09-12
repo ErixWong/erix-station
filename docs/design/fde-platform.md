@@ -86,7 +86,7 @@
 ```
 docker network: edge       ← 只有 ingress + portal
 docker network: control    ← portal + db + 所有 FDE 容器
-docker network: fde-alice  ← 只给 alice 的容器和她的辅助容器
+docker network: fde-alice  ← 只给 alice 的容器
 docker network: fde-bob    ← ...
 ```
 
@@ -97,7 +97,7 @@ docker network: fde-bob    ← ...
 | 组件 | 职责 | 明确不做 |
 |---|---|---|
 | `station-edge`（Traefik） | TLS、按 host 路由、forwardAuth、访问日志（原始，非审计真相）、唯一对外入口 | 不碰业务逻辑 |
-| `station-portal` | 用户系统、项目/端口分配、容器生命周期、事件与消息、SSE、LLM 网关、用量记账 | 不跑 agent、不做工具执行 |
+| `station-portal` | 用户系统、项目/端口分配、容器生命周期、事件与消息、SSE、LLM 网关**租户绑定**（虚拟 key 的开通/吊销/额度，见 §11；网关本身是独立组件，不是 portal 内部模块）、用量记账 | 不跑 agent、不做工具执行、不自写 LLM 流式代理 |
 | `station-db`（Postgres） | 用户/会话/消息/transcript/events/端口表/用量/审计 | 不存代码 |
 | `fde-<name>`（FDE 容器） | `station-runner`（跑 erix agent）+ code-server + dev servers；状态写 DB | 不 publish 端口、不挂 `docker.sock`、不存平台密钥 |
 
@@ -210,6 +210,8 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` 取 FDE 标�
 3. 分配端口块 + 生成 Traefik 路由（**同一事务**）
 4. 在 LLM 网关建**虚拟 key**（额度、模型白名单、别名 `alice@client-x`）
 5. 生成项目模板与 AGENTS.md（含端口约定、分支约定）
+
+> **边界（决策者 2026-09，issue #3 评论）**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立），也**不负责 clone 与 git 凭据下发**——clone 与 git 凭据（SSH key / token）由 FDE 在容器内自行配置，等同他自己的开发机（见 §12.2）。
 
 ### 7.3 offboarding 必须同样脚本化
 
@@ -390,6 +392,8 @@ audit_log           (actor_id, action, target, ts)
 
 → 待 Q1 确认公司是否已有网关；没有则先起一个 LiteLLM 容器，仍走 C。
 
+> **澄清（归属归位）**：LLM 网关是**独立组件**——公司已有网关，或平台另起的网关容器（如 LiteLLM），**不是 portal 内部的实现模块**；portal 侧只有「租户绑定」逻辑（上面的 1/2/3）。Q1（公司是否已有网关）保持未决，本文不替选型拍板。
+
 > 模式 C 的「唯一可达」是**依赖外部网络策略实现的前提**（安全团队职责，issue #3），不是平台自身交付物；该前提未成立时，模式 C 退化为「模式 A + 审计告警」（见 §11.4 降级路径）。
 
 ### 11.4 配套细节
@@ -420,7 +424,9 @@ audit_log           (actor_id, action, target, ts)
 - 一个项目 = `~/projects/<project>`；一个 run = `~/worktrees/<project>-<runId>` + 分支 `agent/<runId>`
 - 端口从 `~/projects/<project>/.erix/ports.json` 取，不自己挑；dev server 绑 `0.0.0.0`
 - 回流走 fork/PR，不直接在主干改
-- `git worktree` 注意：`.git` 是共享的（`worktree prune` 由平台/人管理，别让 agent 乱跑 `worktree remove`）；`node_modules` 每个 worktree 一份 → 用 pnpm store / npm cache 共享，或给容器 `--memory` 限额
+- `git worktree` 由 **agent（FDE）自己在容器内全权管理**：创建、`worktree remove` / `worktree prune` 清理都归它自己负责，平台不介入（决策者 2026-09，issue #3 评论）；`.git` 是共享的，清理时别误删其他 run 的 worktree
+- `node_modules` 每个 worktree 一份 → 用 pnpm store / npm cache 共享
+- clone 与 git 凭据（SSH key / token）由 FDE 在容器内自行配置（等同他自己的开发机）；平台不下发、不代管 git 凭据（边界见 §7.2）
 
 ### 12.3 端口模板（FDE 容器内）
 
@@ -463,9 +469,10 @@ audit_log           (actor_id, action, target, ts)
 - FDE 容器由 portal 通过 Docker API 动态创建（模板化，非 compose）
 - **数据持久化**：bind mount 一律 `/docker/<名称>/`（平台统一约定）；用户空间 `/srv/erix/users/<fde>/`（宿主路径与容器内一致）
 - `restart: unless-stopped`；DB 与 portal 配 healthcheck
-- **可靠性**：中心 DB 是全平台单点 → 备份 + 主从；portal 无状态（状态在 DB），可重启
+- **容器资源限额**：FDE 容器的创建参数（如 `--memory` 限额）只能由 portal 经 Docker API 设置（容器创建参数为平台侧独有）；`node_modules` 每 worktree 一份的磁盘/内存压力在容器内由 FDE 用 pnpm store / npm cache 自行缓解（§12.2）
+- **可靠性**：中心 DB 是全平台单点；portal 无状态（状态在 DB），可重启。**DB 备份/高可用不在本项目范围**（系统级方案负责，决策者 2026-09，issue #3 评论）——平台侧只保证数据落卷（bind mount，见上）、DB 处于可被系统级备份方案备份的形态
 - **可观测**：run 事件、judge 决策、工具调用、访问审计、用量都在 DB，直接做看板
-- **长任务无人看** → 完成/失败/需审批时通知（邮件或 IM webhook）
+- **长任务无人看** → 完成/失败/需审批时通知（邮件或 IM webhook）——**延后（P2+），P1 不做**（决策者 2026-09，issue #3 评论）。§7.1 本地 admin 登录告警、§11.4 出口策略未实施时的管理层书面知情，语义保留（它们是设计结论），但**通知通道实现同属延后事项**，不阻塞 P1
 
 ---
 
@@ -473,10 +480,17 @@ audit_log           (actor_id, action, target, ts)
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P0** | erix-agent 抽 `src/session/`，发 0.4.0（**在 erix-agent 仓库**） | `npm test` 全绿 + CLI 行为不变 |
+| **P0** | erix-agent 抽 `src/session/`，发 0.4.0（**在 erix-agent 仓库**） | `npm test` 全绿 + CLI 行为不变（验收口径在 erix-agent 侧） |
 | **P1** | Traefik + portal + DB + 单 FDE 容器；登录、项目列表、对话（SSE）、停止 | 真机走通「登录→建项目→对话→工具卡片→停止」；playwright + vision 验证 |
 | **P2** | 多 FDE、端口分配 + 预览卡片/iframe、事件重放、工具审批、账号生命周期 workflow | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
 | **P3** | LLM 网关 + 用量记账 + 审计 + code-server 模板（出口管控为**外部依赖**：安全团队网络层策略，issue #3，非平台交付项） | 成本可按客户项目归集；安全团队出口策略实施后「改 endpoint 无效」，未实施时降级为审计+告警 |
+
+> **P0 的跨仓库交接关系（erix-station ↔ erix-agent）**（与项目 AGENTS.md 约定一致）：
+>
+> 1. 需求以 **issue 形式提给 erix-agent 仓库**（能力缺口驱动——「上游需要的能力缺口以 issue 形式提到 erix-agent」）；本仓库不实现引擎逻辑。
+> 2. 验收口径在 **erix-agent 侧**：`npm test` 全绿 + CLI 行为不变。
+> 3. **版本 pin 策略**：erix-station 侧 pin 具体 erix-agent 版本进入 FDE 容器镜像/模板，升级走 canary；版本记录点为 `containers.agent_version`（§9.1）。
+> 4. 本项目**不修改** erix-agent 行为，只依赖其公开 API（`runToolLoop` / `TranscriptStore` / `erix-tools`）。
 
 ---
 

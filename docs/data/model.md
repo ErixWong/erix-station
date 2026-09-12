@@ -265,8 +265,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
-| `run_events` | **热保留 + 到期归档删除**：run 结束后保留 N 天（建议 30 天，部署变量），过期导出 JSONL 冷存（`/docker/station-db/archive/`，env §6 目录约定）后 `DELETE` | 事件的唯一消费是实时推送与断线补发；补发窗口有限是**已声明的契约语义**——过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取（portal.md §5.2-4） |
-| `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠两点吸收：① jsonb 自动 TOAST 压缩；② **session 归档后可整体导出冷存**（同 JSONL 冷存目录），活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
+| `run_events` | **热保留，当前不删除**。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记 | 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
+| `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
 | `run_checkpoints` | 随 transcript 同生命周期；resume 只需要**最新** checkpoint，旧 seq 可在 run 结束后只留最大 seq 一条（`loadLatestCheckpoint`，规格 §9.3） | checkpoint 语义决定历史 seq 无消费者 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
 | `usage_ledger` / `audit_log` | 永久保留，只追加 | 记账与审计语义（规格 §14 看板/对账）；量小（每 run 数行 / 每请求一行） |
@@ -274,9 +274,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 **运维注记**：
 
-- 冷存导出 = 「可恢复但不在线」；需要在线可查的长期归档（P3 之后）再评估分区表（按 `day`/`created_at` RANGE 分区）或独立归档库，**v1 DDL 不上分区**（过早复杂化）。
-- `DELETE` 密集的 `run_events` 关注 autovacuum；膨胀监控直接查 DB（原理三：状态在中心）。
-- 量级粗估：单 FDE 日 20 runs × 100 事件/run × 2 KB ≈ 4 MB/日/FDE → 个位数 FDE + 30 天热保留在 GB 以下，对 275 G 可用磁盘（env §8.1）无压力；transcript 冷存前的在线积累是主要增长项，需纳入看板。
+- 冷存导出 = 「可恢复但不在线」，属**将来可选项（当前不实施**，决策者 2026-09，issue #3 评论**）**：若启用，导出目标可用 `/docker/station-db/archive/`（env §6 目录约定）。需要在线可查的长期归档（P3 之后）再评估分区表（按 `day`/`created_at` RANGE 分区）或独立归档库，**v1 DDL 不上分区**（过早复杂化）。
+- 若将来启用 `run_events` 冷存删除，则 `DELETE` 密集，需关注 autovacuum；膨胀监控直接查 DB（原理三：状态在中心）。
+- 量级粗估：单 FDE 日 20 runs × 100 事件/run × 2 KB ≈ 4 MB/日/FDE → 个位数 FDE 规模下即使**不删除**、长期热保留，增长亦平缓（年量级 GB），对 275 G 可用磁盘（env §8.1）无压力；transcript 的在线积累是主要增长项，需纳入看板。
 
 ---
 
