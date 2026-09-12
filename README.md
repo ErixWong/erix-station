@@ -5,14 +5,17 @@
 **定位一句话**：`erix-agent` 是引擎（无头 agent 运行时），`erix-station` 是宿主平台（谁在用、在哪台机器上跑、怎么访问、花了多少钱）。
 
 - 状态：**设计阶段**（无业务代码）
-- 主设计文档：[`docs/design/fde-platform.md`](docs/design/fde-platform.md)
+- **入口文档**：[`docs/README.md`](docs/README.md) —— 文档地图 + 待补齐清单（实现者从这里开始）
+- 主规格：[`docs/design/fde-platform.md`](docs/design/fde-platform.md)
+- 设计原理与取舍：[`docs/design/principles.md`](docs/design/principles.md)
 - 上游引擎：[erix-agent](https://github.com/ErixWong/erix-agent)
 
 ## 现在有什么
 
 | 目录 | 内容 |
 |---|---|
-| `docs/design/` | 主设计文档（拓扑 / 网络 / 授权 / 端口 / 数据模型 / 分期） |
+| `docs/` | 文档地图（`docs/README.md`）：现有文档 + 待补齐清单与验收标准 |
+| `docs/design/` | 主规格（拓扑 / 网络 / 授权 / 端口 / 数据模型 / 分期）+ 设计原理与被否决方案 |
 | `deploy/` | 待建：Traefik + portal + DB 的 compose，FDE 容器模板 |
 | `portal/` | 待建：管理平台服务 |
 | `runner/` | 待建：容器内 agent worker |

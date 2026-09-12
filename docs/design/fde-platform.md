@@ -3,6 +3,9 @@
 > 状态：**草案（设计阶段，无实现）**
 > 来源：2026-09-12 六轮设计讨论，归档于 [erix-llm-kit#24](https://git.erix.vip/eric/erix-llm-kit/issues/24)
 > 上游：erix-agent（引擎）；本文只描述**宿主平台**。
+>
+> **本文只写「是什么」**。要理解「为什么」、查看**被否决的方案**、以及未覆盖场景如何推导，读 [`principles.md`](principles.md)。
+> 待补齐的文档清单见 [`../README.md`](../README.md)。
 
 ---
 
