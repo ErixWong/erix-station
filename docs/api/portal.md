@@ -110,7 +110,7 @@
 
 ### 2.1 登录方式（P1）
 
-**P1 用本地账号**：argon2id 口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；env §8 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
+**P1 用本地账号**：argon2id 口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
 
 - 第一个 admin 由部署 bootstrap 在本地建（规格 §7.1）；**TOTP 种子由 bootstrap 流程生成下发，不走公开 API**（P1 契约不含注册/自助找回端点）。
 - OIDC 接入后登录入口变化（跳转 SSO），但 **cookie、session 语义、本文其余端点全部不变**——前端无需感知。
@@ -273,6 +273,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 字段 | 说明 |
 |---|---|
 | `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9][a-z0-9-]{0,62}` |
+| `repo_url` | 仓库地址，**仅作记录/展示元数据**：平台不 clone、不物化该目录、不下发 git 凭据；clone 与 git 凭据由 FDE 在容器内自行配置（规格 §7.2/§12.2，决策者 2026-09，issue #3 评论） |
 | `slot` | 项目端口块序号（决定 `4000 + slot*8` 起始端口，规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
 
@@ -319,6 +320,8 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 409 | `name_conflict` | 同名项目已存在 |
 | 409 | `port_quota_exceeded` | 用户端口总配额超限（规格 §8.2：**明确报错**而非静默漂移） |
 | 503 | `container_unreachable` | 需要落 `.erix/ports.json` 时容器不可达（§6.3） |
+
+> **边界（决策者 2026-09，issue #3 评论）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 只是登记元数据。**平台不负责 clone，也不下发 git 凭据**——仓库目录由 FDE 在容器内自行 `git clone` 并配置凭据（等同他自己的开发机，规格 §7.2/§12.2）。
 
 ### 3.4 `GET /api/projects/:id`
 
@@ -592,6 +595,8 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 3. 无 `Last-Event-ID`（首次连接）：**不补发历史**，只推连接之后的新事件——历史消息/状态由 `GET /api/sessions/:id`（含 `last_seq` 与消息列表）获取；前端如需从某点重放，可显式带 `Last-Event-ID` 或查询参数 `?last_event_id=<seq>`（两者等价，查询参数供非 `EventSource` 客户端使用）。
 4. `Last-Event-ID` 大于当前 `last_seq`（如 session 已删）→ `404 not_found`；小于最小保留 seq（事件归档后）→ `410 Gone` + `{"error":{"code":"replay_unavailable", ...}}`，前端应回退到 `GET /api/sessions/:id` 全量拉取。
 
+> ⚠️ 与归档策略的对应（model.md §4，决策者 2026-09，issue #3 评论）：**事件冷存导出暂不实施（P1/P2 不删除事件）**，因此 `410 replay_unavailable` **保留定义但当前不会触发**；前端仍应实现该回退分支以兼容将来启用归档。
+
 > 也可用该端点做**事件重放**（P2 验收「断线重连不漏事件」即依赖本节语义）。
 
 ### 5.3 事件信封完整类型清单（对应规格 §10.1；LoopEvent 部分与 erix-agent v0.3.4 `src/loop.js:533` 的 LoopEvent union 一一对应，共 8 类）
@@ -690,7 +695,7 @@ portal → FDE 容器走 `http://fde-<name>:3000`（control 网络，Bearer per-
 |---|---|---|---|
 | 1 | Q7 portal 技术栈 | (a) 零依赖 Node | 仅实现注记，**契约形状无关** |
 | 2 | `BASE_DOMAIN`（影响 cookie `Domain`、所有示例 URL；当前倾向 `erix.vip`） | env §1 ⚠️ | §0 / §2.5 |
-| 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2） | env §8 / Q3 倾向 (a) | §2.1 |
+| 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2） | env §4 / Q3 倾向 (a) | §2.1 |
 | 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
 | 5 | 任务下发 push→pull 演进 | 规格 §10.3：单机可先 push | §6.3（`container_unreachable` 出现条件） |
 | 6 | `run.cost` 记账口径 | 依赖 Q1/Q4 | §4.1（P1 可为 `null`） |

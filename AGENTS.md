@@ -65,5 +65,5 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 ## 7. 已定架构决策（详见 docs/design/fde-platform.md 附录 A）
 
 - D1 Traefik 作 ingress；D2 SSO + 本地 break-glass admin；D3 每 FDE 双网络接入
-- D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关
+- D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree
