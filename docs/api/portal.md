@@ -110,7 +110,7 @@
 
 ### 2.1 登录方式（P1）
 
-**P1 用本地账号**：argon2id 口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；env §8 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
+**P1 用本地账号**：argon2id 口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
 
 - 第一个 admin 由部署 bootstrap 在本地建（规格 §7.1）；**TOTP 种子由 bootstrap 流程生成下发，不走公开 API**（P1 契约不含注册/自助找回端点）。
 - OIDC 接入后登录入口变化（跳转 SSO），但 **cookie、session 语义、本文其余端点全部不变**——前端无需感知。
@@ -690,7 +690,7 @@ portal → FDE 容器走 `http://fde-<name>:3000`（control 网络，Bearer per-
 |---|---|---|---|
 | 1 | Q7 portal 技术栈 | (a) 零依赖 Node | 仅实现注记，**契约形状无关** |
 | 2 | `BASE_DOMAIN`（影响 cookie `Domain`、所有示例 URL；当前倾向 `erix.vip`） | env §1 ⚠️ | §0 / §2.5 |
-| 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2） | env §8 / Q3 倾向 (a) | §2.1 |
+| 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2） | env §4 / Q3 倾向 (a) | §2.1 |
 | 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
 | 5 | 任务下发 push→pull 演进 | 规格 §10.3：单机可先 push | §6.3（`container_unreachable` 出现条件） |
 | 6 | `run.cost` 记账口径 | 依赖 Q1/Q4 | §4.1（P1 可为 `null`） |

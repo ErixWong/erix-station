@@ -14,7 +14,7 @@
 | # | 问题 | 影响 | 状态 |
 |---|---|---|---|
 | Q1 | 公司是否已有统一 LLM 网关（LiteLLM / one-api / one-hub）？ | 决定 portal 是「租户绑定」还是「兼做网关」（§11） | ⚠️ 待定 |
-| Q2 | 出口管控（egress allowlist）能否落地？允许哪些域名？ | 决定「防用外部 key」是硬保证还是降级为审计告警（§11） | ⚠️ 待定 |
+| Q2 | 出口管控（egress）职责归属 | 平台侧保证凭据层（虚拟 key）+ 审计；网络层阻断（容器能否出网、可访问哪些域名）由安全团队负责（§11） | ✅ 已定：外部依赖（安全团队），决策者 2026-09（issue #3） |
 | Q3 | 本地 admin 的定位：仅破窗，还是 FDE 也可用？ | 认证设计（§6） | ⚠️ 待定 |
 | Q4 | LLM 虚拟 key 粒度：每 FDE 一把，还是每客户项目一把？ | 成本归属精度 vs key 数量（§11） | ⚠️ 待定 |
 | Q5 | 端口分级：项目级 + run 级都做，还是先只做项目级？ | 端口模型复杂度（§8） | ⚠️ 待定 |
@@ -96,7 +96,7 @@ docker network: fde-bob    ← ...
 
 | 组件 | 职责 | 明确不做 |
 |---|---|---|
-| `station-edge`（Traefik） | TLS、按 host 路由、forwardAuth、审计、唯一对外入口 | 不碰业务逻辑 |
+| `station-edge`（Traefik） | TLS、按 host 路由、forwardAuth、访问日志（原始，非审计真相）、唯一对外入口 | 不碰业务逻辑 |
 | `station-portal` | 用户系统、项目/端口分配、容器生命周期、事件与消息、SSE、LLM 网关、用量记账 | 不跑 agent、不做工具执行 |
 | `station-db`（Postgres） | 用户/会话/消息/transcript/events/端口表/用量/审计 | 不存代码 |
 | `fde-<name>`（FDE 容器） | `station-runner`（跑 erix agent）+ code-server + dev servers；状态写 DB | 不 publish 端口、不挂 `docker.sock`、不存平台密钥 |
@@ -123,7 +123,7 @@ alice   → 在 control + fde-alice 上 → 能访问 portal；
 |---|---|---|
 | `-p 4000:4000` publish 到宿主机 | 绕过 ingress，直接访问 | FDE 容器一律不 publish；只有 ingress publish 80/443 |
 | 所有容器同一 bridge 网络 | alice 的容器 `curl bob:4000` 直达 | 每 FDE 独立网络（§5.1） |
-| 容器内自建隧道（cloudflared/ngrok） | 绕过平台直接对外 | egress allowlist（§11.4，取决于 Q2） |
+| 容器内自建隧道（cloudflared/ngrok） | 绕过平台直接对外 | 安全团队网络层策略（§11.4，issue #3）+ 平台审计 |
 
 ### 5.3 「不 publish」不等于「不监听」
 
@@ -372,13 +372,15 @@ audit_log           (actor_id, action, target, ts)
 
 **唯一有效的保证是：网络到不了。** 把 LLM 网关做成唯一可达的 LLM 出口，其他 LLM 域名 DNS 不解析 / IP 不可达 → 改 endpoint、换 key 均无效。
 
+> **职责边界（决策者 2026-09，issue #3）**：「网络到不了」由**网络层出口策略**实现，属**安全团队职责**，平台不负实施责任。技术事实：Docker 容器默认经宿主机 NAT 出网且无任何限制；出口策略只能在网络层实施（宿主机 iptables/nftables 按 docker 网络/容器 IP/veth 接口、或强制 egress 代理按域名白名单、或网络设备对容器所在网段做策略），平台业务代码实现不了。平台侧不可推卸的部分是**凭据红线**：容器内只放网关虚拟 key（带额度/模型白名单/可吊销），永不下放下游真实 key。
+
 ### 11.3 模式对比
 
 | 模式 | 形态 | key 进容器 | 能改 endpoint 绕过 | 需自写代理 |
 |---|---|---|---|---|
 | A 直连 | 容器 → 网关（per-FDE 虚拟 key） | 是 | **能**（除非做出口管控） | 否 |
 | B 经 portal | 容器 → portal → 上游 | 否 | 不能 | **是**（SSE 透传） |
-| **C 网络强制（选定）** | 容器 → 网关，**且网关是唯一可达的 LLM 出口** | 是（虚拟 key） | **不能** | 否 |
+| **C 网络强制（选定）** | 容器 → 网关，**且网关是唯一可达的 LLM 出口**（前提：安全团队网络层出口策略已实施，issue #3） | 是（虚拟 key） | **不能** | 否 |
 
 **选 C**：用现成的 LiteLLM/one-api 做网关（不自己写流式代理），portal 只做：
 
@@ -388,14 +390,16 @@ audit_log           (actor_id, action, target, ts)
 
 → 待 Q1 确认公司是否已有网关；没有则先起一个 LiteLLM 容器，仍走 C。
 
+> 模式 C 的「唯一可达」是**依赖外部网络策略实现的前提**（安全团队职责，issue #3），不是平台自身交付物；该前提未成立时，模式 C 退化为「模式 A + 审计告警」（见 §11.4 降级路径）。
+
 ### 11.4 配套细节
 
 - key 通过 `ERIX_API_KEY_FILE` 指向**只读文件**注入，不写进 config 正文（erix 的 `ModelConfig` 原生支持 `apiKeyEnv` / `apiKeyFile`）
 - **judge / fold 用便宜模型**：`ModelConfigProvider.resolve(slot)` 支持 `default` / `audit` / `fold`；长任务 judge 会 +10~30% 调用量
 - **额度用尽**：网关 429 → erix 分类 `KitError(rate_limited, retryable)` → 宿主需友好提示，且避免重试继续烧配额
 - **对账**：网关 usage 与 erix `onUsage` 两套数都要记（差异来自 judge/fold 的额外调用）
-- **出口 allowlist** 需覆盖：npm registry、pypi、GitHub/内部 git、镜像仓库；**LLM 域名不在白名单**（这正是强制点）
-- 若 Q2 无法落地 → 「防用外部 key」降级为**审计 + 告警**，需让管理层知情（性质不同）
+- **出口 allowlist 移交给安全团队的网络层策略**（白名单内容由安全团队维护）：npm registry、pypi、GitHub/内部 git、镜像仓库；**LLM 域名不在白名单**——这是「唯一出口」的实现方式（决策者 2026-09，issue #3）。平台对安全团队的接口：容器网络名/命名规范（`control` / `fde-<name>`）、审计事件、以及「上游 LLM 只经网关」的架构事实
+- 若安全团队的出口策略未实施 → 「防用外部 key」降级为**审计 + 告警**，须管理层**书面知情**（性质不同）
 
 ---
 
@@ -472,7 +476,7 @@ audit_log           (actor_id, action, target, ts)
 | **P0** | erix-agent 抽 `src/session/`，发 0.4.0（**在 erix-agent 仓库**） | `npm test` 全绿 + CLI 行为不变 |
 | **P1** | Traefik + portal + DB + 单 FDE 容器；登录、项目列表、对话（SSE）、停止 | 真机走通「登录→建项目→对话→工具卡片→停止」；playwright + vision 验证 |
 | **P2** | 多 FDE、端口分配 + 预览卡片/iframe、事件重放、工具审批、账号生命周期 workflow | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
-| **P3** | LLM 网关 + 出口管控 + 用量记账 + 审计 + code-server 模板 | 改 endpoint 无效；成本可按客户项目归集 |
+| **P3** | LLM 网关 + 用量记账 + 审计 + code-server 模板（出口管控为**外部依赖**：安全团队网络层策略，issue #3，非平台交付项） | 成本可按客户项目归集；安全团队出口策略实施后「改 endpoint 无效」，未实施时降级为审计+告警 |
 
 ---
 
@@ -485,7 +489,7 @@ audit_log           (actor_id, action, target, ts)
 | D3 | 每 FDE 容器 = `control` + `fde-<name>` 双网络接入 | portal 可访问所有容器；FDE 互相不可达 |
 | D4 | **不 publish 任何 FDE 端口** | 堵死绕过 ingress 的第二条路；所有 auth 生效的前提 |
 | D5 | dev 端口由**平台分配**，DB 为真相 + `.erix/ports.json` 为派生副本（单向） | 防冲突/URL 漂移；agent 不自己挑端口 |
-| D6 | LLM 走**模式 C：唯一可达的网关出口** | 「FDE 改不了 endpoint」只能靠网络强制，不能靠文件权限 |
+| D6 | LLM 走**模式 C：唯一可达的网关出口**；其中「FDE 改不了 endpoint」**依赖网络层出口策略（安全团队职责），平台不负实施责任**；策略未实施时降级为审计+告警，须管理层书面知情（决策者 2026-09，issue #3） | 「FDE 改不了 endpoint」只能靠网络强制，不能靠文件权限 |
 | D7 | 事件/transcript 落中心 DB，portal 从 DB 读并发 SSE | portal 重启不杀任务；断线可按 Last-Event-ID 补发 |
 | D8 | 隔离单元 = **worktree**（`agent/<runId>` 分支） | 同仓库并发多 agent 不冲突；回流走 fork/PR |
 | D9 | **认证放边缘**，dev server 与 agent 不感知认证 | 安全设施对 agent 工具链透明；应用零改造 |

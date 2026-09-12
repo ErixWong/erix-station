@@ -8,7 +8,7 @@
 -- 表语义、状态机、三份数据边界、归档策略、记账口径见 docs/data/model.md。
 --
 -- 环境事实（docs/env.md）：
---   目标版本 postgres:16（env §10）；数据目录 /docker/station-db/（env §7）。
+--   目标版本 postgres:16（env §10）；数据目录 /docker/station-db/（env §6）。
 --
 -- DDL 约定：
 --   - 枚举一律 text + CHECK（不用 ENUM 类型，便于 additive 演进）

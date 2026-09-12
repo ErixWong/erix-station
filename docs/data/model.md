@@ -10,7 +10,7 @@
 
 ## 0. 总览
 
-环境事实（env.md）：DB 为独立 `station-db` 容器，**postgres:16**（env §10），仅 `control` 网络内可达、不 publish 宿主机（env §6），数据目录 `/docker/station-db/`（env §7）。
+环境事实（env.md）：DB 为独立 `station-db` 容器，**postgres:16**（env §10），仅 `control` 网络内可达、不 publish 宿主机（env §5），数据目录 `/docker/station-db/`（env §6）。
 
 DDL 全局约定（schema.sql 头部亦有注）：
 
@@ -42,7 +42,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 
 | 关键字段 | 语义 |
 |---|---|
-| `role` | `fde` / `admin`。OIDC 接入后来自 group claim，不在 UI 手点（规格 §7.1）；P1 本地账号在本地表维护（env §8 ⚠️） |
+| `role` | `fde` / `admin`。OIDC 接入后来自 group claim，不在 UI 手点（规格 §7.1）；P1 本地账号在本地表维护（env §4 ⚠️） |
 | `fde_name` | FDE 标识 = 容器名 `fde-<name>` 的 `<name>`、预览域名首段；未建容器时 `NULL`。全表唯一 |
 | `auth_source` / `oidc_sub` | `local` / `oidc`；OIDC JIT 建档按 `email` + `oidc_sub`（规格 §7.1）。P1 恒为 `local`（portal.md §2.1） |
 | `password_hash` / `totp_secret` | 本地账号：argon2id 哈希 + **强制 TOTP**（规格 §7.1）；TOTP 种子只经 bootstrap 下发，不走公开 API（portal.md §2.1） |
@@ -265,7 +265,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
-| `run_events` | **热保留 + 到期归档删除**：run 结束后保留 N 天（建议 30 天，部署变量），过期导出 JSONL 冷存（`/docker/station-db/archive/`，env §7 目录约定）后 `DELETE` | 事件的唯一消费是实时推送与断线补发；补发窗口有限是**已声明的契约语义**——过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取（portal.md §5.2-4） |
+| `run_events` | **热保留 + 到期归档删除**：run 结束后保留 N 天（建议 30 天，部署变量），过期导出 JSONL 冷存（`/docker/station-db/archive/`，env §6 目录约定）后 `DELETE` | 事件的唯一消费是实时推送与断线补发；补发窗口有限是**已声明的契约语义**——过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取（portal.md §5.2-4） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠两点吸收：① jsonb 自动 TOAST 压缩；② **session 归档后可整体导出冷存**（同 JSONL 冷存目录），活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
 | `run_checkpoints` | 随 transcript 同生命周期；resume 只需要**最新** checkpoint，旧 seq 可在 run 结束后只留最大 seq 一条（`loadLatestCheckpoint`，规格 §9.3） | checkpoint 语义决定历史 seq 无消费者 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
@@ -276,7 +276,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 - 冷存导出 = 「可恢复但不在线」；需要在线可查的长期归档（P3 之后）再评估分区表（按 `day`/`created_at` RANGE 分区）或独立归档库，**v1 DDL 不上分区**（过早复杂化）。
 - `DELETE` 密集的 `run_events` 关注 autovacuum；膨胀监控直接查 DB（原理三：状态在中心）。
-- 量级粗估：单 FDE 日 20 runs × 100 事件/run × 2 KB ≈ 4 MB/日/FDE → 个位数 FDE + 30 天热保留在 GB 以下，对 275 G 可用磁盘（env §4）无压力；transcript 冷存前的在线积累是主要增长项，需纳入看板。
+- 量级粗估：单 FDE 日 20 runs × 100 事件/run × 2 KB ≈ 4 MB/日/FDE → 个位数 FDE + 30 天热保留在 GB 以下，对 275 G 可用磁盘（env §8.1）无压力；transcript 冷存前的在线积累是主要增长项，需纳入看板。
 
 ---
 

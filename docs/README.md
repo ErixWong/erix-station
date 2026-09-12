@@ -35,7 +35,7 @@
 **必须包含**：
 - base domain；portal 域名（`station.<base>`）与预览域名（`*.fde.<base>`）
 - DNS 泛解析能力；证书方式（Let's Encrypt DNS-01 / 内部 CA / 自签）
-- 网络可达性：是否 VPN-only；公司出口是否有正向代理（会影响出口管控设计）
+- 网络可达性：是否 VPN-only；公司出口是否有正向代理（会影响安全团队出口策略的落地方式，issue #3）
 - 宿主机：CPU / 内存 / 磁盘；Docker 版本；是否已有 Portainer（是）
 - SSO：OIDC provider 的 issuer / client 注册方式 / group claim 名称；或「先用本地账号」
 - 端口占用现状（80/443/8080/5432 是否可用）
