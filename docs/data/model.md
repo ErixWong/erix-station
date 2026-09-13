@@ -1,7 +1,9 @@
 # 数据模型说明（model.md）
 
 > 状态：**契约基线（阻塞 P1）**
-> 依据：[`../design/fde-platform.md`](../design/fde-platform.md) §8/§9/§10（规格，下称「规格 §x」）、[`../design/principles.md`](../design/principles.md)（原理）、[`../env.md`](../env.md)（环境事实，下称「env §x」）。
+> 依据：[`../design/fde-platform.md`](../design/fde-platform.md) §8/§9/§10（规格，下称「规格 §x」）、[`../design/principles.md`](../design/principles.md)（原理）、[`../design/runner-integration.md`](../design/runner-integration.md)（runner 集成设计：internal 端点 / 租约 / 幂等键，下称「runner-integration §x」）、[`../env.md`](../env.md)（环境事实，下称「env §x」）。
+>
+> **写入方总原则（决策者 2026-09，issue #3 评论，D1'/D2'）**：**Postgres 的业务写方只有 portal**；容器（agentd/worker）不持有 DB 凭据、不直连 DB，一切 run 侧写入经 portal internal API（portal.md §9）落库。下文各表「谁写」均按此口径。
 > 配套：可执行 DDL 在 [`schema.sql`](schema.sql)（`psql -f` 空库可执行，已实测）；API 层字段口径与 [`../api/portal.md`](../api/portal.md) 对齐（下称「portal.md §x」）。
 >
 > **本文只补契约细节，不重新设计**：规格 §9.1 是表名 + 字段草图，本文与 schema.sql 把它落成可执行模型。与规格冲突时以规格为准并提 issue。
@@ -10,7 +12,7 @@
 
 ## 0. 总览
 
-环境事实（env.md）：DB 为独立 `station-db` 容器，**postgres:16**（env §10），仅 `control` 网络内可达、不 publish 宿主机（env §5），数据目录 `/docker/station-db/`（env §6）。
+环境事实（env.md）：DB 为独立 `station-db` 容器，**postgres:16**（env §10），仅 `backend` 网络内可达（H-B：`control` 已取消）、不 publish 宿主机（env §5），数据目录 `/docker/station-db/`（env §6）。
 
 DDL 全局约定（schema.sql 头部亦有注）：
 
@@ -28,11 +30,13 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 账号与认证 | `users` / `login_sessions` / `api_tokens` | 规格 §7 |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
 | 会话与对话 | `chat_sessions` / `runs` / `messages` | 规格 §9.1 |
-| 端口分配 | `port_allocations` | 规格 §8 |
+| 端口分配与路由 | `port_allocations` / `route_outbox` | 规格 §8 / topology.md §5/§8 |
 | 引擎持久化 | `transcript_rounds` / `run_checkpoints` / `run_events` | 规格 §9.2/§9.3 |
-| 工具与审批 | `tool_calls` / `judge_decisions` / `approvals` / `artifacts` | 规格 §9.1 |
+| 工具与审批 | `tool_calls` / `tool_outputs` / `judge_decisions` / `approvals` / `artifacts` | 规格 §9.1 / topology.md §9 |
 | 用量与审计 | `usage_ledger` / `audit_log` | 规格 §11.4 / §14 |
-| 任务队列 | `run_queue` ⚠️ | 规格 §10.3（拉模型终态，push 模式不启用） |
+| 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
+| 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
+| LLM 网关绑定 | `fde_llm_bindings` | 规格 §11.3 / topology.md §4-L7 |
 
 ---
 
@@ -63,11 +67,11 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 关键字段 | 语义 |
 |---|---|
-| `fde_name` / `container_name` | 均唯一；`container_name = fde-<name>`，control 网络内 docker DNS 可达（规格 §5.3） |
-| `runner_token` | portal → runner 的 Bearer token（规格 §10.3）。**portal 需持原文发起调用，故存原文**（非哈希）；严禁入日志/镜像/仓库（原理 §5 清单） |
+| `fde_name` / `container_name` | 均唯一；`container_name = fde-<name>`（docker 容器名）。该容器名只在其自己的 `/29` 网络内按 docker DNS 解析（供其自有服务）；portal **不**按容器名/容器 IP 访问它——平台通道全出站经 Traefik（H-B，topology.md §2/§4；`control` 已取消） |
+| `runner_token_hash` / `token_generation` / `revoked_at` / `rotated_at` | per-container token（规格 §10.3 / issue #12）：**仅存哈希**。建容器时生成原文、注入容器 env `ERIX_STATION_TOKEN`；**容器 → portal 单向出示原文**（internal API Bearer），portal 只校验哈希、不再向容器出示。`token_generation` 是代次（轮换/重建 +1），`revoked_at` / `rotated_at` 记录吊销/轮换时刻——旧代次哈希失配 → `401 token_revoked`（原子吊销，topology.md §6 第 9 条）。严禁明文入 DB/日志/镜像/仓库（原理 §5 清单）。**容器除此之外无任何平台凭据，尤其没有 DB 凭据**（D1'） |
 | `status` | `creating / running / stopped / exited / removed`（状态机见 §2.4） |
 | `agent_version` | erix-agent 版本 pin / canary 的记录点（规格 §14 容器升级流程） |
-| `last_heartbeat` | 容器 → portal 只写 DB + 心跳（规格 §10.3）；portal 据此判断 `container_unreachable`（portal.md §6.3）与 `container_exited` |
+| `last_heartbeat` | agentd 心跳（15s ⚠️，经 internal API 上报、portal 落库，runner-integration §4.2 U4）；3 次丢失（45s ⚠️）判容器死（视 `exited`），run 级处置走租约到期 re-claim（runner-integration §6.4） |
 
 ### 1.5 `projects` — 项目（容器内仓库目录）
 
@@ -107,7 +111,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `fde_id` | → `users.id`，**FDE 用户**（forward-auth 的 `cookie.sub` 比对对象，portal.md §2.7 第 4 步） |
 | `scope` / `run_id` | `project` 级 `run_id` 必空、`run` 级必带 → `CHECK ((scope='run') = (run_id IS NOT NULL))`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，字段先行保留（principles §4 Q5 倾向 (b)） |
-| `port` | 容器内 dev 端口，`CHECK (port BETWEEN 4000 AND 4999)`；3000 runner / 3001 code-server 是容器固定角色，不入表（规格 §12.3） |
+| `port` | 容器内 dev 端口，`CHECK (port BETWEEN 4000 AND 4999)`；3001 code-server 是容器固定角色，不入表（规格 §12.3；原 3000 runner 内部 API 角色已取消——容器平台通道零监听，规格 §10.3，决策者 2026-09） |
 | `hostname` / `url` | 由 portal **与 Traefik 路由同源生成**（规格 §8.1）；前端只展示/跳转 `url`，永不拼接（portal.md §8-4） |
 | `exposure` | `private`（默认）/ `org-visible` / `public`（规格 §6.5；非 admin 申请 `public` 被拒，portal.md §4.7） |
 | `state` | 状态机见 §2.2 |
@@ -120,15 +124,15 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 ### 1.10 `transcript_rounds` — 第②层：canonical 消息
 
-见 §3。`UNIQUE(run_id, round)`；`messages` jsonb 为该轮 canonical 消息数组（模型上下文 + resume 源）；`folded` 只影响视图，**档案完整不删**（规格 §9.2）；`folded_payload` 存 fold 后的展示载荷。只由 store 适配器（规格 §9.3）写入。
+见 §3。`UNIQUE(run_id, round)`。**`record` jsonb 存上游 RoundRecord 全量原样，是全量真相**——store 的 `load()` 原样返回它（resume / fold 的输入）；`messages` / `folded` / `folded_payload` 是**派生/加速列**，供 SQL 查询与 UI 使用（决策者 2026-09，D2' 对齐；上游 RoundRecord 形状见 runner-integration §9.1）。fold 只影响视图，**档案完整不删**（规格 §9.2）；fold 后原轮 `UPDATE`（`folded=true` + `folded_payload`），不插新行（runner-integration §9.3）。写入方 = portal internal 端点（`PUT .../transcript/rounds/:round`，按 round 幂等 + `dedupKey` 双保险）；runner 侧是 HTTP adapter 调用方，不直连 DB。
 
 ### 1.11 `run_checkpoints` — checkpoint（fail-closed 的落点）
 
-`UNIQUE(run_id, seq)`。**必须成对**（save + load）：工具执行前写失败 → `checkpoint_failed`，任务直接失败（规格 §9.3-1）；DB adapter 必须包 retry 且识别其为可重试（规格 §9.3-2）。⚠️ 规格 §9.3 强烈建议「本地 file 优先 + DB 异步复制」装饰器——落地与否影响 `checkpoint_failed` 出现频率，不影响本表结构。
+**每 run 一行**（`run_id` 即主键）：上游 store 的 `saveCheckpoint` 是**覆盖写单份**（tmp+rename 原子覆盖）、`loadLatestCheckpoint(runId)` 无参数（依据：erix-agent v0.3.5 `src/store/file.js:279-297`，已 grep 复核）。写入语义 = `INSERT ... ON CONFLICT (run_id) DO UPDATE`（单行覆盖，重试安全；portal.md §9）。**必须成对**（save + load）：工具执行前写失败 → `checkpoint_failed`，任务直接失败（规格 §9.3-1）；HTTP adapter 必须包 retry 且识别其为可重试（规格 §9.3-2，runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
 
 ### 1.12 `run_events` — 第③层：流式事件日志
 
-见 §3。只追加；`seq` 由宿主落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
+见 §3。只追加；`seq` 由 portal 落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；**`client_event_id` 为客户端幂等键**（worker 生成 `run_id:单调计数`），`UNIQUE(run_id, client_event_id)` + `ON CONFLICT DO NOTHING` 支撑 agentd 批量上报的 at-least-once 去重（runner-integration §7.3）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
 
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
 
@@ -145,9 +149,66 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 `actor_id` 可空（系统动作 / 未认证的 forward-auth 判定）；forward-auth **每次判定无论通过与否都写**（portal.md §2.7）——「谁在什么时候看了哪个端口」（原理二）。本地 admin 的每次登录/操作强制审计 + 告警（规格 §7.1）。
 
-### 1.16 `run_queue` — 任务队列 ⚠️ 待决策者确认
+### 1.16 `run_queue` — 任务队列（含租约）
 
-规格 §10.3：拉模型（容器长轮询 / `LISTEN` 领 `run_queue`）为终态，单机可先用 push。**push 模式下本表不启用**，结构先行落地以免中途迁移。`run_id UNIQUE`（一个 run 至多入队一次）；状态机见 §2.5。
+派单 = **拉取**：agentd `POST /api/internal/claim` 长轮询（hold ≤30s ⚠️）+ portal 侧 NOTIFY/事件唤醒；push 优化 P2 后置（推荐倾向，⚠️ 待决策者确认，runner-integration §15-3）。claim / 续租 / 回收全由 portal 经 internal API 执行（D1'：容器不直连 DB）。
+
+| 关键字段 | 语义 |
+|---|---|
+| `container_id` | **派单目标**容器（入队时定，路由语义） |
+| `owner_container_id` | **当前租约持有者**（claim 时写，release / reaper 回收时清）。与 `container_id` 分列的理由：容器重建后由新容器 re-claim 时只改持有者、不改路由原值 |
+| `claim_token` | 本次认领凭证；run 级写请求带 `X-Claim-Token`，re-claim 后旧 token 失效（`409 lease_lost`）——**双写防护**（runner-integration §4.2/§6.4） |
+| `lease_until` | 租约到期时刻（lease 90s ⚠️，随心跳续期）；过期允许 re-claim（认领 SQL 见 schema.sql §8 注释） |
+| `attempts` | 认领次数；耗尽（如 ≥3）→ runs `failed`（`internal`，runner-integration §6.2） |
+
+`run_id UNIQUE`（一个 run 至多入队一次）；CHECK 强制 `claimed` 行必带 `claimed_at / lease_until / owner_container_id / claim_token`；状态机见 §2.4。
+
+### 1.17 `fde_networks` — FDE 网络注册表（IPAM 真相，H-B D-10）
+
+| 关键字段 | 语义 |
+|---|---|
+| `fde_id` | → `users.id`，主键：**每 FDE 一行**（一个 FDE 一张网络） |
+| `network_name` / `subnet` | 均唯一。`network_name = fde-<name>`（docker 网络名）；`subnet` 为 `10.200.<n>.0/29`（默认池）或 `10.201.<n>.0/28`（大 FDE 段） |
+| `prefix_len` | `29` 或 `28`（CHECK 限定）；`/29` 5 个容器位、`/28` 13 个容器位（`.0` 网络 / `.1` 网关 / 末位广播，topology.md §3） |
+| `gateway` | 该网络 `.1`（宿主 bridge 端点；Traefik 走 host 网络经此可达容器） |
+| `pool` | `default`（`10.200.0.0/16`）或 `large`（`10.201.0.0/16`）；两段**保留给 FDE 网络专用**（topology.md §2/§3） |
+| `state` | 状态机见 §2.6 |
+| `revision` | 与 `route_outbox` / reconciler 对账的版本号 |
+
+**复用语义**：`subnet` 为**全局唯一**（非部分索引）——offboarding 后 `state → released`，块可复用，但复用前需由 portal 先**腾出该行**（`DELETE` 已释放记录，或将其 `subnet` 改指新块；历史归属由 `audit_log` 的 `network.allocate` / `network.release` 承载）再分配给新 `fde_id`。已建网络子网不可改 → 扩容 = 重建网络（数据在 bind mount，容器是牲口）。
+
+### 1.18 `route_outbox` — 路由发布 outbox（issue #9）
+
+| 关键字段 | 语义 |
+|---|---|
+| `aggregate` / `aggregate_id` | 聚合类型与实例 id（如 `port_allocation` / `port_allocations.id`、`llm_binding` / `fde_llm_bindings.fde_id`） |
+| `op` | `upsert` / `delete`；`delete` 用 **tombstone**（revision 递增 + op=delete，不物理删行） |
+| `revision` | 聚合内单调递增版本；`UNIQUE(aggregate, aggregate_id, revision)` 保证同一聚合同一版本至多一条（重试/重复投递安全） |
+| `payload` | 生成该路由所需的全部事实快照（hostname/url/backend IP 等），随 revision 固化 |
+| `state` | 状态机见 §2.5 |
+| `attempts` / `last_error` | 发布重试计数与最近失败原因 |
+
+**语义**：portal 在 DB 事务里写 desired state（`port_allocations` / `fde_llm_bindings`）+ 本表一行；**Traefik file provider 是异步幂等派生状态**（PG 事务无法含文件写入）。`delete` 用 tombstone；启动时从 DB 全量重建路由（幂等）；reconciler 消费 outbox 并做 debounce/批量合并、临时文件校验后原子替换（topology.md §8）。
+
+### 1.19 `tool_outputs` — 工具结果全文另存（topology.md §9）
+
+| 关键字段 | 语义 |
+|---|---|
+| `run_id` / `tool_call_id` | 归属 run 与工具调用；`tool_call_id` 与 `tool_calls.call_id` 对齐（portal.md §5.3；若 issue #10 最终改为 UUID 再同步）；`UNIQUE(run_id, tool_call_id)` |
+| `bytes` / `sha256` | 字节数与 sha256（阈值判定、配额、digest 校验/去重） |
+| `body` | 工具结果全文；**超过阈值才另存**——事件里只放 `result_digest` + 引用（`tool_outputs.id`），避免打爆 `run_events` |
+
+### 1.20 `fde_llm_bindings` — FDE ↔ LLM 网关虚拟 key 绑定（规格 §11.3）
+
+| 关键字段 | 语义 |
+|---|---|
+| `fde_id` | → `users.id`，主键：每 FDE 一行 |
+| `gateway` / `key_id` | 网关标识与网关侧 key id（创建成功后回填） |
+| `key_alias` | 业务别名（如 `alice@client-x`），供用量对账映射（规格 §11.3） |
+| `state` / `generation` | 状态机见 §2.7；`generation` 为虚拟 key 代次（轮换 +1，旧代次在网关吊销） |
+| `revoked_at` / `rotated_at` | 吊销/轮换时刻 |
+
+**红线**：真实 key **绝不存明文**——只写宿主 Traefik 动态配置（600，portal 可写、Traefik 只读）；本表只存 `key_id` / 别名 / 代次（供轮换、吊销、用量对账，topology.md §4-L7/§6 第 8 条）。
 
 ---
 
@@ -176,23 +237,23 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `queued` | portal：`POST /api/sessions/:id/messages` 创建 run（portal.md §4.3） | runner：领取并开始（→ `running`）；portal：stop 端点（→ `cancelling`）、`runs_one_active_per_session` 约束 |
-| `running` | runner：开始执行时 `markRunState`（规格 §9.3） | portal：SSE 状态展示、`GET /api/runs/:id`；FDE：stop / 审批操作的前置状态 |
-| `cancelling` | portal：`POST /api/sessions/:id/stop` 写 `cancel_requested_at` + 状态（portal.md §4.5） | runner：轮询标记并 abort 工具循环（规格 §10.3）；portal：SSE 展示「停止中」 |
-| `finished`（终态） | runner：`run_end`（含 `termination` / `usage` 汇总，portal.md §5.3-13） | portal：消息落 `messages`、用量记 `usage_ledger`、run 级端口释放（→ `released`）；UI：展示 |
-| `failed`（终态） | runner：异常退出；portal：心跳丢失判定 `container_exited`（portal.md §6.4） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：重发消息继续（checkpoint 成对恢复） |
+| `queued` | portal：`POST /api/sessions/:id/messages` 创建 run（portal.md §4.3） | agentd：claim 领取并开始（→ `running`，经 internal API，portal.md §9）；portal：stop 端点（→ `cancelling`）、`runs_one_active_per_session` 约束 |
+| `running` | agentd 上报 `markRunState`（规格 §9.3），**portal 落库**（D1'） | portal：SSE 状态展示、`GET /api/runs/:id`；FDE：stop / 审批操作的前置状态 |
+| `cancelling` | portal：`POST /api/sessions/:id/stop` 写 `cancel_requested_at` + 状态（portal.md §4.5） | agentd：SSE `stop_request`（主）/ 心跳 `stop_run_ids`（兜底）收到后 abort worker（runner-integration §4.3/§10）；portal：SSE 展示「停止中」 |
+| `finished`（终态） | worker 跑完上报 → agentd 经 internal API 提交终态载荷（含 `termination` / `usage` 汇总，portal.md §5.3-13 / §9），**portal 收敛落库** | portal：消息落 `messages`、用量记 `usage_ledger`、run 级端口释放（→ `released`）；UI：展示 |
+| `failed`（终态） | agentd 上报异常（如 `worker_crashed`）；portal：心跳丢失判定 `container_exited`（portal.md §6.4） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：重发消息继续（checkpoint 成对恢复） |
 
 > 终态不可再变（无产生新状态的出边）；`cancelling` 的收敛者恒为 runner——容器死了由 portal 心跳检测直接置 `failed`（`container_exited`），不留悬挂 `cancelling`。
 
 ### 2.2 `port_allocations.state`
 
 ```
- 创建（项目/run 端口分配，与 Traefik 路由同一事务）
+ 创建（项目/run 端口分配：同一 DB 事务写 port_allocations + route outbox）
         │
    ┌────▼─────┐  观测到 dev server 监听 / 首次授权访问   ┌────────┐
    │ allocated│ ──────────────────────────────────────▶ │ active │
    └────┬─────┘                                         └───┬────┘
-        │        项目删除 / run 结束 / 配额回收（同事务删路由）      │
+        │        项目删除 / run 结束 / 配额回收（同一 DB 事务写 outbox tombstone）      │
         └──────────────────────┬────────────────────────────┘
                             ┌──▼──────┐
                             │ released│（released_at 必填，reaper 定期清理）
@@ -201,7 +262,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `allocated` | portal：项目创建 / run 启动时的分配事务（规格 §7.2 第 3 步 / §8.2） | forward-auth：放行（portal.md §2.7 第 2 步）；portal：生成 `ports.json` + Traefik 路由（同源，规格 §8.1） |
+| `allocated` | portal：项目创建 / run 启动时的分配事务（规格 §7.2 第 3 步 / §8.2） | forward-auth：放行（portal.md §2.7 第 2 步）；portal：同事务写 `port_allocations` + route outbox、生成 `ports.json`；reconciler 异步幂等发布 Traefik 路由（同源，规格 §8.1） |
 | `active` | portal：观测到端口实际在服务（runner 上报监听或首次授权请求）后升级标记 | forward-auth：放行；UI：预览卡片「在线」展示；报表 |
 | `released`（终态） | portal：项目删除 / run 结束 / reaper 回收（规格 §8.2） | forward-auth：**403**（portal.md §2.7）；分配器：端口与 hostname 可复用（部分唯一索引不再覆盖）；reaper：过期清理 |
 
@@ -221,9 +282,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `pending` | runner：judge/工具拦截产生待审批项（规格 §9.1；portal.md §4.8） | FDE：`GET /api/approvals?status=pending` 列表与决定；通知（规格 §14「需审批时通知」） |
-| `approved`（终态） | FDE：`POST /api/approvals/:id`（`decision=approve`） | runner：轮询到决定后继续执行该工具调用；审计 |
-| `denied`（终态） | 同上（`decision=deny`） | runner：终止该工具调用并反馈引擎；审计 |
+| `pending` | worker 侧 judge/工具拦截产生，经 agentd 中转、portal 建单（规格 §9.1；portal.md §4.8/§9） | FDE：`GET /api/approvals?status=pending` 列表与决定；通知（规格 §14「需审批时通知」） |
+| `approved`（终态） | FDE：`POST /api/approvals/:id`（`decision=approve`） | worker：经 agentd 中转（SSE 快通道 + 轮询兜底，runner-integration §10）收到决定后继续执行该工具调用；审计 |
+| `denied`（终态） | 同上（`decision=deny`） | worker：不抛错，把「被拒绝」作为 tool_result 反馈引擎（runner-integration §10.1）；审计 |
 
 > `409 already_decided`（portal.md §4.8）由 `decided_at IS NOT NULL` + 应用层条件更新（`UPDATE ... WHERE status='pending'`）兜底；终态无出边。
 
@@ -231,10 +292,69 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 表.字段 | 状态集合 | 产生方 → 消费方（要点） |
 |---|---|---|
-| `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发前的可达性判断（`container_unreachable`，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`） |
+| `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发前的可达性判断（`container_unreachable`，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`，3 次丢失 ≈45s ⚠️，runner-integration §4.2） |
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
 | `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
-| `run_queue.status` ⚠️ | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；runner 领取（`claimed`，`claimed_at` 必填由 CHECK 强制）→ 完成 `done` / 取消 `cancelled` |
+| `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回 `pending`（re-claim） |
+
+### 2.5 `route_outbox.state`
+
+```
+ portal 写 desired state + outbox 行（revision 递增）
+        │
+   ┌────▼─────┐   reconciler 领取（FOR UPDATE SKIP LOCKED）   ┌────────────┐
+   │ pending  │ ───────────────────────────────────────────▶ │ processing │
+   └──────────┘                                              └─────┬──────┘
+                                                         发布成功│  发布失败（attempts 内退避重试）
+                                                        ┌───────▼──┐   ┌───────┐
+                                                        │ published│   │ failed │（attempts 耗尽 / 告警）
+                                                        └──────────┘   └───────┘
+```
+
+| 状态 | 产生方 | 消费方 |
+|---|---|---|
+| `pending` | portal：任何写 desired state 的事务同时写一行 outbox（revision 递增） | reconciler：领取并处理 |
+| `processing` | reconciler：领取（原子，避免重复消费） | reconciler 自身：发布成功后置 `published` |
+| `published` | reconciler：Traefik 动态配置生成 + 校验 + 原子替换 + reload 成功后 | 对账任务：与 file provider 比对（四向对账，topology.md §8） |
+| `failed` | reconciler：发布失败（`attempts` 耗尽或不可重试） | 告警 + 人工介入；退避窗口内会回 `pending` 重试 |
+
+> 幂等保证：`UNIQUE(aggregate, aggregate_id, revision)` + 生成文件为**纯函数**（同 revision 同输出）→ 重复消费/重试安全。失败保留上一版本文件（原子替换只在新文件校验通过后发生，topology.md §8）。
+
+### 2.6 `fde_networks.state`
+
+```
+ onboarding 分配子网（写 fde_networks + docker network create）
+        │
+   ┌────▼─────┐  容器起好/首次可达（reconciler 观测）   ┌────────┐
+   │ allocated│ ─────────────────────────────────────▶ │ active │
+   └────┬─────┘                                       └───┬────┘
+        │        offboarding 回收子网（state→released + released_at） │
+        └───────────────────────────────────────────────┘
+                                        ┌──▼──────┐
+                                        │ released│（released_at 必填；块可复用）
+                                        └─────────┘
+```
+
+| 状态 | 产生方 | 消费方 |
+|---|---|---|
+| `allocated` | portal/reconciler：onboarding 分配子网（DB 写行 + `docker network create --subnet`） | reconciler：建网 + 起容器；IPAM：该 subnet 被占用（`UNIQUE(subnet)` 挡并发） |
+| `active` | reconciler：容器已起、网络可达（观测到容器接入） | 连通矩阵/对账：视为在役网络 |
+| `released`（终态） | portal/reconciler：offboarding 停容器 → 删网络 → 回收子网 | IPAM：块可复用（复用前先腾出该行，见 §1.17）；对账：不再有对应 docker 网络 |
+
+### 2.7 `fde_llm_bindings.state`
+
+```
+ 建虚拟 key（portal 调网关 admin API → 写行 active）
+        │
+   ┌────▼────┐   offboarding / 轮换旧代次   ┌────────┐
+   │ active  │ ───────────────────────────▶ │ revoked│
+   └─────────┘                              └────────┘
+```
+
+| 状态 | 产生方 | 消费方 |
+|---|---|---|
+| `active` | portal：onboarding 建虚拟 key（网关 admin API + 本表一行 + Traefik 注入路由 outbox） | Traefik：`Authorization` 注入；网关：额度/模型白名单/用量 |
+| `revoked`（终态） | portal：offboarding / 轮换（旧代次吊销，`revoked_at` 必填） | Traefik：删除对应 LLM 注入路由（outbox op=delete）；网关：吊销 key |
 
 ---
 
@@ -244,16 +364,16 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 层 | 表 | 内容 | 谁写 | 谁读 | 可折叠 |
 |---|---|---|---|---|---|
-| ① 人看的对话 | `messages` | 用户输入 + assistant 最终回复（含 `synthetic` 标记的合成消息） | portal（用户消息，POST 时）/ runner（run 结束时回写 assistant 回复） | **UI 唯一对话来源** | 否 |
-| ② canonical 消息 | `transcript_rounds` | 模型上下文 + resume 源（含 judge 注入、wrapup、nudge） | **仅 store 适配器**（`appendRound`，规格 §9.3） | **仅 `runToolLoop`**（resume / fold） | 是（fold 只影响视图） |
-| ③ 流式事件日志 | `run_events` | 带 seq 的事件信封（portal.md §5.3 全类型） | **仅 store decorator**（事件落库，规格 §9.3-4） | 前端 SSE / 断线重放 | 否 |
+| ① 人看的对话 | `messages` | 用户输入 + assistant 最终回复（含 `synthetic` 标记的合成消息） | **portal**：用户消息（POST 时）；assistant 回复 = worker 终态上报、portal 落库（D1'） | **UI 唯一对话来源** | 否 |
+| ② canonical 消息 | `transcript_rounds` | 模型上下文 + resume 源（含 judge 注入、wrapup、nudge）；`record` = RoundRecord 全量真相，其余列派生 | **仅 portal internal 端点**（`appendRound` 映射，runner-integration §9.1）；runner 是 HTTP adapter 调用方，不直连 DB | **仅 `runToolLoop`**（resume / fold，经 `GET .../transcript`） | 是（fold 只影响视图） |
+| ③ 流式事件日志 | `run_events` | 带 seq 的事件信封（portal.md §5.3 全类型） | **仅 portal**（agentd 批量上报事件，portal 分配 seq 落库，runner-integration §7） | 前端 SSE / 断线重放 | 否 |
 
 「不混」不是纪律口号，落地方式有四层：
 
 1. **物理分表**：三层各自一张表，schema 上没有共用列可互相污染；唯一桥接是 `run_id` / `session_id` 外键（关联 ≠ 混合）。
 2. **写入路径单一**：每张表只有一个代码写入方（见上表「谁写」）。UI 渲染**只读 `messages`**；引擎 resume **只读 `transcript_rounds`**；SSE **只读 `run_events`**。代码评审时任何跨层读写（如 UI 直接渲染 transcript）即为 bug。
 3. **合成消息的显式标记**：judge 在 transcript 里注入的是 user role 合成消息（规格 §9.2）；凡需进入人读层的合成内容，落 `messages` 时必须 `synthetic = true`（DB 层 `NOT NULL DEFAULT false` + 应用层显式置位），UI 显著标记——不借道、不隐式。
-4. **（P2 强化，⚠️ 实现注记）DB 角色分离**：拆 `station_portal` / `station_runner` 两个 DB 角色，用 `GRANT` 把「写 `transcript_rounds`/`run_events`」收归 runner 角色、「写 `messages`」收归 portal 角色，把约定变成权限。P1 单账号先用前 3 层。
+4. **DB 角色（决策者 2026-09，D1' 后简化）**：**portal 是 Postgres 唯一业务写方**，业务角色 = `station_portal`（最小 GRANT：只授 portal 端点实际用到的表/操作）；迁移角色 = `station_platform`（DDL/迁移专用，与运行时角色分离）。**runner 不连 DB，因此不需要 `station_runner` 角色**（原「P2 拆 station_portal/station_runner 双角色」设想作废——容器侧根本没有 DB 凭据可发）。「不混」在 DB 层不再依赖角色分离，由 internal 端点的写入路径唯一性保证（第 2 层）。
 
 > seq 统一：`messages.seq` 与 `run_events.seq` 共用 `chat_sessions.last_seq` 分配器（同事务递增），三层各自的序互不依赖、但对 UI 呈现（消息与事件交错的时间线）有一致的单调序。
 
@@ -267,10 +387,11 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|---|
 | `run_events` | **热保留，当前不删除**。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记 | 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
-| `run_checkpoints` | 随 transcript 同生命周期；resume 只需要**最新** checkpoint，旧 seq 可在 run 结束后只留最大 seq 一条（`loadLatestCheckpoint`，规格 §9.3） | checkpoint 语义决定历史 seq 无消费者 |
+| `run_checkpoints` | **每 run 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestCheckpoint` 无参数、只读最新（唯一消费者），覆盖写天然无积累 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
 | `usage_ledger` / `audit_log` | 永久保留，只追加 | 记账与审计语义（规格 §14 看板/对账）；量小（每 run 数行 / 每请求一行） |
 | `port_allocations`（released） | reaper 定期硬删 `released_at` 过期的记录（规格 §8.2） | 历史归属信息已由 `audit_log`（`port.allocate` / `port.release` 动作）承载 |
+| `tool_outputs` | 随 run 生命周期保留（`run_id` 归属）；`body` 靠 TOAST 压缩吸收 | 阈值另存本就是为把大 payload 移出 `run_events`；行数 = 超阈值的工具调用数（topology.md §9） |
 
 **运维注记**：
 
@@ -288,7 +409,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 项 | 口径 |
 |---|---|
-| 最小粒度 | **一 run 一条**（`source='erix'`）：runner 在 `run_end` 时以 `onUsage` 汇总落 `input_tokens / output_tokens`；`user_id / project_id` 由 `run → session → project` 推导后**冗余落列**（聚合免 join） |
+| 最小粒度 | **一 run 一条**（`source='erix'`）：worker 在 run 结束时以引擎返回值汇总，随终态载荷经 internal API 上报（portal.md §9 I8），**portal 落** `input_tokens / output_tokens`；`user_id / project_id` 由 `run → session → project` 推导后**冗余落列**（聚合免 join） |
 | `day` | UTC 日历日，写入时计算，聚合冗余维度（按日看板/限额） |
 | 双源对账 | 规格 §11.4「网关 usage 与 erix onUsage 两套数都要记」：网关侧按 `key_alias + day` 聚合周期拉取落 `source='gateway'` 行（`run_id` 为 NULL——每 FDE 一把 key 时网关只知道 key 不知道 run）；**差异 = judge/fold 的额外调用 + 丢失事件**，供对账看板 |
 | 成本归属 | 按 `project_id`（≈ 客户项目，规格 §11.3「业务口径：网关不知道 FDE→客户项目这层映射，portal 补」） |
@@ -308,3 +429,6 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | 4 | `port_allocations` `allocated → active` 触发条件 | runner 上报监听 / 首次授权访问，先到者 | §2.2（不影响转发语义） |
 | 5 | 三表「不混」的 DB 角色分离（GRANT 强制） | P1 靠写入路径约定，P2 拆角色 | §3-4（实现注记，不影响 schema） |
 | 6 | 规格 §9.3「本地 file 优先 + DB 异步复制」store 装饰器 | 规格为「强烈建议」 | §1.11（影响 `checkpoint_failed` 频率，不影响表结构） |
+| 7 | `tool_outputs` 阈值（bytes） | 未定（建议如 4KB/8KB） | §1.19；决定「事件里放 digest、全文落表」的边界 |
+| 8 | `route_outbox` 聚合类型枚举（`port_allocation`/`llm_binding`/…） | 实现时定全量清单 | §1.18；reconciler debounce/SLO 已定（topology.md §8），枚举待补 |
+| 9 | `fde_networks` 复用前「腾行」的精确做法 | `DELETE` 已释放行 vs 保留并改 `subnet`；历史由 `audit_log` 承载 | §1.17（`UNIQUE(subnet)` 全局唯一所致） |

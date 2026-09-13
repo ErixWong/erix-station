@@ -16,7 +16,7 @@
 | 项 | 取值 | 来源 |
 |---|---|---|
 | Base URL | `https://<PORTAL_HOST>`（`PORTAL_HOST = station.<BASE_DOMAIN>`，如 `https://station.erix.vip`） | env §1/§10 ⚠️ 待决策者确认 |
-| 服务监听 | `station-portal:8080`，仅 `edge`/`control` docker 网络内，不 publish 宿主机 | 规格 §5.3 / §6.4（规格自身取值，与环境无关） |
+| 服务监听 | portal 容器内 `:8080`，publish **仅 `127.0.0.1:8080`（宿主回环）**，由 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN | 规格 §5.3 / §6.4 / topology.md §2.2 |
 | 字符集 / 格式 | 全部 `application/json; charset=utf-8`（SSE 端点除外） | — |
 | 时间格式 | ISO 8601 UTC（如 `2026-09-12T08:30:00.000Z`） | — |
 | ID 约定 | `run_id` 用 **UUID**（规格 §9.3：不要 cwd 派生）；其余 ID 为不透明字符串，前端不得解析其结构 | 规格 §9.3 |
@@ -51,6 +51,8 @@
 | 审批 | `POST /api/approvals/:id` | 审批决定 |
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
+>
+> 容器 → portal 的内部端点（`/api/internal/*`）见 §9（经 Traefik：`https://station.<base>/api/internal/*` + 来源 ipAllowList，H-B 定稿 D-5），不属上表。
 
 ---
 
@@ -335,7 +337,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 ### 3.6 `DELETE /api/projects/:id`
 
-响应 `204`。删除 = 回收该项目全部端口 + 删除 Traefik 路由（同一事务，规格 §8.2）+ 项目归档。
+响应 `204`。删除 = 回收该项目全部端口（`state → released`）+ 写 route outbox tombstone（同一 DB 事务，规格 §8.2）+ 项目归档；Traefik 路由由 file provider **异步、幂等**发布删除（「路由表里没有 = 不可达」）。
 错误：`409 active_runs` —— 项目下有进行中的 run，须先停止。
 
 ---
@@ -666,16 +668,16 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 ### 6.3 容器不可达 → `container_unreachable`（503）
 
-portal → FDE 容器走 `http://fde-<name>:3000`（control 网络，Bearer per-container token，规格 §5.3/§10.3）。容器下线/崩溃/网络不通时：
+平台通道**全出站**（H-B D-5，issue #5）：portal **不主动连接容器**；容器「在线」以 agentd 心跳为证明（15s 心跳，连续 3 次丢失 ≈45s 判 `exited`，runner §4.2）。容器下线/崩溃/网络不通时：
 
 | 端点 | 表现 |
 |---|---|
-| `POST /api/sessions/:id/messages` | `503 container_unreachable`，`retryable: true`。**不产生** message/run 记录（fail-fast，避免「消息发出去了但没执行」的假象） |
+| `POST /api/sessions/:id/messages` | 拉模型为终态（runner §4）：消息落库即 `202`，不依赖容器在线（容器恢复后自行 claim）；仅 push 下发（⚠️ 待决策者确认）时同步依赖可达，失败返回 `503 container_unreachable`（`retryable: true`）且**不产生** message/run 记录 |
 | `POST /api/sessions/:id/stop` | 仍返回 `200`：`cancel_requested_at` 是 DB 标记（规格 §10.3），容器恢复后 runner 轮询到即终止；不因此报错 |
-| `POST /api/projects`（需落 `ports.json`） | `503 container_unreachable`，整个事务回滚（端口分配与容器内 JSON 不脱节） |
+| `POST /api/projects`（写 `ports.json`） | **不依赖容器网络**：portal 直写宿主 bind mount（H-B D-6，issue #7），不受容器在线影响 |
 | SSE / GET 类 | 不受影响——事件与状态都在 DB（原理三），容器死了历史照样可看 |
 
-⚠️ 待决策者确认：任务下发单机可先用 push、拉模型（长轮询领 `run_queue`）为终态（规格 §10.3）。**pull 模型落地后**，`POST .../messages` 不再同步依赖容器可达——消息落库即 `202`，容器恢复后自行领取；上表第一行随之退化为「仅 push 模式适用」。契约的响应 schema 不变，仅错误出现条件变化。
+⚠️ 待决策者确认：任务下发单机可先用 push、拉模型（长轮询领 `run_queue`）为终态（规格 §10.3）。本表第一行按**拉模型（终态）**描述——消息落库即 `202`、不依赖容器在线；仅在实现为 push 下发时 `POST .../messages` 才同步依赖容器可达（上表「仅 push 下发」分支）。契约的响应 schema 不变，仅错误出现条件变化。
 
 ### 6.4 run 级错误码汇总（`run.error.code` / `run_end.error.code`）
 
@@ -710,3 +712,398 @@ portal → FDE 容器走 `http://fde-<name>:3000`（control 网络，Bearer per-
 2. SSE mock：按 §5.3 清单逐类型发事件，`id` 递增；模拟断线后带 `Last-Event-ID` 重连，验证补发不漏（P2 验收的前端半边）。
 3. `messages.synthetic: true` 的消息必须有独立视觉标记（规格 §9.2 红线）。
 4. 预览 URL 一律取 `PortAllocation.url` 字段，禁止拼接域名（规格 §8.1 同源原则）。
+
+---
+
+## 9. 内部端点（internal）：容器 → portal
+
+> 本节的唯一事实来源是 [`../design/runner-integration.md`](../design/runner-integration.md)（下称「runner §x」）§4（portal ↔ agentd 协议）、§7（事件批量与 seq）、§9（store adapter 契约）、§11（凭据模型）；配套数据表见 [`../data/schema.sql`](../data/schema.sql)（`run_events.client_event_id`、`run_queue` 租约字段、`run_checkpoints` 单行、`transcript_rounds.record`）与[规格](../design/fde-platform.md) §10.3。端点编号 U1–U12 与 runner §4.2 一一对应。
+
+三条要点：
+
+- **经 Traefik 暴露给容器（H-B D-5，issue #5）**：本节端点经 `https://station.<base>/api/internal/*` 可达——容器内把 `station.<base>` 解析到本 FDE 的 bridge 网关 IP（`--add-host`），Traefik(host:443) 以 `ipAllowList(10.200.0.0/16)` 限源后回环到 portal `127.0.0.1:8080`（topology.md §4-L3/§5）。portal 对 `/api/internal` 前缀不做 forwardAuth（鉴权靠 per-container token，审计由端点自身写 `audit_log` 关键动作）。调用方只有 FDE 容器内的 `station-agentd`（runner §4.1）。
+- **认证**：每个请求 `Authorization: Bearer <per-container token>`。token 建容器时由 portal 生成、存 DB（`containers.runner_token`）、注入容器 env `ERIX_STATION_TOKEN`，**仅 agentd 持有**（fork worker 时从 env 剔除，runner §3）。portal 由 token 解出 `container_id` / `user_id`，后续所有 `:id` 资源校验归属该容器——**token 只能操作本 FDE 的资源，越权一律 404/403**（与 §1.2 同口径：不泄露存在性）。
+- **背景**：容器**不直连 DB**——所有平台状态写入（事件 / transcript / checkpoint / 用量 / 审批 / 状态收敛）都经本节端点由 portal 落库，Postgres 的业务写方只有 portal（决策者 2026-09，issue #3 评论，D1'/D2'）。本设计取代原「容器写 DB + portal 推容器 :3000」方案（runner §11.2：容器零监听、零入站）。
+
+**与公开端点章节的关系**：§0.1 清单的公开端点面向**浏览器 + session cookie**（§2.5）；本节 internal 端点面向**容器 + per-container token**——两套认证不互通，session cookie 不能调 internal 端点，per-container token 也不能调公开端点。
+
+### 9.1 总览
+
+| 项 | 取值 |
+|---|---|
+| Base URL | `https://station.<base>/api/internal`（容器内 `--add-host station.<base>:<本 FDE 网关 IP>`，经 Traefik host:443，H-B D-5） |
+| 认证头 | `Authorization: Bearer <per-container token>`（每请求） |
+| 租约凭证头 | `X-Claim-Token: <claim_token>`——claim 之后的 run 级写端点（U2/U3/U5–U12）携带；portal 校验「该 run 当前有效租约 = 此 token」，不匹配 → `409 lease_lost`（防 re-claim 后旧 agentd 双写，runner §4.2/§6.4） |
+| 长驻连接 | `GET .../stream`（SSE 下行，§9.12）+ 循环 `POST .../claim`（长轮询，§9.3）；其余为短请求 |
+| 语义基调 | **at-least-once + 幂等**：所有写端点携带客户端幂等键，portal 端 DB 唯一约束兜底；agentd 对所有 5xx/网络错误无限指数退避重试（§9.13） |
+
+### 9.2 端点清单
+
+| # | 方法 + 路径 | 用途 | 幂等 |
+|---|---|---|---|
+| U1 | `POST /api/internal/claim` | 领任务（长轮询，§9.3） | lease + `claim_token` |
+| U2 | `PUT /api/internal/runs/:id/state` | run 状态收敛（markRunState + 终态，§9.6） | 终态不可变，重复提交返回首次结果 |
+| U3 | `POST /api/internal/runs/:id/events` | 事件批量上报（§9.4） | `client_event_id` 唯一 |
+| U4 | `POST /api/internal/heartbeat` | 心跳 + 租约续期 + stop 兜底轮询（§9.5） | 天然幂等（覆盖写） |
+| U5 | `PUT /api/internal/runs/:id/transcript/rounds/:round` | store：`appendRound`（§9.7） | `UNIQUE(run_id, round)` + `dedupKey` |
+| U6 | `GET /api/internal/runs/:id/transcript` | store：`load`（§9.7） | 只读 |
+| U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall`（§9.7；P1 可 501） | 只读 |
+| U8 | `PUT /api/internal/runs/:id/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint`（§9.8） | 单行覆盖写 |
+| U9 | `GET /api/internal/runs/:id/checkpoint/latest` | store：`loadLatestCheckpoint`（§9.8） | 只读 |
+| U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单（§9.10） | 一个工具调用至多一单 |
+| U11 | `GET /api/internal/approvals/:id` | 审批决定轮询兜底（§9.10） | 只读 |
+| U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（§9.11） | 重复 release 返回首次结果 |
+| — | `GET /api/internal/stream` | SSE 下行通道（§9.12） | — |
+
+> usage **不单设端点**：随 U2 终态载荷上报（§9.9）。
+
+### 9.3 `POST /api/internal/claim`（U1：领任务，长轮询）
+
+请求：
+
+```json
+{ "capacity": 2, "hold_ms": 30000 }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `capacity` | agentd 当前可再接收的 run 数（并发上限默认 4 ⚠️，runner §13）；portal 一次至多派发 `capacity` 条（契约按单条设计，响应数组为兼容扩展） |
+| `hold_ms` | 长轮询挂起时长，**上限 30s** ⚠️（runner §4.2） |
+
+响应 `200`（领到任务，返回 ticket）：
+
+```json
+{
+  "queue_id": "q_91",
+  "claim_token": "ct_3f8a...",
+  "lease_expires_at": "2026-09-12T09:01:31.000Z",
+  "run": {
+    "id": "9d3b2f1e-7c4a-4e2b-9f0a-1c2d3e4f5a6b",
+    "session_id": "s_3kd9",
+    "project": { "name": "proj1", "root_path": "~/projects/proj1" },
+    "task": "把登录按钮改成品牌色",
+    "message_id": "m_552",
+    "model": "claude-sonnet",
+    "resume": false,
+    "attachments": []
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `claim_token` | 本次认领的凭证；后续该 run 的写端点经 `X-Claim-Token` 头携带（§9.1）。re-claim 后旧 token 失效 |
+| `lease_expires_at` | 租约到期时刻（lease 90s ⚠️）；对应 `run_queue.lease_until` 列（schema.sql） |
+| `run.task` | 本轮用户输入，worker 必须显式传给引擎（runner §6.3） |
+| `run.resume` | `true` = re-claim 场景，引擎从 checkpoint 恢复（runner §6.3-5） |
+
+响应 `204`：**hold 超时仍无任务**（无响应体）；agentd 立即发起下一次 claim。
+
+派单与挂起语义（runner §4.2）：
+
+- 有 `pending` 行：`SELECT ... FOR UPDATE SKIP LOCKED` → `status='claimed'`、`claimed_at=now`、`lease_until=now+90s`、`attempts++`，发 `claim_token`。
+- 无 `pending` 行：挂起连接（**不持有事务/锁**）；portal 在 `POST /messages` 入队后 `NOTIFY run_queue`（或单节点进程内事件）唤醒挂起的 claim 再查一次；到 `hold_ms` 仍无 → `204`。
+- SSE `run_assigned` 只是**唤醒 hint**，不携带权威载荷——hint 到达时任务可能已被其他 capacity 领走，载荷以 claim 响应为准（§9.12）。
+
+> ⚠️ 命名对齐项：runner §4.2 文中租约字段写作 `lease_expires_at`，schema.sql 已落地列名为 `lease_until`；API 载荷字段名以 runner §4.2 为准，列名差异见 runner §16.2-R5 修订项。
+
+错误：`401 token_invalid / token_revoked`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
+
+### 9.4 `POST /api/internal/runs/:id/events`（U3：事件批量上报）
+
+请求：
+
+```json
+{
+  "batch_id": "b_20260912-0007",
+  "events": [
+    {
+      "client_event_id": "9d3b2f1e-...:42",
+      "type": "assistant_delta",
+      "ts": "2026-09-12T09:00:02.130Z",
+      "payload": { "text": "好的" }
+    },
+    {
+      "client_event_id": "9d3b2f1e-...:43",
+      "type": "tool_use",
+      "ts": "2026-09-12T09:00:02.410Z",
+      "payload": { "tool_call_id": "tc_301", "name": "bash", "input": { "command": "pnpm test" } }
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `batch_id` | 批次标识（agentd 生成，供日志/排障关联）；**幂等键是逐事件的 `client_event_id`，不是 batch_id** |
+| `events[].client_event_id` | 客户端幂等键，`run_id + ":" + 单调计数`（worker 生成）；portal 端 `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING` |
+| `events[].type` | 事件类型，清单同 §5.3（portal 原样透传落 `run_events`） |
+| `events[].ts` | 事件产生时间（ISO 8601 UTC） |
+| `events[].payload` | 类型特有字段（对应 §5.3 信封内层） |
+
+批量参数（runner §7.2）：**250ms 或 2KB 先到者触发** ⚠️；单批上限 200 条 / 256KB，超出切多批顺序发送；单 run 内严格按 `client_event_id` 递增，批量不重排。
+
+响应 `200`：
+
+```json
+{ "stored": 98, "seq_first": 1001, "seq_last": 1098 }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `stored` | **实际插入**条数。批次中已存在（重复）的 `client_event_id` 被跳过、不计入——**部分重复时响应仍为 `200`，`stored` 小于请求条数属正常幂等命中，不是错误**；agentd 收到 `200` 即确认整批、从缓冲删除 |
+| `seq_first` / `seq_last` | 本批新插入事件分配到的 seq 区间。seq 由 portal 在**同一事务**内 `chat_sessions.last_seq` 逐条 +1 分配（`UNIQUE(session_id, seq)` 兜底）；**seq 只在 portal 产生，worker/agentd 永不自造** |
+
+幂等与重试（runner §7.3）：**at-least-once**——agentd 只有收到 `200` 才确认删除；任何失败重试**整批**，重复批次安全。
+
+### 9.5 `POST /api/internal/heartbeat`（U4：心跳 + 租约续期）
+
+请求（间隔 **15s** ⚠️）：
+
+```json
+{
+  "agent_version": "0.1.0",
+  "runs": [
+    { "run_id": "9d3b2f1e-...", "status": "running", "worker_pid": 1234 }
+  ]
+}
+```
+
+响应 `200`：
+
+```json
+{ "now": "2026-09-12T09:00:15.000Z", "stop_run_ids": [ "9d3b2f1e-..." ], "revoked": false }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `stop_run_ids` | portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run——**停止指令的兜底通道**（SSE 为主、心跳为备）；agentd 对列出的 run 执行 abort |
+| `revoked` | `true` = token 已吊销 / 容器被 offboard → agentd 停止领新任务、收敛在跑 run 后退出 |
+
+语义：portal 对请求中每个 claimed run 续租（`lease_until = now + 90s` ⚠️）。portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**；run 级处置走租约到期 re-claim（runner §6.4）。
+
+幂等：天然幂等（覆盖写 `last_heartbeat`、续 lease）。
+
+### 9.6 `PUT /api/internal/runs/:id/state`（U2：run 状态收敛）
+
+同一端点覆盖 store `markRunState`（非终态）与 run 终态收敛（runner §4.2 / §9.1）。
+
+**非终态（markRunState）**——请求：
+
+```json
+{ "state": "running" }
+```
+
+响应 `200`。幂等：覆盖写 `runs.status`。
+
+**终态收敛**——请求：
+
+```json
+{
+  "state": "finished",
+  "termination": { "reason": "end_turn" },
+  "usage": { "input_tokens": 15230, "output_tokens": 2104 },
+  "rounds": 3,
+  "final_text": "已完成：登录按钮已改为品牌色……",
+  "error": null
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `state` | `finished` \| `failed` |
+| `termination` | 引擎 `runToolLoop` 返回值透传，对象 `{reason, detail?}`，`reason` 取值集合见 §4.1 |
+| `usage` | 整 run 用量汇总；portal 同事务写 `runs.usage` + `usage_ledger`（`source='erix'`，一 run 一条，`UNIQUE(run_id, source)`）——见 §9.9 |
+| `rounds` / `final_text` | 轮数与 assistant 最终文本；portal 同事务回写 `messages` assistant 行 |
+| `error` | 失败时 `{code, message, retryable}`（run 级错误码见 §6.4）；成功为 `null` |
+
+响应 `200`（portal 终态事务：runs 置终态 + `run_queue → done/cancelled` + messages 回写 + usage_ledger，runner §6.1）。
+
+幂等：**终态不可变**——重复提交返回首次结果。
+
+> **顺序约束（runner §7.4）**：终态收敛**必须在该 run 全部事件批被 `200` 确认后才发送**——否则前端会先见 `run_end` 再收到补发事件，破坏 seq 单调体验。
+
+### 9.7 transcript rounds（U5/U6/U7）
+
+store adapter 契约（runner §9.1）的落库端点；`transcript_rounds.record` 存上游 RoundRecord 全量原样，`messages` / `folded_payload` 为派生加速列（schema.sql）。
+
+#### `PUT /api/internal/runs/:id/transcript/rounds/:round`（U5：appendRound）
+
+请求体为 RoundRecord：
+
+```json
+{
+  "dedupKey": "9d3b2f1e-...:r3",
+  "folded": false,
+  "messages": [
+    { "role": "user", "content": "把登录按钮改成品牌色" },
+    { "role": "assistant", "content": "好的……" }
+  ],
+  "foldedPayload": null
+}
+```
+
+响应 `200`：
+
+```json
+{ "inserted": true }
+```
+
+幂等：**按 round 幂等**——`UNIQUE(run_id, round)` + body 带 `dedupKey` 双保险；命中冲突 → `200 { "inserted": false }`（对齐上游 dedupKey 语义）。worker 每轮只 append 一次，重试以同参数重发，安全。
+
+fold 语义（runner §9.3）：`folded` 行与原始行共享 `(run_id, round)` 键空间——fold 后原轮走 `UPDATE`（`folded=true` + `folded_payload`），**不插新行**，档案完整不删。
+
+#### `GET /api/internal/runs/:id/transcript`（U6：load）
+
+响应 `200`：
+
+```json
+{ "records": [ { "dedupKey": "...", "folded": false, "messages": [ ... ], "...": "..." } ] }
+```
+
+按 round 升序，`record` 列原样返回。只读。
+
+#### `GET /api/internal/runs/:id/transcript/recall`（U7：recall）
+
+query：`from_round` / `to_round` / `pattern`。
+
+响应 `200`：
+
+```json
+{ "text": "……命中的档案原文（含 folded_payload，折叠原文同属档案）……" }
+```
+
+只读。
+
+> ⚠️ **P1 可暂未实现本端点**：此时返回 `501`，错误码 `not_implemented`（`retryable: false`），容器侧 recall 工具降级为不可用；契约形状保留，后续分期补齐。
+
+### 9.8 checkpoint（U8/U9）
+
+#### `PUT /api/internal/runs/:id/checkpoint`（U8：saveCheckpoint / appendCheckpoint）
+
+请求：
+
+```json
+{
+  "seq": 7,
+  "snapshot": { "round": 3, "executedToolIds": [ "..." ], "...": "上游 checkpoint 快照原样" }
+}
+```
+
+响应 `200`。
+
+幂等：**单行覆盖语义**——`run_checkpoints` 每 run 单行（`run_id` 主键，schema.sql），`INSERT ... ON CONFLICT (run_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = now()`；对齐上游 tmp+rename 原子覆盖，**重试同一快照安全**。`seq` 由 worker 单调计数（每 run 从 0 递增），供调用方侧记录次序。
+
+> ⚠️ 对齐项：runner §9.1 描述为 `UPSERT (run_id, seq)`（按 seq 多行），schema.sql 已落地为**每 run 单行**（无 `seq` 列、`ON CONFLICT (run_id)`，对齐上游「saveCheckpoint 覆盖写单份、loadLatestCheckpoint 无参数」）。两者「覆盖写、重试安全」语义一致；存储粒度以 schema.sql 为准，差异列入 runner §16.2 修订清单。
+
+**重试要求**（runner §9.2，fail-closed 语义下的补偿，adapter 必须包 retry）：
+
+| 项 | 策略（⚠️ 参数待确认） |
+|---|---|
+| 重试次数 | 3 次（不含首次） |
+| 退避 | 1s → 2s → 5s（指数，±20% 抖动） |
+| 可重试错误 | 网络错误、5xx、429 |
+| 不可重试 | 4xx → 直接抛 |
+| 耗尽 | 错误透传引擎 → `checkpoint_failed` → run 失败（用户口径见 §6.2「进度未丢失，可重新发送继续」） |
+
+#### `GET /api/internal/runs/:id/checkpoint/latest`（U9：loadLatestCheckpoint）
+
+响应 `200`：
+
+```json
+{ "checkpoint": { "snapshot": { "...": "..." }, "updated_at": "2026-09-12T09:00:10.000Z" } }
+```
+
+无 checkpoint → `204`（adapter 返回 `undefined`）。只读。
+
+### 9.9 usage 上报
+
+**不单设端点**（runner §4.2）：run 用量随 §9.6 终态载荷（`usage`）上报，portal 同事务写 `runs.usage` + `usage_ledger`（`source='erix'`，一 run 一条，`UNIQUE(run_id, source)`，model.md §1.14）。网关侧用量由 portal 定期从 LLM 网关拉取落 `usage_ledger`（`source='gateway'`，规格 §11.4），不经过容器。
+
+### 9.10 审批（U10/U11）
+
+#### `POST /api/internal/runs/:id/approvals`（U10：创建审批单）
+
+请求：
+
+```json
+{
+  "tool_call_id": "tc_301",
+  "round": 4,
+  "name": "bash",
+  "input_digest": "rm -rf node_modules && pnpm install"
+}
+```
+
+响应 `201`：
+
+```json
+{ "approval_id": "ap_77" }
+```
+
+幂等：**一个工具调用至多一单**（`approvals.tool_call_id UNIQUE`，schema.sql）；同 `tool_call_id` 重复创建 → portal 返回原单 `200 { "approval_id": "ap_77" }`（agentd 重启 re-claim + resume 后再次执行到同一工具的场景，runner §10.2）。
+
+#### `GET /api/internal/approvals/:id`（U11：结果轮询兜底）
+
+响应 `200`：
+
+```json
+{
+  "status": "approved",
+  "decided_by": "u_alice",
+  "decided_at": "2026-09-12T09:06:00.000Z",
+  "note": "可选备注"
+}
+```
+
+`status`：`pending` \| `approved` \| `denied`（pending 时后三个字段缺省）。只读。
+
+取决定与挂起语义（runner §10.1/§10.2）：
+
+- **双通道**：SSE `approval_decision` 为主（实时，§9.12）；worker 挂起期间 agentd 每 **5s** ⚠️ 轮询本端点兜底（SSE 断线时审批不卡死）。先到者生效。
+- **超时语义**：挂起 **10 分钟** ⚠️ 无决定 → agentd **本地按 denied 处理**（无需 portal 配合）；portal 侧审批单保持 `pending` 留痕——FDE 事后再点时 run 已继续，portal 接受决定、写审计，但不再下发（agentd 侧无等待者，忽略该 `approval_decision`，幂等）。
+- **拒绝语义**：denied 时 worker **不抛错**——把「该工具调用被 FDE 拒绝」作为 tool_result 文本返回引擎，由模型决定改道或收尾，避免一次拒绝炸掉整个 run。
+- 挂起期间心跳照常续租，run 不会被 re-claim。
+
+### 9.11 `POST /api/internal/runs/:id/release`（U12：主动放弃已领任务）
+
+claim 后准备工作（worktree 创建 / worker fork）失败时使用（runner §6.2）。
+
+请求：
+
+```json
+{ "reason": "worktree_failed" }
+```
+
+响应 `200`；portal 将 queue 行回 `pending`（`attempts < 3` 时重新被领）或 `cancelled`（attempts 耗尽 → runs `failed`）。
+
+幂等：重复 release 返回首次结果。
+
+### 9.12 `GET /api/internal/stream`（SSE 下行通道）
+
+常连；断线指数退避重连（1s→2s→5s→10s→30s 封顶）。事件类型表（runner §4.3）：
+
+| `event:` | 字段 | 语义 | agentd 动作 |
+|---|---|---|---|
+| `run_assigned` | `{run_id, queue_id}` | **唤醒 hint**：有新任务可领；**不携带权威载荷**（载荷以 claim 响应为准） | 若当前 claim 处于 hold 间隙则立即发起 claim |
+| `approval_decision` | `{approval_id, run_id, decision, note, decided_at}` | 审批结果**快通道** | resolve 对应 worker 的 await（§9.10） |
+| `stop_request` | `{run_id, reason}` | portal 已写 `cancel_requested_at`（§4.5），要求终止 | IPC `abort` → worker；若无此 run（已结束）忽略 |
+| `revoke` | `{reason}` | token 吊销 / 容器停用 | 停领新任务；在跑 run 继续到终态后退出 |
+| `ping` | `{ts}` | 15s 保活 | 更新「下行健康」标记；连续丢失触发重连 |
+
+### 9.13 错误码与重试策略（internal 通道）
+
+错误信封沿用 §1.1；下表为本通道特有 code（runner §4.5）：
+
+| HTTP | code | 含义 | agentd 处理 |
+|---|---|---|---|
+| 401 | `token_invalid` / `token_revoked` | token 错 / 吊销 | 停领新任务；`token_revoked` 时按 `revoke` 流程退出 |
+| 403 | `run_ownership_mismatch` | run 不属本容器 | 记日志告警（视为 bug/攻击），**不重试** |
+| 404 | `run_not_found` | run 不存在（已清理） | 停止相关上报，收敛本地状态 |
+| 409 | `run_terminal` | 向终态 run 写事件 / checkpoint / state | 幂等命中：**视为成功**（`stored` 语义），不再重试 |
+| 409 | `lease_lost` | `X-Claim-Token` 失效（run 已被 re-claim） | 本地 abort 该 run 的 worker（若还在跑），丢弃缓冲 |
+| 422 | `validation_failed` | 载荷不合法 | **不重试**，记错误日志（视为 bug） |
+| 429 | `rate_limited` | portal 自我保护 | 遵循 `Retry-After` 退避 |
+| 5xx（含 503）/ 网络错误 | — | portal/DB 抖动 | **无限指数退避重试**（1s→2s→5s→10s→30s 封顶，抖动 ±20%）；事件缓冲走背压与 spool（runner §7.4） |
+
+> ⚠️ 对齐项：本表 `422 validation_failed` 与 §1.2 公开端点的 `400 validation_failed` 取值不同；internal 通道以 runner §4.5 为准，两处口径统一列入后续修订。
