@@ -35,28 +35,62 @@
           view.innerHTML = '<p>已登录：<strong>' + esc(u.login) + '</strong>（' + esc(u.role) + fde + '，auth_source=' + esc(u.auth_source) + '）</p>' +
             '<button id="logout">登出</button>';
           document.getElementById('logout').onclick = async () => {
-            await fetch('/api/logout', { method: 'POST' });
+            await fetch('/api/auth/logout', { method: 'POST' });
             location.reload();
           };
           return;
         }
       } catch (e) { /* fall through to login form */ }
-      view.innerHTML = '<form id="login">' +
-        '<label>登录名 <input name="login" autocomplete="username"></label>' +
-        '<label>口令 <input name="password" type="password" autocomplete="current-password"></label>' +
-        '<button type="submit">登录</button>' +
+      renderLogin(view);
+    }
+
+    function renderLogin(view, pendingToken) {
+      if (!pendingToken) {
+        view.innerHTML = '<form id="login">' +
+          '<label>登录名 <input name="login" autocomplete="username"></label>' +
+          '<label>口令 <input name="password" type="password" autocomplete="current-password"></label>' +
+          '<button type="submit">下一步</button>' +
+          '<div id="err" class="err"></div>' +
+          '</form>' +
+          '<p class="muted">本地账号两步登录（口令 → TOTP）。开发期 COOKIE_PROFILE 见 .env。</p>';
+        document.getElementById('login').onsubmit = async (e) => {
+          e.preventDefault();
+          const f = e.target;
+          const r = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ login: f.login.value, password: f.password.value }),
+          });
+          if (r.status === 200) {
+            const data = await r.json();
+            if (data.status === 'totp_required') return renderLogin(view, data.pending_token);
+          }
+          document.getElementById('err').textContent = '登录失败（' + r.status + '）';
+        };
+        return;
+      }
+      view.innerHTML = '<form id="totp">' +
+        '<label>认证器 App 的 6 位验证码 <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>' +
+        '<button type="submit">验证并登录</button>' +
         '<div id="err" class="err"></div>' +
         '</form>' +
-        '<p class="muted">P1 walking skeleton：本地账号登录（开发期 COOKIE_PROFILE 见 .env）。</p>';
-      document.getElementById('login').onsubmit = async (e) => {
+        '<p class="muted">已校验口令；请输入 TOTP 验证码完成登录。</p>';
+      document.getElementById('totp').onsubmit = async (e) => {
         e.preventDefault();
         const f = e.target;
-        const r = await fetch('/api/login', {
+        const r = await fetch('/api/auth/login/totp', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ login: f.login.value, password: f.password.value }),
+          body: JSON.stringify({ pending_token: pendingToken, code: f.code.value }),
         });
-        if (r.ok) { location.reload(); } else { document.getElementById('err').textContent = '登录失败（' + r.status + '）'; }
+        if (r.ok) { location.reload(); return; }
+        if (r.status === 401) {
+          const data = await r.json().catch(() => ({}));
+          if (data.error && data.error.code === 'pending_expired') {
+            return renderLogin(view); // 待决令牌过期 → 重新走第一步
+          }
+        }
+        document.getElementById('err').textContent = 'TOTP 校验失败（' + r.status + '）';
       };
     }
     boot();

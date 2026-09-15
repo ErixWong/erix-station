@@ -28,12 +28,14 @@
 | 服务 | 镜像 | tag pin 要求 | command（ENTRYPOINT/CMD） | 运行用户 | restart | 部署期 |
 |---|---|---|---|---|---|---|
 | `station-edge`（Traefik） | `TRAEFIK_IMAGE`（官方 `traefik:v3`） | 生产 `traefik:v3.<minor>.<patch>` **再 pin digest**（env §10 ⚠️） | `traefik --configFile=/etc/traefik/traefik.yml`（静态配置见 §4） | **root**（官方镜像默认；需绑 80/443 与写 `acme.json`） | `unless-stopped` | P1 ✅ |
-| `station-portal` | `PORTAL_IMAGE`（自构建，build context `portal/`） | `erix-station/portal:<git-sha>` 不可变 tag，部署时 pin digest | `station-portal serve`（零依赖 Node，Q7 倾向 (a)） | **root（UID 0）**（materializer 需 chown 工作区、写 Traefik 动态配置 600、经 socket-proxy 调 Docker API，user-space §6.1 `PORTAL_RUNTIME_UID=0`） | `unless-stopped` | P1 ✅ |
+| `station-portal` | `PORTAL_IMAGE`（自构建，build context `portal/`） | `erix-station/portal:<git-sha>` 不可变 tag，部署时 pin digest | `node portal/src/cli.js serve`（零依赖 Node，Q7 倾向 (a)） | **P1 skeleton：`node`（非 root，UID 1000，`USER node`）**，compose 加固 `no-new-privileges` + `cap_drop: [ALL]`；⚠️ WP2 起 materializer 需 chown 工作区、写 Traefik 动态配置 600、经 socket-proxy 调 Docker API → 需 root（user-space §6.1 `PORTAL_RUNTIME_UID=0`），届时再切回 | `unless-stopped` | P1 ✅ |
 | `station-db` | `DB_IMAGE`（官方 `postgres:16`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
-| `station-docker-socket-proxy` | `SOCKET_PROXY_IMAGE`（`tecnativa/docker-socket-proxy`） | digest pin（env §10 ⚠️） | 官方默认入口 | 官方默认（非 root 或受 `no-new-privileges` 约束，见 §5） | `unless-stopped` | P1 ✅ |
+| `station-docker-socket-proxy` | `SOCKET_PROXY_IMAGE`（`tecnativa/docker-socket-proxy:v0.5.0`） | 生产 digest pin（env §10 ⚠️）；P1 开发 pin patch tag `v0.5.0` | 官方默认入口（haproxy） | 官方默认（root，受 `no-new-privileges` + `cap_drop: [ALL]` + `read_only` 约束；白名单仅 `CONTAINERS=1`/`NETWORKS=1` + `POST=0` **只读**，`/var/run/docker.sock` 只挂到本服务，见 §5） | `unless-stopped` | P1 ✅ |
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
 | `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
 
+> **P1 `MIGRATE_ON_START=0`**：baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（`deploy/db-init/00-init.sh`，超级用户，空数据目录时）完成一次，portal 运行时以 `station_portal` 启动、不重复跑 superuser bootstrap；首个增量迁移出现时以 `station_platform`（`MIGRATE_DATABASE_URL`）跑（§3）。
+>
 > **镜像预拉取**：portal **不授 IMAGES**（socket-proxy 白名单仅 CONTAINERS/NETWORKS，§5）。FDE 镜像由**宿主在部署时 `docker pull`** 预拉取（版本 pin 走 `containers.agent_version` + canary，规格 §14）；镜像升级 = 宿主预拉新 digest + 重建容器，不经过 portal 的 Docker API。
 >
 > **LLM 网关（P3，不入 P1 compose）的字段契约**：`llm-gateway` 接 `backend` 网络，**数据面 publish 仅 `127.0.0.1:4000`（回环，供 Traefik `llm.<base>` 路由回环访问）；admin 面不发布**（仅 `backend` 内可达，topology §6 第 6 条 / env §5）。Q1（公司是否已有网关）未定 → 已有则复用、不部署本容器；没有则 P3 起一个 LiteLLM 容器，portal 仍只做租户绑定（规格 §11.3）。
@@ -60,7 +62,7 @@
 |---|---|---|---|---|---|---|
 | `station-db` | `backend` | **无**（仅 backend 内可达） | `/docker/station-db/` → `/var/lib/postgresql/data`（RW，属主由 postgres 镜像初始化） | — | `pg_isready`（见下） | `/docker/station-db/.env.db`（600） |
 | `station-portal` | `backend` | **`127.0.0.1:8080:8080`**（回环，供 Traefik 反代 + forwardAuth） | ① `/srv/erix/users` → `/srv/erix/users`（RW，**同路径**，materializer 直写用户空间，user-space §2.2）；② `/docker/station-edge/dynamic/` → `/docker/station-edge/dynamic/`（RW，600 文件，**单一写方**，reconciler 写 Traefik 动态配置）；③ `/docker/station-edge/firewall/` → `/docker/station-edge/firewall/`（RW，600，reconciler 写 `rules.v4`）。**不挂整个 `/docker/station-edge`**（Traefik 静态配置 / `acme.json` / `logs/` 不挂给 portal）。portal 自身无持久卷（状态在 DB） | `station-db`（`condition: service_healthy`）+ `station-docker-socket-proxy`（`condition: service_started`） | `station-portal healthcheck`（见下） | `/docker/station-portal/.env.portal`（600） |
-| `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1 NETWORKS=1`，其余 0，见 §5） |
+| `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1`、`NETWORKS=1`、`POST=0`，其余 0，见 §5） |
 | `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `/docker/station-edge/traefik.yml` → `/etc/traefik/traefik.yml`（RO）；② `/docker/station-edge/dynamic/` → `/etc/traefik/dynamic/`（RO，**与 portal 共享宿主目录、Traefik 侧只读**）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，**仅 Traefik 读写、不挂给 portal**）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW，**仅 Traefik、不挂给 portal**） | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**） |
 
 ### 2.3 healthcheck 命令与阈值（写死）
@@ -76,8 +78,16 @@
 
 ### 2.4 `env_file` 约定与凭据注入
 
-- 所有平台凭据（`DB_PASSWORD`、runner token 生成、OIDC client secret、DNS-01 token、ACME 凭据）一律经 `env_file` 指向宿主 **600 权限文件**（`/docker/<名称>/.env.<名称>`），**不进 compose 正文、不进仓库**（项目 AGENTS.md §6，env §6）。
-- `DB_PASSWORD` 部署时生成存凭据文件 600（env §10）；portal 运行时角色 `station_portal`（最小 GRANT）、迁移角色 `station_platform`（DDL 专用，model §3）。
+- **P1 落地**：`deploy/docker-compose.yml` 经 **`deploy/.env`（600 权限，不入库）** 的 compose 变量插值注入全部环境变量；**口令不写死、不进 compose 正文、不进仓库**（`deploy/.env.example` 只含占位 `change-me-dev-only`）。部署期可再把凭据拆到宿主 600 文件（`/docker/<名称>/.env.<名称>`）由 `env_file` 引用（项目 AGENTS.md §6，env §6）。
+- **portal 的三个连接身份（口令均经 600 权限 `deploy/.env` 注入）**：
+
+  | 身份 | 环境变量 | 角色 | 用途 |
+  |---|---|---|---|
+  | 运行时 | `DATABASE_URL` | `station_portal`（最小 DML GRANT） | portal 业务读写 |
+  | 迁移 | `MIGRATE_DATABASE_URL` | `station_platform`（DDL/表 owner） | 增量迁移 `deploy/migrations/*.sql` |
+  | bootstrap | `BOOTSTRAP_DATABASE_URL` | 超级用户（`POSTGRES_USER`） | schema.sql/bootstrap.sql 的角色/授权/ownership（仅 bootstrap 步骤用） |
+
+- `DB_PASSWORD`（超级用户 `POSTGRES_PASSWORD`）部署时生成、存 600 权限 `deploy/.env`（env §10）；生产环境所有 `change-me-dev-only` 占位必须改掉。
 - LLM 虚拟 key **不进任何 env_file/容器**：真实 key 只存在于 portal 经 reconciler 写出的宿主 Traefik 动态配置（600，portal 可写、Traefik 只读，topology §6 第 8 条）。
 
 ---
@@ -86,8 +96,10 @@
 
 ### 3.1 谁执行、怎么幂等
 
+> **P1 实际执行方（与 `deploy/db-init/00-init.sh` 对齐）**：P1 walking skeleton 下 baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（空数据目录时，超级用户）完成一次，portal 以 `MIGRATE_ON_START=0` 启动、不重复跑 superuser bootstrap。`00-init.sh` 顺序：① 应用 `schema.sql`（baseline）→ ② `ALTER ROLE ... PASSWORD` 设 `station_platform`/`station_portal` 口令（来自 600 权限 `deploy/.env`）→ ③ 回填 baseline 哨兵 checksum 为真实 `sha256(schema.sql)` → ④ 应用 `bootstrap.sql`（schema 授权 + 表/序列 ownership 归正到 `station_platform`）→ ⑤ 收紧跨库 CONNECT。
+
 - **baseline = [`../data/schema.sql`](../data/schema.sql)**（可执行建表 DDL，单事务 `BEGIN;…COMMIT;`，**自包含**：开头幂等创建 `station_platform` / `station_portal` 两个角色，空库 `psql -f` 可单独执行，不依赖 bootstrap）。
-- **migration runner**：portal 在**启动时、监听端口之前**先跑迁移（或用独立一次性 `station-migrate` 命令，实现任选，语义一致）。迁移角色 `station_platform`（DDL），运行时角色 `station_portal`（DML 最小 GRANT）。
+- **migration runner**：`portal/src/migrate.js` 以 advisory lock 串行化，按序应用 baseline → bootstrap → `deploy/migrations/*.sql`（文件名升序），幂等、失败可恢复。**P1 默认 `MIGRATE_ON_START=0`**（baseline/bootstrap 已由 db-init 完成）；当 `MIGRATE_ON_START=1` 时 portal 在**监听端口之前**跑迁移，迁移角色 `station_platform`（DDL），运行时角色 `station_portal`（DML 最小 GRANT）。
 - **幂等**：新增 `schema_migrations` 表（`version text PK, checksum text, applied_at timestamptz DEFAULT now()`）。每个迁移文件在**单事务**内执行，成功后插入 `schema_migrations` 行；已存在的 `version` 跳过。`schema.sql` 作为 `version='0000_baseline'` 只在空库首次应用（已有 `schema_migrations` 则不再重放 baseline）。
 - **顺序**：baseline → `deploy/migrations/0001-*.sql` → `0002-*.sql` …（文件名编号升序）。每次新增 DDL 都写成新编号迁移文件，**不修改已应用的迁移**（改历史迁移会破坏 checksum 一致性）。
 
@@ -100,8 +112,8 @@
 
 ### 3.3 `docs/data/schema.sql` 的应用方式
 
-- **空库**：可直接以超级用户（POSTGRES_USER）执行 `psql -f docs/data/schema.sql`（自包含：开头幂等创建角色 → 建表 → 落 `0000_baseline` → 授最小 DML GRANT），记录 `0000_baseline`。
-- **生产**：迁移 runner 以 `station_platform` 角色执行 `psql -f docs/data/schema.sql`（等价单事务 baseline）；随后（或按需）以超级用户执行 `docs/data/bootstrap.sql` 做环境特有附加初始化（schema 级授权、口令、ownership 等，可重复执行）。
+- **空库**：P1 由 `deploy/db-init/00-init.sh`（超级用户）执行，顺序见 §3.1；也可手动以超级用户 `psql -f docs/data/schema.sql`（自包含：开头幂等创建角色 → 建表 → 落 `0000_baseline` → 授最小 DML GRANT），记录 `0000_baseline`。
+- **生产/P1**：baseline 由 db-init 超级用户完成；随后 `bootstrap.sql` 做 schema 级授权 + 表/序列 ownership 归正到 `station_platform` + 角色属性兑底（超级用户，可重复执行）；增量迁移以 `station_platform`（`MIGRATE_DATABASE_URL`）跑。
 - **已有库**：不重放 baseline；只按 `deploy/migrations/` 顺序补增量。
 - schema.sql 由文档→`deploy/` 的**生成/拷贝步骤**保持同步（schema.sql 是真相，`deploy/` 的 baseline 副本是部署产物；若将来拆分，以 `docs/data/schema.sql` 为准）。
 
@@ -187,11 +199,13 @@
 |---|---|
 | 镜像 | `SOCKET_PROXY_IMAGE` = `tecnativa/docker-socket-proxy`（digest pin，env §10 ⚠️） |
 | 挂载 | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） |
-| API 白名单 | `CONTAINERS=1`、`NETWORKS=1`，**其余全 0**（`IMAGES/EXEC/SYSTEM/AUTH/SECRETS/BUILD/COMMIT/PLUGINS/SWARM/INFO/VOLUMES/…`） |
-| 加固 | `--security-opt no-new-privileges`；官方默认非特权运行；不 publish、仅 `backend` 网络 |
+| API 白名单 | `CONTAINERS=1`、`NETWORKS=1`、`POST=0`，**其余全 0**（`IMAGES/EXEC/SYSTEM/AUTH/SECRETS/BUILD/COMMIT/PLUGINS/SWARM/INFO/VOLUMES/…`）；`POST=0` → **只放行 GET 类 Docker API，P1 portal 只读** |
+| 加固 | `--security-opt no-new-privileges` + `cap_drop: [ALL]` + `read_only`（`/tmp`、`/run`、`/var/lib/haproxy` 走 tmpfs）；不 publish、仅 `backend` 网络 |
 | portal 连接 | `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` |
 
-**白名单理由（每项都对应 portal 实际所需的最小面）**：
+> **P1 只读矩阵（portal 经 socket-proxy 实际可用的 Docker API）**：`POST=0` 下仅 `GET` 类调用生效——`/_ping`、`/version`、`/containers/json` 及 `CONTAINERS=1` 放行的读端点、`/networks` 及 `NETWORKS=1` 放行的读端点。**创建容器（`POST /containers/create`）与建网络（`POST /networks/create`）在 P1 不可用，归 ⚠️ WP2 交付**：WP2 需把 socket-proxy 白名单扩展为 `POST=1`（同时保持下方 B6 的创建字段 allowlist 收紧），portal 才能经 Docker API 创建 FDE 容器（§6）。
+
+**白名单理由（每项都对应 portal 实际所需的最小面；⚠️ P1 因 `POST=0` 只读，下列 create/start/stop/rm 与 network create 为 WP2 目标面，P1 仅 GET 类生效）**：
 
 - `CONTAINERS`：FDE 容器生命周期（create/start/stop/rm/inspect/ps）——portal 核心职责。
 - `NETWORKS`：FDE 网络生命周期（`network create --subnet` / inspect / ls / rm），onboarding/offboarding。
@@ -201,7 +215,7 @@
 - **不授 `SYSTEM`/`AUTH`/`SECRETS`**：防读宿主 docker 配置/凭据/secret。
 - **不授 `BUILD`/`COMMIT`**：防镜像篡改/逃逸面。
 
-> **参数级约束（B6：`CONTAINERS=1` 本身不等于「只能创建规定 FDE 容器」）**：真正的最小面不是 socket-proxy 的 API 白名单，而是 portal 在 `POST /containers/create` **之前**强制校验的**创建字段 allowlist（provisioning broker）**——
+> **参数级约束（B6：`CONTAINERS=1` 本身不等于「只能创建规定 FDE 容器」；⚠️ WP2 交付——P1 `POST=0` 只读、尚不创建容器）**：真正的最小面不是 socket-proxy 的 API 白名单，而是 portal 在 `POST /containers/create` **之前**强制校验的**创建字段 allowlist（provisioning broker）**——
 >
 > - **镜像**：只允许**预拉取的 `FDE_IMAGE` digest**（`image@sha256:…`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
 > - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
@@ -217,6 +231,8 @@
 
 ## 6. FDE 容器创建契约（portal 经 Docker API，模板化）
 
+> ⚠️ **WP2 交付**：P1 portal 经 socket-proxy 只读（`POST=0`），尚不能 `POST /containers/create`；本节字段级契约供 WP2 的容器创建实现照做（启用前需按 §5 扩展白名单 `POST=1`）。
+>
 > 路径/UID/权限的**完整契约**以 [`user-space.md`](user-space.md) 为准（本文 §6 引用、不重写）。以下字段级契约供 portal 的容器创建实现照做。
 
 ### 6.1 网络创建（显式 subnet）
@@ -276,8 +292,8 @@
 ### 7.1 P1 包含
 
 - **4 个 compose 服务**：`station-edge`（Traefik，host 网络）+ `station-portal` + `station-db` + `station-docker-socket-proxy`（§2）。
-- **单 FDE 容器**（含 `station-agentd`/`station-runner`/erix-agent），由 portal 经 Docker API 动态创建（§6）。
-- **登录**（本地账号 + argon2id + 强制 TOTP，bootstrap CLI，portal §2.9）、**项目列表/创建**（含项目级**单端口**分配 + `ports.json` 物化，规格 §8.2/§8.5）、**对话（SSE）**、**停止**。
+- **单 FDE 容器**（含 `station-agentd`/`station-runner`/erix-agent）⚠️ **WP2 交付**：FDE 容器的动态创建（portal 经 Docker API，§6）归 WP2——P1 portal 经 socket-proxy 只读（`POST=0`），尚不能创建容器。
+- **登录**（本地账号 + `crypto.scrypt` 口令哈希（P1 骨架，argon2id 待决策者确认后按自描述哈希平滑迁移，portal §2.9.4）+ 强制 TOTP，bootstrap CLI，portal §2.9）、**项目列表/创建**（含项目级**单端口**分配 + `ports.json` 物化，规格 §8.2/§8.5）、**对话（SSE）**、**停止**。
 - **internal API**（agentd ↔ portal 全出站通道）+ **防火墙应用**（§4.4）+ **DB 迁移**（§3）。
 - P1 验收 = 规格 §15 P1 行「登录→建项目→对话→工具卡片→停止」。
 

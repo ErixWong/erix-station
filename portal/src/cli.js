@@ -6,6 +6,7 @@ import { loadConfig } from './config.js';
 import { createPool } from './db.js';
 import { migrate } from './migrate.js';
 import * as auth from './auth.js';
+import * as totp from './totp.js';
 import { createServer } from './http.js';
 
 function usage() {
@@ -14,7 +15,7 @@ function usage() {
     'usage:\n' +
       '  cli.js serve\n' +
       '  cli.js migrate\n' +
-      '  cli.js bootstrap-admin --login <name> [--password <pw>] [--display-name <name>] [--allow-extra]\n' +
+      '  cli.js bootstrap-admin --login <name> [--password <pw>] [--display-name <name>] [--allow-extra] [--print-secret]\n' +
       '  cli.js healthcheck',
   );
 }
@@ -23,16 +24,20 @@ async function serve() {
   const config = loadConfig();
   const pool = createPool(config.databaseUrl);
   if (config.migrateOnStart) {
+    const migratePool = createPool(config.migrateDatabaseUrl);
+    const bootstrapPool = createPool(config.bootstrapDatabaseUrl);
     try {
-      const summary = await migrate(pool, {});
+      const summary = await migrate(migratePool, { bootstrapPool });
       // eslint-disable-next-line no-console
       console.log('[migrate] ok', summary);
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('[migrate] failed:', err.message);
-      await pool.end().catch(() => {});
+      await Promise.all([pool.end(), migratePool.end(), bootstrapPool.end()].map((p) => p.catch(() => {})));
       process.exit(1);
     }
+    await migratePool.end().catch(() => {});
+    await bootstrapPool.end().catch(() => {});
   }
   const server = createServer({ pool, config });
   server.listen(config.port, config.host, () => {
@@ -45,9 +50,10 @@ async function serve() {
 
 async function runMigrate() {
   const config = loadConfig();
-  const pool = createPool(config.databaseUrl);
+  const pool = createPool(config.migrateDatabaseUrl);
+  const bootstrapPool = createPool(config.bootstrapDatabaseUrl);
   try {
-    const summary = await migrate(pool, {});
+    const summary = await migrate(pool, { bootstrapPool });
     // eslint-disable-next-line no-console
     console.log('[migrate] done', summary);
     process.exitCode = 0;
@@ -57,7 +63,18 @@ async function runMigrate() {
     process.exitCode = 1;
   } finally {
     await pool.end().catch(() => {});
+    await bootstrapPool.end().catch(() => {});
   }
+}
+
+function printTotpProvisioning(secret, login, issuer) {
+  const uri = totp.otpauthUri(secret, { issuer, label: login });
+  // eslint-disable-next-line no-console
+  console.log(`TOTP otpauth URI: ${uri}`);
+  // eslint-disable-next-line no-console
+  console.log('⚠️ 请用认证器 App（Google Authenticator / 1Password / Aegis 等）扫码或录入上述 URI。');
+  // eslint-disable-next-line no-console
+  console.log(`   种子（base32，仅此一次下发，之后不再显示）：${secret}`);
 }
 
 async function bootstrapAdmin(values) {
@@ -68,7 +85,8 @@ async function bootstrapAdmin(values) {
     process.exit(2);
   }
   const config = loadConfig();
-  const pool = createPool(config.databaseUrl);
+  // bootstrap-admin 属 bootstrap 操作：用 bootstrap 超级用户（BOOTSTRAP_DATABASE_URL）执行迁移与写 users。
+  const pool = createPool(config.bootstrapDatabaseUrl);
   try {
     await migrate(pool, {});
   } catch (err) {
@@ -100,11 +118,12 @@ async function bootstrapAdmin(values) {
       generated = true;
     }
     const passwordHash = await auth.hashPassword(password);
+    const totpSecret = totp.generateSecret(20);
     const displayName = values['display-name'] || login;
     await pool.query(
-      `INSERT INTO users (login, display_name, role, auth_source, status, password_hash)
-       VALUES ($1, $2, 'admin', 'local', 'active', $3)`,
-      [login, displayName, passwordHash],
+      `INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret)
+       VALUES ($1, $2, 'admin', 'local', 'active', $3, $4)`,
+      [login, displayName, passwordHash, totpSecret],
     );
     // eslint-disable-next-line no-console
     console.log(`created admin login=${login} display_name=${displayName}`);
@@ -113,6 +132,12 @@ async function bootstrapAdmin(values) {
     if (generated) {
       // eslint-disable-next-line no-console
       console.log('⚠️ 请立即记录此一次性口令（P1 skeleton 暂无强制改密 UI）');
+    }
+    if (values['print-secret']) {
+      printTotpProvisioning(totpSecret, login, config.totp.issuer);
+    } else {
+      // eslint-disable-next-line no-console
+      console.log('TOTP 种子已生成并入 totp_secret；如需打印 otpauth URI 请加 --print-secret。');
     }
   } finally {
     await pool.end().catch(() => {});
@@ -152,6 +177,7 @@ async function main() {
       password: { type: 'string' },
       'display-name': { type: 'string' },
       'allow-extra': { type: 'boolean', default: false },
+      'print-secret': { type: 'boolean', default: false },
     },
   });
   const [command] = positionals;
