@@ -426,7 +426,7 @@ CREATE TABLE fde_networks (
   pool         text NOT NULL CHECK (pool IN ('default', 'large')),  -- default=10.200/16；large=10.201/16
   state        text NOT NULL DEFAULT 'allocated'
                CHECK (state IN ('allocated', 'active', 'released')),
-  revision     bigint NOT NULL DEFAULT 0,                -- 仅属「网络聚合」的版本号（与 route_outbox 网络行对账）；路由级版本见 route_revisions（§9 route_outbox），两者不可混用
+  revision     bigint NOT NULL DEFAULT 0,                -- 预留的网络聚合版本号（暂无 network 聚合 outbox 行；若将来引入网络相关派生发布，按 route_revisions 的 head 模式成对使用）；与 route_revisions.revision 不可混用
   created_at   timestamptz NOT NULL DEFAULT now(),
   released_at  timestamptz,
   -- 字段间一致性约束（P7）：masklen 与 prefix_len 一致；gateway 为该子网 .1；
