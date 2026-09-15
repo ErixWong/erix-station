@@ -258,7 +258,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 1. **取 `X-Forwarded-Host` → 精确查 `port_allocations.hostname`**（活跃唯一索引）。查不到 → `404 not_found`（「路由表里没有 = 不可达」，原理二；正常不该发生，发生说明路由与 DB 失同步）。
 2. allocation `state` 必须 ∈ {`allocated`,`active`}；`released` → `403 forbidden`（`allocation_released`）。
-3. **取凭证**：先查 `X-Forwarded-Uri` 的 `preview_ticket` 参数；无 ticket 再查 `__Host-fde_preview` cookie；两者皆无 → `401 unauthorized`（Traefik 配置为据此 302 到 `https://<PORTAL_HOST>` 登录页，登录后回跳）。
+3. **取凭证**：先查 `X-Forwarded-Uri` 的 `preview_ticket` 参数；无 ticket 再查 `__Host-fde_preview` cookie；两者皆无 → `403 forbidden`（`preview_ticket_required`；⚠️ **WP2a fail-closed**——本期不签发 ticket / 预览 cookie，无凭证一律走此分支；ticket 签发与 `allocated→active` 启用归 WP2b/P2）。
 4. **校验凭证（按哈希查库，不解析 `sub`；所有凭证查询显式带 `state='active'`）**：
    - ticket（bootstrap）：`h = sha256(ticket)` → 查 `preview_grants`（`kind='ticket'`）。必须满足：存在、`state='active'`、未 `revoked_at`、未过期（`expires_at > now()`）、`allocation_id` == 第 1 步的 allocation。任一不满足 → 失败分支（见下）。
    - 预览 cookie（steady-state）：`h = sha256(cookie)` → 查 `preview_grants`（`kind='session'`）。必须满足：存在、`state='active'`、未 `revoked_at`、未过期、`allocation_id` 匹配；否则 `401 unauthorized`（`preview_session_invalid` / `preview_session_expired`）。校验通过则滚动续期（刷新 `expires_at`/`last_seen_at` 并重发 cookie）。
@@ -282,8 +282,8 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 |---|---|
 | `200` + `X-Auth-User` | 预览 cookie 有效（或 `public`），放行到上游 |
 | `302` + `Set-Cookie` + `Location` | ticket 有效，换取预览 cookie 并跳回干净 URL（ticket 从地址栏消失） |
-| `401` | 无凭证 / ticket 过期 / session 无效（触发登录跳转） |
-| `403` | 已认证但无权 / 端口已释放 / ticket 真·重放（已消费且无活跃派生 session）·已撤销·不匹配 / 用户已禁用 |
+| `401` | ticket 过期 / session 无效（触发登录跳转） |
+| `403` | 无凭证（WP2a fail-closed：`preview_ticket_required`）· 已认证但无权 / 端口已释放 / ticket 真·重放（已消费且无活跃派生 session）·已撤销·不匹配 / 用户已禁用 |
 | `404` | hostname 无对应 allocation |
 
 失败响应体统一用 §1.1 错误信封（`code` 见上各分支；Traefik 对 401 触发登录跳转、对 4xx/5xx 原样回传，`X-Auth-User` 缺失即不放行）。
