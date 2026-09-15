@@ -143,7 +143,7 @@ CREATE TABLE runs (
                       CHECK (status IN ('queued', 'running', 'cancelling', 'finished', 'failed')),
   termination         jsonb,                     -- runToolLoop 返回值透传，对象 {reason, detail?}（model.md §1.7；portal.md §4.1/§5.3）：
                                                  -- reason ∈ end_turn / no_tool / stall / max_rounds_cap / reflection_stop /
-                                                 -- judge_done / continuation_exhausted / aborted / failed（erix-agent v0.3.4 src/loop.js:622）。
+                                                 -- judge_done / continuation_exhausted / aborted / failed（erix-agent v0.3.5 src/loop.js:622）。
                                                  -- UI 的「已取消」是宿主展示态：由 cancel_requested_at + reason='aborted' 推导（model.md §2.1），非引擎取值
   rounds              int NOT NULL DEFAULT 0,
   usage               jsonb NOT NULL DEFAULT '{"input_tokens": 0, "output_tokens": 0}' :: jsonb,
@@ -179,7 +179,7 @@ CREATE TABLE messages (
 
 CREATE TABLE port_allocations (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  fde_id      uuid NOT NULL REFERENCES users (id),     -- FDE 用户；forward-auth 的 cookie.sub 比对对象（portal.md §2.7）
+  fde_id      uuid NOT NULL REFERENCES users (id),     -- FDE 用户；forward-auth 按预览凭证哈希查 preview_grants 解析 user_id 后与此列比对（portal.md §2.7；不解析 cookie.sub，旧口径作废）
   scope       text NOT NULL CHECK (scope IN ('project', 'run')),
   project_id  uuid NOT NULL REFERENCES projects (id),
   run_id      uuid REFERENCES runs (id),
@@ -210,6 +210,43 @@ CREATE INDEX port_allocations_reaper_idx
   ON port_allocations (released_at) WHERE state = 'released';
 
 -- ----------------------------------------------------------------------------
+-- 预览授权凭证（portal.md §2.7/§2.8）：一次性 ticket 与 host-only 预览 cookie 两种凭证，均只存哈希。
+-- forwardAuth 按「预览 token 的哈希」查本表解析 user_id 后做 exposure 判定，不解析 cookie.sub（旧口径作废）；
+-- portal 自身会话的登录态才查 login_sessions（§2.5），与本表互不相干。
+--
+-- 与 port_allocations 释放的联动：allocation 为软删除（state → released），不物理删行；释放事务由 portal 应用层
+-- 同事务把该 allocation 的 active 凭证置 revoked（revoked_at=now()），forwardAuth 第 2 步始终重查 allocation.state 双保险（portal.md §2.8）。
+-- 外键为普通引用（不设 ON DELETE CASCADE）：物理删除 allocation（reaper 定期硬删 released 过期行，model.md §4）前必须先清空
+-- 引用它的本表行（grant reaper 先删过期/已吊销/已消耗行，或显式 DELETE ... WHERE allocation_id = ...）；DB 外键兜底防悬挂引用。
+-- state 是权威生命周期列；expires_at 是 TTL 截止时刻。expired 由 reaper 周期性懒打标（state → expired），forwardAuth 的有效性
+-- 判定同时查 state 与 expires_at > now()（reaper 打标前的窗口内，过期行仍会被拒绝，双保险）。
+CREATE TABLE preview_grants (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  token_hash    text NOT NULL UNIQUE,             -- sha256(token)；与 login_sessions.token_hash 同口径，不存明文（portal.md §2.8）
+  user_id       uuid NOT NULL REFERENCES users (id),
+  allocation_id uuid NOT NULL REFERENCES port_allocations (id),
+  kind          text NOT NULL
+                CHECK (kind IN ('ticket', 'session')),   -- ticket=一次性预览 ticket；session=host-only 预览 cookie（portal.md §2.7）
+  state         text NOT NULL DEFAULT 'active'
+                CHECK (state IN ('active', 'used', 'revoked', 'expired')),
+  expires_at    timestamptz NOT NULL,             -- ticket TTL 60s ⚠️；session 15min 滚动续期 ⚠️（portal.md §2.8）
+  used_at       timestamptz,                      -- ticket 一次性消耗时刻（forwardAuth 同事务原子置位，portal.md §2.7 第 4 步）
+  revoked_at    timestamptz,                      -- 显式吊销 / allocation released / 用户 disabled（portal.md §2.8/§2.9.3）
+  last_seen_at  timestamptz,                      -- session 最近一次校验通过（滚动续期刷新）
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  created_ip    inet,
+  created_ua    text,
+  CHECK (kind <> 'session' OR used_at IS NULL),        -- 只有一次性 ticket 有 used 语义；session 永不 used
+  CHECK ((state = 'used') = (used_at IS NOT NULL)),
+  CHECK ((state = 'revoked') = (revoked_at IS NOT NULL))
+);
+CREATE INDEX preview_grants_user_idx ON preview_grants (user_id);
+CREATE INDEX preview_grants_allocation_idx ON preview_grants (allocation_id);
+-- reaper：清理过期（expires_at 已过）/ 已消耗 / 已吊销的行（portal.md §2.8「定期清理过期行」）
+CREATE INDEX preview_grants_reaper_idx
+  ON preview_grants (expires_at) WHERE state IN ('active', 'used', 'revoked');
+
+-- ----------------------------------------------------------------------------
 -- 5. 引擎持久化（规格 §9.2 / §9.3：TranscriptStore 适配器落点）
 -- ----------------------------------------------------------------------------
 
@@ -229,11 +266,16 @@ CREATE TABLE transcript_rounds (
 -- checkpoint 必须成对（save + load），写失败 fail-closed → checkpoint_failed（规格 §9.3-1）
 -- 每 run 单行：上游 saveCheckpoint 是覆盖写单份（tmp+rename 原子覆盖）、loadLatestCheckpoint 无参数
 -- （依据：erix-agent v0.3.5 src/store/file.js:279-297；决策者 2026-09 D2' 对齐）。
--- 写入语义：INSERT ... ON CONFLICT (run_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = now()
--- （单行覆盖，重试同一快照安全；portal internal 端点 PUT .../checkpoint，portal.md §9）
+-- 写入语义：INSERT ... ON CONFLICT (run_id) DO UPDATE
+--   SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
+--   WHERE run_checkpoints.revision < EXCLUDED.revision
+-- （单行覆盖 + revision CAS：旧/乱序快照被 WHERE 子句拒绝 → portal 返回 409 checkpoint_stale；
+--   重试同一 revision 安全）。revision = worker 每 run 从 0 递增的单调版本，resume 时经 U9 读回继续 +1
+-- （runner-integration §9.5）。portal internal 端点 PUT .../checkpoint（U8/U9 已同步 revision，portal.md §9.8）。
 CREATE TABLE run_checkpoints (
   run_id     uuid PRIMARY KEY REFERENCES runs (id),
   snapshot   jsonb NOT NULL,
+  revision   bigint NOT NULL DEFAULT 0,          -- 单调 CAS 版本（旧快照被拒；seq 仅为调用方本地元数据、不落库）
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -252,10 +294,18 @@ CREATE TABLE run_events (
 );
 CREATE INDEX run_events_run_idx ON run_events (run_id, seq);
 
+-- spool（事件通道应急缓冲）不是 DB 表：它是容器内 `~/.cache/station/spool/<run_id>.jsonl` 的
+-- append-only 本地文件（runner-integration §7.5），只缓冲「尚未被 portal 200 确认」的事件批，
+-- 不是 transcript 副本（D2' 纯 DB）。ack 游标、损坏检测与修复、配额/写满、重启扫描、删除时机
+-- 见 runner-integration §7.5；真相仍在 run_events（第③层），spool 只是投递缓冲，故不入库。
+
 -- ----------------------------------------------------------------------------
 -- 6. 工具调用、judge、审批、产物（规格 §9.1）
 -- ----------------------------------------------------------------------------
 
+-- tool_calls 行由 portal 在 U3 事件上报时幂等 upsert：对 type='tool_use' 事件 INSERT ... ON CONFLICT (run_id, call_id) DO NOTHING
+-- （后续 tool_result / tool_call_delta 按 (run_id, call_id) 更新 result_digest/duration_ms/judged 等派生字段，portal.md §9.10）。
+-- 因此 U10 建审批单时 tool_calls 行必已存在，approvals / tool_outputs 的复合外键 (run_id, call_id) 得以满足。
 CREATE TABLE tool_calls (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   run_id        uuid NOT NULL REFERENCES runs (id),
@@ -289,12 +339,14 @@ CREATE TABLE approvals (
   run_id       uuid NOT NULL REFERENCES runs (id),
   tool_call_id text NOT NULL,
   status       text NOT NULL DEFAULT 'pending'
-               CHECK (status IN ('pending', 'approved', 'denied')),
+               CHECK (status IN ('pending', 'approved', 'denied', 'expired')),
   decided_by   uuid REFERENCES users (id),
   decided_at   timestamptz,
+  expired_at   timestamptz,                      -- #10（topology.md §4-L6）：超时 10min 由 portal 打 expired（修审计失真）；迟到决定被拒（portal.md §9.10）
   note         text,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  CHECK ((status = 'pending') = (decided_at IS NULL)),
+  CHECK ((status IN ('pending', 'expired')) = (decided_at IS NULL)),
+  CHECK ((status = 'expired') = (expired_at IS NOT NULL)),
   UNIQUE (run_id, tool_call_id),                                   -- 一个工具调用至多一条审批单（run 内 call_id 唯一）
   FOREIGN KEY (run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)
 );
@@ -358,52 +410,68 @@ CREATE INDEX audit_log_actor_idx ON audit_log (actor_id, ts);
 -- runner-integration §15-3）；push 优化 P2 后置。容器不直连 DB：claim/续租/回收
 -- 全部由 portal 经 internal API 执行（D1'）。
 --
--- 租约字段（lease_until / owner_container_id / claim_token / attempts）支撑
--- 「原子认领 + 租约过期可重领 + 双写防护」（runner-integration §4.2/§6.4）。
--- 建议的认领 SQL（portal 在 POST /api/internal/claim 内执行，单语句原子）：
+-- 租约字段（lease_until / owner_container_id / claim_token / attempts / max_attempts）支撑
+-- 「原子认领 + 租约过期可重领 + 双写防护 + 崩溃循环上限」（runner-integration §4.2/§6.4/§6.5）。
 --
---   UPDATE run_queue
+-- 领取资格以「稳定 FDE 身份」为准（run → session → user），容器实例只作租约持有者标记：
+--   container_id      = 入队时的派单目标容器实例（历史路由快照，审计/对账用；重建后不改写）
+--   owner_container_id = 当前租约持有者容器实例（claim 时写，release/回收时清；fencing 用它 + claim_token）
+--   领取资格          = 认领容器的 user_id == run 归属 user_id（容器重建后新容器同 user，天然可领旧队列行）
+--
+-- 建议的认领 SQL（portal 在 POST /api/internal/claim 内执行，单语句原子；
+-- $1=认领容器 id、$2=claim_token、$3=认领容器 user_id（由 token 解出））：
+--
+--   UPDATE run_queue q
 --   SET status = 'claimed',
 --       claimed_at = now(),
 --       lease_until = now() + interval '90 seconds',   -- lease 90s ⚠️
---       owner_container_id = $1,                        -- 认领容器（token 解出）
+--       owner_container_id = $1,                        -- 当前租约持有者（认领容器）
 --       claim_token = $2,                               -- 本次认领凭证（随机生成）
 --       attempts = attempts + 1
---   WHERE id = (
---     SELECT id FROM run_queue
---     WHERE container_id = $1
---       AND (status = 'pending'
---            OR (status = 'claimed' AND lease_until < now()))  -- 租约过期可重领
---     ORDER BY created_at
+--   WHERE q.id = (
+--     SELECT q2.id FROM run_queue q2
+--     JOIN runs r          ON r.id = q2.run_id
+--     JOIN chat_sessions s ON s.id = r.session_id
+--     WHERE s.user_id = $3                             -- 稳定路由：同 FDE 用户（跨容器重建）
+--       AND q2.attempts < q2.max_attempts              -- 未达崩溃循环上限
+--       AND (q2.status = 'pending'
+--            OR (q2.status = 'claimed' AND q2.lease_until < now()))  -- 租约过期可重领
+--     ORDER BY q2.created_at
 --     FOR UPDATE SKIP LOCKED
 --     LIMIT 1
 --   )
 --   RETURNING *;
 --
 -- 续租：随心跳 UPDATE ... SET lease_until = now() + interval '90 seconds'
---   WHERE id = $1 AND claim_token = $2（claim_token 不匹配 = 租约已易主 → 409 lease_lost）。
--- reaper：UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL
---   WHERE status='claimed' AND lease_until < now()（agentd 崩溃后的回收路径）。
+--   WHERE id = $1 AND claim_token = $2（claim_token 不匹配 = 租约已易主 → 响应 run 级 lease_lost，runner-integration §4.2 U4）。
+-- reaper（portal 定时任务，同一事务联动 runs）：
+--   分支1（未耗尽）：UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL
+--     WHERE status='claimed' AND lease_until < now() AND attempts < max_attempts;
+--   分支2（已耗尽）：UPDATE run_queue SET status='done'（并 runs → failed(max_attempts_exceeded)）
+--     WHERE status='claimed' AND lease_until < now() AND attempts >= max_attempts;
+-- release（U12）：attempts < max_attempts → 回 pending；attempts >= max_attempts → done + runs failed(max_attempts_exceeded)。
 
 CREATE TABLE run_queue (
   id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   run_id             uuid NOT NULL UNIQUE REFERENCES runs (id),  -- 一个 run 至多入队一次
-  container_id       uuid NOT NULL REFERENCES containers (id),   -- 派单目标容器（入队时定，路由语义）
-  owner_container_id uuid REFERENCES containers (id),            -- 当前租约持有者（claim 时写，release/回收时清）；与 container_id 分列：容器重建后新容器 re-claim 时不改路由原值
-  claim_token        text,                                       -- 本次认领凭证；X-Claim-Token 头携带，防 re-claim 后旧 agentd 双写（runner-integration §4.2）
+  container_id       uuid NOT NULL REFERENCES containers (id),   -- 入队时的派单目标容器实例（历史路由快照，审计/对账）；领取资格不再按它过滤（重建后实例 id 会变）
+  owner_container_id uuid REFERENCES containers (id),            -- 当前租约持有者容器实例（claim 时写，release/回收时清）；fencing 用 owner_container_id + claim_token
+  claim_token        text,                                       -- 本次认领凭证；X-Claim-Token 头携带（心跳 U4 逐 run 携带），防 re-claim 后旧 agentd 双写（runner-integration §4.2）
   status             text NOT NULL DEFAULT 'pending'
                      CHECK (status IN ('pending', 'claimed', 'done', 'cancelled')),
-  attempts           int NOT NULL DEFAULT 0,                     -- 认领次数；耗尽（如 ≥3）→ runs failed(internal)（runner-integration §6.2）
+  attempts           int NOT NULL DEFAULT 0,                     -- 已发起的（re-）start 次数（claim 成功 +1）；崩溃循环上限见 max_attempts
+  max_attempts       int NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),  -- 崩溃循环上限：attempts >= max_attempts 且再失败 → runs failed(max_attempts_exceeded)
   lease_until        timestamptz,                                -- 租约到期时刻；过期允许 re-claim（lease 90s ⚠️）
   created_at         timestamptz NOT NULL DEFAULT now(),
   claimed_at         timestamptz,
   CHECK (status <> 'claimed' OR (claimed_at IS NOT NULL
                                  AND lease_until IS NOT NULL
                                  AND owner_container_id IS NOT NULL
-                                 AND claim_token IS NOT NULL))
+                                 AND claim_token IS NOT NULL)),
+  CHECK (attempts <= max_attempts)                               -- 认领 SQL 已按 attempts < max_attempts 过滤，此处兜底防越界
 );
 CREATE INDEX run_queue_pending_idx
-  ON run_queue (container_id, created_at) WHERE status = 'pending';
+  ON run_queue (created_at) WHERE status = 'pending';
 -- reaper / 认领 SQL 的过期租约扫描
 CREATE INDEX run_queue_lease_idx
   ON run_queue (lease_until) WHERE status = 'claimed';

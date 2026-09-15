@@ -16,10 +16,13 @@
 | [`design/fde-platform.md`](design/fde-platform.md) | **主规格**：拓扑、网络与隔离、访问控制、账号生命周期、端口分配、数据模型、事件流、LLM 接入、容器模板、部署、分期、决策 D1~D10 | ✅ |
 | [`design/topology.md`](design/topology.md) | **H-B 网络与访问拓扑定稿（单一事实来源）**：拓扑、IPAM、链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、实测证据（决策者 2026-09，issue #5） | ✅ |
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
+| [`design/user-space.md`](design/user-space.md) | **用户空间物化契约（阻塞 P1 开工，issue #7）**：宿主↔portal↔FDE 容器路径映射、文件清单与 JSON schema、原子写 + manifest 多文件一致性、UID/权限、失败重试状态机、变更感知、重建幂等、项目目录归属 | ✅ |
+| [`design/deploy-contract.md`](design/deploy-contract.md) | **P1 部署契约**：服务清单与镜像 pin、compose 字段（网络/publish/volume/healthcheck/env_file）、DB 迁移机制、Traefik 静态/动态配置、防火墙应用方式（iptables-nft 幂等 + fail-closed）、socket-proxy 白名单策略、FDE 容器创建参数、P1 范围声明、readiness 语义 | ✅ |
 | [`env.md`](env.md) | **部署参数清单**：参数定义 + 参考实例 A + 目标环境探测 checklist（非单机环境事实） | ✅ |
 | [`api/portal.md`](api/portal.md) | **portal API 契约**：认证、端点请求/响应 schema、SSE 事件信封类型清单、错误语义 | ✅ |
 | [`data/schema.sql`](data/schema.sql) | **可执行建表 DDL**：约束/索引/外键齐全，postgres:16 空库实测 `psql -f` 可执行 | ✅ |
 | [`data/model.md`](data/model.md) | **数据模型说明**：表用途、字段语义、状态机、三份数据边界、归档与记账口径 | ✅ |
+| [`testing.md`](testing.md) | **测试与验收契约（D5）**：测试分层与命令表、隔离约定（路径注入/临时栈/伪造 FDE 容器）、必测清单（网络隔离/认证/文件物化/崩溃恢复/路由发布/API 契约/浏览器验证）、验收判定与门禁、已知不可测项 | ✅ |
 
 ---
 
@@ -98,7 +101,9 @@
 
 ---
 
-### D5. `docs/testing.md` —— 测试与验收 ⚠️ 阻塞 P1 交付
+### D5. `docs/testing.md` —— 测试与验收 ✅ 已完成
+
+> **状态**：✅ 已完成，交付于 [`testing.md`](testing.md)。以下「必须包含 / 验收 / 依赖」保留作验收依据。
 
 **为什么**：全局约定要求「语法保底 → 单测全绿 → 浏览器验证」；规格只有一行验收。
 
@@ -143,14 +148,14 @@
 ## 三、建议补齐顺序
 
 ```
-✅ D1 (env) ─┬─ D5 (testing，阻塞 P1 交付)
+✅ D1 (env) ─┬─ ✅ D5 (testing)
              └─ D6 (runbook，P2 前置)
 ✅ D2 (API 契约)
 ✅ D3 (schema)
 D4 (ADR，无依赖，可随时补)
 ```
 
-**最小可开工集** = **D1 + D2 + D3** —— 已就绪 ✅（P1 可开工）。下一步：D4/D5/D6 可在 P1 期间并行补。
+**最小可开工集** = **D1 + D2 + D3 + D5** —— 已就绪 ✅（P1 可开工，测试与验收契约已补齐）。下一步：D4/D6 可在 P1 期间并行补。
 
 ---
 
