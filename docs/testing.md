@@ -557,17 +557,15 @@ P1 交付完成 = 同时满足：
 | 1 | P1 是否含预览/真实 LLM | 不含预览/真实 LLM；对话验收走 mock 网关（deploy §7.3） | §4.1 分支 |
 | 2 | preview ticket TTL / 预览 cookie TTL | 60s / 15min 滚动（portal §2.8 ⚠️） | §3.2 B、§5-5 |
 | 3 | 租约/心跳/事件批量/背压/spool 配额/capacity | 90s/15s/250ms·2KB/10000·4MB/256MB·1GB/4（env §11.1 + runner §15 ⚠️） | §3.4 R7/R8 |
-| 4 | materializer outbox 复用 `route_outbox` 还是新增表 | 复用（user-space §12-2 ⚠️） | §3.3 物化测试的 outbox 落点 |
+| 4 | materializer outbox 复用 `route_outbox` 还是新增表 | ✅ 已定稿：新增 `materialize_outbox` + `materialize_revisions`（A7，不复用 `route_outbox`，schema.sql §9 / model §1.22） | §3.3 物化测试的 outbox 落点 |
 | 5 | argon2id 参数 / 口令长度 / TOTP 强制 | `m=19MiB,t=2,p=1` / ≥12 / 强制（portal §2.9.4 ⚠️） | §3.2 A |
 
 ### 6.2 转派同步点（本文不修改，需另开轮次）
 
 | # | 目标文档 | 需同步点 | 本文对应 |
 |---|---|---|---|
-| S1 | `api/portal.md` §3.5 | 「改名会同步重生成端口 hostname/url」→「改名不重生成，旧 hostname 保持」（规格 §8.5 不可变；deploy §9.2 S1 已标记） | §3.6 |
 | S2 | `data/model.md` §2.2 | `allocated→active` 触发条件定案为「首次 forward-auth 放行」（规格 §8.6；deploy §9.2 S2 已标记） | §3.5 T7 |
 | S3 | `data/schema.sql` | 缺 `schema_migrations` 表（deploy §3.1 要求；deploy §9.2 S3 已标记）；可选 `users.fde_name` 加 CHECK（规格 §8.5） | §2.2.2/§2.2.3 |
-| S4 | `data/model.md` §1.18 | `route_outbox` 语义扩到「materializer outbox（`aggregate='user_space'`）」（user-space §7.1/§12-2 ⚠️） | §3.3 |
 
 ---
 

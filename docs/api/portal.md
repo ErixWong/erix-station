@@ -336,9 +336,9 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` 均失效（forwardAuth 每请求重查） |
 | 上游可见性 | **预览 cookie 与 portal session cookie 都绝不到达预览上游**：二者 host-only、只在各自 host 发送；Traefik `strip-cookie` 中间件在放行后删除 `Cookie`（fde-platform §6.4）——上游 dev server 收到的请求头里**没有 `Cookie`** |
 
-> DDL 已落地（schema.sql §4 / model.md §1.21）：`preview_grants` 表（`token_hash UNIQUE`、`kind ∈ {ticket,session}`、`state ∈ {active,used,revoked,expired}`、`user_id`→`users`、`allocation_id`→`port_allocations`、`expires_at`、`used_at`、`revoked_at`、`last_seen_at`、`created_at`、`created_ip`、`created_ua`），并加 reaper 定期清理过期行。
+> DDL 已落地（schema.sql §4 / model.md §1.21）：`preview_grants` 表（`token_hash UNIQUE`、`kind ∈ {ticket,session}`、`state ∈ {active,used,revoked,expired}`、`user_id`→`users`（主体）、`issuer_id`→`users`（ticket 签发者，session 系统派生可空）、`allocation_id`→`port_allocations`、`parent_ticket_id`→`preview_grants.id`（ticket→session 关联，可空）、`expires_at`、`used_at`、`revoked_at`、`last_seen_at`、`created_at`、`created_ip`、`created_ua`），并加 reaper 定期清理过期行。
 >
-> ⚠️ **DDL/契约同步点（B3/B4/B11，本轮不改 schema.sql/model.md，待转派）**：需在 `preview_grants` 新增 **`issuer_id uuid REFERENCES users(id)`**（ticket 的签发者；session 为系统派生、可空）与 **`parent_ticket_id uuid REFERENCES preview_grants(id)`**（ticket→session 关联，可空）；`user_id` 语义定为**主体（被授权访问的身份）**。reaper 语义：`active` 且 `expires_at <= now()` → `state='expired'`（懒打标）；allocation 释放 / 显式吊销 → `state='revoked'`（同事务写 `revoked_at`）；ticket 消费 → `state='used'`（同事务写 `used_at`）。**所有凭证查询显式带 `state='active'`**（B11）。
+> **DDL/契约（B3/B4/B11）**：`issuer_id`（ticket 的签发者；session 为系统派生、可空）与 `parent_ticket_id`（ticket→session 关联，可空）已落 `preview_grants`；`user_id` 语义 = **主体（被授权访问的身份）**。reaper 语义：`active` 且 `expires_at <= now()` → `state='expired'`（懒打标）；allocation 释放 / 显式吊销 → `state='revoked'`（同事务写 `revoked_at`）；ticket 消费 → `state='used'`（同事务写 `used_at`）。**所有凭证查询显式带 `state='active'`**（B11）。
 >
 > **URL ticket 脱敏（B3）**：`preview_ticket` 是 URL 中的凭证，必须脱敏——① **审计**：`audit_log.details` 只记 `grant_kind='ticket'` + `grant_id` + token 哈希前缀，**不记 ticket 明文**；② **access log**：Traefik 原始 access log 对 `*.fde.<base>` 的 `preview_ticket` 查询参数**脱敏/不记录**（accessLog fields 排除 query，或 reconciler 对 `*.fde.<base>` 不记 query string）；③ **浏览器 history/地址栏**：第 6 步 `302 Location` 剔除 `preview_ticket`，地址栏/历史不留 ticket；④ **Referer**：预览响应统一 **`Referrer-Policy: no-referrer`**（fde-platform §6.3），ticket URL 不会经 Referer 泄漏给子资源/外链。
 
@@ -823,8 +823,9 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 契约表现：
 
 - run `status → failed`，`run.error = { "code": "checkpoint_failed", "retryable": true, ... }`；`run_end` 事件带同样 `error`。
-- **宿主 store adapter 必须把 `checkpoint_failed` 识别为可重试并包 retry**（规格 §9.3-2，erix ≤0.3.5 无内建重试）；重试耗尽后才是用户可见的失败。
-- 前端见到该错误码的提示口径：「任务因平台存储故障中止，进度未丢失，可重新发送继续」（重发消息走 §4.3，引擎 resume 依赖成对的 checkpoint）。
+- **宿主 store adapter 必须把 `checkpoint_failed` 识别为可重试并包 retry**（规格 §9.3-2，erix ≤0.3.5 无内建重试，3 次退避见 runner-integration §9.2）；重试耗尽后透传 → run 终态 `failed`。
+- **`checkpoint_failed` 是终态、不自动 re-claim**（A3 定稿，model.md §2.9 / runner-integration R20）：它是引擎在工具执行前/后 checkpoint 写失败时的 fail-closed 判定（**不是**进程崩溃），存储故障持续时 re-claim 只会原地重演，故直接终态 `failed`；终态后不可 resume。
+- **恢复口径（前端提示）**：「任务因平台存储故障中止，已持久化的进度（checkpoint/transcript）未丢失，请稍后重新发送」——**重发消息 = 新 run**（`POST /messages` 产生新 run，本期无跨 run resume）；**同 run 的恢复 = re-claim**（仅进程崩溃场景：租约到期后 re-claim 领同一 run，`resume:true`、`attempt > 1`，从最新 checkpoint 续跑，runner-integration §6.4）。
 - ⚠️ 待决策者确认（Q7 之外的实现注记）：规格 §9.3 强烈建议「本地 file 优先 + DB 异步复制」的 store 装饰器以避免中心 DB 抖动杀光所有任务；该取舍影响此错误的出现频率，不影响契约形状。
 
 ### 6.3 容器不可达 → `container_unreachable`（503）
@@ -845,7 +846,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | code | retryable | 含义 | 用户提示口径 |
 |---|---|---|---|
 | `rate_limited` | 是（人工/延迟后） | LLM 配额耗尽（§6.1） | 配额用尽，勿自动重试 |
-| `checkpoint_failed` | 是 | checkpoint 写失败，fail-closed 中止（§6.2） | 存储故障，可重发继续 |
+| `checkpoint_failed` | 是 | checkpoint 写失败，fail-closed 中止，终态（§6.2） | 存储故障，重发产生新 run |
 | `container_exited` | 是 | 容器在 run 进行中退出，且 `attempts >= max_attempts`（耗尽）后由 portal 置终态（否则走租约到期 re-claim，不直接终态，runner §6.4） | 容器异常，平台正在恢复 |
 | `max_attempts_exceeded` | 否 | attempts 耗尽（默认 3，schema.sql `run_queue.max_attempts`），U12 release / reaper 置终态（§9.11） | 多次尝试失败，请手动重新提交 |
 | `spool_full` | 是 | 事件 spool 写满且内存队列也满，worker 主动失败（runner §7.5） | 事件通道拥塞，可重发继续 |
@@ -1292,7 +1293,7 @@ ON CONFLICT (run_id) DO UPDATE
 | 退避 | 1s → 2s → 5s（指数，±20% 抖动） |
 | 可重试错误 | 网络错误、5xx、429 |
 | 不可重试 | 4xx → 直接抛（`checkpoint_stale` 除外：视为已过期、不重试） |
-| 耗尽 | 错误透传引擎 → `checkpoint_failed` → run 失败（用户口径见 §6.2「进度未丢失，可重新发送继续」） |
+| 耗尽 | 错误透传引擎 → `checkpoint_failed` → run 终态 `failed`（用户口径见 §6.2：重发产生新 run，不自动 re-claim） |
 
 错误：`400 validation_failed`（缺 `revision`/`snapshot` 或 `revision` 非非负整数）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 run_terminal`（终态 run 不再接受 checkpoint——终态 barrier）；`409 checkpoint_stale`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
