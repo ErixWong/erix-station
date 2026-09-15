@@ -230,7 +230,9 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | 关键字段 | 语义 |
 |---|---|
 | `token_hash` | 唯一；`sha256(token)`，不存明文（与 `login_sessions.token_hash` 同口径） |
-| `user_id` / `allocation_id` | 凭证归属用户与目标 allocation（`allocation_id → port_allocations.id`） |
+| `user_id` / `allocation_id` | 凭证**主体（被授权访问的身份）**与目标 allocation（`allocation_id → port_allocations.id`）；`user_id` 是 exposure 判定身份（≠ 签发者，见 `issuer_id`） |
+| `issuer_id` | ticket 的**签发者**（登录用户，`→ users.id`）；session 为系统派生、**可空**（portal.md §2.7/§2.8 B4）。普通 FDE 自签 = issuer = subject = owner；admin 代签他人 private = subject = admin、issuer = admin |
+| `parent_ticket_id` | ticket→session 关联（`→ preview_grants.id` 自引用，**可空**）：session 行指向派生它的 ticket；ticket 行为 `NULL`。安全重放分支按 `parent_ticket_id=$ticket_id` 查派生 session（portal.md §2.7 第 6 步） |
 | `kind` | `ticket`（一次性）/ `session`（host-only 预览 cookie，滚动续期） |
 | `state` | `active / used / revoked / expired`（状态机见 §2.4）；`used` 仅 ticket 有（`CHECK (kind='session') = (used_at IS NULL)`） |
 | `expires_at` | TTL 截止时刻：ticket **60s** ⚠️、session **15min** ⚠️ 滚动（portal.md §2.8） |
@@ -301,7 +303,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 ```
  创建（项目/run 端口分配：同一 DB 事务写 port_allocations + route outbox）
         │
-   ┌────▼─────┐  观测到 dev server 监听 / 首次授权访问   ┌────────┐
+   ┌────▼─────┐  首次 forward-auth 放行（幂等升级）   ┌────────┐
    │ allocated│ ──────────────────────────────────────▶ │ active │
    └────┬─────┘                                         └───┬────┘
         │        项目删除 / run 结束 / 配额回收（同一 DB 事务写 outbox tombstone）      │
@@ -314,10 +316,10 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
 | `allocated` | portal：项目创建 / run 启动时的分配事务（规格 §7.2 第 3 步 / §8.2） | forward-auth：放行（portal.md §2.7 第 2 步）；portal：同一 DB 事务写 `port_allocations`（desired state）+ route outbox；`ports.json` 由 portal 在事务提交后原子写 bind mount；reconciler 异步幂等发布 Traefik 路由（同源，规格 §8.1） |
-| `active` | portal：观测到端口实际在服务（runner 上报监听或首次授权请求）后升级标记 | forward-auth：放行；UI：预览卡片「在线」展示；报表 |
+| `active` | portal：首次 forward-auth 放行（`200 + X-Auth-User`）后幂等升级（`UPDATE ... WHERE state='allocated'`，规格 §8.6） | forward-auth：放行；UI：预览卡片「在线」展示；报表 |
 | `released`（终态） | portal：项目删除 / run 结束 / reaper 回收（规格 §8.2） | forward-auth：**403**（portal.md §2.7）；分配器：端口与 hostname 可复用（部分唯一索引不再覆盖）；reaper：过期清理 |
 
-> ⚠️ 待决策者确认：`allocated → active` 的精确触发条件规格未定义（规格 §8 只列了三个状态名）。当前按「runner 上报端口开始监听，或首次 forward-auth 放行」取先到者实现；该细化不影响转发语义（`allocated` / `active` 一律放行）。
+> 已定稿（规格 §8.6）：`allocated → active` 由**首次 forward-auth 放行**触发（`200 + X-Auth-User`）。portal 在放行判定通过后的同次处理内幂等升级（`UPDATE ... SET state='active' WHERE id=$1 AND state='allocated'`）：首次放行才升级、后续放行影响 0 行、已 `released` 不会误升级；升级**不写 route outbox、不重发路由**（`allocated` / `active` 转发语义一致，规格 §8.6）。`active` 状态在 DB（原理三），FDE 容器 / Traefik 路由 / `ports.json` 重建后**不回落**，唯一回退路径是 `released`（无 `active → allocated` 逆转换）。P1 无预览路由，故 P1 期间 allocation 恒为 `allocated`，`active` 只在 P2 预览启用后出现。
 
 ### 2.3 `approvals.status`
 
@@ -526,7 +528,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | 1 | Q1/Q4：`usage_ledger` 粒度与 `cost` 口径 | Q1→(b) 自建 LiteLLM 不写代理；Q4→(a) 每 FDE 一把 key + 项目标签 | §5；`runs.cost` / `usage_ledger.cost` P1 可空 |
 | 2 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | `port_allocations.scope/run_id` 字段先行保留（§1.9） |
 | 3 | `run_queue` 表：pull 模型为终态，push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | 规格 §10.3 旧描述「单机可先 push」已不再作为默认 | §1.16（表先行落地，push 模式不启用） |
-| 4 | `port_allocations` `allocated → active` 触发条件 | runner 上报监听 / 首次授权访问，先到者 | §2.2（不影响转发语义） |
+| 4 | `port_allocations` `allocated → active` 触发条件 | ✅ 已定稿：首次 forward-auth 放行（幂等升级，重建不回落，规格 §8.6） | §2.2 |
 | 5 | 三表「不混」的 DB 角色分离（GRANT 强制） | ✅ 已落地：`station_platform`（DDL）/`station_portal`（DML）已入 schema.sql §0（幂等创建）+ schema.sql §10（最小 DML GRANT）；`bootstrap.sql` 作附加初始化（A6） | §3-4 |
 | 6 | 规格 §9.3「本地 file 优先 + DB 异步复制」store 装饰器 | 规格为「强烈建议」 | §1.11（影响 `checkpoint_failed` 频率，不影响表结构） |
 | 7 | `tool_outputs` 阈值（bytes） | 未定（建议如 4KB/8KB） | §1.19；决定「事件里放 digest、全文落表」的边界 |

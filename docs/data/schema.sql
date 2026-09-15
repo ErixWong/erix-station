@@ -244,6 +244,8 @@ CREATE INDEX port_allocations_reaper_idx
 -- 预览授权凭证（portal.md §2.7/§2.8）：一次性 ticket 与 host-only 预览 cookie 两种凭证，均只存哈希。
 -- forwardAuth 按「预览 token 的哈希」查本表解析 user_id 后做 exposure 判定，不解析 cookie.sub（旧口径作废）；
 -- portal 自身会话的登录态才查 login_sessions（§2.5），与本表互不相干。
+-- 身份两列（B4）：user_id = 主体（被授权访问的身份，exposure 判定用）；issuer_id = ticket 的签发者（登录用户，
+--   session 为系统派生、可空）。parent_ticket_id = ticket→session 关联（session 行指向派生它的 ticket，供安全重放，portal.md §2.7 第 6 步）。
 --
 -- 与 port_allocations 释放的联动：allocation 为软删除（state → released），不物理删行；释放事务由 portal 应用层
 -- 同事务把该 allocation 的 active 凭证置 revoked（revoked_at=now()），forwardAuth 第 2 步始终重查 allocation.state 双保险（portal.md §2.8）。
@@ -254,8 +256,10 @@ CREATE INDEX port_allocations_reaper_idx
 CREATE TABLE preview_grants (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   token_hash    text NOT NULL UNIQUE,             -- sha256(token)；与 login_sessions.token_hash 同口径，不存明文（portal.md §2.8）
-  user_id       uuid NOT NULL REFERENCES users (id),
+  user_id       uuid NOT NULL REFERENCES users (id),   -- 主体（被授权访问的身份）；exposure 判定用此列（portal.md §2.7/§2.8；不解析 cookie.sub）
+  issuer_id     uuid REFERENCES users (id),            -- ticket 的签发者（登录用户）；session 为系统派生、可空（portal.md §2.8/B4）
   allocation_id uuid NOT NULL REFERENCES port_allocations (id),
+  parent_ticket_id uuid REFERENCES preview_grants (id),-- ticket→session 关联：session 行指向其派生自的 ticket；ticket 行 NULL（portal.md §2.7 第 6 步/B4）
   kind          text NOT NULL
                 CHECK (kind IN ('ticket', 'session')),   -- ticket=一次性预览 ticket；session=host-only 预览 cookie（portal.md §2.7）
   state         text NOT NULL DEFAULT 'active'
@@ -268,11 +272,15 @@ CREATE TABLE preview_grants (
   created_ip    inet,
   created_ua    text,
   CHECK (kind <> 'session' OR used_at IS NULL),        -- 只有一次性 ticket 有 used 语义；session 永不 used
+  CHECK (kind <> 'ticket' OR issuer_id IS NOT NULL),   -- ticket 必有签发者；session 系统派生、issuer 可空（B4）
+  CHECK ((kind = 'session') = (parent_ticket_id IS NOT NULL)),  -- session 必指向派生 ticket；ticket 无父（B3/B4）
   CHECK ((state = 'used') = (used_at IS NOT NULL)),
   CHECK ((state = 'revoked') = (revoked_at IS NOT NULL))
 );
 CREATE INDEX preview_grants_user_idx ON preview_grants (user_id);
+CREATE INDEX preview_grants_issuer_idx ON preview_grants (issuer_id);   -- admin 代签 / 按签发者吊销与审计
 CREATE INDEX preview_grants_allocation_idx ON preview_grants (allocation_id);
+CREATE INDEX preview_grants_parent_ticket_idx ON preview_grants (parent_ticket_id);  -- 安全重放：按 parent_ticket_id 查派生 session（portal.md §2.7 第 6 步）
 -- reaper：清理过期（expires_at 已过）/ 已消耗 / 已吊销的行（portal.md §2.8「定期清理过期行」）
 CREATE INDEX preview_grants_reaper_idx
   ON preview_grants (expires_at) WHERE state IN ('active', 'used', 'revoked');

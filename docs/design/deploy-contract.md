@@ -335,7 +335,6 @@
 
 | # | 目标文档 | 需同步 |
 |---|---|---|
-| S1 | `api/portal.md` §3.5 | 「改名会同步重生成端口 hostname/url」→ 改为「改名**不**重生成 hostname/url，旧 hostname 保持」（规格 §8.5 不可变性） |
 | S2 | `data/model.md` §2.2 | `allocated → active` 触发条件由 `⚠️` 定案为「首次 forward-auth 放行」（规格 §8.6）；删除「runner 上报监听」先到者表述 |
 | S3 | `data/schema.sql` | （可选）`users.fde_name` 加 `CHECK (fde_name ~ '^[a-z0-9][a-z0-9-]{0,62}$')`（规格 §8.5 grammar 的 `<fde>` 字符集落库）；新增 `schema_migrations` 表（§3） |
 | S4 | `api/portal.md` §9（internal） | 无需新增端口上报端点（§8.6 选 forward-auth 触发，不选 runner 上报）——确认不新增即可 |
