@@ -515,6 +515,82 @@ test('forward-auth fail-closed：无预览凭证 403 / 未知 host 404 / release
   }
 });
 
+test('POST /api/ports/:id/preview-ticket：无会话 401；有会话 201 且存哈希（portal.md §2.8）', async () => {
+  const password = 'pw';
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice',
+    auth_source: 'local', status: 'active',
+    password_hash: await auth.hashPassword(password),
+    totp_secret: totp.generateSecret(20), last_totp_step: null,
+  };
+  const grants = [];
+  const pool = {
+    grants,
+    async query(sql, params = []) {
+      if (sql.includes('schema_migrations')) return { rows: [{ version: '0000_baseline' }] };
+      if (sql.includes('FROM users WHERE login')) return { rows: [user] };
+      if (sql.includes('FROM users WHERE id') && sql.includes('totp_secret')) return { rows: [user] };
+      if (sql.includes('INSERT INTO login_pending')) {
+        this.pending = { user_id: user.id, token_hash: params[1], created_at: params[2], expires_at: params[3], used_at: null };
+        return { rows: [] };
+      }
+      if (sql.includes('SELECT user_id FROM login_pending')) {
+        const p = this.pending;
+        return { rows: p && p.used_at === null && new Date(p.expires_at) > new Date(params[1]) ? [{ user_id: p.user_id }] : [] };
+      }
+      if (sql.includes('UPDATE login_pending SET used_at')) {
+        if (this.pending && this.pending.used_at === null) { this.pending.used_at = new Date(); return { rows: [{ user_id: this.pending.user_id }] }; }
+        return { rows: [] };
+      }
+      if (sql.includes('UPDATE users SET last_totp_step')) { user.last_totp_step = Number(params[1]); return { rows: [{ id: user.id }] }; }
+      if (sql.includes('INSERT INTO login_sessions')) {
+        this.session = { id: 's1', user_id: user.id, token_hash: params[1], created_at: params[2], expires_at: params[3], last_seen_at: params[2], revoked_at: null };
+        return { rows: [] };
+      }
+      if (sql.includes('FROM login_sessions s') && sql.includes('JOIN users')) {
+        if (!this.session || this.session.revoked_at) return { rows: [] };
+        return { rows: [{ id: user.id, login: user.login, display_name: user.display_name, role: user.role, fde_name: user.fde_name, auth_source: user.auth_source, status: user.status, session_id: this.session.id, expires_at: this.session.expires_at, last_seen_at: this.session.last_seen_at }] };
+      }
+      if (sql.includes('FROM port_allocations WHERE id = $1')) {
+        return { rows: [{ id: 'pa1', fde_id: 'u1', state: 'allocated', exposure: 'private', url: 'https://alice-p-proj1-4000.fde.localhost' }] };
+      }
+      if (sql.includes('INSERT INTO preview_grants')) {
+        grants.push({ token_hash: params[0], kind: 'ticket', user_id: params[1], issuer_id: params[2], allocation_id: params[3], expires_at: params[4] });
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+  const s = await startServer({ pool, overrides: {
+    previewTicketTtlSeconds: 60,
+    previewSessionSigningKey: 'test-key',
+    previewCookie: { name: 'fde_preview_dev', secure: false, httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 900 },
+  } });
+  try {
+    // 无会话 → 401
+    const noSession = await fetch(`${s.base}/api/ports/pa1/preview-ticket`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(noSession.status, 401);
+
+    // 登录拿会话
+    const step1 = await fetch(`${s.base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ login: 'alice', password }) });
+    const { pending_token } = await step1.json();
+    const step2 = await fetch(`${s.base}/api/auth/login/totp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pending_token, code: totp.totp(user.totp_secret) }) });
+    const token = step2.headers.get('set-cookie').split(';')[0].split('=')[1];
+
+    const r = await fetch(`${s.base}/api/ports/pa1/preview-ticket`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${token}` }, body: '{}' });
+    assert.equal(r.status, 201);
+    const body = await r.json();
+    assert.ok(body.ticket.startsWith('pt_'));
+    assert.equal(body.expires_in, 60);
+    // 只存哈希
+    assert.equal(grants.length, 1);
+    assert.notEqual(grants[0].token_hash, body.ticket);
+  } finally {
+    await s.close();
+  }
+});
+
 test('GET /api/projects/:id/ports：返回端口列表（portal.md §4.7）', async () => {
   const port = { id: 'pa1', scope: 'project', port: 4000, role: 'frontend', run_id: null, hostname: 'alice-p-proj1-4000.fde.localhost', url: 'https://alice-p-proj1-4000.fde.localhost', exposure: 'private', state: 'allocated', released_at: null };
   const pool = {
@@ -539,6 +615,29 @@ test('GET /api/projects/:id/ports：返回端口列表（portal.md §4.7）', as
     const body = await r.json();
     assert.equal(body.items.length, 1);
     assert.equal(body.items[0].hostname, 'alice-p-proj1-4000.fde.localhost');
+  } finally {
+    await s.close();
+  }
+});
+
+test('F2：forward-auth 审计不记 query（含 ?preview_ticket=<明文>）', async () => {
+  const pool = new FakePool({ users: [] });
+  const s = await startServer({ pool });
+  try {
+    const secret = 'pt_S3CRET_TICKET_LEAK_CHECK';
+    const res = await fetch(`${s.base}/api/forward-auth`, {
+      headers: {
+        'x-forwarded-host': 'alice-p-proj1-4000.fde.localhost',
+        'x-forwarded-uri': `/?preview_ticket=${secret}&extra=1`,
+      },
+    });
+    assert.equal(res.status, 404); // 无真实 allocation → deny；审计仍写入
+    const auditRow = pool.audit.find((a) => a.action === 'auth.forward_auth');
+    assert.ok(auditRow, 'forward-auth 审计已写入');
+    const details = JSON.parse(auditRow.details);
+    assert.equal(details.uri, '/', '审计只记 path，剥离所有 query');
+    assert.ok(!details.uri.includes('preview_ticket'), '不含 preview_ticket');
+    assert.ok(!JSON.stringify(auditRow).includes(secret), '审计不含 ticket 明文');
   } finally {
     await s.close();
   }
