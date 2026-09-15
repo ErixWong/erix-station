@@ -500,7 +500,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 - **judge / fold 用便宜模型**：`ModelConfigProvider.resolve(slot)` 支持 `default` / `audit` / `fold`；长任务 judge 会 +10~30% 调用量
 - **额度用尽**：网关 429 → erix 分类 `KitError(rate_limited, retryable)` → 宿主需友好提示，且避免重试继续烧配额
 - **对账**：网关 usage 与 erix `onUsage` 两套数都要记（差异来自 judge/fold 的额外调用）
-- **出口 allowlist 移交给安全团队的网络层策略**（白名单内容由安全团队维护）：npm registry、pypi、GitHub/内部 git、镜像仓库；**LLM 域名不在白名单**——这是「唯一出口」的实现方式（决策者 2026-09，issue #3）。平台对安全团队的接口：容器网络名/命名规范（`fde-<name>`）+ 子网段 `10.200.0.0/16`（`control` 已取消，H-B 定稿 issue #5）、审计事件、以及「上游 LLM 只经网关」的架构事实
+- **出口 allowlist 移交给安全团队的网络层策略**（白名单内容由安全团队维护）：npm registry、pypi、GitHub/内部 git、镜像仓库；**LLM 域名不在白名单**——这是「唯一出口」的实现方式（决策者 2026-09，issue #3）。平台对安全团队的接口：容器网络名/命名规范（`fde-<name>`）+ 子网段 `10.200.0.0/16` 与 `10.201.0.0/16`（默认池 `/29` 与大 FDE `/28` 池；均保留给 FDE 网络专用，`control` 已取消，H-B 定稿 issue #5）、审计事件、以及「上游 LLM 只经网关」的架构事实
 - 若安全团队的出口策略未实施 → 「防用外部 key」降级为**审计 + 告警**，须管理层**书面知情**（性质不同）
 
 ---
