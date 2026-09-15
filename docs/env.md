@@ -156,11 +156,18 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 |---|---|---|---|
 | 容器命名 | 项目前缀 + 组件名 | 平台规范固定（规格 §14 已定） | 本平台：`station-edge` / `station-portal` / `station-db`；FDE 容器：`fde-<name>`（如 `fde-alice`） |
 | `DATA_ROOT` | 平台数据 bind mount 根目录，布局为 `<DATA_ROOT>/<名称>/` | 决策者/运维约定 | `/docker`（参考实例 A 的全机统一约定，见 §8.1）；如 `/docker/station-db/`（pg data）、`/docker/station-edge/`（traefik 动态配置/证书存储 acme.json） |
-| `USER_SPACE_ROOT` | FDE 用户空间根，布局为 `<USER_SPACE_ROOT>/<fde>/`，**宿主路径与容器内路径一致**（规格 §12.1） | 路径结构平台规范固定；具体取值由决策者/运维提供 | `/srv/erix/users`（参考实例 A，见 §8.1）；如 `/srv/erix/users/alice/{home,projects,worktrees,cache}` |
+| `USER_SPACE_ROOT` | FDE 用户空间根，布局为 `<USER_SPACE_ROOT>/<fde>/`（宿主路径）；FDE 容器内映射 `/home/<user>`（见 [`design/user-space.md`](design/user-space.md) §2） | 路径结构平台规范固定；具体取值由决策者/运维提供 | `/srv/erix/users`（参考实例 A，见 §8.1）；如 `/srv/erix/users/alice/{home,projects,worktrees,cache}` |
+| `FDE_CONTAINER_USER` / `FDE_HOME` | 容器内 FDE 用户名与 HOME（user-space.md §2.4；⚠️ 用户名固定 `erix` vs 按 FDE 名，倾向固定 `erix`） | 平台规范固定 | `erix` / `/home/erix` |
+| `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（工作区目录属主） | 平台规范固定（user-space.md §6） | `1000` / `1000` |
+| `AGENTD_UID` / `WORKER_UID` | agentd（唯一持 per-container token）/ worker（每 run）的 UID；GID 同 `1000` | 平台规范固定（runner-integration §11.3 不同 UID 优先） | `1001` / `1002` |
+| `PORTAL_RUNTIME_UID` | portal 容器运行身份 = materializer 物化写入身份（需 chown 工作区目录、写 Docker API） | 平台规范固定（user-space.md §6.1） | `0`（root） |
+| `USER_SPACE_DIR_MODE` / `USER_SPACE_UMASK` | 工作区目录模式 / 容器进程 umask；平台文件权限固定 | 平台规范固定（user-space.md §6.2） | `2770` / `0002`（平台文件 `0644`，`manifest.json` `0444`） |
 | `backend` / `fde-<name>` | **`backend` = 显式 `172.30.0.0/24`**（compose 声明，与 FDE 池彻底隔离）；`fde-<name>` 每 FDE 一条 `/29`；Traefik 走 host 网络（H-B 定稿，issue #5；~~`edge` / `control`~~ 已取消——共享 `control` 是横向越权根源）。**`10.200.0.0/16` 与 `10.201.0.0/16` 保留给 FDE 网络专用**，其它 compose/自动网络不得使用 | 平台规范固定（规格 §3/§5，topology.md §2） | `backend` 接 portal + station-db + LLM 网关；`fde-<name>` 只接该 FDE 的容器（`10.200.<n>.0/29`，大 FDE `/28` 见 §5.2） |
 | 凭据存放 | 平台凭据（DB 密码、runner token、OIDC client secret、DNS-01 API token）一律环境变量或凭据文件注入（项目 AGENTS.md §6），不进仓库、不进 compose 正文 | 决策者/运维约定 | 参考实例 A：`~/.config/mcp/creds/`，权限 **600**（已实测存在，含 gitea、portainer、mssql 等凭据，见 §8.1）；或 `<DATA_ROOT>/<名称>/` 下 600 文件 |
 
 凭据注入要点（平台规范固定，不随环境变化）：
+
+- 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `2770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
 
 - LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + baseURL）：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
 - `docker.sock` 仅 portal 挂载，且前置 `tecnativa/docker-socket-proxy` 收窄到 CONTAINERS/NETWORKS/VOLUMES（规格 §4）
@@ -266,9 +273,79 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `DATA_ROOT` | 决策者/运维约定（§6） | `/docker` |
 | `USER_SPACE_ROOT` | 结构平台规范固定，取值决策者/运维提供（§6） | `/srv/erix/users` |
 | `DB_PASSWORD` | 部署时生成，存凭据文件 600（§6） | — |
-| `PORTAL_IMAGE` / `EDGE_IMAGE` / `DB_IMAGE` | 平台规范固定（规格 §14） | portal 自构建；`traefik:v3`；`postgres:16` |
+| `PORTAL_IMAGE` | 平台规范固定（规格 §14）；自构建（build context `portal/`） | `erix-station/portal:<git-sha>`（不可变 tag；部署时再 `docker inspect --format '{{.Id}}'` 记 digest） |
+| `DB_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `postgres:16`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体 patch/digest 部署时由 §9 产出后填；P1 开发可临时 `postgres:16` 并记录 resolved digest） |
+| `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
+| `SOCKET_PROXY_IMAGE` | 平台规范固定（规格 §4 / §6） | `tecnativa/docker-socket-proxy`（digest pin，⚠️ 版本部署时定） |
+| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`） |
+| `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
+| `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
+| `TRAEFIK_CONFIG_DIR` | 平台规范固定（deploy-contract.md；由 `DATA_ROOT` 派生） | `/docker/station-edge/`（静态 `traefik.yml` + `dynamic/` 目录 + `acme.json` + `logs/` + `firewall/` 规则文件） |
+| `FIREWALL_RULES_PATH` | 平台规范固定（deploy-contract.md；由 `TRAEFIK_CONFIG_DIR` 派生） | `/docker/station-edge/firewall/`（规则文件 `rules.v4`，权限 **600**） |
+| `DB_DATA_DIR` | 平台规范固定（由 `DATA_ROOT` 派生） | `/docker/station-db/`（pg data；见 §6） |
 
+> **镜像 pin 策略（deploy-contract.md §2 的完整契约，此处只记取值口径）**：`deploy/` 内的 compose/镜像引用**不得使用浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。生产部署对每个镜像最终以 **digest**（`image@sha256:…`）锁定；P1 开发期可暂用 `<major>.<minor>` 类 tag，但必须在 `docker inspect` 后把 resolved digest 记录进部署记录（env 附录 B / runbook）。`⚠️ 待决策者确认`：`postgres:16` / `traefik:v3` 的具体 patch 号与 digest 是部署期事实，本文不虚构；P1 开发按 §0 即可，目标环境按 §9 探测后再 pin。
+>
 > 宿主机内网 IP（DNS A 记录目标）在部署时由运维填入 DNS，不进入 compose 变量。
+
+---
+
+## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）
+
+> 本节是 **P1 运行时契约**的取值锚点：把散落在规格 / runner-integration / topology 里的超时与资源参数收敛到一处，并补上「DB 超时 / 时间权威 / 日志轮转」三块此前缺失的运行时事实。**配置来源**指向实现时读取的环境变量或服务参数；实现未到位的参数按「当前倾向」取值并标注 `⚠️ 待决策者确认`。
+
+### 11.1 超时 / 心跳 / 租约 / 背压参数
+
+| 参数 | 默认值 | 单位 | 上限 | 配置来源 | 超时/错误表现 | 监控指标 |
+|---|---|---|---|---|---|---|
+| SSE（portal→浏览器）路由 read/write timeout | ≥ 300 | s | 无（长连接） | Traefik 动态配置（portal reconciler 生成；topology §6 第 10 条「路由 read/write timeout ≥ 5min；SSE 禁缓冲」） | 断连 → 浏览器 `EventSource` 按 `retry: 3000` 自动重连 + `Last-Event-ID` 补发 | SSE 连接数、断线重连率、补发事件数 |
+| SSE（portal→浏览器）心跳注释行 | 15 | s | — | portal（portal.md §5.1 `: ping`） | 连续 3 个周期无心跳 → 客户端判死重连 | 心跳丢失数 |
+| SSE（agentd→portal `/api/internal/stream`）重连退避 | 1→2→5→10→30 封顶 | s | 30 | agentd（runner §4.3/§4.5） | 断开按指数退避重连 | agentd 下行健康、重连次数 |
+| claim 长轮询 `hold_ms` | 30 | s | **30（硬上限）** | agentd 请求参数（runner §4.2 U1） | hold 超时无任务 → `204`，agentd 立即再 claim | claim 空转率、hold 命中率 |
+| 租约 `lease` | 90 | s | — | portal（schema.sql `run_queue` 认领 SQL，`now()+interval '90 seconds'`） | 到期未续 → 允许 re-claim（旧写 `lease_lost`） | lease 过期/易主次数 |
+| 心跳间隔 / 判死阈值 | 15 / 45 | s | — | agentd（runner §4.2 U4） | 连续 3 次丢失（45s）→ `containers.status` 视 `exited` | `containers.last_heartbeat` 延迟、判死次数 |
+| 审批轮询兜底 / 审批超时 | 5 / 600 | s | — | agentd（runner §10.1） | 10min 无决定 → 按 denied 继续（审批单留 `pending`） | 审批 pending 时长、超时数 |
+| store adapter checkpoint 重试 | 3 次（1s→2s→5s） | 次 / s | 3 | worker（runner §9.2） | 耗尽 → `checkpoint_failed` → run `failed` | checkpoint 重试率、`checkpoint_failed` 数 |
+| 事件批量窗口 | 250ms 或 2KB 先到 | ms / KB | 单批 200 条 / 256KB | agentd（runner §7.2） | — | 批次大小、批间隔、端到端延迟 |
+| 背压（worker / agentd 内存队列） | 10000 条/4MB；20000 条/8MB | 条 / MB | 见左 | worker / agentd（runner §7.4） | 超限落 spool；spool 也满 → run `spool_full` | 队列深度、spool 用量 |
+| spool 配额 | 每 run 256MB / 每容器 1GB | MB | 见左 | agentd（runner §7.5） | 写满 → 事件不静默丢，显式 `spool_full` run 失败 | spool 磁盘占用 |
+| agentd 并发 `capacity` | 4 | run | 4 | agentd claim 上报（runner §13） | portal 不超发 | 并发 run 数 |
+| portal HTTP 慢客户端防护 | 请求头 10s / 请求体 30s / keep-alive 60s | s | — | portal 服务器配置（技术栈 Q7 ⚠️，语义与栈无关） | 超时断连；连接数超限 → 排队 / `503` | 慢客户端断开数 |
+| portal 最大并发连接数 | 1024 | 连接 | — | portal 服务器配置 | 超限排队或 `503 rate_limited` | 峰值连接数 |
+
+> 上表中带 `⚠️` 语义的参数（capacity、背压阈值、spool 配额等）沿用 runner-integration.md §15 的当前倾向取值，**未新造数值**；实现前由决策者按 §9/runbook 复核。
+
+### 11.2 DB 运行时参数（连接池 / statement / lock 超时）
+
+> 中心 DB 是全平台单点（规格 §14）；以下参数是「DB 抖动不把慢查询/死锁放大成平台级故障」的 P1 基线。**DB 侧**参数以 `station_portal` 运行时角色（model.md §3）在 `ALTER ROLE ... SET` 或每连接 `SET` 下发；**portal 侧**连接池参数在 portal 配置下发。
+
+| 参数 | 默认值 | 单位 | 上限 | 配置来源 | 超时/错误表现 | 监控指标 |
+|---|---|---|---|---|---|---|
+| portal → DB 连接池大小 | 20 | 连接 | 与 DB `max_connections` 匹配（默认 100，预留运维连接） | portal 配置 | 池耗尽 → 等待队列 / 请求 `503`；internal 通道 5xx 由 agentd 无限退避重试兜底（runner §4.5） | 池使用率、等待时长 |
+| DB `statement_timeout` | 30 | s | — | `ALTER ROLE station_portal SET statement_timeout`（或每连接） | 超时 → `57014 query_canceled` → 该事务失败回滚 → portal `5xx`（可重试） | 慢查询数、被取消查询数 |
+| DB `lock_timeout` | 10 | s | — | 同上 | 等锁超时 → `55P03 lock_not_available` → 事务回滚（不阻塞死等） | 锁等待次数、锁等待时长 |
+| DB `idle_in_transaction_session_timeout` | 60 | s | — | 同上 | 超时 → 会话被终止（`25P03` / 连接断开）→ 应用层重试 | 空闲事务会话数、被终止会话数 |
+| DB `max_connections` | 100 | 连接 | 按内存/规模评估 | postgres 容器参数（`postgresql.conf` / command） | 超限 → 新连接拒绝（`53300 too_many_connections`） | 连接数 / 上限 |
+
+### 11.3 时间权威来源（统一口径）
+
+- **所有平台时间戳一律 UTC**（ISO 8601 `…Z`；schema.sql 全部 `timestamptz`，portal.md §0）。
+- **权威时钟 = DB `now()`**（station-db 的 PostgreSQL 时钟）：portal 落库的 `seq` 分配、`created_at` / `lease_until` / `released_at` / `claimed_at` 等一律以 DB `now()`（`DEFAULT now()` 已落 schema.sql）为准；租约、reaper、对账、记账（`day` 按 UTC 日历日）全部以 DB 时钟为准。
+- **worker/agentd 上报的事件 `ts` 仅作展示**：它记录「事件在容器内产生的时刻」，**不参与** seq 排序、租约判定、reaper、对账。权威时序恒为 DB 侧 `now()` 分配的 `seq` / 时间列。
+- **时钟漂移对账**：reconciler/定时任务比对「宿主时钟 ↔ DB 时钟 ↔ 容器上报 `ts`」的漂移，超阈值（如 30s）告警（告警通道为 P2 延后事项，但状态落库可查）。
+
+### 11.4 日志位置与轮转
+
+| 组件 | 位置 | 轮转 |
+|---|---|---|
+| portal | `docker logs station-portal`（json-file driver） | docker json-file `max-size` + `max-file`（如 `10m` / `3`） |
+| station-db | `docker logs station-db`（postgres 默认 stderr） | 同上 |
+| Traefik | access log → `/docker/station-edge/logs/`（文件）+ 容器 stdout | 文件由 host `logrotate` 轮转（`daily` + `compress` + `rotate 7`）；stdout 由 docker json-file |
+| socket-proxy | `docker logs station-docker-socket-proxy` | json-file `max-size`/`max-file` |
+| FDE 容器（agentd/worker） | `docker logs fde-<name>`（agentd 单行 JSON 统一输出，runner §14） | 同上 |
+| 排障真相 | 事件/工具调用/judge/审批/用量/审计在 DB（原理三），日志只是**原始**记录、**不作审计依据**（topology §5.2） | — |
+
+> 日志轮转的 `max-size`/`max-file` 与 `logrotate` 周期为运维约定（⚠️ 待决策者确认具体数值）；本文只定「位置 + 必须轮转 + 日志≠审计」三点，不虚构轮转数值。docker daemon 级 `log-driver`/`log-opts` 由 `deploy/` 的 daemon.json 或 compose `logging:` 段设置（deploy-contract.md §2）。
 
 ---
 

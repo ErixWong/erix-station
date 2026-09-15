@@ -99,12 +99,12 @@
 ### L1 用户 → portal
 
 `浏览器 https://station.<base>` → Traefik(host:443) → `127.0.0.1:8080` → portal。
-认证 = portal 自己的 **host-only session cookie**（修 issue #6 后）。SSE 回传需 `flushInterval`（§6 第 5/10 条）。
+认证 = portal 自己的 **host-only session cookie `__Host-fde_session`**（`Secure`/`HttpOnly`/`SameSite=Lax`/`Path=/`、**无 `Domain`**；issue #6 后，取值细节以 [`../api/portal.md`](../api/portal.md) §2.5 为准）。SSE 回传需 `flushInterval`（§6 第 5/10 条）。
 
 ### L2 用户 → 预览/IDE
 
-`浏览器 https://<fde>-<tok>-<port>.fde.<base>` → Traefik → **forwardAuth**（`127.0.0.1:8080/api/forward-auth`，查 `port_allocations` + 会话）→ 200 后代理到 `http://10.200.<n>.2:<port>`。
-**这是唯一「用户直连容器」的链路**（iframe 内嵌 portal 页面）。
+`浏览器 https://<fde>-<tok>-<port>.fde.<base>` → Traefik → **forwardAuth**（`127.0.0.1:8080/api/forward-auth`，查 `port_allocations.hostname` + 按 token 哈希查 `preview_grants`，**不解析 cookie `sub`**；portal 自身会话校验才查 `login_sessions`）→ 200 后代理到 `http://10.200.<n>.2:<port>`。
+预览凭证 = **一次性 ticket（`?preview_ticket=`）换取的 host-only 预览 cookie `__Host-fde_preview`**，**绝不用 portal session cookie**（portal cookie 为 host-only、不会发到预览域，issue #6）。**这是唯一「用户直连容器」的链路**（iframe 内嵌 portal 页面）。执行顺序 / 失败语义 / 信任边界见 §5.2。
 
 ### L3 agentd → portal（internal API）
 
@@ -214,6 +214,41 @@ ORDER BY subnet;
 
 > **池范围 ≠ 放行范围**：`10.200.0.0/16` 与 `10.201.0.0/16` 只是 `fde_networks.subnet` 的**取值池**（子网从这两段中切出），**不是**放行范围；放行范围恒为 `fde_networks` 中实际存在的精确 `subnet`。任何把 `/16` 直接写进 `sourceRange` / `ClientIP` / iptables 的配置都是 bug。
 
+### 5.2 认证与授权链路执行顺序总表（四条链）
+
+> 本文与 [`../api/portal.md`](../api/portal.md) §2.5/§2.7/§2.8 的 cookie/ticket 口径**一致**：portal session cookie 与预览 cookie 均为 **host-only（`__Host-` 前缀、不设 `Domain`、`Secure`/`HttpOnly`/`SameSite=Lax`）**；预览访问走**一次性 ticket + host-only 预览 cookie**，**绝不使用 portal session cookie**（issue #6）。本表是执行顺序与失败语义的唯一落点，cookie/ticket 取值细节以 portal.md 为准。
+
+#### Traefik 中间件执行顺序（通用）
+
+Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中间件（按 `middlewares:` 声明顺序）→ service**。平台用到的中间件及**必须的先后**：
+
+1. `redirect`（scheme http→https）——挂在 entryPoint 层，先于一切
+2. `ipAllowList`（来源白名单，internal 路由）——**必须在任何业务中间件之前**，先挡非白名单来源
+3. `forwardAuth`（身份 + 授权，预览路由 `fde-auth`）——在代理到上游**之前**执行
+4. `headers`（LLM 凭据注入，`<fde>-llm-auth`）——在代理到上游**之前**注入并覆盖
+
+> 单条路由实际只挂其一（internal=`ipAllowList`；预览=`forwardAuth`；LLM=`headers`），不出现同一路由叠加多类；若将来叠加，顺序恒为 `ipAllowList` → `forwardAuth` → `headers` → `redirect`。
+
+#### 四条链路总表
+
+| 链路 | 中间件/检查（按顺序） | 每层失败 → HTTP code | redirect? | 写审计? |
+|---|---|---|---|---|
+| **① 浏览器 → portal**（`station.<base>`） | TLS 终结 → Host 匹配 → portal 自身 session cookie 校验（按 `login_sessions.token_hash` 查库）→ 路由 handler | TLS/主机不匹配 → 连接失败 / `404`；session 无效 → `401 unauthorized`（JSON） | `401` 前端跳登录页 | portal 写登录/登出/关键动作 `audit_log`；Traefik access log 仅原始 |
+| **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `401`（→ 302 登录）；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `401` → Traefik 302 到 `https://<PORTAL_HOST>` | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
+| **③ 容器 → internal API**（`/api/internal/*`） | TLS（容器→Traefik）→ `Host(station) && PathPrefix(/api/internal)` + **`ipAllowList`（remote address，每 FDE 精确 subnet）** → service portal → portal Bearer 校验（`containers.runner_token_hash` 按代次比对）→ 归属校验（`run → session → user_id`）→ handler | 来源不在白名单 → `403`（Traefik）；Bearer 缺失/错 → `401 token_invalid`；吊销 → `401 token_revoked`；归属不符 → `403 run_ownership_mismatch`（或 `404`） | 否（容器不是浏览器，不 302） | portal 对关键动作（claim/心跳/吊销/越权）写 `audit_log` |
+| **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`<fde>-llm-auth` 注入并覆盖 `Authorization` + `X-FDE-Identity`）→ service `llm-hub` | 无匹配 ClientIP → `404`（无兜底路由）；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走网关 `usage_ledger`，Traefik access log 原始 |
+
+#### 失败语义与信任边界（写死）
+
+- **forwardAuth 故障 → deny-all**：portal 5xx / 连接失败 / 超时时，Traefik `forwardAuth` 默认拒绝（请求**不到达**预览上游），**禁止任何 fail-open 配置**；可叠加 basic-auth 兜底（规格 §6.2，仅作 forwardAuth 挂掉时的降级，不是主机制）。
+- **`X-Forwarded-*` 信任边界**：
+  - public entryPoint **不配** `forwardedHeaders.insecure`（不信任客户端 `X-Forwarded-*`）。
+  - forwardAuth 中间件 **不配** `trustForwardHeader: true`（默认 false）→ Traefik 用真实 `Host`/`URI`/`Method` **覆盖** `X-Forwarded-Host`/`X-Forwarded-Uri`/`X-Forwarded-Method` 后再回调 portal——portal 只信 Traefik 覆盖后的值，客户端自报无法伪造。
+  - `ipAllowList` / `ClientIP` **不配**基于 XFF 的 `ipStrategy`（`depth`/`excludedIPs`）——来源判定只用 request remote address（§5）。
+  - `aliasHeadersStrategy: delete`（§6 第 2 条）——防 `X_FDE_Identity` 之类别名头绕过注入。
+  - **推论**：直接以浏览器访问 `https://station.<base>/api/forward-auth`（`Host=station.<base>`）会被 forwardAuth 以「hostname 无对应 allocation」拒为 `404`，无法冒用预览授权（§5 公共约定「forwardAuth 只被 Traefik 回调」由此成立）。
+- **审计归属**：portal `audit_log` 是审计真相；Traefik access log 是原始日志，不作审计依据（规格 §4 组件职责）。
+
 ---
 
 ## 6. 加固清单（10 条，必须全部配置）
@@ -305,7 +340,7 @@ ORDER BY subnet;
 **路由发布预算与收敛机制**（outbox reconciler，配合 §5）：
 
 - **debounce/批量合并**：outbox 到达后按短窗口（如 200ms）聚合同批 revision，一次生成整份 Traefik 动态配置（而非逐 allocation 写文件/reload）。
-- **临时文件校验后原子替换**：生成到临时文件 → Traefik 配置 schema 校验（或 dry-check）→ `mv` 原子替换 → reload。**失败保留上一版本文件**（不回滚到空/半截），并把该 outbox 行置 `failed` + 告警。
+- **临时文件校验后原子替换**：生成到临时文件 → Traefik 配置 schema 校验（或 dry-check）→ `mv` 原子替换 → reload。**失败保留上一版本文件**（不回滚到空/半截）；`attempts < max` 时退回 `pending` 退避重试，`attempts` 耗尽（≥5 ⚠️）才置 `failed`（人工介入终态）+ 告警（状态机与 schema.sql / model.md §2.5 一致）。
 - **reload SLO**：P95 < 2s（从 outbox 落库到 Traefik 生效；目标环境实测）。批量合并不逐条 reload 是达标前提。
 - **预期最大路由数**：30 FDE × 每 FDE 端口数（如 8 项目端口 + run 级若干）→ 数百条 router+service；file provider 单文件承载无压力，reload 频率受 debounce 控制。
 - **批量 offboarding**：N 个 FDE 同时 offboard 时，reconciler 合并为一次生成 + 一次 reload（tombstone 批量处理），不逐 FDE reload。

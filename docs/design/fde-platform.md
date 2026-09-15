@@ -162,7 +162,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 | 层 | 机制 | 挡住的攻击 |
 |---|---|---|
 | ① **网络拓扑** | 每 FDE 独立 `/29`；dev 端口不 publish；Traefik 在 host 网络、零接入即可达所有容器（H-B，§5） | 其他 FDE 的容器直连；内网/公网直连宿主机端口 |
-| ② **门口授权** | Traefik forwardAuth：`cookie.sub === hostname 里的 FDE 标识` | 同在 VPN 的其他人、会话被钓鱼、链接被转发 |
+| ② **门口授权** | Traefik forwardAuth：按 token 哈希查 `preview_grants`（预览凭证）解析 `user_id`，再与 hostname 对应 allocation 的 `fde_id` 及 `exposure` 比对（**不解析 cookie `sub`**；portal 自身会话校验才查 `login_sessions`，同为哈希口径；细节见 [portal.md](../api/portal.md) §2.7 / [topology.md](topology.md) §5.2） | 同在 VPN 的其他人、会话被钓鱼、链接被转发 |
 
 **只有①没②**：任何能连 ingress 的人都能看 → 需求不达成。
 **只有②没①**：一句 `curl 172.x.x.x:4000` 绕过门 → 更糟（有防护的错觉）。
@@ -178,7 +178,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 
 | 坑 | 解法 |
 |---|---|
-| **SameSite 打死 iframe**：portal 在 `station.a.com`、预览在 `b.com` → cross-site → iframe 里 cookie 不发送，预览显示登录页 | **把 FDE 页面放在与 portal 同一 registrable domain 下**：portal = `station.<base>`，预览 = `alice-r3a7f-4000.fde.<base>`。同 site → `SameSite=Lax` 在 iframe 内正常发送 |
+| **SameSite 打死 iframe**：portal 在 `station.a.com`、预览在 `b.com` → cross-site → iframe 里 cookie 不发送，预览显示登录页 | **把 FDE 页面放在与 portal 同一 registrable domain 下**：portal = `station.<base>`，预览 = `alice-r3a7f-4000.fde.<base>`。同 site → `SameSite=Lax` 在 iframe 内正常发送。⚠️ **P1 预览凭证不再是 portal session cookie**：portal 签发一次性 ticket，forwardAuth 换取**预览 host 的 host-only 预览 cookie**（portal session cookie 为 host-only、绝不发到预览域）——同 registrable domain 布局仍保留，是为让「预览 host 自己的 cookie」在 iframe 内为 same-site；细节见 [portal.md](../api/portal.md) §2.5/§2.7/§2.8 |
 | CSP / 缓存 / Referer 泄漏 | `Content-Security-Policy: frame-ancestors https://station.<base>`；`Cache-Control: private, no-store`；`Referrer-Policy: no-referrer` |
 
 ### 6.4 Traefik 骨架（H-B，决策者 2026-09 定稿，issue #5）
@@ -265,7 +265,7 @@ http:
         # responseForwarding.flushInterval 必须调小（≤100ms），否则 token 流被缓冲成整段（topology.md §6 第 5 条）
 ```
 
-portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` 取 FDE 标识 → 与 session cookie 的 `sub` 比对 → 200 / 403**。端口/槽位白名单、审计日志都在这里做。
+portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确查 `port_allocations.hostname` → 按 token 哈希查 `preview_grants`（一次性 ticket / host-only 预览 cookie；portal 自身会话才查 `login_sessions`）→ 按 `exposure` 授权**（**不解析 session cookie 的 `sub`**）。端口/槽位白名单、审计日志都在这里做；执行顺序与失败语义见 [portal.md](../api/portal.md) §2.7 与 [topology.md](topology.md) §5.2，此处不重复定义。
 
 **路由由 portal 生成、经 reconciler 幂等发布到 Traefik file provider，与 DB 的端口分配表同源**（DB 事务写 `port_allocations` + route outbox/revision，§8.1）——不允许手工改，也不允许 FDE 容器打 label 自注册（「路由表里没有 = 不可达」「FDE 不能自注册路由」这两条性质必须成立）。动态配置文件含全部虚拟 key，宿主文件权限 **600**，仅 portal 可写、Traefik 只读（topology.md §6 第 8 条）。
 
@@ -303,7 +303,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` 取 FDE 标�
 2. **分配子网（IPAM）→ 建 `fde-<name>` 网络 → 起容器**（H-B 定稿 D-1/D-10，issue #5）：portal 查 `fde_networks` 推荐下一块空闲 `/29`（管理员可改），`docker network create --subnet` 显式创建；容器**只接自己这条网络**（不再有 `control` 接入），bind mount 用户空间
 3. 分配端口块 + **写预览路由 + LLM 注入路由**：DB 事务写 `port_allocations` + route outbox/revision，由 reconciler **幂等发布**到 Traefik file provider（§8.1；不再是「路由与 DB 同事务」——PG 事务无法含文件写入）
 4. 在 LLM 网关建**虚拟 key**（额度、模型白名单、别名 `alice@client-x`）；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
-5. **写模板/AGENTS.md（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）；含端口约定、分支约定
+5. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 
 > **边界（决策者 2026-09，issue #3 评论）**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立），也**不负责 clone 与 git 凭据下发**——clone 与 git 凭据（SSH key / token）由 FDE 在容器内自行配置，等同他自己的开发机（见 §12.2）。
 
@@ -333,7 +333,7 @@ DB: port_allocations（权威，唯一写入口）
         │ PG 事务无法含文件写入，故不再是「路由与 DB 同一事务」）
         ▼
 reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router+service，§6.4）
-        │ portal 单向写出（直写宿主 bind mount，D-6/issue #7，无需容器网络可达）
+        │ portal 单向写出（直写宿主 bind mount，D-6/issue #7，无需容器网络可达；契约见 user-space.md）
         ▼
 容器内 ~/projects/<project>/.erix/ports.json（agent 只读，永不写）
 ```
@@ -344,16 +344,20 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 **同步规则**：平台 → 容器**单向**；agent 需要新端口**发 API 申请**，绝不自己挑。
 
-### 8.2 分配策略
+### 8.2 分配策略（项目创建分配**单端口**，不是完整端口块）
 
-| 类别 | 用途 | 生命周期 |
-|---|---|---|
-| **项目级固定端口** | URL 稳定：书签、演示、客户 demo、对话页预览卡片 | 项目创建时分配，删除时回收 |
-| **run 级临时端口** | 多分支并发开发；URL 带 runId | run 结束回收 |
+> **裁决（消除「run 端口块 `4000 + runIndex*8…+7` 与 `POST /projects` 只返回一个端口」的矛盾）**：端口空间按 **8 端口块（slot）** 划分，但**项目创建只分配块内第一个端口**；块的其余 7 个端口是 **run 级**（P2）。完整端口块是 run 级规则，不属于项目创建。
 
+| 类别 | 用途 | 生命周期 | P1 |
+|---|---|---|---|
+| **项目级固定端口** | URL 稳定：书签、演示、客户 demo、对话页预览卡片 | 项目创建时分配，删除时回收 | ✅ P1 |
+| **run 级临时端口** | 多分支并发开发；URL 带 runId | run 结束回收 | P2 |
+
+- **端口块（slot）**：每 FDE 端口空间按 8 端口块划分，块 `s` = `4000 + s*8 … 4000 + s*8 + 7`。项目创建时分配一个 slot（`projects.slot`，用户内活跃唯一，schema.sql `projects_live_slot_key`）。
+- **项目级固定端口** = 块首 `4000 + s*8`（默认 `role=frontend`）：项目创建时分配**这一个**端口，`POST /api/projects` 返回**这一个**（示例 `4016 = 4000 + 2*8`，slot=2）。项目删除时回收。
+- **run 级端口块**（P2）= 同项目 slot 块内的剩余 7 个端口 `4000 + s*8 + 1 … +7`（`backend` / `debug` / `spare`），run 启动时按需分配、run 结束回收——「run 端口块」指「一个项目块的 run 级部分」，不是独立于项目的第二套编号。
 - 容器固定角色：`3001` code-server（原 `3000` runner 内部 API **已取消**：容器平台通道零监听、全出站，§10.3，决策者 2026-09，issue #3 评论）
-- run 端口块：`4000 + runIndex*8 … +7`（前端/后端/浏览器调试/备用）
-- 每用户总配额（如 40 个端口），超限**明确报错**而非静默漂移
+- 每用户总配额（如 40 个端口），超限**明确报错**而非静默漂移（`port_quota_exceeded`）
 - 定期 reaper 回收 `released_at` 过期项；Traefik 配置由 reconciler 按 route outbox 幂等发布（§8.1，H-B）
 
 ### 8.3 `ports.json` 结构
@@ -375,6 +379,51 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 1. 端口一律从 `.erix/ports.json` 取，**不要自己挑**
 2. dev server 必须绑 **`0.0.0.0`**（容器内）——与常规安全建议相反，因为容器网络私有且只有 ingress 能进；绑 `127.0.0.1` 会导致 ingress 够不着
+
+### 8.5 hostname grammar 与 `<tok>` 生成（写死）
+
+> **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
+
+**grammar**（小写、DNS 标签安全）：
+
+```
+hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
+<fde>          := [a-z0-9][a-z0-9-]{0,62}          -- users.fde_name，小写
+<tok>          := <project-tok> | <run-tok>
+<project-tok>  := "p-" <project-name>              -- project-name = [a-z0-9][a-z0-9-]{0,62}（schema CHECK）
+<run-tok>      := "r" <runid-short>                -- runid-short = [a-z0-9]{5,8}
+<port>         := [0-9]{4}                          -- 恒 4 位（4000..4999）
+```
+
+| 段 | 字符集 | 长度 | 生成规则 |
+|---|---|---|---|
+| `<fde>` | `[a-z0-9-]`，小写，不以 `-` 开头/结尾 | 1..63 | `users.fde_name`（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段） |
+| `<project-tok>` | `p-` + `[a-z0-9-]` | `p-` + 1..63 | `"p-" + projects.name`（项目名快照） |
+| `<run-tok>` | `r` + `[a-z0-9]`（**不含 `-`**，避免与段分隔符歧义） | `r` + 5..8 | `"r" + base32(run_id UUID，RFC 4648 小写无 padding) 的前 5 位`；碰撞时递增到 6/7/8 位重试 |
+| `<port>` | `[0-9]` | 4 | `4000..4999` 的十进制，零填充到 4 位 |
+
+- **base32 字母表**：`abcdefghijklmnopqrstuvwxyz234567`（小写、无 padding），天然满足「无 `-`、小写、字母数字」，且与现有示例 `r3a7f` 一致（`3a7f` 均为合法 base32 字符）。
+- **不可变性（写死）**：`hostname` / `url` 是 allocation 的**一次性分配标识，一旦生成永不改写**。保证书签/分享链接/iframe/预览卡片不漂移（原理三「URL 稳定」，§8.2 项目级固定端口用途）。
+- **碰撞处理**：`project-tok` 天然无碰撞（`fde_name` 全局唯一 + `projects.name` 用户内唯一 + hostname 含两者，schema.sql `port_allocations_live_hostname_key` 兜底）；`run-tok` 靠 base32 熵（5 位 ≈ 25 bits）+ `port_allocations_live_hostname_key` 唯一索引兜底，碰撞时**递增位数重试**（5→6→7→8，8 位 ≈ 40 bits，单 FDE 活跃 run 规模下碰撞概率可忽略）。
+- **项目改名行为（写死）**：`PATCH /api/projects/:id` 改名**不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**；改名只影响 `projects.name`（容器内目录名）与**后续新建** run 的 hostname，旧 hostname 保持可访问（书签不破）。
+
+> ⚠️ 跨文件同步点：portal.md §3.5 现行文字「改名会同步重生成端口 hostname/url」与本条「不可变」冲突，须转派修订 portal.md 为「改名不重生成 hostname/url，旧 hostname 保持」；另 schema.sql `users.fde_name` 目前无 `CHECK`（仅 `UNIQUE`），本 grammar 的 `<fde>` 字符集需在应用层强制（可选转派 schema.sql 加 CHECK）。
+
+### 8.6 `allocated → active` 的触发条件与幂等更新（写死）
+
+> **裁决**：`allocated → active` 由 **首次 forward-auth 放行** 触发（P2 预览链路首次成功授权）。选它而非「runner 上报监听」的理由：forward-auth 放行是「端口已经过边缘授权并实际被访问过」的确定信号，且**不需要新增任何 internal 端点**；「runner 上报监听」要求 agentd 可靠探测 detached dev server 的监听状态（额外探测机制 + 新端点），P1 无预览、收益为零。model.md §2.2 的 `⚠️ 待决策者确认` 按本条定案（转派 model.md 同步）。
+
+- **判定**：Traefik 回调 `/api/forward-auth`（portal.md §2.7）返回 `200 + X-Auth-User`（放行）即触发。
+- **写库时机**：portal 在**同一次 forward-auth 处理内**，放行判定通过后执行幂等升级：
+  ```sql
+  UPDATE port_allocations
+  SET state = 'active'
+  WHERE id = $1 AND state = 'allocated';
+  ```
+  `WHERE state='allocated'` 保证**幂等**：首次放行才升级，后续放行影响 0 行、不重复写；已 `released` 不会误升级。
+- **不触发路由重发布**：`allocated` 与 `active` 的转发语义一致（forward-auth 第 2 步两者都放行，portal.md §2.7），故升级**不写 route outbox、不重发 Traefik 路由**——`active` 只是 UI「在线」展示态 + 报表口径。
+- **语义边界（尽力而为，不是强在线探针）**：forward-auth 放行只证明「授权通过且请求到达边缘」，**不**证明上游 dev server 返回 200（授权与上游健康是两件事）。因此 `active` 的语义 =「已获准访问过」，UI「在线」应按此口径；dev server 强在线探针（reconciler 定期对上游 200 探测）留作 P2 预览卡片可选增强，P1 不做。
+- **P1 影响**：P1 无预览路由（deploy-contract.md §7 P1 范围），故 P1 期间 allocation 恒为 `allocated`，`active` 只在 P2 预览启用后出现；不影响 P1 端口分配/物化/回收。
 
 ---
 
@@ -413,7 +462,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 四条注意：
 
 1. **checkpoint 必须成对**（save + load）。不成对 → 恢复保护静默失效；成对 → **fail-closed**：工具执行前写失败则抛 `checkpoint_failed`，任务直接失败。
-2. **store adapter 必须包 retry**，并把 `checkpoint_failed` 识别为**可重试**（erix ≤0.3.4 无重试）。adapter = 调 portal internal 端点的 HTTP adapter（不直连 DB，D1'/D2'），重试参数见 [runner-integration.md](runner-integration.md) §9.2。
+2. **store adapter 必须包 retry**，并把 `checkpoint_failed` 识别为**可重试**（erix ≤0.3.5 无内建重试）。adapter = 调 portal internal 端点的 HTTP adapter（不直连 DB，D1'/D2'），重试参数见 [runner-integration.md](runner-integration.md) §9.2。
 3. **runId 用 UUID**，不要用 cwd 派生（多用户下会撞）。
 4. `run_events` / 用量 / session 状态**不属于** `TranscriptStore` 契约 → 由 portal 在 internal 端点侧补齐（事件落库与 seq 分配、`last_seq` 推进、`usage_ledger` 记账；agentd 只负责上报，runner-integration §4.2/§7）。
 
@@ -427,13 +476,16 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 | erix 回调 | 信封 |
 |---|---|
-| `onEvent`（`round_start`/`attempt`/`tool_use`/`tool_result`/`usage`/`round_end`/…） | `{seq, ts, session_id, run_id, type: 同 LoopEvent}` |
+| `onEvent`（`round_start`/`attempt`/`tool_use`/`tool_result`/`usage`/`round_end`/…） | `{seq, ts, session_id, run_id, type: 同 LoopEvent}`（其中 `usage` 类事件**仅实时展示**，不参与记账，见下） |
 | `onDelta` / `onReasoningDelta` | `{type:"assistant_delta"｜"reasoning_delta", text}` |
 | `onToolCall`（参数增量） | `{type:"tool_call_delta", ...}` |
 | `onJudge` | `{type:"judge", kind, action, decision}` |
-| `runToolLoop` 返回值 | `{type:"run_end", termination, usage, compaction_stats}` |
+| `runToolLoop` 返回值 | 喂 U2 终态载荷（`termination`/`usage`/`rounds`/`final_text`），**不直接产事件**——`run_end` 事件由 portal 在 U2 终态事务合成（runner §7.6） |
 
 `seq`（erix 不提供）由宿主在落库时分配。
+
+> **usage 唯一权威来源**：记账以 `onUsage`（随 U2 终态载荷 `usage` 上报 → `runs.usage` + `usage_ledger`，`source='erix'`，一 run 一条）为准；`onEvent` 中出现的 `usage` 类事件**只作实时展示、不产生第二条记账**（runner-integration §4.2/§6.3）。
+> **`run_end` 唯一产生方**：portal 由 U2 终态合成（worker 不再经 U3 发 `run_end`，runner §7.6）——上表「runToolLoop 返回值」一行只说明数据来源，不表示 worker 直接发事件。
 
 ### 10.2 传输
 
@@ -507,26 +559,30 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 ## 12. 容器模板与工作区约定
 
-### 12.1 目录布局
+### 12.1 目录布局与路径映射
+
+宿主 `/srv/erix/users/<fde>/`，FDE 容器内映射为 `/home/<user>/`（HOME）。**路径映射表、文件清单、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**——本节只保留规格层面的骨架，细节以该契约为准（原「bind mount 到容器内同路径（路径一致性约定）」的临时表述已按 issue #7 修正为「宿主路径 ↔ `/home/<user>` 显式映射」）。
 
 ```
-/srv/erix/users/<fde>/            # 宿主机；bind mount 到容器内同路径（路径一致性约定）
-├── home/                          # HOME：.erix/{config.json,mcp.json,skills,todos}
-├── projects/<project>/            # 仓库；含 .erix/ports.json
-├── worktrees/<project>-<runId>/   # 每个 run 独占的 git worktree
+/srv/erix/users/<fde>/            # 宿主机（user-space.md §2）
+├── home/                          # 挂到容器 /home/<user>（HOME：.erix/{config.json,mcp.json,skills,todos} + .cache/station/spool）
+├── projects/<project>/            # 仓库；含 .erix/{ports.json,AGENTS.md} + .gitignore
+├── worktrees/<project>-<runId>/   # 每个 run 独占的 git worktree（agentd 创建）
 └── cache/                         # 依赖缓存（npm/pnpm/pip）
 ```
 
-> **容器网络（H-B 定稿，issue #5）**：FDE 容器**只接自己的 `/29`**（不接 `backend`、无 `control`）；Traefik 不在容器内（host 网络）；容器内**零 LLM 凭据**（§11）。文件投递（模板/AGENTS.md/ports.json）由 portal 直写上述宿主 bind mount（D-6），不需任何入站网络。
+> **容器网络（H-B 定稿，issue #5）**：FDE 容器**只接自己的 `/29`**（不接 `backend`、无 `control`）；Traefik 不在容器内（host 网络）；容器内**零 LLM 凭据**（§11）。文件投递（模板/AGENTS.md/ports.json）由 portal 直写上述宿主 bind mount（D-6），不需任何入站网络；属主/权限/原子写见 [`user-space.md`](user-space.md) §5/§6。
 
 ### 12.2 容器内约定（写进 FDE 容器的 AGENTS.md）
 
 - 一个项目 = `~/projects/<project>`；一个 run = `~/worktrees/<project>-<runId>` + 分支 `agent/<runId>`
 - 端口从 `~/projects/<project>/.erix/ports.json` 取，不自己挑；dev server 绑 `0.0.0.0`
 - 回流走 fork/PR，不直接在主干改
-- `git worktree` 由 **agent（FDE）自己在容器内全权管理**：创建、`worktree remove` / `worktree prune` 清理都归它自己负责，平台不介入（决策者 2026-09，issue #3 评论）；`.git` 是共享的，清理时别误删其他 run 的 worktree
+- `git worktree` 的**创建与清理（`worktree remove` / `worktree prune`）归 agentd**（run 启动前必须存在、结束后由 agentd 回收，见 runner-integration §6.2）；worktree 内的**内容由 agent（FDE）在容器内自行管理**（改代码、commit、分支），平台不代管内容（决策者 2026-09，issue #3 评论）；`.git` 是共享的，清理时别误删其他 run 的 worktree
 - `node_modules` 每个 worktree 一份 → 用 pnpm store / npm cache 共享
 - clone 与 git 凭据（SSH key / token）由 FDE 在容器内自行配置（等同他自己的开发机）；平台不下发、不代管 git 凭据（边界见 §7.2）
+
+> **平台文件读取纪律**：`ports.json` / `config.json` 一律经 `manifest.json` 校验后再读（防跨文件混合版本），见 [`user-space.md`](user-space.md) §3/§5.4。
 
 ### 12.3 端口模板（FDE 容器内）
 
@@ -569,14 +625,20 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 ## 14. 部署与运维（裸 Linux host + Docker）
 
-- 平台栈用 `deploy/docker-compose.yml`：`station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`）+ `station-portal`（`backend` 网络，publish 仅 `127.0.0.1:8080` 回环）+ `station-db`（`backend` 网络，不 publish）（H-B 定稿，issue #5）
-- FDE 容器由 portal 通过 Docker API 动态创建（模板化，非 compose）
-- **数据持久化**：bind mount 一律 `/docker/<名称>/`（平台统一约定）；用户空间 `/srv/erix/users/<fde>/`（宿主路径与容器内一致）
-- `restart: unless-stopped`；DB 与 portal 配 healthcheck
+> **部署契约（compose 字段、镜像 pin、healthcheck、DB 迁移、Traefik 静态/动态配置、防火墙应用方式、socket-proxy、FDE 容器创建参数、readiness 语义、P1 范围）已独立成文：[`deploy-contract.md`](deploy-contract.md)**（P1 部署契约）。本节只保留规格层面的不变式与决策，字段级细节以该契约为准。
+>
+> （注：任务原文写「§12 部署段」，但本文 §12 是「容器模板与工作区约定」，部署段实为 §14——按实际位置引用，本节即原「部署与运维」段。）
+
+- 平台栈用 `deploy/docker-compose.yml`：`station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`）+ `station-portal`（`backend` 网络，publish 仅 `127.0.0.1:8080` 回环）+ `station-db`（`backend` 网络，不 publish）+ `docker-socket-proxy`（`backend` 网络，仅 portal 可达）（H-B 定稿，issue #5；**compose 字段/healthcheck/volume/镜像 pin 见 deploy-contract.md §2/§3**）
+- FDE 容器由 portal 通过 Docker API 动态创建（模板化，非 compose）；**创建契约（网络 `--subnet`/`--add-host`/UID-GID/capability/agentd 命令）见 deploy-contract.md §5**
+- **数据持久化**：bind mount 一律 `/docker/<名称>/`（平台统一约定）；用户空间 `/srv/erix/users/<fde>/`（宿主路径，FDE 容器内映射 `/home/<user>`，见 [`user-space.md`](user-space.md) §2）；**宿主源↔容器目标↔权限见 deploy-contract.md §2**
+- `restart: unless-stopped`；DB 与 portal 配 healthcheck（**阈值与 readiness 语义见 deploy-contract.md §2/§8**）
 - **容器资源限额**：FDE 容器的创建参数（如 `--memory` 限额）只能由 portal 经 Docker API 设置（容器创建参数为平台侧独有）；`node_modules` 每 worktree 一份的磁盘/内存压力在容器内由 FDE 用 pnpm store / npm cache 自行缓解（§12.2）
 - **可靠性**：中心 DB 是全平台单点；portal 无状态（状态在 DB），可重启。**DB 备份/高可用不在本项目范围**（系统级方案负责，决策者 2026-09，issue #3 评论）——平台侧只保证数据落卷（bind mount，见上）、DB 处于可被系统级备份方案备份的形态
 - **可观测**：run 事件、judge 决策、工具调用、访问审计、用量都在 DB，直接做看板
 - **长任务无人看** → 完成/失败/需审批时通知（邮件或 IM webhook）——**延后（P2+），P1 不做**（决策者 2026-09，issue #3 评论）。§7.1 本地 admin 登录告警、§11.4 出口策略未实施时的管理层书面知情，语义保留（它们是设计结论），但**通知通道实现同属延后事项**，不阻塞 P1
+- **运行时超时/租约/心跳/背压/时间权威/日志轮转**：见 [`env.md`](../env.md) §11「P1 运行时参数表」
+- **防火墙应用方式**（iptables-nft、幂等、fail-closed、docker/宿主重启恢复）：见 deploy-contract.md §4
 
 ---
 

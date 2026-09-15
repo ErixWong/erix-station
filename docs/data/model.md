@@ -27,7 +27,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 
 | 组 | 表 | 来源 |
 |---|---|---|
-| 账号与认证 | `users` / `login_sessions` / `api_tokens` | 规格 §7 |
+| 账号与认证 | `users` / `login_sessions` / `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.7 |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
 | 会话与对话 | `chat_sessions` / `runs` / `messages` | 规格 §9.1 |
 | 端口分配与路由 | `port_allocations` / `route_outbox` / `route_revisions` | 规格 §8 / topology.md §5/§8 |
@@ -96,7 +96,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `id` | **portal 生成的 UUID**，随任务下发给容器；禁止 cwd 派生（规格 §9.3-3：多用户会撞） |
 | `status` | 状态机见 §2.1 |
-| `termination` | run 结束时由 `runToolLoop` 返回值透传：**对象** `{reason, detail?}` jsonb，`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, reflection_stop, judge_done, continuation_exhausted, aborted, failed}`（依据：erix-agent v0.3.4 `src/loop.js:622`；portal.md §4.1/§5.3）；运行中为 `NULL` |
+| `termination` | run 结束时由 `runToolLoop` 返回值透传：**对象** `{reason, detail?}` jsonb，`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, reflection_stop, judge_done, continuation_exhausted, aborted, failed}`（依据：erix-agent v0.3.5 `src/loop.js:622`；portal.md §4.1/§5.3）；运行中为 `NULL` |
 | `usage` / `cost` | `usage` 为 `{input_tokens, output_tokens}` jsonb（run_end 汇总）；`cost` ⚠️ 待决策者确认（Q1/Q4，P1 可空，见 §5） |
 | `error` | 失败时为 `{code, message, retryable}`；run 级错误码见 portal.md §6.4（`rate_limited` / `checkpoint_failed` / `container_exited` / …） |
 | `cancel_requested_at` | 停止标记：portal 写、runner 轮询（`AbortController` 跨不了进程，规格 §10.3） |
@@ -109,7 +109,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 关键字段 | 语义 |
 |---|---|
-| `fde_id` | → `users.id`，**FDE 用户**（forward-auth 的 `cookie.sub` 比对对象，portal.md §2.7 第 4 步） |
+| `fde_id` | → `users.id`，**FDE 用户**（forward-auth 按预览凭证哈希查 `preview_grants` 解析 `user_id` 后与此列比对，portal.md §2.7；不解析 `cookie.sub`，旧口径作废） |
 | `scope` / `run_id` | `project` 级 `run_id` 必空、`run` 级必带 → `CHECK ((scope='run') = (run_id IS NOT NULL))`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，字段先行保留（principles §4 Q5 倾向 (b)） |
 | `port` | 容器内 dev 端口，`CHECK (port BETWEEN 4000 AND 4999)`；3001 code-server 是容器固定角色，不入表（规格 §12.3；原 3000 runner 内部 API 角色已取消——容器平台通道零监听，规格 §10.3，决策者 2026-09） |
 | `hostname` / `url` | 由 portal **与 Traefik 路由同源生成**（规格 §8.1）；前端只展示/跳转 `url`，永不拼接（portal.md §8-4） |
@@ -128,17 +128,21 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 ### 1.11 `run_checkpoints` — checkpoint（fail-closed 的落点）
 
-**每 run 一行**（`run_id` 即主键）：上游 store 的 `saveCheckpoint` 是**覆盖写单份**（tmp+rename 原子覆盖）、`loadLatestCheckpoint(runId)` 无参数（依据：erix-agent v0.3.5 `src/store/file.js:279-297`，已 grep 复核）。写入语义 = `INSERT ... ON CONFLICT (run_id) DO UPDATE`（单行覆盖，重试安全；portal.md §9）。**必须成对**（save + load）：工具执行前写失败 → `checkpoint_failed`，任务直接失败（规格 §9.3-1）；HTTP adapter 必须包 retry 且识别其为可重试（规格 §9.3-2，runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
+**每 run 一行**（`run_id` 即主键）：上游 store 的 `saveCheckpoint` 是**覆盖写单份**（tmp+rename 原子覆盖）、`loadLatestCheckpoint(runId)` 无参数（依据：erix-agent v0.3.5 `src/store/file.js:279-297`，已 grep 复核）。写入语义 = `INSERT ... ON CONFLICT (run_id) DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9）。**必须成对**（save + load）：工具执行前写失败 → `checkpoint_failed`，任务直接失败（规格 §9.3-1）；HTTP adapter 必须包 retry 且识别其为可重试（规格 §9.3-2，runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
+
+**单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 run 的**单调版本号**。worker 每 run 从 0 起递增；portal 端 `DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume（方案 B re-claim）时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker 从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
 
 ### 1.12 `run_events` — 第③层：流式事件日志
 
-见 §3。只追加；`seq` 由 portal 落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；**`client_event_id` 为客户端幂等键**（worker 生成 `run_id:单调计数`），`UNIQUE(run_id, client_event_id)` + `ON CONFLICT DO NOTHING` 支撑 agentd 批量上报的 at-least-once 去重（runner-integration §7.3）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
+见 §3。只追加；`seq` 由 portal 落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；**`client_event_id` 为客户端幂等键**（worker 生成 `run_id:attempt:单调计数`，attempt 为本次 start 次数、计数为该 attempt 内单调递增），`UNIQUE(run_id, client_event_id)` + `ON CONFLICT DO NOTHING` 支撑 agentd 批量上报的 at-least-once 去重（runner-integration §7.3）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
+
+> **事件排序与 attempt 语义（issue #8）**：`seq` 只是**回放游标**（session 全局、按到达顺序分配、严格递增、无空洞），**不是** run 内逻辑顺序；逻辑顺序由 `client_event_id` 的 `(attempt, 计数)` 编码。attempt 使 re-claim 后新 worker 的计数归零也不会与旧 attempt 的 `client_event_id` 碰撞。乱序**到达**不影响正确性（逐事件幂等 + 自包含）；严格递增只对 `seq` 游标成立。详见 runner-integration §7.3/§7.5。
 
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
 
-- `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。
+- `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。**行由 portal 在 U3 事件上报时幂等 upsert**（`type='tool_use'` 事件 `INSERT ... ON CONFLICT (run_id, call_id) DO NOTHING`，后续 `tool_result`/`tool_call_delta` 更新派生字段，portal.md §9.10）——U10 建审批单时行必已存在。
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。
-- `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending` 与 `decided_at` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 审批契约由 issue #10 定稿确认；若 #10 改判为 UUID，则以 #10 为准并同步本表。
+- `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending/expired` 与 `decided_at IS NULL` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 超时语义已定稿（#10：`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判 UUID 待 #10 确认。
 - `artifacts`：run 产出的文件登记（`kind / path / size / sha`），路径为容器内路径。
 
 ### 1.14 `usage_ledger` — 用量台账
@@ -155,13 +159,14 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 关键字段 | 语义 |
 |---|---|
-| `container_id` | **派单目标**容器（入队时定，路由语义） |
-| `owner_container_id` | **当前租约持有者**（claim 时写，release / reaper 回收时清）。与 `container_id` 分列的理由：容器重建后由新容器 re-claim 时只改持有者、不改路由原值 |
-| `claim_token` | 本次认领凭证；run 级写请求带 `X-Claim-Token`，re-claim 后旧 token 失效（`409 lease_lost`）——**双写防护**（runner-integration §4.2/§6.4） |
+| `container_id` | **入队时的派单目标容器实例**（历史路由快照，审计/对账用）。**领取资格不再按它过滤**（重建后容器实例 id 会变） |
+| `owner_container_id` | **当前租约持有者**容器实例（claim 时写，release / reaper 回收时清）。fencing 用 `owner_container_id` + `claim_token` |
+| `claim_token` | 本次认领凭证；run 级写请求带 `X-Claim-Token`、心跳 U4 逐 run 携带，re-claim 后旧 token 失效（`lease_lost`）——**双写防护**（runner-integration §4.2/§6.4） |
 | `lease_until` | 租约到期时刻（lease 90s ⚠️，随心跳续期）；过期允许 re-claim（认领 SQL 见 schema.sql §8 注释） |
-| `attempts` | 认领次数；耗尽（如 ≥3）→ runs `failed`（`internal`，runner-integration §6.2） |
+| `attempts` | 已发起的（re-）start 次数（claim 成功 +1）；崩溃循环上限见 `max_attempts` |
+| `max_attempts` | 崩溃循环上限（默认 3，`CHECK max_attempts >= 1`）；`attempts >= max_attempts` 且再失败 → runs `failed`（`max_attempts_exceeded`） |
 
-`run_id UNIQUE`（一个 run 至多入队一次）；CHECK 强制 `claimed` 行必带 `claimed_at / lease_until / owner_container_id / claim_token`；状态机见 §2.4。
+**领取资格（issue #8）**：以**稳定 FDE 身份**（`user_id`，经 run → session → user 推导）为准，**不以容器实例 id** 为准——容器重建后新容器（同 user）天然可领取入队时派给旧容器的队列行；`owner_container_id` 记录当前持有者、`container_id` 保留入队时目标作审计快照。`run_id UNIQUE`（一个 run 至多入队一次）；CHECK 强制 `claimed` 行必带 `claimed_at / lease_until / owner_container_id / claim_token`，另有 `CHECK (attempts <= max_attempts)`；状态机见 §2.4/§2.8。
 
 ### 1.17 `fde_networks` — FDE 网络注册表（IPAM 真相，H-B D-10）
 
@@ -200,7 +205,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `body` | 工具结果全文；**超过阈值才另存**——事件里只放 `result_digest` + 引用（`tool_outputs.id`），避免打爆 `run_events` |
 
 > **`tool_call_id` canonical 规则（`tool_outputs` / `approvals` 一致）**：外部 ID = `tool_calls.call_id`（事件流 `tool_use`/`tool_result`/`tool_call_delta` 的 `tool_call_id`，字符串如 `tc_301`）；`tool_calls.id` 是**内部主键（uuid），不外露、不进 API 载荷**。两表都以复合外键 `(run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)` 关联（`tool_calls` 有 `UNIQUE(run_id, call_id)`）。
-> ⚠️ **审批契约由 issue #10 定稿确认**：若 #10 改判为 UUID，则以 #10 为准并同步 `approvals` / `tool_outputs` 两表。
+> ⚠️ **审批契约（issue #10）**：超时语义已定稿（`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判为 UUID 仍待 #10 确认——若改判则同步 `approvals` / `tool_outputs` 两表。
 
 ### 1.20 `fde_llm_bindings` — FDE ↔ LLM 网关虚拟 key 绑定（规格 §11.3）
 
@@ -213,6 +218,23 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `revoked_at` / `rotated_at` | 吊销/轮换时刻 |
 
 **红线**：真实 key **绝不存明文**——只写宿主 Traefik 动态配置（600，portal 可写、Traefik 只读）；本表只存 `key_id` / 别名 / 代次（供轮换、吊销、用量对账，topology.md §4-L7/§6 第 8 条）。
+
+### 1.21 `preview_grants` — 预览授权凭证（portal.md §2.7/§2.8）
+
+forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 exposure 判定（**不解析 `cookie.sub`，旧口径作废**）；portal 自身会话的登录态才查 `login_sessions`（§1.2），与本表互不相干。两种凭证：`kind='ticket'`（一次性预览 ticket）与 `kind='session'`（host-only 预览 cookie）。
+
+| 关键字段 | 语义 |
+|---|---|
+| `token_hash` | 唯一；`sha256(token)`，不存明文（与 `login_sessions.token_hash` 同口径） |
+| `user_id` / `allocation_id` | 凭证归属用户与目标 allocation（`allocation_id → port_allocations.id`） |
+| `kind` | `ticket`（一次性）/ `session`（host-only 预览 cookie，滚动续期） |
+| `state` | `active / used / revoked / expired`（状态机见 §2.4）；`used` 仅 ticket 有（`CHECK (kind='session') = (used_at IS NULL)`） |
+| `expires_at` | TTL 截止时刻：ticket **60s** ⚠️、session **15min** ⚠️ 滚动（portal.md §2.8） |
+| `used_at` | ticket 首次校验同事务原子置位（单次有效，重放 → `403 preview_ticket_used`） |
+| `revoked_at` | 显式吊销 / allocation `released` / 用户 `disabled`（portal.md §2.8/§2.9.3） |
+| `last_seen_at` | session 最近一次校验通过（滚动续期刷新） |
+
+**与 allocation 释放的联动**：allocation 为软删除（`state → released`），释放事务由 portal 应用层**同事务**把该 allocation 的 `active` 凭证置 `revoked`；forwardAuth 每请求重查 allocation `state` 双保险（portal.md §2.8）。外键为普通引用（无级联）：物理删除 allocation（reaper 硬删 released 过期行，§4）前须先清空引用它的本表行（grant reaper 先删过期/已吊销/已消耗行，或显式按 `allocation_id` 删）。`expired` 由 reaper 周期性懒打标；forwardAuth 有效性判定同时查 `state` 与 `expires_at > now()`（打标前窗口仍拒绝，双保险）。
 
 ---
 
@@ -230,14 +252,15 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
                  ┌────▼─────┐   POST /stop（cancel_requested）│
                  │ running  │ ◀───────────────────────────────┘ (仅标记，状态仍由 runner 收敛)
                  └────┬─────┘
-        run_end 正常  │  异常（checkpoint_failed / rate_limited / container_exited / …）
+        run_end 正常  │  异常（checkpoint_failed 重试耗尽 / rate_limited / max_attempts_exceeded）
                  ┌────▼────┐   ┌────────┐
                  │ finished│   │ failed │
                  └─────────┘   └────────┘
    cancelling 收敛：runner 终止后 → finished（termination.reason='aborted'）或 failed
+   （崩溃 ≠ 直接终态：worker/agentd 崩 → §2.8 崩溃恢复，attempts 内 re-claim 续跑）
 ```
 
-> UI 上「已取消」是**宿主展示态**：由 `cancel_requested_at` + `termination.reason='aborted'` 推导，不是引擎的 termination 取值（引擎 reason 集合见 §1.7，依据：erix-agent v0.3.4 `src/loop.js:622`/`712`）。
+> UI 上「已取消」是**宿主展示态**：由 `cancel_requested_at` + `termination.reason='aborted'` 推导，不是引擎的 termination 取值（引擎 reason 集合见 §1.7，依据：erix-agent v0.3.5 `src/loop.js:622`/`712`）。
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
@@ -245,9 +268,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `running` | agentd 上报 `markRunState`（规格 §9.3），**portal 落库**（D1'） | portal：SSE 状态展示、`GET /api/runs/:id`；FDE：stop / 审批操作的前置状态 |
 | `cancelling` | portal：`POST /api/sessions/:id/stop` 写 `cancel_requested_at` + 状态（portal.md §4.5） | agentd：SSE `stop_request`（主）/ 心跳 `stop_run_ids`（兜底）收到后 abort worker（runner-integration §4.3/§10）；portal：SSE 展示「停止中」 |
 | `finished`（终态） | worker 跑完上报 → agentd 经 internal API 提交终态载荷（含 `termination` / `usage` 汇总，portal.md §5.3-13 / §9），**portal 收敛落库** | portal：消息落 `messages`、用量记 `usage_ledger`、run 级端口释放（→ `released`）；UI：展示 |
-| `failed`（终态） | agentd 上报异常（如 `worker_crashed`）；portal：心跳丢失判定 `container_exited`（portal.md §6.4） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：重发消息继续（checkpoint 成对恢复） |
+| `failed`（终态） | **非重试性错误**（`checkpoint_failed` 重试耗尽 / `rate_limited` / `max_attempts_exceeded` 等）由 agentd 上报；崩溃（worker/agentd）在方案 B 下**不直接终态**——先走 §2.8 re-claim，`attempts >= max_attempts` 才置 `failed`（`max_attempts_exceeded`） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：可手动重新提交（新 run，非自动 resume） |
 
-> 终态不可再变（无产生新状态的出边）；`cancelling` 的收敛者恒为 runner——容器死了由 portal 心跳检测直接置 `failed`（`container_exited`），不留悬挂 `cancelling`。
+> 终态不可再变（无产生新状态的出边）；`cancelling` 的收敛者恒为 runner——容器死了（心跳 3 次丢失）走 §2.8 崩溃恢复（租约到期 re-claim，或 attempts 耗尽 → `failed`），不留悬挂 `cancelling`。
 
 ### 2.2 `port_allocations.state`
 
@@ -278,19 +301,23 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
  runner 工具拦截 / judge 要求审批
         │
    ┌────▼────┐   FDE 决定（POST /api/approvals/:id）
-   │ pending │ ──────────────┬──────────────┐
-   └─────────┘          ┌────▼────┐    ┌────▼───┐
-                        │ approved│    │ denied │
-                        └─────────┘    └────────┘
+   │ pending │ ─────────────┬──────────────┐
+   └────┬─────┘        ┌────▼────┐   ┌────▼───┐
+        │ 10min 无决定    │ approved│   │ denied │
+        │（portal 打标）  └────┘   └────────┘
+   ┌────▼────┐
+   │ expired │（终态，修 #10 审计失真；迟到决定被拒）
+   └─────────┘
 ```
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `pending` | worker 侧 judge/工具拦截产生，经 agentd 中转、portal 建单（规格 §9.1；portal.md §4.8/§9） | FDE：`GET /api/approvals?status=pending` 列表与决定；通知（规格 §14「需审批时通知」） |
+| `pending` | worker 侧 judge/工具拦截产生，经 agentd 中转、portal 建单（规格 §9.1；portal.md §4.8/§9） | FDE：`GET /api/approvals?status=pending` 列表与决定；通知（规格 §14「需审批时通知」）；审批 reaper：10min 超时 → `expired` |
 | `approved`（终态） | FDE：`POST /api/approvals/:id`（`decision=approve`） | worker：经 agentd 中转（SSE 快通道 + 轮询兜底，runner-integration §10）收到决定后继续执行该工具调用；审计 |
 | `denied`（终态） | 同上（`decision=deny`） | worker：不抛错，把「被拒绝」作为 tool_result 反馈引擎（runner-integration §10.1）；审计 |
+| `expired`（终态） | portal 审批 reaper：`pending` 挂起 **10 分钟** ⚠️ 无决定 → 置 `expired`（写 `expired_at`，#10 / topology.md §4-L6） | worker：agentd 本地 10min 超时按 denied 收敛（不等 portal 打标）；FDE：迟到决定被拒（`409 approval_expired`，portal.md §9.10）；审计 |
 
-> `409 already_decided`（portal.md §4.8）由 `decided_at IS NOT NULL` + 应用层条件更新（`UPDATE ... WHERE status='pending'`）兜底；终态无出边。
+> `409 already_decided` / `409 approval_expired`（portal.md §4.8/§9.10）由条件更新（`UPDATE ... WHERE status='pending'`）兜底；终态无出边。
 
 ### 2.4 次要状态机（一览）
 
@@ -299,7 +326,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发（拉模型：消息落库即 202、容器恢复后自行 claim，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`，3 次丢失 ≈45s ⚠️，runner-integration §4.2） |
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
 | `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
-| `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回 `pending`（re-claim） |
+| `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收：`attempts < max_attempts` → 回 `pending`（re-claim），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
+| `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
 
 ### 2.5 `route_outbox.state`
 
@@ -310,21 +338,24 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
    │ pending  │ ────────────────────────────────────────────────────────────────────────────────▶ │ processing │
    └──────────┘                                                                                    └─────┬──────┘
                          租约到期未完成 → reaper 回收 pending（attempts+1）│
-                                                         发布成功│  发布失败（attempts 内退避重试）
+                                              发布失败且 attempts < max → 退回 pending（退避重试，attempts+1）
+                                                         发布成功│  发布失败且 attempts 耗尽
                                                         ┌───────▼──┐   ┌───────┐
-                                                        │ published│   │ failed │（attempts 耗尽 / 告警）
+                                                        │ published│   │ failed │（终态：人工介入）
                                                         └──────────┘   └───────┘
 ```
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `pending` | portal：任何写 desired state 的事务同时写一行 outbox（revision 递增，见 `route_revisions`）；reaper 把过期 `processing` 回收 | reconciler：领取并处理 |
+| `pending` | portal：任何写 desired state 的事务同时写一行 outbox（revision 递增，见 `route_revisions`）；reaper 把过期 `processing` 回收；reconciler 发布失败且 `attempts < max` 时退回 | reconciler：领取并处理 |
 | `processing` | reconciler：领取（原子，`FOR UPDATE SKIP LOCKED` + 写 `claimed_at`/`lease_until`/`worker_id`，避免重复消费） | reconciler 自身：发布成功后置 `published` |
 | `published` | reconciler：Traefik 动态配置生成 + 校验 + 原子替换 + reload 成功后 | 对账任务：与 file provider 比对（四向对账，topology.md §8） |
-| `failed` | reconciler：发布失败（`attempts` 耗尽或不可重试） | 告警 + 人工介入；退避窗口内会回 `pending` 重试 |
+| `failed` | reconciler：发布失败且 `attempts` 耗尽（≥5 ⚠️）或不可重试 | **终态**：告警 + 人工介入；**不自动回 `pending`** |
 
-> **版本单调 + latest-wins**：reconciler 消费前先查 `route_revisions`（`FOR UPDATE`）取当前 head，**只接受 `revision = head.revision` 的行**；`revision < head` 的晚到旧事件（含小 revision 后到达的 delete tombstone）**一律丢弃、不发布**。
-> **崩溃恢复**：reconciler 启动时 + 定时任务把 `state='processing' AND lease_until < now()` 回收为 `pending`（attempts+1），防 worker 崩溃后孤儿锁死；`attempts` 耗尽（≥5 ⚠️）→ `failed` + 告警。
+> **完整状态机（与 schema.sql 注释一致）**：`pending → processing → published`；`processing` 发布失败且 `attempts < max` → 退回 `pending` 退避重试（1s→2s→5s→10s→30s 封顶，attempts+1）；`attempts` 耗尽 → `failed`（人工介入**终态**，不自动重试）。租约到期未完成的 `processing` 由 reaper 回收为 `pending`（attempts+1）。
+> **版本单调 + latest-wins**：reconciler 消费前先查 `route_revisions`（`FOR UPDATE`）取当前 head，**只接受 `revision = head.revision` 的行**；`revision < head` 的晚到旧事件（含小 revision 后到达的 delete tombstone）**一律丢弃、不发布**。`published` 行是追加历史（保留审计/对账）；desired state 再次变更时 portal 再写一行更高 revision 的 outbox，reconciler 只发布新 head。
+> **latest-wins 丢弃不写 `audit_log`**：`revision < head` 的晚到旧事件被丢弃属 reconciler 幂等收敛的**内部行为**（非对外状态变更），故不逐行写审计；漂移/异常由四向对账（topology.md §8）告警覆盖。⚠️ 待决策者确认（如需完整丢弃轨迹可另加审计）。
+> **崩溃恢复**：reconciler 启动时 + 定时任务把 `state='processing' AND lease_until < now()` 回收为 `pending`（attempts+1），防 worker 崩溃后孤儿锁死。
 > 幂等保证：`UNIQUE(aggregate, aggregate_id, revision)` + 生成文件为**纯函数**（同 revision 同输出）→ 重复消费/重试安全。失败保留上一版本文件（原子替换只在新文件校验通过后发生，topology.md §8）。
 
 ### 2.6 `fde_networks.state`
@@ -362,6 +393,33 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|---|
 | `active` | portal：onboarding 建虚拟 key（网关 admin API + 本表一行 + Traefik 注入路由 outbox） | Traefik：`Authorization` 注入；网关：额度/模型白名单/用量 |
 | `revoked`（终态） | portal：offboarding / 轮换（旧代次吊销，`revoked_at` 必填） | Traefik：删除对应 LLM 注入路由（outbox op=delete）；网关：吊销 key |
+
+### 2.8 崩溃恢复流程（run 级，方案 B：同 run_id re-claim）
+
+> ⚠️ 待决策者确认：本文按 principles §3（容器是牲口、状态在中心）倾向 **方案 B**；方案 A（不自动 resume，新 run + `resume_from_run_id`）为备选，取舍见 runner-integration §6.5。
+
+一个 `run`（`runs.id`）= 一次逻辑任务，可跨多次容器生命周期/worker 进程；每次（re-）start 是一个 **attempt**（`run_queue.attempts`），上限 `max_attempts`。
+
+```
+ 入队(pending) → claim(attempts=1, 发 claim_token/lease) → running ──┐
+      ▲                                                              │ worker 崩 / agentd 崩 / 容器重建 / 网络分区
+      │  attempts < max_attempts                                     ▼
+      │◀──────────────────────── re-claim（resume:true，attempts++）──┘
+      │ attempts >= max_attempts
+      └────────────────────────→ run failed(max_attempts_exceeded)（终态）
+```
+
+| 步骤 | 负责方 | 动作 |
+|---|---|---|
+| 崩溃检测 | agentd（worker 非预期 exit）/ portal（心跳 3 次丢失 ≈45s 判容器死） | worker 崩：agentd 走 U12 release + 重新 claim；agentd/容器崩：portal reaper 待 `lease_until` 过期回收 |
+| 回收 | portal（reaper） | `attempts < max_attempts` → 回 `pending`（清 claim_token/owner_container_id）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` |
+| 重新认领 | 新 agentd（重建后）或原 agentd（分区恢复后） | 按 **user_id 路由**领取（非 container_id，§1.16）；新 claim_token 使旧 token 失效 |
+| 双写防护 | portal | 旧 worker 任何写（事件/checkpoint/终态）→ `lease_lost` → 旧 agentd 本地 abort、丢缓冲（§4.5） |
+| resume | 新 worker | `resume = attempt > 1`；引擎从 `run_checkpoints`（本 run_id 单行）+ `transcript_rounds`（本 run_id）恢复，checkpoint revision 从 U9 读回继续 +1 |
+| 副作用隔离 | 平台 | **DB 状态写被 fencing 拒绝**；外部副作用（shell/网络/LLM）平台无法物理终止（原理四），由 attempt 边界 + 审计标记隔离（runner-integration §6.5） |
+| 终态 barrier | agentd | 全部事件批（U3）200 确认 + 全部 store 调用完成后，才提交 U2 终态；portal 合成 `run_end` 事件（runner-integration §7.6） |
+
+**方案 B 的代价（记录在案）**：`runs.status` 在终态前可多次 `running ↔ failed(attempt)`；`failed` 成为「attempt 级失败」而非「run 级终态」，真正的 run 级终态由 `max_attempts` 耗尽或非重试性错误触发；终态 `failed` 后无自动 resume（如需跨 run 续跑，那是方案 A 的 `resume_from_run_id`，本期不做）。
 
 ---
 
@@ -432,10 +490,17 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|---|---|
 | 1 | Q1/Q4：`usage_ledger` 粒度与 `cost` 口径 | Q1→(b) 自建 LiteLLM 不写代理；Q4→(a) 每 FDE 一把 key + 项目标签 | §5；`runs.cost` / `usage_ledger.cost` P1 可空 |
 | 2 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | `port_allocations.scope/run_id` 字段先行保留（§1.9） |
-| 3 | `run_queue` 表：pull 模型终态，push 先行 | 规格 §10.3：单机可先 push | §1.16（表先行落地，push 模式不启用） |
+| 3 | `run_queue` 表：pull 模型为终态，push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | 规格 §10.3 旧描述「单机可先 push」已不再作为默认 | §1.16（表先行落地，push 模式不启用） |
 | 4 | `port_allocations` `allocated → active` 触发条件 | runner 上报监听 / 首次授权访问，先到者 | §2.2（不影响转发语义） |
 | 5 | 三表「不混」的 DB 角色分离（GRANT 强制） | P1 靠写入路径约定，P2 拆角色 | §3-4（实现注记，不影响 schema） |
 | 6 | 规格 §9.3「本地 file 优先 + DB 异步复制」store 装饰器 | 规格为「强烈建议」 | §1.11（影响 `checkpoint_failed` 频率，不影响表结构） |
 | 7 | `tool_outputs` 阈值（bytes） | 未定（建议如 4KB/8KB） | §1.19；决定「事件里放 digest、全文落表」的边界 |
 | 8 | `route_outbox` 聚合类型枚举（`port_allocation`/`llm_binding`/…） | 实现时定全量清单 | §1.18；reconciler debounce/SLO 已定（topology.md §8），枚举待补 |
 | 9 | `fde_networks` 复用前「腾行」的精确做法 | `DELETE` 已释放行 vs 保留并改 `subnet`；历史由 `audit_log` 承载 | §1.17（`UNIQUE(subnet)` 全局唯一所致） |
+| 10 | 崩溃恢复方案：**方案 A（新 run + `resume_from_run_id`，不自动 resume）** vs **方案 B（同 run_id re-claim，倾向）** | 倾向 B（principles §3 + 现有 claim/lease/resume 机制；checkpoint/transcript 单行-per-run 天然同 run_id） | §2.8；影响 checkpoint 查询契约、审计/UI（runner-integration §6.5） |
+| 11 | `client_event_id` 是否含 attempt 前缀（`run_id:attempt:计数`） | 含（re-claim 后计数归零不碰撞） | §1.12；portal.md §9.4 已同步 |
+| 12 | `run_end` 事件唯一产生方：worker 经 U3 vs portal 由 U2 合成 | portal 由 U2 合成（单事务，无事件/终态排序间隙） | §1.12/§2.1；portal.md §5.3 已同步 |
+| 13 | checkpoint 单调性：`revision` CAS（旧快照拒绝） | 采用（`run_checkpoints.revision` 已落 DDL） | §1.11；portal.md §9.8 U8/U9 已同步 |
+| 14 | 心跳 U4 逐 run 携带 `claim_token` + 部分失败响应 | 采用 | §1.16；portal.md §9.5 已同步 |
+| 15 | spool 契约（路径/配额/写满/删除） | 见 runner-integration §7.5（参数 ⚠️） | 不入库（非真相）；§1.12 |
+| 16 | `max_attempts` 默认值与耗尽终态 | 默认 3；耗尽 → `failed(max_attempts_exceeded)` | §1.16/§2.8（已落 DDL） |
