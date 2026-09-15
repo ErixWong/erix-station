@@ -40,7 +40,7 @@
 3. 授权逻辑集中在一处，才可能审计（「谁在什么时候看了哪个端口」）。
 
 **派生规则**：
-- 授权规则是 `f(cookie.sub, host 中的 FDE 标识)` 的纯函数，在 `/api/forward-auth` 一处实现
+- 授权规则是 `f(预览凭证哈希解析出的身份, host 中的 FDE 标识)` 的纯函数，在 `/api/forward-auth` 一处实现（按预览 token 哈希查 `preview_grants` 解析身份；**不解析 cookie 内容**，portal session cookie 为 `__Host-` host-only 且不会到达预览域——portal.md §2.5/§2.7）
 - 路由由 portal 生成写入 Traefik file provider，与 DB 端口表**同源**（DB 事务写 `port_allocations` + route outbox；Traefik file provider 是异步、幂等、可重试的派生状态）
 - **路由表里没有 = 不可达**（比 403 更干净）
 - dev server 不改造；容器内 agent 走回环，不经 ingress
