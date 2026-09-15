@@ -10,6 +10,13 @@ import * as totp from './totp.js';
 import { createServer } from './http.js';
 import { startMaterializerLoop } from './materializer.js';
 import { startRoutesLoop } from './routes.js';
+import {
+  createDockerClient,
+  onboardFde,
+  deprovisionFde,
+  reconcileOnce,
+  startProvisionerLoop,
+} from './provisioner.js';
 
 function usage() {
   // eslint-disable-next-line no-console
@@ -18,6 +25,8 @@ function usage() {
       '  cli.js serve\n' +
       '  cli.js migrate\n' +
       '  cli.js bootstrap-admin --login <name> [--password <pw>] [--display-name <name>] [--allow-extra] [--print-secret]\n' +
+      '  cli.js provision-fde --fde-name <name>\n' +
+      '  cli.js deprovision-fde --fde-name <name>\n' +
       '  cli.js healthcheck',
   );
 }
@@ -42,9 +51,10 @@ async function serve() {
     await bootstrapPool.end().catch(() => {});
   }
   const server = createServer({ pool, config });
-  // 启动 materializer + 路由 reconciler 常驻循环（WP2a）。
+  // 启动 materializer + 路由 reconciler + provisioner 对账常驻循环（WP2a/WP2b）。
   const materializerLoop = startMaterializerLoop(pool, config);
   const routesLoop = startRoutesLoop(pool, config);
+  const provisionerLoop = startProvisionerLoop(pool, config);
   server.listen(config.port, config.host, () => {
     // eslint-disable-next-line no-console
     console.log(
@@ -52,13 +62,14 @@ async function serve() {
     );
     // eslint-disable-next-line no-console
     console.log(
-      `[portal] reconcilers started (materializer root=${config.userSpaceRoot}, traefik dynamic=${config.traefikDynamicDir})`,
+      `[portal] reconcilers started (materializer root=${config.userSpaceRoot}, traefik dynamic=${config.traefikDynamicDir}, docker=${config.dockerHost})`,
     );
   });
   // 进程退出时停循环（优雅关闭）。
   const shutdown = () => {
     materializerLoop.stop();
     routesLoop.stop();
+    provisionerLoop.stop();
     server.close(() => process.exit(0));
   };
   process.once('SIGTERM', shutdown);
@@ -157,6 +168,58 @@ async function bootstrapAdmin(values) {
   }
 }
 
+async function runProvisionFde(values) {
+  const fdeName = values['fde-name'];
+  if (!fdeName) {
+    // eslint-disable-next-line no-console
+    console.error('--fde-name is required');
+    process.exit(2);
+  }
+  const config = loadConfig();
+  const pool = createPool(config.databaseUrl);
+  const docker = createDockerClient({ dockerHost: config.dockerHost });
+  try {
+    const out = await onboardFde(pool, config, { fdeName, docker });
+    // eslint-disable-next-line no-console
+    console.log(
+      `[provision-fde] ok fde=${fdeName} network=${out.networkName} subnet=${out.subnet} container=${out.containerName}`,
+    );
+    process.exitCode = 0;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[provision-fde] failed:', err.message);
+    process.exitCode = 1;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+
+async function runDeprovisionFde(values) {
+  const fdeName = values['fde-name'];
+  if (!fdeName) {
+    // eslint-disable-next-line no-console
+    console.error('--fde-name is required');
+    process.exit(2);
+  }
+  const config = loadConfig();
+  const pool = createPool(config.databaseUrl);
+  const docker = createDockerClient({ dockerHost: config.dockerHost });
+  try {
+    const out = await deprovisionFde(pool, config, { fdeName, docker });
+    // eslint-disable-next-line no-console
+    console.log(
+      `[deprovision-fde] ok fde=${fdeName} container=${out.containerName} network=${out.networkName}`,
+    );
+    process.exitCode = 0;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[deprovision-fde] failed:', err.message);
+    process.exitCode = 1;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+
 async function healthcheck() {
   // 等价 wget -qO- http://127.0.0.1:8080/api/health（deploy-contract §2.3）：
   // 命中 /healthz，200 才算就绪（DB 可达 + 迁移到 head 由服务端判定）。
@@ -191,6 +254,7 @@ async function main() {
       'display-name': { type: 'string' },
       'allow-extra': { type: 'boolean', default: false },
       'print-secret': { type: 'boolean', default: false },
+      'fde-name': { type: 'string' },
     },
   });
   const [command] = positionals;
@@ -201,6 +265,10 @@ async function main() {
       return runMigrate();
     case 'bootstrap-admin':
       return bootstrapAdmin(values);
+    case 'provision-fde':
+      return runProvisionFde(values);
+    case 'deprovision-fde':
+      return runDeprovisionFde(values);
     case 'healthcheck':
       return healthcheck();
     default:

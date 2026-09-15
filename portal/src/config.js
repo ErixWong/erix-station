@@ -38,6 +38,32 @@ export function cookieSettings(profile = 'prod', ttlSeconds = DEFAULT_SESSION_TT
   };
 }
 
+/**
+ * 预览 cookie（host-only）属性随 COOKIE_PROFILE 切换（portal.md §2.8）。
+ * - prod     -> __Host-fde_preview + Secure=true（host-only 于当前预览 host）
+ * - dev-http -> fde_preview_dev + Secure=false（仅本机 HTTP 联调）
+ */
+export function previewCookieSettings(profile = 'prod', ttlSeconds = 15 * 60) {
+  if (profile === 'dev-http') {
+    return {
+      name: 'fde_preview_dev',
+      secure: false,
+      httpOnly: true,
+      sameSite: 'Lax',
+      path: '/',
+      maxAge: ttlSeconds,
+    };
+  }
+  return {
+    name: '__Host-fde_preview',
+    secure: true,
+    httpOnly: true,
+    sameSite: 'Lax',
+    path: '/',
+    maxAge: ttlSeconds,
+  };
+}
+
 function defaultStaticDir() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../static');
 }
@@ -120,5 +146,42 @@ export function loadConfig(env = process.env) {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),
+    // ---- WP2b：FDE provisioning + preview ticket ----
+    // FDE 容器镜像/命令（开发期 traefik/whoami 站台；生产自构建 runner 镜像，env §10/deploy-contract §6.2）。
+    fdeImage: env.FDE_IMAGE || 'traefik/whoami',
+    fdeCmd: parseJsonStringArray(env.FDE_CMD, ['-port', '4000']),
+    fdeAgentVersion: env.FDE_AGENT_VERSION || 'dev',
+    // 资源限额（deploy-contract §6.2，⚠️ 数值待决策者确认）：默认 512m，可配 0 表示不限。
+    fdeMemoryLimit: env.FDE_MEMORY_LIMIT || '512m',
+    // 容器内双 UID（runner-integration/user-space §6.1：agentd 1001 / worker 1002，GID 1000）。
+    agentdUid: intEnv(env, 'FDE_AGENTD_UID', 1001),
+    workerUid: intEnv(env, 'FDE_WORKER_UID', 1002),
+    // portal 经 socket-proxy 访问 Docker API（deploy-contract §5；不直挂 docker.sock）。
+    dockerHost: env.DOCKER_HOST || 'tcp://station-docker-socket-proxy:2375',
+    // 预览 ticket/session（portal.md §2.8）。
+    previewTicketTtlSeconds: intEnv(env, 'PREVIEW_TICKET_TTL_SECONDS', 60),
+    previewSessionTtlSeconds: intEnv(env, 'PREVIEW_SESSION_TTL_SECONDS', 15 * 60),
+    previewCookie: previewCookieSettings(cookieProfile, intEnv(env, 'PREVIEW_SESSION_TTL_SECONDS', 15 * 60)),
+    // 预览 session 派生密钥（HMAC-SHA256，portal.md §2.7 第 6 步）；生产必须显式注入，开发期仅联调占位。
+    previewSessionSigningKey: env.SESSION_SIGNING_KEY || 'erix-station-dev-signing-key-change-me',
+    // 预览 ticket 签发限流（portal.md §6.1：按用户 + IP）。
+    previewTicketRateLimit: {
+      maxFailures: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_MAX', 20),
+      windowMs: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_WINDOW_MS', 60 * 1000),
+      blockMs: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_BLOCK_MS', 60 * 1000),
+      maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
+    },
   };
+}
+
+/** 解析 JSON 字符串数组（如 FDE_CMD='["-port","4000"]'）；非法输入回退到 fallback。 */
+function parseJsonStringArray(raw, fallback) {
+  if (!raw) return fallback;
+  try {
+    const v = JSON.parse(raw);
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) return v;
+  } catch {
+    // fallthrough
+  }
+  return fallback;
 }
