@@ -1,0 +1,73 @@
+# ============================================================================
+# erix-station 本地开发栈（P1 walking skeleton）
+# 依据：docs/design/deploy-contract.md §2 + docs/env.md §0（开发期参数）
+# 服务：station-db / station-portal / station-edge（socket-proxy、FDE、LLM 网关归后续轮次）
+# ============================================================================
+name: station
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: ${BACKEND_SUBNET:-172.32.0.0/24}
+
+services:
+  station-db:
+    container_name: station-db
+    image: ${POSTGRES_IMAGE:-postgres:16.15}
+    restart: unless-stopped
+    networks:
+      - backend
+    volumes:
+      - /docker/station-db/:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-station}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev-only}
+      POSTGRES_DB: ${POSTGRES_DB:-station}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  station-portal:
+    container_name: station-portal
+    build:
+      context: ..
+      dockerfile: portal/Dockerfile
+    image: erix-station/portal:local
+    restart: unless-stopped
+    networks:
+      - backend
+    depends_on:
+      station-db:
+        condition: service_healthy
+    ports:
+      # 仅回环发布（deploy-contract §2.2）；容器内固定 8080，宿主端口见 PORTAL_HOST_PORT
+      - "127.0.0.1:${PORTAL_HOST_PORT:-18080}:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-station}:${POSTGRES_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
+      COOKIE_PROFILE: ${COOKIE_PROFILE:-dev-http}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
+      MIGRATE_ON_START: "1"
+    healthcheck:
+      test: ["CMD", "node", "portal/src/cli.js", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  station-edge:
+    container_name: station-edge
+    image: ${TRAEFIK_IMAGE:-traefik:v3.7.13}
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic/:/etc/traefik/dynamic/:ro
+    # 开发期 http，无 acme.json / 证书；部署期证书与 logs 见 deploy-contract §2.2/§4.3

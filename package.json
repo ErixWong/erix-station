@@ -1,0 +1,19 @@
+{
+  "name": "erix-station",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FDE Station — 给 FDE 用的开发工位平台（宿主平台）",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node portal/src/cli.js serve",
+    "db:migrate": "node portal/src/cli.js migrate",
+    "healthcheck": "node portal/src/cli.js healthcheck"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}

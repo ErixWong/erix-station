@@ -48,7 +48,7 @@
 
 | 网络 | 声明方式 | 成员 |
 |---|---|---|
-| `backend` | compose 顶层 `networks.backend`，`ipam.config[].subnet = 172.30.0.0/24`（**显式**，不与 FDE 池 `10.200.0.0/16`/`10.201.0.0/16` 及既有 bridge 重叠，env §5.2） | `station-portal` + `station-db` + `station-docker-socket-proxy` |
+| `backend` | compose 顶层 `networks.backend`，`ipam.config[].subnet = 172.30.0.0/24`（**显式**，不与 FDE 池 `10.200.0.0/16`/`10.201.0.0/16` 及既有 bridge 重叠，env §5.2）；**生产取值可由 `BACKEND_SUBNET` 覆盖，须避开宿主既有网段（开发期见 env.md §0）** | `station-portal` + `station-db` + `station-docker-socket-proxy` |
 | `host` | Traefik `network_mode: host`（**零 docker 网络接入**，topology §2.2 D-2） | `station-edge` |
 
 - FDE 网络 `fde-<name>` **不在 compose 内**，由 portal 经 Docker API 显式 `--subnet` 创建（§6）。
