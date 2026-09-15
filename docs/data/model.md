@@ -173,7 +173,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `gateway` | 该网络 `.1`（宿主 bridge 端点；Traefik 走 host 网络经此可达容器） |
 | `pool` | `default`（`10.200.0.0/16`）或 `large`（`10.201.0.0/16`）；两段**保留给 FDE 网络专用**（topology.md §2/§3）。**池范围 ≠ 放行范围**：放行/来源规则按 `subnet` 精确派生（topology.md §5.1） |
 | `state` | 状态机见 §2.6 |
-| `revision` | 仅属「网络聚合」的版本号（与 `route_outbox` 网络行对账）；**路由级版本见 `route_revisions`（§1.18），不可混用** |
+| `revision` | 预留的网络聚合版本号（暂无 network 聚合 outbox 行；若将来引入网络相关派生发布，按 `route_revisions` 的 head 模式成对使用）；**与 `route_revisions.revision` 不可混用** |
 
 **复用语义**：`subnet` 为**全局唯一**（非部分索引）——offboarding 后 `state → released`，块可复用，但复用前需由 portal 先**腾出该行**（`DELETE` 已释放记录，或将其 `subnet` 改指新块；历史归属由 `audit_log` 的 `network.allocate` / `network.release` 承载）再分配给新 `fde_id`。已建网络子网不可改 → 扩容 = 重建网络（数据在 bind mount，容器是牲口）。
 
