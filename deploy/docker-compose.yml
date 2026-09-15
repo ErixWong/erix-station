@@ -111,9 +111,21 @@ services:
       - no-new-privileges
     cap_drop:
       - ALL
+    cap_add:
+      # materializer 以 root 写平台文件（root:root 0644/0444）+ chown 工作区（1000:1000）：需 CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID（deploy-contract §1/§2.2 注）。
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     ports:
       # 仅回环发布（deploy-contract §2.2）；容器内固定 8080，宿主端口见 PORTAL_HOST_PORT
       - "127.0.0.1:${PORTAL_HOST_PORT:-18080}:8080"
+    volumes:
+      # 用户空间（D-6 直写宿主 bind mount，RW 同路径，user-space §2.2）；宿主路径可注入（开发期隔离用临时目录）。
+      - ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}:/srv/erix/users
+      # Traefik 动态配置（reconciler 单一写方，deploy-contract §4.2）；与 Traefik 侧共享宿主目录。
+      - ${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}:/etc/traefik/dynamic
     environment:
       PORT: "8080"
       # 运行时身份 station_portal（最小 DML，deploy-contract §2.4/§3）
@@ -127,6 +139,19 @@ services:
       COOKIE_PROFILE: ${COOKIE_PROFILE:-dev-http}
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
+      # ---- WP2a：materializer + 路由 reconciler ----
+      ERIX_USERSPACE_ROOT: /srv/erix/users
+      TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
+      TRAEFIK_DYNAMIC_FILE: routes.yml
+      PORTAL_HOST: station.${BASE_DOMAIN:-localhost}
+      PORTAL_BACKEND_URL: http://127.0.0.1:${PORTAL_HOST_PORT:-18080}
+      TRAEFIK_ENTRYPOINT: web
+      LLM_HOST: llm.${BASE_DOMAIN:-localhost}
+      PORT_QUOTA: ${PORT_QUOTA:-40}
+      FDE_POOL: ${FDE_POOL:-default}
+      IPAM_RESERVED_SUBNETS: ${IPAM_RESERVED_SUBNETS:-}
+      FDE_USER_UID: ${FDE_USER_UID:-1000}
+      FDE_USER_GID: ${FDE_USER_GID:-1000}
       # P1：baseline(schema.sql) + bootstrap.sql 由 station-db 首次初始化（db-init/00-init.sh，超级用户）
       # 完成；deploy/migrations/*.sql 尚无增量。运行时以 station_portal 启动，不重复跑 superuser-only
       # 的 bootstrap。出现首个增量迁移时，以 station_platform（MIGRATE_DATABASE_URL）跑
@@ -152,6 +177,7 @@ services:
       - --configFile=/etc/traefik/traefik.yml
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./traefik/dynamic/:/etc/traefik/dynamic/:ro
+      # 动态配置目录与 portal（reconciler）共享宿主目录；Traefik 侧只读（deploy-contract §4.2）。
+      - ${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}:/etc/traefik/dynamic/:ro
     # 开发期 http，无 acme.json / 证书；部署期证书与 logs 见 deploy-contract §2.2/§4.3
     # 注：开发期绑定 8090/8443（>1024）无需 NET_BIND_SERVICE；生产 80/443 需 cap_add: [NET_BIND_SERVICE]

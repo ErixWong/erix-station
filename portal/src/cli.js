@@ -8,6 +8,8 @@ import { migrate } from './migrate.js';
 import * as auth from './auth.js';
 import * as totp from './totp.js';
 import { createServer } from './http.js';
+import { startMaterializerLoop } from './materializer.js';
+import { startRoutesLoop } from './routes.js';
 
 function usage() {
   // eslint-disable-next-line no-console
@@ -40,12 +42,27 @@ async function serve() {
     await bootstrapPool.end().catch(() => {});
   }
   const server = createServer({ pool, config });
+  // 启动 materializer + 路由 reconciler 常驻循环（WP2a）。
+  const materializerLoop = startMaterializerLoop(pool, config);
+  const routesLoop = startRoutesLoop(pool, config);
   server.listen(config.port, config.host, () => {
     // eslint-disable-next-line no-console
     console.log(
       `[portal] listening on http://${config.host}:${config.port} (cookie=${config.cookie.name}, secure=${config.cookie.secure})`,
     );
+    // eslint-disable-next-line no-console
+    console.log(
+      `[portal] reconcilers started (materializer root=${config.userSpaceRoot}, traefik dynamic=${config.traefikDynamicDir})`,
+    );
   });
+  // 进程退出时停循环（优雅关闭）。
+  const shutdown = () => {
+    materializerLoop.stop();
+    routesLoop.stop();
+    server.close(() => process.exit(0));
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
 async function runMigrate() {

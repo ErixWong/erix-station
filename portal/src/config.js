@@ -97,5 +97,26 @@ export function loadConfig(env = process.env) {
     baseDomain: env.BASE_DOMAIN || 'localhost',
     migrateOnStart: env.MIGRATE_ON_START !== '0',
     staticDir: env.STATIC_DIR || defaultStaticDir(),
+    // ---- WP2a：用户空间物化 + 路由 reconciler 配置 ----
+    // 用户空间根（portal 容器内路径，= 宿主 bind mount 目标；user-space §2.2 / env §6）。
+    userSpaceRoot: env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
+    // FDE 工作区属主 UID/GID（user-space §6.1：1000/1000）。
+    fdeUid: intEnv(env, 'FDE_USER_UID', 1000),
+    fdeGid: intEnv(env, 'FDE_USER_GID', 1000),
+    // Traefik 动态配置目录（portal 容器内路径，reconciler 写 file provider；deploy-contract §4.2）。
+    traefikDynamicDir: env.TRAEFIK_DYNAMIC_DIR || '/etc/traefik/dynamic',
+    traefikDynamicFile: env.TRAEFIK_DYNAMIC_FILE || 'routes.yml',
+    // portal 域名与后端（reconciler 生成 portal 路由与 forwardAuth 地址用）。
+    portalHost: env.PORTAL_HOST || `station.${env.BASE_DOMAIN || 'localhost'}`,
+    portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
+    traefikEntryPoint: env.TRAEFIK_ENTRYPOINT || 'web',
+    llmHost: env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`,
+    // 端口配额 / 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
+    portQuota: intEnv(env, 'PORT_QUOTA', 40),
+    fdePool: env.FDE_POOL || 'default',
+    reservedSubnets: (env.IPAM_RESERVED_SUBNETS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
   };
 }

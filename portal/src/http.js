@@ -10,6 +10,7 @@ import path from 'node:path';
 import { URL } from 'node:url';
 import * as auth from './auth.js';
 import * as migrate from './migrate.js';
+import * as projects from './projects.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -174,6 +175,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details), headers);
         return;
       }
+      if (err instanceof projects.ProjectError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -246,6 +251,24 @@ async function routeApi(req, res, ctx, url) {
     const headers = {};
     if (renewed) headers['Set-Cookie'] = sessionCookieHeader(config.cookie, token);
     return sendJson(res, 200, { user: session.user }, headers);
+  }
+
+  // 边缘授权回调（Traefik forwardAuth）：非浏览器 API，不要求 session cookie。
+  if (pathname === '/api/forward-auth') {
+    return handleForwardAuth(req, res, ctx);
+  }
+
+  // ---- 项目与端口（portal.md §3） ----
+  if (pathname === '/api/projects') {
+    if (req.method === 'POST') return handleCreateProject(req, res, ctx);
+    if (req.method === 'GET') return handleListProjects(req, res, ctx);
+  }
+  const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch) {
+    const projectId = decodeURIComponent(projectMatch[1]);
+    if (req.method === 'GET') return handleGetProject(req, res, ctx, projectId);
+    if (req.method === 'PATCH') return handlePatchProject(req, res, ctx, projectId);
+    if (req.method === 'DELETE') return handleDeleteProject(req, res, ctx, projectId);
   }
 
   return sendJson(res, 404, errorBody('not_found', 'not found'));
@@ -384,6 +407,89 @@ async function handleLoginTotp(req, res, ctx) {
   });
   const cookieHeader = sessionCookieHeader(config.cookie, session.token);
   return sendJson(res, 200, { user: result.user }, { 'Set-Cookie': cookieHeader });
+}
+
+/** 要求有效 session（除登录/forward-auth 外所有公开端点）。 */
+async function requireSession(req, ctx) {
+  const token = getCookie(req, ctx.config.cookie.name);
+  if (!token) throw new HttpError(401, 'unauthorized', 'unauthorized');
+  const session = await auth.findSessionUser(ctx.pool, token);
+  if (!session) throw new HttpError(401, 'unauthorized', 'unauthorized');
+  return session;
+}
+
+/**
+ * forwardAuth 回调（portal.md §2.7）。P1 占位：仅做 hostname → allocation 精确存在性校验。
+ * ⚠️ P2：完整预览凭证（ticket/cookie）+ exposure 授权未实现（deploy §7.2 P1 无预览）。
+ */
+async function handleForwardAuth(req, res, ctx) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  if (!host) return sendJson(res, 404, errorBody('not_found', 'not found'));
+  const r = await ctx.pool.query(
+    `SELECT u.fde_name
+       FROM port_allocations a
+       JOIN users u ON u.id = a.fde_id
+      WHERE a.hostname = $1 AND a.state IN ('allocated', 'active')
+      LIMIT 1`,
+    [host],
+  );
+  if (r.rows.length === 0) return sendJson(res, 404, errorBody('not_found', 'not found'));
+  res.writeHead(200, { 'X-Auth-User': r.rows[0].fde_name || '' });
+  res.end();
+}
+
+async function handleCreateProject(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const repoUrl = typeof body.repo_url === 'string' ? body.repo_url.trim() : '';
+  const template = typeof body.template === 'string' ? body.template : 'default';
+  const result = await projects.createProject(ctx.pool, {
+    userId: session.user.id,
+    name,
+    repoUrl,
+    template,
+    config: ctx.config,
+  });
+  return sendJson(res, 201, { project: result.project, ports: [result.port] });
+}
+
+async function handleListProjects(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://localhost');
+  const cursor = url.searchParams.get('cursor') || undefined;
+  const limit = Number(url.searchParams.get('limit') || 20);
+  const result = await projects.listProjects(ctx.pool, { userId: session.user.id, cursor, limit });
+  return sendJson(res, 200, result);
+}
+
+async function handleGetProject(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  const result = await projects.getProject(ctx.pool, { userId: session.user.id, projectId });
+  return sendJson(res, 200, result);
+}
+
+async function handlePatchProject(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  if (typeof body.name !== 'string' || !body.name.trim()) {
+    throw new HttpError(400, 'validation_failed', 'name 为必填字段', { details: { field: 'name' } });
+  }
+  const project = await projects.renameProject(ctx.pool, {
+    userId: session.user.id,
+    projectId,
+    name: body.name.trim(),
+  });
+  return sendJson(res, 200, project);
+}
+
+async function handleDeleteProject(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  await projects.deleteProject(ctx.pool, { userId: session.user.id, projectId });
+  res.writeHead(204);
+  res.end();
 }
 
 async function serveStatic(req, res, ctx, url) {
