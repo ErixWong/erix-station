@@ -90,7 +90,7 @@
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
 | 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `port_quota_exceeded` | 状态冲突，各端点分别列出 | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
-| 503 | `container_unreachable` | FDE 容器不可达（见 §6.3） | 是 |
+| 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
 | 500 | `internal` | 未分类服务端错误 | 否 |
 
 > 资源归属一律以「当前登录用户」过滤：**越权访问与他人资源一律表现为 404**（`not_found`），只有「本人资源上的越级操作」（如普通 FDE 开 `public` 端口）才返回 403。
@@ -321,7 +321,6 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 400 | `validation_failed` | name 非法 / repo_url 非法 |
 | 409 | `name_conflict` | 同名项目已存在 |
 | 409 | `port_quota_exceeded` | 用户端口总配额超限（规格 §8.2：**明确报错**而非静默漂移） |
-| 503 | `container_unreachable` | 需要落 `.erix/ports.json` 时容器不可达（§6.3） |
 
 > **边界（决策者 2026-09，issue #3 评论）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 只是登记元数据。**平台不负责 clone，也不下发 git 凭据**——仓库目录由 FDE 在容器内自行 `git clone` 并配置凭据（等同他自己的开发机，规格 §7.2/§12.2）。
 
@@ -333,7 +332,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 请求（全部可选）：`{ "name": "proj2" }`。
 响应 `200`：更新后的 Project。
-错误：`409 name_conflict`；改名会同步重生成端口 hostname/url（同一事务，规格 §8.1「URL 与路由同源」）。
+错误：`409 name_conflict`；改名会同步重生成端口 hostname/url——同一 DB 事务更新 desired state + route outbox，Traefik file provider 异步幂等发布（规格 §8.1「URL 与路由同源」）。
 
 ### 3.6 `DELETE /api/projects/:id`
 
@@ -454,7 +453,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 404 | `not_found` | session 不存在/不属本人 |
 | 409 | `run_in_progress` | 该 session 已有进行中 run |
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
-| 503 | `container_unreachable` | FDE 容器不在线/不可达（§6.3） |
+| 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |
 
 > 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。
 
@@ -556,6 +555,8 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 |---|---|
 | `tool_call.input_digest` | 工具入参的展示摘要（完整入参可能很大；详情经 `GET /api/runs/:id` 关联查询） |
 | `status` | `pending` \| `approved` \| `denied` |
+
+> `tool_call.id` / 审批请求里的 `tool_call_id` 是**外部 `call_id`**（事件流 `tool_use`/`tool_result` 的 `tool_call_id`，字符串），**不是** `tool_calls.id` 内部主键（后者为 uuid、不外露）。canonical 规则见 model.md §1.19。⚠️ 审批契约由 issue #10 定稿确认，若改判为 UUID 则以 #10 为准。
 
 #### `GET /api/approvals?status=pending`
 
@@ -721,8 +722,8 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 三条要点：
 
-- **经 Traefik 暴露给容器（H-B D-5，issue #5）**：本节端点经 `https://station.<base>/api/internal/*` 可达——容器内把 `station.<base>` 解析到本 FDE 的 bridge 网关 IP（`--add-host`），Traefik(host:443) 以 `ipAllowList(10.200.0.0/16)` 限源后回环到 portal `127.0.0.1:8080`（topology.md §4-L3/§5）。portal 对 `/api/internal` 前缀不做 forwardAuth（鉴权靠 per-container token，审计由端点自身写 `audit_log` 关键动作）。调用方只有 FDE 容器内的 `station-agentd`（runner §4.1）。
-- **认证**：每个请求 `Authorization: Bearer <per-container token>`。token 建容器时由 portal 生成、存 DB（`containers.runner_token`）、注入容器 env `ERIX_STATION_TOKEN`，**仅 agentd 持有**（fork worker 时从 env 剔除，runner §3）。portal 由 token 解出 `container_id` / `user_id`，后续所有 `:id` 资源校验归属该容器——**token 只能操作本 FDE 的资源，越权一律 404/403**（与 §1.2 同口径：不泄露存在性）。
+- **经 Traefik 暴露给容器（H-B D-5，issue #5）**：本节端点经 `https://station.<base>/api/internal/*` 可达——容器内把 `station.<base>` 解析到本 FDE 的 bridge 网关 IP（`--add-host`），Traefik(host:443) 以 `ipAllowList`（由 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，topology.md §5.1）限源后回环到 portal `127.0.0.1:8080`（topology.md §4-L3/§5）。portal 对 `/api/internal` 前缀不做 forwardAuth（鉴权靠 per-container token，审计由端点自身写 `audit_log` 关键动作）。调用方只有 FDE 容器内的 `station-agentd`（runner §4.1）。
+- **认证**：每个请求 `Authorization: Bearer <per-container token>`。完整生命周期（schema.sql `containers` / model.md §1.4）：portal 在建容器或轮换时**生成原文**，原文**仅用于注入容器 env `ERIX_STATION_TOKEN`**、**仅 agentd 持有**（fork worker 时从 env 剔除，runner §3）；DB **只存哈希**（`runner_token_hash`）+ 代次（`token_generation`），并记录吊销/轮换时刻（`revoked_at` / `rotated_at`）——portal **永不从 DB 取回原文**。轮换（新代次 `token_generation + 1`）或吊销（`revoked_at` 置位 / `state` 停用）后，旧 token 立即失效（校验时按代次比对哈希，失配 → `401 token_revoked`）。portal 由 token 解出 `container_id` / `user_id`，后续所有 `:id` 资源校验归属该容器——**token 只能操作本 FDE 的资源，越权一律 404/403**（与 §1.2 同口径：不泄露存在性）。
 - **背景**：容器**不直连 DB**——所有平台状态写入（事件 / transcript / checkpoint / 用量 / 审批 / 状态收敛）都经本节端点由 portal 落库，Postgres 的业务写方只有 portal（决策者 2026-09，issue #3 评论，D1'/D2'）。本设计取代原「容器写 DB + portal 推容器 :3000」方案（runner §11.2：容器零监听、零入站）。
 
 **与公开端点章节的关系**：§0.1 清单的公开端点面向**浏览器 + session cookie**（§2.5）；本节 internal 端点面向**容器 + per-container token**——两套认证不互通，session cookie 不能调 internal 端点，per-container token 也不能调公开端点。
@@ -805,7 +806,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 - 无 `pending` 行：挂起连接（**不持有事务/锁**）；portal 在 `POST /messages` 入队后 `NOTIFY run_queue`（或单节点进程内事件）唤醒挂起的 claim 再查一次；到 `hold_ms` 仍无 → `204`。
 - SSE `run_assigned` 只是**唤醒 hint**，不携带权威载荷——hint 到达时任务可能已被其他 capacity 领走，载荷以 claim 响应为准（§9.12）。
 
-> ⚠️ 命名对齐项：runner §4.2 文中租约字段写作 `lease_expires_at`，schema.sql 已落地列名为 `lease_until`；API 载荷字段名以 runner §4.2 为准，列名差异见 runner §16.2-R5 修订项。
+> ⚠️ 命名对齐：API 载荷字段名 `lease_expires_at` 与 schema 列 `run_queue.lease_until` **一一对应**（同一时刻）；runner §4.2 已统一以 schema 列名 `lease_until` 描述 DB 写，仅 API 载荷保留 `lease_expires_at`（列名差异见 runner §16.2-R5，✅ 已落地）。
 
 错误：`401 token_invalid / token_revoked`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
@@ -992,9 +993,9 @@ query：`from_round` / `to_round` / `pattern`。
 
 响应 `200`。
 
-幂等：**单行覆盖语义**——`run_checkpoints` 每 run 单行（`run_id` 主键，schema.sql），`INSERT ... ON CONFLICT (run_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = now()`；对齐上游 tmp+rename 原子覆盖，**重试同一快照安全**。`seq` 由 worker 单调计数（每 run 从 0 递增），供调用方侧记录次序。
+幂等：**单行覆盖语义**——`run_checkpoints` 每 run 单行（`run_id` 主键，schema.sql），`INSERT ... ON CONFLICT (run_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = now()`；对齐上游 tmp+rename 原子覆盖，**重试同一快照安全**。`seq` 若需要仅是**调用方本地元数据**（worker 每 run 从 0 递增），**不落库**（`run_checkpoints` 无 `seq` 列）。
 
-> ⚠️ 对齐项：runner §9.1 描述为 `UPSERT (run_id, seq)`（按 seq 多行），schema.sql 已落地为**每 run 单行**（无 `seq` 列、`ON CONFLICT (run_id)`，对齐上游「saveCheckpoint 覆盖写单份、loadLatestCheckpoint 无参数」）。两者「覆盖写、重试安全」语义一致；存储粒度以 schema.sql 为准，差异列入 runner §16.2 修订清单。
+> ⚠️ 对齐项：runner §9.1 曾描述为 `UPSERT (run_id, seq)`（按 seq 多行），schema.sql 已落地为**每 run 单行**（无 `seq` 列、`ON CONFLICT (run_id)`，对齐上游「saveCheckpoint 覆盖写单份、loadLatestCheckpoint 无参数」）。两者「覆盖写、重试安全」语义一致；存储粒度以 schema.sql 为准，差异已列入 runner §16.2-R11 修订条目（✅ 已落地）。
 
 **重试要求**（runner §9.2，fail-closed 语义下的补偿，adapter 必须包 retry）：
 
@@ -1041,7 +1042,9 @@ query：`from_round` / `to_round` / `pattern`。
 { "approval_id": "ap_77" }
 ```
 
-幂等：**一个工具调用至多一单**（`approvals.tool_call_id UNIQUE`，schema.sql）；同 `tool_call_id` 重复创建 → portal 返回原单 `200 { "approval_id": "ap_77" }`（agentd 重启 re-claim + resume 后再次执行到同一工具的场景，runner §10.2）。
+幂等：**一个工具调用至多一单**（`approvals` `UNIQUE(run_id, tool_call_id)`，schema.sql）；同 `tool_call_id` 重复创建 → portal 返回原单 `200 { "approval_id": "ap_77" }`（agentd 重启 re-claim + resume 后再次执行到同一工具的场景，runner §10.2）。
+
+`tool_call_id` 为**外部 `call_id`**（事件流 `tool_use`/`tool_result` 的 `tool_call_id`，字符串如 `tc_301`），**不是** `tool_calls.id` 内部主键（uuid、不外露）；canonical 规则见 model.md §1.19。⚠️ 审批契约由 issue #10 定稿确认，若改判为 UUID 则以 #10 为准。
 
 #### `GET /api/internal/approvals/:id`（U11：结果轮询兜底）
 

@@ -30,7 +30,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 账号与认证 | `users` / `login_sessions` / `api_tokens` | 规格 §7 |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
 | 会话与对话 | `chat_sessions` / `runs` / `messages` | 规格 §9.1 |
-| 端口分配与路由 | `port_allocations` / `route_outbox` | 规格 §8 / topology.md §5/§8 |
+| 端口分配与路由 | `port_allocations` / `route_outbox` / `route_revisions` | 规格 §8 / topology.md §5/§8 |
 | 引擎持久化 | `transcript_rounds` / `run_checkpoints` / `run_events` | 规格 §9.2/§9.3 |
 | 工具与审批 | `tool_calls` / `tool_outputs` / `judge_decisions` / `approvals` / `artifacts` | 规格 §9.1 / topology.md §9 |
 | 用量与审计 | `usage_ledger` / `audit_log` | 规格 §11.4 / §14 |
@@ -136,9 +136,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
 
-- `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。
+- `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。
-- `approvals`：**一个工具调用至多一条审批单**（`tool_call_id UNIQUE`）；`CHECK` 保证 `pending` 与 `decided_at` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。
+- `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending` 与 `decided_at` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 审批契约由 issue #10 定稿确认；若 #10 改判为 UUID，则以 #10 为准并同步本表。
 - `artifacts`：run 产出的文件登记（`kind / path / size / sha`），路径为容器内路径。
 
 ### 1.14 `usage_ledger` — 用量台账
@@ -171,9 +171,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `network_name` / `subnet` | 均唯一。`network_name = fde-<name>`（docker 网络名）；`subnet` 为 `10.200.<n>.0/29`（默认池）或 `10.201.<n>.0/28`（大 FDE 段） |
 | `prefix_len` | `29` 或 `28`（CHECK 限定）；`/29` 5 个容器位、`/28` 13 个容器位（`.0` 网络 / `.1` 网关 / 末位广播，topology.md §3） |
 | `gateway` | 该网络 `.1`（宿主 bridge 端点；Traefik 走 host 网络经此可达容器） |
-| `pool` | `default`（`10.200.0.0/16`）或 `large`（`10.201.0.0/16`）；两段**保留给 FDE 网络专用**（topology.md §2/§3） |
+| `pool` | `default`（`10.200.0.0/16`）或 `large`（`10.201.0.0/16`）；两段**保留给 FDE 网络专用**（topology.md §2/§3）。**池范围 ≠ 放行范围**：放行/来源规则按 `subnet` 精确派生（topology.md §5.1） |
 | `state` | 状态机见 §2.6 |
-| `revision` | 与 `route_outbox` / reconciler 对账的版本号 |
+| `revision` | 仅属「网络聚合」的版本号（与 `route_outbox` 网络行对账）；**路由级版本见 `route_revisions`（§1.18），不可混用** |
 
 **复用语义**：`subnet` 为**全局唯一**（非部分索引）——offboarding 后 `state → released`，块可复用，但复用前需由 portal 先**腾出该行**（`DELETE` 已释放记录，或将其 `subnet` 改指新块；历史归属由 `audit_log` 的 `network.allocate` / `network.release` 承载）再分配给新 `fde_id`。已建网络子网不可改 → 扩容 = 重建网络（数据在 bind mount，容器是牲口）。
 
@@ -183,20 +183,24 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `aggregate` / `aggregate_id` | 聚合类型与实例 id（如 `port_allocation` / `port_allocations.id`、`llm_binding` / `fde_llm_bindings.fde_id`） |
 | `op` | `upsert` / `delete`；`delete` 用 **tombstone**（revision 递增 + op=delete，不物理删行） |
-| `revision` | 聚合内单调递增版本；`UNIQUE(aggregate, aggregate_id, revision)` 保证同一聚合同一版本至多一条（重试/重复投递安全） |
+| `revision` | 聚合内单调递增版本；`UNIQUE(aggregate, aggregate_id, revision)` 保证同一聚合同一版本至多一条（重试/重复投递安全）；**单调性由 `route_revisions`（每聚合版本 head）保证**，reconciler 只发布 revision = 当前 head 的行 |
 | `payload` | 生成该路由所需的全部事实快照（hostname/url/backend IP 等），随 revision 固化 |
 | `state` | 状态机见 §2.5 |
 | `attempts` / `last_error` | 发布重试计数与最近失败原因 |
+| `claimed_at` / `lease_until` / `worker_id` | `processing` 租约字段：领取时刻 / 到期时刻（lease 60s ⚠️）/ worker 标识；到期未完成由 reaper 回收为 `pending`（attempts+1，§2.5） |
 
-**语义**：portal 在 DB 事务里写 desired state（`port_allocations` / `fde_llm_bindings`）+ 本表一行；**Traefik file provider 是异步幂等派生状态**（PG 事务无法含文件写入）。`delete` 用 tombstone；启动时从 DB 全量重建路由（幂等）；reconciler 消费 outbox 并做 debounce/批量合并、临时文件校验后原子替换（topology.md §8）。
+**语义**：portal 在 DB 事务里写 desired state（`port_allocations` / `fde_llm_bindings`）+ 本表一行，并在**同一事务**内 `SELECT ... FOR UPDATE` 递增 `route_revisions.revision`；**Traefik file provider 是异步幂等派生状态**（PG 事务无法含文件写入）。`delete` 用 tombstone；启动时从 DB 全量重建路由（幂等）；reconciler 消费 outbox 并做 debounce/批量合并、临时文件校验后原子替换（topology.md §8）。`route_revisions` 是「每聚合版本 head」（`PRIMARY KEY(aggregate, aggregate_id)`）；`route_outbox.(aggregate, aggregate_id, revision)` 与其同键空间关联（非外键：outbox 是追加历史，head 只存当前最大版本）。
 
 ### 1.19 `tool_outputs` — 工具结果全文另存（topology.md §9）
 
 | 关键字段 | 语义 |
 |---|---|
-| `run_id` / `tool_call_id` | 归属 run 与工具调用；`tool_call_id` 与 `tool_calls.call_id` 对齐（portal.md §5.3；若 issue #10 最终改为 UUID 再同步）；`UNIQUE(run_id, tool_call_id)` |
+| `run_id` / `tool_call_id` | 归属 run 与工具调用；`tool_call_id` 为**外部 `call_id`**（对齐 `tool_calls.call_id`），复合外键 `(run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)`；`UNIQUE(run_id, tool_call_id)` |
 | `bytes` / `sha256` | 字节数与 sha256（阈值判定、配额、digest 校验/去重） |
 | `body` | 工具结果全文；**超过阈值才另存**——事件里只放 `result_digest` + 引用（`tool_outputs.id`），避免打爆 `run_events` |
+
+> **`tool_call_id` canonical 规则（`tool_outputs` / `approvals` 一致）**：外部 ID = `tool_calls.call_id`（事件流 `tool_use`/`tool_result`/`tool_call_delta` 的 `tool_call_id`，字符串如 `tc_301`）；`tool_calls.id` 是**内部主键（uuid），不外露、不进 API 载荷**。两表都以复合外键 `(run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)` 关联（`tool_calls` 有 `UNIQUE(run_id, call_id)`）。
+> ⚠️ **审批契约由 issue #10 定稿确认**：若 #10 改判为 UUID，则以 #10 为准并同步 `approvals` / `tool_outputs` 两表。
 
 ### 1.20 `fde_llm_bindings` — FDE ↔ LLM 网关虚拟 key 绑定（规格 §11.3）
 
@@ -262,7 +266,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `allocated` | portal：项目创建 / run 启动时的分配事务（规格 §7.2 第 3 步 / §8.2） | forward-auth：放行（portal.md §2.7 第 2 步）；portal：同事务写 `port_allocations` + route outbox、生成 `ports.json`；reconciler 异步幂等发布 Traefik 路由（同源，规格 §8.1） |
+| `allocated` | portal：项目创建 / run 启动时的分配事务（规格 §7.2 第 3 步 / §8.2） | forward-auth：放行（portal.md §2.7 第 2 步）；portal：同一 DB 事务写 `port_allocations`（desired state）+ route outbox；`ports.json` 由 portal 在事务提交后原子写 bind mount；reconciler 异步幂等发布 Traefik 路由（同源，规格 §8.1） |
 | `active` | portal：观测到端口实际在服务（runner 上报监听或首次授权请求）后升级标记 | forward-auth：放行；UI：预览卡片「在线」展示；报表 |
 | `released`（终态） | portal：项目删除 / run 结束 / reaper 回收（规格 §8.2） | forward-auth：**403**（portal.md §2.7）；分配器：端口与 hostname 可复用（部分唯一索引不再覆盖）；reaper：过期清理 |
 
@@ -292,7 +296,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 表.字段 | 状态集合 | 产生方 → 消费方（要点） |
 |---|---|---|
-| `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发前的可达性判断（`container_unreachable`，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`，3 次丢失 ≈45s ⚠️，runner-integration §4.2） |
+| `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发（拉模型：消息落库即 202、容器恢复后自行 claim，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`，3 次丢失 ≈45s ⚠️，runner-integration §4.2） |
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
 | `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
 | `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回 `pending`（re-claim） |
@@ -300,11 +304,12 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 ### 2.5 `route_outbox.state`
 
 ```
- portal 写 desired state + outbox 行（revision 递增）
+ portal 写 desired state + outbox 行 + 同事务递增 route_revisions（revision 递增）
         │
-   ┌────▼─────┐   reconciler 领取（FOR UPDATE SKIP LOCKED）   ┌────────────┐
-   │ pending  │ ───────────────────────────────────────────▶ │ processing │
-   └──────────┘                                              └─────┬──────┘
+   ┌────▼─────┐   reconciler 领取（FOR UPDATE SKIP LOCKED，写 claimed_at/lease_until/worker_id）   ┌────────────┐
+   │ pending  │ ────────────────────────────────────────────────────────────────────────────────▶ │ processing │
+   └──────────┘                                                                                    └─────┬──────┘
+                         租约到期未完成 → reaper 回收 pending（attempts+1）│
                                                          发布成功│  发布失败（attempts 内退避重试）
                                                         ┌───────▼──┐   ┌───────┐
                                                         │ published│   │ failed │（attempts 耗尽 / 告警）
@@ -313,11 +318,13 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `pending` | portal：任何写 desired state 的事务同时写一行 outbox（revision 递增） | reconciler：领取并处理 |
-| `processing` | reconciler：领取（原子，避免重复消费） | reconciler 自身：发布成功后置 `published` |
+| `pending` | portal：任何写 desired state 的事务同时写一行 outbox（revision 递增，见 `route_revisions`）；reaper 把过期 `processing` 回收 | reconciler：领取并处理 |
+| `processing` | reconciler：领取（原子，`FOR UPDATE SKIP LOCKED` + 写 `claimed_at`/`lease_until`/`worker_id`，避免重复消费） | reconciler 自身：发布成功后置 `published` |
 | `published` | reconciler：Traefik 动态配置生成 + 校验 + 原子替换 + reload 成功后 | 对账任务：与 file provider 比对（四向对账，topology.md §8） |
 | `failed` | reconciler：发布失败（`attempts` 耗尽或不可重试） | 告警 + 人工介入；退避窗口内会回 `pending` 重试 |
 
+> **版本单调 + latest-wins**：reconciler 消费前先查 `route_revisions`（`FOR UPDATE`）取当前 head，**只接受 `revision = head.revision` 的行**；`revision < head` 的晚到旧事件（含小 revision 后到达的 delete tombstone）**一律丢弃、不发布**。
+> **崩溃恢复**：reconciler 启动时 + 定时任务把 `state='processing' AND lease_until < now()` 回收为 `pending`（attempts+1），防 worker 崩溃后孤儿锁死；`attempts` 耗尽（≥5 ⚠️）→ `failed` + 告警。
 > 幂等保证：`UNIQUE(aggregate, aggregate_id, revision)` + 生成文件为**纯函数**（同 revision 同输出）→ 重复消费/重试安全。失败保留上一版本文件（原子替换只在新文件校验通过后发生，topology.md §8）。
 
 ### 2.6 `fde_networks.state`

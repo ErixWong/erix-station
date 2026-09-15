@@ -106,12 +106,12 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | Docker `default-address-pools` | docker daemon 默认地址池：每 FDE 一条 `/29` 从这里切（`10.200.0.0/16` size 29 → 8192 条 FDE 网络）。**为什么需要**：docker 默认池每建一条 bridge 就吃掉一段，FDE 规模稍大即耗尽（参考实例 A 上默认池已被既有容器用掉大半） | 平台规范固定（topology.md §3） | daemon.json：`"default-address-pools": [{"base": "10.200.0.0/16", "size": 29}]` |
 | 大 FDE 保留段 | 需要多个自有服务的 FDE 用 `/28`（13 个容器位），从独立段分配，不与默认池混；portal IPAM 显式 `--subnet` 创建 | 平台规范固定（topology.md §3） | `10.201.0.0/16` |
 | `backend` 子网 | portal + station-db + LLM 网关的**显式独立子网**（compose 声明 `subnet`，不再 docker 自动分配），与 FDE 池彻底隔离 | 平台规范固定（topology.md §2/§3） | `172.30.0.0/24`（已避开本机既有 `172.19/20/23/26/27/29/31`；目标环境按 §9 第 16 项探测后定） |
-| 容器 → 宿主收紧（分层防火墙） | 分 **INPUT**（宿主本地服务）与 **DOCKER-USER**（转发/publish）两层收紧；规则由 `fde_networks` 的**精确 CIDR** 生成（覆盖 `10.200.0.0/16` 与 `10.201.0.0/16`，含 `/28`），详见 §5.3 与 topology.md §6 第 7 条 | 平台规范固定（加固清单，issue #5） | 见 §5.3 |
+| 容器 → 宿主收紧（分层防火墙） | 分 **INPUT**（宿主本地服务）与 **DOCKER-USER**（转发/publish）两层收紧；规则由 `fde_networks` 的**精确 CIDR** 生成（每 `subnet` 一条 `/29` 或 `/28`，见 topology.md §5.1）；`10.200.0.0/16` 与 `10.201.0.0/16` 仅为取值池（**池范围 ≠ 放行范围**），详见 §5.3 与 topology.md §6 第 7 条 | 平台规范固定（加固清单，issue #5） | 见 §5.3 |
 | Traefik `--api=false` | 关闭 dashboard/API 管理面：FDE 能访问 Traefik，开着就是跳板（topology.md §6 第 1 条） | 平台规范固定 | 静态配置 `api: false` |
 
 ### 5.3 分层防火墙模型（容器 → 宿主收紧：INPUT + DOCKER-USER）
 
-> 依据 topology.md §6（单一事实来源）。**评审修正**：原「只写 `DOCKER-USER` 一条链」不成立——`DOCKER-USER` 在 FORWARD 链，而**容器访问宿主本地服务走 INPUT**；publish 端口在 PREROUTING 已 DNAT（到 FORWARD 时目的地址已被改写，`-d <宿主IP>` 匹配不到）。故改为两层，规则由 `fde_networks` 的**精确 CIDR** 生成（含 `/28`），**不硬编码单一池**，覆盖 `10.200.0.0/16` 与 `10.201.0.0/16`。
+> 依据 topology.md §6（单一事实来源）。**评审修正**：原「只写 `DOCKER-USER` 一条链」不成立——`DOCKER-USER` 在 FORWARD 链，而**容器访问宿主本地服务走 INPUT**；publish 端口在 PREROUTING 已 DNAT（到 FORWARD 时目的地址已被改写，`-d <宿主IP>` 匹配不到）。故改为两层，规则由 `fde_networks` 的**精确 CIDR** 生成（每 `subnet` 一条，含 `/28`，见 topology.md §5.1），**不硬编码单一池**；`10.200.0.0/16` 与 `10.201.0.0/16` 仅为取值池（**池范围 ≠ 放行范围**）。
 
 **① INPUT 链（宿主本地服务）**：
 

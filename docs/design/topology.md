@@ -112,7 +112,7 @@
 N 个 worker ──IPC──▶ agentd（唯一 HTTP 客户端、唯一持 token）
                         │ https://station.<base>/api/internal/*（--add-host station.<base>:<网关IP>）
                         ▼
-                  Traefik:443 → ipAllowList(10.200.0.0/16 + 10.201.0.0/16) → 127.0.0.1:8080 → portal（Bearer 校验）
+                  Traefik:443 → ipAllowList(精确 CIDR，由 fde_networks 派生，§5.1) → 127.0.0.1:8080 → portal（Bearer 校验）
 ```
 
 - **物理通道只有一条**（agentd 聚合），worker 零凭据、零网络 IO
@@ -147,7 +147,7 @@ worker（零凭据，占位 key + baseURL=https://llm.<base>/v1；`llm.<base>` �
   │ POST https://llm.<base>/v1/chat/completions（可带任意 Authorization）
   ▼
 Traefik(host:443)
-  ① router：Host(`llm.<base>`) && ClientIP(`10.200.<n>.0/29`)   ← 身份来自网络来源，非自报
+  ① router：Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)   ← 身份来自网络来源，非自报；subnet 由 fde_networks 精确派生：默认池 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`（§5.1）
   ② middleware：customRequestHeaders 覆盖 Authorization: Bearer <该 FDE 虚拟 key> + X-FDE-Identity
   ③ service → http://127.0.0.1:4000（网关数据面，回环）
   ▼
@@ -179,8 +179,8 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 |---|---|---|---|---|
 | portal | `Host(`station.<base>`)` | — | `http://127.0.0.1:8080` | L1 |
 | 预览/IDE（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
-| LLM（**每 FDE 一条 router + 一条 headers middleware**） | `Host(`llm.<base>`) && ClientIP(`10.200.<n>.0/29`)` | `<fde>-llm-auth`（headers 注入） | `llm-hub` → `http://127.0.0.1:4000` | L7；身份来自网络来源，注入凭据并覆盖伪造头；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
-| internal | `PathPrefix(`/api/internal`)`（挂在 `station.<base>` 路由链上） | `internal-allow`（`ipAllowList`，从 `fde_networks` 生成，覆盖 `10.200.0.0/16` 与 `10.201.0.0/16`） | `http://127.0.0.1:8080` | L3/L5；容器侧经 hosts 注入（`--add-host station.<base>:<网关IP>`；`llm.<base>` 同法，见 L3）访问 |
+| LLM（**每 FDE 一条 router + 一条 headers middleware**） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `<fde>-llm-auth`（headers 注入） | `llm-hub` → `http://127.0.0.1:4000` | L7；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
+| internal | `PathPrefix(`/api/internal`)`（挂在 `station.<base>` 路由链上） | `internal-allow`（`ipAllowList`，从 `fde_networks` 精确派生，每 `subnet` 一条，§5.1） | `http://127.0.0.1:8080` | L3/L5；容器侧经 hosts 注入（`--add-host station.<base>:<网关IP>`；`llm.<base>` 同法，见 L3）访问 |
 
 **公共约定**：
 
@@ -190,6 +190,30 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 - `llm-hub` service 的 `responseForwarding.flushInterval` 必须调小（≤100ms），否则 token 流被缓冲成整段（§6 第 5 条）。
 - **来源判定一律用 request remote address（不读 `X-Forwarded-For`）**：`ipAllowList`（internal 路由）与 `ClientIP`（LLM 路由）默认匹配 remote address；public entryPoint 不配 `forwardedHeaders.insecure`、中间件不配基于 XFF 的 `ipStrategy`。「容器直达 host Traefik、无中间代理」是「来源子网 = 身份」成立的安全前提，作为配置约束写死；**验收**：伪造/重复 `X-Forwarded-For` 不得影响来源判定（§10 证据 8 反向断言）。
 
+### 5.1 来源规则派生（唯一口径）
+
+> **所有「按来源子网放行/判定」的规则共用同一条派生结果**：internal 路由 `ipAllowList`、LLM 路由 `ClientIP`、宿主 INPUT、DOCKER-USER——**禁止在任何文档/配置里把 `/16` 聚合池直接写进放行范围**。
+
+派生规则：对 `fde_networks` 中 `state ∈ {allocated, active}` 的每一行，取其 `subnet`（精确 `/29` 或 `/28`）生成一条来源规则；上述四处**全部复用这一派生结果**。
+
+派生 SQL（portal/reconciler 每次全量生成时执行）：
+
+```sql
+SELECT subnet
+FROM fde_networks
+WHERE state IN ('allocated', 'active')
+ORDER BY subnet;
+```
+
+两个具体示例（假设 `fde_networks` 现有两行）：
+
+| `fde_id` | `subnet` | `pool` | 派生的来源规则 |
+|---|---|---|---|
+| alice | `10.200.1.0/29` | `default` | `ipAllowList` 一条 `10.200.1.0/29`；LLM `ClientIP(`10.200.1.0/29`)`；INPUT/DOCKER-USER `-s 10.200.1.0/29` |
+| bob（大 FDE） | `10.201.7.0/28` | `large` | `ipAllowList` 一条 `10.201.7.0/28`；LLM `ClientIP(`10.201.7.0/28`)`；INPUT/DOCKER-USER `-s 10.201.7.0/28` |
+
+> **池范围 ≠ 放行范围**：`10.200.0.0/16` 与 `10.201.0.0/16` 只是 `fde_networks.subnet` 的**取值池**（子网从这两段中切出），**不是**放行范围；放行范围恒为 `fde_networks` 中实际存在的精确 `subnet`。任何把 `/16` 直接写进 `sourceRange` / `ClientIP` / iptables 的配置都是 bug。
+
 ---
 
 ## 6. 加固清单（10 条，必须全部配置）
@@ -197,9 +221,9 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 | # | 项 | 配置 | 为什么 |
 |---|---|---|---|
 | 1 | Traefik 关闭管理面 | `--api=false`（dashboard/API 全关） | FDE 能访问 Traefik，开着就是跳板 |
-| 2 | **头别名防伪造** | entryPoint `aliasHeadersStrategy: delete`（或 `reject`） | 实测警告：`X_FDE_Identity` 之类别名头可绕过注入（§10 证据 9） |
+| 2 | **头别名防伪造** | `entryPoints.<name>.http.aliasHeadersStrategy: delete`（或 `reject`） | 实测警告：`X_FDE_Identity` 之类别名头可绕过注入（§10 证据 9）。**必须挂在 `http` 层级下**——写成 `entryPoints.<name>.aliasHeadersStrategy` 会错层 → Traefik 启动失败（fde-platform.md §6.4 注释） |
 | 3 | **禁止兜底路由** | 不写 `Host(llm.<base>)` 的通配路由（无 ClientIP 条件） | 实测：无匹配来源 404 = 默认拒绝，兜底等于开门 |
-| 4 | internal 路由来源白名单 | `/api/internal/*` 加 `ipAllowList`（从 `fde_networks` 生成，覆盖 `10.200.0.0/16` 与 `10.201.0.0/16`） | internal API 走 ingress，必须限制来源（含大 FDE `/28` 段） |
+| 4 | internal 路由来源白名单 | `/api/internal/*` 加 `ipAllowList`（从 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，§5.1） | internal API 走 ingress，必须限制来源（含大 FDE `/28` 段） |
 | 5 | 流式 | hub service `responseForwarding.flushInterval` 调小（≤100ms） | 否则 token 流被缓冲成整段 |
 | 6 | 网关 admin 面隔离 | admin 端口不发布，只在 `backend` 网络 | 否则 FDE 能自开额度/建 key |
 | 7 | **容器 → 宿主服务收紧（分层）** | INPUT（宿主本地服务）+ DOCKER-USER（转发/publish）两层，见 §6.1 | **实测**：FDE 容器可达宿主 `gitea:3000`/`mssql:1433`/`portainer:9000`（所有方案共同缺口）；原「只写 DOCKER-USER」不成立（§6.1） |
@@ -209,7 +233,7 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 
 ### 6.1 分层防火墙模型（容器 → 宿主收紧：INPUT + DOCKER-USER）
 
-> **评审修正**：原第 7 条「只写 `DOCKER-USER`」不成立——`DOCKER-USER` 在 FORWARD 链，而**容器访问宿主本地服务走 INPUT**；publish 端口在 PREROUTING 已 DNAT（到 FORWARD 时目的地址已被改写，`-d <宿主IP>` 匹配不到）。故改为两层，规则由 `fde_networks` 的**精确 CIDR** 生成（含 `/28`），**不硬编码单一池**，覆盖 `10.200.0.0/16` 与 `10.201.0.0/16`。
+> **评审修正**：原第 7 条「只写 `DOCKER-USER`」不成立——`DOCKER-USER` 在 FORWARD 链，而**容器访问宿主本地服务走 INPUT**；publish 端口在 PREROUTING 已 DNAT（到 FORWARD 时目的地址已被改写，`-d <宿主IP>` 匹配不到）。故改为两层，规则由 `fde_networks` 的**精确 CIDR** 生成（每 `subnet` 一条，含 `/28`，§5.1），**不硬编码单一池**；`10.200.0.0/16` 与 `10.201.0.0/16` 仅为取值池（**池范围 ≠ 放行范围**）。
 
 **① INPUT 链（宿主本地服务）**：
 

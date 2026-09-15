@@ -61,7 +61,7 @@
 
 **派生规则**：
 - transcript / events / 端口分配 / 用量 / 审计 / 会话 → **全部在 DB**
-- run loop 在容器里执行，但事件与快照**边跑边写 DB**；portal 重启后客户端按 `Last-Event-ID` 补发
+- run loop 在容器里执行，但事件与快照**边跑边经 portal internal API 落库**（容器不直连 DB，D1'）；portal 重启后客户端按 `Last-Event-ID` 补发
 - `.erix/ports.json` 是**派生视图**（为 agent 免 API 读取），**不是真相**
 - 主机重启后，凭 DB 能重新生成全部端口 JSON 与 Traefik 路由（自愈）
 

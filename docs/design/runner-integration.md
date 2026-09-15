@@ -141,7 +141,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | 项 | 取值 |
 |---|---|
 | Base URL | `https://station.<base>/api/internal`（容器内 `--add-host station.<base>:<本 FDE 网关 IP>`，H-B D-5；`station.<base>` 由 env §10 部署变量 `PORTAL_HOST` 决定） |
-| 网络路径 | **经 Traefik**：`Host(station.<base>) && PathPrefix(/api/internal)` + `ipAllowList(10.200.0.0/16)` 限源后回环到 portal `127.0.0.1:8080`；portal 对 internal 前缀不做 forwardAuth（鉴权靠 per-container token，审计由端点自身写 `audit_log` 关键动作） |
+| 网络路径 | **经 Traefik**：`Host(station.<base>) && PathPrefix(/api/internal)` + `ipAllowList`（由 `fde_networks` 精确派生，每 `subnet` 一条，topology.md §5.1）限源后回环到 portal `127.0.0.1:8080`；portal 对 internal 前缀不做 forwardAuth（鉴权靠 per-container token，审计由端点自身写 `audit_log` 关键动作） |
 | 认证 | 每个请求 `Authorization: Bearer <per-container token>`；portal 由 token 解出 `container_id` / `user_id`，后续所有 `:run_id` 资源校验归属该容器（防跨容器伪造 run_id） |
 | 连接 | 两条长驻出站连接：`GET .../stream`（SSE 下行）+ 循环 `POST .../claim`（长轮询）；其余为短请求 |
 | 语义基调 | **at-least-once + 幂等**：所有写端点携带客户端幂等键，portal 端 DB 唯一约束兜底；agentd 对所有 5xx/网络错误无限指数退避重试（见 §4.5） |
@@ -157,9 +157,9 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | U5 | `PUT /api/internal/runs/:id/transcript/rounds/:round` | store：`appendRound` | RoundRecord（含 `dedupKey`、`folded`、`messages`、`foldedPayload`） | `200 {inserted: bool}` | `UNIQUE(run_id, round)` + dedupKey（§9.3） |
 | U6 | `GET /api/internal/runs/:id/transcript` | store：`load` | — | `200 {records: [...]}` | 只读 |
 | U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall` | query：`from_round` / `to_round` / `pattern` | `200 {text}` | 只读 |
-| U8 | `PUT /api/internal/runs/:id/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint` | `{seq, snapshot}` | `200` | `UPSERT (run_id, seq)` 覆盖写（§9.3） |
+| U8 | `PUT /api/internal/runs/:id/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint` | `{seq?, snapshot}`（`seq` 仅调用方本地元数据、不落库） | `200` | 单行覆盖写（§9.3） |
 | U9 | `GET /api/internal/runs/:id/checkpoint/latest` | store：`loadLatestCheckpoint` | — | `200 {checkpoint}` / `204`（无） | 只读 |
-| U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单 | `{tool_call_id, round, name, input_digest}` | `201 {approval_id}` | 一个工具调用至多一单（`approvals.tool_call_id UNIQUE`，schema.sql） |
+| U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单 | `{tool_call_id, round, name, input_digest}` | `201 {approval_id}` | 一个工具调用至多一单（`approvals` `UNIQUE(run_id, tool_call_id)`，schema.sql） |
 | U11 | `GET /api/internal/approvals/:id` | 审批决定**轮询兜底** | — | `200 {status, decided_by?, decided_at?, note?}` | 只读 |
 | U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（准备工作失败） | `{reason}` | `200`；portal 将 queue 行回 `pending`（attempts 内）或 `cancelled` | 重复 release 返回首次结果 |
 
@@ -171,7 +171,7 @@ agentd                          portal
   │                                 │ 有 pending 行：
   │                                 │   SELECT ... FOR UPDATE SKIP LOCKED
   │                                 │   → status='claimed', claimed_at=now,
-  │                                 │     lease_expires_at=now+90s, attempts++
+  │                                 │     lease_until=now+90s, attempts++
   │◀────────── 200 {ticket} ────────│
   │                                 │ 无 pending 行：挂起连接（不持有事务/锁）
   │                                 │   · DB LISTEN/NOTIFY 或进程内事件唤醒 → 再查一次
@@ -179,14 +179,14 @@ agentd                          portal
   │◀────────── 204 ─────────────────│（agentd 立即发起下一次 claim）
 ```
 
-- ticket 载荷：`{queue_id, claim_token, lease_expires_at, run: {id, session_id, project: {name, root_path}, task, message_id, model, resume, attachments}}`。
+- ticket 载荷：`{queue_id, claim_token, lease_expires_at, run: {id, session_id, project: {name, root_path}, task, message_id, model, resume, attachments}}`（`lease_expires_at` 为 API 载荷字段名，对应 schema 列 `run_queue.lease_until`，见 portal.md §9.3）。
 - `claim_token`：本次认领的凭证；U2/U3/U5-U12 携带（header `X-Claim-Token`），portal 校验「该 run 当前有效租约 = 此 token」——**防止旧 agentd（崩溃恢复后）与新 agentd 双写同一 run**（re-claim 后旧 token 失效，`409 lease_lost`）。
 - **唤醒机制**：portal 在 `POST /messages` 入队后 `NOTIFY run_queue`（或单节点进程内 EventEmitter，规格 §10.2 同构）唤醒挂起的 claim；这是「拉取 + portal 侧事件唤醒」，push 优化（P2）后置 ⚠️。
 - 并发容量：`capacity` = agentd 当前可再接收的 run 数（§13）；portal 一次至多派发 `capacity` 条（响应数组或逐条，实现细节，契约按单条设计、数组为兼容扩展）。
 
 **heartbeat（U4）语义**：
 
-- 间隔 **15s**（⚠️）；每次携带当前活跃 run 列表 → portal 对每个 claimed run 续租（`lease_expires_at = now + 90s` ⚠️）。
+- 间隔 **15s**（⚠️）；每次携带当前活跃 run 列表 → portal 对每个 claimed run 续租（`lease_until = now + 90s` ⚠️）。
 - 响应 `stop_run_ids`：portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run——**停止指令的兜底通道**（SSE 为主、心跳为备）。
 - 响应 `revoked: true`：token 已吊销 / 容器被 offboard → agentd 停止领新任务、收敛在跑 run 后退出。
 - portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**（`containers.status → exited` 语义，model.md §2.4）；run 级处置走租约到期（§6.4）。
@@ -266,7 +266,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
  │ runs: queued│                                            ▼
  └─────────────┘                              agentd: POST /claim（hold ≤30s）
         │                                      │ 200 ticket：run_queue → claimed
-        │                                      │   lease_expires_at = now+90s
+        │                                      │   lease_until = now+90s
         │                                      │   attempts++，发 claim_token     [portal 负责]
         │                                      ▼
         │                            【claimed（租约态）】runs 仍 queued
@@ -371,7 +371,7 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 
 - **at-least-once**：agentd 只有在收到 `200` 后才从缓冲确认删除；任何失败重试整批。
 - **幂等键**：`client_event_id`（`run_id + ":" + 单调计数`，worker 生成）。portal 端 `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING`，响应 `stored` 为实际插入数；重复批次安全。
-  - ⚠️ **schema 对齐项**：`run_events` 现行 DDL（schema.sql:234-247）无 `client_event_id` 列，需补 `client_event_id text` + `UNIQUE(run_id, client_event_id)`（列入 §16，由后续 schema 任务落地）。
+  - ✅ **已落地**：`run_events.client_event_id text` + `UNIQUE(run_id, client_event_id)` 已在 schema.sql（§3 run_events / model.md §1.12）；原「待补列」待办删除。
 - **seq 分配**：portal 在**同一事务**内 `UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`（model.md §1.6），逐事件分配；`UNIQUE(session_id, seq)` 兜底（schema.sql:247）。seq 只在 portal 产生——worker/agentd 永不自造 seq。
 - **缺口检测**：前端按 SSE `id` 检测跳号；跳号 → 断开并以最后收到的 `id` 作 `Last-Event-ID` 重连补发（portal.md §5.2）。portal 广播层同样按 seq 顺序推送（事务提交乱序时按 seq 重排后再发）。
 - **断线重放**：portal 端语义已在 portal.md §5.2 定义（补发大于 `Last-Event-ID` 的全部事件）；容器侧 portal↔agentd 通道**无重放概念**——agentd 未确认的事件本地持有，重连后续传。
@@ -426,8 +426,8 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 | `load(runId)` | `load` | U6 `GET .../transcript` | 读 `transcript_rounds` 按 round 升序 | 只读 |
 | `recall(runId, from?, to?, pattern?)` | `recall` | U7 `GET .../transcript/recall` | 读 `transcript_rounds`（含 `folded_payload`，对齐上游「折叠原文同属档案」`src/store/file.js:252-261`） | 只读 |
 | `markRunState(runId, state)` | `markRunState` | U2 `PUT .../state`（非终态：`{state}`） | `runs.status`（running 等） | 覆盖写 |
-| `saveCheckpoint(runId, cp)` | `saveCheckpoint` | U8 `PUT .../checkpoint` | `run_checkpoints` | **覆盖写语义**：`seq` 由 worker 单调计数（每 run 从 0 递增），`INSERT ... ON CONFLICT (run_id, seq) DO UPDATE SET snapshot=EXCLUDED.snapshot`——对齐上游 tmp+rename 原子覆盖（`src/store/file.js:279-286`），且重试同一 seq 安全 |
-| `loadLatestCheckpoint(runId)` | `loadLatestCheckpoint` | U9 `GET .../checkpoint/latest` | `SELECT ... ORDER BY seq DESC LIMIT 1`；无 → `204` → adapter 返回 `undefined` | 只读 |
+| `saveCheckpoint(runId, cp)` | `saveCheckpoint` | U8 `PUT .../checkpoint` | `run_checkpoints` | **单行覆盖写语义**：每 run 单行（`run_id` 主键），`INSERT ... ON CONFLICT (run_id) DO UPDATE SET snapshot=EXCLUDED.snapshot, updated_at=now()`——对齐上游 tmp+rename 原子覆盖（`src/store/file.js:279-286`），重试同一快照安全；`seq` 仅调用方本地元数据（worker 每 run 从 0 递增），**不落库** |
+| `loadLatestCheckpoint(runId)` | `loadLatestCheckpoint` | U9 `GET .../checkpoint/latest` | 直接取单行（`SELECT ... WHERE run_id = $1`，无 `ORDER BY seq`）；无 → `204` → adapter 返回 `undefined` | 只读 |
 
 > `appendCheckpoint`：上游 file 实现即 `saveCheckpoint` 别名（`src/store/file.js:287-289`）；引擎选择顺序是先 `saveCheckpoint` 后 `appendCheckpoint`（`src/loop.js:1193-1199`），adapter 实现 `saveCheckpoint` 即可覆盖。
 
@@ -491,7 +491,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | **用户离线** | 审批单停 `pending`；worker 挂起等待但 **worker/agentd 均活着** → 心跳照常续租，run 不会被 re-claim；10min 超时 → denied → run 继续（模型收到拒绝反馈） |
 | 审批中途用户 stop | SSE `stop_request` → agentd 同时发 `abort` + 以 `denied` resolve 挂起的审批 → 引擎 abort 收敛（`aborted`） |
 | run 已终态后 FDE 才点审批 | portal 接受决定、写审计；agentd 侧无等待者，忽略 `approval_decision`（幂等） |
-| agentd 重启时存在挂起审批 | run 本身已被 re-claim + resume；审批单仍 `pending`，resume 后的 run 若再次执行到同一工具会**新建审批单**（`tool_call_id UNIQUE` 冲突 → portal 返回原单 `200 {approval_id}`，继续等原单决定） |
+| agentd 重启时存在挂起审批 | run 本身已被 re-claim + resume；审批单仍 `pending`，resume 后的 run 若再次执行到同一工具会**新建审批单**（`UNIQUE(run_id, tool_call_id)` 冲突 → portal 返回原单 `200 {approval_id}`，继续等原单决定） |
 
 ---
 
@@ -630,13 +630,14 @@ FDE 浏览器        portal                agentd               worker（execute
 | R1 | 规格 §10.3 | 「portal → 容器 HTTP push」「容器 → portal 写 DB + 心跳」与 D1'/D2' 及本文出站模型相反 | 改为：容器全出站（SSE + POST 上行 internal API）；删除容器 :3000 入站角色（§12.3 端口表同步去 3000 runner 行或改为「无」） |
 | R2 | 规格 §13.1 / §15 P0 | 「等上游抽 `src/session` 发 0.4.0」P0 已被 D3' 作废（上游永久非目标） | 删除 P0，P1 内容补上「会话层由 portal + agentd/worker 实现（见本文 §1.3）」 |
 | R3 | 规格 §9.3 末尾「强烈建议」 | 「本地 file 优先 + DB 异步复制」被 D2' 明确不采纳 | 改写为本文 §9.2/§9.4 的重试包装与代价说明 |
-| R4 | portal.md §6.3 | 「portal → FDE 容器 `http://fde-<name>:3000`」不复存在；`container_unreachable` 出现条件变化（pull 下拉取语义：消息落库即 202，容器恢复后自行领取——portal.md §6.3 末尾注已预留此演进） | 按本文 §4 重写该节 |
-| R5 | schema.sql `run_queue`（:347 起） | 缺租约字段 | 补 `lease_expires_at timestamptz`、`claim_token text`、`attempts int NOT NULL DEFAULT 0` |
+| R4 | portal.md §6.3 | 「portal → FDE 容器 `http://fde-<name>:3000`」不复存在；`container_unreachable` 出现条件变化（pull 下拉取语义：消息落库即 202，容器恢复后自行领取） | ✅ 已改：portal.md §6.3 已按本文 §4 重写（拉模型落库即 202；`container_unreachable` 仅 push 下发模式保留，⚠️ 待决策者确认） |
+| R5 | schema.sql `run_queue`（:347 起） | 缺租约字段 | ✅ 已落地（列名 `lease_until`）：`lease_until timestamptz` + `claim_token text` + `attempts int NOT NULL DEFAULT 0`（本文 §4.2/§6 已统一以 `lease_until` 描述 DB 写；API 载荷名 `lease_expires_at` 保留并与 `lease_until` 对应，portal.md §9.3） |
 | R6 | schema.sql `run_events`（:234 起） | 缺事件幂等键 | 补 `client_event_id text` + `UNIQUE(run_id, client_event_id)`（§7.3） |
 | R7 | schema.sql `containers.runner_token`（:85 注释） | 「portal 需持原文调用，故存原文」在出站模型下过时 | ✅ 已改：`containers.runner_token_hash` + `token_generation`/`revoked_at`/`rotated_at`（schema.sql / model.md §1.4） |
 | R8 | model.md §3「谁写」表 | 「runner 回写 assistant 回复」在 D1' 下实为 runner 上报、**portal 落库** | 措辞对齐 |
 | R9 | 上游行号引用 | portal.md / model.md 引用 v0.3.4 行号；本地仓库已 v0.3.5 | 统一口径时核对（本文全部按 v0.3.5 实测标注） |
 | R10 | 本文 §1.3/§5/§6.3/§11/§13 及 fde-platform.md §11 / env.md §6 | 「LLM 虚拟 key 文件注入容器（`apiKeyFile`）」已按 H-B D-4 作废：容器内零 LLM 凭据（占位 key + `baseURL=https://llm.<base>/v1`），真实虚拟 key 只存在于宿主 Traefik 动态配置（600） | 已对齐（本文 + fde-platform.md + env.md 均已注明作废；schema.sql 无 LLM 凭据列，无需改动） |
+| R11 | schema.sql `run_checkpoints`（每 run 单行，无 `seq` 列） | 本文 §4.2 U8/§9.1 曾写 `UPSERT (run_id, seq)` / `ORDER BY seq`，与 schema 单行覆盖写矛盾 | ✅ 已改：统一为 `ON CONFLICT (run_id) DO UPDATE`、loadLatestCheckpoint 直接取单行；`seq` 仅调用方本地元数据、不落库（本文 §4.2/§9.1，portal.md §9.8） |
 
 ---
 
