@@ -22,7 +22,7 @@
 - 一台容器同时承载多个仓库是常态（FDE 同时服务多个客户）。所以「一台容器 = 一个隔离域」，但「一个仓库 = 一个工作单元」。
 
 **派生规则**：
-- 每 FDE 容器接入 `control` + `fde-<name>` 两个网络，**不与其他 FDE 共享任何网络**
+- 每 FDE 容器**只接自己的 `/29` 网络**（`fde-<name>`），不与其他 FDE 共享任何网络（H-B：`control` 已取消，topology.md §2）
 - FDE 容器不 publish 端口、不挂 `docker.sock`、不持有平台密钥
 - 同一仓库的并发靠 **worktree + `agent/<runId>` 分支**，不靠多容器
 
@@ -41,7 +41,7 @@
 
 **派生规则**：
 - 授权规则是 `f(cookie.sub, host 中的 FDE 标识)` 的纯函数，在 `/api/forward-auth` 一处实现
-- 路由由 portal 生成写入 Traefik file provider，与 DB 端口表**同源同事务**
+- 路由由 portal 生成写入 Traefik file provider，与 DB 端口表**同源**（DB 事务写 `port_allocations` + route outbox；Traefik file provider 是异步、幂等、可重试的派生状态）
 - **路由表里没有 = 不可达**（比 403 更干净）
 - dev server 不改造；容器内 agent 走回环，不经 ingress
 
@@ -61,7 +61,7 @@
 
 **派生规则**：
 - transcript / events / 端口分配 / 用量 / 审计 / 会话 → **全部在 DB**
-- run loop 在容器里执行，但事件与快照**边跑边写 DB**；portal 重启后客户端按 `Last-Event-ID` 补发
+- run loop 在容器里执行，但事件与快照**边跑边经 portal internal API 落库**（容器不直连 DB，D1'）；portal 重启后客户端按 `Last-Event-ID` 补发
 - `.erix/ports.json` 是**派生视图**（为 agent 免 API 读取），**不是真相**
 - 主机重启后，凭 DB 能重新生成全部端口 JSON 与 Traefik 路由（自愈）
 
@@ -113,7 +113,7 @@
 
 | 设计规则（规格位置） | 来源原理 |
 |---|---|
-| 每 FDE 双网络接入（§5.1） | 一 |
+| 每 FDE 独立 `/29` 网络（§5.1） | 一 |
 | 不 publish FDE 端口（§5.2） | 一、四 |
 | 每 FDE 独立 bridge 网络（§5.2） | 一、四 |
 | ingress 是唯一入口 + forwardAuth（§6） | 二、四 |
@@ -163,7 +163,7 @@
 
 ### Q2 出口管控（egress）职责归属 —— ✅ 已决策
 
-> **已决策：出口管控归安全团队（网络层）**（决策者 2026-09，issue #3）。平台职责止于**凭据红线**（容器内只放网关虚拟 key，永不下放下游真实 key）与**审计**；若安全团队的出口策略未实施，「防外发」降级为审计 + 告警，须管理层书面知情。
+> **已决策：出口管控归安全团队（网络层）**（决策者 2026-09，issue #3）。平台职责止于**凭据红线**（容器内**零 LLM 凭据**——H-B 定稿 D-4 后连虚拟 key 也不放容器，仅占位 key + `baseURL=https://llm.<base>/v1`，真实虚拟 key 由 Traefik 按来源子网注入；永不下放下游真实 key）与**审计**；若安全团队的出口策略未实施，「防外发」降级为审计 + 告警，须管理层书面知情。
 >
 > 决策者原话：「防火墙那是安全团队的事情，不用我们管。」技术事实：Docker 容器默认经宿主机 NAT 出网且无任何限制；出口策略只能在网络层实施（宿主机 iptables/nftables、强制 egress 代理按域名白名单、或网络设备对容器所在网段做策略），平台业务代码实现不了。
 

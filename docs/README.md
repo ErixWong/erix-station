@@ -14,6 +14,7 @@
 | [`../README.md`](../README.md) | 项目定位、三条不变式 | ✅ |
 | [`../AGENTS.md`](../AGENTS.md) | 项目特有规则（边界/结构/端口/流程/已定决策） | ✅ |
 | [`design/fde-platform.md`](design/fde-platform.md) | **主规格**：拓扑、网络与隔离、访问控制、账号生命周期、端口分配、数据模型、事件流、LLM 接入、容器模板、部署、分期、决策 D1~D10 | ✅ |
+| [`design/topology.md`](design/topology.md) | **H-B 网络与访问拓扑定稿（单一事实来源）**：拓扑、IPAM、链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、实测证据（决策者 2026-09，issue #5） | ✅ |
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
 | [`env.md`](env.md) | **部署参数清单**：参数定义 + 参考实例 A + 目标环境探测 checklist（非单机环境事实） | ✅ |
 | [`api/portal.md`](api/portal.md) | **portal API 契约**：认证、端点请求/响应 schema、SSE 事件信封类型清单、错误语义 | ✅ |
