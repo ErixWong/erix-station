@@ -30,7 +30,7 @@
 | `station-edge`（Traefik） | `TRAEFIK_IMAGE`（官方 `traefik:v3`） | 生产 `traefik:v3.<minor>.<patch>` **再 pin digest**（env §10 ⚠️） | `traefik --configFile=/etc/traefik/traefik.yml`（静态配置见 §4） | **root**（官方镜像默认；需绑 80/443 与写 `acme.json`） | `unless-stopped` | P1 ✅ |
 | `station-portal` | `PORTAL_IMAGE`（自构建，build context `portal/`） | `erix-station/portal:<git-sha>` 不可变 tag，部署时 pin digest | `node portal/src/cli.js serve`（零依赖 Node，Q7 倾向 (a)） | **WP2a 起 `root`（`PORTAL_RUNTIME_UID=0`）**：materializer 需 chown 工作区（1000:1000）、写 Traefik 动态配置（600）、经 socket-proxy 调 Docker API（user-space §6.1）；compose 加固 `no-new-privileges` + `cap_drop: [ALL]`，并回加 `cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]`（WP1 skeleton 原为 `node` 非 root，已切回） | `unless-stopped` | P1 ✅ |
 | `station-db` | `DB_IMAGE`（官方 `postgres:16`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
-| `station-docker-socket-proxy` | `SOCKET_PROXY_IMAGE`（`tecnativa/docker-socket-proxy:v0.5.0`） | 生产 digest pin（env §10 ⚠️）；P1 开发 pin patch tag `v0.5.0` | 官方默认入口（haproxy） | 官方默认（root，受 `no-new-privileges` + `cap_drop: [ALL]` + `read_only` 约束；白名单仅 `CONTAINERS=1`/`NETWORKS=1` + `POST=0` **只读**，`/var/run/docker.sock` 只挂到本服务，见 §5） | `unless-stopped` | P1 ✅ |
+| `station-docker-socket-proxy` | `SOCKET_PROXY_IMAGE`（`tecnativa/docker-socket-proxy:v0.5.0`） | 生产 digest pin（env §10 ⚠️）；P1 开发 pin patch tag `v0.5.0` | 官方默认入口（haproxy） | 官方默认（root，受 `no-new-privileges` + `cap_drop: [ALL]` + `read_only` 约束；白名单 `CONTAINERS=1`/`NETWORKS=1` + `POST=1`，`/var/run/docker.sock` 只挂到本服务，见 §5） | `unless-stopped` | P1 ✅ |
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
 | `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
 
@@ -64,7 +64,7 @@
 | `station-portal` | `backend` | **`127.0.0.1:8080:8080`**（回环，供 Traefik 反代 + forwardAuth） | ① 用户空间 `${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}` → `/srv/erix/users`（RW，**同路径**，materializer 直写用户空间，user-space §2.2）；② 动态配置 `${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}` → `/etc/traefik/dynamic`（RW，**单一写方**，reconciler 写 Traefik 动态配置；生产宿主目录为 `/docker/station-edge/dynamic/`，开发期默认仓库相对目录）；③ `/docker/station-edge/firewall/` → `/docker/station-edge/firewall/`（RW，600，reconciler 写 `rules.v4`，WP2b 接入防火墙时启用）。**不挂整个 `/docker/station-edge`**（Traefik 静态配置 / `acme.json` / `logs/` 不挂给 portal）。portal 自身无持久卷（状态在 DB） | `station-db`（`condition: service_healthy`）+ `station-docker-socket-proxy`（`condition: service_started`） | `station-portal healthcheck`（见下） | `/docker/station-portal/.env.portal`（600） |
 
 > **WP2a 开发期宿主管道路径参数**：用户空间与动态配置两个 bind mount 的宿主路径用 `ERIX_USERSPACE_ROOT_HOST` / `TRAEFIK_DYNAMIC_DIR_HOST` 注入（见 env §10），容器内路径固定（`/srv/erix/users` / `/etc/traefik/dynamic`）。开发期指向临时目录时**必须 0755**——Traefik/portal 容器以 `cap_drop: ALL` 运行、无 `DAC_OVERRIDE`，目录需 other 可读/可穿越。生产路径仍按本表默认（`/srv/erix/users` / `/docker/station-edge/dynamic/`）。
-| `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1`、`NETWORKS=1`、`POST=0`，其余 0，见 §5） |
+| `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1`、`NETWORKS=1`、`POST=1`，其余 0，见 §5） |
 | `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `/docker/station-edge/traefik.yml` → `/etc/traefik/traefik.yml`（RO）；② `/docker/station-edge/dynamic/` → `/etc/traefik/dynamic/`（RO，**与 portal 共享宿主目录、Traefik 侧只读**）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，**仅 Traefik 读写、不挂给 portal**）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW，**仅 Traefik、不挂给 portal**） | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**） |
 
 > **`station-db` 容器加固（与其它三服务一致）**：`security_opt: [no-new-privileges]` + `cap_drop: [ALL]`，并显式回加 postgres 初始化所需的最小 capability `CHOWN` / `DAC_OVERRIDE` / `FOWNER` / `SETGID` / `SETUID`（官方入口以 root 启动、chown 数据目录后用 gosu 降权到 `postgres`）。已用空卷起栈验证 DB 可完成首次初始化（建库/应用 schema/设角色口令）并 healthy。
@@ -203,13 +203,25 @@
 |---|---|
 | 镜像 | `SOCKET_PROXY_IMAGE` = `tecnativa/docker-socket-proxy`（digest pin，env §10 ⚠️） |
 | 挂载 | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） |
-| API 白名单 | `CONTAINERS=1`、`NETWORKS=1`、`POST=0`，**其余全 0**（`IMAGES/EXEC/SYSTEM/AUTH/SECRETS/BUILD/COMMIT/PLUGINS/SWARM/INFO/VOLUMES/…`）；`POST=0` → **只放行 GET 类 Docker API，P1 portal 只读** |
+| API 白名单 | `CONTAINERS=1`、`NETWORKS=1`、`POST=1`，**其余全 0**（`IMAGES/EXEC/SYSTEM/AUTH/SECRETS/BUILD/COMMIT/PLUGINS/SWARM/INFO/VOLUMES/…`）；`POST=1` → **放行 containers/networks 生命周期所需的非 GET 方法**（WP2b 起，portal 经此创建/启动/停止/删除 FDE 容器） |
 | 加固 | `--security-opt no-new-privileges` + `cap_drop: [ALL]` + `read_only`（`/tmp`、`/run`、`/var/lib/haproxy` 走 tmpfs）；不 publish、仅 `backend` 网络 |
 | portal 连接 | `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` |
 
-> **P1 只读矩阵（portal 经 socket-proxy 实际可用的 Docker API）**：`POST=0` 下仅 `GET` 类调用生效——`/_ping`、`/version`、`/containers/json` 及 `CONTAINERS=1` 放行的读端点、`/networks` 及 `NETWORKS=1` 放行的读端点。**创建容器（`POST /containers/create`）与建网络（`POST /networks/create`）在 P1 不可用，归 ⚠️ WP2 交付**：WP2 需把 socket-proxy 白名单扩展为 `POST=1`（同时保持下方 B6 的创建字段 allowlist 收紧），portal 才能经 Docker API 创建 FDE 容器（§6）。
+> **WP2b 已放开（portal 经 socket-proxy 实际可用的 Docker API）**：`POST=1` 下放行 `CONTAINERS=1`/`NETWORKS=1` 两个类别内的全部方法——`/_ping`、`/version`、`/containers/json`、`/containers/create`、`/containers/{id}/json`、`/containers/{id}/start|stop`、`DELETE /containers/{id}`、`/networks`、`/networks/create`、`/networks/{id}`、`DELETE /networks/{id}`。**真正的路径级最小面由 portal 侧代码层白名单兑底**（见下「实现偏差」）。
 
-**白名单理由（每项都对应 portal 实际所需的最小面；⚠️ P1 因 `POST=0` 只读，下列 create/start/stop/rm 与 network create 为 WP2 目标面，P1 仅 GET 类生效）**：
+### 5.1 ⚠️ 实现偏差：socket-proxy 的 POST 是全局方法门，无路径级 POST 白名单
+
+> **不改设计决策，只记录实现现实**（deploy-contract §5 的「路径级最小面」意图由两层实现：socket-proxy 类别级 + portal 代码层）。
+
+对 `tecnativa/docker-socket-proxy:v0.5.0` 的 haproxy 模板（`/usr/local/etc/haproxy/haproxy.cfg.template`）实测确认：
+
+- **`POST` 是一个全局方法门**：模板首行 `http-request deny unless METH_GET \|\| { env(POST) -m bool }`——`POST=1` 放行**所有**非 GET 方法（POST/PUT/DELETE…），**没有**「按 endpoint 类别/路径区分 POST」的粒度。
+- **类别级白名单**（`CONTAINERS`/`NETWORKS`/…）控制「哪些路径可达」，是唯一存在的路径粒度；`POST` 只叠加一个全局方法开关。
+- 因此「只允许 containers/networks 创建与启动所需的 POST」**无法在该镜像上用 env 表达**。落地采用：**类别级白名单（`CONTAINERS=1`+`NETWORKS=1`） + portal 侧代码层白名单**（`provisioner.DOCKER_ALLOWED_PATHS`，写死允许的 Docker API 路径，多余路径一律拒绝，B6 落地）。二者叠加后的实际最小面 = 代码层白名单所列的 containers/networks 生命周期路径，与契约意图一致。
+- 附注：`ALLOW_START`/`ALLOW_STOP`/`ALLOW_RESTARTS` 在 `CONTAINERS=1` 下是冗余的（`^.../containers` 前缀规则已匹配 `/containers/{id}/start|stop|…` 子路径），compose 仍显式置 `1` 仅作意图说明。
+- 残余风险：portal 被攻破后经 socket-proxy 至多能对 containers/networks 两个类别发任意方法（如 `DELETE /networks/{id}`）；「不碰其它类别（IMAGES/EXEC/SYSTEM…）」与「创建字段 allowlist（B6）」仍由 socket-proxy 类别白名单 + portal 代码层兜住，爆炸半径与 §5 正文结论一致。
+
+**白名单理由（每项都对应 portal 实际所需的最小面；WP2b 起 create/start/stop/rm 与 network create 为已交付面，由代码层白名单兑底）**：
 
 - `CONTAINERS`：FDE 容器生命周期（create/start/stop/rm/inspect/ps）——portal 核心职责。
 - `NETWORKS`：FDE 网络生命周期（`network create --subnet` / inspect / ls / rm），onboarding/offboarding。
@@ -219,7 +231,7 @@
 - **不授 `SYSTEM`/`AUTH`/`SECRETS`**：防读宿主 docker 配置/凭据/secret。
 - **不授 `BUILD`/`COMMIT`**：防镜像篡改/逃逸面。
 
-> **参数级约束（B6：`CONTAINERS=1` 本身不等于「只能创建规定 FDE 容器」；⚠️ WP2 交付——P1 `POST=0` 只读、尚不创建容器）**：真正的最小面不是 socket-proxy 的 API 白名单，而是 portal 在 `POST /containers/create` **之前**强制校验的**创建字段 allowlist（provisioning broker）**——
+> **参数级约束（B6：`CONTAINERS=1` 本身不等于「只能创建规定 FDE 容器」；WP2b 已交付——portal 侧 provisioning broker 在 `POST /containers/create` **之前**强制校验创建字段 allowlist）**：真正的最小面不是 socket-proxy 的 API 白名单，而是 portal 在 `POST /containers/create` **之前**强制校验的**创建字段 allowlist（provisioning broker）**——
 >
 > - **镜像**：只允许**预拉取的 `FDE_IMAGE` digest**（`image@sha256:…`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
 > - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
@@ -235,7 +247,7 @@
 
 ## 6. FDE 容器创建契约（portal 经 Docker API，模板化）
 
-> ⚠️ **WP2 交付**：P1 portal 经 socket-proxy 只读（`POST=0`），尚不能 `POST /containers/create`；本节字段级契约供 WP2 的容器创建实现照做（启用前需按 §5 扩展白名单 `POST=1`）。
+> ⚠️ **WP2b 已交付**：portal 经 socket-proxy（`POST=1`）创建/启动/停止/删除 FDE 容器；本节字段级契约为 `portal/src/provisioner.js` 的实现依据（创建字段 allowlist 见 §5 B6）。
 >
 > 路径/UID/权限的**完整契约**以 [`user-space.md`](user-space.md) 为准（本文 §6 引用、不重写）。以下字段级契约供 portal 的容器创建实现照做。
 
@@ -296,7 +308,7 @@
 ### 7.1 P1 包含
 
 - **4 个 compose 服务**：`station-edge`（Traefik，host 网络）+ `station-portal` + `station-db` + `station-docker-socket-proxy`（§2）。
-- **单 FDE 容器**（含 `station-agentd`/`station-runner`/erix-agent）⚠️ **WP2 交付**：FDE 容器的动态创建（portal 经 Docker API，§6）归 WP2——P1 portal 经 socket-proxy 只读（`POST=0`），尚不能创建容器。
+- **单 FDE 容器**（含 `station-agentd`/`station-runner`/erix-agent）✅ **WP2b 已交付**：FDE 容器的动态创建（portal 经 Docker API + socket-proxy，§6）由 `portal/src/provisioner.js` 实现（开发期默认 `traefik/whoami` 站台，生产切 runner 镜像）。
 - **登录**（本地账号 + `crypto.scrypt` 口令哈希（P1 骨架，argon2id 待决策者确认后按自描述哈希平滑迁移，portal §2.9.4）+ 强制 TOTP，bootstrap CLI，portal §2.9）、**项目列表/创建**（含项目级**单端口**分配 + `ports.json` 物化，规格 §8.2/§8.5）、**对话（SSE）**、**停止**。
 - **internal API**（agentd ↔ portal 全出站通道）+ **防火墙应用**（§4.4）+ **DB 迁移**（§3）。
 - P1 验收 = 规格 §15 P1 行「登录→建项目→对话→工具卡片→停止」。

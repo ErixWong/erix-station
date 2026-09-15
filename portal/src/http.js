@@ -11,6 +11,7 @@ import { URL } from 'node:url';
 import * as auth from './auth.js';
 import * as migrate from './migrate.js';
 import * as projects from './projects.js';
+import * as preview from './preview.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -63,6 +64,15 @@ function getCookie(req, name) {
 }
 
 function sessionCookieHeader(cookie, token) {
+  const parts = [`${cookie.name}=${token}`, `Path=${cookie.path}`];
+  if (cookie.httpOnly) parts.push('HttpOnly');
+  if (cookie.secure) parts.push('Secure');
+  parts.push(`SameSite=${cookie.sameSite}`, `Max-Age=${cookie.maxAge}`);
+  return parts.join('; ');
+}
+
+/** 预览 cookie（host-only，无 Domain）——ticket 换取 / 滚动续期重发（portal.md §2.7/§2.8）。 */
+function previewCookieHeader(cookie, token) {
   const parts = [`${cookie.name}=${token}`, `Path=${cookie.path}`];
   if (cookie.httpOnly) parts.push('HttpOnly');
   if (cookie.secure) parts.push('Secure');
@@ -163,7 +173,13 @@ export function createServer({ pool, config, log = console }) {
     maxQueue: config.kdfQueueLimit,
     queueTimeoutMs: config.kdfQueueTimeoutMs,
   });
-  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore };
+  const previewTicketLimiter = createRateLimiter(config.previewTicketRateLimit ?? {
+    maxFailures: 20,
+    windowMs: 60 * 1000,
+    blockMs: 60 * 1000,
+    maxEntries: 10000,
+  });
+  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter };
 
   return http.createServer(async (req, res) => {
     try {
@@ -275,6 +291,12 @@ async function routeApi(req, res, ctx, url) {
   if (projectPortsMatch) {
     const projectId = decodeURIComponent(projectPortsMatch[1]);
     if (req.method === 'GET') return handleGetProjectPorts(req, res, ctx, projectId);
+  }
+  // 预览 ticket 签发（portal.md §2.8）。
+  const portTicketMatch = pathname.match(/^\/api\/ports\/([^/]+)\/preview-ticket$/);
+  if (portTicketMatch) {
+    const portId = decodeURIComponent(portTicketMatch[1]);
+    if (req.method === 'POST') return handlePreviewTicket(req, res, ctx, portId);
   }
 
   return sendJson(res, 404, errorBody('not_found', 'not found'));
@@ -428,31 +450,102 @@ async function requireSession(req, ctx) {
  * forwardAuth 回调（portal.md §2.7）。fail-closed：
  *  ① hostname 精确查 port_allocations（查不到 404 = 路由表里没有 = 不可达）；
  *  ② released → 403 allocation_released；
- *  ③ 无有效预览凭证 → 403 preview_ticket_required（⚠️ WP2b：一次性 ticket / 预览 cookie /
- *     exposure 授权完整实现归后续 WP；当前严禁「只查 hostname 就放行」）。
- * 放行成功分支（WP2b 上线后）在返回 200 + X-Auth-User 前执行 allocated→active 幂等升级：
+ *  ③ 无凭证 → 403 preview_ticket_required；ticket 无效/过期 → 401；撤销/不匹配/重放 → 403；
+ *  ④ 凭证校验通过 → exposure 判定（private：owner/admin）；
+ *  ⑤ ticket 通过 → 302 + Set-Cookie（换取预览 cookie）；cookie 通过 → 200 + X-Auth-User。
+ * 放行（allow/redirect）后执行 allocated→active 幂等升级：
  *   UPDATE port_allocations SET state='active' WHERE id=$1 AND state='allocated'（fde-platform §8.6）。
  */
 async function handleForwardAuth(req, res, ctx) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
-  if (!host) return sendJson(res, 404, errorBody('not_found', 'not found'));
-  const r = await ctx.pool.query(
-    `SELECT a.id, a.fde_id, a.state, u.fde_name
-       FROM port_allocations a
-       JOIN users u ON u.id = a.fde_id
-      WHERE a.hostname = $1
-      LIMIT 1`,
-    [host],
-  );
-  if (r.rows.length === 0) return sendJson(res, 404, errorBody('not_found', 'not found'));
-  const alloc = r.rows[0];
-  if (alloc.state === 'released') {
-    return sendJson(res, 403, errorBody('allocation_released', 'allocation released'));
+  const uri = req.headers['x-forwarded-uri'] || req.url;
+  const method = req.headers['x-forwarded-method'] || req.method;
+  const scheme = req.headers['x-forwarded-proto'] || 'https';
+  const cookieValue = getCookie(req, ctx.config.previewCookie?.name ?? '__Host-fde_preview');
+
+  const result = await preview.authorizeForwardAuth(ctx.pool, ctx.config, {
+    hostname: host || '',
+    uri,
+    cookieValue,
+    method,
+    scheme,
+  });
+
+  // 审计：每次判定（无论通过与否）都写（portal.md §2.7）。details 不记 ticket/cookie 明文。
+  const details = {
+    uri,
+    method,
+    exposure: result.allocation?.exposure ?? null,
+    result: result.outcome,
+    grant_kind: result.grantKind ?? null,
+    subject_id: result.subjectId ?? null,
+    issuer_id: result.issuerId ?? null,
+    grant_id: result.grantId ?? null,
+  };
+  await auth.audit(ctx.pool, {
+    actorId: result.subjectId ?? null,
+    action: 'auth.forward_auth',
+    target: host || '',
+    details,
+  }).catch(() => {});
+
+  if (result.outcome === 'deny') {
+    return sendJson(res, result.status, errorBody(result.code, result.message));
   }
-  // ⚠️ WP2b：此处为完整预览凭证校验（ticket → 预览 cookie / exposure 判定）的插入点。
-  // 凭证校验通过后放行并执行 allocated → active 升级（幂等）。
-  // P1 fail-closed：无有效预览凭证一律 403（绝不因 hostname 存在即放行）。
-  return sendJson(res, 403, errorBody('preview_ticket_required', 'preview ticket required'));
+
+  // 放行 → allocated→active 幂等升级（fde-platform §8.6）；不写 route outbox、不重发路由。
+  await ctx.pool
+    .query(`UPDATE port_allocations SET state = 'active' WHERE id = $1 AND state = 'allocated'`, [result.allocation.id])
+    .catch(() => {});
+
+  if (result.outcome === 'redirect') {
+    const headers = {
+      'Set-Cookie': previewCookieHeader(ctx.config.previewCookie, result.sessionToken),
+      Location: result.location,
+      'Cache-Control': 'private, no-store',
+      'Referrer-Policy': 'no-referrer',
+    };
+    res.writeHead(302, headers);
+    res.end();
+    return;
+  }
+
+  // allow：200 + X-Auth-User（Traefik authResponseHeaders 透传）；session 续期重发 Set-Cookie。
+  const headers = { 'X-Auth-User': result.fdeName || '' };
+  if (result.cookieToken) headers['Set-Cookie'] = previewCookieHeader(ctx.config.previewCookie, result.cookieToken);
+  sendJson(res, 200, {}, headers);
+}
+
+/** 签发一次性预览 ticket（portal.md §2.8）。 */
+async function handlePreviewTicket(req, res, ctx, portId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  const rlKey = `ticket:${session.user.id}:${ip}`;
+  const check = ctx.previewTicketLimiter.check(rlKey);
+  if (!check.allowed) {
+    throw new HttpError(429, 'rate_limited', '预览 ticket 签发过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(check.retryAfterSeconds) },
+    });
+  }
+
+  const result = await preview.issuePreviewTicket(ctx.pool, ctx.config, {
+    allocationId: portId,
+    session,
+    ip,
+    ua: req.headers['user-agent'] ?? null,
+  });
+  if (result.error) {
+    const { status, code } = result.error;
+    throw new HttpError(status, code, code === 'not_found' ? 'not found' : code);
+  }
+
+  // 记录本次成功签发（作为限流计数），防单用户短时刷 ticket。
+  ctx.previewTicketLimiter.recordFailure(rlKey);
+  return sendJson(res, 201, result);
 }
 
 async function handleCreateProject(req, res, ctx) {
