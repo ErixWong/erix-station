@@ -27,7 +27,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 
 | 组 | 表 | 来源 |
 |---|---|---|
-| 账号与认证 | `users` / `login_sessions` / `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.7 |
+| 账号与认证 | `users` / `login_sessions` / `login_pending` / `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.2/§2.7 |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
 | 会话与对话 | `chat_sessions` / `runs` / `messages` | 规格 §9.1 |
 | 端口分配与路由 | `port_allocations` / `route_outbox` / `route_revisions` | 规格 §8 / topology.md §5/§8 |
@@ -52,6 +52,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | `fde_name` | FDE 标识 = 容器名 `fde-<name>` 的 `<name>`、预览域名首段；未建容器时 `NULL`。全表唯一 |
 | `auth_source` / `oidc_sub` | `local` / `oidc`；OIDC JIT 建档按 `email` + `oidc_sub`（规格 §7.1）。P1 恒为 `local`（portal.md §2.1） |
 | `password_hash` / `totp_secret` | 本地账号：argon2id 哈希 + **强制 TOTP**（规格 §7.1）；TOTP 种子只经 bootstrap 下发，不走公开 API（portal.md §2.1） |
+| `last_totp_step` | TOTP 单码防重放（portal.md §2.9.4）：最近成功校验的时间步长（`bigint`，`floor(unix_seconds/30)`）；同时间窗内同码（步长 ≤ 已记录值）拒绝，成功校验原子推进 |
 | `status` / `disabled_at` | `active` / `disabled`。offboarding 停用（规格 §7.3），与 IdP 对账任务的写入目标 |
 
 **状态机**：`active → disabled`（单向；恢复 = 管理操作重新置 `active`，无自动路径）。
@@ -259,7 +260,21 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 
 ### 1.23 `schema_migrations` — 迁移台账（A6 定稿）
 
-`version text PK` / `checksum text NOT NULL` / `applied_at timestamptz NOT NULL DEFAULT now()`（deploy-contract.md §3）。本文件（schema.sql）即 baseline，记录 `version='0000_baseline'`；baseline 的 checksum 由迁移 runner 在应用后写入真实 sha256（文件无法包含自身哈希，哨兵值见 schema.sql §10）。写入方 = 迁移 runner（`station_platform`）；读取方 = portal readiness（`station_portal` 只读本表，判「迁移到 head」）。
+`version text PK` / `checksum text NOT NULL` / `applied_at timestamptz NOT NULL DEFAULT now()`（deploy-contract.md §3）。本文件（schema.sql）即 baseline，记录 `version='0000_baseline'`；baseline 的 checksum 由迁移 runner 在应用后写入真实 sha256（文件无法包含自身哈希，哨兵值见 schema.sql §10）。写入方 = 迁移 runner（`station_platform`）；读取方 = portal readiness（`station_portal` 只读本表，判「迁移到 head」——对比实际 migration head：baseline + `deploy/migrations/*.sql` 全部版本）。
+
+### 1.24 `login_pending` — 两步登录第一步的待决令牌（portal.md §2.2）
+
+口令校验成功后**仅**发短期 `pending_token`（默认 120s、单次消费），**不发 cookie**；`/api/auth/login/totp` 校验 TOTP 成功后才建立 `login_sessions` 并下发 session cookie。
+
+| 关键字段 | 语义 |
+|---|---|
+| `token_hash` | `sha256(pending_token)`，唯一；**只存哈希不存原文**（与 `login_sessions.token_hash` 同口径） |
+| `user_id` | 绑定用户（`→ users.id`）；令牌不能跨用户使用 |
+| `expires_at` | 短期 TTL（默认 120s）；过期后消费失败 → `401 pending_expired` |
+| `used_at` | 单次消费标记：原子 `UPDATE ... SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL AND expires_at > now()`，影响 0 行 = 过期/已用/不存在 |
+| `created_ip` / `created_ua` | 签发来源（审计/排障） |
+
+写入方 = portal（登录第一步）；消费方 = portal（登录第二步，单次原子消费）。
 
 ---
 

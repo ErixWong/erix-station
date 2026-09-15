@@ -1,7 +1,8 @@
 # ============================================================================
 # erix-station 本地开发栈（P1 walking skeleton）
 # 依据：docs/design/deploy-contract.md §2 + docs/env.md §0（开发期参数）
-# 服务：station-db / station-portal / station-edge（socket-proxy、FDE、LLM 网关归后续轮次）
+# 服务：station-db / station-docker-socket-proxy / station-portal / station-edge
+#   （FDE 容器、LLM 网关、materializer、路由 reconciler 归后续轮次）
 # ============================================================================
 name: station
 
@@ -20,16 +21,65 @@ services:
       - backend
     volumes:
       - /docker/station-db/:/var/lib/postgresql/data
+      # 首次初始化（空数据目录时执行一次）：建角色 + 设口令 + baseline + bootstrap + ownership 归正。
+      # 角色口令经 600 权限的 deploy/.env 注入（deploy-contract §2.4），不进镜像/仓库。
+      - ./db-init/00-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
+      - ../docs/data/schema.sql:/init-sql/schema.sql:ro
+      - ../docs/data/bootstrap.sql:/init-sql/bootstrap.sql:ro
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-station}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-dev-only}
       POSTGRES_DB: ${POSTGRES_DB:-station}
+      # 迁移/运行时角色口令（init 脚本读取后 ALTER ROLE ... PASSWORD）
+      PLATFORM_DB_PASSWORD: ${PLATFORM_DB_PASSWORD:-change-me-dev-only}
+      PORTAL_DB_PASSWORD: ${PORTAL_DB_PASSWORD:-change-me-dev-only}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  # /var/run/docker.sock 只挂到这里；portal 经 tcp://station-docker-socket-proxy:2375 访问（deploy-contract §5）。
+  # 白名单：CONTAINERS=1、NETWORKS=1，其余 0；POST=0 → 本阶段 portal 只读 Docker API（创建容器归 WP2）。
+  station-docker-socket-proxy:
+    container_name: station-docker-socket-proxy
+    image: ${SOCKET_PROXY_IMAGE:-tecnativa/docker-socket-proxy:v0.5.0}
+    restart: unless-stopped
+    networks:
+      - backend
+    read_only: true
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    # haproxy 需要写 pidfile(/run) 与临时配置(/tmp) 与 server-state(/var/lib/haproxy)
+    tmpfs:
+      - /tmp
+      - /run
+      - /var/lib/haproxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: "1"
+      NETWORKS: "1"
+      POST: "0"
+      EVENTS: "0"
+      VOLUMES: "0"
+      IMAGES: "0"
+      EXEC: "0"
+      SYSTEM: "0"
+      AUTH: "0"
+      SECRETS: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      PLUGINS: "0"
+      SWARM: "0"
+      INFO: "0"
+      # 只读健康/版本端点（readiness 与验收用），镜像默认即为 1，此处显式声明
+      PING: "1"
+      VERSION: "1"
+    # 其余变量（CONFIGS/DISTRIBUTION/GRPC/NODES/SERVICES/SESSION/TASKS/ALLOW_*）沿用镜像默认 0
 
   station-portal:
     container_name: station-portal
@@ -43,16 +93,33 @@ services:
     depends_on:
       station-db:
         condition: service_healthy
+      station-docker-socket-proxy:
+        condition: service_started
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
     ports:
       # 仅回环发布（deploy-contract §2.2）；容器内固定 8080，宿主端口见 PORTAL_HOST_PORT
       - "127.0.0.1:${PORTAL_HOST_PORT:-18080}:8080"
     environment:
       PORT: "8080"
-      DATABASE_URL: postgres://${POSTGRES_USER:-station}:${POSTGRES_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
+      # 运行时身份 station_portal（最小 DML，deploy-contract §2.4/§3）
+      DATABASE_URL: postgres://${PORTAL_DB_USER:-station_portal}:${PORTAL_DB_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
+      # 迁移身份 station_platform（DDL；migrate runner 读取，见 deploy-contract §3）
+      MIGRATE_DATABASE_URL: postgres://${PLATFORM_DB_USER:-station_platform}:${PLATFORM_DB_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
+      # bootstrap 超级用户（schema.sql/bootstrap.sql 的角色/授权/ownership，仅 bootstrap 步骤用）
+      BOOTSTRAP_DATABASE_URL: postgres://${POSTGRES_USER:-station}:${POSTGRES_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
+      # portal 经 socket-proxy 访问 Docker API（不直挂 /var/run/docker.sock）
+      DOCKER_HOST: tcp://station-docker-socket-proxy:2375
       COOKIE_PROFILE: ${COOKIE_PROFILE:-dev-http}
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
-      MIGRATE_ON_START: "1"
+      # P1：baseline(schema.sql) + bootstrap.sql 由 station-db 首次初始化（db-init/00-init.sh，超级用户）
+      # 完成；deploy/migrations/*.sql 尚无增量。运行时以 station_portal 启动，不重复跑 superuser-only
+      # 的 bootstrap。出现首个增量迁移时，以 station_platform（MIGRATE_DATABASE_URL）跑
+      # `node portal/src/cli.js migrate`，或让 migrate runner 消费 MIGRATE_DATABASE_URL 后置回 1。
+      MIGRATE_ON_START: "0"
     healthcheck:
       test: ["CMD", "node", "portal/src/cli.js", "healthcheck"]
       interval: 10s
@@ -65,9 +132,14 @@ services:
     image: ${TRAEFIK_IMAGE:-traefik:v3.7.13}
     restart: unless-stopped
     network_mode: host
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
     command:
       - --configFile=/etc/traefik/traefik.yml
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic/:/etc/traefik/dynamic/:ro
     # 开发期 http，无 acme.json / 证书；部署期证书与 logs 见 deploy-contract §2.2/§4.3
+    # 注：开发期绑定 8090/8443（>1024）无需 NET_BIND_SERVICE；生产 80/443 需 cap_add: [NET_BIND_SERVICE]

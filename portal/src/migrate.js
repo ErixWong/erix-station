@@ -1,9 +1,11 @@
-// 迁移 runner：按顺序应用 schema.sql（baseline）与 bootstrap.sql，幂等。
+// 迁移 runner：advisory lock 串行化（单实例并发安全），按序应用 baseline（schema.sql）→ bootstrap.sql
+//   → deploy/migrations/*.sql（文件名升序），幂等，失败可恢复。
 // 依据：docs/design/deploy-contract.md §3。
-//   - baseline = docs/data/schema.sql（单事务 BEGIN..COMMIT，自包含），空库首次应用；
-//     应用后由本 runner 把真实 sha256 写回 schema_migrations.checksum。
-//   - bootstrap.sql 含 psql \gexec 元命令，本 runner 做最小等价模拟（跑出 SELECT 结果串再执行）。
-//   - deploy/migrations/*.sql 按文件名升序应用（P1 skeleton 尚无，机制预留）。
+//   - baseline = docs/data/schema.sql（自带 BEGIN..COMMIT，自包含）。哨兵 checksum 由 runner 在应用后
+//     写回真实 sha256（哨兵值 = 'sha256:<computed-by-migration-runner>'），并把「哨兵→真实值」纳入
+//     可靠状态机（失败可重跑，不留下已提交 schema + 哨兵 checksum 的半成品态）。
+//   - bootstrap.sql 含 psql \gexec 元命令，本 runner 做最小等价模拟，并在单个事务内执行（明确事务边界）。
+//   - 每个增量迁移在单事务内执行 + 落 schema_migrations 行；checksum 失配 → 拒绝启动。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,6 +14,13 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '../..');
+
+// 迁移 advisory lock key：任意固定 64-bit 整数，本平台专用。
+const MIGRATION_LOCK_KEY = 74452311;
+
+// schema.sql 内部插入的哨兵 checksum（见 docs/data/schema.sql §10）。
+const BASELINE_SENTINEL = 'sha256:<computed-by-migration-runner>';
+const BASELINE_VERSION = '0000_baseline';
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -29,9 +38,27 @@ export function defaultMigrationsDir() {
   return path.resolve(REPO_ROOT, 'deploy/migrations');
 }
 
+/** 列出增量迁移文件（文件名升序）。 */
+export function listMigrationFiles(migrationsDir = defaultMigrationsDir()) {
+  if (!fs.existsSync(migrationsDir)) return [];
+  return fs
+    .readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort()
+    .map((f) => ({ version: f.replace(/\.sql$/, ''), file: path.join(migrationsDir, f) }));
+}
+
+/** 期望已应用的全部版本（baseline + 全部增量迁移），供 readiness 对比实际 migration head。 */
+export function computeExpectedVersions(migrationsDir = defaultMigrationsDir()) {
+  const versions = [BASELINE_VERSION];
+  for (const m of listMigrationFiles(migrationsDir)) versions.push(m.version);
+  return versions;
+}
+
 export async function isBaselineApplied(pool) {
   const r = await pool.query(
-    `SELECT version FROM schema_migrations WHERE version = '0000_baseline'`,
+    `SELECT version FROM schema_migrations WHERE version = $1`,
+    [BASELINE_VERSION],
   );
   return Array.isArray(r.rows) && r.rows.length > 0;
 }
@@ -39,6 +66,14 @@ export async function isBaselineApplied(pool) {
 async function schemaMigrationsExists(pool) {
   const r = await pool.query(`SELECT to_regclass('public.schema_migrations') AS rel`);
   return !!(r.rows?.[0] && r.rows[0].rel != null);
+}
+
+async function baselineChecksum(pool) {
+  const r = await pool.query(
+    `SELECT checksum FROM schema_migrations WHERE version = $1`,
+    [BASELINE_VERSION],
+  );
+  return r.rows?.[0]?.checksum ?? null;
 }
 
 /**
@@ -66,20 +101,28 @@ function splitPsqlStatements(sql) {
   return units;
 }
 
-async function applyBootstrap(pool, sql, log) {
-  for (const unit of splitPsqlStatements(sql)) {
-    if (unit.gexec) {
-      const res = await pool.query(unit.sql);
-      for (const row of res.rows ?? []) {
-        const cmd = row[Object.keys(row)[0]];
-        if (cmd && typeof cmd === 'string' && cmd.trim()) {
-          log.log(`[migrate] bootstrap gexec: ${cmd}`);
-          await pool.query(cmd);
+/** 在单个事务内执行 bootstrap.sql（\gexec 模拟 + 明确事务边界）。 */
+async function applyBootstrap(client, sql, log) {
+  await client.query('BEGIN');
+  try {
+    for (const unit of splitPsqlStatements(sql)) {
+      if (unit.gexec) {
+        const res = await client.query(unit.sql);
+        for (const row of res.rows ?? []) {
+          const cmd = row[Object.keys(row)[0]];
+          if (cmd && typeof cmd === 'string' && cmd.trim()) {
+            log.log(`[migrate] bootstrap gexec: ${cmd}`);
+            await client.query(cmd);
+          }
         }
+      } else if (unit.sql.trim()) {
+        await client.query(unit.sql);
       }
-    } else if (unit.sql.trim()) {
-      await pool.query(unit.sql);
     }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
   }
 }
 
@@ -88,46 +131,61 @@ export async function migrate(pool, opts = {}) {
   const bootstrapSqlPath = opts.bootstrapSqlPath ?? defaultBootstrapSqlPath();
   const migrationsDir = opts.migrationsDir ?? defaultMigrationsDir();
   const log = opts.log ?? console;
+  // 迁移身份（station_platform）与 bootstrap 超级用户可分离；未拆分时回退到同一 pool。
+  const bootstrapPool = opts.bootstrapPool ?? pool;
 
   const schemaSql = fs.readFileSync(schemaSqlPath, 'utf8');
   const expectedBaselineChecksum = `sha256:${sha256(schemaSql)}`;
-  const exists = await schemaMigrationsExists(pool);
-  const baselineApplied = exists && (await isBaselineApplied(pool));
 
-  if (!baselineApplied) {
-    log.log('[migrate] applying baseline (schema.sql)');
-    // schema.sql 自带 BEGIN..COMMIT；无参数 → node-pg 走 simple protocol，支持多语句单事务。
-    await pool.query(schemaSql);
-    await pool.query(
-      `UPDATE schema_migrations SET checksum = $1 WHERE version = '0000_baseline'`,
-      [expectedBaselineChecksum],
-    );
-  } else {
-    const r = await pool.query(
-      `SELECT checksum FROM schema_migrations WHERE version = '0000_baseline'`,
-    );
-    const stored = r.rows?.[0]?.checksum;
-    if (stored && stored !== expectedBaselineChecksum) {
+  // 使用单一连接持有 session 级 advisory lock，串行化并发迁移进程。
+  const client = await pool.connect();
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
+
+    const exists = await schemaMigrationsExists(client);
+    const baselineApplied = exists && (await isBaselineApplied(client));
+
+    if (!baselineApplied) {
+      log.log('[migrate] applying baseline (schema.sql)');
+      // schema.sql 自带 BEGIN..COMMIT；node-pg simple protocol 支持多语句单事务。
+      await client.query(schemaSql);
+    }
+
+    // baseline checksum 状态机：哨兵/缺失 → 回填真实 sha256（失败可重跑恢复）；
+    // 已是其它值且与真实 sha256 不符 → 拒绝启动（防改历史）。
+    const stored = await baselineChecksum(client);
+    if (stored === null || stored === BASELINE_SENTINEL) {
+      await client.query('BEGIN');
+      try {
+        await client.query(
+          `UPDATE schema_migrations SET checksum = $1 WHERE version = $2`,
+          [expectedBaselineChecksum, BASELINE_VERSION],
+        );
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      }
+      log.log(`[migrate] baseline checksum recorded (${expectedBaselineChecksum})`);
+    } else if (stored !== expectedBaselineChecksum) {
       throw new Error(
         `baseline checksum mismatch (stored=${stored}, expected=${expectedBaselineChecksum}); refusing to start`,
       );
     }
-  }
 
-  log.log('[migrate] applying bootstrap.sql');
-  await applyBootstrap(pool, fs.readFileSync(bootstrapSqlPath, 'utf8'), log);
+    log.log('[migrate] applying bootstrap.sql (single transaction)');
+    const bootstrapClient = bootstrapPool === pool ? client : await bootstrapPool.connect();
+    try {
+      await applyBootstrap(bootstrapClient, fs.readFileSync(bootstrapSqlPath, 'utf8'), log);
+    } finally {
+      if (bootstrapPool !== pool) bootstrapClient.release();
+    }
 
-  // 增量迁移（deploy/migrations/*.sql，文件名升序）。P1 skeleton 尚无文件。
-  if (fs.existsSync(migrationsDir)) {
-    const files = fs
-      .readdirSync(migrationsDir)
-      .filter((f) => f.endsWith('.sql'))
-      .sort();
-    for (const f of files) {
-      const version = f.replace(/\.sql$/, '');
-      const content = fs.readFileSync(path.join(migrationsDir, f), 'utf8');
+    // 增量迁移（deploy/migrations/*.sql，文件名升序）。
+    for (const { version, file } of listMigrationFiles(migrationsDir)) {
+      const content = fs.readFileSync(file, 'utf8');
       const checksum = `sha256:${sha256(content)}`;
-      const existing = await pool.query(
+      const existing = await client.query(
         `SELECT checksum FROM schema_migrations WHERE version = $1`,
         [version],
       );
@@ -138,9 +196,8 @@ export async function migrate(pool, opts = {}) {
         continue;
       }
       log.log(`[migrate] applying ${version}`);
-      const client = await pool.connect();
+      await client.query('BEGIN');
       try {
-        await client.query('BEGIN');
         await client.query(content);
         await client.query(
           `INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)`,
@@ -150,11 +207,12 @@ export async function migrate(pool, opts = {}) {
       } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         throw err;
-      } finally {
-        client.release();
       }
     }
-  }
 
-  return { baselineAppliedNow: !baselineApplied, baselineChecksum: expectedBaselineChecksum };
+    return { baselineAppliedNow: !baselineApplied, baselineChecksum: expectedBaselineChecksum };
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]).catch(() => {});
+    client.release();
+  }
 }

@@ -39,16 +39,31 @@ BEGIN;
 --   station_platform：DDL/迁移专用（生产上由迁移 runner 以该身份执行本文件，即表 owner）。
 --   station_portal：运行时 DML 专用（末尾授最小 DML GRANT）。
 -- 属性与 bootstrap.sql 一致（LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE）；
---   bootstrap.sql 可重复执行、不改属性，仅补环境特有设置（口令/ownership 等）。
+--   两处都幂等兜底修正已存在旧角色的属性（LOGIN + NOSUPERUSER NOCREATEDB NOCREATEROLE）。
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_platform') THEN
     CREATE ROLE station_platform LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+  ELSE
+    -- 兜底已存在的旧角色（可能 NOLOGIN）：仅在实际属性不符时才 ALTER（幂等，属性已正确时不产生权限要求）。
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_platform' AND NOT rolcanlogin) THEN
+      ALTER ROLE station_platform LOGIN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_platform' AND (rolsuper OR rolcreatedb OR rolcreaterole)) THEN
+      ALTER ROLE station_platform NOSUPERUSER NOCREATEDB NOCREATEROLE;
+    END IF;
   END IF;
 END $$;
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_portal') THEN
     CREATE ROLE station_portal LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+  ELSE
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_portal' AND NOT rolcanlogin) THEN
+      ALTER ROLE station_portal LOGIN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_portal' AND (rolsuper OR rolcreatedb OR rolcreaterole)) THEN
+      ALTER ROLE station_portal NOSUPERUSER NOCREATEDB NOCREATEROLE;
+    END IF;
   END IF;
 END $$;
 
@@ -70,6 +85,7 @@ CREATE TABLE users (
   oidc_sub      text UNIQUE,                       -- OIDC subject；auth_source='oidc' 时必填（应用层校验）
   password_hash text,                              -- argon2id；oidc 账号为 NULL
   totp_secret   text,                              -- 本地账号强制 TOTP（规格 §7.1）；种子只经 bootstrap 下发
+  last_totp_step bigint,                           -- TOTP 单码防重放（portal.md §2.9.4）：最近成功校验的时间步，同窗同码拒绝
   status        text NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'disabled')),
   created_at    timestamptz NOT NULL DEFAULT now(),
@@ -90,6 +106,21 @@ CREATE TABLE login_sessions (
 );
 CREATE INDEX login_sessions_user_idx
   ON login_sessions (user_id) WHERE revoked_at IS NULL;
+
+-- 两步登录第一步的待决令牌（portal.md §2.2）：口令校验后仅发短期 pending_token（单次消费），
+-- 只存 hash、绑定 user；TOTP 校验成功后才真正建立 login_sessions 并下发 cookie。
+CREATE TABLE login_pending (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    uuid NOT NULL REFERENCES users (id),
+  token_hash text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,             -- 短期（默认 120s，portal.md §2.2）
+  used_at    timestamptz,                      -- 单次消费标记（原子 UPDATE ... WHERE used_at IS NULL）
+  created_ip inet,
+  created_ua text
+);
+CREATE INDEX login_pending_user_idx ON login_pending (user_id);
+CREATE INDEX login_pending_expiry_idx ON login_pending (expires_at) WHERE used_at IS NULL;
 
 -- API token：非浏览器客户端用（basic auth 兜底场景之外的程序化访问，规格 §6.2）
 CREATE TABLE api_tokens (

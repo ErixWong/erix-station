@@ -26,6 +26,8 @@ P1 本地开发（写代码、起栈联调）只需：
 | 入口端口 | **127.0.0.1 + 任意高端口**。默认建议：Traefik `websecure` → **`8443`**，`web` → **`8090`**（参考实例 A 上已用 `ss -tlnp` 确认两者空闲，2026-09）。**注意避开本机已占用端口**：80/443 被占（443 为 `nginx_reverse_proxy`）、8080 被占（`gitea_act_runner`）、5432 被占、8931~8934 是 playwright 容器（见 §8.2）；换机器或换端口前一律先 `ss -tlnp` 自查 |
 | portal 发布端口 | **`127.0.0.1:18080:8080`**（宿主 8080 已被 `gitea_act_runner` 占用 → 开发期 portal 宿主端口改用 `18080`，`PORTAL_HOST_PORT=18080`；容器内仍听 8080） |
 | backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `voiceprint_default` 占用（`br-8e3857476b83` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
+| socket-proxy | 开发期**同样启用**：`station-docker-socket-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` 访问 Docker API（不直挂 socket）；白名单 `CONTAINERS=1`/`NETWORKS=1` + `POST=0` → **P1 只读**（创建容器归 WP2） |
+| DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**，portal 运行时 `MIGRATE_ON_START=0` 不重复跑 |
 | 域名 | 不依赖 DNS 泛解析：用 `/etc/hosts` 逐条指到 127.0.0.1，或用 `*.localhost` 变通（`station.localhost` / `alice-r3a7f-4008.fde.localhost`，多数系统 localhost 子域自动回环到 127.0.0.1）。⚠️ **`*.localhost` 变通只对浏览器/宿主有效，对容器无效**：容器内解析 `station.<base>` / `llm.<base>` 用创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1） |
 | TLS | 自签证书，或直接 http 联调（cookie `Secure`/`SameSite` 属性按实际域名方案调试，正式语义仍以 portal.md §2.5 为准） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
@@ -74,7 +76,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | 参数 | 语义 | 取值来源 | 示例值 |
 |---|---|---|---|
 | OIDC provider 事实 | issuer / client 注册方式 / group claim 名称 | 决策者提供 ⚠️ | 未发现可用的公司 SSO 事实（均未实测） |
-| P1 认证方案 | portal 本地表 + argon2id 哈希 + 强制 TOTP（规格 §7.1 本地 admin 通道的同一套机制）；第一个 admin 只能本地建（bootstrap） | 平台规范固定（倾向，依据 principles §4 Q3 倾向 (a)：本地账号仅破窗 + bootstrap） | 先用本地账号：在没有 IdP 事实前，P1 不阻塞于 SSO |
+| P1 认证方案 | portal 本地表 + `crypto.scrypt` 口令哈希（P1 骨架；argon2id 待决策者确认后按自描述哈希平滑迁移，portal §2.9.4）+ 强制 TOTP（规格 §7.1 本地 admin 通道的同一套机制）；第一个 admin 只能本地建（bootstrap） | 平台规范固定（倾向，依据 principles §4 Q3 倾向 (a)：本地账号仅破窗 + bootstrap） | 先用本地账号：在没有 IdP 事实前，P1 不阻塞于 SSO |
 | OIDC 接入 | 拿到 issuer / client 注册方式 / group claim 名称后接入（建议 P2）：JIT provisioning，角色来自 group claim（`fde` / `admin`），不在 UI 手点 | 平台规范固定（规格 §7.1 / D2 已定方向），接入时点取决于决策者提供事实 | 延后到 P2 |
 
 ## 5. 端口参数与 ingress 入口
@@ -172,8 +174,8 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 - 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `2770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
 
 - LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + baseURL）：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
-- `docker.sock` 仅 portal 挂载，且前置 `tecnativa/docker-socket-proxy` 收窄到 CONTAINERS/NETWORKS（`VOLUMES` 已删，bind mount 不需 volume API；创建参数 allowlist 见 deploy-contract §5）
-- `DB_PASSWORD` 部署时生成后存凭据文件（600）
+- `docker.sock` **只挂到 `station-docker-socket-proxy`**（不直挂 portal）；portal 经 `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` 访问，白名单 `CONTAINERS=1`/`NETWORKS=1` + `POST=0`（P1 只读；`VOLUMES` 已删，bind mount 不需 volume API；创建参数 allowlist 见 deploy-contract §5）
+- 超级用户口令（`POSTGRES_PASSWORD`）与两个角色口令（`PLATFORM_DB_PASSWORD`/`PORTAL_DB_PASSWORD`）部署时生成后存 `deploy/.env`（600）
 
 ## 7. 运行时与资源要求
 
@@ -276,11 +278,13 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `DNS_PROVIDER` / DNS-01 API token | 决策者提供，凭据文件注入（§2 ⚠️ / §6） | 待填 |
 | `DATA_ROOT` | 决策者/运维约定（§6） | `/docker` |
 | `USER_SPACE_ROOT` | 结构平台规范固定，取值决策者/运维提供（§6） | `/srv/erix/users` |
-| `DB_PASSWORD` | 部署时生成，存凭据文件 600（§6） | — |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | 超级用户（bootstrap）身份；部署时生成，`POSTGRES_PASSWORD` 存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station` / — / `station` |
+| `PLATFORM_DB_USER` / `PLATFORM_DB_PASSWORD` | 迁移身份（DDL/表 owner）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_platform` / — |
+| `PORTAL_DB_USER` / `PORTAL_DB_PASSWORD` | 运行时身份（最小 DML GRANT）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_portal` / — |
 | `PORTAL_IMAGE` | 平台规范固定（规格 §14）；自构建（build context `portal/`） | `erix-station/portal:<git-sha>`（不可变 tag；部署时再 `docker inspect --format '{{.Id}}'` 记 digest） |
 | `DB_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `postgres:16`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体 patch/digest 部署时由 §9 产出后填；P1 开发可临时 `postgres:16` 并记录 resolved digest） |
 | `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
-| `SOCKET_PROXY_IMAGE` | 平台规范固定（规格 §4 / §6） | `tecnativa/docker-socket-proxy`（digest pin，⚠️ 版本部署时定） |
+| `SOCKET_PROXY_IMAGE` | 平台规范固定（规格 §4 / §6 / deploy-contract §5） | `tecnativa/docker-socket-proxy:v0.5.0`（P1 开发 pin patch tag；生产再 pin digest；`POST=0` 只读） |
 | `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`） |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
@@ -288,6 +292,8 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FIREWALL_RULES_PATH` | 平台规范固定（deploy-contract.md；由 `TRAEFIK_CONFIG_DIR` 派生） | `/docker/station-edge/firewall/`（规则文件 `rules.v4`，权限 **600**） |
 | `DB_DATA_DIR` | 平台规范固定（由 `DATA_ROOT` 派生） | `/docker/station-db/`（pg data；见 §6） |
 
+> **口令必须改 + 600 权限存放**：`POSTGRES_PASSWORD` / `PLATFORM_DB_PASSWORD` / `PORTAL_DB_PASSWORD` 在生产环境必须把 `change-me-dev-only` 占位全部改掉，并以 **600 权限 `deploy/.env`** 存放（不入库、不进 compose 正文、不进镜像，见 deploy-contract §2.4）。
+>
 > **镜像 pin 策略（deploy-contract.md §2 的完整契约，此处只记取值口径）**：`deploy/` 内的 compose/镜像引用**不得使用浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。生产部署对每个镜像最终以 **digest**（`image@sha256:…`）锁定；P1 开发期可暂用 `<major>.<minor>` 类 tag，但必须在 `docker inspect` 后把 resolved digest 记录进部署记录（env 附录 B / runbook）。`⚠️ 待决策者确认`：`postgres:16` / `traefik:v3` 的具体 patch 号与 digest 是部署期事实，本文不虚构；P1 开发按 §0 即可，目标环境按 §9 探测后再 pin。
 >
 > 宿主机内网 IP（DNS A 记录目标）在部署时由运维填入 DNS，不进入 compose 变量。

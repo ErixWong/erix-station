@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --test",
+    "test:integration": "node --test portal/integration/db-integration.mjs",
     "start": "node portal/src/cli.js serve",
     "db:migrate": "node portal/src/cli.js migrate",
     "healthcheck": "node portal/src/cli.js healthcheck"
