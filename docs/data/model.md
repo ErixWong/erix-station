@@ -37,6 +37,8 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
 | 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
 | LLM 网关绑定 | `fde_llm_bindings` | 规格 §11.3 / topology.md §4-L7 |
+| 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
+| 迁移台账 | `schema_migrations` | deploy-contract.md §3（A6 定稿） |
 
 ---
 
@@ -136,6 +138,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 见 §3。只追加；`seq` 由 portal 落库时从 `chat_sessions.last_seq` 分配（session 内单调递增，portal.md §5.1）；**`client_event_id` 为客户端幂等键**（worker 生成 `run_id:attempt:单调计数`，attempt 为本次 start 次数、计数为该 attempt 内单调递增），`UNIQUE(run_id, client_event_id)` + `ON CONFLICT DO NOTHING` 支撑 agentd 批量上报的 at-least-once 去重（runner-integration §7.3）；`session_id` 为冗余列，支撑 SSE 按 session 补发（`Last-Event-ID`）；`UNIQUE(session_id, seq)`；`type` 清单见 portal.md §5.3，上游 additive 新类型原样透传（故 DB 层不对 `type` 做 CHECK 枚举）。
 
+**`run_end` 唯一性与来源（A4 定稿）**：`type='run_end'` 是 portal 在 U2 终态事务内**合成**的 run 内最后一条事件（worker 不再经 U3 发 `run_end`，runner-integration §7.6），其 `client_event_id` 为确定性值 `run_id:final:run_end`。schema 额外有部分唯一索引 `UNIQUE (run_id) WHERE type='run_end'`（`run_events_run_end_key`），保证**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**；U2 终态重试用 `ON CONFLICT (run_id, client_event_id) DO NOTHING` 去重（同载荷幂等）。
+
 > **事件排序与 attempt 语义（issue #8）**：`seq` 只是**回放游标**（session 全局、按到达顺序分配、严格递增、无空洞），**不是** run 内逻辑顺序；逻辑顺序由 `client_event_id` 的 `(attempt, 计数)` 编码。attempt 使 re-claim 后新 worker 的计数归零也不会与旧 attempt 的 `client_event_id` 碰撞。乱序**到达**不影响正确性（逐事件幂等 + 自包含）；严格递增只对 `seq` 游标成立。详见 runner-integration §7.3/§7.5。
 
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`
@@ -163,10 +167,10 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `owner_container_id` | **当前租约持有者**容器实例（claim 时写，release / reaper 回收时清）。fencing 用 `owner_container_id` + `claim_token` |
 | `claim_token` | 本次认领凭证；run 级写请求带 `X-Claim-Token`、心跳 U4 逐 run 携带，re-claim 后旧 token 失效（`lease_lost`）——**双写防护**（runner-integration §4.2/§6.4） |
 | `lease_until` | 租约到期时刻（lease 90s ⚠️，随心跳续期）；过期允许 re-claim（认领 SQL 见 schema.sql §8 注释） |
-| `attempts` | 已发起的（re-）start 次数（claim 成功 +1）；崩溃循环上限见 `max_attempts` |
-| `max_attempts` | 崩溃循环上限（默认 3，`CHECK max_attempts >= 1`）；`attempts >= max_attempts` 且再失败 → runs `failed`（`max_attempts_exceeded`） |
+| `attempts` | 已发起的（re-）start 次数（**只在 claim 成功时 +1**；reaper 回 pending / U12 release 回 pending 均**不**递增，A1 定稿）；崩溃循环上限见 `max_attempts` |
+| `max_attempts` | 崩溃循环上限（默认 3，`CHECK max_attempts >= 1`）；`attempts >= max_attempts` 且再崩溃 → runs `failed`（`max_attempts_exceeded`） |
 
-**领取资格（issue #8）**：以**稳定 FDE 身份**（`user_id`，经 run → session → user 推导）为准，**不以容器实例 id** 为准——容器重建后新容器（同 user）天然可领取入队时派给旧容器的队列行；`owner_container_id` 记录当前持有者、`container_id` 保留入队时目标作审计快照。`run_id UNIQUE`（一个 run 至多入队一次）；CHECK 强制 `claimed` 行必带 `claimed_at / lease_until / owner_container_id / claim_token`，另有 `CHECK (attempts <= max_attempts)`；状态机见 §2.4/§2.8。
+**领取资格（issue #8；A2 收紧）**：以**稳定 FDE 身份**（`user_id`，经 run → session → user 推导）为准，**不以容器实例 id** 为准——容器重建后新容器（同 user）天然可领取入队时派给旧容器的队列行；`owner_container_id` 记录当前持有者、`container_id` 保留入队时目标作审计快照。**认领同时要求 `runs.status IN ('queued','running')`**——`cancelling`（用户已 stop）与终态（`finished`/`failed`）绝不进入认领结果（A2）。`run_id UNIQUE`（一个 run 至多入队一次）；CHECK 强制 `claimed` 行必带 `claimed_at / lease_until / owner_container_id / claim_token`，另有 `CHECK (attempts <= max_attempts)`；状态机见 §2.4/§2.8。
 
 ### 1.17 `fde_networks` — FDE 网络注册表（IPAM 真相，H-B D-10）
 
@@ -236,6 +240,25 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 
 **与 allocation 释放的联动**：allocation 为软删除（`state → released`），释放事务由 portal 应用层**同事务**把该 allocation 的 `active` 凭证置 `revoked`；forwardAuth 每请求重查 allocation `state` 双保险（portal.md §2.8）。外键为普通引用（无级联）：物理删除 allocation（reaper 硬删 released 过期行，§4）前须先清空引用它的本表行（grant reaper 先删过期/已吊销/已消耗行，或显式按 `allocation_id` 删）。`expired` 由 reaper 周期性懒打标；forwardAuth 有效性判定同时查 `state` 与 `expires_at > now()`（打标前窗口仍拒绝，双保险）。
 
+### 1.22 `materialize_revisions` / `materialize_outbox` — 用户空间物化 outbox（A7 定稿）
+
+与 `route_outbox`/`route_revisions` 同构但**独立成表**（不复用 `route_outbox`，避免与路由 reconciler 争抢同一行/同一租约/同一键空间）。聚合键 = **FDE**（`fde_id` = `users.id`），详见 user-space.md §7.1 与 schema.sql §9。
+
+| 关键字段 | 语义 |
+|---|---|
+| `materialize_revisions.fde_id` | 主键：每 FDE 一个版本 head |
+| `materialize_revisions.revision` | 该 FDE 物化版本 head，单调递增 |
+| `materialize_outbox.fde_id` / `revision` | 聚合键与版本；`UNIQUE(fde_id, revision)`（同 FDE 同版本至多一条） |
+| `materialize_outbox.op` | `upsert` / `delete`；`delete` 用 tombstone（revision 递增 + op=delete，不物理删行） |
+| `materialize_outbox.state` | `pending / processing / published / failed`（状态机同 `route_outbox`，§2.5 语义同构） |
+| `materialize_outbox.attempts` / `lease_until` / `worker_id` | 物化租约与重试：领取 `pending→processing` 写 `claimed_at/lease_until/worker_id`；成功 `published`；失败 `attempts+1` 退回 `pending` 退避重试；耗尽 `failed`+告警；崩溃恢复由 reaper 回收过期 `processing` |
+
+**消费语义（快照隔离 + 同 FDE 串行 + latest-wins）**：materializer 只领取 `revision = materialize_revisions.revision`（head）的行（`FOR UPDATE SKIP LOCKED`）；渲染以**当前 DB desired state 重读**为唯一输入（纯函数，不依赖 payload 增量），因此每个 FDE 同时只有一个 head 被领取 → 同 FDE 并发物化天然串行；`revision < head` 的晚到旧事件/旧 tombstone 一律丢弃（latest-wins）。已删除文件（项目删除 → 该项目 `ports.json`/`.erix/AGENTS.md`/`.gitignore` 等）由 materializer 在消费时落盘清理（user-space.md §7.1）。
+
+### 1.23 `schema_migrations` — 迁移台账（A6 定稿）
+
+`version text PK` / `checksum text NOT NULL` / `applied_at timestamptz NOT NULL DEFAULT now()`（deploy-contract.md §3）。本文件（schema.sql）即 baseline，记录 `version='0000_baseline'`；baseline 的 checksum 由迁移 runner 在应用后写入真实 sha256（文件无法包含自身哈希，哨兵值见 schema.sql §10）。写入方 = 迁移 runner（`station_platform`）；读取方 = portal readiness（`station_portal` 只读本表，判「迁移到 head」）。
+
 ---
 
 ## 2. 状态机
@@ -258,6 +281,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
                  └─────────┘   └────────┘
    cancelling 收敛：runner 终止后 → finished（termination.reason='aborted'）或 failed
    （崩溃 ≠ 直接终态：worker/agentd 崩 → §2.8 崩溃恢复，attempts 内 re-claim 续跑）
+   （例外 A2：容器已死 + cancelling → portal（reaper）收敛 finished/aborted，绝不回 pending 续跑）
 ```
 
 > UI 上「已取消」是**宿主展示态**：由 `cancel_requested_at` + `termination.reason='aborted'` 推导，不是引擎的 termination 取值（引擎 reason 集合见 §1.7，依据：erix-agent v0.3.5 `src/loop.js:622`/`712`）。
@@ -268,9 +292,9 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | `running` | agentd 上报 `markRunState`（规格 §9.3），**portal 落库**（D1'） | portal：SSE 状态展示、`GET /api/runs/:id`；FDE：stop / 审批操作的前置状态 |
 | `cancelling` | portal：`POST /api/sessions/:id/stop` 写 `cancel_requested_at` + 状态（portal.md §4.5） | agentd：SSE `stop_request`（主）/ 心跳 `stop_run_ids`（兜底）收到后 abort worker（runner-integration §4.3/§10）；portal：SSE 展示「停止中」 |
 | `finished`（终态） | worker 跑完上报 → agentd 经 internal API 提交终态载荷（含 `termination` / `usage` 汇总，portal.md §5.3-13 / §9），**portal 收敛落库** | portal：消息落 `messages`、用量记 `usage_ledger`、run 级端口释放（→ `released`）；UI：展示 |
-| `failed`（终态） | **非重试性错误**（`checkpoint_failed` 重试耗尽 / `rate_limited` / `max_attempts_exceeded` 等）由 agentd 上报；崩溃（worker/agentd）在方案 B 下**不直接终态**——先走 §2.8 re-claim，`attempts >= max_attempts` 才置 `failed`（`max_attempts_exceeded`） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：可手动重新提交（新 run，非自动 resume） |
+| `failed`（终态） | **仅终态、不可回退（A5 定稿）**：attempt 级失败**绝不**写 `runs.status='failed'`（记入 `run_queue.attempts` + `audit_log`，`runs.status` 保持 `queued/running`）；`failed` 只由**非重试性错误**（`checkpoint_failed` 重试耗尽 / `rate_limited`）或崩溃循环耗尽（`max_attempts_exceeded`）产生（§2.8/§2.9） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：可手动重新提交（新 run，非自动 resume） |
 
-> 终态不可再变（无产生新状态的出边）；`cancelling` 的收敛者恒为 runner——容器死了（心跳 3 次丢失）走 §2.8 崩溃恢复（租约到期 re-claim，或 attempts 耗尽 → `failed`），不留悬挂 `cancelling`。
+> 终态不可再变（无产生新状态的出边）；`cancelling` 的收敛者**恒为 runner**，**唯一例外**是「容器已死（心跳 3 次丢失）且租约过期」——此时 runner 已不存在，由 portal（reaper）收敛 `finished`（`termination.reason='aborted'`，A2），不留悬挂 `cancelling`。
 
 ### 2.2 `port_allocations.state`
 
@@ -326,7 +350,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | `containers.status` | `creating / running / stopped / exited / removed` | portal 生命周期操作产生（规格 §7.2/§7.3）；消费：任务下发（拉模型：消息落库即 202、容器恢复后自行 claim，portal.md §6.3）、心跳检测（`running` 长时无心跳 → 视 `exited`，3 次丢失 ≈45s ⚠️，runner-integration §4.2） |
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
 | `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
-| `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收：`attempts < max_attempts` → 回 `pending`（re-claim），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
+| `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制，attempts+1）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收（A1/A2 定稿）：`runs.status='cancelling'` → `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
 | `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
 
 ### 2.5 `route_outbox.state`
@@ -403,23 +427,34 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 ```
  入队(pending) → claim(attempts=1, 发 claim_token/lease) → running ──┐
       ▲                                                              │ worker 崩 / agentd 崩 / 容器重建 / 网络分区
-      │  attempts < max_attempts                                     ▼
-      │◀──────────────────────── re-claim（resume:true，attempts++）──┘
+      │  attempts < max_attempts（claim 时已 +1，回 pending 不递增）   ▼
+      │◀──────────────────────── re-claim（resume:true，claim 时 attempts++）──┘
       │ attempts >= max_attempts
       └────────────────────────→ run failed(max_attempts_exceeded)（终态）
+   （A2 例外：runs.status='cancelling' 时不论 attempts，直接收敛 finished/aborted，不 re-claim）
 ```
 
 | 步骤 | 负责方 | 动作 |
 |---|---|---|
 | 崩溃检测 | agentd（worker 非预期 exit）/ portal（心跳 3 次丢失 ≈45s 判容器死） | worker 崩：agentd 走 U12 release + 重新 claim；agentd/容器崩：portal reaper 待 `lease_until` 过期回收 |
-| 回收 | portal（reaper） | `attempts < max_attempts` → 回 `pending`（清 claim_token/owner_container_id）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` |
-| 重新认领 | 新 agentd（重建后）或原 agentd（分区恢复后） | 按 **user_id 路由**领取（非 container_id，§1.16）；新 claim_token 使旧 token 失效 |
+| 回收 | portal（reaper） | **A2 分支**：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（`termination.reason='aborted'`），不回 pending；**A1 分支**：`attempts < max_attempts` → 回 `pending`（清 claim_token/owner_container_id/lease/claimed_at，**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` |
+| 重新认领 | 新 agentd（重建后）或原 agentd（分区恢复后） | 按 **user_id 路由**领取且 `runs.status IN ('queued','running')`（非 container_id，§1.16）；新 claim_token 使旧 token 失效 |
 | 双写防护 | portal | 旧 worker 任何写（事件/checkpoint/终态）→ `lease_lost` → 旧 agentd 本地 abort、丢缓冲（§4.5） |
 | resume | 新 worker | `resume = attempt > 1`；引擎从 `run_checkpoints`（本 run_id 单行）+ `transcript_rounds`（本 run_id）恢复，checkpoint revision 从 U9 读回继续 +1 |
 | 副作用隔离 | 平台 | **DB 状态写被 fencing 拒绝**；外部副作用（shell/网络/LLM）平台无法物理终止（原理四），由 attempt 边界 + 审计标记隔离（runner-integration §6.5） |
 | 终态 barrier | agentd | 全部事件批（U3）200 确认 + 全部 store 调用完成后，才提交 U2 终态；portal 合成 `run_end` 事件（runner-integration §7.6） |
 
-**方案 B 的代价（记录在案）**：`runs.status` 在终态前可多次 `running ↔ failed(attempt)`；`failed` 成为「attempt 级失败」而非「run 级终态」，真正的 run 级终态由 `max_attempts` 耗尽或非重试性错误触发；终态 `failed` 后无自动 resume（如需跨 run 续跑，那是方案 A 的 `resume_from_run_id`，本期不做）。
+**方案 B 的代价与 A5 口径（定稿）**：`runs.status` **不**在终态前多次 `running ↔ failed`——attempt 级失败（崩溃/re-claim）**不写 `runs.status`**，只记入 `run_queue.attempts`（claim 时递增）与 `audit_log`（`run.claim` / `run.lease_superseded` / `run.released` / `run.attempt_exhausted`）；`runs.status` 在崩溃恢复期间保持 `queued`/`running`，**只有**耗尽（`max_attempts_exceeded`）或非重试性错误（`checkpoint_failed` 重试耗尽 / `rate_limited`，§2.9）才置终态 `failed`。终态 `failed` 后无自动 resume（如需跨 run 续跑，那是方案 A 的 `resume_from_run_id`，本期不做）。UI 的「第 N 次尝试」由 `run_end.payload.attempt` 与 `audit_log` 展示，而非 `runs.status` 回跳。
+
+### 2.9 `checkpoint_failed` 恢复口径（A3 定稿）
+
+| 项 | 结论 |
+|---|---|
+| 谁置 `checkpoint_failed` | **worker**：`runToolLoop` 在工具执行前/后 checkpoint 写失败时 fail-closed 抛错（adapter 已按 runner-integration §9.2 做 3 次重试，耗尽后透传）→ agentd 经 U2 终态上报 `failed`，`error={code:'checkpoint_failed', retryable:true}`；portal 落库 |
+| 是否可重试 | **adapter 层可重试**（3 次，1s/2s/5s）；**run 层不自动 re-claim**——它是引擎 fail-closed 判定而非进程崩溃，存储故障持续时 re-claim 只会原地重演；因此直接终态 `failed`（与 A1 的崩溃耗尽、A2 的 cancelling 并列的终态来源，不冲突） |
+| 恢复时 checkpoint 取哪一份 | **最新已持久化那一份**：`run_checkpoints` 单行，U9 返回的 `snapshot + revision`。失败的那次 save 没有落库（revision CAS 拒旧/失败不写），不存在「半份 checkpoint」；`runs.status='failed'` 终态后不可 resume（终态 barrier） |
+| 与 revision CAS 的关系 | 失败写不改变 `run_checkpoints.revision`（要么 0 行更新被拒、要么网络失败未达库）；U9 读回的是上一个成功 revision；若将来启用同 run resume，从 `revision+1` 续计，不冲突 |
+| 是否需人工介入 | **是**：存储恢复 + 用户重发（`POST /messages` 产生新 run）。本期无跨 run resume（方案 A 不做），「进度未丢失」仅指 checkpoint/transcript 数据仍完整保留在 DB、可供未来 resume 或人工检查，**不**自动续跑 |
 
 ---
 
@@ -438,7 +473,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 1. **物理分表**：三层各自一张表，schema 上没有共用列可互相污染；唯一桥接是 `run_id` / `session_id` 外键（关联 ≠ 混合）。
 2. **写入路径单一**：每张表只有一个代码写入方（见上表「谁写」）。UI 渲染**只读 `messages`**；引擎 resume **只读 `transcript_rounds`**；SSE **只读 `run_events`**。代码评审时任何跨层读写（如 UI 直接渲染 transcript）即为 bug。
 3. **合成消息的显式标记**：judge 在 transcript 里注入的是 user role 合成消息（规格 §9.2）；凡需进入人读层的合成内容，落 `messages` 时必须 `synthetic = true`（DB 层 `NOT NULL DEFAULT false` + 应用层显式置位），UI 显著标记——不借道、不隐式。
-4. **DB 角色（决策者 2026-09，D1' 后简化）**：**portal 是 Postgres 唯一业务写方**，业务角色 = `station_portal`（最小 GRANT：只授 portal 端点实际用到的表/操作）；迁移角色 = `station_platform`（DDL/迁移专用，与运行时角色分离）。**runner 不连 DB，因此不需要 `station_runner` 角色**（原「P2 拆 station_portal/station_runner 双角色」设想作废——容器侧根本没有 DB 凭据可发）。「不混」在 DB 层不再依赖角色分离，由 internal 端点的写入路径唯一性保证（第 2 层）。
+4. **DB 角色（A6 已落地）**：**portal 是 Postgres 唯一业务写方**。两个角色已落地：`station_platform`（DDL/迁移专用，schema.sql 表 owner）+ `station_portal`（运行时 DML 专用，最小 GRANT：只授业务表 `SELECT/INSERT/UPDATE/DELETE` 与序列 `USAGE/SELECT`，不授 DDL；对 `schema_migrations` 只读）。角色由 `docs/data/schema.sql` 开头**幂等创建**（自包含，空库可单独执行）；`docs/data/bootstrap.sql` 是生产环境的附加初始化（schema 级授权 + 口令/ownership 等环境特有设置，可重复执行）；对象级 DML GRANT 在 schema.sql §10（`station_platform` 授出）。**runner 不连 DB，因此不需要 `station_runner` 角色**（容器侧根本没有 DB 凭据可发）。「不混」在 DB 层由「internal 端点写入路径唯一（第 2 层）+ 运行时角色只 DML」双重保证。
 
 > seq 统一：`messages.seq` 与 `run_events.seq` 共用 `chat_sessions.last_seq` 分配器（同事务递增），三层各自的序互不依赖、但对 UI 呈现（消息与事件交错的时间线）有一致的单调序。
 
@@ -492,7 +527,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | 2 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | `port_allocations.scope/run_id` 字段先行保留（§1.9） |
 | 3 | `run_queue` 表：pull 模型为终态，push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | 规格 §10.3 旧描述「单机可先 push」已不再作为默认 | §1.16（表先行落地，push 模式不启用） |
 | 4 | `port_allocations` `allocated → active` 触发条件 | runner 上报监听 / 首次授权访问，先到者 | §2.2（不影响转发语义） |
-| 5 | 三表「不混」的 DB 角色分离（GRANT 强制） | P1 靠写入路径约定，P2 拆角色 | §3-4（实现注记，不影响 schema） |
+| 5 | 三表「不混」的 DB 角色分离（GRANT 强制） | ✅ 已落地：`station_platform`（DDL）/`station_portal`（DML）已入 schema.sql §0（幂等创建）+ schema.sql §10（最小 DML GRANT）；`bootstrap.sql` 作附加初始化（A6） | §3-4 |
 | 6 | 规格 §9.3「本地 file 优先 + DB 异步复制」store 装饰器 | 规格为「强烈建议」 | §1.11（影响 `checkpoint_failed` 频率，不影响表结构） |
 | 7 | `tool_outputs` 阈值（bytes） | 未定（建议如 4KB/8KB） | §1.19；决定「事件里放 digest、全文落表」的边界 |
 | 8 | `route_outbox` 聚合类型枚举（`port_allocation`/`llm_binding`/…） | 实现时定全量清单 | §1.18；reconciler debounce/SLO 已定（topology.md §8），枚举待补 |
@@ -504,3 +539,5 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | 14 | 心跳 U4 逐 run 携带 `claim_token` + 部分失败响应 | 采用 | §1.16；portal.md §9.5 已同步 |
 | 15 | spool 契约（路径/配额/写满/删除） | 见 runner-integration §7.5（参数 ⚠️） | 不入库（非真相）；§1.12 |
 | 16 | `max_attempts` 默认值与耗尽终态 | 默认 3；耗尽 → `failed(max_attempts_exceeded)` | §1.16/§2.8（已落 DDL） |
+| 17 | materializer outbox 复用 `route_outbox` vs 新增表 | ✅ 新增 `materialize_outbox` + `materialize_revisions`（A7，避免与路由 reconciler 争抢） | §1.22；user-space.md §7.1 |
+| 18 | `checkpoint_failed` 是否自动 re-claim | 不自动 re-claim（终态，人工重发；A3 定稿） | §2.9；portal.md §6.2 需同步提示口径 |

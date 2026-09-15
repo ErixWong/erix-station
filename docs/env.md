@@ -170,7 +170,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 - 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `2770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
 
 - LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + baseURL）：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
-- `docker.sock` 仅 portal 挂载，且前置 `tecnativa/docker-socket-proxy` 收窄到 CONTAINERS/NETWORKS/VOLUMES（规格 §4）
+- `docker.sock` 仅 portal 挂载，且前置 `tecnativa/docker-socket-proxy` 收窄到 CONTAINERS/NETWORKS（`VOLUMES` 已删，bind mount 不需 volume API；创建参数 allowlist 见 deploy-contract §5）
 - `DB_PASSWORD` 部署时生成后存凭据文件（600）
 
 ## 7. 运行时与资源要求

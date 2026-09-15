@@ -256,19 +256,23 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 1. **取 `X-Forwarded-Host` → 精确查 `port_allocations.hostname`**（活跃唯一索引）。查不到 → `404 not_found`（「路由表里没有 = 不可达」，原理二；正常不该发生，发生说明路由与 DB 失同步）。
 2. allocation `state` 必须 ∈ {`allocated`,`active`}；`released` → `403 forbidden`（`allocation_released`）。
 3. **取凭证**：先查 `X-Forwarded-Uri` 的 `preview_ticket` 参数；无 ticket 再查 `__Host-fde_preview` cookie；两者皆无 → `401 unauthorized`（Traefik 配置为据此 302 到 `https://<PORTAL_HOST>` 登录页，登录后回跳）。
-4. **校验凭证（按哈希查库，不解析 `sub`）**：
-   - ticket：`h = sha256(ticket)` → 查 `preview_grants`（`kind='ticket'`）。必须满足：存在、未 `revoked_at`、未过期（`expires_at > now()`）、`used_at IS NULL`（一次性）、`allocation_id` == 第 1 步的 allocation。满足则**同事务原子置 `used_at`**（`UPDATE ... WHERE id=? AND used_at IS NULL`，影响行数为 0 视为已被用）；任一不满足：
+4. **校验凭证（按哈希查库，不解析 `sub`；所有凭证查询显式带 `state='active'`）**：
+   - ticket（bootstrap）：`h = sha256(ticket)` → 查 `preview_grants`（`kind='ticket'`）。必须满足：存在、`state='active'`、未 `revoked_at`、未过期（`expires_at > now()`）、`allocation_id` == 第 1 步的 allocation。任一不满足 → 失败分支（见下）。
+   - 预览 cookie（steady-state）：`h = sha256(cookie)` → 查 `preview_grants`（`kind='session'`）。必须满足：存在、`state='active'`、未 `revoked_at`、未过期、`allocation_id` 匹配；否则 `401 unauthorized`（`preview_session_invalid` / `preview_session_expired`）。校验通过则滚动续期（刷新 `expires_at`/`last_seen_at` 并重发 cookie）。
+   - ticket 失败分支：
      - 不存在 / 已过期 / 格式非法 → `401 unauthorized`（`preview_ticket_invalid` / `preview_ticket_expired`）
-     - 已使用（`used_at` 非空）→ `403 forbidden`（`preview_ticket_used`，重放防护）
-     - 已撤销 → `403 forbidden`（`preview_ticket_revoked`）
+     - 已撤销（`state='revoked'`）→ `403 forbidden`（`preview_ticket_revoked`）
      - `allocation_id` 不匹配 → `403 forbidden`（`preview_ticket_mismatch`）
-   - 预览 cookie：`h = sha256(cookie)` → 查 `preview_grants`（`kind='session'`）。必须满足：存在、未 `revoked_at`、未过期、`allocation_id` 匹配；否则 `401 unauthorized`（`preview_session_invalid` / `preview_session_expired`）。校验通过则滚动续期（刷新 `expires_at`/`last_seen_at` 并重发 cookie）。
-5. **按 `exposure` 判定**（用凭证解出的 `user_id`，规格 §6.5）：
-   - `private`：`user_id == allocation.fde_id`，否则 `403 forbidden`
+     - 已消费（`state='used'`）→ 走第 6 步的**安全重放**分支（非必然 403，见下）
+5. **按 `exposure` 判定**（用凭证解出的**主体身份 `user_id`**，规格 §6.5）：
+   - `private`：`user_id == allocation.fde_id` **或** `users(user_id).role == 'admin'`（**显式 admin 例外，写审计 + 告警**）；否则 `403 forbidden`
    - `org-visible`：任意**有效且 `users.status='active'`** 的已认证用户 → 通过
    - `public`：不要求凭证（跳过第 3/4 步的凭证校验，但仍须过第 1/2 步 allocation 校验）；**默认不给**（规格 §6.5，仅 admin 可开）
    - 额外：`users.status='disabled'` 的用户一律拒绝（`403 forbidden`）。
-6. **ticket 通过（bootstrap）→ 换取预览 cookie**：生成随机 token → 存 `preview_grants`（`kind='session'`，TTL 见 §2.8）→ 返回 `302 Found`，响应头 `Set-Cookie: __Host-fde_preview=<token>; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=<TTL>`（**不设 `Domain`，host-only 于当前预览 host**）+ `Location: <原 URL，剔除 preview_ticket 参数与 fragment>`。浏览器跟随重定向后带预览 cookie 再请求，命中第 2 种凭证。
+6. **ticket 通过（bootstrap）→ 换取预览 cookie（crash-safe，单事务）**：
+   - **同一 DB 事务**内完成：① 原子消费 ticket（`UPDATE preview_grants SET state='used', used_at=now() WHERE id=$id AND state='active' AND used_at IS NULL`，影响 0 行 = 已被消费，走重放分支）；② 派生 session token（**确定性**：`session_token = "s_" + base64url(HMAC-SHA256(session_signing_key, "preview-session:" + ticket))`，**不存明文**；`session_signing_key` 为 portal 服务端密钥、永不下发）；③ 幂等创建 session grant（`INSERT ... (token_hash=sha256(session_token), kind='session', user_id, allocation_id, issuer_id, parent_ticket_id, expires_at=now()+15min) ON CONFLICT (token_hash) DO NOTHING`）并记录 **ticket→session 关联**（`parent_ticket_id`）。
+   - **响应丢失后的安全重放**：ticket 已被消费（第①步 0 行）但浏览器未收到 cookie 时，同一 ticket 再次到来 → 查 `parent_ticket_id=$id` 的 session 行：若存在且 `state='active'` 未过期 → **返回同一 bootstrap 结果**（同样的 `Set-Cookie` + `Location`，因 token 确定性派生）——**不产生第二个 session token、不改状态、不 403**；若该 session 已 `revoked`/`expired`（真·重放）→ `403 preview_ticket_used`。
+   - 返回 `302 Found` + `Set-Cookie: __Host-fde_preview=<session_token>; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=<TTL>`（**不设 `Domain`**，host-only 于当前预览 host）+ `Location: <原 URL 的绝对形式，剔除 preview_ticket 参数与 fragment>`。浏览器跟随重定向后带预览 cookie 再请求，命中第 2 种凭证。
 7. **预览 cookie 通过（steady-state）→ 放行**：`200` + 响应头 `X-Auth-User: <fde_name>`（Traefik `authResponseHeaders` 透传给上游；`public` 放行同样带 `X-Auth-User: <fde_name>`，取自 allocation）。
 
 | 响应 | 含义 |
@@ -276,12 +280,12 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | `200` + `X-Auth-User` | 预览 cookie 有效（或 `public`），放行到上游 |
 | `302` + `Set-Cookie` + `Location` | ticket 有效，换取预览 cookie 并跳回干净 URL（ticket 从地址栏消失） |
 | `401` | 无凭证 / ticket 过期 / session 无效（触发登录跳转） |
-| `403` | 已认证但无权 / 端口已释放 / ticket 已用·已撤销·不匹配 / 用户已禁用 |
+| `403` | 已认证但无权 / 端口已释放 / ticket 真·重放（已消费且无活跃派生 session）·已撤销·不匹配 / 用户已禁用 |
 | `404` | hostname 无对应 allocation |
 
 失败响应体统一用 §1.1 错误信封（`code` 见上各分支；Traefik 对 401 触发登录跳转、对 4xx/5xx 原样回传，`X-Auth-User` 缺失即不放行）。
 
-每次判定（无论通过与否、无论 ticket/session/public）写 `audit_log`（`action='auth.forward_auth'`，`actor_id` = 凭证 `user_id` 或 `public`/无凭证时 `NULL`，`target` = hostname，`details` = {uri, method, exposure, result, grant_kind}）——「谁在什么时候看了哪个端口」（原理二）。**forwardAuth 故障（portal 5xx / 连接失败 / 超时）→ Traefik 侧 deny-all**（默认拒绝，绝不放行；可叠加 basic-auth 兜底，规格 §6.2 / topology.md §5.2）。
+每次判定（无论通过与否、无论 ticket/session/public）写 `audit_log`（`action='auth.forward_auth'`，`actor_id` = 凭证**主体** `user_id`（`public`/无凭证时 `NULL`），`target` = hostname，`details` = {uri, method, exposure, result, grant_kind, subject_id, issuer_id}）——「谁在什么时候看了哪个端口」（原理二）。**`details` 不得记录 ticket / cookie 明文**（只记 `grant_id` 与 token 哈希前 8 位）。**forwardAuth 故障（portal 5xx / 连接失败 / 超时）→ Traefik 侧 deny-all**（默认拒绝，绝不放行；可叠加 basic-auth 兜底，规格 §6.2 / topology.md §5.2）。
 
 ### 2.8 `POST /api/ports/:id/preview-ticket` + 预览 ticket / 预览 cookie 语义
 
@@ -308,9 +312,9 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | `expires_in` | TTL 秒数（**60s ⚠️ 待决策者确认**） |
 
 签发规则：
-- 当前用户对该 allocation 的可见性必须成立：`private` → 仅 owner；`org-visible` → 任意已认证用户；`public` → 任意已认证用户（P1 `public` 默认不可开）。不成立 → `404 not_found`（他人资源不泄露存在性，§1.2）。
+- 当前用户对该 allocation 的可见性必须成立：`private` → 仅 owner **或 admin**（admin 例外，写审计 + 告警）；`org-visible` → 任意已认证用户；`public` → 任意已认证用户（P1 `public` 默认不可开）。不成立 → `404 not_found`（他人资源不泄露存在性，§1.2）。
 - allocation 必须 `state ∈ {allocated,active}`；已 `released` 视同不存在 → `404`。
-- portal 生成随机 token，只存 `preview_grants`（`kind='ticket'`，`token_hash=sha256(ticket)`，`user_id`、`allocation_id`、`expires_at=now+60s`、`created_ip/created_ua`）。**不存 ticket 明文**（与 `login_sessions.token_hash` 同口径）。
+- portal 生成随机 token，只存 `preview_grants`（`kind='ticket'`，`token_hash=sha256(ticket)`，**`issuer_id` = 当前登录用户（签发者）**、`user_id` = **主体（被授权访问的身份：普通 FDE 自签 = issuer = subject；admin 代签他人 private = subject 为 admin）**、`allocation_id`、`expires_at=now+60s`、`created_ip/created_ua`）。**不存 ticket 明文**（与 `login_sessions.token_hash` 同口径）。
 
 #### ticket 语义（`preview_grants.kind='ticket'`）
 
@@ -318,21 +322,25 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 |---|---|
 | 签名 / 存储 | **不透明随机 token + 服务端哈希查找**（`sha256`）；选**有状态**而非「无状态 HMAC 签名」——一次性（single-use）与撤销必须有服务端状态支撑，纯签名 ticket 无法可靠地「用一次即失效」或「显式撤销」 |
 | TTL | **60s ⚠️ 待决策者确认**（覆盖人工点击/iframe 首帧的间隙，又不至于可被长期重放） |
-| 一次性 | 首次校验在**同一事务**原子置 `used_at`；再次出现 → `403 preview_ticket_used`（重放防护） |
-| 撤销 | `revoked_at` 置位即失效；portal 关闭预览页 / 用户登出 / admin 吊销时可选显式撤销未使用的 ticket |
-| 与 allocation 释放联动 | allocation `state → released`（项目删除 / run 结束 / reaper）时，**同一事务**将该 allocation 的未使用 ticket 全部置 `revoked_at`（或删除）；且 forwardAuth 第 2 步始终重查 allocation `state`，双保险 |
+| 一次性（crash-safe） | 首次校验在**同一 DB 事务**内消费 ticket + 派生 session + 记 `ticket→session` 关联（§2.7 第 6 步）；响应丢失后**同一 ticket 安全重放**（返回同一 bootstrap 结果、不产生第二个 session token）；仅当已消费且派生的 session 已 `revoked`/`expired` 才 `403 preview_ticket_used` |
+| 撤销 | `state='active' → 'revoked'`（同事务置 `revoked_at`）即失效；portal 关闭预览页 / 用户登出 / admin 吊销时可选显式撤销未使用的 ticket |
+| 与 allocation 释放联动 | allocation `state → released`（项目删除 / run 结束 / reaper）时，**同一事务**将该 allocation 的 `active` ticket 全部置 `state='revoked'`（同事务写 `revoked_at`）；且 forwardAuth 第 2 步始终重查 allocation `state`，双保险 |
 
 #### 预览 cookie 语义（`preview_grants.kind='session'`）
 
 | 项 | 取值 / 语义 |
 |---|---|
-| 生成 | ticket 首次校验通过后，forwardAuth 生成随机 token，存 `preview_grants`（`kind='session'`），并 `302` 下发 `Set-Cookie`（§2.7 第 6 步） |
+| 生成 | ticket 首次校验通过后，forwardAuth 在**同一事务**内消费 ticket 并**确定性派生** session token（`HMAC-SHA256(session_signing_key, "preview-session:" + ticket)`，不存明文），存 `preview_grants`（`kind='session'`，记 `parent_ticket_id`），并 `302` 下发 `Set-Cookie`（§2.7 第 6 步） |
 | 名称 / 属性 | `__Host-fde_preview`；`Secure`/`HttpOnly`/`SameSite=Lax`/`Path=/`、**不设 `Domain`（host-only 于当前预览 host）**；开发期纯 HTTP 按 §2.5 同法去 `__Host-` 前缀并关 `Secure` |
 | TTL | `Max-Age` 与 `expires_at` 一致：**15 分钟 ⚠️ 待决策者确认**，滚动续期（每次 forwardAuth 成功刷新） |
 | 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` 均失效（forwardAuth 每请求重查） |
-| 上游可见性 | **预览 cookie 与 portal session cookie 都绝不到达预览上游**：二者 host-only、只在各自 host 发送；forwardAuth 不把 cookie 透传上游 |
+| 上游可见性 | **预览 cookie 与 portal session cookie 都绝不到达预览上游**：二者 host-only、只在各自 host 发送；Traefik `strip-cookie` 中间件在放行后删除 `Cookie`（fde-platform §6.4）——上游 dev server 收到的请求头里**没有 `Cookie`** |
 
 > DDL 已落地（schema.sql §4 / model.md §1.21）：`preview_grants` 表（`token_hash UNIQUE`、`kind ∈ {ticket,session}`、`state ∈ {active,used,revoked,expired}`、`user_id`→`users`、`allocation_id`→`port_allocations`、`expires_at`、`used_at`、`revoked_at`、`last_seen_at`、`created_at`、`created_ip`、`created_ua`），并加 reaper 定期清理过期行。
+>
+> ⚠️ **DDL/契约同步点（B3/B4/B11，本轮不改 schema.sql/model.md，待转派）**：需在 `preview_grants` 新增 **`issuer_id uuid REFERENCES users(id)`**（ticket 的签发者；session 为系统派生、可空）与 **`parent_ticket_id uuid REFERENCES preview_grants(id)`**（ticket→session 关联，可空）；`user_id` 语义定为**主体（被授权访问的身份）**。reaper 语义：`active` 且 `expires_at <= now()` → `state='expired'`（懒打标）；allocation 释放 / 显式吊销 → `state='revoked'`（同事务写 `revoked_at`）；ticket 消费 → `state='used'`（同事务写 `used_at`）。**所有凭证查询显式带 `state='active'`**（B11）。
+>
+> **URL ticket 脱敏（B3）**：`preview_ticket` 是 URL 中的凭证，必须脱敏——① **审计**：`audit_log.details` 只记 `grant_kind='ticket'` + `grant_id` + token 哈希前缀，**不记 ticket 明文**；② **access log**：Traefik 原始 access log 对 `*.fde.<base>` 的 `preview_ticket` 查询参数**脱敏/不记录**（accessLog fields 排除 query，或 reconciler 对 `*.fde.<base>` 不记 query string）；③ **浏览器 history/地址栏**：第 6 步 `302 Location` 剔除 `preview_ticket`，地址栏/历史不留 ticket；④ **Referer**：预览响应统一 **`Referrer-Policy: no-referrer`**（fde-platform §6.3），ticket URL 不会经 Referer 泄漏给子资源/外链。
 
 ### 2.9 P1 本地账号生命周期（bootstrap / 建第二个 FDE / 禁用恢复 / 密码与 TOTP）
 
@@ -395,12 +403,14 @@ station-portal user enable  --login <login>
 
 | 主体 | 自己的项目 | 自己的会话/run | 自己的审批 | 预览访问（exposure） | 用户管理 / 全局 |
 |---|---|---|---|---|---|
-| `admin` | 读/写/删；运维视角可**读全部 FDE 项目**（每次读他人资源写审计 + 告警） | 读/写/stop；运维视角可读全部会话/run | 决定自己的审批单；运维视角可读全部审批单 | 可对任意 allocation 签发 ticket（含 `private` 他人）与开 `public` | 建/禁用/恢复用户、重置口令/TOTP、吊销会话/ticket、offboarding（§2.9） |
+| `admin` | 读/写/删；运维视角可**读全部 FDE 项目**（每次读他人资源写审计 + 告警） | 读/写/stop；运维视角可读全部会话/run | 决定自己的审批单；运维视角可读全部审批单 | 可对任意 allocation 签发 ticket（含 `private` 他人；`issuer_id`=admin、主体 `user_id`=admin，forwardAuth 按主体 + **admin 例外**放行并写审计）与开 `public` | 建/禁用/恢复用户、重置口令/TOTP、吊销会话/ticket、offboarding（§2.9） |
 | `普通 FDE` | 仅本人项目（他人 → `404`） | 仅本人 session/run | 仅本人审批单（他人 → `404`） | 本人 `private` + 任意 `org-visible` + `public`；**不得开 `public`**（`403 forbidden`，§4.7） | 无 |
 | `同租户已认证` | ✗（`404`） | ✗（`404`） | ✗（`404`） | 仅 `org-visible` allocation 的预览（ticket 绑定其 `user_id`） | 无 |
 | `公开`（未认证） | ✗（`401`/`404`） | ✗ | ✗ | 仅 `public` allocation 的预览（无凭证，审计 `actor_id=NULL`） | 无 |
 
 > 口径补充：`org-visible`/`public` 的预览仍需经 portal（§2.8 签发 ticket / 直接跳转），且 forwardAuth 每请求重查 `users.status` 与 allocation `state`（§2.7）；「同租户可见」只是 exposure 的放宽，不等于可读他人项目/会话/run 数据。
+>
+> **ticket 的 `issuer_id` 与主体 `user_id`（B4，三处口径一致）**：签发（§2.8）记录两者——`issuer_id` = 谁签的（登录用户），`user_id` = 主体（被授权访问的身份）；forwardAuth 的 `private` 判定（§2.7 第 5 步）用**主体** + **admin 例外**；审计（§2.7）同时记 `subject_id`/`issuer_id`。普通 FDE 自签 = issuer = subject = owner；admin 代签他人 private = issuer = subject = admin。
 
 ---
 
@@ -482,7 +492,7 @@ station-portal user enable  --login <login>
 
 请求（全部可选）：`{ "name": "proj2" }`。
 响应 `200`：更新后的 Project。
-错误：`409 name_conflict`；改名会同步重生成端口 hostname/url——同一 DB 事务更新 desired state + route outbox，Traefik file provider 异步幂等发布（规格 §8.1「URL 与路由同源」）。
+错误：`409 name_conflict`；**改名不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**，改名只更新 `projects.name`（容器内目录名）与**后续新建** run/端口的 hostname，旧 hostname 保持可访问（书签不破，规格 §8.5 不可变性）。改名不写 route outbox（无 hostname/url 变化）；`ports.json` 与 Traefik 路由的更新时机 = **只有新建/释放 allocation** 才触发（规格 §8.1，DB 为真相）。
 
 ### 3.6 `DELETE /api/projects/:id`
 
