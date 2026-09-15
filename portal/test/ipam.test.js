@@ -8,6 +8,7 @@ import {
   cidrsOverlap,
   enumerateSubnets,
   nextAvailableSubnet,
+  allocateNetworkInTx,
   POOLS,
 } from '../src/ipam.js';
 
@@ -63,4 +64,69 @@ test('大 FDE /28：从 10.201.0.0/16 分配且与 /29 池隔离', () => {
   const cand = nextAvailableSubnet(['10.200.0.0/29', '10.200.0.8/29'], POOLS.large);
   assert.equal(cand.subnet, '10.201.0.0/28');
   assert.equal(cand.prefixLen, 28);
+});
+
+/** 最小 fake client：模拟 allocateNetworkInTx 用到的 fde_networks 查询。 */
+function makeIpamClient(rows) {
+  const state = rows.map((r) => ({ ...r }));
+  return {
+    state,
+    async query(sql, params = []) {
+      if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+      if (sql.includes("state IN ('allocated', 'active')")) {
+        const [fdeId] = params;
+        const r = this.state.find((x) => x.fde_id === fdeId && (x.state === 'allocated' || x.state === 'active'));
+        return { rows: r ? [r] : [] };
+      }
+      if (sql.includes('SELECT subnet FROM fde_networks')) {
+        return { rows: this.state.map((x) => ({ subnet: x.subnet })) };
+      }
+      if (sql.includes("state = 'released'") && sql.trimStart().startsWith('SELECT')) {
+        const [fdeId] = params;
+        const r = this.state.find((x) => x.fde_id === fdeId && x.state === 'released');
+        return { rows: r ? [r] : [] };
+      }
+      if (sql.trimStart().startsWith('UPDATE fde_networks')) {
+        const [fdeId, networkName, subnet, prefixLen, gateway, pool] = params;
+        const r = this.state.find((x) => x.fde_id === fdeId && x.state === 'released');
+        r.network_name = networkName;
+        r.subnet = subnet;
+        r.prefix_len = prefixLen;
+        r.gateway = gateway;
+        r.pool = pool;
+        r.state = 'allocated';
+        r.revision = (r.revision || 0) + 1;
+        r.released_at = null;
+        return { rows: [{ fde_id: r.fde_id, network_name: r.network_name, subnet: r.subnet, prefix_len: r.prefix_len, gateway: r.gateway, pool: r.pool, state: r.state }] };
+      }
+      if (sql.trimStart().startsWith('INSERT INTO fde_networks')) {
+        const [fdeId, networkName, subnet, prefixLen, gateway, pool] = params;
+        const r = { fde_id: fdeId, network_name: networkName, subnet, prefix_len: prefixLen, gateway, pool, state: 'allocated', revision: 0, released_at: null };
+        this.state.push(r);
+        return { rows: [{ ...r }] };
+      }
+      return { rows: [] };
+    },
+  };
+}
+
+test('F4：同 fde_id 有 released 行时 UPDATE 复用（不 INSERT 冲突）且子网正确', async () => {
+  const client = makeIpamClient([
+    { fde_id: 'u1', network_name: 'fde-alice', subnet: '10.200.1.0/29', prefix_len: 29, gateway: '10.200.1.1', pool: 'default', state: 'released', revision: 3, released_at: new Date() },
+  ]);
+  const row = await allocateNetworkInTx(client, 'u1', 'alice');
+  assert.equal(row.state, 'allocated');
+  // released 子网仍在 UNIQUE 中占位 → 分配下一块空闲（10.200.0.0/29），且复用同一行（不 INSERT）。
+  assert.equal(row.subnet, '10.200.0.0/29');
+  assert.equal(client.state.length, 1);
+  assert.equal(client.state[0].revision, 4);
+  assert.equal(client.state[0].released_at, null);
+});
+
+test('F4：无既有行时 INSERT 分配', async () => {
+  const client = makeIpamClient([]);
+  const row = await allocateNetworkInTx(client, 'u1', 'alice');
+  assert.equal(row.state, 'allocated');
+  assert.equal(row.subnet, '10.200.0.0/29');
+  assert.equal(client.state.length, 1);
 });

@@ -279,6 +279,13 @@ export async function renameProject(pool, { userId, projectId, name }) {
        RETURNING id, name, repo_url, root_path, slot, template, created_at`,
       [projectId, userId, name, `~/projects/${name}`],
     );
+    // F7：改名也须 enqueue materialize change（新目录生成 + 旧目录收敛）。
+    // 不改 route outbox（hostname/url 是项目名快照，不可变，portal.md §3.5 / fde-platform §8.5）。
+    await enqueueMaterializeChange(client, {
+      fdeId: userId,
+      op: 'upsert',
+      payload: { project_id: projectId, project_name: name },
+    });
     await client.query('COMMIT');
     return toProject(r.rows[0]);
   } catch (err) {

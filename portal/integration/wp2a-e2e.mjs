@@ -201,6 +201,15 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     // 4) 建项目
     await createProject();
 
+    // F10：GET /api/projects/:id/ports（portal.md §4.7）
+    const portsList = await fetch(`${PORTAL}/api/projects/${S.projectId}/ports`, {
+      headers: { Cookie: `fde_session_dev=${S.cookie}` },
+    });
+    assert.equal(portsList.status, 200, 'GET ports list');
+    const portsBody = await portsList.json();
+    assert.equal(portsBody.items.length, 1);
+    assert.equal(portsBody.items[0].hostname, S.hostname);
+
     // 5) 等物化落盘 + 权限
     const portsPath = hostPathOf('projects', 'proj1', '.erix', 'ports.json');
     const manifestPath = hostPathOf('home', '.erix', 'manifest.json');
@@ -230,6 +239,11 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     const routesText = fs.readFileSync(routesFile, 'utf8');
     assert.match(routesText, new RegExp(`fde-${S.hostname.split('.')[0]}:`));
     assert.ok(!routesText.includes('10.200.0.0/16'), '禁止 /16 聚合进放行范围');
+    // F3：每个 active FDE 生成 LLM 路由（Host(llm) && ClientIP(精确 subnet) → llm-hub，无兜底）。
+    assert.ok(routesText.includes('llm.localhost'), 'routes.yml 含 llm 路由');
+    assert.match(routesText, /ClientIP\(`10\.200\.\d+\.\d+\/2[89]`\)/, 'LLM ClientIP 精确 subnet');
+    assert.ok(routesText.includes('service: llm-hub'), 'LLM service llm-hub');
+    assert.ok(routesText.includes('fde-alice-llm'), 'fde-alice-llm router');
 
     // 7) 手工建 FDE 网络 + whoami 假 dev server
     await readDbNetwork();
@@ -239,13 +253,13 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     S.containerName = 'fde-alice-svc';
     docker(`run -d --rm --name ${S.containerName} --network ${S.networkName} --ip ${backendIp} traefik/whoami -port ${S.port}`);
 
-    // 8) 经 Traefik curl 可达
+    // 8) 经 Traefik curl：无预览凭证 → fail-closed 403（F2）；不再因 hostname 存在即放行。
     const curl = `curl -s -o /dev/null -w '%{http_code}' -H 'Host: ${S.hostname}' ${TRAEFIK_WEB}/`;
     const code = await waitFor(async () => {
       const c = execSync(curl, { encoding: 'utf8', stdio: 'pipe' }).trim();
-      return c === '200' ? c : null;
-    }, { label: `curl 200 via Traefik (${S.hostname})`, timeoutMs: 30000 });
-    assert.equal(code, '200');
+      return c === '403' ? c : null;
+    }, { label: `curl 403 via Traefik (${S.hostname})`, timeoutMs: 30000 });
+    assert.equal(code, '403');
 
     // 9) DELETE 项目 → 端口回收 + tombstone + 收敛
     const del = await fetch(`${PORTAL}/api/projects/${S.projectId}`, {
@@ -283,8 +297,31 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     }, { label: 'curl 404 after delete', timeoutMs: 30000 });
     assert.equal(afterCode, '404');
 
+    // 10) F4：释放网络 → 再建项目成功且子网正确（released 行复用，不 500）。
+    await docker(
+      `exec -i station-db psql -U station -d station -c "UPDATE fde_networks SET state='released', released_at=now() WHERE fde_id='00000000-0000-0000-0000-000000000001'"`,
+    );
+    const p2 = await fetch(`${PORTAL}/api/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${S.cookie}` },
+      body: JSON.stringify({ name: 'proj2', repo_url: 'https://git.example/alice/proj2.git', template: 'node' }),
+    });
+    const p2body = await p2.json();
+    assert.equal(p2.status, 201, `F4 re-create project: ${JSON.stringify(p2body)}`);
+    const netRow = docker(
+      `exec -i station-db psql -U station -d station -tAc "SELECT subnet, state FROM fde_networks WHERE fde_id='00000000-0000-0000-0000-000000000001'"`,
+    ).trim();
+    const [netSubnet, netState] = netRow.split('|').map((s) => s.trim());
+    assert.equal(netState, 'allocated', 'F4 network reallocated');
+    assert.notEqual(netSubnet, S.subnet, 'F4 new subnet differs');
+    // 清理 proj2（网络回收由 cleanup 负责）
+    await fetch(`${PORTAL}/api/projects/${p2body.project.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: `fde_session_dev=${S.cookie}` },
+    });
+
     // eslint-disable-next-line no-console
-    console.log(`\n[e2e] OK: project=${S.projectId} hostname=${S.hostname} port=${S.port} subnet=${S.subnet} curl 200 → delete → curl 404`);
+    console.log(`\n[e2e] OK: project=${S.projectId} hostname=${S.hostname} port=${S.port} subnet=${S.subnet} curl 403 (无凭证) → delete → curl 404 → F4 重分配 ${netSubnet}`);
   } catch (err) {
     // 失败时打印 portal 日志便于定位，再交给 cleanup。
     try {

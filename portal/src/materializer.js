@@ -4,7 +4,15 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { sha256, atomicWriteFile, ensureDirSafe, readFileIfExists } from './fsutil.js';
+import {
+  sha256,
+  atomicWriteFile,
+  ensureDirSafe,
+  readFileIfExists,
+  assertSafePath,
+  writeTempFile,
+  commitTempFile,
+} from './fsutil.js';
 
 // 容器内用户名固定 erix（⚠️ 待决策者确认，user-space §2.4）。
 export const FDE_CONTAINER_USER = 'erix';
@@ -210,12 +218,24 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
     ensureWorkspaceDirs(files);
 
     // 3) 逐文件原子写（内容不变则跳过，user-space §8.2）；记录最终 entries。
+    // F6：用 lstat 判断（不跟随 symlink）——即使同内容，目标为 symlink 也强制走 atomicWriteFile，
+    //    由 assertSafePath 拒绝（materialize_path_tampered），绝不静默保留 symlink。
     const entries = {};
+    let contentChanged = false;
     for (const f of files) {
       const prev = prevFiles[f.containerPath];
-      const current = readFileIfExists(f.hostPath);
       const newSha = sha256(f.content);
-      const changed = current !== f.content;
+      let current = null;
+      let isSymlink = false;
+      try {
+        const st = fs.lstatSync(f.hostPath);
+        if (st.isSymbolicLink()) isSymlink = true;
+        else current = readFileIfExists(f.hostPath);
+      } catch {
+        current = null;
+      }
+      const changed = isSymlink || current !== f.content;
+      if (changed) contentChanged = true;
       const revision = changed ? (prev?.revision ?? 0) + 1 : (prev?.revision ?? 0);
       if (changed) {
         atomicWriteFile(f.hostPath, f.content, { mode: f.mode, root: rootReal });
@@ -223,14 +243,37 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
       entries[f.containerPath] = { sha256: newSha, revision };
     }
 
-    // 4) 清理已删除文件（prevManifest 中不在本次 desired 集里的平台文件）。
-    removeStaleFiles(prevFiles, new Set(Object.keys(entries)), rootReal, fdeName, log);
+    // M2：stale-only 变更也算「变更」——本次实际会删除的 stale 文件数 > 0 时，materialized_at 必须更新。
+    // 预扫描（不实际删除），保证「先备好新 manifest 再删除」的提交点顺序不被打乱。
+    const desiredPaths = new Set(Object.keys(entries));
+    const staleScan = collectStaleFiles(prevFiles, desiredPaths, rootReal, fdeName);
+    const anyChanged = contentChanged || staleScan.candidates.length > 0;
 
-    // 5) 最后写 manifest（提交点，0444）；内容不变则不重写（user-space §8.2 幂等）。
+    // F8：内容未变（且无 stale 删除）时沿用旧 manifest 的 materialized_at，保证同快照字节级相同（幂等）。
+    const effectiveMaterializedAt = (!anyChanged && prevManifest?.materialized_at)
+      ? prevManifest.materialized_at
+      : materializedAt;
+
+    // 4) 提交点（F5）：新 manifest 先写 tmp（不 rename）→ 删除 stale → 最后 rename manifest。
+    //    先备好新 manifest 再删除，避免「删了 stale 才发现 manifest 写失败」破坏旧版本。
     const manifestPath = path.join(rootReal, fdeName, 'home', '.erix', 'manifest.json');
-    const manifestContent = renderManifest({ fdeName, generation, entries, materializedAt });
+    const manifestContent = renderManifest({ fdeName, generation, entries, materializedAt: effectiveMaterializedAt });
     if (readFileIfExists(manifestPath) !== manifestContent) {
-      atomicWriteFile(manifestPath, manifestContent, { mode: MANIFEST_MODE, root: rootReal });
+      const tmp = writeTempFile(manifestPath, manifestContent, { mode: MANIFEST_MODE, root: rootReal });
+      try {
+        removeStaleFiles(prevFiles, desiredPaths, rootReal, fdeName, log);
+        // L5：commitTempFile 返回 false（rename 已提交但目录 fsync 失败）时按失败处理，不标记发布成功。
+        if (!commitTempFile(tmp, manifestPath, { root: rootReal })) {
+          throw new Error(`fsync directory failed after manifest rename: ${manifestPath}`);
+        }
+      } catch (err) {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {}
+        throw err;
+      }
+    } else {
+      removeStaleFiles(prevFiles, desiredPaths, rootReal, fdeName, log);
     }
 
     return { generation, manifest: manifestContent, files: entries };
@@ -239,22 +282,71 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
   return { materialize, ensureWorkspaceDirs };
 }
 
-function removeStaleFiles(prevFiles, desiredContainerPaths, root, fdeName, log) {
+/**
+ * 平台管理路径的精确判定（不用「后缀猜」）：只认平台自己会生成的路径——
+ * home/.erix 目录、home/AGENTS.md（精确）、projects/<project>/.gitignore（恰好在项目根）、
+ * projects/<project>/.erix/*。用户自建的嵌套 .gitignore/AGENTS.md（如 projects/<project>/<repo>/.gitignore）不在此列。
+ */
+function isPlatformManagedPath(containerPath) {
+  if (typeof containerPath !== 'string' || !containerPath.startsWith(`${CONTAINER_HOME}/`)) return false;
+  const rel = containerPath.slice(CONTAINER_HOME.length + 1);
+  if (rel === 'AGENTS.md') return true;
+  if (rel.startsWith('.erix/')) return true;
+  if (!rel.startsWith('projects/')) return false;
+  const parts = rel.split('/');
+  // projects/<project>/.gitignore（项目根，不含再往下的嵌套 repo 路径）
+  if (parts.length === 3 && parts[2] === '.gitignore') return true;
+  // projects/<project>/.erix/<file>
+  if (parts.length === 4 && parts[2] === '.erix') return true;
+  return false;
+}
+
+/**
+ * 预扫描上一版 manifest 中需要删除的 stale 文件（不实际删除）。
+ * 返回 { candidates: [{containerPath, hostPath}], skipped: [{containerPath, message}] }。
+ * 与 removeStaleFiles 共用同一判定，保证「预判将被删」与「实际删除」一致。
+ */
+function collectStaleFiles(prevFiles, desiredContainerPaths, root, fdeName) {
+  const rootReal = path.resolve(root);
+  const fdeRoot = path.resolve(rootReal, fdeName);
+  const candidates = [];
+  const skipped = [];
   for (const containerPath of Object.keys(prevFiles)) {
     if (desiredContainerPaths.has(containerPath)) continue;
-    // 只清理平台所有文件（.erix/ 下、.gitignore、AGENTS.md）。
-    const isPlatform = containerPath.startsWith(`${CONTAINER_HOME}/`) &&
-      (containerPath.includes('/.erix/') ||
-        containerPath.endsWith('/.gitignore') ||
-        containerPath.endsWith('/AGENTS.md'));
-    if (!isPlatform) continue;
-    const real = hostPathFor(root, fdeName, containerPath);
     try {
-      if (fs.existsSync(real)) fs.unlinkSync(real);
+      // F1：删除路径来自磁盘 prevManifest，不可信——无论是否平台管理路径，先重新规范化 + assertSafePath，
+      // 强制处于当前 FDE root 之内；任何逃逸 / 含 symlink 的可疑路径跳过并告警（不删、不 500）。
+      const hostPath = path.resolve(hostPathFor(rootReal, fdeName, containerPath));
+      const rel = path.relative(fdeRoot, hostPath);
+      if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new Error(`stale path escapes FDE root: ${containerPath}`);
+      }
+      assertSafePath(fdeRoot, hostPath);
+      // 只清理「平台管理路径集合」中、且已不在本次 desired plan 的文件；其余一律不动（不告警，属用户自建文件）。
+      if (!isPlatformManagedPath(containerPath)) continue;
+      if (fs.existsSync(hostPath)) candidates.push({ containerPath, hostPath });
     } catch (e) {
-      log.warn?.(`[materializer] unlink stale file ${real}: ${e.message}`);
+      skipped.push({ containerPath, message: e.message });
     }
   }
+  return { candidates, skipped };
+}
+
+function removeStaleFiles(prevFiles, desiredContainerPaths, root, fdeName, log) {
+  const { candidates, skipped } = collectStaleFiles(prevFiles, desiredContainerPaths, root, fdeName);
+  for (const s of skipped) {
+    log.warn?.(`[materializer] skip stale file ${s.containerPath}: ${s.message}`);
+  }
+  let deleted = 0;
+  for (const { containerPath, hostPath } of candidates) {
+    try {
+      fs.unlinkSync(hostPath);
+      deleted += 1;
+    } catch (e) {
+      log.warn?.(`[materializer] skip stale file ${containerPath}: ${e.message}`);
+    }
+  }
+  return deleted;
 }
 
 // ---------------------------------------------------------------------------
