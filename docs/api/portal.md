@@ -395,6 +395,8 @@ station-portal user enable  --login <login>
 | TOTP 重置 | `station-portal user reset-totp --login <login>`：重生成种子并输出 otpauth URI/二维码；**强制该用户重新走两步登录** |
 | 限流 | 登录爆破与 TOTP 连续失败走 §2.2/§2.3 的 `429 rate_limited`（`Retry-After`） |
 
+> **口令哈希实现注（P1 skeleton）**：⚠️ P1 骨架实现暂用 Node 内置 `crypto.scrypt`（零依赖，满足「运行时依赖仅 `pg`」）；argon2id 的参数本身仍待决策者确认，切换时按自描述哈希（`algo$…$salt$hash`）平滑迁移，登录成功时对旧格式自动 rehash。
+>
 > ⚠️ 待决策者确认：TOTP 本身是否保留为**强制**（规格 §7.1 已写「强制 TOTP」，此处按已决处理，仅算法参数留待确认）；admin 数量上限是否收紧为 1。
 
 ### 2.10 授权矩阵（P1）

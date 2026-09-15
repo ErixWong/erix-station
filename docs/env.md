@@ -24,6 +24,8 @@ P1 本地开发（写代码、起栈联调）只需：
 | 项 | 开发期做法 |
 |---|---|
 | 入口端口 | **127.0.0.1 + 任意高端口**。默认建议：Traefik `websecure` → **`8443`**，`web` → **`8090`**（参考实例 A 上已用 `ss -tlnp` 确认两者空闲，2026-09）。**注意避开本机已占用端口**：80/443 被占（443 为 `nginx_reverse_proxy`）、8080 被占（`gitea_act_runner`）、5432 被占、8931~8934 是 playwright 容器（见 §8.2）；换机器或换端口前一律先 `ss -tlnp` 自查 |
+| portal 发布端口 | **`127.0.0.1:18080:8080`**（宿主 8080 已被 `gitea_act_runner` 占用 → 开发期 portal 宿主端口改用 `18080`，`PORTAL_HOST_PORT=18080`；容器内仍听 8080） |
+| backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `voiceprint_default` 占用（`br-8e3857476b83` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
 | 域名 | 不依赖 DNS 泛解析：用 `/etc/hosts` 逐条指到 127.0.0.1，或用 `*.localhost` 变通（`station.localhost` / `alice-r3a7f-4008.fde.localhost`，多数系统 localhost 子域自动回环到 127.0.0.1）。⚠️ **`*.localhost` 变通只对浏览器/宿主有效，对容器无效**：容器内解析 `station.<base>` / `llm.<base>` 用创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1） |
 | TLS | 自签证书，或直接 http 联调（cookie `Secure`/`SameSite` 属性按实际域名方案调试，正式语义仍以 portal.md §2.5 为准） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
@@ -268,6 +270,8 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `LLM_HOST` | 平台规范固定 = `llm.` + `BASE_DOMAIN`（§1；容器内 hosts 注入解析，不进 DNS，仅证书 SAN 用） | `llm.erix.vip` |
 | `TRAEFIK_WEB_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `80` |
 | `TRAEFIK_WEBSECURE_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `443`（冲突未解时 `8443`，见 §5.1/§8.3） |
+| `BACKEND_SUBNET` | 平台规范固定（deploy-contract.md §2.1）；须避开宿主既有网段 | `172.30.0.0/24`（开发期本机为 `172.32.0.0/24`，见 §0） |
+| `PORTAL_HOST_PORT` | 平台规范固定（portal publish 仅回环 `127.0.0.1`，容器内固定 8080） | `8080`（开发期本机为 `18080`，见 §0） |
 | `ACME_EMAIL` | 决策者提供（§2 ⚠️） | 待填 |
 | `DNS_PROVIDER` / DNS-01 API token | 决策者提供，凭据文件注入（§2 ⚠️ / §6） | 待填 |
 | `DATA_ROOT` | 决策者/运维约定（§6） | `/docker` |
