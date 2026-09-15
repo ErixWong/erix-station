@@ -25,6 +25,7 @@ P1 本地开发（写代码、起栈联调）只需：
 |---|---|
 | 入口端口 | **127.0.0.1 + 任意高端口**。默认建议：Traefik `websecure` → **`8443`**，`web` → **`8090`**（参考实例 A 上已用 `ss -tlnp` 确认两者空闲，2026-09）。**注意避开本机已占用端口**：80/443 被占（443 为 `nginx_reverse_proxy`）、8080 被占（`gitea_act_runner`）、5432 被占、8931~8934 是 playwright 容器（见 §8.2）；换机器或换端口前一律先 `ss -tlnp` 自查 |
 | portal 发布端口 | **`127.0.0.1:18080:8080`**（宿主 8080 已被 `gitea_act_runner` 占用 → 开发期 portal 宿主端口改用 `18080`，`PORTAL_HOST_PORT=18080`；容器内仍听 8080） |
+| 用户空间根 / 动态配置目录 | 开发期**可注入临时目录隔离**：`ERIX_USERSPACE_ROOT_HOST`（宿主用户空间根，默认 `/srv/erix/users`）与 `TRAEFIK_DYNAMIC_DIR_HOST`（Traefik 动态配置宿主目录，默认 `./traefik/dynamic`）——两者都**必须 0755**（Traefik/portal 容器以 `cap_drop: ALL` 运行、无 `DAC_OVERRIDE`，目录对容器需 other 可读/可穿越；`mktemp -d` 默认 0700 需先 chmod） |
 | backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `voiceprint_default` 占用（`br-8e3857476b83` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
 | socket-proxy | 开发期**同样启用**：`station-docker-socket-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` 访问 Docker API（不直挂 socket）；白名单 `CONTAINERS=1`/`NETWORKS=1` + `POST=0` → **P1 只读**（创建容器归 WP2） |
 | DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**，portal 运行时 `MIGRATE_ON_START=0` 不重复跑 |
@@ -162,6 +163,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | `DATA_ROOT` | 平台数据 bind mount 根目录，布局为 `<DATA_ROOT>/<名称>/` | 决策者/运维约定 | `/docker`（参考实例 A 的全机统一约定，见 §8.1）；如 `/docker/station-db/`（pg data）、`/docker/station-edge/`（traefik 动态配置/证书存储 acme.json） |
 | `USER_SPACE_ROOT` | FDE 用户空间根，布局为 `<USER_SPACE_ROOT>/<fde>/`（宿主路径）；FDE 容器内映射 `/home/<user>`（见 [`design/user-space.md`](design/user-space.md) §2） | 路径结构平台规范固定；具体取值由决策者/运维提供 | `/srv/erix/users`（参考实例 A，见 §8.1）；如 `/srv/erix/users/alice/{home,projects,worktrees,cache}` |
 | `FDE_CONTAINER_USER` / `FDE_HOME` | 容器内 FDE 用户名与 HOME（user-space.md §2.4；⚠️ 用户名固定 `erix` vs 按 FDE 名，倾向固定 `erix`） | 平台规范固定 | `erix` / `/home/erix` |
+| `ERIX_USERSPACE_ROOT` | portal 运行时读写的用户空间根（**容器内路径**，=`USER_SPACE_ROOT` 的 portal 运行时名；compose 以 `ERIX_USERSPACE_ROOT_HOST` 挂到该路径） | 平台规范固定 | `/srv/erix/users` |
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（工作区目录属主） | 平台规范固定（user-space.md §6） | `1000` / `1000` |
 | `AGENTD_UID` / `WORKER_UID` | agentd（唯一持 per-container token）/ worker（每 run）的 UID；GID 同 `1000` | 平台规范固定（runner-integration §11.3 不同 UID 优先） | `1001` / `1002` |
 | `PORTAL_RUNTIME_UID` | portal 容器运行身份 = materializer 物化写入身份（需 chown 工作区目录、写 Docker API） | 平台规范固定（user-space.md §6.1） | `0`（root） |
@@ -291,6 +293,16 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `TRAEFIK_CONFIG_DIR` | 平台规范固定（deploy-contract.md；由 `DATA_ROOT` 派生） | `/docker/station-edge/`（静态 `traefik.yml` + `dynamic/` 目录 + `acme.json` + `logs/` + `firewall/` 规则文件） |
 | `FIREWALL_RULES_PATH` | 平台规范固定（deploy-contract.md；由 `TRAEFIK_CONFIG_DIR` 派生） | `/docker/station-edge/firewall/`（规则文件 `rules.v4`，权限 **600**） |
 | `DB_DATA_DIR` | 平台规范固定（由 `DATA_ROOT` 派生） | `/docker/station-db/`（pg data；见 §6） |
+| `ERIX_USERSPACE_ROOT` | portal 运行时环境变量：用户空间根（portal **容器内路径**，固定 `/srv/erix/users`，与宿主 bind mount 同路径，user-space §2.2） | 平台规范固定 | `/srv/erix/users` |
+| `ERIX_USERSPACE_ROOT_HOST` | compose 插值：宿主用户空间根路径（默认 `/srv/erix/users`；开发期可指向临时目录隔离，结构不变） | 平台规范固定 + 开发期隔离 | `/srv/erix/users` |
+| `TRAEFIK_DYNAMIC_DIR` | portal 运行时环境变量：Traefik 动态配置目录（portal **容器内路径**，reconciler 单一写方，deploy-contract §4.2） | 平台规范固定 | `/etc/traefik/dynamic` |
+| `TRAEFIK_DYNAMIC_DIR_HOST` | compose 插值：Traefik 动态配置宿主目录（portal 写方与 Traefik 只读方共享；生产 `/docker/station-edge/dynamic/`，开发期默认 `./traefik/dynamic`） | 平台规范固定 + 开发期隔离 | `./traefik/dynamic` |
+| `PORTAL_BACKEND_URL` | portal 后端回环地址（reconciler 生成 portal service 与 forwardAuth 地址用） | 平台规范固定 + 目标环境探测（回环端口） | `http://127.0.0.1:8080`（开发期 `http://127.0.0.1:18080`，§0） |
+| `TRAEFIK_ENTRYPOINT` | reconciler 生成路由挂载的 Traefik entryPoint | 平台规范固定 | `web`（P1 开发 http；生产 `websecure`） |
+| `PORT_QUOTA` | 每用户项目 slot 配额（规格 §8.2「如 40 个端口」） | 平台规范固定 | `40` |
+| `FDE_POOL` | IPAM 默认池选择 | 平台规范固定 | `default`（`large` = 大 FDE `/28` 段） |
+| `IPAM_RESERVED_SUBNETS` | IPAM 保留网段（逗号分隔；避开宿主既有网段，开发期可置空，因 FDE 池 10.200/10.201 与 backend 172.32 天然隔离） | 目标环境探测 | ``（空） |
+| `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（user-space §6.1） | 平台规范固定 | `1000` / `1000` |
 
 > **口令必须改 + 600 权限存放**：`POSTGRES_PASSWORD` / `PLATFORM_DB_PASSWORD` / `PORTAL_DB_PASSWORD` 在生产环境必须把 `change-me-dev-only` 占位全部改掉，并以 **600 权限 `deploy/.env`** 存放（不入库、不进 compose 正文、不进镜像，见 deploy-contract §2.4）。
 >

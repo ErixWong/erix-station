@@ -11,7 +11,7 @@ import * as auth from '../src/auth.js';
 import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
 
-async function startServer({ users = [], overrides = {} } = {}) {
+async function startServer({ users = [], overrides = {}, pool: customPool } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
@@ -37,7 +37,7 @@ async function startServer({ users = [], overrides = {} } = {}) {
     staticDir,
     ...overrides,
   };
-  const pool = new FakePool({ users });
+  const pool = customPool || new FakePool({ users });
   const server = createServer({ pool, config });
   await new Promise((res) => server.listen(0, '127.0.0.1', res));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -479,5 +479,67 @@ test('KDF 队列满 → 503 kdf_busy（快速失败，不无限排队）', async
     assert.equal((await first).status, 200);
   } finally {
     await close();
+  }
+});
+
+test('forward-auth fail-closed：无预览凭证 403 / 未知 host 404 / released 403', async () => {
+  const allocs = new Map([
+    ['alice-p-proj1-4016.fde.localhost', { id: 'pa1', fde_id: 'u1', state: 'allocated', fde_name: 'alice' }],
+    ['bob-p-proj1-4016.fde.localhost', { id: 'pa2', fde_id: 'u2', state: 'released', fde_name: 'bob' }],
+  ]);
+  const pool = {
+    async query(sql, params) {
+      if (sql.includes('FROM port_allocations a')) {
+        const host = params[0];
+        const a = allocs.get(host);
+        return { rows: a ? [a] : [] };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+  const s = await startServer({ pool });
+  try {
+    const unknown = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'nope.fde.localhost' } });
+    assert.equal(unknown.status, 404);
+
+    const nocred = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'alice-p-proj1-4016.fde.localhost' } });
+    assert.equal(nocred.status, 403);
+    assert.equal((await nocred.json()).error.code, 'preview_ticket_required');
+
+    const released = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'bob-p-proj1-4016.fde.localhost' } });
+    assert.equal(released.status, 403);
+    assert.equal((await released.json()).error.code, 'allocation_released');
+  } finally {
+    await s.close();
+  }
+});
+
+test('GET /api/projects/:id/ports：返回端口列表（portal.md §4.7）', async () => {
+  const port = { id: 'pa1', scope: 'project', port: 4000, role: 'frontend', run_id: null, hostname: 'alice-p-proj1-4000.fde.localhost', url: 'https://alice-p-proj1-4000.fde.localhost', exposure: 'private', state: 'allocated', released_at: null };
+  const pool = {
+    async query(sql, params) {
+      if (sql.includes('FROM login_sessions s') && sql.includes('JOIN users')) {
+        return { rows: [{ id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local', status: 'active', session_id: 's1', expires_at: new Date(Date.now() + 3600000), last_seen_at: new Date() }] };
+      }
+      if (sql.includes('FROM projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL')) {
+        return { rows: [{ id: 'p1', name: 'proj1', repo_url: 'https://git.example/a.git', root_path: '~/projects/proj1', slot: 0, template: 'node', created_at: new Date('2026-09-12T08:30:00.000Z') }] };
+      }
+      if (sql.includes('FROM port_allocations WHERE project_id = $1 AND state')) {
+        return { rows: [port] };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+  const s = await startServer({ pool });
+  try {
+    const r = await fetch(`${s.base}/api/projects/p1/ports`, { headers: { Cookie: 'fde_session_dev=tok' } });
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.items.length, 1);
+    assert.equal(body.items[0].hostname, 'alice-p-proj1-4000.fde.localhost');
+  } finally {
+    await s.close();
   }
 });

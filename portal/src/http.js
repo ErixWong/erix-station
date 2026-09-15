@@ -10,6 +10,7 @@ import path from 'node:path';
 import { URL } from 'node:url';
 import * as auth from './auth.js';
 import * as migrate from './migrate.js';
+import * as projects from './projects.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -174,6 +175,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details), headers);
         return;
       }
+      if (err instanceof projects.ProjectError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -246,6 +251,30 @@ async function routeApi(req, res, ctx, url) {
     const headers = {};
     if (renewed) headers['Set-Cookie'] = sessionCookieHeader(config.cookie, token);
     return sendJson(res, 200, { user: session.user }, headers);
+  }
+
+  // 边缘授权回调（Traefik forwardAuth）：非浏览器 API，不要求 session cookie。
+  if (pathname === '/api/forward-auth') {
+    return handleForwardAuth(req, res, ctx);
+  }
+
+  // ---- 项目与端口（portal.md §3） ----
+  if (pathname === '/api/projects') {
+    if (req.method === 'POST') return handleCreateProject(req, res, ctx);
+    if (req.method === 'GET') return handleListProjects(req, res, ctx);
+  }
+  const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch) {
+    const projectId = decodeURIComponent(projectMatch[1]);
+    if (req.method === 'GET') return handleGetProject(req, res, ctx, projectId);
+    if (req.method === 'PATCH') return handlePatchProject(req, res, ctx, projectId);
+    if (req.method === 'DELETE') return handleDeleteProject(req, res, ctx, projectId);
+  }
+  // F10：端口列表（portal.md §4.7）——复用 getProject 的 ports 查询。
+  const projectPortsMatch = pathname.match(/^\/api\/projects\/([^/]+)\/ports$/);
+  if (projectPortsMatch) {
+    const projectId = decodeURIComponent(projectPortsMatch[1]);
+    if (req.method === 'GET') return handleGetProjectPorts(req, res, ctx, projectId);
   }
 
   return sendJson(res, 404, errorBody('not_found', 'not found'));
@@ -384,6 +413,106 @@ async function handleLoginTotp(req, res, ctx) {
   });
   const cookieHeader = sessionCookieHeader(config.cookie, session.token);
   return sendJson(res, 200, { user: result.user }, { 'Set-Cookie': cookieHeader });
+}
+
+/** 要求有效 session（除登录/forward-auth 外所有公开端点）。 */
+async function requireSession(req, ctx) {
+  const token = getCookie(req, ctx.config.cookie.name);
+  if (!token) throw new HttpError(401, 'unauthorized', 'unauthorized');
+  const session = await auth.findSessionUser(ctx.pool, token);
+  if (!session) throw new HttpError(401, 'unauthorized', 'unauthorized');
+  return session;
+}
+
+/**
+ * forwardAuth 回调（portal.md §2.7）。fail-closed：
+ *  ① hostname 精确查 port_allocations（查不到 404 = 路由表里没有 = 不可达）；
+ *  ② released → 403 allocation_released；
+ *  ③ 无有效预览凭证 → 403 preview_ticket_required（⚠️ WP2b：一次性 ticket / 预览 cookie /
+ *     exposure 授权完整实现归后续 WP；当前严禁「只查 hostname 就放行」）。
+ * 放行成功分支（WP2b 上线后）在返回 200 + X-Auth-User 前执行 allocated→active 幂等升级：
+ *   UPDATE port_allocations SET state='active' WHERE id=$1 AND state='allocated'（fde-platform §8.6）。
+ */
+async function handleForwardAuth(req, res, ctx) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  if (!host) return sendJson(res, 404, errorBody('not_found', 'not found'));
+  const r = await ctx.pool.query(
+    `SELECT a.id, a.fde_id, a.state, u.fde_name
+       FROM port_allocations a
+       JOIN users u ON u.id = a.fde_id
+      WHERE a.hostname = $1
+      LIMIT 1`,
+    [host],
+  );
+  if (r.rows.length === 0) return sendJson(res, 404, errorBody('not_found', 'not found'));
+  const alloc = r.rows[0];
+  if (alloc.state === 'released') {
+    return sendJson(res, 403, errorBody('allocation_released', 'allocation released'));
+  }
+  // ⚠️ WP2b：此处为完整预览凭证校验（ticket → 预览 cookie / exposure 判定）的插入点。
+  // 凭证校验通过后放行并执行 allocated → active 升级（幂等）。
+  // P1 fail-closed：无有效预览凭证一律 403（绝不因 hostname 存在即放行）。
+  return sendJson(res, 403, errorBody('preview_ticket_required', 'preview ticket required'));
+}
+
+async function handleCreateProject(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const repoUrl = typeof body.repo_url === 'string' ? body.repo_url.trim() : '';
+  const template = typeof body.template === 'string' ? body.template : 'default';
+  const result = await projects.createProject(ctx.pool, {
+    userId: session.user.id,
+    name,
+    repoUrl,
+    template,
+    config: ctx.config,
+  });
+  return sendJson(res, 201, { project: result.project, ports: [result.port] });
+}
+
+async function handleListProjects(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://localhost');
+  const cursor = url.searchParams.get('cursor') || undefined;
+  const limit = Number(url.searchParams.get('limit') || 20);
+  const result = await projects.listProjects(ctx.pool, { userId: session.user.id, cursor, limit });
+  return sendJson(res, 200, result);
+}
+
+async function handleGetProject(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  const result = await projects.getProject(ctx.pool, { userId: session.user.id, projectId });
+  return sendJson(res, 200, result);
+}
+
+async function handleGetProjectPorts(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  const result = await projects.getProject(ctx.pool, { userId: session.user.id, projectId });
+  return sendJson(res, 200, { items: result.ports });
+}
+
+async function handlePatchProject(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  if (typeof body.name !== 'string' || !body.name.trim()) {
+    throw new HttpError(400, 'validation_failed', 'name 为必填字段', { details: { field: 'name' } });
+  }
+  const project = await projects.renameProject(ctx.pool, {
+    userId: session.user.id,
+    projectId,
+    name: body.name.trim(),
+  });
+  return sendJson(res, 200, project);
+}
+
+async function handleDeleteProject(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  await projects.deleteProject(ctx.pool, { userId: session.user.id, projectId });
+  res.writeHead(204);
+  res.end();
 }
 
 async function serveStatic(req, res, ctx, url) {
