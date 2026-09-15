@@ -1,0 +1,16 @@
+# Traefik 动态配置 —— 开发期（P1 walking skeleton）
+# 把 station.localhost 路由到 portal（host 网络 Traefik → 宿主回环发布的 portal）。
+# 注：portal 宿主发布端口为 PORTAL_HOST_PORT=18080（本机 8080 被 gitea_act_runner 占用），
+#     故 backend 指向 127.0.0.1:18080；生产 portal publish 127.0.0.1:8080，由 reconciler 生成。
+http:
+  routers:
+    portal:
+      entryPoints:
+        - web
+      rule: "Host(`station.localhost`)"
+      service: portal
+  services:
+    portal:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:18080"

@@ -90,6 +90,7 @@
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
 | 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `port_quota_exceeded` | 状态冲突，各端点分别列出 | 否 |
+| 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
 | 500 | `internal` | 未分类服务端错误 | 否 |
@@ -131,12 +132,14 @@
 响应 `200`（口令正确，进入第二步；**此时尚未登录**）：
 
 ```json
-{ "status": "totp_required", "pending_token": "pt_9f2c...", "expires_in": 300 }
+{ "status": "totp_required", "pending_token": "pt_9f2c...", "expires_in": 120 }
 ```
 
 | 字段 | 说明 |
 |---|---|
-| `pending_token` | 一次性、5 分钟有效的待决令牌，仅可用于 `/api/auth/login/totp` |
+| `pending_token` | 一次性、短期（默认 120s，`PENDING_TOKEN_TTL_SECONDS` 可配）有效的待决令牌，仅可用于 `/api/auth/login/totp`；服务端只存其 `sha256` |
+
+请求约束（S3）：`Content-Type` 必须为 `application/json`（否则 `400 validation_failed`）；`login` ≤ 128、`password` ≤ 256 字符（否则 `400 validation_failed`）；请求体超过上限（默认 64KiB，`Content-Length` 或流式字节）→ `413 payload_too_large`（标准错误信封）。
 
 错误：
 
@@ -395,6 +398,8 @@ station-portal user enable  --login <login>
 | TOTP 重置 | `station-portal user reset-totp --login <login>`：重生成种子并输出 otpauth URI/二维码；**强制该用户重新走两步登录** |
 | 限流 | 登录爆破与 TOTP 连续失败走 §2.2/§2.3 的 `429 rate_limited`（`Retry-After`） |
 
+> **口令哈希实现注（P1 skeleton）**：⚠️ P1 骨架实现暂用 Node 内置 `crypto.scrypt`（零依赖，满足「运行时依赖仅 `pg`」）；argon2id 的参数本身仍待决策者确认，切换时按自描述哈希（`algo$…$salt$hash`）平滑迁移，登录成功时对旧格式自动 rehash。
+>
 > ⚠️ 待决策者确认：TOTP 本身是否保留为**强制**（规格 §7.1 已写「强制 TOTP」，此处按已决处理，仅算法参数留待确认）；admin 数量上限是否收紧为 1。
 
 ### 2.10 授权矩阵（P1）
