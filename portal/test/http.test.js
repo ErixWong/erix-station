@@ -619,3 +619,26 @@ test('GET /api/projects/:id/ports：返回端口列表（portal.md §4.7）', as
     await s.close();
   }
 });
+
+test('F2：forward-auth 审计不记 query（含 ?preview_ticket=<明文>）', async () => {
+  const pool = new FakePool({ users: [] });
+  const s = await startServer({ pool });
+  try {
+    const secret = 'pt_S3CRET_TICKET_LEAK_CHECK';
+    const res = await fetch(`${s.base}/api/forward-auth`, {
+      headers: {
+        'x-forwarded-host': 'alice-p-proj1-4000.fde.localhost',
+        'x-forwarded-uri': `/?preview_ticket=${secret}&extra=1`,
+      },
+    });
+    assert.equal(res.status, 404); // 无真实 allocation → deny；审计仍写入
+    const auditRow = pool.audit.find((a) => a.action === 'auth.forward_auth');
+    assert.ok(auditRow, 'forward-auth 审计已写入');
+    const details = JSON.parse(auditRow.details);
+    assert.equal(details.uri, '/', '审计只记 path，剥离所有 query');
+    assert.ok(!details.uri.includes('preview_ticket'), '不含 preview_ticket');
+    assert.ok(!JSON.stringify(auditRow).includes(secret), '审计不含 ticket 明文');
+  } finally {
+    await s.close();
+  }
+});

@@ -14,8 +14,10 @@ import {
   ensureFdeContainer,
   fdeContainerIp,
   reconcileOnce,
+  deprovisionFde,
   DOCKER_ALLOWED_PATHS,
 } from '../src/provisioner.js';
+import { hashToken } from '../src/auth.js';
 
 function listen(server) {
   return new Promise((res) => server.listen(0, '127.0.0.1', res));
@@ -85,8 +87,8 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.equal(body.User, '1001:1000'); // 镜像无双 UID 用户 → --user 兜底
   assert.equal(body.Labels['station.managed'], 'true');
   assert.equal(body.Labels['fde.name'], 'alice');
-  // 不变式一：不 publish 端口
-  assert.deepEqual(body.HostConfig.PortBindings, {});
+  // 不变式一：不 publish 端口（proxy P1 字段级 allowlist 拒绝任何 PortBindings 字段）
+  assert.equal('PortBindings' in body.HostConfig, false);
   // bind mount 只允许本 FDE 用户空间（user-space §2.4）
   assert.deepEqual(body.HostConfig.Binds, [
     '/srv/erix/users/alice/home:/home/erix',
@@ -96,18 +98,21 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   ]);
   // 只接自己的 /29
   assert.equal(body.HostConfig.NetworkMode, 'fde-alice');
-  assert.equal(body.NetworkingConfig.EndpointsConfig['fde-alice'].IPAMConfig.IPv4Address, '10.200.1.2');
+  // R2：不再携带 NetworkingConfig（--ip 已移除，默认 IPAM 顺序分配固定位 .2）
+  assert.equal('NetworkingConfig' in body, false);
   assert.equal(body.HostConfig.Memory, 512 * 1024 * 1024);
   assert.deepEqual(body.HostConfig.CapDrop, ['ALL']);
   assert.deepEqual(body.HostConfig.SecurityOpt, ['no-new-privileges']);
   assert.equal(body.HostConfig.Init, true);
-  assert.deepEqual(body.HostConfig.ExtraHosts, ['station.localhost:10.200.1.1', 'llm.localhost:10.200.1.1']);
+  // R5：不再携带 ExtraHosts（--add-host 已移除）
+  assert.equal('ExtraHosts' in body.HostConfig, false);
 });
 
 test('buildNetworkConfig：显式 subnet + gateway', () => {
   const body = buildNetworkConfig({ name: 'fde-alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1', fdeName: 'alice' });
   assert.equal(body.Name, 'fde-alice');
-  assert.equal(body.CheckDuplicate, true);
+  // R2：不再携带 CheckDuplicate（proxy 网络创建白名单只允许 Name/Driver/IPAM/Labels）
+  assert.equal('CheckDuplicate' in body, false);
   assert.deepEqual(body.IPAM.Config, [{ Subnet: '10.200.1.0/29', Gateway: '10.200.1.1' }]);
   assert.equal(body.Labels['station.managed'], 'true');
 });
@@ -178,9 +183,9 @@ test('Docker API 调用序列（fake server）：建网络 + 建容器 + 启动'
         'POST /containers/cid1/start',
       ],
     );
-    // create body 必须无端口发布
+    // create body 必须无端口发布字段（proxy P1 拒绝任何 PortBindings 字段）
     const createCall = calls.find((c) => c.path.startsWith('/containers/create'));
-    assert.deepEqual(createCall.body.HostConfig.PortBindings, {});
+    assert.equal('PortBindings' in createCall.body.HostConfig, false);
     assert.ok(createCall.body.Env.some((e) => e.startsWith('ERIX_STATION_TOKEN=')), '容器 env 注入 per-container token');
     assert.ok(createCall.body.Env.some((e) => e === 'ERIX_FDE_NAME=alice'));
   } finally {
@@ -191,6 +196,7 @@ test('Docker API 调用序列（fake server）：建网络 + 建容器 + 启动'
 test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 → 删除 + 审计', async () => {
   const pool = {
     audit: [],
+    containerUpserts: [],
     async query(sql, params = []) {
       if (sql.includes('FROM users u') && sql.includes('JOIN fde_networks n')) {
         return {
@@ -201,12 +207,22 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
               subnet: '10.200.1.0/29',
               gateway: '10.200.1.1',
               network_name: 'fde-alice',
-              container_id: 'c1',
+              container_id: null,
               container_name: 'fde-alice',
-              container_status: 'creating',
+              container_status: null,
+              runner_token_hash: null,
             },
           ],
         };
+      }
+      // F10：锁内重新确认仍是 desired
+      if (sql.includes('SELECT 1 FROM fde_networks WHERE fde_id')) {
+        return { rows: [{ '?column?': 1 }] };
+      }
+      // F8：对账创建容器时同步 upsert containers 行（含 token hash）
+      if (sql.includes('INSERT INTO containers') && sql.includes('ON CONFLICT (fde_name)')) {
+        this.containerUpserts.push({ user_id: params[0], fde_name: params[1], token_hash: params[3] });
+        return { rows: [] };
       }
       if (sql.includes('INSERT INTO audit_log')) {
         // provisioner 的 SQL 把 action 作为字面量（'container.orphan_removed'），target/details 为参数。
@@ -256,13 +272,15 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
     },
   };
   const config = {
-    userSpaceRoot: '/tmp/erix-users-test',
+    userSpaceRoot: '/srv/erix/users',
+    userSpaceRootHost: '/tmp/erix-users-test',
     fdeUid: 1000,
     fdeGid: 1000,
     fdeImage: 'traefik/whoami',
     fdeCmd: ['-port', '4000'],
     fdeMemoryLimit: '512m',
-    agentdUid: 1001,
+    fdeAgentVersion: 'dev',
+    fdeDevUser: '1001:1000',
     baseDomain: 'localhost',
     llmHost: 'llm.localhost',
   };
@@ -272,6 +290,10 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
   assert.ok(calls.includes('createContainer'), '重建缺失容器');
   assert.ok(calls.includes('removeContainer:fde-bob'), '删除孤儿容器');
   assert.ok(pool.audit.some((a) => a.action === 'container.orphan_removed' && a.target === 'fde-bob'));
+  // F8：重建时同步 upsert containers 行（含 token hash）
+  assert.equal(pool.containerUpserts.length, 1);
+  assert.ok(pool.containerUpserts[0].token_hash, 'upsert 含 runner_token_hash');
+  assert.equal(pool.containerUpserts[0].fde_name, 'alice');
 });
 
 test('DOCKER_ALLOWED_PATHS 白名单表只含 containers/networks 生命周期（不含 exec/images/system）', () => {
@@ -279,4 +301,210 @@ test('DOCKER_ALLOWED_PATHS 白名单表只含 containers/networks 生命周期�
   assert.ok(paths.some((p) => p.includes('containers/create')));
   assert.ok(paths.some((p) => p.includes('networks/create')));
   assert.ok(!paths.some((p) => p.includes('exec') || p.includes('images') || p.includes('system') || p.includes('volumes')));
+});
+
+test('F6：create 成功 + DB update 失败 → 重试重建后容器 env token 与 DB hash 一致', async () => {
+  let dbTokenHash = null; // 模拟 containers.runner_token_hash（DB 真相）
+  let upsertFailures = 1; // 首次 upsert 抛错（模拟 create 成功后 DB 写失败）
+  const pool = {
+    async query(sql, params = []) {
+      if (sql.includes('FROM users u') && sql.includes('JOIN fde_networks n')) {
+        return {
+          rows: [{
+            user_id: 'u1', fde_name: 'alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1',
+            network_name: 'fde-alice', container_id: dbTokenHash ? 'c1' : null,
+            container_name: 'fde-alice', container_status: 'running', runner_token_hash: dbTokenHash,
+          }],
+        };
+      }
+      if (sql.includes('SELECT 1 FROM fde_networks WHERE fde_id')) return { rows: [{ '?column?': 1 }] };
+      if (sql.includes('INSERT INTO containers') && sql.includes('ON CONFLICT (fde_name)')) {
+        if (upsertFailures > 0) { upsertFailures -= 1; throw new Error('simulated DB update failure after create'); }
+        dbTokenHash = params[3];
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+    async connect() { throw new Error('no real pool in unit test'); },
+    async end() {},
+  };
+
+  let containerEnvToken = null;
+  const docker = {
+    async inspectNetwork() { return { status: 404, data: null }; },
+    async createNetwork() { return { status: 201, data: { Id: 'nid' } }; },
+    async inspectContainer() {
+      if (containerEnvToken === null) return { status: 404, data: null };
+      return { status: 200, data: { Id: 'cid', State: { Status: 'running' }, Config: { Env: [`ERIX_STATION_TOKEN=${containerEnvToken}`, 'ERIX_FDE_NAME=alice'] } } };
+    },
+    async createContainer(body) {
+      const line = body.Env.find((e) => e.startsWith('ERIX_STATION_TOKEN='));
+      containerEnvToken = line.split('=')[1];
+      return { status: 201, data: { Id: 'cid' } };
+    },
+    async startContainer() { return { status: 204 }; },
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer() { containerEnvToken = null; return { ok: true, stopped: true, removed: true }; },
+    async listContainers() { return { status: 200, data: [] }; },
+  };
+  const config = {
+    userSpaceRoot: '/srv/erix/users',
+    userSpaceRootHost: '/tmp/erix-users-f6',
+    fdeUid: 1000, fdeGid: 1000, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
+    fdeMemoryLimit: '512m', fdeAgentVersion: 'dev', fdeDevUser: '1001:1000',
+    baseDomain: 'localhost', llmHost: 'llm.localhost',
+  };
+
+  // 第 1 轮：create 成功，但 DB upsert 抛错（token 未入 DB）→ 容器 env 有 token、DB 无 token。
+  const s1 = await reconcileOnce(pool, config, { docker });
+  assert.equal(s1.rebuilt, 0, '第 1 轮 upsert 失败不应计入 rebuilt（异常被捕获）');
+  assert.notEqual(containerEnvToken, null);
+  assert.equal(dbTokenHash, null, '模拟 DB 写失败后 runner_token_hash 仍未写入');
+
+  // 第 2 轮：检测到 DB token 缺失/失配 → 重建，upsert 成功 → env token 与 DB hash 一致。
+  const s2 = await reconcileOnce(pool, config, { docker });
+  assert.equal(s2.rebuilt, 1, '第 2 轮应重建');
+  assert.ok(containerEnvToken, '重建后容器有 env token');
+  assert.equal(dbTokenHash, hashToken(containerEnvToken), 'DB hash 与容器 env token 一致');
+});
+
+test('F7：reconcile 幂等——两轮后第二轮不重建（同一容器）', async () => {
+  let dbTokenHash = null;
+  const pool = {
+    async query(sql, params = []) {
+      if (sql.includes('FROM users u') && sql.includes('JOIN fde_networks n')) {
+        return {
+          rows: [{
+            user_id: 'u1', fde_name: 'alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1',
+            network_name: 'fde-alice', container_id: dbTokenHash ? 'c1' : null,
+            container_name: 'fde-alice', container_status: 'running', runner_token_hash: dbTokenHash,
+          }],
+        };
+      }
+      if (sql.includes('SELECT 1 FROM fde_networks WHERE fde_id')) return { rows: [{ '?column?': 1 }] };
+      if (sql.includes('INSERT INTO containers') && sql.includes('ON CONFLICT (fde_name)')) {
+        dbTokenHash = params[3];
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+    async connect() { throw new Error('no real pool'); },
+    async end() {},
+  };
+  let containerEnvToken = null;
+  let createCount = 0;
+  const docker = {
+    async inspectNetwork() { return { status: 404, data: null }; },
+    async createNetwork() { return { status: 201, data: { Id: 'nid' } }; },
+    async inspectContainer() {
+      if (containerEnvToken === null) return { status: 404, data: null };
+      return { status: 200, data: { Id: 'cid', State: { Status: 'running' }, Config: { Env: [`ERIX_STATION_TOKEN=${containerEnvToken}`] } } };
+    },
+    async createContainer(body) {
+      createCount += 1;
+      containerEnvToken = body.Env.find((e) => e.startsWith('ERIX_STATION_TOKEN=')).split('=')[1];
+      return { status: 201, data: { Id: 'cid' } };
+    },
+    async startContainer() { return { status: 204 }; },
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer() { containerEnvToken = null; return { ok: true, stopped: true, removed: true }; },
+    async listContainers() { return { status: 200, data: [] }; },
+  };
+  const config = {
+    userSpaceRoot: '/srv/erix/users', userSpaceRootHost: '/tmp/erix-users-f7',
+    fdeUid: 1000, fdeGid: 1000, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
+    fdeMemoryLimit: '512m', fdeAgentVersion: 'dev', fdeDevUser: '1001:1000',
+    baseDomain: 'localhost', llmHost: 'llm.localhost',
+  };
+  const s1 = await reconcileOnce(pool, config, { docker });
+  assert.equal(s1.rebuilt, 1);
+  assert.equal(createCount, 1);
+  const s2 = await reconcileOnce(pool, config, { docker });
+  assert.equal(s2.rebuilt, 0, '第二轮 token 一致 → 不重建');
+  assert.equal(createCount, 1, '同一容器，不重复创建');
+  assert.equal(dbTokenHash, hashToken(containerEnvToken));
+});
+
+test('F11：ensureFdeNetwork inspect 200 但 managed/subnet/gateway 失配 → 报错（不静默采用）', async () => {
+  const docker = {
+    async inspectNetwork() {
+      return { status: 200, data: { Id: 'nid', Labels: {}, IPAM: { Config: [{ Subnet: '10.200.9.0/29', Gateway: '10.200.9.1' }] } } };
+    },
+  };
+  await assert.rejects(
+    () => ensureFdeNetwork(docker, { name: 'fde-alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1', fdeName: 'alice' }),
+    /mismatches contract/,
+  );
+});
+
+test('P4：ensureFdeNetwork inspect 200 但 fde.name label 失配 → 报错；409 分支 re-inspect 同样校验', async () => {
+  // inspect 200 但 fde.name 不一致
+  const dockerBad = {
+    async inspectNetwork() {
+      return { status: 200, data: { Id: 'nid', Labels: { 'station.managed': 'true', 'fde.name': 'bob' }, IPAM: { Config: [{ Subnet: '10.200.1.0/29', Gateway: '10.200.1.1' }] } } };
+    },
+  };
+  await assert.rejects(
+    () => ensureFdeNetwork(dockerBad, { name: 'fde-alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1', fdeName: 'alice' }),
+    /mismatches contract/,
+  );
+
+  // 409 后 re-inspect 仍失配 → 报错
+  let createCalled = false;
+  const docker409 = {
+    async inspectNetwork(name) {
+      if (!createCalled) return { status: 404, data: null };
+      return { status: 200, data: { Id: 'nid2', Labels: { 'station.managed': 'true', 'fde.name': 'bob' }, IPAM: { Config: [{ Subnet: '10.200.1.0/29', Gateway: '10.200.1.1' }] } } };
+    },
+    async createNetwork() {
+      createCalled = true;
+      return { status: 409, data: null };
+    },
+  };
+  await assert.rejects(
+    () => ensureFdeNetwork(docker409, { name: 'fde-alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1', fdeName: 'alice' }),
+    /mismatches contract/,
+  );
+
+  // 409 后 re-inspect 通过 → 视为已存在
+  let createCalledOk = false;
+  const dockerOk = {
+    async inspectNetwork(name) {
+      if (name === 'fde-alice' && createCalledOk) {
+        return { status: 200, data: { Id: 'nid3', Labels: { 'station.managed': 'true', 'fde.name': 'alice' }, IPAM: { Config: [{ Subnet: '10.200.1.0/29', Gateway: '10.200.1.1' }] } } };
+      }
+      return { status: 404, data: null };
+    },
+    async createNetwork() {
+      createCalledOk = true;
+      return { status: 409, data: null };
+    },
+  };
+  const r = await ensureFdeNetwork(dockerOk, { name: 'fde-alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1', fdeName: 'alice' });
+  assert.equal(r.created, false);
+  assert.equal(r.id, 'nid3');
+});
+
+test('F9：deprovision 容器删除失败 → 不标 removed（保留 desired state）+ 抛错供重试', async () => {
+  const calls = [];
+  const pool = {
+    async query(sql, params = []) {
+      calls.push(sql.split(' ').slice(0, 3).join(' '));
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      return { rows: [] };
+    },
+    async connect() { throw new Error('no real pool'); },
+    async end() {},
+  };
+  const docker = {
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer() { return { status: 500 }; }, // 删除失败
+    async removeNetwork() { return { ok: true, removed: true }; },
+  };
+  await assert.rejects(
+    () => deprovisionFde(pool, {}, { fdeName: 'alice', docker }),
+    /container removal failed/,
+  );
+  assert.ok(!calls.some((c) => c.includes('UPDATE containers SET status')), '容器删除失败不得标 removed');
+  assert.ok(!calls.some((c) => c.includes('UPDATE fde_networks SET state')), '网络状态不得 released');
 });
