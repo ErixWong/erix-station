@@ -32,9 +32,9 @@
 | `station-db` | `DB_IMAGE`（官方 `postgres:16`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
 | `station-docker-socket-proxy` | `SOCKET_PROXY_IMAGE`（`tecnativa/docker-socket-proxy`） | digest pin（env §10 ⚠️） | 官方默认入口 | 官方默认（非 root 或受 `no-new-privileges` 约束，见 §5） | `unless-stopped` | P1 ✅ |
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
-| `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `tini -- station-agentd`（`docker run --init` + entrypoint exec agentd，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
+| `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
 
-> **镜像预拉取**：portal **不授 IMAGES**（socket-proxy 白名单仅 CONTAINERS/NETWORKS/VOLUMES，§5）。FDE 镜像由**宿主在部署时 `docker pull`** 预拉取（版本 pin 走 `containers.agent_version` + canary，规格 §14）；镜像升级 = 宿主预拉新 digest + 重建容器，不经过 portal 的 Docker API。
+> **镜像预拉取**：portal **不授 IMAGES**（socket-proxy 白名单仅 CONTAINERS/NETWORKS，§5）。FDE 镜像由**宿主在部署时 `docker pull`** 预拉取（版本 pin 走 `containers.agent_version` + canary，规格 §14）；镜像升级 = 宿主预拉新 digest + 重建容器，不经过 portal 的 Docker API。
 >
 > **LLM 网关（P3，不入 P1 compose）的字段契约**：`llm-gateway` 接 `backend` 网络，**数据面 publish 仅 `127.0.0.1:4000`（回环，供 Traefik `llm.<base>` 路由回环访问）；admin 面不发布**（仅 `backend` 内可达，topology §6 第 6 条 / env §5）。Q1（公司是否已有网关）未定 → 已有则复用、不部署本容器；没有则 P3 起一个 LiteLLM 容器，portal 仍只做租户绑定（规格 §11.3）。
 
@@ -59,9 +59,9 @@
 | 服务 | network | publish | volumes（宿主源 → 容器目标，权限） | depends_on | healthcheck | env_file |
 |---|---|---|---|---|---|---|
 | `station-db` | `backend` | **无**（仅 backend 内可达） | `/docker/station-db/` → `/var/lib/postgresql/data`（RW，属主由 postgres 镜像初始化） | — | `pg_isready`（见下） | `/docker/station-db/.env.db`（600） |
-| `station-portal` | `backend` | **`127.0.0.1:8080:8080`**（回环，供 Traefik 反代 + forwardAuth） | ① `/srv/erix/users` → `/srv/erix/users`（RW，**同路径**，materializer 直写用户空间，user-space §2.2）；② `/docker/station-edge` → `/docker/station-edge`（RW，写 Traefik 动态配置 600 + 防火墙规则 600）。portal 自身无持久卷（状态在 DB） | `station-db`（`condition: service_healthy`）+ `station-docker-socket-proxy`（`condition: service_started`） | `station-portal healthcheck`（见下） | `/docker/station-portal/.env.portal`（600） |
-| `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1 NETWORKS=1 VOLUMES=1`，其余 0，见 §5） |
-| `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `/docker/station-edge/traefik.yml` → `/etc/traefik/traefik.yml`（RO）；② `/docker/station-edge/dynamic/` → `/etc/traefik/dynamic/`（RO）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，仅 Traefik 写）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW） | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**） |
+| `station-portal` | `backend` | **`127.0.0.1:8080:8080`**（回环，供 Traefik 反代 + forwardAuth） | ① `/srv/erix/users` → `/srv/erix/users`（RW，**同路径**，materializer 直写用户空间，user-space §2.2）；② `/docker/station-edge/dynamic/` → `/docker/station-edge/dynamic/`（RW，600 文件，**单一写方**，reconciler 写 Traefik 动态配置）；③ `/docker/station-edge/firewall/` → `/docker/station-edge/firewall/`（RW，600，reconciler 写 `rules.v4`）。**不挂整个 `/docker/station-edge`**（Traefik 静态配置 / `acme.json` / `logs/` 不挂给 portal）。portal 自身无持久卷（状态在 DB） | `station-db`（`condition: service_healthy`）+ `station-docker-socket-proxy`（`condition: service_started`） | `station-portal healthcheck`（见下） | `/docker/station-portal/.env.portal`（600） |
+| `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1 NETWORKS=1`，其余 0，见 §5） |
+| `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `/docker/station-edge/traefik.yml` → `/etc/traefik/traefik.yml`（RO）；② `/docker/station-edge/dynamic/` → `/etc/traefik/dynamic/`（RO，**与 portal 共享宿主目录、Traefik 侧只读**）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，**仅 Traefik 读写、不挂给 portal**）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW，**仅 Traefik、不挂给 portal**） | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**） |
 
 ### 2.3 healthcheck 命令与阈值（写死）
 
@@ -86,7 +86,7 @@
 
 ### 3.1 谁执行、怎么幂等
 
-- **baseline = [`../data/schema.sql`](../data/schema.sql)**（可执行建表 DDL，单事务 `BEGIN;…COMMIT;`，`psql -f` 空库实测可执行）。
+- **baseline = [`../data/schema.sql`](../data/schema.sql)**（可执行建表 DDL，单事务 `BEGIN;…COMMIT;`，**自包含**：开头幂等创建 `station_platform` / `station_portal` 两个角色，空库 `psql -f` 可单独执行，不依赖 bootstrap）。
 - **migration runner**：portal 在**启动时、监听端口之前**先跑迁移（或用独立一次性 `station-migrate` 命令，实现任选，语义一致）。迁移角色 `station_platform`（DDL），运行时角色 `station_portal`（DML 最小 GRANT）。
 - **幂等**：新增 `schema_migrations` 表（`version text PK, checksum text, applied_at timestamptz DEFAULT now()`）。每个迁移文件在**单事务**内执行，成功后插入 `schema_migrations` 行；已存在的 `version` 跳过。`schema.sql` 作为 `version='0000_baseline'` 只在空库首次应用（已有 `schema_migrations` 则不再重放 baseline）。
 - **顺序**：baseline → `deploy/migrations/0001-*.sql` → `0002-*.sql` …（文件名编号升序）。每次新增 DDL 都写成新编号迁移文件，**不修改已应用的迁移**（改历史迁移会破坏 checksum 一致性）。
@@ -100,7 +100,8 @@
 
 ### 3.3 `docs/data/schema.sql` 的应用方式
 
-- **空库**：runner 以 `station_platform` 角色执行 `psql -f docs/data/schema.sql`（等价单事务 baseline），记录 `0000_baseline`。
+- **空库**：可直接以超级用户（POSTGRES_USER）执行 `psql -f docs/data/schema.sql`（自包含：开头幂等创建角色 → 建表 → 落 `0000_baseline` → 授最小 DML GRANT），记录 `0000_baseline`。
+- **生产**：迁移 runner 以 `station_platform` 角色执行 `psql -f docs/data/schema.sql`（等价单事务 baseline）；随后（或按需）以超级用户执行 `docs/data/bootstrap.sql` 做环境特有附加初始化（schema 级授权、口令、ownership 等，可重复执行）。
 - **已有库**：不重放 baseline；只按 `deploy/migrations/` 顺序补增量。
 - schema.sql 由文档→`deploy/` 的**生成/拷贝步骤**保持同步（schema.sql 是真相，`deploy/` 的 baseline 副本是部署产物；若将来拆分，以 `docs/data/schema.sql` 为准）。
 
@@ -127,7 +128,8 @@
 
 - 目录：宿主 `/docker/station-edge/dynamic/`（600 文件），容器内 `/etc/traefik/dynamic/`（RO）。
 - **单一写方**：portal（reconciler）生成整份动态配置 → 临时文件 → schema 校验 → `mv` 原子替换 → file provider reload；失败保留上一版文件（topology §8）。
-- 动态配置内容（P1 最小集）：portal 路由 + internal 路由（`Host(station.<base>) && PathPrefix(/api/internal)` + `ipAllowList` 由 `fde_networks` 精确派生）+ `fde-auth` forwardAuth 中间件（P2）+ LLM 注入路由（P3）。**P1 不含预览路由、不含 LLM 路由**（§7）。
+- **写边界（B5）**：portal 只 RW `dynamic/` 与 `firewall/` 两个子目录；`traefik.yml`（静态）、`acme.json`、`logs/` **不挂给 portal**（§2.2）。Traefik 对 `dynamic/` 只读、对 `acme.json` 单独 RW（600，仅 Traefik）、对 `logs/` RW（仅 Traefik）。
+- 动态配置内容（P1 最小集）：portal 路由 + internal 路由（`Host(station.<base>) && PathPrefix(/api/internal)` + `ipAllowList` 由 `fde_networks` 精确派生）+ `fde-auth` forwardAuth 中间件（P2）。**P1 不含预览路由、不含真实 LLM 注入路由**（§7）；仅 P1 开发期可**可选启用** dev-only LLM mock 路由（`llm.<base>` → 回环 mock，§7.3 选项 1，零真实凭据）。
 - 每 allocation 一条 router+service（否决单通配 service，topology §5）；hub service `responseForwarding.flushInterval ≤ 100ms`（P3 流式）。
 
 ### 4.3 证书/ACME 存储与权限
@@ -185,7 +187,7 @@
 |---|---|
 | 镜像 | `SOCKET_PROXY_IMAGE` = `tecnativa/docker-socket-proxy`（digest pin，env §10 ⚠️） |
 | 挂载 | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） |
-| API 白名单 | `CONTAINERS=1`、`NETWORKS=1`、`VOLUMES=1`，**其余全 0**（`IMAGES/EXEC/SYSTEM/AUTH/SECRETS/BUILD/COMMIT/PLUGINS/SWARM/INFO/…`） |
+| API 白名单 | `CONTAINERS=1`、`NETWORKS=1`，**其余全 0**（`IMAGES/EXEC/SYSTEM/AUTH/SECRETS/BUILD/COMMIT/PLUGINS/SWARM/INFO/VOLUMES/…`） |
 | 加固 | `--security-opt no-new-privileges`；官方默认非特权运行；不 publish、仅 `backend` 网络 |
 | portal 连接 | `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` |
 
@@ -193,11 +195,21 @@
 
 - `CONTAINERS`：FDE 容器生命周期（create/start/stop/rm/inspect/ps）——portal 核心职责。
 - `NETWORKS`：FDE 网络生命周期（`network create --subnet` / inspect / ls / rm），onboarding/offboarding。
-- `VOLUMES`：卷观察（inspect/ls），配合绑定挂载的运维对账（env §6 已定清单）。
+- **删除 `VOLUMES`**：portal 用 **bind mount** 而非 docker volume（user-space §2.2 的四条宿主路径），不需要 `VOLUMES` API（`inspect/ls` 卷观察无必要、且多一个被攻破后可枚举宿主卷的面）。
 - **不授 `IMAGES`**：FDE 镜像由宿主部署时预拉取（§1），portal 不需要、也不应能拉任意镜像（防被攻破后拉恶意镜像）。
 - **不授 `EXEC`**：portal 被攻破后 `docker exec` 进任意容器 = 跨信任边界提权（违反不变式一）。
 - **不授 `SYSTEM`/`AUTH`/`SECRETS`**：防读宿主 docker 配置/凭据/secret。
 - **不授 `BUILD`/`COMMIT`**：防镜像篡改/逃逸面。
+
+> **参数级约束（B6：`CONTAINERS=1` 本身不等于「只能创建规定 FDE 容器」）**：真正的最小面不是 socket-proxy 的 API 白名单，而是 portal 在 `POST /containers/create` **之前**强制校验的**创建字段 allowlist（provisioning broker）**——
+>
+> - **镜像**：只允许**预拉取的 `FDE_IMAGE` digest**（`image@sha256:…`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
+> - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
+> - **bind mount**：白名单 = `USER_SPACE_ROOT/<fde>/{home,projects,worktrees,cache}` 四条宿主源（user-space §2.4 / §6.4）；拒绝其它宿主路径（尤其 `/var/run/docker.sock`、`/docker/**`、`/`）。
+> - **禁止项（硬拒绝）**：`--privileged`、`--pid=host`、`--network=host`、`--device`、`--cap-add` 超出 §6.2 白名单、`--security-opt` 以外的任意 security 选项、`--publish`（`-p`）。
+> - **`--ip`**：只允许该 FDE `/29`（或 `/28`）内的固定位（`.2`）；其它 IP 拒绝。
+>
+> **被攻破时的爆炸半径**：portal 被攻破后，攻击者经 socket-proxy **至多**能「在已授权 FDE 位点用 `FDE_IMAGE` digest 起一个满足 allowlist 的容器」——即**该 FDE 自己的 /29 内的资源滥用 + 可读该 FDE 的 bind mount**；**不能**拉任意镜像、`exec` 进其它容器、publish 端口、挂 `docker.sock`、`privileged`/host PID/host network 逃逸宿主、改其它网络/卷。**跨 FDE 与宿主逃逸被 allowlist 挡住**；纵向提权（`EXEC`/`SYSTEM`/`AUTH`/`SECRETS`）被 socket-proxy 白名单挡住。残余风险 = 单个被攻破 FDE 的数据面（原理四：FDE 自损本就接受，见 runner §11.3）。
 
 > FDE 容器**永不挂 `docker.sock`、也访问不到 socket-proxy**（FDE 只接自己的 `/29`，不在 `backend`）。
 
@@ -221,14 +233,18 @@
 | `--network` | `fde-<name>`（**只接自己的 `/29`**，不接 backend/control） | topology §2.2 D-1 |
 | `--ip` | `<gateway> + 1`（= `.2`，FDE 主容器固定位；Traefik 预览/LLM 后端用 `10.200.<n>.2:<port>`） | topology §3 / §4-L2 |
 | `--add-host` | `station.<base>:<gateway>` + `llm.<base>:<gateway>`（**两条**，映射到本 FDE bridge 网关 `.1`；容器内解析不走 DNS） | env §0/§1，topology §4-L3 |
-| `--init` | `true`（tini 作 PID 1，reap + 信号转发） | runner §2.3 方案 (a) |
+| `--init` | `true`（docker 内置 tini 作 PID 1，reap + 信号转发；**entrypoint 不再重复 `tini --`**，避免双重 init） | runner §2.3 方案 (a) |
 | `--restart` | `unless-stopped` | 规格 §14 |
-| entrypoint/command | `tini -- station-agentd` | runner §2.3 |
+| entrypoint/command | `station-agentd`（**直接** exec；`--init` 的 tini 已是 PID 1，agentd 为 PID 2） | runner §2.3 |
 | env | `ERIX_STATION_TOKEN`（per-container token，建容器时生成、**仅存哈希入 DB**、原文注入容器 env，runner §4.4）；`ERIX_STATION_BASE_URL=https://station.<base>/api/internal`；`ERIX_FDE_NAME=<name>` | runner §4.1 |
 | `--security-opt` | `no-new-privileges` | topology §6.2 |
-| `--cap-drop` / `--cap-add` | `--cap-drop ALL`，回加运行必需最小集（`SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE`/`FOWNER`，供 root 启动后 drop 到 1001、fork worker 切 1002、chown 工作区）；**不授 `NET_ADMIN`/`SYS_ADMIN`/`SYS_PTRACE`** | topology §6.2 / runner §11.3 |
+| `--cap-drop` / `--cap-add` | `--cap-drop ALL`，回加运行必需最小集（`SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`CAP_KILL`）：前五项供 root 启动后 drop 到 1001、fork worker 切 1002、chown 工作区；**`CAP_KILL` 供 agentd（UID 1001）在 lease lost / stop 时对 worker（UID 1002，不同 UID）发 `SIGTERM`/`SIGKILL`**（跨 UID `kill(2)` 需 `CAP_KILL`，runner §2.4/§6.4/§6.5）。**不授 `NET_ADMIN`/`SYS_ADMIN`/`SYS_PTRACE`** | topology §6.2 / runner §11.3 |
 | seccomp/AppArmor | 保持默认 profile | topology §6.2 |
 | 资源限额 | `--memory` 等由 portal 经 Docker API 设置（规格 §14；具体数值 ⚠️ 按 FDE 规模定） | 规格 §14 |
+
+> **PID 1 / 信号 / 僵尸回收（B12 定案：单一 init，不双重 init）**：`--init=true` 由 docker 注入 tini 作 PID 1，entrypoint/command 直接 `station-agentd`（PID 2）。stop/restart 行为：`docker stop` 对 tini 发 `SIGTERM` → tini 转发给 agentd → agentd 对在跑 worker `SIGTERM`（5s 宽限）→ `SIGKILL`（runner §2.4）；`unless-stopped` 下 agentd 崩 → 容器退出 → docker 拉起。**僵尸回收验证（smoke test，testing.md §3.8）**：`docker exec fde-<name> ps -ef` 断言无 `<defunct>`（dev server 退出由 tini reap，不留 zombie）。
+>
+> **`CAP_KILL` 与 `no-new-privileges`（B7）**：容器以 root 启动、随后 drop 到 UID 1001；`setuid(1001)` 默认会清空 effective/permitted capability，故 agentd 在 drop 前须 `prctl(PR_SET_KEEPCAPS, 1)`，drop 后再 `capset()` 把 effective 集收敛为仅 `CAP_KILL`（如还需）——否则跨 UID kill worker 会 `EPERM`。`no-new-privileges` **不禁止**该机制（`PR_SET_KEEPCAPS` 只保留 bounding set 内已授能力、非提权）；若实现不保留 `CAP_KILL`，则须改同 UID / supervisor 模型（runner §11.3 备选）。跨 UID signal 的 smoke test 见 testing.md §3.8。
 
 ### 6.3 UID/GID（引用 user-space §6.1）
 
@@ -274,9 +290,20 @@
 | **run 级端口块 + 事件重放 UI** | P2 | 只做项目级单端口（规格 §8.2）；run 级端口分配/URL 带 runId 不启用 |
 | **工具审批** | P2 | **完全不部署**审批单/审批 UI/审批中转（tools 直接执行；judge 拦截链 P2 再接，runner §10 端点 P2 才启用） |
 | **SSO / OIDC** | P2 | **不部署** OIDC（P1 恒 `auth_source=local`，env §4/portal §2.1） |
-| **LLM 网关（模式 C）+ 用量记账 + code-server 模板** | P3 | **完全不部署** `llm-gateway` 容器、不实现 Traefik LLM 注入路由。P1 对话所需的 LLM 走**开发期临时直连**：portal 物化的 `config.json` baseURL/key 在 P1 指向开发机可达的 LLM endpoint（`LLM_DEV_BASE_URL` + `LLM_DEV_API_KEY` 经 portal env 注入，**仅限 P1 开发机、不进目标环境**）——⚠️ 这是对「容器零 LLM 凭据」红线（topology D-4）的 **P1 开发期临时豁免**，P3 模式 C 落地后废除 |
+| **LLM 网关（模式 C）+ 用量记账 + code-server 模板** | P3 | **不部署真实 LLM 网关、不写真实虚拟 key**。P1 对话验收用**无真实凭据的 OpenAI-compatible mock/test gateway**（dev-only helper，见 §7.3），容器仍只持占位 key + `baseURL`（topology D-4 红线**无豁免**）；真实 LLM 网关（LiteLLM）+ 用量记账 + code-server 模板归 P3 |
 | **通知通道**（邮件/IM webhook） | P2+ | 不部署；告警**状态**（`failed`+code）P1 落库可查（规格 §14 / user-space §7.3） |
 | **备份/高可用** | 系统级方案（issue #3） | 不部署；平台只保证数据落卷、DB 处于可被系统级备份的形态（规格 §14） |
+
+### 7.3 P1 对话验收的 LLM mock 网关（dev-only，零真实凭据）
+
+> 红线（topology D-4 / 规格 §11.4）：容器内**零真实 LLM 凭据**——P1 **也不例外**。已删除「`LLM_DEV_BASE_URL` + `LLM_DEV_API_KEY` 注入容器」的临时豁免路径：**任何真实 LLM key 都不经 portal env 注入、不进 `config.json`、不进容器 env/镜像**。
+
+- **mock 网关是什么**：本地运行的 **OpenAI-compatible `/v1/chat/completions` mock**（返回 canned/流式 SSE 响应、可注入 `429 rate_limited` 或错误码以测错误映射，testing.md §3.9），**不含任何真实 LLM key、不访问任何上游 LLM**。
+- **部署位置（dev-only helper）**：宿主机 `127.0.0.1:4000` 回环进程或独立 dev 容器；**不进 P1 目标 compose、不进生产**（P3 由真实 `llm-gateway` 占据该回环端口，env §5）。P1 验收时由开发者手动拉起。
+- **如何满足「经 Traefik 注入」链路（二选一）**：
+  1. **完整演练注入链（推荐）**：P1 开发期**可选启用** `llm.<base>` 路由（与 P3 同形态：`Host(llm.<base>) && ClientIP(<该 FDE 精确 subnet>)` → headers middleware 覆盖 `Authorization` → service 回环 `127.0.0.1:4000`），但注入的是 **mock 哨兵值**（如 `Authorization: Bearer erix-mock`，非真实 key，mock 只校验/忽略该值）；容器 `--add-host llm.<base>:<本 FDE 网关 IP>`、`config.json` 占位 key + `baseURL=https://llm.<base>/v1` 与 P3 **完全一致**。这样 P1 即演练「ClientIP 判身份 → 覆盖伪造 Authorization → 回环到网关」的完整链路，**全程零真实凭据**。
+  2. **mock 模式简化（⚠️ 待决策者确认）**：P1 不启用 `llm.<base>` 注入路由，`config.json` 的 `baseURL` 直接指向 mock 回环（容器经 `--add-host` 映射宿主 mock 地址）+ 占位 key。此简化不演练注入链，但**仍满足零真实凭据红线**（占位 key + mock，无真实 key）。生产/P3 一律回到选项 1 的完整链。
+- **红线不变**：无论哪个选项，容器 env/文件/镜像里**绝不出现**任何真实 LLM key（`LLM_DEV_API_KEY` 一类变量**删除**）；mock 网关自身也不持有真实 LLM key。凡「P1 开发期临时豁免」的表述一律作废。
 
 ---
 

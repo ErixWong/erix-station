@@ -280,7 +280,7 @@
 1. 读 `manifest.json`（其自身是原子替换，读不到半截）→ 得 generation G 与各文件 `sha256`。
 2. 逐文件读取并计算 `sha256`，与 manifest 记录比对。
 3. **全部匹配** → 使用这批文件；**任一不匹配** → 判定为「读到跨代混合版本」，**放弃本次结果**，退避后重读（建议 20ms → 50ms → 100ms，封顶 3 次）。
-4. 3 次仍不一致 → 视为平台侧物化异常，agentd **告警**（记日志 + 下次心跳上报 `materialize_mismatch`），并**降级使用最后一份一致快照**（若之前成功读到过）或暂停领新 run（若从未读到一致快照）。
+4. 3 次仍不一致 → 视为平台侧物化异常，agentd **告警**（记日志 + 下次心跳上报 `materialize_mismatch`），并**暂停领取新 run**（A8 定稿：不降级到「最后一份一致快照」——单文件原子替换只保证单文件一致，读方没有版本化快照/双目录提交可可靠取回旧一致状态，降级承诺不可实现）。
 
 > 为什么「读 manifest → 读文件 → 比哈希」能保证不读到混合版本：文件被 rename 到新代（G+1）时，其哈希不再等于 manifest 里 G 代记录的值，读方必能检测到，从而重试收敛到某一完整代。物化频率低（端口变更才发生），重试窗口可忽略。
 
@@ -334,23 +334,32 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 
 ## 7. 失败与重试状态机（DB commit → materializer → file revision → retry/backoff → alert）
 
-### 7.1 物化链路（与 route outbox 同构）
+### 7.1 物化链路（与 route outbox 同构，独立 outbox 表）
 
 ```
 ① DB 事务提交 desired state
-   （例：建项目 = projects + port_allocations + route_outbox(port_allocation) + materialize 意图）
+   （例：建项目 = projects + port_allocations + route_outbox(port_allocation) + materialize_outbox 行）
         │
 ② materializer 消费（claim，FOR UPDATE SKIP LOCKED，租约 60s）
-   · 以 DB 快照为纯函数输入，渲染目标文件内容（§5.5）
+   · 只领取 revision = materialize_revisions.revision（head）的 pending 行
+   · 以 DB desired state 重读为纯函数输入，渲染目标文件内容（§5.5）
    · 逐文件 tmp → fsync → rename → fsync 目录（§5.1）
    · 最后写 manifest.json（generation+1，§5.3）
         │
-③ 成功 → 标记 published + 递增 file revision head + 记录 generation
+③ 成功 → 标记 published + 递增 materialize_revisions.revision head + 记录 generation
    失败 → attempts+1，退避重试（1s→2s→5s→10s→30s 封顶，±20% 抖动）
         │ attempts 耗尽（≥5 ⚠️）→ failed + 告警；保留上一版文件（不回滚、不写半截）
 ```
 
-> ⚠️ 待决策者确认（跨文件同步点）：materializer 的 outbox **复用什么表**。当前倾向：**复用 `route_outbox`**（`aggregate='user_space'`，`aggregate_id=users.id`），`route_revisions` 同键空间加 `('user_space', <fde_id>)` 的 revision head——`aggregate` 是 `text` 非枚举，**无需改 schema.sql**；但 model.md §1.18 把 `route_outbox` 描述为「路由发布 outbox」，扩展其语义需在 model.md 补一段说明（**本轮不改 model.md/schema.sql**，此点写入 §13 转派）。备选是新增独立 `materialize_outbox` 表（本轮同样不改 schema）。
+> **A7 定稿：materializer outbox 使用独立表 `materialize_outbox` + `materialize_revisions`**（已落 schema.sql §9 / model.md §1.22，不复用 `route_outbox`）。理由：避免与路由 reconciler 争抢同一行/同一租约/同一键空间，且聚合键（per-FDE）、租约、attempts、失败语义各自独立清晰。
+>
+> **写入路径（portal，同一 DB 事务）**：写 desired state（`projects` / `port_allocations` 等）+ `INSERT materialize_outbox(op, revision, payload)` + 同事务递增 `materialize_revisions.revision`（`INSERT ... ON CONFLICT (fde_id) DO UPDATE SET revision = materialize_revisions.revision + 1`）。
+>
+> **消费路径（materializer）**：`FOR UPDATE SKIP LOCKED` 领取 `revision = materialize_revisions.revision`（head）的 `pending` 行 → `processing`（写 `claimed_at/lease_until/worker_id`）→ 以 **DB desired state 重读**为纯函数输入渲染该 FDE 全部平台文件（§5.5，不依赖 payload 增量）→ 逐文件 tmp+fsync+rename（§5.1）→ 最后 manifest.json（generation+1，§5.3）→ `published`。失败 → `attempts+1` 退回 `pending` 退避重试；耗尽 → `failed` + 告警（保留上一版文件）。崩溃恢复：materializer 启动时+定时任务把 `state='processing' AND lease_until<now()` 回收为 `pending`（`attempts+1`）。
+>
+> **快照隔离 + 同 FDE 串行 + latest-wins**：materializer 重读 DB desired state 为唯一输入（纯函数）→ 渲染结果只依赖「领取时刻已提交」的快照，天然快照隔离；每个 FDE 同时只有一个 `revision = head` 被领取 → 同 FDE 并发物化天然串行；`revision < head` 的晚到旧事件/旧 tombstone **一律丢弃**（latest-wins）。
+>
+> **已删除文件清理**：materializer 每次消费对该 FDE 做声明式全量收敛——磁盘上存在但 DB desired state 已无的文件（如项目删除后的 `projects/<p>/.erix/*`）**落盘删除**，并在 manifest.json 中移除对应项（`op='delete'` 是触发信号，权威内容以 DB 为准）。
 
 ### 7.2 「DB 已提交但文件未发布」的语义与读取方行为
 
@@ -444,10 +453,10 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | 维度 | 路由（Traefik file provider） | 用户空间文件（`ports.json` 等） |
 |---|---|---|
 | 真相源 | `port_allocations`（DB） | 同左 |
-| 发布机制 | `route_outbox` + `route_revisions` + reconciler → Traefik 动态配置 | materializer outbox（§7.1）+ file revision head → bind mount |
+| 发布机制 | `route_outbox` + `route_revisions` + reconciler → Traefik 动态配置 | `materialize_outbox` + `materialize_revisions` + materializer（§7.1）→ bind mount |
 | 消费者 | Traefik（host 网络） | FDE 容器内 agentd/worker |
 | 原子性域 | 单份 Traefik 动态配置（tmp + 校验 + `mv`，topology §8） | 单 FDE 的 `manifest.json`（generation） |
-| revision | `route_revisions.(aggregate,aggregate_id).revision` | 用户空间的 `generation` / per-file `revision` |
+| revision | `route_revisions.(aggregate,aggregate_id).revision` | `materialize_revisions.fde_id.revision`（outbox 版本 head）；文件侧另记 `generation` / per-file `revision`（§5.3） |
 
 **为什么不共享一个 generation**：
 1. 两者**消费者不同、可达性判定不同**：路由可用性由 forward-auth 查 DB hostname（portal.md §2.7），文件视图由 agent 查 `ports.json`——互相独立，没有「必须同刻生效」的正确性要求。
@@ -455,7 +464,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 3. **正确性由「同源 + 最终一致 + 定时对账」保证**：两者都从同一 DB 快照派生，都在同一轮 reconciler 收敛里发布；短暂偏斜（路由先于/后于文件生效）只造成「预览 URL 暂不可达」或「端口暂不可见」，不造成错误分配/越权（§7.2），对账兜底收敛。
 
 **落地要求**：
-- 一次 DB 事务（如建项目）同时写 `port_allocations` + `route_outbox` + materialize 意图（§7.1），**保证同源、同起点**。
+- 一次 DB 事务（如建项目）同时写 `port_allocations` + `route_outbox` + `materialize_outbox` 行 + 递增 `materialize_revisions.revision`（§7.1），**保证同源、同起点**。
 - materializer 与 route reconciler 在**同一对账轮**内消费各自的 outbox，先后顺序不强制（各自幂等）。
 - 定时对账做「DB ↔ 路由文件 ↔ 用户空间文件」三向比对（topology §8 四向对账的子集），漂移即修。
 
@@ -478,7 +487,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | # | 事项 | 当前倾向 | 影响 |
 |---|---|---|---|
 | 1 | 容器内用户名固定 `erix` 还是按 FDE 名 | 固定 `erix`（§2.4） | 镜像模板 / HOME 路径 |
-| 2 | materializer outbox 复用 `route_outbox` 还是新增表 | 复用 `route_outbox`（aggregate=`user_space`） | model.md/schema.sql（本轮不改，§13） |
+| 2 | materializer outbox 复用 `route_outbox` 还是新增表 | ✅ 已定：新增 `materialize_outbox` + `materialize_revisions`（A7，已落 schema.sql §9 / model.md §1.22） | schema.sql / model.md（已落地，§13 S1） |
 | 3 | `config.json` 字段名与 erix-agent `config/*` 对齐 | 以 erix-agent 为准，平台只保证「占位 key + baseURL + 三 slot」语义 | 上游契约对齐（§13） |
 | 4 | 定时对账周期 | 5min | 漂移收敛时延 |
 
@@ -486,11 +495,11 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 
 ## 13. 跨文件同步点（本轮不改，转派）
 
-> 按硬要求，本轮**不修改** `runner-integration.md`、`schema.sql`、`model.md`、`api/portal.md`。以下同步点已在本文给出契约结论，但需另开轮次落到对应文档。
+> 注：S1（materialize outbox/revision 表）已在后续轮次落地到 schema.sql / model.md（A7）。其余同步点仍待转派到对应文档。
 
 | # | 目标文档 | 需同步点 | 本文对应 |
 |---|---|---|---|
-| S1 | `data/schema.sql` + `data/model.md` | materializer 的 outbox/revision 表形态（复用 `route_outbox` aggregate=`user_space`，或新增 `materialize_outbox`） | §7.1 / §10 / §12-2 |
+| S1 | `data/schema.sql` + `data/model.md` | ✅ 已落地：新增 `materialize_outbox` + `materialize_revisions`（A7，见 schema.sql §9 / model.md §1.22） | §7.1 / §10 / §12-2 |
 | S2 | `data/model.md` §1.9 / §2.2 | `ports.json` 投影范围与 `allocated→active` 触发条件、`generation` 字段来源 | §4.3.1 |
 | S3 | `design/runner-integration.md` §7.4 | spool 路径 `~/.cache/station/spool/` 与本文 §4.2 已对齐（无冲突，确认即可）；§5 `run_start` 载荷若需携带「本 run 端口快照」则补字段（P2 run 级端口） | §3 / §4.3.1 |
 | S4 | `design/runner-integration.md` §6.3 | worker 读 `config.json` 前先经 manifest 校验（本文 §5.4 硬规则） | §5.4 |
@@ -508,4 +517,4 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | 原理（DB 是真相、文件权限非边界） | [`principles.md`](principles.md) §1 原理三/四 |
 | 容器内进程/UID/凭据 | [`runner-integration.md`](runner-integration.md) §2/§3/§11 |
 | 部署参数（路径/UID） | [`../env.md`](../env.md) §6 |
-| 数据模型（`port_allocations` / `route_outbox`） | [`../data/model.md`](../data/model.md) §1.9/§1.18 |
+| 数据模型（`port_allocations` / `route_outbox` / `materialize_outbox`） | [`../data/model.md`](../data/model.md) §1.9/§1.18/§1.22 |

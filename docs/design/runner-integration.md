@@ -161,7 +161,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | U9 | `GET /api/internal/runs/:id/checkpoint/latest` | store：`loadLatestCheckpoint` | — | `200 {checkpoint: {snapshot, revision, updated_at}}` / `204`（无） | 只读 |
 | U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单 | `{tool_call_id, round, name, input_digest}` | `201 {approval_id}` | 一个工具调用至多一单（`approvals` `UNIQUE(run_id, tool_call_id)`，schema.sql） |
 | U11 | `GET /api/internal/approvals/:id` | 审批决定**轮询兜底** | — | `200 {status, decided_by?, decided_at?, note?}` | 只读 |
-| U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（准备工作失败 / worker 崩溃） | `{reason}` | `200`；portal 将 queue 行回 `pending`（`attempts < max_attempts`）或 `done` + runs `failed(max_attempts_exceeded)`（耗尽） | 重复 release 返回首次结果 |
+| U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（准备工作失败 / worker 崩溃） | `{reason}` | `200`；portal 收敛：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（aborted，A2）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**，A1）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)`（耗尽） | 重复 release 返回首次结果 |
 
 **claim（U1）长轮询 hold 语义与超时**：
 
@@ -181,7 +181,7 @@ agentd                          portal
 
 - ticket 载荷：`{queue_id, claim_token, lease_expires_at, run: {id, session_id, attempt, project: {name, root_path}, task, message_id, model, resume, attachments}}`（`lease_expires_at` 为 API 载荷字段名，对应 schema 列 `run_queue.lease_until`，见 portal.md §9.3；`attempt` = 本次 claim 后的 `run_queue.attempts`，供 worker 生成 `client_event_id` 与审计；`resume = attempt > 1`）。
 - `claim_token`：本次认领的凭证；U2/U3/U5-U12 携带（header `X-Claim-Token`）、**心跳 U4 逐 run 携带**（`runs[].claim_token`），portal 校验「该 run 当前有效租约 = 此 token」——**防止旧 agentd（崩溃恢复后）与新 agentd 双写同一 run**（re-claim 后旧 token 失效，`409 lease_lost` / 心跳 `lease_lost`）。
-- **领取资格（user_id 路由，issue #8）**：portal 按「认领容器的 user_id == run 归属 user_id」（run → session → user，由 token 解出）判定领取资格，**不以 `run_queue.container_id`（容器实例）过滤**——容器重建后新容器（同 user）天然可领取旧队列行；`container_id` 仅作入队时目标快照、`owner_container_id` 记当前持有者（schema.sql §8 / model.md §1.16）。
+- **领取资格（user_id 路由，issue #8；A2 收紧）**：portal 按「认领容器的 user_id == run 归属 user_id」（run → session → user，由 token 解出）判定领取资格，**不以 `run_queue.container_id`（容器实例）过滤**——容器重建后新容器（同 user）天然可领取旧队列行；`container_id` 仅作入队时目标快照、`owner_container_id` 记当前持有者（schema.sql §8 / model.md §1.16）。**同时只认领 `runs.status IN ('queued','running')` 的 run**：`cancelling`（用户已 stop）/ 终态（`finished`/`failed`）绝不进入认领结果（A2）。
 - **唤醒机制**：portal 在 `POST /messages` 入队后 `NOTIFY run_queue`（或单节点进程内 EventEmitter，规格 §10.2 同构）唤醒挂起的 claim；这是「拉取 + portal 侧事件唤醒」，push 优化（P2）后置 ⚠️。
 - 并发容量：`capacity` = agentd 当前可再接收的 run 数（§13）；portal 一次至多派发 `capacity` 条（响应数组或逐条，实现细节，契约按单条设计、数组为兼容扩展）。
 
@@ -359,9 +359,10 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 | 场景 | 检测方 | 收敛路径 | 负责方 |
 |---|---|---|---|
-| claim 后准备工作失败（worktree/fork） | agentd | `POST /release` → `attempts < max_attempts` 回 `pending` 重新被领；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` | agentd 上报，portal 重排 |
-| worker 崩溃（run 进行中） | agentd（`exit` 事件非预期码） | agentd `POST /release`（reason=worker_crashed）→ 立即 re-claim 同一 run（`attempts++`，`resume:true`）→ 新 worker 从 checkpoint 续跑（§6.5） | agentd（release + re-claim） |
-| agentd / 容器崩溃 | portal（心跳 3 次丢失 = 45s ⚠️） | `containers` 视 `exited`；租约 90s 到期后 reaper：`attempts < max_attempts` → claimed 行回 `pending`；`attempts >= max_attempts` → `done` + runs `failed`。容器重启（Docker `unless-stopped`）后新 agentd re-claim，`resume:true` 继续 | portal（reaper）+ Docker（重启）+ agentd（re-claim） |
+| claim 后准备工作失败（worktree/fork） | agentd | `POST /release` → `attempts < max_attempts` 回 `pending` 重新被领（**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` | agentd 上报，portal 重排 |
+| worker 崩溃（run 进行中） | agentd（`exit` 事件非预期码） | agentd `POST /release`（reason=worker_crashed）→ 立即 re-claim 同一 run（claim 时 `attempts++`，`resume:true`）→ 新 worker 从 checkpoint 续跑（§6.5） | agentd（release + re-claim） |
+| agentd / 容器崩溃 | portal（心跳 3 次丢失 = 45s ⚠️） | `containers` 视 `exited`；租约 90s 到期后 reaper（A1/A2）：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → claimed 行回 `pending`（**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed`。容器重启（Docker `unless-stopped`）后新 agentd re-claim，`resume:true` 继续 | portal（reaper）+ Docker（重启）+ agentd（re-claim） |
+| **stop 在 running 中 + 容器死（cancelling）** | portal（心跳丢失）+ reaper | 用户已 stop（`runs.status='cancelling'`）但容器死在 worker abort 之前：租约到期后 reaper **绝不回 pending 续跑**，直接 queue `cancelled` + runs `finished`（`termination.reason='aborted'`，A2）。这是「cancelling 收敛者恒为 runner」的唯一例外——runner 已死，portal 是唯一收敛方 | portal（reaper） |
 | re-claim 双写防护 | portal | 旧 `claim_token` 失效 → 旧 agentd（若复活）任何写请求 `409 lease_lost` / 心跳 `lease_lost` → 本地 abort、丢缓冲与 spool | portal 强制 |
 | 容器重建 | portal（offboarding/重建 workflow） | 旧 token 吊销、新 token 注入新容器；在跑 run 走租约到期 re-claim（同上）；**领取按 user_id 路由**（新容器同 user 可领，§4.2） | portal |
 | 租约丢失后的旧 worker 副作用 | —（见 §6.5「副作用策略」） | DB 状态写被 fencing 拒绝；外部副作用（shell/网络/LLM）平台无法物理终止（原理四），由 attempt 边界 + 审计标记隔离 | portal 标记 + agentd 尽力 abort |
@@ -389,7 +390,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 **对 checkpoint 查询契约的影响（方案 B）**：`loadLatestCheckpoint(run_id)` 恒按本 run_id 单行读；U9 返回 `revision`，resume 时 worker 续用 `revision+1` 起计（§9.5）。若决策者改选 A，需引入 `runs.resume_from_run_id`（源 run），U8/U9 按源 run 读写 checkpoint、`load/recall` 按源 run 读 transcript——为 A 预留的列**本期不落 DDL**，仅记录改选 A 时的迁移路径。
 
-**对审计与 UI 的影响（方案 B）**：`run_queue.attempts` 每次 claim 递增；`audit_log` 记录 `run.claim` / `run.lease_superseded` / `run.attempt_exhausted`；UI 的 run 详情显示「第 N 次尝试」；`run_end` 事件 payload 带 `attempt`。方案 B 的代价：`runs.status` 终态前可多次 `running ↔ failed(attempt)`，真正的 run 级终态由 `max_attempts` 耗尽或非重试性错误触发。
+**对审计与 UI 的影响（方案 B）**：`run_queue.attempts` 每次 claim 递增；`audit_log` 记录 `run.claim` / `run.lease_superseded` / `run.attempt_exhausted`；UI 的 run 详情显示「第 N 次尝试」；`run_end` 事件 payload 带 `attempt`。**方案 B 的代价（A5 定稿）**：`runs.status` 在崩溃恢复期间**保持 `queued`/`running`**，**不**出现 `running ↔ failed(attempt)`——attempt 级失败只记 `run_queue.attempts` + `audit_log`，**不写 `runs.status='failed'`**；真正的 run 级终态 `failed` 仅由 `max_attempts` 耗尽（`max_attempts_exceeded`）或非重试性错误（`checkpoint_failed` 重试耗尽 / `rate_limited`，§9.2 / model.md §2.9）触发。
 
 **租约丢失后的副作用策略（gap #8）**：
 
@@ -470,14 +471,18 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 
 ### 7.6 `run_end` 唯一产生方、事件 batch ack 与 U2 终态 barrier（issue #8）
 
-**`run_end` 唯一产生方（倾向，⚠️ 待决策者确认）：portal 由 U2 终态合成。**
+**`run_end` 唯一产生方（已定，A4）：portal 由 U2 终态合成。**
 
 | 方案 | 说明 | 取舍 |
 |---|---|---|
 | (a) worker 经 U3 发 `run_end` 事件 | worker 把 `runToolLoop` 返回值作为 `type:"run_end"` 事件走事件批量上报 | 存在「`run_end` 事件先到、后续事件后到」的排序间隙；worker 在「发 run_end 后、U2 前」崩溃会留下无终态的事件 |
-| (b) portal 由 U2 合成（**倾向**） | worker 不发 `run_end` 事件；portal 在 U2 终态事务里**合成**一条 `run_end` 事件（新 seq，payload 取 U2 的 termination/usage/rounds/final_text） | 终态状态 + `run_end` 事件**同事务原子提交**，无排序间隙；`run_end` 恒为 run 内最后一条事件 |
+| (b) portal 由 U2 合成（**已定**） | worker 不发 `run_end` 事件；portal 在 U2 终态事务里**合成**一条 `run_end` 事件（新 seq，payload 取 U2 的 termination/usage/rounds/final_text） | 终态状态 + `run_end` 事件**同事务原子提交**，无排序间隙；`run_end` 恒为 run 内最后一条事件 |
 
 选 (b) 的理由：U2 终态载荷本就携带 `termination/usage/rounds/final_text`（§4.2 U2），portal 合成只是把它写成一条带 seq 的事件；单写方、单事务，消除「事件在终态之后到达」整类 bug。worker 侧不再产生 `run_end` 事件（引擎返回值只喂 U2）。
+
+**确定性 `client_event_id` 与 DB 唯一性（A4）**：合成事件的 `client_event_id` 固定为 `run_id:final:run_end`（与 worker 事件的 `run_id:attempt:计数` 命名空间不碰撞）。schema.sql 已有两条兑底：① `UNIQUE(run_id, client_event_id)`（同 id 重放用 `ON CONFLICT DO NOTHING` 去重）；② 部分唯一索引 `UNIQUE(run_id) WHERE type='run_end'`（`run_events_run_end_key`）——**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**。
+
+**U2 终态加锁顺序（A4）**：portal 在 U2 终态事务内按序执行——① `SELECT ... FROM runs WHERE id=$1 FOR UPDATE`（锁 run 行，串行化并发 U2 / reaper / release）；② 校验 `X-Claim-Token` 与当前 `run_queue.claim_token` 一致（或走 reaper 的 portal 收敛路径，见 §6.4 cancelling 例外）；③ 写 `runs` 终态（status/termination/usage/error/ended_at）；④ `run_queue → done`（或 `cancelled`）；⑤ 回写 `messages` + `usage_ledger`；⑥ 从 `chat_sessions.last_seq` 分配 seq 并 `INSERT run_events`（`type='run_end'`，`client_event_id='run_id:final:run_end'`，`ON CONFLICT (run_id, client_event_id) DO NOTHING`）。第 ⑥ 步的 seq 最大，使 `run_end` 恒为 run 内最后一条事件。
 
 **事件 batch ack（U3）**：U3 响应 `200 {stored, seq_first, seq_last}` 即「batch ack」= 该批事件已持久化 `run_events` 并分配 seq。agentd 收到 `200` 才推进 spool ack 游标、从缓冲删除；`stored < 请求条数` 是幂等命中（非错误）。batch ack 是「已落库」确认，不是「已推送到浏览器」确认——SSE 推送是 portal 落库后的派生动作（portal.md §5）。
 
@@ -541,6 +546,8 @@ D2' 纯 DB 意味着 portal/DB 抖动会直接传导到引擎的 fail-closed（�
 | 可重试错误 | 网络错误、5xx、429；`checkpoint_failed` 语义上可重试（规格 §9.3-2） |
 | 不可重试 | 4xx（`validation_failed` / `lease_lost` / `run_terminal` 之外的）→ 直接抛 |
 | 耗尽 | 错误透传引擎 → `checkpoint_failed` → run 失败，用户口径见 portal.md §6.2（「进度未丢失，可重新发送继续」） |
+
+> **A3 定稿：`checkpoint_failed` 是终态、不自动 re-claim**。它产生于 worker（`runToolLoop` fail-closed 抛错，adapter 3 次重试耗尽后透传），经 agentd U2 终态上报 `failed`（`error.code='checkpoint_failed', retryable=true`）；**不是**进程崩溃，因此不走 §6.4 的 release/re-claim——存储故障持续时 re-claim 只会原地重演。恢复时 checkpoint 取**最新已持久化那一份**（U9 返回的 `snapshot+revision`），失败的那次 save 未落库、不改变 `run_checkpoints.revision`；需「存储恢复 + 用户重发」（本期无跨 run resume，方案 A 不做）。完整口径见 model.md §2.9。
 
 ### 9.3 transcript round 幂等
 
@@ -727,9 +734,9 @@ FDE 浏览器        portal                agentd               worker（execute
 | 13 | store adapter 重试参数（3 次，1s/2s/5s） | 采用（§9.2） |
 | 14 | `reflection` / `wrapup` 的显式配置值（对话型宿主参照 host-upgrade-guide §1 评估 `wrapup:false`） | 待定（§6.3-8） |
 | 15 | 审批轮询兜底间隔 5s | 采用（§10.1） |
-| 16 | 崩溃恢复方案：方案 A（新 run + `resume_from_run_id`，不自动 resume）vs 方案 B（同 run_id re-claim） | 倾向 B（§6.5） |
+| 16 | 崩溃恢复方案：方案 A（新 run + `resume_from_run_id`，不自动 resume）vs 方案 B（同 run_id re-claim） | 已定 B（§6.5；A5 口径：attempt 失败不写 `runs.status='failed'`） |
 | 17 | `client_event_id` 含 attempt 前缀（`run_id:attempt:计数`） | 采用（§7.3） |
-| 18 | `run_end` 事件唯一产生方：portal 由 U2 合成（worker 不发） | 倾向 (b)（§7.6） |
+| 18 | `run_end` 事件唯一产生方：portal 由 U2 合成（worker 不发） | 已定 (b)（§7.6；`client_event_id='run_id:final:run_end'` + 部分唯一索引） |
 | 19 | checkpoint 单调性：revision CAS（旧快照 → `409 checkpoint_stale`） | 采用（§9.5；已落 DDL） |
 | 20 | 心跳 U4 逐 run 携带 `claim_token` + 部分失败响应（run 级 `lease_lost`） | 采用（§4.2） |
 | 21 | 领取资格按 user_id 路由（非 container_id）；`max_attempts` 默认 3、耗尽 → `failed(max_attempts_exceeded)` | 采用（§4.2/§6.4；已落 DDL） |
@@ -772,6 +779,11 @@ FDE 浏览器        portal                agentd               worker（execute
 | R15 | portal.md §5.3 / §9.6（run_end / U2） | `run_end` 来源未明确；「最后一批事件 200 后才能提交终态」缺 batch ack / 状态机 | `run_end` 事件由 portal 在 U2 终态事务合成（worker 不再经 U3 发 run_end）；payload 带 `attempt`；终态 barrier 见本文 §7.6。✅ 已转派：portal.md §5.3/§9.6 已同步 |
 | R16 | portal.md §9.3（U1 claim） | ticket 无 `attempt` 字段 | ticket `run` 加 `attempt`（= claim 后 `run_queue.attempts`）；`resume = attempt > 1`。✅ 已转派：portal.md §9.3 已同步 |
 | R17 | portal.md §6.4 / §9.11（release） | `attempts` 耗尽语义与终态码未定 | 新增 run 级错误码 `max_attempts_exceeded` / `spool_full`；`container_exited` 改为「容器死且 attempts 耗尽才终态」；release 语义 `attempts < max → pending` / `attempts >= max → done + failed`。✅ 已转派：portal.md §6.4/§9.11 已同步 |
+| R18 | portal.md §9.3（U1 claim） | claim 未过滤 `cancelling`/终态 | A2 定稿：认领资格新增 `runs.status IN ('queued','running')`——`cancelling`（用户已 stop）/终态绝不进入认领结果 |
+| R19 | portal.md §9.11（release）/ §6.4 | release/reaper 未分 `cancelling` 分支 | A1/A2 定稿：`cancelling` → queue `cancelled` + runs `finished`（aborted）；否则 `attempts < max` 回 pending（**attempts 不变**）、`attempts >= max` → done + `failed(max_attempts_exceeded)` |
+| R20 | portal.md §6.2（checkpoint_failed） | 「进度未丢失，可重新发送继续」暗示跨 run 续跑 | A3 定稿：`checkpoint_failed` 是终态、不自动 re-claim；checkpoint/transcript 数据仍保留（未损坏），但本期无跨 run resume，重发产生新 run |
+| R21 | portal.md §5.3 / §9.6（run_end / U2） | 缺确定性 `client_event_id` 与加锁顺序 | A4 定稿：`client_event_id='run_id:final:run_end'`；部分唯一索引 `UNIQUE(run_id) WHERE type='run_end'`；U2 加锁顺序见 §7.6 |
+| R22 | deploy-contract.md §3 | `schema_migrations`/baseline 未落地、缺 bootstrap 执行顺序 | A6 已落地：schema.sql §0 幂等创建角色（自包含，空库可单独执行）+ schema.sql §10（`schema_migrations` + 对象级 GRANT）；`docs/data/bootstrap.sql`（超级用户，附加 schema 级授权/环境特有设置，可重复执行）；baseline checksum 由迁移 runner 写入真实 sha256 |
 
 ---
 

@@ -109,7 +109,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 | `station-db`（Postgres） | 用户/会话/消息/transcript/events/端口表/用量/审计 | 不存代码 |
 | `fde-<name>`（FDE 容器） | `station-agentd`（常驻守护/桥接，唯一出站连 portal）+ `station-runner`（每 run 一个子进程，跑 erix agent）+ code-server + dev servers（进程模型见 [runner-integration.md](runner-integration.md) §2，命名 ⚠️ 待决策者确认）；平台状态一律经 portal internal API 落 DB——**容器不直连 DB**（决策者 2026-09，issue #3 评论） | 不 publish 端口、**不监听任何对外端口**、不挂 `docker.sock`、**不持有平台密钥（含 DB 凭据）**——唯一平台凭据为 per-container token，仅 agentd 持有 |
 
-**只有 portal 挂 `/var/run/docker.sock`**（建议前置 `tecnativa/docker-socket-proxy` 收窄到 CONTAINERS/NETWORKS/VOLUMES）。FDE 容器永不挂。
+**只有 portal 挂 `/var/run/docker.sock`**（建议前置 `tecnativa/docker-socket-proxy` 收窄到 CONTAINERS/NETWORKS，创建参数 allowlist 见 deploy-contract §5）。FDE 容器永不挂。
 
 ---
 
@@ -224,7 +224,7 @@ http:
       rule: "Host(`alice-p-proj1-4000.fde.<base>`)"
       entryPoints: [websecure]
       priority: 200
-      middlewares: [fde-auth]
+      middlewares: [fde-auth, strip-cookie]
       service: fde-alice-4000
     # LLM 注入：每 FDE 一条 router + 一条 headers middleware（各自独立 priority）；
     # 身份来自网络来源（ClientIP），非自报；禁止写无 ClientIP 条件的兜底路由（无匹配 404 = 默认拒绝）
@@ -239,7 +239,12 @@ http:
     fde-auth:
       forwardAuth:
         address: "http://127.0.0.1:8080/api/forward-auth"   # Traefik 在 host、portal 发布在回环，不再走容器网络寻址
+        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]
         authResponseHeaders: [X-Auth-User]
+    strip-cookie:
+      headers:
+        customRequestHeaders:
+          Cookie: ""   # 放行后删除 Cookie：预览 cookie 只到 forwardAuth、绝不透传上游（B2 实测验证）
     internal-allow:
       ipAllowList:
         # 从 fde_networks 精确派生：state ∈ {allocated,active} 的每个 subnet 一条（topology.md §5.1）。
@@ -264,6 +269,8 @@ http:
         servers: [{ url: "http://127.0.0.1:4000" }]
         # responseForwarding.flushInterval 必须调小（≤100ms），否则 token 流被缓冲成整段（topology.md §6 第 5 条）
 ```
+
+> **预览链路 Cookie 边界（B2，已用 `traefik:v3` + `traefik/whoami` 实跑验证）**：`fde-auth` 的 `authRequestHeaders` 是**最小 allowlist**——forwardAuth 只收到 `X-Forwarded-*`（Host/Uri/Method/Proto）与 `Cookie`（预览凭证 `__Host-fde_preview`；portal session cookie 为 host-only、到不了预览 host）。放行后 `strip-cookie` 中间件**删除 `Cookie`**，保证预览上游（dev server）收到的请求头里**没有 `Cookie`**（whoami 回显：上游无 `Cookie` 头）。**302 阶段**：forwardAuth 返回 `302 + Set-Cookie + Location` 时，Traefik 把该响应**原样透传给浏览器**（不剥离 `Set-Cookie`、不缓存）；`Location` 必须用**绝对 URL**（portal §2.7 第 6 步已如此，相对路径会被 Traefik 改写成相对 forwardAuth 地址）。
 
 portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确查 `port_allocations.hostname` → 按 token 哈希查 `preview_grants`（一次性 ticket / host-only 预览 cookie；portal 自身会话才查 `login_sessions`）→ 按 `exposure` 授权**（**不解析 session cookie 的 `sub`**）。端口/槽位白名单、审计日志都在这里做；执行顺序与失败语义见 [portal.md](../api/portal.md) §2.7 与 [topology.md](topology.md) §5.2，此处不重复定义。
 
@@ -407,7 +414,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 - **碰撞处理**：`project-tok` 天然无碰撞（`fde_name` 全局唯一 + `projects.name` 用户内唯一 + hostname 含两者，schema.sql `port_allocations_live_hostname_key` 兜底）；`run-tok` 靠 base32 熵（5 位 ≈ 25 bits）+ `port_allocations_live_hostname_key` 唯一索引兜底，碰撞时**递增位数重试**（5→6→7→8，8 位 ≈ 40 bits，单 FDE 活跃 run 规模下碰撞概率可忽略）。
 - **项目改名行为（写死）**：`PATCH /api/projects/:id` 改名**不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**；改名只影响 `projects.name`（容器内目录名）与**后续新建** run 的 hostname，旧 hostname 保持可访问（书签不破）。
 
-> ⚠️ 跨文件同步点：portal.md §3.5 现行文字「改名会同步重生成端口 hostname/url」与本条「不可变」冲突，须转派修订 portal.md 为「改名不重生成 hostname/url，旧 hostname 保持」；另 schema.sql `users.fde_name` 目前无 `CHECK`（仅 `UNIQUE`），本 grammar 的 `<fde>` 字符集需在应用层强制（可选转派 schema.sql 加 CHECK）。
+> ⚠️ 跨文件同步点：portal.md §3.5 已同步为「改名不重生成 hostname/url，旧 hostname 保持（项目名快照）」（与本条不可变性一致，B9）；schema.sql `users.fde_name` 目前无 `CHECK`（仅 `UNIQUE`），本 grammar 的 `<fde>` 字符集需在应用层强制（可选转派 schema.sql 加 CHECK）。
 
 ### 8.6 `allocated → active` 的触发条件与幂等更新（写死）
 
@@ -422,6 +429,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
   ```
   `WHERE state='allocated'` 保证**幂等**：首次放行才升级，后续放行影响 0 行、不重复写；已 `released` 不会误升级。
 - **不触发路由重发布**：`allocated` 与 `active` 的转发语义一致（forward-auth 第 2 步两者都放行，portal.md §2.7），故升级**不写 route outbox、不重发 Traefik 路由**——`active` 只是 UI「在线」展示态 + 报表口径。
+- **重建恢复**：`active` 状态在 DB（原理三），FDE 容器 / Traefik 路由 / `ports.json` 重建后 **DB 里的 `state='active'` 不回落**（DB 是真相，重建只是重新物化派生视图）；reconciler 凭 DB 全量重建路由时按当前 `state` 生成，不依赖「是否曾放行」的历史事件。唯一回退路径是 `released`（项目删除 / run 结束 / reaper），无 `active → allocated` 逆转换。
 - **语义边界（尽力而为，不是强在线探针）**：forward-auth 放行只证明「授权通过且请求到达边缘」，**不**证明上游 dev server 返回 200（授权与上游健康是两件事）。因此 `active` 的语义 =「已获准访问过」，UI「在线」应按此口径；dev server 强在线探针（reconciler 定期对上游 200 探测）留作 P2 预览卡片可选增强，P1 不做。
 - **P1 影响**：P1 无预览路由（deploy-contract.md §7 P1 范围），故 P1 期间 allocation 恒为 `allocated`，`active` 只在 P2 预览启用后出现；不影响 P1 端口分配/物化/回收。
 
