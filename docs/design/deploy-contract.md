@@ -209,19 +209,21 @@
 
 > **WP2b 已放开（portal 经 socket-proxy 实际可用的 Docker API）**：`POST=1` 下放行 `CONTAINERS=1`/`NETWORKS=1` 两个类别内的全部方法——`/_ping`、`/version`、`/containers/json`、`/containers/create`、`/containers/{id}/json`、`/containers/{id}/start|stop`、`DELETE /containers/{id}`、`/networks`、`/networks/create`、`/networks/{id}`、`DELETE /networks/{id}`。**真正的路径级最小面由 portal 侧代码层白名单兑底**（见下「实现偏差」）。
 
-### 5.1 ⚠️ 实现偏差：socket-proxy 的 POST 是全局方法门，无路径级 POST 白名单
+### 5.1 ✅ 自研 admission proxy 实现了契约的路径级+参数级白名单
 
-> **不改设计决策，只记录实现现实**（deploy-contract §5 的「路径级最小面」意图由两层实现：socket-proxy 类别级 + portal 代码层）。
+> **已替换 tecnativa/docker-socket-proxy**：自研零依赖 Node admission proxy（`deploy/fde-proxy/server.js`，compose 服务 `station-docker-proxy`）落地 §5 的「路径级最小面」意图——**方法+路径白名单（12 条契约路径）+ POST /containers/create 参数级策略校验**，不再依赖「socket-proxy 类别级 + portal 代码层」的软边界。
 
-对 `tecnativa/docker-socket-proxy:v0.5.0` 的 haproxy 模板（`/usr/local/etc/haproxy/haproxy.cfg.template`）实测确认：
+（历史记录，供上下文：）对 `tecnativa/docker-socket-proxy:v0.5.0` 的 haproxy 模板实测确认：
 
-- **`POST` 是一个全局方法门**：模板首行 `http-request deny unless METH_GET \|\| { env(POST) -m bool }`——`POST=1` 放行**所有**非 GET 方法（POST/PUT/DELETE…），**没有**「按 endpoint 类别/路径区分 POST」的粒度。
-- **类别级白名单**（`CONTAINERS`/`NETWORKS`/…）控制「哪些路径可达」，是唯一存在的路径粒度；`POST` 只叠加一个全局方法开关。
-- 因此「只允许 containers/networks 创建与启动所需的 POST」**无法在该镜像上用 env 表达**。落地采用：**类别级白名单（`CONTAINERS=1`+`NETWORKS=1`） + portal 侧代码层白名单**（`provisioner.DOCKER_ALLOWED_PATHS`，写死允许的 Docker API 路径，多余路径一律拒绝，B6 落地）。二者叠加后的实际最小面 = 代码层白名单所列的 containers/networks 生命周期路径，与契约意图一致。
-- 附注：`ALLOW_START`/`ALLOW_STOP`/`ALLOW_RESTARTS` 在 `CONTAINERS=1` 下是冗余的（`^.../containers` 前缀规则已匹配 `/containers/{id}/start|stop|…` 子路径），compose 仍显式置 `1` 仅作意图说明。
-- 残余风险：portal 被攻破后经 socket-proxy 至多能对 containers/networks 两个类别发任意方法（如 `DELETE /networks/{id}`）；「不碰其它类别（IMAGES/EXEC/SYSTEM…）」与「创建字段 allowlist（B6）」仍由 socket-proxy 类别白名单 + portal 代码层兜住，爆炸半径与 §5 正文结论一致。
+- **`POST` 是一个全局方法门**：模板首行 `http-request deny unless METH_GET \|\| { env(POST) -m bool }`——`POST=1` 放行**所有**非 GET 方法，**没有**「按 endpoint 类别/路径区分 POST」的粒度，因此无法在该镜像上用 env 表达路径级 POST 白名单。
 
-**白名单理由（每项都对应 portal 实际所需的最小面；WP2b 起 create/start/stop/rm 与 network create 为已交付面，由代码层白名单兑底）**：
+**自研 proxy 落地（真正安全边界）**：
+
+- **路径白名单（12 条）**：`GET /_ping`、`GET /version`、`GET /containers/json`、`POST /containers/create`、`GET /containers/{name}/json`、`POST /containers/{name}/start|stop`、`DELETE /containers/{name}`、`GET /networks`、`POST /networks/create`、`GET /networks/{name}`、`DELETE /networks/{name}`；其余路径一律 403。
+- **create 参数级校验（§5 B6，在 proxy 内强制）**：拒绝 `Privileged` / `PidMode=host` / `NetworkMode=host`；`PortBindings` 必须空；`CapDrop` 必须含 `ALL`；`SecurityOpt` 必须含 `no-new-privileges`；binds source 必须在 `USERSPACE_ROOT` 之下且不含 `docker.sock`；`Image` 必须匹配 `IMAGE_ALLOWLIST` 前缀（env 可配）。不合规 → 403 + 理由。
+- **其余放行路径原样转发（含流式）**。
+
+**白名单理由（每项都对应 portal 实际所需的最小面）**：
 
 - `CONTAINERS`：FDE 容器生命周期（create/start/stop/rm/inspect/ps）——portal 核心职责。
 - `NETWORKS`：FDE 网络生命周期（`network create --subnet` / inspect / ls / rm），onboarding/offboarding。
@@ -231,7 +233,7 @@
 - **不授 `SYSTEM`/`AUTH`/`SECRETS`**：防读宿主 docker 配置/凭据/secret。
 - **不授 `BUILD`/`COMMIT`**：防镜像篡改/逃逸面。
 
-> **参数级约束（B6：`CONTAINERS=1` 本身不等于「只能创建规定 FDE 容器」；WP2b 已交付——portal 侧 provisioning broker 在 `POST /containers/create` **之前**强制校验创建字段 allowlist）**：真正的最小面不是 socket-proxy 的 API 白名单，而是 portal 在 `POST /containers/create` **之前**强制校验的**创建字段 allowlist（provisioning broker）**——
+> **参数级约束（B6：`POST /containers/create` 参数级 allowlist 已在 admission proxy 内强制，不再依赖 portal 代码层）**：真正的最小面 = proxy 在 `POST /containers/create` **之前**强制校验的创建字段 allowlist——
 >
 > - **镜像**：只允许**预拉取的 `FDE_IMAGE` digest**（`image@sha256:…`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
 > - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
@@ -239,9 +241,13 @@
 > - **禁止项（硬拒绝）**：`--privileged`、`--pid=host`、`--network=host`、`--device`、`--cap-add` 超出 §6.2 白名单、`--security-opt` 以外的任意 security 选项、`--publish`（`-p`）。
 > - **`--ip`**：只允许该 FDE `/29`（或 `/28`）内的固定位（`.2`）；其它 IP 拒绝。
 >
-> **被攻破时的爆炸半径**：portal 被攻破后，攻击者经 socket-proxy **至多**能「在已授权 FDE 位点用 `FDE_IMAGE` digest 起一个满足 allowlist 的容器」——即**该 FDE 自己的 /29 内的资源滥用 + 可读该 FDE 的 bind mount**；**不能**拉任意镜像、`exec` 进其它容器、publish 端口、挂 `docker.sock`、`privileged`/host PID/host network 逃逸宿主、改其它网络/卷。**跨 FDE 与宿主逃逸被 allowlist 挡住**；纵向提权（`EXEC`/`SYSTEM`/`AUTH`/`SECRETS`）被 socket-proxy 白名单挡住。残余风险 = 单个被攻破 FDE 的数据面（原理四：FDE 自损本就接受，见 runner §11.3）。
+> **被攻破时的爆炸半径**：portal 被攻破后，攻击者经 admission proxy **至多**能「在已授权 FDE 位点用 `FDE_IMAGE` digest 起一个满足 allowlist 的容器」——即**该 FDE 自己的 /29 内的资源滥用 + 可读该 FDE 的 bind mount**；**不能**拉任意镜像、`exec` 进其它容器、publish 端口、挂 `docker.sock`、`privileged`/host PID/host network 逃逸宿主、改其它网络/卷。**跨 FDE 与宿主逃逸被 allowlist 挡住**；纵向提权（`EXEC`/`SYSTEM`/`AUTH`/`SECRETS`）被 proxy 路径白名单挡住。残余风险 = 单个被攻破 FDE 的数据面（原理四：FDE 自损本就接受，见 runner §11.3）。
 
-> FDE 容器**永不挂 `docker.sock`、也访问不到 socket-proxy**（FDE 只接自己的 `/29`，不在 `backend`）。
+> **残余风险（第三轮加固，记录不改代码）**：
+> 1. **bind TOCTOU**：proxy 校验 bind source 后、Docker 真正挂载前，宿主路径可能被换成 symlink。触发前提是攻击者能改宿主 bind source（portal 被攻破才可，FDE 用户无法触达 proxy——FDE 只接自己的 `/29`，不在 `backend`）。记为已知残余风险。
+> 2. **生命周期对象替换竞态**：inspect 通过后、按名 start/stop/rm 前，同名对象可能被替换（inspect-后-按名操作竞态）。同上，攻击者须能改 proxy 可见的 Docker 对象（= portal 被攻破），归入同一类别。
+
+> FDE 容器**永不挂 `docker.sock`、也访问不到 admission proxy**（FDE 只接自己的 `/29`，不在 `backend`）。
 
 ---
 

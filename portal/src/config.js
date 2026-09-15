@@ -71,6 +71,34 @@ function defaultStaticDir() {
 export function loadConfig(env = process.env) {
   const sessionTtlSeconds = intEnv(env, 'SESSION_TTL_SECONDS', DEFAULT_SESSION_TTL_SECONDS);
   const cookieProfile = env.COOKIE_PROFILE || 'prod';
+  // 生产判定：FDE_DEV_MODE=1 显式开发（即使镜像内 NODE_ENV=production 也按开发）；
+  // FDE_DEV_MODE=0 显式生产；未设时按 NODE_ENV=production 判生产，否则开发。
+  const fdeDevMode =
+    env.FDE_DEV_MODE === '1' ? true : env.FDE_DEV_MODE === '0' ? false : env.NODE_ENV !== 'production';
+
+  // F12：生产模式要求 FDE_IMAGE 为 image@sha256:… 形态（或启动时预拉取校验）；dev 允许 tag 但警告。
+  const fdeImage = env.FDE_IMAGE || 'traefik/whoami';
+  const imageIsDigest = /@sha256:[0-9a-f]{64}$/.test(fdeImage);
+  if (!imageIsDigest && !fdeDevMode) {
+    throw new Error('FDE_IMAGE 必须为 image@sha256:<digest> 形态（生产模式；或显式 FDE_DEV_MODE=1 进入开发模式）');
+  }
+  if (!imageIsDigest && fdeDevMode) {
+    // eslint-disable-next-line no-console
+    console.warn(`[config] ⚠️ dev 偏差：FDE_IMAGE=${fdeImage} 非 digest pin；生产必须改为 image@sha256:…`);
+  }
+
+  // F14：生产模式缺失/占位 SESSION_SIGNING_KEY 时 fail-closed（拒绝启动）；dev 保持现状 + 警告。
+  const signingKeyRaw = env.SESSION_SIGNING_KEY;
+  const signingKeyIsPlaceholder =
+    !signingKeyRaw || signingKeyRaw === 'erix-station-dev-signing-key-change-me';
+  if (signingKeyIsPlaceholder && !fdeDevMode) {
+    throw new Error('SESSION_SIGNING_KEY 必须显式注入强随机值（生产模式拒绝启动）');
+  }
+  if (signingKeyIsPlaceholder && fdeDevMode) {
+    // eslint-disable-next-line no-console
+    console.warn('[config] ⚠️ SESSION_SIGNING_KEY 使用 dev 占位值，生产必须改为强随机值');
+  }
+
   return {
     host: env.HOST || '0.0.0.0',
     port: Number(env.PORT || 8080),
@@ -126,6 +154,8 @@ export function loadConfig(env = process.env) {
     // ---- WP2a：用户空间物化 + 路由 reconciler 配置 ----
     // 用户空间根（portal 容器内路径，= 宿主 bind mount 目标；user-space §2.2 / env §6）。
     userSpaceRoot: env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
+    // F3：bind source 用的**宿主**路径（Docker API bind source 必须是宿主路径，与容器内 userSpaceRoot 解耦）。
+    userSpaceRootHost: env.ERIX_USERSPACE_ROOT_HOST || env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
     // FDE 工作区属主 UID/GID（user-space §6.1：1000/1000）。
     fdeUid: intEnv(env, 'FDE_USER_UID', 1000),
     fdeGid: intEnv(env, 'FDE_USER_GID', 1000),
@@ -148,7 +178,10 @@ export function loadConfig(env = process.env) {
       .filter(Boolean),
     // ---- WP2b：FDE provisioning + preview ticket ----
     // FDE 容器镜像/命令（开发期 traefik/whoami 站台；生产自构建 runner 镜像，env §10/deploy-contract §6.2）。
-    fdeImage: env.FDE_IMAGE || 'traefik/whoami',
+    fdeImage,
+    fdeDevMode,
+    // F5：开发期 whoami 等镜像不满足「root 启动→drop 1001」契约时的 --user 兜底（⚠️ dev 偏差）；生产留空由镜像 entrypoint 降权。
+    fdeDevUser: env.FDE_DEV_USER || null,
     fdeCmd: parseJsonStringArray(env.FDE_CMD, ['-port', '4000']),
     fdeAgentVersion: env.FDE_AGENT_VERSION || 'dev',
     // 资源限额（deploy-contract §6.2，⚠️ 数值待决策者确认）：默认 512m，可配 0 表示不限。
@@ -156,14 +189,14 @@ export function loadConfig(env = process.env) {
     // 容器内双 UID（runner-integration/user-space §6.1：agentd 1001 / worker 1002，GID 1000）。
     agentdUid: intEnv(env, 'FDE_AGENTD_UID', 1001),
     workerUid: intEnv(env, 'FDE_WORKER_UID', 1002),
-    // portal 经 socket-proxy 访问 Docker API（deploy-contract §5；不直挂 docker.sock）。
-    dockerHost: env.DOCKER_HOST || 'tcp://station-docker-socket-proxy:2375',
+    // portal 经自研 admission proxy 访问 Docker API（deploy-contract §5；不直挂 docker.sock）。
+    dockerHost: env.DOCKER_HOST || 'tcp://station-docker-proxy:2375',
     // 预览 ticket/session（portal.md §2.8）。
     previewTicketTtlSeconds: intEnv(env, 'PREVIEW_TICKET_TTL_SECONDS', 60),
     previewSessionTtlSeconds: intEnv(env, 'PREVIEW_SESSION_TTL_SECONDS', 15 * 60),
     previewCookie: previewCookieSettings(cookieProfile, intEnv(env, 'PREVIEW_SESSION_TTL_SECONDS', 15 * 60)),
     // 预览 session 派生密钥（HMAC-SHA256，portal.md §2.7 第 6 步）；生产必须显式注入，开发期仅联调占位。
-    previewSessionSigningKey: env.SESSION_SIGNING_KEY || 'erix-station-dev-signing-key-change-me',
+    previewSessionSigningKey: signingKeyRaw || 'erix-station-dev-signing-key-change-me',
     // 预览 ticket 签发限流（portal.md §6.1：按用户 + IP）。
     previewTicketRateLimit: {
       maxFailures: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_MAX', 20),

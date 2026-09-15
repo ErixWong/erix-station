@@ -287,3 +287,26 @@ test('authorizeForwardAuth：private 越权（非 owner 主体）→ 403', async
   assert.equal(res.status, 403);
   assert.equal(res.code, 'forbidden');
 });
+
+test('F13：已消费 ticket 跨 hostname 重放 → 403 preview_ticket_mismatch（先于安全重放，不派发 session 到别的 allocation）', async () => {
+  const allocB = { ...ALLOC, id: 'pa2', hostname: 'bob-p-proj1-4000.fde.localhost', url: 'https://bob-p-proj1-4000.fde.localhost' };
+  const { pool, grants } = makePool({ allocations: [ALLOC, allocB] });
+  const ticket = 'pt_cross_host';
+  // 已消费 ticket（allocation_id=pa1）+ 已派生活跃 session（安全重放分支的诱饵）
+  grants.push({
+    id: 'g1', token_hash: hashToken(ticket), user_id: 'u1', issuer_id: 'u1', allocation_id: 'pa1',
+    parent_ticket_id: null, kind: 'ticket', state: 'used', expires_at: later(60), used_at: NOW, revoked_at: null,
+  });
+  const sessionToken = derivePreviewSessionToken(ticket, KEY);
+  grants.push({
+    id: 'g-sess', token_hash: hashToken(sessionToken), user_id: 'u1', issuer_id: null,
+    allocation_id: 'pa1', parent_ticket_id: 'g1', kind: 'session', state: 'active', expires_at: later(600), used_at: null, revoked_at: null,
+  });
+
+  const res = await authorizeForwardAuth(pool, config, {
+    hostname: allocB.hostname, uri: `/?preview_ticket=${ticket}`, scheme: 'http', now: NOW,
+  });
+  assert.equal(res.outcome, 'deny');
+  assert.equal(res.status, 403);
+  assert.equal(res.code, 'preview_ticket_mismatch');
+});

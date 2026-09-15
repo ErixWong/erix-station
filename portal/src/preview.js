@@ -110,6 +110,10 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, now
   const audit = { allocation, subjectId: g?.user_id ?? null, issuerId: g?.issuer_id ?? null, grantId: g?.id ?? null, grantKind: 'ticket' };
 
   if (!g) return deny(401, 'preview_ticket_invalid', 'preview ticket invalid', audit);
+  // F13：跨 hostname 重放必须 403 preview_ticket_mismatch——先于安全重放分支（防已消费 ticket 用派生 session 打到别的 allocation）。
+  if (g.allocation_id !== allocation.id) {
+    return deny(403, 'preview_ticket_mismatch', 'preview ticket does not match allocation', audit);
+  }
   if (g.state === 'revoked') return deny(403, 'preview_ticket_revoked', 'preview ticket revoked', audit);
   if (g.state === 'used') {
     // 响应丢失后的安全重放：有活跃派生 session 则返回同一 bootstrap 结果，否则真·重放 403。
@@ -126,9 +130,6 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, now
   }
   if (g.state === 'expired' || new Date(g.expires_at) <= now) {
     return deny(401, 'preview_ticket_expired', 'preview ticket expired', audit);
-  }
-  if (g.allocation_id !== allocation.id) {
-    return deny(403, 'preview_ticket_mismatch', 'preview ticket does not match allocation', audit);
   }
 
   const exposureDeny = await checkExposure(pool, allocation, g.user_id);

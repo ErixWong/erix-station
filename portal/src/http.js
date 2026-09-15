@@ -63,6 +63,13 @@ function getCookie(req, name) {
   return null;
 }
 
+/** F2：审计前只记 path，剥离所有 query（?preview_ticket=<明文> 等绝不入审计）。 */
+function pathOnly(uri) {
+  if (typeof uri !== 'string') return '/';
+  const q = uri.indexOf('?');
+  return q === -1 ? uri : uri.slice(0, q);
+}
+
 function sessionCookieHeader(cookie, token) {
   const parts = [`${cookie.name}=${token}`, `Path=${cookie.path}`];
   if (cookie.httpOnly) parts.push('HttpOnly');
@@ -471,9 +478,9 @@ async function handleForwardAuth(req, res, ctx) {
     scheme,
   });
 
-  // 审计：每次判定（无论通过与否）都写（portal.md §2.7）。details 不记 ticket/cookie 明文。
+  // 审计：每次判定（无论通过与否）都写（portal.md §2.7）。details 不记 ticket/cookie 明文，也不记 query（F2：剥离所有 query，只记 path）。
   const details = {
-    uri,
+    uri: pathOnly(uri),
     method,
     exposure: result.allocation?.exposure ?? null,
     result: result.outcome,

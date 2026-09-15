@@ -1,16 +1,17 @@
-// FDE 容器 provisioning：经 socket-proxy 调 Docker API（DOCKER_HOST），创建/启动/停止/删除 FDE 容器。
+// FDE 容器 provisioning：经自研 admission proxy 调 Docker API（DOCKER_HOST），创建/启动/停止/删除 FDE 容器。
 // 依据：docs/design/deploy-contract.md §5（B6 创建字段 allowlist / socket-proxy 白名单）/§6（容器创建契约）、
 //       docs/design/topology.md §3（每 FDE 一条 /29）、docs/design/user-space.md §2/§6（bind mount / UID / 权限）、
 //       docs/data/schema.sql §2/§9（containers / fde_networks）。
 //
 // 三条不变式落地：
 //   1. FDE 容器不 publish 端口（HostConfig.PortBindings 恒空）；
-//   2. portal 不挂 docker.sock（只经 DOCKER_HOST=tcp://station-docker-socket-proxy:2375 访问）；
+//   2. portal 不挂 docker.sock（只经 DOCKER_HOST=tcp://station-docker-proxy:2375 访问自研 admission proxy）；
 //   3. DB 是状态真相（容器状态回写 containers；启动/定时对账 DB↔Docker）。
 //
 // 代码层 Docker API 白名单（DOCKER_ALLOWED_PATHS）：只允许下列路径，多余路径一律拒绝（B6 落地）。
 
 import path from 'node:path';
+import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { ensureDirSafe } from './fsutil.js';
 import { parseCidr, intToIp, allocateNetwork } from './ipam.js';
@@ -116,6 +117,22 @@ export function parseMemoryLimit(value) {
   return Math.floor(n * mult);
 }
 
+/** 断言 bind source realpath 仍在 userSpaceRoot 内（防 symlink 逃逸；不存在则交给 docker 报错）。 */
+function assertBindSourceInsideRoot(userSpaceRoot, bindSource) {
+  let resolved;
+  try {
+    resolved = fs.realpathSync(bindSource);
+  } catch {
+    return; // 目录尚未物化：ensureUserSpaceMountDirs 之后才创建；交给 docker 报错。
+  }
+  const root = path.resolve(userSpaceRoot);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    const err = new Error(`bind source escapes user space (symlink?): ${bindSource} -> ${resolved}`);
+    err.code = 'bind_source_escaped';
+    throw err;
+  }
+}
+
 /**
  * FDE 容器的 Docker API create body（契约 §6.2/§6.4）。
  * 不变式：不 publish 端口（无 PortBindings）、不挂 docker.sock、bind mount 只允许本 FDE 用户空间。
@@ -136,8 +153,8 @@ export function buildContainerConfig({
   env = [],
   labels = {},
   memoryLimit = '512m',
-  runUser = null, // '1001:1000' 等；镜像不具备双 UID 用户时用 --user 兜底
-  capAdd = [],
+  runUser = null, // '1001:1000' 等；镜像不具备双 UID 用户时用 --user 兜底（FDE_DEV_USER，⚠️ dev 偏差）
+  capAdd = ['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL'], // 契约 §6.2：root 启动→drop 1001、fork 1002 所需最小集（含跨 UID kill 的 CAP_KILL）
 }) {
   const home = `/home/${homeUser}`;
   const hostRoot = path.join(path.resolve(userSpaceRoot), fdeName);
@@ -147,10 +164,16 @@ export function buildContainerConfig({
     `${hostRoot}/worktrees:${home}/worktrees`,
     `${hostRoot}/cache:${home}/cache`,
   ];
+  // P3 纵深防御：bind source realpath 后必须仍在 userSpaceRoot 内（防 symlink 逃逸）。
+  for (const b of binds) assertBindSourceInsideRoot(userSpaceRoot, b.split(':')[0]);
   const body = {
     Image: image,
     Cmd: cmd,
-    Env: env,
+    Env: [
+      ...(env ?? []),
+      // F4：容器内 agentd 依赖的 internal API base URL（契约 §6.2）。
+      `ERIX_STATION_BASE_URL=https://station.${baseDomain}/api/internal`,
+    ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, ...labels },
     HostConfig: {
       Binds: binds,
@@ -161,15 +184,11 @@ export function buildContainerConfig({
       CapAdd: capAdd,
       Init: true,
       Memory: parseMemoryLimit(memoryLimit),
-      ExtraHosts: [`station.${baseDomain}:${gateway}`, `llm.${baseDomain}:${gateway}`],
-      // 不变式一：不 publish 端口。
-      PortBindings: {},
+      // 不变式一：不 publish 端口 —— 不携带 PortBindings 字段（proxy P1 字段级 allowlist 拒绝任何 PortBindings）。
     },
-    NetworkingConfig: {
-      EndpointsConfig: {
-        [networkName]: { IPAMConfig: { IPv4Address: ip } },
-      },
-    },
+    // R2：不再携带 NetworkingConfig（--ip）——proxy 第三轮加固已直接拒绝该字段；
+    // 单容器/单网络下默认 IPAM 顺序分配即固定位 .2（topology §3）。
+    // R5：不再携带 ExtraHosts（--add-host）——proxy 已直接拒绝该字段。
   };
   if (runUser) body.User = runUser;
   return body;
@@ -179,7 +198,6 @@ export function buildContainerConfig({
 export function buildNetworkConfig({ name, subnet, gateway, fdeName }) {
   return {
     Name: name,
-    CheckDuplicate: true,
     Driver: 'bridge',
     IPAM: { Driver: 'default', Config: [{ Subnet: subnet, Gateway: gateway }] },
     Labels: { 'station.managed': 'true', 'fde.name': fdeName },
@@ -200,17 +218,41 @@ export function ensureUserSpaceMountDirs({ userSpaceRoot, fdeName, uid, gid, log
 // Docker 编排（按 name 幂等；404 = 不存在）
 // ---------------------------------------------------------------------------
 
+/** 校验 inspect 返回的网络满足契约（managed + fde.name + subnet + gateway）。不满足抛错。 */
+function assertNetworkContract(data, { name, subnet, gateway, fdeName }) {
+  const labels = data?.Labels ?? {};
+  const ipam = data?.IPAM?.Config?.[0] ?? {};
+  const managedOk = labels['station.managed'] === 'true';
+  const fdeNameOk = labels['fde.name'] === fdeName;
+  const subnetOk = ipam.Subnet === subnet;
+  const gatewayOk = ipam.Gateway === gateway;
+  if (!managedOk || !fdeNameOk || !subnetOk || !gatewayOk) {
+    throw new Error(
+      `network ${name} exists but mismatches contract (managed=${labels['station.managed']}, fde.name=${labels['fde.name']}, subnet=${ipam.Subnet}, gateway=${ipam.Gateway}); expected managed=true, fde.name=${fdeName}, ${subnet}, ${gateway}`,
+    );
+  }
+}
+
 /** 确保 docker 网络存在（不存在则按契约创建）。返回 { created, id }。 */
 export async function ensureFdeNetwork(docker, { name, subnet, gateway, fdeName, log = console }) {
   const existing = await docker.inspectNetwork(name);
-  if (existing.status === 200) return { created: false, id: existing.data?.Id ?? null };
+  if (existing.status === 200) {
+    // F11：inspect 200 后必须校验 managed label + fde.name + subnet/gateway 与 DB 一致；不一致 → 报错（不静默采用）。
+    assertNetworkContract(existing.data ?? {}, { name, subnet, gateway, fdeName });
+    return { created: false, id: existing.data?.Id ?? null };
+  }
   if (existing.status !== 404) {
     throw new Error(`inspect network ${name} failed: HTTP ${existing.status}`);
   }
   const res = await docker.createNetwork(buildNetworkConfig({ name, subnet, gateway, fdeName }));
   if (res.status === 409) {
-    // 并发下另一 reconcile/onboard 已创建 → 视为已存在。
-    return { created: false, id: null };
+    // 并发下另一 reconcile/onboard 已创建 → 必须 re-inspect 并做同样契约校验（F11/P4）。
+    const now = await docker.inspectNetwork(name);
+    if (now.status !== 200) {
+      throw new Error(`re-inspect network ${name} after 409 failed: HTTP ${now.status}`);
+    }
+    assertNetworkContract(now.data ?? {}, { name, subnet, gateway, fdeName });
+    return { created: false, id: now.data?.Id ?? null };
   }
   if (res.status !== 201 && res.status !== 200) {
     throw new Error(`create network ${name} failed: HTTP ${res.status} ${JSON.stringify(res.data)}`);
@@ -225,9 +267,18 @@ export function generateRunnerToken() {
   return { token, tokenHash: hashToken(token) };
 }
 
+/** 从 Docker inspect 返回的 Config.Env 中读取 ERIX_STATION_TOKEN 原文（用于对账校验 hash 一致）。 */
+export function readContainerEnv(inspectData, key = 'ERIX_STATION_TOKEN') {
+  const env = inspectData?.Config?.Env ?? [];
+  const prefix = `${key}=`;
+  const line = env.find((e) => typeof e === 'string' && e.startsWith(prefix));
+  return line ? line.slice(prefix.length) : null;
+}
+
 /**
  * 确保 FDE 容器存在并 running（不存在则创建+启动）。
- * 返回 { created, started, id, token }（token 仅在新建时生成并注入容器 env）。
+ * @param opts.runnerToken 可选：单点生成的 token 原文；不传则内部新生成。
+ * 返回 { created, started, id, token, envToken }（envToken = 容器内实际 ERIX_STATION_TOKEN 原文，供对账校验）。
  */
 export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
   const { containerName } = opts;
@@ -242,13 +293,14 @@ export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
       }
       started = true;
     }
-    return { created: false, started, id: existing.data?.Id ?? null, token: null };
+    return { created: false, started, id: existing.data?.Id ?? null, token: null, envToken: readContainerEnv(existing.data) };
   }
   if (existing.status !== 404) {
     throw new Error(`inspect container ${containerName} failed: HTTP ${existing.status}`);
   }
 
-  const { token } = generateRunnerToken();
+  // F6：单点生成——onboard 传入的 token 与 DB hash 同源；未传入则此处生成（reconcile 重建路径）。
+  const token = opts.runnerToken ?? generateRunnerToken().token;
   const body = buildContainerConfig({
     ...opts,
     env: [...(opts.env ?? []), `ERIX_STATION_TOKEN=${token}`, `ERIX_FDE_NAME=${opts.fdeName}`],
@@ -260,7 +312,7 @@ export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
     if (now.status === 200) {
       const status = now.data?.State?.Status;
       if (status !== 'running') await docker.startContainer(containerName);
-      return { created: false, started: status !== 'running', id: now.data?.Id ?? null, token: null };
+      return { created: false, started: status !== 'running', id: now.data?.Id ?? null, token: null, envToken: readContainerEnv(now.data) };
     }
   }
   if (created.status !== 201) {
@@ -272,29 +324,33 @@ export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
     throw new Error(`start container ${containerName} failed: HTTP ${started.status}`);
   }
   log.log?.(`[provisioner] container created: ${containerName} (${id})`);
-  return { created: true, started: true, id, token };
+  return { created: true, started: true, id, token, envToken: token };
 }
 
-/** 停止并删除 FDE 容器（404 视为已删）。 */
+/** 停止并删除 FDE 容器（404 视为已删）。返回 { ok, stopped, removed }（F9：删除失败时 ok=false，供调用方保留 desired state）。 */
 export async function removeFdeContainer(docker, containerName, { log = console } = {}) {
-  const stop = await docker.stopContainer(containerName).catch(() => ({ status: 404 }));
+  const stop = await docker.stopContainer(containerName).catch((e) => ({ status: 500, error: e }));
   if (stop.status !== 204 && stop.status !== 304 && stop.status !== 404) {
     log.warn?.(`[provisioner] stop ${containerName} returned ${stop.status}`);
   }
-  const rm = await docker.removeContainer(containerName).catch(() => ({ status: 404 }));
+  const rm = await docker.removeContainer(containerName).catch((e) => ({ status: 500, error: e }));
   if (rm.status !== 204 && rm.status !== 404) {
     log.warn?.(`[provisioner] rm ${containerName} returned ${rm.status}`);
   }
-  return rm.status === 204 || rm.status === 404;
+  return {
+    ok: rm.status === 204 || rm.status === 404,
+    stopped: stop.status === 204 || stop.status === 304 || stop.status === 404,
+    removed: rm.status === 204 || rm.status === 404,
+  };
 }
 
-/** 删除 FDE 网络（404 视为已删；不删仍被容器占用的网络）。 */
+/** 删除 FDE 网络（404 视为已删；不删仍被容器占用的网络）。返回 { ok, removed }。 */
 export async function removeFdeNetwork(docker, networkName, { log = console } = {}) {
-  const rm = await docker.removeNetwork(networkName).catch(() => ({ status: 404 }));
+  const rm = await docker.removeNetwork(networkName).catch((e) => ({ status: 500, error: e }));
   if (rm.status !== 204 && rm.status !== 404) {
     log.warn?.(`[provisioner] rm network ${networkName} returned ${rm.status}`);
   }
-  return rm.status === 204 || rm.status === 404;
+  return { ok: rm.status === 204 || rm.status === 404, removed: rm.status === 204 || rm.status === 404 };
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +378,43 @@ export function fdeContainerIp(subnet) {
   return intToIp((parsed.base + 2) >>> 0);
 }
 
+/** per-fde advisory lock：串行化同一 FDE 的 Docker 变更（provision/reconcile/deprovision），F7/F10。
+ *  单测 fake pool 无 connect 时跳过（进程内互斥仍靠 ON CONFLICT / 409）。 */
+async function withFdeLock(pool, fdeName, fn) {
+  let client;
+  try {
+    client = await pool.connect();
+  } catch {
+    return fn();
+  }
+  const key = `fde:${fdeName}`;
+  try {
+    await client.query('SELECT pg_advisory_lock(hashtext($1))', [key]);
+    return await fn();
+  } finally {
+    await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]).catch(() => {});
+    client.release();
+  }
+}
+
+/** 同步 upsert containers 行（F7/F8：ON CONFLICT 幂等 + 含 token hash），消除 DB/容器分裂。 */
+async function upsertContainerRow(pool, { userId, fdeName, containerName, tokenHash, image, agentVersion }) {
+  await pool.query(
+    `INSERT INTO containers (user_id, fde_name, container_name, runner_token_hash, token_generation, status, image, agent_version)
+     VALUES ($1, $2, $3, $4, 1, 'creating', $5, $6)
+     ON CONFLICT (fde_name) DO UPDATE SET
+       container_name = EXCLUDED.container_name,
+       runner_token_hash = EXCLUDED.runner_token_hash,
+       token_generation = containers.token_generation + 1,
+       status = 'creating',
+       image = EXCLUDED.image,
+       agent_version = EXCLUDED.agent_version,
+       rotated_at = now(),
+       updated_at = now()`,
+    [userId, fdeName, containerName, tokenHash, image, agentVersion],
+  );
+}
+
 /**
  * 对账一轮：① DB 说该有而 Docker 没有 → 重建；② Docker 多出孤儿容器 → 按策略删除 + 告警。
  * 容器状态回写 DB（running/stopped/removed）。返回统计供测试/观测。
@@ -340,18 +433,24 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
     const ip = fdeContainerIp(subnet);
 
     try {
-      ensureUserSpaceMountDirs({
-        userSpaceRoot: config.userSpaceRoot,
-        fdeName,
-        uid: config.fdeUid ?? 1000,
-        gid: config.fdeGid ?? 1000,
-        log,
-      });
-      await ensureFdeNetwork(docker, { name: networkName, subnet, gateway, fdeName, log });
+      await withFdeLock(pool, fdeName, async () => {
+        // F10：锁内重新确认仍是 desired（deprovision 可能已 release，旧快照不再重建）。
+        const still = await pool.query(
+          `SELECT 1 FROM fde_networks WHERE fde_id = $1 AND state IN ('allocated','active')`,
+          [row.user_id],
+        );
+        if (still.rows.length === 0) return;
 
-      const res = await ensureFdeContainer(
-        docker,
-        {
+        ensureUserSpaceMountDirs({
+          userSpaceRoot: config.userSpaceRoot,
+          fdeName,
+          uid: config.fdeUid ?? 1000,
+          gid: config.fdeGid ?? 1000,
+          log,
+        });
+        await ensureFdeNetwork(docker, { name: networkName, subnet, gateway, fdeName, log });
+
+        const opts = {
           fdeName,
           containerName,
           image: config.fdeImage,
@@ -361,40 +460,47 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           gateway,
           baseDomain: config.baseDomain,
           llmHost: config.llmHost,
-          userSpaceRoot: config.userSpaceRoot,
+          userSpaceRoot: config.userSpaceRootHost, // F3：bind source 用宿主路径（与容器内 userSpaceRoot 解耦）
           memoryLimit: config.fdeMemoryLimit,
-          runUser: `${config.agentdUid ?? 1001}:${config.fdeGid ?? 1000}`,
-        },
-        { log },
-      );
+          runUser: config.fdeDevUser ?? null, // F5：生产留空（镜像 entrypoint 降权）；dev 用 FDE_DEV_USER 兜底
+        };
 
-      // 容器状态回写 DB（DB 是真相）；重建时同步写入 runner_token_hash（轮换，issue #12）。
-      if (res.created) {
-        stats.rebuilt += 1;
-        if (res.token) {
-          await pool.query(
-            `UPDATE containers
-                SET status = 'running', runner_token_hash = $2, token_generation = token_generation + 1,
-                    rotated_at = now(), updated_at = now()
-              WHERE user_id = $1`,
-            [row.user_id, hashToken(res.token)],
-          );
-        } else {
+        let res = await ensureFdeContainer(docker, opts, { log });
+
+        // F6：容器 env token 与 DB hash 必须一致；缺失/失配 → 重建。
+        const dbHash = row.runner_token_hash;
+        if (!res.created && (res.envToken == null || !dbHash || hashToken(res.envToken) !== dbHash)) {
+          await removeFdeContainer(docker, containerName, { log });
+          res = await ensureFdeContainer(docker, opts, { log });
+        }
+
+        if (res.created) {
+          // F8：对账创建容器时同步 upsert containers 行（含 token hash），消除 DB/容器分裂。
+          await upsertContainerRow(pool, {
+            userId: row.user_id,
+            fdeName,
+            containerName,
+            tokenHash: hashToken(res.token),
+            image: config.fdeImage,
+            agentVersion: config.fdeAgentVersion ?? 'dev',
+          });
+          stats.rebuilt += 1;
+        } else if (res.started) {
           await pool.query(
             `UPDATE containers SET status = 'running', updated_at = now()
               WHERE user_id = $1 AND status <> 'removed'`,
             [row.user_id],
           );
+          stats.statusUpdates += 1;
         }
-      } else if (res.started) {
+        // 兑底：确保 status 收敛到 running。
         await pool.query(
           `UPDATE containers SET status = 'running', updated_at = now()
-            WHERE user_id = $1 AND status <> 'removed'`,
+            WHERE user_id = $1 AND status IN ('creating','stopped','exited')`,
           [row.user_id],
         );
-        stats.statusUpdates += 1;
-      }
-      stats.ensured += 1;
+        stats.ensured += 1;
+      });
     } catch (err) {
       log.warn?.(`[provisioner] reconcile fde=${fdeName} failed: ${err.message}`);
     }
@@ -412,113 +518,143 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
        VALUES (NULL, 'container.orphan_removed', $1, $2)`,
       [name, JSON.stringify({ reason: 'docker has managed container not present in DB desired state' })],
     ).catch(() => {});
-    await removeFdeContainer(docker, name, { log }).catch(() => {});
-    stats.orphansRemoved += 1;
+    const rm = await removeFdeContainer(docker, name, { log }).catch(() => ({ ok: false }));
+    if (rm.ok) stats.orphansRemoved += 1;
   }
 
   return stats;
 }
 
-/** onboarding：分配子网（IPAM）→ 写 containers 行 → 建网络 + 容器 → status running。幂等。 */
+/** onboarding：分配子网（IPAM）→ 单点生成 token（hash 入 DB + 明文只进 create env）→ 建网络 + 容器 → status running。幂等。 */
 export async function onboardFde(pool, config, { fdeName, docker, log = console } = {}) {
-  const user = await pool.query(
-    `SELECT id, fde_name, status FROM users WHERE fde_name = $1 AND status = 'active'`,
-    [fdeName],
-  );
-  const u = user.rows[0];
-  if (!u) throw new Error(`no active user with fde_name=${fdeName}`);
-  const userId = u.id;
-
-  const net = await allocateNetwork(pool, userId, fdeName, {
-    poolName: config.fdePool ?? 'default',
-    reservedSubnets: config.reservedSubnets ?? [],
-    log,
-  });
-
-  const existing = await pool.query(`SELECT id FROM containers WHERE user_id = $1`, [userId]);
-  let containerId;
-  if (existing.rows[0]) {
-    containerId = existing.rows[0].id;
-  } else {
-    const { tokenHash } = generateRunnerToken();
-    const row = await pool.query(
-      `INSERT INTO containers (user_id, fde_name, container_name, runner_token_hash, token_generation, status, image, agent_version)
-       VALUES ($1, $2, $3, $4, 1, 'creating', $5, $6)
-       RETURNING id`,
-      [userId, fdeName, `fde-${fdeName}`, tokenHash, config.fdeImage, config.fdeAgentVersion ?? 'dev'],
+  return withFdeLock(pool, fdeName, async () => {
+    const user = await pool.query(
+      `SELECT id, fde_name, status FROM users WHERE fde_name = $1 AND status = 'active'`,
+      [fdeName],
     );
-    containerId = row.rows[0].id;
-  }
+    const u = user.rows[0];
+    if (!u) throw new Error(`no active user with fde_name=${fdeName}`);
+    const userId = u.id;
 
-  ensureUserSpaceMountDirs({
-    userSpaceRoot: config.userSpaceRoot,
-    fdeName,
-    uid: config.fdeUid ?? 1000,
-    gid: config.fdeGid ?? 1000,
-    log,
-  });
+    const net = await allocateNetwork(pool, userId, fdeName, {
+      poolName: config.fdePool ?? 'default',
+      reservedSubnets: config.reservedSubnets ?? [],
+      log,
+    });
 
-  const subnet = net.subnet;
-  const gateway = net.gateway;
-  const ip = fdeContainerIp(subnet);
-  await ensureFdeNetwork(docker, { name: net.network_name, subnet, gateway, fdeName, log });
-  const res = await ensureFdeContainer(
-    docker,
-    {
-      fdeName,
-      containerName: `fde-${fdeName}`,
-      image: config.fdeImage,
-      cmd: config.fdeCmd,
-      networkName: net.network_name,
-      ip,
-      gateway,
-      baseDomain: config.baseDomain,
-      llmHost: config.llmHost,
+    const containerName = `fde-${fdeName}`;
+    // F6：单点 token——检查既有 DB 行与既有容器 env token 是否一致，一致则复用（幂等，不轮换）。
+    const dbRow = (await pool.query(`SELECT id, runner_token_hash FROM containers WHERE user_id = $1`, [userId])).rows[0];
+    const existing = await docker.inspectContainer(containerName);
+    const envToken = existing.status === 200 ? readContainerEnv(existing.data) : null;
+
+    let token;
+    let tokenHash;
+    let containerId;
+    let needRecreate;
+    if (dbRow && existing.status === 200 && envToken && hashToken(envToken) === dbRow.runner_token_hash) {
+      token = envToken;
+      tokenHash = dbRow.runner_token_hash;
+      containerId = dbRow.id;
+      needRecreate = false;
+    } else {
+      ({ token, tokenHash } = generateRunnerToken());
+      needRecreate = true;
+      if (dbRow) {
+        await pool.query(
+          `UPDATE containers SET runner_token_hash = $2, token_generation = token_generation + 1,
+              status = 'creating', rotated_at = now(), updated_at = now() WHERE id = $1`,
+          [dbRow.id, tokenHash],
+        );
+        containerId = dbRow.id;
+      } else {
+        const row = await pool.query(
+          `INSERT INTO containers (user_id, fde_name, container_name, runner_token_hash, token_generation, status, image, agent_version)
+           VALUES ($1, $2, $3, $4, 1, 'creating', $5, $6)
+           RETURNING id`,
+          [userId, fdeName, containerName, tokenHash, config.fdeImage, config.fdeAgentVersion ?? 'dev'],
+        );
+        containerId = row.rows[0].id;
+      }
+    }
+
+    ensureUserSpaceMountDirs({
       userSpaceRoot: config.userSpaceRoot,
-      memoryLimit: config.fdeMemoryLimit,
-      runUser: `${config.agentdUid ?? 1001}:${config.fdeGid ?? 1000}`,
-    },
-    { log },
-  );
+      fdeName,
+      uid: config.fdeUid ?? 1000,
+      gid: config.fdeGid ?? 1000,
+      log,
+    });
 
-  if (res.created && res.token) {
-    await pool.query(
-      `UPDATE containers SET status = 'running', runner_token_hash = $2, token_generation = token_generation + 1,
-          rotated_at = now(), updated_at = now() WHERE id = $1`,
-      [containerId, hashToken(res.token)],
+    const subnet = net.subnet;
+    const gateway = net.gateway;
+    const ip = fdeContainerIp(subnet);
+    await ensureFdeNetwork(docker, { name: net.network_name, subnet, gateway, fdeName, log });
+    if (needRecreate) {
+      await removeFdeContainer(docker, containerName, { log }); // 删除失配旧容器（若有）
+    }
+    const res = await ensureFdeContainer(
+      docker,
+      {
+        fdeName,
+        containerName,
+        image: config.fdeImage,
+        cmd: config.fdeCmd,
+        networkName: net.network_name,
+        ip,
+        gateway,
+        baseDomain: config.baseDomain,
+        llmHost: config.llmHost,
+        userSpaceRoot: config.userSpaceRootHost, // F3
+        memoryLimit: config.fdeMemoryLimit,
+        runUser: config.fdeDevUser ?? null, // F5
+        runnerToken: token,
+      },
+      { log },
     );
-  } else {
-    await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);
-  }
 
-  return {
-    userId,
-    containerId,
-    networkName: net.network_name,
-    subnet,
-    gateway,
-    containerName: `fde-${fdeName}`,
-  };
+    await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);
+
+    return {
+      userId,
+      containerId,
+      networkName: net.network_name,
+      subnet,
+      gateway,
+      containerName,
+    };
+  });
 }
 
-/** offboarding（容器+网络）：停/删容器 → 删网络 → DB 状态收敛（removed / released）。 */
+/** offboarding（容器+网络）：停/删容器 → 删网络 → DB 状态收敛（removed / released）。F9：删除失败不标 removed。 */
 export async function deprovisionFde(pool, config, { fdeName, docker, log = console } = {}) {
-  const user = await pool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
-  const u = user.rows[0];
-  if (!u) throw new Error(`no user with fde_name=${fdeName}`);
+  return withFdeLock(pool, fdeName, async () => {
+    const user = await pool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
+    const u = user.rows[0];
+    if (!u) throw new Error(`no user with fde_name=${fdeName}`);
 
-  const containerName = `fde-${fdeName}`;
-  const networkName = `fde-${fdeName}`;
-  await removeFdeContainer(docker, containerName, { log }).catch((err) => log.warn?.(`[provisioner] ${err.message}`));
-  await removeFdeNetwork(docker, networkName, { log }).catch((err) => log.warn?.(`[provisioner] ${err.message}`));
+    const containerName = `fde-${fdeName}`;
+    const networkName = `fde-${fdeName}`;
+    const containerRm = await removeFdeContainer(docker, containerName, { log });
+    if (!containerRm.ok) {
+      // F9：Docker 删除失败 → 不更新 DB（保留 desired state 供下次对账重试）+ 告警。
+      log.warn?.(`[provisioner] deprovision ${fdeName}: container removal failed; desired state preserved for retry`);
+      throw new Error(`deprovision ${fdeName}: container removal failed (status preserved for retry)`);
+    }
+    const networkRm = await removeFdeNetwork(docker, networkName, { log });
+    if (!networkRm.ok) {
+      log.warn?.(`[provisioner] deprovision ${fdeName}: network removal failed; desired state preserved for retry`);
+      throw new Error(`deprovision ${fdeName}: network removal failed (status preserved for retry)`);
+    }
 
-  await pool.query(`UPDATE containers SET status = 'removed', updated_at = now() WHERE user_id = $1 AND status <> 'removed'`, [u.id]);
-  await pool.query(
-    `UPDATE fde_networks SET state = 'released', released_at = now()
-      WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
-    [u.id],
-  );
-  return { userId: u.id, containerName, networkName };
+    await pool.query(`UPDATE containers SET status = 'removed', updated_at = now() WHERE user_id = $1 AND status <> 'removed'`, [u.id]);
+    await pool.query(
+      `UPDATE fde_networks SET state = 'released', released_at = now()
+        WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
+      [u.id],
+    );
+    return { userId: u.id, containerName, networkName };
+  });
 }
 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
