@@ -111,15 +111,15 @@ export class FakePool {
       };
     }
 
-    // renewSession：滚动续期（距上次续期超阈值才写库）
+    // renewSession：滚动续期（距上次续期超阈值才写库；last_seen_at=本次活动时间，expires_at=本次活动+TTL）
     if (sql.includes('UPDATE login_sessions') && sql.includes('last_seen_at <')) {
-      const [sessionId, expiresAt, cutoff] = params;
+      const [sessionId, expiresAt, lastSeenAt, cutoff] = params;
       const s = this.sessions.find(
         (x) => x.id === sessionId && x.revoked_at === null && new Date(x.last_seen_at) < new Date(cutoff),
       );
       if (!s) return { rows: [] };
       s.expires_at = expiresAt;
-      s.last_seen_at = expiresAt;
+      s.last_seen_at = lastSeenAt;
       return { rows: [{ expires_at: expiresAt }] };
     }
 

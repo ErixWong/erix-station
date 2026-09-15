@@ -199,6 +199,7 @@ export async function consumePendingToken(pool, token, { now = new Date() } = {}
 /**
  * 校验某用户的 TOTP（窗口 ±1 + 单码防重放 + last_totp_step 原子推进）。
  * 返回 { ok, user } 或 { ok:false, reason: 'totp_invalid' | 'totp_replay' }。
+ * 畸形 totp_secret（非法 base32）一律按认证失败处理（不 500）。
  */
 export async function verifyTotpForUser(
   pool,
@@ -209,6 +210,7 @@ export async function verifyTotpForUser(
     digits = totpLib.DEFAULT_DIGITS,
     period = totpLib.DEFAULT_PERIOD,
     window = totpLib.DEFAULT_WINDOW,
+    log,
   } = {},
 ) {
   const res = await pool.query(
@@ -219,13 +221,20 @@ export async function verifyTotpForUser(
   const row = res.rows?.[0];
   if (!row || !row.totp_secret) return { ok: false, reason: 'totp_invalid' };
   const lastStep = row.last_totp_step == null ? null : Number(row.last_totp_step);
-  const result = totpLib.verifyTotp(row.totp_secret, code, {
-    digits,
-    period,
-    window,
-    time: now.getTime(),
-    lastStep,
-  });
+  let result;
+  try {
+    result = totpLib.verifyTotp(row.totp_secret, code, {
+      digits,
+      period,
+      window,
+      time: now.getTime(),
+      lastStep,
+    });
+  } catch (err) {
+    // 非法 base32 等畸形种子：按认证失败处理，绝不 500。
+    log?.warn?.(`[auth] malformed totp_secret for user=${userId} (treated as totp_invalid)`);
+    return { ok: false, reason: 'totp_invalid' };
+  }
   if (!result.valid) {
     return { ok: false, reason: result.replay ? 'totp_replay' : 'totp_invalid' };
   }
@@ -303,6 +312,7 @@ export async function findSessionUser(pool, token, { now = new Date() } = {}) {
 
 /**
  * 滚动续期：距上次续期超过 renewIntervalMs 才写库（避免每个请求都写）。
+ * 滚动语义（portal.md §2.5）：last_seen_at = 本次活动时间，expires_at = 本次活动 + TTL。
  * 返回新的 expires_at（Date）表示已续期，否则 null。
  */
 export async function renewSession(
@@ -314,12 +324,12 @@ export async function renewSession(
   const cutoff = new Date(now.getTime() - renewIntervalMs);
   const res = await pool.query(
     `UPDATE login_sessions
-        SET expires_at = $2, last_seen_at = $2
+        SET expires_at = $2, last_seen_at = $3
       WHERE id = $1
         AND revoked_at IS NULL
-        AND last_seen_at < $3
+        AND last_seen_at < $4
       RETURNING expires_at`,
-    [sessionId, expiresAt, cutoff],
+    [sessionId, expiresAt, now, cutoff],
   );
   return res.rows?.[0]?.expires_at ?? null;
 }

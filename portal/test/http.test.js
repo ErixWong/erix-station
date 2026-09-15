@@ -20,9 +20,17 @@ async function startServer({ users = [], overrides = {} } = {}) {
     sessionRenewIntervalSeconds: 3600,
     pendingTokenTtlSeconds: 120,
     totp: { issuer: 'FDE Station', digits: 6, period: 30, window: 1 },
-    loginRateLimit: { maxFailures: 5, windowMs: 15 * 60 * 1000, blockMs: 60 * 1000 },
-    totpRateLimit: { maxFailures: 5, windowMs: 15 * 60 * 1000, blockMs: 60 * 1000 },
+    loginRateLimit: { maxFailures: 5, windowMs: 15 * 60 * 1000, blockMs: 60 * 1000, maxEntries: 10000 },
+    totpRateLimit: {
+      maxFailures: 5,
+      windowMs: 15 * 60 * 1000,
+      blockMs: 60 * 1000,
+      perTokenMaxFailures: 5,
+      maxEntries: 10000,
+    },
     kdfConcurrency: 2,
+    kdfQueueLimit: 100,
+    kdfQueueTimeoutMs: 30000,
     maxBodyBytes: 64 * 1024,
     maxLoginLength: 128,
     maxPasswordLength: 256,
@@ -291,5 +299,185 @@ test('旧路径 /api/login、/api/logout → 307 到新路径', async () => {
     assert.equal(r.headers.get('location'), '/api/auth/login');
   } finally {
     await s.close();
+  }
+});
+
+test('TOTP 限流按账户+IP 计数：换新 pending token 仍被限流（不被绕过）', async () => {
+  const password = 'pw';
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+    auth_source: 'local', status: 'active',
+    password_hash: await auth.hashPassword(password),
+    totp_secret: totp.generateSecret(20), last_totp_step: null,
+  };
+  const s = await startServer({
+    users: [user],
+    overrides: {
+      totpRateLimit: {
+        maxFailures: 2,
+        windowMs: 60 * 1000,
+        blockMs: 60 * 1000,
+        perTokenMaxFailures: 10,
+        maxEntries: 10000,
+      },
+    },
+  });
+  const login = async () => {
+    const r = await fetch(`${s.base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    assert.equal(r.status, 200);
+    return (await r.json()).pending_token;
+  };
+  const tryTotp = (token) =>
+    fetch(`${s.base}/api/auth/login/totp`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pending_token: token, code: '000000' }),
+    });
+
+  try {
+    let token = await login();
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await tryTotp(token)).status, 401);
+    }
+
+    // 口令步成功拿到全新 pending token，但账户+IP 计数已封禁 → 仍 429
+    token = await login();
+    const blocked = await tryTotp(token);
+    assert.equal(blocked.status, 429);
+    assert.ok(Number(blocked.headers.get('retry-after')) > 0);
+    assert.equal((await blocked.json()).error.code, 'rate_limited');
+  } finally {
+    await s.close();
+  }
+});
+
+test('TOTP 单 token 尝试上限独立生效：同 token 超限 → 429', async () => {
+  const password = 'pw';
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+    auth_source: 'local', status: 'active',
+    password_hash: await auth.hashPassword(password),
+    totp_secret: totp.generateSecret(20), last_totp_step: null,
+  };
+  const s = await startServer({
+    users: [user],
+    overrides: {
+      totpRateLimit: {
+        maxFailures: 10,
+        windowMs: 60 * 1000,
+        blockMs: 60 * 1000,
+        perTokenMaxFailures: 2,
+        maxEntries: 10000,
+      },
+    },
+  });
+  try {
+    const step1 = await fetch(`${s.base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    const { pending_token } = await step1.json();
+    for (let i = 0; i < 2; i++) {
+      const r = await fetch(`${s.base}/api/auth/login/totp`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pending_token, code: '000000' }),
+      });
+      assert.equal(r.status, 401);
+    }
+    const blocked = await fetch(`${s.base}/api/auth/login/totp`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pending_token, code: '000000' }),
+    });
+    assert.equal(blocked.status, 429);
+    assert.equal((await blocked.json()).error.code, 'rate_limited');
+  } finally {
+    await s.close();
+  }
+});
+
+test('畸形 totp_secret（非法 base32）→ 401 totp_invalid，不 500', async () => {
+  const password = 'pw';
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+    auth_source: 'local', status: 'active',
+    password_hash: await auth.hashPassword(password),
+    totp_secret: 'not-base32!', last_totp_step: null,
+  };
+  const s = await startServer({ users: [user] });
+  try {
+    const step1 = await fetch(`${s.base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    const { pending_token } = await step1.json();
+    const r = await fetch(`${s.base}/api/auth/login/totp`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pending_token, code: '123456' }),
+    });
+    assert.equal(r.status, 401);
+    assert.equal((await r.json()).error.code, 'totp_invalid');
+  } finally {
+    await s.close();
+  }
+});
+
+test('KDF 队列满 → 503 kdf_busy（快速失败，不无限排队）', async () => {
+  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
+  fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
+  const password = 'pw';
+  const passwordHash = await auth.hashPassword(password);
+  let releaseGate;
+  const gate = new Promise((r) => { releaseGate = r; });
+  const pool = {
+    async query(sql) {
+      if (sql.includes('schema_migrations')) return { rows: [{ version: '0000_baseline' }] };
+      if (sql.includes('FROM users WHERE login')) {
+        await gate; // 持有 KDF 信号量，制造并发
+        return {
+          rows: [{ id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null, auth_source: 'local', status: 'active', password_hash: passwordHash }],
+        };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+  const config = {
+    cookie: cookieSettings('dev-http', 604800),
+    sessionTtlSeconds: 604800,
+    sessionRenewIntervalSeconds: 3600,
+    pendingTokenTtlSeconds: 120,
+    totp: { issuer: 'FDE Station', digits: 6, period: 30, window: 1 },
+    loginRateLimit: { maxFailures: 5, windowMs: 15 * 60 * 1000, blockMs: 60 * 1000, maxEntries: 10000 },
+    totpRateLimit: { maxFailures: 5, windowMs: 15 * 60 * 1000, blockMs: 60 * 1000, perTokenMaxFailures: 5, maxEntries: 10000 },
+    kdfConcurrency: 1,
+    kdfQueueLimit: 0,
+    kdfQueueTimeoutMs: 30000,
+    maxBodyBytes: 64 * 1024,
+    maxLoginLength: 128,
+    maxPasswordLength: 256,
+    staticDir,
+  };
+  const server = createServer({ pool, config });
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const close = () => new Promise((res) => server.close(res));
+  try {
+    const first = fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    await new Promise((r) => setTimeout(r, 30)); // 让第一个请求先拿到信号量
+    const second = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    assert.equal(second.status, 503);
+    assert.equal((await second.json()).error.code, 'kdf_busy');
+    releaseGate();
+    assert.equal((await first).status, 200);
+  } finally {
+    await close();
   }
 });

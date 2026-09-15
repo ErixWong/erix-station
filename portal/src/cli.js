@@ -133,12 +133,8 @@ async function bootstrapAdmin(values) {
       // eslint-disable-next-line no-console
       console.log('⚠️ 请立即记录此一次性口令（P1 skeleton 暂无强制改密 UI）');
     }
-    if (values['print-secret']) {
-      printTotpProvisioning(totpSecret, login, config.totp.issuer);
-    } else {
-      // eslint-disable-next-line no-console
-      console.log('TOTP 种子已生成并入 totp_secret；如需打印 otpauth URI 请加 --print-secret。');
-    }
+    // 默认打印 otpauth provisioning URI 与 secret（一次性展示）；--print-secret 保留为兼容开关（无额外行为）。
+    printTotpProvisioning(totpSecret, login, config.totp.issuer);
   } finally {
     await pool.end().catch(() => {});
   }
