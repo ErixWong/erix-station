@@ -33,6 +33,10 @@ SELECT 'CREATE ROLE station_portal LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE'
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'station_portal')
 \gexec
 
+-- 幂等兜底：修正已存在旧角色的属性（可能 NOLOGIN / 属性漂移）——bootstrap 以超级用户执行，必有权限。
+ALTER ROLE station_platform LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+ALTER ROLE station_portal   LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+
 -- 数据库连接权（默认 PUBLIC 已可 CONNECT，此处显式声明最小化面；如需收紧可 REVOKE FROM PUBLIC）。
 SELECT format('GRANT CONNECT ON DATABASE %I TO station_platform, station_portal', current_database())
 \gexec
@@ -42,3 +46,17 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO station_platform, station_portal'
 --   station_portal 只需 USAGE（表级 DML 在 schema.sql §10 授出）。
 GRANT CREATE, USAGE ON SCHEMA public TO station_platform;
 GRANT USAGE ON SCHEMA public TO station_portal;
+
+-- 表 ownership 归正：若 schema.sql 曾以超级用户执行，表 owner 为超级用户；
+-- 归正到 station_platform 使迁移角色具备 DDL 所需（后续 deploy/migrations/* 由其执行）。
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+    EXECUTE format('ALTER TABLE public.%I OWNER TO station_platform', r.tablename);
+  END LOOP;
+  FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' LOOP
+    EXECUTE format('ALTER SEQUENCE public.%I OWNER TO station_platform', r.sequencename);
+  END LOOP;
+END $$;

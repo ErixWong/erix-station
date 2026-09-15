@@ -1,0 +1,20 @@
+# 构建上下文 = 仓库根（compose 用 context: .. / dockerfile: portal/Dockerfile）
+.git
+.gitignore
+node_modules
+.env
+.env.*
+!.env.example
+deploy
+runner
+logs
+*.log
+coverage
+dist
+build
+.DS_Store
+*.pid
+portal/test
+docs/design
+docs/api
+docs/README.md
