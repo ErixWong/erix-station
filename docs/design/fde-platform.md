@@ -149,7 +149,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 容器内 dev server / code-server **仍然监听**端口（3001、4000+），只是仅在容器自己的 `/29` 内可达：
 
 - **预览/IDE**：Traefik（host）→ forwardAuth（`http://127.0.0.1:8080/api/forward-auth`）→ 直连容器 IP `http://10.200.<n>.2:<port>`（每 allocation 一条 router+service，§6.4；topology.md §4-L2）
-- **平台通道全出站经 Traefik**（方向反转为决策者 2026-09 裁定，issue #3 评论；经 Traefik 为 H-B 定稿 D-5，issue #5）：容器内不再有 runner 监听端口（3000 角色取消，§12.3），portal **不主动访问容器**；`station-agentd` 全出站——`https://station.<base>/api/internal/*`（容器侧 `--add-host station.<base>:<网关IP>`），Traefik 上以 `ipAllowList(10.200.0.0/16)` 限源后回环到 portal `127.0.0.1:8080`（SSE 下行 + POST 上行，§10.3；取舍对比见 [runner-integration.md](runner-integration.md) §11.2；topology.md §4-L3）
+- **平台通道全出站经 Traefik**（方向反转为决策者 2026-09 裁定，issue #3 评论；经 Traefik 为 H-B 定稿 D-5，issue #5）：容器内不再有 runner 监听端口（3000 角色取消，§12.3），portal **不主动访问容器**；`station-agentd` 全出站——`https://station.<base>/api/internal/*`（容器侧 `--add-host station.<base>:<网关IP>`），Traefik 上以 `ipAllowList`（由 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，topology.md §5.1）限源后回环到 portal `127.0.0.1:8080`（SSE 下行 + POST 上行，§10.3；取舍对比见 [runner-integration.md](runner-integration.md) §11.2；topology.md §4-L3）
 - **LLM 调用**：worker → `https://llm.<base>` → Traefik 按来源子网注入凭据 → 网关数据面回环 `127.0.0.1:4000`（§11；topology.md §4-L7）
 - **hosts 注入（创建 FDE 容器时，docker `--add-host` 或等价受控方式）**：容器内解析 `station.<base>` 与 `llm.<base>` 都**不走内网/公网 DNS**，映射到该 FDE 的 bridge 网关 IP（默认池 `10.200.<n>.1`；大 FDE `10.201.<n>.1`）。开发期 `*.localhost` 变通对容器无效，必须同样注入（env.md §0/§1；topology.md §4-L3）
 
@@ -234,6 +234,7 @@ http:
       priority: 200
       middlewares: [alice-llm-auth]
       service: llm-hub
+    # 大 FDE（/28）示例：rule: "Host(`llm.<base>`) && ClientIP(`10.201.7.0/28`)"（subnet 由 fde_networks 派生，topology.md §5.1）
   middlewares:
     fde-auth:
       forwardAuth:
@@ -241,7 +242,10 @@ http:
         authResponseHeaders: [X-Auth-User]
     internal-allow:
       ipAllowList:
-        sourceRange: ["10.200.0.0/16", "10.201.0.0/16"]   # 从 fde_networks 生成，覆盖两池（含大 FDE /28）
+        # 从 fde_networks 精确派生：state ∈ {allocated,active} 的每个 subnet 一条（topology.md §5.1）。
+        # 示例（若 fde_networks 现有 10.200.1.0/29 与 10.201.7.0/28 两块）：
+        sourceRange: ["10.200.1.0/29", "10.201.7.0/28"]
+        # ⚠️ 池范围 ≠ 放行范围：10.200.0.0/16 / 10.201.0.0/16 仅是取值池，禁止直接写入 sourceRange
         # 不配置 ipStrategy.depth / ipStrategy.excludedIPs：默认按 request remote address 判定（不读 X-Forwarded-For）
     alice-llm-auth:
       headers:
@@ -378,24 +382,19 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 ### 9.1 表清单（草案）
 
-```
-users / login_sessions / api_tokens
-containers          (fde_name, container_name, runner_token_hash, token_generation, status, image, agent_version, last_heartbeat, revoked_at, rotated_at)
-projects            (user_id, name, repo_url, root_path, slot, template)
-port_allocations    (见 §8)
-chat_sessions       (user_id, project_id, title, model, status, last_seq)
-messages            (session_id, seq, role, content, synthetic, attachments)
-runs                (session_id, status, termination, rounds, usage, cost, started_at, ended_at)
-transcript_rounds   (run_id, round, folded, messages JSON, folded_payload JSON)
-run_checkpoints     (run_id, seq, snapshot JSON)
-run_events          (run_id, seq, ts, type, payload JSON)
-tool_calls          (run_id, round, name, input, result_digest, duration_ms, judged, approved)
-judge_decisions     (run_id, kind, action, decision JSON)
-approvals           (run_id, tool_call_id, status, decided_by, decided_at)
-artifacts           (run_id, kind, path, size, sha)
-usage_ledger        (user_id, project_id, run_id, input_tokens, output_tokens, cost, day)
-audit_log           (actor_id, action, target, ts)
-```
+> **表结构以 [`schema.sql`](../data/schema.sql) + [`model.md`](../data/model.md) 为唯一事实来源**（可执行 DDL，`psql -f` 空库可实测）。本节不再维护内联草图表清单——历史草案遗漏了新表与 `client_event_id`、且 checkpoint 的 `seq` 口径过时，直接引用以消歧。
+>
+> 表分组一览（写入方 / 状态机 / 三份数据边界见 model.md §0/§2/§3）：
+> - 账号与认证：`users` / `login_sessions` / `api_tokens`
+> - 容器与项目：`containers` / `projects`
+> - 会话与对话：`chat_sessions` / `runs` / `messages`
+> - 端口分配与路由：`port_allocations` / `route_outbox` / `route_revisions`
+> - 引擎持久化：`transcript_rounds` / `run_checkpoints`（每 run 单行）/ `run_events`（含 `client_event_id`）
+> - 工具与审批：`tool_calls` / `tool_outputs` / `judge_decisions` / `approvals` / `artifacts`
+> - 用量与审计：`usage_ledger` / `audit_log`
+> - 任务队列：`run_queue`（含租约字段）
+> - 网络与 IPAM：`fde_networks`
+> - LLM 网关绑定：`fde_llm_bindings`
 
 ### 9.2 三份数据不可混（重要）
 
@@ -446,7 +445,7 @@ audit_log           (actor_id, action, target, ts)
 
 > 本节按决策者裁定重写（D1'/D2'，覆盖原「portal → 容器 push + 容器写 DB」描述）。完整协议（端点、租约、事件批量、审批中转）见 [runner-integration.md](runner-integration.md) §4；internal 端点契约见 [../api/portal.md](../api/portal.md) §9。
 
-- **容器 → portal**：唯一通道 = portal 的 **internal HTTP API**（`/api/internal/*`，H-B 定稿 D-5（issue #5）：**经 Traefik**——`Host(station.<base>) && PathPrefix(/api/internal)` + `ipAllowList(10.200.0.0/16)` 限源后回环到 portal `127.0.0.1:8080`；容器侧经 `--add-host station.<base>:<网关IP>` 访问，见 topology.md §4-L3。原「仅 `control` 网络可达、不经 Traefik」随 `control` 取消一并作废）。所有平台状态写入（事件 / transcript / checkpoint / 用量 / 审批 / 状态收敛）都经该 API 由 **portal 落库**——**容器不直连 DB，Postgres 的业务写方只有 portal**。容器唯一的平台凭据是 **per-container token**（建容器时生成、存 DB、注入容器 env），每个请求以 `Authorization: Bearer` 出示，且只能操作本 FDE 的资源。
+- **容器 → portal**：唯一通道 = portal 的 **internal HTTP API**（`/api/internal/*`，H-B 定稿 D-5（issue #5）：**经 Traefik**——`Host(station.<base>) && PathPrefix(/api/internal)` + `ipAllowList`（由 `fde_networks` 精确派生，每 `subnet` 一条，topology.md §5.1）限源后回环到 portal `127.0.0.1:8080`；容器侧经 `--add-host station.<base>:<网关IP>` 访问，见 topology.md §4-L3。原「仅 `control` 网络可达、不经 Traefik」随 `control` 取消一并作废）。所有平台状态写入（事件 / transcript / checkpoint / 用量 / 审批 / 状态收敛）都经该 API 由 **portal 落库**——**容器不直连 DB，Postgres 的业务写方只有 portal**。容器唯一的平台凭据是 **per-container token**（建容器时生成、存 DB、注入容器 env），每个请求以 `Authorization: Bearer` 出示，且只能操作本 FDE 的资源。
 - **portal → 容器**：**不主动推、不要求容器监听端口**。改为 agentd 出站维持 **SSE 长连接（下行）**：派单唤醒 hint / 审批决定 / 停止指令 / 吊销；派单本身为**拉取**（claim 长轮询 hold + portal 侧 NOTIFY/事件唤醒；push 作为 P2 优化后置 ⚠️ 待决策者确认）。
 - **租约与心跳**（参数 ⚠️ 待决策者确认）：claim 发租约（lease 90s），心跳 15s 续期并兼作停止指令的兜底轮询；连续 3 次心跳丢失（45s）判容器死，租约到期允许 re-claim。
 - **取消**：`AbortController` 跨不了进程 → portal 写 DB `cancel_requested_at` 标记，经 SSE `stop_request` 下发 + 心跳响应兜底，agentd abort 对应 worker；终态收敛仍由 runner 侧上报、portal 落库。
@@ -489,7 +488,7 @@ audit_log           (actor_id, action, target, ts)
 
 → 待 Q1 确认公司是否已有网关；没有则先起一个 LiteLLM 容器，仍走 C。
 
-> **H-B 链路（决策者 2026-09 定稿，issue #5 D-4；实测见 topology.md §10 证据 8）**：agent/worker 只认 `llm.<base>`——容器内**零 LLM 凭据**，仅占位 key + `baseURL=https://llm.<base>/v1`；请求经 Traefik（host:443），router `Host(llm.<base>) && ClientIP(10.200.<n>.0/29)` 按**网络来源**判定身份，headers middleware **覆盖** `Authorization: Bearer <该 FDE 虚拟 key>` + 注入 `X-FDE-Identity`（容器自带的任何 `Authorization` 均被覆盖）；service 回环到网关数据面 `127.0.0.1:4000`；网关 **admin 面不发布**、只在 `backend` 网络。**禁止无 ClientIP 条件的兜底路由**（无匹配来源 404 = 默认拒绝）。配套：`aliasHeadersStrategy: delete`、hub service `flushInterval` 调小、路由配置 600（§6.4，topology.md §6）。
+> **H-B 链路（决策者 2026-09 定稿，issue #5 D-4；实测见 topology.md §10 证据 8）**：agent/worker 只认 `llm.<base>`——容器内**零 LLM 凭据**，仅占位 key + `baseURL=https://llm.<base>/v1`；请求经 Traefik（host:443），router `Host(llm.<base>) && ClientIP(<该 FDE 精确 subnet>，默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`)` 按**网络来源**判定身份，headers middleware **覆盖** `Authorization: Bearer <该 FDE 虚拟 key>` + 注入 `X-FDE-Identity`（容器自带的任何 `Authorization` 均被覆盖）；service 回环到网关数据面 `127.0.0.1:4000`；网关 **admin 面不发布**、只在 `backend` 网络。**禁止无 ClientIP 条件的兜底路由**（无匹配来源 404 = 默认拒绝）。配套：`aliasHeadersStrategy: delete`、hub service `flushInterval` 调小、路由配置 600（§6.4，topology.md §6）。
 
 > **澄清（归属归位）**：LLM 网关是**独立组件**——公司已有网关，或平台另起的网关容器（如 LiteLLM），**不是 portal 内部的实现模块**；portal 侧只有「租户绑定」逻辑（上面的 1/2/3）。Q1（公司是否已有网关）保持未决，本文不替选型拍板。
 

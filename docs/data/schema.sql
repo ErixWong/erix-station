@@ -282,17 +282,21 @@ CREATE TABLE judge_decisions (
 CREATE INDEX judge_decisions_run_idx ON judge_decisions (run_id, created_at);
 
 -- 审批：一个工具调用至多一条审批单；FDE 决定后 runner 轮询继续/终止（portal.md §4.8）
+-- tool_call_id 为「外部 call_id」字符串（对齐 tool_calls.call_id，非 tool_calls.id 内部主键；canonical 规则见 model.md §1.19）。
+-- ⚠️ 审批契约由 issue #10 定稿确认；若 #10 改判为 UUID，则以 #10 为准并同步本表（先消除 uuid↔text 三口径矛盾）。
 CREATE TABLE approvals (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   run_id       uuid NOT NULL REFERENCES runs (id),
-  tool_call_id uuid NOT NULL UNIQUE REFERENCES tool_calls (id),
+  tool_call_id text NOT NULL,
   status       text NOT NULL DEFAULT 'pending'
                CHECK (status IN ('pending', 'approved', 'denied')),
   decided_by   uuid REFERENCES users (id),
   decided_at   timestamptz,
   note         text,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  CHECK ((status = 'pending') = (decided_at IS NULL))
+  CHECK ((status = 'pending') = (decided_at IS NULL)),
+  UNIQUE (run_id, tool_call_id),                                   -- 一个工具调用至多一条审批单（run 内 call_id 唯一）
+  FOREIGN KEY (run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)
 );
 CREATE INDEX approvals_pending_idx ON approvals (created_at) WHERE status = 'pending';
 CREATE INDEX approvals_run_idx ON approvals (run_id);
@@ -422,9 +426,19 @@ CREATE TABLE fde_networks (
   pool         text NOT NULL CHECK (pool IN ('default', 'large')),  -- default=10.200/16；large=10.201/16
   state        text NOT NULL DEFAULT 'allocated'
                CHECK (state IN ('allocated', 'active', 'released')),
-  revision     bigint NOT NULL DEFAULT 0,                -- 与 route_outbox / reconciler 对账的版本号
+  revision     bigint NOT NULL DEFAULT 0,                -- 仅属「网络聚合」的版本号（与 route_outbox 网络行对账）；路由级版本见 route_revisions（§9 route_outbox），两者不可混用
   created_at   timestamptz NOT NULL DEFAULT now(),
   released_at  timestamptz,
+  -- 字段间一致性约束（P7）：masklen 与 prefix_len 一致；gateway 为该子网 .1；
+  -- pool 必须落在对应保留段且 prefix_len 匹配（default→10.200/16 且 /29；large→10.201/16 且 /28）。
+  -- 应用层仍需做 Docker 现存网络重叠检查（reconciler 建网络前经 Docker API 校验，topology.md §8），DB CHECK 只保证字段自洽。
+  CHECK (masklen(subnet) = prefix_len),
+  CHECK (host(gateway) = host(set_masklen(subnet::inet, prefix_len) + 1)),
+  CHECK (
+    (pool = 'default' AND prefix_len = 29 AND subnet::inet << inet '10.200.0.0/16')
+    OR
+    (pool = 'large'   AND prefix_len = 28 AND subnet::inet << inet '10.201.0.0/16')
+  ),
   CHECK ((state = 'released') = (released_at IS NOT NULL))
 );
 
@@ -435,27 +449,55 @@ CREATE TABLE fde_networks (
 --   - op='delete' 用 tombstone（revision 递增 + op=delete，不物理删行，供 offboarding/重建收敛）
 --   - 启动时（portal/Traefik）从 DB 全量重建路由（幂等，topology.md §8）
 --   - UNIQUE(aggregate, aggregate_id, revision)：同一聚合同一版本至多一条（重试/重复投递安全）
+--   - revision 单调性由 route_revisions（每聚合版本 head）保证（P5，见下）；reconciler 只发布 revision = 当前 head 的行
+--     （`revision < head` 的晚到旧事件 / 旧 tombstone 一律丢弃 → latest-wins，model.md §2.5）。
+--
+-- 租约与重试（P6）：reconciler 领取时把 state='pending' → 'processing'（原子，FOR UPDATE SKIP LOCKED）并写
+--   claimed_at / lease_until / worker_id；发布成功 → 'published'；失败 → attempts+1 且退回 'pending' 退避重试
+--   （1s→2s→5s→10s→30s 封顶，⚠️ 参数待确认）；attempts 耗尽（≥5 ⚠️）→ 'failed' + 告警（保留上一版文件，topology.md §8）。
+--   崩溃恢复：reconciler 启动时 + 定时任务把 `state='processing' AND lease_until < now()` 回收为 'pending'（attempts+1），防孤儿锁死。
+
+-- 每路由聚合的版本 head（P5）：desired state 写事务里与 outbox 行同事务 `SELECT ... FOR UPDATE` 递增 revision。
+-- 聚合标识 (aggregate, aggregate_id) 与 route_outbox 对齐；revision 单调递增、每聚合一行（当前最大版本）。
+-- 消费语义：reconciler 消费 outbox 前先 `SELECT revision FROM route_revisions WHERE aggregate=$1 AND aggregate_id=$2 FOR UPDATE`，
+--   仅 outbox.revision = head.revision 才发布；`revision < head` → 晚到旧事件丢弃、不发布。
+CREATE TABLE route_revisions (
+  aggregate    text NOT NULL,
+  aggregate_id uuid NOT NULL,
+  revision     bigint NOT NULL,
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (aggregate, aggregate_id)
+);
+
 CREATE TABLE route_outbox (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   aggregate    text NOT NULL,                            -- 聚合类型：'port_allocation' / 'llm_binding' 等
   aggregate_id uuid NOT NULL,                            -- 聚合实例 id（如 port_allocations.id / fde_llm_bindings.fde_id）
   op           text NOT NULL CHECK (op IN ('upsert', 'delete')),
-  revision     bigint NOT NULL,                          -- 聚合内单调递增版本（desired state 版本）
+  revision     bigint NOT NULL,                          -- 聚合内单调递增版本（与 route_revisions.head 对齐；同聚合同 revision 唯一）
   payload      jsonb NOT NULL DEFAULT '{}' :: jsonb,     -- 生成该路由所需的全部事实（hostname/url/backend IP 等），随 revision 快照
   state        text NOT NULL DEFAULT 'pending'
                CHECK (state IN ('pending', 'processing', 'published', 'failed')),
-  attempts     int NOT NULL DEFAULT 0,                   -- 发布尝试次数（reconciler 退避重试）
+  attempts     int NOT NULL DEFAULT 0,                   -- 发布尝试次数（reconciler 退避重试；耗尽 → failed + 告警）
   last_error   text,                                     -- 最近一次失败原因（published 后清空）
+  claimed_at   timestamptz,                              -- reconciler 领取时刻（state → processing 时写）
+  lease_until  timestamptz,                              -- 处理租约到期时刻（lease 60s ⚠️）；到期未完成由 reaper 回收为 pending，attempts+1
+  worker_id    text,                                     -- 领取该行的 reconciler worker 标识（崩溃恢复归属）
   published_at timestamptz,                              -- 最近一次成功发布时刻
   created_at   timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (aggregate, aggregate_id, revision)
+  UNIQUE (aggregate, aggregate_id, revision),
+  CHECK (state <> 'processing' OR (claimed_at IS NOT NULL AND lease_until IS NOT NULL))
 );
 CREATE INDEX route_outbox_pending_idx
   ON route_outbox (state) WHERE state IN ('pending', 'processing');
+-- reaper：回收 `state='processing' AND lease_until < now()` 的孤儿行（reconciler 启动时 + 定时任务）
+CREATE INDEX route_outbox_lease_idx
+  ON route_outbox (lease_until) WHERE state = 'processing';
 
 -- 工具结果全文另存（topology.md §9 / issue #5 评论 1 §5）：工具结果超过阈值才另存——
 -- 事件里只放 digest + 引用（tool_outputs.id），完整 body 落本表，避免打爆 run_events。
--- tool_call_id 与 tool_calls.call_id 对齐（portal.md §5.3）；若 issue #10 最终改为 UUID 再同步。
+-- tool_call_id 为「外部 call_id」（对齐 tool_calls.call_id，非 tool_calls.id 内部主键）；canonical 规则见 model.md §1.19。
+-- ⚠️ 审批契约由 issue #10 定稿确认；若 #10 改判为 UUID，则以 #10 为准并同步本表（先消除 uuid↔text 三口径矛盾）。
 CREATE TABLE tool_outputs (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   run_id       uuid NOT NULL REFERENCES runs (id),
@@ -464,7 +506,8 @@ CREATE TABLE tool_outputs (
   sha256       text NOT NULL,                            -- body 的 sha256（digest 校验/去重）
   body         text NOT NULL,                            -- 工具结果全文（jsonb/文本，TOAST 压缩吸收）
   created_at   timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (run_id, tool_call_id)
+  UNIQUE (run_id, tool_call_id),
+  FOREIGN KEY (run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)
 );
 CREATE INDEX tool_outputs_run_idx ON tool_outputs (run_id, created_at);
 
