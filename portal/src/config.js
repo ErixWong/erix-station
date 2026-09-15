@@ -75,13 +75,21 @@ export function loadConfig(env = process.env) {
       maxFailures: intEnv(env, 'LOGIN_RATE_LIMIT_MAX_FAILURES', 5),
       windowMs: intEnv(env, 'LOGIN_RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000),
       blockMs: intEnv(env, 'LOGIN_RATE_LIMIT_BLOCK_MS', 60 * 1000),
+      maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
     },
+    // TOTP 限流按「账户 + IP」计数（防换新 pending_token 绕过），另保留单 token 尝试上限。
+    // 退避策略：账户级 10 次失败 / 15 分钟窗口，超限锁定至窗口结束（blockMs = windowMs）。
     totpRateLimit: {
-      maxFailures: intEnv(env, 'TOTP_RATE_LIMIT_MAX_FAILURES', 5),
+      maxFailures: intEnv(env, 'TOTP_RATE_LIMIT_MAX_FAILURES', 10),
       windowMs: intEnv(env, 'TOTP_RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000),
-      blockMs: intEnv(env, 'TOTP_RATE_LIMIT_BLOCK_MS', 60 * 1000),
+      blockMs: intEnv(env, 'TOTP_RATE_LIMIT_BLOCK_MS', 15 * 60 * 1000),
+      perTokenMaxFailures: intEnv(env, 'TOTP_TOKEN_RATE_LIMIT_MAX_FAILURES', 5),
+      maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
     },
     kdfConcurrency: intEnv(env, 'KDF_CONCURRENCY', 4),
+    // KDF 等待队列上限与排队超时：队列满/超时快速失败（503 kdf_busy），不让请求无限排队。
+    kdfQueueLimit: intEnv(env, 'KDF_QUEUE_LIMIT', 100),
+    kdfQueueTimeoutMs: intEnv(env, 'KDF_QUEUE_TIMEOUT_MS', 30 * 1000),
     // 请求体上限与字段上限（S3：防止超大 body/字段触发 scrypt 或打爆内存）
     maxBodyBytes: intEnv(env, 'MAX_BODY_BYTES', 64 * 1024),
     maxLoginLength: intEnv(env, 'MAX_LOGIN_LENGTH', 128),

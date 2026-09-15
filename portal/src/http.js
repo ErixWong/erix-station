@@ -144,9 +144,25 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
 
 export function createServer({ pool, config, log = console }) {
   const loginLimiter = createRateLimiter(config.loginRateLimit);
-  const totpLimiter = createRateLimiter(config.totpRateLimit);
-  const kdfSemaphore = createSemaphore(config.kdfConcurrency);
-  const ctx = { pool, config, log, loginLimiter, totpLimiter, kdfSemaphore };
+  // TOTP 失败限流按「账户 + IP」计数（防换新 pending_token 绕过）；单 token 尝试上限单独计。
+  const totpLimiter = createRateLimiter({
+    maxFailures: config.totpRateLimit.maxFailures,
+    windowMs: config.totpRateLimit.windowMs,
+    blockMs: config.totpRateLimit.blockMs,
+    maxEntries: config.totpRateLimit.maxEntries,
+  });
+  const totpTokenLimiter = createRateLimiter({
+    maxFailures: config.totpRateLimit.perTokenMaxFailures,
+    windowMs: config.totpRateLimit.windowMs,
+    blockMs: config.totpRateLimit.blockMs,
+    maxEntries: config.totpRateLimit.maxEntries,
+  });
+  const kdfSemaphore = createSemaphore({
+    max: config.kdfConcurrency,
+    maxQueue: config.kdfQueueLimit,
+    queueTimeoutMs: config.kdfQueueTimeoutMs,
+  });
+  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore };
 
   return http.createServer(async (req, res) => {
     try {
@@ -262,7 +278,18 @@ async function handleLoginStep1(req, res, ctx) {
   }
 
   // 限制并发 KDF：未认证请求不能无界并发触发 scrypt（S3）。
-  await ctx.kdfSemaphore.acquire();
+  // 队列满/排队超时快速失败（503 kdf_busy），不让请求无限排队。
+  try {
+    await ctx.kdfSemaphore.acquire();
+  } catch (err) {
+    if (err?.code === 'kdf_queue_full' || err?.code === 'kdf_queue_timeout') {
+      throw new HttpError(503, 'kdf_busy', '服务繁忙，请稍后重试', {
+        retryable: true,
+        headers: { 'Retry-After': '1' },
+      });
+    }
+    throw err;
+  }
   let result;
   try {
     result = await auth.authenticate(pool, login, password, { log: ctx.log });
@@ -303,29 +330,43 @@ async function handleLoginTotp(req, res, ctx) {
   }
 
   const ip = req.socket.remoteAddress || 'unknown';
-  const rlKey = `totp:${ip}:${pendingToken}`;
-  const check = ctx.totpLimiter.check(rlKey);
-  if (!check.allowed) {
-    throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
-      retryable: true,
-      headers: { 'Retry-After': String(check.retryAfterSeconds) },
-    });
-  }
 
   // 非消费读取：TOTP 错误允许用同一 pending_token 重试（错误码不烧 token）；
-  // 只有 TOTP 通过才原子消费（单次消费）。
+  // 只有 TOTP 通过才原子消费（单次消费）。先解出用户，再按「账户 + IP」限流。
   const userId = await auth.findPendingUser(pool, pendingToken);
   if (!userId) {
     throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+  }
+
+  // 账户 + IP 失败计数：换新 pending_token 不重置（口令步成功也不清空），防第二因素爆破。
+  const accountKey = `totp:${userId}:${ip}`;
+  const accountCheck = ctx.totpLimiter.check(accountKey);
+  if (!accountCheck.allowed) {
+    throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(accountCheck.retryAfterSeconds) },
+    });
+  }
+
+  // 单 token 尝试上限（保留原有单 token 爆破防护）。
+  const tokenKey = `totp-token:${ip}:${pendingToken}`;
+  const tokenCheck = ctx.totpTokenLimiter.check(tokenKey);
+  if (!tokenCheck.allowed) {
+    throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(tokenCheck.retryAfterSeconds) },
+    });
   }
 
   const result = await auth.verifyTotpForUser(pool, userId, code, {
     digits: config.totp.digits,
     period: config.totp.period,
     window: config.totp.window,
+    log: ctx.log,
   });
   if (!result.ok) {
-    ctx.totpLimiter.recordFailure(rlKey);
+    ctx.totpLimiter.recordFailure(accountKey);
+    ctx.totpTokenLimiter.recordFailure(tokenKey);
     throw new HttpError(401, 'totp_invalid', 'TOTP 校验失败');
   }
 
@@ -334,7 +375,8 @@ async function handleLoginTotp(req, res, ctx) {
     throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
   }
 
-  ctx.totpLimiter.reset(rlKey);
+  ctx.totpLimiter.reset(accountKey);
+  ctx.totpTokenLimiter.reset(tokenKey);
   const session = await auth.createSession(pool, result.user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,

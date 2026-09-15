@@ -65,6 +65,8 @@
 | `station-docker-socket-proxy` | `backend` | **无**（仅 portal 可达；FDE 不在 backend，天然不可达） | `/var/run/docker.sock` → `/var/run/docker.sock`（**RO**） | — | 无（官方镜像无内置；靠 `service_started` 依赖） | env 白名单（`CONTAINERS=1`、`NETWORKS=1`、`POST=0`，其余 0，见 §5） |
 | `station-edge` | `host` | **无**（host 网络直接监听 `TRAEFIK_WEB_PORT`/`TRAEFIK_WEBSECURE_PORT`） | ① `/docker/station-edge/traefik.yml` → `/etc/traefik/traefik.yml`（RO）；② `/docker/station-edge/dynamic/` → `/etc/traefik/dynamic/`（RO，**与 portal 共享宿主目录、Traefik 侧只读**）；③ `/docker/station-edge/acme.json` → `/acme.json`（RW，**600**，**仅 Traefik 读写、不挂给 portal**）；④ `/docker/station-edge/logs/` → `/var/log/traefik/`（RW，**仅 Traefik、不挂给 portal**） | —（host 网络独立启动；路由在 portal 就绪后自然可用） | 无（`--api=false` 关闭 ping；靠 restart policy + reconciler 对账兜底，§8） | `/docker/station-edge/.env.edge`（600，含 ACME/DNS-01 凭据，经环境变量注入、**不进 traefik.yml**） |
 
+> **`station-db` 容器加固（与其它三服务一致）**：`security_opt: [no-new-privileges]` + `cap_drop: [ALL]`，并显式回加 postgres 初始化所需的最小 capability `CHOWN` / `DAC_OVERRIDE` / `FOWNER` / `SETGID` / `SETUID`（官方入口以 root 启动、chown 数据目录后用 gosu 降权到 `postgres`）。已用空卷起栈验证 DB 可完成首次初始化（建库/应用 schema/设角色口令）并 healthy。
+
 ### 2.3 healthcheck 命令与阈值（写死）
 
 | 服务 | test | interval | timeout | retries | start_period |

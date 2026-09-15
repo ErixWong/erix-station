@@ -143,6 +143,30 @@ test('renewSession：距上次续期超阈值才写库并返回新 expires_at；
   assert.equal(new Date(renewed).getTime(), t0.getTime() + 2 * 60 * 60 * 1000 + 100 * 1000);
 });
 
+test('renewSession：连续多次活动请求 expires_at 持续前移，last_seen_at 写为活动时间', async () => {
+  const user = { id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null, auth_source: 'local', status: 'active' };
+  const pool = new FakePool({ users: [user] });
+  const t0 = new Date('2026-01-01T00:00:00Z');
+  const { token } = await auth.createSession(pool, 'u1', { ttlSeconds: 100, now: t0 });
+  const found = await auth.findSessionUser(pool, token, { now: t0 });
+  const sessionId = found.session.id;
+  const interval = 60 * 60 * 1000;
+
+  // 第一次续期：t0+2h → expires = t0+2h+100s
+  const r1 = await auth.renewSession(pool, sessionId, { ttlSeconds: 100, renewIntervalMs: interval, now: new Date(t0.getTime() + 2 * interval) });
+  assert.equal(new Date(r1).getTime(), t0.getTime() + 2 * interval + 100 * 1000);
+  const after1 = await auth.findSessionUser(pool, token, { now: new Date(t0.getTime() + 2 * interval) });
+  assert.equal(new Date(after1.session.last_seen_at).getTime(), t0.getTime() + 2 * interval); // 活动时间而非未来 expires
+
+  // 第二次续期：t0+4h → expires 继续前移（不再被未来 last_seen_at 卡住）
+  const r2 = await auth.renewSession(pool, sessionId, { ttlSeconds: 100, renewIntervalMs: interval, now: new Date(t0.getTime() + 4 * interval) });
+  assert.equal(new Date(r2).getTime(), t0.getTime() + 4 * interval + 100 * 1000);
+
+  // 紧随其后（阈值内）→ 不再写
+  const r3 = await auth.renewSession(pool, sessionId, { ttlSeconds: 100, renewIntervalMs: interval, now: new Date(t0.getTime() + 4 * interval + 60 * 1000) });
+  assert.equal(r3, null);
+});
+
 test('verifyTotpForUser：正确码通过、错误码拒绝、重放拒绝', async () => {
   const secret = totp.generateSecret(20);
   const user = {
@@ -174,4 +198,22 @@ test('verifyTotpForUser：正确码通过、错误码拒绝、重放拒绝', asy
   const wrong = await auth.verifyTotpForUser(pool, 'u1', '000000', { now });
   assert.equal(wrong.ok, false);
   assert.equal(wrong.reason, 'totp_invalid');
+});
+
+test('verifyTotpForUser：畸形 totp_secret（非法 base32）→ totp_invalid，不抛错不 500', async () => {
+  const user = {
+    id: 'u1',
+    login: 'alice',
+    display_name: 'Alice',
+    role: 'admin',
+    fde_name: null,
+    auth_source: 'local',
+    status: 'active',
+    totp_secret: 'not-base32!',
+    last_totp_step: null,
+  };
+  const pool = new FakePool({ users: [user] });
+  const r = await auth.verifyTotpForUser(pool, 'u1', '123456', { now: new Date() });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'totp_invalid');
 });

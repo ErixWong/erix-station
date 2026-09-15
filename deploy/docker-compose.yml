@@ -19,6 +19,18 @@ services:
     restart: unless-stopped
     networks:
       - backend
+    # 与其它三服务一致的容器加固：禁提权 + 丢弃全部 capability，仅回加 postgres 初始化所需最小集。
+    # 官方入口以 root 启动（chown 数据目录）后用 gosu 降权到 postgres，需：CHOWN / DAC_OVERRIDE / FOWNER / SETGID / SETUID。
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     volumes:
       - /docker/station-db/:/var/lib/postgresql/data
       # 首次初始化（空数据目录时执行一次）：建角色 + 设口令 + baseline + bootstrap + ownership 归正。
