@@ -286,8 +286,15 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PORTAL_IMAGE` | 平台规范固定（规格 §14）；自构建（build context `portal/`） | `erix-station/portal:<git-sha>`（不可变 tag；部署时再 `docker inspect --format '{{.Id}}'` 记 digest） |
 | `DB_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `postgres:16`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体 patch/digest 部署时由 §9 产出后填；P1 开发可临时 `postgres:16` 并记录 resolved digest） |
 | `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
-| `SOCKET_PROXY_IMAGE` | 平台规范固定（规格 §4 / §6 / deploy-contract §5） | `tecnativa/docker-socket-proxy:v0.5.0`（P1 开发 pin patch tag；生产再 pin digest；`POST=0` 只读） |
-| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`） |
+| `SOCKET_PROXY_IMAGE` | 平台规范固定（规格 §4 / §6 / deploy-contract §5） | `tecnativa/docker-socket-proxy:v0.5.0`（P1 开发 pin patch tag；生产再 pin digest；`POST=1` 已放开 containers/networks 生命周期，路径级最小面由 portal 代码层白名单兑底，见 deploy-contract §5.1 实现偏差） |
+| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）** |
+| `FDE_CMD` | 平台规范固定（FDE 容器命令；开发期 whoami 站台用，生产为 `station-agentd` 入口） | JSON 数组；开发期 `["-port","4000"]`（首个项目块首端口，fde-platform §8.2） |
+| `FDE_AGENT_VERSION` | 平台规范固定（写 `containers.agent_version`；开发期占位） | `dev` |
+| `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；⚠️ 具体数值待决策者确认） | `512m`（`0` 表示不限） |
+| `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
+| `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
+| `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8 ⚠️ 待决策者确认） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
+| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P2+ 接入 | `http://127.0.0.1:4000`（reconciler 生成 llm-hub service 回环地址） |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
 | `TRAEFIK_CONFIG_DIR` | 平台规范固定（deploy-contract.md；由 `DATA_ROOT` 派生） | `/docker/station-edge/`（静态 `traefik.yml` + `dynamic/` 目录 + `acme.json` + `logs/` + `firewall/` 规则文件） |

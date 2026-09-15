@@ -1,7 +1,7 @@
 # ============================================================================
 # erix-station 本地开发栈（P1 walking skeleton）
 # 依据：docs/design/deploy-contract.md §2 + docs/env.md §0（开发期参数）
-# 服务：station-db / station-docker-socket-proxy / station-portal / station-edge
+# 服务：station-db / station-docker-proxy / station-portal / station-edge
 #   （FDE 容器、LLM 网关、materializer、路由 reconciler 归后续轮次）
 # ============================================================================
 name: station
@@ -52,11 +52,15 @@ services:
       retries: 10
       start_period: 10s
 
-  # /var/run/docker.sock 只挂到这里；portal 经 tcp://station-docker-socket-proxy:2375 访问（deploy-contract §5）。
-  # 白名单：CONTAINERS=1、NETWORKS=1，其余 0；POST=0 → 本阶段 portal 只读 Docker API（创建容器归 WP2）。
-  station-docker-socket-proxy:
-    container_name: station-docker-socket-proxy
-    image: ${SOCKET_PROXY_IMAGE:-tecnativa/docker-socket-proxy:v0.5.0}
+  # /var/run/docker.sock 只挂到这里；portal 经 tcp://station-docker-proxy:2375 访问（deploy-contract §5）。
+  # 自研零依赖 admission proxy：方法+路径白名单（12 条契约路径）+ POST /containers/create 策略校验（§5 B6），
+  # 替换 tecnativa/docker-socket-proxy（其 POST=1 是全局方法门，无路径级 POST 白名单）。
+  station-docker-proxy:
+    container_name: station-docker-proxy
+    build:
+      context: ./fde-proxy
+      dockerfile: Dockerfile
+    image: erix-station/fde-proxy:local
     restart: unless-stopped
     networks:
       - backend
@@ -65,33 +69,34 @@ services:
       - no-new-privileges
     cap_drop:
       - ALL
-    # haproxy 需要写 pidfile(/run) 与临时配置(/tmp) 与 server-state(/var/lib/haproxy)
     tmpfs:
       - /tmp
-      - /run
-      - /var/lib/haproxy
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # P3：ro 挂载用户空间根，供 proxy realpath 校验 bind source（防 symlink 逃逸）。
+      - ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}:/srv/erix/users:ro
     environment:
-      CONTAINERS: "1"
-      NETWORKS: "1"
-      POST: "0"
-      EVENTS: "0"
-      VOLUMES: "0"
-      IMAGES: "0"
-      EXEC: "0"
-      SYSTEM: "0"
-      AUTH: "0"
-      SECRETS: "0"
-      BUILD: "0"
-      COMMIT: "0"
-      PLUGINS: "0"
-      SWARM: "0"
-      INFO: "0"
-      # 只读健康/版本端点（readiness 与验收用），镜像默认即为 1，此处显式声明
-      PING: "1"
-      VERSION: "1"
-    # 其余变量（CONFIGS/DISTRIBUTION/GRPC/NODES/SERVICES/SESSION/TASKS/ALLOW_*）沿用镜像默认 0
+      PORT: "2375"
+      SOCKET_PATH: /var/run/docker.sock
+      # bind source 根：USERSPACE_ROOT = 容器内路径（realpath 校验用）；USERSPACE_ROOT_HOST = 宿主路径（路径换算）。
+      USERSPACE_ROOT: /srv/erix/users
+      USERSPACE_ROOT_HOST: ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}
+      # 镜像白名单：与 FDE_IMAGE 同源 env（全串精确匹配；生产用 image@sha256:…）
+      IMAGE_ALLOWLIST: ${FDE_IMAGE:-traefik/whoami}
+      # 允许的容器 Memory 上限（字节；0 = 不限）
+      MAX_MEMORY: ${FDE_MEMORY_LIMIT_MAX:-0}
+      # 允许的容器 PidsLimit 上限（0 = 不限）
+      MAX_PIDS: ${FDE_PIDS_LIMIT_MAX:-0}
+      # 允许的容器 User 值（逗号分隔；默认 1001:1000）
+      ALLOWED_USERS: ${FDE_ALLOWED_USERS:-1001:1000}
+      # 允许的 network create subnet 池（逗号分隔 CIDR）
+      IPAM_POOLS: ${FDE_IPAM_POOLS:-10.200.0.0/16,10.201.0.0/16}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:2375/_ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   station-portal:
     container_name: station-portal
@@ -105,7 +110,7 @@ services:
     depends_on:
       station-db:
         condition: service_healthy
-      station-docker-socket-proxy:
+      station-docker-proxy:
         condition: service_started
     security_opt:
       - no-new-privileges
@@ -134,13 +139,15 @@ services:
       MIGRATE_DATABASE_URL: postgres://${PLATFORM_DB_USER:-station_platform}:${PLATFORM_DB_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
       # bootstrap 超级用户（schema.sql/bootstrap.sql 的角色/授权/ownership，仅 bootstrap 步骤用）
       BOOTSTRAP_DATABASE_URL: postgres://${POSTGRES_USER:-station}:${POSTGRES_PASSWORD:-change-me-dev-only}@station-db:5432/${POSTGRES_DB:-station}
-      # portal 经 socket-proxy 访问 Docker API（不直挂 /var/run/docker.sock）
-      DOCKER_HOST: tcp://station-docker-socket-proxy:2375
+      # portal 经自研 admission proxy 访问 Docker API（不直挂 /var/run/docker.sock）
+      DOCKER_HOST: tcp://station-docker-proxy:2375
       COOKIE_PROFILE: ${COOKIE_PROFILE:-dev-http}
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
       # ---- WP2a：materializer + 路由 reconciler ----
       ERIX_USERSPACE_ROOT: /srv/erix/users
+      # F3：bind source 用宿主路径（与容器内 ERIX_USERSPACE_ROOT 解耦）
+      ERIX_USERSPACE_ROOT_HOST: ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}
       TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
       TRAEFIK_DYNAMIC_FILE: routes.yml
       PORTAL_HOST: station.${BASE_DOMAIN:-localhost}
@@ -154,6 +161,21 @@ services:
       IPAM_RESERVED_SUBNETS: ${IPAM_RESERVED_SUBNETS:-}
       FDE_USER_UID: ${FDE_USER_UID:-1000}
       FDE_USER_GID: ${FDE_USER_GID:-1000}
+      # ---- WP2b：FDE provisioning + preview ticket ----
+      FDE_IMAGE: ${FDE_IMAGE:-traefik/whoami}
+      # F12/F14：FDE_DEV_MODE=1 显式开发模式（默认未设即开发）；生产设 0 或 NODE_ENV=production
+      FDE_DEV_MODE: ${FDE_DEV_MODE:-1}
+      # F5：开发期 whoami 镜像不满足「root 启动→drop 1001」契约时的 --user 兜底（⚠️ dev 偏差）；生产留空由镜像 entrypoint 降权
+      FDE_DEV_USER: ${FDE_DEV_USER:-1001:1000}
+      FDE_CMD: ${FDE_CMD:-["-port","4000"]}
+      FDE_AGENT_VERSION: ${FDE_AGENT_VERSION:-dev}
+      FDE_MEMORY_LIMIT: ${FDE_MEMORY_LIMIT:-512m}
+      FDE_AGENTD_UID: ${FDE_AGENTD_UID:-1001}
+      FDE_WORKER_UID: ${FDE_WORKER_UID:-1002}
+      # 预览 session 派生密钥（HMAC-SHA256，portal.md §2.7）；生产必须显式改掉此 dev 占位
+      SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY:-erix-station-dev-signing-key-change-me}
+      PREVIEW_TICKET_TTL_SECONDS: ${PREVIEW_TICKET_TTL_SECONDS:-60}
+      PREVIEW_SESSION_TTL_SECONDS: ${PREVIEW_SESSION_TTL_SECONDS:-900}
       # P1：baseline(schema.sql) + bootstrap.sql 由 station-db 首次初始化（db-init/00-init.sh，超级用户）
       # 完成；deploy/migrations/*.sql 尚无增量。运行时以 station_portal 启动，不重复跑 superuser-only
       # 的 bootstrap。出现首个增量迁移时，以 station_platform（MIGRATE_DATABASE_URL）跑
