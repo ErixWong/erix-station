@@ -270,6 +270,12 @@ async function routeApi(req, res, ctx, url) {
     if (req.method === 'PATCH') return handlePatchProject(req, res, ctx, projectId);
     if (req.method === 'DELETE') return handleDeleteProject(req, res, ctx, projectId);
   }
+  // F10：端口列表（portal.md §4.7）——复用 getProject 的 ports 查询。
+  const projectPortsMatch = pathname.match(/^\/api\/projects\/([^/]+)\/ports$/);
+  if (projectPortsMatch) {
+    const projectId = decodeURIComponent(projectPortsMatch[1]);
+    if (req.method === 'GET') return handleGetProjectPorts(req, res, ctx, projectId);
+  }
 
   return sendJson(res, 404, errorBody('not_found', 'not found'));
 }
@@ -419,23 +425,34 @@ async function requireSession(req, ctx) {
 }
 
 /**
- * forwardAuth 回调（portal.md §2.7）。P1 占位：仅做 hostname → allocation 精确存在性校验。
- * ⚠️ P2：完整预览凭证（ticket/cookie）+ exposure 授权未实现（deploy §7.2 P1 无预览）。
+ * forwardAuth 回调（portal.md §2.7）。fail-closed：
+ *  ① hostname 精确查 port_allocations（查不到 404 = 路由表里没有 = 不可达）；
+ *  ② released → 403 allocation_released；
+ *  ③ 无有效预览凭证 → 403 preview_ticket_required（⚠️ WP2b：一次性 ticket / 预览 cookie /
+ *     exposure 授权完整实现归后续 WP；当前严禁「只查 hostname 就放行」）。
+ * 放行成功分支（WP2b 上线后）在返回 200 + X-Auth-User 前执行 allocated→active 幂等升级：
+ *   UPDATE port_allocations SET state='active' WHERE id=$1 AND state='allocated'（fde-platform §8.6）。
  */
 async function handleForwardAuth(req, res, ctx) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   if (!host) return sendJson(res, 404, errorBody('not_found', 'not found'));
   const r = await ctx.pool.query(
-    `SELECT u.fde_name
+    `SELECT a.id, a.fde_id, a.state, u.fde_name
        FROM port_allocations a
        JOIN users u ON u.id = a.fde_id
-      WHERE a.hostname = $1 AND a.state IN ('allocated', 'active')
+      WHERE a.hostname = $1
       LIMIT 1`,
     [host],
   );
   if (r.rows.length === 0) return sendJson(res, 404, errorBody('not_found', 'not found'));
-  res.writeHead(200, { 'X-Auth-User': r.rows[0].fde_name || '' });
-  res.end();
+  const alloc = r.rows[0];
+  if (alloc.state === 'released') {
+    return sendJson(res, 403, errorBody('allocation_released', 'allocation released'));
+  }
+  // ⚠️ WP2b：此处为完整预览凭证校验（ticket → 预览 cookie / exposure 判定）的插入点。
+  // 凭证校验通过后放行并执行 allocated → active 升级（幂等）。
+  // P1 fail-closed：无有效预览凭证一律 403（绝不因 hostname 存在即放行）。
+  return sendJson(res, 403, errorBody('preview_ticket_required', 'preview ticket required'));
 }
 
 async function handleCreateProject(req, res, ctx) {
@@ -468,6 +485,12 @@ async function handleGetProject(req, res, ctx, projectId) {
   const session = await requireSession(req, ctx);
   const result = await projects.getProject(ctx.pool, { userId: session.user.id, projectId });
   return sendJson(res, 200, result);
+}
+
+async function handleGetProjectPorts(req, res, ctx, projectId) {
+  const session = await requireSession(req, ctx);
+  const result = await projects.getProject(ctx.pool, { userId: session.user.id, projectId });
+  return sendJson(res, 200, { items: result.ports });
 }
 
 async function handlePatchProject(req, res, ctx, projectId) {

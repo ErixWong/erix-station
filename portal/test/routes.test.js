@@ -1,11 +1,15 @@
 // 单测：routes.js（来源规则派生 /29 与 /28、revision head 过滤 + tombstone 丢弃、显式 router+service）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   deriveSourceRanges,
   filterCurrentHead,
   generateTraefikConfig,
   validateTraefikConfig,
+  rebuildRoutes,
 } from '../src/routes.js';
 
 test('deriveSourceRanges：从 fde_networks 精确 subnet 派生（/29 与 /28），禁止 /16 池', () => {
@@ -76,10 +80,123 @@ test('generateTraefikConfig：大 FDE /28 来源规则精确写入', () => {
   assert.ok(!text.includes('/16'));
 });
 
-test('validateTraefikConfig：非空 / 关键节 / 重复 router 名拒绝', () => {
+test('validateTraefikConfig：结构断言 / 控制字符 / 重复 router 名拒绝', () => {
   const allocs = [{ hostname: 'alice-p-proj1-4016.fde.localhost' }];
-  assert.equal(validateTraefikConfig('http:\n  routers:\n  services:\n', allocs), true);
+  const name = 'fde-alice-p-proj1-4016';
+  const good = ['http:', '  routers:', `    ${name}:`, '  middlewares:', '  services:', `    ${name}:`].join('\n');
+  assert.equal(validateTraefikConfig(good, allocs), true);
   assert.throws(() => validateTraefikConfig('', allocs), /empty/);
   assert.throws(() => validateTraefikConfig('foo', allocs), /missing sections/);
-  assert.throws(() => validateTraefikConfig('http:\n  routers:\n  services:\n', [allocs[0], allocs[0]]), /duplicate/);
+  assert.throws(() => validateTraefikConfig(`${good}\n\u0000`, allocs), /control/);
+  assert.throws(() => validateTraefikConfig(good, [allocs[0], allocs[0]]), /duplicate/);
+});
+
+test('generateTraefikConfig：每 active FDE 生成 LLM 路由（Host(llm) && ClientIP(精确 subnet) → llm-hub，无兜底）', () => {
+  const text = generateTraefikConfig({
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: ['10.200.1.0/29'],
+    llmHost: 'llm.localhost',
+    llmGatewayUrl: 'http://127.0.0.1:4000',
+    llmNetworks: [{ subnet: '10.200.1.0/29', fdeName: 'alice' }],
+  });
+  assert.match(text, /fde-alice-llm:/);
+  assert.ok(text.includes('Host(`llm.localhost`) && ClientIP(`10.200.1.0/29`)'));
+  assert.match(text, /alice-llm-auth/);
+  assert.ok(text.includes('Authorization: "Bearer erix-placeholder"'));
+  assert.ok(text.includes('X-FDE-Identity: "alice"'));
+  assert.ok(text.includes('service: llm-hub'));
+  assert.ok(text.includes('url: "http://127.0.0.1:4000"'));
+  // 禁止无 ClientIP 条件的兜底路由
+  assert.ok(!text.includes('rule: "Host(`llm.localhost`)"'));
+});
+
+test('generateTraefikConfig：hostname/router key 注入面拒绝（换行/控制字符/非法字符）', () => {
+  const base = {
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: [],
+  };
+  assert.throws(
+    () => generateTraefikConfig({ ...base, allocations: [{ id: 'pa1', hostname: 'alice-p-proj1-4016.fde.localhost\nbad', port: 4016, backendUrl: 'http://10.200.1.2:4016' }] }),
+    /invalid allocation hostname/,
+  );
+  assert.throws(
+    () => generateTraefikConfig({ ...base, allocations: [{ id: 'pa1', hostname: 'ALICE.fde.localhost', port: 4016, backendUrl: 'http://10.200.1.2:4016' }] }),
+    /invalid allocation hostname/,
+  );
+  assert.throws(() => generateTraefikConfig({ ...base, portalHost: 'station.localhost\n' }), /invalid portal hostname/);
+});
+
+test('M4：llm-hub service 含 responseForwarding.flushInterval ≤ 100ms', () => {
+  const text = generateTraefikConfig({
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: ['10.200.1.0/29'],
+    llmHost: 'llm.localhost',
+    llmGatewayUrl: 'http://127.0.0.1:4000',
+    llmNetworks: [{ subnet: '10.200.1.0/29', fdeName: 'alice' }],
+  });
+  assert.ok(text.includes('    llm-hub:'));
+  assert.ok(text.includes('        responseForwarding:'));
+  assert.match(text, /flushInterval: 100ms/);
+});
+
+test('M3：含换行/控制字符的 llmGatewayUrl/portalBackendUrl/entryPoint 拒绝（不落盘）', () => {
+  const base = {
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: [],
+  };
+  assert.throws(
+    () => generateTraefikConfig({ ...base, llmHost: 'llm.localhost', llmGatewayUrl: 'http://127.0.0.1:4000\ninjected: yes', llmNetworks: [{ subnet: '10.200.1.0/29', fdeName: 'alice' }] }),
+    /control characters/,
+  );
+  assert.throws(() => generateTraefikConfig({ ...base, portalBackendUrl: 'http://127.0.0.1:18080\nx' }), /control characters/);
+  assert.throws(() => generateTraefikConfig({ ...base, entryPoint: 'web\t' }), /control characters/);
+  assert.throws(() => generateTraefikConfig({ ...base, portalBackendUrl: 'ftp://127.0.0.1:8080' }), /http\/https/);
+});
+
+test('validateTraefikConfig：tab/CR 控制字符拒绝（不含合法换行分隔符）', () => {
+  const allocs = [{ hostname: 'alice-p-proj1-4016.fde.localhost' }];
+  const name = 'fde-alice-p-proj1-4016';
+  const good = ['http:', '  routers:', `    ${name}:`, '  middlewares:', '  services:', `    ${name}:`].join('\n');
+  assert.equal(validateTraefikConfig(good, allocs), true);
+  assert.throws(() => validateTraefikConfig(`${good}\n\t`, allocs), /control/);
+  assert.throws(() => validateTraefikConfig(good.replace(/\n/g, '\r\n'), allocs), /control/);
+});
+
+test('M3：含换行的 LLM_GATEWAY_HOST 在发布路径被拒绝且不落盘', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-m3-'));
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM fde_networks')) {
+        return { rows: [{ fde_id: 'u1', subnet: '10.200.1.0/29', fde_name: 'alice' }] };
+      }
+      if (sql.includes('FROM port_allocations')) {
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+  };
+  const config = {
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    traefikEntryPoint: 'web',
+    llmHost: 'llm.localhost',
+    llmGatewayUrl: 'http://127.0.0.1:4000\ninjected: yes',
+    traefikDynamicDir: dir,
+    traefikDynamicFile: 'routes.yml',
+  };
+  await assert.rejects(() => rebuildRoutes(pool, config), /control characters/);
+  assert.equal(fs.existsSync(path.join(dir, 'routes.yml')), false);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

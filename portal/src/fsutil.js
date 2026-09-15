@@ -64,8 +64,12 @@ function fsyncDir(dir) {
   try {
     fd = fs.openSync(dir, 'r');
     fs.fsyncSync(fd);
-  } catch {
-    // 某些平台/目录 fsync 不可用：忽略（rename 本身已原子）。
+    return true;
+  } catch (e) {
+    // F12：至少 console.error。不向上抛——rename 已提交，抛错会把「已提交」误报为失败、
+    // 破坏调用方（materialize/route）重试语义；以 false 返回失败语义，调用方可选告警。
+    console.error(`[fsutil] fsyncDir ${dir} failed: ${e.message}`);
+    return false;
   } finally {
     if (fd !== undefined) {
       try {
@@ -76,10 +80,11 @@ function fsyncDir(dir) {
 }
 
 /**
- * 单文件原子写（user-space §5.1）：同目录 temp（O_EXCL + O_NOFOLLOW，0600）→ 写 → fsync → chmod 最终模式 → rename → fsync 目录。
- * 失败清理 temp 并抛错，保留旧文件（绝不写半截）。
+ * 写同目录 temp（O_EXCL + O_NOFOLLOW，0600）→ 写内容 → fsync → chmod 最终模式。
+ * 只落 temp、不 rename；返回 temp 路径，供两阶段提交（user-space §5.3 提交点 / F5）。
+ * 失败清理 temp 并抛错。
  */
-export function atomicWriteFile(target, content, { mode = 0o644, root = null } = {}) {
+export function writeTempFile(target, content, { mode = 0o644, root = null } = {}) {
   if (root) assertSafePath(root, target);
   const dir = path.dirname(target);
   const tmp = path.join(dir, `${path.basename(target)}.${randomHex(4)}.tmp`);
@@ -91,14 +96,46 @@ export function atomicWriteFile(target, content, { mode = 0o644, root = null } =
     fs.closeSync(fd);
     fd = undefined;
     fs.chmodSync(tmp, mode);
-    fs.renameSync(tmp, target);
-    fsyncDir(dir);
+    return tmp;
   } catch (err) {
     if (fd !== undefined) {
       try {
         fs.closeSync(fd);
       } catch {}
     }
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
+}
+
+/**
+ * 提交 temp → target（rename 原子替换 + fsync 目录）。调用方负责失败时清理 temp。
+ * 返回 boolean：rename 成功但目录 fsync 失败时返回 false（已提交但持久性未确认）；
+ * 不抛错（rename 已提交，抛错会把「已提交」误报为失败，破坏调用方重试语义）。
+ */
+export function commitTempFile(tmp, target, { root = null } = {}) {
+  if (root) assertSafePath(root, target);
+  fs.renameSync(tmp, target);
+  return fsyncDir(path.dirname(target));
+}
+
+/**
+ * 单文件原子写（user-space §5.1）：writeTempFile + commitTempFile 一步完成。
+ * 失败清理 temp 并抛错，保留旧文件（绝不写半截）。
+ * rename 已提交但目录 fsync 失败时抛 `materialize_fsync_failed`（持久性未确认，调用方须走失败语义）。
+ */
+export function atomicWriteFile(target, content, { mode = 0o644, root = null } = {}) {
+  const tmp = writeTempFile(target, content, { mode, root });
+  try {
+    const ok = commitTempFile(tmp, target, { root });
+    if (!ok) {
+      const err = new Error(`fsync directory failed after rename: ${target}`);
+      err.code = 'materialize_fsync_failed';
+      throw err;
+    }
+  } catch (err) {
     try {
       fs.unlinkSync(tmp);
     } catch {}

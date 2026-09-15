@@ -123,6 +123,26 @@ export async function allocateNetworkInTx(client, userId, fdeName, opts = {}) {
   const taken = await client.query(`SELECT subnet FROM fde_networks`);
   const existingCidrs = taken.rows.map((r) => r.subnet).concat(reservedSubnets);
   const cand = nextAvailableSubnet(existingCidrs, poolSpec);
+
+  // F4：fde_networks.fde_id 是主键，released 行仍占用该主键 → 直接 INSERT 会冲突 500。
+  // 同 fde_id 已有 released 行时 UPDATE 复用该行（改 subnet/gateway/state/revision），否则 INSERT。
+  const released = await client.query(
+    `SELECT fde_id FROM fde_networks WHERE fde_id = $1 AND state = 'released'`,
+    [userId],
+  );
+  if (released.rows.length > 0) {
+    const row = await client.query(
+      `UPDATE fde_networks
+          SET network_name = $2, subnet = $3, prefix_len = $4, gateway = $5, pool = $6,
+              state = 'allocated', revision = revision + 1, released_at = NULL
+        WHERE fde_id = $1 AND state = 'released'
+        RETURNING fde_id, network_name, subnet, prefix_len, gateway, pool, state`,
+      [userId, networkName, cand.subnet, cand.prefixLen, cand.gateway, poolName],
+    );
+    log.log?.(`[ipam] reallocated ${cand.subnet} (${networkName}) for fde=${fdeName}`);
+    return row.rows[0];
+  }
+
   const row = await client.query(
     `INSERT INTO fde_networks (fde_id, network_name, subnet, prefix_len, gateway, pool, state)
      VALUES ($1, $2, $3, $4, $5, $6, 'allocated')

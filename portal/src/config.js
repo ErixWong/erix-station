@@ -111,6 +111,8 @@ export function loadConfig(env = process.env) {
     portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
     traefikEntryPoint: env.TRAEFIK_ENTRYPOINT || 'web',
     llmHost: env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`,
+    // LLM 网关数据面回环地址（topology §4-L7）。P1 为 mock/占位，真实网关 P2+ 接入。
+    llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4000',
     // 端口配额 / 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
     portQuota: intEnv(env, 'PORT_QUOTA', 40),
     fdePool: env.FDE_POOL || 'default',

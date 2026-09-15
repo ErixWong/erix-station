@@ -10,6 +10,7 @@ import {
   findFreeSlot,
   toProject,
   toPort,
+  renameProject,
   DEFAULT_PORT_QUOTA,
   PORT_BLOCK_BASE,
   PORT_BLOCK_SIZE,
@@ -100,4 +101,28 @@ test('toProject / toPort 映射', () => {
   assert.equal(port.port, 4016);
   assert.equal(port.state, 'allocated');
   assert.equal(port.released_at, null);
+});
+
+test('F7：改名后 enqueue materialize change（新目录生成 + 旧目录收敛；不改 route outbox）', async () => {
+  const calls = { materialize: 0, route: 0 };
+  const client = {
+    async query(sql, params) {
+      if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+      if (sql.includes('SELECT 1 FROM projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL')) return { rows: [{ '?column?': 1 }] };
+      if (sql.includes('SELECT 1 FROM projects WHERE user_id = $1 AND name = $2')) return { rows: [] };
+      if (sql.trimStart().startsWith('UPDATE projects SET name')) {
+        return { rows: [{ id: params[0], name: params[2], repo_url: 'https://git.example/a.git', root_path: params[3], slot: 0, template: 'node', created_at: new Date('2026-09-12T08:30:00.000Z') }] };
+      }
+      if (sql.includes('INSERT INTO materialize_revisions')) return { rows: [{ revision: 2 }] };
+      if (sql.includes('INSERT INTO materialize_outbox')) { calls.materialize += 1; return { rows: [] }; }
+      if (sql.includes('INSERT INTO route_outbox')) { calls.route += 1; return { rows: [] }; }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } };
+  const p = await renameProject(pool, { userId: 'u1', projectId: 'p1', name: 'proj2' });
+  assert.equal(p.name, 'proj2');
+  assert.equal(calls.materialize, 1);
+  assert.equal(calls.route, 0);
 });
