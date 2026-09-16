@@ -13,7 +13,7 @@
 
 | # | 问题 | 影响 | 状态 |
 |---|---|---|---|
-| Q1 | 公司是否已有统一 LLM 网关（候选分析与活跃度筛查见 [`design/llm-gateway/llm-gateway-selection.md`](design/llm-gateway/llm-gateway-selection.md)；one-api / one-hub 已因停更淘汰） | 决定 portal 是「租户绑定」还是「兼做网关」（§11） | ⚠️ 待定 |
+| Q1 | 公司是否已有统一 LLM 网关（候选分析与活跃度筛查见 [`llm-gateway/llm-gateway-selection.md`](llm-gateway/llm-gateway-selection.md)；one-api / one-hub 已因停更淘汰） | 决定 portal 是「租户绑定」还是「兼做网关」（§11） | ⚠️ 待定 |
 | Q2 | 出口管控（egress）职责归属 | 平台侧保证凭据层（虚拟 key）+ 审计；网络层阻断（容器能否出网、可访问哪些域名）由安全团队负责（§11） | ✅ 已定：外部依赖（安全团队），决策者 2026-09（issue #3） |
 | Q3 | 本地 admin 的定位：仅破窗，还是 FDE 也可用？ | 认证设计（§6） | ⚠️ 待定 |
 | Q4 | LLM 虚拟 key 粒度：每 FDE 一把，还是每客户项目一把？ | 成本归属精度 vs key 数量（§11） | ⚠️ 待定 |
