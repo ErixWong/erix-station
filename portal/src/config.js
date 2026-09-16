@@ -167,6 +167,11 @@ export function loadConfig(env = process.env) {
     portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
     traefikEntryPoint: env.TRAEFIK_ENTRYPOINT || 'web',
     llmHost: env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`,
+    // ---- 容器经 Traefik 访问 portal/LLM 的公共入口 base URL（scheme://host[:port]）----
+    // dev：web entrypoint http + 高端口；prod：websecure entrypoint https + 443（隐式）。
+    // 由 ERIX_STATION_BASE_URL（agentd）与 config.json endpoint（worker provider）使用。
+    portalPublicBaseUrl: resolvePublicBaseUrl(env, 'PORTAL_PUBLIC_BASE_URL', env.PORTAL_HOST || `station.${env.BASE_DOMAIN || 'localhost'}`),
+    llmPublicBaseUrl: resolvePublicBaseUrl(env, 'LLM_PUBLIC_BASE_URL', env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`),
     // LLM 网关数据面回环地址（topology §4-L7）。P1 为 mock/占位，真实网关 P2+ 接入。
     llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4000',
     // 端口配额 / 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
@@ -217,4 +222,20 @@ function parseJsonStringArray(raw, fallback) {
     // fallthrough
   }
   return fallback;
+}
+
+/**
+ * 容器经 Traefik 访问 portal/LLM 的公共入口 base URL（scheme://host[:port]）。
+ * 优先显式 env；否则按 entrypoint 推导：dev（web）http + TRAEFIK_WEB_PORT，prod（websecure）https + 443。
+ */
+function resolvePublicBaseUrl(env, key, host) {
+  if (env[key] && String(env[key]).trim()) return String(env[key]).trim().replace(/\/+$/, '');
+  const entrypoint = env.TRAEFIK_ENTRYPOINT || 'web';
+  const webPort = Number(env.TRAEFIK_WEB_PORT || 8090);
+  const websecurePort = Number(env.TRAEFIK_WEBSECURE_PORT || 8443);
+  const scheme = entrypoint === 'websecure' ? 'https' : 'http';
+  const port = entrypoint === 'websecure'
+    ? (websecurePort === 443 ? '' : `:${websecurePort}`)
+    : `:${webPort}`;
+  return `${scheme}://${host}${port}`;
 }

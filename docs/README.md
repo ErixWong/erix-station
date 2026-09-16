@@ -18,6 +18,7 @@
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
 | [`design/user-space.md`](design/user-space.md) | **用户空间物化契约（阻塞 P1 开工，issue #7）**：宿主↔portal↔FDE 容器路径映射、文件清单与 JSON schema、原子写 + manifest 多文件一致性、UID/权限、失败重试状态机、变更感知、重建幂等、项目目录归属 | ✅ |
 | [`design/deploy-contract.md`](design/deploy-contract.md) | **P1 部署契约**：服务清单与镜像 pin、compose 字段（网络/publish/volume/healthcheck/env_file）、DB 迁移机制、Traefik 静态/动态配置、防火墙应用方式（iptables-nft 幂等 + fail-closed）、socket-proxy 白名单策略、FDE 容器创建参数、P1 范围声明、readiness 语义 | ✅ |
+| [`design/llm-gateway/llm-gateway-selection.md`](design/llm-gateway/llm-gateway-selection.md) | **LLM 网关选型支撑（Q1 决策材料）**：本场景硬需求准绳、候选活跃度核查（one-api / one-hub 因停更淘汰）、LiteLLM vs new-api 对比、建议与 P3 实测项 | 草案（待 Q1 定稿） |
 | [`env.md`](env.md) | **部署参数清单**：参数定义 + 参考实例 A + 目标环境探测 checklist（非单机环境事实） | ✅ |
 | [`api/portal.md`](api/portal.md) | **portal API 契约**：认证、端点请求/响应 schema、SSE 事件信封类型清单、错误语义 | ✅ |
 | [`data/schema.sql`](data/schema.sql) | **可执行建表 DDL**：约束/索引/外键齐全，postgres:16 空库实测 `psql -f` 可执行 | ✅ |
