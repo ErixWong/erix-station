@@ -54,7 +54,7 @@ node --check "$RUNNER_JS"
 
 ```bash
 cd /home/eric/projects/erix-station
-# ⚠️ 前置条件：portal/ 与 package.json 已实现（当前仓库尚无，见 §1.1 注），否则 npm test 退出 254
+# ✅ 前置条件已满足：portal/ 与 package.json 已落地，npm test 当前 168 pass / 0 fail（见 §1.1 注）
 npm test                                    # 默认 Node 22
 PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node 24）
 ```
@@ -403,7 +403,7 @@ node --input-type=module -e \
 接入落点（实现后）：
 
 - **store adapter 契约测试**：用 `transcriptStoreContract` 跑**本平台的 HTTP store adapter**（实现 `TranscriptStore` 六方法，映射到 portal internal U5–U9，runner §9.1）。跑法：起 in-process stub 实现 U5–U9（§2.1 fake），adapter 指向 stub，contract 测试逐方法断言。**这验证的是「我们的 adapter 满足上游 store 接口语义」，不是验证 portal 业务逻辑**。
-- **config provider 契约测试**：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。
+- **config provider 契约测试**：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（顶层键 `slots` + 占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。
 - **CI 接入**：规格 §13.2-6「`erix-agent/contract-tests` 应接入 CI（长期运行的宿主必需）」——落点为 `npm test` 的一个子集（`contract-tests` 目录），随全绿门槛执行。
 
 ### 3.7 浏览器验证流程（playwright MCP → 截图 → vision MCP；守不变式 2，P1 验收主链路）
@@ -567,7 +567,7 @@ P1 交付完成 = 同时满足：
 | # | 目标文档 | 需同步点 | 状态 |
 |---|---|---|---|
 | S2 | `data/model.md` §2.2 | `allocated→active` 触发条件定案为「首次 forward-auth 放行」（规格 §8.6；deploy §9.2 S2 已标记） | ✅ 已同步（model.md §2.2 已定稿并注明） |
-| S3 | `data/schema.sql` | 缺 `schema_migrations` 表（deploy §3.1 要求；deploy §9.2 S3 已标记）；可选 `users.fde_name` 加 CHECK（规格 §8.5） | ✅ 已同步（schema.sql §10 `schema_migrations` 已落） |
+| S3 | `data/schema.sql` | `schema_migrations` 表（deploy §3.1）+ `users.fde_name` CHECK（规格 §8.5） | ✅ 已同步（schema.sql §10 + §2 CHECK 均已落） |
 
 ---
 

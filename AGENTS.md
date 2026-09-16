@@ -26,7 +26,7 @@
 portal/     # 管理平台服务：用户/项目/端口/容器生命周期/事件/LLM 网关
 runner/     # 容器内 agent worker（接 erix-agent，跑 runToolLoop）
 deploy/     # compose、traefik 配置模板、FDE 容器模板
-docs/       # 文档地图（docs/README.md）+ design/ + 待建 api/ data/ decisions/ ops/
+docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）+ 待建 decisions/ ops/
 ```
 
 **动手前先读三份文档**：
@@ -51,7 +51,7 @@ docs/       # 文档地图（docs/README.md）+ design/ + 待建 api/ data/ deci
 | 端口 | 用途 |
 |---|---|
 | 80 / 443 | Traefik ingress（唯一对外；**生产值**——开发期本机 80/443 被 nginx 占用，按 env.md §0 用 8090/8443） |
-| 8080 | portal（backend 网络 + publish 仅 `127.0.0.1:8080` 回环，供 Traefik 反代/forwardAuth） |
+| 8080 | portal（backend 网络 + publish 仅 `127.0.0.1:8080` 回环，供 Traefik 反代/forwardAuth；开发期本机映射 `18080`，env.md §0） |
 | 4000 | LLM 网关数据面（publish 仅 `127.0.0.1:4000` 回环；P1 由 station-mock-llm 占据，P3 由真实网关占据） |
 | 5432 | DB（backend 网络内，不 publish） |
 

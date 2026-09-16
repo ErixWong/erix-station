@@ -52,4 +52,4 @@ sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml
 ## 说明
 
 - 开发期 `COOKIE_PROFILE=dev-http` → cookie 名 `fde_session_dev`、无 `Secure`（仅本机 HTTP 联调；部署配置必须 `prod`）。
-- 本轮只有三个容器；`station-docker-socket-proxy` / FDE 容器 / LLM 网关 / materializer / 路由 reconciler 归后续轮次。
+- 本轮平台栈三个容器（edge/portal/db）+ `station-docker-proxy`；FDE 容器 / LLM 网关（P1 为 `station-mock-llm`）/ materializer / 路由 reconciler 均已随 WP2a–WP3b 交付（`station-docker-proxy` 亦已落地，见 deploy-contract §5.1）。

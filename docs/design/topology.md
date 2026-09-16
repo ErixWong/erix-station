@@ -5,7 +5,7 @@
 >
 > **本文是 H-B 网络与访问拓扑的单一事实来源（single source of truth）**：拓扑结构、网络/IP 分配、全链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、流式与存储策略、实测证据，一律以本文为准。
 >
-> ⚠️ **与既有文档的关系**：规格 [`fde-platform.md`](fde-platform.md) §3/§5/§6.4/§10.3/§11、[`runner-integration.md`](runner-integration.md) §4/§10/§11、[`../env.md`](../env.md) §5/§6 中凡与本文冲突的描述（旧 `edge`/`control` 拓扑、internal API 不经 Traefik、portal 不 publish、容器内放 LLM 虚拟 key 文件等），**以本文为准**；既有文档的逐处修订属后续任务（issue #5 评论 2 §11 影响面清单），不由本文承担。
+> **与既有文档的关系（已对齐，2026-09-16 审计复核）**：规格 [`fde-platform.md`](fde-platform.md) §3/§5/§6.4/§10.3/§11/§12.3/§14、[`runner-integration.md`](runner-integration.md) §4/§10/§11、[`../env.md`](../env.md) §5/§6 均已按本文修订（旧 `edge`/`control` 拓扑、internal API 不经 Traefik、portal 不 publish、容器内放 LLM key 文件等旧描述已清）；如有残留冲突**以本文为准**。
 
 ---
 
@@ -234,7 +234,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | 链路 | 中间件/检查（按顺序） | 每层失败 → HTTP code | redirect? | 写审计? |
 |---|---|---|---|---|
 | **① 浏览器 → portal**（`station.<base>`） | TLS 终结 → Host 匹配 → portal 自身 session cookie 校验（按 `login_sessions.token_hash` 查库）→ 路由 handler | TLS/主机不匹配 → 连接失败 / `404`；session 无效 → `401 unauthorized`（JSON） | `401` 前端跳登录页 | portal 写登录/登出/关键动作 `audit_log`；Traefik access log 仅原始 |
-| **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `403 forbidden（preview_ticket_required）`；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `403`（凭证类）→ Traefik 透传；登录引导由 portal 前端按 `preview_ticket_required` 处理 | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
+| **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `403 forbidden（preview_ticket_required）`（**`public` exposure 例外：跳过凭证校验，仍须过 hostname/state**）；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `403`（凭证类）→ Traefik 透传；登录引导由 portal 前端按 `preview_ticket_required` 处理 | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
 | **③ 容器 → internal API**（`/api/internal/*`） | TLS（容器→Traefik）→ `Host(station) && PathPrefix(/api/internal)` + **`ipAllowList`（remote address，每 FDE 精确 subnet）** → service portal → portal Bearer 校验（`containers.runner_token_hash` 按代次比对）→ 归属校验（`run → session → user_id`）→ handler | 来源不在白名单 → `403`（Traefik）；Bearer 缺失/错 → `401 token_invalid`；吊销 → `401 token_revoked`；归属不符 → `403 run_ownership_mismatch`（或 `404`） | 否（容器不是浏览器，不 302） | portal 对关键动作（claim/心跳/吊销/越权）写 `audit_log` |
 | **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`<fde>-llm-auth` 注入并覆盖 `Authorization` + `X-FDE-Identity`）→ service `llm-hub` | 无匹配 ClientIP → `404`（无兜底路由）；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走网关 `usage_ledger`，Traefik access log 原始 |
 
@@ -317,7 +317,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 |---|---|---|
 | FDE A → FDE B（任意端口） | 禁止 | 无共享网络 + 宿主不转发 |
 | FDE → station-db | 禁止 | 无网络路径 + 无凭据 |
-| FDE → 宿主 :443（Traefik） | 允许 | INPUT + DOCKER-USER + `ipAllowList` |
+| FDE → 宿主 :443（Traefik） | 允许 | INPUT（443 放行）+ DOCKER-USER（其它宿主端口拒绝，§6.1）——`ipAllowList` 仅用于 ③ internal API 行，不参与本行 |
 | FDE → 宿主其它端口 | 禁止 | INPUT + DOCKER-USER（分层，§6.1） |
 | 浏览器 → `station.<base>` / `*.fde.<base>` | 允许 | Traefik 路由 + forwardAuth |
 | portal → station-db | 允许 | `backend` 网络 |
@@ -421,7 +421,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 
 | 主题 | 位置 |
 |---|---|
-| 主规格（网络与隔离模型、Traefik 骨架、LLM 接入——**与本文冲突处以本文为准**，修订属后续任务） | [`fde-platform.md`](fde-platform.md) §5 / §6.4 / §11 |
+| 主规格（网络与隔离模型、Traefik 骨架、LLM 接入——**已按本文对齐**，残留冲突以本文为准） | [`fde-platform.md`](fde-platform.md) §5 / §6.4 / §11 |
 | 容器内进程模型、出站协议端点、事件批量参数、幂等与租约 | [`runner-integration.md`](runner-integration.md) §2 / §4 / §7 |
 | 部署参数（`default-address-pools`、端口清单、路径与凭据注入约定） | [`../env.md`](../env.md) |
 | internal 端点契约、SSE 语义 | [`../api/portal.md`](../api/portal.md) §9 / §5 |

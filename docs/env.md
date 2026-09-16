@@ -175,7 +175,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 
 - 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `2770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
 
-- LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + baseURL）：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
+- LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + endpoint：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
 - `docker.sock` **只挂到 `station-docker-proxy`**（不直挂 portal）；portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问，路径白名单见 deploy-contract §5.1（自研 admission proxy：12 条契约路径 + create 参数级校验；`VOLUMES` 不授，bind mount 不需 volume API）
 - 超级用户口令（`POSTGRES_PASSWORD`）与两个角色口令（`PLATFORM_DB_PASSWORD`/`PORTAL_DB_PASSWORD`）部署时生成后存 `deploy/.env`（600）
 
@@ -307,7 +307,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `TRAEFIK_DYNAMIC_DIR_HOST` | compose 插值：Traefik 动态配置宿主目录（portal 写方与 Traefik 只读方共享；生产 `/docker/station-edge/dynamic/`，开发期默认 `./traefik/dynamic`） | 平台规范固定 + 开发期隔离 | `./traefik/dynamic` |
 | `PORTAL_BACKEND_URL` | portal 后端回环地址（reconciler 生成 portal service 与 forwardAuth 地址用） | 平台规范固定 + 目标环境探测（回环端口） | `http://127.0.0.1:8080`（开发期 `http://127.0.0.1:18080`，§0） |
 | `TRAEFIK_ENTRYPOINT` | reconciler 生成路由挂载的 Traefik entryPoint | 平台规范固定 | `web`（P1 开发 http；生产 `websecure`） |
-| `PORT_QUOTA` | 每用户项目 slot 配额（规格 §8.2「如 40 个端口」） | 平台规范固定 | `40` |
+| `PORT_QUOTA` | 每用户项目 slot 配额（规格 §8.2：N 个项目 slot = N×8 端口上限） | 平台规范固定 | `40` |
 | `FDE_POOL` | IPAM 默认池选择 | 平台规范固定 | `default`（`large` = 大 FDE `/28` 段） |
 | `IPAM_RESERVED_SUBNETS` | IPAM 保留网段（逗号分隔；避开宿主既有网段，开发期可置空，因 FDE 池 10.200/10.201 与 backend 172.32 天然隔离） | 目标环境探测 | ``（空） |
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（user-space §6.1） | 平台规范固定 | `1000` / `1000` |
@@ -325,7 +325,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 变量 | 用途 | 默认 / 示例 |
 |---|---|---|
 | `PORTAL_PUBLIC_BASE_URL` | portal 对外完整 URL（cookie 域 / 跳转生成用，portal 运行时） | 空 = 由 `PORTAL_HOST` 派生 |
-| `LLM_PUBLIC_BASE_URL` | LLM 网关对外完整 URL（`llm.<base>`，路由生成与占位 baseURL 用） | 空 = 由 `LLM_HOST` 派生 |
+| `LLM_PUBLIC_BASE_URL` | LLM 网关对外完整 URL（`llm.<base>`，路由生成与占位 endpoint 用） | 空 = 由 `LLM_HOST` 派生 |
 | `SESSION_TTL_SECONDS` | portal 登录会话 TTL | `604800`（7 天） |
 | `FDE_IPAM_POOLS` | IPAM 池（逗号分隔 CIDR；proxy/portal 双侧校验） | `10.200.0.0/16,10.201.0.0/16` |
 | `FDE_ALLOWED_USERS` | FDE 容器允许的 `uid:gid` 白名单（create 参数级校验，deploy-contract §5.1） | `1001:1000` |

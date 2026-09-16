@@ -5,7 +5,7 @@
 >
 > **本文只定义「契约形状」**（端点、schema、错误语义、事件信封），不定义实现。前端可只依据本文 + mock 数据开发；后端实现与本文冲突时以规格为准并提 issue。
 >
-> ⚠️ **Q7（portal 技术栈）未决**：不影响本文任何契约形状；文中个别实现注记按 principles §4 Q7 倾向 (a)（零依赖 `node:http` + 原生前端）给出，标注「⚠️ 待决策者确认」。
+✅ **Q7 已定稿**（零依赖 `node:http` + 原生前端，principles §4；fde-platform 附录 A）：不影响本文任何契约形状；文中实现注记按定稿口径给出。
 
 ---
 
@@ -315,7 +315,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | `expires_in` | TTL 秒数（**60s ⚠️ 待决策者确认**） |
 
 签发规则：
-- 当前用户对该 allocation 的可见性必须成立：`private` → 仅 owner **或 admin**（admin 例外，写审计 + 告警）；`org-visible` → 任意已认证用户；`public` → 任意已认证用户（P1 `public` 默认不可开）。不成立 → `404 not_found`（他人资源不泄露存在性，§1.2）。
+- 当前用户对该 allocation 的可见性必须成立：`private` → 仅 owner **或 admin**（admin 例外，写审计 + 告警）；`org-visible` → 任意已认证用户；`public` → 真公开免凭证（**默认不给，仅 admin 可开**）——签发侧同样仅 admin 可为 `public` allocation 签发 bootstrap ticket。不成立 → `404 not_found`（他人资源不泄露存在性，§1.2）。
 - allocation 必须 `state ∈ {allocated,active}`；已 `released` 视同不存在 → `404`。
 - portal 生成随机 token，只存 `preview_grants`（`kind='ticket'`，`token_hash=sha256(ticket)`，**`issuer_id` = 当前登录用户（签发者）**、`user_id` = **主体（被授权访问的身份：普通 FDE 自签 = issuer = subject；admin 代签他人 private = subject 为 admin）**、`allocation_id`、`expires_at=now+60s`、`created_ip/created_ua`）。**不存 ticket 明文**（与 `login_sessions.token_hash` 同口径）。
 
@@ -439,7 +439,7 @@ station-portal user enable  --login <login>
 
 | 字段 | 说明 |
 |---|---|
-| `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9][a-z0-9-]{0,62}` |
+| `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`（同 schema.sql CHECK，不允许尾随 `-`） |
 | `repo_url` | 仓库地址，**仅作记录/展示元数据**：平台不 clone、不物化该目录、不下发 git 凭据；clone 与 git 凭据由 FDE 在容器内自行配置（规格 §7.2/§12.2，决策者 2026-09，issue #3 评论） |
 | `slot` | 项目端口块序号（决定 `4000 + slot*8` 起始端口，规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
@@ -864,7 +864,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 | # | 事项 | 当前倾向（principles §4） | 影响 |
 |---|---|---|---|
-| 1 | Q7 portal 技术栈 | (a) 零依赖 Node | 仅实现注记，**契约形状无关** |
+| 1 | ~~Q7 portal 技术栈~~ ✅ 已定稿：(a) 零依赖 `node:http` + 原生前端（principles §4；WP1 落地） | — | 仅实现注记，**契约形状无关** |
 | 2 | `BASE_DOMAIN`（影响示例 URL 与 cookie 生效 host；当前倾向 `erix.vip`） | env §1 ⚠️ | §0 / §2.5 |
 | 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2） | env §4 / Q3 倾向 (a) | §2.1 |
 | 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
@@ -1125,8 +1125,6 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 ```
 
 响应 `200`。幂等：重复 `{state:"running"}` 在 `queued`/`running` 下均为 `200`（覆盖写/无变化）。
-
-**终态收敛**——请求：
 
 **终态收敛**——请求：
 

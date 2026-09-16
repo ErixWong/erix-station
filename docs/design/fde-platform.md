@@ -109,7 +109,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 | `station-db`（Postgres） | 用户/会话/消息/transcript/events/端口表/用量/审计 | 不存代码 |
 | `fde-<name>`（FDE 容器） | `station-agentd`（常驻守护/桥接，唯一出站连 portal）+ `station-runner`（每 run 一个子进程，跑 erix agent）+ code-server + dev servers（进程模型见 [runner-integration.md](runner-integration.md) §2，命名 ⚠️ 待决策者确认）；平台状态一律经 portal internal API 落 DB——**容器不直连 DB**（决策者 2026-09，issue #3 评论） | 不 publish 端口、**不监听任何对外端口**、不挂 `docker.sock`、**不持有平台密钥（含 DB 凭据）**——唯一平台凭据为 per-container token，仅 agentd 持有 |
 
-**只有 portal 挂 `/var/run/docker.sock`**，且经 **`station-docker-proxy`**（自研零依赖 Node admission proxy，方法+路径白名单 12 条 + `POST /containers/create` 参数级 allowlist；完整契约见 deploy-contract §5.1。原「tecnativa/docker-socket-proxy + 类别级 env 白名单」方案已被替换）。FDE 容器永不挂。
+**只有 `station-docker-proxy` 挂 `/var/run/docker.sock`（只读）**；portal **不直挂**，经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API——proxy 为（自研零依赖 Node admission proxy，方法+路径白名单 12 条 + `POST /containers/create` 参数级 allowlist；完整契约见 deploy-contract §5.1。原「tecnativa/docker-socket-proxy + 类别级 env 白名单」方案已被替换）。FDE 容器永不挂。
 
 ---
 
@@ -178,7 +178,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 
 | 坑 | 解法 |
 |---|---|
-| **SameSite 打死 iframe**：portal 在 `station.a.com`、预览在 `b.com` → cross-site → iframe 里 cookie 不发送，预览显示登录页 | **把 FDE 页面放在与 portal 同一 registrable domain 下**：portal = `station.<base>`，预览 = `alice-r3a7f-4000.fde.<base>`。同 site → `SameSite=Lax` 在 iframe 内正常发送。⚠️ **P1 预览凭证不再是 portal session cookie**：portal 签发一次性 ticket，forwardAuth 换取**预览 host 的 host-only 预览 cookie**（portal session cookie 为 host-only、绝不发到预览域）——同 registrable domain 布局仍保留，是为让「预览 host 自己的 cookie」在 iframe 内为 same-site；细节见 [portal.md](../api/portal.md) §2.5/§2.7/§2.8 |
+| **SameSite 打死 iframe**：portal 在 `station.a.com`、预览在 `b.com` → cross-site → iframe 里 cookie 不发送，预览显示登录页 | **把 FDE 页面放在与 portal 同一 registrable domain 下**：portal = `station.<base>`，预览 = `alice-p-proj1-4000.fde.<base>`。同 site → `SameSite=Lax` 在 iframe 内正常发送。⚠️ **P1 预览凭证不再是 portal session cookie**：portal 签发一次性 ticket，forwardAuth 换取**预览 host 的 host-only 预览 cookie**（portal session cookie 为 host-only、绝不发到预览域）——同 registrable domain 布局仍保留，是为让「预览 host 自己的 cookie」在 iframe 内为 same-site；细节见 [portal.md](../api/portal.md) §2.5/§2.7/§2.8 |
 | CSP / 缓存 / Referer 泄漏 | `Content-Security-Policy: frame-ancestors https://station.<base>`；`Cache-Control: private, no-store`；`Referrer-Policy: no-referrer` |
 
 ### 6.4 Traefik 骨架（H-B，决策者 2026-09 定稿，issue #5）
@@ -394,15 +394,15 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 ### 8.5 hostname grammar 与 `<tok>` 生成（写死）
 
 > **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
-> **总长约束（DNS 标签安全的前提）**：首标签 = `<fde>"-"<tok>"-"<port>`，DNS 标签上限 63 字符——portal 生成前必须校验 `<fde>` + `<tok>` 段总长 ≤ 56（63 − 分隔符与 4 位端口）；schema 层字符集 CHECK 不校验长度组合，应用层强制（含不得以 `-` 开头/结尾）。
+> **总长约束（DNS 标签安全的前提）**：首标签 = `<fde>"-"<tok>"-"<port>`，DNS 标签上限 63 字符——portal 生成前必须校验 `<fde>` + `<tok>` 段总长 ≤ 57（63 − 2 个分隔符 − 4 位端口）；schema 层字符集 CHECK 不校验长度组合，应用层强制（含不得以 `-` 开头/结尾）。
 
 **grammar**（小写、DNS 标签安全）：
 
 ```
 hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
-<fde>          := [a-z0-9][a-z0-9-]{0,62}          -- users.fde_name，小写
+<fde>          := [a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?   -- users.fde_name，小写（同 schema.sql CHECK）
 <tok>          := <project-tok> | <run-tok>
-<project-tok>  := "p-" <project-name>              -- project-name = [a-z0-9][a-z0-9-]{0,62}（schema CHECK）
+<project-tok>  := "p-" <project-name>              -- project-name = [a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?（schema CHECK）
 <run-tok>      := "r" <runid-short>                -- runid-short = [a-z0-9]{5,8}
 <port>         := [0-9]{4}                          -- 恒 4 位（4000..4999）
 ```
@@ -419,7 +419,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 - **碰撞处理**：`project-tok` 天然无碰撞（`fde_name` 全局唯一 + `projects.name` 用户内唯一 + hostname 含两者，schema.sql `port_allocations_live_hostname_key` 兜底）；`run-tok` 靠 base32 熵（5 位 ≈ 25 bits）+ `port_allocations_live_hostname_key` 唯一索引兜底，碰撞时**递增位数重试**（5→6→7→8，8 位 ≈ 40 bits，单 FDE 活跃 run 规模下碰撞概率可忽略）。
 - **项目改名行为（写死）**：`PATCH /api/projects/:id` 改名**不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**；改名只影响 `projects.name`（容器内目录名）与**后续新建** run 的 hostname，旧 hostname 保持可访问（书签不破）。
 
-> ⚠️ 跨文件同步点：portal.md §3.5 已同步为「改名不重生成 hostname/url，旧 hostname 保持（项目名快照）」（与本条不可变性一致，B9）；schema.sql `users.fde_name` 目前无 `CHECK`（仅 `UNIQUE`），本 grammar 的 `<fde>` 字符集需在应用层强制（可选转派 schema.sql 加 CHECK）。
+> ⚠️ 跨文件同步点：portal.md §3.5 已同步为「改名不重生成 hostname/url，旧 hostname 保持（项目名快照）」（与本条不可变性一致，B9）；schema.sql `users.fde_name` 目前无 `CHECK`（仅 `UNIQUE`），本 grammar 的 `<fde>` 字符集需在应用层强制（已落地：schema.sql §2 `users.fde_name` 与 §4 `projects.name` 均有同构字符集 CHECK，grammar 与 CHECK 同源；应用层另须校验段长组合，见本节总长约束。）
 
 ### 8.6 `allocated → active` 的触发条件与幂等更新（写死）
 
@@ -643,7 +643,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 >
 > （注：任务原文写「§12 部署段」，但本文 §12 是「容器模板与工作区约定」，部署段实为 §14——按实际位置引用，本节即原「部署与运维」段。）
 
-- 平台栈用 `deploy/docker-compose.yml`：`station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`）+ `station-portal`（`backend` 网络，publish 仅 `127.0.0.1:8080` 回环）+ `station-db`（`backend` 网络，不 publish）+ `docker-socket-proxy`（`backend` 网络，仅 portal 可达）（H-B 定稿，issue #5；**compose 字段/healthcheck/volume/镜像 pin 见 deploy-contract.md §2/§3**）
+- 平台栈用 `deploy/docker-compose.yml`：`station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`）+ `station-portal`（`backend` 网络，publish 仅 `127.0.0.1:8080` 回环）+ `station-db`（`backend` 网络，不 publish）+ `station-docker-proxy`（`backend` 网络，仅 portal 可达；开发期另有 `station-mock-llm`，成员表以 deploy-contract §2.1 为准）（H-B 定稿，issue #5；**compose 字段/healthcheck/volume/镜像 pin 见 deploy-contract.md §2/§3**）
 - FDE 容器由 portal 通过 Docker API 动态创建（模板化，非 compose）；**创建契约（网络 `--subnet`/`--add-host`/UID-GID/capability/agentd 命令）见 deploy-contract.md §5**
 - **数据持久化**：bind mount 一律 `/docker/<名称>/`（平台统一约定）；用户空间 `/srv/erix/users/<fde>/`（宿主路径，FDE 容器内映射 `/home/<user>`，见 [`user-space.md`](user-space.md) §2）；**宿主源↔容器目标↔权限见 deploy-contract.md §2**
 - `restart: unless-stopped`；DB 与 portal 配 healthcheck（**阈值与 readiness 语义见 deploy-contract.md §2/§8**）
