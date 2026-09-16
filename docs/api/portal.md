@@ -114,7 +114,7 @@
 
 ### 2.1 登录方式（P1）
 
-**P1 用本地账号**：argon2id 口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
+**P1 用本地账号**：口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；P1 骨架暂用 Node 内置 `crypto.scrypt`，目标 argon2id 按 §2.9.4 平滑迁移；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
 
 - 第一个 admin 由部署 bootstrap 在本地建（规格 §7.1）；**TOTP 种子由 bootstrap 流程生成下发，不走公开 API**（P1 契约不含注册/自助找回端点）。
 - OIDC 接入后登录入口变化（跳转 SSO），但 **cookie、session 语义、本文其余端点全部不变**——前端无需感知。
@@ -250,7 +250,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 | 头 | 用途 |
 |---|---|
-| `X-Forwarded-Host` | 形如 `<fde>-<token>-<port>.fde.<BASE_DOMAIN>`（示例：`alice-r3a7f-4008.fde.erix.vip`）；Traefik 以真实 `Host` 覆盖 |
+| `X-Forwarded-Host` | 形如 `<fde>-<token>-<port>.fde.<BASE_DOMAIN>`（示例：`alice-r3a7fq-4001.fde.erix.vip`）；Traefik 以真实 `Host` 覆盖 |
 | `X-Forwarded-Uri` / `X-Forwarded-Method` | 从 `X-Forwarded-Uri` 解析 `preview_ticket` 查询参数；方法用于审计 |
 | `Cookie` | 只看 `__Host-fde_preview`（本 host 的预览 cookie） |
 
@@ -303,7 +303,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 ```json
 {
   "ticket": "pt_<随机 256-bit base64url>",
-  "url": "https://alice-r3a7f-4008.fde.erix.vip/?preview_ticket=pt_…",
+  "url": "https://alice-r3a7fq-4001.fde.erix.vip/?preview_ticket=pt_…",
   "expires_in": 60
 }
 ```
@@ -531,7 +531,7 @@ station-portal user enable  --login <login>
 | 字段 | 说明 |
 |---|---|
 | `status` | `active` \| `archived` |
-| `last_seq` | 该 session 已落库事件的最大 `seq`（SSE 断线补发的基准，规格 §10.2） |
+| `last_seq` | 该 session 已分配的最大 `seq`（messages 与 run_events **共用同一分配器**，schema.sql §3；SSE 断线补发的基准，规格 §10.2） |
 | `active_run_id` | 进行中 run 的 id，无则 `null` |
 
 ```json
@@ -795,11 +795,11 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段） |
 | 11 | `tool_call_delta` | `onToolCall`（参数增量） | `tool_call_id: string`，`name?: string`（仅首帧），`arguments_delta: string`（JSON 文本片段，前端按序拼接得完整入参） |
 | 12 | `judge` | `onJudge` | `kind: "round"\|"intercept"`，`action: "judge_done"\|"nudge"\|"continue"\|"executed"\|"blocked"\|"degraded"`，`decision: {done, confidence, reason, evidence} \| null`，可选 `error: "timeout"\|"error"\|"parse"`，可选 `tool: {id?, name?, input?}`（依据：erix-agent v0.3.5 `src/loop.js:545-552` JudgeEvent typedef；对应 `judge_decisions` 表） |
-| 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；依据：`src/loop.js:622`），`usage: { input_tokens, output_tokens }`（整 run 汇总），`compaction_stats: array`（宿主侧字段名：值为引擎返回值 `compactionStats` **数组**原样，元素 `{compacted, foldedRounds, tokensBefore, tokensAfter}`，依据：`src/loop.js:624`；snake_case 命名为宿主约定），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6） |
+| 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；依据：`src/loop.js:622`），`usage: { input_tokens, output_tokens }`（整 run 汇总），`compaction_stats: array`（宿主侧字段名：值为引擎返回值 `compactionStats` **数组**原样透传，元素 `{compacted, foldedRounds, tokensBefore, tokensAfter}`，依据：erix-agent v0.3.5 `src/loop.js:624`；snake_case 命名为宿主约定），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6） |
 
 > 说明与边界：
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
-> - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（`{text}` / `{termination, usage, compaction_stats}`）；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全。
+> - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（`{text}` / `{termination, usage, compaction_stats}`——`compaction_stats` 为引擎返回值 `compactionStats`（`src/loop.js:624`）经 U2 载荷透传，runner §7.6 同字段；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。
 > - `termination` 是**对象** `{reason, detail?}`，`reason` 取值集合以 erix-agent v0.3.5 `runToolLoop` 返回值契约为准（`src/loop.js:622`）：`end_turn` / `no_tool` / `stall` / `max_rounds_cap` / `reflection_stop` / `judge_done` / `continuation_exhausted` / `aborted` / `failed`。宿主映射：用户主动停止 → `aborted`（`src/loop.js:712`）；引擎失败 → `failed`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。
 > - **assistant 完整消息不单独发事件**：前端拼接 `assistant_delta` 流渲染气泡；run 结束后的持久对话内容以 `GET /api/sessions/:id` 的 `messages` 为准（`run_events` 是流式日志，`messages` 是人看的对话，两层不混，规格 §9.2）。
 > - 审批请求的出现通过 `judge` 事件（`action` 指示需审批）+ `GET /api/approvals` 列表体现，不单独设事件类型。
@@ -831,7 +831,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 - **宿主 store adapter 必须把 `checkpoint_failed` 识别为可重试并包 retry**（规格 §9.3-2，erix ≤0.3.5 无内建重试，3 次退避见 runner-integration §9.2）；重试耗尽后透传 → run 终态 `failed`。
 - **`checkpoint_failed` 是终态、不自动 re-claim**（A3 定稿，model.md §2.9 / runner-integration R20）：它是引擎在工具执行前/后 checkpoint 写失败时的 fail-closed 判定（**不是**进程崩溃），存储故障持续时 re-claim 只会原地重演，故直接终态 `failed`；终态后不可 resume。
 - **恢复口径（前端提示）**：「任务因平台存储故障中止，已持久化的进度（checkpoint/transcript）未丢失，请稍后重新发送」——**重发消息 = 新 run**（`POST /messages` 产生新 run，本期无跨 run resume）；**同 run 的恢复 = re-claim**（仅进程崩溃场景：租约到期后 re-claim 领同一 run，`resume:true`、`attempt > 1`，从最新 checkpoint 续跑，runner-integration §6.4）。
-- ⚠️ 待决策者确认（Q7 之外的实现注记）：规格 §9.3 强烈建议「本地 file 优先 + DB 异步复制」的 store 装饰器以避免中心 DB 抖动杀光所有任务；该取舍影响此错误的出现频率，不影响契约形状。
+- ~~⚠️ 待决策者确认~~ **已定稿（D2'）**：存储为纯 DB（Postgres），不采纳「本地 file 优先 + DB 异步复制」装饰器；中心 DB 抖动风险由 adapter 重试包装补偿（runner-integration §9.2），抖动超过重试窗口会使在跑任务 `checkpoint_failed` 失败（§6.2 恢复口径）。
 
 ### 6.3 容器不可达 → `container_unreachable`（503）
 
@@ -986,7 +986,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 - 无可领行：挂起连接（**不持有事务/锁**）；portal 在 `POST /messages` 入队后 `NOTIFY run_queue`（或单节点进程内事件）唤醒挂起的 claim 再查一次；到 `hold_ms` 仍无 → `204`。
 - SSE `run_assigned` 只是**唤醒 hint**，不携带权威载荷——hint 到达时任务可能已被其他 capacity 领走，载荷以 claim 响应为准（§9.12）。
 
-**领取资格（归属过滤，user_id 路由，issue #8）**：portal 按「认领容器的 `user_id`（由 token 解出）== run 归属 `user_id`（run → session → user 推导）」判定领取资格，**不以 `run_queue.container_id`（容器实例）过滤**——容器重建后新容器（同 user）天然可领取入队时派给旧容器的队列行；`container_id` 仅作入队目标快照、`owner_container_id` 记当前持有者（schema.sql §8 / model.md §1.16）。**终态 run（`finished`/`failed`/`cancelled`）永不进入认领结果**。
+**领取资格（归属过滤，user_id 路由，issue #8）**：portal 按「认领容器的 `user_id`（由 token 解出）== run 归属 `user_id`（run → session → user 推导）」判定领取资格，**不以 `run_queue.container_id`（容器实例）过滤**——容器重建后新容器（同 user）天然可领取入队时派给旧容器的队列行；`container_id` 仅作入队目标快照、`owner_container_id` 记当前持有者（schema.sql §8 / model.md §1.16）。**终态 run（`finished`/`failed`；`cancelling` 中间态亦不可领，schema.sql §4）永不进入认领结果**。
 
 **重领条件（re-claim）**：满足下面**全部**条件的队列行才可被认领（含首次）：① `status='pending'`，或 `status='claimed' AND lease_until < now()`（租约到期）；② `attempts < max_attempts`（未达崩溃循环上限）；③ `run → session → user == 认领 user_id`。`attempts >= max_attempts` 的过期 claimed 行由 reaper 直接终态（§9.11/§6.4），不再进入 claim。
 
@@ -1024,7 +1024,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `events` | array，`0 ≤ length ≤ 200` | 事件数组；**空数组合法**（portal 按 no-op 处理，见下）。单批总字节上限 **256KB** ⚠️（runner §7.2）；条数或字节超限 → `400 validation_failed`，agentd 切多批顺序重发 |
 | `events[].client_event_id` | string，格式 `run_id + ":" + attempt + ":" + 计数` | 客户端幂等键（worker 生成，**带 attempt 前缀**，runner §7.3）；`attempt` = claim ticket 的 `run.attempt`（§9.3），`计数` = 该 attempt 内从 0 单调递增。portal 端 `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING` |
 | `events[].type` | string | 事件类型，清单同 §5.3（portal 原样透传落 `run_events`）；未知类型（上游 additive）原样透传、不报错 |
-| `events[].ts` | string（ISO 8601 UTC） | 事件产生时间 |
+| `events[].ts` | string（ISO 8601 UTC） | **宿主落库时间**（与 §5.3 信封、schema `DEFAULT now()` 同口径；worker 上报的产生时刻仅作展示参考，不参与 seq 排序/对账，env §11.3） |
 | `events[].payload` | **object（必为 JSON 对象）** | 类型特有字段（对应 §5.3 信封内层）。portal 不校验内部字段语义，但要求 `payload` 为对象——非对象 → `400 validation_failed`。**payload union**：已知类型按 §5.3 字段形状填充，未知类型原样透传 |
 
 **`client_event_id` 重启/重领不碰撞（attempt 前缀）**：`client_event_id` 中的 `attempt` 来自 claim ticket（`run_queue.attempts`）；re-claim 后 `attempt++`，新 worker 的 `计数` 归零也不会与旧 attempt 的 `run_id:attempt:计数` 碰撞——否则旧 attempt 的 `:0`/`:1` 会被新 attempt 当重复丢弃（runner §7.3）。**worker 在未发生 re-claim 的同 attempt 内重启**（如进程被 agentd 重拉但 claim 未变）必须沿用原 `attempt` 并继续计数，否则会产生撞键。
@@ -1128,6 +1128,8 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 **终态收敛**——请求：
 
+**终态收敛**——请求：
+
 ```json
 {
   "state": "finished",
@@ -1135,6 +1137,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
   "usage": { "input_tokens": 15230, "output_tokens": 2104 },
   "rounds": 3,
   "final_text": "已完成：登录按钮已改为品牌色……",
+  "compaction_stats": [ { "compacted": true, "foldedRounds": 2, "tokensBefore": 41200, "tokensAfter": 9800 } ],
   "error": null
 }
 ```
@@ -1145,11 +1148,12 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `termination` | 引擎 `runToolLoop` 返回值透传，对象 `{reason, detail?}`，`reason` 取值集合见 §4.1 |
 | `usage` | 整 run 用量汇总；portal 同事务写 `runs.usage` + `usage_ledger`（`source='erix'`，一 run 一条，`UNIQUE(run_id, source)`）——见 §9.9 |
 | `rounds` / `final_text` | 轮数与 assistant 最终文本；portal 同事务回写 `messages` assistant 行 |
+| `compaction_stats` | 引擎返回值 `compactionStats`（erix-agent v0.3.5 `src/loop.js:624`）**原样透传**（数组，元素 `{compacted, foldedRounds, tokensBefore, tokensAfter}`；snake_case 为宿主约定）；portal 写入 `run_end` 事件（§5.3 第 13 类） |
 | `error` | 失败时 `{code, message, retryable}`（run 级错误码见 §6.4）；成功为 `null` |
 
 响应 `200`（portal 终态事务：runs 置终态 + `run_queue → done/cancelled` + messages 回写 + usage_ledger，runner §6.1）。
 
-**重复终态语义（同载荷 vs 不同载荷）**：portal 以 `(termination, usage, rounds, final_text, error)` 的**规范化 JSON 哈希**判定是否同载荷。
+**重复终态语义（同载荷 vs 不同载荷）**：portal 以 `(termination, usage, rounds, final_text, compaction_stats, error)` 的**规范化 JSON 哈希**判定是否同载荷。
 
 | 情形 | 响应 | 语义 |
 |---|---|---|
@@ -1158,7 +1162,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | 重复提交，**不同载荷** | `409 run_terminal`（details 附首次存储结果） | 终态不可变，新载荷**被拒、不落库** |
 | 非终态写（`{state:"running"}`）落在终态 run | `409 run_terminal` | 终态不可回退 |
 
-> **顺序约束（runner §7.4/§7.6）**：终态收敛**必须在该 run 全部事件批被 `200` 确认后才发送**；portal 在终态事务内**合成** `run_end` 事件（worker 不再经 U3 发 `run_end`，runner §7.6），payload 带 `attempt`。终态 barrier：此后 U3/U5/U8 写一律 `409 run_terminal`。
+> **顺序约束（runner §7.4/§7.6）**：终态收敛**必须在该 run 全部事件批被 `200` 确认后才发送**；portal 在终态事务内**合成** `run_end` 事件（worker 不再经 U3 发 `run_end`，runner §7.6），payload 带 `attempt`。终态 barrier：此后 U3/U5/U8/U10 及 state 写一律 `409 run_terminal`（读端点 U6/U7/U9/U11 不受限；runner-integration §7.6 同口径）。
 
 错误：`400 validation_failed`（终态载荷缺 `termination`/`usage`/`rounds` 等）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 invalid_transition`（非法状态转换）；`409 run_terminal`（终态 run 的写/不同载荷重复终态）；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
@@ -1422,7 +1426,7 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 |---|---|---|
 | `X-Claim-Token` 失配（run 已被 re-claim） | 拒绝，不产生任何状态变化 | —（`409 lease_lost`） |
 | `run_queue.status = 'cancelled'` 或 `runs.status = 'cancelling'`（用户已 stop） | queue → `cancelled`；runs → `finished`（`termination.reason='aborted'`） | `cancelled` |
-| `attempts < max_attempts` | queue → `pending`（清 `claim_token`/`owner_container_id`/`lease_until`）；runs → `queued`（可重领） | `requeued` |
+| `attempts < max_attempts` | queue → `pending`（清 `claim_token`/`owner_container_id`/`lease_until`）；`runs.status` **不变**（attempt 级失败不写 runs，同 run re-claim 后 `attempt > 1` 续跑，model.md §2.8 A1/runner-integration U12） | `requeued` |
 | `attempts >= max_attempts` | queue → `done`；runs → `failed`（`max_attempts_exceeded`） | `failed_max_attempts` |
 
 **组合语义**：

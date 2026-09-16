@@ -20,7 +20,7 @@
 | D-5 | **internal API 经 Traefik**（`/api/internal/*` + 来源白名单 + per-container token） | 避免 portal 接入每条 FDE 网络 |
 | D-6 | **文件投递走 portal 直写宿主 bind mount**（`/srv/erix/users/<fde>/`） | 无需任何入站网络（详见 issue #7） |
 | D-7 | **流式**：单一合并点（agentd，250ms/2KB）+ 边界 flush；reasoning 粗粒度落库；工具结果阈值另存 | 见 §9 |
-| D-8 | **加固三件套**：`DOCKER-USER` 规则 + `ipAllowList` + `aliasHeadersStrategy: delete` | 见 §6 |
+| D-8 | **加固三件套**：`INPUT` + `DOCKER-USER` 两层防火墙规则 + `ipAllowList` + `aliasHeadersStrategy: delete`（原「仅 DOCKER-USER」经 §6.1 评审修正为两层） | 见 §6.1 |
 | D-9 | **reconciler 声明式收敛**（网络、路由、IP 漂移） | 见 §8 |
 | D-10 | **子网由 portal 管 IPAM**（DB 注册表，系统推荐、管理员可改） | 见 §3 |
 
@@ -40,7 +40,7 @@
 │    ├─ llm.<base>            → http://127.0.0.1:4000 （LLM 网关数据面） │
 │    └─ /api/internal/*       → http://127.0.0.1:8080 （ipAllowList）    │
 │                                                                      │
-│  backend 网络（172.30.0.0/24）：portal（publish 127.0.0.1:8080）+ station-db + LLM 网关 │
+│  backend 网络（172.30.0.0/24）：portal（publish 127.0.0.1:8080）+ station-db + station-docker-proxy + station-mock-llm（P1）+ LLM 网关（P3）│
 │                                                                      │
 │  fde-alice 10.200.1.0/29：alice 主容器(.2) + 她的自有服务(.3)…          │
 │  fde-bob   10.200.2.0/29：bob 主容器(.2) + …                          │
@@ -64,7 +64,7 @@
 | 网络 | 类型 | 成员 | 子网 |
 |---|---|---|---|
 | host | 宿主网络栈 | Traefik（host 网络模式） | —（不占 docker 网络） |
-| `backend` | docker bridge（compose 管理，`subnet` 显式声明） | portal + station-db + LLM 网关 | **显式 `172.30.0.0/24`**（与 FDE 池 `10.200.0.0/16` / `10.201.0.0/16` 彻底隔离） |
+| `backend` | docker bridge（compose 管理，`subnet` 显式声明） | portal + station-db + station-docker-proxy + station-mock-llm（P1 开发期）+ LLM 网关（P3 加入；成员表以 deploy-contract §2.1 为准） | **显式 `172.30.0.0/24`**（与 FDE 池 `10.200.0.0/16` / `10.201.0.0/16` 彻底隔离） |
 | `fde-<name>` | docker bridge（portal 经 Docker API 按 `--subnet` 显式创建） | 该 FDE 的主容器 + 其自有服务（db/redis/sidecar） | `10.200.<n>.0/29`（大 FDE 为 `10.201.<n>.0/28`，见 §3） |
 
 ---
@@ -75,7 +75,7 @@
 |---|---|
 | 默认池 | `default-address-pools: [{ base: "10.200.0.0/16", size: 29 }]` → **8192** 条 FDE 网络 |
 | 大 FDE 段 | 预留 `10.201.0.0/16`（`/28`，13 个容器位）给需要多个自有服务的 FDE |
-| `/28` 内分配 | `.1` 宿主网关 / `.2` FDE 主容器 / `.3–.14` FDE 自有服务与备用（13 位） |
+| `/28` 内分配 | `.1` 宿主网关 / `.2` FDE 主容器 / `.3–.14` FDE 自有服务与备用（12 位；可分配 `.2–.14` 共 13 位） |
 | `/29` 内分配 | `.1` 宿主网关 / `.2` FDE 主容器 / `.3` FDE 自有服务（db/redis/sidecar）/ `.4–.6` 备用（5 位） |
 | IPAM 归属 | **portal 管**：DB 表 `fde_networks`（见 [schema.sql](../data/schema.sql) / [model.md](../data/model.md) §1.17；`fde_id` 主键、`subnet`/`network_name` 唯一、`prefix_len ∈ {29,28}`、`pool ∈ {default,large}`、`state` allocated→active→released）；系统推荐下一块空闲，管理员可改；docker 用 `--subnet` 显式创建 |
 | 扩展 | Docker 不能改已有网络子网 → 扩容 = 重建网络（数据在 bind mount，容器是牲口） |
@@ -143,7 +143,7 @@ N 个 worker ──IPC──▶ agentd（唯一 HTTP 客户端、唯一持 token
 ### L7 LLM 调用（**Traefik 注入凭据**）
 
 ```
-worker（零凭据，占位 key + baseURL=https://llm.<base>/v1；`llm.<base>` 经 L3 的 hosts 注入解析到本 FDE 网关 IP）
+worker（零凭据，占位 key + endpoint=https://llm.<base>/v1；`llm.<base>` 经 L3 的 hosts 注入解析到本 FDE 网关 IP）
   │ POST https://llm.<base>/v1/chat/completions（可带任意 Authorization）
   ▼
 Traefik(host:443)
@@ -178,7 +178,7 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 | 路由 | 规则 | middleware | service | 说明 |
 |---|---|---|---|---|
 | portal | `Host(`station.<base>`)` | — | `http://127.0.0.1:8080` | L1 |
-| 预览/IDE（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
+| 预览/IDE（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth）→ `strip-cookie`（放行后删 Cookie，预览凭证不透传上游，B2 实测） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
 | LLM（**每 FDE 一条 router + 一条 headers middleware**） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `<fde>-llm-auth`（headers 注入） | `llm-hub` → `http://127.0.0.1:4000` | L7；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
 | internal | `PathPrefix(`/api/internal`)`（挂在 `station.<base>` 路由链上） | `internal-allow`（`ipAllowList`，从 `fde_networks` 精确派生，每 `subnet` 一条，§5.1） | `http://127.0.0.1:8080` | L3/L5；容器侧经 hosts 注入（`--add-host station.<base>:<网关IP>`；`llm.<base>` 同法，见 L3）访问 |
 
@@ -227,14 +227,14 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 3. `forwardAuth`（身份 + 授权，预览路由 `fde-auth`）——在代理到上游**之前**执行
 4. `headers`（LLM 凭据注入，`<fde>-llm-auth`）——在代理到上游**之前**注入并覆盖
 
-> 单条路由实际只挂其一（internal=`ipAllowList`；预览=`forwardAuth`；LLM=`headers`），不出现同一路由叠加多类；若将来叠加，顺序恒为 `ipAllowList` → `forwardAuth` → `headers` → `redirect`。
+> `redirect`（scheme http→https）只挂在 **entryPoint 层**，不参与 router 中间件链，因此恒先于一切业务中间件。router 中间件链按需叠加：internal=`ipAllowList`；预览=`forwardAuth` → `strip-cookie`；LLM=`headers`。若将来同路由叠加多类，顺序恒为 `ipAllowList` → `forwardAuth` → `headers`。
 
 #### 四条链路总表
 
 | 链路 | 中间件/检查（按顺序） | 每层失败 → HTTP code | redirect? | 写审计? |
 |---|---|---|---|---|
 | **① 浏览器 → portal**（`station.<base>`） | TLS 终结 → Host 匹配 → portal 自身 session cookie 校验（按 `login_sessions.token_hash` 查库）→ 路由 handler | TLS/主机不匹配 → 连接失败 / `404`；session 无效 → `401 unauthorized`（JSON） | `401` 前端跳登录页 | portal 写登录/登出/关键动作 `audit_log`；Traefik access log 仅原始 |
-| **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `401`（→ 302 登录）；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `401` → Traefik 302 到 `https://<PORTAL_HOST>` | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
+| **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `403 forbidden（preview_ticket_required）`；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `403`（凭证类）→ Traefik 透传；登录引导由 portal 前端按 `preview_ticket_required` 处理 | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
 | **③ 容器 → internal API**（`/api/internal/*`） | TLS（容器→Traefik）→ `Host(station) && PathPrefix(/api/internal)` + **`ipAllowList`（remote address，每 FDE 精确 subnet）** → service portal → portal Bearer 校验（`containers.runner_token_hash` 按代次比对）→ 归属校验（`run → session → user_id`）→ handler | 来源不在白名单 → `403`（Traefik）；Bearer 缺失/错 → `401 token_invalid`；吊销 → `401 token_revoked`；归属不符 → `403 run_ownership_mismatch`（或 `404`） | 否（容器不是浏览器，不 302） | portal 对关键动作（claim/心跳/吊销/越权）写 `audit_log` |
 | **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`<fde>-llm-auth` 注入并覆盖 `Authorization` + `X-FDE-Identity`）→ service `llm-hub` | 无匹配 ClientIP → `404`（无兜底路由）；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走网关 `usage_ledger`，Traefik access log 原始 |
 
@@ -342,7 +342,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 - **debounce/批量合并**：outbox 到达后按短窗口（如 200ms）聚合同批 revision，一次生成整份 Traefik 动态配置（而非逐 allocation 写文件/reload）。
 - **临时文件校验后原子替换**：生成到临时文件 → Traefik 配置 schema 校验（或 dry-check）→ `mv` 原子替换 → reload。**失败保留上一版本文件**（不回滚到空/半截）；`attempts < max` 时退回 `pending` 退避重试，`attempts` 耗尽（≥5 ⚠️）才置 `failed`（人工介入终态）+ 告警（状态机与 schema.sql / model.md §2.5 一致）。
 - **reload SLO**：P95 < 2s（从 outbox 落库到 Traefik 生效；目标环境实测）。批量合并不逐条 reload 是达标前提。
-- **预期最大路由数**：30 FDE × 每 FDE 端口数（如 8 项目端口 + run 级若干）→ 数百条 router+service；file provider 单文件承载无压力，reload 频率受 debounce 控制。
+- **预期最大路由数**：30 FDE × 每 FDE 端口数（每项目 1 个项目级端口 + 块内 7 个 run 级，§8.2）→ 数百条 router+service；file provider 单文件承载无压力，reload 频率受 debounce 控制。
 - **批量 offboarding**：N 个 FDE 同时 offboard 时，reconciler 合并为一次生成 + 一次 reload（tombstone 批量处理），不逐 FDE reload。
 
 ---

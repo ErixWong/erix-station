@@ -25,11 +25,11 @@ P1 本地开发（写代码、起栈联调）只需：
 |---|---|
 | 入口端口 | **127.0.0.1 + 任意高端口**。默认建议：Traefik `websecure` → **`8443`**，`web` → **`8090`**（参考实例 A 上已用 `ss -tlnp` 确认两者空闲，2026-09）。**注意避开本机已占用端口**：80/443 被占（443 为 `nginx_reverse_proxy`）、8080 被占（`gitea_act_runner`）、5432 被占、8931~8934 是 playwright 容器（见 §8.2）；换机器或换端口前一律先 `ss -tlnp` 自查 |
 | portal 发布端口 | **`127.0.0.1:18080:8080`**（宿主 8080 已被 `gitea_act_runner` 占用 → 开发期 portal 宿主端口改用 `18080`，`PORTAL_HOST_PORT=18080`；容器内仍听 8080） |
-| 用户空间根 / 动态配置目录 | 开发期**可注入临时目录隔离**：`ERIX_USERSPACE_ROOT_HOST`（宿主用户空间根，默认 `/srv/erix/users`）与 `TRAEFIK_DYNAMIC_DIR_HOST`（Traefik 动态配置宿主目录，默认 `./traefik/dynamic`）——两者都**必须 0755**（Traefik/portal 容器以 `cap_drop: ALL` 运行、无 `DAC_OVERRIDE`，目录对容器需 other 可读/可穿越；`mktemp -d` 默认 0700 需先 chmod） |
+| 用户空间根 / 动态配置目录 | 开发期**可注入临时目录隔离**：`ERIX_USERSPACE_ROOT_HOST`（宿主用户空间根，默认 `/srv/erix/users`）与 `TRAEFIK_DYNAMIC_DIR_HOST`（Traefik 动态配置宿主目录，默认 `./traefik/dynamic`）——两者都**建议 0755**（portal 虽回加了 `CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID`（deploy-contract §1），开发期临时目录仍避免依赖特权位；station-docker-proxy 以 gid 1000 穿越目录（deploy-contract §5.1）；`mktemp -d` 默认 0700 需先 chmod） |
 | backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `voiceprint_default` 占用（`br-8e3857476b83` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
-| socket-proxy | 开发期**同样启用**：`station-docker-socket-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` 访问 Docker API（不直挂 socket）；白名单 `CONTAINERS=1`/`NETWORKS=1` + `POST=0` → **P1 只读**（创建容器归 WP2） |
+| socket-proxy | 开发期**同样启用**：`station-docker-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API（不直挂 socket）；白名单见 deploy-contract §5.1（自研 admission proxy：方法+路径白名单 12 条 + create 参数级校验；**不再用** tecnativa 类别级 env 门） |
 | DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**，portal 运行时 `MIGRATE_ON_START=0` 不重复跑 |
-| 域名 | 不依赖 DNS 泛解析：用 `/etc/hosts` 逐条指到 127.0.0.1，或用 `*.localhost` 变通（`station.localhost` / `alice-r3a7f-4008.fde.localhost`，多数系统 localhost 子域自动回环到 127.0.0.1）。⚠️ **`*.localhost` 变通只对浏览器/宿主有效，对容器无效**：容器内解析 `station.<base>` / `llm.<base>` 用创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1） |
+| 域名 | 不依赖 DNS 泛解析：用 `/etc/hosts` 逐条指到 127.0.0.1，或用 `*.localhost` 变通（`station.localhost` / `alice-r3a7fq-4001.fde.localhost`，多数系统 localhost 子域自动回环到 127.0.0.1）。⚠️ **`*.localhost` 变通只对浏览器/宿主有效，对容器无效**：容器内解析 `station.<base>` / `llm.<base>` 用创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1） |
 | TLS | 自签证书，或直接 http 联调（cookie `Secure`/`SameSite` 属性按实际域名方案调试，正式语义仍以 portal.md §2.5 为准） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
 
@@ -45,7 +45,7 @@ P1 本地开发（写代码、起栈联调）只需：
 |---|---|---|---|
 | `BASE_DOMAIN` | base domain，portal 与预览域名的公共后缀 | 决策者提供 ⚠️ | `erix.vip`（倾向：与参考实例 A 的 git host `git.erix.vip` 同域，规格 §8.3 示例 URL 亦用 `fde.erix.vip`） |
 | `PORTAL_HOST` | portal 域名 = `station.` + base domain | 平台规范固定（规格 §6.3） | `station.erix.vip` |
-| `FDE_WILDCARD_HOST` | 预览泛域名；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（如 `alice-r3a7f-4008.fde.erix.vip`） |
+| `FDE_WILDCARD_HOST` | 预览泛域名；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（如 `alice-r3a7fq-4001.fde.erix.vip`） |
 | DNS 泛解析 | 内网 DNS 添加两条 A 记录：`station.<base>` 与 `*.fde.<base>` → 宿主机内网 IP。**部署期事项（P1 开发不需要**，开发期用 §0 的 hosts/localhost 变通，决策者 2026-09，issue #3 评论**）** | 目标环境探测 + 决策者确认 ⚠️（倾向：平台 VPN-only/内网（见 §3），泛解析只需内网 DNS 支持） | 探测命令见 §9。若内网 DNS 不支持泛解析，降级方案是 portal 生成显式路由 + 逐条 A 记录，控制面复杂度上升（见 principles §3「每个端口一条手工路由」被否决项的权衡） |
 | `llm.<base>`（LLM 数据面域名） | **不进内网/公网 DNS**：只被 FDE 容器（worker）访问，容器内用 hosts 注入（`--add-host llm.<base>:<该 FDE 网关 IP>`）解析到 Traefik（host:443）；证书 SAN 仍需覆盖（§2）。浏览器从不直接访问 `llm.<base>` | 平台规范固定（topology.md §4-L7，H-B） | `llm.erix.vip`（仅作证书 SAN / 容器 hosts 注入用，不做 A 记录） |
 | 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台亦**不负责 clone 与 git 凭据下发**（由 FDE 在容器内自行配置，规格 §7.2/§12.2；决策者 2026-09，issue #3 评论） | 决策者提供 | `git.erix.vip`（内网自托管 Gitea——**仅为参考实例 A 的情况**，见 §8.1，非设计约束） |
@@ -176,7 +176,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 - 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `2770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
 
 - LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + baseURL）：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
-- `docker.sock` **只挂到 `station-docker-socket-proxy`**（不直挂 portal）；portal 经 `DOCKER_HOST=tcp://station-docker-socket-proxy:2375` 访问，白名单 `CONTAINERS=1`/`NETWORKS=1` + `POST=0`（P1 只读；`VOLUMES` 已删，bind mount 不需 volume API；创建参数 allowlist 见 deploy-contract §5）
+- `docker.sock` **只挂到 `station-docker-proxy`**（不直挂 portal）；portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问，路径白名单见 deploy-contract §5.1（自研 admission proxy：12 条契约路径 + create 参数级校验；`VOLUMES` 不授，bind mount 不需 volume API）
 - 超级用户口令（`POSTGRES_PASSWORD`）与两个角色口令（`PLATFORM_DB_PASSWORD`/`PORTAL_DB_PASSWORD`）部署时生成后存 `deploy/.env`（600）
 
 ## 7. 运行时与资源要求
@@ -284,9 +284,9 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PLATFORM_DB_USER` / `PLATFORM_DB_PASSWORD` | 迁移身份（DDL/表 owner）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_platform` / — |
 | `PORTAL_DB_USER` / `PORTAL_DB_PASSWORD` | 运行时身份（最小 DML GRANT）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_portal` / — |
 | `PORTAL_IMAGE` | 平台规范固定（规格 §14）；自构建（build context `portal/`） | `erix-station/portal:<git-sha>`（不可变 tag；部署时再 `docker inspect --format '{{.Id}}'` 记 digest） |
-| `DB_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `postgres:16`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体 patch/digest 部署时由 §9 产出后填；P1 开发可临时 `postgres:16` 并记录 resolved digest） |
+| `POSTGRES_IMAGE` | 平台规范固定（规格 §14）；官方镜像（compose 变量名 `POSTGRES_IMAGE`） | `postgres:16.15`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体值部署时由 §9 产出后填） |
 | `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
-| `SOCKET_PROXY_IMAGE` | 平台规范固定（规格 §4 / §6 / deploy-contract §5） | `tecnativa/docker-socket-proxy:v0.5.0`（P1 开发 pin patch tag；生产再 pin digest；`POST=1` 已放开 containers/networks 生命周期，路径级最小面由 portal 代码层白名单兑底，见 deploy-contract §5.1 实现偏差） |
+| `STATION_DOCKER_PROXY_IMAGE` | 平台规范固定（deploy-contract §5.1）；自构建（build context `deploy/fde-proxy/`） | `erix-station/fde-proxy:<git-sha>`（自研 admission proxy；tecnativa/docker-socket-proxy 方案已废弃） |
 | `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）** |
 | `FDE_CMD` | 平台规范固定（FDE 容器命令；开发期 whoami 站台用，生产为 `station-agentd` 入口） | JSON 数组；开发期 `["-port","4000"]`（首个项目块首端口，fde-platform §8.2） |
 | `FDE_AGENT_VERSION` | 平台规范固定（写 `containers.agent_version`；开发期占位） | `dev` |
@@ -294,7 +294,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
 | `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8 ⚠️ 待决策者确认） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
-| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P2+ 接入 | `http://127.0.0.1:4000`（reconciler 生成 llm-hub service 回环地址） |
+| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P3 接入（deploy-contract §7.3） | `http://127.0.0.1:4000`（reconciler 生成 llm-hub service 回环地址） |
 | `LLM_GATEWAY_PORT` | 平台规范固定（deploy-contract §7.3）；`station-mock-llm` 数据面在宿主的回环发布端口（**dev-only**；P3 真实网关同端口） | `4000` |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
@@ -318,6 +318,22 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 >
 > 宿主机内网 IP（DNS A 记录目标）在部署时由运维填入 DNS，不进入 compose 变量。
 
+### 10.1 补登：已在 `deploy/` 使用、此前未登记的变量（2026-09-16 审计补登）
+
+> 以下参数已被 `deploy/.env.example` / `docker-compose.yml` 使用但本表（§10 自称验收锚点）此前未登记，按 README 写作纪律 3 补齐。描述以实现处为准。
+
+| 变量 | 用途 | 默认 / 示例 |
+|---|---|---|
+| `PORTAL_PUBLIC_BASE_URL` | portal 对外完整 URL（cookie 域 / 跳转生成用，portal 运行时） | 空 = 由 `PORTAL_HOST` 派生 |
+| `LLM_PUBLIC_BASE_URL` | LLM 网关对外完整 URL（`llm.<base>`，路由生成与占位 baseURL 用） | 空 = 由 `LLM_HOST` 派生 |
+| `SESSION_TTL_SECONDS` | portal 登录会话 TTL | `604800`（7 天） |
+| `FDE_IPAM_POOLS` | IPAM 池（逗号分隔 CIDR；proxy/portal 双侧校验） | `10.200.0.0/16,10.201.0.0/16` |
+| `FDE_ALLOWED_USERS` | FDE 容器允许的 `uid:gid` 白名单（create 参数级校验，deploy-contract §5.1） | `1001:1000` |
+| `FDE_MEMORY_LIMIT_MAX` / `FDE_PIDS_LIMIT_MAX` | FDE 容器资源限额上限（`0` = 不限；透传 station-docker-proxy） | `0` / `0` |
+| `FDE_DEV_MODE` | 显式开发模式（F12/F14 松约束；生产必须 `0` 或 `NODE_ENV=production`） | 开发 `1` / 生产 `0` |
+| `FDE_DEV_USER` | 开发期容器 `--user`（whoami 镜像无双 UID 用户时兑底） | `1001:1000` |
+| `MOCK_LATENCY_MS` | station-mock-llm 注入延迟（联调用，dev-only） | `0` |
+
 ---
 
 ## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）
@@ -334,7 +350,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | claim 长轮询 `hold_ms` | 30 | s | **30（硬上限）** | agentd 请求参数（runner §4.2 U1） | hold 超时无任务 → `204`，agentd 立即再 claim | claim 空转率、hold 命中率 |
 | 租约 `lease` | 90 | s | — | portal（schema.sql `run_queue` 认领 SQL，`now()+interval '90 seconds'`） | 到期未续 → 允许 re-claim（旧写 `lease_lost`） | lease 过期/易主次数 |
 | 心跳间隔 / 判死阈值 | 15 / 45 | s | — | agentd（runner §4.2 U4） | 连续 3 次丢失（45s）→ `containers.status` 视 `exited` | `containers.last_heartbeat` 延迟、判死次数 |
-| 审批轮询兜底 / 审批超时 | 5 / 600 | s | — | agentd（runner §10.1） | 10min 无决定 → 按 denied 继续（审批单留 `pending`） | 审批 pending 时长、超时数 |
+| 审批轮询兜底 / 审批超时 | 5 / 600 | s | — | agentd（runner §10.1） | 10min 无决定 → 按 denied 继续；审批单由 portal reaper 打 `expired`（权威审计态，portal.md §9.12/model.md） | 审批 pending 时长、超时数 |
 | store adapter checkpoint 重试 | 3 次（1s→2s→5s） | 次 / s | 3 | worker（runner §9.2） | 耗尽 → `checkpoint_failed` → run `failed` | checkpoint 重试率、`checkpoint_failed` 数 |
 | 事件批量窗口 | 250ms 或 2KB 先到 | ms / KB | 单批 200 条 / 256KB | agentd（runner §7.2） | — | 批次大小、批间隔、端到端延迟 |
 | 背压（worker / agentd 内存队列） | 10000 条/4MB；20000 条/8MB | 条 / MB | 见左 | worker / agentd（runner §7.4） | 超限落 spool；spool 也满 → run `spool_full` | 队列深度、spool 用量 |
@@ -371,7 +387,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | portal | `docker logs station-portal`（json-file driver） | docker json-file `max-size` + `max-file`（如 `10m` / `3`） |
 | station-db | `docker logs station-db`（postgres 默认 stderr） | 同上 |
 | Traefik | access log → `/docker/station-edge/logs/`（文件）+ 容器 stdout | 文件由 host `logrotate` 轮转（`daily` + `compress` + `rotate 7`）；stdout 由 docker json-file |
-| socket-proxy | `docker logs station-docker-socket-proxy` | json-file `max-size`/`max-file` |
+| socket-proxy | `docker logs station-docker-proxy` | json-file `max-size`/`max-file` |
 | FDE 容器（agentd/worker） | `docker logs fde-<name>`（agentd 单行 JSON 统一输出，runner §14） | 同上 |
 | 排障真相 | 事件/工具调用/judge/审批/用量/审计在 DB（原理三），日志只是**原始**记录、**不作审计依据**（topology §5.2） | — |
 

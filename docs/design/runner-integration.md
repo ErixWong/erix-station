@@ -49,10 +49,10 @@ worker 侧对上游的**全部**依赖面（D4'，再没有别的）：
 | 上游能力 | 导入路径 | 事实锚点（erix-agent v0.3.5 源码） |
 |---|---|---|
 | `runToolLoop` | `erix-agent` | 参数/返回值 typedef：`src/loop.js:562-626`；`termination` 取值集合：`src/loop.js:622` |
-| `TranscriptStore` 接口（6 方法） | 接口约定 | typedef：`src/store/file.js:186-194`；dedupKey 幂等语义：`src/store/file.js:51-56`（`recordKey`）与 `:167`（追加前去重）；checkpoint 覆盖写（tmp+rename 原子覆盖）：`src/store/file.js:279-289` |
+| `TranscriptStore` 接口（6 方法） | 接口约定 | typedef：`src/store/file.js:186-194`；dedupKey 幂等语义：`src/store/file.js:51-56`（`recordKey`）与 `:167`（追加前去重）；checkpoint 覆盖写（tmp+rename 原子覆盖）：`src/store/file.js:279-297` |
 | 工具组装 | `erix-agent/tools` | 导出清单：`src/tools/index.js:1-9`（`createJail` / `createFileTools` / `createToolRegistry` / tool providers / `createRecallTool`） |
 | 契约测试 | `erix-agent/contract-tests` | `package.json:23-27` exports；`test/contract/index.js` 导出 `transcriptStoreContract` / `modelConfigProviderContract` |
-| 配置/凭据解析 | `erix-agent`（`config/*`） | `createJsonFileModelConfigProvider`（`~/.erix/config.json`，含占位 key + `baseURL=https://llm.<base>/v1`）为主；`createStaticModelConfigProvider` / `createEnvModelConfigProvider` / `resolveApiKey` / `apiKeyFile`（`src/config/api-key.js:9-30`）为上游能力，**H-B 下不使用 `apiKeyFile`/`resolveApiKey`**（容器内零 LLM 凭据，§11） |
+| 配置/凭据解析 | `erix-agent`（`config/*`） | `createJsonFileModelConfigProvider`（`~/.erix/config.json`，含占位 key + `endpoint=https://llm.<base>/v1`）为主；`createStaticModelConfigProvider` / `createEnvModelConfigProvider` / `resolveApiKey` / `apiKeyFile`（`src/config/api-key.js:9-30`）为上游能力，**H-B 下不使用 `apiKeyFile`/`resolveApiKey`**（容器内零 LLM 凭据，§11） |
 | 宿主行为注意事项 | 文档 | `docs/host-upgrade-guide-v030.md`：checkpoint fail-closed（§0-4）、多轮必须显式传 `task`（§1 应对清单-2）、`checkpoint_failed` 需宿主 adapter 包重试（§1 应对清单-4） |
 
 > **宿主组装的三个硬注意**（来自上游事实，worker 实现时必须遵守）：
@@ -268,8 +268,8 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `type` | 方向 | 字段 | 语义 |
 |---|---|---|---|
 | `worker_ready` | worker→agentd | `{pid}` | fork 后握手；agentd 收到后才发 `run_start` |
-| `run_start` | agentd→worker | `{run_id, session_id, attempt, task, cwd, project, model, resume, attachments, config: {model_config_path}}` | worker 据此组装 `runToolLoop` 参数（§6.3；`config.json` 内为占位 key + `baseURL=https://llm.<base>/v1`，无独立 key 文件）；`cwd` = 已建好的 worktree；`attempt` = 本次 start 次数（生成 `client_event_id`，§7.3） |
-| `event` | worker→agentd | `{run_id, client_event_id, type, ts, payload}` | 引擎回调透传（`onEvent` 8 类 / `onDelta` / `onReasoningDelta` / `onToolCall` / `onJudge`），**逐条即发**，批量在 agentd（§7.2）；`client_event_id` = `run_id:attempt:计数`（§7.3，重启/重领不碰撞） |
+| `run_start` | agentd→worker | `{run_id, session_id, attempt, task, cwd, project, model, resume, attachments, config: {model_config_path, reflection, wrapup}}` | worker 据此组装 `runToolLoop` 参数（§6.3；`config.json` 内为占位 key + `endpoint=https://llm.<base>/v1`，无独立 key 文件）；`cwd` = 已建好的 worktree；`attempt` = 本次 start 次数（生成 `client_event_id`，§7.3）；`reflection`/`wrapup` 引擎策略由 portal 随 run_start 下发（§6.3-8 的载体） |
+| `event` | worker→agentd | `{run_id, client_event_id, type, ts, payload}` | 引擎回调透传（`onEvent` 8 类 / `onDelta` / `onReasoningDelta` / `onToolCall` / `onJudge`），**逐条即发**，批量在 agentd（§7.2）；`onUsage` **不产 IPC `event`**（仅喂 U2 终态载荷，§6.3-6）；`client_event_id` = `run_id:attempt:计数`（§7.3，重启/重领不碰撞） |
 | `store_request` | worker→agentd | `{req_id, method, args}` | `method ∈ appendRound/load/recall/markRunState/saveCheckpoint/loadLatestCheckpoint`；agentd 映射到 U2/U5-U9（§9.1），加 token 转发 |
 | `store_response` | agentd→worker | `{req_id, ok, result?, error?: {code, message, retryable}}` | 对应 `store_request`；`ok:false` 时 worker 侧 adapter 按 §9.2 重试策略处理 |
 | `approval_request` | worker→agentd | `{req_id, run_id, tool_call_id, round, name, input_digest}` | `executeTool` 包装层发起；worker 挂起等待 |
@@ -343,12 +343,12 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 收到 `run_start` 后：
 
-1. **provider**：`createJsonFileModelConfigProvider`（`~/.erix/config.json`）resolve `default` slot；judge/fold 用 `audit` / `fold` slot（规格 §11.4）；API key 用**占位 key**（`baseURL=https://llm.<base>/v1`）——**worker 组装 provider 不需要任何真实密钥**，真实虚拟 key 由 Traefik 按来源子网注入（H-B D-4，§11/§16.2）。
+1. **provider**：读 `config.json` 前先经 `manifest.json` 校验（user-space §5.4 硬规则：generation/sha256 一致才读，防跨文件混合版本）→ `createJsonFileModelConfigProvider`（`~/.erix/config.json`）resolve `default` slot；judge/fold 用 `audit` / `fold` slot（规格 §11.4）；API key 用**占位 key**（`endpoint=https://llm.<base>/v1`）——**worker 组装 provider 不需要任何真实密钥**，真实虚拟 key 由 Traefik 按来源子网注入（H-B D-4，§11/§16.2）。
 2. **task**：`run_start.task`（本轮用户输入）显式传入（§1.3 硬注意-1）。
 3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即 worktree）+ `createFileTools` + `createToolRegistry` + `createRecallTool`（`src/tools/index.js:1-9`）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。
 4. **store**：IPC 版 HTTP adapter（§9），`runId` = `run_start.run_id`（portal 生成的 UUID，规格 §9.3-3）。
 5. **resume**：`run_start.resume === true`（即 `attempt > 1` 的 re-claim）时传 `resume: true`（引擎从 checkpoint 恢复，跳过已执行工具——`executedToolIds` 去重，`src/loop.js:1179-1180`；副作用工具按 tool id 幂等，host-upgrade-guide §0-4）。resume 时 adapter 先经 U9 读回当前 checkpoint 的 `revision`，本地计数从 `revision+1` 续起（§9.5），避免新 worker 从 0 起计被 CAS 误拒。
-6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge / onUsage` 全部桥接到 IPC `event`；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
+6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge` 全部桥接到 IPC `event`；**`onUsage` 不产 IPC `event`**——其值随 U2 终态载荷上报（含 usage 与 compaction_stats，§7.6）；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
 7. **signal**：worker 持有 `AbortController`，IPC `abort` 时触发。
 8. **reflection**：显式传（不依赖 `maxRounds>=16` 的默认开启，§1.3 硬注意-3）；`wrapup` 显式传（对话型宿主参照 host-upgrade-guide §1 touwaka 的先例评估 `wrapup: false` ⚠️）。
 9. **结束**：resolve → `run_finished {ok:true, termination, usage, rounds, final_text}`；reject → 按 `error.code`（`checkpoint_failed` / `rate_limited` / abort→`aborted`）映射 `run_finished {ok:false, error}`。引擎 abort 时 `termination.reason="aborted"`（`src/loop.js:712-717` 的 `fail()`：`signal?.aborted ? "aborted" : "failed"`）。
@@ -437,7 +437,7 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 - **幂等键**：`client_event_id`（`run_id + ":" + attempt + ":" + 单调计数`，worker 生成）。portal 端 `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING`，响应 `stored` 为实际插入数；重复批次安全。
   - ✅ **已落地**：`run_events.client_event_id text` + `UNIQUE(run_id, client_event_id)` 已在 schema.sql（§3 run_events / model.md §1.12）；原「待补列」待办删除。
   - **attempt 前缀（issue #8，重启不碰撞）**：`attempt` = 本次 start 次数（claim 后 `run_queue.attempts`，经 ticket `run.attempt` / IPC `run_start.attempt` 下发）；`计数` 为该 attempt 内从 0 递增。re-claim 后新 worker 计数归零也不与旧 attempt 碰撞——否则旧 attempt 的 `run_id:0`、`run_id:1` 会被新 attempt 当重复丢弃。
-- **seq 分配**：portal 在**同一事务**内 `UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`（model.md §1.6），逐事件分配；`UNIQUE(session_id, seq)` 兜底（schema.sql:247）。seq 只在 portal 产生——worker/agentd 永不自造 seq。
+- **seq 分配**：portal 在**同一事务**内 `UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`（model.md §1.6），逐事件分配；`UNIQUE(session_id, seq)` 兜底（schema.sql §5 run_events）。seq 只在 portal 产生——worker/agentd 永不自造 seq。
 - **缺口检测**：前端按 SSE `id` 检测跳号；跳号 → 断开并以最后收到的 `id` 作 `Last-Event-ID` 重连补发（portal.md §5.2）。portal 广播层同样按 seq 顺序推送（事务提交乱序时按 seq 重排后再发）。
 - **断线重放**：portal 端语义已在 portal.md §5.2 定义（补发大于 `Last-Event-ID` 的全部事件）；容器侧 portal↔agentd 通道**无重放概念**——agentd 未确认的事件本地持有，重连后续传。
 - **排序语义澄清（issue #8，解决「乱序不影响正确性」vs「严格递增」的矛盾）**：二者指不同的东西——
@@ -476,9 +476,9 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 | 方案 | 说明 | 取舍 |
 |---|---|---|
 | (a) worker 经 U3 发 `run_end` 事件 | worker 把 `runToolLoop` 返回值作为 `type:"run_end"` 事件走事件批量上报 | 存在「`run_end` 事件先到、后续事件后到」的排序间隙；worker 在「发 run_end 后、U2 前」崩溃会留下无终态的事件 |
-| (b) portal 由 U2 合成（**已定**） | worker 不发 `run_end` 事件；portal 在 U2 终态事务里**合成**一条 `run_end` 事件（新 seq，payload 取 U2 的 termination/usage/rounds/final_text） | 终态状态 + `run_end` 事件**同事务原子提交**，无排序间隙；`run_end` 恒为 run 内最后一条事件 |
+| (b) portal 由 U2 合成（**已定**） | worker 不发 `run_end` 事件；portal 在 U2 终态事务里**合成**一条 `run_end` 事件（新 seq，payload 取 U2 的 termination/usage/rounds/final_text/compaction_stats） | 终态状态 + `run_end` 事件**同事务原子提交**，无排序间隙；`run_end` 恒为 run 内最后一条事件 |
 
-选 (b) 的理由：U2 终态载荷本就携带 `termination/usage/rounds/final_text`（§4.2 U2），portal 合成只是把它写成一条带 seq 的事件；单写方、单事务，消除「事件在终态之后到达」整类 bug。worker 侧不再产生 `run_end` 事件（引擎返回值只喂 U2）。
+选 (b) 的理由：U2 终态载荷本就携带 `termination/usage/rounds/final_text/compaction_stats`（§4.2 U2），portal 合成只是把它写成一条带 seq 的事件；单写方、单事务，消除「事件在终态之后到达」整类 bug。worker 侧不再产生 `run_end` 事件（引擎返回值只喂 U2）。
 
 **确定性 `client_event_id` 与 DB 唯一性（A4）**：合成事件的 `client_event_id` 固定为 `run_id:final:run_end`（与 worker 事件的 `run_id:attempt:计数` 命名空间不碰撞）。schema.sql 已有两条兑底：① `UNIQUE(run_id, client_event_id)`（同 id 重放用 `ON CONFLICT DO NOTHING` 去重）；② 部分唯一索引 `UNIQUE(run_id) WHERE type='run_end'`（`run_events_run_end_key`）——**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**。
 
@@ -486,7 +486,7 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 
 **事件 batch ack（U3）**：U3 响应 `200 {stored, seq_first, seq_last}` 即「batch ack」= 该批事件已持久化 `run_events` 并分配 seq。agentd 收到 `200` 才推进 spool ack 游标、从缓冲删除；`stored < 请求条数` 是幂等命中（非错误）。batch ack 是「已落库」确认，不是「已推送到浏览器」确认——SSE 推送是 portal 落库后的派生动作（portal.md §5）。
 
-**U2 终态提交 barrier**：agentd 在发送 U2 终态前必须满足：① 该 run 全部事件批已收到 `200`（batch ack 完成，含 spool 重传）；② 全部 store 调用（U5-U9）已完成。portal 端在 U2 终态事务内：置 runs 终态 + `run_queue → done` + 合成 `run_end` 事件（seq 最大）+ messages 回写 + usage_ledger。终态不可变；此后任何 U3/U8/state 写 → `409 run_terminal`（§4.5）——即终态是「不再接受事件/checkpoint」的硬屏障。`run_end` 事件 payload 带 `attempt`（供 UI 标注第几次尝试）。
+**U2 终态提交 barrier**：agentd 在发送 U2 终态前必须满足：① 该 run 全部事件批已收到 `200`（batch ack 完成，含 spool 重传）；② 全部 store 调用（U5-U9）已完成。portal 端在 U2 终态事务内：置 runs 终态 + `run_queue → done` + 合成 `run_end` 事件（seq 最大）+ messages 回写 + usage_ledger。终态不可变；此后任何 U3/U5/U8/U10/state 写 → `409 run_terminal`（§4.5）——即终态是「不再接受事件/checkpoint」的硬屏障。`run_end` 事件 payload 带 `attempt`（供 UI 标注第几次尝试）。
 
 ---
 
@@ -558,7 +558,7 @@ D2' 纯 DB 意味着 portal/DB 抖动会直接传导到引擎的 fail-closed（�
 
 规格 §9.3 曾「强烈建议本地 file 优先 + DB 异步复制」以吸收中心 DB 抖动；D2' 裁定**纯 DB 无 file 副本**后：
 
-- 中心 DB 抖动超过 ~8s（重试窗口）将**杀掉正在跑的任务**（`checkpoint_failed`）。接受该代价的理由：DB 与 portal 同宿主机（规格 §14），抖动窗口小；失败后经方案 B re-claim 自动 resume（§6.5），无需用户手动重发。
+- 中心 DB 抖动超过 ~8s（重试窗口）将**杀掉正在跑的任务**（`checkpoint_failed`）。接受该代价的理由：DB 与 portal 同宿主机（规格 §14），抖动窗口小；**失败后为终态，需存储恢复 + 用户重发（新 run）——不自动 re-claim**（A3 定稿，§9.5/§15-16；抖动持续时 re-claim 只会原地重演）。
 - **spool 文件（§7.5）不是 transcript 副本**：它只缓冲 SSE 事件流（第③层），第②层 transcript 无本地副本，D2' 语义完整。
 - resume 的全部前提（checkpoint 成对、最新 checkpoint 可读）都在 DB，容器重建后由新 worker 经 portal 读回——原理三成立。
 
@@ -633,7 +633,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | DB 凭据 | **无** | — | D1'：Postgres 业务写方只有 portal |
 | docker.sock | **不挂载** | — | 不变式一 |
 
-> **容器内零真实 LLM 凭据（H-B D-4 红线，issue #8 清理过时描述）**：容器 config（`~/.erix/config.json`）里只有**占位 key** + `baseURL=https://llm.<base>/v1`；**不存在任何真实 LLM key、没有 `ERIX_API_KEY_FILE`、没有独立 key 文件**——`erix-agent` 的 `apiKeyFile` / `resolveApiKey` / `createEnvModelConfigProvider` / `createStaticModelConfigProvider` 等真实凭据路径在 H-B 下**一律不使用**（§1.3/§6.3）。真实虚拟 key 只存在于宿主 Traefik 动态配置（600），由 Traefik 按来源子网注入 `Authorization`。凡出现「key 文件注入容器 / `ERIX_API_KEY_FILE`」的描述均视为过时。
+> **容器内零真实 LLM 凭据（H-B D-4 红线，issue #8 清理过时描述）**：容器 config（`~/.erix/config.json`）里只有**占位 key** + `endpoint=https://llm.<base>/v1`；**不存在任何真实 LLM key、没有 `ERIX_API_KEY_FILE`、没有独立 key 文件**——`erix-agent` 的 `apiKeyFile` / `resolveApiKey` / `createEnvModelConfigProvider` / `createStaticModelConfigProvider` 等真实凭据路径在 H-B 下**一律不使用**（§1.3/§6.3）。真实虚拟 key 只存在于宿主 Traefik 动态配置（600），由 Traefik 按来源子网注入 `Authorization`。凡出现「key 文件注入容器 / `ERIX_API_KEY_FILE`」的描述均视为过时。
 
 ### 11.2 「容器不监听端口」对比原 push 方案
 
@@ -694,7 +694,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | 审批上下文 | 每 `tool_call_id` 一单、每 run 独立挂起点 | 审批 UI 列表（按用户聚合） |
 | 事件序 | `client_event_id` 每 run 单调 | `chat_sessions.last_seq`（session 级分配器） |
 | HTTP 连接 | — | agentd 的 portal 连接池（SSE×1 + 短请求复用 keep-alive） |
-| LLM 凭据 | — | **无**（容器内零 LLM 凭据：占位 key + `baseURL=https://llm.<base>/v1`，真实 key 由 Traefik 按来源子网注入，H-B D-4） |
+| LLM 凭据 | — | **无**（容器内零 LLM 凭据：占位 key + `endpoint=https://llm.<base>/v1`，真实 key 由 Traefik 按来源子网注入，H-B D-4） |
 | MCP | — | 本期不做（上游永久非目标，§1.2）；将来若做，连接池为容器级共享 ⚠️ |
 
 **并发上限**：agentd `capacity` = 最大并发 run 数，默认 **4**（⚠️ 待决策者确认）；claim 时如实申报，portal 不超发。worker_threads 评估（替代 fork 降内存）列为 **P2** 后置项 ⚠️。
@@ -766,12 +766,12 @@ FDE 浏览器        portal                agentd               worker（execute
 | R2 | 规格 §13.1 / §15 P0 | 「等上游抽 `src/session` 发 0.4.0」P0 已被 D3' 作废（上游永久非目标） | 删除 P0，P1 内容补上「会话层由 portal + agentd/worker 实现（见本文 §1.3）」 |
 | R3 | 规格 §9.3 末尾「强烈建议」 | 「本地 file 优先 + DB 异步复制」被 D2' 明确不采纳 | 改写为本文 §9.2/§9.4 的重试包装与代价说明 |
 | R4 | portal.md §6.3 | 「portal → FDE 容器 `http://fde-<name>:3000`」不复存在；`container_unreachable` 出现条件变化（pull 下拉取语义：消息落库即 202，容器恢复后自行领取） | ✅ 已改：portal.md §6.3 已按本文 §4 重写（拉模型落库即 202；`container_unreachable` 仅 push 下发模式保留，⚠️ 待决策者确认） |
-| R5 | schema.sql `run_queue`（:347 起） | 缺租约字段 | ✅ 已落地：`lease_until timestamptz` + `claim_token text` + `attempts int NOT NULL DEFAULT 0` + `max_attempts int NOT NULL DEFAULT 3`（本文 §4.2/§6）；领取资格改按 user_id 路由（不再 `container_id=$1`，§4.2）；API 载荷名 `lease_expires_at` 保留并与 `lease_until` 对应（portal.md §9.3 已同步 `attempt`/release 语义） |
-| R6 | schema.sql `run_events`（:234 起） | 缺事件幂等键 | ✅ 已落地：`client_event_id text` + `UNIQUE(run_id, client_event_id)`；格式升级为 `run_id:attempt:计数`（§7.3） |
-| R7 | schema.sql `containers.runner_token`（:85 注释） | 「portal 需持原文调用，故存原文」在出站模型下过时 | ✅ 已改：`containers.runner_token_hash` + `token_generation`/`revoked_at`/`rotated_at`（schema.sql / model.md §1.4） |
+| R5 | schema.sql §8 `run_queue` | 缺租约字段 | ✅ 已落地：`lease_until timestamptz` + `claim_token text` + `attempts int NOT NULL DEFAULT 0` + `max_attempts int NOT NULL DEFAULT 3`（本文 §4.2/§6）；领取资格改按 user_id 路由（不再 `container_id=$1`，§4.2）；API 载荷名 `lease_expires_at` 保留并与 `lease_until` 对应（portal.md §9.3 已同步 `attempt`/release 语义） |
+| R6 | schema.sql `run_events`（§5 引擎持久化） | 缺事件幂等键 | ✅ 已落地：`client_event_id text` + `UNIQUE(run_id, client_event_id)`；格式升级为 `run_id:attempt:计数`（§7.3） |
+| R7 | schema.sql `containers`（§2） | 「portal 需持原文调用，故存原文」在出站模型下过时 | ✅ 已改：`containers.runner_token_hash` + `token_generation`/`revoked_at`/`rotated_at`（schema.sql / model.md §1.4） |
 | R8 | model.md §3「谁写」表 | 「runner 回写 assistant 回复」在 D1' 下实为 runner 上报、**portal 落库** | 措辞对齐 |
 | R9 | 上游行号引用 | 各文档原混用 v0.3.4 / v0.3.5 行号 | ✅ 已统一：全部按 v0.3.5（本地 HEAD 1a511eb）实测标注 |
-| R10 | 本文 §1.3/§5/§6.3/§11/§13 及 fde-platform.md §11 / env.md §6 | 「LLM 虚拟 key 文件注入容器（`apiKeyFile`）」已按 H-B D-4 作废：容器内零 LLM 凭据（占位 key + `baseURL=https://llm.<base>/v1`），真实虚拟 key 只存在于宿主 Traefik 动态配置（600） | 已对齐（本文 + fde-platform.md + env.md 均已注明作废；schema.sql 无 LLM 凭据列，无需改动） |
+| R10 | 本文 §1.3/§5/§6.3/§11/§13 及 fde-platform.md §11 / env.md §6 | 「LLM 虚拟 key 文件注入容器（`apiKeyFile`）」已按 H-B D-4 作废：容器内零 LLM 凭据（占位 key + `endpoint=https://llm.<base>/v1`），真实虚拟 key 只存在于宿主 Traefik 动态配置（600） | 已对齐（本文 + fde-platform.md + env.md 均已注明作废；schema.sql 无 LLM 凭据列，无需改动） |
 | R11 | schema.sql `run_checkpoints`（每 run 单行，无 `seq` 列） | 本文 §4.2 U8/§9.1 曾写 `UPSERT (run_id, seq)` / `ORDER BY seq`，与 schema 单行覆盖写矛盾 | ✅ 已改：统一为 `ON CONFLICT (run_id) DO UPDATE`；并新增 `revision` 列 + CAS（`WHERE revision < EXCLUDED.revision`，§9.5）；`seq` 仅调用方本地元数据、不落库（portal.md §9.8 已同步 revision） |
 | R12 | portal.md §9.5（U4 heartbeat） | 请求 `runs[]` 缺 `claim_token`；响应无 run 级部分失败 | 本文 §4.2 已写清应改成什么样：请求 `runs[].claim_token`；响应加 `runs[]`（`lease: renewed / lease_lost`）+ `revoked` 保持容器级；`lease_lost`/`revoked` 非 HTTP 错误。✅ 已转派：portal.md §9.5 已同步 |
 | R13 | portal.md §9.8（U8/U9 checkpoint） | 请求/响应无 `revision`；`seq` 口径过时 | U8 请求 `{revision, snapshot}`、响应 `200`/`409 checkpoint_stale`；U9 响应 `{checkpoint: {snapshot, revision, updated_at}}`；`seq` 仅本地元数据。✅ 已转派：portal.md §9.8 已同步 |
@@ -802,7 +802,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | fail-closed 抛 `checkpoint_failed`（工具执行前/后） | `src/loop.js:1249-1255` / `:1317-1322` |
 | `TranscriptStore` 接口 typedef（6 方法） | `src/store/file.js:186-194` |
 | dedupKey → recordKey / 追加前去重 | `src/store/file.js:51-56` / `:167` |
-| checkpoint 覆盖写（tmp+rename）；`appendCheckpoint` = `saveCheckpoint` 别名 | `src/store/file.js:279-289` |
+| checkpoint 覆盖写（tmp+rename）；`appendCheckpoint` = `saveCheckpoint` 别名 | `src/store/file.js:279-297` |
 | 公共导出清单（runToolLoop / providers / store / config / 压缩 / judge） | `src/index.js` |
 | tools 子路径导出（jail / file-tools / registry / providers / recall） | `src/tools/index.js:1-9` |
 | package exports（`.` / `./tools` / `./contract-tests`） | `package.json:23-27` |

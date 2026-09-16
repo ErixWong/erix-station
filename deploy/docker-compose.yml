@@ -164,7 +164,7 @@ services:
       PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}
-      # LLM 网关数据面回环地址（P1 mock/占位，真实网关 P2+ 接入；topology §4-L7）。
+      # LLM 网关数据面回环地址（P1 mock/占位，真实网关 P3 接入；topology §4-L7）。
       LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4000}
       PORT_QUOTA: ${PORT_QUOTA:-40}
       FDE_POOL: ${FDE_POOL:-default}

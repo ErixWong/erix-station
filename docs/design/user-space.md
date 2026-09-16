@@ -7,7 +7,7 @@
 >
 > **已定决策（不可改）**：
 > - **D-6 文件投递走 portal 直写宿主 bind mount**（`/srv/erix/users/<fde>/`），无需任何入站网络（topology §1 D-6，issue #7）。
-> - **容器内零 LLM 凭据**：仅占位 key + `baseURL=https://llm.<base>/v1`；真实虚拟 key 由 Traefik 按来源子网注入，永不下发容器（topology §1 D-4 / 规格 §11.4）。
+> - **容器内零 LLM 凭据**：仅占位 key + `endpoint=https://llm.<base>/v1`；真实虚拟 key 由 Traefik 按来源子网注入，永不下发容器（topology §1 D-4 / 规格 §11.4）。
 > - **DB 是状态真相**：用户空间文件是 DB 的**派生视图**，不是真相（principles §1 原理三；规格 §8.1）。`ports.json` 是 `port_allocations` 的派生视图。
 > - **每 FDE 一条独立 `/29`**、**Traefik 走 host 网络**、**portal 不主动访问容器**——文件投递只走「portal 直写宿主 bind mount」，无网络路径（topology §1 D-1/D-2/D-6）。
 
@@ -61,7 +61,7 @@
 ├── home/                       # 容器 HOME 的内容（挂到 /home/<user>）
 │   ├── AGENTS.md               # 平台文件（容器级约定）
 │   ├── .erix/
-│   │   ├── config.json         # 平台文件（LLM 占位 key + baseURL + model slots）
+│   │   ├── config.json         # 平台文件（LLM 占位 key + endpoint + model slots）
 │   │   ├── mcp.json            # 平台文件（本期空骨架；MCP 本期不做）
 │   │   ├── manifest.json       # 平台文件（多文件一致性提交点，§5.3）
 │   │   ├── skills/             # FDE/agent 自管（平台不物化内容）
@@ -123,7 +123,7 @@
 
 | 文件（容器路径） | 格式 / schema | 写方 | 读方 | 权限 | 随 allocation 变化 |
 |---|---|---|---|---|---|
-| `/home/<user>/.erix/config.json` | JSON（§4.3.2） | materializer | worker（`createJsonFileModelConfigProvider`）；agentd 启动校验 | `0644`（root:root） | 否（仅 baseURL/占位 key/model slots；与端口无关） |
+| `/home/<user>/.erix/config.json` | JSON（§4.3.2） | materializer | worker（`createJsonFileModelConfigProvider`）；agentd 启动校验 | `0644`（root:root） | 否（仅 endpoint/占位 key/model slots；与端口无关） |
 | `/home/<user>/.erix/mcp.json` | JSON（`{"mcpServers":{}}` 空骨架） | materializer | 本期无（MCP 本期不做） | `0644` | 否 |
 | `/home/<user>/.erix/manifest.json` | JSON（§4.3.3） | materializer | agentd / worker（多文件一致性校验） | `0444` | 是（generation 随任一批次递增） |
 | `/home/<user>/AGENTS.md` | Markdown（容器级约定） | materializer | FDE / agent（人读 + pi 逐级加载） | `0644` | 否 |
@@ -139,11 +139,11 @@
 |---|---|---|
 | `/home/<user>/projects/<project>/`（仓库内容） | FDE clone + agent 编辑 | 平台只创建空目录与平台文件，**不 clone、不下发 git 凭据**（规格 §7.2） |
 | `/home/<user>/worktrees/<project>-<runId>/` | **agentd**（`git worktree add`，runner §6.2） | **worktree 元数据无文件**：run↔worktree 绑定在 DB（`runs.id` + 路径约定 `~/worktrees/<project>-<runId>`），不在用户空间物化任何元数据文件（避免与 git 自身元数据冲突、避免双真相） |
-| `/home/<user>/.cache/station/spool/<runId>.jsonl` | agentd / worker（事件缓冲，runner §7.4） | **JSONL**（append-only，每行一个事件信封）；run 结束后清排；平台不读不写 |
+| `/home/<user>/.cache/station/spool/<runId>.jsonl` | agentd / worker（事件缓冲，runner §7.5） | **JSONL**（append-only，每行一个事件信封）；run 结束后清排；平台不读不写 |
 | `/home/<user>/cache/` | FDE / agent（pnpm store / npm / pip） | 依赖缓存，平台不代管 |
 | `/home/<user>/.erix/skills/`、`.erix/todos/` | FDE / agent 自管 | 平台只建目录（若模板需要），内容不物化 |
 
-> **spool 路径澄清**：事件 spool 在 `~/.cache/station/spool/`（runner §7.4 原文），依赖缓存在 `~/cache/`（规格 §12.1）——两者**不同目录**，不是同一路径的两处写法。本表按此区分，不改 runner-integration.md。
+> **spool 路径澄清**：事件 spool 在 `~/.cache/station/spool/`（runner §7.5 原文），依赖缓存在 `~/cache/`（规格 §12.1）——两者**不同目录**，不是同一路径的两处写法。本表按此区分，不改 runner-integration.md。
 
 ### 4.3 JSON schema
 
@@ -169,10 +169,10 @@
     },
     {
       "scope": "run",
-      "port": 4008,
+      "port": 4001,
       "role": "backend",
-      "run_id": "r3a7f",
-      "url": "https://alice-r3a7f-4008.fde.erix.vip",
+      "run_id": "6f1c2a34-9b8e-4f2d-a1c5-7d8e0f1a2b3c",
+      "url": "https://alice-r3a7fq-4001.fde.erix.vip",
       "exposure": "private",
       "state": "active"
     }
@@ -190,7 +190,7 @@
 
 **序列化规则（幂等前提）**：对象键按字典序、2 空格缩进、末尾换行。同一 DB 快照 → 字节级相同的文件（§5.5）。
 
-#### 4.3.2 `config.json`（LLM 配置，占位 key + baseURL）
+#### 4.3.2 `config.json`（LLM 配置，占位 key + endpoint）
 
 路径：`/home/<user>/.erix/config.json`。
 
@@ -198,17 +198,17 @@
 {
   "default": {
     "apiKey": "erix-placeholder",
-    "baseURL": "https://llm.erix.vip/v1",
+    "endpoint": "https://llm.erix.vip/v1",
     "model": "claude-sonnet"
   },
   "audit": {
     "apiKey": "erix-placeholder",
-    "baseURL": "https://llm.erix.vip/v1",
+    "endpoint": "https://llm.erix.vip/v1",
     "model": "claude-haiku"
   },
   "fold": {
     "apiKey": "erix-placeholder",
-    "baseURL": "https://llm.erix.vip/v1",
+    "endpoint": "https://llm.erix.vip/v1",
     "model": "claude-haiku"
   }
 }
@@ -217,10 +217,10 @@
 | 项 | 取值 | 说明 |
 |---|---|---|
 | `*.apiKey` | `"erix-placeholder"`（占位哨兵值） | **非真实凭据**。worker 依此发送 `Authorization: Bearer erix-placeholder`，Traefik 在 `llm.<base>` 路由用 `customRequestHeaders` **覆盖**为真实虚拟 key（topology §10 证据 8）。**真实 key 永不物化进容器**（D-4）。 |
-| `*.baseURL` | `https://llm.<base>/v1`（`llm.<base>` = `llm.erix.vip`，env §10 `LLM_HOST`） | 容器内经 `--add-host llm.<base>:<本 FDE 网关 IP>` 解析到 Traefik host:443（env §0/§1）；**不写 A 记录、不进 DNS**。 |
+| `*.endpoint` | `https://llm.<base>/v1`（`llm.<base>` = `llm.erix.vip`，env §10 `LLM_HOST`） | 容器内经 `--add-host llm.<base>:<本 FDE 网关 IP>` 解析到 Traefik host:443（env §0/§1）；**不写 A 记录、不进 DNS**。 |
 | `*.model` | `default`/`audit`/`fold` 三个 slot 的模型名 | 平台默认值；`audit`/`fold` 用便宜模型（规格 §11.4）。 |
 
-> ⚠️ 待决策者确认 + 上游对齐项：`config.json` 的**确切字段名与嵌套结构**必须与 erix-agent `config/*` 的 `createJsonFileModelConfigProvider` 读取格式一致（runner §1.3 契约锚点）。本表给出的是平台职责范围内**必须保证的语义**（三个 slot、占位 key、baseURL）；若上游字段名不同（如 `apiKey` vs `key`），实现时按上游为准，本文只承诺「占位 key + `baseURL=https://llm.<base>/v1` + `default/audit/fold` 三 slot」这一语义。此项同步点见 §13 跨文件清单。
+> ⚠️ 待决策者确认 + 上游对齐项：`config.json` 的**确切字段名与嵌套结构**必须与 erix-agent `config/*` 的 `createJsonFileModelConfigProvider` 读取格式一致（runner §1.3 契约锚点）。本表给出的是平台职责范围内**必须保证的语义**（三个 slot、占位 key、endpoint）；若上游字段名不同（如 `apiKey` vs `key`），实现时按上游为准，本文只承诺「占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot」这一语义。此项同步点见 §13 跨文件清单。
 
 #### 4.3.3 `manifest.json`（多文件一致性提交点）
 
@@ -314,7 +314,7 @@ materializer 对所有 JSON 统一「对象键字典序 + 2 空格缩进 + 末�
 | `/srv/erix/users/`（宿主根） | root:root | `0755` | 仅 portal（root）可写；Traefik/db 不挂、无权限 |
 | `/srv/erix/users/<fde>/` 及其下工作区目录（`home`、`projects`、`projects/<p>`、`worktrees`、`worktrees/<...>`、`cache`） | `erix`(1000):`erix`(1000) | **`2770`**（setgid + 组 rwx） | setgid 使新建子项继承 GID 1000；组 rwx 使 agentd(1001)/worker(1002) 可协作 |
 | `.erix/`（HOME 级与项目级） | `erix`(1000):`erix`(1000) | `0750` | FDE 可管理 `skills/todos`；平台文件在其中为 root 属只读（下一行）；agentd/worker 只读 |
-| `.cache/station/spool/`（事件 spool） | `erix`(1000):`erix`(1000) | `2770`（组可写） | agentd(1001) 与 worker(1002) **都写** spool（runner §7.4），故需组写；setgid 使新建 `.jsonl` 继承 GID 1000 |
+| `.cache/station/spool/`（事件 spool） | `erix`(1000):`erix`(1000) | `2770`（组可写） | agentd(1001) 与 worker(1002) **都写** spool（runner §7.5），故需组写；setgid 使新建 `.jsonl` 继承 GID 1000 |
 | **平台文件**（`config.json`/`mcp.json`/`ports.json`/`AGENTS.md`/`.gitignore`） | root:root | `0644` | 容器内 1000/1001/1002 可读、不可写（防误改；FDE 有 root 可绕过，§4.1 已声明） |
 | `manifest.json` | root:root | `0444` | 更强只读（内容无敏感，但改它即破坏一致性校验，故只读） |
 | 容器内进程 `umask` | — | **`0002`** | 新建文件 664、新建目录 775（配合 setgid 组协作） |
@@ -437,7 +437,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | 文件 | 手改后果 | 平台行为 |
 |---|---|---|
 | `ports.json` | agent 读到被改的端口视图 | **对账重物化覆盖**（DB 是真相）；同时写 `audit_log`（`materialize.drift`）+ 告警（P2 通知通道，状态 P1 可查） |
-| `config.json` | 手改 baseURL/model/key | **对账重物化覆盖**为平台值；但真正防「改 endpoint」靠网络（`llm.<base>` 唯一可达，Traefik 注入真 key），文件被改**无害**（占位 key 无价值） |
+| `config.json` | 手改 endpoint/model/key | **对账重物化覆盖**为平台值；但真正防「改 endpoint」靠网络（`llm.<base>` 唯一可达，Traefik 注入真 key），文件被改**无害**（占位 key 无价值） |
 | `manifest.json`（0444） | 改哈希/删文件可破坏一致性校验 | 读方校验失败 → 重读 → 仍失败则告警 + 暂停领新 run（§5.4）；对账重物化恢复 |
 | `.erix/AGENTS.md`、`~/AGENTS.md`、`.gitignore` | 改约定 | 对账重物化覆盖为平台模板值 |
 | `skills/`、`todos/`、`cache/`、`projects/<p>` 仓库内容、`worktrees/` | **FDE 合法自管内容，平台不碰** | 永不覆盖、永不告警 |
@@ -475,7 +475,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | 项 | 结论 |
 |---|---|
 | 文件权限是安全边界吗 | **不是**（principles §1 原理四）。只防误改；真正边界是网络（每 FDE 独立 `/29`、不 publish、ingress 唯一、LLM 唯一出口）。 |
-| 平台文件泄漏什么 | 无敏感内容：占位 key 无价值、baseURL 是内网 `llm.<base>`、`ports.json` 是 FDE 自己的端口。**真实 LLM key / DB 凭据 / runner token 永不进入用户空间文件**。 |
+| 平台文件泄漏什么 | 无敏感内容：占位 key 无价值、endpoint 是内网 `llm.<base>`、`ports.json` 是 FDE 自己的端口。**真实 LLM key / DB 凭据 / runner token 永不进入用户空间文件**。 |
 | FDE 能否破坏自己 | 能（有 root）——**接受**（runner §11.3 同口径）；只保证「他人/平台状态不被单个 FDE 破坏」。 |
 | 跨 FDE 隔离 | bind mount 每 FDE 只挂自己的 `/srv/erix/users/<fde>/`；materializer 只按 DB `fde_id` 写对应目录；名字白名单 + 无 `..`（§6.3）防越目录。 |
 | 单 FDE 写入路径 | materializer 不读回用户空间内容做决策（§6.3-4），杜绝「FDE 篡改文件反灌平台」。 |
@@ -488,7 +488,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 |---|---|---|---|
 | 1 | 容器内用户名固定 `erix` 还是按 FDE 名 | 固定 `erix`（§2.4） | 镜像模板 / HOME 路径 |
 | 2 | materializer outbox 复用 `route_outbox` 还是新增表 | ✅ 已定：新增 `materialize_outbox` + `materialize_revisions`（A7，已落 schema.sql §9 / model.md §1.22） | schema.sql / model.md（已落地，§13 S1） |
-| 3 | `config.json` 字段名与 erix-agent `config/*` 对齐 | 以 erix-agent 为准，平台只保证「占位 key + baseURL + 三 slot」语义 | 上游契约对齐（§13） |
+| 3 | `config.json` 字段名与 erix-agent `config/*` 对齐 | 以 erix-agent 为准，平台只保证「占位 key + endpoint + 三 slot」语义 | 上游契约对齐（§13） |
 | 4 | 定时对账周期 | 5min | 漂移收敛时延 |
 
 ---
@@ -501,7 +501,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 |---|---|---|---|
 | S1 | `data/schema.sql` + `data/model.md` | ✅ 已落地：新增 `materialize_outbox` + `materialize_revisions`（A7，见 schema.sql §9 / model.md §1.22） | §7.1 / §10 / §12-2 |
 | S2 | `data/model.md` §1.9 / §2.2 | `ports.json` 投影范围与 `allocated→active` 触发条件、`generation` 字段来源 | §4.3.1 |
-| S3 | `design/runner-integration.md` §7.4 | spool 路径 `~/.cache/station/spool/` 与本文 §4.2 已对齐（无冲突，确认即可）；§5 `run_start` 载荷若需携带「本 run 端口快照」则补字段（P2 run 级端口） | §3 / §4.3.1 |
+| S3 | `design/runner-integration.md` §7.5 | spool 路径 `~/.cache/station/spool/` 与本文 §4.2 已对齐（无冲突，确认即可）；§5 `run_start` 载荷若需携带「本 run 端口快照」则补字段（P2 run 级端口） | §3 / §4.3.1 |
 | S4 | `design/runner-integration.md` §6.3 | worker 读 `config.json` 前先经 manifest 校验（本文 §5.4 硬规则） | §5.4 |
 | S5 | `api/portal.md` §3.3 | `POST /api/projects` 响应/语义补「项目目录与平台文件由 materializer 物化」的说明 | §9.1 |
 | S6 | `docs/README.md` 待补齐清单 | 新增 D 项或记录本文为「用户空间物化契约」已交付 | 本文件 |
