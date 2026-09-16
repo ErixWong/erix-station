@@ -344,6 +344,13 @@ export class FakeInternalPool {
       return { rows: [] };
     }
 
+    // ---- messages assistant final_text 读取（M4：终态幂等比对）----
+    if (sql.includes('FROM messages') && sql.includes("role = 'assistant'") && sql.includes('ORDER BY seq DESC')) {
+      const [runId] = params;
+      const m = [...this.messages].filter((x) => x.run_id === runId && x.role === 'assistant').sort((a, b) => b.seq - a.seq)[0];
+      return { rows: m ? [{ content: m.content }] : [] };
+    }
+
     // ---- messages assistant 回写（role 为字面量 'assistant'）----
     if (sql.includes('INSERT INTO messages')) {
       const [sessionId, runId, seq, content] = params;

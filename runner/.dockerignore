@@ -1,0 +1,10 @@
+# build context = runner/（deploy-contract §1：FDE_IMAGE 自构建，tag erix-station/fde:<版本>-<sha>）。
+# 照全局 .dockerignore 规矩：不送 node_modules / .git / 日志 / 缓存进构建上下文。
+.git
+.gitignore
+node_modules
+npm-debug.log*
+*.log
+.DS_Store
+*.pid
+README.md

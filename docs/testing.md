@@ -33,7 +33,7 @@
 | **端到端（e2e）** | 真机走通「登录→建项目→对话→工具卡片→停止」 | 本机 docker compose 平台栈 + Playwright MCP | §1.4 P1 验收清单 + §3.7 浏览器流程 | 十分钟级 | 截图 + vision 读图确认 + 关键断言通过 |
 | **安全回归（security）** | 网络隔离 / 认证 / 凭据红线，**必须真机** | 目标环境（部分可在本机开发环境跑通，见 §3.1） | §3.1/§3.2 命令 | 分钟级 | 逐条对应 topology §6.1 验收矩阵 |
 
-> **当前仓库状态（前置条件，B8）**：`portal/`、`runner/`、`deploy/` 尚未创建（`README.md` §「现在有什么」），无 `package.json`。因此 §1 的**代码类命令**（`npm test`、`node --check <文件>`）在实现落地前**不可运行**——`npm test` 当前退出码 254（无 `package.json`）、`node --check portal/src/foo.js` 当前退出码 1（文件不存在），均为**预期**，不是失败。它们是**实现落位后必须可执行**的验收命令（契约先行）；在实现之前，只有「可执行性」本身（`psql -f schema.sql`、临时网络/假容器起停）能实测，其余以「实现后照此执行」为准。
+> **当前仓库状态（前置条件，B8）**：`portal/`、`runner/`、`deploy/` 已落地（含 `package.json`），单测当前 **168 pass / 0 fail**（`npm test`，node --test）。§1 的代码类命令（`npm test`、`node --check <文件>`）现可运行；本文命令随实现演进，以仓库现状为准。
 
 ### 1.2 分层命令与判定
 
@@ -54,7 +54,7 @@ node --check "$RUNNER_JS"
 
 ```bash
 cd /home/eric/projects/erix-station
-# ⚠️ 前置条件：portal/ 与 package.json 已实现（当前仓库尚无，见 §1.1 注），否则 npm test 退出 254
+# ✅ 前置条件已满足：portal/ 与 package.json 已落地，npm test 当前 168 pass / 0 fail（见 §1.1 注）
 npm test                                    # 默认 Node 22
 PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node 24）
 ```
@@ -98,7 +98,9 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 | P1-7 | 真机主链路 | §3.7.1 playwright + vision | 登录→建项目→对话→工具卡片→停止 | 截图可读 + 无致命 console（§3.7.1） |
 | P1-8 | contract-tests 接入 | §3.6.3 | 导出面正确 + 深路径 `ERR_PACKAGE_PATH_NOT_EXPORTED` | 接入（§3.6.3） |
 
-**P2（多 FDE、端口分配+预览、事件重放、工具审批、账号生命周期）**
+**P2（多 FDE、run 级端口分配+预览、事件重放、工具审批、账号生命周期）**
+
+> 端口分期口径（规格 §8.2/§7.1）：**项目级端口（1 个/项目）归 P1**，**run 级端口（块内 7 个/run）+ 预览归 P2**——P1 验收已覆盖项目级端口分配。
 
 | # | 验收项 | 命令 | 期望输出 | 判定标准 |
 |---|---|---|---|---|
@@ -270,7 +272,7 @@ SQL
 
 | 用例 | 动作 | 期望返回码 + code | 判定 |
 |---|---|---|---|
-| B1 未认证访问任意 `*.fde.<base>` | `curl -s -o /dev/null -w '%{http_code}' https://alice-p-proj1-4000.fde.<base>/` | `401`（`unauthorized`；无 ticket 无预览 cookie）→ Traefik 302 登录 | 401，且**响应/上游不含 `__Host-fde_session`** |
+| B1 未认证访问任意 `*.fde.<base>` | `curl -s -o /dev/null -w '%{http_code}' https://alice-p-proj1-4000.fde.<base>/` | `403`（`preview_ticket_required`；无 ticket 无预览 cookie）| 403，且**响应/上游不含 `__Host-fde_session`** |
 | B2 hostname 无对应 allocation | 访问 `https://nope-x-4000.fde.<base>/` | `404`（`not_found`） | 404（「路由表里没有 = 不可达」） |
 | B3 ticket 过期 / 不存在 / 格式非法 | `?preview_ticket=<过期/假>` | `401`（`preview_ticket_expired`/`preview_ticket_invalid`） | 401 |
 | B4 ticket 已用（重放） | 同一 ticket 第二次 | `403`（`preview_ticket_used`） | 403，重放防护 |
@@ -401,7 +403,7 @@ node --input-type=module -e \
 接入落点（实现后）：
 
 - **store adapter 契约测试**：用 `transcriptStoreContract` 跑**本平台的 HTTP store adapter**（实现 `TranscriptStore` 六方法，映射到 portal internal U5–U9，runner §9.1）。跑法：起 in-process stub 实现 U5–U9（§2.1 fake），adapter 指向 stub，contract 测试逐方法断言。**这验证的是「我们的 adapter 满足上游 store 接口语义」，不是验证 portal 业务逻辑**。
-- **config provider 契约测试**：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（占位 key + `baseURL=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。
+- **config provider 契约测试**：用 `modelConfigProviderContract` 跑**本平台物化的 `config.json`**（顶层键 `slots` + 占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot，user-space §4.3.2）经 `createJsonFileModelConfigProvider` 解析的结果——断言三个 slot 可解析、占位 key 可读（真实 key 由 Traefik 注入，容器内零凭据，runner §11.1）。
 - **CI 接入**：规格 §13.2-6「`erix-agent/contract-tests` 应接入 CI（长期运行的宿主必需）」——落点为 `npm test` 的一个子集（`contract-tests` 目录），随全绿门槛执行。
 
 ### 3.7 浏览器验证流程（playwright MCP → 截图 → vision MCP；守不变式 2，P1 验收主链路）
@@ -535,7 +537,7 @@ P1 交付完成 = 同时满足：
 
 | # | 项 | 为什么暂不测 | 处置 |
 |---|---|---|---|
-| 1 | **真实 LLM 配额/调用**（P3） | 需真实 LLM 网关 + 上游配额；P1 对话走**无真实凭据的 OpenAI-compatible mock/test gateway**（deploy §7.3，容器仍只持占位 key + `baseURL`，无 `LLM_DEV_*` 变量） | P1 用 mock/占位断言「请求发出、错误码映射（`rate_limited`→429、`checkpoint_failed`）正确」（§3.9）；真实配额 P3 验收 |
+| 1 | **真实 LLM 配额/调用**（P3） | 需真实 LLM 网关 + 上游配额；P1 对话走**无真实凭据的 OpenAI-compatible mock/test gateway**（deploy §7.3，容器仍只持占位 key + `endpoint`，无 `LLM_DEV_*` 变量） | P1 用 mock/占位断言「请求发出、错误码映射（`rate_limited`→429、`checkpoint_failed`）正确」（§3.9）；真实配额 P3 验收 |
 | 2 | **目标环境网络策略（出口管控）** | 外部依赖（安全团队，issue #3），本机开发机未实施 | N5（FDE→互联网）目标环境实测；「改 endpoint 无效」（P3 验收）依赖安全团队策略，未实施时降级为审计+告警（规格 §11.4） |
 | 3 | **LLM 注入真实虚拟 key 覆盖伪造头**（topology §4-L7/§10 证据 8） | P3 才部署 `llm-gateway` + LLM 注入路由（deploy §7.2） | 归 P3 验收；P1 不测（不假通过） |
 | 4 | **`erix-agent` 依赖未安装**（本机无 `~/projects/erix-agent`，npm 源未接入） | 契约已定义（runner §1.3），接入命令见 §3.6.3 | 「待接入」：安装 + contract-tests 跑通后转「已测」；当前显式标「未验收」 |
@@ -560,12 +562,12 @@ P1 交付完成 = 同时满足：
 | 4 | materializer outbox 复用 `route_outbox` 还是新增表 | ✅ 已定稿：新增 `materialize_outbox` + `materialize_revisions`（A7，不复用 `route_outbox`，schema.sql §9 / model §1.22） | §3.3 物化测试的 outbox 落点 |
 | 5 | argon2id 参数 / 口令长度 / TOTP 强制 | `m=19MiB,t=2,p=1` / ≥12 / 强制（portal §2.9.4 ⚠️） | §3.2 A |
 
-### 6.2 转派同步点（本文不修改，需另开轮次）
+### 6.2 转派同步点（已销账）
 
-| # | 目标文档 | 需同步点 | 本文对应 |
+| # | 目标文档 | 需同步点 | 状态 |
 |---|---|---|---|
-| S2 | `data/model.md` §2.2 | `allocated→active` 触发条件定案为「首次 forward-auth 放行」（规格 §8.6；deploy §9.2 S2 已标记） | §3.5 T7 |
-| S3 | `data/schema.sql` | 缺 `schema_migrations` 表（deploy §3.1 要求；deploy §9.2 S3 已标记）；可选 `users.fde_name` 加 CHECK（规格 §8.5） | §2.2.2/§2.2.3 |
+| S2 | `data/model.md` §2.2 | `allocated→active` 触发条件定案为「首次 forward-auth 放行」（规格 §8.6；deploy §9.2 S2 已标记） | ✅ 已同步（model.md §2.2 已定稿并注明） |
+| S3 | `data/schema.sql` | `schema_migrations` 表（deploy §3.1）+ `users.fde_name` CHECK（规格 §8.5） | ✅ 已同步（schema.sql §10 + §2 CHECK 均已落） |
 
 ---
 

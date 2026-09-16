@@ -33,12 +33,16 @@ function json(obj) {
 // 纯渲染（同 DB 快照 → 字节级相同输出）
 // ---------------------------------------------------------------------------
 
-export function renderConfigJson({ llmHost }) {
-  const baseURL = `https://${llmHost}/v1`;
+export function renderConfigJson({ llmBaseUrl }) {
+  // erix-agent v0.3.5 实测：createJsonFileModelConfigProvider 读 `slots.{default,audit,fold}` 嵌套结构，
+  // 且 OpenAI provider 字段为 `endpoint`（非 baseURL）。占位 key + endpoint，零真实 LLM 凭据（runner §6.3/§11）。
+  const endpoint = `${String(llmBaseUrl).replace(/\/+$/, '')}/v1`;
   return json({
-    default: { apiKey: 'erix-placeholder', baseURL, model: 'claude-sonnet' },
-    audit: { apiKey: 'erix-placeholder', baseURL, model: 'claude-haiku' },
-    fold: { apiKey: 'erix-placeholder', baseURL, model: 'claude-haiku' },
+    slots: {
+      default: { apiKey: 'erix-placeholder', endpoint, model: 'claude-sonnet' },
+      audit: { apiKey: 'erix-placeholder', endpoint, model: 'claude-haiku' },
+      fold: { apiKey: 'erix-placeholder', endpoint, model: 'claude-haiku' },
+    },
   });
 }
 
@@ -153,14 +157,14 @@ export function hostPathFor(root, fdeName, containerPath) {
  * 纯函数：由 DB desired state 渲染该 FDE 全部平台文件（不含 manifest）。
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
-export function buildFilePlan({ fdeName, baseDomain, llmHost, projects, allocationsByProject, root, generation }) {
+export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, projects, allocationsByProject, root, generation }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
   };
 
   add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
-  add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmHost }));
+  add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
 
   for (const project of projects) {
@@ -209,11 +213,11 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    * 渲染 + 落盘该 FDE 全部平台文件 + manifest（提交点）。
    * 返回 manifest 内容与最终 generation（供测试断言）。
    */
-  async function materialize({ fdeName, baseDomain, llmHost, projects, allocationsByProject, generation, prevManifest, materializedAt = new Date() }) {
+  async function materialize({ fdeName, baseDomain, llmBaseUrl, projects, allocationsByProject, generation, prevManifest, materializedAt = new Date() }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
-    const files = buildFilePlan({ fdeName, baseDomain, llmHost, projects, allocationsByProject, root: rootReal, generation });
+    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, projects, allocationsByProject, root: rootReal, generation });
 
     ensureWorkspaceDirs(files);
 
@@ -386,7 +390,7 @@ async function readFdeDesiredState(pool, fdeId, config) {
     fdeName,
     projects: projects.rows,
     allocationsByProject,
-    llmHost: config.llmHost,
+    llmBaseUrl: config.llmPublicBaseUrl,
     baseDomain: config.baseDomain,
   };
 }
@@ -479,7 +483,7 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
       await mat.materialize({
         fdeName: state.fdeName,
         baseDomain: state.baseDomain,
-        llmHost: state.llmHost,
+        llmBaseUrl: state.llmBaseUrl,
         projects: state.projects,
         allocationsByProject: state.allocationsByProject,
         generation: Number(row.revision),

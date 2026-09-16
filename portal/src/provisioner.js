@@ -150,6 +150,7 @@ export function buildContainerConfig({
   gateway,
   baseDomain,
   llmHost,
+  portalPublicBaseUrl,
   userSpaceRoot,
   homeUser = 'erix',
   env = [],
@@ -173,8 +174,8 @@ export function buildContainerConfig({
     Cmd: cmd,
     Env: [
       ...(env ?? []),
-      // F4：容器内 agentd 依赖的 internal API base URL（契约 §6.2）。
-      `ERIX_STATION_BASE_URL=https://station.${baseDomain}/api/internal`,
+      // F4：容器内 agentd 依赖的 internal API base URL（契约 §6.2）。dev http + 高端口 / prod https + 443。
+      `ERIX_STATION_BASE_URL=${String(portalPublicBaseUrl || `https://station.${baseDomain}`).replace(/\/+$/, '')}/api/internal`,
     ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, ...labels },
     HostConfig: {
@@ -186,11 +187,12 @@ export function buildContainerConfig({
       CapAdd: capAdd,
       Init: true,
       Memory: parseMemoryLimit(memoryLimit),
+      // 契约 §6.2：容器内 station.<base> / llm.<base> 解析到本 FDE bridge 网关（Traefik host 网络入口）。
+      ExtraHosts: [`station.${baseDomain}:${gateway}`, `${llmHost}:${gateway}`],
       // 不变式一：不 publish 端口 —— 不携带 PortBindings 字段（proxy P1 字段级 allowlist 拒绝任何 PortBindings）。
     },
     // R2：不再携带 NetworkingConfig（--ip）——proxy 第三轮加固已直接拒绝该字段；
     // 单容器/单网络下默认 IPAM 顺序分配即固定位 .2（topology §3）。
-    // R5：不再携带 ExtraHosts（--add-host）——proxy 已直接拒绝该字段。
   };
   if (runUser) body.User = runUser;
   return body;
@@ -462,6 +464,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           gateway,
           baseDomain: config.baseDomain,
           llmHost: config.llmHost,
+          portalPublicBaseUrl: config.portalPublicBaseUrl,
           userSpaceRoot: config.userSpaceRootHost, // F3：bind source 用宿主路径（与容器内 userSpaceRoot 解耦）
           memoryLimit: config.fdeMemoryLimit,
           runUser: config.fdeDevUser ?? null, // F5：生产留空（镜像 entrypoint 降权）；dev 用 FDE_DEV_USER 兜底
@@ -607,6 +610,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
         gateway,
         baseDomain: config.baseDomain,
         llmHost: config.llmHost,
+        portalPublicBaseUrl: config.portalPublicBaseUrl,
         userSpaceRoot: config.userSpaceRootHost, // F3
         memoryLimit: config.fdeMemoryLimit,
         runUser: config.fdeDevUser ?? null, // F5

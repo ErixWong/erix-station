@@ -104,8 +104,9 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.deepEqual(body.HostConfig.CapDrop, ['ALL']);
   assert.deepEqual(body.HostConfig.SecurityOpt, ['no-new-privileges']);
   assert.equal(body.HostConfig.Init, true);
-  // R5：不再携带 ExtraHosts（--add-host 已移除）
-  assert.equal('ExtraHosts' in body.HostConfig, false);
+  // 契约 §6.2：容器内 station.<base>/llm.<base> → 本 FDE bridge 网关（--add-host）。
+  assert.deepEqual(body.HostConfig.ExtraHosts, ['station.localhost:10.200.1.1', 'llm.localhost:10.200.1.1']);
+  assert.ok(body.Env.some((e) => e.startsWith('ERIX_STATION_BASE_URL=https://station.localhost/api/internal')), '默认 portal base url');
 });
 
 test('buildNetworkConfig：显式 subnet + gateway', () => {
