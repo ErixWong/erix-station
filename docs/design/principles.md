@@ -100,7 +100,7 @@
 - ADR-009 教训：把安全混进 agent 会产生**虚假承诺**，分层后各层可独立替换。
 
 **派生规则**：
-- 平台**只使用** erix-agent 的公开 API（`runToolLoop` / `TranscriptStore` / `erix-agent/tools` / 未来的 `erix-agent/session`）
+- 平台**只使用** erix-agent 的公开 API（`runToolLoop` / `TranscriptStore` / `erix-agent/tools`）；会话层由本平台自实现（D3'：上游已把会话管理列为永久非目标）
 - 引擎缺口以 issue 形式回上游，**不在平台里 fork 一份**
 - 多角色编排、重试调度、审批 → **平台职责**，不进引擎
 - 引擎侧行为变化 → 平台跑 contract-tests 而非人工 checklist
@@ -138,7 +138,7 @@
 | **path-prefix 反代**（`station/alice/app/4000/...`） | SPA 绝对路径、HMR websocket、cookie path、redirect `Location`、CORS 全部会炸；无法为任意框架适配 | 只代理自研且路径已知的应用 |
 | **IP 白名单作主机制** | VPN 池/DHCP 漂移；**公司出口 NAT 把所有人塌缩成同一源 IP**（要么人人可看，要么自己进不去）；多设备/手机/客户现场失效 | 平台整体就是 VPN-only（这时它是**网络层**措施，不是按人白名单） |
 | **basic auth 作主机制** | 浏览器按 host+realm 自动重发凭据（共享浏览器/录屏泄漏）；每子域弹窗；静态密钥轮换与离职要逐容器改；无法分级可见性；无访问审计；不复用 SSO | forwardAuth 故障时的 deny-all 兜底；非浏览器客户端 |
-| **每个端口一条手工/动态路由配置** | 控制面复杂度爆炸（N 用户 × M 端口） | 无——泛域名 + host 编码端口用一条规则解决 |
+| **每个端口一条手工/动态路由配置** | 控制面复杂度爆炸（N 用户 × M 端口）——**已按 issue #9 改判**：per-allocation router+service 由 reconciler 从 DB 幂等生成，复杂度由自动化承担；被否决的是「手工维护」与「单通配 service」，不是 per-allocation 模型本身 | reconciler（topology §8） |
 | **让 agent 自己挑端口** | 冲突；端口漂移导致 URL 变化（书签/预览/iframe 全断）；无法审计与回收 | 无 |
 | **所有 FDE 容器共享一个 docker 网络** | 容器互访可绕过 ingress 直达（`curl alice:4000`） | 无 |
 | **把工作区锁在「仓库」粒度（同一仓库串行）** | 白白串行化；FDE 常态就是同仓库多分支并行 | 无（用 worktree 解决） |
@@ -163,7 +163,7 @@
 
 ### Q2 出口管控（egress）职责归属 —— ✅ 已决策
 
-> **已决策：出口管控归安全团队（网络层）**（决策者 2026-09，issue #3）。平台职责止于**凭据红线**（容器内**零 LLM 凭据**——H-B 定稿 D-4 后连虚拟 key 也不放容器，仅占位 key + `baseURL=https://llm.<base>/v1`，真实虚拟 key 由 Traefik 按来源子网注入；永不下放下游真实 key）与**审计**；若安全团队的出口策略未实施，「防外发」降级为审计 + 告警，须管理层书面知情。
+> **已决策：出口管控归安全团队（网络层）**（决策者 2026-09，issue #3）。平台职责止于**凭据红线**（容器内**零 LLM 凭据**——H-B 定稿 D-4 后连虚拟 key 也不放容器，仅占位 key + `endpoint=https://llm.<base>/v1`，真实虚拟 key 由 Traefik 按来源子网注入；永不下放下游真实 key）与**审计**；若安全团队的出口策略未实施，「防外发」降级为审计 + 告警，须管理层书面知情。
 >
 > 决策者原话：「防火墙那是安全团队的事情，不用我们管。」技术事实：Docker 容器默认经宿主机 NAT 出网且无任何限制；出口策略只能在网络层实施（宿主机 iptables/nftables、强制 egress 代理按域名白名单、或网络设备对容器所在网段做策略），平台业务代码实现不了。
 

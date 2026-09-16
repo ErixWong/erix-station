@@ -79,7 +79,9 @@ CREATE TABLE users (
   display_name  text NOT NULL DEFAULT '',
   role          text NOT NULL DEFAULT 'fde'
                 CHECK (role IN ('fde', 'admin')),  -- OIDC 后来自 group claim，不在 UI 手点（规格 §7.1）
-  fde_name      text UNIQUE,                       -- 容器名 fde-<name> 的 <name>、预览域名首段；未建容器时 NULL
+  fde_name      text UNIQUE
+                CHECK (fde_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+                -- 容器名 fde-<name> 的 <name>、预览域名首段（DNS 标签，≤63，规格 §8.5）；未建容器时 NULL
   auth_source   text NOT NULL DEFAULT 'local'
                 CHECK (auth_source IN ('local', 'oidc')),
   oidc_sub      text UNIQUE,                       -- OIDC subject；auth_source='oidc' 时必填（应用层校验）
@@ -164,7 +166,7 @@ CREATE TABLE projects (
   id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id    uuid NOT NULL REFERENCES users (id),
   name       text NOT NULL
-             CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,62}$'),  -- 同时是容器内目录名（portal.md §3.1）
+             CHECK (name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),  -- 同时是容器内目录名（portal.md §3.1）
   repo_url   text NOT NULL,
   root_path  text NOT NULL,                      -- ~/projects/<name>
   slot       int NOT NULL CHECK (slot >= 0),     -- 项目端口块序号：起始端口 4000 + slot*8（规格 §8.2）

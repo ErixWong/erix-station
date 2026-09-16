@@ -526,7 +526,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 
 | 项 | 口径 |
 |---|---|
-| 最小粒度 | **一 run 一条**（`source='erix'`）：worker 在 run 结束时以引擎返回值汇总，随终态载荷经 internal API 上报（portal.md §9 I8），**portal 落** `input_tokens / output_tokens`；`user_id / project_id` 由 `run → session → project` 推导后**冗余落列**（聚合免 join） |
+| 最小粒度 | **一 run 一条**（`source='erix'`）：worker 在 run 结束时以引擎返回值汇总，随终态载荷经 internal API 上报（portal.md §9.6 U2 / §9.9），**portal 落** `input_tokens / output_tokens`；`user_id / project_id` 由 `run → session → project` 推导后**冗余落列**（聚合免 join） |
 | `day` | UTC 日历日，写入时计算，聚合冗余维度（按日看板/限额） |
 | 双源对账 | 规格 §11.4「网关 usage 与 erix onUsage 两套数都要记」：网关侧按 `key_alias + day` 聚合周期拉取落 `source='gateway'` 行（`run_id` 为 NULL——每 FDE 一把 key 时网关只知道 key 不知道 run）；**差异 = judge/fold 的额外调用 + 丢失事件**，供对账看板 |
 | 成本归属 | 按 `project_id`（≈ 客户项目，规格 §11.3「业务口径：网关不知道 FDE→客户项目这层映射，portal 补」） |
@@ -545,7 +545,7 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | 3 | `run_queue` 表：pull 模型为终态，push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | 规格 §10.3 旧描述「单机可先 push」已不再作为默认 | §1.16（表先行落地，push 模式不启用） |
 | 4 | `port_allocations` `allocated → active` 触发条件 | ✅ 已定稿：首次 forward-auth 放行（幂等升级，重建不回落，规格 §8.6） | §2.2 |
 | 5 | 三表「不混」的 DB 角色分离（GRANT 强制） | ✅ 已落地：`station_platform`（DDL）/`station_portal`（DML）已入 schema.sql §0（幂等创建）+ schema.sql §10（最小 DML GRANT）；`bootstrap.sql` 作附加初始化（A6） | §3-4 |
-| 6 | 规格 §9.3「本地 file 优先 + DB 异步复制」store 装饰器 | 规格为「强烈建议」 | §1.11（影响 `checkpoint_failed` 频率，不影响表结构） |
+| ~~6~~ ✅ 已定稿（D2'）：纯 DB 无 file 副本，该建议作废（规格 §9.3 已改写） | 规格已改写 | §1.11（代价说明） |
 | 7 | `tool_outputs` 阈值（bytes） | 未定（建议如 4KB/8KB） | §1.19；决定「事件里放 digest、全文落表」的边界 |
 | 8 | `route_outbox` 聚合类型枚举（`port_allocation`/`llm_binding`/…） | 实现时定全量清单 | §1.18；reconciler debounce/SLO 已定（topology.md §8），枚举待补 |
 | 9 | `fde_networks` 复用前「腾行」的精确做法 | `DELETE` 已释放行 vs 保留并改 `subnet`；历史由 `audit_log` 承载 | §1.17（`UNIQUE(subnet)` 全局唯一所致） |

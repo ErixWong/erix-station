@@ -105,7 +105,7 @@ flowchart TB
 > 完整论据见 `topology.md`（§6 加固清单、§7 连通矩阵、§8 残余风险）；此处只列设计动机。
 
 - **出站受控（不是什么网都能上）**：FDE 容器虽有 shell，无法靠文件权限阻止他改配置——**唯一有效的保证是「网络到不了」**。出口白名单由安全团队在网络层实施；LLM 域名**不在**白名单 → 网关是唯一可达的 LLM 出口，改 endpoint/换 key 均无效
-- **LLM 调用无需容器持钥**：容器内**零 LLM 凭据**——config 里只有占位 key + `baseURL=llm.example.com`；真实虚拟 key 只存在于宿主 Traefik 动态配置（600，仅 portal 可写、Traefik 只读），请求过边缘时按**来源子网**判定身份后**覆盖注入** `Authorization`（容器自带的任何 key 均被覆盖）。安全价值：即使容器被完全攻破（含 root），也**拿不到任何 LLM 凭据**；且凭据永不落到容器磁盘/环境变量，无泄漏面可审计
+- **LLM 调用无需容器持钥**：容器内**零 LLM 凭据**——config 里只有占位 key + `endpoint=llm.example.com`；真实虚拟 key 只存在于宿主 Traefik 动态配置（600，仅 portal 可写、Traefik 只读），请求过边缘时按**来源子网**判定身份后**覆盖注入** `Authorization`（容器自带的任何 key 均被覆盖）。安全价值：即使容器被完全攻破（含 root），也**拿不到任何 LLM 凭据**；且凭据永不落到容器磁盘/环境变量，无泄漏面可审计
 - **FDE 之间互不可达（防失控）**：横向越权的根因是共享网络——原 `control` 共享网络因此被取消。每 FDE 独占 `/29`，跨 bridge 转发被 DOCKER-ISOLATION 丢弃，隔离零配置、无第二条路
 - **容器 → 宿主服务也要堵**：实测 FDE 容器经网关 IP 可达宿主 gitea/mssql/portainer——故用**分层防火墙**（INPUT 管宿主本地服务 + DOCKER-USER 管转发/publish），规则由 `fde_networks` 精确 CIDR 生成
 - **身份 = 网络位置**：internal API 与 LLM 链路都按来源子网判定（ipAllowList / ClientIP），凭据由 Traefik 覆盖注入——凭证偷不走、伪造头被 `aliasHeadersStrategy: delete` 与「不读 X-Forwarded-For」堵死
