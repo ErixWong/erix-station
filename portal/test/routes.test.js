@@ -22,6 +22,35 @@ test('deriveSourceRanges：从 fde_networks 精确 subnet 派生（/29 与 /28�
   assert.ok(!ranges.some((r) => r.endsWith('/16')));
 });
 
+test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowList 精确 subnet', () => {
+  const text = generateTraefikConfig({
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: ['10.200.1.0/29', '10.201.7.0/28'],
+  });
+  // internal 前缀 + Host(station) 双条件；priority 200 > portal 100
+  assert.ok(text.includes('Host(`station.localhost`) && PathPrefix(`/api/internal`)'));
+  assert.match(text, /    internal:\n      entryPoints: \[web\]\n      rule: "Host\(`station\.localhost`\) && PathPrefix\(`\/api\/internal`\)"\n      priority: 200/);
+  // portal 路由 priority 100 < internal 200
+  assert.match(text, /    portal:\n      entryPoints: \[web\]\n      rule: "Host\(`station\.localhost`\)"\n      priority: 100/);
+  // ipAllowList 精确 /29 与 /28，不含 /16 池
+  assert.match(text, /sourceRange: \["10\.200\.1\.0\/29", "10\.201\.7\.0\/28"\]/);
+  assert.ok(!text.includes('10.200.0.0/16'));
+  assert.ok(!text.includes('10.201.0.0/16'));
+  // internal 挂 internal-allow 中间件（ipAllowList），无 forwardAuth
+  assert.ok(text.includes('middlewares: [internal-allow]'));
+  assert.ok(!/    internal:\n(?:.*\n)*?forwardAuth:/.test(text));
+});
+
+test('deriveSourceRanges：非 FDE 网段（backend 等）不在 allowlist（只取传入的 fde_networks 行）', () => {
+  // deriveSourceRanges 只投影 fde_networks 行；backend 子网不进入（由 readRouteDesiredState 从 fde_networks 表过滤）。
+  const ranges = deriveSourceRanges([{ subnet: '10.200.1.0/29' }]);
+  assert.deepEqual(ranges, ['10.200.1.0/29']);
+  assert.ok(!ranges.includes('172.32.0.0/24'));
+});
+
 test('filterCurrentHead：revision==head 发布；revision<head 晚到旧事件/旧 tombstone 丢弃', () => {
   const rows = [
     { aggregate: 'port_allocation', aggregate_id: 'a1', revision: 1, op: 'upsert' },

@@ -12,6 +12,7 @@ import * as auth from './auth.js';
 import * as migrate from './migrate.js';
 import * as projects from './projects.js';
 import * as preview from './preview.js';
+import * as internal from './internal.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -202,6 +203,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof internal.InternalError) {
+        sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -243,6 +248,11 @@ async function routeApi(req, res, ctx, url) {
     res.writeHead(307, { Location: '/api/auth/logout' });
     res.end();
     return;
+  }
+
+  // 容器 → portal 全出站通道（per-container token 鉴权，不经 forwardAuth，portal.md §9）。
+  if (pathname.startsWith('/api/internal/')) {
+    return handleInternal(req, res, ctx, url);
   }
 
   if (req.method === 'POST' && pathname === '/api/auth/login') {
@@ -613,6 +623,172 @@ async function handleDeleteProject(req, res, ctx, projectId) {
   await projects.deleteProject(ctx.pool, { userId: session.user.id, projectId });
   res.writeHead(204);
   res.end();
+}
+
+// ---------------------------------------------------------------------------
+// internal 端点（portal.md §9）：容器 → portal 全出站通道。Bearer token 鉴权 + X-Claim-Token 租约凭证。
+// ---------------------------------------------------------------------------
+
+const INTERNAL_EVENTS_LIMIT = 320 * 1024; // 事件批 256KB 载荷 + 信封冗余
+const INTERNAL_ROUND_LIMIT = 1.5 * 1024 * 1024; // transcript round 1MB + 信封冗余
+const INTERNAL_CHECKPOINT_LIMIT = 2 * 1024 * 1024; // checkpoint snapshot 可较大
+
+function bearerToken(req) {
+  const header = req.headers.authorization || '';
+  const m = /^Bearer\s+(.+)$/i.exec(header);
+  return m ? m[1].trim() : '';
+}
+
+function claimTokenHeader(req) {
+  return (req.headers['x-claim-token'] || '').trim();
+}
+
+async function handleInternal(req, res, ctx, url) {
+  const { pathname } = url;
+  const identity = await internal.authenticateContainer(ctx.pool, bearerToken(req));
+  const { container, user } = identity;
+
+  // SSE 下行通道（§9.12）
+  if (pathname === '/api/internal/stream') {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    return handleInternalStream(req, res, ctx, identity);
+  }
+
+  // U1 claim（长轮询，§9.3）
+  if (pathname === '/api/internal/claim') {
+    if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const capacity = body.capacity ?? 1;
+    const holdMs = body.hold_ms ?? 30000;
+    const ticket = await internal.claimRun(ctx.pool, { container, user, capacity, holdMs });
+    if (!ticket) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    return sendJson(res, 200, ticket);
+  }
+
+  // U4 heartbeat（§9.5）
+  if (pathname === '/api/internal/heartbeat') {
+    if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const result = await internal.heartbeat(ctx.pool, { container, user, body });
+    return sendJson(res, 200, result);
+  }
+
+  // U11 approval 结果轮询兜底（§9.10）
+  const approvalMatch = pathname.match(/^\/api\/internal\/approvals\/([^/]+)$/);
+  if (approvalMatch) {
+    if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    const approvalId = decodeURIComponent(approvalMatch[1]);
+    const result = await internal.getApproval(ctx.pool, { container, user, approvalId, claimToken: claimTokenHeader(req) });
+    return sendJson(res, 200, result);
+  }
+
+  // runs/:id/*
+  const runMatch = pathname.match(/^\/api\/internal\/runs\/([^/]+)(\/.*)?$/);
+  if (runMatch) {
+    const runId = decodeURIComponent(runMatch[1]);
+    const sub = runMatch[2] || '';
+    const claimToken = claimTokenHeader(req);
+
+    if (sub === '/state') {
+      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await internal.setRunState(ctx.pool, { container, user, runId, claimToken, body });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/events') {
+      if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, INTERNAL_EVENTS_LIMIT);
+      const result = await internal.postEvents(ctx.pool, { container, user, runId, claimToken, body });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/release') {
+      if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await internal.releaseRun(ctx.pool, { container, user, runId, claimToken, body });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/checkpoint') {
+      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
+      const result = await internal.putCheckpoint(ctx.pool, { container, user, runId, claimToken, body });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/checkpoint/latest') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const result = await internal.getLatestCheckpoint(ctx.pool, { container, user, runId, claimToken });
+      if (result === null) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/transcript') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const limit = Number(url.searchParams.get('limit') || 10000);
+      const cursor = url.searchParams.get('cursor') ? Number(url.searchParams.get('cursor')) : null;
+      const result = await internal.getTranscript(ctx.pool, { container, user, runId, claimToken, limit, cursor });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/transcript/recall') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const fromRound = Number(url.searchParams.get('from_round') ?? 0);
+      const toRoundRaw = url.searchParams.get('to_round');
+      const toRound = toRoundRaw === null ? null : Number(toRoundRaw);
+      const pattern = url.searchParams.get('pattern') ?? '';
+      const result = await internal.recallTranscript(ctx.pool, { container, user, runId, claimToken, fromRound, toRound, pattern });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/approvals') {
+      if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await internal.createApproval(ctx.pool, { container, user, runId, claimToken, body });
+      return sendJson(res, result.status, { approval_id: result.approval_id });
+    }
+
+    const roundMatch = sub.match(/^\/transcript\/rounds\/(\d+)$/);
+    if (roundMatch) {
+      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, INTERNAL_ROUND_LIMIT);
+      const round = Number(roundMatch[1]);
+      const result = await internal.putRound(ctx.pool, { container, user, runId, round, claimToken, body });
+      return sendJson(res, 200, result);
+    }
+  }
+
+  return sendJson(res, 404, errorBody('not_found', 'not found'));
+}
+
+/** SSE 下行：注册到 hub，15s 保活，断开时注销（§9.12）。 */
+function handleInternalStream(req, res, ctx, identity) {
+  const { container, user } = identity;
+  internal.registerSseClient(container.id, user.id, res);
+  res.writeHead(200, internal.sseHeaders());
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  internal.writeSseComment(res, 'connected');
+  internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
+  const pingTimer = setInterval(() => {
+    internal.writeSseComment(res, 'ping');
+    internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
+  }, 15000);
+  const cleanup = () => {
+    clearInterval(pingTimer);
+    internal.unregisterSseClient(container.id, res);
+  };
+  req.on('close', cleanup);
+  res.on('close', cleanup);
 }
 
 async function serveStatic(req, res, ctx, url) {

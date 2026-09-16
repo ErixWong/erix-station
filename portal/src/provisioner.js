@@ -16,6 +16,7 @@ import crypto from 'node:crypto';
 import { ensureDirSafe } from './fsutil.js';
 import { parseCidr, intToIp, allocateNetwork } from './ipam.js';
 import { hashToken } from './auth.js';
+import { enqueueRouteChange } from './outbox.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -648,11 +649,23 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     }
 
     await pool.query(`UPDATE containers SET status = 'removed', updated_at = now() WHERE user_id = $1 AND status <> 'removed'`, [u.id]);
-    await pool.query(
-      `UPDATE fde_networks SET state = 'released', released_at = now()
-        WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
-      [u.id],
-    );
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE fde_networks SET state = 'released', released_at = now()
+          WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
+        [u.id],
+      );
+      // FDE 网络释放 → 触发路由 reconciler 重生成（internal ipAllowList / llm 路由收敛）。
+      await enqueueRouteChange(client, { aggregate: 'fde_network', aggregateId: u.id, op: 'delete', payload: { network_name: networkName } });
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
     return { userId: u.id, containerName, networkName };
   });
 }

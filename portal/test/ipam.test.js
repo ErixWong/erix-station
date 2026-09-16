@@ -105,6 +105,12 @@ function makeIpamClient(rows) {
         this.state.push(r);
         return { rows: [{ ...r }] };
       }
+      if (sql.includes('INSERT INTO route_revisions')) {
+        return { rows: [{ revision: 1 }] };
+      }
+      if (sql.includes('INSERT INTO route_outbox')) {
+        return { rows: [] };
+      }
       return { rows: [] };
     },
   };

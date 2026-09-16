@@ -4,6 +4,7 @@
 // 依据：docs/design/topology.md §3/§5.1、docs/data/schema.sql §9（fde_networks）、docs/env.md §5.2。
 
 import crypto from 'node:crypto';
+import { enqueueRouteChange } from './outbox.js';
 
 // 全局 IPAM 锁：串行化「查空闲块 → 插行」，避免并发分配到同一 subnet（fde_networks.subnet UNIQUE 兜底）。
 const IPAM_LOCK_KEY = 74452312;
@@ -140,6 +141,7 @@ export async function allocateNetworkInTx(client, userId, fdeName, opts = {}) {
       [userId, networkName, cand.subnet, cand.prefixLen, cand.gateway, poolName],
     );
     log.log?.(`[ipam] reallocated ${cand.subnet} (${networkName}) for fde=${fdeName}`);
+    await enqueueRouteChange(client, { aggregate: 'fde_network', aggregateId: userId, op: 'upsert', payload: { subnet: cand.subnet, network_name: networkName } });
     return row.rows[0];
   }
 
@@ -150,6 +152,7 @@ export async function allocateNetworkInTx(client, userId, fdeName, opts = {}) {
     [userId, networkName, cand.subnet, cand.prefixLen, cand.gateway, poolName],
   );
   log.log?.(`[ipam] allocated ${cand.subnet} (${networkName}) for fde=${fdeName}`);
+  await enqueueRouteChange(client, { aggregate: 'fde_network', aggregateId: userId, op: 'upsert', payload: { subnet: cand.subnet, network_name: networkName } });
   return row.rows[0];
 }
 
