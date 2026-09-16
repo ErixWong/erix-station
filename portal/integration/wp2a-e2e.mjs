@@ -36,6 +36,15 @@ function dockerStdin(args, input) {
   });
 }
 
+// M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
+// 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
+const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
+function removeDbDir() {
+  const parent = path.posix.dirname(DB_DIR);
+  const name = path.posix.basename(DB_DIR);
+  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
+}
+
 function compose(args, env = {}) {
   return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
     encoding: 'utf8',
@@ -172,15 +181,15 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     // 工作区/动态目录由 materializer/reconciler 以 root 写文件，但目录属主仍为 eric → 直接删。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-    // /docker/station-db 被 postgres 容器 chown 到 999 → 用临时 root 容器删（env §8.1 只读会话无法直接删）。
-    safe(() => docker('run --rm -v /docker:/docker alpine rm -rf /docker/station-db'));
+    // DB 数据目录被 postgres 容器 chown 到 999 → 用临时 root 容器删（env §8.1 只读会话无法直接删）。
+    removeDbDir();
   };
   t.after(cleanup);
 
   try {
     // 0) 预清理：确保干净起点（前次残留）。
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('run --rm -v /docker:/docker alpine rm -rf /docker/station-db'));
+    removeDbDir();
 
     // 1) 起栈
     compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot });

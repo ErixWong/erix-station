@@ -32,7 +32,7 @@ services:
       - SETGID
       - SETUID
     volumes:
-      - /docker/station-db/:/var/lib/postgresql/data
+      - ${STATION_DB_DIR:-/docker/station-db}/:/var/lib/postgresql/data
       # 首次初始化（空数据目录时执行一次）：建角色 + 设口令 + baseline + bootstrap + ownership 归正。
       # 角色口令经 600 权限的 deploy/.env 注入（deploy-contract §2.4），不进镜像/仓库。
       - ./db-init/00-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro

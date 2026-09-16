@@ -35,6 +35,7 @@ const CFG = {
   workerUid: Number(process.env.FDE_WORKER_UID || process.env.ERIX_WORKER_UID || 1002),
   workerGid: Number(process.env.FDE_WORKER_GID || process.env.ERIX_WORKER_GID || 1000),
   capacity: Number(process.env.ERIX_AGENTD_CAPACITY || 1),
+  hbOkPath: process.env.ERIX_HB_OK_PATH || '/run/station/hb-ok',
   heartbeatMs: Number(process.env.ERIX_HEARTBEAT_MS || 15000),
   batchWindowMs: Number(process.env.ERIX_BATCH_WINDOW_MS || 250),
   batchBytes: Number(process.env.ERIX_BATCH_BYTES || 2048),
@@ -88,6 +89,10 @@ function makeRunCtx(runId) {
     finishing: false,
     // 已被租约/停止裁决，丢弃后续写
     dropped: false,
+    // F6：最后一次 IPC 活动（watchdog 用）；M3：worktree 清理路径
+    lastIpcAt: Date.now(),
+    worktreePath: null,
+    projectDir: null,
   };
 }
 
@@ -286,6 +291,12 @@ async function claimOnce() {
   });
 }
 
+// M5：心跳成功 → 刷新健康标记文件 mtime（healthcheck.sh 检查 180s 内新鲜度）。
+// 放 agentd 侧（进程内）而非 cron：与心跳节奏一致，失败不影响心跳主流程。
+function touchHbOk() {
+  try { fs.utimesSync(CFG.hbOkPath, new Date(), new Date()); } catch {}
+}
+
 // ---------------------------------------------------------------------------
 // 心跳（§4.2 U4）
 // ---------------------------------------------------------------------------
@@ -419,6 +430,14 @@ async function flushEvents(ctx) {
   let batchBytes = 0;
   while (ctx.events.length > 0 && batch.length < BATCH_EVENTS_MAX) {
     const evSize = Buffer.byteLength(JSON.stringify(ctx.events[0]), 'utf8');
+    // F7：单事件超批上限 → 丢弃 + 告警，不毒化整个队列（portal 400 非可重试 → 原实现会无限重试风暴）。
+    if (evSize > BATCH_BYTES_MAX) {
+      const ev = ctx.events.shift();
+      ctx.eventBytes = Math.max(0, ctx.eventBytes - evSize);
+      log('warn', 'event exceeds batch byte limit, dropped', {
+        run_id: ctx.runId, bytes: evSize, limit: BATCH_BYTES_MAX, type: ev?.type });
+      continue;
+    }
     if (batch.length > 0 && batchBytes + evSize > BATCH_BYTES_MAX) break;
     const ev = ctx.events.shift();
     batch.push(ev);
@@ -454,6 +473,12 @@ async function flushEvents(ctx) {
 function enqueueEvent(ctx, ev) {
   if (ctx.dropped) return;
   ctx.events.push(ev);
+  // F7：待发事件总量设上限（env ERIX_MAX_PENDING_EVENTS，默认 20000），防止队列无界增长。
+  if (ctx.events.length > CFG.maxPendingEvents) {
+    const ev2 = ctx.events.shift();
+    ctx.eventBytes = Math.max(0, ctx.eventBytes - Buffer.byteLength(JSON.stringify(ev2), 'utf8'));
+    log('warn', 'pending event queue overflow, oldest dropped', { run_id: ctx.runId, pending: ctx.events.length });
+  }
   ctx.eventBytes += Buffer.byteLength(JSON.stringify(ev), 'utf8');
   if (ctx.eventBytes >= CFG.batchBytes || ctx.events.length >= BATCH_EVENTS_MAX) {
     if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
@@ -497,16 +522,21 @@ async function finishRun(ctx, payload) {
 // ---------------------------------------------------------------------------
 // abort（§6.4/§6.5）：SIGTERM worker，标记丢弃
 // ---------------------------------------------------------------------------
+// M2：杀整个进程组（worker 以 detached fork 创建，负 pid = 组）；回退单 pid。
+function killProcessGroup(pid, sig) {
+  try { process.kill(-pid, sig); return; } catch {}
+  try { process.kill(pid, sig); } catch {}
+}
+
 function abortRun(ctx, reason) {
   if (ctx.dropped) return;
   ctx.dropped = true;
   if (ctx.worker && ctx.worker.connected) {
     sendIpc(ctx.worker, { type: MSG.ABORT, run_id: ctx.runId, reason });
-    // 5s 宽限后 SIGKILL（§2.4）
+    // 5s 宽限后 SIGKILL（§2.4）；M2：按进程组杀，防孑遗子进程
+    const pid = ctx.workerPid;
     setTimeout(() => {
-      if (ctx.worker && ctx.worker.exitCode === null && ctx.worker.signalCode === null) {
-        try { ctx.worker.kill('SIGKILL'); } catch {}
-      }
+      if (pid) killProcessGroup(pid, 'SIGKILL');
     }, 5000);
   }
   log('info', 'abort run', { run_id: ctx.runId, reason });
@@ -525,12 +555,14 @@ function spawnWorker(ctx, runStart) {
   const child = fork(WORKER_PATH, [], {
     uid: CFG.workerUid,
     gid: CFG.workerGid,
+    detached: true, // M2：独立进程组，watchdog/abort 可整组杀
     env: childEnv,
     cwd: runStart.cwd,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   ctx.worker = child;
   ctx.workerPid = child.pid ?? null;
+  ctx.lastIpcAt = Date.now();
 
   child.stdout?.on('data', (d) => process.stdout.write(`[worker ${ctx.runId.slice(0, 8)}] ${d}`));
   child.stderr?.on('data', (d) => process.stderr.write(`[worker ${ctx.runId.slice(0, 8)}] ${d}`));
@@ -542,6 +574,7 @@ function spawnWorker(ctx, runStart) {
 
 function onWorkerMessage(ctx, runStart, msg) {
   if (!msg || typeof msg !== 'object') return;
+  ctx.lastIpcAt = Date.now(); // F6：任意 IPC 消息都算 worker 活着
   switch (msg.type) {
     case MSG.WORKER_READY:
       sendIpc(ctx.worker, { type: MSG.RUN_START, ...runStart });
@@ -636,10 +669,38 @@ async function onWorkerFinished(ctx, msg) {
 function cleanupRun(ctx) {
   if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
   if (ctx.worker) {
+    const pid = ctx.workerPid;
     try { if (ctx.worker.connected) ctx.worker.kill('SIGTERM'); } catch {}
+    if (pid) {
+      // M2：SIGTERM 后短宽限整组 SIGKILL，防 worker 忽略信号残留
+      setTimeout(() => killProcessGroup(pid, 'SIGKILL'), 2000);
+    }
   }
+  cleanupWorktree(ctx); // M3
   state.runs.delete(ctx.runId);
   log('info', 'run cleaned up', { run_id: ctx.runId });
+}
+
+// M3：清理 run 的 worktree——真实 git worktree 用 `git worktree remove --force`；
+// 兑底目录（mkdir fallback）直接 rmSync；之后 prune 残留元数据。best-effort。
+function cleanupWorktree(ctx) {
+  const wt = ctx.worktreePath;
+  if (!wt) return;
+  const projectDir = ctx.projectDir;
+  if (projectDir && fs.existsSync(path.join(projectDir, '.git')) && fs.existsSync(wt)) {
+    try {
+      execFileSync('git', ['worktree', 'remove', '--force', wt], {
+        cwd: projectDir, stdio: ['ignore', 'ignore', 'ignore'], timeout: 10000,
+      });
+      return;
+    } catch {}
+  }
+  try {
+    if (fs.existsSync(wt)) fs.rmSync(wt, { recursive: true, force: true });
+  } catch {}
+  if (projectDir) {
+    try { execFileSync('git', ['worktree', 'prune'], { cwd: projectDir, stdio: ['ignore', 'ignore', 'ignore'], timeout: 10000 }); } catch {}
+  }
 }
 
 async function releaseAndRequeue(ctx, reason) {
@@ -676,6 +737,9 @@ async function handleTicket(ticket) {
     await releaseAndRequeue(ctx, 'worktree_failed');
     return;
   }
+  // M3：记录清理所需路径
+  ctx.worktreePath = cwd;
+  ctx.projectDir = path.join(CFG.home, 'projects', run.project?.name ?? 'default');
 
   // 先 PUT running（§6.1：准备就绪后）。worker 内部 runToolLoop 也会 markRunState('running')，幂等。
   try {
@@ -746,8 +810,21 @@ async function heartbeatLoop() {
   for (;;) {
     if (state.shutdown) return;
     await sleep(CFG.heartbeatMs);
+    // F6：watchdog——worker 长时间无任何 IPC（SIGSTOP/死循环/管道卡死）→ SIGKILL 整组，
+    // exit 路径会 releaseAndRequeue（attempt+1、resume）。阈值远大于正常 LLM 等待。
+    const now = Date.now();
+    for (const ctx of state.runs.values()) {
+      if (!ctx.worker || ctx.finishing) continue;
+      const silentMs = now - ctx.lastIpcAt;
+      if (silentMs > CFG.watchdogMs) {
+        log('warn', 'watchdog: worker silent, killing', {
+          run_id: ctx.runId, silent_ms: silentMs, threshold_ms: CFG.watchdogMs });
+        if (ctx.workerPid) killProcessGroup(ctx.workerPid, 'SIGKILL');
+      }
+    }
     try {
       const data = await heartbeatOnce();
+      touchHbOk(); // M5：心跳成功 → 刷新健康标记（healthcheck.sh 读 mtime）
       if (data?.revoked) {
         state.revokeReason = 'revoked';
         log('warn', 'heartbeat revoked', {});

@@ -364,9 +364,15 @@ test('F4：U2 finish 同载荷重放幂等（200），载荷不同 409 run_termi
   assert.equal(r2.state, 'finished');
   assert.equal(r2.idempotent, true);
 
-  // 载荷不同 → 409 run_terminal。
+  // 载荷不同（usage）→ 409 run_terminal。
   await assert.rejects(
     () => setRunState(pool, { container, user, runId, claimToken, body: { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 9, output_tokens: 2 }, rounds: 1 } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'run_terminal',
+  );
+
+  // M4：载荷不同（final_text）→ 同样 409（final_text 落 messages，幂等比对必须含它）。
+  await assert.rejects(
+    () => setRunState(pool, { container, user, runId, claimToken, body: { ...payload, final_text: 'different' } }),
     (e) => e instanceof InternalError && e.status === 409 && e.code === 'run_terminal',
   );
 });

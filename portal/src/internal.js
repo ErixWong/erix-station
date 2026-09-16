@@ -371,7 +371,7 @@ export async function setRunState(pool, { container, user, runId, claimToken, bo
   const run = await fetchRun(pool, runId, user.id);
   if (isTerminal(run.status)) {
     // F4：终态幂等重放——相同终态载荷返回 200（响应丢失后重试安全）；载荷不同才 409 run_terminal。
-    if (state === run.status && terminalPayloadMatches(run, body)) {
+    if (state === run.status && (await terminalPayloadMatches(pool, run, body))) {
       return { state: run.status, idempotent: true };
     }
     throw new InternalError(409, 'run_terminal', 'run already terminal');
@@ -403,8 +403,8 @@ export async function setRunState(pool, { container, user, runId, claimToken, bo
   return finishRun(pool, { user, run, runId, claimToken, state, body });
 }
 
-/** F4：终态载荷一致判定（同 termination/error/rounds/usage → 幂等成功）。 */
-function terminalPayloadMatches(run, body) {
+/** F4：终态载荷一致判定（同 termination/error/rounds/usage/final_text → 幂等成功）。 */
+async function terminalPayloadMatches(pool, run, body) {
   const stored = {
     termination: run.termination ?? null,
     error: run.error ?? null,
@@ -417,6 +417,16 @@ function terminalPayloadMatches(run, body) {
     rounds: body?.rounds ?? 0,
     usage: body?.usage ?? { input_tokens: 0, output_tokens: 0 },
   };
+  // M4：final_text 落在 messages（assistant、synthetic=false）而非 runs 行——
+  // 幂等重放需一并比对，否则不同 final_text 的重放会被误判为幂等成功。
+  const msg = await pool.query(
+    `SELECT content FROM messages
+      WHERE run_id = $1 AND role = 'assistant' AND synthetic = false
+      ORDER BY seq DESC LIMIT 1`,
+    [run.id],
+  );
+  stored.final_text = msg.rows?.[0]?.content ?? '';
+  incoming.final_text = typeof body?.final_text === 'string' ? body.final_text : '';
   return canonicalHash(stored) === canonicalHash(incoming);
 }
 
