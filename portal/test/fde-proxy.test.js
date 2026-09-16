@@ -99,7 +99,7 @@ test('P1 顶层字段 allowlist：未知字段 / WorkingDir / ExposedPorts / Net
   assert.deepEqual(validateCreateBody(okBody({ Entrypoint: ['/bin/sh'] }), CFG), []);
 });
 
-test('P1 HostConfig 字段 allowlist：Mounts/Devices/VolumesFrom/Privileged/PortBindings/PublishMode/Links/ExtraHosts 全 403', () => {
+test('P1 HostConfig 字段 allowlist：Mounts/Devices/VolumesFrom/Privileged/PortBindings/PublishMode/Links 全 403', () => {
   const forbidden = {
     Mounts: [{ Type: 'bind', Source: '/var/run/docker.sock', Target: '/var/run/docker.sock' }],
     Devices: [{ PathOnHost: '/dev/sda', PathInContainer: '/dev/sda', CgroupPermissions: 'rwm' }],
@@ -108,13 +108,27 @@ test('P1 HostConfig 字段 allowlist：Mounts/Devices/VolumesFrom/Privileged/Por
     PortBindings: {},
     PublishMode: 'host',
     Links: ['db'],
-    ExtraHosts: ['station.localhost:10.200.1.1'],
   };
   for (const [key, val] of Object.entries(forbidden)) {
     const body = okBody({ HostConfig: { ...okBody().HostConfig, [key]: val } });
     const reasons = validateCreateBody(body, CFG);
     assert.ok(reasons.some((r) => r.includes(`HostConfig field not allowed: ${key}`)), `${key} 应被拒`);
   }
+});
+
+test('ExtraHosts（--add-host）：合法 host:ipv4 允许，非法形态/超限 403', () => {
+  // 契约 §6.2：容器内 station.<base>/llm.<base> → 本 FDE bridge 网关（合法）。
+  const ok = okBody({ HostConfig: { ...okBody().HostConfig, ExtraHosts: ['station.localhost:10.200.1.1', 'llm.localhost:10.200.1.1'] } });
+  assert.deepEqual(validateCreateBody(ok, CFG), []);
+
+  const badForm = okBody({ HostConfig: { ...okBody().HostConfig, ExtraHosts: ['station.localhost'] } });
+  assert.ok(validateCreateBody(badForm, CFG).some((r) => r.includes('ExtraHosts')));
+
+  const badIp = okBody({ HostConfig: { ...okBody().HostConfig, ExtraHosts: ['station.localhost:999.1.1.1'] } });
+  assert.ok(validateCreateBody(badIp, CFG).some((r) => r.includes('ExtraHosts')));
+
+  const tooMany = okBody({ HostConfig: { ...okBody().HostConfig, ExtraHosts: ['a:1.1.1.1', 'b:1.1.1.1', 'c:1.1.1.1', 'd:1.1.1.1', 'e:1.1.1.1'] } });
+  assert.ok(validateCreateBody(tooMany, CFG).some((r) => r.includes('ExtraHosts')));
 });
 
 test('P1 值校验：CapAdd=SYS_ADMIN / NetworkMode=bridge / CapDrop 多值 / SecurityOpt 多值 / Memory 超限 全 403', () => {

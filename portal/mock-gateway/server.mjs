@@ -5,6 +5,9 @@
 import http from 'node:http';
 
 const PORT = Number(process.env.PORT || 4000);
+// 可选人为延迟（ms）：让 mock 完成请求变慢，供 e2e 真机崩溃恢复在 run 进行中重启容器（默认 0 无延迟）。
+const LATENCY_MS = Math.max(0, Number(process.env.MOCK_LATENCY_MS || 0));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // P1 虚拟 key 形态：接受 erix-placeholder / erix-mock / erix-<任意> 形态，拒绝其它（fde-platform §11.3）。
 const VIRTUAL_KEY_RE = /^erix-[a-z0-9_-]+$/i;
 
@@ -95,7 +98,8 @@ function handleChat(req, res) {
   }
 
   readJson(req)
-    .then((body) => {
+    .then(async (body) => {
+      if (LATENCY_MS > 0) await sleep(LATENCY_MS);
       const model = body.model || 'mock-model';
       const id = `chatcmpl-mock-${Date.now().toString(36)}`;
       const content = mockContent(extractUserContent(body));

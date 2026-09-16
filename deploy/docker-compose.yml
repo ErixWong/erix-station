@@ -32,7 +32,7 @@ services:
       - SETGID
       - SETUID
     volumes:
-      - /docker/station-db/:/var/lib/postgresql/data
+      - ${STATION_DB_DIR:-/docker/station-db}/:/var/lib/postgresql/data
       # 首次初始化（空数据目录时执行一次）：建角色 + 设口令 + baseline + bootstrap + ownership 归正。
       # 角色口令经 600 权限的 deploy/.env 注入（deploy-contract §2.4），不进镜像/仓库。
       - ./db-init/00-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
@@ -69,6 +69,10 @@ services:
       - no-new-privileges
     cap_drop:
       - ALL
+    # 运行身份：uid 0（root）以 owner 权限读/写 docker.sock（host 上 root:docker 660）；gid 1000（erix 组）
+    # 以 group 权限穿越 2770 用户空间目录——cap_drop ALL 下 root 无 DAC_OVERRIDE，只能靠组权限做
+    # realpath 校验 bind source（防 symlink 逃逸），否则 2770 目录（other=---）会 EACCES。
+    user: "0:1000"
     tmpfs:
       - /tmp
     volumes:
@@ -153,8 +157,14 @@ services:
       PORTAL_HOST: station.${BASE_DOMAIN:-localhost}
       PORTAL_BACKEND_URL: http://127.0.0.1:${PORTAL_HOST_PORT:-18080}
       TRAEFIK_ENTRYPOINT: web
+      # 容器经 Traefik 访问 portal/LLM 的公共入口 base URL（scheme://host[:port]）。dev http+高端口 / prod https+443。
+      # 由 ERIX_STATION_BASE_URL（agentd）与 config.json endpoint（worker provider）使用。
+      TRAEFIK_WEB_PORT: ${TRAEFIK_WEB_PORT:-8090}
+      TRAEFIK_WEBSECURE_PORT: ${TRAEFIK_WEBSECURE_PORT:-8443}
+      PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
+      LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}
-      # LLM 网关数据面回环地址（P1 mock/占位，真实网关 P2+ 接入；topology §4-L7）。
+      # LLM 网关数据面回环地址（P1 mock/占位，真实网关 P3 接入；topology §4-L7）。
       LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4000}
       PORT_QUOTA: ${PORT_QUOTA:-40}
       FDE_POOL: ${FDE_POOL:-default}
@@ -165,8 +175,9 @@ services:
       FDE_IMAGE: ${FDE_IMAGE:-traefik/whoami}
       # F12/F14：FDE_DEV_MODE=1 显式开发模式（默认未设即开发）；生产设 0 或 NODE_ENV=production
       FDE_DEV_MODE: ${FDE_DEV_MODE:-1}
-      # F5：开发期 whoami 镜像不满足「root 启动→drop 1001」契约时的 --user 兜底（⚠️ dev 偏差）；生产留空由镜像 entrypoint 降权
-      FDE_DEV_USER: ${FDE_DEV_USER:-1001:1000}
+      # F5：开发期 whoami 镜像不满足「root 启动→drop 1001」契约时的 --user 兜底（⚠️ dev 偏差）；生产留空由镜像 entrypoint 降权。
+      # 用单斜线默认（`-` 非 `:-`）：显式空值（真实 runner 镜像不用 --user）不会被默认值覆盖。
+      FDE_DEV_USER: ${FDE_DEV_USER-1001:1000}
       FDE_CMD: ${FDE_CMD:-["-port","4000"]}
       FDE_AGENT_VERSION: ${FDE_AGENT_VERSION:-dev}
       FDE_MEMORY_LIMIT: ${FDE_MEMORY_LIMIT:-512m}
@@ -205,6 +216,9 @@ services:
       - ALL
     tmpfs:
       - /tmp
+    environment:
+      # 可选人为延迟（ms）：e2e 崩溃恢复需要 run 进行中重启容器，用延迟让 run 保持 running。默认 0。
+      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-0}
     ports:
       # 仅回环发布（topology §4-L7 / env §5）；LLM 网关数据面 admin 面不发布
       - "127.0.0.1:${LLM_GATEWAY_PORT:-4000}:4000"
