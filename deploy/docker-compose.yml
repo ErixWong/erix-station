@@ -188,6 +188,33 @@ services:
       retries: 5
       start_period: 30s
 
+  # P1 mock LLM 网关（dev-only，零真实凭据，deploy-contract §7.3）：OpenAI-compatible
+  # /v1/chat/completions（流式/非流式）。数据面 publish 仅宿主回环 127.0.0.1:4000，供 Traefik
+  # `llm.<base>` 路由回环访问（topology §4-L7）；P3 由真实 LLM 网关（LiteLLM）替换。
+  station-mock-llm:
+    container_name: station-mock-llm
+    build:
+      context: ../portal/mock-gateway
+      dockerfile: Dockerfile
+    image: erix-station/mock-llm:local
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    ports:
+      # 仅回环发布（topology §4-L7 / env §5）；LLM 网关数据面 admin 面不发布
+      - "127.0.0.1:${LLM_GATEWAY_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   station-edge:
     container_name: station-edge
     image: ${TRAEFIK_IMAGE:-traefik:v3.7.13}

@@ -4,11 +4,13 @@ api: false
 
 entryPoints:
   web:
-    address: "127.0.0.1:8090"
+    # WP3a：web 入口需对 FDE 容器可达（容器经自身 bridge 网关 IP → 宿主 → Traefik，topology §4-L3/L7），
+    # 故开发期绑定 0.0.0.0（127.0.0.1 对容器不可达）。生产入口为 80（对外）与 FDE 白名单网关路径。
+    address: ":8090"
     http:
       aliasHeadersStrategy: delete
   websecure:
-    address: "127.0.0.1:8443"
+    address: ":8443"
     http:
       aliasHeadersStrategy: delete
 
