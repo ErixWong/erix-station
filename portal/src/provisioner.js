@@ -17,6 +17,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { parseCidr, intToIp, allocateNetwork } from './ipam.js';
 import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
+import { broadcastRevoke } from './internal.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -633,6 +634,8 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     const user = await pool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
     const u = user.rows[0];
     if (!u) throw new Error(`no user with fde_name=${fdeName}`);
+    const containerRow = await pool.query(`SELECT id FROM containers WHERE user_id = $1`, [u.id]);
+    const containerId = containerRow.rows[0]?.id ?? null;
 
     const containerName = `fde-${fdeName}`;
     const networkName = `fde-${fdeName}`;
@@ -649,6 +652,8 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     }
 
     await pool.query(`UPDATE containers SET status = 'removed', updated_at = now() WHERE user_id = $1 AND status <> 'removed'`, [u.id]);
+    // F7：offboarding 吊销 token → 主动关闭该容器已建立的 SSE 连接（agentd 收到 revoke 即退出）。
+    if (containerId) broadcastRevoke(containerId, { reason: 'offboarded' });
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
