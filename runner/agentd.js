@@ -40,6 +40,10 @@ const CFG = {
   batchBytes: Number(process.env.ERIX_BATCH_BYTES || 2048),
   maxEventsPerBatch: 200,
   maxBatchBytes: 256 * 1024,
+  // F6：worker 无响应 watchdog——超过此时间无任何 IPC 消息（事件/store/log）→ SIGKILL worker + release requeue。
+  // 默认 5min：runToolLoop 在 LLM 流式等待期间也可能长时间无 IPC，阈值必须远大于正常模型等待；env 可调。
+  watchdogMs: Number(process.env.ERIX_AGENTD_WATCHDOG_MS || 300000),
+  maxPendingEvents: Number(process.env.ERIX_MAX_PENDING_EVENTS || 20000),
 };
 
 // 批处理单批上限（§7.2）。
@@ -256,6 +260,11 @@ function handleSseChunk(raw) {
   if (event === 'revoke') {
     state.revokeReason = payload?.reason ?? 'revoked';
     log('warn', 'revoke received', { reason: state.revokeReason });
+    // F5：revoke → abort 全部运行中 run（worker 收敛），否则 heartbeat loop 虽退、runs 与
+    // claim/sse 循环仍在，agentd 无法按契约「收敛后退出」（评审 F5：token 已吊销仍持续心跳）。
+    for (const ctx of state.runs.values()) {
+      abortRun(ctx, 'revoked');
+    }
     return;
   }
   if (event === 'approval_decision') {
@@ -404,7 +413,17 @@ function scheduleFlush(ctx) {
 async function flushEvents(ctx) {
   if (ctx.dropped || ctx.inflight || ctx.events.length === 0) return;
   ctx.inflight = true;
-  const batch = ctx.events.splice(0, BATCH_EVENTS_MAX);
+  // F7：按字节切批——单批 ≤ BATCH_BYTES_MAX 且 ≤ BATCH_EVENTS_MAX（评审 F7：原实现只按条数，
+  // portal 端 256KiB 拒收 → 整批退回无限重试风暴）。
+  const batch = [];
+  let batchBytes = 0;
+  while (ctx.events.length > 0 && batch.length < BATCH_EVENTS_MAX) {
+    const evSize = Buffer.byteLength(JSON.stringify(ctx.events[0]), 'utf8');
+    if (batch.length > 0 && batchBytes + evSize > BATCH_BYTES_MAX) break;
+    const ev = ctx.events.shift();
+    batch.push(ev);
+    batchBytes += evSize;
+  }
   const body = {
     batch_id: `${ctx.runId}:b${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
     events: batch,
@@ -464,10 +483,14 @@ async function drainEvents(ctx) {
 // 终态收敛（U2，§7.6）
 // ---------------------------------------------------------------------------
 async function finishRun(ctx, payload) {
-  const r = await internalRequest('PUT', `/runs/${ctx.runId}/state`, {
-    body: payload,
-    claimToken: ctx.claimToken,
-  });
+  // M1：终态上报必须 transient 重试（网络闪断/5xx 时丢终态 → run 卡 running 只能靠 reaper 收敛）。
+  const r = await withRetry(
+    () => internalRequest('PUT', `/runs/${ctx.runId}/state`, {
+      body: payload,
+      claimToken: ctx.claimToken,
+    }),
+    { what: `finishRun run=${ctx.runId}`, retryable: () => !ctx.dropped },
+  );
   return r.data;
 }
 
@@ -563,25 +586,29 @@ function onWorkerMessage(ctx, runStart, msg) {
 function onWorkerExit(ctx, code, signal) {
   log('info', 'worker exit', { run_id: ctx.runId, code, signal });
   if (ctx.worker) { ctx.worker = null; ctx.workerPid = null; }
-  // 非预期退出且未终态/未丢弃 → release + 重新认领（§6.4 worker 崩溃）。
-  if (!ctx.finishing && !ctx.dropped && (code !== 0 || signal)) {
+  // F4：dropped（stop/lease_lost 裁决）也必须清理 ctx——否则 state.runs 永不移除，
+  // capacity=1 下 claim 循环永久停摆（评审实测路径）。dropped 不写 U2（租约已易主，写必 409），
+  // 但 capacity 必须释放、本地上下文必须回收。
+  if (ctx.dropped) {
+    cleanupRun(ctx);
+    return;
+  }
+  // 非预期退出且未终态 → release + 重新认领（§6.4 worker 崩溃）。
+  if (!ctx.finishing && (code !== 0 || signal)) {
     log('warn', 'worker crashed', { run_id: ctx.runId, code, signal });
     releaseAndRequeue(ctx, 'worker_crashed');
   }
 }
 
 async function onWorkerFinished(ctx, msg) {
-  if (ctx.finishing || ctx.dropped) return;
+  // F4：dropped（stop/lease_lost 已裁决）时仍尝试 U2——若租约仍在我方则终态收敛；
+  // 已易主则 U2 得 409 lease_lost（fencing），run 由新租约持有者收敛（§6.4/§12）。
+  // 无论 U2 是否成功，worker 退出后都必须 cleanupRun 释放 capacity（评审 F4：dropped ctx 永留 state.runs）。
+  if (ctx.finishing) return;
   ctx.finishing = true;
 
   // 终态 barrier：先排空事件（§7.6 ①）。
   await drainEvents(ctx);
-
-  if (ctx.dropped) {
-    log('warn', 'run dropped before finish', { run_id: ctx.runId });
-    cleanupRun(ctx);
-    return;
-  }
 
   const body = {
     state: msg.ok ? 'finished' : 'failed',

@@ -5,9 +5,12 @@
 
 FROM node:22-slim
 
-# ---- 运行时诊断工具（procps：ps/pgrep，healthcheck 与 smoke test 依赖；deploy-contract §2.3/testing §3.8）----
+# ---- 运行时工具（deploy-contract §2.3/testing §3.8 + git worktree §6.2）----
+# procps：ps/pgrep（healthcheck 与 smoke test 依赖）。
+# git：真实项目 run 需要 worktree（runner §6.2）；缺失时 agentd 会静默回退空目录（评审 F2）→ 必须安装。
+# ca-certificates：erix-agent 访问 llm.<base>（https）与 git https clone（FDE 自配凭据，§11.1）。
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends procps \
+  && apt-get install -y --no-install-recommends procps git \
   && rm -rf /var/lib/apt/lists/*
 
 # ---- 三用户（deploy-contract §6.3）：erix(1000)/erix-agentd(1001)/erix-worker(1002) 同 GID 1000 ----
@@ -30,13 +33,15 @@ RUN npm install --omit=dev --no-audit --no-fund \
 COPY agentd.js worker.js ./
 COPY lib ./lib
 COPY entrypoint.sh /usr/local/bin/station-agentd-entrypoint
-RUN chmod 0755 /usr/local/bin/station-agentd-entrypoint
+COPY healthcheck.sh /usr/local/bin/station-agentd-healthcheck
+RUN chmod 0755 /usr/local/bin/station-agentd-entrypoint /usr/local/bin/station-agentd-healthcheck
 
 # ---- 非 root 运行路径（deploy-contract §1）：root 启动 → drop 1001（setpriv ambient caps）----
 # 说明：compose/provisioner 已 --init（tini 作 PID 1）；entrypoint 直接 exec agentd，不重复 init（runner §2.3 方案 (a)）。
 # setpriv 以 ambient caps 保留 SETUID/SETGID/KILL，供 agentd(1001) fork worker(1002) 与跨 UID kill（deploy-contract §6.2 B7）。
 ENTRYPOINT ["/usr/local/bin/station-agentd-entrypoint"]
 
-# healthcheck（deploy-contract §2.3 未给 FDE 行；agentd 活性 = 心跳 + SSE，容器健康以进程存活为准）。
-HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
-  CMD pgrep -f "node /opt/erix/agentd.js" > /dev/null || exit 1
+# healthcheck（M5）：进程存活 + 心跳新鲜度——agentd 每次成功心跳 touch /run/station/hb-ok，
+# 健康要求进程在 + 心跳新鲜（<120s）或启动宽限（hb 文件尚无但 agentd 进程 <120s，避免启动竞态误重启）。
+HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=3 \
+  CMD /usr/local/bin/station-agentd-healthcheck || exit 1
