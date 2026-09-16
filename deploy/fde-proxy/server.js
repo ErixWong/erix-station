@@ -49,7 +49,7 @@ const TOP_LEVEL_FIELDS = new Set([
   'User', // env §10：whoami 等镜像无 1001 用户时 `--user` 兜底（⚠️ dev 偏差）
   'HostConfig',
 ]);
-// R5：ExtraHosts 直接剔除（不需要 --add-host）。
+// 容器内 station.<base>/llm.<base> 需解析到本 FDE bridge 网关（--add-host，契约 §6.2/topology §4-L3/L7）。
 const HOST_CONFIG_FIELDS = new Set([
   'Binds',
   'NetworkMode',
@@ -61,6 +61,7 @@ const HOST_CONFIG_FIELDS = new Set([
   'RestartPolicy',
   'Init',
   'PidsLimit',
+  'ExtraHosts',
 ]);
 const CAP_ADD_ALLOW = new Set(['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL']);
 const NETWORK_NAME_RE = /^fde-[a-z0-9-]+$/;
@@ -549,6 +550,24 @@ export function validateCreateBody(body, opts = {}) {
     const rp = h.RestartPolicy;
     if (!isPlainObject(rp) || Object.keys(rp).length !== 1 || rp.Name !== 'unless-stopped') {
       reasons.push('RestartPolicy must be exactly {"Name":"unless-stopped"}');
+    }
+  }
+  // --add-host：容器内 station.<base>/llm.<base> → 本 FDE bridge 网关（契约 §6.2）。只允许 host:ipv4 形态。
+  if (h.ExtraHosts !== undefined) {
+    if (!Array.isArray(h.ExtraHosts) || h.ExtraHosts.length > 4) {
+      reasons.push('ExtraHosts must be an array of <= 4 host:ip entries');
+    } else {
+      for (const entry of h.ExtraHosts) {
+        const m = /^([a-z0-9.-]+):(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(String(entry));
+        if (!m) {
+          reasons.push(`ExtraHosts entry must be host:ipv4: ${entry}`);
+          continue;
+        }
+        const octets = m[2].split('.').map(Number);
+        if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+          reasons.push(`ExtraHosts entry ipv4 invalid: ${entry}`);
+        }
+      }
     }
   }
   if (h.Memory !== undefined) {

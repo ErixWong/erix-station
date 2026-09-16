@@ -21,13 +21,13 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mat-test-'));
 }
 
-test('renderConfigJson：占位 key + baseURL=https://llm.<base>/v1 + 三 slot', () => {
-  const obj = JSON.parse(renderConfigJson({ llmHost: 'llm.localhost' }));
-  assert.equal(obj.default.apiKey, 'erix-placeholder');
-  assert.equal(obj.default.baseURL, 'https://llm.localhost/v1');
-  assert.equal(obj.audit.apiKey, 'erix-placeholder');
-  assert.equal(obj.fold.apiKey, 'erix-placeholder');
-  assert.equal(obj.default.model, 'claude-sonnet');
+test('renderConfigJson：占位 key + endpoint（erix-agent v0.3.5 slots 嵌套格式）+ 三 slot', () => {
+  const obj = JSON.parse(renderConfigJson({ llmBaseUrl: 'http://llm.localhost:8090' }));
+  assert.equal(obj.slots.default.apiKey, 'erix-placeholder');
+  assert.equal(obj.slots.default.endpoint, 'http://llm.localhost:8090/v1');
+  assert.equal(obj.slots.audit.apiKey, 'erix-placeholder');
+  assert.equal(obj.slots.fold.apiKey, 'erix-placeholder');
+  assert.equal(obj.slots.default.model, 'claude-sonnet');
 });
 
 test('renderPortsJson：schema/fde/project/generation/allocations 投影（state 未释放）', () => {
@@ -76,7 +76,7 @@ test('buildFilePlan：home 骨架 + 每项目平台文件，路径映射正确',
   const files = buildFilePlan({
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     root: '/srv/erix/users',
     generation: 1,
     projects: [{ id: 'p1', name: 'proj1' }],
@@ -118,7 +118,7 @@ test('materialize：幂等（同一快照两次 → generation 不变、字节�
   const snapshot = {
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 5,
     projects: [{ id: 'p1', name: 'proj1' }],
     allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
@@ -145,7 +145,7 @@ test('materialize：项目删除后清理 stale 平台文件', async () => {
   const before = {
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 1,
     projects: [proj],
     allocationsByProject: new Map([['p1', alloc]]),
@@ -169,7 +169,7 @@ test('materialize：ports.json generation == manifest generation（跨文件一�
   const r = await mat.materialize({
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 42,
     projects: [{ id: 'p1', name: 'proj1' }],
     allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
@@ -206,7 +206,7 @@ test('F1：prevManifest 被篡改含 ../ 时，不删除其他 FDE 的文件（�
   await mat.materialize({
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 2,
     projects: [],
     allocationsByProject: new Map(),
@@ -226,7 +226,7 @@ test('F6：同内容 symlink 拒绝（lstat 不跟随，不静默保留 symlink�
   const snapshot = {
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 1,
     projects: [],
     allocationsByProject: new Map(),
@@ -255,7 +255,7 @@ test('F8：未传 materializedAt 时同快照仍字节级幂等（沿用旧 mate
   const snapshot = {
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 5,
     projects: [{ id: 'p1', name: 'proj1' }],
     allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
@@ -280,7 +280,7 @@ test('M1：root 内用户自建 .gitignore/AGENTS.md 在 stale 清理后存活�
   const before = {
     fdeName: 'alice',
     baseDomain: 'localhost',
-    llmHost: 'llm.localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
     generation: 1,
     projects: [proj],
     allocationsByProject: new Map([['p1', alloc]]),
@@ -328,7 +328,7 @@ test('M2：stale-only 变更（仅删 stale）时 materialized_at 更新', async
   const alloc = [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }];
   const t1 = new Date('2026-09-12T08:30:00.000Z');
   await mat.materialize({
-    fdeName: 'alice', baseDomain: 'localhost', llmHost: 'llm.localhost', generation: 1,
+    fdeName: 'alice', baseDomain: 'localhost', llmBaseUrl: 'http://llm.localhost:8090', generation: 1,
     projects: [proj], allocationsByProject: new Map([['p1', alloc]]), materializedAt: t1,
   });
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
@@ -338,7 +338,7 @@ test('M2：stale-only 变更（仅删 stale）时 materialized_at 更新', async
   const t2 = new Date('2026-09-12T09:00:00.000Z');
   // 仅删项目 → 无内容变更，只有 stale 删除 → materialized_at 必须更新到 t2。
   await mat.materialize({
-    fdeName: 'alice', baseDomain: 'localhost', llmHost: 'llm.localhost', generation: 2,
+    fdeName: 'alice', baseDomain: 'localhost', llmBaseUrl: 'http://llm.localhost:8090', generation: 2,
     projects: [], allocationsByProject: new Map(), prevManifest: prev, materializedAt: t2,
   });
   const after = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));

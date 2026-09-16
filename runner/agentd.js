@@ -1,0 +1,787 @@
+#!/usr/bin/env node
+// station-agentd：FDE 容器内常驻守护/桥接进程。
+// 依据：docs/design/runner-integration.md §2/§3/§4/§6/§7/§11/§12。
+//
+// 职责（§3）：
+//   - 唯一持 per-container token（env ERIX_STATION_TOKEN，仅本进程内存，fork worker 时从 env 剔除）；
+//   - 全出站：SSE 下行 + POST 上行 → portal（internal API）；
+//   - 心跳循环（15s）：续租 + stop 兜底 + revoked 收敛；
+//   - claim 长轮询领任务 → 准备工作目录 → fork worker 子进程（UID 1002）；
+//   - 事件批量上报（250ms/2KB，§7.2）+ store_request 转发（加 Authorization + X-Claim-Token）；
+//   - 终态 barrier（§7.6）：事件批全部 200 后才 PUT 终态；
+//   - lease_lost → 本地 abort worker、丢缓冲（方案 B，§6.4）；revoked → 收敛后退出。
+//
+// P1 范围（任务约定）：单容器串行（capacity=1）、approvals 路径留空（P2）、spool 不落盘（§7.5 待定）。
+
+import { fork, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WORKER_PATH = path.join(__dirname, 'worker.js');
+
+// ---------------------------------------------------------------------------
+// 配置（env §10 / deploy-contract §6.2）
+// ---------------------------------------------------------------------------
+const CFG = {
+  token: process.env.ERIX_STATION_TOKEN || '',
+  baseUrl: (process.env.ERIX_STATION_BASE_URL || 'https://station.localhost/api/internal').replace(/\/+$/, ''),
+  fdeName: process.env.ERIX_FDE_NAME || 'unknown',
+  agentVersion: process.env.ERIX_AGENT_VERSION || '0.1.0',
+  homeUser: process.env.FDE_CONTAINER_USER || 'erix',
+  home: process.env.FDE_HOME || `/home/${process.env.FDE_CONTAINER_USER || 'erix'}`,
+  workerUid: Number(process.env.FDE_WORKER_UID || process.env.ERIX_WORKER_UID || 1002),
+  workerGid: Number(process.env.FDE_WORKER_GID || process.env.ERIX_WORKER_GID || 1000),
+  capacity: Number(process.env.ERIX_AGENTD_CAPACITY || 1),
+  heartbeatMs: Number(process.env.ERIX_HEARTBEAT_MS || 15000),
+  batchWindowMs: Number(process.env.ERIX_BATCH_WINDOW_MS || 250),
+  batchBytes: Number(process.env.ERIX_BATCH_BYTES || 2048),
+  maxEventsPerBatch: 200,
+  maxBatchBytes: 256 * 1024,
+};
+
+// 批处理单批上限（§7.2）。
+const BATCH_BYTES_MAX = CFG.maxBatchBytes;
+const BATCH_EVENTS_MAX = CFG.maxEventsPerBatch;
+
+// ---------------------------------------------------------------------------
+// 日志（单行 JSON，runner §14）
+// ---------------------------------------------------------------------------
+function log(level, msg, extra = {}) {
+  const line = { ts: new Date().toISOString(), level, msg, fde: CFG.fdeName, ...extra };
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify(line));
+}
+
+// ---------------------------------------------------------------------------
+// 状态
+// ---------------------------------------------------------------------------
+const state = {
+  sseOk: false,
+  sawPing: false,
+  revokeReason: null, // 非空 → 停领新任务、收敛后退出
+  shutdown: false,
+  runs: new Map(), // runId -> RunCtx
+};
+
+/** RunCtx：单个活跃 run 的本地上下文。 */
+function makeRunCtx(runId) {
+  return {
+    runId,
+    claimToken: null,
+    attempt: 1,
+    resume: false,
+    worker: null,
+    workerPid: null,
+    // 事件批量缓冲
+    events: [],
+    eventBytes: 0,
+    flushTimer: null,
+    inflight: false,
+    // 终态 barrier
+    finishing: false,
+    // 已被租约/停止裁决，丢弃后续写
+    dropped: false,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 内部 HTTP 客户端（零依赖，Node 22 fetch；§4.5 重试/错误分类）
+// ---------------------------------------------------------------------------
+const BACKOFF = [1000, 2000, 5000, 10000, 30000];
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function backoffFor(n) {
+  return BACKOFF[Math.min(n, BACKOFF.length - 1)];
+}
+
+class InternalError extends Error {
+  constructor(status, code, message, retryable) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable;
+  }
+}
+
+async function internalRequest(method, p, { body, claimToken, retries = 0, timeoutMs = 30000 } = {}) {
+  const headers = {
+    Authorization: `Bearer ${CFG.token}`,
+    'Content-Type': 'application/json',
+  };
+  if (claimToken) headers['X-Claim-Token'] = claimToken;
+  const payload = body !== undefined ? JSON.stringify(body) : undefined;
+  if (payload !== undefined) headers['Content-Length'] = Buffer.byteLength(payload);
+
+  let res;
+  try {
+    res = await fetch(`${CFG.baseUrl}${p}`, {
+      method,
+      headers,
+      body: payload,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    // 网络错误 → 可重试
+    throw new InternalError(0, 'network_error', String(err?.message ?? err), true);
+  }
+
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = text; }
+  }
+
+  if (res.status >= 200 && res.status < 300) return { status: res.status, data };
+
+  const code = data?.error?.code ?? `http_${res.status}`;
+  const message = data?.error?.message ?? text;
+  // §4.5 错误分类
+  const retryable = res.status >= 500 || res.status === 429;
+  const err = new InternalError(res.status, code, message, retryable);
+
+  // lease_lost / run_terminal / checkpoint_stale / 4xx 等 → 不重试（由调用方按语义处理）。
+  if (res.status === 409) err.retryable = false;
+  throw err;
+}
+
+/** 无限指数退避重试（仅对可重试错误）。onRetry 用于观测。 */
+async function withRetry(fn, { what, retryable = () => true, maxRetries = Infinity } = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      const canRetry = err instanceof InternalError && err.retryable && retryable(err) && attempt < maxRetries;
+      if (!canRetry) throw err;
+      const delay = backoffFor(attempt) * (0.8 + Math.random() * 0.4);
+      log('warn', `retry ${what}`, { attempt: attempt + 1, code: err.code, delayMs: Math.round(delay) });
+      await sleep(delay);
+      attempt += 1;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSE 下行（§4.3）：ping 保活 / stop_request / revoke / approval_decision（P2）
+// ---------------------------------------------------------------------------
+function openSse() {
+  let stopped = false;
+  const run = async () => {
+    let attempt = 0;
+    while (!stopped && !state.revokeReason && !state.shutdown) {
+      if (attempt > 0) {
+        const delay = backoffFor(attempt - 1) * (0.8 + Math.random() * 0.4);
+        log('info', 'sse reconnect', { attempt, delayMs: Math.round(delay) });
+        await sleep(delay);
+      }
+      try {
+        const res = await fetch(`${CFG.baseUrl}/stream`, {
+          headers: { Authorization: `Bearer ${CFG.token}`, Accept: 'text/event-stream' },
+        });
+        if (!res.ok || !res.body) {
+          const text = await res.text().catch(() => '');
+          if (res.status === 401) {
+            state.revokeReason = 'token_revoked';
+            log('warn', 'sse 401 token_revoked');
+            return;
+          }
+          throw new InternalError(res.status, 'sse', text, true);
+        }
+        state.sseOk = true;
+        attempt = 0;
+        log('info', 'sse connected');
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const raw = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            handleSseChunk(raw);
+          }
+        }
+        state.sseOk = false;
+        log('warn', 'sse stream ended', {});
+        attempt += 1;
+      } catch (err) {
+        state.sseOk = false;
+        log('warn', 'sse disconnected', { reason: String(err?.message ?? err) });
+        attempt += 1;
+      }
+    }
+  };
+  return { run, stop: () => { stopped = true; } };
+}
+
+function handleSseChunk(raw) {
+  let event = 'message';
+  const data = [];
+  for (const line of raw.split('\n')) {
+    if (line.startsWith(':')) continue; // 注释心跳
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data.push(line.slice(5).trim());
+  }
+  if (data.length === 0) return;
+  let payload;
+  try { payload = JSON.parse(data.join('\n')); } catch { return; }
+
+  if (event === 'ping') {
+    if (!state.sawPing) {
+      state.sawPing = true;
+      log('info', 'sse ping received', {});
+    }
+    return;
+  }
+  if (event === 'run_assigned') {
+    // 唤醒 hint：不携带权威载荷；claim 长轮询本身会被 portal 侧 NOTIFY 唤醒，此处仅日志。
+    log('debug', 'run_assigned hint', { run_id: payload?.run_id });
+    return;
+  }
+  if (event === 'stop_request') {
+    const runId = payload?.run_id;
+    const ctx = runId ? state.runs.get(runId) : null;
+    if (ctx) abortRun(ctx, 'stop_request');
+    return;
+  }
+  if (event === 'revoke') {
+    state.revokeReason = payload?.reason ?? 'revoked';
+    log('warn', 'revoke received', { reason: state.revokeReason });
+    return;
+  }
+  if (event === 'approval_decision') {
+    // P1 不实现审批；忽略（P2 接入）。
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// claim 长轮询（§4.2 U1）
+// ---------------------------------------------------------------------------
+async function claimOnce() {
+  // hold_ms=30000 是服务端长轮询上限；客户端超时必须显著大于 hold，否则会在 204 返回前被 AbortSignal
+  // 掐断（30s vs 30s 竞态 → claim 永远拿不到响应）。留 10s 缓冲。
+  const holdMs = 30000;
+  return internalRequest('POST', '/claim', {
+    body: { capacity: CFG.capacity, hold_ms: holdMs },
+    timeoutMs: holdMs + 10000,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 心跳（§4.2 U4）
+// ---------------------------------------------------------------------------
+async function heartbeatOnce() {
+  const runs = [];
+  for (const ctx of state.runs.values()) {
+    if (!ctx.worker) continue;
+    runs.push({ run_id: ctx.runId, status: 'running', worker_pid: ctx.workerPid, claim_token: ctx.claimToken });
+  }
+  const r = await internalRequest('POST', '/heartbeat', {
+    body: { agent_version: CFG.agentVersion, runs },
+  });
+  return r.data;
+}
+
+// ---------------------------------------------------------------------------
+// worktree 准备（§6.2）：git worktree add，失败回退 mkdir（P1 无真实仓库）
+// ---------------------------------------------------------------------------
+function prepareWorktree(projectName, runId) {
+  const projectsDir = path.join(CFG.home, 'projects');
+  const worktreesDir = path.join(CFG.home, 'worktrees');
+  const projectDir = path.join(projectsDir, projectName || 'default');
+  const wt = path.join(worktreesDir, `${projectName || 'default'}-${runId}`);
+  fs.mkdirSync(worktreesDir, { recursive: true });
+
+  // 尝试 git worktree（真实仓库场景）；失败/非 git 仓库 → 普通目录（P1 兜底）。
+  try {
+    const isRepo = fs.existsSync(path.join(projectDir, '.git'));
+    if (isRepo) {
+      execFileSync('git', ['worktree', 'add', wt, '-b', `agent/${runId}`], {
+        cwd: projectDir, stdio: ['ignore', 'ignore', 'ignore'],
+      });
+      return wt;
+    }
+  } catch {
+    // fallthrough → mkdir
+  }
+  fs.mkdirSync(wt, { recursive: true });
+  return wt;
+}
+
+// ---------------------------------------------------------------------------
+// store_request → internal 端点映射（§9.1）
+// ---------------------------------------------------------------------------
+async function handleStoreRequest(ctx, method, args) {
+  const runId = ctx.runId;
+  switch (method) {
+    case 'appendRound': {
+      const record = normalizeRoundRecord(runId, args?.record);
+      const round = record.round;
+      const r = await withRetry(
+        () => internalRequest('PUT', `/runs/${runId}/transcript/rounds/${round}`, { body: record, claimToken: ctx.claimToken }),
+        { what: `appendRound run=${runId} round=${round}` },
+      );
+      return r.data;
+    }
+    case 'load': {
+      // U6 分页循环拉全量（runner §9.1 注：超出 10000 轮时循环；P1 单页足够）。
+      const records = [];
+      let cursor = null;
+      for (;;) {
+        const q = cursor == null ? '?limit=10000' : `?limit=10000&cursor=${cursor}`;
+        const r = await withRetry(
+          () => internalRequest('GET', `/runs/${runId}/transcript${q}`, { claimToken: ctx.claimToken }),
+          { what: `load run=${runId}` },
+        );
+        records.push(...(r.data?.records ?? []));
+        cursor = r.data?.next_cursor ?? null;
+        if (cursor == null) break;
+      }
+      return { records };
+    }
+    case 'recall': {
+      const qs = new URLSearchParams();
+      if (args?.fromRound != null) qs.set('from_round', String(args.fromRound));
+      if (args?.toRound != null) qs.set('to_round', String(args.toRound));
+      qs.set('pattern', String(args?.pattern ?? ''));
+      const r = await withRetry(
+        () => internalRequest('GET', `/runs/${runId}/transcript/recall?${qs.toString()}`, { claimToken: ctx.claimToken }),
+        { what: `recall run=${runId}` },
+      );
+      return r.data;
+    }
+    case 'markRunState': {
+      const r = await withRetry(
+        () => internalRequest('PUT', `/runs/${runId}/state`, { body: { state: args?.state ?? 'running' }, claimToken: ctx.claimToken }),
+        { what: `markRunState run=${runId}` },
+      );
+      return r.data;
+    }
+    case 'saveCheckpoint': {
+      const revision = Number(args?.revision ?? 0);
+      const snapshot = args?.snapshot ?? {};
+      const r = await withRetry(
+        () => internalRequest('PUT', `/runs/${runId}/checkpoint`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
+        { what: `saveCheckpoint run=${runId} rev=${revision}` },
+      );
+      return r.data;
+    }
+    case 'loadLatestCheckpoint': {
+      const r = await withRetry(
+        () => internalRequest('GET', `/runs/${runId}/checkpoint/latest`, { claimToken: ctx.claimToken }),
+        { what: `loadLatestCheckpoint run=${runId}` },
+      );
+      return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
+    }
+    default:
+      throw new Error(`unknown store method: ${method}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 事件批量上报（§7.2/§7.6）
+// ---------------------------------------------------------------------------
+function scheduleFlush(ctx) {
+  if (ctx.flushTimer || ctx.dropped) return;
+  ctx.flushTimer = setTimeout(() => {
+    ctx.flushTimer = null;
+    flushEvents(ctx).catch((err) => {
+      if (!ctx.dropped) log('warn', 'flush events failed', { run_id: ctx.runId, err: String(err?.message ?? err) });
+    });
+  }, CFG.batchWindowMs);
+}
+
+async function flushEvents(ctx) {
+  if (ctx.dropped || ctx.inflight || ctx.events.length === 0) return;
+  ctx.inflight = true;
+  const batch = ctx.events.splice(0, BATCH_EVENTS_MAX);
+  const body = {
+    batch_id: `${ctx.runId}:b${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
+    events: batch,
+  };
+  try {
+    const r = await internalRequest('POST', `/runs/${ctx.runId}/events`, { body, claimToken: ctx.claimToken });
+    log('debug', 'events stored', { run_id: ctx.runId, stored: r.data?.stored, count: batch.length });
+  } catch (err) {
+    // 不可重试的 409 lease_lost/run_terminal → 丢弃该 run 缓冲（§4.5/§6.5）。
+    if (err instanceof InternalError && !err.retryable && err.status === 409) {
+      ctx.dropped = true;
+      log('warn', 'events dropped (409)', { run_id: ctx.runId, code: err.code });
+      ctx.events.length = 0;
+      ctx.eventBytes = 0;
+    } else {
+      // 可重试：放回队首，退避重试。
+      ctx.events.unshift(...batch);
+      if (err instanceof InternalError && err.retryable) {
+        await sleep(backoffFor(0));
+      }
+    }
+  } finally {
+    ctx.inflight = false;
+    if (ctx.events.length > 0) scheduleFlush(ctx);
+  }
+}
+
+function enqueueEvent(ctx, ev) {
+  if (ctx.dropped) return;
+  ctx.events.push(ev);
+  ctx.eventBytes += Buffer.byteLength(JSON.stringify(ev), 'utf8');
+  if (ctx.eventBytes >= CFG.batchBytes || ctx.events.length >= BATCH_EVENTS_MAX) {
+    if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
+    flushEvents(ctx).catch(() => {});
+  } else {
+    scheduleFlush(ctx);
+  }
+}
+
+/** 终态 barrier（§7.6）：排空事件批 → PUT 终态。 */
+async function drainEvents(ctx) {
+  if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
+  for (let i = 0; i < 200 && ctx.events.length > 0; i++) {
+    await flushEvents(ctx);
+    if (ctx.dropped) break;
+    if (ctx.events.length === 0) break;
+  }
+  // 若仍有余量且未被丢弃 → 最后一搏（切多批）。
+  while (ctx.events.length > 0 && !ctx.dropped) {
+    await flushEvents(ctx);
+    if (ctx.events.length === 0) break;
+    await sleep(backoffFor(0));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 终态收敛（U2，§7.6）
+// ---------------------------------------------------------------------------
+async function finishRun(ctx, payload) {
+  const r = await internalRequest('PUT', `/runs/${ctx.runId}/state`, {
+    body: payload,
+    claimToken: ctx.claimToken,
+  });
+  return r.data;
+}
+
+// ---------------------------------------------------------------------------
+// abort（§6.4/§6.5）：SIGTERM worker，标记丢弃
+// ---------------------------------------------------------------------------
+function abortRun(ctx, reason) {
+  if (ctx.dropped) return;
+  ctx.dropped = true;
+  if (ctx.worker && ctx.worker.connected) {
+    sendIpc(ctx.worker, { type: MSG.ABORT, run_id: ctx.runId, reason });
+    // 5s 宽限后 SIGKILL（§2.4）
+    setTimeout(() => {
+      if (ctx.worker && ctx.worker.exitCode === null && ctx.worker.signalCode === null) {
+        try { ctx.worker.kill('SIGKILL'); } catch {}
+      }
+    }, 5000);
+  }
+  log('info', 'abort run', { run_id: ctx.runId, reason });
+}
+
+// ---------------------------------------------------------------------------
+// worker 生命周期（§5/§6）
+// ---------------------------------------------------------------------------
+function spawnWorker(ctx, runStart) {
+  const childEnv = { ...process.env };
+  // §11：worker 无凭据——剔除 token；HOME 指向 erix（工作区属主）。
+  delete childEnv.ERIX_STATION_TOKEN;
+  childEnv.HOME = CFG.home;
+  childEnv.FDE_CONTAINER_USER = CFG.homeUser;
+
+  const child = fork(WORKER_PATH, [], {
+    uid: CFG.workerUid,
+    gid: CFG.workerGid,
+    env: childEnv,
+    cwd: runStart.cwd,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  ctx.worker = child;
+  ctx.workerPid = child.pid ?? null;
+
+  child.stdout?.on('data', (d) => process.stdout.write(`[worker ${ctx.runId.slice(0, 8)}] ${d}`));
+  child.stderr?.on('data', (d) => process.stderr.write(`[worker ${ctx.runId.slice(0, 8)}] ${d}`));
+
+  child.on('message', (msg) => onWorkerMessage(ctx, runStart, msg));
+  child.on('error', (err) => log('warn', 'worker error', { run_id: ctx.runId, err: String(err?.message ?? err) }));
+  child.on('exit', (code, signal) => onWorkerExit(ctx, code, signal));
+}
+
+function onWorkerMessage(ctx, runStart, msg) {
+  if (!msg || typeof msg !== 'object') return;
+  switch (msg.type) {
+    case MSG.WORKER_READY:
+      sendIpc(ctx.worker, { type: MSG.RUN_START, ...runStart });
+      break;
+    case MSG.EVENT:
+      if (msg.run_id === ctx.runId) enqueueEvent(ctx, msg.event);
+      break;
+    case MSG.STORE_REQUEST: {
+      handleStoreRequest(ctx, msg.method, msg.args)
+        .then((result) => sendIpc(ctx.worker, { type: MSG.STORE_RESPONSE, req_id: msg.req_id, ok: true, result }))
+        .catch((err) => {
+          const isLeaseLost = err instanceof InternalError && err.code === 'lease_lost';
+          if (isLeaseLost) ctx.dropped = true;
+          sendIpc(ctx.worker, {
+            type: MSG.STORE_RESPONSE,
+            req_id: msg.req_id,
+            ok: false,
+            error: {
+              code: err?.code ?? 'internal',
+              message: String(err?.message ?? err),
+              retryable: err instanceof InternalError ? err.retryable : false,
+            },
+          });
+        });
+      break;
+    }
+    case MSG.APPROVAL_REQUEST:
+      // P1：approvals 路径留空（runner §10 端点 P2 接入）。
+      sendIpc(ctx.worker, { type: MSG.APPROVAL_DECISION, req_id: msg.req_id, decision: 'denied', note: 'approvals not implemented (P1)' });
+      break;
+    case MSG.RUN_FINISHED:
+      onWorkerFinished(ctx, msg);
+      break;
+    case MSG.LOG:
+      log('info', 'worker log', { run_id: ctx.runId, level: msg.level, msg: msg.msg });
+      break;
+    default:
+      break;
+  }
+}
+
+function onWorkerExit(ctx, code, signal) {
+  log('info', 'worker exit', { run_id: ctx.runId, code, signal });
+  if (ctx.worker) { ctx.worker = null; ctx.workerPid = null; }
+  // 非预期退出且未终态/未丢弃 → release + 重新认领（§6.4 worker 崩溃）。
+  if (!ctx.finishing && !ctx.dropped && (code !== 0 || signal)) {
+    log('warn', 'worker crashed', { run_id: ctx.runId, code, signal });
+    releaseAndRequeue(ctx, 'worker_crashed');
+  }
+}
+
+async function onWorkerFinished(ctx, msg) {
+  if (ctx.finishing || ctx.dropped) return;
+  ctx.finishing = true;
+
+  // 终态 barrier：先排空事件（§7.6 ①）。
+  await drainEvents(ctx);
+
+  if (ctx.dropped) {
+    log('warn', 'run dropped before finish', { run_id: ctx.runId });
+    cleanupRun(ctx);
+    return;
+  }
+
+  const body = {
+    state: msg.ok ? 'finished' : 'failed',
+    termination: msg.termination ?? (msg.ok ? { reason: 'end_turn' } : { reason: 'failed' }),
+    usage: msg.usage ?? { input_tokens: 0, output_tokens: 0 },
+    rounds: msg.rounds ?? 0,
+    final_text: msg.final_text ?? '',
+  };
+  if (!msg.ok) body.error = msg.error ?? { code: 'failed', message: 'run failed', retryable: false };
+
+  try {
+    const r = await finishRun(ctx, body);
+    log('info', 'run finished', { run_id: ctx.runId, state: body.state, run_end_seq: r?.run_end_seq });
+  } catch (err) {
+    // 409 run_terminal 幂等命中 → 视为成功；lease_lost → 已易主，不再写。
+    if (err instanceof InternalError && err.code === 'run_terminal') {
+      log('info', 'run finish idempotent', { run_id: ctx.runId });
+    } else {
+      log('warn', 'run finish failed', { run_id: ctx.runId, code: err?.code, msg: String(err?.message ?? err) });
+    }
+  }
+  cleanupRun(ctx);
+}
+
+function cleanupRun(ctx) {
+  if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
+  if (ctx.worker) {
+    try { if (ctx.worker.connected) ctx.worker.kill('SIGTERM'); } catch {}
+  }
+  state.runs.delete(ctx.runId);
+  log('info', 'run cleaned up', { run_id: ctx.runId });
+}
+
+async function releaseAndRequeue(ctx, reason) {
+  try {
+    const r = await internalRequest('POST', `/runs/${ctx.runId}/release`, { body: { reason }, claimToken: ctx.claimToken });
+    log('info', 'release run', { run_id: ctx.runId, reason, outcome: r.data?.outcome });
+  } catch (err) {
+    log('warn', 'release failed', { run_id: ctx.runId, code: err?.code, msg: String(err?.message ?? err) });
+  }
+  // 回 pending 后立即 re-claim 同一 run（attempt+1、resume=true）由主 claim 循环完成。
+  cleanupRun(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// claim → 准备 → fork worker（§6.1）
+// ---------------------------------------------------------------------------
+async function handleTicket(ticket) {
+  const run = ticket.run ?? {};
+  const runId = run.id;
+  if (!runId) return;
+  if (state.runs.has(runId)) return; // 已在跑（幂等）
+
+  const ctx = makeRunCtx(runId);
+  ctx.claimToken = ticket.claim_token;
+  ctx.attempt = Number(run.attempt ?? 1);
+  ctx.resume = run.resume === true;
+  state.runs.set(runId, ctx);
+
+  let cwd;
+  try {
+    cwd = prepareWorktree(run.project?.name ?? 'default', runId);
+  } catch (err) {
+    log('warn', 'worktree prep failed', { run_id: runId, err: String(err?.message ?? err) });
+    await releaseAndRequeue(ctx, 'worktree_failed');
+    return;
+  }
+
+  // 先 PUT running（§6.1：准备就绪后）。worker 内部 runToolLoop 也会 markRunState('running')，幂等。
+  try {
+    await internalRequest('PUT', `/runs/${runId}/state`, { body: { state: 'running' }, claimToken: ctx.claimToken });
+  } catch (err) {
+    log('warn', 'mark running failed', { run_id: runId, code: err?.code, msg: String(err?.message ?? err) });
+    if (err instanceof InternalError && err.code === 'lease_lost') {
+      cleanupRun(ctx);
+      return;
+    }
+  }
+
+  const runStart = {
+    run_id: runId,
+    session_id: run.session_id ?? null,
+    attempt: ctx.attempt,
+    task: run.task ?? '',
+    cwd,
+    project: run.project?.name ?? 'default',
+    model: run.model ?? null,
+    resume: ctx.resume,
+    attachments: Array.isArray(run.attachments) ? run.attachments : [],
+    config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
+  };
+  try {
+    spawnWorker(ctx, runStart);
+    log('info', 'worker spawned', { run_id: runId, attempt: ctx.attempt, resume: ctx.resume, pid: ctx.workerPid, cwd });
+  } catch (err) {
+    log('warn', 'fork failed', { run_id: runId, err: String(err?.message ?? err) });
+    await releaseAndRequeue(ctx, 'fork_failed');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 主循环：claim + heartbeat（并行的两个长任务）
+// ---------------------------------------------------------------------------
+async function claimLoop() {
+  for (;;) {
+    if (state.revokeReason || state.shutdown) return;
+    const available = CFG.capacity - state.runs.size;
+    if (available <= 0) {
+      await sleep(1000);
+      continue;
+    }
+    try {
+      const r = await claimOnce();
+      if (r.status === 200 && r.data) {
+        await handleTicket(r.data);
+      }
+      // 204 → 立即再 claim
+    } catch (err) {
+      if (err instanceof InternalError && err.code === 'token_revoked') {
+        state.revokeReason = 'token_revoked';
+        return;
+      }
+      if (err instanceof InternalError && !err.retryable) {
+        log('warn', 'claim non-retryable', { code: err.code, msg: String(err.message) });
+        await sleep(backoffFor(0));
+        continue;
+      }
+      log('warn', 'claim failed', { msg: String(err?.message ?? err) });
+      await sleep(backoffFor(0));
+    }
+  }
+}
+
+async function heartbeatLoop() {
+  for (;;) {
+    if (state.shutdown) return;
+    await sleep(CFG.heartbeatMs);
+    try {
+      const data = await heartbeatOnce();
+      if (data?.revoked) {
+        state.revokeReason = 'revoked';
+        log('warn', 'heartbeat revoked', {});
+        return;
+      }
+      for (const runId of data?.stop_run_ids ?? []) {
+        const ctx = state.runs.get(runId);
+        if (ctx) abortRun(ctx, 'stop_heartbeat');
+      }
+      for (const item of data?.runs ?? []) {
+        if (item?.lease === 'lease_lost') {
+          const ctx = state.runs.get(item.run_id);
+          if (ctx) {
+            log('warn', 'lease_lost from heartbeat', { run_id: item.run_id, reason: item.reason });
+            abortRun(ctx, 'lease_lost');
+            // 丢弃缓冲与 spool（§6.4）；run 由新租约持有者/portal 收敛。
+            ctx.dropped = true;
+          }
+        }
+      }
+    } catch (err) {
+      log('warn', 'heartbeat failed', { msg: String(err?.message ?? err) });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 优雅退出（§2/§14）
+// ---------------------------------------------------------------------------
+function shutdown() {
+  if (state.shutdown) return;
+  state.shutdown = true;
+  log('info', 'shutdown: draining runs');
+  for (const ctx of state.runs.values()) {
+    abortRun(ctx, 'agent_shutdown');
+  }
+  // 给 worker 5s 宽限后退出；tini 会转发信号并 reap。
+  setTimeout(() => process.exit(0), 5000);
+}
+
+// ---------------------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------------------
+async function main() {
+  if (!CFG.token) {
+    log('error', 'ERIX_STATION_TOKEN missing');
+    process.exit(1);
+  }
+  log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
+
+  const sse = openSse();
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  await Promise.all([sse.run(), claimLoop(), heartbeatLoop()]);
+  log('info', 'agentd exiting', { revoke: state.revokeReason });
+  process.exit(0);
+}
+
+main().catch((err) => {
+  log('error', 'agentd fatal', { err: String(err?.stack ?? err) });
+  process.exit(1);
+});

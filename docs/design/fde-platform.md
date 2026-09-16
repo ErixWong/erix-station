@@ -13,7 +13,7 @@
 
 | # | 问题 | 影响 | 状态 |
 |---|---|---|---|
-| Q1 | 公司是否已有统一 LLM 网关（LiteLLM / one-api / one-hub）？ | 决定 portal 是「租户绑定」还是「兼做网关」（§11） | ⚠️ 待定 |
+| Q1 | 公司是否已有统一 LLM 网关（候选分析与活跃度筛查见 [`design/llm-gateway/llm-gateway-selection.md`](design/llm-gateway/llm-gateway-selection.md)；one-api / one-hub 已因停更淘汰） | 决定 portal 是「租户绑定」还是「兼做网关」（§11） | ⚠️ 待定 |
 | Q2 | 出口管控（egress）职责归属 | 平台侧保证凭据层（虚拟 key）+ 审计；网络层阻断（容器能否出网、可访问哪些域名）由安全团队负责（§11） | ✅ 已定：外部依赖（安全团队），决策者 2026-09（issue #3） |
 | Q3 | 本地 admin 的定位：仅破窗，还是 FDE 也可用？ | 认证设计（§6） | ⚠️ 待定 |
 | Q4 | LLM 虚拟 key 粒度：每 FDE 一把，还是每客户项目一把？ | 成本归属精度 vs key 数量（§11） | ⚠️ 待定 |
@@ -546,7 +546,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 2. 禁用账号时**吊销**（删 key + 删对应 LLM 注入路由）
 3. 定期拉用量 → 落 `usage_ledger`，做**业务口径**（按 FDE / 按客户项目，网关不知道这层映射）
 
-→ 待 Q1 确认公司是否已有网关；没有则先起一个 LiteLLM 容器，仍走 C。
+→ 待 Q1 确认公司是否已有网关；没有则先起一个网关容器（候选分析见 [`llm-gateway/llm-gateway-selection.md`](llm-gateway/llm-gateway-selection.md)：默认且唯一推荐 LiteLLM；one-api / one-hub 因停更淘汰，new-api 因源码级验证不达标出局——429 语义缺失、鉴权契约 rc 期间重写、凭据通道不可收紧，详见 [`llm-gateway/new-api-api-analysis.md`](llm-gateway/new-api-api-analysis.md)），仍走 C。
 
 > **H-B 链路（决策者 2026-09 定稿，issue #5 D-4；实测见 topology.md §10 证据 8）**：agent/worker 只认 `llm.<base>`——容器内**零 LLM 凭据**，仅占位 key + `baseURL=https://llm.<base>/v1`；请求经 Traefik（host:443），router `Host(llm.<base>) && ClientIP(<该 FDE 精确 subnet>，默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`)` 按**网络来源**判定身份，headers middleware **覆盖** `Authorization: Bearer <该 FDE 虚拟 key>` + 注入 `X-FDE-Identity`（容器自带的任何 `Authorization` 均被覆盖）；service 回环到网关数据面 `127.0.0.1:4000`；网关 **admin 面不发布**、只在 `backend` 网络。**禁止无 ClientIP 条件的兜底路由**（无匹配来源 404 = 默认拒绝）。配套：`aliasHeadersStrategy: delete`、hub service `flushInterval` 调小、路由配置 600（§6.4，topology.md §6）。
 

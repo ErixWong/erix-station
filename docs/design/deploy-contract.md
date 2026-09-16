@@ -221,6 +221,7 @@
 
 - **路径白名单（12 条）**：`GET /_ping`、`GET /version`、`GET /containers/json`、`POST /containers/create`、`GET /containers/{name}/json`、`POST /containers/{name}/start|stop`、`DELETE /containers/{name}`、`GET /networks`、`POST /networks/create`、`GET /networks/{name}`、`DELETE /networks/{name}`；其余路径一律 403。
 - **create 参数级校验（§5 B6，在 proxy 内强制）**：拒绝 `Privileged` / `PidMode=host` / `NetworkMode=host`；`PortBindings` 必须空；`CapDrop` 必须含 `ALL`；`SecurityOpt` 必须含 `no-new-privileges`；binds source 必须在 `USERSPACE_ROOT` 之下且不含 `docker.sock`；`Image` 必须匹配 `IMAGE_ALLOWLIST` 前缀（env 可配）。不合规 → 403 + 理由。
+- **运行身份**：`user: "0:1000"`——uid 0（root）以 owner 权限读写 `docker.sock`（宿主 `root:docker` 660）；gid 1000（erix 组）以 group 权限穿越 2770 用户空间目录。`cap_drop: ALL` 下 root **无 `DAC_OVERRIDE`**，必须靠组权限才能 `realpath` 校验 bind source（防 symlink 逃逸），否则 2770 目录（other=---）会 `EACCES` 导致 bind 校验误判「not resolvable」。
 - **其余放行路径原样转发（含流式）**。
 
 **白名单理由（每项都对应 portal 实际所需的最小面）**：
