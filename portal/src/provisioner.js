@@ -641,6 +641,10 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     const containerRow = await pool.query(`SELECT id FROM containers WHERE user_id = $1`, [u.id]);
     const containerId = containerRow.rows[0]?.id ?? null;
 
+    // F7：先广播 revoke 再删容器——agentd 收到 revoke 即优雅退出；若先删容器，
+    // SSE socket 随容器消亡，broadcast 永远无人接收（WP4 验收实测暴露的顺序缺陷）。
+    if (containerId) broadcastRevoke(containerId, { reason: 'offboarded' });
+
     const containerName = `fde-${fdeName}`;
     const networkName = `fde-${fdeName}`;
     const containerRm = await removeFdeContainer(docker, containerName, { log });
@@ -656,8 +660,7 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     }
 
     await pool.query(`UPDATE containers SET status = 'removed', updated_at = now() WHERE user_id = $1 AND status <> 'removed'`, [u.id]);
-    // F7：offboarding 吊销 token → 主动关闭该容器已建立的 SSE 连接（agentd 收到 revoke 即退出）。
-    if (containerId) broadcastRevoke(containerId, { reason: 'offboarded' });
+    // F7：offboarding 吊销 token（revoke 已在删容器前广播）。
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
