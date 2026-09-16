@@ -10,6 +10,7 @@ import * as totp from './totp.js';
 import { createServer } from './http.js';
 import { startMaterializerLoop } from './materializer.js';
 import { startRoutesLoop } from './routes.js';
+import { startReaperLoop } from './internal.js';
 import {
   createDockerClient,
   onboardFde,
@@ -55,6 +56,7 @@ async function serve() {
   const materializerLoop = startMaterializerLoop(pool, config);
   const routesLoop = startRoutesLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);
+  const reaperLoop = startReaperLoop(pool);
   server.listen(config.port, config.host, () => {
     // eslint-disable-next-line no-console
     console.log(
@@ -70,6 +72,7 @@ async function serve() {
     materializerLoop.stop();
     routesLoop.stop();
     provisionerLoop.stop();
+    reaperLoop.stop();
     server.close(() => process.exit(0));
   };
   process.once('SIGTERM', shutdown);
