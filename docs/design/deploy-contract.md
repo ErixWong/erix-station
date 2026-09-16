@@ -336,8 +336,8 @@
 
 > 红线（topology D-4 / 规格 §11.4）：容器内**零真实 LLM 凭据**——P1 **也不例外**。已删除「`LLM_DEV_BASE_URL` + `LLM_DEV_API_KEY` 注入容器」的临时豁免路径：**任何真实 LLM key 都不经 portal env 注入、不进 `config.json`、不进容器 env/镜像**。
 
-- **mock 网关是什么**：本地运行的 **OpenAI-compatible `/v1/chat/completions` mock**（返回 canned/流式 SSE 响应、可注入 `429 rate_limited` 或错误码以测错误映射，testing.md §3.9），**不含任何真实 LLM key、不访问任何上游 LLM**。
-- **部署位置（dev-only helper）**：宿主机 `127.0.0.1:4000` 回环进程或独立 dev 容器；**不进 P1 目标 compose、不进生产**（P3 由真实 `llm-gateway` 占据该回环端口，env §5）。P1 验收时由开发者手动拉起。
+- **mock 网关是什么**：本地运行的 **OpenAI-compatible `/v1/chat/completions` mock**（返回 canned/流式 SSE 响应，✅ WP3a 已实现虚拟 key 形态校验 `erix-*` 与流式/非流式；可注入 `429 rate_limited` 或错误码以测错误映射，testing.md §3.9），**不含任何真实 LLM key、不访问任何上游 LLM**。
+- **部署位置（dev-only helper）**：✅ **WP3a 已落地为独立 compose 服务 `station-mock-llm`**（`portal/mock-gateway/`，零依赖 Node，数据面 publish 仅宿主回环 `127.0.0.1:${LLM_GATEWAY_PORT:-4000}`，read_only + cap_drop:ALL 加固）；**不进生产**（P3 由真实 `llm-gateway` 占据该回环端口，env §5）。开发期随 `docker compose up -d` 一起拉起，无需手动启动。
 - **如何满足「经 Traefik 注入」链路（二选一）**：
   1. **完整演练注入链（推荐）**：P1 开发期**可选启用** `llm.<base>` 路由（与 P3 同形态：`Host(llm.<base>) && ClientIP(<该 FDE 精确 subnet>)` → headers middleware 覆盖 `Authorization` → service 回环 `127.0.0.1:4000`），但注入的是 **mock 哨兵值**（如 `Authorization: Bearer erix-mock`，非真实 key，mock 只校验/忽略该值）；容器 `--add-host llm.<base>:<本 FDE 网关 IP>`、`config.json` 占位 key + `baseURL=https://llm.<base>/v1` 与 P3 **完全一致**。这样 P1 即演练「ClientIP 判身份 → 覆盖伪造 Authorization → 回环到网关」的完整链路，**全程零真实凭据**。
   2. **mock 模式简化（⚠️ 待决策者确认）**：P1 不启用 `llm.<base>` 注入路由，`config.json` 的 `baseURL` 直接指向 mock 回环（容器经 `--add-host` 映射宿主 mock 地址）+ 占位 key。此简化不演练注入链，但**仍满足零真实凭据红线**（占位 key + mock，无真实 key）。生产/P3 一律回到选项 1 的完整链。
