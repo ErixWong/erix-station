@@ -42,6 +42,6 @@ RUN chmod 0755 /usr/local/bin/station-agentd-entrypoint /usr/local/bin/station-a
 ENTRYPOINT ["/usr/local/bin/station-agentd-entrypoint"]
 
 # healthcheck（M5）：进程存活 + 心跳新鲜度——agentd 每次成功心跳 touch /run/station/hb-ok，
-# 健康要求进程在 + 心跳新鲜（<120s）或启动宽限（hb 文件尚无但 agentd 进程 <120s，避免启动竞态误重启）。
+# 健康要求进程在 + 心跳新鲜（<180s）；启动宽限由 --start-period=120s + entrypoint 启动即建 hb-ok（mtime=启动时刻）保证，避免启动竞态误重启。
 HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=3 \
   CMD /usr/local/bin/station-agentd-healthcheck || exit 1

@@ -167,8 +167,17 @@ function makeEvent(type, payload) {
   };
 }
 
+let droppedEventCount = 0;
+
 function emitEvent(type, payload) {
-  sendIpc(process, { type: MSG.EVENT, run_id: runId, event: makeEvent(type, payload) });
+  // F7：sendIpc false = 通道关闭/背压丢消息——不能静默丢：计数 + stderr 告警
+  // （通道已关时 LOG IPC 也发不出，只能写 stderr，agentd 会透传到自己的 stdout）。
+  const ok = sendIpc(process, { type: MSG.EVENT, run_id: runId, event: makeEvent(type, payload) });
+  if (!ok) {
+    droppedEventCount += 1;
+    // eslint-disable-next-line no-console
+    console.error(`[worker] ipc send failed, event dropped (total=${droppedEventCount}, type=${type})`);
+  }
 }
 
 function loopEventPayload(event) {

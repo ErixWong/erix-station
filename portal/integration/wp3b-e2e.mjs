@@ -36,6 +36,15 @@ function dockerStdin(args, input) {
   });
 }
 
+// M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
+// 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
+const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
+function removeDbDir() {
+  const parent = path.posix.dirname(DB_DIR);
+  const name = path.posix.basename(DB_DIR);
+  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
+}
+
 function compose(args, env = {}) {
   return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
     encoding: 'utf8',
@@ -194,14 +203,14 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     safe(() => docker('rmi -f erix-station/portal:local erix-station/mock-llm:local erix-station/fde:local 2>/dev/null || true'));
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-    safe(() => docker('run --rm -v /docker:/docker alpine rm -rf /docker/station-db'));
+    removeDbDir();
   };
   t.after(cleanup);
 
   try {
     // 0) 预清理
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('run --rm -v /docker:/docker alpine rm -rf /docker/station-db'));
+    removeDbDir();
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
 
     // 1) 构建真实 runner 镜像（build context runner/）
