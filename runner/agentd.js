@@ -860,6 +860,11 @@ function shutdown() {
   log('info', 'shutdown: draining runs');
   for (const ctx of state.runs.values()) {
     abortRun(ctx, 'agent_shutdown');
+    // 崩溃恢复方案 B（§6.4/§9.6）：agent 关停属「容器是牲口」——不写终态（U2），
+    // 让租约过期后由 portal re-claim（attempt+1、resume）收敛。finishing=true 挡住
+    // onWorkerFinished 的 U2 写入（F4 修复后 dropped 也会尝试 U2，这里必须显式豁免），
+    // 否则容器 restart 会被误判为永久 failed、恢复路径被劫持（e2e 实测回归）。
+    ctx.finishing = true;
   }
   // 给 worker 5s 宽限后退出；tini 会转发信号并 reap。
   setTimeout(() => process.exit(0), 5000);
