@@ -29,7 +29,7 @@
 |---|---|---|---|---|---|---|
 | `station-edge`（Traefik） | `TRAEFIK_IMAGE`（官方 `traefik:v3`） | 生产 `traefik:v3.<minor>.<patch>` **再 pin digest**（env §10 ⚠️） | `traefik --configFile=/etc/traefik/traefik.yml`（静态配置见 §4） | **root**（官方镜像默认；需绑 80/443 与写 `acme.json`） | `unless-stopped` | P1 ✅ |
 | `station-portal` | `PORTAL_IMAGE`（自构建，build context `portal/`） | `erix-station/portal:<git-sha>` 不可变 tag，部署时 pin digest | `node portal/src/cli.js serve`（零依赖 Node，Q7 已定稿 (a)） | **WP2a 起 `root`（`PORTAL_RUNTIME_UID=0`）**：materializer 需 chown 工作区（1000:1000）、写 Traefik 动态配置（600）、经 socket-proxy 调 Docker API（user-space §6.1）；compose 加固 `no-new-privileges` + `cap_drop: [ALL]`，并回加 `cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]`（WP1 skeleton 原为 `node` 非 root，已切回） | `unless-stopped` | P1 ✅ |
-| `station-db` | `DB_IMAGE`（官方 `postgres:16`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
+| `station-db` | `POSTGRES_IMAGE`（官方 `postgres:16.15`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
 | `station-docker-proxy`（自研 admission proxy） | 自构建（build context `deploy/fde-proxy/`，零依赖 Node） | `erix-station/fde-proxy:<git-sha>` 不可变 tag | `node deploy/fde-proxy/server.js` | `user: "0:1000"`（root 读 sock + gid 1000 穿越用户空间；`no-new-privileges` + `cap_drop: [ALL]` + `read_only`；**方法+路径白名单 12 条 + create 参数级校验**，见 §5.1） | `unless-stopped` | P1 ✅ |
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
 | `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
@@ -254,7 +254,7 @@
 
 ## 6. FDE 容器创建契约（portal 经 Docker API，模板化）
 
-> ⚠️ **WP2b 已交付**：portal 经 socket-proxy（`POST=1`）创建/启动/停止/删除 FDE 容器；本节字段级契约为 `portal/src/provisioner.js` 的实现依据（创建字段 allowlist 见 §5 B6）。
+> ⚠️ **WP2b 已交付**：portal 经 **`station-docker-proxy`**（自研 admission proxy，方法+路径白名单 12 条 + create 参数级 allowlist）创建/启动/停止/删除 FDE 容器；本节字段级契约为 `portal/src/provisioner.js` 的实现依据（创建字段 allowlist 见 §5.1）。
 >
 > 路径/UID/权限的**完整契约**以 [`user-space.md`](user-space.md) 为准（本文 §6 引用、不重写）。以下字段级契约供 portal 的容器创建实现照做。
 
@@ -370,14 +370,14 @@
 | 3 | 容器内用户名固定 `erix` | 固定 `erix`（user-space §2.4 同口径） |
 | 4 | 日志轮转 `max-size`/`max-file` 具体值 | env §11.4 运维约定 |
 
-### 9.2 转派同步点（本轮不改，需另开轮次）
+### 9.2 转派同步点（已销账）
 
 | # | 目标文档 | 需同步 |
 |---|---|---|
 | S2 | `data/model.md` §2.2 | ✅ 已落地：`allocated → active` 定案为「首次 forward-auth 放行」（model.md 已改为定稿口径） |
 | S3 | `data/schema.sql` | ✅ 已落地：`users.fde_name` CHECK 与 `schema_migrations` 表均已入库 |
 | S4 | `api/portal.md` §9（internal） | 无需新增端口上报端点（§8.6 选 forward-auth 触发，不选 runner 上报）——确认不新增即可 |
-| S5 | `docs/README.md` 待补齐清单 | 新增 D8 记录本文为「P1 部署契约」已交付（原「`deploy/` 待建」仍成立，本文是 `deploy/` 的生成依据） |
+| S5 | `docs/README.md` 待补齐清单 | 记录本文为「P1 部署契约」已交付——`deploy/` 已落地并运行（README「现在有什么」已更新），本文是其契约依据 |
 
 ---
 

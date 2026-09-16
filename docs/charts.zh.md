@@ -32,7 +32,7 @@ flowchart LR
 - **六个主体**：浏览器、Traefik、Portal、DB、FDE 容器、LLM 网关——所有线都只连它们
 - **一切流量只过 Traefik**：浏览器、容器、LLM 全是；「路由表里没有 = 不可达」
 - **Portal 是 DB 唯一写方**：容器不直连 DB，事件/状态全经 internal API 由 portal 落库
-- **容器只出站**：零监听、零平台密钥（仅 per-container token），派单走 SSE 下行
+- **容器只出站**：平台通道零入站监听、零平台密钥（仅 per-container token），派单走 SSE 下行
 - **LLM 凭据在边缘注入**：容器内只有占位 key，真实虚拟 key 由 Traefik 按来源子网覆盖注入
 
 ---
@@ -50,9 +50,9 @@ flowchart TB
     TRA["station-edge（Traefik）<br/>host 网络，独占 80/443<br/>TLS · 按 host 路由 · forwardAuth<br/>LLM 凭据按来源子网注入"]
 
     subgraph backend["backend 网络 172.30.0.0/24"]
-        POR["station-portal :8080<br/>publish 仅 127.0.0.1<br/>唯一挂 docker.sock"]
+        POR["station-portal :8080<br/>publish 仅 127.0.0.1<br/>DOCKER_HOST=tcp://station-docker-proxy:2375"]
         DB2[("station-db（Postgres）<br/>状态真相：用户/会话/transcript<br/>事件/端口/用量/审计")]
-        LLM["llm-gateway（LiteLLM 等）<br/>唯一 LLM 出口<br/>数据面回环 :4000 · admin 不发布"]
+        LLM["llm-gateway（LiteLLM）<br/>唯一 LLM 出口<br/>数据面回环 :4000 · admin 不发布"]
     end
 
     subgraph fdeA["fde-alice（10.200.1.0/29 独占）"]
@@ -88,6 +88,8 @@ flowchart TB
     POR -- "物化用户空间<br/>/srv/erix/users/<fde> → HOME" --> CS
     RUN -.-> GIT
     RUN -. "非白名单目的地：网络层不可达" .-> EGRESS
+    AGD <-.-> BLOCK
+    fdeB <-.-> BLOCK
 ```
 
 ### 要点
@@ -98,7 +100,7 @@ flowchart TB
 - **每 FDE 一条独占 `/29`**：`fde-alice` / `fde-bob` 互不相通，隔离由拓扑保证（DOCKER-ISOLATION），零配置
 - **容器 → portal 全出站、经 Traefik**：ipAllowList 由 `fde_networks` 精确派生，回环到 portal
 - **LLM 身份 = 来源子网**：Traefik `ClientIP` 判定后覆盖注入 `Authorization`；无匹配来源 404 = 默认拒绝
-- **portal 是唯一控制面写手**：唯一挂 docker.sock；端口分配 + route outbox 同事务落 DB，reconciler 幂等发布路由
+- **portal 是唯一控制面写手**：docker.sock 只挂 station-docker-proxy（portal 经 proxy 访问 Docker API）；端口分配 + route outbox 同事务落 DB，reconciler 幂等发布路由
 
 ### 为什么这样设计网络（安全考量）
 
@@ -109,7 +111,7 @@ flowchart TB
 - **FDE 之间互不可达（防失控）**：横向越权的根因是共享网络——原 `control` 共享网络因此被取消。每 FDE 独占 `/29`，跨 bridge 转发被 DOCKER-ISOLATION 丢弃，隔离零配置、无第二条路
 - **容器 → 宿主服务也要堵**：实测 FDE 容器经网关 IP 可达宿主 gitea/mssql/portainer——故用**分层防火墙**（INPUT 管宿主本地服务 + DOCKER-USER 管转发/publish），规则由 `fde_networks` 精确 CIDR 生成
 - **身份 = 网络位置**：internal API 与 LLM 链路都按来源子网判定（ipAllowList / ClientIP），凭据由 Traefik 覆盖注入——凭证偷不走、伪造头被 `aliasHeadersStrategy: delete` 与「不读 X-Forwarded-For」堵死
-- **纵深防御**：拓扑隔离（网络不可达）+ 边缘认证（forwardAuth）**两层缺一不可**；容器零监听、零平台密钥 → 即使被攻破也无凭据可偷、无入口可打
+- **纵深防御**：拓扑隔离（网络不可达）+ 边缘认证（forwardAuth）**两层缺一不可**；容器平台通道零入站、零平台密钥 → 即使被攻破也无凭据可偷、无入口可打
 - **明示接受的残余风险**：FDE 是自己容器的 root，可伪造**自己的**事件/用量；跨 FDE 由 portal 归属校验挡住（不能影响他人、不能越权读 DB/凭据）——这是有意为之的取舍，不是疏漏
 
 ---
@@ -174,8 +176,8 @@ sequenceDiagram
     A->>T: GET alice-p-proj1-4000.fde.example.com
     T->>P: forwardAuth（查 preview_grants + exposure）
     P-->>T: 200 放行（首放行：allocation → active）
-    T->>R: strip-cookie 后直连容器 IP 10.200.1.2:4000
-    R-->>A: dev server 页面（iframe 内，零改造）
+    T->>CS: strip-cookie 后代理到容器 10.200.1.2:4000（dev server）
+    CS-->>A: dev server 页面（iframe 内，零改造）
     end
 
     rect rgb(245, 255, 245)
@@ -191,7 +193,7 @@ sequenceDiagram
 
 - **阶段 1 认证全在边缘**：SSO/OIDC + session cookie；应用自身不感知认证
 - **阶段 2 portal 不主动连容器**：派单 hint 走既有 SSE 长连接，agentd 出站 claim（租约 + 心跳）
-- **阶段 3 是系统心脏**：LLM 身份靠来源子网、状态靠出站上报落 DB——容器零监听、零密钥、不碰 DB
+- **阶段 3 是系统心脏**：LLM 身份靠来源子网、状态靠出站上报落 DB——容器平台通道零入站、零密钥、不碰 DB
 - **阶段 4 事件先落 DB 再推 SSE**：portal 重启不杀任务、多端同步、断线按 seq 补发
 - **阶段 5 预览零改造**：forwardAuth 边缘授权 + strip-cookie，dev server 无感知
 - **阶段 6 记账唯一权威**：`run_end` 由 portal 合成；usage 以终态上报为准，与网关用量定期对账
@@ -212,7 +214,7 @@ flowchart TB
     end
 
     subgraph access["访问时刻（每次请求）"]
-        BR2["浏览器<br/>https://alice-p-proj1-4000.fde.erix.vip"] --> T2["Traefik :443<br/>TLS 泛域名证书终结"]
+        BR2["浏览器<br/>https://alice-p-proj1-4000.fde.example.com"] --> T2["Traefik :443<br/>TLS 泛域名证书终结"]
         T2 --> FA["forwardAuth → portal<br/>hostname 查 allocation → 查 preview_grants<br/>→ 比对 fde_id + exposure（每次判定写 audit_log）"]
         FA -- "放行（首放行：allocated → active）" --> SC["strip-cookie<br/>预览凭证绝不透传上游"]
         SC --> IP["直连容器 IP :4000<br/>dev server 零改造，全程裸 HTTP"]
@@ -223,6 +225,6 @@ flowchart TB
 
 - **DB 是真相，路由是影子**：分配、改配、回收全是 DB 操作；Traefik 配置、容器内 ports.json、URL 三处派生物自动同步——不存在任何「手工同步」步骤，也没有「FDE 自注册路由」的口子。**路由表里没有 = 不可达**是一条可验证的安全性质
 - **域名动态获得、不可自选**：hostname 由 grammar（fde + 项目名 + 端口）机械生成——自由拼域名被刻意禁止，否则上面的安全性质就被「我给自己的服务起个名」绕开；泛域名 DNS + 泛域名证书让每条新分配**零 DNS/证书操作**
-- **认证全在边缘，dev server 零改造**：agent 写的 app 不加登录、不管 TLS、不配 CORS；forwardAuth 在 Traefik 中间件层完成判定，凭证体系（一次性 ticket → host-only 预览 cookie）与 portal 登录态隔离——链接转发给别人 = 401
+- **认证全在边缘，dev server 零改造**：agent 写的 app 不加登录、不管 TLS、不配 CORS；forwardAuth 在 Traefik 中间件层完成判定，凭证体系（一次性 ticket → host-only 预览 cookie）与 portal 登录态隔离——链接转发给别人 = 403（preview_ticket_required / preview_ticket_used）
 - **加密责任集中一处**：容器内裸 HTTP（dev server 原生形态），TLS 由 Traefik 无缝接管；明文只存在于单 FDE 独占 `/29` 内——不存在中间人位置
 - **监听面与可达面精确相等**：dev server 绑 0.0.0（反常规）只因唯一的客户端是宿主 Traefik；端口不 publish、跨 FDE 被 DOCKER-ISOLATION 拦——「监听 0.0.0.0」的实际可达范围收敛为边缘一个点

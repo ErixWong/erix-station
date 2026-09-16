@@ -188,7 +188,7 @@
 | `allocations[]` | array | 该项目（`project_id`）当前所有未释放分配（`state ∈ {allocated, active}`）的投影 |
 | `allocations[].scope/port/role/run_id/url/exposure/state` | — | 与 `port_allocations` 列一一对应（model §1.9）；`run_id` 项目级恒 `null`，run 级为 run UUID 字符串 |
 
-**序列化规则（幂等前提）**：对象键按字典序、2 空格缩进、末尾换行。同一 DB 快照 → 字节级相同的文件（§5.5）。
+**序列化规则（幂等前提）**：对象键序固定（按渲染模板插入序，非字典序）、2 空格缩进、末尾换行。同一 DB 快照 → 字节级相同的文件（§5.5）。
 
 #### 4.3.2 `config.json`（LLM 配置，占位 key + endpoint）
 
@@ -196,31 +196,33 @@
 
 ```json
 {
-  "default": {
-    "apiKey": "erix-placeholder",
-    "endpoint": "https://llm.erix.vip/v1",
-    "model": "claude-sonnet"
-  },
-  "audit": {
-    "apiKey": "erix-placeholder",
-    "endpoint": "https://llm.erix.vip/v1",
-    "model": "claude-haiku"
-  },
-  "fold": {
-    "apiKey": "erix-placeholder",
-    "endpoint": "https://llm.erix.vip/v1",
-    "model": "claude-haiku"
+  "slots": {
+    "default": {
+      "apiKey": "erix-placeholder",
+      "endpoint": "https://llm.erix.vip/v1",
+      "model": "claude-sonnet"
+    },
+    "audit": {
+      "apiKey": "erix-placeholder",
+      "endpoint": "https://llm.erix.vip/v1",
+      "model": "claude-haiku"
+    },
+    "fold": {
+      "apiKey": "erix-placeholder",
+      "endpoint": "https://llm.erix.vip/v1",
+      "model": "claude-haiku"
+    }
   }
 }
 ```
 
 | 项 | 取值 | 说明 |
 |---|---|---|
-| `*.apiKey` | `"erix-placeholder"`（占位哨兵值） | **非真实凭据**。worker 依此发送 `Authorization: Bearer erix-placeholder`，Traefik 在 `llm.<base>` 路由用 `customRequestHeaders` **覆盖**为真实虚拟 key（topology §10 证据 8）。**真实 key 永不物化进容器**（D-4）。 |
-| `*.endpoint` | `https://llm.<base>/v1`（`llm.<base>` = `llm.erix.vip`，env §10 `LLM_HOST`） | 容器内经 `--add-host llm.<base>:<本 FDE 网关 IP>` 解析到 Traefik host:443（env §0/§1）；**不写 A 记录、不进 DNS**。 |
-| `*.model` | `default`/`audit`/`fold` 三个 slot 的模型名 | 平台默认值；`audit`/`fold` 用便宜模型（规格 §11.4）。 |
+| `slots.*.apiKey` | `"erix-placeholder"`（占位哨兵值） | **非真实凭据**。worker 依此发送 `Authorization: Bearer erix-placeholder`，Traefik 在 `llm.<base>` 路由用 `customRequestHeaders` **覆盖**为真实虚拟 key（topology §10 证据 8）。**真实 key 永不物化进容器**（D-4）。 |
+| `slots.*.endpoint` | `https://llm.<base>/v1`（`llm.<base>` = `llm.erix.vip`，env §10 `LLM_HOST`） | 容器内经 `--add-host llm.<base>:<本 FDE 网关 IP>` 解析到 Traefik host:443（env §0/§1）；**不写 A 记录、不进 DNS**。 |
+| `slots.*.model` | `default`/`audit`/`fold` 三个 slot 的模型名 | 平台默认值；`audit`/`fold` 用便宜模型（规格 §11.4）。 |
 
-> ⚠️ 待决策者确认 + 上游对齐项：`config.json` 的**确切字段名与嵌套结构**必须与 erix-agent `config/*` 的 `createJsonFileModelConfigProvider` 读取格式一致（runner §1.3 契约锚点）。本表给出的是平台职责范围内**必须保证的语义**（三个 slot、占位 key、endpoint）；若上游字段名不同（如 `apiKey` vs `key`），实现时按上游为准，本文只承诺「占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot」这一语义。此项同步点见 §13 跨文件清单。
+> **已对齐上游（v0.3.5 `src/config/json-file.js` 实测）**：`config.json` 顶层键为 **`slots`**，即 `{"slots": {"default": {apiKey, endpoint, model}, "audit": …, "fold": …}}`；`createJsonFileModelConfigProvider` 只认 `parsed.slots`（缺 `slots` → 配置解析失败）。字段名 `apiKey`/`endpoint`/`model` 与实现（materializer）一致；平台承诺语义 =「占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot」。
 
 #### 4.3.3 `manifest.json`（多文件一致性提交点）
 
@@ -290,7 +292,7 @@ agentd / worker **不直接裸读** `ports.json` / `config.json`：一律「先�
 
 ### 5.5 幂等序列化
 
-materializer 对所有 JSON 统一「对象键字典序 + 2 空格缩进 + 末尾换行」；Markdown/纯文本用固定模板渲染。保证：**同一 DB 快照 → 字节级相同输出**。这使「重复物化」「全量重物化」都幂等（§9），且 `sha256` 稳定、可比对。
+materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序）+ 2 空格缩进 + 末尾换行」；Markdown/纯文本用固定模板渲染。保证：**同一 DB 快照 → 字节级相同输出**。这使「重复物化」「全量重物化」都幂等（§9），且 `sha256` 稳定、可比对。
 
 ---
 
@@ -325,7 +327,7 @@ materializer 对所有 JSON 统一「对象键字典序 + 2 空格缩进 + 末�
 
 materializer 所有写入路径**只能由 DB 白名单值派生**，并做符号链接防御：
 
-1. **名字白名单**：`<fde>` 与 `<project>` 只取 DB 值，`<project>` 受 `CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,62}$')` 约束（schema.sql），`<fde>` 同受用户名校验——**不可能**出现 `..`、`/`、绝对路径、空段。任何拼出的路径先 `realpath`/规范校验，越出 `/srv/erix/users/<fde>/` 即拒。
+1. **名字白名单**：`<fde>` 与 `<project>` 只取 DB 值，`<project>` 受 `CHECK (name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')` 约束（schema.sql），`<fde>` 同受用户名校验——**不可能**出现 `..`、`/`、绝对路径、空段。任何拼出的路径先 `realpath`/规范校验，越出 `/srv/erix/users/<fde>/` 即拒。
 2. **`O_NOFOLLOW` + `O_EXCL`**：写 temp 用 `O_CREAT|O_EXCL|O_NOFOLLOW`；rename 前对**目标路径的每一段目录**做 `lstat` 校验：是符号链接 → **拒绝 + 告警**（视为 FDE 篡改，`materialize_path_tampered`）。`rename()` 本身**不跟随目标文件的符号链接**（替换的是链接本身），所以最终文件不能被预置 symlink 劫持；真正要防的是**目录段**被换成 symlink（如把 `projects/proj1/.erix` 换成指向他 FDE 目录的链接）。
 3. **先建目录、后写文件**：materializer 先 `mkdir -p` 并校验目录属主（不满足则 `chown`/重建），再写文件；目录缺失时创建，目录为 symlink 时拒写。
 4. **从不读回用户空间内容做决策**：materializer 的输入**只来自 DB**，不把用户空间文件当输入——避免「FDE 篡改文件 → 平台行为被污染」。
@@ -500,10 +502,10 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | # | 目标文档 | 需同步点 | 本文对应 |
 |---|---|---|---|
 | S1 | `data/schema.sql` + `data/model.md` | ✅ 已落地：新增 `materialize_outbox` + `materialize_revisions`（A7，见 schema.sql §9 / model.md §1.22） | §7.1 / §10 / §12-2 |
-| S2 | `data/model.md` §1.9 / §2.2 | `ports.json` 投影范围与 `allocated→active` 触发条件、`generation` 字段来源 | §4.3.1 |
+| S2 | `data/model.md` §1.9 / §2.2 | ✅ 已同步（`allocated→active` 定稿 + `generation` 字段已落 model.md） | §4.3.1 |
 | S3 | `design/runner-integration.md` §7.5 | spool 路径 `~/.cache/station/spool/` 与本文 §4.2 已对齐（无冲突，确认即可）；§5 `run_start` 载荷若需携带「本 run 端口快照」则补字段（P2 run 级端口） | §3 / §4.3.1 |
-| S4 | `design/runner-integration.md` §6.3 | worker 读 `config.json` 前先经 manifest 校验（本文 §5.4 硬规则） | §5.4 |
-| S5 | `api/portal.md` §3.3 | `POST /api/projects` 响应/语义补「项目目录与平台文件由 materializer 物化」的说明 | §9.1 |
+| S4 | `design/runner-integration.md` §6.3 | worker 读 `config.json` 前先经 manifest 校验（本文 §5.4 硬规则） | ✅ 已同步（runner §6.3-1 已补 manifest 校验步骤） |
+| S5 | `api/portal.md` §3.3 | `POST /api/projects` 响应/语义补「项目目录与平台文件由 materializer 物化」的说明 | ⚠️ 未落地（portal.md §3.3 尚无此说明，待补） |
 | S6 | `docs/README.md` 待补齐清单 | 新增 D 项或记录本文为「用户空间物化契约」已交付 | 本文件 |
 
 ---

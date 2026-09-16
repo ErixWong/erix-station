@@ -52,7 +52,7 @@ flowchart TB
     subgraph backend["backend network 172.30.0.0/24"]
         POR["station-portal :8080<br/>publishes only 127.0.0.1<br/>the only container with docker.sock"]
         DB2[("station-db (Postgres)<br/>source of truth: users/sessions/transcripts<br/>events/ports/usage/audit")]
-        LLM["llm-gateway (LiteLLM etc.)<br/>the only LLM egress<br/>data plane loopback :4000 · admin not published"]
+        LLM["llm-gateway (LiteLLM)<br/>the only LLM egress<br/>data plane loopback :4000 · admin not published"]
     end
 
     subgraph fdeA["fde-alice (10.200.1.0/29, exclusive)"]
@@ -88,6 +88,8 @@ flowchart TB
     POR -- "materialize user space<br/>/srv/erix/users/<fde> → HOME" --> CS
     RUN -.-> GIT
     RUN -. "non-allowlisted destinations: unreachable at network layer" .-> EGRESS
+    AGD <-.-> BLOCK
+    fdeB <-.-> BLOCK
 ```
 
 ### Key points
@@ -174,7 +176,7 @@ sequenceDiagram
     A->>T: GET alice-p-proj1-4000.fde.example.com
     T->>P: forwardAuth (checks preview_grants + exposure)
     P-->>T: 200 pass (first pass: allocation → active)
-    T->>R: strip-cookie, then direct to container IP 10.200.1.2:4000
+    T->>CS: strip-cookie, then proxy to container 10.200.1.2:4000 (dev server)
     R-->>A: dev server page (in iframe, zero modification)
     end
 
@@ -212,7 +214,7 @@ flowchart TB
     end
 
     subgraph access["Access time (every request)"]
-        BR2["Browser<br/>https://alice-p-proj1-4000.fde.erix.vip"] --> T2["Traefik :443<br/>TLS terminated with wildcard cert"]
+        BR2["Browser<br/>https://alice-p-proj1-4000.fde.example.com"] --> T2["Traefik :443<br/>TLS terminated with wildcard cert"]
         T2 --> FA["forwardAuth → portal<br/>hostname → allocation lookup → preview_grants<br/>→ fde_id + exposure check (every decision writes audit_log)"]
         FA -- "pass (first pass: allocated → active)" --> SC["strip-cookie<br/>preview credentials never reach the upstream"]
         SC --> IP["direct to container IP :4000<br/>dev server zero-modification, plain HTTP all the way"]

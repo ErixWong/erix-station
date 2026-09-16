@@ -455,6 +455,8 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 
 ### 7.5 spool 契约（事件通道应急缓冲，issue #8）
 
+> **P1 实现状态**：P1 为**内存缓冲**（固定窗口 + 退避重试，`runner/agentd.js`），**spool 落盘未实现**——本节落盘/fsync/`.ack` 游标/配额（`spool_full`）/启动扫描重传为 P2 契约；`runner/README.md` 与 `user-space.md` 的目录权限按契约先行保留。
+>
 > spool 是**容器本地投递缓冲**，不是真相（真相在 `run_events`，第③层）；不是 transcript 副本（D2'）。容器内路径与用户空间物化契约对齐——**见 `docs/design/user-space.md`**；本文按 `~/.cache/station/spool/<run_id>.jsonl`（= `/home/<user>/.cache/station/spool/`，映射宿主 `/srv/erix/users/<fde>/home/.cache/station/spool/<run_id>.jsonl`，HOME bind mount 持久卷）写死，最终以 user-space.md 为准。
 
 | 项 | 契约 |
