@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { hashToken, audit } from './auth.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
+const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
 const HOLD_MS_MAX = 30000; // claim 长轮询 hold 上限
 const MAX_EVENTS_PER_BATCH = 200; // runner §7.2
 const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
@@ -136,7 +137,7 @@ export async function authenticateContainer(pool, token, { now = new Date() } = 
 async function fetchRun(pool, runId, userId, { forUpdate = false } = {}) {
   const lock = forUpdate ? ' FOR UPDATE' : '';
   const res = await pool.query(
-    `SELECT r.id, r.session_id, r.status, r.cancel_requested_at, r.rounds, r.usage, r.error,
+    `SELECT r.id, r.session_id, r.status, r.cancel_requested_at, r.rounds, r.usage, r.error, r.termination,
             s.user_id, s.project_id
        FROM runs r
        JOIN chat_sessions s ON s.id = r.session_id
@@ -151,15 +152,16 @@ async function fetchRun(pool, runId, userId, { forUpdate = false } = {}) {
   return row;
 }
 
-/** 校验 X-Claim-Token 与当前有效租约一致（防 re-claim 后旧 agentd 双写，runner §6.4）。 */
+/** 校验 X-Claim-Token 与当前有效租约一致（防 re-claim 后旧 agentd 双写，runner §6.4）。
+ *  F1：同时要求 lease_until > now()（DB 时钟），过期租约一律 409 lease_lost，不得继续写。 */
 async function assertClaimToken(pool, runId, claimToken) {
   const res = await pool.query(
-    `SELECT claim_token, status FROM run_queue WHERE run_id = $1`,
+    `SELECT claim_token, status FROM run_queue WHERE run_id = $1 AND lease_until > now()`,
     [runId],
   );
   const row = res.rows?.[0];
   if (!row || row.claim_token !== claimToken) {
-    throw new InternalError(409, 'lease_lost', 'claim token mismatch (run reclaimed)');
+    throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
   }
   return row;
 }
@@ -286,7 +288,11 @@ export function broadcastApprovalDecision(userId, data) {
 
 export function broadcastRevoke(containerId, data) {
   const client = sseClients.get(containerId);
-  if (client) writeSseEvent(client.res, 'revoke', data);
+  if (!client) return;
+  writeSseEvent(client.res, 'revoke', data);
+  // F7：token 吊销后服务端主动关闭已建立的 SSE 连接（agentd 收到 revoke 即停领新任务并退出）。
+  if (typeof client.res.end === 'function') client.res.end();
+  sseClients.delete(containerId);
 }
 
 // ---- SSE 写封装 ----
@@ -364,6 +370,10 @@ export async function setRunState(pool, { container, user, runId, claimToken, bo
 
   const run = await fetchRun(pool, runId, user.id);
   if (isTerminal(run.status)) {
+    // F4：终态幂等重放——相同终态载荷返回 200（响应丢失后重试安全）；载荷不同才 409 run_terminal。
+    if (state === run.status && terminalPayloadMatches(run, body)) {
+      return { state: run.status, idempotent: true };
+    }
     throw new InternalError(409, 'run_terminal', 'run already terminal');
   }
 
@@ -374,18 +384,40 @@ export async function setRunState(pool, { container, user, runId, claimToken, bo
       });
     }
     await assertClaimToken(pool, runId, claimToken);
-    await pool.query(
+    const upd = await pool.query(
       `UPDATE runs r
           SET status = 'running', started_at = COALESCE(r.started_at, now())
          FROM run_queue q
         WHERE r.id = $1 AND q.run_id = r.id AND q.claim_token = $2
+          AND q.lease_until > now()
           AND r.status IN ('queued','running')`,
       [runId, claimToken],
     );
+    // F6：CAS 查影响行数——伪造/过期 token 竞态下 0 行生效不得返回成功。
+    if (upd.rowCount === 0) {
+      throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
+    }
     return { state: 'running' };
   }
 
   return finishRun(pool, { user, run, runId, claimToken, state, body });
+}
+
+/** F4：终态载荷一致判定（同 termination/error/rounds/usage → 幂等成功）。 */
+function terminalPayloadMatches(run, body) {
+  const stored = {
+    termination: run.termination ?? null,
+    error: run.error ?? null,
+    rounds: run.rounds ?? 0,
+    usage: run.usage ?? { input_tokens: 0, output_tokens: 0 },
+  };
+  const incoming = {
+    termination: body?.termination ?? null,
+    error: body?.error ?? null,
+    rounds: body?.rounds ?? 0,
+    usage: body?.usage ?? { input_tokens: 0, output_tokens: 0 },
+  };
+  return canonicalHash(stored) === canonicalHash(incoming);
 }
 
 /** 终态收敛事务（runner §7.6 加锁顺序：锁 run → 校验租约 → 写终态 → queue 收敛 → messages/usage/run_end）。 */
@@ -418,9 +450,9 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
         details: { from: r.status, to: state },
       });
     }
-    const q = await client.query(`SELECT claim_token, attempts FROM run_queue WHERE run_id = $1 FOR UPDATE`, [runId]);
+    const q = await client.query(`SELECT claim_token, attempts FROM run_queue WHERE run_id = $1 AND lease_until > now() FOR UPDATE`, [runId]);
     if (!q.rows?.[0] || q.rows[0].claim_token !== claimToken) {
-      throw new InternalError(409, 'lease_lost', 'claim token mismatch (run reclaimed)');
+      throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
     }
 
     const payload = {
@@ -536,9 +568,9 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     if (!r) throw new InternalError(404, 'run_not_found', 'run not found');
     if (r.user_id !== user.id) throw new InternalError(403, 'run_ownership_mismatch', 'run does not belong to this container');
     if (isTerminal(r.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
-    const q = await client.query(`SELECT claim_token FROM run_queue WHERE run_id = $1`, [runId]);
+    const q = await client.query(`SELECT claim_token FROM run_queue WHERE run_id = $1 AND lease_until > now()`, [runId]);
     if (!q.rows?.[0] || q.rows[0].claim_token !== claimToken) {
-      throw new InternalError(409, 'lease_lost', 'claim token mismatch (run reclaimed)');
+      throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
     }
 
     let stored = 0;
@@ -625,11 +657,20 @@ export async function heartbeat(pool, { container, user, body }) {
       results.push({ run_id: r.run_id, lease: 'lease_lost', reason });
       continue;
     }
+    // F1：token 匹配但租约已过期 → 不得续期，返回 lease_lost（agentd 应 re-claim）。
+    if (!q.lease_until || new Date(q.lease_until).getTime() <= Date.now()) {
+      results.push({ run_id: r.run_id, lease: 'lease_lost', reason: 'expired' });
+      continue;
+    }
     const renewed = await pool.query(
       `UPDATE run_queue SET lease_until = now() + interval '${LEASE_SECONDS} seconds'
-        WHERE run_id = $1 AND claim_token = $2 RETURNING lease_until`,
+        WHERE run_id = $1 AND claim_token = $2 AND lease_until > now() RETURNING lease_until`,
       [r.run_id, r.claim_token],
     );
+    if (renewed.rows.length === 0) {
+      results.push({ run_id: r.run_id, lease: 'lease_lost', reason: 'expired' });
+      continue;
+    }
     results.push({ run_id: r.run_id, lease: 'renewed', lease_until: renewed.rows?.[0]?.lease_until ?? null });
   }
 
@@ -876,7 +917,7 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
   try {
     await client.query('BEGIN');
     const runRow = await client.query(
-      `SELECT r.id, r.status, s.user_id
+      `SELECT r.id, r.session_id, r.status, s.user_id
          FROM runs r JOIN chat_sessions s ON s.id = r.session_id
         WHERE r.id = $1 FOR UPDATE`,
       [runId],
@@ -884,34 +925,56 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
     const r = runRow.rows?.[0];
     if (!r) throw new InternalError(404, 'run_not_found', 'run not found');
     if (r.user_id !== user.id) throw new InternalError(403, 'run_ownership_mismatch', 'run does not belong to this container');
-    if (isTerminal(r.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
 
     const q = await client.query(
-      `SELECT status, attempts, max_attempts, claim_token FROM run_queue WHERE run_id = $1 FOR UPDATE`,
+      `SELECT status, attempts, max_attempts, claim_token, lease_until FROM run_queue WHERE run_id = $1 FOR UPDATE`,
       [runId],
     );
     const qrow = q.rows?.[0];
-    if (!qrow || qrow.claim_token !== claimToken) {
+    if (!qrow) throw new InternalError(404, 'run_not_found', 'run not found');
+    if (qrow.claim_token !== claimToken) {
       throw new InternalError(409, 'lease_lost', 'claim token mismatch (run reclaimed)');
     }
+
+    // F5：幂等重放——claim_token 匹配但已非 claimed（首次 release 已收敛）→ 返回首次结果。
+    if (qrow.status !== 'claimed') {
+      const replay = replayReleaseResult(qrow.status, r.status, qrow);
+      await client.query('COMMIT');
+      return { run_id: runId, ...replay };
+    }
+
+    // F1：租约 fencing——仍 claimed 但租约过期 → 409 lease_lost（不处理）。
+    if (!qrow.lease_until || new Date(qrow.lease_until).getTime() <= Date.now()) {
+      throw new InternalError(409, 'lease_lost', 'lease expired');
+    }
+    if (isTerminal(r.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
 
     let outcome;
     let runStatus;
     let queueStatus;
+    // 注意：release 后保留 claim_token（供幂等重放识别），fencing 由 lease_until 清空保证（旧 token 无法续租/写）。
     if (qrow.status === 'cancelled' || r.status === 'cancelling') {
-      await client.query(`UPDATE run_queue SET status='cancelled', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+      await client.query(`UPDATE run_queue SET status='cancelled', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
       await client.query(`UPDATE runs SET status='finished', termination='{"reason":"aborted"}'::jsonb, ended_at=now() WHERE id=$1`, [runId]);
       outcome = 'cancelled';
       runStatus = 'finished';
       queueStatus = 'cancelled';
+      const runEndSeq = await allocSeq(client, r.session_id);
+      await client.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
+          JSON.stringify({ termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) })],
+      );
     } else if (Number(qrow.attempts) < Number(qrow.max_attempts)) {
-      await client.query(`UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+      await client.query(`UPDATE run_queue SET status='pending', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
       await client.query(`UPDATE runs SET status='queued' WHERE id=$1`, [runId]);
       outcome = 'requeued';
       runStatus = 'queued';
       queueStatus = 'pending';
     } else {
-      await client.query(`UPDATE run_queue SET status='done', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+      await client.query(`UPDATE run_queue SET status='done', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
       await client.query(
         `UPDATE runs SET status='failed', error='{"code":"max_attempts_exceeded","message":"attempts exhausted","retryable":false}'::jsonb, ended_at=now() WHERE id=$1`,
         [runId],
@@ -919,6 +982,15 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       outcome = 'failed_max_attempts';
       runStatus = 'failed';
       queueStatus = 'done';
+      const runEndSeq = await allocSeq(client, r.session_id);
+      await client.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
+          JSON.stringify({ termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
+            error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } })],
+      );
     }
 
     await client.query('COMMIT');
@@ -937,4 +1009,126 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
   } finally {
     client.release();
   }
+}
+
+/** F5：由 queue 状态重建首次 release 的结果（幂等重放）。 */
+function replayReleaseResult(queueStatus, runStatus, qrow) {
+  const attempts = Number(qrow.attempts);
+  const maxAttempts = Number(qrow.max_attempts);
+  if (queueStatus === 'cancelled') {
+    return { run_status: 'finished', queue_status: 'cancelled', attempts, max_attempts: maxAttempts, outcome: 'cancelled' };
+  }
+  if (queueStatus === 'done') {
+    return { run_status: 'failed', queue_status: 'done', attempts, max_attempts: maxAttempts, outcome: 'failed_max_attempts' };
+  }
+  return { run_status: runStatus ?? 'queued', queue_status: 'pending', attempts, max_attempts: maxAttempts, outcome: 'requeued' };
+}
+
+// ---------------------------------------------------------------------------
+// run 租约 reaper（runner §6.4/§12；schema.sql §8 注释）
+// ---------------------------------------------------------------------------
+
+function sleepReaper(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 单次 reaper 扫描：把 lease_until 过期的 claimed 行按矩阵收敛。
+ *   ① cancelling（用户已 stop 但容器死）→ queue cancelled + runs finished（aborted，A2）；
+ *   ② attempts >= max_attempts → queue done + runs failed(max_attempts_exceeded)（A1 耗尽）；
+ *   ③ attempts < max_attempts → 回 pending（attempts 不变，claim 时已 +1）。
+ * 终态分支（①/②）同事务合成 run_end（F3 口径，runner §7.6）。
+ * @returns {Array<{run_id, outcome, run_status}>}
+ */
+export async function reapExpiredRuns(pool) {
+  const candidates = await pool.query(
+    `SELECT q.run_id, q.attempts, q.max_attempts, r.status, r.session_id
+       FROM run_queue q JOIN runs r ON r.id = q.run_id
+      WHERE q.status = 'claimed' AND q.lease_until < now()`,
+  );
+  const results = [];
+  for (const c of candidates.rows ?? []) {
+    const runId = c.run_id;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const runRow = await client.query(`SELECT id, session_id, status FROM runs WHERE id = $1 FOR UPDATE`, [runId]);
+      const r = runRow.rows?.[0];
+      if (!r) {
+        await client.query('ROLLBACK');
+        continue;
+      }
+      const q = await client.query(
+        `SELECT status, attempts, max_attempts, lease_until FROM run_queue WHERE run_id = $1 FOR UPDATE`,
+        [runId],
+      );
+      const qrow = q.rows?.[0];
+      // 双检：仍在 claimed 且租约确实过期（防与心跳续租竞态）。
+      if (!qrow || qrow.status !== 'claimed' || !qrow.lease_until || new Date(qrow.lease_until).getTime() >= Date.now()) {
+        await client.query('ROLLBACK');
+        continue;
+      }
+
+      if (r.status === 'cancelling') {
+        await client.query(`UPDATE run_queue SET status='cancelled', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+        await client.query(`UPDATE runs SET status='finished', termination='{"reason":"aborted"}'::jsonb, ended_at=now() WHERE id=$1`, [runId]);
+        const runEndSeq = await allocSeq(client, r.session_id);
+        await client.query(
+          `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+           VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+           ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+          [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
+            JSON.stringify({ termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) })],
+        );
+        results.push({ run_id: runId, outcome: 'cancelled', run_status: 'finished' });
+      } else if (Number(qrow.attempts) >= Number(qrow.max_attempts)) {
+        await client.query(`UPDATE run_queue SET status='done', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+        await client.query(
+          `UPDATE runs SET status='failed', error='{"code":"max_attempts_exceeded","message":"attempts exhausted","retryable":false}'::jsonb, ended_at=now() WHERE id=$1`,
+          [runId],
+        );
+        const runEndSeq = await allocSeq(client, r.session_id);
+        await client.query(
+          `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+           VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+           ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+          [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
+            JSON.stringify({ termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
+              error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } })],
+        );
+        results.push({ run_id: runId, outcome: 'failed_max_attempts', run_status: 'failed' });
+      } else {
+        await client.query(`UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+        await client.query(`UPDATE runs SET status='queued' WHERE id=$1`, [runId]);
+        results.push({ run_id: runId, outcome: 'requeued', run_status: 'queued' });
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  return results;
+}
+
+/** 启动 run 租约 reaper 常驻循环（由 cli serve 调用）。 */
+export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = console } = {}) {
+  let stopped = false;
+  (async () => {
+    while (!stopped) {
+      try {
+        await reapExpiredRuns(pool);
+      } catch (err) {
+        log.warn?.(`[reaper] loop error: ${err.message}`);
+      }
+      await sleepReaper(intervalMs);
+    }
+  })();
+  return {
+    stop() {
+      stopped = true;
+    },
+  };
 }

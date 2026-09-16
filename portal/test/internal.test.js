@@ -14,11 +14,14 @@ import {
   setRunState,
   postEvents,
   releaseRun,
+  heartbeat,
+  reapExpiredRuns,
   putCheckpoint,
   getLatestCheckpoint,
   registerSseClient,
   unregisterSseClient,
   broadcastStopRequest,
+  broadcastRevoke,
   notifyRunEnqueued,
   hubStats,
   writeSseEvent,
@@ -253,4 +256,165 @@ test('SSE hub：register/broadcast/run_assigned/stop_request/unregister', async 
   const done = { writableEnded: true, write() { throw new Error('should not write'); } };
   writeSseEvent(done, 'ping', {});
   assert.ok(true);
+});
+
+test('F1：租约过期 fencing——heartbeat/state/events 全 lease_lost（不续租不写）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+
+  // 把 lease_until 改到过去（评审实测：过期 lease 仍被续/写）。
+  pool.queue[0].lease_until = Date.now() - 1000;
+
+  // heartbeat：过期租约不得续期，返回 run 级 lease_lost。
+  const hb = await heartbeat(pool, { container, user, body: { agent_version: '0.1', runs: [{ run_id: runId, status: 'running', worker_pid: 1, claim_token: claimToken }] } });
+  assert.equal(hb.runs[0].lease, 'lease_lost');
+  assert.equal(hb.runs[0].reason, 'expired');
+  assert.ok(pool.queue[0].lease_until < Date.now(), '过期租约未被续期');
+
+  // state running → 409 lease_lost。
+  await assert.rejects(
+    () => setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'lease_lost',
+  );
+
+  // events → 409 lease_lost。
+  await assert.rejects(
+    () => postEvents(pool, { container, user, runId, claimToken, body: { batch_id: 'b', events: [{ client_event_id: 'run1:1:0', type: 'assistant_delta', ts: null, payload: { text: 'x' } }] } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'lease_lost',
+  );
+});
+
+test('F2：reaper 收敛——过期 claimed 行按矩阵（requeue/耗尽/cancelling）', async () => {
+  // ① attempts < max → requeue（attempts 不变）
+  const a = seedClaimable({ runId: 'run-a', containerId: 'c1', userId: 'u1' });
+  const u = { id: 'u1', login: 'alice' };
+  const container = { id: 'c1', user_id: 'u1' };
+  const ta = await claimRun(a.pool, { container, user: u, capacity: 1, holdMs: 10 });
+  a.pool.runs[0].status = 'running';
+  a.pool.queue[0].lease_until = Date.now() - 1000;
+  const ra = await reapExpiredRuns(a.pool);
+  assert.equal(ra[0].outcome, 'requeued');
+  assert.equal(a.pool.queue[0].status, 'pending');
+  assert.equal(a.pool.runs[0].status, 'queued');
+  assert.equal(a.pool.queue[0].attempts, 1, 'reaper 回 pending 不递增 attempts');
+
+  // ② attempts >= max → done + failed(max_attempts_exceeded) + run_end
+  const b = seedClaimable({ runId: 'run-b', containerId: 'c1', userId: 'u1' });
+  const tb = await claimRun(b.pool, { container, user: u, capacity: 1, holdMs: 10 });
+  b.pool.runs[0].status = 'running';
+  b.pool.queue[0].attempts = 3;
+  b.pool.queue[0].max_attempts = 3;
+  b.pool.queue[0].lease_until = Date.now() - 1000;
+  const rb = await reapExpiredRuns(b.pool);
+  assert.equal(rb[0].outcome, 'failed_max_attempts');
+  assert.equal(b.pool.queue[0].status, 'done');
+  assert.equal(b.pool.runs[0].status, 'failed');
+  assert.ok(b.pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run-b:final:run_end'), '耗尽终态合成 run_end');
+
+  // ③ cancelling → cancelled + finished(aborted) + run_end
+  const c = seedClaimable({ runId: 'run-c', containerId: 'c1', userId: 'u1' });
+  const tc = await claimRun(c.pool, { container, user: u, capacity: 1, holdMs: 10 });
+  c.pool.runs[0].status = 'cancelling';
+  c.pool.queue[0].lease_until = Date.now() - 1000;
+  const rc = await reapExpiredRuns(c.pool);
+  assert.equal(rc[0].outcome, 'cancelled');
+  assert.equal(c.pool.queue[0].status, 'cancelled');
+  assert.equal(c.pool.runs[0].status, 'finished');
+  assert.ok(c.pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run-c:final:run_end'), 'cancelling 终态合成 run_end');
+});
+
+test('F3：U12 release 终态分支（cancelling / 耗尽）合成 run_end', async () => {
+  // cancelling → finished + run_end
+  const a = seedClaimable({ runId: 'run-a', containerId: 'c1', userId: 'u1' });
+  const container = { id: 'c1', user_id: 'u1' };
+  const user = { id: 'u1', login: 'alice' };
+  const ta = await claimRun(a.pool, { container, user, capacity: 1, holdMs: 10 });
+  a.pool.runs[0].status = 'cancelling';
+  await releaseRun(a.pool, { container, user, runId: 'run-a', claimToken: ta.claim_token, body: { reason: 'stop' } });
+  assert.equal(a.pool.runs[0].status, 'finished');
+  assert.ok(a.pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run-a:final:run_end'), 'cancelling release 合成 run_end');
+
+  // 耗尽 → failed + run_end
+  const b = seedClaimable({ runId: 'run-b', containerId: 'c1', userId: 'u1' });
+  const tb = await claimRun(b.pool, { container, user, capacity: 1, holdMs: 10 });
+  b.pool.queue[0].attempts = 3;
+  b.pool.queue[0].max_attempts = 3;
+  await releaseRun(b.pool, { container, user, runId: 'run-b', claimToken: tb.claim_token, body: { reason: 'worker_crashed' } });
+  assert.equal(b.pool.runs[0].status, 'failed');
+  assert.ok(b.pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run-b:final:run_end'), '耗尽 release 合成 run_end');
+});
+
+test('F4：U2 finish 同载荷重放幂等（200），载荷不同 409 run_terminal', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+
+  const payload = { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 10, output_tokens: 3 }, rounds: 1, final_text: 'done' };
+  const r1 = await setRunState(pool, { container, user, runId, claimToken, body: payload });
+  assert.equal(r1.state, 'finished');
+
+  // 同载荷重放 → 200 幂等成功（不再 409）。
+  const r2 = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
+  assert.equal(r2.state, 'finished');
+  assert.equal(r2.idempotent, true);
+
+  // 载荷不同 → 409 run_terminal。
+  await assert.rejects(
+    () => setRunState(pool, { container, user, runId, claimToken, body: { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 9, output_tokens: 2 }, rounds: 1 } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'run_terminal',
+  );
+});
+
+test('F5：U12 release 同 claim_token 重放幂等（不 409）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+
+  const r1 = await releaseRun(pool, { container, user, runId, claimToken, body: { reason: 'worker_crashed' } });
+  assert.equal(r1.outcome, 'requeued');
+
+  // 同 claim_token 重放 → 幂等返回首次结果（不 409）。
+  const r2 = await releaseRun(pool, { container, user, runId, claimToken, body: { reason: 'worker_crashed' } });
+  assert.equal(r2.outcome, 'requeued');
+  assert.equal(r2.run_status, 'queued');
+  assert.equal(r2.queue_status, 'pending');
+
+  // token 不匹配 → 409 lease_lost。
+  await assert.rejects(
+    () => releaseRun(pool, { container, user, runId, claimToken: 'wrong-token', body: { reason: 'x' } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'lease_lost',
+  );
+});
+
+test('F6：setRunState CAS 查影响行数——伪造 token 不得返回成功', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+
+  // 伪造 token：UPDATE 命中 0 行 → 409 lease_lost，且 runs.status 保持 queued。
+  await assert.rejects(
+    () => setRunState(pool, { container, user, runId, claimToken: 'forged-token', body: { state: 'running' } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'lease_lost',
+  );
+  assert.equal(pool.runs[0].status, 'queued');
+});
+
+test('F7：revoke 后已建 SSE 连接被服务端主动关闭', async () => {
+  const res = { written: [], ended: false, destroyed: false, writableEnded: false, write(s) { this.written.push(s); }, end() { this.ended = true; } };
+  registerSseClient('c1', 'u1', res);
+  assert.equal(hubStats().sseClients, 1);
+
+  broadcastRevoke('c1', { reason: 'offboarded' });
+  assert.ok(res.written.some((s) => s.includes('event: revoke')));
+  assert.equal(res.ended, true, 'revoke 后连接被 res.end() 关闭');
+  assert.equal(hubStats().sseClients, 0, 'revoke 后客户端注销');
 });

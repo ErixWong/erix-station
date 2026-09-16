@@ -40,6 +40,12 @@ export class FakeInternalPool {
   }
 
   async query(sql, params = []) {
+    const res = await this._query(sql, params);
+    if (res && res.rows && !('rowCount' in res)) res.rowCount = res.rows.length;
+    return res;
+  }
+
+  async _query(sql, params = []) {
     // ---- authenticateContainer ----
     if (sql.includes('FROM containers c') && sql.includes('JOIN users u')) {
       const tokenHash = params[0];
@@ -90,6 +96,18 @@ export class FakeInternalPool {
       return { rows: [{ queue_id: q.id, run_id: q.run_id, claim_token: q.claim_token, lease_until: q.lease_until, attempts: q.attempts }] };
     }
 
+    // ---- reaper：候选扫描（claimed + 租约过期）----
+    if (sql.includes('FROM run_queue q JOIN runs r') && sql.includes("q.status = 'claimed'")) {
+      const now = Date.now();
+      const rows = this.queue
+        .filter((q) => q.status === 'claimed' && q.lease_until != null && q.lease_until < now)
+        .map((q) => {
+          const r = this._run(q.run_id);
+          return { run_id: q.run_id, attempts: q.attempts, max_attempts: q.max_attempts, status: r?.status, session_id: r?.session_id };
+        });
+      return { rows };
+    }
+
     // ---- fetchRun ----
     if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions s') && sql.includes('WHERE r.id')) {
       const runId = params[0];
@@ -106,6 +124,7 @@ export class FakeInternalPool {
             rounds: r.rounds ?? 0,
             usage: r.usage ?? null,
             error: r.error ?? null,
+            termination: r.termination ?? null,
             user_id: s?.user_id ?? null,
             project_id: s?.project_id ?? null,
           },
@@ -125,6 +144,10 @@ export class FakeInternalPool {
       const runId = params[0];
       const q = this._queue(runId);
       if (!q) return { rows: [] };
+      // F1：SQL 带 lease_until > now() 时应用层在 DB 模拟租约过期 fencing。
+      if (sql.includes('lease_until > now()') && !(q.lease_until != null && q.lease_until > Date.now())) {
+        return { rows: [] };
+      }
       if (sql.includes('FOR UPDATE')) {
         return { rows: [{ claim_token: q.claim_token, attempts: q.attempts, max_attempts: q.max_attempts, status: q.status, lease_until: q.lease_until }] };
       }
@@ -152,6 +175,7 @@ export class FakeInternalPool {
       const r = this._run(runId);
       const q = this._queue(runId);
       if (!r || !q || q.claim_token !== claimToken) return { rows: [] };
+      if (q.lease_until == null || q.lease_until <= Date.now()) return { rows: [] };
       if (!['queued', 'running'].includes(r.status)) return { rows: [] };
       r.status = 'running';
       r.started_at = r.started_at ?? Date.now();
@@ -197,6 +221,7 @@ export class FakeInternalPool {
       const [runId, claimToken] = params;
       const q = this._queue(runId);
       if (!q || q.claim_token !== claimToken) return { rows: [] };
+      if (q.lease_until == null || q.lease_until <= Date.now()) return { rows: [] };
       q.lease_until = Date.now() + 90000;
       return { rows: [{ lease_until: q.lease_until }] };
     }
@@ -207,8 +232,10 @@ export class FakeInternalPool {
       const r = this._run(runId);
       if (r) {
         r.status = state;
-        r.termination = params[2] ?? null;
-        r.error = params[5] ?? null;
+        r.termination = params[2] ? JSON.parse(params[2]) : null;
+        r.usage = params[3] ? JSON.parse(params[3]) : null;
+        r.rounds = params[4] ?? 0;
+        r.error = params[5] ? JSON.parse(params[5]) : null;
         r.ended_at = Date.now();
       }
       return { rows: [] };
@@ -228,7 +255,7 @@ export class FakeInternalPool {
       return { rows: [] };
     }
 
-    // ---- release：queue 收敛（字面量 status）----
+    // ---- release/reaper：queue 收敛（字面量 status）----
     if (sql.includes('UPDATE run_queue SET status=')) {
       const [runId] = params;
       const q = this._queue(runId);
@@ -236,10 +263,11 @@ export class FakeInternalPool {
         if (sql.includes("status='cancelled'")) q.status = 'cancelled';
         else if (sql.includes("status='pending'")) q.status = 'pending';
         else if (sql.includes("status='done'")) q.status = 'done';
-        q.claim_token = null;
         q.owner_container_id = null;
         q.lease_until = null;
         q.claimed_at = null;
+        // release（U12）保留 claim_token 供幂等重放；reaper 显式 claim_token=NULL 才清。
+        if (sql.includes('claim_token=NULL')) q.claim_token = null;
       }
       return { rows: [] };
     }
