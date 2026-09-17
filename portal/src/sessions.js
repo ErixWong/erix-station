@@ -15,9 +15,13 @@ export class SessionError extends Error {
 }
 
 const ACTIVE_RUN_STATES = `('queued', 'running', 'cancelling')`;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** session 属主校验 + 取行；不存在/不属本人一律 404（不泄露存在性，portal.md §1.2 惯例）。 */
+/** session 属主校验 + 取行；不存在/不属本人/已归档/非法 UUID 一律 404（不泄露存在性，portal.md §1.2 惯例）。 */
 async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {}) {
+  if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) {
+    throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
+  }
   const lock = forUpdate ? ' FOR UPDATE' : '';
   const res = await pool.query(
     `SELECT s.id, s.user_id, s.project_id, s.title, s.model, s.status, s.last_seq,
@@ -37,9 +41,9 @@ async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {})
   return row;
 }
 
-/** GET /api/sessions?project_id=（可选过滤，按 updated_at 倒序 + keyset 分页 §1.3）。 */
-export async function listSessions(pool, { userId, projectId, cursor, limit = 50 }) {
-  const n = Math.min(Math.max(Number(limit) || 50, 1), 200);
+/** GET /api/sessions?project_id=（可选过滤，按 updated_at 倒序 + keyset 分页 §1.3：默认 20、上限 100）。 */
+export async function listSessions(pool, { userId, projectId, cursor, limit = 20 }) {
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [userId];
   let where = `user_id = $1 AND status = 'active'`;
   if (projectId) {
@@ -47,6 +51,9 @@ export async function listSessions(pool, { userId, projectId, cursor, limit = 50
     where += ` AND project_id = $${params.length}`;
   }
   if (cursor) {
+    if (!UUID_RE.test(cursor)) {
+      throw new SessionError('validation_failed', 'cursor 非法', { details: { field: 'cursor' } });
+    }
     params.push(cursor);
     where += ` AND updated_at < (SELECT updated_at FROM chat_sessions WHERE id = $${params.length})`;
   }
@@ -65,12 +72,15 @@ export async function listSessions(pool, { userId, projectId, cursor, limit = 50
   return { items, next_cursor: nextCursor };
 }
 
-/** POST /api/sessions —— 建会话（project 必须属本人）。 */
+/** POST /api/sessions —— 建会话（project 必须属本人且未删除）。 */
 export async function createSession(pool, { userId, projectId, title, model }) {
   if (!projectId || typeof projectId !== 'string') {
     throw new SessionError('validation_failed', 'project_id 必填', { details: { field: 'project_id' } });
   }
-  const own = await pool.query(`SELECT id FROM projects WHERE id = $1 AND user_id = $2`, [projectId, userId]);
+  const own = await pool.query(
+    `SELECT id FROM projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+    [projectId, userId],
+  );
   if (!own.rows?.[0]) {
     throw new SessionError('not_found', 'project not found', { httpStatus: 404 });
   }
@@ -89,21 +99,34 @@ export async function createSession(pool, { userId, projectId, title, model }) {
   return rowToSession(res.rows[0]);
 }
 
-/** GET /api/sessions/:id —— 会话详情 + 消息列表（seq 升序）+ last_seq + 活跃 run。 */
-export async function getSession(pool, { userId, sessionId, limit = 200 }) {
+/**
+ * GET /api/sessions/:id —— 会话详情 + 消息列表 + last_seq + active_run_id（§4.1 ChatSession 契约）。
+ * 消息 keyset 分页（§1.3）：默认/无 cursor 取**最新** limit 条（升序返回）；cursor=更早一批的最小 seq，取 seq < cursor 的最新一批。
+ */
+export async function getSession(pool, { userId, sessionId, limit = 20, messagesCursor }) {
   const s = await fetchSession(pool, sessionId, userId);
-  const n = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  const params = [sessionId, n];
+  let where = `session_id = $1`;
+  if (messagesCursor != null) {
+    if (!Number.isInteger(Number(messagesCursor)) || Number(messagesCursor) < 1) {
+      throw new SessionError('validation_failed', 'cursor 必须为正整数', { details: { field: 'cursor' } });
+    }
+    params.push(Number(messagesCursor));
+    where += ` AND seq < $3`;
+  }
   const msgs = await pool.query(
     `SELECT id, run_id, seq, role, content, synthetic, attachments, created_at
-       FROM messages WHERE session_id = $1 ORDER BY seq ASC LIMIT $2`,
-    [sessionId, n],
+       FROM messages WHERE ${where} ORDER BY seq DESC LIMIT $2`,
+    params,
   );
+  msgs.rows.reverse(); // 升序返回
   const active = await pool.query(
     `SELECT id, status FROM runs WHERE session_id = $1 AND status IN ${ACTIVE_RUN_STATES} ORDER BY queued_at DESC LIMIT 1`,
     [sessionId],
   );
   return {
-    session: rowToSession(s),
+    session: { ...rowToSession(s), active_run_id: active.rows[0]?.id ?? null },
     messages: msgs.rows.map((m) => ({
       id: m.id,
       run_id: m.run_id,
@@ -115,21 +138,26 @@ export async function getSession(pool, { userId, sessionId, limit = 200 }) {
       created_at: m.created_at?.toISOString?.() ?? m.created_at,
     })),
     last_seq: Number(s.last_seq),
-    active_run: active.rows[0] ? { id: active.rows[0].id, status: active.rows[0].status } : null,
+    // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
+    next_cursor: msgs.rows.length === n ? Number(msgs.rows[0].seq) : null,
   };
 }
 
-/** PATCH /api/sessions/:id —— 改标题。 */
+/** PATCH /api/sessions/:id —— 改标题（CAS 限定 active，防归档后仍改成功）。 */
 export async function updateSession(pool, { userId, sessionId, title }) {
   await fetchSession(pool, sessionId, userId);
   if (typeof title !== 'string' || title.length > 200) {
     throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { details: { field: 'title' } });
   }
   const res = await pool.query(
-    `UPDATE chat_sessions SET title = $2, updated_at = now() WHERE id = $1
-     RETURNING id, user_id, project_id, title, model, status, last_seq, created_at, updated_at`,
+    `UPDATE chat_sessions SET title = $2, updated_at = now()
+      WHERE id = $1 AND status = 'active'
+      RETURNING id, user_id, project_id, title, model, status, last_seq, created_at, updated_at`,
     [sessionId, title],
   );
+  if (res.rows.length === 0) {
+    throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
+  }
   return rowToSession(res.rows[0]);
 }
 
@@ -259,20 +287,38 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
 
 /**
  * POST /api/sessions/:id/stop —— 写 cancel_requested_at + status='cancelling'（portal.md §4.5）。
- * 终止结果经 SSE run_end（reason='aborted'）体现；无进行中 run → 409 no_active_run。
+ * 事务内锁 session 行（与发消息串行化，防「检查无活跃 run → 新 run 提交 → 误停新 run」竞态）；
+ * 终止结果经 SSE run_end（reason='aborted'）体现；cancelling 重复停止幂等返回 200。
  */
 export async function stopSession(pool, { userId, sessionId }) {
-  await fetchSession(pool, sessionId, userId);
-  const res = await pool.query(
-    `UPDATE runs SET status = 'cancelling', cancel_requested_at = now()
-      WHERE session_id = $1 AND status IN ('queued', 'running')
-      RETURNING id, status`,
-    [sessionId],
-  );
-  if (res.rows.length === 0) {
-    throw new SessionError('no_active_run', 'no active run on session', { httpStatus: 409 });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const s = await fetchSession(client, sessionId, userId, { forUpdate: true });
+    // 先停止 queued/running；已是 cancelling 视为幂等成功（前端重复点击不报错）
+    let res = await client.query(
+      `UPDATE runs SET status = 'cancelling', cancel_requested_at = now()
+        WHERE session_id = $1 AND status IN ('queued', 'running')
+        RETURNING id`,
+      [s.id],
+    );
+    if (res.rows.length === 0) {
+      res = await client.query(
+        `SELECT id FROM runs WHERE session_id = $1 AND status = 'cancelling' ORDER BY queued_at DESC LIMIT 1`,
+        [s.id],
+      );
+      if (res.rows.length === 0) {
+        throw new SessionError('no_active_run', 'no active run on session', { httpStatus: 409 });
+      }
+    }
+    await client.query('COMMIT');
+    return { run: { id: res.rows[0].id, status: 'cancelling' } };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
-  return { run: { id: res.rows[0].id, status: res.rows[0].status } };
 }
 
 function rowToSession(r) {

@@ -617,6 +617,7 @@ station-portal user enable  --login <login>
 | 400 | `validation_failed` | content 为空 |
 | 404 | `not_found` | session 不存在/不属本人 |
 | 409 | `run_in_progress` | 该 session 已有进行中 run |
+| 409 | `no_active_container` | 拉模型补充分支：该用户**从未有过任何容器记录**（containers 无非 removed 行，无法确定 run 归属与入队目标）——落库即 202 前提是存在容器行（runs.container_id 非空）；已有但离线的容器不受此码影响（§6.3） |
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |
 
