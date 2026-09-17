@@ -809,6 +809,9 @@ async function claimLoop() {
 async function heartbeatLoop() {
   for (;;) {
     if (state.shutdown) return;
+    // 评审 PR#23（reviewer M1）：revoke 后必须停心跳——否则 heartbeatLoop 永不返回、
+    // Promise.all 不 resolve，'agentd exiting' 不可达，agentd 只能靠 SIGTERM 兕底。
+    if (state.revokeReason) return;
     await sleep(CFG.heartbeatMs);
     // F6：watchdog——worker 长时间无任何 IPC（SIGSTOP/死循环/管道卡死）→ SIGKILL 整组，
     // exit 路径会 releaseAndRequeue（attempt+1、resume）。阈值远大于正常 LLM 等待。
@@ -885,7 +888,12 @@ async function main() {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  await Promise.all([sse.run(), claimLoop(), heartbeatLoop()]);
+  const sseTask = sse.run(); // 后台运行，不 await——SSE 流由 portal 主动关闭，token 吊销后流不会断
+  // （评审 PR#23 reviewer M1：不能把它挂进 Promise.all，否则 revoke 后 agentd 永不退出）。
+  await Promise.all([claimLoop(), heartbeatLoop()]);
+  // 两个决策循环返回（正常退出/revoke/token_revoked）即收敛退出，残留流由 process.exit 关断。
+  sse.stop();
+  void sseTask;
   log('info', 'agentd exiting', { revoke: state.revokeReason });
   process.exit(0);
 }
