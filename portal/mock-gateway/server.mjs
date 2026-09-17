@@ -64,6 +64,22 @@ function mockContent(userContent) {
   return `${echo}\n\n这是 P1 零凭据 mock 网关的固定响应，未调用任何真实 LLM。`;
 }
 
+// ---- tool_calls 支持（WP5 UI 验收：触发词让 agent 真实执行工具，验证浏览器工具卡片渲染） ----
+const TOOL_TRIGGER_RE = /用工具|USE_TOOL/i;
+const MOCK_TOOL = { id: 'call_mock_tree_1', name: 'tree', args: '{"path":"."}' };
+
+function messagesHaveToolResult(messages) {
+  return (Array.isArray(messages) ? messages : []).some((m) => m?.role === 'tool');
+}
+
+function mockToolCall() {
+  return [{ index: 0, id: MOCK_TOOL.id, type: 'function', function: { name: MOCK_TOOL.name, arguments: MOCK_TOOL.args } }];
+}
+
+function mockFinalAfterTool() {
+  return '（mock）已执行 tree 工具：目录结构与预期一致。这是工具卡片链路的固定收尾响应。';
+}
+
 function usageFor(body) {
   const promptTokens = Math.max(1, Math.ceil(JSON.stringify(body?.messages ?? []).length / 4));
   const completionTokens = 24;
@@ -102,10 +118,24 @@ function handleChat(req, res) {
       if (LATENCY_MS > 0) await sleep(LATENCY_MS);
       const model = body.model || 'mock-model';
       const id = `chatcmpl-mock-${Date.now().toString(36)}`;
-      const content = mockContent(extractUserContent(body));
       const stream = body.stream === true;
+      const msgs = Array.isArray(body?.messages) ? body.messages : [];
+      // 三态：① 对话含 tool 结果 → 收尾文本；② 用户消息带触发词 → 发 tool_call；③ 其它 → 固定回显。
+      const mode = messagesHaveToolResult(msgs) ? 'final'
+        : TOOL_TRIGGER_RE.test(extractUserContent(body)) ? 'tool_call' : 'echo';
+      const content = mode === 'final' ? mockFinalAfterTool() : mockContent(extractUserContent(body));
 
       if (!stream) {
+        if (mode === 'tool_call') {
+          return sendJson(res, 200, {
+            id,
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, message: { role: 'assistant', tool_calls: mockToolCall() }, finish_reason: 'tool_calls' }],
+            usage: usageFor(body),
+          });
+        }
         return sendJson(res, 200, {
           id,
           object: 'chat.completion',
@@ -116,13 +146,22 @@ function handleChat(req, res) {
         });
       }
 
-      // SSE 流式：分 3 段发出，最后 [DONE]。
+      // SSE 流式：文本分 3 段发出；tool_call 模式单帧发出后 finish=tool_calls；最后 [DONE]。
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
       });
+      if (mode === 'tool_call') {
+        const tc = completionChunk(id, model, '', { delta: true });
+        tc.choices[0].delta = { role: 'assistant', tool_calls: mockToolCall() };
+        res.write(`data: ${JSON.stringify(tc)}\n\n`);
+        res.write(`data: ${JSON.stringify(completionChunk(id, model, '', { delta: true, finish: 'tool_calls' }))}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
       const chunks = [content.slice(0, 12), content.slice(12, 32), content.slice(32) || '（完）'];
       const roleChunk = completionChunk(id, model, '', { delta: true });
       res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);

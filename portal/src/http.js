@@ -11,6 +11,7 @@ import { URL } from 'node:url';
 import * as auth from './auth.js';
 import * as migrate from './migrate.js';
 import * as projects from './projects.js';
+import * as sessions from './sessions.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
@@ -203,6 +204,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof sessions.SessionError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof internal.InternalError) {
         sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details));
         return;
@@ -316,7 +321,201 @@ async function routeApi(req, res, ctx, url) {
     if (req.method === 'POST') return handlePreviewTicket(req, res, ctx, portId);
   }
 
+  // ---- 会话与对话（portal.md §4/§5）----
+  if (pathname === '/api/sessions') {
+    if (req.method === 'POST') return handleCreateSession(req, res, ctx);
+    if (req.method === 'GET') return handleListSessions(req, res, ctx);
+  }
+  const sessionMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
+  if (sessionMatch) {
+    const sessionId = decodeURIComponent(sessionMatch[1]);
+    if (req.method === 'GET') return handleGetSession(req, res, ctx, sessionId);
+    if (req.method === 'PATCH') return handlePatchSession(req, res, ctx, sessionId);
+    if (req.method === 'DELETE') return handleArchiveSession(req, res, ctx, sessionId);
+  }
+  if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/messages$/.test(pathname)) {
+    return handlePostMessage(req, res, ctx, decodeURIComponent(pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)[1]));
+  }
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events$/.test(pathname)) {
+    return handleSessionStream(req, res, ctx, decodeURIComponent(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
+  }
+  if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/stop$/.test(pathname)) {
+    return handleStopSession(req, res, ctx, decodeURIComponent(pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/)[1]));
+  }
+  const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/);
+  if (runMatch) {
+    const runId = decodeURIComponent(runMatch[1]);
+    if (req.method === 'GET') return handleGetRun(req, res, ctx, runId);
+  }
+
   return sendJson(res, 404, errorBody('not_found', 'not found'));
+}
+
+async function handleListSessions(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://x');
+  const result = await sessions.listSessions(ctx.pool, {
+    userId: session.user.id,
+    projectId: url.searchParams.get('project_id') || undefined,
+    cursor: url.searchParams.get('cursor') || undefined,
+    limit: url.searchParams.get('limit') || undefined,
+  });
+  return sendJson(res, 200, result);
+}
+
+async function handleCreateSession(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const created = await sessions.createSession(ctx.pool, {
+    userId: session.user.id,
+    projectId: body?.project_id,
+    title: body?.title,
+    model: body?.model,
+  });
+  return sendJson(res, 201, { session: created });
+}
+
+async function handleGetSession(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://x');
+  const result = await sessions.getSession(ctx.pool, {
+    userId: session.user.id, sessionId,
+    limit: url.searchParams.get('limit') || undefined,
+    messagesCursor: url.searchParams.get('cursor'),
+  });
+  return sendJson(res, 200, result);
+}
+
+async function handlePatchSession(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const updated = await sessions.updateSession(ctx.pool, { userId: session.user.id, sessionId, title: body?.title });
+  return sendJson(res, 200, { session: updated });
+}
+
+async function handleArchiveSession(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  await sessions.archiveSession(ctx.pool, { userId: session.user.id, sessionId });
+  res.writeHead(204); // §4.2：204 无体
+  res.end();
+}
+
+async function handlePostMessage(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const result = await sessions.postMessage(ctx.pool, {
+    userId: session.user.id,
+    sessionId,
+    content: body?.content,
+    attachments: body?.attachments,
+    notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
+  });
+  return sendJson(res, 202, result);
+}
+
+async function handleStopSession(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）
+  const result = await sessions.stopSession(ctx.pool, { userId: session.user.id, sessionId });
+  // 即时停止通道：SSE 下行 stop_request（agentd 立即 abort）；若容器离线，靠心跳 stop_run_ids 兼底（15s）。
+  try {
+    internal.broadcastStopRequest(session.user.id, { run_id: result.run.id, session_id: sessionId });
+  } catch { /* 心跳兼容 */ }
+  return sendJson(res, 200, result);
+}
+
+/** 浏览器 SSE（portal.md §5）：先注册（缓冲）→ DB 补发（Last-Event-ID / ?last_event_id）→ flush 后转 live；15s 心跳。 */
+async function handleSessionStream(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  const s = await sessions.getSession(ctx.pool, { userId: session.user.id, sessionId, limit: 1 });
+  const url = new URL(req.url, 'http://x');
+  // 无 Last-Event-ID（首连）不补发历史（§5.2.3）；非法值 400（header/query 同口径）。
+  const raw = req.headers['last-event-id'] ?? url.searchParams.get('last_event_id');
+  let lastEventId = null;
+  if (raw !== undefined && raw !== null && raw !== '') {
+    lastEventId = Number(raw);
+    if (!Number.isInteger(lastEventId) || lastEventId < 0) {
+      throw new HttpError(400, 'validation_failed', 'Last-Event-ID 必须为非负整数');
+    }
+    if (lastEventId > s.last_seq) {
+      throw new HttpError(404, 'not_found', 'last_event_id beyond session');
+    }
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'X-Accel-Buffering': 'no',
+    Connection: 'keep-alive',
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  res.write('retry: 3000\n\n');
+
+  // 先注册（此后落库的事件进缓冲，不丢）；再补发；最后 flush 缓冲（跳过已补发 seq）转 live（§5.2）。
+  const rec = internal.registerSessionClient(sessionId, res);
+  let replayedSeq = null;
+  if (lastEventId != null) {
+    const replay = await ctx.pool.query(
+      `SELECT seq, ts, run_id, type, payload FROM run_events
+        WHERE session_id = $1 AND seq > $2 ORDER BY seq ASC`,
+      [sessionId, lastEventId],
+    );
+    for (const row of replay.rows) {
+      const seq = Number(row.seq);
+      const data = JSON.stringify({
+        seq, ts: row.ts?.toISOString?.() ?? row.ts,
+        session_id: sessionId, run_id: row.run_id, type: row.type, ...row.payload,
+      });
+      internal.writeSseEvent(res, row.type, data, seq);
+      replayedSeq = seq;
+    }
+  } else {
+    internal.writeSseComment(res, 'connected'); // 首连不补发历史
+  }
+  internal.sessionClientGoLive(sessionId, rec, replayedSeq);
+  internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
+
+  const pingTimer = setInterval(() => {
+    internal.writeSseComment(res, 'ping');
+    internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
+  }, 15000);
+  const cleanup = () => {
+    clearInterval(pingTimer);
+    internal.unregisterSessionClient(sessionId, rec);
+  };
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+}
+
+/** GET /api/runs/:id（portal.md §4.6）：run 详情（属主经 session join 校验，不泄露存在性）。 */
+async function handleGetRun(req, res, ctx, runId) {
+  const session = await requireSession(req, ctx);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runId ?? '')) {
+    throw new HttpError(404, 'not_found', 'run not found');
+  }
+  const r = await ctx.pool.query(
+    `SELECT r.id, r.session_id, r.status, r.termination, r.usage, r.error, r.cancel_requested_at,
+            r.queued_at, r.started_at, r.ended_at
+       FROM runs r JOIN chat_sessions s ON s.id = r.session_id
+      WHERE r.id = $1 AND s.user_id = $2`,
+    [runId, session.user.id],
+  );
+  const row = r.rows?.[0];
+  if (!row) throw new HttpError(404, 'not_found', 'run not found');
+  return sendJson(res, 200, {
+    run: {
+      id: row.id, session_id: row.session_id, status: row.status,
+      termination: row.termination ?? null, usage: row.usage ?? null, error: row.error ?? null,
+      cancel_requested_at: row.cancel_requested_at?.toISOString?.() ?? null,
+      queued_at: row.queued_at?.toISOString?.() ?? null,
+      started_at: row.started_at?.toISOString?.() ?? null,
+      ended_at: row.ended_at?.toISOString?.() ?? null,
+    },
+  });
 }
 
 async function handleLoginStep1(req, res, ctx) {

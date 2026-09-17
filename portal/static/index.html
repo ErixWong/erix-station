@@ -5,94 +5,376 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FDE Station</title>
   <style>
-    body { font-family: system-ui, -apple-system, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.4rem; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; background: #fafafa; }
-    form { display: flex; flex-direction: column; gap: .75rem; }
-    label { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; }
-    input { padding: .5rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }
-    button { padding: .5rem; font-size: 1rem; cursor: pointer; border: 1px solid #ccc; border-radius: 4px; background: #fff; }
-    button:hover { background: #f0f0f0; }
-    .err { color: #b00; font-size: .9rem; }
-    .muted { color: #666; font-size: .9rem; }
+    :root { --bd: #ddd; --muted: #666; --brand: #0a7; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 0; color: #222; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: .6rem 1rem; border-bottom: 1px solid var(--bd); display: flex; gap: 1rem; align-items: center; }
+    header h1 { font-size: 1.05rem; margin: 0; }
+    header .who { color: var(--muted); font-size: .85rem; flex: 1; }
+    header button { padding: .35rem .8rem; }
+    main { flex: 1; display: flex; min-height: 0; }
+    aside { width: 15rem; border-right: 1px solid var(--bd); overflow-y: auto; padding: .5rem; }
+    aside .proj { margin-bottom: .8rem; }
+    aside select, aside input, aside button { width: 100%; padding: .4rem; margin-top: .3rem; }
+    aside .sess { border: 1px solid var(--bd); border-radius: 6px; padding: .45rem; margin-top: .4rem; cursor: pointer; font-size: .88rem; }
+    aside .sess.active { border-color: var(--brand); background: #f2fff9; }
+    aside .sess .meta { color: var(--muted); font-size: .75rem; }
+    #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    #stream { flex: 1; overflow-y: auto; padding: 1rem; }
+    .msg { margin: .4rem 0; padding: .55rem .8rem; border-radius: 8px; max-width: 46rem; white-space: pre-wrap; word-break: break-word; }
+    .msg.user { background: #e8f4ff; margin-left: auto; }
+    .msg.assistant { background: #f6f6f6; }
+    .msg.synthetic { border-left: 3px solid #d80; background: #fffaf0; }
+    .card { border: 1px solid var(--bd); border-left: 3px solid #888; border-radius: 6px; padding: .4rem .7rem; margin: .35rem 0; font-size: .85rem; max-width: 46rem; background: #fbfbfb; }
+    .card.ok { border-left-color: #2a2; }
+    .card.err { border-left-color: #b33; }
+    .card .t { font-weight: 600; }
+    .card .dig { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .roundsep { color: var(--muted); font-size: .75rem; margin: .6rem 0 .2rem; }
+    .syserr { color: #b33; font-size: .85rem; }
+    #composer { border-top: 1px solid var(--bd); padding: .7rem; display: flex; gap: .6rem; }
+    #composer textarea { flex: 1; padding: .5rem; resize: none; height: 3.2rem; }
+    #composer button { padding: .5rem 1.1rem; }
+    #stopBtn { display: none; background: #fff2f0; border-color: #b33; color: #b33; }
+    .muted { color: var(--muted); font-size: .8rem; }
   </style>
 </head>
 <body>
-  <h1>FDE Station</h1>
-  <div id="view" class="card">加载中…</div>
+  <header>
+    <h1>FDE Station</h1>
+    <span class="who" id="who"></span>
+    <button id="logout">登出</button>
+  </header>
+  <main>
+    <aside>
+      <div class="proj">
+        <label class="muted">项目</label>
+        <select id="projectSel"></select>
+        <button id="newProj">＋ 新项目</button>
+      </div>
+      <button id="newSess">＋ 新会话</button>
+      <div id="sessList"></div>
+    </aside>
+    <section id="chat">
+      <div id="stream"><p class="muted">选择或新建会话</p></div>
+      <div id="composer">
+        <textarea id="input" placeholder="输入任务，Enter 发送（Shift+Enter 换行）"></textarea>
+        <button id="sendBtn">发送</button>
+        <button id="stopBtn">■ 停止</button>
+      </div>
+    </section>
+  </main>
   <script>
-    function esc(s) {
-      return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-    async function boot() {
-      const view = document.getElementById('view');
-      try {
-        const r = await fetch('/api/me', { headers: { Accept: 'application/json' } });
-        if (r.ok) {
-          const data = await r.json();
-          const u = data.user;
-          const fde = u.fde_name ? ' / ' + esc(u.fde_name) : '';
-          view.innerHTML = '<p>已登录：<strong>' + esc(u.login) + '</strong>（' + esc(u.role) + fde + '，auth_source=' + esc(u.auth_source) + '）</p>' +
-            '<button id="logout">登出</button>';
-          document.getElementById('logout').onclick = async () => {
-            await fetch('/api/auth/logout', { method: 'POST' });
-            location.reload();
-          };
-          return;
-        }
-      } catch (e) { /* fall through to login form */ }
-      renderLogin(view);
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
+                lastSeq: 0, es: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null };
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw Object.assign(new Error(body.error?.message ?? r.status), { code: body.error?.code, status: r.status });
+      return body;
     }
 
-    function renderLogin(view, pendingToken) {
-      if (!pendingToken) {
-        view.innerHTML = '<form id="login">' +
-          '<label>登录名 <input name="login" autocomplete="username"></label>' +
-          '<label>口令 <input name="password" type="password" autocomplete="current-password"></label>' +
-          '<button type="submit">下一步</button>' +
-          '<div id="err" class="err"></div>' +
-          '</form>' +
-          '<p class="muted">本地账号两步登录（口令 → TOTP）。开发期 COOKIE_PROFILE 见 .env。</p>';
-        document.getElementById('login').onsubmit = async (e) => {
-          e.preventDefault();
-          const f = e.target;
-          const r = await fetch('/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ login: f.login.value, password: f.password.value }),
-          });
-          if (r.status === 200) {
-            const data = await r.json();
-            if (data.status === 'totp_required') return renderLogin(view, data.pending_token);
-          }
-          document.getElementById('err').textContent = '登录失败（' + r.status + '）';
-        };
-        return;
-      }
-      view.innerHTML = '<form id="totp">' +
-        '<label>认证器 App 的 6 位验证码 <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>' +
-        '<button type="submit">验证并登录</button>' +
-        '<div id="err" class="err"></div>' +
-        '</form>' +
-        '<p class="muted">已校验口令；请输入 TOTP 验证码完成登录。</p>';
-      document.getElementById('totp').onsubmit = async (e) => {
+    async function boot() {
+      try {
+        const me = await api('/api/me');
+        S.user = me.user;
+      } catch { renderLogin(); return; }
+      $('who').textContent = `${S.user.login}（${S.user.role}${S.user.fde_name ? ' / ' + S.user.fde_name : ''}）`;
+      $('logout').onclick = async () => { await fetch('/api/auth/logout', { method: 'POST' }); location.reload(); };
+      await initWorkspace();
+    }
+
+    function renderLogin() {
+      $('who').textContent = '未登录';
+      $('sessList').innerHTML = '';
+      $('stream').innerHTML = '';
+      $('composer').style.display = 'none';
+      const div = document.createElement('div');
+      div.style.cssText = 'max-width:22rem;margin:4rem auto;padding:1.5rem;border:1px solid #ddd;border-radius:10px';
+      div.innerHTML = `
+        <h2 style="margin-top:0">FDE Station 登录</h2>
+        <form id="loginForm">
+          <label class="muted">登录名</label><input name="login" autocomplete="username" style="width:100%;padding:.4rem;margin:.2rem 0 .6rem">
+          <label class="muted">口令</label><input name="password" type="password" autocomplete="current-password" style="width:100%;padding:.4rem;margin:.2rem 0 .6rem">
+          <button style="width:100%;padding:.5rem">下一步</button>
+        </form>
+        <form id="totpForm" style="display:none">
+          <p class="muted">输入认证器 6 位码（本地账号两步登录）。</p>
+          <label class="muted">TOTP</label><input name="code" inputmode="numeric" style="width:100%;padding:.4rem;margin:.2rem 0 .6rem">
+          <button style="width:100%;padding:.5rem">验证并登录</button>
+        </form>
+        <p id="loginErr" class="syserr"></p>`;
+      $('stream').appendChild(div);
+      $('loginForm').onsubmit = async (e) => {
         e.preventDefault();
         const f = e.target;
-        const r = await fetch('/api/auth/login/totp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pending_token: pendingToken, code: f.code.value }),
-        });
-        if (r.ok) { location.reload(); return; }
-        if (r.status === 401) {
-          const data = await r.json().catch(() => ({}));
-          if (data.error && data.error.code === 'pending_expired') {
-            return renderLogin(view); // 待决令牌过期 → 重新走第一步
-          }
-        }
-        document.getElementById('err').textContent = 'TOTP 校验失败（' + r.status + '）';
+        try {
+          const r = await fetch('/api/auth/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ login: f.login.value.trim(), password: f.password.value }),
+          });
+          if (!r.ok) throw new Error('口令校验失败（' + r.status + '）');
+          S.pendingToken = (await r.json()).pending_token;
+          $('loginForm').style.display = 'none';
+          $('totpForm').style.display = '';
+          $('loginErr').textContent = '';
+        } catch (err) { $('loginErr').textContent = err.message; }
+      };
+      $('totpForm').onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const r = await fetch('/api/auth/login/totp', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pending_token: S.pendingToken, code: e.target.code.value.trim() }),
+          });
+          if (!r.ok) throw new Error('TOTP 验证失败（' + r.status + '）');
+          location.reload();
+        } catch (err) { $('loginErr').textContent = err.message; }
       };
     }
+
+    async function initWorkspace() {
+      $('composer').style.display = '';
+      $('newProj').onclick = async () => {
+        const name = prompt('项目名（小写字母/数字/连字符）：');
+        if (!name) return;
+        const repo = prompt('Git 仓库地址：', 'https://git.example/alice/' + name + '.git');
+        if (!repo) return;
+        try {
+          const { project } = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, repo_url: repo, template: 'node' }) });
+          S.projects.push(project);
+          const sel = $('projectSel');
+          sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+          sel.value = project.id;
+          S.projectId = project.id;
+          await loadSessions();
+        } catch (e) { alert('建项目失败：' + e.message); }
+      };
+
+      const pj = await api('/api/projects');
+      S.projects = pj.items ?? [];
+      const sel = $('projectSel');
+      sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+      if (S.projects.length === 0) {
+        $('sessList').innerHTML = '<p class="muted">先创建项目</p>';
+        return;
+      }
+      S.projectId = S.projects[0].id;
+      sel.onchange = () => { S.projectId = sel.value; loadSessions(); };
+      await loadSessions();
+    }
+
+    async function loadSessions() {
+      const data = await api(`/api/sessions?project_id=${encodeURIComponent(S.projectId)}`);
+      S.sessions = data.items ?? [];
+      renderSessions();
+    }
+
+    function renderSessions() {
+      $('sessList').innerHTML = S.sessions.map((s) =>
+        `<div class="sess ${s.id === S.sessionId ? 'active' : ''}" data-id="${esc(s.id)}">` +
+        `<div>${esc(s.title || '未命名会话')}</div>` +
+        `<div class="meta">${s.active_run_id ? '● 运行中' : esc(new Date(s.updated_at).toLocaleString())}</div></div>`
+      ).join('') || '<p class="muted">暂无会话</p>';
+      for (const el of $('sessList').querySelectorAll('.sess')) {
+        el.onclick = () => openSession(el.dataset.id);
+      }
+    }
+
+    $('newSess').onclick = async () => {
+      try {
+        const { session } = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ project_id: S.projectId }) });
+        S.sessions.unshift({ ...session, has_active_run: false });
+        renderSessions();
+        openSession(session.id);
+      } catch (e) { alert('建会话失败：' + e.message); }
+    };
+
+    async function openSession(id) {
+      if (S.es) { S.es.close(); S.es = null; }
+      S.sessionId = id; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
+      $('stream').innerHTML = '';
+      renderSessions();
+      const data = await api(`/api/sessions/${encodeURIComponent(id)}`);
+      S.lastSeq = data.last_seq;
+      S.renderedIds = new Set();
+      for (const m of data.messages) addMessage(m);
+      if (data.session.active_run_id) { S.activeRunId = data.session.active_run_id; setRunning(true); }
+      connectEvents(id);
+    }
+
+    function connectEvents(id) {
+      const es = new EventSource(`/api/sessions/${encodeURIComponent(id)}/events`);
+      S.es = es;
+      es.onmessage = () => {}; // 具名事件分发
+      for (const type of ['round_start','round_end','attempt','recovering','recovered','usage',
+                          'tool_use','tool_result','assistant_delta','reasoning_delta',
+                          'tool_call_delta','judge','run_end','ping']) {
+        es.addEventListener(type, (e) => handleEvent(type, e));
+      }
+      es.onerror = () => { /* EventSource 自动重连，带 Last-Event-ID */ };
+    }
+
+    function addMessage(m) {
+      if (S.renderedIds) {
+        if (S.renderedIds.has(m.id)) return m; // 去重（refresh 与流式缓冲竞态）
+        S.renderedIds.add(m.id);
+      }
+      const div = document.createElement('div');
+      div.className = `msg ${m.role}${m.synthetic ? ' synthetic' : ''}`;
+      div.textContent = (m.synthetic ? '〔系统注入〕' : '') + m.content;
+      $('stream').appendChild(div);
+      scrollDown();
+      return div;
+    }
+
+    function toolCard(callId, name, input) {
+      if (S.toolCards[callId]) return S.toolCards[callId];
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `<div class="t">🔧 ${esc(name ?? 'tool')} <span class="dig"></span></div><div class="out muted"></div>`;
+      card.querySelector('.dig').textContent = typeof input === 'object' ? JSON.stringify(input ?? {}).slice(0, 120) : String(input ?? '').slice(0, 120);
+      $('stream').appendChild(card);
+      S.toolCards[callId] = card;
+      scrollDown();
+      return card;
+    }
+
+    function handleEvent(type, e) {
+      let d;
+      try { d = e.data ? JSON.parse(e.data) : {}; } catch { return; } // 畸形事件忽略（§5.3）
+      if (typeof d.seq === 'number') S.lastSeq = Math.max(S.lastSeq, d.seq);
+      switch (type) {
+        case 'ping': return;
+        case 'round_start':
+          if (S.deltaBuf) { S.deltaBuf = null; }
+          sep(`round ${d.round}`); return;
+        case 'attempt': sep(`round ${d.round} · 尝试 ${d.attempt}/${d.maxAttempts}`); return;
+        case 'recovering': sep(`重试中（${d.attempt}/${d.maxAttempts}）`); return;
+        case 'recovered': sep('重试成功'); return;
+        case 'assistant_delta': {
+          if (!S.deltaBuf) {
+            const div = document.createElement('div');
+            div.className = 'msg assistant';
+            div.textContent = '';
+            $('stream').appendChild(div);
+            S.deltaBuf = div;
+          }
+          S.deltaBuf.textContent += d.text ?? '';
+          scrollDown(); return;
+        }
+        case 'reasoning_delta': return; // 推理增量 P1 不展示
+        case 'tool_call_delta': {
+          if (d.tool_call_id) {
+            const card = toolCard(d.tool_call_id, d.name ?? '', '（参数流式生成中…）');
+            card.dataset.args = (card.dataset.args ?? '') + (d.arguments_delta ?? '');
+          }
+          return;
+        }
+        case 'tool_use': {
+          const card = toolCard(d.tool_call_id, d.name, d.input);
+          card.dataset.args = typeof d.input === 'object' ? JSON.stringify(d.input ?? {}) : String(d.input ?? '');
+          return;
+        }
+        case 'tool_result': {
+          const card = S.toolCards[d.tool_call_id];
+          if (card) {
+            card.classList.add(d.ok ? 'ok' : 'err');
+            card.querySelector('.out').textContent = `${d.ok ? '✓' : '✗'} ${d.result_digest ?? ''}（${d.duration_ms ?? 0}ms）`;
+          }
+          return;
+        }
+        case 'judge': {
+          if (d.kind === 'intercept') sep(`judge：${d.action}${d.decision?.reason ? ' — ' + d.decision.reason : ''}`);
+          return;
+        }
+        case 'usage': return;
+        case 'run_end': {
+          // 历史重放的旧 run_end 不参与运行态状态机（防误关当前 run 的停止按钮/误拉刷新）
+          const isCurrent = d.run_id === S.activeRunId;
+          if (isCurrent) {
+            // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）
+            if (S.deltaBuf) { S.deltaBuf.remove(); S.deltaBuf = null; }
+            const reason = d.termination?.reason ?? '';
+            sep(`run 结束：${reason}${d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : ''}`);
+            if (d.error) {
+              const div = document.createElement('div');
+              div.className = 'syserr';
+              div.textContent = `run 失败：${d.error.code} — ${d.error.message}`;
+              $('stream').appendChild(div);
+            }
+            S.activeRunId = null;
+            setRunning(false);
+            refreshSession(d.run_id);
+          }
+          return;
+        }
+        default: return; // 未知类型忽略（§5.3 向后兼容）
+      }
+    }
+
+    async function refreshSession(runId) {
+      try {
+        const data = await api(`/api/sessions/${encodeURIComponent(S.sessionId)}`);
+        const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
+        for (const m of msgs) addMessage(m);
+        await loadSessions();
+      } catch { /* 尽力 */ }
+    }
+
+    function sep(text) {
+      const div = document.createElement('div');
+      div.className = 'roundsep';
+      div.textContent = text;
+      $('stream').appendChild(div);
+      scrollDown();
+    }
+
+    function scrollDown() { $('stream').scrollTop = $('stream').scrollHeight; }
+
+    function setRunning(on) {
+      $('stopBtn').style.display = on ? 'inline-block' : 'none'; // 显式值压过样式表 display:none
+      $('sendBtn').disabled = on;
+    }
+
+    $('sendBtn').onclick = send;
+    $('input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+
+    async function send() {
+      const content = $('input').value.trim();
+      if (!content || !S.sessionId || S.activeRunId) return;
+      $('input').value = '';
+      try {
+        const { message, run } = await api(`/api/sessions/${encodeURIComponent(S.sessionId)}/messages`, {
+          method: 'POST', body: JSON.stringify({ content, attachments: [] }),
+        });
+        addMessage({ ...message, role: 'user' });
+        S.activeRunId = run.id;
+        setRunning(true);
+        loadSessions();
+      } catch (e) {
+        const div = document.createElement('div');
+        div.className = 'syserr';
+        div.textContent = `发送失败：${e.message}${e.code === 'run_in_progress' ? '（已有进行中任务）' : ''}`;
+        $('stream').appendChild(div);
+      }
+    }
+
+    $('stopBtn').onclick = async () => {
+      if (!S.sessionId || !S.activeRunId) return;
+      try {
+        await api(`/api/sessions/${encodeURIComponent(S.sessionId)}/stop`, { method: 'POST', body: '{}' });
+        sep('已请求停止…');
+      } catch (e) { alert('停止失败：' + e.message); }
+    };
+
     boot();
   </script>
 </body>
