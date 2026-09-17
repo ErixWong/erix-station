@@ -296,7 +296,9 @@ export function broadcastRevoke(containerId, data) {
 }
 
 // ---- 浏览器侧 session SSE hub（portal.md §5；keyed by session，多客户端并存） ----
-const sessionClients = new Map(); // sessionId -> Set<res>
+// 注册先于补发（防「补发查询→注册」窗口丢事件）：注册后先缓冲，补发完成后 flush（跳过已补发 seq）再转 live。
+const sessionClients = new Map(); // sessionId -> Set<clientRec>
+const SESSION_CLIENT_BUFFER_MAX = 1000;
 
 export function registerSessionClient(sessionId, res) {
   let set = sessionClients.get(sessionId);
@@ -304,32 +306,50 @@ export function registerSessionClient(sessionId, res) {
     set = new Set();
     sessionClients.set(sessionId, set);
   }
-  set.add(res);
+  const rec = { res, buffer: [], live: false };
+  set.add(rec);
+  return rec;
 }
 
-export function unregisterSessionClient(sessionId, res) {
+/** 补发完成后调用：把缓冲中的事件（seq > sinceSeq）写给该客户端，随后转 live。 */
+export function sessionClientGoLive(sessionId, rec, sinceSeq = null) {
+  const events = rec.buffer.splice(0, rec.buffer.length);
+  for (const ev of events) {
+    if (sinceSeq != null && ev.seq <= sinceSeq) continue; // 补发已含
+    writeSessionEvent(rec.res, ev, sessionId);
+  }
+  rec.live = true;
+}
+
+export function unregisterSessionClient(sessionId, recOrRes) {
   const set = sessionClients.get(sessionId);
   if (!set) return;
-  set.delete(res);
+  for (const rec of set) {
+    if (rec === recOrRes || rec.res === recOrRes) set.delete(rec);
+  }
   if (set.size === 0) sessionClients.delete(sessionId);
 }
 
-/** 事件落库后推给该 session 的所有浏览器 SSE 客户端（portal.md §5.1 wire 格式）。 */
+function writeSessionEvent(res, ev, sessionId) {
+  const data = JSON.stringify({
+    seq: ev.seq, ts: ev.ts, session_id: sessionId, run_id: ev.run_id, type: ev.type, ...ev.payload,
+  });
+  writeSseEvent(res, ev.type, data, ev.seq);
+}
+
+/** 事件落库后推给该 session 的所有浏览器 SSE 客户端（portal.md §5.1 wire 格式）；未 live 的先缓冲。 */
 export function notifySessionEvents(sessionId, events) {
   const set = sessionClients.get(sessionId);
   if (!set || set.size === 0) return;
   for (const ev of events) {
-    const data = JSON.stringify({
-      seq: ev.seq, ts: ev.ts, session_id: sessionId, run_id: ev.run_id, type: ev.type, ...ev.payload,
-    });
-    for (const res of set) {
-      writeSseEvent(res, ev.type, data, ev.seq);
+    for (const rec of set) {
+      if (!rec.live) {
+        if (rec.buffer.length < SESSION_CLIENT_BUFFER_MAX) rec.buffer.push(ev);
+        continue;
+      }
+      writeSessionEvent(rec.res, ev, sessionId);
     }
   }
-}
-
-export function sessionHubStats() {
-  return { sessionClients: [...sessionClients.values()].reduce((a, s) => a + s.size, 0) };
 }
 
 // ---- SSE 写封装 ----

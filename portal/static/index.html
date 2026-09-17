@@ -24,6 +24,7 @@
     .msg { margin: .4rem 0; padding: .55rem .8rem; border-radius: 8px; max-width: 46rem; white-space: pre-wrap; word-break: break-word; }
     .msg.user { background: #e8f4ff; margin-left: auto; }
     .msg.assistant { background: #f6f6f6; }
+    .msg.synthetic { border-left: 3px solid #d80; background: #fffaf0; }
     .card { border: 1px solid var(--bd); border-left: 3px solid #888; border-radius: 6px; padding: .4rem .7rem; margin: .35rem 0; font-size: .85rem; max-width: 46rem; background: #fbfbfb; }
     .card.ok { border-left-color: #2a2; }
     .card.err { border-left-color: #b33; }
@@ -69,7 +70,7 @@
     const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
-                lastSeq: 0, es: null, activeRunId: null, deltaBuf: null, toolCards: {} };
+                lastSeq: 0, es: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null };
 
     async function api(path, opts = {}) {
       const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -201,8 +202,9 @@
       renderSessions();
       const data = await api(`/api/sessions/${encodeURIComponent(id)}`);
       S.lastSeq = data.last_seq;
+      S.renderedIds = new Set();
       for (const m of data.messages) addMessage(m);
-      if (data.active_run) { S.activeRunId = data.active_run.id; setRunning(true); }
+      if (data.session.active_run_id) { S.activeRunId = data.session.active_run_id; setRunning(true); }
       connectEvents(id);
     }
 
@@ -219,9 +221,13 @@
     }
 
     function addMessage(m) {
+      if (S.renderedIds) {
+        if (S.renderedIds.has(m.id)) return m; // 去重（refresh 与流式缓冲竞态）
+        S.renderedIds.add(m.id);
+      }
       const div = document.createElement('div');
-      div.className = `msg ${m.role}`;
-      div.textContent = m.content;
+      div.className = `msg ${m.role}${m.synthetic ? ' synthetic' : ''}`;
+      div.textContent = (m.synthetic ? '〔系统注入〕' : '') + m.content;
       $('stream').appendChild(div);
       scrollDown();
       return div;
@@ -240,7 +246,8 @@
     }
 
     function handleEvent(type, e) {
-      const d = e.data ? JSON.parse(e.data) : {};
+      let d;
+      try { d = e.data ? JSON.parse(e.data) : {}; } catch { return; } // 畸形事件忽略（§5.3）
       if (typeof d.seq === 'number') S.lastSeq = Math.max(S.lastSeq, d.seq);
       switch (type) {
         case 'ping': return;
@@ -288,20 +295,23 @@
         }
         case 'usage': return;
         case 'run_end': {
-          if (S.deltaBuf) S.deltaBuf = null;
-          const reason = d.termination?.reason ?? '';
-          const cancelled = reason === 'aborted';
-          sep(`run 结束：${reason}${d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : ''}`);
-          if (d.error) {
-            const div = document.createElement('div');
-            div.className = 'syserr';
-            div.textContent = `run 失败：${d.error.code} — ${d.error.message}`;
-            $('stream').appendChild(div);
+          // 历史重放的旧 run_end 不参与运行态状态机（防误关当前 run 的停止按钮/误拉刷新）
+          const isCurrent = d.run_id === S.activeRunId;
+          if (isCurrent) {
+            // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）
+            if (S.deltaBuf) { S.deltaBuf.remove(); S.deltaBuf = null; }
+            const reason = d.termination?.reason ?? '';
+            sep(`run 结束：${reason}${d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : ''}`);
+            if (d.error) {
+              const div = document.createElement('div');
+              div.className = 'syserr';
+              div.textContent = `run 失败：${d.error.code} — ${d.error.message}`;
+              $('stream').appendChild(div);
+            }
+            S.activeRunId = null;
+            setRunning(false);
+            refreshSession(d.run_id);
           }
-          S.activeRunId = null;
-          setRunning(false);
-          // 拉取 assistant 终稿（回写消息），替代增量缓冲的展示
-          refreshSession(d.run_id);
           return;
         }
         default: return; // 未知类型忽略（§5.3 向后兼容）

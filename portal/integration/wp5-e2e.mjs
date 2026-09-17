@@ -59,34 +59,37 @@ function readCookie(setCookie) {
 const S = { userspaceRoot: null, dynamicRoot: null, password: 'correct horse battery staple', totpSecret: null, cookie: null };
 const FDE_ENV = { FDE_IMAGE, FDE_CMD: '[]', FDE_DEV_USER: '', FDE_DEV_MODE: '1', FDE_AGENT_VERSION: '0.1.0', MOCK_LATENCY_MS: '5000' };
 
-async function insertUser() {
-  const userId = '00000000-0000-4000-8000-0000000000a1';
+async function insertUser(loginName) {
+  const suffix = loginName === 'alice' ? 'a1' : 'a2';
+  const userId = `00000000-0000-4000-8000-0000000000${suffix}`;
   const passwordHash = await auth.hashPassword(S.password);
-  S.totpSecret = totp.generateSecret(20);
+  const secret = totp.generateSecret(20);
   psqlStdin(`
     INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status, password_hash, totp_secret)
-    VALUES ('${userId}', 'alice', 'Alice', 'fde', 'alice', 'local', 'active', '${passwordHash}', '${S.totpSecret}');
+    VALUES ('${userId}', '${loginName}', '${loginName}', 'fde', '${loginName}', 'local', 'active', '${passwordHash}', '${secret}');
   `);
-  S.userId = userId;
+  if (loginName === 'alice') { S.userId = userId; S.totpSecret = secret; }
+  return secret;
 }
-async function login() {
+async function login(loginName = 'alice', secret = S.totpSecret) {
   const step1 = await fetch(`${PORTAL}/api/auth/login`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ login: 'alice', password: S.password }),
+    body: JSON.stringify({ login: loginName, password: S.password }),
   });
   assert.equal(step1.status, 200, 'login step1');
   const { pending_token } = await step1.json();
   const step2 = await fetch(`${PORTAL}/api/auth/login/totp`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pending_token, code: totp.totp(S.totpSecret) }),
+    body: JSON.stringify({ pending_token, code: totp.totp(secret) }),
   });
   assert.equal(step2.status, 200, 'login step2');
-  S.cookie = readCookie(step2.headers.get('set-cookie'));
-  assert.ok(S.cookie, 'session cookie');
+  const cookie = readCookie(step2.headers.get('set-cookie'));
+  assert.ok(cookie, 'session cookie');
+  return cookie;
 }
-async function api(path, opts = {}) {
+async function api(path, opts = {}, cookie = S.cookie) {
   const r = await fetch(`${PORTAL}${path}`, {
-    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${S.cookie}` }, ...opts,
+    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${cookie}` }, ...opts,
   });
   const body = await r.json().catch(() => ({}));
   return { status: r.status, body };
@@ -161,8 +164,8 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
       return r && r.status === 200;
     }, { label: 'portal healthz', timeoutMs: 240000, intervalMs: 1000 });
 
-    await insertUser();
-    await login();
+    await insertUser('alice');
+    S.cookie = await login('alice');
     const proj = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name: 'proj1', repo_url: 'https://git.example/alice/proj1.git', template: 'node' }) });
     assert.equal(proj.status, 201, 'create project');
     const projectId = proj.body.project.id;
@@ -183,8 +186,29 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     });
     const detail = await api(`/api/sessions/${sessionId}`);
     assert.equal(detail.status, 200);
+    assert.equal(detail.body.session.active_run_id, null, '新会话无活跃 run（§4.1 active_run_id）');
     assert.equal(detail.body.last_seq, 0, '新会话 last_seq=0');
     assert.deepEqual(detail.body.messages, []);
+
+    // 跨用户越权：bob 对 alice 的 session 一律 404（不泄露存在性）
+    const bobSecret = await insertUser('bob');
+    const bobCookie = await login('bob', bobSecret);
+    for (const [method, p2, body] of [
+      ['GET', `/api/sessions/${sessionId}`, undefined],
+      ['PATCH', `/api/sessions/${sessionId}`, JSON.stringify({ title: 'x' })],
+      ['DELETE', `/api/sessions/${sessionId}`, undefined],
+      ['POST', `/api/sessions/${sessionId}/messages`, JSON.stringify({ content: 'x' })],
+      ['POST', `/api/sessions/${sessionId}/stop`, '{}'],
+      ['GET', `/api/sessions/${sessionId}/events`, undefined],
+    ]) {
+      const r = await api(p2, { method, body }, bobCookie);
+      assert.equal(r.status, 404, `跨用户 ${method} ${p2} → 404（得 ${r.status}）`);
+    }
+    // 非法 last_event_id → 400；超界 → 404（bob 视角对 alice 会话先 404，用 alice 自测）
+    const badLe = await api(`/api/sessions/${sessionId}/events?last_event_id=abc`, {}, S.cookie);
+    assert.equal(badLe.status, 400, '非法 last_event_id → 400');
+    // 归档后不可改标题（CAS）：先归档一个空会话验证
+
 
     // 2) 校验：空 content 400；他人会话 404（用 alice 的会话 + 未登录请求 → 401/404 由鉴权层保证）
     const bad = await api(`/api/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content: '' }) });
@@ -220,6 +244,10 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     const assistantMsgs = after.body.messages.filter((m) => m.run_id === run1 && m.role === 'assistant' && !m.synthetic);
     assert.equal(assistantMsgs.length, 1, `assistant 回写一 run 一条：${JSON.stringify(after.body.messages)}`);
 
+    // 6.5) 无进行中 run 时 stop → 409
+    const stopIdle = await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: '{}' });
+    assert.equal(stopIdle.status, 409, '无进行中 run 时 stop → 409');
+
     // 7) 停止链路 + 实时 SSE：先连浏览器 SSE（无 last_event_id，不补发历史）→ 发消息 →
     //    stop → 实时收 run_end(aborted)（验 ④ live 推送通道，与 ⑤ replay 互补）
     const sent2 = await api(`/api/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content: '会被停止的任务' }) });
@@ -234,6 +262,8 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     const stop = await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: '{}' });
     assert.equal(stop.status, 200, `stop: ${JSON.stringify(stop.body)}`);
     assert.equal(stop.body.run.status, 'cancelling');
+    const stopAgain = await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: '{}' });
+    assert.equal(stopAgain.status, 200, 'cancelling 重复停止幂等 200');
     const liveEvents = await livePromise;
     const liveRunEnd = liveEvents.filter((e) => e.type === 'run_end').at(-1);
     assert.ok(liveRunEnd && liveRunEnd.data.run_id === run2, '实时 SSE 收到 run2 run_end');
@@ -245,12 +275,18 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     }, { label: 'run2 终态（aborted）', timeoutMs: 120000, intervalMs: 500 });
     const term2 = psql(`SELECT termination->>'reason' FROM runs WHERE id='${run2}'`);
     assert.ok(['aborted', 'failed'].includes(term2), `run2 终止原因 aborted/failed：${term2}`);
-    const noActive = await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: '{}' });
-    assert.equal(noActive.status, 409, '无进行中 run 时 stop → 409');
+    const runDetail = await api(`/api/runs/${run2}`);
+    assert.equal(runDetail.status, 200, `GET /api/runs/:id: ${JSON.stringify(runDetail.body)}`);
+    assert.equal(runDetail.body.run.id, run2);
+    assert.equal(runDetail.body.run.termination?.reason, 'aborted', 'run 详情 termination.aborted');
+    const runForeign = await api(`/api/runs/${run2}`, {}, bobCookie);
+    assert.equal(runForeign.status, 404, '他人 run → 404');
+    const run404 = await api('/api/runs/00000000-0000-4000-8000-0000000000zz');
+    assert.ok([400, 404].includes(run404.status), '非法 run id → 400/404');
 
     // 8) 归档：无进行中 run → 204/200；归档后 GET → 404（存在性不泄露）
     const arch = await api(`/api/sessions/${sessionId}`, { method: 'DELETE' });
-    assert.equal(arch.status, 200, `archive: ${JSON.stringify(arch.body)}`);
+    assert.equal(arch.status, 204, `archive → 204（得 ${arch.status}）`);
     const gone = await api(`/api/sessions/${sessionId}`);
     assert.equal(gone.status, 404, '归档后 GET 404');
 
