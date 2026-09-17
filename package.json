@@ -14,6 +14,7 @@
     "test:integration:wp3a": "node --test portal/integration/wp3a-e2e.mjs",
     "test:integration:wp3b": "node --test portal/integration/wp3b-e2e.mjs",
     "test:integration:wp4": "node --test portal/integration/wp4-acceptance.mjs",
+    "test:integration:wp5": "node --test portal/integration/wp5-e2e.mjs",
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
     "start": "node portal/src/cli.js serve",
     "db:migrate": "node portal/src/cli.js migrate",
