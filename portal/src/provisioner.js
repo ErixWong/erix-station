@@ -656,7 +656,10 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     }
 
     await pool.query(`UPDATE containers SET status = 'removed', updated_at = now() WHERE user_id = $1 AND status <> 'removed'`, [u.id]);
-    // F7：offboarding 吊销 token → 主动关闭该容器已建立的 SSE 连接（agentd 收到 revoke 即退出）。
+    // F7：offboarding 吊销 token → 进程内广播 revoke（agentd 收到即停领新任务并收敛退出）。
+    // 排序语义（评审 PR#23 M2）：广播放在 desired state 提交之后——F9 删除失败保留现场时不广播，
+    // 避免容器保留但 agentd 已被叫停的坏状态。已知限制：当前唯一调用者是 CLI 独立进程，
+    // 内存 hub 跨进程不可达（收敛靠心跳 token_revoked 兜底）→ issue #22 统一解决。
     if (containerId) broadcastRevoke(containerId, { reason: 'offboarded' });
     const client = await pool.connect();
     try {
