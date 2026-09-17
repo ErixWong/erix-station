@@ -60,14 +60,14 @@ export async function listSessions(pool, { userId, projectId, cursor, limit = 20
   params.push(n + 1);
   const res = await pool.query(
     `SELECT s.id, s.project_id, s.title, s.model, s.last_seq, s.created_at, s.updated_at,
-            (SELECT count(*) FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES}) > 0 AS has_active_run
+            (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id
        FROM chat_sessions s
       WHERE ${where}
       ORDER BY s.updated_at DESC
       LIMIT $${params.length}`,
     params,
   );
-  const items = res.rows.slice(0, n).map(rowToSession);
+  const items = res.rows.slice(0, n).map((r) => ({ ...rowToSession(r), active_run_id: r.active_run_id ?? null }));
   const nextCursor = res.rows.length > n ? res.rows[n - 1].id : null;
   return { items, next_cursor: nextCursor };
 }
@@ -120,6 +120,8 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
        FROM messages WHERE ${where} ORDER BY seq DESC LIMIT $2`,
     params,
   );
+  const hasOlder = msgs.rows.length > n; // 多取的 1 条存在 ⇒ 还有更早消息
+  if (hasOlder) msgs.rows.pop();
   msgs.rows.reverse(); // 升序返回
   const active = await pool.query(
     `SELECT id, status FROM runs WHERE session_id = $1 AND status IN ${ACTIVE_RUN_STATES} ORDER BY queued_at DESC LIMIT 1`,
@@ -139,7 +141,7 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     })),
     last_seq: Number(s.last_seq),
     // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
-    next_cursor: msgs.rows.length === n ? Number(msgs.rows[0].seq) : null,
+    next_cursor: hasOlder ? Number(msgs.rows[0].seq) : null,
   };
 }
 

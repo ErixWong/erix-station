@@ -179,7 +179,7 @@
       $('sessList').innerHTML = S.sessions.map((s) =>
         `<div class="sess ${s.id === S.sessionId ? 'active' : ''}" data-id="${esc(s.id)}">` +
         `<div>${esc(s.title || '未命名会话')}</div>` +
-        `<div class="meta">${s.has_active_run ? '● 运行中' : esc(new Date(s.updated_at).toLocaleString())}</div></div>`
+        `<div class="meta">${s.active_run_id ? '● 运行中' : esc(new Date(s.updated_at).toLocaleString())}</div></div>`
       ).join('') || '<p class="muted">暂无会话</p>';
       for (const el of $('sessList').querySelectorAll('.sess')) {
         el.onclick = () => openSession(el.dataset.id);
@@ -338,7 +338,7 @@
     function scrollDown() { $('stream').scrollTop = $('stream').scrollHeight; }
 
     function setRunning(on) {
-      $('stopBtn').style.display = on ? '' : 'none';
+      $('stopBtn').style.display = on ? 'inline-block' : 'none'; // 显式值压过样式表 display:none
       $('sendBtn').disabled = on;
     }
 
