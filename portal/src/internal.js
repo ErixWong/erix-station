@@ -295,6 +295,43 @@ export function broadcastRevoke(containerId, data) {
   sseClients.delete(containerId);
 }
 
+// ---- 浏览器侧 session SSE hub（portal.md §5；keyed by session，多客户端并存） ----
+const sessionClients = new Map(); // sessionId -> Set<res>
+
+export function registerSessionClient(sessionId, res) {
+  let set = sessionClients.get(sessionId);
+  if (!set) {
+    set = new Set();
+    sessionClients.set(sessionId, set);
+  }
+  set.add(res);
+}
+
+export function unregisterSessionClient(sessionId, res) {
+  const set = sessionClients.get(sessionId);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) sessionClients.delete(sessionId);
+}
+
+/** 事件落库后推给该 session 的所有浏览器 SSE 客户端（portal.md §5.1 wire 格式）。 */
+export function notifySessionEvents(sessionId, events) {
+  const set = sessionClients.get(sessionId);
+  if (!set || set.size === 0) return;
+  for (const ev of events) {
+    const data = JSON.stringify({
+      seq: ev.seq, ts: ev.ts, session_id: sessionId, run_id: ev.run_id, type: ev.type, ...ev.payload,
+    });
+    for (const res of set) {
+      writeSseEvent(res, ev.type, data, ev.seq);
+    }
+  }
+}
+
+export function sessionHubStats() {
+  return { sessionClients: [...sessionClients.values()].reduce((a, s) => a + s.size, 0) };
+}
+
 // ---- SSE 写封装 ----
 
 export function sseHeaders() {
@@ -306,9 +343,10 @@ export function sseHeaders() {
   };
 }
 
-export function writeSseEvent(res, event, data) {
+export function writeSseEvent(res, event, data, id = null) {
   if (res.writableEnded || res.destroyed) return;
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const idLine = id != null ? `id: ${id}\n` : '';
+  res.write(`${idLine}event: ${event}\ndata: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`);
 }
 
 export function writeSseComment(res, text) {
@@ -516,6 +554,10 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
     );
 
     await client.query('COMMIT');
+    // 浏览器侧 SSE 推送（终态 run_end 也必须实时可见）
+    try {
+      notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload }]);
+    } catch { /* 尽力推送 */ }
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
     return { state, queue_status: queueStatus, run_end_seq: runEndSeq };
   } catch (err) {
@@ -586,6 +628,7 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     let stored = 0;
     let seqFirst = null;
     let seqLast = null;
+    const committedEvents = []; // 提交后推浏览器侧 SSE（D7）
     for (const ev of events) {
       // 先查重再分配 seq：重复事件不消耗 seq（§7.3 严格递增、无空洞）。
       const dup = await client.query(`SELECT 1 FROM run_events WHERE run_id = $1 AND client_event_id = $2`, [runId, ev.client_event_id]);
@@ -600,6 +643,10 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
       );
       if (ins.rows.length > 0) {
         stored += 1;
+        committedEvents.push({
+          seq, ts: (ev.ts ?? new Date().toISOString()),
+          run_id: runId, type: ev.type, payload: ev.payload ?? {},
+        });
         if (seqFirst === null) seqFirst = seq;
         seqLast = seq;
       }
@@ -617,6 +664,10 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     }
 
     await client.query('COMMIT');
+    // D7：事件先落 DB，再推浏览器侧 SSE（§5.1）。通知失败不影响 200（客户端靠 Last-Event-ID 补发）。
+    try {
+      if (committedEvents.length > 0) notifySessionEvents(r.session_id, committedEvents);
+    } catch { /* 尽力推送 */ }
     return { stored, seq_first: seqFirst, seq_last: seqLast };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -962,6 +1013,7 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
     let outcome;
     let runStatus;
     let queueStatus;
+    let committedRunEnd = null; // 提交后推浏览器侧 SSE（aborted/max_attempts 的合成 run_end）
     // 注意：release 后保留 claim_token（供幂等重放识别），fencing 由 lease_until 清空保证（旧 token 无法续租/写）。
     if (qrow.status === 'cancelled' || r.status === 'cancelling') {
       await client.query(`UPDATE run_queue SET status='cancelled', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
@@ -970,13 +1022,14 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       runStatus = 'finished';
       queueStatus = 'cancelled';
       const runEndSeq = await allocSeq(client, r.session_id);
+      const runEndPayload = { termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) };
       await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
          VALUES ($1, $2, $3, $4, 'run_end', $5, now())
          ON CONFLICT (run_id, client_event_id) DO NOTHING`,
-        [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
-          JSON.stringify({ termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) })],
+        [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
       );
+      committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
     } else if (Number(qrow.attempts) < Number(qrow.max_attempts)) {
       await client.query(`UPDATE run_queue SET status='pending', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
       await client.query(`UPDATE runs SET status='queued' WHERE id=$1`, [runId]);
@@ -993,17 +1046,21 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       runStatus = 'failed';
       queueStatus = 'done';
       const runEndSeq = await allocSeq(client, r.session_id);
+      const runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
+        error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } };
       await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
          VALUES ($1, $2, $3, $4, 'run_end', $5, now())
          ON CONFLICT (run_id, client_event_id) DO NOTHING`,
-        [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
-          JSON.stringify({ termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
-            error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } })],
+        [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
       );
+      committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
     }
 
     await client.query('COMMIT');
+    try {
+      if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
+    } catch { /* 尽力推送 */ }
     await audit(pool, { actorId: user.id, action: 'run.release', target: runId, details: { reason, outcome } }).catch(() => {});
     return {
       run_id: runId,
@@ -1057,6 +1114,7 @@ export async function reapExpiredRuns(pool) {
       WHERE q.status = 'claimed' AND q.lease_until < now()`,
   );
   const results = [];
+  let committedRunEnd = null; // 提交后推浏览器侧 SSE（回收路径的合成 run_end）
   for (const c of candidates.rows ?? []) {
     const runId = c.run_id;
     const client = await pool.connect();
@@ -1083,13 +1141,14 @@ export async function reapExpiredRuns(pool) {
         await client.query(`UPDATE run_queue SET status='cancelled', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
         await client.query(`UPDATE runs SET status='finished', termination='{"reason":"aborted"}'::jsonb, ended_at=now() WHERE id=$1`, [runId]);
         const runEndSeq = await allocSeq(client, r.session_id);
+        const runEndPayload = { termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) };
         await client.query(
           `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
            VALUES ($1, $2, $3, $4, 'run_end', $5, now())
            ON CONFLICT (run_id, client_event_id) DO NOTHING`,
-          [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
-            JSON.stringify({ termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts) })],
+          [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
         );
+        committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
         results.push({ run_id: runId, outcome: 'cancelled', run_status: 'finished' });
       } else if (Number(qrow.attempts) >= Number(qrow.max_attempts)) {
         await client.query(`UPDATE run_queue SET status='done', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
@@ -1098,14 +1157,15 @@ export async function reapExpiredRuns(pool) {
           [runId],
         );
         const runEndSeq = await allocSeq(client, r.session_id);
+        const runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
+          error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } };
         await client.query(
           `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
            VALUES ($1, $2, $3, $4, 'run_end', $5, now())
            ON CONFLICT (run_id, client_event_id) DO NOTHING`,
-          [runId, r.session_id, runEndSeq, `${runId}:final:run_end`,
-            JSON.stringify({ termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
-              error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } })],
+          [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
         );
+        committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
         results.push({ run_id: runId, outcome: 'failed_max_attempts', run_status: 'failed' });
       } else {
         await client.query(`UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
@@ -1113,6 +1173,10 @@ export async function reapExpiredRuns(pool) {
         results.push({ run_id: runId, outcome: 'requeued', run_status: 'queued' });
       }
       await client.query('COMMIT');
+      try {
+        if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
+      } catch { /* 尽力推送 */ }
+      committedRunEnd = null;
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;
