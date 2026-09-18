@@ -34,7 +34,7 @@
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
 | `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
 
-> **P1 `MIGRATE_ON_START=0`**：baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（`deploy/db-init/00-init.sh`，超级用户，空数据目录时）完成一次，portal 运行时以 `station_portal` 启动、不重复跑 superuser bootstrap；增量迁移（现有 `deploy/migrations/0001-idempotency-keys.sql`）以 `station_platform`（`MIGRATE_DATABASE_URL`）跑：`cli.js migrate` 或 `MIGRATE_ON_START=1`（§3.1/§3.3）。
+> **P1 `MIGRATE_ON_START=1`（compose 显式启用启动迁移）**：baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（`deploy/db-init/00-init.sh`，超级用户，空数据目录时）完成一次；portal 在**监听端口前**以 `station_platform`（`MIGRATE_DATABASE_URL`）应用 `deploy/migrations/*.sql` 增量（现有 `0001-idempotency-keys.sql`），运行时再以 `station_portal` 提供 DML。**单实例平台（P1）下启动迁移是安全的**——advisory lock 串行化 + 每迁移单事务 + checksum 防改历史；**多实例部署必须改为外部执行迁移并禁用启动迁移**（§3.1）。
 >
 > **镜像预拉取**：portal **不授 IMAGES**（station-docker-proxy 路径白名单仅 containers/networks，§5.1）。FDE 镜像由**宿主在部署时 `docker pull`** 预拉取（版本 pin 走 `containers.agent_version` + canary，规格 §14）；镜像升级 = 宿主预拉新 digest + 重建容器，不经过 portal 的 Docker API。
 >
@@ -100,10 +100,12 @@
 
 ### 3.1 谁执行、怎么幂等
 
-> **P1 实际执行方（与 `deploy/db-init/00-init.sh` 对齐）**：P1 walking skeleton 下 baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（空数据目录时，超级用户）完成一次，portal 以 `MIGRATE_ON_START=0` 启动、不重复跑 superuser bootstrap。`00-init.sh` 顺序：① 应用 `schema.sql`（baseline）→ ② `ALTER ROLE ... PASSWORD` 设 `station_platform`/`station_portal` 口令（来自 600 权限 `deploy/.env`）→ ③ 回填 baseline 哨兵 checksum 为真实 `sha256(schema.sql)` → ④ 应用 `bootstrap.sql`（schema 授权 + 表/序列 ownership 归正到 `station_platform`）→ ⑤ 收紧跨库 CONNECT。
+> **P1 实际执行方（与 `deploy/db-init/00-init.sh` 对齐）**：P1 walking skeleton 下 baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（空数据目录时，超级用户）完成一次。`00-init.sh` 顺序：① 应用 `schema.sql`（baseline）→ ② `ALTER ROLE ... PASSWORD` 设 `station_platform`/`station_portal` 口令（来自 600 权限 `deploy/.env`）→ ③ 回填 baseline 哨兵 checksum 为真实 `sha256(schema.sql)` → ④ 应用 `bootstrap.sql`（schema 授权 + 表/序列 ownership 归正到 `station_platform`）→ ⑤ 收紧跨库 CONNECT。**增量迁移由 portal 自己跑**：compose 显式置 `MIGRATE_ON_START: "1"`，portal 在监听端口前应用 `deploy/migrations/*.sql`（`station_platform`），故「部署了新版本但忘跑迁移 → 表缺失」不再可能（§3.1/§3.3）。
+>
+> **多实例部署（同一库多个 portal 副本）**：启动迁移是**单实例**约定——必须改为**外部一次性迁移 + 禁用启动迁移**：先在发布窗口跑一次 `node portal/src/cli.js migrate`（`MIGRATE_ON_START=0`，`station_platform` 身份），再以 `MIGRATE_ON_START=0`（compose override 覆盖本行，如 `docker-compose.multi.yml`）起全部实例。理由：迁移是发布动作，不是每实例启动动作——并发 DDL 无收益（哪怕 advisory lock 能串行化），且失败会拒启对应实例（§3.2），把发布风险放到启动路径上。
 
 - **baseline = [`../data/schema.sql`](../data/schema.sql)**（可执行建表 DDL，单事务 `BEGIN;…COMMIT;`，**自包含**：开头幂等创建 `station_platform` / `station_portal` 两个角色，空库 `psql -f` 可单独执行，不依赖 bootstrap）。**baseline 自 P1 起冻结**：新增 schema 一律走 `deploy/migrations/` 增量（§3.3），不修改本文件（改则 checksum 失配）。
-- **migration runner**：`portal/src/migrate.js` 以 advisory lock 串行化，按序应用 baseline → bootstrap → `deploy/migrations/*.sql`（文件名升序），幂等、失败可恢复。**P1 默认 `MIGRATE_ON_START=0`**（baseline/bootstrap 已由 db-init 完成）；当 `MIGRATE_ON_START=1` 时 portal 在**监听端口之前**跑迁移，迁移角色 `station_platform`（DDL），运行时角色 `station_portal`（DML 最小 GRANT）。
+- **migration runner**：`portal/src/migrate.js` 以 advisory lock 串行化，按序应用 baseline → bootstrap → `deploy/migrations/*.sql`（文件名升序），幂等、失败可恢复。**P1 compose 显式 `MIGRATE_ON_START: "1"`**（单实例：起栈即自动补迁移，避免「部署后忘跑迁移」）；当 `MIGRATE_ON_START=1` 时 portal 在**监听端口之前**跑迁移，迁移角色 `station_platform`（DDL），运行时角色 `station_portal`（DML 最小 GRANT）。**多实例部署须置 0 并外部跑迁移**（见本节首段注）。
 - **幂等**：新增 `schema_migrations` 表（`version text PK, checksum text, applied_at timestamptz DEFAULT now()`）。每个迁移文件在**单事务**内执行，成功后插入 `schema_migrations` 行；已存在的 `version` 跳过。`schema.sql` 作为 `version='0000_baseline'` 只在空库首次应用（已有 `schema_migrations` 则不再重放 baseline）。
 - **顺序**：baseline → `deploy/migrations/0001-*.sql` → `0002-*.sql` …（文件名编号升序）。每次新增 DDL 都写成新编号迁移文件，**不修改已应用的迁移**（改历史迁移会破坏 checksum 一致性）。
 
@@ -118,7 +120,7 @@
 
 - **baseline 自 P1 冻结**：`schema.sql` 只包含 P1 已定稿的表。自 `0001` 起的所有 schema 演进**只**写入 `deploy/migrations/`（增量生效，见 §3.1）；不得回写 baseline（会改变 `0000_baseline` 的 checksum → runner 拒绝启动，§3.2）。即：新表/新列出现在 baseline 里就是 bug。
 - **空库**：P1 由 `deploy/db-init/00-init.sh`（超级用户）执行，顺序见 §3.1；也可手动以超级用户 `psql -f docs/data/schema.sql`（自包含：开头幂等创建角色 → 建表 → 落 `0000_baseline` → 授最小 DML GRANT），记录 `0000_baseline`。
-- **生产/P1**：baseline 由 db-init 超级用户完成；随后 `bootstrap.sql` 做 schema 级授权 + 表/序列 ownership 归正到 `station_platform` + 角色属性兑底（超级用户，可重复执行）；增量迁移以 `station_platform`（`MIGRATE_DATABASE_URL`）跑——目前已有 `0001-idempotency-keys.sql`（写操作幂等台账 `idempotency_keys`，portal.md §1.4），**首次部署到已有库必须显式跑一次迁移**：`node portal/src/cli.js migrate` 或 `MIGRATE_ON_START=1`（portal 监听前应用）。迁移文件由 portal 镜像 `COPY deploy/migrations/` 带进容器（`/app/deploy/migrations`）。
+- **生产/P1**：baseline 由 db-init 超级用户完成；随后 `bootstrap.sql` 做 schema 级授权 + 表/序列 ownership 归正到 `station_platform` + 角色属性兑底（超级用户，可重复执行）；增量迁移以 `station_platform`（`MIGRATE_DATABASE_URL`）跑——目前已有 `0001-idempotency-keys.sql`（写操作幂等台账 `idempotency_keys`，portal.md §1.4），**由 portal 启动时自动应用**（compose `MIGRATE_ON_START: "1"`，监听端口前；多实例部署改外部跑，见 §3.1）。迁移文件由 portal 镜像 `COPY deploy/migrations/` 带进容器（`/app/deploy/migrations`）。
 - **已有库**：不重放 baseline；只按 `deploy/migrations/` 顺序补增量。
 - schema.sql 由文档→`deploy/` 的**生成/拷贝步骤**保持同步（schema.sql 是真相，`deploy/` 的 baseline 副本是部署产物；若将来拆分，以 `docs/data/schema.sql` 为准）。
 
