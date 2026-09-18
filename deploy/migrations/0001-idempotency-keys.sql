@@ -8,7 +8,7 @@
 --                        超过 5 分钟（持有者崩溃残留，stale）→ 视为可覆盖，被后续请求 UPDATE 抢回后执行；
 --   state='done'         完成行：落 status_code/response 供回放（TTL 24h 内命中；request_hash 不一致 → 409 idempotency_key_reuse）。
 --   claim_token          占位持有者标识（owner fencing，G2）：占位/抢回时写入新 UUID，
---                        record/complete/release 均带 `AND claim_token = $`——旧持有者崩溃后被抢回，
+--                        record/补记（writeDone）/release 均带 `AND claim_token = $`——旧持有者崩溃后被抢回，
 --                        其迟到的记账/释放一律 0 行（不覆写新持有者的结果）。done 行保留最后一次占位的 token。
 --   created_at 既作 TTL 24h 基准（done 行的命中窗口），也作 in_progress 陈旧判定基准。
 --   占位行 status_code/response 为 NULL（结果尚未产生）——回放只读 state='done' 行，故不会回放出占位态。

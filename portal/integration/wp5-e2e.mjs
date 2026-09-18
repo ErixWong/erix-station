@@ -178,6 +178,8 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
       'idempotency_keys 由迁移 0001 建出');
     assert.equal(psql(`SELECT count(*) FROM information_schema.columns WHERE table_name='idempotency_keys' AND column_name='state'`), '1',
       'state 列（先占位后执行）存在');
+    assert.equal(psql(`SELECT count(*) FROM information_schema.columns WHERE table_name='idempotency_keys' AND column_name='claim_token'`), '1',
+      'claim_token 列（owner fencing，G2）存在');
 
     await insertUser('alice');
     S.cookie = await login('alice');
@@ -296,6 +298,9 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     // 台账 status_code/response 落库与首次一致
     assert.equal(psql(`SELECT status_code FROM idempotency_keys WHERE key='${idemKey}'`), '202');
     assert.equal(psql(`SELECT response->'run'->>'id' FROM idempotency_keys WHERE key='${idemKey}'`), idemRunId);
+    // G2：完成行保留占位时写入的 claim_token（owner fencing）——记账与业务写入同事务，故此处必非空
+    assert.equal(psql(`SELECT claim_token IS NOT NULL FROM idempotency_keys WHERE key='${idemKey}'`), 't',
+      '完成行带 claim_token（占位持有者标识）');
 
     // 6.7) 同 key 不同载荷 → 409 idempotency_key_reuse（不产生第二次副作用）
     const idemReuse = await api(`/api/sessions/${sessionId}/messages`, {
@@ -355,6 +360,8 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     assert.equal(Number(psql(`SELECT count(*) FROM idempotency_keys WHERE key='${raceKey}'`)), 1, '并发同 key 台账一行');
     assert.equal(psql(`SELECT state FROM idempotency_keys WHERE key='${raceKey}'`), 'done',
       '赢家完成后台账为 done（先占位后执行）');
+    assert.equal(psql(`SELECT claim_token IS NOT NULL FROM idempotency_keys WHERE key='${raceKey}'`), 't',
+      '并发赢家的台账行带 claim_token（G2 fencing 标识）');
     // 等该 run 收敛（下步 step 7/8 需要无活跃 run）
     const raceRunId = raceWinner.body.run.id;
     await waitFor(() => {
