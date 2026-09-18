@@ -12,11 +12,13 @@
 --
 -- 本表**仅由本迁移提供**：docs/data/schema.sql 是自 P1 冻结的 baseline（deploy/migrations/README.md），
 --   新增 DDL 一律走增量迁移，不改 baseline（改 baseline 会改变其 checksum → migrate runner 拒绝启动）。
--- 幂等：`CREATE TABLE IF NOT EXISTS` + `ADD COLUMN IF NOT EXISTS` + `DROP NOT NULL`（可重复执行）；
---   末尾两条 ALTER 只为兼容**预发布期**已建出本表的库（本 PR 未发布前，该表曾一度写在 baseline 里，
---   那一版不含 state 且 status_code/response 为 NOT NULL）；对全新库是 no-op。
---   注：兼容路径只补列与可空性，不补 state 的 CHECK 约束（该库为开发/预发布库，应用层总是写合法值）——
---   全新库一律带上 CHECK。
+-- 幂等：`CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`（可重复执行）。
+-- 预发布库（本迁移发布前在本机建过本表的开发库）：**请直接重建**，不提供 ALTER 兼容路径——
+--   runner 先校验 baseline checksum（migrate.js：baseline 校验在增量之前），旧库要么 checksum 失配
+--   直接拒启、要么结构与本文件不一致（缺列/多 NOT NULL）而无人修复；「兼容旧库」的 ALTER 分支既
+--   不可达又制造第二套 schema 口径（旧 baseline 曾包含过本表）。重建：
+--     docker compose -f deploy/docker-compose.yml down -v && rm -rf /docker/station-db && up -d
+--   重建后 baseline + 增量自 0001 起线性应用（compose 默认 MIGRATE_ON_START=1 自动跑到头）。
 -- 约定：单事务（runner 会 BEGIN → 执行 → 落 schema_migrations → COMMIT，deploy/migrations/README.md）。
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   user_id      uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -29,11 +31,6 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   created_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, endpoint, key)
 );
-
--- 预发布期兼容（对全新库 no-op，见文件头说明）
-ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'done';
-ALTER TABLE idempotency_keys ALTER COLUMN status_code DROP NOT NULL;
-ALTER TABLE idempotency_keys ALTER COLUMN response DROP NOT NULL;
 
 -- 过期清理扫描索引（reaper 低频 DELETE created_at < now() - interval '24 hours'）
 CREATE INDEX IF NOT EXISTS idempotency_keys_created_idx ON idempotency_keys (created_at);
