@@ -28,7 +28,7 @@ P1 本地开发（写代码、起栈联调）只需：
 | 用户空间根 / 动态配置目录 | 开发期**可注入临时目录隔离**：`ERIX_USERSPACE_ROOT_HOST`（宿主用户空间根，默认 `/srv/erix/users`）与 `TRAEFIK_DYNAMIC_DIR_HOST`（Traefik 动态配置宿主目录，默认 `./traefik/dynamic`）——两者都**建议 0755**（portal 虽回加了 `CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID`（deploy-contract §1），开发期临时目录仍避免依赖特权位；station-docker-proxy 以 gid 1000 穿越目录（deploy-contract §5.1）；`mktemp -d` 默认 0700 需先 chmod） |
 | backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `voiceprint_default` 占用（`br-8e3857476b83` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
 | socket-proxy | 开发期**同样启用**：`station-docker-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API（不直挂 socket）；白名单见 deploy-contract §5.1（自研 admission proxy：方法+路径白名单 12 条 + create 参数级校验；**不再用** tecnativa 类别级 env 门） |
-| DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**，portal 运行时 `MIGRATE_ON_START=0` 不重复跑 |
+| DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**。增量迁移（`deploy/migrations/*.sql`）**由 portal 自己跑**：`MIGRATE_ON_START=1`（compose 显式值），portal 在监听端口前应用（§10） |
 | 域名 | 不依赖 DNS 泛解析：用 `/etc/hosts` 逐条指到 127.0.0.1，或用 `*.localhost` 变通（`station.localhost` / `alice-r3a7fq-4001.fde.localhost`，多数系统 localhost 子域自动回环到 127.0.0.1）。⚠️ **`*.localhost` 变通只对浏览器/宿主有效，对容器无效**：容器内解析 `station.<base>` / `llm.<base>` 用创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1） |
 | TLS | 自签证书，或直接 http 联调（cookie `Secure`/`SameSite` 属性按实际域名方案调试，正式语义仍以 portal.md §2.5 为准） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
@@ -283,6 +283,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | 超级用户（bootstrap）身份；部署时生成，`POSTGRES_PASSWORD` 存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station` / — / `station` |
 | `PLATFORM_DB_USER` / `PLATFORM_DB_PASSWORD` | 迁移身份（DDL/表 owner）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_platform` / — |
 | `PORTAL_DB_USER` / `PORTAL_DB_PASSWORD` | 运行时身份（最小 DML GRANT）；口令存 **600 权限 `deploy/.env`**（§6），⚠️ 必须改 | `station_portal` / — |
+| `MIGRATE_ON_START` | 是否由 portal 在**监听端口前**自动应用增量迁移（`deploy/migrations/*.sql`，身份 `station_platform`）；compose 显式置 **`1`**——P1 单实例平台自动迁移安全，避免「部署后忘跑迁移 → 表缺失」（deploy-contract §3.1） | `1`（单实例）；⚠️ **多实例部署必须置 `0` 并外部跑一次 `node portal/src/cli.js migrate`**（并发 DDL/发布风险不上启动路径） |
 | `PORTAL_IMAGE` | 平台规范固定（规格 §14）；自构建（build context `portal/`） | `erix-station/portal:<git-sha>`（不可变 tag；部署时再 `docker inspect --format '{{.Id}}'` 记 digest） |
 | `POSTGRES_IMAGE` | 平台规范固定（规格 §14）；官方镜像（compose 变量名 `POSTGRES_IMAGE`） | `postgres:16.15`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体值部署时由 §9 产出后填） |
 | `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
