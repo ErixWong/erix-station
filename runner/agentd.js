@@ -881,6 +881,9 @@ async function main() {
     log('error', 'ERIX_STATION_TOKEN missing');
     process.exit(1);
   }
+  // user-space §6.2：容器内进程 umask = 0002（新建文件 664/目录 775，配合同 GID 1000 组协作）。
+  // agentd 建 worktree、fork worker（继承 umask）的文件都需跨 UID（1001/1002）组可写。
+  process.umask(0o002);
   log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
 
   const sse = openSse();

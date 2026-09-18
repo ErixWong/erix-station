@@ -45,6 +45,14 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npm install -g playwright@1.63.0 \
   && npx playwright install --with-deps chromium
 
+# ---- git 跨 UID 协作（实测发现，issue #27 记录）----
+# safe.directory：agentd(1001)/worker(1002) 在 FDE(1000) clone 的仓库里跑 git 必触发
+#   "dubious ownership" → agentd.js:326 catch 吞掉 → worktree 机制**静默降级成普通目录**（D8 隔离失效）。
+# sharedRepository=group：git 原生机制，init/clone 自动把 .git 调成 2775 组写——免约定，
+#   对任意入口（docker exec shell umask 022 / agent bash）都生效；agentd(1001) 才能 worktree add。
+# 配合 agentd/worker 的 umask 0002（user-space §6.2）：agentd checkout 的 worktree 文件 664，worker(1002) 可写。
+RUN printf '[safe]\n\tdirectory = *\n\n[core]\n\tsharedRepository = group\n' > /etc/gitconfig
+
 WORKDIR /opt/erix
 
 # ---- erix-agent 依赖（npm v0.3.5，deploy-contract §1 版本记录点）----
