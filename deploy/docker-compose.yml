@@ -60,7 +60,8 @@ services:
     build:
       context: ./fde-proxy
       dockerfile: Dockerfile
-    image: erix-station/fde-proxy:local
+    # 生产 pin 不可变引用（image@sha256:<digest> 或 sha256:<imageId>，issue #27）；dev 默认 local。
+    image: ${STATION_DOCKER_PROXY_IMAGE:-erix-station/fde-proxy:local}
     restart: unless-stopped
     networks:
       - backend
@@ -180,7 +181,8 @@ services:
       FDE_DEV_USER: ${FDE_DEV_USER-1001:1000}
       FDE_CMD: ${FDE_CMD:-["-port","4000"]}
       FDE_AGENT_VERSION: ${FDE_AGENT_VERSION:-dev}
-      FDE_MEMORY_LIMIT: ${FDE_MEMORY_LIMIT:-512m}
+      # FDE 内存限额（issue #27 已决 2026-09-18：默认 4g——B 档镜像下 dotnet build/chromium 峰值需要；`0` 不限）
+      FDE_MEMORY_LIMIT: ${FDE_MEMORY_LIMIT:-4g}
       FDE_AGENTD_UID: ${FDE_AGENTD_UID:-1001}
       FDE_WORKER_UID: ${FDE_WORKER_UID:-1002}
       # 预览 session 派生密钥（HMAC-SHA256，portal.md §2.7）；生产必须显式改掉此 dev 占位
