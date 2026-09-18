@@ -331,8 +331,10 @@ function prepareWorktree(projectName, runId) {
       });
       return wt;
     }
-  } catch {
-    // fallthrough → mkdir
+  } catch (err) {
+    // fallthrough → mkdir 兜底（P1 无真实仓库场景）。⚠️ 不能静默：dubious ownership / EACCES
+    // 被吞曾导致 worktree 机制整体静默降级（issue #27，2026-09-18 修复），失败必须留痕。
+    log('warn', 'worktree add failed, fallback to plain dir', { run_id: runId, wt, err: String(err?.message ?? err) });
   }
   fs.mkdirSync(wt, { recursive: true });
   return wt;

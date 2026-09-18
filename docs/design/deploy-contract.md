@@ -23,7 +23,7 @@
 
 ## 1. 服务清单（镜像 pin / command / 运行用户 / restart）
 
-> 镜像取值见 env §10；**生产部署对每个镜像最终以 digest（`image@sha256:…`）锁定，禁止浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。P1 开发期可暂用 `<major>.<minor>` 类 tag 并记录 resolved digest。
+> 镜像取值见 env §10；**生产部署对每个镜像最终以不可变引用锁定（issue #27 双轨两形态：① repo digest `image@sha256:…`；② image ID `sha256:<imageId>`，目标机本地 build 时 RepoDigests 为空），禁止浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。P1 开发期可暂用 `<major>.<minor>` 类 tag 并记录 resolved digest。
 
 | 服务 | 镜像 | tag pin 要求 | command（ENTRYPOINT/CMD） | 运行用户 | restart | 部署期 |
 |---|---|---|---|---|---|---|
@@ -237,7 +237,7 @@
 
 > **参数级约束（B6：`POST /containers/create` 参数级 allowlist 已在 admission proxy 内强制，不再依赖 portal 代码层）**：真正的最小面 = proxy 在 `POST /containers/create` **之前**强制校验的创建字段 allowlist——
 >
-> - **镜像**：只允许**预拉取的 `FDE_IMAGE` digest**（`image@sha256:…`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
+> - **镜像**：只允许**预拉取/本地 build 的 `FDE_IMAGE` 不可变引用**（issue #27 双轨两形态：① `image@sha256:…`；② `sha256:<imageId>`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
 > - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
 > - **bind mount**：白名单 = `USER_SPACE_ROOT/<fde>/{home,projects,worktrees,cache}` 四条宿主源（user-space §2.4 / §6.4）；拒绝其它宿主路径（尤其 `/var/run/docker.sock`、`/docker/**`、`/`）。
 > - **禁止项（硬拒绝）**：`--privileged`、`--pid=host`、`--network=host`、`--device`、`--cap-add` 超出 §6.2 白名单、`--security-opt` 以外的任意 security 选项、`--publish`（`-p`）。

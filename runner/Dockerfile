@@ -5,7 +5,7 @@
 # 依据：docs/design/deploy-contract.md §6（三用户/root-drop/--init/healthcheck）、
 #       docs/design/runner-integration.md §2/§11（进程模型/凭据边界）。
 # build context = runner/（deploy-contract §1：FDE_IMAGE 自构建）。
-# 层序：重且稳定的层（apt/dotnet/playwright/code-server）在前，易变代码在后——改 runner 代码不触发重装。
+# 层序：重且稳定的层（apt/dotnet/playwright）在前，易变代码在后——改 runner 代码不触发重装。
 
 FROM node:22-slim
 
@@ -15,12 +15,13 @@ FROM node:22-slim
 # ca-certificates：erix-agent 访问 llm.<base>（https）与 git https clone（FDE 自配凭据，§11.1）。
 # python3/venv/pip + build-essential（gcc/g++/make/libc-dev）：Python 项目 + node-gyp 原生模块
 #   （缺这三样时 npm install sharp/better-sqlite3 等必挂，issue #27 §1.3）。
+# python3-dev（Python.h 头文件）：缺则 pip 源码构建必挂（评审 F2 实测 Python.h: No such file）。
 # libicu72：.NET SDK 运行依赖（globalization；node:22-slim 不带）。
-# curl：code-server 官方安装脚本需要（运行期亦可用于排障）。
+# curl：排障/HTTPS 拉取（code-server 已裁定不装，issue #27）。
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        procps git ca-certificates curl \
-       python3 python3-venv python3-pip \
+       python3 python3-venv python3-pip python3-dev \
        build-essential \
        libicu72 \
   && rm -rf /var/lib/apt/lists/*
@@ -43,7 +44,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 # 浏览器装到固定路径（root 属主、全员可读执行；agent 以 erix/worker 运行时只读使用）。
 # code-server 不装（用户 2026-09-18 裁定：路线图 P3 项不提前；issue #27 §2 同步）。
 RUN npm install -g playwright@1.63.0 \
-  && npx playwright install --with-deps chromium
+  && npx playwright install --with-deps chromium \
+  && rm -rf /var/lib/apt/lists/*  # --with-deps 触发 apt 安装，同层清理（评审 F6）
 
 # ---- git 跨 UID 协作（实测发现，issue #27 记录）----
 # safe.directory：agentd(1001)/worker(1002) 在 FDE(1000) clone 的仓库里跑 git 必触发

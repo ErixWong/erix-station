@@ -316,6 +316,8 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 >
 > **镜像 pin 策略（deploy-contract.md §2 的完整契约，此处只记取值口径；双轨定稿见 issue #27，2026-09-18）**：`deploy/` 内的 compose/镜像引用**不得使用浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。生产部署对每个镜像最终以**不可变引用**锁定，两种形态（F12 校验均接受）：**① repo digest** `image@sha256:…`——push/pull 后 `docker inspect --format '{{index .RepoDigests 0}}'` 取；**② image ID** `sha256:<imageId>`——目标机本地 build（RepoDigests 为空）用 `docker inspect --format '{{.Id}}'` 取。P1 开发期可暂用 `<major>.<minor>` 类 tag，但必须在 `docker inspect` 后把 resolved digest 记录进部署记录（env 附录 B / runbook）。`⚠️ 待决策者确认`：`postgres:16` / `traefik:v3` 的具体 patch 号与 digest 是部署期事实，本文不虚构；P1 开发按 §0 即可，目标环境按 §9 探测后再 pin。
 >
+> **容器内 Playwright 覆写（issue #27 评审 F9）**：镜像内置 playwright 1.63/chromium，浏览器路径镜像级写死 `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`（root:root 0755，只读使用）。FDE 项目若需 pin 其它 playwright 版本，在容器内覆写：`PLAYWRIGHT_BROWSERS_PATH=$HOME/cache/ms-playwright npx playwright install chromium`（`~/cache/` 为 FDE 自管卷，重建不丢，user-space §2）。
+>
 > 宿主机内网 IP（DNS A 记录目标）在部署时由运维填入 DNS，不进入 compose 变量。
 
 ### 10.1 补登：已在 `deploy/` 使用、此前未登记的变量（2026-09-16 审计补登）
