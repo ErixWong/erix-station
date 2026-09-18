@@ -8,9 +8,11 @@
 
 import crypto from 'node:crypto';
 import { hashToken, audit } from './auth.js';
+import { purgeExpired } from './idempotency.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
+const IDEMPOTENCY_PURGE_INTERVAL_MS = 60 * 60 * 1000; // 幂等键过期清理间隔（TTL 24h，1h 扫一次足够）
 const HOLD_MS_MAX = 30000; // claim 长轮询 hold 上限
 const MAX_EVENTS_PER_BATCH = 200; // runner §7.2
 const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
@@ -297,8 +299,10 @@ export function broadcastRevoke(containerId, data) {
 
 // ---- 浏览器侧 session SSE hub（portal.md §5；keyed by session，多客户端并存） ----
 // 注册先于补发（防「补发查询→注册」窗口丢事件）：注册后先缓冲，补发完成后 flush（跳过已补发 seq）再转 live。
+// 缓冲上限溢出不再静默丢弃（B 项，§5.1/§5.2）：写 `resync` 控制帧 + `res.end()` 让该客户端重连——
+// 浏览器 EventSource 自动带 `Last-Event-ID`（或前端按 §5.2 用 `?last_event_id=` 重连），由 SSE handler 补发收敛。
 const sessionClients = new Map(); // sessionId -> Set<clientRec>
-const SESSION_CLIENT_BUFFER_MAX = 1000;
+export const SESSION_CLIENT_BUFFER_MAX = 1000;
 
 export function registerSessionClient(sessionId, res) {
   let set = sessionClients.get(sessionId);
@@ -306,17 +310,19 @@ export function registerSessionClient(sessionId, res) {
     set = new Set();
     sessionClients.set(sessionId, set);
   }
-  const rec = { res, buffer: [], live: false };
+  const rec = { res, buffer: [], live: false, resync: false, lastSeq: null };
   set.add(rec);
   return rec;
 }
 
 /** 补发完成后调用：把缓冲中的事件（seq > sinceSeq）写给该客户端，随后转 live。 */
 export function sessionClientGoLive(sessionId, rec, sinceSeq = null) {
+  if (rec.resync) return; // 已判定需重同步（缓冲溢出）：连接已 end，不再 flush
   const events = rec.buffer.splice(0, rec.buffer.length);
   for (const ev of events) {
     if (sinceSeq != null && ev.seq <= sinceSeq) continue; // 补发已含
     writeSessionEvent(rec.res, ev, sessionId);
+    rec.lastSeq = ev.seq;
   }
   rec.live = true;
 }
@@ -337,17 +343,42 @@ function writeSessionEvent(res, ev, sessionId) {
   writeSseEvent(res, ev.type, data, ev.seq);
 }
 
+/**
+ * 缓冲溢出处理（B 项，§5.1/§5.2）：写 `resync` 控制帧（reason='buffer_overflow'）→ `res.end()` 关闭该连接
+ * → 从 map 移除。
+ * 客户端收到后立刻 close + 带 `last_event_id` 重连，由 SSE handler 补发漏掉的事件（seq > last_event_id）。
+ * 帧内**不带** last_seq（F6 / reviewer M-3）：客户端本地水位线才是权威值（服务端 rec.lastSeq 在补发窗口
+ * 内可能尚未包含已落库事件，用它当重连游标会丢事件）；重连游标由客户端自己维护。
+ */
+function resyncSessionClient(sessionId, rec) {
+  rec.resync = true;
+  try {
+    writeSseEvent(rec.res, 'resync', { reason: 'buffer_overflow' });
+    if (typeof rec.res.end === 'function') rec.res.end();
+  } catch { /* 尽力：写失败也要把 rec 摘掉，避免脏状态常驻 */ }
+  rec.buffer.length = 0;
+  unregisterSessionClient(sessionId, rec);
+}
+
 /** 事件落库后推给该 session 的所有浏览器 SSE 客户端（portal.md §5.1 wire 格式）；未 live 的先缓冲。 */
 export function notifySessionEvents(sessionId, events) {
   const set = sessionClients.get(sessionId);
   if (!set || set.size === 0) return;
   for (const ev of events) {
-    for (const rec of set) {
+    for (const rec of [...set]) { // 复制：溢出路径会在迭代中从 set 移除 rec
+      if (rec.resync) continue; // 已判定需重同步，等待连接关闭/清理
       if (!rec.live) {
-        if (rec.buffer.length < SESSION_CLIENT_BUFFER_MAX) rec.buffer.push(ev);
+        if (rec.buffer.length < SESSION_CLIENT_BUFFER_MAX) {
+          rec.buffer.push(ev);
+          rec.lastSeq = ev.seq;
+          continue;
+        }
+        // 缓冲已满：不再静默丢事件，改判重同步（§5.1：seq 无空洞 → 丢一条即需补发收敛）
+        resyncSessionClient(sessionId, rec);
         continue;
       }
       writeSessionEvent(rec.res, ev, sessionId);
+      rec.lastSeq = ev.seq;
     }
   }
 }
@@ -385,7 +416,11 @@ export function unregisterSseClient(containerId, res) {
 
 /** 供单测观察当前 SSE 客户端/等待者数量（不暴露内部结构）。 */
 export function hubStats() {
-  return { sseClients: sseClients.size, claimWaiters: claimWaiters.size };
+  return {
+    sseClients: sseClients.size,
+    sessionClients: [...sessionClients.values()].reduce((n, set) => n + set.size, 0),
+    claimWaiters: claimWaiters.size,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,12 +1245,24 @@ export async function reapExpiredRuns(pool) {
 /** 启动 run 租约 reaper 常驻循环（由 cli serve 调用）。 */
 export function startReaperLoop(pool, { intervalMs = REAPER_INTERVAL_MS, log = console } = {}) {
   let stopped = false;
+  let lastPurgeAt = 0;
   (async () => {
     while (!stopped) {
       try {
         await reapExpiredRuns(pool);
       } catch (err) {
         log.warn?.(`[reaper] loop error: ${err.message}`);
+      }
+      // 幂等键过期清理（portal.md §1.4，TTL 24h）：低频（默认 1h，与 15s 的 run 扫描解耦）跑一次。
+      // 清理失败不影响 reaper 主循环——命中判定本身带 TTL 过滤，脏行只是占空间。
+      if (Date.now() - lastPurgeAt >= IDEMPOTENCY_PURGE_INTERVAL_MS) {
+        lastPurgeAt = Date.now();
+        try {
+          const purged = await purgeExpired(pool);
+          if (purged > 0) log.log?.(`[reaper] purged ${purged} expired idempotency_keys`);
+        } catch (err) {
+          log.warn?.(`[reaper] idempotency purge error: ${err.message}`);
+        }
       }
       await sleepReaper(intervalMs);
     }

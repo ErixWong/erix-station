@@ -89,7 +89,8 @@
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
-| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `port_quota_exceeded` | 状态冲突，各端点分别列出 | 否 |
+| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `port_quota_exceeded` / `idempotency_key_reuse` | 状态冲突，各端点分别列出 | 否 |
+| 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），稍后重试即可拿到首次结果（§1.4） | 是 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
@@ -107,6 +108,19 @@
 ### 1.4 写操作幂等
 
 `POST` 端点接受可选 `Idempotency-Key` 请求头；同 key 重复提交返回首次结果（尤其 `POST .../messages`，防断网重发产生两条用户消息）。
+
+**当前生效范围**：本轮仅 `POST /api/sessions/:id/messages` 实现幂等（也是 `idempotency_keys` 台账的**唯一写入方**）；其余 `POST` 端点收到 `Idempotency-Key` 时**忽略**该头（无幂等语义、不落台账）——后续端点复用时沿用本节语义（尤其「先占位后执行」与 409 码）。
+
+**实现口径**（本轮实现，P1）：
+
+- **台账落库**：`idempotency_keys`（`PRIMARY KEY (user_id, endpoint, key)`；由增量迁移 `deploy/migrations/0001-idempotency-keys.sql` 提供，baseline `schema.sql` 自 P1 冻结、不含本表）。`endpoint` 为**具体端点含路径参数**（如 `POST /api/sessions/<id>/messages`）——同 key 跨 session 不串号；`request_hash` = 规范化请求体（`content` + `attachments` 的 `{kind,path,name}` 子集）的 `sha256`。
+- **先占位后执行**（`state` 列）：① `state='done'` 且未过期（TTL 24h）→ 直接回放；② 否则先 `INSERT ... state='in_progress'` **占位**（并发同 key 只有一个请求能占到，故副作用**至多执行一次**）；③ 占到占位 → 执行 → `UPDATE state='done'` + 落 `status_code`/`response` → 返回；执行抛错 → **删除占位行**后原样报错（释放 key，客户端可原样重试，不把瞬时错误钉成永久结果）。
+- **TTL 24h**：只有 `created_at > now() - interval '24 hours'` 的完成行参与命中；过期行语义上等同不存在（重发时由占位语句的条件 upsert 原子覆盖），物理清理由 portal reaper 低频（≈1h）`DELETE`（`idempotency.js` `purgeExpired`）。
+- **命中回放**：`request_hash` 一致 → 按首次 `status_code`（`POST .../messages` = `202`）与首次响应体**原样返回**，且**不重复副作用**（不重复唤醒 runner、不产生第二条 user 消息/第二个 run）。
+- **同 key 不同载荷**：`request_hash` 不一致 → `409 idempotency_key_reuse`（不执行首次副作用的第二遍）。
+- **并发同 key**：先到先得——占位期间的后续请求 → `409 idempotency_conflict`（`retryable: true`，**不执行** fn）；首执行完成后的重发 → 正常回放。占位持有者崩溃（`in_progress` ≥ 5 分钟）→ 视同可覆盖：后续请求抢回后执行（否则一次崩溃会把该 key 永久钉死）。
+- **请求体校验前置**：非法请求体先返回 `400 validation_failed`，**不占用**占位行（否则一次笔误会让同 key 的合法重试撞 409 reuse）。
+- **非法 key**：非字符串 / 长度 > 128 / 含控制字符（**含仅出现在两侧**的 CR/LF 等，trim 前判定）→ `400 validation_failed`；无该头或纯空白 = 无幂等语义（直通）。
 
 ---
 
@@ -621,7 +635,7 @@ station-portal user enable  --login <login>
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |
 
-> 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。
+> 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。实现口径：TTL 24h；**先占位后执行**（`in_progress` 占位 → `done` 完成，副作用至多一次）；同 key 不同载荷 → `409 idempotency_key_reuse`；并发同 key 未收敛（占位 < 5 分钟）→ `409 idempotency_conflict`（`retryable: true`，稍后重试拿首次结果）；重放路径不重复副作用（不重复唤醒 runner）。
 
 ### 4.4 `GET /api/sessions/:id/events`（SSE）
 
@@ -741,10 +755,12 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 ### 5.1 传输语义
 
 - **SSE 而非 WebSocket**（规格 §10.2）：事件单向，输入走 `POST .../messages`。
-- **事件先落 DB，portal 从 DB 读并推流**（规格 §10.2 / D7）：portal 重启不杀正在跑的 run；`seq` 由宿主在落库事务内**逐事件原子 +1 分配**（`UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`，`UNIQUE(session_id, seq)` 兜底），**每个 session 内严格单调递增、无空洞**——不存在「并发落库产生合法间隙」的情况（runner §7.3）。前端检测到跳号即视为事件丢失，按 §5.2 用 `Last-Event-ID` 重连补发（无合法间隙，故不会造成重连风暴）。
+- **事件先落 DB，portal 从 DB 读并推流**（规格 §10.2 / D7）：portal 重启不杀正在跑的 run；`seq` 由宿主在落库事务内**逐事件原子 +1 分配**（`UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`，`UNIQUE(session_id, seq)` 兜底），**每个 session 内严格单调递增、无空洞**——不存在「并发落库产生合法间隙」的情况（runner §7.3）。
+  > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 - 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。
+- **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow"}` 后 `res.end()`。该帧**不带** `last_seq`：重连游标由客户端用自己的本地水位线（已收到的最大 `seq`，含 `messages` 与 `run_events` 共用分配器造成的跳号）维护，服务端缓冲区里的最大 seq 不构成可靠游标（补发/写回窗口内可能漏）。客户端应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）。这是客户端唯一的主动重连触发条件（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
 
 每条事件的 wire 格式：
 

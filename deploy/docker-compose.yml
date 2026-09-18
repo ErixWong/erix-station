@@ -188,10 +188,12 @@ services:
       PREVIEW_TICKET_TTL_SECONDS: ${PREVIEW_TICKET_TTL_SECONDS:-60}
       PREVIEW_SESSION_TTL_SECONDS: ${PREVIEW_SESSION_TTL_SECONDS:-900}
       # P1：baseline(schema.sql) + bootstrap.sql 由 station-db 首次初始化（db-init/00-init.sh，超级用户）
-      # 完成；deploy/migrations/*.sql 尚无增量。运行时以 station_portal 启动，不重复跑 superuser-only
-      # 的 bootstrap。出现首个增量迁移时，以 station_platform（MIGRATE_DATABASE_URL）跑
-      # `node portal/src/cli.js migrate`，或让 migrate runner 消费 MIGRATE_DATABASE_URL 后置回 1。
-      MIGRATE_ON_START: "0"
+      # 完成；增量迁移已存在（deploy/migrations/0001-idempotency-keys.sql，portal.md §1.4 幂等台账）。
+      # 运行时以 station_portal 启动，不重复跑 superuser-only 的 bootstrap。开发期本栈默认不自动应用
+      # 增量（MIGRATE_ON_START=0）——首次部署到已有库时以 station_platform（MIGRATE_DATABASE_URL）跑
+      # `node portal/src/cli.js migrate`，或设 MIGRATE_ON_START=1 让 portal 在监听端口前应用
+      # （wp5 e2e 即用后者验证真实迁移路径）。可用宿主环境变量覆盖。
+      MIGRATE_ON_START: "${MIGRATE_ON_START:-0}"
     healthcheck:
       test: ["CMD", "node", "portal/src/cli.js", "healthcheck"]
       interval: 10s

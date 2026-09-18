@@ -12,9 +12,12 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-# 源码 + 迁移脚本（schema/bootstrap）
+# 源码 + 迁移脚本（schema/bootstrap + 增量迁移）
 COPY portal/ portal/
 COPY docs/data/ docs/data/
+# 增量迁移（deploy/migrations/*.sql）：migrate runner 的 defaultMigrationsDir() = /app/deploy/migrations，
+# 由 `cli.js migrate` 或 MIGRATE_ON_START=1 以 station_platform 应用到 head（deploy-contract §3.1/§3.3）。
+COPY deploy/migrations/ deploy/migrations/
 
 # materializer 以 root 写平台文件（root:root 0644/0444）、chown 工作区目录（1000:1000）。
 USER root
