@@ -289,11 +289,12 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 |---|---|
 | `PRIMARY KEY (user_id, endpoint, key)` | 幂等键空间：按用户 + **具体端点（含路径参数）** + 客户端 key 隔离（同 key 跨 session 不串号） |
 | `request_hash` | 规范化请求体（`content` + `attachments[{kind,path,name}]`）的 `sha256`；命中且不一致 → `409 idempotency_key_reuse`（不重复执行副作用） |
-| `state` | `'in_progress'` 占位行 → 完成行 `'done'`（默认）。**先占位后执行**：并发同 key 只有一个请求能占到占位，故副作用至多执行一次；`in_progress` 超过 5 分钟（`IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES`）视为持有者崩溃残留，可被后续请求 UPDATE 抢回（否则该 key 被一次崩溃永久钉死） |
-| `status_code` / `response` | 首次响应的状态码与响应体，回放时原样返回（`POST .../messages` = `202`）；**占位行为 NULL**（结果尚未产生，回放只读 `done` 行，故不会回放出占位态） |
+| `state` | `'in_progress'` 占位行 → 完成行 `'done'`（默认）。**先占位后执行**：并发同 key 只有一个请求能占到占位；`in_progress` 超过 5 分钟（`IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES`）视为持有者崩溃残留，可被后续请求 UPDATE 抢回（否则该 key 被一次崩溃永久钉死） |
+| `claim_token` | **owner fencing** 标识：占位/抢回时写入 `crypto.randomUUID()`（抢占回会改写它）。台账转 `done`、补记与释放一律带 `AND claim_token = $` 条件，故被抢回的旧持有者的迟到写入一律 0 行（旧持有者 `record` 命中 0 行 → `409 idempotency_conflict`，其业务事务回滚）。`done` 行保留最后一次占位的值 |
+| `status_code` / `response` | 首次响应的状态码与响应体，回放时原样返回（`POST .../messages` = `202`）；**占位行为 NULL**（结果尚未产生，回放只读 `done` 行，故不会回放出占位态）。写入时机：与业务写入**同事务**（fn 在自身事务内调 `record(client, …)`，portal.md §1.4），故没有「有台账无业务写入」的窗口 |
 | `created_at` | 双用途：① TTL 基准——命中判定带 `created_at > now() - interval '24 hours'`；② `in_progress` 陈旧判定基准。过期行由 portal reaper 低频（≈1h）物理 `DELETE`（`idempotency.js` `purgeExpired`）；`idempotency_keys_created_idx` 供该扫描 |
 
-并发同 key（先到先得）：占位期间（< 5 分钟）的后续请求 → `409 idempotency_conflict`（`retryable: true`，**不执行** fn）；执行抛错 → 删除占位行释放 key；首执行完成后重发 → 回放首次结果。写入方 = portal（HTTP 层包装，`portal/src/idempotency.js`）；读取方 = 同样只读本表命中判定（无其它消费者，不参与 SSE/状态机）。
+并发同 key（先到先得）：占位期间（< 5 分钟）的后续请求 → `409 idempotency_conflict`（`retryable: true`，**不执行** fn）；执行抛错 → 删除占位行释放 key；首执行完成后重发 → 回放首次结果。**记账与业务写入同事务**（fn 事务内 `record()`）→ 同 key 至多一次副作用；未接入 `record` 的调用方退回「业务提交后补记」路径（仍有残留窗口，portal.md §1.4）。写入方 = portal（HTTP 层包装，`portal/src/idempotency.js`）；读取方 = 同样只读本表命中判定（无其它消费者，不参与 SSE/状态机）。
 
 ---
 
