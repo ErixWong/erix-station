@@ -155,7 +155,7 @@ export function buildContainerConfig({
   homeUser = 'erix',
   env = [],
   labels = {},
-  memoryLimit = '512m',
+  memoryLimit = '4g', // issue #27 已决 2026-09-18（B 档镜像下 dotnet build/chromium 峰值；0 不限）
   runUser = null, // '1001:1000' 等；镜像不具备双 UID 用户时用 --user 兜底（FDE_DEV_USER，⚠️ dev 偏差）
   capAdd = ['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL'], // 契约 §6.2：root 启动→drop 1001、fork 1002 所需最小集（含跨 UID kill 的 CAP_KILL）
 }) {

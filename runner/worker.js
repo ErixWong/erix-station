@@ -9,6 +9,11 @@
 //   - provider 用 erix-agent `createJsonFileModelConfigProvider`（config.json 内占位 key + endpoint，零真实 LLM 凭据，§6.3）；
 //   - 终态由 agentd 经 U2 上报（worker 只回 run_finished，不发 run_end 事件，§7.6）。
 
+// user-space §6.2：umask 0002（新建文件 664/目录 775）——worker/agent 写 worktree 与 spool 的文件
+// 需跨 UID（1002↔1001/1000，同 GID 1000）组可写；fork 时已从 agentd/entrypoint 继承（entrypoint.sh
+// 早有 umask 0002，本处为防御性重设，评审 F8）。
+process.umask(0o002);
+
 import {
   createJsonFileModelConfigProvider,
   createOpenAIProvider,

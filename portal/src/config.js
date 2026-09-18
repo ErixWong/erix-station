@@ -76,15 +76,17 @@ export function loadConfig(env = process.env) {
   const fdeDevMode =
     env.FDE_DEV_MODE === '1' ? true : env.FDE_DEV_MODE === '0' ? false : env.NODE_ENV !== 'production';
 
-  // F12：生产模式要求 FDE_IMAGE 为 image@sha256:… 形态（或启动时预拉取校验）；dev 允许 tag 但警告。
+  // F12：生产模式要求 FDE_IMAGE 为不可变引用形态（issue #27 pin 双轨，P1 = image ID 路线）：
+  //   `image@sha256:<digest>`（repo digest，push/pull 后才有）或 `sha256:<imageId>`（目标机本地
+  //   build 的 image ID——本地 build 的 RepoDigests 为空，唯一不可变引用）；dev 允许 tag 但警告。
   const fdeImage = env.FDE_IMAGE || 'traefik/whoami';
-  const imageIsDigest = /@sha256:[0-9a-f]{64}$/.test(fdeImage);
+  const imageIsDigest = /@?sha256:[0-9a-f]{64}$/.test(fdeImage);
   if (!imageIsDigest && !fdeDevMode) {
-    throw new Error('FDE_IMAGE 必须为 image@sha256:<digest> 形态（生产模式；或显式 FDE_DEV_MODE=1 进入开发模式）');
+    throw new Error('FDE_IMAGE 必须为 image@sha256:<digest> 或 sha256:<imageId> 形态（生产模式；或显式 FDE_DEV_MODE=1 进入开发模式）');
   }
   if (!imageIsDigest && fdeDevMode) {
     // eslint-disable-next-line no-console
-    console.warn(`[config] ⚠️ dev 偏差：FDE_IMAGE=${fdeImage} 非 digest pin；生产必须改为 image@sha256:…`);
+    console.warn(`[config] ⚠️ dev 偏差：FDE_IMAGE=${fdeImage} 非不可变引用；生产 pin 两形态之一：image@sha256:… 或 sha256:<imageId>（issue #27）`);
   }
 
   // F14：生产模式缺失/占位 SESSION_SIGNING_KEY 时 fail-closed（拒绝启动）；dev 保持现状 + 警告。
@@ -189,8 +191,8 @@ export function loadConfig(env = process.env) {
     fdeDevUser: env.FDE_DEV_USER || null,
     fdeCmd: parseJsonStringArray(env.FDE_CMD, ['-port', '4000']),
     fdeAgentVersion: env.FDE_AGENT_VERSION || 'dev',
-    // 资源限额（deploy-contract §6.2，⚠️ 数值待决策者确认）：默认 512m，可配 0 表示不限。
-    fdeMemoryLimit: env.FDE_MEMORY_LIMIT || '512m',
+    // 资源限额（deploy-contract §6.2；issue #27 已决 2026-09-18）：默认 4g（B 档镜像下 dotnet build/chromium 峰值），可配 0 表示不限。
+    fdeMemoryLimit: env.FDE_MEMORY_LIMIT || '4g',
     // 容器内双 UID（runner-integration/user-space §6.1：agentd 1001 / worker 1002，GID 1000）。
     agentdUid: intEnv(env, 'FDE_AGENTD_UID', 1001),
     workerUid: intEnv(env, 'FDE_WORKER_UID', 1002),

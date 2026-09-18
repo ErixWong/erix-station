@@ -331,8 +331,10 @@ function prepareWorktree(projectName, runId) {
       });
       return wt;
     }
-  } catch {
-    // fallthrough → mkdir
+  } catch (err) {
+    // fallthrough → mkdir 兜底（P1 无真实仓库场景）。⚠️ 不能静默：dubious ownership / EACCES
+    // 被吞曾导致 worktree 机制整体静默降级（issue #27，2026-09-18 修复），失败必须留痕。
+    log('warn', 'worktree add failed, fallback to plain dir', { run_id: runId, wt, err: String(err?.message ?? err) });
   }
   fs.mkdirSync(wt, { recursive: true });
   return wt;
@@ -881,6 +883,9 @@ async function main() {
     log('error', 'ERIX_STATION_TOKEN missing');
     process.exit(1);
   }
+  // user-space §6.2：容器内进程 umask = 0002（新建文件 664/目录 775，配合同 GID 1000 组协作）。
+  // agentd 建 worktree、fork worker（继承 umask）的文件都需跨 UID（1001/1002）组可写。
+  process.umask(0o002);
   log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
 
   const sse = openSse();
