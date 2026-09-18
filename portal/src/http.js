@@ -416,9 +416,9 @@ async function handleArchiveSession(req, res, ctx, sessionId) {
 async function handlePostMessage(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  // 头校验先于读体：非法 key 快速失败，不读请求体
-  const key = idempotency.normalizeKey(req.headers['idempotency-key']);
+  // 先读体（与其它端点一致：413/400 行为不受密钥校验影响），再校验 Idempotency-Key 头
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const key = idempotency.normalizeKey(req.headers['idempotency-key']); // 非法 → 400 validation_failed
   const endpoint = `POST /api/sessions/${sessionId}/messages`; // 含路径参数：同 key 跨 session 不串号
   const result = await idempotency.executeWithIdempotency(
     ctx.pool,
