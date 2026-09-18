@@ -88,8 +88,9 @@ async function login(loginName = 'alice', secret = S.totpSecret) {
   return cookie;
 }
 async function api(path, opts = {}, cookie = S.cookie) {
+  const { headers, ...rest } = opts; // 允许调用方追加头（如 Idempotency-Key）而不丢 Cookie
   const r = await fetch(`${PORTAL}${path}`, {
-    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${cookie}` }, ...opts,
+    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${cookie}`, ...(headers ?? {}) }, ...rest,
   });
   const body = await r.json().catch(() => ({}));
   return { status: r.status, body };
@@ -248,6 +249,91 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     const stopIdle = await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: '{}' });
     assert.equal(stopIdle.status, 409, '无进行中 run 时 stop → 409');
 
+    // 6.6) A 项幂等（portal.md §1.4）：同 Idempotency-Key 重发同一 content → 首次结果（同 message.id/run.id）。
+    //      重发时机选在首个 run 结束后（而非 run 进行中）：按 §4.3「同 session 单活跃 run」语义，
+    //      run 进行中重发若未命中幂等回放会撞 409 run_in_progress；放到结束后断言「回放」语义更确定
+    //      （注：回放路径根本不会调 postMessage，故 run 进行中重发也能回放——这里不做依赖）。
+    const idemKey = `wp5-idem-${Date.now()}`;
+    const idemContent = '幂等重发验收任务';
+    const idemHeaders = { 'Idempotency-Key': idemKey };
+    const userMsgsBefore = Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`));
+    const idemFirst = await api(`/api/sessions/${sessionId}/messages`, {
+      method: 'POST', headers: idemHeaders, body: JSON.stringify({ content: idemContent, attachments: [] }),
+    });
+    assert.equal(idemFirst.status, 202, `幂等首次 202：${JSON.stringify(idemFirst.body)}`);
+    assert.equal(idemFirst.body.message.content, idemContent);
+    const idemRunId = idemFirst.body.run.id;
+    // 等首个 run 收敛，再做重发
+    await waitFor(() => {
+      const st = psql(`SELECT status FROM runs WHERE id='${idemRunId}'`);
+      return st === 'finished' || st === 'failed' ? st : null;
+    }, { label: 'idempotent run 终态', timeoutMs: 120000, intervalMs: 500 });
+
+    const idemSecond = await api(`/api/sessions/${sessionId}/messages`, {
+      method: 'POST', headers: idemHeaders, body: JSON.stringify({ content: idemContent, attachments: [] }),
+    });
+    assert.equal(idemSecond.status, 202, '同 key 重发仍 202（回放首次结果）');
+    assert.equal(idemSecond.body.message.id, idemFirst.body.message.id, '回放返回首次 message.id');
+    assert.equal(idemSecond.body.run.id, idemRunId, '回放返回首次 run.id');
+    // DB 对账：两次提交只产生 1 条 user 消息（assistant 回写不计入 user 计数）
+    const userMsgsAfter = Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`));
+    assert.equal(userMsgsAfter - userMsgsBefore, 1, `同 key 重发只新增 1 条 user 消息（实际 ${userMsgsAfter - userMsgsBefore}）`);
+    assert.equal(Number(psql(`SELECT count(*) FROM idempotency_keys WHERE key='${idemKey}'`)), 1, '幂等台账一行');
+    // 台账 status_code/response 落库与首次一致
+    assert.equal(psql(`SELECT status_code FROM idempotency_keys WHERE key='${idemKey}'`), '202');
+    assert.equal(psql(`SELECT response->'run'->>'id' FROM idempotency_keys WHERE key='${idemKey}'`), idemRunId);
+
+    // 6.7) 同 key 不同载荷 → 409 idempotency_key_reuse（不产生第二次副作用）
+    const idemReuse = await api(`/api/sessions/${sessionId}/messages`, {
+      method: 'POST', headers: idemHeaders, body: JSON.stringify({ content: `${idemContent}（不同载荷）`, attachments: [] }),
+    });
+    assert.equal(idemReuse.status, 409, `同 key 不同载荷 409：${JSON.stringify(idemReuse.body)}`);
+    assert.equal(idemReuse.body.error.code, 'idempotency_key_reuse');
+    assert.equal(Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`)), userMsgsAfter,
+      '409 不产生新 user 消息');
+
+    // 6.8) 非法 Idempotency-Key（>128）→ 400 validation_failed
+    const idemBad = await api(`/api/sessions/${sessionId}/messages`, {
+      method: 'POST', headers: { 'Idempotency-Key': 'x'.repeat(129) }, body: JSON.stringify({ content: 'x' }),
+    });
+    assert.equal(idemBad.status, 400, `非法 key 400（得 ${idemBad.status}）`);
+    assert.equal(idemBad.body.error.code, 'validation_failed');
+    assert.equal(Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`)), userMsgsAfter,
+      '非法 key 不产生新 user 消息');
+
+    // 6.9) 并发同 key 双发（双击/客户端重发竞态）：无论哪一边先赢，都不得产生第二条 user 消息/第二个 run。
+    //      两种可能结果均合规（按任务口径注释）：① 输者回放 → 两边都 202 且同 message.id/run.id；
+    //      ② 输者撞上 sessions.postMessage 自己的「同 session 单活跃 run」守卫 → 409 run_in_progress。
+    const raceKey = `wp5-race-${Date.now()}`;
+    const raceContent = '幂等并发重发验收';
+    const raceBeforeUser = Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`));
+    const raceBeforeRuns = Number(psql(`SELECT count(*) FROM runs WHERE session_id='${sessionId}'`));
+    const [race1, race2] = await Promise.all([
+      api(`/api/sessions/${sessionId}/messages`, { method: 'POST', headers: { 'Idempotency-Key': raceKey }, body: JSON.stringify({ content: raceContent, attachments: [] }) }),
+      api(`/api/sessions/${sessionId}/messages`, { method: 'POST', headers: { 'Idempotency-Key': raceKey }, body: JSON.stringify({ content: raceContent, attachments: [] }) }),
+    ]);
+    const raceStatuses = [race1.status, race2.status].sort((a, b) => a - b);
+    assert.ok(raceStatuses.every((s) => s === 202 || s === 409), `并发同 key 状态 ∈ {202,409}：${raceStatuses}`);
+    assert.ok(raceStatuses.includes(202), `并发同 key 至少一个 202：${raceStatuses}`);
+    if (raceStatuses[0] === 202 && raceStatuses[1] === 202) {
+      assert.equal(race1.body.message.id, race2.body.message.id, '并发同 key 两边 202 → 同一 message.id（回放）');
+      assert.equal(race1.body.run.id, race2.body.run.id, '并发同 key 两边 202 → 同一 run.id（回放）');
+    } else {
+      const loser = race1.status === 409 ? race1 : race2;
+      assert.equal(loser.body.error.code, 'run_in_progress', '输者被单活跃 run 守卫拦住');
+    }
+    assert.equal(Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`)) - raceBeforeUser, 1,
+      '并发双发只产生 1 条 user 消息');
+    assert.equal(Number(psql(`SELECT count(*) FROM runs WHERE session_id='${sessionId}'`)) - raceBeforeRuns, 1,
+      '并发双发只产生 1 个 run');
+    assert.equal(Number(psql(`SELECT count(*) FROM idempotency_keys WHERE key='${raceKey}'`)), 1, '并发同 key 台账一行');
+    // 等该 run 收敛（下步 step 7/8 需要无活跃 run）
+    const raceRunId = (race1.status === 202 ? race1 : race2).body.run.id;
+    await waitFor(() => {
+      const st = psql(`SELECT status FROM runs WHERE id='${raceRunId}'`);
+      return st === 'finished' || st === 'failed' ? st : null;
+    }, { label: '并发幂等 run 终态', timeoutMs: 120000, intervalMs: 500 });
+
     // 7) 停止链路 + 实时 SSE：先连浏览器 SSE（无 last_event_id，不补发历史）→ 发消息 →
     //    stop → 实时收 run_end(aborted)（验 ④ live 推送通道，与 ⑤ replay 互补）
     const sent2 = await api(`/api/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content: '会被停止的任务' }) });
@@ -290,7 +376,7 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     const gone = await api(`/api/sessions/${sessionId}`);
     assert.equal(gone.status, 404, '归档后 GET 404');
 
-    console.log('\n[wp5] ✅ 对话链路全绿：会话/发消息建 run/409 并发/SSE 事件流/seq 连续/停止→aborted/回写/归档');
+    console.log('\n[wp5] ✅ 对话链路全绿：会话/发消息建 run/409 并发/SSE 事件流/seq 连续/停止→aborted/回写/幂等重发/归档');
   } catch (err) {
     try {
       console.log('\n[wp5] --- portal logs ---');
