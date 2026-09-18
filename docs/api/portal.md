@@ -750,11 +750,12 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 ### 5.1 传输语义
 
 - **SSE 而非 WebSocket**（规格 §10.2）：事件单向，输入走 `POST .../messages`。
-- **事件先落 DB，portal 从 DB 读并推流**（规格 §10.2 / D7）：portal 重启不杀正在跑的 run；`seq` 由宿主在落库事务内**逐事件原子 +1 分配**（`UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`，`UNIQUE(session_id, seq)` 兜底），**每个 session 内严格单调递增、无空洞**——不存在「并发落库产生合法间隙」的情况（runner §7.3）。前端检测到跳号即视为事件丢失，按 §5.2 用 `Last-Event-ID` 重连补发（无合法间隙，故不会造成重连风暴）。
+- **事件先落 DB，portal 从 DB 读并推流**（规格 §10.2 / D7）：portal 重启不杀正在跑的 run；`seq` 由宿主在落库事务内**逐事件原子 +1 分配**（`UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`，`UNIQUE(session_id, seq)` 兜底），**每个 session 内严格单调递增、无空洞**——不存在「并发落库产生合法间隙」的情况（runner §7.3）。
+  > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 - 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。
-- **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow","last_seq":<已推/已缓冲的最大 seq|null>}` 后 `res.end()`。客户端（浏览器）应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）；因此前端需同时实现「跳号检测」与 `resync` 监听（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
+- **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow","last_seq":<已推/已缓冲的最大 seq|null>}` 后 `res.end()`。客户端（浏览器）应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）。这是客户端唯一的主动重连触发条件（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
 
 每条事件的 wire 格式：
 

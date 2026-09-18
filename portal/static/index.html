@@ -219,14 +219,17 @@
       for (const type of ['round_start','round_end','attempt','recovering','recovered','usage',
                           'tool_use','tool_result','assistant_delta','reasoning_delta',
                           'tool_call_delta','judge','run_end','ping','resync']) {
-        // 陈旧连接的事件一律忽略（重连后旧连接可能还有在途帧，防误判跳号触发重连风暴）
+        // 陈旧连接的事件一律忽略（重连后旧连接可能还有在途帧，防重复渲染/重复推进水位线）
         es.addEventListener(type, (e) => { if (S.es !== es) return; handleEvent(type, e); });
       }
       es.onerror = () => { /* EventSource 自动重连，带 Last-Event-ID */ };
     }
 
-    // 需重同步（跳号 / 服务端缓冲溢出）：主动断开 + 带 last_event_id 重连补发（§5.1/§5.2）。
-    // 关键：重连成功（收回到达 seq）前**不推进 S.lastSeq**，否则丢失区间会被跳过。
+    // 需重同步（仅由服务端 `resync` 控制帧触发，如补发前缓冲溢出）：主动断开 +
+    // 带 ?last_event_id=<本地已知最大 seq> 重连，由服务端补发 seq > last_event_id 收敛（§5.2）。
+    // 注：**不**做客户端「seq 跳号 → 重连」启发式——messages 与 run_events 共用 chat_sessions.last_seq
+    // 分配器（schema.sql §3），事件流单独看存在**合法空洞**（user 消息/assistant 回写各占一个 seq），
+    // 跳号判定会无限重连（实测复现）；断线恢复靠 EventSource 自动重连（带 Last-Event-ID）与服务端 resync。
     function resyncEvents(why) {
       const id = S.esSessionId ?? S.sessionId;
       if (!id) return;
@@ -264,12 +267,9 @@
       let d;
       try { d = e.data ? JSON.parse(e.data) : {}; } catch { return; } // 畸形事件忽略（§5.3）
       if (type === 'resync') { resyncEvents(d.reason === 'buffer_overflow' ? '服务端缓冲溢出' : (d.reason ?? 'resync')); return; }
-      if (typeof d.seq === 'number') {
-        // §5.1：session 内 seq 严格递增无空洞 → 跳号即事件丢失，必须带 last_event_id 重连补发。
-        // 跳号时**不更新** S.lastSeq（否则重连从跳号后的值续，漏掉丢失区间）。
-        if (S.lastSeq > 0 && d.seq > S.lastSeq + 1) { resyncEvents(`事件跳号 ${S.lastSeq} → ${d.seq}`); return; }
-        S.lastSeq = Math.max(S.lastSeq, d.seq);
-      }
+      // 实现注记（§5.1）：事件流 seq 有合法空洞（messages 占号），故**不做**跳号重连判定；
+      // 这里只推进本地水位线（resync 重连时作为 ?last_event_id 回放游标）。
+      if (typeof d.seq === 'number') S.lastSeq = Math.max(S.lastSeq, d.seq);
       switch (type) {
         case 'ping': return;
         case 'round_start':

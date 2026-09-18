@@ -82,33 +82,32 @@ test('前端：首连不补发历史（URL 无 last_event_id）', () => {
   assert.equal(FakeEventSource.instances[0].url, '/api/sessions/sess-1/events');
 });
 
-test('前端：seq 跳号 → close + 带 ?last_event_id 重连，且重连前不推进 lastSeq', () => {
+test('前端：seq 跳号**不**触发重连（事件流有合法空洞：messages 与 run_events 共用 seq 分配器）', () => {
+  // 裁决依据（issue #25 B.3，(a) 口径）：事件流单独看存在合法空洞（user 消息/assistant 回写占号），
+  // 以跳号作为重连触发条件会无限重连（实测复现）；丢失恢复靠自动重连（Last-Event-ID）+ 服务端 resync。
   const { client } = loadClient();
   const { S } = client;
-  S.sessionId = 'sess-1'; S.esSessionId = 'sess-1'; S.lastSeq = 5; S.activeRunId = 'run-1';
+  S.sessionId = 'sess-1'; S.esSessionId = 'sess-1'; S.lastSeq = 1; S.activeRunId = 'run-1';
   client.connectEvents('sess-1');
   const es1 = FakeEventSource.instances.at(-1);
 
-  // 连续事件：正常推进
-  es1.emit('assistant_delta', evt(6, { text: 'a' }));
-  assert.equal(S.lastSeq, 6);
-  assert.equal(FakeEventSource.instances.length, 1, '连续事件不重连');
+  for (const seq of [2, 3, 4]) es1.emit('assistant_delta', evt(seq, { text: 'x' }));
+  assert.equal(S.lastSeq, 4);
+  assert.equal(FakeEventSource.instances.length, 1);
 
-  // 跳号（7/8 丢失）：视为事件丢失 → 主动重连补发
-  es1.emit('tool_result', evt(9, { tool_call_id: 'tc1' }));
-  assert.equal(S.lastSeq, 6, '跳号时不得推进 lastSeq（否则漏掉丢失区间）');
-  assert.equal(es1.closed, true, '跳号后关闭旧连接');
+  es1.emit('run_end', evt(6, { run_id: 'run-1', termination: { reason: 'end_turn' } })); // 5 = assistant 回写占号
+  assert.equal(FakeEventSource.instances.length, 1, '跳号不重连（不风暴）');
+  assert.equal(es1.closed, false);
+  assert.equal(S.lastSeq, 6, '水位线照常推进');
+
+  // 陈旧连接的在途帧仍被忽略
+  es1.emit('assistant_delta', evt(20, { text: 'stale' }));
+  client.connectEvents('sess-1');
   const es2 = FakeEventSource.instances.at(-1);
-  assert.equal(es2.url, '/api/sessions/sess-1/events?last_event_id=6', '带本地已知最大 seq 重连');
-
-  // 重连补发回到连续 seq 后恢复推进
-  es2.emit('assistant_delta', evt(7, { text: 'b' }));
-  assert.equal(S.lastSeq, 7);
-
-  // 陈旧连接的在途帧一律忽略（不误判跳号、不触发重连风暴）
-  es1.emit('assistant_delta', evt(100, { text: 'stale' }));
-  assert.equal(S.lastSeq, 7, '陈旧连接事件被忽略');
-  assert.equal(FakeEventSource.instances.length, 2, '陈旧事件不再触发重连');
+  es1.emit('assistant_delta', evt(30, { text: 'stale-2' }));
+  assert.equal(S.lastSeq, 20, '旧连接帧不再推进水位线');
+  es2.emit('assistant_delta', evt(21, { text: 'new' }));
+  assert.equal(S.lastSeq, 21);
 });
 
 test('前端：resync 控制帧（服务端缓冲溢出）→ close + 带 last_event_id 重连', () => {
@@ -125,7 +124,7 @@ test('前端：resync 控制帧（服务端缓冲溢出）→ close + 带 last_e
   assert.equal(S.lastSeq, 7, 'resync 不推进 lastSeq');
 });
 
-test('前端：lastSeq=0（无已知历史）时不因跳号重连（既有口径）；resync 仍能收敛', () => {
+test('前端：lastSeq=0（无已知历史）→ 不重连；resync 仍能带游标重连收敛', () => {
   const { client } = loadClient();
   const { S } = client;
   S.sessionId = 'sess-3'; S.esSessionId = 'sess-3'; S.lastSeq = 0;
@@ -140,12 +139,15 @@ test('前端：lastSeq=0（无已知历史）时不因跳号重连（既有口�
   assert.equal(FakeEventSource.instances.at(-1).url, '/api/sessions/sess-3/events?last_event_id=5');
 });
 
-test('前端：跳号/重连后 run_end 状态机守卫不变（仅 activeRunId 匹配时驱动 UI）', () => {
+test('前端：resync 重连后 run_end 状态机守卫不变（仅 activeRunId 匹配时驱动 UI）', () => {
   const { client, elements } = loadClient();
   const { S } = client;
   S.sessionId = 'sess-4'; S.esSessionId = 'sess-4'; S.lastSeq = 2; S.activeRunId = 'run-cur';
   client.connectEvents('sess-4');
-  const es = FakeEventSource.instances.at(-1);
+  let es = FakeEventSource.instances.at(-1);
+  es.emit('resync', { reason: 'buffer_overflow', last_seq: 2 });
+  es = FakeEventSource.instances.at(-1);
+  assert.equal(es.url, '/api/sessions/sess-4/events?last_event_id=2');
 
   // 历史重放的旧 run_end（run_id 不匹配）不得驱动状态机（不关停止按钮）
   es.emit('run_end', evt(3, { run_id: 'run-old', termination: { reason: 'end_turn' } }));
