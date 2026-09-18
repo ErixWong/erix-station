@@ -224,6 +224,18 @@ export function createServer({ pool, config, log = console }) {
   });
 }
 
+/**
+ * 路径参数中的 UUID 解码 + **归一化为小写**（F5 / reviewer M-4）。
+ * UUID 大小写等价（十六进制），但宿主侧会把 session/run id 当**字符串**用：
+ *   ① 幂等 `endpoint` 串（`POST /api/sessions/<id>/messages`）——同一 session 的大小写不同会变成两个幂等命名空间；
+ *   ② session SSE hub 的 key（`registerSessionClient(sessionId)`）——DB 回读的 id 恒为小写，
+ *      用大写路径连上来的客户端会被注册到另一个 key 下，**永远收不到实时事件**。
+ * 合法 UUID 的字符集（0-9a-f）不受影响；仍按原样交给各自的 UUID 正则/DB 查询（非法值照常 404）。
+ */
+function decodeUuid(raw) {
+  return decodeURIComponent(raw).toLowerCase();
+}
+
 async function route(req, res, ctx) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
@@ -333,23 +345,23 @@ async function routeApi(req, res, ctx, url) {
   }
   const sessionMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
   if (sessionMatch) {
-    const sessionId = decodeURIComponent(sessionMatch[1]);
+    const sessionId = decodeUuid(sessionMatch[1]);
     if (req.method === 'GET') return handleGetSession(req, res, ctx, sessionId);
     if (req.method === 'PATCH') return handlePatchSession(req, res, ctx, sessionId);
     if (req.method === 'DELETE') return handleArchiveSession(req, res, ctx, sessionId);
   }
   if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/messages$/.test(pathname)) {
-    return handlePostMessage(req, res, ctx, decodeURIComponent(pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)[1]));
+    return handlePostMessage(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)[1]));
   }
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events$/.test(pathname)) {
-    return handleSessionStream(req, res, ctx, decodeURIComponent(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
+    return handleSessionStream(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
   }
   if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/stop$/.test(pathname)) {
-    return handleStopSession(req, res, ctx, decodeURIComponent(pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/)[1]));
+    return handleStopSession(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/)[1]));
   }
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/);
   if (runMatch) {
-    const runId = decodeURIComponent(runMatch[1]);
+    const runId = decodeUuid(runMatch[1]);
     if (req.method === 'GET') return handleGetRun(req, res, ctx, runId);
   }
 
@@ -416,19 +428,22 @@ async function handleArchiveSession(req, res, ctx, sessionId) {
 async function handlePostMessage(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
-  // 先读体（与其它端点一致：413/400 行为不受密钥校验影响），再校验 Idempotency-Key 头
+  // 先读体（与其它端点一致：413/400 行为不受密钥校验影响），再校验体与 Idempotency-Key 头
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  // F3：请求体校验**前置到幂等包装之前**——非法体 400 且不占幂等占位行；
+  // 否则首次非法体占位后，同 key 的合法重试会因 request_hash 不同撞 409 idempotency_key_reuse。
+  const { content, attachments } = sessions.validateMessageBody(body);
   const key = idempotency.normalizeKey(req.headers['idempotency-key']); // 非法 → 400 validation_failed
   const endpoint = `POST /api/sessions/${sessionId}/messages`; // 含路径参数：同 key 跨 session 不串号
   const result = await idempotency.executeWithIdempotency(
     ctx.pool,
-    { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash(body) },
+    { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }) },
     async () => {
       const posted = await sessions.postMessage(ctx.pool, {
         userId: session.user.id,
         sessionId,
-        content: body?.content,
-        attachments: body?.attachments,
+        content,
+        attachments,
         notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
       });
       return { statusCode: 202, response: posted };
@@ -479,6 +494,20 @@ async function handleSessionStream(req, res, ctx, sessionId) {
 
   // 先注册（此后落库的事件进缓冲，不丢）；再补发；最后 flush 缓冲（跳过已补发 seq）转 live（§5.2）。
   const rec = internal.registerSessionClient(sessionId, res);
+
+  // F4：注册后**立即**安装 cleanup（once 守卫）——补发前的 DB 查询/写帧期间客户端断开，
+  // 也必须在第一时间把 rec 从 hub 摘除（否则 rec 永久残留：事件泄漏 + ping 定时器常驻）。
+  let pingTimer = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (pingTimer) clearInterval(pingTimer);
+    internal.unregisterSessionClient(sessionId, rec);
+  };
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+
   let replayedSeq = null;
   if (lastEventId != null) {
     const replay = await ctx.pool.query(
@@ -489,6 +518,7 @@ async function handleSessionStream(req, res, ctx, sessionId) {
     for (const row of replay.rows) {
       // 补发期间缓冲溢出 → hub 已写 resync 并 end()：停止补发（写入被 writeSseEvent 静默跳过）
       if (rec.resync) break;
+      if (cleaned) return; // 补发期间连接已断开（cleanup 已摘除 rec）：不再写
       const seq = Number(row.seq);
       const data = JSON.stringify({
         seq, ts: row.ts?.toISOString?.() ?? row.ts,
@@ -500,20 +530,15 @@ async function handleSessionStream(req, res, ctx, sessionId) {
   } else {
     internal.writeSseComment(res, 'connected'); // 首连不补发历史
   }
+  if (cleaned) return; // 补发期间断开：连接已关，不再 goLive（rec 已摘除）/不再起心跳
   internal.sessionClientGoLive(sessionId, rec, replayedSeq);
   if (rec.resync) return; // 已判定需重同步（res.end 已调用）：跳过 ping 与心跳循环
   internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
 
-  const pingTimer = setInterval(() => {
+  pingTimer = setInterval(() => {
     internal.writeSseComment(res, 'ping');
     internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
   }, 15000);
-  const cleanup = () => {
-    clearInterval(pingTimer);
-    internal.unregisterSessionClient(sessionId, rec);
-  };
-  req.on('close', cleanup);
-  res.on('close', cleanup);
 }
 
 /** GET /api/runs/:id（portal.md §4.6）：run 详情（属主经 session join 校验，不泄露存在性）。 */
@@ -915,7 +940,7 @@ async function handleInternal(req, res, ctx, url) {
   // runs/:id/*
   const runMatch = pathname.match(/^\/api\/internal\/runs\/([^/]+)(\/.*)?$/);
   if (runMatch) {
-    const runId = decodeURIComponent(runMatch[1]);
+    const runId = decodeUuid(runMatch[1]);
     const sub = runMatch[2] || '';
     const claimToken = claimTokenHeader(req);
 

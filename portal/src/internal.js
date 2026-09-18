@@ -344,15 +344,16 @@ function writeSessionEvent(res, ev, sessionId) {
 }
 
 /**
- * 缓冲溢出处理（B 项，§5.1/§5.2）：写 `resync` 控制帧（reason='buffer_overflow' +
- * 已推/已缓冲的最大 seq）→ `res.end()` 关闭该连接 → 从 map 移除。
+ * 缓冲溢出处理（B 项，§5.1/§5.2）：写 `resync` 控制帧（reason='buffer_overflow'）→ `res.end()` 关闭该连接
+ * → 从 map 移除。
  * 客户端收到后立刻 close + 带 `last_event_id` 重连，由 SSE handler 补发漏掉的事件（seq > last_event_id）。
+ * 帧内**不带** last_seq（F6 / reviewer M-3）：客户端本地水位线才是权威值（服务端 rec.lastSeq 在补发窗口
+ * 内可能尚未包含已落库事件，用它当重连游标会丢事件）；重连游标由客户端自己维护。
  */
 function resyncSessionClient(sessionId, rec) {
   rec.resync = true;
-  const lastSeq = rec.lastSeq ?? (rec.buffer.length > 0 ? rec.buffer[rec.buffer.length - 1].seq : null);
   try {
-    writeSseEvent(rec.res, 'resync', { reason: 'buffer_overflow', last_seq: lastSeq });
+    writeSseEvent(rec.res, 'resync', { reason: 'buffer_overflow' });
     if (typeof rec.res.end === 'function') rec.res.end();
   } catch { /* 尽力：写失败也要把 rec 摘掉，避免脏状态常驻 */ }
   rec.buffer.length = 0;
@@ -415,7 +416,11 @@ export function unregisterSseClient(containerId, res) {
 
 /** 供单测观察当前 SSE 客户端/等待者数量（不暴露内部结构）。 */
 export function hubStats() {
-  return { sseClients: sseClients.size, claimWaiters: claimWaiters.size };
+  return {
+    sseClients: sseClients.size,
+    sessionClients: [...sessionClients.values()].reduce((n, set) => n + set.size, 0),
+    claimWaiters: claimWaiters.size,
+  };
 }
 
 // ---------------------------------------------------------------------------

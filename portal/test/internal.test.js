@@ -457,7 +457,7 @@ test('B：session hub 缓冲未满 → 不重同步（事件进缓冲，连接�
   unregisterSessionClient('s-buffer-ok', rec);
 });
 
-test('B：session hub 缓冲溢出 → 写 resync 帧（reason/last_seq）+ res.end()，并从 map 移除', () => {
+test('B：session hub 缓冲溢出 → 写 resync 帧（reason，不带 last_seq）+ res.end()，并从 map 移除', () => {
   const res = fakeSseRes();
   const rec = registerSessionClient('s-overflow', res);
   notifySessionEvents('s-overflow', Array.from({ length: SESSION_CLIENT_BUFFER_MAX }, (_, i) => sessionEvent(i + 1)));
@@ -469,8 +469,9 @@ test('B：session hub 缓冲溢出 → 写 resync 帧（reason/last_seq）+ res.
   const resyncFrame = frames.find((s) => s.includes('event: resync'));
   assert.ok(resyncFrame, `写入 resync 帧：${JSON.stringify(res.written)}`);
   assert.ok(resyncFrame.includes('"reason":"buffer_overflow"'));
-  assert.equal(rec.lastSeq, SESSION_CLIENT_BUFFER_MAX, 'last_seq = 当前已缓冲的最大 seq');
-  assert.ok(resyncFrame.includes(`"last_seq":${SESSION_CLIENT_BUFFER_MAX}`));
+  assert.ok(!resyncFrame.includes('last_seq'), 'F6：resync 帧不带 last_seq（重连游标以客户端本地水位线为准）');
+  // 服务端仍跟踪 rec.lastSeq（仅内部状态，不再下发）
+  assert.equal(rec.lastSeq, SESSION_CLIENT_BUFFER_MAX, 'lastSeq 内部仍跟踪已推/已缓冲的最大 seq');
   assert.equal(res.ended, true, '溢出后 res.end() 关闭连接（浏览器随之重连带 Last-Event-ID）');
 
   // 已从 map 移除：后续事件不再写入该连接
@@ -478,6 +479,7 @@ test('B：session hub 缓冲溢出 → 写 resync 帧（reason/last_seq）+ res.
   notifySessionEvents('s-overflow', [sessionEvent(SESSION_CLIENT_BUFFER_MAX + 2)]);
   assert.equal(res.written.length, writes, '重同步后 rec 已摘除，不再推送');
   assert.equal(rec.buffer.length, 0, '缓冲已清空（防脏状态常驻）');
+  assert.equal(hubStats().sessionClients, 0, 'resync 后 session hub 无残留客户端');
 });
 
 test('B：session hub 溢出只影响溢出客户端；live 客户端继续收事件', () => {
@@ -495,4 +497,5 @@ test('B：session hub 溢出只影响溢出客户端；live 客户端继续收�
   assert.equal(live.written.length, SESSION_CLIENT_BUFFER_MAX + 1, 'live 客户端逐条收到');
   assert.equal(slowRec.resync, true);
   unregisterSessionClient('s-multi', liveRec);
+  assert.equal(hubStats().sessionClients, 0);
 });
