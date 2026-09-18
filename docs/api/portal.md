@@ -108,6 +108,15 @@
 
 `POST` 端点接受可选 `Idempotency-Key` 请求头；同 key 重复提交返回首次结果（尤其 `POST .../messages`，防断网重发产生两条用户消息）。
 
+**实现口径**（本轮实现，P1）：
+
+- **台账落库**：`idempotency_keys`（`PRIMARY KEY (user_id, endpoint, key)`，baseline `schema.sql` §3.1 / 迁移 `0001-idempotency-keys.sql`）。`endpoint` 为**具体端点含路径参数**（如 `POST /api/sessions/<id>/messages`）——同 key 跨 session 不串号；`request_hash` = 规范化请求体（`content` + `attachments`）的 `sha256`。
+- **TTL 24h**：只有 `created_at > now() - interval '24 hours'` 的记录参与命中；过期记录语义上等同不存在（重发时由条件 upsert `ON CONFLICT ... DO UPDATE ... WHERE` 原子覆盖同名过期行），物理清理由 portal reaper 低频（≈1h）`DELETE`（`idempotency.js` `purgeExpired`）。
+- **命中回放**：`request_hash` 一致 → 按首次 `status_code`（`POST .../messages` = `202`）与首次响应体**原样返回**，且**不重复副作用**（不重复唤醒 runner、不产生第二条 user 消息/第二个 run）。
+- **同 key 不同载荷**：`request_hash` 不一致 → `409 idempotency_key_reuse`（不执行首次副作用的第二遍）。
+- **并发同 key**：后到者在台账抢写失败（同名幂等行仍新鲜；`INSERT ... ON CONFLICT ... DO UPDATE ... WHERE 过期` 写入 0 行）后回查——返回首次结果；回查仍无（并发赢家回滚）→ `409 idempotency_conflict`（`retryable: true`）。
+- **非法 key**：非字符串 / 长度 > 128 / 含控制字符 → `400 validation_failed`；无该头或空串 = 无幂等语义（直通）。
+
 ---
 
 ## 2. 认证
@@ -621,7 +630,7 @@ station-portal user enable  --login <login>
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |
 
-> 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。
+> 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。实现口径：TTL 24h；同 key 不同载荷 → `409 idempotency_key_reuse`；并发同 key 返回首次结果（抢写失败者回查，仍无 → `409 idempotency_conflict`）；重放路径不重复副作用（不重复唤醒 runner）。
 
 ### 4.4 `GET /api/sessions/:id/events`（SSE）
 
@@ -745,6 +754,7 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 - 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。
+- **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow","last_seq":<已推/已缓冲的最大 seq|null>}` 后 `res.end()`。客户端（浏览器）应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）；因此前端需同时实现「跳号检测」与 `resync` 监听（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
 
 每条事件的 wire 格式：
 
