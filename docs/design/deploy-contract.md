@@ -32,11 +32,11 @@
 | `station-db` | `POSTGRES_IMAGE`（官方 `postgres:16.15`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
 | `station-docker-proxy`（自研 admission proxy） | 自构建（build context `deploy/fde-proxy/`，零依赖 Node） | `erix-station/fde-proxy:<git-sha>` 不可变 tag | `node deploy/fde-proxy/server.js` | `user: "0:1000"`（root 读 sock + gid 1000 穿越用户空间；`no-new-privileges` + `cap_drop: [ALL]` + `read_only`；**方法+路径白名单 12 条 + create 参数级校验**，见 §5.1） | `unless-stopped` | P1 ✅ |
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
-| `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version` | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
+| `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version`；**B 档语言矩阵（issue #27）：Node 22 + Python3/venv/pip + gcc/g++/make + .NET SDK 8（COPY 自官方 sdk 镜像）+ Playwright/chromium（§12.4 装容器内不做 sidecar）；code-server 不装（P3 再议）；实测 2.29GB** | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
 
 > **P1 `MIGRATE_ON_START=0`**：baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（`deploy/db-init/00-init.sh`，超级用户，空数据目录时）完成一次，portal 运行时以 `station_portal` 启动、不重复跑 superuser bootstrap；增量迁移（现有 `deploy/migrations/0001-idempotency-keys.sql`）以 `station_platform`（`MIGRATE_DATABASE_URL`）跑：`cli.js migrate` 或 `MIGRATE_ON_START=1`（§3.1/§3.3）。
 >
-> **镜像预拉取**：portal **不授 IMAGES**（station-docker-proxy 路径白名单仅 containers/networks，§5.1）。FDE 镜像由**宿主在部署时 `docker pull`** 预拉取（版本 pin 走 `containers.agent_version` + canary，规格 §14）；镜像升级 = 宿主预拉新 digest + 重建容器，不经过 portal 的 Docker API。
+> **镜像预拉取**：portal **不授 IMAGES**（station-docker-proxy 路径白名单仅 containers/networks，§5.1）。FDE 镜像由**宿主在部署时预拉取**——有 registry 时 `docker pull`（pin 形态 ① `image@sha256:…`，RepoDigests 取自 push/pull 后 inspect）；**P1 目标机本地 build 时 `docker build` 后取 image ID**（`docker inspect --format '{{.Id}}'`，pin 形态 ② `sha256:<imageId>`——本地 build 无 RepoDigests，issue #27）；版本 pin 走 `containers.agent_version` + canary，规格 §14。镜像升级 = 宿主预拉/重建新不可变引用 + 重建容器，不经过 portal 的 Docker API。
 >
 > **LLM 网关（P3，不入 P1 compose）的字段契约**：`llm-gateway` 接 `backend` 网络，**数据面 publish 仅 `127.0.0.1:4000`（回环，供 Traefik `llm.<base>` 路由回环访问）；admin 面不发布**（仅 `backend` 内可达，topology §6 第 6 条 / env §5）。Q1（公司是否已有网关）未定 → 已有则复用、不部署本容器；没有则 P3 起一个 LiteLLM 容器，portal 仍只做租户绑定（规格 §11.3）。
 
@@ -280,7 +280,7 @@
 | `--security-opt` | `no-new-privileges` | topology §6.2 |
 | `--cap-drop` / `--cap-add` | `--cap-drop ALL`，回加运行必需最小集（`SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`CAP_KILL`）：前五项供 root 启动后 drop 到 1001、fork worker 切 1002、chown 工作区；**`CAP_KILL` 供 agentd（UID 1001）在 lease lost / stop 时对 worker（UID 1002，不同 UID）发 `SIGTERM`/`SIGKILL`**（跨 UID `kill(2)` 需 `CAP_KILL`，runner §2.4/§6.4/§6.5）。**不授 `NET_ADMIN`/`SYS_ADMIN`/`SYS_PTRACE`** | topology §6.2 / runner §11.3 |
 | seccomp/AppArmor | 保持默认 profile | topology §6.2 |
-| 资源限额 | `--memory` 等由 portal 经 Docker API 设置（规格 §14；具体数值 ⚠️ 按 FDE 规模定） | 规格 §14 |
+| 资源限额 | `--memory` 默认 `4g`（issue #27 已决 2026-09-18，B 档镜像下 dotnet build/chromium 峰值需要；env `FDE_MEMORY_LIMIT` 可调，`0` 不限）；`--pids` 等由 portal 经 Docker API 设置 | 规格 §14 / issue #27 |
 
 > **PID 1 / 信号 / 僵尸回收（B12 定案：单一 init，不双重 init）**：`--init=true` 由 docker 注入 tini 作 PID 1，entrypoint/command 直接 `station-agentd`（PID 2）。stop/restart 行为：`docker stop` 对 tini 发 `SIGTERM` → tini 转发给 agentd → agentd 对在跑 worker `SIGTERM`（5s 宽限）→ `SIGKILL`（runner §2.4）；`unless-stopped` 下 agentd 崩 → 容器退出 → docker 拉起。**僵尸回收验证（smoke test，testing.md §3.8）**：`docker exec fde-<name> ps -ef` 断言无 `<defunct>`（dev server 退出由 tini reap，不留 zombie）。
 >
