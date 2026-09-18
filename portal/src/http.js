@@ -424,6 +424,10 @@ async function handleArchiveSession(req, res, ctx, sessionId) {
  * 可选 `Idempotency-Key`（§1.4）：同 key 重复提交返回**首次结果**（同 message.id / run.id），
  * 不产生第二条 user 消息/第二个 run，也**不重复副作用**（notify 唤醒只在首次执行路径发生，
  * 因为 replay 路径不会调用 sessions.postMessage）。
+ *
+ * G2：把幂等层给的 `record` 回调转交 sessions.postMessage，由它在**同一个业务事务内**调
+ * `record(client, 202, payload)`——消息/run 与幂等台账同一次 COMMIT，“同 key 至多一次副作用”
+ * （记账与业务写入同事务）；占位被接管时 record 抛 409 → 业务事务回滚。
  */
 async function handlePostMessage(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
@@ -437,13 +441,14 @@ async function handlePostMessage(req, res, ctx, sessionId) {
   const endpoint = `POST /api/sessions/${sessionId}/messages`; // 含路径参数：同 key 跨 session 不串号
   const result = await idempotency.executeWithIdempotency(
     ctx.pool,
-    { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }) },
-    async () => {
+    { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }), log: ctx.log },
+    async (record) => {
       const posted = await sessions.postMessage(ctx.pool, {
         userId: session.user.id,
         sessionId,
         content,
         attachments,
+        record,
         notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
       });
       return { statusCode: 202, response: posted };

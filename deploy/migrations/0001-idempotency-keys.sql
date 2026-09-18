@@ -2,11 +2,14 @@
 -- 用途：POST 写端点（当前唯一使用者 POST /api/sessions/:id/messages）可选 Idempotency-Key 去重：
 --   同 (user_id, endpoint, key) 重复提交返回首次结果，不产生第二条 user 消息 / 第二个 run。
 --
--- 语义（先占位后执行，F1 裁决：消除「先执行后记账」的幂等双执行窗口）：
+-- 语义（先占位后执行 + 记账并入业务事务，F1/G2 裁决：消除「先执行后记账」的幂等双执行窗口）：
 --   state='in_progress'  占位行：首个请求抢到（并发同 key 只有一个能占到），fn 至多执行一次；
 --                        占位期间（< 5 分钟，IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES）同 key 请求 → 409 idempotency_conflict(retryable)；
 --                        超过 5 分钟（持有者崩溃残留，stale）→ 视为可覆盖，被后续请求 UPDATE 抢回后执行；
 --   state='done'         完成行：落 status_code/response 供回放（TTL 24h 内命中；request_hash 不一致 → 409 idempotency_key_reuse）。
+--   claim_token          占位持有者标识（owner fencing，G2）：占位/抢回时写入新 UUID，
+--                        record/complete/release 均带 `AND claim_token = $`——旧持有者崩溃后被抢回，
+--                        其迟到的记账/释放一律 0 行（不覆写新持有者的结果）。done 行保留最后一次占位的 token。
 --   created_at 既作 TTL 24h 基准（done 行的命中窗口），也作 in_progress 陈旧判定基准。
 --   占位行 status_code/response 为 NULL（结果尚未产生）——回放只读 state='done' 行，故不会回放出占位态。
 --
@@ -28,6 +31,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   state        text NOT NULL DEFAULT 'done' CHECK (state IN ('in_progress', 'done')),
   status_code  int,               -- 完成行的首次响应状态码（回放原样返回）；占位行为 NULL
   response     jsonb,             -- 完成行的首次响应体（回放原样返回）；占位行为 NULL
+  claim_token  text,              -- 占位持有者标识（owner fencing）：占位/抢回时写入新 UUID，done 行保留最后一次的值；旧持有者的迟到记账/释放因 token 失配而 0 行
   created_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, endpoint, key)
 );
