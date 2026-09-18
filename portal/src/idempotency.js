@@ -7,8 +7,9 @@
 //     baseline docs/data/schema.sql 自 P1 冻结、不改动，见 deploy/migrations/README.md）。
 //   - 流程（**先占位后执行**，F1 裁决：消除「先执行后记账」的双执行窗口）：
 //     ① `state='done'` 且未过期（TTL 24h）→ 回放首次结果（不执行 fn，不产生第二次副作用）；
-//     ② 否则**先占位**（`INSERT ... state='in_progress' ON CONFLICT DO NOTHING` 语义）——
-//        并发同 key 只有一个请求能占到（其余 0 行），故**fn 至多执行一次**；
+//     ② 否则**先占位**（占位语句：无同名行 → 插入；同名行仍新鲜 → 0 行，等价于 `ON CONFLICT DO NOTHING`；
+//        同名 `done` 行已过期 → 原子覆盖，故不必等 reaper 清过期行也能重发）——
+//        并发同 key 只有一个请求能占到，故**fn 至多执行一次**；
 //     ③ 占到占位 → 执行 fn() → `UPDATE` 本行 `state='done'` + status_code/response → 返回；
 //        fn() 抛错 → `DELETE` 占位行后原样 rethrow（释放 key，客户端可重试；不把瞬时错误钉成永久结果）；
 //     ④ 占位 0 行（并发竞争/残留）→ 读现有行判定：

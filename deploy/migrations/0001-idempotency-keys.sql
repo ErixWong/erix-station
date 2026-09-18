@@ -15,6 +15,8 @@
 -- 幂等：`CREATE TABLE IF NOT EXISTS` + `ADD COLUMN IF NOT EXISTS` + `DROP NOT NULL`（可重复执行）；
 --   末尾两条 ALTER 只为兼容**预发布期**已建出本表的库（本 PR 未发布前，该表曾一度写在 baseline 里，
 --   那一版不含 state 且 status_code/response 为 NOT NULL）；对全新库是 no-op。
+--   注：兼容路径只补列与可空性，不补 state 的 CHECK 约束（该库为开发/预发布库，应用层总是写合法值）——
+--   全新库一律带上 CHECK。
 -- 约定：单事务（runner 会 BEGIN → 执行 → 落 schema_migrations → COMMIT，deploy/migrations/README.md）。
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   user_id      uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
