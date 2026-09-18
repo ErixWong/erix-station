@@ -286,14 +286,14 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PORTAL_IMAGE` | 平台规范固定（规格 §14）；自构建（build context `portal/`） | `erix-station/portal:<git-sha>`（不可变 tag；部署时再 `docker inspect --format '{{.Id}}'` 记 digest） |
 | `POSTGRES_IMAGE` | 平台规范固定（规格 §14）；官方镜像（compose 变量名 `POSTGRES_IMAGE`） | `postgres:16.15`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体值部署时由 §9 产出后填） |
 | `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
-| `STATION_DOCKER_PROXY_IMAGE` | 平台规范固定（deploy-contract §5.1）；自构建（build context `deploy/fde-proxy/`） | `erix-station/fde-proxy:<git-sha>`（自研 admission proxy；tecnativa/docker-socket-proxy 方案已废弃） |
-| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）** |
+| `STATION_DOCKER_PROXY_IMAGE` | 平台规范固定（deploy-contract §5.1）；自构建（build context `deploy/fde-proxy/`） | `erix-station/fde-proxy:<git-sha>`（自研 admission proxy；tecnativa/docker-socket-proxy 方案已废弃）；dev 默认 `:local`，compose 插值可 env 覆盖（issue #27） |
+| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）**；生产 pin 双轨见下方「镜像 pin 策略」+ issue #27（B 档语言矩阵：Node/Python/.NET/Playwright，实测 2.29GB） |
 | `FDE_CMD` | 平台规范固定（FDE 容器命令；开发期 whoami 站台用，生产为 `station-agentd` 入口） | JSON 数组；开发期 `["-port","4000"]`（首个项目块首端口，fde-platform §8.2） |
 | `FDE_AGENT_VERSION` | 平台规范固定（写 `containers.agent_version`；开发期占位） | `dev` |
-| `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；⚠️ 具体数值待决策者确认） | `512m`（`0` 表示不限） |
+| `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；**已决 2026-09-18，issue #27**） | `4g`（B 档镜像下 dotnet build/chromium 峰值需要；`0` 表示不限） |
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
-| `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8 ⚠️ 待决策者确认） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
+| `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8；**已决 2026-09-18，issue #27**） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
 | `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P3 接入（deploy-contract §7.3） | `http://127.0.0.1:4000`（reconciler 生成 llm-hub service 回环地址） |
 | `LLM_GATEWAY_PORT` | 平台规范固定（deploy-contract §7.3）；`station-mock-llm` 数据面在宿主的回环发布端口（**dev-only**；P3 真实网关同端口） | `4000` |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
@@ -314,7 +314,9 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 
 > **口令必须改 + 600 权限存放**：`POSTGRES_PASSWORD` / `PLATFORM_DB_PASSWORD` / `PORTAL_DB_PASSWORD` 在生产环境必须把 `change-me-dev-only` 占位全部改掉，并以 **600 权限 `deploy/.env`** 存放（不入库、不进 compose 正文、不进镜像，见 deploy-contract §2.4）。
 >
-> **镜像 pin 策略（deploy-contract.md §2 的完整契约，此处只记取值口径）**：`deploy/` 内的 compose/镜像引用**不得使用浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。生产部署对每个镜像最终以 **digest**（`image@sha256:…`）锁定；P1 开发期可暂用 `<major>.<minor>` 类 tag，但必须在 `docker inspect` 后把 resolved digest 记录进部署记录（env 附录 B / runbook）。`⚠️ 待决策者确认`：`postgres:16` / `traefik:v3` 的具体 patch 号与 digest 是部署期事实，本文不虚构；P1 开发按 §0 即可，目标环境按 §9 探测后再 pin。
+> **镜像 pin 策略（deploy-contract.md §2 的完整契约，此处只记取值口径；双轨定稿见 issue #27，2026-09-18）**：`deploy/` 内的 compose/镜像引用**不得使用浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。生产部署对每个镜像最终以**不可变引用**锁定，两种形态（F12 校验均接受）：**① repo digest** `image@sha256:…`——push/pull 后 `docker inspect --format '{{index .RepoDigests 0}}'` 取；**② image ID** `sha256:<imageId>`——目标机本地 build（RepoDigests 为空）用 `docker inspect --format '{{.Id}}'` 取。P1 开发期可暂用 `<major>.<minor>` 类 tag，但必须在 `docker inspect` 后把 resolved digest 记录进部署记录（env 附录 B / runbook）。`⚠️ 待决策者确认`：`postgres:16` / `traefik:v3` 的具体 patch 号与 digest 是部署期事实，本文不虚构；P1 开发按 §0 即可，目标环境按 §9 探测后再 pin。
+>
+> **容器内 Playwright 覆写（issue #27 评审 F9）**：镜像内置 playwright 1.63/chromium，浏览器路径镜像级写死 `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`（root:root 0755，只读使用）。FDE 项目若需 pin 其它 playwright 版本，在容器内覆写：`PLAYWRIGHT_BROWSERS_PATH=$HOME/cache/ms-playwright npx playwright install chromium`（`~/cache/` 为 FDE 自管卷，重建不丢，user-space §2）。
 >
 > 宿主机内网 IP（DNS A 记录目标）在部署时由运维填入 DNS，不进入 compose 变量。
 
