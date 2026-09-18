@@ -7,11 +7,12 @@
 //   - 全部平台网络 IO 经 IPC `store_request` → agentd（agentd 加 Authorization + X-Claim-Token 转发，§9.1）；
 //   - 事件经 IPC `event` 逐条回 agentd 批量上报（§5/§7）；
 //   - provider 用 erix-agent `createJsonFileModelConfigProvider`（config.json 内占位 key + endpoint，零真实 LLM 凭据，§6.3）；
+//   - 终态由 agentd 经 U2 上报（worker 只回 run_finished，不发 run_end 事件，§7.6）。
 
 // user-space §6.2：umask 0002（新建文件 664/目录 775）——worker/agent 写 worktree 与 spool 的文件
-// 需跨 UID（1002↔1001/1000，同 GID 1000）组可写；fork 时已从 agentd 继承，此处防御性重设。
+// 需跨 UID（1002↔1001/1000，同 GID 1000）组可写；fork 时已从 agentd/entrypoint 继承（entrypoint.sh
+// 早有 umask 0002，本处为防御性重设，评审 F8）。
 process.umask(0o002);
-//   - 终态由 agentd 经 U2 上报（worker 只回 run_finished，不发 run_end 事件，§7.6）。
 
 import {
   createJsonFileModelConfigProvider,
