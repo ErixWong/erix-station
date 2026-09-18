@@ -5,7 +5,11 @@ node_modules
 .env
 .env.*
 !.env.example
-deploy
+# portal 镜像的构建上下文 = 仓库根（compose 用 context: .. / dockerfile: portal/Dockerfile）：
+# deploy/ 下只有增量迁移需要进镜像（migrate runner 的 defaultMigrationsDir() = /app/deploy/migrations，
+# 见 deploy-contract §3.3 / deploy/migrations/README.md），其余（compose/.env/fde-proxy）不进镜像。
+deploy/*
+!deploy/migrations
 runner
 logs
 *.log

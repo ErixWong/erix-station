@@ -16,6 +16,38 @@ export class SessionError extends Error {
 
 const ACTIVE_RUN_STATES = `('queued', 'running', 'cancelling')`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** 单条 user 消息内容上限（portal.md §4.3）。 */
+export const MAX_MESSAGE_CONTENT_LENGTH = 100_000;
+
+/**
+ * 请求体校验（**纯函数，无 IO**）：返回裁剪后的 `{content, attachments}`；不合法一律 `SessionError`(400 validation_failed)。
+ *
+ * 为什么单独导出（F3 裁决 / reviewer M-7）：`handlePostMessage` 必须在**幂等包装之前**调用它——
+ * 非法请求体要 400 且**不占用** Idempotency-Key 占位行；否则首次非法体先占位，同 key 的合法重试
+ * 会因 request_hash 不同撞 409 idempotency_key_reuse（等于把一次笔误钉成永久 409）。
+ * 同时它把 attachments 元素裁剪为实际消费的 `{kind, path, name?}` 子集，供请求 hash 复用。
+ */
+export function validateMessageBody(body) {
+  const content = body?.content;
+  if (typeof content !== 'string' || content.trim().length === 0) {
+    throw new SessionError('validation_failed', 'content 必填且非空', { details: { field: 'content' } });
+  }
+  if (content.length > MAX_MESSAGE_CONTENT_LENGTH) {
+    throw new SessionError('validation_failed', `content 过长（≤${MAX_MESSAGE_CONTENT_LENGTH} 字符）`, { details: { field: 'content' } });
+  }
+  const raw = body?.attachments;
+  if (raw !== undefined && !Array.isArray(raw)) {
+    throw new SessionError('validation_failed', 'attachments 必须为数组', { details: { field: 'attachments' } });
+  }
+  const attachments = (raw ?? []).map((a) => {
+    if (!a || typeof a !== 'object' || !['file', 'image'].includes(a.kind) || typeof a.path !== 'string' || !a.path) {
+      throw new SessionError('validation_failed', 'attachments 元素须为 {kind: file|image, path, name?}', { details: { field: 'attachments' } });
+    }
+    // 只保留实际消费的字段（多送的 UI 字段既不落库也不参与幂等 hash）
+    return a.name === undefined ? { kind: a.kind, path: a.path } : { kind: a.kind, path: a.path, name: a.name };
+  });
+  return { content, attachments };
+}
 
 /** session 属主校验 + 取行；不存在/不属本人/已归档/非法 UUID 一律 404（不泄露存在性，portal.md §1.2 惯例）。 */
 async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {}) {
@@ -194,22 +226,10 @@ export async function archiveSession(pool, { userId, sessionId }) {
  * 拉模型（终态）语义：落库即 202，FDE 不在线时 run 在队列等待（§6.3）。
  */
 export async function postMessage(pool, { userId, sessionId, content, attachments, notify }) {
-  if (typeof content !== 'string' || content.trim().length === 0) {
-    throw new SessionError('validation_failed', 'content 必填且非空', { details: { field: 'content' } });
-  }
-  if (content.length > 100_000) {
-    throw new SessionError('validation_failed', 'content 过长（≤100000 字符）', { details: { field: 'content' } });
-  }
-  if (attachments !== undefined) {
-    if (!Array.isArray(attachments)) {
-      throw new SessionError('validation_failed', 'attachments 必须为数组', { details: { field: 'attachments' } });
-    }
-    for (const a of attachments) {
-      if (!a || typeof a !== 'object' || !['file', 'image'].includes(a.kind) || typeof a.path !== 'string' || !a.path) {
-        throw new SessionError('validation_failed', 'attachments 元素须为 {kind: file|image, path, name?}', { details: { field: 'attachments' } });
-      }
-    }
-  }
+  // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
+  const valid = validateMessageBody({ content, attachments });
+  const safeContent = valid.content;
+  const safeAttachments = valid.attachments;
 
   const client = await pool.connect();
   let committed = null;
@@ -243,7 +263,7 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       `INSERT INTO messages (session_id, seq, role, content, attachments)
        VALUES ($1, $2, 'user', $3, $4)
        RETURNING id, seq, role, content, attachments, created_at`,
-      [s.id, seq, content, JSON.stringify(attachments ?? [])],
+      [s.id, seq, safeContent, JSON.stringify(safeAttachments)],
     );
 
     // run + 入队（§4.3：显式把用户输入作为 task 传引擎；id 由 portal 生成，禁止 cwd 派生 §9.3-3）
@@ -268,7 +288,7 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
         role: 'user',
         content: msg.rows[0].content,
         synthetic: false,
-        attachments: attachments ?? [],
+        attachments: safeAttachments,
         created_at: msg.rows[0].created_at?.toISOString?.() ?? msg.rows[0].created_at,
       },
       run: { id: run.rows[0].id, status: run.rows[0].status },

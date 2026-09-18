@@ -25,6 +25,11 @@ import {
   notifyRunEnqueued,
   hubStats,
   writeSseEvent,
+  registerSessionClient,
+  unregisterSessionClient,
+  sessionClientGoLive,
+  notifySessionEvents,
+  SESSION_CLIENT_BUFFER_MAX,
 } from '../src/internal.js';
 import { FakeInternalPool, seedClaimable } from './fake-internal-pool.js';
 
@@ -423,4 +428,74 @@ test('F7：revoke 后已建 SSE 连接被服务端主动关闭', async () => {
   assert.ok(res.written.some((s) => s.includes('event: revoke')));
   assert.equal(res.ended, true, 'revoke 后连接被 res.end() 关闭');
   assert.equal(hubStats().sseClients, 0, 'revoke 后客户端注销');
+});
+
+// ---- B：session hub 缓冲溢出 → resync（portal.md §5.1/§5.2） ----
+
+function fakeSseRes() {
+  return {
+    written: [], ended: false, destroyed: false, writableEnded: false,
+    write(s) { this.written.push(s); },
+    end() { this.ended = true; this.writableEnded = true; },
+  };
+}
+const sessionEvent = (seq, type = 'assistant_delta', payload = { text: `t${seq}` }) => ({
+  seq, ts: '2026-09-12T00:00:00.000Z', run_id: 'run-x', type, payload,
+});
+
+test('B：session hub 缓冲未满 → 不重同步（事件进缓冲，连接不关）', () => {
+  const res = fakeSseRes();
+  const rec = registerSessionClient('s-buffer-ok', res);
+  notifySessionEvents('s-buffer-ok', Array.from({ length: SESSION_CLIENT_BUFFER_MAX }, (_, i) => sessionEvent(i + 1)));
+  assert.equal(rec.buffer.length, SESSION_CLIENT_BUFFER_MAX, '缓冲到上限');
+  assert.equal(res.ended, false, '未溢出不 end()');
+  assert.equal(res.written.length, 0, '未 live 客户端不直接写（先缓冲）');
+  // 转 live 后 flush 缓冲（带 id: <seq>）
+  sessionClientGoLive('s-buffer-ok', rec);
+  assert.equal(res.written.length, SESSION_CLIENT_BUFFER_MAX);
+  assert.ok(res.written[0].includes(`id: 1\n`));
+  unregisterSessionClient('s-buffer-ok', rec);
+});
+
+test('B：session hub 缓冲溢出 → 写 resync 帧（reason，不带 last_seq）+ res.end()，并从 map 移除', () => {
+  const res = fakeSseRes();
+  const rec = registerSessionClient('s-overflow', res);
+  notifySessionEvents('s-overflow', Array.from({ length: SESSION_CLIENT_BUFFER_MAX }, (_, i) => sessionEvent(i + 1)));
+  assert.equal(res.ended, false);
+
+  // 第 1001 条事件：超过 SESSION_CLIENT_BUFFER_MAX → 不再静默丢弃，改判重同步
+  notifySessionEvents('s-overflow', [sessionEvent(SESSION_CLIENT_BUFFER_MAX + 1)]);
+  const frames = res.written.map((s) => s.trim()).filter(Boolean);
+  const resyncFrame = frames.find((s) => s.includes('event: resync'));
+  assert.ok(resyncFrame, `写入 resync 帧：${JSON.stringify(res.written)}`);
+  assert.ok(resyncFrame.includes('"reason":"buffer_overflow"'));
+  assert.ok(!resyncFrame.includes('last_seq'), 'F6：resync 帧不带 last_seq（重连游标以客户端本地水位线为准）');
+  // 服务端仍跟踪 rec.lastSeq（仅内部状态，不再下发）
+  assert.equal(rec.lastSeq, SESSION_CLIENT_BUFFER_MAX, 'lastSeq 内部仍跟踪已推/已缓冲的最大 seq');
+  assert.equal(res.ended, true, '溢出后 res.end() 关闭连接（浏览器随之重连带 Last-Event-ID）');
+
+  // 已从 map 移除：后续事件不再写入该连接
+  const writes = res.written.length;
+  notifySessionEvents('s-overflow', [sessionEvent(SESSION_CLIENT_BUFFER_MAX + 2)]);
+  assert.equal(res.written.length, writes, '重同步后 rec 已摘除，不再推送');
+  assert.equal(rec.buffer.length, 0, '缓冲已清空（防脏状态常驻）');
+  assert.equal(hubStats().sessionClients, 0, 'resync 后 session hub 无残留客户端');
+});
+
+test('B：session hub 溢出只影响溢出客户端；live 客户端继续收事件', () => {
+  const live = fakeSseRes();
+  const liveRec = registerSessionClient('s-multi', live);
+  sessionClientGoLive('s-multi', liveRec);
+
+  const slow = fakeSseRes();
+  const slowRec = registerSessionClient('s-multi', slow);
+  notifySessionEvents('s-multi', Array.from({ length: SESSION_CLIENT_BUFFER_MAX + 1 }, (_, i) => sessionEvent(i + 1)));
+
+  assert.equal(slow.ended, true, '未 live 且溢出的客户端被重同步');
+  assert.ok(slow.written.some((s) => s.includes('event: resync')));
+  assert.equal(live.ended, false, 'live 客户端不受影响');
+  assert.equal(live.written.length, SESSION_CLIENT_BUFFER_MAX + 1, 'live 客户端逐条收到');
+  assert.equal(slowRec.resync, true);
+  unregisterSessionClient('s-multi', liveRec);
+  assert.equal(hubStats().sessionClients, 0);
 });
