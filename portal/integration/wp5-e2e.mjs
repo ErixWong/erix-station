@@ -159,11 +159,25 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     removeDbDir();
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     docker(`build -t ${FDE_IMAGE} runner/`);
-    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, ...FDE_ENV });
+    // F2：baseline（docs/data/schema.sql）自 P1 冻结、**不含** idempotency_keys；该表只能由增量迁移
+    //   0001 提供 → 本 e2e 以 MIGRATE_ON_START=1 跑**真实迁移 runner**（portal 在监听端口前以
+    //   station_platform 应用 baseline 之后的增量）。这不仅让表存在，也验证了「增量生效」链路。
+    compose('up -d --build', {
+      ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+      MIGRATE_ON_START: '1', ...FDE_ENV,
+    });
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
       return r && r.status === 200;
     }, { label: 'portal healthz', timeoutMs: 240000, intervalMs: 1000 });
+
+    // 迁移链路对账：0001 已应用 + 表/state 列存在（baseline 未提供此表）
+    assert.equal(psql(`SELECT count(*) FROM schema_migrations WHERE version='0001-idempotency-keys'`), '1',
+      '增量迁移 0001 已落 schema_migrations');
+    assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='idempotency_keys'`), '1',
+      'idempotency_keys 由迁移 0001 建出');
+    assert.equal(psql(`SELECT count(*) FROM information_schema.columns WHERE table_name='idempotency_keys' AND column_name='state'`), '1',
+      'state 列（先占位后执行）存在');
 
     await insertUser('alice');
     S.cookie = await login('alice');
@@ -301,9 +315,11 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     assert.equal(Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`)), userMsgsAfter,
       '非法 key 不产生新 user 消息');
 
-    // 6.9) 并发同 key 双发（双击/客户端重发竞态）：无论哪一边先赢，都不得产生第二条 user 消息/第二个 run。
-    //      两种可能结果均合规（按任务口径注释）：① 输者回放 → 两边都 202 且同 message.id/run.id；
-    //      ② 输者撞上 sessions.postMessage 自己的「同 session 单活跃 run」守卫 → 409 run_in_progress。
+    // 6.9) 并发同 key 双发（双击/客户端重发竞态）：**先到先得**，无论哪一边先赢，都不得产生第二条 user 消息/第二个 run。
+    //      按新裁决（先占位后执行），两种结果均合规：① 赢家 202、输者 409 `idempotency_conflict`（占位在
+    //      赢家手里，`retryable: true`）；② 赢家已提交占位但**输者先于赢家拿到 session 锁**时，输者会撞
+    //      sessions.postMessage 的「同 session 单活跃 run」守卫 → 409 `run_in_progress`。两者都允许（先到先得）。
+    //      旧「输者回查并回放首次结果」语义已废弃（那正是 F1 的双执行窗口），故这里**不再**断言两边同 id。
     const raceKey = `wp5-race-${Date.now()}`;
     const raceContent = '幂等并发重发验收';
     const raceBeforeUser = Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`));
@@ -315,20 +331,32 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     const raceStatuses = [race1.status, race2.status].sort((a, b) => a - b);
     assert.ok(raceStatuses.every((s) => s === 202 || s === 409), `并发同 key 状态 ∈ {202,409}：${raceStatuses}`);
     assert.ok(raceStatuses.includes(202), `并发同 key 至少一个 202：${raceStatuses}`);
-    if (raceStatuses[0] === 202 && raceStatuses[1] === 202) {
-      assert.equal(race1.body.message.id, race2.body.message.id, '并发同 key 两边 202 → 同一 message.id（回放）');
-      assert.equal(race1.body.run.id, race2.body.run.id, '并发同 key 两边 202 → 同一 run.id（回放）');
+    const raceWinner = race1.status === 202 ? race1 : race2;
+    const raceLoser = race1.status === 202 ? race2 : race1;
+    if (raceLoser.status === 409) {
+      // 先到先得：输者只会是「幂等占位未收敛」或「同 session 单活跃 run」两者之一
+      assert.ok(
+        ['idempotency_conflict', 'run_in_progress'].includes(raceLoser.body.error.code),
+        `输者 409 码仅允许 idempotency_conflict / run_in_progress（得 ${raceLoser.body.error.code}）`,
+      );
+      if (raceLoser.body.error.code === 'idempotency_conflict') {
+        assert.equal(raceLoser.body.error.retryable, true, 'idempotency_conflict 可重试');
+      }
     } else {
-      const loser = race1.status === 409 ? race1 : race2;
-      assert.equal(loser.body.error.code, 'run_in_progress', '输者被单活跃 run 守卫拦住');
+      // 两边都 202：只能是赢家完成后输者（同一个 key）后来命中回放 → 同 message/run id
+      assert.equal(raceLoser.status, 202, `输者状态：${raceLoser.status}`);
+      assert.equal(raceLoser.body.message.id, raceWinner.body.message.id, '两边 202 → 同一 message.id（回放）');
+      assert.equal(raceLoser.body.run.id, raceWinner.body.run.id, '两边 202 → 同一 run.id（回放）');
     }
     assert.equal(Number(psql(`SELECT count(*) FROM messages WHERE session_id='${sessionId}' AND role='user'`)) - raceBeforeUser, 1,
       '并发双发只产生 1 条 user 消息');
     assert.equal(Number(psql(`SELECT count(*) FROM runs WHERE session_id='${sessionId}'`)) - raceBeforeRuns, 1,
       '并发双发只产生 1 个 run');
     assert.equal(Number(psql(`SELECT count(*) FROM idempotency_keys WHERE key='${raceKey}'`)), 1, '并发同 key 台账一行');
+    assert.equal(psql(`SELECT state FROM idempotency_keys WHERE key='${raceKey}'`), 'done',
+      '赢家完成后台账为 done（先占位后执行）');
     // 等该 run 收敛（下步 step 7/8 需要无活跃 run）
-    const raceRunId = (race1.status === 202 ? race1 : race2).body.run.id;
+    const raceRunId = raceWinner.body.run.id;
     await waitFor(() => {
       const st = psql(`SELECT status FROM runs WHERE id='${raceRunId}'`);
       return st === 'finished' || st === 'failed' ? st : null;

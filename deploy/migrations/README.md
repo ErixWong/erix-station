@@ -1,7 +1,12 @@
 # deploy/migrations/ — 增量 DB 迁移目录
 
-> 依据：`docs/design/deploy-contract.md` §3。P1 walking skeleton **尚无增量迁移文件**，
-> 本目录只约定命名/顺序/幂等规则，供迁移 runner（`portal/src/migrate.js` 读取）与后续轮次使用。
+> 依据：`docs/design/deploy-contract.md` §3。本目录自 **0001** 起已有实际增量迁移
+> （`0001-idempotency-keys.sql`，portal.md §1.4 幂等台账）；命名/顺序/幂等规则供迁移 runner
+> （`portal/src/migrate.js` 读取）与后续轮次使用。
+>
+> **baseline 已冻结**：`docs/data/schema.sql`（`version='0000_baseline'`）自 P1 起不可再改——
+> 改它会让 `00-init.sh`/runner 记录的真实 `sha256` 失配，runner 直接拒绝启动（§3.2 防改历史）。
+> 新增 DDL 一律写成新编号迁移文件（本目录），**不**回写 baseline。
 
 ## 目录职责
 
@@ -15,9 +20,7 @@
 
 - 文件名：`NNNN-<slug>.sql`，`NNNN` 为四位递增序号（`0001`、`0002`、…），`<slug>` 为
   小写 kebab-case 简短描述。
-- 顺序 = 文件名升序（`sort`）。**已应用的迁移文件不得再修改**：修改会改变 checksum，
-  runner 检测失配后拒绝启动（防改历史，deploy-contract §3.2）。
-- 每次新增 DDL 都写成新编号迁移文件，**不修改已应用的迁移**。
+- 顺序 = 文件名升序（`sort`）。**已应用的迁移文件不得再修改**（见下「单文件约定」）。
 
 ## 单文件约定
 
@@ -25,13 +28,19 @@
   schema_migrations` → `COMMIT`），失败整体回滚、不写台账行。
 - 数据迁移（有损 / 大表 rewrite）必须显式 `SET lock_timeout` / `SET statement_timeout`
   并保持幂等（`IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` 等），见 deploy-contract §3.2。
+- **已应用的迁移不得再修改**：runner 记录每个迁移文件的 `sha256`，改动即失配、拒绝启动。
+  未发布（未进入任何已部署库）的迁移可以在同一个 PR 内迭代，但发布后只能追加新编号。
+- 迁移内新建的表/序列自动获得 `station_portal` 的最小 DML 授权——baseline 已设
+  `ALTER DEFAULT PRIVILEGES FOR ROLE station_platform`（schema.sql §10），无需在迁移里重复 `GRANT`。
 
-## 示例（后续轮次再添加，勿在本轮放实际迁移文件）
+## 镜像与执行
 
-```sql
--- 0001-add-users-display-name-index.sql
-CREATE INDEX IF NOT EXISTS users_display_name_idx ON users (display_name);
-```
+- portal 镜像（`portal/Dockerfile`）`COPY deploy/migrations/`，容器内路径 `/app/deploy/migrations`
+  （= `migrate.js` 的 `defaultMigrationsDir()`）。
+- 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
+  身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
+- 现状：`0001-idempotency-keys.sql`（写操作幂等台账 `idempotency_keys`）。首次部署到已有库时
+  需显式跑一次迁移（`MIGRATE_ON_START=0` 的栈不会自动应用增量）。
 
 > 迁移身份 = `station_platform`（DDL，表 owner）；运行时身份 = `station_portal`（最小 DML）。
 > 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。
