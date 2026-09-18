@@ -238,27 +238,6 @@ CREATE TABLE messages (
 );
 
 -- ----------------------------------------------------------------------------
--- 3.1 API 写操作幂等键（portal.md §1.4）：POST 写端点可选 `Idempotency-Key` 去重
---     同 (user_id, endpoint, key) 重复提交返回首次结果，不产生重复副作用
---     （当前唯一使用者：POST /api/sessions/:id/messages，防断网重发产生两条用户消息）。
---     TTL 24h：命中判定带 created_at > now() - interval '24 hours'；过期行由 portal reaper 低频物理清理
---     （portal/src/idempotency.js 的 purgeExpired）。与增量迁移 deploy/migrations/0001-idempotency-keys.sql
---     定义一致——本文件保持自包含（psql -f 空库可执行），迁移侧用 IF NOT EXISTS 幂等兜底。
--- ----------------------------------------------------------------------------
-CREATE TABLE idempotency_keys (
-  user_id      uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-  endpoint     text NOT NULL,                    -- 具体端点（含路径参数，如 POST /api/sessions/<id>/messages）：同 key 跨 session 不串号
-  key          text NOT NULL,                    -- 客户端原始 Idempotency-Key（≤128、无控制字符，由 portal 层校验）
-  request_hash text NOT NULL,                    -- 规范化请求体（content + attachments）的 sha256：不一致 → 409 idempotency_key_reuse
-  status_code  int  NOT NULL,                    -- 首次响应状态码（回放原样返回）
-  response     jsonb NOT NULL,                   -- 首次响应体（回放原样返回）
-  created_at   timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (user_id, endpoint, key)
-);
--- 过期清理扫描索引（reaper 低频 DELETE created_at < now() - interval '24 hours'）
-CREATE INDEX idempotency_keys_created_idx ON idempotency_keys (created_at);
-
--- ----------------------------------------------------------------------------
 -- 4. 端口分配（规格 §8：DB 是真相，ports.json 与 Traefik 路由是派生）
 -- ----------------------------------------------------------------------------
 
