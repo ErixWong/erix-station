@@ -30,6 +30,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 账号与认证 | `users` / `login_sessions` / `login_pending` / `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.2/§2.7 |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
 | 会话与对话 | `chat_sessions` / `runs` / `messages` | 规格 §9.1 |
+| 写操作幂等 | `idempotency_keys` | portal.md §1.4（本轮实现；增量迁移 0001） |
 | 端口分配与路由 | `port_allocations` / `route_outbox` / `route_revisions` | 规格 §8 / topology.md §5/§8 |
 | 引擎持久化 | `transcript_rounds` / `run_checkpoints` / `run_events` | 规格 §9.2/§9.3 |
 | 工具与审批 | `tool_calls` / `tool_outputs` / `judge_decisions` / `approvals` / `artifacts` | 规格 §9.1 / topology.md §9 |
@@ -275,6 +276,21 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | `created_ip` / `created_ua` | 签发来源（审计/排障） |
 
 写入方 = portal（登录第一步）；消费方 = portal（登录第二步，单次原子消费）。
+
+### 1.25 `idempotency_keys` — 写操作幂等键台账（portal.md §1.4）
+
+POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)` 重复提交返回**首次结果**，不产生重复副作用（当前唯一使用者 `POST /api/sessions/:id/messages`，防断网重发产生两条 user 消息）。
+
+| 关键字段 | 语义 |
+|---|---|
+| `PRIMARY KEY (user_id, endpoint, key)` | 幂等键空间：按用户 + **具体端点（含路径参数）** + 客户端 key 隔离（同 key 跨 session 不串号） |
+| `request_hash` | 规范化请求体（`content` + `attachments`）的 `sha256`；命中且不一致 → `409 idempotency_key_reuse`（不重复执行副作用） |
+| `status_code` / `response` | 首次响应的状态码与响应体，回放时原样返回（`POST .../messages` = `202`） |
+| `created_at` | TTL 基准：命中判定带 `created_at > now() - interval '24 hours'`；过期行由 portal reaper 低频（≈1h）物理 `DELETE`（`idempotency.js` `purgeExpired`）；`idempotency_keys_created_idx` 供该扫描 |
+
+并发同 key：后到者抢写台账失败（同名行仍新鲜；`ON CONFLICT ... DO UPDATE ... WHERE 过期` 写入 0 行）后回查首次结果并回放；回查仍无 → `409 idempotency_conflict`（`retryable: true`）。写入方 = portal（HTTP 层包装，`portal/src/idempotency.js`）；读取方 = 同样只读本表命中判定（无其它消费者，不参与 SSE/状态机）。
+
+> **与 baseline/迁移的双写**：本表同时存在 baseline `schema.sql` §3.1（baseline 自包含，`psql -f` 空库可执行）与增量迁移 `deploy/migrations/0001-idempotency-keys.sql`（`IF NOT EXISTS` 幂等兜底）。
 
 ---
 

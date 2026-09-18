@@ -12,6 +12,7 @@ import * as auth from './auth.js';
 import * as migrate from './migrate.js';
 import * as projects from './projects.js';
 import * as sessions from './sessions.js';
+import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
@@ -208,6 +209,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof idempotency.IdempotencyError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable, err.details));
+        return;
+      }
       if (err instanceof internal.InternalError) {
         sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details));
         return;
@@ -402,18 +407,35 @@ async function handleArchiveSession(req, res, ctx, sessionId) {
   res.end();
 }
 
+/**
+ * POST /api/sessions/:id/messages（portal.md §4.3）：发用户消息 + 建 run 入队。
+ * 可选 `Idempotency-Key`（§1.4）：同 key 重复提交返回**首次结果**（同 message.id / run.id），
+ * 不产生第二条 user 消息/第二个 run，也**不重复副作用**（notify 唤醒只在首次执行路径发生，
+ * 因为 replay 路径不会调用 sessions.postMessage）。
+ */
 async function handlePostMessage(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
+  // 头校验先于读体：非法 key 快速失败，不读请求体
+  const key = idempotency.normalizeKey(req.headers['idempotency-key']);
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-  const result = await sessions.postMessage(ctx.pool, {
-    userId: session.user.id,
-    sessionId,
-    content: body?.content,
-    attachments: body?.attachments,
-    notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
-  });
-  return sendJson(res, 202, result);
+  const endpoint = `POST /api/sessions/${sessionId}/messages`; // 含路径参数：同 key 跨 session 不串号
+  const result = await idempotency.executeWithIdempotency(
+    ctx.pool,
+    { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash(body) },
+    async () => {
+      const posted = await sessions.postMessage(ctx.pool, {
+        userId: session.user.id,
+        sessionId,
+        content: body?.content,
+        attachments: body?.attachments,
+        notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
+      });
+      return { statusCode: 202, response: posted };
+    },
+  );
+  // 回放路径按首次 status_code（202）与首次 body 原样返回（§1.4）
+  return sendJson(res, result.statusCode, result.response);
 }
 
 async function handleStopSession(req, res, ctx, sessionId) {
@@ -465,6 +487,8 @@ async function handleSessionStream(req, res, ctx, sessionId) {
       [sessionId, lastEventId],
     );
     for (const row of replay.rows) {
+      // 补发期间缓冲溢出 → hub 已写 resync 并 end()：停止补发（写入被 writeSseEvent 静默跳过）
+      if (rec.resync) break;
       const seq = Number(row.seq);
       const data = JSON.stringify({
         seq, ts: row.ts?.toISOString?.() ?? row.ts,
@@ -477,6 +501,7 @@ async function handleSessionStream(req, res, ctx, sessionId) {
     internal.writeSseComment(res, 'connected'); // 首连不补发历史
   }
   internal.sessionClientGoLive(sessionId, rec, replayedSeq);
+  if (rec.resync) return; // 已判定需重同步（res.end 已调用）：跳过 ping 与心跳循环
   internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
 
   const pingTimer = setInterval(() => {
