@@ -70,7 +70,7 @@
     const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
-                lastSeq: 0, es: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null };
+                lastSeq: 0, es: null, esSessionId: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null };
 
     async function api(path, opts = {}) {
       const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -198,6 +198,7 @@
     async function openSession(id) {
       if (S.es) { S.es.close(); S.es = null; }
       S.sessionId = id; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
+      S.esSessionId = id;
       $('stream').innerHTML = '';
       renderSessions();
       const data = await api(`/api/sessions/${encodeURIComponent(id)}`);
@@ -208,16 +209,30 @@
       connectEvents(id);
     }
 
-    function connectEvents(id) {
-      const es = new EventSource(`/api/sessions/${encodeURIComponent(id)}/events`);
+    function connectEvents(id, lastEventId = null) {
+      // §5.2：带 ?last_event_id=<seq> 重连 → 服务端补发 seq > last_event_id 的事件；无参 = 首连不补发历史。
+      const q = lastEventId != null ? `?last_event_id=${encodeURIComponent(lastEventId)}` : '';
+      const es = new EventSource(`/api/sessions/${encodeURIComponent(id)}/events${q}`);
       S.es = es;
+      S.esSessionId = id;
       es.onmessage = () => {}; // 具名事件分发
       for (const type of ['round_start','round_end','attempt','recovering','recovered','usage',
                           'tool_use','tool_result','assistant_delta','reasoning_delta',
-                          'tool_call_delta','judge','run_end','ping']) {
-        es.addEventListener(type, (e) => handleEvent(type, e));
+                          'tool_call_delta','judge','run_end','ping','resync']) {
+        // 陈旧连接的事件一律忽略（重连后旧连接可能还有在途帧，防误判跳号触发重连风暴）
+        es.addEventListener(type, (e) => { if (S.es !== es) return; handleEvent(type, e); });
       }
       es.onerror = () => { /* EventSource 自动重连，带 Last-Event-ID */ };
+    }
+
+    // 需重同步（跳号 / 服务端缓冲溢出）：主动断开 + 带 last_event_id 重连补发（§5.1/§5.2）。
+    // 关键：重连成功（收回到达 seq）前**不推进 S.lastSeq**，否则丢失区间会被跳过。
+    function resyncEvents(why) {
+      const id = S.esSessionId ?? S.sessionId;
+      if (!id) return;
+      sep(`事件流需重同步（${why}），正在重连补发…`);
+      if (S.es) { try { S.es.close(); } catch { /* 忽略 */ } S.es = null; }
+      connectEvents(id, S.lastSeq);
     }
 
     function addMessage(m) {
@@ -248,7 +263,13 @@
     function handleEvent(type, e) {
       let d;
       try { d = e.data ? JSON.parse(e.data) : {}; } catch { return; } // 畸形事件忽略（§5.3）
-      if (typeof d.seq === 'number') S.lastSeq = Math.max(S.lastSeq, d.seq);
+      if (type === 'resync') { resyncEvents(d.reason === 'buffer_overflow' ? '服务端缓冲溢出' : (d.reason ?? 'resync')); return; }
+      if (typeof d.seq === 'number') {
+        // §5.1：session 内 seq 严格递增无空洞 → 跳号即事件丢失，必须带 last_event_id 重连补发。
+        // 跳号时**不更新** S.lastSeq（否则重连从跳号后的值续，漏掉丢失区间）。
+        if (S.lastSeq > 0 && d.seq > S.lastSeq + 1) { resyncEvents(`事件跳号 ${S.lastSeq} → ${d.seq}`); return; }
+        S.lastSeq = Math.max(S.lastSeq, d.seq);
+      }
       switch (type) {
         case 'ping': return;
         case 'round_start':
