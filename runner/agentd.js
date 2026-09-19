@@ -746,8 +746,12 @@ function cleanupRun(ctx) {
     const pid = ctx.workerPid;
     try { if (ctx.worker.connected) ctx.worker.kill('SIGTERM'); } catch {}
     if (pid) {
-      // M2：SIGTERM 后短宽限整组 SIGKILL，防 worker 忽略信号残留
-      setTimeout(() => killProcessGroup(pid, 'SIGKILL'), 2000);
+      // M2：SIGTERM 后短宽限整组 SIGKILL，防 worker 忽略信号残留。
+      // 审计 #37 评审：与 abortRun 的 5s timer 同样的 PID 复用防护——worker 已退出（workerPid=null）
+      // 或 ctx 已不在跑（state.runs 移除）时不得杀。
+      setTimeout(() => {
+        if (pid && ctx.workerPid === pid && state.runs.get(ctx.runId) === ctx) killProcessGroup(pid, 'SIGKILL');
+      }, 2000);
     }
   }
   cleanupWorktree(ctx); // M3

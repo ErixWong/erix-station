@@ -251,8 +251,13 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       throw new SessionError('run_in_progress', 'session has an active run', { httpStatus: 409 });
     }
 
+    // issue #37 评审（major）：必须同时排除 revoked_at 非空的容器——deprovision 前置事务先吊销 token
+    // 并释放网段（此时 status 可能还是 running），若只按 status 过滤，吊销后仍能建新 run，
+    // 而该 run 不在 offboard 的收敛快照里、容器随后被删 → 永久排队无人 claim。
     const container = await client.query(
-      `SELECT id FROM containers WHERE user_id = $1 AND status <> 'removed' ORDER BY created_at DESC LIMIT 1`,
+      `SELECT id FROM containers
+        WHERE user_id = $1 AND status <> 'removed' AND revoked_at IS NULL
+        ORDER BY created_at DESC LIMIT 1`,
       [userId],
     );
     if (!container.rows?.[0]) {
