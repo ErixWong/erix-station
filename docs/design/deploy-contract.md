@@ -24,6 +24,8 @@
 ## 1. 服务清单（镜像 pin / command / 运行用户 / restart）
 
 > 镜像取值见 env §10；**生产部署对每个镜像最终以不可变引用锁定（issue #27 双轨两形态：① repo digest `image@sha256:…`；② image ID `sha256:<imageId>`，目标机本地 build 时 RepoDigests 为空），禁止浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。P1 开发期可暂用 `<major>.<minor>` 类 tag 并记录 resolved digest。
+>
+> **运行时强制范围（审计 #34 F-E）**：portal 启动时 fail-closed 校验的**只有 `FDE_IMAGE`**（`portal/src/config.js` F12，双轨两形态）。`PORTAL_IMAGE` / `POSTGRES_IMAGE` / `TRAEFIK_IMAGE` / `STATION_DOCKER_PROXY_IMAGE` 经 compose 变量注入，portal 进程内看不到其实际引用 → **不属运行时校验范围，由部署流程保证**（部署记录留存 `docker inspect` 解析出的 digest，见 env 附录 B / runbook）。
 
 | 服务 | 镜像 | tag pin 要求 | command（ENTRYPOINT/CMD） | 运行用户 | restart | 部署期 |
 |---|---|---|---|---|---|---|

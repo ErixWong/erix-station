@@ -80,7 +80,13 @@ export function loadConfig(env = process.env) {
   //   `image@sha256:<digest>`（repo digest，push/pull 后才有）或 `sha256:<imageId>`（目标机本地
   //   build 的 image ID——本地 build 的 RepoDigests 为空，唯一不可变引用）；dev 允许 tag 但警告。
   const fdeImage = env.FDE_IMAGE || 'traefik/whoami';
-  const imageIsDigest = /@?sha256:[0-9a-f]{64}$/.test(fdeImage);
+  // 严格两分支（审计 #34 F-D）：旧的 `/@?sha256:[0-9a-f]{64}$/` 是 lax-accept——`repo@evilsha256:<hex>`、
+  // `任意串sha256:<hex>` 都能过（Docker 后续会拒，但校验口径与错误信息不符）。分支：
+  //   ① image ID：`sha256:<64hex>`
+  //   ② repo digest：`<合法镜像引用>@sha256:<64hex>`（引用可含 registry host:port / path / tag）
+  const imageIdRef = /^sha256:[0-9a-f]{64}$/;
+  const repoDigestRef = /^[A-Za-z0-9][A-Za-z0-9._\-/:]*@sha256:[0-9a-f]{64}$/;
+  const imageIsDigest = imageIdRef.test(fdeImage) || repoDigestRef.test(fdeImage);
   if (!imageIsDigest && !fdeDevMode) {
     throw new Error('FDE_IMAGE 必须为 image@sha256:<digest> 或 sha256:<imageId> 形态（生产模式；或显式 FDE_DEV_MODE=1 进入开发模式）');
   }
