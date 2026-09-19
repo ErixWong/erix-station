@@ -1104,7 +1104,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 |---|---|
 | `now` | 服务端时间（供 agentd 校时） |
 | `stop_run_ids` | portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run——**停止指令的兜底通道**（SSE 为主、心跳为备）；agentd 对列出的 run 执行 abort |
-| `revoked` | `true` = token 已吊销 / 容器被 offboard → agentd 停止领新任务、收敛在跑 run 后退出（**容器级**，非 HTTP 错误） |
+| `revoked` | 保留字段，**当前恒为 `false`**：吊销不走 200——`authenticateContainer` 对 `revoked_at` 非空的行在鉴权阶段直接 `401 token_revoked`（审计 #34 F-C；agentd 的 200 分支仅作同径兜底） |
 | `runs[]` | **逐 run 续租结果**。未出现在请求 `runs[]` 里的 run 不产生结果行 |
 | `runs[].lease` | `renewed`（claim_token 匹配，已续租 `lease_until = now + 90s` ⚠️）或 `lease_lost`（claim_token 不匹配——该 run 已被 re-claim / 租约易主） |
 | `runs[].lease_until` | 仅 `lease: renewed` 时返回（续租后的到期时刻） |
@@ -1113,7 +1113,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 语义（与 runner §4.2 U4 一致）：
 
 - **续租**：portal 对每个 run 校验 `claim_token` 匹配当前有效租约 → 续租（`lease_until = now + 90s` ⚠️）；不匹配 → `lease: lease_lost`。
-- **`lease_lost` vs `revoked`**：`lease_lost` 是 **run 级**（单个 run 的租约被取代）→ agentd **本地 abort 该 run 的 worker、丢弃其缓冲与 spool**，不再续传该 run 的任何写；`revoked: true` 是 **容器级**（token 吊销 / offboard）→ agentd 停领新任务、收敛在跑 run 后退出。二者都在 `200` 内表达，**不是 HTTP 错误**；`401/5xx` 才是整次心跳失败（agentd 指数退避重试）。
+- **`lease_lost` vs `revoked`**：`lease_lost` 是 **run 级**（单个 run 的租约被取代）→ agentd **本地 abort 该 run 的 worker、丢弃其缓冲与 spool**，不再续传该 run 的任何写；`revoked` 是 **容器级**（token 吊销 / offboard）→ agentd 停领新任务、drain（abort 全部在跑 run → 等 worker 退出 → 清理 worktree）后退出。`revoked` **不在 `200` 内表达**：吊销由鉴权阶段 `401 token_revoked` 给出（SSE revoke / claim 401 / heartbeat 401 三径同源，issue #22）；`401/5xx` 对非吊销原因才是整次心跳失败（指数退避重试）。
 - **停止兑底**：`stop_run_ids` 是 portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run 的兑底通道（SSE 为主、心跳为备）。
 
 幂等：天然幂等（覆盖写 `last_heartbeat`、续 lease）。portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**；run 级处置走租约到期 re-claim（runner §6.4）。
