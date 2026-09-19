@@ -239,8 +239,10 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
       }
       return { rows: [] };
     },
+    // 审计 #37：孤儿网络清理现走 withFdeLock(requireLock)——connect 需可用（advisory lock +
+    // 锁内重读复用上方 query 分支）；锁内重读的 JOIN 形式 SQL 返回空行 → 判孤儿 → 清理路径照走。
     async connect() {
-      throw new Error('unexpected connect in this test');
+      return { query: (sql, params) => this.query(sql, params), release() {} };
     },
     async end() {},
   };
@@ -653,7 +655,7 @@ function makeDeprovisionPool({ runRows = [], failOnRunsQuery = false, sqls = [] 
       return {
         async query(sql) {
           sqls.push(sql);
-          if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions')) {
+          if (sql.includes('FROM runs r') && sql.includes('JOIN run_queue')) {
             if (failOnRunsQuery) throw new Error('runs query exploded');
             return { rows: runRows };
           }

@@ -386,11 +386,14 @@ export function fdeContainerIp(subnet) {
 
 /** per-fde advisory lock：串行化同一 FDE 的 Docker 变更（provision/reconcile/deprovision），F7/F10。
  *  单测 fake pool 无 connect 时跳过（进程内互斥仍靠 ON CONFLICT / 409）。 */
-async function withFdeLock(pool, fdeName, fn) {
+async function withFdeLock(pool, fdeName, fn, { requireLock = false } = {}) {
   let client;
   try {
     client = await pool.connect();
   } catch {
+    // requireLock（评审 major）：孤儿网络清理的安全性依赖本锁——连接失败时**跳过**比无锁执行安全
+    // （无锁执行会与 onboard/deprovision 并发，TOCTOU 防护失效）。默认保持旧 fallback 语义。
+    if (requireLock) throw new Error(`fde lock ${fdeName}: pool connect failed (requireLock)`);
     return fn();
   }
   const key = `fde:${fdeName}`;
@@ -570,6 +573,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
            WHERE u.fde_name = $1 AND n.state IN ('allocated', 'active')`,
           [fdeName],
         );
+        // （requireLock：连接失败时上方抛错 → 外层 catch 跳过该网络，本轮不清理）
         if (still.rows.length > 0) return; // 锁内确认：已是 desired → 不删
         log.warn?.(`[provisioner] orphan network detected: ${name} (removing)`);
         await pool.query(
@@ -579,7 +583,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
         ).catch(() => {});
         const rm = await removeFdeNetwork(docker, name, { log });
         if (rm.ok) stats.orphanNetworksRemoved += 1;
-      });
+      }, { requireLock: true });
     } catch (err) {
       log.warn?.(`[provisioner] orphan network ${name} cleanup failed: ${err.message}`);
     }
@@ -704,7 +708,20 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
  * ＋合成 `run_end`（client_event_id = `<runId>:final:run_end`，seq 用 §7.3 统一分配器）。
  * best-effort：失败只告警、不回滚已提交的吊销（安全优先）；返回合成的 run_end 供调用方推 SSE。
  */
+/**
+ * 锁顺序说明（评审 blocker，两轮）：三方事务必须同序才能避免 deadlock——
+ *   reaper（internal.js）：runs → run_queue → chat_sessions(allocSeq)
+ *   stopSession（sessions.js）：chat_sessions → runs
+ *   postMessage（sessions.js）：chat_sessions → runs（新插入）
+ * offboard 若在一个事务里「锁 runs 再 allocSeq 锁 sessions」，与 stopSession 反序；若「先锁 sessions
+ * 再锁 runs」，与 reaper 反序——**任何单事务全序都会与某一方成环**。
+ * 解法：拆两步。事务 A 只按 reaper 同序（runs → queue）终态化，**不碰 sessions**；
+ * run_end 合成放独立小事务 B（只碰 sessions 单行），锁持有时间极短、不与 runs 锁共存 → 无环。
+ * 代价：A 与 B 之间存在「runs 已 finished 但 run_end 未合成」的毫秒级窗口——进程恰好死在中间则
+ * run_end 缺失（DB 状态仍是 finished，前端刷新可见；offboard 场景罕见，记 #36 残余）。
+ */
 async function terminateActiveRuns(pool, { userId, log = console } = {}) {
+  // 事务 A：终态化（锁序 runs → run_queue，与 reaper 完全同序；不碰 chat_sessions）
   const runEnds = [];
   let client;
   try {
@@ -712,16 +729,13 @@ async function terminateActiveRuns(pool, { userId, log = console } = {}) {
     // 不得让 offboard 在「token 已吊销、资源未清理」的中间态抛出。
     client = await pool.connect();
     await client.query('BEGIN');
-    // ⚠️ 锁顺序必须与 stopSession（sessions.js：先锁 chat_sessions 再更新 runs）一致，否则
-    // 「offboard × 用户停止」并发会形成 chat_sessions/runs 反序 deadlock（评审 blocker）：
-    // FROM 以 s 打头 + FOR UPDATE OF s, r，两个事务都按 s → r 的顺序拿锁。
     const active = await client.query(
       `SELECT r.id, r.session_id, q.attempts
-         FROM chat_sessions s
-         JOIN runs r ON r.session_id = s.id
+         FROM runs r
          JOIN run_queue q ON q.run_id = r.id
-        WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
-        FOR UPDATE OF s, r`,
+        WHERE r.session_id IN (SELECT id FROM chat_sessions WHERE user_id = $1)
+          AND r.status IN ('queued', 'running', 'cancelling')
+        FOR UPDATE OF r`,
       [userId],
     );
     for (const row of active.rows ?? []) {
@@ -737,31 +751,50 @@ async function terminateActiveRuns(pool, { userId, log = console } = {}) {
           WHERE id=$1 AND status IN ('queued', 'running', 'cancelling')`,
         [row.id],
       );
-      const seq = await allocSeq(client, row.session_id);
-      const payload = {
-        termination: { reason: 'aborted' },
-        usage: { input_tokens: 0, output_tokens: 0 },
-        rounds: 0,
-        attempt: Number(row.attempts ?? 1),
-      };
-      await client.query(
-        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
-         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
-         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
-        [row.id, row.session_id, seq, `${row.id}:final:run_end`, JSON.stringify(payload)],
-      );
-      runEnds.push({ session_id: row.session_id, run_id: row.id, seq, payload });
+      runEnds.push({ session_id: row.session_id, run_id: row.id, attempt: Number(row.attempts ?? 1) });
     }
     await client.query('COMMIT');
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await client?.query('ROLLBACK').catch(() => {});
     // 不抛：offboard 的安全语义（token 已吊销）不因业务收敛失败而回滚。
     log.warn?.(`[provisioner] offboard terminate active runs failed (user ${userId}): ${err.message}`);
     return [];
   } finally {
     client?.release();
   }
-  return runEnds;
+  if (runEnds.length === 0) return [];
+
+  // 事务 B：合成 run_end（每 run 一个小事务，只锁 chat_sessions 单行；不持 runs 锁 → 无环）
+  const events = [];
+  for (const e of runEnds) {
+    let c2;
+    try {
+      c2 = await pool.connect();
+      await c2.query('BEGIN');
+      const seq = await allocSeq(c2, e.session_id);
+      const payload = {
+        termination: { reason: 'aborted' },
+        usage: { input_tokens: 0, output_tokens: 0 },
+        rounds: 0,
+        attempt: e.attempt,
+      };
+      await c2.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [e.run_id, e.session_id, seq, `${e.run_id}:final:run_end`, JSON.stringify(payload)],
+      );
+      await c2.query('COMMIT');
+      events.push({ session_id: e.session_id, run_id: e.run_id, seq, payload });
+    } catch (err) {
+      await c2?.query('ROLLBACK').catch(() => {});
+      // run_end 缺失不回滚终态（runs 已 finished 是真相）；记告警。
+      log.warn?.(`[provisioner] offboard run_end synthesis failed (run ${e.run_id}): ${err.message}`);
+    } finally {
+      c2?.release();
+    }
+  }
+  return events;
 }
 
 /** offboarding（容器+网络）：**先吊销 token + 释放网段（一个事务）→ 再删 Docker 资源 → status 收敛**。
