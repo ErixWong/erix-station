@@ -5,19 +5,27 @@
 //   - portal.md §1.4（写操作幂等）与 §4.3（POST .../messages 支持 Idempotency-Key）。
 //   - 表：`idempotency_keys`（**仅由**增量迁移 deploy/migrations/0001-idempotency-keys.sql 提供；
 //     baseline docs/data/schema.sql 自 P1 冻结、不改动，见 deploy/migrations/README.md）。
-//   - 流程（**先占位后执行**，F1 裁决：消除「先执行后记账」的双执行窗口）：
+//   - 流程（**先占位后执行 + 记账并入业务事务**，F1/G2 裁决）：
 //     ① `state='done'` 且未过期（TTL 24h）→ 回放首次结果（不执行 fn，不产生第二次副作用）；
 //     ② 否则**先占位**（占位语句：无同名行 → 插入；同名行仍新鲜 → 0 行，等价于 `ON CONFLICT DO NOTHING`；
 //        同名 `done` 行已过期 → 原子覆盖，故不必等 reaper 清过期行也能重发）——
 //        并发同 key 只有一个请求能占到，故**fn 至多执行一次**；
-//     ③ 占到占位 → 执行 fn() → `UPDATE` 本行 `state='done'` + status_code/response → 返回；
-//        fn() 抛错 → `DELETE` 占位行后原样 rethrow（释放 key，客户端可重试；不把瞬时错误钉成永久结果）；
+//     ③ 占到占位 → 执行 `fn(record)`；fn 在**自己的业务事务内**调用 `record(client, statusCode, response)`
+//        把台账行改为 `done`（同 client 同事务）→ 业务写入与记账**同一次 COMMIT**，
+//        故「同 key 至多一次副作用（记账与业务写入同事务）」（崩溃窗口归零）；
+//        fn 未调用 record（向后兼容，见 record 说明）→ 本模块在 fn 返回后补记（该路径仍有
+//        「业务已提交、记账未提交」的残余窗口，故不绝对化）；
+//        fn 抛错 → `DELETE` 占位行后原样 rethrow（释放 key，客户端可重试；不把瞬时错误钉成永久结果）；
 //     ④ 占位 0 行（并发竞争/残留）→ 读现有行判定：
 //        - `done` 且未过期 → 回放（request_hash 不一致 → 409 idempotency_key_reuse）；
 //        - `done` 但已过期 → 视同不存在，重试占位（原子覆盖过期行）；
 //        - `in_progress` 且 < IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES（5 分钟）→ 409 idempotency_conflict
 //          （retryable: true，先到先得；**输者不执行 fn**）；
 //        - `in_progress` 且 ≥ 5 分钟（持有者崩溃残留）→ 视同可覆盖：UPDATE 抢回为本次 in_progress 后执行 fn。
+//   - **owner fencing（claim_token，G2）**：占位/抢回时写入新的 `crypto.randomUUID()`；
+//     `record` / 补记（writeDone） / `release` 一律带 `AND claim_token = $` 条件。A 崩溃后 B 抢回会改写 token，
+//     于是迟到的 A 的记账/释放全部 0 行：A 的 `record()` 抛 409（业务事务随之回滚，不会提交第二次副作用），
+//     迟到的 A 的 release 不会删掉 B 的占位。
 //   - TTL 24h：命中判定带 `created_at > now() - interval '24 hours'`；过期行语义上等同不存在
 //     （由占位语句的 `ON CONFLICT ... DO UPDATE ... WHERE 过期` 原子覆盖），
 //     并另由 reaper 低频调用 `purgeExpired` 物理清理（portal/src/internal.js startReaperLoop）。
@@ -156,69 +164,80 @@ function isStaleInProgress(row, now = Date.now()) {
 }
 
 /**
- * 占位：抢写 `state='in_progress'` 本行。
+ * 占位：抢写 `state='in_progress'` 本行（同时写入本次请求的 owner 标识 `claim_token`）。
  *   - 无同名行 → 插入成功（1 行）；
  *   - 同名行仍新鲜（`done` 未过期 / `in_progress` 未超时）→ 0 行（并发输者，由调用方判定）；
  *   - 同名 `done` 行已过期 → 原子覆盖为本轮占位（1 行，避免过期行拦住重发）。
  * 返回是否占到占位。
  */
-async function claim(pool, { userId, endpoint, key, hash }) {
+async function claim(pool, { userId, endpoint, key, hash, claimToken }) {
   const res = await pool.query(
-    `INSERT INTO idempotency_keys (user_id, endpoint, key, request_hash, state, status_code, response)
-     VALUES ($1, $2, $3, $4, 'in_progress', NULL, NULL)
+    `INSERT INTO idempotency_keys (user_id, endpoint, key, request_hash, state, status_code, response, claim_token)
+     VALUES ($1, $2, $3, $4, 'in_progress', NULL, NULL, $5)
      ON CONFLICT (user_id, endpoint, key) DO UPDATE
         SET request_hash = EXCLUDED.request_hash,
             state        = 'in_progress',
             status_code  = NULL,
             response     = NULL,
+            claim_token  = EXCLUDED.claim_token,
             created_at   = now()
       WHERE idempotency_keys.state = 'done'
         AND idempotency_keys.created_at <= now() - interval '${IDEMPOTENCY_TTL_HOURS} hours'
      RETURNING 1 AS claimed`,
-    [userId, endpoint, key, hash],
+    [userId, endpoint, key, hash, claimToken],
   );
   return (res.rows?.length ?? 0) > 0;
 }
 
 /**
  * 抢回崩溃残留的 in_progress 占位（≥ IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES）。
- * 条件 UPDATE 保证并发下只有一个请求能抢到（其余 0 行 → 继续走 conflict/回查判定）。
+ * 条件 UPDATE 保证并发下只有一个请求能抢到（其余 0 行 → 继续走 conflict/回查判定）；
+ * 抢回时**改写 claim_token**——被抢回方的迟到记账/释放因此全部失配（fencing）。
  */
-async function takeOverStale(pool, { userId, endpoint, key, hash }) {
+async function takeOverStale(pool, { userId, endpoint, key, hash, claimToken }) {
   const res = await pool.query(
     `UPDATE idempotency_keys
         SET request_hash = $4,
             state        = 'in_progress',
             status_code  = NULL,
             response     = NULL,
+            claim_token  = $5,
             created_at   = now()
       WHERE user_id = $1 AND endpoint = $2 AND key = $3
         AND state = 'in_progress'
         AND created_at <= now() - interval '${IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES} minutes'
      RETURNING 1 AS claimed`,
-    [userId, endpoint, key, hash],
+    [userId, endpoint, key, hash, claimToken],
   );
   return (res.rows?.length ?? 0) > 0;
 }
 
-/** 落最终结果：占位行 → `state='done'` + 首次 status_code/response。 */
-async function complete(pool, { userId, endpoint, key, statusCode, response }) {
-  await pool.query(
+/**
+ * 台账转 `done` 的**带所有者条件** UPDATE（fencing 的唯一写点）：
+ *   `state='in_progress' AND claim_token = $6` 两个条件都必须成立。
+ * 返回是否命中本 owner 的占位行；0 行 = 本请求已不是 owner（被抢回/释放/清理）。
+ * `runner` 可以是业务事务的 client（record 路径：同 client 同事务）或 pool（补记路径）。
+ */
+async function writeDone(runner, { userId, endpoint, key, claimToken, statusCode, response }) {
+  const res = await runner.query(
     `UPDATE idempotency_keys
         SET state = 'done', status_code = $4, response = $5
       WHERE user_id = $1 AND endpoint = $2 AND key = $3
-        AND state = 'in_progress'`,
-    [userId, endpoint, key, statusCode, JSON.stringify(response)],
+        AND state = 'in_progress'
+        AND claim_token = $6`,
+    [userId, endpoint, key, statusCode, JSON.stringify(response), claimToken],
   );
+  return (res.rowCount ?? res.rows?.length ?? 0) > 0;
 }
 
-/** 释放占位（fn 抛错路径）：删除本请求的 in_progress 占位行，客户端可原样重试。 */
-async function release(pool, { userId, endpoint, key }) {
+/** 释放占位（fn 抛错路径）：删除**本 owner 的** in_progress 占位行，客户端可原样重试。 */
+async function release(pool, { userId, endpoint, key, claimToken }) {
   await pool.query(
     `DELETE FROM idempotency_keys
       WHERE user_id = $1 AND endpoint = $2 AND key = $3
-        AND state = 'in_progress'`,
-    [userId, endpoint, key],
+        AND state = 'in_progress'
+        AND claim_token = $4`,
+    [userId, endpoint, key, claimToken],
   );
 }
 
@@ -243,20 +262,40 @@ function conflictError() {
 }
 
 /**
- * 幂等执行包装（**先占位后执行**）。
+ * 本请求已**不再是占位 owner**（被抢回/释放/清理）——`record()` 命中 0 行时抛出。
+ * 语义上就是 409 `idempotency_conflict`（retryable）：fn 的业务事务会随之回滚，
+ * 不会提交第二次副作用；客户端重试会拿到新 owner 的结果（回放）。
+ */
+function lostClaimError() {
+  return new IdempotencyError(
+    'idempotency_conflict',
+    '本请求的幂等占位已被其它请求接管（owner fencing），本次业务写入已回滚，请重试',
+    { httpStatus: 409, retryable: true, details: { field: 'Idempotency-Key' } },
+  );
+}
+
+/**
+ * 幂等执行包装（**先占位后执行，记账并入业务事务**）。
  * @param pool    pg pool（或测试用 fake pool）
- * @param ctx     { userId, endpoint, key, requestHash }
+ * @param ctx     { userId, endpoint, key, requestHash, log? }
  *                endpoint 为**具体端点**（含路径参数，如 `POST /api/sessions/<id>/messages`）——
  *                同 key 跨 session 不串号；key 为 null 时无幂等语义。
- * @param fn      async () => ({ statusCode, response })，**至多执行一次**（占位赢家才执行）；
+ *                log 用于非致命告警（release 失败、补记失配），默认 console。
+ * @param fn      `async (record) => ({ statusCode, response })`，**至多执行一次**（占位赢家才执行）；
  *                副作用（如 notify 唤醒）应留在 fn 内，回放路径绝不执行。
+ *                `record(client, statusCode, response)`：**在 fn 自己的业务事务内**调用，
+ *                把台账行改为 done（同 client 同事务）——业务写入与记账同一次 COMMIT。
+ *                fn 可以不调用它（向后兼容）：此时由本模块在 fn 返回后补记（残余窗口，见文件头）。
  * @returns { replayed, statusCode, response }
  */
-export async function executeWithIdempotency(pool, { userId, endpoint, key, requestHash: hash }, fn) {
+export async function executeWithIdempotency(pool, { userId, endpoint, key, requestHash: hash, log = console }, fn) {
   if (key == null) {
     const fresh = await fn();
     return { replayed: false, ...fresh };
   }
+
+  // 本次请求的 owner 标识：随占位写入，并作为 record/补记/release 的 fencing 条件
+  const claimToken = crypto.randomUUID();
 
   let owned = false;
   for (let attempt = 0; attempt < MAX_CLAIM_ATTEMPTS && !owned; attempt += 1) {
@@ -265,7 +304,7 @@ export async function executeWithIdempotency(pool, { userId, endpoint, key, requ
     if (done) return replayHit(done, hash);
 
     // ② 先占位：并发同 key 只有一个请求能占到（其余 0 行）→ fn 至多执行一次
-    if (await claim(pool, { userId, endpoint, key, hash })) {
+    if (await claim(pool, { userId, endpoint, key, hash, claimToken })) {
       owned = true;
       break;
     }
@@ -278,20 +317,57 @@ export async function executeWithIdempotency(pool, { userId, endpoint, key, requ
       continue; // 过期完成行：本轮 claim 的 ON CONFLICT 应已覆盖；走到这里说明竞态，重试
     }
     if (!isStaleInProgress(row)) throw conflictError(); // in_progress 未超时：先到先得，输者不执行 fn
-    if (await takeOverStale(pool, { userId, endpoint, key, hash })) owned = true; // 崩溃残留 → 抢回后执行
+    if (await takeOverStale(pool, { userId, endpoint, key, hash, claimToken })) owned = true; // 崩溃残留 → 抢回后执行
   }
   if (!owned) throw conflictError();
 
-  // ④ 本请求持有占位 → 执行唯一一次副作用，并按结果落台账
+  // ④ 记账回调（G2）：交给 fn 在**它自己的业务事务内**调用 —— 消息/run 的写入与台账转 done
+  //    同一 client、同一事务提交，故崩溃窗口归零（portal.md §1.4）。
+  let recorded = null;
+  const record = async (client, statusCode, response) => {
+    if (!client || typeof client.query !== 'function') {
+      // 编程错误（不是请求错误）：必须传业务事务的 client，否则记账会落在别的连接/事务上
+      throw new TypeError('record(client, statusCode, response)：client 必须是业务事务的 client（同 client 同事务记账）');
+    }
+    if (!(await writeDone(client, { userId, endpoint, key, claimToken, statusCode, response }))) {
+      // 占位已被其它 owner 接管（fencing）：抛 409 → fn 的事务回滚（不提交第二次副作用）→ 客户端重试拿回放
+      throw lostClaimError();
+    }
+    recorded = { statusCode, response };
+    return recorded;
+  };
+
+  // ⑤ 本请求持有占位 → 执行唯一一次副作用（fn 自行决定是否在事务内调 record）
   let fresh;
   try {
-    fresh = await fn();
+    fresh = await fn(record);
   } catch (err) {
-    // 释放占位：客户端可原样重试（不落失败态，避免把一次瞬时错误钉成永久结果）
-    await release(pool, { userId, endpoint, key }).catch(() => {});
+    // 释放占位：客户端可原样重试（不落失败态，避免把一次瞬时错误钉成永久结果）。
+    // 释放失败**不再静默吞**：告警后照旧 rethrow 原错误（占位最迟在 stale 窗口后由后续请求抢回）。
+    try {
+      await release(pool, { userId, endpoint, key, claimToken });
+    } catch (releaseErr) {
+      log?.warn?.(
+        `[idempotency] 占位释放失败（endpoint=${endpoint}）：${releaseErr?.message}；` +
+          `${IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES} 分钟后可由后续请求抢回`,
+      );
+    }
     throw err;
   }
-  await complete(pool, { userId, endpoint, key, statusCode: fresh.statusCode, response: fresh.response });
+
+  // ⑥ fn 已在自身事务内记账（record 路径）→ 台账已是 done，直接返回；
+  //    否则（fn 未调用 record）走补记路径——该路径仍有「业务已提交、记账未提交」的残余窗口（文件头有注）。
+  if (recorded === null) {
+    const done = await writeDone(pool, {
+      userId, endpoint, key, claimToken, statusCode: fresh.statusCode, response: fresh.response,
+    });
+    if (!done) {
+      log?.warn?.(
+        `[idempotency] 台账补记未命中本 owner（claim_token 失配，endpoint=${endpoint}）：` +
+          '该调用方未使用 record 同事务记账，存在既知残余窗口（portal.md §1.4）',
+      );
+    }
+  }
   return { replayed: false, statusCode: fresh.statusCode, response: fresh.response };
 }
 

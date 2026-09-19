@@ -90,7 +90,7 @@
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
 | 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `port_quota_exceeded` / `idempotency_key_reuse` | 状态冲突，各端点分别列出 | 否 |
-| 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），稍后重试即可拿到首次结果（§1.4） | 是 |
+| 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
@@ -113,8 +113,10 @@
 
 **实现口径**（本轮实现，P1）：
 
-- **台账落库**：`idempotency_keys`（`PRIMARY KEY (user_id, endpoint, key)`；由增量迁移 `deploy/migrations/0001-idempotency-keys.sql` 提供，baseline `schema.sql` 自 P1 冻结、不含本表）。`endpoint` 为**具体端点含路径参数**（如 `POST /api/sessions/<id>/messages`）——同 key 跨 session 不串号；`request_hash` = 规范化请求体（`content` + `attachments` 的 `{kind,path,name}` 子集）的 `sha256`。
-- **先占位后执行**（`state` 列）：① `state='done'` 且未过期（TTL 24h）→ 直接回放；② 否则先 `INSERT ... state='in_progress'` **占位**（并发同 key 只有一个请求能占到，故副作用**至多执行一次**）；③ 占到占位 → 执行 → `UPDATE state='done'` + 落 `status_code`/`response` → 返回；执行抛错 → **删除占位行**后原样报错（释放 key，客户端可原样重试，不把瞬时错误钉成永久结果）。
+- **台账落库**：`idempotency_keys`（`PRIMARY KEY (user_id, endpoint, key)`；由增量迁移 `deploy/migrations/0001-idempotency-keys.sql` 提供，baseline `schema.sql` 自 P1 冻结、不含本表）。`endpoint` 为**具体端点含路径参数**（如 `POST /api/sessions/<id>/messages`）——同 key 跨 session 不串号；`request_hash` = 规范化请求体（`content` + `attachments` 的 `{kind,path,name}` 子集）的 `sha256`；`claim_token` = 占位持有者标识（`crypto.randomUUID()`，占位/抢回时写入，`done` 行保留最后一次的值）。
+- **先占位后执行 + 记账并入业务事务**（`state` 列）：① `state='done'` 且未过期（TTL 24h）→ 直接回放；② 否则先 `INSERT ... state='in_progress'` **占位**（并发同 key 只有一个请求能占到，故副作用**至多执行一次**）；③ 占到占位 → 执行 `fn(record)`：fn **在自己的业务事务内**调 `record(client, statusCode, response)` 把台账行转 `done`（**同 client 同事务**）——业务写入（user 消息 + run + 队列）与记账**同一次 COMMIT**，故**同 key 至多一次副作用（记账与业务写入同事务）**；执行抛错 → **删除占位行**后原样报错（释放 key，客户端可原样重试，不把瞬时错误钉成永久结果）。
+- **owner fencing（`claim_token`）**：`record` / 补记 / 释占位一律带 `AND claim_token = $` 条件。占位持有者崩溃超 5 分钟被后续请求抢回时会**改写 token**，故迟到的旧持有者的记账/释放全部 0 行——旧持有者 `record` 命中 0 行即抛 `409 idempotency_conflict`（`retryable: true`），其业务事务随之回滚，**不会提交第二次副作用**。
+- **不绝对化的残余窗口**：若 `fn` **未**调用 `record`（未接入同事务记账的调用方），退回「业务提交后由幂等层补记」的旧路径，该路径仍存在「业务已提交、记账未提交」的极窄崩溃窗口（补记命中 0 行时告警但不报错）。**当前唯一使用者 `POST /api/sessions/<id>/messages` 已接入 `record`，故该端点无此窗口**——后续端点接入幂等时必须一并接入 `record`，否则退回有窗口的路径。
 - **TTL 24h**：只有 `created_at > now() - interval '24 hours'` 的完成行参与命中；过期行语义上等同不存在（重发时由占位语句的条件 upsert 原子覆盖），物理清理由 portal reaper 低频（≈1h）`DELETE`（`idempotency.js` `purgeExpired`）。
 - **命中回放**：`request_hash` 一致 → 按首次 `status_code`（`POST .../messages` = `202`）与首次响应体**原样返回**，且**不重复副作用**（不重复唤醒 runner、不产生第二条 user 消息/第二个 run）。
 - **同 key 不同载荷**：`request_hash` 不一致 → `409 idempotency_key_reuse`（不执行首次副作用的第二遍）。
@@ -635,7 +637,7 @@ station-portal user enable  --login <login>
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |
 
-> 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。实现口径：TTL 24h；**先占位后执行**（`in_progress` 占位 → `done` 完成，副作用至多一次）；同 key 不同载荷 → `409 idempotency_key_reuse`；并发同 key 未收敛（占位 < 5 分钟）→ `409 idempotency_conflict`（`retryable: true`，稍后重试拿首次结果）；重放路径不重复副作用（不重复唤醒 runner）。
+> 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。实现口径：TTL 24h；**先占位后执行 + 记账并入业务事务**（`in_progress` 占位 → 业务事务内 `record()` 转 `done`，同一次 COMMIT，故「同 key 至多一次副作用（记账与业务写入同事务）」）；`claim_token` owner fencing 使被抢回的旧持有者的迟到记账/释放失效（§1.4）；同 key 不同载荷 → `409 idempotency_key_reuse`；并发同 key 未收敛（占位 < 5 分钟）→ `409 idempotency_conflict`（`retryable: true`，稍后重试拿首次结果）；重放路径不重复副作用（不重复唤醒 runner）。
 
 ### 4.4 `GET /api/sessions/:id/events`（SSE）
 
