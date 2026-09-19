@@ -47,6 +47,9 @@ test('F12 prod（审计 #34 F-D）：lax-accept 收紧——伪 sha256: 尾缀�
     `repo:tag:extra@sha256:${HEX64}`,// tag 中出现第二个冒号
     `repo/FOO@sha256:${HEX64}`,      // path 段大写（repository 必须小写）
     `repo./x@sha256:${HEX64}`,       // path 段以分隔符结尾
+    // 评审 B：单标签首段大写——docker 视其为 namespace（须小写），不得借 host 解释放行
+    `FOO/bar@sha256:${HEX64}`,
+    `Foo/bar@sha256:${HEX64}`,
   ];
   for (const img of bad) {
     assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: img }), /image@sha256/, `应拒绝：${img}`);
@@ -60,6 +63,10 @@ test('F12 prod（审计 #34 F-D）：合法引用形态不误伤（registry/tag/
     `registry.example.com:8443/ns/sub/fde:v2@sha256:${HEX64}`,
     `fde@sha256:${HEX64}`,
     `sha256:${HEX64}`,
+    // docker 允许 `__` / 多个 `-` 作名称段分隔符（评审 B info：旧模式会误拒，fail-closed 但口径不符）
+    `foo__bar@sha256:${HEX64}`,
+    `foo--bar@sha256:${HEX64}`,
+    `foo.bar@sha256:${HEX64}`,
   ];
   for (const img of good) {
     assert.equal(loadConfig({ ...PROD, FDE_IMAGE: img }).fdeImage, img, `应放行：${img}`);

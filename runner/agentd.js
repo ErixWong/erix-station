@@ -107,11 +107,17 @@ function makeRunCtx(runId) {
 // ---------------------------------------------------------------------------
 const BACKOFF = [1000, 2000, 5000, 10000, 30000];
 
-/** 等未完成的终态补报（评审 A：fire-and-forget 的 PUT 不得被 process.exit 截断）；graceMs 上限防卡死。 */
+/**
+ * 等未完成的终态补报（评审 A：fire-and-forget 的 PUT 不得被 process.exit 截断）。
+ * 循环等待（非单次快照）：等待期间 onWorkerExit 仍可能把新的补报放进 pendingReports；
+ * 总预算 graceMs 封顶，超时即放行（不阻塞容器停止）。调用顺序：**drainRuns 之后**调用。
+ */
 async function drainPendingReports(graceMs = 2000) {
-  if (state.pendingReports.size === 0) return;
-  const pending = [...state.pendingReports].map((p) => p.catch(() => {}));
-  await Promise.race([Promise.all(pending), sleep(graceMs)]);
+  const deadline = Date.now() + graceMs;
+  while (state.pendingReports.size > 0 && Date.now() < deadline) {
+    const pending = [...state.pendingReports].map((p) => p.catch(() => {}));
+    await Promise.race([Promise.all(pending), sleep(Math.max(1, deadline - Date.now()))]);
+  }
 }
 
 function sleep(ms) {
@@ -951,9 +957,11 @@ function shutdown() {
     log('warn', 'shutdown hard exit (drain did not finish)');
     process.exit(0);
   }, 15000);
-  void drainPendingReports()
-    .then(() => drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) }))
-    .then((r) => log('info', 'shutdown drain done', { drained: r.drained, pending: r.pending }))
+  void drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) })
+    .then((r) => {
+      log('info', 'shutdown drain done', { drained: r.drained, pending: r.pending });
+      return drainPendingReports(); // 同上：drain 期间才产生的新补报
+    })
     .finally(() => { clearTimeout(hardExit); process.exit(0); });
 }
 
@@ -985,8 +993,10 @@ async function main() {
   // 审计 #34 F-A（major）：不能盲退——先 drain（等 worker 真退出、deadline 后强杀）
   // 再退出，否则：① abortRun 的 5s SIGKILL timer 随进程消失 → 挂住的 worker 进程组残留；
   // ② onWorkerExit 不跑 → cleanupRun 不跑 → worktree 残留（违反 D8「隔离单元 = worktree」）。
-  await drainPendingReports();
   const drained = await drainRuns([...state.runs.values()], { kill: killProcessGroup, log: (m, e) => log('warn', m, e) });
+  // 顺序（评审 A 定向复核）：必须**先 drain runs 再等补报**——onWorkerExit 在 drain 期间才把新的补报
+  // 放进 pendingReports；反序（先等补报）会漏掉这一批，drainRuns 返回后立即 exit 即截断 PUT。
+  await drainPendingReports();
   log('info', 'agentd exiting', { revoke: state.revokeReason, drained: drained.drained, pending: drained.pending });
   process.exit(0);
 }
@@ -995,9 +1005,9 @@ main().catch(async (err) => {
   log('error', 'agentd fatal', { err: String(err?.stack ?? err) });
   // 审计 #34 评审 A（major）：fatal 可能发生在 worker 已启动之后——与正常退出同等要求：
   // 先给未完成的补报留时间，再 drain worker（短 deadline：已是异常路径，不拖长容器退出）。
-  await drainPendingReports(1000).catch(() => {});
   await drainRuns([...state.runs.values()], {
     deadlineMs: 3000, killGraceMs: 1000, kill: killProcessGroup, log: (m, e) => log('warn', m, e),
   }).catch(() => {});
+  await drainPendingReports(1000).catch(() => {}); // 同上：drain 期间才产生的新补报
   process.exit(1);
 });
