@@ -411,6 +411,7 @@ async function upsertContainerRow(pool, { userId, fdeName, containerName, tokenH
        runner_token_hash = EXCLUDED.runner_token_hash,
        token_generation = containers.token_generation + 1,
        status = 'creating',
+       revoked_at = NULL,  -- issue #22 F1：deprovision→重新 provision 的同一行必须清吊销标记，否则新 agentd 永久 401 DOA
        image = EXCLUDED.image,
        agent_version = EXCLUDED.agent_version,
        rotated_at = now(),
@@ -568,7 +569,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
       if (dbRow) {
         await pool.query(
           `UPDATE containers SET runner_token_hash = $2, token_generation = token_generation + 1,
-              status = 'creating', rotated_at = now(), updated_at = now() WHERE id = $1`,
+              status = 'creating', revoked_at = NULL, rotated_at = now(), updated_at = now() WHERE id = $1`,
           [dbRow.id, tokenHash],
         );
         containerId = dbRow.id;
