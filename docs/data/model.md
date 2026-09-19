@@ -37,7 +37,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 用量与审计 | `usage_ledger` / `audit_log` | 规格 §11.4 / §14 |
 | 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
 | 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
-| LLM 网关绑定 | `fde_llm_bindings` | 规格 §11.3 / topology.md §4-L7 |
+| LLM 配置 | `fde_llm_bindings`（扩列，migration 0002）/ `llm_providers` / `llm_models`（master-detail，migration 0002 新增） | issue #38（去 LiteLLM hub、上游直发 per-FDE key） |
 | 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
 | 迁移台账 | `schema_migrations` | deploy-contract.md §3（A6 定稿） |
 
@@ -222,8 +222,11 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `key_alias` | 业务别名（如 `alice@client-x`），供用量对账映射（规格 §11.3） |
 | `state` / `generation` | 状态机见 §2.7；`generation` 为虚拟 key 代次（轮换 +1，旧代次在网关吊销） |
 | `revoked_at` / `rotated_at` | 吊销/轮换时刻 |
+| `provider_id` | → `llm_providers.id`（上游供应商；migration 0002 新增列） |
+| `api_key` | per-FDE 上游明文 key（migration 0002 新增列）；`NULL` = 未配置（该 FDE 无 LLM 可用，心跳下行空模型集） |
+| `main_model_id` / `embedding_model_id` / `vision_model_id` | → `llm_models.id`（migration 0002 新增列）；`main` 必须 `tool_calling=true` 由**应用层**校验（PG 无法跨表查能力标记） |
 
-**红线**：真实 key **绝不存明文**——只写宿主 Traefik 动态配置（600，portal 可写、Traefik 只读）；本表只存 `key_id` / 别名 / 代次（供轮换、吊销、用量对账，topology.md §4-L7/§6 第 8 条）。
+**红线（2026-09-19 修订，用户决策：去 LiteLLM hub、上游直发 key）**：真 key 允许存 DB（原「绝不存明文」前提是 LiteLLM 持有真 key，该前提已不成立），但必须：①容器永不持有（key 只存在于 DB → portal 内存 → Traefik 动态配置 mode 600）；②API 回显只给掩码（sk-…last4），编辑需重输；③不进日志/审计/错误信息。`gateway` 列语义更新：值 `'direct'` 表示上游直连（不再要求网关名）；旧值保留兼容。
 
 ### 1.21 `preview_grants` — 预览授权凭证（portal.md §2.7/§2.8）
 
