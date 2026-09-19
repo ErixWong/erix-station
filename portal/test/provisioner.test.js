@@ -227,8 +227,9 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
         return { rows: [] };
       }
       if (sql.includes('INSERT INTO audit_log')) {
-        // provisioner 的 SQL 把 action 作为字面量（'container.orphan_removed'），target/details 为参数。
-        this.audit.push({ action: 'container.orphan_removed', target: params[0] });
+        // provisioner 的 SQL 把 action 作为字面量，target/details 为参数（容器/网络两条孤儿路径）。
+        const action = sql.includes('network.orphan_removed') ? 'network.orphan_removed' : 'container.orphan_removed';
+        this.audit.push({ action, target: params[0] });
         return { rows: [] };
       }
       // 审计 #34 F-B：孤儿容器删除后的 DB 自愈收尾（status → removed）
@@ -238,8 +239,10 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
       }
       return { rows: [] };
     },
+    // 审计 #37：孤儿网络清理现走 withFdeLock(requireLock)——connect 需可用（advisory lock +
+    // 锁内重读复用上方 query 分支）；锁内重读的 JOIN 形式 SQL 返回空行 → 判孤儿 → 清理路径照走。
     async connect() {
-      throw new Error('unexpected connect in this test');
+      return { query: (sql, params) => this.query(sql, params), release() {} };
     },
     async end() {},
   };
@@ -277,6 +280,21 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
       calls.push('listContainers');
       return { status: 200, data: [{ Names: ['/fde-bob'], Id: 'orphan1' }] };
     },
+    async listNetworks() {
+      calls.push('listNetworks');
+      // 审计 #36-1：一个孤儿网络（不在 desired）+ 一个 desired 网络（fde-alice，不得删）
+      return {
+        status: 200,
+        data: [
+          { Name: 'fde-bob-net', Id: 'nid-orphan', Labels: { 'station.managed': 'true' } },
+          { Name: 'fde-alice', Id: 'nid-desired', Labels: { 'station.managed': 'true' } },
+        ],
+      };
+    },
+    async removeNetwork(name) {
+      calls.push(`removeNetwork:${name}`);
+      return { status: 204 };
+    },
   };
   const config = {
     userSpaceRoot: '/srv/erix/users',
@@ -299,6 +317,12 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
   assert.ok(pool.audit.some((a) => a.action === 'container.orphan_removed' && a.target === 'fde-bob'));
   // 审计 #34 F-B：孤儿清理后 DB 行收敛为 removed（「DB 是状态真相」在删除失败路径上仍成立）
   assert.deepEqual(pool.orphanRemovedRows, ['bob'], '孤儿容器删除后必须把对应 containers 行标 removed');
+  // 审计 #36-1：孤儿网络清理 + 审计日志；desired 网络不得被删
+  assert.equal(stats.orphanNetworksRemoved, 1, '孤儿网络必须被清理');
+  assert.ok(calls.includes('removeNetwork:fde-bob-net'), '孤儿网络被删除');
+  assert.ok(!calls.includes('removeNetwork:fde-alice'), 'desired 网络不得被删除');
+  assert.ok(pool.audit.some((a) => a.action === 'network.orphan_removed' && a.target === 'fde-bob-net'),
+    '孤儿网络清理必须写审计日志');
   // F8：重建时同步 upsert containers 行（含 token hash）
   assert.equal(pool.containerUpserts.length, 1);
   assert.ok(pool.containerUpserts[0].token_hash, 'upsert 含 runner_token_hash');
@@ -355,6 +379,7 @@ test('F6：create 成功 + DB update 失败 → 重试重建后容器 env token 
     async stopContainer() { return { status: 204 }; },
     async removeContainer() { containerEnvToken = null; return { ok: true, stopped: true, removed: true }; },
     async listContainers() { return { status: 200, data: [] }; },
+    async listNetworks() { return { status: 200, data: [] }; },
   };
   const config = {
     userSpaceRoot: '/srv/erix/users',
@@ -418,6 +443,7 @@ test('F7：reconcile 幂等——两轮后第二轮不重建（同一容器）',
     async stopContainer() { return { status: 204 }; },
     async removeContainer() { containerEnvToken = null; return { ok: true, stopped: true, removed: true }; },
     async listContainers() { return { status: 200, data: [] }; },
+    async listNetworks() { return { status: 200, data: [] }; },
   };
   const config = {
     userSpaceRoot: '/srv/erix/users', userSpaceRootHost: '/tmp/erix-users-f7',
@@ -612,6 +638,77 @@ test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/cl
   assert.deepEqual(containerUpdParams.at(-1), ['u1'], 'user_id 参数必须绑定 $1（评审 F5）');
 });
 
+
+// ---------------------------------------------------------------------------
+// issue #33（源自 #22 F6）：offboard = 系统发起的 stop —— 收敛该用户全部 active run，
+// 口径对齐 reaper A2（queue cancelled + runs finished/aborted + 合成 run_end）。
+// ---------------------------------------------------------------------------
+function makeDeprovisionPool({ runRows = [], failOnRunsQuery = false, sqls = [] } = {}) {
+  return {
+    async query(sql) {
+      sqls.push(sql);
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          sqls.push(sql);
+          if (sql.includes('FROM runs r') && sql.includes('JOIN run_queue')) {
+            if (failOnRunsQuery) throw new Error('runs query exploded');
+            return { rows: runRows };
+          }
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          if (sql.includes('RETURNING last_seq')) return { rows: [{ last_seq: 7 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+    async end() {},
+  };
+}
+const DEPROVISION_DOCKER_OK = {
+  async stopContainer() { return { status: 204 }; },
+  async removeContainer() { return { status: 204 }; },
+  async removeNetwork() { return { status: 204 }; },
+};
+
+test('issue #33：deprovision 收敛 active run（queue cancelled + runs finished/aborted + 合成 run_end）+ 推 SSE', async () => {
+  const sqls = [];
+  const notified = [];
+  const pool = makeDeprovisionPool({ runRows: [{ id: 'run-1', session_id: 'sess-1', attempts: 2 }], sqls });
+  await deprovisionFde(pool, {}, {
+    fdeName: 'alice', docker: DEPROVISION_DOCKER_OK,
+    notify: (sid, evts) => notified.push({ sid, evts }),
+  });
+  const joined = sqls.join('\n');
+  assert.ok(/UPDATE run_queue SET status='cancelled'/.test(joined), 'queue 必须置 cancelled（对齐 reaper A2）');
+  assert.ok(/UPDATE runs SET status='finished'/.test(joined), 'run 必须置 finished');
+  assert.ok(joined.includes('"reason":"aborted"'), 'termination.reason 必须为 aborted（与 reaper A2 一致）');
+  assert.ok(sqls.some((q) => q.includes("'run_end'")), '必须合成 run_end 事件');
+  assert.deepEqual(
+    notified.map((n) => [n.sid, n.evts[0].type, n.evts[0].seq, n.evts[0].payload.termination.reason]),
+    [['sess-1', 'run_end', 7, 'aborted']],
+    'run_end 必须以 §7.3 分配的 seq 推给 SSE',
+  );
+});
+
+test('issue #33：run 收敛失败不回滚 offboard（best-effort：token 仍吊销、资源仍删除）', async () => {
+  const sqls = [];
+  const dockerCalls = [];
+  const pool = makeDeprovisionPool({ failOnRunsQuery: true, sqls });
+  const docker = {
+    async stopContainer() { dockerCalls.push('stop'); return { status: 204 }; },
+    async removeContainer() { dockerCalls.push('remove'); return { status: 204 }; },
+    async removeNetwork() { dockerCalls.push('removeNetwork'); return { status: 204 }; },
+  };
+  const out = await deprovisionFde(pool, {}, { fdeName: 'alice', docker, log: { warn() {} } });
+  assert.equal(out.containerName, 'fde-alice', 'offboard 必须成功返回（收敛失败不阻断）');
+  assert.ok(sqls.some((q) => q.includes('UPDATE containers SET revoked_at = now()')), 'token 仍必须吊销（安全优先）');
+  assert.deepEqual(dockerCalls, ['stop', 'remove', 'removeNetwork'], '资源清理必须照常执行');
+});
 
 // ---------------------------------------------------------------------------
 // issue #22 评审 F1（blocker 回归锚点）：revoked_at 必须有「清」路径。

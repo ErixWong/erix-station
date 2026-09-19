@@ -593,7 +593,9 @@ function abortRun(ctx, reason) {
     // 5s 宽限后 SIGKILL（§2.4）；M2：按进程组杀，防孑遗子进程
     const pid = ctx.workerPid;
     setTimeout(() => {
-      if (pid) killProcessGroup(pid, 'SIGKILL');
+      // 审计 #36-4：只在「仍是同一个在跑的 worker」时强杀——5s 后 pid 可能已被 OS 回收复用给无关进程。
+      // 退出时 onWorkerExit 置 ctx.workerPid = null，cleanupRun 使 ctx 离开 state.runs → 两个条件都不成立。
+      if (pid && ctx.workerPid === pid && state.runs.get(ctx.runId) === ctx) killProcessGroup(pid, 'SIGKILL');
     }, 5000);
   }
   log('info', 'abort run', { run_id: ctx.runId, reason });
@@ -744,8 +746,14 @@ function cleanupRun(ctx) {
     const pid = ctx.workerPid;
     try { if (ctx.worker.connected) ctx.worker.kill('SIGTERM'); } catch {}
     if (pid) {
-      // M2：SIGTERM 后短宽限整组 SIGKILL，防 worker 忽略信号残留
-      setTimeout(() => killProcessGroup(pid, 'SIGKILL'), 2000);
+      // M2：SIGTERM 后短宽限整组 SIGKILL，防 worker 忽略信号残留。
+      // 审计 #37 评审：与 abortRun 的 5s timer 同样的 PID 复用防护——worker 已退出（workerPid=null）
+      // 或 ctx 已不在跑（state.runs 移除）时不得杀。
+      // 评审 #37 二轮 major：cleanup 语境下不能用 state.runs 校验（cleanupRun 随后立即移除该条目，
+      // 条件永假 → 强杀失效）。正确判据 = worker 仍未退出（onWorkerExit 会把 workerPid 置 null）。
+      setTimeout(() => {
+        if (pid && ctx.workerPid === pid) killProcessGroup(pid, 'SIGKILL');
+      }, 2000);
     }
   }
   cleanupWorktree(ctx); // M3
