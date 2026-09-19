@@ -371,7 +371,7 @@ internal 通道与公开端点的 `validation_failed` **统一为 `400`**（port
 | U1 claim | `400`（capacity/hold_ms 越界）、`200`/`204`（长轮询）、re-claim 条件（lease 过期/attempts<max/user_id 路由，portal §9.3） |
 | U2 state | 合法转换表逐行 + `409 invalid_transition` + 重复终态同载荷 `200`（`idempotent:true`）/不同载荷 `409 run_terminal`（portal §9.6） |
 | U3 events | 空批次 `200 {stored:0,seq_first:null,seq_last:null}`、重复批次 `stored<条数`、`400`（超限/非对象 payload/格式非法）、终态 `409 run_terminal`（portal §9.4） |
-| U4 heartbeat | 逐 run 续租 `renewed` / `lease_lost`（reason 取值）、`revoked:true` 容器级、`stop_run_ids` 兑底（portal §9.5） |
+| U4 heartbeat | 逐 run 续租 `renewed` / `lease_lost`（reason 取值）、吊销经 `401 token_revoked`（非 200 `revoked:true`，审计 #34 F-C）、`stop_run_ids` 兑底（portal §9.5） |
 | U5 transcript | 同 round 同 body `200 {inserted:false}` / 不同 body `409 round_conflict` / 不同 dedupKey `409 round_conflict`（portal §9.7） |
 | U6/U7 load/recall | 分页 `next_cursor`、`400 response_too_large`、U7 `501 not_implemented` 降级（P1 可 501，portal §9.7） |
 | U8/U9 checkpoint | 首次/前进 `200`、`409 checkpoint_stale`、`204`（无）、终态仍可读（portal §9.8） |
