@@ -17,6 +17,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { parseCidr, intToIp, allocateNetwork } from './ipam.js';
 import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
+import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
 
 // ---------------------------------------------------------------------------
@@ -97,7 +98,8 @@ export function createDockerClient({ dockerHost, request = defaultRequest } = {}
     startContainer: (idOrName) => call('POST', `/containers/${idOrName}/start`),
     stopContainer: (idOrName) => call('POST', `/containers/${idOrName}/stop`),
     removeContainer: (idOrName) => call('DELETE', `/containers/${idOrName}`),
-    listNetworks: () => call('GET', '/networks'),
+    listNetworks: (filters) =>
+      call('GET', filters ? `/networks?filters=${encodeURIComponent(JSON.stringify(filters))}` : '/networks'),
     inspectNetwork: (idOrName) => call('GET', `/networks/${idOrName}`),
     createNetwork: (body) => call('POST', '/networks/create', body),
     removeNetwork: (idOrName) => call('DELETE', `/networks/${idOrName}`),
@@ -384,11 +386,14 @@ export function fdeContainerIp(subnet) {
 
 /** per-fde advisory lock：串行化同一 FDE 的 Docker 变更（provision/reconcile/deprovision），F7/F10。
  *  单测 fake pool 无 connect 时跳过（进程内互斥仍靠 ON CONFLICT / 409）。 */
-async function withFdeLock(pool, fdeName, fn) {
+async function withFdeLock(pool, fdeName, fn, { requireLock = false } = {}) {
   let client;
   try {
     client = await pool.connect();
   } catch {
+    // requireLock（评审 major）：孤儿网络清理的安全性依赖本锁——连接失败时**跳过**比无锁执行安全
+    // （无锁执行会与 onboard/deprovision 并发，TOCTOU 防护失效）。默认保持旧 fallback 语义。
+    if (requireLock) throw new Error(`fde lock ${fdeName}: pool connect failed (requireLock)`);
     return fn();
   }
   const key = `fde:${fdeName}`;
@@ -426,8 +431,7 @@ async function upsertContainerRow(pool, { userId, fdeName, containerName, tokenH
  */
 export async function reconcileOnce(pool, config, { docker, log = console } = {}) {
   const desired = await readFdeDesired(pool);
-  const desiredNames = new Set(desired.map((r) => `fde-${r.fde_name}`));
-  const stats = { ensured: 0, rebuilt: 0, orphansRemoved: 0, statusUpdates: 0 };
+  const stats = { ensured: 0, rebuilt: 0, orphansRemoved: 0, orphanNetworksRemoved: 0, statusUpdates: 0 };
 
   for (const row of desired) {
     const fdeName = row.fde_name;
@@ -512,12 +516,19 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
     }
   }
 
-  // 孤儿容器：带 station.managed 标签、但 DB 无对应非 removed 容器 → 删除 + 告警。
+  // 审计 #36-3：孤儿判定改用**重新读取**的 desired 快照（此前用循环开始前的快照）——缩小
+  // 「窗口内 onboard 的新容器被误删」与「deprovision 残留容器多等一轮」的抖动窗口。仍非严格锁内，
+  // 属最终一致（残余记 #36）。
+  const orphanDesired = await readFdeDesired(pool);
+  const freshContainerNames = new Set(orphanDesired.map((r) => `fde-${r.fde_name}`));
+  const freshNetworkNames = new Set(orphanDesired.map((r) => r.network_name));
+
+  // 孤儿容器：带 station.managed 标签、但不在 desired 容器集合 → 删除 + 告警。
   const listed = await docker.listContainers({ label: ['station.managed=true'] }).catch(() => ({ status: 200, data: [] }));
   for (const c of listed.data ?? []) {
     const name = (c.Names?.[0] || '').replace(/^\//, '');
     if (!name.startsWith('fde-')) continue;
-    if (desiredNames.has(name)) continue;
+    if (freshContainerNames.has(name)) continue;
     log.warn?.(`[provisioner] orphan container detected: ${name} (removing)`);
     await pool.query(
       `INSERT INTO audit_log (actor_id, action, target, details)
@@ -536,6 +547,45 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           WHERE c.user_id = u.id AND u.fde_name = $1 AND c.status <> 'removed'`,
         [name.replace(/^fde-/, '')],
       ).catch(() => {});
+    }
+  }
+
+  // 孤儿网络（审计 #36-1）：带 station.managed 标签、不在 desired 的 fde-* 网络 → 删除。
+  // 背景：deprovision 的前置事务先释放网段（该 FDE 离开 desired），若删网络失败则残留——容器有孤儿
+  // 分支自愈，**网络此前没有任何清理路径**；残留网络会让同 FDE re-onboard 时 allocateNetwork 分配
+  // 新 subnet，而残留网络的旧 subnet 触发 assertNetworkContract 失配 → re-onboard 被阻断（需人工删）。
+  // 安全性：只删不在 desired 的网络；仍被容器使用的网络 docker 会拒绝删除（记 warn，不重试风暴）。
+  const nets = await docker.listNetworks({ label: ['station.managed=true'] })
+    .catch(() => ({ status: 200, data: [] }));
+  for (const n of nets.data ?? []) {
+    const name = n?.Name;
+    if (!name || !name.startsWith('fde-')) continue;
+    if ((n?.Labels ?? {})['station.managed'] !== 'true') continue;
+    if (freshNetworkNames.has(name)) continue;
+    // 审计 #37 评审（TOCTOU）：快照可能过期——onboardFde 持 FDE 锁期间创建的网络不能凭旧快照判死。
+    // 与 deprovision/onboard 同锁串行化，并**锁内重读** desired 二次确认后才删。
+    const fdeName = name.replace(/^fde-/, '');
+    try {
+      await withFdeLock(pool, fdeName, async () => {
+        const still = await pool.query(
+          `SELECT 1 FROM fde_networks n
+            JOIN users u ON u.id = n.fde_id
+           WHERE u.fde_name = $1 AND n.state IN ('allocated', 'active')`,
+          [fdeName],
+        );
+        // （requireLock：连接失败时上方抛错 → 外层 catch 跳过该网络，本轮不清理）
+        if (still.rows.length > 0) return; // 锁内确认：已是 desired → 不删
+        log.warn?.(`[provisioner] orphan network detected: ${name} (removing)`);
+        await pool.query(
+          `INSERT INTO audit_log (actor_id, action, target, details)
+           VALUES (NULL, 'network.orphan_removed', $1, $2)`,
+          [name, JSON.stringify({ reason: 'managed network not present in DB desired state' })],
+        ).catch(() => {});
+        const rm = await removeFdeNetwork(docker, name, { log });
+        if (rm.ok) stats.orphanNetworksRemoved += 1;
+      }, { requireLock: true });
+    } catch (err) {
+      log.warn?.(`[provisioner] orphan network ${name} cleanup failed: ${err.message}`);
     }
   }
 
@@ -646,6 +696,107 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
   });
 }
 
+/**
+ * offboard 时收敛该用户全部 active run（issue #33，源自 #22 评审 F6）。
+ *
+ * 为什么必须做：容器被删后无人上报 U2 终态；非 cancelling 的过期租约还会被 reaper 回退
+ * `pending`（容器已删、无人能 claim）→ run 长期非终态；且 `sessions.js` 的 ACTIVE_RUN_STATES 会让
+ * `deleteProject` 409。
+ *
+ * 口径**对齐 reaper A2**（internal.js reapExpiredRuns 的 cancelling 分支）：
+ * `run_queue → cancelled`（清 claim 字段）＋ `runs → finished` + `termination.reason='aborted'`
+ * ＋合成 `run_end`（client_event_id = `<runId>:final:run_end`，seq 用 §7.3 统一分配器）。
+ * best-effort：失败只告警、不回滚已提交的吊销（安全优先）；返回合成的 run_end 供调用方推 SSE。
+ */
+/**
+ * 锁顺序说明（评审 blocker，两轮）：三方事务必须同序才能避免 deadlock——
+ *   reaper（internal.js）：runs → run_queue → chat_sessions(allocSeq)
+ *   stopSession（sessions.js）：chat_sessions → runs
+ *   postMessage（sessions.js）：chat_sessions → runs（新插入）
+ * offboard 若在一个事务里「锁 runs 再 allocSeq 锁 sessions」，与 stopSession 反序；若「先锁 sessions
+ * 再锁 runs」，与 reaper 反序——**任何单事务全序都会与某一方成环**。
+ * 解法：拆两步。事务 A 只按 reaper 同序（runs → queue）终态化，**不碰 sessions**；
+ * run_end 合成放独立小事务 B（只碰 sessions 单行），锁持有时间极短、不与 runs 锁共存 → 无环。
+ * 代价：A 与 B 之间存在「runs 已 finished 但 run_end 未合成」的毫秒级窗口——进程恰好死在中间则
+ * run_end 缺失（DB 状态仍是 finished，前端刷新可见；offboard 场景罕见，记 #36 残余）。
+ */
+async function terminateActiveRuns(pool, { userId, log = console } = {}) {
+  // 事务 A：终态化（锁序 runs → run_queue，与 reaper 完全同序；不碰 chat_sessions）
+  const runEnds = [];
+  let client;
+  try {
+    // 连接获取也要在 best-effort 范围内（评审 major）：池耗尽/连接失败时只告警，
+    // 不得让 offboard 在「token 已吊销、资源未清理」的中间态抛出。
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const active = await client.query(
+      `SELECT r.id, r.session_id, q.attempts
+         FROM runs r
+         JOIN run_queue q ON q.run_id = r.id
+        WHERE r.session_id IN (SELECT id FROM chat_sessions WHERE user_id = $1)
+          AND r.status IN ('queued', 'running', 'cancelling')
+        FOR UPDATE OF r`,
+      [userId],
+    );
+    for (const row of active.rows ?? []) {
+      await client.query(
+        `UPDATE run_queue SET status='cancelled', claim_token=NULL, owner_container_id=NULL,
+                              lease_until=NULL, claimed_at=NULL
+          WHERE run_id=$1`,
+        [row.id],
+      );
+      await client.query(
+        `UPDATE runs SET status='finished', termination='{"reason":"aborted"}'::jsonb,
+                         cancel_requested_at=COALESCE(cancel_requested_at, now()), ended_at=now()
+          WHERE id=$1 AND status IN ('queued', 'running', 'cancelling')`,
+        [row.id],
+      );
+      runEnds.push({ session_id: row.session_id, run_id: row.id, attempt: Number(row.attempts ?? 1) });
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
+    // 不抛：offboard 的安全语义（token 已吊销）不因业务收敛失败而回滚。
+    log.warn?.(`[provisioner] offboard terminate active runs failed (user ${userId}): ${err.message}`);
+    return [];
+  } finally {
+    client?.release();
+  }
+  if (runEnds.length === 0) return [];
+
+  // 事务 B：合成 run_end（每 run 一个小事务，只锁 chat_sessions 单行；不持 runs 锁 → 无环）
+  const events = [];
+  for (const e of runEnds) {
+    let c2;
+    try {
+      c2 = await pool.connect();
+      await c2.query('BEGIN');
+      const seq = await allocSeq(c2, e.session_id);
+      const payload = {
+        termination: { reason: 'aborted' },
+        usage: { input_tokens: 0, output_tokens: 0 },
+        rounds: 0,
+        attempt: e.attempt,
+      };
+      await c2.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [e.run_id, e.session_id, seq, `${e.run_id}:final:run_end`, JSON.stringify(payload)],
+      );
+      await c2.query('COMMIT');
+      events.push({ session_id: e.session_id, run_id: e.run_id, seq, payload });
+    } catch (err) {
+      await c2?.query('ROLLBACK').catch(() => {});
+      // run_end 缺失不回滚终态（runs 已 finished 是真相）；记告警。
+      log.warn?.(`[provisioner] offboard run_end synthesis failed (run ${e.run_id}): ${err.message}`);
+    } finally {
+      c2?.release();
+    }
+  }
+  return events;
+}
+
 /** offboarding（容器+网络）：**先吊销 token + 释放网段（一个事务）→ 再删 Docker 资源 → status 收敛**。
  *
  * F-B（审计 #34，major）：安全优先——token 必须先于资源删除失效，否则「Docker 删除成功但 DB 写失败」
@@ -657,7 +808,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
  * 删除失败的收敛路径（不假装成功，但也不留垃圾）：容器已不在 desired → reconcile 的孤儿分支删除
  * 容器并把 DB 行收敛为 removed（自愈）；status 不提前标 removed（F9：删除失败不标 removed）。
  */
-export async function deprovisionFde(pool, config, { fdeName, docker, log = console } = {}) {
+export async function deprovisionFde(pool, config, { fdeName, docker, log = console, notify } = {}) {
   return withFdeLock(pool, fdeName, async () => {
     const user = await pool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
     const u = user.rows[0];
@@ -691,6 +842,21 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
       throw err;
     } finally {
       client.release();
+    }
+
+    // ①b 收敛该用户全部 active run（issue #33）——offboard = 系统发起的 stop；口径对齐 reaper A2。
+    //     放在吊销事务提交之后：业务收敛失败不回滚安全吊销（best-effort，失败仅告警）。
+    const runEnds = await terminateActiveRuns(pool, { userId: u.id, log });
+    if (runEnds.length > 0) {
+      if (typeof notify === 'function') {
+        for (const e of runEnds) {
+          try {
+            notify(e.session_id, [{ seq: e.seq, ts: new Date().toISOString(), run_id: e.run_id, type: 'run_end', payload: e.payload }]);
+          } catch { /* 尽力推送；跨进程时 hub 为空，live SSE 不实时（重连/刷新后由 backlog 补发） */ }
+        }
+      } else {
+        log.warn?.(`[provisioner] offboard closed ${runEnds.length} active run(s); SSE notify 未注入（离线 CLI：前端由 backlog 补发）`);
+      }
     }
 
     // ② 删 Docker 资源。失败 → throw 供重试；token 已吊销、网段已释放，残留容器由 reconcile 孤儿分支自愈。

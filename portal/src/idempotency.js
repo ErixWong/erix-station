@@ -326,8 +326,13 @@ export async function executeWithIdempotency(pool, { userId, endpoint, key, requ
   let recorded = null;
   const record = async (client, statusCode, response) => {
     if (recorded) return recorded; // 幂等守卫：本请求内重复调用直接返回首次结果（防误抛 409/误删占位）
-    if (!client || typeof client.query !== 'function' || typeof client.connect === 'function') {
-      // connect 存在 ⇒ 传的是 Pool 而非事务 client：业务事务回滚时台账却已 done → 幻影回放，直接拒绝
+    // 防呆判据（wp5 实测修复）：pg 8 的 standalone Client **也带 connect()**（standalone 模式），
+    // 旧判据「有 connect ⇒ 是 Pool」在真实 pg 下恒真 → 一切走 record 的请求都 500。
+    // 可靠特征组合：Pool.connect() 租出的 client **无 end()**；Pool / standalone Client 都是
+    // connect + end 同有且无 release——两者都不在业务事务中，同样必须拒绝。
+    if (!client || typeof client.query !== 'function' ||
+        (typeof client.connect === 'function' && typeof client.end === 'function' &&
+         typeof client.release !== 'function')) {
       // 编程错误（不是请求错误）：必须传业务事务的 client，否则记账会落在别的连接/事务上
       throw new TypeError('record(client, statusCode, response)：client 必须是业务事务的 client（同 client 同事务记账）');
     }
