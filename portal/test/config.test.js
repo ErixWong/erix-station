@@ -33,6 +33,57 @@ test('F12 prod：畸形串拒绝——63/65 hex、大写 hex、裸 digest 无前
   assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: HEX64 })); // 无 sha256: 前缀
 });
 
+test('F12 prod（审计 #34 F-D）：lax-accept 收紧——伪 sha256: 尾缀不得通过', () => {
+  const bad = [
+    `evil-sha256:${HEX64}`,          // 无 @，前缀是任意串
+    `repo@evilsha256:${HEX64}`,      // @ 前缀不是 sha256:
+    `sha256:${HEX64}x`,              // 结尾多余字符
+    `@sha256:${HEX64}`,              // 空引用
+    `-bad/name@sha256:${HEX64}`,     // 引用不合法的起始字符
+    `erix-station/fde:1.0 @sha256:${HEX64}`, // 引用含空格
+    // 评审 A：仅字符集校验会放行的 malformed（docker reference 语法违规）
+    `repo//foo@sha256:${HEX64}`,     // 空 path 段
+    `repo/:@sha256:${HEX64}`,        // 空 path 段 + 空 tag
+    `repo:tag:extra@sha256:${HEX64}`,// tag 中出现第二个冒号
+    `repo/FOO@sha256:${HEX64}`,      // path 段大写（repository 必须小写）
+    `repo./x@sha256:${HEX64}`,       // path 段以分隔符结尾
+    // 评审 B：单标签首段大写——docker 视其为 namespace（须小写），不得借 host 解释放行
+    `FOO/bar@sha256:${HEX64}`,
+    `Foo/bar@sha256:${HEX64}`,
+    // 评审 B 第四轮：host 分支缺外层分组导致「合法 host + :数字 + 非法尾缀」被拆成 port+path 放行
+    `registry.example.com:5000x/fde@sha256:${HEX64}`,
+    `gcr.io:5000v2/fde@sha256:${HEX64}`,
+    `localhost:5000x/fde@sha256:${HEX64}`,
+    `192.168.1.1:5000x/fde@sha256:${HEX64}`,
+  ];
+  for (const img of bad) {
+    assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: img }), /image@sha256/, `应拒绝：${img}`);
+  }
+});
+
+test('F12 prod（审计 #34 F-D）：合法引用形态不误伤（registry/tag/path）', () => {
+  const good = [
+    `erix-station/fde:1.0.0-abc@sha256:${HEX64}`,
+    `localhost:5000/fde@sha256:${HEX64}`,
+    `registry.example.com:8443/ns/sub/fde:v2@sha256:${HEX64}`,
+    // 单标签 host + 端口（含 `:` → docker 视为 registry；评审 B 实测的 false-reject 回归）
+    `registry:5000/fde@sha256:${HEX64}`,
+    `192.168.1.1:5000/fde@sha256:${HEX64}`,
+    `myhost:5000/fde@sha256:${HEX64}`,
+    `harbor:5000/ns/fde@sha256:${HEX64}`,
+    `Localhost:5000/fde@sha256:${HEX64}`,
+    `fde@sha256:${HEX64}`,
+    `sha256:${HEX64}`,
+    // docker 允许 `__` / 多个 `-` 作名称段分隔符（评审 B info：旧模式会误拒，fail-closed 但口径不符）
+    `foo__bar@sha256:${HEX64}`,
+    `foo--bar@sha256:${HEX64}`,
+    `foo.bar@sha256:${HEX64}`,
+  ];
+  for (const img of good) {
+    assert.equal(loadConfig({ ...PROD, FDE_IMAGE: img }).fdeImage, img, `应放行：${img}`);
+  }
+});
+
 test('F12 dev：tag 允许（仅警告，不抛错）', () => {
   const cfg = loadConfig({ ...DEV, FDE_IMAGE: 'traefik/whoami' });
   assert.equal(cfg.fdeImage, 'traefik/whoami');

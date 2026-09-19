@@ -332,7 +332,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | 时机 | 动作 |
 |---|---|
 | **onboarding** | 分配子网（DB）→ **建网络前经 Docker API 校验子网与既有网络 / `fde_networks` 无重叠** → 建 `fde-<name>` 网络（`--subnet`）→ 起容器 → 写 ports 路由 + LLM 注入路由 → 写模板/AGENTS.md（bind mount）→ 建网关虚拟 key |
-| **offboarding** | 停容器 → 删路由（含 LLM 注入）→ 删网络 → 回收子网 → 吊销 token/虚拟 key |
+| **offboarding** | **吊销 token/虚拟 key → 释放子网（同事务）** → 停容器 → 删路由（含 LLM 注入）→ 删网络（审计 #34 F-B：token 必须先于资源删除失效，且与「离开 desired」同事务——否则 DB 写失败窗口内旧 token 仍有效，或被 reconcile 复活） |
 | **portal/Traefik 启动** | 从 DB 全量重建缺失状态（幂等）：路由文件、内部端点、网络记录对账 |
 | **定时对账** | DB ↔ docker（容器/网络/IP）↔ Traefik 路由 ↔ `fde_networks` 四向一致；漂移即修 + 告警 |
 | **容器重建后** | 检测 IP 变化 → 重写该 FDE 的预览路由与 LLM 路由注入（H-B 的唯一技术债 L8，由本行兜住） |

@@ -198,6 +198,7 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
   const pool = {
     audit: [],
     containerUpserts: [],
+    orphanRemovedRows: [],
     async query(sql, params = []) {
       if (sql.includes('FROM users u') && sql.includes('JOIN fde_networks n')) {
         return {
@@ -228,6 +229,11 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
       if (sql.includes('INSERT INTO audit_log')) {
         // provisioner 的 SQL 把 action 作为字面量（'container.orphan_removed'），target/details 为参数。
         this.audit.push({ action: 'container.orphan_removed', target: params[0] });
+        return { rows: [] };
+      }
+      // 审计 #34 F-B：孤儿容器删除后的 DB 自愈收尾（status → removed）
+      if (sql.includes("UPDATE containers c SET status = 'removed'")) {
+        this.orphanRemovedRows.push(params[0]);
         return { rows: [] };
       }
       return { rows: [] };
@@ -291,6 +297,8 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
   assert.ok(calls.includes('createContainer'), '重建缺失容器');
   assert.ok(calls.includes('removeContainer:fde-bob'), '删除孤儿容器');
   assert.ok(pool.audit.some((a) => a.action === 'container.orphan_removed' && a.target === 'fde-bob'));
+  // 审计 #34 F-B：孤儿清理后 DB 行收敛为 removed（「DB 是状态真相」在删除失败路径上仍成立）
+  assert.deepEqual(pool.orphanRemovedRows, ['bob'], '孤儿容器删除后必须把对应 containers 行标 removed');
   // F8：重建时同步 upsert containers 行（含 token hash）
   assert.equal(pool.containerUpserts.length, 1);
   assert.ok(pool.containerUpserts[0].token_hash, 'upsert 含 runner_token_hash');
@@ -486,15 +494,25 @@ test('P4：ensureFdeNetwork inspect 200 但 fde.name label 失配 → 报错；4
   assert.equal(r.id, 'nid3');
 });
 
-test('F9：deprovision 容器删除失败 → 不标 removed（保留 desired state）+ 抛错供重试', async () => {
+test('F9 + 审计 #34 F-B：deprovision 容器删除失败 → 不标 removed，但 token 已吊销 + 网段已释放（安全优先 + 自愈路径）', async () => {
   const calls = [];
   const pool = {
     async query(sql, params = []) {
-      calls.push(sql.split(' ').slice(0, 3).join(' '));
+      calls.push(sql.replace(/\s+/g, ' ').trim());
       if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
       return { rows: [] };
     },
-    async connect() { throw new Error('no real pool'); },
+    async connect() {
+      return {
+        async query(sql) {
+          calls.push(sql.replace(/\s+/g, ' ').trim());
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
     async end() {},
   };
   const docker = {
@@ -506,16 +524,57 @@ test('F9：deprovision 容器删除失败 → 不标 removed（保留 desired st
     () => deprovisionFde(pool, {}, { fdeName: 'alice', docker }),
     /container removal failed/,
   );
-  assert.ok(!calls.some((c) => c.includes('UPDATE containers SET status')), '容器删除失败不得标 removed');
-  assert.ok(!calls.some((c) => c.includes('UPDATE fde_networks SET state')), '网络状态不得 released');
+  // F9（保留）：删除失败不得假装成功
+  assert.ok(!calls.some((c) => c.includes("status = 'removed'")), '容器删除失败不得标 removed');
+  // F-B（新语义）：安全与「离开 desired」必须前置且已提交
+  assert.ok(calls.some((c) => c.includes('UPDATE containers SET revoked_at = now()')),
+    'token 必须先于资源删除吊销（否则 DB 写失败窗口内旧 token 仍有效）');
+  assert.ok(calls.some((c) => c.includes("UPDATE fde_networks SET state = 'released'")),
+    '网段必须同事务释放——否则该 FDE 仍在 reconcile 的 desired 集合，会被重建并清空 revoked_at（复活）');
+});
+
+test('审计 #34 F-B：前置事务失败 → 不做任何 Docker 删除（fail-closed，不产生「容器已删但 token 有效」窗口）', async () => {
+  const dockerCalls = [];
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql.includes('UPDATE containers SET revoked_at')) throw new Error('db down');
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+    async end() {},
+  };
+  const docker = {
+    async stopContainer() { dockerCalls.push('stop'); return { status: 204 }; },
+    async removeContainer() { dockerCalls.push('remove'); return { status: 204 }; },
+    async removeNetwork() { dockerCalls.push('removeNetwork'); return { status: 204 }; },
+  };
+  await assert.rejects(() => deprovisionFde(pool, {}, { fdeName: 'alice', docker }), /db down/);
+  assert.deepEqual(dockerCalls, [], '吊销事务未提交前不得碰 Docker（否则失败窗口内 token 仍有效而资源已删）');
 });
 
 test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/claim 的 401 token_revoked 即显式信号）', async () => {
   const sqls = [];
   const containerUpdParams = [];
+  // 评审 B：SQL 顺序断言拦不住「把吊销挪到 Docker 删除之后」——把 docker 调用也纳入同一序列。
+  const seq = [];
+  const noteSeq = (sql) => {
+    if (sql.includes('UPDATE containers SET revoked_at')) seq.push('sql:revoke');
+    if (sql.includes("UPDATE containers SET status = 'removed'")) seq.push('sql:removed');
+  };
   const pool = {
     async query(sql, params = []) {
       sqls.push(sql);
+      noteSeq(sql);
       if (sql.includes('UPDATE containers') && sql.includes('WHERE user_id = $1')) containerUpdParams.push(params);
       if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
       if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
@@ -525,6 +584,7 @@ test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/cl
       return {
         async query(sql) {
           sqls.push(sql);
+          noteSeq(sql);
           if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
           return { rows: [] };
         },
@@ -535,16 +595,20 @@ test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/cl
   };
   const docker = {
     async stopContainer() { return { status: 204 }; },
-    async removeContainer() { return { status: 204 }; },
-    async removeNetwork() { return { status: 204 }; },
+    async removeContainer() { seq.push('docker:removeContainer'); return { status: 204 }; },
+    async removeNetwork() { seq.push('docker:removeNetwork'); return { status: 204 }; },
   };
   await deprovisionFde(pool, {}, { fdeName: 'alice', docker });
-  const containersUpd = sqls.find((s) => s.includes('UPDATE containers'));
-  assert.ok(containersUpd, '必须更新 containers');
-  assert.ok(containersUpd.includes("revoked_at = now()"), '必须写 revoked_at（跨进程 revoke 信号，issue #22）');
-  assert.ok(containersUpd.includes("status = 'removed'"), '必须标 removed');
-  // 评审 F5：断言 WHERE 与参数绑定（防「全表 UPDATE」回归）
-  assert.ok(containersUpd.includes('WHERE user_id = $1'), '必须按 user_id 限定');
+  const revokeUpd = sqls.find((s) => s.includes('UPDATE containers SET revoked_at'));
+  const removedUpd = sqls.find((s) => s.includes("UPDATE containers SET status = 'removed'"));
+  assert.ok(revokeUpd, '必须先写 revoked_at（跨进程 revoke 信号，issue #22）');
+  assert.ok(revokeUpd.includes('WHERE user_id = $1'), '必须按 user_id 限定（防全表 UPDATE）');
+  assert.ok(removedUpd, '资源清理成功后必须标 removed');
+  assert.ok(removedUpd.includes('WHERE user_id = $1'), '必须按 user_id 限定');
+  // 审计 #34 F-B：顺序语义——吊销必须发生在**删除 Docker 资源之前**（把 docker 调用纳入同一序列，
+  // 否则「吊销挪到删除之后」这种变异拦不住——评审 B 实测）。
+  assert.deepEqual(seq, ['sql:revoke', 'docker:removeContainer', 'docker:removeNetwork', 'sql:removed'],
+    '顺序必须是：吊销 → 删容器 → 删网络 → 标 removed');
   assert.deepEqual(containerUpdParams.at(-1), ['u1'], 'user_id 参数必须绑定 $1（评审 F5）');
 });
 

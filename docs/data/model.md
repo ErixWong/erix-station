@@ -438,7 +438,7 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 |---|---|---|
 | `allocated` | portal/reconciler：onboarding 分配子网（DB 写行 + `docker network create --subnet`） | reconciler：建网 + 起容器；IPAM：该 subnet 被占用（`UNIQUE(subnet)` 挡并发） |
 | `active` | reconciler：容器已起、网络可达（观测到容器接入） | 连通矩阵/对账：视为在役网络 |
-| `released`（终态） | portal/reconciler：offboarding 停容器 → 删网络 → 回收子网 | IPAM：块可复用（复用前先腾出该行，见 §1.17）；对账：不再有对应 docker 网络 |
+| `released`（终态） | portal/reconciler：offboarding **先吊销 token + 释放网段（同事务，审计 #34 F-B）** → 停容器 → 删网络 | IPAM：块可复用（复用前先腾出该行，见 §1.17）；对账：不再有对应 docker 网络 |
 
 ### 2.7 `fde_llm_bindings.state`
 

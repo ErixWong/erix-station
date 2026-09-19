@@ -80,7 +80,35 @@ export function loadConfig(env = process.env) {
   //   `image@sha256:<digest>`（repo digest，push/pull 后才有）或 `sha256:<imageId>`（目标机本地
   //   build 的 image ID——本地 build 的 RepoDigests 为空，唯一不可变引用）；dev 允许 tag 但警告。
   const fdeImage = env.FDE_IMAGE || 'traefik/whoami';
-  const imageIsDigest = /@?sha256:[0-9a-f]{64}$/.test(fdeImage);
+  // 严格两分支（审计 #34 F-D）：旧的 `/@?sha256:[0-9a-f]{64}$/` 是 lax-accept——`repo@evilsha256:<hex>`、
+  // `任意串sha256:<hex>` 都能过（Docker 后续会拒，但校验口径与错误信息不符）。分支：
+  //   ① image ID：`sha256:<64hex>`
+  //   ② repo digest：`<合法镜像引用>@sha256:<64hex>`（引用可含 registry host:port / path / tag）
+  const imageIdRef = /^sha256:[0-9a-f]{64}$/;
+  // repo digest 引用按 docker reference 语法校验（评审 A：仅字符集允许仍会收 `repo//foo@…`、
+  // `repo:tag:extra@…` 这类 malformed）。构成：[host[:port]/]path[:tag]
+  //   host：域名标签（允许大写——域名大小写不敏感）  path：小写 [a-z0-9] 段，`/` 分隔且不得为空
+  //   tag：`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`
+  // 名称段分隔符对齐 docker：`[._]|__|[-]+`（评审 B info：单 `[._-]` 会误拒 `foo__bar`/`foo--bar`）
+  const repoNameSeg = '[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*';
+  const repoPath = `${repoNameSeg}(?:/${repoNameSeg})*`;
+  // registry host 严格对齐 docker 的 splitDockerDomain（评审 B，两轮）——首段满足下列其一为 registry
+  // （域名大小写不敏感 → 允许大写）；否则该段是 namespace（须小写，由 repoPath 覆盖）：
+  //   ① 含 `.`（多标签域名）  ② **含 `:`（单标签 + 端口，如 registry:5000）**  ③ `localhost`
+  // 少了 ② 会误拒 `registry:5000/fde`（评审 B 实测的 false-reject 回归）；少了 ③/① 的区分则
+  // 会把 `FOO/bar` 当 host 放行（docker 视为 namespace 须小写）。
+  const repoHostLabel = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
+  const repoHostDotted = `${repoHostLabel}(?:\\.${repoHostLabel})+`;
+  // ⚠️ 整体分组必不可少（评审 B 第四轮实测）：缺外层 `(?:…)` 时 `^(?:HOST/)?` 里的 `/` 只绑定
+  // 最后一个交替分支，`dotted|localhost` 分支不再要求 `/` → `registry.example.com:5000x/fde` 被
+  // 拆成「port :5000」+「path x/fde」误放行。
+  const repoHost = `(?:(?:${repoHostDotted}|localhost)(?::[0-9]+)?|${repoHostLabel}:[0-9]+)`;
+  // 边界声明：本校验是**形态门**（三类前缀 + 严格 sha256 后缀），不声称 docker reference 语法完备。
+  // 已知边界（fail-open，Docker 兜底）：`foo__bar.example.com/fde` 这类「首段含 `.` 但域名含非法
+  // 字符」我们会放行而 docker 会拒（#34 follow-up）。要完全对齐需引入域名语法校验，收益不抵复杂度。
+  const repoTag = '[A-Za-z0-9_][A-Za-z0-9._-]{0,127}';
+  const repoDigestRef = new RegExp(`^(?:${repoHost}/)?${repoPath}(?::${repoTag})?@sha256:[0-9a-f]{64}$`);
+  const imageIsDigest = imageIdRef.test(fdeImage) || repoDigestRef.test(fdeImage);
   if (!imageIsDigest && !fdeDevMode) {
     throw new Error('FDE_IMAGE 必须为 image@sha256:<digest> 或 sha256:<imageId> 形态（生产模式；或显式 FDE_DEV_MODE=1 进入开发模式）');
   }
