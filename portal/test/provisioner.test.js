@@ -728,3 +728,102 @@ test('issue #22 评审 F1：重新 provision 的两条 UPDATE 必须重置 revok
     assert.ok(b.includes('revoked_at = NULL'), `token 轮换 UPDATE 必须重置 revoked_at：\n${b}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// issue #38 Phase B1：LLM 配置 offboard/onboard 联动。
+// 评审重点：LLM 吊销必须与 containers/token 吊销**同一事务**（revokeFdeLlmConfigTx 只吃调用方
+// 事务的 client）——seq 断言把 outbox 写入也纳入同一序列，防「挪到事务外/挪到 Docker 删除后」变异。
+// ---------------------------------------------------------------------------
+
+function makeB1Pool({ llmRowCount = 1, seq, paramsLog }) {
+  return {
+    async query(sql) {
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql, params = []) {
+          paramsLog.push({ sql, params });
+          if (sql === 'BEGIN') seq.push('tx:begin');
+          if (sql === 'COMMIT') seq.push('tx:commit');
+          if (sql.includes('UPDATE containers SET revoked_at')) seq.push('sql:revoke-token');
+          if (sql.includes('UPDATE fde_llm_bindings') && sql.includes("SET state = 'revoked'")) {
+            seq.push(llmRowCount > 0 ? 'sql:revoke-llm' : 'sql:revoke-llm-noop');
+          }
+          if (sql.includes('INSERT INTO route_outbox')) seq.push(`sql:outbox:${params[0]}:${params[2]}`);
+          if (sql.includes('UPDATE fde_llm_bindings')) return { rows: [], rowCount: llmRowCount };
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+    async end() {},
+  };
+}
+
+function makeB1Docker(seq) {
+  return {
+    async stopContainer() { seq.push('docker:stop'); return { status: 204 }; },
+    async removeContainer() { seq.push('docker:rm'); return { status: 204 }; },
+    async removeNetwork() { seq.push('docker:rmnet'); return { status: 204 }; },
+  };
+}
+
+test('issue #38 Phase B1：deprovision 前置事务内吊销 LLM（state=revoked + outbox delete，与 token 吊销同事务、先于 Docker）', async () => {
+  const seq = [];
+  const paramsLog = [];
+  const pool = makeB1Pool({ llmRowCount: 1, seq, paramsLog });
+  await deprovisionFde(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
+
+  assert.deepEqual(
+    seq,
+    [
+      // ① 前置事务（原子）：token 吊销 → 网段释放 → LLM 吊销 + 双 outbox tombstone
+      'tx:begin', 'sql:revoke-token',
+      'sql:outbox:fde_network:delete', 'sql:revoke-llm', 'sql:outbox:llm_binding:delete',
+      'tx:commit',
+      // ①b terminateActiveRuns 事务 A（无 active run → 立即提交的空事务）
+      'tx:begin', 'tx:commit',
+      // ② Docker 资源删除
+      'docker:stop', 'docker:rm', 'docker:rmnet',
+    ],
+    'LLM 吊销必须发生在吊销事务（BEGIN..COMMIT）内、且在一切 Docker 操作之前',
+  );
+
+  const llmIns = paramsLog.find((e) => e.sql.includes('INSERT INTO route_outbox') && e.params[0] === 'llm_binding');
+  assert.ok(llmIns, '必须写 aggregate=llm_binding 的 tombstone');
+  assert.equal(llmIns.params[1], 'u1', 'aggregate_id = fde id');
+  assert.equal(llmIns.params[2], 'delete');
+  const payloadStr = JSON.stringify(llmIns.params[4]);
+  assert.ok(payloadStr.includes('alice'), 'payload 带 fde_name 供 reconciler 收敛');
+  assert.ok(!payloadStr.includes('sk-test'), 'payload 不得含 api_key 明文（红线 ③）');
+});
+
+test('issue #38 Phase B1：无 LLM 配置的 FDE deprovision 正常（rowCount=0 → 不写 llm outbox，Docker 照常清理）', async () => {
+  const seq = [];
+  const paramsLog = [];
+  const pool = makeB1Pool({ llmRowCount: 0, seq, paramsLog });
+  await deprovisionFde(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
+  assert.ok(!seq.includes('sql:revoke-llm'), '无 active binding 不得产生实际吊销');
+  assert.ok(seq.includes('sql:revoke-llm-noop'), 'UPDATE 仍会下发（幂等空转，匹配 0 行）');
+  assert.ok(!seq.some((s) => s.includes('outbox:llm_binding')), '无 active binding 不得写 llm outbox');
+  assert.ok(seq.includes('sql:revoke-token') && seq.includes('docker:rm'), 'token 吊销与 Docker 清理照常');
+});
+
+test('issue #38 Phase B1：onboard 复用分支恢复 LLM / 全新不复活（源码契约锚点）+ deprovision 吊销在事务块内', async () => {
+  const src = await import('node:fs').then((fs) => fs.promises.readFile(
+    new URL('../src/provisioner.js', import.meta.url), 'utf8'));
+  // onboardFde：LLM 联动必须挂在容器就绪之后，且 restoreRevoked 与复用判定（needRecreate）绑定——
+  // 复用（false）→ 复活 revoked；全新（true）→ 只幂等 upsert active，不复活 revoked。
+  const onboardCall = 'syncFdeLlmBindingOnOnboard(pool, { userId, fdeName, restoreRevoked: !needRecreate })';
+  assert.ok(src.includes(onboardCall), `onboardFde 必须调用 LLM 恢复联动：${onboardCall}`);
+  // deprovisionFde：① 前置事务块内、COMMIT 之前必须调 revokeFdeLlmConfigTx（同事务是评审重点）。
+  const txStart = src.indexOf('① 前置事务');
+  const commitIdx = src.indexOf("await client.query('COMMIT')", txStart);
+  const revokeIdx = src.indexOf('revokeFdeLlmConfigTx(client, { fdeId: u.id, fdeName })', txStart);
+  assert.ok(txStart > 0 && revokeIdx > txStart && revokeIdx < commitIdx,
+    'LLM 吊销必须位于 ① 前置事务块内、COMMIT 之前（不得挪到独立连接/独立事务）');
+});

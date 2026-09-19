@@ -21,6 +21,8 @@ import {
   getFdeLlmConfig,
   getFdeLlmEcho,
   setFdeLlmConfig,
+  revokeFdeLlmConfigTx,
+  syncFdeLlmBindingOnOnboard,
   LlmError,
   LLM_MODEL_TYPES,
 } from '../src/llm.js';
@@ -207,6 +209,22 @@ class LlmFakePool {
     }
     if (sql.includes('SELECT api_key FROM fde_llm_bindings WHERE fde_id')) {
       return { rows: this.bindings.filter((b) => b.fde_id === params[0]).map((b) => ({ api_key: b.api_key })) };
+    }
+    // issue #38 Phase B1：offboard 吊销联动（revokeFdeLlmConfigTx）——必须在通用 UPDATE 处理器之前。
+    if (sql.includes('UPDATE fde_llm_bindings') && sql.includes("SET state = 'revoked'")) {
+      const b = this.bindings.find((x) => x.fde_id === params[0] && x.state === 'active');
+      if (b) { b.state = 'revoked'; b.revoked_at = new Date(); b.updated_at = new Date(); }
+      return { rows: [], rowCount: b ? 1 : 0 };
+    }
+    // issue #38 Phase B1：onboard 恢复联动（syncFdeLlmBindingOnOnboard）。
+    if (sql.includes('SELECT state FROM fde_llm_bindings WHERE fde_id') && sql.includes('FOR UPDATE')) {
+      const b = this.bindings.find((x) => x.fde_id === params[0]);
+      return { rows: b ? [{ state: b.state }] : [] };
+    }
+    if (sql.includes('UPDATE fde_llm_bindings') && sql.includes("SET state = 'active', revoked_at = NULL")) {
+      const b = this.bindings.find((x) => x.fde_id === params[0]);
+      if (b) { b.state = 'active'; b.revoked_at = null; b.updated_at = new Date(); }
+      return { rows: [], rowCount: b ? 1 : 0 };
     }
     if (sql.includes('SELECT 1 FROM fde_llm_bindings WHERE fde_id')) {
       return { rows: this.bindings.some((b) => b.fde_id === params[0]) ? [{ '?column?': 1 }] : [] };
@@ -745,4 +763,89 @@ test('migration 0002-llm-config.sql：包含全部预期语句（弱断言，TOD
   const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
   assert.ok(baseline.includes('CREATE TABLE fde_llm_bindings ('), 'baseline 保留 fde_llm_bindings 原表');
   assert.ok(!baseline.includes('llm_providers'), 'baseline 不含新表（结构变更只走增量迁移）');
+});
+
+// ---------------------------------------------------------------------------
+// issue #38 Phase B1：offboard/onboard 联动事务助手（revokeFdeLlmConfigTx /
+// syncFdeLlmBindingOnOnboard）——与 provisioner 前置吊销/复用恢复分支同构验证。
+// ---------------------------------------------------------------------------
+
+test('B1：revokeFdeLlmConfigTx——active → revoked（revoked_at=now()）+ outbox delete（payload 不含 key）', async () => {
+  const pool = new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [{ fde_id: 'u1', provider_id: 'p1', api_key: 'sk-test-1234567890', state: 'active', main_model_id: 'm1' }],
+  });
+  const client = await pool.connect();
+  const revoked = await revokeFdeLlmConfigTx(client, { fdeId: 'u1', fdeName: 'alice' });
+  assert.equal(revoked, true);
+  const b = pool.bindings.find((x) => x.fde_id === 'u1');
+  assert.equal(b.state, 'revoked');
+  assert.ok(b.revoked_at instanceof Date);
+  const del = pool.outbox.filter((o) => o.aggregate === 'llm_binding');
+  assert.equal(del.length, 1);
+  assert.equal(del[0].op, 'delete');
+  assert.equal(del[0].aggregate_id, 'u1');
+  assert.equal(del[0].payload.fde_name, 'alice');
+  assert.ok(!JSON.stringify(del[0].payload).includes('sk-test-1234567890'), 'tombstone payload 不得含 key（红线 ③）');
+  // 幂等：已 revoked → 返回 false 且不再写 outbox
+  const again = await revokeFdeLlmConfigTx(client, { fdeId: 'u1', fdeName: 'alice' });
+  assert.equal(again, false);
+  assert.equal(pool.outbox.filter((o) => o.aggregate === 'llm_binding').length, 1);
+});
+
+test('B1：revokeFdeLlmConfigTx——无 binding 行 → false，不写 outbox（兼容无 LLM 配置的 FDE）', async () => {
+  const pool = new LlmFakePool({ users: [{ id: 'u1', fde_name: 'alice', status: 'active' }] });
+  const client = await pool.connect();
+  assert.equal(await revokeFdeLlmConfigTx(client, { fdeId: 'u1', fdeName: 'alice' }), false);
+  assert.equal(pool.outbox.length, 0);
+});
+
+test('B1：syncFdeLlmBindingOnOnboard——复用分支 revoked → active（revoked_at=NULL）+ outbox upsert', async () => {
+  const pool = new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    bindings: [{
+      fde_id: 'u1', provider_id: 'p1', api_key: 'sk-test-1234567890', state: 'revoked',
+      revoked_at: new Date(), main_model_id: 'm1',
+    }],
+  });
+  const out = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: true });
+  assert.deepEqual(out, { restored: true, republished: true });
+  const b = pool.bindings[0];
+  assert.equal(b.state, 'active');
+  assert.equal(b.revoked_at, null, '复活必须清 revoked_at（同 #37 防御逻辑；注意是 fde_llm_bindings 本表，非 containers 表）');
+  const ups = pool.outbox.filter((o) => o.aggregate === 'llm_binding' && o.op === 'upsert');
+  assert.equal(ups.length, 1);
+  assert.equal(ups[0].aggregate_id, 'u1');
+  assert.ok(!JSON.stringify(ups[0].payload).includes('sk-test-1234567890'), 'payload 不得含 key');
+});
+
+test('B1：syncFdeLlmBindingOnOnboard——全新 onboard（restoreRevoked=false）不复活 revoked 配置', async () => {
+  const pool = new LlmFakePool({
+    bindings: [{
+      fde_id: 'u1', provider_id: 'p1', api_key: 'sk-test-1234567890', state: 'revoked',
+      revoked_at: new Date(), main_model_id: 'm1',
+    }],
+  });
+  const out = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: false });
+  assert.deepEqual(out, { restored: false, republished: false });
+  assert.equal(pool.bindings[0].state, 'revoked', 'offboard 是管理员意图，全新 onboard 不得自动恢复 LLM');
+  assert.equal(pool.outbox.length, 0);
+});
+
+test('B1：syncFdeLlmBindingOnOnboard——active 配置幂等 upsert（revision 递增）；无 binding 行 → no-op', async () => {
+  const pool = new LlmFakePool({
+    bindings: [{ fde_id: 'u1', provider_id: 'p1', api_key: 'sk-test-1234567890', state: 'active', main_model_id: 'm1' }],
+  });
+  const out1 = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: false });
+  assert.deepEqual(out1, { restored: false, republished: true });
+  const rev = pool.revisions.get('llm_binding:u1');
+  const out2 = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: false });
+  assert.deepEqual(out2, { restored: false, republished: true });
+  assert.equal(pool.revisions.get('llm_binding:u1'), rev + 1, '每次 upsert revision 递增（head 语义，与 setFdeLlmConfig 同构）');
+
+  const empty = new LlmFakePool({});
+  assert.deepEqual(
+    await syncFdeLlmBindingOnOnboard(empty, { fdeId: 'u9', fdeName: 'nobody', restoreRevoked: true }),
+    { restored: false, republished: false },
+  );
 });
