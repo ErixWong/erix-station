@@ -9,6 +9,7 @@
 import crypto from 'node:crypto';
 import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
+import { allocSeq } from './seq.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -621,15 +622,6 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
   } finally {
     client.release();
   }
-}
-
-/** seq 分配器：单行 chat_sessions.last_seq +1（§7.3 统一口径；messages 与 run_events 共享）。 */
-async function allocSeq(client, sessionId) {
-  const res = await client.query(
-    `UPDATE chat_sessions SET last_seq = last_seq + 1, updated_at = now() WHERE id = $1 RETURNING last_seq`,
-    [sessionId],
-  );
-  return Number(res.rows[0].last_seq);
 }
 
 // ---------------------------------------------------------------------------

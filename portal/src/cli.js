@@ -10,7 +10,7 @@ import * as totp from './totp.js';
 import { createServer } from './http.js';
 import { startMaterializerLoop } from './materializer.js';
 import { startRoutesLoop } from './routes.js';
-import { startReaperLoop } from './internal.js';
+import { startReaperLoop, notifySessionEvents } from './internal.js';
 import {
   createDockerClient,
   onboardFde,
@@ -208,7 +208,9 @@ async function runDeprovisionFde(values) {
   const pool = createPool(config.databaseUrl);
   const docker = createDockerClient({ dockerHost: config.dockerHost });
   try {
-    const out = await deprovisionFde(pool, config, { fdeName, docker });
+    // issue #33：offboard 会收敛该用户 active run 并合成 run_end——进程内有 SSE hub 时直接推送
+    // （离线 CLI 无 hub，前端由 backlog 补发；DB 已写 run_events 才是真相）。
+    const out = await deprovisionFde(pool, config, { fdeName, docker, notify: notifySessionEvents });
     // eslint-disable-next-line no-console
     console.log(
       `[deprovision-fde] ok fde=${fdeName} container=${out.containerName} network=${out.networkName}`,

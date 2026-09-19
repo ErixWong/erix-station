@@ -638,6 +638,77 @@ test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/cl
 
 
 // ---------------------------------------------------------------------------
+// issue #33（源自 #22 F6）：offboard = 系统发起的 stop —— 收敛该用户全部 active run，
+// 口径对齐 reaper A2（queue cancelled + runs finished/aborted + 合成 run_end）。
+// ---------------------------------------------------------------------------
+function makeDeprovisionPool({ runRows = [], failOnRunsQuery = false, sqls = [] } = {}) {
+  return {
+    async query(sql) {
+      sqls.push(sql);
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          sqls.push(sql);
+          if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions')) {
+            if (failOnRunsQuery) throw new Error('runs query exploded');
+            return { rows: runRows };
+          }
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          if (sql.includes('RETURNING last_seq')) return { rows: [{ last_seq: 7 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+    async end() {},
+  };
+}
+const DEPROVISION_DOCKER_OK = {
+  async stopContainer() { return { status: 204 }; },
+  async removeContainer() { return { status: 204 }; },
+  async removeNetwork() { return { status: 204 }; },
+};
+
+test('issue #33：deprovision 收敛 active run（queue cancelled + runs finished/aborted + 合成 run_end）+ 推 SSE', async () => {
+  const sqls = [];
+  const notified = [];
+  const pool = makeDeprovisionPool({ runRows: [{ id: 'run-1', session_id: 'sess-1', attempts: 2 }], sqls });
+  await deprovisionFde(pool, {}, {
+    fdeName: 'alice', docker: DEPROVISION_DOCKER_OK,
+    notify: (sid, evts) => notified.push({ sid, evts }),
+  });
+  const joined = sqls.join('\n');
+  assert.ok(/UPDATE run_queue SET status='cancelled'/.test(joined), 'queue 必须置 cancelled（对齐 reaper A2）');
+  assert.ok(/UPDATE runs SET status='finished'/.test(joined), 'run 必须置 finished');
+  assert.ok(joined.includes('"reason":"aborted"'), 'termination.reason 必须为 aborted（与 reaper A2 一致）');
+  assert.ok(sqls.some((q) => q.includes("'run_end'")), '必须合成 run_end 事件');
+  assert.deepEqual(
+    notified.map((n) => [n.sid, n.evts[0].type, n.evts[0].seq, n.evts[0].payload.termination.reason]),
+    [['sess-1', 'run_end', 7, 'aborted']],
+    'run_end 必须以 §7.3 分配的 seq 推给 SSE',
+  );
+});
+
+test('issue #33：run 收敛失败不回滚 offboard（best-effort：token 仍吊销、资源仍删除）', async () => {
+  const sqls = [];
+  const dockerCalls = [];
+  const pool = makeDeprovisionPool({ failOnRunsQuery: true, sqls });
+  const docker = {
+    async stopContainer() { dockerCalls.push('stop'); return { status: 204 }; },
+    async removeContainer() { dockerCalls.push('remove'); return { status: 204 }; },
+    async removeNetwork() { dockerCalls.push('removeNetwork'); return { status: 204 }; },
+  };
+  const out = await deprovisionFde(pool, {}, { fdeName: 'alice', docker, log: { warn() {} } });
+  assert.equal(out.containerName, 'fde-alice', 'offboard 必须成功返回（收敛失败不阻断）');
+  assert.ok(sqls.some((q) => q.includes('UPDATE containers SET revoked_at = now()')), 'token 仍必须吊销（安全优先）');
+  assert.deepEqual(dockerCalls, ['stop', 'remove', 'removeNetwork'], '资源清理必须照常执行');
+});
+
+// ---------------------------------------------------------------------------
 // issue #22 评审 F1（blocker 回归锚点）：revoked_at 必须有「清」路径。
 // deprovision 写 revoked_at=now() 后，同一 containers 行被重新 provision 复用时
 // （upsertContainerRow 的 DO UPDATE / onboardFde 的 token 轮换 UPDATE）必须重置 revoked_at=NULL，
