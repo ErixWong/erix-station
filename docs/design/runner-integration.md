@@ -229,7 +229,7 @@ agentd                          portal
 | `run_assigned` | `{run_id, queue_id}` | **唤醒 hint**：有新任务可领。**不携带权威载荷**（载荷以 claim 响应为准）——hint 到达时任务可能已被其他 capacity 领走，agentd 必须容忍 | 若当前 claim 处于 hold 间隙则立即发起 claim |
 | `approval_decision` | `{approval_id, run_id, decision, note, decided_at}` | 审批结果**快通道** | resolve 对应 worker 的 await（§10） |
 | `stop_request` | `{run_id, reason}` | portal 已写 `cancel_requested_at`（portal.md §4.5），要求终止 | IPC `abort` → worker；若无此 run（已结束）忽略 |
-| `revoke` | `{reason}` | token 吊销 / 容器停用 | 停领新任务；在跑 run 继续到终态后退出 |
+| `revoke` | `{reason}` | token 吊销 / 容器停用 | 停领新任务；**abort 全部在跑 run**（worker 收敛）后退出——三个信号源（SSE revoke / claim 401 / heartbeat 401 token_revoked）同径（issue #22 beginRevoke） |
 | `ping` | `{ts}` | 15s 保活（也可作 SSE 注释行） | 更新「下行健康」标记；连续丢失触发重连 |
 
 > **为什么 SSE 下行而非 portal push 容器 :3000**：原方案（规格 §10.3「portal → 容器 HTTP」）要求容器监听端口 + portal 持 token 主动向容器出示。出站模型下容器**零监听、零入站**，安全收益见 §11.2。下行实时性需求只有三类（派单唤醒 / 审批决定 / 停止），SSE 全部覆盖；其中派单本就是拉取语义（claim），`run_assigned` 只是降低空转延迟的 hint。

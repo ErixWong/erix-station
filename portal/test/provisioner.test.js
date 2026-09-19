@@ -509,3 +509,61 @@ test('F9：deprovision 容器删除失败 → 不标 removed（保留 desired st
   assert.ok(!calls.some((c) => c.includes('UPDATE containers SET status')), '容器删除失败不得标 removed');
   assert.ok(!calls.some((c) => c.includes('UPDATE fde_networks SET state')), '网络状态不得 released');
 });
+
+test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/claim 的 401 token_revoked 即显式信号）', async () => {
+  const sqls = [];
+  const containerUpdParams = [];
+  const pool = {
+    async query(sql, params = []) {
+      sqls.push(sql);
+      if (sql.includes('UPDATE containers') && sql.includes('WHERE user_id = $1')) containerUpdParams.push(params);
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          sqls.push(sql);
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+    async end() {},
+  };
+  const docker = {
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer() { return { status: 204 }; },
+    async removeNetwork() { return { status: 204 }; },
+  };
+  await deprovisionFde(pool, {}, { fdeName: 'alice', docker });
+  const containersUpd = sqls.find((s) => s.includes('UPDATE containers'));
+  assert.ok(containersUpd, '必须更新 containers');
+  assert.ok(containersUpd.includes("revoked_at = now()"), '必须写 revoked_at（跨进程 revoke 信号，issue #22）');
+  assert.ok(containersUpd.includes("status = 'removed'"), '必须标 removed');
+  // 评审 F5：断言 WHERE 与参数绑定（防「全表 UPDATE」回归）
+  assert.ok(containersUpd.includes('WHERE user_id = $1'), '必须按 user_id 限定');
+  assert.deepEqual(containerUpdParams.at(-1), ['u1'], 'user_id 参数必须绑定 $1（评审 F5）');
+});
+
+
+// ---------------------------------------------------------------------------
+// issue #22 评审 F1（blocker 回归锚点）：revoked_at 必须有「清」路径。
+// deprovision 写 revoked_at=now() 后，同一 containers 行被重新 provision 复用时
+// （upsertContainerRow 的 DO UPDATE / onboardFde 的 token 轮换 UPDATE）必须重置 revoked_at=NULL，
+// 否则新容器 agentd 永久 401 token_revoked（DOA）。
+// 说明：onboardFde 全链 docker/pool fake 成本高，此处以源码契约锚点断言（评审 F1 修复的两条
+// UPDATE）防回归；端到端语义由 db-integration/探针覆盖。
+// ---------------------------------------------------------------------------
+test('issue #22 评审 F1：重新 provision 的两条 UPDATE 必须重置 revoked_at = NULL', async () => {
+  const src = await import('node:fs').then((fs) => fs.promises.readFile(
+    new URL('../src/provisioner.js', import.meta.url), 'utf8'));
+  // SQL 模板串（反引号内）为块：含 token_generation 递增的块 = token 轮换 UPDATE
+  const blocks = src.split('`').filter((b) => b.includes('token_generation') && (b.includes('DO UPDATE SET') || b.includes('UPDATE containers')));
+  assert.ok(blocks.length >= 2, `应有 ≥2 处 token 轮换 UPDATE（upsert DO UPDATE + onboard 轮换），实际 ${blocks.length}`);
+  for (const b of blocks) {
+    assert.ok(b.includes('revoked_at = NULL'), `token 轮换 UPDATE 必须重置 revoked_at：\n${b}`);
+  }
+});
