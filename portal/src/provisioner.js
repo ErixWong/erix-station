@@ -98,7 +98,8 @@ export function createDockerClient({ dockerHost, request = defaultRequest } = {}
     startContainer: (idOrName) => call('POST', `/containers/${idOrName}/start`),
     stopContainer: (idOrName) => call('POST', `/containers/${idOrName}/stop`),
     removeContainer: (idOrName) => call('DELETE', `/containers/${idOrName}`),
-    listNetworks: () => call('GET', '/networks'),
+    listNetworks: (filters) =>
+      call('GET', filters ? `/networks?filters=${encodeURIComponent(JSON.stringify(filters))}` : '/networks'),
     inspectNetwork: (idOrName) => call('GET', `/networks/${idOrName}`),
     createNetwork: (body) => call('POST', '/networks/create', body),
     removeNetwork: (idOrName) => call('DELETE', `/networks/${idOrName}`),
@@ -558,14 +559,30 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
     if (!name || !name.startsWith('fde-')) continue;
     if ((n?.Labels ?? {})['station.managed'] !== 'true') continue;
     if (freshNetworkNames.has(name)) continue;
-    log.warn?.(`[provisioner] orphan network detected: ${name} (removing)`);
-    await pool.query(
-      `INSERT INTO audit_log (actor_id, action, target, details)
-       VALUES (NULL, 'network.orphan_removed', $1, $2)`,
-      [name, JSON.stringify({ reason: 'managed network not present in DB desired state' })],
-    ).catch(() => {});
-    const rm = await removeFdeNetwork(docker, name, { log });
-    if (rm.ok) stats.orphanNetworksRemoved += 1;
+    // 审计 #37 评审（TOCTOU）：快照可能过期——onboardFde 持 FDE 锁期间创建的网络不能凭旧快照判死。
+    // 与 deprovision/onboard 同锁串行化，并**锁内重读** desired 二次确认后才删。
+    const fdeName = name.replace(/^fde-/, '');
+    try {
+      await withFdeLock(pool, fdeName, async () => {
+        const still = await pool.query(
+          `SELECT 1 FROM fde_networks n
+            JOIN users u ON u.id = n.fde_id
+           WHERE u.fde_name = $1 AND n.state IN ('allocated', 'active')`,
+          [fdeName],
+        );
+        if (still.rows.length > 0) return; // 锁内确认：已是 desired → 不删
+        log.warn?.(`[provisioner] orphan network detected: ${name} (removing)`);
+        await pool.query(
+          `INSERT INTO audit_log (actor_id, action, target, details)
+           VALUES (NULL, 'network.orphan_removed', $1, $2)`,
+          [name, JSON.stringify({ reason: 'managed network not present in DB desired state' })],
+        ).catch(() => {});
+        const rm = await removeFdeNetwork(docker, name, { log });
+        if (rm.ok) stats.orphanNetworksRemoved += 1;
+      });
+    } catch (err) {
+      log.warn?.(`[provisioner] orphan network ${name} cleanup failed: ${err.message}`);
+    }
   }
 
   return stats;
@@ -688,17 +705,23 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
  * best-effort：失败只告警、不回滚已提交的吊销（安全优先）；返回合成的 run_end 供调用方推 SSE。
  */
 async function terminateActiveRuns(pool, { userId, log = console } = {}) {
-  const client = await pool.connect();
   const runEnds = [];
+  let client;
   try {
+    // 连接获取也要在 best-effort 范围内（评审 major）：池耗尽/连接失败时只告警，
+    // 不得让 offboard 在「token 已吊销、资源未清理」的中间态抛出。
+    client = await pool.connect();
     await client.query('BEGIN');
+    // ⚠️ 锁顺序必须与 stopSession（sessions.js：先锁 chat_sessions 再更新 runs）一致，否则
+    // 「offboard × 用户停止」并发会形成 chat_sessions/runs 反序 deadlock（评审 blocker）：
+    // FROM 以 s 打头 + FOR UPDATE OF s, r，两个事务都按 s → r 的顺序拿锁。
     const active = await client.query(
       `SELECT r.id, r.session_id, q.attempts
-         FROM runs r
-         JOIN chat_sessions s ON s.id = r.session_id
+         FROM chat_sessions s
+         JOIN runs r ON r.session_id = s.id
          JOIN run_queue q ON q.run_id = r.id
         WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
-        FOR UPDATE OF r`,
+        FOR UPDATE OF s, r`,
       [userId],
     );
     for (const row of active.rows ?? []) {
@@ -736,7 +759,7 @@ async function terminateActiveRuns(pool, { userId, log = console } = {}) {
     log.warn?.(`[provisioner] offboard terminate active runs failed (user ${userId}): ${err.message}`);
     return [];
   } finally {
-    client.release();
+    client?.release();
   }
   return runEnds;
 }
@@ -796,7 +819,7 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
         for (const e of runEnds) {
           try {
             notify(e.session_id, [{ seq: e.seq, ts: new Date().toISOString(), run_id: e.run_id, type: 'run_end', payload: e.payload }]);
-          } catch { /* 尽力推送（离线 CLI 无 hub 时由 DB backlog 补发） */ }
+          } catch { /* 尽力推送；跨进程时 hub 为空，live SSE 不实时（重连/刷新后由 backlog 补发） */ }
         }
       } else {
         log.warn?.(`[provisioner] offboard closed ${runEnds.length} active run(s); SSE notify 未注入（离线 CLI：前端由 backlog 补发）`);
