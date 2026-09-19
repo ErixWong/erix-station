@@ -19,6 +19,7 @@ import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
+import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -685,6 +686,11 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
 
     await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);
 
+    // issue #38 Phase B1：onboard LLM 联动。复用分支（needRecreate=false）→ 恢复 revoked binding；
+    // 全新 onboard → 不复活 revoked（admin 重新配置后再生效），仅对 active 配置幂等 upsert 发布。
+    // 放在容器就绪之后：LLM 路由的 ClientIP 条件依赖本 FDE 网段，先保证网络/容器落地再发布。
+    await syncFdeLlmBindingOnOnboard(pool, { userId, fdeName, restoreRevoked: !needRecreate });
+
     return {
       userId,
       containerId,
@@ -834,8 +840,11 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
           WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
         [u.id],
       );
-      // FDE 网络释放 → 触发路由 reconciler 重生成（internal ipAllowList / llm 路由收敛）。
+      // FDE 网络释放 → 触发路由 reconciler 重生成（internal ipAllowList 收敛）。
       await enqueueRouteChange(client, { aggregate: 'fde_network', aggregateId: u.id, op: 'delete', payload: { network_name: networkName } });
+      // issue #38 Phase B1：LLM 配置吊销与容器/token 吊销**同事务**（revokeFdeLlmConfigTx 只吃本事务
+      // client）——凭据失效必须原子发生，不允许「token 已吊销、Traefik 仍注入上游 key」的中间窗口。
+      await revokeFdeLlmConfigTx(client, { fdeId: u.id, fdeName });
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});

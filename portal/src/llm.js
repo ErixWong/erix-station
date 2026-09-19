@@ -425,6 +425,94 @@ export async function setFdeLlmConfig(pool, {
 }
 
 /**
+ * 吊销事务内联动（issue #38 Phase B1，deprovisionFde 前置事务调用）。
+ * fde_llm_bindings active → revoked（revoked_at=now()）+ outbox tombstone（aggregate='llm_binding'，op='delete'）。
+ *
+ * **评审重点**：本函数只接受调用方事务的 client、绝不自行 connect——LLM 吊销必须与 containers/token
+ * 吊销**同一事务**。若在独立连接上先吊销容器 token、再独立吊销 LLM，两事务之间会留下「容器已死但
+ * Traefik 仍向该 FDE 子网注入上游 api_key」的窗口（且反向顺序亦然）；offboard 语义要求凭据失效
+ * 与「离开 desired」原子发生（topology §8 offboarding 行、审计 #34 F-B 同款推理）。
+ * tombstone payload 不含 api_key（红线 ③）；本函数不写 audit（offboard 整体审计由调用方负责）。
+ *
+ * @returns boolean 是否实际吊销了一行 active binding（无行/已 revoked → false，不写 outbox）
+ */
+export async function revokeFdeLlmConfigTx(client, { fdeId, fdeName } = {}) {
+  const r = await client.query(
+    `UPDATE fde_llm_bindings
+        SET state = 'revoked', revoked_at = now(), updated_at = now()
+      WHERE fde_id = $1 AND state = 'active'`,
+    [fdeId],
+  );
+  if (r.rowCount === 0) return false;
+  await enqueueRouteChange(client, {
+    aggregate: 'llm_binding',
+    aggregateId: fdeId,
+    op: 'delete',
+    payload: { fde_name: fdeName },
+  });
+  return true;
+}
+
+/**
+ * onboard 恢复联动（issue #38 Phase B1，onboardFde 调用；独立小事务，容器/网络已就绪后执行）。
+ *
+ *  - 复用分支（restoreRevoked=true）：binding state='revoked' → 恢复 'active'（revoked_at=NULL）+ outbox
+ *    upsert（同事务）——与 #37 revoked_at 复活防御同思路：重新 onboard 的 FDE 其 LLM 配置应复活。
+ *    注意复活对象是 **fde_llm_bindings.revoked_at**（本表），与 containers.revoked_at（#22 F1）是两张表，
+ *    互不干扰——containers 行复用的 UPDATE 不会顺带清本表状态。
+ *  - 全新 onboard（restoreRevoked=false）：**不自动复活** revoked 配置（offboard 是管理员意图，LLM 恢复
+ *    应经 admin 重新确认）；仅对仍 'active' 的配置做幂等 upsert 发布（保证 Traefik 动态配置齐全，
+ *    幂等可重复执行）。
+ *
+ * @returns { restored, republished }
+ */
+export async function syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restoreRevoked = false } = {}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // 与 setFdeLlmConfig 同 advisory key，串行化同 FDE 的配置写入/恢复。
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
+    const r = await client.query(
+      `SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
+      [fdeId],
+    );
+    const row = r.rows[0];
+    if (!row) {
+      await client.query('COMMIT');
+      return { restored: false, republished: false };
+    }
+    let restored = false;
+    if (row.state === 'revoked' && restoreRevoked) {
+      await client.query(
+        `UPDATE fde_llm_bindings
+            SET state = 'active', revoked_at = NULL, updated_at = now()
+          WHERE fde_id = $1`,
+        [fdeId],
+      );
+      restored = true;
+    }
+    // active（原本或刚恢复）→ 幂等 upsert，触发 reconciler 重发布（tombstone 批量 offboard 后
+    // 的 re-onboard 场景也靠它补齐 Traefik 配置）。
+    const effective = restored || row.state === 'active';
+    if (effective) {
+      await enqueueRouteChange(client, {
+        aggregate: 'llm_binding',
+        aggregateId: fdeId,
+        op: 'upsert',
+        payload: { fde_name: fdeName, restored },
+      });
+    }
+    await client.query('COMMIT');
+    return { restored, republished: effective };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * 删除 FDE LLM 配置（tombstone op='delete'，与 port_allocation 释放同构）。Phase B/C 使用。
  * @returns boolean 是否存在配置行
  */
