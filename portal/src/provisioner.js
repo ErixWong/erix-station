@@ -525,7 +525,18 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
       [name, JSON.stringify({ reason: 'docker has managed container not present in DB desired state' })],
     ).catch(() => {});
     const rm = await removeFdeContainer(docker, name, { log }).catch(() => ({ ok: false }));
-    if (rm.ok) stats.orphansRemoved += 1;
+    if (rm.ok) {
+      stats.orphansRemoved += 1;
+      // F-B（审计 #34）：自愈收尾——容器已删，把对应 DB 行收敛为 removed（否则 status 停在 running，
+      // 「DB 是状态真相」在失败路径上不成立）。deprovision 删除失败后的残留容器走的正是这条路
+      // （前置事务已吊销 token 并释放网段 → 该 FDE 已不在 desired → 下一轮即被此处清理）。
+      await pool.query(
+        `UPDATE containers c SET status = 'removed', updated_at = now()
+           FROM users u
+          WHERE c.user_id = u.id AND u.fde_name = $1 AND c.status <> 'removed'`,
+        [name.replace(/^fde-/, '')],
+      ).catch(() => {});
+    }
   }
 
   return stats;
@@ -635,7 +646,17 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
   });
 }
 
-/** offboarding（容器+网络）：停/删容器 → 删网络 → DB 状态收敛（removed / released）。F9：删除失败不标 removed。 */
+/** offboarding（容器+网络）：**先吊销 token + 释放网段（一个事务）→ 再删 Docker 资源 → status 收敛**。
+ *
+ * F-B（审计 #34，major）：安全优先——token 必须先于资源删除失效，否则「Docker 删除成功但 DB 写失败」
+ * 的窗口里 DB 仍认为 token 有效，泄漏的旧 token 可继续访问 internal API（违反不变式三「DB 是状态真相」）。
+ * 且「释放网段」必须与「吊销」同事务：readFdeDesired 按 `fde_networks.state IN ('allocated','active')`
+ * 判定 desired，若只提吊销而不离开 desired，下一次 reconcile 会 ensure 容器 → upsertContainerRow
+ * 重写 token 并清空 revoked_at（PR #32 的 F1 修复）→ **FDE 被复活**。
+ *
+ * 删除失败的收敛路径（不假装成功，但也不留垃圾）：容器已不在 desired → reconcile 的孤儿分支删除
+ * 容器并把 DB 行收敛为 removed（自愈）；status 不提前标 removed（F9：删除失败不标 removed）。
+ */
 export async function deprovisionFde(pool, config, { fdeName, docker, log = console } = {}) {
   return withFdeLock(pool, fdeName, async () => {
     const user = await pool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
@@ -646,32 +667,17 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
 
     const containerName = `fde-${fdeName}`;
     const networkName = `fde-${fdeName}`;
-    const containerRm = await removeFdeContainer(docker, containerName, { log });
-    if (!containerRm.ok) {
-      // F9：Docker 删除失败 → 不更新 DB（保留 desired state 供下次对账重试）+ 告警。
-      log.warn?.(`[provisioner] deprovision ${fdeName}: container removal failed; desired state preserved for retry`);
-      throw new Error(`deprovision ${fdeName}: container removal failed (status preserved for retry)`);
-    }
-    const networkRm = await removeFdeNetwork(docker, networkName, { log });
-    if (!networkRm.ok) {
-      log.warn?.(`[provisioner] deprovision ${fdeName}: network removal failed; desired state preserved for retry`);
-      throw new Error(`deprovision ${fdeName}: network removal failed (status preserved for retry)`);
-    }
 
-    await pool.query(
-      `UPDATE containers SET status = 'removed', revoked_at = now(), updated_at = now()
-        WHERE user_id = $1 AND status <> 'removed'`,
-      [u.id],
-    );
-    // F7：offboarding 吊销 token → 进程内广播 revoke（agentd 收到即停领新任务并收敛退出）。
-    // 排序语义（评审 PR#23 M2）：广播放在 desired state 提交之后——F9 删除失败保留现场时不广播，
-    // 避免容器保留但 agentd 已被叫停的坏状态。已知限制：当前唯一调用者是 CLI 独立进程，
-    // 内存 hub 跨进程不可达 → issue #22 方案②：revoked_at 落 DB（本行）后，agentd 心跳/claim
-    // 的 401 token_revoked（authenticateContainer 读 DB）即显式信号，agentd 收敛退出（≤1 心跳周期）。
-    if (containerId) broadcastRevoke(containerId, { reason: 'offboarded' });
+    // ① 前置事务（原子）：吊销 token + 释放网段 + 路由收敛。
+    //    token 立即失效（后续心跳/claim 401 token_revoked）；FDE 立即脱离 reconcile 的 desired 集合。
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(
+        `UPDATE containers SET revoked_at = now(), updated_at = now()
+          WHERE user_id = $1 AND revoked_at IS NULL`,
+        [u.id],
+      );
       await client.query(
         `UPDATE fde_networks SET state = 'released', released_at = now()
           WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
@@ -686,6 +692,29 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     } finally {
       client.release();
     }
+
+    // ② 删 Docker 资源。失败 → throw 供重试；token 已吊销、网段已释放，残留容器由 reconcile 孤儿分支自愈。
+    const containerRm = await removeFdeContainer(docker, containerName, { log });
+    if (!containerRm.ok) {
+      log.warn?.(`[provisioner] deprovision ${fdeName}: container removal failed; token already revoked, container left for reconciler cleanup`);
+      throw new Error(`deprovision ${fdeName}: container removal failed (token already revoked; container left for reconciler cleanup)`);
+    }
+    const networkRm = await removeFdeNetwork(docker, networkName, { log });
+    if (!networkRm.ok) {
+      log.warn?.(`[provisioner] deprovision ${fdeName}: network removal failed; token already revoked, retry or reconciler cleanup`);
+      throw new Error(`deprovision ${fdeName}: network removal failed (token already revoked)`);
+    }
+
+    // ③ 资源已清理 → status 收敛（F9：只有删干净才标 removed）。
+    await pool.query(
+      `UPDATE containers SET status = 'removed', updated_at = now()
+        WHERE user_id = $1 AND status <> 'removed'`,
+      [u.id],
+    );
+    // F7：进程内广播 revoke（agentd 收到即停领新任务并收敛退出）——**仅作低延迟提示，不是安全边界**
+    // （安全边界是 ① 的 DB 吊销：agentd 心跳/claim 的 401 token_revoked）。当前唯一调用者是 CLI
+    // 独立进程，内存 hub 跨进程不可达 → issue #22 方案②。
+    if (containerId) broadcastRevoke(containerId, { reason: 'offboarded' });
     return { userId: u.id, containerName, networkName };
   });
 }

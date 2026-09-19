@@ -33,6 +33,33 @@ test('F12 prod：畸形串拒绝——63/65 hex、大写 hex、裸 digest 无前
   assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: HEX64 })); // 无 sha256: 前缀
 });
 
+test('F12 prod（审计 #34 F-D）：lax-accept 收紧——伪 sha256: 尾缀不得通过', () => {
+  const bad = [
+    `evil-sha256:${HEX64}`,          // 无 @，前缀是任意串
+    `repo@evilsha256:${HEX64}`,      // @ 前缀不是 sha256:
+    `sha256:${HEX64}x`,              // 结尾多余字符
+    `@sha256:${HEX64}`,              // 空引用
+    `-bad/name@sha256:${HEX64}`,     // 引用不合法的起始字符
+    `erix-station/fde:1.0 @sha256:${HEX64}`, // 引用含空格
+  ];
+  for (const img of bad) {
+    assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: img }), /image@sha256/, `应拒绝：${img}`);
+  }
+});
+
+test('F12 prod（审计 #34 F-D）：合法引用形态不误伤（registry/tag/path）', () => {
+  const good = [
+    `erix-station/fde:1.0.0-abc@sha256:${HEX64}`,
+    `localhost:5000/fde@sha256:${HEX64}`,
+    `registry.example.com:8443/ns/sub/fde:v2@sha256:${HEX64}`,
+    `fde@sha256:${HEX64}`,
+    `sha256:${HEX64}`,
+  ];
+  for (const img of good) {
+    assert.equal(loadConfig({ ...PROD, FDE_IMAGE: img }).fdeImage, img, `应放行：${img}`);
+  }
+});
+
 test('F12 dev：tag 允许（仅警告，不抛错）', () => {
   const cfg = loadConfig({ ...DEV, FDE_IMAGE: 'traefik/whoami' });
   assert.equal(cfg.fdeImage, 'traefik/whoami');
