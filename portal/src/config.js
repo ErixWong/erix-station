@@ -89,11 +89,16 @@ export function loadConfig(env = process.env) {
   // `repo:tag:extra@…` 这类 malformed）。构成：[host[:port]/]path[:tag]
   //   host：域名标签（允许大写——域名大小写不敏感）  path：小写 [a-z0-9] 段，`/` 分隔且不得为空
   //   tag：`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`
-  const repoNameSeg = '[a-z0-9]+(?:[._-][a-z0-9]+)*';
+  // 名称段分隔符对齐 docker：`[._]|__|[-]+`（评审 B info：单 `[._-]` 会误拒 `foo__bar`/`foo--bar`）
+  const repoNameSeg = '[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*';
   const repoPath = `${repoNameSeg}(?:/${repoNameSeg})*`;
-  const repoHost = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*';
+  // registry host 对齐 docker 的 splitDockerDomain（评审 B minor）：首段**含 `.`** 或为 `localhost`
+  // 时才是 registry（域名大小写不敏感，故允许大写）；单标签首段在 docker 里是 namespace（须小写）
+  // → 由 repoPath 覆盖。少了这条，`FOO/bar@sha256:…` 会被当作 host=`FOO` 放行（docker 会拒）。
+  const repoHostLabel = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
+  const repoHost = `(?:${repoHostLabel}(?:\\.${repoHostLabel})+|localhost)(?::[0-9]+)?`;
   const repoTag = '[A-Za-z0-9_][A-Za-z0-9._-]{0,127}';
-  const repoDigestRef = new RegExp(`^(?:${repoHost}(?::[0-9]+)?/)?${repoPath}(?::${repoTag})?@sha256:[0-9a-f]{64}$`);
+  const repoDigestRef = new RegExp(`^(?:${repoHost}/)?${repoPath}(?::${repoTag})?@sha256:[0-9a-f]{64}$`);
   const imageIsDigest = imageIdRef.test(fdeImage) || repoDigestRef.test(fdeImage);
   if (!imageIsDigest && !fdeDevMode) {
     throw new Error('FDE_IMAGE 必须为 image@sha256:<digest> 或 sha256:<imageId> 形态（生产模式；或显式 FDE_DEV_MODE=1 进入开发模式）');
