@@ -509,3 +509,36 @@ test('F9：deprovision 容器删除失败 → 不标 removed（保留 desired st
   assert.ok(!calls.some((c) => c.includes('UPDATE containers SET status')), '容器删除失败不得标 removed');
   assert.ok(!calls.some((c) => c.includes('UPDATE fde_networks SET state')), '网络状态不得 released');
 });
+
+test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/claim 的 401 token_revoked 即显式信号）', async () => {
+  const sqls = [];
+  const pool = {
+    async query(sql, params = []) {
+      sqls.push(sql);
+      if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          sqls.push(sql);
+          if (sql.includes('RETURNING revision')) return { rows: [{ revision: 1 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+    async end() {},
+  };
+  const docker = {
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer() { return { status: 204 }; },
+    async removeNetwork() { return { status: 204 }; },
+  };
+  await deprovisionFde(pool, {}, { fdeName: 'alice', docker });
+  const containersUpd = sqls.find((s) => s.includes('UPDATE containers'));
+  assert.ok(containersUpd, '必须更新 containers');
+  assert.ok(containersUpd.includes("revoked_at = now()"), '必须写 revoked_at（跨进程 revoke 信号，issue #22）');
+  assert.ok(containersUpd.includes("status = 'removed'"), '必须标 removed');
+});
