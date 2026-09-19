@@ -227,8 +227,9 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
         return { rows: [] };
       }
       if (sql.includes('INSERT INTO audit_log')) {
-        // provisioner 的 SQL 把 action 作为字面量（'container.orphan_removed'），target/details 为参数。
-        this.audit.push({ action: 'container.orphan_removed', target: params[0] });
+        // provisioner 的 SQL 把 action 作为字面量，target/details 为参数（容器/网络两条孤儿路径）。
+        const action = sql.includes('network.orphan_removed') ? 'network.orphan_removed' : 'container.orphan_removed';
+        this.audit.push({ action, target: params[0] });
         return { rows: [] };
       }
       // 审计 #34 F-B：孤儿容器删除后的 DB 自愈收尾（status → removed）
@@ -277,6 +278,21 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
       calls.push('listContainers');
       return { status: 200, data: [{ Names: ['/fde-bob'], Id: 'orphan1' }] };
     },
+    async listNetworks() {
+      calls.push('listNetworks');
+      // 审计 #36-1：一个孤儿网络（不在 desired）+ 一个 desired 网络（fde-alice，不得删）
+      return {
+        status: 200,
+        data: [
+          { Name: 'fde-bob-net', Id: 'nid-orphan', Labels: { 'station.managed': 'true' } },
+          { Name: 'fde-alice', Id: 'nid-desired', Labels: { 'station.managed': 'true' } },
+        ],
+      };
+    },
+    async removeNetwork(name) {
+      calls.push(`removeNetwork:${name}`);
+      return { status: 204 };
+    },
   };
   const config = {
     userSpaceRoot: '/srv/erix/users',
@@ -299,6 +315,12 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
   assert.ok(pool.audit.some((a) => a.action === 'container.orphan_removed' && a.target === 'fde-bob'));
   // 审计 #34 F-B：孤儿清理后 DB 行收敛为 removed（「DB 是状态真相」在删除失败路径上仍成立）
   assert.deepEqual(pool.orphanRemovedRows, ['bob'], '孤儿容器删除后必须把对应 containers 行标 removed');
+  // 审计 #36-1：孤儿网络清理 + 审计日志；desired 网络不得被删
+  assert.equal(stats.orphanNetworksRemoved, 1, '孤儿网络必须被清理');
+  assert.ok(calls.includes('removeNetwork:fde-bob-net'), '孤儿网络被删除');
+  assert.ok(!calls.includes('removeNetwork:fde-alice'), 'desired 网络不得被删除');
+  assert.ok(pool.audit.some((a) => a.action === 'network.orphan_removed' && a.target === 'fde-bob-net'),
+    '孤儿网络清理必须写审计日志');
   // F8：重建时同步 upsert containers 行（含 token hash）
   assert.equal(pool.containerUpserts.length, 1);
   assert.ok(pool.containerUpserts[0].token_hash, 'upsert 含 runner_token_hash');
@@ -355,6 +377,7 @@ test('F6：create 成功 + DB update 失败 → 重试重建后容器 env token 
     async stopContainer() { return { status: 204 }; },
     async removeContainer() { containerEnvToken = null; return { ok: true, stopped: true, removed: true }; },
     async listContainers() { return { status: 200, data: [] }; },
+    async listNetworks() { return { status: 200, data: [] }; },
   };
   const config = {
     userSpaceRoot: '/srv/erix/users',
@@ -418,6 +441,7 @@ test('F7：reconcile 幂等——两轮后第二轮不重建（同一容器）',
     async stopContainer() { return { status: 204 }; },
     async removeContainer() { containerEnvToken = null; return { ok: true, stopped: true, removed: true }; },
     async listContainers() { return { status: 200, data: [] }; },
+    async listNetworks() { return { status: 200, data: [] }; },
   };
   const config = {
     userSpaceRoot: '/srv/erix/users', userSpaceRootHost: '/tmp/erix-users-f7',
