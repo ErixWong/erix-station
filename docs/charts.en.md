@@ -1,8 +1,8 @@
 # Architecture Charts (English)
 
 > Three charts: ① simplified data flow (PPT-level) ② network architecture ③ end-to-end sequence.
-> Spec source: `docs/design/fde-platform.md`; for topology details defer to `docs/design/topology.md`.
-> Chinese version: [`charts.zh.md`](charts.zh.md).
+> Terms: **FDE** = Forward Deployed Engineer (the platform's user); **run** = one agent task; **preview** = a dev server inside the FDE's container, exposed to their browser.
+> Two extra sections for reviewers: **host hardening** (after Chart 2) and **security & network review notes** (at the end).
 
 ---
 
@@ -104,8 +104,6 @@ flowchart TB
 
 ### Why the network is designed this way (security rationale)
 
-> Full argument in `topology.md` (§6 hardening checklist, §7 connectivity matrix, §8 residual risk); design motivations only here.
-
 - **Controlled egress (not free internet access)**: FDE containers have a shell — file permissions can't stop them from editing configs; **the only effective guarantee is "the network cannot reach it"**. The egress allowlist is enforced at the network layer by the security team; LLM domains are **not** on the allowlist → the gateway is the only reachable LLM exit, so changing endpoint/key is pointless
 - **LLM calls require no key inside the container**: containers hold **zero LLM credentials** — their config contains only a placeholder key plus `endpoint=llm.example.com`; the real virtual key lives solely in the host's Traefik dynamic config (mode 600, writable only by portal, read-only for Traefik). As a request crosses the edge, identity is determined by **source subnet** and `Authorization` is **override-injected** (any key the container presents is overwritten). Security value: even a fully compromised container (root included) yields **no LLM credentials at all**; keys never touch container disks or env vars, so there is no leakage surface to audit
 - **FDEs cannot reach each other (no loss of control)**: shared networks are the root cause of lateral privilege escalation — the original shared `control` network was abolished for exactly this reason. Each FDE owns an exclusive `/29`; cross-bridge forwarding is dropped by DOCKER-ISOLATION — isolation with zero configuration and no workaround
@@ -113,6 +111,29 @@ flowchart TB
 - **Identity = network location**: both the internal API and LLM links authenticate by source subnet (ipAllowList / ClientIP), with credentials override-injected by Traefik — tokens can't be stolen, forged headers are killed by `aliasHeadersStrategy: delete` and "never read X-Forwarded-For"
 - **Defense in depth**: topology isolation (unreachable) + edge auth (forwardAuth) — **both layers required, neither suffices alone**; containers are zero-listener with zero platform secrets → even if compromised, there are no credentials to steal and no inbound path to exploit
 - **Residual risk, explicitly accepted**: FDEs are root inside their own container and can forge **their own** events/usage; cross-FDE is blocked by portal ownership checks (cannot affect others, cannot escalate to DB/LLM credentials) — a deliberate trade-off, not an oversight
+
+---
+
+## Host hardening · why a container cannot reach host services
+
+> Measured gap: FDE containers could reach host gitea / mssql / portainer through their bridge gateway IP (`.1` = the host) — one compromised FDE would have handed over every container on the machine (measured on our lab host).
+
+An FDE is **root inside its own container**, so file permissions, config locks and secret isolation cannot stop it. The only guarantee root cannot bypass is that **the network cannot reach it** — which is why this hardening lives in the host's netfilter, not in the container.
+
+Two layers are needed because Linux delivers them along two different paths:
+
+| Path | Chain | Rule essence |
+|---|---|---|
+| container → host-local service (gitea:3000, mssql:1433, portainer:9000) | `INPUT` (local delivery) | `-s <FDE CIDR> -j DROP` (443 excepted) |
+| container → published port (post-DNAT forwarding) | `FORWARD` → `DOCKER-USER` | `-s <FDE CIDR> -m conntrack --ctstate DNAT -j DROP` |
+
+`DOCKER-USER` is Docker's official extension point for user rules, and packets arrive there **already DNAT'd** — matching host addresses there is impossible by design, hence the conntrack match.
+
+**Why it cannot lock anyone out or break anything:** every DROP is scoped to FDE subnets, so management traffic (originating outside those subnets) never matches; the rules live in two own chains whose default action is `RETURN`, so non-FDE traffic falls straight back to the existing rules; Docker's own chains are never flushed and default policies are never changed. Rules are derived per FDE from `fde_networks` (exact `/29` or `/28`) — the `/16` pool is a value pool only, **never** an allow range.
+
+**Failure modes are fail-closed:** if rule generation or validation fails, the fallback is a blanket DROP for both pools (443 excepted), never a return to the open state. Bring-up is deliberately reversible — rules are applied by hand during acceptance (a plain reboot reverts them) with `iptables-apply -t 60` as an automatic rollback; persistence (systemd unit + Docker drop-in + reconciler drift detection) is enabled only after acceptance passes.
+
+**Acceptance (target environment, all must pass):** FDE → host `:443` ✅ reachable · FDE → host `:8080` / `:4000` ❌ · FDE → `gitea:3000` / `mssql:1433` / `portainer:9000` ❌ **all three** · FDE A → FDE B ❌ · FDE → DNS ✅ · FDE → internet per the security team's egress policy.
 
 ---
 
@@ -202,7 +223,7 @@ sequenceDiagram
 
 ## Mechanism Deep-Dive · The Preview Access Chain (port allocation → edge auth → container)
 
-> Spec refs: `fde-platform.md` §8 / §5.3 / §6, `topology.md` §4-L2, `portal.md` §2.7–2.8. This mechanism simultaneously achieves "users open a preview like any normal website" and "containers have zero inbound, zero published ports, and cannot self-register routes".
+> This mechanism simultaneously achieves "users open a preview like any normal website" and "containers have zero inbound, zero published ports, and cannot self-register routes".
 
 ```mermaid
 flowchart TB
@@ -228,3 +249,22 @@ flowchart TB
 - **Auth entirely at the edge, dev servers zero-modification**: the agent's app adds no login, no TLS, no CORS; forwardAuth decides in the Traefik middleware layer, and the credential system (one-time ticket → host-only preview cookie) is isolated from the portal login state — forwarding the link to someone else = 401
 - **Encryption responsibility concentrated in one place**: plain HTTP inside the container (the native form of dev servers), TLS seamlessly taken over by Traefik; plaintext exists only inside the single-FDE exclusive `/29` — no man-in-the-middle position exists
 - **Listen surface equals reachable surface exactly**: the dev server binds 0.0.0.0 (against convention) only because its sole client is the host's Traefik; ports are not published and cross-FDE traffic is dropped by DOCKER-ISOLATION — the actual reachable range of "listening on 0.0.0.0" collapses to a single point at the edge
+
+---
+
+## Security & network review notes
+
+> Short answers to the questions this design attracts most often from security and network reviewers. The last two entries are **open items we are asking the reviewers to weigh in on**, not settled decisions.
+
+| Question | Answer |
+|---|---|
+| Can a container bypass the gateway and call an LLM provider directly? | Not through the platform: the network-layer egress allowlist excludes LLM domains, so the gateway is the only reachable LLM exit. This rests on that network-layer policy rather than on platform code — a dependency we are asking the security team to own. |
+| Can a container forge another FDE's source IP to steal its identity? | Measured: the host runs `rp_filter = 2` (loose), so a forged source is not dropped by the kernel. But a spoofed source cannot complete a TCP handshake (replies are routed to the impersonated FDE), so no data can be read and no quota consumed; the residual exposure is blind traffic plus access-log attribution noise. A per-bridge anti-spoof rule (`-i br-fde-<name> ! -s <its CIDR> -j DROP`) would close even that. **Open item for review:** we recommend adding that rule to the baseline for every FDE. |
+| What if forwardAuth (portal) is down? | Fail-closed: Traefik's forwardAuth denies when the auth server errors or times out, so requests never reach the preview upstream. Fail-open configuration is forbidden. |
+| Who can reach the Docker API (`station-docker-proxy:2375`)? | Only portal, over the `backend` network, through an allowlisted socket proxy. Nothing is published, FDE containers are not members of that network, and no container mounts `docker.sock`. |
+| What happens to the firewall after a host or Docker restart? | A host reboot re-applies rules via the `station-firewall` unit; a Docker daemon restart rebuilds `DOCKER-USER` and drops our jump — covered by a `docker.service` drop-in plus reconciler drift detection. **Open item for review:** after a host reboot, containers (`unless-stopped`) may start a few seconds before the firewall unit applies — we propose an explicit ordering guarantee and would value the reviewers' input. |
+| Is the Traefik admin API / dashboard exposed? | No: `api: false` in static config — not the default, written explicitly. FDE containers are unavoidable Traefik clients, so a closed admin surface is treated as an immutable ingress property with its own acceptance item. |
+| How large does the routing configuration get, and what if publishing fails? | One router + one service per allocation (30 FDEs × their ports ≈ hundreds). The outbox reconciler debounces, validates, swaps atomically, keeps the last good version on failure, and targets P95 < 2 s from DB commit to Traefik reload. |
+| What exactly does a fully compromised container gain and lose? | **Gains:** forge its own events/usage/terminal state, burn its own quota, modify its own workspace. **Loses:** reach other FDEs, the DB, host services, or any LLM credential; register its own routes; reach the internet beyond the allowlist. Cross-FDE is blocked by portal ownership checks keyed on the per-container token. |
+| Does the firewall break container DNS or outbound NAT? | No: outbound NAT happens in the nat table's POSTROUTING chain, and DNS resolves through Docker's embedded resolver inside the netns (`127.0.0.11`) — neither traverses these two chains. Both chains accept `ESTABLISHED,RELATED` first, so in-flight FDE → host:443 sessions survive rule application. |
+| Where do the rules come from, and how do the four consumers stay consistent? | One derivation from `fde_networks` (exact `/29` or `/28` per FDE) feeds the internal `ipAllowList`, the LLM `ClientIP` match, `INPUT` and `DOCKER-USER` — a single source, so the four cannot drift. |

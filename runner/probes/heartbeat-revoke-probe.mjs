@@ -2,8 +2,10 @@
 // 必须成为唯一收敛信号（SSE /stream 保持打开不参与）——验证 beginRevoke 三信号同径。
 //   新代码：heartbeat 401 → beginRevoke → 收敛退出（~300ms）→ PROBE_OK
 //   旧代码：catch 吞成 warn 无限循环 → 10s 超时 PROBE_FAIL_TIMEOUT
-// 跑法：node runner/test/probes/heartbeat-revoke-probe.mjs（仓库根目录；不进 npm test 自动套件——
-// spawn 子进程 + http server，属探针性质）。负向对照：git show <旧ref>:runner/agentd.js 配 lib 副本跑同探针。
+// 跑法：node runner/probes/heartbeat-revoke-probe.mjs（仓库根目录）。⚠️ 必须放在 test/ 目录外：
+// node --test 会自动发现 test/**/*.mjs 并执行（copilot 复审抓出，2026-09-19 实测 ok 22 计入套件）——
+// 本探针 spawn 子进程 + http server + process.exit，属副作用性文件，不得进套件。
+// 负向对照：git show <旧ref>:runner/agentd.js 配 lib 副本跑同探针。
 // 探针 v2（issue #22 评审 F4 改造）：SSE /stream 保持打开（200 event-stream），仅 heartbeat 返回
 // 401 token_revoked —— heartbeat 401 成为唯一收敛信号。
 //   旧代码（main）：heartbeat 401 被 catch 吞成 warn 继续转，agentd 永不退出 → PROBE_FAIL（超时）

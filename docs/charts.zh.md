@@ -1,8 +1,8 @@
 # 架构图（中文版）
 
 > 三张图：① 简化数据流（PPT 级）② 网络架构 ③ 端到端时序。
-> 规格来源：`docs/design/fde-platform.md`；拓扑细节以 `docs/design/topology.md` 为准。
-> 英文版见 [`charts.en.md`](charts.en.md)。
+> 术语：**FDE** = Forward Deployed Engineer（平台使用者）；**run** = 一次 agent 任务；**preview** = FDE 容器内暴露到其浏览器的 dev server。
+> 另附两节：**宿主收紧原理**（图 2 之后）与**网络与安全评审说明**（文末）。
 
 ---
 
@@ -104,8 +104,6 @@ flowchart TB
 
 ### 为什么这样设计网络（安全考量）
 
-> 完整论据见 `topology.md`（§6 加固清单、§7 连通矩阵、§8 残余风险）；此处只列设计动机。
-
 - **出站受控（不是什么网都能上）**：FDE 容器虽有 shell，无法靠文件权限阻止他改配置——**唯一有效的保证是「网络到不了」**。出口白名单由安全团队在网络层实施；LLM 域名**不在**白名单 → 网关是唯一可达的 LLM 出口，改 endpoint/换 key 均无效
 - **LLM 调用无需容器持钥**：容器内**零 LLM 凭据**——config 里只有占位 key + `endpoint=llm.example.com`；真实虚拟 key 只存在于宿主 Traefik 动态配置（600，仅 portal 可写、Traefik 只读），请求过边缘时按**来源子网**判定身份后**覆盖注入** `Authorization`（容器自带的任何 key 均被覆盖）。安全价值：即使容器被完全攻破（含 root），也**拿不到任何 LLM 凭据**；且凭据永不落到容器磁盘/环境变量，无泄漏面可审计
 - **FDE 之间互不可达（防失控）**：横向越权的根因是共享网络——原 `control` 共享网络因此被取消。每 FDE 独占 `/29`，跨 bridge 转发被 DOCKER-ISOLATION 丢弃，隔离零配置、无第二条路
@@ -113,6 +111,29 @@ flowchart TB
 - **身份 = 网络位置**：internal API 与 LLM 链路都按来源子网判定（ipAllowList / ClientIP），凭据由 Traefik 覆盖注入——凭证偷不走、伪造头被 `aliasHeadersStrategy: delete` 与「不读 X-Forwarded-For」堵死
 - **纵深防御**：拓扑隔离（网络不可达）+ 边缘认证（forwardAuth）**两层缺一不可**；容器平台通道零入站、零平台密钥 → 即使被攻破也无凭据可偷、无入口可打
 - **明示接受的残余风险**：FDE 是自己容器的 root，可伪造**自己的**事件/用量；跨 FDE 由 portal 归属校验挡住（不能影响他人、不能越权读 DB/凭据）——这是有意为之的取舍，不是疏漏
+
+---
+
+## 宿主收紧 · 为什么容器摸不到宿主服务
+
+> 实测缺口：FDE 容器曾能经网桥网关 IP（`.1` = 宿主）访问宿主 gitea / mssql / portainer——一个 FDE 沦陷就等于交出整台机器上的所有容器（本机实测）。
+
+FDE 是自己容器的 **root**，所以文件权限、配置锁、密钥隔离都拦不住它。唯一骗不过 root 的保证是**网络到不了**——这就是收紧必须做在宿主内核 netfilter、而不是容器里的原因。
+
+必须两层，是因为内核里两条路不同：
+
+| 路径 | 链 | 规则要点 |
+|---|---|---|
+| 容器 → 宿主本地服务（gitea:3000 / mssql:1433 / portainer:9000） | `INPUT`（本地投递） | `-s <FDE CIDR> -j DROP`（443 除外） |
+| 容器 → publish 端口（DNAT 后转发） | `FORWARD` → `DOCKER-USER` | `-s <FDE CIDR> -m conntrack --ctstate DNAT -j DROP` |
+
+`DOCKER-USER` 是 Docker 官方的用户规则扩展点，且包到达时**目的地址已被 DNAT 改写**——在那里匹配宿主地址在设计上不可能，故用 conntrack 判定。
+
+**为什么不可能锁死管理通道、也不会误伤：** 每条 DROP 都限定来源为 FDE 子网，管理流量源地址不在此列 → 永不命中；规则放在两条自有链里、默认动作是 `RETURN`，非 FDE 流量直接落回既有规则；Docker 自建的链一条不 flush，默认策略一概不改。规则按 FDE 从 `fde_networks` 逐条派生（精确 `/29` 或 `/28`）——`/16` 只是取值池，**绝不**作为放行范围。
+
+**失败方向是 fail-closed：** 规则生成或校验失败时，兜底是对两个池整体 DROP（443 除外），绝不回到放行态。上线过程刻意可逆：验收期手工应用（重启即还原）+ `iptables-apply -t 60` 自动回滚；持久化（systemd unit + docker drop-in + reconciler 漂移检测）等验收全绿后再启用。
+
+**验收（目标环境，逐项必须通过）：** FDE → 宿主 `:443` ✅ 通 · FDE → 宿主 `:8080` / `:4000` ❌ · FDE → `gitea:3000` / `mssql:1433` / `portainer:9000` ❌ **三个全拒** · FDE A → FDE B ❌ · FDE → DNS ✅ · FDE → 互联网按安全团队出口策略。
 
 ---
 
@@ -202,7 +223,7 @@ sequenceDiagram
 
 ## 机制解析 · 预览访问链路（端口分配 → 边缘认证 → 容器）
 
-> 对应规格：`fde-platform.md` §8 / §5.3 / §6，`topology.md` §4-L2，`portal.md` §2.7–2.8。这套机制同时做到了「用户像访问普通网站一样点开预览」和「容器零入站、零发布、不自注册路由」。
+> 这套机制同时做到了「用户像访问普通网站一样点开预览」和「容器零入站、零发布、不自注册路由」。
 
 ```mermaid
 flowchart TB
@@ -228,3 +249,22 @@ flowchart TB
 - **认证全在边缘，dev server 零改造**：agent 写的 app 不加登录、不管 TLS、不配 CORS；forwardAuth 在 Traefik 中间件层完成判定，凭证体系（一次性 ticket → host-only 预览 cookie）与 portal 登录态隔离——链接转发给别人 = 403（preview_ticket_required / preview_ticket_used）
 - **加密责任集中一处**：容器内裸 HTTP（dev server 原生形态），TLS 由 Traefik 无缝接管；明文只存在于单 FDE 独占 `/29` 内——不存在中间人位置
 - **监听面与可达面精确相等**：dev server 绑 0.0.0（反常规）只因唯一的客户端是宿主 Traefik；端口不 publish、跨 FDE 被 DOCKER-ISOLATION 拦——「监听 0.0.0.0」的实际可达范围收敛为边缘一个点
+
+---
+
+## 网络与安全评审说明
+
+> 以下是本设计最常被网络与安全评审方追问的问题及简短回答。最后两条是**我们希望评审方一并拍板的开放项**，尚未定案。
+
+| 问题 | 回答 |
+|---|---|
+| 容器能不能绕过网关直连 LLM 提供商？ | 平台侧不能：网络层出口白名单不含 LLM 域名，网关是唯一可达的 LLM 出口。这条落在网络层策略上、而非平台代码上——是我们希望安全团队认领的依赖项。 |
+| 能不能伪造别的 FDE 源 IP 冒用身份？ | 实测本机 `rp_filter = 2`（loose），内核不会拦伪造源。但伪造源**完不成 TCP 握手**（回包路由给被冒用的 FDE），因此拿不到数据、也用不掉额度；残余暴露只剩盲打流量与访问日志归因噪音。按网桥加一条 `-i br-fde-<name> ! -s <其 CIDR> -j DROP` 可连这点也堵上。**待评审拍板：** 我们建议把这条规则列入每个 FDE 的基线。 |
+| forwardAuth（portal）挂了会怎样？ | fail-closed：认证服务报错或超时，Traefik 一律拒绝，请求到不了预览上游；禁止任何 fail-open 配置。 |
+| 谁能访问 Docker API（`station-docker-proxy:2375`）？ | 只有 portal，经 `backend` 网络、过带白名单的 socket proxy；不 publish，FDE 容器不是该网络成员，也没有任何容器挂 `docker.sock`。 |
+| 宿主/Docker 重启后防火墙怎么办？ | 宿主重启由 `station-firewall` unit 重新应用；docker daemon 重启会重建 `DOCKER-USER` 并丢掉我们的 jump——由 `docker.service` drop-in + reconciler 漂移检测兜住。**待评审拍板：** 宿主重启后，容器（`unless-stopped`）可能先于防火墙 unit 应用而启动数秒——我们建议加一条显式的启动顺序保证，也希望听听评审方意见。 |
+| Traefik 管理面（API/Dashboard）暴露吗？ | 不：静态配置显式 `api: false`（非默认值）。FDE 容器是 Traefik 的必然访问者，故管理面关闭被当作 ingress 的不可变属性并单列验收项。 |
+| 路由配置会有多大？发布失败怎么办？ | 每条 allocation 一条 router + 一条 service（30 FDE × 各自端口 ≈ 数百条）。outbox reconciler 做 debounce、校验、原子替换，失败保留上一版本，reload 目标 P95 < 2s（从 DB 落库到 Traefik 生效）。 |
+| 容器被完全攻破到底能拿到什么、又拿不到什么？ | **能**：伪造自己的事件/用量/终态、烧自己的额度、改自己的工作区。**不能**：碰其他 FDE、DB、宿主服务或任何 LLM 凭据；自注册路由；越过白名单上互联网。跨 FDE 由 portal 按 per-container token 做归属校验挡住。 |
+| 防火墙会不会弄坏容器 DNS 或出网 NAT？ | 不会：出网 NAT 在 nat 表 POSTROUTING，DNS 走 netns 内 Docker 内嵌解析器（`127.0.0.11`）——两条链都不经过。两条链首条都是 `ESTABLISHED,RELATED` 放行，因此应用规则的瞬间，已建立的 FDE → 宿主 :443 连接不受影响。 |
+| 规则从哪来、四处判定如何保持一致？ | 同一条派生：从 `fde_networks` 取每个 FDE 的精确 `/29` 或 `/28`，同时喂给 internal `ipAllowList`、LLM `ClientIP`、`INPUT`、`DOCKER-USER`——单一来源，四处不可能漂移。 |
