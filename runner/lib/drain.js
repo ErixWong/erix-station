@@ -8,6 +8,7 @@
  * 本模块把「等 worker 真退出（带 deadline 强杀）」抽成可注入、可单测的纯逻辑：
  *   1. 等全部在跑 worker exit（deadlineMs，默认 8s = abort 的 5s 宽限 + 余量）
  *   2. 仍未退出 → 注入的 kill（agentd 传 killProcessGroup，按进程组 SIGKILL）
+ *      ⚠️ 必须显式传 'SIGKILL'（评审 B 实测：不传信号时 process.kill 默认 SIGTERM，与「强杀」语义不符）
  *   3. 再等 killGraceMs（默认 2s）→ 仍不退出则如实报告 pending（D 状态的进程杀不掉，记日志）
  *
  * 判定「已退出」的契约：ctx.workerPid 由 onWorkerExit 置 null（agentd 现有行为）。
@@ -27,7 +28,7 @@ function waitAllOrTimeout(list, ms) {
 
 /**
  * @param {Iterable<object>} ctxs 在跑 run 的 ctx（需含 workerPid 与 exited）
- * @param {{deadlineMs?:number, killGraceMs?:number, kill?:(pid:number)=>void, log?:(msg:string, extra?:object)=>void}} [opts]
+ * @param {{deadlineMs?:number, killGraceMs?:number, kill?:(pid:number, signal:string)=>void, log?:(msg:string, extra?:object)=>void}} [opts]
  * @returns {Promise<{drained:boolean, killed:number, pending:number, waitedMs:number}>}
  */
 export async function drainRuns(ctxs, {
@@ -52,7 +53,7 @@ export async function drainRuns(ctxs, {
   let killed = 0;
   for (const ctx of left) {
     if (!ctx.workerPid) continue;
-    try { kill(ctx.workerPid); killed += 1; } catch { /* 进程已消失 */ }
+    try { kill(ctx.workerPid, 'SIGKILL'); killed += 1; } catch { /* 进程已消失 */ }
   }
   await waitAllOrTimeout(left, killGraceMs);
   const result = done(killed);

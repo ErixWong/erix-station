@@ -701,7 +701,9 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     }
     const networkRm = await removeFdeNetwork(docker, networkName, { log });
     if (!networkRm.ok) {
-      log.warn?.(`[provisioner] deprovision ${fdeName}: network removal failed; token already revoked, retry or reconciler cleanup`);
+      // 注：容器有 reconcile 孤儿分支自愈，**网络没有**对账清理路径（评审 B）——需重跑 deprovision-fde
+      // 或人工 `docker network rm`；且残留网络会因 `assertNetworkContract` 子网校验阻断同 FDE 的 re-onboard。
+      log.warn?.(`[provisioner] deprovision ${fdeName}: network removal failed; token already revoked, rerun deprovision or remove the network manually`);
       throw new Error(`deprovision ${fdeName}: network removal failed (token already revoked)`);
     }
 

@@ -27,15 +27,16 @@ test('drain：worker 及时退出 → drained，不 kill', async () => {
   assert.deepEqual(killed, [], '按时退出不得强杀');
 });
 
-test('drain：worker 挂住 → 到 deadline 强杀，杀后退出则 drained', async () => {
+test('drain：worker 挂住 → 到 deadline 强杀（必须显式 SIGKILL），杀后退出则 drained', async () => {
   const killed = [];
   const ctx = makeCtx({ pid: 4242 });
   const r = await drainRuns([ctx], {
     deadlineMs: 20,
     killGraceMs: 100,
-    kill: (pid) => { killed.push(pid); ctx.exit(); }, // 杀即退出
+    kill: (pid, signal) => { killed.push(`${pid}:${signal}`); ctx.exit(); }, // 杀即退出
   });
-  assert.deepEqual(killed, [4242], '必须在 deadline 后强杀');
+  // 评审 B 实测：不传 signal 时 process.kill 默认 SIGTERM（不是强杀）——必须显式 SIGKILL
+  assert.deepEqual(killed, ['4242:SIGKILL'], '必须在 deadline 后以 SIGKILL 强杀');
   assert.equal(r.drained, true);
   assert.equal(r.killed, 1);
 });
@@ -60,6 +61,6 @@ test('drain：多个 worker 部分退出 → 只强杀存活者', async () => {
   const r = await drainRuns([fast, slow], {
     deadlineMs: 30, killGraceMs: 50, kill: (pid) => { killed.push(pid); slow.exit(); },
   });
-  assert.deepEqual(killed, [2], '只杀未退出的那个');
+  assert.deepEqual(killed, [2], '只杀未退出的那个（快的那条不得被误杀）');
   assert.equal(r.drained, true);
 });
