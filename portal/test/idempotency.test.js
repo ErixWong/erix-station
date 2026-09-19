@@ -18,14 +18,17 @@ const TTL_MS = 24 * 60 * 60 * 1000;
 const STALE_MS = IDEMPOTENCY_IN_PROGRESS_STALE_MINUTES * 60 * 1000;
 
 /**
- * 内存 fake pool：模拟 idempotency_keys 的真实语义（含 state 机）。
+ * 内存 fake pool：模拟 idempotency_keys 的真实语义（含 state 机 + **claim_token owner fencing**）。
  * - findDone：`state='done'` 且未过期（TTL 24h）才命中；
- * - claim：无同名行 → 插入 in_progress；同名行仍「新鲜」（done 未过期 / in_progress 未超时）→ 0 行（并发输者）；
- *   同名 done 行已过期 → 原子覆盖为 in_progress（1 行）；
- * - takeOverStale：仅 state='in_progress' 且 ≥ 5 分钟（崩溃残留）→ 抢回（1 行）；
- * - complete / release：按 state 守卫改/删行；
+ * - claim：无同名行 → 插入 in_progress（写入本次 claim_token）；同名行仍「新鲜」→ 0 行；
+ *   同名 done 行已过期 → 原子覆盖为 in_progress（并改写 claim_token）；
+ * - takeOverStale：仅 state='in_progress' 且 ≥ 5 分钟（崩溃残留）→ 抢回（**改写 claim_token**）；
+ * - writeDone（转 done）：`state='in_progress' AND claim_token=$` 双条件，失配 → 0 行（fencing）；
+ * - release：`state='in_progress' AND claim_token=$` 双条件（不删别人/新持有者的占位）；
  * - jsonb 列（response）按 node-pg 真实行为解析为对象返回（不是字符串）。
  * `claimMisses` 用于模拟「占位被别人抢到」的窗口（前 N 次 claim 强制 0 行），`onClaimMiss` 可在该窗口 seed 赢家结果。
+ * `ledgerWrites` 计数台账 done 写入的来源（tx = 业务事务 client 内，pool = 幂等层补记），用于断言
+ * 「record 路径不再补记」（同事务记账生效）。
  */
 class FakeIdempotencyPool {
   constructor({ claimMisses = 0, onClaimMiss = null } = {}) {
@@ -33,14 +36,17 @@ class FakeIdempotencyPool {
     this.claimAttempts = 0;
     this.claimMisses = claimMisses;
     this.onClaimMiss = onClaimMiss;
+    this.ledgerWrites = { tx: 0, pool: 0 };
+    // 由 FakeTxClient 在代执行期间置位：用于区分「客户端的同事务记账」与「幂等层的补记」
+    this.inTxClient = null;
   }
 
-  seed({ userId, endpoint, key, requestHash: hash, state = 'done', statusCode = 202, response = {}, createdAt = new Date() }) {
+  seed({ userId, endpoint, key, requestHash: hash, state = 'done', statusCode = 202, response = {}, createdAt = new Date(), claimToken = null }) {
     this.rows = this.rows.filter((r) => !(r.user_id === userId && r.endpoint === endpoint && r.key === key));
     this.rows.push({
       user_id: userId, endpoint, key, request_hash: hash,
       state, status_code: state === 'done' ? statusCode : null, response: state === 'done' ? response : null,
-      created_at: createdAt,
+      claim_token: claimToken, created_at: createdAt,
     });
   }
 
@@ -63,7 +69,7 @@ class FakeIdempotencyPool {
     }
     if (s.startsWith('INSERT INTO idempotency_keys')) {
       this.claimAttempts += 1;
-      const [userId, endpoint, key, hash] = params;
+      const [userId, endpoint, key, hash, claimToken] = params;
       if (this.claimMisses > 0) { // 模拟并发赢家已抢到占位（本请求 DO UPDATE 的 WHERE 不成立 → 0 行）
         this.claimMisses -= 1;
         this.onClaimMiss?.(this);
@@ -72,35 +78,36 @@ class FakeIdempotencyPool {
       const existing = this.row({ userId, endpoint, key });
       if (existing) {
         if (existing.state === 'done' && existing.created_at.getTime() <= Date.now() - TTL_MS) {
-          Object.assign(existing, { request_hash: hash, state: 'in_progress', status_code: null, response: null, created_at: new Date() });
+          Object.assign(existing, { request_hash: hash, state: 'in_progress', status_code: null, response: null, claim_token: claimToken, created_at: new Date() });
           return { rows: [{ claimed: 1 }] };
         }
         return { rows: [] };
       }
       this.rows.push({
         user_id: userId, endpoint, key, request_hash: hash,
-        state: 'in_progress', status_code: null, response: null, created_at: new Date(),
+        state: 'in_progress', status_code: null, response: null, claim_token: claimToken, created_at: new Date(),
       });
       return { rows: [{ claimed: 1 }] };
     }
-    if (s.startsWith('UPDATE idempotency_keys SET request_hash = $4')) { // takeOverStale
-      const [userId, endpoint, key, hash] = params;
+    if (s.startsWith('UPDATE idempotency_keys SET request_hash = $4')) { // takeOverStale（抢回：改写 claim_token）
+      const [userId, endpoint, key, hash, claimToken] = params;
       const row = this.row({ userId, endpoint, key });
       if (!row || row.state !== 'in_progress' || row.created_at.getTime() > Date.now() - STALE_MS) return { rows: [] };
-      Object.assign(row, { request_hash: hash, state: 'in_progress', status_code: null, response: null, created_at: new Date() });
+      Object.assign(row, { request_hash: hash, state: 'in_progress', status_code: null, response: null, claim_token: claimToken, created_at: new Date() });
       return { rows: [{ claimed: 1 }] };
     }
-    if (s.startsWith(`UPDATE idempotency_keys SET state = 'done'`)) { // complete
-      const [userId, endpoint, key, statusCode, response] = params;
+    if (s.startsWith(`UPDATE idempotency_keys SET state = 'done'`)) { // writeDone（state + claim_token 双条件）
+      const [userId, endpoint, key, statusCode, response, claimToken] = params;
+      this.ledgerWrites[this.inTxClient ? 'tx' : 'pool'] += 1;
       const row = this.row({ userId, endpoint, key });
-      if (!row || row.state !== 'in_progress') return { rows: [] };
+      if (!row || row.state !== 'in_progress' || row.claim_token !== claimToken) return { rows: [], rowCount: 0 };
       Object.assign(row, { state: 'done', status_code: statusCode, response: JSON.parse(response) });
-      return { rows: [{ ok: 1 }] };
+      return { rows: [{ ok: 1 }], rowCount: 1 };
     }
-    if (s.startsWith('DELETE FROM idempotency_keys WHERE user_id') && s.includes(`state = 'in_progress'`)) { // release
-      const [userId, endpoint, key] = params;
+    if (s.startsWith('DELETE FROM idempotency_keys WHERE user_id') && s.includes(`state = 'in_progress'`)) { // release（state + claim_token 双条件）
+      const [userId, endpoint, key, claimToken] = params;
       const before = this.rows.length;
-      this.rows = this.rows.filter((r) => !(r.user_id === userId && r.endpoint === endpoint && r.key === key && r.state === 'in_progress'));
+      this.rows = this.rows.filter((r) => !(r.user_id === userId && r.endpoint === endpoint && r.key === key && r.state === 'in_progress' && r.claim_token === claimToken));
       return { rows: [], rowCount: before - this.rows.length };
     }
     if (s.startsWith('DELETE FROM idempotency_keys WHERE created_at')) { // purgeExpired
@@ -109,6 +116,57 @@ class FakeIdempotencyPool {
       return { rows: [], rowCount: before - this.rows.length };
     }
     throw new Error(`unexpected SQL in fake pool: ${sql}`);
+  }
+}
+
+/**
+ * 业务事务 fake client（模拟 `sessions.postMessage` 的连接）：
+ * BEGIN → 业务写入 → `record(client, 202, payload)` → COMMIT/ROLLBACK。
+ * 台账写写入**真的落到 pool**（故 record 能立即看到 fencing 的 0 行），ROLLBACK 则回滚到 BEGIN 时的快照
+ * （模拟 Postgres 事务回滚）——用于验证「记账与业务写入同事务」。
+ * 台账写入计到 `pool.ledgerWrites.tx`（幂等层的补记计到 `.pool`），供断言「record 路径不再补记」。
+ */
+class FakeTxClient {
+  constructor(pool) {
+    this.pool = pool;
+    this.snapshot = structuredClone(pool.rows);
+    this.committed = false;
+  }
+
+  async query(sql, params = []) {
+    const s = sql.replace(/\s+/g, ' ').trim();
+    if (s === 'BEGIN') return { rows: [] };
+    if (s === 'COMMIT') { this.snapshot = null; this.committed = true; return { rows: [] }; }
+    if (s === 'ROLLBACK') {
+      if (this.snapshot) this.pool.rows = this.snapshot;
+      this.snapshot = null;
+      return { rows: [] };
+    }
+    if (s.startsWith('INSERT INTO messages')) return { rows: [{ id: 'm-tx', seq: 1 }] }; // 业务写入（fake）
+    if (s.startsWith('UPDATE idempotency_keys')) {
+      const prev = this.pool.inTxClient;
+      this.pool.inTxClient = this;
+      try { return await this.pool.query(sql, params); } finally { this.pool.inTxClient = prev; }
+    }
+    throw new Error(`unexpected SQL in fake tx client: ${sql}`);
+  }
+}
+
+/**
+ * 模拟 sessions.postMessage 的业务事务：BEGIN → 写消息 → record(client,…) → COMMIT/ROLLBACK。
+ * 与真实实现同构：record 抛错（占位被接管）→ ROLLBACK → 原样 rethrow（业务写入与记账一起回滚）。
+ */
+async function businessTx(pool, record, payload = { message: { id: 'm-new' }, run: { id: 'r-new' } }) {
+  const client = new FakeTxClient(pool);
+  await client.query('BEGIN');
+  try {
+    await client.query(`INSERT INTO messages (session_id, seq, role) VALUES ($1, $2, $3)`, ['s1', 1, 'user']);
+    if (record) await record(client, 202, payload);
+    await client.query('COMMIT');
+    return { client, payload };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
   }
 }
 
@@ -420,4 +478,173 @@ test('purgeExpired：只清过期行，返回删除条数', async () => {
   assert.equal(purged, 2);
   assert.deepEqual(pool.rows.map((r) => r.key), ['fresh']);
   assert.equal(await purgeExpired(pool), 0);
+});
+
+// ---------------------------------------------------------------------------
+// PR #26 修复轮 2（G2）：记账并入业务事务（record）+ claim_token owner fencing
+// ---------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+test('G2 record 路径：fn 在自身事务内记账（同 client）→ 台账 done 不再由幂等层补记', async () => {
+  const pool = new FakeIdempotencyPool();
+  let calls = 0;
+  const res = await executeWithIdempotency(pool, ctx(), async (record) => {
+    calls += 1;
+    const { payload } = await businessTx(pool, record);
+    return { statusCode: 202, response: payload };
+  });
+  assert.equal(calls, 1);
+  assert.equal(res.replayed, false);
+  assert.equal(pool.rows.length, 1);
+  assert.equal(pool.rows[0].state, 'done', 'record 已把台账转 done');
+  assert.equal(pool.rows[0].status_code, 202);
+  assert.deepEqual(pool.rows[0].response, { message: { id: 'm-new' }, run: { id: 'r-new' } });
+  assert.match(pool.rows[0].claim_token, UUID_RE, '占位时写入 claim_token（UUID），done 后保留');
+  assert.deepEqual(pool.ledgerWrites, { tx: 1, pool: 0 }, '记账恰好一次且经业务事务 client（幂等层不再补记）');
+
+  // 同 key 重发 → 回放（不执行 fn，也不再记账）
+  const again = await executeWithIdempotency(pool, ctx(), async (record) => {
+    calls += 1;
+    const { payload } = await businessTx(pool, record);
+    return { statusCode: 202, response: payload };
+  });
+  assert.equal(again.replayed, true);
+  assert.equal(calls, 1);
+  assert.deepEqual(again.response, { message: { id: 'm-new' }, run: { id: 'r-new' } });
+  assert.deepEqual(pool.ledgerWrites, { tx: 1, pool: 0 });
+});
+
+test('G2 同事务：fn 的事务 ROLLBACK → 台账不留 done（记账与业务写入同事务）', async () => {
+  const pool = new FakeIdempotencyPool();
+  const res = await executeWithIdempotency(pool, ctx(), async (record) => {
+    const client = new FakeTxClient(pool);
+    await client.query('BEGIN');
+    await record(client, 202, { message: { id: 'm-rollback' } });
+    await client.query('ROLLBACK');
+    return { statusCode: 202, response: { message: { id: 'm-rollback' } } };
+  });
+  assert.equal(res.replayed, false);
+  assert.equal(pool.rows[0].state, 'in_progress', '业务事务回滚 → 台账不得留 done（无幻影结果）');
+  assert.equal(pool.rows[0].response, null);
+  assert.equal(pool.rows[0].status_code, null);
+});
+
+test('G2 向后兼容：fn 不调用 record → 幂等层补记（业务提交后才写台账，既有残余窗口）', async () => {
+  const pool = new FakeIdempotencyPool();
+  const res = await executeWithIdempotency(pool, ctx(), ok('m-legacy', 'r-legacy'));
+  assert.equal(res.replayed, false);
+  assert.deepEqual(pool.ledgerWrites, { tx: 0, pool: 1 }, '补记路径经 pool（非 fn 事务）');
+  assert.equal(pool.rows[0].state, 'done');
+  assert.deepEqual(pool.rows[0].response, { message: { id: 'm-legacy' }, run: { id: 'r-legacy' } });
+});
+
+test('G2 fencing：record 在占位被接管后调用 → 409 idempotency_conflict(retryable)，业务事务回滚且不写 done', async () => {
+  const pool = new FakeIdempotencyPool();
+  await assert.rejects(
+    () => executeWithIdempotency(pool, ctx(), async (record) => {
+      pool.rows[0].claim_token = 'other-owner-token'; // 模拟占位已被其它请求抢回（owner 变更）
+      const { payload } = await businessTx(pool, record);
+      return { statusCode: 202, response: payload };
+    }),
+    (e) => e instanceof IdempotencyError
+      && e.code === 'idempotency_conflict' && e.httpStatus === 409 && e.retryable === true,
+  );
+  assert.equal(pool.ledgerWrites.tx, 1, 'record 尝试了一次 UPDATE');
+  assert.equal(pool.rows[0].state, 'in_progress', '输者不得把台账写成 done');
+  assert.equal(pool.rows[0].claim_token, 'other-owner-token', '新持有者的 token 未被覆写');
+  assert.equal(pool.rows[0].response, null);
+});
+
+test('G2 fencing：release 带 claim_token —— 占位被接管后旧 owner 的释放不删新占位', async () => {
+  const pool = new FakeIdempotencyPool();
+  const boom = new Error('postMessage failed');
+  await assert.rejects(
+    () => executeWithIdempotency(pool, ctx(), async () => {
+      pool.rows[0].claim_token = 'other-owner-token'; // fn 执行期间占位被抢回
+      throw boom;
+    }),
+    (e) => e === boom,
+  );
+  assert.equal(pool.rows.length, 1, '不得删掉新持有者的占位行');
+  assert.equal(pool.rows[0].claim_token, 'other-owner-token');
+  assert.equal(pool.rows[0].state, 'in_progress');
+});
+
+test('G2 fencing：补记路径同样带 claim_token —— 占位被接管后补记 0 行（告警但不改写台账）', async () => {
+  const pool = new FakeIdempotencyPool();
+  const warns = [];
+  const res = await executeWithIdempotency(pool, ctx({ log: { warn: (m) => warns.push(m) } }), async () => {
+    pool.rows[0].claim_token = 'other-owner-token'; // fn 执行期间占位被抢回
+    return { statusCode: 202, response: { message: { id: 'm-loser' } } };
+  });
+  assert.equal(res.statusCode, 202, '业务已提交 → 按 fn 结果返回（该路径的残余窗口见 portal.md §1.4）');
+  assert.equal(pool.rows[0].state, 'in_progress', '不得覆写新持有者的占位');
+  assert.equal(pool.rows[0].claim_token, 'other-owner-token');
+  assert.equal(warns.length, 1, '补记失配必须告警（不静默）');
+  assert.match(warns[0], /claim_token 失配/);
+});
+
+test('G2 fencing：stale 抢回后旧 owner 的迟到记账不生效（token 失配，行仍属新 owner）', async () => {
+  const pool = new FakeIdempotencyPool();
+  // 崩溃残留：6 分钟前的 in_progress 占位，持有者 token = old-token
+  pool.seed({
+    userId: 'u1', endpoint: ctx().endpoint, key: 'k-1', requestHash: ctx().requestHash,
+    state: 'in_progress', createdAt: new Date(Date.now() - (STALE_MS + 60_000)), claimToken: 'old-token',
+  });
+  let takenToken = null;
+  let lateRowCount = null;
+  const res = await executeWithIdempotency(pool, ctx(), async (record) => {
+    takenToken = pool.rows[0].claim_token;
+    // 旧 owner（崩溃后苏醒）此刻迟到补记：state='in_progress' 成立、仅 claim_token 失配 → 必须 0 行
+    const late = await pool.query(
+      `UPDATE idempotency_keys
+          SET state = 'done', status_code = $4, response = $5
+        WHERE user_id = $1 AND endpoint = $2 AND key = $3
+          AND state = 'in_progress' AND claim_token = $6`,
+      ['u1', ctx().endpoint, 'k-1', 202, JSON.stringify({ message: { id: 'stale-ghost' } }), 'old-token'],
+    );
+    lateRowCount = late.rowCount;
+    assert.equal(pool.rows[0].state, 'in_progress', '迟到记账后行仍为 in_progress（未被旧 owner 写死）');
+    const { payload } = await businessTx(pool, record);
+    return { statusCode: 202, response: payload };
+  });
+  assert.notEqual(takenToken, 'old-token', '抢回后 token 已改写为本次请求');
+  assert.equal(lateRowCount, 0, '旧 owner 迟到记账 0 行（state 匹配、claim_token 失配 → fencing 生效）');
+  assert.equal(res.replayed, false);
+  assert.equal(pool.rows[0].state, 'done');
+  assert.deepEqual(pool.rows[0].response, { message: { id: 'm-new' }, run: { id: 'r-new' } },
+    '台账是新 owner 的结果（迟到写入未覆写）');
+});
+
+test('G2 record：未传业务事务 client → TypeError（编程错误，不落台账）', async () => {
+  const pool = new FakeIdempotencyPool();
+  await assert.rejects(
+    () => executeWithIdempotency(pool, ctx(), async (record) => {
+      await record(undefined, 202, {});
+      return ok()();
+    }),
+    (e) => e instanceof TypeError,
+  );
+  assert.equal(pool.rows.length, 0, 'fn 抛错 → 释放本 owner 的占位行');
+});
+
+test('G2 release 的 DB 错误不再静默吞：告警后照旧 rethrow 原错误（M-5）', async () => {
+  const pool = new FakeIdempotencyPool();
+  const origQuery = pool.query.bind(pool);
+  pool.query = async (sql, params) => {
+    if (sql.replace(/\s+/g, ' ').trim().startsWith('DELETE FROM idempotency_keys')) {
+      throw new Error('connection terminated');
+    }
+    return origQuery(sql, params);
+  };
+  const warns = [];
+  const boom = new Error('postMessage failed');
+  await assert.rejects(
+    () => executeWithIdempotency(pool, ctx({ log: { warn: (m) => warns.push(m) } }), async () => { throw boom; }),
+    (e) => e === boom, // 原错误原样 rethrow（不被 release 的 DB 错误替换）
+  );
+  assert.equal(warns.length, 1, '释放失败必须告警');
+  assert.match(warns[0], /占位释放失败/);
+  assert.equal(pool.rows[0].state, 'in_progress', '释放失败 → 占位残留，等 stale 窗口被后续请求抢回');
 });

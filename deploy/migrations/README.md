@@ -39,8 +39,9 @@
   （= `migrate.js` 的 `defaultMigrationsDir()`）。
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
-- 现状：`0001-idempotency-keys.sql`（写操作幂等台账 `idempotency_keys`）。首次部署到已有库时
-  需显式跑一次迁移（`MIGRATE_ON_START=0` 的栈不会自动应用增量）。
+- 现状：`0001-idempotency-keys.sql`（写操作幂等台账 `idempotency_keys`）。**P1 compose 显式设
+  `MIGRATE_ON_START: "1"`**——单实例平台起栈即自动补增量，不再需要人工补跑（deploy-contract §3.1）；
+  多实例部署必须置 `0` 并外部跑迁移。
 
 > 迁移身份 = `station_platform`（DDL，表 owner）；运行时身份 = `station_portal`（最小 DML）。
 > 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。

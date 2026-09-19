@@ -222,10 +222,16 @@ export async function archiveSession(pool, { userId, sessionId }) {
 /**
  * POST /api/sessions/:id/messages —— 发用户消息 + 建 run 入队（portal.md §4.3）。
  * 事务内：锁 session（串行化并发发送）→ 活跃 run 检查（409 run_in_progress）→
- * seq 原子分配写 user 消息 → 建 run + run_queue → COMMIT → 唤醒 claim（runner §4.2）。
+ * seq 原子分配写 user 消息 → 建 run + run_queue → **幂等台账转 done（record，同事务）** → COMMIT
+ * → 唤醒 claim（runner §4.2）。
  * 拉模型（终态）语义：落库即 202，FDE 不在线时 run 在队列等待（§6.3）。
+ *
+ * `record`（可选）由幂等层注入（idempotency.js `executeWithIdempotency` 传给 fn 的回调，G2）：
+ * 在 COMMIT 前以**同一个 client** 调 `record(client, 202, payload)`，使「消息/run 写入」与「幂等台账
+ * 转 done」落在同一事务提交——否则「业务已提交、记账未提交」的崩溃窗口会让客户端重发时再执行一次。
+ * record 命中 0 行（占位已被其它 owner 接管）会抛 409 → 本事务 ROLLBACK，不产生第二次副作用。
  */
-export async function postMessage(pool, { userId, sessionId, content, attachments, notify }) {
+export async function postMessage(pool, { userId, sessionId, content, attachments, notify, record }) {
   // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
   const valid = validateMessageBody({ content, attachments });
   const safeContent = valid.content;
@@ -279,8 +285,7 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
     // 消息关联 run（user 消息 = 它触发的 run）
     await client.query(`UPDATE messages SET run_id = $2 WHERE id = $1`, [msg.rows[0].id, runId]);
 
-    await client.query('COMMIT');
-    committed = {
+    const payload = {
       message: {
         id: msg.rows[0].id,
         run_id: runId,
@@ -293,6 +298,12 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       },
       run: { id: run.rows[0].id, status: run.rows[0].status },
     };
+
+    // G2：幂等记账并入业务事务（同 client 同事务）——状态码取本端点的契约值 202（portal.md §4.3）。
+    if (record) await record(client, 202, payload);
+
+    await client.query('COMMIT');
+    committed = payload;
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
