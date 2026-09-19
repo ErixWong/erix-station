@@ -26,6 +26,7 @@ import {
   createRecallTool,
 } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc } from './lib/ipc.js';
+import { resolveRunModel } from './lib/llm-models.js';
 
 const nextReqId = createReqIdGenerator();
 let runStart = null;
@@ -244,10 +245,14 @@ async function startRun(msg) {
   // 1) provider（§6.3-1：config.json 占位 key + endpoint；真实 key 由 Traefik 注入）。
   const modelProvider = createJsonFileModelConfigProvider({ path: modelConfigPath });
   const defaultCfg = await modelProvider.resolve('default');
+  // issue #38 Phase B2：RUN_START 带下行模型集（run 边界生效的快照）→ 请求体 model 字段用下行真模型名；
+  // 旧 agentd / 无配置（msg 无 models）→ 占位 config 的 model 名（现状行为）。endpoint/key 始终走占位文件。
+  // models 只经 IPC 内存传递，**不写任何文件/日志**。
+  const modelName = resolveRunModel(defaultCfg.model, msg.models);
   const provider = createOpenAIProvider({
     endpoint: defaultCfg.endpoint,
     apiKey: defaultCfg.apiKey,
-    model: defaultCfg.model,
+    model: modelName,
   });
 
   // 3) tools（§6.3-3：jail + file-tools + registry + recall；approvals 钩子 P2 留空）。

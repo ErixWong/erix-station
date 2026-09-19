@@ -271,6 +271,36 @@ export async function getFdeLlmConfig(pool, userId) {
   };
 }
 
+/**
+ * 心跳下行模型集（issue #38 Phase B2）：agent 用真模型名的传导通道。
+ * 单条轻量 JOIN（fde_llm_bindings active + provider enabled），**不含 api_key**——key 绝不进心跳响应。
+ * main 仅取 tool_calling=true 的模型（setFdeLlmConfig 写入时已校验，此处再过滤防目录被改后下行失真）。
+ * @returns null（无 active binding / provider 停用 / 无可用模型）| { main?, embedding?, vision? }（均为上游 model_id）
+ */
+export async function getFdeLlmHeartbeatModels(pool, userId) {
+  const r = await pool.query(
+    `SELECT mm.model_id AS main_upstream,
+            em.model_id AS embedding_upstream,
+            vm.model_id AS vision_upstream
+       FROM fde_llm_bindings b
+       JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
+       LEFT JOIN llm_models mm ON mm.id = b.main_model_id AND mm.enabled = true AND mm.tool_calling = true
+       LEFT JOIN llm_models em ON em.id = b.embedding_model_id AND em.enabled = true AND em.type = 'embedding'
+       LEFT JOIN llm_models vm ON vm.id = b.vision_model_id AND vm.enabled = true AND vm.type = 'vision'
+      WHERE b.fde_id = $1 AND b.state = 'active'`,
+    [userId],
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+  const models = {};
+  if (row.main_upstream != null) models.main = { model: row.main_upstream, type: 'text' };
+  if (row.embedding_upstream != null) models.embedding = { model: row.embedding_upstream, type: 'embedding' };
+  if (row.vision_upstream != null) models.vision = { model: row.vision_upstream, type: 'vision' };
+  // 不下发空对象：main 为必备位（setFdeLlmConfig 强制），它缺失说明目录被改到不可用 → 整体不下行。
+  if (!models.main) return null;
+  return models;
+}
+
 /** admin 回显版：api_key 只给掩码（红线 ②）；无配置 → null。 */
 export async function getFdeLlmEcho(pool, fdeName) {
   const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);

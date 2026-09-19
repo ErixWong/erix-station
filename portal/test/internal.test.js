@@ -499,3 +499,91 @@ test('B：session hub 溢出只影响溢出客户端；live 客户端继续收�
   unregisterSessionClient('s-multi', liveRec);
   assert.equal(hubStats().sessionClients, 0);
 });
+
+// ---------------------------------------------------------------------------
+// issue #38 Phase B2：心跳下行模型集（agent 用真模型名的传导通道）
+// ---------------------------------------------------------------------------
+
+/** 心跳 models 现场构造：active binding + enabled provider + 三槽位模型。 */
+function seedLlmHeartbeat(overrides = {}) {
+  const base = seedClaimable();
+  base.pool.llm.providers = [{ id: 'p1', enabled: true }];
+  base.pool.llm.models = [
+    { id: 'm-main', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', tool_calling: true, enabled: true },
+    { id: 'm-emb', provider_id: 'p1', model_id: 'text-embedding-3', type: 'embedding', tool_calling: false, enabled: true },
+    { id: 'm-vis', provider_id: 'p1', model_id: 'gpt-4o-vision', type: 'vision', tool_calling: false, enabled: true },
+  ];
+  base.pool.llm.bindings = [{
+    fde_id: base.userId, state: 'active', provider_id: 'p1',
+    main_model_id: 'm-main', embedding_model_id: 'm-emb', vision_model_id: 'm-vis',
+  }];
+  Object.assign(base.pool.llm, overrides.llm ?? {});
+  if (overrides.binding) Object.assign(base.pool.llm.bindings[0], overrides.binding);
+  return base;
+}
+
+test('心跳下行模型集：active binding → 下发 main/embedding/vision（上游 model_id，非 uuid）', async () => {
+  const { pool, userId, containerId } = seedLlmHeartbeat();
+  const hb = await heartbeat(pool, {
+    container: { id: containerId, user_id: userId },
+    user: { id: userId, login: 'alice' },
+    body: { agent_version: '0.1', runs: [] },
+  });
+  assert.deepEqual(hb.models, {
+    main: { model: 'gpt-4o', type: 'text' },
+    embedding: { model: 'text-embedding-3', type: 'embedding' },
+    vision: { model: 'gpt-4o-vision', type: 'vision' },
+  });
+  const all = JSON.stringify(hb.models);
+  assert.ok(!all.includes('m-main'), '下行的是上游 model_id，不是模型行 uuid');
+});
+
+test('心跳下行模型集：仅 main 位 → 只下发 main；binding revoked / 无配置 → models=null（不下发空对象）', async () => {
+  // 仅 main（无 embedding/vision 位）
+  const a = seedLlmHeartbeat({ binding: { embedding_model_id: null, vision_model_id: null } });
+  const hbA = await heartbeat(a.pool, {
+    container: { id: a.containerId, user_id: a.userId },
+    user: { id: a.userId, login: 'alice' },
+    body: { runs: [] },
+  });
+  assert.deepEqual(hbA.models, { main: { model: 'gpt-4o', type: 'text' } });
+
+  // revoked → null
+  const b = seedLlmHeartbeat({ binding: { state: 'revoked' } });
+  const hbB = await heartbeat(b.pool, {
+    container: { id: b.containerId, user_id: b.userId },
+    user: { id: b.userId, login: 'alice' },
+    body: { runs: [] },
+  });
+  assert.equal(hbB.models, null);
+
+  // 无 binding 行 → null
+  const c = seedLlmHeartbeat({ llm: { bindings: [] } });
+  const hbC = await heartbeat(c.pool, {
+    container: { id: c.containerId, user_id: c.userId },
+    user: { id: c.userId, login: 'alice' },
+    body: { runs: [] },
+  });
+  assert.equal(hbC.models, null);
+});
+
+test('心跳下行模型集：provider 停用 / main 位 tool_calling=false → models=null（不下发半残配置）', async () => {
+  // provider 停用 → null
+  const a = seedLlmHeartbeat({ llm: { providers: [{ id: 'p1', enabled: false }] } });
+  const hbA = await heartbeat(a.pool, {
+    container: { id: a.containerId, user_id: a.userId },
+    user: { id: a.userId, login: 'alice' },
+    body: { runs: [] },
+  });
+  assert.equal(hbA.models, null);
+
+  // main 模型 tool_calling 被目录改掉 → 缺 main → 整体 null
+  const b = seedLlmHeartbeat();
+  b.pool.llm.models.find((m) => m.id === 'm-main').tool_calling = false;
+  const hbB = await heartbeat(b.pool, {
+    container: { id: b.containerId, user_id: b.userId },
+    user: { id: b.userId, login: 'alice' },
+    body: { runs: [] },
+  });
+  assert.equal(hbB.models, null);
+});

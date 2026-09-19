@@ -16,6 +16,8 @@ import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
 import * as llm from './llm.js';
+import * as admin from './admin.js';
+import { createDockerClient, onboardFde } from './provisioner.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -164,7 +166,7 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
   }
 }
 
-export function createServer({ pool, config, log = console }) {
+export function createServer({ pool, config, log = console, docker = null }) {
   const loginLimiter = createRateLimiter(config.loginRateLimit);
   // TOTP 失败限流按「账户 + IP」计数（防换新 pending_token 绕过）；单 token 尝试上限单独计。
   const totpLimiter = createRateLimiter({
@@ -190,7 +192,16 @@ export function createServer({ pool, config, log = console }) {
     blockMs: 60 * 1000,
     maxEntries: 10000,
   });
-  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter };
+  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter, docker };
+  // issue #38 Phase B2 admin UI：portal serve 进程本就有 config.dockerHost（cli.js serve 的
+  // startProvisionerLoop 也用它自建 client——调查结论见 Phase B2 报告），故 provision 端点**可实现**：
+  // 按需懒建并缓存 docker client（不持有连接，仅 HTTP 工厂）。测试可经 createServer({ docker }) 注入。
+  let lazyDocker = null;
+  ctx.adminDocker = () => {
+    if (ctx.docker) return ctx.docker;
+    if (!lazyDocker) lazyDocker = createDockerClient({ dockerHost: ctx.config.dockerHost });
+    return lazyDocker;
+  };
 
   return http.createServer(async (req, res) => {
     try {
@@ -222,6 +233,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof admin.AdminError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -244,6 +259,29 @@ function decodeUuid(raw) {
 async function route(req, res, ctx) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
+
+  // admin UI 页面（issue #38 Phase B2）：GET /admin 服务 admin.html。
+  // 未登录 → 302 /（与登录页同入口）；非 admin → 403（与 /api/admin/* 的错误信封一致）。
+  if (pathname === '/admin') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    }
+    let session = null;
+    try {
+      session = await requireSession(req, ctx);
+    } catch {
+      session = null; // 未登录 → 302 到登录页
+    }
+    if (!session) {
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
+    }
+    if (session.user.role !== 'admin') {
+      return sendJson(res, 403, errorBody('forbidden', 'forbidden'));
+    }
+    return sendStaticFile(res, path.join(path.resolve(ctx.config.staticDir), 'admin.html'));
+  }
 
   if (pathname === '/healthz' || pathname === '/api/health') {
     if (req.method !== 'GET') {
@@ -462,6 +500,53 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
+  // admin 用户管理（issue #38 Phase B2 admin UI）
+  if (pathname === '/api/admin/users') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await admin.listUsers(ctx.pool));
+    }
+    if (req.method === 'POST') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const created = await admin.createUser(ctx.pool, {
+        actorId: session.user.id,
+        login: body?.login,
+        display_name: body?.display_name,
+        password: body?.password,
+        fde_name: body?.fde_name,
+        totpIssuer: ctx.config.totp?.issuer,
+        limits: {
+          maxLoginLength: ctx.config.maxLoginLength,
+          maxPasswordLength: ctx.config.maxPasswordLength,
+        },
+      });
+      // totp_secret 仅此响应出现一次（红线）；列表/其它端点永不回显。
+      return sendJson(res, 201, created);
+    }
+  }
+
+  // FDE 容器 provision（调查结论：portal serve 进程有 config.dockerHost，client 懒建，端点可实现）
+  const adminProvisionMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/provision$/);
+  if (adminProvisionMatch && req.method === 'POST') {
+    const fdeName = decodeURIComponent(adminProvisionMatch[1]);
+    if (!projects.validateFdeName(fdeName).ok) {
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    }
+    let out;
+    try {
+      out = await onboardFde(ctx.pool, ctx.config, { fdeName, docker: ctx.adminDocker(), log: ctx.log });
+    } catch (err) {
+      // 对账循环仍在后台跑，失败不致命——把原因回给 admin（无敏感信息）。
+      throw new HttpError(500, 'provision_failed', String(err?.message ?? err));
+    }
+    return sendJson(res, 200, {
+      fde: fdeName,
+      network: out.networkName,
+      subnet: out.subnet,
+      container: out.containerName,
+    });
+  }
+
   // per-FDE LLM 配置（回显只给掩码；api_key 缺省 = 保留旧值）
   const adminFdeLlmMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm$/);
   if (adminFdeLlmMatch) {
@@ -470,9 +555,15 @@ async function handleAdminApi(req, res, ctx, url) {
       throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
     }
     if (req.method === 'GET') {
-      // 无配置 200 + null；api_key 永不出响应（只掩码）
+      // 无配置 200 + null；api_key 永不出响应（只掩码）。
+      // active_run（口径同 sessions.js ACTIVE_RUN_STATES）：true 时 UI 提示「换供应商影响进行中的 run」。
       const config = await llm.getFdeLlmEcho(ctx.pool, fdeName);
-      return sendJson(res, 200, { config });
+      let activeRun = false;
+      if (config) {
+        const u = await ctx.pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+        if (u.rows[0]) activeRun = await admin.fdeHasActiveRun(ctx.pool, u.rows[0].id);
+      }
+      return sendJson(res, 200, { config, active_run: activeRun });
     }
     if (req.method === 'PUT') {
       requireJson(req);
@@ -1188,6 +1279,17 @@ async function serveStatic(req, res, ctx, url) {
   if (relPath.startsWith('..') || path.isAbsolute(relPath)) {
     return sendJson(res, 403, errorBody('forbidden', 'forbidden'));
   }
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return sendJson(res, 404, errorBody('not_found', 'not found'));
+    return sendStaticFile(res, filePath);
+  } catch {
+    return sendJson(res, 404, errorBody('not_found', 'not found'));
+  }
+}
+
+/** 发送单个静态文件（/admin 页面与 serveStatic 共用；不存在走 404）。 */
+function sendStaticFile(res, filePath) {
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile()) return sendJson(res, 404, errorBody('not_found', 'not found'));
