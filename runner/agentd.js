@@ -196,7 +196,7 @@ function openSse() {
         if (!res.ok || !res.body) {
           const text = await res.text().catch(() => '');
           if (res.status === 401) {
-            state.revokeReason = 'token_revoked';
+            beginRevoke('token_revoked');
             log('warn', 'sse 401 token_revoked');
             return;
           }
@@ -263,13 +263,8 @@ function handleSseChunk(raw) {
     return;
   }
   if (event === 'revoke') {
-    state.revokeReason = payload?.reason ?? 'revoked';
-    log('warn', 'revoke received', { reason: state.revokeReason });
-    // F5：revoke → abort 全部运行中 run（worker 收敛），否则 heartbeat loop 虽退、runs 与
-    // claim/sse 循环仍在，agentd 无法按契约「收敛后退出」（评审 F5：token 已吊销仍持续心跳）。
-    for (const ctx of state.runs.values()) {
-      abortRun(ctx, 'revoked');
-    }
+    log('warn', 'revoke received', { reason: payload?.reason ?? 'revoked' });
+    beginRevoke(payload?.reason ?? 'revoked');
     return;
   }
   if (event === 'approval_decision') {
@@ -522,6 +517,21 @@ async function finishRun(ctx, payload) {
 }
 
 /**
+ * revoke 统一入口（issue #22 评审 F2）：置位 + abort 全部在跑 run。
+ * 三个信号源（SSE revoke / claim 401 token_revoked / heartbeat 401 token_revoked）必须同径，
+ * 否则某个循环先行退出时会遗留 detached worker 与未清理的 runs（评审实测：心跳 401 原实现无 abort）。
+ * 补报语义：abort 后 onWorkerExit 对 stop_* 补报 U2；revoked 场景不补报——token 已吊销，U2 必 401，
+ * 终态由 portal 侧收敛（active runs 收敛属 issue #22 F6 follow-up）。
+ */
+function beginRevoke(reason) {
+  state.revokeReason = reason;
+  log('warn', 'revoke begin', { reason, active_runs: state.runs.size });
+  for (const ctx of state.runs.values()) {
+    abortRun(ctx, 'revoked');
+  }
+}
+
+/**
  * 方案②（issue #25 第 4 项）：abort 后 worker 被 SIGKILL/未回 U2 消息时的显式终态补报。
  * 语义与 reaper A2 对齐：cancelling → runs finished + termination aborted（用户停止）。
  * best-effort：dropped 使 withRetry 不重试；409 run_terminal（已收敛）/lease_lost（fencing）
@@ -651,10 +661,10 @@ function onWorkerExit(ctx, code, signal) {
   // capacity=1 下 claim 循环永久停摆（评审实测路径）。dropped 不写 U2（租约已易主，写必 409），
   // 但 capacity 必须释放、本地上下文必须回收。
   if (ctx.dropped) {
-    // 方案②（issue #25 第 4 项）：stop/revoked 场景租约仍在我方 → 显式上报终态，
-    // 省掉 90s 租约 reaper 兑底等待（「停止」体验立竿见影）。lease_lost 场景租约已易主，
-    // 写必 409 lease_lost → 保持仅清理（由新持有者/portal 收敛，评审 F4 语义不变）。
-    if (ctx.dropReason === 'stop_request' || ctx.dropReason === 'stop_heartbeat' || ctx.dropReason === 'revoked') {
+    // 方案②（issue #25 第 4 项）：stop 场景租约仍在我方 → 显式上报终态，省掉 90s 租约 reaper
+    // 兑底等待（「停止」体验立竿见影）。lease_lost 场景租约已易主，写必 409 → 仅清理；
+    // revoked 场景 token 已吊销，U2 必 401 → 也不补报（issue #22 评审 F3，终态由 portal 收敛）。
+    if (ctx.dropReason === 'stop_request' || ctx.dropReason === 'stop_heartbeat') {
       void reportTerminalAfterDrop(ctx);
     }
     cleanupRun(ctx);
@@ -831,7 +841,7 @@ async function claimLoop() {
       // 204 → 立即再 claim
     } catch (err) {
       if (err instanceof InternalError && err.code === 'token_revoked') {
-        state.revokeReason = 'token_revoked';
+        beginRevoke('token_revoked'); // issue #22 评审 F2：与 SSE/heartbeat 同径，abort 全部在跑 run
         return;
       }
       if (err instanceof InternalError && !err.retryable) {
@@ -890,10 +900,8 @@ async function heartbeatLoop() {
     } catch (err) {
       if (err instanceof InternalError && err.code === 'token_revoked') {
         // issue #22 方案②：token_revoked 即显式 revoke 信号——心跳路径不能像 claim 那样吞成
-        // 普通错误继续转（否则收敛只剩 claim 循环的 ≤30s 兑底）。置位后与本循环 revoked 分支
-        // 同径：停心跳、abort 全部 run、收敛退出。
-        state.revokeReason = 'token_revoked';
-        log('warn', 'heartbeat 401 token_revoked', {});
+        // 普通错误继续转。beginRevoke 统一处理：停心跳 + abort 全部在跑 run + 收敛退出。
+        beginRevoke('token_revoked');
         return;
       }
       log('warn', 'heartbeat failed', { msg: String(err?.message ?? err) });
