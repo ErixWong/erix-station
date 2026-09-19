@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
+import { drainRuns } from './lib/drain.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(__dirname, 'worker.js');
@@ -80,6 +81,8 @@ function makeRunCtx(runId) {
     resume: false,
     worker: null,
     workerPid: null,
+    // 审计 #34 F-A：worker 退出的可等待句柄（drain 用它等「真退出」而非盲退）
+    exited: null,
     // 事件批量缓冲
     events: [],
     eventBytes: 0,
@@ -601,6 +604,8 @@ function spawnWorker(ctx, runStart) {
   ctx.worker = child;
   ctx.workerPid = child.pid ?? null;
   ctx.lastIpcAt = Date.now();
+  // 审计 #34 F-A：可等待的退出句柄（与下面 onWorkerExit 并存——exit 事件可多监听）
+  ctx.exited = new Promise((resolve) => { child.once('exit', () => resolve()); });
 
   child.stdout?.on('data', (d) => process.stdout.write(`[worker ${ctx.runId.slice(0, 8)}] ${d}`));
   child.stderr?.on('data', (d) => process.stderr.write(`[worker ${ctx.runId.slice(0, 8)}] ${d}`));
@@ -878,8 +883,11 @@ async function heartbeatLoop() {
       const data = await heartbeatOnce();
       touchHbOk(); // M5：心跳成功 → 刷新健康标记（healthcheck.sh 读 mtime）
       if (data?.revoked) {
-        state.revokeReason = 'revoked';
-        log('warn', 'heartbeat revoked', {});
+        // 审计 #34 F-C：此分支当前不可达（authenticateContainer 对 revoked_at 非空的行先返回
+        // 401 token_revoked，吊销走下面的 catch）。保留为**同径兜底**：若将来 portal 改回 200
+        // 语义，行为必须与 401 路径一致——abort 全部在跑 run + drain 退出（旧实现只置
+        // revokeReason 不 abort，与 runner-integration.md 的 revoke 口径不符）。
+        beginRevoke('revoked');
         return;
       }
       for (const runId of data?.stop_run_ids ?? []) {
@@ -916,7 +924,8 @@ function shutdown() {
   if (state.shutdown) return;
   state.shutdown = true;
   log('info', 'shutdown: draining runs');
-  for (const ctx of state.runs.values()) {
+  const ctxs = [...state.runs.values()];
+  for (const ctx of ctxs) {
     abortRun(ctx, 'agent_shutdown');
     // 崩溃恢复方案 B（§6.4/§9.6）：agent 关停属「容器是牲口」——不写终态（U2），
     // 让租约过期后由 portal re-claim（attempt+1、resume）收敛。finishing=true 挡住
@@ -924,8 +933,15 @@ function shutdown() {
     // 否则容器 restart 会被误判为永久 failed、恢复路径被劫持（e2e 实测回归）。
     ctx.finishing = true;
   }
-  // 给 worker 5s 宽限后退出；tini 会转发信号并 reap。
-  setTimeout(() => process.exit(0), 5000);
+  // 审计 #34 F-A：等 worker 真退出（含 SIGKILL 兜底）再退；hard deadline 防“死等”卡住容器停止。
+  // 兜底 15s > drain 的 5s + kill grace 2s。tini 仍会 reap 孤儿进程。
+  const hardExit = setTimeout(() => {
+    log('warn', 'shutdown hard exit (drain did not finish)');
+    process.exit(0);
+  }, 15000);
+  void drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) })
+    .then((r) => log('info', 'shutdown drain done', { drained: r.drained, pending: r.pending }))
+    .finally(() => { clearTimeout(hardExit); process.exit(0); });
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +968,11 @@ async function main() {
   // 两个决策循环返回（正常退出/revoke/token_revoked）即收敛退出，残留流由 process.exit 关断。
   sse.stop();
   void sseTask;
-  log('info', 'agentd exiting', { revoke: state.revokeReason });
+  // 审计 #34 F-A（major）：不能盲退——先 drain（等 worker 真退出、deadline 后强杀）
+  // 再退出，否则：① abortRun 的 5s SIGKILL timer 随进程消失 → 挂住的 worker 进程组残留；
+  // ② onWorkerExit 不跑 → cleanupRun 不跑 → worktree 残留（违反 D8「隔离单元 = worktree」）。
+  const drained = await drainRuns([...state.runs.values()], { kill: killProcessGroup, log: (m, e) => log('warn', m, e) });
+  log('info', 'agentd exiting', { revoke: state.revokeReason, drained: drained.drained, pending: drained.pending });
   process.exit(0);
 }
 

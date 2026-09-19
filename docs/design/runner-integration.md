@@ -214,7 +214,7 @@ agentd                          portal
   ```
 
 - 逐 run 结果语义：`lease: renewed` = claim_token 匹配，已续租；`lease: lease_lost` = claim_token 不匹配（该 run 已被 re-claim / 租约易主）→ agentd **本地 abort 该 run 的 worker、丢弃其缓冲与 spool**，不再续传该 run 的任何写。
-- `lease_lost` vs `revoked`：`lease_lost` 是 **run 级**（单个 run 的租约被取代）；`revoked: true` 是 **容器级**（token 吊销 / offboard）→ agentd 停止领新任务、收敛在跑 run 后退出。二者都在 `200` 内表达，**不是 HTTP 错误**；`401/5xx` 才是整次心跳失败（agentd 指数退避重试）。
+- `lease_lost` vs `revoked`：`lease_lost` 是 **run 级**（单个 run 的租约被取代），在 `200` 内表达；`revoked`（token 吊销 / offboard）是 **容器级**且**不在 `200` 内表达**——吊销由 `authenticateContainer` 在鉴权阶段直接返回 `401 token_revoked`（三条路径同径：SSE revoke / claim 401 / heartbeat 401 → `beginRevoke`，issue #22 方案②）。agentd 收到即 drain（abort 全部在跑 run → 等 worker 真退出 → 清理 worktree）后退出（审计 #34 F-A/F-C）。`401/5xx` 对非吊销原因才是整次心跳失败（指数退避重试）。
 - 响应 `stop_run_ids`：portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run——**停止指令的兜底通道**（SSE 为主、心跳为备）。
 - portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**（`containers.status → exited` 语义，model.md §2.4）；run 级处置走租约到期 re-claim（§6.4/§6.5）。
 
