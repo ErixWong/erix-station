@@ -64,8 +64,11 @@ child.on('exit', (code) => {
   clearTimeout(timer);
   const gotHeartbeatSignal = out.includes('revoke begin') && out.includes('token_revoked');
   const gotExiting = out.includes('agentd exiting') && out.includes('token_revoked');
-  console.log(`exit=${code} heartbeatSignal=${gotHeartbeatSignal} exitingWithRevoke=${gotExiting}`);
-  if (code === 0 && gotHeartbeatSignal && gotExiting) {
+  // 接入点回归锚点（审计 #34 评审 A 的变异 ①：删掉 main 尾部的 drainRuns 调用时 npm test 仍全绿）：
+  // 退出日志必须带 drain 结果——缺它就是接入点被删/绕过。
+  const gotDrainReport = out.includes('"drained"');
+  console.log(`exit=${code} heartbeatSignal=${gotHeartbeatSignal} exitingWithRevoke=${gotExiting} drainReport=${gotDrainReport}`);
+  if (code === 0 && gotHeartbeatSignal && gotExiting && gotDrainReport) {
     console.log('PROBE_OK: heartbeat 401 token_revoked → beginRevoke → 收敛退出（issue #22 方案②）');
     process.exit(0);
   }

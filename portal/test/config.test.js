@@ -41,6 +41,12 @@ test('F12 prod（审计 #34 F-D）：lax-accept 收紧——伪 sha256: 尾缀�
     `@sha256:${HEX64}`,              // 空引用
     `-bad/name@sha256:${HEX64}`,     // 引用不合法的起始字符
     `erix-station/fde:1.0 @sha256:${HEX64}`, // 引用含空格
+    // 评审 A：仅字符集校验会放行的 malformed（docker reference 语法违规）
+    `repo//foo@sha256:${HEX64}`,     // 空 path 段
+    `repo/:@sha256:${HEX64}`,        // 空 path 段 + 空 tag
+    `repo:tag:extra@sha256:${HEX64}`,// tag 中出现第二个冒号
+    `repo/FOO@sha256:${HEX64}`,      // path 段大写（repository 必须小写）
+    `repo./x@sha256:${HEX64}`,       // path 段以分隔符结尾
   ];
   for (const img of bad) {
     assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: img }), /image@sha256/, `应拒绝：${img}`);

@@ -65,6 +65,9 @@ function log(level, msg, extra = {}) {
 // 状态
 // ---------------------------------------------------------------------------
 const state = {
+  // 审计 #34 评审 A：未完成的终态补报（PUT）——退出前必须等（否则被 process.exit 截断，
+  // 退化为 90s reaper 兜底，违背 issue #25 第 4 项「省掉兜底等待」的目的）。
+  pendingReports: new Set(),
   sseOk: false,
   sawPing: false,
   revokeReason: null, // 非空 → 停领新任务、收敛后退出
@@ -103,6 +106,13 @@ function makeRunCtx(runId) {
 // 内部 HTTP 客户端（零依赖，Node 22 fetch；§4.5 重试/错误分类）
 // ---------------------------------------------------------------------------
 const BACKOFF = [1000, 2000, 5000, 10000, 30000];
+
+/** 等未完成的终态补报（评审 A：fire-and-forget 的 PUT 不得被 process.exit 截断）；graceMs 上限防卡死。 */
+async function drainPendingReports(graceMs = 2000) {
+  if (state.pendingReports.size === 0) return;
+  const pending = [...state.pendingReports].map((p) => p.catch(() => {}));
+  await Promise.race([Promise.all(pending), sleep(graceMs)]);
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -670,7 +680,9 @@ function onWorkerExit(ctx, code, signal) {
     // 兑底等待（「停止」体验立竿见影）。lease_lost 场景租约已易主，写必 409 → 仅清理；
     // revoked 场景 token 已吊销，U2 必 401 → 也不补报（issue #22 评审 F3，终态由 portal 收敛）。
     if (ctx.dropReason === 'stop_request' || ctx.dropReason === 'stop_heartbeat') {
-      void reportTerminalAfterDrop(ctx);
+      // 审计 #34 评审 A：track 未完成的补报（见 state.pendingReports），退出前由 drainPendingReports 等待。
+      const p = reportTerminalAfterDrop(ctx).finally(() => state.pendingReports.delete(p));
+      state.pendingReports.add(p);
     }
     cleanupRun(ctx);
     return;
@@ -939,7 +951,8 @@ function shutdown() {
     log('warn', 'shutdown hard exit (drain did not finish)');
     process.exit(0);
   }, 15000);
-  void drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) })
+  void drainPendingReports()
+    .then(() => drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) }))
     .then((r) => log('info', 'shutdown drain done', { drained: r.drained, pending: r.pending }))
     .finally(() => { clearTimeout(hardExit); process.exit(0); });
 }
@@ -950,6 +963,7 @@ function shutdown() {
 async function main() {
   if (!CFG.token) {
     log('error', 'ERIX_STATION_TOKEN missing');
+    // 此处无需 drain：尚无 worker（评审 A 指出的例外路径，此处显式说明）。
     process.exit(1);
   }
   // user-space §6.2：容器内进程 umask = 0002（新建文件 664/目录 775，配合同 GID 1000 组协作）。
@@ -971,12 +985,19 @@ async function main() {
   // 审计 #34 F-A（major）：不能盲退——先 drain（等 worker 真退出、deadline 后强杀）
   // 再退出，否则：① abortRun 的 5s SIGKILL timer 随进程消失 → 挂住的 worker 进程组残留；
   // ② onWorkerExit 不跑 → cleanupRun 不跑 → worktree 残留（违反 D8「隔离单元 = worktree」）。
+  await drainPendingReports();
   const drained = await drainRuns([...state.runs.values()], { kill: killProcessGroup, log: (m, e) => log('warn', m, e) });
   log('info', 'agentd exiting', { revoke: state.revokeReason, drained: drained.drained, pending: drained.pending });
   process.exit(0);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   log('error', 'agentd fatal', { err: String(err?.stack ?? err) });
+  // 审计 #34 评审 A（major）：fatal 可能发生在 worker 已启动之后——与正常退出同等要求：
+  // 先给未完成的补报留时间，再 drain worker（短 deadline：已是异常路径，不拖长容器退出）。
+  await drainPendingReports(1000).catch(() => {});
+  await drainRuns([...state.runs.values()], {
+    deadlineMs: 3000, killGraceMs: 1000, kill: killProcessGroup, log: (m, e) => log('warn', m, e),
+  }).catch(() => {});
   process.exit(1);
 });
