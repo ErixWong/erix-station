@@ -61,6 +61,11 @@ test('F12 prod（审计 #34 F-D）：合法引用形态不误伤（registry/tag/
     `erix-station/fde:1.0.0-abc@sha256:${HEX64}`,
     `localhost:5000/fde@sha256:${HEX64}`,
     `registry.example.com:8443/ns/sub/fde:v2@sha256:${HEX64}`,
+    // 单标签 host + 端口（含 `:` → docker 视为 registry；评审 B 实测的 false-reject 回归）
+    `registry:5000/fde@sha256:${HEX64}`,
+    `myhost:5000/fde@sha256:${HEX64}`,
+    `harbor:5000/ns/fde@sha256:${HEX64}`,
+    `Localhost:5000/fde@sha256:${HEX64}`,
     `fde@sha256:${HEX64}`,
     `sha256:${HEX64}`,
     // docker 允许 `__` / 多个 `-` 作名称段分隔符（评审 B info：旧模式会误拒，fail-closed 但口径不符）

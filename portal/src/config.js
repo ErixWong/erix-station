@@ -92,11 +92,14 @@ export function loadConfig(env = process.env) {
   // 名称段分隔符对齐 docker：`[._]|__|[-]+`（评审 B info：单 `[._-]` 会误拒 `foo__bar`/`foo--bar`）
   const repoNameSeg = '[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*';
   const repoPath = `${repoNameSeg}(?:/${repoNameSeg})*`;
-  // registry host 对齐 docker 的 splitDockerDomain（评审 B minor）：首段**含 `.`** 或为 `localhost`
-  // 时才是 registry（域名大小写不敏感，故允许大写）；单标签首段在 docker 里是 namespace（须小写）
-  // → 由 repoPath 覆盖。少了这条，`FOO/bar@sha256:…` 会被当作 host=`FOO` 放行（docker 会拒）。
+  // registry host 严格对齐 docker 的 splitDockerDomain（评审 B，两轮）——首段满足下列其一为 registry
+  // （域名大小写不敏感 → 允许大写）；否则该段是 namespace（须小写，由 repoPath 覆盖）：
+  //   ① 含 `.`（多标签域名）  ② **含 `:`（单标签 + 端口，如 registry:5000）**  ③ `localhost`
+  // 少了 ② 会误拒 `registry:5000/fde`（评审 B 实测的 false-reject 回归）；少了 ③/① 的区分则
+  // 会把 `FOO/bar` 当 host 放行（docker 视为 namespace 须小写）。
   const repoHostLabel = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
-  const repoHost = `(?:${repoHostLabel}(?:\\.${repoHostLabel})+|localhost)(?::[0-9]+)?`;
+  const repoHostDotted = `${repoHostLabel}(?:\\.${repoHostLabel})+`;
+  const repoHost = `(?:${repoHostDotted}|localhost)(?::[0-9]+)?|${repoHostLabel}:[0-9]+`;
   const repoTag = '[A-Za-z0-9_][A-Za-z0-9._-]{0,127}';
   const repoDigestRef = new RegExp(`^(?:${repoHost}/)?${repoPath}(?::${repoTag})?@sha256:[0-9a-f]{64}$`);
   const imageIsDigest = imageIdRef.test(fdeImage) || repoDigestRef.test(fdeImage);
