@@ -550,7 +550,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
 
     const containerName = `fde-${fdeName}`;
     // F6：单点 token——检查既有 DB 行与既有容器 env token 是否一致，一致则复用（幂等，不轮换）。
-    const dbRow = (await pool.query(`SELECT id, runner_token_hash FROM containers WHERE user_id = $1`, [userId])).rows[0];
+    const dbRow = (await pool.query(`SELECT id, runner_token_hash, revoked_at FROM containers WHERE user_id = $1`, [userId])).rows[0];
     const existing = await docker.inspectContainer(containerName);
     const envToken = existing.status === 200 ? readContainerEnv(existing.data) : null;
 
@@ -558,7 +558,9 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
     let tokenHash;
     let containerId;
     let needRecreate;
-    if (dbRow && existing.status === 200 && envToken && hashToken(envToken) === dbRow.runner_token_hash) {
+    if (dbRow && existing.status === 200 && envToken && hashToken(envToken) === dbRow.runner_token_hash && dbRow.revoked_at == null) {
+      // 复用条件含 revoked_at IS NULL（issue #22 评审硬化）：被吊销的行即使容器/env token 侥幸
+      // 一致也不得复用——authenticateContainer 对 revoked_at!=null 一律 401，复用即 DOA。
       token = envToken;
       tokenHash = dbRow.runner_token_hash;
       containerId = dbRow.id;

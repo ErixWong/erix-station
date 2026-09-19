@@ -516,7 +516,7 @@ test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/cl
   const pool = {
     async query(sql, params = []) {
       sqls.push(sql);
-      if (sql.includes('UPDATE containers')) containerUpdParams.push(params);
+      if (sql.includes('UPDATE containers') && sql.includes('WHERE user_id = $1')) containerUpdParams.push(params);
       if (sql.includes('FROM users WHERE fde_name')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
       if (sql.includes('FROM containers WHERE user_id')) return { rows: [{ id: 'c1' }] };
       return { rows: [] };
