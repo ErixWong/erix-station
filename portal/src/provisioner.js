@@ -17,6 +17,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { parseCidr, intToIp, allocateNetwork } from './ipam.js';
 import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
+import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
 
 // ---------------------------------------------------------------------------
@@ -674,6 +675,72 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
   });
 }
 
+/**
+ * offboard 时收敛该用户全部 active run（issue #33，源自 #22 评审 F6）。
+ *
+ * 为什么必须做：容器被删后无人上报 U2 终态；非 cancelling 的过期租约还会被 reaper 回退
+ * `pending`（容器已删、无人能 claim）→ run 长期非终态；且 `sessions.js` 的 ACTIVE_RUN_STATES 会让
+ * `deleteProject` 409。
+ *
+ * 口径**对齐 reaper A2**（internal.js reapExpiredRuns 的 cancelling 分支）：
+ * `run_queue → cancelled`（清 claim 字段）＋ `runs → finished` + `termination.reason='aborted'`
+ * ＋合成 `run_end`（client_event_id = `<runId>:final:run_end`，seq 用 §7.3 统一分配器）。
+ * best-effort：失败只告警、不回滚已提交的吊销（安全优先）；返回合成的 run_end 供调用方推 SSE。
+ */
+async function terminateActiveRuns(pool, { userId, log = console } = {}) {
+  const client = await pool.connect();
+  const runEnds = [];
+  try {
+    await client.query('BEGIN');
+    const active = await client.query(
+      `SELECT r.id, r.session_id, q.attempts
+         FROM runs r
+         JOIN chat_sessions s ON s.id = r.session_id
+         JOIN run_queue q ON q.run_id = r.id
+        WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
+        FOR UPDATE OF r`,
+      [userId],
+    );
+    for (const row of active.rows ?? []) {
+      await client.query(
+        `UPDATE run_queue SET status='cancelled', claim_token=NULL, owner_container_id=NULL,
+                              lease_until=NULL, claimed_at=NULL
+          WHERE run_id=$1`,
+        [row.id],
+      );
+      await client.query(
+        `UPDATE runs SET status='finished', termination='{"reason":"aborted"}'::jsonb,
+                         cancel_requested_at=COALESCE(cancel_requested_at, now()), ended_at=now()
+          WHERE id=$1 AND status IN ('queued', 'running', 'cancelling')`,
+        [row.id],
+      );
+      const seq = await allocSeq(client, row.session_id);
+      const payload = {
+        termination: { reason: 'aborted' },
+        usage: { input_tokens: 0, output_tokens: 0 },
+        rounds: 0,
+        attempt: Number(row.attempts ?? 1),
+      };
+      await client.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [row.id, row.session_id, seq, `${row.id}:final:run_end`, JSON.stringify(payload)],
+      );
+      runEnds.push({ session_id: row.session_id, run_id: row.id, seq, payload });
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    // 不抛：offboard 的安全语义（token 已吊销）不因业务收敛失败而回滚。
+    log.warn?.(`[provisioner] offboard terminate active runs failed (user ${userId}): ${err.message}`);
+    return [];
+  } finally {
+    client.release();
+  }
+  return runEnds;
+}
+
 /** offboarding（容器+网络）：**先吊销 token + 释放网段（一个事务）→ 再删 Docker 资源 → status 收敛**。
  *
  * F-B（审计 #34，major）：安全优先——token 必须先于资源删除失效，否则「Docker 删除成功但 DB 写失败」
@@ -685,7 +752,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
  * 删除失败的收敛路径（不假装成功，但也不留垃圾）：容器已不在 desired → reconcile 的孤儿分支删除
  * 容器并把 DB 行收敛为 removed（自愈）；status 不提前标 removed（F9：删除失败不标 removed）。
  */
-export async function deprovisionFde(pool, config, { fdeName, docker, log = console } = {}) {
+export async function deprovisionFde(pool, config, { fdeName, docker, log = console, notify } = {}) {
   return withFdeLock(pool, fdeName, async () => {
     const user = await pool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
     const u = user.rows[0];
@@ -719,6 +786,21 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
       throw err;
     } finally {
       client.release();
+    }
+
+    // ①b 收敛该用户全部 active run（issue #33）——offboard = 系统发起的 stop；口径对齐 reaper A2。
+    //     放在吊销事务提交之后：业务收敛失败不回滚安全吊销（best-effort，失败仅告警）。
+    const runEnds = await terminateActiveRuns(pool, { userId: u.id, log });
+    if (runEnds.length > 0) {
+      if (typeof notify === 'function') {
+        for (const e of runEnds) {
+          try {
+            notify(e.session_id, [{ seq: e.seq, ts: new Date().toISOString(), run_id: e.run_id, type: 'run_end', payload: e.payload }]);
+          } catch { /* 尽力推送（离线 CLI 无 hub 时由 DB backlog 补发） */ }
+        }
+      } else {
+        log.warn?.(`[provisioner] offboard closed ${runEnds.length} active run(s); SSE notify 未注入（离线 CLI：前端由 backlog 补发）`);
+      }
     }
 
     // ② 删 Docker 资源。失败 → throw 供重试；token 已吊销、网段已释放，残留容器由 reconcile 孤儿分支自愈。
