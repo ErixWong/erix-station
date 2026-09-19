@@ -99,7 +99,13 @@ export function loadConfig(env = process.env) {
   // 会把 `FOO/bar` 当 host 放行（docker 视为 namespace 须小写）。
   const repoHostLabel = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
   const repoHostDotted = `${repoHostLabel}(?:\\.${repoHostLabel})+`;
-  const repoHost = `(?:${repoHostDotted}|localhost)(?::[0-9]+)?|${repoHostLabel}:[0-9]+`;
+  // ⚠️ 整体分组必不可少（评审 B 第四轮实测）：缺外层 `(?:…)` 时 `^(?:HOST/)?` 里的 `/` 只绑定
+  // 最后一个交替分支，`dotted|localhost` 分支不再要求 `/` → `registry.example.com:5000x/fde` 被
+  // 拆成「port :5000」+「path x/fde」误放行。
+  const repoHost = `(?:(?:${repoHostDotted}|localhost)(?::[0-9]+)?|${repoHostLabel}:[0-9]+)`;
+  // 边界声明：本校验是**形态门**（三类前缀 + 严格 sha256 后缀），不声称 docker reference 语法完备。
+  // 已知边界（fail-open，Docker 兜底）：`foo__bar.example.com/fde` 这类「首段含 `.` 但域名含非法
+  // 字符」我们会放行而 docker 会拒（#34 follow-up）。要完全对齐需引入域名语法校验，收益不抵复杂度。
   const repoTag = '[A-Za-z0-9_][A-Za-z0-9._-]{0,127}';
   const repoDigestRef = new RegExp(`^(?:${repoHost}/)?${repoPath}(?::${repoTag})?@sha256:[0-9a-f]{64}$`);
   const imageIsDigest = imageIdRef.test(fdeImage) || repoDigestRef.test(fdeImage);
