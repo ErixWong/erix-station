@@ -50,6 +50,11 @@ test('F12 prod（审计 #34 F-D）：lax-accept 收紧——伪 sha256: 尾缀�
     // 评审 B：单标签首段大写——docker 视其为 namespace（须小写），不得借 host 解释放行
     `FOO/bar@sha256:${HEX64}`,
     `Foo/bar@sha256:${HEX64}`,
+    // 评审 B 第四轮：host 分支缺外层分组导致「合法 host + :数字 + 非法尾缀」被拆成 port+path 放行
+    `registry.example.com:5000x/fde@sha256:${HEX64}`,
+    `gcr.io:5000v2/fde@sha256:${HEX64}`,
+    `localhost:5000x/fde@sha256:${HEX64}`,
+    `192.168.1.1:5000x/fde@sha256:${HEX64}`,
   ];
   for (const img of bad) {
     assert.throws(() => loadConfig({ ...PROD, FDE_IMAGE: img }), /image@sha256/, `应拒绝：${img}`);
@@ -63,6 +68,7 @@ test('F12 prod（审计 #34 F-D）：合法引用形态不误伤（registry/tag/
     `registry.example.com:8443/ns/sub/fde:v2@sha256:${HEX64}`,
     // 单标签 host + 端口（含 `:` → docker 视为 registry；评审 B 实测的 false-reject 回归）
     `registry:5000/fde@sha256:${HEX64}`,
+    `192.168.1.1:5000/fde@sha256:${HEX64}`,
     `myhost:5000/fde@sha256:${HEX64}`,
     `harbor:5000/ns/fde@sha256:${HEX64}`,
     `Localhost:5000/fde@sha256:${HEX64}`,
