@@ -15,6 +15,7 @@ import * as sessions from './sessions.js';
 import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
+import * as llm from './llm.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -217,6 +218,10 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details));
         return;
       }
+      if (err instanceof llm.LlmError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -363,6 +368,126 @@ async function routeApi(req, res, ctx, url) {
   if (runMatch) {
     const runId = decodeUuid(runMatch[1]);
     if (req.method === 'GET') return handleGetRun(req, res, ctx, runId);
+  }
+
+  // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
+  if (pathname.startsWith('/api/admin/')) {
+    return handleAdminApi(req, res, ctx, url);
+  }
+
+  return sendJson(res, 404, errorBody('not_found', 'not found'));
+}
+
+// ---------------------------------------------------------------------------
+// admin LLM 配置端点（issue #38 Phase A）
+// ---------------------------------------------------------------------------
+
+/** admin 鉴权：session 用户 role 必须为 'admin'，否则 403 forbidden。 */
+async function requireAdmin(req, ctx) {
+  const session = await requireSession(req, ctx);
+  if (session.user.role !== 'admin') throw new HttpError(403, 'forbidden', 'forbidden');
+  return session;
+}
+
+async function handleAdminApi(req, res, ctx, url) {
+  const { pathname } = url;
+  const session = await requireAdmin(req, ctx); // 所有 /api/admin/* 端点统一先鉴权
+
+  // 供应商 CRUD
+  if (pathname === '/api/admin/llm/providers') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await llm.listProviders(ctx.pool));
+    }
+    if (req.method === 'POST') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const provider = await llm.createProvider(ctx.pool, { name: body?.name, base_url: body?.base_url });
+      return sendJson(res, 201, { provider });
+    }
+  }
+  const adminProviderMatch = pathname.match(/^\/api\/admin\/llm\/providers\/([^/]+)$/);
+  if (adminProviderMatch) {
+    const providerId = decodeUuid(adminProviderMatch[1]);
+    if (req.method === 'PATCH') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const provider = await llm.updateProvider(ctx.pool, providerId, {
+        base_url: body?.base_url,
+        enabled: body?.enabled,
+      });
+      return sendJson(res, 200, { provider });
+    }
+    if (req.method === 'DELETE') {
+      await llm.deleteProvider(ctx.pool, providerId);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+  }
+  const adminProviderModelsMatch = pathname.match(/^\/api\/admin\/llm\/providers\/([^/]+)\/models$/);
+  if (adminProviderModelsMatch && req.method === 'POST') {
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const model = await llm.createModel(ctx.pool, {
+      provider_id: decodeUuid(adminProviderModelsMatch[1]),
+      model_id: body?.model_id,
+      name: body?.name,
+      type: body?.type,
+      tool_calling: body?.tool_calling,
+      context_window: body?.context_window,
+    });
+    return sendJson(res, 201, { model });
+  }
+
+  // 模型 CRUD
+  const adminModelMatch = pathname.match(/^\/api\/admin\/llm\/models\/([^/]+)$/);
+  if (adminModelMatch) {
+    const modelId = decodeUuid(adminModelMatch[1]);
+    if (req.method === 'PATCH') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const model = await llm.updateModel(ctx.pool, modelId, {
+        name: body?.name,
+        enabled: body?.enabled,
+        tool_calling: body?.tool_calling,
+        context_window: body?.context_window,
+      });
+      return sendJson(res, 200, { model });
+    }
+    if (req.method === 'DELETE') {
+      await llm.deleteModel(ctx.pool, modelId);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+  }
+
+  // per-FDE LLM 配置（回显只给掩码；api_key 缺省 = 保留旧值）
+  const adminFdeLlmMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm$/);
+  if (adminFdeLlmMatch) {
+    const fdeName = decodeURIComponent(adminFdeLlmMatch[1]);
+    if (!projects.validateFdeName(fdeName).ok) {
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    }
+    if (req.method === 'GET') {
+      // 无配置 200 + null；api_key 永不出响应（只掩码）
+      const config = await llm.getFdeLlmEcho(ctx.pool, fdeName);
+      return sendJson(res, 200, { config });
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const config = await llm.setFdeLlmConfig(ctx.pool, {
+        actorId: session.user.id,
+        fdeName,
+        provider_id: body?.provider_id,
+        api_key: body?.api_key,
+        main_model_id: body?.main_model_id,
+        embedding_model_id: body?.embedding_model_id,
+        vision_model_id: body?.vision_model_id,
+      });
+      return sendJson(res, 200, { config });
+    }
   }
 
   return sendJson(res, 404, errorBody('not_found', 'not found'));
