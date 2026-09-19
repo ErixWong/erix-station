@@ -19,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
 import { drainRuns } from './lib/drain.js';
+import { parseHeartbeatModels } from './lib/llm-models.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(__dirname, 'worker.js');
@@ -73,6 +74,9 @@ const state = {
   revokeReason: null, // 非空 → 停领新任务、收敛后退出
   shutdown: false,
   runs: new Map(), // runId -> RunCtx
+  // issue #38 Phase B2：心跳下行的模型集（{main,embedding,vision} 或 null）。仅 IPC 内存传递，
+  // **不落文件/日志**。每次心跳刷新；进行中的 run 不受影响（run 边界生效，见 spawnWorker 快照）。
+  llmModels: null,
 };
 
 /** RunCtx：单个活跃 run 的本地上下文。 */
@@ -843,6 +847,9 @@ async function handleTicket(ticket) {
     resume: ctx.resume,
     attachments: Array.isArray(run.attachments) ? run.attachments : [],
     config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
+    // issue #38 Phase B2：模型快照，run 边界生效——此处取的是 **run 启动瞬间**的 state.llmModels，
+    // 之后心跳刷新 state.llmModels 不影响本 run（进行中 run 的模型名在其生命周期内锁定）。
+    models: state.llmModels,
   };
   try {
     spawnWorker(ctx, runStart);
@@ -908,6 +915,8 @@ async function heartbeatLoop() {
     try {
       const data = await heartbeatOnce();
       touchHbOk(); // M5：心跳成功 → 刷新健康标记（healthcheck.sh 读 mtime）
+      // Phase B2：刷新下行模型集。旧 portal 不下行 / 无配置 → null（行为与现状一致）。
+      state.llmModels = parseHeartbeatModels(data);
       if (data?.revoked) {
         // 审计 #34 F-C：此分支当前不可达（authenticateContainer 对 revoked_at 非空的行先返回
         // 401 token_revoked，吊销走下面的 catch）。保留为**同径兜底**：若将来 portal 改回 200

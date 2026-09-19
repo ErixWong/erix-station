@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
+import { getFdeLlmHeartbeatModels } from './llm.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -791,7 +792,12 @@ export async function heartbeat(pool, { container, user, body }) {
     stopRunIds = stop.rows.map((r) => r.id);
   }
 
-  return { now: now.toISOString(), stop_run_ids: stopRunIds, revoked: false, runs: results };
+  // issue #38 Phase B2：心跳下行模型集（agent 用真模型名的传导通道）。
+  // 同 client 顺查（心跳已持 pool），单条轻量 JOIN、**不含 api_key**；无 active binding / provider
+  // 停用 → null（不下发空对象，agentd 侧保持现状行为，向后兼容旧 portal 与无配置 FDE）。
+  const models = await getFdeLlmHeartbeatModels(pool, user.id);
+
+  return { now: now.toISOString(), stop_run_ids: stopRunIds, revoked: false, runs: results, models };
 }
 
 // ---------------------------------------------------------------------------

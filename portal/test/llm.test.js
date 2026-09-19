@@ -20,6 +20,7 @@ import {
   deleteModel,
   getFdeLlmConfig,
   getFdeLlmEcho,
+  getFdeLlmHeartbeatModels,
   setFdeLlmConfig,
   revokeFdeLlmConfigTx,
   syncFdeLlmBindingOnOnboard,
@@ -184,6 +185,26 @@ class LlmFakePool {
     }
 
     // fde_llm_bindings
+    // issue #38 Phase B2：心跳下行模型集（getFdeLlmHeartbeatModels）——provider enabled /
+    // main tool_calling / 模型 enabled+type 过滤都在查询内（区别于 getFdeLlmConfig 的全量 JOIN）。
+    if (sql.includes('FROM fde_llm_bindings b') && sql.includes('JOIN llm_providers') && sql.includes('p.enabled = true')) {
+      const b = this.bindings.find((x) => x.fde_id === params[0] && x.state === 'active');
+      if (!b) return { rows: [] };
+      const p = this.providers.find((x) => x.id === b.provider_id);
+      if (!p || p.enabled === false) return { rows: [] };
+      const model = (id) => this.models.find((x) => x.id === id);
+      const upstream = (id, ok) => {
+        const m = model(id);
+        return m && m.enabled !== false && ok(m) ? m.model_id : null;
+      };
+      return {
+        rows: [{
+          main_upstream: upstream(b.main_model_id, (m) => m.type === 'text' && m.tool_calling === true),
+          embedding_upstream: upstream(b.embedding_model_id, (m) => m.type === 'embedding'),
+          vision_upstream: upstream(b.vision_model_id, (m) => m.type === 'vision'),
+        }],
+      };
+    }
     if (sql.includes('FROM fde_llm_bindings b') && sql.includes('JOIN llm_providers')) {
       const b = this.bindings.find((x) => x.fde_id === params[0] && x.state === 'active');
       if (!b) return { rows: [] };
@@ -498,6 +519,34 @@ test('setFdeLlmConfig：二次更新 api_key 缺省 = 保留旧值；generation 
   assert.equal(pool.outbox[1].revision, 2, 'route_revisions head 单调递增');
 });
 
+test('getFdeLlmHeartbeatModels（Phase B2 心跳下行）：active binding → 上游 model_id 三槽位；各类缺失 → null', async () => {
+  const pool = seedPool(); // openai p1：gpt-4o(m-main,tc=true)/text-embedding-3(m-emb)；配置写入后 binding active
+  assert.equal(await getFdeLlmHeartbeatModels(pool, 'u1'), null, '无配置 → null');
+
+  await setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p1', api_key: FULL_KEY, main_model_id: 'm-main', embedding_model_id: 'm-emb' });
+
+  const models = await getFdeLlmHeartbeatModels(pool, 'u1');
+  assert.deepEqual(models, {
+    main: { model: 'gpt-4o', type: 'text' },
+    embedding: { model: 'text-embedding-3', type: 'embedding' },
+  }, '下行上游 model_id（非 uuid），有才带 embedding/vision');
+  assert.ok(!JSON.stringify(models).includes('m-main'), '不含模型行 uuid');
+
+  // main 的 tool_calling 被目录改掉 → 缺 main → 整体 null（不下发半残配置）
+  pool.models.find((m) => m.id === 'm-main').tool_calling = false;
+  assert.equal(await getFdeLlmHeartbeatModels(pool, 'u1'), null);
+
+  // provider 停用 → null
+  pool.models.find((m) => m.id === 'm-main').tool_calling = true;
+  pool.providers.find((p) => p.id === 'p1').enabled = false;
+  assert.equal(await getFdeLlmHeartbeatModels(pool, 'u1'), null);
+  pool.providers.find((p) => p.id === 'p1').enabled = true;
+
+  // binding revoked → null
+  pool.bindings.find((b) => b.fde_id === 'u1').state = 'revoked';
+  assert.equal(await getFdeLlmHeartbeatModels(pool, 'u1'), null);
+});
+
 test('getFdeLlmConfig：内部全量（含明文 key，供心跳下行/发布器）；getFdeLlmEcho：掩码回显；无配置 → null', async () => {
   const pool = seedPool();
   assert.equal(await getFdeLlmEcho(pool, 'alice'), null, '无配置 200 + null');
@@ -628,7 +677,7 @@ test('HTTP：完整管理流——建 provider/model → PUT 配置 → GET 回�
     // 无配置 → 200 + null
     let res = await fetch(`${base}/api/admin/fdes/alice/llm`, { headers: { cookie: admin.cookie } });
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { config: null });
+    assert.deepEqual(await res.json(), { config: null, active_run: false });
 
     // PUT 配置
     res = await fetch(`${base}/api/admin/fdes/alice/llm`, {
