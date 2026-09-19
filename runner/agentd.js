@@ -593,7 +593,9 @@ function abortRun(ctx, reason) {
     // 5s 宽限后 SIGKILL（§2.4）；M2：按进程组杀，防孑遗子进程
     const pid = ctx.workerPid;
     setTimeout(() => {
-      if (pid) killProcessGroup(pid, 'SIGKILL');
+      // 审计 #36-4：只在「仍是同一个在跑的 worker」时强杀——5s 后 pid 可能已被 OS 回收复用给无关进程。
+      // 退出时 onWorkerExit 置 ctx.workerPid = null，cleanupRun 使 ctx 离开 state.runs → 两个条件都不成立。
+      if (pid && ctx.workerPid === pid && state.runs.get(ctx.runId) === ctx) killProcessGroup(pid, 'SIGKILL');
     }, 5000);
   }
   log('info', 'abort run', { run_id: ctx.runId, reason });

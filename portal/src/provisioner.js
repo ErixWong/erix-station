@@ -426,8 +426,7 @@ async function upsertContainerRow(pool, { userId, fdeName, containerName, tokenH
  */
 export async function reconcileOnce(pool, config, { docker, log = console } = {}) {
   const desired = await readFdeDesired(pool);
-  const desiredNames = new Set(desired.map((r) => `fde-${r.fde_name}`));
-  const stats = { ensured: 0, rebuilt: 0, orphansRemoved: 0, statusUpdates: 0 };
+  const stats = { ensured: 0, rebuilt: 0, orphansRemoved: 0, orphanNetworksRemoved: 0, statusUpdates: 0 };
 
   for (const row of desired) {
     const fdeName = row.fde_name;
@@ -512,12 +511,19 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
     }
   }
 
-  // 孤儿容器：带 station.managed 标签、但 DB 无对应非 removed 容器 → 删除 + 告警。
+  // 审计 #36-3：孤儿判定改用**重新读取**的 desired 快照（此前用循环开始前的快照）——缩小
+  // 「窗口内 onboard 的新容器被误删」与「deprovision 残留容器多等一轮」的抖动窗口。仍非严格锁内，
+  // 属最终一致（残余记 #36）。
+  const orphanDesired = await readFdeDesired(pool);
+  const freshContainerNames = new Set(orphanDesired.map((r) => `fde-${r.fde_name}`));
+  const freshNetworkNames = new Set(orphanDesired.map((r) => r.network_name));
+
+  // 孤儿容器：带 station.managed 标签、但不在 desired 容器集合 → 删除 + 告警。
   const listed = await docker.listContainers({ label: ['station.managed=true'] }).catch(() => ({ status: 200, data: [] }));
   for (const c of listed.data ?? []) {
     const name = (c.Names?.[0] || '').replace(/^\//, '');
     if (!name.startsWith('fde-')) continue;
-    if (desiredNames.has(name)) continue;
+    if (freshContainerNames.has(name)) continue;
     log.warn?.(`[provisioner] orphan container detected: ${name} (removing)`);
     await pool.query(
       `INSERT INTO audit_log (actor_id, action, target, details)
@@ -537,6 +543,28 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
         [name.replace(/^fde-/, '')],
       ).catch(() => {});
     }
+  }
+
+  // 孤儿网络（审计 #36-1）：带 station.managed 标签、不在 desired 的 fde-* 网络 → 删除。
+  // 背景：deprovision 的前置事务先释放网段（该 FDE 离开 desired），若删网络失败则残留——容器有孤儿
+  // 分支自愈，**网络此前没有任何清理路径**；残留网络会让同 FDE re-onboard 时 allocateNetwork 分配
+  // 新 subnet，而残留网络的旧 subnet 触发 assertNetworkContract 失配 → re-onboard 被阻断（需人工删）。
+  // 安全性：只删不在 desired 的网络；仍被容器使用的网络 docker 会拒绝删除（记 warn，不重试风暴）。
+  const nets = await docker.listNetworks({ label: ['station.managed=true'] })
+    .catch(() => ({ status: 200, data: [] }));
+  for (const n of nets.data ?? []) {
+    const name = n?.Name;
+    if (!name || !name.startsWith('fde-')) continue;
+    if ((n?.Labels ?? {})['station.managed'] !== 'true') continue;
+    if (freshNetworkNames.has(name)) continue;
+    log.warn?.(`[provisioner] orphan network detected: ${name} (removing)`);
+    await pool.query(
+      `INSERT INTO audit_log (actor_id, action, target, details)
+       VALUES (NULL, 'network.orphan_removed', $1, $2)`,
+      [name, JSON.stringify({ reason: 'managed network not present in DB desired state' })],
+    ).catch(() => {});
+    const rm = await removeFdeNetwork(docker, name, { log });
+    if (rm.ok) stats.orphanNetworksRemoved += 1;
   }
 
   return stats;
