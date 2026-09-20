@@ -295,7 +295,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
 | `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8；**已决 2026-09-18，issue #27**） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
-| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P3 接入（deploy-contract §7.3） | `http://127.0.0.1:4000`（reconciler 生成 llm-hub service 回环地址） |
+| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P3 接入（deploy-contract §7.3）。**2026-09-20 修订（issue #38）**：LLM 路由已改为上游直发（per-FDE service url = `llm_providers.base_url`），reconciler **不再消费**本变量生成 service；`config.llmGatewayUrl` 仅保留兼容（外部脚本/文档引用），新代码勿依赖 | `http://127.0.0.1:4000`（历史语义：llm-hub service 回环地址；现仅 mock-llm 容器自身数据面地址） |
 | `LLM_GATEWAY_PORT` | 平台规范固定（deploy-contract §7.3）；`station-mock-llm` 数据面在宿主的回环发布端口（**dev-only**；P3 真实网关同端口） | `4000` |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
