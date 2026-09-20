@@ -572,16 +572,21 @@ async function handleAdminApi(req, res, ctx, url) {
       // F6（Round B 评审，fail-visible）：运行中换 provider/key 会**静默**改变运行中 run 的上游
       //（RUN_START 只快照 models，provider/key 由 Traefik 当前路由决定）——撞活跃 run 时服务端拒绝：
       //   ① provider 事实变化（provider_id 值变化；无旧配置时首次给上游 = 从「无路由」变「有路由」）；
-      //   ② 凭据事实变化（显式携带 api_key——缺省=保留旧值，任何显式新 key 都算换凭据）。
+      //   ② 凭据事实变化（与当前配置值比较：缺省=保留旧值不算变化；显式新 key 或显式 null=清空都算）。
       // 纯模型变更（main/embedding/vision）不受守卫：模型本就是 run 边界生效（RUN_START 快照），不误伤。
       // 显式 force=true 放行（管理员知情确认），放行后仍正常写 outbox。
       if (body?.force !== true) {
         const u = await ctx.pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
         const userId = u.rows[0]?.id;
         if (userId && await admin.fdeHasActiveRun(ctx.pool, userId)) {
+          // N1（Round C 评审）：判定「凭据事实是否真的变化」——与**当前配置值**比较，而不是
+          // 「是否显式传了非空值」。旧口径把显式 api_key:null 当「无变更」放过，而 llm.js 会把它
+          // 写成 api_key=NULL → 运行中静默清空凭据（路由消失，run 的 LLM 调用直接失败）。
+          // current 含明文 key：仅用于内存比较，绝不写进日志/错误（红线 ③）。
+          // 注：这只是事务外预检（快路径）；权威复检在 setFdeLlmConfig 事务内（N3，防并发 PUT）。
           const current = await llm.getFdeLlmConfig(ctx.pool, userId);
           const providerChanged = body?.provider_id !== undefined && body.provider_id !== (current?.provider_id ?? null);
-          const keyChanged = body?.api_key !== undefined && body.api_key !== null && body.api_key !== '';
+          const keyChanged = body?.api_key !== undefined && (body.api_key ?? null) !== (current?.api_key ?? null);
           if (providerChanged || keyChanged) {
             throw new HttpError(409, 'active_run_conflict',
               '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。'
