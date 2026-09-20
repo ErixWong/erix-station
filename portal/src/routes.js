@@ -8,6 +8,7 @@
 // Traefik file provider 按目录 watch 自动合并生效。outbox 消费对 aggregate 无感（claimRouteRows
 // 通用），aggregate='llm_binding' 行与 port_allocation 走同一条领取/租约/全量重建链路。
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './fsutil.js';
 import { parseCidr } from './ipam.js';
@@ -192,9 +193,12 @@ export function generateTraefikConfig({
  *
  * @param llmBindings [{ fdeName, subnet, providerId, baseUrl, apiKey }]（apiKey=null 跳过）
  */
-// 零 active binding 的空产物：只能为**空/注释文件**。`http: {}` 会被 Traefik file provider
-// 拒绝（"http cannot be a standalone element"——Phase C e2e 实测）且其报错会连坐同目录 routes.yml 热更新。
-export const LLM_EMPTY_CONFIG = '# llm-routes.yml: no active llm bindings\n';
+// 零 active binding 的空产物 = **不写文件**（rebuildRoutes unlink）。实测口径（wp4 e2e，Traefik v3 file provider）：
+//   - 'http: {}' / 纯注释 / 空 map 子键（routers: {} 等）→ 全部被拒（"cannot be a standalone element"，
+//     YAML null 同样报错）且**连坐同目录 routes.yml**——整个目录加载失败，全部路由 404（wp4 断言②实锤）。
+//   → 唯一安全的「无 LLM 配置」形态是文件不存在：file provider 对缺失文件无感知。
+// 返回 null 表示零 binding（调用方负责 unlink）。
+export const LLM_EMPTY_CONFIG = null;
 
 export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = [] }) {
   const active = [];
@@ -259,13 +263,15 @@ export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = []
 
 /** 轻量结构断言（LLM 段）：控制字符拒绝 + 关键节存在 + router/middleware 成对 + service 去重无重复。 */
 export function validateLlmTraefikConfig(text, llmBindings) {
-  if (typeof text !== 'string' || text.trim().length === 0) throw new Error('generated llm config empty');
-  if (/[\x00-\x09\x0b-\x1f\x7f]/.test(text)) throw new Error('generated llm config contains control characters');
   const fdeNames = llmBindings.filter((b) => b?.apiKey != null).map((b) => b.fdeName).sort();
-  if (fdeNames.length === 0) {
-    if (text !== LLM_EMPTY_CONFIG) throw new Error('generated llm config not empty for zero bindings');
+  if (text === LLM_EMPTY_CONFIG) {
+    // null 契约：零 active binding 时不写文件（rebuildRoutes 负责 unlink）。
+    if (fdeNames.length > 0) throw new Error('generated llm config empty with active bindings');
     return true;
   }
+  if (typeof text !== 'string' || text.trim().length === 0) throw new Error('generated llm config empty');
+  if (/[\x00-\x09\x0b-\x1f\x7f]/.test(text)) throw new Error('generated llm config contains control characters');
+  if (fdeNames.length === 0) throw new Error('generated llm config not empty for zero bindings');
   if (!text.includes('  routers:') || !text.includes('  middlewares:') || !text.includes('  services:')) {
     throw new Error('generated llm config missing sections');
   }
@@ -441,11 +447,18 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
   const target = path.join(config.traefikDynamicDir, config.traefikDynamicFile ?? 'routes.yml');
   const llmTarget = path.join(config.traefikDynamicDir, config.traefikLlmDynamicFile ?? 'llm-routes.yml');
   atomicWriteFile(target, text, { mode: 0o644, root: config.traefikDynamicDir });
-  // 红线：本文件含上游 api_key 明文，必须 0600（存储纪律 ①：key 只存在于 DB → 内存 → mode 600 文件）。
-  atomicWriteFile(llmTarget, llmText, { mode: 0o600, root: config.traefikDynamicDir });
+  if (llmText === null) {
+    // 零 binding：文件不得存在（见 LLM_EMPTY_CONFIG 注释——任何形式的空文件都会连坐整个目录）。
+    // unlink 原子；ENOENT 幂等。
+    await fs.promises.unlink(llmTarget).catch((e) => { if (e?.code !== 'ENOENT') throw e; });
+  } else {
+    // 红线：本文件含上游 api_key 明文，必须 0600（存储纪律 ①：key 只存在于 DB → 内存 → mode 600 文件）。
+    atomicWriteFile(llmTarget, llmText, { mode: 0o600, root: config.traefikDynamicDir });
+  }
   return {
     target,
     llmTarget,
+    llmPublished: llmText !== null,
     allocations: state.allocations.length,
     sourceRanges: state.sourceRanges,
     llmBindings: state.llmBindings.length,

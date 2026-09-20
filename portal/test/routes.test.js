@@ -194,10 +194,10 @@ test('B1：service 共享——两个 FDE 同 provider 只一份 service；最�
   const shared = generateLlmTraefikConfig(llmArgs([BINDING_ALICE, BINDING_CAROL]));
   assert.equal(shared.split('\n').filter((l) => l === '    llm-provider-deadbeef:').length, 1, '同 provider 的 service 必须去重为一份');
   assert.ok(shared.includes('      service: llm-provider-deadbeef'));
-  // 最后一个引用者删除 → service 段整体为空 → 产物为注释空文件（http: {} 被 Traefik 拒绝，e2e 实测）
+  // 最后一个引用者删除 → service 段整体为空 → 产物为 null（调用方 unlink；任何空文件形态都被 Traefik 拒且连坐目录）
   const empty = generateLlmTraefikConfig(llmArgs([]));
   assert.equal(empty, LLM_EMPTY_CONFIG);
-  assert.ok(!empty.includes('llm-provider-'));
+  assert.equal(empty, null);
 });
 
 test('B1：fail-closed——api_key 为 NULL（未配置）的 binding 不生成路由、不注入空凭据', () => {
@@ -383,14 +383,14 @@ test('B1：rebuildRoutes 拆两份发布——routes.yml 0644 无密钥 / llm-ro
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('B1：无 LLM 配置的 FDE 发布——llm 产物为注释空文件、主文件正常、权限仍 600/644', async () => {
+test('B1：无 LLM 配置的 FDE 发布——llm 文件不存在（null 契约）、主文件正常、权限仍 644', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-b1-none-'));
   const config = { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir };
   const out = await rebuildRoutes(makePublishPool({ bindings: [] }), config);
   const mainText = fs.readFileSync(out.target, 'utf8');
-  const llmText = fs.readFileSync(out.llmTarget, 'utf8');
-  assert.equal(llmText, LLM_EMPTY_CONFIG);
+  assert.equal(out.llmPublished, false, '零 binding → 不写 llm 文件');
+  assert.equal(fs.existsSync(out.llmTarget), false, 'llm 文件不得存在（空文件形态被 Traefik 拒且连坐目录）');
   assert.ok(mainText.includes('Host(`station.localhost`)'), '无 LLM 配置不影响主路由发布');
-  assert.equal(fs.statSync(out.llmTarget).mode & 0o777, 0o600, '即使空 LLM 段文件也保持 600（下一版可能含 key）');
+  assert.equal(fs.statSync(out.target).mode & 0o777, 0o644, '主文件 644（无密钥）');
   fs.rmSync(dir, { recursive: true, force: true });
 });
