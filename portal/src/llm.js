@@ -113,7 +113,13 @@ export async function createProvider(pool, { name, base_url } = {}) {
   return toProvider(r.rows[0], []);
 }
 
-/** 更新 base_url / enabled（name 不可改，防 UNIQUE 混乱）。 */
+/**
+ * 更新 base_url / enabled（name 不可改，防 UNIQUE 混乱）。
+ * F2：base_url / enabled 任一变更都会改变路由发布事实（Traefik 仍会用旧 URL / 停用 provider 的路由），
+ * 因此在同一事务内为受影响的 active bindings 写 route outbox（aggregate='llm_binding'，aggregateId=fde_id，
+ * 复用 enqueueRouteChange），触发 reconciler 全量重建收敛；payload 不含 api_key（红线 ③）。
+ * 无任何变更字段（base_url/enabled 均缺省）时不动 outbox。
+ */
 export async function updateProvider(pool, id, { base_url, enabled } = {}) {
   if (base_url !== undefined) {
     try {
@@ -126,17 +132,46 @@ export async function updateProvider(pool, id, { base_url, enabled } = {}) {
   if (enabled !== undefined && typeof enabled !== 'boolean') {
     throw new LlmError('validation_failed', 'enabled 必须为 boolean', { httpStatus: 400, details: { field: 'enabled' } });
   }
-  const r = await pool.query(
-    `UPDATE llm_providers
+  const changed = base_url !== undefined || enabled !== undefined;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(
+      `UPDATE llm_providers
         SET base_url = COALESCE($2, base_url),
             enabled  = COALESCE($3, enabled),
             updated_at = now()
       WHERE id = $1
       RETURNING id, name, base_url, api_format, enabled, created_at, updated_at`,
-    [id, base_url ?? null, enabled ?? null],
-  );
-  if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-  return toProvider(r.rows[0], []);
+      [id, base_url ?? null, enabled ?? null],
+    );
+    if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
+
+    if (changed) {
+      // 受影响 bindings = 该 provider 下仍 active 的绑定（revoked 的不发布路由，无需触发）；
+      // 逐 FDE 一条 outbox 行，与 setFdeLlmConfig 的 aggregate/aggregateId 口径一致。
+      const affected = await client.query(
+        `SELECT fde_id FROM fde_llm_bindings WHERE provider_id = $1 AND state = 'active'`,
+        [id],
+      );
+      for (const b of affected.rows) {
+        await enqueueRouteChange(client, {
+          aggregate: 'llm_binding',
+          aggregateId: b.fde_id,
+          op: 'upsert',
+          payload: { provider_id: id, base_url_changed: base_url !== undefined, enabled_changed: enabled !== undefined },
+        });
+      }
+    }
+
+    await client.query('COMMIT');
+    return toProvider(r.rows[0], []);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /** 物理删；被 fde_llm_bindings 引用 → 409 provider_in_use。 */
