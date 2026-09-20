@@ -183,7 +183,7 @@ export function generateTraefikConfig({
  *
  * 结构（与 issue 定稿一致）：
  *   routers:    llm-<fdeName>           rule: Host(`<llmHost>`) && ClientIP(`<精确 subnet>`)
- *   middlewares: llm-key-<fdeName>      headers.request.set.Authorization = Bearer <api_key>
+ *   middlewares: llm-key-<fdeName>      headers.customRequestHeaders.Authorization = Bearer <api_key>
  *   services:   llm-provider-<id 前 8 位>  loadBalancer.servers.url = <provider base_url>（同 provider 去重一份）
  *
  * fail-closed：api_key 为 NULL（未配置）的 binding 不生成路由（该 FDE 无 LLM 可用，不注入空凭据）；
@@ -192,6 +192,10 @@ export function generateTraefikConfig({
  *
  * @param llmBindings [{ fdeName, subnet, providerId, baseUrl, apiKey }]（apiKey=null 跳过）
  */
+// 零 active binding 的空产物：只能为**空/注释文件**。`http: {}` 会被 Traefik file provider
+// 拒绝（"http cannot be a standalone element"——Phase C e2e 实测）且其报错会连坐同目录 routes.yml 热更新。
+export const LLM_EMPTY_CONFIG = '# llm-routes.yml: no active llm bindings\n';
+
 export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = [] }) {
   const active = [];
   for (const b of llmBindings) {
@@ -205,7 +209,7 @@ export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = []
     assertSafeString(b.apiKey, 'apiKey');
     active.push(b);
   }
-  if (active.length === 0) return 'http: {}\n';
+  if (active.length === 0) return LLM_EMPTY_CONFIG;
   if (!isValidHostname(llmHost)) throw new Error(`invalid llm hostname: ${JSON.stringify(llmHost)}`);
   assertSafeString(entryPoint, 'entryPoint');
 
@@ -233,9 +237,10 @@ export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = []
   for (const b of active) {
     lines.push(`    llm-key-${b.fdeName}:`);
     lines.push('      headers:');
-    lines.push('        request:');
-    lines.push('          set:');
-    lines.push(`            Authorization: ${yq(`Bearer ${b.apiKey}`)}`);
+    // Traefik v3 headers middleware 注入请求头 = customRequestHeaders（Phase C e2e 实测：
+    // v2 风格 request.set 在 v3.7 报 "field not found, node: request"，整份动态配置被拒）。
+    lines.push('        customRequestHeaders:');
+    lines.push(`          Authorization: ${yq(`Bearer ${b.apiKey}`)}`);
   }
 
   lines.push('  services:');
@@ -258,7 +263,7 @@ export function validateLlmTraefikConfig(text, llmBindings) {
   if (/[\x00-\x09\x0b-\x1f\x7f]/.test(text)) throw new Error('generated llm config contains control characters');
   const fdeNames = llmBindings.filter((b) => b?.apiKey != null).map((b) => b.fdeName).sort();
   if (fdeNames.length === 0) {
-    if (text !== 'http: {}\n') throw new Error('generated llm config not empty for zero bindings');
+    if (text !== LLM_EMPTY_CONFIG) throw new Error('generated llm config not empty for zero bindings');
     return true;
   }
   if (!text.includes('  routers:') || !text.includes('  middlewares:') || !text.includes('  services:')) {

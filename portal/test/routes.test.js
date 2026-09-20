@@ -10,6 +10,7 @@ import {
   filterCurrentHead,
   generateTraefikConfig,
   generateLlmTraefikConfig,
+  LLM_EMPTY_CONFIG,
   validateTraefikConfig,
   validateLlmTraefikConfig,
   rebuildRoutes,
@@ -157,10 +158,10 @@ test('B1：LLM 段渲染——per-FDE router + key 注入 middleware + per-provi
   assert.ok(!text.includes('rule: "Host(`llm.localhost`)"'), '禁止无 ClientIP 条件的兜底路由（fail-closed）');
   assert.ok(text.includes('      middlewares: [llm-key-alice]'));
   assert.ok(text.includes('      service: llm-provider-deadbeef'));
-  // middleware：llm-key-<fdeName> 注入明文 key（v3 headers.request.set）
+  // middleware：llm-key-<fdeName> 注入明文 key（Traefik v3 headers.customRequestHeaders，e2e 实测口径）
   assert.match(text, /    llm-key-alice:/);
-  assert.ok(text.includes('            Authorization: "Bearer sk-test-1234567890"'));
-  assert.ok(text.includes('        request:') && text.includes('          set:'));
+  assert.ok(text.includes('          Authorization: "Bearer sk-test-1234567890"'));
+  assert.ok(text.includes('        customRequestHeaders:'));
   // service：llm-provider-<providerId 前 8 位> → provider base_url（直连上游，无 llm-hub）
   assert.match(text, /    llm-provider-deadbeef:/);
   assert.ok(text.includes('          - url: "https://api.upstream.example.com/v1"'));
@@ -193,15 +194,15 @@ test('B1：service 共享——两个 FDE 同 provider 只一份 service；最�
   const shared = generateLlmTraefikConfig(llmArgs([BINDING_ALICE, BINDING_CAROL]));
   assert.equal(shared.split('\n').filter((l) => l === '    llm-provider-deadbeef:').length, 1, '同 provider 的 service 必须去重为一份');
   assert.ok(shared.includes('      service: llm-provider-deadbeef'));
-  // 最后一个引用者删除 → service 段整体为空 → 产物为 http: {}
+  // 最后一个引用者删除 → service 段整体为空 → 产物为注释空文件（http: {} 被 Traefik 拒绝，e2e 实测）
   const empty = generateLlmTraefikConfig(llmArgs([]));
-  assert.equal(empty, 'http: {}\n');
+  assert.equal(empty, LLM_EMPTY_CONFIG);
   assert.ok(!empty.includes('llm-provider-'));
 });
 
 test('B1：fail-closed——api_key 为 NULL（未配置）的 binding 不生成路由、不注入空凭据', () => {
   const text = generateLlmTraefikConfig(llmArgs([{ ...BINDING_ALICE, apiKey: null }]));
-  assert.equal(text, 'http: {}\n');
+  assert.equal(text, LLM_EMPTY_CONFIG);
 });
 
 test('B1：注入面拒绝——api_key/baseUrl 含控制字符、fdeName 非法、providerId 非法（不落盘）', () => {
@@ -382,13 +383,13 @@ test('B1：rebuildRoutes 拆两份发布——routes.yml 0644 无密钥 / llm-ro
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('B1：无 LLM 配置的 FDE 发布——llm 产物为 http: {}、主文件正常、权限仍 600/644', async () => {
+test('B1：无 LLM 配置的 FDE 发布——llm 产物为注释空文件、主文件正常、权限仍 600/644', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-b1-none-'));
   const config = { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir };
   const out = await rebuildRoutes(makePublishPool({ bindings: [] }), config);
   const mainText = fs.readFileSync(out.target, 'utf8');
   const llmText = fs.readFileSync(out.llmTarget, 'utf8');
-  assert.equal(llmText, 'http: {}\n');
+  assert.equal(llmText, LLM_EMPTY_CONFIG);
   assert.ok(mainText.includes('Host(`station.localhost`)'), '无 LLM 配置不影响主路由发布');
   assert.equal(fs.statSync(out.llmTarget).mode & 0o777, 0o600, '即使空 LLM 段文件也保持 600（下一版可能含 key）');
   fs.rmSync(dir, { recursive: true, force: true });
