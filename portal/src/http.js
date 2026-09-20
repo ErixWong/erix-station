@@ -556,7 +556,8 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'GET') {
       // 无配置 200 + null；api_key 永不出响应（只掩码）。
-      // active_run（口径同 sessions.js ACTIVE_RUN_STATES）：true 时 UI 提示「换供应商影响进行中的 run」。
+      // active_run（口径同 sessions.js ACTIVE_RUN_STATES）：true 时 UI 提示「换供应商/key 将被服务端 409
+      // 拒绝（F6 守卫见 PUT 分支）」；纯模型变更不受影响（run 边界生效）。
       const config = await llm.getFdeLlmEcho(ctx.pool, fdeName);
       let activeRun = false;
       if (config) {
@@ -568,6 +569,26 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'PUT') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // F6（Round B 评审，fail-visible）：运行中换 provider/key 会**静默**改变运行中 run 的上游
+      //（RUN_START 只快照 models，provider/key 由 Traefik 当前路由决定）——撞活跃 run 时服务端拒绝：
+      //   ① provider 事实变化（provider_id 值变化；无旧配置时首次给上游 = 从「无路由」变「有路由」）；
+      //   ② 凭据事实变化（显式携带 api_key——缺省=保留旧值，任何显式新 key 都算换凭据）。
+      // 纯模型变更（main/embedding/vision）不受守卫：模型本就是 run 边界生效（RUN_START 快照），不误伤。
+      // 显式 force=true 放行（管理员知情确认），放行后仍正常写 outbox。
+      if (body?.force !== true) {
+        const u = await ctx.pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+        const userId = u.rows[0]?.id;
+        if (userId && await admin.fdeHasActiveRun(ctx.pool, userId)) {
+          const current = await llm.getFdeLlmConfig(ctx.pool, userId);
+          const providerChanged = body?.provider_id !== undefined && body.provider_id !== (current?.provider_id ?? null);
+          const keyChanged = body?.api_key !== undefined && body.api_key !== null && body.api_key !== '';
+          if (providerChanged || keyChanged) {
+            throw new HttpError(409, 'active_run_conflict',
+              '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。'
+              + '确认无影响请带 force=true 重试。');
+          }
+        }
+      }
       const config = await llm.setFdeLlmConfig(ctx.pool, {
         actorId: session.user.id,
         fdeName,

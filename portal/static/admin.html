@@ -326,7 +326,7 @@
       const providerOpts = S.providers.map((p) =>
         `<option value="${esc(p.id)}" ${cfg && p.id === cfg.provider_id ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
       pane.innerHTML = `
-        ${activeRun ? '<div class="warnbox">⚠️ 有活跃 run：换供应商会影响进行中的 run。</div>' : ''}
+        ${activeRun ? '<div class="warnbox">⚠️ 有活跃 run：更换供应商或 API key 会被服务端拒绝（影响进行中的 run）；纯模型变更不受影响。</div>' : ''}
         <form class="llmform" data-llmform="${fde}">
           <label>供应商<select name="provider_id">${providerOpts}</select></label>
           <label>API Key（<span data-keyhint>${cfg?.api_key ? '已配置 ' + esc(cfg.api_key) + '，重输以修改' : '首次配置必填'}</span>）
@@ -372,8 +372,15 @@
 
       form.onsubmit = async (e) => {
         e.preventDefault();
+        await submitLlm(false);
+      };
+
+      // F6（Round B 评审）：服务端对「活跃 run + 换 provider/key」返回 409 active_run_conflict。
+      // UI 必须真实处理 409：展示服务端原因，且只有在管理员**显式点击确认**后才带 force=true 重试——
+      // 绝不静默 force（fail-visible：运行中换 provider 会静默改变 run 的上游，必须留人工知情痕迹）。
+      async function submitLlm(force) {
         const msg = pane.querySelector('[data-llmmsg]');
-        msg.innerHTML = '';
+        if (!force) msg.innerHTML = '';
         try {
           const body = {
             provider_id: form.provider_id.value,
@@ -382,19 +389,37 @@
             vision_model_id: form.vision_model_id.value || null,
           };
           if (form.api_key.value) body.api_key = form.api_key.value;
+          if (force) body.force = true;
           const r = await api(`/api/admin/fdes/${fde}/llm`, { method: 'PUT', body: JSON.stringify(body) });
           const div = document.createElement('div');
           div.className = 'okmsg';
           div.textContent = `已保存：主模型 ${r.config.main.model_id}` + (r.config.api_key ? `（key ${r.config.api_key}）` : '');
+          msg.innerHTML = '';
           msg.appendChild(div);
           form.api_key.value = '';
         } catch (err) {
+          if (err?.code === 'active_run_conflict' && !force) {
+            // 服务端拒绝 → 展示原因 + 显式确认按钮（点击才算知情，才带 force=true 重试）。
+            msg.innerHTML = '';
+            const div = document.createElement('div');
+            div.className = 'syserr';
+            div.textContent = '已拒绝（409）：' + err.message;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'small';
+            btn.textContent = '确认无影响，强制保存';
+            btn.onclick = () => submitLlm(true);
+            msg.appendChild(div);
+            msg.appendChild(btn);
+            return;
+          }
           const div = document.createElement('div');
           div.className = 'syserr';
           div.textContent = '错误：' + err.message;
+          msg.innerHTML = '';
           msg.appendChild(div);
         }
-      };
+      }
 
       pane.querySelector('[data-provision]').onclick = async () => {
         const msg = pane.querySelector('[data-llmmsg]');

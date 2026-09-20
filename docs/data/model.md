@@ -228,6 +228,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 **红线（2026-09-19 修订，用户决策：去 LiteLLM hub、上游直发 key）**：真 key 允许存 DB（原「绝不存明文」前提是 LiteLLM 持有真 key，该前提已不成立），但必须：①容器永不持有（key 只存在于 DB → portal 内存 → Traefik 动态配置 mode 600）；②API 回显只给掩码（sk-…last4），编辑需重输；③不进日志/审计/错误信息。`gateway` 列语义更新：值 `'direct'` 表示上游直连（不再要求网关名）；旧值保留兼容。
 
+**运行中变更守卫（2026-09-20 修订，issue #38（PR #39 评审 F6）：UI 提示不足以保证 fail-visible，改服务端拒绝）**：`PUT /api/admin/fdes/:name/llm` 在「该 FDE 有活跃 run（口径同 sessions.js `ACTIVE_RUN_STATES` = queued/running/cancelling）**且**本次变更改变上游/凭据事实」时返回 **`409 active_run_conflict`**，不写 outbox；请求体显式 `force: true`（管理员知情确认）才放行，放行后仍正常写 outbox。判定的「上游/凭据事实」＝① `provider_id` 值变化（无旧配置时首次给上游 = 从「无路由」变「有路由」，同样算）；② 显式携带 `api_key`（缺省＝保留旧值，任何显式新 key 都算换凭据）。**纯模型变更（`main_model_id`/`embedding_model_id`/`vision_model_id`）不受守卫**——模型本就是 run 边界生效（RUN_START 只快照 models，见 runner-integration/agentd），运行中改模型不影响已锁定的 run；而 provider/key 由 Traefik 当前路由即时决定，运行中变更会**静默**改运行中 run 的上游，故必须服务端拒绝 + 显式 force。原「换 provider 撞活跃 run＝admin UI 黄条提示缓解」口径作废（黄条仍在但只是知情提示，真正拦截在服务端）。
+
 ### 1.21 `preview_grants` — 预览授权凭证（portal.md §2.7/§2.8）
 
 forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 exposure 判定（**不解析 `cookie.sub`，旧口径作废**）；portal 自身会话的登录态才查 `login_sessions`（§1.2），与本表互不相干。两种凭证：`kind='ticket'`（一次性预览 ticket）与 `kind='session'`（host-only 预览 cookie）。
