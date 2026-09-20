@@ -119,8 +119,13 @@ export async function createProvider(pool, { name, base_url } = {}) {
  * 因此在同一事务内为受影响的 active bindings 写 route outbox（aggregate='llm_binding'，aggregateId=fde_id，
  * 复用 enqueueRouteChange），触发 reconciler 全量重建收敛；payload 不含 api_key（红线 ③）。
  * 无任何变更字段（base_url/enabled 均缺省）时不动 outbox。
+ *
+ * N2（Round C 评审）：base_url/enabled 变更会改变运行中 run 的上游路由（换上游/摘路由），与 F6 同口径
+ * 在**本事务内**拦活跃 run——先查受影响 active bindings，再逐 FDE 按 admin.fdeHasActiveRun 同口径查
+ * queued/running/cancelling run；命中且 force!==true → 抛 active_run_conflict（409），UPDATE 与 outbox
+ * 一概不写（整个事务回滚，fail-visible）。force=true 放行（管理员知情确认）。
  */
-export async function updateProvider(pool, id, { base_url, enabled } = {}) {
+export async function updateProvider(pool, id, { base_url, enabled, force = false } = {}) {
   if (base_url !== undefined) {
     try {
       const parsed = new URL(base_url);
@@ -136,6 +141,35 @@ export async function updateProvider(pool, id, { base_url, enabled } = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // N2：守卫先于 UPDATE（命中即抛，事务回滚 → 不写任何变更、不写 outbox）。
+    // 受影响 bindings = 该 provider 下仍 active 的绑定（revoked 的不发布路由，无需守卫/触发）。
+    let affectedRows = [];
+    if (changed) {
+      const affected = await client.query(
+        `SELECT fde_id FROM fde_llm_bindings WHERE provider_id = $1 AND state = 'active'`,
+        [id],
+      );
+      affectedRows = affected.rows;
+      if (force !== true) {
+        for (const b of affectedRows) {
+          const act = await client.query(
+            `SELECT 1
+               FROM runs r
+               JOIN chat_sessions s ON s.id = r.session_id
+              WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
+              LIMIT 1`,
+            [b.fde_id],
+          );
+          if (act.rows.length > 0) {
+            throw new LlmError('active_run_conflict',
+              '存在绑定该供应商且有进行中 run 的 FDE：变更 base_url/enabled 会改变运行中 run 的上游路由。'
+              + '确认无影响请带 force=true 重试。', { httpStatus: 409 });
+          }
+        }
+      }
+    }
+
     const r = await client.query(
       `UPDATE llm_providers
         SET base_url = COALESCE($2, base_url),
@@ -148,13 +182,8 @@ export async function updateProvider(pool, id, { base_url, enabled } = {}) {
     if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
 
     if (changed) {
-      // 受影响 bindings = 该 provider 下仍 active 的绑定（revoked 的不发布路由，无需触发）；
       // 逐 FDE 一条 outbox 行，与 setFdeLlmConfig 的 aggregate/aggregateId 口径一致。
-      const affected = await client.query(
-        `SELECT fde_id FROM fde_llm_bindings WHERE provider_id = $1 AND state = 'active'`,
-        [id],
-      );
-      for (const b of affected.rows) {
+      for (const b of affectedRows) {
         await enqueueRouteChange(client, {
           aggregate: 'llm_binding',
           aggregateId: b.fde_id,

@@ -53,6 +53,7 @@ class LlmFakePool {
     this.outbox = [];           // { aggregate, aggregate_id, op, revision, payload, state }
     this.audit = [];            // { actor_id, action, target, details }
     this.sqlLog = [];           // { sql, params }
+    this.activeRun = false;     // N2/N3：fdeHasActiveRun 同口径的活跃 run 开关（llm.js 事务内复检用）
   }
 
   async query(sql, params = []) {
@@ -71,6 +72,11 @@ class LlmFakePool {
   #dispatch(sql, params) {
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
     if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+
+    // N2/N3（Round C 评审）：fdeHasActiveRun 同口径的活跃 run 判定（llm.js 事务内复检）
+    if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions')) {
+      return { rows: this.activeRun ? [{ '?column?': 1 }] : [] };
+    }
 
     // route_revisions head 递增（outbox.js bumpRouteRevision）
     if (sql.includes('INSERT INTO route_revisions')) {
@@ -418,6 +424,44 @@ test('F2：updateProvider 无变更字段 / 无受影响 binding / 404 → 不�
   assert.equal(pool3.outbox.length, 0);
 });
 
+test('N2（Round C 评审）：updateProvider 撞活跃 run → 409 不写变更不写 outbox（事务回滚）；force=true 放行；无活跃 run 不受影响', async () => {
+  const pool = seedProviderWithBindings();
+  pool.activeRun = true;
+
+  // ① enabled:false → 409 且无 outbox、provider 未变
+  await assert.rejects(
+    () => updateProvider(pool, 'p1', { enabled: false }),
+    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409,
+  );
+  assert.equal(pool.providers.find((p) => p.id === 'p1').enabled, true, '409 不得写变更');
+  assert.equal(pool.outbox.length, 0, '409 不得写 outbox');
+
+  // ② base_url 变更 → 409 且 provider 未变
+  await assert.rejects(
+    () => updateProvider(pool, 'p1', { base_url: 'https://new-upstream.example.com' }),
+    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409,
+  );
+  assert.equal(pool.providers.find((p) => p.id === 'p1').base_url, 'https://api.openai.com/v1', '409 不得写变更');
+  assert.equal(pool.outbox.length, 0);
+
+  // ③ force:true → 200 且写 outbox（放行后仍正常发布）
+  const updated = await updateProvider(pool, 'p1', { enabled: false, force: true });
+  assert.equal(updated.enabled, false);
+  assert.equal(pool.outbox.length, 2, '两个 active binding 各一条 outbox');
+
+  // ④ 无活跃 run → 不受守卫影响（回归 F2 行为）
+  const pool2 = seedProviderWithBindings();
+  const ok = await updateProvider(pool2, 'p1', { base_url: 'https://proxy.internal/v2' });
+  assert.equal(ok.base_url, 'https://proxy.internal/v2');
+  assert.equal(pool2.outbox.length, 2);
+
+  // ⑤ 变更字段缺省（无事实变化）→ 即使活跃 run 也不拦（无路由面影响）
+  const pool3 = seedProviderWithBindings();
+  pool3.activeRun = true;
+  await updateProvider(pool3, 'p1', {});
+  assert.equal(pool3.outbox.length, 0, '无变更字段不写 outbox');
+});
+
 // ---------------------------------------------------------------------------
 // model CRUD
 // ---------------------------------------------------------------------------
@@ -685,6 +729,10 @@ class HttpLlmPool extends FakePool {
           this.llm.audit.push({ actor_id: params[0], action, target: params[1], details: params[2] });
           return Promise.resolve({ rows: [] });
         }
+        // N2/N3：llm.js 的活跃 run 复检经 connect() 的 client 发起（不再只走 pool.query 预检）
+        if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions')) {
+          return Promise.resolve({ rows: this.activeRun ? [{ '?column?': 1 }] : [] });
+        }
         return llmClient.query(sql, params);
       },
       release: () => llmClient.release(),
@@ -915,6 +963,54 @@ test('HTTP N1（Round C 评审）：凭据事实变化按当前值比较——ap
     const err5 = await res.json();
     assert.equal(res.status, 409, `首次配置撞活跃 run 应 409：${JSON.stringify(err5)}`);
     assert.equal(err5.error.code, 'active_run_conflict');
+  } finally {
+    await close();
+  }
+});
+
+test('HTTP N2（Round C 评审）：PATCH provider 撞活跃 run → 409 无 outbox 且 provider 未变；force=true 放行写 outbox；无活跃 run 不受影响', async () => {
+  const { base, pool, admin, close } = await startAdminServer({
+    providers: [{ id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true }],
+    models: [
+      { id: 'm-main', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, enabled: true },
+    ],
+    bindings: [{
+      fde_id: FDE_USER.id, gateway: 'direct', key_alias: 'alice@llm', state: 'active', generation: 1,
+      provider_id: 'p1', api_key: 'sk-n2-secret', main_model_id: 'm-main',
+    }],
+  });
+  try {
+    const H = { cookie: admin.cookie, 'content-type': 'application/json' };
+    const patch = (body) => fetch(`${base}/api/admin/llm/providers/p1`, { method: 'PATCH', headers: H, body: JSON.stringify(body) });
+
+    // 前置：无活跃 run → base_url 变更 200（不受影响，照旧写 outbox）
+    let res = await patch({ base_url: 'https://proxy.internal/v2' });
+    assert.equal(res.status, 200, `无活跃 run 应 200：${JSON.stringify(await res.json())}`);
+    const outboxBase = pool.llm.outbox.length;
+    assert.equal(outboxBase, 1, '该 provider 有 1 个 active binding → 1 条 outbox');
+
+    pool.activeRun = true;
+    // ① enabled:false → 409 且无 outbox、provider 未变
+    res = await patch({ enabled: false });
+    const err1 = await res.json();
+    assert.equal(res.status, 409, `enabled:false 应 409：${JSON.stringify(err1)}`);
+    assert.equal(err1.error.code, 'active_run_conflict');
+    assert.equal(pool.llm.outbox.length, outboxBase, '409 不得写 outbox');
+    assert.equal(pool.llm.providers.find((p) => p.id === 'p1').enabled, true, 'provider 未变');
+
+    // ② base_url 变更 → 409
+    res = await patch({ base_url: 'https://evil-upstream.example.com' });
+    const err2 = await res.json();
+    assert.equal(res.status, 409, `base_url 变更应 409：${JSON.stringify(err2)}`);
+    assert.equal(err2.error.code, 'active_run_conflict');
+    assert.equal(pool.llm.outbox.length, outboxBase);
+    assert.equal(pool.llm.providers.find((p) => p.id === 'p1').base_url, 'https://proxy.internal/v2', 'provider 未变');
+
+    // ③ force:true → 200 且写 outbox
+    res = await patch({ enabled: false, force: true });
+    assert.equal(res.status, 200, `force 放行：${JSON.stringify(await res.json())}`);
+    assert.equal(pool.llm.outbox.length, outboxBase + 1, 'force 放行必须写 outbox');
+    assert.equal(pool.llm.providers.find((p) => p.id === 'p1').enabled, false);
   } finally {
     await close();
   }
