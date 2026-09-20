@@ -535,8 +535,16 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
   try {
     atomicWriteFile(target, text, { mode: 0o644, root: config.traefikDynamicDir });
   } catch (err) {
-    await fs.promises.unlink(llmTarget).catch(() => {});
-    log.warn?.(`[routes] routes.yml publish failed (${err.message}); fail-closed：已摘除 llm-routes.yml，含密文件不再被 Traefik 使用`);
+    // N4（Round C 评审）：回滚摘除失败与第 1 步**同一严格口径**——绝不谎称「已摘除」：
+    // 旧代码 unlink 失败被 .catch(() => {}) 吞掉后仍 warn「已摘除」，撒谎（旧 key 文件可能仍被
+    // Traefik 使用）。摘除失败必须 error 级明示「含密文件可能残留」，并把该事实带进抛出的错误。
+    try {
+      await fs.promises.unlink(llmTarget);
+      log.warn?.(`[routes] routes.yml publish failed (${err.message}); fail-closed：已摘除 llm-routes.yml，含密文件不再被 Traefik 使用`);
+    } catch (e2) {
+      log.error?.(`[routes] routes.yml publish failed (${err.message}) 且含密文件 llm-routes.yml 摘除失败: ${e2.message} —— 含密文件可能残留，旧 api_key 可能仍被 Traefik 使用（异常态）`);
+      throw new Error(`routes.yml publish failed: ${err.message}; 含密文件可能残留（摘除失败: ${e2.message}）`);
+    }
     throw err;
   }
   return {
