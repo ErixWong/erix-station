@@ -641,3 +641,61 @@ test('F3-5：startRoutesLoop 启动重建失败 → 写 full_rebuild outbox 行�
   fs.chmodSync(dir, 0o700);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// N5（Round C 评审）：入队也失败（DB 抖动）→ 内存标记置位，此后每轮循环（消费 outbox 前）重试入队。
+class N5LoopFakePool {
+  constructor() {
+    this.sqlLog = [];
+    this.fullRebuildEnqueueAttempts = 0; // fake 记录的调用序列（供断言）
+    this.failEnqueueTimes = 1;           // 首次入队（启动路径）失败，其后成功
+  }
+
+  #dispatch(sql, params) {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql.includes('INSERT INTO route_revisions') && params?.[0] === 'full_rebuild') {
+      this.fullRebuildEnqueueAttempts += 1;
+      if (this.fullRebuildEnqueueAttempts <= this.failEnqueueTimes) throw new Error('db unavailable (injected)');
+      return { rows: [{ revision: this.fullRebuildEnqueueAttempts }] };
+    }
+    if (sql.includes('INSERT INTO route_revisions')) return { rows: [{ revision: 1 }] };
+    return { rows: [] };
+  }
+
+  async query(sql, params = []) {
+    this.sqlLog.push({ sql, params });
+    return this.#dispatch(sql, params);
+  }
+
+  async connect() {
+    const self = this;
+    return {
+      query: async (sql, params = []) => { self.sqlLog.push({ sql, params }); return self.#dispatch(sql, params); },
+      release: () => {},
+    };
+  }
+}
+
+test('N5（Round C 评审）：启动重建失败 + 入队也失败 → needsFullRebuild 标记置位；下一轮重试入队成功 → 清位（fake 记录调用序列）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-n5-loop-'));
+  fs.chmodSync(dir, 0o000); // 发布必然失败 → 触发启动重建失败分支
+  const pool = new N5LoopFakePool();
+  const warns = [];
+  const log = { warn: (m) => warns.push(m), error: () => {} };
+  const loop = startRoutesLoop(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log });
+  await new Promise((r) => setTimeout(r, 900)); // 循环 250ms/轮，足够跑过「重试成功」轮
+  loop.stop();
+
+  // 调用序列：启动路径 1 次（失败，置标记）+ 循环重试 1 次（成功，清位）——之后不再重试。
+  assert.equal(pool.fullRebuildEnqueueAttempts, 2, '启动 1 次失败 + 循环重试 1 次成功，共 2 次');
+  const enqueues = pool.sqlLog.filter((e) => e.sql.includes('INSERT INTO route_revisions') && e.params?.[0] === 'full_rebuild');
+  assert.equal(enqueues.length, 2);
+  assert.ok(warns.some((m) => m.includes('startup rebuild failed')), '启动重建失败必须告警');
+  assert.ok(warns.some((m) => m.includes('enqueue full_rebuild row failed') && m.includes('needsFullRebuild')), '入队失败必须置位并告警');
+  assert.ok(warns.some((m) => m.includes('入队重试成功')), '重试成功必须清位并告知');
+  assert.ok(
+    warns.filter((m) => m.includes('入队重试仍失败')).length === 0,
+    '重试成功后不得再无谓重试（标记已清）',
+  );
+  fs.chmodSync(dir, 0o700);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
