@@ -228,12 +228,14 @@ http:
       service: fde-alice-4000
     # LLM 注入：每 FDE 一条 router + 一条 headers middleware（各自独立 priority）；
     # 身份来自网络来源（ClientIP），非自报；禁止写无 ClientIP 条件的兜底路由（无匹配 404 = 默认拒绝）
-    fde-alice-llm:
+    # （2026-09-20 修订，issue #38：按 fde_llm_bindings 逐 binding 生成、注入真实上游 key、per-provider
+    #  service 上游直发；无 binding 不生成 LLM 路由 = fail-closed；本段实际发布在独立文件 llm-routes.yml，mode 600）
+    llm-alice:
       rule: "Host(`llm.<base>`) && ClientIP(`10.200.1.0/29`)"
       entryPoints: [websecure]
       priority: 200
-      middlewares: [alice-llm-auth]
-      service: llm-hub
+      middlewares: [llm-key-alice]
+      service: llm-provider-<provider id 前 8 位>
     # 大 FDE（/28）示例：rule: "Host(`llm.<base>`) && ClientIP(`10.201.7.0/28`)"（subnet 由 fde_networks 派生，topology.md §5.1）
   middlewares:
     fde-auth:
@@ -252,11 +254,10 @@ http:
         sourceRange: ["10.200.1.0/29", "10.201.7.0/28"]
         # ⚠️ 池范围 ≠ 放行范围：10.200.0.0/16 / 10.201.0.0/16 仅是取值池，禁止直接写入 sourceRange
         # 不配置 ipStrategy.depth / ipStrategy.excludedIPs：默认按 request remote address 判定（不读 X-Forwarded-For）
-    alice-llm-auth:
+    llm-key-alice:
       headers:
         customRequestHeaders:                 # 覆盖容器自带的任何 Authorization（实测可覆盖伪造头）
-          Authorization: "Bearer <alice 虚拟 key>"
-          X-FDE-Identity: "alice"
+          Authorization: "Bearer <alice binding 的真实上游 api_key>"   # 2026-09-20 修订（issue #38）：不再有平台虚拟 key / X-FDE-Identity
   services:
     portal:
       loadBalancer:
@@ -264,9 +265,9 @@ http:
     fde-alice-4000:
       loadBalancer:
         servers: [{ url: "http://10.200.1.2:4000" }]   # 容器 IP；重建漂移由 reconciler 重写（H-B 唯一技术债，topology.md §4-L8/§8）
-    llm-hub:
+    llm-provider-<id 前 8 位>:
       loadBalancer:
-        servers: [{ url: "http://127.0.0.1:4000" }]
+        servers: [{ url: "<llm_providers.base_url，如 http://127.0.0.1:4000>" }]   # 2026-09-20 修订（issue #38）：per-provider 上游直发，不再共享 llm-hub
         # responseForwarding.flushInterval 必须调小（≤100ms），否则 token 流被缓冲成整段（topology.md §6 第 5 条）
 ```
 
@@ -545,7 +546,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 | B 经 portal | 容器 → portal → 上游 | 否 | 不能 | **是**（SSE 透传） |
 | **C 网络强制（选定）** | 容器 → Traefik（按来源子网注入凭据）→ 网关，**且网关是唯一可达的 LLM 出口**（前提：安全团队网络层出口策略已实施，issue #3） | **否**（H-B 定稿 D-4，issue #5：容器零 LLM 凭据，Traefik 按 `ClientIP` 注入） | **不能** | 否 |
 
-**选 C**：用现成网关做（不自己写流式代理）——默认 LiteLLM（选型与活跃度/源码级验证见 [llm-gateway/](llm-gateway/llm-gateway-selection.md)；one-api/one-hub 停更淘汰、new-api 源码级验证出局），portal 只做：
+**选 C**：用现成网关做（不自己写流式代理）——~~默认 LiteLLM~~（**2026-09-20 修订，issue #38：去 LiteLLM hub、上游直发 per-FDE key**；下述 1/2/3 的「网关虚拟 key」改为「`fde_llm_bindings` 真实上游 key」，由 Traefik 注入后直连 `llm_providers.base_url`，无 binding 无路由 = fail-closed。选型材料仍见 [llm-gateway/](llm-gateway/llm-gateway-selection.md)），portal 只做：
 
 1. 开通账号时调网关 admin API **建虚拟 key**（额度、模型白名单、别名 `alice@client-x`）——key 随后由 portal（经 reconciler）写入**宿主 Traefik 动态配置**（文件权限 600，仅 portal 可写、Traefik 只读），**不下发容器**
 2. 禁用账号时**吊销**（删 key + 删对应 LLM 注入路由）
@@ -553,7 +554,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 → 待 Q1 确认公司是否已有网关；没有则先起一个网关容器（候选分析见 [`llm-gateway/llm-gateway-selection.md`](llm-gateway/llm-gateway-selection.md)：默认且唯一推荐 LiteLLM；one-api / one-hub 因停更淘汰，new-api 因源码级验证不达标出局——429 语义缺失、鉴权契约 rc 期间重写、凭据通道不可收紧，详见 [`llm-gateway/new-api-api-analysis.md`](llm-gateway/new-api-api-analysis.md)），仍走 C。
 
-> **H-B 链路（决策者 2026-09 定稿，issue #5 D-4；实测见 topology.md §10 证据 8）**：agent/worker 只认 `llm.<base>`——容器内**零 LLM 凭据**，仅占位 key + `endpoint=https://llm.<base>/v1`；请求经 Traefik（host:443），router `Host(llm.<base>) && ClientIP(<该 FDE 精确 subnet>，默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`)` 按**网络来源**判定身份，headers middleware **覆盖** `Authorization: Bearer <该 FDE 虚拟 key>` + 注入 `X-FDE-Identity`（容器自带的任何 `Authorization` 均被覆盖）；service 回环到网关数据面 `127.0.0.1:4000`；网关 **admin 面不发布**、只在 `backend` 网络。**禁止无 ClientIP 条件的兜底路由**（无匹配来源 404 = 默认拒绝）。配套：`aliasHeadersStrategy: delete`、hub service `flushInterval` 调小、路由配置 600（§6.4，topology.md §6）。
+> **H-B 链路（决策者 2026-09 定稿，issue #5 D-4；实测见 topology.md §10 证据 8）**：agent/worker 只认 `llm.<base>`——容器内**零 LLM 凭据**，仅占位 key + `endpoint=https://llm.<base>/v1`；请求经 Traefik（host:443），router `Host(llm.<base>) && ClientIP(<该 FDE 精确 subnet>，默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`)` 按**网络来源**判定身份，headers middleware **覆盖** `Authorization: Bearer <该 FDE binding 的真实上游 api_key>`（容器自带的任何 `Authorization` 均被覆盖；**2026-09-20 修订，issue #38**：不再注入 `X-FDE-Identity`、不再有平台虚拟 key——路由按 `fde_llm_bindings`（必须含 api_key）生成，无 binding 无路由，LLM 段独立文件 `llm-routes.yml` mode 600）；service = per-provider `llm-provider-<id>` → `llm_providers.base_url`（如 mock 数据面回环 `127.0.0.1:4000`，**上游直发**）；provider admin 配置面走 portal admin API。**禁止无 ClientIP 条件的兜底路由**（无匹配来源 404 = 默认拒绝）。配套：`aliasHeadersStrategy: delete`、provider service `flushInterval` 调小、LLM 路由配置 600（§6.4，topology.md §6）。（原「网关 admin 面不发布、只在 backend 网络」随 LiteLLM hub 取消而移除——issue #38，2026-09-20。）
 
 > **澄清（归属归位）**：LLM 网关是**独立组件**——公司已有网关，或平台另起的网关容器（如 LiteLLM），**不是 portal 内部的实现模块**；portal 侧只有「租户绑定」逻辑（上面的 1/2/3）。Q1（公司是否已有网关）保持未决，本文不替选型拍板。
 
@@ -561,7 +562,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 ### 11.4 配套细节
 
-- **容器内零 LLM 凭据**（H-B 定稿 D-4，issue #5）：容器 config 里只有占位 key + `endpoint=https://llm.<base>/v1`（`llm.<base>` 经 §5.3 hosts 注入解析到本 FDE 网关 IP）；真实虚拟 key 只存在于宿主 Traefik 动态配置（600，portal 可写、Traefik 只读）。原「key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
+- **容器内零 LLM 凭据**（H-B 定稿 D-4，issue #5）：容器 config 里只有占位 key + `endpoint=https://llm.<base>/v1`（`llm.<base>` 经 §5.3 hosts 注入解析到本 FDE 网关 IP）；真实 key 只存在于 DB（`fde_llm_bindings.api_key`）→ portal 内存 → 宿主 Traefik 动态配置 `llm-routes.yml`（**600**，portal 可写、Traefik 只读；**2026-09-20 修订，issue #38**：允许存 DB——原「绝不存明文」前提是 LiteLLM 持有真 key，该前提已不成立；存储纪律见 model.md §3）。原「key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
 - **judge / fold 用便宜模型**：`ModelConfigProvider.resolve(slot)` 支持 `default` / `audit` / `fold`；长任务 judge 会 +10~30% 调用量
 - **额度用尽**：网关 429 → erix 分类 `KitError(rate_limited, retryable)` → 宿主需友好提示，且避免重试继续烧配额
 - **对账**：网关 usage 与 erix `onUsage` 两套数都要记（差异来自 judge/fold 的额外调用）
