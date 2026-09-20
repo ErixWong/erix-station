@@ -18,6 +18,12 @@ import { enqueueRouteChange } from './outbox.js';
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MAX_ATTEMPTS = 5;
 
+// F3'（Round B 评审）：route_revisions / route_outbox 的 aggregate_id 是 uuid NOT NULL
+//（schema.sql §9），非 UUID 字符串在真实 DB 上会报 invalid input syntax for type uuid。
+// full_rebuild 的 outbox 行只是「触发一次全量重建」的信号、不对应真实聚合行，用固定 nil UUID 哨兵：
+// 满足 uuid 类型约束，且多次重试复用同一聚合 → 复用既有 revision head / 租约 / 重试链路。
+export const FULL_REBUILD_AGGREGATE_ID = '00000000-0000-0000-0000-000000000000';
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -457,7 +463,7 @@ export async function enqueueFullRebuild(pool) {
     await client.query('BEGIN');
     await enqueueRouteChange(client, {
       aggregate: 'full_rebuild',
-      aggregateId: 'startup',
+      aggregateId: FULL_REBUILD_AGGREGATE_ID,
       op: 'upsert',
       payload: { reason: 'startup_rebuild_failed' },
     });
