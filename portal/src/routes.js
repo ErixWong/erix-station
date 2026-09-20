@@ -585,6 +585,11 @@ export async function recoverRouteOrphans(pool) {
 export function startRoutesLoop(pool, config, { log = console, workerId = 'routes-1', onPause } = {}) {
   let stopped = false;
   let consecutiveFailures = 0;
+  // N5（Round C 评审）：启动重建失败且 full_rebuild 入队**也**失败（如 DB 抖动）时，旧代码只 warn——
+  // DB 恢复后不会再有任何全量重建触发。保留内存标记 needsFullRebuild：此后每次循环迭代
+  // （消费 outbox 之前）重试入队，成功即清位。复用既有 250ms 循环节奏（正常路径零成本空转），
+  // 不新增高频轮询/新时间轮；进程重启后由启动路径的 enqueueFullRebuild 重新尝试。
+  let needsFullRebuild = false;
   (async () => {
     // 启动全量重建（portal/Traefik 重启后从 DB 重建缺失状态，topology §8）。
     try {
@@ -597,11 +602,22 @@ export function startRoutesLoop(pool, config, { log = console, workerId = 'route
         await enqueueFullRebuild(pool);
         log.warn?.('[routes] startup rebuild 失败：已写入 full_rebuild outbox 行，等待循环重试');
       } catch (e2) {
-        log.warn?.(`[routes] enqueue full_rebuild row failed: ${e2.message}`);
+        needsFullRebuild = true;
+        log.warn?.(`[routes] enqueue full_rebuild row failed: ${e2.message}；已置 needsFullRebuild 标记，循环内将持续重试入队`);
       }
     }
     while (!stopped) {
       try {
+        // N5：标记为真 → 消费 outbox 之前先重试入队（成功清位；失败保持标记，下轮继续）。
+        if (needsFullRebuild) {
+          try {
+            await enqueueFullRebuild(pool);
+            needsFullRebuild = false;
+            log.warn?.('[routes] full_rebuild 入队重试成功：循环将消费该行走全量重建');
+          } catch (e2) {
+            log.warn?.(`[routes] full_rebuild 入队重试仍失败: ${e2.message}（needsFullRebuild 保持，下轮继续）`);
+          }
+        }
         await recoverRouteOrphans(pool);
         await runRoutesOnce(pool, config, { log, workerId });
         consecutiveFailures = 0;
