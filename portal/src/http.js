@@ -449,9 +449,12 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'PATCH') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // N2（Round C 评审）：base_url/enabled 变更撞活跃 run 由 updateProvider 在**同一事务内**守卫
+      // （409 active_run_conflict，不写变更/不写 outbox）；force=true 透传放行。
       const provider = await llm.updateProvider(ctx.pool, providerId, {
         base_url: body?.base_url,
         enabled: body?.enabled,
+        force: body?.force === true,
       });
       return sendJson(res, 200, { provider });
     }
