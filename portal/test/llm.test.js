@@ -238,8 +238,9 @@ class LlmFakePool {
       const hit = this.bindings.some((b) => b.provider_id === params[0]);
       return { rows: hit ? [{ '?column?': 1 }] : [] };
     }
-    if (sql.includes('SELECT api_key FROM fde_llm_bindings WHERE fde_id')) {
-      return { rows: this.bindings.filter((b) => b.fde_id === params[0]).map((b) => ({ api_key: b.api_key })) };
+    // N3：setFdeLlmConfig 事务内复检需要旧 provider_id + api_key（事实变化判定）
+    if (sql.includes('SELECT provider_id, api_key FROM fde_llm_bindings WHERE fde_id')) {
+      return { rows: this.bindings.filter((b) => b.fde_id === params[0]).map((b) => ({ provider_id: b.provider_id, api_key: b.api_key })) };
     }
     // issue #38 Phase B1：offboard 吊销联动（revokeFdeLlmConfigTx）——必须在通用 UPDATE 处理器之前。
     if (sql.includes('UPDATE fde_llm_bindings') && sql.includes("SET state = 'revoked'")) {
@@ -460,6 +461,51 @@ test('N2（Round C 评审）：updateProvider 撞活跃 run → 409 不写变更
   pool3.activeRun = true;
   await updateProvider(pool3, 'p1', {});
   assert.equal(pool3.outbox.length, 0, '无变更字段不写 outbox');
+});
+
+test('N3（Round C 评审）：setFdeLlmConfig 事务内权威复检——活跃 run 撞事实变化 → 409 不写库不写 outbox；force/同值放行；锁序 advisory → 复检 → 写入', async () => {
+  const pool = seedPool();
+  await setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p1', api_key: 'sk-n3-key000001', main_model_id: 'm-main' });
+  const outboxBase = pool.outbox.length;
+  pool.activeRun = true;
+
+  // provider 事实变化（p1→p2，模型位同步换成 p2 的 text+tc 模型）→ 409
+  await assert.rejects(
+    () => setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p2', api_key: 'sk-n3-x', main_model_id: 'm-other-provider' }),
+    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409,
+  );
+
+  // key 事实变化（显式新值）→ 409：不写库、不写 outbox
+  await assert.rejects(
+    () => setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p1', api_key: 'sk-n3-newkey001', main_model_id: 'm-main' }),
+    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409,
+  );
+  const b0 = pool.bindings.find((b) => b.fde_id === 'u1');
+  assert.equal(b0.provider_id, 'p1', '409 不写库');
+  assert.equal(b0.api_key, 'sk-n3-key000001', '409 不写库');
+  assert.equal(pool.outbox.length, outboxBase, '409 不写 outbox');
+
+  // api_key 缺省（=保留旧值）+ provider 不变 → 不算事实变化 → 200 不误伤
+  const ok1 = await setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main' });
+  assert.equal(ok1.api_key, maskKey('sk-n3-key000001'));
+
+  // force=true → 200 且写 outbox（放行后仍正常发布）
+  const ok2 = await setFdeLlmConfig(pool, { fdeName: 'alice', provider_id: 'p1', api_key: 'sk-n3-forced01', main_model_id: 'm-main', force: true });
+  assert.equal(ok2.api_key, maskKey('sk-n3-forced01'));
+  assert.equal(pool.outbox.length, outboxBase + 2, '两次成功写入各一条 outbox');
+
+  // 锁序断言（首次调用即含完整序列）：BEGIN → advisory lock → runs 复检 → 写 bindings → outbox → COMMIT
+  const seq = pool.sqlLog.map((e) => e.sql);
+  const iBegin = seq.findIndex((s) => s === 'BEGIN');
+  const iAdv = seq.findIndex((s) => s.includes('pg_advisory_xact_lock'));
+  const iRuns = seq.findIndex((s) => s.includes('FROM runs r') && s.includes('JOIN chat_sessions'));
+  const iWrite = seq.findIndex((s) => s.includes('UPDATE fde_llm_bindings') || s.includes('INSERT INTO fde_llm_bindings'));
+  const iOutbox = seq.findIndex((s) => s.includes('INSERT INTO route_outbox'));
+  const iCommit = seq.findIndex((s) => s === 'COMMIT');
+  assert.ok(iBegin !== -1 && iBegin < iAdv, 'advisory lock 在 BEGIN 之后');
+  assert.ok(iAdv < iRuns, '活跃 run 复检在 advisory lock（已持有）之后');
+  assert.ok(iRuns < iWrite, '复检在写入之前');
+  assert.ok(iWrite < iOutbox && iOutbox < iCommit, 'outbox 在事务内、COMMIT 之前写入');
 });
 
 // ---------------------------------------------------------------------------

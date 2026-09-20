@@ -251,6 +251,17 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       throw new SessionError('run_in_progress', 'session has an active run', { httpStatus: 409 });
     }
 
+    // N3（Round C 评审）：取与 setFdeLlmConfig 相同的 per-FDE advisory lock，使「建 run」与
+    // 「LLM 配置写入」全序——关闭「F6 守卫检查在配置事务外 → PUT 查到无活跃 run → 并发建 run
+    // 提交 → PUT 提交」的竞态窗口。锁序：chat_sessions（上，FOR UPDATE）→ 本 advisory → containers
+    // （下，FOR UPDATE）——与全系统偏序 chat_sessions < llm-binding < containers < fde_llm_bindings
+    // 一致（完整论证见 llm.js 文件头注释），无环、无死锁。
+    // fde_name 为 null 的账户不可能有 fde_llm_bindings 行（配置按 fde_name 寻址），跳过不取锁。
+    const fde = await client.query(`SELECT fde_name FROM users WHERE id = $1`, [userId]);
+    if (fde.rows[0]?.fde_name) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fde.rows[0].fde_name}`]);
+    }
+
     // issue #37 评审（major）：必须同时排除 revoked_at 非空的容器——deprovision 前置事务先吊销 token
     // 并释放网段（此时 status 可能还是 running），若只按 status 过滤，吊销后仍能建新 run，
     // 而该 run 不在 offboard 的收敛快照里、容器随后被删 → 永久排队无人 claim。

@@ -8,6 +8,23 @@
 //   ③ key 不进日志/审计/错误信息（audit details 与 route outbox payload 均不含 key）。
 // outbox 联动与 projects.js createProject 的 port_allocation 写法完全同构
 //（enqueueRouteChange：route_revisions head + route_outbox 行，同事务）。
+//
+// N3（Round C 评审）锁序论证——postMessage（sessions.js）与 setFdeLlmConfig 取**同一把**
+// per-FDE advisory lock（pg_advisory_xact_lock(hashtext('llm-binding:'||fdeName))），全系统相关
+// 加锁顺序（行锁仅列显式锁；普通 SELECT/INSERT 新行不产生等待边）：
+//   postMessage（sessions.js）： chat_sessions(FOR UPDATE) → llm-binding advisory → containers(FOR UPDATE)
+//                                → runs/run_queue（新插入）
+//   setFdeLlmConfig/delete/恢复： llm-binding advisory → fde_llm_bindings(UPDATE)
+//   updateProvider（N2）：        llm_providers(UPDATE)（活跃 run 复检为无锁 SELECT，不产生锁边）
+//   offboard 前置事务（provisioner.js）：containers(UPDATE) → fde_networks(UPDATE) → fde_llm_bindings(UPDATE)
+//                                （**不取** advisory——若取则与 postMessage「advisory→containers」成环，
+//                                故 revokeFdeLlmConfigTx 明确只吃调用方事务、不加本锁）
+//   onboard/deprovision 外层：   pg_advisory_lock('fde:<name>') 会话锁（另一 key 空间，仅 provisioner 持有）
+// 偏序 chat_sessions < llm-binding < containers < fde_llm_bindings 覆盖全部锁边 → 无环 → 无死锁。
+// 竞态窗口关闭原理：建 run 与配置写入经同一把 advisory lock 全序——配置先提交则 run 建在新配置之后
+//（run 边界语义：新 run 本就该用新上游/凭据，模型本就是 run 边界快照）；run 先提交则配置事务的
+// 事务内复检（N3）必见其 → 409。残余窗口见报告：provider 级 PATCH（updateProvider）不取本锁
+//（一 provider 多 FDE，无法复用 per-FDE 锁），与建 run 之间保留提交序窄窗口。
 
 import { enqueueRouteChange } from './outbox.js';
 
@@ -402,6 +419,7 @@ async function loadSlotModel(client, { slot, modelId, providerId, expectType, re
  */
 export async function setFdeLlmConfig(pool, {
   actorId = null, fdeName, provider_id, api_key, main_model_id, embedding_model_id = null, vision_model_id = null,
+  force = false,
 } = {}) {
   if (typeof provider_id !== 'string' || provider_id === '') {
     throw new LlmError('validation_failed', 'provider_id 为必填字段', { httpStatus: 400, details: { field: 'provider_id' } });
@@ -440,11 +458,38 @@ export async function setFdeLlmConfig(pool, {
     });
 
     const existing = await client.query(
-      `SELECT api_key FROM fde_llm_bindings WHERE fde_id = $1`,
+      `SELECT provider_id, api_key FROM fde_llm_bindings WHERE fde_id = $1`,
       [userId],
     );
     const oldKey = existing.rows[0]?.api_key ?? null;
+    const oldProvider = existing.rows[0]?.provider_id ?? null;
     const newKey = api_key === undefined ? oldKey : api_key;
+
+    // N3（Round C 评审）：F6 守卫的**权威复检**必须在本事务内（advisory lock 已持有）执行：
+    // http.js 的预检在事务外，挡不住「两个并发 PUT 双双通过预检后都提交」；此处对**已提交**状态复检。
+    // 「事实变化」口径与 http.js 预检一致（api_key 缺省=保留旧值不算变化；显式 null=清空算变化；
+    // 首次配置 current=null，给 provider/key 都算事实变化）。命中活跃 run 且未 force → 409，
+    // UPDATE/INSERT/outbox 一概不写（事务回滚）。并发安全：postMessage 建 run 取同一把 advisory
+    // lock（锁序论证见本文件头注释）→ 两事务全序，「PUT 查到无活跃 run → 并发建 run → PUT 提交」窗口关闭。
+    if (force !== true) {
+      const providerChanged = provider_id !== oldProvider;
+      const keyChanged = api_key !== undefined && (api_key ?? null) !== oldKey;
+      if (providerChanged || keyChanged) {
+        const act = await client.query(
+          `SELECT 1
+             FROM runs r
+             JOIN chat_sessions s ON s.id = r.session_id
+            WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
+            LIMIT 1`,
+          [userId],
+        );
+        if (act.rows.length > 0) {
+          throw new LlmError('active_run_conflict',
+            '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。'
+            + '确认无影响请带 force=true 重试。', { httpStatus: 409 });
+        }
+      }
+    }
 
     if (existing.rows.length > 0) {
       // 更新：gateway 语义收敛为 'direct'（上游直连），generation 不变（无代次轮换语义）。
