@@ -19,7 +19,10 @@ import * as totp from '../src/totp.js';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
-const MOCK = 'http://127.0.0.1:4000';
+const MOCK = 'http://127.0.0.1:4000'; // 数据面（FDE→Traefik→mock 链路）
+// F4（评审）：/__debug/last-request 只在独立调试端口（MOCK_DEBUG_PORT，默认 4001，仅宿主回环）
+// 提供；数据面 4000 对 /__debug/* 一律 404（防 FDE 经 llm.<base> 读全局 Authorization 跨 FDE 泄露 key）。
+const MOCK_DEBUG = 'http://127.0.0.1:4001';
 const FDE_IMAGE = 'erix-station/fde:local';
 // e2e 专用上游 key（形态有意非 erix-*：mock 虚拟 key 校验按设计 401——注入断言靠
 // __debug/last-request 记录而非响应；run 因此以 failed 终态完成属预期，见各断言注释）。
@@ -40,6 +43,17 @@ function resolveLlmHost() {
   return `llm.${baseDomain}`;
 }
 const LLM_HOST = resolveLlmHost();
+
+// Traefik web entrypoint 端口（容器内 llm.<base> 走 http + 该端口，同源于 config.js resolvePublicBaseUrl）。
+function resolveTraefikWebPort() {
+  try {
+    const envText = fs.readFileSync(path.join(REPO_ROOT, 'deploy/.env'), 'utf8');
+    const m = /^TRAEFIK_WEB_PORT=(.+)$/m.exec(envText);
+    if (m && m[1].trim()) return m[1].trim();
+  } catch { /* 缺 .env → 用 compose 默认 8090 */ }
+  return '8090';
+}
+const TRAEFIK_WEB_PORT = resolveTraefikWebPort();
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, { encoding: 'utf8', stdio: 'pipe', cwd: REPO_ROOT });
@@ -82,7 +96,7 @@ function readCookie(setCookie) {
 const readLlmRoutes = () => safe(() => docker(`run --rm -v ${S.dynamicRoot}:/d:ro alpine cat /d/llm-routes.yml 2>/dev/null`)) ?? '';
 const llmRoutesMode = () => safe(() => docker(`run --rm -v ${S.dynamicRoot}:/d:ro alpine stat -c %a /d/llm-routes.yml 2>/dev/null`))?.trim() ?? '';
 async function mockLastRequest() {
-  const r = await fetch(`${MOCK}/__debug/last-request`);
+  const r = await fetch(`${MOCK_DEBUG}/__debug/last-request`);
   if (r.status === 204) return null;
   assert.equal(r.status, 200, 'debug 端点 200');
   return r.json();
@@ -321,6 +335,16 @@ test('WP6 端到端：LLM 注入链路（config → admin API → Traefik 注入
     // 注入成功：Authorization 被换成真 key（掩码后四位 3456）；下行生效：model 用真模型名
     assert.ok(seen1.authorization === `Bearer ${API_KEY}`, `注入 key 命中（掩码 …${API_KEY.slice(-4)}）`);
     assert.equal(seen1.model, 'mock-model-a', '心跳下行模型集生效：run 请求体 model=mock-model-a');
+
+    // F4 反向断言（评审）：/__debug/last-request 只存在于宿主回环调试端口——
+    // ① 宿主直连数据面 4000 → 404；② FDE 容器内经 LLM 路由（llm.<base>:webPort，无 path 限制
+    // 必达 mock 数据面）→ 404。堵住「任一 FDE 读到全局 Authorization（= 他人注入的真实 key）」。
+    const dp = await fetch(`${MOCK}/__debug/last-request`);
+    assert.equal(dp.status, 404, `宿主直连数据面 4000 的 /__debug 必须 404（得 ${dp.status}）`);
+    const viaLlm = docker(`exec fde-alice node -e ${JSON.stringify(
+      `fetch('http://${LLM_HOST}:${TRAEFIK_WEB_PORT}/__debug/last-request').then(r=>{console.log(r.status)}).catch(e=>{console.log('ERR '+e.message)})`,
+    )}`).trim();
+    assert.equal(viaLlm, '404', `FDE 容器经 LLM 路由访问 /__debug 必须 404（得 ${viaLlm}）`);
 
     // 8) 换模型（不传 api_key = 保留旧值）→ 心跳刷新 → 新 run：model 变、key 不变
     const modelB = await adminApi(`/api/admin/llm/providers/${providerId}/models`, {
