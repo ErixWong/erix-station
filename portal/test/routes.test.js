@@ -518,6 +518,54 @@ test('F3：有 binding 先发密后发明——主文件发布失败时新版含
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('N4（Round C 评审）：主文件发布失败 + 含密文件摘除失败 → error 级日志明示「可能残留」+ 抛出含「可能残留」的错误，绝不谎称已摘除', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-n4-rollback-unlink-fail-'));
+  const llmTarget = path.join(dir, 'llm-routes.yml');
+  // 有 binding → 第 1 步成功写含密文件；routes.yml 预置为目录 → 第 2 步 rename 失败；
+  // 注入 unlink 失败（仅 llm-routes.yml）→ 回滚摘除失败（旧代码会吞掉并谎称「已摘除」）。
+  fs.mkdirSync(path.join(dir, 'routes.yml'));
+  const pool = makePublishPool({
+    bindings: [{
+      fde_id: 'u1', api_key: 'sk-test-1234567890',
+      provider_id: 'deadbeef-1111-2222-3333-444444444444',
+      base_url: 'https://api.upstream.example.com/v1',
+      fde_name: 'alice', subnet: '10.200.1.0/29',
+    }],
+  });
+  const errors = [];
+  const warns = [];
+  const log = { warn: (m) => warns.push(m), error: (m) => errors.push(m) };
+  const fsp = fs.promises;
+  const origUnlink = fsp.unlink;
+  fsp.unlink = async (p) => {
+    if (String(p) === llmTarget) {
+      const e = new Error('EPERM: injected unlink failure');
+      e.code = 'EPERM';
+      throw e;
+    }
+    return origUnlink(p);
+  };
+  try {
+    await assert.rejects(
+      () => rebuildRoutes(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log }),
+      /含密文件可能残留/,
+      '摘除失败必须把「可能残留」事实带进抛出的错误',
+    );
+  } finally {
+    fsp.unlink = origUnlink; // 恢复，避免影响其它用例
+  }
+  assert.ok(fs.existsSync(llmTarget), '含密文件确实残留在盘上（正是要报告的异常态）');
+  assert.ok(
+    errors.some((m) => m.includes('含密文件可能残留') && m.includes('Traefik')),
+    '必须 error 级日志明示「含密文件可能残留，旧 api_key 可能仍被 Traefik 使用」',
+  );
+  assert.ok(
+    warns.every((m) => !m.includes('已摘除 llm-routes.yml')),
+    '摘除失败时绝不谎称「已摘除」（旧代码的撒谎行为）',
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------------------
 // F2：desired-state 过滤 p.enabled = true（与心跳查询同口径）；停用 provider → 无 LLM 路由
 // ---------------------------------------------------------------------------
