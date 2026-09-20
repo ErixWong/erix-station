@@ -2,6 +2,10 @@
 // OpenAI-compatible 最小实现：POST /v1/chat/completions（流式 SSE + 非流式）。
 // 依据：docs/design/deploy-contract.md §7.3、docs/design/fde-platform.md §11。
 // 红线：不持任何真实 LLM key、不访问任何上游；虚拟 key 只做形态校验（erix-* 占位形态，P1 不做额度）。
+//
+// issue #38 Phase C：GET /__debug/last-request —— **dev/验收专用**调试端点，返回内存中最近一次
+// chat 请求的 { authorization, model, ts }（无请求 → 204）。仅 e2e 注入链路断言使用；生产网关
+// （P3 LiteLLM）不存在此端点。记录只在内存、不落盘、不含会话内容。
 import http from 'node:http';
 
 const PORT = Number(process.env.PORT || 4000);
@@ -10,6 +14,9 @@ const LATENCY_MS = Math.max(0, Number(process.env.MOCK_LATENCY_MS || 0));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // P1 虚拟 key 形态：接受 erix-placeholder / erix-mock / erix-<任意> 形态，拒绝其它（fde-platform §11.3）。
 const VIRTUAL_KEY_RE = /^erix-[a-z0-9_-]+$/i;
+
+// issue #38 Phase C（dev/验收专用）：最近一次 chat 请求的记录（GET /__debug/last-request 返回）。
+let lastRequest = null; // { authorization: string|null, model: string|null, ts: number }
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -105,16 +112,25 @@ function completionChunk(id, model, content, { finish = null, delta = false } = 
 
 function handleChat(req, res) {
   const auth = req.headers.authorization || '';
-  const m = /^Bearer\s+(.+)$/i.exec(auth);
-  const key = m ? m[1].trim() : '';
-  if (!VIRTUAL_KEY_RE.test(key)) {
-    return sendJson(res, 401, {
-      error: { message: 'invalid virtual key', type: 'invalid_request_error', code: 'invalid_api_key' },
-    });
-  }
 
+  // 先读 body 再校验 key（Phase C 调整）：调试记录要在 401 路径也能拿到 model——注入链路 e2e
+  // 用真 key 形态（过不了 VIRTUAL_KEY_RE，mock 按设计 401），注入断言靠本记录而非响应。
+  // 唯一行为差异：「非法 JSON + 非法 key」组合从 401 变为 400（先解析后校验）；合法 JSON 路径不变。
   readJson(req)
     .then(async (body) => {
+      // dev/验收调试（issue #38 Phase C）：无论校验成败都记录最近一次请求（不含任何会话内容）。
+      lastRequest = {
+        authorization: auth || null,
+        model: typeof body?.model === 'string' ? body.model : null,
+        ts: Date.now(),
+      };
+      const m = /^Bearer\s+(.+)$/i.exec(auth);
+      const key = m ? m[1].trim() : '';
+      if (!VIRTUAL_KEY_RE.test(key)) {
+        return sendJson(res, 401, {
+          error: { message: 'invalid virtual key', type: 'invalid_request_error', code: 'invalid_api_key' },
+        });
+      }
       if (LATENCY_MS > 0) await sleep(LATENCY_MS);
       const model = body.model || 'mock-model';
       const id = `chatcmpl-mock-${Date.now().toString(36)}`;
@@ -198,6 +214,15 @@ function handler(req, res) {
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     return handleChat(req, res);
+  }
+  // issue #38 Phase C（dev/验收专用，生产网关 P3 LiteLLM 无此端点）：返回最近一次 chat 请求记录。
+  if (req.method === 'GET' && url.pathname === '/__debug/last-request') {
+    if (lastRequest == null) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    return sendJson(res, 200, lastRequest);
   }
   return sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error', code: 'not_found' } });
 }

@@ -18,6 +18,33 @@ async function post(port, path, { body, key } = {}) {
   return res;
 }
 
+test('mock 网关：/__debug/last-request（Phase C dev 调试端点）', async (t) => {
+  const server = createGatewayServer();
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  // 无请求 → 204
+  const empty = await fetch(`http://127.0.0.1:${port}/__debug/last-request`);
+  assert.equal(empty.status, 204);
+
+  // 401 路径（真 key 形态过不了虚拟 key 校验）也记录 authorization + model——注入断言依赖此行为
+  const bad = await post(port, '/v1/chat/completions', { key: 'sk-e2e-abcdef123456', body: { model: 'mock-model-a', messages: [{ role: 'user', content: 'hi' }] } });
+  assert.equal(bad.status, 401);
+  const seen = await fetch(`http://127.0.0.1:${port}/__debug/last-request`);
+  assert.equal(seen.status, 200);
+  const seenBody = await seen.json();
+  assert.equal(seenBody.authorization, 'Bearer sk-e2e-abcdef123456');
+  assert.equal(seenBody.model, 'mock-model-a');
+  assert.equal(typeof seenBody.ts, 'number');
+
+  // 合法请求覆盖记录
+  const ok = await post(port, '/v1/chat/completions', { key: 'erix-placeholder', body: { model: 'mock-model-b', messages: [{ role: 'user', content: 'hi' }] } });
+  assert.equal(ok.status, 200);
+  const seen2 = await (await fetch(`http://127.0.0.1:${port}/__debug/last-request`)).json();
+  assert.equal(seen2.authorization, 'Bearer erix-placeholder');
+  assert.equal(seen2.model, 'mock-model-b');
+});
+
 test('mock 网关：虚拟 key 校验（erix-* 通过，其它 401）', async (t) => {
   const server = createGatewayServer();
   const port = await listen(server);
