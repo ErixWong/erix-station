@@ -18,6 +18,7 @@ import {
   DOCKER_ALLOWED_PATHS,
 } from '../src/provisioner.js';
 import { hashToken } from '../src/auth.js';
+import { syncFdeLlmBindingOnOnboard } from '../src/llm.js';
 
 function listen(server) {
   return new Promise((res) => server.listen(0, '127.0.0.1', res));
@@ -818,12 +819,109 @@ test('issue #38 Phase B1：onboard 复用分支恢复 LLM / 全新不复活（�
     new URL('../src/provisioner.js', import.meta.url), 'utf8'));
   // onboardFde：LLM 联动必须挂在容器就绪之后，且 restoreRevoked 与复用判定（needRecreate）绑定——
   // 复用（false）→ 复活 revoked；全新（true）→ 只幂等 upsert active，不复活 revoked。
-  const onboardCall = 'syncFdeLlmBindingOnOnboard(pool, { userId, fdeName, restoreRevoked: !needRecreate })';
-  assert.ok(src.includes(onboardCall), `onboardFde 必须调用 LLM 恢复联动：${onboardCall}`);
+  // F1（Round B 评审）：参数名必须叫 fdeId 且值必须是该 FDE 的 id（userId = users.id =
+  // fde_llm_bindings.fde_id）——传 userId 键会被 llm.js 的解构静默丢弃 → fde_id=NULL → 无行命中，
+  // 恢复/重发布静默 no-op（曾因此复用容器时 revoked binding 不恢复）。
+  const onboardCall = 'syncFdeLlmBindingOnOnboard(pool, { fdeId: userId, fdeName, restoreRevoked: !needRecreate })';
+  assert.ok(src.includes(onboardCall), `onboardFde 必须调用 LLM 恢复联动且参数名为 fdeId：${onboardCall}`);
+  // 跨模块契约锚点：llm.js 侧按 { fdeId, ... } 解构——两侧参数名漂移会被此断言拦截。
+  const llmSrc = await import('node:fs').then((fs) => fs.promises.readFile(
+    new URL('../src/llm.js', import.meta.url), 'utf8'));
+  assert.ok(
+    llmSrc.includes('syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restoreRevoked = false } = {})'),
+    'llm.js 的 syncFdeLlmBindingOnOnboard 必须按 fdeId 解构（与 provisioner 调用点参数名一致）',
+  );
   // deprovisionFde：① 前置事务块内、COMMIT 之前必须调 revokeFdeLlmConfigTx（同事务是评审重点）。
   const txStart = src.indexOf('① 前置事务');
   const commitIdx = src.indexOf("await client.query('COMMIT')", txStart);
   const revokeIdx = src.indexOf('revokeFdeLlmConfigTx(client, { fdeId: u.id, fdeName })', txStart);
   assert.ok(txStart > 0 && revokeIdx > txStart && revokeIdx < commitIdx,
     'LLM 吊销必须位于 ① 前置事务块内、COMMIT 之前（不得挪到独立连接/独立事务）');
+});
+
+// ---------------------------------------------------------------------------
+// F1（Round B 评审）：走真实函数链路验证 onboard 联动的参数语义——
+// syncFdeLlmBindingOnOnboard 收到的 fdeId 必须命中 fde_llm_bindings.fde_id（WHERE fde_id = $1），
+// 否则 revoked → active 恢复与 outbox upsert 静默 no-op（fake pool 真按 params 过滤行）。
+// ---------------------------------------------------------------------------
+test('F1（Round B 评审）：syncFdeLlmBindingOnOnboard（真实函数）restoreRevoked=true → revoked→active + outbox upsert 命中该 FDE 的 id', async () => {
+  const seq = [];
+  const paramsLog = [];
+  const state = { 'u1': { state: 'revoked', revokeParams: null } }; // 内存态：fdb 行按 fde_id 索引
+  const pool = {
+    async connect() {
+      return {
+        async query(sql, params = []) {
+          paramsLog.push({ sql, params });
+          if (sql === 'BEGIN') seq.push('tx:begin');
+          if (sql === 'COMMIT') seq.push('tx:commit');
+          if (sql.includes('SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE')) {
+            const row = state[params[0]];
+            return { rows: row ? [{ state: row.state }] : [] };
+          }
+          if (sql.includes("UPDATE fde_llm_bindings") && sql.includes("SET state = 'active'")) {
+            const row = state[params[0]];
+            if (!row) return { rows: [], rowCount: 0 };
+            row.state = 'active';
+            row.revokeParams = params;
+            return { rows: [], rowCount: 1 };
+          }
+          if (sql.includes('INSERT INTO route_revisions')) {
+            seq.push(`rev:${params[0]}:${params[1]}`);
+            return { rows: [{ revision: 7 }] };
+          }
+          if (sql.includes('INSERT INTO route_outbox')) {
+            seq.push(`outbox:${params[0]}:${params[2]}`);
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+  };
+
+  // 等价于 onboardFde 复用分支的调用（provisioner 侧参数名修复后即此形状）：
+  const out = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: true });
+  assert.deepEqual(out, { restored: true, republished: true }, 'revoked binding 必须被恢复且重发布 outbox');
+
+  // 命中的是「该 FDE 的 id」：所有 WHERE/SET fde_id = $1 的参数都是 u1（若为 NULL 则无行命中 → 静默 no-op）。
+  const hit = paramsLog.find((e) => e.sql.includes('SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE'));
+  assert.equal(hit.params[0], 'u1', 'FOR UPDATE 锁行参数必须是该 FDE 的 id');
+  assert.equal(state.u1.state, 'active', 'revoked → active 已发生');
+  assert.equal(state.u1.revokeParams[0], 'u1', 'UPDATE fde_id = 该 FDE 的 id');
+
+  assert.deepEqual(seq, ['tx:begin', 'rev:llm_binding:u1', 'outbox:llm_binding:upsert', 'tx:commit'],
+    '事务内顺序：BEGIN → revision head → outbox upsert → COMMIT');
+  const outbox = paramsLog.find((e) => e.sql.includes('INSERT INTO route_outbox'));
+  assert.equal(outbox.params[0], 'llm_binding');
+  assert.equal(outbox.params[1], 'u1', 'outbox aggregate_id = 该 FDE 的 id（revision head 同键）');
+  assert.equal(outbox.params[2], 'upsert');
+  assert.ok(outbox.params[4].includes('alice') && outbox.params[4].includes('"restored":true'), 'payload 带 fde_name + restored 标记');
+});
+
+test('F1（Round B 评审）：传错参数名（userId 键）→ 真实函数静默 no-op（回归锚点：bug 形态演示）', async () => {
+  // 若调用点退回传 { userId }，解构得到 fdeId=undefined → WHERE fde_id = NULL 无行命中，
+  // 返回 {restored:false, republished:false} 且不发任何 UPDATE/outbox——本用例把该失效形态钉死。
+  const pool = {
+    async connect() {
+      return {
+        async query(sql, params = []) {
+          if (sql.includes('SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE')) {
+            return { rows: [] }; // fde_id=NULL 永不命中
+          }
+          if (sql.includes('INSERT INTO route_outbox')) {
+            assert.fail('静默 no-op 形态不得写 outbox');
+          }
+          if (sql.includes('UPDATE fde_llm_bindings')) {
+            assert.fail('静默 no-op 形态不得发 UPDATE');
+          }
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+  };
+  const out = await syncFdeLlmBindingOnOnboard(pool, { userId: 'u1', fdeName: 'alice', restoreRevoked: true });
+  assert.deepEqual(out, { restored: false, republished: false });
 });

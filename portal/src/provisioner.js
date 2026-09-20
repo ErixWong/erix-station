@@ -689,7 +689,10 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
     // issue #38 Phase B1：onboard LLM 联动。复用分支（needRecreate=false）→ 恢复 revoked binding；
     // 全新 onboard → 不复活 revoked（admin 重新配置后再生效），仅对 active 配置幂等 upsert 发布。
     // 放在容器就绪之后：LLM 路由的 ClientIP 条件依赖本 FDE 网段，先保证网络/容器落地再发布。
-    await syncFdeLlmBindingOnOnboard(pool, { userId, fdeName, restoreRevoked: !needRecreate });
+    // F1（Round B 评审）：参数名必须叫 fdeId——llm.js 的 syncFdeLlmBindingOnOnboard 按
+    // { fdeId, fdeName, restoreRevoked } 解构，传 userId 会被静默丢弃 → fde_id=NULL → 无行命中，
+    // 恢复/重发布静默 no-op。此处 userId 即该 FDE 的 users.id（= fde_llm_bindings.fde_id）。
+    await syncFdeLlmBindingOnOnboard(pool, { fdeId: userId, fdeName, restoreRevoked: !needRecreate });
 
     return {
       userId,
