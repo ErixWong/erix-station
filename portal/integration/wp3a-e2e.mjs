@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseCidr, intToIp } from '../src/ipam.js';
+import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -144,8 +145,9 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
     removeDbDir();
 
-    // 1) 起栈（含 station-mock-llm）
-    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot });
+    // 1) 起栈（含 station-mock-llm）；MIGRATE_ON_START=1：迁移 0002（llm_providers/llm_models +
+    // fde_llm_bindings 扩列）必须已应用，下方 ensureMockLlmBinding 的 admin API 才有表/列可用。
+    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1' });
 
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
@@ -179,13 +181,24 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     S.token = readTokenFromContainer();
     assert.ok(S.token, 'ERIX_STATION_TOKEN 已注入容器');
 
-    // 3) 等 routes.yml 生成 internal + llm 路由
+    // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
+    // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、跑 run 之前补 binding。
+    await ensureMockLlmBinding({
+      docker,
+      dynamicDir: S.dynamicRoot,
+      fdeName: 'alice',
+      adminLogin: 'wp3a-admin',
+      adminPassword: 'wp3a-admin-pass-123',
+    });
+
+    // 3) 等 routes.yml 生成 internal 路由（issue #38 Phase B1 起 LLM 段拆独立文件 llm-routes.yml，
+    //    其中 llm-alice 已由上方 helper 等待过；本处只等主文件）
     const routesFile = path.join(S.dynamicRoot, 'routes.yml');
     await waitFor(() => {
       if (!fs.existsSync(routesFile)) return null;
       const txt = fs.readFileSync(routesFile, 'utf8');
-      return txt.includes('/api/internal') && txt.includes('llm.localhost') ? txt : null;
-    }, { label: 'routes.yml 含 internal + llm 路由' });
+      return txt.includes('/api/internal') ? txt : null;
+    }, { label: 'routes.yml 含 internal 路由' });
 
     // 4) ipAllowList 负向：宿主来源（127.0.0.1）不在 FDE subnet → 403
     const curlForbidden = `curl -s -o /dev/null -w '%{http_code}' -H 'Host: station.localhost' -H 'Authorization: Bearer ${S.token}' ${TRAEFIK_WEB}/api/internal/heartbeat`;

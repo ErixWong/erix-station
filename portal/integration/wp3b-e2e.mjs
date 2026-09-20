@@ -13,6 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
+import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -216,10 +217,13 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     // 1) 构建真实 runner 镜像（build context runner/）
     docker(`build -t ${FDE_IMAGE} runner/`);
 
-    // 2) 起栈（含 mock LLM；FDE 用真实 runner 镜像：tag + dev-mode + 无 --user）
+    // 2) 起栈（含 mock LLM；FDE 用真实 runner 镜像：tag + dev-mode + 无 --user）。
+    // MIGRATE_ON_START=1：迁移 0002（llm_providers/llm_models + fde_llm_bindings 扩列）必须已应用，
+    // 下方 ensureMockLlmBinding 的 admin API 才有表/列可用。
     compose('up -d --build', {
       ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
       TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+      MIGRATE_ON_START: '1',
       ...FDE_ENV,
     });
 
@@ -265,6 +269,16 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     assert.ok(S.containerId, 'containers row');
     S.token = readTokenFromContainer();
     assert.ok(S.token, 'ERIX_STATION_TOKEN 已注入容器');
+
+    // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
+    // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、跑 run 之前补 binding。
+    await ensureMockLlmBinding({
+      docker,
+      dynamicDir: S.dynamicRoot,
+      fdeName: 'alice',
+      adminLogin: 'wp3b-admin',
+      adminPassword: 'wp3b-admin-pass-123',
+    });
 
     // 5) agentd 连上 SSE 收 ping（§4.3）+ 首次心跳（containers.last_heartbeat）
     await waitFor(() => (agentdLogs().includes('sse ping received') ? true : null), { label: 'agentd SSE ping received', timeoutMs: 60000 });

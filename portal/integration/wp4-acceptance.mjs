@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
+import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -196,7 +197,9 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     removeDbDir();
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     docker(`build -t ${FDE_IMAGE} runner/`);
-    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, ...FDE_ENV });
+    // MIGRATE_ON_START=1：迁移 0002（llm_providers/llm_models + fde_llm_bindings 扩列）必须已应用，
+    // 下方 ensureMockLlmBinding 的 admin API 才有表/列可用（与 wp5/wp6 同口径）。
+    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1', ...FDE_ENV });
 
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
@@ -217,6 +220,16 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     docker('exec station-portal node portal/src/cli.js provision-fde --fde-name bob');
     await waitFor(() => (psql(`SELECT status FROM containers WHERE fde_name='bob'`) === 'running' ? true : null),
       { label: 'fde-bob running', timeoutMs: 60000 });
+
+    // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings 生成，无 binding 无 LLM 出口。
+    // 只给 alice 配 mock binding（bob 必须保持无配置——本脚本断言 bob 不受影响）。
+    await ensureMockLlmBinding({
+      docker,
+      dynamicDir: S.dynamicRoot,
+      fdeName: 'alice',
+      adminLogin: 'wp4-admin',
+      adminPassword: 'wp4-admin-pass-123',
+    });
 
     const bobIp = containerIp('bob');
     const aliceIp = containerIp('alice');
