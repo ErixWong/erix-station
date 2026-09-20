@@ -14,6 +14,7 @@ import {
   validateTraefikConfig,
   validateLlmTraefikConfig,
   rebuildRoutes,
+  startRoutesLoop,
 } from '../src/routes.js';
 
 test('deriveSourceRanges：从 fde_networks 精确 subnet 派生（/29 与 /28），禁止 /16 池', () => {
@@ -322,8 +323,10 @@ test('M3：含换行/控制字符的 LLM 发布事实（base_url）在发布路�
 // ---------------------------------------------------------------------------
 
 function makePublishPool({ bindings = [] } = {}) {
-  return {
-    async query(sql) {
+  const pool = {
+    sqlLog: [],
+    async query(sql, params = []) {
+      this.sqlLog.push({ sql, params });
       if (sql.includes('FROM fde_networks')) {
         return { rows: [{ fde_id: 'u1', subnet: '10.200.1.0/29', fde_name: 'alice' }] };
       }
@@ -336,6 +339,7 @@ function makePublishPool({ bindings = [] } = {}) {
       return { rows: [] };
     },
   };
+  return pool;
 }
 
 const PUBLISH_CONFIG_BASE = {
@@ -392,5 +396,194 @@ test('B1：无 LLM 配置的 FDE 发布——llm 文件不存在（null 契约�
   assert.equal(fs.existsSync(out.llmTarget), false, 'llm 文件不得存在（空文件形态被 Traefik 拒且连坐目录）');
   assert.ok(mainText.includes('Host(`station.localhost`)'), '无 LLM 配置不影响主路由发布');
   assert.equal(fs.statSync(out.target).mode & 0o777, 0o644, '主文件 644（无密钥）');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// F5：providerId / entryPoint YAML 注入面收口（评审复现串：a: bad / a,foo / a#foo / a foo）
+// ---------------------------------------------------------------------------
+
+test('F5：providerId 注入面——YAML 元字符串（: , # 空格）一律拒绝，先校验后写', () => {
+  for (const bad of ['a: bad', 'a,foo', 'a#foo', 'a foo']) {
+    assert.throws(
+      () => generateLlmTraefikConfig(llmArgs([{ ...BINDING_ALICE, providerId: bad }])),
+      /invalid provider id/,
+      `providerId=${JSON.stringify(bad)} 必须拒绝（评审复现串）`,
+    );
+  }
+  // 合法：UUID（DB 主键形态）与安全短 token 均通过
+  assert.ok(generateLlmTraefikConfig(llmArgs([BINDING_ALICE])).includes('llm-provider-deadbeef'));
+  const short = generateLlmTraefikConfig(llmArgs([{ ...BINDING_ALICE, providerId: 'abc_123-XY' }]));
+  assert.ok(short.includes('llm-provider-abc_123-'), 'service key = llm-provider-<providerId 前 8 位>');
+  assert.ok(short.includes('      service: llm-provider-abc_123-'));
+});
+
+test('F5：entryPoint 注入面——仅安全 token（^[a-zA-Z0-9_-]+$），非法即抛（LLM 段 + 主配置同口径）', () => {
+  for (const bad of ['web,internal', 'web: x', 'web#x', 'web x', 'web]x']) {
+    assert.throws(
+      () => generateLlmTraefikConfig({ ...llmArgs([BINDING_ALICE]), entryPoint: bad }),
+      /entryPoint/,
+      `entryPoint=${JSON.stringify(bad)} 必须拒绝`,
+    );
+  }
+  // 控制字符仍由 assertSafeString 先行拒绝（报错信息区分两层原因）
+  assert.throws(
+    () => generateLlmTraefikConfig({ ...llmArgs([BINDING_ALICE]), entryPoint: 'web\nx' }),
+    /control characters/,
+  );
+  assert.ok(
+    generateLlmTraefikConfig({ ...llmArgs([BINDING_ALICE]), entryPoint: 'web_secure-1' }).includes('entryPoints: [web_secure-1]'),
+    '合法安全 token 通过',
+  );
+  // 主配置同一白名单（entryPoint 裸拼进 entryPoints flow list，同注入面）
+  const base = {
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    allocations: [],
+    sourceRanges: [],
+  };
+  assert.throws(() => generateTraefikConfig({ ...base, entryPoint: 'web,internal' }), /entryPoint/);
+  assert.throws(() => generateTraefikConfig({ ...base, entryPoint: 'web: x' }), /entryPoint/);
+  assert.ok(generateTraefikConfig({ ...base, entryPoint: 'web-1' }).includes('entryPoints: [web-1]'));
+});
+
+// ---------------------------------------------------------------------------
+// F3：发布 fail-closed——先发含密文件、再无密主文件；任一步失败按红线处置
+// ---------------------------------------------------------------------------
+
+test('F3：零 binding → 摘除残留 llm-routes.yml（unlink 成功路径），主文件正常发布', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-f3-unlink-'));
+  const llmTarget = path.join(dir, 'llm-routes.yml');
+  // 预置旧含密文件（上一代 key 仍在盘上 = 评审发现的残留场景）
+  fs.writeFileSync(llmTarget, 'http:\n  routers:\n    llm-alice:\n      # stale secret-bearing content\n', { mode: 0o600 });
+  const out = await rebuildRoutes(makePublishPool({ bindings: [] }), { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir });
+  assert.equal(out.llmPublished, false);
+  assert.equal(fs.existsSync(llmTarget), false, '零 binding 时残留含密文件必须被摘除');
+  assert.ok(fs.existsSync(out.target), '主文件正常发布');
+  assert.equal(fs.statSync(out.target).mode & 0o777, 0o644);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('F3：零 binding 但 unlink 失败（EACCES）→ 抛错并明示「含密文件可能残留」，绝不静默', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-f3-unlink-fail-'));
+  const llmTarget = path.join(dir, 'llm-routes.yml');
+  fs.writeFileSync(llmTarget, 'stale-secret-bearing-content', { mode: 0o600 });
+  fs.chmodSync(dir, 0o000); // 目录只读：unlink 必然 EACCES
+  const errors = [];
+  const warns = [];
+  const log = { warn: (m) => warns.push(m), error: (m) => errors.push(m) };
+  try {
+    await assert.rejects(
+      () => rebuildRoutes(makePublishPool({ bindings: [] }), { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log }),
+      /含密文件可能残留/,
+      'unlink 失败必须抛出含「可能残留」语义的错',
+    );
+  } finally {
+    fs.chmodSync(dir, 0o700); // 恢复权限供清理（也供下方断言读到残留文件）
+  }
+  assert.ok(errors.some((m) => m.includes('含密文件可能残留')), '日志必须明示异常态（旧 key 可能仍被 Traefik 使用）');
+  assert.ok(warns.length === 0, '摘除失败不是 warn 级，必须 error 级');
+  assert.ok(fs.existsSync(llmTarget), '摘除失败时旧含密文件确实仍在盘上（正是要报告的异常态）');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('F3：有 binding 先发密后发明——主文件发布失败时新版含密文件已发布，随后 fail-closed 摘除', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-f3-rollback-'));
+  const llmTarget = path.join(dir, 'llm-routes.yml');
+  // 预置旧含密文件（旧 key 代）+ 把 routes.yml 预置为目录：第 2 步 rename 目标非法 → 主文件发布失败
+  fs.writeFileSync(llmTarget, 'old-generation-secret', { mode: 0o600 });
+  fs.mkdirSync(path.join(dir, 'routes.yml'));
+  const warns = [];
+  const log = { warn: (m) => warns.push(m), error: () => {} };
+  const pool = makePublishPool({
+    bindings: [{
+      fde_id: 'u1', api_key: 'sk-test-1234567890',
+      provider_id: 'deadbeef-1111-2222-3333-444444444444',
+      base_url: 'https://api.upstream.example.com/v1',
+      fde_name: 'alice', subnet: '10.200.1.0/29',
+    }],
+  });
+  await assert.rejects(
+    () => rebuildRoutes(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log }),
+    /ENOTDIR|EISDIR|rename/i,
+    '主文件发布失败必须把 rename 错误向上抛',
+  );
+  // fail-closed 回滚：含密文件被摘除——旧 key 不得在新主文件缺位的情况下继续被 Traefik 使用
+  assert.equal(fs.existsSync(llmTarget), false, '主文件失败 → 含密文件必须 fail-closed 摘除');
+  assert.ok(
+    warns.some((m) => m.includes('fail-closed') && m.includes('已摘除 llm-routes.yml')),
+    '日志必须能看出「已按 fail-closed 摘除含密文件」',
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// F2：desired-state 过滤 p.enabled = true（与心跳查询同口径）；停用 provider → 无 LLM 路由
+// ---------------------------------------------------------------------------
+
+test('F2：readRouteDesiredState 的 LLM JOIN 必须过滤 p.enabled = true（停用 provider 的 binding 不进路由输入）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-f2-enabled-'));
+  const pool = makePublishPool({ bindings: [] });
+  await rebuildRoutes(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir });
+  const llmSql = pool.sqlLog.find((e) => e.sql.includes('FROM fde_llm_bindings b'));
+  assert.ok(llmSql, '应发起 LLM desired-state 查询');
+  assert.ok(
+    llmSql.sql.includes('p.enabled = true'),
+    'desired-state 必须过滤停用 provider（与 getFdeLlmHeartbeatModels 心跳查询同口径）',
+  );
+  // 过滤后零 binding 的渲染输入 → 无 LLM 路由（fail-closed，与 generateLlmTraefikConfig b?.apiKey 口径一致）
+  assert.equal(generateLlmTraefikConfig(llmArgs([])), LLM_EMPTY_CONFIG);
+  assert.equal(fs.existsSync(path.join(dir, 'llm-routes.yml')), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// F3-5：启动重建失败 → 写 full_rebuild outbox 行作为循环重试信号（不改成高频轮询）
+// ---------------------------------------------------------------------------
+
+class LoopFakePool {
+  constructor() {
+    this.sqlLog = [];
+  }
+
+  #dispatch(sql) {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql.includes('INSERT INTO route_revisions')) return { rows: [{ revision: 1 }] };
+    return { rows: [] };
+  }
+
+  async query(sql, params = []) {
+    this.sqlLog.push({ sql, params });
+    return this.#dispatch(sql);
+  }
+
+  async connect() {
+    const self = this;
+    return {
+      query: async (sql, params = []) => { self.sqlLog.push({ sql, params }); return self.#dispatch(sql); },
+      release: () => {},
+    };
+  }
+}
+
+test('F3-5：startRoutesLoop 启动重建失败 → 写 full_rebuild outbox 行（循环消费到即重试全量重建）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-f3-loop-'));
+  fs.chmodSync(dir, 0o000); // 发布必然失败 → 触发启动重建失败分支
+  const pool = new LoopFakePool();
+  const warns = [];
+  const log = { warn: (m) => warns.push(m), error: () => {} };
+  const loop = startRoutesLoop(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log });
+  await new Promise((r) => setTimeout(r, 300));
+  loop.stop();
+  assert.ok(warns.some((m) => m.includes('startup rebuild failed')), '启动重建失败必须告警');
+  assert.ok(
+    pool.sqlLog.some((e) => e.sql.includes('INSERT INTO route_revisions') && e.params[0] === 'full_rebuild' && e.params[1] === 'startup'),
+    '必须写 full_rebuild 的 revisions head',
+  );
+  assert.ok(
+    pool.sqlLog.some((e) => e.sql.includes('INSERT INTO route_outbox') && e.params[0] === 'full_rebuild' && e.params[1] === 'startup'),
+    '必须写 full_rebuild pending outbox 行（循环消费到即重试全量重建）',
+  );
+  fs.chmodSync(dir, 0o700);
   fs.rmSync(dir, { recursive: true, force: true });
 });

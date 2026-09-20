@@ -1,7 +1,8 @@
 // 路由 reconciler：消费 route_outbox（route_revisions head 语义）→ 生成 Traefik file provider 动态配置。
 // 依据：docs/design/topology.md §5/§5.1/§8、docs/data/schema.sql §9（route_outbox/revisions）。
 // 每 allocation 一条显式 router + service（否决单通配 service）；来源规则从 fde_networks 精确 subnet 派生（禁 /16 聚合）。
-// 原子替换（tmp → 校验 → rename），失败保留上一版。
+// 原子替换（tmp → 校验 → rename）。发布顺序与回滚见 rebuildRoutes 注释：先发含密 llm-routes.yml、
+// 再无密 routes.yml，任一环节失败按 fail-closed 处置（绝不让旧/半截含密文件继续被 Traefik 使用）。
 //
 // issue #38 Phase B1：LLM 段拆独立文件 llm-routes.yml（mode 600，含上游 api_key 明文）——
 // 主文件 routes.yml 保持 0644（无密钥）。两文件同目录、同 atomicWriteFile、同一次全量重建，
@@ -12,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './fsutil.js';
 import { parseCidr } from './ipam.js';
+import { enqueueRouteChange } from './outbox.js';
 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MAX_ATTEMPTS = 5;
@@ -81,6 +83,21 @@ function assertSafeString(value, label) {
   return value;
 }
 
+/**
+ * F5：YAML 裸写 token 白名单——凡直接裸拼进 YAML（不加引号/不进 yq）的值（entryPoints flow list、
+ * providerId 前缀的 service key）必须命中 ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$，否则视为注入直接抛错。
+ * 控制字符/换行仍由 assertSafeString 先行拒绝（报错信息区分两层原因）。
+ */
+const SAFE_TOKEN_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+function assertSafeToken(value, label) {
+  assertSafeString(value, label);
+  if (!SAFE_TOKEN_RE.test(value)) {
+    throw new Error(`${label} must be a safe token (^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$): ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 function assertHttpUrl(value, label) {
   assertSafeString(value, label);
   let u;
@@ -115,8 +132,9 @@ export function generateTraefikConfig({
   }
   for (const r of sourceRanges) parseCidr(r); // 非法/含控制字符的 CIDR 直接拒绝
 
-  // M3：非 hostname 值（entryPoint/URL）同样拒绝控制字符/换行（yq 不转义换行）；URL 额外要求 http/https 可解析。
-  assertSafeString(entryPoint, 'entryPoint');
+  // M3/F5：非 hostname 值同样拒绝控制字符/换行（yq 不转义换行）；URL 额外要求 http/https 可解析；
+  // entryPoint 裸拼进 entryPoints flow list（不加引号），须命中安全 token 白名单（F5 注入面收口）。
+  assertSafeToken(entryPoint, 'entryPoint');
   assertHttpUrl(portalBackendUrl, 'portalBackendUrl');
 
   const forwardAuthAddress = `${portalBackendUrl.replace(/\/$/, '')}/api/forward-auth`;
@@ -201,21 +219,26 @@ export function generateTraefikConfig({
 export const LLM_EMPTY_CONFIG = null;
 
 export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = [] }) {
+  // F5：entryPoint 裸拼进每 router 的 entryPoints flow list（不加引号）——合法与否与 binding 数量无关，
+  // 入口处先校验（fail-fast，先校验后写）。
+  assertSafeToken(entryPoint, 'entryPoint');
   const active = [];
   for (const b of llmBindings) {
     if (b == null) continue;
     if (b.apiKey == null) continue; // 未配置 key → 无 LLM 可用，fail-closed 不发布
     if (!isValidHostname(b.fdeName)) throw new Error(`invalid fde name: ${JSON.stringify(b.fdeName)}`);
     parseCidr(b.subnet);
+    // F5：providerId 会拼成未加引号的 YAML service key（llm-provider-<前 8 位>），注入面收口为
+    // 严格白名单 ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$。选这套而不是「UUID 形态」单独分支的理由：
+    // DB 主键就是 UUID，天然命中本白名单；单一白名单同时兼容短测试 id，避免两套校验口径漂移。
     assertSafeString(b.providerId, 'providerId');
-    if (!/^[a-zA-Z0-9]/.test(b.providerId)) throw new Error(`invalid provider id: ${JSON.stringify(b.providerId)}`);
+    if (!SAFE_TOKEN_RE.test(b.providerId)) throw new Error(`invalid provider id: ${JSON.stringify(b.providerId)}`);
     assertHttpUrl(b.baseUrl, 'baseUrl');
     assertSafeString(b.apiKey, 'apiKey');
     active.push(b);
   }
   if (active.length === 0) return LLM_EMPTY_CONFIG;
   if (!isValidHostname(llmHost)) throw new Error(`invalid llm hostname: ${JSON.stringify(llmHost)}`);
-  assertSafeString(entryPoint, 'entryPoint');
 
   // 确定性输出：binding 按 fdeName 排序、service 按 provider 前缀排序——同 DB 状态两次渲染字节相同（幂等）。
   active.sort((x, y) => x.fdeName.localeCompare(y.fdeName));
@@ -330,7 +353,7 @@ export async function readRouteDesiredState(pool, config) {
   const llmRows = await pool.query(
     `SELECT b.fde_id, b.api_key, p.id AS provider_id, p.base_url, u.fde_name, n.subnet
        FROM fde_llm_bindings b
-       JOIN llm_providers p ON p.id = b.provider_id
+       JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
        JOIN users u ON u.id = b.fde_id
        JOIN fde_networks n ON n.fde_id = b.fde_id AND n.state IN ('allocated', 'active')
       WHERE b.state = 'active'
@@ -424,9 +447,40 @@ async function markRouteFailed(pool, id, error) {
 }
 
 /**
+ * F3-5（启动重建失败补偿）：写一条全量重建 outbox 行（aggregate='full_rebuild'）作为重试信号。
+ * 选 (a)「写 pending outbox 行触发循环重试」而非 (b)「定时兜底全量重建」的理由：复用既有
+ * claim/租约/重试/标记链路（含 crash 恢复），不引入新的时间轮询维度；无 pending 行时循环照常 250ms 低耗空转。
+ */
+export async function enqueueFullRebuild(pool) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await enqueueRouteChange(client, {
+      aggregate: 'full_rebuild',
+      aggregateId: 'startup',
+      op: 'upsert',
+      payload: { reason: 'startup_rebuild_failed' },
+    });
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * 全量重生成 Traefik 动态配置并原子替换（启动/定时对账用，不依赖 outbox 行）。
  * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 api_key 明文，**0600**，issue #38 Phase B1）。
- * 两份都先生成+校验再落盘：任一渲染失败则两份都不写（不落半截、失败保留上一版）。
+ * 两份都先生成+校验再落盘：任一渲染失败则两份都不写（不落半截）。
+ *
+ * F3 发布语义（fail-closed 硬红线：任何失败都不允许让「已撤销/已停用」的 key 继续被 Traefik 使用）：
+ *   1. 先发含密文件 llm-routes.yml（零 binding → unlink；有 binding → 写新内容 0600）；
+ *   2. 再无密主文件 routes.yml（0644）——若第 2 步失败，主文件保持上一版不动，回滚删除
+ *      llm-routes.yml（宁可不给 LLM 路由，也不让旧 key 在新主配置下继续生效），再抛错；
+ *   3. 若第 1 步含密文件发布本身失败（写或 unlink）→ 主文件不动（保持上一版），并尽力摘除盘上
+ *      旧含密文件；摘除失败属异常态，错误/日志必须明示「含密文件可能残留」，绝不静默。
  */
 export async function rebuildRoutes(pool, config, { log = console } = {}) {
   const state = await readRouteDesiredState(pool, config);
@@ -446,14 +500,38 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
   validateLlmTraefikConfig(llmText, state.llmBindings);
   const target = path.join(config.traefikDynamicDir, config.traefikDynamicFile ?? 'routes.yml');
   const llmTarget = path.join(config.traefikDynamicDir, config.traefikLlmDynamicFile ?? 'llm-routes.yml');
-  atomicWriteFile(target, text, { mode: 0o644, root: config.traefikDynamicDir });
-  if (llmText === null) {
-    // 零 binding：文件不得存在（见 LLM_EMPTY_CONFIG 注释——任何形式的空文件都会连坐整个目录）。
-    // unlink 原子；ENOENT 幂等。
-    await fs.promises.unlink(llmTarget).catch((e) => { if (e?.code !== 'ENOENT') throw e; });
-  } else {
-    // 红线：本文件含上游 api_key 明文，必须 0600（存储纪律 ①：key 只存在于 DB → 内存 → mode 600 文件）。
-    atomicWriteFile(llmTarget, llmText, { mode: 0o600, root: config.traefikDynamicDir });
+
+  // 第 1 步：先发含密文件（零 binding → unlink；有 binding → 写新内容）。
+  try {
+    if (llmText === null) {
+      // 零 binding：文件不得存在（见 LLM_EMPTY_CONFIG 注释——任何形式的空文件都会连坐整个目录）。
+      // unlink 原子；ENOENT 幂等。
+      await fs.promises.unlink(llmTarget).catch((e) => { if (e?.code !== 'ENOENT') throw e; });
+    } else {
+      // 红线：本文件含上游 api_key 明文，必须 0600（存储纪律 ①：key 只存在于 DB → 内存 → mode 600 文件）。
+      atomicWriteFile(llmTarget, llmText, { mode: 0o600, root: config.traefikDynamicDir });
+    }
+  } catch (err) {
+    // 第 1 步失败：主文件保持上一版不动（不进入第 2 步）；尽力摘除盘上旧含密文件，
+    // 绝不静默——摘除失败必须明示「含密文件可能残留」异常态（旧 api_key 可能仍被 Traefik 使用）。
+    try {
+      await fs.promises.unlink(llmTarget);
+      log.warn?.(`[routes] llm-routes.yml publish failed (${err.message}); 已摘除含密文件，主文件保持上一版`);
+    } catch (e2) {
+      log.error?.(`[routes] llm-routes.yml publish failed (${err.message}) 且旧含密文件摘除失败: ${e2.message} —— 含密文件可能残留，旧 api_key 可能仍被 Traefik 使用（异常态）`);
+      throw new Error(`llm-routes.yml publish failed: ${err.message}; 含密文件可能残留（摘除失败: ${e2.message}）`);
+    }
+    throw new Error(`llm-routes.yml publish failed: ${err.message}; 已摘除含密文件，主文件保持上一版`);
+  }
+
+  // 第 2 步：再无密主文件。失败 → fail-closed 回滚：删除 llm-routes.yml（宁可无 LLM 路由，
+  // 也不让含 key 的 llm 文件与旧/新主文件组合被 Traefik 继续使用），再抛错。
+  try {
+    atomicWriteFile(target, text, { mode: 0o644, root: config.traefikDynamicDir });
+  } catch (err) {
+    await fs.promises.unlink(llmTarget).catch(() => {});
+    log.warn?.(`[routes] routes.yml publish failed (${err.message}); fail-closed：已摘除 llm-routes.yml，含密文件不再被 Traefik 使用`);
+    throw err;
   }
   return {
     target,
@@ -499,6 +577,14 @@ export function startRoutesLoop(pool, config, { log = console, workerId = 'route
       await rebuildRoutes(pool, config, { log });
     } catch (err) {
       log.warn?.(`[routes] startup rebuild failed: ${err.message}`);
+      // F3-5：启动重建失败必须可重试——写一条 full_rebuild outbox 行，循环消费到即重试全量重建
+      //（不改成高频轮询；outbox 行本身带 claim/租约/重试语义，见 enqueueFullRebuild 注释）。
+      try {
+        await enqueueFullRebuild(pool);
+        log.warn?.('[routes] startup rebuild 失败：已写入 full_rebuild outbox 行，等待循环重试');
+      } catch (e2) {
+        log.warn?.(`[routes] enqueue full_rebuild row failed: ${e2.message}`);
+      }
     }
     while (!stopped) {
       try {

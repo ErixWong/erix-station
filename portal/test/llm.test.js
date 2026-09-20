@@ -224,6 +224,10 @@ class LlmFakePool {
         }],
       };
     }
+    // issue #38 F2：updateProvider 收敛——查受影响 active bindings（provider 变更 → route outbox）
+    if (sql.includes('SELECT fde_id FROM fde_llm_bindings WHERE provider_id')) {
+      return { rows: this.bindings.filter((b) => b.provider_id === params[0] && b.state === 'active').map((b) => ({ fde_id: b.fde_id })) };
+    }
     if (sql.includes('SELECT 1 FROM fde_llm_bindings WHERE provider_id')) {
       const hit = this.bindings.some((b) => b.provider_id === params[0]);
       return { rows: hit ? [{ '?column?': 1 }] : [] };
@@ -345,6 +349,73 @@ test('provider delete：被 fde_llm_bindings 引用 → 409 provider_in_use', as
     (e) => e instanceof LlmError && e.httpStatus === 409 && e.code === 'provider_in_use',
   );
   assert.equal(pool.providers.length, 1, '拒绝删除');
+});
+
+// ---------------------------------------------------------------------------
+// F2：updateProvider 变更收敛——base_url / enabled 变更在同事务写受影响 bindings 的 route outbox
+// ---------------------------------------------------------------------------
+
+function seedProviderWithBindings() {
+  return new LlmFakePool({
+    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }, { id: 'u2', fde_name: 'bob', status: 'active' }],
+    providers: [{ id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true }],
+    bindings: [
+      { fde_id: 'u1', gateway: 'direct', key_alias: 'alice@llm', state: 'active', generation: 1, provider_id: 'p1', api_key: 'sk-secret-alice', main_model_id: 'm1' },
+      { fde_id: 'u2', gateway: 'direct', key_alias: 'bob@llm', state: 'active', generation: 1, provider_id: 'p1', api_key: 'sk-secret-bob', main_model_id: 'm1' },
+    ],
+  });
+}
+
+test('F2：updateProvider 改 base_url → 同事务为每个受影响 active binding 写 route outbox（payload 不含 key）', async () => {
+  const pool = seedProviderWithBindings();
+  const updated = await updateProvider(pool, 'p1', { base_url: 'https://proxy.internal/v2' });
+  assert.equal(updated.base_url, 'https://proxy.internal/v2');
+  assert.equal(pool.outbox.length, 2, '两个 active binding 各一条 outbox');
+  const ids = pool.outbox.map((o) => o.aggregate_id).sort();
+  assert.deepEqual(ids, ['u1', 'u2']);
+  for (const o of pool.outbox) {
+    assert.equal(o.aggregate, 'llm_binding');
+    assert.equal(o.op, 'upsert');
+    assert.equal(o.state, 'pending');
+    assert.equal(o.payload.provider_id, 'p1');
+    assert.equal(o.payload.base_url_changed, true);
+    assert.ok(!JSON.stringify(o.payload).includes('sk-secret-'), 'payload 绝不含 api_key（红线 ③）');
+  }
+  // 同事务证据：outbox 写入发生在 COMMIT 之前（sqlLog 顺序 BEGIN ... outbox ... COMMIT）。
+  const log = pool.sqlLog.map((e) => e.sql);
+  const beginIdx = log.findIndex((s) => s === 'BEGIN');
+  const outboxIdx = log.findIndex((s) => s.includes('INSERT INTO route_outbox'));
+  const commitIdx = log.findIndex((s) => s === 'COMMIT');
+  assert.ok(beginIdx !== -1 && outboxIdx > beginIdx && commitIdx > outboxIdx, 'outbox 必须在事务内');
+});
+
+test('F2：updateProvider 停用 enabled=false → 写 outbox（路由面随之 fail-closed 摘除）', async () => {
+  const pool = seedProviderWithBindings();
+  const updated = await updateProvider(pool, 'p1', { enabled: false });
+  assert.equal(updated.enabled, false);
+  assert.equal(pool.outbox.length, 2);
+  for (const o of pool.outbox) {
+    assert.equal(o.aggregate, 'llm_binding');
+    assert.equal(o.payload.enabled_changed, true);
+  }
+});
+
+test('F2：updateProvider 无变更字段 / 无受影响 binding / 404 → 不写 outbox', async () => {
+  // 无变更字段（空对象）：裸 UPDATE 成功但不触发 outbox。
+  const pool = seedProviderWithBindings();
+  await updateProvider(pool, 'p1', {});
+  assert.equal(pool.outbox.length, 0, '无 base_url/enabled 变更不写 outbox');
+
+  // 该 provider 无 active binding（revoked 不算受影响）。
+  const pool2 = seedProviderWithBindings();
+  pool2.bindings.forEach((b) => { b.state = 'revoked'; });
+  await updateProvider(pool2, 'p1', { enabled: false });
+  assert.equal(pool2.outbox.length, 0, 'revoked binding 不发布路由，无需触发');
+
+  // 404：provider 不存在 → 错误且不写 outbox。
+  const pool3 = seedProviderWithBindings();
+  await assert.rejects(() => updateProvider(pool3, 'p-ghost', { enabled: false }), (e) => e.httpStatus === 404);
+  assert.equal(pool3.outbox.length, 0);
 });
 
 // ---------------------------------------------------------------------------
