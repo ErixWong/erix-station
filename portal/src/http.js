@@ -597,6 +597,8 @@ async function handleAdminApi(req, res, ctx, url) {
           }
         }
       }
+      // N3：force 透传——权威复检在 setFdeLlmConfig 事务内（advisory lock 之后、写入之前），
+      // 上方事务外预检只是快路径（提前 409，不进事务）。
       const config = await llm.setFdeLlmConfig(ctx.pool, {
         actorId: session.user.id,
         fdeName,
@@ -605,6 +607,7 @@ async function handleAdminApi(req, res, ctx, url) {
         main_model_id: body?.main_model_id,
         embedding_model_id: body?.embedding_model_id,
         vision_model_id: body?.vision_model_id,
+        force: body?.force === true,
       });
       return sendJson(res, 200, { config });
     }

@@ -721,7 +721,8 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
  * 锁顺序说明（评审 blocker，两轮）：三方事务必须同序才能避免 deadlock——
  *   reaper（internal.js）：runs → run_queue → chat_sessions(allocSeq)
  *   stopSession（sessions.js）：chat_sessions → runs
- *   postMessage（sessions.js）：chat_sessions → runs（新插入）
+ *   postMessage（sessions.js）：chat_sessions → llm-binding advisory（#38 N3，与 LLM 配置写入全序）
+ *                            → containers（FOR UPDATE，#37）→ runs（新插入）
  * offboard 若在一个事务里「锁 runs 再 allocSeq 锁 sessions」，与 stopSession 反序；若「先锁 sessions
  * 再锁 runs」，与 reaper 反序——**任何单事务全序都会与某一方成环**。
  * 解法：拆两步。事务 A 只按 reaper 同序（runs → queue）终态化，**不碰 sessions**；
