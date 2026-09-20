@@ -655,6 +655,7 @@ class HttpLlmPool extends FakePool {
   constructor(seed) {
     super({ users: [ADMIN, FDE_USER] });
     this.llm = new LlmFakePool({ users: [FDE_USER], ...seed });
+    this.activeRun = false; // F6：fdeHasActiveRun 的开关（口径同 sessions.js ACTIVE_RUN_STATES）
     this.sessions.push({
       id: 'ls-llm', user_id: ADMIN.id, token_hash: auth.hashToken(ADMIN_TOKEN),
       created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
@@ -662,6 +663,10 @@ class HttpLlmPool extends FakePool {
   }
 
   async query(sql, params = []) {
+    // F6：active run 判定（fdeHasActiveRun 的 JOIN；FakePool 不覆盖，默认无活跃 run）
+    if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions')) {
+      return { rows: this.activeRun ? [{ '?column?': 1 }] : [] };
+    }
     if (/llm_providers|llm_models|fde_llm_bindings|route_revisions|route_outbox|pg_advisory_xact_lock/.test(sql)
         || sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK'
         || (sql.includes('FROM users WHERE fde_name'))) {
@@ -798,6 +803,61 @@ test('HTTP：完整管理流——建 provider/model → PUT 配置 → GET 回�
     assert.equal(res.status, 403);
     const forbid = await res.json();
     assert.equal(forbid.error.code, 'forbidden');
+  } finally {
+    await close();
+  }
+});
+
+test('HTTP F6（Round B 评审）：活跃 run 撞换 provider/key → 409 active_run_conflict 不写 outbox；force=true 放行；纯模型变更不误伤', async () => {
+  const { base, pool, admin, close } = await startAdminServer({
+    providers: [
+      { id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true },
+      { id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com', enabled: true },
+    ],
+    models: [
+      { id: 'm-main', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, enabled: true },
+      { id: 'm-x', provider_id: 'p2', model_id: 'claude-sonnet', name: 'Sonnet', type: 'text', tool_calling: true, enabled: true },
+      { id: 'm-x2', provider_id: 'p2', model_id: 'claude-haiku', name: 'Haiku', type: 'text', tool_calling: true, enabled: true },
+    ],
+  });
+  try {
+    const H = { cookie: admin.cookie, 'content-type': 'application/json' };
+    const put = (body) => fetch(`${base}/api/admin/fdes/alice/llm`, { method: 'PUT', headers: H, body: JSON.stringify(body) });
+
+    // 前置（用例③：无活跃 run 不拦）：首次配置 → 200
+    let res = await put({ provider_id: 'p1', api_key: 'sk-key-aaaa1111', main_model_id: 'm-main' });
+    assert.equal(res.status, 200, `首次配置：${JSON.stringify(await res.json())}`);
+    const outboxBase = pool.llm.outbox.length;
+    assert.equal(outboxBase, 1, '首次配置写 1 条 outbox');
+
+    // ① 活跃 run + provider_id 变更 → 409 且不写 outbox
+    pool.activeRun = true;
+    res = await put({ provider_id: 'p2', main_model_id: 'm-x' });
+    assert.equal(res.status, 409, `换 provider 应 409：${JSON.stringify(await res.json())}`);
+    assert.equal(pool.llm.outbox.length, outboxBase, '409 路径不得写 outbox');
+
+    // ①b 活跃 run + 显式 api_key（凭据轮换）→ 409 且不写 outbox
+    res = await put({ provider_id: 'p1', api_key: 'sk-key-bbbb2222', main_model_id: 'm-main' });
+    assert.equal(res.status, 409, '活跃 run 换 key 应 409');
+    assert.equal((await res.json()).error.code, 'active_run_conflict');
+    assert.equal(pool.llm.outbox.length, outboxBase, '409 路径不得写 outbox');
+
+    // ② 带 force=true → 200 且写 outbox（放行后仍正常发布）
+    res = await put({ provider_id: 'p2', api_key: 'sk-key-bbbb2222', main_model_id: 'm-x', force: true });
+    assert.equal(res.status, 200, `force=true 应放行：${JSON.stringify(await res.json())}`);
+    assert.equal(pool.llm.outbox.length, outboxBase + 1, 'force 放行必须写 outbox');
+    assert.equal(pool.llm.outbox.at(-1).aggregate, 'llm_binding');
+    assert.equal(pool.llm.outbox.at(-1).op, 'upsert');
+
+    // ④ 纯模型变更（provider 值不变、不传 api_key）+ 活跃 run → 200 不误伤
+    res = await put({ provider_id: 'p2', main_model_id: 'm-x2' });
+    assert.equal(res.status, 200, `纯模型变更应 200：${JSON.stringify(await res.json())}`);
+    assert.equal(pool.llm.outbox.length, outboxBase + 2, '纯模型变更照常写 outbox');
+
+    // ③ 无活跃 run → 换 provider 200
+    pool.activeRun = false;
+    res = await put({ provider_id: 'p1', api_key: 'sk-key-cccc3333', main_model_id: 'm-main' });
+    assert.equal(res.status, 200, `无活跃 run 换 provider 应 200：${JSON.stringify(await res.json())}`);
   } finally {
     await close();
   }

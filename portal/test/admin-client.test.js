@@ -67,7 +67,7 @@ test('admin.html 结构：必备区块/表单/七类模型下拉/防 XSS 的 esc
   // 与 index.html 同款 esc（XSS 转义）；tool_calling checkbox 存在；active_run 黄色提示文案存在
   assert.match(html, /const esc = \(s\) => String\(s\)\.replace\(\/\[&<>"'\]\//, 'esc 与 index.html 同款');
   assert.ok(html.includes('tool_calling'), 'tool_calling checkbox');
-  assert.ok(html.includes('有活跃 run：换供应商会影响进行中的 run'), 'active_run 提示文案');
+  assert.ok(html.includes('有活跃 run：更换供应商或 API key 会被服务端拒绝'), 'active_run 提示文案');
   assert.ok(html.includes('仅此一次显示'), 'TOTP 一次性提示');
   assert.ok(html.includes('api/admin/users') && html.includes('api/admin/llm/providers'), '调用 admin API');
 });
