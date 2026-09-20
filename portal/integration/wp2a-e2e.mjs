@@ -248,11 +248,15 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     const routesText = fs.readFileSync(routesFile, 'utf8');
     assert.match(routesText, new RegExp(`fde-${S.hostname.split('.')[0]}:`));
     assert.ok(!routesText.includes('10.200.0.0/16'), '禁止 /16 聚合进放行范围');
-    // F3：每个 active FDE 生成 LLM 路由（Host(llm) && ClientIP(精确 subnet) → llm-hub，无兜底）。
-    assert.ok(routesText.includes('llm.localhost'), 'routes.yml 含 llm 路由');
-    assert.match(routesText, /ClientIP\(`10\.200\.\d+\.\d+\/2[89]`\)/, 'LLM ClientIP 精确 subnet');
-    assert.ok(routesText.includes('service: llm-hub'), 'LLM service llm-hub');
-    assert.ok(routesText.includes('fde-alice-llm'), 'fde-alice-llm router');
+    // F3（2026-09-20 修订，issue #38）：LLM 段已拆到独立文件 llm-routes.yml（mode 0600），
+    // 主文件 routes.yml 不再含任何 LLM 段。fail-closed：无 binding = 无 LLM 出口，
+    // 零 binding 时 rebuildRoutes 直接 unlink llm-routes.yml（Traefik v3 file provider 拒绝空形态）。
+    // wp2a 场景 alice 不配任何 binding → 断言「文件不存在」。ClientIP 精确 subnet 的覆盖
+    // 在 wp6（文件存在但无 llm-bob）+ 单测 portal/test/routes.test.js:157/375，本脚本不再重复。
+    assert.ok(!fs.existsSync(path.join(S.dynamicRoot, 'llm-routes.yml')), '零 binding → llm-routes.yml 不存在');
+    assert.ok(!routesText.includes('llm.localhost'), 'routes.yml 不含 llm 路由');
+    assert.ok(!routesText.includes('llm-hub'), 'routes.yml 不含 llm-hub service');
+    assert.ok(!routesText.includes('fde-alice-llm'), 'routes.yml 不含 fde-alice-llm router');
 
     // 7) 手工建 FDE 网络 + whoami 假 dev server
     await readDbNetwork();
