@@ -15,6 +15,7 @@ import {
   validateLlmTraefikConfig,
   rebuildRoutes,
   startRoutesLoop,
+  FULL_REBUILD_AGGREGATE_ID,
 } from '../src/routes.js';
 
 test('deriveSourceRanges：从 fde_networks 精确 subnet 派生（/29 与 /28），禁止 /16 池', () => {
@@ -566,6 +567,10 @@ class LoopFakePool {
   }
 }
 
+// F3'（Round B 评审）：aggregate_id 是 uuid NOT NULL（schema.sql §9），必须断言 UUID 形态，
+// 不得断言非 UUID 字面量（'startup' 曾把真实 DB 上的类型错误写成单测期望）。
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 test('F3-5：startRoutesLoop 启动重建失败 → 写 full_rebuild outbox 行（循环消费到即重试全量重建）', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-f3-loop-'));
   fs.chmodSync(dir, 0o000); // 发布必然失败 → 触发启动重建失败分支
@@ -575,14 +580,15 @@ test('F3-5：startRoutesLoop 启动重建失败 → 写 full_rebuild outbox 行�
   const loop = startRoutesLoop(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log });
   await new Promise((r) => setTimeout(r, 300));
   loop.stop();
+  assert.equal(FULL_REBUILD_AGGREGATE_ID, '00000000-0000-0000-0000-000000000000', '哨兵为固定 nil UUID');
   assert.ok(warns.some((m) => m.includes('startup rebuild failed')), '启动重建失败必须告警');
   assert.ok(
-    pool.sqlLog.some((e) => e.sql.includes('INSERT INTO route_revisions') && e.params[0] === 'full_rebuild' && e.params[1] === 'startup'),
-    '必须写 full_rebuild 的 revisions head',
+    pool.sqlLog.some((e) => e.sql.includes('INSERT INTO route_revisions') && e.params[0] === 'full_rebuild' && UUID_RE.test(String(e.params[1]))),
+    '必须写 full_rebuild 的 revisions head（aggregate_id 满足 uuid 形态）',
   );
   assert.ok(
-    pool.sqlLog.some((e) => e.sql.includes('INSERT INTO route_outbox') && e.params[0] === 'full_rebuild' && e.params[1] === 'startup'),
-    '必须写 full_rebuild pending outbox 行（循环消费到即重试全量重建）',
+    pool.sqlLog.some((e) => e.sql.includes('INSERT INTO route_outbox') && e.params[0] === 'full_rebuild' && UUID_RE.test(String(e.params[1]))),
+    '必须写 full_rebuild pending outbox 行（循环消费到即重试全量重建；aggregate_id 满足 uuid 形态）',
   );
   fs.chmodSync(dir, 0o700);
   fs.rmSync(dir, { recursive: true, force: true });
