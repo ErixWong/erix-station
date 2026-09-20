@@ -863,6 +863,63 @@ test('HTTP F6（Round B 评审）：活跃 run 撞换 provider/key → 409 activ
   }
 });
 
+test('HTTP N1（Round C 评审）：凭据事实变化按当前值比较——api_key:null=清空（409）/同值=无变化（200）/新值=409/force 放行且真清空', async () => {
+  const { base, pool, admin, close } = await startAdminServer({
+    providers: [{ id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true }],
+    models: [
+      { id: 'm-main', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, enabled: true },
+    ],
+  });
+  try {
+    const H = { cookie: admin.cookie, 'content-type': 'application/json' };
+    const put = (fde, body) => fetch(`${base}/api/admin/fdes/${fde}/llm`, { method: 'PUT', headers: H, body: JSON.stringify(body) });
+    const CURRENT = 'sk-n1-currentkey99';
+
+    // 前置：首次配置（无活跃 run）→ 200
+    let res = await put('alice', { provider_id: 'p1', api_key: CURRENT, main_model_id: 'm-main' });
+    assert.equal(res.status, 200, `首次配置：${JSON.stringify(await res.json())}`);
+    const outboxBase = pool.llm.outbox.length;
+    pool.activeRun = true;
+
+    // ① 活跃 run + 显式 api_key:null（=清空凭据的事实变化，旧口径会误判「无变更」）→ 409 且不写 outbox
+    res = await put('alice', { provider_id: 'p1', api_key: null, main_model_id: 'm-main' });
+    const err1 = await res.json();
+    assert.equal(res.status, 409, `api_key:null 应 409：${JSON.stringify(err1)}`);
+    assert.equal(err1.error.code, 'active_run_conflict');
+    assert.equal(pool.llm.outbox.length, outboxBase, '409 路径不得写 outbox');
+    assert.equal(pool.llm.bindings.find((b) => b.fde_id === FDE_USER.id).api_key, CURRENT, '409 不得写库');
+
+    // ② 活跃 run + api_key 与当前值相同 → 200（不算事实变化，不误伤幂等重试）
+    res = await put('alice', { provider_id: 'p1', api_key: CURRENT, main_model_id: 'm-main' });
+    assert.equal(res.status, 200, `同值 key 应 200：${JSON.stringify(await res.json())}`);
+    assert.equal(pool.llm.outbox.length, outboxBase + 1, '同值更新照常写 outbox');
+
+    // ③ 活跃 run + api_key 新值 → 409
+    res = await put('alice', { provider_id: 'p1', api_key: 'sk-n1-brandnew01', main_model_id: 'm-main' });
+    const err3 = await res.json();
+    assert.equal(res.status, 409, `新 key 应 409：${JSON.stringify(err3)}`);
+    assert.equal(err3.error.code, 'active_run_conflict');
+    assert.equal(pool.llm.outbox.length, outboxBase + 1, '409 路径不得写 outbox');
+
+    // ④ force:true + api_key:null → 200 且写 outbox，且凭据**真的**被清空（api_key=NULL）
+    res = await put('alice', { provider_id: 'p1', api_key: null, main_model_id: 'm-main', force: true });
+    assert.equal(res.status, 200, `force 放行：${JSON.stringify(await res.json())}`);
+    assert.equal(pool.llm.outbox.length, outboxBase + 2, 'force 放行必须写 outbox');
+    assert.equal(pool.llm.bindings.find((b) => b.fde_id === FDE_USER.id).api_key, null, 'api_key 真被置 NULL');
+    const echo = await (await fetch(`${base}/api/admin/fdes/alice/llm`, { headers: { cookie: admin.cookie } })).json();
+    assert.equal(echo.config.api_key, null, '掩码回显 api_key=null');
+
+    // ⑤ 首次配置（current=null）+ 活跃 run + 配 key → 也算事实变化 → 409
+    pool.llm.users.push({ id: 'u2', fde_name: 'bob', status: 'active' });
+    res = await put('bob', { provider_id: 'p1', api_key: 'sk-n1-bobfirst01', main_model_id: 'm-main' });
+    const err5 = await res.json();
+    assert.equal(res.status, 409, `首次配置撞活跃 run 应 409：${JSON.stringify(err5)}`);
+    assert.equal(err5.error.code, 'active_run_conflict');
+  } finally {
+    await close();
+  }
+});
+
 test('HTTP：provider/model 管理端点（POST/PATCH/DELETE + 409 引用拒绝）', async () => {
   const seed = {
     providers: [{ id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true }],
