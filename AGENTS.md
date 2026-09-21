@@ -80,3 +80,30 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - D1 Traefik 作 ingress；D2 SSO + 本地 break-glass admin；D3 每 FDE 仅自己的 `/29` 独立网络（`control` 共享网络已取消，H-B 定稿 issue #5）
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree
+
+## 8. erix-agent 依赖与升级（0.3.5 → 0.9.0，2026-09 分析）
+
+- **源仓库**：`~/projects/erix-llm-kit`（npm 包名就是 `erix-agent`；本地无同名目录，别再找错）。宿主契约 `docs/host-consumer-contract.md`；0.6.0 升级指南 `docs/host-upgrade-guide-0.6.0.md`；破坏性变化以 CHANGELOG 为准。
+- runner 锁 `0.3.5`（runner/package.json），最新 `0.9.0`。升级为**大改动**：走分支 + PR + §6.1 双模型评审。
+
+### 必改项（breaking，不改跑不起来）
+
+1. **`erix-agent/tools` 四个导入断供**（0.9.0 只剩 `createToolRegistry` + tool providers）：
+   - `createJail` / `createFileTools` → 0.6.0 删除（ADR-009：库不提供沙箱）→ runner 自带 file 工具与 jail 路径边界（牢笼仍由本项目提供，不变式 1）；
+   - `createRecallTool` → 0.8.0 随 recall 工具退役删除 → 删该工具，档案取回改 note 工作流（`note_take`/`note_read`/`note_list`，引擎要求 NotesStore；实现放 `src/store/notes.js` 导出 `createFileNotesStore`/`assertNotesStore`）。
+2. **TranscriptStore 必需方法变 8 个**（0.6.0 起 run 前 fail-closed 校验，缺即 TypeError）：station 现有 7 个，缺 **`saveRunState`/`loadRunState`** → 三段链路都补：worker `makeStore`（IPC）→ agentd `handleStoreState` 加 case → portal internal 新端点（`PUT/GET /runs/:id/runstate`，落 `runs.run_state jsonb`，与不变式 3「DB 是状态真相」一致）。契约要求：写失败向上抛、runState 对象含 `state`/`stateVersion`。
+3. **store.recall 不再必需**：引擎 0.8.0 起不再调用；agentd/portal 的 recall 端点可保留或删（升级时拍板，别留孤儿）。
+4. **未知顶层选项抛 TypeError**：worker 现有传参已逐项核对在契约白名单内，无需改（后续加参数必须先对 `host-consumer-contract.md` 选项清单）。
+
+### 需拍板的行为差异（不 crash，但改模型可见面/成本）
+
+- `maxRounds: 8 + reflection: false` → 0.9.0 扩轮唯一路径是 judge，长任务会撞 `max_rounds_cap`；是否开 judge（成本 vs 扩轮）由用户拍板。
+- 新默认值：output hygiene 4096（超限工具结果归档+截断提示）、工具结果 TTL 折叠（`ERIX_TOOL_RESULT_TTL` 默认 2）、retry `attempts:2`；单轮聚合预算在未传窗口配置时不生效（同 0.6.0 行为）。
+- resume 语义拆分（0.7.0）：轮号跨 resume 连续，轮预算每次 run 从 0 起计 → wp3b-e2e 的 resume 用例要按新口径核对。
+
+### 随动同步项
+
+- `termination` 新枚举 `final_guard_unverified`（docs/data/schema.sql 注释还按 0.3.5 写）；`usage` 增可选 `cacheRead`/`cacheWrite`；新事件类型 `compaction`/`final_guard`、judge 事件带 `extend`/`passThrough` 决策 → portal 事件白名单/前端枚举核对。
+- provider 导出 `createOpenAIProvider`/`createJsonFileModelConfigProvider` 与 `registry.executeTool(name, input, context)` 签名未变；worker 的 executeTool 已是结构化包装，无需改。
+- 升级后对 station store adapter 跑 `erix-agent/contract-tests`（`transcriptStoreContract` 0.6.0 起更严：checkpoint 字节保真、多 runId 隔离、runState round-trip）。
+- `runner/package.json` 版本号 + lock、wp3b-e2e、本节状态在 PR 内同步更新。
