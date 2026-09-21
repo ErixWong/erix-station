@@ -15,6 +15,9 @@ import * as sessions from './sessions.js';
 import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
+import * as llm from './llm.js';
+import * as admin from './admin.js';
+import { createDockerClient, onboardFde } from './provisioner.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -163,7 +166,7 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
   }
 }
 
-export function createServer({ pool, config, log = console }) {
+export function createServer({ pool, config, log = console, docker = null }) {
   const loginLimiter = createRateLimiter(config.loginRateLimit);
   // TOTP 失败限流按「账户 + IP」计数（防换新 pending_token 绕过）；单 token 尝试上限单独计。
   const totpLimiter = createRateLimiter({
@@ -189,7 +192,16 @@ export function createServer({ pool, config, log = console }) {
     blockMs: 60 * 1000,
     maxEntries: 10000,
   });
-  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter };
+  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter, docker };
+  // issue #38 Phase B2 admin UI：portal serve 进程本就有 config.dockerHost（cli.js serve 的
+  // startProvisionerLoop 也用它自建 client——调查结论见 Phase B2 报告），故 provision 端点**可实现**：
+  // 按需懒建并缓存 docker client（不持有连接，仅 HTTP 工厂）。测试可经 createServer({ docker }) 注入。
+  let lazyDocker = null;
+  ctx.adminDocker = () => {
+    if (ctx.docker) return ctx.docker;
+    if (!lazyDocker) lazyDocker = createDockerClient({ dockerHost: ctx.config.dockerHost });
+    return lazyDocker;
+  };
 
   return http.createServer(async (req, res) => {
     try {
@@ -217,6 +229,14 @@ export function createServer({ pool, config, log = console }) {
         sendJson(res, err.status, errorBody(err.code, err.message, err.retryable, err.details));
         return;
       }
+      if (err instanceof llm.LlmError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof admin.AdminError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -239,6 +259,29 @@ function decodeUuid(raw) {
 async function route(req, res, ctx) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
+
+  // admin UI 页面（issue #38 Phase B2）：GET /admin 服务 admin.html。
+  // 未登录 → 302 /（与登录页同入口）；非 admin → 403（与 /api/admin/* 的错误信封一致）。
+  if (pathname === '/admin') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    }
+    let session = null;
+    try {
+      session = await requireSession(req, ctx);
+    } catch {
+      session = null; // 未登录 → 302 到登录页
+    }
+    if (!session) {
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
+    }
+    if (session.user.role !== 'admin') {
+      return sendJson(res, 403, errorBody('forbidden', 'forbidden'));
+    }
+    return sendStaticFile(res, path.join(path.resolve(ctx.config.staticDir), 'admin.html'));
+  }
 
   if (pathname === '/healthz' || pathname === '/api/health') {
     if (req.method !== 'GET') {
@@ -363,6 +406,211 @@ async function routeApi(req, res, ctx, url) {
   if (runMatch) {
     const runId = decodeUuid(runMatch[1]);
     if (req.method === 'GET') return handleGetRun(req, res, ctx, runId);
+  }
+
+  // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
+  if (pathname.startsWith('/api/admin/')) {
+    return handleAdminApi(req, res, ctx, url);
+  }
+
+  return sendJson(res, 404, errorBody('not_found', 'not found'));
+}
+
+// ---------------------------------------------------------------------------
+// admin LLM 配置端点（issue #38 Phase A）
+// ---------------------------------------------------------------------------
+
+/** admin 鉴权：session 用户 role 必须为 'admin'，否则 403 forbidden。 */
+async function requireAdmin(req, ctx) {
+  const session = await requireSession(req, ctx);
+  if (session.user.role !== 'admin') throw new HttpError(403, 'forbidden', 'forbidden');
+  return session;
+}
+
+async function handleAdminApi(req, res, ctx, url) {
+  const { pathname } = url;
+  const session = await requireAdmin(req, ctx); // 所有 /api/admin/* 端点统一先鉴权
+
+  // 供应商 CRUD
+  if (pathname === '/api/admin/llm/providers') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await llm.listProviders(ctx.pool));
+    }
+    if (req.method === 'POST') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const provider = await llm.createProvider(ctx.pool, { name: body?.name, base_url: body?.base_url });
+      return sendJson(res, 201, { provider });
+    }
+  }
+  const adminProviderMatch = pathname.match(/^\/api\/admin\/llm\/providers\/([^/]+)$/);
+  if (adminProviderMatch) {
+    const providerId = decodeUuid(adminProviderMatch[1]);
+    if (req.method === 'PATCH') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // N2（Round C 评审）：base_url/enabled 变更撞活跃 run 由 updateProvider 在**同一事务内**守卫
+      // （409 active_run_conflict，不写变更/不写 outbox）；force=true 透传放行。
+      const provider = await llm.updateProvider(ctx.pool, providerId, {
+        base_url: body?.base_url,
+        enabled: body?.enabled,
+        force: body?.force === true,
+      });
+      return sendJson(res, 200, { provider });
+    }
+    if (req.method === 'DELETE') {
+      await llm.deleteProvider(ctx.pool, providerId);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+  }
+  const adminProviderModelsMatch = pathname.match(/^\/api\/admin\/llm\/providers\/([^/]+)\/models$/);
+  if (adminProviderModelsMatch && req.method === 'POST') {
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const model = await llm.createModel(ctx.pool, {
+      provider_id: decodeUuid(adminProviderModelsMatch[1]),
+      model_id: body?.model_id,
+      name: body?.name,
+      type: body?.type,
+      tool_calling: body?.tool_calling,
+      context_window: body?.context_window,
+    });
+    return sendJson(res, 201, { model });
+  }
+
+  // 模型 CRUD
+  const adminModelMatch = pathname.match(/^\/api\/admin\/llm\/models\/([^/]+)$/);
+  if (adminModelMatch) {
+    const modelId = decodeUuid(adminModelMatch[1]);
+    if (req.method === 'PATCH') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const model = await llm.updateModel(ctx.pool, modelId, {
+        name: body?.name,
+        enabled: body?.enabled,
+        tool_calling: body?.tool_calling,
+        context_window: body?.context_window,
+      });
+      return sendJson(res, 200, { model });
+    }
+    if (req.method === 'DELETE') {
+      await llm.deleteModel(ctx.pool, modelId);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+  }
+
+  // admin 用户管理（issue #38 Phase B2 admin UI）
+  if (pathname === '/api/admin/users') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await admin.listUsers(ctx.pool));
+    }
+    if (req.method === 'POST') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const created = await admin.createUser(ctx.pool, {
+        actorId: session.user.id,
+        login: body?.login,
+        display_name: body?.display_name,
+        password: body?.password,
+        fde_name: body?.fde_name,
+        totpIssuer: ctx.config.totp?.issuer,
+        limits: {
+          maxLoginLength: ctx.config.maxLoginLength,
+          maxPasswordLength: ctx.config.maxPasswordLength,
+        },
+      });
+      // totp_secret 仅此响应出现一次（红线）；列表/其它端点永不回显。
+      return sendJson(res, 201, created);
+    }
+  }
+
+  // FDE 容器 provision（调查结论：portal serve 进程有 config.dockerHost，client 懒建，端点可实现）
+  const adminProvisionMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/provision$/);
+  if (adminProvisionMatch && req.method === 'POST') {
+    const fdeName = decodeURIComponent(adminProvisionMatch[1]);
+    if (!projects.validateFdeName(fdeName).ok) {
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    }
+    let out;
+    try {
+      out = await onboardFde(ctx.pool, ctx.config, { fdeName, docker: ctx.adminDocker(), log: ctx.log });
+    } catch (err) {
+      // 对账循环仍在后台跑，失败不致命——把原因回给 admin（无敏感信息）。
+      throw new HttpError(500, 'provision_failed', String(err?.message ?? err));
+    }
+    return sendJson(res, 200, {
+      fde: fdeName,
+      network: out.networkName,
+      subnet: out.subnet,
+      container: out.containerName,
+    });
+  }
+
+  // per-FDE LLM 配置（回显只给掩码；api_key 缺省 = 保留旧值）
+  const adminFdeLlmMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm$/);
+  if (adminFdeLlmMatch) {
+    const fdeName = decodeURIComponent(adminFdeLlmMatch[1]);
+    if (!projects.validateFdeName(fdeName).ok) {
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    }
+    if (req.method === 'GET') {
+      // 无配置 200 + null；api_key 永不出响应（只掩码）。
+      // active_run（口径同 sessions.js ACTIVE_RUN_STATES）：true 时 UI 提示「换供应商/key 将被服务端 409
+      // 拒绝（F6 守卫见 PUT 分支）」；纯模型变更不受影响（run 边界生效）。
+      const config = await llm.getFdeLlmEcho(ctx.pool, fdeName);
+      let activeRun = false;
+      if (config) {
+        const u = await ctx.pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+        if (u.rows[0]) activeRun = await admin.fdeHasActiveRun(ctx.pool, u.rows[0].id);
+      }
+      return sendJson(res, 200, { config, active_run: activeRun });
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // F6（Round B 评审，fail-visible）：运行中换 provider/key 会**静默**改变运行中 run 的上游
+      //（RUN_START 只快照 models，provider/key 由 Traefik 当前路由决定）——撞活跃 run 时服务端拒绝：
+      //   ① provider 事实变化（provider_id 值变化；无旧配置时首次给上游 = 从「无路由」变「有路由」）；
+      //   ② 凭据事实变化（与当前配置值比较：缺省=保留旧值不算变化；显式新 key 或显式 null=清空都算）。
+      // 纯模型变更（main/embedding/vision）不受守卫：模型本就是 run 边界生效（RUN_START 快照），不误伤。
+      // 显式 force=true 放行（管理员知情确认），放行后仍正常写 outbox。
+      if (body?.force !== true) {
+        const u = await ctx.pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+        const userId = u.rows[0]?.id;
+        if (userId && await admin.fdeHasActiveRun(ctx.pool, userId)) {
+          // N1（Round C 评审）：判定「凭据事实是否真的变化」——与**当前配置值**比较，而不是
+          // 「是否显式传了非空值」。旧口径把显式 api_key:null 当「无变更」放过，而 llm.js 会把它
+          // 写成 api_key=NULL → 运行中静默清空凭据（路由消失，run 的 LLM 调用直接失败）。
+          // current 含明文 key：仅用于内存比较，绝不写进日志/错误（红线 ③）。
+          // 注：这只是事务外预检（快路径）；权威复检在 setFdeLlmConfig 事务内（N3，防并发 PUT）。
+          const current = await llm.getFdeLlmConfig(ctx.pool, userId);
+          const providerChanged = body?.provider_id !== undefined && body.provider_id !== (current?.provider_id ?? null);
+          const keyChanged = body?.api_key !== undefined && (body.api_key ?? null) !== (current?.api_key ?? null);
+          if (providerChanged || keyChanged) {
+            throw new HttpError(409, 'active_run_conflict',
+              '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。'
+              + '确认无影响请带 force=true 重试。');
+          }
+        }
+      }
+      // N3：force 透传——权威复检在 setFdeLlmConfig 事务内（advisory lock 之后、写入之前），
+      // 上方事务外预检只是快路径（提前 409，不进事务）。
+      const config = await llm.setFdeLlmConfig(ctx.pool, {
+        actorId: session.user.id,
+        fdeName,
+        provider_id: body?.provider_id,
+        api_key: body?.api_key,
+        main_model_id: body?.main_model_id,
+        embedding_model_id: body?.embedding_model_id,
+        vision_model_id: body?.vision_model_id,
+        force: body?.force === true,
+      });
+      return sendJson(res, 200, { config });
+    }
   }
 
   return sendJson(res, 404, errorBody('not_found', 'not found'));
@@ -1063,6 +1311,17 @@ async function serveStatic(req, res, ctx, url) {
   if (relPath.startsWith('..') || path.isAbsolute(relPath)) {
     return sendJson(res, 403, errorBody('forbidden', 'forbidden'));
   }
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return sendJson(res, 404, errorBody('not_found', 'not found'));
+    return sendStaticFile(res, filePath);
+  } catch {
+    return sendJson(res, 404, errorBody('not_found', 'not found'));
+  }
+}
+
+/** 发送单个静态文件（/admin 页面与 serveStatic 共用；不存在走 404）。 */
+function sendStaticFile(res, filePath) {
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile()) return sendJson(res, 404, errorBody('not_found', 'not found'));

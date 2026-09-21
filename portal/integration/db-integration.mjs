@@ -7,6 +7,7 @@ import { createPool } from '../src/db.js';
 import { migrate, computeExpectedVersions } from '../src/migrate.js';
 import { checkReady } from '../src/http.js';
 import { executeWithIdempotency, requestHash } from '../src/idempotency.js';
+import { enqueueFullRebuild, FULL_REBUILD_AGGREGATE_ID } from '../src/routes.js';
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 if (!DATABASE_URL) {
@@ -62,7 +63,7 @@ test('迁移：空库应用 baseline+bootstrap、幂等、head readiness、并�
 
   // head = baseline + 全部增量迁移（deploy/migrations/*.sql，文件名升序）
   const expectedVersions = computeExpectedVersions();
-  assert.deepEqual(expectedVersions, ['0000_baseline', '0001-idempotency-keys']);
+  assert.deepEqual(expectedVersions, ['0000_baseline', '0001-idempotency-keys', '0002-llm-config']);
   assert.equal(await checkReady(pool), true);
 
   // F2：baseline（schema.sql）自 P1 冻结、**不含** idempotency_keys；该表只由增量迁移 0001 提供
@@ -86,6 +87,45 @@ test('迁移：空库应用 baseline+bootstrap、幂等、head readiness、并�
   // checksum 已从哨兵回填为真实 sha256
   const r = await pool.query(`SELECT checksum FROM schema_migrations WHERE version = '0000_baseline'`);
   assert.match(r.rows[0].checksum, /^sha256:[0-9a-f]{64}$/);
+});
+
+test("F3'（Round B 评审）：enqueueFullRebuild 在真实 DB 可落盘——aggregate_id=nil uuid 哨兵，revisions/outbox 各一行 pending", async () => {
+  // 幂等：首个用例已应用全部迁移；此处再调一次确保本用例独立可跑。
+  await migrate(pool, {});
+  // 清掉历史 full_rebuild 行，保证「恰好各一行」断言的确定性。
+  await pool.query(`DELETE FROM route_outbox WHERE aggregate = 'full_rebuild'`);
+  await pool.query(`DELETE FROM route_revisions WHERE aggregate = 'full_rebuild'`);
+
+  // 不抛错即堵住「invalid input syntax for type uuid」（Round A 用非 UUID 字面量 'startup' 的回归类别）。
+  await enqueueFullRebuild(pool);
+
+  const rev = await pool.query(
+    `SELECT aggregate_id::text AS aggregate_id, revision
+       FROM route_revisions WHERE aggregate = 'full_rebuild'`,
+  );
+  assert.equal(rev.rows.length, 1, 'route_revisions 恰好一行 full_rebuild');
+  assert.equal(rev.rows[0].aggregate_id, FULL_REBUILD_AGGREGATE_ID, 'revisions head aggregate_id = nil uuid 哨兵');
+
+  const out = await pool.query(
+    `SELECT aggregate_id::text AS aggregate_id, op, revision, state, payload
+       FROM route_outbox WHERE aggregate = 'full_rebuild'`,
+  );
+  assert.equal(out.rows.length, 1, 'route_outbox 恰好一行 full_rebuild');
+  assert.equal(out.rows[0].aggregate_id, FULL_REBUILD_AGGREGATE_ID, 'outbox aggregate_id = nil uuid 哨兵');
+  assert.equal(out.rows[0].state, 'pending', 'outbox 行 state=pending（循环可消费）');
+  assert.equal(Number(out.rows[0].revision), Number(rev.rows[0].revision), 'outbox revision = revisions head（head 语义）');
+  assert.equal(out.rows[0].op, 'upsert');
+  assert.equal(out.rows[0].payload?.reason ?? JSON.parse(out.rows[0].payload).reason, 'startup_rebuild_failed');
+
+  // 重试复用同一聚合：再次入队只递增 head，不产生第二聚合（哨兵语义）。
+  await enqueueFullRebuild(pool);
+  const rev2 = await pool.query(
+    `SELECT revision FROM route_revisions WHERE aggregate = 'full_rebuild' AND aggregate_id = $1`,
+    [FULL_REBUILD_AGGREGATE_ID],
+  );
+  assert.equal(Number(rev2.rows[0].revision), Number(rev.rows[0].revision) + 1, '二次入队复用同一聚合（revision 递增）');
+  const outN = await pool.query(`SELECT count(*)::int AS n FROM route_outbox WHERE aggregate = 'full_rebuild'`);
+  assert.equal(outN.rows[0].n, 2, '二次入队再写一行 pending outbox（重试信号）');
 });
 
 test('角色属性：station_platform / station_portal 均为 LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE', async () => {

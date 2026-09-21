@@ -7,6 +7,8 @@ WORKDIR /app
 COPY server.mjs ./
 
 ENV PORT=4000
+ENV MOCK_DEBUG_PORT=4001
 EXPOSE 4000
+EXPOSE 4001
 
 CMD ["node", "server.mjs"]

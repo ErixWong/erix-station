@@ -2,14 +2,31 @@
 // OpenAI-compatible 最小实现：POST /v1/chat/completions（流式 SSE + 非流式）。
 // 依据：docs/design/deploy-contract.md §7.3、docs/design/fde-platform.md §11。
 // 红线：不持任何真实 LLM key、不访问任何上游；虚拟 key 只做形态校验（erix-* 占位形态，P1 不做额度）。
+//
+// issue #38 Phase C：GET /__debug/last-request —— **dev/验收专用**调试端点，返回内存中最近一次
+// chat 请求的 { authorization, model, ts }（无请求 → 204）。仅 e2e 注入链路断言使用；生产网关
+// （P3 LiteLLM）不存在此端点。记录只在内存、不落盘、不含会话内容。
+//
+// F4（Round B 评审）：该端点**只**在独立调试端口（MOCK_DEBUG_PORT，默认 4001）提供；数据面端口
+//（PORT，默认 4000）对 /__debug/* 一律 404。原因：LLM router 规则无 path 限制
+//（Host(llm.<base>) && ClientIP(<subnet>)），FDE 容器可经 llm.<base> 打到数据面端口，若 debug
+// 端点与数据面同端口，任一 FDE 都能读到**全局**最近一次请求的 Authorization（= Traefik 注入的
+// 真实上游 key）——跨 FDE 泄露。调试端口仅宿主回环发布（compose），Traefik/容器网均不可达。
 import http from 'node:http';
 
 const PORT = Number(process.env.PORT || 4000);
+// F4（Round B 评审）：dev/验收专用调试端口——/__debug/last-request 只在此端口提供，与数据面
+// 分离（compose 仅宿主回环发布；LLM router 无 path 限制，同端口会被 FDE 容器经 llm.<base> 读到
+// 全局 Authorization = 跨 FDE 泄露注入的真实 key）。
+const DEBUG_PORT = Number(process.env.MOCK_DEBUG_PORT || 4001);
 // 可选人为延迟（ms）：让 mock 完成请求变慢，供 e2e 真机崩溃恢复在 run 进行中重启容器（默认 0 无延迟）。
 const LATENCY_MS = Math.max(0, Number(process.env.MOCK_LATENCY_MS || 0));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // P1 虚拟 key 形态：接受 erix-placeholder / erix-mock / erix-<任意> 形态，拒绝其它（fde-platform §11.3）。
 const VIRTUAL_KEY_RE = /^erix-[a-z0-9_-]+$/i;
+
+// issue #38 Phase C（dev/验收专用）：最近一次 chat 请求的记录（GET /__debug/last-request 返回）。
+let lastRequest = null; // { authorization: string|null, model: string|null, ts: number }
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -105,16 +122,25 @@ function completionChunk(id, model, content, { finish = null, delta = false } = 
 
 function handleChat(req, res) {
   const auth = req.headers.authorization || '';
-  const m = /^Bearer\s+(.+)$/i.exec(auth);
-  const key = m ? m[1].trim() : '';
-  if (!VIRTUAL_KEY_RE.test(key)) {
-    return sendJson(res, 401, {
-      error: { message: 'invalid virtual key', type: 'invalid_request_error', code: 'invalid_api_key' },
-    });
-  }
 
+  // 先读 body 再校验 key（Phase C 调整）：调试记录要在 401 路径也能拿到 model——注入链路 e2e
+  // 用真 key 形态（过不了 VIRTUAL_KEY_RE，mock 按设计 401），注入断言靠本记录而非响应。
+  // 唯一行为差异：「非法 JSON + 非法 key」组合从 401 变为 400（先解析后校验）；合法 JSON 路径不变。
   readJson(req)
     .then(async (body) => {
+      // dev/验收调试（issue #38 Phase C）：无论校验成败都记录最近一次请求（不含任何会话内容）。
+      lastRequest = {
+        authorization: auth || null,
+        model: typeof body?.model === 'string' ? body.model : null,
+        ts: Date.now(),
+      };
+      const m = /^Bearer\s+(.+)$/i.exec(auth);
+      const key = m ? m[1].trim() : '';
+      if (!VIRTUAL_KEY_RE.test(key)) {
+        return sendJson(res, 401, {
+          error: { message: 'invalid virtual key', type: 'invalid_request_error', code: 'invalid_api_key' },
+        });
+      }
       if (LATENCY_MS > 0) await sleep(LATENCY_MS);
       const model = body.model || 'mock-model';
       const id = `chatcmpl-mock-${Date.now().toString(36)}`;
@@ -199,14 +225,40 @@ function handler(req, res) {
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     return handleChat(req, res);
   }
+  // F4（Round B 评审）：/__debug/* 只在独立调试端口（MOCK_DEBUG_PORT）提供——数据面对该路径
+  // 一律 404（LLM router 无 path 限制，FDE 容器可达数据面；debug 端点含全局 Authorization，
+  // 同端口 = 跨 FDE 泄露真实注入 key）。
   return sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error', code: 'not_found' } });
 }
 
-// 直接以脚本方式运行时监听（Docker 入口 / 本地联调）。
+/** F4：调试面 handler——只提供 GET /__debug/last-request（dev/验收专用，独立于数据面端口）。 */
+function debugHandler(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  if (req.method === 'GET' && url.pathname === '/__debug/last-request') {
+    if (lastRequest == null) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    return sendJson(res, 200, lastRequest);
+  }
+  return sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error', code: 'not_found' } });
+}
+
+/** 构造 mock 网关调试面 HTTP server（与数据面分离；不自动 listen，供测试注入随机端口）。 */
+export function createDebugServer() {
+  return http.createServer(debugHandler);
+}
+
+// 直接以脚本方式运行时监听（Docker 入口 / 本地联调）：数据面 PORT + 调试面 DEBUG_PORT 同进程双端口。
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop());
 if (isMain) {
   createGatewayServer().listen(PORT, '0.0.0.0', () => {
     // eslint-disable-next-line no-console
     console.log(`[mock-llm] listening on :${PORT} (zero-credential OpenAI-compatible mock)`);
+  });
+  createDebugServer().listen(DEBUG_PORT, '0.0.0.0', () => {
+    // eslint-disable-next-line no-console
+    console.log(`[mock-llm] debug endpoint on :${DEBUG_PORT} (dev-only, host loopback publish)`);
   });
 }

@@ -218,7 +218,7 @@
 
 | 项 | 取值 | 说明 |
 |---|---|---|
-| `slots.*.apiKey` | `"erix-placeholder"`（占位哨兵值） | **非真实凭据**。worker 依此发送 `Authorization: Bearer erix-placeholder`，Traefik 在 `llm.<base>` 路由用 `customRequestHeaders` **覆盖**为真实虚拟 key（topology §10 证据 8）。**真实 key 永不物化进容器**（D-4）。 |
+| `slots.*.apiKey` | `"erix-placeholder"`（占位哨兵值） | **非真实凭据（2026-09-20 确认，issue #38：容器内占位 key 语义不变）**。worker 依此发送 `Authorization: Bearer erix-placeholder`，Traefik 在 `llm.<base>` 路由用 `customRequestHeaders` **覆盖**为该 FDE `fde_llm_bindings` 的**真实上游 api_key**（per-FDE，topology §10 证据 8；修订前为「覆盖为平台虚拟 key 再经 llm-hub 网关」）。**真实 key 永不物化进容器**（D-4）。**fail-closed：无 binding（含未配 api_key）→ 该 FDE 无 LLM 路由，出口 404**（2026-09-20 修订，issue #38）。 |
 | `slots.*.endpoint` | `https://llm.<base>/v1`（`llm.<base>` = `llm.erix.vip`，env §10 `LLM_HOST`） | 容器内经 `--add-host llm.<base>:<本 FDE 网关 IP>` 解析到 Traefik host:443（env §0/§1）；**不写 A 记录、不进 DNS**。 |
 | `slots.*.model` | `default`/`audit`/`fold` 三个 slot 的模型名 | 平台默认值；`audit`/`fold` 用便宜模型（规格 §11.4）。 |
 

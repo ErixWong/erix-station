@@ -251,6 +251,36 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       throw new SessionError('run_in_progress', 'session has an active run', { httpStatus: 409 });
     }
 
+    // N3（Round C 评审）：取与 setFdeLlmConfig 相同的 per-FDE advisory lock，使「建 run」与
+    // 「LLM 配置写入」全序——关闭「F6 守卫检查在配置事务外 → PUT 查到无活跃 run → 并发建 run
+    // 提交 → PUT 提交」的竞态窗口。锁序：chat_sessions（上，FOR UPDATE）→ 本 advisory →（D2 起
+    // 中间还有 llm-provider advisory，见下）→ containers（下，FOR UPDATE）——与全系统偏序
+    // chat_sessions < llm-binding < llm-provider < containers 一致（完整论证见 llm.js 文件头注释），
+    // 无环、无死锁。
+    // fde_name 为 null 的账户不可能有 fde_llm_bindings 行（配置按 fde_name 寻址），跳过不取锁。
+    const fde = await client.query(`SELECT fde_name FROM users WHERE id = $1`, [userId]);
+    if (fde.rows[0]?.fde_name) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fde.rows[0].fde_name}`]);
+    }
+
+    // D2（Round D 评审）：该 FDE 当前 active binding 的 provider 再取 per-provider advisory lock
+    //（key 与 updateProvider 事务开头所取同），使「provider PATCH（换上游/停用）」与「建 run」全序——
+    // 关闭「PATCH 在建 run 的『无活跃 run』检查之后提交、已启动 run 的上游被改」的窗口：PATCH 先提交则
+    // 本 run 用新上游（run 边界语义）；本 run 先提交则 updateProvider 拿锁后的 N2 事务内复检必见其 → 409。
+    // 锁序：本锁在 llm-binding 之后、containers FOR UPDATE 之前（chat_sessions < llm-binding <
+    // llm-provider < containers），无环（完整论证见 llm.js 文件头注释）。
+    // 一致性：本 SELECT 在 llm-binding 锁之下——该锁串行化 setFdeLlmConfig/deleteFdeLlmConfig/syncFde
+    // 全部 binding 写入方，读到的是已提交快照（provider_id 本身可被 setFdeLlmConfig 更新，
+    // 但该更新同样必须持 llm-binding 锁——与本读串行：要么先提交（本读得新值），要么后提交
+    // （其事务内活跃 run 复检必见本 run → 409/force）），故锁 key 与本 run 实际使用的 provider 同指。
+    const binding = await client.query(
+      `SELECT provider_id FROM fde_llm_bindings WHERE fde_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    if (binding.rows[0]?.provider_id) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-provider:${binding.rows[0].provider_id}`]);
+    }
+
     // issue #37 评审（major）：必须同时排除 revoked_at 非空的容器——deprovision 前置事务先吊销 token
     // 并释放网段（此时 status 可能还是 running），若只按 status 过滤，吊销后仍能建新 run，
     // 而该 run 不在 offboard 的收敛快照里、容器随后被删 → 永久排队无人 claim。

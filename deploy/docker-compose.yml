@@ -207,7 +207,9 @@ services:
 
   # P1 mock LLM 网关（dev-only，零真实凭据，deploy-contract §7.3）：OpenAI-compatible
   # /v1/chat/completions（流式/非流式）。数据面 publish 仅宿主回环 127.0.0.1:4000，供 Traefik
-  # `llm.<base>` 路由回环访问（topology §4-L7）；P3 由真实 LLM 网关（LiteLLM）替换。
+  # `llm.<base>` 路由回环访问（topology §4-L7）。
+  # 2026-09-20 修订（issue #38）：LLM 出口已定 per-FDE 上游直发（fde_llm_bindings → 注入真实上游 key），
+  # 不建 LiteLLM hub；P3 如需接真实上游，只需把 admin API 里 provider 的 base_url 指到真实端点。
   station-mock-llm:
     container_name: station-mock-llm
     build:
@@ -225,9 +227,16 @@ services:
     environment:
       # 可选人为延迟（ms）：e2e 崩溃恢复需要 run 进行中重启容器，用延迟让 run 保持 running。默认 0。
       MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-0}
+      # F4（评审）：dev/验收专用调试端口（仅提供 /__debug/last-request，返回全局最近请求的
+      # Authorization=注入的真实 key）——只 publish 宿主回环，Traefik/容器网络均不可达。
+      # 容器内固定 4001；MOCK_DEBUG_PORT 只决定宿主侧 publish 端口。
+      MOCK_DEBUG_PORT: 4001
     ports:
       # 仅回环发布（topology §4-L7 / env §5）；LLM 网关数据面 admin 面不发布
       - "127.0.0.1:${LLM_GATEWAY_PORT:-4000}:4000"
+      # dev/验收专用调试面（F4）：仅宿主回环；不可经 Traefik 到达（FDE 容器无此路由，数据面对
+      # /__debug/* 一律 404——防止任一 FDE 经 llm.<base> 读到全局 Authorization 跨 FDE 泄露 key）。
+      - "127.0.0.1:${MOCK_DEBUG_PORT:-4001}:4001"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s

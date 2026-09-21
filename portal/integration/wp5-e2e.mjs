@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
+import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -190,6 +191,16 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
       { label: 'fde-alice running', timeoutMs: 60000 });
     await waitFor(() => (docker('logs fde-alice 2>&1').includes('sse ping received') ? true : null),
       { label: 'agentd sse ping', timeoutMs: 90000, intervalMs: 1000 });
+
+    // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
+    // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、发消息之前补 binding。
+    await ensureMockLlmBinding({
+      docker,
+      dynamicDir: S.dynamicRoot,
+      fdeName: 'alice',
+      adminLogin: 'wp5-admin',
+      adminPassword: 'wp5-admin-pass-123',
+    });
 
     // 1) 建会话 + 详情
     const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ project_id: projectId, title: 'wp5' }) });

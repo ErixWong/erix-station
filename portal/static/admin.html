@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FDE Station · 管理台</title>
+  <style>
+    :root { --bd: #ddd; --muted: #666; --brand: #0a7; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 0; color: #222; background: #fafafa; }
+    header { padding: .6rem 1rem; border-bottom: 1px solid var(--bd); display: flex; gap: 1rem; align-items: center; background: #fff; }
+    header h1 { font-size: 1.05rem; margin: 0; }
+    header .who { color: var(--muted); font-size: .85rem; flex: 1; }
+    header a { font-size: .85rem; color: var(--brand); text-decoration: none; }
+    main { max-width: 72rem; margin: 0 auto; padding: 1rem; display: flex; flex-direction: column; gap: 1.2rem; }
+    section { background: #fff; border: 1px solid var(--bd); border-radius: 10px; padding: 1rem 1.2rem; }
+    section h2 { font-size: 1rem; margin: 0 0 .8rem; }
+    .muted { color: var(--muted); font-size: .8rem; }
+    .syserr { color: #b33; font-size: .85rem; margin: .4rem 0; }
+    .okmsg { color: #2a2; font-size: .85rem; margin: .4rem 0; }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #eee; vertical-align: middle; }
+    th { color: var(--muted); font-weight: 500; font-size: .78rem; }
+    input, select, button { padding: .35rem .5rem; font-size: .85rem; }
+    button { cursor: pointer; border: 1px solid var(--bd); border-radius: 6px; background: #fff; }
+    button:hover { border-color: var(--brand); }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    button.danger { color: #b33; border-color: #b33; background: #fff2f0; }
+    button.small { padding: .15rem .5rem; font-size: .78rem; }
+    form.inline { display: flex; flex-wrap: wrap; gap: .5rem; align-items: end; margin: .6rem 0; }
+    form.inline label { display: flex; flex-direction: column; gap: .15rem; font-size: .75rem; color: var(--muted); }
+    .card { border: 1px solid var(--bd); border-radius: 8px; padding: .7rem .9rem; margin: .5rem 0; }
+    .card .head { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+    .card .head .name { font-weight: 600; }
+    .card .head .url { color: var(--muted); font-size: .82rem; word-break: break-all; }
+    .card .head .spacer { flex: 1; }
+    .badge { display: inline-block; padding: .05rem .45rem; border-radius: 999px; font-size: .72rem; border: 1px solid var(--bd); }
+    .badge.on { color: #2a2; border-color: #2a2; background: #f2fff4; }
+    .badge.off { color: #999; background: #f4f4f4; }
+    .badge.type { color: #06c; border-color: #06c; background: #f0f6ff; }
+    .detail { margin-top: .6rem; border-top: 1px dashed var(--bd); padding-top: .6rem; }
+    .warnbox { border: 1px solid #d80; background: #fffaf0; color: #a60; border-radius: 8px; padding: .5rem .8rem; font-size: .83rem; margin: .5rem 0; }
+    .totpbox { border: 1px solid var(--brand); background: #f2fff9; border-radius: 8px; padding: .6rem .8rem; margin: .5rem 0; font-size: .85rem; }
+    .totpbox code { word-break: break-all; user-select: all; }
+    .row-head { cursor: pointer; }
+    .row-head:hover { background: #f6fffa; }
+    .llmform { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .5rem; margin-top: .5rem; }
+    .llmform label { display: flex; flex-direction: column; gap: .15rem; font-size: .75rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>FDE Station · 管理台</h1>
+    <span class="who" id="who"></span>
+    <a href="/">← 返回工作台</a>
+  </header>
+  <main>
+    <section id="llmSection">
+      <h2>LLM 供应商</h2>
+      <div id="llmErr"></div>
+      <div id="providerList"><p class="muted">加载中…</p></div>
+      <form class="inline" id="addProviderForm">
+        <label>供应商名<input name="name" required placeholder="openai"></label>
+        <label>Base URL<input name="base_url" required placeholder="https://api.openai.com/v1"></label>
+        <button class="primary" type="submit">＋ 新增供应商</button>
+      </form>
+    </section>
+
+    <section id="fdeSection">
+      <h2>FDE 管理</h2>
+      <div id="fdeErr"></div>
+      <div id="totpOnce"></div>
+      <div id="userList"><p class="muted">加载中…</p></div>
+      <h2 style="margin-top:1rem">新增 FDE 用户</h2>
+      <form class="inline" id="addUserForm">
+        <label>登录名<input name="login" required autocomplete="off"></label>
+        <label>显示名<input name="display_name" autocomplete="off"></label>
+        <label>口令<input name="password" type="password" required autocomplete="new-password"></label>
+        <label>fde_name（可空）<input name="fde_name" placeholder="alice" autocomplete="off"></label>
+        <button class="primary" type="submit">＋ 创建用户</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    // 与 index.html 同款的 HTML 转义：所有动态值进 DOM 前必须经 esc() 或 textContent。
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    const S = { user: null, providers: [], users: [], expanded: new Set(), userExpanded: new Set() };
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      if (r.status === 204) return null;
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw Object.assign(new Error(body.error?.message ?? ('HTTP ' + r.status)), { code: body.error?.code, status: r.status });
+      return body;
+    }
+
+    function showErr(elId, err) {
+      $(elId).innerHTML = '';
+      if (!err) return;
+      const div = document.createElement('div');
+      div.className = 'syserr';
+      div.textContent = '错误：' + (err?.message ?? String(err));
+      $(elId).appendChild(div);
+    }
+
+    async function boot() {
+      try {
+        const me = await api('/api/me');
+        S.user = me.user;
+        if (S.user.role !== 'admin') { document.body.innerHTML = '<main><p class="syserr">403 forbidden：需要管理员权限。</p></main>'; return; }
+      } catch {
+        location.href = '/';
+        return;
+      }
+      $('who').textContent = `${S.user.login}（admin）`;
+      await Promise.all([loadProviders(), loadUsers()]);
+    }
+
+    // ------------------------------------------------------------------
+    // LLM 供应商
+    // ------------------------------------------------------------------
+    async function loadProviders() {
+      showErr('llmErr', null);
+      try {
+        const data = await api('/api/admin/llm/providers');
+        S.providers = data.items ?? [];
+        renderProviders();
+      } catch (e) { showErr('llmErr', e); }
+    }
+
+    function typeBadge(t) { return `<span class="badge type">${esc(t)}</span>`; }
+
+    function renderProviders() {
+      const list = $('providerList');
+      list.innerHTML = '';
+      if (S.providers.length === 0) list.innerHTML = '<p class="muted">暂无供应商，先在下方新增。</p>';
+      for (const p of S.providers) {
+        const card = document.createElement('div');
+        card.className = 'card';
+        const open = S.expanded.has(p.id);
+        const models = p.models ?? [];
+        card.innerHTML = `
+          <div class="head">
+            <span class="name">${esc(p.name)}</span>
+            <span class="url">${esc(p.base_url)}</span>
+            <span class="badge ${p.enabled ? 'on' : 'off'}">${p.enabled ? '启用' : '停用'}</span>
+            <span class="spacer"></span>
+            <button class="small" data-act="models">${open ? '收起模型' : `模型明细（${models.length}）`}</button>
+            <button class="small" data-act="toggle">${p.enabled ? '停用' : '启用'}</button>
+            <button class="small danger" data-act="del">删除</button>
+          </div>
+          <div class="detail" style="display:${open ? '' : 'none'}">
+            <table>
+              <thead><tr><th>model_id</th><th>名称</th><th>类型</th><th>tool_calling</th><th>上下文窗口</th><th>状态</th><th></th></tr></thead>
+              <tbody>${models.map((m) => `
+                <tr>
+                  <td>${esc(m.model_id)}</td>
+                  <td>${esc(m.name)}</td>
+                  <td>${typeBadge(m.type)}</td>
+                  <td>${m.tool_calling ? '✓' : '—'}</td>
+                  <td>${m.context_window ?? '—'}</td>
+                  <td><span class="badge ${m.enabled ? 'on' : 'off'}">${m.enabled ? '启用' : '停用'}</span></td>
+                  <td>
+                    <button class="small" data-model="${esc(m.id)}" data-mact="toggle">${m.enabled ? '停用' : '启用'}</button>
+                    <button class="small danger" data-model="${esc(m.id)}" data-mact="del">删除</button>
+                  </td>
+                </tr>`).join('') || '<tr><td colspan="7" class="muted">该供应商下暂无模型</td></tr>'}
+              </tbody>
+            </table>
+            <form class="inline" data-addmodel="${esc(p.id)}">
+              <label>model_id<input name="model_id" required placeholder="gpt-4o"></label>
+              <label>名称<input name="name" required placeholder="GPT-4o"></label>
+              <label>类型<select name="type">
+                ${['text','embedding','vision','rerank','audio-tts','audio-stt','image-gen'].map((t) => `<option value="${t}">${t}</option>`).join('')}
+              </select></label>
+              <label>上下文窗口<input name="context_window" type="number" min="1" placeholder="128000"></label>
+              <label style="flex-direction:row;align-items:center;gap:.3rem"><input name="tool_calling" type="checkbox" style="width:auto"> tool_calling</label>
+              <button class="primary" type="submit">＋ 新增模型</button>
+            </form>
+          </div>`;
+        list.appendChild(card);
+
+        card.querySelector('[data-act="models"]').onclick = () => {
+          if (S.expanded.has(p.id)) S.expanded.delete(p.id); else S.expanded.add(p.id);
+          renderProviders();
+        };
+        card.querySelector('[data-act="toggle"]').onclick = async () => {
+          try {
+            await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled: !p.enabled }) });
+            await loadProviders();
+          } catch (e) { showErr('llmErr', e); }
+        };
+        card.querySelector('[data-act="del"]').onclick = async () => {
+          if (!confirm(`确认删除供应商 ${p.name}？其下模型将一并删除。`)) return;
+          try {
+            await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+            S.expanded.delete(p.id);
+            await loadProviders();
+          } catch (e) { showErr('llmErr', e); }
+        };
+        for (const btn of card.querySelectorAll('[data-mact="toggle"]')) {
+          btn.onclick = async () => {
+            const m = models.find((x) => x.id === btn.dataset.model);
+            try {
+              await api(`/api/admin/llm/models/${encodeURIComponent(m.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled: !m.enabled }) });
+              await loadProviders();
+            } catch (e) { showErr('llmErr', e); }
+          };
+        }
+        for (const btn of card.querySelectorAll('[data-mact="del"]')) {
+          btn.onclick = async () => {
+            const m = models.find((x) => x.id === btn.dataset.model);
+            if (!confirm(`确认删除模型 ${m.model_id}？`)) return;
+            try {
+              await api(`/api/admin/llm/models/${encodeURIComponent(m.id)}`, { method: 'DELETE' });
+              await loadProviders();
+            } catch (e) { showErr('llmErr', e); }
+          };
+        }
+        const addForm = card.querySelector('[data-addmodel]');
+        addForm.onsubmit = async (e) => {
+          e.preventDefault();
+          const f = e.target;
+          try {
+            await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}/models`, {
+              method: 'POST',
+              body: JSON.stringify({
+                model_id: f.model_id.value.trim(),
+                name: f.name.value.trim(),
+                type: f.type.value,
+                tool_calling: f.tool_calling.checked,
+                context_window: f.context_window.value ? Number(f.context_window.value) : null,
+              }),
+            });
+            S.expanded.add(p.id);
+            await loadProviders();
+          } catch (err) { showErr('llmErr', err); }
+        };
+      }
+    }
+
+    $('addProviderForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      try {
+        await api('/api/admin/llm/providers', {
+          method: 'POST',
+          body: JSON.stringify({ name: f.name.value.trim(), base_url: f.base_url.value.trim() }),
+        });
+        f.reset();
+        await loadProviders();
+      } catch (err) { showErr('llmErr', err); }
+    };
+
+    // ------------------------------------------------------------------
+    // FDE 管理
+    // ------------------------------------------------------------------
+    async function loadUsers() {
+      showErr('fdeErr', null);
+      try {
+        const data = await api('/api/admin/users');
+        S.users = data.items ?? [];
+        renderUsers();
+      } catch (e) { showErr('fdeErr', e); }
+    }
+
+    function renderUsers() {
+      const list = $('userList');
+      list.innerHTML = '';
+      if (S.users.length === 0) list.innerHTML = '<p class="muted">暂无用户。</p>';
+      for (const u of S.users) {
+        const wrap = document.createElement('div');
+        wrap.className = 'card';
+        const open = S.userExpanded.has(u.id);
+        wrap.innerHTML = `
+          <div class="head row-head">
+            <span class="name">${esc(u.login)}</span>
+            <span class="muted">${esc(u.display_name)}</span>
+            <span class="badge type">${esc(u.role)}</span>
+            ${u.fde_name ? `<span class="badge on">${esc(u.fde_name)}</span>` : '<span class="muted">无 fde_name</span>'}
+            <span class="badge ${u.status === 'active' ? 'on' : 'off'}">${esc(u.status)}</span>
+            <span class="spacer"></span>
+            <button class="small" data-act="expand">${open ? '收起' : '展开'}</button>
+          </div>
+          <div class="detail" style="display:${open ? '' : 'none'}">
+            <div data-pane="llm"><p class="muted">加载 LLM 配置…</p></div>
+          </div>`;
+        list.appendChild(wrap);
+        wrap.querySelector('.row-head').onclick = (ev) => {
+          if (ev.target.tagName === 'BUTTON') return;
+          if (S.userExpanded.has(u.id)) S.userExpanded.delete(u.id); else S.userExpanded.add(u.id);
+          renderUsers();
+        };
+        wrap.querySelector('[data-act="expand"]').onclick = () => {
+          if (S.userExpanded.has(u.id)) S.userExpanded.delete(u.id); else S.userExpanded.add(u.id);
+          renderUsers();
+        };
+        if (open) loadUserLlmPane(wrap.querySelector('[data-pane="llm"]'), u);
+      }
+    }
+
+    async function loadUserLlmPane(pane, u) {
+      if (!u.fde_name) {
+        pane.innerHTML = '<p class="muted">该用户未配置 fde_name，无需 LLM 配置。</p>';
+        return;
+      }
+      const fde = encodeURIComponent(u.fde_name);
+      let cfg = null;
+      let activeRun = false;
+      try {
+        const data = await api(`/api/admin/fdes/${fde}/llm`);
+        cfg = data.config;
+        activeRun = data.active_run === true;
+      } catch (e) {
+        pane.innerHTML = '';
+        const div = document.createElement('div');
+        div.className = 'syserr';
+        div.textContent = '错误：' + e.message;
+        pane.appendChild(div);
+        return;
+      }
+      // provider 下拉变化 → 按类型/能力过滤三个模型下拉（main 仅 tool_calling=true 的 text 模型）。
+      const providerOpts = S.providers.map((p) =>
+        `<option value="${esc(p.id)}" ${cfg && p.id === cfg.provider_id ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+      pane.innerHTML = `
+        ${activeRun ? '<div class="warnbox">⚠️ 有活跃 run：更换供应商或 API key 会被服务端拒绝（影响进行中的 run）；纯模型变更不受影响。</div>' : ''}
+        <form class="llmform" data-llmform="${fde}">
+          <label>供应商<select name="provider_id">${providerOpts}</select></label>
+          <label>API Key（<span data-keyhint>${cfg?.api_key ? '已配置 ' + esc(cfg.api_key) + '，重输以修改' : '首次配置必填'}</span>）
+            <input name="api_key" type="password" autocomplete="new-password" placeholder="${cfg?.api_key ? '留空 = 保持不变' : ''}"></label>
+          <label>主模型（text · tool_calling）<select name="main_model_id"></select></label>
+          <label>Embedding（可空）<select name="embedding_model_id"></select></label>
+          <label>Vision（可空）<select name="vision_model_id"></select></label>
+          <div style="display:flex;gap:.5rem;align-items:end">
+            <button class="primary" type="submit">保存 LLM 配置</button>
+            <button type="button" data-provision>provision 容器</button>
+          </div>
+        </form>
+        <div data-llmmsg></div>`;
+
+      const form = pane.querySelector('[data-llmform]');
+      const sel = form.provider_id;
+      function fillModelSelects() {
+        const p = S.providers.find((x) => x.id === sel.value);
+        const ms = (p?.models ?? []).filter((m) => m.enabled);
+        const optsFor = (type, needTc) => {
+          const list = ms.filter((m) => m.type === type && (!needTc || m.tool_calling === true));
+          return '<option value="">（不配置）</option>' + list.map((m) =>
+            `<option value="${esc(m.id)}" ${cfg && m.model_id === cfg[type === 'text' ? 'main' : type]?.model_id ? 'selected' : ''}>${esc(m.model_id)} — ${esc(m.name)}</option>`).join('');
+        };
+        form.main_model_id.innerHTML = optsFor('text', true);
+        form.embedding_model_id.innerHTML = optsFor('embedding', false);
+        form.vision_model_id.innerHTML = optsFor('vision', false);
+        if (cfg) {
+          if (cfg.main?.model_id) {
+            const cur = ms.find((m) => m.model_id === cfg.main.model_id && m.tool_calling === true && m.type === 'text');
+            if (cur) form.main_model_id.value = cur.id;
+          }
+          for (const slot of ['embedding', 'vision']) {
+            if (cfg[slot]?.model_id) {
+              const cur = ms.find((m) => m.model_id === cfg[slot].model_id && m.type === slot);
+              if (cur) form[slot + '_model_id'].value = cur.id;
+            }
+          }
+        }
+      }
+      fillModelSelects();
+      sel.onchange = fillModelSelects;
+
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        await submitLlm(false);
+      };
+
+      // F6（Round B 评审）：服务端对「活跃 run + 换 provider/key」返回 409 active_run_conflict。
+      // UI 必须真实处理 409：展示服务端原因，且只有在管理员**显式点击确认**后才带 force=true 重试——
+      // 绝不静默 force（fail-visible：运行中换 provider 会静默改变 run 的上游，必须留人工知情痕迹）。
+      async function submitLlm(force) {
+        const msg = pane.querySelector('[data-llmmsg]');
+        if (!force) msg.innerHTML = '';
+        try {
+          const body = {
+            provider_id: form.provider_id.value,
+            main_model_id: form.main_model_id.value || undefined,
+            embedding_model_id: form.embedding_model_id.value || null,
+            vision_model_id: form.vision_model_id.value || null,
+          };
+          if (form.api_key.value) body.api_key = form.api_key.value;
+          if (force) body.force = true;
+          const r = await api(`/api/admin/fdes/${fde}/llm`, { method: 'PUT', body: JSON.stringify(body) });
+          const div = document.createElement('div');
+          div.className = 'okmsg';
+          div.textContent = `已保存：主模型 ${r.config.main.model_id}` + (r.config.api_key ? `（key ${r.config.api_key}）` : '');
+          msg.innerHTML = '';
+          msg.appendChild(div);
+          form.api_key.value = '';
+        } catch (err) {
+          if (err?.code === 'active_run_conflict' && !force) {
+            // 服务端拒绝 → 展示原因 + 显式确认按钮（点击才算知情，才带 force=true 重试）。
+            msg.innerHTML = '';
+            const div = document.createElement('div');
+            div.className = 'syserr';
+            div.textContent = '已拒绝（409）：' + err.message;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'small';
+            btn.textContent = '确认无影响，强制保存';
+            btn.onclick = () => submitLlm(true);
+            msg.appendChild(div);
+            msg.appendChild(btn);
+            return;
+          }
+          const div = document.createElement('div');
+          div.className = 'syserr';
+          div.textContent = '错误：' + err.message;
+          msg.innerHTML = '';
+          msg.appendChild(div);
+        }
+      }
+
+      pane.querySelector('[data-provision]').onclick = async () => {
+        const msg = pane.querySelector('[data-llmmsg]');
+        msg.innerHTML = '';
+        try {
+          const r = await api(`/api/admin/fdes/${fde}/provision`, { method: 'POST', body: '{}' });
+          const div = document.createElement('div');
+          div.className = 'okmsg';
+          div.textContent = `provision 完成：${r.container}（${r.network} ${r.subnet}）`;
+          msg.appendChild(div);
+        } catch (err) {
+          const div = document.createElement('div');
+          div.className = 'syserr';
+          div.textContent = '错误：' + err.message;
+          msg.appendChild(div);
+        }
+      };
+    }
+
+    $('addUserForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      showErr('fdeErr', null);
+      try {
+        const body = {
+          login: f.login.value.trim(),
+          display_name: f.display_name.value.trim(),
+          password: f.password.value,
+        };
+        if (f.fde_name.value.trim()) body.fde_name = f.fde_name.value.trim();
+        const r = await api('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
+        // TOTP 种子仅此一次显示（红线）：刷新/重进不再可见。
+        $('totpOnce').innerHTML = `
+          <div class="totpbox">
+            <div>用户 <b>${esc(r.user.login)}</b> 已创建。请用认证器 App 录入以下 otpauth URI 或种子（<b>仅此一次显示</b>）：</div>
+            <div>otpauth URI：<code>${esc(r.totp_uri)}</code></div>
+            <div>TOTP 种子：<code>${esc(r.totp_secret)}</code></div>
+          </div>`;
+        f.reset();
+        await loadUsers();
+      } catch (err) { showErr('fdeErr', err); }
+    };
+
+    boot();
+  </script>
+</body>
+</html>
