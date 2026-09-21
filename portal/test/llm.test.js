@@ -136,6 +136,10 @@ class LlmFakePool {
     if (sql.includes('SELECT id, name, enabled FROM llm_providers WHERE id')) {
       return { rows: this.providers.filter((p) => p.id === params[0]) };
     }
+    // D1：updateProvider 事务内当前值读取（同值 PATCH 按值判定事实变化，不走 UPDATE）
+    if (sql.includes('SELECT id, name, base_url, api_format, enabled') && sql.includes('FROM llm_providers WHERE id')) {
+      return { rows: this.providers.filter((p) => p.id === params[0]) };
+    }
     if (sql.includes('SELECT 1 FROM llm_providers WHERE id')) {
       return { rows: this.providers.filter((p) => p.id === params[0]).map(() => ({ '?column?': 1 })) };
     }
@@ -461,6 +465,52 @@ test('N2（Round C 评审）：updateProvider 撞活跃 run → 409 不写变更
   pool3.activeRun = true;
   await updateProvider(pool3, 'p1', {});
   assert.equal(pool3.outbox.length, 0, '无变更字段不写 outbox');
+});
+
+test('D1（Round D 评审）：updateProvider 同值 PATCH 按值判定事实变化——活跃 run 不拦、不写 outbox、updated_at 不动；真变仍 409/force 放行', async () => {
+  // ① 活跃 run + enabled 同值 PATCH → 200 且无 outbox、无 UPDATE（updated_at 不动）
+  const pool = seedProviderWithBindings();
+  pool.activeRun = true;
+  const before = pool.providers.find((p) => p.id === 'p1').updated_at;
+  const same = await updateProvider(pool, 'p1', { enabled: true });
+  assert.equal(same.enabled, true);
+  assert.equal(pool.outbox.length, 0, '同值 PATCH 不得写 outbox');
+  assert.equal(pool.providers.find((p) => p.id === 'p1').updated_at, before, '同值 PATCH 不得改 updated_at');
+  assert.ok(
+    !pool.sqlLog.some((e) => e.sql.includes('UPDATE llm_providers')),
+    '同值 PATCH 整体跳过 UPDATE',
+  );
+
+  // ② 活跃 run + base_url 同值 PATCH → 200 且无 outbox
+  const poolB = seedProviderWithBindings();
+  poolB.activeRun = true;
+  const sameB = await updateProvider(poolB, 'p1', { base_url: 'https://api.openai.com/v1' });
+  assert.equal(sameB.base_url, 'https://api.openai.com/v1');
+  assert.equal(poolB.outbox.length, 0, '同值 PATCH 不得写 outbox');
+
+  // ③ 活跃 run + 值真变 → 仍 409（按值判定后确属事实变化）
+  const pool2 = seedProviderWithBindings();
+  pool2.activeRun = true;
+  await assert.rejects(
+    () => updateProvider(pool2, 'p1', { enabled: false }),
+    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409,
+  );
+  assert.equal(pool2.outbox.length, 0);
+
+  // ④ force:true + 真变 → 200 且写 outbox
+  const pool3 = seedProviderWithBindings();
+  pool3.activeRun = true;
+  const forced = await updateProvider(pool3, 'p1', { enabled: false, force: true });
+  assert.equal(forced.enabled, false);
+  assert.equal(pool3.outbox.length, 2, 'force 放行后仍正常写 outbox');
+
+  // ⑤ 无活跃 run + 同值 PATCH → 200 无 outbox、updated_at 不动（不无谓触发发布）
+  const pool4 = seedProviderWithBindings();
+  const before4 = pool4.providers.find((p) => p.id === 'p1').updated_at;
+  const ok4 = await updateProvider(pool4, 'p1', { base_url: 'https://api.openai.com/v1', enabled: true });
+  assert.equal(ok4.base_url, 'https://api.openai.com/v1');
+  assert.equal(pool4.outbox.length, 0, '同值 PATCH 不得写 outbox');
+  assert.equal(pool4.providers.find((p) => p.id === 'p1').updated_at, before4, '同值 PATCH 不得改 updated_at');
 });
 
 test('N3（Round C 评审）：setFdeLlmConfig 事务内权威复检——活跃 run 撞事实变化 → 409 不写库不写 outbox；force/同值放行；锁序 advisory → 复检 → 写入', async () => {
