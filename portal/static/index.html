@@ -184,6 +184,7 @@
           sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
           sel.value = project.id;
           S.projectId = project.id;
+          updateWorkspaceAvailability(); // 验收 major-1：首个项目创建后须解除输入区/发送/「＋新会话」禁用
           await loadSessions();
         } catch (e) { alert('建项目失败：' + e.message); }
       };
@@ -193,12 +194,13 @@
       const sel = $('projectSel');
       sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
       updateWorkspaceAvailability(); // issue #42：无项目 → 禁用输入区/发送/「＋新会话」
+      // 验收 major-2：onchange 无条件绑定（在空项目 early return 之前，否则从零项目开始时切换项目永不加载会话）
+      sel.onchange = () => { S.projectId = sel.value; loadSessions(); };
       if (S.projects.length === 0) {
         $('sessList').innerHTML = '<p class="muted">先创建项目</p>';
         return;
       }
       S.projectId = S.projects[0].id;
-      sel.onchange = () => { S.projectId = sel.value; loadSessions(); };
       await loadSessions();
     }
 
