@@ -141,6 +141,11 @@ export async function createProvider(pool, { name, base_url } = {}) {
  * 在**本事务内**拦活跃 run——先查受影响 active bindings，再逐 FDE 按 admin.fdeHasActiveRun 同口径查
  * queued/running/cancelling run；命中且 force!==true → 抛 active_run_conflict（409），UPDATE 与 outbox
  * 一概不写（整个事务回滚，fail-visible）。force=true 放行（管理员知情确认）。
+ *
+ * D1（Round D 评审）：「事实变化」按**值**比较（与 N1 同口径），而非「字段是否传入」——事务内先读当前
+ * 行，base_url/enabled 与当前值相同 → 不是事实变化：不触发活跃 run 守卫、不写 outbox，且整体跳过
+ * UPDATE（updated_at 不动），正常返回 200。杜绝①活跃 run 下同值 PATCH 误 409、②无活跃 run 下同值
+ * PATCH 写 outbox 触发无意义发布。
  */
 export async function updateProvider(pool, id, { base_url, enabled, force = false } = {}) {
   if (base_url !== undefined) {
@@ -154,10 +159,20 @@ export async function updateProvider(pool, id, { base_url, enabled, force = fals
   if (enabled !== undefined && typeof enabled !== 'boolean') {
     throw new LlmError('validation_failed', 'enabled 必须为 boolean', { httpStatus: 400, details: { field: 'enabled' } });
   }
-  const changed = base_url !== undefined || enabled !== undefined;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // D1：事务内先读当前值，按值判定事实变化（同值 PATCH 不算变更）。
+    const cur = await client.query(
+      `SELECT id, name, base_url, api_format, enabled, created_at, updated_at
+         FROM llm_providers WHERE id = $1`,
+      [id],
+    );
+    if (cur.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
+    const current = cur.rows[0];
+    const changed = (base_url !== undefined && base_url !== current.base_url)
+      || (enabled !== undefined && enabled !== current.enabled);
 
     // N2：守卫先于 UPDATE（命中即抛，事务回滚 → 不写任何变更、不写 outbox）。
     // 受影响 bindings = 该 provider 下仍 active 的绑定（revoked 的不发布路由，无需守卫/触发）。
@@ -187,6 +202,12 @@ export async function updateProvider(pool, id, { base_url, enabled, force = fals
       }
     }
 
+    // D1：同值 PATCH（含两字段均缺省）→ 无任何写（updated_at 不动、无 outbox），返回当前值。
+    if (!changed) {
+      await client.query('COMMIT');
+      return toProvider(current, []);
+    }
+
     const r = await client.query(
       `UPDATE llm_providers
         SET base_url = COALESCE($2, base_url),
@@ -198,16 +219,14 @@ export async function updateProvider(pool, id, { base_url, enabled, force = fals
     );
     if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
 
-    if (changed) {
-      // 逐 FDE 一条 outbox 行，与 setFdeLlmConfig 的 aggregate/aggregateId 口径一致。
-      for (const b of affectedRows) {
-        await enqueueRouteChange(client, {
-          aggregate: 'llm_binding',
-          aggregateId: b.fde_id,
-          op: 'upsert',
-          payload: { provider_id: id, base_url_changed: base_url !== undefined, enabled_changed: enabled !== undefined },
-        });
-      }
+    // 逐 FDE 一条 outbox 行，与 setFdeLlmConfig 的 aggregate/aggregateId 口径一致。
+    for (const b of affectedRows) {
+      await enqueueRouteChange(client, {
+        aggregate: 'llm_binding',
+        aggregateId: b.fde_id,
+        op: 'upsert',
+        payload: { provider_id: id, base_url_changed: base_url !== undefined, enabled_changed: enabled !== undefined },
+      });
     }
 
     await client.query('COMMIT');
