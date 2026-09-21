@@ -9,22 +9,28 @@
 // outbox 联动与 projects.js createProject 的 port_allocation 写法完全同构
 //（enqueueRouteChange：route_revisions head + route_outbox 行，同事务）。
 //
-// N3（Round C 评审）锁序论证——postMessage（sessions.js）与 setFdeLlmConfig 取**同一把**
-// per-FDE advisory lock（pg_advisory_xact_lock(hashtext('llm-binding:'||fdeName))），全系统相关
-// 加锁顺序（行锁仅列显式锁；普通 SELECT/INSERT 新行不产生等待边）：
-//   postMessage（sessions.js）： chat_sessions(FOR UPDATE) → llm-binding advisory → containers(FOR UPDATE)
+// N3/D2（Round C/D 评审）锁序论证——postMessage（sessions.js）取锁序：
+//   chat_sessions(FOR UPDATE) → llm-binding advisory → llm-provider advisory → containers(FOR UPDATE)
 //                                → runs/run_queue（新插入）
+// 其余路径锁序列（行锁仅列显式锁；普通 SELECT/INSERT 新行不产生等待边）：
 //   setFdeLlmConfig/delete/恢复： llm-binding advisory → fde_llm_bindings(UPDATE)
-//   updateProvider（N2）：        llm_providers(UPDATE)（活跃 run 复检为无锁 SELECT，不产生锁边）
+//   updateProvider（D2）：        llm-provider advisory（事务开头，首锁）→ llm_providers(UPDATE 本行)
+//                                （活跃 run 复检/受影响 bindings 均为无锁 SELECT，不产生锁边）
 //   offboard 前置事务（provisioner.js）：containers(UPDATE) → fde_networks(UPDATE) → fde_llm_bindings(UPDATE)
 //                                （**不取** advisory——若取则与 postMessage「advisory→containers」成环，
 //                                故 revokeFdeLlmConfigTx 明确只吃调用方事务、不加本锁）
+//   deleteProvider/createProvider/model CRUD：无 advisory、无 FOR UPDATE → 不产生等待边
 //   onboard/deprovision 外层：   pg_advisory_lock('fde:<name>') 会话锁（另一 key 空间，仅 provisioner 持有）
-// 偏序 chat_sessions < llm-binding < containers < fde_llm_bindings 覆盖全部锁边 → 无环 → 无死锁。
-// 竞态窗口关闭原理：建 run 与配置写入经同一把 advisory lock 全序——配置先提交则 run 建在新配置之后
-//（run 边界语义：新 run 本就该用新上游/凭据，模型本就是 run 边界快照）；run 先提交则配置事务的
-// 事务内复检（N3）必见其 → 409。残余窗口见报告：provider 级 PATCH（updateProvider）不取本锁
-//（一 provider 多 FDE，无法复用 per-FDE 锁），与建 run 之间保留提交序窄窗口。
+// 偏序 chat_sessions < llm-binding < llm-provider < containers < fde_llm_bindings 覆盖全部锁边：
+// 唯一同时碰 binding 与 provider 的路径是 postMessage（固定 binding→provider）；唯一持有 provider 锁的
+// updateProvider 从不取 binding 锁 → 无 provider→binding 反向边 → 无环 → 无死锁。
+// 竞态窗口关闭原理：① N3——建 run 与 FDE 配置写入经同一把 llm-binding advisory 全序：配置先提交则
+// run 建在新配置之后（run 边界语义：新 run 本就该用新上游/凭据，模型本就是 run 边界快照）；run 先提交
+// 则配置事务的 N3 事务内复检必见其 → 409。② D2——provider PATCH（updateProvider）在事务开头取
+// llm-provider advisory，postMessage 在 llm-binding 锁下读当前 binding 的 provider_id（该锁串行化全部
+// binding 写入方，读到的是已提交快照；provider_id 不可变，锁 key 与 updateProvider 必然同指）后取同 key
+// 锁：provider PATCH 先提交则 run 用新上游（run 边界语义）；postMessage 先提交则 updateProvider 拿锁后
+// 的 N2 事务内复检必见其 run → 409。Round C 残留的「provider PATCH 与建 run 之间的提交序窗口」关闭。
 
 import { enqueueRouteChange } from './outbox.js';
 
@@ -146,6 +152,10 @@ export async function createProvider(pool, { name, base_url } = {}) {
  * 行，base_url/enabled 与当前值相同 → 不是事实变化：不触发活跃 run 守卫、不写 outbox，且整体跳过
  * UPDATE（updated_at 不动），正常返回 200。杜绝①活跃 run 下同值 PATCH 误 409、②无活跃 run 下同值
  * PATCH 写 outbox 触发无意义发布。
+ *
+ * D2（Round D 评审）：事务开头取 per-provider advisory lock（首锁），与 postMessage 在 llm-binding
+ * 锁下按 binding 读到的 provider_id 所取之锁同 key——「provider PATCH vs 建 run」提交序窗口关闭
+ * （全序论证见本文件头注释）。
  */
 export async function updateProvider(pool, id, { base_url, enabled, force = false } = {}) {
   if (base_url !== undefined) {
@@ -163,7 +173,14 @@ export async function updateProvider(pool, id, { base_url, enabled, force = fals
   try {
     await client.query('BEGIN');
 
+    // D2（Round D 评审）：per-provider advisory lock（事务首锁）——与 postMessage 取同 key 的锁
+    //（postMessage 在 llm-binding 锁下读 binding 的 provider_id 后取本锁），使「provider PATCH」与
+    //「建 run」全序：PATCH 先提交则新 run 用新上游（run 边界语义）；run 先提交则本事务内 N2 复检必见
+    // 其 → 409。锁序：本锁是事务首锁且无反向 binding 边（见文件头论证），无环。
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-provider:${id}`]);
+
     // D1：事务内先读当前值，按值判定事实变化（同值 PATCH 不算变更）。
+    // 本 SELECT 在 provider 锁之下读到的是已提交值，同值/真变判定与并发 PATCH 全序。
     const cur = await client.query(
       `SELECT id, name, base_url, api_format, enabled, created_at, updated_at
          FROM llm_providers WHERE id = $1`,
