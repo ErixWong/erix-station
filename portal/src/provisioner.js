@@ -19,6 +19,7 @@ import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
+import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -685,6 +686,14 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
 
     await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);
 
+    // issue #38 Phase B1：onboard LLM 联动。复用分支（needRecreate=false）→ 恢复 revoked binding；
+    // 全新 onboard → 不复活 revoked（admin 重新配置后再生效），仅对 active 配置幂等 upsert 发布。
+    // 放在容器就绪之后：LLM 路由的 ClientIP 条件依赖本 FDE 网段，先保证网络/容器落地再发布。
+    // F1（Round B 评审）：参数名必须叫 fdeId——llm.js 的 syncFdeLlmBindingOnOnboard 按
+    // { fdeId, fdeName, restoreRevoked } 解构，传 userId 会被静默丢弃 → fde_id=NULL → 无行命中，
+    // 恢复/重发布静默 no-op。此处 userId 即该 FDE 的 users.id（= fde_llm_bindings.fde_id）。
+    await syncFdeLlmBindingOnOnboard(pool, { fdeId: userId, fdeName, restoreRevoked: !needRecreate });
+
     return {
       userId,
       containerId,
@@ -712,7 +721,8 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
  * 锁顺序说明（评审 blocker，两轮）：三方事务必须同序才能避免 deadlock——
  *   reaper（internal.js）：runs → run_queue → chat_sessions(allocSeq)
  *   stopSession（sessions.js）：chat_sessions → runs
- *   postMessage（sessions.js）：chat_sessions → runs（新插入）
+ *   postMessage（sessions.js）：chat_sessions → llm-binding advisory（#38 N3，与 LLM 配置写入全序）
+ *                            → containers（FOR UPDATE，#37）→ runs（新插入）
  * offboard 若在一个事务里「锁 runs 再 allocSeq 锁 sessions」，与 stopSession 反序；若「先锁 sessions
  * 再锁 runs」，与 reaper 反序——**任何单事务全序都会与某一方成环**。
  * 解法：拆两步。事务 A 只按 reaper 同序（runs → queue）终态化，**不碰 sessions**；
@@ -834,8 +844,11 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
           WHERE fde_id = $1 AND state IN ('allocated', 'active')`,
         [u.id],
       );
-      // FDE 网络释放 → 触发路由 reconciler 重生成（internal ipAllowList / llm 路由收敛）。
+      // FDE 网络释放 → 触发路由 reconciler 重生成（internal ipAllowList 收敛）。
       await enqueueRouteChange(client, { aggregate: 'fde_network', aggregateId: u.id, op: 'delete', payload: { network_name: networkName } });
+      // issue #38 Phase B1：LLM 配置吊销与容器/token 吊销**同事务**（revokeFdeLlmConfigTx 只吃本事务
+      // client）——凭据失效必须原子发生，不允许「token 已吊销、Traefik 仍注入上游 key」的中间窗口。
+      await revokeFdeLlmConfigTx(client, { fdeId: u.id, fdeName });
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});

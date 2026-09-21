@@ -192,6 +192,8 @@ export function loadConfig(env = process.env) {
     // Traefik 动态配置目录（portal 容器内路径，reconciler 写 file provider；deploy-contract §4.2）。
     traefikDynamicDir: env.TRAEFIK_DYNAMIC_DIR || '/etc/traefik/dynamic',
     traefikDynamicFile: env.TRAEFIK_DYNAMIC_FILE || 'routes.yml',
+    // issue #38 Phase B1：LLM 段（含上游 api_key 明文）独立文件，mode 600（routes.js rebuildRoutes 写入）。
+    traefikLlmDynamicFile: env.TRAEFIK_LLM_DYNAMIC_FILE || 'llm-routes.yml',
     // portal 域名与后端（reconciler 生成 portal 路由与 forwardAuth 地址用）。
     portalHost: env.PORTAL_HOST || `station.${env.BASE_DOMAIN || 'localhost'}`,
     portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
@@ -202,7 +204,8 @@ export function loadConfig(env = process.env) {
     // 由 ERIX_STATION_BASE_URL（agentd）与 config.json endpoint（worker provider）使用。
     portalPublicBaseUrl: resolvePublicBaseUrl(env, 'PORTAL_PUBLIC_BASE_URL', env.PORTAL_HOST || `station.${env.BASE_DOMAIN || 'localhost'}`),
     llmPublicBaseUrl: resolvePublicBaseUrl(env, 'LLM_PUBLIC_BASE_URL', env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`),
-    // LLM 网关数据面回环地址（topology §4-L7）。P1 为 mock/占位，真实网关 P2+ 接入。
+    // LLM 网关数据面回环地址。issue #38 Phase B1 起 LLM 路由直连 llm_providers.base_url
+    // （不再经 llm-hub），本键暂保留兼容（外部脚本/文档引用），routes.js 已不再消费。
     llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4000',
     // 端口配额 / 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
     portQuota: intEnv(env, 'PORT_QUOTA', 40),

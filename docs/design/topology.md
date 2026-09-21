@@ -148,14 +148,15 @@ worker（零凭据，占位 key + endpoint=https://llm.<base>/v1；`llm.<base>` 
   ▼
 Traefik(host:443)
   ① router：Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)   ← 身份来自网络来源，非自报；subnet 由 fde_networks 精确派生：默认池 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`（§5.1）
-  ② middleware：customRequestHeaders 覆盖 Authorization: Bearer <该 FDE 虚拟 key> + X-FDE-Identity
-  ③ service → http://127.0.0.1:4000（网关数据面，回环）
+  ② middleware：customRequestHeaders 覆盖 Authorization: Bearer <该 FDE binding 的真实上游 api_key>
+     （2026-09-20 修订，issue #38：无独立网关再校验，不再注入 X-FDE-Identity；无 binding 则无此路由）
+  ③ service → llm_providers.base_url（如 http://127.0.0.1:4000 mock 数据面，回环；per-provider 上游直发）
   ▼
-LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
+上游 provider（额度/模型白名单/用量由上游 key 自身承担）
 ```
 
 **实测**：A 子网拿到 alice 的 key、B 子网拿到 bob 的 key；两者主动带的 `Authorization: Bearer STOLEN-KEY` **被覆盖**；无匹配来源 **404**（§10 证据 8）。
-**配套**：`aliasHeadersStrategy: delete`（防头别名伪造，Traefik 自行警告过，§10 证据 9）、无兜底路由、流式 `flushInterval`、网关 admin 面只在 `backend`。
+**配套**：`aliasHeadersStrategy: delete`（防头别名伪造，Traefik 自行警告过，§10 证据 9）、无兜底路由、流式 `flushInterval`（**2026-09-20 修订，issue #38**：LLM 段独立 `llm-routes.yml` mode 600；不再建 LiteLLM hub，admin 面约束随之移除）。
 **边界**：「不能直连外部 LLM」仍靠**安全团队网络层出口策略**（issue #3），Traefik 只负责平台允许的那条路。
 
 ### L8 端口/路由发布与 IP 漂移
@@ -179,7 +180,7 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 |---|---|---|---|---|
 | portal | `Host(`station.<base>`)` | — | `http://127.0.0.1:8080` | L1 |
 | 预览/IDE（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth）→ `strip-cookie`（放行后删 Cookie，预览凭证不透传上游，B2 实测） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
-| LLM（**每 FDE 一条 router + 一条 headers middleware**） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `<fde>-llm-auth`（headers 注入） | `llm-hub` → `http://127.0.0.1:4000` | L7；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
+| LLM（**每 FDE 一条 router + 一条 headers middleware**；**2026-09-20 修订，issue #38**） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `llm-key-<fde>`（headers 注入该 FDE 的**真实上游 key**） | `llm-provider-<id>` → 该 binding 供应商的 `llm_providers.base_url`（**不再共享 `llm-hub`**；默认 mock `http://127.0.0.1:4000`） | L7；**路由按 `fde_llm_bindings`（必须含 api_key）逐 binding 生成**，发布到独立文件 `llm-routes.yml`（mode 0600，与 `routes.yml` 0644 拆分）；**无 binding → 无路由（fail-closed）**；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
 | internal | `PathPrefix(`/api/internal`)`（挂在 `station.<base>` 路由链上） | `internal-allow`（`ipAllowList`，从 `fde_networks` 精确派生，每 `subnet` 一条，§5.1） | `http://127.0.0.1:8080` | L3/L5；容器侧经 hosts 注入（`--add-host station.<base>:<网关IP>`；`llm.<base>` 同法，见 L3）访问 |
 
 **公共约定**：
@@ -187,7 +188,7 @@ LLM 网关（按 key 做额度/模型白名单/用量）→ 上游 provider
 - **forwardAuth 指向 `127.0.0.1:8080`**（`http://127.0.0.1:8080/api/forward-auth`）——Traefik 在 host 网络，portal 发布在回环，forwardAuth 不再走容器网络寻址。
 - **Traefik 动态配置由 portal 写 file provider**：portal（经 reconciler，§8）生成全部动态路由文件，与 DB（`port_allocations` / route outbox / `fde_networks`）同源；「路由表里没有 = 不可达」这条性质必须成立。文件权限与职责分工见 §6 第 8 条。
 - **路由发布预算**：outbox reconciler 的 debounce/批量合并、临时文件校验后原子替换、失败保留上一版本、reload SLO（P95 < 2s）、最大路由数（30 FDE × N 端口）与批量 offboarding 见 §8。
-- `llm-hub` service 的 `responseForwarding.flushInterval` 必须调小（≤100ms），否则 token 流被缓冲成整段（§6 第 5 条）。
+- LLM service（`llm-provider-*`，**2026-09-20 修订，issue #38**：由共享 `llm-hub` 改为 per-provider service）的 `responseForwarding.flushInterval` 必须调小（≤100ms），否则 token 流被缓冲成整段（§6 第 5 条）。
 - **来源判定一律用 request remote address（不读 `X-Forwarded-For`）**：`ipAllowList`（internal 路由）与 `ClientIP`（LLM 路由）默认匹配 remote address；public entryPoint 不配 `forwardedHeaders.insecure`、中间件不配基于 XFF 的 `ipStrategy`。「容器直达 host Traefik、无中间代理」是「来源子网 = 身份」成立的安全前提，作为配置约束写死；**验收**：伪造/重复 `X-Forwarded-For` 不得影响来源判定（§10 证据 8 反向断言）。
 
 ### 5.1 来源规则派生（唯一口径）
@@ -225,7 +226,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 1. `redirect`（scheme http→https）——挂在 entryPoint 层，先于一切
 2. `ipAllowList`（来源白名单，internal 路由）——**必须在任何业务中间件之前**，先挡非白名单来源
 3. `forwardAuth`（身份 + 授权，预览路由 `fde-auth`）——在代理到上游**之前**执行
-4. `headers`（LLM 凭据注入，`<fde>-llm-auth`）——在代理到上游**之前**注入并覆盖
+4. `headers`（LLM 凭据注入，`llm-key-<fde>`；**2026-09-20 修订，issue #38**：注入该 FDE 的真实上游 key，不再有独立网关再校验）——在代理到上游**之前**注入并覆盖
 
 > `redirect`（scheme http→https）只挂在 **entryPoint 层**，不参与 router 中间件链，因此恒先于一切业务中间件。router 中间件链按需叠加：internal=`ipAllowList`；预览=`forwardAuth` → `strip-cookie`；LLM=`headers`。若将来同路由叠加多类，顺序恒为 `ipAllowList` → `forwardAuth` → `headers`。
 
@@ -236,7 +237,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | **① 浏览器 → portal**（`station.<base>`） | TLS 终结 → Host 匹配 → portal 自身 session cookie 校验（按 `login_sessions.token_hash` 查库）→ 路由 handler | TLS/主机不匹配 → 连接失败 / `404`；session 无效 → `401 unauthorized`（JSON） | `401` 前端跳登录页 | portal 写登录/登出/关键动作 `audit_log`；Traefik access log 仅原始 |
 | **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `403 forbidden（preview_ticket_required）`（**`public` exposure 例外：跳过凭证校验，仍须过 hostname/state**）；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `403`（凭证类）→ Traefik 透传；登录引导由 portal 前端按 `preview_ticket_required` 处理 | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
 | **③ 容器 → internal API**（`/api/internal/*`） | TLS（容器→Traefik）→ `Host(station) && PathPrefix(/api/internal)` + **`ipAllowList`（remote address，每 FDE 精确 subnet）** → service portal → portal Bearer 校验（`containers.runner_token_hash` 按代次比对）→ 归属校验（`run → session → user_id`）→ handler | 来源不在白名单 → `403`（Traefik）；Bearer 缺失/错 → `401 token_invalid`；吊销 → `401 token_revoked`；归属不符 → `403 run_ownership_mismatch`（或 `404`） | 否（容器不是浏览器，不 302） | portal 对关键动作（claim/心跳/吊销/越权）写 `audit_log` |
-| **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`<fde>-llm-auth` 注入并覆盖 `Authorization` + `X-FDE-Identity`）→ service `llm-hub` | 无匹配 ClientIP → `404`（无兜底路由）；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走网关 `usage_ledger`，Traefik access log 原始 |
+| **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`llm-key-<fde>` 注入并覆盖 `Authorization` 为该 FDE binding 的真实上游 key）→ service `llm-provider-<id>`（= `llm_providers.base_url`，上游直发；**2026-09-20 修订，issue #38**：去 `llm-hub`/LiteLLM hub） | 无匹配 ClientIP → `404`（无兜底路由）；**无 `fde_llm_bindings`（含 api_key）binding → 不生成路由（fail-closed，2026-09-20 修订，issue #38）**；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走 `usage_ledger`，Traefik access log 原始 |
 
 #### 失败语义与信任边界（写死）
 
@@ -259,10 +260,10 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | 2 | **头别名防伪造** | `entryPoints.<name>.http.aliasHeadersStrategy: delete`（或 `reject`） | 实测警告：`X_FDE_Identity` 之类别名头可绕过注入（§10 证据 9）。**必须挂在 `http` 层级下**——写成 `entryPoints.<name>.aliasHeadersStrategy` 会错层 → Traefik 启动失败（fde-platform.md §6.4 注释） |
 | 3 | **禁止兜底路由** | 不写 `Host(llm.<base>)` 的通配路由（无 ClientIP 条件） | 实测：无匹配来源 404 = 默认拒绝，兜底等于开门 |
 | 4 | internal 路由来源白名单 | `/api/internal/*` 加 `ipAllowList`（从 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，§5.1） | internal API 走 ingress，必须限制来源（含大 FDE `/28` 段） |
-| 5 | 流式 | hub service `responseForwarding.flushInterval` 调小（≤100ms） | 否则 token 流被缓冲成整段 |
-| 6 | 网关 admin 面隔离 | admin 端口不发布，只在 `backend` 网络 | 否则 FDE 能自开额度/建 key |
+| 5 | 流式 | LLM service（`llm-provider-*`；**2026-09-20 修订，issue #38**：由 hub service 改为 per-provider）`responseForwarding.flushInterval` 调小（≤100ms） | 否则 token 流被缓冲成整段 |
+| 6 | 网关 admin 面隔离 | admin 端口不发布，只在 `backend` 网络 | 否则 FDE 能自开额度/建 key（**2026-09-20 修订，issue #38**：随 LiteLLM hub 取消，本约束不再适用——provider 配置走 portal admin API；provider 自身若有 admin 面仍按此原则隔离） |
 | 7 | **容器 → 宿主服务收紧（分层）** | INPUT（宿主本地服务）+ DOCKER-USER（转发/publish）两层，见 §6.1 | **实测**：FDE 容器可达宿主 `gitea:3000`/`mssql:1433`/`portainer:9000`（所有方案共同缺口）；原「只写 DOCKER-USER」不成立（§6.1） |
-| 8 | Traefik 动态配置含全部虚拟 key | 宿主文件权限 **600**，仅 portal 可写、Traefik 只读 | 凭据集中点，必须锁死 |
+| 8 | Traefik 动态配置含全部上游 key（`llm-routes.yml`；**2026-09-20 修订，issue #38**：由「虚拟 key」改为 per-FDE 真实上游 key，独立文件 mode 600） | 宿主文件权限 **600**，仅 portal 可写、Traefik 只读 | 凭据集中点，必须锁死 |
 | 9 | per-container token | 仅存哈希 + `generation/revoked_at`；原文只注入容器 env、portal 不存明文；容器重建/离职原子吊销 | 见 issue #12；边界与残余风险见 §6.2 |
 | 10 | SSE 与长轮询超时 | 路由 read/write timeout ≥ 5min；SSE 禁缓冲 | claim 长轮询与 SSE 都用长连接 |
 
@@ -331,11 +332,11 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 
 | 时机 | 动作 |
 |---|---|
-| **onboarding** | 分配子网（DB）→ **建网络前经 Docker API 校验子网与既有网络 / `fde_networks` 无重叠** → 建 `fde-<name>` 网络（`--subnet`）→ 起容器 → 写 ports 路由 + LLM 注入路由 → 写模板/AGENTS.md（bind mount）→ 建网关虚拟 key |
-| **offboarding** | **吊销 token/虚拟 key → 释放子网（同事务）** → 停容器 → 删路由（含 LLM 注入）→ 删网络（审计 #34 F-B：token 必须先于资源删除失效，且与「离开 desired」同事务——否则 DB 写失败窗口内旧 token 仍有效，或被 reconcile 复活） |
+| **onboarding** | 分配子网（DB）→ **建网络前经 Docker API 校验子网与既有网络 / `fde_networks` 无重叠** → 建 `fde-<name>` 网络（`--subnet`）→ 起容器 → 写 ports 路由 + LLM 路由（**2026-09-20 修订，issue #38**：仅当已配 `fde_llm_bindings`（含 api_key），否则无 LLM 路由、fail-closed）→ 写模板/AGENTS.md（bind mount）；LLM binding 由 admin API 维护，**不在 onboarding 建** |
+| **offboarding** | **吊销 token + 吊销 LLM binding（`revokeFdeLlmConfigTx`，同事务；2026-09-20 修订，issue #38）→ 释放子网（同事务）** → 停容器 → 删路由（含 LLM 段收敛）→ 删网络（审计 #34 F-B：token 必须先于资源删除失效，且与「离开 desired」同事务——否则 DB 写失败窗口内旧 token 仍有效，或被 reconcile 复活） |
 | **portal/Traefik 启动** | 从 DB 全量重建缺失状态（幂等）：路由文件、内部端点、网络记录对账 |
 | **定时对账** | DB ↔ docker（容器/网络/IP）↔ Traefik 路由 ↔ `fde_networks` 四向一致；漂移即修 + 告警 |
-| **容器重建后** | 检测 IP 变化 → 重写该 FDE 的预览路由与 LLM 路由注入（H-B 的唯一技术债 L8，由本行兜住） |
+| **容器重建后** | 检测 IP 变化 → 重写该 FDE 的预览路由与 LLM 路由（LLM 段在 `llm-routes.yml`，**2026-09-20 修订，issue #38**：按 binding 生成、含上游 key 明文 0600；H-B 的唯一技术债 L8，由本行兜住） |
 
 **路由发布预算与收敛机制**（outbox reconciler，配合 §5）：
 
@@ -373,27 +374,28 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | 5 | **多归属容器做 L3 转发**（含双向静态路由） | ❌ **不通** | 否决「路由器容器」方案（§11） |
 | 6 | 对运行中容器 `network connect/disconnect` | ✅ **零重启**（`StartedAt` 未变）、立即可达、**按容器名寻址可用** | 若走容器模式，接入是低成本在线操作 |
 | 7 | 同一容器接入 30 条 `/29` | ⚠️ 可用但 **31 张网卡/31 个 IP**，建网 2.3s + 接入 2.5s，宿主多 30 座 bridge | 否决「Traefik 接 N 条网络」，定 H-B（§11） |
-| 8 | **Traefik v3 按 `ClientIP` 注入 LLM 凭据** | ✅ A 子网 → `Bearer alice-virtual-key`；B 子网 → `bob-virtual-key`；**两者自带的 `Bearer STOLEN-KEY` 被覆盖**；无匹配来源 **404** | D-4/L7：FDE 容器零 LLM 凭据且无法冒用 |
+| 8 | **Traefik v3 按 `ClientIP` 注入 LLM 凭据** | ✅ A 子网 → alice binding 的真实上游 key；B 子网 → bob binding 的真实上游 key（**2026-09-20 修订，issue #38**：由「虚拟 key + llm-hub」改为 per-FDE 真实上游 key 直发）；**两者自带的 `Bearer STOLEN-KEY` 被覆盖**；无匹配来源 **404**；无 binding 不生成路由（fail-closed） | D-4/L7：FDE 容器零 LLM 凭据且无法冒用 |
 | 9 | Traefik 启动警告（头别名） | ⚠️ `aliasHeadersStrategy is not configured … allows a client to spoof the headers Traefik manages` | D-8：**必须**设 `aliasHeadersStrategy: delete`（§6 第 2 条） |
 
-> 证据 8 的配置形态（供实现参考）：
+> 证据 8 的配置形态（供实现参考；**2026-09-20 修订，issue #38**：按 `fde_llm_bindings` 逐 binding 生成，
+> 注入真实上游 key，per-provider service 上游直发；本段独立文件 `llm-routes.yml` mode 0600）：
 > ```yaml
 > routers:
->   fde-alice-llm:
+>   llm-alice:
 >     rule: "Host(`llm.<base>`) && ClientIP(`10.200.1.0/29`)"
->     middlewares: [alice-llm-auth]
->     service: llm-hub
+>     middlewares: [llm-key-alice]
+>     service: llm-provider-<provider id 前 8 位>
 > middlewares:
->   alice-llm-auth:
+>   llm-key-alice:
 >     headers:
 >       customRequestHeaders:
->         Authorization: "Bearer <alice 虚拟 key>"
->         X-FDE-Identity: "alice"
+>         Authorization: "Bearer <alice binding 的真实上游 api_key>"
 > services:
->   llm-hub:
+>   llm-provider-<id 前 8 位>:
 >     loadBalancer:
->       servers: [{ url: "http://127.0.0.1:4000" }]
->       # responseForwarding.flushInterval 必须调小（流式必需）
+>       servers: [{ url: "<llm_providers.base_url，如 http://127.0.0.1:4000>" }]
+>       responseForwarding:
+>         flushInterval: 100ms   # 必须调小（流式必需）
 > ```
 
 ---

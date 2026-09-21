@@ -88,6 +88,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | `TRAEFIK_WEBSECURE_PORT` | Traefik `websecure` entrypoint 的监听端口（同上，host 网络） | 同上 | `443`（目标环境冲突未解时过渡用 `8443`，见 §5.1 与 §8.3） |
 | portal 8080 | portal 服务端口，**publish 仅 `127.0.0.1:8080`（回环）**：portal 在 `backend` 网络，回环 publish 供 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN（H-B 定稿 D-3，issue #5，规格 §5） | 平台规范固定 + 目标环境探测（回环 8080 可用性，§9 第 7 项） | `127.0.0.1:8080`（⚠️ 参考实例 A 上宿主 8080 已被 `gitea_act_runner` 占用，见 §8.2——该机部署需迁移占用者或改 publish 端口） |
 | LLM 网关数据面 4000 | LLM 网关数据面端口，**publish 仅 `127.0.0.1:4000`（回环）**，供 Traefik `llm.<base>` 路由回环访问；**admin 面不发布**（只在 `backend` 网络。H-B 定稿，issue #5） | 平台规范固定 | `127.0.0.1:4000` |
+| mock 调试面 4001（`MOCK_DEBUG_PORT`） | **仅 dev/验收**（P1 mock 网关）：只提供 `GET /__debug/last-request`（返回全局最近请求的 `Authorization`＝Traefik 注入的真实上游 key），**publish 仅 `127.0.0.1:${MOCK_DEBUG_PORT:-4001}`（回环）**；数据面 4000 对 `/__debug/*` 一律 404，FDE 容器/Traefik 均不可达（**2026-09-20 修订，issue #38 PR #39 评审 F4**：debug 端点原与数据面同端口且 LLM router 无 path 限制，任一 FDE 可经 `llm.<base>` 读到全局 Authorization＝跨 FDE 泄露 key）。生产网关（P3）无此端点 | 目标环境探测（回环 4001 可用性，§9 第 7 项） | `127.0.0.1:4001` |
 | station-db 5432 | 数据库端口，**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机；station-db 是独立 postgres 容器，与宿主既有实例互不可见 | 平台规范固定 | —（同上） |
 
 ### 5.1 通用部署前检查：ingress 端口可用性
@@ -221,6 +222,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 443 | ⚠️ **已被容器 `nginx_reverse_proxy` 占用**（`0.0.0.0:443->443/tcp`，nginx，默认 vhost 对 `https://127.0.0.1/` 返回 `502 Bad Gateway`；同容器另映射 9001/9002） | Traefik `websecure` entrypoint | 参考实例 A 上冲突，处理选项见 §8.3 |
 | 8080 | 已被容器 `gitea_act_runner` 占用（host 网络，进程直接监听 `:::8080`，Go 服务：`http://127.0.0.1:8080/` 返回 `404 text/plain`） | portal（H-B：**publish `127.0.0.1:8080` 回环**，规格 §5） | ⚠️ **参考实例 A 上有冲突**：回环 8080 被占 → 该机部署需迁移占用者或改 portal publish 端口；目标环境按 §9 第 7 项重新核实 |
 | 4000 | `ss -tlnp` 未见宿主监听（2026-05） | LLM 网关数据面（H-B：**publish `127.0.0.1:4000` 回环**；admin 面不发布） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
+| 4001 | `ss -tlnp` 未见宿主监听（2026-05） | mock 调试面（dev/验收专用，**publish `127.0.0.1:4001` 回环**，`MOCK_DEBUG_PORT`；F4 起与数据面分离，见 §5） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
 | 5432 | 已被容器 `postgresql` 占用（`0.0.0.0:5432->5432/tcp`） | station-db（**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机） | 无冲突——station-db 是独立 postgres 容器，只对 `backend` 网络暴露 5432，与宿主既有实例互不可见（同上） |
 
 ### 8.3 443 占用处理记录（参考实例 A 的候选方案）
@@ -295,7 +297,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
 | `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8；**已决 2026-09-18，issue #27**） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
-| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P3 接入（deploy-contract §7.3） | `http://127.0.0.1:4000`（reconciler 生成 llm-hub service 回环地址） |
+| `LLM_GATEWAY_HOST` | 平台规范固定（topology §4-L7）；P1 mock/占位，真实网关 P3 接入（deploy-contract §7.3）。**2026-09-20 修订（issue #38）**：LLM 路由已改为上游直发（per-FDE service url = `llm_providers.base_url`），reconciler **不再消费**本变量生成 service；`config.llmGatewayUrl` 仅保留兼容（外部脚本/文档引用），新代码勿依赖 | `http://127.0.0.1:4000`（历史语义：llm-hub service 回环地址；现仅 mock-llm 容器自身数据面地址） |
 | `LLM_GATEWAY_PORT` | 平台规范固定（deploy-contract §7.3）；`station-mock-llm` 数据面在宿主的回环发布端口（**dev-only**；P3 真实网关同端口） | `4000` |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
