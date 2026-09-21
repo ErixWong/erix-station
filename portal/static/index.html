@@ -412,8 +412,12 @@
       } catch (e) {
         const div = document.createElement('div');
         div.className = 'syserr';
-        div.textContent = `发送失败：${e.message}${e.code === 'run_in_progress' ? '（已有进行中任务）' : ''}`;
+        // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）
+        div.textContent = e.code === 'llm_not_configured'
+          ? '发送失败：该 FDE 未配置 LLM 上游，请到管理台 /admin 配置（无权限请联系管理员）'
+          : `发送失败：${e.message}${e.code === 'run_in_progress' ? '（已有进行中任务）' : ''}`;
         $('stream').appendChild(div);
+        scrollDown();
       }
     }
 
