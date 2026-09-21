@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FDE Station</title>
+  <!-- issue #42：内联 SVG favicon（原 404） -->
+  <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="%230a7"/><text x="8" y="12" font-size="10" text-anchor="middle" fill="%23fff" font-family="sans-serif">F</text></svg>'>
   <style>
     :root { --bd: #ddd; --muted: #666; --brand: #0a7; }
     * { box-sizing: border-box; }
@@ -57,6 +59,8 @@
     #composer button { padding: .5rem 1.1rem; }
     #stopBtn { display: none; background: #fff2f0; border-color: #b33; color: #b33; }
     .muted { color: var(--muted); font-size: .8rem; }
+    /* issue #42：禁用态视觉变灰 */
+    button:disabled, textarea:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -67,7 +71,7 @@
   </header>
   <main>
     <aside>
-      <div class="proj">
+      <div class="proj" id="projBox">
         <label class="muted">项目</label>
         <select id="projectSel"></select>
         <button id="newProj">＋ 新项目</button>
@@ -92,6 +96,8 @@
 
     const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
                 lastSeq: 0, es: null, esSessionId: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null };
+    // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）
+    const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
 
     async function api(path, opts = {}) {
       const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -112,6 +118,9 @@
 
     function renderLogin() {
       $('who').textContent = '未登录';
+      // issue #42：未登录隐藏侧栏「＋新项目 / ＋新会话」与项目选择区（登出后 reload 走本路径，同样生效）
+      $('projBox').style.display = 'none';
+      $('newSess').style.display = 'none';
       $('sessList').innerHTML = '';
       $('stream').innerHTML = '';
       $('composer').style.display = 'none';
@@ -161,6 +170,8 @@
 
     async function initWorkspace() {
       $('composer').style.display = '';
+      $('projBox').style.display = '';
+      $('newSess').style.display = '';
       $('newProj').onclick = async () => {
         const name = prompt('项目名（小写字母/数字/连字符）：');
         if (!name) return;
@@ -181,6 +192,7 @@
       S.projects = pj.items ?? [];
       const sel = $('projectSel');
       sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+      updateWorkspaceAvailability(); // issue #42：无项目 → 禁用输入区/发送/「＋新会话」
       if (S.projects.length === 0) {
         $('sessList').innerHTML = '<p class="muted">先创建项目</p>';
         return;
@@ -188,6 +200,16 @@
       S.projectId = S.projects[0].id;
       sel.onchange = () => { S.projectId = sel.value; loadSessions(); };
       await loadSessions();
+    }
+
+    // issue #42：无项目时禁用输入框/发送/「＋新会话」，placeholder 引导先建项目。
+    function updateWorkspaceAvailability() {
+      const hasProject = S.projects.length > 0;
+      S.noProject = !hasProject;
+      $('input').disabled = !hasProject;
+      $('input').placeholder = hasProject ? '输入任务，Enter 发送（Shift+Enter 换行）' : '先创建项目';
+      $('newSess').disabled = !hasProject;
+      if (!S.activeRunId) $('sendBtn').disabled = !hasProject;
     }
 
     async function loadSessions() {
@@ -200,7 +222,7 @@
       $('sessList').innerHTML = S.sessions.map((s) =>
         `<div class="sess ${s.id === S.sessionId ? 'active' : ''}" data-id="${esc(s.id)}">` +
         `<div>${esc(s.title || '未命名会话')}</div>` +
-        `<div class="meta">${s.active_run_id ? '● 运行中' : esc(new Date(s.updated_at).toLocaleString())}</div></div>`
+        `<div class="meta">${s.active_run_id ? '● 运行中' : esc(new Date(s.updated_at).toLocaleString('zh-CN'))}</div></div>`
       ).join('') || '<p class="muted">暂无会话</p>';
       for (const el of $('sessList').querySelectorAll('.sess')) {
         el.onclick = () => openSession(el.dataset.id);
@@ -351,7 +373,16 @@
             // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）
             if (S.deltaBuf) { S.deltaBuf.remove(); S.deltaBuf = null; }
             const reason = d.termination?.reason ?? '';
-            sep(`run 结束：${reason}${d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : ''}`);
+            const usage = d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : '';
+            // issue #42：终止原因分级——failed/max_rounds_cap/aborted 红色告警，end_turn 灰色中性
+            if (RUN_FAIL_REASONS.has(reason)) {
+              const div = document.createElement('div');
+              div.className = 'syserr';
+              div.textContent = `run 结束：${reason}${usage}`;
+              $('stream').appendChild(div);
+            } else {
+              sep(`run 结束：${reason === 'end_turn' ? '正常完成' : reason}${usage}`);
+            }
             if (d.error) {
               const div = document.createElement('div');
               div.className = 'syserr';
@@ -389,7 +420,7 @@
 
     function setRunning(on) {
       $('stopBtn').style.display = on ? 'inline-block' : 'none'; // 显式值压过样式表 display:none
-      $('sendBtn').disabled = on;
+      $('sendBtn').disabled = on || !!S.noProject; // issue #42：无项目时发送恒禁用
     }
 
     $('sendBtn').onclick = send;
@@ -410,6 +441,7 @@
         setRunning(true);
         loadSessions();
       } catch (e) {
+        $('input').value = content; // issue #42：发送失败回填输入，已输入内容不丢
         const div = document.createElement('div');
         div.className = 'syserr';
         // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）
