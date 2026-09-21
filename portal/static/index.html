@@ -32,6 +32,26 @@
     .card .dig { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .roundsep { color: var(--muted); font-size: .75rem; margin: .6rem 0 .2rem; }
     .syserr { color: #b33; font-size: .85rem; }
+    /* issue #40：Markdown 子集渲染（仅助手终稿；用户/系统注入保持纯文本） */
+    .msg.md { white-space: normal; line-height: 1.55; }
+    .md > :first-child { margin-top: 0; }
+    .md > :last-child { margin-bottom: 0; }
+    .md p { margin: .35rem 0; }
+    .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: .55rem 0 .3rem; line-height: 1.3; }
+    .md h1 { font-size: 1.3rem; } .md h2 { font-size: 1.18rem; } .md h3 { font-size: 1.08rem; }
+    .md h4, .md h5, .md h6 { font-size: 1rem; }
+    .md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #ececec; border-radius: 4px; padding: .08rem .32rem; font-size: .86em; }
+    .md-code { border: 1px solid var(--bd); border-radius: 6px; margin: .45rem 0; background: #fbfbfb; }
+    .md-code .md-lang { padding: .15rem .55rem; font-size: .72rem; color: var(--muted); border-bottom: 1px solid var(--bd); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .md-code pre { margin: 0; padding: .55rem .7rem; overflow-x: auto; }
+    .md-code pre code { background: none; padding: 0; font-size: .84rem; display: block; white-space: pre; }
+    .md ul, .md ol { margin: .35rem 0; padding-left: 1.5rem; }
+    .md li { margin: .12rem 0; }
+    .md blockquote { border-left: 3px solid #ccc; margin: .4rem 0; padding: .05rem .75rem; color: #555; }
+    .md table { border-collapse: collapse; margin: .45rem 0; }
+    .md th, .md td { border: 1px solid var(--bd); padding: .3rem .65rem; font-size: .86rem; }
+    .md th { background: #f0f0f0; }
+    .md a { color: #06c; word-break: break-all; }
     #composer { border-top: 1px solid var(--bd); padding: .7rem; display: flex; gap: .6rem; }
     #composer textarea { flex: 1; padding: .5rem; resize: none; height: 3.2rem; }
     #composer button { padding: .5rem 1.1rem; }
@@ -64,6 +84,7 @@
       </div>
     </section>
   </main>
+  <script src="/markdown.js"></script>
   <script>
     'use strict';
     const $ = (id) => document.getElementById(id);
@@ -245,7 +266,15 @@
       }
       const div = document.createElement('div');
       div.className = `msg ${m.role}${m.synthetic ? ' synthetic' : ''}`;
-      div.textContent = (m.synthetic ? '〔系统注入〕' : '') + m.content;
+      // issue #40：仅助手终稿渲染 Markdown 子集（markdown.js 先转义后格式化，XSS 安全）；
+      // 用户消息与系统注入（synthetic）保持 textContent 纯文本。流式增量（deltaBuf）全程
+      // textContent 追加，run_end 终稿经 refreshSession → addMessage 整体渲染（半截 ``` 不炸布局）。
+      if (m.role === 'assistant' && !m.synthetic && typeof renderMarkdown === 'function') {
+        div.classList.add('md');
+        div.innerHTML = renderMarkdown(m.content);
+      } else {
+        div.textContent = (m.synthetic ? '〔系统注入〕' : '') + m.content;
+      }
       $('stream').appendChild(div);
       scrollDown();
       return div;
