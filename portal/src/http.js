@@ -685,6 +685,21 @@ async function handlePostMessage(req, res, ctx, sessionId) {
   // F3：请求体校验**前置到幂等包装之前**——非法体 400 且不占幂等占位行；
   // 否则首次非法体占位后，同 key 的合法重试会因 request_hash 不同撞 409 idempotency_key_reuse。
   const { content, attachments } = sessions.validateMessageBody(body);
+  // issue #41：建 run 前预检该 FDE 是否已绑定可用 LLM 上游（active binding + enabled provider +
+  // 非空 api_key；SQL 口径同 routes.js llmRows / llm.js getFdeLlmHeartbeatModels 的 JOIN 条件）。
+  // 未配置 → 409 llm_not_configured fail-fast：不占幂等占位、不入队 run（否则 run 永久排队，
+  // 等一个永远不会出现的 LLM 出口）。
+  const bound = await ctx.pool.query(
+    `SELECT 1
+       FROM fde_llm_bindings b
+       JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
+      WHERE b.fde_id = $1 AND b.state = 'active' AND b.api_key IS NOT NULL AND b.api_key <> ''
+      LIMIT 1`,
+    [session.user.id],
+  );
+  if (!bound.rows?.length) {
+    throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置');
+  }
   const key = idempotency.normalizeKey(req.headers['idempotency-key']); // 非法 → 400 validation_failed
   const endpoint = `POST /api/sessions/${sessionId}/messages`; // 含路径参数：同 key 跨 session 不串号
   const result = await idempotency.executeWithIdempotency(
