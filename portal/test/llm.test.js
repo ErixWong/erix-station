@@ -28,6 +28,7 @@ import {
   LLM_MODEL_TYPES,
 } from '../src/llm.js';
 import { createServer } from '../src/http.js';
+import { postMessage } from '../src/sessions.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
@@ -511,6 +512,69 @@ test('D1（Round D 评审）：updateProvider 同值 PATCH 按值判定事实变
   assert.equal(ok4.base_url, 'https://api.openai.com/v1');
   assert.equal(pool4.outbox.length, 0, '同值 PATCH 不得写 outbox');
   assert.equal(pool4.providers.find((p) => p.id === 'p1').updated_at, before4, '同值 PATCH 不得改 updated_at');
+});
+
+test('D2（Round D 评审）：updateProvider 事务首锁为 llm-provider advisory，且先于活跃 run 复检（锁序 provider → 复检 → UPDATE → outbox）', async () => {
+  const pool = seedProviderWithBindings();
+  pool.activeRun = true;
+  await assert.rejects(() => updateProvider(pool, 'p1', { enabled: false }), (e) => e.httpStatus === 409);
+
+  const seq = pool.sqlLog.map((e) => e.sql);
+  const iBegin = seq.findIndex((s) => s === 'BEGIN');
+  const iAdv = seq.findIndex((s) => s.includes('pg_advisory_xact_lock'));
+  const iCur = seq.findIndex((s) => s.includes('SELECT id, name, base_url, api_format, enabled'));
+  const iRuns = seq.findIndex((s) => s.includes('FROM runs r') && s.includes('JOIN chat_sessions'));
+  assert.ok(iBegin !== -1 && iBegin < iAdv, 'advisory lock 是事务首锁（BEGIN 之后第一个语句）');
+  assert.ok(iAdv < iCur, '当前值读取在 advisory lock（已持有）之后');
+  assert.ok(iAdv < iRuns, '活跃 run 复检在 advisory lock（已持有）之后');
+  assert.match(pool.sqlLog[iAdv].params[0], /^llm-provider:p1$/, '锁 key 为 per-provider');
+});
+
+test('D2（Round D 评审）：postMessage 取锁序 chat_sessions → llm-binding → binding 读 → llm-provider → containers', async () => {
+  // 按现有 fake pool 测试风格：内存 client 派发 postMessage 的全部 SQL 并记录顺序。
+  const order = [];
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  const client = {
+    async query(sql, params = []) {
+      order.push({ sql, params });
+      const s = sql.replace(/\s+/g, ' ').trim();
+      if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [] };
+      if (s.includes('pg_advisory_xact_lock')) return { rows: [] };
+      if (s.includes('FROM chat_sessions s') && s.includes('JOIN projects')) {
+        return { rows: [{ id: sessionId, user_id: 'u1', project_id: 'pr1', title: 't', model: null, status: 'active', last_seq: 0, project_name: 'p' }] };
+      }
+      if (s.includes('FROM runs WHERE session_id')) return { rows: [] };
+      if (s.includes('SELECT fde_name FROM users WHERE id')) return { rows: [{ fde_name: 'alice' }] };
+      if (s.includes('SELECT provider_id FROM fde_llm_bindings')) return { rows: [{ provider_id: 'p1' }] };
+      if (s.includes('FROM containers')) return { rows: [{ id: 'c1' }] };
+      if (s.includes('UPDATE chat_sessions SET last_seq')) return { rows: [{ last_seq: 1 }] };
+      if (s.startsWith('INSERT INTO messages')) {
+        return { rows: [{ id: 'm1', seq: 1, role: 'user', content: 'hi', attachments: '[]', created_at: new Date() }] };
+      }
+      if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
+      if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
+      if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
+      throw new Error(`unexpected SQL: ${sql}`);
+    },
+    release() {},
+  };
+  const pool = { connect: async () => client };
+  const posted = await postMessage(pool, { userId: 'u1', sessionId, content: 'hi', attachments: [] });
+  assert.equal(posted.run.status, 'queued');
+
+  const seq = order.map((e) => e.sql);
+  const idx = (pred) => seq.findIndex(pred);
+  const iChat = idx((s) => s.includes('FROM chat_sessions s') && s.includes('FOR UPDATE'));
+  const iBindLock = order.findIndex((e) => e.sql.includes('pg_advisory_xact_lock') && e.params[0] === 'llm-binding:alice');
+  const iBindingRead = idx((s) => s.includes('SELECT provider_id FROM fde_llm_bindings'));
+  const iProvLock = order.findIndex((e) => e.sql.includes('pg_advisory_xact_lock') && e.params[0] === 'llm-provider:p1');
+  const iContainers = idx((s) => s.includes('FROM containers') && s.includes('FOR UPDATE'));
+  assert.ok(iChat !== -1 && iChat < iBindLock, 'chat_sessions FOR UPDATE 最先');
+  assert.ok(iBindLock < iBindingRead, 'binding 读取在 llm-binding 锁之下');
+  assert.equal(order[iBindLock].params[0], 'llm-binding:alice');
+  assert.ok(iBindingRead < iProvLock, 'llm-provider 锁在 binding 读取之后');
+  assert.equal(order[iProvLock].params[0], 'llm-provider:p1', '锁 key 与 updateProvider 同口径');
+  assert.ok(iProvLock < iContainers, 'llm-provider 锁在 containers FOR UPDATE 之前');
 });
 
 test('N3（Round C 评审）：setFdeLlmConfig 事务内权威复检——活跃 run 撞事实变化 → 409 不写库不写 outbox；force/同值放行；锁序 advisory → 复检 → 写入', async () => {
