@@ -270,7 +270,9 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
     // 锁序：本锁在 llm-binding 之后、containers FOR UPDATE 之前（chat_sessions < llm-binding <
     // llm-provider < containers），无环（完整论证见 llm.js 文件头注释）。
     // 一致性：本 SELECT 在 llm-binding 锁之下——该锁串行化 setFdeLlmConfig/deleteFdeLlmConfig/syncFde
-    // 全部 binding 写入方，读到的是已提交快照；provider_id 不可变，故锁 key 与 updateProvider 同指。
+    // 全部 binding 写入方，读到的是已提交快照（provider_id 本身可被 setFdeLlmConfig 更新，
+    // 但该更新同样必须持 llm-binding 锁——与本读串行：要么先提交（本读得新值），要么后提交
+    // （其事务内活跃 run 复检必见本 run → 409/force）），故锁 key 与本 run 实际使用的 provider 同指。
     const binding = await client.query(
       `SELECT provider_id FROM fde_llm_bindings WHERE fde_id = $1 AND state = 'active'`,
       [userId],

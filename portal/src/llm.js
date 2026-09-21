@@ -28,7 +28,9 @@
 // run 建在新配置之后（run 边界语义：新 run 本就该用新上游/凭据，模型本就是 run 边界快照）；run 先提交
 // 则配置事务的 N3 事务内复检必见其 → 409。② D2——provider PATCH（updateProvider）在事务开头取
 // llm-provider advisory，postMessage 在 llm-binding 锁下读当前 binding 的 provider_id（该锁串行化全部
-// binding 写入方，读到的是已提交快照；provider_id 不可变，锁 key 与 updateProvider 必然同指）后取同 key
+// binding 写入方，读到的是已提交快照；provider_id 可被 setFdeLlmConfig 更新，但该更新同样持
+// llm-binding 锁与本读串行——要么先提交（本读得新值），要么后提交（其事务内复检必见本 run →
+// 409/force）），锁 key 与本 run 实际使用的 provider 必然同指）后取同 key
 // 锁：provider PATCH 先提交则 run 用新上游（run 边界语义）；postMessage 先提交则 updateProvider 拿锁后
 // 的 N2 事务内复检必见其 run → 409。Round C 残留的「provider PATCH 与建 run 之间的提交序窗口」关闭。
 
