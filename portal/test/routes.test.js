@@ -566,6 +566,66 @@ test('N4（Round C 评审）：主文件发布失败 + 含密文件摘除失败 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('D3（Round D 评审）：回滚摘除遇 ENOENT（含密文件本就不在）→ 视为 fail-closed 达成，不误报「可能残留」', async () => {
+  // 场景 1（第 2 步回滚分支）：零 binding + 主文件 publish 失败（routes.yml 预置为目录），
+  // llm-routes.yml 本就不存在 → 回滚 unlink 必然 ENOENT = fail-closed 已达成。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-d3-rollback-enoent-'));
+    fs.mkdirSync(path.join(dir, 'routes.yml'));
+    const errors = [];
+    const log = { warn: () => {}, error: (m) => errors.push(m) };
+    try {
+      await assert.rejects(
+        () => rebuildRoutes(makePublishPool({ bindings: [] }), { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log }),
+        /ENOTDIR|EISDIR|rename/,
+        '只抛原始的主文件发布错误（不得带「可能残留」后缀）',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    assert.equal(errors.length, 0, 'ENOENT 不是异常态：不得 error 级日志、不得报「含密文件可能残留」');
+  }
+
+  // 场景 2（第 1 步回滚分支）：有 binding 但含密文件写失败（目录只读 → EACCES），
+  // 回滚摘除遇 ENOENT（文件本就不在；stub 注入以摆脱目录权限对 unlink 错误码的干扰）。
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-d3-step1-enoent-'));
+    fs.chmodSync(dir, 0o000);
+    const errors = [];
+    const log = { warn: () => {}, error: (m) => errors.push(m) };
+    const pool = makePublishPool({
+      bindings: [{
+        fde_id: 'u1', api_key: 'sk-test-1234567890',
+        provider_id: 'deadbeef-1111-2222-3333-444444444444',
+        base_url: 'https://api.upstream.example.com/v1',
+        fde_name: 'alice', subnet: '10.200.1.0/29',
+      }],
+    });
+    const fsp = fs.promises;
+    const origUnlink = fsp.unlink;
+    fsp.unlink = async (p) => {
+      if (String(p) === path.join(dir, 'llm-routes.yml')) {
+        const e = new Error("ENOENT: no such file or directory, unlink 'llm-routes.yml'");
+        e.code = 'ENOENT';
+        throw e;
+      }
+      return origUnlink(p);
+    };
+    try {
+      await assert.rejects(
+        () => rebuildRoutes(pool, { ...PUBLISH_CONFIG_BASE, traefikDynamicDir: dir }, { log }),
+        (e) => /llm-routes.yml publish failed/.test(e.message) && !/含密文件可能残留/.test(e.message),
+        'ENOENT 摘除不得把「可能残留」带进错误',
+      );
+    } finally {
+      fsp.unlink = origUnlink; // 恢复，避免影响其它用例
+      fs.chmodSync(dir, 0o700);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    assert.equal(errors.length, 0, 'ENOENT 不得 error 级误报「含密文件可能残留」');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // F2：desired-state 过滤 p.enabled = true（与心跳查询同口径）；停用 provider → 无 LLM 路由
 // ---------------------------------------------------------------------------

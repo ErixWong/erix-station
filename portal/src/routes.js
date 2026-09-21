@@ -524,6 +524,12 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
       await fs.promises.unlink(llmTarget);
       log.warn?.(`[routes] llm-routes.yml publish failed (${err.message}); 已摘除含密文件，主文件保持上一版`);
     } catch (e2) {
+      // D3（Round D 评审）：ENOENT = 含密文件本就不在 = fail-closed 已达成（无任何含 key 文件
+      // 可被 Traefik 使用），视为摘除成功，绝不误报「可能残留」。
+      if (e2?.code === 'ENOENT') {
+        log.warn?.(`[routes] llm-routes.yml publish failed (${err.message}); 含密文件本就不存在（fail-closed 状态达成），主文件保持上一版`);
+        throw new Error(`llm-routes.yml publish failed: ${err.message}; 主文件保持上一版`);
+      }
       log.error?.(`[routes] llm-routes.yml publish failed (${err.message}) 且旧含密文件摘除失败: ${e2.message} —— 含密文件可能残留，旧 api_key 可能仍被 Traefik 使用（异常态）`);
       throw new Error(`llm-routes.yml publish failed: ${err.message}; 含密文件可能残留（摘除失败: ${e2.message}）`);
     }
@@ -542,6 +548,12 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
       await fs.promises.unlink(llmTarget);
       log.warn?.(`[routes] routes.yml publish failed (${err.message}); fail-closed：已摘除 llm-routes.yml，含密文件不再被 Traefik 使用`);
     } catch (e2) {
+      // D3（Round D 评审）：ENOENT = 含密文件本就不在 = fail-closed 已达成，视为摘除成功，
+      // 只抛原始的主文件发布错误，绝不误报「可能残留」。
+      if (e2?.code === 'ENOENT') {
+        log.warn?.(`[routes] routes.yml publish failed (${err.message}); fail-closed：含密文件本就不存在（fail-closed 状态达成）`);
+        throw err;
+      }
       log.error?.(`[routes] routes.yml publish failed (${err.message}) 且含密文件 llm-routes.yml 摘除失败: ${e2.message} —— 含密文件可能残留，旧 api_key 可能仍被 Traefik 使用（异常态）`);
       throw new Error(`routes.yml publish failed: ${err.message}; 含密文件可能残留（摘除失败: ${e2.message}）`);
     }
