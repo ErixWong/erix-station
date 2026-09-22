@@ -298,3 +298,88 @@ test('前端：创建项目路径与 onchange 共用项目切换清理', async (
   assert.equal(oldEs.closed, true);
   assert.deepEqual(calls, ['/api/sessions?project_id=p1', '/api/sessions?project_id=p1', '/api/sessions?project_id=p2']);
 });
+
+test('前端：创建首个项目后会话列表加载失败仍解除工作区禁用态', async () => {
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/projects' && !opts.method) {
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    if (url === '/api/projects' && opts.method === 'POST') {
+      return { ok: true, status: 200, async json() { return { project: { id: 'p1', name: 'first' } }; } };
+    }
+    if (url.startsWith('/api/sessions?project_id=')) throw new Error('会话列表不可用');
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, created } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  await client.initWorkspace();
+
+  elements.get('newProjName').value = 'first';
+  await elements.get('newProjForm').onsubmit({ preventDefault() {} });
+
+  assert.equal(S.noProject, false);
+  assert.equal(elements.get('input').disabled, false);
+  assert.ok(created.some((el) => el.className === 'syserr' && el.textContent.includes('项目已创建')));
+});
+
+test('前端：send 迟到响应不污染切换后的项目运行态', async () => {
+  let resolveSend;
+  const sendResponse = new Promise((resolve) => { resolveSend = resolve; });
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions/s1/messages' && opts.method === 'POST') return sendResponse;
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }, { id: 'p2', name: 'two' }];
+  S.projectId = 'p1';
+  S.sessionId = 's1';
+  S.noProject = false;
+  elements.get('input').value = '旧项目任务';
+
+  const pending = elements.get('sendBtn').onclick();
+  await Promise.resolve();
+  await client.switchProject('p2', { loadSessions: false });
+  resolveSend({
+    ok: true,
+    status: 200,
+    async json() {
+      return { message: { id: 'm1', content: '旧项目任务' }, run: { id: 'run-1' } };
+    },
+  });
+  await pending;
+
+  assert.equal(S.activeRunId, null);
+  assert.notEqual(elements.get('stopBtn').style.display, 'inline-block');
+});
+
+test('前端：新会话迟到响应不写入切换后的项目且不打开旧会话', async () => {
+  let resolveCreate;
+  const createResponse = new Promise((resolve) => { resolveCreate = resolve; });
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions' && opts.method === 'POST') return createResponse;
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }, { id: 'p2', name: 'two' }];
+  S.projectId = 'p1';
+
+  const pending = elements.get('newSess').onclick();
+  await Promise.resolve();
+  await client.switchProject('p2', { loadSessions: false });
+  resolveCreate({
+    ok: true,
+    status: 200,
+    async json() {
+      return { session: { id: 's-old', title: '旧项目会话' } };
+    },
+  });
+  await pending;
+
+  assert.equal(S.sessions.length, 0);
+  assert.equal(FakeEventSource.instances.length, 0);
+});

@@ -239,10 +239,18 @@
           const sel = $('projectSel');
           sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
           sel.value = project.id;
-          await switchProject(project.id);
           updateWorkspaceAvailability(); // 验收 major-1：首个项目创建后须解除输入区/发送/「＋新会话」禁用
           projectForm.reset();
           projectForm.style.display = 'none';
+          try {
+            await switchProject(project.id);
+          } catch {
+            const div = document.createElement('div');
+            div.className = 'syserr';
+            div.textContent = '项目已创建；会话列表加载失败，可切换项目重试';
+            $('stream').appendChild(div);
+            scrollDown();
+          }
         } catch (e) { projectError.textContent = e.message; }
       };
 
@@ -330,12 +338,17 @@
     }
 
     $('newSess').onclick = async () => {
+      const reqSeq = S.sessionReqSeq;
       try {
         const { session } = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ project_id: S.projectId }) });
+        if (reqSeq !== S.sessionReqSeq) return;
         S.sessions.unshift({ ...session, has_active_run: false });
         renderSessions();
         openSession(session.id);
-      } catch (e) { alert('建会话失败：' + e.message); }
+      } catch (e) {
+        if (reqSeq !== S.sessionReqSeq) return;
+        alert('建会话失败：' + e.message);
+      }
     };
 
     async function openSession(id) {
@@ -528,8 +541,11 @@
     }
 
     async function refreshSession(runId) {
+      const reqSeq = S.sessionReqSeq;
+      const sid = S.sessionId;
       try {
-        const data = await api(`/api/sessions/${encodeURIComponent(S.sessionId)}`);
+        const data = await api(`/api/sessions/${encodeURIComponent(sid)}`);
+        if (reqSeq !== S.sessionReqSeq || (sid !== undefined && S.sessionId !== sid)) return;
         const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
         for (const m of msgs) addMessage(m);
         await loadSessions();
@@ -557,18 +573,22 @@
     });
 
     async function send() {
+      const reqSeq = S.sessionReqSeq;
+      const sid = S.sessionId;
       const content = $('input').value.trim();
-      if (!content || !S.sessionId || S.activeRunId) return;
+      if (!content || !sid || S.activeRunId) return;
       $('input').value = '';
       try {
-        const { message, run } = await api(`/api/sessions/${encodeURIComponent(S.sessionId)}/messages`, {
+        const { message, run } = await api(`/api/sessions/${encodeURIComponent(sid)}/messages`, {
           method: 'POST', body: JSON.stringify({ content, attachments: [] }),
         });
+        if (reqSeq !== S.sessionReqSeq || (sid !== undefined && S.sessionId !== sid)) return;
         addMessage({ ...message, role: 'user' });
         S.activeRunId = run.id;
         setRunning(true);
         loadSessions();
       } catch (e) {
+        if (reqSeq !== S.sessionReqSeq || (sid !== undefined && S.sessionId !== sid)) return;
         $('input').value = content; // issue #42：发送失败回填输入，已输入内容不丢
         const div = document.createElement('div');
         div.className = 'syserr';
