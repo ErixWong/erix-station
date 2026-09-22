@@ -95,7 +95,8 @@
     const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
-                lastSeq: 0, es: null, esSessionId: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null };
+                lastSeq: 0, es: null, esSessionId: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null,
+                projectReqSeq: 0 }; // 评审 LOW-3：项目切换请求序号（迟到响应丢弃）
     // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）
     const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
 
@@ -215,7 +216,10 @@
     }
 
     async function loadSessions() {
+      // 评审 LOW-3：请求序号守卫——快速 A→B 切换时，A 的迟到响应不得覆盖 B 的会话列表
+      const reqSeq = ++S.projectReqSeq;
       const data = await api(`/api/sessions?project_id=${encodeURIComponent(S.projectId)}`);
+      if (reqSeq !== S.projectReqSeq) return; // 过期响应：projectId 已变，丢弃
       S.sessions = data.items ?? [];
       renderSessions();
     }
