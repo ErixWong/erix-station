@@ -545,11 +545,12 @@
     }
 
     async function refreshSession(runId) {
+      const reqSeq = S.sessionReqSeq;
       const ctx = S.ctxSeq;
       const sid = S.sessionId;
       try {
         const data = await api(`/api/sessions/${encodeURIComponent(sid)}`);
-        if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
+        if (reqSeq !== S.sessionReqSeq || ctx !== S.ctxSeq || S.sessionId !== sid) return;
         const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
         for (const m of msgs) addMessage(m);
         await loadSessions();
