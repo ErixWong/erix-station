@@ -1105,7 +1105,7 @@ async function handleCreateProject(req, res, ctx) {
   requireJson(req);
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
-  const repoUrl = typeof body.repo_url === 'string' ? body.repo_url.trim() : '';
+  const repoUrl = body.repo_url === undefined || body.repo_url === null ? undefined : body.repo_url;
   const template = typeof body.template === 'string' ? body.template : 'default';
   const result = await projects.createProject(ctx.pool, {
     userId: session.user.id,

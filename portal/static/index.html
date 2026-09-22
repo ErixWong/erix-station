@@ -256,7 +256,23 @@
       updateProjectMeta();
       updateWorkspaceAvailability(); // issue #42：无项目 → 禁用输入区/发送/「＋新会话」
       // 验收 major-2：onchange 无条件绑定（在空项目 early return 之前，否则从零项目开始时切换项目永不加载会话）
-      sel.onchange = () => { S.projectId = sel.value; updateProjectMeta(); loadSessions(); };
+      sel.onchange = () => {
+        if (S.es) { S.es.close(); S.es = null; }
+        S.projectId = sel.value;
+        S.sessionId = null;
+        S.activeRunId = null;
+        S.lastSeq = 0;
+        S.deltaBuf = null;
+        S.toolCards = {};
+        S.renderedIds = null;
+        S.esSessionId = null;
+        S.sessions = [];
+        $('stream').innerHTML = '<p class="muted">选择或新建会话</p>';
+        setRunning(false);
+        updateProjectMeta();
+        renderSessions();
+        loadSessions();
+      };
       if (S.projects.length === 0) {
         const isPlatformAdmin = S.user.role === 'admin' && !S.user.fde_name;
         const emptyText = isPlatformAdmin ? '平台管理员：请到管理台创建 FDE 用户与分配资源' : '先创建项目';
