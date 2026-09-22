@@ -51,9 +51,10 @@ function loadClient() {
   const m = html.match(/<script>([\s\S]*?)<\/script>/);
   assert.ok(m, 'index.html 应含单个内联脚本');
   const els = new Map();
+  const created = []; // sep()/msg 等 createElement 产物（断言渲染文本用）
   const document = {
     getElementById(id) { if (!els.has(id)) els.set(id, makeEl()); return els.get(id); },
-    createElement() { return makeEl(); },
+    createElement() { const el = makeEl(); created.push(el); return el; },
   };
   const sandbox = {
     document,
@@ -68,7 +69,7 @@ function loadClient() {
   const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents };`;
   new vm.Script(code).runInContext(ctx);
   FakeEventSource.instances = [];
-  return { client: ctx.__client, elements: els };
+  return { client: ctx.__client, elements: els, created };
 }
 
 /** 构造事件载荷（emit 会自行包成 SSE 帧）；带 seq + run_id 的典型事件。 */
@@ -158,4 +159,44 @@ test('前端：resync 重连后 run_end 状态机守卫不变（仅 activeRunId 
   es.emit('run_end', evt(4, { run_id: 'run-cur', termination: { reason: 'end_turn' } }));
   assert.equal(S.activeRunId, null);
   assert.equal(elements.get('stopBtn').style.display, 'none');
+});
+
+test('前端：0.9.0 新事件类型白名单 + 载荷对齐（compaction/final_guard/forced_final/judge extend/passThrough，issue #43 评审 F4）', () => {
+  const { client, created } = loadClient();
+  const { S } = client;
+  S.sessionId = 'sess-9'; S.esSessionId = 'sess-9'; S.lastSeq = 0; S.activeRunId = 'run-9';
+  client.connectEvents('sess-9');
+  const es = FakeEventSource.instances.at(-1);
+
+  // 白名单：新事件类型已注册具名监听（未注册 = 事件被 EventSource 静默丢弃）
+  for (const type of ['compaction', 'final_guard', 'forced_final']) {
+    assert.ok(es.listeners.has(type), `SSE 白名单缺 ${type}`);
+  }
+
+  // compaction：详情在 d.compaction（orchestrator recordCompactionStat）
+  es.emit('compaction', evt(2, { round: 5, compaction: { compacted: true, foldedRounds: 3, tokensBefore: 9000, tokensAfter: 4000, layers: 1 } }));
+  // final_guard：action + reason（termination.js）
+  es.emit('final_guard', evt(3, { round: 6, action: 'accept' }));
+  // forced_final：round + reason（termination.js:215，0.9.0 最后一轮强制无 tools 终稿）
+  es.emit('forced_final', evt(4, { round: 7, reason: 'max_rounds_cap' }));
+  // judge passThrough：挂在 intercept 类事件上（checkpoint-executor）
+  es.emit('judge', evt(5, { kind: 'intercept', action: 'executed', passThrough: 'on_track', tool: { name: 'readFile' } }));
+  es.emit('judge', evt(6, { kind: 'intercept', action: 'executed', passThrough: 'readonly', tool: { name: 'note_read' } }));
+  // judge 扩轮：extend/extendReason/plan 在 d.decision 内（round judge）
+  es.emit('judge', evt(7, { kind: 'round', action: 'extend', decision: { extend: true, extendReason: '任务未完成', plan: '继续实现登录页' } }));
+  es.emit('judge', evt(8, { kind: 'round', action: 'decline_extend', decision: { extend: false, extendReason: '足够好' } }));
+  // judge 拦截（无 passThrough）：action + decision.reason
+  es.emit('judge', evt(9, { kind: 'intercept', action: 'blocked', decision: { done: false, reason: '方向偏离' } }));
+
+  const seps = created.filter((el) => el.className === 'roundsep').map((el) => el.textContent);
+  const joined = seps.join('\n');
+  assert.ok(seps.some((t) => t.includes('上下文折叠') && t.includes('3 轮折叠') && t.includes('9000 → 4000')), `compaction 渲染：${joined}`);
+  assert.ok(seps.some((t) => t.includes('final guard：accept')), `final_guard 渲染：${joined}`);
+  assert.ok(seps.some((t) => t.includes('forced final') && t.includes('max_rounds_cap')), `forced_final 渲染：${joined}`);
+  assert.ok(seps.some((t) => t.includes('放行（on_track）')), `judge passThrough(on_track)：${joined}`);
+  assert.ok(seps.some((t) => t.includes('放行（readonly）')), `judge passThrough(readonly)：${joined}`);
+  assert.ok(seps.some((t) => t.includes('扩轮') && t.includes('继续实现登录页')), `judge extend（decision 内 plan）：${joined}`);
+  assert.ok(seps.some((t) => t.includes('不扩轮')), `judge decline_extend：${joined}`);
+  assert.ok(seps.some((t) => t.includes('blocked') && t.includes('方向偏离')), `judge 拦截：${joined}`);
+  assert.equal(S.lastSeq, 9, '水位线照常推进');
 });

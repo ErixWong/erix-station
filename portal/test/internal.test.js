@@ -18,6 +18,8 @@ import {
   reapExpiredRuns,
   putCheckpoint,
   getLatestCheckpoint,
+  saveRunState,
+  loadRunState,
   registerSseClient,
   unregisterSseClient,
   broadcastStopRequest,
@@ -233,6 +235,88 @@ test('putCheckpoint：revision CAS（前进 200 / 旧 revision 409 checkpoint_st
 
   const latest = await getLatestCheckpoint(pool, { container, user, runId, claimToken });
   assert.equal(latest.checkpoint.revision, 2);
+});
+
+test('saveRunState/loadRunState：run_state 合并写 + 引擎终态标记（mark）+ 终态后读放宽（0.9.0 八方法契约）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+
+  // loadRunState：无 → null
+  assert.equal(await loadRunState(pool, { container, user, runId, claimToken }), null);
+
+  // saveRunState 全量合并（reference 语义 = previous + state）
+  await saveRunState(pool, { container, user, runId, claimToken, body: { run_state: { stateVersion: 3, deterministic: { rounds: 2 } } } });
+  await saveRunState(pool, { container, user, runId, claimToken, body: { run_state: { semantic: { text: 'summary', version: 1 } } } });
+
+  // markRunState 终态标记（引擎 succeeded）只合并 state 字段，不动 runs.status
+  await saveRunState(pool, { container, user, runId, claimToken, body: { state: 'succeeded' } });
+
+  const state = await loadRunState(pool, { container, user, runId, claimToken });
+  assert.equal(state.run_state.state, 'succeeded');
+  assert.equal(state.run_state.stateVersion, 3);
+  assert.deepEqual(state.run_state.deterministic, { rounds: 2 });
+  assert.deepEqual(state.run_state.semantic, { text: 'summary', version: 1 });
+  assert.equal(pool.runs[0].status, 'running', 'mark 不触碰 runs.status');
+
+  // 校验失败：非对象 run_state / 空 body
+  await assert.rejects(
+    () => saveRunState(pool, { container, user, runId, claimToken, body: { run_state: 'nope' } }),
+    (e) => e.code === 'validation_failed',
+  );
+  await assert.rejects(
+    () => saveRunState(pool, { container, user, runId, claimToken, body: {} }),
+    (e) => e.code === 'validation_failed',
+  );
+
+  // 终态后写 409 run_terminal；终态后读仍放宽可读
+  await setRunState(pool, {
+    container, user, runId, claimToken,
+    body: { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 1, output_tokens: 2 }, rounds: 1, final_text: 'ok' },
+  });
+  await assert.rejects(
+    () => saveRunState(pool, { container, user, runId, claimToken: null, body: { run_state: { stateVersion: 4 } } }),
+    (e) => e.code === 'run_terminal',
+  );
+  const after = await loadRunState(pool, { container, user, runId, claimToken: null });
+  assert.equal(after.run_state.state, 'succeeded', '终态后仍可读');
+});
+
+test('saveRunState：F2 原子写——租约过期/re-claim 后旧 worker 的迟到写被 fencing（409 lease_lost，状态不被覆盖）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const t1 = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  await setRunState(pool, { container, user, runId, claimToken: t1.claim_token, body: { state: 'running' } });
+
+  // 旧 worker（token t1）正常写一次
+  await saveRunState(pool, { container, user, runId, claimToken: t1.claim_token, body: { run_state: { stateVersion: 1, sentinel: 'attempt1' } } });
+
+  // ① 租约过期（未 re-claim）：t1 再写 → 409 lease_lost，已落库状态不被覆盖
+  pool.queue[0].lease_until = Date.now() - 1000;
+  await assert.rejects(
+    () => saveRunState(pool, { container, user, runId, claimToken: t1.claim_token, body: { run_state: { sentinel: 'stale-write' } } }),
+    (e) => e.code === 'lease_lost',
+  );
+  // 读端点在此场景同样要求有效租约（run 未终态），直接查 fake 行验证「写未生效」。
+  assert.equal(pool.runs[0].run_state.sentinel, 'attempt1', '过期租约的写未生效');
+
+  // ② re-claim（attempt 2，新 token t2）：旧 token t1 的迟到写被 fencing；新 token 可写
+  const t2 = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  assert.equal(t2.run.attempt, 2);
+  await assert.rejects(
+    () => saveRunState(pool, { container, user, runId, claimToken: t1.claim_token, body: { run_state: { sentinel: 'old-owner-overwrite' } } }),
+    (e) => e.code === 'lease_lost',
+  );
+  assert.equal(pool.runs[0].run_state.sentinel, 'attempt1', 're-claim 后旧 token 写未生效');
+
+  await saveRunState(pool, { container, user, runId, claimToken: t2.claim_token, body: { run_state: { sentinel: 'attempt2' } } });
+  const state = await loadRunState(pool, { container, user, runId, claimToken: t2.claim_token });
+  assert.equal(state.run_state.sentinel, 'attempt2', '新租约持有者可写');
+  assert.equal(state.run_state.stateVersion, 1, '合并语义保留（jsonb || patch）');
 });
 
 test('SSE hub：register/broadcast/run_assigned/stop_request/unregister', async () => {

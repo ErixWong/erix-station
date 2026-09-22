@@ -80,3 +80,40 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - D1 Traefik 作 ingress；D2 SSO + 本地 break-glass admin；D3 每 FDE 仅自己的 `/29` 独立网络（`control` 共享网络已取消，H-B 定稿 issue #5）
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree
+
+## 8. erix-agent 依赖与升级（0.3.5 → 0.9.0，2026-09 分析）
+
+- **源仓库**：`~/projects/erix-llm-kit`（npm 包名就是 `erix-agent`；本地无同名目录，别再找错）。宿主契约 `docs/host-consumer-contract.md`；0.6.0 升级指南 `docs/host-upgrade-guide-0.6.0.md`；破坏性变化以 CHANGELOG 为准。
+- runner 锁 `0.3.5`（runner/package.json），最新 `0.9.0`。升级为**大改动**：走分支 + PR + §6.1 双模型评审。
+
+### 必改项（breaking，不改跑不起来）
+
+1. **`erix-agent/tools` 四个导入断供**（0.9.0 只剩 `createToolRegistry` + tool providers）：
+   - `createJail` / `createFileTools` → 0.6.0 删除（ADR-009：库不提供沙箱）→ runner 自带 file 工具与 jail 路径边界（牢笼仍由本项目提供，不变式 1）；
+   - `createRecallTool` → 0.8.0 随 recall 工具退役删除 → 删该工具，档案取回改 note 工作流（`note_take`/`note_read`/`note_list`，引擎要求 NotesStore；实现放 `src/store/notes.js` 导出 `createFileNotesStore`/`assertNotesStore`）。
+2. **TranscriptStore 必需方法变 8 个**（0.6.0 起 run 前 fail-closed 校验，缺即 TypeError）：station 现有 7 个，缺 **`saveRunState`/`loadRunState`** → 三段链路都补：worker `makeStore`（IPC）→ agentd `handleStoreState` 加 case → portal internal 新端点（`PUT/GET /runs/:id/runstate`，落 `runs.run_state jsonb`，与不变式 3「DB 是状态真相」一致）。契约要求：写失败向上抛、runState 对象含 `state`/`stateVersion`。
+3. **store.recall 不再必需**：引擎 0.8.0 起不再调用；agentd/portal 的 recall 端点可保留或删（升级时拍板，别留孤儿）。
+4. **未知顶层选项抛 TypeError**：worker 现有传参已逐项核对在契约白名单内，无需改（后续加参数必须先对 `host-consumer-contract.md` 选项清单）。
+
+### 需拍板的行为差异（不 crash，但改模型可见面/成本）
+
+- `maxRounds: 8 + judge 已开`（`reflection: { enabled: true, roundJudge: true }`，用户 2026-09-22 拍板，推翻「P1 mock 关 judge」）→ 长任务 nearLimit 可经 round judge `extend` 扩轮；judge 请求失败 fail-closed 不扩轮（`roundJudgeFailures` 限 3 后本轮禁用）；judgeIntercept 默认开（工具透明审计）。
+- 新默认值：output hygiene 4096（超限工具结果归档+截断提示）、工具结果 TTL 折叠（`ERIX_TOOL_RESULT_TTL` 默认 2）、retry `attempts:2`；单轮聚合预算在未传窗口配置时不生效（同 0.6.0 行为）。
+- resume 语义拆分（0.7.0）：轮号跨 resume 连续，轮预算每次 run 从 0 起计 → wp3b-e2e 的 resume 用例要按新口径核对。
+
+### 随动同步项
+
+- `termination` 新枚举 `final_guard_unverified`（docs/data/schema.sql 注释还按 0.3.5 写）；`usage` 增可选 `cacheRead`/`cacheWrite`；新事件类型 `compaction`/`final_guard`、judge 事件带 `extend`/`passThrough` 决策 → portal 事件白名单/前端枚举核对。
+- provider 导出 `createOpenAIProvider`/`createJsonFileModelConfigProvider` 与 `registry.executeTool(name, input, context)` 签名未变；worker 的 executeTool 已是结构化包装，无需改。
+- 升级后对 station store adapter 跑 `erix-agent/contract-tests`（`transcriptStoreContract` 0.6.0 起更严：checkpoint 字节保真、多 runId 隔离、runState round-trip）。
+- `runner/package.json` 版本号 + lock、wp3b-e2e、本节状态在 PR 内同步更新。
+
+### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
+
+- [x] **必改项 1**：`erix-agent/tools` 四导入断供 → runner 自带 jail + file 工具（`runner/lib/file-tools.js`，0.3.5 语义移植）；recall 工具删除，档案取回归 note 工作流（`runner/lib/notes-tools.js`，复用随包 notes 技能模块 + `createFileNotesStore`，落盘 `<worktree>/.notes`）。
+- [x] **必改项 2**：store adapter 补 `saveRunState`/`loadRunState`（`runner/lib/store.js`，transport 可注入）→ agentd `handleStoreRequest` 两 case → portal `PUT/GET /runs/:id/runstate`（落 `runs.run_state jsonb`，迁移 `0003-run-state.sql`）。markRunState 双路：`'running'` → U2；引擎终态标记 → runstate 合并 `state`（不动 `runs.status`）。
+- [x] **必改项 3**：store.recall 端点**保留**（引擎 0.8.0 起不调用；worker 不注册 recall 工具；非孤儿——既有断言面与只读兼容）。
+- [x] **必改项 4**：worker 传参逐项核对在 `host-consumer-contract.md` 选项白名单内，未加契约外键。
+- [x] **随动同步**：`runner/package.json` → 0.9.0 + lock；portal 事件白名单补 `compaction`/`final_guard`/`forced_final`（judge 事件 `extend`/`passThrough` 前端展示）；termination 枚举补 `final_guard_unverified` + `run_state` 列文档落 `docs/data/model.md`（**baseline 冻结规则优先**：`docs/data/schema.sql` 的修改已回滚——`migrate.js` 实时 sha256 校验，改 baseline 会让既有部署拒启；DDL 只走 `0003-run-state.sql`）；契约测试 `transcriptStoreContract` 对 station adapter 全绿（`runner/test/store-contract.test.js`）。
+- [x] **wp3b-e2e 真机复跑全绿**（2026-09-22，隔离栈：`STATION_STACK_ID` + 端口/容器名/DB 目录 env 化；含 F3 sentinel 恢复断言）。配套修了两个真问题：F8 traefik 静态配置 `TRAEFIK_STATIC_HOST` env 化（CLI 覆盖被 `--configFile` 静态文件压制，实测证伪）；F9 orphan 清扫按 `station.stack` 标签过滤（同宿主双 portal 互删对方 FDE 的真缺陷，共享栈旧镜像需重建后才受保护）。
+- [x] **judge（扩轮）已开**（2026-09-22 用户拍板）：`worker.js` `reflection: { enabled: true, roundJudge: true }`；F3 sentinel 断言可再加强为内容级（LOW，copilot 复审遗留）。

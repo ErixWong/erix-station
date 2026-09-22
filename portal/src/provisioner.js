@@ -158,6 +158,7 @@ export function buildContainerConfig({
   homeUser = 'erix',
   env = [],
   labels = {},
+  stackId = 'default', // F9：栈所有权标签（orphan 清扫按 station.stack 过滤；缺省 default）
   memoryLimit = '4g', // issue #27 已决 2026-09-18（B 档镜像下 dotnet build/chromium 峰值；0 不限）
   runUser = null, // '1001:1000' 等；镜像不具备双 UID 用户时用 --user 兜底（FDE_DEV_USER，⚠️ dev 偏差）
   capAdd = ['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL'], // 契约 §6.2：root 启动→drop 1001、fork 1002 所需最小集（含跨 UID kill 的 CAP_KILL）
@@ -180,7 +181,7 @@ export function buildContainerConfig({
       // F4：容器内 agentd 依赖的 internal API base URL（契约 §6.2）。dev http + 高端口 / prod https + 443。
       `ERIX_STATION_BASE_URL=${String(portalPublicBaseUrl || `https://station.${baseDomain}`).replace(/\/+$/, '')}/api/internal`,
     ],
-    Labels: { 'station.managed': 'true', 'fde.name': fdeName, ...labels },
+    Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId, ...labels },
     HostConfig: {
       Binds: binds,
       NetworkMode: networkName,
@@ -202,12 +203,12 @@ export function buildContainerConfig({
 }
 
 /** FDE 网络的 Docker API create body（契约 §6.1：显式 subnet + gateway）。 */
-export function buildNetworkConfig({ name, subnet, gateway, fdeName }) {
+export function buildNetworkConfig({ name, subnet, gateway, fdeName, stackId = 'default' }) {
   return {
     Name: name,
     Driver: 'bridge',
     IPAM: { Driver: 'default', Config: [{ Subnet: subnet, Gateway: gateway }] },
-    Labels: { 'station.managed': 'true', 'fde.name': fdeName },
+    Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId },
   };
 }
 
@@ -241,7 +242,7 @@ function assertNetworkContract(data, { name, subnet, gateway, fdeName }) {
 }
 
 /** 确保 docker 网络存在（不存在则按契约创建）。返回 { created, id }。 */
-export async function ensureFdeNetwork(docker, { name, subnet, gateway, fdeName, log = console }) {
+export async function ensureFdeNetwork(docker, { name, subnet, gateway, fdeName, stackId = 'default', log = console }) {
   const existing = await docker.inspectNetwork(name);
   if (existing.status === 200) {
     // F11：inspect 200 后必须校验 managed label + fde.name + subnet/gateway 与 DB 一致；不一致 → 报错（不静默采用）。
@@ -251,7 +252,7 @@ export async function ensureFdeNetwork(docker, { name, subnet, gateway, fdeName,
   if (existing.status !== 404) {
     throw new Error(`inspect network ${name} failed: HTTP ${existing.status}`);
   }
-  const res = await docker.createNetwork(buildNetworkConfig({ name, subnet, gateway, fdeName }));
+  const res = await docker.createNetwork(buildNetworkConfig({ name, subnet, gateway, fdeName, stackId }));
   if (res.status === 409) {
     // 并发下另一 reconcile/onboard 已创建 → 必须 re-inspect 并做同样契约校验（F11/P4）。
     const now = await docker.inspectNetwork(name);
@@ -431,6 +432,8 @@ async function upsertContainerRow(pool, { userId, fdeName, containerName, tokenH
  * 容器状态回写 DB（running/stopped/removed）。返回统计供测试/观测。
  */
 export async function reconcileOnce(pool, config, { docker, log = console } = {}) {
+  // F9：本栈所有权 id——孤儿清扫只清 station.stack === stackId 的资源（无标签视为 default）。
+  const stackId = config.stackId ?? 'default';
   const desired = await readFdeDesired(pool);
   const stats = { ensured: 0, rebuilt: 0, orphansRemoved: 0, orphanNetworksRemoved: 0, statusUpdates: 0 };
 
@@ -458,7 +461,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           gid: config.fdeGid ?? 1000,
           log,
         });
-        await ensureFdeNetwork(docker, { name: networkName, subnet, gateway, fdeName, log });
+        await ensureFdeNetwork(docker, { name: networkName, subnet, gateway, fdeName, stackId, log });
 
         const opts = {
           fdeName,
@@ -474,6 +477,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           userSpaceRoot: config.userSpaceRootHost, // F3：bind source 用宿主路径（与容器内 userSpaceRoot 解耦）
           memoryLimit: config.fdeMemoryLimit,
           runUser: config.fdeDevUser ?? null, // F5：生产留空（镜像 entrypoint 降权）；dev 用 FDE_DEV_USER 兜底
+          stackId, // F9：创建即打 station.stack 所有权标签
         };
 
         let res = await ensureFdeContainer(docker, opts, { log });
@@ -530,6 +534,8 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
     const name = (c.Names?.[0] || '').replace(/^\//, '');
     if (!name.startsWith('fde-')) continue;
     if (freshContainerNames.has(name)) continue;
+    // F9：只清本栈孤儿——station.stack 缺失视为 default（既有资产兼容）；异栈标签一律跳过。
+    if (((c.Labels ?? {})['station.stack'] ?? 'default') !== stackId) continue;
     log.warn?.(`[provisioner] orphan container detected: ${name} (removing)`);
     await pool.query(
       `INSERT INTO audit_log (actor_id, action, target, details)
@@ -562,6 +568,8 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
     const name = n?.Name;
     if (!name || !name.startsWith('fde-')) continue;
     if ((n?.Labels ?? {})['station.managed'] !== 'true') continue;
+    // F9：只清本栈孤儿网络——station.stack 缺失视为 default；异栈标签一律跳过。
+    if (((n?.Labels ?? {})['station.stack'] ?? 'default') !== stackId) continue;
     if (freshNetworkNames.has(name)) continue;
     // 审计 #37 评审（TOCTOU）：快照可能过期——onboardFde 持 FDE 锁期间创建的网络不能凭旧快照判死。
     // 与 deprovision/onboard 同锁串行化，并**锁内重读** desired 二次确认后才删。
@@ -596,6 +604,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
 /** onboarding：分配子网（IPAM）→ 单点生成 token（hash 入 DB + 明文只进 create env）→ 建网络 + 容器 → status running。幂等。 */
 export async function onboardFde(pool, config, { fdeName, docker, log = console } = {}) {
   return withFdeLock(pool, fdeName, async () => {
+    const stackId = config.stackId ?? 'default'; // F9：本栈所有权 id
     const user = await pool.query(
       `SELECT id, fde_name, status FROM users WHERE fde_name = $1 AND status = 'active'`,
       [fdeName],
@@ -659,7 +668,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
     const subnet = net.subnet;
     const gateway = net.gateway;
     const ip = fdeContainerIp(subnet);
-    await ensureFdeNetwork(docker, { name: net.network_name, subnet, gateway, fdeName, log });
+    await ensureFdeNetwork(docker, { name: net.network_name, subnet, gateway, fdeName, stackId, log });
     if (needRecreate) {
       await removeFdeContainer(docker, containerName, { log }); // 删除失配旧容器（若有）
     }
@@ -679,6 +688,7 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
         userSpaceRoot: config.userSpaceRootHost, // F3
         memoryLimit: config.fdeMemoryLimit,
         runUser: config.fdeDevUser ?? null, // F5
+        stackId, // F9：创建即打 station.stack 所有权标签
         runnerToken: token,
       },
       { log },

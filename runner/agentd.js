@@ -401,11 +401,35 @@ async function handleStoreRequest(ctx, method, args) {
       return r.data;
     }
     case 'markRunState': {
+      // 'running' → U2 /state（runs.status）；引擎终态标记（succeeded/unverified_error/guard_error）
+      // → runstate 端点合并进 runs.run_state blob（不动 runs.status，终态仍由 U2 上报，§6.3-9）。
+      const state = args?.state ?? 'running';
+      const endpoint = state === 'running' ? 'state' : 'runstate';
       const r = await withRetry(
-        () => internalRequest('PUT', `/runs/${runId}/state`, { body: { state: args?.state ?? 'running' }, claimToken: ctx.claimToken }),
-        { what: `markRunState run=${runId}` },
+        () => internalRequest('PUT', `/runs/${runId}/${endpoint}`, { body: { state }, claimToken: ctx.claimToken }),
+        { what: `markRunState run=${runId} state=${state}` },
       );
       return r.data;
+    }
+    case 'saveRunState': {
+      // 0.6.0 起引擎持久化确定性 run state（run 前 fail-closed 校验 8 方法之一）。
+      const runState = args?.runState ?? {};
+      const r = await withRetry(
+        () => internalRequest('PUT', `/runs/${runId}/runstate`, { body: { run_state: runState }, claimToken: ctx.claimToken }),
+        { what: `saveRunState run=${runId}` },
+      );
+      return r.data;
+    }
+    case 'loadRunState': {
+      const r = await withRetry(
+        () => internalRequest('GET', `/runs/${runId}/runstate`, { claimToken: ctx.claimToken }),
+        { what: `loadRunState run=${runId}` },
+      );
+      // F3（issue #43 评审）：loadRunState 仅引擎 resume 路径调用（attempt ≥ 2 的 re-claim）。
+      // 留痕 = 「恢复读」请求痕迹：wp3b-e2e 用它区分 attempt2 真的经 loadRunState 恢复
+      // （vs 只靠 attempt2 自己的 saveRunState 也能通过的假绿）。每 resume 仅 1 次，低量。
+      log('info', 'store loadRunState', { run_id: runId, restored: r?.data?.run_state != null });
+      return r.data; // {run_state} 或 204 → null
     }
     case 'saveCheckpoint': {
       const revision = Number(args?.revision ?? 0);

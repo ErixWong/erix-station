@@ -57,7 +57,7 @@ worker 侧对上游的**全部**依赖面（D4'，再没有别的）：
 
 > **宿主组装的三个硬注意**（来自上游事实，worker 实现时必须遵守）：
 > 1. **多轮显式传 `task`**：本轮用户输入作为 `task` 字符串传入，否则 judge 拿旧种子当基准（`docs/host-upgrade-guide-v030.md` §1-2；`task > context.task > transcript 最后一条 user 文本`，`src/loop.js:597` typedef 注释）。
-> 2. **checkpoint store 成对才启用 fail-closed**：`saveCheckpoint`/`appendCheckpoint` 与 `loadLatestCheckpoint` 同时存在才有 `hasCheckpointStore`（`src/loop.js:1181-1184`）。我们的 adapter 六方法全实现 → fail-closed 生效：工具执行前/后写失败抛 `checkpoint_failed`（`src/loop.js:1249-1255` 与 `:1317-1322`）。
+> 2. **checkpoint store 成对才启用 fail-closed**：`saveCheckpoint`/`appendCheckpoint` 与 `loadLatestCheckpoint` 同时存在才有 `hasCheckpointStore`（`src/loop.js:1181-1184`）。我们的 adapter 八方法全实现（0.9.0 起引擎 fail-closed 校验 8 方法，缺即 run 前 TypeError） → fail-closed 生效：工具执行前/后写失败抛 `checkpoint_failed`（`src/loop.js:1249-1255` 与 `:1317-1322`）。
 > 3. **judge 默认行为**：`maxRounds >= 16` 且未显式传 `reflection` 时 judge 自动开启（`src/loop.js:562` 注释）。worker 必须**显式传** `reflection` 配置（开/关/参数），不依赖默认值（host-upgrade-guide §0-1）——具体策略 ⚠️ 见 §15。
 
 ---
@@ -270,7 +270,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `worker_ready` | worker→agentd | `{pid}` | fork 后握手；agentd 收到后才发 `run_start` |
 | `run_start` | agentd→worker | `{run_id, session_id, attempt, task, cwd, project, model, resume, attachments, config: {model_config_path, reflection, wrapup}}` | worker 据此组装 `runToolLoop` 参数（§6.3；`config.json` 内为占位 key + `endpoint=https://llm.<base>/v1`，无独立 key 文件）；`cwd` = 已建好的 worktree；`attempt` = 本次 start 次数（生成 `client_event_id`，§7.3）；`reflection`/`wrapup` 引擎策略由 portal 随 run_start 下发（§6.3-8 的载体） |
 | `event` | worker→agentd | `{run_id, client_event_id, type, ts, payload}` | 引擎回调透传（`onEvent` 8 类 / `onDelta` / `onReasoningDelta` / `onToolCall` / `onJudge`），**逐条即发**，批量在 agentd（§7.2）；`onUsage` **不产 IPC `event`**（仅喂 U2 终态载荷，§6.3-6）；`client_event_id` = `run_id:attempt:计数`（§7.3，重启/重领不碰撞） |
-| `store_request` | worker→agentd | `{req_id, method, args}` | `method ∈ appendRound/load/recall/markRunState/saveCheckpoint/loadLatestCheckpoint`；agentd 映射到 U2/U5-U9（§9.1），加 token 转发 |
+| `store_request` | worker→agentd | `{req_id, method, args}` | `method ∈ appendRound/load/recall/markRunState/saveRunState/loadRunState/saveCheckpoint/loadLatestCheckpoint`（0.9.0 八方法）；agentd 映射到 U2/U5-U9/runstate（§9.1），加 token 转发 |
 | `store_response` | agentd→worker | `{req_id, ok, result?, error?: {code, message, retryable}}` | 对应 `store_request`；`ok:false` 时 worker 侧 adapter 按 §9.2 重试策略处理 |
 | `approval_request` | worker→agentd | `{req_id, run_id, tool_call_id, round, name, input_digest}` | `executeTool` 包装层发起；worker 挂起等待 |
 | `approval_decision` | agentd→worker | `{req_id, approval_id, decision: "approved"\|"denied", note?}` | resolve worker 的 await；超时/拒绝语义见 §10 |
@@ -522,18 +522,23 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 
 ## 9. store adapter 契约（HTTP 版，D2'）
 
-### 9.1 六方法 → internal 端点映射
+### 9.1 八方法 → internal 端点映射（0.9.0 起，issue #43）
 
-worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → agentd → internal 端点）；agentd 是无状态转发（加 `Authorization` + `X-Claim-Token`）。接口语义锚点：上游 typedef `src/store/file.js:186-194`。
+worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → agentd → internal 端点）；agentd 是无状态转发（加 `Authorization` + `X-Claim-Token`）。接口语义锚点：上游 typedef `src/store/file.js:175-177`；0.6.0 起引擎 run 前 fail-closed 校验 **8 方法**（缺 `saveRunState`/`loadRunState` 即 TypeError，host-upgrade-guide §2）。
 
 | store 方法 | IPC `method` | internal 端点 | 落库 | 幂等语义 |
 |---|---|---|---|---|
 | `appendRound(runId, record)` | `appendRound` | U5 `PUT .../transcript/rounds/:round` | `transcript_rounds` | `UNIQUE(run_id, round)`；body 带 `dedupKey`，portal 命中冲突 → `200 {inserted:false}`（对齐上游 dedupKey 语义：`src/store/file.js:51-56`/`167`） |
 | `load(runId)` | `load` | U6 `GET .../transcript` | 读 `transcript_rounds` 按 round 升序 | 只读 |
 | `recall(runId, from?, to?, pattern?)` | `recall` | U7 `GET .../transcript/recall` | 读 `transcript_rounds`（含 `folded_payload`，对齐上游「折叠原文同属档案」`src/store/file.js:252-261`） | 只读 |
-| `markRunState(runId, state)` | `markRunState` | U2 `PUT .../state`（非终态：`{state}`） | `runs.status`（running 等） | 覆盖写 |
+| `markRunState(runId, state)` | `markRunState` | `running` → U2 `PUT .../state`；**引擎终态标记**（succeeded / unverified_error / guard_error / failed / aborted，0.9.0 `termination.js finish()`）→ `PUT .../runstate {state}` | `running` 落 `runs.status`；终态标记合并进 `runs.run_state jsonb` | 覆盖写 / 合并写（见下） |
 | `saveCheckpoint(runId, cp)` | `saveCheckpoint` | U8 `PUT .../checkpoint` | `run_checkpoints` | **单行覆盖写 + revision CAS**：每 run 单行（`run_id` 主键），`INSERT ... ON CONFLICT (run_id) DO UPDATE SET snapshot=EXCLUDED.snapshot, revision=EXCLUDED.revision, updated_at=now() WHERE run_checkpoints.revision < EXCLUDED.revision`——旧 revision 被拒（§9.5）；`seq` 仅调用方本地元数据（其值可等于 revision），**不落库** |
 | `loadLatestCheckpoint(runId)` | `loadLatestCheckpoint` | U9 `GET .../checkpoint/latest` | 直接取单行（`SELECT ... WHERE run_id = $1`）；返回 `{snapshot, revision, updated_at}`；无 → `204` → adapter 返回 `undefined`（revision 供 resume 续计，§9.5） | 只读 |
+| `saveRunState(runId, runState)` | `saveRunState` | `PUT .../runstate {run_state}`（0.6.0 新增，issue #43） | `runs.run_state` jsonb 合并写：`COALESCE(run_state,'{}') \|\| patch`（并并入 `runId`，reference 语义 = 上游 file store） | 合并写 |
+| `loadRunState(runId)` | `loadRunState` | `GET .../runstate`（0.6.0 新增） | 读 `runs.run_state`；无 → `204` → adapter 返回 `undefined` | 只读；终态 run 仍可读（同 U9 口径） |
+
+> **markRunState 双路语义（issue #43 拍板）**：`'running'` 仍走 U2（`runs.status`，终态由 worker 经 run_finished → U2 上报，§6.3-9）；引擎终态标记只合并 `run_state.state`，**不触碰 `runs.status`**（宿主终态唯一权威仍是 U2，不变式 3）。
+> **recall（0.8.0 退役）**：引擎不再调用 `store.recall`，worker 也不再注册 recall 工具（档案取回归 note 工作流：note_list → note_read，NotesStore 落盘在 run worktree 内）；U7 端点与 adapter 方法保留（既有断言面与只读兼容，非孤儿）。
 
 > `appendCheckpoint`：上游 file 实现即 `saveCheckpoint` 别名（`src/store/file.js:287-289`）；引擎选择顺序是先 `saveCheckpoint` 后 `appendCheckpoint`（`src/loop.js:1193-1199`），adapter 实现 `saveCheckpoint` 即可覆盖。
 
@@ -734,7 +739,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | 11 | internal 端点前缀 `/api/internal`、claim 载荷形状、`X-Claim-Token` 头 | 采用（§4） |
 | 12 | 背压上限（worker 10000 条/4MB；agentd 20000 条/8MB；spool 机制） | 采用（§7.4） |
 | 13 | store adapter 重试参数（3 次，1s/2s/5s） | 采用（§9.2） |
-| 14 | `reflection` / `wrapup` 的显式配置值（对话型宿主参照 host-upgrade-guide §1 评估 `wrapup:false`） | 待定（§6.3-8） |
+| 14 | `reflection` / `wrapup` 的显式配置值（对话型宿主参照 host-upgrade-guide §1 评估 `wrapup:false`） | **已拍板 2026-09-22（issue #43）**：`reflection: { enabled: true, roundJudge: true }`（judge 扩轮开）、`wrapup: false` |
 | 15 | 审批轮询兜底间隔 5s | 采用（§10.1） |
 | 16 | 崩溃恢复方案：方案 A（新 run + `resume_from_run_id`，不自动 resume）vs 方案 B（同 run_id re-claim） | 已定 B（§6.5；A5 口径：attempt 失败不写 `runs.status='failed'`） |
 | 17 | `client_event_id` 含 attempt 前缀（`run_id:attempt:计数`） | 采用（§7.3） |
