@@ -109,6 +109,14 @@
       return body;
     }
 
+    function afterLoginRoute(user) {
+      if (user && user.role === 'admin' && !user.fde_name) {
+        location.replace('/admin');
+        return;
+      }
+      location.reload();
+    }
+
     async function boot() {
       try {
         const me = await api('/api/me');
@@ -156,7 +164,7 @@
           const body = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(body?.error?.message || `请求失败（HTTP ${r.status}）`);
           const data = body;
-          if (data.user) { location.reload(); return; } // 未注册 TOTP：密码直通会话
+          if (data.user) { afterLoginRoute(data.user); return; } // 未注册 TOTP：密码直通会话
           S.pendingToken = data.pending_token;
           $('loginForm').style.display = 'none';
           $('totpForm').style.display = '';
@@ -174,7 +182,7 @@
           });
           const body = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(body?.error?.message || `请求失败（HTTP ${r.status}）`);
-          location.reload();
+          afterLoginRoute(body.user);
         } catch (err) { $('loginErr').textContent = err.message; }
       };
     }
@@ -208,19 +216,29 @@
       // 验收 major-2：onchange 无条件绑定（在空项目 early return 之前，否则从零项目开始时切换项目永不加载会话）
       sel.onchange = () => { S.projectId = sel.value; loadSessions(); };
       if (S.projects.length === 0) {
-        $('sessList').innerHTML = '<p class="muted">先创建项目</p>';
+        const isPlatformAdmin = S.user.role === 'admin' && !S.user.fde_name;
+        const emptyText = isPlatformAdmin ? '平台管理员：请到管理台创建 FDE 用户与分配资源' : '先创建项目';
+        const adminLink = isPlatformAdmin ? '<br><a href="/admin">进入管理台</a>' : '';
+        $('sessList').innerHTML = `<p class="muted">${esc(emptyText)}${adminLink}</p>`;
+        $('stream').innerHTML = isPlatformAdmin
+          ? `<p class="muted">${esc(emptyText)}${adminLink}</p>`
+          : '<p class="muted">选择或新建会话</p>';
         return;
       }
       S.projectId = S.projects[0].id;
       await loadSessions();
     }
 
-    // issue #42：无项目时禁用输入框/发送/「＋新会话」，placeholder 引导先建项目。
+    // issue #42：无项目时禁用输入框/发送/「＋新会话」，placeholder 引导建项目或进入管理台。
     function updateWorkspaceAvailability() {
       const hasProject = S.projects.length > 0;
+      const isPlatformAdmin = S.user.role === 'admin' && !S.user.fde_name;
       S.noProject = !hasProject;
       $('input').disabled = !hasProject;
-      $('input').placeholder = hasProject ? '输入任务，Enter 发送（Shift+Enter 换行）' : '先创建项目';
+      $('input').placeholder = isPlatformAdmin
+        ? '平台管理员：请到管理台创建 FDE 用户与分配资源'
+        : hasProject ? '输入任务，Enter 发送（Shift+Enter 换行）' : '先创建项目';
+      $('newProj').disabled = isPlatformAdmin;
       $('newSess').disabled = !hasProject;
       if (!S.activeRunId) $('sendBtn').disabled = !hasProject;
     }
