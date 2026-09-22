@@ -905,7 +905,7 @@ async function handleLoginStep1(req, res, ctx) {
       userAgent: req.headers['user-agent'] ?? null,
       ttlSeconds: config.sessionTtlSeconds,
     });
-    return sendJson(res, 200, { user: result.user }, {
+    return sendJson(res, 200, { status: 'authenticated', user: result.user }, {
       'Set-Cookie': sessionCookieHeader(config.cookie, session.token),
     });
   }

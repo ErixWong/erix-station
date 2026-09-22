@@ -21,6 +21,15 @@ export class FakePool {
       return { rows: u ? [u] : [] };
     }
 
+    // hasTotpEnrollment：NULL 与空字符串均表示未注册。
+    if (sql.includes("SELECT 1 FROM users WHERE id") && sql.includes("NULLIF(totp_secret, '') IS NOT NULL")) {
+      const userId = params[0];
+      const u = this.users.find(
+        (x) => x.id === userId && x.status === 'active' && x.totp_secret != null && x.totp_secret !== '',
+      );
+      return { rows: u ? [{ '?column?': 1 }] : [] };
+    }
+
     // verifyTotpForUser：按 id 查活跃用户（含 totp_secret/last_totp_step）
     if (sql.includes('FROM users WHERE id') && sql.includes('totp_secret')) {
       const userId = params[0];
