@@ -42,11 +42,12 @@ function makeEl() {
     appendChild() {}, remove() {},
     querySelector() { return makeEl(); }, querySelectorAll() { return []; },
     addEventListener() {},
+    focus() {}, reset() {},
   };
 }
 
 /** 载入 index.html 的内联脚本（桩化 document/EventSource/fetch），导出测试需要的内部绑定。 */
-function loadClient() {
+function loadClient({ fetch: fetchImpl } = {}) {
   const html = fs.readFileSync(INDEX_HTML, 'utf8');
   const m = html.match(/<script>([\s\S]*?)<\/script>/);
   assert.ok(m, 'index.html 应含单个内联脚本');
@@ -59,14 +60,14 @@ function loadClient() {
   const sandbox = {
     document,
     EventSource: FakeEventSource,
-    fetch: async () => { throw new Error('fetch 在单测中禁用'); }, // boot() 走 renderLogin 分支
+    fetch: fetchImpl ?? (async () => { throw new Error('fetch 在单测中禁用'); }), // boot() 走 renderLogin 分支
     location: { reload() {} },
     alert() {}, prompt() { return null; },
     console, setTimeout, clearTimeout, setInterval, clearInterval,
   };
   const ctx = vm.createContext(sandbox);
   // 顶层 const/let 不进 globalThis，用同脚本片段把内部绑定导出给测试驱动
-  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents };`;
+  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents, switchProject, openSession, initWorkspace };`;
   new vm.Script(code).runInContext(ctx);
   FakeEventSource.instances = [];
   return { client: ctx.__client, elements: els, created };
@@ -199,4 +200,101 @@ test('前端：0.9.0 新事件类型白名单 + 载荷对齐（compaction/final_
   assert.ok(seps.some((t) => t.includes('不扩轮')), `judge decline_extend：${joined}`);
   assert.ok(seps.some((t) => t.includes('blocked') && t.includes('方向偏离')), `judge 拦截：${joined}`);
   assert.equal(S.lastSeq, 9, '水位线照常推进');
+});
+
+test('前端：切换项目清理旧会话、EventSource 和聊天区', async () => {
+  const { client, elements } = loadClient();
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p2', name: 'project-2' }];
+  S.sessionId = 's1';
+  S.es = new FakeEventSource('/api/sessions/s1/events');
+  elements.set('stream', makeEl());
+  elements.get('stream').innerHTML = '<div>旧项目消息</div>';
+
+  await client.switchProject('p2', { loadSessions: false });
+
+  assert.equal(S.projectId, 'p2');
+  assert.equal(S.sessionId, null);
+  assert.equal(S.es, null);
+  assert.equal(S.activeRunId, null);
+  assert.equal(S.lastSeq, 0);
+  assert.equal(S.esSessionId, null);
+  assert.equal(S.deltaBuf, null);
+  assert.deepEqual(Object.keys(S.toolCards), []);
+  assert.equal(S.renderedIds, null);
+  assert.equal(S.sessions.length, 0);
+  assert.equal(FakeEventSource.instances[0].closed, true);
+  assert.equal(elements.get('stream').innerHTML, '<p class="muted">选择或新建会话</p>');
+});
+
+test('前端：openSession 迟到响应被项目切换作废且不建立旧会话连接', async () => {
+  let resolveSession;
+  const sessionResponse = new Promise((resolve) => { resolveSession = resolve; });
+  const fetchImpl = async (url) => {
+    if (url === '/api/me') throw new Error('未登录');
+    if (url === '/api/sessions/s1') return sessionResponse;
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p2', name: 'project-2' }];
+
+  const pending = client.openSession('s1');
+  await Promise.resolve();
+  await client.switchProject('p2', { loadSessions: false });
+  resolveSession({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        last_seq: 3,
+        messages: [{ id: 'm1', role: 'assistant', content: '旧项目', run_id: 'run-1' }],
+        session: { active_run_id: 'run-1' },
+      };
+    },
+  });
+  await pending;
+
+  assert.equal(S.sessionId, null);
+  assert.equal(FakeEventSource.instances.length, 0);
+});
+
+test('前端：创建项目路径与 onchange 共用项目切换清理', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/me') throw new Error('未登录');
+    if (url === '/api/projects' && !opts.method) {
+      return { ok: true, status: 200, async json() { return { items: [{ id: 'p1', name: 'one' }] }; } };
+    }
+    if (url === '/api/projects' && opts.method === 'POST') {
+      return { ok: true, status: 200, async json() { return { project: { id: 'p2', name: 'two' } }; } };
+    }
+    if (url.startsWith('/api/sessions?project_id=')) {
+      calls.push(url);
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  await client.initWorkspace();
+
+  S.sessionId = 's1';
+  const oldEs = new FakeEventSource('/api/sessions/s1/events');
+  S.es = oldEs;
+  elements.get('projectSel').value = 'p1';
+  await elements.get('projectSel').onchange();
+  assert.equal(S.sessionId, null);
+  assert.equal(oldEs.closed, true);
+
+  elements.get('newProjName').value = 'two';
+  await elements.get('newProjForm').onsubmit({ preventDefault() {} });
+
+  assert.equal(S.projectId, 'p2');
+  assert.equal(S.sessionId, null);
+  assert.equal(oldEs.closed, true);
+  assert.deepEqual(calls, ['/api/sessions?project_id=p1', '/api/sessions?project_id=p1', '/api/sessions?project_id=p2']);
 });
