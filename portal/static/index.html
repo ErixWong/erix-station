@@ -19,6 +19,9 @@
     aside { width: 15rem; border-right: 1px solid var(--bd); overflow-y: auto; padding: .5rem; }
     aside .proj { margin-bottom: .8rem; }
     aside select, aside input, aside button { width: 100%; padding: .4rem; margin-top: .3rem; }
+    #newProjForm { margin-top: .4rem; }
+    #newProjForm .actions { display: flex; gap: .35rem; }
+    #newProjForm .actions button { flex: 1; }
     aside .sess { border: 1px solid var(--bd); border-radius: 6px; padding: .45rem; margin-top: .4rem; cursor: pointer; font-size: .88rem; }
     aside .sess.active { border-color: var(--brand); background: #f2fff9; }
     aside .sess .meta { color: var(--muted); font-size: .75rem; }
@@ -76,7 +79,19 @@
       <div class="proj" id="projBox">
         <label class="muted">项目</label>
         <select id="projectSel"></select>
+        <div id="projectMeta" class="muted"></div>
         <button id="newProj">＋ 新项目</button>
+        <form id="newProjForm" style="display:none" novalidate>
+          <label class="muted" for="newProjName">项目名（小写字母/数字/连字符）</label>
+          <input id="newProjName" name="name" required maxlength="63" placeholder="例如 my-project">
+          <label class="muted" for="newProjRepo">关联仓库（可选）</label>
+          <input id="newProjRepo" name="repo_url" placeholder="https://git.example/org/project.git">
+          <div class="actions">
+            <button type="submit">创建</button>
+            <button type="button" id="newProjCancel">取消</button>
+          </div>
+          <p id="newProjErr" class="syserr" role="alert"></p>
+        </form>
       </div>
       <button id="newSess">＋ 新会话</button>
       <div id="sessList"></div>
@@ -101,6 +116,7 @@
                 projectReqSeq: 0 }; // 评审 LOW-3：项目切换请求序号（迟到响应丢弃）
     // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）
     const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
+    const PROJECT_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
     async function api(path, opts = {}) {
       const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -191,30 +207,56 @@
       $('composer').style.display = '';
       $('projBox').style.display = '';
       $('newSess').style.display = '';
-      $('newProj').onclick = async () => {
-        const name = prompt('项目名（小写字母/数字/连字符）：');
-        if (!name) return;
-        const repo = prompt('Git 仓库地址：', 'https://git.example/alice/' + name + '.git');
-        if (!repo) return;
+      const projectForm = $('newProjForm');
+      const projectNameInput = $('newProjName');
+      const projectRepoInput = $('newProjRepo');
+      const projectError = $('newProjErr');
+      $('newProj').onclick = () => {
+        projectForm.style.display = '';
+        projectError.textContent = '';
+        projectNameInput.focus();
+      };
+      $('newProjCancel').onclick = () => {
+        projectForm.reset();
+        projectForm.style.display = 'none';
+        projectError.textContent = '';
+      };
+      projectForm.onsubmit = async (e) => {
+        e.preventDefault();
+        const name = projectNameInput.value.trim();
+        const repo = projectRepoInput.value.trim();
+        projectError.textContent = '';
+        if (!PROJECT_NAME_RE.test(name)) {
+          projectError.textContent = '项目名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）';
+          projectNameInput.focus();
+          return;
+        }
+        const payload = { name, template: 'node' };
+        if (repo) payload.repo_url = repo;
         try {
-          const { project } = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, repo_url: repo, template: 'node' }) });
+          const { project } = await api('/api/projects', { method: 'POST', body: JSON.stringify(payload) });
           S.projects.push(project);
           const sel = $('projectSel');
           sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
           sel.value = project.id;
           S.projectId = project.id;
+          updateProjectMeta();
           updateWorkspaceAvailability(); // 验收 major-1：首个项目创建后须解除输入区/发送/「＋新会话」禁用
+          projectForm.reset();
+          projectForm.style.display = 'none';
           await loadSessions();
-        } catch (e) { alert('建项目失败：' + e.message); }
+        } catch (e) { projectError.textContent = e.message; }
       };
 
       const pj = await api('/api/projects');
       S.projects = pj.items ?? [];
       const sel = $('projectSel');
       sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+      S.projectId = S.projects[0]?.id ?? null;
+      updateProjectMeta();
       updateWorkspaceAvailability(); // issue #42：无项目 → 禁用输入区/发送/「＋新会话」
       // 验收 major-2：onchange 无条件绑定（在空项目 early return 之前，否则从零项目开始时切换项目永不加载会话）
-      sel.onchange = () => { S.projectId = sel.value; loadSessions(); };
+      sel.onchange = () => { S.projectId = sel.value; updateProjectMeta(); loadSessions(); };
       if (S.projects.length === 0) {
         const isPlatformAdmin = S.user.role === 'admin' && !S.user.fde_name;
         const emptyText = isPlatformAdmin ? '平台管理员：请到管理台创建 FDE 用户与分配资源' : '先创建项目';
@@ -225,8 +267,14 @@
           : '<p class="muted">选择或新建会话</p>';
         return;
       }
-      S.projectId = S.projects[0].id;
       await loadSessions();
+    }
+
+    function updateProjectMeta() {
+      const project = S.projects.find((p) => String(p.id) === String(S.projectId));
+      $('projectMeta').textContent = project
+        ? `${project.root_path || `~/projects/${project.name}`}${project.repo_url ? ` · 仓库：${project.repo_url}` : ''}`
+        : '';
     }
 
     // issue #42：无项目时禁用输入框/发送/「＋新会话」，placeholder 引导建项目或进入管理台。

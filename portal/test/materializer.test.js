@@ -12,6 +12,7 @@ import {
   renderManifest,
   buildFilePlan,
   createMaterializer,
+  runMaterializerOnce,
   hostPathFor,
   CONTAINER_HOME,
 } from '../src/materializer.js';
@@ -87,6 +88,86 @@ test('buildFilePlan：home 骨架 + 每项目平台文件，路径映射正确',
   assert.ok(hostPaths.includes(path.join('/srv/erix/users', 'alice', 'projects', 'proj1', '.erix', 'ports.json')));
   const portsFile = files.find((f) => f.containerPath.endsWith('.erix/ports.json'));
   assert.equal(JSON.parse(portsFile.content).generation, 1);
+});
+
+test('renderProjectAgentsMd：有 repoUrl 时写入真实地址并移除占位符', () => {
+  const files = buildFilePlan({
+    fdeName: 'alice',
+    baseDomain: 'localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
+    root: '/srv/erix/users',
+    generation: 1,
+    projects: [{ id: 'p1', name: 'proj1', repo_url: 'https://git.example/alice/proj1.git' }],
+    allocationsByProject: new Map(),
+  });
+  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
+  assert.match(agents, /https:\/\/git\.example\/alice\/proj1\.git/);
+  assert.doesNotMatch(agents, /<repo_url>/);
+});
+
+test('renderProjectAgentsMd：无 repoUrl 时给出未关联仓库指引且移除占位符', () => {
+  const files = buildFilePlan({
+    fdeName: 'alice',
+    baseDomain: 'localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
+    root: '/srv/erix/users',
+    generation: 1,
+    projects: [{ id: 'p1', name: 'proj1', repo_url: null }],
+    allocationsByProject: new Map(),
+  });
+  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
+  assert.match(agents, /未关联仓库/);
+  assert.doesNotMatch(agents, /<repo_url>/);
+});
+
+test('runMaterializerOnce：项目查询带出 repo_url 并落盘真实仓库地址', async () => {
+  const root = tmpdir();
+  const repoUrl = 'https://git.example/alice/proj1.git';
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM users')) {
+        return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      }
+      if (sql.includes('FROM projects')) {
+        const project = { id: 'p1', name: 'proj1' };
+        // 模拟 pg 的投影：只有查询显式选择 repo_url 时，行里才有该字段。
+        if (sql.includes('repo_url')) project.repo_url = repoUrl;
+        return { rows: [project] };
+      }
+      if (sql.includes('FROM port_allocations')) return { rows: [] };
+      if (sql.includes('UPDATE materialize_outbox SET state =')) return { rows: [] };
+      throw new Error(`unexpected pool query: ${sql}`);
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+          if (sql.includes('RETURNING o.id')) {
+            return { rows: [{ id: 'outbox-1', fde_id: 'u1', revision: 1, op: 'update' }] };
+          }
+          if (sql.startsWith('UPDATE materialize_outbox')) return { rows: [] };
+          throw new Error(`unexpected client query: ${sql}`);
+        },
+        release() {},
+      };
+    },
+  };
+
+  try {
+    const result = await runMaterializerOnce(pool, {
+      userSpaceRoot: root,
+      llmPublicBaseUrl: 'http://llm.localhost:8090',
+      baseDomain: 'localhost',
+    });
+    assert.deepEqual(result, { processed: 1, claimed: 1 });
+
+    const agentsPath = path.join(root, 'alice', 'projects', 'proj1', '.erix', 'AGENTS.md');
+    const agents = fs.readFileSync(agentsPath, 'utf8');
+    assert.match(agents, new RegExp(repoUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(agents, /<repo_url>/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('fsutil.atomicWriteFile：写入完整内容，无半截/空文件', () => {
