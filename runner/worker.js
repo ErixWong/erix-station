@@ -187,28 +187,59 @@ async function startRun(msg) {
   });
 
   // 3) tools（§6.3-3：jail + 自带 file 工具（0.6.0 起库不提供，牢笼由本项目提供，不变式 1）
-  //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；NotesStore 落盘
-  //    在 run worktree 内）；approvals 钩子 P2 留空）。
+  //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；issue #46 起走
+  //    0.10.0 装配工厂，notesDir 为 agentd 下行的 run 数据目录，logical-run 作用域跨 attempt 保留）；
+  //    approvals 钩子 P2 留空）。
   const jail = createJail({ root: cwd, writable: [cwd] });
   const fileTools = createFileTools(jail);
-  let noteTools = { schemas: [], executors: {} };
+  // issue #46（选项 A，logical-run 作用域）：notesDir 由 agentd 下行（run 数据目录
+  // <home>/runs/<runId>/notes，跨 attempt 保留，与 worktree 生命周期解耦——resume 不再丢 notes）。
+  // 旧 agentd 无 notes_dir 字段 → 回退 worktree 内 .notes（旧语义，resume 仍会丢，warn 明示）。
+  let noteTools = { schemas: [], executeTool: null, lifecycle: null };
   try {
-    // notes 目录放 run worktree 内（worktree 随 run 清理回收，notes 为 run 作用域，D8）。
-    noteTools = await createNotesTools({ runId, notesDir: path.join(cwd, '.notes') });
+    const notesDir = typeof msg.notes_dir === 'string' && msg.notes_dir.length > 0
+      ? msg.notes_dir
+      : path.join(cwd, '.notes');
+    if (typeof msg.notes_dir !== 'string' || msg.notes_dir.length === 0) {
+      sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: 'notes_dir missing from RUN_START (old agentd?), fallback to worktree-local .notes; notes will NOT survive resume',
+      });
+    }
+    noteTools = await createNotesTools({ runId, notesDir });
   } catch (err) {
     sendIpc(process, {
       type: MSG.LOG, run_id: runId, level: 'warn',
       msg: `notes tools unavailable, run continues without note workflow: ${String(err?.message ?? err)}`,
     });
   }
+  // registry 只装 file 工具；note_* 走工厂结构化 executeTool（工厂内部强制宿主作用域）。
   const registry = createToolRegistry({
-    executors: { ...fileTools.executors, ...noteTools.executors },
-    schemas: [...fileTools.schemas, ...noteTools.schemas],
+    executors: fileTools.executors,
+    schemas: fileTools.schemas,
   });
   const tools = [...fileTools.schemas, ...noteTools.schemas];
-  const executeTool = async (options) => registry.executeTool(options.name, options.input, options.context);
+  const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
+  const executeTool = async (options) => {
+    if (noteTools.executeTool && noteToolNames.has(options.name)) {
+      return noteTools.executeTool(options);
+    }
+    return registry.executeTool(options.name, options.input, options.context);
+  };
 
   try {
+    // issue #46：notes 生命周期——onRunStart（janitor）在 runToolLoop 前（上游 bin/cli.js 模式）；
+    // 失败只告警不中断 run（档案工具仍在，仅清扫未跑）。
+    if (noteTools.lifecycle) {
+      try {
+        await noteTools.lifecycle.onRunStart();
+      } catch (err) {
+        sendIpc(process, {
+          type: MSG.LOG, run_id: runId, level: 'warn',
+          msg: `notes onRunStart (janitor) failed, run continues: ${String(err?.message ?? err)}`,
+        });
+      }
+    }
     const result = await runToolLoop({
       provider,
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
@@ -282,6 +313,24 @@ async function startRun(msg) {
       },
     });
   } finally {
+    // issue #46：onRunComplete（completeRun→janitor）在 finally 收尾；errors[] 只记日志，
+    // 不覆盖 run 主错误（上游 bin/cli.js 同款 completionErrors 模式）。
+    if (noteTools.lifecycle) {
+      try {
+        const completion = await noteTools.lifecycle.onRunComplete();
+        for (const failure of completion?.errors ?? []) {
+          sendIpc(process, {
+            type: MSG.LOG, run_id: runId, level: 'warn',
+            msg: `notes completion error (${failure.operation}): ${String(failure.error?.message ?? failure.error)}`,
+          });
+        }
+      } catch (err) {
+        sendIpc(process, {
+          type: MSG.LOG, run_id: runId, level: 'warn',
+          msg: `notes onRunComplete failed: ${String(err?.message ?? err)}`,
+        });
+      }
+    }
     // 给 agentd 足够时间接收 run_finished 后再退出（IPC 有序，send 即已入队，短延迟防 race）。
     setTimeout(() => process.exit(0), 200);
   }
