@@ -67,7 +67,7 @@ function loadClient({ fetch: fetchImpl } = {}) {
   };
   const ctx = vm.createContext(sandbox);
   // 顶层 const/let 不进 globalThis，用同脚本片段把内部绑定导出给测试驱动
-  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents, switchProject, openSession, initWorkspace };`;
+  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents, switchProject, openSession, refreshSession, initWorkspace };`;
   new vm.Script(code).runInContext(ctx);
   FakeEventSource.instances = [];
   return { client: ctx.__client, elements: els, created };
@@ -259,6 +259,44 @@ test('前端：openSession 迟到响应被项目切换作废且不建立旧会�
 
   assert.equal(S.sessionId, null);
   assert.equal(FakeEventSource.instances.length, 0);
+});
+
+test('前端：refreshSession 迟到响应在同一会话重开后被丢弃', async () => {
+  let resolveSession;
+  const sessionResponse = new Promise((resolve) => { resolveSession = resolve; });
+  const fetchImpl = async (url) => {
+    if (url === '/api/sessions/s1') return sessionResponse;
+    if (url === '/api/sessions?project_id=p1') {
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, created } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.sessionId = 's1';
+  S.projectId = 'p1';
+  S.renderedIds = null;
+  elements.set('stream', makeEl());
+  elements.get('stream').innerHTML = '';
+
+  const pendingRefresh = client.refreshSession('run-1');
+  await Promise.resolve();
+  const pendingOpen = client.openSession('s1');
+  resolveSession({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        last_seq: 1,
+        messages: [{ id: 'm-assistant', role: 'assistant', content: '迟到终稿', run_id: 'run-1' }],
+        session: { active_run_id: null },
+      };
+    },
+  });
+  await Promise.all([pendingRefresh, pendingOpen]);
+
+  const rendered = created.filter((el) => el.textContent === '迟到终稿');
+  assert.equal(rendered.length, 1);
 });
 
 test('前端：同一会话重开不吞 send 失败回填', async () => {
