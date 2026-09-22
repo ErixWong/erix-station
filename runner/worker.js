@@ -14,19 +14,18 @@
 // 早有 umask 0002，本处为防御性重设，评审 F8）。
 process.umask(0o002);
 
+import path from 'node:path';
 import {
   createJsonFileModelConfigProvider,
   createOpenAIProvider,
   runToolLoop,
 } from 'erix-agent';
-import {
-  createJail,
-  createFileTools,
-  createToolRegistry,
-  createRecallTool,
-} from 'erix-agent/tools';
+import { createToolRegistry } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc } from './lib/ipc.js';
 import { resolveRunModel } from './lib/llm-models.js';
+import { createFileTools, createJail } from './lib/file-tools.js';
+import { createNotesTools } from './lib/notes-tools.js';
+import { makeStore } from './lib/store.js';
 
 const nextReqId = createReqIdGenerator();
 let runStart = null;
@@ -82,77 +81,6 @@ function ipcRequest(type, payload) {
       reject(Object.assign(new Error('ipc channel closed'), { code: 'ipc_closed', retryable: true }));
     }
   });
-}
-
-// ---------------------------------------------------------------------------
-// store adapter（IPC 版，§9；checkpoint/round 带重试包装 §9.2）
-// ---------------------------------------------------------------------------
-const RETRY_DELAYS = [1000, 2000, 5000];
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function makeStore(runId) {
-  let revision = 0;
-
-  async function requestWithRetry(method, args) {
-    let lastErr;
-    for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
-      try {
-        return await ipcRequest(MSG.STORE_REQUEST, { method, args });
-      } catch (err) {
-        lastErr = err;
-        const retryable = err?.retryable === true && err?.code !== 'checkpoint_stale';
-        if (!retryable || attempt >= RETRY_DELAYS.length) throw err;
-        const delay = RETRY_DELAYS[attempt] * (0.8 + Math.random() * 0.4);
-        await sleep(delay);
-      }
-    }
-    throw lastErr;
-  }
-
-  return {
-    async appendRound(r, record) {
-      await requestWithRetry('appendRound', { runId: r, record });
-    },
-    async load(r) {
-      const res = await requestWithRetry('load', { runId: r });
-      return Array.isArray(res?.records) ? res.records : [];
-    },
-    async recall(r, fromRound, toRound, pattern) {
-      const res = await requestWithRetry('recall', { runId: r, fromRound, toRound, pattern });
-      return typeof res?.text === 'string' ? res.text : '';
-    },
-    async markRunState(r, state) {
-      // erix-agent 在 start 调 'running'；finish/fail 的 'succeeded'/'aborted'/'failed' 是引擎内部标记，
-      // 终态由 worker 在 runToolLoop resolve/reject 后经 run_finished → agentd U2 上报（§6.3-9）。
-      if (state !== 'running') return;
-      await requestWithRetry('markRunState', { runId: r, state });
-    },
-    async saveCheckpoint(r, checkpoint) {
-      revision += 1;
-      try {
-        await requestWithRetry('saveCheckpoint', { runId: r, revision, snapshot: checkpoint });
-      } catch (err) {
-        // §9.5：revision <= 当前 → checkpoint_stale 视为「本快照已过期」，不重试、不抛（继续以最新为准）。
-        if (err?.code === 'checkpoint_stale') return;
-        throw err;
-      }
-    },
-    async appendCheckpoint(r, checkpoint) {
-      await this.saveCheckpoint(r, checkpoint);
-    },
-    async loadLatestCheckpoint(r) {
-      const res = await requestWithRetry('loadLatestCheckpoint', { runId: r });
-      if (!res || !res.checkpoint) {
-        revision = 0;
-        return undefined;
-      }
-      revision = Number(res.checkpoint.revision ?? 0);
-      return res.checkpoint.snapshot;
-    },
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +168,10 @@ async function startRun(msg) {
   const { task, cwd, resume } = msg;
   const modelConfigPath = msg.config?.model_config_path || '/home/erix/.erix/config.json';
 
-  const store = makeStore(runId);
+  // store adapter（§9；IPC transport：store_request → agentd 转发；0.9.0 起引擎 fail-closed 校验 8 方法）。
+  const store = makeStore(runId, {
+    request: (method, args) => ipcRequest(MSG.STORE_REQUEST, { method, args }),
+  });
 
   // 1) provider（§6.3-1：config.json 占位 key + endpoint；真实 key 由 Traefik 注入）。
   const modelProvider = createJsonFileModelConfigProvider({ path: modelConfigPath });
@@ -255,15 +186,26 @@ async function startRun(msg) {
     model: modelName,
   });
 
-  // 3) tools（§6.3-3：jail + file-tools + registry + recall；approvals 钩子 P2 留空）。
+  // 3) tools（§6.3-3：jail + 自带 file 工具（0.6.0 起库不提供，牢笼由本项目提供，不变式 1）
+  //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；NotesStore 落盘
+  //    在 run worktree 内）；approvals 钩子 P2 留空）。
   const jail = createJail({ root: cwd, writable: [cwd] });
   const fileTools = createFileTools(jail);
-  const recallTool = createRecallTool({ store, runId });
+  let noteTools = { schemas: [], executors: {} };
+  try {
+    // notes 目录放 run worktree 内（worktree 随 run 清理回收，notes 为 run 作用域，D8）。
+    noteTools = await createNotesTools({ runId, notesDir: path.join(cwd, '.notes') });
+  } catch (err) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `notes tools unavailable, run continues without note workflow: ${String(err?.message ?? err)}`,
+    });
+  }
   const registry = createToolRegistry({
-    executors: { ...fileTools.executors, recall: recallTool.execute },
-    schemas: [...fileTools.schemas, recallTool.schema],
+    executors: { ...fileTools.executors, ...noteTools.executors },
+    schemas: [...fileTools.schemas, ...noteTools.schemas],
   });
-  const tools = [...fileTools.schemas, recallTool.schema];
+  const tools = [...fileTools.schemas, ...noteTools.schemas];
   const executeTool = async (options) => registry.executeTool(options.name, options.input, options.context);
 
   try {
@@ -303,8 +245,11 @@ async function startRun(msg) {
       resume: resume === true,
       maxRounds: 8,
       stream: true,
-      // 8) reflection / wrapup 显式传（§6.3-8）；P1 mock 关 judge、对话型宿主关 wrapup。
-      reflection: false,
+      // 8) reflection / wrapup 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
+      // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
+      // nearLimit 时可 extend 扩轮；judgeIntercept 默认开（工具透明审计）。judge 输出非法
+      // JSON 时 fail-closed 不扩轮（roundJudgeFailures 限 3 后本轮禁用）。wrapup 保持关（对话型宿主）。
+      reflection: { enabled: true, roundJudge: true },
       wrapup: false,
       // 7) signal
       signal: abortController.signal,

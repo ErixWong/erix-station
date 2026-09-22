@@ -1253,6 +1253,25 @@ async function handleInternal(req, res, ctx, url) {
       }
       return sendJson(res, 200, result);
     }
+    if (sub === '/runstate') {
+      // 0.9.0 起引擎 8 方法契约：saveRunState（PUT {run_state}）/ loadRunState（GET）。
+      if (req.method === 'PUT') {
+        requireJson(req);
+        const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
+        const result = await internal.saveRunState(ctx.pool, { container, user, runId, claimToken, body });
+        return sendJson(res, 200, result);
+      }
+      if (req.method === 'GET') {
+        const result = await internal.loadRunState(ctx.pool, { container, user, runId, claimToken });
+        if (result === null) {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        return sendJson(res, 200, result);
+      }
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    }
     if (sub === '/transcript') {
       if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       const limit = Number(url.searchParams.get('limit') || 10000);

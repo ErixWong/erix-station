@@ -100,8 +100,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `id` | **portal 生成的 UUID**，随任务下发给容器；禁止 cwd 派生（规格 §9.3-3：多用户会撞） |
 | `status` | 状态机见 §2.1 |
-| `termination` | run 结束时由 `runToolLoop` 返回值透传：**对象** `{reason, detail?}` jsonb，`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, reflection_stop, judge_done, continuation_exhausted, aborted, failed}`（依据：erix-agent v0.3.5 `src/loop.js:622`；portal.md §4.1/§5.3）；运行中为 `NULL` |
+| `termination` | run 结束时由 `runToolLoop` 返回值透传：**对象** `{reason, detail?}` jsonb，`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, reflection_stop, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed}`（0.9.0 起新增 `final_guard_unverified`：finalGuard 修订重试耗尽 fail-closed，host-consumer-contract.md「Final-answer verification」；依据：erix-agent v0.9.0；portal.md §4.1/§5.3）；运行中为 `NULL` |
 | `usage` / `cost` | `usage` 为 `{input_tokens, output_tokens}` jsonb（run_end 汇总）；`cost` ⚠️ 待决策者确认（Q1/Q4，P1 可空，见 §5） |
+| `run_state` | 引擎确定性 run state（0.9.0 八方法契约 `saveRunState`/`loadRunState`，issue #43；DDL：`deploy/migrations/0003-run-state.sql`，**baseline 已冻结故不写入 schema.sql**）；合并写（`COALESCE(run_state,'{}') || patch`），`markRunState` 终态标记只并 `state` 字段（`succeeded`/`unverified_error`/`guard_error`/`failed`/`aborted`）；`runs.status` 终态仍由 U2 收敛，本列是引擎侧断点/恢复事实（不变式 3） |
 | `error` | 失败时为 `{code, message, retryable}`；run 级错误码见 portal.md §6.4（`rate_limited` / `checkpoint_failed` / `container_exited` / …） |
 | `cancel_requested_at` | 停止标记：portal 写、runner 轮询（`AbortController` 跨不了进程，规格 §10.3） |
 

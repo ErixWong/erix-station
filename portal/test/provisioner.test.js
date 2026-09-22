@@ -925,3 +925,110 @@ test('F1（Round B 评审）：传错参数名（userId 键）→ 真实函数�
   const out = await syncFdeLlmBindingOnOnboard(pool, { userId: 'u1', fdeName: 'alice', restoreRevoked: true });
   assert.deepEqual(out, { restored: false, republished: false });
 });
+
+// F9：栈所有权标签（station.stack）——并行隔离栈的 reconcile 互删对方 FDE 是真回归根因
+// （wp3b-e2e 隔离栈实测：两套 portal 的 orphan 清扫互删）。本组断言过滤语义：
+//  labels['station.stack'] ?? 'default' === stackId 才清理；异栈/跨栈（无标签且非 default 栈）一律跳过。
+function makeOrphanPool() {
+  const state = { audit: [], orphanRemovedRows: [] };
+  return {
+    state,
+    async query(sql, params) {
+      if (sql.includes('orphan_removed')) {
+        state.audit.push({ action: sql.includes('network.') ? 'network.orphan_removed' : 'container.orphan_removed', target: params[0] });
+        return { rows: [] };
+      }
+      if (sql.includes('UPDATE containers c SET status')) {
+        state.orphanRemovedRows.push(params[0]);
+        return { rows: [] };
+      }
+      return { rows: [] }; // readFdeDesired / 锁内重读 → 空 = 全部判孤儿
+    },
+    async connect() {
+      return { query: async () => ({ rows: [] }), release() {} };
+    },
+    async end() {},
+  };
+}
+
+function makeStackFilterDocker({ containers, networks }) {
+  const removed = { containers: [], networks: [] };
+  return {
+    removed,
+    async listContainers() {
+      return { status: 200, data: containers };
+    },
+    async listNetworks() {
+      return { status: 200, data: networks };
+    },
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer(name) { removed.containers.push(name); return { status: 204 }; },
+    async removeNetwork(name) { removed.networks.push(name); return { status: 204 }; },
+  };
+}
+
+test('F9：create body 打 station.stack 所有权标签（缺省 default）', () => {
+  const base = {
+    fdeName: 'alice',
+    containerName: 'fde-alice',
+    image: 'img',
+    cmd: ['x'],
+    networkName: 'fde-alice',
+    ip: '10.0.0.2',
+    gateway: '10.0.0.1',
+    baseDomain: 'localhost',
+    llmHost: 'llm.localhost',
+    portalPublicBaseUrl: 'http://station.localhost:8090',
+    userSpaceRoot: '/tmp/erix-users',
+  };
+  const c = buildContainerConfig(base);
+  assert.equal(c.Labels['station.stack'], 'default', '容器标签缺省 default');
+  assert.equal(buildContainerConfig({ ...base, stackId: 'station-e2e-43' }).Labels['station.stack'], 'station-e2e-43');
+  assert.equal(
+    buildNetworkConfig({ name: 'fde-x', subnet: '10.0.0.0/24', gateway: '10.0.0.1', fdeName: 'x', stackId: 's1' }).Labels['station.stack'],
+    's1',
+    '网络标签跟随 stackId',
+  );
+});
+
+test('F9：default 栈 orphan 清扫——无标签=本栈资产（删）、异栈标签跳过、显式 default 删', async () => {
+  const pool = makeOrphanPool();
+  const docker = makeStackFilterDocker({
+    containers: [
+      { Names: ['/fde-old'], Id: 'c1' }, // 无标签 → 视为 default → 删
+      { Names: ['/fde-other'], Id: 'c2', Labels: { 'station.managed': 'true', 'fde.name': 'other', 'station.stack': 'other' } },
+      { Names: ['/fde-exp'], Id: 'c3', Labels: { 'station.stack': 'exp' } }, // 异栈标签 → 不删
+      { Names: ['/fde-explicit'], Id: 'c4', Labels: { 'station.stack': 'default' } }, // 显式 default → 删
+    ],
+    networks: [
+      { Name: 'fde-old-net', Id: 'n1', Labels: { 'station.managed': 'true' } }, // 有 managed、无 station.stack → default → 删
+      { Name: 'fde-other-net', Id: 'n2', Labels: { 'station.managed': 'true', 'station.stack': 'other' } }, // 异栈 → 不删
+    ],
+  });
+  const stats = await reconcileOnce(pool, {}, { docker }); // config 无 stackId → default
+  assert.deepEqual(docker.removed.containers.sort(), ['fde-explicit', 'fde-old'], '只删本栈（default）孤儿容器');
+  assert.deepEqual(docker.removed.networks, ['fde-old-net'], '只删本栈孤儿网络');
+  assert.equal(stats.orphansRemoved, 2);
+  assert.equal(stats.orphanNetworksRemoved, 1);
+  assert.ok(pool.state.audit.some((a) => a.action === 'container.orphan_removed' && a.target === 'fde-old'));
+});
+
+test('F9：隔离栈（stackId=station-e2e-43）只清本栈——无标签与 default 标签资产均跳过', async () => {
+  const pool = makeOrphanPool();
+  const docker = makeStackFilterDocker({
+    containers: [
+      { Names: ['/fde-alice43'], Id: 'c1', Labels: { 'station.managed': 'true', 'fde.name': 'alice43', 'station.stack': 'station-e2e-43' } },
+      { Names: ['/fde-eric'], Id: 'c2', Labels: { 'station.managed': 'true', 'fde.name': 'eric' } }, // 共享栈无标签资产 → 不删
+      { Names: ['/fde-reviewer'], Id: 'c3', Labels: { 'station.managed': 'true', 'fde.name': 'reviewer', 'station.stack': 'default' } }, // 显式 default → 不删
+    ],
+    networks: [
+      { Name: 'fde-alice43', Id: 'n1', Labels: { 'station.managed': 'true', 'station.stack': 'station-e2e-43' } },
+      { Name: 'fde-eric', Id: 'n2', Labels: { 'station.managed': 'true' } }, // 共享栈网络 → 不删
+    ],
+  });
+  const stats = await reconcileOnce(pool, { stackId: 'station-e2e-43' }, { docker });
+  assert.deepEqual(docker.removed.containers, ['fde-alice43'], '隔离栈只删本栈容器，不碰共享 fde-eric/fde-reviewer');
+  assert.deepEqual(docker.removed.networks, ['fde-alice43']);
+  assert.equal(stats.orphansRemoved, 1);
+  assert.equal(stats.orphanNetworksRemoved, 1);
+});

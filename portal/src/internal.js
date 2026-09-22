@@ -963,6 +963,67 @@ export async function getLatestCheckpoint(pool, { container, user, runId, claimT
 }
 
 // ---------------------------------------------------------------------------
+// runstate（0.9.0 起引擎 8 方法契约：saveRunState/loadRunState，落 runs.run_state jsonb）
+// ---------------------------------------------------------------------------
+
+/**
+ * 保存/合并引擎 run state（deterministic + semantic，0.6.0+ schema）。
+ * body 两种形态：① {run_state: <object>}——saveRunState 全量合并（reference 语义 = 上游 file store
+ * 的 previous + state 合并写）；② {state: <string>}——markRunState 引擎终态标记（succeeded /
+ * unverified_error / guard_error / failed / aborted），仅合并 state 字段，不触碰 runs.status
+ *（宿主终态唯一权威仍是 U2 setRunState，§6.3-9 / 不变式 3）。
+ */
+export async function saveRunState(pool, { container, user, runId, claimToken, body }) {
+  let patch;
+  if (body?.run_state !== undefined) {
+    if (!body.run_state || typeof body.run_state !== 'object' || Array.isArray(body.run_state)) {
+      throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' } });
+    }
+    patch = body.run_state;
+  } else if (typeof body?.state === 'string' && body.state) {
+    patch = { state: body.state };
+  } else {
+    throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' } });
+  }
+
+  // runId 并入 blob（reference 语义 = 上游 file store saveRunState 的 {...state, runId}）。
+  // F2（issue #43 评审）：单条条件 UPDATE、写本身原子——非终态 + 属主 + 有效租约/claim 全部进
+  // WHERE（口径同 setRunState markRunning 的 CAS），0 行才二次分类错误（fetchRun 补 404/403，
+  // 终态 → run_terminal，否则 lease_lost）。杜绝 check-then-update 竞态：租约过期/re-claim 后
+  // 旧 worker 的迟到写不可能覆盖新 worker 的 run_state。
+  const res = await pool.query(
+    `UPDATE runs r
+        SET run_state = COALESCE(r.run_state, '{}'::jsonb) || $4::jsonb
+       FROM run_queue q, chat_sessions s
+      WHERE r.id = $1
+        AND r.session_id = s.id
+        AND s.user_id = $3
+        AND q.run_id = r.id
+        AND q.claim_token = $2
+        AND q.lease_until > now()
+        AND r.status IN ('queued','running','cancelling')`,
+    [runId, claimToken, user.id, JSON.stringify({ ...patch, runId })],
+  );
+  if (res.rowCount === 0) {
+    const run = await fetchRun(pool, runId, user.id); // 404/403 在此抛
+    if (isTerminal(run.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
+    throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
+  }
+  return { ok: true };
+}
+
+/** 读取引擎 run state；无 → null（HTTP 204）。读语义同 U9：终态 run 仍可读。 */
+export async function loadRunState(pool, { container, user, runId, claimToken }) {
+  const run = await fetchRun(pool, runId, user.id);
+  if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
+
+  const res = await pool.query(`SELECT run_state FROM runs WHERE id = $1`, [runId]);
+  const row = res.rows?.[0];
+  if (!row || row.run_state == null) return null;
+  return { run_state: row.run_state };
+}
+
+// ---------------------------------------------------------------------------
 // U10/U11 approvals
 // ---------------------------------------------------------------------------
 

@@ -57,7 +57,7 @@ RUN printf '[safe]\n\tdirectory = *\n\n[core]\n\tsharedRepository = group\n' > /
 
 WORKDIR /opt/erix
 
-# ---- erix-agent 依赖（npm v0.3.5，deploy-contract §1 版本记录点）----
+# ---- erix-agent 依赖（npm v0.9.0，issue #43；deploy-contract §1 版本记录点）----
 # 构建不留缓存与凭据：--omit=dev（erix-agent 零运行时依赖）+ 清 npm cache；容器内无真实 LLM key。
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev --no-audit --no-fund \

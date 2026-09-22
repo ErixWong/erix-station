@@ -945,6 +945,8 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall`（§9.7；P1 可 501） | 只读 |
 | U8 | `PUT /api/internal/runs/:id/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint`（§9.8） | 单行覆盖写 + revision CAS |
 | U9 | `GET /api/internal/runs/:id/checkpoint/latest` | store：`loadLatestCheckpoint`（§9.8） | 只读 |
+| — | `PUT /api/internal/runs/:id/runstate` | store：`saveRunState` / markRunState 终态标记（§9.8a，0.9.0 八方法契约，issue #43） | `runs.run_state` jsonb 合并写 |
+| — | `GET /api/internal/runs/:id/runstate` | store：`loadRunState`（§9.8a） | 只读；无 → 204 |
 | U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单（§9.10） | 一个工具调用至多一单 |
 | U11 | `GET /api/internal/approvals/:id` | 审批决定轮询兜底（§9.10） | 只读 |
 | U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（§9.11） | 重复 release 返回首次结果 |
@@ -1338,6 +1340,28 @@ ON CONFLICT (run_id) DO UPDATE
 **404/无权限/lease/终态语义**：run 不存在 → `404 run_not_found`；不属本容器 → `403 run_ownership_mismatch`；`X-Claim-Token` 失配 → `409 lease_lost`；**终态 run 仍可读**（checkpoint 不可变、作为审计/resume 记录可查）→ `200`（有则返回）/`204`（无则空）。
 
 错误：`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
+
+### 9.8a runstate（saveRunState / loadRunState，0.9.0 八方法契约，issue #43）
+
+0.6.0 起引擎 `TranscriptStore` 契约要求 8 方法（run 前 fail-closed 校验，缺即 TypeError，host-upgrade-guide §2）；`saveRunState`/`loadRunState` 持久化/恢复引擎确定性 run state（resume 依赖），落 `runs.run_state jsonb`（schema.sql；不变式 3「DB 是状态真相」）。
+
+#### `PUT /api/internal/runs/:id/runstate`（saveRunState / markRunState 终态标记）
+
+请求两种形态（合并写语义，`run_state = COALESCE(run_state,'{}') || patch`，并并入 `runId`）：
+
+```json
+{ "run_state": { "stateVersion": 3, "deterministic": { "rounds": 2 }, "semantic": { "text": "…", "version": 1 } } }
+{ "state": "succeeded" }
+```
+
+- `{run_state}`：引擎 saveRunState 全量合并（deterministic + semantic）。
+- `{state}`：**引擎终态标记**（succeeded / unverified_error / guard_error / failed / aborted，0.9.0 `termination.js finish()`）——只合并 `state` 字段，**不触碰 `runs.status`**（宿主终态唯一权威仍是 §9.6 U2，runner §6.3-9）。
+
+响应 `200 {ok:true}`。错误：`400 validation_failed`（run_state 非对象 / 两种形态都缺）；`401/403/404` 同 U8；`409 lease_lost`；`409 run_terminal`（终态 barrier，写不再接受）；`429`；5xx 退避重试（§9.13）。
+
+#### `GET /api/internal/runs/:id/runstate`（loadRunState）
+
+响应 `200 { "run_state": { ... } }`；从未写入 → `204`（adapter 返回 `undefined`，resume 按「无状态」正常继续）。**终态 run 仍可读**（读语义同 U9）。错误：`401/403/404`；非终态时 `409 lease_lost`；`429`；5xx 退避重试（§9.13）。
 
 ### 9.9 usage 上报
 
