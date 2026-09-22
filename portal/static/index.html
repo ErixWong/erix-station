@@ -113,7 +113,7 @@
 
     const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
                 lastSeq: 0, es: null, esSessionId: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null,
-                projectReqSeq: 0, sessionReqSeq: 0 }; // 项目/会话请求序号（迟到响应丢弃）
+                projectReqSeq: 0, sessionReqSeq: 0, ctxSeq: 0 }; // 项目/会话请求序号与项目上下文代次（迟到响应丢弃）
     // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）
     const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
     const PROJECT_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -278,7 +278,7 @@
 
     async function switchProject(projectId, { loadSessions: shouldLoadSessions = true } = {}) {
       if (S.es) { S.es.close(); S.es = null; }
-      S.sessionReqSeq++;
+      S.ctxSeq++;
       S.projectReqSeq++;
       S.projectId = projectId;
       S.sessionId = null;
@@ -338,28 +338,32 @@
     }
 
     $('newSess').onclick = async () => {
-      const reqSeq = S.sessionReqSeq;
+      const ctx = S.ctxSeq;
+      $('newSess').disabled = true;
       try {
         const { session } = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ project_id: S.projectId }) });
-        if (reqSeq !== S.sessionReqSeq) return;
+        if (ctx !== S.ctxSeq) return;
         S.sessions.unshift({ ...session, has_active_run: false });
         renderSessions();
         openSession(session.id);
       } catch (e) {
-        if (reqSeq !== S.sessionReqSeq) return;
+        if (ctx !== S.ctxSeq) return;
         alert('建会话失败：' + e.message);
+      } finally {
+        updateWorkspaceAvailability();
       }
     };
 
     async function openSession(id) {
       const reqSeq = ++S.sessionReqSeq;
+      const ctx = S.ctxSeq;
       if (S.es) { S.es.close(); S.es = null; }
       S.sessionId = id; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
       S.esSessionId = id;
       $('stream').innerHTML = '';
       renderSessions();
       const data = await api(`/api/sessions/${encodeURIComponent(id)}`);
-      if (reqSeq !== S.sessionReqSeq) return;
+      if (reqSeq !== S.sessionReqSeq || ctx !== S.ctxSeq) return;
       S.lastSeq = data.last_seq;
       S.renderedIds = new Set();
       for (const m of data.messages) addMessage(m);
@@ -541,11 +545,11 @@
     }
 
     async function refreshSession(runId) {
-      const reqSeq = S.sessionReqSeq;
+      const ctx = S.ctxSeq;
       const sid = S.sessionId;
       try {
         const data = await api(`/api/sessions/${encodeURIComponent(sid)}`);
-        if (reqSeq !== S.sessionReqSeq || (sid !== undefined && S.sessionId !== sid)) return;
+        if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
         for (const m of msgs) addMessage(m);
         await loadSessions();
@@ -573,7 +577,7 @@
     });
 
     async function send() {
-      const reqSeq = S.sessionReqSeq;
+      const ctx = S.ctxSeq;
       const sid = S.sessionId;
       const content = $('input').value.trim();
       if (!content || !sid || S.activeRunId) return;
@@ -582,13 +586,13 @@
         const { message, run } = await api(`/api/sessions/${encodeURIComponent(sid)}/messages`, {
           method: 'POST', body: JSON.stringify({ content, attachments: [] }),
         });
-        if (reqSeq !== S.sessionReqSeq || (sid !== undefined && S.sessionId !== sid)) return;
+        if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         addMessage({ ...message, role: 'user' });
         S.activeRunId = run.id;
         setRunning(true);
         loadSessions();
       } catch (e) {
-        if (reqSeq !== S.sessionReqSeq || (sid !== undefined && S.sessionId !== sid)) return;
+        if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         $('input').value = content; // issue #42：发送失败回填输入，已输入内容不丢
         const div = document.createElement('div');
         div.className = 'syserr';
