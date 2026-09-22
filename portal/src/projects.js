@@ -111,26 +111,36 @@ async function loadUser(client, userId) {
 
 /**
  * 创建项目（同一事务：projects + 端口分配 + IPAM 确保网络 + route/materialize outbox）。
+ * repo_url 是可选登记元数据；不填时项目仍会创建为容器内的空工作目录。
  * @returns { project, port }
  */
 export async function createProject(pool, { userId, name, repoUrl, template = 'default', config }) {
   const v = validateProjectName(name);
   if (!v.ok) throw new ProjectError('validation_failed', v.reason, { httpStatus: 400, details: { field: 'name' } });
-  if (typeof repoUrl !== 'string' || repoUrl.trim() === '') {
-    throw new ProjectError('validation_failed', 'repo_url 为必填字段', { httpStatus: 400, details: { field: 'repo_url' } });
-  }
-  // repo_url 仅作登记元数据（平台不 clone），做最小 URL 形状校验（不强制 git 协议）。
-  let repoUrlParsed;
-  try {
-    repoUrlParsed = new URL(repoUrl);
-  } catch {
-    throw new ProjectError('validation_failed', 'repo_url 非法', { httpStatus: 400, details: { field: 'repo_url' } });
-  }
-  if (!['http:', 'https:', 'git:', 'ssh:'].includes(repoUrlParsed.protocol)) {
-    throw new ProjectError('validation_failed', 'repo_url 非法（仅支持 http/https/git/ssh）', {
-      httpStatus: 400,
-      details: { field: 'repo_url' },
-    });
+  let normalizedRepoUrl = null;
+  if (repoUrl !== undefined && repoUrl !== null) {
+    if (typeof repoUrl !== 'string') {
+      throw new ProjectError('validation_failed', 'repo_url 非法', { httpStatus: 400, details: { field: 'repo_url' } });
+    }
+    if (/[\x00-\x1f\x7f]/.test(repoUrl)) {
+      throw new ProjectError('validation_failed', 'repo_url 非法', { httpStatus: 400, details: { field: 'repo_url' } });
+    }
+    normalizedRepoUrl = repoUrl.trim() || null;
+    if (normalizedRepoUrl) {
+      // repo_url 仅作可选登记元数据（平台不 clone），做最小 URL 形状校验。
+      let repoUrlParsed;
+      try {
+        repoUrlParsed = new URL(normalizedRepoUrl);
+      } catch {
+        throw new ProjectError('validation_failed', 'repo_url 非法', { httpStatus: 400, details: { field: 'repo_url' } });
+      }
+      if (!['http:', 'https:', 'git:', 'ssh:'].includes(repoUrlParsed.protocol)) {
+        throw new ProjectError('validation_failed', 'repo_url 非法（仅支持 http/https/git/ssh）', {
+          httpStatus: 400,
+          details: { field: 'repo_url' },
+        });
+      }
+    }
   }
 
   const client = await pool.connect();
@@ -183,7 +193,7 @@ export async function createProject(pool, { userId, name, repoUrl, template = 'd
       `INSERT INTO projects (user_id, name, repo_url, root_path, slot, template)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, name, repo_url, root_path, slot, template, created_at`,
-      [userId, name, repoUrl, `~/projects/${name}`, slot, template],
+      [userId, name, normalizedRepoUrl, `~/projects/${name}`, slot, template],
     );
     const projectId = projectRow.rows[0].id;
 

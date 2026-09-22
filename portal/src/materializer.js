@@ -74,7 +74,21 @@ export function renderHomeAgentsMd({ fdeName }) {
   ].join('\n');
 }
 
-export function renderProjectAgentsMd({ fdeName, projectName }) {
+export function renderProjectAgentsMd({ fdeName, projectName, repoUrl }) {
+  const normalizedRepoUrl = typeof repoUrl === 'string' && repoUrl.trim() ? repoUrl.trim() : null;
+  const repoGuide = normalizedRepoUrl
+    ? [
+        `已关联仓库：${normalizedRepoUrl}`,
+        '',
+        '目录非空（含 `.erix/`、`.gitignore`），clone 到临时目录再搬移，或 `git init + remote add + fetch + checkout`：',
+        '',
+        '```bash',
+        `git init && git remote add origin '${normalizedRepoUrl.replaceAll("'", "'\\''")}' && git fetch origin && git checkout -b main origin/main`,
+        '```',
+      ]
+    : [
+        '未关联仓库：可直接在本目录工作（如新建代码/`git init`），或自行 `git clone <地址> .`。',
+      ];
   return [
     `# ${projectName} · 项目级约定`,
     '',
@@ -82,13 +96,9 @@ export function renderProjectAgentsMd({ fdeName, projectName }) {
     '',
     '## clone 方式指引',
     '',
-    '目录非空（含 `.erix/`、`.gitignore`），clone 到临时目录再搬移，或 `git init + remote add + fetch + checkout`：',
+    ...repoGuide,
     '',
-    '```bash',
-    `git init && git remote add origin <repo_url> && git fetch origin && git checkout -b main origin/main`,
-    '```',
-    '',
-    '两种方式都不会触碰 `.erix/`。',
+    '上述操作都不会触碰 `.erix/`。',
     '',
     '## 端口',
     '',
@@ -174,7 +184,10 @@ export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, projects, alloc
       `${CONTAINER_HOME}/projects/${project.name}/.erix/ports.json`,
       renderPortsJson({ fdeName, projectName: project.name, allocations: allocs, generation }),
     );
-    add(`${CONTAINER_HOME}/projects/${project.name}/.erix/AGENTS.md`, renderProjectAgentsMd({ fdeName, projectName: project.name }));
+    add(
+      `${CONTAINER_HOME}/projects/${project.name}/.erix/AGENTS.md`,
+      renderProjectAgentsMd({ fdeName, projectName: project.name, repoUrl: project.repo_url }),
+    );
   }
   return files;
 }
@@ -372,7 +385,7 @@ async function readFdeDesiredState(pool, fdeId, config) {
   if (user.rows.length === 0) return null;
   const fdeName = user.rows[0].fde_name;
   const projects = await pool.query(
-    `SELECT id, name FROM projects WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
+    `SELECT id, name, repo_url FROM projects WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
     [fdeId],
   );
   const allocs = await pool.query(

@@ -42,11 +42,12 @@ function makeEl() {
     appendChild() {}, remove() {},
     querySelector() { return makeEl(); }, querySelectorAll() { return []; },
     addEventListener() {},
+    focus() {}, reset() {},
   };
 }
 
 /** 载入 index.html 的内联脚本（桩化 document/EventSource/fetch），导出测试需要的内部绑定。 */
-function loadClient() {
+function loadClient({ fetch: fetchImpl } = {}) {
   const html = fs.readFileSync(INDEX_HTML, 'utf8');
   const m = html.match(/<script>([\s\S]*?)<\/script>/);
   assert.ok(m, 'index.html 应含单个内联脚本');
@@ -59,14 +60,14 @@ function loadClient() {
   const sandbox = {
     document,
     EventSource: FakeEventSource,
-    fetch: async () => { throw new Error('fetch 在单测中禁用'); }, // boot() 走 renderLogin 分支
+    fetch: fetchImpl ?? (async () => { throw new Error('fetch 在单测中禁用'); }), // boot() 走 renderLogin 分支
     location: { reload() {} },
     alert() {}, prompt() { return null; },
     console, setTimeout, clearTimeout, setInterval, clearInterval,
   };
   const ctx = vm.createContext(sandbox);
   // 顶层 const/let 不进 globalThis，用同脚本片段把内部绑定导出给测试驱动
-  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents };`;
+  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents, switchProject, openSession, refreshSession, initWorkspace };`;
   new vm.Script(code).runInContext(ctx);
   FakeEventSource.instances = [];
   return { client: ctx.__client, elements: els, created };
@@ -199,4 +200,306 @@ test('前端：0.9.0 新事件类型白名单 + 载荷对齐（compaction/final_
   assert.ok(seps.some((t) => t.includes('不扩轮')), `judge decline_extend：${joined}`);
   assert.ok(seps.some((t) => t.includes('blocked') && t.includes('方向偏离')), `judge 拦截：${joined}`);
   assert.equal(S.lastSeq, 9, '水位线照常推进');
+});
+
+test('前端：切换项目清理旧会话、EventSource 和聊天区', async () => {
+  const { client, elements } = loadClient();
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p2', name: 'project-2' }];
+  S.sessionId = 's1';
+  S.es = new FakeEventSource('/api/sessions/s1/events');
+  elements.set('stream', makeEl());
+  elements.get('stream').innerHTML = '<div>旧项目消息</div>';
+
+  await client.switchProject('p2', { loadSessions: false });
+
+  assert.equal(S.projectId, 'p2');
+  assert.equal(S.sessionId, null);
+  assert.equal(S.es, null);
+  assert.equal(S.activeRunId, null);
+  assert.equal(S.lastSeq, 0);
+  assert.equal(S.esSessionId, null);
+  assert.equal(S.deltaBuf, null);
+  assert.deepEqual(Object.keys(S.toolCards), []);
+  assert.equal(S.renderedIds, null);
+  assert.equal(S.sessions.length, 0);
+  assert.equal(FakeEventSource.instances[0].closed, true);
+  assert.equal(elements.get('stream').innerHTML, '<p class="muted">选择或新建会话</p>');
+});
+
+test('前端：openSession 迟到响应被项目切换作废且不建立旧会话连接', async () => {
+  let resolveSession;
+  const sessionResponse = new Promise((resolve) => { resolveSession = resolve; });
+  const fetchImpl = async (url) => {
+    if (url === '/api/me') throw new Error('未登录');
+    if (url === '/api/sessions/s1') return sessionResponse;
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p2', name: 'project-2' }];
+
+  const pending = client.openSession('s1');
+  await Promise.resolve();
+  await client.switchProject('p2', { loadSessions: false });
+  resolveSession({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        last_seq: 3,
+        messages: [{ id: 'm1', role: 'assistant', content: '旧项目', run_id: 'run-1' }],
+        session: { active_run_id: 'run-1' },
+      };
+    },
+  });
+  await pending;
+
+  assert.equal(S.sessionId, null);
+  assert.equal(FakeEventSource.instances.length, 0);
+});
+
+test('前端：refreshSession 迟到响应在同一会话重开后被丢弃', async () => {
+  let resolveSession;
+  const sessionResponse = new Promise((resolve) => { resolveSession = resolve; });
+  const fetchImpl = async (url) => {
+    if (url === '/api/sessions/s1') return sessionResponse;
+    if (url === '/api/sessions?project_id=p1') {
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, created } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.sessionId = 's1';
+  S.projectId = 'p1';
+  S.renderedIds = null;
+  elements.set('stream', makeEl());
+  elements.get('stream').innerHTML = '';
+
+  const pendingRefresh = client.refreshSession('run-1');
+  await Promise.resolve();
+  const pendingOpen = client.openSession('s1');
+  resolveSession({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        last_seq: 1,
+        messages: [{ id: 'm-assistant', role: 'assistant', content: '迟到终稿', run_id: 'run-1' }],
+        session: { active_run_id: null },
+      };
+    },
+  });
+  await Promise.all([pendingRefresh, pendingOpen]);
+
+  const rendered = created.filter((el) => el.textContent === '迟到终稿');
+  assert.equal(rendered.length, 1);
+});
+
+test('前端：同一会话重开不吞 send 失败回填', async () => {
+  let resolveSend;
+  const sendResponse = new Promise((resolve) => { resolveSend = resolve; });
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions/s1/messages' && opts.method === 'POST') return sendResponse;
+    if (url === '/api/sessions/s1') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { last_seq: 0, messages: [], session: { active_run_id: null } };
+        },
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, created } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.sessionId = 's1';
+  S.projectId = 'p1';
+  S.activeRunId = null;
+  S.noProject = false;
+  elements.get('input').value = '原始内容';
+
+  const pendingSend = elements.get('sendBtn').onclick();
+  await Promise.resolve();
+  const pendingReopen = client.openSession(S.sessionId);
+  resolveSend({
+    ok: false,
+    status: 500,
+    async json() { return { error: { message: '发送失败原因' } }; },
+  });
+  await Promise.all([pendingSend, pendingReopen]);
+
+  assert.equal(elements.get('input').value, '原始内容');
+  assert.ok(created.some((el) => el.className === 'syserr' && el.textContent.includes('发送失败原因')));
+});
+
+test('前端：创建项目路径与 onchange 共用项目切换清理', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/me') throw new Error('未登录');
+    if (url === '/api/projects' && !opts.method) {
+      return { ok: true, status: 200, async json() { return { items: [{ id: 'p1', name: 'one' }] }; } };
+    }
+    if (url === '/api/projects' && opts.method === 'POST') {
+      return { ok: true, status: 200, async json() { return { project: { id: 'p2', name: 'two' } }; } };
+    }
+    if (url.startsWith('/api/sessions?project_id=')) {
+      calls.push(url);
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  await client.initWorkspace();
+
+  S.sessionId = 's1';
+  const oldEs = new FakeEventSource('/api/sessions/s1/events');
+  S.es = oldEs;
+  elements.get('projectSel').value = 'p1';
+  await elements.get('projectSel').onchange();
+  assert.equal(S.sessionId, null);
+  assert.equal(oldEs.closed, true);
+
+  elements.get('newProjName').value = 'two';
+  await elements.get('newProjForm').onsubmit({ preventDefault() {} });
+
+  assert.equal(S.projectId, 'p2');
+  assert.equal(S.sessionId, null);
+  assert.equal(oldEs.closed, true);
+  assert.deepEqual(calls, ['/api/sessions?project_id=p1', '/api/sessions?project_id=p1', '/api/sessions?project_id=p2']);
+});
+
+test('前端：创建首个项目后会话列表加载失败仍解除工作区禁用态', async () => {
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/projects' && !opts.method) {
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    if (url === '/api/projects' && opts.method === 'POST') {
+      return { ok: true, status: 200, async json() { return { project: { id: 'p1', name: 'first' } }; } };
+    }
+    if (url.startsWith('/api/sessions?project_id=')) throw new Error('会话列表不可用');
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, created } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  await client.initWorkspace();
+
+  elements.get('newProjName').value = 'first';
+  await elements.get('newProjForm').onsubmit({ preventDefault() {} });
+
+  assert.equal(S.noProject, false);
+  assert.equal(elements.get('input').disabled, false);
+  assert.ok(created.some((el) => el.className === 'syserr' && el.textContent.includes('项目已创建')));
+});
+
+test('前端：send 迟到响应不污染切换后的项目运行态', async () => {
+  let resolveSend;
+  const sendResponse = new Promise((resolve) => { resolveSend = resolve; });
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions/s1/messages' && opts.method === 'POST') return sendResponse;
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }, { id: 'p2', name: 'two' }];
+  S.projectId = 'p1';
+  S.sessionId = 's1';
+  S.noProject = false;
+  elements.get('input').value = '旧项目任务';
+
+  const pending = elements.get('sendBtn').onclick();
+  await Promise.resolve();
+  await client.switchProject('p2', { loadSessions: false });
+  resolveSend({
+    ok: true,
+    status: 200,
+    async json() {
+      return { message: { id: 'm1', content: '旧项目任务' }, run: { id: 'run-1' } };
+    },
+  });
+  await pending;
+
+  assert.equal(S.activeRunId, null);
+  assert.notEqual(elements.get('stopBtn').style.display, 'inline-block');
+});
+
+test('前端：新会话迟到响应不写入切换后的项目且不打开旧会话', async () => {
+  let resolveCreate;
+  const createResponse = new Promise((resolve) => { resolveCreate = resolve; });
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions' && opts.method === 'POST') return createResponse;
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }, { id: 'p2', name: 'two' }];
+  S.projectId = 'p1';
+
+  const pending = elements.get('newSess').onclick();
+  await Promise.resolve();
+  await client.switchProject('p2', { loadSessions: false });
+  resolveCreate({
+    ok: true,
+    status: 200,
+    async json() {
+      return { session: { id: 's-old', title: '旧项目会话' } };
+    },
+  });
+  await pending;
+
+  assert.equal(S.sessions.length, 0);
+  assert.equal(FakeEventSource.instances.length, 0);
+});
+
+test('前端：连点新会话保留两个成功创建的会话', async () => {
+  const createResolvers = [];
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions' && opts.method === 'POST') {
+      return new Promise((resolve) => createResolvers.push(resolve));
+    }
+    if (url === '/api/sessions/s-1' || url === '/api/sessions/s-2') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { last_seq: 0, messages: [], session: { active_run_id: null } };
+        },
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+
+  const first = elements.get('newSess').onclick();
+  const second = elements.get('newSess').onclick();
+  assert.equal(elements.get('newSess').disabled, true);
+  assert.equal(createResolvers.length, 2);
+
+  createResolvers[1]({
+    ok: true,
+    status: 201,
+    async json() { return { session: { id: 's-2', title: '第二个会话' } }; },
+  });
+  createResolvers[0]({
+    ok: true,
+    status: 201,
+    async json() { return { session: { id: 's-1', title: '第一个会话' } }; },
+  });
+  await Promise.all([first, second]);
+
+  assert.deepEqual(Array.from(S.sessions, (s) => s.id).sort(), ['s-1', 's-2']);
+  assert.equal(elements.get('newSess').disabled, false);
 });
