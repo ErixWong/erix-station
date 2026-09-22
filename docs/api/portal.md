@@ -437,7 +437,7 @@ station-portal user enable  --login <login>
 
 ## 3. 项目（Projects）
 
-项目 = FDE 容器内的一个仓库目录 `~/projects/<project>`（规格 §2 术语）。所有项目端点只返回/操作**当前登录用户**的项目。
+项目 = FDE 容器内的一个工作目录 `~/projects/<project>`（若关联仓库则可作为仓库目录；规格 §2 术语）。所有项目端点只返回/操作**当前登录用户**的项目。
 
 ### 3.1 Project 对象
 
@@ -456,9 +456,11 @@ station-portal user enable  --login <login>
 | 字段 | 说明 |
 |---|---|
 | `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`（同 schema.sql CHECK，不允许尾随 `-`） |
-| `repo_url` | 仓库地址，**仅作记录/展示元数据**：平台不 clone、不物化该目录、不下发 git 凭据；clone 与 git 凭据由 FDE 在容器内自行配置（规格 §7.2/§12.2，决策者 2026-09，issue #3 评论） |
+| `repo_url` | 可选仓库地址，**仅作记录/展示元数据**；不填时为 `null`。平台不 clone、不物化该目录、不下发 git 凭据；clone 与 git 凭据由 FDE 在容器内自行配置（规格 §7.2/§12.2，决策者 2026-09，issue #3 评论） |
 | `slot` | 项目端口块序号（决定 `4000 + slot*8` 起始端口，规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
+
+> 项目目录 = 容器内 `/home/<FDE_CONTAINER_USER>/projects/<name>`；当前容器用户为 `erix`。
 
 ### 3.2 `GET /api/projects`
 
@@ -472,7 +474,7 @@ station-portal user enable  --login <login>
 { "name": "proj1", "repo_url": "https://git.<BASE_DOMAIN>/client-x/proj1.git", "template": "node" }
 ```
 
-`template` 可省略（默认模板）。
+`repo_url` 可省略（或传空串，服务端按 `null` 落库）；`template` 也可省略（默认模板）。不填仓库时，项目就是容器内 `~/projects/<name>` 下的空工作目录，FDE 无需预先了解仓库概念。
 
 响应 `201`：Project 对象 + 本次分配的端口（**创建项目与分配项目级端口是同一事务**，规格 §7.2 第 3 步 / §8.2）：
 
@@ -499,11 +501,11 @@ station-portal user enable  --login <login>
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 400 | `validation_failed` | name 非法 / repo_url 非法 |
+| 400 | `validation_failed` | name 非法 / 提供了 repo_url 但其地址非法 |
 | 409 | `name_conflict` | 同名项目已存在 |
 | 409 | `port_quota_exceeded` | 用户端口总配额超限（规格 §8.2：**明确报错**而非静默漂移） |
 
-> **边界（决策者 2026-09，issue #3 评论）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 只是登记元数据。**平台不负责 clone，也不下发 git 凭据**——仓库目录由 FDE 在容器内自行 `git clone` 并配置凭据（等同他自己的开发机，规格 §7.2/§12.2）。
+> **边界（决策者 2026-09，issue #3 评论；issue #52 方案 A）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 是可选登记元数据。**平台不负责 clone，也不下发 git 凭据**——提供地址时仓库目录由 FDE 在容器内自行 `git clone` 并配置凭据；不提供地址时项目就是 `~/projects/<name>` 下的空工作目录，FDE 不需要知道仓库概念（等同他自己的开发机，规格 §7.2/§12.2）。
 
 ### 3.4 `GET /api/projects/:id`
 

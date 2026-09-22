@@ -8,6 +8,7 @@ import {
   buildUrl,
   slotToPort,
   findFreeSlot,
+  createProject,
   toProject,
   toPort,
   renameProject,
@@ -16,6 +17,65 @@ import {
   PORT_BLOCK_SIZE,
   ProjectError,
 } from '../src/projects.js';
+
+function createProjectPool() {
+  const queries = [];
+  const client = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(normalized)) return { rows: [] };
+      if (normalized.includes('SELECT id, login, display_name, role, fde_name')) {
+        return { rows: [{ id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local', status: 'active' }] };
+      }
+      if (normalized.includes('SELECT 1 FROM projects WHERE user_id = $1 AND name = $2')) return { rows: [] };
+      if (normalized.includes('FROM fde_networks WHERE fde_id = $1 AND state IN')) {
+        return { rows: [{ fde_id: 'u1', network_name: 'fde-alice', subnet: '10.200.0.0/29', prefix_len: 29, gateway: '10.200.0.1', pool: 'default', state: 'allocated' }] };
+      }
+      if (normalized.startsWith('SELECT slot FROM projects')) return { rows: [] };
+      if (normalized.startsWith('INSERT INTO projects')) {
+        return {
+          rows: [{
+            id: 'p1',
+            name: params[1],
+            repo_url: params[2],
+            root_path: params[3],
+            slot: params[4],
+            template: params[5],
+            created_at: new Date('2026-09-12T08:30:00.000Z'),
+          }],
+        };
+      }
+      if (normalized.startsWith('INSERT INTO port_allocations')) {
+        return {
+          rows: [{
+            id: 'pa1',
+            scope: 'project',
+            port: params[2],
+            role: 'frontend',
+            run_id: null,
+            hostname: params[3],
+            url: params[4],
+            exposure: 'private',
+            state: 'allocated',
+            released_at: null,
+          }],
+        };
+      }
+      if (normalized.startsWith('INSERT INTO route_revisions') || normalized.startsWith('INSERT INTO materialize_revisions')) {
+        return { rows: [{ revision: 1 }] };
+      }
+      if (normalized.startsWith('INSERT INTO route_outbox') || normalized.startsWith('INSERT INTO materialize_outbox')) return { rows: [] };
+      if (normalized.startsWith('SELECT pg_advisory_xact_lock')) return { rows: [] };
+      throw new Error(`unexpected query in createProject test: ${normalized}`);
+    },
+    release() {},
+  };
+  return {
+    queries,
+    async connect() { return client; },
+  };
+}
 
 test('validateProjectName：合法名 / 非法名（大写、下划线、前导 -、超长）', () => {
   assert.equal(validateProjectName('proj1').ok, true);
@@ -102,6 +162,61 @@ test('toProject / toPort 映射', () => {
   assert.equal(port.state, 'allocated');
   assert.equal(port.released_at, null);
 });
+
+for (const [label, repoUrl] of [['未提供 repo_url', undefined], ['repo_url 为空串', ''], ['repo_url 纯空白', '   ']]) {
+  test(`createProject：${label} → 成功创建并将 repo_url 落库为 NULL`, async () => {
+    const pool = createProjectPool();
+    const result = await createProject(pool, {
+      userId: 'u1',
+      name: 'proj1',
+      repoUrl,
+      template: 'node',
+      config: { baseDomain: 'localhost' },
+    });
+    const insert = pool.queries.find(({ sql }) => sql.includes('INSERT INTO projects'));
+    assert.equal(result.project.repo_url, null);
+    assert.equal(insert.params[2], null);
+  });
+}
+
+for (const repoUrl of [123, {}]) {
+  test(`createProject：非字符串 repo_url ${JSON.stringify(repoUrl)} → validation_failed 400`, async () => {
+    await assert.rejects(
+      () => createProject(createProjectPool(), { userId: 'u1', name: 'proj1', repoUrl, config: { baseDomain: 'localhost' } }),
+      (err) => err instanceof ProjectError
+        && err.code === 'validation_failed'
+        && err.httpStatus === 400
+        && err.details.field === 'repo_url',
+    );
+  });
+}
+
+test('createProject：repo_url 含控制字符 → validation_failed 400', async () => {
+  await assert.rejects(
+    () => createProject(createProjectPool(), {
+      userId: 'u1',
+      name: 'proj1',
+      repoUrl: 'https://git.example/repo\n.git',
+      config: { baseDomain: 'localhost' },
+    }),
+    (err) => err instanceof ProjectError
+      && err.code === 'validation_failed'
+      && err.httpStatus === 400
+      && err.details.field === 'repo_url',
+  );
+});
+
+for (const repoUrl of ['ftp://x', 'not-a-url']) {
+  test(`createProject：非法 repo_url ${repoUrl} → validation_failed 400`, async () => {
+    await assert.rejects(
+      () => createProject(createProjectPool(), { userId: 'u1', name: 'proj1', repoUrl, config: { baseDomain: 'localhost' } }),
+      (err) => err instanceof ProjectError
+        && err.code === 'validation_failed'
+        && err.httpStatus === 400
+        && err.details.field === 'repo_url',
+    );
+  });
+}
 
 test('F7：改名后 enqueue materialize change（新目录生成 + 旧目录收敛；不改 route outbox）', async () => {
   const calls = { materialize: 0, route: 0 };
