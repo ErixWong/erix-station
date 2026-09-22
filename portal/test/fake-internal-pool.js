@@ -347,6 +347,25 @@ export class FakeInternalPool {
       return { rows: c ? [{ snapshot: c.snapshot, revision: c.revision, updated_at: new Date() }] : [] };
     }
 
+    // ---- runstate（0.9.0 引擎 8 方法契约；F2：单条条件 UPDATE，非终态+属主+有效租约全进 WHERE）----
+    if (sql.includes('UPDATE runs r') && sql.includes('SET run_state')) {
+      const [runId, claimToken, userId, patchJson] = params;
+      const r = this._run(runId);
+      const q = this._queue(runId);
+      const s = r ? this._session(r.session_id) : null;
+      if (!r || !q || !s || s.user_id !== userId) return { rows: [] };
+      if (q.claim_token !== claimToken) return { rows: [] };
+      if (q.lease_until == null || q.lease_until <= Date.now()) return { rows: [] };
+      if (!['queued', 'running', 'cancelling'].includes(r.status)) return { rows: [] };
+      r.run_state = { ...(r.run_state ?? {}), ...JSON.parse(patchJson) };
+      return { rows: [{ id: runId }] };
+    }
+    if (sql.includes('SELECT run_state FROM runs WHERE id')) {
+      const runId = params[0];
+      const r = this._run(runId);
+      return { rows: r && r.run_state != null ? [{ run_state: r.run_state }] : [{ run_state: null }] };
+    }
+
     // ---- approvals ----
     if (sql.includes('INSERT INTO approvals')) {
       const [runId, toolCallId] = params;
