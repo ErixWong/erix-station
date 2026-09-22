@@ -245,8 +245,11 @@ async function startRun(msg) {
       resume: resume === true,
       maxRounds: 8,
       stream: true,
-      // 8) reflection / wrapup 显式传（§6.3-8）；P1 mock 关 judge、对话型宿主关 wrapup。
-      reflection: false,
+      // 8) reflection / wrapup 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
+      // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
+      // nearLimit 时可 extend 扩轮；judgeIntercept 默认开（工具透明审计）。judge 输出非法
+      // JSON 时 fail-closed 不扩轮（roundJudgeFailures 限 3 后本轮禁用）。wrapup 保持关（对话型宿主）。
+      reflection: { enabled: true, roundJudge: true },
       wrapup: false,
       // 7) signal
       signal: abortController.signal,

@@ -739,7 +739,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | 11 | internal 端点前缀 `/api/internal`、claim 载荷形状、`X-Claim-Token` 头 | 采用（§4） |
 | 12 | 背压上限（worker 10000 条/4MB；agentd 20000 条/8MB；spool 机制） | 采用（§7.4） |
 | 13 | store adapter 重试参数（3 次，1s/2s/5s） | 采用（§9.2） |
-| 14 | `reflection` / `wrapup` 的显式配置值（对话型宿主参照 host-upgrade-guide §1 评估 `wrapup:false`） | 待定（§6.3-8） |
+| 14 | `reflection` / `wrapup` 的显式配置值（对话型宿主参照 host-upgrade-guide §1 评估 `wrapup:false`） | **已拍板 2026-09-22（issue #43）**：`reflection: { enabled: true, roundJudge: true }`（judge 扩轮开）、`wrapup: false` |
 | 15 | 审批轮询兜底间隔 5s | 采用（§10.1） |
 | 16 | 崩溃恢复方案：方案 A（新 run + `resume_from_run_id`，不自动 resume）vs 方案 B（同 run_id re-claim） | 已定 B（§6.5；A5 口径：attempt 失败不写 `runs.status='failed'`） |
 | 17 | `client_event_id` 含 attempt 前缀（`run_id:attempt:计数`） | 采用（§7.3） |

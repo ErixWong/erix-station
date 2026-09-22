@@ -97,7 +97,7 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 
 ### 需拍板的行为差异（不 crash，但改模型可见面/成本）
 
-- `maxRounds: 8 + reflection: false` → 0.9.0 扩轮唯一路径是 judge，长任务会撞 `max_rounds_cap`；是否开 judge（成本 vs 扩轮）由用户拍板。
+- `maxRounds: 8 + judge 已开`（`reflection: { enabled: true, roundJudge: true }`，用户 2026-09-22 拍板，推翻「P1 mock 关 judge」）→ 长任务 nearLimit 可经 round judge `extend` 扩轮；judge 请求失败 fail-closed 不扩轮（`roundJudgeFailures` 限 3 后本轮禁用）；judgeIntercept 默认开（工具透明审计）。
 - 新默认值：output hygiene 4096（超限工具结果归档+截断提示）、工具结果 TTL 折叠（`ERIX_TOOL_RESULT_TTL` 默认 2）、retry `attempts:2`；单轮聚合预算在未传窗口配置时不生效（同 0.6.0 行为）。
 - resume 语义拆分（0.7.0）：轮号跨 resume 连续，轮预算每次 run 从 0 起计 → wp3b-e2e 的 resume 用例要按新口径核对。
 
@@ -116,4 +116,4 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - [x] **必改项 4**：worker 传参逐项核对在 `host-consumer-contract.md` 选项白名单内，未加契约外键。
 - [x] **随动同步**：`runner/package.json` → 0.9.0 + lock；portal 事件白名单补 `compaction`/`final_guard`/`forced_final`（judge 事件 `extend`/`passThrough` 前端展示）；termination 枚举补 `final_guard_unverified` + `run_state` 列文档落 `docs/data/model.md`（**baseline 冻结规则优先**：`docs/data/schema.sql` 的修改已回滚——`migrate.js` 实时 sha256 校验，改 baseline 会让既有部署拒启；DDL 只走 `0003-run-state.sql`）；契约测试 `transcriptStoreContract` 对 station adapter 全绿（`runner/test/store-contract.test.js`）。
 - [x] **wp3b-e2e 真机复跑全绿**（2026-09-22，隔离栈：`STATION_STACK_ID` + 端口/容器名/DB 目录 env 化；含 F3 sentinel 恢复断言）。配套修了两个真问题：F8 traefik 静态配置 `TRAEFIK_STATIC_HOST` env 化（CLI 覆盖被 `--configFile` 静态文件压制，实测证伪）；F9 orphan 清扫按 `station.stack` 标签过滤（同宿主双 portal 互删对方 FDE 的真缺陷，共享栈旧镜像需重建后才受保护）。
-- [ ] **待办**：是否开 judge（扩轮）另行决策，本升级不开；F3 sentinel 断言可再加强为内容级（LOW，copilot 复审遗留）。
+- [x] **judge（扩轮）已开**（2026-09-22 用户拍板）：`worker.js` `reflection: { enabled: true, roundJudge: true }`；F3 sentinel 断言可再加强为内容级（LOW，copilot 复审遗留）。
