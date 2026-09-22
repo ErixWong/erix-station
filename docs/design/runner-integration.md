@@ -538,7 +538,8 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 | `loadRunState(runId)` | `loadRunState` | `GET .../runstate`（0.6.0 新增） | 读 `runs.run_state`；无 → `204` → adapter 返回 `undefined` | 只读；终态 run 仍可读（同 U9 口径） |
 
 > **markRunState 双路语义（issue #43 拍板）**：`'running'` 仍走 U2（`runs.status`，终态由 worker 经 run_finished → U2 上报，§6.3-9）；引擎终态标记只合并 `run_state.state`，**不触碰 `runs.status`**（宿主终态唯一权威仍是 U2，不变式 3）。
-> **recall（0.8.0 退役）**：引擎不再调用 `store.recall`，worker 也不再注册 recall 工具（档案取回归 note 工作流：note_list → note_read，NotesStore 落盘在 run worktree 内）；U7 端点与 adapter 方法保留（既有断言面与只读兼容，非孤儿）。
+> **recall（0.8.0 退役）**：引擎不再调用 `store.recall`，worker 也不再注册 recall 工具（档案取回归 note 工作流：note_list → note_read）；U7 端点与 adapter 方法保留（既有断言面与只读兼容，非孤儿）。
+> **notes 落盘位置（issue #46，0.10.0 起）**：NotesStore 不再落 run worktree，迁 **run 数据目录** `<home>/runs/<runId>/notes/`（logical-run 作用域，跨 attempt 保留——resume 不丢 notes；agentd RUN_START 下行 `notes_dir`，终态后由 agentd 清理，attempt 间绝不删）。详见 AGENTS.md §8.2。
 
 > `appendCheckpoint`：上游 file 实现即 `saveCheckpoint` 别名（`src/store/file.js:287-289`）；引擎选择顺序是先 `saveCheckpoint` 后 `appendCheckpoint`（`src/loop.js:1193-1199`），adapter 实现 `saveCheckpoint` 即可覆盖。
 

@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
+import { cleanupRunData, prepareRunDataDir, sweepRunDataDir } from './lib/run-data.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(__dirname, 'worker.js');
@@ -47,6 +48,10 @@ const CFG = {
   // 默认 5min：runToolLoop 在 LLM 流式等待期间也可能长时间无 IPC，阈值必须远大于正常模型等待；env 可调。
   watchdogMs: Number(process.env.ERIX_AGENTD_WATCHDOG_MS || 300000),
   maxPendingEvents: Number(process.env.ERIX_MAX_PENDING_EVENTS || 20000),
+  // issue #46：启动清扫 run 数据目录的 mtime 保留期（小时）；0 = 禁用清扫。
+  // 必须保留窗口远大于「崩溃 → portal re-claim 同 run（resume）」的间隔，否则会把待 resume
+  // 的 notes 当残留删光（race 推导见 runner/lib/run-data.js sweepRunDataDir 头注释）。
+  runDataTtlHours: Number(process.env.ERIX_RUN_DATA_TTL_HOURS || 24),
 };
 
 // 批处理单批上限（§7.2）。
@@ -720,7 +725,9 @@ function onWorkerExit(ctx, code, signal) {
       const p = reportTerminalAfterDrop(ctx).finally(() => state.pendingReports.delete(p));
       state.pendingReports.add(p);
     }
-    cleanupRun(ctx);
+    // issue #46：stop 路径是终态（补报 aborted）→ 清 run 数据目录；
+    // lease_lost/revoked 非本端收敛 → 保留（lease_lost 可能易主重跑，resume 要读 notes）。
+    cleanupRun(ctx, { purgeRunData: ctx.dropReason === 'stop_request' || ctx.dropReason === 'stop_heartbeat' });
     return;
   }
   // 非预期退出且未终态 → release + 重新认领（§6.4 worker 崩溃）。
@@ -754,21 +761,26 @@ async function onWorkerFinished(ctx, msg) {
     body.error = msg.error ?? { code: 'failed', message: 'run failed', retryable: false };
   }
 
+  // issue #46：仅当 U2 确认终态收敛（成功或 run_terminal 幂等命中）才清 run 数据目录；
+  // lease_lost（已易主）/其他失败 → 保留（易主后由新持有者重建，本地残留由启动 sweep 兜底）。
+  let runTerminalConfirmed = false;
   try {
     const r = await finishRun(ctx, body);
+    runTerminalConfirmed = true;
     log('info', 'run finished', { run_id: ctx.runId, state: body.state, run_end_seq: r?.run_end_seq });
   } catch (err) {
     // 409 run_terminal 幂等命中 → 视为成功；lease_lost → 已易主，不再写。
     if (err instanceof InternalError && err.code === 'run_terminal') {
+      runTerminalConfirmed = true;
       log('info', 'run finish idempotent', { run_id: ctx.runId });
     } else {
       log('warn', 'run finish failed', { run_id: ctx.runId, code: err?.code, msg: String(err?.message ?? err) });
     }
   }
-  cleanupRun(ctx);
+  cleanupRun(ctx, { purgeRunData: runTerminalConfirmed });
 }
 
-function cleanupRun(ctx) {
+function cleanupRun(ctx, { purgeRunData = false } = {}) {
   if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
   if (ctx.worker) {
     const pid = ctx.workerPid;
@@ -785,9 +797,16 @@ function cleanupRun(ctx) {
     }
   }
   cleanupWorktree(ctx); // M3
+  // issue #46：run 数据目录仅在终态清理（purgeRunData=true，onWorkerFinished 收敛成功后）；
+  // releaseAndRequeue（resume/崩溃重排队）与 lease_lost 路径绝不删——attempt 间 notes 必须保留。
+  if (purgeRunData) cleanupRunData({ home: CFG.home, runId: ctx.runId, workerUid: CFG.workerUid, workerGid: CFG.workerGid, log });
   state.runs.delete(ctx.runId);
-  log('info', 'run cleaned up', { run_id: ctx.runId });
+  log('info', 'run cleaned up', { run_id: ctx.runId, purge_run_data: purgeRunData });
 }
+
+// run 数据目录生命周期（issue #46，选项 A）实现在 ./lib/run-data.js：
+// <CFG.home>/runs/<runId>/notes/ 跨 attempt 保留（resume 可读前序 attempt 的 notes），
+// 与 worktree 生命周期完全解耦；终态清理 + 启动 sweep（mtime TTL，race 推导见该文件头注释）。
 
 // M3：清理 run 的 worktree——真实 git worktree 用 `git worktree remove --force`；
 // 兑底目录（mkdir fallback）直接 rmSync；之后 prune 残留元数据。best-effort。
@@ -849,6 +868,15 @@ async function handleTicket(ticket) {
   ctx.worktreePath = cwd;
   ctx.projectDir = path.join(CFG.home, 'projects', run.project?.name ?? 'default');
 
+  // issue #46（选项 A）：备 run 数据目录（notes 落点，跨 attempt 保留）。
+  try {
+    ctx.runDataPath = prepareRunDataDir(CFG.home, runId);
+  } catch (err) {
+    log('warn', 'run data dir prep failed', { run_id: runId, err: String(err?.message ?? err) });
+    await releaseAndRequeue(ctx, 'run_data_failed');
+    return;
+  }
+
   // 先 PUT running（§6.1：准备就绪后）。worker 内部 runToolLoop 也会 markRunState('running')，幂等。
   try {
     await internalRequest('PUT', `/runs/${runId}/state`, { body: { state: 'running' }, claimToken: ctx.claimToken });
@@ -870,6 +898,8 @@ async function handleTicket(ticket) {
     model: run.model ?? null,
     resume: ctx.resume,
     attachments: Array.isArray(run.attachments) ? run.attachments : [],
+    // issue #46：notesDir 下行（run 数据目录内，logical-run 作用域；worker 不再自推 worktree 路径）。
+    notes_dir: path.join(ctx.runDataPath, 'notes'),
     config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
     // issue #38 Phase B2：模型快照，run 边界生效——此处取的是 **run 启动瞬间**的 state.llmModels，
     // 之后心跳刷新 state.llmModels 不影响本 run（进行中 run 的模型名在其生命周期内锁定）。
@@ -1019,6 +1049,17 @@ async function main() {
   // agentd 建 worktree、fork worker（继承 umask）的文件都需跨 UID（1001/1002）组可写。
   process.umask(0o002);
   log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
+
+  // issue #46：清扫上次运行残留的 run 数据目录（终态清理失败/异常退出遗留）。
+  // 必须在 claimLoop 之前调用；只删 mtime 超过保留期的目录——崩溃后待 resume re-claim 的
+  // run 目录 mtime 新鲜必然保留（race 推导见 runner/lib/run-data.js 头注释）。
+  sweepRunDataDir({
+    home: CFG.home,
+    ttlHours: CFG.runDataTtlHours,
+    workerUid: CFG.workerUid,
+    workerGid: CFG.workerGid,
+    log,
+  });
 
   const sse = openSse();
 

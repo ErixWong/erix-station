@@ -8,6 +8,6 @@
     "node": ">=22"
   },
   "dependencies": {
-    "erix-agent": "0.9.0"
+    "erix-agent": "0.10.0"
   }
 }
