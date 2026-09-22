@@ -161,7 +161,7 @@
           $('loginForm').style.display = 'none';
           $('totpForm').style.display = '';
           $('loginErr').textContent = '';
-          if (typeof $('totpCode').focus === 'function') $('totpCode').focus();
+          $('totpCode').focus();
         } catch (err) { $('loginErr').textContent = err.message; }
       };
       $('backToLogin').onclick = () => location.reload();

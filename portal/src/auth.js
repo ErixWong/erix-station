@@ -260,10 +260,10 @@ export async function verifyTotpForUser(
 }
 
 /** 建立会话：生成不透明 token，只把 sha256(token) 写入 login_sessions。 */
-/** 用户是否已注册 TOTP（totp_secret 非空）。未注册 → 登录口令直通建会话（跳过第二因素）。 */
+/** 用户是否已注册 TOTP（NULL 或空字符串均视为未注册）。未注册 → 登录口令直通建会话（跳过第二因素）。 */
 export async function hasTotpEnrollment(pool, userId) {
   const { rows } = await pool.query(
-    'SELECT 1 FROM users WHERE id = $1 AND totp_secret IS NOT NULL',
+    "SELECT 1 FROM users WHERE id = $1 AND NULLIF(totp_secret, '') IS NOT NULL",
     [userId],
   );
   return rows.length > 0;
