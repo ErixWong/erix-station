@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const STATIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../static');
 
 /** 加载 markdown.js（+ 可选 index.html 内联脚本）到独立 sandbox，返回可调用绑定。 */
-function loadClient({ withIndex = false, dropRenderer = false } = {}) {
+function loadClient({ withIndex = false, dropRenderer = false, fetchImpl = null } = {}) {
   const els = new Map();
   const document = {
     getElementById(id) { if (!els.has(id)) els.set(id, makeEl()); return els.get(id); },
@@ -20,7 +20,7 @@ function loadClient({ withIndex = false, dropRenderer = false } = {}) {
   };
   const sandbox = {
     document,
-    fetch: async () => { throw new Error('fetch 在单测中禁用'); },
+    fetch: fetchImpl ?? (async () => { throw new Error('fetch 在单测中禁用'); }),
     location: { reload() {} },
     alert() {}, prompt() { return null; },
     console, setTimeout, clearTimeout, setInterval, clearInterval,
@@ -33,7 +33,7 @@ function loadClient({ withIndex = false, dropRenderer = false } = {}) {
     const html = fs.readFileSync(path.join(STATIC_DIR, 'index.html'), 'utf8');
     const m = html.match(/<script>([\s\S]*?)<\/script>/);
     assert.ok(m, 'index.html 应含内联脚本');
-    vm.runInContext(m[1] + '\n;globalThis.__client = { S, addMessage };', ctx);
+    vm.runInContext(m[1] + '\n;globalThis.__client = { S, addMessage, loadSessions };', ctx);
   }
   return { render: ctx.renderMarkdown ?? sandbox.renderMarkdown, client: ctx.__client, elements: els };
 }
@@ -176,4 +176,50 @@ test('集成：renderMarkdown 未加载时 addMessage 退化为纯文本（脚�
   const a = client.addMessage({ id: 'm9', role: 'assistant', synthetic: false, content: '# 标题' });
   assert.equal(a.textContent, '# 标题');
   assert.equal(a.innerHTML, '');
+});
+// ---------------------------------------------------------------------------
+// 评审 LOW-2 回归：私用区字符占位符防碰撞
+// ---------------------------------------------------------------------------
+
+test('评审 LOW-2：输入中的 \uE000<数字>\uE000 不被误还原为行内代码', () => {
+  const { render } = loadClient();
+  const PUA = String.fromCharCode(0xE000);
+  // 私用区字符 → 数字实体（&#57344;），占位符不可能来自用户输入
+  assert.equal(render(PUA + '0' + PUA), '<p>&#' + 0xE000 + ';0&#' + 0xE000 + ';</p>');
+  // 与真行内代码共存时不误还原
+  assert.equal(render('`x` and ' + PUA + '0' + PUA), '<p><code>x</code> and &#' + 0xE000 + ';0&#' + 0xE000 + ';</p>');
+  // 私用区字符不得从任何出口漏出原始形态
+  const out = render(PUA + '0' + PUA);
+  assert.ok(!out.includes(PUA), '输出不得含原始私用区字符');
+});
+
+// ---------------------------------------------------------------------------
+// 评审 LOW-3 回归：项目切换竞态守卫（loadSessions 请求序号）
+// ---------------------------------------------------------------------------
+
+test('评审 LOW-3：快速 A→B 切换时 A 的迟到响应不得覆盖 B 的会话列表', async () => {
+  let releaseA;
+  const gateA = new Promise((r) => { releaseA = r; });
+  const fetchImpl = async (url) => {
+    if (!url.startsWith('/api/sessions?')) throw new Error('fetch 在单测中仅允许 loadSessions'); // boot() 的 /api/me 走 renderLogin 分支
+    if (url.includes('project_id=proj-A')) {
+      await gateA; // A 的响应迟到
+      return { ok: true, json: async () => ({ items: [{ id: 'sa', title: 'A会话' }] }) };
+    }
+    return { ok: true, json: async () => ({ items: [{ id: 'sb', title: 'B会话' }] }) };
+  };
+  const { client, elements } = loadClient({ withIndex: true, fetchImpl });
+  const { S, loadSessions } = client;
+
+  S.projectId = 'proj-A';
+  const pA = loadSessions();
+  S.projectId = 'proj-B'; // 用户迅速切到 B
+  const pB = loadSessions();
+  await pB;
+  assert.ok(elements.get('sessList').innerHTML.includes('B会话'), 'B 的响应先到，列表为 B');
+
+  releaseA(); // A 的迟到响应现在才到
+  await pA;
+  assert.ok(elements.get('sessList').innerHTML.includes('B会话'), '迟到响应被序号守卫丢弃');
+  assert.ok(!elements.get('sessList').innerHTML.includes('A会话'), 'A 不得覆盖 B');
 });

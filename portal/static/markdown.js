@@ -21,9 +21,13 @@
   const PLACEHOLDER = (n) => '\uE000' + n + '\uE000';
 
   // ---- 行内格式（输入为原始文本，内部先转义） ----
+  // 评审 LOW-2：先把输入里的私用区字符（U+E000–U+F8FF）转成数字实体——占位符才可能
+  // 不可能来自用户输入（否则 '\uE0000\uE000' 会被误还原成 <code>undefined</code>）。
+  const sanitizePua = (s) => s.replace(/[\uE000-\uF8FF]/g, (c) => '&#' + c.charCodeAt(0) + ';');
+
   function inline(text) {
     const codes = [];
-    let s = esc(text);
+    let s = sanitizePua(esc(text));
     // 1) 行内代码最先占位：其内部不再做任何格式替换（防 `*` 等在代码里被格式化）
     s = s.replace(/`([^`]+)`/g, (_m, c) => {
       codes.push(c);
