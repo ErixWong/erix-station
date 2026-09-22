@@ -685,27 +685,30 @@ async function handlePostMessage(req, res, ctx, sessionId) {
   // F3：请求体校验**前置到幂等包装之前**——非法体 400 且不占幂等占位行；
   // 否则首次非法体占位后，同 key 的合法重试会因 request_hash 不同撞 409 idempotency_key_reuse。
   const { content, attachments } = sessions.validateMessageBody(body);
-  // issue #41：建 run 前预检该 FDE 是否已绑定可用 LLM 上游（active binding + enabled provider +
-  // 非空 api_key；SQL 口径同 routes.js llmRows / llm.js getFdeLlmHeartbeatModels 的 JOIN 条件）。
-  // 未配置 → 409 llm_not_configured fail-fast：不占幂等占位、不入队 run（否则 run 永久排队，
-  // 等一个永远不会出现的 LLM 出口）。
-  const bound = await ctx.pool.query(
-    `SELECT 1
-       FROM fde_llm_bindings b
-       JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
-      WHERE b.fde_id = $1 AND b.state = 'active' AND b.api_key IS NOT NULL AND b.api_key <> ''
-      LIMIT 1`,
-    [session.user.id],
-  );
-  if (!bound.rows?.length) {
-    throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置');
-  }
   const key = idempotency.normalizeKey(req.headers['idempotency-key']); // 非法 → 400 validation_failed
   const endpoint = `POST /api/sessions/${sessionId}/messages`; // 含路径参数：同 key 跨 session 不串号
   const result = await idempotency.executeWithIdempotency(
     ctx.pool,
     { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }), log: ctx.log },
     async (record) => {
+      // issue #41：建 run 前预检该 FDE 是否已绑定可用 LLM 上游（active binding + enabled provider +
+      // 非空 api_key；SQL 口径同 routes.js llmRows / llm.js getFdeLlmHeartbeatModels 的 JOIN 条件）。
+      // 未配置 → 409 llm_not_configured fail-fast：不入队 run（否则 run 永久排队，等一个永远不会
+      // 出现的 LLM 出口）。
+      // 评审 MEDIUM-1：预检必须放在 fn 内（executeWithIdempotency 之后）——回放优先（findDone 在
+      // fn 之前返回首次结果，不被预检截断）；claim 后 fn 抛错走 ⑤ release 路径，「失败不占位」
+      // 语义保持（修好绑定后同 key 原样重试可成功建 run）。
+      const bound = await ctx.pool.query(
+        `SELECT 1
+           FROM fde_llm_bindings b
+           JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
+          WHERE b.fde_id = $1 AND b.state = 'active' AND b.api_key IS NOT NULL AND b.api_key <> ''
+          LIMIT 1`,
+        [session.user.id],
+      );
+      if (!bound.rows?.length) {
+        throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置');
+      }
       const posted = await sessions.postMessage(ctx.pool, {
         userId: session.user.id,
         sessionId,
