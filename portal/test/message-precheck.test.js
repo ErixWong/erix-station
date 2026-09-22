@@ -22,15 +22,16 @@ const SESSION_ID = 'a1b2c3d4-1111-4111-8111-abcdefabcdef';
 const TOKEN = 'tok-llm-precheck-test';
 
 /**
- * 内存 pool：登录会话 + LLM 预检开关 + postMessage 业务事务所需的全部 SQL。
+ * 内存 pool：登录会话 + LLM 预检开关 + postMessage 业务事务 + 幂等台账所需的全部 SQL。
  * llmUpstreamOk=false 模拟「无 active binding / api_key 空 / provider 停用」的 JOIN 空结果。
  */
 class MessagePool extends FakePool {
   constructor({ llmUpstreamOk = false } = {}) {
     super({ users: [USER] });
     this.llmUpstreamOk = llmUpstreamOk;
-    this.connected = 0; // 业务事务 connect 次数（预检 409 路径必须保持 0）
+    this.connected = 0; // 业务事务 connect 次数（预检 409 路径必须保持 0；回放路径不得增长）
     this.notified = [];
+    this.idem = new Map(); // 幂等台账：`${userId}|${endpoint}|${key}` → 行（内存模拟 idempotency_keys）
     this.sessions.push({
       id: 'ls1', user_id: USER.id, token_hash: auth.hashToken(TOKEN),
       created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
@@ -42,6 +43,40 @@ class MessagePool extends FakePool {
   }
 
   async query(sql, params = []) {
+    // ---- 幂等台账（内存模拟 idempotency_keys；行一旦写入恒新鲜，过期路径不在本测试范围） ----
+    if (sql.includes('INSERT INTO idempotency_keys')) {
+      const [userId, endpoint, key, hash, claimToken] = params;
+      const k = `${userId}|${endpoint}|${key}`;
+      if (this.idem.has(k)) return { rows: [] }; // 已存在（in_progress 未超时 / done 未过期）→ 占位失败
+      this.idem.set(k, { state: 'in_progress', request_hash: hash, claim_token: claimToken, status_code: null, response: null, created_at: new Date() });
+      return { rows: [{ claimed: 1 }] };
+    }
+    if (sql.includes('FROM idempotency_keys') && sql.includes("state = 'done'")) {
+      const [userId, endpoint, key] = params;
+      const row = this.idem.get(`${userId}|${endpoint}|${key}`);
+      return { rows: row && row.state === 'done' ? [row] : [] };
+    }
+    if (sql.includes('FROM idempotency_keys') && !sql.includes('DELETE FROM')) { // findRow（claim 失败后的归属判定）
+      const [userId, endpoint, key] = params;
+      const row = this.idem.get(`${userId}|${endpoint}|${key}`);
+      return { rows: row ? [row] : [] };
+    }
+    if (sql.includes('UPDATE idempotency_keys') && sql.includes("SET state = 'done'")) { // writeDone（record）
+      const [userId, endpoint, key, statusCode, response, claimToken] = params;
+      const row = this.idem.get(`${userId}|${endpoint}|${key}`);
+      if (!row || row.state !== 'in_progress' || row.claim_token !== claimToken) return { rows: [], rowCount: 0 };
+      row.state = 'done';
+      row.status_code = statusCode;
+      row.response = JSON.parse(response);
+      return { rows: [{ state: 'done' }], rowCount: 1 };
+    }
+    if (sql.includes('DELETE FROM idempotency_keys') && params.length === 4) { // release（fn 抛错路径）
+      const [userId, endpoint, key, claimToken] = params;
+      const k = `${userId}|${endpoint}|${key}`;
+      const row = this.idem.get(k);
+      if (row && row.state === 'in_progress' && row.claim_token === claimToken) this.idem.delete(k);
+      return { rows: [] };
+    }
     // issue #41 预检：JOIN 结果（routes.js llmRows 口径）
     if (sql.includes('FROM fde_llm_bindings') && sql.includes('llm_providers')) {
       return { rows: this.llmUpstreamOk ? [{ ok: 1 }] : [] };
@@ -154,6 +189,58 @@ test('issue #41：未登录 → 401（预检不绕开鉴权）', async () => {
       body: JSON.stringify({ content: 'hi' }),
     });
     assert.equal(r.status, 401);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 评审 MEDIUM-1 回归：幂等语义优先于 LLM 预检（预检在 executeWithIdempotency 的 fn 内）
+// ---------------------------------------------------------------------------
+
+function postMessageKeyed(s, key, body) {
+  return fetch(`${s.base}/api/sessions/${SESSION_ID}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: s.cookieHeader, 'Idempotency-Key': key },
+    body: JSON.stringify(body),
+  });
+}
+
+test('评审 MEDIUM-1：预检 409（带幂等 key）→ 修好绑定 → 同 key 重试成功建 run（失败不留占位）', async () => {
+  const s = await startServer({ llmUpstreamOk: false });
+  try {
+    const key = 'k-retry-after-llm-fix';
+    const r1 = await postMessageKeyed(s, key, { content: 'hi', attachments: [] });
+    assert.equal(r1.status, 409);
+    assert.equal((await r1.json()).error.code, 'llm_not_configured');
+    assert.equal(s.pool.idem.size, 0, 'fn 抛错路径必须 release 占位行（失败不占位）');
+
+    s.pool.llmUpstreamOk = true; // 管理员在管理台配好 LLM 上游
+    const r2 = await postMessageKeyed(s, key, { content: 'hi', attachments: [] });
+    assert.equal(r2.status, 202, '同 key 原样重试应成功（占位已释放，可重新 claim）');
+    const body2 = await r2.json();
+    assert.equal(body2.message.role, 'user');
+    assert.equal(body2.run.status, 'queued');
+  } finally {
+    await s.close();
+  }
+});
+
+test('评审 MEDIUM-1：已完成请求的同 key 重试 → 回放首次结果（202 同 message/run，预检不再截断）', async () => {
+  const s = await startServer({ llmUpstreamOk: true });
+  try {
+    const key = 'k-replay-after-done';
+    const r1 = await postMessageKeyed(s, key, { content: 'hi', attachments: [] });
+    assert.equal(r1.status, 202);
+    const first = await r1.json();
+    const connectedAfterFirst = s.pool.connected;
+
+    s.pool.llmUpstreamOk = false; // 成功后上游被撤（不该影响回放）
+    const r2 = await postMessageKeyed(s, key, { content: 'hi', attachments: [] });
+    assert.equal(r2.status, 202, '回放优先：findDone 在 fn（含预检）之前返回首次结果');
+    const second = await r2.json();
+    assert.deepEqual(second, first, '回放体与首次结果逐字一致（同 message.id / run.id）');
+    assert.equal(s.pool.connected, connectedAfterFirst, '回放路径不执行业务事务');
   } finally {
     await s.close();
   }
