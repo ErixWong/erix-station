@@ -43,6 +43,7 @@ function readCookie(setCookie) {
  * @param {string} opts.dynamicDir     宿主侧 Traefik 动态目录（llm-routes.yml 所在）
  * @param {string} [opts.llmDynamicFile]
  * @param {string} opts.fdeName
+ * @param {string} [opts.portalContainerName]  portal 容器名（F8 并行隔离：缺省 station-portal）
  * @param {string} opts.adminLogin     break-glass admin 登录名（每 e2e 独立，避免冲突）
  * @param {string} opts.adminPassword  break-glass admin 口令（无空格）
  * @param {string} [opts.model]        model_id（mock 忽略模型名，route 存在即可跑通）
@@ -55,6 +56,7 @@ export async function ensureMockLlmBinding({
   dynamicDir,
   llmDynamicFile = 'llm-routes.yml',
   fdeName,
+  portalContainerName = 'station-portal',
   adminLogin,
   adminPassword,
   model = 'mock-model',
@@ -67,7 +69,7 @@ export async function ensureMockLlmBinding({
   assert.ok(!/\s/.test(adminPassword), 'adminPassword 不含空格（CLI 参数传递）');
 
   // 1) bootstrap break-glass admin → 解析一次性 TOTP 种子（输出不入日志）
-  const bootOut = docker(`exec station-portal node portal/src/cli.js bootstrap-admin --allow-extra --login ${adminLogin} --password ${adminPassword}`);
+  const bootOut = docker(`exec ${portalContainerName} node portal/src/cli.js bootstrap-admin --allow-extra --login ${adminLogin} --password ${adminPassword}`);
   const seedMatch = /种子（[^\n]*）：([A-Z2-7]{16,})/.exec(bootOut);
   assert.ok(seedMatch, `bootstrap-admin 输出含 TOTP 种子行：${bootOut.split('\n')[0] ?? ''}`);
   const adminSecret = seedMatch[1];

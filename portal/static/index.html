@@ -267,7 +267,7 @@
       es.onmessage = () => {}; // 具名事件分发
       for (const type of ['round_start','round_end','attempt','recovering','recovered','usage',
                           'tool_use','tool_result','assistant_delta','reasoning_delta',
-                          'tool_call_delta','judge','run_end','ping','resync']) {
+                          'tool_call_delta','judge','compaction','final_guard','forced_final','run_end','ping','resync']) {
         // 陈旧连接的事件一律忽略（重连后旧连接可能还有在途帧，防重复渲染/重复推进水位线）
         es.addEventListener(type, (e) => { if (S.es !== es) return; handleEvent(type, e); });
       }
@@ -368,9 +368,35 @@
           return;
         }
         case 'judge': {
-          if (d.kind === 'intercept') sep(`judge：${d.action}${d.decision?.reason ? ' — ' + d.decision.reason : ''}`);
+          // 0.9.0 引擎载荷（已对源码核实）：extend/extendReason/plan 在 d.decision 内
+          // （orchestrator round judge）；passThrough 挂在 intercept 类事件上
+          // （checkpoint-executor，action='executed' + passThrough='on_track'|'readonly'）。
+          const dec = d.decision ?? {};
+          if (d.passThrough) { sep(`judge：放行（${d.passThrough}）`); return; }
+          if (dec.extend === true) {
+            sep(`judge：扩轮${dec.plan ? ' — ' + String(dec.plan).slice(0, 80) : ''}${dec.extendReason ? '（' + String(dec.extendReason).slice(0, 60) + '）' : ''}`);
+            return;
+          }
+          if (dec.extend === false) {
+            sep(`judge：不扩轮${dec.extendReason ? ' — ' + String(dec.extendReason).slice(0, 80) : ''}`);
+            return;
+          }
+          if (d.kind === 'intercept' || d.action) {
+            sep(`judge：${d.action ?? ''}${dec.reason ? ' — ' + dec.reason : ''}`);
+          }
           return;
         }
+        // 0.9.0 新事件类型（issue #43）：compaction = 上下文折叠（详情在 d.compaction，
+        // orchestrator recordCompactionStat）；final_guard = 终稿核验（action ∈ accept/skip/
+        // revise/degraded/error）；forced_final = 最后一轮强制无 tools 文本终稿（termination.js）。
+        // P1 仅状态行展示，不参与运行态状态机。
+        case 'compaction': {
+          const c = d.compaction ?? {};
+          sep(`上下文折叠（round ${d.round}）：${c.foldedRounds ?? 0} 轮折叠，${c.tokensBefore ?? '?'} → ${c.tokensAfter ?? '?'} tokens`);
+          return;
+        }
+        case 'final_guard': sep(`final guard：${d.action ?? 'unknown'}${d.reason ? ` — ${d.reason}` : ''}`); return;
+        case 'forced_final': sep(`forced final（round ${d.round}）：${d.reason ?? ''}`); return;
         case 'usage': return;
         case 'run_end': {
           // 历史重放的旧 run_end 不参与运行态状态机（防误关当前 run 的停止按钮/误拉刷新）

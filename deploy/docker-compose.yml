@@ -14,7 +14,7 @@ networks:
 
 services:
   station-db:
-    container_name: station-db
+    container_name: "${STATION_DB_NAME:-station-db}"
     image: ${POSTGRES_IMAGE:-postgres:16.15}
     restart: unless-stopped
     networks:
@@ -56,7 +56,7 @@ services:
   # 自研零依赖 admission proxy：方法+路径白名单（12 条契约路径）+ POST /containers/create 策略校验（§5 B6），
   # 替换 tecnativa/docker-socket-proxy（其 POST=1 是全局方法门，无路径级 POST 白名单）。
   station-docker-proxy:
-    container_name: station-docker-proxy
+    container_name: "${STATION_DOCKER_PROXY_NAME:-station-docker-proxy}"
     build:
       context: ./fde-proxy
       dockerfile: Dockerfile
@@ -104,7 +104,7 @@ services:
       start_period: 5s
 
   station-portal:
-    container_name: station-portal
+    container_name: "${STATION_PORTAL_NAME:-station-portal}"
     build:
       context: ..
       dockerfile: portal/Dockerfile
@@ -211,7 +211,7 @@ services:
   # 2026-09-20 修订（issue #38）：LLM 出口已定 per-FDE 上游直发（fde_llm_bindings → 注入真实上游 key），
   # 不建 LiteLLM hub；P3 如需接真实上游，只需把 admin API 里 provider 的 base_url 指到真实端点。
   station-mock-llm:
-    container_name: station-mock-llm
+    container_name: "${STATION_MOCK_LLM_NAME:-station-mock-llm}"
     build:
       context: ../portal/mock-gateway
       dockerfile: Dockerfile
@@ -245,7 +245,7 @@ services:
       start_period: 5s
 
   station-edge:
-    container_name: station-edge
+    container_name: "${STATION_EDGE_NAME:-station-edge}"
     image: ${TRAEFIK_IMAGE:-traefik:v3.7.13}
     restart: unless-stopped
     network_mode: host
@@ -255,8 +255,14 @@ services:
       - ALL
     command:
       - --configFile=/etc/traefik/traefik.yml
+      # F8 注：入口端口**不写 CLI 覆盖**——Traefik v3 带 --configFile 时静态文件里已定义的
+      # entryPoints 会压过 CLI 覆盖（实测 file + --entrypoints.web.address=:19090 仍绑 :8090、
+      # 与共享 edge 抢端口 EADDRINUSE）。隔离栈改经 TRAEFIK_STATIC_HOST 整体替换静态配置文件
+      #（见下条 volume 与 wp3b-e2e 的生成逻辑）。
     volumes:
-      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      # 静态配置可整体替换（F8 并行隔离：wp3b-e2e 生成仅改入口端口的专用 traefik.yml 注入）；
+      # 缺省 = 共享同一份文件，渲染不变、不 recreate。
+      - ${TRAEFIK_STATIC_HOST:-./traefik/traefik.yml}:/etc/traefik/traefik.yml:ro
       # 动态配置目录与 portal（reconciler）共享宿主目录；Traefik 侧只读（deploy-contract §4.2）。
       - ${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}:/etc/traefik/dynamic/:ro
     # 开发期 http，无 acme.json / 证书；部署期证书与 logs 见 deploy-contract §2.2/§4.3

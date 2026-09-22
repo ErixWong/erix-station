@@ -107,3 +107,12 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - provider 导出 `createOpenAIProvider`/`createJsonFileModelConfigProvider` 与 `registry.executeTool(name, input, context)` 签名未变；worker 的 executeTool 已是结构化包装，无需改。
 - 升级后对 station store adapter 跑 `erix-agent/contract-tests`（`transcriptStoreContract` 0.6.0 起更严：checkpoint 字节保真、多 runId 隔离、runState round-trip）。
 - `runner/package.json` 版本号 + lock、wp3b-e2e、本节状态在 PR 内同步更新。
+
+### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
+
+- [x] **必改项 1**：`erix-agent/tools` 四导入断供 → runner 自带 jail + file 工具（`runner/lib/file-tools.js`，0.3.5 语义移植）；recall 工具删除，档案取回归 note 工作流（`runner/lib/notes-tools.js`，复用随包 notes 技能模块 + `createFileNotesStore`，落盘 `<worktree>/.notes`）。
+- [x] **必改项 2**：store adapter 补 `saveRunState`/`loadRunState`（`runner/lib/store.js`，transport 可注入）→ agentd `handleStoreRequest` 两 case → portal `PUT/GET /runs/:id/runstate`（落 `runs.run_state jsonb`，迁移 `0003-run-state.sql`）。markRunState 双路：`'running'` → U2；引擎终态标记 → runstate 合并 `state`（不动 `runs.status`）。
+- [x] **必改项 3**：store.recall 端点**保留**（引擎 0.8.0 起不调用；worker 不注册 recall 工具；非孤儿——既有断言面与只读兼容）。
+- [x] **必改项 4**：worker 传参逐项核对在 `host-consumer-contract.md` 选项白名单内，未加契约外键。
+- [x] **随动同步**：`runner/package.json` → 0.9.0 + lock；portal 事件白名单补 `compaction`/`final_guard`（judge 事件 `extend`/`passThrough` 前端展示）；termination 枚举补 `final_guard_unverified` + `run_state` 列文档落 `docs/data/model.md`（**baseline 冻结规则优先**：`docs/data/schema.sql` 的修改已回滚——`migrate.js` 实时 sha256 校验，改 baseline 会让既有部署拒启；DDL 只走 `0003-run-state.sql`）；契约测试 `transcriptStoreContract` 对 station adapter 全绿（`runner/test/store-contract.test.js`）。
+- [ ] **待办**：wp3b-e2e 真机复跑（共享栈被 portal-ux-fixes 评审占用期间未跑；断言已补 run_state 链路）；是否开 judge（扩轮）另行决策，本升级不开。
