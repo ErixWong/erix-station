@@ -100,6 +100,58 @@ test('两步登录：口令正确仅返回 pending_token（不发 cookie），TO
   }
 });
 
+test('未注册 TOTP（totp_secret 为 NULL）→ step1 口令直通建会话', async () => {
+  const password = 'correct horse battery staple';
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+    auth_source: 'local', status: 'active',
+    password_hash: await auth.hashPassword(password),
+    totp_secret: null, last_totp_step: null,
+  };
+  const s = await startServer({ users: [user] });
+  try {
+    const step1 = await fetch(`${s.base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    assert.equal(step1.status, 200);
+    const body = await step1.json();
+    assert.equal(body.status, 'authenticated');
+    assert.ok(body.user);
+    assert.equal(Object.hasOwn(body, 'pending_token'), false);
+    assert.ok(step1.headers.get('set-cookie'));
+  } finally {
+    await s.close();
+  }
+});
+
+test('未注册 TOTP（totp_secret 为空字符串）→ step1 口令直通建会话', async () => {
+  const password = 'correct horse battery staple';
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'admin', fde_name: null,
+    auth_source: 'local', status: 'active',
+    password_hash: await auth.hashPassword(password),
+    totp_secret: '', last_totp_step: null,
+  };
+  const s = await startServer({ users: [user] });
+  try {
+    const step1 = await fetch(`${s.base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: 'alice', password }),
+    });
+    assert.equal(step1.status, 200);
+    const body = await step1.json();
+    assert.equal(body.status, 'authenticated');
+    assert.ok(body.user);
+    assert.equal(Object.hasOwn(body, 'pending_token'), false);
+    assert.ok(step1.headers.get('set-cookie'));
+  } finally {
+    await s.close();
+  }
+});
+
 test('错误 TOTP → 401 totp_invalid；pending_token 二次使用 → 401 pending_expired', async () => {
   const password = 'pw';
   const totpSecret = totp.generateSecret(20);
