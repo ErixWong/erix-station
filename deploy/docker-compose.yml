@@ -148,6 +148,9 @@ services:
       DOCKER_HOST: tcp://station-docker-proxy:2375
       COOKIE_PROFILE: ${COOKIE_PROFILE:-dev-http}
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      # F9：栈所有权标签——reconcile 孤儿清扫只清 station.stack=<stackId> 的本栈 FDE 容器/网络，
+      # 防并行栈（如 wp3b-e2e 隔离栈，STATION_STACK_ID=station-e2e-43）互删对方 FDE。缺省 default。
+      STATION_STACK_ID: ${STATION_STACK_ID:-default}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
       # ---- WP2a：materializer + 路由 reconciler ----
       ERIX_USERSPACE_ROOT: /srv/erix/users

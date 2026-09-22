@@ -7,7 +7,7 @@
 //
 // 并行隔离用法（F8）：不拆共享栈（station-*）的前提下跑隔离栈——所有固定名/端口经 env 派生：
 //   STATION_DB_DIR=/tmp/station-db-43 COMPOSE_PROJECT_NAME=station-e2e-43 \
-//   STATION_DB_NAME=station-db-43 STATION_PORTAL_NAME=station-portal-43 \
+//   STATION_DB_NAME=station-db-43 STATION_PORTAL_NAME=station-portal-43 STATION_STACK_ID=station-e2e-43 \
 //   PORTAL_HOST_PORT=28080 LLM_GATEWAY_PORT=4400 MOCK_DEBUG_PORT=4401 \
 //   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=alice43 \
 //   node portal/integration/wp3b-e2e.mjs
