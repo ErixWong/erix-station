@@ -83,7 +83,7 @@ export function renderProjectAgentsMd({ fdeName, projectName, repoUrl }) {
         '目录非空（含 `.erix/`、`.gitignore`），clone 到临时目录再搬移，或 `git init + remote add + fetch + checkout`：',
         '',
         '```bash',
-        `git init && git remote add origin ${normalizedRepoUrl} && git fetch origin && git checkout -b main origin/main`,
+        `git init && git remote add origin '${normalizedRepoUrl.replaceAll("'", "'\\''")}' && git fetch origin && git checkout -b main origin/main`,
         '```',
       ]
     : [

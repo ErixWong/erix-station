@@ -105,6 +105,21 @@ test('renderProjectAgentsMd：有 repoUrl 时写入真实地址并移除占位�
   assert.doesNotMatch(agents, /<repo_url>/);
 });
 
+test('renderProjectAgentsMd：repoUrl 含 shell 元字符时在命令中使用 POSIX 单引号引用', () => {
+  const files = buildFilePlan({
+    fdeName: 'alice',
+    baseDomain: 'localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
+    root: '/srv/erix/users',
+    generation: 1,
+    projects: [{ id: 'p1', name: 'proj1', repo_url: 'https://host/repo.git;id' }],
+    allocationsByProject: new Map(),
+  });
+  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
+  assert.match(agents, /origin 'https:\/\/host\/repo\.git;id'/);
+  assert.doesNotMatch(agents, /origin https:\/\/host\/repo\.git;id/);
+});
+
 test('renderProjectAgentsMd：无 repoUrl 时给出未关联仓库指引且移除占位符', () => {
   const files = buildFilePlan({
     fdeName: 'alice',

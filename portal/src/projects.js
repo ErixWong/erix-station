@@ -122,6 +122,9 @@ export async function createProject(pool, { userId, name, repoUrl, template = 'd
     if (typeof repoUrl !== 'string') {
       throw new ProjectError('validation_failed', 'repo_url 非法', { httpStatus: 400, details: { field: 'repo_url' } });
     }
+    if (/[\x00-\x1f\x7f]/.test(repoUrl)) {
+      throw new ProjectError('validation_failed', 'repo_url 非法', { httpStatus: 400, details: { field: 'repo_url' } });
+    }
     normalizedRepoUrl = repoUrl.trim() || null;
     if (normalizedRepoUrl) {
       // repo_url 仅作可选登记元数据（平台不 clone），做最小 URL 形状校验。

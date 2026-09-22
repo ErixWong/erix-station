@@ -163,7 +163,7 @@ test('toProject / toPort 映射', () => {
   assert.equal(port.released_at, null);
 });
 
-for (const [label, repoUrl] of [['未提供 repo_url', undefined], ['repo_url 为空串', '']]) {
+for (const [label, repoUrl] of [['未提供 repo_url', undefined], ['repo_url 为空串', ''], ['repo_url 纯空白', '   ']]) {
   test(`createProject：${label} → 成功创建并将 repo_url 落库为 NULL`, async () => {
     const pool = createProjectPool();
     const result = await createProject(pool, {
@@ -178,6 +178,33 @@ for (const [label, repoUrl] of [['未提供 repo_url', undefined], ['repo_url �
     assert.equal(insert.params[2], null);
   });
 }
+
+for (const repoUrl of [123, {}]) {
+  test(`createProject：非字符串 repo_url ${JSON.stringify(repoUrl)} → validation_failed 400`, async () => {
+    await assert.rejects(
+      () => createProject(createProjectPool(), { userId: 'u1', name: 'proj1', repoUrl, config: { baseDomain: 'localhost' } }),
+      (err) => err instanceof ProjectError
+        && err.code === 'validation_failed'
+        && err.httpStatus === 400
+        && err.details.field === 'repo_url',
+    );
+  });
+}
+
+test('createProject：repo_url 含控制字符 → validation_failed 400', async () => {
+  await assert.rejects(
+    () => createProject(createProjectPool(), {
+      userId: 'u1',
+      name: 'proj1',
+      repoUrl: 'https://git.example/repo\n.git',
+      config: { baseDomain: 'localhost' },
+    }),
+    (err) => err instanceof ProjectError
+      && err.code === 'validation_failed'
+      && err.httpStatus === 400
+      && err.details.field === 'repo_url',
+  );
+});
 
 for (const repoUrl of ['ftp://x', 'not-a-url']) {
   test(`createProject：非法 repo_url ${repoUrl} → validation_failed 400`, async () => {

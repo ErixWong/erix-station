@@ -51,6 +51,92 @@ async function startServer({ users = [], overrides = {}, pool: customPool } = {}
   };
 }
 
+test('POST /api/projects：非字符串 repo_url → 400 validation_failed', async () => {
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice',
+    auth_source: 'local', status: 'active',
+  };
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM login_sessions s') && sql.includes('JOIN users')) {
+        return {
+          rows: [{
+            ...user,
+            session_id: 's1',
+            expires_at: new Date(Date.now() + 3600000),
+            last_seen_at: new Date(),
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql, params = []) {
+          const normalized = sql.replace(/\s+/g, ' ').trim();
+          if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(normalized)) return { rows: [] };
+          if (normalized.includes('SELECT pg_advisory_xact_lock')) return { rows: [] };
+          if (normalized.includes('SELECT id, login, display_name, role, fde_name')) return { rows: [user] };
+          if (normalized.includes('FROM projects WHERE user_id = $1 AND name = $2')) return { rows: [] };
+          if (normalized.includes('FROM fde_networks WHERE fde_id = $1 AND state IN')) {
+            return { rows: [{ fde_id: 'u1', network_name: 'fde-alice', subnet: '10.200.0.0/29', prefix_len: 29, gateway: '10.200.0.1', pool: 'default', state: 'allocated' }] };
+          }
+          if (normalized.startsWith('SELECT slot FROM projects')) return { rows: [] };
+          if (normalized.startsWith('INSERT INTO projects')) {
+            return {
+              rows: [{
+                id: 'p1',
+                name: params[1],
+                repo_url: params[2],
+                root_path: params[3],
+                slot: params[4],
+                template: params[5],
+                created_at: new Date('2026-09-12T08:30:00.000Z'),
+              }],
+            };
+          }
+          if (normalized.startsWith('INSERT INTO port_allocations')) {
+            return {
+              rows: [{
+                id: 'pa1',
+                scope: 'project',
+                port: params[2],
+                role: 'frontend',
+                run_id: null,
+                hostname: params[3],
+                url: params[4],
+                exposure: 'private',
+                state: 'allocated',
+                released_at: null,
+              }],
+            };
+          }
+          if (normalized.startsWith('INSERT INTO route_revisions') || normalized.startsWith('INSERT INTO materialize_revisions')) {
+            return { rows: [{ revision: 1 }] };
+          }
+          if (normalized.startsWith('INSERT INTO route_outbox') || normalized.startsWith('INSERT INTO materialize_outbox')) return { rows: [] };
+          throw new Error(`unexpected query in HTTP createProject test: ${normalized}`);
+        },
+        release() {},
+      };
+    },
+  };
+  const s = await startServer({ pool, overrides: { baseDomain: 'localhost' } });
+  try {
+    const response = await fetch(`${s.base}/api/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: 'fde_session_dev=tok' },
+      body: JSON.stringify({ name: 'proj1', repo_url: 123 }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.error.code, 'validation_failed');
+    assert.equal(body.error.details.field, 'repo_url');
+  } finally {
+    await s.close();
+  }
+});
+
 test('两步登录：口令正确仅返回 pending_token（不发 cookie），TOTP 通过才发 cookie', async () => {
   const password = 'correct horse battery staple';
   const totpSecret = totp.generateSecret(20);
