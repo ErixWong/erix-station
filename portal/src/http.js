@@ -895,6 +895,21 @@ async function handleLoginStep1(req, res, ctx) {
   }
 
   ctx.loginLimiter.reset(rlKey);
+
+  // 未注册 TOTP（totp_secret 为空）→ 跳过第二因素，口令直通建会话。
+  // （偏离规格 §7.1「强制 TOTP」：NULL secret 原语义 = 第二步永远失败 = 永久锁死；
+  //   现改为「未注册即跳过」，用户决策 2026-09-22，规格同步见 issue）
+  if (!(await auth.hasTotpEnrollment(pool, result.user.id))) {
+    const session = await auth.createSession(pool, result.user.id, {
+      ip,
+      userAgent: req.headers['user-agent'] ?? null,
+      ttlSeconds: config.sessionTtlSeconds,
+    });
+    return sendJson(res, 200, { user: result.user }, {
+      'Set-Cookie': sessionCookieHeader(config.cookie, session.token),
+    });
+  }
+
   const pending = await auth.createPendingToken(pool, result.user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,

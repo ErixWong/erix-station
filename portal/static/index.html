@@ -150,7 +150,9 @@
             body: JSON.stringify({ login: f.login.value.trim(), password: f.password.value }),
           });
           if (!r.ok) throw new Error('口令校验失败（' + r.status + '）');
-          S.pendingToken = (await r.json()).pending_token;
+          const data = await r.json();
+          if (data.user) { location.reload(); return; } // 未注册 TOTP：密码直通会话
+          S.pendingToken = data.pending_token;
           $('loginForm').style.display = 'none';
           $('totpForm').style.display = '';
           $('loginErr').textContent = '';
