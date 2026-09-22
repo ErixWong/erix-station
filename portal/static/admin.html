@@ -41,6 +41,7 @@
     .detail { margin-top: .6rem; border-top: 1px dashed var(--bd); padding-top: .6rem; }
     .warnbox { border: 1px solid #d80; background: #fffaf0; color: #a60; border-radius: 8px; padding: .5rem .8rem; font-size: .83rem; margin: .5rem 0; }
     .totpbox { border: 1px solid var(--brand); background: #f2fff9; border-radius: 8px; padding: .6rem .8rem; margin: .5rem 0; font-size: .85rem; }
+    .totpbox .qr { display: block; width: 12rem; height: 12rem; margin: .5rem 0; image-rendering: pixelated; }
     .totpbox code { word-break: break-all; user-select: all; }
     .row-head { cursor: pointer; }
     .row-head:hover { background: #f6fffa; }
@@ -81,6 +82,7 @@
       </form>
     </section>
   </main>
+  <script src="/qrcode.js"></script>
   <script>
     'use strict';
     const $ = (id) => document.getElementById(id);
@@ -452,11 +454,16 @@
         if (f.fde_name.value.trim()) body.fde_name = f.fde_name.value.trim();
         const r = await api('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
         // TOTP 种子仅此一次显示（红线）：刷新/重进不再可见。
+        const qr = qrcode(0, 'M');
+        qr.addData(r.totp_uri);
+        qr.make();
         $('totpOnce').innerHTML = `
           <div class="totpbox">
+            <img class="qr" src="${qr.createDataURL(4, 8)}" alt="TOTP 认证器二维码">
             <div>用户 <b>${esc(r.user.login)}</b> 已创建。请用认证器 App 录入以下 otpauth URI 或种子（<b>仅此一次显示</b>）：</div>
             <div>otpauth URI：<code>${esc(r.totp_uri)}</code></div>
             <div>TOTP 种子：<code>${esc(r.totp_secret)}</code></div>
+            <div>下一步：展开该用户卡片 → 配置 LLM 上游 → 点击 provision 容器；将登录名/口令与本二维码交给用户扫码录入认证器。</div>
           </div>`;
         f.reset();
         await loadUsers();
