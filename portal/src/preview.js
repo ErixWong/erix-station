@@ -99,7 +99,7 @@ async function findActiveSessionByParent(pool, parentTicketId, now) {
 }
 
 /** 校验一次性 ticket 凭证（portal.md §2.7 第 4/6 步）。 */
-async function handleTicket(pool, config, { ticket, allocation, uri, scheme, now }) {
+async function handleTicket(pool, config, { ticket, allocation, uri, scheme, hostHeader = null, now }) {
   const h = hashToken(ticket);
   const r = await pool.query(
     `SELECT id, user_id, issuer_id, allocation_id, state, expires_at, used_at, revoked_at
@@ -123,7 +123,7 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, now
       return redirect(allocation, {
         ...audit,
         sessionToken,
-        location: buildLocation(scheme, allocation.hostname, stripPreviewTicket(uri)),
+        location: buildLocation(scheme, allocation.hostname, stripPreviewTicket(uri), hostHeader),
       });
     }
     return deny(403, 'preview_ticket_used', 'preview ticket already used', audit);
@@ -156,7 +156,7 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, now
         return redirect(allocation, {
           ...audit,
           sessionToken,
-          location: buildLocation(scheme, allocation.hostname, stripPreviewTicket(uri)),
+          location: buildLocation(scheme, allocation.hostname, stripPreviewTicket(uri), hostHeader),
         });
       }
       return deny(403, 'preview_ticket_used', 'preview ticket already used', audit);
@@ -179,7 +179,7 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, now
   return redirect(allocation, {
     ...audit,
     sessionToken,
-    location: buildLocation(scheme, allocation.hostname, stripPreviewTicket(uri)),
+    location: buildLocation(scheme, allocation.hostname, stripPreviewTicket(uri), hostHeader),
   });
 }
 
@@ -215,16 +215,22 @@ async function handleSessionCookie(pool, config, { cookie, allocation, now }) {
   return allow(allocation, { ...audit, cookieToken: cookie });
 }
 
-function buildLocation(scheme, hostname, cleanUri) {
+/**
+ * 302 Location 的 host 来源：优先用请求的原始 Host（含非默认端口，fix-250923-01）。
+ * 安全性：hostHeader 已在 authorizeForwardAuth 里剥端口后与 port_allocations.hostname 精确匹配
+ * （查不到即 404），故 hostHeader 的 host 部分必等于 allocation.hostname，无开放重定向面。
+ */
+function buildLocation(scheme, hostname, cleanUri, hostHeader = null) {
   const s = scheme === 'http' ? 'http' : 'https';
-  return `${s}://${hostname}${cleanUri || '/'}`;
+  const host = typeof hostHeader === 'string' && hostHeader !== '' ? hostHeader : hostname;
+  return `${s}://${host}${cleanUri || '/'}`;
 }
 
 /**
  * forward-auth 授权核心（portal.md §2.7）。返回结构化结果，由 http.js 映射为 HTTP 响应。
  * fail-closed：无凭证 / 凭证无效一律 deny，绝不放行。
  */
-export async function authorizeForwardAuth(pool, config, { hostname, uri = '/', cookieValue = null, method = 'GET', scheme = 'https', now = new Date() } = {}) {
+export async function authorizeForwardAuth(pool, config, { hostname, hostHeader = null, uri = '/', cookieValue = null, method = 'GET', scheme = 'https', now = new Date() } = {}) {
   const r = await pool.query(
     `SELECT a.id, a.fde_id, a.state, a.exposure, a.hostname, u.fde_name, u.status AS user_status
        FROM port_allocations a
@@ -253,7 +259,7 @@ export async function authorizeForwardAuth(pool, config, { hostname, uri = '/', 
 
   const ticket = parsePreviewTicket(uri);
   if (ticket) {
-    const res = await handleTicket(pool, config, { ticket, allocation, uri, scheme, now });
+    const res = await handleTicket(pool, config, { ticket, allocation, uri, scheme, hostHeader, now });
     return { ...res, fdeName: allocation.fde_name };
   }
   if (cookieValue) {
