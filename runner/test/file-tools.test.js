@@ -48,6 +48,39 @@ test('tree：目录树带深度限制', () =>
     assert.match(out, /c\.txt/);
   }));
 
+test('createJail：返回对象含 root 且等于传入根的 realpath', () =>
+  withJail((jail, root) => {
+    assert.equal(jail.root, fs.realpathSync(root));
+    assert.equal(typeof jail.root, 'string');
+    assert.ok(path.isAbsolute(jail.root));
+  }));
+
+test('tree：根标签统一为 ./（空目录，. 与 "" 与 ./ 输出一致）', () =>
+  withJail(async (jail) => {
+    const tools = createFileTools(jail);
+    const fromDot = await tools.executors.tree({ path: '.' });
+    const fromEmpty = await tools.executors.tree({ path: '' });
+    const fromSlash = await tools.executors.tree({ path: './' });
+    assert.equal(fromDot, './');
+    assert.equal(fromEmpty, fromDot);
+    assert.equal(fromSlash, fromDot);
+  }));
+
+test('tree：根标签统一为 ./（含文件目录，三者输出一致）', () =>
+  withJail(async (jail, root) => {
+    fs.mkdirSync(path.join(root, 'b'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'a.txt'), 'x');
+    fs.writeFileSync(path.join(root, 'b', 'c.txt'), 'y');
+    const tools = createFileTools(jail);
+    const expected = './\n  a.txt\n  b/\n    c.txt';
+    const fromDot = await tools.executors.tree({ path: '.' });
+    const fromEmpty = await tools.executors.tree({ path: '' });
+    const fromSlash = await tools.executors.tree({ path: './' });
+    assert.equal(fromDot, expected);
+    assert.equal(fromEmpty, fromDot);
+    assert.equal(fromSlash, fromDot);
+  }));
+
 test('rg：正则命中', () =>
   withJail(async (jail, root) => {
     fs.writeFileSync(path.join(root, 'x.txt'), 'foo bar\nbaz\nfoo twice\n');

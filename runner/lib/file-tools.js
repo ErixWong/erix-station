@@ -46,7 +46,8 @@ export class JailError extends Error {
 /**
  * 创建文件系统路径 jail（0.3.5 createJail 同名同语义移植）。
  * @param {{root:string, writable?:string[], maskedPaths?:string[]}} options
- * @returns {{resolve:(p:string)=>string, resolveForWrite:(p:string)=>string, assertReadable:(p:string)=>string}}
+ * @returns {{root:string, resolve:(p:string)=>string, resolveForWrite:(p:string)=>string, assertReadable:(p:string)=>string}}
+ *   root 为已 realpath 的绝对根路径，供调用方做「解析结果 == 根」判定。
  */
 export function createJail({ root, writable = [], maskedPaths = [] }) {
   const rootPath = fs.realpathSync(path.resolve(root));
@@ -81,7 +82,7 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
     return resolvedPath;
   };
 
-  return { resolve, resolveForWrite, assertReadable };
+  return { root: rootPath, resolve, resolveForWrite, assertReadable };
 }
 
 function normalizeNonNegativeInteger(value, fallback) {
@@ -253,8 +254,9 @@ export function createFileTools(jail) {
     if (resolvedTreePath === null) return '';
     const maxDepth = normalizeNonNegativeInteger(depth, 3);
     const rootStat = fs.statSync(resolvedTreePath);
-    const rootLabel = treePath === '.' ? '.' : path.basename(resolvedTreePath);
-    const lines = [rootLabel + (rootStat.isDirectory() ? '/' : '')];
+    // 根标签固定 './'：''/'./' 此前会显示 worktree 的 basename，被模型误读为同名子目录 → ENOENT 循环（issue #64 排查发现）
+    const rootLabel = resolvedTreePath === jail.root ? './' : path.basename(resolvedTreePath);
+    const lines = [rootStat.isDirectory() && !rootLabel.endsWith('/') ? rootLabel + '/' : rootLabel];
     const visitedDirectories = new Set();
     let entries = 1;
 
