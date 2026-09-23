@@ -74,4 +74,34 @@ describe('全局路由守卫', () => {
     await router.push('/');
     expect(router.currentRoute.value.path).toBe('/login');
   });
+
+  it('未登录访问深链 → /login 且带 redirect 回跳（hash 模式下 URL 为 #/session/s1）', async () => {
+    fetchMe(401, { error: { code: 'unauthorized', message: 'unauthorized' } });
+    const router = await freshRouter();
+    await router.push('/session/s1');
+    expect(router.currentRoute.value.path).toBe('/login');
+    expect(router.currentRoute.value.query.redirect).toBe('/session/s1');
+  });
+
+  it('已登录访问 /login?redirect=... → 回跳到 redirect 目标', async () => {
+    fetchMe(200, { user: FDE_USER });
+    const router = await freshRouter();
+    await router.push({ path: '/login', query: { redirect: '/session/s1' } });
+    expect(router.currentRoute.value.path).toBe('/session/s1');
+  });
+
+  it('已登录访问 /login（无 redirect）→ 回工作台 /', async () => {
+    fetchMe(200, { user: FDE_USER });
+    const router = await freshRouter();
+    await router.push('/login');
+    expect(router.currentRoute.value.path).toBe('/');
+  });
+
+  it('/session/:id 路由存在且复用工作台组件', async () => {
+    fetchMe(200, { user: FDE_USER });
+    const router = await freshRouter();
+    await router.push('/session/abc');
+    expect(router.currentRoute.value.name).toBe('session');
+    expect(router.currentRoute.value.params.id).toBe('abc');
+  });
 });
