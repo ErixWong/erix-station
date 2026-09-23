@@ -24,8 +24,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 # 源码 + 迁移脚本（schema/bootstrap + 增量迁移）
 COPY portal/ portal/
-# 前端构建产物：只注入 dist（staticDir/app/，由 serveStatic 以 /app 前缀服务，见 http.js 注释）。
-# 前端 node_modules 不进 runtime 镜像（.dockerignore 排除 + 本 COPY 仅 --from builder 的 dist）。
+# 前端构建产物：只注入 dist（staticDir/app/；serveStatic 把 / 与 /assets/* 映射到该注入目录，
+# 见 http.js issue #61 P2 注释）。前端 node_modules 不进 runtime 镜像
+#（.dockerignore 排除 + 本 COPY 仅 --from builder 的 dist）。
 COPY --from=frontend-builder /build/portal/frontend/dist/ portal/static/app/
 COPY docs/data/ docs/data/
 # 增量迁移（deploy/migrations/*.sql）：migrate runner 的 defaultMigrationsDir() = /app/deploy/migrations，

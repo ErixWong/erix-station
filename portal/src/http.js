@@ -1362,10 +1362,11 @@ async function serveStatic(req, res, ctx, url) {
   } catch {
     throw new HttpError(400, 'validation_failed', 'invalid path');
   }
-  if (rel === '/') rel = '/index.html';
-  // issue #61 P1（过渡期挂载点，P2 翻转后删除）：Vue SPA 挂在 /app/——dist 由 Docker 多阶段
-  // 构建注入 staticDir/app/；hash 路由承担子路径，故 /app(/|) 只需指到 index.html，无需 catch-all。
-  if (rel === '/app' || rel === '/app/') rel = '/app/index.html';
+  // issue #61 P2 翻转：/ 服务 Vue SPA——dist 由 Docker 多阶段构建注入 staticDir/app/
+  //（vite base '/'，产物引用 /assets/*，故 /assets/ 前缀映射到注入目录；hash 路由承担子路径，
+  // 无需 pathname catch-all）。旧 static/index.html 保留文件但不再被引用（P4 删）。
+  if (rel === '/' || rel === '/index.html') rel = '/app/index.html';
+  else if (rel.startsWith('/assets/')) rel = `/app${rel}`;
   // 以静态目录为根做规范化，再用 path.relative 校验未逃逸（静态路径穿越防护）。
   const filePath = path.resolve(staticRoot, `.${rel}`);
   const relPath = path.relative(staticRoot, filePath);
