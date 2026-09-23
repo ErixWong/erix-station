@@ -39,12 +39,12 @@
     .msg.user { background: #e8f4ff; margin-left: auto; }
     .msg.assistant { background: var(--bs-secondary-bg); }
     .msg.synthetic { border-left: 3px solid var(--bs-warning); background: var(--bs-warning-bg-subtle); }
-    /* 工具卡片（JS class 钩子 card ok/err/t/dig/out） */
-    #stream .card { border: 1px solid var(--bd); border-left: 3px solid #888; border-radius: 6px; padding: .4rem .7rem; margin: .35rem 0; font-size: .85rem; max-width: 46rem; background: var(--bs-tertiary-bg); }
-    #stream .card.ok { border-left-color: var(--bs-success); }
-    #stream .card.err { border-left-color: var(--bs-danger); }
-    #stream .card .t { font-weight: 600; }
-    #stream .card .dig { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* 工具卡片（JS class 钩子 card ok/err/t/dig/out；排除登录卡，登录卡走纯 Bootstrap card） */
+    #stream .card:not(.login-card) { border: 1px solid var(--bd); border-left: 3px solid #888; border-radius: 6px; padding: .4rem .7rem; margin: .35rem 0; font-size: .85rem; max-width: 46rem; background: var(--bs-tertiary-bg); }
+    #stream .card:not(.login-card).ok { border-left-color: var(--bs-success); }
+    #stream .card:not(.login-card).err { border-left-color: var(--bs-danger); }
+    #stream .card:not(.login-card) .t { font-weight: 600; }
+    #stream .card:not(.login-card) .dig { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     /* 会话列表项（JS class 钩子 sess active/meta） */
     .sess { border: 1px solid var(--bd); border-radius: 6px; padding: .45rem; margin-top: .4rem; cursor: pointer; font-size: .88rem; }
     .sess.active { border-color: var(--brand); background: var(--bs-success-bg-subtle); }
@@ -188,7 +188,7 @@
       $('stream').innerHTML = '';
       $('composer').style.display = 'none';
       const div = document.createElement('div');
-      div.className = 'card mx-auto mt-5';
+      div.className = 'card login-card mx-auto mt-5';
       div.style.maxWidth = '22rem';
       div.innerHTML = `
         <div class="card-body">
