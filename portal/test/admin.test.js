@@ -188,6 +188,14 @@ test('admin 用户管理：重复 login → 409；缺字段 / 非法 fde_name �
     });
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error.details.field, 'fde_name');
+    // 尾随连字符会被 DB CHECK 拒绝，必须在落库前返回 validation_failed
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H, body: JSON.stringify({ login: 'dave', password: 'whatever-1', fde_name: 'abc-' }),
+    });
+    assert.equal(res.status, 400);
+    const invalidFde = await res.json();
+    assert.equal(invalidFde.error.code, 'validation_failed');
+    assert.equal(invalidFde.error.details.field, 'fde_name');
     // fde_name 被占用
     res = await fetch(`${base}/api/admin/users`, {
       method: 'POST', headers: H, body: JSON.stringify({ login: 'carol', password: 'whatever-1', fde_name: 'alice' }),
@@ -230,6 +238,14 @@ test('admin 用户管理 + provision + llm：非 admin 一律 403，无 cookie 4
 test('admin provision：未知 fde → 500 provision_failed（对账循环后台兜底，错误信息回显）', async () => {
   const { base, cookie, close } = await startAdminServer();
   try {
+    const invalid = await fetch(`${base}/api/admin/fdes/abc-/provision`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(invalid.status, 400);
+    const invalidBody = await invalid.json();
+    assert.equal(invalidBody.error.code, 'validation_failed');
+    assert.equal(invalidBody.error.details.field, 'fde_name');
+
     const res = await fetch(`${base}/api/admin/fdes/ghost/provision`, {
       method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}',
     });

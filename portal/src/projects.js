@@ -8,8 +8,8 @@ import {
   enqueueMaterializeChange,
 } from './outbox.js';
 
-export const PROJECT_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
-export const FDE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+export const PROJECT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+export const FDE_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 export const PORT_BLOCK_BASE = 4000;
 export const PORT_BLOCK_SIZE = 8;
 export const DEFAULT_PORT_QUOTA = 40; // 每用户项目 slot 配额（规格 §8.2「如 40 个端口」）
