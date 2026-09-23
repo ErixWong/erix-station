@@ -27,6 +27,17 @@ import { createFileTools, createJail } from './lib/file-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
 
+// issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
+// docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
+// 约束真模型收尾行为：交付物落盘、回复只写简短摘要、不贴代码全文。
+const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，工作目录是本次 run 独占的 worktree。
+
+交付规则：
+1. 交付物（代码/配置/文档）必须用 writeFile 写入工作目录的文件系统——磁盘上的文件才是交付物。
+2. 修改既有文件前先 readFile 看现状，不要凭空整文件覆写。
+3. 收尾回复只写简短摘要：做了什么、写入/修改了哪些文件、如何运行与验证；不要在回复里粘贴代码全文或大段文件内容。
+4. 若任务只是问答或解释、不产生交付物，直接回答即可，无需写文件。`;
+
 const nextReqId = createReqIdGenerator();
 let runStart = null;
 
@@ -242,6 +253,8 @@ async function startRun(msg) {
     }
     const result = await runToolLoop({
       provider,
+      // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
+      system: SYSTEM_PROMPT,
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
       onEvent: (event) => {
         if (event?.type === 'usage') return; // 双源去重：记账以返回值 usage 为准（§7.3/§6.3-6）
