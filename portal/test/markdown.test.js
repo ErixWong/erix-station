@@ -17,11 +17,17 @@ function loadClient({ withIndex = false, dropRenderer = false, fetchImpl = null 
   const document = {
     getElementById(id) { if (!els.has(id)) els.set(id, makeEl()); return els.get(id); },
     createElement() { return makeEl(); },
+    // issue #55：前端用到 document.body.classList（抽屉）与 document.hidden（通知）
+    body: { classList: { add() {}, remove() {}, toggle() {}, contains: () => false } },
+    hidden: false,
   };
   const sandbox = {
     document,
     fetch: fetchImpl ?? (async () => { throw new Error('fetch 在单测中禁用'); }),
-    location: { reload() {} },
+    // issue #55：前端用到 window（popstate）/history（hash 深链）/location.hash 等浏览器 API
+    window: { addEventListener() {}, focus() {} },
+    history: { pushState() {}, replaceState() {} },
+    location: { reload() {}, hash: '', pathname: '/', search: '' },
     alert() {}, prompt() { return null; },
     console, setTimeout, clearTimeout, setInterval, clearInterval,
   };

@@ -37,11 +37,13 @@ class FakeEventSource {
 function makeEl() {
   return {
     style: {}, dataset: {}, textContent: '', innerHTML: '', value: '', disabled: false,
-    scrollTop: 0, scrollHeight: 0,
+    scrollTop: 0, scrollHeight: 0, clientHeight: 0,
     classList: { add() {}, remove() {}, contains: () => false },
     appendChild() {}, remove() {},
     querySelector() { return makeEl(); }, querySelectorAll() { return []; },
-    addEventListener() {},
+    // issue #55 A2：记录事件监听，测试可直接驱动 scroll 处理函数
+    listeners: {},
+    addEventListener(type, fn) { this.listeners[type] = fn; },
     focus() {}, reset() {},
   };
 }
@@ -53,24 +55,42 @@ function loadClient({ fetch: fetchImpl } = {}) {
   assert.ok(m, 'index.html 应含单个内联脚本');
   const els = new Map();
   const created = []; // sep()/msg 等 createElement 产物（断言渲染文本用）
+  // issue #55：前端用到 document.body.classList（抽屉）与 document.hidden（通知）；
+  // body.classList 记录 drawer-open 状态，测试可断言
+  const bodyClasses = new Set();
   const document = {
     getElementById(id) { if (!els.has(id)) els.set(id, makeEl()); return els.get(id); },
     createElement() { const el = makeEl(); created.push(el); return el; },
+    body: { classList: {
+      add(c) { bodyClasses.add(c); },
+      remove(c) { bodyClasses.delete(c); },
+      toggle(c) { bodyClasses.has(c) ? bodyClasses.delete(c) : bodyClasses.add(c); },
+      contains: (c) => bodyClasses.has(c),
+    } },
+    hidden: false,
   };
+  const winListeners = {}; // issue #55 B1：记录 window 级监听（popstate）
+  const historyCalls = []; // issue #55 B1：记录 pushState/replaceState
   const sandbox = {
     document,
     EventSource: FakeEventSource,
     fetch: fetchImpl ?? (async () => { throw new Error('fetch 在单测中禁用'); }), // boot() 走 renderLogin 分支
-    location: { reload() {} },
+    // issue #55：前端用到 window（popstate）/history（hash 深链）/location.hash 等浏览器 API
+    window: { addEventListener(type, fn) { winListeners[type] = fn; }, focus() {} },
+    history: {
+      pushState(_a, _b, url) { historyCalls.push(['push', url]); },
+      replaceState(_a, _b, url) { historyCalls.push(['replace', url]); },
+    },
+    location: { reload() {}, hash: '', pathname: '/', search: '' },
     alert() {}, prompt() { return null; },
     console, setTimeout, clearTimeout, setInterval, clearInterval,
   };
   const ctx = vm.createContext(sandbox);
   // 顶层 const/let 不进 globalThis，用同脚本片段把内部绑定导出给测试驱动
-  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents, switchProject, openSession, refreshSession, initWorkspace };`;
+  const code = `${m[1]}\n;globalThis.__client = { S, handleEvent, connectEvents, resyncEvents, switchProject, openSession, refreshSession, initWorkspace, drafts };`;
   new vm.Script(code).runInContext(ctx);
   FakeEventSource.instances = [];
-  return { client: ctx.__client, elements: els, created };
+  return { client: ctx.__client, elements: els, created, winListeners, historyCalls, bodyClasses, loc: sandbox.location };
 }
 
 /** 构造事件载荷（emit 会自行包成 SSE 帧）；带 seq + run_id 的典型事件。 */
@@ -502,4 +522,349 @@ test('前端：连点新会话保留两个成功创建的会话', async () => {
 
   assert.deepEqual(Array.from(S.sessions, (s) => s.id).sort(), ['s-1', 's-2']);
   assert.equal(elements.get('newSess').disabled, false);
+});
+
+// ---------------------------------------------------------------------------
+// issue #55 P1：A1 会话草稿 / A2 滚动跟随 / B1 hash 深链 / B4 移动端抽屉
+// ---------------------------------------------------------------------------
+
+/** openSession 所需的会话详情 fetch 桩。 */
+const sessDetailFetch = () => async (url, opts = {}) => {
+  if (opts.method) throw new Error(`unexpected fetch: ${url}`);
+  const m = url.match(/^\/api\/sessions\/(s-1|s-2|s-3)$/);
+  if (m) {
+    return { ok: true, status: 200, async json() { return { last_seq: 0, messages: [], session: { active_run_id: null } }; } };
+  }
+  throw new Error(`unexpected fetch: ${url}`);
+};
+
+test('issue #55 A1：切换会话保存并恢复输入草稿', async () => {
+  const { client, elements } = loadClient({ fetch: sessDetailFetch() });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }, { id: 's-2', title: '会话二' }];
+
+  await client.openSession('s-1');
+  elements.get('input').value = '写到一半的草稿';
+  await client.openSession('s-2');
+  assert.equal(elements.get('input').value, '', '新会话无草稿则清空输入框');
+  elements.get('input').value = '第二条草稿';
+  await client.openSession('s-1');
+  assert.equal(elements.get('input').value, '写到一半的草稿', '切回会话一恢复其草稿');
+  await client.openSession('s-2');
+  assert.equal(elements.get('input').value, '第二条草稿', '切回会话二恢复其草稿');
+});
+
+test('issue #55 A1：切项目暂存草稿，重开会话可恢复；发送成功清除草稿', async () => {
+  const { client, elements } = loadClient({ fetch: sessDetailFetch() });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }];
+
+  await client.openSession('s-1');
+  elements.get('input').value = '跨项目的草稿';
+  await client.switchProject('p1', { loadSessions: false });
+  assert.equal(S.sessionId, null);
+  assert.equal(elements.get('input').value, '', '切项目后输入框清空');
+  await client.openSession('s-1');
+  assert.equal(elements.get('input').value, '跨项目的草稿', '同项目重开会话恢复草稿');
+
+  // 发送成功 → 输入框清空且草稿被清除
+  elements.get('input').value = '已发送内容';
+  let resolveSend;
+  const sendP = new Promise((r) => { resolveSend = r; });
+  const sendFetch = async (url, opts = {}) => {
+    if (opts.method === 'POST') return sendP;
+    if (url.startsWith('/api/sessions?project_id=')) {
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    return sessDetailFetch()(url, opts);
+  };
+  const c2 = loadClient({ fetch: sendFetch });
+  c2.client.S.user = { role: 'user', fde_name: 'alice' };
+  c2.client.S.projects = [{ id: 'p1', name: 'one' }];
+  c2.client.S.projectId = 'p1';
+  c2.client.S.sessions = [{ id: 's-1', title: '会话一' }];
+  await c2.client.openSession('s-1');
+  c2.elements.get('input').value = '已发送内容';
+  const pending = c2.elements.get('sendBtn').onclick();
+  await Promise.resolve();
+  resolveSend({
+    ok: true, status: 201,
+    async json() { return { message: { id: 'm-1', content: '已发送内容', role: 'user', run_id: 'r-1' }, run: { id: 'r-1' } }; },
+  });
+  await pending;
+  assert.equal(c2.elements.get('input').value, '');
+  await c2.client.openSession('s-1');
+  assert.equal(c2.elements.get('input').value, '', '发送成功后草稿已清除，重开不回填');
+});
+
+test('issue #55 A2：离开底部暂停自动跟随并显示「↓ 最新」，回底自动恢复', () => {
+  const { client, elements } = loadClient();
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.sessionId = 'sess-1'; S.esSessionId = 'sess-1'; S.activeRunId = 'run-1';
+  client.connectEvents('sess-1');
+  const es = FakeEventSource.instances.at(-1);
+  const stream = elements.get('stream');
+  const onScroll = stream.listeners.scroll;
+  assert.equal(typeof onScroll, 'function', 'scroll 监听已绑定');
+
+  // 初始在底部：流式增量照常跟随（「↓ 最新」未出现；桩无 CSS，隐藏态即非 block）
+  stream.scrollHeight = 1000; stream.clientHeight = 600; stream.scrollTop = 400;
+  onScroll(); // gap=0 ≤80 → 跟随
+  es.emit('assistant_delta', evt(1, { text: 'hello' }));
+  assert.equal(stream.scrollTop, 1000, '跟随状态滚到底');
+  assert.notEqual(elements.get('toLatest').style.display, 'block');
+
+  // 用户向上滚动离开底部 → 暂停跟随 + 显示按钮；后续增量不再拉底
+  stream.scrollTop = 200; // gap=200 >80
+  onScroll();
+  assert.equal(S.autoFollow, false);
+  assert.equal(elements.get('toLatest').style.display, 'block');
+  stream.scrollTop = 200;
+  es.emit('assistant_delta', evt(2, { text: ' more' }));
+  assert.equal(stream.scrollTop, 200, '暂停跟随后不拉底');
+
+  // 点击「↓ 最新」回底并恢复跟随
+  elements.get('toLatest').onclick();
+  assert.equal(S.autoFollow, true);
+  assert.equal(stream.scrollTop, 1000);
+  assert.equal(elements.get('toLatest').style.display, 'none');
+
+  // 手动滚回底部附近（<80px）自动恢复跟随
+  stream.scrollTop = 150; onScroll();
+  assert.equal(S.autoFollow, false);
+  stream.scrollTop = 930; // gap=70 <80
+  onScroll();
+  assert.equal(S.autoFollow, true);
+  assert.equal(elements.get('toLatest').style.display, 'none');
+});
+
+test('issue #55 B1：openSession 记录 hash 深链，popstate 切换/回退会话', async () => {
+  // 评审修复后 popstate 对列表外会话走 detail 端点：s-404 须返回真实 404 响应才会回退默认视图
+  const fetch404 = async (url, opts = {}) => {
+    if (url === '/api/sessions/s-404' && !opts.method) {
+      return { ok: false, status: 404, async json() { return { error: { code: 'not_found', message: '不存在' } }; } };
+    }
+    return sessDetailFetch()(url, opts);
+  };
+  const { client, elements, winListeners, historyCalls, loc } = loadClient({ fetch: fetch404 });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }, { id: 's-2', title: '会话二' }];
+
+  await client.openSession('s-1');
+  assert.deepEqual(historyCalls.at(-1), ['push', '#/session/s-1'], '选中会话写入 hash');
+
+  const onPop = winListeners.popstate;
+  assert.equal(typeof onPop, 'function', 'popstate 监听已绑定');
+
+  // 模拟前进/后退到另一会话的 hash：popstate 打开对应会话（不重复 push）
+  historyCalls.length = 0;
+  loc.hash = '#/session/s-2';
+  onPop();
+  assert.equal(S.sessionId, 's-2', 'popstate 切到 hash 指向的会话');
+  assert.equal(historyCalls.filter(([k]) => k === 'push').length, 0, 'popstate 不再重复 push');
+
+  // 模拟后退到无 hash：回退默认视图并清深链
+  historyCalls.length = 0;
+  loc.hash = '';
+  onPop();
+  assert.equal(S.sessionId, null, 'popstate 无 hash 时回退默认视图');
+  assert.deepEqual(historyCalls.at(-1), ['replace', '/'], '清深链走 replaceState');
+  assert.match(elements.get('stream').innerHTML, /选择或新建会话/);
+
+  // hash 指向不存在的会话（detail 端点 404）：静默回退默认视图
+  historyCalls.length = 0;
+  loc.hash = '#/session/s-404';
+  onPop();
+  await new Promise((r) => setTimeout(r, 0)); // resolveHashSession 内异步 detail 解析需一拍
+  assert.equal(S.sessionId, null);
+  assert.deepEqual(historyCalls.at(-1), ['replace', '/']);
+});
+
+test('issue #55 B1：深链会话不存在时静默回退默认视图', async () => {
+  const notFoundFetch = async (url, opts = {}) => {
+    if (url === '/api/sessions/s-x' && !opts.method) {
+      return { ok: false, status: 404, async json() { return { error: { code: 'not_found', message: '不存在' } }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, historyCalls } = loadClient({ fetch: notFoundFetch });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }];
+
+  await client.openSession('s-x');
+  assert.equal(S.sessionId, null, '不存在的会话回退默认视图');
+  assert.match(elements.get('stream').innerHTML, /选择或新建会话/);
+  assert.deepEqual(historyCalls.at(-1), ['replace', '/'], '静默清掉失效深链');
+});
+
+test('issue #55 B4：选中会话自动收起移动端抽屉', async () => {
+  const { client, elements, bodyClasses } = loadClient({ fetch: sessDetailFetch() });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }];
+
+  elements.get('navToggle').onclick(); // 模拟移动端展开抽屉
+  assert.equal(bodyClasses.has('drawer-open'), true);
+  elements.get('backdrop').onclick();
+  assert.equal(bodyClasses.has('drawer-open'), false, 'backdrop 点击关闭抽屉');
+  elements.get('navToggle').onclick();
+  await client.openSession('s-1');
+  assert.equal(bodyClasses.has('drawer-open'), false, '选中会话后自动收起抽屉');
+});
+
+// ---------------------------------------------------------------------------
+// PR #56 双模型评审修复：草稿生命周期 / 深链 detail 解析 / 错误区分 / 重开路由
+// ---------------------------------------------------------------------------
+
+test('评审修复：发送失败后期间切走会话，草稿保留且切回可恢复', async () => {
+  let resolveSend;
+  const sendP = new Promise((r) => { resolveSend = r; });
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions/s1/messages' && opts.method === 'POST') return sendP;
+    if (url.startsWith('/api/sessions?project_id=')) {
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    if (url === '/api/sessions/s1' || url === '/api/sessions/s2') {
+      return { ok: true, status: 200, async json() { return { last_seq: 0, messages: [], session: { active_run_id: null } }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's1', title: '会话一' }, { id: 's2', title: '会话二' }];
+
+  await client.openSession('s1');
+  elements.get('input').value = '发送失败的任务';
+  const pending = elements.get('sendBtn').onclick();
+  await Promise.resolve();
+  await client.openSession('s2'); // 发送在途期间切走会话
+  resolveSend({
+    ok: false,
+    status: 500,
+    async json() { return { error: { message: '服务器错误' } }; },
+  });
+  await pending;
+
+  // 守卫拦截 UI 回填（当前在 s2），但草稿按 sid 键写回，跨上下文不丢
+  assert.equal(elements.get('input').value, '', '失败回填被守卫拦截（已切到 s2）');
+  assert.equal(client.drafts.get('s1'), '发送失败的任务', '发送失败后切走会话，草稿仍在');
+  await client.openSession('s1');
+  assert.equal(elements.get('input').value, '发送失败的任务', '切回 s1 草稿恢复');
+});
+
+test('评审修复：恢复草稿后手动清空，切走再切回输入框为空', async () => {
+  const { client, elements } = loadClient({ fetch: sessDetailFetch() });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }, { id: 's-2', title: '会话二' }];
+
+  await client.openSession('s-1');
+  elements.get('input').value = '要清掉的草稿';
+  await client.openSession('s-2');
+  await client.openSession('s-1');
+  assert.equal(elements.get('input').value, '要清掉的草稿', '草稿先恢复');
+
+  elements.get('input').value = ''; // 用户手动清空
+  await client.openSession('s-2');
+  assert.equal(client.drafts.has('s-1'), false, '空值离开路径删除草稿（不再残留）');
+  await client.openSession('s-1');
+  assert.equal(elements.get('input').value, '', '切回输入框为空');
+});
+
+test('评审修复：会话详情 500 → 保留 hash + stream syserr（仅 404 才清路由）', async () => {
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/sessions/s1' && !opts.method) {
+      return { ok: false, status: 500, async json() { return { error: { code: 'internal', message: '服务器错误' } }; } };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, created, historyCalls } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's1', title: '会话一' }];
+
+  await client.openSession('s1');
+
+  assert.equal(S.sessionId, 's1', '会话仍选中（保留视图语义）');
+  assert.deepEqual(historyCalls.at(-1), ['push', '#/session/s1'], 'hash 保留：最后一次路由写入仍是 push');
+  assert.equal(historyCalls.some(([k]) => k === 'replace'), false, '非 404 错误不清路由（无 replaceState）');
+  assert.ok(created.some((el) => el.className === 'syserr' && el.textContent === '会话加载失败，可刷新重试'));
+  assert.equal(elements.get('stream').innerHTML, '', '详情加载失败不渲染消息');
+});
+
+test('评审修复：深链指向其他项目会话 → detail 解析、切项目（同步 select）后打开', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts = {}) => {
+    if (url === '/api/projects' && !opts.method) {
+      return { ok: true, status: 200, async json() { return { items: [{ id: 'p1', name: 'one' }, { id: 'p2', name: 'two' }] }; } };
+    }
+    if (url.startsWith('/api/sessions?project_id=')) {
+      calls.push(url);
+      return { ok: true, status: 200, async json() { return { items: [] }; } };
+    }
+    if (url === '/api/sessions/sX' && !opts.method) {
+      return {
+        ok: true, status: 200,
+        async json() {
+          return { last_seq: 0, messages: [], session: { id: 'sX', project_id: 'p2', active_run_id: null } };
+        },
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const { client, elements, loc } = loadClient({ fetch: fetchImpl });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  loc.hash = '#/session/sX';
+
+  await client.initWorkspace();
+  await new Promise((r) => setTimeout(r, 0)); // resolveHashSession 内 openSession 未 await，事件连接需一拍
+
+  assert.equal(S.projectId, 'p2', '深链跨项目 → 已切到会话所属项目');
+  assert.equal(elements.get('projectSel').value, 'p2', '程序化切换同步 select 选中项');
+  assert.equal(S.sessionId, 'sX', '切项目后打开深链会话');
+  assert.ok(calls.includes('/api/sessions?project_id=p2'), '新项目的会话列表已加载');
+  assert.equal(FakeEventSource.instances.at(-1).url, '/api/sessions/sX/events', '深链会话已建立事件连接');
+});
+
+test('评审修复：同会话重开走 replaceState 而非 pushState', async () => {
+  const { client, historyCalls } = loadClient({ fetch: sessDetailFetch() });
+  const { S } = client;
+  S.user = { role: 'user', fde_name: 'alice' };
+  S.projects = [{ id: 'p1', name: 'one' }];
+  S.projectId = 'p1';
+  S.sessions = [{ id: 's-1', title: '会话一' }];
+
+  await client.openSession('s-1');
+  assert.deepEqual(historyCalls.at(-1), ['push', '#/session/s-1'], '首次打开 push');
+
+  historyCalls.length = 0;
+  await client.openSession('s-1'); // 同会话重开（点击刷新语义）
+  assert.deepEqual(historyCalls, [['replace', '#/session/s-1']], '重开只 replace，不重复 push（历史记录不膨胀）');
+
+  historyCalls.length = 0;
+  await client.openSession('s-2'); // 非同会话仍是 push
+  assert.deepEqual(historyCalls.at(-1), ['push', '#/session/s-2']);
 });

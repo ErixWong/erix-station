@@ -63,18 +63,37 @@
     #composer button { padding: .5rem 1.1rem; }
     #stopBtn { display: none; background: #fff2f0; border-color: #b33; color: #b33; }
     .muted { color: var(--muted); font-size: .8rem; }
+    /* issue #55 A2：「↓ 最新」悬浮按钮（离开底部自动跟随暂停时出现） */
+    #chat { position: relative; }
+    #toLatest { position: absolute; right: 1.2rem; bottom: 5.6rem; z-index: 5; display: none;
+                border-radius: 999px; border: 1px solid var(--bd); background: #fff; color: var(--brand);
+                padding: .35rem .9rem; box-shadow: 0 2px 8px rgba(0,0,0,.12); cursor: pointer; }
+    /* issue #55 B4：≤768px 侧栏变固定抽屉（默认收起），backdrop 半透明遮罩点击关闭 */
+    #navToggle { display: none; }
+    #backdrop { display: none; }
+    @media (max-width: 768px) {
+      #navToggle { display: inline-block; }
+      aside { position: fixed; top: 0; left: 0; bottom: 0; width: 16rem; z-index: 30;
+              background: #fff; transform: translateX(-100%); transition: transform .2s ease; }
+      body.drawer-open aside { transform: none; }
+      #backdrop { display: block; position: fixed; inset: 0; z-index: 25; background: rgba(0,0,0,.4);
+                  opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+      body.drawer-open #backdrop { opacity: 1; pointer-events: auto; }
+    }
     /* issue #42：禁用态视觉变灰 */
     button:disabled, textarea:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
   </style>
 </head>
 <body>
   <header>
+    <button id="navToggle" aria-label="打开导航">导航</button>
     <h1>FDE Station</h1>
     <span class="who" id="who"></span>
     <a id="adminLink" href="/admin" style="display:none">管理台</a>
     <button id="logout">登出</button>
   </header>
   <main>
+    <div id="backdrop"></div>
     <aside>
       <div class="proj" id="projBox">
         <label class="muted">项目</label>
@@ -103,6 +122,7 @@
         <button id="sendBtn">发送</button>
         <button id="stopBtn">■ 停止</button>
       </div>
+      <button id="toLatest" type="button">↓ 最新</button>
     </section>
   </main>
   <script src="/markdown.js"></script>
@@ -113,7 +133,18 @@
 
     const S = { user: null, projects: [], projectId: null, sessions: [], sessionId: null,
                 lastSeq: 0, es: null, esSessionId: null, activeRunId: null, deltaBuf: null, toolCards: {}, renderedIds: null,
-                projectReqSeq: 0, sessionReqSeq: 0, ctxSeq: 0 }; // 项目/会话请求序号与项目上下文代次（迟到响应丢弃）
+                projectReqSeq: 0, sessionReqSeq: 0, ctxSeq: 0, autoFollow: true }; // 项目/会话请求序号与项目上下文代次（迟到响应丢弃）
+    // issue #55 A1：per-session 输入草稿（内存 Map，key=sessionId）；切换会话/项目时保存与恢复
+    const drafts = new Map();
+    // 评审修复：统一的草稿暂存——有值 set、空值 delete（恢复后手动清空须能真正清掉）；无选中会话不动。
+    // openSession / switchProject / resetSessionView 三条「离开会话」路径共用，替换原先的 if(value) set 写法。
+    function saveDraft() {
+      if (!S.sessionId) return;
+      const v = $('input').value;
+      if (v) drafts.set(S.sessionId, v);
+      else drafts.delete(S.sessionId);
+    }
+    const AUTO_FOLLOW_GAP = 80; // issue #55 A2：距底超过该值视为「离开底部」，暂停自动跟随
     // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）
     const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
     const PROJECT_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -274,13 +305,22 @@
         return;
       }
       await loadSessions();
+      // issue #55 B1：启动时若 URL 带 #/session/<id>，走统一深链解析（列表内直接打开；列表外走 detail 端点）
+      const hashSid = currentHashSession();
+      if (hashSid) await resolveHashSession(hashSid);
     }
 
     async function switchProject(projectId, { loadSessions: shouldLoadSessions = true } = {}) {
       if (S.es) { S.es.close(); S.es = null; }
+      // issue #55 A1：离开旧会话前保存输入草稿（空值则清除）；B1：切项目即无选中会话，清深链
+      saveDraft();
+      $('input').value = '';
+      clearRoute();
       S.ctxSeq++;
       S.projectReqSeq++;
       S.projectId = projectId;
+      // 评审修复：程序化切换（如深链跨项目解析）同步 <select>，防 UI 选中项与 S.projectId 失步
+      $('projectSel').value = projectId;
       S.sessionId = null;
       S.activeRunId = null;
       S.lastSeq = 0;
@@ -289,6 +329,9 @@
       S.renderedIds = null;
       S.esSessionId = null;
       S.sessions = [];
+      // 评审修复：与 resetSessionView 对齐的状态复位（自动跟随恢复、隐藏「↓ 最新」、收起移动端抽屉）
+      S.autoFollow = true; $('toLatest').style.display = 'none';
+      document.body.classList.remove('drawer-open');
       $('stream').innerHTML = '<p class="muted">选择或新建会话</p>';
       setRunning(false);
       updateProjectMeta();
@@ -354,15 +397,42 @@
       }
     };
 
-    async function openSession(id) {
+    async function openSession(id, { syncRoute = true } = {}) {
       const reqSeq = ++S.sessionReqSeq;
       const ctx = S.ctxSeq;
+      // 评审修复：同会话重开只刷新路由（replaceState），不重复 push——保留点击刷新语义，只修历史记录膨胀
+      const isReopen = String(id) === String(S.sessionId);
       if (S.es) { S.es.close(); S.es = null; }
+      // issue #55 A1：离开旧会话前保存输入草稿（空值则清除），切回时恢复；B4：移动端选中会话后自动收起抽屉
+      saveDraft();
+      $('input').value = drafts.get(id) ?? '';
+      document.body.classList.remove('drawer-open');
       S.sessionId = id; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
       S.esSessionId = id;
+      S.autoFollow = true; $('toLatest').style.display = 'none';
+      if (syncRoute) {
+        const url = `#/session/${encodeURIComponent(id)}`;
+        if (isReopen) history.replaceState(null, '', url);
+        else history.pushState(null, '', url);
+      }
       $('stream').innerHTML = '';
       renderSessions();
-      const data = await api(`/api/sessions/${encodeURIComponent(id)}`);
+      let data;
+      try {
+        data = await api(`/api/sessions/${encodeURIComponent(id)}`);
+      } catch (e) {
+        if (reqSeq !== S.sessionReqSeq || ctx !== S.ctxSeq) return;
+        if (e.code === 'not_found' || e.status === 404) {
+          resetSessionView(); // issue #55 B1：会话不存在（如已被删除/深链失效）：静默回退默认视图（清 hash）
+          return;
+        }
+        // 评审修复：其他错误（网络/5xx）区分处理——保留 hash（可刷新重试）+ stream 区 syserr
+        const div = document.createElement('div');
+        div.className = 'syserr';
+        div.textContent = '会话加载失败，可刷新重试';
+        $('stream').appendChild(div);
+        return;
+      }
       if (reqSeq !== S.sessionReqSeq || ctx !== S.ctxSeq) return;
       S.lastSeq = data.last_seq;
       S.renderedIds = new Set();
@@ -515,6 +585,7 @@
           // 历史重放的旧 run_end 不参与运行态状态机（防误关当前 run 的停止按钮/误拉刷新）
           const isCurrent = d.run_id === S.activeRunId;
           if (isCurrent) {
+            notifyRunEnd(d); // issue #55 A7：运行完成桌面通知（页面在后台时）
             // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）
             if (S.deltaBuf) { S.deltaBuf.remove(); S.deltaBuf = null; }
             const reason = d.termination?.reason ?? '';
@@ -565,7 +636,83 @@
       scrollDown();
     }
 
-    function scrollDown() { $('stream').scrollTop = $('stream').scrollHeight; }
+    function scrollDown() { if (!S.autoFollow) return; $('stream').scrollTop = $('stream').scrollHeight; }
+
+    // issue #55 A2：用户向上滚动离开底部时暂停自动跟随并显示「↓ 最新」；回到底部附近自动恢复跟随
+    $('stream').addEventListener('scroll', () => {
+      const el = $('stream');
+      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (gap > AUTO_FOLLOW_GAP) {
+        if (S.autoFollow) { S.autoFollow = false; $('toLatest').style.display = 'block'; }
+      } else if (!S.autoFollow) {
+        S.autoFollow = true; $('toLatest').style.display = 'none';
+      }
+    });
+    $('toLatest').onclick = () => {
+      S.autoFollow = true; $('toLatest').style.display = 'none';
+      $('stream').scrollTop = $('stream').scrollHeight;
+    };
+
+    // issue #55 B1：hash 深链 #/session/<id>（portal 静态服务无 pathname 通配，hash 路由刷新/分享均安全）
+    function currentHashSession() {
+      const m = location.hash.match(/^#\/session\/([^/]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+    function clearRoute() { history.replaceState(null, '', location.pathname + location.search); }
+
+    // 评审修复：hash 深链统一解析——当前项目列表内直接打开；列表外走 detail 端点：
+    // 跨项目 → 切项目后打开（含 select 同步）；同项目（分页外的旧会话）→ 直接打开；
+    // 404/not_found → 静默回退默认视图（清 hash）；其他错误 → 保留 hash + syserr「会话加载失败，可刷新重试」。
+    async function resolveHashSession(sid) {
+      if (S.sessions.some((s) => String(s.id) === String(sid))) {
+        openSession(sid, { syncRoute: false });
+        return;
+      }
+      let session;
+      try {
+        ({ session } = await api(`/api/sessions/${encodeURIComponent(sid)}`));
+      } catch (e) {
+        if (e.code === 'not_found' || e.status === 404) {
+          resetSessionView(); // 深链失效：静默回退默认视图（含清 hash）
+          return;
+        }
+        const div = document.createElement('div');
+        div.className = 'syserr';
+        div.textContent = '会话加载失败，可刷新重试';
+        $('stream').appendChild(div);
+        return;
+      }
+      if (String(session.project_id) !== String(S.projectId)) {
+        await switchProject(session.project_id);
+      }
+      openSession(sid, { syncRoute: false });
+      // 评审修复：switchProject 会 clearRoute() 抹掉 hash，刷新即丢深链；这里把深链写回。
+      // 列表内路径 hash 本就等于该 URL，replaceState 为无害 no-op；跨项目路径则恢复深链。
+      history.replaceState(null, '', `#/session/${encodeURIComponent(sid)}`);
+    }
+
+    // issue #55 B1：会话不存在/被 popstate 回退时静默回到默认视图（不动项目/会话列表，只清会话详情区）
+    function resetSessionView() {
+      if (S.es) { S.es.close(); S.es = null; }
+      // issue #55 A1：popstate 回退也属「离开会话」，先存草稿（空值则清除）
+      saveDraft();
+      S.sessionId = null; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
+      S.renderedIds = null; S.esSessionId = null; S.autoFollow = true;
+      $('toLatest').style.display = 'none';
+      $('stream').innerHTML = '<p class="muted">选择或新建会话</p>';
+      $('input').value = '';
+      setRunning(false);
+      renderSessions();
+      clearRoute();
+    }
+
+    window.addEventListener('popstate', () => {
+      const sid = currentHashSession();
+      if (sid) {
+        if (String(sid) === String(S.sessionId)) return;
+        resolveHashSession(sid); // 评审修复：统一走 detail 端点解析（跨项目/分页外旧会话/失效深链）
+      } else if (S.sessionId) resetSessionView();
+    });
 
     function setRunning(on) {
       $('stopBtn').style.display = on ? 'inline-block' : 'none'; // 显式值压过样式表 display:none
@@ -582,17 +729,25 @@
       const sid = S.sessionId;
       const content = $('input').value.trim();
       if (!content || !sid || S.activeRunId) return;
+      // issue #55 A7：首次发送属用户手势，此时申请桌面通知权限（浏览器要求 gesture 触发）；不支持/被拒静默降级
+      if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        try { Notification.requestPermission().catch(() => {}); } catch { /* 忽略 */ }
+      }
       $('input').value = '';
       try {
         const { message, run } = await api(`/api/sessions/${encodeURIComponent(sid)}/messages`, {
           method: 'POST', body: JSON.stringify({ content, attachments: [] }),
         });
+        // 评审修复：API 成功返回后才删草稿，且在守卫判定之前无条件执行（原先 await 前删，失败即丢草稿）
+        drafts.delete(sid);
         if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         addMessage({ ...message, role: 'user' });
         S.activeRunId = run.id;
         setRunning(true);
         loadSessions();
       } catch (e) {
+        // 评审修复：草稿按 sid 键，守卫之前写回——发送失败后即使期间切走会话，切回仍可恢复
+        drafts.set(sid, content);
         if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         $('input').value = content; // issue #42：发送失败回填输入，已输入内容不丢
         const div = document.createElement('div');
@@ -613,6 +768,27 @@
         sep('已请求停止…');
       } catch (e) { alert('停止失败：' + e.message); }
     };
+
+    // issue #55 A7：run_end 且页面在后台且已授权 → 桌面通知（标题含会话标题，点击聚焦标签页）；不支持的浏览器静默降级
+    function notifyRunEnd(d) {
+      try {
+        if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+        if (!document.hidden) return;
+        const sess = S.sessions.find((s) => String(s.id) === String(S.sessionId));
+        const title = sess?.title || '未命名会话';
+        const reason = d.termination?.reason ?? '';
+        const failed = RUN_FAIL_REASONS.has(reason) || !!d.error;
+        const body = d.error
+          ? `运行失败：${d.error.code} — ${d.error.message}`
+          : failed ? `运行结束：${reason}` : '运行完成';
+        const n = new Notification(`FDE Station · ${title}`, { body });
+        n.onclick = () => { window.focus(); n.close(); };
+      } catch { /* 构造通知可能抛错（非安全上下文等）：静默忽略 */ }
+    }
+
+    // issue #55 B4：移动端抽屉开关（backdrop 点击关闭见 HTML/CSS）
+    $('navToggle').onclick = () => document.body.classList.toggle('drawer-open');
+    $('backdrop').onclick = () => document.body.classList.remove('drawer-open');
 
     boot();
   </script>
