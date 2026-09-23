@@ -81,6 +81,8 @@
                   opacity: 0; pointer-events: none; transition: opacity .2s ease; }
       body.drawer-open #backdrop { opacity: 1; pointer-events: auto; }
     }
+    /* #composer 的 flex 布局写在样式表（不能用 d-flex：!important 会压过 JS 的内联 display 开关） */
+    #composer { display: flex; }
     /* #stopBtn 初始隐藏（JS setRunning 用内联 style.display 压过样式表） */
     #stopBtn { display: none; }
   </style>
@@ -120,7 +122,7 @@
     </aside>
     <section id="chat" class="d-flex flex-column flex-grow-1 position-relative">
       <div id="stream" class="flex-grow-1 overflow-auto p-3"><p class="muted">选择或新建会话</p></div>
-      <div id="composer" class="border-top p-2 d-flex gap-2">
+      <div id="composer" class="border-top p-2 gap-2">
         <textarea id="input" class="form-control" placeholder="输入任务，Enter 发送（Shift+Enter 换行）" style="height: 3.2rem; resize: none"></textarea>
         <button id="sendBtn" class="btn btn-primary">发送</button>
         <button id="stopBtn" class="btn btn-outline-danger">■ 停止</button>
@@ -173,6 +175,7 @@
         const me = await api('/api/me');
         S.user = me.user;
       } catch { renderLogin(); return; }
+      $('logout').style.display = ''; // 已登录恢复「登出」（renderLogin 隐藏）
       $('who').textContent = `${S.user.login}（${S.user.role}${S.user.fde_name ? ' / ' + S.user.fde_name : ''}）`;
       $('adminLink').style.display = S.user.role === 'admin' ? '' : 'none';
       $('logout').onclick = async () => { await fetch('/api/auth/logout', { method: 'POST' }); location.reload(); };
@@ -187,6 +190,8 @@
       $('sessList').innerHTML = '';
       $('stream').innerHTML = '';
       $('composer').style.display = 'none';
+      $('sidebar').style.display = 'none'; // 未登录：整个侧栏隐藏，登录卡居中占满（不画空壳边栏）
+      $('logout').style.display = 'none'; // 未登录不出现「登出」
       const div = document.createElement('div');
       div.className = 'card login-card mx-auto mt-5';
       div.style.maxWidth = '22rem';
@@ -243,6 +248,7 @@
 
     async function initWorkspace() {
       $('composer').style.display = '';
+      $('sidebar').style.display = ''; // 恢复侧栏（renderLogin 里隐藏）
       $('projBox').style.display = '';
       $('newSess').style.display = '';
       const projectForm = $('newProjForm');
