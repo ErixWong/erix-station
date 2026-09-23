@@ -3,9 +3,11 @@
 // 校验 + 错误展示 + repo_url 可选）、＋新会话、会话列表（.sess/.active/.meta 语义 → Tailwind）。
 // 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价）。
 import { ref } from 'vue';
+import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
 
 const store = useWorkbenchStore();
+const auth = useAuthStore();
 const emit = defineEmits<{
   (e: 'select-session', id: string): void;
   (e: 'new-session'): void;
@@ -38,6 +40,13 @@ async function onSubmitForm() {
 </script>
 
 <template>
+  <!-- 常驻「管理台」入口（旧 index.html header adminLink 的 SPA 等价；admin 角色才显示） -->
+  <router-link
+    v-if="auth.user?.role === 'admin'"
+    to="/admin"
+    class="mb-2 block rounded-md border border-black/20 px-2.5 py-1 text-center text-sm hover:bg-black/5"
+  >管理台</router-link>
+
   <div>
     <!-- 项目区（旧 #projBox） -->
     <label class="muted" for="projectSel">项目</label>
