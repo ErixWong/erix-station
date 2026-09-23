@@ -1,0 +1,4 @@
+# portal/static/ —— 静态根（serveStatic 的 staticDir）。
+# 旧整页 HTML（index.html / admin.html）与 vendor/ 已于 issue #61 P4 退役删除；
+# Vue SPA 构建产物由 Docker 多阶段构建注入本目录的 app/（本地开发为 vite dev，不经此处）。
+# 本文件仅用于让 git 保留空目录。
