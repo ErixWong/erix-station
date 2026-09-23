@@ -1,0 +1,10 @@
+/* issue #61：Tailwind v4（@tailwindcss/vite，无 config 文件）。
+   主题令牌平移自 portal/static/index.html 的 :root 变量：
+   --brand: #0a7 及 #59 登录卡 .btn-primary 的三档按钮色。 */
+@import 'tailwindcss';
+
+@theme {
+  --color-brand: #0a7;
+  --color-brand-hover: #086;
+  --color-brand-active: #075;
+}
