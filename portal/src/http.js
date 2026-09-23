@@ -260,27 +260,18 @@ async function route(req, res, ctx) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
 
-  // admin UI 页面（issue #38 Phase B2）：GET /admin 服务 admin.html。
-  // 未登录 → 302 /（与登录页同入口）；非 admin → 403（与 /api/admin/* 的错误信封一致）。
+  // /admin 兼容跳转（issue #61 P4）：管理台已 Vue 化（P3，/#/admin），旧 admin.html 退役。
+  // GET/HEAD → 302 到 SPA hash 路由 /#/admin；认证与角色判断全部交给前端路由守卫：
+  // 未登录 → /#/login?redirect=/admin，非 admin → 回工作台（portal/frontend/src/router.ts），
+  // 与旧版「未登录 302 /、非 admin 403」语义等价且更简单——后端不再为页面路由维护会话/角色逻辑。
+  // POST 等非幂等方法：SPA 页面路由下无意义，按惯例 405（不 302：避免改写非幂等请求的语义）。
   if (pathname === '/admin') {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     }
-    let session = null;
-    try {
-      session = await requireSession(req, ctx);
-    } catch {
-      session = null; // 未登录 → 302 到登录页
-    }
-    if (!session) {
-      res.writeHead(302, { Location: '/' });
-      res.end();
-      return;
-    }
-    if (session.user.role !== 'admin') {
-      return sendJson(res, 403, errorBody('forbidden', 'forbidden'));
-    }
-    return sendStaticFile(res, path.join(path.resolve(ctx.config.staticDir), 'admin.html'));
+    res.writeHead(302, { Location: '/#/admin' });
+    res.end();
+    return;
   }
 
   if (pathname === '/healthz' || pathname === '/api/health') {
@@ -1364,7 +1355,7 @@ async function serveStatic(req, res, ctx, url) {
   }
   // issue #61 P2 翻转：/ 服务 Vue SPA——dist 由 Docker 多阶段构建注入 staticDir/app/
   //（vite base '/'，产物引用 /assets/*，故 /assets/ 前缀映射到注入目录；hash 路由承担子路径，
-  // 无需 pathname catch-all）。旧 static/index.html 保留文件但不再被引用（P4 删）。
+  // 无需 pathname catch-all）。旧 static/index.html 已于 P4 删除。
   if (rel === '/' || rel === '/index.html') rel = '/app/index.html';
   else if (rel.startsWith('/assets/')) rel = `/app${rel}`;
   // 以静态目录为根做规范化，再用 path.relative 校验未逃逸（静态路径穿越防护）。
@@ -1382,7 +1373,7 @@ async function serveStatic(req, res, ctx, url) {
   }
 }
 
-/** 发送单个静态文件（/admin 页面与 serveStatic 共用；不存在走 404）。 */
+/** 发送单个静态文件（serveStatic 专用；不存在走 404）。 */
 function sendStaticFile(res, filePath) {
   try {
     const stat = fs.statSync(filePath);
