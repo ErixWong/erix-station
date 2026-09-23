@@ -46,6 +46,12 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 测试隔离约定：涉及用户配置/容器网络的测试必须注入路径参数，不碰真实环境。
 
+### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
+
+- 入口：`http://hp.inteva.vip:8090/`（deploy 栈 station-portal；代码更新后需 `docker compose build station-portal && docker compose up -d station-portal` 生效）
+- 测试账号：`eric-admin / admin123`（admin → 管理台）、`eric / admin123`（fde:eric → 工作台）——两账号均未注册 TOTP，密码直通
+- 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`（bootstrap-admin 不能重置已存在账号）
+
 ## 5. 端口登记（本机，避让已有占用）
 
 | 端口 | 用途 |
