@@ -2,12 +2,12 @@ import { defineConfig } from 'vitest/config';
 import vue from '@vitejs/plugin-vue';
 import tailwindcss from '@tailwindcss/vite';
 
-// issue #61 P1：Vue SPA 过渡期挂载在 /app/（portal 后端 serveStatic 接入，见 portal/src/http.js）；
-// P2 工作台迁移完成后会把 base 翻转到 / 并下线旧 index.html。
+// issue #61 P2 翻转：Vue SPA 已挂在 /（portal 后端 serveStatic 把 / 与 /assets/* 映射到
+// staticDir/app/ 注入目录，见 portal/src/http.js）。
 export default defineConfig({
   // hash 路由（createWebHashHistory）：服务端无需 history 回退；旧 index.html 的
   // #/session/<id> 深链已有 hash 先例（issue #55 B1）。
-  base: '/app/',
+  base: '/',
   plugins: [vue(), tailwindcss()],
   build: {
     outDir: 'dist',
