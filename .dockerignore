@@ -19,6 +19,10 @@ build
 .DS_Store
 *.pid
 portal/test
+# issue #61 P1：前端 node_modules 与本地构建产物不进构建上下文（dist 由多阶段 builder 产出后
+# COPY --from 注入；避免前端依赖泄进 runtime 镜像层）。
+portal/frontend/node_modules
+portal/frontend/dist
 docs/design
 docs/api
 docs/README.md
