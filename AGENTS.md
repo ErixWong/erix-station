@@ -42,6 +42,7 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 |---|---|
 | `node --check <file>` | 语法保底（零依赖 Node ESM） |
 | `npm test` | 单测（`node --test`） |
+| `cd portal/frontend && npm run typecheck && npm test` | 前端 Vue SPA：vue-tsc 类型检查 + vitest 单测（devDependencies 需 `NODE_ENV=development npm install`，本机 NODE_ENV=production 会跳过） |
 | `docker compose -f deploy/docker-compose.yml up -d` | 本地起平台栈 |
 
 测试隔离约定：涉及用户配置/容器网络的测试必须注入路径参数，不碰真实环境。
