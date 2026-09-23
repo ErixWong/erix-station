@@ -12,6 +12,8 @@ import { useAuthStore } from './stores/auth';
 export const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('./views/LoginView.vue'), meta: { public: true } },
   { path: '/', name: 'workbench', component: () => import('./views/WorkbenchView.vue') },
+  // issue #55 B1 深链迁入路由层：#/session/<id>（hash 模式下与旧版 URL 形态一致，刷新/分享安全）。
+  { path: '/session/:id', name: 'session', component: () => import('./views/WorkbenchView.vue') },
   { path: '/admin', name: 'admin', component: () => import('./views/AdminView.vue'), meta: { requiresRole: 'admin' } },
 ];
 
@@ -36,9 +38,13 @@ export function createAppRouter(history: RouterHistory = createWebHashHistory())
       }
     }
     if (to.meta.public) {
-      return auth.user ? { path: '/' } : true;
+      // 已登录访问 /login → 回工作台（带 redirect 时优先回跳原目标）。
+      if (!auth.user) return true;
+      const redirect = typeof to.query.redirect === 'string' ? to.query.redirect : '/';
+      return { path: redirect.startsWith('/') ? redirect : '/' };
     }
-    if (!auth.user) return { path: '/login' };
+    // 未登录访问受保护路由 → /login，并带 redirect 回跳（登录后恢复原目标，如深链会话）。
+    if (!auth.user) return { path: '/login', query: { redirect: to.fullPath } };
     if (to.meta.requiresRole && auth.user.role !== to.meta.requiresRole) return { path: '/' };
     return true;
   });

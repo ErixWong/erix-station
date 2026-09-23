@@ -2,11 +2,18 @@
 // 登录页：观感对齐旧 index.html renderLogin() 的 Bootstrap 登录卡（居中卡、品牌绿主按钮、
 // 两步切换）。字段/按钮文案/错误展示位置保持逐字等价。
 import { ref, nextTick } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore, afterLoginRoute } from '../stores/auth';
 
 const router = useRouter();
+const route = useRoute();
 const auth = useAuthStore();
+
+// 登录守卫携带的 redirect 回跳（如未登录访问 /session/<id> 深链）；仅允许站内路径。
+function loginRedirect(): string {
+  const r = route.query.redirect;
+  return typeof r === 'string' && r.startsWith('/') ? r : afterLoginRoute(auth.user!);
+}
 const login = ref('');
 const password = ref('');
 const code = ref('');
@@ -15,7 +22,7 @@ const totpInput = ref<HTMLInputElement | null>(null);
 async function onLoginSubmit() {
   await auth.login(login.value, password.value);
   if (auth.user) {
-    router.replace(afterLoginRoute(auth.user));
+    router.replace(loginRedirect());
     return;
   }
   if (auth.pendingToken) {
@@ -27,7 +34,7 @@ async function onLoginSubmit() {
 
 async function onTotpSubmit() {
   await auth.submitTotp(code.value);
-  if (auth.user) router.replace(afterLoginRoute(auth.user));
+  if (auth.user) router.replace(loginRedirect());
 }
 </script>
 

@@ -2,6 +2,12 @@
 
 P1 walking skeleton：认证骨架 + 迁移 runner + 极简原生页面。运行时依赖仅 `pg`。
 
+**用户面前端（issue #61）**：`portal/frontend/` 是 Vue 3 SPA（Vite 8 + TS + vue-router 4 hash 模式 +
+pinia + Tailwind v4 + vitest），`npm run build` 产物由 Docker 多阶段构建注入 `static/app/`，
+`portal/src/http.js` 的 serveStatic 将 `/` 与 `/assets/*` 映射到该注入目录（开发态 `vite dev` 走
+`:5173` 代理到 portal `:8080`）。旧 `static/index.html` 在 P4 清理前保留但不再被引用；
+`static/admin.html` 管理台仍由后端直发，P3 迁移。前端单测：`cd portal/frontend && npm test`。
+
 ## 目录
 
 ```
