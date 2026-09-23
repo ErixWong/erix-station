@@ -1,5 +1,5 @@
 // 单测：issue #38 Phase B2 admin UI 服务端——用户管理端点 / provision 端点 /
-//       GET llm 的 active_run 字段 / GET /admin 页面路由（302/403/200）/ 非 admin 403。
+//       GET llm 的 active_run 字段 / GET /admin 兼容跳转（302 → /#/admin，issue #61 P4）/ 非 admin 403。
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool，不碰真实 DB / docker。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -105,9 +105,8 @@ class AdminPool extends FakePool {
 }
 
 async function startAdminServer({ seed = {}, docker = null } = {}) {
+  // P4：旧 index.html/admin.html 静态页已退役（serveStatic 只服务注入的 app/），fixture 不再写文件。
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-admin-static-'));
-  fs.writeFileSync(path.join(staticDir, 'index.html'), 'INDEX');
-  fs.writeFileSync(path.join(staticDir, 'admin.html'), 'ADMIN-HTML');
   const config = {
     cookie: cookieSettings('dev-admin', 604800),
     sessionTtlSeconds: 604800,
@@ -297,26 +296,21 @@ test('GET llm 响应附加 active_run：有 queued/running/cancelling run → tr
   }
 });
 
-test('GET /admin 页面：未登录 → 302 /；非 admin → 403；admin → 200 admin.html', async () => {
-  const { base, pool, cookie, close } = await startAdminServer();
+test('GET /admin 兼容跳转（P4）：一律 302 /#/admin；POST → 405；认证/角色交给前端路由守卫', async () => {
+  const { base, cookie, close } = await startAdminServer();
   try {
-    const anon = await fetch(`${base}/admin`, { redirect: 'manual' });
-    assert.equal(anon.status, 302);
-    assert.equal(anon.headers.get('location'), '/');
-
-    pool.sessions.push({
-      id: 'ls-fde2', user_id: FDE_USER.id, token_hash: auth.hashToken('tok-fde-b2-admin'),
-      created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
-    });
-    const cookieName = cookie.split('=')[0];
-    const fde = await fetch(`${base}/admin`, { headers: { cookie: `${cookieName}=tok-fde-b2-admin` } });
-    assert.equal(fde.status, 403);
-    assert.equal((await fde.json()).error.code, 'forbidden');
-
-    const admin = await fetch(`${base}/admin`, { headers: { cookie } });
-    assert.equal(admin.status, 200);
-    assert.match(admin.headers.get('content-type'), /text\/html/);
-    assert.equal(await admin.text(), 'ADMIN-HTML');
+    // 未登录 / 已登录 / admin：后端一律 302 到 SPA hash 路由（认证与角色判断由前端守卫承担）。
+    for (const headers of [{}, { cookie }]) {
+      const res = await fetch(`${base}/admin`, { redirect: 'manual', headers });
+      assert.equal(res.status, 302);
+      assert.equal(res.headers.get('location'), '/#/admin');
+    }
+    const head = await fetch(`${base}/admin`, { method: 'HEAD', redirect: 'manual' });
+    assert.equal(head.status, 302);
+    assert.equal(head.headers.get('location'), '/#/admin');
+    // POST 非幂等方法维持 405（不 302，避免改写非幂等请求语义——http.js /admin 注释）。
+    const post = await fetch(`${base}/admin`, { method: 'POST', redirect: 'manual' });
+    assert.equal(post.status, 405);
   } finally {
     await close();
   }
