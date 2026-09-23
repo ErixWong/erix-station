@@ -78,19 +78,36 @@ function createProjectPool() {
 }
 
 test('validateProjectName：合法名 / 非法名（大写、下划线、前导 -、超长）', () => {
+  assert.equal(validateProjectName('a').ok, true);
   assert.equal(validateProjectName('proj1').ok, true);
   assert.equal(validateProjectName('my-project-2').ok, true);
+  assert.equal(validateProjectName('a'.repeat(63)).ok, true);
   assert.equal(validateProjectName('Proj1').ok, false); // 大写
   assert.equal(validateProjectName('proj_1').ok, false); // 下划线
   assert.equal(validateProjectName('-proj').ok, false); // 前导 -
+  assert.equal(validateProjectName('abc-').ok, false); // 尾随 -
   assert.equal(validateProjectName('a'.repeat(64)).ok, false); // 超 63
 });
 
 test('validateFdeName：合法 / 非法', () => {
+  assert.equal(validateFdeName('a').ok, true);
   assert.equal(validateFdeName('alice').ok, true);
   assert.equal(validateFdeName('alice-2').ok, true);
+  assert.equal(validateFdeName('a'.repeat(63)).ok, true);
   assert.equal(validateFdeName('Alice').ok, false);
+  assert.equal(validateFdeName('abc-').ok, false);
+  assert.equal(validateFdeName('a'.repeat(64)).ok, false);
   assert.equal(validateFdeName('-alice').ok, false);
+});
+
+test('createProject：项目名尾随 - → validation_failed 400', async () => {
+  await assert.rejects(
+    () => createProject(createProjectPool(), { userId: 'u1', name: 'abc-', config: { baseDomain: 'localhost' } }),
+    (err) => err instanceof ProjectError
+      && err.code === 'validation_failed'
+      && err.httpStatus === 400
+      && err.details.field === 'name',
+  );
 });
 
 test('buildHostname：grammar <fde>-p-<project>-<port>.fde.<base>，端口 4 位', () => {
