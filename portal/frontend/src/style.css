@@ -8,3 +8,37 @@
   --color-brand-hover: #086;
   --color-brand-active: #075;
 }
+
+/* ---- 工作台（issue #61 P2）：portal/static/index.html 内联样式的平移（.muted/.syserr/.roundsep/
+   .msg 气泡/.md* markdown 子集渲染钩子）。工具卡片与会话列表项已组件化为 Tailwind 类。 ---- */
+:root { --muted: rgba(0, 0, 0, .55); }
+.muted { color: var(--muted); font-size: .8rem; }
+.syserr { color: #dc3545; font-size: .85rem; }
+.roundsep { color: rgba(0, 0, 0, .55); font-size: .75rem; margin: .6rem 0 .2rem; }
+
+/* 消息气泡（旧 .msg user/assistant/synthetic/md） */
+.msg { margin: .4rem 0; padding: .55rem .8rem; border-radius: 8px; max-width: 46rem; white-space: pre-wrap; word-break: break-word; }
+.msg.user { background: #e8f4ff; margin-left: auto; }
+.msg.assistant { background: #f8f9fa; }
+.msg.synthetic { border-left: 3px solid #ffc107; background: #fff3cd; }
+
+/* issue #40：Markdown 子集渲染样式（renderMarkdown 输出的 .md 结构钩子，保持定制） */
+.msg.md { white-space: normal; line-height: 1.55; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: .35rem 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: .55rem 0 .3rem; line-height: 1.3; }
+.md h1 { font-size: 1.3rem; } .md h2 { font-size: 1.18rem; } .md h3 { font-size: 1.08rem; }
+.md h4, .md h5, .md h6 { font-size: 1rem; }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #ececec; border-radius: 4px; padding: .08rem .32rem; font-size: .86em; }
+.md-code { border: 1px solid rgba(0, 0, 0, .1); border-radius: 6px; margin: .45rem 0; background: #fbfbfb; }
+.md-code .md-lang { padding: .15rem .55rem; font-size: .72rem; color: rgba(0, 0, 0, .55); border-bottom: 1px solid rgba(0, 0, 0, .1); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.md-code pre { margin: 0; padding: .55rem .7rem; overflow-x: auto; }
+.md-code pre code { background: none; padding: 0; font-size: .84rem; display: block; white-space: pre; }
+.md ul, .md ol { margin: .35rem 0; padding-left: 1.5rem; }
+.md li { margin: .12rem 0; }
+.md blockquote { border-left: 3px solid #ccc; margin: .4rem 0; padding: .05rem .75rem; color: #555; }
+.md table { border-collapse: collapse; margin: .45rem 0; }
+.md th, .md td { border: 1px solid rgba(0, 0, 0, .1); padding: .3rem .65rem; font-size: .86rem; }
+.md th { background: #f0f0f0; }
+.md a { color: #06c; word-break: break-all; }
