@@ -5,8 +5,9 @@ P1 walking skeleton：认证骨架 + 迁移 runner + 极简原生页面。运行
 **用户面前端（issue #61）**：`portal/frontend/` 是 Vue 3 SPA（Vite 8 + TS + vue-router 4 hash 模式 +
 pinia + Tailwind v4 + vitest），`npm run build` 产物由 Docker 多阶段构建注入 `static/app/`，
 `portal/src/http.js` 的 serveStatic 将 `/` 与 `/assets/*` 映射到该注入目录（开发态 `vite dev` 走
-`:5173` 代理到 portal `:8080`）。旧 `static/index.html` 在 P4 清理前保留但不再被引用；
-`static/admin.html` 管理台仍由后端直发，P3 迁移。前端单测：`cd portal/frontend && npm test`。
+`:5173` 代理到 portal `:8080`）。旧整页 HTML（`static/index.html` / `static/admin.html`）与
+`static/vendor/` 已于 P4 退役删除；`GET /admin` 由后端 302 到 SPA hash 路由 `/#/admin`（认证与
+角色判断交给前端路由守卫）。前端单测：`cd portal/frontend && npm test`（typecheck：`npm run typecheck`）。
 
 ## 目录
 
@@ -20,7 +21,7 @@ portal/
     auth.js             # session 只存 token_hash / timingSafeEqual / 过期吊销
     http.js             # 路由分发（healthz / login / logout / me + 静态页）
     cli.js              # serve / migrate / bootstrap-admin / healthcheck
-  static/index.html     # 极简原生页面（显示登录态）
+  static/              # 静态根（Vue SPA 产物由 Docker 构建注入 static/app/）
   test/                 # node --test 单测
 ```
 
