@@ -780,3 +780,33 @@ test('F2：forward-auth 审计不记 query（含 ?preview_ticket=<明文>）', a
     await s.close();
   }
 });
+
+// issue #61 P1：Vue SPA 过渡期挂载 /app——/app 与 /app/ 服务 staticDir/app/index.html，
+// /app/ 前缀的静态资源（vite base '/app/' 产物）按原路径服务；根路径不受影响。
+test('GET /app 与 /app/ → 服务 Vue SPA index.html（过渡期挂载点）', async () => {
+  const s = await startServer();
+  try {
+    fs.mkdirSync(path.join(s.staticDir, 'app', 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(s.staticDir, 'app', 'index.html'), 'SECRET_VUE_INDEX');
+    fs.writeFileSync(path.join(s.staticDir, 'app', 'assets', 'app.js'), 'SECRET_ASSET');
+
+    for (const p of ['/app', '/app/']) {
+      const res = await fetch(`${s.base}${p}`);
+      assert.equal(res.status, 200, `${p} → 200`);
+      assert.equal(await res.text(), 'SECRET_VUE_INDEX');
+    }
+    const asset = await fetch(`${s.base}/app/assets/app.js`);
+    assert.equal(asset.status, 200);
+    assert.equal(await asset.text(), 'SECRET_ASSET');
+
+    // 根路径仍走旧 index.html（线上主形态不动）
+    const root = await fetch(`${s.base}/`);
+    assert.equal(await root.text(), 'SECRET_INDEX');
+
+    // 路径穿越防护对 /app 前缀同样生效（逃逸出 staticRoot 才 403；根内 ../ 与直接请求等价，不属逃逸）
+    const traversal = await fetch(`${s.base}/app/%2e%2e%2f%2e%2e%2fetc%2fpasswd`);
+    assert.equal(traversal.status, 403);
+  } finally {
+    await s.close();
+  }
+});
