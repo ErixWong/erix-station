@@ -136,6 +136,14 @@
                 projectReqSeq: 0, sessionReqSeq: 0, ctxSeq: 0, autoFollow: true }; // 项目/会话请求序号与项目上下文代次（迟到响应丢弃）
     // issue #55 A1：per-session 输入草稿（内存 Map，key=sessionId）；切换会话/项目时保存与恢复
     const drafts = new Map();
+    // 评审修复：统一的草稿暂存——有值 set、空值 delete（恢复后手动清空须能真正清掉）；无选中会话不动。
+    // openSession / switchProject / resetSessionView 三条「离开会话」路径共用，替换原先的 if(value) set 写法。
+    function saveDraft() {
+      if (!S.sessionId) return;
+      const v = $('input').value;
+      if (v) drafts.set(S.sessionId, v);
+      else drafts.delete(S.sessionId);
+    }
     const AUTO_FOLLOW_GAP = 80; // issue #55 A2：距底超过该值视为「离开底部」，暂停自动跟随
     // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）
     const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
@@ -297,23 +305,22 @@
         return;
       }
       await loadSessions();
-      // issue #55 B1：启动时若 URL 带 #/session/<id>，选中对应会话；不存在则静默回退默认视图
+      // issue #55 B1：启动时若 URL 带 #/session/<id>，走统一深链解析（列表内直接打开；列表外走 detail 端点）
       const hashSid = currentHashSession();
-      if (hashSid) {
-        if (S.sessions.some((s) => String(s.id) === String(hashSid))) openSession(hashSid, { syncRoute: false });
-        else clearRoute();
-      }
+      if (hashSid) await resolveHashSession(hashSid);
     }
 
     async function switchProject(projectId, { loadSessions: shouldLoadSessions = true } = {}) {
       if (S.es) { S.es.close(); S.es = null; }
-      // issue #55 A1：离开旧会话前保存输入草稿；B1：切项目即无选中会话，清深链
-      if (S.sessionId && $('input').value) drafts.set(S.sessionId, $('input').value);
+      // issue #55 A1：离开旧会话前保存输入草稿（空值则清除）；B1：切项目即无选中会话，清深链
+      saveDraft();
       $('input').value = '';
       clearRoute();
       S.ctxSeq++;
       S.projectReqSeq++;
       S.projectId = projectId;
+      // 评审修复：程序化切换（如深链跨项目解析）同步 <select>，防 UI 选中项与 S.projectId 失步
+      $('projectSel').value = projectId;
       S.sessionId = null;
       S.activeRunId = null;
       S.lastSeq = 0;
@@ -322,6 +329,9 @@
       S.renderedIds = null;
       S.esSessionId = null;
       S.sessions = [];
+      // 评审修复：与 resetSessionView 对齐的状态复位（自动跟随恢复、隐藏「↓ 最新」、收起移动端抽屉）
+      S.autoFollow = true; $('toLatest').style.display = 'none';
+      document.body.classList.remove('drawer-open');
       $('stream').innerHTML = '<p class="muted">选择或新建会话</p>';
       setRunning(false);
       updateProjectMeta();
@@ -390,23 +400,37 @@
     async function openSession(id, { syncRoute = true } = {}) {
       const reqSeq = ++S.sessionReqSeq;
       const ctx = S.ctxSeq;
+      // 评审修复：同会话重开只刷新路由（replaceState），不重复 push——保留点击刷新语义，只修历史记录膨胀
+      const isReopen = String(id) === String(S.sessionId);
       if (S.es) { S.es.close(); S.es = null; }
-      // issue #55 A1：离开旧会话前保存输入草稿，切回时恢复；B4：移动端选中会话后自动收起抽屉
-      if (S.sessionId && $('input').value) drafts.set(S.sessionId, $('input').value);
+      // issue #55 A1：离开旧会话前保存输入草稿（空值则清除），切回时恢复；B4：移动端选中会话后自动收起抽屉
+      saveDraft();
       $('input').value = drafts.get(id) ?? '';
       document.body.classList.remove('drawer-open');
       S.sessionId = id; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
       S.esSessionId = id;
       S.autoFollow = true; $('toLatest').style.display = 'none';
-      if (syncRoute) history.pushState(null, '', `#/session/${encodeURIComponent(id)}`);
+      if (syncRoute) {
+        const url = `#/session/${encodeURIComponent(id)}`;
+        if (isReopen) history.replaceState(null, '', url);
+        else history.pushState(null, '', url);
+      }
       $('stream').innerHTML = '';
       renderSessions();
       let data;
       try {
         data = await api(`/api/sessions/${encodeURIComponent(id)}`);
-      } catch {
+      } catch (e) {
         if (reqSeq !== S.sessionReqSeq || ctx !== S.ctxSeq) return;
-        resetSessionView(); // issue #55 B1：会话不存在（如已被删除/深链失效）：静默回退默认视图
+        if (e.code === 'not_found' || e.status === 404) {
+          resetSessionView(); // issue #55 B1：会话不存在（如已被删除/深链失效）：静默回退默认视图（清 hash）
+          return;
+        }
+        // 评审修复：其他错误（网络/5xx）区分处理——保留 hash（可刷新重试）+ stream 区 syserr
+        const div = document.createElement('div');
+        div.className = 'syserr';
+        div.textContent = '会话加载失败，可刷新重试';
+        $('stream').appendChild(div);
         return;
       }
       if (reqSeq !== S.sessionReqSeq || ctx !== S.ctxSeq) return;
@@ -636,11 +660,42 @@
     }
     function clearRoute() { history.replaceState(null, '', location.pathname + location.search); }
 
+    // 评审修复：hash 深链统一解析——当前项目列表内直接打开；列表外走 detail 端点：
+    // 跨项目 → 切项目后打开（含 select 同步）；同项目（分页外的旧会话）→ 直接打开；
+    // 404/not_found → 静默回退默认视图（清 hash）；其他错误 → 保留 hash + syserr「会话加载失败，可刷新重试」。
+    async function resolveHashSession(sid) {
+      if (S.sessions.some((s) => String(s.id) === String(sid))) {
+        openSession(sid, { syncRoute: false });
+        return;
+      }
+      let session;
+      try {
+        ({ session } = await api(`/api/sessions/${encodeURIComponent(sid)}`));
+      } catch (e) {
+        if (e.code === 'not_found' || e.status === 404) {
+          resetSessionView(); // 深链失效：静默回退默认视图（含清 hash）
+          return;
+        }
+        const div = document.createElement('div');
+        div.className = 'syserr';
+        div.textContent = '会话加载失败，可刷新重试';
+        $('stream').appendChild(div);
+        return;
+      }
+      if (String(session.project_id) !== String(S.projectId)) {
+        await switchProject(session.project_id);
+      }
+      openSession(sid, { syncRoute: false });
+      // 评审修复：switchProject 会 clearRoute() 抹掉 hash，刷新即丢深链；这里把深链写回。
+      // 列表内路径 hash 本就等于该 URL，replaceState 为无害 no-op；跨项目路径则恢复深链。
+      history.replaceState(null, '', `#/session/${encodeURIComponent(sid)}`);
+    }
+
     // issue #55 B1：会话不存在/被 popstate 回退时静默回到默认视图（不动项目/会话列表，只清会话详情区）
     function resetSessionView() {
       if (S.es) { S.es.close(); S.es = null; }
-      // issue #55 A1：popstate 回退也属「离开会话」，先存草稿
-      if (S.sessionId && $('input').value) drafts.set(S.sessionId, $('input').value);
+      // issue #55 A1：popstate 回退也属「离开会话」，先存草稿（空值则清除）
+      saveDraft();
       S.sessionId = null; S.lastSeq = 0; S.activeRunId = null; S.deltaBuf = null; S.toolCards = {};
       S.renderedIds = null; S.esSessionId = null; S.autoFollow = true;
       $('toLatest').style.display = 'none';
@@ -655,8 +710,7 @@
       const sid = currentHashSession();
       if (sid) {
         if (String(sid) === String(S.sessionId)) return;
-        if (S.sessions.some((s) => String(s.id) === String(sid))) openSession(sid, { syncRoute: false });
-        else resetSessionView(); // 深链会话不存在：静默回退默认视图
+        resolveHashSession(sid); // 评审修复：统一走 detail 端点解析（跨项目/分页外旧会话/失效深链）
       } else if (S.sessionId) resetSessionView();
     });
 
@@ -680,20 +734,22 @@
         try { Notification.requestPermission().catch(() => {}); } catch { /* 忽略 */ }
       }
       $('input').value = '';
-      drafts.delete(sid); // issue #55 A1：发送成功即清除该会话草稿
       try {
         const { message, run } = await api(`/api/sessions/${encodeURIComponent(sid)}/messages`, {
           method: 'POST', body: JSON.stringify({ content, attachments: [] }),
         });
+        // 评审修复：API 成功返回后才删草稿，且在守卫判定之前无条件执行（原先 await 前删，失败即丢草稿）
+        drafts.delete(sid);
         if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         addMessage({ ...message, role: 'user' });
         S.activeRunId = run.id;
         setRunning(true);
         loadSessions();
       } catch (e) {
+        // 评审修复：草稿按 sid 键，守卫之前写回——发送失败后即使期间切走会话，切回仍可恢复
+        drafts.set(sid, content);
         if (ctx !== S.ctxSeq || S.sessionId !== sid) return;
         $('input').value = content; // issue #42：发送失败回填输入，已输入内容不丢
-        drafts.set(sid, content); // issue #55 A1：回填内容同步进草稿，切走再切回不丢
         const div = document.createElement('div');
         div.className = 'syserr';
         // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）
