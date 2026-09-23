@@ -17,7 +17,7 @@
 | `docs/` | 文档地图（`docs/README.md`）：现有文档 + 待补齐清单与验收标准 |
 | `docs/design/` | 主规格（拓扑 / 网络 / 授权 / 端口 / 数据模型 / 分期）+ 设计原理与被否决方案 |
 | `deploy/` | Traefik + portal + DB 的 compose、FDE 容器模板、迁移脚本 |
-| `portal/` | 管理平台服务（internal API + 用户面 API + mock LLM 网关） |
+| `portal/` | 管理平台服务（internal API + 用户面 API + mock LLM 网关）；用户面前端为 Vue 3 SPA（`portal/frontend/`，issue #61：Vite + TS + vue-router + pinia + Tailwind v4，`/` 服务构建产物） |
 | `runner/` | 容器内 agent worker（agentd + worker，接 erix-agent `runToolLoop`） |
 
 ## 三条不变式（红线）

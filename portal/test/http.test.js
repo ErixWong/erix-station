@@ -14,6 +14,9 @@ import { FakePool } from './fake-pool.js';
 async function startServer({ users = [], overrides = {}, pool: customPool } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
+  // issue #61 P2：Vue SPA dist 由 Docker 注入 staticDir/app/（见 portal/Dockerfile），/ 翻转后服务它。
+  fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
+  fs.writeFileSync(path.join(staticDir, 'app', 'index.html'), 'SECRET_VUE_INDEX');
   const config = {
     cookie: cookieSettings('dev-http', 604800),
     sessionTtlSeconds: 604800,
@@ -377,7 +380,7 @@ test('静态路径穿越 → 403（不泄露文件内容）', async () => {
   try {
     const ok = await fetch(`${s.base}/`);
     assert.equal(ok.status, 200);
-    assert.equal(await ok.text(), 'SECRET_INDEX');
+    assert.equal(await ok.text(), 'SECRET_VUE_INDEX'); // issue #61 P2：/ 已翻转为 Vue SPA
 
     // 编码的 .. 与 /（避免 URL 规范化提前折叠）
     const traversal = await fetch(`${s.base}/%2e%2e%2f%2e%2e%2fetc%2fpasswd`);
@@ -781,30 +784,33 @@ test('F2：forward-auth 审计不记 query（含 ?preview_ticket=<明文>）', a
   }
 });
 
-// issue #61 P1：Vue SPA 过渡期挂载 /app——/app 与 /app/ 服务 staticDir/app/index.html，
-// /app/ 前缀的静态资源（vite base '/app/' 产物）按原路径服务；根路径不受影响。
-test('GET /app 与 /app/ → 服务 Vue SPA index.html（过渡期挂载点）', async () => {
+// issue #61 P2 翻转：/ 与 /index.html 服务 Vue SPA（staticDir/app/index.html，dist 注入目录），
+// 构建产物引用的 /assets/* 映射到注入目录；旧 index.html 保留文件但不再被 / 引用（P4 删）。
+test('GET / 与 /assets/* → 服务 Vue SPA（P2 翻转；/app 挂载点已删除）', async () => {
   const s = await startServer();
   try {
     fs.mkdirSync(path.join(s.staticDir, 'app', 'assets'), { recursive: true });
     fs.writeFileSync(path.join(s.staticDir, 'app', 'index.html'), 'SECRET_VUE_INDEX');
     fs.writeFileSync(path.join(s.staticDir, 'app', 'assets', 'app.js'), 'SECRET_ASSET');
 
-    for (const p of ['/app', '/app/']) {
+    for (const p of ['/', '/index.html']) {
       const res = await fetch(`${s.base}${p}`);
       assert.equal(res.status, 200, `${p} → 200`);
       assert.equal(await res.text(), 'SECRET_VUE_INDEX');
     }
-    const asset = await fetch(`${s.base}/app/assets/app.js`);
+    const asset = await fetch(`${s.base}/assets/app.js`);
     assert.equal(asset.status, 200);
     assert.equal(await asset.text(), 'SECRET_ASSET');
 
-    // 根路径仍走旧 index.html（线上主形态不动）
-    const root = await fetch(`${s.base}/`);
-    assert.equal(await root.text(), 'SECRET_INDEX');
+    // P1 过渡期挂载点已删除：/app 不再特殊处理（staticDir/app 是目录 → 404）
+    const legacy = await fetch(`${s.base}/app`);
+    assert.equal(legacy.status, 404);
 
-    // 路径穿越防护对 /app 前缀同样生效（逃逸出 staticRoot 才 403；根内 ../ 与直接请求等价，不属逃逸）
-    const traversal = await fetch(`${s.base}/app/%2e%2e%2f%2e%2e%2fetc%2fpasswd`);
+    // 路径穿越防护对 /assets 映射同样生效：/app/assets/../.. 仍在 staticRoot 内（与直接请求
+    // 等价 → 404 不属逃逸）；再加一级 .. 逃逸出 staticRoot 才 403。
+    const inside = await fetch(`${s.base}/assets/%2e%2e%2f%2e%2e%2fetc%2fpasswd`);
+    assert.equal(inside.status, 404);
+    const traversal = await fetch(`${s.base}/assets/%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd`);
     assert.equal(traversal.status, 403);
   } finally {
     await s.close();
