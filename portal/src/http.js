@@ -1009,7 +1009,11 @@ async function requireSession(req, ctx) {
  *   UPDATE port_allocations SET state='active' WHERE id=$1 AND state='allocated'（fde-platform §8.6）。
  */
 async function handleForwardAuth(req, res, ctx) {
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  // dev 端口（8090/8443）下浏览器 Host 恒带端口后缀（如 `xxx.fde.localhost:8090`），而
+  // port_allocations.hostname 按无端口 hostname 存储（fix-250923-01）：剥离 `:port` 再做
+  // 精确匹配（生产 80/443 无端口后缀，行为不变）。
+  const rawHost = req.headers['x-forwarded-host'] || req.headers.host;
+  const host = typeof rawHost === 'string' ? rawHost.replace(/:\d+$/, '') : rawHost;
   const uri = req.headers['x-forwarded-uri'] || req.url;
   const method = req.headers['x-forwarded-method'] || req.method;
   const scheme = req.headers['x-forwarded-proto'] || 'https';
@@ -1017,6 +1021,8 @@ async function handleForwardAuth(req, res, ctx) {
 
   const result = await preview.authorizeForwardAuth(ctx.pool, ctx.config, {
     hostname: host || '',
+    // 原始 Host（可能带端口）：302 Location 需要保留非默认端口（fix-250923-01，dev 8090/8443）。
+    hostHeader: rawHost || '',
     uri,
     cookieValue,
     method,
