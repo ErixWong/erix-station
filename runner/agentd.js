@@ -13,7 +13,7 @@
 //
 // P1 范围（任务约定）：单容器串行（capacity=1）、approvals 路径留空（P2）、spool 不落盘（§7.5 待定）。
 
-import { fork, execFileSync } from 'node:child_process';
+import { fork } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -114,9 +114,8 @@ function makeRunCtx(runId) {
     finishing: false,
     // 已被租约/停止裁决，丢弃后续写
     dropped: false,
-    // F6：最后一次 IPC 活动（watchdog 用）；M3：worktree 清理路径
+    // F6：最后一次 IPC 活动（watchdog 用）。D8 修订（2026-09-24）：cwd = 项目目录，无 worktree 清理路径。
     lastIpcAt: Date.now(),
-    worktreePath: null,
     projectDir: null,
   };
 }
@@ -404,31 +403,14 @@ async function heartbeatOnce() {
 }
 
 // ---------------------------------------------------------------------------
-// worktree 准备（§6.2）：git worktree add，失败回退 mkdir（P1 无真实仓库）
+// 项目目录准备（§6.2，D8 修订 2026-09-24，AGENTS.md §7）：确保 ~/projects/<name> 存在，
+// agent 直接在项目目录工作（pi 参照系），不再做 git worktree add。
+// ⚠️ 项目目录是用户资产：任何路径不得删除（原 cleanupWorktree 已整体拆除）。
 // ---------------------------------------------------------------------------
-function prepareWorktree(projectName, runId) {
-  const projectsDir = path.join(CFG.home, 'projects');
-  const worktreesDir = path.join(CFG.home, 'worktrees');
-  const projectDir = path.join(projectsDir, projectName || 'default');
-  const wt = path.join(worktreesDir, `${projectName || 'default'}-${runId}`);
-  fs.mkdirSync(worktreesDir, { recursive: true });
-
-  // 尝试 git worktree（真实仓库场景）；失败/非 git 仓库 → 普通目录（P1 兜底）。
-  try {
-    const isRepo = fs.existsSync(path.join(projectDir, '.git'));
-    if (isRepo) {
-      execFileSync('git', ['worktree', 'add', wt, '-b', `agent/${runId}`], {
-        cwd: projectDir, stdio: ['ignore', 'ignore', 'ignore'],
-      });
-      return wt;
-    }
-  } catch (err) {
-    // fallthrough → mkdir 兜底（P1 无真实仓库场景）。⚠️ 不能静默：dubious ownership / EACCES
-    // 被吞曾导致 worktree 机制整体静默降级（issue #27，2026-09-18 修复），失败必须留痕。
-    log('warn', 'worktree add failed, fallback to plain dir', { run_id: runId, wt, err: String(err?.message ?? err) });
-  }
-  fs.mkdirSync(wt, { recursive: true });
-  return wt;
+function prepareProjectCwd(projectName) {
+  const projectDir = path.join(CFG.home, 'projects', projectName || 'default');
+  fs.mkdirSync(projectDir, { recursive: true });
+  return projectDir;
 }
 
 // ---------------------------------------------------------------------------
@@ -868,7 +850,7 @@ function onWorkerExit(ctx, code, signal) {
       // 审计 #34 评审 A：track 未完成的补报（见 state.pendingReports），退出前由 drainPendingReports 等待。
       const p = reportTerminalAfterDrop(ctx).finally(() => state.pendingReports.delete(p));
       state.pendingReports.add(p);
-      // issue #64 R1：stop 路径是终态（补报 aborted）→ worktree 移除前先捕获产物（best-effort），
+      // issue #64 R1：stop 路径是终态（补报 aborted）→ 清场前先捕获产物（best-effort），
       // 捕获完成后照常清场（含 run 数据目录）。lease_lost/revoked 非本端收敛 → 走下方 else 不捕获。
       captureRunArtifact(ctx).finally(() => cleanupRun(ctx, { archiveRunData: true }));
     } else {
@@ -929,7 +911,7 @@ async function onWorkerFinished(ctx, msg) {
 }
 
 /**
- * issue #64 R1：run 终态产物回收——worktree 移除前捕获并上传（U13）。
+ * issue #64 R1：run 终态产物回收——清场（run 数据目录归档）前捕获并上传（U13）。
  * 仅由「终态已确认」路径调用：onWorkerFinished 收敛成功 / 409 run_terminal 幂等命中、
  * stop 路径（stop_request/stop_heartbeat，补报 aborted 的分支）。
  * 崩溃/lease_lost/revoke/resume 路径**不捕获**——run 还会继续，产物回收只发生在确认终态时。
@@ -938,7 +920,7 @@ async function onWorkerFinished(ctx, msg) {
 async function captureRunArtifact(ctx) {
   const result = await captureAndUploadArtifact({
     runId: ctx.runId,
-    worktreePath: ctx.worktreePath,
+    cwd: ctx.projectDir,
     log,
     upload: ({ buffer, sha256, size }) => internalRequest('PUT', `/runs/${ctx.runId}/artifact`, {
       body: buffer,
@@ -969,7 +951,6 @@ function cleanupRun(ctx, { archiveRunData: shouldArchive = false } = {}) {
       }, 2000);
     }
   }
-  cleanupWorktree(ctx); // M3
   // issue #46 + #64 R1 配套：run 数据目录仅在终态清理（archiveRunData=true，onWorkerFinished 收敛成功后）
   // **归档**（runs/ → runs-archive/，conversation-state.md §5 P1 真相层归档 TTL 替代物理删除）；
   // releaseAndRequeue（resume/崩溃重排队）与 lease_lost 路径绝不归档——attempt 间 notes 必须保留。
@@ -979,31 +960,9 @@ function cleanupRun(ctx, { archiveRunData: shouldArchive = false } = {}) {
 }
 
 // run 数据目录生命周期（issue #46 选项 A + #64 R1 配套归档修正）实现在 ./lib/run-data.js：
-// <CFG.home>/runs/<runId>/notes/ 跨 attempt 保留（resume 可读前序 attempt 的 notes），与 worktree
-// 生命周期完全解耦；终态确认后归档（runs-archive/），启动 sweep 双扫描（runs/ 残留 TTL +
-// runs-archive/ 归档 TTL，race 推导见该文件头注释）。
-
-// M3：清理 run 的 worktree——真实 git worktree 用 `git worktree remove --force`；
-// 兑底目录（mkdir fallback）直接 rmSync；之后 prune 残留元数据。best-effort。
-function cleanupWorktree(ctx) {
-  const wt = ctx.worktreePath;
-  if (!wt) return;
-  const projectDir = ctx.projectDir;
-  if (projectDir && fs.existsSync(path.join(projectDir, '.git')) && fs.existsSync(wt)) {
-    try {
-      execFileSync('git', ['worktree', 'remove', '--force', wt], {
-        cwd: projectDir, stdio: ['ignore', 'ignore', 'ignore'], timeout: 10000,
-      });
-      return;
-    } catch {}
-  }
-  try {
-    if (fs.existsSync(wt)) fs.rmSync(wt, { recursive: true, force: true });
-  } catch {}
-  if (projectDir) {
-    try { execFileSync('git', ['worktree', 'prune'], { cwd: projectDir, stdio: ['ignore', 'ignore', 'ignore'], timeout: 10000 }); } catch {}
-  }
-}
+// <CFG.home>/runs/<runId>/notes/ 跨 attempt 保留（resume 可读前序 attempt 的 notes），与 run
+// 工作区（D8 修订后 = 项目目录，用户资产不删）生命周期完全解耦；终态确认后归档（runs-archive/），
+// 启动 sweep 双扫描（runs/ 残留 TTL + runs-archive/ 归档 TTL，race 推导见该文件头注释）。
 
 async function releaseAndRequeue(ctx, reason) {
   try {
@@ -1034,15 +993,14 @@ async function handleTicket(ticket) {
 
   let cwd;
   try {
-    cwd = prepareWorktree(run.project?.name ?? 'default', runId);
+    cwd = prepareProjectCwd(run.project?.name ?? 'default');
   } catch (err) {
-    log('warn', 'worktree prep failed', { run_id: runId, err: String(err?.message ?? err) });
-    await releaseAndRequeue(ctx, 'worktree_failed');
+    log('warn', 'project cwd prep failed', { run_id: runId, err: String(err?.message ?? err) });
+    await releaseAndRequeue(ctx, 'prepare_cwd_failed');
     return;
   }
-  // M3：记录清理所需路径
-  ctx.worktreePath = cwd;
-  ctx.projectDir = path.join(CFG.home, 'projects', run.project?.name ?? 'default');
+  // D8 修订：cwd 即项目目录（单一事实来源；产物捕获、spawnWorker 均用它）。
+  ctx.projectDir = cwd;
 
   // issue #46（选项 A）：备 run 数据目录（notes 落点，跨 attempt 保留）。
   try {
@@ -1078,7 +1036,7 @@ async function handleTicket(ticket) {
     attachments: Array.isArray(run.attachments) ? run.attachments : [],
     // issue #69：会话历史下行（portal 已限幅，透传不二次校验）；内容不进日志，只可记条数。
     history: Array.isArray(run.history) ? run.history : [],
-    // issue #46：notesDir 下行（run 数据目录内，logical-run 作用域；worker 不再自推 worktree 路径）。
+    // issue #46：notesDir 下行（run 数据目录内，logical-run 作用域；worker 不再自推工作区路径）。
     notes_dir: path.join(ctx.runDataPath, 'notes'),
     config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
     // issue #38 Phase B2：模型快照，run 边界生效——此处取的是 **run 启动瞬间**的 state.llmModels，
@@ -1227,7 +1185,7 @@ async function main() {
     process.exit(1);
   }
   // user-space §6.2：容器内进程 umask = 0002（新建文件 664/目录 775，配合同 GID 1000 组协作）。
-  // agentd 建 worktree、fork worker（继承 umask）的文件都需跨 UID（1001/1002）组可写。
+  // agentd 建项目目录、fork worker（继承 umask）的文件都需跨 UID（1001/1002）组可写。
   process.umask(0o002);
   log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
 
@@ -1259,7 +1217,8 @@ async function main() {
   void sseTask;
   // 审计 #34 F-A（major）：不能盲退——先 drain（等 worker 真退出、deadline 后强杀）
   // 再退出，否则：① abortRun 的 5s SIGKILL timer 随进程消失 → 挂住的 worker 进程组残留；
-  // ② onWorkerExit 不跑 → cleanupRun 不跑 → worktree 残留（违反 D8「隔离单元 = worktree」）。
+  // ② onWorkerExit 不跑 → cleanupRun 不跑 → capacity 不释放、run 数据目录残留（D8 修订后
+  //    项目目录是用户资产，本就无 worktree 清理义务）。
   const drained = await drainRuns([...state.runs.values()], { kill: killProcessGroup, log: (m, e) => log('warn', m, e) });
   // 顺序（评审 A 定向复核）：必须**先 drain runs 再等补报**——onWorkerExit 在 drain 期间才把新的补报
   // 放进 pendingReports；反序（先等补报）会漏掉这一批，drainRuns 返回后立即 exit 即截断 PUT。

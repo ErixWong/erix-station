@@ -181,7 +181,7 @@ test('mock 网关：USE_SHELL 触发 → shell tool_call（issue #72/#64 真机 
   assert.equal(tc.length, 1);
   assert.equal(tc[0].function.name, 'shell');
   const args = JSON.parse(tc[0].function.arguments);
-  // 命令既验证 shell 真执行（node --version），又在 worktree 留下 untracked 探针文件（issue #64 产物回收）
+  // 命令既验证 shell 真执行（node --version），又在项目目录留下 untracked 探针文件（issue #64 产物回收）
   assert.ok(args.command.includes('node --version'));
   assert.ok(args.command.includes('shell-probe.txt'));
 

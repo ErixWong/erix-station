@@ -1,6 +1,7 @@
 // runner/lib/artifacts.js 单测（issue #64 R1）：tar 结构可解出 diff 与新文件、20MB 上限截断、
 // 非 git 全量清单、捕获+上传编排（失败不抛出 / 409 幂等）。
-// 隔离约定：tmp 目录作 worktree；git 用例为真实 `git init` 临时仓库（本机有 git，与 agentd 运行前提一致）。
+// D8 修订（2026-09-24）：捕获目标 = 项目目录（worker cwd），git 用例即真实项目目录场景。
+// 隔离约定：tmp 目录作项目目录；git 用例为真实 `git init` 临时仓库（本机有 git，与 agentd 运行前提一致）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -34,24 +35,23 @@ function untar(buf) {
   return out;
 }
 
-function makeGitWorktree({ dirty = true } = {}) {
+/** 造一个带 run 产物（修改 + untracked）的真实 git 项目目录（D8 修订后捕获目标）。 */
+function makeGitProject({ dirty = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-art-git-'));
-  const wt = path.join(root, 'wt');
   execFileSync('git', ['init', '-q', root]);
   execFileSync('git', ['-C', root, 'config', 'user.email', 't@t']);
   execFileSync('git', ['-C', root, 'config', 'user.name', 't']);
   fs.writeFileSync(path.join(root, 'README.md'), '# base\n');
   execFileSync('git', ['-C', root, 'add', '.']);
   execFileSync('git', ['-C', root, 'commit', '-qm', 'base']);
-  execFileSync('git', ['-C', root, 'worktree', 'add', '-q', wt, '-b', 'agent/run1']);
   if (dirty) {
     // run 产物：修改已跟踪文件 + 两个 untracked 新文件（其一在子目录，验证 porcelain 折叠展开）
-    fs.writeFileSync(path.join(wt, 'README.md'), '# base\nmodified by agent\n');
-    fs.writeFileSync(path.join(wt, 'server.js'), 'console.log(1);\n');
-    fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
-    fs.writeFileSync(path.join(wt, 'src', 'app.js'), 'export const x = 1;\n');
+    fs.writeFileSync(path.join(root, 'README.md'), '# base\nmodified by agent\n');
+    fs.writeFileSync(path.join(root, 'server.js'), 'console.log(1);\n');
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'app.js'), 'export const x = 1;\n');
   }
-  return { root, wt };
+  return { root };
 }
 
 test('buildTar：ustar 结构可被系统 tar 解出（校验和/对齐正确）', () => {
@@ -101,9 +101,9 @@ test('walkFiles：排除 .git/node_modules/.notes，符号链接跳过', () => {
 });
 
 test('captureArtifact（git）：tar 含 diff.patch（修改）+ 新文件快照 + manifest', async () => {
-  const { root, wt } = makeGitWorktree();
+  const { root } = makeGitProject();
   try {
-    const res = await captureArtifact({ runId: 'run1', worktreePath: wt });
+    const res = await captureArtifact({ runId: 'run1', cwd: root });
     assert.ok(res);
     const entries = untar(zlib.gunzipSync(res.buffer));
     // diff.patch 含已跟踪文件的修改
@@ -135,7 +135,7 @@ test('captureArtifact（非 git）：全量文件清单进快照', async () => {
     fs.writeFileSync(path.join(root, 'a.txt'), 'aaa');
     fs.mkdirSync(path.join(root, 'sub'));
     fs.writeFileSync(path.join(root, 'sub', 'b.txt'), 'bbbb');
-    const res = await captureArtifact({ runId: 'run2', worktreePath: root });
+    const res = await captureArtifact({ runId: 'run2', cwd: root });
     assert.ok(res);
     const entries = untar(zlib.gunzipSync(res.buffer));
     const manifest = JSON.parse(entries.get(ARTIFACT_MANIFEST_NAME).toString('utf8'));
@@ -153,7 +153,7 @@ test('captureArtifact：超过 maxBytes 截断并标记 truncated（不静默丢
     fs.writeFileSync(path.join(root, 'big1.bin'), Buffer.alloc(600, 1));
     fs.writeFileSync(path.join(root, 'big2.bin'), Buffer.alloc(600, 2));
     fs.writeFileSync(path.join(root, 'big3.bin'), Buffer.alloc(600, 3));
-    const res = await captureArtifact({ runId: 'run3', worktreePath: root, maxBytes: 1200 });
+    const res = await captureArtifact({ runId: 'run3', cwd: root, maxBytes: 1200 });
     assert.ok(res);
     const manifest = JSON.parse(untar(zlib.gunzipSync(res.buffer)).get(ARTIFACT_MANIFEST_NAME).toString('utf8'));
     assert.equal(manifest.truncated, true);
@@ -164,12 +164,12 @@ test('captureArtifact：超过 maxBytes 截断并标记 truncated（不静默丢
   }
 });
 
-test('captureArtifact：空 worktree / 无变更 → null（不上传，表无行兼容现状）', async () => {
-  const { root, wt } = makeGitWorktree({ dirty: false });
+test('captureArtifact：空项目目录 / 无变更 → null（不上传，表无行兼容现状）', async () => {
+  const { root } = makeGitProject({ dirty: false });
   try {
-    // 无 diff、无 untracked（新 worktree 分支与 HEAD 一致）
-    assert.equal(await captureArtifact({ runId: 'run4', worktreePath: wt }), null);
-    assert.equal(await captureArtifact({ runId: 'run5', worktreePath: path.join(root, 'nope') }), null);
+    // 无 diff、无 untracked（干净仓库）
+    assert.equal(await captureArtifact({ runId: 'run4', cwd: root }), null);
+    assert.equal(await captureArtifact({ runId: 'run5', cwd: path.join(root, 'nope') }), null);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -181,7 +181,7 @@ test('captureAndUploadArtifact：上传失败不抛出（ok:false，清场不被
     fs.writeFileSync(path.join(root, 'a.txt'), 'x');
     const logs = [];
     const res = await captureAndUploadArtifact({
-      runId: 'run6', worktreePath: root,
+      runId: 'run6', cwd: root,
       upload: async () => { throw Object.assign(new Error('boom'), { code: 'network_error' }); },
       log: (level, msg, extra) => logs.push([level, msg, extra]),
     });
@@ -199,7 +199,7 @@ test('captureAndUploadArtifact：409 artifact_exists 视为幂等成功（不覆
     fs.writeFileSync(path.join(root, 'a.txt'), 'x');
     let calls = 0;
     const res = await captureAndUploadArtifact({
-      runId: 'run7', worktreePath: root,
+      runId: 'run7', cwd: root,
       upload: async () => { calls += 1; throw Object.assign(new Error('exists'), { code: 'artifact_exists' }); },
       log: () => {},
     });
@@ -217,7 +217,7 @@ test('captureAndUploadArtifact：正常路径上传 bundle（sha/size/manifest �
     fs.writeFileSync(path.join(root, 'a.txt'), 'payload');
     let got = null;
     const res = await captureAndUploadArtifact({
-      runId: 'run8', worktreePath: root,
+      runId: 'run8', cwd: root,
       upload: async (bundle) => { got = bundle; },
       log: () => {},
     });

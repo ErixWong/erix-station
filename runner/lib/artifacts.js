@@ -1,8 +1,9 @@
-// issue #64 R1：run 终态 worktree 产物回收——agentd 侧捕获与上传。
+// issue #64 R1：run 终态产物回收——agentd 侧捕获与上传。
 // 依据：docs/design/runner-integration.md §4.2 U13 / §6.6。
+// D8 修订（2026-09-24，AGENTS.md §7）：捕获目标 = 项目目录（worker cwd），不再是 run worktree。
 //
-// 捕获内容（终态确认后、cleanupWorktree/archiveRunData 之前）：
-//   - git worktree：`git diff HEAD`（含 staged）→ diff.patch；`git status --porcelain` 中
+// 捕获内容（终态确认后、run 数据目录归档之前）：
+//   - git 仓库（项目目录）：`git diff HEAD`（含 staged）→ diff.patch；`git status --porcelain` 中
 //     untracked（`??`）新文件 → 快照进 tar。
 //   - 非 git 目录：全量文件清单（排除 .git/node_modules/.notes）。
 // 打包：单 tar.gz = diff.patch + files/NNNNNN 快照 + manifest.json（真实路径/大小/sha256/truncated
@@ -121,28 +122,28 @@ export function walkFiles(root) {
 }
 
 /**
- * 捕获 worktree 产物 → 单 tar.gz（含 manifest.json）。
+ * 捕获 run 工作目录（项目目录）产物 → 单 tar.gz（含 manifest.json）。
  * @param {object} opts
  * @param {string} opts.runId
- * @param {string} opts.worktreePath
+ * @param {string} opts.cwd run 工作目录绝对路径（D8 修订后 = 项目目录）
  * @param {number} [opts.maxBytes] 文件快照累计上限（截断标记 truncated）
  * @param {(args:string[])=>Promise<string|null>} [opts.gitExec] 可注入的 git 执行器（测试用）
- * @returns {Promise<{buffer:Buffer, manifest:object}|null>} 无产物（worktree 不存在/空变更）返回 null
+ * @returns {Promise<{buffer:Buffer, manifest:object}|null>} 无产物（目录不存在/空变更）返回 null
  */
-export async function captureArtifact({ runId, worktreePath, maxBytes = ARTIFACT_MAX_BYTES, gitExec }) {
-  if (!worktreePath || !fs.existsSync(worktreePath)) return null;
+export async function captureArtifact({ runId, cwd, maxBytes = ARTIFACT_MAX_BYTES, gitExec }) {
+  if (!cwd || !fs.existsSync(cwd)) return null;
   const git = gitExec ?? defaultGitExec;
-  const isGit = (await git(['-C', worktreePath, 'rev-parse', '--is-inside-work-tree']))?.trim() === 'true';
+  const isGit = (await git(['-C', cwd, 'rev-parse', '--is-inside-work-tree']))?.trim() === 'true';
 
   let diff = '';
   let untracked = [];
   let allFiles = null; // 非 git 场景：全量清单
   if (isGit) {
-    diff = (await git(['-C', worktreePath, 'diff', 'HEAD'])) ?? ''; // 含 staged
-    const porcelain = await git(['-C', worktreePath, 'status', '--porcelain']);
+    diff = (await git(['-C', cwd, 'diff', 'HEAD'])) ?? ''; // 含 staged
+    const porcelain = await git(['-C', cwd, 'status', '--porcelain']);
     if (porcelain !== null) untracked = parseUntrackedPaths(porcelain);
   } else {
-    allFiles = walkFiles(worktreePath);
+    allFiles = walkFiles(cwd);
   }
 
   const entries = [];
@@ -154,7 +155,7 @@ export async function captureArtifact({ runId, worktreePath, maxBytes = ARTIFACT
   }
 
   const snapshot = (rel) => {
-    const abs = path.join(worktreePath, rel);
+    const abs = path.join(cwd, rel);
     let buf;
     try {
       const st = fs.statSync(abs);
@@ -170,7 +171,7 @@ export async function captureArtifact({ runId, worktreePath, maxBytes = ARTIFACT
 
   for (const rel of untracked) {
     if (truncated) break;
-    const abs = path.join(worktreePath, rel);
+    const abs = path.join(cwd, rel);
     let st;
     try { st = fs.statSync(abs); } catch { continue; }
     if (st.isDirectory()) {
@@ -197,7 +198,7 @@ export async function captureArtifact({ runId, worktreePath, maxBytes = ARTIFACT
     schema: 1,
     run_id: runId,
     captured_at: new Date().toISOString(),
-    worktree: worktreePath,
+    cwd,
     git: isGit,
     truncated,
     diff_bytes: entries[0]?.name === 'diff.patch' ? entries[0].data.length : 0,
@@ -218,9 +219,9 @@ export async function captureArtifact({ runId, worktreePath, maxBytes = ARTIFACT
  * @param {(bundle:{buffer:Buffer,size:number,sha256:string,manifest:object})=>Promise<void>} opts.upload
  * @returns {Promise<{ok:boolean,captured?:boolean,deduped?:boolean,size?:number,sha256?:string,truncated?:boolean,error?:string}>}
  */
-export async function captureAndUploadArtifact({ runId, worktreePath, maxBytes, gitExec, upload, log = () => {} }) {
+export async function captureAndUploadArtifact({ runId, cwd, maxBytes, gitExec, upload, log = () => {} }) {
   try {
-    const captured = await captureArtifact({ runId, worktreePath, maxBytes, gitExec });
+    const captured = await captureArtifact({ runId, cwd, maxBytes, gitExec });
     if (!captured) {
       log('info', 'no artifact to capture', { run_id: runId });
       return { ok: true, captured: false };

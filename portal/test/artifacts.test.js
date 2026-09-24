@@ -23,7 +23,7 @@ const RUN_ID = '11111111-2222-3333-4444-555555555555';
 function makeBundle({ truncated = false, files = [{ path: 'a.js', data: 'x' }] } = {}) {
   const manifest = {
     schema: 1, run_id: RUN_ID, captured_at: new Date().toISOString(),
-    worktree: '/home/erix/worktrees/p-' + RUN_ID, git: true, truncated,
+    cwd: '/home/erix/projects/p', git: true, truncated,
     diff_bytes: 3, files: files.map((f, i) => ({
       path: f.path, size: Buffer.byteLength(f.data), sha256: '0'.repeat(64), tar: `files/${String(i).padStart(6, '0')}`,
     })),
