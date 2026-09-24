@@ -17,6 +17,7 @@
 | [`design/topology.md`](design/topology.md) | **H-B 网络与访问拓扑定稿（单一事实来源）**：拓扑、IPAM、链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、实测证据（决策者 2026-09，issue #5） | ✅ |
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
 | [`design/runner-integration.md`](design/runner-integration.md) | **runner 集成契约（WP3b）**：agentd/worker 职责、IPC 信封、租约/心跳/事件批、终态收敛、erix-agent `runToolLoop`/`TranscriptStore` 锚点（v0.9.0，§9.1 八方法） | ✅ |
+| [`design/conversation-state.md`](design/conversation-state.md) | **会话状态模型（issue #77）**：三层生命周期（执行/会话/工作区）、session-scoped transcript 目标态、引擎现状源码核对、pi 参照系、P0–P3 分阶段实施、红线与验收口径 | ✅（设计定稿待实施） |
 | [`design/audit-2026-09-16.md`](design/audit-2026-09-16.md) | **设计文档集一致性审计（2026-09-16）**：58 条发现 + 修复处置记录（issue #21） | ✅ |
 | [`design/user-space.md`](design/user-space.md) | **用户空间物化契约（阻塞 P1 开工，issue #7）**：宿主↔portal↔FDE 容器路径映射、文件清单与 JSON schema、原子写 + manifest 多文件一致性、UID/权限、失败重试状态机、变更感知、重建幂等、项目目录归属 | ✅ |
 | [`design/deploy-contract.md`](design/deploy-contract.md) | **P1 部署契约**：服务清单与镜像 pin、compose 字段（网络/publish/volume/healthcheck/env_file）、DB 迁移机制、Traefik 静态/动态配置、防火墙应用方式（iptables-nft 幂等 + fail-closed）、socket-proxy 白名单策略、FDE 容器创建参数、P1 范围声明、readiness 语义 | ✅ |
