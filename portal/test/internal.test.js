@@ -8,6 +8,9 @@ import {
   isValidClientEventId,
   validateTransition,
   assembleTicket,
+  HISTORY_DEFAULTS,
+  normalizeHistoryBudget,
+  truncateHistory,
   validateEventPayload,
   authenticateContainer,
   claimRun,
@@ -69,6 +72,110 @@ test('assembleTicket：resume = attempt > 1（方案 B re-claim）', () => {
   });
   assert.equal(t2.run.resume, true);
   assert.equal(t2.run.task, '');
+});
+
+test('truncateHistory：先按条数截尾（保最新），再按 UTF-8 字节从头丢到符合（issue #69）', () => {
+  const msgs = (n) => Array.from({ length: n }, (_, i) => ({ role: 'user', content: `m${i + 1}` }));
+  // 条数截尾：保最新 3 条
+  assert.deepEqual(truncateHistory(msgs(5), { maxMessages: 3 }), [
+    { role: 'user', content: 'm3' },
+    { role: 'user', content: 'm4' },
+    { role: 'user', content: 'm5' },
+  ]);
+  // 字节截断：maxBytes 内保最新丢最旧（中文 3 字节/字）
+  const cn = [
+    { role: 'user', content: '一二三四五六七八九十' }, // 30B
+    { role: 'assistant', content: 'hello' },            // 5B
+    { role: 'user', content: 'ab' },                    // 2B
+  ];
+  assert.deepEqual(truncateHistory(cn, { maxBytes: 10 }), [
+    { role: 'assistant', content: 'hello' },
+    { role: 'user', content: 'ab' },
+  ]);
+  // 顺序：先条数后字节（条数截完再按字节丢）
+  assert.deepEqual(
+    truncateHistory(cn, { maxMessages: 2, maxBytes: 100 }),
+    [{ role: 'assistant', content: 'hello' }, { role: 'user', content: 'ab' }],
+  );
+  // 非法入参
+  assert.deepEqual(truncateHistory(null), []);
+  assert.deepEqual(truncateHistory('x'), []);
+  // 预算缺省用默认
+  assert.deepEqual(truncateHistory(msgs(25)).length, HISTORY_DEFAULTS.maxMessages);
+});
+
+test('normalizeHistoryBudget：非正整数/缺省回退默认（issue #69）', () => {
+  assert.deepEqual(normalizeHistoryBudget(), HISTORY_DEFAULTS);
+  assert.deepEqual(normalizeHistoryBudget({ maxMessages: 0, maxBytes: -1 }), HISTORY_DEFAULTS);
+  assert.deepEqual(normalizeHistoryBudget({ maxMessages: 'x', maxBytes: 1.5 }), HISTORY_DEFAULTS);
+  assert.deepEqual(normalizeHistoryBudget({ maxMessages: 5, maxBytes: 100 }), { maxMessages: 5, maxBytes: 100 });
+});
+
+test('assembleTicket：history 注入与缺省（issue #69）', () => {
+  const base = {
+    queueId: 'q1', claimToken: 'ct1', leaseUntil: new Date('2026-09-12T00:01:30Z'),
+    run: { id: 'run1', session_id: 's1', model: 'm' }, project: { name: 'p', root_path: '~/p' },
+    message: { id: 'm1', content: 'hi', attachments: [] }, attempts: 1,
+  };
+  assert.deepEqual(assembleTicket(base).run.history, []);
+  const h = [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }];
+  assert.deepEqual(assembleTicket({ ...base, history: h }).run.history, h);
+});
+
+test('claimRun：history 下行——session 最近 user/assistant 升序、排除当前消息（issue #69）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  // 现场：m0(assistant, seq0) m1(user 'hello'=当前消息, seq1) m2(assistant, seq2)；m3 属别的 session 不混入
+  pool.messages.push(
+    { id: 'm0', run_id: 'run0', session_id: sessionId, role: 'assistant', content: 'prev answer', seq: 0, attachments: [] },
+    { id: 'm2', run_id: runId, session_id: sessionId, role: 'assistant', content: 'last answer', seq: 2, attachments: [] },
+    { id: 'm3', run_id: 'runX', session_id: 'sX', role: 'assistant', content: 'other session', seq: 9, attachments: [] },
+  );
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  assert.deepEqual(ticket.run.history, [
+    { role: 'assistant', content: 'prev answer' },
+    { role: 'assistant', content: 'last answer' },
+  ]);
+});
+
+test('claimRun：history 预算注入——条数截断与字节截断（issue #69）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  // seq1 为当前消息（seed 自带）；seq2..6 五条 assistant 历史
+  for (let i = 2; i <= 6; i += 1) {
+    pool.messages.push({ id: `m${i}`, run_id: runId, session_id: sessionId, role: 'assistant', content: `ans${i}`, seq: i, attachments: [] });
+  }
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+
+  // 条数：maxMessages=3 → 保最新 3 条（ans4/5/6），升序
+  const t1 = await claimRun(pool, { container, user, capacity: 1, holdMs: 10, historyBudget: { maxMessages: 3, maxBytes: 16384 } });
+  assert.deepEqual(t1.run.history, [
+    { role: 'assistant', content: 'ans4' },
+    { role: 'assistant', content: 'ans5' },
+    { role: 'assistant', content: 'ans6' },
+  ]);
+
+  // 重置现场再测字节：maxBytes=10 → 'ans4'(4B)+'ans5'(4B)+'ans6'(4B)=12B → 丢最旧 ans4，保 ans5/ans6
+  const { pool: pool2, userId: u2, containerId: c2 } = seedClaimable();
+  for (let i = 2; i <= 6; i += 1) {
+    pool2.messages.push({ id: `m${i}`, run_id: 'run1', session_id: 's1', role: 'assistant', content: `ans${i}`, seq: i, attachments: [] });
+  }
+  const t2 = await claimRun(pool2, { container: { id: c2, user_id: u2 }, user: { id: u2, login: 'alice' }, capacity: 1, holdMs: 10, historyBudget: { maxMessages: 20, maxBytes: 10 } });
+  assert.deepEqual(t2.run.history, [
+    { role: 'assistant', content: 'ans5' },
+    { role: 'assistant', content: 'ans6' },
+  ]);
+
+  // 非法注入值回退默认（20 条上限内全保留 5 条）
+  const { pool: pool3, userId: u3, containerId: c3 } = seedClaimable();
+  for (let i = 2; i <= 6; i += 1) {
+    pool3.messages.push({ id: `m${i}`, run_id: 'run1', session_id: 's1', role: 'assistant', content: `ans${i}`, seq: i, attachments: [] });
+  }
+  const t3 = await claimRun(pool3, { container: { id: c3, user_id: u3 }, user: { id: u3, login: 'alice' }, capacity: 1, holdMs: 10, historyBudget: { maxMessages: 0, maxBytes: -5 } });
+  assert.equal(t3.run.history.length, 5);
+  assert.equal(t3.run.history[0].content, 'ans2');
 });
 
 test('canonicalJson/canonicalHash：键序无关的稳定规范化', () => {
