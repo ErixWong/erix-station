@@ -131,3 +131,88 @@ test('mock 网关：/healthz 与未知路径', async (t) => {
   const nf = await fetch(`http://127.0.0.1:${port}/nope`);
   assert.equal(nf.status, 404);
 });
+
+const TOOL_RESULT_MSGS = (toolName) => [
+  { role: 'user', content: 'USE_SHELL' },
+  { role: 'assistant', tool_calls: [{ id: 'call_x', type: 'function', function: { name: toolName, arguments: '{}' } }] },
+  { role: 'tool', tool_call_id: 'call_x', content: 'exit_code: 0\nduration_ms: 12\ntruncated: false\nv22.0.0' },
+];
+
+test('mock 网关：USE_TOOL 触发 → tree tool_call（WP5 回归锚点，行为不变）', async (t) => {
+  const server = createGatewayServer();
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  const res = await post(port, '/v1/chat/completions', {
+    key: 'erix-placeholder',
+    body: { model: 'mock-model', messages: [{ role: 'user', content: '帮我看看目录，用工具' }], stream: false },
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  const tc = body.choices[0].message.tool_calls;
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(tc.length, 1);
+  assert.equal(tc[0].function.name, 'tree');
+  assert.equal(tc[0].function.arguments, '{"path":"."}');
+
+  // 第二轮：对话含 tool 结果 → tree 固定收尾文本
+  const final = await post(port, '/v1/chat/completions', {
+    key: 'erix-placeholder',
+    body: { model: 'mock-model', messages: TOOL_RESULT_MSGS('tree'), stream: false },
+  });
+  const finalBody = await final.json();
+  assert.equal(finalBody.choices[0].finish_reason, 'stop');
+  assert.ok(finalBody.choices[0].message.content.includes('已执行 tree 工具'));
+});
+
+test('mock 网关：USE_SHELL 触发 → shell tool_call（issue #72/#64 真机 e2e 探针）', async (t) => {
+  const server = createGatewayServer();
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  const res = await post(port, '/v1/chat/completions', {
+    key: 'erix-placeholder',
+    body: { model: 'mock-model', messages: [{ role: 'user', content: 'USE_SHELL' }], stream: false },
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  const tc = body.choices[0].message.tool_calls;
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(tc.length, 1);
+  assert.equal(tc[0].function.name, 'shell');
+  const args = JSON.parse(tc[0].function.arguments);
+  // 命令既验证 shell 真执行（node --version），又在 worktree 留下 untracked 探针文件（issue #64 产物回收）
+  assert.ok(args.command.includes('node --version'));
+  assert.ok(args.command.includes('shell-probe.txt'));
+
+  // 第二轮：对话含 tool 结果 → shell 专属固定收尾文本（区分于 tree）
+  const final = await post(port, '/v1/chat/completions', {
+    key: 'erix-placeholder',
+    body: { model: 'mock-model', messages: TOOL_RESULT_MSGS('shell'), stream: false },
+  });
+  const finalBody = await final.json();
+  assert.equal(finalBody.choices[0].finish_reason, 'stop');
+  assert.ok(finalBody.choices[0].message.content.includes('已执行 shell 工具'));
+  assert.ok(finalBody.choices[0].message.content.includes('shell-probe.txt'));
+});
+
+test('mock 网关：USE_SHELL 优先级高于 USE_TOOL（同消息两者并存按 shell 处理）', async (t) => {
+  const server = createGatewayServer();
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  const res = await post(port, '/v1/chat/completions', {
+    key: 'erix-placeholder',
+    body: { model: 'mock-model', messages: [{ role: 'user', content: 'USE_TOOL 和 USE_SHELL 都有' }], stream: false },
+  });
+  const body = await res.json();
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'shell');
+
+  // 流式路径同样优先 shell
+  const sres = await post(port, '/v1/chat/completions', {
+    key: 'erix-placeholder',
+    body: { model: 'mock-model', messages: [{ role: 'user', content: 'use_tool use_shell' }], stream: true },
+  });
+  const text = await sres.text();
+  assert.ok(text.includes('"name":"shell"'), `流式 tool_call 应为 shell：${text}`);
+});
