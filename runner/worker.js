@@ -24,6 +24,7 @@ import { createToolRegistry } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc } from './lib/ipc.js';
 import { resolveRunModel } from './lib/llm-models.js';
 import { createFileTools, createJail } from './lib/file-tools.js';
+import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
 import { mapHistoryToInitialMessages } from './lib/history.js';
@@ -37,7 +38,8 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 1. 交付物（代码/配置/文档）必须用 writeFile 写入工作目录的文件系统——磁盘上的文件才是交付物。
 2. 修改既有文件前先 readFile 看现状，不要凭空整文件覆写。
 3. 收尾回复只写简短摘要：做了什么、写入/修改了哪些文件、如何运行与验证；不要在回复里粘贴代码全文或大段文件内容。
-4. 若任务只是问答或解释、不产生交付物，直接回答即可，无需写文件。`;
+4. 若任务只是问答或解释、不产生交付物，直接回答即可，无需写文件。
+5. 交付前尽量用 shell 工具运行验证命令（构建/测试/lint），跑通再交付；命令在容器内执行，不要改动 worktree 之外的状态。`;
 
 const nextReqId = createReqIdGenerator();
 let runStart = null;
@@ -225,12 +227,15 @@ async function startRun(msg) {
       msg: `notes tools unavailable, run continues without note workflow: ${String(err?.message ?? err)}`,
     });
   }
-  // registry 只装 file 工具；note_* 走工厂结构化 executeTool（工厂内部强制宿主作用域）。
+  // issue #72：shell 工具（进程内命令执行，v1 自动执行 + tool 事件审计）——与 file 工具
+  // 同为纯 {executors, schemas} 形态，并入 registry 最简；note_* 例外走工厂结构化 executeTool
+  // （工厂内部强制宿主作用域），保持独立分支不动。
+  const shellTools = createShellTools({ worktreeRoot: cwd });
   const registry = createToolRegistry({
-    executors: fileTools.executors,
-    schemas: fileTools.schemas,
+    executors: { ...fileTools.executors, ...shellTools.executors },
+    schemas: [...fileTools.schemas, ...shellTools.schemas],
   });
-  const tools = [...fileTools.schemas, ...noteTools.schemas];
+  const tools = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
   const executeTool = async (options) => {
     if (noteTools.executeTool && noteToolNames.has(options.name)) {
