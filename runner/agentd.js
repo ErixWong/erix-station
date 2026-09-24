@@ -161,7 +161,10 @@ async function internalRequest(method, p, { body, claimToken, retries = 0, timeo
       payload = JSON.stringify(body);
       headers['Content-Type'] = 'application/json';
     }
-    headers['Content-Length'] = payload.length;
+    // ⚠️ Content-Length 必须按 UTF-8 字节数：JSON.stringify 返回 string，`.length` 数的是
+    //    UTF-16 码元——含中文等多字节字符时小于实际字节数，server 会等永远等不完的字节
+    //    → 请求挂起 → 客户端 30s 超时 → network_error 无限重试（#77 真机风暴根因，实测复现）。
+    headers['Content-Length'] = Buffer.byteLength(payload);
   } else {
     headers['Content-Type'] = 'application/json';
   }
