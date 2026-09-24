@@ -28,7 +28,7 @@
 | **平台文件** | 由 portal/materializer 生成、写入用户空间的文件（`config.json` / `ports.json` / `AGENTS.md` / `.gitignore` / `manifest.json` / 模板）。见 §4 |
 | **generation** | 每个 FDE 用户空间的物化批次号，单调递增；是多文件一致性的提交点（见 §5.3） |
 | **宿主路径** | `/srv/erix/users/<fde>/...`，materializer 写盘的真实路径 |
-| **容器路径** | `/home/<user>/...`，FDE 容器内进程（agentd/worker/code-server）看到的路径 |
+| **容器路径** | `/home/<user>/...`，FDE 容器内进程（agentd/worker）看到的路径 |
 
 ---
 
@@ -302,7 +302,7 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 
 | 角色 | UID | GID | 运行位置 | 说明 |
 |---|---|---|---|---|
-| FDE 用户 `erix` | **1000** | **1000** | FDE 容器 | 工作区属主；code-server、FDE 交互 shell、dev servers 以它运行 |
+| FDE 用户 `erix` | **1000** | **1000** | FDE 容器 | 工作区属主；FDE 交互通道为对话界面，dev servers 以它运行 |
 | `erix-agentd` | **1001** | 1000 | FDE 容器 | 唯一持 per-container token 的进程；fork worker 时切 UID（runner §11.3） |
 | `erix-worker` | **1002** | 1000 | FDE 容器 | 每 run 一个；跑 `runToolLoop`/工具；无任何平台凭据 |
 | portal（materializer 写入身份） | **0（root）** | 0 | portal 容器 | 控制面：需 `chown`（把工作区目录属主设成 1000）、写 Docker API、写 Traefik 动态配置（600）与 LLM key 文件 |

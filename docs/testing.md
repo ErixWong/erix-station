@@ -111,14 +111,14 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 | P2-5 | 工具审批 + 超时 `expired` | §3.6.2 U10/U11 | 审批决定 / 10min 超时 / 迟到决定 `409` | §3.6.2 |
 | P2-6 | 账号生命周期 workflow | onboarding/offboarding 脚本（规格 §7.2/§7.3） | 建子网/起容器/分配端口/物化 + 停容器/吊销 | 脚本走通 |
 
-**P3（LLM 网关 + 用量记账 + 审计 + code-server）**
+**P3（LLM 网关 + 用量记账 + 审计）**
 
 | # | 验收项 | 命令 | 期望输出 | 判定标准 |
 |---|---|---|---|---|
 | P3-1 | LLM 注入（来源子网→身份） | topology §4-L7 实测（§10 证据 8） | A 子网拿 alice key、伪造 Authorization 被覆盖、无匹配 404 | topology §10 证据 8 |
 | P3-2 | 成本按客户项目归集 | 拉网关用量 → `usage_ledger` | `source='gateway'` 行、按 `key_alias`/`project_id` 归集 | model §5 |
 | P3-3 | 改 endpoint 无效 | 出口策略实施后实测 | 外部 LLM 域名不可达、仅 `llm.<base>` 可达 | 规格 §11（安全团队策略依赖，issue #3） |
-| P3-4 | code-server 模板 + 审计 | 起 code-server（:3001）+ `audit_log` 查询 | :3001 经 Traefik 可达、关键动作落审计 | 规格 §12.3/§14 |
+| P3-4 | 审计 | `audit_log` 查询（关键动作：登录/端口分配/预览授权/LLM 调用） | 关键动作落审计、可检索 | 规格 §14 |
 
 ---
 
@@ -256,7 +256,7 @@ SQL
 
 ### 3.2 认证与边缘授权（守不变式 2；契约 = portal §2.5/§2.7/§2.8 + topology §5.2）
 
-> ⚠️ **P1 范围**：预览/IDE 路由（`*.fde.<base>` forwardAuth + preview ticket/cookie）归 **P2**（deploy §7.2「P1 完全不部署预览路由」）。因此 §3.2 的预览 ticket 用例为 **P2 验收**；P1 的认证验收只含「portal 自身 session cookie」+「internal API token」+「forwardAuth 不泄露 cookie 的结构性断言（若 P1 写了 fde-auth 中间件但无预览路由，则以『未部署预览路由 = fail-closed』为 P1 断言）」。
+> ⚠️ **P1 范围**：预览路由（`*.fde.<base>` forwardAuth + preview ticket/cookie）归 **P2**（deploy §7.2「P1 完全不部署预览路由」）。因此 §3.2 的预览 ticket 用例为 **P2 验收**；P1 的认证验收只含「portal 自身 session cookie」+「internal API token」+「forwardAuth 不泄露 cookie 的结构性断言（若 P1 写了 fde-auth 中间件但无预览路由，则以『未部署预览路由 = fail-closed』为 P1 断言）」。
 
 **A. portal session cookie（P1）**
 
@@ -503,7 +503,7 @@ P1 交付完成 = 同时满足：
 4. **P1 范围安全回归通过**：§3.1 中本机可跑的 N1–N3/N6 + §3.2 C（internal token）+ §3.4 R4/R6/R7/R10/R11 真机通过（§4.2 判「必须真机」的项；N4 归 P2）。
 5. **契约测试接入**：§3.6.3 的 `erix-agent/contract-tests` 跑通（store adapter + config provider），深路径导入被拒的负向断言通过。
 
-> ⚠️ **P1 是否含预览/真实 LLM（待决策者确认）**：按 deploy §7.2 已定 **P1 不含**预览/IDE iframe、多 FDE、**真实 LLM 网关**（归 P2/P3）；**P1 对话验收走无真实凭据的 mock 网关（deploy §7.3 + §3.9）**。因此：
+> ⚠️ **P1 是否含预览/真实 LLM（待决策者确认）**：按 deploy §7.2 已定 **P1 不含**预览 iframe、多 FDE、**真实 LLM 网关**（归 P2/P3）；**P1 对话验收走无真实凭据的 mock 网关（deploy §7.3 + §3.9）**。因此：
 > - **若按「P1 不含预览/真实 LLM」**（当前文档定稿）：§3.2 B（preview ticket）、§3.1 N4 的「多 FDE」完整版、真实 LLM 注入（topology §4-L7）**不属于 P1 验收**，归 P2/P3；P1 只须保证「未部署预览路由 = fail-closed」（`*.fde.<base>` 无路由 → 404/不可达）这一条，对话链路用 §3.9 的 mock 断言。
 > - **若决策者改判「P1 含预览」**：把 §3.2 B 与 §3.5 T1（预览路由端到端）提入 P1 验收，并要求 preview ticket TTL（60s ⚠️）、预览 cookie TTL（15min ⚠️）先拍板（portal §2.8 ⚠️）。**若「P1 含真实 LLM」**：把 topology §4-L7 的真实 LLM 注入验收（A 子网拿 alice key / B 子网拿 bob key / 伪造 Authorization 被覆盖 / 无匹配来源 404，topology §10 证据 8）提入 P1，且需真实 LLM 网关（LiteLLM）——这会引入「真实 LLM 配额」依赖（§5），须决策者明确接受。
 

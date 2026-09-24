@@ -36,7 +36,7 @@
 │                                                                      │
 │  Traefik（host 网络，独占 80/443，--api=false）                        │
 │    ├─ station.<base>        → http://127.0.0.1:8080 （portal，回环）   │
-│    ├─ *.fde.<base>          → http://10.200.<n>.2:<port>（预览/IDE）   │
+│    ├─ *.fde.<base>          → http://10.200.<n>.2:<port>（预览）      │
 │    ├─ llm.<base>            → http://127.0.0.1:4000 （LLM 网关数据面） │
 │    └─ /api/internal/*       → http://127.0.0.1:8080 （ipAllowList）    │
 │                                                                      │
@@ -101,7 +101,7 @@
 `浏览器 https://station.<base>` → Traefik(host:443) → `127.0.0.1:8080` → portal。
 认证 = portal 自己的 **host-only session cookie `__Host-fde_session`**（`Secure`/`HttpOnly`/`SameSite=Lax`/`Path=/`、**无 `Domain`**；issue #6 后，取值细节以 [`../api/portal.md`](../api/portal.md) §2.5 为准）。SSE 回传需 `flushInterval`（§6 第 5/10 条）。
 
-### L2 用户 → 预览/IDE
+### L2 用户 → 预览
 
 `浏览器 https://<fde>-<tok>-<port>.fde.<base>` → Traefik → **forwardAuth**（`127.0.0.1:8080/api/forward-auth`，查 `port_allocations.hostname` + 按 token 哈希查 `preview_grants`，**不解析 cookie `sub`**；portal 自身会话校验才查 `login_sessions`）→ 200 后代理到 `http://10.200.<n>.2:<port>`。
 预览凭证 = **一次性 ticket（`?preview_ticket=`）换取的 host-only 预览 cookie `__Host-fde_preview`**，**绝不用 portal session cookie**（portal cookie 为 host-only、不会发到预览域，issue #6）。**这是唯一「用户直连容器」的链路**（iframe 内嵌 portal 页面）。执行顺序 / 失败语义 / 信任边界见 §5.2。
@@ -179,7 +179,7 @@ Traefik(host:443)
 | 路由 | 规则 | middleware | service | 说明 |
 |---|---|---|---|---|
 | portal | `Host(`station.<base>`)` | — | `http://127.0.0.1:8080` | L1 |
-| 预览/IDE（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth）→ `strip-cookie`（放行后删 Cookie，预览凭证不透传上游，B2 实测） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
+| 预览（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth）→ `strip-cookie`（放行后删 Cookie，预览凭证不透传上游，B2 实测） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
 | LLM（**每 FDE 一条 router + 一条 headers middleware**；**2026-09-20 修订，issue #38**） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `llm-key-<fde>`（headers 注入该 FDE 的**真实上游 key**） | `llm-provider-<id>` → 该 binding 供应商的 `llm_providers.base_url`（**不再共享 `llm-hub`**；默认 mock `http://127.0.0.1:4000`） | L7；**路由按 `fde_llm_bindings`（必须含 api_key）逐 binding 生成**，发布到独立文件 `llm-routes.yml`（mode 0600，与 `routes.yml` 0644 拆分）；**无 binding → 无路由（fail-closed）**；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
 | internal | `PathPrefix(`/api/internal`)`（挂在 `station.<base>` 路由链上） | `internal-allow`（`ipAllowList`，从 `fde_networks` 精确派生，每 `subnet` 一条，§5.1） | `http://127.0.0.1:8080` | L3/L5；容器侧经 hosts 注入（`--add-host station.<base>:<网关IP>`；`llm.<base>` 同法，见 L3）访问 |
 
