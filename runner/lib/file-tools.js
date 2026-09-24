@@ -2,7 +2,7 @@
 // 「库不提供沙箱，牢笼由宿主提供」——不变式 1「容器是信任边界」的落地）。
 // 本文件移植自 erix-agent 0.3.5 的 src/tools/jail.js + src/tools/file-tools.js（上游 #101 删除），
 // 工具 schema/executor 结构与旧 createFileTools 返回的 {executors, schemas} 完全对齐。
-// 语义不变式：worker 无平台凭据、cwd（run worktree）内可写；越界路径抛 JailError。
+// 语义不变式：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内可写；越界路径抛 JailError。
 import fs from 'node:fs';
 import path from 'node:path';
 

@@ -9,7 +9,7 @@
 //   - provider 用 erix-agent `createJsonFileModelConfigProvider`（config.json 内占位 key + endpoint，零真实 LLM 凭据，§6.3）；
 //   - 终态由 agentd 经 U2 上报（worker 只回 run_finished，不发 run_end 事件，§7.6）。
 
-// user-space §6.2：umask 0002（新建文件 664/目录 775）——worker/agent 写 worktree 与 spool 的文件
+// user-space §6.2：umask 0002（新建文件 664/目录 775）——worker/agent 写项目目录与 spool 的文件
 // 需跨 UID（1002↔1001/1000，同 GID 1000）组可写；fork 时已从 agentd/entrypoint 继承（entrypoint.sh
 // 早有 umask 0002，本处为防御性重设，评审 F8）。
 process.umask(0o002);
@@ -33,14 +33,14 @@ import { mapHistoryToInitialMessages } from './lib/history.js';
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
 // 约束真模型收尾行为：交付物落盘、回复只写简短摘要、不贴代码全文。
-const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，工作目录是本次 run 独占的 worktree。
+const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，工作目录是项目目录 \`~/projects/<project>\`（本次 run 直接在此工作，交付物留在项目目录内）。
 
 交付规则：
 1. 交付物（代码/配置/文档）必须用 writeFile 写入工作目录的文件系统——磁盘上的文件才是交付物。
 2. 修改既有文件前先 readFile 看现状，不要凭空整文件覆写。
 3. 收尾回复只写简短摘要：做了什么、写入/修改了哪些文件、如何运行与验证；不要在回复里粘贴代码全文或大段文件内容。
 4. 若任务只是问答或解释、不产生交付物，直接回答即可，无需写文件。
-5. 交付前尽量用 shell 工具运行验证命令（构建/测试/lint），跑通再交付；命令在容器内执行，不要改动 worktree 之外的状态。`;
+5. 交付前尽量用 shell 工具运行验证命令（构建/测试/lint），跑通再交付；命令在容器内执行，不要改动项目目录之外的状态。`;
 
 const nextReqId = createReqIdGenerator();
 let runStart = null;
@@ -215,8 +215,8 @@ async function startRun(msg) {
   const jail = createJail({ root: cwd, writable: [cwd] });
   const fileTools = createFileTools(jail);
   // issue #46（选项 A，logical-run 作用域）：notesDir 由 agentd 下行（run 数据目录
-  // <home>/runs/<runId>/notes，跨 attempt 保留，与 worktree 生命周期解耦——resume 不再丢 notes）。
-  // 旧 agentd 无 notes_dir 字段 → 回退 worktree 内 .notes（旧语义，resume 仍会丢，warn 明示）。
+  // <home>/runs/<runId>/notes，跨 attempt 保留，与 run 工作区生命周期解耦——resume 不再丢 notes）。
+  // 旧 agentd 无 notes_dir 字段 → 回退 cwd 内 .notes（旧语义，resume 仍会丢，warn 明示）。
   let noteTools = { schemas: [], executeTool: null, lifecycle: null };
   try {
     const notesDir = typeof msg.notes_dir === 'string' && msg.notes_dir.length > 0
@@ -225,7 +225,7 @@ async function startRun(msg) {
     if (typeof msg.notes_dir !== 'string' || msg.notes_dir.length === 0) {
       sendIpc(process, {
         type: MSG.LOG, run_id: runId, level: 'warn',
-        msg: 'notes_dir missing from RUN_START (old agentd?), fallback to worktree-local .notes; notes will NOT survive resume',
+        msg: 'notes_dir missing from RUN_START (old agentd?), fallback to cwd-local .notes; notes will NOT survive resume',
       });
     }
     noteTools = await createNotesTools({ runId, notesDir });

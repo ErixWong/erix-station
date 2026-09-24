@@ -30,7 +30,7 @@
 | 会话管理 / skills / MCP | 上游**永久非目标**（`docs/requirements.md` §2）；本平台**自己实现会话层**（D3'），skills/MCP 本期不做 |
 | 容器创建/销毁/镜像/资源限额 | portal（Docker API，规格 §4/§14） |
 | 端口分配与路由 | portal（规格 §8） |
-| git clone / git 凭据 / worktree **内容** | FDE 在容器内自理（规格 §7.2/§12.2，决策者裁定）；worktree 的**创建与清理（`remove`/`prune`）归 agentd**（§6.2） |
+| git clone / git 凭据 / 项目目录 **内容** | FDE 在容器内自理（规格 §7.2/§12.2，决策者裁定）；项目目录的**准备（确保存在）归 agentd**（§6.2；D8 修订 2026-09-24 起不再使用 worktree） |
 | LLM 出口管控 | 安全团队网络层（规格 §11.2，issue #3） |
 
 ### 1.3 为什么会话层由我们实现（D3'/D4'）
@@ -76,7 +76,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 │       │     职责：心跳/领任务/事件批量上报/审批中转/stop 中转/worker 池/孤儿清理
 │       │
 │       ├─ station-runner（worker，run A）       ← fork 子进程，每 run 一个
-│       │     cwd = ~/worktrees/<project>-<runIdA>
+│       │     cwd = ~/projects/<project>（D8 修订 2026-09-24 起，不再用 worktree）
 │       │     跑 runToolLoop；无凭据；事件经 IPC 交 agentd
 │       │     └─ （工具副作用：bash 起的 dev server 等，detached 后由 PID 1 收养）
 │       │
@@ -92,7 +92,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 |---|---|---|---|
 | tini（PID 1） | docker（`--init`） | 容器启动 | 容器生命周期 |
 | `station-agentd` | tini | 容器 entrypoint | agentd 退出 = 容器主进程退出 = 容器退出（`restart: unless-stopped` 由 Docker 拉起，规格 §14） |
-| `station-runner`（worker） | agentd（`child_process.fork`，独立进程组） | claim 到 run 且 worktree 就绪后 | run 终态即退出；崩溃由 agentd 捕获（§6.4/§12） |
+| `station-runner`（worker） | agentd（`child_process.fork`，独立进程组） | claim 到 run 且项目目录就绪后 | run 终态即退出；崩溃由 agentd 捕获（§6.4/§12） |
 | dev servers | 起初是 worker 的 bash 工具子进程；`setsid`/nohup 后脱离进程组 | run 进行中（agent 行为） | **run 结束不杀**；真正退出时被 tini reap |
 
 ### 2.3 PID 1 与进程编排：方案与取舍 ⚠️
@@ -121,7 +121,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | **UID / 权限** | 独立 UID（唯一持 token 的进程）；最小 capability，不授 `CAP_SYS_PTRACE` | **不同 UID**（fork 时切 UID + 剔除 token）；无特权能力 | 宿主侧进程，不进入容器（无容器 UID 语义） |
 | **网络** | 唯一出站：→ portal（SSE + POST，经 Traefik host:443）；不监听任何对外端口 | **无任何平台网络 IO**；只经 IPC 与 agentd 通讯；LLM 请求经 worker 内 provider 发 `llm.<base>`（占位 key，真 key 由 Traefik 注入，规格 §11） | 监听 `:8080`（仅宿主回环 `127.0.0.1:8080`）；internal 端点经 Traefik 回环到 portal |
 | **DB** | 不直连（无凭据） | 不直连 | **唯一业务写方**（D1'） |
-| **任务** | claim 长轮询领任务；lease 续期（随心跳）；准备工作（worktree）；认领失败 release；**run 终态产物捕获上传（U13，issue #64，§6.6）** | 跑 `runToolLoop`；组装引擎参数（provider/tools/store/task） | 入队（`run_queue`）；租约判定与 re-claim；状态收敛 |
+| **任务** | claim 长轮询领任务；lease 续期（随心跳）；准备工作（项目目录）；认领失败 release；**run 终态产物捕获上传（U13，issue #64，§6.6）** | 跑 `runToolLoop`；组装引擎参数（provider/tools/store/task） | 入队（`run_queue`）；租约判定与 re-claim；状态收敛 |
 | **事件** | 批量（250ms/2KB）、重试、顺序保证、spool 兜底 | 引擎回调 → IPC 即发（不批量） | 分配 seq、写 `run_events`、SSE 广播 |
 | **transcript/checkpoint** | store_request 的无状态转发（加 Authorization） | `TranscriptStore` HTTP adapter（IPC 版）的调用方 | 端点落 `transcript_rounds` / `run_checkpoints` |
 | **审批** | 中转：worker await ↔ portal 审批单；SSE 快通道 + 轮询兜底；10min 超时拒绝 | 在 `executeTool` 包装层发起并 await；收到拒绝则返回 tool_result「被拒绝」 | 审批单 CRUD、决定写库、SSE 下发 |
@@ -212,7 +212,7 @@ agentd                          portal
   ```
 
 - 逐 run 结果语义：`lease: renewed` = claim_token 匹配，已续租；`lease: lease_lost` = claim_token 不匹配（该 run 已被 re-claim / 租约易主）→ agentd **本地 abort 该 run 的 worker、丢弃其缓冲与 spool**，不再续传该 run 的任何写。
-- `lease_lost` vs `revoked`：`lease_lost` 是 **run 级**（单个 run 的租约被取代），在 `200` 内表达；`revoked`（token 吊销 / offboard）是 **容器级**且**不在 `200` 内表达**——吊销由 `authenticateContainer` 在鉴权阶段直接返回 `401 token_revoked`（三条路径同径：SSE revoke / claim 401 / heartbeat 401 → `beginRevoke`，issue #22 方案②）。agentd 收到即 drain（abort 全部在跑 run → 等 worker 真退出 → 清理 worktree）后退出（审计 #34 F-A/F-C）。`401/5xx` 对非吊销原因才是整次心跳失败（指数退避重试）。
+- `lease_lost` vs `revoked`：`lease_lost` 是 **run 级**（单个 run 的租约被取代），在 `200` 内表达；`revoked`（token 吊销 / offboard）是 **容器级**且**不在 `200` 内表达**——吊销由 `authenticateContainer` 在鉴权阶段直接返回 `401 token_revoked`（三条路径同径：SSE revoke / claim 401 / heartbeat 401 → `beginRevoke`，issue #22 方案②）。agentd 收到即 drain（abort 全部在跑 run → 等 worker 真退出 → 清场）后退出（审计 #34 F-A/F-C）。`401/5xx` 对非吊销原因才是整次心跳失败（指数退避重试）。
 - 响应 `stop_run_ids`：portal 侧 `cancel_requested_at` 已置位但 SSE `stop_request` 可能未达的 run——**停止指令的兜底通道**（SSE 为主、心跳为备）。
 - portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**（`containers.status → exited` 语义，model.md §2.4）；run 级处置走租约到期 re-claim（§6.4/§6.5）。
 
@@ -266,7 +266,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `type` | 方向 | 字段 | 语义 |
 |---|---|---|---|
 | `worker_ready` | worker→agentd | `{pid}` | fork 后握手；agentd 收到后才发 `run_start` |
-| `run_start` | agentd→worker | `{run_id, session_id, attempt, task, cwd, project, model, resume, attachments, config: {model_config_path, reflection, wrapup}}` | worker 据此组装 `runToolLoop` 参数（§6.3；`config.json` 内为占位 key + `endpoint=https://llm.<base>/v1`，无独立 key 文件）；`cwd` = 已建好的 worktree；`attempt` = 本次 start 次数（生成 `client_event_id`，§7.3）；`reflection`/`wrapup` 引擎策略由 portal 随 run_start 下发（§6.3-8 的载体） |
+| `run_start` | agentd→worker | `{run_id, session_id, attempt, task, cwd, project, model, resume, attachments, config: {model_config_path, reflection, wrapup}}` | worker 据此组装 `runToolLoop` 参数（§6.3；`config.json` 内为占位 key + `endpoint=https://llm.<base>/v1`，无独立 key 文件）；`cwd` = 项目目录 `~/projects/<project>`（D8 修订 2026-09-24 起，不再用 worktree）；`attempt` = 本次 start 次数（生成 `client_event_id`，§7.3）；`reflection`/`wrapup` 引擎策略由 portal 随 run_start 下发（§6.3-8 的载体） |
 | `event` | worker→agentd | `{run_id, client_event_id, type, ts, payload}` | 引擎回调透传（`onEvent` 8 类 / `onDelta` / `onReasoningDelta` / `onToolCall` / `onJudge`），**逐条即发**，批量在 agentd（§7.2）；`onUsage` **不产 IPC `event`**（仅喂 U2 终态载荷，§6.3-6）；`client_event_id` = `run_id:attempt:计数`（§7.3，重启/重领不碰撞） |
 | `store_request` | worker→agentd | `{req_id, method, args}` | `method ∈ appendRound/load/recall/markRunState/saveRunState/loadRunState/saveCheckpoint/loadLatestCheckpoint`（0.9.0 八方法）；agentd 映射到 U2/U5-U9/runstate（§9.1），加 token 转发 |
 | `store_response` | agentd→worker | `{req_id, ok, result?, error?: {code, message, retryable}}` | 对应 `store_request`；`ok:false` 时 worker 侧 adapter 按 §9.2 重试策略处理 |
@@ -299,8 +299,8 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
         │                                      ▼
         │                            【claimed（租约态）】runs 仍 queued
         │                                      │ agentd 准备工作：
-        │                                      │   git worktree add ~/worktrees/<project>-<runId>
-        │                                      │        -b agent/<runId>
+        │                                      │   确保项目目录 ~/projects/<project> 存在（mkdir -p）
+        │                                      │   （D8 修订 2026-09-24 起，不再 git worktree add）
         │                                      │   fork worker → run_start        [agentd 负责]
         │                            准备失败 → POST /release → queue 回 pending / cancelled
         │                                      ▼
@@ -331,8 +331,8 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | 步骤 | 负责方 | 失败表现与处置 |
 |---|---|---|
 | 入队（runs queued + queue pending + user message） | portal | 事务失败 → `POST /messages` 5xx，无副作用 |
-| worktree 创建（`git worktree add`） | **agentd**（run 启动前必须存在，故不能留给 agent） | 失败 → `POST /release`；`attempts >= max_attempts` → runs `failed`（`max_attempts_exceeded`） |
-| worktree 清理（`worktree remove` / `prune`） | **agentd**（run 结束后回收；FDE/agent 只管理 worktree 内**内容**，不负责脚手架清理）。**清理前先捕获终态产物（U13，issue #64，§6.6）** | `.git` 共享，清理时勿误删他 run 的 worktree |
+| 项目目录准备（确保 `~/projects/<name>` 存在） | **agentd**（run 启动前必须存在，故不能留给 agent；D8 修订 2026-09-24，AGENTS.md §7：agent 直接在项目目录工作，不再 `git worktree add`） | 失败 → `POST /release`；`attempts >= max_attempts` → runs `failed`（`max_attempts_exceeded`） |
+| 项目目录「清理」 | **无**——项目目录是用户资产，run 结束后**绝不删除**（D8 修订，原 worktree remove/prune 已拆除）。清场前照常先捕获终态产物（U13，issue #64，§6.6） | — |
 | worker fork + 参数组装 | agentd / worker | fork 失败 → 同 release 路径 |
 | 状态收敛（终态事务） | portal | 见 §6.4 agentd 崩溃路径 |
 | 租约续期 | agentd（随心跳）→ portal 落库 | 续期失败重试；90s 未续 → re-claim 窗口打开 |
@@ -343,7 +343,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 1. **provider**：读 `config.json` 前先经 `manifest.json` 校验（user-space §5.4 硬规则：generation/sha256 一致才读，防跨文件混合版本）→ `createJsonFileModelConfigProvider`（`~/.erix/config.json`）resolve `default` slot；judge/fold 用 `audit` / `fold` slot（规格 §11.4）；API key 用**占位 key**（`endpoint=https://llm.<base>/v1`）——**worker 组装 provider 不需要任何真实密钥**，真实虚拟 key 由 Traefik 按来源子网注入（H-B D-4，§11/§16.2）。
 2. **task**：`run_start.task`（本轮用户输入）显式传入（§1.3 硬注意-1）。
-3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即 worktree）+ `createFileTools` + `createShellTools` + `createNotesTools` + `createToolRegistry`（file + shell + note 三组工具，PR #74 / issue #72）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。code-server 清退（issue #71）后，容器内「跑命令」职能由 **shell 工具**承接（issue #72，PR #74）。
+3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即项目目录）+ `createFileTools` + `createShellTools` + `createNotesTools` + `createToolRegistry`（file + shell + note 三组工具，PR #74 / issue #72）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。code-server 清退（issue #71）后，容器内「跑命令」职能由 **shell 工具**承接（issue #72，PR #74）。
 4. **store**：IPC 版 HTTP adapter（§9），`runId` = `run_start.run_id`（portal 生成的 UUID，规格 §9.3-3）。
 5. **resume**：`run_start.resume === true`（即 `attempt > 1` 的 re-claim）时传 `resume: true`（引擎从 checkpoint 恢复，跳过已执行工具——`executedToolIds` 去重，`src/loop.js:1179-1180`；副作用工具按 tool id 幂等，host-upgrade-guide §0-4）。resume 时 adapter 先经 U9 读回当前 checkpoint 的 `revision`，本地计数从 `revision+1` 续起（§9.5），避免新 worker 从 0 起计被 CAS 误拒。
 6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge` 全部桥接到 IPC `event`；**`onUsage` 不产 IPC `event`**——其值随 U2 终态载荷上报（含 usage 与 compaction_stats，§7.6）；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
@@ -357,7 +357,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 | 场景 | 检测方 | 收敛路径 | 负责方 |
 |---|---|---|---|
-| claim 后准备工作失败（worktree/fork） | agentd | `POST /release` → `attempts < max_attempts` 回 `pending` 重新被领（**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` | agentd 上报，portal 重排 |
+| claim 后准备工作失败（项目目录/fork） | agentd | `POST /release` → `attempts < max_attempts` 回 `pending` 重新被领（**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)` | agentd 上报，portal 重排 |
 | worker 崩溃（run 进行中） | agentd（`exit` 事件非预期码） | agentd `POST /release`（reason=worker_crashed）→ 立即 re-claim 同一 run（claim 时 `attempts++`，`resume:true`）→ 新 worker 从 checkpoint 续跑（§6.5） | agentd（release + re-claim） |
 | agentd / 容器崩溃 | portal（心跳 3 次丢失 = 45s ⚠️） | `containers` 视 `exited`；租约 90s 到期后 reaper（A1/A2）：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → claimed 行回 `pending`（**attempts 不变**）；`attempts >= max_attempts` → `done` + runs `failed`。容器重启（Docker `unless-stopped`）后新 agentd re-claim，`resume:true` 继续 | portal（reaper）+ Docker（重启）+ agentd（re-claim） |
 | **stop 在 running 中 + 容器死（cancelling）** | portal（心跳丢失）+ reaper | 用户已 stop（`runs.status='cancelling'`）但容器死在 worker abort 之前：租约到期后 reaper **绝不回 pending 续跑**，直接 queue `cancelled` + runs `finished`（`termination.reason='aborted'`，A2）。这是「cancelling 收敛者恒为 runner」的唯一例外——runner 已死，portal 是唯一收敛方 | portal（reaper） |
@@ -400,7 +400,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 **问题**：worktree 用完即焚（`cleanupWorktree`）+ run 数据目录终态 purge，agent 交付的文件产物曾只存活在聊天记录里（issue #64 根因 R1）。
 
-**捕获时机与执行者**：agentd 在 **run 终态确认之后、`cleanupWorktree` / `cleanupRunData` 之前**捕获：
+**捕获时机与执行者**：agentd 在 **run 终态确认之后、清场（`cleanupRun` 含 run 数据目录归档）之前**捕获：
 
 | 路径 | 捕获？ | 说明 |
 |---|---|---|
@@ -408,9 +408,9 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `onWorkerFinished` 且 U2 返回 `409 run_terminal`（幂等命中） | ✅ | 视为终态确认（同 run 重复收敛） |
 | stop 路径 `onWorkerExit`（dropReason=`stop_request`/`stop_heartbeat`） | ✅ | 补报 aborted 的分支是终态；捕获完成后照常清场 |
 | `lease_lost` / `revoked` / agentd shutdown | ❌ | 非本端收敛，run 可能由新租约续跑 |
-| worker 崩溃 → `releaseAndRequeue`（resume） | ❌ | run 未终态，attempt 间 worktree 本就保留 |
+| worker 崩溃 → `releaseAndRequeue`（resume） | ❌ | run 未终态，attempt 间项目目录本就保留 |
 
-**捕获内容**（`runner/lib/artifacts.js`）：git worktree → `git diff HEAD`（含 staged）→ `diff.patch` + `git status --porcelain` 的 untracked（`??`，目录折叠递归展开）新文件快照；非 git 目录 → 全量文件清单（排除 `.git`/`node_modules`/`.notes`）。打包为单 tar.gz：`diff.patch` + `files/NNNNNN`（tar 条目名恒为短名，真实路径只在 manifest 内——读写两侧免 longname/pax 编码）+ `manifest.json`（`run_id / git / truncated / diff_bytes / files[{path,size,sha256,tar}]`）。文件快照累计上限 **20MB**（`ERIX_ARTIFACT_MAX_BYTES` 可调），超限截断并在 `manifest.truncated` 标记（不静默丢）。空变更（无 diff 且无新文件）→ 不上传，兼容现状（`artifacts` 表无行 = 无产物）。
+**捕获内容**（`runner/lib/artifacts.js`）：git 仓库（项目目录）→ `git diff HEAD`（含 staged）→ `diff.patch` + `git status --porcelain` 的 untracked（`??`，目录折叠递归展开）新文件快照；非 git 目录 → 全量文件清单（排除 `.git`/`node_modules`/`.notes`）。打包为单 tar.gz：`diff.patch` + `files/NNNNNN`（tar 条目名恒为短名，真实路径只在 manifest 内——读写两侧免 longname/pax 编码）+ `manifest.json`（`run_id / git / truncated / diff_bytes / files[{path,size,sha256,tar}]`）。文件快照累计上限 **20MB**（`ERIX_ARTIFACT_MAX_BYTES` 可调），超限截断并在 `manifest.truncated` 标记（不静默丢）。空变更（无 diff 且无新文件）→ 不上传，兼容现状（`artifacts` 表无行 = 无产物）。
 
 **存放与上报**：agentd 经 U13（`PUT /api/internal/runs/:id/artifact`，body = tar.gz 字节流 + `X-Sha-256`）上传 portal；portal 校验大小上限 + sha + 归属（终态后租约已释放 → 不校验 X-Claim-Token），落盘持久卷 `ERIX_ARTIFACTS_ROOT/<runId>.tar.gz`（默认 `/srv/erix/artifacts`，portal 容器 bind mount，deploy-contract §2.2 ④；tmp + rename 原子替换），并写 `artifacts` 表一行（`kind='worktree_bundle'`、`manifest` jsonb——迁移 0005；`UNIQUE(run_id, kind)` 兜底幂等，重复上传 409 `artifact_exists` **不覆盖**）。
 
@@ -559,7 +559,7 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 
 > **markRunState 双路语义（issue #43 拍板）**：`'running'` 仍走 U2（`runs.status`，终态由 worker 经 run_finished → U2 上报，§6.3-9）；引擎终态标记只合并 `run_state.state`，**不触碰 `runs.status`**（宿主终态唯一权威仍是 U2，不变式 3）。
 > **recall（0.8.0 退役）**：引擎不再调用 `store.recall`，worker 也不再注册 recall 工具（档案取回归 note 工作流：note_list → note_read）；U7 端点与 adapter 方法保留（既有断言面与只读兼容，非孤儿）。
-> **notes 落盘位置（issue #46，0.10.0 起）**：NotesStore 不再落 run worktree，迁 **run 数据目录** `<home>/runs/<runId>/notes/`（logical-run 作用域，跨 attempt 保留——resume 不丢 notes；agentd RUN_START 下行 `notes_dir`，终态后由 agentd 清理，attempt 间绝不删）。详见 AGENTS.md §8.2。
+> **notes 落盘位置（issue #46，0.10.0 起）**：NotesStore 不再落 run 工作区（D8 修订前为 run worktree），迁 **run 数据目录** `<home>/runs/<runId>/notes/`（logical-run 作用域，跨 attempt 保留——resume 不丢 notes；agentd RUN_START 下行 `notes_dir`，终态后由 agentd 清理，attempt 间绝不删）。详见 AGENTS.md §8.2。
 
 > `appendCheckpoint`：上游 file 实现即 `saveCheckpoint` 别名（`src/store/file.js:287-289`）；引擎选择顺序是先 `saveCheckpoint` 后 `appendCheckpoint`（`src/loop.js:1193-1199`），adapter 实现 `saveCheckpoint` 即可覆盖。
 
@@ -715,8 +715,8 @@ FDE 浏览器        portal                agentd               worker（execute
 | 资源 | 隔离点（每 run 独立） | 共享点（容器级） |
 |---|---|---|
 | 执行 | **worker 进程**（每 run 一个 fork，崩溃不传染） | CPU / 内存（容器限额，portal 创建参数，规格 §14） |
-| 工作目录 | worktree `~/worktrees/<project>-<runId>`（jail 根） | `~/projects/<project>` 仓库本体与 `.git` |
-| 分支 | `agent/<runId>` | git 对象库 |
+| 工作目录 | 项目目录 `~/projects/<project>`（jail 根；D8 修订 2026-09-24 起不再用 worktree，agent 直接在项目目录工作） | 同左（无每 run 独立工作区） |
+| 分支 | 无平台分支（D8 修订后不再建 `agent/<runId>`，分支由 FDE 自治） | git 对象库 |
 | 端口 | run 级端口块（`4000+slot*8` 起，P2，规格 §8.2） | 项目级固定端口 |
 | store 键 | `runId`（UUID，portal 生成下发） | 中心 DB |
 | 审批上下文 | 每 `tool_call_id` 一单、每 run 独立挂起点 | 审批 UI 列表（按用户聚合） |
@@ -735,7 +735,7 @@ FDE 浏览器        portal                agentd               worker（execute
 |---|---|
 | agentd 日志 | stdout → `docker logs fde-<name>`（json-file driver）；关键生命周期单行 JSON（`{ts, level, msg, run_id?}`） |
 | worker 日志 | stdout/stderr 经 IPC `log` 消息 → agentd 加 `run_id` 前缀统一输出（避免多 run 交错不可读） |
-| 关键事件（必打） | 容器启动/token 校验通过、SSE 连接建立/断开/重连、claim 成功/超时、worktree 创建、worker fork/exit（码）、事件批发送（条数/重试次数）、spool 启用/清排、审批发起/决定/超时、abort 收发、run 收敛上报 |
+| 关键事件（必打） | 容器启动/token 校验通过、SSE 连接建立/断开/重连、claim 成功/超时、项目目录准备、worker fork/exit（码）、事件批发送（条数/重试次数）、spool 启用/清排、审批发起/决定/超时、abort 收发、run 收敛上报 |
 | 平台侧真相 | 事件/工具调用/judge/审批/用量/审计全在 DB（原理三），看板直接查库（规格 §14） |
 | 排障入口 | ① `docker logs fde-<name>` 看 agentd；② `runs.error` + `run_events` 尾段看 run 死因；③ `containers.last_heartbeat` 看活性；④ `run_queue` 看租约/attempts |
 
@@ -754,7 +754,7 @@ FDE 浏览器        portal                agentd               worker（execute
 | 5 | 事件批量：250ms 或 2KB 先到者；打字机 20–30ms/字前端动画 | 采用（§7.2/§8） |
 | 6 | worker 隔离：每 run 一个 fork；P2 评估 worker_threads | 采用（§13） |
 | 7 | 审批：超时 10min → 按 denied 继续；超时后补决定的处置（§10.1 末） | 采用 |
-| 8 | worktree：run 启动时 **agentd 创建**；清理（remove/prune）归 agentd，内容归 FDE（已定，规格 §12.2） | 采用（§6.2） |
+| 8 | ~~worktree~~ **D8 修订（2026-09-24，AGENTS.md §7）**：cwd 直达项目目录——agentd 只确保 `~/projects/<name>` 存在，不再创建/清理 worktree；目录内容归 FDE（原定，规格 §12.2） | 修订（§6.2） |
 | 9 | PID 1：tini（`docker --init`）+ agentd 主进程；agentd 崩 → 容器整体重启 | 倾向 (a)（§2.3） |
 | 10 | 单容器最大并发 run 数（capacity）= 4 | 待定（§13） |
 | 11 | internal 端点前缀 `/api/internal`、claim 载荷形状、`X-Claim-Token` 头 | 采用（§4） |
