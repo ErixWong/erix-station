@@ -80,9 +80,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 │       │     跑 runToolLoop；无凭据；事件经 IPC 交 agentd
 │       │     └─ （工具副作用：bash 起的 dev server 等，detached 后由 PID 1 收养）
 │       │
-│       ├─ station-runner（worker，run B）       ← 并发 run 各一个（上限见 §13）
-│       │
-│       └─ code-server（:3001，容器内监听，不 publish）← agentd 拉起并守护（崩了重拉）
+│       └─ station-runner（worker，run B）       ← 并发 run 各一个（上限见 §13）
 │
 └─ dev servers（:4000+，FDE /agent 经 bash 工具以 setsid/detached 方式拉起）
     父进程退出后被 PID 1（tini）收养，**刻意存活**（预览语义，规格 §8/§12.3）
@@ -95,15 +93,14 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | tini（PID 1） | docker（`--init`） | 容器启动 | 容器生命周期 |
 | `station-agentd` | tini | 容器 entrypoint | agentd 退出 = 容器主进程退出 = 容器退出（`restart: unless-stopped` 由 Docker 拉起，规格 §14） |
 | `station-runner`（worker） | agentd（`child_process.fork`，独立进程组） | claim 到 run 且 worktree 就绪后 | run 终态即退出；崩溃由 agentd 捕获（§6.4/§12） |
-| code-server | agentd（spawn + 守护重拉） | agentd 启动时 | agentd 负责 respawn；连续崩溃退避 |
 | dev servers | 起初是 worker 的 bash 工具子进程；`setsid`/nohup 后脱离进程组 | run 进行中（agent 行为） | **run 结束不杀**；真正退出时被 tini reap |
 
 ### 2.3 PID 1 与进程编排：方案与取舍 ⚠️
 
 | 方案 | 形态 | 优点 | 缺点 | 结论 |
 |---|---|---|---|---|
-| **(a) tini + agentd（倾向）** | `docker run --init`，entrypoint 直接 exec agentd | 零额外组件；reap/信号转发由 tini 兜底；agentd 自己管 worker 池（它需要 fork 语义与 IPC 通道，supervisord 给不了） | agentd 需自实现 code-server 守护（几十行）；agentd 崩 → 容器重启（Docker `unless-stopped` 兜底，符合「容器是牲口」） | **倾向采用** ⚠️ 待决策者确认 |
-| (b) supervisord 为 PID 1 | supervisord 管 agentd + code-server | 成熟守护；code-server 重拉免费 | 多一层配置与进程；agentd 崩溃时容器不退出（worker 可能已全部脱离控制，状态要靠 portal 租约收敛——反而不如直接重启容器干净） | 备选 |
+| **(a) tini + agentd（倾向）** | `docker run --init`，entrypoint 直接 exec agentd | 零额外组件；reap/信号转发由 tini 兜底；agentd 自己管 worker 池（它需要 fork 语义与 IPC 通道，supervisord 给不了） | agentd 崩 → 容器重启（Docker `unless-stopped` 兜底，符合「容器是牲口」） | **倾向采用** ⚠️ 待决策者确认 |
+| (b) supervisord 为 PID 1 | supervisord 管 agentd | 成熟守护；agentd 崩溃重拉免费 | 多一层配置与进程；agentd 崩溃时容器不退出（worker 可能已全部脱离控制，状态要靠 portal 租约收敛——反而不如直接重启容器干净） | 备选 |
 | (c) agentd 直接做 PID 1 | entrypoint = agentd | 最简 | Node 默认不 reap 无主子进程 → dev server 退出留 zombie；信号语义要自己写对 | 否决（zombie 是长期运行容器的慢性病） |
 
 > **决策点**：(a) 与 (b) 的真实差异只在「agentd 崩溃时容器是否整体重启」。按原理三（容器是牲口、状态在中心），**整体重启更干净**：agentd 崩 → 容器退出 → Docker 拉起 → 新 agentd 重新 SSE + claim，run 由 portal 租约机制 re-claim（§6.4）。
@@ -129,7 +126,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | **transcript/checkpoint** | store_request 的无状态转发（加 Authorization） | `TranscriptStore` HTTP adapter（IPC 版）的调用方 | 端点落 `transcript_rounds` / `run_checkpoints` |
 | **审批** | 中转：worker await ↔ portal 审批单；SSE 快通道 + 轮询兜底；10min 超时拒绝 | 在 `executeTool` 包装层发起并 await；收到拒绝则返回 tool_result「被拒绝」 | 审批单 CRUD、决定写库、SSE 下发 |
 | **停止** | SSE `stop_request` / 心跳兜底 → IPC `abort` | `AbortController.abort()` → 引擎收敛 `aborted`（`src/loop.js:712-717`） | 写 `cancel_requested_at`；发 SSE；心跳响应兜底 |
-| **进程** | fork/kill worker；code-server 守护；孤儿清理 | 单 run 生命周期 | Docker API 管容器 |
+| **进程** | fork/kill worker；孤儿清理 | 单 run 生命周期 | Docker API 管容器 |
 | **明确不做** | 不执行工具、不碰 LLM、不解析 transcript 内容 | 不持凭据、不直连 portal/DB、不管理端口 | 不跑 agent、不执行工具、不自写 LLM 代理（规格 §4） |
 
 ---
@@ -635,7 +632,7 @@ FDE 浏览器        portal                agentd               worker（execute
 
 | 凭据 | 位置 | 持有进程 | 说明 |
 |---|---|---|---|
-| **per-container token** | env `ERIX_STATION_TOKEN`（建容器时 portal 注入） | **仅 agentd**；fork worker 与 spawn code-server 时均从 env 剔除（code-server 同样不持有，属平台卫生措施；FDE 有 shell，同 UID 可读 agentd 的 `/proc/<pid>/environ` 属「FDE 自损」残余风险，见 §11.2） | 容器唯一平台凭据（D1'）；吊销即 `401 token_revoked` + SSE `revoke` |
+| **per-container token** | env `ERIX_STATION_TOKEN`（建容器时 portal 注入） | **仅 agentd**；fork worker 时从 env 剔除（FDE 有 shell，同 UID 可读 agentd 的 `/proc/<pid>/environ` 属「FDE 自损」残余风险，见 §11.2） | 容器唯一平台凭据（D1'）；吊销即 `401 token_revoked` + SSE `revoke` |
 | LLM 网关虚拟 key | **容器内不存在**（H-B D-4）；真实虚拟 key 只存在于宿主 Traefik 动态配置（600，portal 可写、Traefik 只读） | **无进程可读**；Traefik 按来源子网注入 `Authorization` | 带额度/模型白名单/可吊销（规格 §11.3 模式 C 的凭据红线）；**不是平台凭据** |
 | git 凭据（SSH key / token） | FDE 自行配置（规格 §12.2） | 容器用户进程 | 平台不下发、不代管 |
 | DB 凭据 | **无** | — | D1'：Postgres 业务写方只有 portal |
