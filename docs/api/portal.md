@@ -960,6 +960,12 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | U11 | `GET /api/internal/approvals/:id` | 审批决定轮询兜底（§9.10） | 只读 |
 | U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（§9.11） | 重复 release 返回首次结果 |
 | U13 | `PUT /api/internal/runs/:id/artifact` | **run 终态产物 bundle 上传**（issue #64 R1，runner §6.6） | `UNIQUE(run_id, kind)`；重复上传 409 `artifact_exists`（不覆盖） |
+| S1 | `GET /api/internal/transcript/:key` | store：`load`（session 维度，§9.8b，issue #81 P2） | 只读 |
+| S2 | `PUT /api/internal/transcript/:key/rounds/:round` | store：`appendRound`（§9.8b） | `(transcript_key, dedup_key)` 部分唯一索引 |
+| S3 | `PUT /api/internal/transcript/:key/checkpoint` | store：`saveCheckpoint` / `appendCheckpoint`（§9.8b） | 单行覆盖写 + revision CAS |
+| S4 | `GET /api/internal/transcript/:key/checkpoint/latest` | store：`loadLatestCheckpoint`（§9.8b） | 只读；无 → 204 |
+| S5 | `PUT /api/internal/transcript/:key/runstate` | store：`saveRunState` / markRunState 终态标记（§9.8b） | `chat_sessions.engine_run_state` jsonb 合并写 |
+| S6 | `GET /api/internal/transcript/:key/runstate` | store：`loadRunState`（§9.8b） | 只读；无 → 204 |
 | — | `GET /api/internal/stream` | SSE 下行通道（§9.12） | — |
 
 > usage **不单设端点**：随 U2 终态载荷上报（§9.9）。
@@ -1372,6 +1378,44 @@ ON CONFLICT (run_id) DO UPDATE
 #### `GET /api/internal/runs/:id/runstate`（loadRunState）
 
 响应 `200 { "run_state": { ... } }`；从未写入 → `204`（adapter 返回 `undefined`，resume 按「无状态」正常继续）。**终态 run 仍可读**（读语义同 U9）。错误：`401/403/404`；非终态时 `409 lease_lost`；`429`；5xx 退避重试（§9.13）。
+
+### 9.8b session transcript（S1–S6，issue #81 P2）
+
+> **实现状态（2026-09）**：已随 `portal/src/internal.js` + `portal/src/http.js` 实现，迁移 `0006-session-transcript.sql`。
+> 依据 `docs/design/conversation-state.md` §4.1：transcript key 从 runId 切到 **sessionId**（= `:key`），
+> 照抄 erix-agent CLI「预写入 + resume」模式（引擎零改动）。`runId` 退回纯运维身份。
+
+**与 run 作用域端点（U5–U9/runstate）并存**：U 系列端点不动，旧 runner 继续可用（向后兼容）；
+S 系列端点是 P2 起 runner 的默认路径。存储 = 既有表加列 + 部分唯一索引（评估记录见迁移文件头注释）：
+`transcript_rounds.transcript_key/dedup_key`（生成列，`record->>'dedupKey'`）、
+`run_checkpoints.transcript_key`、`chat_sessions.engine_run_state`。
+
+**鉴权三层**（对齐 §9.1 per-container token）：① `Authorization: Bearer`；② session 属主校验
+（`:key` = `chat_sessions.id`，须属于该容器用户，否则 404 `session_not_found` / 403
+`session_ownership_mismatch`）；③ **writer run fencing**：所有 S 端点必带 `?run_id=<writer runId>`
+query 参数 + `X-Claim-Token` 头——writer run 必须属于该 session（否则 400 `transcript_key_mismatch`）
+且持当前有效租约（否则 409 `lease_lost`）。终态后 queue 释放 claim_token → 一切写自动
+409 `lease_lost`（S 端点不提供终态后读；读写都发生在活跃租约窗口内）。
+
+**行语义（与 U5 的关键差异）**：CLI 模式下宿主预写行与上一轮引擎记录**同行号**（round = latestRound），
+故 S2 的行唯一性判据是 `(transcript_key, dedup_key)` 而非 `(key, round)`；`dedup_key` 幂等——
+崩溃重跑同 dedupKey 重放返回 `{inserted:false}`（**绝不产生重复 user 消息**），同 dedupKey 不同 body
+409 `round_conflict`（fold 更新 false→true 视为合法 UPDATE，同 U5 口径）。S1 行序
+`round ASC, created_at ASC`（同 round 多行按入档时序）。
+
+| 端点 | 语义 |
+|---|---|
+| `GET /api/internal/transcript/:key` | load 全量（`limit`/`cursor` 分页，cursor 以 round 为游标） |
+| `PUT /api/internal/transcript/:key/rounds/:round` | appendRound（body = RoundRecord 全量，dedupKey 必填 ≤256 字符，body ≤1MB） |
+| `PUT /api/internal/transcript/:key/checkpoint` | saveCheckpoint / appendCheckpoint（revision CAS，旧 revision 409 `checkpoint_stale`） |
+| `GET /api/internal/transcript/:key/checkpoint/latest` | loadLatestCheckpoint；无 → 204 |
+| `PUT /api/internal/transcript/:key/runstate` | saveRunState `{run_state}` / markRunState 终态标记 `{state}`（合并写，blob 并入 `runId = :key`，引擎契约 `loadRunState(key).runId === key`）；不动 `runs.status` |
+| `GET /api/internal/transcript/:key/runstate` | loadRunState；无 → 204 |
+
+**runner 侧接线**：`markRunState('running')` 仍走 U2 真 runId（runs 表生命周期，sessionId 绝不进 U2）；
+宿主预写 dedupKey = `<key>:input:<messageId>`（`messageId` 经 U1 ticket `run.message_id` 下行）；
+resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即完整上文）。部署顺序：
+**portal 先上（S 端点纯增量，旧 runner 无感），FDE 镜像（runner/agentd/worker）后上**。
 
 ### 9.9 usage 上报
 

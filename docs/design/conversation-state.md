@@ -78,7 +78,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 |---|---|---|---|
 | **P0** | 本设计定稿；上游 issue（resume + new user turn）；#77 跟踪 | — | 本文档 |
 | **P1** | #64 R1：产物回收 + **终态清场语义修正**（真相层归档 TTL 替代物理删除，只清视图/临时物；`ERIX_RUN_DATA_TTL_HOURS` 语义扩展为归档而非删除） | — | 待派工 |
-| **P2** | store key 切 session 维度（**照抄 CLI 预写入+resume 模式，引擎零改动**）：portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息预写入（dedupKey 幂等判据） | 无（CLI 已验证模式） | 待派工 |
+| **P2** | #81 P2：store key 切 session 维度（**照抄 CLI 预写入+resume 模式，引擎零改动**）：portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息预写入（dedupKey 幂等判据） | 无（CLI 已验证模式） | **已实施**（`feat-260924-06-session-transcript`：迁移 0006 + portal S1–S6 端点 + worker 三分支装配；部署顺序：portal 先上、FDE 镜像后上） |
 | **P3** | messages 表降级 UI 投影；#70 文本注入退役（保留为 transcript 缺失时的兜底） | P2 稳定 | 待 P2 |
 
 ## 6. 红线与验收口径

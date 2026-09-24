@@ -1018,6 +1018,207 @@ export async function getLatestCheckpoint(pool, { container, user, runId, claimT
 }
 
 // ---------------------------------------------------------------------------
+// session-scoped transcript（issue #81 P2，docs/design/conversation-state.md §4.1）
+//
+// transcript key = sessionId（引擎 runToolLoop 的 store key）；宿主（worker）以
+// dedupKey=`<key>:input:<messageId>` 预写入用户消息后 resume=true，跨 run 在同一会话键上累积。
+// 与 run 作用域端点（U5–U9/runstate）并存：旧 runner 继续走旧端点，互不干扰（迁移 0006）。
+// 鉴权三层：① per-container token（authenticateContainer，http.js 统一）；
+// ② session 属主校验（fetchSession）；③ writer run  fencing——请求必带 `?run_id=<writer runId>`
+// query 参数 + X-Claim-Token 头：writer run 必须属于该 session 且持有当前有效租约
+// （assertClaimToken）。终态后 queue 行释放 claim_token → 一切写自动 409 lease_lost，
+// 无需额外终态 barrier（与 run 作用域读端点「终态放宽」不同：session 读写都发生在
+// 活跃租约窗口内，portal 侧不提供终态后 session 读）。
+// ---------------------------------------------------------------------------
+
+const MAX_TRANSCRIPT_KEY_LEN = 128;
+
+async function fetchSession(pool, key, userId) {
+  if (typeof key !== 'string' || key.length === 0 || key.length > MAX_TRANSCRIPT_KEY_LEN) {
+    throw new InternalError(400, 'validation_failed', 'transcript key 必填且 ≤128 字符', { details: { field: 'key' } });
+  }
+  const res = await pool.query(`SELECT id, user_id FROM chat_sessions WHERE id = $1`, [key]);
+  const row = res.rows?.[0];
+  if (!row) throw new InternalError(404, 'session_not_found', 'session not found');
+  if (row.user_id !== userId) {
+    throw new InternalError(403, 'session_ownership_mismatch', 'session does not belong to this container');
+  }
+  return row;
+}
+
+/** writer run 校验：真 runId 必带；必须存在、属主一致、且属于该 transcript 的 session。 */
+async function fetchWriterRun(pool, runId, userId, key) {
+  const run = await fetchRun(pool, runId, userId);
+  if (run.session_id !== key) {
+    throw new InternalError(400, 'transcript_key_mismatch', 'writer run does not belong to this transcript session', {
+      details: { key, run_id: runId },
+    });
+  }
+  return run;
+}
+
+/** session transcript 写入（宿主预写 + 引擎轮记录）。行唯一性 = (transcript_key, dedup_key)——
+ *  CLI 模式下行号可复用（宿主预写行与上一轮引擎记录同行号），dedupKey 才是幂等判据（迁移 0006）。 */
+export async function putSessionRound(pool, { container, user, key, round, claimToken, writerRunId, body }) {
+  if (!Number.isInteger(round) || round < 0) {
+    throw new InternalError(400, 'validation_failed', 'round 必须为非负整数');
+  }
+  const dedupKey = body?.dedupKey;
+  if (typeof dedupKey !== 'string' || dedupKey.length === 0 || dedupKey.length > 256) {
+    throw new InternalError(400, 'validation_failed', 'dedupKey 必填且 ≤256 字符');
+  }
+  const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
+  if (bytes > MAX_ROUND_BYTES) {
+    throw new InternalError(400, 'validation_failed', 'round 请求体超过 1MB 上限');
+  }
+
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const record = body;
+  const folded = body.folded === true;
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const foldedPayload = body.foldedPayload ?? null;
+
+  const inserted = await pool.query(
+    `INSERT INTO transcript_rounds (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
+     VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (transcript_key, dedup_key) WHERE transcript_key IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [key, dedupKey, round, JSON.stringify(record), folded, JSON.stringify(messages), foldedPayload ? JSON.stringify(foldedPayload) : null],
+  );
+  if (inserted.rows.length > 0) return { inserted: true };
+
+  const existing = await pool.query(
+    `SELECT record, folded FROM transcript_rounds WHERE transcript_key = $1 AND dedup_key = $2`,
+    [key, dedupKey],
+  );
+  const ex = existing.rows?.[0];
+  if (!ex) return { inserted: true }; // 理论上不可达（并发已由 ON CONFLICT 序列化）
+
+  if (canonicalHash(ex.record) === canonicalHash(record)) {
+    return { inserted: false }; // 幂等命中（崩溃重跑红线：绝不产生重复 user 消息）
+  }
+  // fold 更新：同 dedupKey、folded false→true 视为合法 UPDATE（同 run 作用域 U5 语义）。
+  if (folded && ex.folded === false) {
+    await pool.query(
+      `UPDATE transcript_rounds SET record = $3, folded = true, messages = $4, folded_payload = $5
+        WHERE transcript_key = $1 AND dedup_key = $2`,
+      [key, dedupKey, JSON.stringify(record), JSON.stringify(messages), foldedPayload ? JSON.stringify(foldedPayload) : null],
+    );
+    return { inserted: true };
+  }
+  throw new InternalError(409, 'round_conflict', '同 dedupKey 已存在且 body 不同', { details: { dedupKey } });
+}
+
+/** session transcript 全量读取（load 分页；行序 = round ASC, created_at ASC——行号可复用，
+ *  同 round 多行按入档时间序，恢复后的消息顺序才正确）。cursor 以 round 为游标：同 round
+ *  行必同页（LIMIT 截断的极端大会话才可能出现跨页同行号，单会话 >10000 轮超出 P2 范围）。 */
+export async function getSessionTranscript(pool, { container, user, key, claimToken, writerRunId, limit = 10000, cursor = null }) {
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const lim = Math.min(Math.max(1, Number(limit) || 10000), 10000);
+  const cur = cursor == null ? -1 : Number(cursor);
+  const res = await pool.query(
+    `SELECT round, record FROM transcript_rounds
+      WHERE transcript_key = $1 AND round > $2
+      ORDER BY round ASC, created_at ASC
+      LIMIT $3`,
+    [key, cur, lim],
+  );
+  const records = res.rows.map((r) => ({ round: Number(r.round), ...r.record }));
+  const nextCursor = records.length > 0 ? records[records.length - 1].round : null;
+  return { records, next_cursor: nextCursor };
+}
+
+/** session checkpoint 覆盖写 + revision CAS（同 U8 语义，键 = transcript key）。 */
+export async function putSessionCheckpoint(pool, { container, user, key, claimToken, writerRunId, body }) {
+  const revision = body?.revision;
+  if (!Number.isInteger(revision) || revision < 0) {
+    throw new InternalError(400, 'validation_failed', 'revision 必须为非负整数');
+  }
+  if (!body?.snapshot || typeof body.snapshot !== 'object' || Array.isArray(body.snapshot)) {
+    throw new InternalError(400, 'validation_failed', 'snapshot 必须为对象');
+  }
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const res = await pool.query(
+    `INSERT INTO run_checkpoints (run_id, transcript_key, snapshot, revision, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (transcript_key) WHERE transcript_key IS NOT NULL DO UPDATE
+       SET snapshot = EXCLUDED.snapshot, revision = EXCLUDED.revision, updated_at = now()
+       WHERE run_checkpoints.revision < EXCLUDED.revision
+     RETURNING revision`,
+    [writerRunId, key, JSON.stringify(body.snapshot), revision],
+  );
+  if (res.rows.length === 0) {
+    throw new InternalError(409, 'checkpoint_stale', 'checkpoint revision 不大于当前（CAS 拒绝）');
+  }
+  return { revision: Number(res.rows[0].revision) };
+}
+
+/** session checkpoint 读取；无 → null（HTTP 204）。 */
+export async function getSessionLatestCheckpoint(pool, { container, user, key, claimToken, writerRunId }) {
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const res = await pool.query(
+    `SELECT snapshot, revision, updated_at FROM run_checkpoints WHERE transcript_key = $1`,
+    [key],
+  );
+  const row = res.rows?.[0];
+  if (!row) return null;
+  return { checkpoint: { snapshot: row.snapshot, revision: Number(row.revision), updated_at: row.updated_at } };
+}
+
+/** session 引擎 run state 合并写（saveRunState 全量合并 / markRunState 终态标记仅合并 state 字段）。
+ *  blob 并入 runId = transcript key（reference 语义 = 上游 file store 的 {...state, runId}，
+ *  引擎契约 loadRunState(key).runId === key）。不动 runs.status（宿主终态唯一权威仍是 U2，不变式 3）。 */
+export async function saveSessionRunState(pool, { container, user, key, claimToken, writerRunId, body }) {
+  let patch;
+  if (body?.run_state !== undefined) {
+    if (!body.run_state || typeof body.run_state !== 'object' || Array.isArray(body.run_state)) {
+      throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' } });
+    }
+    patch = body.run_state;
+  } else if (typeof body?.state === 'string' && body.state) {
+    patch = { state: body.state };
+  } else {
+    throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' } });
+  }
+
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  await pool.query(
+    `UPDATE chat_sessions
+        SET engine_run_state = COALESCE(engine_run_state, '{}'::jsonb) || $2::jsonb
+      WHERE id = $1 AND user_id = $3`,
+    [key, JSON.stringify({ ...patch, runId: key }), user.id],
+  );
+  return { ok: true };
+}
+
+/** session 引擎 run state 读取；无 → null（HTTP 204）。 */
+export async function loadSessionRunState(pool, { container, user, key, claimToken, writerRunId }) {
+  await fetchSession(pool, key, user.id);
+  await fetchWriterRun(pool, writerRunId, user.id, key);
+  await assertClaimToken(pool, writerRunId, claimToken);
+
+  const res = await pool.query(`SELECT engine_run_state FROM chat_sessions WHERE id = $1`, [key]);
+  const row = res.rows?.[0];
+  if (!row || row.engine_run_state == null) return null;
+  return { run_state: row.engine_run_state };
+}
+
+// ---------------------------------------------------------------------------
 // runstate（0.9.0 起引擎 8 方法契约：saveRunState/loadRunState，落 runs.run_state jsonb）
 // ---------------------------------------------------------------------------
 

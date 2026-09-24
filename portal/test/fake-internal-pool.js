@@ -324,6 +324,90 @@ export class FakeInternalPool {
       return { rows: [] };
     }
 
+    // ---- session transcript rounds（issue #81 P2：键 = transcript_key，唯一性 = (key, dedup_key)）----
+    if (sql.includes('INSERT INTO transcript_rounds') && sql.includes('transcript_key')) {
+      const [key, dedupKey, round, record, folded, messages] = params;
+      if (this.rounds.some((x) => x.transcript_key === key && x.dedup_key === dedupKey)) return { rows: [] };
+      this.rounds.push({ transcript_key: key, dedup_key: dedupKey, run_id: null, round, record: JSON.parse(record), folded, messages: JSON.parse(messages), created_at: ++this._claim });
+      return { rows: [{ id: 'sr' + this.rounds.length }] };
+    }
+    if (sql.includes('FROM transcript_rounds WHERE transcript_key') && sql.includes('dedup_key')) {
+      const [key, dedupKey] = params;
+      const r = this.rounds.find((x) => x.transcript_key === key && x.dedup_key === dedupKey);
+      return { rows: r ? [{ record: r.record, folded: r.folded }] : [] };
+    }
+    if (sql.includes('UPDATE transcript_rounds SET record') && sql.includes('transcript_key')) {
+      const [key, dedupKey, record, folded, messages] = params;
+      const r = this.rounds.find((x) => x.transcript_key === key && x.dedup_key === dedupKey);
+      if (r) {
+        r.record = JSON.parse(record);
+        r.folded = folded === true;
+        r.messages = JSON.parse(messages);
+      }
+      return { rows: [] };
+    }
+    if (sql.includes('SELECT round, record FROM transcript_rounds') && sql.includes('transcript_key')) {
+      const [key, cursor, limit] = params;
+      const rows = this.rounds
+        .filter((x) => x.transcript_key === key && x.round > cursor)
+        .sort((a, b) => (a.round - b.round) || (a.created_at - b.created_at))
+        .slice(0, limit)
+        .map((x) => ({ round: x.round, record: x.record }));
+      return { rows };
+    }
+
+    // ---- transcript rounds（run 作用域读；session 读分支在前）----
+    if (sql.includes('SELECT round, record FROM transcript_rounds')) {
+      const [runId, cursor, limit] = params;
+      const rows = this.rounds
+        .filter((x) => x.run_id === runId && x.round > cursor)
+        .sort((a, b) => a.round - b.round)
+        .slice(0, limit)
+        .map((x) => ({ round: x.round, record: x.record }));
+      return { rows };
+    }
+
+    // ---- session checkpoint（issue #81 P2：ON CONFLICT (transcript_key) + revision CAS）----
+    if (sql.includes('INSERT INTO run_checkpoints') && sql.includes('transcript_key')) {
+      const [runId, key, snapshot, revision] = params;
+      const existing = this.checkpoints.find((c) => c.transcript_key === key);
+      if (!existing) {
+        this.checkpoints.push({ run_id: runId, transcript_key: key, snapshot: JSON.parse(snapshot), revision });
+        return { rows: [{ revision }] };
+      }
+      if (revision > existing.revision) {
+        existing.snapshot = JSON.parse(snapshot);
+        existing.revision = revision;
+        return { rows: [{ revision }] };
+      }
+      return { rows: [] }; // stale
+    }
+    if (sql.includes('FROM run_checkpoints WHERE transcript_key')) {
+      const [key] = params;
+      const c = this.checkpoints.find((x) => x.transcript_key === key);
+      return { rows: c ? [{ snapshot: c.snapshot, revision: c.revision, updated_at: new Date() }] : [] };
+    }
+
+    // ---- session 属主校验（fetchSession）----
+    if (sql.includes('SELECT id, user_id FROM chat_sessions WHERE id')) {
+      const key = params[0];
+      const s = this._session(key);
+      return { rows: s ? [{ id: s.id, user_id: s.user_id }] : [] };
+    }
+
+    // ---- session 引擎 run state（chat_sessions.engine_run_state 合并写，issue #81 P2）----
+    if (sql.includes('UPDATE chat_sessions') && sql.includes('engine_run_state')) {
+      const [key, patchJson] = params;
+      const s = this._session(key);
+      if (s) s.engine_run_state = { ...(s.engine_run_state ?? {}), ...JSON.parse(patchJson) };
+      return { rows: [] };
+    }
+    if (sql.includes('SELECT engine_run_state FROM chat_sessions WHERE id')) {
+      const key = params[0];
+      const s = this._session(key);
+      return { rows: s ? [{ engine_run_state: s.engine_run_state ?? null }] : [] };
+    }
+
     // ---- transcript rounds ----
     if (sql.includes('INSERT INTO transcript_rounds')) {
       const [runId, round, record, folded, messages] = params;
