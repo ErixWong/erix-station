@@ -179,6 +179,10 @@ export function loadConfig(env = process.env) {
     kdfQueueTimeoutMs: intEnv(env, 'KDF_QUEUE_TIMEOUT_MS', 30 * 1000),
     // 请求体上限与字段上限（S3：防止超大 body/字段触发 scrypt 或打爆内存）
     maxBodyBytes: intEnv(env, 'MAX_BODY_BYTES', 64 * 1024),
+    // issue #64 R1：run 终态产物（worktree bundle tar.gz）存储与上限。
+    // 持久卷 bind mount（deploy-contract §2.2 ④）；上限默认 20MB，与 agentd 侧截断口径一致。
+    artifactsRoot: env.ERIX_ARTIFACTS_ROOT || '/srv/erix/artifacts',
+    artifactMaxBytes: intEnv(env, 'ERIX_ARTIFACT_MAX_BYTES', 20 * 1024 * 1024),
     maxLoginLength: intEnv(env, 'MAX_LOGIN_LENGTH', 128),
     maxPasswordLength: intEnv(env, 'MAX_PASSWORD_LENGTH', 256),
     baseDomain: env.BASE_DOMAIN || 'localhost',

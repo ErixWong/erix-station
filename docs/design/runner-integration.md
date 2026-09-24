@@ -121,7 +121,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | **UID / 权限** | 独立 UID（唯一持 token 的进程）；最小 capability，不授 `CAP_SYS_PTRACE` | **不同 UID**（fork 时切 UID + 剔除 token）；无特权能力 | 宿主侧进程，不进入容器（无容器 UID 语义） |
 | **网络** | 唯一出站：→ portal（SSE + POST，经 Traefik host:443）；不监听任何对外端口 | **无任何平台网络 IO**；只经 IPC 与 agentd 通讯；LLM 请求经 worker 内 provider 发 `llm.<base>`（占位 key，真 key 由 Traefik 注入，规格 §11） | 监听 `:8080`（仅宿主回环 `127.0.0.1:8080`）；internal 端点经 Traefik 回环到 portal |
 | **DB** | 不直连（无凭据） | 不直连 | **唯一业务写方**（D1'） |
-| **任务** | claim 长轮询领任务；lease 续期（随心跳）；准备工作（worktree）；认领失败 release | 跑 `runToolLoop`；组装引擎参数（provider/tools/store/task） | 入队（`run_queue`）；租约判定与 re-claim；状态收敛 |
+| **任务** | claim 长轮询领任务；lease 续期（随心跳）；准备工作（worktree）；认领失败 release；**run 终态产物捕获上传（U13，issue #64，§6.6）** | 跑 `runToolLoop`；组装引擎参数（provider/tools/store/task） | 入队（`run_queue`）；租约判定与 re-claim；状态收敛 |
 | **事件** | 批量（250ms/2KB）、重试、顺序保证、spool 兜底 | 引擎回调 → IPC 即发（不批量） | 分配 seq、写 `run_events`、SSE 广播 |
 | **transcript/checkpoint** | store_request 的无状态转发（加 Authorization） | `TranscriptStore` HTTP adapter（IPC 版）的调用方 | 端点落 `transcript_rounds` / `run_checkpoints` |
 | **审批** | 中转：worker await ↔ portal 审批单；SSE 快通道 + 轮询兜底；10min 超时拒绝 | 在 `executeTool` 包装层发起并 await；收到拒绝则返回 tool_result「被拒绝」 | 审批单 CRUD、决定写库、SSE 下发 |
@@ -159,6 +159,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | U10 | `POST /api/internal/runs/:id/approvals` | 创建审批单 | `{tool_call_id, round, name, input_digest}` | `201 {approval_id}` | 一个工具调用至多一单（`approvals` `UNIQUE(run_id, tool_call_id)`，schema.sql） |
 | U11 | `GET /api/internal/approvals/:id` | 审批决定**轮询兜底** | — | `200 {status, decided_by?, decided_at?, note?}` | 只读 |
 | U12 | `POST /api/internal/runs/:id/release` | 主动放弃已领任务（准备工作失败 / worker 崩溃） | `{reason}` | `200`；portal 收敛：`runs.status='cancelling'` → queue `cancelled` + runs `finished`（aborted，A2）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**，A1）；`attempts >= max_attempts` → `done` + runs `failed(max_attempts_exceeded)`（耗尽） | 重复 release 返回首次结果 |
+| U13 | `PUT /api/internal/runs/:id/artifact` | **run 终态产物 bundle 上传**（issue #64 R1，§6.6） | body = tar.gz 字节流（`diff.patch` + `files/NNNNNN` 快照 + `manifest.json`）；header `X-Sha-256` | `200 {artifact_id, size, sha256, truncated}`；重复上传 `409 artifact_exists`（不覆盖） | `UNIQUE(run_id, kind)`（kind=`worktree_bundle`，迁移 0005）；**终态后租约已释放 → 不校验 X-Claim-Token**，鉴权 = per-container token + run 属主校验（与读端点族「终态放宽租约」同口径） |
 
 **claim（U1）长轮询 hold 语义与超时**：
 
@@ -331,7 +332,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 |---|---|---|
 | 入队（runs queued + queue pending + user message） | portal | 事务失败 → `POST /messages` 5xx，无副作用 |
 | worktree 创建（`git worktree add`） | **agentd**（run 启动前必须存在，故不能留给 agent） | 失败 → `POST /release`；`attempts >= max_attempts` → runs `failed`（`max_attempts_exceeded`） |
-| worktree 清理（`worktree remove` / `prune`） | **agentd**（run 结束后回收；FDE/agent 只管理 worktree 内**内容**，不负责脚手架清理） | `.git` 共享，清理时勿误删他 run 的 worktree |
+| worktree 清理（`worktree remove` / `prune`） | **agentd**（run 结束后回收；FDE/agent 只管理 worktree 内**内容**，不负责脚手架清理）。**清理前先捕获终态产物（U13，issue #64，§6.6）** | `.git` 共享，清理时勿误删他 run 的 worktree |
 | worker fork + 参数组装 | agentd / worker | fork 失败 → 同 release 路径 |
 | 状态收敛（终态事务） | portal | 见 §6.4 agentd 崩溃路径 |
 | 租约续期 | agentd（随心跳）→ portal 落库 | 续期失败重试；90s 未续 → re-claim 窗口打开 |
@@ -342,7 +343,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 
 1. **provider**：读 `config.json` 前先经 `manifest.json` 校验（user-space §5.4 硬规则：generation/sha256 一致才读，防跨文件混合版本）→ `createJsonFileModelConfigProvider`（`~/.erix/config.json`）resolve `default` slot；judge/fold 用 `audit` / `fold` slot（规格 §11.4）；API key 用**占位 key**（`endpoint=https://llm.<base>/v1`）——**worker 组装 provider 不需要任何真实密钥**，真实虚拟 key 由 Traefik 按来源子网注入（H-B D-4，§11/§16.2）。
 2. **task**：`run_start.task`（本轮用户输入）显式传入（§1.3 硬注意-1）。
-3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即 worktree）+ `createFileTools` + `createToolRegistry` + `createRecallTool`（`src/tools/index.js:1-9`）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。
+3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即 worktree）+ `createFileTools` + `createShellTools` + `createNotesTools` + `createToolRegistry`（file + shell + note 三组工具，PR #74 / issue #72）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。code-server 清退（issue #71）后，容器内「跑命令」职能由 **shell 工具**承接（issue #72，PR #74）。
 4. **store**：IPC 版 HTTP adapter（§9），`runId` = `run_start.run_id`（portal 生成的 UUID，规格 §9.3-3）。
 5. **resume**：`run_start.resume === true`（即 `attempt > 1` 的 re-claim）时传 `resume: true`（引擎从 checkpoint 恢复，跳过已执行工具——`executedToolIds` 去重，`src/loop.js:1179-1180`；副作用工具按 tool id 幂等，host-upgrade-guide §0-4）。resume 时 adapter 先经 U9 读回当前 checkpoint 的 `revision`，本地计数从 `revision+1` 续起（§9.5），避免新 worker 从 0 起计被 CAS 误拒。
 6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge` 全部桥接到 IPC `event`；**`onUsage` 不产 IPC `event`**——其值随 U2 终态载荷上报（含 usage 与 compaction_stats，§7.6）；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
@@ -394,6 +395,28 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 - **平台 fencing 只能挡「状态写」，不能挡「外部副作用」**——这是原理四的直接推论：shell/网络/LLM 调用发生在容器内、平台无网络/进程级强制手段，旧 worker 在分区期间可能继续产生外部副作用。
 - 隔离手段（尽力而为，非物理保证）：① 双写防护（`lease_lost`）保证旧 worker 的事件/checkpoint/终态全部被拒，**不污染真相**（transcript/事件流只反映当前租约持有者的 attempt）；② 事件 `client_event_id` 带 attempt 前缀，新 attempt 的事件与旧 attempt 严格分界；③ portal 在 re-claim 时写 `audit_log`（`run.lease_superseded`），UI 标注「该 run 曾发生租约易主」；④ agentd 收到 `lease_lost` 后尽力 `SIGTERM/SIGKILL` 本地 worker。
 - **不承诺物理终止旧 worker**（容器分区时做不到）；若容器本身已死（重建场景），副作用自然停止。方案 A 下「禁止自动 resume」的含义对照：旧 run 直接终态，不存在「同 run 旧 worker 与 fencing」问题，但代价是每次崩溃都要用户手动介入 + 跨 run checkpoint 重映射。
+
+### 6.6 run 终态产物回收（issue #64 R1，v1）
+
+**问题**：worktree 用完即焚（`cleanupWorktree`）+ run 数据目录终态 purge，agent 交付的文件产物曾只存活在聊天记录里（issue #64 根因 R1）。
+
+**捕获时机与执行者**：agentd 在 **run 终态确认之后、`cleanupWorktree` / `cleanupRunData` 之前**捕获：
+
+| 路径 | 捕获？ | 说明 |
+|---|---|---|
+| `onWorkerFinished` 且 U2 终态收敛成功 | ✅ | finished / failed / aborted（worker 自然收敛） |
+| `onWorkerFinished` 且 U2 返回 `409 run_terminal`（幂等命中） | ✅ | 视为终态确认（同 run 重复收敛） |
+| stop 路径 `onWorkerExit`（dropReason=`stop_request`/`stop_heartbeat`） | ✅ | 补报 aborted 的分支是终态；捕获完成后照常清场 |
+| `lease_lost` / `revoked` / agentd shutdown | ❌ | 非本端收敛，run 可能由新租约续跑 |
+| worker 崩溃 → `releaseAndRequeue`（resume） | ❌ | run 未终态，attempt 间 worktree 本就保留 |
+
+**捕获内容**（`runner/lib/artifacts.js`）：git worktree → `git diff HEAD`（含 staged）→ `diff.patch` + `git status --porcelain` 的 untracked（`??`，目录折叠递归展开）新文件快照；非 git 目录 → 全量文件清单（排除 `.git`/`node_modules`/`.notes`）。打包为单 tar.gz：`diff.patch` + `files/NNNNNN`（tar 条目名恒为短名，真实路径只在 manifest 内——读写两侧免 longname/pax 编码）+ `manifest.json`（`run_id / git / truncated / diff_bytes / files[{path,size,sha256,tar}]`）。文件快照累计上限 **20MB**（`ERIX_ARTIFACT_MAX_BYTES` 可调），超限截断并在 `manifest.truncated` 标记（不静默丢）。空变更（无 diff 且无新文件）→ 不上传，兼容现状（`artifacts` 表无行 = 无产物）。
+
+**存放与上报**：agentd 经 U13（`PUT /api/internal/runs/:id/artifact`，body = tar.gz 字节流 + `X-Sha-256`）上传 portal；portal 校验大小上限 + sha + 归属（终态后租约已释放 → 不校验 X-Claim-Token），落盘持久卷 `ERIX_ARTIFACTS_ROOT/<runId>.tar.gz`（默认 `/srv/erix/artifacts`，portal 容器 bind mount，deploy-contract §2.2 ④；tmp + rename 原子替换），并写 `artifacts` 表一行（`kind='worktree_bundle'`、`manifest` jsonb——迁移 0005；`UNIQUE(run_id, kind)` 兜底幂等，重复上传 409 `artifact_exists` **不覆盖**）。
+
+**取回**：`GET /api/runs/:id/artifact`（用户面，admin 或 run 属主，非属主 404 不泄露存在性）流式返回 tar.gz。**前端产物视图（R3）本期不做**，为后续项。
+
+**失败语义**：捕获/上传失败**不得阻塞清场**——warn 日志 + 结果 `{ok:false}`，清场照常；上传 409 `artifact_exists` 视为幂等成功（不覆盖）。
 
 ---
 
