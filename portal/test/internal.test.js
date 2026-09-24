@@ -178,6 +178,32 @@ test('claimRun：history 预算注入——条数截断与字节截断（issue #
   assert.equal(t3.run.history[0].content, 'ans2');
 });
 
+test('claimRun：history 查询抛错 → best-effort 回退空历史，claim 不阻断（issue #69 评审修正）', async () => {
+  const { pool, userId, containerId, sessionId } = seedClaimable();
+  pool.messages.push(
+    { id: 'm0', run_id: 'run0', session_id: sessionId, role: 'assistant', content: 'prev answer', seq: 0, attachments: [] },
+  );
+  // 注入：history 查询抛错（模拟 DB 抖动），其余查询正常——对齐 fake pool 风格，包一层委托。
+  const origQuery = pool.query.bind(pool);
+  pool.query = (sql, params) => {
+    if (sql.includes('FROM messages') && sql.includes('role IN')) {
+      return Promise.reject(new Error('history query db down'));
+    }
+    return origQuery(sql, params);
+  };
+  const warns = [];
+  const log = { warn: (msg) => warns.push(msg) };
+
+  const ticket = await claimRun(pool, { container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10, log });
+  assert.ok(ticket); // claim 仍成功（UPDATE run_queue 已生效，ticket 照常发出）
+  assert.equal(ticket.run.id, 'run1');
+  assert.deepEqual(ticket.run.history, []); // 历史回退空数组
+  assert.equal(warns.length, 1); // warn 只记 err 摘要
+  assert.ok(warns[0].includes('history query failed'));
+  assert.ok(warns[0].includes('history query db down'));
+  assert.ok(!warns[0].includes('prev answer')); // 红线：history 内容不入日志
+});
+
 test('canonicalJson/canonicalHash：键序无关的稳定规范化', () => {
   assert.equal(canonicalJson({ b: 1, a: [2, { d: 3, c: 4 }] }), '{"a":[2,{"c":4,"d":3}],"b":1}');
   assert.equal(canonicalHash({ a: 1, b: 2 }), canonicalHash({ b: 2, a: 1 }));

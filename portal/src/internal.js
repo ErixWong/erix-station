@@ -211,7 +211,7 @@ function isTerminal(status) {
 // ---------------------------------------------------------------------------
 
 /** 单次原子认领（FOR UPDATE SKIP LOCKED，schema.sql §8 认领 SQL）。返回 ticket 或 null。 */
-async function tryClaim(pool, { container, user, capacity, now = new Date(), historyBudget } = {}) {
+async function tryClaim(pool, { container, user, capacity, now = new Date(), historyBudget, log } = {}) {
   const claimToken = crypto.randomBytes(24).toString('base64url');
   const claimed = await pool.query(
     `UPDATE run_queue q
@@ -261,18 +261,25 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
 
   // issue #69：会话历史下行——该 run 所属 session 最近 user/assistant 消息，排除当前这条（message_id），
   // 查最近 maxMessages 条（DESC），截断后升序注入 ticket。预算超限保最新丢最旧，不注入合成消息。
-  const budget = normalizeHistoryBudget(historyBudget);
-  const currentMessageId = message.rows?.[0]?.id ?? crypto.randomUUID();
-  const historyRows = await pool.query(
-    `SELECT role, content FROM messages
-      WHERE session_id = $1 AND role IN ('user', 'assistant') AND id <> $2
-      ORDER BY seq DESC LIMIT $3`,
-    [runRow.session_id, currentMessageId, budget.maxMessages],
-  );
-  const history = truncateHistory(
-    [...(historyRows.rows ?? [])].reverse().map((m) => ({ role: m.role, content: m.content })),
-    budget,
-  );
+  // 评审修正：history 是增强物不是关键路径——查询失败 best-effort 回退空历史，绝不阻断 claim
+  // （claim 已 UPDATE run_queue，炸在这里要等 lease reaper 自愈，白损延迟）。日志只记 err 摘要。
+  let history = [];
+  try {
+    const budget = normalizeHistoryBudget(historyBudget);
+    const currentMessageId = message.rows?.[0]?.id ?? crypto.randomUUID();
+    const historyRows = await pool.query(
+      `SELECT role, content FROM messages
+        WHERE session_id = $1 AND role IN ('user', 'assistant') AND id <> $2
+        ORDER BY seq DESC LIMIT $3`,
+      [runRow.session_id, currentMessageId, budget.maxMessages],
+    );
+    history = truncateHistory(
+      [...(historyRows.rows ?? [])].reverse().map((m) => ({ role: m.role, content: m.content })),
+      budget,
+    );
+  } catch (err) {
+    log?.warn?.(`[internal] history query failed, claim continues with empty history: ${String(err?.message ?? err)}`);
+  }
 
   return assembleTicket({
     queueId: row.queue_id,
@@ -477,7 +484,7 @@ export function hubStats() {
 // U1 claim（含 hold 长轮询）
 // ---------------------------------------------------------------------------
 
-export async function claimRun(pool, { container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), historyBudget } = {}) {
+export async function claimRun(pool, { container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), historyBudget, log = console } = {}) {
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 64) {
     throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' } });
   }
@@ -485,7 +492,7 @@ export async function claimRun(pool, { container, user, capacity = 1, holdMs = H
     throw new InternalError(400, 'validation_failed', `hold_ms 越界（1..${HOLD_MS_MAX}）`, { details: { field: 'hold_ms' } });
   }
 
-  const ticket = await tryClaim(pool, { container, user, capacity, now, historyBudget });
+  const ticket = await tryClaim(pool, { container, user, capacity, now, historyBudget, log });
   if (ticket) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: ticket.run.id, details: { attempt: ticket.run.attempt } }).catch(() => {});
     return ticket;
@@ -493,7 +500,7 @@ export async function claimRun(pool, { container, user, capacity = 1, holdMs = H
 
   const deadline = Date.now() + holdMs;
   await waitForWakeup(user.id, deadline);
-  const retry = await tryClaim(pool, { container, user, capacity, now, historyBudget });
+  const retry = await tryClaim(pool, { container, user, capacity, now, historyBudget, log });
   if (retry) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: retry.run.id, details: { attempt: retry.run.attempt } }).catch(() => {});
     return retry;
