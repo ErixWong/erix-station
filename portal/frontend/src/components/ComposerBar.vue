@@ -20,7 +20,7 @@ function onKeydown(e: KeyboardEvent) {
       class="flex-1 rounded-md border border-black/20 px-3 py-1.5 resize-none focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
       style="height: 3.2rem"
       :placeholder="store.inputPlaceholder"
-      :disabled="store.noProject"
+      :disabled="store.noDir"
       @keydown="onKeydown"
     ></textarea>
     <button
