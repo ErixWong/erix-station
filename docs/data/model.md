@@ -116,7 +116,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `fde_id` | → `users.id`，**FDE 用户**（forward-auth 按预览凭证哈希查 `preview_grants` 解析 `user_id` 后与此列比对，portal.md §2.7；不解析 `cookie.sub`，旧口径作废） |
 | `scope` / `run_id` | `project` 级 `run_id` 必空、`run` 级必带 → `CHECK ((scope='run') = (run_id IS NOT NULL))`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，字段先行保留（principles §4 Q5 倾向 (b)） |
-| `port` | 容器内 dev 端口，`CHECK (port BETWEEN 4000 AND 4999)`；3001 code-server 是容器固定角色，不入表（规格 §12.3；原 3000 runner 内部 API 角色已取消——容器平台通道零监听，规格 §10.3，决策者 2026-09） |
+| `port` | 容器内 dev 端口，`CHECK (port BETWEEN 4000 AND 4999)`；原 3001 code-server / 3000 runner 内部 API 容器固定端口角色均已取消（规格 §12.3，issue #71 / issue #3 评论，决策者 2026-09）——容器平台通道零监听，不入表 |
 | `hostname` / `url` | 由 portal **与 Traefik 路由同源生成**（规格 §8.1）；前端只展示/跳转 `url`，永不拼接（portal.md §8-4） |
 | `exposure` | `private`（默认）/ `org-visible` / `public`（规格 §6.5；非 admin 申请 `public` 被拒，portal.md §4.7） |
 | `state` | 状态机见 §2.2 |

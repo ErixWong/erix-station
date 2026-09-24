@@ -58,7 +58,7 @@ flowchart TB
     subgraph fdeA["fde-alice（10.200.1.0/29 独占）"]
         AGD["station-agentd<br/>出站守护 · per-container token<br/>SSE 下行：派单/审批/停止"]
         RUN["station-runner（每 run 一个）<br/>pi agent — runToolLoop<br/>TranscriptStore = HTTP adapter"]
-        CS["code-server :3001<br/>dev server :4000+<br/>workspace 卷"]
+        CS["dev server :4000+<br/>workspace 卷"]
     end
 
     subgraph fdeB["fde-bob（10.200.2.0/29 独占）"]
@@ -72,7 +72,7 @@ flowchart TB
 
     BR2 --> TRA
     TRA -- "portal UI：station.example.com" --> POR
-    TRA -- "预览/IDE：*.fde.example.com<br/>forwardAuth 后直连容器 IP" --> CS
+    TRA -- "预览：*.fde.example.com<br/>forwardAuth 后直连容器 IP" --> CS
 
     AGD -- "internal API 经 Traefik<br/>ipAllowList（仅 FDE 子网）" --> POR
     RUN --> AGD
@@ -197,8 +197,8 @@ sequenceDiagram
     A->>T: GET alice-p-proj1-4000.fde.example.com
     T->>P: forwardAuth（查 preview_grants + exposure）
     P-->>T: 200 放行（首放行：allocation → active）
-    T->>CS: strip-cookie 后代理到容器 10.200.1.2:4000（dev server）
-    CS-->>A: dev server 页面（iframe 内，零改造）
+    T->>DS: strip-cookie 后代理到容器 10.200.1.2:4000（dev server）
+    DS-->>A: dev server 页面（iframe 内，零改造）
     end
 
     rect rgb(245, 255, 245)

@@ -67,14 +67,13 @@
                           │  --api=false，唯一 ingress；不接任何 docker 网络）│
                           └───┬───────────────┬──────────────┬───────────┘
       station.<domain>        │               │ *.fde.<domain>│  llm.<domain>
-      （portal：登录/项目/对话） │               │ （项目预览/IDE） │（LLM 调用：Traefik
+      （portal：登录/项目/对话） │               │ （项目预览）   │（LLM 调用：Traefik
                               ▼               ▼              │  按来源子网注入凭据）
                     ┌──────────────────┐  ┌──────────────────────────────┐ ▼
                     │  station-portal  │  │ FDE 容器 "alice"（仅自己的   │ ┌───────────────┐
                     │  用户/项目/端口   │  │  /29，如 10.200.1.0/29）    │ │ LLM 网关      │
                     │  容器生命周期     │  │  station-agentd（守护/桥接）   │ │（backend 网络；│
                     │  事件/SSE        │  │  station-runner（每 run 子进程）│ │ 数据面 publish │
-                    │  LLM 网关租户绑定 │  │  :3001 code-server           │ │ 仅回环         │
                     └────────┬─────────┘  │  :4000+ dev servers          │ │ 127.0.0.1:4000 │
                     backend 网络           │  workspace volume            │ │ admin 不发布） │
                     publish 仅            └──────────────┬───────────────┘ └───────────────┘
@@ -107,7 +106,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 | `station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`） | TLS、按 host 路由、forwardAuth、**LLM 凭据按来源子网注入**（H-B，§11）、访问日志（原始，非审计真相）、唯一对外入口 | 不碰业务逻辑 |
 | `station-portal` | 用户系统、项目/端口分配、容器生命周期、事件与消息、SSE、LLM 网关**租户绑定**（虚拟 key 的开通/吊销/额度，见 §11；网关本身是独立组件，不是 portal 内部模块）、用量记账 | 不跑 agent、不做工具执行、不自写 LLM 流式代理 |
 | `station-db`（Postgres） | 用户/会话/消息/transcript/events/端口表/用量/审计 | 不存代码 |
-| `fde-<name>`（FDE 容器） | `station-agentd`（常驻守护/桥接，唯一出站连 portal）+ `station-runner`（每 run 一个子进程，跑 erix agent）+ code-server + dev servers（进程模型见 [runner-integration.md](runner-integration.md) §2，命名 ⚠️ 待决策者确认）；平台状态一律经 portal internal API 落 DB——**容器不直连 DB**（决策者 2026-09，issue #3 评论） | 不 publish 端口、**不监听任何对外端口**、不挂 `docker.sock`、**不持有平台密钥（含 DB 凭据）**——唯一平台凭据为 per-container token，仅 agentd 持有 |
+| `fde-<name>`（FDE 容器） | `station-agentd`（常驻守护/桥接，唯一出站连 portal）+ `station-runner`（每 run 一个子进程，跑 erix agent）+ dev servers（进程模型见 [runner-integration.md](runner-integration.md) §2，命名 ⚠️ 待决策者确认）；平台状态一律经 portal internal API 落 DB——**容器不直连 DB**（决策者 2026-09，issue #3 评论） | 不 publish 端口、**不监听任何对外端口**、不挂 `docker.sock`、**不持有平台密钥（含 DB 凭据）**——唯一平台凭据为 per-container token，仅 agentd 持有 |
 
 **只有 `station-docker-proxy` 挂 `/var/run/docker.sock`（只读）**；portal **不直挂**，经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API——proxy 为（自研零依赖 Node admission proxy，方法+路径白名单 12 条 + `POST /containers/create` 参数级 allowlist；完整契约见 deploy-contract §5.1。原「tecnativa/docker-socket-proxy + 类别级 env 白名单」方案已被替换）。FDE 容器永不挂。
 
@@ -146,9 +145,9 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 
 ### 5.3 「不 publish」不等于「不监听」；H-B 下的实际路径
 
-容器内 dev server / code-server **仍然监听**端口（3001、4000+），只是仅在容器自己的 `/29` 内可达：
+容器内 dev server **仍然监听**端口（4000+），只是仅在容器自己的 `/29` 内可达：
 
-- **预览/IDE**：Traefik（host）→ forwardAuth（`http://127.0.0.1:8080/api/forward-auth`）→ 直连容器 IP `http://10.200.<n>.2:<port>`（每 allocation 一条 router+service，§6.4；topology.md §4-L2）
+- **预览**：Traefik（host）→ forwardAuth（`http://127.0.0.1:8080/api/forward-auth`）→ 直连容器 IP `http://10.200.<n>.2:<port>`（每 allocation 一条 router+service，§6.4；topology.md §4-L2）
 - **平台通道全出站经 Traefik**（方向反转为决策者 2026-09 裁定，issue #3 评论；经 Traefik 为 H-B 定稿 D-5，issue #5）：容器内不再有 runner 监听端口（3000 角色取消，§12.3），portal **不主动访问容器**；`station-agentd` 全出站——`https://station.<base>/api/internal/*`（容器侧 `--add-host station.<base>:<网关IP>`），Traefik 上以 `ipAllowList`（由 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，topology.md §5.1）限源后回环到 portal `127.0.0.1:8080`（SSE 下行 + POST 上行，§10.3；取舍对比见 [runner-integration.md](runner-integration.md) §11.2；topology.md §4-L3）
 - **LLM 调用**：worker → `https://llm.<base>` → Traefik 按来源子网注入凭据 → 网关数据面回环 `127.0.0.1:4000`（§11；topology.md §4-L7）
 - **hosts 注入（创建 FDE 容器时，docker `--add-host` 或等价受控方式）**：容器内解析 `station.<base>` 与 `llm.<base>` 都**不走内网/公网 DNS**，映射到该 FDE 的 bridge 网关 IP（默认池 `10.200.<n>.1`；大 FDE `10.201.<n>.1`）。开发期 `*.localhost` 变通对容器无效，必须同样注入（env.md §0/§1；topology.md §4-L3）
@@ -217,7 +216,7 @@ http:
       priority: 200
       middlewares: [internal-allow]
       service: portal
-    # 预览/IDE：每 allocation 一条 router + 一条 service（Host 精确匹配，各自独立 priority）。
+    # 预览：每 allocation 一条 router + 一条 service（Host 精确匹配，各自独立 priority）。
     # 否决原「单条 HostRegexp + service: fde-dynamic」的「零 per-port 配置」方案——
     # 单 service 无法表达 per-allocation 的后端地址与生命周期（issue #9，topology.md §5）
     fde-alice-4000:
@@ -364,7 +363,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 - **端口块（slot）**：每 FDE 端口空间按 8 端口块划分，块 `s` = `4000 + s*8 … 4000 + s*8 + 7`。项目创建时分配一个 slot（`projects.slot`，用户内活跃唯一，schema.sql `projects_live_slot_key`）。
 - **项目级固定端口** = 块首 `4000 + s*8`（默认 `role=frontend`）：项目创建时分配**这一个**端口，`POST /api/projects` 返回**这一个**（示例 `4016 = 4000 + 2*8`，slot=2）。项目删除时回收。
 - **run 级端口块**（P2）= 同项目 slot 块内的剩余 7 个端口 `4000 + s*8 + 1 … +7`（`backend` / `debug` / `spare`），run 启动时按需分配、run 结束回收——「run 端口块」指「一个项目块的 run 级部分」，不是独立于项目的第二套编号。
-- 容器固定角色：`3001` code-server（原 `3000` runner 内部 API **已取消**：容器平台通道零监听、全出站，§10.3，决策者 2026-09，issue #3 评论）
+- 容器固定角色：`3001` **已取消**（code-server 清退，容器唯一交互入口为 FDE 对话界面，issue #71，决策者 2026-09-24；原 `3000` runner 内部 API 同样已取消：容器平台通道零监听、全出站，§10.3，issue #3 评论）
 - 每用户总配额（如 40 个**项目 slot**，即 40×8 = 320 个端口的上限；env.md `PORT_QUOTA`），超限**明确报错**而非静默漂移（`port_quota_exceeded`）
 - 定期 reaper 回收 `released_at` 过期项；Traefik 配置由 reconciler 按 route outbox 幂等发布（§8.1，H-B）
 
@@ -603,13 +602,11 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 | 端口 | 用途 | 暴露 |
 |---|---|---|
 | ~~3000~~ | ~~`station-runner` 内部 API~~ **已取消**：容器平台通道零监听、全出站（§10.3，决策者 2026-09，issue #3 评论） | — |
-| 3001 | code-server | FDE 私 |
+| ~~3001~~ | ~~code-server~~ **已取消**：容器唯一交互入口为 FDE 对话界面（issue #71，决策者 2026-09-24；对齐 3000 取消先例） | — |
 | 4000+ 块首 | 项目级固定端口：dev servers / 浏览器调试（P1） | FDE 私，可分享 |
 | 4000+ 块内其余 | 按 run 分配的 dev servers / 浏览器调试（P2） | FDE 私，可分享 |
 
 > H-B 对齐确认（issue #5）：容器内**无 runner 监听端口**（3000 已取消，平台通道全出站经 Traefik，§5.3/§10.3）；Traefik 不在容器内（host 网络）；以上端口均不 publish，仅经 Traefik 每 allocation 一条路由可达（§6.4）。
-
-> **建议把 code-server 放进模板**：纯聊天界面的 agent 很痛苦——人需要在同一台机器上接管、review、手改，IDE 与聊天面板指向同一 workspace 才叫协作。
 
 ### 12.4 Playwright
 
@@ -663,7 +660,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 |---|---|---|
 | **P1** | Traefik + portal + DB + 单 FDE 容器（含 station-agentd / station-runner）；登录、项目列表、对话（SSE）、停止 | 真机走通「登录→建项目→对话→工具卡片→停止」；playwright + vision 验证 |
 | **P2** | 多 FDE、run 级端口块 + 预览卡片/iframe、事件重放、工具审批、账号生命周期 workflow（项目级端口分配已在 P1，见 §8.2/deploy-contract §7.1） | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
-| **P3** | LLM 网关 + 用量记账 + 审计 + code-server 模板（出口管控为**外部依赖**：安全团队网络层策略，issue #3，非平台交付项） | 成本可按客户项目归集；安全团队出口策略实施后「改 endpoint 无效」，未实施时降级为审计+告警 |
+| **P3** | LLM 网关 + 用量记账 + 审计（出口管控为**外部依赖**：安全团队网络层策略，issue #3，非平台交付项） | 成本可按客户项目归集；安全团队出口策略实施后「改 endpoint 无效」，未实施时降级为审计+告警 |
 
 > **原 P0（「等 erix-agent 抽 `src/session/` 发 0.4.0」）已删除**（决策者 2026-09，issue #3 评论）：上游把会话管理列为永久非目标（§13.1），会话层由本平台自实现。**P1 内容不变，只是解除了外部依赖阻塞**——P1 现为第一阶段。
 
