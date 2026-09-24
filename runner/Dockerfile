@@ -18,9 +18,10 @@ FROM node:22-slim
 # python3-dev（Python.h 头文件）：缺则 pip 源码构建必挂（评审 F2 实测 Python.h: No such file）。
 # libicu72：.NET SDK 运行依赖（globalization；node:22-slim 不带）。
 # curl：排障/HTTPS 拉取（code-server 已裁定不装，issue #27）。
+# tree：跨项目目录概览（内置 tree 工具被 jail 锁在项目内，shell 层需要真二进制，真机 run dca532a3 实证）。
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-       procps git ca-certificates curl \
+       procps git ca-certificates curl tree \
        python3 python3-venv python3-pip python3-dev \
        build-essential \
        libicu72 \
