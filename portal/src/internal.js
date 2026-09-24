@@ -101,7 +101,10 @@ export function validateTransition(from, to) {
 
 /** claim ticket 组装（纯函数，供单测）。resume = attempt > 1（方案 B）。
  *  issue #69：history = 该 session 最近的 user/assistant 消息（[{role, content:string}]，已按预算截断、
- *  升序、排除当前 message），由调用方（tryClaim）查库 + truncateHistory 后注入。 */
+ *  升序、排除当前 message），由调用方（tryClaim）查库 + truncateHistory 后注入。
+ *  P5 去项目化：run.cwd = 会话绑定 cwd（~/projects/<name> 相对形式）为权威下行；run.project 保留
+ *  项目名/根路径快照仅为**旧 agentd** 过渡兼容（部署序 portal 先上、FDE 镜像后上，新 agentd 优先读
+ *  run.cwd）。 */
 export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, message, attempts, history }) {
   return {
     queue_id: queueId,
@@ -111,6 +114,7 @@ export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, 
       id: run.id,
       session_id: run.session_id,
       attempt: attempts,
+      cwd: run.cwd ?? null,
       project: { name: project?.name ?? '', root_path: project?.root_path ?? '' },
       task: message?.content ?? '',
       message_id: message?.id ?? null,
@@ -242,17 +246,21 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
   if (!row) return null;
 
   const run = await pool.query(
-    `SELECT r.id, r.session_id, s.model
+    `SELECT r.id, r.session_id, s.model, s.cwd
        FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE r.id = $1`,
     [row.run_id],
   );
   const runRow = run.rows?.[0];
   if (!runRow) return null;
 
-  const project = await pool.query(
-    `SELECT name, root_path FROM projects WHERE id = (SELECT project_id FROM chat_sessions WHERE id = $1)`,
-    [runRow.session_id],
-  );
+  // P5：cwd 为权威绑定；run.project 快照（目录名/根路径）供旧 agentd 过渡兼容。
+  const projectName = typeof runRow.cwd === 'string'
+    ? runRow.cwd.replace(/^~\/projects\//, '')
+    : '';
+  const project = {
+    name: projectName,
+    root_path: typeof runRow.cwd === 'string' ? runRow.cwd : '',
+  };
   const message = await pool.query(
     `SELECT id, content, attachments FROM messages
       WHERE run_id = $1 AND role = 'user' ORDER BY seq DESC LIMIT 1`,
@@ -285,8 +293,8 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
     queueId: row.queue_id,
     claimToken: row.claim_token,
     leaseUntil: row.lease_until,
-    run: { id: runRow.id, session_id: runRow.session_id, model: runRow.model },
-    project: project.rows?.[0],
+    run: { id: runRow.id, session_id: runRow.session_id, model: runRow.model, cwd: runRow.cwd ?? null },
+    project,
     message: message.rows?.[0],
     attempts: Number(row.attempts),
     history,

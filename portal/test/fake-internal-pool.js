@@ -114,7 +114,7 @@ export class FakeInternalPool {
       return { rows };
     }
 
-    // ---- fetchRun ----
+    // ---- fetchRun / claim run 行（runs JOIN chat_sessions；含会话 model/cwd 投影）----
     if (sql.includes('FROM runs r') && sql.includes('JOIN chat_sessions s') && sql.includes('WHERE r.id')) {
       const runId = params[0];
       const r = this._run(runId);
@@ -133,6 +133,8 @@ export class FakeInternalPool {
             termination: r.termination ?? null,
             user_id: s?.user_id ?? null,
             project_id: s?.project_id ?? null,
+            model: s?.model ?? null,
+            cwd: s?.cwd ?? null,
           },
         ],
       };
@@ -160,13 +162,7 @@ export class FakeInternalPool {
       return { rows: [{ claim_token: q.claim_token, status: q.status, lease_until: q.lease_until }] };
     }
 
-    // ---- 项目（claim ticket 组装）----
-    if (sql.includes('SELECT name, root_path FROM projects')) {
-      const sessionId = params[0];
-      const s = this._session(sessionId);
-      const p = this.projects.find((x) => x.id === s?.project_id);
-      return { rows: p ? [{ name: p.name, root_path: p.root_path }] : [] };
-    }
+    // P5：claim 的 run 行直接带出 s.cwd（fake 经上方 fetchRun 投影）；不再查询 projects 表。
 
     // ---- messages（claim 会话历史下行，issue #69：最近 user/assistant，排除当前 message_id，DESC LIMIT）----
     if (sql.includes('FROM messages') && sql.includes('role IN')) {
@@ -526,7 +522,7 @@ export function seedClaimable({ userId = 'u1', containerId = 'c1', runId = 'run1
     users: [{ id: userId, login: 'alice', status: 'active' }],
     containers: [{ id: containerId, user_id: userId, runner_token_hash: hashToken(token), status: 'running', fde_name: 'alice', container_name: 'fde-alice', token_generation: 1 }],
     projects: [{ id: projectId, name: 'proj1', root_path: '~/projects/proj1' }],
-    sessions: [{ id: sessionId, user_id: userId, project_id: projectId, model: 'mock-model', last_seq: 0 }],
+    sessions: [{ id: sessionId, user_id: userId, project_id: projectId, cwd: '~/projects/proj1', model: 'mock-model', last_seq: 0 }],
     runs: [{ id: runId, session_id: sessionId, status: 'queued' }],
     queue: [{ id: 'q1', run_id: runId, container_id: containerId, status: 'pending', attempts: 0, max_attempts: 3, created_at: 1 }],
     messages: [{ id: 'm1', run_id: runId, session_id: sessionId, role: 'user', content: 'hello', seq: 1, attachments: [] }],

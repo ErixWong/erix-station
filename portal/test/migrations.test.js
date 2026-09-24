@@ -43,3 +43,34 @@ test('baseline 冻结：docs/data/schema.sql 不含 0006 的列（DDL 只走增�
   assert.ok(!baseline.includes('transcript_key'), 'baseline 不得回写 transcript_key');
   assert.ok(!baseline.includes('engine_run_state'), 'baseline 不得回写 engine_run_state');
 });
+
+// 0008（P5 去项目化，docs/design/directory-as-project.md 定稿）：会话 cwd 绑定 + 端口分配去项目化。
+test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、关键语义锚点齐全', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 8, '0008 是最后编号（连续无空洞）');
+
+  const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
+  // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
+  assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS cwd'), 'chat_sessions 加 cwd 列（幂等）');
+  assert.ok(sql.includes('ALTER COLUMN project_id DROP NOT NULL'), 'project_id 解除 NOT NULL（留档）');
+  assert.ok(sql.includes('DROP COLUMN IF EXISTS project_id'), 'port_allocations 退役 project_id（幂等）');
+  assert.ok(sql.includes('SET cwd = p.root_path'), '回填 = projects.root_path 关联值');
+  assert.ok(sql.includes('AND s.cwd IS NULL'), '回填只动 cwd IS NULL 行（可重放）');
+  assert.ok(sql.includes('regexp_replace'), 'hostname/url 重写（保留 .fde.<base> 后缀，不硬编码域名）');
+  // WHERE 子句保证重写幂等：重写后形态不再命中旧形态匹配。
+  assert.match(sql, /WHERE a\.hostname ~ '\^\[a-z0-9-\]\+-p-/);
+  // projects 表保留不删（退役留档）。
+  assert.ok(!/DROP TABLE projects/.test(sql), 'projects 表不得删除');
+});
+
+test('baseline 冻结：docs/data/schema.sql 不含 0008 的 cwd 列（DDL 只走增量文件）', () => {
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  const chatSessions = baseline.slice(
+    baseline.indexOf('CREATE TABLE chat_sessions'),
+    baseline.indexOf('CREATE TABLE runs'),
+  );
+  // 注：runs 表头注释含「禁止 cwd 派生」字样（规格 §9.3-3），故只断言无 cwd 列定义。
+  assert.ok(!/\bcwd\s+text/.test(chatSessions), 'baseline chat_sessions 不得回写 cwd 列');
+});
