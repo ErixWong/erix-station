@@ -34,7 +34,7 @@
 | `station-db` | `POSTGRES_IMAGE`（官方 `postgres:16.15`） | 生产 `postgres:16.<patch>` **再 pin digest**（env §10 ⚠️） | 官方默认（`postgres`，容器内以 `postgres` 用户跑） | `postgres`（镜像内置） | `unless-stopped` | P1 ✅ |
 | `station-docker-proxy`（自研 admission proxy） | 自构建（build context `deploy/fde-proxy/`，零依赖 Node） | `erix-station/fde-proxy:<git-sha>` 不可变 tag | `node deploy/fde-proxy/server.js` | `user: "0:1000"`（root 读 sock + gid 1000 穿越用户空间；`no-new-privileges` + `cap_drop: [ALL]` + `read_only`；**方法+路径白名单 12 条 + create 参数级校验**，见 §5.1） | `unless-stopped` | P1 ✅ |
 | `llm-gateway`（LLM 网关） | LiteLLM（`ghcr.io/berriai/litellm` 或等价） | digest pin（Q1 未定 → ⚠️ 具体镜像/版本待决策者确认） | 官方默认 | 官方默认 | `unless-stopped` | **P3**（P1 不部署，见 §7） |
-| `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version`；**B 档语言矩阵（issue #27）：Node 22 + Python3/venv/pip + gcc/g++/make + .NET SDK 8（COPY 自官方 sdk 镜像）+ Playwright/chromium（§12.4 装容器内不做 sidecar）；code-server 不装（P3 再议）；实测 2.29GB** | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
+| `fde-<name>`（FDE 容器，模板化） | `FDE_IMAGE`（自构建，build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>` 不可变 tag；版本记录点 `containers.agent_version`；**B 档语言矩阵（issue #27）：Node 22 + Python3/venv/pip + gcc/g++/make + .NET SDK 8（COPY 自官方 sdk 镜像）+ Playwright/chromium（§12.4 装容器内不做 sidecar）；code-server 已清退（issue #71，容器唯一交互入口为 FDE 对话界面）；实测 2.29GB** | `station-agentd`（`docker run --init`：docker 内置 tini 作 PID 1，entrypoint **直接** exec agentd，**不重复 `tini --`**，runner §2.3 方案 (a)） | root 启动 → **drop 到 `erix-agentd`(1001)**，fork worker 切 `erix-worker`(1002)（user-space §6.1） | `unless-stopped` | P1 ✅（单实例；多 FDE = P2） |
 
 > **P1 `MIGRATE_ON_START=1`（compose 显式启用启动迁移）**：baseline（`schema.sql`）与 `bootstrap.sql` 由 `station-db` **首次初始化**（`deploy/db-init/00-init.sh`，超级用户，空数据目录时）完成一次；portal 在**监听端口前**以 `station_platform`（`MIGRATE_DATABASE_URL`）应用 `deploy/migrations/*.sql` 增量（现有 `0001-idempotency-keys.sql`），运行时再以 `station_portal` 提供 DML。**单实例平台（P1）下启动迁移是安全的**——advisory lock 串行化 + 每迁移单事务 + checksum 防改历史；**多实例部署必须改为外部执行迁移并禁用启动迁移**（§3.1）。
 >
@@ -296,7 +296,7 @@
 
 | 角色 | UID | GID | 运行位置 |
 |---|---|---|---|
-| FDE 用户 `erix` | 1000 | 1000 | FDE 容器（工作区属主、code-server/dev servers） |
+| FDE 用户 `erix` | 1000 | 1000 | FDE 容器（工作区属主、dev servers） |
 | `erix-agentd` | 1001 | 1000 | 唯一持 token，root 启动后 drop 到 1001 |
 | `erix-worker` | 1002 | 1000 | fork 时切 UID + 从 env 剔除 token |
 
@@ -331,12 +331,12 @@
 
 | 项 | 归期 | P1 部署方式 |
 |---|---|---|
-| **预览 / IDE iframe**（`*.fde.<base>` 浏览器访问 + forwardAuth 预览凭证 ticket/cookie） | P2 | **不部署预览路由**：不发布 `*.fde.<base>` 预览路由。预览凭证代码已就绪（WP2b 已实现签发/校验/`allocated→active`，portal.md §2.8），P1 仅不启用（fail-closed：路由表无预览路由 = 不可达）；端口分配照常落 DB |
+| **预览 iframe**（`*.fde.<base>` 浏览器访问 + forwardAuth 预览凭证 ticket/cookie） | P2 | **不部署预览路由**：不发布 `*.fde.<base>` 预览路由。预览凭证代码已就绪（WP2b 已实现签发/校验/`allocated→active`，portal.md §2.8），P1 仅不启用（fail-closed：路由表无预览路由 = 不可达）；端口分配照常落 DB |
 | **多 FDE** | P2 | 只部署单 FDE（`fde-<name>` 仅一个） |
 | **run 级端口块 + 事件重放 UI** | P2 | 只做项目级单端口（规格 §8.2）；run 级端口分配/URL 带 runId 不启用 |
 | **工具审批** | P2 | **完全不部署**审批单/审批 UI/审批中转（tools 直接执行；judge 拦截链 P2 再接，runner §10 端点 P2 才启用） |
 | **SSO / OIDC** | P2 | **不部署** OIDC（P1 恒 `auth_source=local`，env §4/portal §2.1） |
-| **LLM 网关（模式 C）+ 用量记账 + code-server 模板** | P3 | **不部署真实 LLM 网关、不写真实虚拟 key**。P1 对话验收用**无真实凭据的 OpenAI-compatible mock/test gateway**（dev-only helper，见 §7.3），容器仍只持占位 key + `endpoint`（topology D-4 红线**无豁免**）；真实 LLM 网关（LiteLLM）+ 用量记账 + code-server 模板归 P3 |
+| **LLM 网关（模式 C）+ 用量记账** | P3 | **不部署真实 LLM 网关、不写真实虚拟 key**。P1 对话验收用**无真实凭据的 OpenAI-compatible mock/test gateway**（dev-only helper，见 §7.3），容器仍只持占位 key + `endpoint`（topology D-4 红线**无豁免**）；真实 LLM 网关（LiteLLM）+ 用量记账归 P3 |
 | **通知通道**（邮件/IM webhook） | P2+ | 不部署；告警**状态**（`failed`+code）P1 落库可查（规格 §14 / user-space §7.3） |
 | **备份/高可用** | 系统级方案（issue #3） | 不部署；平台只保证数据落卷、DB 处于可被系统级备份的形态（规格 §14） |
 

@@ -58,7 +58,7 @@ flowchart TB
     subgraph fdeA["fde-alice (10.200.1.0/29, exclusive)"]
         AGD["station-agentd<br/>outbound daemon · per-container token<br/>SSE downlink: dispatch / approval / stop"]
         RUN["station-runner (one per run)<br/>pi agent — runToolLoop<br/>TranscriptStore = HTTP adapter"]
-        CS["code-server :3001<br/>dev servers :4000+<br/>workspace volume"]
+        CS["dev servers :4000+<br/>workspace volume"]
     end
 
     subgraph fdeB["fde-bob (10.200.2.0/29, exclusive)"]
@@ -72,7 +72,7 @@ flowchart TB
 
     BR2 --> TRA
     TRA -- "portal UI: station.example.com" --> POR
-    TRA -- "preview/IDE: *.fde.example.com<br/>forwardAuth, then direct to container IP" --> CS
+    TRA -- "preview: *.fde.example.com<br/>forwardAuth, then direct to container IP" --> CS
 
     AGD -- "internal API via Traefik<br/>ipAllowList (FDE subnets only)" --> POR
     RUN --> AGD
@@ -197,8 +197,8 @@ sequenceDiagram
     A->>T: GET alice-p-proj1-4000.fde.example.com
     T->>P: forwardAuth (checks preview_grants + exposure)
     P-->>T: 200 pass (first pass: allocation → active)
-    T->>CS: strip-cookie, then proxy to container 10.200.1.2:4000 (dev server)
-    R-->>A: dev server page (in iframe, zero modification)
+    T->>DS: strip-cookie, then proxy to container 10.200.1.2:4000 (dev server)
+    DS-->>A: dev server page (in iframe, zero modification)
     end
 
     rect rgb(245, 255, 245)
