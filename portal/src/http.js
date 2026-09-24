@@ -1193,7 +1193,9 @@ async function handleInternal(req, res, ctx, url) {
     const body = await readJsonBody(req, ctx.config.maxBodyBytes);
     const capacity = body.capacity ?? 1;
     const holdMs = body.hold_ms ?? 30000;
-    const ticket = await internal.claimRun(ctx.pool, { container, user, capacity, holdMs });
+    // issue #69：会话历史预算经 config 注入（env：STATION_HISTORY_MAX_MESSAGES / STATION_HISTORY_MAX_BYTES）。
+    const historyBudget = { maxMessages: ctx.config.historyMaxMessages, maxBytes: ctx.config.historyMaxBytes };
+    const ticket = await internal.claimRun(ctx.pool, { container, user, capacity, holdMs, historyBudget });
     if (!ticket) {
       res.writeHead(204);
       res.end();

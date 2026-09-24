@@ -168,6 +168,17 @@ export class FakeInternalPool {
       return { rows: p ? [{ name: p.name, root_path: p.root_path }] : [] };
     }
 
+    // ---- messages（claim 会话历史下行，issue #69：最近 user/assistant，排除当前 message_id，DESC LIMIT）----
+    if (sql.includes('FROM messages') && sql.includes('role IN')) {
+      const [sessionId, excludeId, limit] = params;
+      const rows = [...this.messages]
+        .filter((x) => x.session_id === sessionId && ['user', 'assistant'].includes(x.role) && x.id !== excludeId)
+        .sort((a, b) => b.seq - a.seq)
+        .slice(0, limit)
+        .map((m) => ({ role: m.role, content: m.content }));
+      return { rows };
+    }
+
     // ---- messages（claim task）----
     if (sql.includes('FROM messages') && sql.includes("role = 'user'")) {
       const runId = params[0];
