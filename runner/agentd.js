@@ -16,11 +16,12 @@
 import { fork, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
 import { cleanupRunData, prepareRunDataDir, sweepRunDataDir } from './lib/run-data.js';
+import { captureAndUploadArtifact } from './lib/artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(__dirname, 'worker.js');
@@ -146,14 +147,26 @@ class InternalError extends Error {
   }
 }
 
-async function internalRequest(method, p, { body, claimToken, retries = 0, timeoutMs = 30000 } = {}) {
+async function internalRequest(method, p, { body, claimToken, retries = 0, timeoutMs = 30000, contentType, headers: extraHeaders } = {}) {
   const headers = {
     Authorization: `Bearer ${CFG.token}`,
-    'Content-Type': 'application/json',
   };
+  let payload;
+  if (body !== undefined) {
+    if (Buffer.isBuffer(body)) {
+      // issue #64：artifact 上传等二进制端点（U13）。
+      payload = body;
+      headers['Content-Type'] = contentType ?? 'application/octet-stream';
+    } else {
+      payload = JSON.stringify(body);
+      headers['Content-Type'] = 'application/json';
+    }
+    headers['Content-Length'] = payload.length;
+  } else {
+    headers['Content-Type'] = 'application/json';
+  }
   if (claimToken) headers['X-Claim-Token'] = claimToken;
-  const payload = body !== undefined ? JSON.stringify(body) : undefined;
-  if (payload !== undefined) headers['Content-Length'] = Buffer.byteLength(payload);
+  if (extraHeaders) Object.assign(headers, extraHeaders);
 
   let res;
   try {
@@ -724,10 +737,12 @@ function onWorkerExit(ctx, code, signal) {
       // 审计 #34 评审 A：track 未完成的补报（见 state.pendingReports），退出前由 drainPendingReports 等待。
       const p = reportTerminalAfterDrop(ctx).finally(() => state.pendingReports.delete(p));
       state.pendingReports.add(p);
+      // issue #64 R1：stop 路径是终态（补报 aborted）→ worktree 移除前先捕获产物（best-effort），
+      // 捕获完成后照常清场（含 run 数据目录）。lease_lost/revoked 非本端收敛 → 走下方 else 不捕获。
+      captureRunArtifact(ctx).finally(() => cleanupRun(ctx, { purgeRunData: true }));
+    } else {
+      cleanupRun(ctx, { purgeRunData: false });
     }
-    // issue #46：stop 路径是终态（补报 aborted）→ 清 run 数据目录；
-    // lease_lost/revoked 非本端收敛 → 保留（lease_lost 可能易主重跑，resume 要读 notes）。
-    cleanupRun(ctx, { purgeRunData: ctx.dropReason === 'stop_request' || ctx.dropReason === 'stop_heartbeat' });
     return;
   }
   // 非预期退出且未终态 → release + 重新认领（§6.4 worker 崩溃）。
@@ -777,7 +792,34 @@ async function onWorkerFinished(ctx, msg) {
       log('warn', 'run finish failed', { run_id: ctx.runId, code: err?.code, msg: String(err?.message ?? err) });
     }
   }
+  // issue #64 R1：终态确认后、清场前捕获产物（best-effort，不阻塞）。
+  if (runTerminalConfirmed) await captureRunArtifact(ctx);
   cleanupRun(ctx, { purgeRunData: runTerminalConfirmed });
+}
+
+/**
+ * issue #64 R1：run 终态产物回收——worktree 移除前捕获并上传（U13）。
+ * 仅由「终态已确认」路径调用：onWorkerFinished 收敛成功 / 409 run_terminal 幂等命中、
+ * stop 路径（stop_request/stop_heartbeat，补报 aborted 的分支）。
+ * 崩溃/lease_lost/revoke/resume 路径**不捕获**——run 还会继续，产物回收只发生在确认终态时。
+ * best-effort：lib 内已全量兜底不抛出，失败仅 warn 日志，绝不得阻塞清场。
+ */
+async function captureRunArtifact(ctx) {
+  const result = await captureAndUploadArtifact({
+    runId: ctx.runId,
+    worktreePath: ctx.worktreePath,
+    log,
+    upload: ({ buffer, sha256, size }) => internalRequest('PUT', `/runs/${ctx.runId}/artifact`, {
+      body: buffer,
+      contentType: 'application/gzip',
+      timeoutMs: 60000, // 20MB 上传，放宽超时
+      headers: { 'X-Sha-256': sha256, 'X-Artifact-Size': String(size) },
+    }),
+  });
+  if (!result.ok) {
+    log('warn', 'artifact capture failed (cleanup continues)', { run_id: ctx.runId, error: result.error });
+  }
+  return result;
 }
 
 function cleanupRun(ctx, { purgeRunData = false } = {}) {
@@ -1086,13 +1128,20 @@ async function main() {
   process.exit(0);
 }
 
-main().catch(async (err) => {
-  log('error', 'agentd fatal', { err: String(err?.stack ?? err) });
-  // 审计 #34 评审 A（major）：fatal 可能发生在 worker 已启动之后——与正常退出同等要求：
-  // 先给未完成的补报留时间，再 drain worker（短 deadline：已是异常路径，不拖长容器退出）。
-  await drainRuns([...state.runs.values()], {
-    deadlineMs: 3000, killGraceMs: 1000, kill: killProcessGroup, log: (m, e) => log('warn', m, e),
-  }).catch(() => {});
-  await drainPendingReports(1000).catch(() => {}); // 同上：drain 期间才产生的新补报
-  process.exit(1);
-});
+// 仅直接执行（`node agentd.js` / 容器入口）时启动主循环；被测试 import 时不启动。
+const isDirectRun = typeof process.argv[1] === 'string' && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  main().catch(async (err) => {
+    log('error', 'agentd fatal', { err: String(err?.stack ?? err) });
+    // 审计 #34 评审 A（major）：fatal 可能发生在 worker 已启动之后——与正常退出同等要求：
+    // 先给未完成的补报留时间，再 drain worker（短 deadline：已是异常路径，不拖长容器退出）。
+    await drainRuns([...state.runs.values()], {
+      deadlineMs: 3000, killGraceMs: 1000, kill: killProcessGroup, log: (m, e) => log('warn', m, e),
+    }).catch(() => {});
+    await drainPendingReports(1000).catch(() => {}); // 同上：drain 期间才产生的新补报
+    process.exit(1);
+  });
+}
+
+// 测试导出（issue #64：终态清场路径的捕获触发用 node:test + stub fetch 覆盖；非对外契约）。
+export { onWorkerFinished, onWorkerExit };

@@ -150,7 +150,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 - `tool_calls`：`call_id` 对应事件流的 `tool_call_id`（portal.md §5.3），`UNIQUE(run_id, call_id)`；**`call_id` 是外部 ID（canonical，见 §1.19），`tool_calls.id` 仅内部主键（uuid）、不外露**；`result_digest` 只存摘要（完整结果可能很大）；`approved` 三态（`NULL` = 未涉及审批）。**行由 portal 在 U3 事件上报时幂等 upsert**（`type='tool_use'` 事件 `INSERT ... ON CONFLICT (run_id, call_id) DO NOTHING`，后续 `tool_result`/`tool_call_delta` 更新派生字段，portal.md §9.10）——U10 建审批单时行必已存在。
 - `judge_decisions`：judge 事件（`kind / action / decision`）的持久化，与 `run_events` 中 `judge` 类型事件同源。
 - `approvals`：**一个工具调用至多一条审批单**（`UNIQUE(run_id, tool_call_id)`，`tool_call_id` 为外部 `call_id`）；`CHECK` 保证 `pending/expired` 与 `decided_at IS NULL` 一致；决定后 runner 轮询继续/终止（portal.md §4.8）。状态机见 §2.3。⚠️ 超时语义已定稿（#10：`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判 UUID 待 #10 确认。
-- `artifacts`：run 产出的文件登记（`kind / path / size / sha`），路径为容器内路径。
+- `artifacts`：run 产出的文件登记（issue #64 R1 起为**终态产物 bundle 登记**：`kind='worktree_bundle'`，一 run 一行，`UNIQUE(run_id, kind)`（迁移 0005），重复上传 409 不覆盖）。`path` = portal 持久卷路径（`ERIX_ARTIFACTS_ROOT/<runId>.tar.gz`；原「容器内路径」登记设想由 v1 bundle 语义替代），`size`/`sha`（sha256）描述 bundle 本体，`manifest`（jsonb，迁移 0005）= agentd 生成的包内清单（文件路径/大小/sha256/`truncated` 截断标记），portal 从 tar 内 `manifest.json` 抽出落库。bundle 内容：`diff.patch`（git diff HEAD）+ 新文件快照 + `manifest.json`，上限 20MB（`ERIX_ARTIFACT_MAX_BYTES`）。
 
 ### 1.14 `usage_ledger` — 用量台账
 
