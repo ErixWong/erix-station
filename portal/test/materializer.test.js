@@ -28,7 +28,7 @@ test('renderConfigJson：占位 key + endpoint（erix-agent v0.3.5 slots 嵌套�
   assert.equal(obj.slots.default.endpoint, 'http://llm.localhost:8090/v1');
   assert.equal(obj.slots.audit.apiKey, 'erix-placeholder');
   assert.equal(obj.slots.fold.apiKey, 'erix-placeholder');
-  assert.equal(obj.slots.default.model, 'claude-sonnet');
+  assert.equal(obj.slots.default.model, 'deepseek-flash'); // 占位即兜底：须为 relay 真实支持的模型名（#79）
 });
 
 test('renderPortsJson：schema/fde/project/generation/allocations 投影（state 未释放）', () => {
