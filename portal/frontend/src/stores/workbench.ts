@@ -384,10 +384,18 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   async function send() {
+    const content = inputValue.value.trim();
+    if (!content || es.activeRunId.value) return;
+    // issue #84 P5 真机验收修正：选了目录但未打开会话时，首条发送自动建会话（原实现 !sid 静默返回，
+    // 用户「选目录→打字→发送」没有任何反馈）。目录未选中（空 projects）才保持 no-op。
+    if (!sessionId.value) {
+      if (!dirCwd.value) return;
+      const created = await createSession();
+      if (!created) return; // 建会话失败已 alert，输入内容保留
+    }
     const ctx = ctxSeq.value;
     const sid = sessionId.value;
-    const content = inputValue.value.trim();
-    if (!content || !sid || es.activeRunId.value) return;
+    if (!sid) return;
     // issue #55 A7：首次发送属用户手势，此时申请桌面通知权限（浏览器要求 gesture 触发）；不支持/被拒静默降级。
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
       try { Notification.requestPermission().catch(() => {}); } catch { /* 忽略 */ }
