@@ -136,6 +136,8 @@ services:
       - ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}:/srv/erix/users
       # Traefik 动态配置（reconciler 单一写方，deploy-contract §4.2）；与 Traefik 侧共享宿主目录。
       - ${TRAEFIK_DYNAMIC_DIR_HOST:-./traefik/dynamic}:/etc/traefik/dynamic
+      # issue #64 R1：run 终态产物（worktree bundle tar.gz）持久卷（deploy-contract §2.2 ④）。
+      - ${ERIX_ARTIFACTS_ROOT_HOST:-/srv/erix/artifacts}:/srv/erix/artifacts
     environment:
       PORT: "8080"
       # 运行时身份 station_portal（最小 DML，deploy-contract §2.4/§3）
@@ -160,6 +162,8 @@ services:
       TRAEFIK_DYNAMIC_FILE: routes.yml
       PORTAL_HOST: ${PORTAL_HOST:-station.localhost}
       PORTAL_BACKEND_URL: http://127.0.0.1:${PORTAL_HOST_PORT:-18080}
+      # issue #64 R1：run 终态产物持久卷（容器内路径；宿主路径经 ERIX_ARTIFACTS_ROOT_HOST 注入）。
+      ERIX_ARTIFACTS_ROOT: /srv/erix/artifacts
       TRAEFIK_ENTRYPOINT: web
       # 容器经 Traefik 访问 portal/LLM 的公共入口 base URL（scheme://host[:port]）。dev http+高端口 / prod https+443。
       # 由 ERIX_STATION_BASE_URL（agentd）与 config.json endpoint（worker provider）使用。

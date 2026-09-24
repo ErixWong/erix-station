@@ -15,6 +15,7 @@ import * as sessions from './sessions.js';
 import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
+import * as artifacts from './artifacts.js';
 import * as llm from './llm.js';
 import * as admin from './admin.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
@@ -147,6 +148,35 @@ function readJsonBody(req, limit) {
         reject(new HttpError(400, 'validation_failed', 'invalid JSON body'));
       }
     });
+    req.on('error', (e) => reject(e));
+  });
+}
+
+/** 读取原始字节请求体（artifact 上传等二进制端点）；超限语义同 readJsonBody。 */
+function readRawBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const contentLength = req.headers['content-length'];
+    if (contentLength) {
+      const n = Number(contentLength);
+      if (Number.isFinite(n) && n > limit) {
+        reject(new HttpError(413, 'payload_too_large', 'request body too large', { details: { max_bytes: limit } }));
+        req.resume(); // 排空，配合响应 Connection: close
+        return;
+      }
+    }
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(new HttpError(413, 'payload_too_large', 'request body too large', { details: { max_bytes: limit } }));
+        req.removeAllListeners('data');
+        req.resume();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', (e) => reject(e));
   });
 }
@@ -397,6 +427,12 @@ async function routeApi(req, res, ctx, url) {
   if (runMatch) {
     const runId = decodeUuid(runMatch[1]);
     if (req.method === 'GET') return handleGetRun(req, res, ctx, runId);
+  }
+  // issue #64 R1：run 产物 bundle 取回（admin 或 run 属主；流式返回 tar.gz）。
+  const runArtifactMatch = pathname.match(/^\/api\/runs\/([^/]+)\/artifact$/);
+  if (runArtifactMatch) {
+    const runId = decodeUuid(runArtifactMatch[1]);
+    if (req.method === 'GET') return handleGetRunArtifact(req, res, ctx, runId);
   }
 
   // ---- admin LLM 配置（issue #38 Phase A；requireAdmin 鉴权） ----
@@ -828,6 +864,27 @@ async function handleGetRun(req, res, ctx, runId) {
       ended_at: row.ended_at?.toISOString?.() ?? null,
     },
   });
+}
+
+/**
+ * GET /api/runs/:id/artifact（issue #64 R1）：run 终态产物 bundle 取回。
+ * 鉴权：admin 或 run 属主（非属主 404，对齐 handleGetRun 不泄露存在性）；流式返回 tar.gz。
+ */
+async function handleGetRunArtifact(req, res, ctx, runId) {
+  const session = await requireSession(req, ctx);
+  const { filePath, row } = await artifacts.getRunArtifact(ctx.pool, {
+    sessionUser: session.user,
+    runId,
+    artifactsRoot: ctx.config.artifactsRoot ?? '/srv/erix/artifacts',
+  });
+  const stat = fs.statSync(filePath);
+  res.writeHead(200, {
+    'Content-Type': 'application/gzip',
+    'Content-Length': stat.size,
+    'Content-Disposition': `attachment; filename="${runId}.tar.gz"`,
+    'X-Artifact-Truncated': row.manifest?.truncated === true ? 'true' : 'false',
+  });
+  fs.createReadStream(filePath).pipe(res);
 }
 
 async function handleLoginStep1(req, res, ctx) {
@@ -1300,6 +1357,25 @@ async function handleInternal(req, res, ctx, url) {
       const toRound = toRoundRaw === null ? null : Number(toRoundRaw);
       const pattern = url.searchParams.get('pattern') ?? '';
       const result = await internal.recallTranscript(ctx.pool, { container, user, runId, claimToken, fromRound, toRound, pattern });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/artifact') {
+      // U13（issue #64 R1）：run 终态产物 bundle 上传。终态后租约已释放 → 仅容器 token + 属主校验。
+      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const maxBytes = ctx.config.artifactMaxBytes ?? 20 * 1024 * 1024;
+      // +1 余量：恰好超限的请求也能给出 413 而非连接截断。
+      const data = await readRawBody(req, maxBytes + 1);
+      if (data.length > maxBytes) {
+        throw new HttpError(413, 'artifact_too_large', 'artifact 超过大小上限', { details: { max_bytes: maxBytes } });
+      }
+      const shaHeader = req.headers['x-sha-256'];
+      const result = await artifacts.putRunArtifact(ctx.pool, {
+        user, runId, data,
+        sha256: typeof shaHeader === 'string' ? shaHeader.trim() : null,
+        artifactsRoot: ctx.config.artifactsRoot ?? '/srv/erix/artifacts',
+        maxBytes,
+        log: ctx.log,
+      });
       return sendJson(res, 200, result);
     }
     if (sub === '/approvals') {
