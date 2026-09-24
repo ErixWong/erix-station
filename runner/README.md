@@ -31,4 +31,4 @@ docker build -t erix-station/fde:local runner/
 - **approvals 不实现**（路径留空，P2 接入，runner §10）。
 - **spool 不落盘**（runner §7.5 待定项）；事件投递为内存缓冲 + 无限退避重试（§7.2/§4.5）。
 - **erix-agent v0.3.5 实测差异**：`createJsonFileModelConfigProvider` 读 `slots.{default,audit,fold}` 嵌套结构且字段为 `endpoint`（非 `baseURL`）——materializer 已按实测修正 config.json（见 WP3b 报告偏差记录）。
-- **worktree**：有 `.git` 时 `git worktree add`，否则回退 `mkdir`（P1 无真实仓库兜底）。
+- **项目目录（D8 修订 2026-09-24，AGENTS.md §7）**：worker cwd 直达 `~/projects/<project>`，agentd 只确保目录存在（mkdir -p），不再 `git worktree add`；项目目录是用户资产，清场绝不删除。

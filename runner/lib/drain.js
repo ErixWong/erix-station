@@ -3,7 +3,8 @@
  *
  * 问题：`beginRevoke` 只是「发 IPC abort + 安排 5s 后 SIGKILL」，而 agentd 的主循环返回后
  * 立即 `process.exit(0)`——于是：① SIGKILL 兜底 timer 随进程消失 → 挂住的 worker 进程组残留；
- * ② `onWorkerExit` 不跑 → `cleanupRun` 不跑 → worktree 残留（违反 D8「隔离单元 = worktree」）。
+ * ② `onWorkerExit` 不跑 → `cleanupRun` 不跑 → capacity 不释放、run 数据目录残留
+ * （D8 修订 2026-09-24 后项目目录是用户资产，本就无 worktree 清理义务）。
  *
  * 本模块把「等 worker 真退出（带 deadline 强杀）」抽成可注入、可单测的纯逻辑：
  *   1. 等全部在跑 worker exit（deadlineMs，默认 8s = abort 的 5s 宽限 + 余量）
