@@ -87,6 +87,21 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree
 
+## 7. D8 修订（2026-09-24，决策者拍板）：cwd 直达项目目录，拆除 worktree
+
+D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录（cwd）**」：
+
+- **理由**：FDE 是开发者本人的工位容器（非服务端牲口场），交付物应天然持久于 `~/projects/<project>`；
+  worktree 的临时性（run 终态即焚）与神秘容器路径一直在泄漏复杂度给用户和模型（真机反复实证：
+  俄罗斯方块手动抢救、hello.sh 报 worktree 路径）。隔离收益实际拿不到：agentd `capacity=1`
+  串行执行 + 每 session 单活跃 run，并行碰撞在当前形态不存在。
+- **新语义**：worker cwd = `~/projects/<project>`（jail 可写边界不变，就是这个目录）；
+  `prepareWorktree`/`cleanupWorktree` 拆除；产物捕获（f402a11）目标改项目目录；
+  run 数据目录归档（P1）不变；非 git 项目不再需要 mkdir 兜底。
+- **代价与边界**：agent 弄脏项目由用户 git 自治（工位语义本就如此）；将来真要并行同项目，
+  再按项目粒度加执行锁，不预支 worktree 复杂度。
+- **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
+
 ## 8. erix-agent 依赖与升级（0.3.5 → 0.9.0，2026-09 分析）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名就是 `erix-agent`；本地无同名目录，别再找错）。宿主契约 `docs/host-consumer-contract.md`；0.6.0 升级指南 `docs/host-upgrade-guide-0.6.0.md`；破坏性变化以 CHANGELOG 为准。
