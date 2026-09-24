@@ -898,6 +898,8 @@ async function handleTicket(ticket) {
     model: run.model ?? null,
     resume: ctx.resume,
     attachments: Array.isArray(run.attachments) ? run.attachments : [],
+    // issue #69：会话历史下行（portal 已限幅，透传不二次校验）；内容不进日志，只可记条数。
+    history: Array.isArray(run.history) ? run.history : [],
     // issue #46：notesDir 下行（run 数据目录内，logical-run 作用域；worker 不再自推 worktree 路径）。
     notes_dir: path.join(ctx.runDataPath, 'notes'),
     config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
@@ -907,7 +909,8 @@ async function handleTicket(ticket) {
   };
   try {
     spawnWorker(ctx, runStart);
-    log('info', 'worker spawned', { run_id: runId, attempt: ctx.attempt, resume: ctx.resume, pid: ctx.workerPid, cwd });
+    // issue #69：history 只记条数，绝不记内容。
+    log('info', 'worker spawned', { run_id: runId, attempt: ctx.attempt, resume: ctx.resume, pid: ctx.workerPid, cwd, history_count: Array.isArray(run.history) ? run.history.length : 0 });
   } catch (err) {
     log('warn', 'fork failed', { run_id: runId, err: String(err?.message ?? err) });
     await releaseAndRequeue(ctx, 'fork_failed');

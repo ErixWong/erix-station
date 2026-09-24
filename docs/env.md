@@ -361,6 +361,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 背压（worker / agentd 内存队列） | 10000 条/4MB；20000 条/8MB | 条 / MB | 见左 | worker / agentd（runner §7.4） | 超限落 spool；spool 也满 → run `spool_full` | 队列深度、spool 用量 |
 | spool 配额 | 每 run 256MB / 每容器 1GB | MB | 见左 | agentd（runner §7.5） | 写满 → 事件不静默丢，显式 `spool_full` run 失败 | spool 磁盘占用 |
 | agentd 并发 `capacity` | 4 | run | 4 | agentd claim 上报（runner §13） | portal 不超发 | 并发 run 数 |
+| 会话历史下行预算（issue #69） | 20 条 / 16384 字节 | 条 / B | — | portal（`STATION_HISTORY_MAX_MESSAGES` / `STATION_HISTORY_MAX_BYTES`，claim ticket 注入 `run.history`；超限保最新丢最旧，超限字节按 content UTF-8 计） | 超预算丢最旧历史，不影响本轮 task | ticket history 条数/字节 |
 | portal HTTP 慢客户端防护 | 请求头 10s / 请求体 30s / keep-alive 60s | s | — | portal 服务器配置（技术栈 Q7 ⚠️，语义与栈无关） | 超时断连；连接数超限 → 排队 / `503` | 慢客户端断开数 |
 | portal 最大并发连接数 | 1024 | 连接 | — | portal 服务器配置 | 超限排队或 `503 rate_limited` | 峰值连接数 |
 
