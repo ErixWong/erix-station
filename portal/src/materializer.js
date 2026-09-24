@@ -39,9 +39,11 @@ export function renderConfigJson({ llmBaseUrl }) {
   const endpoint = `${String(llmBaseUrl).replace(/\/+$/, '')}/v1`;
   return json({
     slots: {
-      default: { apiKey: 'erix-placeholder', endpoint, model: 'claude-sonnet' },
-      audit: { apiKey: 'erix-placeholder', endpoint, model: 'claude-haiku' },
-      fold: { apiKey: 'erix-placeholder', endpoint, model: 'claude-haiku' },
+      // 占位 model 用真实存在且 relay 支持的名字（#79 教训：冷启动竞态回退时会真发请求，
+      //      虚构名会被 relay 拒绝——占位即兜底，必须可用）。
+      default: { apiKey: 'erix-placeholder', endpoint, model: 'deepseek-flash' },
+      audit: { apiKey: 'erix-placeholder', endpoint, model: 'deepseek-flash' },
+      fold: { apiKey: 'erix-placeholder', endpoint, model: 'deepseek-flash' },
     },
   });
 }
