@@ -27,7 +27,7 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
 <template>
   <!-- 空态：旧版「选择或新建会话」默认文案（平台管理员进管理台引导） -->
   <div v-if="store.entries.length === 0">
-    <p v-if="store.noProject && store.isPlatformAdmin" class="muted">
+    <p v-if="store.noDir && store.isPlatformAdmin" class="muted">
       平台管理员：请到管理台创建 FDE 用户与分配资源<br><router-link to="/admin" class="underline">进入管理台</router-link>
     </p>
     <p v-else class="muted">选择或新建会话</p>
