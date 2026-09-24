@@ -1279,6 +1279,73 @@ async function handleInternal(req, res, ctx, url) {
     return sendJson(res, 200, result);
   }
 
+  // session-scoped transcript（issue #81 P2，conversation-state.md §4.1；迁移 0006）。
+  // key = sessionId（引擎 store key）；writer run 经 ?run_id= query 参数 + X-Claim-Token 头 fencing。
+  const sessionTranscriptMatch = pathname.match(/^\/api\/internal\/transcript\/([^/]+)(\/.*)?$/);
+  if (sessionTranscriptMatch) {
+    const key = decodeURIComponent(sessionTranscriptMatch[1]);
+    const sub = sessionTranscriptMatch[2] || '';
+    const claimToken = claimTokenHeader(req);
+    const writerRunIdParam = url.searchParams.get('run_id');
+    const writerRunId = writerRunIdParam ? decodeUuid(writerRunIdParam) : null;
+    if (writerRunId === null) {
+      throw new HttpError(400, 'validation_failed', 'run_id query 参数必填（writer run，租约 fencing）', { details: { field: 'run_id' } });
+    }
+    const base = { container, user, key, claimToken, writerRunId };
+
+    if (sub === '') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const limit = Number(url.searchParams.get('limit') || 10000);
+      const cursor = url.searchParams.get('cursor') ? Number(url.searchParams.get('cursor')) : null;
+      const result = await internal.getSessionTranscript(ctx.pool, { ...base, limit, cursor });
+      return sendJson(res, 200, result);
+    }
+    const sessionRoundMatch = sub.match(/^\/rounds\/(\d+)$/);
+    if (sessionRoundMatch) {
+      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, INTERNAL_ROUND_LIMIT);
+      const result = await internal.putSessionRound(ctx.pool, { ...base, round: Number(sessionRoundMatch[1]), body });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/checkpoint') {
+      if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      requireJson(req);
+      const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
+      const result = await internal.putSessionCheckpoint(ctx.pool, { ...base, body });
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/checkpoint/latest') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const result = await internal.getSessionLatestCheckpoint(ctx.pool, base);
+      if (result === null) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      return sendJson(res, 200, result);
+    }
+    if (sub === '/runstate') {
+      if (req.method === 'PUT') {
+        requireJson(req);
+        const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);
+        const result = await internal.saveSessionRunState(ctx.pool, { ...base, body });
+        return sendJson(res, 200, result);
+      }
+      if (req.method === 'GET') {
+        const result = await internal.loadSessionRunState(ctx.pool, base);
+        if (result === null) {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+        return sendJson(res, 200, result);
+      }
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    }
+    return sendJson(res, 404, errorBody('not_found', 'not found'));
+  }
+
   // runs/:id/*
   const runMatch = pathname.match(/^\/api\/internal\/runs\/([^/]+)(\/.*)?$/);
   if (runMatch) {
