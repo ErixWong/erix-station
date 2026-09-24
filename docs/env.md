@@ -339,6 +339,15 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_DEV_USER` | 开发期容器 `--user`（whoami 镜像无双 UID 用户时兑底） | `1001:1000` |
 | `MOCK_LATENCY_MS` | station-mock-llm 注入延迟（联调用，dev-only） | `0` |
 
+### 10.2 补登：agentd 容器侧环境变量（runner 运行时，2026-09-24 登记）
+
+> 以下变量由 FDE 容器内 agentd 进程读取（`runner/agentd.js`），不经 compose 插值；此前未登记，随 issue #64 R1 配套归档修正一并补齐。
+
+| 变量 | 用途 | 默认 / 示例 |
+|---|---|---|
+| `ERIX_RUN_DATA_TTL_HOURS` | 启动 sweep 对 `<home>/runs/`（活跃层：跨 attempt notes 等 run 数据）残留的 mtime 保留期（小时）；崩溃后 resume re-claim 必在窗口内发生，新鲜目录不会误删（race 推导见 `runner/lib/run-data.js` 头注释）；`0` = 禁用该扫描 | `24` |
+| `ERIX_ARCHIVE_TTL_HOURS` | 启动 sweep 对 `<home>/runs-archive/`（归档层：终态确认后从 `runs/` 整体移入的会话真相——transcript/notes，conversation-state.md §5 P1 归档 TTL 替代物理删除）的 mtime 保留期（小时），超期才物理删除；`0` = 禁用归档清扫（一律保留，纯人工/运维兜底） | `168`（7 天） |
+
 ---
 
 ## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）

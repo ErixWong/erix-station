@@ -106,6 +106,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `error` | 失败时为 `{code, message, retryable}`；run 级错误码见 portal.md §6.4（`rate_limited` / `checkpoint_failed` / `container_exited` / …） |
 | `cancel_requested_at` | 停止标记：portal 写、runner 轮询（`AbortController` 跨不了进程，规格 §10.3） |
 
+**容器侧 run 数据目录（文件真相的归档层，issue #64 R1 配套 / conversation-state.md §5 P1）**：DB 是状态真相（不变式 3），容器内文件只有两类值得保留——worktree 产物（终态捕获为 artifact bundle 入 `artifacts` 表 + portal 持久卷，§1.13）与 run 数据目录（notes 等 logical-run 作用域数据，resume 的跨 attempt 输入）。后者生命周期两层（`runner/lib/run-data.js`）：`<home>/runs/<runId>/` 活跃层跨 attempt 保留，崩溃残留由 agentd 启动 sweep 按 `ERIX_RUN_DATA_TTL_HOURS`（默认 24h）物理清除；**终态确认后不再物理删除**，整体**归档**（同盘 rename）进 `<home>/runs-archive/<runId>/`——transcript/notes 是会话真相层（conversation-state.md），仅当 mtime 超过归档 TTL（`ERIX_ARCHIVE_TTL_HOURS`，默认 168h=7 天，`0`=禁用）才由 sweep 物理删除。worktree 照旧随 run 回收（D8 执行隔离物，非真相层）；产物捕获发生在归档/清场之前，归档不拦截产物回收。
+
 ### 1.8 `messages` — 第①层：人看的对话
 
 见 §3 边界说明。要点：`role` 仅 `user / assistant`；`synthetic` 默认 `false`，judge/wrapup 注入的合成消息置 `true`，**UI 必须显著标记**（规格 §9.2 红线）；`seq` 与 `run_events` 共用 `chat_sessions.last_seq` 分配器，`UNIQUE(session_id, seq)`；`run_id` 关联产生它的 run（用户消息 = 它触发的 run）。
