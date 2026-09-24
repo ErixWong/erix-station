@@ -26,6 +26,7 @@ import { resolveRunModel } from './lib/llm-models.js';
 import { createFileTools, createJail } from './lib/file-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
+import { mapHistoryToInitialMessages } from './lib/history.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -282,6 +283,10 @@ async function startRun(msg) {
       // 1) task 显式传（§1.3 硬注意-1）；2) 本轮用户输入作为 task + 初始消息。
       task,
       initialUserMessage: task,
+      // issue #69：会话历史下行——非 resume 时把 RUN_START.history 映射为引擎 initialMessages
+      // （纯函数非法入参回退 []）。resume 时不传（undefined = 全新会话路径）：checkpoint 拥有
+      // 上下文，注入历史会重复。task/initialUserMessage 保持现状不动。
+      initialMessages: resume === true ? undefined : mapHistoryToInitialMessages(msg.history),
       tools,
       executeTool,
       store,

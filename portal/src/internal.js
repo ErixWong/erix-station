@@ -16,6 +16,35 @@ const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
 const IDEMPOTENCY_PURGE_INTERVAL_MS = 60 * 60 * 1000; // 幂等键过期清理间隔（TTL 24h，1h 扫一次足够）
 const HOLD_MS_MAX = 30000; // claim 长轮询 hold 上限
+
+/** issue #69：会话历史下行预算默认值（env 可调：STATION_HISTORY_MAX_MESSAGES / STATION_HISTORY_MAX_BYTES）。 */
+export const HISTORY_DEFAULTS = { maxMessages: 20, maxBytes: 16384 };
+
+/** 预算注入值的规范化：非正整数/缺省回退默认（claim 链路不做硬失败）。纯函数，供单测。 */
+export function normalizeHistoryBudget(budget = {}) {
+  const maxMessages = Number(budget?.maxMessages);
+  const maxBytes = Number(budget?.maxBytes);
+  return {
+    maxMessages: Number.isInteger(maxMessages) && maxMessages > 0 ? maxMessages : HISTORY_DEFAULTS.maxMessages,
+    maxBytes: Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : HISTORY_DEFAULTS.maxBytes,
+  };
+}
+
+/** 历史预算截断（纯函数，供单测）：先按条数截尾（保最新），再按 content UTF-8 字节从头丢到符合。
+ *  入参按升序（旧→新）；不注入任何合成消息。 */
+export function truncateHistory(messages, budget = {}) {
+  if (!Array.isArray(messages)) return [];
+  const { maxMessages, maxBytes } = normalizeHistoryBudget(budget);
+  const kept = messages.slice(-maxMessages); // 保最新 maxMessages 条
+  const bytesOf = (m) => Buffer.byteLength(String(m?.content ?? ''), 'utf8');
+  let total = kept.reduce((n, m) => n + bytesOf(m), 0);
+  let start = 0;
+  while (total > maxBytes && start < kept.length) {
+    total -= bytesOf(kept[start]); // 丢最旧
+    start += 1;
+  }
+  return kept.slice(start);
+}
 const MAX_EVENTS_PER_BATCH = 200; // runner §7.2
 const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
 const MAX_ROUND_BYTES = 1024 * 1024; // portal.md §9.7
@@ -70,8 +99,10 @@ export function validateTransition(from, to) {
   );
 }
 
-/** claim ticket 组装（纯函数，供单测）。resume = attempt > 1（方案 B）。 */
-export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, message, attempts }) {
+/** claim ticket 组装（纯函数，供单测）。resume = attempt > 1（方案 B）。
+ *  issue #69：history = 该 session 最近的 user/assistant 消息（[{role, content:string}]，已按预算截断、
+ *  升序、排除当前 message），由调用方（tryClaim）查库 + truncateHistory 后注入。 */
+export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, message, attempts, history }) {
   return {
     queue_id: queueId,
     claim_token: claimToken,
@@ -86,6 +117,7 @@ export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, 
       model: run.model ?? null,
       resume: attempts > 1,
       attachments: Array.isArray(message?.attachments) ? message.attachments : [],
+      history: Array.isArray(history) ? history : [],
     },
   };
 }
@@ -179,7 +211,7 @@ function isTerminal(status) {
 // ---------------------------------------------------------------------------
 
 /** 单次原子认领（FOR UPDATE SKIP LOCKED，schema.sql §8 认领 SQL）。返回 ticket 或 null。 */
-async function tryClaim(pool, { container, user, capacity, now = new Date() } = {}) {
+async function tryClaim(pool, { container, user, capacity, now = new Date(), historyBudget } = {}) {
   const claimToken = crypto.randomBytes(24).toString('base64url');
   const claimed = await pool.query(
     `UPDATE run_queue q
@@ -227,6 +259,21 @@ async function tryClaim(pool, { container, user, capacity, now = new Date() } = 
     [row.run_id],
   );
 
+  // issue #69：会话历史下行——该 run 所属 session 最近 user/assistant 消息，排除当前这条（message_id），
+  // 查最近 maxMessages 条（DESC），截断后升序注入 ticket。预算超限保最新丢最旧，不注入合成消息。
+  const budget = normalizeHistoryBudget(historyBudget);
+  const currentMessageId = message.rows?.[0]?.id ?? crypto.randomUUID();
+  const historyRows = await pool.query(
+    `SELECT role, content FROM messages
+      WHERE session_id = $1 AND role IN ('user', 'assistant') AND id <> $2
+      ORDER BY seq DESC LIMIT $3`,
+    [runRow.session_id, currentMessageId, budget.maxMessages],
+  );
+  const history = truncateHistory(
+    [...(historyRows.rows ?? [])].reverse().map((m) => ({ role: m.role, content: m.content })),
+    budget,
+  );
+
   return assembleTicket({
     queueId: row.queue_id,
     claimToken: row.claim_token,
@@ -235,6 +282,7 @@ async function tryClaim(pool, { container, user, capacity, now = new Date() } = 
     project: project.rows?.[0],
     message: message.rows?.[0],
     attempts: Number(row.attempts),
+    history,
   });
 }
 
@@ -429,7 +477,7 @@ export function hubStats() {
 // U1 claim（含 hold 长轮询）
 // ---------------------------------------------------------------------------
 
-export async function claimRun(pool, { container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date() } = {}) {
+export async function claimRun(pool, { container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), historyBudget } = {}) {
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 64) {
     throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' } });
   }
@@ -437,7 +485,7 @@ export async function claimRun(pool, { container, user, capacity = 1, holdMs = H
     throw new InternalError(400, 'validation_failed', `hold_ms 越界（1..${HOLD_MS_MAX}）`, { details: { field: 'hold_ms' } });
   }
 
-  const ticket = await tryClaim(pool, { container, user, capacity, now });
+  const ticket = await tryClaim(pool, { container, user, capacity, now, historyBudget });
   if (ticket) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: ticket.run.id, details: { attempt: ticket.run.attempt } }).catch(() => {});
     return ticket;
@@ -445,7 +493,7 @@ export async function claimRun(pool, { container, user, capacity = 1, holdMs = H
 
   const deadline = Date.now() + holdMs;
   await waitForWakeup(user.id, deadline);
-  const retry = await tryClaim(pool, { container, user, capacity, now });
+  const retry = await tryClaim(pool, { container, user, capacity, now, historyBudget });
   if (retry) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: retry.run.id, details: { attempt: retry.run.attempt } }).catch(() => {});
     return retry;
