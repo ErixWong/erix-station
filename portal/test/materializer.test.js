@@ -1,4 +1,6 @@
 // 单测：materializer.js（渲染 / manifest generation / 原子写 / 幂等 / 删除清理）+ fsutil 原子写。
+// P5 去项目化（directory-as-project §5）：项目级物化退役——平台文件 = 家目录骨架 +
+// FDE 级 ~/.erix/ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
 // 隔离约定（docs/testing.md §2.1）：注入临时目录，不碰真实 /srv/erix/users。
 import test from 'node:test';
 import { mock } from 'node:test';
@@ -10,6 +12,7 @@ import {
   renderConfigJson,
   renderPortsJson,
   renderManifest,
+  renderHomeAgentsMd,
   buildFilePlan,
   createMaterializer,
   runMaterializerOnce,
@@ -22,6 +25,20 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mat-test-'));
 }
 
+const ALLOC = { scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-4016.fde.localhost', exposure: 'private', state: 'allocated' };
+
+function snapshot(overrides = {}) {
+  return {
+    fdeName: 'alice',
+    baseDomain: 'localhost',
+    llmBaseUrl: 'http://llm.localhost:8090',
+    generation: 1,
+    allocations: [],
+    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
+    ...overrides,
+  };
+}
+
 test('renderConfigJson：占位 key + endpoint（erix-agent v0.3.5 slots 嵌套格式）+ 三 slot', () => {
   const obj = JSON.parse(renderConfigJson({ llmBaseUrl: 'http://llm.localhost:8090' }));
   assert.equal(obj.slots.default.apiKey, 'erix-placeholder');
@@ -31,23 +48,34 @@ test('renderConfigJson：占位 key + endpoint（erix-agent v0.3.5 slots 嵌套�
   assert.equal(obj.slots.default.model, 'deepseek-flash'); // 占位即兜底：须为 relay 真实支持的模型名（#79）
 });
 
-test('renderPortsJson：schema/fde/project/generation/allocations 投影（state 未释放）', () => {
+test('renderPortsJson：P5 FDE 级单一文件（schema/fde/generation/allocations 平铺，无 project 字段）', () => {
   const obj = JSON.parse(
     renderPortsJson({
       fdeName: 'alice',
-      projectName: 'proj1',
       generation: 42,
-      allocations: [
-        { scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' },
-      ],
+      allocations: [ALLOC],
     }),
   );
   assert.equal(obj.schema, 1);
   assert.equal(obj.fde, 'alice');
-  assert.equal(obj.project, 'proj1');
   assert.equal(obj.generation, 42);
+  assert.equal(obj.project, undefined, 'FDE 级文件不再按项目分组');
   assert.equal(obj.allocations.length, 1);
   assert.equal(obj.allocations[0].port, 4016);
+});
+
+test('renderHomeAgentsMd：端口指引指向 FDE 级 ~/.erix/ports.json（不再提项目级 .erix/ports.json）', () => {
+  const md = renderHomeAgentsMd({ fdeName: 'alice' });
+  assert.match(md, /~\/\.erix\/ports\.json/);
+  assert.doesNotMatch(md, /projects\/<project>\/\.erix\/ports\.json/);
+});
+
+test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目录 clone . / git init）', () => {
+  const md = renderHomeAgentsMd({ fdeName: 'alice' });
+  assert.match(md, /## clone 方式/);
+  assert.match(md, /git clone <地址> \./);
+  assert.match(md, /git init/);
+  assert.doesNotMatch(md, /<repo_url>/);
 });
 
 test('renderManifest：files 键字典序 + generation + materialized_at', () => {
@@ -66,104 +94,49 @@ test('renderManifest：files 键字典序 + generation + materialized_at', () =>
   assert.equal(obj.files['/home/erix/AGENTS.md'].revision, 1);
 });
 
-test('hostPathFor：容器绝对路径 → 宿主 <root>/<fde>/...', () => {
+test('hostPathFor：容器绝对路径 → 宿主 <root>/<fde>/...（D8/P5：worktrees 挂载已拆，home 内容落 home/）', () => {
   assert.equal(
     hostPathFor('/srv/erix/users', 'alice', `${CONTAINER_HOME}/projects/proj1/.erix/ports.json`),
     path.join('/srv/erix/users', 'alice', 'projects/proj1/.erix/ports.json'),
   );
+  assert.equal(
+    hostPathFor('/srv/erix/users', 'alice', `${CONTAINER_HOME}/.erix/ports.json`),
+    path.join('/srv/erix/users', 'alice', 'home', '.erix/ports.json'),
+  );
 });
 
-test('buildFilePlan：home 骨架 + 每项目平台文件，路径映射正确', () => {
+test('buildFilePlan：P5 家目录骨架 + FDE 级 ports.json（无任何项目级文件）', () => {
   const files = buildFilePlan({
     fdeName: 'alice',
     baseDomain: 'localhost',
     llmBaseUrl: 'http://llm.localhost:8090',
     root: '/srv/erix/users',
     generation: 1,
-    projects: [{ id: 'p1', name: 'proj1' }],
-    allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
+    allocations: [ALLOC],
   });
   const hostPaths = files.map((f) => f.hostPath);
   assert.ok(hostPaths.includes(path.join('/srv/erix/users', 'alice', 'home', 'AGENTS.md')));
-  assert.ok(hostPaths.includes(path.join('/srv/erix/users', 'alice', 'projects', 'proj1', '.erix', 'ports.json')));
+  assert.ok(hostPaths.includes(path.join('/srv/erix/users', 'alice', 'home', '.erix', 'ports.json')));
+  assert.ok(hostPaths.includes(path.join('/srv/erix/users', 'alice', 'home', '.erix', 'config.json')));
+  assert.ok(hostPaths.includes(path.join('/srv/erix/users', 'alice', 'home', '.erix', 'mcp.json')));
+  // 项目级物化整体退役：.gitignore / 项目 .erix/ 一律不生成。
+  assert.equal(files.filter((f) => f.containerPath.includes('/projects/')).length, 0, '无项目级平台文件');
   const portsFile = files.find((f) => f.containerPath.endsWith('.erix/ports.json'));
   assert.equal(JSON.parse(portsFile.content).generation, 1);
+  assert.equal(JSON.parse(portsFile.content).allocations.length, 1);
 });
 
-test('renderProjectAgentsMd：有 repoUrl 时写入真实地址并移除占位符', () => {
-  const files = buildFilePlan({
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    root: '/srv/erix/users',
-    generation: 1,
-    projects: [{ id: 'p1', name: 'proj1', repo_url: 'https://git.example/alice/proj1.git' }],
-    allocationsByProject: new Map(),
-  });
-  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
-  assert.match(agents, /https:\/\/git\.example\/alice\/proj1\.git/);
-  assert.doesNotMatch(agents, /<repo_url>/);
-});
-
-test('renderProjectAgentsMd：repoUrl 含 shell 元字符时在命令中使用 POSIX 单引号引用', () => {
-  const files = buildFilePlan({
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    root: '/srv/erix/users',
-    generation: 1,
-    projects: [{ id: 'p1', name: 'proj1', repo_url: 'https://host/repo.git;id' }],
-    allocationsByProject: new Map(),
-  });
-  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
-  assert.match(agents, /origin 'https:\/\/host\/repo\.git;id'/);
-  assert.doesNotMatch(agents, /origin https:\/\/host\/repo\.git;id/);
-});
-
-test('renderProjectAgentsMd：repoUrl 含单引号时生成 POSIX 安全转义命令', () => {
-  const files = buildFilePlan({
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    root: '/srv/erix/users',
-    generation: 1,
-    projects: [{ id: 'p1', name: 'proj1', repo_url: "https://host/repo.git'x" }],
-    allocationsByProject: new Map(),
-  });
-  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
-  assert.ok(agents.includes("'https://host/repo.git'\\''x'"));
-});
-
-test('renderProjectAgentsMd：无 repoUrl 时给出未关联仓库指引且移除占位符', () => {
-  const files = buildFilePlan({
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    root: '/srv/erix/users',
-    generation: 1,
-    projects: [{ id: 'p1', name: 'proj1', repo_url: null }],
-    allocationsByProject: new Map(),
-  });
-  const agents = files.find((f) => f.containerPath.endsWith('.erix/AGENTS.md')).content;
-  assert.match(agents, /未关联仓库/);
-  assert.doesNotMatch(agents, /<repo_url>/);
-});
-
-test('runMaterializerOnce：项目查询带出 repo_url 并落盘真实仓库地址', async () => {
+test('runMaterializerOnce：P5 不再查询 projects；allocations 平铺落 FDE 级 ports.json', async () => {
   const root = tmpdir();
-  const repoUrl = 'https://git.example/alice/proj1.git';
+  const queried = [];
   const pool = {
     async query(sql) {
+      queried.push(sql);
       if (sql.includes('FROM users')) {
         return { rows: [{ id: 'u1', fde_name: 'alice' }] };
       }
-      if (sql.includes('FROM projects')) {
-        const project = { id: 'p1', name: 'proj1' };
-        // 模拟 pg 的投影：只有查询显式选择 repo_url 时，行里才有该字段。
-        if (sql.includes('repo_url')) project.repo_url = repoUrl;
-        return { rows: [project] };
-      }
-      if (sql.includes('FROM port_allocations')) return { rows: [] };
+      if (sql.includes('FROM projects')) throw new Error('P5：materializer 不得再查询 projects 表');
+      if (sql.includes('FROM port_allocations')) return { rows: [{ ...ALLOC }] };
       if (sql.includes('UPDATE materialize_outbox SET state =')) return { rows: [] };
       throw new Error(`unexpected pool query: ${sql}`);
     },
@@ -190,10 +163,10 @@ test('runMaterializerOnce：项目查询带出 repo_url 并落盘真实仓库地
     });
     assert.deepEqual(result, { processed: 1, claimed: 1 });
 
-    const agentsPath = path.join(root, 'alice', 'projects', 'proj1', '.erix', 'AGENTS.md');
-    const agents = fs.readFileSync(agentsPath, 'utf8');
-    assert.match(agents, new RegExp(repoUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.doesNotMatch(agents, /<repo_url>/);
+    const ports = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'ports.json'), 'utf8'));
+    assert.equal(ports.fde, 'alice');
+    assert.equal(ports.allocations.length, 1);
+    assert.equal(ports.allocations[0].url, ALLOC.url);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -225,20 +198,12 @@ test('fsutil.atomicWriteFile：目标路径含 symlink → 拒写且保留旧文
 test('materialize：幂等（同一快照两次 → generation 不变、字节级相同、无重写）', async () => {
   const root = tmpdir();
   const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
-  const snapshot = {
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 5,
-    projects: [{ id: 'p1', name: 'proj1' }],
-    allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
-    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
-  };
-  const r1 = await mat.materialize(snapshot);
+  const snap = snapshot({ generation: 5, allocations: [ALLOC] });
+  const r1 = await mat.materialize(snap);
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
   const prevManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   const mtime1 = fs.statSync(manifestPath).mtimeMs;
-  const r2 = await mat.materialize({ ...snapshot, prevManifest });
+  const r2 = await mat.materialize({ ...snap, prevManifest });
   assert.equal(r1.generation, 5);
   assert.equal(r2.generation, 5);
   assert.equal(r1.manifest, r2.manifest);
@@ -247,46 +212,57 @@ test('materialize：幂等（同一快照两次 → generation 不变、字节�
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('materialize：项目删除后清理 stale 平台文件', async () => {
+/** 在磁盘 + prevManifest 里预置一份「旧版平台生成」的项目脚手架（模拟 0008 前的存量状态）。 */
+function seedLegacyProjectScaffold(root, mat) {
+  const scaffold = {
+    gitignore: path.join(root, 'alice', 'projects', 'proj1', '.gitignore'),
+    ports: path.join(root, 'alice', 'projects', 'proj1', '.erix', 'ports.json'),
+    agents: path.join(root, 'alice', 'projects', 'proj1', '.erix', 'AGENTS.md'),
+  };
+  for (const p of Object.values(scaffold)) fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(scaffold.gitignore, '.erix/\n');
+  fs.writeFileSync(scaffold.ports, '{"schema":1,"project":"proj1"}\n');
+  fs.writeFileSync(scaffold.agents, '# proj1 · 项目级约定\n');
+  return scaffold;
+}
+
+function prevManifestWithScaffold(prevManifest, sha = 'c'.repeat(64)) {
+  return {
+    ...prevManifest,
+    files: {
+      ...prevManifest.files,
+      [`${CONTAINER_HOME}/projects/proj1/.gitignore`]: { sha256: sha, revision: 1 },
+      [`${CONTAINER_HOME}/projects/proj1/.erix/ports.json`]: { sha256: sha, revision: 1 },
+      [`${CONTAINER_HOME}/projects/proj1/.erix/AGENTS.md`]: { sha256: sha, revision: 1 },
+    },
+  };
+}
+
+test('materialize：P5 新 plan 收敛移除存量项目脚手架（stale 清理，manifest 机制）', async () => {
   const root = tmpdir();
   const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
-  const proj = { id: 'p1', name: 'proj1' };
-  const alloc = [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }];
-  const before = {
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 1,
-    projects: [proj],
-    allocationsByProject: new Map([['p1', alloc]]),
-    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
-  };
-  await mat.materialize(before);
-  const portsPath = path.join(root, 'alice', 'projects', 'proj1', '.erix', 'ports.json');
-  assert.ok(fs.existsSync(portsPath));
-  const prevManifest = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'manifest.json'), 'utf8'));
+  await mat.materialize(snapshot());
+  const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
+  const scaffold = seedLegacyProjectScaffold(root, mat);
+  for (const p of Object.values(scaffold)) assert.ok(fs.existsSync(p), '预置脚手架存在');
 
-  // 项目删除 → projects 为空 → 清理该项目平台文件（以 DB 为真相，prevManifest 仅作删除/幂等诊断）。
-  const after = { ...before, generation: 2, projects: [], allocationsByProject: new Map(), prevManifest };
-  await mat.materialize(after);
-  assert.equal(fs.existsSync(portsPath), false);
+  // 同代新 plan（无项目文件）+ prevManifest 含旧脚手架 → stale 收敛移除。
+  await mat.materialize({
+    ...snapshot(),
+    prevManifest: prevManifestWithScaffold(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))),
+  });
+  for (const p of Object.values(scaffold)) assert.equal(fs.existsSync(p), false, '旧脚手架被移除');
+  // 家目录骨架不受影响。
+  assert.ok(fs.existsSync(path.join(root, 'alice', 'home', 'AGENTS.md')));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('materialize：ports.json generation == manifest generation（跨文件一致性锚点）', async () => {
+test('materialize：ports.json generation == manifest generation（跨文件一致性锚点，FDE 级）', async () => {
   const root = tmpdir();
   const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
-  const r = await mat.materialize({
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 42,
-    projects: [{ id: 'p1', name: 'proj1' }],
-    allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
-    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
-  });
+  const r = await mat.materialize(snapshot({ generation: 42, allocations: [ALLOC] }));
   const manifest = JSON.parse(r.manifest);
-  const ports = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'projects', 'proj1', '.erix', 'ports.json'), 'utf8'));
+  const ports = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'ports.json'), 'utf8'));
   assert.equal(manifest.generation, 42);
   assert.equal(ports.generation, 42);
   assert.equal(sha256(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'manifest.json'))), sha256(r.manifest));
@@ -313,16 +289,7 @@ test('F1：prevManifest 被篡改含 ../ 时，不删除其他 FDE 的文件（�
     },
   };
 
-  await mat.materialize({
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 2,
-    projects: [],
-    allocationsByProject: new Map(),
-    prevManifest,
-    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
-  });
+  await mat.materialize(snapshot({ generation: 2, prevManifest }));
   // 不抛错（跳过而非 500）；受害文件仍在；且告警记录可疑路径。
   assert.ok(fs.existsSync(victim));
   assert.equal(fs.readFileSync(victim, 'utf8'), 'VICTIM');
@@ -333,16 +300,8 @@ test('F1：prevManifest 被篡改含 ../ 时，不删除其他 FDE 的文件（�
 test('F6：同内容 symlink 拒绝（lstat 不跟随，不静默保留 symlink）', async () => {
   const root = tmpdir();
   const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
-  const snapshot = {
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 1,
-    projects: [],
-    allocationsByProject: new Map(),
-    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
-  };
-  await mat.materialize(snapshot);
+  const snap = snapshot();
+  await mat.materialize(snap);
   const agentsPath = path.join(root, 'alice', 'home', 'AGENTS.md');
   const content = fs.readFileSync(agentsPath, 'utf8');
   // 用 symlink 替换目标文件（指向同内容的他处文件）。
@@ -353,7 +312,7 @@ test('F6：同内容 symlink 拒绝（lstat 不跟随，不静默保留 symlink�
   const prevManifest = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'manifest.json'), 'utf8'));
 
   await assert.rejects(
-    mat.materialize({ ...snapshot, prevManifest }),
+    mat.materialize({ ...snap, prevManifest }),
     /symlink|tampered/,
   );
   fs.rmSync(root, { recursive: true, force: true });
@@ -362,20 +321,14 @@ test('F6：同内容 symlink 拒绝（lstat 不跟随，不静默保留 symlink�
 test('F8：未传 materializedAt 时同快照仍字节级幂等（沿用旧 materialized_at）', async () => {
   const root = tmpdir();
   const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
-  const snapshot = {
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 5,
-    projects: [{ id: 'p1', name: 'proj1' }],
-    allocationsByProject: new Map([['p1', [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }]]]),
-  };
-  const r1 = await mat.materialize(snapshot);
+  const snap = snapshot({ generation: 5, allocations: [ALLOC] });
+  delete snap.materializedAt; // 走默认 new Date()
+  const r1 = await mat.materialize(snap);
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
   const prev = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   const mtime1 = fs.statSync(manifestPath).mtimeMs;
   // 第二次不传 materializedAt（默认 new Date()）→ 内容未变应沿用旧 materialized_at，字节级相同。
-  const r2 = await mat.materialize({ ...snapshot, prevManifest: prev });
+  const r2 = await mat.materialize({ ...snap, prevManifest: prev });
   assert.equal(r1.manifest, r2.manifest);
   assert.equal(fs.statSync(manifestPath).mtimeMs, mtime1);
   fs.rmSync(root, { recursive: true, force: true });
@@ -385,18 +338,7 @@ test('M1：root 内用户自建 .gitignore/AGENTS.md 在 stale 清理后存活�
   const root = tmpdir();
   const warnings = [];
   const mat = createMaterializer({ root, uid: 1000, gid: 1000, log: { warn: (m) => warnings.push(m) } });
-  const proj = { id: 'p1', name: 'proj1' };
-  const alloc = [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }];
-  const before = {
-    fdeName: 'alice',
-    baseDomain: 'localhost',
-    llmBaseUrl: 'http://llm.localhost:8090',
-    generation: 1,
-    projects: [proj],
-    allocationsByProject: new Map([['p1', alloc]]),
-    materializedAt: new Date('2026-09-12T08:30:00.000Z'),
-  };
-  await mat.materialize(before);
+  await mat.materialize(snapshot());
 
   // 用户在 root 内自建嵌套 .gitignore / AGENTS.md（不属于平台管理路径集合）。
   const userGitignore = path.join(root, 'alice', 'projects', 'user', 'repo', '.gitignore');
@@ -411,49 +353,40 @@ test('M1：root 内用户自建 .gitignore/AGENTS.md 在 stale 清理后存活�
   prev.files[`${CONTAINER_HOME}/projects/user/repo/.gitignore`] = { sha256: 'x'.repeat(64), revision: 1 };
   prev.files[`${CONTAINER_HOME}/projects/user/repo/AGENTS.md`] = { sha256: 'y'.repeat(64), revision: 1 };
 
-  // 项目删除 → 平台文件 stale；用户文件虽在 prevManifest 但不在平台管理路径集合 → 必须存活。
-  await mat.materialize({
-    ...before,
-    generation: 2,
-    projects: [],
-    allocationsByProject: new Map(),
-    prevManifest: prev,
-    materializedAt: new Date('2026-09-12T09:00:00.000Z'),
-  });
+  // 平台自己的项目脚手架 stale；用户文件虽在 prevManifest 但不在平台管理路径集合 → 必须存活。
+  const scaffold = seedLegacyProjectScaffold(root, mat);
+  const prev2 = prevManifestWithScaffold(prev);
+  await mat.materialize({ ...snapshot({ generation: 2 }), prevManifest: prev2 });
 
   assert.equal(fs.existsSync(userGitignore), true);
   assert.equal(fs.readFileSync(userGitignore, 'utf8'), 'node_modules/\n');
   assert.equal(fs.existsSync(userAgents), true);
   assert.equal(fs.readFileSync(userAgents, 'utf8'), '# my own agents\n');
 
-  // 平台自己的项目文件仍被清理。
-  assert.equal(fs.existsSync(path.join(root, 'alice', 'projects', 'proj1', '.erix', 'ports.json')), false);
+  // 平台自己的项目脚手架仍被清理。
+  for (const p of Object.values(scaffold)) assert.equal(fs.existsSync(p), false);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('M2：stale-only 变更（仅删 stale）时 materialized_at 更新', async () => {
   const root = tmpdir();
   const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
-  const proj = { id: 'p1', name: 'proj1' };
-  const alloc = [{ scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-proj1-4016.fde.localhost', exposure: 'private', state: 'allocated' }];
   const t1 = new Date('2026-09-12T08:30:00.000Z');
-  await mat.materialize({
-    fdeName: 'alice', baseDomain: 'localhost', llmBaseUrl: 'http://llm.localhost:8090', generation: 1,
-    projects: [proj], allocationsByProject: new Map([['p1', alloc]]), materializedAt: t1,
-  });
+  await mat.materialize(snapshot({ materializedAt: t1 }));
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
-  const prev = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  let prev = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(prev.materialized_at, t1.toISOString());
 
+  // 预置存量项目脚手架（stale 候选）。
+  const scaffold = seedLegacyProjectScaffold(root, mat);
+  prev = prevManifestWithScaffold(prev);
+
   const t2 = new Date('2026-09-12T09:00:00.000Z');
-  // 仅删项目 → 无内容变更，只有 stale 删除 → materialized_at 必须更新到 t2。
-  await mat.materialize({
-    fdeName: 'alice', baseDomain: 'localhost', llmBaseUrl: 'http://llm.localhost:8090', generation: 2,
-    projects: [], allocationsByProject: new Map(), prevManifest: prev, materializedAt: t2,
-  });
+  // 无内容变更，只有 stale 删除 → materialized_at 必须更新到 t2。
+  await mat.materialize({ ...snapshot({ generation: 2 }), prevManifest: prev, materializedAt: t2 });
   const after = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   assert.equal(after.materialized_at, t2.toISOString());
-  assert.equal(fs.existsSync(path.join(root, 'alice', 'projects', 'proj1', '.erix', 'ports.json')), false);
+  for (const p of Object.values(scaffold)) assert.equal(fs.existsSync(p), false);
   fs.rmSync(root, { recursive: true, force: true });
 });
 

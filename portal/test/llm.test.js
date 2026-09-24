@@ -540,8 +540,9 @@ test('D2（Round D 评审）：postMessage 取锁序 chat_sessions → llm-bindi
       const s = sql.replace(/\s+/g, ' ').trim();
       if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [] };
       if (s.includes('pg_advisory_xact_lock')) return { rows: [] };
-      if (s.includes('FROM chat_sessions s') && s.includes('JOIN projects')) {
-        return { rows: [{ id: sessionId, user_id: 'u1', project_id: 'pr1', title: 't', model: null, status: 'active', last_seq: 0, project_name: 'p' }] };
+      // P5：fetchSession 不再 JOIN projects（cwd 为权威绑定，project_id 可空留档）。
+      if (s.includes('FROM chat_sessions s') && s.includes('FOR UPDATE')) {
+        return { rows: [{ id: sessionId, user_id: 'u1', project_id: null, cwd: '~/projects/p', title: 't', model: null, status: 'active', last_seq: 0 }] };
       }
       if (s.includes('FROM runs WHERE session_id')) return { rows: [] };
       if (s.includes('SELECT fde_name FROM users WHERE id')) return { rows: [{ fde_name: 'alice' }] };
