@@ -9,7 +9,7 @@ import { listDirs, fileTree, DirError } from '../src/dirs.js';
 
 function tmpUserspace() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dirs-'));
-  const projects = path.join(root, 'alice', 'home', 'projects');
+  const projects = path.join(root, 'alice', 'projects');
   fs.mkdirSync(projects, { recursive: true });
   return { root, projects };
 }

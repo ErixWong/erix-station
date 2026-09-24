@@ -9,7 +9,7 @@ import { createSession, validateSessionCwd, SessionError } from '../src/sessions
 
 function tmpRoot() {
   const userSpaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-sessions-'));
-  return { userSpaceRoot, projectsRoot: path.join(userSpaceRoot, 'alice', 'home', 'projects') };
+  return { userSpaceRoot, projectsRoot: path.join(userSpaceRoot, 'alice', 'projects') };
 }
 
 function poolWith({ fdeName = 'alice' } = {}) {

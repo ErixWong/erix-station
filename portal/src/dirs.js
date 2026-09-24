@@ -1,7 +1,7 @@
 // P5 目录视图（docs/design/directory-as-project.md §4）：目录下拉 + 目录树的数据源。
 // 依据：设计定稿 §2「项目列表 = DISTINCT cwd ∪ ~/projects/ 一级目录枚举」、§4（目录下拉带运行态
 //       徽标、目录树懒展开单层）、§7 非目标（只读、不递归、不做任意路径手输）。
-// 通道：portal 直读宿主机 bind mount <userSpaceRoot>/<fde>/home/projects/（零容器改动）；
+// 通道：portal 直读宿主机 bind mount <userSpaceRoot>/<fde>/projects/（零容器改动）；
 //       running/queued_count 从 runs 聚合（cwd 匹配）。只读——本模块无任何写路径。
 
 import fs from 'node:fs';
@@ -31,7 +31,7 @@ function isSafeDirName(name) {
  */
 export async function listDirs(pool, { userId, userSpaceRoot, fdeName, log = console } = {}) {
   if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
-  const projectsRoot = path.join(path.resolve(userSpaceRoot), fdeName, 'home', 'projects');
+  const projectsRoot = path.join(path.resolve(userSpaceRoot), fdeName, 'projects');
 
   let names = [];
   try {
@@ -97,7 +97,7 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
     });
   }
   const name = CWD_RE.exec(safeCwd)[1];
-  const root = path.resolve(userSpaceRoot, fdeName, 'home', 'projects', name);
+  const root = path.resolve(userSpaceRoot, fdeName, 'projects', name);
 
   // 根必须真实存在且不是 symlink（目录树只浏览已存在的目录；不存在 = 404）。
   let rootSt;

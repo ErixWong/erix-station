@@ -140,7 +140,7 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
 /**
  * POST /api/sessions —— 建会话（P5：请求体 project_id = 目录名 → 绑定 cwd）。
  * 校验 `~/projects/<name>` 形态（validateSessionCwd）→ 目录存在性确保（不存在则 mkdir，
- * 「＋新建目录」语义；直写 FDE 家目录 bind mount <userSpaceRoot>/<fde>/home/projects/<name>）。
+ * 「＋新建目录」语义；直写 FDE 家目录 bind mount <userSpaceRoot>/<fde>/projects/<name>）。
  * projects 表写入路径已退役：不再要求/不再写 project_id（列留档，迁移 0008 解除 NOT NULL）。
  */
 export async function createSession(pool, { userId, projectId, title, model, config }) {
@@ -171,7 +171,7 @@ export async function createSession(pool, { userId, projectId, title, model, con
   }
   ensureDirSafe(
     userSpaceRoot,
-    path.join(path.resolve(userSpaceRoot), fdeName, 'home', 'projects', name),
+    path.join(path.resolve(userSpaceRoot), fdeName, 'projects', name),
     { mode: 0o2770, uid: config?.fdeUid ?? 1000, gid: config?.fdeGid ?? 1000 },
   );
 
