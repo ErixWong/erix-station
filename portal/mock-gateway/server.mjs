@@ -82,18 +82,33 @@ function mockContent(userContent) {
 }
 
 // ---- tool_calls 支持（WP5 UI 验收：触发词让 agent 真实执行工具，验证浏览器工具卡片渲染） ----
+// USE_SHELL（issue #72/#64 真机 e2e）：触发 shell 工具，命令真实执行 node --version 并在 worktree
+// 写入 untracked 探针文件 shell-probe.txt（供产物回收捕获，issue #64）。优先级高于 USE_TOOL。
 const TOOL_TRIGGER_RE = /用工具|USE_TOOL/i;
+const SHELL_TRIGGER_RE = /USE_SHELL/i;
 const MOCK_TOOL = { id: 'call_mock_tree_1', name: 'tree', args: '{"path":"."}' };
+const MOCK_SHELL_TOOL = {
+  id: 'call_mock_shell_1',
+  name: 'shell',
+  args: JSON.stringify({ command: "node --version && printf 'artifact-probe-from-shell\\n' > shell-probe.txt" }),
+};
+// 最近一次发出的工具名：第二轮（对话含 tool 结果）按此区分 shell / tree 的固定收尾文本。
+let lastToolName = null;
 
 function messagesHaveToolResult(messages) {
   return (Array.isArray(messages) ? messages : []).some((m) => m?.role === 'tool');
 }
 
-function mockToolCall() {
-  return [{ index: 0, id: MOCK_TOOL.id, type: 'function', function: { name: MOCK_TOOL.name, arguments: MOCK_TOOL.args } }];
+function mockToolCall(tool) {
+  const t = tool || MOCK_TOOL;
+  lastToolName = t.name;
+  return [{ index: 0, id: t.id, type: 'function', function: { name: t.name, arguments: t.args } }];
 }
 
 function mockFinalAfterTool() {
+  if (lastToolName === 'shell') {
+    return '（mock）已执行 shell 工具：node --version 输出正常，探针文件 shell-probe.txt 已写入工作目录。';
+  }
   return '（mock）已执行 tree 工具：目录结构与预期一致。这是工具卡片链路的固定收尾响应。';
 }
 
@@ -148,17 +163,19 @@ function handleChat(req, res) {
       const msgs = Array.isArray(body?.messages) ? body.messages : [];
       // 三态：① 对话含 tool 结果 → 收尾文本；② 用户消息带触发词 → 发 tool_call；③ 其它 → 固定回显。
       const mode = messagesHaveToolResult(msgs) ? 'final'
+        : SHELL_TRIGGER_RE.test(extractUserContent(body)) ? 'tool_call_shell'
         : TOOL_TRIGGER_RE.test(extractUserContent(body)) ? 'tool_call' : 'echo';
       const content = mode === 'final' ? mockFinalAfterTool() : mockContent(extractUserContent(body));
 
       if (!stream) {
-        if (mode === 'tool_call') {
+        if (mode === 'tool_call' || mode === 'tool_call_shell') {
+          const toolCalls = mockToolCall(mode === 'tool_call_shell' ? MOCK_SHELL_TOOL : MOCK_TOOL);
           return sendJson(res, 200, {
             id,
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
             model,
-            choices: [{ index: 0, message: { role: 'assistant', tool_calls: mockToolCall() }, finish_reason: 'tool_calls' }],
+            choices: [{ index: 0, message: { role: 'assistant', tool_calls: toolCalls }, finish_reason: 'tool_calls' }],
             usage: usageFor(body),
           });
         }
@@ -179,9 +196,9 @@ function handleChat(req, res) {
         Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
       });
-      if (mode === 'tool_call') {
+      if (mode === 'tool_call' || mode === 'tool_call_shell') {
         const tc = completionChunk(id, model, '', { delta: true });
-        tc.choices[0].delta = { role: 'assistant', tool_calls: mockToolCall() };
+        tc.choices[0].delta = { role: 'assistant', tool_calls: mockToolCall(mode === 'tool_call_shell' ? MOCK_SHELL_TOOL : MOCK_TOOL) };
         res.write(`data: ${JSON.stringify(tc)}\n\n`);
         res.write(`data: ${JSON.stringify(completionChunk(id, model, '', { delta: true, finish: 'tool_calls' }))}\n\n`);
         res.write('data: [DONE]\n\n');
