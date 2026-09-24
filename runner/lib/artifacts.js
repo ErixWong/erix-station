@@ -1,7 +1,7 @@
 // issue #64 R1：run 终态 worktree 产物回收——agentd 侧捕获与上传。
 // 依据：docs/design/runner-integration.md §4.2 U13 / §6.6。
 //
-// 捕获内容（终态确认后、cleanupWorktree/cleanupRunData 之前）：
+// 捕获内容（终态确认后、cleanupWorktree/archiveRunData 之前）：
 //   - git worktree：`git diff HEAD`（含 staged）→ diff.patch；`git status --porcelain` 中
 //     untracked（`??`）新文件 → 快照进 tar。
 //   - 非 git 目录：全量文件清单（排除 .git/node_modules/.notes）。
