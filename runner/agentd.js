@@ -99,6 +99,8 @@ function makeRunCtx(runId) {
     claimToken: null,
     attempt: 1,
     resume: false,
+    // issue #81 P2：transcript key = sessionId（portal ticket 下行）；null = 旧 portal，回退 run 作用域。
+    sessionId: null,
     worker: null,
     workerPid: null,
     // 审计 #34 F-A：worker 退出的可等待句柄（drain 用它等「真退出」而非盲退）
@@ -430,29 +432,62 @@ function prepareWorktree(projectName, runId) {
 }
 
 // ---------------------------------------------------------------------------
-// store_request → internal 端点映射（§9.1）
+// store_request → internal 端点映射（§9.1；issue #81 P2 起 session 维度）
 // ---------------------------------------------------------------------------
-async function handleStoreRequest(ctx, method, args) {
+// transcript key = ctx.sessionId（引擎 store key，worker 以它调用 8 方法并自检与 RUN_START 一致）。
+// P2 起七个方法（appendRound/load/saveCheckpoint/loadLatestCheckpoint/saveRunState/loadRunState/
+// markRunState 终态标记）走新 session 端点 `/transcript/:key/...`；writer fencing = 真 runId 经
+// ?run_id= query 参数 + X-Claim-Token（portal 校验 writer run 属于该 session 且持有效租约）。
+// markRunState('running') 仍走 U2 真 runId（runs 表生命周期，sessionId 绝不进 U2）。
+// 旧 portal（ctx.sessionId = null）→ 全部回退 run 作用域旧端点（向后兼容，语义 = main 现状）。
+
+/** session 键一致性自检：worker 传来的引擎 key 必须等于 RUN_START 下行的 sessionId。 */
+function assertSessionKey(ctx, args) {
+  if (args?.runId !== ctx.sessionId) {
+    throw new Error(`transcript key mismatch: worker sent ${String(args?.runId)}, expect session ${ctx.sessionId}`);
+  }
+  return ctx.sessionId;
+}
+
+async function handleStoreRequest(ctx, method, args, deps = {}) {
+  const request = deps.request ?? internalRequest;
   const runId = ctx.runId;
+  const sessionKey = ctx.sessionId;
+  // session 端点公共 query：writer run（租约 fencing）。
+  const writerQs = `?run_id=${encodeURIComponent(runId)}`;
   switch (method) {
     case 'appendRound': {
+      if (sessionKey) {
+        const key = assertSessionKey(ctx, args);
+        const record = normalizeRoundRecord(key, args?.record);
+        const round = record.round;
+        const r = await withRetry(
+          () => request('PUT', `/transcript/${encodeURIComponent(key)}/rounds/${round}${writerQs}`, { body: record, claimToken: ctx.claimToken }),
+          { what: `appendRound key=${key} round=${round}` },
+        );
+        return r.data;
+      }
       const record = normalizeRoundRecord(runId, args?.record);
       const round = record.round;
       const r = await withRetry(
-        () => internalRequest('PUT', `/runs/${runId}/transcript/rounds/${round}`, { body: record, claimToken: ctx.claimToken }),
+        () => request('PUT', `/runs/${runId}/transcript/rounds/${round}`, { body: record, claimToken: ctx.claimToken }),
         { what: `appendRound run=${runId} round=${round}` },
       );
       return r.data;
     }
     case 'load': {
-      // U6 分页循环拉全量（runner §9.1 注：超出 10000 轮时循环；P1 单页足够）。
+      // 分页循环拉全量（runner §9.1 注：超出 10000 轮时循环；P1 单页足够）。
       const records = [];
       let cursor = null;
+      const basePath = sessionKey
+        ? `/transcript/${encodeURIComponent(assertSessionKey(ctx, args))}`
+        : `/runs/${runId}/transcript`;
       for (;;) {
-        const q = cursor == null ? '?limit=10000' : `?limit=10000&cursor=${cursor}`;
+        const paging = cursor == null ? 'limit=10000' : `limit=10000&cursor=${cursor}`;
+        const qs = sessionKey ? `?${paging}&run_id=${encodeURIComponent(runId)}` : `?${paging}`;
         const r = await withRetry(
-          () => internalRequest('GET', `/runs/${runId}/transcript${q}`, { claimToken: ctx.claimToken }),
-          { what: `load run=${runId}` },
+          () => request('GET', `${basePath}${qs}`, { claimToken: ctx.claimToken }),
+          { what: `load ${sessionKey ? `key=${sessionKey}` : `run=${runId}`}` },
         );
         records.push(...(r.data?.records ?? []));
         cursor = r.data?.next_cursor ?? null;
@@ -466,34 +501,61 @@ async function handleStoreRequest(ctx, method, args) {
       if (args?.toRound != null) qs.set('to_round', String(args.toRound));
       qs.set('pattern', String(args?.pattern ?? ''));
       const r = await withRetry(
-        () => internalRequest('GET', `/runs/${runId}/transcript/recall?${qs.toString()}`, { claimToken: ctx.claimToken }),
+        () => request('GET', `/runs/${runId}/transcript/recall?${qs.toString()}`, { claimToken: ctx.claimToken }),
         { what: `recall run=${runId}` },
       );
       return r.data;
     }
     case 'markRunState': {
-      // 'running' → U2 /state（runs.status）；引擎终态标记（succeeded/unverified_error/guard_error）
-      // → runstate 端点合并进 runs.run_state blob（不动 runs.status，终态仍由 U2 上报，§6.3-9）。
+      // 双路语义（issue #81 P2，容易错）：
+      // 'running' → U2 /runs/:真runId/state（runs 表生命周期，sessionId 绝不进 U2）；
+      // 引擎终态标记（succeeded/unverified_error/guard_error）→ session transcript runstate
+      // 合并写（键 = args.runId = sessionId，writer fencing = 真 runId）。
       const state = args?.state ?? 'running';
-      const endpoint = state === 'running' ? 'state' : 'runstate';
+      if (state === 'running' || !sessionKey) {
+        const endpoint = state === 'running' ? 'state' : 'runstate';
+        const r = await withRetry(
+          () => request('PUT', `/runs/${runId}/${endpoint}`, { body: { state }, claimToken: ctx.claimToken }),
+          { what: `markRunState run=${runId} state=${state}` },
+        );
+        return r.data;
+      }
+      const key = assertSessionKey(ctx, args);
       const r = await withRetry(
-        () => internalRequest('PUT', `/runs/${runId}/${endpoint}`, { body: { state }, claimToken: ctx.claimToken }),
-        { what: `markRunState run=${runId} state=${state}` },
+        () => request('PUT', `/transcript/${encodeURIComponent(key)}/runstate${writerQs}`, { body: { state }, claimToken: ctx.claimToken }),
+        { what: `markRunState key=${key} state=${state}` },
       );
       return r.data;
     }
     case 'saveRunState': {
       // 0.6.0 起引擎持久化确定性 run state（run 前 fail-closed 校验 8 方法之一）。
       const runState = args?.runState ?? {};
+      if (sessionKey) {
+        const key = assertSessionKey(ctx, args);
+        const r = await withRetry(
+          () => request('PUT', `/transcript/${encodeURIComponent(key)}/runstate${writerQs}`, { body: { run_state: runState }, claimToken: ctx.claimToken }),
+          { what: `saveRunState key=${key}` },
+        );
+        return r.data;
+      }
       const r = await withRetry(
-        () => internalRequest('PUT', `/runs/${runId}/runstate`, { body: { run_state: runState }, claimToken: ctx.claimToken }),
+        () => request('PUT', `/runs/${runId}/runstate`, { body: { run_state: runState }, claimToken: ctx.claimToken }),
         { what: `saveRunState run=${runId}` },
       );
       return r.data;
     }
     case 'loadRunState': {
+      if (sessionKey) {
+        const key = assertSessionKey(ctx, args);
+        const r = await withRetry(
+          () => request('GET', `/transcript/${encodeURIComponent(key)}/runstate${writerQs}`, { claimToken: ctx.claimToken }),
+          { what: `loadRunState key=${key}` },
+        );
+        log('info', 'store loadRunState', { session_key: key, restored: r?.data?.run_state != null });
+        return r.data; // {run_state} 或 204 → null
+      }
       const r = await withRetry(
-        () => internalRequest('GET', `/runs/${runId}/runstate`, { claimToken: ctx.claimToken }),
+        () => request('GET', `/runs/${runId}/runstate`, { claimToken: ctx.claimToken }),
         { what: `loadRunState run=${runId}` },
       );
       // F3（issue #43 评审）：loadRunState 仅引擎 resume 路径调用（attempt ≥ 2 的 re-claim）。
@@ -505,15 +567,31 @@ async function handleStoreRequest(ctx, method, args) {
     case 'saveCheckpoint': {
       const revision = Number(args?.revision ?? 0);
       const snapshot = args?.snapshot ?? {};
+      if (sessionKey) {
+        const key = assertSessionKey(ctx, args);
+        const r = await withRetry(
+          () => request('PUT', `/transcript/${encodeURIComponent(key)}/checkpoint${writerQs}`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
+          { what: `saveCheckpoint key=${key} rev=${revision}` },
+        );
+        return r.data;
+      }
       const r = await withRetry(
-        () => internalRequest('PUT', `/runs/${runId}/checkpoint`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
+        () => request('PUT', `/runs/${runId}/checkpoint`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
         { what: `saveCheckpoint run=${runId} rev=${revision}` },
       );
       return r.data;
     }
     case 'loadLatestCheckpoint': {
+      if (sessionKey) {
+        const key = assertSessionKey(ctx, args);
+        const r = await withRetry(
+          () => request('GET', `/transcript/${encodeURIComponent(key)}/checkpoint/latest${writerQs}`, { claimToken: ctx.claimToken }),
+          { what: `loadLatestCheckpoint key=${key}` },
+        );
+        return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
+      }
       const r = await withRetry(
-        () => internalRequest('GET', `/runs/${runId}/checkpoint/latest`, { claimToken: ctx.claimToken }),
+        () => request('GET', `/runs/${runId}/checkpoint/latest`, { claimToken: ctx.claimToken }),
         { what: `loadLatestCheckpoint run=${runId}` },
       );
       return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
@@ -951,6 +1029,7 @@ async function handleTicket(ticket) {
   ctx.claimToken = ticket.claim_token;
   ctx.attempt = Number(run.attempt ?? 1);
   ctx.resume = run.resume === true;
+  ctx.sessionId = typeof run.session_id === 'string' && run.session_id.length > 0 ? run.session_id : null;
   state.runs.set(runId, ctx);
 
   let cwd;
@@ -988,6 +1067,8 @@ async function handleTicket(ticket) {
   const runStart = {
     run_id: runId,
     session_id: run.session_id ?? null,
+    // issue #81 P2：message_id 下行（transcript 预写 dedupKey = `<sessionId>:input:<messageId>`）。
+    message_id: run.message_id ?? null,
     attempt: ctx.attempt,
     task: run.task ?? '',
     cwd,
@@ -1204,4 +1285,4 @@ if (isDirectRun) {
 
 // 测试导出（issue #64：终态清场路径的捕获触发用 node:test + stub fetch 覆盖；非对外契约）。
 // issue #79：initialHeartbeatGate/state 供冷启动顺序单测注入桩断言（非对外契约）。
-export { onWorkerFinished, onWorkerExit, initialHeartbeatGate, state };
+export { onWorkerFinished, onWorkerExit, initialHeartbeatGate, state, handleStoreRequest };
