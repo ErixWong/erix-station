@@ -20,7 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
-import { cleanupRunData, prepareRunDataDir, sweepRunDataDir } from './lib/run-data.js';
+import { archiveRunData, prepareRunDataDir, sweepRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -56,6 +56,10 @@ const CFG = {
   // 必须保留窗口远大于「崩溃 → portal re-claim 同 run（resume）」的间隔，否则会把待 resume
   // 的 notes 当残留删光（race 推导见 runner/lib/run-data.js sweepRunDataDir 头注释）。
   runDataTtlHours: Number(process.env.ERIX_RUN_DATA_TTL_HOURS || 24),
+  // issue #64 R1 配套（conversation-state.md §5 P1）：runs-archive/ 归档保留期（小时），
+  // 默认 168h=7 天；0 = 禁用归档清扫（一律保留，纯人工/运维兜底）。
+  // 用 ?? 而非 ||：显式 0 必须生效（禁用语义），不能被默认值覆盖。
+  archiveTtlHours: Number(process.env.ERIX_ARCHIVE_TTL_HOURS ?? 168),
 };
 
 // 批处理单批上限（§7.2）。
@@ -788,9 +792,9 @@ function onWorkerExit(ctx, code, signal) {
       state.pendingReports.add(p);
       // issue #64 R1：stop 路径是终态（补报 aborted）→ worktree 移除前先捕获产物（best-effort），
       // 捕获完成后照常清场（含 run 数据目录）。lease_lost/revoked 非本端收敛 → 走下方 else 不捕获。
-      captureRunArtifact(ctx).finally(() => cleanupRun(ctx, { purgeRunData: true }));
+      captureRunArtifact(ctx).finally(() => cleanupRun(ctx, { archiveRunData: true }));
     } else {
-      cleanupRun(ctx, { purgeRunData: false });
+      cleanupRun(ctx, { archiveRunData: false });
     }
     return;
   }
@@ -843,7 +847,7 @@ async function onWorkerFinished(ctx, msg) {
   }
   // issue #64 R1：终态确认后、清场前捕获产物（best-effort，不阻塞）。
   if (runTerminalConfirmed) await captureRunArtifact(ctx);
-  cleanupRun(ctx, { purgeRunData: runTerminalConfirmed });
+  cleanupRun(ctx, { archiveRunData: runTerminalConfirmed });
 }
 
 /**
@@ -871,7 +875,7 @@ async function captureRunArtifact(ctx) {
   return result;
 }
 
-function cleanupRun(ctx, { purgeRunData = false } = {}) {
+function cleanupRun(ctx, { archiveRunData: shouldArchive = false } = {}) {
   if (ctx.flushTimer) { clearTimeout(ctx.flushTimer); ctx.flushTimer = null; }
   if (ctx.worker) {
     const pid = ctx.workerPid;
@@ -888,16 +892,18 @@ function cleanupRun(ctx, { purgeRunData = false } = {}) {
     }
   }
   cleanupWorktree(ctx); // M3
-  // issue #46：run 数据目录仅在终态清理（purgeRunData=true，onWorkerFinished 收敛成功后）；
-  // releaseAndRequeue（resume/崩溃重排队）与 lease_lost 路径绝不删——attempt 间 notes 必须保留。
-  if (purgeRunData) cleanupRunData({ home: CFG.home, runId: ctx.runId, workerUid: CFG.workerUid, workerGid: CFG.workerGid, log });
+  // issue #46 + #64 R1 配套：run 数据目录仅在终态清理（archiveRunData=true，onWorkerFinished 收敛成功后）
+  // **归档**（runs/ → runs-archive/，conversation-state.md §5 P1 真相层归档 TTL 替代物理删除）；
+  // releaseAndRequeue（resume/崩溃重排队）与 lease_lost 路径绝不归档——attempt 间 notes 必须保留。
+  if (shouldArchive) archiveRunData({ home: CFG.home, runId: ctx.runId, workerUid: CFG.workerUid, workerGid: CFG.workerGid, log });
   state.runs.delete(ctx.runId);
-  log('info', 'run cleaned up', { run_id: ctx.runId, purge_run_data: purgeRunData });
+  log('info', 'run cleaned up', { run_id: ctx.runId, archived: shouldArchive });
 }
 
-// run 数据目录生命周期（issue #46，选项 A）实现在 ./lib/run-data.js：
-// <CFG.home>/runs/<runId>/notes/ 跨 attempt 保留（resume 可读前序 attempt 的 notes），
-// 与 worktree 生命周期完全解耦；终态清理 + 启动 sweep（mtime TTL，race 推导见该文件头注释）。
+// run 数据目录生命周期（issue #46 选项 A + #64 R1 配套归档修正）实现在 ./lib/run-data.js：
+// <CFG.home>/runs/<runId>/notes/ 跨 attempt 保留（resume 可读前序 attempt 的 notes），与 worktree
+// 生命周期完全解耦；终态确认后归档（runs-archive/），启动 sweep 双扫描（runs/ 残留 TTL +
+// runs-archive/ 归档 TTL，race 推导见该文件头注释）。
 
 // M3：清理 run 的 worktree——真实 git worktree 用 `git worktree remove --force`；
 // 兑底目录（mkdir fallback）直接 rmSync；之后 prune 残留元数据。best-effort。
@@ -1144,12 +1150,13 @@ async function main() {
   process.umask(0o002);
   log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
 
-  // issue #46：清扫上次运行残留的 run 数据目录（终态清理失败/异常退出遗留）。
-  // 必须在 claimLoop 之前调用；只删 mtime 超过保留期的目录——崩溃后待 resume re-claim 的
-  // run 目录 mtime 新鲜必然保留（race 推导见 runner/lib/run-data.js 头注释）。
+  // issue #46 + #64 R1 配套：清扫上次运行残留的 run 数据目录（终态归档失败/异常退出遗留）与
+  // 超归档 TTL 的 runs-archive/ 目录。必须在 claimLoop 之前调用；只删 mtime 超过保留期的目录
+  // ——崩溃后待 resume re-claim 的 run 目录 mtime 新鲜必然保留（race 推导见 runner/lib/run-data.js 头注释）。
   sweepRunDataDir({
     home: CFG.home,
     ttlHours: CFG.runDataTtlHours,
+    archiveTtlHours: CFG.archiveTtlHours,
     workerUid: CFG.workerUid,
     workerGid: CFG.workerGid,
     log,
