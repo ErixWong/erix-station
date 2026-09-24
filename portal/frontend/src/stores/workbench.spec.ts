@@ -1,5 +1,6 @@
-// workbench store 单测：草稿三路径、addMessage 去重/渲染规则、发送失败回填、
-// 会话加载守卫、深链解析（列表内/跨项目/404 静默回退）。语义锚点：旧 index.html 内联 JS。
+// workbench store 单测（issue #84 P5 改版）：目录即项目——/api/dirs 数据源、cwd 过滤、
+// createDir（POST /api/sessions {cwd}）、selectDir 复位语义、跨目录深链。
+// 语义锚点：旧 index.html 内联 JS + 本 store 头注。消息/草稿/发送守卫用例不受 P5 影响，保留。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { setWorkbenchHooks, useWorkbenchStore } from './workbench';
@@ -31,44 +32,190 @@ function mockFetch(handler: (url: string, init?: RequestInit) => { status: numbe
   }));
 }
 
+/** 捕获最近一次 POST /api/sessions 的请求体（createSession/createDir 断言用）。 */
+let lastSessionPostBody: unknown = null;
+
 beforeEach(() => {
   setActivePinia(createPinia());
   FakeEventSource.instances = [];
+  lastSessionPostBody = null;
   vi.stubGlobal('EventSource', FakeEventSource);
   vi.stubGlobal('alert', vi.fn());
   setWorkbenchHooks({});
 });
 
 const USER = { role: 'fde', fde_name: 'alice' };
+const DIR_A = { name: 'demo', cwd: '~/projects/demo', running_count: 1, queued_count: 1 };
+const DIR_B = { name: 'other', cwd: '~/projects/other', running_count: 0, queued_count: 0 };
 
-describe('workbench store', () => {
-  it('initWorkspace：无项目 → noProject 禁用态；有项目 → 加载会话列表', async () => {
-    mockFetch(() => ({ status: 200, body: { items: [] } }));
+/** 标准 handler：/api/dirs 返回 [DIR_A, DIR_B]；/api/sessions 按 cwd 参数分派。 */
+function dirsAwareHandler(lists: Record<string, unknown[]>) {
+  return (url: string, init?: RequestInit) => {
+    if (url.startsWith('/api/dirs')) return { status: 200, body: { dirs: [DIR_A, DIR_B] } };
+    if (url.startsWith('/api/sessions') && init?.method === 'POST') {
+      lastSessionPostBody = JSON.parse(String(init.body));
+      return { status: 200, body: { session: { id: 's-new', cwd: (lastSessionPostBody as { cwd: string }).cwd } } };
+    }
+    const m = url.match(/[?&]cwd=([^&]*)/);
+    const cwd = m ? decodeURIComponent(m[1]) : '';
+    return { status: 200, body: { items: lists[cwd] ?? [] } };
+  };
+}
+
+describe('workbench store（P5 目录即项目）', () => {
+  it('initWorkspace：无目录 → noDir 禁用态；有目录 → 选中第一个目录并加载其会话', async () => {
+    mockFetch(() => ({ status: 200, body: { dirs: [] } }));
     const store = useWorkbenchStore();
     await store.initWorkspace(USER);
-    expect(store.noProject).toBe(true);
-    expect(store.inputPlaceholder).toBe('先创建项目');
+    expect(store.noDir).toBe(true);
+    expect(store.inputPlaceholder).toBe('先创建目录');
     expect(store.sessions).toEqual([]);
 
-    mockFetch((url) => url.startsWith('/api/projects')
-      ? { status: 200, body: { items: [{ id: 'p1', name: 'demo' }] } }
-      : { status: 200, body: { items: [{ id: 's1', title: 't' }] } });
+    mockFetch(dirsAwareHandler({ '~/projects/demo': [{ id: 's1', title: 't', cwd: '~/projects/demo' }] }));
     const store2 = useWorkbenchStore();
     await store2.initWorkspace(USER);
-    expect(store2.noProject).toBe(false);
-    expect(store2.projectId).toBe('p1');
+    expect(store2.noDir).toBe(false);
+    expect(store2.dirCwd).toBe('~/projects/demo');
+    expect(store2.currentDir?.name).toBe('demo');
     expect(store2.sessions.map((s) => s.id)).toEqual(['s1']);
   });
 
-  it('平台管理员空态：newProj 禁用 + 管理台引导 placeholder', async () => {
-    mockFetch(() => ({ status: 200, body: { items: [] } }));
+  it('loadSessions：带 ?cwd= 请求 + 响应 cwd 防御性过滤（契约差异期双保险）', async () => {
+    mockFetch(dirsAwareHandler({
+      // 后端未过滤干净的脏数据：混入别的目录的会话，前端须滤掉
+      '~/projects/demo': [
+        { id: 's1', cwd: '~/projects/demo' },
+        { id: 's-x', cwd: '~/projects/other' },
+      ],
+    }));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    expect(store.sessions.map((s) => s.id)).toEqual(['s1']); // s-x 被客户端过滤
+    const fetchMock = vi.mocked(fetch);
+    expect(String(fetchMock.mock.calls.find(([u]) => String(u).startsWith('/api/sessions'))?.[0]))
+      .toContain('cwd=' + encodeURIComponent('~/projects/demo'));
+  });
+
+  it('平台管理员空态：newDir 禁用 + 管理台引导 placeholder', async () => {
+    mockFetch(() => ({ status: 200, body: { dirs: [] } }));
     const store = useWorkbenchStore();
     await store.initWorkspace({ role: 'admin', fde_name: null });
     expect(store.isPlatformAdmin).toBe(true);
-    expect(store.newProjDisabled).toBe(true);
+    expect(store.newDirDisabled).toBe(true);
     expect(store.inputPlaceholder).toBe('平台管理员：请到管理台创建 FDE 用户与分配资源');
   });
 
+  it('createSession：POST /api/sessions 请求体为 {cwd}（project_id 已退役）', async () => {
+    mockFetch(dirsAwareHandler({}));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    const s = await store.createSession();
+    expect(s?.id).toBe('s-new');
+    expect(lastSessionPostBody).toEqual({ cwd: '~/projects/demo' });
+    expect(store.sessions[0]?.id).toBe('s-new'); // 列表置顶
+  });
+
+  it('createDir：非法名本地校验不发请求；合法名以该 cwd 建会话（服务端 mkdir），切目录并置顶', async () => {
+    mockFetch(dirsAwareHandler({}));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+
+    const bad = await store.createDir('Bad_Name');
+    expect(bad.error).toContain('目录名必须符合');
+    expect(lastSessionPostBody).toBeNull(); // 未发请求
+
+    const ok = await store.createDir('my-app');
+    expect(ok.error).toBeNull();
+    expect(lastSessionPostBody).toEqual({ cwd: '~/projects/my-app' });
+    expect(store.dirCwd).toBe('~/projects/my-app');
+    expect(store.dirs.some((d) => d.cwd === '~/projects/my-app')).toBe(true);
+    expect(store.sessions[0]?.id).toBe('s-new'); // 新会话置顶，视图可打开
+    expect(store.noDir).toBe(false);
+  });
+
+  it('refreshDirs：选中目录仍在 → 不动；已消失 → 回退第一个目录并重载会话', async () => {
+    let dirs = [DIR_A, DIR_B];
+    mockFetch((url) => {
+      if (url.startsWith('/api/dirs')) return { status: 200, body: { dirs } };
+      const m = url.match(/[?&]cwd=([^&]*)/);
+      const cwd = m ? decodeURIComponent(m[1]) : '';
+      const lists: Record<string, unknown[]> = {
+        '~/projects/demo': [{ id: 's1', cwd: '~/projects/demo' }],
+        '~/projects/other': [{ id: 's2', cwd: '~/projects/other' }],
+      };
+      return { status: 200, body: { items: lists[cwd] ?? [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER); // 选中 demo
+    await store.refreshDirs(); // 目录未变 → 会话列表不重载（dirCwd 不变）
+    expect(store.dirCwd).toBe('~/projects/demo');
+
+    dirs = [DIR_B]; // demo 从磁盘消失
+    await store.refreshDirs();
+    expect(store.dirCwd).toBe('~/projects/other');
+    expect(store.sessions.map((s) => s.id)).toEqual(['s2']);
+  });
+
+  it('selectDir：保存并清空草稿、复位协议状态、按 cwd 重载会话（序号守卫丢弃迟到响应）', async () => {
+    const lists: Record<string, unknown[]> = {
+      '~/projects/demo': [{ id: 's-old', title: '旧', cwd: '~/projects/demo' }],
+      '~/projects/other': [{ id: 's-new', title: '新', cwd: '~/projects/other' }],
+    };
+    mockFetch(dirsAwareHandler(lists));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    store.sessionId = 's1';
+    store.inputValue = '目录 A 的草稿';
+    store.es.activeRunId = 'r1';
+    await store.selectDir('~/projects/other');
+    expect(store.dirCwd).toBe('~/projects/other');
+    expect(store.sessionId).toBeNull();
+    expect(store.inputValue).toBe('');
+    expect(store.drafts.get('s1')).toBe('目录 A 的草稿'); // 离开会话已保存
+    expect(store.es.activeRunId).toBeNull();
+    expect(store.sessions.map((s) => s.id)).toEqual(['s-new']);
+  });
+
+  it('深链解析：列表内直开；跨目录切目录后打开并写回深链；404 静默回退', async () => {
+    mockFetch((url) => {
+      if (url.startsWith('/api/dirs')) return { status: 200, body: { dirs: [DIR_A] } };
+      if (url.includes('/api/sessions/deep')) {
+        return { status: 200, body: { session: { id: 'deep', cwd: '~/projects/other' }, messages: [], last_seq: 0 } };
+      }
+      if (url.includes('/api/sessions/in-list')) {
+        return { status: 200, body: { session: { id: 'in-list', cwd: '~/projects/demo' }, messages: [], last_seq: 0 } };
+      }
+      if (url.includes('cwd=' + encodeURIComponent('~/projects/other'))) return { status: 200, body: { items: [] } };
+      return { status: 200, body: { items: [{ id: 'in-list', title: 't', cwd: '~/projects/demo' }] } };
+    });
+    const restored: string[] = [];
+    setWorkbenchHooks({ onDeepLinkRestored: (sid) => restored.push(sid) });
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    expect(store.dirCwd).toBe('~/projects/demo');
+    expect(store.sessions.map((s) => s.id)).toEqual(['in-list']);
+
+    // 列表内深链：直开（当前目录列表命中）
+    await store.resolveRouteSession('in-list');
+    expect(store.sessionId).toBe('in-list');
+
+    // 跨目录深链：detail → 切目录 → 打开 → 写回深链（目录列表合成兜底项）
+    await store.resolveRouteSession('deep');
+    expect(store.dirCwd).toBe('~/projects/other');
+    expect(store.dirs.some((d) => d.cwd === '~/projects/other')).toBe(true);
+    expect(store.sessionId).toBe('deep');
+    expect(restored).toEqual(['deep']);
+
+    // 404 深链：静默回退（sessionId 清空，不抛错）
+    mockFetch((url) => url.includes('/api/sessions/nope')
+      ? { status: 404, body: { error: { code: 'not_found', message: 'not found' } } }
+      : { status: 200, body: { items: [] } });
+    await store.resolveRouteSession('nope');
+    expect(store.sessionId).toBeNull();
+  });
+});
+
+describe('workbench store（P5 前既有语义，回归保留）', () => {
   it('addMessage：renderedIds 去重；助手终稿走 markdown，user/synthetic 纯文本', async () => {
     mockFetch(() => ({ status: 200, body: { items: [] } }));
     const store = useWorkbenchStore();
@@ -104,7 +251,7 @@ describe('workbench store', () => {
     // 真实流程：切走（saveDraft 存草稿）→ 切回恢复
     store.sessionId = 's1';
     store.inputValue = '半截任务';
-    store.sessionId = null; // 切走（旧 openSession/switchProject 先 saveDraft）
+    store.sessionId = null; // 切走（旧 openSession/selectDir 先 saveDraft）
     store.sessionId = 's1';
     store.saveDraft();
     store.sessionId = null;
@@ -186,62 +333,5 @@ describe('workbench store', () => {
     expect(store2.sessionId).toBe('ghost'); // 其他错误：保留（可刷新重试）
     expect(store2.entries.some((e) => e.kind === 'syserr' && e.text === '会话加载失败，可刷新重试')).toBe(true);
     expect(clearRoute).toHaveBeenCalledTimes(1); // 不再清路由
-  });
-
-  it('深链解析：列表内直开；跨项目切项目后打开并写回深链；404 静默回退', async () => {
-    mockFetch((url) => {
-      if (url.startsWith('/api/projects')) return { status: 200, body: { items: [{ id: 'p1', name: 'a' }] } };
-      if (url.includes('/api/sessions/deep')) return { status: 200, body: { session: { id: 'deep', project_id: 'p2' }, messages: [], last_seq: 0 } };
-      if (url.includes('/api/sessions/in-list')) return { status: 200, body: { session: { id: 'in-list', project_id: 'p1' }, messages: [], last_seq: 0 } };
-      if (url.includes('project_id=p2')) return { status: 200, body: { items: [] } };
-      return { status: 200, body: { items: [{ id: 'in-list', title: 't' }] } };
-    });
-    const restored: string[] = [];
-    setWorkbenchHooks({ onDeepLinkRestored: (sid) => restored.push(sid) });
-    const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
-    expect(store.projectId).toBe('p1');
-    expect(store.sessions.map((s) => s.id)).toEqual(['in-list']);
-
-    // 列表内深链：直开（当前项目列表命中）
-    await store.resolveRouteSession('in-list');
-    expect(store.sessionId).toBe('in-list');
-
-    // 跨项目深链：detail → 切项目 → 打开 → 写回深链
-    await store.resolveRouteSession('deep');
-    expect(store.projectId).toBe('p2');
-    expect(store.sessionId).toBe('deep');
-    expect(restored).toEqual(['deep']);
-
-    // 404 深链：静默回退（sessionId 清空，不抛错）
-    mockFetch((url) => url.includes('/api/sessions/nope')
-      ? { status: 404, body: { error: { code: 'not_found', message: 'not found' } } }
-      : { status: 200, body: { items: [] } });
-    await store.resolveRouteSession('nope');
-    expect(store.sessionId).toBeNull();
-  });
-
-  it('switchProject：保存并清空草稿、复位协议状态、重载会话（序号守卫丢弃迟到响应）', async () => {
-    const responses: Record<string, unknown> = {
-      p1: [{ id: 's-old', title: '旧' }],
-      p2: [{ id: 's-new', title: '新' }],
-    };
-    mockFetch((url) => {
-      if (url.startsWith('/api/projects')) return { status: 200, body: { items: [{ id: 'p1' }, { id: 'p2' }] } };
-      const m = url.match(/project_id=(p\d)/);
-      return { status: 200, body: { items: responses[m?.[1] ?? ''] ?? [] } };
-    });
-    const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
-    store.sessionId = 's1';
-    store.inputValue = '项目 A 的草稿';
-    store.es.activeRunId = 'r1';
-    await store.switchProject('p2');
-    expect(store.projectId).toBe('p2');
-    expect(store.sessionId).toBeNull();
-    expect(store.inputValue).toBe('');
-    expect(store.drafts.get('s1')).toBe('项目 A 的草稿'); // 离开会话已保存
-    expect(store.es.activeRunId).toBeNull();
-    expect(store.sessions.map((s) => s.id)).toEqual(['s-new']);
   });
 });

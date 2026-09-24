@@ -72,8 +72,22 @@ onMounted(async () => {
 
 // ---- issue #55 B4：移动端抽屉（≤768px，Tailwind max-md: 变体替代旧 offcanvas 桥接）----
 const drawerOpen = ref(false);
-// 切项目/切会话（离开会话）时收起抽屉——旧 switchProject/openSession 的 classList.remove('drawer-open')。
-watch([() => store.projectId, () => store.sessionId], () => { drawerOpen.value = false; });
+// 切目录/切会话（离开会话）时收起抽屉——旧 switchProject/openSession 的 classList.remove('drawer-open')。
+watch([() => store.dirCwd, () => store.sessionId], () => { drawerOpen.value = false; });
+
+// ---- issue #84 P5.4：顶栏 cwd 徽标（📁 短名；hover 全路径；点击复制）----
+const dirShortName = computed(() => store.currentDir?.name ?? store.dirCwd?.split('/').pop() ?? '');
+const copied = ref(false);
+let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+async function copyCwd() {
+  if (!store.dirCwd) return;
+  try {
+    await navigator.clipboard.writeText(store.dirCwd);
+    copied.value = true;
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => { copied.value = false; }, 1500);
+  } catch { /* 剪贴板不可用（非安全上下文等）：静默降级，title 仍可看全路径 */ }
+}
 
 // ---- issue #55 A2：自动跟随 + 「↓ 最新」悬浮按钮（AUTO_FOLLOW_GAP=80）----
 const streamEl = ref<HTMLElement | null>(null);
@@ -117,6 +131,14 @@ function jumpToLatest() {
         @click="drawerOpen = !drawerOpen"
       >☰ 导航</button>
       <h1 class="text-xl font-medium">FDE Station</h1>
+      <!-- issue #84 P5.4：cwd 徽标（📁 短名；hover 显示全路径；点击复制） -->
+      <button
+        v-if="store.dirCwd"
+        type="button"
+        class="rounded-md border border-black/10 px-2 py-0.5 text-sm hover:bg-black/5"
+        :title="`${store.dirCwd}（点击复制）`"
+        @click="copyCwd"
+      >📁 {{ dirShortName }}<span v-if="copied" class="text-black/40"> 已复制</span></button>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">管理台</router-link>
       <button
