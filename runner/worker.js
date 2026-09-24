@@ -27,6 +27,7 @@ import { createFileTools, createJail } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
+import { planTranscriptSeed } from './lib/transcript-seed.js';
 import { mapHistoryToInitialMessages } from './lib/history.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
@@ -179,12 +180,19 @@ async function startRun(msg) {
   attempt = Number(msg.attempt ?? 1);
   abortController = new AbortController();
 
-  const { task, cwd, resume } = msg;
+  const { task, cwd } = msg;
   const modelConfigPath = msg.config?.model_config_path || '/home/erix/.erix/config.json';
 
-  // store adapter（§9；IPC transport：store_request → agentd 转发；0.9.0 起引擎 fail-closed 校验 8 方法）。
-  const store = makeStore(runId, {
+  // issue #81 P2（conversation-state.md §4.1）：transcript key = sessionId（引擎 runToolLoop 的
+  // store key），runId 退回纯运维身份（事件流/IPC）。store adapter 双身份：engine 面 key=sessionId，
+  // U2 'running' 面真 runId（makeStore 第二参，见 store.js 头注释）。旧 ticket 无 session_id →
+  // 回退 runId（旧 portal 兼容，agentd 侧走 run 作用域旧端点）。
+  const sessionId = typeof msg.session_id === 'string' && msg.session_id.length > 0 ? msg.session_id : null;
+  const messageId = typeof msg.message_id === 'string' && msg.message_id.length > 0 ? msg.message_id : null;
+  const transcriptKey = sessionId ?? runId;
+  const store = makeStore(transcriptKey, {
     request: (method, args) => ipcRequest(MSG.STORE_REQUEST, { method, args }),
+    runId,
   });
 
   // 1) provider（§6.3-1：config.json 占位 key + endpoint；真实 key 由 Traefik 注入）。
@@ -244,6 +252,39 @@ async function startRun(msg) {
     return registry.executeTool(options.name, options.input, options.context);
   };
 
+  // issue #81 P2：CLI「预写入 + resume」模式（planTranscriptSeed 三分支，见 lib/transcript-seed.js）：
+  // 空本子 → 不 resume（initialMessages/initialUserMessage 全新路径，引擎 round 0 种子入档）；
+  // 新消息未入档 → 宿主预写 dedupKey=`<key>:input:<messageId>` → resume=true；
+  // 已入档（崩溃重跑）→ 直接 resume=true 不重复写（幂等红线）。
+  // resume=true 对齐 repl.js:656：不传 initialMessages/initialUserMessage（恢复记录即完整上文）。
+  // ⚠️ 放在 runToolLoop 主 try 之外：load/预写失败 = 崩溃语义（exit 1 无 RUN_FINISHED）——
+  // agentd 视同为 worker 崩溃走 releaseAndRequeue（attempt+1 重试，dedupKey 幂等收敛）；
+  // 不发 RUN_FINISHED failed（那才是 U2 终态，瞬时不应把用户 run 打死）。
+  let transcriptPlan = { resume: msg.resume === true, record: null };
+  if (sessionId && messageId) {
+    try {
+      const records = await store.load(transcriptKey);
+      transcriptPlan = planTranscriptSeed({
+        records, transcriptKey, messageId, attempt, task, legacyResume: msg.resume === true,
+      });
+      if (transcriptPlan.record) {
+        await store.appendRound(transcriptKey, transcriptPlan.record);
+        sendIpc(process, {
+          type: MSG.LOG, run_id: runId, level: 'info',
+          msg: `transcript prewrite: key=${transcriptKey} round=${transcriptPlan.record.round} dedup=${transcriptPlan.record.dedupKey}`,
+        });
+      }
+    } catch (err) {
+      sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: `transcript seed failed, exit for requeue: ${String(err?.message ?? err)}`,
+      });
+      // 延迟退出让 LOG 入队（同 finally 的 200ms 约定）。
+      setTimeout(() => process.exit(1), 200);
+      return;
+    }
+  }
+
   try {
     // issue #46：notes 生命周期——onRunStart（janitor）在 runToolLoop 前（上游 bin/cli.js 模式）；
     // 失败只告警不中断 run（档案工具仍在，仅清扫未跑）。
@@ -285,18 +326,21 @@ async function startRun(msg) {
       onObserverError: (err) => {
         sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: `observer error: ${String(err?.message ?? err)}` });
       },
-      // 1) task 显式传（§1.3 硬注意-1）；2) 本轮用户输入作为 task + 初始消息。
+      // 1) task 显式传（§1.3 硬注意-1）；2) 本轮用户输入经 transcript 预写入/引擎种子入档，
+      //    resume 时不再传 initialMessages/initialUserMessage（对齐 repl.js:656）。
       task,
-      initialUserMessage: task,
-      // issue #69：会话历史下行——非 resume 时把 RUN_START.history 映射为引擎 initialMessages
-      // （纯函数非法入参回退 []）。resume 时不传（undefined = 全新会话路径）：checkpoint 拥有
-      // 上下文，注入历史会重复。task/initialUserMessage 保持现状不动。
-      initialMessages: resume === true ? undefined : mapHistoryToInitialMessages(msg.history),
+      ...(transcriptPlan.resume ? {} : {
+        // issue #69：会话历史下行——非 resume 时把 RUN_START.history 映射为引擎 initialMessages
+        // （纯函数非法入参回退 []；#70 注入本 PR 保留，P3 随 transcript 投影退役）。
+        initialMessages: mapHistoryToInitialMessages(msg.history),
+        initialUserMessage: task,
+      }),
       tools,
       executeTool,
       store,
-      runId,
-      resume: resume === true,
+      // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
+      runId: transcriptKey,
+      resume: transcriptPlan.resume === true,
       maxRounds: 8,
       stream: true,
       // 8) reflection / wrapup 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
