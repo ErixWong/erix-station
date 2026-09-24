@@ -54,12 +54,23 @@ pi（本地单用户，无远端宿主）的会话模型与 erix-agent store 机
 - **messages 表降级为 UI 投影**（从树投影），不再双写
 - **新用户消息先落树、再派工**：portal 收到消息 → 写 session transcript → 派执行
 
-## 4. 引擎现状核对（源码证据）
+## 4. 引擎现状核对（源码证据，2026-09-24 晚修正）
 
 - transcript 累积：非 resume 时 initialMessages/initialUserMessage 作为 round 0 种子入档（`resume-manager.js:245`），每轮 appendRound 到同一 key——跨调用累积**已支持**
 - 字节级恢复：`resume: true` 时 `store.load(key)` 全量恢复（含 tool_use/fold/语义状态，`resume-manager.js:68`）
-- **缺口**：resume 路径 `ctx.messages = restoredMessages` 直接覆盖（`resume-manager.js:89`），`initialMessages` 被静默丢弃，`task` 只是 judge/reflection brief 不进消息列表（`orchestrator.js:1142`）——**resume 通道没有「追加新 user turn」语义**（resume 假设恢复被中断的同一条消息）
-- 结论：目标态需要上游支持（提 issue 到 erix-agent），或宿主在 resume 前把新 user 消息作为记录写入 transcript（语义等价性待上游确认）
+- **缺口（初判，后被 CLI 推翻）**：resume 路径 `ctx.messages = restoredMessages` 直接覆盖（`resume-manager.js:89`），initialMessages 被静默丢弃——曾据此提 erix-agent#135
+- **CLI 既存答案（bin/cli.js:566-614、bin/repl.js:602-656）**：transcript key = `--session` 会话 ID；每轮 load 查历史，有记录 → 宿主自行 `appendRound` 预写入新 user 消息（round=latestRound，dedupKey 唯一）→ `resume: true`；repl 明确 resume 时不传 initialMessages（`...(resume ? {} : { initialMessages, initialUserMessage })`）。**多轮续跑引擎零改动**，#135 已修正为契约文档化请求
+- 结论：P2 依赖解除，照抄 CLI 模式；崩溃重跑 vs 下一轮的判据 = 记录 dedupKey（建议 `<key>:input:<messageId>`）幂等
+
+## 4.1 目标态接线图（station 侧）
+
+```
+engine 视角：runToolLoop(key=sessionId, resume=有记录, store)
+  ├─ 空本子（会话首条）→ 不 resume，initialUserMessage 全新路径
+  ├─ 新消息未入档（正常下一轮）→ worker 预写入 appendRound（dedupKey 幂等）→ resume
+  └─ 消息已入档（崩溃重跑 attempt>1）→ 直接 resume（不重复写入）
+runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 store key
+```
 
 ## 5. 分阶段实施
 
@@ -67,7 +78,7 @@ pi（本地单用户，无远端宿主）的会话模型与 erix-agent store 机
 |---|---|---|---|
 | **P0** | 本设计定稿；上游 issue（resume + new user turn）；#77 跟踪 | — | 本文档 |
 | **P1** | #64 R1：产物回收 + **终态清场语义修正**（真相层归档 TTL 替代物理删除，只清视图/临时物；`ERIX_RUN_DATA_TTL_HOURS` 语义扩展为归档而非删除） | — | 待派工 |
-| **P2** | store key 切 session 维度：宿主 adapter 映射、portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息先落树 | 上游 issue 结论 | 待 P0 |
+| **P2** | store key 切 session 维度（**照抄 CLI 预写入+resume 模式，引擎零改动**）：portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息预写入（dedupKey 幂等判据） | 无（CLI 已验证模式） | 待派工 |
 | **P3** | messages 表降级 UI 投影；#70 文本注入退役（保留为 transcript 缺失时的兜底） | P2 稳定 | 待 P2 |
 
 ## 6. 红线与验收口径
