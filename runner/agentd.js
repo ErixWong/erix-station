@@ -41,6 +41,9 @@ const CFG = {
   capacity: Number(process.env.ERIX_AGENTD_CAPACITY || 1),
   hbOkPath: process.env.ERIX_HB_OK_PATH || '/run/station/hb-ok',
   heartbeatMs: Number(process.env.ERIX_HEARTBEAT_MS || 15000),
+  // issue #79：冷启动 gate 的最长等待——最多 2 个心跳周期（默认 30s）。超时后放行 claim
+  // 并 warn「llmModels 未就绪，run 将回退 config 占位模型」，防心跳故障时永久卡死。
+  hbInitMaxWaitMs: Number(process.env.ERIX_AGENTD_HB_INIT_MAX_WAIT_MS || 2 * (Number(process.env.ERIX_HEARTBEAT_MS || 15000))),
   batchWindowMs: Number(process.env.ERIX_BATCH_WINDOW_MS || 250),
   batchBytes: Number(process.env.ERIX_BATCH_BYTES || 2048),
   maxEventsPerBatch: 200,
@@ -314,6 +317,49 @@ function handleSseChunk(raw) {
   if (event === 'approval_decision') {
     // P1 不实现审批；忽略（P2 接入）。
     return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 冷启动 gate（issue #79）：先完成首次心跳（拿到 models 下行写入 state.llmModels）
+// 再启动 claimLoop——否则容器冷启动时排队 run 会在首跳前被立刻 claim，RUN_START.models
+// 仍是 null → worker 回退 config.json 占位模型名（relay 拒绝「Model ... is not supported」）。
+// 心跳持续故障按超时兜底放行（走占位回退 + warn，不永久卡死）。
+// deps 全部可注入（heartbeatOnce/sleep/now/log/maxWaitMs）——单测用桩断言启动顺序，非对外契约。
+// ---------------------------------------------------------------------------
+async function initialHeartbeatGate(deps = {}) {
+  const hb = deps.heartbeatOnce ?? heartbeatOnce;
+  const sleepImpl = deps.sleep ?? sleep;
+  const now = deps.now ?? Date.now;
+  const logImpl = deps.log ?? log;
+  const maxWaitMs = deps.maxWaitMs ?? CFG.hbInitMaxWaitMs;
+  const deadline = now() + maxWaitMs;
+  let attempt = 0;
+  for (;;) {
+    try {
+      const data = await hb();
+      touchHbOk(); // M5：与 heartbeatLoop 同语义——心跳成功刷新健康标记
+      // Phase B2：下行模型集（与 heartbeatLoop 同语义）。此后 claim 出的 run 的
+      // RUN_START.models 快照取到的即是真实下行模型名，不再回退占位。
+      state.llmModels = parseHeartbeatModels(data);
+      if (data?.revoked) beginRevoke('revoked'); // 同径兜底，与 heartbeatLoop 一致
+      return;
+    } catch (err) {
+      if (err instanceof InternalError && err.code === 'token_revoked') {
+        // 与 claim/heartbeat 同径（issue #22 方案②）：吊销即收敛退出，claimLoop 会因
+        // revokeReason 首圈即返回，不存在卡死。
+        beginRevoke('token_revoked');
+        return;
+      }
+      attempt += 1;
+      if (now() >= deadline) {
+        logImpl('warn', 'llmModels 未就绪，run 将回退 config 占位模型（initial heartbeat gate timeout）', {
+          waited_ms: maxWaitMs, attempts: attempt, err: String(err?.message ?? err),
+        });
+        return;
+      }
+      await sleepImpl(Math.min(backoffFor(attempt), Math.max(0, deadline - now())));
+    }
   }
 }
 
@@ -1116,6 +1162,9 @@ async function main() {
 
   const sseTask = sse.run(); // 后台运行，不 await——SSE 流由 portal 主动关闭，token 吊销后流不会断
   // （评审 PR#23 reviewer M1：不能把它挂进 Promise.all，否则 revoke 后 agentd 永不退出）。
+  // issue #79：冷启动 gate——首次心跳成功（models 下行就位）后才放行 claimLoop；
+  // 心跳持续故障按 hbInitMaxWaitMs 超时兜底放行（warn，走占位回退），不阻塞启动。
+  await initialHeartbeatGate();
   await Promise.all([claimLoop(), heartbeatLoop()]);
   // 两个决策循环返回（正常退出/revoke/token_revoked）即收敛退出，残留流由 process.exit 关断。
   sse.stop();
@@ -1147,4 +1196,5 @@ if (isDirectRun) {
 }
 
 // 测试导出（issue #64：终态清场路径的捕获触发用 node:test + stub fetch 覆盖；非对外契约）。
-export { onWorkerFinished, onWorkerExit };
+// issue #79：initialHeartbeatGate/state 供冷启动顺序单测注入桩断言（非对外契约）。
+export { onWorkerFinished, onWorkerExit, initialHeartbeatGate, state };
