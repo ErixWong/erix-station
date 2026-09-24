@@ -677,7 +677,7 @@ async function handleCreateSession(req, res, ctx) {
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
   const created = await sessions.createSession(ctx.pool, {
     userId: session.user.id,
-    projectId: body?.project_id,
+    projectId: body?.cwd ?? body?.project_id, // P5：cwd 为准；project_id 为过渡别名（并行 worker 契约漂移兼容，issue #84）
     title: body?.title,
     model: body?.model,
     config: ctx.config,
