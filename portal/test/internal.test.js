@@ -74,6 +74,28 @@ test('assembleTicket：resume = attempt > 1（方案 B re-claim）', () => {
   assert.equal(t2.run.task, '');
 });
 
+test('assembleTicket：P5 cwd 权威下行 + project 快照兼容旧 agentd（双列过渡）', () => {
+  const t = assembleTicket({
+    queueId: 'q1', claimToken: 'ct1', leaseUntil: new Date('2026-09-12T00:01:30Z'),
+    run: { id: 'run1', session_id: 's1', model: 'm', cwd: '~/projects/meeting_asr_app' },
+    project: { name: 'meeting_asr_app', root_path: '~/projects/meeting_asr_app' },
+    message: { id: 'm1', content: 'hi', attachments: [] }, attempts: 1,
+  });
+  assert.equal(t.run.cwd, '~/projects/meeting_asr_app');
+  // project 快照保留（部署序 portal 先上、FDE 镜像后上：旧 agentd 只读 run.project）。
+  assert.equal(t.run.project.name, 'meeting_asr_app');
+  assert.equal(t.run.project.root_path, '~/projects/meeting_asr_app');
+
+  // cwd 缺失（旧 DB 行未回填的极端态）→ 下行 null，agentd 侧回退 project.name。
+  const legacy = assembleTicket({
+    queueId: 'q1', claimToken: 'ct1', leaseUntil: new Date(),
+    run: { id: 'run1', session_id: 's1', model: 'm' },
+    project: { name: 'p', root_path: '~/projects/p' },
+    message: null, attempts: 1,
+  });
+  assert.equal(legacy.run.cwd, null);
+});
+
 test('truncateHistory：先按条数截尾（保最新），再按 UTF-8 字节从头丢到符合（issue #69）', () => {
   const msgs = (n) => Array.from({ length: n }, (_, i) => ({ role: 'user', content: `m${i + 1}` }));
   // 条数截尾：保最新 3 条
@@ -134,6 +156,8 @@ test('claimRun：history 下行——session 最近 user/assistant 升序、排�
   const user = { id: userId, login: 'alice' };
 
   const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  assert.equal(ticket.run.cwd, '~/projects/proj1', 'P5：ticket 下行会话绑定 cwd（权威）');
+  assert.equal(ticket.run.project.name, 'proj1', 'project 快照兼容旧 agentd');
   assert.deepEqual(ticket.run.history, [
     { role: 'assistant', content: 'prev answer' },
     { role: 'assistant', content: 'last answer' },

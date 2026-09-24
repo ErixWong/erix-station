@@ -11,7 +11,10 @@
 //   - 终态 barrier（§7.6）：事件批全部 200 后才 PUT 终态；
 //   - lease_lost → 本地 abort worker、丢缓冲（方案 B，§6.4）；revoked → 收敛后退出。
 //
-// P1 范围（任务约定）：单容器串行（capacity=1）、approvals 路径留空（P2）、spool 不落盘（§7.5 待定）。
+// P1 范围（任务约定）：approvals 路径留空（P2）、spool 不落盘（§7.5 待定）。
+// P5 去项目化（directory-as-project §2）：同项目并行放行——capacity 默认 1 → 2（pi 对齐，不加锁；
+// env ERIX_AGENTD_CAPACITY 可调），同 cwd 两个 run 各自隔离（run 数据/notes/transcript/artifacts
+// 全 per-run/per-session），工作文件碰撞由用户 git 自治。
 
 import { fork } from 'node:child_process';
 import fs from 'node:fs';
@@ -38,7 +41,7 @@ const CFG = {
   home: process.env.FDE_HOME || `/home/${process.env.FDE_CONTAINER_USER || 'erix'}`,
   workerUid: Number(process.env.FDE_WORKER_UID || process.env.ERIX_WORKER_UID || 1002),
   workerGid: Number(process.env.FDE_WORKER_GID || process.env.ERIX_WORKER_GID || 1000),
-  capacity: Number(process.env.ERIX_AGENTD_CAPACITY || 1),
+  capacity: Number(process.env.ERIX_AGENTD_CAPACITY || 2),
   hbOkPath: process.env.ERIX_HB_OK_PATH || '/run/station/hb-ok',
   heartbeatMs: Number(process.env.ERIX_HEARTBEAT_MS || 15000),
   // issue #79：冷启动 gate 的最长等待——最多 2 个心跳周期（默认 30s）。超时后放行 claim
@@ -411,6 +414,27 @@ function prepareProjectCwd(projectName) {
   const projectDir = path.join(CFG.home, 'projects', projectName || 'default');
   fs.mkdirSync(projectDir, { recursive: true });
   return projectDir;
+}
+
+/**
+ * 解析 run 工作目录（P5）：优先 run.cwd（portal 下发的 ~/projects/<name> 相对形式，权威）；
+ * 缺失/非法时回退 run.project?.name（旧 portal 部署序错位兼容）并 warn。任何路径不得删除。
+ */
+function resolveRunCwd(run) {
+  const raw = run?.cwd;
+  if (typeof raw === 'string' && raw.length > 0) {
+    const m = /^~\/projects\/([^/]+)$/.exec(raw);
+    // 形态防线：只认 ~/projects/<name> 一级目录（含 . / .. 拒收），绝不接受任意绝对路径。
+    if (m && m[1] !== '.' && m[1] !== '..') {
+      const dir = path.join(CFG.home, 'projects', m[1]);
+      fs.mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+    log('warn', 'run.cwd 形态非法，回退 project name', { run_id: run?.id ?? null, cwd: raw });
+  } else {
+    log('warn', 'run.cwd 缺失（旧 portal），回退 project name', { run_id: run?.id ?? null, project: run?.project?.name ?? null });
+  }
+  return prepareProjectCwd(run?.project?.name ?? 'default');
 }
 
 // ---------------------------------------------------------------------------
@@ -993,7 +1017,7 @@ async function handleTicket(ticket) {
 
   let cwd;
   try {
-    cwd = prepareProjectCwd(run.project?.name ?? 'default');
+    cwd = resolveRunCwd(run);
   } catch (err) {
     log('warn', 'project cwd prep failed', { run_id: runId, err: String(err?.message ?? err) });
     await releaseAndRequeue(ctx, 'prepare_cwd_failed');
@@ -1244,4 +1268,5 @@ if (isDirectRun) {
 
 // 测试导出（issue #64：终态清场路径的捕获触发用 node:test + stub fetch 覆盖；非对外契约）。
 // issue #79：initialHeartbeatGate/state 供冷启动顺序单测注入桩断言（非对外契约）。
-export { onWorkerFinished, onWorkerExit, initialHeartbeatGate, state, handleStoreRequest };
+// P5：resolveRunCwd 供 cwd 解析/回退语义单测；testConfig 仅暴露 capacity 默认值断言（非对外契约）。
+export { onWorkerFinished, onWorkerExit, initialHeartbeatGate, state, handleStoreRequest, resolveRunCwd, CFG as testConfig };

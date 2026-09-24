@@ -168,7 +168,6 @@ export function buildContainerConfig({
   const binds = [
     `${hostRoot}/home:${home}`,
     `${hostRoot}/projects:${home}/projects`,
-    `${hostRoot}/worktrees:${home}/worktrees`,
     `${hostRoot}/cache:${home}/cache`,
   ];
   // P3 纵深防御：bind source realpath 后必须仍在 userSpaceRoot 内（防 symlink 逃逸）。
@@ -212,11 +211,12 @@ export function buildNetworkConfig({ name, subnet, gateway, fdeName, stackId = '
   };
 }
 
-/** 确保 FDE 用户空间 4 个 bind mount 宿主目录存在（2770 + uid/gid，user-space §2.4/§6.2）。 */
+/** 确保 FDE 用户空间 bind mount 宿主目录存在（2770 + uid/gid，user-space §2.4/§6.2）。
+ *  D8 修订：worktrees 挂载已拆除（#81 P2.5，cwd 直达项目目录）。 */
 export function ensureUserSpaceMountDirs({ userSpaceRoot, fdeName, uid, gid, log = console }) {
   const root = path.resolve(userSpaceRoot);
   const fdeRoot = path.join(root, fdeName);
-  for (const sub of ['home', 'projects', 'worktrees', 'cache']) {
+  for (const sub of ['home', 'projects', 'cache']) {
     ensureDirSafe(root, path.join(fdeRoot, sub), { mode: 0o2770, uid, gid, log });
   }
   return fdeRoot;
