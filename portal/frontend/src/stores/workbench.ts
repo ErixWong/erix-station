@@ -392,6 +392,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (!dirCwd.value) return;
       const created = await createSession();
       if (!created) return; // 建会话失败已 alert，输入内容保留
+      // createSession 只建不开（开=视图层路由职责）；发送链路里必须显式打开，
+      // 否则 sid 仍为空、消息发不出（18:32 真机实证：会话建了、输入还在）。
+      await openSession(created.id);
     }
     const ctx = ctxSeq.value;
     const sid = sessionId.value;
