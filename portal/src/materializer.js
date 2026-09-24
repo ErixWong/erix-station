@@ -60,11 +60,17 @@ export function renderHomeAgentsMd({ fdeName }) {
     '',
     '## 目录约定',
     '',
-    `- 一个项目 = \`~/projects/<project>\`（本容器用户 ${FDE_CONTAINER_USER}）`,
+    `- 一个项目 = \`~/projects/<project>\`（本容器用户 ${FDE_CONTAINER_USER}）——目录即项目，无注册`,
     '- 一个 run 直接在项目目录 `~/projects/<project>` 工作，交付物留在项目目录内',
-    '- 端口一律从 `~/projects/<project>/.erix/ports.json` 取，不要自己挑；dev server 绑 `0.0.0.0`',
+    '- **端口一律从 `~/.erix/ports.json` 取**，不要自己挑；dev server 绑 `0.0.0.0`',
     '- 回流走 fork/PR，不直接在主干改',
     '- `node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）',
+    '',
+    '## clone 方式',
+    '',
+    '- 平台不 clone、不下发 git 凭据；SSH key / token 由你在容器内自行配置（等同你自己的开发机）',
+    '- 空目录：`git clone <地址> .`（`.` 后缀 = clone 进当前目录）',
+    '- 或直接 `git init` 新建；目录非空时 clone 到临时目录再搬移',
     '',
     '## 环境事实（先查再用，不要重复安装）',
     '',
@@ -82,51 +88,12 @@ export function renderHomeAgentsMd({ fdeName }) {
   ].join('\n');
 }
 
-export function renderProjectAgentsMd({ fdeName, projectName, repoUrl }) {
-  const normalizedRepoUrl = typeof repoUrl === 'string' && repoUrl.trim() ? repoUrl.trim() : null;
-  const repoGuide = normalizedRepoUrl
-    ? [
-        `已关联仓库：${normalizedRepoUrl}`,
-        '',
-        '目录非空（含 `.erix/`、`.gitignore`），clone 到临时目录再搬移，或 `git init + remote add + fetch + checkout`：',
-        '',
-        '```bash',
-        `git init && git remote add origin '${normalizedRepoUrl.replaceAll("'", "'\\''")}' && git fetch origin && git checkout -b main origin/main`,
-        '```',
-      ]
-    : [
-        '未关联仓库：可直接在本目录工作（如新建代码/`git init`），或自行 `git clone <地址> .`。',
-      ];
-  return [
-    `# ${projectName} · 项目级约定`,
-    '',
-    '> 本文件由平台生成（root:root 0644），位于 `.erix/` 内（已被 `.gitignore` 忽略），clone/checkout 不会触碰。',
-    '',
-    '## clone 方式指引',
-    '',
-    ...repoGuide,
-    '',
-    '上述操作都不会触碰 `.erix/`。',
-    '',
-    '## 端口',
-    '',
-    '- 端口从 `.erix/ports.json` 取，不自己挑',
-    '- dev server 绑 `0.0.0.0`',
-    '',
-    `（FDE：${fdeName} / 项目：${projectName}）`,
-    '',
-  ].join('\n');
-}
-
-export function renderGitignore() {
-  return '.erix/\n';
-}
-
-export function renderPortsJson({ fdeName, projectName, allocations, generation }) {
+// P5 去项目化（directory-as-project §3/§5）：ports.json 升为 FDE 级单一文件 ~/.erix/ports.json——
+// allocations 不再按项目分组（port_allocations.project_id 已退役，迁移 0008）。
+export function renderPortsJson({ fdeName, allocations, generation }) {
   return json({
     schema: 1,
     fde: fdeName,
-    project: projectName,
     generation,
     allocations: allocations.map((a) => ({
       scope: a.scope,
@@ -159,13 +126,14 @@ export function renderManifest({ fdeName, generation, entries, materializedAt })
 /**
  * 计算 hostPath（宿主路径 = <root>/<fde> 前缀 + 容器相对路径）。
  * 容器绝对路径 /home/erix/... → 宿主 <root>/<fde>/home/...。
+ * D8 修订 + P5：projects/cache 是独立挂载（user-space §2.4），worktrees 挂载已拆除（#81 P2.5）。
  */
 export function hostPathFor(root, fdeName, containerPath) {
   const rel = containerPath.replace(new RegExp(`^${CONTAINER_HOME}/`), '');
   const top = rel.split('/')[0];
-  // 容器内 projects/worktrees/cache 是独立挂载（user-space §2.4），直接映射到 <root>/<fde>/<top>；
+  // 容器内 projects/cache 是独立挂载（user-space §2.4），直接映射到 <root>/<fde>/<top>；
   // 其余（home 内容：AGENTS.md、.erix/* 等）映射到 <root>/<fde>/home/<rel>。
-  if (top === 'projects' || top === 'worktrees' || top === 'cache') {
+  if (top === 'projects' || top === 'cache') {
     return path.join(root, fdeName, rel);
   }
   return path.join(root, fdeName, 'home', rel);
@@ -173,9 +141,11 @@ export function hostPathFor(root, fdeName, containerPath) {
 
 /**
  * 纯函数：由 DB desired state 渲染该 FDE 全部平台文件（不含 manifest）。
+ * P5：项目级物化（.gitignore / .erix/ports.json / .erix/AGENTS.md）整体退役——平台文件只落家目录
+ * 骨架 + FDE 级 ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
-export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, projects, allocationsByProject, root, generation }) {
+export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, root, generation }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
@@ -184,19 +154,7 @@ export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, projects, alloc
   add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
-
-  for (const project of projects) {
-    const allocs = allocationsByProject.get(project.id) ?? [];
-    add(`${CONTAINER_HOME}/projects/${project.name}/.gitignore`, renderGitignore());
-    add(
-      `${CONTAINER_HOME}/projects/${project.name}/.erix/ports.json`,
-      renderPortsJson({ fdeName, projectName: project.name, allocations: allocs, generation }),
-    );
-    add(
-      `${CONTAINER_HOME}/projects/${project.name}/.erix/AGENTS.md`,
-      renderProjectAgentsMd({ fdeName, projectName: project.name, repoUrl: project.repo_url }),
-    );
-  }
+  add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, generation }));
   return files;
 }
 
@@ -234,11 +192,11 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    * 渲染 + 落盘该 FDE 全部平台文件 + manifest（提交点）。
    * 返回 manifest 内容与最终 generation（供测试断言）。
    */
-  async function materialize({ fdeName, baseDomain, llmBaseUrl, projects, allocationsByProject, generation, prevManifest, materializedAt = new Date() }) {
+  async function materialize({ fdeName, baseDomain, llmBaseUrl, allocations, generation, prevManifest, materializedAt = new Date() }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
-    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, projects, allocationsByProject, root: rootReal, generation });
+    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, root: rootReal, generation });
 
     ensureWorkspaceDirs(files);
 
@@ -392,25 +350,15 @@ async function readFdeDesiredState(pool, fdeId, config) {
   );
   if (user.rows.length === 0) return null;
   const fdeName = user.rows[0].fde_name;
-  const projects = await pool.query(
-    `SELECT id, name, repo_url FROM projects WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
-    [fdeId],
-  );
+  // P5：FDE 级单一 ports.json——allocations 平铺（不再按项目分组；projects 表不再参与物化）。
   const allocs = await pool.query(
-    `SELECT id, project_id, scope, port, role, run_id, url, exposure, state
+    `SELECT id, scope, port, role, run_id, url, exposure, state
        FROM port_allocations WHERE fde_id = $1 AND state <> 'released' ORDER BY port`,
     [fdeId],
   );
-  const allocationsByProject = new Map();
-  for (const a of allocs.rows) {
-    const list = allocationsByProject.get(a.project_id) ?? [];
-    list.push(a);
-    allocationsByProject.set(a.project_id, list);
-  }
   return {
     fdeName,
-    projects: projects.rows,
-    allocationsByProject,
+    allocations: allocs.rows,
     llmBaseUrl: config.llmPublicBaseUrl,
     baseDomain: config.baseDomain,
   };
@@ -505,8 +453,7 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         fdeName: state.fdeName,
         baseDomain: state.baseDomain,
         llmBaseUrl: state.llmBaseUrl,
-        projects: state.projects,
-        allocationsByProject: state.allocationsByProject,
+        allocations: state.allocations,
         generation: Number(row.revision),
         prevManifest,
       });

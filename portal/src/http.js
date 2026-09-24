@@ -18,6 +18,7 @@ import * as internal from './internal.js';
 import * as artifacts from './artifacts.js';
 import * as llm from './llm.js';
 import * as admin from './admin.js';
+import * as dirs from './dirs.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
@@ -251,6 +252,10 @@ export function createServer({ pool, config, log = console, docker = null }) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof dirs.DirError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof idempotency.IdempotencyError) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable, err.details));
         return;
@@ -377,23 +382,32 @@ async function routeApi(req, res, ctx, url) {
     return handleForwardAuth(req, res, ctx);
   }
 
-  // ---- 项目与端口（portal.md §3） ----
+  // ---- 目录视图（P5 directory-as-project §4：目录下拉 + 目录树，portal 直读 bind mount） ----
+  if (pathname === '/api/dirs' && req.method === 'GET') {
+    return handleListDirs(req, res, ctx);
+  }
+  if (pathname === '/api/files/tree' && req.method === 'GET') {
+    return handleFileTree(req, res, ctx, url);
+  }
+
+  // ---- 项目与端口（portal.md §3；P5：写路径退役，projects 表留档只读） ----
   if (pathname === '/api/projects') {
-    if (req.method === 'POST') return handleCreateProject(req, res, ctx);
+    // P5 去项目化：项目注册已退役（目录即项目）。写端点 410 明示退役；GET 保留（归档只读）。
+    if (req.method === 'POST') throw new HttpError(410, 'project_api_retired', '项目注册已退役（P5 目录即项目）：目录经 POST /api/sessions 的 project_id（cwd）自动创建');
     if (req.method === 'GET') return handleListProjects(req, res, ctx);
   }
   const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
   if (projectMatch) {
     const projectId = decodeURIComponent(projectMatch[1]);
     if (req.method === 'GET') return handleGetProject(req, res, ctx, projectId);
-    if (req.method === 'PATCH') return handlePatchProject(req, res, ctx, projectId);
-    if (req.method === 'DELETE') return handleDeleteProject(req, res, ctx, projectId);
+    if (req.method === 'PATCH' || req.method === 'DELETE') {
+      throw new HttpError(410, 'project_api_retired', '项目 CRUD 已退役（P5 目录即项目，projects 表留档只读）');
+    }
   }
-  // F10：端口列表（portal.md §4.7）——复用 getProject 的 ports 查询。
+  // F10：端口列表（portal.md §4.7）。P5：port_allocations 去项目化后项目维度端口不可推导，退役。
   const projectPortsMatch = pathname.match(/^\/api\/projects\/([^/]+)\/ports$/);
   if (projectPortsMatch) {
-    const projectId = decodeURIComponent(projectPortsMatch[1]);
-    if (req.method === 'GET') return handleGetProjectPorts(req, res, ctx, projectId);
+    throw new HttpError(410, 'project_api_retired', '项目维度端口列表已退役（P5）：端口一律见 FDE 级 ~/.erix/ports.json');
   }
   // 预览 ticket 签发（portal.md §2.8）。
   const portTicketMatch = pathname.match(/^\/api\/ports\/([^/]+)\/preview-ticket$/);
@@ -649,12 +663,14 @@ async function handleListSessions(req, res, ctx) {
   const result = await sessions.listSessions(ctx.pool, {
     userId: session.user.id,
     projectId: url.searchParams.get('project_id') || undefined,
+    cwd: url.searchParams.get('cwd') || undefined,
     cursor: url.searchParams.get('cursor') || undefined,
     limit: url.searchParams.get('limit') || undefined,
   });
   return sendJson(res, 200, result);
 }
 
+/** P5：POST /api/sessions —— project_id 即目录名（cwd 绑定；目录不存在时服务端 mkdir）。 */
 async function handleCreateSession(req, res, ctx) {
   const session = await requireSession(req, ctx);
   requireJson(req);
@@ -664,6 +680,7 @@ async function handleCreateSession(req, res, ctx) {
     projectId: body?.project_id,
     title: body?.title,
     model: body?.model,
+    config: ctx.config,
   });
   return sendJson(res, 201, { session: created });
 }
@@ -1154,21 +1171,26 @@ async function handlePreviewTicket(req, res, ctx, portId) {
   return sendJson(res, 201, result);
 }
 
-async function handleCreateProject(req, res, ctx) {
+async function handleListDirs(req, res, ctx) {
   const session = await requireSession(req, ctx);
-  requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-  const name = typeof body.name === 'string' ? body.name.trim() : '';
-  const repoUrl = body.repo_url === undefined || body.repo_url === null ? undefined : body.repo_url;
-  const template = typeof body.template === 'string' ? body.template : 'default';
-  const result = await projects.createProject(ctx.pool, {
+  return sendJson(res, 200, await dirs.listDirs(ctx.pool, {
     userId: session.user.id,
-    name,
-    repoUrl,
-    template,
-    config: ctx.config,
+    userSpaceRoot: ctx.config.userSpaceRoot,
+    fdeName: session.user.fde_name,
+    log: ctx.log,
+  }));
+}
+
+/** 目录树懒展开（单层只读）：?cwd=<相对cwd>&path=<相对路径>（path 默认 '.'）。 */
+async function handleFileTree(req, res, ctx, url) {
+  const session = await requireSession(req, ctx);
+  const result = await dirs.fileTree({
+    userSpaceRoot: ctx.config.userSpaceRoot,
+    fdeName: session.user.fde_name,
+    cwd: url.searchParams.get('cwd'),
+    relPath: url.searchParams.get('path') ?? '.',
   });
-  return sendJson(res, 201, { project: result.project, ports: [result.port] });
+  return sendJson(res, 200, result);
 }
 
 async function handleListProjects(req, res, ctx) {
@@ -1186,33 +1208,8 @@ async function handleGetProject(req, res, ctx, projectId) {
   return sendJson(res, 200, result);
 }
 
-async function handleGetProjectPorts(req, res, ctx, projectId) {
-  const session = await requireSession(req, ctx);
-  const result = await projects.getProject(ctx.pool, { userId: session.user.id, projectId });
-  return sendJson(res, 200, { items: result.ports });
-}
-
-async function handlePatchProject(req, res, ctx, projectId) {
-  const session = await requireSession(req, ctx);
-  requireJson(req);
-  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-  if (typeof body.name !== 'string' || !body.name.trim()) {
-    throw new HttpError(400, 'validation_failed', 'name 为必填字段', { details: { field: 'name' } });
-  }
-  const project = await projects.renameProject(ctx.pool, {
-    userId: session.user.id,
-    projectId,
-    name: body.name.trim(),
-  });
-  return sendJson(res, 200, project);
-}
-
-async function handleDeleteProject(req, res, ctx, projectId) {
-  const session = await requireSession(req, ctx);
-  await projects.deleteProject(ctx.pool, { userId: session.user.id, projectId });
-  res.writeHead(204);
-  res.end();
-}
+// P5：handleCreateProject / handlePatchProject / handleDeleteProject / handleGetProjectPorts 已随
+// 项目注册制一并退役（写端点与项目维度端口端点在 routeApi 直接 410 project_api_retired）。
 
 // ---------------------------------------------------------------------------
 // internal 端点（portal.md §9）：容器 → portal 全出站通道。Bearer token 鉴权 + X-Claim-Token 租约凭证。

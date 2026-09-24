@@ -90,11 +90,10 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.equal(body.Labels['fde.name'], 'alice');
   // 不变式一：不 publish 端口（proxy P1 字段级 allowlist 拒绝任何 PortBindings 字段）
   assert.equal('PortBindings' in body.HostConfig, false);
-  // bind mount 只允许本 FDE 用户空间（user-space §2.4）
+  // bind mount 只允许本 FDE 用户空间（user-space §2.4）；D8 修订：worktrees 挂载已拆除（#81 P2.5）
   assert.deepEqual(body.HostConfig.Binds, [
     '/srv/erix/users/alice/home:/home/erix',
     '/srv/erix/users/alice/projects:/home/erix/projects',
-    '/srv/erix/users/alice/worktrees:/home/erix/worktrees',
     '/srv/erix/users/alice/cache:/home/erix/cache',
   ]);
   // 只接自己的 /29

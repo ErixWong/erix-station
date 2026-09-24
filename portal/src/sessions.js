@@ -1,9 +1,15 @@
-// 会话与对话链路（portal.md §4/§5）。
+// 会话与对话链路（portal.md §4/§5；P5 去项目化 docs/design/directory-as-project.md 定稿）。
 // 端点：GET/POST /api/sessions、GET/PATCH/DELETE /api/sessions/:id、
 //       POST /api/sessions/:id/messages（建 run 入队）、POST .../stop（写 cancel_requested_at）。
 // SSE 流（GET /api/sessions/:id/events）在 http.js 组装：DB 补发（§5.2 Last-Event-ID）+ 实时注册（session hub）。
 // 依据：规格 §10.2/§13.2-4（多轮显式传 task）、D7（事件先落 DB）、§9.3（seq 由宿主原子分配）。
+//
+// P5：会话 = cwd + transcript 的绑定体。请求体仍叫 project_id（前端契约），语义 = 目录名
+// （相对形式 ~/projects/<name>）：服务端校验形态 + 目录不存在时 mkdir（「＋新建目录」语义，
+// 直接写 FDE 家目录 bind mount）。projects 表写入路径退役（留档只读）。
 import crypto from 'node:crypto';
+import path from 'node:path';
+import { ensureDirSafe } from './fsutil.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -16,6 +22,29 @@ export class SessionError extends Error {
 
 const ACTIVE_RUN_STATES = `('queued', 'running', 'cancelling')`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** 会话 cwd 形态：~/projects/<name>（name 为一级目录名，不得含 /，不得为 . / ..；P5 边界）。 */
+export const CWD_RE = /^~\/projects\/([^/]+)$/;
+
+/**
+ * 校验并规范化会话 cwd（纯函数）：返回相对形式 `~/projects/<name>`。
+ * 与项目注册时代的 PROJECT_NAME_RE 不同——目录名允许下划线等（用户在容器内自建目录的自由
+ * 命名权），唯一硬边界是「一级目录、无路径穿越」（name 不得含 /，拒绝 . 与 ..）。
+ */
+export function validateSessionCwd(value) {
+  const m = typeof value === 'string' && CWD_RE.exec(value);
+  if (!m) {
+    throw new SessionError('validation_failed', 'project_id（cwd）必须是 ~/projects/<name> 一级目录形式', {
+      details: { field: 'project_id' },
+    });
+  }
+  const name = m[1];
+  if (name === '.' || name === '..' || /[\x00-\x1f\x7f]/.test(name)) {
+    throw new SessionError('validation_failed', '目录名非法（拒绝 . / .. / 控制字符）', {
+      details: { field: 'project_id' },
+    });
+  }
+  return `~/projects/${name}`;
+}
 /** 单条 user 消息内容上限（portal.md §4.3）。 */
 export const MAX_MESSAGE_CONTENT_LENGTH = 100_000;
 
@@ -49,17 +78,16 @@ export function validateMessageBody(body) {
   return { content, attachments };
 }
 
-/** session 属主校验 + 取行；不存在/不属本人/已归档/非法 UUID 一律 404（不泄露存在性，portal.md §1.2 惯例）。 */
+/** session 属主校验 + 取行；不存在/不属本人/已归档/非法 UUID 一律 404（不泄露存在性，portal.md §1.2 惯例）。
+ *  P5：projects 表退役留档——不再 JOIN projects（project_id 可空，cwd 为权威绑定）。 */
 async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {}) {
   if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) {
     throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
   }
   const lock = forUpdate ? ' FOR UPDATE' : '';
   const res = await pool.query(
-    `SELECT s.id, s.user_id, s.project_id, s.title, s.model, s.status, s.last_seq,
-            p.name AS project_name
+    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.model, s.status, s.last_seq
        FROM chat_sessions s
-       JOIN projects p ON p.id = s.project_id
       WHERE s.id = $1${lock}`,
     [sessionId],
   );
@@ -73,14 +101,19 @@ async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {})
   return row;
 }
 
-/** GET /api/sessions?project_id=（可选过滤，按 updated_at 倒序 + keyset 分页 §1.3：默认 20、上限 100）。 */
-export async function listSessions(pool, { userId, projectId, cursor, limit = 20 }) {
+/** GET /api/sessions?project_id=&cwd=（可选过滤，按 updated_at 倒序 + keyset 分页 §1.3：默认 20、上限 100）。
+ *  P5：cwd 过滤为「该目录的会话列表」（directory-as-project §4 左栏；精确匹配会话绑定 cwd）。 */
+export async function listSessions(pool, { userId, projectId, cwd, cursor, limit = 20 }) {
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [userId];
   let where = `user_id = $1 AND status = 'active'`;
   if (projectId) {
     params.push(projectId);
     where += ` AND project_id = $${params.length}`;
+  }
+  if (cwd) {
+    params.push(validateSessionCwd(cwd));
+    where += ` AND cwd = $${params.length}`;
   }
   if (cursor) {
     if (!UUID_RE.test(cursor)) {
@@ -91,7 +124,7 @@ export async function listSessions(pool, { userId, projectId, cursor, limit = 20
   }
   params.push(n + 1);
   const res = await pool.query(
-    `SELECT s.id, s.project_id, s.title, s.model, s.last_seq, s.created_at, s.updated_at,
+    `SELECT s.id, s.project_id, s.cwd, s.title, s.model, s.last_seq, s.created_at, s.updated_at,
             (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id
        FROM chat_sessions s
       WHERE ${where}
@@ -104,29 +137,49 @@ export async function listSessions(pool, { userId, projectId, cursor, limit = 20
   return { items, next_cursor: nextCursor };
 }
 
-/** POST /api/sessions —— 建会话（project 必须属本人且未删除）。 */
-export async function createSession(pool, { userId, projectId, title, model }) {
-  if (!projectId || typeof projectId !== 'string') {
-    throw new SessionError('validation_failed', 'project_id 必填', { details: { field: 'project_id' } });
-  }
-  const own = await pool.query(
-    `SELECT id FROM projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-    [projectId, userId],
-  );
-  if (!own.rows?.[0]) {
-    throw new SessionError('not_found', 'project not found', { httpStatus: 404 });
-  }
+/**
+ * POST /api/sessions —— 建会话（P5：请求体 project_id = 目录名 → 绑定 cwd）。
+ * 校验 `~/projects/<name>` 形态（validateSessionCwd）→ 目录存在性确保（不存在则 mkdir，
+ * 「＋新建目录」语义；直写 FDE 家目录 bind mount <userSpaceRoot>/<fde>/home/projects/<name>）。
+ * projects 表写入路径已退役：不再要求/不再写 project_id（列留档，迁移 0008 解除 NOT NULL）。
+ */
+export async function createSession(pool, { userId, projectId, title, model, config }) {
+  const cwd = validateSessionCwd(projectId);
+  const name = CWD_RE.exec(cwd)[1];
   if (title !== undefined && (typeof title !== 'string' || title.length > 200)) {
     throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { details: { field: 'title' } });
   }
   if (model !== undefined && (typeof model !== 'string' || model.length > 100)) {
     throw new SessionError('validation_failed', 'model 必须为 ≤100 字符的字符串', { details: { field: 'model' } });
   }
+
+  // 「＋新建目录」语义：目录不存在则创建（权限口径同 provisioner/materializer 工作区目录：
+  // 2770 + erix 属主；root 创建即 chown，非 root 环境 best-effort 告警不阻断——fsutil 语义）。
+  const fde = await pool.query(
+    `SELECT fde_name FROM users WHERE id = $1 AND status = 'active'`,
+    [userId],
+  );
+  const fdeName = fde.rows?.[0]?.fde_name;
+  if (!fdeName) {
+    throw new SessionError('validation_failed', '当前用户未配置 fde_name，无法确定家目录', {
+      details: { field: 'fde_name' },
+    });
+  }
+  const userSpaceRoot = config?.userSpaceRoot;
+  if (!userSpaceRoot) {
+    throw new SessionError('internal', 'userSpaceRoot 未配置', { httpStatus: 500 });
+  }
+  ensureDirSafe(
+    userSpaceRoot,
+    path.join(path.resolve(userSpaceRoot), fdeName, 'home', 'projects', name),
+    { mode: 0o2770, uid: config?.fdeUid ?? 1000, gid: config?.fdeGid ?? 1000 },
+  );
+
   const res = await pool.query(
-    `INSERT INTO chat_sessions (user_id, project_id, title, model)
+    `INSERT INTO chat_sessions (user_id, cwd, title, model)
      VALUES ($1, $2, $3, $4)
-     RETURNING id, user_id, project_id, title, model, status, last_seq, created_at, updated_at`,
-    [userId, projectId, title ?? '', model ?? null],
+     RETURNING id, user_id, project_id, cwd, title, model, status, last_seq, created_at, updated_at`,
+    [userId, cwd, title ?? '', model ?? null],
   );
   return rowToSession(res.rows[0]);
 }
@@ -186,7 +239,7 @@ export async function updateSession(pool, { userId, sessionId, title }) {
   const res = await pool.query(
     `UPDATE chat_sessions SET title = $2, updated_at = now()
       WHERE id = $1 AND status = 'active'
-      RETURNING id, user_id, project_id, title, model, status, last_seq, created_at, updated_at`,
+      RETURNING id, user_id, project_id, cwd, title, model, status, last_seq, created_at, updated_at`,
     [sessionId, title],
   );
   if (res.rows.length === 0) {
@@ -396,7 +449,8 @@ export async function stopSession(pool, { userId, sessionId }) {
 function rowToSession(r) {
   return {
     id: r.id,
-    project_id: r.project_id,
+    project_id: r.project_id ?? null,
+    cwd: r.cwd ?? null,
     title: r.title,
     model: r.model,
     status: r.status,
