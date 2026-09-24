@@ -341,7 +341,9 @@ async function startRun(msg) {
       // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
       runId: transcriptKey,
       resume: transcriptPlan.resume === true,
-      maxRounds: 8,
+      // maxRounds 16（2026-09-24 用户拍板，自 8 上调）：与上游 judge 常规搭配对齐
+      //（DEFAULT_REFLECTION_MIN_ROUNDS=16）；复杂任务少扩轮摩擦，失控上限 = judge 每轮审查兜底。
+      maxRounds: 16,
       stream: true,
       // 8) reflection / wrapup 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
       // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
