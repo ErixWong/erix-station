@@ -110,6 +110,11 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   // issue #84 P5：agentd/worker 可调参数下发（默认值随 portal env）。
   assert.ok(body.Env.includes('ERIX_MAX_ROUNDS=16'), 'ERIX_MAX_ROUNDS 默认下发');
   assert.ok(body.Env.includes('ERIX_AGENTD_CAPACITY=2'), 'ERIX_AGENTD_CAPACITY 默认下发');
+  assert.ok(body.Env.includes('ERIX_ARTIFACT_MAX_BYTES=104857600'), 'ERIX_ARTIFACT_MAX_BYTES 默认下发');
+  assert.ok(body.Env.includes('ERIX_ARTIFACT_CAPTURE_BUDGET_MS=60000'), 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS 默认下发');
+  assert.ok(body.Env.includes('ERIX_SHELL_TIMEOUT_MS=60000'), 'ERIX_SHELL_TIMEOUT_MS 默认下发');
+  assert.ok(body.Env.includes('ERIX_SHELL_MAX_TIMEOUT_MS=600000'), 'ERIX_SHELL_MAX_TIMEOUT_MS 默认下发');
+  assert.ok(body.Env.includes('ERIX_SHELL_OUTPUT_MAX_BYTES=32768'), 'ERIX_SHELL_OUTPUT_MAX_BYTES 默认下发');
 });
 
 test('buildNetworkConfig：显式 subnet + gateway', () => {

@@ -14,10 +14,24 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const DEFAULT_TIMEOUT_MS = 60_000;
-const MAX_TIMEOUT_MS = 600_000;
+// 三件套 env 可调（issue #84 配套，2026-09-24）：长构建场景可放宽默认超时；
+// DEFAULT 自动钳到 ≤ MAX（防误配出「默认即非法」）。
+const DEFAULT_TIMEOUT_MS = Math.min(
+  parseIntEnv(process.env.ERIX_SHELL_TIMEOUT_MS, 60_000, { min: 1_000, max: 3_600_000 }),
+  parseIntEnv(process.env.ERIX_SHELL_MAX_TIMEOUT_MS, 600_000, { min: 1_000, max: 3_600_000 }),
+);
+const MAX_TIMEOUT_MS = parseIntEnv(process.env.ERIX_SHELL_MAX_TIMEOUT_MS, 600_000, { min: 1_000, max: 3_600_000 });
+const MAX_OUTPUT_BYTES = parseIntEnv(process.env.ERIX_SHELL_OUTPUT_MAX_BYTES, 32 * 1024, { min: 1024, max: 1024 * 1024 });
+
+function parseIntEnv(raw, defaultValue, { min, max }) {
+  const n = Number(raw);
+  if (raw === undefined || raw === null || raw === '' || !Number.isInteger(n) || n < min || n > max) {
+    return defaultValue;
+  }
+  return n;
+}
 // 输出截断：保留尾部最多 32KiB + 头部截断标记（报错/测试摘要都在尾部，头部舍弃）。
-const MAX_OUTPUT_BYTES = 32 * 1024;
+// （MAX_OUTPUT_BYTES 已上移至 env 解析段，与三件套同处定义）
 const TRUNCATION_MARKER = `[... output truncated, showing last ${MAX_OUTPUT_BYTES} bytes ...]`;
 
 const schema = {

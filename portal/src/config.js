@@ -182,7 +182,7 @@ export function loadConfig(env = process.env) {
     // issue #64 R1：run 终态产物（worktree bundle tar.gz）存储与上限。
     // 持久卷 bind mount（deploy-contract §2.2 ④）；上限默认 20MB，与 agentd 侧截断口径一致。
     artifactsRoot: env.ERIX_ARTIFACTS_ROOT || '/srv/erix/artifacts',
-    artifactMaxBytes: intEnv(env, 'ERIX_ARTIFACT_MAX_BYTES', 20 * 1024 * 1024),
+    artifactMaxBytes: intEnv(env, 'ERIX_ARTIFACT_MAX_BYTES', 100 * 1024 * 1024), // 2026-09-24 20MB→100MB（与 runner 侧同 env 同默认）
     maxLoginLength: intEnv(env, 'MAX_LOGIN_LENGTH', 128),
     maxPasswordLength: intEnv(env, 'MAX_PASSWORD_LENGTH', 256),
     baseDomain: env.BASE_DOMAIN || 'localhost',

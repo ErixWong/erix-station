@@ -182,6 +182,11 @@ export function buildContainerConfig({
       // issue #84 P5：agentd/worker 可调参数下发（portal env → FDE 容器 env；改值重建容器即可，无需镜像）。
       `ERIX_MAX_ROUNDS=${Number(process.env.ERIX_MAX_ROUNDS) || 16}`,
       `ERIX_AGENTD_CAPACITY=${Number(process.env.ERIX_AGENTD_CAPACITY) || 2}`,
+      `ERIX_ARTIFACT_MAX_BYTES=${Number(process.env.ERIX_ARTIFACT_MAX_BYTES) || (100 * 1024 * 1024)}`,
+      `ERIX_ARTIFACT_CAPTURE_BUDGET_MS=${Number(process.env.ERIX_ARTIFACT_CAPTURE_BUDGET_MS) || 60000}`,
+      `ERIX_SHELL_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_TIMEOUT_MS) || 60000}`,
+      `ERIX_SHELL_MAX_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_MAX_TIMEOUT_MS) || 600000}`,
+      `ERIX_SHELL_OUTPUT_MAX_BYTES=${Number(process.env.ERIX_SHELL_OUTPUT_MAX_BYTES) || 32768}`,
     ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId, ...labels },
     HostConfig: {

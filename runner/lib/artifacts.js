@@ -17,7 +17,16 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
-export const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024;
+// 上限 env 可调（issue #84 配套，2026-09-24 用户拍板 20MB → 100MB 默认）：与 portal 侧
+// ERIX_ARTIFACT_MAX_BYTES 同名同值（provisioner 同光纤下发），两侧必须一致。
+export const ARTIFACT_MAX_BYTES = Number.isInteger(Number(process.env.ERIX_ARTIFACT_MAX_BYTES))
+  && Number(process.env.ERIX_ARTIFACT_MAX_BYTES) > 0
+  ? Number(process.env.ERIX_ARTIFACT_MAX_BYTES) : 100 * 1024 * 1024;
+// 打包时间预算（ms）：超时停止收录、manifest.truncated 标记——封死「大产物打包太久」的痛点
+// （时间预算比字节数更本质：字节再大，时间有上界）。
+export const ARTIFACT_CAPTURE_BUDGET_MS = Number.isInteger(Number(process.env.ERIX_ARTIFACT_CAPTURE_BUDGET_MS))
+  && Number(process.env.ERIX_ARTIFACT_CAPTURE_BUDGET_MS) > 0
+  ? Number(process.env.ERIX_ARTIFACT_CAPTURE_BUDGET_MS) : 60_000;
 export const ARTIFACT_MANIFEST_NAME = 'manifest.json';
 
 const EXCLUDE_DIRS = new Set(['.git', 'node_modules', '.notes']);
@@ -130,7 +139,8 @@ export function walkFiles(root) {
  * @param {(args:string[])=>Promise<string|null>} [opts.gitExec] 可注入的 git 执行器（测试用）
  * @returns {Promise<{buffer:Buffer, manifest:object}|null>} 无产物（目录不存在/空变更）返回 null
  */
-export async function captureArtifact({ runId, cwd, maxBytes = ARTIFACT_MAX_BYTES, gitExec }) {
+export async function captureArtifact({ runId, cwd, maxBytes = ARTIFACT_MAX_BYTES, gitExec, budgetMs = ARTIFACT_CAPTURE_BUDGET_MS }) {
+  const captureDeadline = Date.now() + budgetMs;
   if (!cwd || !fs.existsSync(cwd)) return null;
   const git = gitExec ?? defaultGitExec;
   const isGit = (await git(['-C', cwd, 'rev-parse', '--is-inside-work-tree']))?.trim() === 'true';
@@ -155,6 +165,7 @@ export async function captureArtifact({ runId, cwd, maxBytes = ARTIFACT_MAX_BYTE
   }
 
   const snapshot = (rel) => {
+    if (truncated || Date.now() > captureDeadline) { truncated = true; return; }
     const abs = path.join(cwd, rel);
     let buf;
     try {
@@ -206,7 +217,7 @@ export async function captureArtifact({ runId, cwd, maxBytes = ARTIFACT_MAX_BYTE
   };
   entries.push({ name: ARTIFACT_MANIFEST_NAME, data: Buffer.from(JSON.stringify(manifest), 'utf8') });
   const tar = buildTar(entries);
-  return { buffer: zlib.gzipSync(tar), manifest };
+  return { buffer: zlib.gzipSync(tar, { level: 1 }), manifest }; // level 1：大包提速，源码压缩比可接受
 }
 
 // ---------------------------------------------------------------------------

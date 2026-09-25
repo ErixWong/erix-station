@@ -445,6 +445,6 @@ test('handler 真机探针：R1 inspect scope / R2 NetworkingConfig / R3 利用�
 
 
 test('env 白名单：P5 可调参数键放行（issue #84）', () => {
-  const body = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_MAX_ROUNDS=16', 'ERIX_AGENTD_CAPACITY=2'] });
+  const body = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_MAX_ROUNDS=16', 'ERIX_AGENTD_CAPACITY=2', 'ERIX_ARTIFACT_MAX_BYTES=104857600', 'ERIX_SHELL_TIMEOUT_MS=60000', 'ERIX_SHELL_MAX_TIMEOUT_MS=600000', 'ERIX_SHELL_OUTPUT_MAX_BYTES=32768', 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS=60000'] });
   assert.deepEqual(validateCreateBody(body, CFG), []);
 });
