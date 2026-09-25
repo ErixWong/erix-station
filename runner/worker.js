@@ -14,6 +14,7 @@
 // 早有 umask 0002，本处为防御性重设，评审 F8）。
 process.umask(0o002);
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
