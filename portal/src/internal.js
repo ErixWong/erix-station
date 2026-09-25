@@ -11,6 +11,7 @@ import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
 import { getFdeLlmHeartbeatModels } from './llm.js';
+import { scheduleAutoTitle } from './session-title.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -678,6 +679,11 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
     try {
       notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload }]);
     } catch { /* 尽力推送 */ }
+    // issue #88：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
+    // 天然「每 run 至多评估一次」）。经 session SSE hub 推 'session_updated' 让列表标题实时到达。
+    try {
+      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, notify: notifySessionEvents });
+    } catch { /* 评估调度失败不影响终态响应 */ }
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
     return { state, queue_status: queueStatus, run_end_seq: runEndSeq };
   } catch (err) {

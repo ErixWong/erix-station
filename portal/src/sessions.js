@@ -86,7 +86,7 @@ async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {})
   }
   const lock = forUpdate ? ' FOR UPDATE' : '';
   const res = await pool.query(
-    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.model, s.status, s.last_seq
+    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.status, s.last_seq
        FROM chat_sessions s
       WHERE s.id = $1${lock}`,
     [sessionId],
@@ -124,7 +124,7 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
   }
   params.push(n + 1);
   const res = await pool.query(
-    `SELECT s.id, s.project_id, s.cwd, s.title, s.model, s.last_seq, s.created_at, s.updated_at,
+    `SELECT s.id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.last_seq, s.created_at, s.updated_at,
             (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id
        FROM chat_sessions s
       WHERE ${where}
@@ -175,11 +175,14 @@ export async function createSession(pool, { userId, projectId, title, model, con
     { mode: 0o2770, uid: config?.fdeUid ?? 1000, gid: config?.fdeGid ?? 1000 },
   );
 
+  // issue #88：显式传 title = 用户起名（含空串显式置空视为接管）→ 'manual'，自动更新不再覆盖；
+  // 未传 → 'auto'，等首条消息后的自动标题（session-title.js）。
+  const titleSource = title === undefined ? 'auto' : 'manual';
   const res = await pool.query(
-    `INSERT INTO chat_sessions (user_id, cwd, title, model)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, user_id, project_id, cwd, title, model, status, last_seq, created_at, updated_at`,
-    [userId, cwd, title ?? '', model ?? null],
+    `INSERT INTO chat_sessions (user_id, cwd, title, model, title_source)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, user_id, project_id, cwd, title, title_source, model, status, last_seq, created_at, updated_at`,
+    [userId, cwd, title ?? '', model ?? null, titleSource],
   );
   return rowToSession(res.rows[0]);
 }
@@ -236,10 +239,11 @@ export async function updateSession(pool, { userId, sessionId, title }) {
   if (typeof title !== 'string' || title.length > 200) {
     throw new SessionError('validation_failed', 'title 必须为 ≤200 字符的字符串', { details: { field: 'title' } });
   }
+  // issue #88：手工 PATCH 标题 → title_source='manual'（手工优先：自动更新只写 'auto' 行）。
   const res = await pool.query(
-    `UPDATE chat_sessions SET title = $2, updated_at = now()
+    `UPDATE chat_sessions SET title = $2, title_source = 'manual', updated_at = now()
       WHERE id = $1 AND status = 'active'
-      RETURNING id, user_id, project_id, cwd, title, model, status, last_seq, created_at, updated_at`,
+      RETURNING id, user_id, project_id, cwd, title, title_source, model, status, last_seq, created_at, updated_at`,
     [sessionId, title],
   );
   if (res.rows.length === 0) {
@@ -452,6 +456,7 @@ function rowToSession(r) {
     project_id: r.project_id ?? null,
     cwd: r.cwd ?? null,
     title: r.title,
+    title_source: r.title_source ?? 'auto', // issue #88：旧部署行由迁移 0009 回填；缺省兜底 'auto'
     model: r.model,
     status: r.status,
     last_seq: Number(r.last_seq),

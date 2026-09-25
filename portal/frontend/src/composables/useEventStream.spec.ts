@@ -35,6 +35,7 @@ function makeHooks() {
     onSysErr: vi.fn(),
     onToolCardCreated: vi.fn(),
     onCurrentRunEnd: vi.fn(),
+    onSessionUpdated: vi.fn(), // issue #88 自动标题刷新
   } satisfies EventStreamHooks;
 }
 
@@ -144,6 +145,21 @@ describe('useEventStream（mock EventSource）', () => {
     expect(hooks.onSep).toHaveBeenCalledWith('run 结束：正常完成 · tokens 3+5');
     expect(hooks.onSysErr).not.toHaveBeenCalled();
     expect(hooks.onCurrentRunEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('issue #88 session_updated：通知宿主原地更新标题（live-only 帧，无 seq 不进消息流）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('session_updated', { ts: 'x', session_id: 'sess-1', title: '修复登录白屏' });
+    expect(hooks.onSessionUpdated).toHaveBeenCalledTimes(1);
+    expect(hooks.onSessionUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 'sess-1', title: '修复登录白屏' }),
+    );
+    // 无 seq：不推进水位线；不产生 sep/syserr（标题不是时间线事件）
+    expect(s.lastSeq.value).toBe(0);
+    expect(hooks.onSep).not.toHaveBeenCalled();
+    expect(hooks.onSysErr).not.toHaveBeenCalled();
   });
 
   it('run_end 分级：failed 红色 syserr + error 信封；tokens 缺省 0', () => {
