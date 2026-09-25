@@ -43,6 +43,7 @@
 | 会话 | `DELETE /api/sessions/:id` | 归档会话 |
 | 对话 | `POST /api/sessions/:id/messages` | 发消息（创建 run） |
 | 对话 | `GET /api/sessions/:id/events` | **SSE 事件流**（§5） |
+| 对话 | `GET /api/sessions/:id/events/history` | run_events 展示类事件历史（§4.4a，刷新后重建卡片/面板） |
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
 | 端口 | `GET /api/projects/:id/ports` | 端口分配列表 |
@@ -644,6 +645,29 @@ station-portal user enable  --login <login>
 ### 4.4 `GET /api/sessions/:id/events`（SSE）
 
 实时事件流，详见 §5。
+
+### 4.4a `GET /api/sessions/:id/events/history`（issue #89：run_events 展示类事件历史）
+
+刷新后前端重建工具卡片 / judge 面板的**只读历史通路**（对齐 pi-web「转录即真相」：历史与实时走同一渲染入口）。
+
+- **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
+- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final`）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。
+- **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
+- **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
+- **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
+
+响应 `200`：
+
+```json
+{
+  "events": [
+    { "seq": 12, "run_id": "9d3b2f1e-...", "type": "tool_use", "payload": { "tool_call_id": "c1", "name": "bash", "input": { "cmd": "ls" } } }
+  ],
+  "next_cursor": null
+}
+```
+
+错误：`401 unauthorized`；`404 not_found`；`400 validation_failed`（`limit` / `before` 非正整数）。
 
 ### 4.5 `POST /api/sessions/:id/stop`
 

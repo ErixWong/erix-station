@@ -12,7 +12,7 @@
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
 import { api, ApiError } from '../api';
-import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload } from '../composables/useEventStream';
+import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
@@ -40,6 +40,7 @@ export interface ChatMessage {
   content: string;
   synthetic?: boolean;
   run_id?: string | null;
+  seq?: number; // issue #89：刷新后历史归并回放（与 run_events 共用分配器，按 seq 穿插）
 }
 
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
@@ -268,8 +269,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     renderedIds.value = new Set();
     entries.value = [];
     let data: SessionDetail;
+    let history: { events: RunHistoryEvent[] } | null = null;
     try {
-      data = await api<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`);
+      // issue #89：详情与展示类事件历史**并行**拉取（转录即真相对齐）；历史端点失败降级为
+      // 纯文本视图（旧行为），不影响详情加载。
+      const [d, h] = await Promise.all([
+        api<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`),
+        api<{ events: RunHistoryEvent[] }>(`/api/sessions/${encodeURIComponent(id)}/events/history`).catch(() => null),
+      ]);
+      data = d;
+      history = h;
     } catch (e) {
       if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value) return;
       if (e instanceof ApiError && (e.code === 'not_found' || e.status === 404)) {
@@ -283,7 +292,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value) return;
     es.lastSeq.value = data.last_seq;
     renderedIds.value = new Set();
-    for (const m of data.messages) addMessage(m);
+    // issue #89：messages（addMessage）与历史 run_events（es.replayEvent）按 seq 归并回放——
+    // 历史工具卡片走 toolCards/StreamPanel 同一渲染路径（callId 去重），judge → variant='judge'
+    // 的 sep，消息与卡片按 seq 正确穿插。replayEvent 为 history 模式：不推进水位线、不驱动
+    // 运行态状态机（run_end 已被后端白名单与前端双层短路）。
+    const merged: Array<{ seq: number; msg?: ChatMessage; ev?: RunHistoryEvent }> = [
+      ...data.messages.map((m) => ({ seq: m.seq ?? 0, msg: m })),
+      ...(history?.events ?? []).map((ev) => ({ seq: ev.seq, ev })),
+    ];
+    merged.sort((a, b) => a.seq - b.seq);
+    for (const item of merged) {
+      if (item.msg) addMessage(item.msg);
+      else if (item.ev) es.replayEvent(item.ev);
+    }
     if (data.session.active_run_id) {
       es.activeRunId.value = data.session.active_run_id;
     }
