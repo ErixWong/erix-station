@@ -239,6 +239,32 @@ describe('useEventStream（mock EventSource）', () => {
     expect(hooks.onSysErr).not.toHaveBeenCalled();
   });
 
+  it('judge 分隔行带 variant=judge，其余状态行（round/compaction 等）不带', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', { decision: { extend: true, plan: 'P', extendReason: 'R' } });
+    lastES().emit('judge', { decision: { extend: false, extendReason: '够用了' } });
+    lastES().emit('judge', { passThrough: 'on_track' });
+    lastES().emit('judge', { kind: 'intercept', action: 'executed', decision: { reason: 'ok' } });
+    // judge 四分支均以第二参数 'judge' 产出（面板样式高亮）
+    expect(hooks.onSep.mock.calls).toEqual([
+      ['judge：扩轮 — P（R）', 'judge'],
+      ['judge：不扩轮 — 够用了', 'judge'],
+      ['judge：放行（on_track）', 'judge'],
+      ['judge：executed — ok', 'judge'],
+    ]);
+
+    // 其余状态行保持无 variant 的灰色分隔行语义
+    lastES().emit('round_start', { round: 2 });
+    lastES().emit('compaction', { round: 2, compaction: { foldedRounds: 3, tokensBefore: 100, tokensAfter: 40 } });
+    lastES().emit('final_guard', { action: 'accept', reason: 'fine' });
+    lastES().emit('forced_final', { round: 5, reason: 'cap' });
+    for (const call of hooks.onSep.mock.calls.slice(4)) {
+      expect(call[1]).toBeUndefined();
+    }
+  });
+
   it('reasoning_delta/usage/未知类型忽略；畸形 JSON 忽略；ping 忽略', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);

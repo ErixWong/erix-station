@@ -88,8 +88,8 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
          类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
     <div v-else-if="en.kind === 'delta'" class="msg assistant md" v-html="renderMarkdown(en.text)"></div>
-    <!-- roundsep / 系统分隔行 -->
-    <div v-else-if="en.kind === 'sep'" class="roundsep">{{ en.text }}</div>
+    <!-- roundsep / 系统分隔行（judge 事件以 variant='judge' 走黄色面板样式） -->
+    <div v-else-if="en.kind === 'sep'" :class="en.variant === 'judge' ? 'roundsep judge-panel' : 'roundsep'">{{ en.text }}</div>
     <!-- issue #42：红色系统错误行 -->
     <div v-else-if="en.kind === 'syserr'" class="syserr">{{ en.text }}</div>
     <!-- 工具卡片（issue #85：可折叠，默认收起；ok/err 左边框分级；头部整行 button 防溢出） -->
