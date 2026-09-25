@@ -46,8 +46,8 @@ export interface RunEndPayload {
 }
 
 export interface EventStreamHooks {
-  /** roundsep / 系统分隔行（judge/compaction/run_end 灰色文案等）。 */
-  onSep: (text: string) => void;
+  /** roundsep / 系统分隔行（judge/compaction/run_end 灰色文案等；judge 事件带 variant='judge'，由面板样式高亮）。 */
+  onSep: (text: string, variant?: 'judge') => void;
   /** .syserr 红色错误行（RUN_FAIL_REASONS / run 失败信封）。 */
   onSysErr: (text: string) => void;
   /** 工具卡片**首次创建**时通知宿主（宿主负责在消息流中占位，保持插入顺序）。 */
@@ -168,17 +168,17 @@ export function useEventStream(hooks: EventStreamHooks) {
         // （orchestrator round judge）；passThrough 挂在 intercept 类事件上
         // （checkpoint-executor，action='executed' + passThrough='on_track'|'readonly'）。
         const dec = d.decision ?? {};
-        if (d.passThrough) { hooks.onSep(`judge：放行（${d.passThrough}）`); return; }
+        if (d.passThrough) { hooks.onSep(`judge：放行（${d.passThrough}）`, 'judge'); return; }
         if (dec.extend === true) {
-          hooks.onSep(`judge：扩轮${dec.plan ? ' — ' + String(dec.plan).slice(0, 80) : ''}${dec.extendReason ? '（' + String(dec.extendReason).slice(0, 60) + '）' : ''}`);
+          hooks.onSep(`judge：扩轮${dec.plan ? ' — ' + String(dec.plan).slice(0, 80) : ''}${dec.extendReason ? '（' + String(dec.extendReason).slice(0, 60) + '）' : ''}`, 'judge');
           return;
         }
         if (dec.extend === false) {
-          hooks.onSep(`judge：不扩轮${dec.extendReason ? ' — ' + String(dec.extendReason).slice(0, 80) : ''}`);
+          hooks.onSep(`judge：不扩轮${dec.extendReason ? ' — ' + String(dec.extendReason).slice(0, 80) : ''}`, 'judge');
           return;
         }
         if (d.kind === 'intercept' || d.action) {
-          hooks.onSep(`judge：${d.action ?? ''}${dec.reason ? ' — ' + dec.reason : ''}`);
+          hooks.onSep(`judge：${d.action ?? ''}${dec.reason ? ' — ' + dec.reason : ''}`, 'judge');
         }
         return;
       }

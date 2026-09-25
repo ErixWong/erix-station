@@ -45,7 +45,7 @@ export interface ChatMessage {
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
 export type StreamEntry =
   | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null }
-  | { kind: 'sep'; text: string }
+  | { kind: 'sep'; text: string; variant?: 'judge' }
   | { kind: 'syserr'; text: string }
   | { kind: 'tool'; callId: string }
   | { kind: 'delta'; text: string };
@@ -90,7 +90,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   // SSE 协议状态 + 事件语义（hooks 接回展示层）。
   const es = useEventStream({
-    onSep: (text) => entries.value.push({ kind: 'sep', text }),
+    onSep: (text, variant) => entries.value.push({ kind: 'sep', text, variant }),
     onSysErr: (text) => entries.value.push({ kind: 'syserr', text }),
     onToolCardCreated: (callId) => entries.value.push({ kind: 'tool', callId }),
     onCurrentRunEnd: (d) => {

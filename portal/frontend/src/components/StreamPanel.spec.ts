@@ -57,6 +57,20 @@ describe('消息渲染（pi-web 风格对齐）', () => {
   });
 });
 
+describe('分隔行渲染（roundsep）', () => {
+  it('judge variant 渲染为黄色面板 .roundsep.judge-panel；普通 sep 保持灰色 .roundsep', () => {
+    const store = useWorkbenchStore();
+    store.entries.push({ kind: 'sep', text: 'round 2' });
+    store.entries.push({ kind: 'sep', text: 'judge：扩轮 — P（R）', variant: 'judge' });
+    const wrapper = mount(StreamPanel);
+    const seps = wrapper.findAll('.roundsep');
+    expect(seps).toHaveLength(2);
+    expect(seps[0].classes()).toEqual(['roundsep']);
+    expect(seps[1].classes()).toEqual(['roundsep', 'judge-panel']);
+    expect(seps[1].text()).toBe('judge：扩轮 — P（R）');
+  });
+});
+
 describe('工具卡片折叠（issue #85）', () => {
   it('默认折叠：只有头部 button，无 pre 结果区', () => {
     const { wrapper } = setup({ c1: { name: 'bash', dig: '{}', args: '{"command":"ls"}', ok: null, out: '' } });
