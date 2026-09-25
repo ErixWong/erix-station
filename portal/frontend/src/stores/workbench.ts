@@ -98,6 +98,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       notifyRunEnd(d);
       refreshSession(d.run_id);
     },
+    // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
+    onSessionUpdated: (d) => {
+      const sid = d.session_id != null ? String(d.session_id) : sessionId.value;
+      if (typeof d.title !== 'string' || sid == null) return;
+      const item = sessions.value.find((s) => String(s.id) === sid);
+      if (item) item.title = d.title;
+    },
   });
 
   // ---- 计算属性（旧 updateProjectMeta / updateWorkspaceAvailability / setRunning 的响应式等价）----
