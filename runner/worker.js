@@ -15,6 +15,7 @@
 process.umask(0o002);
 
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   createJsonFileModelConfigProvider,
   createOpenAIProvider,
@@ -175,6 +176,25 @@ function loopEventPayload(event) {
 // ---------------------------------------------------------------------------
 // run 主流程（§6.3 组装 runToolLoop 参数）
 // ---------------------------------------------------------------------------
+/**
+ * 确保项目目录是 git 仓库（issue #84 P5 配套，2026-09-24 用户要求强制）：
+ * cwd/.git 不存在 → git init -b main（以 worker 身份跑，属主天然正确；幂等；失败仅 warn 不阻断）。
+ * 动机：①产物快照对所有项目走 diff 模式（只拍变化，天然小）；②用户 git 自治的基线。
+ * 已是仓库（含 clone 来的）→ 零操作。execFileSync 导入自 child_process 的 spawnSync 不依赖 PATH 外组件。
+ */
+function ensureGitRepo(cwd, log2) {
+  if (fs.existsSync(path.join(cwd, '.git'))) return;
+  const r = spawnSync('git', ['init', '-b', 'main'], { cwd, timeout: 10_000, stdio: 'ignore' });
+  if (r.error || r.status !== 0) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `git init failed (continuing without repo): ${String(r.error?.message ?? `exit ${r.status}`)}`,
+    });
+    return;
+  }
+  sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'info', msg: `git init -b main in project dir (was not a repo)` });
+}
+
 async function startRun(msg) {
   runStart = msg;
   runId = msg.run_id;
@@ -213,6 +233,7 @@ async function startRun(msg) {
   //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；issue #46 起走
   //    0.10.0 装配工厂，notesDir 为 agentd 下行的 run 数据目录，logical-run 作用域跨 attempt 保留）；
   //    approvals 钩子 P2 留空）。
+  ensureGitRepo(cwd);
   const jail = createJail({ root: cwd, writable: [cwd] });
   const fileTools = createFileTools(jail);
   // issue #46（选项 A，logical-run 作用域）：notesDir 由 agentd 下行（run 数据目录
