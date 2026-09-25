@@ -32,6 +32,7 @@ import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed } from './lib/transcript-seed.js';
 import { mapHistoryToInitialMessages } from './lib/history.js';
+import { generateSessionTitle, resolveFirstUserContent } from './lib/session-title.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -379,6 +380,20 @@ async function startRun(msg) {
       signal: abortController.signal,
     });
 
+    // issue #88 修订（2026-09-25 用户拍板）：标题改由 agent 侧顺带生成——runToolLoop 正常返回后
+    // 用既有 provider 发一次小请求（非流式、10s 超时、maxTokens 512；思考型模型兼容归引擎 provider
+    // 层管，portal 不再独立调 relay）。开关 ERIX_SESSION_AUTO_TITLE（'0' 关，provisioner 下发链）。
+    // 失败/超时/空 → 空串（portal 走降级链），generateSessionTitle 全链 catch，绝不阻塞终态上报。
+    let title = '';
+    if (process.env.ERIX_SESSION_AUTO_TITLE !== '0') {
+      title = await generateSessionTitle({
+        provider,
+        firstUserContent: resolveFirstUserContent({ history: msg.history, task }),
+        finalText: result.finalText ?? '',
+        // 失败 warn 走 IPC LOG → agentd 日志（与 worker 其它日志同径，stderr 兜底在 lib 内）。
+        log: { warn: (m) => sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: m }) },
+      });
+    }
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
@@ -387,6 +402,7 @@ async function startRun(msg) {
       usage: result.usage ?? { input_tokens: 0, output_tokens: 0 },
       rounds: result.rounds ?? 0,
       final_text: result.finalText ?? '',
+      title,
     });
   } catch (err) {
     const aborted = abortController?.signal?.aborted === true;
@@ -399,6 +415,7 @@ async function startRun(msg) {
       usage: { input_tokens: 0, output_tokens: 0 },
       rounds: 0,
       final_text: '',
+      title: '', // 失败路径不生成标题（portal 降级链兜住）
       error: {
         code,
         message: String(err?.message ?? err),

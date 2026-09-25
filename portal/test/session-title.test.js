@@ -1,11 +1,14 @@
-// 单测：issue #88 会话标题自动生成与自动更新（portal/src/session-title.js + sessions.js title_source 语义）。
+// 单测：issue #88 会话标题自动落库与自动更新（portal/src/session-title.js + sessions.js title_source 语义）。
+// 2026-09-25 修订：标题生成移到 agent（worker）侧（runner/lib/session-title.js，随 run_finished 上报），
+// portal 侧 evaluateAutoTitle 不再发任何 HTTP——消费 agentTitle → 防抖判据 → title_source='auto' 守卫
+// 落库 → SSE session_updated。降级链：agent title 缺失/空 → 首条用户消息截断 → cwd basename。
 // 覆盖：
 //   * title_source 语义：createSession 显式 title → manual / 缺省 → auto；updateSession 改 title → manual；
 //     自动更新 UPDATE 只写 title_source='auto' 的行（manual 行 0 行不覆盖）。
-//   * 生成降级链：LLM 成功 → 清洗后 ≤30 字符；LLM 失败/超时 → 首条用户消息截断；空消息 → cwd basename。
+//   * agentTitle 消费：上报标题清洗落库 + SSE；空/缺失 → 降级链（首条消息截断 / cwd basename）。
 //   * 节流判据（shouldRefreshTitle 纯函数 + evaluateAutoTitle 集成）：首启必生成、≥N 轮新 user 消息、
 //     话题漂移启发式（关键词零重合）、manual 行直接跳过、开关关闭 no-op。
-// 隔离约定（docs/testing.md §2.1）：内存 fake pool + mock fetchImpl，不碰真实 DB / 网络。
+// 隔离约定（docs/testing.md §2.1）：内存 fake pool，不碰真实 DB / 网络。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -17,7 +20,6 @@ import {
   sanitizeTitle,
   clipTitleFromMessage,
   fallbackTitleFromCwd,
-  buildTitlePrompt,
   evaluateAutoTitle,
 } from '../src/session-title.js';
 import { createSession, updateSession } from '../src/sessions.js';
@@ -104,16 +106,6 @@ test('clipTitleFromMessage / fallbackTitleFromCwd：首条消息截断与 cwd ba
   assert.equal(fallbackTitleFromCwd(null), '未命名会话');
 });
 
-test('buildTitlePrompt：含首条与最近用户消息 + 长度约束（锚定 prompt 语义）', () => {
-  const p = buildTitlePrompt({ firstUserContent: '修复登录', latestUserContent: '还是白屏' });
-  assert.ok(p.includes(`不超过 ${AUTO_TITLE_MAX_LEN} 个字符`));
-  assert.ok(p.includes('对话首条用户消息：修复登录'));
-  assert.ok(p.includes('最近一条用户消息：还是白屏'));
-  // 首条 = 最近时不重复带最近一条。
-  const p2 = buildTitlePrompt({ firstUserContent: 'hi', latestUserContent: 'hi' });
-  assert.ok(!p2.includes('最近一条用户消息'));
-});
-
 // ---------------------------------------------------------------------------
 // sessions.js：title_source 语义（createSession / updateSession）
 // ---------------------------------------------------------------------------
@@ -181,13 +173,13 @@ test('updateSession：改 title → title_source=manual', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// evaluateAutoTitle：fake pool 集成（mock fetchImpl，不碰网络）
+// evaluateAutoTitle：fake pool 集成（消费 agent 上报 title，不发任何 HTTP）
 // ---------------------------------------------------------------------------
 
 const CFG = { sessionAutoTitle: true, sessionAutoTitleMinNew: 3 };
 
-/** 可编排 fake pool：一张 chat_sessions 行 + messages 数组 + 可选 LLM 配置行。 */
-function titlePool({ session = {}, messages = [], llmConfig = null } = {}) {
+/** 可编排 fake pool：一张 chat_sessions 行 + messages 数组。 */
+function titlePool({ session = {}, messages = [] } = {}) {
   const queries = [];
   const sess = {
     id: 's1', user_id: 'u1', title: '', title_source: 'auto', cwd: '~/projects/demo',
@@ -213,9 +205,6 @@ function titlePool({ session = {}, messages = [], llmConfig = null } = {}) {
         const n = messages.filter((m) => m.role === 'user' && m.seq > params[1]).length;
         return { rows: [{ n }] };
       }
-      if (sql.includes('FROM fde_llm_bindings b')) {
-        return { rows: llmConfig ? [llmConfig] : [] };
-      }
       if (sql.startsWith('UPDATE chat_sessions')) {
         // 模拟 DB 守卫：UPDATE 只写 title_source='auto' 的行
         if (sess.title_source !== 'auto') return { rows: [], rowCount: 0 };
@@ -230,95 +219,50 @@ function titlePool({ session = {}, messages = [], llmConfig = null } = {}) {
   return pool;
 }
 
-const LLM_CFG_ROW = {
-  fde_id: 'u1', api_key: 'sk-test-not-real', state: 'active',
-  provider_id: 'p1', provider_name: 'mock', base_url: 'http://mock-llm.invalid/v1',
-  main_upstream: 'mock-model', main_name: 'Mock', main_type: 'text',
-  embedding_upstream: null, embedding_name: null, embedding_type: null,
-  vision_upstream: null, vision_name: null, vision_type: null,
-};
-
-/** mock fetch：按脚本返回 OpenAI 兼容响应（或抛错/超时语义）。 */
-function mockFetch(script) {
-  const calls = [];
-  const fn = async (url, opts = {}) => {
-    calls.push({ url, opts });
-    const s = typeof script === 'function' ? script(url, opts) : script;
-    if (s instanceof Error) throw s;
-    if (s && s.__timeout) {
-      // 模拟不返回的 LLM：等 AbortController 触发（evaluateAutoTitle 超时 10s 太长，用 close 语义即抛）
-      throw new Error('The operation was aborted');
-    }
-    return {
-      ok: s.ok ?? true,
-      status: s.status ?? 200,
-      json: async () => s.body,
-    };
-  };
-  fn.calls = calls;
-  return fn;
-}
-
-test('evaluateAutoTitle：LLM 成功 → 清洗后标题落库（auto_title_seq 推进）+ SSE 通知', async () => {
+test('evaluateAutoTitle：agent 上报标题 → 清洗后落库（auto_title_seq 推进）+ SSE 通知', async () => {
   const pool = titlePool({
     messages: [{ role: 'user', content: '帮我修复登录页面的白屏问题', seq: 1 }],
-    llmConfig: LLM_CFG_ROW,
   });
-  const fetchImpl = mockFetch({ body: { choices: [{ message: { content: '「修复登录白屏」' } }] } });
   const notified = [];
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', runId: 'r1', config: CFG, fetchImpl,
+    sessionId: 's1', runId: 'r1', agentTitle: '「修复登录白屏」', config: CFG,
     notify: (sid, events) => notified.push({ sid, events }),
     log: { warn() {}, info() {} },
   });
   assert.equal(title, '修复登录白屏', '引号包裹被清洗');
-  assert.ok(fetchImpl.calls.length === 1, '恰好一次 LLM 调用');
-  assert.ok(fetchImpl.calls[0].url.startsWith('http://mock-llm.invalid/v1/v1') === false, 'base_url 已含 /v1 时不得重复拼接');
-  assert.equal(fetchImpl.calls[0].url, 'http://mock-llm.invalid/v1/chat/completions');
-  assert.equal(JSON.parse(fetchImpl.calls[0].opts.body).model, 'mock-model');
-  assert.equal(JSON.parse(fetchImpl.calls[0].opts.body).stream, false);
   assert.equal(notified.length, 1, '标题更新经 SSE 推送');
   assert.equal(notified[0].events[0].type, 'session_updated');
   assert.equal(notified[0].events[0].payload.title, '修复登录白屏');
   assert.equal(pool.updates.length, 1, '落库一次');
 });
 
-test('evaluateAutoTitle：LLM 失败/超时 → 降级首条用户消息截断（主链路无感知）', async () => {
+test('evaluateAutoTitle：agent title 缺失/空串 → 降级首条用户消息截断', async () => {
   const long = '帮我修复登录页面的白屏问题并补充单元测试覆盖边界情况尤其会话过期'.repeat(2);
-  const pool = titlePool({
-    messages: [{ role: 'user', content: long, seq: 1 }],
-    llmConfig: LLM_CFG_ROW,
-  });
-  const fetchImpl = mockFetch(new Error('connect ECONNREFUSED'));
-  const warns = [];
-  const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl,
-    log: { warn: (m) => warns.push(m), info() {} },
-  });
   const expected = Array.from(long.replace(/\s+/g, ' ').trim()).slice(0, AUTO_TITLE_MAX_LEN).join('');
-  assert.equal(title, expected, '降级 = 首条消息截断 30 字符');
-  assert.ok(warns.some((m) => m.includes('降级')), '降级路径有 warn 日志');
+  for (const agentTitle of ['', '   ', undefined, null]) {
+    const pool = titlePool({ messages: [{ role: 'user', content: long, seq: 1 }] });
+    const title = await evaluateAutoTitle(pool, {
+      sessionId: 's1', agentTitle, config: CFG, log: { warn() {}, info() {} },
+    });
+    assert.equal(title, expected, `agentTitle=${JSON.stringify(agentTitle)} → 降级 = 首条消息截断 30 字符`);
+  }
 });
 
-test('evaluateAutoTitle：LLM 配置缺失 → 直接降级首条消息截断（不发起 HTTP）', async () => {
+test('evaluateAutoTitle：agent title 超 30 字符 → 清洗截断后落库', async () => {
   const pool = titlePool({ messages: [{ role: 'user', content: '写个排序脚本', seq: 1 }] });
-  const fetchImpl = mockFetch({ body: {} });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl, log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: '长'.repeat(50), config: CFG, log: { warn() {}, info() {} },
   });
-  assert.equal(title, '写个排序脚本');
-  assert.equal(fetchImpl.calls.length, 0, '无 LLM 配置不得发请求');
+  assert.equal(title, '长'.repeat(AUTO_TITLE_MAX_LEN), 'agent 侧已清洗，portal 再过一遍幂等');
 });
 
-test('evaluateAutoTitle：LLM 返回畸形/空白 → 降级 cwd basename（首条消息为空时）', async () => {
+test('evaluateAutoTitle：agent title 不合规（仅空引号）且首条消息为空 → 末级降级 cwd basename', async () => {
   const pool = titlePool({
     session: { cwd: '~/projects/meeting_asr_app' },
     messages: [{ role: 'user', content: '   ', seq: 1 }],
-    llmConfig: LLM_CFG_ROW,
   });
-  const fetchImpl = mockFetch({ body: { choices: [] } }); // 无 message.content → 畸形
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl, log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: '「」', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, 'meeting_asr_app', '末级降级 = cwd basename');
 });
@@ -327,10 +271,9 @@ test('evaluateAutoTitle：manual 行绝不覆盖（并发手工 PATCH 语义）'
   const pool = titlePool({
     session: { title: '我手工起的名', title_source: 'manual' },
     messages: [{ role: 'user', content: '随便聊聊', seq: 9 }],
-    llmConfig: LLM_CFG_ROW,
   });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl: mockFetch({}), log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: '新话题标题', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
   assert.equal(pool.updates.length, 0, 'manual 行零 UPDATE');
@@ -340,7 +283,6 @@ test('evaluateAutoTitle：UPDATE 命中 0 行（评估期间被改 manual）→ 
   // 模拟竞态：SELECT 时还是 auto，UPDATE 时被并发 PATCH 置 manual → rowCount=0。
   const pool = titlePool({
     messages: [{ role: 'user', content: '修 bug', seq: 1 }],
-    llmConfig: LLM_CFG_ROW,
   });
   const orig = pool.query.bind(pool);
   pool.query = async (sql, params) => {
@@ -352,7 +294,7 @@ test('evaluateAutoTitle：UPDATE 命中 0 行（评估期间被改 manual）→ 
   };
   const notified = [];
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl: mockFetch({ body: { choices: [{ message: { content: '修 bug' } }] } }),
+    sessionId: 's1', agentTitle: '修 bug', config: CFG,
     notify: (sid, events) => notified.push(events),
     log: { warn() {}, info() {} },
   });
@@ -367,15 +309,12 @@ test('evaluateAutoTitle：防抖——未到 N 轮且话题未漂移 → 不刷�
       { role: 'user', content: '修复登录 bug', seq: 1 },
       { role: 'user', content: '登录页颜色再调下', seq: 7 }, // 与标题有重合（登录）
     ],
-    llmConfig: LLM_CFG_ROW,
   });
-  const fetchImpl = mockFetch({});
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl, log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: '全新标题', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
   assert.equal(pool.updates.length, 0);
-  assert.equal(fetchImpl.calls.length, 0, '不刷新则不花 LLM 调用');
 });
 
 test('evaluateAutoTitle：≥N 轮新 user 消息 → 刷新（即使话题相关）', async () => {
@@ -387,21 +326,19 @@ test('evaluateAutoTitle：≥N 轮新 user 消息 → 刷新（即使话题相�
       { role: 'user', content: '登录报错处理', seq: 7 },
       { role: 'user', content: '登录页收尾', seq: 8 },
     ],
-    llmConfig: LLM_CFG_ROW,
   });
-  const fetchImpl = mockFetch({ body: { choices: [{ message: { content: '登录页优化' } }] } });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl, log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: '登录页优化', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, '登录页优化');
   assert.equal(pool.updates.length, 1);
 });
 
 test('evaluateAutoTitle：开关关闭（ERIX_SESSION_AUTO_TITLE=0）→ no-op', async () => {
-  const pool = titlePool({ messages: [{ role: 'user', content: 'hi', seq: 1 }], llmConfig: LLM_CFG_ROW });
+  const pool = titlePool({ messages: [{ role: 'user', content: 'hi', seq: 1 }] });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: { sessionAutoTitle: false, sessionAutoTitleMinNew: 3 },
-    fetchImpl: mockFetch({}), log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: 'hi', config: { sessionAutoTitle: false, sessionAutoTitleMinNew: 3 },
+    log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
   assert.equal(pool.queries.length, 0, '开关关闭时连 DB 都不查');
@@ -410,7 +347,7 @@ test('evaluateAutoTitle：开关关闭（ERIX_SESSION_AUTO_TITLE=0）→ no-op',
 test('evaluateAutoTitle：会话已归档/不存在 → 安静跳过', async () => {
   const pool = titlePool({ session: { status: 'gone' }, messages: [{ role: 'user', content: 'hi', seq: 1 }] });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl: mockFetch({}), log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: 'hi', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
 });
@@ -418,7 +355,7 @@ test('evaluateAutoTitle：会话已归档/不存在 → 安静跳过', async () 
 test('evaluateAutoTitle：评估链抛错（DB 故障）→ 吞掉返回 null，不向上抛', async () => {
   const pool = { query: async () => { throw new Error('db down'); } };
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', config: CFG, fetchImpl: mockFetch({}), log: { warn() {}, info() {} },
+    sessionId: 's1', agentTitle: 'hi', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
 });

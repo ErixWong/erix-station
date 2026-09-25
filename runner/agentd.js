@@ -908,6 +908,9 @@ async function onWorkerFinished(ctx, msg) {
     usage: msg.usage ?? { input_tokens: 0, output_tokens: 0 },
     rounds: msg.rounds ?? 0,
     final_text: msg.final_text ?? '',
+    // issue #88 修订：worker 侧已顺带生成会话标题（ERIX_SESSION_AUTO_TITLE 开关），随终态透传；
+    // 缺失/空串 → portal 落库评估走降级链（首条消息截断 → cwd basename）。
+    title: typeof msg.title === 'string' ? msg.title : '',
   };
   if (!msg.ok && msg.termination?.reason !== 'aborted') {
     body.error = msg.error ?? { code: 'failed', message: 'run failed', retryable: false };
