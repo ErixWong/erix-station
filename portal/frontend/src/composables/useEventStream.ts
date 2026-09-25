@@ -21,7 +21,7 @@ const EVENT_TYPES = [
   'round_start', 'round_end', 'attempt', 'recovering', 'recovered', 'usage',
   'tool_use', 'tool_result', 'assistant_delta', 'reasoning_delta',
   'tool_call_delta', 'judge', 'compaction', 'final_guard', 'forced_final',
-  'run_end', 'ping', 'resync',
+  'run_end', 'session_updated', 'ping', 'resync', // issue #88：session_updated = 自动标题刷新（live-only，不落 run_events）
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
@@ -54,6 +54,8 @@ export interface EventStreamHooks {
   onToolCardCreated: (callId: string) => void;
   /** 当前 run 的 run_end（通知 + 终稿回写在宿主侧做：notifyRunEnd / refreshSession）。 */
   onCurrentRunEnd: (d: RunEndPayload & Record<string, unknown>) => void;
+  /** issue #88：自动标题刷新（portal run 终态后异步评估、经 session SSE 推送）——宿主原地更新列表项。 */
+  onSessionUpdated?: (d: { session_id?: string; title?: string } & Record<string, unknown>) => void;
 }
 
 // dig 摘要：对象 → JSON 截 120 字；其余 → String 截 120（旧 toolCard 原样）。
@@ -125,6 +127,10 @@ export function useEventStream(hooks: EventStreamHooks) {
     if (typeof d.seq === 'number') lastSeq.value = Math.max(lastSeq.value, d.seq);
     switch (type) {
       case 'ping': return;
+      case 'session_updated':
+        // issue #88：标题是会话元数据而非时间线事件（live-only 帧，无 seq）；只更新列表项，不进消息流。
+        hooks.onSessionUpdated?.(d);
+        return;
       case 'round_start':
         if (deltaText.value) { deltaText.value = null; }
         hooks.onSep(`round ${d.round}`); return;

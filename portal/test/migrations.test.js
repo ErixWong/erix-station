@@ -49,7 +49,8 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 8, '0008 是最后编号（连续无空洞）');
+  // issue #88 起 0009 为最后编号；本断言随新迁移递增（README：编号连续无空洞）。
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 9, '0009 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -73,4 +74,41 @@ test('baseline 冻结：docs/data/schema.sql 不含 0008 的 cwd 列（DDL 只�
   );
   // 注：runs 表头注释含「禁止 cwd 派生」字样（规格 §9.3-3），故只断言无 cwd 列定义。
   assert.ok(!/\bcwd\s+text/.test(chatSessions), 'baseline chat_sessions 不得回写 cwd 列');
+});
+
+// 0009（issue #88 会话标题自动生成）：title_source 语义列 + auto_title_seq 游标，
+// 存量手工标题回填 'manual'（auto_title_seq IS NULL 守卫 → 可重放且不误伤未来自动标题行）。
+test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语义锚点齐全', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 9, '0009 是最后编号（连续无空洞）');
+
+  const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
+  assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
+  assert.ok(sql.includes("CHECK (title_source IN ('auto', 'manual'))"), "title_source 枚举 'auto'/'manual'");
+  assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS auto_title_seq'), 'chat_sessions 加 auto_title_seq 游标列（幂等）');
+  // 回填守卫：只动「auto + 从未自动更新 + 标题非空」的行（可重放，不翻未来自动标题行）。
+  assert.ok(sql.includes("SET title_source = 'manual'"), '存量非空标题回填 manual');
+  assert.ok(sql.includes('AND auto_title_seq IS NULL'), '回填守卫：只动从未自动更新的行');
+  assert.ok(sql.includes("AND btrim(title) <> ''"), '回填只动标题非空的行');
+
+  // 语句级幂等（README 单文件约定）：除 UPDATE 外全部 IF NOT EXISTS；UPDATE 由 WHERE 守卫可重放。
+  const statements = sql.split(';').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('--'));
+  for (const stmt of statements) {
+    const head = stmt.replace(/^--[^\n]*\n/g, '').trim().toUpperCase();
+    if (head.startsWith('UPDATE')) continue; // 条件 UPDATE，WHERE 守卫保证可重放
+    assert.ok(head.startsWith('ALTER TABLE'), `0009 只允许 ALTER/条件 UPDATE，发现：${head.slice(0, 60)}`);
+    assert.ok(head.includes('IF NOT EXISTS'), `ALTER 必须 IF NOT EXISTS：${head.slice(0, 60)}`);
+  }
+});
+
+test('baseline 冻结：docs/data/schema.sql 不含 0009 的 title_source/auto_title_seq 列（DDL 只走增量文件）', () => {
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  const chatSessions = baseline.slice(
+    baseline.indexOf('CREATE TABLE chat_sessions'),
+    baseline.indexOf('CREATE TABLE runs'),
+  );
+  assert.ok(!/title_source/.test(chatSessions), 'baseline chat_sessions 不得回写 title_source 列');
+  assert.ok(!/auto_title_seq/.test(chatSessions), 'baseline chat_sessions 不得回写 auto_title_seq 列');
 });

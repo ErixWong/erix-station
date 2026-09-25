@@ -355,6 +355,15 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `ERIX_SHELL_MAX_TIMEOUT_MS` | agent shell 工具超时上限（单次调用超上限按上限钳制）；DEFAULT 自动钳 ≤ 此值 | `600000` |
 | `ERIX_SHELL_OUTPUT_MAX_BYTES` | agent shell 工具输出截断上限（字节，影响模型可见输出量） | `32768` |
 
+### 10.3 补登：portal 侧环境变量（会话自动标题，issue #88，2026-09-25 登记）
+
+> 以下变量由 portal 进程读取（`portal/src/config.js`），不经 compose 插值（有缺省、可不进 `.env`）；此前未登记，随 issue #88 会话标题自动生成实现补齐。
+
+| 变量 | 用途 | 默认 / 示例 |
+|---|---|---|
+| `ERIX_SESSION_AUTO_TITLE` | 会话标题自动生成与自动更新总开关（issue #88）：portal 在 run 终态事件（finished/failed）后**异步**评估（不阻塞消息主链路），用该 FDE 自己的 LLM 配置走一次轻量补全生成 ≤30 字符标题；失败/超时降级链：首条用户消息截断 → cwd basename。手工改过的标题（`title_source='manual'`）不被覆盖 | `1`（开；`0` = 关闭） |
+| `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 防抖阈值 N：距上次自动标题更新 ≥ N 轮新 user 消息才刷新（或话题漂移启发式命中：≥1 轮新消息且与现标题关键词零重合） | `3` |
+
 ---
 
 ## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）
