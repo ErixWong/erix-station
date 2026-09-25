@@ -23,7 +23,7 @@ import {
   runToolLoop,
 } from 'erix-agent';
 import { createToolRegistry } from 'erix-agent/tools';
-import { MSG, createReqIdGenerator, sendIpc } from './lib/ipc.js';
+import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
 import { parseMaxRounds } from './lib/config.js';
 import { resolveRunModel } from './lib/llm-models.js';
 import { createFileTools, createJail } from './lib/file-tools.js';
@@ -96,7 +96,7 @@ function ipcRequest(type, payload) {
     const ok = sendIpc(process, { type, req_id: reqId, ...payload });
     if (!ok) {
       pendingStore.delete(reqId);
-      reject(Object.assign(new Error('ipc channel closed'), { code: 'ipc_closed', retryable: true }));
+      reject(Object.assign(new Error(`ipc send failed: ${lastSendError ?? 'channel closed'}`), { code: 'ipc_closed', retryable: true }));
     }
   });
 }
