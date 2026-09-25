@@ -8,6 +8,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
 import { AUTO_FOLLOW_GAP } from '../lib/constants';
+import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
 import ComposerBar from '../components/ComposerBar.vue';
@@ -16,6 +17,9 @@ const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
 const store = useWorkbenchStore();
+
+// ---- issue #90：侧栏宽度拖拽调整（钳制/持久化/键盘微调在 composable 内）----
+const sidebar = useSidebarWidth();
 
 // 旧 who 文案：`login（role / fde_name）`，无 fde_name 时只显示 role。
 const who = computed(() => {
@@ -123,7 +127,8 @@ function jumpToLatest() {
 </script>
 
 <template>
-  <div class="h-screen flex flex-col bg-white">
+  <!-- 拖拽期间 select-none 防选中文本 -->
+  <div class="h-screen flex flex-col bg-white" :class="sidebar.dragging.value && 'select-none'">
     <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 md:hidden"
@@ -155,14 +160,31 @@ function jumpToLatest() {
         @click="drawerOpen = false"
       ></div>
       <!-- 侧栏：≥md 静态；<md 抽屉（旧 offcanvas-md + body.drawer-open 的 Tailwind 等价） -->
+      <!-- w-60 改 CSS 变量绑定（仅 ≥md 生效），shrink-0 保留 -->
       <aside
-        class="w-60 shrink-0 overflow-y-auto border-r border-black/10 p-2 bg-white"
+        class="w-60 md:w-(--sidebar-w) shrink-0 overflow-y-auto border-r border-black/10 p-2 bg-white"
+        :style="sidebar.asideStyle.value"
         :class="drawerOpen
           ? 'max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:shadow-lg'
           : 'max-md:hidden'"
       >
         <SidebarPanel @select-session="onSelectSession" @new-session="onNewSession" />
       </aside>
+      <!-- issue #90：拖拽把手 = aside 右缘兄弟元素（aside 内 overflow-y-auto，不放内部避免与滚动条打架） -->
+      <div
+        class="hidden md:block w-1 shrink-0 cursor-col-resize touch-none transition-colors"
+        :class="sidebar.dragging.value ? 'bg-brand/60' : 'bg-black/10 hover:bg-brand/40'"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整侧栏宽度"
+        :aria-valuenow="sidebar.width.value"
+        :aria-valuemin="SIDEBAR_MIN"
+        :aria-valuemax="SIDEBAR_MAX"
+        tabindex="0"
+        @pointerdown="sidebar.onHandlePointerDown"
+        @dblclick="sidebar.resetWidth"
+        @keydown="sidebar.onHandleKeydown"
+      ></div>
 
       <section class="relative flex flex-1 flex-col min-w-0">
         <div ref="streamEl" class="flex-1 overflow-auto p-3" @scroll="onStreamScroll">
