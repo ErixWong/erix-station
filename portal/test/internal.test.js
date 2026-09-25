@@ -593,6 +593,33 @@ test('F3：U12 release 终态分支（cancelling / 耗尽）合成 run_end', asy
   assert.ok(b.pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run-b:final:run_end'), '耗尽 release 合成 run_end');
 });
 
+// issue #88 修订：worker 侧生成的会话标题随终态上报——finishRun 收包校验（字符串、截断 ≤200）。
+test('U2 finish：title 字段校验——非字符串 400；超长字符串截断放行（fire-and-forget 评估落库）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+
+  // 非字符串 → 400 validation_failed（title 是可选增强字段，类型错不静默吞）。
+  await assert.rejects(
+    () => setRunState(pool, {
+      container, user, runId, claimToken,
+      body: { state: 'finished', termination: { reason: 'end_turn' }, title: 42 },
+    }),
+    (e) => e instanceof InternalError && e.status === 400 && e.code === 'validation_failed',
+  );
+  assert.equal(pool.runs[0].status, 'running', '校验失败不写终态');
+
+  // 超长字符串（>200 字符）→ 截断后放行（fire-and-forget 评估链，不阻塞终态响应）。
+  const res = await setRunState(pool, {
+    container, user, runId, claimToken,
+    body: { state: 'finished', termination: { reason: 'end_turn' }, title: '长'.repeat(500), final_text: 'done' },
+  });
+  assert.equal(res.state, 'finished');
+});
+
 test('F4：U2 finish 同载荷重放幂等（200），载荷不同 409 run_terminal', async () => {
   const { pool, userId, containerId, runId } = seedClaimable();
   const container = { id: containerId, user_id: userId };

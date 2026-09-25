@@ -355,14 +355,14 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `ERIX_SHELL_MAX_TIMEOUT_MS` | agent shell 工具超时上限（单次调用超上限按上限钳制）；DEFAULT 自动钳 ≤ 此值 | `600000` |
 | `ERIX_SHELL_OUTPUT_MAX_BYTES` | agent shell 工具输出截断上限（字节，影响模型可见输出量） | `32768` |
 
-### 10.3 补登：portal 侧环境变量（会话自动标题，issue #88，2026-09-25 登记）
+### 10.3 补登：portal 侧环境变量（会话自动标题，issue #88，2026-09-25 登记；同日修订为 agent 侧生成）
 
-> 以下变量由 portal 进程读取（`portal/src/config.js`），不经 compose 插值（有缺省、可不进 `.env`）；此前未登记，随 issue #88 会话标题自动生成实现补齐。
+> 以下变量由 portal 进程读取（`portal/src/config.js`），并经 provisioner 下发链（compose `station-portal` env → provisioner Env → FDE 容器 env，fde-proxy `ENV_KEY_ALLOW` 白名单已登记）同名下发 worker 侧。**2026-09-25 修订**（用户拍板）：标题生成从「portal 独立调 relay」改为「agent（worker）侧生成、随 `run_finished` 上报、portal 落库」——agent 跑任务时本就有完整上下文与既有 provider（§6.3，复用 Traefik 数据面与 key 注入），思考型模型兼容归引擎 provider 层管；portal 不再持有 LLM HTTP 客户端。变量名与开关语义不变（`0` = 两侧全关）。
 
 | 变量 | 用途 | 默认 / 示例 |
 |---|---|---|
-| `ERIX_SESSION_AUTO_TITLE` | 会话标题自动生成与自动更新总开关（issue #88）：portal 在 run 终态事件（finished/failed）后**异步**评估（不阻塞消息主链路），用该 FDE 自己的 LLM 配置走一次轻量补全生成 ≤30 字符标题；失败/超时降级链：首条用户消息截断 → cwd basename。手工改过的标题（`title_source='manual'`）不被覆盖 | `1`（开；`0` = 关闭） |
-| `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 防抖阈值 N：距上次自动标题更新 ≥ N 轮新 user 消息才刷新（或话题漂移启发式命中：≥1 轮新消息且与现标题关键词零重合） | `3` |
+| `ERIX_SESSION_AUTO_TITLE` | 会话标题自动生成与自动更新总开关（issue #88）：worker 侧在 `runToolLoop` 正常返回后用既有 provider 发一次轻量非流式补全（首条用户消息 + finalText 各截 500 字符，≤30 字符标题，10s 超时，maxTokens 512），标题随 `run_finished` 上报、portal 异步评估落库（不阻塞消息主链路）；失败/空降级链：首条用户消息截断 → cwd basename。手工改过的标题（`title_source='manual'`）不被覆盖。**下发光纤**：portal env → provisioner Env → FDE 容器 env | `1`（开；`0` = 关闭） |
+| `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 防抖阈值 N：距上次自动标题更新 ≥ N 轮新 user 消息才刷新（或话题漂移启发式命中：≥1 轮新消息且与现标题关键词零重合）。portal 侧落库评估用，不下发 worker | `3` |
 
 ---
 
