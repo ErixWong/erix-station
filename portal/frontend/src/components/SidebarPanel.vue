@@ -53,8 +53,9 @@ async function onSubmitNewDir() {
 </script>
 
 <template>
-  <!-- issue #92：aside 内 flex-col 三段（固定头 / 列表独立滚 / 树固定底）；h-full 铺满 aside 高 -->
   <div class="flex h-full min-h-0 flex-col">
+    <!-- issue #92：aside 内 flex-col 三段（固定头 / 列表独立滚 / 树固定底）；h-full 铺满 aside 高 -->
+    <!-- ⚠️ 根级不放注释：注释+元素会被 Vue 3 编成多根 fragment（禁用属性透传，也破坏单根断言） -->
     <!-- ① 固定头：不随会话列表滚动 -->
     <div class="shrink-0">
       <!-- 常驻「管理台」入口（旧 index.html header adminLink 的 SPA 等价；admin 角色才显示） -->
