@@ -127,7 +127,9 @@ async function callLlmForTitle({ cfg, prompt, fetchImpl, timeoutMs }) {
         model: cfg.main.model_id,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.2,
-        max_tokens: 64,
+        // 512 而非 64：用户主模型可能是思考型（如 deepseek-flash，reasoning_content 先烧 token），
+        // 给小会把 max_tokens 全烧在 reasoning、content 空串 → 白白降级（真机实锳）。512 对标题任务仍极廉价。
+        max_tokens: 512,
         stream: false,
       }),
       signal: ctrl.signal,
@@ -208,6 +210,12 @@ export async function evaluateAutoTitle(pool, { sessionId, runId, config, fetchI
       } catch (err) {
         log?.warn?.(`[auto-title] llm 生成失败，降级首条消息截断（session=${sessionId} run=${runId ?? ''}）：${String(err?.message ?? err)}`);
       }
+    } else if (llmCfg) {
+      // 配置存在但缺关键字段（如 key/base_url 空）——静默降级，留 warn 便于排查。
+      log?.warn?.(`[auto-title] llm 配置不完整，降级首条消息截断（session=${sessionId}）`);
+    }
+    if (title == null && llmCfg) {
+      log?.warn?.(`[auto-title] llm 返回不可用（空/畸形），降级首条消息截断（session=${sessionId} run=${runId ?? ''}）`);
     }
     if (title == null) title = clipTitleFromMessage(first.content);
     if (title == null) title = fallbackTitleFromCwd(s.cwd);
