@@ -147,6 +147,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 **`run_end` 唯一性与来源（A4 定稿）**：`type='run_end'` 是 portal 在 U2 终态事务内**合成**的 run 内最后一条事件（worker 不再经 U3 发 `run_end`，runner-integration §7.6），其 `client_event_id` 为确定性值 `run_id:final:run_end`。schema 额外有部分唯一索引 `UNIQUE (run_id) WHERE type='run_end'`（`run_events_run_end_key`），保证**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**；U2 终态重试用 `ON CONFLICT (run_id, client_event_id) DO NOTHING` 去重（同载荷幂等）。
 
+> **展示类历史读取通路（issue #89）**：`GET /api/sessions/:id/events/history`（portal.md §4.4a）按 seq 升序返回白名单内的展示类事件（工具卡片 / judge / round / compaction 等），供前端刷新后走与 SSE 实时**同一渲染路径**重建展示层；运行态语义事件（`run_end`/`usage`/`checkpoint` 等）不下发——历史回放不驱动运行态状态机。
+
 > **事件排序与 attempt 语义（issue #8）**：`seq` 只是**回放游标**（session 全局、按到达顺序分配、严格递增、无空洞），**不是** run 内逻辑顺序；逻辑顺序由 `client_event_id` 的 `(attempt, 计数)` 编码。attempt 使 re-claim 后新 worker 的计数归零也不会与旧 attempt 的 `client_event_id` 碰撞。乱序**到达**不影响正确性（逐事件幂等 + 自包含）；严格递增只对 `seq` 游标成立。详见 runner-integration §7.3/§7.5。
 
 ### 1.13 `tool_calls` / `judge_decisions` / `approvals` / `artifacts`

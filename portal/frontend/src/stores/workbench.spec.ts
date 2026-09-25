@@ -309,6 +309,113 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(err && 'text' in err ? err.text : '').toContain('（已有进行中任务）');
   });
 
+  it('issue #89：openSession 并行拉 events/history，messages 与事件按 seq 归并穿插重建', async () => {
+    mockFetch((url) => {
+      if (url.includes('/api/sessions/s1/events/history')) {
+        return {
+          status: 200,
+          body: {
+            events: [
+              { seq: 2, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: { cmd: 'ls' } } },
+              { seq: 3, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: true, result_digest: 'ok', duration_ms: 5 } },
+              { seq: 4, run_id: 'r1', type: 'judge', payload: { decision: { extend: false, extendReason: '够用了' } } },
+            ],
+            next_cursor: null,
+          },
+        };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            messages: [
+              { id: 'm1', role: 'user', content: '任务', seq: 1 },
+              { id: 'm2', role: 'assistant', content: '完成', seq: 5 },
+            ],
+            last_seq: 5,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    // 归并顺序：msg(1) → tool_use(2) 卡片 → tool_result(3) 回填 → judge(4) sep → msg(5)
+    expect(store.entries.map((e) => e.kind)).toEqual(['msg', 'tool', 'sep', 'msg']);
+    const judgeSep = store.entries[2];
+    expect(judgeSep.kind).toBe('sep');
+    if (judgeSep.kind === 'sep') {
+      expect(judgeSep.text).toBe('judge：不扩轮 — 够用了');
+      expect(judgeSep.variant).toBe('judge'); // feat-260925-02 judge 面板高亮 sep
+    }
+    const card = store.es.toolCards.get('c1');
+    expect(card?.ok).toBe(true);
+    expect(card?.out).toBe('✓ ok（5ms）');
+    expect(store.es.lastSeq).toBe(5);
+    expect(store.es.activeRunId).toBeNull();
+  });
+
+  it('issue #89 红线：历史回放不驱动运行态状态机（run_end 误下发也不触发刷新/停按钮态）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/api/sessions/s1/events/history')) {
+        return {
+          status: 200,
+          body: {
+            // 模拟异常：服务端误把 run_end 下发（白名单外，前端二次短路兜底）
+            events: [
+              { seq: 2, run_id: 'r1', type: 'run_end', payload: { termination: { reason: 'end_turn' } } },
+              { seq: 3, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: {} } },
+            ],
+            next_cursor: null,
+          },
+        };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: 'r-active' }, // 有进行中 run
+            messages: [{ id: 'm1', role: 'user', content: '任务', seq: 1 }],
+            last_seq: 3,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.es.activeRunId).toBe('r-active'); // 未被历史 run_end 清掉（停止按钮保持）
+    expect(store.es.lastSeq).toBe(3); // 水位线仍按 detail.last_seq
+    expect(store.entries.some((e) => e.kind === 'sep' && e.text.includes('run 结束'))).toBe(false);
+    expect(store.es.toolCards.has('c1')).toBe(true); // 展示事件正常重建
+    expect(store.running).toBe(true);
+  });
+
+  it('issue #89：events/history 拉取失败降级为纯文本视图（不影响详情加载，不报错）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/api/sessions/s1/events/history')) {
+        return { status: 500, body: { error: { code: 'internal', message: 'boom' } } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1' },
+            messages: [{ id: 'm1', role: 'user', content: '任务', seq: 1 }],
+            last_seq: 1,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionId).toBe('s1');
+    expect(store.entries.map((e) => e.kind)).toEqual(['msg']); // 仅消息，无 syserr
+    expect(store.entries.some((e) => e.kind === 'syserr')).toBe(false);
+  });
+
   it('openSession 404 → 静默 resetSessionView + onClearRoute 清深链；其他错误保留 + syserr', async () => {
     let mode: 'not_found' | 'boom' = 'not_found';
     mockFetch((url) => {
