@@ -71,9 +71,17 @@ export function sendIpc(proc, msg) {
   if (proc && typeof proc.send === 'function' && proc.connected) {
     try {
       return proc.send(msg);
-    } catch {
+    } catch (err) {
+      // 序列化失败（BigInt/循环引用等）也会走到这里——吞掉真实错误会把 IPC 误诊成
+      // 'channel closed'（issue #84 配套真机：checkpoint 在固定 round 确定性失败，
+      // 错误全被此 catch 掩盖）。上抛消息供上层记录。
+      lastSendError = err?.message ?? String(err);
       return false;
     }
   }
+  lastSendError = 'channel closed';
   return false;
 }
+
+/** 最近一次 sendIpc 失败的真实原因（ipcRequest reject 时透传，避免误诊）。 */
+export let lastSendError = null;
