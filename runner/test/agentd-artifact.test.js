@@ -166,6 +166,32 @@ test('onWorkerExit lease_lost：run 未确认终态 → 不捕获', async (t) =>
   assert.equal(fs.existsSync(root), true, '项目目录不删');
 });
 
+// issue #88 修订：worker 侧生成的会话标题随终态透传 portal（缺失/空串 → portal 降级链）。
+test('onWorkerFinished：title 字段随终态透传（有值原样 / 缺失置空串）', async (t) => {
+  const { root } = makeProject();
+  const { calls, impl } = stubFetch();
+  t.after(() => { globalThis.fetch = undefined; fs.rmSync(root, { recursive: true, force: true }); });
+  globalThis.fetch = impl;
+
+  const ctx1 = makeCtx(root);
+  await agentd.onWorkerFinished(ctx1, {
+    ok: true, termination: { reason: 'end_turn' },
+    usage: { input_tokens: 1, output_tokens: 2 }, rounds: 1, final_text: 'done',
+    title: '修复登录白屏',
+  });
+  assert.equal(calls.state[0].body.title, '修复登录白屏', 'worker 上报 title 原样透传 U2');
+
+  calls.state.length = 0;
+  const ctx2 = makeCtx(root);
+  ctx2.runId = '22222222-3333-4444-4555-566666666666';
+  await agentd.onWorkerFinished(ctx2, {
+    ok: true, termination: { reason: 'end_turn' },
+    usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, final_text: '',
+    // 旧 worker 无 title 字段
+  });
+  assert.equal(calls.state[0].body.title, '', '缺失 title → 空串（portal 走降级链）');
+});
+
 test('artifact 上传失败（409 artifact_exists / 5xx）：不阻塞清场', async (t) => {
   for (const artifactStatus of [409, 503]) {
     const { root } = makeProject();

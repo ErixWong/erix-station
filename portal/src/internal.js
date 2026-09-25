@@ -11,7 +11,7 @@ import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
 import { getFdeLlmHeartbeatModels } from './llm.js';
-import { scheduleAutoTitle } from './session-title.js';
+import { scheduleAutoTitle, AGENT_TITLE_MAX_LEN } from './session-title.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -596,6 +596,16 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
   const rounds = body.rounds;
   const finalText = body.final_text;
   const error = body.error ?? null;
+  // issue #88 修订：worker 侧已顺带生成的会话标题随终态上报（字符串；截断 ≤200 入库评估）。
+  // 只进 chat_sessions 评估链（scheduleAutoTitle），不写 runs 行、不参与终态幂等比对
+  // （标题是会话级 best-effort 元数据，重放丢一次评估无妨）。
+  let agentTitle = '';
+  if (body.title !== undefined && body.title !== null) {
+    if (typeof body.title !== 'string') {
+      throw new InternalError(400, 'validation_failed', 'title 必须为字符串', { details: { field: 'title' } });
+    }
+    agentTitle = Array.from(body.title).slice(0, AGENT_TITLE_MAX_LEN).join('');
+  }
 
   if (!termination || typeof termination !== 'object' || !termination.reason) {
     throw new InternalError(400, 'validation_failed', '终态载荷缺 termination.reason');
@@ -680,9 +690,10 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
       notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload }]);
     } catch { /* 尽力推送 */ }
     // issue #88：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
-    // 天然「每 run 至多评估一次」）。经 session SSE hub 推 'session_updated' 让列表标题实时到达。
+    // 天然「每 run 至多评估一次」）。标题由 worker 侧生成随终态上报（agentTitle）；经 session
+    // SSE hub 推 'session_updated' 让列表标题实时到达。
     try {
-      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, notify: notifySessionEvents });
+      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, agentTitle, notify: notifySessionEvents });
     } catch { /* 评估调度失败不影响终态响应 */ }
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
     return { state, queue_status: queueStatus, run_end_seq: runEndSeq };
