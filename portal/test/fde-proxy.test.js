@@ -442,3 +442,9 @@ test('handler 真机探针：R1 inspect scope / R2 NetworkingConfig / R3 利用�
   const okNet = await post('/networks/create', okNetworkBody());
   assert.equal(okNet.status, 201, '合规 network create 201');
 });
+
+
+test('env 白名单：P5 可调参数键放行（issue #84）', () => {
+  const body = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_MAX_ROUNDS=16', 'ERIX_AGENTD_CAPACITY=2'] });
+  assert.deepEqual(validateCreateBody(body, CFG), []);
+});
