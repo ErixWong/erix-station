@@ -15,6 +15,8 @@ import { api, ApiError } from '../api';
 import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE } from '../lib/constants';
+// issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
+import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
 
 /** 目录项（GET /api/dirs）：~/projects/ 一级目录 + 跨目录运行态计数。 */
 export interface DirInfo {
@@ -228,6 +230,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     dirCwd.value = cwd;
     sessionId.value = null;
     es.resetStreamState();
+    // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
+    clearExpandedToolCalls();
     renderedIds.value = null;
     sessions.value = [];
     // 评审修复：与 resetSessionView 对齐的状态复位（旧版同时复位自动跟随/「↓ 最新」/抽屉——
@@ -252,6 +256,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     inputValue.value = drafts.get(id) ?? '';
     sessionId.value = id;
     es.resetStreamState();
+    // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
+    clearExpandedToolCalls();
     renderedIds.value = new Set();
     entries.value = [];
     let data: SessionDetail;
@@ -327,6 +333,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     dirCwd.value = cwd;
     sessionId.value = null;
     es.resetStreamState();
+    // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
+    clearExpandedToolCalls();
     renderedIds.value = null;
     sessions.value = [];
     streamDefaultText();
@@ -377,6 +385,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     saveDraft();
     sessionId.value = null;
     es.resetStreamState();
+    // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
+    clearExpandedToolCalls();
     renderedIds.value = null;
     inputValue.value = '';
     streamDefaultText();
