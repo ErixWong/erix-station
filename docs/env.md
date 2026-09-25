@@ -349,6 +349,11 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `ERIX_ARCHIVE_TTL_HOURS` | 启动 sweep 对 `<home>/runs-archive/`（归档层：终态确认后从 `runs/` 整体移入的会话真相——transcript/notes，conversation-state.md §5 P1 归档 TTL 替代物理删除）的 mtime 保留期（小时），超期才物理删除；`0` = 禁用归档清扫（一律保留，纯人工/运维兜底） | `168`（7 天） |
 | `ERIX_AGENTD_CAPACITY` | agentd 同时执行的 run 上限（并行度；P5 去项目化起同项目并行放行，pi 对齐不锁）。**下发光纤**：portal（compose `ERIX_AGENTD_CAPACITY`）→ provisioner → FDE 容器 env——改值改 deploy env + `docker compose up -d station-portal` + 重建 FDE 容器，**无需重建镜像** | `2` |
 | `ERIX_MAX_ROUNDS` | worker `runToolLoop` 轮预算（2026-09-24 用户拍板自 8 上调，与上游 judge 常规搭配 `DEFAULT_REFLECTION_MIN_ROUNDS=16` 对齐；nearLimit 由 round judge 扩轮兜底）。**下发光纤**同上（provisioner Env 注入，issue #84）；非法值回退默认 | `16` |
+| `ERIX_ARTIFACT_MAX_BYTES` | run 终态产物快照的文件内容累计上限（字节），超限截断并 manifest.truncated 标记。**runner 侧（采集）与 portal 侧（存储校验）同名同默认**，2026-09-24 自 20MB → 100MB | `104857600`（100MB） |
+| `ERIX_ARTIFACT_CAPTURE_BUDGET_MS` | 产物快照打包时间预算（ms）：超时停止收录并 truncated 标记——时间预算比字节数更本质，封死「大产物打包久」的痛点 | `60000` |
+| `ERIX_SHELL_TIMEOUT_MS` | agent shell 工具默认超时（可被单次调用的 timeout_ms 参数覆盖） | `60000` |
+| `ERIX_SHELL_MAX_TIMEOUT_MS` | agent shell 工具超时上限（单次调用超上限按上限钳制）；DEFAULT 自动钳 ≤ 此值 | `600000` |
+| `ERIX_SHELL_OUTPUT_MAX_BYTES` | agent shell 工具输出截断上限（字节，影响模型可见输出量） | `32768` |
 
 ---
 
