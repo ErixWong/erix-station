@@ -179,6 +179,9 @@ export function buildContainerConfig({
       ...(env ?? []),
       // F4：容器内 agentd 依赖的 internal API base URL（契约 §6.2）。dev http + 高端口 / prod https + 443。
       `ERIX_STATION_BASE_URL=${String(portalPublicBaseUrl || `https://station.${baseDomain}`).replace(/\/+$/, '')}/api/internal`,
+      // issue #84 P5：agentd/worker 可调参数下发（portal env → FDE 容器 env；改值重建容器即可，无需镜像）。
+      `ERIX_MAX_ROUNDS=${Number(process.env.ERIX_MAX_ROUNDS) || 16}`,
+      `ERIX_AGENTD_CAPACITY=${Number(process.env.ERIX_AGENTD_CAPACITY) || 2}`,
     ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId, ...labels },
     HostConfig: {

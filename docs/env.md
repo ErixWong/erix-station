@@ -347,6 +347,8 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 |---|---|---|
 | `ERIX_RUN_DATA_TTL_HOURS` | 启动 sweep 对 `<home>/runs/`（活跃层：跨 attempt notes 等 run 数据）残留的 mtime 保留期（小时）；崩溃后 resume re-claim 必在窗口内发生，新鲜目录不会误删（race 推导见 `runner/lib/run-data.js` 头注释）；`0` = 禁用该扫描 | `24` |
 | `ERIX_ARCHIVE_TTL_HOURS` | 启动 sweep 对 `<home>/runs-archive/`（归档层：终态确认后从 `runs/` 整体移入的会话真相——transcript/notes，conversation-state.md §5 P1 归档 TTL 替代物理删除）的 mtime 保留期（小时），超期才物理删除；`0` = 禁用归档清扫（一律保留，纯人工/运维兜底） | `168`（7 天） |
+| `ERIX_AGENTD_CAPACITY` | agentd 同时执行的 run 上限（并行度；P5 去项目化起同项目并行放行，pi 对齐不锁）。**下发光纤**：portal（compose `ERIX_AGENTD_CAPACITY`）→ provisioner → FDE 容器 env——改值改 deploy env + `docker compose up -d station-portal` + 重建 FDE 容器，**无需重建镜像** | `2` |
+| `ERIX_MAX_ROUNDS` | worker `runToolLoop` 轮预算（2026-09-24 用户拍板自 8 上调，与上游 judge 常规搭配 `DEFAULT_REFLECTION_MIN_ROUNDS=16` 对齐；nearLimit 由 round judge 扩轮兜底）。**下发光纤**同上（provisioner Env 注入，issue #84）；非法值回退默认 | `16` |
 
 ---
 
