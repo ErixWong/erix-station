@@ -8,6 +8,8 @@ import type { ToolCardState } from '../composables/useEventStream';
 // issue #85：卡片折叠（默认收起）+ 单行摘要防溢出，方案对齐 pi web ToolCallBlock。
 import { getToolPreview } from '../lib/toolSummary';
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
+// pi-web 风格：流式增量也走 markdown 渲染（渲染器先转义后格式化，半截 ``` 容错收尾）。
+import { renderMarkdown } from '../lib/markdown';
 
 const store = useWorkbenchStore();
 
@@ -83,8 +85,9 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       <div v-if="en.html" v-html="en.html"></div>
       <template v-else>{{ en.text }}</template>
     </div>
-    <!-- 流式增量气泡（旧 S.deltaBuf 的 textContent 追加） -->
-    <div v-else-if="en.kind === 'delta'" class="msg assistant">{{ en.text }}</div>
+    <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
+         类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
+    <div v-else-if="en.kind === 'delta'" class="msg assistant md" v-html="renderMarkdown(en.text)"></div>
     <!-- roundsep / 系统分隔行 -->
     <div v-else-if="en.kind === 'sep'" class="roundsep">{{ en.text }}</div>
     <!-- issue #42：红色系统错误行 -->
