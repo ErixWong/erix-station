@@ -1,9 +1,12 @@
 <script setup lang="ts">
-// 侧栏（issue #84 P5.4，设计文档 §4 左栏竖排三段）：
-//   ① 目录下拉（DirSelect：目录名 + ●N 运行态徽标 + ↻ 双刷 + 末项「＋ 新建目录」内联表单）
-//   ② 会话列表（沿用现状组件语义，数据源改为 WHERE cwd = 选中目录）
-//   ③ 目录树面板（DirectoryTree，默认收起，懒展开）
-// 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价）。
+// 侧栏（issue #84 P5.4，设计文档 §4 左栏竖排三段；issue #92 改 aside 内 flex-col 三段布局）：
+//   ① 固定头：目录下拉（DirSelect：目录名 + ●N 运行态徽标 + ↻ 双刷 + 末项「＋ 新建目录」
+//      内联表单）+ 「＋ 新会话」按钮——不随列表滚动
+//   ② 会话列表段：flex-1 min-h-0 overflow-y-auto，独立内部滚动（空态文案「先创建目录」/
+//      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树
+//   ③ 目录树面板（DirectoryTree，默认收起，懒展开）：固定底部，任意会话数下恒可达
+// 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价），
+// 三段结构在抽屉内同样成立（aside 高度由 max-md:inset-y-0 撑满，h-full 生效）。
 import { ref } from 'vue';
 import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
@@ -50,57 +53,67 @@ async function onSubmitNewDir() {
 </script>
 
 <template>
-  <!-- 常驻「管理台」入口（旧 index.html header adminLink 的 SPA 等价；admin 角色才显示） -->
-  <router-link
-    v-if="auth.user?.role === 'admin'"
-    to="/admin"
-    class="mb-2 block rounded-md border border-black/20 px-2.5 py-1 text-center text-sm hover:bg-black/5"
-  >管理台</router-link>
+  <!-- issue #92：aside 内 flex-col 三段（固定头 / 列表独立滚 / 树固定底）；h-full 铺满 aside 高 -->
+  <div class="flex h-full min-h-0 flex-col">
+    <!-- ① 固定头：不随会话列表滚动 -->
+    <div class="shrink-0">
+      <!-- 常驻「管理台」入口（旧 index.html header adminLink 的 SPA 等价；admin 角色才显示） -->
+      <router-link
+        v-if="auth.user?.role === 'admin'"
+        to="/admin"
+        class="mb-2 block rounded-md border border-black/20 px-2.5 py-1 text-center text-sm hover:bg-black/5"
+      >管理台</router-link>
 
-  <!-- ① 目录下拉 + ↻ 双刷（issue #84 P5：替换原项目 select + 新项目表单） -->
-  <DirSelect @refresh="onRefresh" @new-dir="onNewDirIntent" />
+      <!-- 目录下拉 + ↻ 双刷（issue #84 P5：替换原项目 select + 新项目表单） -->
+      <DirSelect @refresh="onRefresh" @new-dir="onNewDirIntent" />
 
-  <!-- 「＋ 新建目录」内联表单（输入名字 → 以该 cwd 建会话，服务端校验 + mkdir） -->
-  <form v-if="showNewDir" class="mt-2" novalidate @submit.prevent="onSubmitNewDir">
-    <label class="muted" for="newDirName">目录名（小写字母/数字/连字符）</label>
-    <input
-      id="newDirName" v-model="newDirName" required maxlength="63" placeholder="例如 my-project"
-      class="w-full mt-1 rounded-md border border-black/20 px-2 py-1 text-sm"
-    >
-    <div class="flex gap-2 mt-2">
-      <button type="submit" class="flex-1 rounded-md bg-brand text-white text-sm px-2.5 py-1 hover:bg-brand-hover">创建</button>
-      <button type="button" class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5" @click="onCancelNewDir">取消</button>
+      <!-- 「＋ 新建目录」内联表单（输入名字 → 以该 cwd 建会话，服务端校验 + mkdir） -->
+      <form v-if="showNewDir" class="mt-2" novalidate @submit.prevent="onSubmitNewDir">
+        <label class="muted" for="newDirName">目录名（小写字母/数字/连字符）</label>
+        <input
+          id="newDirName" v-model="newDirName" required maxlength="63" placeholder="例如 my-project"
+          class="w-full mt-1 rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
+        <div class="flex gap-2 mt-2">
+          <button type="submit" class="flex-1 rounded-md bg-brand text-white text-sm px-2.5 py-1 hover:bg-brand-hover">创建</button>
+          <button type="button" class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5" @click="onCancelNewDir">取消</button>
+        </div>
+        <p class="syserr mt-2" role="alert">{{ newDirError }}</p>
+      </form>
+
+      <!-- 「＋ 新会话」：固定头内，列表再长也不动 -->
+      <button
+        class="w-full mt-3 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
+        :disabled="store.newSessDisabled"
+        @click="emit('new-session')"
+      >＋ 新会话</button>
     </div>
-    <p class="syserr mt-2" role="alert">{{ newDirError }}</p>
-  </form>
 
-  <!-- ② 会话列表（该目录） -->
-  <button
-    class="w-full mt-3 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
-    :disabled="store.newSessDisabled"
-    @click="emit('new-session')"
-  >＋ 新会话</button>
-
-  <div v-if="store.noDir" class="mt-2">
-    <p v-if="store.isPlatformAdmin" class="muted">
-      平台管理员：请到管理台创建 FDE 用户与分配资源<br><router-link to="/admin" class="underline">进入管理台</router-link>
-    </p>
-    <p v-else class="muted">先创建目录</p>
-  </div>
-  <div v-else>
-    <p v-if="store.sessions.length === 0" class="muted mt-2">暂无会话</p>
-    <div
-      v-for="s in store.sessions"
-      :key="String(s.id)"
-      class="mt-2 cursor-pointer rounded-md border border-black/15 px-2 py-1.5 text-sm"
-      :class="String(s.id) === String(store.sessionId) ? 'border-brand bg-green-50' : 'hover:bg-black/5'"
-      @click="emit('select-session', String(s.id))"
-    >
-      <div>{{ s.title || '未命名会话' }}</div>
-      <div class="text-black/50 text-xs">{{ store.sessMeta(s) }}</div>
+    <!-- ② 会话列表段（该目录）：flex-1 min-h-0 + 独立内部滚动；空态文案也放这里（issue #92） -->
+    <div class="mt-2 min-h-0 flex-1 overflow-y-auto">
+      <div v-if="store.noDir">
+        <p v-if="store.isPlatformAdmin" class="muted">
+          平台管理员：请到管理台创建 FDE 用户与分配资源<br><router-link to="/admin" class="underline">进入管理台</router-link>
+        </p>
+        <p v-else class="muted">先创建目录</p>
+      </div>
+      <div v-else>
+        <p v-if="store.sessions.length === 0" class="muted">暂无会话</p>
+        <div
+          v-for="s in store.sessions"
+          :key="String(s.id)"
+          class="mt-2 cursor-pointer rounded-md border border-black/15 px-2 py-1.5 text-sm"
+          :class="String(s.id) === String(store.sessionId) ? 'border-brand bg-green-50' : 'hover:bg-black/5'"
+          @click="emit('select-session', String(s.id))"
+        >
+          <div>{{ s.title || '未命名会话' }}</div>
+          <div class="text-black/50 text-xs">{{ store.sessMeta(s) }}</div>
+        </div>
+      </div>
     </div>
-  </div>
 
-  <!-- ③ 目录树面板（默认收起，懒展开；节点点击暂无动作，P6 预览后补） -->
-  <DirectoryTree ref="treeRef" :cwd="store.dirCwd" />
+    <!-- ③ 目录树面板（默认收起，懒展开；节点点击暂无动作，P6 预览后补）：固定底部恒可达 -->
+    <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负 -->
+    <DirectoryTree ref="treeRef" class="shrink-0" :cwd="store.dirCwd" />
+  </div>
 </template>
