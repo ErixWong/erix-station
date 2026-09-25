@@ -91,6 +91,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `status` | `active / archived`；有进行中 run 时禁止归档（portal.md §4.2 `409 run_in_progress`） |
 | `last_seq` | **session 级 seq 分配器**：`messages.seq` 与 `run_events.seq` 都由它分配（同事务 `UPDATE ... SET last_seq = last_seq + 1 ... RETURNING`），保证 SSE 的 `Last-Event-ID` 语义（portal.md §5.1/§5.2）。这是原理三「状态在中心」在实时层的落点 |
+| `title` / `title_source` | 会话标题（issue #88）。`title_source` ∈ `auto`/`manual`（默认 `auto`，迁移 `0009-session-auto-title.sql`）：建会话显式传 title 或 PATCH 改 title → `manual`（手工优先，自动更新**只写 `auto` 行**）；portal 在 run 终态事件后异步评估生成（LLM 轻量补全 ≤30 字符，降级链：首条用户消息截断 → cwd basename），经 session SSE `session_updated` 推送前端 |
+| `auto_title_seq` | 上次自动标题更新时的 `last_seq` 快照（迁移 0009；`NULL` = 从未自动更新）——防抖判据「距上次更新 ≥ N 轮新 user 消息」的游标（`ERIX_SESSION_AUTO_TITLE_MIN_NEW` 调 N，`ERIX_SESSION_AUTO_TITLE=0` 关开关） |
 
 `active_run_id`（portal.md §4.1）**不落列**，由 `runs_one_active_per_session` 部分唯一索引覆盖的运行中 run 推导——避免两份真相（原理五同构：单一事实源）。
 

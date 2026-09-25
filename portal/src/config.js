@@ -183,6 +183,10 @@ export function loadConfig(env = process.env) {
     // 持久卷 bind mount（deploy-contract §2.2 ④）；上限默认 20MB，与 agentd 侧截断口径一致。
     artifactsRoot: env.ERIX_ARTIFACTS_ROOT || '/srv/erix/artifacts',
     artifactMaxBytes: intEnv(env, 'ERIX_ARTIFACT_MAX_BYTES', 100 * 1024 * 1024), // 2026-09-24 20MB→100MB（与 runner 侧同 env 同默认）
+    // issue #88：会话标题自动生成开关（默认开；ERIX_SESSION_AUTO_TITLE=0 关闭）。
+    // minNew = 防抖阈值：距上次自动更新至少 N 轮新用户消息才刷新（或话题漂移启发式命中）。
+    sessionAutoTitle: env.ERIX_SESSION_AUTO_TITLE !== '0',
+    sessionAutoTitleMinNew: intEnv(env, 'ERIX_SESSION_AUTO_TITLE_MIN_NEW', 3),
     maxLoginLength: intEnv(env, 'MAX_LOGIN_LENGTH', 128),
     maxPasswordLength: intEnv(env, 'MAX_PASSWORD_LENGTH', 256),
     baseDomain: env.BASE_DOMAIN || 'localhost',
