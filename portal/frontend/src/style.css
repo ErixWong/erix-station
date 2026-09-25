@@ -15,6 +15,8 @@
 .muted { color: var(--muted); font-size: .8rem; }
 .syserr { color: #dc3545; font-size: .85rem; }
 .roundsep { color: rgba(0, 0, 0, .55); font-size: .75rem; margin: .6rem 0 .2rem; }
+/* judge 决策事件：黄色面板（与 .msg.synthetic 黄色语义呼应，突出扩轮/不扩轮/放行/intercept 决策） */
+.roundsep.judge-panel { color: rgba(0, 0, 0, .8); font-size: .8rem; border-left: 3px solid #ffc107; background: #fff3cd; border-radius: 0 6px 6px 0; padding: 6px 10px; margin: 10px 0; max-width: 46rem; }
 
 /* 消息（气泡语义对齐 pi-web MessageView：助手无气泡直排，用户浅蓝气泡右对齐，
    synthetic 保留黄色左边条语义；--user-bg 等效值取自 pi-web 亮色主题） */
