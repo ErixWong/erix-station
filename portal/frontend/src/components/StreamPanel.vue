@@ -2,9 +2,53 @@
 // 消息流（旧 #stream 的渲染语义平移）：addMessage 三分（user/assistant/synthetic）、
 // 助手终稿 markdown（v-html，渲染器本身先转义后格式化，XSS 安全）、工具卡片、
 // roundsep/syserr 分隔行、流式增量气泡。自动跟随/「↓ 最新」由父级持有（scroll 容器也在父级）。
+import { reactive, watch } from 'vue';
 import { useWorkbenchStore, type StreamEntry } from '../stores/workbench';
+import type { ToolCardState } from '../composables/useEventStream';
+// issue #85：卡片折叠（默认收起）+ 单行摘要防溢出，方案对齐 pi web ToolCallBlock。
+import { getToolPreview } from '../lib/toolSummary';
+import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 
 const store = useWorkbenchStore();
+
+// 展开态：组件内 reactive Set 驱动重渲染，模块级 Set（toolCallExpansion）做跨重渲染记忆，
+// 二者双向镜像；entries 重建（SSE 补发/历史重放）后从模块 Set 回灌，展开状态不丢。
+const expandedIds = reactive(new Set<string>());
+
+watch(
+  () => store.entries,
+  () => {
+    for (const en of store.entries) {
+      if (en.kind === 'tool' && isToolCallExpanded(en.callId) && !expandedIds.has(en.callId)) {
+        expandedIds.add(en.callId);
+      }
+    }
+  },
+  { immediate: true },
+);
+
+function isExpanded(callId: string): boolean {
+  return expandedIds.has(callId);
+}
+
+function toggleCard(callId: string): void {
+  const next = !expandedIds.has(callId);
+  setToolCallExpanded(callId, next);
+  if (next) expandedIds.add(callId);
+  else expandedIds.delete(callId);
+}
+
+// 单行摘要：优先 args 里的语义键（command/path/...），解析失败回退 dig（§旧 toolCard 原样）。
+function summaryText(card: ToolCardState): string {
+  return getToolPreview(card.args) || card.dig || (card.args ? '' : '（参数生成中…）');
+}
+
+// 折叠态状态位：✓/✗（出错变红）+ 耗时；尚无结果（null）显示 …。
+function statusMark(card: ToolCardState): string {
+  if (card.ok === true) return '✓' + (card.dur != null ? ` ${card.dur}ms` : '');
+  if (card.ok === false) return '✗' + (card.dur != null ? ` ${card.dur}ms` : '');
+  return '…';
+}
 
 function entryKey(en: StreamEntry, i: number): string {
   switch (en.kind) {
@@ -45,17 +89,40 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
     <div v-else-if="en.kind === 'sep'" class="roundsep">{{ en.text }}</div>
     <!-- issue #42：红色系统错误行 -->
     <div v-else-if="en.kind === 'syserr'" class="syserr">{{ en.text }}</div>
-    <!-- 工具卡片（状态取 es.toolCards[callId]；ok/err 左边框分级） -->
+    <!-- 工具卡片（issue #85：可折叠，默认收起；ok/err 左边框分级；头部整行 button 防溢出） -->
     <div
       v-else-if="en.kind === 'tool' && store.es.toolCards.get(en.callId)"
       class="my-1.5 max-w-[46rem] rounded-md border border-black/10 border-l-4 bg-black/[0.03] px-3 py-1.5 text-sm"
       :class="store.es.toolCards.get(en.callId)!.ok === true ? 'border-l-green-600'
         : store.es.toolCards.get(en.callId)!.ok === false ? 'border-l-red-600' : 'border-l-neutral-500'"
     >
-      <div class="font-semibold">🔧 {{ store.es.toolCards.get(en.callId)!.name }}
-        <span class="text-black/50 font-normal truncate">{{ store.es.toolCards.get(en.callId)!.dig }}</span>
-      </div>
-      <div class="text-black/50">{{ store.es.toolCards.get(en.callId)!.out }}</div>
+      <button
+        type="button"
+        class="flex w-full min-w-0 items-center gap-2 text-left"
+        :aria-expanded="isExpanded(en.callId)"
+        @click="toggleCard(en.callId)"
+      >
+        <span
+          class="shrink-0 font-semibold"
+          :class="store.es.toolCards.get(en.callId)!.ok === false ? 'text-red-600' : ''"
+        >🔧 {{ store.es.toolCards.get(en.callId)!.name }}</span>
+        <span class="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-normal text-black/50">
+          {{ summaryText(store.es.toolCards.get(en.callId)!) }}
+        </span>
+        <span
+          class="shrink-0 font-normal"
+          :class="store.es.toolCards.get(en.callId)!.ok === false ? 'text-red-600' : 'text-black/50'"
+        >{{ statusMark(store.es.toolCards.get(en.callId)!) }}</span>
+        <span
+          class="shrink-0 text-black/50 transition-transform duration-150"
+          :class="{ 'rotate-180': isExpanded(en.callId) }"
+        >▾</span>
+      </button>
+      <!-- 展开态：完整 args（pre 块永不溢出）+ 结果摘要行（tool_result 只带 digest，不虚构全文） -->
+      <template v-if="isExpanded(en.callId)">
+        <pre class="mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ store.es.toolCards.get(en.callId)!.args }}</pre>
+        <div class="font-normal text-black/50">{{ store.es.toolCards.get(en.callId)!.out }}</div>
+      </template>
     </div>
   </template>
 </template>

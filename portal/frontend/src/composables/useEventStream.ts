@@ -33,6 +33,9 @@ export interface ToolCardState {
   args: string;
   ok: boolean | null; // null = 尚无结果；true/false = tool_result 回填
   out: string;
+  // issue #85：tool_result 的 duration_ms 原值（可选，tool_result 回填），卡片头部耗时显示用；
+  // out 文案的拼接语义不变。
+  dur?: number;
 }
 
 export interface RunEndPayload {
@@ -149,6 +152,7 @@ export function useEventStream(hooks: EventStreamHooks) {
         const card = toolCards.get(d.tool_call_id);
         if (card) {
           card.ok = !!d.ok;
+          card.dur = d.duration_ms ?? 0;
           card.out = `${d.ok ? '✓' : '✗'} ${d.result_digest ?? ''}（${d.duration_ms ?? 0}ms）`;
         }
         return;
