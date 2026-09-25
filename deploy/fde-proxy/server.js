@@ -69,7 +69,7 @@ const CONTAINER_NAME_RE = /^\/fde-[a-z0-9-]+$/;
 const FDE_NAME_RE = /^[a-z0-9-]+$/;
 const RESTART_POLICY_NAMES = new Set(['unless-stopped']);
 // R3：Env 键白名单（其余 Env 值一律拒）。
-const ENV_KEY_ALLOW = new Set(['PATH', 'ERIX_STATION_TOKEN', 'ERIX_STATION_BASE_URL', 'ERIX_FDE_NAME', 'ERIX_MAX_ROUNDS', 'ERIX_AGENTD_CAPACITY', 'ERIX_ARTIFACT_MAX_BYTES', 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS', 'ERIX_SHELL_TIMEOUT_MS', 'ERIX_SHELL_MAX_TIMEOUT_MS', 'ERIX_SHELL_OUTPUT_MAX_BYTES']); // issue #84 P5：agentd/worker 可调参数下发
+const ENV_KEY_ALLOW = new Set(['PATH', 'ERIX_STATION_TOKEN', 'ERIX_STATION_BASE_URL', 'ERIX_FDE_NAME', 'ERIX_MAX_ROUNDS', 'ERIX_AGENTD_CAPACITY', 'ERIX_ARTIFACT_MAX_BYTES', 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS', 'ERIX_SHELL_TIMEOUT_MS', 'ERIX_SHELL_MAX_TIMEOUT_MS', 'ERIX_SHELL_OUTPUT_MAX_BYTES', 'ERIX_SESSION_AUTO_TITLE']); // issue #84 P5：agentd/worker 可调参数下发；issue #88 修订：worker 侧会话标题生成开关
 // R4：任何层禁止的原型污染键。
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 

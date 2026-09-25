@@ -448,3 +448,12 @@ test('env 白名单：P5 可调参数键放行（issue #84）', () => {
   const body = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_MAX_ROUNDS=16', 'ERIX_AGENTD_CAPACITY=2', 'ERIX_ARTIFACT_MAX_BYTES=104857600', 'ERIX_SHELL_TIMEOUT_MS=60000', 'ERIX_SHELL_MAX_TIMEOUT_MS=600000', 'ERIX_SHELL_OUTPUT_MAX_BYTES=32768', 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS=60000'] });
   assert.deepEqual(validateCreateBody(body, CFG), []);
 });
+
+// issue #88 修订：worker 侧会话标题生成开关经下发链登记（compose → provisioner → FDE 容器 env），
+// fde-proxy ENV_KEY_ALLOW 必须放行。
+test('env 白名单：ERIX_SESSION_AUTO_TITLE 放行（issue #88 修订，worker 侧标题生成）', () => {
+  const body = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_SESSION_AUTO_TITLE=1'] });
+  assert.deepEqual(validateCreateBody(body, CFG), []);
+  const denied = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_SESSION_AUTO_TITLE_NOT_A_KEY=1'] });
+  assert.ok(validateCreateBody(denied, CFG).some((r) => r.includes('Env key not allowed')), '未知键仍 deny-by-default');
+});

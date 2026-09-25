@@ -177,6 +177,9 @@ services:
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}
       ERIX_SHELL_MAX_TIMEOUT_MS: ${ERIX_SHELL_MAX_TIMEOUT_MS:-600000}
       ERIX_SHELL_OUTPUT_MAX_BYTES: ${ERIX_SHELL_OUTPUT_MAX_BYTES:-32768}
+      # issue #88 修订：会话标题生成移到 worker 侧（随 run_finished 上报，portal 落库）；
+      # 开关同名下发 FDE 容器 env（'0' 关），portal 侧同 env 控制落库评估。下发光纤同 issue #84 P5。
+      ERIX_SESSION_AUTO_TITLE: ${ERIX_SESSION_AUTO_TITLE:-1}
       PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}

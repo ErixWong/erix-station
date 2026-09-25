@@ -115,6 +115,8 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.ok(body.Env.includes('ERIX_SHELL_TIMEOUT_MS=60000'), 'ERIX_SHELL_TIMEOUT_MS 默认下发');
   assert.ok(body.Env.includes('ERIX_SHELL_MAX_TIMEOUT_MS=600000'), 'ERIX_SHELL_MAX_TIMEOUT_MS 默认下发');
   assert.ok(body.Env.includes('ERIX_SHELL_OUTPUT_MAX_BYTES=32768'), 'ERIX_SHELL_OUTPUT_MAX_BYTES 默认下发');
+  // issue #88 修订：worker 侧会话标题生成开关（字符串开关，默认下发 '1'；'0' 透传）。
+  assert.ok(body.Env.includes('ERIX_SESSION_AUTO_TITLE=1'), 'ERIX_SESSION_AUTO_TITLE 默认下发');
 });
 
 test('buildNetworkConfig：显式 subnet + gateway', () => {
