@@ -1,7 +1,7 @@
 // runner/lib/ipc.js 纯函数单测（零依赖，不碰 docker）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeRoundRecord, createReqIdGenerator } from '../lib/ipc.js';
+import { normalizeRoundRecord, createReqIdGenerator, sendIpc } from '../lib/ipc.js';
 
 test('normalizeRoundRecord：常规轮（roundKey+dedupKey）保留字段并注入 round', () => {
   const record = {
@@ -44,4 +44,28 @@ test('createReqIdGenerator：单调递增', () => {
   assert.equal(next(), 1);
   assert.equal(next(), 2);
   assert.equal(next(), 3);
+});
+
+test('sendIpc：背压返回 false 视为已入队成功（真机 bug 回归：大 checkpoint 误判 channel closed）', () => {
+  // Node IPC：send() 返回 false 可能只是「消息超过缓冲阈值已入队」，channel 仍健康。
+  const proc = {
+    connected: true,
+    send() { return false; }, // 模拟背压入队
+  };
+  assert.equal(sendIpc(proc, { hello: 'world' }), true);
+});
+
+test('sendIpc：channel 已连接但 send 抛错 → 失败并留真实原因', async () => {
+  const mod = await import('../lib/ipc.js');
+  const proc = {
+    connected: true,
+    send() { throw new Error('Do not know how to serialize a BigInt'); },
+  };
+  assert.equal(sendIpc(proc, { x: 1 }), false);
+  assert.match(mod.lastSendError, /BigInt/);
+});
+
+test('sendIpc：connected=false → 失败（channel closed）', () => {
+  const proc = { connected: false, send() { return true; } };
+  assert.equal(sendIpc(proc, {}), false);
 });
