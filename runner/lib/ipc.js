@@ -68,13 +68,17 @@ export function createReqIdGenerator() {
 
 /** 发送 IPC 消息（忽略通道关闭的写失败，避免 shutdown 竞态抛错）。 */
 export function sendIpc(proc, msg) {
+  // ⚠️ Node IPC 背压语义（真机 bug 实证）：proc.send() 返回 false 有两种含义——
+  //   ① channel 已关闭（真失败）；② 消息超过内部缓冲阈值，**已入队**待 'drain'（背压，非失败！）。
+  // 原实现把 false 一律当失败 → 大 checkpoint（transcript 增长跨过阈值）被误判
+  // 'ipc channel closed' → 引擎 fail-closed → run 在固定 round 确定性失败。
+  // 修法：connected 为真时 send 只可能「成功/入队」或「抛错」，false 一律视为已入队成功。
   if (proc && typeof proc.send === 'function' && proc.connected) {
     try {
-      return proc.send(msg);
+      proc.send(msg);
+      return true;
     } catch (err) {
-      // 序列化失败（BigInt/循环引用等）也会走到这里——吞掉真实错误会把 IPC 误诊成
-      // 'channel closed'（issue #84 配套真机：checkpoint 在固定 round 确定性失败，
-      // 错误全被此 catch 掩盖）。上抛消息供上层记录。
+      // 序列化失败（BigInt/循环引用）或 send 时 channel 恰好关闭——真失败，留痕。
       lastSendError = err?.message ?? String(err);
       return false;
     }
