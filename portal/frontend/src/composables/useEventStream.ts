@@ -27,6 +27,23 @@ const EVENT_TYPES = [
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
 export const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
 
+// issue #89：历史回放（刷新后重建展示层，对齐 pi-web「转录即真相」）可回放的展示类事件白名单——
+// 与后端 GET /api/sessions/:id/events/history 的下发白名单一致。运行态语义事件（run_end/usage/
+// 增量流等）不在其列：历史回放绝不驱动运行态状态机（停止按钮/run 状态/终态刷新）。
+const HISTORY_REPLAY_TYPES = new Set([
+  'tool_use', 'tool_result', 'tool_call_delta', 'judge',
+  'round', 'round_start', 'round_end', 'attempt', 'recovering', 'recovered',
+  'compaction', 'final_guard', 'forced_final',
+]);
+
+/** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
+export interface RunHistoryEvent {
+  seq: number;
+  run_id: string | null;
+  type: string;
+  payload: Record<string, unknown>;
+}
+
 export interface ToolCardState {
   name: string;
   dig: string;
@@ -122,9 +139,26 @@ export function useEventStream(hooks: EventStreamHooks) {
       resyncEvents(d.reason === 'buffer_overflow' ? '服务端缓冲溢出' : (d.reason ?? 'resync'));
       return;
     }
+    dispatch(type, d);
+  }
+
+  /**
+   * issue #89：历史 run_events 回放（GET /api/sessions/:id/events/history 的响应项，
+   * 与 SSE data 展开后同构）。history 模式红线：
+   *   * 只走展示分支（tool 卡片 / sep / syserr），产出与实时**同一渲染路径**（toolCards Map +
+   *     onToolCardCreated 占位 + StreamPanel）；
+   *   * 不推进水位线（openSession 已按 detail.last_seq 初始化；回放事件 seq ≤ 该值）；
+   *   * run_end 强制短路——绝不触发 onCurrentRunEnd / refreshSession / 停止按钮状态机。
+   */
+  function replayEvent(raw: RunHistoryEvent) {
+    if (!HISTORY_REPLAY_TYPES.has(raw.type)) return;
+    dispatch(raw.type, { seq: raw.seq, run_id: raw.run_id, ...(raw.payload ?? {}) }, true);
+  }
+
+  function dispatch(type: string, d: Record<string, any>, history = false) {
     // 实现注记（§5.1）：事件流 seq 有合法空洞（messages 占号），故**不做**跳号重连判定；
-    // 这里只推进本地水位线（resync 重连时作为 ?last_event_id 回放游标）。
-    if (typeof d.seq === 'number') lastSeq.value = Math.max(lastSeq.value, d.seq);
+    // 这里只推进本地水位线（resync 重连时作为 ?last_event_id 回放游标）；历史回放不推进。
+    if (typeof d.seq === 'number' && !history) lastSeq.value = Math.max(lastSeq.value, d.seq);
     switch (type) {
       case 'ping': return;
       case 'session_updated':
@@ -195,7 +229,9 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'forced_final': hooks.onSep(`forced final（round ${d.round}）：${d.reason ?? ''}`); return;
       case 'usage': return;
       case 'run_end': {
-        // 历史重放的旧 run_end 不参与运行态状态机（防误关当前 run 的停止按钮/误拉刷新）。
+        // issue #89 红线：历史回放的 run_end 一律短路——绝不驱动运行态状态机
+        // （防误关当前 run 的停止按钮/误拉刷新）。实时路径保留「仅当前 run」守卫。
+        if (history) return;
         const isCurrent = d.run_id === activeRunId.value;
         if (isCurrent) {
           // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）。
@@ -228,7 +264,8 @@ export function useEventStream(hooks: EventStreamHooks) {
   return {
     lastSeq, esSessionId, activeRunId, deltaText, toolCards,
     connect, closeEs, resetStreamState,
-    // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）。
-    handleEvent, toolCard,
+    // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）；
+    // replayEvent 供 openSession 历史归并回放驱动（issue #89）。
+    handleEvent, toolCard, replayEvent,
   };
 }

@@ -431,6 +431,11 @@ async function routeApi(req, res, ctx, url) {
   if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/messages$/.test(pathname)) {
     return handlePostMessage(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)[1]));
   }
+  // issue #89：run_events 展示类事件历史（前端刷新后重建工具卡片/judge 面板）。须在 SSE
+  // 路由之前注册（两者路径不冲突，此处仅显式表达「REST 历史」与「SSE 实时」是两条通路）。
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events\/history$/.test(pathname)) {
+    return handleSessionEventsHistory(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events\/history$/)[1]));
+  }
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events$/.test(pathname)) {
     return handleSessionStream(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
   }
@@ -854,6 +859,88 @@ async function handleSessionStream(req, res, ctx, sessionId) {
     internal.writeSseComment(res, 'ping');
     internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
   }, 15000);
+}
+
+/**
+ * issue #89：GET /api/sessions/:id/events/history —— run_events 展示类事件历史（前端刷新后
+ * 重建工具卡片/judge 面板用，对齐 pi-web「转录即真相」）。红线：只读重建——白名单外类型
+ * （run_end/usage/checkpoint/heartbeat/assistant_delta 等，含全部运行态语义事件）不下发，
+ * 不驱动前端运行态状态机；SSE 首连不补发语义（§5.2.3）不变，本端点是独立 REST 通路。
+ *
+ * 契约：鉴权同 GET /api/sessions/:id（非属主/不存在 404，不泄露存在性）；keyset 分页
+ * （§1.3）：默认取最新 limit 条（升序返回），before=<seq> 取更早一批；next_cursor 非 null
+ * 表示还有更早批次。大小防护：limit 默认 500/上限 2000；payload 字符串叶值统一截 2000 字符
+ * （tool_use.input / tool_call_delta.arguments_delta 可能很大），防超大响应。
+ */
+const HISTORY_EVENT_TYPES = new Set([
+  'tool_use', 'tool_result', 'tool_call_delta', 'judge',
+  'round', 'round_start', 'round_end', 'attempt', 'recovering', 'recovered',
+  'compaction', 'final_guard', 'forced_final',
+]);
+const HISTORY_EVENT_DEFAULT_LIMIT = 500;
+const HISTORY_EVENT_MAX_LIMIT = 2000;
+const HISTORY_PAYLOAD_STRING_CAP = 2000;
+
+// 展示 payload 截断：字符串叶值超cap → 截断 + 标记（JSON 形状保持合法，前端 String() 路径原样可用）。
+function truncateHistoryPayload(value, depth = 0) {
+  if (typeof value === 'string') {
+    return value.length > HISTORY_PAYLOAD_STRING_CAP
+      ? value.slice(0, HISTORY_PAYLOAD_STRING_CAP) + '…（已截断）'
+      : value;
+  }
+  if (Array.isArray(value)) {
+    if (depth > 4) return value;
+    return value.map((v) => truncateHistoryPayload(v, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    if (depth > 4) return value;
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = truncateHistoryPayload(v, depth + 1);
+    return out;
+  }
+  return value;
+}
+
+async function handleSessionEventsHistory(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  const own = await ctx.pool.query(
+    `SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2 AND status = 'active'`,
+    [sessionId, session.user.id],
+  );
+  if (!own.rows?.length) throw new HttpError(404, 'not_found', 'session not found');
+  const url = new URL(req.url, 'http://x');
+  let limit = Number(url.searchParams.get('limit') ?? HISTORY_EVENT_DEFAULT_LIMIT);
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new HttpError(400, 'validation_failed', 'limit 必须为正整数', { details: { field: 'limit' } });
+  }
+  limit = Math.min(limit, HISTORY_EVENT_MAX_LIMIT);
+  const beforeRaw = url.searchParams.get('before');
+  let before = null;
+  if (beforeRaw != null && beforeRaw !== '') {
+    before = Number(beforeRaw);
+    if (!Number.isInteger(before) || before < 1) {
+      throw new HttpError(400, 'validation_failed', 'before 必须为正整数', { details: { field: 'before' } });
+    }
+  }
+  const params = [sessionId, [...HISTORY_EVENT_TYPES]];
+  let where = 'session_id = $1 AND type = ANY($2)';
+  if (before != null) { params.push(before); where += ` AND seq < $${params.length}`; }
+  params.push(limit + 1); // 多取 1 条判 hasOlder（§1.3 keyset 口径，对齐 getSession）
+  const r = await ctx.pool.query(
+    `SELECT seq, run_id, type, payload FROM run_events WHERE ${where} ORDER BY seq DESC LIMIT $${params.length}`,
+    params,
+  );
+  const hasOlder = r.rows.length > limit;
+  const rows = r.rows.slice(0, limit).reverse(); // 升序返回（展示回放按 seq 归并穿插）
+  return sendJson(res, 200, {
+    events: rows.map((row) => ({
+      seq: Number(row.seq),
+      run_id: row.run_id ?? null,
+      type: row.type,
+      payload: truncateHistoryPayload(row.payload ?? {}),
+    })),
+    next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
+  });
 }
 
 /** GET /api/runs/:id（portal.md §4.6）：run 详情（属主经 session join 校验，不泄露存在性）。 */

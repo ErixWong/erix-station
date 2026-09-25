@@ -279,6 +279,83 @@ describe('useEventStream（mock EventSource）', () => {
     expect(s.deltaText.value).toBeNull();
   });
 
+  describe('replayEvent（issue #89 历史回放：刷新后重建展示层）', () => {
+    it('历史 tool_use/tool_result → 卡片（与实时同一渲染路径，callId 去重占位一次）', () => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.replayEvent({ seq: 2, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: { cmd: 'ls' } } });
+      s.replayEvent({ seq: 3, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: true, result_digest: 'file1', duration_ms: 9 } });
+      expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
+      expect(s.toolCards.size).toBe(1);
+      const card = s.toolCards.get('c1')!;
+      expect(card.name).toBe('bash');
+      expect(card.args).toBe('{"cmd":"ls"}');
+      expect(card.ok).toBe(true);
+      expect(card.out).toBe('✓ file1（9ms）');
+
+      // 同 callId 二次回放（重复拉取/竞态）不重复占位
+      s.replayEvent({ seq: 2, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: { cmd: 'ls' } } });
+      expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
+      expect(s.toolCards.size).toBe(1);
+    });
+
+    it('历史 judge → variant=judge 的 sep；round/compaction/final_guard 同样只产 sep', () => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.replayEvent({ seq: 4, run_id: 'r1', type: 'judge', payload: { decision: { extend: false, extendReason: '够用了' } } });
+      s.replayEvent({ seq: 1, run_id: 'r1', type: 'round_start', payload: { round: 1 } });
+      s.replayEvent({ seq: 5, run_id: 'r1', type: 'compaction', payload: { round: 2, compaction: { foldedRounds: 1, tokensBefore: 9, tokensAfter: 3 } } });
+      s.replayEvent({ seq: 6, run_id: 'r1', type: 'final_guard', payload: { action: 'accept', reason: 'fine' } });
+      // vi.fn 不记录末尾 undefined 实参：单参调用表现为 ['文案']
+      expect(hooks.onSep.mock.calls).toEqual([
+        ['judge：不扩轮 — 够用了', 'judge'],
+        ['round 1'],
+        ['上下文折叠（round 2）：1 轮折叠，9 → 3 tokens'],
+        ['final guard：accept — fine'],
+      ]);
+    });
+
+    it('红线：历史 run_end 强制短路——不驱动状态机（不通知宿主/不动 activeRunId/不产 sep）', () => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.activeRunId.value = 'run-CURRENT';
+      // 模拟服务端误下发当前 run 的 run_end：history 模式也不得触发 onCurrentRunEnd
+      s.replayEvent({ seq: 9, run_id: 'run-CURRENT', type: 'run_end', payload: { termination: { reason: 'end_turn' } } });
+      // 历史 run 的 run_end 同样忽略
+      s.replayEvent({ seq: 8, run_id: 'run-OLD', type: 'run_end', payload: { termination: { reason: 'failed' } } });
+      expect(hooks.onCurrentRunEnd).not.toHaveBeenCalled();
+      expect(hooks.onSep).not.toHaveBeenCalled();
+      expect(hooks.onSysErr).not.toHaveBeenCalled();
+      expect(s.activeRunId.value).toBe('run-CURRENT');
+    });
+
+    it('白名单外类型（assistant_delta/usage/heartbeat）忽略：不产生增量气泡', () => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.replayEvent({ seq: 2, run_id: 'r1', type: 'assistant_delta', payload: { text: '半截' } });
+      s.replayEvent({ seq: 3, run_id: 'r1', type: 'usage', payload: { usage: {} } });
+      s.replayEvent({ seq: 4, run_id: 'r1', type: 'heartbeat', payload: {} });
+      expect(s.deltaText.value).toBeNull();
+      expect(s.lastSeq.value).toBe(0);
+      expect(hooks.onSep).not.toHaveBeenCalled();
+    });
+
+    it('不推进水位线（openSession 已按 detail.last_seq 初始化）；历史卡片可被实时 tool_result 回填', () => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.lastSeq.value = 7; // openSession 预置
+      s.replayEvent({ seq: 5, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: {} } });
+      expect(s.lastSeq.value).toBe(7);
+
+      // 实时路径同 callId 回填（历史与实时同一 toolCards 渲染路径的直接证据）
+      s.connect('sess-1');
+      lastES().emit('tool_result', { seq: 8, tool_call_id: 'c1', ok: false, result_digest: 'boom', duration_ms: 3 });
+      expect(s.toolCards.get('c1')!.ok).toBe(false);
+      expect(s.toolCards.get('c1')!.out).toBe('✗ boom（3ms）');
+      expect(s.lastSeq.value).toBe(8);
+    });
+  });
+
   it('resetStreamState 复位全部协议状态并断开连接', () => {
     const s = useEventStream(makeHooks());
     s.connect('sess-1');
