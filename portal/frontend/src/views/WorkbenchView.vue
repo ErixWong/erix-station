@@ -161,8 +161,10 @@ function jumpToLatest() {
       ></div>
       <!-- 侧栏：≥md 静态；<md 抽屉（旧 offcanvas-md + body.drawer-open 的 Tailwind 等价） -->
       <!-- w-60 改 CSS 变量绑定（仅 ≥md 生效），shrink-0 保留 -->
+      <!-- issue #92：aside 改 flex-col 以承载 SidebarPanel 的三段布局（固定头/列表独立滚/树固定底）；
+           overflow-y-auto 保留作兜底——正常三段结构下列表段内部消化滚动，整栏不再滚 -->
       <aside
-        class="w-60 md:w-(--sidebar-w) shrink-0 overflow-y-auto border-r border-black/10 p-2 bg-white"
+        class="flex w-60 md:w-(--sidebar-w) flex-col shrink-0 overflow-y-auto border-r border-black/10 bg-white p-2"
         :style="sidebar.asideStyle.value"
         :class="drawerOpen
           ? 'max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:shadow-lg'
