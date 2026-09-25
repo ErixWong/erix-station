@@ -169,6 +169,9 @@ services:
       # 由 ERIX_STATION_BASE_URL（agentd）与 config.json endpoint（worker provider）使用。
       TRAEFIK_WEB_PORT: ${TRAEFIK_WEB_PORT:-8090}
       TRAEFIK_WEBSECURE_PORT: ${TRAEFIK_WEBSECURE_PORT:-8443}
+      # issue #84 P5：FDE agentd/worker 可调参数（portal → provisioner → FDE 容器 env 下发；改值重建容器即可）。
+      ERIX_MAX_ROUNDS: ${ERIX_MAX_ROUNDS:-16}
+      ERIX_AGENTD_CAPACITY: ${ERIX_AGENTD_CAPACITY:-2}
       PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}

@@ -107,6 +107,9 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   // 契约 §6.2：容器内 station.<base>/llm.<base> → 本 FDE bridge 网关（--add-host）。
   assert.deepEqual(body.HostConfig.ExtraHosts, ['station.localhost:10.200.1.1', 'llm.localhost:10.200.1.1']);
   assert.ok(body.Env.some((e) => e.startsWith('ERIX_STATION_BASE_URL=https://station.localhost/api/internal')), '默认 portal base url');
+  // issue #84 P5：agentd/worker 可调参数下发（默认值随 portal env）。
+  assert.ok(body.Env.includes('ERIX_MAX_ROUNDS=16'), 'ERIX_MAX_ROUNDS 默认下发');
+  assert.ok(body.Env.includes('ERIX_AGENTD_CAPACITY=2'), 'ERIX_AGENTD_CAPACITY 默认下发');
 });
 
 test('buildNetworkConfig：显式 subnet + gateway', () => {
