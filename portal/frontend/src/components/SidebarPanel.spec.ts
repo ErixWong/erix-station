@@ -9,6 +9,7 @@ import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import SidebarPanel from './SidebarPanel.vue';
+import SessionPickerModal from './SessionPickerModal.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
@@ -132,5 +133,58 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
     card!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await flushPromises();
     expect(onSelectSession).toHaveBeenCalledWith('42');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #94：会话选择入口——① 列表尾「查看全部 →」（仅 sessionsNextCursor 存在）② 固定头 🔍
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · issue #94 会话选择入口', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  it('入口①：sessionsNextCursor 为 null → 列表尾不渲染「查看全部」相关文案', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] });
+    expect(wrapper.text()).not.toContain('查看全部会话');
+    expect(wrapper.text()).not.toContain('显示最近 20 个');
+  });
+
+  it('入口①：sessionsNextCursor 存在 → 渲染「显示最近 20 个」+「查看全部会话 →」，点击打开 modal（scope=cwd），选中后关闭并回传 select-session', async () => {
+    const onSelectSession = vi.fn();
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] }, { onSelectSession });
+    const store = useWorkbenchStore();
+    store.sessionsNextCursor = 'cursor-x'; // 截断：还有未展示的会话
+    await flushPromises();
+    expect(wrapper.text()).toContain('显示最近 20 个');
+    // modal 数据源：一条可点选的结果行
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      items: [{ id: '99', title: '目标会话', cwd: '~/projects/a', updated_at: new Date().toISOString(), active_run_id: null }],
+      next_cursor: null, total: 1,
+    }), { status: 200 })));
+    await wrapper.findAll('button').find((b) => b.text() === '查看全部会话 →')!.trigger('click');
+    await flushPromises();
+    await new Promise((r) => setTimeout(r, 20)); // composable 首屏 setTimeout(0)
+    await flushPromises();
+    const modal = wrapper.findComponent(SessionPickerModal);
+    expect(modal.exists()).toBe(true);
+    expect(modal.props('scope')).toBe('cwd');
+    expect(modal.props('cwd')).toBe('~/projects/a');
+    await modal.find('li[role="option"]').trigger('click');
+    await flushPromises();
+    expect(onSelectSession).toHaveBeenCalledWith('99'); // 复用视图层深链逻辑
+    expect(wrapper.findComponent(SessionPickerModal).exists()).toBe(false); // modal 已关闭
+  });
+
+  it('入口②：固定头 🔍 恒可见；有目录时 scope=cwd、无目录时 scope=all', async () => {
+    const w1 = await mountPanel({ dirs: DIR });
+    const btn1 = w1.find('button[aria-label="查找会话"]');
+    expect(btn1.exists()).toBe(true);
+    await btn1.trigger('click');
+    expect(w1.findComponent(SessionPickerModal).props('scope')).toBe('cwd');
+
+    const w2 = await mountPanel({ noDir: true });
+    const btn2 = w2.find('button[aria-label="查找会话"]');
+    expect(btn2.exists()).toBe(true); // 无目录也恒可见
+    await btn2.trigger('click');
+    expect(w2.findComponent(SessionPickerModal).props('scope')).toBe('all');
   });
 });
