@@ -669,8 +669,10 @@ async function handleListSessions(req, res, ctx) {
     userId: session.user.id,
     projectId: url.searchParams.get('project_id') || undefined,
     cwd: url.searchParams.get('cwd') || undefined,
+    q: url.searchParams.get('q') || undefined, // issue #94：标题 contains 服务端过滤
     cursor: url.searchParams.get('cursor') || undefined,
     limit: url.searchParams.get('limit') || undefined,
+    total: url.searchParams.get('total') === '1', // issue #94：为 1 时返回与条件一致的 COUNT
   });
   return sendJson(res, 200, result);
 }

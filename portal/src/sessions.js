@@ -48,6 +48,9 @@ export function validateSessionCwd(value) {
 /** 单条 user 消息内容上限（portal.md §4.3）。 */
 export const MAX_MESSAGE_CONTENT_LENGTH = 100_000;
 
+/** issue #94：会话列表搜索词（q）长度上限（对齐 title ≤200 的既有边界）。 */
+export const MAX_SESSION_QUERY_LENGTH = 200;
+
 /**
  * 请求体校验（**纯函数，无 IO**）：返回裁剪后的 `{content, attachments}`；不合法一律 `SessionError`(400 validation_failed)。
  *
@@ -101,9 +104,31 @@ async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {})
   return row;
 }
 
-/** GET /api/sessions?project_id=&cwd=（可选过滤，按 updated_at 倒序 + keyset 分页 §1.3：默认 20、上限 100）。
- *  P5：cwd 过滤为「该目录的会话列表」（directory-as-project §4 左栏；精确匹配会话绑定 cwd）。 */
-export async function listSessions(pool, { userId, projectId, cwd, cursor, limit = 20 }) {
+/**
+ * issue #94：keyset 游标编解码（不透明串）——base64url(JSON {u: updated_at ISO, i: id})。
+ * 旧格式（纯 UUID）与任何非法值一律 validation_failed（游标与查询条件绑定，跨条件复用本就失效，
+ * 严格拒绝比静默跳过安全）。
+ */
+export function encodeSessionCursor(row) {
+  return Buffer.from(JSON.stringify({ u: rowToSession(row).updated_at, i: row.id }), 'utf8').toString('base64url');
+}
+
+export function decodeSessionCursor(cursor) {
+  try {
+    const obj = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
+    if (obj && typeof obj.u === 'string' && obj.u && typeof obj.i === 'string' && UUID_RE.test(obj.i)) {
+      return { updatedAt: obj.u, id: obj.i };
+    }
+  } catch { /* 非法编码落入统一报错 */ }
+  throw new SessionError('validation_failed', 'cursor 非法', { details: { field: 'cursor' } });
+}
+
+/** GET /api/sessions?project_id=&cwd=&q=&cursor=&limit=&total=（可选过滤，updated_at DESC, id DESC
+ *  复合 keyset 分页 §1.3：默认 20、上限 100；issue #94）。
+ *  P5：cwd 过滤为「该目录的会话列表」（directory-as-project §4 左栏；精确匹配会话绑定 cwd）。
+ *  issue #94：q = 标题 contains（ILIKE，服务端过滤）；total=1 → 返回与当前条件一致的 COUNT；
+ *  排序键为 (updated_at, id) 复合——仅按 updated_at 会在同时间戳记录间跳页（旧游标缺陷修复）。 */
+export async function listSessions(pool, { userId, projectId, cwd, q, cursor, limit = 20, total = false }) {
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [userId];
   let where = `user_id = $1 AND status = 'active'`;
@@ -115,12 +140,25 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
     params.push(validateSessionCwd(cwd));
     where += ` AND cwd = $${params.length}`;
   }
-  if (cursor) {
-    if (!UUID_RE.test(cursor)) {
-      throw new SessionError('validation_failed', 'cursor 非法', { details: { field: 'cursor' } });
+  if (q !== undefined && q !== null && q !== '') {
+    if (typeof q !== 'string' || q.length > MAX_SESSION_QUERY_LENGTH) {
+      throw new SessionError('validation_failed', `q 必须为 ≤${MAX_SESSION_QUERY_LENGTH} 字符的字符串`, {
+        details: { field: 'q' },
+      });
     }
-    params.push(cursor);
-    where += ` AND updated_at < (SELECT updated_at FROM chat_sessions WHERE id = $${params.length})`;
+    params.push(`%${q}%`);
+    where += ` AND title ILIKE $${params.length}`;
+  }
+  // total 与「当前查询条件（user_id/cwd/q/active）」一致：不含游标边界（游标是分页位置，不是过滤条件）。
+  let totalCount;
+  if (total) {
+    const cnt = await pool.query(`SELECT COUNT(*)::int AS total FROM chat_sessions s WHERE ${where}`, params);
+    totalCount = cnt.rows[0]?.total ?? 0;
+  }
+  if (cursor) {
+    const boundary = decodeSessionCursor(cursor);
+    params.push(boundary.updatedAt, boundary.id);
+    where += ` AND (s.updated_at, s.id) < ($${params.length - 1}, $${params.length})`;
   }
   params.push(n + 1);
   const res = await pool.query(
@@ -128,13 +166,13 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
             (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id
        FROM chat_sessions s
       WHERE ${where}
-      ORDER BY s.updated_at DESC
+      ORDER BY s.updated_at DESC, s.id DESC
       LIMIT $${params.length}`,
     params,
   );
   const items = res.rows.slice(0, n).map((r) => ({ ...rowToSession(r), active_run_id: r.active_run_id ?? null }));
-  const nextCursor = res.rows.length > n ? res.rows[n - 1].id : null;
-  return { items, next_cursor: nextCursor };
+  const nextCursor = res.rows.length > n ? encodeSessionCursor(res.rows[n - 1]) : null;
+  return total ? { items, next_cursor: nextCursor, total: totalCount } : { items, next_cursor: nextCursor };
 }
 
 /**

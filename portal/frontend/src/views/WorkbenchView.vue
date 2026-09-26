@@ -3,7 +3,7 @@
 // 深链 #/session/<id> 已迁入 vue-router（/session/:id 路由，issue #55 B1 语义平移）：
 //   列表内直开 / 跨项目切项目后打开（写回深链）/ 404 静默回退清路由 / 其他错误保留路由 + 报错。
 // popstate（前进/后退）由 vue-router hash 模式驱动路由参数变化 → 本组件 watcher 等价旧 popstate 处理器。
-import { computed, nextTick, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
@@ -12,6 +12,7 @@ import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSid
 import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
 import ComposerBar from '../components/ComposerBar.vue';
+import SessionPickerModal from '../components/SessionPickerModal.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -65,6 +66,22 @@ async function onNewSession() {
 async function onLogout() {
   await auth.logout();
   router.replace('/login');
+}
+
+// ---- issue #94：顶栏查找会话（入口③：scope='all' 跨目录找回）+ Ctrl/⌘+K 全局快捷键 ----
+const pickerOpen = ref(false);
+function onGlobalKeydown(e: KeyboardEvent) {
+  // 组合键判定：Ctrl/⌘+K 且非输入法组合（e.isComposing）——普通键入不经此拦截，不与输入框冲突
+  if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+  if (e.key.toLowerCase() !== 'k' || e.isComposing) return;
+  e.preventDefault();
+  pickerOpen.value = true;
+}
+onMounted(() => window.addEventListener('keydown', onGlobalKeydown));
+onUnmounted(() => window.removeEventListener('keydown', onGlobalKeydown));
+function onPickerSelect(id: string) {
+  pickerOpen.value = false;
+  void onSelectSession(id); // 复用现有深链逻辑（同会话刷新 / 跨目录 / 路由 push）
 }
 
 onMounted(async () => {
@@ -144,6 +161,14 @@ function jumpToLatest() {
         :title="`${store.dirCwd}（点击复制）`"
         @click="copyCwd"
       >📁 {{ dirShortName }}<span v-if="copied" class="text-black/40"> 已复制</span></button>
+      <!-- issue #94 入口③：顶栏查找会话（scope=all 跨目录找回；Ctrl/⌘+K 同语义） -->
+      <button
+        type="button"
+        title="查找会话（Ctrl/⌘+K）"
+        aria-label="查找会话"
+        class="rounded-md border border-black/20 px-2 py-1 text-sm hover:bg-black/5"
+        @click="pickerOpen = true"
+      >🔍</button>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">管理台</router-link>
       <button
@@ -193,6 +218,14 @@ function jumpToLatest() {
           <StreamPanel />
         </div>
         <ComposerBar />
+        <!-- issue #94：会话选择 modal（入口③，scope='all'） -->
+        <SessionPickerModal
+          v-if="pickerOpen"
+          scope="all"
+          :cwd="store.dirCwd ?? undefined"
+          @select="onPickerSelect"
+          @close="pickerOpen = false"
+        />
         <!-- issue #55 A2：「↓ 最新」悬浮按钮 -->
         <button
           v-if="showToLatest"

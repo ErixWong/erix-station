@@ -1,10 +1,12 @@
 <script setup lang="ts">
 // 侧栏（issue #84 P5.4，设计文档 §4 左栏竖排三段；issue #92 改 aside 内 flex-col 三段布局）：
 //   ① 固定头：目录下拉（DirSelect：目录名 + ●N 运行态徽标 + ↻ 双刷 + 末项「＋ 新建目录」
-//      内联表单）+ 「＋ 新会话」按钮——不随列表滚动
+//      内联表单）+ 「＋ 新会话」按钮 + 🔍 查找会话（issue #94 入口②）——不随列表滚动
 //   ② 会话列表段：flex-1 min-h-0 overflow-y-auto，独立内部滚动（空态文案「先创建目录」/
-//      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树
+//      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树；列表尾渲染
+//      「显示最近 20 个」+「查看全部会话 →」（issue #94 入口①，仅 sessionsNextCursor 存在）
 //   ③ 目录树面板（DirectoryTree，默认收起，懒展开）：固定底部，任意会话数下恒可达
+// issue #94：SessionPickerModal（通用会话选择器，三入口共用）挂在本组件与 WorkbenchView。
 // 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价），
 // 三段结构在抽屉内同样成立（aside 高度由 max-md:inset-y-0 撑满，h-full 生效）。
 import { ref } from 'vue';
@@ -12,6 +14,7 @@ import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
 import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
+import SessionPickerModal from './SessionPickerModal.vue';
 
 const store = useWorkbenchStore();
 const auth = useAuthStore();
@@ -25,6 +28,18 @@ const treeRef = ref<InstanceType<typeof DirectoryTree> | null>(null);
 function onRefresh() {
   void store.refreshDirs().catch(() => { /* loadDirs 失败静默：下拉保留旧数据，下次刷新重试 */ });
   treeRef.value?.reload();
+}
+
+// ---- issue #94：会话选择 modal（入口① 查看全部 / 入口② 固定头 🔍）----
+const pickerOpen = ref(false);
+const pickerScope = ref<'cwd' | 'all'>('cwd');
+function openPicker(scope: 'cwd' | 'all') {
+  pickerScope.value = scope;
+  pickerOpen.value = true;
+}
+function onPickerSelect(id: string) {
+  pickerOpen.value = false;
+  emit('select-session', id); // 路由 push/跨目录逻辑由视图 onSelectSession 统一处理
 }
 
 // ---- 「＋ 新建目录」内联表单（DIR_NAME_RE 校验 + 错误展示；创建成功后打开新会话）----
@@ -82,12 +97,21 @@ async function onSubmitNewDir() {
         <p class="syserr mt-2" role="alert">{{ newDirError }}</p>
       </form>
 
-      <!-- 「＋ 新会话」：固定头内，列表再长也不动 -->
-      <button
-        class="w-full mt-3 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
-        :disabled="store.newSessDisabled"
-        @click="emit('new-session')"
-      >＋ 新会话</button>
+      <!-- 「＋ 新会话」+ 🔍 查找会话（issue #94 入口②：默认当前目录，无目录时全量） -->
+      <div class="mt-3 flex gap-2">
+        <button
+          class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
+          :disabled="store.newSessDisabled"
+          @click="emit('new-session')"
+        >＋ 新会话</button>
+        <button
+          type="button"
+          title="查找会话"
+          aria-label="查找会话"
+          class="shrink-0 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
+          @click="openPicker(store.dirCwd ? 'cwd' : 'all')"
+        >🔍</button>
+      </div>
     </div>
 
     <!-- ② 会话列表段（该目录）：flex-1 min-h-0 + 独立内部滚动；空态文案也放这里（issue #92） -->
@@ -110,11 +134,29 @@ async function onSubmitNewDir() {
           <div>{{ s.title || '未命名会话' }}</div>
           <div class="text-black/50 text-xs">{{ store.sessMeta(s) }}</div>
         </div>
+        <!-- issue #94 入口①：仅截断时渲染（next_cursor 存在 = 该目录还有未展示的会话） -->
+        <div v-if="store.sessionsNextCursor" class="mt-2 mb-1">
+          <p class="text-black/50 text-xs">显示最近 20 个</p>
+          <button
+            type="button"
+            class="mt-1 w-full rounded-md border border-black/20 px-2 py-1.5 text-sm text-brand hover:bg-black/5"
+            @click="openPicker('cwd')"
+          >查看全部会话 →</button>
+        </div>
       </div>
     </div>
 
     <!-- ③ 目录树面板（默认收起，懒展开；节点点击暂无动作，P6 预览后补）：固定底部恒可达 -->
     <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负 -->
     <DirectoryTree ref="treeRef" class="shrink-0" :cwd="store.dirCwd" />
+
+    <!-- issue #94：会话选择 modal（teleport 无必要——侧栏抽屉/桌面布局下 fixed 遮罩均覆盖全屏） -->
+    <SessionPickerModal
+      v-if="pickerOpen"
+      :scope="pickerScope"
+      :cwd="store.dirCwd ?? undefined"
+      @select="onPickerSelect"
+      @close="pickerOpen = false"
+    />
   </div>
 </template>
