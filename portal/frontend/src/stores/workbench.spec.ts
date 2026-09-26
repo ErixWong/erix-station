@@ -92,8 +92,9 @@ describe('workbench store（P5 目录即项目）', () => {
     await store.initWorkspace(USER);
     expect(store.sessions.map((s) => s.id)).toEqual(['s1']); // s-x 被客户端过滤
     const fetchMock = vi.mocked(fetch);
-    expect(String(fetchMock.mock.calls.find(([u]) => String(u).startsWith('/api/sessions'))?.[0]))
-      .toContain('cwd=' + encodeURIComponent('~/projects/demo'));
+    const url = new URL(String(fetchMock.mock.calls.find(([u]) => String(u).startsWith('/api/sessions'))?.[0]), 'http://x');
+    expect(url.searchParams.get('cwd')).toBe('~/projects/demo');
+    expect(url.searchParams.get('limit')).toBe('20'); // issue #94：侧栏列表显式截断 20
   });
 
   it('平台管理员空态：newDir 禁用 + 管理台引导 placeholder', async () => {
