@@ -188,3 +188,49 @@ describe('SidebarPanel · issue #94 会话选择入口', () => {
     expect(w2.findComponent(SessionPickerModal).props('scope')).toBe('all');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #94：「当前会话」置顶卡——深链打开的会话不在侧栏列表时给上下文（重开语义同 #55 B4）
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · issue #94 「当前会话」置顶卡', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  it('sessionId 在列表中 → 无置顶卡（列表卡自身以选中态高亮）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] });
+    useWorkbenchStore().sessionId = '1';
+    await flushPromises();
+    expect(wrapper.find('[data-testid="pinned-current"]').exists()).toBe(false);
+  });
+
+  it('sessionId 不在列表中 → 置顶卡存在且含标题，样式带 border-brand bg-green-50，位于列表段最顶；点击 emit select-session', async () => {
+    const onSelectSession = vi.fn();
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] }, { onSelectSession });
+    useWorkbenchStore().sessionId = 'deep-99'; // 深链：不在当前目录列表（如被「最近 20 个」截断）
+    await flushPromises();
+    const card = wrapper.find('[data-testid="pinned-current"]');
+    expect(card.exists()).toBe(true);
+    expect(card.text()).toContain('📌 当前会话'); // 标题
+    expect(card.classes()).toContain('border-brand'); // 复用选中态高亮
+    expect(card.classes()).toContain('bg-green-50');
+    // v-for 之外、位于列表段最顶部（其父容器即 v-else 列表容器，卡是其首个元素子节点）
+    expect(card.element.parentElement!.firstElementChild).toBe(card.element);
+    await card.trigger('click');
+    expect(onSelectSession).toHaveBeenCalledWith('deep-99'); // 重开当前会话
+  });
+
+  it('空态（暂无会话）+ 深链 sessionId → 置顶卡仍显示（可能是唯一一张卡），与空态文案共存', async () => {
+    const wrapper = await mountPanel({ dirs: DIR });
+    useWorkbenchStore().sessionId = 'deep-7';
+    await flushPromises();
+    expect(wrapper.find('[data-testid="pinned-current"]').exists()).toBe(true);
+    expect(paneEls(wrapper).list.textContent).toContain('暂无会话');
+  });
+
+  it('noDir（列表未加载）→ 不显示置顶卡', async () => {
+    const wrapper = await mountPanel({ noDir: true });
+    useWorkbenchStore().sessionId = 'deep-1';
+    await flushPromises();
+    expect(wrapper.find('[data-testid="pinned-current"]').exists()).toBe(false);
+  });
+});
+
