@@ -49,7 +49,8 @@ export function useSidebarWidth() {
     setWidth(SIDEBAR_DEFAULT); // 双击把手恢复默认
   }
 
-  // pointerdown → setPointerCapture → pointermove 实时改宽 → pointerup 结束。
+  // pointerdown → setPointerCapture → pointermove 实时改宽（仅内存）→ pointerup 落盘并结束。
+  // 持久化节流：onMove 高频触发不写 localStorage，避免拖拽途中反复同步写；松手按最终宽度写一次。
   // 把手是 aside 的兄弟元素（aside 内 overflow-y-auto，内部把手会与滚动条打架）。
   function onHandlePointerDown(e: PointerEvent) {
     const el = e.currentTarget as HTMLElement;
@@ -60,11 +61,12 @@ export function useSidebarWidth() {
     const startX = e.clientX;
     const startWidth = width.value;
     const onMove = (ev: PointerEvent) => {
-      // 持久化走实时写入：localStorage 同步写成本可忽略，松手即已落盘
-      setWidth(startWidth + (ev.clientX - startX));
+      // 节流落盘：拖拽中只改内存宽度，localStorage 写推迟到 pointerup（按最终宽度写一次）
+      width.value = clampSidebarWidth(startWidth + (ev.clientX - startX));
     };
     const onUp = (ev: PointerEvent) => {
       dragging.value = false;
+      saveSidebarWidth(width.value); // 松手落盘：此时 width 已是钳制后的最终值
       if (el.hasPointerCapture(ev.pointerId)) el.releasePointerCapture(ev.pointerId);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);

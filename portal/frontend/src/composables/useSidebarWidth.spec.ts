@@ -153,7 +153,7 @@ describe('useSidebarWidth · composable 交互', () => {
     expect(w2.find('.handle').attributes('aria-valuenow')).toBe(String(SIDEBAR_DEFAULT));
   });
 
-  it('pointer 拖拽：capture → move 实时改宽 → up 结束并 release；宽度钳制且持久化', async () => {
+  it('pointer 拖拽：capture → move 实时改宽（仅内存，不落盘）→ up 按最终宽度落盘一次并 release', async () => {
     const wrapper = mount(HandleStub);
     await flushPromises();
     const el = wrapper.find('.handle').element;
@@ -163,21 +163,40 @@ describe('useSidebarWidth · composable 交互', () => {
     expect(captureSpy).toHaveBeenCalledWith(7);
     expect(wrapper.find('.handle').classes()).toContain('bg-brand/60'); // 拖拽中高亮
 
-    // 向右拖 60px：240 → 300（实时写 localStorage）
+    // 向右拖 60px：240 → 300（实时改宽，但 localStorage 不写——节流落盘）
     firePointer(el, 'pointermove', { clientX: 560 });
     await wrapper.vm.$nextTick();
     expect(wrapper.find('.handle').attributes('aria-valuenow')).toBe('300');
-    expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBe('300');
+    expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBeNull(); // 拖拽中不落盘
 
-    // 拖过上限：钳到 480
+    // 拖过上限：钳到 480（仍不落盘）
     firePointer(el, 'pointermove', { clientX: 5000 });
     await wrapper.vm.$nextTick();
     expect(wrapper.find('.handle').attributes('aria-valuenow')).toBe(String(SIDEBAR_MAX));
+    expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBeNull();
 
     firePointer(el, 'pointerup', { pointerId: 7 });
     await wrapper.vm.$nextTick();
+    expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBe(String(SIDEBAR_MAX)); // 松手按最终宽度写一次
     expect(releaseSpy).toHaveBeenCalledWith(7);
     expect(wrapper.find('.handle').classes()).toContain('bg-black/10'); // 结束恢复
+  });
+
+  it('拖拽中途多次 pointermove 后 localStorage 未变，pointerup 后等于最终宽度', async () => {
+    const wrapper = mount(HandleStub);
+    await flushPromises();
+    const el = wrapper.find('.handle').element;
+    firePointer(el, 'pointerdown', { button: 0, clientX: 300, pointerId: 3 });
+    const moves = [330, 360, 340, 380, 350]; // 来回多次移动
+    for (const x of moves) {
+      firePointer(el, 'pointermove', { clientX: x });
+      await wrapper.vm.$nextTick();
+      expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBeNull();
+    }
+    expect(wrapper.find('.handle').attributes('aria-valuenow')).toBe('290'); // 240 + (350-300)，内存实时生效
+    firePointer(el, 'pointerup', { pointerId: 3 });
+    await wrapper.vm.$nextTick();
+    expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBe('290'); // 仅最终值落盘
   });
 
   it('pointerdown 非主键（button=2）不进入拖拽', async () => {
@@ -198,7 +217,7 @@ describe('useSidebarWidth · composable 交互', () => {
     expect(localStorage.getItem(SIDEBAR_STORAGE_KEY)).toBe(String(SIDEBAR_DEFAULT));
   });
 
-  it('键盘 ←/→ 以 16px 步长微调并钳制', async () => {
+  it('键盘 ←/→ 以 16px 步长微调并即时落盘（键盘路径不受拖拽节流影响）', async () => {
     const wrapper = mount(HandleStub);
     await flushPromises();
     const handle = wrapper.find('.handle');
