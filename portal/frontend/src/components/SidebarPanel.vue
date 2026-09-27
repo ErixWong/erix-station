@@ -5,13 +5,15 @@
 //   ② 会话列表段：flex-1 min-h-0 overflow-y-auto，独立内部滚动（空态文案「先创建目录」/
 //      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树；列表尾渲染
 //      「显示最近 20 个」+「查看全部会话 →」（issue #94 入口①，仅 sessionsNextCursor 存在）
+//      列表段顶部：深链打开的会话不在当前列表（如被「最近 20 个」截断）时，置顶「当前会话」卡（issue #94）
 //   ③ 目录树面板（DirectoryTree，默认收起，懒展开）：固定底部，任意会话数下恒可达
 // issue #94：SessionPickerModal（通用会话选择器，三入口共用）挂在本组件与 WorkbenchView。
 // 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价），
 // 三段结构在抽屉内同样成立（aside 高度由 max-md:inset-y-0 撑满，h-full 生效）。
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
+import type { Session } from '../stores/workbench';
 import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
@@ -41,6 +43,21 @@ function onPickerSelect(id: string) {
   pickerOpen.value = false;
   emit('select-session', id); // 路由 push/跨目录逻辑由视图 onSelectSession 统一处理
 }
+
+// ---- issue #94：「当前会话」置顶卡——深链打开的会话不在当前目录列表（被「最近 20 个」截断等）
+// 时给上下文；点击重开当前会话（与 issue #55 B4 的重开语义一致，路由 push/跨目录由视图处理）。
+const pinnedCurrent = computed(() =>
+  !!store.sessionId
+  && !store.noDir // 列表已加载（有目录上下文）才算「不在列表」；无目录时列表本就未加载
+  && !store.sessions.some((s) => String(s.id) === String(store.sessionId)),
+);
+// 列表外会话的标题/updated_at 未在 store 留存（数据流零改动）：合成占位 Session 仅供 sessMeta 取 meta。
+const pinnedSession = computed<Session>(() => ({ id: String(store.sessionId) }));
+const pinnedMeta = computed(() => {
+  const s = pinnedSession.value;
+  // 无 meta 信息时不渲染 1970 占位时间：有 active_run_id / updated_at 才出 meta 行
+  return s.active_run_id || s.updated_at ? store.sessMeta(s) : '';
+});
 
 // ---- 「＋ 新建目录」内联表单（DIR_NAME_RE 校验 + 错误展示；创建成功后打开新会话）----
 const showNewDir = ref(false);
@@ -123,6 +140,17 @@ async function onSubmitNewDir() {
         <p v-else class="muted">先创建目录</p>
       </div>
       <div v-else>
+        <!-- issue #94：置顶卡在 v-for 之外、位于列表段最顶；空态（暂无会话）时也显示——
+             此时它可能是列表里唯一一张卡。样式复用选中态（border-brand bg-green-50）。 -->
+        <div
+          v-if="pinnedCurrent"
+          data-testid="pinned-current"
+          class="mt-2 cursor-pointer rounded-md border px-2 py-1.5 text-sm border-brand bg-green-50"
+          @click="emit('select-session', String(store.sessionId))"
+        >
+          <div>📌 当前会话</div>
+          <div v-if="pinnedMeta" class="text-black/50 text-xs">{{ pinnedMeta }}</div>
+        </div>
         <p v-if="store.sessions.length === 0" class="muted">暂无会话</p>
         <div
           v-for="s in store.sessions"
@@ -147,8 +175,9 @@ async function onSubmitNewDir() {
     </div>
 
     <!-- ③ 目录树面板（默认收起，懒展开；节点点击暂无动作，P6 预览后补）：固定底部恒可达 -->
-    <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负 -->
-    <DirectoryTree ref="treeRef" class="shrink-0" :cwd="store.dirCwd" />
+    <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负；
+         max-h-[40vh] + overflow-y-auto：树面板自身限高内部滚动，不无限侵占侧栏高度（issue #92） -->
+    <DirectoryTree ref="treeRef" class="shrink-0 max-h-[40vh] overflow-y-auto" :cwd="store.dirCwd" />
 
     <!-- issue #94：会话选择 modal（teleport 无必要——侧栏抽屉/桌面布局下 fixed 遮罩均覆盖全屏） -->
     <SessionPickerModal
