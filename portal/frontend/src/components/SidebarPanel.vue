@@ -175,8 +175,9 @@ async function onSubmitNewDir() {
     </div>
 
     <!-- ③ 目录树面板（默认收起，懒展开；节点点击暂无动作，P6 预览后补）：固定底部恒可达 -->
-    <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负 -->
-    <DirectoryTree ref="treeRef" class="shrink-0" :cwd="store.dirCwd" />
+    <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负；
+         max-h-[40vh] + overflow-y-auto：树面板自身限高内部滚动，不无限侵占侧栏高度（issue #92） -->
+    <DirectoryTree ref="treeRef" class="shrink-0 max-h-[40vh] overflow-y-auto" :cwd="store.dirCwd" />
 
     <!-- issue #94：会话选择 modal（teleport 无必要——侧栏抽屉/桌面布局下 fixed 遮罩均覆盖全屏） -->
     <SessionPickerModal

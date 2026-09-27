@@ -121,6 +121,18 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
     expect(kids[1].querySelectorAll('div.mt-2').length).toBe(15); // 会话卡全在列表段内
   });
 
+  it('目录树面板限高 + 内部滚动：根元素含 max-h-[40vh] 与 overflow-y-auto（保留 shrink-0/mt-3/border-t）', async () => {
+    const wrapper = await mountPanel({
+      dirs: [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }],
+    });
+    const { tree } = paneEls(wrapper);
+    expect(tree.classList).toContain('max-h-[40vh]');
+    expect(tree.classList).toContain('overflow-y-auto');
+    expect(tree.classList).toContain('shrink-0'); // 原透传类保留
+    expect(tree.classList).toContain('mt-3'); // 自带分隔边距保留
+    expect(tree.classList).toContain('border-t');
+  });
+
   it('会话点击语义保持：emit select-session（session id）', async () => {
     const onSelectSession = vi.fn();
     const wrapper = await mountPanel({
