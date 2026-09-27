@@ -1,5 +1,5 @@
 // SessionPickerModal 单测（issue #94）：dialog 语义与焦点管理、结果行渲染、键盘导航（↑↓/Enter/Esc）、
-// 范围切换、三态（加载中/无结果含「清除搜索」/失败保留旧列表+重试）、总数显示、移动端全屏层与滚动锁定。
+// 范围切换、三态（加载中/无结果/失败保留旧列表+重试）、总数显示、移动端全屏层与滚动锁定。
 // 事件断言用父级 onSelect/onClose 回调（emitted() 对本环境 script-setup 组件不记录，仓库先例亦不用）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
@@ -24,7 +24,7 @@ function okBody(items: BodyItem[] = ITEMS, extra: Record<string, unknown> = {}) 
   });
 }
 
-/** 真实推进 macrotask（composable 首屏 setTimeout(0) + jsdom Response.json）后再冲刷微任务。 */
+/** 真实推进 macrotask（jsdom Response.json）后再冲刷微任务。 */
 const tick = async (ms = 30) => {
   await new Promise((r) => setTimeout(r, ms));
   await flushPromises();
@@ -51,13 +51,15 @@ afterEach(() => {
 });
 
 describe('SessionPickerModal（issue #94）', () => {
-  it('dialog 语义：role=dialog + aria-modal，打开焦点进搜索框', async () => {
+  it('dialog 语义：role=dialog + aria-modal + 「浏览会话」标签，打开焦点进 dialog 容器', async () => {
     const wrapper = mountModal();
     await tick();
     const dialog = wrapper.find('[role="dialog"]');
     expect(dialog.exists()).toBe(true);
     expect(dialog.attributes('aria-modal')).toBe('true');
-    expect(document.activeElement).toBe(wrapper.find('input[type="search"]').element);
+    expect(dialog.attributes('aria-label')).toBe('浏览会话');
+    expect(dialog.attributes('tabindex')).toBe('-1');
+    expect(document.activeElement).toBe(dialog.element);
     wrapper.unmount();
   });
 
@@ -97,18 +99,18 @@ describe('SessionPickerModal（issue #94）', () => {
     const onClose = vi.fn();
     const wrapper = mountModal({}, { onSelect, onClose });
     await tick();
-    const input = wrapper.find('input[type="search"]');
+    const dialog = wrapper.find('[role="dialog"]');
     const rows = () => wrapper.findAll('li[role="option"]');
     expect(rows()[0].attributes('aria-selected')).toBe('true'); // 默认高亮首条
-    await input.trigger('keydown', { key: 'ArrowDown' });
+    await dialog.trigger('keydown', { key: 'ArrowDown' });
     expect(rows()[1].attributes('aria-selected')).toBe('true');
-    await input.trigger('keydown', { key: 'ArrowDown' }); // 环形回绕
+    await dialog.trigger('keydown', { key: 'ArrowDown' }); // 环形回绕
     expect(rows()[0].attributes('aria-selected')).toBe('true');
-    await input.trigger('keydown', { key: 'ArrowUp' });
+    await dialog.trigger('keydown', { key: 'ArrowUp' });
     expect(rows()[1].attributes('aria-selected')).toBe('true');
-    await input.trigger('keydown', { key: 'Enter' });
+    await dialog.trigger('keydown', { key: 'Enter' });
     expect(onSelect).toHaveBeenCalledWith('s2');
-    await input.trigger('keydown', { key: 'Escape' });
+    await dialog.trigger('keydown', { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
     wrapper.unmount();
   });
@@ -119,31 +121,24 @@ describe('SessionPickerModal（issue #94）', () => {
     await tick();
     expect(new URL(String(fetchMock.mock.calls[0][0]), 'http://x').searchParams.get('cwd')).toBe('~/projects/demo');
     await wrapper.findAll('button').find((b) => b.text() === '全部目录')!.trigger('click');
-    await tick(350); // 条件变更防抖 300ms
+    await tick();
     const last = new URL(String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][0]), 'http://x');
     expect(last.searchParams.get('cwd')).toBeNull();
     wrapper.unmount();
   });
 
-  it('头部显示「共 N 个匹配」（total 就绪后）', async () => {
+  it('头部显示「共 N 个会话」（total 就绪后）', async () => {
     const wrapper = mountModal();
     await tick();
-    expect(wrapper.text()).toContain(`共 ${ITEMS.length} 个匹配`);
+    expect(wrapper.text()).toContain(`共 ${ITEMS.length} 个会话`);
     wrapper.unmount();
   });
 
-  it('三态·无结果：有查询时提示「无匹配会话」+「清除搜索」清空查询', async () => {
+  it('三态·无结果：空列表提示「该范围暂无会话」', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => okBody([])));
     const wrapper = mountModal();
     await tick();
-    expect(wrapper.text()).toContain('该范围暂无会话'); // 空查询 = 浏览态空列表
-    const input = wrapper.find('input[type="search"]');
-    await input.setValue('部署');
-    await tick(350); // 查询防抖 300ms
-    expect(wrapper.text()).toContain('无匹配会话');
-    const clear = wrapper.findAll('button').find((b) => b.text() === '清除搜索')!;
-    await clear.trigger('click');
-    expect((input.element as HTMLInputElement).value).toBe('');
+    expect(wrapper.text()).toContain('该范围暂无会话');
     wrapper.unmount();
   });
 

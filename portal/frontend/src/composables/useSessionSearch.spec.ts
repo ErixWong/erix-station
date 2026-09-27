@@ -1,6 +1,6 @@
-// useSessionSearch 单测（issue #94）：防抖 / 竞态（请求序号 + AbortController）/ 游标重置 / 三态。
+// useSessionSearch 单测（issue #94）：竞态（请求序号 + AbortController）/ 游标重置 / 三态。
 // fetch 全局桩掉；effectScope 包裹以驱动 onScopeDispose。
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { effectScope, nextTick, ref, type Ref } from 'vue';
 import { useSessionSearch, type PickerSession } from './useSessionSearch';
 
@@ -11,13 +11,13 @@ interface Ctx {
   stop: () => void;
 }
 
-function mountSearch(opts: { scope?: 'cwd' | 'all'; cwd?: string | null; debounceMs?: number } = {}): Ctx {
+function mountSearch(opts: { scope?: 'cwd' | 'all'; cwd?: string | null } = {}): Ctx {
   const scope = ref(opts.scope ?? 'cwd');
   const cwd = ref(opts.cwd ?? '~/projects/demo');
   const s = effectScope();
   let search!: ReturnType<typeof useSessionSearch>;
   s.run(() => {
-    search = useSessionSearch({ scope, cwd, debounceMs: opts.debounceMs ?? 300 });
+    search = useSessionSearch({ scope, cwd });
   });
   return { scope, cwd, search, stop: () => s.stop() };
 }
@@ -53,21 +53,16 @@ function urlOf(mock: ReturnType<typeof vi.fn>, i: number): URL {
   return new URL(String(mock.mock.calls[i][0]), 'http://x');
 }
 
-beforeEach(() => {
-  vi.useFakeTimers();
-});
-
 afterEach(() => {
-  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
 describe('useSessionSearch（issue #94）', () => {
-  it('首屏立即加载（不等防抖）：URL 带 limit/total/cwd，无 q/cursor', async () => {
+  it('首屏立即加载：URL 带 limit/total/cwd，无 q/cursor', async () => {
     const fetchMock = vi.fn(async () => resp(okBody([{ id: 's1' }])));
     vi.stubGlobal('fetch', fetchMock);
     const { search, stop } = mountSearch();
-    await vi.runAllTimersAsync();
+    await settle();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const url = urlOf(fetchMock, 0);
     expect(url.pathname).toBe('/api/sessions');
@@ -82,29 +77,12 @@ describe('useSessionSearch（issue #94）', () => {
     stop();
   });
 
-  it('输入防抖 300ms：期间不请求，防抖窗口后带 q 请求一次', async () => {
-    const fetchMock = vi.fn(async () => resp(okBody([])));
-    vi.stubGlobal('fetch', fetchMock);
-    const { search, stop } = mountSearch();
-    await vi.runAllTimersAsync();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    search.query.value = '部 署';
-    await settle();
-    await vi.advanceTimersByTimeAsync(299);
-    expect(fetchMock).toHaveBeenCalledTimes(1); // 防抖窗口内不请求
-    await vi.advanceTimersByTimeAsync(1);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(urlOf(fetchMock, 1).searchParams.get('q')).toBe('部 署');
-    stop();
-  });
-
   it('竞态防护：条件变更后旧请求的迟到响应被忽略（请求序号 + AbortController）', async () => {
     const calls = controlledFetch();
-    const { search, stop } = mountSearch();
-    await vi.runAllTimersAsync(); // 首屏请求挂起（calls[0]）
-    search.query.value = '新条件';
-    await settle();
-    await vi.advanceTimersByTimeAsync(300); // 第二个请求发出（calls[1]）
+    const { scope, search, stop } = mountSearch();
+    await settle(); // 首屏请求挂起（calls[0]）
+    scope.value = 'all'; // 条件变更立即重拉（无防抖）
+    await settle(); // 第二个请求发出（calls[1]）
     expect(calls).toHaveLength(2);
     // 条件变更即作废在途请求
     expect(calls[0].signal?.aborted).toBe(true);
@@ -126,7 +104,7 @@ describe('useSessionSearch（issue #94）', () => {
     const fetchMock = vi.fn(async (url: string) => resp(bodies[fetchMock.mock.calls.length - 1] ?? okBody([])));
     vi.stubGlobal('fetch', fetchMock);
     const { scope, search, stop } = mountSearch();
-    await vi.runAllTimersAsync();
+    await settle();
     expect(search.nextCursor.value).toBe('CUR1');
     search.loadMore(); // 携带 CUR1 翻页
     await settle();
@@ -136,7 +114,6 @@ describe('useSessionSearch（issue #94）', () => {
     await settle();
     expect(search.items.value).toEqual([]); // 列表清空
     expect(search.nextCursor.value).toBeNull(); // 游标重置
-    await vi.advanceTimersByTimeAsync(300);
     const url = urlOf(fetchMock, 2);
     expect(url.searchParams.get('cursor')).toBeNull();
     expect(url.searchParams.get('cwd')).toBeNull();
@@ -150,7 +127,7 @@ describe('useSessionSearch（issue #94）', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
     const { search, stop } = mountSearch();
-    await vi.runAllTimersAsync();
+    await settle();
     expect(search.items.value).toHaveLength(2);
     search.loadMore();
     await settle();
@@ -174,7 +151,6 @@ describe('useSessionSearch（issue #94）', () => {
     const fetchMock = vi.fn(async () => resp(okBody([])));
     vi.stubGlobal('fetch', fetchMock);
     const { search, stop } = mountSearch();
-    vi.advanceTimersByTime(0); // 首屏请求已发出（同步执行 timer 回调）
     expect(search.loading.value).toBe(true); // 加载中
     await settle();
     expect(search.loading.value).toBe(false);
@@ -188,7 +164,7 @@ describe('useSessionSearch（issue #94）', () => {
       resp(okBody([{ id: 'x' }], { next_cursor: String(url).includes('cursor=') ? null : 'CUR' })));
     vi.stubGlobal('fetch', fetchMock);
     const { search, stop } = mountSearch();
-    await vi.runAllTimersAsync();
+    await settle();
     expect(search.hasMore.value).toBe(true);
     search.loadMore();
     search.loadMore(); // 第二调用在 loadingMore 中 → 不重复请求
@@ -201,7 +177,7 @@ describe('useSessionSearch（issue #94）', () => {
   it('组件卸载：在途请求被 abort（onScopeDispose 清理）', async () => {
     const calls = controlledFetch();
     const { stop } = mountSearch();
-    await vi.runAllTimersAsync();
+    await settle();
     expect(calls).toHaveLength(1);
     stop();
     expect(calls[0].signal?.aborted).toBe(true);
