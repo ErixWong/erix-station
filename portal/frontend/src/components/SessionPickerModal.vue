@@ -3,9 +3,10 @@
 //   ① 侧栏列表尾「查看全部 →」（默认 scope='cwd'）② 侧栏固定头 🔍（无目录时 all）
 //   ③ 顶栏 🔍 / Ctrl·⌘+K（scope='all' 跨目录找回）。
 // 契约：props { scope: 'cwd'|'all', cwd? }；emits select(sessionId) / close。
-// 交互（issue #94 定稿）：范围 segmented 恒可改；空查询=浏览（20/批 keyset，触底+按钮加载更多）；
-// 三态（加载中/无结果含「清除搜索」/失败保留旧列表+重试）；键盘 ↑↓ 高亮、Enter 进入、Esc 关闭、
-// 焦点归还触发按钮；dialog 语义（role/aria-modal）；移动端 max-md 全屏层锁背景滚动，桌面居中 dialog。
+// 交互（issue #94 修订：去搜索改纯浏览——搜索待 #88 标题自动生成后再加回）：
+// 范围 segmented 恒可改；浏览（20/批 keyset，触底+按钮加载更多）；
+// 三态（加载中/无结果/失败保留旧列表+重试）；键盘 ↑↓ 高亮、Enter 进入、Esc 关闭、
+// 焦点进 dialog 容器并归还触发按钮；dialog 语义（role/aria-modal）；移动端 max-md 全屏层锁背景滚动，桌面居中 dialog。
 import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 import { useSessionSearch, type PickerSession } from '../composables/useSessionSearch';
 import { formatRelativeTime } from '../lib/relativeTime';
@@ -20,7 +21,7 @@ const emit = defineEmits<{
 const scope = ref(props.scope);
 const cwdRef = computed(() => props.cwd ?? null);
 const dirShortName = computed(() => props.cwd?.split('/').pop() ?? '');
-const { query, items, loading, loadingMore, error, total, hasMore, empty, loadMore, retry } =
+const { items, loading, loadingMore, error, total, hasMore, empty, loadMore, retry } =
   useSessionSearch({ scope, cwd: cwdRef });
 
 // ---- 键盘高亮（↑↓ 移动、Enter 进入；列表刷新后回第一条）----
@@ -42,7 +43,7 @@ function onKeydown(e: KeyboardEvent) {
   const n = items.value.length;
   if (n === 0) return;
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-    e.preventDefault(); // 防输入框光标移动
+    e.preventDefault();
     const delta = e.key === 'ArrowDown' ? 1 : -1;
     activeIndex.value = (activeIndex.value + delta + n) % n;
   } else if (e.key === 'Enter') {
@@ -61,8 +62,8 @@ function onListScroll() {
   if (gap < 80) loadMore();
 }
 
-// ---- 焦点管理 + 背景滚动锁定：打开焦点进搜索框，关闭归还触发按钮 ----
-const inputEl = useTemplateRef<HTMLInputElement>('inputEl');
+// ---- 焦点管理 + 背景滚动锁定：打开焦点进 dialog，关闭归还触发按钮 ----
+const dialogEl = useTemplateRef<HTMLElement>('dialogEl');
 let previousFocus: Element | null = null;
 let previousOverflow = '';
 
@@ -71,33 +72,32 @@ onMounted(async () => {
   previousOverflow = document.body.style.overflow;
   document.body.style.overflow = 'hidden'; // 锁背景滚动（移动端全屏层）
   await nextTick();
-  inputEl.value?.focus();
+  dialogEl.value?.focus();
 });
 onUnmounted(() => {
   document.body.style.overflow = previousOverflow;
   (previousFocus as HTMLElement | null)?.focus?.();
 });
 
-function clearSearch() {
-  query.value = '';
-}
 const rel = (iso?: string) => formatRelativeTime(iso);
 </script>
 
 <template>
   <!-- 遮罩 + dialog 同一固定容器：移动端全屏层、桌面居中 dialog -->
-  <!-- keydown 挂容器：焦点在搜索框时 ↑↓/Enter/Esc 经冒泡到达 -->
+  <!-- keydown 挂容器：焦点在 dialog 内时 ↑↓/Enter/Esc 经冒泡到达 -->
   <div class="fixed inset-0 z-50" @keydown="onKeydown">
     <div class="absolute inset-0 bg-black/40" @click="emit('close')"></div>
     <div
+      ref="dialogEl"
       role="dialog"
       aria-modal="true"
-      aria-label="查找会话"
-      class="absolute inset-x-0 top-10 bottom-0 flex flex-col bg-white shadow-xl max-md:rounded-t-lg md:inset-auto md:left-1/2 md:top-1/2 md:bottom-auto md:w-[32rem] md:max-h-[72vh] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-lg"
+      aria-label="浏览会话"
+      tabindex="-1"
+      class="absolute inset-x-0 top-10 bottom-0 flex flex-col bg-white shadow-xl outline-none max-md:rounded-t-lg md:inset-auto md:left-1/2 md:top-1/2 md:bottom-auto md:w-[32rem] md:max-h-[72vh] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-lg"
     >
       <!-- 头：范围 segmented（恒可改）+ 总数 + 关闭 -->
       <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
-        <div class="flex min-w-0 rounded-md border border-black/20 text-sm" role="group" aria-label="搜索范围">
+        <div class="flex min-w-0 rounded-md border border-black/20 text-sm" role="group" aria-label="会话范围">
           <button
             type="button"
             class="min-w-0 truncate rounded-l-md px-2 py-1 disabled:opacity-40"
@@ -113,7 +113,7 @@ const rel = (iso?: string) => formatRelativeTime(iso);
             @click="scope = 'all'"
           >全部目录</button>
         </div>
-        <span v-if="total != null" class="ml-auto shrink-0 text-xs text-black/50">共 {{ total }} 个匹配</span>
+        <span v-if="total != null" class="ml-auto shrink-0 text-xs text-black/50">共 {{ total }} 个会话</span>
         <button
           type="button"
           aria-label="关闭"
@@ -121,16 +121,6 @@ const rel = (iso?: string) => formatRelativeTime(iso);
           @click="emit('close')"
         >✕</button>
       </div>
-
-      <!-- 搜索框：打开即焦点 -->
-      <input
-        ref="inputEl"
-        v-model="query"
-        type="search"
-        placeholder="搜索会话标题…"
-        aria-label="搜索会话标题"
-        class="mx-3 mt-2 rounded-md border border-black/20 px-2.5 py-1.5 text-sm"
-      >
 
       <!-- 结果列表：独立滚动 + 触底加载 -->
       <div ref="listEl" class="min-h-0 flex-1 overflow-y-auto px-3 py-2" @scroll="onListScroll">
@@ -157,15 +147,7 @@ const rel = (iso?: string) => formatRelativeTime(iso);
 
         <!-- 三态：加载中 / 无结果 / 失败（保留旧列表 + 重试） -->
         <p v-if="loading" class="muted py-4 text-center text-sm">加载中…</p>
-        <div v-else-if="empty" class="py-6 text-center">
-          <p class="muted text-sm">{{ query.trim() ? '无匹配会话' : '该范围暂无会话' }}</p>
-          <button
-            v-if="query.trim()"
-            type="button"
-            class="mt-2 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
-            @click="clearSearch"
-          >清除搜索</button>
-        </div>
+        <p v-else-if="empty" class="muted py-6 text-center text-sm">该范围暂无会话</p>
         <div v-if="error" class="py-4 text-center">
           <p class="syserr text-sm" role="alert">{{ error }}（旧列表已保留）</p>
           <button
