@@ -248,4 +248,23 @@ describe('SessionPickerModal · i18n（issue #101 P2）', () => {
     expect(w2.find('button[aria-label="Close"]').exists()).toBe(true);
     w2.unmount();
   });
+
+  // issue #105 ③：时间戳（updated_at）随 locale 格式化。
+  it('时间戳随 locale（issue #105 ③）：zh-CN 基线逐字不变，切 en 即时变英文格式', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okBody([
+      { id: 's1', cwd: '~/projects/demo', updated_at: T0, active_run_id: null },
+    ])));
+    const wrapper = mountModal({ scope: 'all' });
+    await tick();
+    const row = () => wrapper.get('li[role="option"]').text();
+    const zh = new Date(T0).toLocaleString('zh-CN');
+    const en = new Date(T0).toLocaleString('en');
+    expect(row()).toContain(zh); // 既有 zh-CN 输出逐字不变
+
+    setLocale('en');
+    await flushPromises();
+    expect(row()).toContain(en);
+    expect(row()).not.toContain(zh); // 不再是中文格式（硬编码 zh-CN 会在此失败）
+    wrapper.unmount();
+  });
 });

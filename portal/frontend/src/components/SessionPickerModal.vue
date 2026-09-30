@@ -10,8 +10,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch 
 import { useI18n } from 'vue-i18n';
 import { useSessionBrowser, type PickerSession } from '../composables/useSessionBrowser';
 
-// issue #101 P2：用户可见文案走 i18n（picker.* / common.*）。
-const { t } = useI18n();
+// issue #101 P2：用户可见文案走 i18n（picker.* / common.*）；issue #105 ③：时间戳亦随 locale。
+const { t, locale } = useI18n();
 
 const props = withDefaults(defineProps<{ scope: 'cwd' | 'all'; cwd?: string }>(), { cwd: undefined });
 const emit = defineEmits<{
@@ -71,8 +71,9 @@ onUnmounted(() => {
   (previousFocus as HTMLElement | null)?.focus?.();
 });
 
-// 绝对本地时间（与侧栏 store.sessMeta 的格式一致：toLocaleString('zh-CN')）。
-const abs = (iso?: string) => new Date(iso ?? 0).toLocaleString('zh-CN');
+// 绝对本地时间（与侧栏 store.sessMeta 一致：按当前 locale 格式化；'zh-CN' 输出逐字不变，en 走英文格式）。
+// locale 为响应式 ref → 模板内调用 abs() 时读取，切语言即时重渲染。
+const abs = (iso?: string) => new Date(iso ?? 0).toLocaleString(locale.value);
 </script>
 
 <template>

@@ -130,10 +130,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const newDirDisabled = computed(() => isPlatformAdmin.value);
   const newSessDisabled = computed(() => noDir.value || creatingSession.value);
   // 会话列表项 meta 行（● 运行中 / 本地化时间）
+  // issue #105 ③：时间戳按当前 locale 格式化（原硬编码 'zh-CN'，英文界面下仍是中文格式）。
+  // 'zh-CN' / 'en' 均为合法 BCP-47；locale 是响应式 ref，模板函数读取它 → 切语言即时重渲染。
   function sessMeta(s: Session): string {
     return s.active_run_id
       ? t('common.runningBadge')
-      : new Date(s.updated_at ?? 0).toLocaleString('zh-CN');
+      : new Date(s.updated_at ?? 0).toLocaleString(i18n.global.locale.value);
   }
 
   // ---- 草稿（saveDraft 三路径共用：openSession / selectDir / resetSessionView）----
