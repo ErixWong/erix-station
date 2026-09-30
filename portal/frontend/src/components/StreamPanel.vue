@@ -3,6 +3,7 @@
 // 助手终稿 markdown（v-html，渲染器本身先转义后格式化，XSS 安全）、工具卡片、
 // roundsep/syserr 分隔行、流式增量气泡。自动跟随/「↓ 最新」由父级持有（scroll 容器也在父级）。
 import { reactive, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type StreamEntry } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
 // issue #85：卡片折叠（默认收起）+ 单行摘要防溢出，方案对齐 pi web ToolCallBlock。
@@ -11,6 +12,7 @@ import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansio
 // pi-web 风格：流式增量也走 markdown 渲染（渲染器先转义后格式化，半截 ``` 容错收尾）。
 import { renderMarkdown } from '../lib/markdown';
 
+const { t } = useI18n();
 const store = useWorkbenchStore();
 
 // 展开态：组件内 reactive Set 驱动重渲染，模块级 Set（toolCallExpansion）做跨重渲染记忆，
@@ -42,7 +44,7 @@ function toggleCard(callId: string): void {
 
 // 单行摘要：优先 args 里的语义键（command/path/...），解析失败回退 dig（§旧 toolCard 原样）。
 function summaryText(card: ToolCardState): string {
-  return getToolPreview(card.args) || card.dig || (card.args ? '' : '（参数生成中…）');
+  return getToolPreview(card.args) || card.dig || (card.args ? '' : t('stream.argsPending'));
 }
 
 // 折叠态状态位：✓/✗（出错变红）+ 耗时；尚无结果（null）显示 …。
@@ -74,9 +76,9 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
   <!-- 空态：旧版「选择或新建会话」默认文案（平台管理员进管理台引导） -->
   <div v-if="store.entries.length === 0">
     <p v-if="store.noDir && store.isPlatformAdmin" class="muted">
-      平台管理员：请到管理台创建 FDE 用户与分配资源<br><router-link to="/admin" class="underline">进入管理台</router-link>
+      {{ t('common.platformAdminHint') }}<br><router-link to="/admin" class="underline">{{ t('common.goToAdmin') }}</router-link>
     </p>
-    <p v-else class="muted">选择或新建会话</p>
+    <p v-else class="muted">{{ t('stream.chooseOrNewSession') }}</p>
   </div>
 
   <template v-for="(en, i) in store.entries" :key="entryKey(en, i)">

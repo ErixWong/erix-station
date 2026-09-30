@@ -1,8 +1,11 @@
 <script setup lang="ts">
 // composer（旧 #composer 平移）：发送/停止/禁用逻辑、Enter 发送（Shift+Enter 换行）。
 // 失败回填输入与 llm_not_configured 409 指引在 store.send() 内（逐行平移）。
+import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore } from '../stores/workbench';
 
+// issue #101 P2：用户可见文案走 i18n（composer.*；占位符来自 store.inputPlaceholder）。
+const { t } = useI18n();
 const store = useWorkbenchStore();
 
 function onKeydown(e: KeyboardEvent) {
@@ -27,12 +30,12 @@ function onKeydown(e: KeyboardEvent) {
       class="rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white px-4 disabled:opacity-50"
       :disabled="store.sendDisabled"
       @click="store.send()"
-    >发送</button>
+    >{{ t('composer.send') }}</button>
     <!-- 停止按钮：运行中显示（旧 setRunning(on) 的显隐语义） -->
     <button
       v-if="store.running"
       class="rounded-md border border-red-600 text-red-600 px-4 hover:bg-red-50"
       @click="store.stop()"
-    >■ 停止</button>
+    >{{ t('composer.stop') }}</button>
   </div>
 </template>

@@ -7,8 +7,12 @@
 // 交互对齐 SessionPickerModal 既有模式：dialog 语义（role/aria-modal）、Esc 关闭、
 // 打开焦点进 dialog、关闭归还触发按钮、锁背景滚动；git 变更标记与 run 终态刷新不在本版范围。
 import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import { renderMarkdown } from '../lib/markdown';
+
+// issue #101 P2：用户可见文案走 i18n（preview.* / common.*）；错误 message 来自后端（原样展示）。
+const { t } = useI18n();
 
 const props = defineProps<{ cwd: string; path: string }>(); // path = 相对 tree 根（= cwd）的路径
 const emit = defineEmits<{ (e: 'close'): void }>();
@@ -72,7 +76,7 @@ function onKeydown(e: KeyboardEvent) {
       ref="dialogEl"
       role="dialog"
       aria-modal="true"
-      :aria-label="`预览 ${props.path}`"
+      :aria-label="t('preview.title', { path: props.path })"
       tabindex="-1"
       class="absolute inset-x-0 top-10 bottom-0 flex flex-col bg-white shadow-xl outline-none max-md:rounded-t-lg md:inset-auto md:left-1/2 md:top-1/2 md:bottom-auto md:w-[42rem] md:max-w-[90vw] md:max-h-[80vh] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-lg"
     >
@@ -82,7 +86,7 @@ function onKeydown(e: KeyboardEvent) {
         <span class="muted min-w-0 truncate text-xs" :title="props.path">{{ props.path }}</span>
         <button
           type="button"
-          aria-label="关闭"
+          :aria-label="t('common.close')"
           class="ml-auto shrink-0 rounded-md px-2 py-1 text-sm hover:bg-black/5"
           @click="emit('close')"
         >✕</button>
@@ -90,7 +94,7 @@ function onKeydown(e: KeyboardEvent) {
 
       <!-- 三态：加载中 / 失败 / 成功（三种渲染分支） -->
       <div class="min-h-0 flex-1 overflow-auto px-3 py-2">
-        <p v-if="loading" class="muted py-6 text-center text-sm">加载中…</p>
+        <p v-if="loading" class="muted py-6 text-center text-sm">{{ t('common.loading') }}</p>
         <p v-else-if="error" class="syserr py-6 text-center text-sm" role="alert">{{ error }}</p>
         <template v-else-if="preview">
           <img v-if="preview.kind === 'image'" :src="preview.data" :alt="preview.name" class="mx-auto max-h-full max-w-full">

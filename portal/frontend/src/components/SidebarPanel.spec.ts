@@ -14,8 +14,12 @@ import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
 import type { DirInfo, Session } from '../stores/workbench';
+import { i18n, setLocale } from '../i18n';
 
 beforeEach(() => {
+  // issue #101 P2：装配真实 i18n 单例（不 mock t()），每例重置为 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
   setActivePinia(createPinia());
   vi.stubGlobal('fetch', vi.fn(async () => new Response('{"items":[]}', { status: 200 })));
 });
@@ -30,13 +34,16 @@ async function mountPanel(
   store.sessions = opts.sessions ?? [];
   store.noDir = opts.noDir ?? false;
   if (opts.platformAdmin) store.isPlatformAdmin = true;
-  useAuthStore().user = opts.platformAdmin
+  const auth = useAuthStore();
+  auth.user = opts.platformAdmin
     ? { id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local' }
     : { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local' };
+  // 已探测过：路由守卫不再打 /api/me（否则 fetch 桩的响应会把刚置的 user 覆写成 undefined）。
+  auth.ready = true;
   const router = createAppRouter(createMemoryHistory());
   router.push('/');
   await router.isReady();
-  const wrapper = mount(SidebarPanel, { global: { plugins: [router] }, attrs });
+  const wrapper = mount(SidebarPanel, { global: { plugins: [router, i18n] }, attrs });
   await flushPromises();
   return wrapper;
 }
@@ -181,3 +188,58 @@ describe('SidebarPanel · issue #94 会话浏览入口', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// issue #101 P2：侧栏用户可见文案走 i18n（zh-CN 基线逐字不变，切 en 即时生效）
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · i18n（issue #101 P2）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  it('zh-CN 基线：＋ 新会话 / 暂无会话 / 浏览会话入口 / 新建目录表单文案', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [] });
+    expect(wrapper.text()).toContain('＋ 新会话');
+    expect(wrapper.text()).toContain('暂无会话');
+    expect(wrapper.get('button[aria-label="浏览会话"]').attributes('title')).toBe('浏览会话（Ctrl/⌘+K）');
+
+    await wrapper.get('select').setValue('__new__'); // 末项「＋ 新建目录」→ 内联表单
+    await flushPromises();
+    expect(wrapper.get('label[for="newDirName"]').text()).toBe('目录名（小写字母/数字/连字符）');
+    expect(wrapper.get('#newDirName').attributes('placeholder')).toBe('例如 my-project');
+    expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['创建', '取消']);
+  });
+
+  it('zh-CN 基线：平台管理员空态提示 + 管理台入口', async () => {
+    const wrapper = await mountPanel({ noDir: true, platformAdmin: true });
+    const { list } = paneEls(wrapper);
+    expect(list.textContent).toContain('平台管理员：请到管理台创建 FDE 用户与分配资源');
+    expect(list.textContent).toContain('进入管理台');
+    expect(wrapper.get('a[href="/admin"]').text()).toBe('管理台');
+  });
+
+  it('切 English：侧栏（含 DirSelect 子组件）文案即时变英文', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [] });
+    setLocale('en');
+    await flushPromises();
+    expect(wrapper.text()).toContain('＋ New session');
+    expect(wrapper.text()).toContain('No sessions');
+    expect(wrapper.get('button[aria-label="Browse sessions"]').attributes('title'))
+      .toBe('Browse sessions (Ctrl/⌘+K)');
+    expect(wrapper.get('label[for="dirSel"]').text()).toBe('Directory');
+    expect(wrapper.get('select').find('option[value="__new__"]').text()).toBe('＋ New directory');
+
+    await wrapper.get('select').setValue('__new__');
+    await flushPromises();
+    expect(wrapper.get('label[for="newDirName"]').text())
+      .toBe('Directory name (lowercase letters / digits / hyphens)');
+    expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['Create', 'Cancel']);
+  });
+
+  it('切 English：平台管理员空态提示与管理台入口变英文', async () => {
+    const wrapper = await mountPanel({ noDir: true, platformAdmin: true });
+    setLocale('en');
+    await flushPromises();
+    expect(wrapper.text()).toContain('Platform admin: create FDE users and assign resources in the admin console');
+    expect(wrapper.text()).toContain('Go to admin console');
+    expect(wrapper.get('a[href="/admin"]').text()).toBe('Admin console');
+  });
+});

@@ -3,7 +3,11 @@
 // （懒加载由父级 DirectoryTree.toggleNode 触发：点一级出一层）；文件/目录图标区分；
 // 文件节点点击 → 父级 DirectoryTree.fileClick（P6 issue #84：emit file-click 打开预览 modal）。
 // 状态（childMap/expandedSet/loadingSet）由 DirectoryTree 持有并透传，保证 ↻ 与切目录时全树归位。
+import { useI18n } from 'vue-i18n';
 import type { TreeEntry } from '../lib/tree';
+
+// issue #101 P2：用户可见文案走 i18n（common.emptyDir）。
+const { t } = useI18n();
 
 const props = defineProps<TreeEntry & {
   path: string; // 父路径（'' = 根层）
@@ -43,7 +47,7 @@ function onClick() {
           v-if="!props.childMap.get(nodeKey)?.length"
           class="muted text-xs"
           :style="{ paddingLeft: 18 + props.depth * 14 + 'px' }"
-        >（空目录）</p>
+        >{{ t('common.emptyDir') }}</p>
         <DirTreeNode
           v-for="c in props.childMap.get(nodeKey) ?? []"
           :key="nodeKey + '/' + c.name"

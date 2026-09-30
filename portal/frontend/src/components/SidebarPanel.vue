@@ -9,6 +9,7 @@
 // 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价），
 // 三段结构在抽屉内同样成立（aside 高度由 max-md:inset-y-0 撑满，h-full 生效）。
 import { ref } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
 import DirSelect from './DirSelect.vue';
@@ -16,6 +17,8 @@ import DirectoryTree from './DirectoryTree.vue';
 import FilePreviewModal from './FilePreviewModal.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
 
+// issue #101 P2：用户可见文案走 i18n（sidebar.* / common.*；代码注释保持中文原文）。
+const { t } = useI18n();
 const store = useWorkbenchStore();
 const auth = useAuthStore();
 const emit = defineEmits<{
@@ -85,21 +88,21 @@ async function onSubmitNewDir() {
         v-if="auth.user?.role === 'admin'"
         to="/admin"
         class="mb-2 block rounded-md border border-black/20 px-2.5 py-1 text-center text-sm hover:bg-black/5"
-      >管理台</router-link>
+      >{{ t('common.adminConsole') }}</router-link>
 
       <!-- 目录下拉 + ↻ 双刷（issue #84 P5：替换原项目 select + 新项目表单） -->
       <DirSelect @refresh="onRefresh" @new-dir="onNewDirIntent" />
 
       <!-- 「＋ 新建目录」内联表单（输入名字 → 以该 cwd 建会话，服务端校验 + mkdir） -->
       <form v-if="showNewDir" class="mt-2" novalidate @submit.prevent="onSubmitNewDir">
-        <label class="muted" for="newDirName">目录名（小写字母/数字/连字符）</label>
+        <label class="muted" for="newDirName">{{ t('sidebar.newDirLabel') }}</label>
         <input
-          id="newDirName" v-model="newDirName" required maxlength="63" placeholder="例如 my-project"
+          id="newDirName" v-model="newDirName" required maxlength="63" :placeholder="t('sidebar.newDirPlaceholder')"
           class="w-full mt-1 rounded-md border border-black/20 px-2 py-1 text-sm"
         >
         <div class="flex gap-2 mt-2">
-          <button type="submit" class="flex-1 rounded-md bg-brand text-white text-sm px-2.5 py-1 hover:bg-brand-hover">创建</button>
-          <button type="button" class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5" @click="onCancelNewDir">取消</button>
+          <button type="submit" class="flex-1 rounded-md bg-brand text-white text-sm px-2.5 py-1 hover:bg-brand-hover">{{ t('common.create') }}</button>
+          <button type="button" class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5" @click="onCancelNewDir">{{ t('common.cancel') }}</button>
         </div>
         <p class="syserr mt-2" role="alert">{{ newDirError }}</p>
       </form>
@@ -110,11 +113,11 @@ async function onSubmitNewDir() {
           class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
           :disabled="store.newSessDisabled"
           @click="emit('new-session')"
-        >＋ 新会话</button>
+        >{{ t('sidebar.newSession') }}</button>
         <button
           type="button"
-          title="浏览会话（Ctrl/⌘+K）"
-          aria-label="浏览会话"
+          :title="t('sidebar.browseTitle')"
+          :aria-label="t('sidebar.browse')"
           class="shrink-0 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
           @click="openPicker(store.dirCwd ? 'cwd' : 'all')"
         >🔍</button>
@@ -125,12 +128,12 @@ async function onSubmitNewDir() {
     <div class="mt-2 min-h-0 flex-1 overflow-y-auto">
       <div v-if="store.noDir">
         <p v-if="store.isPlatformAdmin" class="muted">
-          平台管理员：请到管理台创建 FDE 用户与分配资源<br><router-link to="/admin" class="underline">进入管理台</router-link>
+          {{ t('common.platformAdminHint') }}<br><router-link to="/admin" class="underline">{{ t('common.goToAdmin') }}</router-link>
         </p>
-        <p v-else class="muted">先创建目录</p>
+        <p v-else class="muted">{{ t('common.createFirstDir') }}</p>
       </div>
       <div v-else>
-        <p v-if="store.sessions.length === 0" class="muted">暂无会话</p>
+        <p v-if="store.sessions.length === 0" class="muted">{{ t('sidebar.noSessions') }}</p>
         <div
           v-for="s in store.sessions"
           :key="String(s.id)"
@@ -138,7 +141,7 @@ async function onSubmitNewDir() {
           :class="String(s.id) === String(store.sessionId) ? 'border-brand bg-green-50' : 'hover:bg-black/5'"
           @click="emit('select-session', String(s.id))"
         >
-          <div>{{ s.title || '未命名会话' }}</div>
+          <div>{{ s.title || t('common.unnamedSession') }}</div>
           <div class="text-black/50 text-xs">{{ store.sessMeta(s) }}</div>
         </div>
       </div>
