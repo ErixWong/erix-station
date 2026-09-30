@@ -4,6 +4,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { setWorkbenchHooks, useWorkbenchStore } from './workbench';
+import { setLocale } from '../i18n';
 
 /** EventSource 桩（openSession 会 connect；本套件只验证 URL 与状态，不驱动事件帧）。 */
 class FakeEventSource {
@@ -36,6 +37,9 @@ function mockFetch(handler: (url: string, init?: RequestInit) => { status: numbe
 let lastSessionPostBody: unknown = null;
 
 beforeEach(() => {
+  // issue #101 P2：store 文案走 i18n 单例（i18n.global.t），每例固定 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
   setActivePinia(createPinia());
   FakeEventSource.instances = [];
   lastSessionPostBody = null;
@@ -441,5 +445,80 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(store2.sessionId).toBe('ghost'); // 其他错误：保留（可刷新重试）
     expect(store2.entries.some((e) => e.kind === 'syserr' && e.text === '会话加载失败，可刷新重试')).toBe(true);
     expect(clearRoute).toHaveBeenCalledTimes(1); // 不再清路由
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #101 P2：store 用户可见文案走 i18n（i18n.global.t；zh-CN 基线逐字不变，切 en 即时生效）
+// ---------------------------------------------------------------------------
+describe('workbench store · i18n（issue #101 P2）', () => {
+  it('zh-CN 基线：占位符三态 / 目录名校验错误 / synthetic 前缀 / 停止分隔行', async () => {
+    mockFetch(dirsAwareHandler({}));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    expect(store.inputPlaceholder).toBe('输入任务，Enter 发送（Shift+Enter 换行）');
+
+    store.noDir = true;
+    expect(store.inputPlaceholder).toBe('先创建目录');
+    store.isPlatformAdmin = true;
+    expect(store.inputPlaceholder).toBe('平台管理员：请到管理台创建 FDE 用户与分配资源');
+
+    const bad = await store.createDir('Bad_Name');
+    expect(bad.error).toBe('目录名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）');
+
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'assistant', content: '内容', synthetic: true });
+    const syn = store.entries.find((e) => e.kind === 'msg' && e.synthetic);
+    expect(syn && 'text' in syn ? syn.text : '').toBe('〔系统注入〕内容');
+  });
+
+  it('切 English：占位符 / 校验错误 / synthetic 前缀即时变英文（computed 响应式）', async () => {
+    mockFetch(dirsAwareHandler({}));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    setLocale('en');
+    expect(store.inputPlaceholder).toBe('Type a task, Enter to send (Shift+Enter for a newline)');
+
+    store.noDir = true;
+    expect(store.inputPlaceholder).toBe('Create a directory first');
+    store.isPlatformAdmin = true;
+    expect(store.inputPlaceholder)
+      .toBe('Platform admin: create FDE users and assign resources in the admin console');
+
+    const bad = await store.createDir('Bad_Name');
+    expect(bad.error).toContain('Directory name must be lowercase letters / digits / hyphens');
+
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'assistant', content: 'body', synthetic: true });
+    const syn = store.entries.find((e) => e.kind === 'msg' && e.synthetic);
+    expect(syn && 'text' in syn ? syn.text : '').toBe('[system] body');
+  });
+
+  it('切 English：发送失败 / llm_not_configured / 会话加载失败 / 停止失败文案变英文', async () => {
+    mockFetch((url, init) => {
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        return { status: 409, body: { error: { code: 'llm_not_configured', message: 'llm not configured' } } };
+      }
+      if (url.includes('/api/sessions/ghost')) {
+        return { status: 500, body: { error: { code: 'internal', message: 'boom' } } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.inputValue = 'x';
+    setLocale('en');
+
+    await store.send();
+    const err = store.entries.find((e) => e.kind === 'syserr');
+    expect(err && 'text' in err ? err.text : '').toContain('Send failed: this FDE has no LLM upstream configured');
+
+    // 会话加载失败（非 404）保留路由 + syserr
+    const store2 = useWorkbenchStore();
+    await store2.openSession('ghost');
+    const loadErr = store2.entries.find((e) => e.kind === 'syserr');
+    expect(loadErr && 'text' in loadErr ? loadErr.text : '')
+      .toBe('Failed to load the session; refresh to retry');
   });
 });

@@ -3,6 +3,7 @@
 // 语义锚点：portal/static/index.html 内联 JS 的 connectEvents/handleEvent/resyncEvents（§5.1/§5.2）。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useEventStream, type EventStreamHooks } from './useEventStream';
+import { setLocale } from '../i18n';
 
 /** EventSource 桩：记录 URL/close，手动投递具名事件帧（等价旧 static-client.test.js 的 FakeEventSource）。 */
 class FakeEventSource {
@@ -40,6 +41,9 @@ function makeHooks() {
 }
 
 beforeEach(() => {
+  // issue #101 P2：事件状态行文案走 i18n 单例（非组件上下文 i18n.global.t），每例固定 zh-CN。
+  localStorage.clear();
+  setLocale('zh-CN');
   FakeEventSource.instances = [];
   vi.stubGlobal('EventSource', FakeEventSource);
 });
@@ -371,5 +375,64 @@ describe('useEventStream（mock EventSource）', () => {
     expect(s.deltaText.value).toBeNull();
     expect(s.toolCards.size).toBe(0);
     expect(s.esSessionId.value).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #101 P2：事件状态行/错误行文案走 i18n（zh-CN 基线逐字不变，切 en 即时生效）
+// ---------------------------------------------------------------------------
+describe('useEventStream · i18n（issue #101 P2）', () => {
+  it('zh-CN 基线：状态行/工具卡片结果行/重同步文案逐字不变', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('recovering', { attempt: 2, maxAttempts: 3 });
+    lastES().emit('compaction', { round: 1, compaction: { foldedRounds: 2, tokensBefore: 9, tokensAfter: 4 } });
+    lastES().emit('judge', { decision: { extend: true, plan: 'P', extendReason: 'R' } });
+    lastES().emit('tool_use', { tool_call_id: 'c1', name: 'bash', input: { cmd: 'ls' } });
+    lastES().emit('tool_result', { tool_call_id: 'c1', ok: true, result_digest: 'ok', duration_ms: 5 });
+    lastES().emit('resync', { reason: 'buffer_overflow' });
+    expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
+      '重试中（2/3）',
+      '上下文折叠（round 1）：2 轮折叠，9 → 4 tokens',
+      'judge：扩轮 — P（R）',
+      '事件流需重同步（服务端缓冲溢出），正在重连补发…',
+    ]);
+    expect(s.toolCards.get('c1')!.out).toBe('✓ ok（5ms）');
+  });
+
+  it('切 English：状态行 / judge 后缀 / 工具卡片结果行 / 重同步文案即时变英文', () => {
+    setLocale('en');
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('recovering', { attempt: 2, maxAttempts: 3 });
+    lastES().emit('recovered', {});
+    lastES().emit('judge', { decision: { extend: true, plan: 'P', extendReason: 'R' } });
+    lastES().emit('judge', { decision: { extend: false, extendReason: 'enough' } });
+    lastES().emit('judge', { passThrough: 'on_track' });
+    lastES().emit('compaction', { round: 1, compaction: { foldedRounds: 2, tokensBefore: 9, tokensAfter: 4 } });
+    lastES().emit('forced_final', { round: 5, reason: 'cap' });
+    lastES().emit('tool_use', { tool_call_id: 'c1', name: 'bash', input: { cmd: 'ls' } });
+    lastES().emit('tool_result', { tool_call_id: 'c1', ok: true, result_digest: 'ok', duration_ms: 5 });
+    expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
+      'Retrying (2/3)',
+      'Retry succeeded',
+      'judge: extend rounds — P (R)',
+      'judge: no extension — enough',
+      'judge: pass through (on_track)',
+      'Context compaction (round 1): 2 rounds folded, 9 → 4 tokens',
+      'forced final (round 5): cap',
+    ]);
+    expect(s.toolCards.get('c1')!.out).toBe('✓ ok (5ms)');
+
+    // 事件流重同步 + run 终态/失败分级
+    s.activeRunId.value = 'run-1';
+    lastES().emit('resync', { reason: 'buffer_overflow' });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('Event stream needs resync (server buffer overflow); reconnecting to catch up…');
+    lastES().emit('run_end', { seq: 9, run_id: 'run-1', termination: { reason: 'end_turn' }, usage: { input_tokens: 3, output_tokens: 5 } });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run ended: completed normally · tokens 3+5');
+    lastES().emit('run_end', { seq: 10, run_id: null, termination: { reason: 'failed' }, error: { code: 'llm_error', message: 'boom' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run failed: llm_error — boom');
   });
 });
