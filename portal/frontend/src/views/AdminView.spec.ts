@@ -8,6 +8,8 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import AdminView from './AdminView.vue';
 import { createAppRouter } from '../router';
+import { useAuthStore } from '../stores/auth';
+import { i18n, setLocale } from '../i18n';
 
 // qrcode 换 npm 包（P3 要求）：单测固定 data URL，避免真实绘制。
 vi.mock('qrcode', () => ({
@@ -67,12 +69,17 @@ async function mountAdmin(extra?: (url: string, init?: RequestInit) => Response 
   await router.isReady();
   const fetchFn = fetchMock((url, init) => extra?.(url, init) ?? defaultHandler(url));
   vi.stubGlobal('fetch', fetchFn);
-  const wrapper = mount(AdminView, { global: { plugins: [pinia, router] } });
+  const wrapper = mount(AdminView, { global: { plugins: [pinia, router, i18n] } });
   await flushPromises();
   return { wrapper, fetchFn, router };
 }
 
-beforeEach(() => vi.unstubAllGlobals());
+beforeEach(() => {
+  // issue #101 P3：装配真实 i18n 单例（不 mock t()），每例重置为 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
+  vi.unstubAllGlobals();
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe('AdminView · LLM 供应商区', () => {
@@ -231,5 +238,116 @@ describe('AdminView · FDE 管理区', () => {
     expect(JSON.parse(String(postCall![1]?.body))).toEqual({
       login: 'dave', display_name: '', password: 'pass123',
     });
+  });
+});
+
+// issue #101 P3：切 English 的双向断言（zh 基线断言在上面各用例中逐字未改）。
+describe('AdminView · 语言切换（issue #101 P3）', () => {
+  it('切 English：顶栏与供应商区文案（含空态/表头/按钮）即时变英文', async () => {
+    const { wrapper } = await mountAdmin();
+    setLocale('en');
+    await flushPromises();
+
+    expect(wrapper.get('h1').text()).toBe('FDE Station Admin Console');
+    // 顶栏身份文案：复用 workbench.who（admin 带 fde_name 时含 fde 段）
+    const auth = useAuthStore();
+    auth.user = { id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'alice', auth_source: 'local' };
+    await flushPromises();
+    const header = wrapper.get('header').text();
+    expect(header).toContain('root (admin / alice)');
+    expect(header).toContain('← Back to workbench');
+    expect(header).toContain('Sign out');
+    expect(wrapper.text()).toContain('LLM providers');
+
+    const list = wrapper.find('[data-test="provider-list"]');
+    expect(list.text()).toContain('Enabled');
+    expect(list.text()).toContain('Disabled'); // p2.enabled=false 的徽章
+    expect(list.text()).toContain('Models (2)'); // 模型明细按钮带数量
+    expect(list.text()).toContain('Delete');
+
+    // p2 无模型：展开后空态英文
+    const p2Card = wrapper.findAll('[data-test="provider-card"]')[1];
+    await p2Card.findAll('button')[0].trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="provider-list"]').text()).toContain('No models under this provider yet');
+
+    // 表头 + 新增模型/供应商表单标签英文
+    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[0].trigger('click');
+    await flushPromises();
+    const detail = wrapper.findAll('[data-test="provider-card"]')[0];
+    const thead = detail.find('thead').text();
+    expect(thead).toContain('Name');
+    expect(thead).toContain('Type');
+    expect(thead).toContain('Context window');
+    expect(thead).toContain('Status');
+    expect(detail.find('[data-test="add-model-form"]').text()).toContain('＋ Add model');
+    expect(wrapper.find('[data-test="add-provider-form"]').text()).toContain('＋ Add provider');
+  });
+
+  it('切 English：删除 confirm 文案与 FDE 区文案变英文', async () => {
+    const confirmFn = vi.fn(() => false); // 取消删除：只看 confirm 文案
+    vi.stubGlobal('confirm', confirmFn);
+    const { wrapper } = await mountAdmin();
+    setLocale('en');
+    await flushPromises();
+
+    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[2].trigger('click'); // 删除
+    expect(confirmFn).toHaveBeenCalledWith('Delete provider openai? Its models will be deleted as well.');
+
+    expect(wrapper.text()).toContain('FDE management');
+    const list = wrapper.find('[data-test="user-list"]');
+    expect(list.text()).toContain('no fde_name'); // bob
+    expect(list.text()).toContain('Expand');
+
+    // 展开 bob（无 fde_name）→ 英文提示
+    const bobCard = wrapper.findAll('[data-test="user-card"]')[1];
+    await bobCard.find('button').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="user-list"]').text())
+      .toContain('This user has no fde_name configured; no LLM config needed.');
+
+    const form = wrapper.find('[data-test="add-user-form"]');
+    expect(form.text()).toContain('Login name');
+    expect(form.text()).toContain('Display name');
+    expect(form.text()).toContain('Password');
+    expect(form.text()).toContain('fde_name (optional)');
+    expect(form.text()).toContain('＋ Create user');
+  });
+
+  it('切 English：模型删除 confirm 与一次性 TOTP 盒文案英文（登录名仍加粗）', async () => {
+    const confirmFn = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirmFn);
+    const created = {
+      user: { id: 'u3', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: 'carol', status: 'active' },
+      totp_uri: 'otpauth://totp/erix-station:carol?secret=JBSWY3DPEHPK3PXP&issuer=erix-station',
+      totp_secret: 'JBSWY3DPEHPK3PXP',
+    };
+    const { wrapper } = await mountAdmin((url, init) => {
+      if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
+      return undefined;
+    });
+    setLocale('en');
+    await flushPromises();
+
+    // 展开 openai 模型明细 → 模型删除 confirm 文案英文
+    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[0].trigger('click');
+    await flushPromises();
+    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('tbody button')[1].trigger('click');
+    expect(confirmFn).toHaveBeenCalledWith('Delete model gpt-4o?');
+
+    // 新增用户 → 一次性 TOTP 盒英文（{login}/{onlyOnce} 仍为 <b>）
+    const form = wrapper.find('[data-test="add-user-form"]');
+    await form.findAll('input')[0].setValue('carol');
+    await form.findAll('input')[2].setValue('pass123');
+    await form.trigger('submit.prevent');
+    await flushPromises();
+    const box = wrapper.find('[data-test="totp-box"]');
+    expect(box.text()).toContain('User carol created.');
+    expect(box.text()).toContain('shown only once');
+    expect(box.text()).toContain('otpauth URI: ');
+    expect(box.text()).toContain('TOTP seed: ');
+    expect(box.text()).toContain(created.totp_uri);
+    expect(box.findAll('b').map((b) => b.text())).toEqual(['carol', 'shown only once']);
+    expect(box.find('img').attributes('alt')).toBe('TOTP authenticator QR code');
   });
 });

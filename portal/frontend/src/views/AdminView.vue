@@ -4,11 +4,15 @@
 // pane + 新增用户一次性 TOTP 盒）。状态/动作在 stores/admin.ts；per-user 配置 pane 在
 // components/UserLlmPane.vue。后端零改动：全部走既有 /api/admin/* 端点。
 import { computed, onMounted, reactive } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { MODEL_TYPES, useAdminStore, type LlmModel, type LlmProvider } from '../stores/admin';
 import UserLlmPane from '../components/UserLlmPane.vue';
 
+// issue #101 P3：管理台文案走 i18n（admin.* / common.*）。
+// 顶栏身份文案与工作台顶栏逐字相同 → 直接复用 workbench.who/whoNoFde（同值不重复定义）。
+const { t } = useI18n();
 const router = useRouter();
 const auth = useAuthStore();
 const admin = useAdminStore();
@@ -16,7 +20,9 @@ const admin = useAdminStore();
 const who = computed(() => {
   const u = auth.user;
   if (!u) return '';
-  return `${u.login}（${u.role}${u.fde_name ? ' / ' + u.fde_name : ''}）`;
+  return u.fde_name
+    ? t('workbench.who', { login: u.login, role: u.role, fde: u.fde_name })
+    : t('workbench.whoNoFde', { login: u.login, role: u.role });
 });
 
 // ---- 顶部新增供应商表单（旧 #addProviderForm）----
@@ -56,13 +62,13 @@ async function onAddModel(providerId: string) {
   }
 }
 
-// ---- 供应商/模型删除（旧 confirm 文案逐字保留）----
+// ---- 供应商/模型删除（旧 confirm 文案语义保留，issue #101 P3 走 i18n）----
 function onDeleteProvider(p: LlmProvider) {
-  if (!confirm(`确认删除供应商 ${p.name}？其下模型将一并删除。`)) return;
+  if (!confirm(t('admin.llm.confirmDeleteProvider', { name: p.name }))) return;
   admin.removeProvider(p);
 }
 function onDeleteModel(m: LlmModel) {
-  if (!confirm(`确认删除模型 ${m.model_id}？`)) return;
+  if (!confirm(t('admin.llm.confirmDeleteModel', { model: m.model_id }))) return;
   admin.removeModel(m);
 }
 
@@ -98,25 +104,25 @@ onMounted(() => {
 <template>
   <div class="min-h-screen flex flex-col bg-white">
     <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
-      <h1 class="text-xl font-medium mb-0">FDE Station 管理台</h1>
+      <h1 class="text-xl font-medium mb-0">{{ t('admin.title') }}</h1>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
-      <router-link to="/" class="text-sm underline">← 返回工作台</router-link>
+      <router-link to="/" class="text-sm underline">{{ t('admin.backToWorkbench') }}</router-link>
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
         @click="onLogout"
-      >登出</button>
+      >{{ t('common.logout') }}</button>
     </header>
 
     <main class="flex-1 p-3 flex flex-col gap-4">
       <!-- ==================== LLM 供应商（旧 #llmSection）==================== -->
       <section class="rounded-lg border border-black/10 bg-white">
         <div class="p-3">
-          <h2 class="text-base font-semibold">LLM 供应商</h2>
+          <h2 class="text-base font-semibold">{{ t('admin.llm.sectionTitle') }}</h2>
           <p v-if="admin.llmErr" class="syserr my-1" role="alert">{{ admin.llmErr }}</p>
 
           <div data-test="provider-list">
-            <p v-if="!admin.providersLoaded" class="muted">加载中…</p>
-            <p v-else-if="admin.providers.length === 0" class="muted">暂无供应商，先在下方新增。</p>
+            <p v-if="!admin.providersLoaded" class="muted">{{ t('common.loading') }}</p>
+            <p v-else-if="admin.providers.length === 0" class="muted">{{ t('admin.llm.emptyProviders') }}</p>
 
             <!-- 供应商卡片（旧 .card .head + .detail） -->
             <div
@@ -131,23 +137,23 @@ onMounted(() => {
                 <span
                   class="rounded border px-1.5 py-0.5 text-xs font-medium"
                   :class="p.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
-                >{{ p.enabled ? '启用' : '停用' }}</span>
+                >{{ p.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
                 <span class="flex-1"></span>
                 <button
                   type="button"
                   class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
                   @click="admin.toggleExpandedProvider(String(p.id))"
-                >{{ admin.expandedProviders.includes(String(p.id)) ? '收起模型' : `模型明细（${p.models.length}）` }}</button>
+                >{{ admin.expandedProviders.includes(String(p.id)) ? t('admin.llm.collapseModels') : t('admin.llm.modelsCount', { count: p.models.length }) }}</button>
                 <button
                   type="button"
                   class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
                   @click="admin.toggleProvider(p)"
-                >{{ p.enabled ? '停用' : '启用' }}</button>
+                >{{ p.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
                 <button
                   type="button"
                   class="rounded-md border border-red-600/60 px-2 py-0.5 text-xs text-red-700 hover:bg-red-50"
                   @click="onDeleteProvider(p)"
-                >删除</button>
+                >{{ t('admin.delete') }}</button>
               </div>
 
               <!-- 模型明细 + 新增模型表单（旧 .detail） -->
@@ -156,17 +162,17 @@ onMounted(() => {
                   <thead>
                     <tr class="text-left text-black/60">
                       <th class="py-1 pr-3 font-medium">model_id</th>
-                      <th class="py-1 pr-3 font-medium">名称</th>
-                      <th class="py-1 pr-3 font-medium">类型</th>
+                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colName') }}</th>
+                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
                       <th class="py-1 pr-3 font-medium">tool_calling</th>
-                      <th class="py-1 pr-3 font-medium">上下文窗口</th>
-                      <th class="py-1 pr-3 font-medium">状态</th>
+                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
+                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
                       <th class="py-1 font-medium"></th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr v-if="p.models.length === 0">
-                      <td colspan="7" class="muted py-1">该供应商下暂无模型</td>
+                      <td colspan="7" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
                     </tr>
                     <tr v-for="m in p.models" :key="m.id" class="border-t border-black/5">
                       <td class="py-1 pr-3">{{ m.model_id }}</td>
@@ -180,19 +186,19 @@ onMounted(() => {
                         <span
                           class="rounded border px-1.5 py-0.5 text-xs font-medium"
                           :class="m.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
-                        >{{ m.enabled ? '启用' : '停用' }}</span>
+                        >{{ m.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
                       </td>
                       <td class="py-1">
                         <button
                           type="button"
                           class="mr-1 rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
                           @click="admin.toggleModel(m)"
-                        >{{ m.enabled ? '停用' : '启用' }}</button>
+                        >{{ m.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
                         <button
                           type="button"
                           class="rounded-md border border-red-600/60 px-2 py-0.5 text-xs text-red-700 hover:bg-red-50"
                           @click="onDeleteModel(m)"
-                        >删除</button>
+                        >{{ t('admin.delete') }}</button>
                       </td>
                     </tr>
                   </tbody>
@@ -208,14 +214,14 @@ onMounted(() => {
                     >
                   </label>
                   <label class="flex flex-col gap-1 text-xs text-black/55">
-                    名称
+                    {{ t('admin.llm.colName') }}
                     <input
                       v-model="modelForm(String(p.id)).name" required placeholder="GPT-4o"
                       class="rounded-md border border-black/20 px-2 py-1 text-sm"
                     >
                   </label>
                   <label class="flex flex-col gap-1 text-xs text-black/55">
-                    类型
+                    {{ t('admin.llm.colType') }}
                     <select
                       v-model="modelForm(String(p.id)).type"
                       class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
@@ -224,7 +230,7 @@ onMounted(() => {
                     </select>
                   </label>
                   <label class="flex flex-col gap-1 text-xs text-black/55">
-                    上下文窗口
+                    {{ t('admin.llm.colContextWindow') }}
                     <input
                       v-model="modelForm(String(p.id)).context_window" type="number" min="1" placeholder="128000"
                       class="rounded-md border border-black/20 px-2 py-1 text-sm"
@@ -233,7 +239,7 @@ onMounted(() => {
                   <label class="flex items-center gap-1 pb-1.5 text-xs text-black/55">
                     <input v-model="modelForm(String(p.id)).tool_calling" type="checkbox" class="accent-brand"> tool_calling
                   </label>
-                  <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">＋ 新增模型</button>
+                  <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addModel') }}</button>
                 </form>
               </div>
             </div>
@@ -242,7 +248,7 @@ onMounted(() => {
           <!-- 顶部新增供应商表单（旧 #addProviderForm） -->
           <form data-test="add-provider-form" class="mt-3 flex flex-wrap items-end gap-2" @submit.prevent="onAddProvider">
             <label class="flex flex-col gap-1 text-xs text-black/55">
-              供应商名
+              {{ t('admin.llm.providerName') }}
               <input
                 v-model="providerForm.name" required placeholder="openai"
                 class="rounded-md border border-black/20 px-2 py-1 text-sm"
@@ -255,7 +261,7 @@ onMounted(() => {
                 class="rounded-md border border-black/20 px-2 py-1 text-sm"
               >
             </label>
-            <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">＋ 新增供应商</button>
+            <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addProvider') }}</button>
           </form>
         </div>
       </section>
@@ -263,7 +269,7 @@ onMounted(() => {
       <!-- ==================== FDE 管理（旧 #fdeSection）==================== -->
       <section class="rounded-lg border border-black/10 bg-white">
         <div class="p-3">
-          <h2 class="text-base font-semibold">FDE 管理</h2>
+          <h2 class="text-base font-semibold">{{ t('admin.fde.sectionTitle') }}</h2>
           <p v-if="admin.fdeErr" class="syserr my-1" role="alert">{{ admin.fdeErr }}</p>
 
           <!-- 一次性 TOTP 展示盒（旧 #totpOnce / .totpbox，仅此一次显示） -->
@@ -272,16 +278,19 @@ onMounted(() => {
             data-test="totp-box"
             class="my-2 rounded-lg border border-brand bg-green-50 p-3 text-[0.85rem]"
           >
-            <img :src="admin.totpOnce.qr" alt="TOTP 认证器二维码" class="my-2 block h-48 w-48" style="image-rendering: pixelated">
-            <div>用户 <b>{{ admin.totpOnce.login }}</b> 已创建。请用认证器 App 录入以下 otpauth URI 或种子（<b>仅此一次显示</b>）：</div>
-            <div>otpauth URI：<code class="break-all select-all">{{ admin.totpOnce.uri }}</code></div>
-            <div>TOTP 种子：<code class="break-all select-all">{{ admin.totpOnce.secret }}</code></div>
-            <div>下一步：展开该用户卡片 → 配置 LLM 上游 → 点击 provision 容器；将登录名/口令与本二维码交给用户扫码录入认证器。</div>
+            <img :src="admin.totpOnce.qr" :alt="t('admin.fde.qrAlt')" class="my-2 block h-48 w-48" style="image-rendering: pixelated">
+            <i18n-t keypath="admin.fde.totpCreated" tag="div" scope="global">
+              <template #login><b>{{ admin.totpOnce.login }}</b></template>
+              <template #onlyOnce><b>{{ t('admin.fde.totpOnlyOnce') }}</b></template>
+            </i18n-t>
+            <div>{{ t('admin.fde.otpauthUri') }}<code class="break-all select-all">{{ admin.totpOnce.uri }}</code></div>
+            <div>{{ t('admin.fde.totpSecret') }}<code class="break-all select-all">{{ admin.totpOnce.secret }}</code></div>
+            <div>{{ t('admin.fde.nextStep') }}</div>
           </div>
 
           <div data-test="user-list">
-            <p v-if="!admin.usersLoaded" class="muted">加载中…</p>
-            <p v-else-if="admin.users.length === 0" class="muted">暂无用户。</p>
+            <p v-if="!admin.usersLoaded" class="muted">{{ t('common.loading') }}</p>
+            <p v-else-if="admin.users.length === 0" class="muted">{{ t('admin.fde.emptyUsers') }}</p>
 
             <!-- 用户卡片（旧 .head.row-head：点卡片头展开，按钮除外） -->
             <div
@@ -298,7 +307,7 @@ onMounted(() => {
                 <span class="text-black/50 text-xs">{{ u.display_name }}</span>
                 <span class="rounded border border-sky-600 bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700">{{ u.role }}</span>
                 <span v-if="u.fde_name" class="rounded border border-green-600 bg-green-50 px-1.5 py-0.5 text-xs font-medium text-green-700">{{ u.fde_name }}</span>
-                <span v-else class="muted">无 fde_name</span>
+                <span v-else class="muted">{{ t('admin.fde.noFdeName') }}</span>
                 <span
                   class="rounded border px-1.5 py-0.5 text-xs font-medium"
                   :class="u.status === 'active' ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
@@ -308,37 +317,37 @@ onMounted(() => {
                   type="button"
                   class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
                   @click.stop="admin.toggleExpandedUser(String(u.id))"
-                >{{ admin.expandedUsers.includes(String(u.id)) ? '收起' : '展开' }}</button>
+                >{{ admin.expandedUsers.includes(String(u.id)) ? t('admin.collapse') : t('admin.expand') }}</button>
               </div>
 
-              <!-- per-user LLM 配置 pane（旧 [data-pane="llm"]；无 fde_name 的提示文案逐字保留） -->
+              <!-- per-user LLM 配置 pane（旧 [data-pane="llm"]；无 fde_name 的提示文案走 admin.fde.noFdeNameHint） -->
               <div v-if="admin.expandedUsers.includes(String(u.id))" class="border-t border-dashed border-black/15 px-3 py-2">
-                <p v-if="!u.fde_name" class="muted">该用户未配置 fde_name，无需 LLM 配置。</p>
+                <p v-if="!u.fde_name" class="muted">{{ t('admin.fde.noFdeNameHint') }}</p>
                 <UserLlmPane v-else :user="u" :providers="admin.providers" />
               </div>
             </div>
           </div>
 
           <!-- 新增 FDE 用户表单（旧 #addUserForm） -->
-          <h2 class="mt-4 text-base font-semibold">新增 FDE 用户</h2>
+          <h2 class="mt-4 text-base font-semibold">{{ t('admin.fde.addUserTitle') }}</h2>
           <form data-test="add-user-form" class="mt-2 flex flex-wrap items-end gap-2" @submit.prevent="onAddUser">
             <label class="flex flex-col gap-1 text-xs text-black/55">
-              登录名
+              {{ t('admin.fde.loginLabel') }}
               <input v-model="userForm.login" required autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
             </label>
             <label class="flex flex-col gap-1 text-xs text-black/55">
-              显示名
+              {{ t('admin.fde.displayNameLabel') }}
               <input v-model="userForm.display_name" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
             </label>
             <label class="flex flex-col gap-1 text-xs text-black/55">
-              口令
+              {{ t('admin.fde.passwordLabel') }}
               <input v-model="userForm.password" type="password" required autocomplete="new-password" class="rounded-md border border-black/20 px-2 py-1 text-sm">
             </label>
             <label class="flex flex-col gap-1 text-xs text-black/55">
-              fde_name（可空）
+              {{ t('admin.fde.fdeNameLabel') }}
               <input v-model="userForm.fde_name" placeholder="alice" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
             </label>
-            <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">＋ 创建用户</button>
+            <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.fde.addUser') }}</button>
           </form>
         </div>
       </section>

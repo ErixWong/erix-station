@@ -5,6 +5,12 @@
 import { defineStore } from 'pinia';
 import QRCode from 'qrcode';
 import { api } from '../api';
+import { i18n } from '../i18n';
+
+// issue #101 P3：前端自产文案（「错误：」前缀）走 i18n 单例——options store 非组件上下文，
+// useI18n() 会抛 MUST_BE_CALL_SETUP_TOP，故统一走 i18n.global.t。
+// 注意：服务端透传的 error.message（errText）不译，仅拼接前缀。
+const t = i18n.global.t;
 
 export interface LlmModel {
   id: string;
@@ -97,7 +103,7 @@ export const useAdminStore = defineStore('admin', {
         this.providers = data.items ?? [];
         this.providersLoaded = true;
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
@@ -109,7 +115,7 @@ export const useAdminStore = defineStore('admin', {
         this.users = data.items ?? [];
         this.usersLoaded = true;
       } catch (e) {
-        this.fdeErr = '错误：' + this.errText(e);
+        this.fdeErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
@@ -124,7 +130,7 @@ export const useAdminStore = defineStore('admin', {
         await this.loadProviders();
         return null;
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
         return this.llmErr;
       }
     },
@@ -139,7 +145,7 @@ export const useAdminStore = defineStore('admin', {
         });
         await this.loadProviders();
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
@@ -152,7 +158,7 @@ export const useAdminStore = defineStore('admin', {
         if (i >= 0) this.expandedProviders.splice(i, 1);
         await this.loadProviders();
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
@@ -166,7 +172,7 @@ export const useAdminStore = defineStore('admin', {
         });
         await this.loadProviders();
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
@@ -177,7 +183,7 @@ export const useAdminStore = defineStore('admin', {
         await api(`/api/admin/llm/models/${encodeURIComponent(m.id)}`, { method: 'DELETE' });
         await this.loadProviders();
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
@@ -197,7 +203,7 @@ export const useAdminStore = defineStore('admin', {
         await this.loadProviders();
         return null;
       } catch (e) {
-        this.llmErr = '错误：' + this.errText(e);
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
         return this.llmErr;
       }
     },
@@ -219,7 +225,7 @@ export const useAdminStore = defineStore('admin', {
         await this.loadUsers();
         return null;
       } catch (e) {
-        this.fdeErr = '错误：' + this.errText(e);
+        this.fdeErr = t('admin.errorPrefix') + this.errText(e);
         return this.fdeErr;
       }
     },
