@@ -1,6 +1,6 @@
-// 单测：issue #94 会话列表分页/过滤 API——listSessions 的复合 keyset 游标 / q 过滤 / total 计数。
-// 覆盖：同 updated_at 多条不跳过、复合游标 round-trip、q（ILIKE contains + 长度上限）、
-//       total 与条件一致、旧格式/非法游标一律 validation_failed。
+// 单测：issue #94 会话列表分页 API——listSessions 的复合 keyset 游标（真缺陷修复，评审裁决保留）。
+// 覆盖：同 updated_at 多条不跳过、复合游标 round-trip、末页终止、旧格式/非法游标一律 validation_failed。
+// 评审裁决瘦身：q/total 已拆除（对应用例已删）。
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool 按 SQL 标记 emulate 过滤/排序/LIMIT 语义，不碰真实 DB。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   listSessions, encodeSessionCursor, decodeSessionCursor,
-  SessionError, MAX_SESSION_QUERY_LENGTH,
+  SessionError,
 } from '../src/sessions.js';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
@@ -36,7 +36,7 @@ function row(id, { title = `会话 ${id}`, cwd = '~/projects/a', updated_at = T0
 
 /**
  * 内存 fake pool：解析 listSessions 拼出的 SQL 标记，emulate 语义：
- *   WHERE 过滤（user_id/status/cwd/title ILIKE/复合游标行值比较）+ ORDER BY updated_at DESC, id DESC + LIMIT。
+ *   WHERE 过滤（user_id/status/cwd/复合游标行值比较）+ ORDER BY updated_at DESC, id DESC + LIMIT。
  * 正则按「参数占位符 $N」取参——与参数拼接顺序解耦，只依赖 SQL 结构（换拼接顺序不脆断）。
  * 继承 FakePool：登录会话/用户查询走父类真语义（HTTP 层测试可鉴权）。
  */
@@ -55,11 +55,6 @@ class ListPool extends FakePool {
     let out = this.rows.filter((r) => r.user_id === params[0] && r.status === 'active');
     const cwdIdx = pick(/AND cwd = \$(\d+)/);
     if (cwdIdx) out = out.filter((r) => r.cwd === params[cwdIdx - 1]);
-    const qIdx = pick(/AND title ILIKE \$(\d+)/);
-    if (qIdx) {
-      const needle = String(params[qIdx - 1]).replaceAll('%', '').toLowerCase();
-      out = out.filter((r) => String(r.title ?? '').toLowerCase().includes(needle));
-    }
     const cur = /\(\$(\d+), \$(\d+)\)/.exec(sql); // 复合游标行值比较（唯一成对占位处）
     if (cur) {
       const [u, i] = [params[Number(cur[1]) - 1], params[Number(cur[2]) - 1]];
@@ -74,9 +69,6 @@ class ListPool extends FakePool {
 
   async query(sql, params = []) {
     this.queries.push({ sql, params });
-    if (/SELECT COUNT\(\*\)/.test(sql)) {
-      return { rows: [{ total: this.#filter(sql, params).length }] };
-    }
     if (sql.includes('FROM chat_sessions s')) {
       const limitIdx = /LIMIT \$(\d+)/.exec(sql);
       const limit = limitIdx ? Number(params[limitIdx[1] - 1]) : 100;
@@ -163,18 +155,15 @@ test('listSessions：复合游标 round-trip——跨不同 updated_at + 同 upd
     '22222222-2222-4222-8222-222222222222', '44444444-4444-4444-8444-444444444444'];
   const collected = [];
   let cursor = null;
-  let page1 = null;
-  let lastPage = null;
+  let pages = 0;
   do {
-    const res = await listSessions(pool, { userId: UID, limit: 2, cursor: cursor ?? undefined, total: true });
-    page1 ??= res;
-    lastPage = res;
+    const res = await listSessions(pool, { userId: UID, limit: 2, cursor: cursor ?? undefined });
     collected.push(...res.items.map((i) => i.id));
     cursor = res.next_cursor;
+    pages++;
+    assert.ok(pages <= 3, '翻页应终止（cursor 推进）');
   } while (cursor);
   assert.deepEqual(collected, expected, '(updated_at DESC, id DESC) 全序翻页');
-  assert.equal(page1.total, expected.length, 'total 与过滤条件一致');
-  assert.equal(lastPage.total, expected.length, '翻页后 total 不变');
 });
 
 test('listSessions：末页无更多 → next_cursor 为 null', async () => {
@@ -184,52 +173,8 @@ test('listSessions：末页无更多 → next_cursor 为 null', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// q 过滤 / total 计数
+// HTTP 层：GET /api/sessions 响应组装（真实 server + 内存 pool；评审裁决：q/total 透传已删）
 // ---------------------------------------------------------------------------
-
-test('listSessions：q = 标题 contains（ILIKE，大小写不敏感）', async () => {
-  const pool = new ListPool([
-    row('11111111-1111-4111-8111-111111111111', { title: 'Meeting ASR 方案' }),
-    row('22222222-2222-4222-8222-222222222222', { title: '数据库迁移' }),
-    row('33333333-3333-4333-8333-333333333333', { title: 'meeting notes' }),
-  ]);
-  const res = await listSessions(pool, { userId: UID, q: 'meeting', total: true });
-  assert.match(pool.queries.find((q) => q.sql.includes('FROM chat_sessions s')).sql, /title ILIKE/);
-  assert.deepEqual(res.items.map((i) => i.title).sort(), ['Meeting ASR 方案', 'meeting notes']);
-  assert.equal(res.total, 2, 'total 与 q 条件一致');
-});
-
-test('listSessions：q 与 cwd 叠加过滤，total 与叠加条件一致', async () => {
-  const pool = new ListPool([
-    row('11111111-1111-4111-8111-111111111111', { title: '部署脚本', cwd: '~/projects/a' }),
-    row('22222222-2222-4222-8222-222222222222', { title: '部署计划', cwd: '~/projects/b' }),
-    row('33333333-3333-4333-8333-333333333333', { title: '别的', cwd: '~/projects/a' }),
-    row('44444444-4444-4444-8444-444444444444', { title: '部署文档', cwd: '~/projects/a', status: 'archived' }),
-  ]);
-  const res = await listSessions(pool, { userId: UID, cwd: '~/projects/a', q: '部署', total: true });
-  assert.deepEqual(res.items.map((i) => i.id), ['11111111-1111-4111-8111-111111111111']);
-  assert.equal(res.total, 1, 'total 只计 user_id+cwd+q+active 命中');
-});
-
-test('listSessions：q 超长 → 400 validation_failed（field=q）；不传 total → 无 COUNT 查询', async () => {
-  const pool = new ListPool([row('11111111-1111-4111-8111-111111111111')]);
-  await assert.rejects(
-    () => listSessions(pool, { userId: UID, q: 'x'.repeat(MAX_SESSION_QUERY_LENGTH + 1) }),
-    (e) => e instanceof SessionError && e.code === 'validation_failed' && e.details?.field === 'q',
-  );
-  const res = await listSessions(pool, { userId: UID });
-  assert.equal(res.total, undefined, '未请求 total 不返回该字段');
-  assert.equal(pool.queries.some((q) => /SELECT COUNT\(\*\)/.test(q.sql)), false, '未请求 total 不发 COUNT');
-});
-
-test('listSessions：total 含游标时不被游标边界收窄（计数=全条件命中数）', async () => {
-  const rows = Array.from({ length: 5 }, (_, i) => row(`${String(i + 1).repeat(8)}-${String(i + 1).repeat(4)}-4${String(i + 1).repeat(3)}-8${String(i + 1).repeat(3)}-${String(i + 1).repeat(12)}`));
-  const pool = new ListPool(rows);
-  const page1 = await listSessions(pool, { userId: UID, limit: 2, total: true });
-  assert.equal(page1.total, 5, '第一页 total=全量命中');
-  const page2 = await listSessions(pool, { userId: UID, limit: 2, cursor: page1.next_cursor, total: true });
-  assert.equal(page2.total, 5, '翻页后 total 仍=全量命中（不含游标边界）');
-});
 
 test('listSessions：非法游标（旧格式/垃圾串）→ 400 validation_failed，不发查询', async () => {
   const pool = new ListPool([row('11111111-1111-4111-8111-111111111111')]);
@@ -242,10 +187,6 @@ test('listSessions：非法游标（旧格式/垃圾串）→ 400 validation_fai
   }
   assert.equal(pool.queries.length, before, '校验失败不发 SQL');
 });
-
-// ---------------------------------------------------------------------------
-// HTTP 层：GET /api/sessions?q=&total= 参数透传 + 响应组装（真实 server + 内存 pool）
-// ---------------------------------------------------------------------------
 
 /** HTTP 层 fake pool：登录会话（真 token 哈希校验）+ 列表语义。 */
 function httpServerRows(rows) {
@@ -288,31 +229,33 @@ async function startHttp(rows) {
   };
 }
 
-test('HTTP：GET /api/sessions?q=&total=1 → 200，SQL 带 ILIKE/COUNT，响应组装 items+next_cursor+total', async () => {
+test('HTTP：GET /api/sessions → 200，响应组装 items+next_cursor，无 total 字段、无 COUNT 查询', async () => {
   const rows = [
-    row('11111111-1111-4111-8111-111111111111', { title: '部署脚本' }),
-    row('22222222-2222-4222-8222-222222222222', { title: '部署计划' }),
-    row('33333333-3333-4333-8333-333333333333', { title: '别的' }),
+    row('11111111-1111-4111-8111-111111111111', { title: '部署脚本', updated_at: '2026-09-26T03:00:00.000Z' }),
+    row('22222222-2222-4222-8222-222222222222', { title: '部署计划', updated_at: '2026-09-26T02:00:00.000Z' }),
+    row('33333333-3333-4333-8333-333333333333', { title: '别的', updated_at: '2026-09-26T01:00:00.000Z' }),
   ];
   const s = await startHttp(rows);
   try {
-    const res = await fetch(`${s.base}/api/sessions?q=${encodeURIComponent('部署')}&total=1`, {
+    const res = await fetch(`${s.base}/api/sessions?limit=2`, {
       headers: { Cookie: s.cookieHeader },
     });
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.items.length, 2);
-    assert.equal(body.total, 2, 'total 与 q 条件一致');
-    const listSql = s.pool.queries.find((q) => q.sql.includes('FROM chat_sessions s'));
-    assert.match(listSql.sql, /title ILIKE/, 'q 落到 ILIKE 过滤');
-    assert.ok(s.pool.queries.some((q) => /SELECT COUNT\(\*\)/.test(q.sql)), 'total=1 触发 COUNT');
+    assert.equal(body.items[0].title, '部署脚本');
+    assert.notEqual(body.next_cursor, null, '还有第 3 条 → 有 next_cursor');
+    assert.equal(body.total, undefined, '响应无 total 字段（评审裁决已拆除）');
+    assert.equal(s.pool.queries.some((q) => /SELECT COUNT\(\*\)/.test(q.sql)), false, '无 COUNT 查询');
 
-    // 不带 total：响应无 total 字段、无 COUNT 查询
+    // 翻页：cursor 透传到复合行值比较
     s.pool.queries.length = 0;
-    const res2 = await fetch(`${s.base}/api/sessions`, { headers: { Cookie: s.cookieHeader } });
+    const res2 = await fetch(`${s.base}/api/sessions?limit=2&cursor=${encodeURIComponent(body.next_cursor)}`, {
+      headers: { Cookie: s.cookieHeader },
+    });
     const body2 = await res2.json();
-    assert.equal(body2.total, undefined);
-    assert.equal(s.pool.queries.some((q) => /SELECT COUNT\(\*\)/.test(q.sql)), false);
+    assert.deepEqual(body2.items.map((i) => i.title), ['别的'], 'cursor 之后只剩第 3 条');
+    assert.equal(body2.next_cursor, null);
   } finally {
     await s.close();
   }
