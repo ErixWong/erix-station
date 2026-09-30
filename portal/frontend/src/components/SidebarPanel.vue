@@ -13,6 +13,7 @@ import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
 import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
+import FilePreviewModal from './FilePreviewModal.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
 
 const store = useWorkbenchStore();
@@ -27,6 +28,13 @@ const treeRef = ref<InstanceType<typeof DirectoryTree> | null>(null);
 function onRefresh() {
   void store.refreshDirs().catch(() => { /* loadDirs 失败静默：下拉保留旧数据，下次刷新重试 */ });
   treeRef.value?.reload();
+}
+
+// ---- issue #84 P6：目录树文件点击 → 文件预览 modal（cwd 上下文 = store.dirCwd）----
+const previewTarget = ref<{ cwd: string; path: string } | null>(null);
+function onFileClick(path: string) {
+  if (!store.dirCwd) return; // 无目录时树面板本不可交互，防御性兜底
+  previewTarget.value = { cwd: store.dirCwd, path };
 }
 
 // ---- issue #94：会话选择 modal（固定头 🔍 入口；Ctrl/⌘+K 由 WorkbenchView 提供）----
@@ -136,10 +144,18 @@ async function onSubmitNewDir() {
       </div>
     </div>
 
-    <!-- ③ 目录树面板（默认收起，懒展开；节点点击暂无动作，P6 预览后补）：固定底部恒可达 -->
+    <!-- ③ 目录树面板（默认收起，懒展开；文件点击 → P6 预览 modal）：固定底部恒可达 -->
     <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负；
          max-h-[40vh] + overflow-y-auto：树面板自身限高内部滚动，不无限侵占侧栏高度（issue #92） -->
-    <DirectoryTree ref="treeRef" class="shrink-0 max-h-[40vh] overflow-y-auto" :cwd="store.dirCwd" />
+    <DirectoryTree ref="treeRef" class="shrink-0 max-h-[40vh] overflow-y-auto" :cwd="store.dirCwd" @file-click="onFileClick" />
+
+    <!-- issue #84 P6：文件预览 modal（v-if 挂载：打开才发 /api/file，关闭即卸载归还焦点） -->
+    <FilePreviewModal
+      v-if="previewTarget"
+      :cwd="previewTarget.cwd"
+      :path="previewTarget.path"
+      @close="previewTarget = null"
+    />
 
     <!-- issue #94：会话选择 modal（teleport 无必要——侧栏抽屉/桌面布局下 fixed 遮罩均覆盖全屏） -->
     <SessionPickerModal
