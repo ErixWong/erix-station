@@ -39,7 +39,8 @@ export async function createNotesTools({ runId, notesDir }) {
     // 生命周期：onRunStart=janitor（runToolLoop 前）；onRunComplete=completeRun→janitor，
     // 收尾错误收集在返回的 errors[]（不抛出覆盖主错误）。
     lifecycle: assembler.lifecycle,
-    // ADR-015 semantic 槽位（可选接；本宿主暂未接入 runToolLoop 的 semanticStateProvider 参数）。
+    // ADR-015 semantic 槽位：worker 已透传 runToolLoop 的 semanticStateProvider 参数
+    // （宿主契约 docs/host-consumer-contract.md §Run state：折叠重建 run state 时回调）。
     semanticStateProvider: assembler.semanticStateProvider,
   };
 }
