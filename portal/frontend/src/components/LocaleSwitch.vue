@@ -2,7 +2,7 @@
 // 语言切换菜单（issue #101 P1）：小号下拉——按钮显示当前语言，菜单两项「中文」/「English」。
 // 切换即调 setLocale（i18n 响应式生效 + localStorage 持久化 + <html lang> 同步）；
 // 文案走 locale.* 命名空间（语言名用母语自名，两语言下取值一致）。
-// 组件自带外部点击收起；P2 复用同一组件（WorkbenchView 顶栏 / AdminView 顶栏）。
+// 组件自带外部点击收起；当前挂载点：LoginView 卡片头部 + WorkbenchView 顶栏（AdminView 为次级页面，不挂）。
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { setLocale, type AppLocale } from '../i18n';
