@@ -1,19 +1,16 @@
 <script setup lang="ts">
 // 侧栏（issue #84 P5.4，设计文档 §4 左栏竖排三段；issue #92 改 aside 内 flex-col 三段布局）：
 //   ① 固定头：目录下拉（DirSelect：目录名 + ●N 运行态徽标 + ↻ 双刷 + 末项「＋ 新建目录」
-//      内联表单）+ 「＋ 新会话」按钮 + 🔍 查找会话（issue #94 入口②）——不随列表滚动
+//      内联表单）+ 「＋ 新会话」按钮 + 🔍 浏览会话（issue #94 入口；Ctrl/⌘+K 同语义）——不随列表滚动
 //   ② 会话列表段：flex-1 min-h-0 overflow-y-auto，独立内部滚动（空态文案「先创建目录」/
-//      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树；列表尾渲染
-//      「显示最近 20 个」+「查看全部会话 →」（issue #94 入口①，仅 sessionsNextCursor 存在）
-//      列表段顶部：深链打开的会话不在当前列表（如被「最近 20 个」截断）时，置顶「当前会话」卡（issue #94）
+//      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树
 //   ③ 目录树面板（DirectoryTree，默认收起，懒展开）：固定底部，任意会话数下恒可达
-// issue #94：SessionPickerModal（通用会话选择器，三入口共用）挂在本组件与 WorkbenchView。
+// issue #94（评审裁决瘦身版）：SessionPickerModal（单次全量浏览）挂在本组件与 WorkbenchView。
 // 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价），
 // 三段结构在抽屉内同样成立（aside 高度由 max-md:inset-y-0 撑满，h-full 生效）。
-import { computed, ref } from 'vue';
+import { ref } from 'vue';
 import { useAuthStore } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench';
-import type { Session } from '../stores/workbench';
 import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
@@ -32,7 +29,7 @@ function onRefresh() {
   treeRef.value?.reload();
 }
 
-// ---- issue #94：会话选择 modal（入口① 查看全部 / 入口② 固定头 🔍）----
+// ---- issue #94：会话选择 modal（固定头 🔍 入口；Ctrl/⌘+K 由 WorkbenchView 提供）----
 const pickerOpen = ref(false);
 const pickerScope = ref<'cwd' | 'all'>('cwd');
 function openPicker(scope: 'cwd' | 'all') {
@@ -43,21 +40,6 @@ function onPickerSelect(id: string) {
   pickerOpen.value = false;
   emit('select-session', id); // 路由 push/跨目录逻辑由视图 onSelectSession 统一处理
 }
-
-// ---- issue #94：「当前会话」置顶卡——深链打开的会话不在当前目录列表（被「最近 20 个」截断等）
-// 时给上下文；点击重开当前会话（与 issue #55 B4 的重开语义一致，路由 push/跨目录由视图处理）。
-const pinnedCurrent = computed(() =>
-  !!store.sessionId
-  && !store.noDir // 列表已加载（有目录上下文）才算「不在列表」；无目录时列表本就未加载
-  && !store.sessions.some((s) => String(s.id) === String(store.sessionId)),
-);
-// 列表外会话的标题/updated_at 未在 store 留存（数据流零改动）：合成占位 Session 仅供 sessMeta 取 meta。
-const pinnedSession = computed<Session>(() => ({ id: String(store.sessionId) }));
-const pinnedMeta = computed(() => {
-  const s = pinnedSession.value;
-  // 无 meta 信息时不渲染 1970 占位时间：有 active_run_id / updated_at 才出 meta 行
-  return s.active_run_id || s.updated_at ? store.sessMeta(s) : '';
-});
 
 // ---- 「＋ 新建目录」内联表单（DIR_NAME_RE 校验 + 错误展示；创建成功后打开新会话）----
 const showNewDir = ref(false);
@@ -114,7 +96,7 @@ async function onSubmitNewDir() {
         <p class="syserr mt-2" role="alert">{{ newDirError }}</p>
       </form>
 
-      <!-- 「＋ 新会话」+ 🔍 查找会话（issue #94 入口②：默认当前目录，无目录时全量） -->
+      <!-- 「＋ 新会话」+ 🔍 浏览会话（issue #94：默认当前目录，无目录时全量；Ctrl/⌘+K 同语义） -->
       <div class="mt-3 flex gap-2">
         <button
           class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
@@ -123,8 +105,8 @@ async function onSubmitNewDir() {
         >＋ 新会话</button>
         <button
           type="button"
-          title="查找会话"
-          aria-label="查找会话"
+          title="浏览会话（Ctrl/⌘+K）"
+          aria-label="浏览会话"
           class="shrink-0 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
           @click="openPicker(store.dirCwd ? 'cwd' : 'all')"
         >🔍</button>
@@ -140,17 +122,6 @@ async function onSubmitNewDir() {
         <p v-else class="muted">先创建目录</p>
       </div>
       <div v-else>
-        <!-- issue #94：置顶卡在 v-for 之外、位于列表段最顶；空态（暂无会话）时也显示——
-             此时它可能是列表里唯一一张卡。样式复用选中态（border-brand bg-green-50）。 -->
-        <div
-          v-if="pinnedCurrent"
-          data-testid="pinned-current"
-          class="mt-2 cursor-pointer rounded-md border px-2 py-1.5 text-sm border-brand bg-green-50"
-          @click="emit('select-session', String(store.sessionId))"
-        >
-          <div>📌 当前会话</div>
-          <div v-if="pinnedMeta" class="text-black/50 text-xs">{{ pinnedMeta }}</div>
-        </div>
         <p v-if="store.sessions.length === 0" class="muted">暂无会话</p>
         <div
           v-for="s in store.sessions"
@@ -161,15 +132,6 @@ async function onSubmitNewDir() {
         >
           <div>{{ s.title || '未命名会话' }}</div>
           <div class="text-black/50 text-xs">{{ store.sessMeta(s) }}</div>
-        </div>
-        <!-- issue #94 入口①：仅截断时渲染（next_cursor 存在 = 该目录还有未展示的会话） -->
-        <div v-if="store.sessionsNextCursor" class="mt-2 mb-1">
-          <p class="text-black/50 text-xs">显示最近 20 个</p>
-          <button
-            type="button"
-            class="mt-1 w-full rounded-md border border-black/20 px-2 py-1.5 text-sm text-brand hover:bg-black/5"
-            @click="openPicker('cwd')"
-          >查看全部会话 →</button>
         </div>
       </div>
     </div>
