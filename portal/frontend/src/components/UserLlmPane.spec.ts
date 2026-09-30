@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import UserLlmPane from './UserLlmPane.vue';
 import type { AdminUser, LlmProvider } from '../stores/admin';
+import { i18n, setLocale } from '../i18n';
 
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', status: 'active',
@@ -64,12 +65,17 @@ async function mountPane(extra?: (url: string, init?: RequestInit) => Response |
       ? jsonResponse(200, GET_CONFIG)
       : jsonResponse(404, { error: { code: 'not_found', message: 'not found' } })));
   vi.stubGlobal('fetch', fetchFn);
-  const wrapper = mount(UserLlmPane, { props: { user: FDE_USER, providers: PROVIDERS } });
+  const wrapper = mount(UserLlmPane, { props: { user: FDE_USER, providers: PROVIDERS }, global: { plugins: [i18n] } });
   await flushPromises();
   return { wrapper, fetchFn };
 }
 
-beforeEach(() => vi.unstubAllGlobals());
+beforeEach(() => {
+  // issue #101 P3：装配真实 i18n 单例（不 mock t()），每例重置为 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
+  vi.unstubAllGlobals();
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe('UserLlmPane · LLM 配置表单', () => {
@@ -170,5 +176,91 @@ describe('UserLlmPane · LLM 配置表单', () => {
     expect(wrapper.text()).toContain('provision 完成：fde-alice（fde-alice 10.0.0.0/29）');
     expect(fetchFn.mock.calls.some(([u, i]) =>
       String(u).includes('/api/admin/fdes/alice/provision') && i?.method === 'POST')).toBe(true);
+  });
+});
+
+// issue #101 P3：切 English 的双向断言（zh 基线断言在上面各用例中逐字未改）。
+describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
+  it('切 English：表单标签/占位符/选项/按钮与活跃 run 告警变英文', async () => {
+    const { wrapper } = await mountPane();
+    setLocale('en');
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('⚠️ Active run: changing the provider or API key');
+    expect(wrapper.find('[data-test="key-hint"]').text()).toBe('sk••• configured; re-enter to change');
+    expect(wrapper.find('input[type="password"]').attributes('placeholder')).toBe('leave blank to keep unchanged');
+
+    const form = wrapper.find('form').text();
+    expect(form).toContain('Provider');
+    expect(form).toContain('API Key (');
+    expect(form).toContain('Main model (text · tool_calling)');
+    expect(form).toContain('Embedding (optional)');
+    expect(form).toContain('Vision (optional)');
+    expect(form).toContain('Save LLM config');
+    expect(form).toContain('Provision container');
+
+    // 「（不配置）」选项英文（三个下拉）
+    for (const sel of ['main-model', 'embedding-model', 'vision-model']) {
+      expect(wrapper.find(`[data-test="${sel}"]`).findAll('option')[0].text()).toBe('(not configured)');
+    }
+    expect(wrapper.find('[data-test="main-model"]').findAll('option').map((o) => o.text()))
+      .toEqual(['(not configured)', 'gpt-4o — GPT-4o']);
+  });
+
+  it('切 English：保存成功 / 409 拒绝 / provision 完成 / 错误前缀文案英文', async () => {
+    // ① 保存成功（含 key 后缀）
+    const { wrapper, fetchFn } = await mountPane((url, init) => {
+      if (String(url).includes('/llm') && init?.method === 'PUT') {
+        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'gpt-4o' } } });
+      }
+      if (String(url).includes('/provision') && init?.method === 'POST') {
+        return jsonResponse(200, { fde: 'alice', network: 'fde-alice', subnet: '10.0.0.0/29', container: 'fde-alice' });
+      }
+      return undefined;
+    });
+    setLocale('en');
+    await flushPromises();
+
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(wrapper.text()).toContain('Saved: main model gpt-4o (key sk•••)');
+
+    // ② provision 完成文案
+    await wrapper.findAll('form button')[1].trigger('click');
+    await flushPromises();
+    expect(wrapper.text()).toContain('Provisioned: fde-alice (fde-alice 10.0.0.0/29)');
+    expect(putCalls(fetchFn)).toHaveLength(1);
+
+    // ③ 409 拒绝前缀英文（其后仍为服务端原文，不译）
+    let putCount = 0;
+    const conflict = await mountPane((url, init) => {
+      if (String(url).includes('/llm') && init?.method === 'PUT') {
+        putCount += 1;
+        return jsonResponse(409, {
+          error: { code: 'active_run_conflict', message: '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。确认无影响请带 force=true 重试。' },
+        });
+      }
+      return undefined;
+    });
+    setLocale('en');
+    await flushPromises();
+    await conflict.wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(putCount).toBe(1);
+    expect(conflict.wrapper.text()).toContain('Rejected (409): 该 FDE 有进行中的 run');
+    expect(conflict.wrapper.find('[data-test="force-save"]').text()).toBe('No impact — force save');
+
+    // ④ 非 409 错误：「Error: 」前缀 + 服务端原文
+    const err = await mountPane((url, init) => {
+      if (String(url).includes('/llm') && init?.method === 'PUT') {
+        return jsonResponse(400, { error: { code: 'validation_failed', message: 'fde_name 非法' } });
+      }
+      return undefined;
+    });
+    setLocale('en');
+    await flushPromises();
+    await err.wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(err.wrapper.text()).toContain('Error: fde_name 非法');
   });
 });

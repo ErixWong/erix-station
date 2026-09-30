@@ -1,11 +1,12 @@
-// 默认语言（zh-CN）——i18n key 的权威来源（issue #101 P1；P2 补工作台全量文案）。
+// 默认语言（zh-CN）——i18n key 的权威来源（issue #101 P1；P2 补工作台全量文案，P3 补管理台）。
 //
 // 约定：
 //   ① 新增文案一律先加在这里，再补 en.ts 对译（en.ts 用 `satisfies MessageSchema` 保证键集一致）；
 //   ② 命名空间按页面/组件划分：common.*（跨页面复用）、locale.*（语言切换菜单自身）、
 //      login.*（登录页）、workbench.*（工作台壳/顶栏）、sidebar.*（侧栏）、tree.*（目录树）、
 //      stream.*（消息流 + SSE 事件状态行）、composer.*（输入区）、picker.*（会话浏览 modal）、
-//      preview.*（文件预览 modal）、errors.*（运行时错误/兜底提示文案）；
+//      preview.*（文件预览 modal）、errors.*（运行时错误/兜底提示文案）、
+//      admin.*（管理台：llm.* 供应商/模型区 + per-user pane、fde.* FDE 用户区）；
 //   ③ `as const` 保留字面量类型，供 vue-i18n 泛型与 DefineLocaleMessage 推导 key 类型；
 //   ④ 语言名（locale.zhCN / locale.en）用母语自名（endonym），两种语言下取值相同，不随当前 locale 翻译；
 //   ⑤ 插值片段（stream.event.dash / paren）是「可选后缀」的载体：调用方按条件传空串占位，
@@ -142,6 +143,80 @@ export const zhCN = {
   // 文件预览 modal（components/FilePreviewModal.vue）
   preview: {
     title: '预览 {path}',
+  },
+  // 管理台（views/AdminView.vue + components/UserLlmPane.vue + stores/admin.ts）
+  // 注：服务端透传的 error.message 一律不译，仅译前端自产文案（含「错误：」前缀与 409 拒绝前缀）。
+  admin: {
+    title: 'FDE Station 管理台',
+    backToWorkbench: '← 返回工作台',
+    // 前端自产的错误前缀（拼在服务端 error.message 之前）
+    errorPrefix: '错误：',
+    // 供应商/模型/用户通用状态与动作
+    enabled: '启用',
+    disabled: '停用',
+    delete: '删除',
+    expand: '展开',
+    collapse: '收起',
+    // LLM 供应商/模型区（AdminView #llmSection + UserLlmPane）
+    llm: {
+      sectionTitle: 'LLM 供应商',
+      emptyProviders: '暂无供应商，先在下方新增。',
+      // 模型明细展开按钮：{count} 为模型数量
+      modelsCount: '模型明细（{count}）',
+      collapseModels: '收起模型',
+      emptyModels: '该供应商下暂无模型',
+      colName: '名称',
+      colType: '类型',
+      colContextWindow: '上下文窗口',
+      colStatus: '状态',
+      addModel: '＋ 新增模型',
+      providerName: '供应商名',
+      addProvider: '＋ 新增供应商',
+      confirmDeleteProvider: '确认删除供应商 {name}？其下模型将一并删除。',
+      confirmDeleteModel: '确认删除模型 {model}？',
+      // per-user LLM 配置 pane（UserLlmPane.vue）
+      loadingPane: '加载 LLM 配置…',
+      activeRunWarn: '⚠️ 有活跃 run：更换供应商或 API key 会被服务端拒绝（影响进行中的 run）；纯模型变更不受影响。',
+      providerLabel: '供应商',
+      // 标签带 key 掩码提示（{hint} 为 keyConfigured / keyFirstTime）
+      apiKeyLabel: 'API Key（{hint}）',
+      keyPlaceholder: '留空 = 保持不变',
+      keyConfigured: '已配置 {key}，重输以修改',
+      keyFirstTime: '首次配置必填',
+      mainModelLabel: '主模型（text · tool_calling）',
+      embeddingLabel: 'Embedding（可空）',
+      visionLabel: 'Vision（可空）',
+      notConfigured: '（不配置）',
+      save: '保存 LLM 配置',
+      // 保存成功：saved 必选，savedKeySuffix 仅在服务端回显掩码 key 时拼接
+      saved: '已保存：主模型 {model}',
+      savedKeySuffix: '（key {key}）',
+      provision: 'provision 容器',
+      provisionDone: 'provision 完成：{container}（{network} {subnet}）',
+      // 409 active_run_conflict：前缀译，其后拼服务端原因（不译）
+      conflictPrefix: '已拒绝（409）：',
+      forceSave: '确认无影响，强制保存',
+    },
+    // FDE 用户区（AdminView #fdeSection）
+    fde: {
+      sectionTitle: 'FDE 管理',
+      emptyUsers: '暂无用户。',
+      noFdeName: '无 fde_name',
+      noFdeNameHint: '该用户未配置 fde_name，无需 LLM 配置。',
+      addUserTitle: '新增 FDE 用户',
+      loginLabel: '登录名',
+      displayNameLabel: '显示名',
+      passwordLabel: '口令',
+      fdeNameLabel: 'fde_name（可空）',
+      addUser: '＋ 创建用户',
+      qrAlt: 'TOTP 认证器二维码',
+      // 一次性 TOTP 盒：{login} 与 {onlyOnce} 由模板插槽加粗（见 AdminView 模板）
+      totpCreated: '用户 {login} 已创建。请用认证器 App 录入以下 otpauth URI 或种子（{onlyOnce}）：',
+      totpOnlyOnce: '仅此一次显示',
+      otpauthUri: 'otpauth URI：',
+      totpSecret: 'TOTP 种子：',
+      nextStep: '下一步：展开该用户卡片 → 配置 LLM 上游 → 点击 provision 容器；将登录名/口令与本二维码交给用户扫码录入认证器。',
+    },
   },
   // 运行时错误/兜底提示（api.ts + workbench store + 目录树）
   errors: {
