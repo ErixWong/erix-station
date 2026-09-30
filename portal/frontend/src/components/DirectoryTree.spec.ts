@@ -4,9 +4,15 @@
 // 注意：需 NODE_ENV=development 运行（本机 shell 默认 production 时 VTU emitted/DOM 部分行为失效，
 // 仓库既有约定：NODE_ENV=development npm install && npm test）。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import DirectoryTree from './DirectoryTree.vue';
 import type { TreeEntry } from '../lib/tree';
+import { i18n, setLocale } from '../i18n';
+
+// issue #101 P2：装配真实 i18n 单例（组件内 useI18n() 需要），本文件多处 mount 统一经此助手。
+function mountTree(props: { cwd: string | null; onFileClick?: (p: string) => void }) {
+  return mount(DirectoryTree, { props, global: { plugins: [i18n] } });
+}
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -47,12 +53,17 @@ function rowBtns(wrapper: ReturnType<typeof mount>) {
   return wrapper.findAll('button').filter((b) => ['src', 'README.md', 'index.ts'].some((t) => b.text().includes(t)));
 }
 
-beforeEach(() => vi.unstubAllGlobals());
+beforeEach(() => {
+  vi.unstubAllGlobals();
+  // 每例重置语言为 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
+});
 
 describe('DirectoryTree（目录树面板）', () => {
   it('默认收起：零请求；展开后只拉根层单层（path 参数为空串）', async () => {
     mockTreeFetch();
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo' } });
+    const wrapper = mountTree({ cwd: '~/projects/demo' });
     expect(wrapper.text()).toContain('▸ 目录树');
     expect(vi.mocked(fetch)).not.toHaveBeenCalled(); // 懒：收起时不发请求
 
@@ -77,7 +88,7 @@ describe('DirectoryTree（目录树面板）', () => {
     // 文件节点点击（P6）：emit file-click（相对路径），零树请求
     // （emitted() 对本环境 script-setup 组件不记录，用父级 onFileClick 回调断言，仓库先例同）
     const onFileClick = vi.fn();
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo', onFileClick } });
+    const wrapper = mountTree({ cwd: '~/projects/demo', onFileClick });
     await openPanel(wrapper);
     const callsAfterRoot = vi.mocked(fetch).mock.calls.length;
     const [, readme] = rowBtns(wrapper);
@@ -110,7 +121,7 @@ describe('DirectoryTree（目录树面板）', () => {
 
   it('reload（↻ 路径）：回到全折叠 + 清缓存，面板开着则重拉根层', async () => {
     mockTreeFetch();
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo' } });
+    const wrapper = mountTree({ cwd: '~/projects/demo' });
     await openPanel(wrapper);
     const [src] = rowBtns(wrapper);
     await src.trigger('click');
@@ -127,7 +138,7 @@ describe('DirectoryTree（目录树面板）', () => {
 
   it('切 cwd：树归位（全折叠 + 清缓存），重载新目录根层', async () => {
     mockTreeFetch();
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo' } });
+    const wrapper = mountTree({ cwd: '~/projects/demo' });
     await openPanel(wrapper);
     const [src] = rowBtns(wrapper);
     await src.trigger('click');
@@ -144,7 +155,7 @@ describe('DirectoryTree（目录树面板）', () => {
 
   it('加载失败：错误行展示，节点展开态回滚（可重试点）', async () => {
     mockTreeFetch(['src']);
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo' } });
+    const wrapper = mountTree({ cwd: '~/projects/demo' });
     await openPanel(wrapper);
     const [src] = rowBtns(wrapper);
     await src.trigger('click');
@@ -155,16 +166,60 @@ describe('DirectoryTree（目录树面板）', () => {
 
   it('空目录：根层零条目时显式标注（空目录）', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, { entries: [] })));
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/empty' } });
+    const wrapper = mountTree({ cwd: '~/projects/empty' });
     await wrapper.get('button').trigger('click'); // 展开面板
     await vi.waitFor(() => expect(wrapper.text()).toContain('（空目录）'));
   });
 
   it('cwd 为空：面板展开显示引导文案，零请求', async () => {
     mockTreeFetch();
-    const wrapper = mount(DirectoryTree, { props: { cwd: null } });
+    const wrapper = mountTree({ cwd: null });
     await wrapper.get('button').trigger('click');
     expect(wrapper.text()).toContain('先选择目录');
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #101 P2：目录树用户可见文案走 i18n（zh-CN 基线逐字不变，切 en 即时生效）
+// ---------------------------------------------------------------------------
+describe('DirectoryTree · i18n（issue #101 P2）', () => {
+  it('zh-CN 基线：面板标题 / 未选目录 / 空目录 / 加载失败文案', async () => {
+    const noCwd = mountTree({ cwd: null });
+    await noCwd.get('button').trigger('click'); // 面板默认收起：展开后才渲染空态
+    expect(noCwd.text()).toContain('先选择目录');
+
+    // 空目录：根层零条目（stub 恒返回空 entries）
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, { entries: [] })));
+    const empty = mountTree({ cwd: '~/projects/empty' });
+    await empty.get('button').trigger('click');
+    await vi.waitFor(() => expect(empty.text()).toContain('（空目录）'));
+    expect(empty.text()).toContain('▾ 目录树');
+
+    mockTreeFetch(['']);
+    const failed = mountTree({ cwd: '~/projects/demo' });
+    await failed.get('button').trigger('click');
+    await vi.waitFor(() => expect(failed.text()).toContain('目录树加载失败'));
+    expect(failed.text()).toContain('boom');
+  });
+
+  it('切 English：标题 / 未选目录 / 空目录 / 加载失败文案即时变英文', async () => {
+    const noCwd = mountTree({ cwd: null });
+    await noCwd.get('button').trigger('click');
+    expect(noCwd.text()).toContain('先选择目录');
+    setLocale('en');
+    await flushPromises();
+    expect(noCwd.text()).toContain('Directory tree');
+    expect(noCwd.text()).toContain('Select a directory first');
+
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, { entries: [] })));
+    const empty = mountTree({ cwd: '~/projects/empty' });
+    await empty.get('button').trigger('click');
+    await vi.waitFor(() => expect(empty.text()).toContain('(empty directory)'));
+
+    mockTreeFetch(['']);
+    const failed = mountTree({ cwd: '~/projects/demo' });
+    await failed.get('button').trigger('click');
+    await vi.waitFor(() => expect(failed.text()).toContain('Failed to load the directory tree: boom'));
   });
 });
