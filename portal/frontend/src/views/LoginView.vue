@@ -1,10 +1,15 @@
 <script setup lang="ts">
 // 登录页：观感对齐旧 index.html renderLogin() 的 Bootstrap 登录卡（居中卡、品牌绿主按钮、
 // 两步切换）。字段/按钮文案/错误展示位置保持逐字等价。
+// issue #101 P1：用户可见文案走 i18n（login.*，zh-CN/en 逐字等价），卡片右上角挂语言切换菜单。
+// 注意：错误提示 auth.error 来自 auth store（P2 归 errors.*），本阶段保持原样。
 import { ref, nextTick } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import { useI18n } from 'vue-i18n';
 import { useAuthStore, afterLoginRoute } from '../stores/auth';
+import LocaleSwitch from '../components/LocaleSwitch.vue';
 
+const { t } = useI18n();
 const router = useRouter();
 const route = useRoute();
 const auth = useAuthStore();
@@ -42,16 +47,20 @@ async function onTotpSubmit() {
   <div class="min-h-screen flex items-start md:items-center justify-center bg-white px-3 py-12">
     <div class="w-full max-w-[22rem] rounded-lg border border-black/10 bg-white shadow-sm">
       <div class="p-4">
-        <h2 class="text-xl font-medium mb-3">FDE Station 登录</h2>
+        <!-- 卡片头部：标题 + 语言切换（flex 头部，不遮挡表单） -->
+        <div class="flex items-start justify-between gap-2 mb-3">
+          <h2 class="text-xl font-medium">{{ t('login.title') }}</h2>
+          <LocaleSwitch />
+        </div>
 
         <!-- 第一步：login + password -->
         <form v-if="!auth.pendingToken" @submit.prevent="onLoginSubmit">
-          <label class="block text-xs text-black/50 mb-1" for="loginName">登录名</label>
+          <label class="block text-xs text-black/50 mb-1" for="loginName">{{ t('login.loginName') }}</label>
           <input
             id="loginName" v-model="login" autocomplete="username"
             class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
           >
-          <label class="block text-xs text-black/50 mb-1" for="loginPass">口令</label>
+          <label class="block text-xs text-black/50 mb-1" for="loginPass">{{ t('login.password') }}</label>
           <input
             id="loginPass" v-model="password" type="password" autocomplete="current-password"
             class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
@@ -59,13 +68,13 @@ async function onTotpSubmit() {
           <button
             type="submit" :disabled="auth.loading"
             class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
-          >下一步</button>
+          >{{ t('login.next') }}</button>
         </form>
 
         <!-- 第二步：TOTP（pending_token 已换取） -->
         <form v-else @submit.prevent="onTotpSubmit">
-          <p class="text-black/50 text-sm mb-3">输入认证器 6 位码（本地账号两步登录）。</p>
-          <label class="block text-xs text-black/50 mb-1" for="totpCode">TOTP</label>
+          <p class="text-black/50 text-sm mb-3">{{ t('login.totpHint') }}</p>
+          <label class="block text-xs text-black/50 mb-1" for="totpCode">{{ t('login.totpLabel') }}</label>
           <input
             id="totpCode" ref="totpInput" v-model="code"
             inputmode="numeric" maxlength="6" autocomplete="one-time-code"
@@ -74,12 +83,12 @@ async function onTotpSubmit() {
           <button
             type="submit" :disabled="auth.loading"
             class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
-          >验证并登录</button>
+          >{{ t('login.totpSubmit') }}</button>
           <button
             type="button"
             class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5"
             @click="auth.backToLogin()"
-          >← 返回重新登录</button>
+          >{{ t('login.backToLogin') }}</button>
         </form>
 
         <p class="text-red-600 text-sm mt-3 mb-0" role="alert">{{ auth.error }}</p>
