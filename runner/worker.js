@@ -361,6 +361,11 @@ async function startRun(msg) {
       }),
       tools,
       executeTool,
+      // AGENTS.md §8.2 待办（ADR-015 槽位）：notes 工厂 semanticStateProvider 透传——引擎在
+      // context 折叠重建 run state 时回调（宿主契约 §Run state），返回 {text, version, status}
+      // 注入 run-state 的 semantic 段；undefined/非函数时引擎按「未提供」跳过（工厂加载失败的
+      // 降级路径同样安全：noteTools 回退对象无此字段）。
+      semanticStateProvider: noteTools.semanticStateProvider,
       store,
       // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
       runId: transcriptKey,

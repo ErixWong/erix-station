@@ -117,3 +117,40 @@ test('scope 非 run → unsupported（上游工厂语义保留）', () =>
     const out = JSON.parse(await tools.executeTool({ id: 'tu-1', name: 'note_take', input: { key: 'k', content: 'v', scope: 'user' } }));
     assert.equal(out.status, 'unsupported');
   }));
+
+// ADR-015 槽位（AGENTS.md §8.2 待办 → 接线）：semanticStateProvider 透出并符合 runToolLoop
+// 宿主契约（docs/host-consumer-contract.md §Run state）——引擎折叠重建 run state 时以
+// {runId, state, previous} 回调，返回 {text, version, status}；version 回声 state.stateVersion；
+// store list 失败/无 active note 时返回 undefined（引擎按「未提供」跳过 semantic 段）。
+test('semanticStateProvider：透出工厂目录视图，回调返回契约结构 {text, version, status}', () =>
+  withNotesDir(async (notesDir) => {
+    const tools = await createNotesTools({ runId: 'run-42', notesDir });
+    assert.equal(typeof tools.semanticStateProvider, 'function', '工厂应透出 semanticStateProvider');
+
+    // 无 active note → undefined（引擎降级：不注入 semantic 段）
+    const empty = await tools.semanticStateProvider({ state: { stateVersion: 3 } });
+    assert.equal(empty, undefined);
+
+    // take 一条 active note → 目录渲染（ADR-015：active only、pinned 优先、updated_at 序）
+    await tools.executeTool({ id: 'tu-1', name: 'note_take', input: { key: 'target', content: 'gold-4173' } });
+    const provided = await tools.semanticStateProvider({ state: { stateVersion: 7 } });
+    assert.ok(provided && typeof provided === 'object');
+    assert.equal(provided.status, 'ok');
+    assert.equal(provided.version, 7, 'version 必须回声 payload.state.stateVersion（防 stale 标记）');
+    assert.match(provided.text, /\[notes 小抄目录\]/);
+    assert.match(provided.text, /target/);
+
+    // 无参调用也安全（引擎回调形态之外的人为调用兜底）
+    const bare = await tools.semanticStateProvider();
+    assert.ok(bare && bare.text.includes('target'));
+  }));
+
+test('semanticStateProvider：store list 失败 → 返回 undefined 不抛出（引擎降级路径）', () =>
+  withNotesDir(async (notesDir) => {
+    // 预塞损坏的 store 布局：run 子目录占位成普通文件 → file store list 抛错
+    fs.mkdirSync(path.join(notesDir, 'run'), { recursive: true });
+    fs.writeFileSync(path.join(notesDir, 'run', 'run-42'), 'not-a-dir');
+    const tools = await createNotesTools({ runId: 'run-42', notesDir });
+    const provided = await tools.semanticStateProvider({ state: { stateVersion: 1 } });
+    assert.equal(provided, undefined, 'list 失败必须静默降级为 undefined，不抛穿引擎');
+  }));
