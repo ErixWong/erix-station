@@ -1,5 +1,6 @@
-// DirectoryTree 单测（issue #84 P5.4）：懒展开（点一级出一层）、默认收起、↻ 全折叠归位、
-// 切 cwd 归位、文件/目录图标区分、文件点击无动作、空目录标注。mock fetch，不碰真实后端。
+// DirectoryTree 单测（issue #84 P5.4 + P6）：懒展开（点一级出一层）、默认收起、↻ 全折叠归位、
+// 切 cwd 归位、文件/目录图标区分、文件点击 emit file-click（P6：零树请求，路径为相对路径）、
+// 空目录标注。mock fetch，不碰真实后端。
 // 注意：需 NODE_ENV=development 运行（本机 shell 默认 production 时 VTU emitted/DOM 部分行为失效，
 // 仓库既有约定：NODE_ENV=development npm install && npm test）。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -71,16 +72,18 @@ describe('DirectoryTree（目录树面板）', () => {
     expect(u.searchParams.get('path')).toBe(''); // 根层 = 空 path
   });
 
-  it('懒展开：点目录项才拉下一层（path=src）；收起再展开用缓存不发请求；文件点击无动作', async () => {
+  it('懒展开：点目录项才拉下一层（path=src）；收起再展开用缓存不发请求；文件点击 emit file-click（零树请求）', async () => {
     mockTreeFetch();
-    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo' } });
+    // 文件节点点击（P6）：emit file-click（相对路径），零树请求
+    // （emitted() 对本环境 script-setup 组件不记录，用父级 onFileClick 回调断言，仓库先例同）
+    const onFileClick = vi.fn();
+    const wrapper = mount(DirectoryTree, { props: { cwd: '~/projects/demo', onFileClick } });
     await openPanel(wrapper);
     const callsAfterRoot = vi.mocked(fetch).mock.calls.length;
-
-    // 文件节点点击：无动作（P6 之前无预览，零新请求）
     const [, readme] = rowBtns(wrapper);
     await readme.trigger('click');
     expect(vi.mocked(fetch).mock.calls.length).toBe(callsAfterRoot);
+    expect(onFileClick).toHaveBeenCalledWith('README.md');
 
     // 点目录项 → 拉下一层，展开 icon 变为 📂，子文件出现
     const [src] = rowBtns(wrapper);
@@ -89,6 +92,13 @@ describe('DirectoryTree（目录树面板）', () => {
     expect(vi.mocked(fetch).mock.calls.length).toBe(callsAfterRoot + 1);
     expect(String(vi.mocked(fetch).mock.calls.at(-1)![0])).toContain('path=src');
     expect(src.text()).toContain('📂');
+
+    // 嵌套文件点击：emit 完整相对路径 a/b/c（同样零树请求）
+    const nested = rowBtns(wrapper).find((b) => b.text().includes('index.ts'))!;
+    await nested.trigger('click');
+    expect(onFileClick).toHaveBeenLastCalledWith('src/index.ts');
+    expect(onFileClick).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(callsAfterRoot + 1); // 文件点击不发树请求
 
     // 收起子层再展开：缓存命中，零请求
     await src.trigger('click'); // 收起
