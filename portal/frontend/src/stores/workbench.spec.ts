@@ -521,4 +521,23 @@ describe('workbench store · i18n（issue #101 P2）', () => {
     expect(loadErr && 'text' in loadErr ? loadErr.text : '')
       .toBe('Failed to load the session; refresh to retry');
   });
+
+  // issue #105 ③：会话列表 meta 行时间戳随 locale（原硬编码 toLocaleString('zh-CN')）。
+  it('时间戳随 locale（issue #105 ③）：sessMeta 走当前 locale；运行中徽标优先', () => {
+    const T = '2026-09-20T08:00:00.000Z';
+    const store = useWorkbenchStore();
+    const sess = { id: 's1', title: 'x', updated_at: T, active_run_id: null };
+    const zh = new Date(T).toLocaleString('zh-CN');
+    const en = new Date(T).toLocaleString('en');
+    expect(store.sessMeta(sess)).toBe(zh); // zh-CN 基线逐字不变
+
+    setLocale('en');
+    expect(store.sessMeta(sess)).toBe(en);
+    expect(store.sessMeta(sess)).not.toBe(zh); // 不再是中文格式（硬编码 zh-CN 会在此失败）
+    expect(en).toMatch(/\d{1,2}\/\d{1,2}\/\d{4}/); // 英文短日期序：月/日/年（zh-CN 为年/月/日）
+
+    // 有活跃 run 时仍走「运行中」徽标（时间不参与）；缺 updated_at 兜底 epoch 不抛错。
+    expect(store.sessMeta({ ...sess, active_run_id: 'r1' })).toBe('● Running');
+    expect(typeof store.sessMeta({ id: 's2' })).toBe('string');
+  });
 });
