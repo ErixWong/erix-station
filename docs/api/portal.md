@@ -131,14 +131,15 @@
 
 ### 2.1 登录方式（P1）
 
-**P1 用本地账号**：口令哈希 + **强制 TOTP**，两步登录（规格 §7.1 本地通道的同一套机制；P1 骨架暂用 Node 内置 `crypto.scrypt`，目标 argon2id 按 §2.9.4 平滑迁移；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
+**P1 用本地账号**：口令哈希 + TOTP 第二因素（规格 §7.1 本地通道的同一套机制；P1 骨架暂用 Node 内置 `crypto.scrypt`，目标 argon2id 按 §2.9.4 平滑迁移；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
 
+- **两步登录的适用范围（现状）**：**已注册 TOTP**（`users.totp_secret` 非 NULL/空串）的本地账号走两步（§2.2 → §2.3）；**未注册 TOTP**（`totp_secret` 为 NULL 或空串）的本地账号**口令直通建会话**（§2.2 直接返回 `authenticated`，没有第二步）——用户决策 2026-09-22，实现 d605015。规格 §7.1「强制 TOTP」是**设计目标**，此处为已落地的偏离：CLI 建号（§2.9.1/§2.9.2）与 `reset-totp` 一律下发种子，故经 CLI 创建的账号仍是强制两步；偏离只对「种子为空」的账号生效（原语义下第二步必然失败 = 账号永久锁死）。
 - 第一个 admin 由部署 bootstrap 在本地建（规格 §7.1）；**TOTP 种子由 bootstrap 流程生成下发，不走公开 API**（P1 契约不含注册/自助找回端点）。
 - OIDC 接入后登录入口变化（跳转 SSO），但 **cookie、session 语义、本文其余端点全部不变**——前端无需感知。
 
 ### 2.2 `POST /api/auth/login`
 
-第一步：校验口令。
+第一步：校验口令。响应按该账号是否已注册 TOTP 分两种（§2.1）：已注册 → `totp_required`（进入第二步）；未注册 → `authenticated`（口令直通，直接建会话发 cookie）。
 
 请求：
 
@@ -146,7 +147,7 @@
 { "login": "alice", "password": "••••••••" }
 ```
 
-响应 `200`（口令正确，进入第二步；**此时尚未登录**）：
+响应 `200`（口令正确**且已注册 TOTP**，进入第二步；**此时尚未登录**）：
 
 ```json
 { "status": "totp_required", "pending_token": "pt_9f2c...", "expires_in": 120 }
@@ -155,6 +156,17 @@
 | 字段 | 说明 |
 |---|---|
 | `pending_token` | 一次性、短期（默认 120s，`PENDING_TOKEN_TTL_SECONDS` 可配）有效的待决令牌，仅可用于 `/api/auth/login/totp`；服务端只存其 `sha256` |
+
+响应 `200`（**未注册 TOTP 的账号**：口令直通，**此时已登录**）：
+
+```json
+{
+  "status": "authenticated",
+  "user": { "id": "u_alice", "login": "alice", "display_name": "Alice", "role": "fde", "fde_name": "alice" }
+}
+```
+
+同时下发 session cookie（属性见 §2.5）；**无 `pending_token`**，无需（也无法）再调 `/api/auth/login/totp`。
 
 请求约束（S3）：`Content-Type` 必须为 `application/json`（否则 `400 validation_failed`）；`login` ≤ 128、`password` ≤ 256 字符（否则 `400 validation_failed`）；请求体超过上限（默认 64KiB，`Content-Length` 或流式字节）→ `413 payload_too_large`（标准错误信封）。
 
@@ -411,13 +423,15 @@ station-portal user enable  --login <login>
 | 口令哈希 | **argon2id**；参数（⚠️ 待决策者确认，倾向 OWASP 2026）：`m=19 MiB, t=2, p=1`；本地账号与 OIDC 账号分离（OIDC 无 `password_hash`） |
 | 口令强度 | 长度下限 **12**（⚠️ 待决策者确认）；不做复杂组合规则，但拒绝「与 login 相同 / 常见弱口令」；初始口令必须 `must_change`（首次登录强制改密） |
 | 口令重置 | `station-portal user set-password --login <login>`（admin 本地执行）：重置为新随机口令 + `must_change`，并**吊销该用户全部会话**（防旧会话续用）；不通过公开 API 暴露自助找回 |
-| TOTP | **强制**（规格 §7.1）：RFC 6238 `SHA-1 / 6 位 / 30s`，校验窗口 ±1 步 + 单码防重放（同 30s 窗口内同码只接受一次）；种子 base32，仅 bootstrap/`user create` 时下发 |
+| TOTP | **强制**（规格 §7.1；现状对未注册账号不成立，见下注）：RFC 6238 `SHA-1 / 6 位 / 30s`，校验窗口 ±1 步 + 单码防重放（同 30s 窗口内同码只接受一次）；种子 base32，仅 bootstrap/`user create` 时下发 |
 | TOTP 重置 | `station-portal user reset-totp --login <login>`：重生成种子并输出 otpauth URI/二维码；**强制该用户重新走两步登录** |
 | 限流 | 登录爆破与 TOTP 连续失败走 §2.2/§2.3 的 `429 rate_limited`（`Retry-After`） |
 
 > **口令哈希实现注（P1 skeleton）**：⚠️ P1 骨架实现暂用 Node 内置 `crypto.scrypt`（零依赖，满足「运行时依赖仅 `pg`」）；argon2id 的参数本身仍待决策者确认，切换时按自描述哈希（`algo$…$salt$hash`）平滑迁移，登录成功时对旧格式自动 rehash。
 >
-> ⚠️ 待决策者确认：TOTP 本身是否保留为**强制**（规格 §7.1 已写「强制 TOTP」，此处按已决处理，仅算法参数留待确认）；admin 数量上限是否收紧为 1。
+> **TOTP 强制范围（现状，issue #50）**：未注册 TOTP（`totp_secret` 为 NULL 或空串）的本地账号登录**口令直通建会话**，不强制第二因素（用户决策 2026-09-22，实现 d605015）；经 CLI 建号（§2.9.1/§2.9.2）与 `reset-totp`（上）一律下发种子，故这些账号仍是强制两步。表格中的「**强制**」是规格 §7.1 的设计目标，现状按本注执行（详见 §2.1）。
+>
+> ⚠️ 待决策者确认：TOTP 本身是否保留为**强制**（规格 §7.1 已写「强制 TOTP」，此处按已决处理，仅算法参数留待确认；**现状**：未注册 TOTP 的账号已口令直通，故「强制」只对已注册 TOTP 的账号成立，见上注）；admin 数量上限是否收紧为 1。
 
 ### 2.10 授权矩阵（P1）
 
@@ -918,7 +932,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 |---|---|---|---|
 | 1 | ~~Q7 portal 技术栈~~ ✅ 已定稿：(a) 零依赖 `node:http` + 原生前端（principles §4；WP1 落地） | — | 仅实现注记，**契约形状无关** |
 | 2 | `BASE_DOMAIN`（影响示例 URL 与 cookie 生效 host；当前倾向 `erix.vip`） | env §1 ⚠️ | §0 / §2.5 |
-| 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2） | env §4 / Q3 倾向 (a) | §2.1 |
+| 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2；**现状**：未注册 TOTP 的账号口令直通，见 §2.1） | env §4 / Q3 倾向 (a) | §2.1 |
 | 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
 | 5 | 任务下发 push→pull 演进 | **拉模型为终态**；push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | §6.3（`container_unreachable` 出现条件） |
 | 6 | `run.cost` 记账口径 | 依赖 Q1/Q4 | §4.1（P1 可为 `null`） |

@@ -132,6 +132,8 @@ test('两步登录：口令正确仅返回 pending_token（不发 cookie），TO
     assert.equal(body1.status, 'totp_required');
     assert.ok(body1.pending_token);
     assert.equal(step1.headers.get('set-cookie'), null); // 第一步不发 cookie
+    // issue #50：仅口令通过（尚未完成第二因素）不得写「成功登录」审计。
+    assert.equal(s.pool.audit.filter((a) => a.action === 'auth.login_success').length, 0);
 
     // 第二步：正确 TOTP
     const code = totp.totp(totpSecret);
@@ -154,6 +156,20 @@ test('两步登录：口令正确仅返回 pending_token（不发 cookie），TO
     const me = await fetch(`${s.base}/api/me`, { headers: { Cookie: `fde_session_dev=${token}` } });
     assert.equal(me.status, 200);
     assert.equal((await me.json()).user.login, 'alice');
+
+    // issue #50：TOTP 分支写一条 auth.login_success，details 不含口令/TOTP 码/session token。
+    const loginAudits = s.pool.audit.filter((a) => a.action === 'auth.login_success');
+    assert.equal(loginAudits.length, 1, 'TOTP 分支恰写一条成功登录审计');
+    assert.equal(loginAudits[0].actor_id, 'u1');
+    assert.equal(loginAudits[0].target, 'alice');
+    const auditDetails = JSON.parse(loginAudits[0].details);
+    assert.deepEqual(Object.keys(auditDetails).sort(), ['at', 'login', 'method'], 'details 只含 login/method/at');
+    assert.equal(auditDetails.login, 'alice');
+    assert.equal(auditDetails.method, 'totp');
+    assert.ok(!Number.isNaN(Date.parse(auditDetails.at)), 'at 是合法时间戳');
+    const auditJson = JSON.stringify(loginAudits[0]);
+    assert.ok(!auditJson.includes(password), '审计不含口令');
+    assert.ok(!auditJson.includes(token), '审计不含 session token');
   } finally {
     await s.close();
   }
@@ -180,6 +196,18 @@ test('未注册 TOTP（totp_secret 为 NULL）→ step1 口令直通建会话', 
     assert.ok(body.user);
     assert.equal(Object.hasOwn(body, 'pending_token'), false);
     assert.ok(step1.headers.get('set-cookie'));
+
+    // issue #50：口令直通分支写一条 auth.login_success（method 区分于 TOTP 分支）。
+    const loginAudits = s.pool.audit.filter((a) => a.action === 'auth.login_success');
+    assert.equal(loginAudits.length, 1, '口令直通分支恰写一条成功登录审计');
+    assert.equal(loginAudits[0].actor_id, 'u1');
+    assert.equal(loginAudits[0].target, 'alice');
+    const auditDetails = JSON.parse(loginAudits[0].details);
+    assert.deepEqual(Object.keys(auditDetails).sort(), ['at', 'login', 'method'], 'details 只含 login/method/at');
+    assert.equal(auditDetails.login, 'alice');
+    assert.equal(auditDetails.method, 'password_direct');
+    assert.ok(!Number.isNaN(Date.parse(auditDetails.at)), 'at 是合法时间戳');
+    assert.ok(!JSON.stringify(loginAudits[0]).includes(password), '审计不含口令');
   } finally {
     await s.close();
   }
