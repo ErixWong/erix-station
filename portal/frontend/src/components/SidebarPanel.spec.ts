@@ -149,98 +149,33 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
 });
 
 // ---------------------------------------------------------------------------
-// issue #94：会话选择入口——① 列表尾「查看全部 →」（仅 sessionsNextCursor 存在）② 固定头 🔍
+// issue #94（评审裁决瘦身版）：会话浏览入口——固定头 🔍（title「浏览会话（Ctrl/⌘+K）」）
 // ---------------------------------------------------------------------------
-describe('SidebarPanel · issue #94 会话选择入口', () => {
+describe('SidebarPanel · issue #94 会话浏览入口', () => {
   const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
 
-  it('入口①：sessionsNextCursor 为 null → 列表尾不渲染「查看全部」相关文案', async () => {
-    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] });
-    expect(wrapper.text()).not.toContain('查看全部会话');
-    expect(wrapper.text()).not.toContain('显示最近 20 个');
-  });
-
-  it('入口①：sessionsNextCursor 存在 → 渲染「显示最近 20 个」+「查看全部会话 →」，点击打开 modal（scope=cwd），选中后关闭并回传 select-session', async () => {
-    const onSelectSession = vi.fn();
-    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] }, { onSelectSession });
-    const store = useWorkbenchStore();
-    store.sessionsNextCursor = 'cursor-x'; // 截断：还有未展示的会话
-    await flushPromises();
-    expect(wrapper.text()).toContain('显示最近 20 个');
-    // modal 数据源：一条可点选的结果行
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      items: [{ id: '99', title: '目标会话', cwd: '~/projects/a', updated_at: new Date().toISOString(), active_run_id: null }],
-      next_cursor: null, total: 1,
-    }), { status: 200 })));
-    await wrapper.findAll('button').find((b) => b.text() === '查看全部会话 →')!.trigger('click');
-    await flushPromises();
-    await new Promise((r) => setTimeout(r, 20)); // composable 首屏 setTimeout(0)
-    await flushPromises();
-    const modal = wrapper.findComponent(SessionPickerModal);
-    expect(modal.exists()).toBe(true);
-    expect(modal.props('scope')).toBe('cwd');
-    expect(modal.props('cwd')).toBe('~/projects/a');
-    await modal.find('li[role="option"]').trigger('click');
-    await flushPromises();
-    expect(onSelectSession).toHaveBeenCalledWith('99'); // 复用视图层深链逻辑
-    expect(wrapper.findComponent(SessionPickerModal).exists()).toBe(false); // modal 已关闭
-  });
-
-  it('入口②：固定头 🔍 恒可见；有目录时 scope=cwd、无目录时 scope=all', async () => {
+  it('固定头 🔍 恒可见，title 为「浏览会话（Ctrl/⌘+K）」；有目录时 scope=cwd、无目录时 scope=all', async () => {
     const w1 = await mountPanel({ dirs: DIR });
-    const btn1 = w1.find('button[aria-label="查找会话"]');
+    const btn1 = w1.find('button[aria-label="浏览会话"]');
     expect(btn1.exists()).toBe(true);
+    expect(btn1.attributes('title')).toBe('浏览会话（Ctrl/⌘+K）');
     await btn1.trigger('click');
     expect(w1.findComponent(SessionPickerModal).props('scope')).toBe('cwd');
 
     const w2 = await mountPanel({ noDir: true });
-    const btn2 = w2.find('button[aria-label="查找会话"]');
+    const btn2 = w2.find('button[aria-label="浏览会话"]');
     expect(btn2.exists()).toBe(true); // 无目录也恒可见
     await btn2.trigger('click');
     expect(w2.findComponent(SessionPickerModal).props('scope')).toBe('all');
   });
-});
 
-// ---------------------------------------------------------------------------
-// issue #94：「当前会话」置顶卡——深链打开的会话不在侧栏列表时给上下文（重开语义同 #55 B4）
-// ---------------------------------------------------------------------------
-describe('SidebarPanel · issue #94 「当前会话」置顶卡', () => {
-  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
-
-  it('sessionId 在列表中 → 无置顶卡（列表卡自身以选中态高亮）', async () => {
+  it('无「查看全部会话」入口与「当前会话」置顶卡（评审裁决：已拆除）', async () => {
     const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] });
-    useWorkbenchStore().sessionId = '1';
-    await flushPromises();
+    expect(wrapper.text()).not.toContain('查看全部会话');
+    expect(wrapper.text()).not.toContain('显示最近 20 个');
     expect(wrapper.find('[data-testid="pinned-current"]').exists()).toBe(false);
-  });
-
-  it('sessionId 不在列表中 → 置顶卡存在且含标题，样式带 border-brand bg-green-50，位于列表段最顶；点击 emit select-session', async () => {
-    const onSelectSession = vi.fn();
-    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] }, { onSelectSession });
-    useWorkbenchStore().sessionId = 'deep-99'; // 深链：不在当前目录列表（如被「最近 20 个」截断）
-    await flushPromises();
-    const card = wrapper.find('[data-testid="pinned-current"]');
-    expect(card.exists()).toBe(true);
-    expect(card.text()).toContain('📌 当前会话'); // 标题
-    expect(card.classes()).toContain('border-brand'); // 复用选中态高亮
-    expect(card.classes()).toContain('bg-green-50');
-    // v-for 之外、位于列表段最顶部（其父容器即 v-else 列表容器，卡是其首个元素子节点）
-    expect(card.element.parentElement!.firstElementChild).toBe(card.element);
-    await card.trigger('click');
-    expect(onSelectSession).toHaveBeenCalledWith('deep-99'); // 重开当前会话
-  });
-
-  it('空态（暂无会话）+ 深链 sessionId → 置顶卡仍显示（可能是唯一一张卡），与空态文案共存', async () => {
-    const wrapper = await mountPanel({ dirs: DIR });
-    useWorkbenchStore().sessionId = 'deep-7';
-    await flushPromises();
-    expect(wrapper.find('[data-testid="pinned-current"]').exists()).toBe(true);
-    expect(paneEls(wrapper).list.textContent).toContain('暂无会话');
-  });
-
-  it('noDir（列表未加载）→ 不显示置顶卡', async () => {
-    const wrapper = await mountPanel({ noDir: true });
-    useWorkbenchStore().sessionId = 'deep-1';
+    // 深链会话不在列表：也不贴置顶卡（裁决：真出现不同步应修 store，不贴卡）
+    useWorkbenchStore().sessionId = 'deep-99';
     await flushPromises();
     expect(wrapper.find('[data-testid="pinned-current"]').exists()).toBe(false);
   });
