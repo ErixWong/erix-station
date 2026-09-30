@@ -15,6 +15,12 @@
 // 展示层的 sep/syserr/终稿回写通过 hooks 交给宿主（workbench store）：本 composable 只拥有
 // 协议状态（es/lastSeq/esSessionId/activeRunId/deltaText/toolCards）与事件语义。
 import { reactive, ref } from 'vue';
+import { i18n } from '../i18n';
+
+// 用户可见状态行/错误行文案（issue #101 P2）：非组件上下文（composable 无 setup 实例）→ i18n.global.t。
+// 取词即快照：状态行在事件到达时生成，切语言后旧行不回溯翻译（可接受）。
+// 注：纯英文/emoji 片段（`round 3`、` · tokens 1+2`、'tool'、'resync' 标识符）不属中文文案，保持原样。
+const t = i18n.global.t;
 
 // 具名事件全集（旧 connectEvents 的数组原样，顺序不变）。
 const EVENT_TYPES = [
@@ -117,7 +123,7 @@ export function useEventStream(hooks: EventStreamHooks) {
   function resyncEvents(why: string) {
     const id = esSessionId.value ?? undefined;
     if (!id) return;
-    hooks.onSep(`事件流需重同步（${why}），正在重连补发…`);
+    hooks.onSep(t('stream.event.resync', { why }));
     closeEs();
     connect(id, lastSeq.value);
   }
@@ -136,7 +142,7 @@ export function useEventStream(hooks: EventStreamHooks) {
     let d: Record<string, any>;
     try { d = e.data ? JSON.parse(e.data) : {}; } catch { return; } // 畸形事件忽略（§5.3）
     if (type === 'resync') {
-      resyncEvents(d.reason === 'buffer_overflow' ? '服务端缓冲溢出' : (d.reason ?? 'resync'));
+      resyncEvents(d.reason === 'buffer_overflow' ? t('stream.event.resyncBufferOverflow') : (d.reason ?? 'resync'));
       return;
     }
     dispatch(type, d);
@@ -168,9 +174,13 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'round_start':
         if (deltaText.value) { deltaText.value = null; }
         hooks.onSep(`round ${d.round}`); return;
-      case 'attempt': hooks.onSep(`round ${d.round} · 尝试 ${d.attempt}/${d.maxAttempts}`); return;
-      case 'recovering': hooks.onSep(`重试中（${d.attempt}/${d.maxAttempts}）`); return;
-      case 'recovered': hooks.onSep('重试成功'); return;
+      case 'attempt':
+        hooks.onSep(t('stream.event.attempt', { round: d.round, attempt: d.attempt, max: d.maxAttempts }));
+        return;
+      case 'recovering':
+        hooks.onSep(t('stream.event.recovering', { attempt: d.attempt, max: d.maxAttempts }));
+        return;
+      case 'recovered': hooks.onSep(t('stream.event.recovered')); return;
       case 'assistant_delta':
         if (deltaText.value === null) deltaText.value = '';
         deltaText.value += d.text ?? '';
@@ -178,7 +188,7 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'reasoning_delta': return; // 推理增量 P1 不展示
       case 'tool_call_delta': {
         if (d.tool_call_id) {
-          const card = toolCard(d.tool_call_id, d.name ?? '', '（参数流式生成中…）');
+          const card = toolCard(d.tool_call_id, d.name ?? '', t('stream.argsStreaming'));
           card.args = card.args + (d.arguments_delta ?? '');
         }
         return;
@@ -193,7 +203,11 @@ export function useEventStream(hooks: EventStreamHooks) {
         if (card) {
           card.ok = !!d.ok;
           card.dur = d.duration_ms ?? 0;
-          card.out = `${d.ok ? '✓' : '✗'} ${d.result_digest ?? ''}（${d.duration_ms ?? 0}ms）`;
+          card.out = t('stream.event.toolResult', {
+            mark: d.ok ? '✓' : '✗',
+            digest: d.result_digest ?? '',
+            ms: d.duration_ms ?? 0,
+          });
         }
         return;
       }
@@ -202,17 +216,25 @@ export function useEventStream(hooks: EventStreamHooks) {
         // （orchestrator round judge）；passThrough 挂在 intercept 类事件上
         // （checkpoint-executor，action='executed' + passThrough='on_track'|'readonly'）。
         const dec = d.decision ?? {};
-        if (d.passThrough) { hooks.onSep(`judge：放行（${d.passThrough}）`, 'judge'); return; }
+        if (d.passThrough) { hooks.onSep(t('stream.event.judgePassThrough', { mode: d.passThrough }), 'judge'); return; }
         if (dec.extend === true) {
-          hooks.onSep(`judge：扩轮${dec.plan ? ' — ' + String(dec.plan).slice(0, 80) : ''}${dec.extendReason ? '（' + String(dec.extendReason).slice(0, 60) + '）' : ''}`, 'judge');
+          hooks.onSep(t('stream.event.judgeExtend', {
+            dash: dec.plan ? t('stream.event.dash', { value: String(dec.plan).slice(0, 80) }) : '',
+            paren: dec.extendReason ? t('stream.event.paren', { value: String(dec.extendReason).slice(0, 60) }) : '',
+          }), 'judge');
           return;
         }
         if (dec.extend === false) {
-          hooks.onSep(`judge：不扩轮${dec.extendReason ? ' — ' + String(dec.extendReason).slice(0, 80) : ''}`, 'judge');
+          hooks.onSep(t('stream.event.judgeNoExtend', {
+            dash: dec.extendReason ? t('stream.event.dash', { value: String(dec.extendReason).slice(0, 80) }) : '',
+          }), 'judge');
           return;
         }
         if (d.kind === 'intercept' || d.action) {
-          hooks.onSep(`judge：${d.action ?? ''}${dec.reason ? ' — ' + dec.reason : ''}`, 'judge');
+          hooks.onSep(t('stream.event.judgeAction', {
+            action: d.action ?? '',
+            dash: dec.reason ? t('stream.event.dash', { value: dec.reason }) : '',
+          }), 'judge');
         }
         return;
       }
@@ -222,11 +244,23 @@ export function useEventStream(hooks: EventStreamHooks) {
       // 仅状态行展示，不参与运行态状态机。
       case 'compaction': {
         const c = d.compaction ?? {};
-        hooks.onSep(`上下文折叠（round ${d.round}）：${c.foldedRounds ?? 0} 轮折叠，${c.tokensBefore ?? '?'} → ${c.tokensAfter ?? '?'} tokens`);
+        hooks.onSep(t('stream.event.compaction', {
+          round: d.round,
+          folded: c.foldedRounds ?? 0,
+          before: c.tokensBefore ?? '?',
+          after: c.tokensAfter ?? '?',
+        }));
         return;
       }
-      case 'final_guard': hooks.onSep(`final guard：${d.action ?? 'unknown'}${d.reason ? ` — ${d.reason}` : ''}`); return;
-      case 'forced_final': hooks.onSep(`forced final（round ${d.round}）：${d.reason ?? ''}`); return;
+      case 'final_guard':
+        hooks.onSep(t('stream.event.finalGuard', {
+          action: d.action ?? 'unknown',
+          dash: d.reason ? t('stream.event.dash', { value: d.reason }) : '',
+        }));
+        return;
+      case 'forced_final':
+        hooks.onSep(t('stream.event.forcedFinal', { round: d.round, reason: d.reason ?? '' }));
+        return;
       case 'usage': return;
       case 'run_end': {
         // issue #89 红线：历史回放的 run_end 一律短路——绝不驱动运行态状态机
@@ -239,9 +273,12 @@ export function useEventStream(hooks: EventStreamHooks) {
           const reason = d.termination?.reason ?? '';
           const usage = d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : '';
           // issue #42：终止原因分级——failed/max_rounds_cap/aborted 红色告警，end_turn 灰色中性。
-          if (RUN_FAIL_REASONS.has(reason)) hooks.onSysErr(`run 结束：${reason}${usage}`);
-          else hooks.onSep(`run 结束：${reason === 'end_turn' ? '正常完成' : reason}${usage}`);
-          if (d.error) hooks.onSysErr(`run 失败：${d.error.code} — ${d.error.message}`);
+          if (RUN_FAIL_REASONS.has(reason)) hooks.onSysErr(t('stream.event.runEnd', { reason, usage }));
+          else hooks.onSep(t('stream.event.runEnd', {
+            reason: reason === 'end_turn' ? t('stream.event.runEndNormal') : reason,
+            usage,
+          }));
+          if (d.error) hooks.onSysErr(t('stream.event.runFailed', { code: d.error.code, message: d.error.message }));
           activeRunId.value = null;
           hooks.onCurrentRunEnd(d);
         }

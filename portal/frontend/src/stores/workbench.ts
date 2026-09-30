@@ -12,11 +12,18 @@
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
 import { api, ApiError } from '../api';
+import { i18n } from '../i18n';
 import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
 import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
+
+// 用户可见文案取词（issue #101 P2）：Pinia setup store 不是组件 setup 上下文（useI18n 会抛
+// MUST_BE_CALL_SETUP_TOP，且组件作用域 composer 语义不符），故统一走 i18n.global.t。
+// 响应式：t() 内部读取 locale 响应式 ref，故在 computed / 模板函数中取词会随切语言自动更新；
+// 错误行/通知正文属「事件发生时快照」，不回溯翻译（可接受）。
+const t = i18n.global.t;
 
 /** 目录项（GET /api/dirs）：~/projects/ 一级目录 + 跨目录运行态计数。 */
 export interface DirInfo {
@@ -115,17 +122,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const sendDisabled = computed(() => running.value || noDir.value);
   const inputPlaceholder = computed(() =>
     isPlatformAdmin.value
-      ? '平台管理员：请到管理台创建 FDE 用户与分配资源'
+      ? t('common.platformAdminHint')
       : noDir.value
-        ? '先创建目录'
-        : '输入任务，Enter 发送（Shift+Enter 换行）',
+        ? t('common.createFirstDir')
+        : t('workbench.inputPlaceholder'),
   );
   const newDirDisabled = computed(() => isPlatformAdmin.value);
   const newSessDisabled = computed(() => noDir.value || creatingSession.value);
   // 会话列表项 meta 行（● 运行中 / 本地化时间）
   function sessMeta(s: Session): string {
     return s.active_run_id
-      ? '● 运行中'
+      ? t('common.runningBadge')
       : new Date(s.updated_at ?? 0).toLocaleString('zh-CN');
   }
 
@@ -153,7 +160,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       id: m.id,
       role: m.role,
       synthetic: !!m.synthetic,
-      text: (m.synthetic ? '〔系统注入〕' : '') + m.content,
+      text: (m.synthetic ? t('workbench.systemInjection', { content: m.content }) : m.content),
       html: isMd ? renderMarkdown(m.content) : null,
     });
   }
@@ -288,7 +295,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         return;
       }
       // 评审修复：其他错误（网络/5xx）区分处理——保留 hash（可刷新重试）+ stream 区 syserr。
-      entries.value.push({ kind: 'syserr', text: '会话加载失败，可刷新重试' });
+      entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });
       return;
     }
     if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value) return;
@@ -328,7 +335,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return session;
     } catch (e) {
       if (ctx !== ctxSeq.value) return null;
-      alert('建会话失败：' + (e instanceof Error ? e.message : String(e)));
+      alert(t('errors.createSessionFailed', { message: e instanceof Error ? e.message : String(e) }));
       return null;
     } finally {
       creatingSession.value = false;
@@ -341,7 +348,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
    */
   async function createDir(name: string): Promise<{ error: string | null; session?: Session }> {
     if (!DIR_NAME_RE.test(name)) {
-      return { error: '目录名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）' };
+      return { error: t('errors.dirNameInvalid') };
     }
     const cwd = `~/projects/${name}`;
     let session: Session;
@@ -391,7 +398,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         resetSessionView(); // 深链失效：静默回退默认视图（含清 hash）
         return;
       }
-      entries.value.push({ kind: 'syserr', text: '会话加载失败，可刷新重试' });
+      entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });
       return;
     }
     // issue #84 P5：跨目录深链——会话详情带 cwd，切到其目录（磁盘推导视图必有该目录；
@@ -465,8 +472,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         kind: 'syserr',
         // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）。
         text: err?.code === 'llm_not_configured'
-          ? '发送失败：该 FDE 未配置 LLM 上游，请到管理台 /admin 配置（无权限请联系管理员）'
-          : `发送失败：${err?.message ?? e}${err?.code === 'run_in_progress' ? '（已有进行中任务）' : ''}`,
+          ? t('errors.sendFailedLlmNotConfigured')
+          : t('errors.sendFailed', { message: err?.message ?? e })
+            + (err?.code === 'run_in_progress' ? t('errors.runInProgress') : ''),
       });
     }
   }
@@ -475,9 +483,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!sessionId.value || !es.activeRunId.value) return;
     try {
       await api(`/api/sessions/${encodeURIComponent(sessionId.value)}/stop`, { method: 'POST', body: '{}' });
-      entries.value.push({ kind: 'sep', text: '已请求停止…' });
+      entries.value.push({ kind: 'sep', text: t('workbench.stopRequested') });
     } catch (e) {
-      alert('停止失败：' + (e instanceof Error ? e.message : String(e)));
+      alert(t('errors.stopFailed', { message: e instanceof Error ? e.message : String(e) }));
     }
   }
 
@@ -500,12 +508,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
       if (!document.hidden) return;
       const sess = sessions.value.find((s) => String(s.id) === String(sessionId.value));
-      const title = sess?.title || '未命名会话';
+      const title = sess?.title || t('common.unnamedSession');
       const reason = d.termination?.reason ?? '';
       const failed = RUN_FAIL_REASONS.has(reason) || !!d.error;
       const body = d.error
-        ? `运行失败：${d.error.code} — ${d.error.message}`
-        : failed ? `运行结束：${reason}` : '运行完成';
+        ? t('workbench.notifyFailed', { code: d.error.code, message: d.error.message })
+        : failed ? t('workbench.notifyEnded', { reason }) : t('workbench.notifyDone');
       const n = new Notification(`FDE Station · ${title}`, { body });
       n.onclick = () => { window.focus(); n.close(); };
     } catch { /* 构造通知可能抛错（非安全上下文等）：静默忽略 */ }
