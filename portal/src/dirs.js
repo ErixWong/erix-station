@@ -162,3 +162,106 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
   });
   return { entries };
 }
+
+/**
+ * GET /api/file?cwd=<相对cwd>&path=<相对路径> → 单文件只读预览 { name, path, kind, data }。
+ * P6（issue #84）文件面板点击预览第一版：文本/Markdown/图片；git 变更标记与 run 终态
+ * 刷新不在本版范围。
+ * 牢笼校验与 fileTree 同口径（安全红线）：cwd 形态 → root 真实目录且非 symlink →
+ * 解析后 containment 检查（拒 .. / 绝对路径逃逸）→ 逐段 lstat 拒 symlink（防 bind mount 内
+ * 用户自建 symlink 把文件内容泄漏到 jail 外）→ 目标必须是非 symlink 的普通文件。
+ * 大小上限 FILE_PREVIEW_MAX_BYTES（超限 413 报错不截断）；非图片按「前 8KB 嗅探 NUL 字节」
+ * 判二进制，二进制明确拒绝（不猜测解码乱码）。
+ */
+export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } = {}) {
+  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
+  let safeCwd;
+  try {
+    safeCwd = validateSessionCwd(cwd); // 400 validation_failed（形态不合法 / . / ..）
+  } catch (err) {
+    if (err instanceof DirError) throw err;
+    throw new DirError(err.code ?? 'validation_failed', err.message, {
+      httpStatus: err.httpStatus ?? 400,
+      details: err.details,
+    });
+  }
+  const name = CWD_RE.exec(safeCwd)[1];
+  const root = path.resolve(userSpaceRoot, fdeName, 'projects', name);
+
+  // 根必须真实存在且不是 symlink（与 fileTree 同口径）。
+  let rootSt;
+  try {
+    rootSt = fs.lstatSync(root);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
+    }
+    throw err;
+  }
+  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) {
+    throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
+  }
+
+  if (typeof relPath !== 'string' || relPath.length === 0 || relPath === '.') {
+    throw new DirError('validation_failed', 'path 必须指向具体文件', { details: { field: 'path' } });
+  }
+  const target = path.resolve(root, relPath);
+  if (target !== root) {
+    const rel = path.relative(root, target);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
+    }
+  }
+
+  // 逐段 lstat（不跟随 symlink）：任何已存在段是 symlink → 拒绝（同 fileTree）。
+  const rel = path.relative(root, target);
+  let cur = root;
+  for (const seg of rel.split(path.sep)) {
+    cur = path.join(cur, seg);
+    let st;
+    try {
+      st = fs.lstatSync(cur);
+    } catch (err) {
+      if (err?.code === 'ENOENT') {
+        throw new DirError('not_found', 'file not found', { httpStatus: 404 });
+      }
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new DirError('validation_failed', 'path 含符号链接，拒绝读取', { details: { field: 'path' } });
+    }
+  }
+
+  const st = fs.lstatSync(target);
+  if (!st.isFile()) {
+    throw new DirError('validation_failed', 'path 必须是文件', { details: { field: 'path' } });
+  }
+  if (st.size > FILE_PREVIEW_MAX_BYTES) {
+    throw new DirError('file_too_large', `文件超过预览上限（${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB）`, {
+      httpStatus: 413,
+    });
+  }
+
+  const ext = path.extname(target).toLowerCase();
+  const buf = fs.readFileSync(target);
+  const mime = IMAGE_MIME[ext];
+  if (mime) {
+    // 图片：base64 data URL（SVG 经 <img> 加载不执行脚本，安全口径与浏览器一致）。
+    return { name: path.basename(target), path: rel, kind: 'image', data: `data:${mime};base64,${buf.toString('base64')}` };
+  }
+  // 非图片：前 8KB NUL 嗅探判二进制（UTF-8 文本不可能含 NUL；二进制不猜测解码）。
+  const head = buf.subarray(0, 8192);
+  if (head.includes(0)) {
+    throw new DirError('unsupported_file_type', '二进制文件不支持预览', { httpStatus: 415 });
+  }
+  return { name: path.basename(target), path: rel, kind: 'text', data: buf.toString('utf8') };
+}
+
+/** 预览单文件大小上限（P6 issue #84）：超限报错而非截断，防误点大文件把 portal 内存打爆。 */
+export const FILE_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+
+/** 图片扩展名 → data URL MIME（图片走 base64 data URL，前端 <img> 直接渲染，零新端点）。 */
+const IMAGE_MIME = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
+};
