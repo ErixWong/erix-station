@@ -9,5 +9,8 @@
   },
   "dependencies": {
     "erix-agent": "0.10.0"
+  },
+  "scripts": {
+    "test": "node --test"
   }
 }
