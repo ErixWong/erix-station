@@ -389,6 +389,9 @@ async function routeApi(req, res, ctx, url) {
   if (pathname === '/api/files/tree' && req.method === 'GET') {
     return handleFileTree(req, res, ctx, url);
   }
+  if (pathname === '/api/file' && req.method === 'GET') {
+    return handleFilePreview(req, res, ctx, url);
+  }
 
   // ---- 项目与端口（portal.md §3；P5：写路径退役，projects 表留档只读） ----
   if (pathname === '/api/projects') {
@@ -1276,6 +1279,18 @@ async function handleFileTree(req, res, ctx, url) {
     fdeName: session.user.fde_name,
     cwd: url.searchParams.get('cwd'),
     relPath: url.searchParams.get('path') ?? '.',
+  });
+  return sendJson(res, 200, result);
+}
+
+/** 单文件只读预览（P6 issue #84）：?cwd=<相对cwd>&path=<相对路径>；牢笼校验见 dirs.readFilePreview。 */
+async function handleFilePreview(req, res, ctx, url) {
+  const session = await requireSession(req, ctx);
+  const result = await dirs.readFilePreview({
+    userSpaceRoot: ctx.config.userSpaceRoot,
+    fdeName: session.user.fde_name,
+    cwd: url.searchParams.get('cwd'),
+    relPath: url.searchParams.get('path') ?? '',
   });
   return sendJson(res, 200, result);
 }
