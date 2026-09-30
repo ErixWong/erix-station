@@ -2,13 +2,17 @@
 // 目录树面板（issue #84 P5.4，设计文档 §4 左下段）：默认收起（▸ 目录树）；展开后按
 // GET /api/files/tree?cwd=&path= 懒加载单层列表——初始只有根一层，点某目录项展开下一层；
 // 不跨刷新记忆，reload()（↻ 按钮路径）后回到全折叠；切换 cwd 时树自动归位。
-// 根 = 选中目录（= 会话 cwd = jail root，三锚合一）；节点点击暂无动作（P6 预览后补）。
+// 根 = 选中目录（= 会话 cwd = jail root，三锚合一）；P6（issue #84）：文件节点点击 emit
+// file-click（相对路径），由 SidebarPanel 打开 FilePreviewModal；目录节点维持折叠语义不变。
 import { ref, shallowReactive, watch } from 'vue';
 import { api } from '../api';
 import type { TreeEntry } from '../lib/tree';
 import DirTreeNode from './DirTreeNode.vue';
 
 const props = defineProps<{ cwd: string | null }>();
+const emit = defineEmits<{
+  (e: 'file-click', path: string): void; // 文件节点相对路径（嵌套为 a/b/c）
+}>();
 
 const open = ref(false); // 面板展开开关（默认收起）
 const childMap = shallowReactive(new Map<string, TreeEntry[]>()); // pathKey → 单层条目
@@ -41,6 +45,11 @@ function toggleNode(pathKey: string) {
   }
   expandedSet.add(pathKey);
   if (!childMap.has(pathKey)) void load(pathKey);
+}
+
+/** 文件节点点击：emit 相对路径（P6 预览，父级 SidebarPanel 打开 modal）。 */
+function fileClick(pathKey: string) {
+  emit('file-click', pathKey);
 }
 
 /** ↻ 双刷之一：清缓存与展开态（全折叠）；面板若开着则重载根层。SidebarPanel 经 ref 调用。 */
@@ -82,6 +91,7 @@ watch(open, (v) => { if (v && !childMap.has('') && !loadingSet.has('')) void loa
           :expanded-set="expandedSet"
           :loading-set="loadingSet"
           :toggle-node="toggleNode"
+          :file-click="fileClick"
         />
       </template>
     </div>
