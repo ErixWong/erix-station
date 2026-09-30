@@ -6,8 +6,13 @@
 //   PUT 保存；409 active_run_conflict → 展示服务端原因 + 「确认无影响，强制保存」显式确认
 //   （点击才带 force=true 重试，绝不静默 force）；provision 容器按钮。
 import { computed, onMounted, ref, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { api, ApiError } from '../api';
 import type { AdminUser, LlmModel, LlmProvider } from '../stores/admin';
+
+// issue #101 P3：pane 文案走 i18n（admin.llm.*）；服务端透传的 error.message 不译，
+// 仅前缀（「错误：」/「已拒绝（409）：」）走 t()。
+const { t } = useI18n();
 
 const props = defineProps<{
   user: AdminUser;
@@ -45,7 +50,9 @@ const conflictMsg = ref(''); // 409 拒绝原因（旧 submitLlm 的显式确认
 const showForce = ref(false); // 「确认无影响，强制保存」按钮可见性
 
 // 旧 keyhint：已配置 xxx，重输以修改 / 首次配置必填。
-const keyHint = computed(() => (cfg.value?.api_key ? `已配置 ${cfg.value.api_key}，重输以修改` : '首次配置必填'));
+const keyHint = computed(() => (cfg.value?.api_key
+  ? t('admin.llm.keyConfigured', { key: cfg.value.api_key })
+  : t('admin.llm.keyFirstTime')));
 
 // 当前供应商下启用中的模型（旧 ms = (p?.models ?? []).filter((m) => m.enabled)）。
 const enabledModels = computed<LlmModel[]>(() => {
@@ -67,7 +74,7 @@ async function loadPane() {
     providerId.value = data.config?.provider_id ?? '';
     fillModelSelects();
   } catch (e) {
-    loadErr.value = '错误：' + (e instanceof Error ? e.message : String(e));
+    loadErr.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));
   } finally {
     loading.value = false;
   }
@@ -122,7 +129,8 @@ async function submitLlm(force: boolean) {
       body: JSON.stringify(body),
     });
     cfg.value = r.config;
-    okMsg.value = `已保存：主模型 ${r.config.main.model_id}` + (r.config.api_key ? `（key ${r.config.api_key}）` : '');
+    okMsg.value = t('admin.llm.saved', { model: r.config.main.model_id })
+      + (r.config.api_key ? t('admin.llm.savedKeySuffix', { key: r.config.api_key }) : '');
     errMsg.value = '';
     conflictMsg.value = ''; // 旧版成功即清空消息区（含 409 拒绝与强制按钮）
     showForce.value = false;
@@ -130,11 +138,11 @@ async function submitLlm(force: boolean) {
   } catch (err) {
     if (err instanceof ApiError && err.code === 'active_run_conflict' && !force) {
       // 服务端拒绝 → 展示原因 + 显式确认按钮（点击才算知情，才带 force=true 重试）。
-      conflictMsg.value = '已拒绝（409）：' + err.message;
+      conflictMsg.value = t('admin.llm.conflictPrefix') + err.message;
       showForce.value = true;
       return;
     }
-    errMsg.value = '错误：' + (err instanceof Error ? err.message : String(err));
+    errMsg.value = t('admin.errorPrefix') + (err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -146,9 +154,9 @@ async function onProvision() {
       method: 'POST',
       body: '{}',
     });
-    okMsg.value = `provision 完成：${r.container}（${r.network} ${r.subnet}）`;
+    okMsg.value = t('admin.llm.provisionDone', { container: r.container, network: r.network, subnet: r.subnet });
   } catch (e) {
-    errMsg.value = '错误：' + (e instanceof Error ? e.message : String(e));
+    errMsg.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -156,18 +164,18 @@ onMounted(loadPane);
 </script>
 
 <template>
-  <p v-if="loading" class="muted">加载 LLM 配置…</p>
+  <p v-if="loading" class="muted">{{ t('admin.llm.loadingPane') }}</p>
   <p v-else-if="loadErr" class="syserr">{{ loadErr }}</p>
   <template v-else>
     <!-- 活跃 run 告警盒（旧 .warnbox 语义） -->
     <div
       v-if="activeRun"
       class="my-2 rounded-lg border border-amber-500 bg-amber-50 px-3 py-2 text-[0.83rem] text-amber-800"
-    >⚠️ 有活跃 run：更换供应商或 API key 会被服务端拒绝（影响进行中的 run）；纯模型变更不受影响。</div>
+    >{{ t('admin.llm.activeRunWarn') }}</div>
 
     <form class="mt-2 grid gap-2" style="grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr))" @submit.prevent="submitLlm(false)">
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        供应商
+        {{ t('admin.llm.providerLabel') }}
         <select
           v-model="providerId"
           data-test="provider-select"
@@ -177,39 +185,41 @@ onMounted(loadPane);
         </select>
       </label>
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        API Key（<span data-test="key-hint">{{ keyHint }}</span>）
+        <i18n-t keypath="admin.llm.apiKeyLabel" scope="global">
+          <template #hint><span data-test="key-hint">{{ keyHint }}</span></template>
+        </i18n-t>
         <input
           v-model="apiKey"
           type="password"
           autocomplete="new-password"
-          :placeholder="cfg?.api_key ? '留空 = 保持不变' : ''"
+          :placeholder="cfg?.api_key ? t('admin.llm.keyPlaceholder') : ''"
           class="rounded-md border border-black/20 px-2 py-1 text-sm"
         >
       </label>
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        主模型（text · tool_calling）
+        {{ t('admin.llm.mainModelLabel') }}
         <select v-model="mainModelId" data-test="main-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
-          <option value="">（不配置）</option>
+          <option value="">{{ t('admin.llm.notConfigured') }}</option>
           <option v-for="m in mainOptions" :key="m.id" :value="m.id">{{ m.model_id }} — {{ m.name }}</option>
         </select>
       </label>
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        Embedding（可空）
+        {{ t('admin.llm.embeddingLabel') }}
         <select v-model="embeddingModelId" data-test="embedding-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
-          <option value="">（不配置）</option>
+          <option value="">{{ t('admin.llm.notConfigured') }}</option>
           <option v-for="m in embeddingOptions" :key="m.id" :value="m.id">{{ m.model_id }} — {{ m.name }}</option>
         </select>
       </label>
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        Vision（可空）
+        {{ t('admin.llm.visionLabel') }}
         <select v-model="visionModelId" data-test="vision-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
-          <option value="">（不配置）</option>
+          <option value="">{{ t('admin.llm.notConfigured') }}</option>
           <option v-for="m in visionOptions" :key="m.id" :value="m.id">{{ m.model_id }} — {{ m.name }}</option>
         </select>
       </label>
       <div class="flex items-end gap-2">
-        <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">保存 LLM 配置</button>
-        <button type="button" class="rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="onProvision">provision 容器</button>
+        <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.save') }}</button>
+        <button type="button" class="rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="onProvision">{{ t('admin.llm.provision') }}</button>
       </div>
     </form>
 
@@ -225,7 +235,7 @@ onMounted(loadPane);
           data-test="force-save"
           class="rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
           @click="submitLlm(true)"
-        >确认无影响，强制保存</button>
+        >{{ t('admin.llm.forceSave') }}</button>
       </template>
     </div>
   </template>
