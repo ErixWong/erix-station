@@ -4,6 +4,7 @@
 //   列表内直开 / 跨项目切项目后打开（写回深链）/ 404 静默回退清路由 / 其他错误保留路由 + 报错。
 // popstate（前进/后退）由 vue-router hash 模式驱动路由参数变化 → 本组件 watcher 等价旧 popstate 处理器。
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
@@ -13,7 +14,10 @@ import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
+import LocaleSwitch from '../components/LocaleSwitch.vue';
 
+// issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
@@ -23,10 +27,13 @@ const store = useWorkbenchStore();
 const sidebar = useSidebarWidth();
 
 // 旧 who 文案：`login（role / fde_name）`，无 fde_name 时只显示 role。
+// issue #101 P2：括号形态随语言（zh 全角 / en 半角），两种形态各一个 key（模板插值）。
 const who = computed(() => {
   const u = auth.user;
   if (!u) return '';
-  return `${u.login}（${u.role}${u.fde_name ? ' / ' + u.fde_name : ''}）`;
+  return u.fde_name
+    ? t('workbench.who', { login: u.login, role: u.role, fde: u.fde_name })
+    : t('workbench.whoNoFde', { login: u.login, role: u.role });
 });
 
 // ---- 路由钩子注入（store 保持 router 无关，便于单测）----
@@ -149,24 +156,25 @@ function jumpToLatest() {
     <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 md:hidden"
-        aria-label="打开导航"
+        :aria-label="t('workbench.openNavigation')"
         @click="drawerOpen = !drawerOpen"
-      >☰ 导航</button>
+      >{{ t('workbench.nav') }}</button>
       <h1 class="text-xl font-medium">FDE Station</h1>
       <!-- issue #84 P5.4：cwd 徽标（📁 短名；hover 显示全路径；点击复制） -->
       <button
         v-if="store.dirCwd"
         type="button"
         class="rounded-md border border-black/10 px-2 py-0.5 text-sm hover:bg-black/5"
-        :title="`${store.dirCwd}（点击复制）`"
+        :title="t('workbench.cwdCopyTitle', { cwd: store.dirCwd })"
         @click="copyCwd"
-      >📁 {{ dirShortName }}<span v-if="copied" class="text-black/40"> 已复制</span></button>
+      >📁 {{ dirShortName }}<span v-if="copied" class="text-black/40"> {{ t('common.copied') }}</span></button>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
-      <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">管理台</router-link>
+      <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">{{ t('common.adminConsole') }}</router-link>
+      <LocaleSwitch />
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
         @click="onLogout"
-      >登出</button>
+      >{{ t('common.logout') }}</button>
     </header>
 
     <main class="flex flex-1 min-h-0">
@@ -195,7 +203,7 @@ function jumpToLatest() {
         :class="sidebar.dragging.value ? 'bg-brand/60' : 'bg-black/10 hover:bg-brand/40'"
         role="separator"
         aria-orientation="vertical"
-        aria-label="调整侧栏宽度"
+        :aria-label="t('workbench.resizeSidebar')"
         :aria-valuenow="sidebar.width.value"
         :aria-valuemin="SIDEBAR_MIN"
         :aria-valuemax="SIDEBAR_MAX"
@@ -224,7 +232,7 @@ function jumpToLatest() {
           type="button"
           class="absolute right-4 bottom-24 z-10 rounded-full border border-black/10 bg-white px-3 py-1.5 text-sm shadow text-brand"
           @click="jumpToLatest"
-        >↓ 最新</button>
+        >{{ t('workbench.toLatest') }}</button>
       </section>
     </main>
   </div>

@@ -21,6 +21,7 @@ import {
 import WorkbenchView from '../views/WorkbenchView.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
+import { i18n, setLocale } from '../i18n';
 
 // ---- jsdom 指针事件补齐：setPointerCapture 等不存在，打桩为可断言的 spy ----
 let captureSpy: ReturnType<typeof vi.fn>;
@@ -28,6 +29,8 @@ let releaseSpy: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   localStorage.clear();
+  // issue #101 P2：WorkbenchView 内 useI18n() 需要装配真实 i18n 单例，每例固定 zh-CN。
+  setLocale('zh-CN');
   captureSpy = vi.fn();
   releaseSpy = vi.fn();
   Element.prototype.setPointerCapture = captureSpy as (pointerId: number) => void;
@@ -251,7 +254,7 @@ describe('WorkbenchView · 把手集成（aside 兄弟元素 + aria + 宽度绑�
     // 无目录空态：/api/dirs 返回空，initWorkspace 提前返回，不触其余 API
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify({ dirs: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
-    const wrapper = mount(WorkbenchView, { global: { plugins: [pinia, router] } });
+    const wrapper = mount(WorkbenchView, { global: { plugins: [pinia, router, i18n] } });
     await flushPromises();
     return wrapper;
   }
