@@ -75,7 +75,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const dirs = ref<DirInfo[]>([]);
   const dirCwd = ref<string | null>(null); // 选中目录（页面级状态）
   const sessions = ref<Session[]>([]);
-  const sessionsNextCursor = ref<string | null>(null); // issue #94：存在 → 侧栏渲染「查看全部 →」
   const sessionId = ref<string | null>(null);
   const noDir = ref(false);
   const projectReqSeq = ref(0); // 迟到响应丢弃（快速 A→B 切换）
@@ -218,18 +217,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     noDir.value = dirs.value.length === 0;
   }
 
-  // issue #94：侧栏列表默认截断 20（显式传 limit，便于「查看全部 →」入口依据 next_cursor 显隐）。
-  async function loadSessions(opts: { limit?: number } = { limit: 20 }) {
+  // 侧栏列表：后端默认 limit=20（评审裁决瘦身：不显式传参，无「查看全部」入口）。
+  async function loadSessions(): Promise<void> {
     // 评审 LOW-3：请求序号守卫——快速 A→B 切换时，A 的迟到响应不得覆盖 B 的会话列表。
     const reqSeq = ++projectReqSeq.value;
     const qs = new URLSearchParams({ cwd: dirCwd.value! });
-    // issue #94：侧栏显式 limit=20（截断语义）；响应 next_cursor 存在才渲染「查看全部 →」。
-    if (opts.limit) qs.set('limit', String(opts.limit));
-    const data = await api<{ items?: Session[]; next_cursor?: string | null }>(`/api/sessions?${qs.toString()}`);
+    const data = await api<{ items?: Session[] }>(`/api/sessions?${qs.toString()}`);
     if (reqSeq !== projectReqSeq.value) return; // 过期响应：dirCwd 已变，丢弃
     // 防御性客户端过滤：后端按 cwd 过滤为准；响应带 cwd 时二次对齐（契约差异期双保险）。
     sessions.value = (data.items ?? []).filter((s) => !s.cwd || s.cwd === dirCwd.value);
-    sessionsNextCursor.value = data.next_cursor ?? null;
   }
 
   async function selectDir(cwd: string, opts: { loadSessions?: boolean } = {}) {
@@ -248,7 +244,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearExpandedToolCalls();
     renderedIds.value = null;
     sessions.value = [];
-    sessionsNextCursor.value = null;
     // 评审修复：与 resetSessionView 对齐的状态复位（旧版同时复位自动跟随/「↓ 最新」/抽屉——
     // 这三项属视图层，由 WorkbenchView 监听 dirCwd/sessionId 变化处理）。
     streamDefaultText();
@@ -372,7 +367,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearExpandedToolCalls();
     renderedIds.value = null;
     sessions.value = [];
-    sessionsNextCursor.value = null;
     streamDefaultText();
     // 目录列表兜底补齐（服务端 mkdir 后该目录必然存在于磁盘，正常路径 loadDirs 也能看到）。
     if (!dirs.value.some((d) => d.cwd === cwd)) {
@@ -519,7 +513,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   return {
     // state
-    dirs, dirCwd, sessions, sessionsNextCursor, sessionId, noDir,
+    dirs, dirCwd, sessions, sessionId, noDir,
     entries, renderedIds, inputValue, creatingSession, isPlatformAdmin,
     drafts, es,
     // computed

@@ -68,7 +68,7 @@ async function onLogout() {
   router.replace('/login');
 }
 
-// ---- issue #94：顶栏查找会话（入口③：scope='all' 跨目录找回）+ Ctrl/⌘+K 全局快捷键 ----
+// ---- issue #94：Ctrl/⌘+K 全局快捷键打开会话浏览（scope='all' 跨目录找回）----
 const pickerOpen = ref(false);
 function onGlobalKeydown(e: KeyboardEvent) {
   // 组合键判定：Ctrl/⌘+K 且非输入法组合（e.isComposing）——普通键入不经此拦截，不与输入框冲突
@@ -161,14 +161,6 @@ function jumpToLatest() {
         :title="`${store.dirCwd}（点击复制）`"
         @click="copyCwd"
       >📁 {{ dirShortName }}<span v-if="copied" class="text-black/40"> 已复制</span></button>
-      <!-- issue #94 入口③：顶栏查找会话（scope=all 跨目录找回；Ctrl/⌘+K 同语义） -->
-      <button
-        type="button"
-        title="查找会话（Ctrl/⌘+K）"
-        aria-label="查找会话"
-        class="rounded-md border border-black/20 px-2 py-1 text-sm hover:bg-black/5"
-        @click="pickerOpen = true"
-      >🔍</button>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">管理台</router-link>
       <button
@@ -218,7 +210,7 @@ function jumpToLatest() {
           <StreamPanel />
         </div>
         <ComposerBar />
-        <!-- issue #94：会话选择 modal（入口③，scope='all'） -->
+        <!-- issue #94：会话选择 modal（Ctrl/⌘+K，scope='all'） -->
         <SessionPickerModal
           v-if="pickerOpen"
           scope="all"
