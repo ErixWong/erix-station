@@ -1060,6 +1060,7 @@ async function handleLoginStep1(req, res, ctx) {
       userAgent: req.headers['user-agent'] ?? null,
       ttlSeconds: config.sessionTtlSeconds,
     });
+    await auditLoginSuccess(pool, result.user, 'password_direct');
     return sendJson(res, 200, { status: 'authenticated', user: result.user }, {
       'Set-Cookie': sessionCookieHeader(config.cookie, session.token),
     });
@@ -1140,8 +1141,26 @@ async function handleLoginTotp(req, res, ctx) {
     userAgent: req.headers['user-agent'] ?? null,
     ttlSeconds: config.sessionTtlSeconds,
   });
+  await auditLoginSuccess(pool, result.user, 'totp');
   const cookieHeader = sessionCookieHeader(config.cookie, session.token);
   return sendJson(res, 200, { user: result.user }, { 'Set-Cookie': cookieHeader });
+}
+
+/**
+ * 成功登录审计（`audit_log.action='auth.login_success'`）：两个成功分支各写一条——
+ * `password_direct`（未注册 TOTP，口令直通）与 `totp`（第二因素校验通过）。
+ * details 只记 login / method / at，**不含口令、TOTP 码、session token 等敏感字段**。
+ * best-effort（同 §2.7 forward-auth 审计口径）：审计写失败不阻断已成功的登录。
+ */
+async function auditLoginSuccess(pool, user, method) {
+  await auth
+    .audit(pool, {
+      actorId: user.id,
+      action: 'auth.login_success',
+      target: user.login,
+      details: { login: user.login, method, at: new Date().toISOString() },
+    })
+    .catch(() => {});
 }
 
 /** 要求有效 session（除登录/forward-auth 外所有公开端点）。 */
