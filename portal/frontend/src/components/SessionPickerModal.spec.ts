@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import SessionPickerModal from './SessionPickerModal.vue';
+import { i18n, setLocale } from '../i18n';
 
 interface BodyItem {
   id: string;
@@ -38,11 +39,15 @@ function mountModal(
 ) {
   return mount(SessionPickerModal, {
     props: { scope: props.scope ?? 'cwd', cwd: props.cwd ?? '~/projects/demo', ...handlers },
+    global: { plugins: [i18n] }, // issue #101 P2：装配真实 i18n 单例（组件内 useI18n()）
     attachTo: document.body, // 焦点断言需要真实挂载
   });
 }
 
 beforeEach(() => {
+  // 每例重置语言为 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
   vi.stubGlobal('fetch', vi.fn(async () => okBody()));
 });
 
@@ -177,5 +182,70 @@ describe('SessionPickerModal（issue #94 评审裁决瘦身版）', () => {
     expect(wrapper.text()).not.toContain('共 2 个会话');
     expect(wrapper.text()).not.toContain('加载更多');
     wrapper.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #101 P2：会话浏览 modal 用户可见文案走 i18n（zh-CN 基线逐字不变，切 en 即时生效）
+// ---------------------------------------------------------------------------
+describe('SessionPickerModal · i18n（issue #101 P2）', () => {
+  it('zh-CN 基线：dialog 标签 / 范围分段 / 空态 / 重试 / 未命名会话 / 运行中徽标', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okBody([])));
+    const wrapper = mountModal();
+    await tick();
+    const dialog = wrapper.get('[role="dialog"]');
+    expect(dialog.attributes('aria-label')).toBe('浏览会话');
+    expect(wrapper.get('[role="group"]').attributes('aria-label')).toBe('会话范围');
+    expect(wrapper.text()).toContain('当前目录：demo');
+    expect(wrapper.text()).toContain('全部目录');
+    expect(wrapper.get('ul[role="listbox"]').attributes('aria-label')).toBe('会话列表');
+    expect(wrapper.text()).toContain('该范围暂无会话');
+    expect(wrapper.find('button[aria-label="关闭"]').exists()).toBe(true);
+    wrapper.unmount();
+
+    // 结果行：有活跃 run → 「● 运行中」
+    vi.stubGlobal('fetch', vi.fn(async () => okBody()));
+    const w2 = mountModal();
+    await tick();
+    expect(w2.text()).toContain('部署脚本');
+    expect(w2.text()).toContain('● 运行中');
+    w2.unmount();
+
+    // 失败态：错误（服务端 message）+「（旧列表已保留）」+「重试」
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })));
+    const w3 = mountModal();
+    await tick();
+    expect(w3.get('[role="alert"]').text()).toContain('（旧列表已保留）');
+    expect(w3.text()).toContain('重试');
+    w3.unmount();
+  });
+
+  it('切 English：标签/分段/空态/重试/徽标/未命名会话即时变英文', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okBody([
+      { id: 's1', cwd: '~/projects/demo', updated_at: T0, active_run_id: 'r1' },
+    ])));
+    const wrapper = mountModal({ scope: 'all' });
+    await tick();
+    expect(wrapper.text()).toContain('未命名会话');
+
+    setLocale('en');
+    await flushPromises();
+
+    expect(wrapper.get('[role="dialog"]').attributes('aria-label')).toBe('Browse sessions');
+    expect(wrapper.get('[role="group"]').attributes('aria-label')).toBe('Session scope');
+    expect(wrapper.text()).toContain('Current directory: demo');
+    expect(wrapper.text()).toContain('All directories');
+    expect(wrapper.get('ul[role="listbox"]').attributes('aria-label')).toBe('Session list');
+    expect(wrapper.text()).toContain('Untitled session');
+    expect(wrapper.text()).toContain('● Running');
+    wrapper.unmount();
+
+    // 空态 + 关闭 aria-label
+    vi.stubGlobal('fetch', vi.fn(async () => okBody([])));
+    const w2 = mountModal();
+    await tick();
+    expect(w2.text()).toContain('No sessions in this scope');
+    expect(w2.find('button[aria-label="Close"]').exists()).toBe(true);
+    w2.unmount();
   });
 });

@@ -7,7 +7,11 @@
 // 键盘 ↑↓ 高亮、Enter 进入、Esc 关闭；焦点进 dialog 容器并归还触发按钮；
 // dialog 语义（role/aria-modal）；移动端 max-md 全屏层锁背景滚动，桌面居中 dialog。
 import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { useSessionBrowser, type PickerSession } from '../composables/useSessionBrowser';
+
+// issue #101 P2：用户可见文案走 i18n（picker.* / common.*）。
+const { t } = useI18n();
 
 const props = withDefaults(defineProps<{ scope: 'cwd' | 'all'; cwd?: string }>(), { cwd: undefined });
 const emit = defineEmits<{
@@ -80,31 +84,31 @@ const abs = (iso?: string) => new Date(iso ?? 0).toLocaleString('zh-CN');
       ref="dialogEl"
       role="dialog"
       aria-modal="true"
-      aria-label="浏览会话"
+      :aria-label="t('picker.title')"
       tabindex="-1"
       class="absolute inset-x-0 top-10 bottom-0 flex flex-col bg-white shadow-xl outline-none max-md:rounded-t-lg md:inset-auto md:left-1/2 md:top-1/2 md:bottom-auto md:w-[32rem] md:max-h-[72vh] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-lg"
     >
       <!-- 头：范围 segmented（恒可改）+ 关闭 -->
       <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
-        <div class="flex min-w-0 rounded-md border border-black/20 text-sm" role="group" aria-label="会话范围">
+        <div class="flex min-w-0 rounded-md border border-black/20 text-sm" role="group" :aria-label="t('picker.scopeLabel')">
           <button
             type="button"
             class="min-w-0 truncate rounded-l-md px-2 py-1 disabled:opacity-40"
             :class="scope === 'cwd' ? 'bg-brand text-white' : 'hover:bg-black/5'"
             :disabled="!cwd"
-            :title="cwd ? `当前目录：${cwd}` : '未选择目录'"
+            :title="cwd ? t('picker.currentDirTitle', { cwd }) : t('picker.noDirSelected')"
             @click="scope = 'cwd'"
-          >当前目录：{{ dirShortName || '—' }}</button>
+          >{{ t('picker.currentDir', { name: dirShortName || '—' }) }}</button>
           <button
             type="button"
             class="rounded-r-md border-l border-black/20 px-2 py-1"
             :class="scope === 'all' ? 'bg-brand text-white' : 'hover:bg-black/5'"
             @click="scope = 'all'"
-          >全部目录</button>
+          >{{ t('picker.allDirs') }}</button>
         </div>
         <button
           type="button"
-          aria-label="关闭"
+          :aria-label="t('common.close')"
           class="ml-auto shrink-0 rounded-md px-2 py-1 text-sm hover:bg-black/5"
           @click="emit('close')"
         >✕</button>
@@ -112,7 +116,7 @@ const abs = (iso?: string) => new Date(iso ?? 0).toLocaleString('zh-CN');
 
       <!-- 结果列表：独立滚动（单次全量，无分页） -->
       <div class="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-        <ul role="listbox" aria-label="会话列表">
+        <ul role="listbox" :aria-label="t('picker.listLabel')">
           <li
             v-for="(s, i) in items"
             :key="String(s.id)"
@@ -124,25 +128,25 @@ const abs = (iso?: string) => new Date(iso ?? 0).toLocaleString('zh-CN');
             @mouseenter="activeIndex = i"
           >
             <div class="flex items-baseline gap-2">
-              <span class="truncate">{{ s.title || '未命名会话' }}</span>
-              <span v-if="s.active_run_id" class="shrink-0 text-xs text-brand">● 运行中</span>
+              <span class="truncate">{{ s.title || t('common.unnamedSession') }}</span>
+              <span v-if="s.active_run_id" class="shrink-0 text-xs text-brand">{{ t('common.runningBadge') }}</span>
             </div>
             <div class="text-xs text-black/50">
-              <span v-if="scope === 'all'">{{ s.cwd?.split('/').pop() ?? '（无目录）' }} · </span>{{ abs(s.updated_at) }}
+              <span v-if="scope === 'all'">{{ s.cwd?.split('/').pop() ?? t('common.noDir') }} · </span>{{ abs(s.updated_at) }}
             </div>
           </li>
         </ul>
 
         <!-- 三态：加载中 / 无结果 / 失败（保留旧列表 + 重试） -->
-        <p v-if="loading" class="muted py-4 text-center text-sm">加载中…</p>
-        <p v-else-if="empty" class="muted py-6 text-center text-sm">该范围暂无会话</p>
+        <p v-if="loading" class="muted py-4 text-center text-sm">{{ t('common.loading') }}</p>
+        <p v-else-if="empty" class="muted py-6 text-center text-sm">{{ t('picker.empty') }}</p>
         <div v-if="error" class="py-4 text-center">
-          <p class="syserr text-sm" role="alert">{{ error }}（旧列表已保留）</p>
+          <p class="syserr text-sm" role="alert">{{ error }}{{ t('picker.staleListKept') }}</p>
           <button
             type="button"
             class="mt-2 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
             @click="retry"
-          >重试</button>
+          >{{ t('common.retry') }}</button>
         </div>
       </div>
     </div>

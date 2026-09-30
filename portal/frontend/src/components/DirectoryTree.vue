@@ -5,9 +5,13 @@
 // 根 = 选中目录（= 会话 cwd = jail root，三锚合一）；P6（issue #84）：文件节点点击 emit
 // file-click（相对路径），由 SidebarPanel 打开 FilePreviewModal；目录节点维持折叠语义不变。
 import { ref, shallowReactive, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import type { TreeEntry } from '../lib/tree';
 import DirTreeNode from './DirTreeNode.vue';
+
+// issue #101 P2：用户可见文案走 i18n（tree.* / common.*）。
+const { t } = useI18n();
 
 const props = defineProps<{ cwd: string | null }>();
 const emit = defineEmits<{
@@ -30,7 +34,7 @@ async function load(path: string) {
     childMap.set(path, data.entries ?? []);
   } catch (e) {
     expandedSet.delete(path); // 加载失败：展开态回滚，错误行留在面板顶部
-    error.value = '目录树加载失败：' + (e instanceof Error ? e.message : String(e));
+    error.value = t('errors.treeLoadFailed', { message: e instanceof Error ? e.message : String(e) });
   } finally {
     loadingSet.delete(path);
   }
@@ -74,13 +78,13 @@ watch(open, (v) => { if (v && !childMap.has('') && !loadingSet.has('')) void loa
       type="button"
       class="w-full rounded px-1 py-1 text-left text-sm hover:bg-black/5"
       @click="open = !open"
-    >{{ open ? '▾' : '▸' }} 目录树</button>
+    >{{ open ? '▾' : '▸' }} {{ t('tree.title') }}</button>
     <div v-if="open" class="mt-1 text-sm">
-      <p v-if="!cwd" class="muted px-1 text-xs">先选择目录</p>
+      <p v-if="!cwd" class="muted px-1 text-xs">{{ t('tree.selectDirFirst') }}</p>
       <p v-else-if="error" class="syserr px-1 text-xs" role="alert">{{ error }}</p>
       <template v-else>
-        <p v-if="loadingSet.has('')" class="muted px-1 text-xs">加载中…</p>
-        <p v-else-if="!childMap.get('')?.length" class="muted px-1 text-xs">（空目录）</p>
+        <p v-if="loadingSet.has('')" class="muted px-1 text-xs">{{ t('common.loading') }}</p>
+        <p v-else-if="!childMap.get('')?.length" class="muted px-1 text-xs">{{ t('common.emptyDir') }}</p>
         <DirTreeNode
           v-for="e in childMap.get('') ?? []"
           :key="e.name"

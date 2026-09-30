@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import FilePreviewModal from './FilePreviewModal.vue';
+import { i18n, setLocale } from '../i18n';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -27,6 +28,7 @@ const tick = async (ms = 30) => {
 function mountModal(handlers: { onClose?: () => void } = {}) {
   return mount(FilePreviewModal, {
     props: { cwd: '~/projects/demo', path: 'sub/note.txt', ...handlers },
+    global: { plugins: [i18n] }, // issue #101 P2：装配真实 i18n 单例（组件内 useI18n()）
     attachTo: document.body, // 焦点断言需要真实挂载
   });
 }
@@ -36,7 +38,12 @@ function lastFetchUrl() {
   return String(vi.mocked(fetch).mock.calls.at(-1)![0]);
 }
 
-beforeEach(() => vi.unstubAllGlobals());
+beforeEach(() => {
+  vi.unstubAllGlobals();
+  // 每例重置语言为 zh-CN（既有中文断言逐字不变）。
+  localStorage.clear();
+  setLocale('zh-CN');
+});
 afterEach(() => {
   vi.unstubAllGlobals();
   document.body.innerHTML = '';
@@ -78,6 +85,7 @@ describe('FilePreviewModal（issue #84 P6 文件预览）', () => {
     vi.stubGlobal('fetch', vi.fn(async () => okFile('text', src, 'index.ts')));
     const wrapper = mount(FilePreviewModal, {
       props: { cwd: '~/projects/demo', path: 'src/index.ts', onClose: () => {} },
+      global: { plugins: [i18n] }, // issue #101 P2
       attachTo: document.body,
     });
     await tick();
@@ -93,6 +101,7 @@ describe('FilePreviewModal（issue #84 P6 文件预览）', () => {
     vi.stubGlobal('fetch', vi.fn(async () => okFile('text', '# 标题\n\n正文 **粗体**', 'README.md')));
     const wrapper = mount(FilePreviewModal, {
       props: { cwd: '~/projects/demo', path: 'README.md', onClose: () => {} },
+      global: { plugins: [i18n] }, // issue #101 P2
       attachTo: document.body,
     });
     await tick();
@@ -109,6 +118,7 @@ describe('FilePreviewModal（issue #84 P6 文件预览）', () => {
     vi.stubGlobal('fetch', vi.fn(async () => okFile('image', dataUrl, 'logo.png')));
     const wrapper = mount(FilePreviewModal, {
       props: { cwd: '~/projects/demo', path: 'logo.png', onClose: () => {} },
+      global: { plugins: [i18n] }, // issue #101 P2
       attachTo: document.body,
     });
     await tick();

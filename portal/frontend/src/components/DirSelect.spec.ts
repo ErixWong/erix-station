@@ -6,9 +6,13 @@ import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import DirSelect from './DirSelect.vue';
 import { useWorkbenchStore } from '../stores/workbench';
+import { i18n, setLocale } from '../i18n';
 
 // selectDir 会触发 loadSessions：桩掉 fetch（不碰真实后端）。
 beforeEach(() => {
+  // issue #101 P2：装配真实 i18n 单例，每例重置为 zh-CN。
+  localStorage.clear();
+  setLocale('zh-CN');
   setActivePinia(createPinia());
   vi.stubGlobal('fetch', vi.fn(async () => new Response('{"items":[]}', { status: 200 })));
 });
@@ -17,7 +21,7 @@ function setup(dirs: { name: string; cwd: string; running_count: number; queued_
   const store = useWorkbenchStore();
   store.dirs = dirs;
   store.dirCwd = dirs[0]?.cwd ?? null;
-  const wrapper = mount(DirSelect, { props: {} });
+  const wrapper = mount(DirSelect, { props: {}, global: { plugins: [i18n] } });
   return { store, wrapper };
 }
 
@@ -63,7 +67,7 @@ describe('DirSelect（目录下拉）', () => {
     store2.dirs = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
     store2.dirCwd = '~/projects/a';
     store2.isPlatformAdmin = true;
-    const wrapper2 = mount(DirSelect, { props: {} });
+    const wrapper2 = mount(DirSelect, { props: {}, global: { plugins: [i18n] } });
     await wrapper2.vm.$nextTick();
     expect(store2.newDirDisabled).toBe(true);
     const opt = wrapper2.findAll('option').find((o) => o.text() === '＋ 新建目录');

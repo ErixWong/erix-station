@@ -1,6 +1,8 @@
-// English messages（issue #101 P1）。键集必须与 locales/zh-CN.ts 完全一致：
+// English messages（issue #101 P1；P2 补工作台全量对译）。键集必须与 locales/zh-CN.ts 完全一致：
 // `satisfies MessageSchema` 会在漏译（缺键）或多译（多余键）时编译报错。
 // 语言名保持母语自名（中文 / English），不随当前 locale 翻译。
+// 注：插值片段（stream.event.dash / paren、errors.runInProgress）在 en 侧用半角括号——
+// 它们是直接拼接的可选后缀，`runInProgress` 因此前置一个空格。
 
 import type { MessageSchema } from './zh-CN';
 
@@ -8,6 +10,20 @@ export const en = {
   common: {
     copy: 'Copy',
     copied: 'Copied',
+    close: 'Close',
+    loading: 'Loading…',
+    retry: 'Retry',
+    cancel: 'Cancel',
+    create: 'Create',
+    unnamedSession: 'Untitled session',
+    runningBadge: '● Running',
+    emptyDir: '(empty directory)',
+    noDir: '(no directory)',
+    createFirstDir: 'Create a directory first',
+    adminConsole: 'Admin console',
+    logout: 'Sign out',
+    platformAdminHint: 'Platform admin: create FDE users and assign resources in the admin console',
+    goToAdmin: 'Go to admin console',
   },
   locale: {
     label: 'Language',
@@ -23,5 +39,91 @@ export const en = {
     totpLabel: 'TOTP',
     totpSubmit: 'Verify & sign in',
     backToLogin: '← Back to login',
+  },
+  workbench: {
+    nav: '☰ Navigation',
+    openNavigation: 'Open navigation',
+    who: '{login} ({role} / {fde})',
+    whoNoFde: '{login} ({role})',
+    cwdCopyTitle: '{cwd} (click to copy)',
+    toLatest: '↓ Latest',
+    resizeSidebar: 'Resize sidebar',
+    inputPlaceholder: 'Type a task, Enter to send (Shift+Enter for a newline)',
+    systemInjection: '[system] {content}',
+    stopRequested: 'Stop requested…',
+    notifyFailed: 'Run failed: {code} — {message}',
+    notifyEnded: 'Run ended: {reason}',
+    notifyDone: 'Run finished',
+  },
+  sidebar: {
+    dirLabel: 'Directory',
+    newDirOption: '＋ New directory',
+    refreshTitle: 'Refresh directory list and tree',
+    newDirLabel: 'Directory name (lowercase letters / digits / hyphens)',
+    newDirPlaceholder: 'e.g. my-project',
+    newSession: '＋ New session',
+    browse: 'Browse sessions',
+    browseTitle: 'Browse sessions (Ctrl/⌘+K)',
+    noSessions: 'No sessions',
+  },
+  tree: {
+    title: 'Directory tree',
+    selectDirFirst: 'Select a directory first',
+  },
+  stream: {
+    chooseOrNewSession: 'Select or create a session',
+    argsPending: '(generating arguments…)',
+    argsStreaming: '(arguments streaming…)',
+    event: {
+      resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
+      resyncBufferOverflow: 'server buffer overflow',
+      attempt: 'round {round} · attempt {attempt}/{max}',
+      recovering: 'Retrying ({attempt}/{max})',
+      recovered: 'Retry succeeded',
+      judgePassThrough: 'judge: pass through ({mode})',
+      judgeExtend: 'judge: extend rounds{dash}{paren}',
+      judgeNoExtend: 'judge: no extension{dash}',
+      judgeAction: 'judge: {action}{dash}',
+      compaction: 'Context compaction (round {round}): {folded} rounds folded, {before} → {after} tokens',
+      finalGuard: 'final guard: {action}{dash}',
+      forcedFinal: 'forced final (round {round}): {reason}',
+      runEnd: 'run ended: {reason}{usage}',
+      runEndNormal: 'completed normally',
+      runFailed: 'run failed: {code} — {message}',
+      toolResult: '{mark} {digest} ({ms}ms)',
+      dash: ' — {value}',
+      paren: ' ({value})',
+    },
+  },
+  composer: {
+    send: 'Send',
+    stop: '■ Stop',
+  },
+  picker: {
+    title: 'Browse sessions',
+    scopeLabel: 'Session scope',
+    currentDir: 'Current directory: {name}',
+    currentDirTitle: 'Current directory: {cwd}',
+    noDirSelected: 'No directory selected',
+    allDirs: 'All directories',
+    listLabel: 'Session list',
+    empty: 'No sessions in this scope',
+    staleListKept: '(previous list kept)',
+  },
+  preview: {
+    title: 'Preview {path}',
+  },
+  errors: {
+    requestFailed: 'Request failed (HTTP {status})',
+    sessionLoadFailed: 'Failed to load the session; refresh to retry',
+    createSessionFailed: 'Failed to create session: {message}',
+    stopFailed: 'Failed to stop: {message}',
+    dirNameInvalid:
+      'Directory name must be lowercase letters / digits / hyphens, and must not start or end with a hyphen (max 63 characters)',
+    sendFailed: 'Send failed: {message}',
+    sendFailedLlmNotConfigured:
+      'Send failed: this FDE has no LLM upstream configured. Set it up in the admin console at /admin (contact your administrator if you lack access)',
+    runInProgress: ' (a run is already in progress)',
+    treeLoadFailed: 'Failed to load the directory tree: {message}',
   },
 } as const satisfies MessageSchema;
