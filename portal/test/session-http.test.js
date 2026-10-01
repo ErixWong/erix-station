@@ -84,6 +84,13 @@ class SessionSsePool extends FakePool {
 
   async query(sql, params = []) {
     if (sql.includes('FROM chat_sessions s')) return { rows: [this.sessionRow] };
+    // issue #107：PATCH /api/sessions/:id 的落库（updateSession 的 UPDATE ... RETURNING）；
+    // 与真实 DB 同语义：title 改写 + title_source 置 'manual'（手工优先守卫，issue #88）。
+    if (sql.startsWith('UPDATE chat_sessions') && sql.includes("title_source = 'manual'")) {
+      this.sessionRow.title = params[1];
+      this.sessionRow.title_source = 'manual';
+      return { rows: [{ ...this.sessionRow, cwd: '~/projects/a', updated_at: new Date(), created_at: new Date() }] };
+    }
     if (sql.includes('FROM messages')) return { rows: [] };
     if (sql.includes('FROM runs')) return { rows: [] };
     if (sql.includes('FROM run_events')) {
@@ -226,6 +233,52 @@ test('F5：大写 UUID 路径的 session id 归一化为小写（SSE hub key 对
     const text = await reading;
     assert.ok(text.includes('assistant_delta'), `小写 key 推送的大写路径客户端能收到：${JSON.stringify(text)}`);
     assert.ok(text.includes('id: 6'), '帧带 seq');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// issue #107：PATCH /api/sessions/:id 成功 → 推 `session_updated`（手工改名多标签页同步）
+// ---------------------------------------------------------------------------
+
+test('issue #107：PATCH 改名成功后推 session_updated（live-only 帧，payload.title = 新标题）', async () => {
+  const s = await startServer();
+  try {
+    const res = await fetch(`${s.base}/api/sessions/${SESSION_ID}/events`, {
+      headers: { Cookie: s.cookieHeader, Accept: 'text/event-stream' },
+    });
+    assert.equal(res.status, 200, 'SSE 连接 200');
+    await waitUntil(() => internal.hubStats().sessionClients === 1, { label: 'SSE 客户端已注册' });
+    // 读帧直到第一条 session_updated（连接已注册；未 live 时事件进缓冲，flush 后同样到达）
+    const reading = readSseUntil(res, (t) => t.includes('session_updated'), { label: 'session_updated 帧' });
+
+    // 先发一条**超长**（>200）标题：必须 400 且**不推**任何帧（notify 只在落库成功后发生）
+    const tooLong = '不该出现'.repeat(60);
+    const bad = await fetch(`${s.base}/api/sessions/${SESSION_ID}`, {
+      method: 'PATCH',
+      headers: { Cookie: s.cookieHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: tooLong }),
+    });
+    assert.equal(bad.status, 400, '超 200 字符 → 400 validation_failed');
+    assert.equal((await bad.json()).error.code, 'validation_failed');
+
+    const okRes = await fetch(`${s.base}/api/sessions/${SESSION_ID}`, {
+      method: 'PATCH',
+      headers: { Cookie: s.cookieHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: '  手工改的名  ' }), // 原样落库（trim 是前端职责，后端只校验长度）
+    });
+    assert.equal(okRes.status, 200);
+    const body = await okRes.json();
+    assert.equal(body.session.title, '  手工改的名  ');
+    assert.equal(body.session.title_source, 'manual', '手工改名置 title_source=manual（#88 守卫闭环）');
+
+    const text = await reading;
+    // 首条 session_updated 携带的就是成功那次的新标题：证明 400 那次没有推帧
+    assert.ok(text.includes('"title":"  手工改的名  "'), `session_updated 携带新标题：${JSON.stringify(text)}`);
+    assert.ok(!text.includes('不该出现'), '校验失败（400）不得推 session_updated');
+    assert.ok(text.includes('event: session_updated'), '帧名 = session_updated');
+    assert.ok(!text.includes('id:'), 'live-only 帧不带 seq（不进消息流水位线）');
   } finally {
     await s.close();
   }

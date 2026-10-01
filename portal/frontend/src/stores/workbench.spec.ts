@@ -541,3 +541,99 @@ describe('workbench store · i18n（issue #101 P2）', () => {
     expect(typeof store.sessMeta({ id: 's2' })).toBe('string');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #107：会话手动重命名（renameSession → PATCH /api/sessions/:id）
+// 语义：成功后**原地**更新列表项 title/title_source（不整表 loadSessions）；
+//       空串/纯空白本地拦截不发请求（空串落 manual 会永久关掉自动命名）；
+//       超长按 200 截断（与后端校验同口径）；失败不改 store，把错误文案交调用方展示。
+// ---------------------------------------------------------------------------
+describe('workbench store · renameSession（issue #107）', () => {
+  let calls: Array<{ url: string; method: string; body: unknown }> = [];
+
+  /** PATCH 返回给定结果；其余请求 200 空列表（同时记录全部请求，用于断言「不整表刷新」）。 */
+  function renameHandler(result: { status: number; body: unknown }) {
+    return (url: string, init?: RequestInit) => {
+      calls.push({
+        url,
+        method: init?.method ?? 'GET',
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      if (init?.method === 'PATCH') return result;
+      return { status: 200, body: { items: [] } };
+    };
+  }
+
+  beforeEach(() => {
+    calls = [];
+  });
+
+  it('成功：PATCH {title}（trim）→ 原地更新 title/title_source，且不触发整表 loadSessions', async () => {
+    mockFetch(renameHandler({ status: 200, body: { session: { id: 's1', title: '新名', title_source: 'manual' } } }));
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '旧名', title_source: 'auto' }, { id: 's2', title: '别的会话' }];
+
+    const { error } = await store.renameSession('s1', '  新名  ');
+    expect(error).toBeNull();
+    expect(calls).toEqual([{ url: '/api/sessions/s1', method: 'PATCH', body: { title: '新名' } }]);
+    expect(store.sessions[0].title).toBe('新名');
+    expect(store.sessions[0].title_source).toBe('manual');
+    expect(store.sessions[1].title).toBe('别的会话'); // 其它项不受影响
+    expect(calls.some((c) => c.method === 'GET')).toBe(false); // 原地更新，无整表刷新
+  });
+
+  it('失败（401 ApiError）：返回错误文案、store 原样不动（调用方回退旧标题）', async () => {
+    mockFetch(renameHandler({ status: 401, body: { error: { code: 'unauthorized', message: '未登录' } } }));
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '旧名', title_source: 'auto' }];
+
+    const { error } = await store.renameSession('s1', '新名');
+    expect(error).toBe('未登录');
+    expect(store.sessions[0].title).toBe('旧名');
+    expect(store.sessions[0].title_source).toBe('auto');
+  });
+
+  it('空串/纯空白：本地拦截不发请求（空串落 manual 会永久关掉自动命名）', async () => {
+    mockFetch(renameHandler({ status: 200, body: { session: { id: 's1', title: 'x' } } }));
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '旧名' }];
+
+    for (const blank of ['', '   ', '\t\n ']) {
+      const { error } = await store.renameSession('s1', blank);
+      expect(error).toBe('会话名称不能为空');
+    }
+    expect(calls).toEqual([]);
+    expect(store.sessions[0].title).toBe('旧名');
+    expect(store.sessions[0].title_source).toBeUndefined();
+  });
+
+  it('超长标题：截断到 200 字符再提交（与后端 ≤200 校验同口径）', async () => {
+    mockFetch(renameHandler({ status: 200, body: { session: { id: 's1', title: '长'.repeat(200), title_source: 'manual' } } }));
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '旧名' }];
+
+    const { error } = await store.renameSession('s1', '长'.repeat(250));
+    expect(error).toBeNull();
+    expect(calls[0].body).toEqual({ title: '长'.repeat(200) });
+    expect(store.sessions[0].title).toBe('长'.repeat(200));
+  });
+
+  it('会话不在当前列表（跨目录/已归档）：请求照发，成功不抛错（无匹配项则跳过原地更新）', async () => {
+    mockFetch(renameHandler({ status: 200, body: { session: { id: 'ghost', title: '新名', title_source: 'manual' } } }));
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '旧名' }];
+
+    const { error } = await store.renameSession('ghost', '新名');
+    expect(error).toBeNull();
+    expect(store.sessions[0].title).toBe('旧名');
+  });
+
+  it('i18n：切 English 后空串拦截文案变英文', async () => {
+    mockFetch(renameHandler({ status: 200, body: { session: { id: 's1', title: 'x' } } }));
+    const store = useWorkbenchStore();
+    setLocale('en');
+    const { error } = await store.renameSession('s1', '  ');
+    expect(error).toBe('Session title cannot be empty');
+    expect(calls).toEqual([]);
+  });
+});
