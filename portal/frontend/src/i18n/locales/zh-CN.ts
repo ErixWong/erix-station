@@ -88,7 +88,7 @@ export const zhCN = {
     browse: '浏览会话',
     browseTitle: '浏览会话（Ctrl/⌘+K）',
     noSessions: '暂无会话',
-    // issue #107：会话卡片内联重命名（✏️ 入口的 title/aria-label + 编辑框占位符）
+    // issue #107：会话卡片内联重命名（铅笔图标按钮的 title/aria-label + 编辑框占位符；#112 改 SVG 图标）
     rename: '重命名',
     renamePlaceholder: '会话名称',
   },

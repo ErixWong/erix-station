@@ -73,4 +73,18 @@ describe('DirSelect（目录下拉）', () => {
     const opt = wrapper2.findAll('option').find((o) => o.text() === '＋ 新建目录');
     expect(opt?.attributes('disabled')).toBeDefined();
   });
+
+  // issue #112：控件收敛——32px 高 / 7px 圆角 / 12px 字号（label 11px）。
+  it('控件规格（issue #112）：select 与 ↻ 均 32px 高 / 7px 圆角 / 12px 字号，label 11px', () => {
+    const { wrapper } = setup([{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }]);
+    const select = wrapper.get('select');
+    expect(select.classes()).toContain('h-8');
+    expect(select.classes()).toContain('rounded-[7px]');
+    expect(select.classes()).toContain('text-[12px]');
+    const refresh = wrapper.get('button[title="刷新目录列表与目录树"]');
+    expect(refresh.classes()).toContain('h-8');
+    expect(refresh.classes()).toContain('rounded-[7px]');
+    expect(refresh.classes()).toContain('text-[12px]');
+    expect(wrapper.get('label[for="dirSel"]').classes()).toContain('text-[11px]');
+  });
 });

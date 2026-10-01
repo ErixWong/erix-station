@@ -181,6 +181,35 @@ describe('DirectoryTree（目录树面板）', () => {
 });
 
 // ---------------------------------------------------------------------------
+// issue #112：目录树字号收敛（标题 11px/600/0.05em，行 12px，空态 11px）——懒展开交互不变
+// ---------------------------------------------------------------------------
+describe('DirectoryTree · 字号收敛（issue #112）', () => {
+  it('面板标题 = 小节标题规格（11px/600/0.05em）；行内 12px；空目录文案 11px', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, { entries: [] })));
+    const wrapper = mountTree({ cwd: '~/projects/empty' });
+    const title = wrapper.get('button');
+    expect(title.classes()).toContain('text-[11px]');
+    expect(title.classes()).toContain('font-semibold');
+    expect(title.classes()).toContain('tracking-[0.05em]');
+
+    mockTreeFetch();
+    const w2 = mountTree({ cwd: '~/projects/demo' });
+    await openPanel(w2);
+    const [src] = rowBtns(w2);
+    expect(src.classes()).toContain('text-[12px]');
+    expect(src.classes()).toContain('py-[1px]'); // 行高收紧
+
+    // 空目录提示 11px
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, { entries: [] })));
+    const w3 = mountTree({ cwd: '~/projects/empty' });
+    await w3.get('button').trigger('click');
+    await vi.waitFor(() => expect(w3.text()).toContain('（空目录）'));
+    const emptyLine = w3.findAll('p').find((p) => p.text() === '（空目录）')!;
+    expect(emptyLine.classes()).toContain('text-[11px]');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // issue #101 P2：目录树用户可见文案走 i18n（zh-CN 基线逐字不变，切 en 即时生效）
 // ---------------------------------------------------------------------------
 describe('DirectoryTree · i18n（issue #101 P2）', () => {

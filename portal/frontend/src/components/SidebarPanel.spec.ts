@@ -131,7 +131,7 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
     expect(root.lastElementChild).toBe(tree);
     expect(tree.classList).toContain('shrink-0');
     expect(tree.classList).toContain('border-t'); // 树面板与列表段之间的分隔线（原样式保持）
-    expect(kids[1].querySelectorAll('div.mt-2').length).toBe(15); // 会话卡全在列表段内
+    expect(kids[1].querySelectorAll('[data-session-row]').length).toBe(15); // 会话行全在列表段内（issue #112 扁平行）
   });
 
   it('目录树面板限高 + 内部滚动：根元素含 max-h-[40vh] 与 overflow-y-auto（保留 shrink-0/mt-3/border-t）', async () => {
@@ -158,6 +158,111 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
     card!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await flushPromises();
     expect(onSelectSession).toHaveBeenCalledWith('42');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #112：左栏视觉收敛（会话列表扁平化 + 字号体系 12/11）——纯呈现层断言：
+//   扁平行（无卡片边框/圆角/行间距）、选中 = 左 2px brand 竖条 + 浅绿底、hover 背景、
+//   标题 12px（选中 500）/ 副行 11px、空态 11px、侧栏头控件 32px/7px/12px。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · 左栏视觉收敛（issue #112）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+  /** 列表段内的会话行（扁平行；data-session-row 为呈现层测试钩子）。 */
+  const rows = (wrapper: Awaited<ReturnType<typeof mountPanel>>) =>
+    Array.from(paneEls(wrapper).list.querySelectorAll<HTMLElement>('[data-session-row]'));
+
+  it('会话行为扁平行：无卡片边框/圆角/行间距，54px 最小行高 + 左 14 右 8 内边距', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }, { id: '2', title: 's2' }] });
+    const [r1, r2] = rows(wrapper);
+    expect(rows(wrapper)).toHaveLength(2);
+    for (const r of [r1, r2]) {
+      expect(r.classList).toContain('min-h-[54px]');
+      expect(r.classList).toContain('pl-3.5'); // 左 14px
+      expect(r.classList).toContain('pr-2'); // 右 8px
+      expect(r.classList).toContain('border-l-2'); // 竖条常驻（未选中 transparent，避免布局跳动）
+      expect(r.classList).not.toContain('border'); // 卡片边框已拆除
+      expect(r.classList).not.toContain('rounded-md');
+      expect(r.classList).not.toContain('mt-2'); // 扁平行之间无间距
+    }
+  });
+
+  it('选中态 = 左 2px brand 竖条 + 浅绿底；非选中 = 透明竖条 + hover 浅灰底', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }, { id: '2', title: 's2' }] });
+    useWorkbenchStore().sessionId = '2';
+    await flushPromises();
+    const [r1, r2] = rows(wrapper);
+    expect(r2.classList).toContain('border-l-brand');
+    expect(r2.classList).toContain('bg-green-50');
+    expect(r2.classList).not.toContain('hover:bg-black/5');
+    expect(r1.classList).toContain('border-l-transparent');
+    expect(r1.classList).toContain('hover:bg-black/5');
+    expect(r1.classList).not.toContain('border-l-brand');
+  });
+
+  it('字号体系：标题 12px（选中 font-medium）/ 副行 11px text-dim marginTop 2', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] });
+    const store = useWorkbenchStore();
+    store.sessionId = '1';
+    await flushPromises();
+    const [row] = rows(wrapper);
+    const title = row.querySelector('span.truncate')!;
+    expect(title.textContent).toBe('s1');
+    expect(title.classList).toContain('font-medium'); // 选中 500（非选中无此权重类）
+    expect(title.parentElement!.classList).toContain('text-[12px]');
+    const meta = row.querySelector('div[class~="mt-0.5"]')!; // 副行：marginTop 2（pi-web 规格）
+    expect(meta.classList).toContain('text-[11px]');
+    expect(meta.classList).toContain('text-black/50');
+    expect(meta.textContent).toBe(store.sessMeta(store.sessions[0]));
+  });
+
+  it('空态文案 11px（「暂无会话」/「先创建目录」/平台管理员提示）', async () => {
+    const w1 = await mountPanel({ dirs: DIR });
+    const p = paneEls(w1).list.querySelector('p')!;
+    expect(p.textContent).toBe('暂无会话');
+    expect(p.classList).toContain('text-[11px]');
+
+    const w2 = await mountPanel({ noDir: true });
+    const p2 = paneEls(w2).list.querySelector('p')!;
+    expect(p2.textContent).toBe('先创建目录');
+    expect(p2.classList).toContain('text-[11px]');
+
+    const w3 = await mountPanel({ noDir: true, platformAdmin: true });
+    const p3 = paneEls(w3).list.querySelector('p')!;
+    expect(p3.textContent).toContain('平台管理员');
+    expect(p3.classList).toContain('text-[11px]');
+  });
+
+  it('重命名输入收敛：12px / 30px 高 / 5px 圆角 / brand 边框（铅笔按钮仍 hover 浮现）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const btn = wrapper.get('button[aria-label="重命名"]');
+    expect(btn.classes()).toContain('opacity-0'); // 默认隐藏
+    expect(btn.classes()).toContain('group-hover:opacity-100'); // hover 浮现（交互不变）
+    // issue #112：入口重做为「SVG 铅笔 + 方块按钮」——emoji 不再出现在按钮文本里
+    expect(btn.find('svg').exists()).toBe(true);
+    expect(btn.text()).toBe('');
+    await btn.trigger('click');
+    const input = wrapper.get('input[aria-label="重命名"]');
+    expect(input.classes()).toContain('h-[30px]');
+    expect(input.classes()).toContain('text-[12px]');
+    expect(input.classes()).toContain('rounded-[5px]');
+    expect(input.classes()).toContain('border-brand');
+  });
+
+  it('侧栏头控件统一 32px 高 / 7px 圆角 / 12px 字号（新会话、🔍、目录下拉、↻、管理台入口）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, platformAdmin: true });
+    const { head } = paneEls(wrapper);
+    const ctrl = (sel: string) => head.querySelector<HTMLElement>(sel)!;
+    const newSess = Array.from(head.querySelectorAll('button')).find((b) => b.textContent?.includes('＋ 新会话'))!;
+    expect(newSess.classList).toContain('h-8');
+    expect(newSess.classList).toContain('rounded-[7px]');
+    expect(newSess.classList).toContain('text-[12px]');
+    expect(ctrl('button[aria-label="浏览会话"]').classList).toContain('h-8');
+    expect(ctrl('select').classList).toContain('h-8');
+    expect(ctrl('select').classList).toContain('text-[12px]');
+    expect(ctrl('button[title="刷新目录列表与目录树"]').classList).toContain('h-8');
+    expect(ctrl('a[href="/admin"]').classList).toContain('h-8');
+    expect(ctrl('label[for="dirSel"]').classList).toContain('text-[11px]');
   });
 });
 
@@ -255,7 +360,8 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
 });
 
 // ---------------------------------------------------------------------------
-// issue #107：会话卡片内联重命名（hover ✏️ → 原地 input；Enter/blur 提交、Esc 取消、空串拦截）
+// issue #107：会话卡片内联重命名（hover 铅笔按钮 → 原地 input；Enter/blur 提交、Esc 取消、空串拦截）
+// issue #112：入口由 emoji ✏️ 重做为内联 SVG 铅笔 + 浮现方块按钮（语义/交互不变，仅呈现层）
 // 后端 PATCH /api/sessions/:id 已就绪（本 issue 零接口改动，只补一条 SSE）；本套件桩掉 fetch。
 // ---------------------------------------------------------------------------
 describe('SidebarPanel · 会话重命名（issue #107）', () => {
@@ -278,7 +384,7 @@ describe('SidebarPanel · 会话重命名（issue #107）', () => {
     return calls;
   }
 
-  it('hover 出现 ✏️ 入口（title/aria-label「重命名」）；点击原地开 input（autofocus + 全选），不误触选中会话', async () => {
+  it('hover 出现铅笔按钮（title/aria-label「重命名」）；点击原地开 input（autofocus + 全选），不误触选中会话', async () => {
     const onSelectSession = vi.fn();
     const wrapper = await mountPanel(
       { dirs: DIR, sessions: [{ id: '7', title: '旧名' }], attachTo: true },
@@ -286,7 +392,20 @@ describe('SidebarPanel · 会话重命名（issue #107）', () => {
     );
     try {
       const btn = wrapper.get('button[aria-label="重命名"]');
-      expect(btn.text()).toBe('✏️');
+      // issue #112：入口 = 内联 SVG 铅笔（stroke/currentColor）+ 浮现方块按钮形状；不再是 emoji 文本
+      expect(btn.text()).toBe('');
+      const svg = btn.get('svg');
+      expect(svg.attributes('fill')).toBe('none');
+      expect(svg.attributes('stroke')).toBe('currentColor');
+      expect(svg.attributes('stroke-width')).toBe('2');
+      expect(svg.attributes('viewBox')).toBe('0 0 24 24');
+      expect(svg.attributes('aria-hidden')).toBe('true');
+      expect(btn.classes()).toContain('h-6'); // 24px 方块按钮
+      expect(btn.classes()).toContain('w-6');
+      expect(btn.classes()).toContain('rounded-[5px]');
+      expect(btn.classes()).toContain('border-black/15');
+      expect(btn.classes()).toContain('bg-white');
+      expect(btn.classes()).toContain('hover:bg-black/10');
       expect(btn.attributes('title')).toBe('重命名');
       expect(btn.classes()).toContain('opacity-0'); // 默认隐藏，hover 才浮现（group-hover:opacity-100）
       expect(btn.classes()).toContain('group-hover:opacity-100');
@@ -302,7 +421,7 @@ describe('SidebarPanel · 会话重命名（issue #107）', () => {
       expect(input.attributes('maxlength')).toBe('200'); // 与后端 ≤200 校验同口径
       expect(document.activeElement).toBe(el); // autofocus
       expect([el.selectionStart, el.selectionEnd]).toEqual([0, 2]); // 全选（改整个名字）
-      expect(wrapper.find('button[aria-label="重命名"]').exists()).toBe(false); // 编辑态隐藏 ✏️
+      expect(wrapper.find('button[aria-label="重命名"]').exists()).toBe(false); // 编辑态隐藏铅笔按钮
     } finally {
       wrapper.unmount();
     }
@@ -436,7 +555,7 @@ describe('SidebarPanel · 会话重命名（issue #107）', () => {
     }
   });
 
-  it('i18n：切 English 后 ✏️ 的 title/aria-label 与输入占位符变英文', async () => {
+  it('i18n：切 English 后铅笔按钮的 title/aria-label 与输入占位符变英文', async () => {
     const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: 'old name' }] });
     try {
       setLocale('en');
