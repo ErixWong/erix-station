@@ -69,6 +69,9 @@ export const en = {
     // issue #107：inline rename entry（pencil button title/aria-label + edit input placeholder；#112 SVG icon）
     rename: 'Rename session',
     renamePlaceholder: 'Session name',
+    // issue #114：AI rename entry (one LLM call on click) + inline loading hint
+    aiRename: 'AI rename',
+    aiRenaming: 'Naming with AI…',
   },
   tree: {
     title: 'Directory tree',
@@ -196,5 +199,7 @@ export const en = {
     // issue #107：inline rename — blank title blocked locally / hint when the PATCH fails (old title restored)
     renameEmpty: 'Session title cannot be empty',
     renameFailed: 'Rename failed: {message}',
+    // issue #114：AI rename failure (message comes from the server: 409 no LLM configured / 502 upstream)
+    aiRenameFailed: 'AI rename failed: {message}',
   },
 } as const satisfies MessageSchema;

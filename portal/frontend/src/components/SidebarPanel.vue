@@ -121,6 +121,21 @@ async function commitEdit() {
   if (error) editError.value = { id, text: t('errors.renameFailed', { message: error }) };
 }
 
+// ---- issue #114：「AI 改名」按钮（铅笔旁同款 24px 浮现方块按钮）----
+// 点击 → 行内 loading（按钮禁用 + 转圈）→ POST /api/sessions/:id/ai-title → 成功原地更新 store 标题；
+// 失败走卡片内 `.syserr` 行内提示（沿用 #107 模式，无 toast 体系）。同一时刻只允许一个请求在飞。
+const aiLoadingId = ref<string | null>(null);
+
+async function aiRename(s: Session) {
+  const id = String(s.id);
+  if (aiLoadingId.value != null) return; // 已有一个在飞：忽略重复点击（含跨行）
+  aiLoadingId.value = id;
+  editError.value = null; // 清掉上一次的行内提示（重命名/AI 改名共用同一提示行）
+  const { error } = await store.aiRenameSession(id);
+  aiLoadingId.value = null;
+  if (error) editError.value = { id, text: t('errors.aiRenameFailed', { message: error }) };
+}
+
 // ---- issue #112：左栏视觉收敛（向 pi-web 靠拢）----
 // 行样式为纯呈现层：选中判定抽成函数供 class 绑定复用（与原内联表达式语义完全等价，不改选中逻辑）。
 /** 该会话是否为当前选中（行样式：左 2px brand 竖条 + 浅绿底）。 */
@@ -213,6 +228,52 @@ function isActive(s: Session): boolean {
               <p v-if="editError?.id === String(s.id)" class="syserr mt-0.5" role="alert">{{ editError.text }}</p>
             </div>
             <!-- @click.stop：重命名入口不得误触「选中会话」 -->
+            <!-- issue #114：「AI 改名」按钮——与铅笔同款 24px 浮现方块（点击才调一次 LLM），
+                 行内 loading 时禁用 + 转圈（opacity 由动态类强制可见，不依赖 hover） -->
+            <button
+              type="button"
+              :title="aiLoadingId === String(s.id) ? t('sidebar.aiRenaming') : t('sidebar.aiRename')"
+              :aria-label="t('sidebar.aiRename')"
+              :disabled="aiLoadingId === String(s.id)"
+              class="flex h-6 w-6 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/50 hover:bg-black/10"
+              :class="aiLoadingId === String(s.id) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'"
+              @click.stop="aiRename(s)"
+            >
+              <!-- 转圈：loading 态（同一按钮原地换图标，不新增占位元素） -->
+              <svg
+                v-if="aiLoadingId === String(s.id)"
+                class="animate-spin"
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                aria-hidden="true"
+              >
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+              <!-- 非 loading：星辉/魔法闪光（lucide sparkles 轮廓，stroke=currentColor 风格同 #112 铅笔） -->
+              <svg
+                v-else
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+                <path d="M20 3v4" />
+                <path d="M22 5h-4" />
+                <path d="M4 17v2" />
+                <path d="M5 18H3" />
+              </svg>
+            </button>
             <!-- issue #112：重命名入口重做——emoji ✏️ → 内联 SVG 铅笔（stroke/currentColor，不自带红色）
                  + 浮现按钮形状（24px 方块 / 5px 圆角 / 细边框，对齐 pi-web 图标按钮规格）；
                  title/aria-label/@click.stop/编辑态隐藏 语义全部保留，浮现逻辑仍 opacity-0 → group-hover:opacity-100 -->
