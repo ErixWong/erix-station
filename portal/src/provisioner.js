@@ -187,9 +187,10 @@ export function buildContainerConfig({
       `ERIX_SHELL_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_TIMEOUT_MS) || 60000}`,
       `ERIX_SHELL_MAX_TIMEOUT_MS=${Number(process.env.ERIX_SHELL_MAX_TIMEOUT_MS) || 600000}`,
       `ERIX_SHELL_OUTPUT_MAX_BYTES=${Number(process.env.ERIX_SHELL_OUTPUT_MAX_BYTES) || 32768}`,
-      // issue #88 修订：会话标题生成在 worker 侧（ERIX_SESSION_AUTO_TITLE='0' 关；缺省/其它值开），
-      // 同名开关 portal 侧同读，控制落库评估。字符串开关（非数值），只透传 '0'/'1'。
-      `ERIX_SESSION_AUTO_TITLE=${process.env.ERIX_SESSION_AUTO_TITLE === '0' ? '0' : '1'}`,
+      // issue #88 / #114：会话标题生成在 worker 侧（worker 读 '0' 关；缺省/其它值开）。
+      // #114 起**默认关**（默认标题 = 首条消息截断 / 手工改名 / AI 改名），显式设 1 才开回；
+      // 与 portal 侧 config.sessionAutoTitle 同口径。字符串开关（非数值），只透传 '0'/'1'。
+      `ERIX_SESSION_AUTO_TITLE=${process.env.ERIX_SESSION_AUTO_TITLE === '1' ? '1' : '0'}`,
     ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId, ...labels },
     HostConfig: {

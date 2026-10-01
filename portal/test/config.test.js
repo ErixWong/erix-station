@@ -104,3 +104,16 @@ test('F12 prod：FDE_MEMORY_LIMIT 默认 4g（issue #27 已决），env 覆盖�
     '0',
   );
 });
+
+// ---------------------------------------------------------------------------
+// issue #114：ERIX_SESSION_AUTO_TITLE 默认翻转为关（默认标题改由首条消息截断 + 手工/AI 改名承担）
+// ---------------------------------------------------------------------------
+
+test('issue #114：sessionAutoTitle 默认关；仅显式 ERIX_SESSION_AUTO_TITLE=1 开回 #88 行为', () => {
+  const base = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
+  assert.equal(loadConfig(base).sessionAutoTitle, false, '缺省 → 关（#114 修订）');
+  assert.equal(loadConfig({ ...base, ERIX_SESSION_AUTO_TITLE: '0' }).sessionAutoTitle, false);
+  assert.equal(loadConfig({ ...base, ERIX_SESSION_AUTO_TITLE: '1' }).sessionAutoTitle, true, '显式 1 → 开');
+  assert.equal(loadConfig({ ...base, ERIX_SESSION_AUTO_TITLE: 'yes' }).sessionAutoTitle, false, '非 1 值不视为开');
+  assert.equal(loadConfig(base).sessionAutoTitleMinNew, 3, '防抖阈值缺省不变');
+});

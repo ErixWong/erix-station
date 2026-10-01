@@ -40,6 +40,7 @@
 | 会话 | `POST /api/sessions` | 创建会话 |
 | 会话 | `GET /api/sessions/:id` | 会话详情（含消息历史 + `last_seq`） |
 | 会话 | `PATCH /api/sessions/:id` | 改标题 |
+| 会话 | `POST /api/sessions/:id/ai-title` | AI 改名（按需调一次 LLM 生成标题，§4.5a） |
 | 会话 | `DELETE /api/sessions/:id` | 归档会话 |
 | 对话 | `POST /api/sessions/:id/messages` | 发消息（创建 run） |
 | 对话 | `GET /api/sessions/:id/events` | **SSE 事件流**（§5） |
@@ -616,6 +617,12 @@ station-portal user enable  --login <login>
 | `PATCH /api/sessions/:id` | `{ "title": "新标题" }` | `200 ChatSession` |
 | `DELETE /api/sessions/:id` | — | `204`（归档，`status → archived`；有进行中 run 时 `409 run_in_progress`） |
 
+**标题模型（issue #114 修订）**：
+
+- **默认标题 = 首条用户消息截断**（零 LLM）：`POST /api/sessions/:id/messages` 建首条 `user` 消息时，若会话 `title` 为空且 `title_source='auto'`，取该消息前 30 字（被截断时尾加 `…`）落库，并推一条 `session_updated`（列表标题立即到位）。标题非空则幂等不动；与 `ERIX_SESSION_AUTO_TITLE` 开关**解耦**（开关关闭时照样生效）。
+- **手工改名**（§4.2 `PATCH`）与 **AI 改名**（§4.5a）落 `title_source='manual'`：任何自动流程不得覆盖。
+- **#88 自动起名默认关**：`ERIX_SESSION_AUTO_TITLE` 默认不生效（run 终态不再自动起名），env 显式设 `1` 开回；开关关闭不影响默认标题截断。
+
 ### 4.3 `POST /api/sessions/:id/messages`
 
 发送用户消息并启动一次 run。**多轮对话宿主侧必须显式把本轮用户输入作为 `task` 传给引擎**（规格 §13.2-4），前端无需关心。
@@ -698,6 +705,34 @@ station-portal user enable  --login <login>
 最终终止结果通过 SSE 的 `run_end` 事件（`termination: { "reason": "aborted" }`，依据：erix-agent v0.3.5 `src/loop.js:712`）与 run 状态收敛体现；前端调本端点后应继续听 SSE，不要轮询。
 
 错误：`404 not_found`；`409 no_active_run`（无进行中 run）。
+
+### 4.5a `POST /api/sessions/:id/ai-title`（issue #114：AI 改名）
+
+按需（用户点按钮）调**一次** OpenAI 兼容 `chat/completions`，为会话生成 ≤30 字标题。属主鉴权同 §4.2 `PATCH`（非属主/不存在/已归档 → `404 not_found`）。
+
+- **上下文**：该会话最早的 3 条 `user` 消息，各折叠空白并截断 200 字符；要求模型只输出标题本身。
+- **provider 解析**：① 会话属主 FDE 的 active LLM binding（`fde_llm_bindings` + `llm_providers`，含 key）优先；② 回退第一个启用的 `type='text'` provider+model（`llm_providers` **不存 key**——只适用于无需鉴权的自建端点）；③ 都没有 → `409 llm_not_configured`。
+- **调用**：`POST <base_url>[/v1]/chat/completions`（`base_url` 已含 `/v1` 则不重复拼接），超时 15s。
+- **落库**：响应经 `sanitizeTitle` 清洗（去引号/取首行/截 30 字）后写 `title` + `title_source='manual'` + `updated_at`；推一条 `session_updated`（同 #88/#107，不落 `run_events`）。
+- **决策豁免**：issue #88 定下「portal 不持 LLM 客户端」（标题由 agent 侧随 run 终态上报）；本端点是用户拍板（2026-10-01）的**修订豁免**，范围仅限本端点。
+- **key 纪律**：`api_key` 只进 `Authorization` 头，**绝不进日志/错误信息/响应**（上游回显的 key 亦被脱敏）。
+
+请求体：无（空 JSON `{}`）。
+
+响应 `200`：
+
+```json
+{ "session": { "id": "s_1", "title": "登录页白屏修复", "title_source": "manual", "...": "..." } }
+```
+
+错误：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 404 | `not_found` | session 不存在 / 不属本人 / 已归档（同 §4.2 PATCH） |
+| 409 | `llm_not_configured` | 无 FDE binding 且无启用的 text provider+model |
+| 409 | `no_user_messages` | 会话还没有用户消息（无可用上下文） |
+| 502 | `llm_upstream_failed` | 上游超时 / 非 2xx / 响应无可用标题 |
 
 ### 4.6 `GET /api/runs/:id`
 
