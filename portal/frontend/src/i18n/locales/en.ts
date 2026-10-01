@@ -59,12 +59,16 @@ export const en = {
     dirLabel: 'Directory',
     newDirOption: '＋ New directory',
     refreshTitle: 'Refresh directory list and tree',
+    newDirTitle: 'New directory',
     newDirLabel: 'Directory name (lowercase letters / digits / hyphens)',
     newDirPlaceholder: 'e.g. my-project',
     newSession: '＋ New session',
     browse: 'Browse sessions',
     browseTitle: 'Browse sessions (Ctrl/⌘+K)',
     noSessions: 'No sessions',
+    // issue #107：inline rename entry（✏️ title/aria-label + edit input placeholder）
+    rename: 'Rename session',
+    renamePlaceholder: 'Session name',
   },
   tree: {
     title: 'Directory tree',
@@ -189,5 +193,8 @@ export const en = {
       'Send failed: this FDE has no LLM upstream configured. Set it up in the admin console at /admin (contact your administrator if you lack access)',
     runInProgress: ' (a run is already in progress)',
     treeLoadFailed: 'Failed to load the directory tree: {message}',
+    // issue #107：inline rename — blank title blocked locally / hint when the PATCH fails (old title restored)
+    renameEmpty: 'Session title cannot be empty',
+    renameFailed: 'Rename failed: {message}',
   },
 } as const satisfies MessageSchema;
