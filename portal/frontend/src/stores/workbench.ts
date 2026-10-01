@@ -11,11 +11,11 @@
 // SSE 协议状态在 useEventStream composable 内（M1）。
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
-import { api, ApiError } from '../api';
+import { api, ApiError, patchSessionTitle } from '../api';
 import { i18n } from '../i18n';
 import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
-import { DIR_NAME_RE } from '../lib/constants';
+import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
 import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
 
@@ -36,6 +36,7 @@ export interface DirInfo {
 export interface Session {
   id: string;
   title?: string | null;
+  title_source?: string | null; // issue #107：'manual'（手工改名）| 'auto'（自动标题）
   updated_at?: string;
   active_run_id?: string | null;
   cwd?: string; // issue #84 P5：会话绑定目录（响应带 cwd）
@@ -386,6 +387,29 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return { error: null, session };
   }
 
+  /**
+   * issue #107：侧栏内联重命名——PATCH /api/sessions/:id {title}，成功后**原地**更新列表项
+   * `title`/`title_source`（不整表 loadSessions：重命名不影响排序语义之外的任何字段）。
+   * 空串/纯空白本地拦截（不发请求）：空串落库会置 title_source='manual'，**永久关掉**后续自动命名
+   * （issue #88 守卫）——宁可无操作。超长按 SESSION_TITLE_MAX_LEN 截断（与后端 ≤200 口径一致）。
+   * @returns error=null 成功；否则为错误文案（失败**不动** store，调用方回退展示旧标题）。
+   */
+  async function renameSession(id: string, title: string): Promise<{ error: string | null }> {
+    const clean = title.trim().slice(0, SESSION_TITLE_MAX_LEN);
+    if (!clean) return { error: t('errors.renameEmpty') };
+    try {
+      const { session } = await patchSessionTitle(id, clean);
+      const item = sessions.value.find((s) => String(s.id) === String(id));
+      if (item) {
+        item.title = session.title;
+        item.title_source = session.title_source ?? 'manual';
+      }
+      return { error: null };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   /** 深链解析（旧 resolveHashSession；跨项目切项目由调用方决定路由写回）。 */
   async function resolveRouteSession(sid: string): Promise<void> {
     if (sessions.value.some((s) => String(s.id) === String(sid))) {
@@ -532,7 +556,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessMeta,
     // actions
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
-    createSession, createDir, resolveRouteSession, resetSessionView,
+    createSession, createDir, resolveRouteSession, resetSessionView, renameSession,
     saveDraft, addMessage, send, stop, refreshSession,
   };
 });

@@ -81,12 +81,16 @@ export const zhCN = {
     dirLabel: '目录',
     newDirOption: '＋ 新建目录',
     refreshTitle: '刷新目录列表与目录树',
+    newDirTitle: '新建目录',
     newDirLabel: '目录名（小写字母/数字/连字符）',
     newDirPlaceholder: '例如 my-project',
     newSession: '＋ 新会话',
     browse: '浏览会话',
     browseTitle: '浏览会话（Ctrl/⌘+K）',
     noSessions: '暂无会话',
+    // issue #107：会话卡片内联重命名（✏️ 入口的 title/aria-label + 编辑框占位符）
+    rename: '重命名',
+    renamePlaceholder: '会话名称',
   },
   // 目录树面板（components/DirectoryTree.vue）
   tree: {
@@ -231,6 +235,9 @@ export const zhCN = {
     // 拼在 sendFailed 之后的可选后缀（zh 全角括号、en 前置空格 + 半角括号）
     runInProgress: '（已有进行中任务）',
     treeLoadFailed: '目录树加载失败：{message}',
+    // issue #107：侧栏内联重命名——空串本地拦截 / 提交失败回退旧标题时的轻提示
+    renameEmpty: '会话名称不能为空',
+    renameFailed: '重命名失败：{message}',
   },
 } as const;
 

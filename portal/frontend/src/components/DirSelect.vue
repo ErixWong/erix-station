@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 目录下拉（issue #84 P5.4）：替换原「项目下拉」。数据源 GET /api/dirs（~/projects/ 一级
 // 目录 + running/queued 计数）；选项 = 目录名 + 运行态徽标（●N，N=running+queued，0 不显）；
-// 末项「＋ 新建目录」选中即弹内联表单（SidebarPanel 承接）；↻ 一次双刷（/api/dirs + 目录树）。
+// 末项「＋ 新建目录」选中即弹 NewDirectoryModal；↻ 一次双刷（/api/dirs + 目录树）。
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type DirInfo } from '../stores/workbench';
 
@@ -22,7 +22,7 @@ function onChange(e: Event) {
   const el = e.target as HTMLSelectElement;
   const v = el.value;
   if (v === '__new__') {
-    el.value = store.dirCwd ?? ''; // 下拉弹回当前选中，表单位置由 SidebarPanel 渲染
+    el.value = store.dirCwd ?? ''; // 下拉弹回当前选中，modal 由 SidebarPanel 挂载
     emit('new-dir');
     return;
   }

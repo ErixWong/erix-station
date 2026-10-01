@@ -34,3 +34,18 @@ export async function api<T = unknown>(path: string, opts: RequestInit = {}): Pr
   }
   return body;
 }
+
+/**
+ * issue #107：会话重命名（PATCH /api/sessions/:id，body `{ title }`）。
+ * 成功返回 `{ session }`（含落库后的 title/title_source）；失败抛 ApiError（400 validation_failed /
+ * 404 not_found / 401 未登录）。后端 ≥200 字符拒绝、成功后置 title_source='manual'（手工优先守卫）。
+ */
+export function patchSessionTitle(
+  sessionId: string,
+  title: string,
+): Promise<{ session: { id: string; title: string | null; title_source?: string | null } }> {
+  return api(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
+}
