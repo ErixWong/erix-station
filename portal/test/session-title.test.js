@@ -22,7 +22,7 @@ import {
   fallbackTitleFromCwd,
   evaluateAutoTitle,
 } from '../src/session-title.js';
-import { createSession, updateSession } from '../src/sessions.js';
+import { createSession, updateSession, postMessage } from '../src/sessions.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -106,6 +106,20 @@ test('clipTitleFromMessage / fallbackTitleFromCwd：首条消息截断与 cwd ba
   assert.equal(fallbackTitleFromCwd(null), '未命名会话');
 });
 
+test('issue #114：clipTitleFromMessage({ellipsis:true})——被截断尾加 …；未截断不加；默认不加（#88 语义不变）', () => {
+  const long = 'a'.repeat(50);
+  assert.equal(clipTitleFromMessage(long, { ellipsis: true }), `${'a'.repeat(AUTO_TITLE_MAX_LEN)}…`, '截断 30 字 + 尾缀 …');
+  assert.equal(clipTitleFromMessage('正好三十个字', { ellipsis: true }), '正好三十个字', '未截断不加 …');
+  // 恰好 30 字（边界）：不截断 → 不加省略号。
+  const exact = '字'.repeat(AUTO_TITLE_MAX_LEN);
+  assert.equal(clipTitleFromMessage(exact, { ellipsis: true }), exact, '恰为上限不加 …');
+  assert.equal(clipTitleFromMessage('字'.repeat(AUTO_TITLE_MAX_LEN + 1), { ellipsis: true }), `${'字'.repeat(AUTO_TITLE_MAX_LEN)}…`, '超 1 字即加 …');
+  // 默认参数不破坏 #88 既有调用方（evaluateAutoTitle 降级链）语义。
+  assert.equal(clipTitleFromMessage(long), 'a'.repeat(AUTO_TITLE_MAX_LEN), '默认不加省略号');
+  assert.equal(clipTitleFromMessage(long, {}), 'a'.repeat(AUTO_TITLE_MAX_LEN));
+  assert.equal(clipTitleFromMessage('  ', { ellipsis: true }), null, '空消息仍为 null（走末级降级）');
+});
+
 // ---------------------------------------------------------------------------
 // sessions.js：title_source 语义（createSession / updateSession）
 // ---------------------------------------------------------------------------
@@ -170,6 +184,130 @@ test('updateSession：改 title → title_source=manual', async () => {
   assert.equal(updated.title_source, 'manual');
   const upd = pool.queries.find((q) => q.sql.startsWith('UPDATE chat_sessions') && q.sql.includes('SET title ='));
   assert.ok(upd.sql.includes("title_source = 'manual'"), 'UPDATE 必须置 manual');
+});
+
+// ---------------------------------------------------------------------------
+// issue #114：postMessage 首条消息截断为默认标题（零 LLM，与 ERIX_SESSION_AUTO_TITLE 开关解耦）
+// ---------------------------------------------------------------------------
+
+const PM_SESSION_ID = 'a1b2c3d4-1111-4111-8111-abcdefabcdef';
+
+/** postMessage 的业务事务 fake client：记录 SQL 顺序，模拟 chat_sessions 的标题守卫语义。 */
+function postMessageClient({ title = '', title_source = 'auto' } = {}) {
+  const state = { title, title_source };
+  const order = [];
+  const client = {
+    async query(sql, params = []) {
+      order.push({ sql, params });
+      const s = sql.replace(/\s+/g, ' ').trim();
+      if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [] };
+      if (s.includes('pg_advisory_xact_lock')) return { rows: [] };
+      if (s.includes('FROM chat_sessions s') && s.includes('FOR UPDATE')) {
+        return { rows: [{ id: PM_SESSION_ID, user_id: 'u1', project_id: null, cwd: '~/projects/p', title: state.title, title_source: state.title_source, model: null, status: 'active', last_seq: 0 }] };
+      }
+      if (s.includes('FROM runs WHERE session_id')) return { rows: [] };
+      if (s.includes('SELECT fde_name FROM users WHERE id')) return { rows: [{ fde_name: 'alice' }] };
+      if (s.includes('SELECT provider_id FROM fde_llm_bindings')) return { rows: [] };
+      if (s.includes('FROM containers')) return { rows: [{ id: 'c1' }] };
+      if (s.includes('UPDATE chat_sessions SET last_seq')) return { rows: [{ last_seq: 1 }] };
+      if (s.startsWith('INSERT INTO messages')) {
+        return { rows: [{ id: 'm1', seq: 1, role: 'user', content: params[2], attachments: '[]', created_at: new Date() }] };
+      }
+      // 首条消息默认标题落库：WHERE 守卫与真实 SQL 同语义（title 非空 / 非 auto → 0 行）。
+      if (s.startsWith('UPDATE chat_sessions SET title =')) {
+        if (String(state.title ?? '').trim() !== '' || state.title_source !== 'auto') return { rows: [] };
+        state.title = params[1];
+        return { rows: [{ title: params[1] }] };
+      }
+      if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
+      if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
+      if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
+      throw new Error(`unexpected SQL: ${sql}`);
+    },
+    release() {},
+  };
+  return { pool: { connect: async () => client }, order, state };
+}
+
+/** 从 SQL 日志里取「默认标题落库」语句（无则 undefined）。 */
+const titleStmt = (order) => order.find((e) => e.sql.replace(/\s+/g, ' ').startsWith('UPDATE chat_sessions SET title ='));
+
+async function runPostMessage(opts = {}, msgOpts = {}) {
+  const { pool, order, state } = postMessageClient(opts);
+  const titles = [];
+  const posted = await postMessage(pool, {
+    userId: 'u1',
+    sessionId: PM_SESSION_ID,
+    content: msgOpts.content ?? 'hi',
+    attachments: [],
+    onSessionTitle: (t) => titles.push(t),
+  });
+  return { posted, order, state, titles };
+}
+
+test('issue #114：首条消息 >30 字 → 标题 = 前 30 字 + `…`（零 LLM），COMMIT 后回调推送一次', async () => {
+  const content = '帮我把这个仓库的登录页面白屏问题彻底修复掉并且补上回归测试用例';
+  assert.ok(Array.from(content).length > AUTO_TITLE_MAX_LEN, '用例内容确实超 30 字');
+  const { posted, order, state, titles } = await runPostMessage({}, { content });
+  const stmt = titleStmt(order);
+  assert.ok(stmt, '首条消息应写默认标题');
+  assert.equal(stmt.params[1], `${Array.from(content).slice(0, AUTO_TITLE_MAX_LEN).join('')}…`);
+  assert.equal(state.title, stmt.params[1]);
+  assert.equal(state.title_source, 'auto', '默认标题不改 title_source（仍归自动流程可刷新）');
+  assert.equal(posted.run.status, 'queued', '标题落库不影响建 run 契约');
+  // 推送在 COMMIT 之后（绝不先于落库到达客户端）
+  const iCommit = order.findIndex((e) => e.sql === 'COMMIT');
+  assert.ok(iCommit !== -1 && order.indexOf(stmt) < iCommit, '标题 UPDATE 在事务内');
+  assert.deepEqual(titles, [stmt.params[1]], 'COMMIT 后回调一次新标题（供 SSE 推送）');
+});
+
+test('issue #114：首条消息 ≤30 字 → 标题 = 原文（不加 `…`）', async () => {
+  const { order, state, titles } = await runPostMessage({}, { content: '修复登录页白屏' });
+  assert.equal(titleStmt(order).params[1], '修复登录页白屏');
+  assert.equal(state.title, '修复登录页白屏');
+  assert.deepEqual(titles, ['修复登录页白屏']);
+});
+
+test('issue #114：已有标题（title 非空）→ 幂等不动、不回调', async () => {
+  const { order, titles } = await runPostMessage({ title: '我的标题' }, { content: '新的一条很长的用户消息内容超过三十个字符了吧' });
+  assert.equal(titleStmt(order), undefined, '标题非空 → 不发 UPDATE');
+  assert.deepEqual(titles, []);
+});
+
+test('issue #114：title_source=manual 且标题空 → 不动（手工优先守卫）', async () => {
+  const { order, titles } = await runPostMessage({ title: '', title_source: 'manual' }, { content: '随便一条消息' });
+  assert.equal(titleStmt(order), undefined, 'manual 行绝不写默认标题');
+  assert.deepEqual(titles, []);
+});
+
+test('issue #114：ERIX_SESSION_AUTO_TITLE=0（开关关闭）→ 首条截断标题照样生效（解耦）', async () => {
+  const prev = process.env.ERIX_SESSION_AUTO_TITLE;
+  process.env.ERIX_SESSION_AUTO_TITLE = '0';
+  try {
+    const { order, titles } = await runPostMessage({}, { content: '修复登录页白屏' });
+    assert.equal(titleStmt(order)?.params[1], '修复登录页白屏', '默认命名不读 #88 开关');
+    assert.deepEqual(titles, ['修复登录页白屏']);
+  } finally {
+    if (prev === undefined) delete process.env.ERIX_SESSION_AUTO_TITLE;
+    else process.env.ERIX_SESSION_AUTO_TITLE = prev;
+  }
+});
+
+test('issue #114：并发抢占（UPDATE 命中 0 行）→ 不回调（安静放弃）', async () => {
+  const { pool, order } = postMessageClient({ title: '', title_source: 'auto' });
+  const client = await pool.connect();
+  const origQuery = client.query.bind(client);
+  // 让标题 UPDATE 恒返回 0 行（模拟事务外并发 PATCH 已置 manual/标题非空）
+  client.query = async (sql, params = []) => {
+    const s = sql.replace(/\s+/g, ' ').trim();
+    if (s.startsWith('UPDATE chat_sessions SET title =')) { order.push({ sql, params }); return { rows: [] }; }
+    return origQuery(sql, params);
+  };
+  const titles = [];
+  await postMessage({ connect: async () => client }, {
+    userId: 'u1', sessionId: PM_SESSION_ID, content: 'hi', attachments: [], onSessionTitle: (t) => titles.push(t),
+  });
+  assert.deepEqual(titles, [], '0 行（被抢占）不推送');
 });
 
 // ---------------------------------------------------------------------------

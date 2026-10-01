@@ -11,7 +11,7 @@
 // SSE 协议状态在 useEventStream composable 内（M1）。
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
-import { api, ApiError, patchSessionTitle } from '../api';
+import { api, ApiError, patchSessionTitle, postSessionAiTitle } from '../api';
 import { i18n } from '../i18n';
 import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
@@ -410,6 +410,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
 
+  /**
+   * issue #114：「AI 改名」——POST /api/sessions/:id/ai-title，成功后**原地**更新列表项
+   * `title`/`title_source`（同 renameSession 的原地更新模式，不整表 loadSessions）。
+   * 失败**不动** store（旧标题保留），返回错误文案供调用方做行内提示。
+   * @returns error=null 成功；否则为服务端 error.message（409 无 provider / 502 上游失败）
+   */
+  async function aiRenameSession(id: string): Promise<{ error: string | null }> {
+    try {
+      const { session } = await postSessionAiTitle(id);
+      const item = sessions.value.find((s) => String(s.id) === String(id));
+      if (item) {
+        item.title = session.title;
+        item.title_source = session.title_source ?? 'manual';
+      }
+      return { error: null };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   /** 深链解析（旧 resolveHashSession；跨项目切项目由调用方决定路由写回）。 */
   async function resolveRouteSession(sid: string): Promise<void> {
     if (sessions.value.some((s) => String(s.id) === String(sid))) {
@@ -556,7 +576,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessMeta,
     // actions
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
-    createSession, createDir, resolveRouteSession, resetSessionView, renameSession,
+    createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, send, stop, refreshSession,
   };
 });

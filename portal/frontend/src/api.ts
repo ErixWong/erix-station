@@ -49,3 +49,14 @@ export function patchSessionTitle(
     body: JSON.stringify({ title }),
   });
 }
+
+/**
+ * issue #114：「AI 改名」——POST /api/sessions/:id/ai-title（空体 `{}`）。
+ * 服务端取该会话前 3 条 user 消息调**一次** LLM 生成 ≤30 字标题，落库 title_source='manual'。
+ * 失败抛 ApiError：409 llm_not_configured（未配置 provider）/ 502 llm_upstream_failed（上游失败）/ 404。
+ */
+export function postSessionAiTitle(
+  sessionId: string,
+): Promise<{ session: { id: string; title: string | null; title_source?: string | null } }> {
+  return api(`/api/sessions/${encodeURIComponent(sessionId)}/ai-title`, { method: 'POST', body: '{}' });
+}

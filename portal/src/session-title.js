@@ -79,11 +79,17 @@ export function sanitizeTitle(raw) {
   return Array.from(t).slice(0, AUTO_TITLE_MAX_LEN).join('');
 }
 
-/** 降级标题：首条用户消息截断（纯函数）；空消息 → null（再降级 cwd basename）。 */
-export function clipTitleFromMessage(content) {
+/** 降级标题：首条用户消息截断（纯函数）；空消息 → null（再降级 cwd basename）。
+ *
+ * issue #114：新增 `ellipsis` 选项——内容超过上限被截断时尾部补 `…`（未截断不加）。
+ * 默认 false 以**保持 #88 既有调用方语义**（evaluateAutoTitle 的降级链不想要省略号）；
+ * 首条消息默认命名（sessions.postMessage）显式传 `{ ellipsis: true }`。 */
+export function clipTitleFromMessage(content, { ellipsis = false } = {}) {
   const t = String(content ?? '').replace(/\s+/g, ' ').trim();
   if (t === '') return null;
-  return Array.from(t).slice(0, AUTO_TITLE_MAX_LEN).join('');
+  const chars = Array.from(t);
+  const clipped = chars.slice(0, AUTO_TITLE_MAX_LEN).join('');
+  return ellipsis && chars.length > AUTO_TITLE_MAX_LEN ? `${clipped}…` : clipped;
 }
 
 /** 末级降级：cwd basename（~/projects/<name> → <name>；basename 空 → '未命名会话'）。 */

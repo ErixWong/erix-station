@@ -115,8 +115,36 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.ok(body.Env.includes('ERIX_SHELL_TIMEOUT_MS=60000'), 'ERIX_SHELL_TIMEOUT_MS 默认下发');
   assert.ok(body.Env.includes('ERIX_SHELL_MAX_TIMEOUT_MS=600000'), 'ERIX_SHELL_MAX_TIMEOUT_MS 默认下发');
   assert.ok(body.Env.includes('ERIX_SHELL_OUTPUT_MAX_BYTES=32768'), 'ERIX_SHELL_OUTPUT_MAX_BYTES 默认下发');
-  // issue #88 修订：worker 侧会话标题生成开关（字符串开关，默认下发 '1'；'0' 透传）。
-  assert.ok(body.Env.includes('ERIX_SESSION_AUTO_TITLE=1'), 'ERIX_SESSION_AUTO_TITLE 默认下发');
+  // issue #88 / #114 修订：worker 侧会话标题生成开关（字符串开关；#114 起**默认下发 '0'**——
+  // 默认标题改由首条消息截断/手工/AI 改名承担，省 token；显式设 1 才开回 #88 行为）。
+  assert.ok(body.Env.includes('ERIX_SESSION_AUTO_TITLE=0'), 'ERIX_SESSION_AUTO_TITLE 默认下发 0（#114 默认关）');
+});
+
+test('issue #114：ERIX_SESSION_AUTO_TITLE 显式设 1 → 下发 1（开回 #88 自动起名）；其它值 → 0', () => {
+  const cfg = {
+    fdeName: 'alice',
+    containerName: 'fde-alice',
+    image: 'traefik/whoami',
+    cmd: ['-port', '4000'],
+    networkName: 'fde-alice',
+    ip: '10.200.1.2',
+    gateway: '10.200.1.1',
+    baseDomain: 'localhost',
+    llmHost: 'llm.localhost',
+    userSpaceRoot: '/srv/erix/users',
+    memoryLimit: '512m',
+    runUser: '1001:1000',
+  };
+  const prev = process.env.ERIX_SESSION_AUTO_TITLE;
+  try {
+    process.env.ERIX_SESSION_AUTO_TITLE = '1';
+    assert.ok(buildContainerConfig(cfg).Env.includes('ERIX_SESSION_AUTO_TITLE=1'), '显式 1 → 下发 1');
+    process.env.ERIX_SESSION_AUTO_TITLE = 'yes';
+    assert.ok(buildContainerConfig(cfg).Env.includes('ERIX_SESSION_AUTO_TITLE=0'), '非 1 值 → 下发 0');
+  } finally {
+    if (prev === undefined) delete process.env.ERIX_SESSION_AUTO_TITLE;
+    else process.env.ERIX_SESSION_AUTO_TITLE = prev;
+  }
 });
 
 test('buildNetworkConfig：显式 subnet + gateway', () => {
