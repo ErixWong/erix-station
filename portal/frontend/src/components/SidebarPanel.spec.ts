@@ -25,7 +25,7 @@ beforeEach(() => {
 });
 
 async function mountPanel(
-  opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; platformAdmin?: boolean } = {},
+  opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; platformAdmin?: boolean; attachTo?: boolean } = {},
   attrs: Record<string, unknown> = {},
 ) {
   const store = useWorkbenchStore();
@@ -43,7 +43,13 @@ async function mountPanel(
   const router = createAppRouter(createMemoryHistory());
   router.push('/');
   await router.isReady();
-  const wrapper = mount(SidebarPanel, { global: { plugins: [router, i18n] }, attrs });
+  // issue #107：重命名用例需断言 document.activeElement（autofocus 全选）——挂到真实文档才成立；
+  // 这类用例自行 wrapper.unmount() 清理，避免残留在 body 里干扰后续用例。
+  const wrapper = mount(SidebarPanel, {
+    global: { plugins: [router, i18n] },
+    attrs,
+    attachTo: opts.attachTo ? document.body : undefined,
+  });
   await flushPromises();
   return wrapper;
 }
@@ -195,14 +201,16 @@ describe('SidebarPanel · issue #94 会话浏览入口', () => {
 describe('SidebarPanel · i18n（issue #101 P2）', () => {
   const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
 
-  it('zh-CN 基线：＋ 新会话 / 暂无会话 / 浏览会话入口 / 新建目录表单文案', async () => {
+  it('zh-CN 基线：＋ 新会话 / 暂无会话 / 浏览会话入口 / 新建目录 modal 文案', async () => {
     const wrapper = await mountPanel({ dirs: DIR, sessions: [] });
     expect(wrapper.text()).toContain('＋ 新会话');
     expect(wrapper.text()).toContain('暂无会话');
     expect(wrapper.get('button[aria-label="浏览会话"]').attributes('title')).toBe('浏览会话（Ctrl/⌘+K）');
 
-    await wrapper.get('select').setValue('__new__'); // 末项「＋ 新建目录」→ 内联表单
+    await wrapper.get('select').setValue('__new__'); // 末项「＋ 新建目录」→ modal（不再内联表单）
     await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('新建目录'); // modal 标题
     expect(wrapper.get('label[for="newDirName"]').text()).toBe('目录名（小写字母/数字/连字符）');
     expect(wrapper.get('#newDirName').attributes('placeholder')).toBe('例如 my-project');
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['创建', '取消']);
@@ -229,6 +237,8 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
 
     await wrapper.get('select').setValue('__new__');
     await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('New directory'); // modal 标题
     expect(wrapper.get('label[for="newDirName"]').text())
       .toBe('Directory name (lowercase letters / digits / hyphens)');
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['Create', 'Cancel']);
@@ -241,5 +251,202 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.text()).toContain('Platform admin: create FDE users and assign resources in the admin console');
     expect(wrapper.text()).toContain('Go to admin console');
     expect(wrapper.get('a[href="/admin"]').text()).toBe('Admin console');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #107：会话卡片内联重命名（hover ✏️ → 原地 input；Enter/blur 提交、Esc 取消、空串拦截）
+// 后端 PATCH /api/sessions/:id 已就绪（本 issue 零接口改动，只补一条 SSE）；本套件桩掉 fetch。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · 会话重命名（issue #107）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  /** 替换 fetch 桩：记录全部请求（url/method/body），统一返回给定结果。 */
+  function stubRenameFetch(result: { status: number; body: unknown }) {
+    const calls: Array<{ url: string; method: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({
+        url: String(url),
+        method: init?.method ?? 'GET',
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      return new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    return calls;
+  }
+
+  it('hover 出现 ✏️ 入口（title/aria-label「重命名」）；点击原地开 input（autofocus + 全选），不误触选中会话', async () => {
+    const onSelectSession = vi.fn();
+    const wrapper = await mountPanel(
+      { dirs: DIR, sessions: [{ id: '7', title: '旧名' }], attachTo: true },
+      { onSelectSession },
+    );
+    try {
+      const btn = wrapper.get('button[aria-label="重命名"]');
+      expect(btn.text()).toBe('✏️');
+      expect(btn.attributes('title')).toBe('重命名');
+      expect(btn.classes()).toContain('opacity-0'); // 默认隐藏，hover 才浮现（group-hover:opacity-100）
+      expect(btn.classes()).toContain('group-hover:opacity-100');
+
+      await btn.trigger('click');
+      await flushPromises();
+      expect(onSelectSession).not.toHaveBeenCalled(); // @click.stop：重命名不触发「选中会话」
+
+      const input = wrapper.get('input[aria-label="重命名"]');
+      const el = input.element as HTMLInputElement;
+      expect(el.value).toBe('旧名'); // 原地变 input（不弹 modal）
+      expect(input.attributes('placeholder')).toBe('会话名称');
+      expect(input.attributes('maxlength')).toBe('200'); // 与后端 ≤200 校验同口径
+      expect(document.activeElement).toBe(el); // autofocus
+      expect([el.selectionStart, el.selectionEnd]).toEqual([0, 2]); // 全选（改整个名字）
+      expect(wrapper.find('button[aria-label="重命名"]').exists()).toBe(false); // 编辑态隐藏 ✏️
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('Enter 提交：PATCH /api/sessions/<id> {title}（trim），成功后 store 原地更新 title/title_source 并退出编辑态', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名', title_source: 'auto' }] });
+    const store = useWorkbenchStore();
+    const calls = stubRenameFetch({ status: 200, body: { session: { id: '7', title: '新名', title_source: 'manual' } } });
+    try {
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      const input = wrapper.get('input[aria-label="重命名"]');
+      await input.setValue('  新名  ');
+      await input.trigger('keydown', { key: 'Enter' });
+      await flushPromises();
+
+      expect(calls).toEqual([{ url: '/api/sessions/7', method: 'PATCH', body: { title: '新名' } }]);
+      expect(store.sessions[0].title).toBe('新名'); // 原地更新（不整表 loadSessions）
+      expect(store.sessions[0].title_source).toBe('manual');
+      expect(wrapper.find('input[aria-label="重命名"]').exists()).toBe(false); // 退出编辑态
+      expect(wrapper.text()).toContain('新名');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('blur 提交：失焦即提交（与 Enter 同语义）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    const calls = stubRenameFetch({ status: 200, body: { session: { id: '7', title: '失焦改名', title_source: 'manual' } } });
+    try {
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      const input = wrapper.get('input[aria-label="重命名"]');
+      await input.setValue('失焦改名');
+      await input.trigger('blur');
+      await flushPromises();
+
+      expect(calls).toHaveLength(1);
+      expect(store.sessions[0].title).toBe('失焦改名');
+      expect(wrapper.find('input[aria-label="重命名"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('Esc 取消：不发请求、标题不变、退出编辑态', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    const calls = stubRenameFetch({ status: 200, body: { session: { id: '7', title: '新名' } } });
+    try {
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      const input = wrapper.get('input[aria-label="重命名"]');
+      await input.setValue('新名');
+      await input.trigger('keydown', { key: 'Escape' });
+      await flushPromises();
+
+      expect(calls).toEqual([]);
+      expect(store.sessions[0].title).toBe('旧名');
+      expect(wrapper.find('input[aria-label="重命名"]').exists()).toBe(false);
+      expect(wrapper.text()).toContain('旧名');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('空串/纯空白：前端拦截不提交（空串落 manual 会永久关掉自动命名），静默回退旧标题', async () => {
+    for (const blank of ['', '   ', '\t\n ']) {
+      const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+      const store = useWorkbenchStore();
+      const calls = stubRenameFetch({ status: 200, body: { session: { id: '7', title: '新名', title_source: 'manual' } } });
+      try {
+        await wrapper.get('button[aria-label="重命名"]').trigger('click');
+        const input = wrapper.get('input[aria-label="重命名"]');
+        await input.setValue(blank);
+        await input.trigger('keydown', { key: 'Enter' });
+        await flushPromises();
+
+        expect(calls).toEqual([]);
+        expect(store.sessions[0].title).toBe('旧名');
+        expect(store.sessions[0].title_source).toBeUndefined(); // 未被置 manual
+        expect(wrapper.text()).toContain('旧名');
+        expect(wrapper.find('input[aria-label="重命名"]').exists()).toBe(false);
+      } finally {
+        wrapper.unmount();
+      }
+    }
+  });
+
+  it('超 200 字符：前端截断到 200 再提交（与后端校验口径一致，不把 400 抛给用户）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    const calls = stubRenameFetch({ status: 200, body: { session: { id: '7', title: '长'.repeat(200), title_source: 'manual' } } });
+    try {
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      const input = wrapper.get('input[aria-label="重命名"]');
+      await input.setValue('长'.repeat(250));
+      await input.trigger('keydown', { key: 'Enter' });
+      await flushPromises();
+
+      expect(calls[0].body).toEqual({ title: '长'.repeat(200) });
+      expect(store.sessions[0].title).toBe('长'.repeat(200));
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('PATCH 失败（401）：原地回退旧标题 + 卡片内轻提示（.syserr role=alert）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    stubRenameFetch({ status: 401, body: { error: { code: 'unauthorized', message: '未登录' } } });
+    try {
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      const input = wrapper.get('input[aria-label="重命名"]');
+      await input.setValue('新名');
+      await input.trigger('keydown', { key: 'Enter' });
+      await flushPromises();
+
+      expect(store.sessions[0].title).toBe('旧名'); // store 未被改动（原地回退旧标题）
+      expect(wrapper.find('input[aria-label="重命名"]').exists()).toBe(false);
+      expect(wrapper.text()).toContain('旧名');
+      const alert = wrapper.get('[role="alert"]');
+      expect(alert.text()).toBe('重命名失败：未登录');
+      expect(alert.classes()).toContain('syserr'); // 沿用项目行内错误提示样式（无 toast 体系）
+
+      // 再次进入编辑态：旧提示清掉，可重试
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      await flushPromises();
+      expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('i18n：切 English 后 ✏️ 的 title/aria-label 与输入占位符变英文', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: 'old name' }] });
+    try {
+      setLocale('en');
+      await flushPromises();
+      const btn = wrapper.get('button[aria-label="Rename session"]');
+      expect(btn.attributes('title')).toBe('Rename session');
+      await btn.trigger('click');
+      expect(wrapper.get('input[aria-label="Rename session"]').attributes('placeholder')).toBe('Session name');
+    } finally {
+      wrapper.unmount();
+    }
   });
 });

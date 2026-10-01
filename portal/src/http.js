@@ -709,6 +709,14 @@ async function handlePatchSession(req, res, ctx, sessionId) {
   requireJson(req);
   const body = await readJsonBody(req, ctx.config.maxBodyBytes);
   const updated = await sessions.updateSession(ctx.pool, { userId: session.user.id, sessionId, title: body?.title });
+  // issue #107：手工改名成功同样推一条 `session_updated`（与 session-title.js evaluateAutoTitle 同构，
+  // 形状 { ts, type, payload:{ title } }）——多标签页 / SessionPicker 的列表标题实时同步。
+  // 不落 run_events：标题是会话元数据而非时间线事件（同 #88 裁决）。推送失败不影响已落库的标题。
+  try {
+    internal.notifySessionEvents(sessionId, [{
+      ts: new Date().toISOString(), type: 'session_updated', payload: { title: updated.title },
+    }]);
+  } catch { /* 尽力：无订阅者 / 连接已断都不影响 200 响应 */ }
   return sendJson(res, 200, { session: updated });
 }
 
