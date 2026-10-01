@@ -65,7 +65,7 @@ function onNewDirCreated(sessionId: string) {
 }
 
 // ---- issue #107：会话卡片内联重命名（PATCH /api/sessions/:id，零后端接口改动）----
-// 交互：hover 卡片右端浮现 ✏️ → 点击原地换 <input>（不弹 modal；autofocus + 全选）；Enter 提交 /
+// 交互：hover 卡片右端浮现铅笔按钮 → 点击原地换 <input>（不弹 modal；autofocus + 全选）；Enter 提交 /
 // Esc 取消 / blur 提交；空串/纯空白前端拦截不发请求（空串落库会置 title_source='manual'，
 // 永久关掉后续自动命名——宁可无操作）。同一时刻只允许一个卡片处于编辑态。
 const editingId = ref<string | null>(null);
@@ -120,6 +120,13 @@ async function commitEdit() {
   const { error } = await store.renameSession(id, raw);
   if (error) editError.value = { id, text: t('errors.renameFailed', { message: error }) };
 }
+
+// ---- issue #112：左栏视觉收敛（向 pi-web 靠拢）----
+// 行样式为纯呈现层：选中判定抽成函数供 class 绑定复用（与原内联表达式语义完全等价，不改选中逻辑）。
+/** 该会话是否为当前选中（行样式：左 2px brand 竖条 + 浅绿底）。 */
+function isActive(s: Session): boolean {
+  return String(s.id) === String(store.sessionId);
+}
 </script>
 
 <template>
@@ -129,10 +136,11 @@ async function commitEdit() {
     <!-- ① 固定头：不随会话列表滚动 -->
     <div class="shrink-0">
       <!-- 常驻「管理台」入口（旧 index.html header adminLink 的 SPA 等价；admin 角色才显示） -->
+      <!-- issue #112：侧栏头控件统一 32px 高 / 7px 圆角 / 12px 字号（对齐 pi-web 控件规格） -->
       <router-link
         v-if="auth.user?.role === 'admin'"
         to="/admin"
-        class="mb-2 block rounded-md border border-black/20 px-2.5 py-1 text-center text-sm hover:bg-black/5"
+        class="mb-2 block h-8 rounded-[7px] border border-black/20 bg-black/[.03] px-2.5 text-center text-[12px] leading-8 hover:bg-black/10"
       >{{ t('common.adminConsole') }}</router-link>
 
       <!-- 目录下拉 + ↻ 双刷（issue #84 P5：替换原项目 select + 新项目表单） -->
@@ -141,9 +149,10 @@ async function commitEdit() {
       <!-- 「＋ 新建目录」选 → 弹 NewDirectoryModal（表单不再内联挤在头部） -->
 
       <!-- 「＋ 新会话」+ 🔍 浏览会话（issue #94：默认当前目录，无目录时全量；Ctrl/⌘+K 同语义） -->
+      <!-- issue #112：控件 32px 高 / 7px 圆角 / 12px 字号（bg-hover→bg-selected 映射为本项目黑阶两档） -->
       <div class="mt-3 flex gap-2">
         <button
-          class="flex-1 rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
+          class="h-8 flex-1 rounded-[7px] border border-black/20 bg-black/[.03] px-2.5 text-[12px] hover:bg-black/10 disabled:opacity-50"
           :disabled="store.newSessDisabled"
           @click="emit('new-session')"
         >{{ t('sidebar.newSession') }}</button>
@@ -151,7 +160,7 @@ async function commitEdit() {
           type="button"
           :title="t('sidebar.browseTitle')"
           :aria-label="t('sidebar.browse')"
-          class="shrink-0 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
+          class="h-8 w-8 shrink-0 rounded-[7px] border border-black/20 bg-black/[.03] text-[12px] hover:bg-black/10"
           @click="openPicker(store.dirCwd ? 'cwd' : 'all')"
         >🔍</button>
       </div>
@@ -159,49 +168,77 @@ async function commitEdit() {
 
     <!-- ② 会话列表段（该目录）：flex-1 min-h-0 + 独立内部滚动；空态文案也放这里（issue #92） -->
     <div class="mt-2 min-h-0 flex-1 overflow-y-auto">
+      <!-- issue #112：空态文案 11px / text-dim / padding 8px 10px（对齐 pi-web 空态规格） -->
       <div v-if="store.noDir">
-        <p v-if="store.isPlatformAdmin" class="muted">
+        <p v-if="store.isPlatformAdmin" class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">
           {{ t('common.platformAdminHint') }}<br><router-link to="/admin" class="underline">{{ t('common.goToAdmin') }}</router-link>
         </p>
-        <p v-else class="muted">{{ t('common.createFirstDir') }}</p>
+        <p v-else class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">{{ t('common.createFirstDir') }}</p>
       </div>
       <div v-else>
-        <p v-if="store.sessions.length === 0" class="muted">{{ t('sidebar.noSessions') }}</p>
+        <p v-if="store.sessions.length === 0" class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">{{ t('sidebar.noSessions') }}</p>
+        <!-- issue #112：会话卡片 → 扁平行（对齐 pi-web SessionItem）：无边框卡片、左 14 右 8 内边距、
+             选中 = 左 2px brand 竖条 + 浅绿底（border-l-2 常驻以免布局跳动）、hover = 浅灰底。
+             用 min-h-[54px]（而非固定 height）保留行内错误提示行增高能力，正常两行内容下恰为 54px。 -->
         <div
           v-for="s in store.sessions"
           :key="String(s.id)"
-          class="group mt-2 cursor-pointer rounded-md border border-black/15 px-2 py-1.5 text-sm"
-          :class="String(s.id) === String(store.sessionId) ? 'border-brand bg-green-50' : 'hover:bg-black/5'"
+          data-session-row
+          class="group flex min-h-[54px] cursor-pointer items-center gap-1.5 border-l-2 pl-3.5 pr-2"
+          :class="isActive(s) ? 'border-l-brand bg-green-50' : 'border-l-transparent hover:bg-black/5'"
           @click="emit('select-session', String(s.id))"
         >
-          <div class="flex items-center gap-1">
-            <!-- issue #107：编辑态 = 原地 input（不弹 modal）；非编辑态 = 标题 + hover/focus 浮现的 ✏️ -->
-            <input
-              v-if="editingId === String(s.id)"
-              :ref="setEditInput"
-              v-model="editTitle"
-              :maxlength="SESSION_TITLE_MAX_LEN"
-              :placeholder="t('sidebar.renamePlaceholder')"
+          <!-- issue #107：编辑态 = 原地 input（不弹 modal）；非编辑态 = 标题 + hover/focus 浮现的铅笔按钮 -->
+          <!-- issue #112：input 收敛为 12px / 30px 高 / 5px 圆角（对齐 pi-web 重命名规格） -->
+          <input
+            v-if="editingId === String(s.id)"
+            :ref="setEditInput"
+            v-model="editTitle"
+            :maxlength="SESSION_TITLE_MAX_LEN"
+            :placeholder="t('sidebar.renamePlaceholder')"
+            :aria-label="t('sidebar.rename')"
+            class="h-[30px] min-w-0 flex-1 rounded-[5px] border border-brand bg-white px-2 text-[12px] outline-none"
+            @click.stop
+            @keydown="onEditKeydown"
+            @blur="commitEdit"
+          >
+          <template v-else>
+            <div class="min-w-0 flex-1">
+              <!-- 标题行：12px（选中 500 / 常规 400）+ 单行 ellipsis -->
+              <div class="flex min-w-0 items-center gap-1.5 text-[12px] leading-[1.4]">
+                <span class="min-w-0 truncate" :class="isActive(s) ? 'font-medium' : ''">{{ s.title || t('common.unnamedSession') }}</span>
+              </div>
+              <!-- 副行：11px / text-dim / marginTop 2 -->
+              <div class="mt-0.5 truncate text-[11px] leading-[1.4] text-black/50">{{ store.sessMeta(s) }}</div>
+              <p v-if="editError?.id === String(s.id)" class="syserr mt-0.5" role="alert">{{ editError.text }}</p>
+            </div>
+            <!-- @click.stop：重命名入口不得误触「选中会话」 -->
+            <!-- issue #112：重命名入口重做——emoji ✏️ → 内联 SVG 铅笔（stroke/currentColor，不自带红色）
+                 + 浮现按钮形状（24px 方块 / 5px 圆角 / 细边框，对齐 pi-web 图标按钮规格）；
+                 title/aria-label/@click.stop/编辑态隐藏 语义全部保留，浮现逻辑仍 opacity-0 → group-hover:opacity-100 -->
+            <button
+              type="button"
+              :title="t('sidebar.rename')"
               :aria-label="t('sidebar.rename')"
-              class="min-w-0 flex-1 rounded-md border border-brand px-1 py-0.5 text-sm"
-              @click.stop
-              @keydown="onEditKeydown"
-              @blur="commitEdit"
+              class="flex h-6 w-6 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/50 opacity-0 hover:bg-black/10 focus-visible:opacity-100 group-hover:opacity-100"
+              @click.stop="startEdit(s)"
             >
-            <template v-else>
-              <div class="min-w-0 flex-1 truncate">{{ s.title || t('common.unnamedSession') }}</div>
-              <!-- @click.stop：重命名入口不得误触「选中会话」 -->
-              <button
-                type="button"
-                :title="t('sidebar.rename')"
-                :aria-label="t('sidebar.rename')"
-                class="shrink-0 rounded px-1 text-xs opacity-0 hover:bg-black/10 focus-visible:opacity-100 group-hover:opacity-100"
-                @click.stop="startEdit(s)"
-              >✏️</button>
-            </template>
-          </div>
-          <div class="text-black/50 text-xs">{{ store.sessMeta(s) }}</div>
-          <p v-if="editError?.id === String(s.id)" class="syserr mt-1 text-xs" role="alert">{{ editError.text }}</p>
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+              </svg>
+            </button>
+          </template>
         </div>
       </div>
     </div>

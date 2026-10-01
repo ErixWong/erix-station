@@ -66,7 +66,7 @@ export const en = {
     browse: 'Browse sessions',
     browseTitle: 'Browse sessions (Ctrl/⌘+K)',
     noSessions: 'No sessions',
-    // issue #107：inline rename entry（✏️ title/aria-label + edit input placeholder）
+    // issue #107：inline rename entry（pencil button title/aria-label + edit input placeholder；#112 SVG icon）
     rename: 'Rename session',
     renamePlaceholder: 'Session name',
   },

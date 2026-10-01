@@ -73,18 +73,19 @@ watch(open, (v) => { if (v && !childMap.has('') && !loadingSet.has('')) void loa
 </script>
 
 <template>
+  <!-- issue #112：目录树字号收敛——小节标题 11px/600/0.05em（中文不做 uppercase），行内 11–12px、行高收紧；懒展开交互不动 -->
   <div class="mt-3 border-t border-black/10 pt-2">
     <button
       type="button"
-      class="w-full rounded px-1 py-1 text-left text-sm hover:bg-black/5"
+      class="w-full rounded px-1 py-[3px] text-left text-[11px] font-semibold tracking-[0.05em] hover:bg-black/5"
       @click="open = !open"
     >{{ open ? '▾' : '▸' }} {{ t('tree.title') }}</button>
-    <div v-if="open" class="mt-1 text-sm">
-      <p v-if="!cwd" class="muted px-1 text-xs">{{ t('tree.selectDirFirst') }}</p>
-      <p v-else-if="error" class="syserr px-1 text-xs" role="alert">{{ error }}</p>
+    <div v-if="open" class="mt-1 text-[12px] leading-[1.5]">
+      <p v-if="!cwd" class="px-1 py-0.5 text-[11px] text-black/50">{{ t('tree.selectDirFirst') }}</p>
+      <p v-else-if="error" class="syserr px-1 py-0.5" role="alert">{{ error }}</p>
       <template v-else>
-        <p v-if="loadingSet.has('')" class="muted px-1 text-xs">{{ t('common.loading') }}</p>
-        <p v-else-if="!childMap.get('')?.length" class="muted px-1 text-xs">{{ t('common.emptyDir') }}</p>
+        <p v-if="loadingSet.has('')" class="px-1 py-0.5 text-[11px] text-black/50">{{ t('common.loading') }}</p>
+        <p v-else-if="!childMap.get('')?.length" class="px-1 py-0.5 text-[11px] text-black/50">{{ t('common.emptyDir') }}</p>
         <DirTreeNode
           v-for="e in childMap.get('') ?? []"
           :key="e.name"
