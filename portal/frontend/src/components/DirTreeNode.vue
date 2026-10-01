@@ -30,22 +30,23 @@ function onClick() {
 </script>
 
 <template>
+  <!-- issue #112：行字号 12px / 行高收紧（py 1px）；图标 11px；缩进与懒展开交互不动 -->
   <div>
     <button
       type="button"
-      class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-black/5"
+      class="flex w-full items-center gap-1 rounded px-1 py-[1px] text-left text-[12px] leading-[1.5] hover:bg-black/5"
       :style="{ paddingLeft: 4 + props.depth * 14 + 'px' }"
       @click="onClick"
     >
-      <span class="shrink-0">{{ props.type === 'dir' ? (props.expandedSet.has(nodeKey) ? '📂' : '📁') : '📄' }}</span>
+      <span class="shrink-0 text-[11px]">{{ props.type === 'dir' ? (props.expandedSet.has(nodeKey) ? '📂' : '📁') : '📄' }}</span>
       <span class="truncate">{{ props.name }}</span>
-      <span v-if="props.loadingSet.has(nodeKey)" class="muted text-xs">…</span>
+      <span v-if="props.loadingSet.has(nodeKey)" class="text-[11px] text-black/50">…</span>
     </button>
     <div v-if="props.type === 'dir' && props.expandedSet.has(nodeKey)">
       <template v-if="!props.loadingSet.has(nodeKey)">
         <p
           v-if="!props.childMap.get(nodeKey)?.length"
-          class="muted text-xs"
+          class="text-[11px] text-black/50"
           :style="{ paddingLeft: 18 + props.depth * 14 + 'px' }"
         >{{ t('common.emptyDir') }}</p>
         <DirTreeNode
