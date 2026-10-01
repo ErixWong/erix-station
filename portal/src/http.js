@@ -431,6 +431,10 @@ async function routeApi(req, res, ctx, url) {
     if (req.method === 'PATCH') return handlePatchSession(req, res, ctx, sessionId);
     if (req.method === 'DELETE') return handleArchiveSession(req, res, ctx, sessionId);
   }
+  if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/ai-title$/.test(pathname)) {
+    // issue #114：「AI 改名」——用户主动触发的一次性 LLM 调用（属主鉴权同 PATCH）。
+    return handleAiTitle(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/ai-title$/)[1]));
+  }
   if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/messages$/.test(pathname)) {
     return handlePostMessage(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)[1]));
   }
@@ -728,6 +732,25 @@ async function handleArchiveSession(req, res, ctx, sessionId) {
 }
 
 /**
+ * POST /api/sessions/:id/ai-title（issue #114）：「AI 改名」——按需调一次 LLM 生成标题。
+ * 属主鉴权/存在性/active 校验在 sessions.generateAiTitle 内的 fetchSession（口径同 PATCH，404 不泄露存在性）。
+ * 失败口径：无可用 provider → 409 llm_not_configured；上游超时/非 2xx/标题不可解析 → 502 llm_upstream_failed。
+ * 成功：落库 title_source='manual' + 推 session_updated（多标签页列表标题同步；不落 run_events）。
+ */
+async function handleAiTitle(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）；仍读掉请求体保持行为一致
+  const updated = await sessions.generateAiTitle(ctx.pool, {
+    userId: session.user.id,
+    sessionId,
+    log: ctx.log,
+    notify: internal.notifySessionEvents,
+  });
+  return sendJson(res, 200, { session: updated });
+}
+
+/**
  * POST /api/sessions/:id/messages（portal.md §4.3）：发用户消息 + 建 run 入队。
  * 可选 `Idempotency-Key`（§1.4）：同 key 重复提交返回**首次结果**（同 message.id / run.id），
  * 不产生第二条 user 消息/第二个 run，也**不重复副作用**（notify 唤醒只在首次执行路径发生，
@@ -776,6 +799,10 @@ async function handlePostMessage(req, res, ctx, sessionId) {
         attachments,
         record,
         notify: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
+        // issue #114：首条消息截断出默认标题时推 session_updated（侧栏标题立即到位；live-only）。
+        onSessionTitle: (title) => internal.notifySessionEvents(sessionId, [{
+          ts: new Date().toISOString(), type: 'session_updated', payload: { title },
+        }]),
       });
       return { statusCode: 202, response: posted };
     },

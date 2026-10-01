@@ -569,3 +569,154 @@ describe('SidebarPanel · 会话重命名（issue #107）', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #114：「AI 改名」按钮（铅笔旁同款 24px 浮现方块按钮）
+//   点击 → 行内 loading（禁用 + 转圈）→ POST /api/sessions/:id/ai-title → 成功原地更新标题；
+//   失败 .syserr 行内提示（沿用 #107 模式）；编辑态下两按钮都隐藏；@click.stop 不误触选中。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · AI 改名（issue #114）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  /** 替换 fetch 桩：记录请求（url/method/body）；传函数则用其返回值（做挂起/延迟用）。 */
+  function stubAiFetch(result: { status: number; body: unknown } | (() => Promise<Response>)) {
+    const calls: Array<{ url: string; method: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({
+        url: String(url),
+        method: init?.method ?? 'GET',
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      if (typeof result === 'function') return result();
+      return new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    return calls;
+  }
+
+  it('铅笔旁同款浮现方块按钮：24px / 5px 圆角 / 细边框 / stroke 魔棒 SVG，默认隐藏 hover 浮现', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const btn = wrapper.get('button[aria-label="AI 改名"]');
+    expect(btn.attributes('title')).toBe('AI 改名');
+    expect(btn.classes()).toContain('h-6'); // 24px 方块（与铅笔同规格）
+    expect(btn.classes()).toContain('w-6');
+    expect(btn.classes()).toContain('rounded-[5px]');
+    expect(btn.classes()).toContain('border-black/15');
+    expect(btn.classes()).toContain('bg-white');
+    expect(btn.classes()).toContain('hover:bg-black/10');
+    expect(btn.classes()).toContain('opacity-0'); // 默认隐藏
+    expect(btn.classes()).toContain('group-hover:opacity-100'); // hover 浮现
+    const svg = btn.get('svg');
+    expect(svg.attributes('fill')).toBe('none');
+    expect(svg.attributes('stroke')).toBe('currentColor');
+    expect(svg.attributes('stroke-width')).toBe('2');
+    expect(svg.attributes('viewBox')).toBe('0 0 24 24');
+    expect(svg.attributes('aria-hidden')).toBe('true');
+    expect(btn.text()).toBe(''); // 纯图标，无文本
+  });
+
+  it('点击 → 行内 loading（禁用 + 转圈 + title 换「AI 命名中…」）→ 成功后原地更新 store 标题', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名', title_source: 'auto' }] });
+    const store = useWorkbenchStore();
+    let release!: (r: Response) => void;
+    const calls = stubAiFetch(() => new Promise<Response>((res) => { release = res; }));
+    try {
+      await wrapper.get('button[aria-label="AI 改名"]').trigger('click');
+      await flushPromises();
+
+      const loadingBtn = wrapper.get('button[aria-label="AI 改名"]');
+      expect((loadingBtn.element as HTMLButtonElement).disabled).toBe(true); // 禁用
+      expect(loadingBtn.find('svg.animate-spin').exists()).toBe(true); // 转圈
+      expect(loadingBtn.classes()).toContain('opacity-100'); // loading 态恒可见（不依赖 hover）
+      expect(loadingBtn.attributes('title')).toBe('AI 命名中…');
+
+      release(new Response(
+        JSON.stringify({ session: { id: '7', title: 'AI 起的名字', title_source: 'manual' } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ));
+      await flushPromises();
+
+      expect(calls).toEqual([{ url: '/api/sessions/7/ai-title', method: 'POST', body: {} }]);
+      expect(store.sessions[0].title).toBe('AI 起的名字'); // 原地更新（不整表 loadSessions）
+      expect(store.sessions[0].title_source).toBe('manual');
+      expect(wrapper.text()).toContain('AI 起的名字');
+      expect((wrapper.get('button[aria-label="AI 改名"]').element as HTMLButtonElement).disabled).toBe(false);
+      expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('失败（409 未配置 LLM）→ 标题不变 + 卡片内 .syserr 行内提示；再次点击清掉旧提示', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    stubAiFetch({ status: 409, body: { error: { code: 'llm_not_configured', message: '未配置可用的 LLM 上游' } } });
+    try {
+      await wrapper.get('button[aria-label="AI 改名"]').trigger('click');
+      await flushPromises();
+
+      expect(store.sessions[0].title).toBe('旧名'); // store 未被改动
+      expect(wrapper.text()).toContain('旧名');
+      const alert = wrapper.get('[role="alert"]');
+      expect(alert.text()).toBe('AI 改名失败：未配置可用的 LLM 上游');
+      expect(alert.classes()).toContain('syserr');
+      expect((wrapper.get('button[aria-label="AI 改名"]').element as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('失败（502 上游失败）→ 同样行内提示，且不误触「选中会话」', async () => {
+    const onSelectSession = vi.fn();
+    const wrapper = await mountPanel(
+      { dirs: DIR, sessions: [{ id: '7', title: '旧名' }] },
+      { onSelectSession },
+    );
+    stubAiFetch({ status: 502, body: { error: { code: 'llm_upstream_failed', message: 'LLM 调用失败：上游返回 HTTP 401' } } });
+    try {
+      await wrapper.get('button[aria-label="AI 改名"]').trigger('click');
+      await flushPromises();
+      expect(onSelectSession).not.toHaveBeenCalled(); // @click.stop
+      expect(wrapper.get('[role="alert"]').text()).toBe('AI 改名失败：LLM 调用失败：上游返回 HTTP 401');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('编辑态下两个按钮都隐藏（铅笔 + AI 改名互斥）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    try {
+      expect(wrapper.find('button[aria-label="AI 改名"]').exists()).toBe(true);
+      await wrapper.get('button[aria-label="重命名"]').trigger('click');
+      await flushPromises();
+      expect(wrapper.find('button[aria-label="重命名"]').exists()).toBe(false);
+      expect(wrapper.find('button[aria-label="AI 改名"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('i18n：切 English 后按钮 title/aria-label 与 loading 文案变英文', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: 'old name' }] });
+    let release!: (r: Response) => void;
+    stubAiFetch(() => new Promise<Response>((res) => { release = res; }));
+    try {
+      setLocale('en');
+      await flushPromises();
+      const btn = wrapper.get('button[aria-label="AI rename"]');
+      expect(btn.attributes('title')).toBe('AI rename');
+      await btn.trigger('click');
+      await flushPromises();
+      expect(wrapper.get('button[aria-label="AI rename"]').attributes('title')).toBe('Naming with AI…');
+      release(new Response(
+        JSON.stringify({ session: { id: '7', title: 'x', title_source: 'manual' } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ));
+      await flushPromises();
+    } finally {
+      wrapper.unmount();
+    }
+  });
+});

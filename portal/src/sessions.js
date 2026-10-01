@@ -10,6 +10,8 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { ensureDirSafe } from './fsutil.js';
+import { clipTitleFromMessage, sanitizeTitle, AUTO_TITLE_MAX_LEN } from './session-title.js';
+import { getFdeLlmConfig } from './llm.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -308,8 +310,12 @@ export async function archiveSession(pool, { userId, sessionId }) {
  * 在 COMMIT 前以**同一个 client** 调 `record(client, 202, payload)`，使「消息/run 写入」与「幂等台账
  * 转 done」落在同一事务提交——否则「业务已提交、记账未提交」的崩溃窗口会让客户端重发时再执行一次。
  * record 命中 0 行（占位已被其它 owner 接管）会抛 409 → 本事务 ROLLBACK，不产生第二次副作用。
+ *
+ * `onSessionTitle`（可选，issue #114）：本次若用首条用户消息截断出了默认标题，在 **COMMIT 之后**
+ * 回调一次（入参为新标题），由调用方推 SSE session_updated——让侧栏标题立即到位；不入事务，
+ * 失败不影响 202。
  */
-export async function postMessage(pool, { userId, sessionId, content, attachments, notify, record }) {
+export async function postMessage(pool, { userId, sessionId, content, attachments, notify, record, onSessionTitle }) {
   // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
   const valid = validateMessageBody({ content, attachments });
   const safeContent = valid.content;
@@ -317,6 +323,7 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
 
   const client = await pool.connect();
   let committed = null;
+  let clippedTitle = null; // issue #114：首条消息截断出的默认标题（COMMIT 后回调用）
   try {
     await client.query('BEGIN');
     const s = await fetchSession(client, sessionId, userId, { forUpdate: true });
@@ -389,6 +396,26 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       [s.id, seq, safeContent, JSON.stringify(safeAttachments)],
     );
 
+    // issue #114：默认标题 = 首条用户消息截断（零 LLM）。
+    // 幂等：仅当标题为空（NULL/空串/纯空白）且 title_source='auto' 时写；已有标题（手工/AI 改名）不动。
+    // 与 ERIX_SESSION_AUTO_TITLE 开关**解耦**：这是默认命名（不是 #88 的「自动标题刷新」），
+    // 开关关闭时照样生效——故此处不读 config.sessionAutoTitle。
+    // 超长尾加 `…`（ellipsis: true）；截断本身仍在 AUTO_TITLE_MAX_LEN=30 字。
+    if (String(s.title ?? '').trim() === '' && (s.title_source ?? 'auto') === 'auto') {
+      const clip = clipTitleFromMessage(safeContent, { ellipsis: true });
+      if (clip != null) {
+        // WHERE 再带一次守卫：并发 PATCH/AI 改名已置 manual/标题非空 → 0 行，安静放弃（幂等）。
+        const titleUpd = await client.query(
+          `UPDATE chat_sessions SET title = $2, updated_at = now()
+            WHERE id = $1 AND status = 'active' AND title_source = 'auto'
+              AND (title IS NULL OR btrim(title) = '')
+            RETURNING title`,
+          [s.id, clip],
+        );
+        clippedTitle = titleUpd.rows?.[0]?.title ?? null;
+      }
+    }
+
     // run + 入队（§4.3：显式把用户输入作为 task 传引擎；id 由 portal 生成，禁止 cwd 派生 §9.3-3）
     const runId = crypto.randomUUID();
     const run = await client.query(
@@ -432,6 +459,12 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
   try {
     notify?.({ runId: committed.run.id, userId, sessionId });
   } catch { /* 通知失败不影响主流程 */ }
+  // issue #114：首条截断标题的 SSE 推送（同样在 COMMIT 之后——绝不先于落库到达客户端）。
+  if (clippedTitle != null) {
+    try {
+      onSessionTitle?.(clippedTitle);
+    } catch { /* 推送失败不影响已落库的标题 */ }
+  }
   return committed;
 }
 
@@ -469,6 +502,195 @@ export async function stopSession(pool, { userId, sessionId }) {
   } finally {
     client.release();
   }
+}
+
+// ---------------------------------------------------------------------------
+// issue #114：「AI 改名」——按需的一次性 LLM 调用（用户点按钮才花钱，不做任何自动刷新）
+//
+// 决策豁免说明：issue #88 定下「portal 不持 LLM 客户端」（标题由 agent 侧生成随 run 终态上报），
+// 本端点是**用户拍板（2026-10-01，issue #114）的修订豁免**：用户主动触发的一次性命名请求，
+// 走 portal 直连 OpenAI 兼容 chat/completions（一次往返），不重复造 agent 链路。
+// 豁免范围**仅限本函数**——其余自动路径仍不得由 portal 发 LLM 请求。
+//
+// key 纪律（llm.js 三条存储纪律 ③）：api_key 只进 Authorization 请求头，
+// 绝不进日志/错误信息/HTTP 响应（redactSecret 做最后一道兜底）。
+// ---------------------------------------------------------------------------
+
+/** AI 改名的上下文：会话最早的 N 条 user 消息（单条折叠空白后截 AI_TITLE_CONTEXT_MAX_LEN 字符）。 */
+export const AI_TITLE_CONTEXT_MESSAGES = 3;
+export const AI_TITLE_CONTEXT_MAX_LEN = 200;
+/** 单次上游调用超时（issue #114：~15s）。 */
+export const AI_TITLE_TIMEOUT_MS = 15_000;
+/** 系统提示：与 AUTO_TITLE_MAX_LEN 同口径（≤30 字；落库前仍过一遍 sanitizeTitle）。 */
+export const AI_TITLE_SYSTEM_PROMPT =
+  '你是会话命名助手。根据用户消息为这次会话生成一个简短标题。'
+  + '要求：不超过 30 个字符；与用户消息的语言一致；只输出标题本身，不要引号、序号、解释或结尾标点。';
+
+/** 拼接改名上下文（纯函数，供单测）：最早 N 条 user 消息，各折叠空白并截断 ~200 字。 */
+export function buildAiTitlePrompt(messages) {
+  const list = (Array.isArray(messages) ? messages : [])
+    .slice(0, AI_TITLE_CONTEXT_MESSAGES)
+    .map((m, i) => {
+      const t = String(m ?? '').replace(/\s+/g, ' ').trim().slice(0, AI_TITLE_CONTEXT_MAX_LEN);
+      return `${i + 1}. ${t}`;
+    });
+  return `用户消息：\n${list.join('\n')}\n\n请只输出标题。`;
+}
+
+/** 从 OpenAI 兼容响应体取助手文本（纯函数）：content 为字符串或分片数组。 */
+export function extractAssistantText(body) {
+  const content = body?.choices?.[0]?.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('');
+  return '';
+}
+
+/** 脱敏（纯函数）：从任意文本里抹掉已知 key 与 sk-* 形态串，并截断长度（纪律 ③ 兜底）。 */
+export function redactSecret(text, secret) {
+  let out = String(text ?? '');
+  if (typeof secret === 'string' && secret.length >= 6) out = out.split(secret).join('***');
+  out = out.replace(/sk-[A-Za-z0-9_-]{6,}/g, 'sk-***');
+  return out.slice(0, 200);
+}
+
+/** OpenAI 兼容 chat/completions URL：base 已带 /v1 则直接用，否则补 /v1（口径同 erix-agent provider）。 */
+export function chatCompletionsUrl(baseUrl) {
+  const base = String(baseUrl ?? '').replace(/\/+$/, '');
+  return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+}
+
+/**
+ * provider 解析（issue #114）：① 会话属主 FDE 的 active LLM binding（llm.js 既有读取面）优先；
+ * ② 回退第一个启用的 text provider + model；③ 都没有 → 409 llm_not_configured（清晰文案）。
+ *
+ * 回退分支为何不带凭据：`llm_providers` 表**不存 api_key**——key 只存在于 per-FDE 的
+ * `fde_llm_bindings`（红线 ①「容器永不持有真 key」的同源纪律：key 按 FDE 隔离）。
+ * 因此该回退只适用于无需鉴权的自建 OpenAI 兼容端点；带鉴权的上游必须为对应 FDE 配 binding。
+ */
+export async function resolveAiTitleProvider(pool, userId) {
+  // ① FDE binding（llm.js 既有读取面）：DB 故障不吞（fetchSession 已证明 DB 可用，抛错走 500 更诚实）。
+  const cfg = await getFdeLlmConfig(pool, userId);
+  const mainModel = cfg?.main?.model_id;
+  if (cfg?.base_url && cfg?.api_key && mainModel) {
+    return { base_url: cfg.base_url, api_key: cfg.api_key, model: mainModel, source: 'fde_binding' };
+  }
+  const res = await pool.query(
+    `SELECT p.base_url, m.model_id
+       FROM llm_providers p
+       JOIN llm_models m ON m.provider_id = p.id
+      WHERE p.enabled = true AND m.enabled = true AND m.type = 'text'
+      ORDER BY p.created_at ASC, m.created_at ASC
+      LIMIT 1`,
+  );
+  const row = res.rows?.[0];
+  if (row?.base_url && row?.model_id) {
+    return { base_url: row.base_url, api_key: null, model: row.model_id, source: 'first_text_provider' };
+  }
+  throw new SessionError(
+    'llm_not_configured',
+    '未配置可用的 LLM 上游（AI 改名需要一次 LLM 调用）：请在管理台为该 FDE 配置 LLM 供应商与模型，或至少启用一个 text 模型',
+    { httpStatus: 409 },
+  );
+}
+
+/**
+ * POST /api/sessions/:id/ai-title —— 「AI 改名」（issue #114）。
+ * 属主鉴权同 PATCH（fetchSession：非属主/不存在/已归档一律 404）。
+ * 流程：取上下文 → 解析 provider（无 → 409）→ 一次 chat/completions（15s 超时，失败 → 502）
+ *       → sanitizeTitle 清洗（≤30 字）→ 落库 title_source='manual'（用户主动触发，自动流程不得覆盖）。
+ * @returns 更新后的会话行（rowToSession 形状）
+ */
+export async function generateAiTitle(pool, {
+  userId, sessionId, fetchImpl = fetch, timeoutMs = AI_TITLE_TIMEOUT_MS, notify, log = console,
+} = {}) {
+  await fetchSession(pool, sessionId, userId);
+
+  const msgs = await pool.query(
+    `SELECT content FROM messages
+      WHERE session_id = $1 AND role = 'user'
+      ORDER BY seq ASC LIMIT $2`,
+    [sessionId, AI_TITLE_CONTEXT_MESSAGES],
+  );
+  const contexts = (msgs.rows ?? []).map((r) => r.content);
+  if (contexts.length === 0) {
+    throw new SessionError('no_user_messages', '会话还没有用户消息，无法生成标题', { httpStatus: 409 });
+  }
+
+  const provider = await resolveAiTitleProvider(pool, userId);
+
+  // 超时用显式 AbortController + clearTimeout（不依赖 AbortSignal.timeout 的定时器语义）。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetchImpl(chatCompletionsUrl(provider.base_url), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(provider.api_key ? { Authorization: `Bearer ${provider.api_key}` } : {}),
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        messages: [
+          { role: 'system', content: AI_TITLE_SYSTEM_PROMPT },
+          { role: 'user', content: buildAiTitlePrompt(contexts) },
+        ],
+        temperature: 0.2,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // 网络/超时：错误信息里只有原因，绝无请求头（key）；再过一遍脱敏兜底。
+    const reason = controller.signal.aborted
+      ? `上游调用超时（>${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)}s` : `${timeoutMs}ms`}）`
+      : redactSecret(err?.message ?? err, provider.api_key);
+    log?.warn?.(`[ai-title] 上游调用失败（session=${sessionId}）：${reason}`);
+    throw new SessionError('llm_upstream_failed', `LLM 调用失败：${reason}`, { httpStatus: 502 });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const raw = await res.text().catch(() => '');
+  if (!res.ok) {
+    // 只回显上游 error.message（脱敏 + 截断），不回显整个响应体。
+    let hint = '';
+    try {
+      const msg = JSON.parse(raw)?.error?.message;
+      if (typeof msg === 'string' && msg.trim() !== '') hint = `（${redactSecret(msg, provider.api_key)}）`;
+    } catch { /* 非 JSON 响应体：不给细节 */ }
+    const reason = `上游返回 HTTP ${res.status}${hint}`;
+    log?.warn?.(`[ai-title] 上游返回错误（session=${sessionId}）：${reason}`);
+    throw new SessionError('llm_upstream_failed', `LLM 调用失败：${reason}`, { httpStatus: 502 });
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch { /* 非 JSON：下面统一按「无法解析标题」处理 */ }
+  const title = sanitizeTitle(extractAssistantText(parsed));
+  if (title == null) {
+    log?.warn?.(`[ai-title] 上游未返回可用标题（session=${sessionId}）`);
+    throw new SessionError('llm_upstream_failed', 'LLM 未返回可用的标题', { httpStatus: 502 });
+  }
+
+  // title_source='manual'：用户主动触发 → 任何自动流程（evaluateAutoTitle 只写 'auto' 行）不得覆盖。
+  const upd = await pool.query(
+    `UPDATE chat_sessions SET title = $2, title_source = 'manual', updated_at = now()
+      WHERE id = $1 AND status = 'active'
+      RETURNING id, user_id, project_id, cwd, title, title_source, model, status, last_seq, created_at, updated_at`,
+    [sessionId, title],
+  );
+  if (upd.rows.length === 0) {
+    throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
+  }
+  const session = rowToSession(upd.rows[0]);
+  log?.info?.(`[ai-title] 会话标题已更新（session=${sessionId}，source=${provider.source}）：${title}`);
+  // 多标签页 / SessionPicker 的列表标题实时同步（形状同 #88/#107：{ ts, type, payload:{ title } }）。
+  try {
+    notify?.(sessionId, [{ ts: new Date().toISOString(), type: 'session_updated', payload: { title } }]);
+  } catch { /* 推送失败不影响已落库的标题 */ }
+  return session;
 }
 
 function rowToSession(r) {

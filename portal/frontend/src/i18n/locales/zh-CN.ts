@@ -91,6 +91,9 @@ export const zhCN = {
     // issue #107：会话卡片内联重命名（铅笔图标按钮的 title/aria-label + 编辑框占位符；#112 改 SVG 图标）
     rename: '重命名',
     renamePlaceholder: '会话名称',
+    // issue #114：「AI 改名」按钮（点击才调一次 LLM 生成标题）+ 行内 loading 提示
+    aiRename: 'AI 改名',
+    aiRenaming: 'AI 命名中…',
   },
   // 目录树面板（components/DirectoryTree.vue）
   tree: {
@@ -238,6 +241,8 @@ export const zhCN = {
     // issue #107：侧栏内联重命名——空串本地拦截 / 提交失败回退旧标题时的轻提示
     renameEmpty: '会话名称不能为空',
     renameFailed: '重命名失败：{message}',
+    // issue #114：AI 改名失败（message 为服务端文案：409 未配置 LLM / 502 上游失败）
+    aiRenameFailed: 'AI 改名失败：{message}',
   },
 } as const;
 
