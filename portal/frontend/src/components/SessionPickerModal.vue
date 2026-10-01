@@ -115,34 +115,37 @@ const abs = (iso?: string) => new Date(iso ?? 0).toLocaleString(locale.value);
         >✕</button>
       </div>
 
-      <!-- 结果列表：独立滚动（单次全量，无分页） -->
-      <div class="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+      <!-- 结果列表：独立滚动（单次全量，无分页）；px-2 与侧栏 aside 内边距对齐，使行样式与侧栏同构 -->
+      <div class="min-h-0 flex-1 overflow-y-auto px-2 py-2">
         <ul role="listbox" :aria-label="t('picker.listLabel')">
+          <!-- issue #112：条目与侧栏同一套扁平行样式（无边框卡、左 2px brand 竖条 + 浅绿底、12/11px） -->
           <li
             v-for="(s, i) in items"
             :key="String(s.id)"
-            class="mt-1 cursor-pointer rounded-md border px-2 py-1.5 text-sm"
-            :class="i === activeIndex ? 'border-brand bg-green-50' : 'border-black/15 hover:bg-black/5'"
+            class="flex min-h-[54px] cursor-pointer items-center border-l-2 pl-3.5 pr-2"
+            :class="i === activeIndex ? 'border-l-brand bg-green-50' : 'border-l-transparent hover:bg-black/5'"
             role="option"
             :aria-selected="i === activeIndex"
             @click="pick(s)"
             @mouseenter="activeIndex = i"
           >
-            <div class="flex items-baseline gap-2">
-              <span class="truncate">{{ s.title || t('common.unnamedSession') }}</span>
-              <span v-if="s.active_run_id" class="shrink-0 text-xs text-brand">{{ t('common.runningBadge') }}</span>
-            </div>
-            <div class="text-xs text-black/50">
-              <span v-if="scope === 'all'">{{ s.cwd?.split('/').pop() ?? t('common.noDir') }} · </span>{{ abs(s.updated_at) }}
+            <div class="min-w-0 flex-1">
+              <div class="flex min-w-0 items-center gap-1.5 text-[12px] leading-[1.4]">
+                <span class="truncate">{{ s.title || t('common.unnamedSession') }}</span>
+                <span v-if="s.active_run_id" class="shrink-0 text-[11px] text-brand">{{ t('common.runningBadge') }}</span>
+              </div>
+              <div class="mt-0.5 truncate text-[11px] leading-[1.4] text-black/50">
+                <span v-if="scope === 'all'">{{ s.cwd?.split('/').pop() ?? t('common.noDir') }} · </span>{{ abs(s.updated_at) }}
+              </div>
             </div>
           </li>
         </ul>
 
-        <!-- 三态：加载中 / 无结果 / 失败（保留旧列表 + 重试） -->
-        <p v-if="loading" class="muted py-4 text-center text-sm">{{ t('common.loading') }}</p>
-        <p v-else-if="empty" class="muted py-6 text-center text-sm">{{ t('picker.empty') }}</p>
+        <!-- 三态：加载中 / 无结果 / 失败（保留旧列表 + 重试）；空态文案 11px（issue #112） -->
+        <p v-if="loading" class="py-4 text-center text-[11px] text-black/50">{{ t('common.loading') }}</p>
+        <p v-else-if="empty" class="py-6 text-center text-[11px] text-black/50">{{ t('picker.empty') }}</p>
         <div v-if="error" class="py-4 text-center">
-          <p class="syserr text-sm" role="alert">{{ error }}{{ t('picker.staleListKept') }}</p>
+          <p class="syserr" role="alert">{{ error }}{{ t('picker.staleListKept') }}</p>
           <button
             type="button"
             class="mt-2 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"

@@ -31,11 +31,12 @@ function onChange(e: Event) {
 </script>
 
 <template>
+  <!-- issue #112：控件收敛——32px 高 / 7px 圆角 / 12px 字号（label 11px）；仅 class 变动，交互不动 -->
   <div class="flex items-center gap-1">
-    <label class="muted shrink-0" for="dirSel">{{ t('sidebar.dirLabel') }}</label>
+    <label class="shrink-0 text-[11px] text-black/50" for="dirSel">{{ t('sidebar.dirLabel') }}</label>
     <select
       id="dirSel"
-      class="flex-1 min-w-0 rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+      class="h-8 min-w-0 flex-1 rounded-[7px] border border-black/20 bg-white px-2 text-[12px]"
       :value="store.dirCwd ?? ''"
       @change="onChange"
     >
@@ -49,7 +50,7 @@ function onChange(e: Event) {
     <button
       type="button"
       :title="t('sidebar.refreshTitle')"
-      class="shrink-0 rounded-md border border-black/20 px-2 py-1 text-sm hover:bg-black/5"
+      class="h-8 w-8 shrink-0 rounded-[7px] border border-black/20 bg-black/[.03] text-[12px] hover:bg-black/10"
       @click="emit('refresh')"
     >↻</button>
   </div>
