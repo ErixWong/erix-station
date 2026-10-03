@@ -657,7 +657,7 @@ FDE 浏览器        portal                agentd               worker（execute
 |---|---|---|---|
 | **per-container token** | env `ERIX_STATION_TOKEN`（建容器时 portal 注入） | **仅 agentd**；fork worker 时从 env 剔除（FDE 有 shell，同 UID 可读 agentd 的 `/proc/<pid>/environ` 属「FDE 自损」残余风险，见 §11.2） | 容器唯一平台凭据（D1'）；吊销即 `401 token_revoked` + SSE `revoke` |
 | LLM 网关虚拟 key | **容器内不存在**（H-B D-4）；真实虚拟 key 只存在于宿主 Traefik 动态配置（600，portal 可写、Traefik 只读） | **无进程可读**；Traefik 按来源子网注入 `Authorization` | 带额度/模型白名单/可吊销（规格 §11.3 模式 C 的凭据红线）；**不是平台凭据** |
-| git 凭据（SSH key / token） | FDE 自行配置（规格 §12.2） | 容器用户进程 | 平台不下发、不代管 |
+| git 凭据（SSH key / token） | FDE 自行配置，或由 admin write-through 至 `~/.git-credentials`（user-space §4.1.1） | Git 消费进程；`.git-credentials` 为 FDE 属主 `0640` | 不进 DB、平台日志或 audit payload；不通过环境变量投放 |
 | DB 凭据 | **无** | — | D1'：Postgres 业务写方只有 portal |
 | docker.sock | **不挂载** | — | 不变式一 |
 

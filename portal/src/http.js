@@ -19,6 +19,7 @@ import * as artifacts from './artifacts.js';
 import * as llm from './llm.js';
 import * as admin from './admin.js';
 import * as dirs from './dirs.js';
+import * as gitCredential from './git-credential.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
@@ -268,6 +269,10 @@ export function createServer({ pool, config, log = console, docker = null }) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof gitCredential.GitCredentialError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       if (err instanceof admin.AdminError) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
@@ -483,6 +488,48 @@ async function requireAdmin(req, ctx) {
 async function handleAdminApi(req, res, ctx, url) {
   const { pathname } = url;
   const session = await requireAdmin(req, ctx); // 所有 /api/admin/* 端点统一先鉴权
+
+  const adminGitCredentialMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/git-credential$/);
+  if (adminGitCredentialMatch) {
+    let fdeName;
+    try {
+      fdeName = decodeURIComponent(adminGitCredentialMatch[1]);
+    } catch {
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    }
+    if (!projects.validateFdeName(fdeName).ok) {
+      throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+    }
+    if (req.method === 'GET') {
+      const result = await gitCredential.listGitCredentials({ config: ctx.config, fdeName });
+      return sendJson(res, 200, result);
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await gitCredential.setGitCredential({
+        pool: ctx.pool,
+        actorId: session.user.id,
+        config: ctx.config,
+        fdeName,
+        host: body?.host,
+        username: body?.username,
+        token: body?.token,
+      });
+      return sendJson(res, 200, result);
+    }
+    if (req.method === 'DELETE') {
+      const result = await gitCredential.deleteGitCredential({
+        pool: ctx.pool,
+        actorId: session.user.id,
+        config: ctx.config,
+        fdeName,
+        host: url.searchParams.get('host'),
+      });
+      return sendJson(res, 200, result);
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
 
   // 供应商 CRUD
   if (pathname === '/api/admin/llm/providers') {
