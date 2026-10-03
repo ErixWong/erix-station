@@ -44,12 +44,13 @@ test('LiteLLM live smoke: mint deepseek-flash key, chat completion usage, delete
   const suffix = crypto.randomUUID();
   const alias = `erix-live-smoke-${suffix}`;
   let virtualKey = null;
+  let userId = null;
   try {
     const user = await request('/user/new', masterKey, {
       user_email: `erix-live-smoke-${suffix}@station.invalid`,
     });
     assert.equal(user.response.status, 200, 'LiteLLM user creation failed');
-    const userId = user.payload?.user_id;
+    userId = user.payload?.user_id;
     assert.equal(typeof userId, 'string', 'LiteLLM did not return user_id');
 
     const generated = await request('/key/generate', masterKey, {
@@ -70,9 +71,16 @@ test('LiteLLM live smoke: mint deepseek-flash key, chat completion usage, delete
     assert.equal(completion.response.status, 200, 'LiteLLM chat completion failed');
     assert.ok(completion.payload?.usage && typeof completion.payload.usage === 'object', 'chat completion omitted usage');
   } finally {
-    if (virtualKey) {
-      const deleted = await request('/key/delete', masterKey, { keys: [virtualKey] });
-      assert.equal(deleted.response.status, 200, 'LiteLLM key cleanup failed');
+    try {
+      if (virtualKey) {
+        const deleted = await request('/key/delete', masterKey, { keys: [virtualKey] });
+        assert.equal(deleted.response.status, 200, 'LiteLLM key cleanup failed');
+      }
+    } finally {
+      if (userId) {
+        const deleted = await request('/user/delete', masterKey, { user_ids: [userId] });
+        assert.equal(deleted.response.status, 200, 'LiteLLM user cleanup failed');
+      }
     }
   }
 });
