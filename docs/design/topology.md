@@ -6,6 +6,8 @@
 > **本文是 H-B 网络与访问拓扑的单一事实来源（single source of truth）**：拓扑结构、网络/IP 分配、全链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、流式与存储策略、实测证据，一律以本文为准。
 >
 > **与既有文档的关系（已对齐，2026-09-16 审计复核）**：规格 [`fde-platform.md`](fde-platform.md) §3/§5/§6.4/§10.3/§11/§12.3/§14、[`runner-integration.md`](runner-integration.md) §4/§10/§11、[`../env.md`](../env.md) §5/§6 均已按本文修订（旧 `edge`/`control` 拓扑、internal API 不经 Traefik、portal 不 publish、容器内放 LLM key 文件等旧描述已清）；如有残留冲突**以本文为准**。
+>
+> **issue #117 phase 2 更新**：不改变 H-B 的网络信任边界；替换 2026-09 LLM 段「注入真实上游 key、per-provider 直发」为「注入 LiteLLM per-FDE virtual key、所有 FDE 共用 `llm-gateway` service」。本节仍留有实施前的流量实测记录，当前字段语义以 [`../data/model.md`](../data/model.md) §1.20 为准。
 
 ---
 
@@ -176,11 +178,13 @@ Traefik(host:443)
 
 ## 5. 路由模型
 
+> **issue #117 phase 2 实施口径**：LLM router 仍按 FDE 来源子网隔离并注入每 FDE 的 LiteLLM virtual key；所有 router 共用 `llm-gateway` data-plane service。2026-09-20 的「真实上游 key / per-provider service」描述为历史方案，当前 binding 字段见 [`../data/model.md`](../data/model.md) §1.20。
+
 | 路由 | 规则 | middleware | service | 说明 |
 |---|---|---|---|---|
 | portal | `Host(`station.<base>`)` | — | `http://127.0.0.1:8080` | L1 |
 | 预览（**每 allocation 一条 router + 一条 service**） | `Host(`<fde>-<tok>-<port>.fde.<base>`)` | `fde-auth`（forwardAuth）→ `strip-cookie`（放行后删 Cookie，预览凭证不透传上游，B2 实测） | `http://10.200.<n>.2:<port>` | **否决「单通配 service」**（issue #9）：单 service 无法表达 per-allocation 的后端地址与生命周期；每条 allocation 独立 router+service，由 route outbox + reconciler 生成（L8） |
-| LLM（**每 FDE 一条 router + 一条 headers middleware**；**2026-09-20 修订，issue #38**） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `llm-key-<fde>`（headers 注入该 FDE 的**真实上游 key**） | `llm-provider-<id>` → 该 binding 供应商的 `llm_providers.base_url`（**不再共享 `llm-hub`**；默认 mock `http://127.0.0.1:4000`） | L7；**路由按 `fde_llm_bindings`（必须含 api_key）逐 binding 生成**，发布到独立文件 `llm-routes.yml`（mode 0600，与 `routes.yml` 0644 拆分）；**无 binding → 无路由（fail-closed）**；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；**禁止无 ClientIP 条件的兜底路由**（§6 第 3 条） |
+| LLM（**每 FDE 一条 router + 一条 headers middleware**；issue #117） | `Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)` | `llm-key-<fde>`（注入该 FDE 的 LiteLLM virtual key） | `llm-gateway` → LiteLLM data plane | L7；路由按 active `fde_llm_bindings` 生成，发布到独立文件 `llm-routes.yml`（mode 0600，与 `routes.yml` 0644 拆分）；无 binding → 无路由（fail-closed）；身份来自网络来源，注入凭据并覆盖伪造头；subnet 由 `fde_networks` 精确派生（默认 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`，§5.1）；禁止无 ClientIP 条件的兜底路由（§6 第 3 条） |
 | internal | `PathPrefix(`/api/internal`)`（挂在 `station.<base>` 路由链上） | `internal-allow`（`ipAllowList`，从 `fde_networks` 精确派生，每 `subnet` 一条，§5.1） | `http://127.0.0.1:8080` | L3/L5；容器侧经 hosts 注入（`--add-host station.<base>:<网关IP>`；`llm.<base>` 同法，见 L3）访问 |
 
 **公共约定**：
@@ -188,7 +192,7 @@ Traefik(host:443)
 - **forwardAuth 指向 `127.0.0.1:8080`**（`http://127.0.0.1:8080/api/forward-auth`）——Traefik 在 host 网络，portal 发布在回环，forwardAuth 不再走容器网络寻址。
 - **Traefik 动态配置由 portal 写 file provider**：portal（经 reconciler，§8）生成全部动态路由文件，与 DB（`port_allocations` / route outbox / `fde_networks`）同源；「路由表里没有 = 不可达」这条性质必须成立。文件权限与职责分工见 §6 第 8 条。
 - **路由发布预算**：outbox reconciler 的 debounce/批量合并、临时文件校验后原子替换、失败保留上一版本、reload SLO（P95 < 2s）、最大路由数（30 FDE × N 端口）与批量 offboarding 见 §8。
-- LLM service（`llm-provider-*`，**2026-09-20 修订，issue #38**：由共享 `llm-hub` 改为 per-provider service）的 `responseForwarding.flushInterval` 必须调小（≤100ms），否则 token 流被缓冲成整段（§6 第 5 条）。
+- LLM shared service（`llm-gateway`）的 `responseForwarding.flushInterval` 必须调小（≤100ms），否则 token 流被缓冲成整段（§6 第 5 条）。
 - **来源判定一律用 request remote address（不读 `X-Forwarded-For`）**：`ipAllowList`（internal 路由）与 `ClientIP`（LLM 路由）默认匹配 remote address；public entryPoint 不配 `forwardedHeaders.insecure`、中间件不配基于 XFF 的 `ipStrategy`。「容器直达 host Traefik、无中间代理」是「来源子网 = 身份」成立的安全前提，作为配置约束写死；**验收**：伪造/重复 `X-Forwarded-For` 不得影响来源判定（§10 证据 8 反向断言）。
 
 ### 5.1 来源规则派生（唯一口径）

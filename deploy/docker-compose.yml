@@ -183,8 +183,9 @@ services:
       PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}
-      # LLM 网关数据面兼容地址；当前 mock 占 4000，LiteLLM phase 1 暂用 4100。
-      LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4000}
+      # issue #117 phase 2：portal 已切到 LiteLLM 数据面。Traefik 跑 host 网络，故此处是宿主回环
+      # 地址；LiteLLM 迁移期发布在 4100（4000 仍被 dev mock 占用，待 e2e 基建重写后回收）。
+      LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4100}
       # issue #117：预留 gateway admin 配置供后续阶段使用；当前 portal 不调用这些配置。
       LLM_GATEWAY_MODE: ${LLM_GATEWAY_MODE:-self}
       LLM_GATEWAY_ADMIN_URL: ${LLM_GATEWAY_ADMIN_URL:-http://station-litellm:4000}

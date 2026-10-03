@@ -872,9 +872,8 @@ export async function heartbeat(pool, { container, user, body }) {
     stopRunIds = stop.rows.map((r) => r.id);
   }
 
-  // issue #38 Phase B2：心跳下行模型集（agent 用真模型名的传导通道）。
-  // 同 client 顺查（心跳已持 pool），单条轻量 JOIN、**不含 api_key**；无 active binding / provider
-  // 停用 → null（不下发空对象，agentd 侧保持现状行为，向后兼容旧 portal 与无配置 FDE）。
+  // issue #117：心跳下行 LiteLLM model_name（数据面别名）；DB 槽位仍以 model_info.id 做绑定身份。
+  // 查询只读 binding、不含 api_key；无 active binding → null（agentd 保持旧行为）。
   const models = await getFdeLlmHeartbeatModels(pool, user.id);
 
   return { now: now.toISOString(), stop_run_ids: stopRunIds, revoked: false, runs: results, models };
