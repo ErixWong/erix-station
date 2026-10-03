@@ -65,7 +65,11 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
     await client.keyInfo('sk info/+');
     await client.listModels();
     await client.createModel(modelBody);
-    await client.updateModel({ model_id: 'model-id-1', model_info: { display_name: 'Renamed' } });
+    await client.updateModel({
+      model_id: 'model-id-1',
+      model_info: { display_name: 'Renamed' },
+      litellm_params: { model: 'openai/new-model' },
+    });
     await client.deleteModel('model-id-2');
     await client.blockModel('model-id-3');
     await client.unblockModel('model-id-4');
@@ -84,7 +88,7 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
       ['GET', '/key/info?key=sk+info%2F%2B'],
       ['GET', '/model/info'],
       ['POST', '/model/new'],
-      ['POST', '/model/update'],
+      ['PATCH', '/model/model-id-1/update'],
       ['POST', '/model/delete'],
       ['POST', '/model/block'],
       ['POST', '/model/unblock'],
@@ -97,7 +101,10 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
     assert.deepEqual(calls[1].body, keyBody);
     assert.deepEqual(calls[2].body, updateKeyBody);
     assert.deepEqual(calls[8].body, modelBody);
-    assert.deepEqual(calls[9].body, { model_id: 'model-id-1', model_info: { display_name: 'Renamed' } });
+    assert.deepEqual(calls[9].body, {
+      model_info: { display_name: 'Renamed' },
+      litellm_params: { model: 'openai/new-model' },
+    });
     assert.deepEqual(calls[10].body, { id: 'model-id-2' });
     assert.deepEqual(calls[11].body, { model_id: 'model-id-3' });
     assert.deepEqual(calls[12].body, { model_id: 'model-id-4' });
