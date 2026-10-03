@@ -1,17 +1,12 @@
-// 管理台组件交互单测（issue #61 P3）：
-//   ①供应商卡片渲染 + 启停/删除触发对应 API；
-//   ②无 fde_name 用户的提示文案；活跃 run warnbox 在 UserLlmPane.spec 覆盖；
-//   ③新增用户成功后一次性 TOTP 盒展示（qrcode mock）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
-import AdminView from './AdminView.vue';
+import App from '../App.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
 
-// qrcode 换 npm 包（P3 要求）：单测固定 data URL，避免真实绘制。
 vi.mock('qrcode', () => ({
   default: { toDataURL: vi.fn(async () => 'data:image/png;base64,MOCKQR') },
 }));
@@ -46,14 +41,15 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
-function fetchMock(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
+type Handler = (url: string, init?: RequestInit) => Response | Promise<Response> | undefined;
+
+function fetchMock(handler: Handler) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    return handler(url, init);
+    return handler(url, init) ?? defaultHandler(url);
   });
 }
 
-/** 默认 handler：GET providers/users/me 走静态夹具，其余 404（用例自行覆盖）。 */
 function defaultHandler(url: string): Response {
   if (url === '/api/me') return jsonResponse(200, { user: ADMIN_USER });
   if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS);
@@ -61,143 +57,289 @@ function defaultHandler(url: string): Response {
   return jsonResponse(404, { error: { code: 'not_found', message: 'not found' } });
 }
 
-async function mountAdmin(extra?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined) {
+async function mountAdmin(path = '/admin/users', extra?: Handler) {
   const pinia = createPinia();
   setActivePinia(pinia);
-  const router = createAppRouter(createMemoryHistory());
-  router.push('/admin');
-  await router.isReady();
-  const fetchFn = fetchMock((url, init) => extra?.(url, init) ?? defaultHandler(url));
+  const fetchFn = fetchMock(extra ?? (() => undefined));
   vi.stubGlobal('fetch', fetchFn);
-  const wrapper = mount(AdminView, { global: { plugins: [pinia, router, i18n] } });
+  const router = createAppRouter(createMemoryHistory());
+  await router.push(path);
+  await router.isReady();
+  expect(router.currentRoute.value.path).toBe(path === '/admin' ? '/admin/users' : path);
+  const wrapper = mount(App, { global: { plugins: [pinia, router, i18n] }, attachTo: document.body });
   await flushPromises();
-  return { wrapper, fetchFn, router };
+  return { wrapper, fetchFn, router, pinia };
+}
+
+function callsTo(fetchFn: ReturnType<typeof fetchMock>, method: string, path: string) {
+  return fetchFn.mock.calls.filter(([url, init]) => String(url) === path && init?.method === method);
 }
 
 beforeEach(() => {
-  // issue #101 P3：装配真实 i18n 单例（不 mock t()），每例重置为 zh-CN（既有中文断言逐字不变）。
   localStorage.clear();
   setLocale('zh-CN');
   vi.unstubAllGlobals();
+  document.body.innerHTML = '';
+  document.body.style.overflow = '';
 });
-afterEach(() => vi.unstubAllGlobals());
 
-describe('AdminView · LLM 供应商区', () => {
-  it('渲染供应商卡片：名称/base_url/启停徽章/模型明细按钮；空态文案对齐旧版', async () => {
-    const { wrapper } = await mountAdmin();
-    const list = wrapper.find('[data-test="provider-list"]');
-    expect(list.text()).toContain('openai');
-    expect(list.text()).toContain('https://api.openai.com/v1');
-    expect(list.text()).toContain('启用');
-    expect(list.text()).toContain('模型明细（2）');
-    expect(list.text()).toContain('停用'); // p2 的启停按钮文案（p2.enabled=false）
-    // p2 无模型：展开后空态文案
-    const p2Card = wrapper.findAll('[data-test="provider-card"]')[1];
-    await p2Card.findAll('button')[0].trigger('click'); // 「模型明细（0）」
-    await flushPromises();
-    expect(wrapper.find('[data-test="provider-list"]').text()).toContain('该供应商下暂无模型');
+afterEach(() => {
+  vi.unstubAllGlobals();
+  document.body.innerHTML = '';
+  document.body.style.overflow = '';
+});
+
+describe('Admin console routing and layout', () => {
+  it('/admin redirects to /admin/users; shared header and current tab are rendered', async () => {
+    const { wrapper, router } = await mountAdmin('/admin');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+    expect(wrapper.get('h1').text()).toBe('FDE Station 管理台');
+    expect(wrapper.get('header').text()).toContain('root（admin）');
+    expect(wrapper.get('header').text()).toContain('返回工作台');
+    expect(wrapper.get('header').text()).toContain('登出');
+    expect(wrapper.find('a[aria-current="page"]').text()).toBe('用户管理');
+    wrapper.unmount();
   });
 
-  it('供应商启停触发 PATCH { enabled: !当前值 }，删除触发 DELETE（confirm 文案保留）', async () => {
-    const confirmFn = vi.fn(() => true); // 旧版 confirm 提示
-    vi.stubGlobal('confirm', confirmFn);
-    const { wrapper, fetchFn } = await mountAdmin();
-    // openai 卡片的三个按钮：模型明细 / 停用 / 删除
-    const openaiBtns = wrapper.findAll('[data-test="provider-card"]')[0].findAll('button');
-    await openaiBtns[1].trigger('click'); // 停用（p1.enabled=true → false）
-    await flushPromises();
-    const patchCall = fetchFn.mock.calls.find(([u, i]) =>
-      String(u).includes('/api/admin/llm/providers/p1') && i?.method === 'PATCH');
-    expect(patchCall).toBeTruthy();
-    expect(JSON.parse(String(patchCall![1]?.body))).toEqual({ enabled: false });
+  it('tab links navigate to their routes and opening the saved URL restores the LLM tab', async () => {
+    const { wrapper, router, pinia } = await mountAdmin();
+    try {
+      await wrapper.find('a[href="/admin/llm"]').trigger('click');
+      await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin/llm'));
+      await flushPromises();
+      expect(wrapper.find('a[aria-current="page"]').text()).toBe('LLM 管理');
 
-    await openaiBtns[2].trigger('click'); // 删除
-    await flushPromises();
-    expect(confirmFn).toHaveBeenCalledWith('确认删除供应商 openai？其下模型将一并删除。');
-    const delCall = fetchFn.mock.calls.find(([u, i]) =>
-      String(u).includes('/api/admin/llm/providers/p1') && i?.method === 'DELETE');
-    expect(delCall).toBeTruthy();
+      wrapper.unmount();
+      const refreshedRouter = createAppRouter(createMemoryHistory());
+      await refreshedRouter.push('/admin/llm');
+      await refreshedRouter.isReady();
+      const refreshed = mount(App, { global: { plugins: [pinia, refreshedRouter, i18n] }, attachTo: document.body });
+      await flushPromises();
+      expect(refreshedRouter.currentRoute.value.path).toBe('/admin/llm');
+      expect(refreshed.find('a[aria-current="page"]').text()).toBe('LLM 管理');
+      refreshed.unmount();
+    } finally {
+      wrapper.unmount();
+    }
   });
 
-  it('模型明细表渲染 + 模型启停/删除触发对应 API；删除 confirm 取消则不调用', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => false)); // 取消删除：DELETE 不得发出
-    const { wrapper, fetchFn } = await mountAdmin();
-    // 展开 openai 的模型明细
-    const openaiCard = wrapper.findAll('[data-test="provider-card"]')[0];
-    await openaiCard.findAll('button')[0].trigger('click');
-    await flushPromises();
-    const detail = wrapper.findAll('[data-test="provider-card"]')[0];
-    expect(detail.text()).toContain('model_id');
-    expect(detail.text()).toContain('gpt-4o');
-    expect(detail.text()).toContain('上下文窗口');
-    expect(detail.text()).toContain('128000');
+  it('repository tab is an empty placeholder and performs no admin API calls', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/repos');
+    expect(wrapper.text()).toContain('待后续实现');
+    expect(fetchFn.mock.calls.map(([url]) => String(url))).toEqual(['/api/me']);
+    wrapper.unmount();
+  });
+});
 
-    // 模型行按钮：停用 / 删除
-    const modelBtns = detail.findAll('tbody button');
-    await modelBtns[0].trigger('click'); // m1 停用
-    await flushPromises();
-    const patchCall = fetchFn.mock.calls.find(([u, i]) =>
-      String(u).includes('/api/admin/llm/models/m1') && i?.method === 'PATCH');
-    expect(JSON.parse(String(patchCall![1]?.body))).toEqual({ enabled: false });
+describe('AdminView · LLM 管理', () => {
+  it('供应商卡片保留启停行为，并以确认 modal 执行删除', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers/p1' && init?.method === 'DELETE') return new Response(null, { status: 204 });
+      return undefined;
+    });
+    const cards = wrapper.findAll('[data-test="provider-card"]');
+    expect(cards[0].text()).toContain('openai');
+    expect(cards[0].text()).toContain('https://api.openai.com/v1');
+    expect(cards[0].text()).toContain('启用');
+    expect(cards[1].text()).toContain('停用');
 
-    await modelBtns[1].trigger('click'); // 删除（confirm=false → 不调用 DELETE）
+    await cards[0].findAll('button')[1].trigger('click');
     await flushPromises();
-    expect(fetchFn.mock.calls.some(([u, i]) =>
-      String(u).includes('/api/admin/llm/models/m1') && i?.method === 'DELETE')).toBe(false);
+    const toggle = callsTo(fetchFn, 'PATCH', '/api/admin/llm/providers/p1')[0];
+    expect(JSON.parse(String(toggle[1]?.body))).toEqual({ enabled: false });
+
+    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')
+      .find((button) => button.text() === '删除')!.trigger('click');
+    expect(wrapper.find('[role="dialog"]').text()).toContain('确认删除供应商 openai？其下模型将一并删除。');
+    await wrapper.get('[data-test="confirm-delete"]').trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'DELETE', '/api/admin/llm/providers/p1')).toHaveLength(1);
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
   });
 
-  it('供应商下新增模型表单：POST body 逐字段对齐旧版（context_window 可空、tool_calling 勾选）', async () => {
-    const { wrapper, fetchFn } = await mountAdmin();
-    const openaiCard = wrapper.findAll('[data-test="provider-card"]')[0];
-    await openaiCard.findAll('button')[0].trigger('click'); // 展开
+  it('新增供应商 modal 提交原有 POST body；编辑只提交 base_url', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers' && init?.method === 'POST') return jsonResponse(201, {});
+      if (url === '/api/admin/llm/providers/p1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+
+    await wrapper.get('[data-test="open-add-provider"]').trigger('click');
+    const addForm = wrapper.get('[data-test="add-provider-form"]');
+    await addForm.findAll('input')[0].setValue('new-provider');
+    await addForm.findAll('input')[1].setValue('https://llm.example/v1');
+    await addForm.trigger('submit.prevent');
     await flushPromises();
-    const detail = wrapper.findAll('[data-test="provider-card"]')[0];
-    await detail.find('input[placeholder="gpt-4o"]').setValue('gpt-4o-mini');
-    await detail.find('input[placeholder="GPT-4o"]').setValue('GPT-4o mini');
-    await detail.find('select').setValue('text');
-    await detail.find('input[type="checkbox"]').setValue(true);
-    // context_window 留空 → null
-    await detail.find('form').trigger('submit.prevent');
+    expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/llm/providers')[0][1]?.body)))
+      .toEqual({ name: 'new-provider', base_url: 'https://llm.example/v1' });
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+
+    await wrapper.findAll('[data-test="provider-card"]')[0].get('[data-test="edit-provider"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-provider-form"]');
+    expect(editForm.findAll('input')).toHaveLength(1);
+    await editForm.get('input').setValue('https://new.openai.com/v1');
+    await editForm.trigger('submit.prevent');
     await flushPromises();
-    const postCall = fetchFn.mock.calls.find(([u, i]) =>
-      String(u).includes('/api/admin/llm/providers/p1/models') && i?.method === 'POST');
-    expect(postCall).toBeTruthy();
-    expect(JSON.parse(String(postCall![1]?.body))).toEqual({
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/providers/p1').find(
+      ([, init]) => JSON.parse(String(init?.body)).base_url === 'https://new.openai.com/v1',
+    );
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({ base_url: 'https://new.openai.com/v1' });
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+  });
+
+  it('模型启停不变；新增和编辑分别保留不可编辑字段并 PATCH 允许字段', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers/p1/models' && init?.method === 'POST') return jsonResponse(201, {});
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'DELETE') return new Response(null, { status: 204 });
+      return undefined;
+    });
+    const firstCard = wrapper.findAll('[data-test="provider-card"]')[0];
+    await firstCard.findAll('button')[0].trigger('click');
+    await flushPromises();
+    const modelRow = wrapper.get('[data-test="model-row"]');
+    await modelRow.findAll('button')[0].trigger('click');
+    await flushPromises();
+    const toggle = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1').find(
+      ([, init]) => JSON.parse(String(init?.body)).enabled === false,
+    );
+    expect(JSON.parse(String(toggle?.[1]?.body))).toEqual({ enabled: false });
+
+    await wrapper.get('[data-test="open-add-model"]').trigger('click');
+    const addForm = wrapper.get('[data-test="add-model-form"]');
+    await addForm.findAll('input')[0].setValue('gpt-4o-mini');
+    await addForm.findAll('input')[1].setValue('GPT-4o mini');
+    await addForm.get('select').setValue('text');
+    await addForm.find('input[type="checkbox"]').setValue(true);
+    await addForm.trigger('submit.prevent');
+    await flushPromises();
+    const post = callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0];
+    expect(JSON.parse(String(post[1]?.body))).toEqual({
       model_id: 'gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: true, context_window: null,
     });
+
+    const refreshedRow = wrapper.get('[data-test="model-row"]');
+    await refreshedRow.get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    expect(editForm.text()).toContain('model_id: gpt-4o');
+    expect(editForm.text()).toContain('类型: text');
+    await editForm.findAll('input')[0].setValue('GPT-4o edited');
+    await editForm.findAll('input')[1].setValue('65536');
+    await editForm.find('input[type="checkbox"]').setValue(false);
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1').find(
+      ([, init]) => JSON.parse(String(init?.body)).name === 'GPT-4o edited',
+    );
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      name: 'GPT-4o edited', tool_calling: false, context_window: 65536,
+    });
+
+    const deleteButton = wrapper.get('[data-test="model-row"]').findAll('button')
+      .find((button) => button.text() === '删除')!;
+    await deleteButton.trigger('click');
+    expect(wrapper.find('[role="dialog"]').text()).toContain('确认删除模型 gpt-4o？');
+    await wrapper.find('[role="dialog"]').findAll('button')
+      .find((button) => button.text() === '取消')!.trigger('click');
+    expect(callsTo(fetchFn, 'DELETE', '/api/admin/llm/models/m1')).toHaveLength(0);
+
+    await wrapper.get('[data-test="model-row"]').findAll('button')
+      .find((button) => button.text() === '删除')!.trigger('click');
+    await wrapper.get('[data-test="confirm-delete"]').trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'DELETE', '/api/admin/llm/models/m1')).toHaveLength(1);
+  });
+
+  it('删除请求失败时确认 modal 保持打开并展示错误', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers/p1' && init?.method === 'DELETE') {
+        return jsonResponse(500, { error: { message: 'delete failed' } });
+      }
+      return undefined;
+    });
+    const deleteButton = wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')
+      .find((button) => button.text() === '删除')!;
+    await deleteButton.trigger('click');
+    await wrapper.get('[data-test="confirm-delete"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(wrapper.find('[role="dialog"]').text()).toContain('delete failed');
   });
 });
 
-describe('AdminView · FDE 管理区', () => {
-  it('用户卡片渲染 login/display_name/role/fde_name/status；无 fde_name 展开显示提示文案', async () => {
-    const { wrapper } = await mountAdmin();
-    const list = wrapper.find('[data-test="user-list"]');
-    expect(list.text()).toContain('alice');
-    expect(list.text()).toContain('Alice');
-    expect(list.text()).toContain('fde');
-    expect(list.text()).toContain('alice'); // fde_name 徽章
-    expect(list.text()).toContain('active');
-    expect(list.text()).toContain('无 fde_name'); // bob
-
-    // 展开 bob（无 fde_name）：LLM 配置 pane 的提示文案逐字保留
-    const bobCard = wrapper.findAll('[data-test="user-card"]')[1];
-    await bobCard.find('button').trigger('click');
+describe('Admin modals', () => {
+  it('Esc closes the modal, focuses its first input, restores the trigger, and unlocks prior scroll state', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm');
+    const trigger = wrapper.get('[data-test="open-add-provider"]');
+    document.body.style.overflow = 'clip';
+    (trigger.element as HTMLElement).focus();
+    await trigger.trigger('click');
     await flushPromises();
-    expect(wrapper.find('[data-test="user-list"]').text())
-      .toContain('该用户未配置 fde_name，无需 LLM 配置。');
+
+    const input = wrapper.get('[data-test="add-provider-form"] input').element;
+    expect(document.activeElement).toBe(input);
+    expect(document.body.style.overflow).toBe('hidden');
+    await wrapper.get('[data-test="add-provider-form"] input').trigger('keydown', { key: 'Escape' });
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(trigger.element);
+    expect(document.body.style.overflow).toBe('clip');
+    wrapper.unmount();
   });
 
-  it('新增用户：POST body（fde_name 可空省略）→ 一次性 TOTP 盒（URI/种子/二维码）', async () => {
+  it('clicking the backdrop closes the modal but clicking its contents does not', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm');
+    await wrapper.get('[data-test="open-add-provider"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[role="dialog"]').trigger('click');
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    await wrapper.get('[data-test="modal-backdrop"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('failed create does not close the form or discard its input', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers' && init?.method === 'POST') {
+        return jsonResponse(500, { error: { message: 'provider create failed' } });
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="open-add-provider"]').trigger('click');
+    const form = wrapper.get('[data-test="add-provider-form"]');
+    await form.findAll('input')[0].setValue('kept-name');
+    await form.findAll('input')[1].setValue('https://provider.example/v1');
+    await form.trigger('submit.prevent');
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(form.text()).toContain('provider create failed');
+    expect((wrapper.get('[data-test="add-provider-form"] input').element as HTMLInputElement).value)
+      .toBe('kept-name');
+    wrapper.unmount();
+  });
+});
+
+describe('AdminView · FDE 用户', () => {
+  it('用户卡片保留无 fde_name 提示和 UserLlmPane 挂载；新用户成功后展示一次性 TOTP modal', async () => {
     const created = {
       user: { id: 'u3', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: 'carol', status: 'active' },
       totp_uri: 'otpauth://totp/erix-station:carol?secret=JBSWY3DPEHPK3PXP&issuer=erix-station',
       totp_secret: 'JBSWY3DPEHPK3PXP',
     };
-    const { wrapper, fetchFn } = await mountAdmin((url, init) => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
       if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
       return undefined;
     });
-    const form = wrapper.find('[data-test="add-user-form"]');
+    const list = wrapper.find('[data-test="user-list"]');
+    expect(list.text()).toContain('alice');
+    expect(list.text()).toContain('无 fde_name');
+    await wrapper.findAll('[data-test="user-card"]')[1].find('button').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="user-list"]').text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
+
+    await wrapper.get('[data-test="open-add-user"]').trigger('click');
+    const form = wrapper.get('[data-test="add-user-form"]');
     await form.findAll('input')[0].setValue('carol');
     await form.findAll('input')[1].setValue('Carol');
     await form.findAll('input')[2].setValue('pass123');
@@ -205,149 +347,50 @@ describe('AdminView · FDE 管理区', () => {
     await form.trigger('submit.prevent');
     await flushPromises();
 
-    const postCall = fetchFn.mock.calls.find(([u, i]) => u === '/api/admin/users' && i?.method === 'POST');
-    expect(JSON.parse(String(postCall![1]?.body))).toEqual({
+    expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
       login: 'carol', display_name: 'Carol', password: 'pass123', fde_name: 'carol',
     });
-
-    // 一次性 TOTP 盒：URI/种子/二维码 data URL + 「仅此一次显示」文案
-    const box = wrapper.find('[data-test="totp-box"]');
-    expect(box.exists()).toBe(true);
-    expect(box.text()).toContain('仅此一次显示');
-    expect(box.text()).toContain(created.totp_uri);
-    expect(box.text()).toContain(created.totp_secret);
-    expect(box.find('img').attributes('src')).toBe('data:image/png;base64,MOCKQR');
+    const totp = wrapper.get('[data-test="totp-box"]');
+    expect(totp.text()).toContain('仅此一次显示');
+    expect(totp.text()).toContain(created.totp_uri);
+    expect(totp.text()).toContain(created.totp_secret);
+    expect(totp.find('img').attributes('src')).toBe('data:image/png;base64,MOCKQR');
+    await wrapper.get('[data-test="totp-box"] button').trigger('click');
+    expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+    wrapper.unmount();
   });
 
-  it('新增用户不带 fde_name 时 body 省略该字段（旧版语义）', async () => {
+  it('新增用户时空 fde_name 仍从 POST body 省略', async () => {
     const created = {
       user: { id: 'u4', login: 'dave', display_name: '', role: 'fde', fde_name: null, status: 'active' },
       totp_uri: 'otpauth://totp/x',
       totp_secret: 'SECRET',
     };
-    const { wrapper, fetchFn } = await mountAdmin((url, init) => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
       if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
       return undefined;
     });
-    const form = wrapper.find('[data-test="add-user-form"]');
+    await wrapper.get('[data-test="open-add-user"]').trigger('click');
+    const form = wrapper.get('[data-test="add-user-form"]');
     await form.findAll('input')[0].setValue('dave');
     await form.findAll('input')[2].setValue('pass123');
     await form.trigger('submit.prevent');
     await flushPromises();
-    const postCall = fetchFn.mock.calls.find(([u, i]) => u === '/api/admin/users' && i?.method === 'POST');
-    expect(JSON.parse(String(postCall![1]?.body))).toEqual({
+    expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
       login: 'dave', display_name: '', password: 'pass123',
     });
   });
-});
 
-// issue #101 P3：切 English 的双向断言（zh 基线断言在上面各用例中逐字未改）。
-describe('AdminView · 语言切换（issue #101 P3）', () => {
-  it('切 English：顶栏与供应商区文案（含空态/表头/按钮）即时变英文', async () => {
+  it('shared header identity continues to update with the English locale', async () => {
     const { wrapper } = await mountAdmin();
     setLocale('en');
-    await flushPromises();
-
-    expect(wrapper.get('h1').text()).toBe('FDE Station Admin Console');
-    // 顶栏身份文案：复用 workbench.who（admin 带 fde_name 时含 fde 段）
     const auth = useAuthStore();
-    auth.user = { id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'alice', auth_source: 'local' };
+    auth.user = { ...ADMIN_USER, fde_name: 'alice' };
     await flushPromises();
-    const header = wrapper.get('header').text();
-    expect(header).toContain('root (admin / alice)');
-    expect(header).toContain('← Back to workbench');
-    expect(header).toContain('Sign out');
-    expect(wrapper.text()).toContain('LLM providers');
-
-    const list = wrapper.find('[data-test="provider-list"]');
-    expect(list.text()).toContain('Enabled');
-    expect(list.text()).toContain('Disabled'); // p2.enabled=false 的徽章
-    expect(list.text()).toContain('Models (2)'); // 模型明细按钮带数量
-    expect(list.text()).toContain('Delete');
-
-    // p2 无模型：展开后空态英文
-    const p2Card = wrapper.findAll('[data-test="provider-card"]')[1];
-    await p2Card.findAll('button')[0].trigger('click');
-    await flushPromises();
-    expect(wrapper.find('[data-test="provider-list"]').text()).toContain('No models under this provider yet');
-
-    // 表头 + 新增模型/供应商表单标签英文
-    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[0].trigger('click');
-    await flushPromises();
-    const detail = wrapper.findAll('[data-test="provider-card"]')[0];
-    const thead = detail.find('thead').text();
-    expect(thead).toContain('Name');
-    expect(thead).toContain('Type');
-    expect(thead).toContain('Context window');
-    expect(thead).toContain('Status');
-    expect(detail.find('[data-test="add-model-form"]').text()).toContain('＋ Add model');
-    expect(wrapper.find('[data-test="add-provider-form"]').text()).toContain('＋ Add provider');
-  });
-
-  it('切 English：删除 confirm 文案与 FDE 区文案变英文', async () => {
-    const confirmFn = vi.fn(() => false); // 取消删除：只看 confirm 文案
-    vi.stubGlobal('confirm', confirmFn);
-    const { wrapper } = await mountAdmin();
-    setLocale('en');
-    await flushPromises();
-
-    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[2].trigger('click'); // 删除
-    expect(confirmFn).toHaveBeenCalledWith('Delete provider openai? Its models will be deleted as well.');
-
-    expect(wrapper.text()).toContain('FDE management');
-    const list = wrapper.find('[data-test="user-list"]');
-    expect(list.text()).toContain('no fde_name'); // bob
-    expect(list.text()).toContain('Expand');
-
-    // 展开 bob（无 fde_name）→ 英文提示
-    const bobCard = wrapper.findAll('[data-test="user-card"]')[1];
-    await bobCard.find('button').trigger('click');
-    await flushPromises();
-    expect(wrapper.find('[data-test="user-list"]').text())
-      .toContain('This user has no fde_name configured; no LLM config needed.');
-
-    const form = wrapper.find('[data-test="add-user-form"]');
-    expect(form.text()).toContain('Login name');
-    expect(form.text()).toContain('Display name');
-    expect(form.text()).toContain('Password');
-    expect(form.text()).toContain('fde_name (optional)');
-    expect(form.text()).toContain('＋ Create user');
-  });
-
-  it('切 English：模型删除 confirm 与一次性 TOTP 盒文案英文（登录名仍加粗）', async () => {
-    const confirmFn = vi.fn(() => false);
-    vi.stubGlobal('confirm', confirmFn);
-    const created = {
-      user: { id: 'u3', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: 'carol', status: 'active' },
-      totp_uri: 'otpauth://totp/erix-station:carol?secret=JBSWY3DPEHPK3PXP&issuer=erix-station',
-      totp_secret: 'JBSWY3DPEHPK3PXP',
-    };
-    const { wrapper } = await mountAdmin((url, init) => {
-      if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
-      return undefined;
-    });
-    setLocale('en');
-    await flushPromises();
-
-    // 展开 openai 模型明细 → 模型删除 confirm 文案英文
-    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[0].trigger('click');
-    await flushPromises();
-    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('tbody button')[1].trigger('click');
-    expect(confirmFn).toHaveBeenCalledWith('Delete model gpt-4o?');
-
-    // 新增用户 → 一次性 TOTP 盒英文（{login}/{onlyOnce} 仍为 <b>）
-    const form = wrapper.find('[data-test="add-user-form"]');
-    await form.findAll('input')[0].setValue('carol');
-    await form.findAll('input')[2].setValue('pass123');
-    await form.trigger('submit.prevent');
-    await flushPromises();
-    const box = wrapper.find('[data-test="totp-box"]');
-    expect(box.text()).toContain('User carol created.');
-    expect(box.text()).toContain('shown only once');
-    expect(box.text()).toContain('otpauth URI: ');
-    expect(box.text()).toContain('TOTP seed: ');
-    expect(box.text()).toContain(created.totp_uri);
-    expect(box.findAll('b').map((b) => b.text())).toEqual(['carol', 'shown only once']);
-    expect(box.find('img').attributes('alt')).toBe('TOTP authenticator QR code');
+    expect(wrapper.get('h1').text()).toBe('FDE Station Admin Console');
+    expect(wrapper.get('header').text()).toContain('root (admin / alice)');
+    expect(wrapper.get('header').text()).toContain('← Back to workbench');
+    expect(wrapper.find('a[aria-current="page"]').text()).toBe('User management');
+    wrapper.unmount();
   });
 });

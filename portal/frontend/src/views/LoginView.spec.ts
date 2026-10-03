@@ -151,7 +151,7 @@ describe('LoginView 交互', () => {
     expect(auth.pendingToken).toBeNull();
   });
 
-  it('平台管理员直通：跳到 /admin（afterLoginRoute）', async () => {
+  it('平台管理员直通：跳到 /admin/users（afterLoginRoute + 默认管理台路由）', async () => {
     vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, { status: 'authenticated', user: ADMIN_USER })));
     const { wrapper, router } = await mountLogin();
     await wrapper.find('#loginName').setValue('root');
@@ -159,7 +159,7 @@ describe('LoginView 交互', () => {
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     // 懒加载组件解析 + 导航确认：轮询等待落地（避免数 tick 的脆弱写法）。
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin'));
+    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin/users'));
   });
 
   it('语言切换到 English：登录页文案全量变英文并持久化', async () => {

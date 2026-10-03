@@ -83,6 +83,10 @@ export const useAdminStore = defineStore('admin', {
       return err instanceof Error ? err.message : String(err);
     },
 
+    dismissTotpOnce() {
+      this.totpOnce = null;
+    },
+
     toggleExpandedProvider(id: string) {
       const i = this.expandedProviders.indexOf(id);
       if (i >= 0) this.expandedProviders.splice(i, 1);
@@ -129,6 +133,22 @@ export const useAdminStore = defineStore('admin', {
         });
         await this.loadProviders();
         return null;
+      } catch (e) {
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
+        return this.llmErr;
+      }
+    },
+
+    /** 编辑供应商地址：PATCH /api/admin/llm/providers/<id> { base_url }。 */
+    async updateProvider(p: LlmProvider, baseUrl: string): Promise<string | null> {
+      this.llmErr = null;
+      try {
+        await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ base_url: baseUrl }),
+        });
+        await this.loadProviders();
+        return this.llmErr;
       } catch (e) {
         this.llmErr = t('admin.errorPrefix') + this.errText(e);
         return this.llmErr;
@@ -202,6 +222,25 @@ export const useAdminStore = defineStore('admin', {
         if (!this.expandedProviders.includes(providerId)) this.expandedProviders.push(providerId);
         await this.loadProviders();
         return null;
+      } catch (e) {
+        this.llmErr = t('admin.errorPrefix') + this.errText(e);
+        return this.llmErr;
+      }
+    },
+
+    /** 编辑模型可变字段：PATCH /api/admin/llm/models/<id>。 */
+    async updateModel(
+      m: LlmModel,
+      fields: { name: string; tool_calling: boolean; context_window?: number },
+    ): Promise<string | null> {
+      this.llmErr = null;
+      try {
+        await api(`/api/admin/llm/models/${encodeURIComponent(m.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(fields),
+        });
+        await this.loadProviders();
+        return this.llmErr;
       } catch (e) {
         this.llmErr = t('admin.errorPrefix') + this.errText(e);
         return this.llmErr;
