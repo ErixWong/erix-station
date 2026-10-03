@@ -312,12 +312,12 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 4. 在 LLM 网关建**虚拟 key**（额度、模型白名单、别名 `alice@client-x`）；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
 5. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 
-> **边界（决策者 2026-09，issue #3 评论）**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立），也**不负责 clone 与 git 凭据下发**——clone 与 git 凭据（SSH key / token）由 FDE 在容器内自行配置，等同他自己的开发机（见 §12.2）。
+> **边界**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立），也不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点写入 `home/.git-credentials`；此 write-through 凭据文件不进 DB/日志/audit payload，细节见 [`user-space.md`](user-space.md) §4.1.1。
 
 ### 7.3 offboarding 必须同样脚本化
 
 ```
-停容器 + 吊销 runner token + 吊销 LLM 虚拟 key + 失效登录会话 + 保留 workspace 卷 N 天
+停容器 + 吊销 runner token + 吊销 LLM 虚拟 key + 删除 `.git-credentials` + 失效登录会话 + 保留 workspace 卷 N 天
 ```
 
 并配一个**定时与 IdP 对账**的任务（拉 IdP 用户列表 → 比对 → 停用）。SSO 侧停用 ≠ 本平台停用——**onboarding 和 offboarding 是同一 workflow 的两端，只做前者是内部平台最常见的腐烂方式**。
@@ -578,7 +578,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 ```
 /srv/erix/users/<fde>/            # 宿主机（user-space.md §2）
-├── home/                          # 挂到容器 /home/<user>（HOME：.erix/{config.json,mcp.json,skills,todos} + .cache/station/spool）
+├── home/                          # 挂到容器 /home/<user>（HOME：.git-credentials + .erix/{config.json,mcp.json,skills,todos} + .cache/station/spool）
 ├── projects/<project>/            # 仓库；含 .erix/{ports.json,AGENTS.md} + .gitignore
 ├── worktrees/<project>-<runId>/   # 每个 run 独占的 git worktree（agentd 创建）
 └── cache/                         # 依赖缓存（npm/pnpm/pip）
@@ -593,7 +593,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 - 回流走 fork/PR，不直接在主干改
 - `git worktree` 的**创建与清理（`worktree remove` / `worktree prune`）归 agentd**（run 启动前必须存在、结束后由 agentd 回收，见 runner-integration §6.2）；worktree 内的**内容由 agent（FDE）在容器内自行管理**（改代码、commit、分支），平台不代管内容（决策者 2026-09，issue #3 评论）；`.git` 是共享的，清理时别误删其他 run 的 worktree
 - `node_modules` 每个 worktree 一份 → 用 pnpm store / npm cache 共享
-- clone 与 git 凭据（SSH key / token）由 FDE 在容器内自行配置（等同他自己的开发机）；平台不下发、不代管 git 凭据（边界见 §7.2）
+- FDE 自行执行 clone；Git 凭据可自助配置，或由 admin 通过 portal 凭据端点投放到 `~/.git-credentials`（`0640`、FDE 属主、不进 DB/环境变量；见 [`user-space.md`](user-space.md) §4.1.1）
 
 > **平台文件读取纪律**：`ports.json` / `config.json` 一律经 `manifest.json` 校验后再读（防跨文件混合版本），见 [`user-space.md`](user-space.md) §3/§5.4。
 

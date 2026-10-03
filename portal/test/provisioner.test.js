@@ -3,6 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   assertAllowedDockerPath,
   dockerBaseUrl,
@@ -19,6 +22,20 @@ import {
 } from '../src/provisioner.js';
 import { hashToken } from '../src/auth.js';
 import { syncFdeLlmBindingOnOnboard } from '../src/llm.js';
+
+const DEPROVISION_USER_SPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'station-provisioner-users-'));
+test.after(() => fs.rmSync(DEPROVISION_USER_SPACE_ROOT, { recursive: true, force: true }));
+
+function deprovisionForTest(pool, config, options) {
+  const useInjectedRoot = typeof config?.userSpaceRoot === 'string';
+  const userSpaceRoot = useInjectedRoot
+    ? config.userSpaceRoot
+    : fs.mkdtempSync(path.join(os.tmpdir(), 'station-provisioner-users-'));
+  return deprovisionFde(pool, { ...config, userSpaceRoot }, options)
+    .finally(() => {
+      if (!useInjectedRoot) fs.rmSync(userSpaceRoot, { recursive: true, force: true });
+    });
+}
 
 function listen(server) {
   return new Promise((res) => server.listen(0, '127.0.0.1', res));
@@ -585,7 +602,7 @@ test('F9 + 审计 #34 F-B：deprovision 容器删除失败 → 不标 removed，
     async removeNetwork() { return { ok: true, removed: true }; },
   };
   await assert.rejects(
-    () => deprovisionFde(pool, {}, { fdeName: 'alice', docker }),
+    () => deprovisionForTest(pool, {}, { fdeName: 'alice', docker }),
     /container removal failed/,
   );
   // F9（保留）：删除失败不得假装成功
@@ -622,7 +639,7 @@ test('审计 #34 F-B：前置事务失败 → 不做任何 Docker 删除（fail-
     async removeContainer() { dockerCalls.push('remove'); return { status: 204 }; },
     async removeNetwork() { dockerCalls.push('removeNetwork'); return { status: 204 }; },
   };
-  await assert.rejects(() => deprovisionFde(pool, {}, { fdeName: 'alice', docker }), /db down/);
+  await assert.rejects(() => deprovisionForTest(pool, {}, { fdeName: 'alice', docker }), /db down/);
   assert.deepEqual(dockerCalls, [], '吊销事务未提交前不得碰 Docker（否则失败窗口内 token 仍有效而资源已删）');
 });
 
@@ -662,7 +679,7 @@ test('issue #22 方案②：deprovision 成功 → revoked_at 落 DB（心跳/cl
     async removeContainer() { seq.push('docker:removeContainer'); return { status: 204 }; },
     async removeNetwork() { seq.push('docker:removeNetwork'); return { status: 204 }; },
   };
-  await deprovisionFde(pool, {}, { fdeName: 'alice', docker });
+  await deprovisionForTest(pool, {}, { fdeName: 'alice', docker });
   const revokeUpd = sqls.find((s) => s.includes('UPDATE containers SET revoked_at'));
   const removedUpd = sqls.find((s) => s.includes("UPDATE containers SET status = 'removed'"));
   assert.ok(revokeUpd, '必须先写 revoked_at（跨进程 revoke 信号，issue #22）');
@@ -716,11 +733,16 @@ const DEPROVISION_DOCKER_OK = {
 test('issue #33：deprovision 收敛 active run（queue cancelled + runs finished/aborted + 合成 run_end）+ 推 SSE', async () => {
   const sqls = [];
   const notified = [];
+  const home = path.join(DEPROVISION_USER_SPACE_ROOT, 'alice', 'home');
+  fs.mkdirSync(home, { recursive: true });
+  const credentialFile = path.join(home, '.git-credentials');
+  fs.writeFileSync(credentialFile, 'https://x-access-token:secret@github.com\n', { mode: 0o640 });
   const pool = makeDeprovisionPool({ runRows: [{ id: 'run-1', session_id: 'sess-1', attempts: 2 }], sqls });
-  await deprovisionFde(pool, {}, {
+  await deprovisionForTest(pool, { userSpaceRoot: DEPROVISION_USER_SPACE_ROOT }, {
     fdeName: 'alice', docker: DEPROVISION_DOCKER_OK,
     notify: (sid, evts) => notified.push({ sid, evts }),
   });
+  assert.equal(fs.existsSync(credentialFile), false, 'offboarding 必须删除 FDE HOME 中的 git 凭据文件');
   const joined = sqls.join('\n');
   assert.ok(/UPDATE run_queue SET status='cancelled'/.test(joined), 'queue 必须置 cancelled（对齐 reaper A2）');
   assert.ok(/UPDATE runs SET status='finished'/.test(joined), 'run 必须置 finished');
@@ -742,10 +764,31 @@ test('issue #33：run 收敛失败不回滚 offboard（best-effort：token 仍�
     async removeContainer() { dockerCalls.push('remove'); return { status: 204 }; },
     async removeNetwork() { dockerCalls.push('removeNetwork'); return { status: 204 }; },
   };
-  const out = await deprovisionFde(pool, {}, { fdeName: 'alice', docker, log: { warn() {} } });
+  const out = await deprovisionForTest(pool, {}, { fdeName: 'alice', docker, log: { warn() {} } });
   assert.equal(out.containerName, 'fde-alice', 'offboard 必须成功返回（收敛失败不阻断）');
   assert.ok(sqls.some((q) => q.includes('UPDATE containers SET revoked_at = now()')), 'token 仍必须吊销（安全优先）');
   assert.deepEqual(dockerCalls, ['stop', 'remove', 'removeNetwork'], '资源清理必须照常执行');
+});
+
+test('offboarding 凭据路径不安全时拒绝标记 removed，避免误删用户空间外文件', async () => {
+  const home = path.join(DEPROVISION_USER_SPACE_ROOT, 'alice', 'home');
+  fs.rmSync(path.join(DEPROVISION_USER_SPACE_ROOT, 'alice'), { recursive: true, force: true });
+  fs.mkdirSync(home, { recursive: true });
+  const outside = path.join(DEPROVISION_USER_SPACE_ROOT, 'outside-credential');
+  fs.writeFileSync(outside, 'https://x-access-token:secret@github.com\n');
+  fs.symlinkSync(outside, path.join(home, '.git-credentials'));
+  const sqls = [];
+  const pool = makeDeprovisionPool({ sqls });
+
+  await assert.rejects(
+    deprovisionForTest(pool, { userSpaceRoot: DEPROVISION_USER_SPACE_ROOT }, {
+      fdeName: 'alice', docker: DEPROVISION_DOCKER_OK, log: { warn() {} },
+    }),
+    /git credential file removal failed/,
+  );
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'https://x-access-token:secret@github.com\n');
+  assert.ok(!sqls.some((sql) => sql.includes("UPDATE containers SET status='removed'")),
+    '路径清理失败不得把 offboarding 标成完成');
 });
 
 // ---------------------------------------------------------------------------
@@ -814,7 +857,7 @@ test('issue #38 Phase B1：deprovision 前置事务内吊销 LLM（state=revoked
   const seq = [];
   const paramsLog = [];
   const pool = makeB1Pool({ llmRowCount: 1, seq, paramsLog });
-  await deprovisionFde(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
+  await deprovisionForTest(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
 
   assert.deepEqual(
     seq,
@@ -844,7 +887,7 @@ test('issue #38 Phase B1：无 LLM 配置的 FDE deprovision 正常（rowCount=0
   const seq = [];
   const paramsLog = [];
   const pool = makeB1Pool({ llmRowCount: 0, seq, paramsLog });
-  await deprovisionFde(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
+  await deprovisionForTest(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
   assert.ok(!seq.includes('sql:revoke-llm'), '无 active binding 不得产生实际吊销');
   assert.ok(seq.includes('sql:revoke-llm-noop'), 'UPDATE 仍会下发（幂等空转，匹配 0 行）');
   assert.ok(!seq.some((s) => s.includes('outbox:llm_binding')), '无 active binding 不得写 llm outbox');

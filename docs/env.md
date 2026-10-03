@@ -48,7 +48,7 @@ P1 本地开发（写代码、起栈联调）只需：
 | `FDE_WILDCARD_HOST` | 预览泛域名；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（如 `alice-r3a7fq-4001.fde.erix.vip`） |
 | DNS 泛解析 | 内网 DNS 添加两条 A 记录：`station.<base>` 与 `*.fde.<base>` → 宿主机内网 IP。**部署期事项（P1 开发不需要**，开发期用 §0 的 hosts/localhost 变通，决策者 2026-09，issue #3 评论**）** | 目标环境探测 + 决策者确认 ⚠️（倾向：平台 VPN-only/内网（见 §3），泛解析只需内网 DNS 支持） | 探测命令见 §9。若内网 DNS 不支持泛解析，降级方案是 portal 生成显式路由 + 逐条 A 记录，控制面复杂度上升（见 principles §3「每个端口一条手工路由」被否决项的权衡） |
 | `llm.<base>`（LLM 数据面域名） | **不进内网/公网 DNS**：只被 FDE 容器（worker）访问，容器内用 hosts 注入（`--add-host llm.<base>:<该 FDE 网关 IP>`）解析到 Traefik（host:443）；证书 SAN 仍需覆盖（§2）。浏览器从不直接访问 `llm.<base>` | 平台规范固定（topology.md §4-L7，H-B） | `llm.erix.vip`（仅作证书 SAN / 容器 hosts 注入用，不做 A 记录） |
-| 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台亦**不负责 clone 与 git 凭据下发**（由 FDE 在容器内自行配置，规格 §7.2/§12.2；决策者 2026-09，issue #3 评论） | 决策者提供 | `git.erix.vip`（内网自托管 Gitea——**仅为参考实例 A 的情况**，见 §8.1，非设计约束） |
+| 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点 write-through 到用户空间文件（见 `design/user-space.md` §4.1.1） | 决策者提供 | `git.erix.vip`（内网自托管 Gitea——**仅为参考实例 A 的情况**，见 §8.1，非设计约束） |
 
 ## 2. 证书参数
 

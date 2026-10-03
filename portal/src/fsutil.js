@@ -80,11 +80,11 @@ function fsyncDir(dir) {
 }
 
 /**
- * 写同目录 temp（O_EXCL + O_NOFOLLOW，0600）→ 写内容 → fsync → chmod 最终模式。
+ * 写同目录 temp（O_EXCL + O_NOFOLLOW，0600）→ 写内容 → 设置属主/模式 → fsync。
  * 只落 temp、不 rename；返回 temp 路径，供两阶段提交（user-space §5.3 提交点 / F5）。
  * 失败清理 temp 并抛错。
  */
-export function writeTempFile(target, content, { mode = 0o644, root = null } = {}) {
+export function writeTempFile(target, content, { mode = 0o644, uid = null, gid = null, root = null } = {}) {
   if (root) assertSafePath(root, target);
   const dir = path.dirname(target);
   const tmp = path.join(dir, `${path.basename(target)}.${randomHex(4)}.tmp`);
@@ -92,10 +92,11 @@ export function writeTempFile(target, content, { mode = 0o644, root = null } = {
   try {
     fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
     fs.writeFileSync(fd, content);
+    if (uid !== null || gid !== null) fs.fchownSync(fd, uid ?? -1, gid ?? -1);
+    fs.fchmodSync(fd, mode);
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
-    fs.chmodSync(tmp, mode);
     return tmp;
   } catch (err) {
     if (fd !== undefined) {
@@ -126,8 +127,8 @@ export function commitTempFile(tmp, target, { root = null } = {}) {
  * 失败清理 temp 并抛错，保留旧文件（绝不写半截）。
  * rename 已提交但目录 fsync 失败时抛 `materialize_fsync_failed`（持久性未确认，调用方须走失败语义）。
  */
-export function atomicWriteFile(target, content, { mode = 0o644, root = null } = {}) {
-  const tmp = writeTempFile(target, content, { mode, root });
+export function atomicWriteFile(target, content, { mode = 0o644, uid = null, gid = null, root = null } = {}) {
+  const tmp = writeTempFile(target, content, { mode, uid, gid, root });
   try {
     const ok = commitTempFile(tmp, target, { root });
     if (!ok) {

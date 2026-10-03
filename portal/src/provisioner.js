@@ -20,6 +20,7 @@ import { enqueueRouteChange } from './outbox.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
+import { removeGitCredentialFile } from './git-credential.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -906,6 +907,14 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
       // 或人工 `docker network rm`；且残留网络会因 `assertNetworkContract` 子网校验阻断同 FDE 的 re-onboard。
       log.warn?.(`[provisioner] deprovision ${fdeName}: network removal failed; token already revoked, rerun deprovision or remove the network manually`);
       throw new Error(`deprovision ${fdeName}: network removal failed (token already revoked)`);
+    }
+
+    // ②b 凭据不在 DB/materializer 对账集中：Docker 资源移除后显式清理；失败时保留状态以便重试。
+    try {
+      removeGitCredentialFile({ config, fdeName });
+    } catch (err) {
+      log.warn?.(`[provisioner] deprovision ${fdeName}: git credential file removal failed; Docker resources already removed`);
+      throw new Error(`deprovision ${fdeName}: git credential file removal failed (Docker resources already removed)`, { cause: err });
     }
 
     // ③ 资源已清理 → status 收敛（F9：只有删干净才标 removed）。
