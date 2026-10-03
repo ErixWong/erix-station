@@ -123,7 +123,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 | 网络 | 成员 | 子网 |
 |---|---|---|
 | **host** | Traefik（host 网络模式，零 docker 网络接入，独占 80/443） | —（不占 docker 网络） |
-| **`backend`** | portal（publish 仅 `127.0.0.1:8080` 回环）+ station-db + station-docker-proxy + station-mock-llm（P1 开发期）+ LLM 网关（P3 加入） | **显式 `172.30.0.0/24`**（与 FDE 池 `10.200.0.0/16` / `10.201.0.0/16` 隔离，topology.md §2/§3；成员表以 deploy-contract §2.1 为准） |
+| **`backend`** | portal（publish 仅 `127.0.0.1:8080` 回环）+ station-db + station-docker-proxy + LLM 网关（issue #117 phase 1 以 opt-in profile 加入） | **显式 `172.30.0.0/24`**（与 FDE 池 `10.200.0.0/16` / `10.201.0.0/16` 隔离，topology.md §2/§3；成员表以 deploy-contract §2.1 为准） |
 | **`fde-<name>`** | 该 FDE 的主容器 + 其自有服务（db/redis/sidecar） | **每 FDE 一条独立 `/29`**（默认池 `10.200.0.0/16`；大 FDE 预留 `10.201.0.0/16` `/28`），portal 管 IPAM（topology.md §3） |
 
 **取消 `control`（本次修正点）**：原「portal + db + 所有 FDE 容器共享 `control`」意味着任何 FDE 容器都能直连 portal 与其它 FDE 容器——**共享网络是横向越权的隔离漏洞根源**（issue #5 正文证据）。H-B 下 portal 不再与任何 FDE 容器同网，容器 → portal 的 internal 通道改经 Traefik（§5.3）。
@@ -519,6 +519,8 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 ---
 
 ## 11. LLM 接入与出口管控
+
+> **方向更新（issue #117，2026-10-03）**：目标从 2026-09-20 的「每 FDE 上游 key 直发」切回「LiteLLM 为每 FDE 铸虚拟 key」。本轮仅交付网关基础设施；portal 的 LLM 调用/租户绑定与 Traefik 路由切换留待后续阶段，现有 `station-mock-llm` 保留并继续占 4000，LiteLLM 暂用回环 4100。以下直接上游 key / provider 绑定细节是此前方案的历史记录，不代表 issue #117 的目标态。
 
 ### 11.1 先拆问题
 
