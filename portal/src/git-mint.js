@@ -1,0 +1,216 @@
+// 通过 Gitea/GitLab 管理 API 为 FDE 建账号并铸最小范围的 Git token。
+// 所有上游错误都只包含 provider 与 HTTP 状态，不透传响应体或凭据。
+import crypto from 'node:crypto';
+
+const DEFAULT_TIMEOUT_MS = 10_000;
+
+export class GitMintError extends Error {
+  constructor(code, message, { httpStatus = 502 } = {}) {
+    super(message);
+    this.code = code;
+    this.httpStatus = httpStatus;
+  }
+}
+
+function inputBase(baseUrl, adminKey, login) {
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new GitMintError('git_host_invalid', 'git host base_url is invalid', { httpStatus: 400 });
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password
+      || parsed.search || parsed.hash) {
+    throw new GitMintError('git_host_invalid', 'git host base_url is invalid', { httpStatus: 400 });
+  }
+  if (typeof adminKey !== 'string' || adminKey.trim() === '') {
+    throw new GitMintError('git_admin_key_missing', 'git host admin key is not configured', { httpStatus: 400 });
+  }
+  if (typeof login !== 'string' || login.trim() === '' || login.length > 255
+      || /[\u0000-\u001f\u007f]/.test(login)) {
+    throw new GitMintError('git_login_invalid', 'remote login is invalid', { httpStatus: 400 });
+  }
+  return parsed.href.replace(/\/+$/, '');
+}
+
+function apiUrl(base, path) {
+  return `${base}${path}`;
+}
+
+async function requestJson({ fetchImpl, timeoutMs, provider, url, method, headers, body }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetchImpl(url, {
+      method,
+      headers: { accept: 'application/json', ...headers },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data = {};
+    if (text !== '') {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new GitMintError('git_host_invalid_response', `${provider} API returned invalid JSON`);
+      }
+    }
+    if (!response.ok) {
+      throw new GitMintError('git_host_request_failed', `${provider} API request failed (HTTP ${response.status})`);
+    }
+    return data;
+  } catch (err) {
+    if (err instanceof GitMintError) throw err;
+    if (controller.signal.aborted || err?.name === 'AbortError') {
+      throw new GitMintError('git_host_timeout', `${provider} API request timed out`);
+    }
+    throw new GitMintError('git_host_unreachable', `${provider} API request failed`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function tokenResult(provider, data) {
+  const tokenRef = data?.id ?? data?.token_id;
+  const tokenPlaintext = provider === 'gitea' ? (data?.sha1 ?? data?.token) : data?.token;
+  if ((typeof tokenRef !== 'string' && typeof tokenRef !== 'number')
+      || typeof tokenPlaintext !== 'string' || tokenPlaintext.length === 0) {
+    throw new GitMintError('git_host_invalid_response', `${provider} API omitted token details`);
+  }
+  return { tokenRef: String(tokenRef), tokenPlaintext };
+}
+
+function randomPassword() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  const base = inputBase(baseUrl, adminKey, login);
+  const password = randomPassword();
+  const authorization = `token ${adminKey}`;
+  let created = false;
+  try {
+    const user = await requestJson({
+      fetchImpl,
+      timeoutMs,
+      provider: 'gitea',
+      url: apiUrl(base, '/api/v1/admin/users'),
+      method: 'POST',
+      headers: { authorization, 'content-type': 'application/json' },
+      body: {
+        username: login,
+        email: `station-${crypto.randomBytes(12).toString('hex')}@users.invalid`,
+        password,
+        must_change_password: false,
+        send_notify: false,
+      },
+    });
+    created = true;
+    const remoteLogin = user?.login ?? user?.username ?? login;
+    try {
+      const token = await requestJson({
+        fetchImpl,
+        timeoutMs,
+        provider: 'gitea',
+        url: apiUrl(base, `/api/v1/users/${encodeURIComponent(remoteLogin)}/tokens`),
+        method: 'POST',
+        headers: {
+          authorization: `Basic ${Buffer.from(`${remoteLogin}:${password}`).toString('base64')}`,
+          'content-type': 'application/json',
+        },
+        body: { name: `erix-station-${crypto.randomBytes(8).toString('hex')}`, scopes: ['write:repository'] },
+      });
+      const { tokenRef, tokenPlaintext } = tokenResult('gitea', token);
+      return { remoteLogin, tokenRef, tokenPlaintext };
+    } catch (err) {
+      await requestJson({
+        fetchImpl,
+        timeoutMs,
+        provider: 'gitea',
+        url: apiUrl(base, `/api/v1/admin/users/${encodeURIComponent(remoteLogin)}`),
+        method: 'DELETE',
+        headers: { authorization },
+      }).catch(() => {});
+      throw err;
+    }
+  } catch (err) {
+    if (created && !(err instanceof GitMintError)) {
+      // No upstream exception text is surfaced because it may contain request credentials.
+      throw new GitMintError('git_host_unreachable', 'gitea API request failed');
+    }
+    throw err;
+  }
+}
+
+async function mintGitlab({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  const base = inputBase(baseUrl, adminKey, login);
+  const password = randomPassword();
+  const headers = { 'private-token': adminKey, 'content-type': 'application/json' };
+  let userId = null;
+  try {
+    const user = await requestJson({
+      fetchImpl,
+      timeoutMs,
+      provider: 'gitlab',
+      url: apiUrl(base, '/api/v4/users'),
+      method: 'POST',
+      headers,
+      body: {
+        username: login,
+        name: login,
+        email: `station-${crypto.randomBytes(12).toString('hex')}@users.invalid`,
+        password,
+        skip_confirmation: true,
+      },
+    });
+    userId = user?.id;
+    if (typeof userId !== 'number' && typeof userId !== 'string') {
+      throw new GitMintError('git_host_invalid_response', 'gitlab API omitted user id');
+    }
+    const token = await requestJson({
+      fetchImpl,
+      timeoutMs,
+      provider: 'gitlab',
+      url: apiUrl(base, `/api/v4/users/${encodeURIComponent(userId)}/impersonation_tokens`),
+      method: 'POST',
+      headers,
+      body: {
+        name: `erix-station-${crypto.randomBytes(8).toString('hex')}`,
+        scopes: ['write_repository'],
+      },
+    });
+    const { tokenRef, tokenPlaintext } = tokenResult('gitlab', token);
+    return { remoteLogin: user?.username ?? login, tokenRef, tokenPlaintext };
+  } catch (err) {
+    if (userId !== null) {
+      await requestJson({
+        fetchImpl,
+        timeoutMs,
+        provider: 'gitlab',
+        url: apiUrl(base, `/api/v4/users/${encodeURIComponent(userId)}`),
+        method: 'DELETE',
+        headers: { 'private-token': adminKey },
+      }).catch(() => {});
+    }
+    throw err;
+  }
+}
+
+export async function mintGiteaAccount(options = {}) {
+  return mintGitea(options);
+}
+
+export async function mintGitlabAccount(options = {}) {
+  return mintGitlab(options);
+}
+
+export async function mintGitAccount({ provider, mode, ...options } = {}) {
+  if (mode !== 'minted' || !['gitea', 'gitlab'].includes(provider)) {
+    throw new GitMintError('mint_unsupported', `platform token minting is unsupported for ${provider ?? 'unknown'} (${mode ?? 'unknown'})`, {
+      httpStatus: 400,
+    });
+  }
+  return provider === 'gitea' ? mintGiteaAccount(options) : mintGitlabAccount(options);
+}

@@ -37,6 +37,18 @@ export interface AdminUser {
   role: string;
   fde_name: string | null;
   status: string;
+  git_host_id?: string | null;
+}
+
+export interface GitHost {
+  id: string;
+  name: string;
+  provider: 'gitea' | 'github' | 'gitlab';
+  base_url: string;
+  admin_key: string | null;
+  admin_key_configured: boolean;
+  mode: 'minted' | 'per_fde_pat';
+  enabled: boolean;
 }
 
 // 新增模型表单的类型下拉（旧版 7 类，逐字平移）。
@@ -58,6 +70,10 @@ interface UsersResponse {
   items: AdminUser[];
 }
 
+interface GitHostsResponse {
+  items: GitHost[];
+}
+
 interface CreateUserResponse {
   user: AdminUser;
   totp_secret: string;
@@ -68,10 +84,13 @@ export const useAdminStore = defineStore('admin', {
   state: () => ({
     providers: [] as LlmProvider[],
     users: [] as AdminUser[],
+    gitHosts: [] as GitHost[],
     providersLoaded: false, // 「加载中…」空态用（旧 #providerList 初始文案）
     usersLoaded: false,
+    gitHostsLoaded: false,
     llmErr: null as string | null, // 旧 showErr('llmErr', e)
     fdeErr: null as string | null,
+    gitHostsErr: null as string | null,
     expandedProviders: [] as string[], // 旧 S.expanded（Set<string>，provider id）
     expandedUsers: [] as string[], // 旧 S.userExpanded
     totpOnce: null as TotpOnce | null, // 旧 #totpOnce 内联盒
@@ -119,6 +138,80 @@ export const useAdminStore = defineStore('admin', {
         this.usersLoaded = true;
       } catch (e) {
         this.fdeErr = t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async loadGitHosts() {
+      this.gitHostsErr = null;
+      try {
+        const data = await api<GitHostsResponse>('/api/admin/git-hosts');
+        this.gitHosts = data.items ?? [];
+        this.gitHostsLoaded = true;
+      } catch (e) {
+        this.gitHostsErr = t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async addGitHost(fields: {
+      name: string;
+      provider: GitHost['provider'];
+      base_url: string;
+      admin_key?: string;
+      enabled?: boolean;
+    }): Promise<string | null> {
+      this.gitHostsErr = null;
+      try {
+        await api('/api/admin/git-hosts', { method: 'POST', body: JSON.stringify(fields) });
+        await this.loadGitHosts();
+        return this.gitHostsErr;
+      } catch (e) {
+        this.gitHostsErr = t('admin.errorPrefix') + this.errText(e);
+        return this.gitHostsErr;
+      }
+    },
+
+    async updateGitHost(host: GitHost, fields: Partial<{
+      name: string;
+      provider: GitHost['provider'];
+      base_url: string;
+      admin_key: string;
+      clear_admin_key: boolean;
+      enabled: boolean;
+    }>): Promise<string | null> {
+      this.gitHostsErr = null;
+      try {
+        await api(`/api/admin/git-hosts/${encodeURIComponent(host.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(fields),
+        });
+        await this.loadGitHosts();
+        return this.gitHostsErr;
+      } catch (e) {
+        this.gitHostsErr = t('admin.errorPrefix') + this.errText(e);
+        return this.gitHostsErr;
+      }
+    },
+
+    async toggleGitHost(host: GitHost) {
+      this.gitHostsErr = null;
+      try {
+        await api(`/api/admin/git-hosts/${encodeURIComponent(host.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ enabled: !host.enabled }),
+        });
+        await this.loadGitHosts();
+      } catch (e) {
+        this.gitHostsErr = t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async removeGitHost(host: GitHost) {
+      this.gitHostsErr = null;
+      try {
+        await api(`/api/admin/git-hosts/${encodeURIComponent(host.id)}`, { method: 'DELETE' });
+        await this.loadGitHosts();
+      } catch (e) {
+        this.gitHostsErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
