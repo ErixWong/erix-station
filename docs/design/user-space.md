@@ -233,6 +233,8 @@
 | `slots.*.endpoint` | `https://llm.<base>/v1`（`llm.<base>` = `llm.erix.vip`，env §10 `LLM_HOST`） | 容器内经 `--add-host llm.<base>:<本 FDE 网关 IP>` 解析到 Traefik host:443（env §0/§1）；**不写 A 记录、不进 DNS**。 |
 | `slots.*.model` | `default`/`audit`/`fold` 三个 slot 的模型名 | 平台默认值；`audit`/`fold` 用便宜模型（规格 §11.4）。 |
 
+> **issue #117 phase 2 当前凭据口径**：上表 2026-09-20 的「真实上游 api_key」说明为历史方案；当前 Traefik 注入 `fde_llm_bindings.api_key` 中的 LiteLLM per-FDE virtual key，上游凭据只保存在 LiteLLM credential。Station 槽位以 `model_info.id` 识别模型，并将对应 `model_name` 用作请求体值。
+
 > **已对齐上游（v0.3.5 `src/config/json-file.js` 实测）**：`config.json` 顶层键为 **`slots`**，即 `{"slots": {"default": {apiKey, endpoint, model}, "audit": …, "fold": …}}`；`createJsonFileModelConfigProvider` 只认 `parsed.slots`（缺 `slots` → 配置解析失败）。字段名 `apiKey`/`endpoint`/`model` 与实现（materializer）一致；平台承诺语义 =「占位 key + `endpoint=https://llm.<base>/v1` + `default/audit/fold` 三 slot」。
 
 #### 4.3.3 `manifest.json`（多文件一致性提交点）

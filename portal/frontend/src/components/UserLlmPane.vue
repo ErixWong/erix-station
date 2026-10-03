@@ -39,7 +39,6 @@ const cfg = ref<FdeLlmConfig | null>(null);
 const activeRun = ref(false);
 
 const providerId = ref('');
-const apiKey = ref('');
 const mainModelId = ref('');
 const embeddingModelId = ref('');
 const visionModelId = ref('');
@@ -48,11 +47,6 @@ const okMsg = ref(''); // 旧 [data-llmmsg] 内的 .okmsg
 const errMsg = ref(''); // 旧 [data-llmmsg] 内的 .syserr
 const conflictMsg = ref(''); // 409 拒绝原因（旧 submitLlm 的显式确认分支）
 const showForce = ref(false); // 「确认无影响，强制保存」按钮可见性
-
-// 旧 keyhint：已配置 xxx，重输以修改 / 首次配置必填。
-const keyHint = computed(() => (cfg.value?.api_key
-  ? t('admin.llm.keyConfigured', { key: cfg.value.api_key })
-  : t('admin.llm.keyFirstTime')));
 
 // 当前供应商下启用中的模型（旧 ms = (p?.models ?? []).filter((m) => m.enabled)）。
 const enabledModels = computed<LlmModel[]>(() => {
@@ -122,19 +116,16 @@ async function submitLlm(force: boolean) {
       embedding_model_id: embeddingModelId.value || null,
       vision_model_id: visionModelId.value || null,
     };
-    if (apiKey.value) body.api_key = apiKey.value;
     if (force) body.force = true;
     const r = await api<{ config: FdeLlmConfig & { main: { model_id: string } } }>(`/api/admin/fdes/${fde}/llm`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
     cfg.value = r.config;
-    okMsg.value = t('admin.llm.saved', { model: r.config.main.model_id })
-      + (r.config.api_key ? t('admin.llm.savedKeySuffix', { key: r.config.api_key }) : '');
+    okMsg.value = t('admin.llm.saved', { model: r.config.main.model_id });
     errMsg.value = '';
     conflictMsg.value = ''; // 旧版成功即清空消息区（含 409 拒绝与强制按钮）
     showForce.value = false;
-    apiKey.value = ''; // 旧版成功后清空密码框
   } catch (err) {
     if (err instanceof ApiError && err.code === 'active_run_conflict' && !force) {
       // 服务端拒绝 → 展示原因 + 显式确认按钮（点击才算知情，才带 force=true 重试）。
@@ -184,18 +175,9 @@ onMounted(loadPane);
           <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
         </select>
       </label>
-      <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        <i18n-t keypath="admin.llm.apiKeyLabel" scope="global">
-          <template #hint><span data-test="key-hint">{{ keyHint }}</span></template>
-        </i18n-t>
-        <input
-          v-model="apiKey"
-          type="password"
-          autocomplete="new-password"
-          :placeholder="cfg?.api_key ? t('admin.llm.keyPlaceholder') : ''"
-          class="rounded-md border border-black/20 px-2 py-1 text-sm"
-        >
-      </label>
+      <p v-if="cfg?.api_key" data-test="virtual-key" class="self-end pb-1 text-xs text-black/55">
+        {{ t('admin.llm.virtualKeyLabel', { key: cfg.api_key }) }}
+      </p>
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
         {{ t('admin.llm.mainModelLabel') }}
         <select v-model="mainModelId" data-test="main-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">

@@ -4,7 +4,7 @@
 // 原子替换（tmp → 校验 → rename）。发布顺序与回滚见 rebuildRoutes 注释：先发含密 llm-routes.yml、
 // 再无密 routes.yml，任一环节失败按 fail-closed 处置（绝不让旧/半截含密文件继续被 Traefik 使用）。
 //
-// issue #38 Phase B1：LLM 段拆独立文件 llm-routes.yml（mode 600，含上游 api_key 明文）——
+// issue #38 Phase B1：LLM 段拆独立文件 llm-routes.yml（mode 600，含 per-FDE virtual key）——
 // 主文件 routes.yml 保持 0644（无密钥）。两文件同目录、同 atomicWriteFile、同一次全量重建，
 // Traefik file provider 按目录 watch 自动合并生效。outbox 消费对 aggregate 无感（claimRouteRows
 // 通用），aggregate='llm_binding' 行与 port_allocation 走同一条领取/租约/全量重建链路。
@@ -121,7 +121,7 @@ function assertHttpUrl(value, label) {
 /**
  * 生成 Traefik 主动态配置（YAML 文本，无密钥，mode 0644）。含 portal 路由、internal 路由
  * （ipAllowList 精确派生）、每 allocation 一条 router+service（带 forwardAuth + strip-cookie）。
- * LLM 段（含 api_key 明文）由 generateLlmTraefikConfig 单独生成 llm-routes.yml（mode 600）。
+ * LLM 段（含 LiteLLM virtual key 明文）由 generateLlmTraefikConfig 单独生成 llm-routes.yml（mode 600）。
  * 所有 hostname/router key/subnet 严格校验（F9）；非法输入直接抛错（fail-closed）。
  */
 export function generateTraefikConfig({
@@ -202,20 +202,19 @@ export function generateTraefikConfig({
 }
 
 /**
- * 生成 LLM 段 Traefik 动态配置（YAML 文本，**含上游 api_key 明文**——所在文件必须 mode 600，见 rebuildRoutes）。
- * issue #38 Phase B1：DB（fde_llm_bindings active + llm_providers.base_url + fde_networks.subnet）
- * 物化为 per-FDE 路由 + key 注入（D-4/L7，topology §10 证据 8）。Host 唯一口径 = config.llmHost。
+ * 生成 LLM 段 Traefik 动态配置（YAML 文本，**含 per-FDE LiteLLM key 明文**——文件 mode 600）。
+ * 每个 FDE 使用独立的来源网段路由和 key 注入 middleware，所有路由共用 LiteLLM 数据面 service。
  *
  * 结构（与 issue 定稿一致）：
  *   routers:    llm-<fdeName>           rule: Host(`<llmHost>`) && ClientIP(`<精确 subnet>`)
  *   middlewares: llm-key-<fdeName>      headers.customRequestHeaders.Authorization = Bearer <api_key>
- *   services:   llm-provider-<id 前 8 位>  loadBalancer.servers.url = <provider base_url>（同 provider 去重一份）
+ *   services:   llm-gateway              loadBalancer.servers.url = LiteLLM data-plane URL
  *
- * fail-closed：api_key 为 NULL（未配置）的 binding 不生成路由（该 FDE 无 LLM 可用，不注入空凭据）；
- * 无 ClientIP 条件的兜底路由禁止生成。所有值过控制字符/URL/hostname 校验；api_key 只进返回值，
+ * fail-closed：virtual key 为 NULL（未配置）的 binding 不生成路由（该 FDE 无 LLM 可用，不注入空凭据）；
+ * 无 ClientIP 条件的兜底路由禁止生成。所有值过控制字符/URL/hostname 校验；virtual key 只进返回值，
  * **绝不写日志/错误消息**（调用方同责）。
  *
- * @param llmBindings [{ fdeName, subnet, providerId, baseUrl, apiKey }]（apiKey=null 跳过）
+ * @param llmBindings [{ fdeName, subnet, apiKey }]（apiKey=null 跳过）
  */
 // 零 active binding 的空产物 = **不写文件**（rebuildRoutes unlink）。实测口径（wp4 e2e，Traefik v3 file provider）：
 //   - 'http: {}' / 纯注释 / 空 map 子键（routers: {} 等）→ 全部被拒（"cannot be a standalone element"，
@@ -224,7 +223,7 @@ export function generateTraefikConfig({
 // 返回 null 表示零 binding（调用方负责 unlink）。
 export const LLM_EMPTY_CONFIG = null;
 
-export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = [] }) {
+export function generateLlmTraefikConfig({ entryPoint, llmHost, llmGatewayUrl, llmBindings = [] }) {
   // F5：entryPoint 裸拼进每 router 的 entryPoints flow list（不加引号）——合法与否与 binding 数量无关，
   // 入口处先校验（fail-fast，先校验后写）。
   assertSafeToken(entryPoint, 'entryPoint');
@@ -234,26 +233,15 @@ export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = []
     if (b.apiKey == null) continue; // 未配置 key → 无 LLM 可用，fail-closed 不发布
     if (!isValidHostname(b.fdeName)) throw new Error(`invalid fde name: ${JSON.stringify(b.fdeName)}`);
     parseCidr(b.subnet);
-    // F5：providerId 会拼成未加引号的 YAML service key（llm-provider-<前 8 位>），注入面收口为
-    // 严格白名单 ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$。选这套而不是「UUID 形态」单独分支的理由：
-    // DB 主键就是 UUID，天然命中本白名单；单一白名单同时兼容短测试 id，避免两套校验口径漂移。
-    assertSafeString(b.providerId, 'providerId');
-    if (!SAFE_TOKEN_RE.test(b.providerId)) throw new Error(`invalid provider id: ${JSON.stringify(b.providerId)}`);
-    assertHttpUrl(b.baseUrl, 'baseUrl');
     assertSafeString(b.apiKey, 'apiKey');
     active.push(b);
   }
   if (active.length === 0) return LLM_EMPTY_CONFIG;
   if (!isValidHostname(llmHost)) throw new Error(`invalid llm hostname: ${JSON.stringify(llmHost)}`);
+  assertHttpUrl(llmGatewayUrl, 'llmGatewayUrl');
 
-  // 确定性输出：binding 按 fdeName 排序、service 按 provider 前缀排序——同 DB 状态两次渲染字节相同（幂等）。
+  // 确定性输出：binding 按 fdeName 排序——同 DB 状态两次渲染字节相同（幂等）。
   active.sort((x, y) => x.fdeName.localeCompare(y.fdeName));
-  const serviceKey = (providerId) => `llm-provider-${String(providerId).slice(0, 8)}`;
-  const providers = new Map();
-  for (const b of active) {
-    const key = serviceKey(b.providerId);
-    if (!providers.has(key)) providers.set(key, b.baseUrl);
-  }
 
   const lines = ['http:'];
   lines.push('  routers:');
@@ -263,7 +251,7 @@ export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = []
     lines.push(`      rule: ${yq(`Host(\`${llmHost}\`) && ClientIP(\`${b.subnet}\`)`)}`);
     lines.push('      priority: 200');
     lines.push(`      middlewares: [llm-key-${b.fdeName}]`);
-    lines.push(`      service: ${serviceKey(b.providerId)}`);
+    lines.push('      service: llm-gateway');
   }
 
   lines.push('  middlewares:');
@@ -277,15 +265,13 @@ export function generateLlmTraefikConfig({ entryPoint, llmHost, llmBindings = []
   }
 
   lines.push('  services:');
-  for (const [key, baseUrl] of [...providers.entries()].sort((a, b2) => a[0].localeCompare(b2[0]))) {
-    lines.push(`    ${key}:`);
-    lines.push('      loadBalancer:');
-    lines.push('        servers:');
-    lines.push(`          - url: ${yq(baseUrl)}`);
-    // M4：流式必需——responseForwarding.flushInterval ≤ 100ms（topology §6 第 5 条），否则 token 流被缓冲成整段。
-    lines.push('        responseForwarding:');
-    lines.push('          flushInterval: 100ms');
-  }
+  lines.push('    llm-gateway:');
+  lines.push('      loadBalancer:');
+  lines.push('        servers:');
+  lines.push(`          - url: ${yq(llmGatewayUrl)}`);
+  // 流式必需：保持较短 flush interval，避免 token 流被缓冲成整段。
+  lines.push('        responseForwarding:');
+  lines.push('          flushInterval: 100ms');
 
   return `${lines.join('\n')}\n`;
 }
@@ -315,9 +301,11 @@ export function validateLlmTraefikConfig(text, llmBindings) {
       throw new Error(`llm router ${name} missing key middleware reference`);
     }
   }
-  const serviceNames = [...new Set(llmBindings.filter((b) => b?.apiKey != null).map((b) => `llm-provider-${String(b.providerId).slice(0, 8)}`))];
-  for (const s of serviceNames) {
-    if (lines.filter((l) => l === `    ${s}:`).length !== 1) throw new Error(`llm service ${s} must exist exactly once`);
+  if (lines.filter((l) => l === '    llm-gateway:').length !== 1) {
+    throw new Error('llm service llm-gateway must exist exactly once');
+  }
+  for (const name of fdeNames) {
+    if (!lines.includes(`      service: llm-gateway`)) throw new Error(`llm router ${name} missing gateway service`);
   }
   return true;
 }
@@ -345,8 +333,8 @@ export function validateTraefikConfig(text, allocations) {
 
 /**
  * 从 DB 读取路由所需 desired state（active/allocated 网络 + 未释放 allocation → backend URL
- * + active LLM binding → 发布事实：fde_name/subnet/provider/base_url/api_key）。
- * api_key 明文只进返回值（渲染进 mode 600 文件），**绝不写日志/错误消息**（调用方同责）。
+ * + active LiteLLM binding → 发布事实：fde_name/subnet/virtual key）。
+ * virtual key 明文只进返回值（渲染进 mode 600 文件），**绝不写日志/错误消息**（调用方同责）。
  */
 export async function readRouteDesiredState(pool, config) {
   const networks = await pool.query(
@@ -357,12 +345,12 @@ export async function readRouteDesiredState(pool, config) {
       ORDER BY n.subnet`,
   );
   const llmRows = await pool.query(
-    `SELECT b.fde_id, b.api_key, p.id AS provider_id, p.base_url, u.fde_name, n.subnet
+    `SELECT b.fde_id, b.api_key, u.fde_name, n.subnet
        FROM fde_llm_bindings b
-       JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
        JOIN users u ON u.id = b.fde_id
        JOIN fde_networks n ON n.fde_id = b.fde_id AND n.state IN ('allocated', 'active')
-      WHERE b.state = 'active'
+      WHERE b.state = 'active' AND b.gateway = 'litellm'
+        AND b.api_key IS NOT NULL AND b.api_key <> ''
       ORDER BY u.fde_name`,
   );
   const allocs = await pool.query(
@@ -391,8 +379,6 @@ export async function readRouteDesiredState(pool, config) {
     llmBindings: llmRows.rows.map((r) => ({
       fdeName: r.fde_name,
       subnet: r.subnet,
-      providerId: r.provider_id,
-      baseUrl: r.base_url,
       apiKey: r.api_key ?? null,
     })),
   };
@@ -478,7 +464,7 @@ export async function enqueueFullRebuild(pool) {
 
 /**
  * 全量重生成 Traefik 动态配置并原子替换（启动/定时对账用，不依赖 outbox 行）。
- * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 api_key 明文，**0600**，issue #38 Phase B1）。
+ * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 virtual key 明文，**0600**，issue #38 Phase B1）。
  * 两份都先生成+校验再落盘：任一渲染失败则两份都不写（不落半截）。
  *
  * F3 发布语义（fail-closed 硬红线：任何失败都不允许让「已撤销/已停用」的 key 继续被 Traefik 使用）：
@@ -501,6 +487,7 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
   const llmText = generateLlmTraefikConfig({
     entryPoint: config.traefikEntryPoint,
     llmHost: config.llmHost,
+    llmGatewayUrl: config.llmGatewayUrl,
     llmBindings: state.llmBindings,
   });
   validateLlmTraefikConfig(llmText, state.llmBindings);
@@ -514,12 +501,12 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
       // unlink 原子；ENOENT 幂等。
       await fs.promises.unlink(llmTarget).catch((e) => { if (e?.code !== 'ENOENT') throw e; });
     } else {
-      // 红线：本文件含上游 api_key 明文，必须 0600（存储纪律 ①：key 只存在于 DB → 内存 → mode 600 文件）。
+      // 红线：本文件含 LiteLLM virtual key 明文，必须 0600（key 只存在于 DB → 内存 → mode 600 文件）。
       atomicWriteFile(llmTarget, llmText, { mode: 0o600, root: config.traefikDynamicDir });
     }
   } catch (err) {
     // 第 1 步失败：主文件保持上一版不动（不进入第 2 步）；尽力摘除盘上旧含密文件，
-    // 绝不静默——摘除失败必须明示「含密文件可能残留」异常态（旧 api_key 可能仍被 Traefik 使用）。
+    // 绝不静默——摘除失败必须明示「含密文件可能残留」异常态（旧 virtual key 可能仍被 Traefik 使用）。
     try {
       await fs.promises.unlink(llmTarget);
       log.warn?.(`[routes] llm-routes.yml publish failed (${err.message}); 已摘除含密文件，主文件保持上一版`);
@@ -530,7 +517,7 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
         log.warn?.(`[routes] llm-routes.yml publish failed (${err.message}); 含密文件本就不存在（fail-closed 状态达成），主文件保持上一版`);
         throw new Error(`llm-routes.yml publish failed: ${err.message}; 主文件保持上一版`);
       }
-      log.error?.(`[routes] llm-routes.yml publish failed (${err.message}) 且旧含密文件摘除失败: ${e2.message} —— 含密文件可能残留，旧 api_key 可能仍被 Traefik 使用（异常态）`);
+      log.error?.(`[routes] llm-routes.yml publish failed (${err.message}) 且旧含密文件摘除失败: ${e2.message} —— 含密文件可能残留，旧 virtual key 可能仍被 Traefik 使用（异常态）`);
       throw new Error(`llm-routes.yml publish failed: ${err.message}; 含密文件可能残留（摘除失败: ${e2.message}）`);
     }
     throw new Error(`llm-routes.yml publish failed: ${err.message}; 已摘除含密文件，主文件保持上一版`);
@@ -554,7 +541,7 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
         log.warn?.(`[routes] routes.yml publish failed (${err.message}); fail-closed：含密文件本就不存在（fail-closed 状态达成）`);
         throw err;
       }
-      log.error?.(`[routes] routes.yml publish failed (${err.message}) 且含密文件 llm-routes.yml 摘除失败: ${e2.message} —— 含密文件可能残留，旧 api_key 可能仍被 Traefik 使用（异常态）`);
+      log.error?.(`[routes] routes.yml publish failed (${err.message}) 且含密文件 llm-routes.yml 摘除失败: ${e2.message} —— 含密文件可能残留，旧 virtual key 可能仍被 Traefik 使用（异常态）`);
       throw new Error(`routes.yml publish failed: ${err.message}; 含密文件可能残留（摘除失败: ${e2.message}）`);
     }
     throw err;

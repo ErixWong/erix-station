@@ -1,5 +1,5 @@
 // HTTP 层测试（issue #41）：POST /api/sessions/:id/messages 建 run 前的 LLM 未绑定预检。
-//   无 active 的 fde_llm_bindings（state='active' + api_key 非空 + JOIN llm_providers enabled）
+//   无 active 的 fde_llm_bindings（state='active' + gateway='litellm' + 虚拟 key + model）
 //   → 409 llm_not_configured（fail-fast：不进幂等台账、不开业务事务、不入队 run）。
 //   已配置 → 预检放行，正常走 postMessage 事务（202）。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB。
@@ -77,8 +77,8 @@ class MessagePool extends FakePool {
       if (row && row.state === 'in_progress' && row.claim_token === claimToken) this.idem.delete(k);
       return { rows: [] };
     }
-    // issue #41 预检：JOIN 结果（routes.js llmRows 口径）
-    if (sql.includes('FROM fde_llm_bindings') && sql.includes('llm_providers')) {
+    // issue #117 precheck: active LiteLLM binding with virtual key and selected main model.
+    if (sql.includes('FROM fde_llm_bindings')) {
       return { rows: this.llmUpstreamOk ? [{ ok: 1 }] : [] };
     }
     if (sql.includes('FROM chat_sessions s')) return { rows: [this.sessionRow] };
@@ -153,7 +153,7 @@ test('issue #41：FDE 未配置 LLM 上游（JOIN 空）→ 409 llm_not_configur
   }
 });
 
-test('issue #41：已配置（active binding + enabled provider + 非空 key）→ 预检放行 → 202', async () => {
+test('issue #41：已配置（active LiteLLM binding + 虚拟 key + main model）→ 预检放行 → 202', async () => {
   const s = await startServer({ llmUpstreamOk: true });
   try {
     const r = await postMessage(s, { content: 'hi', attachments: [] });

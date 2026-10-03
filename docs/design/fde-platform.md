@@ -227,14 +227,15 @@ http:
       service: fde-alice-4000
     # LLM 注入：每 FDE 一条 router + 一条 headers middleware（各自独立 priority）；
     # 身份来自网络来源（ClientIP），非自报；禁止写无 ClientIP 条件的兜底路由（无匹配 404 = 默认拒绝）
-    # （2026-09-20 修订，issue #38：按 fde_llm_bindings 逐 binding 生成、注入真实上游 key、per-provider
-    #  service 上游直发；无 binding 不生成 LLM 路由 = fail-closed；本段实际发布在独立文件 llm-routes.yml，mode 600）
+    # （issue #117 phase 2：按 fde_llm_bindings 逐 binding 注入 LiteLLM virtual key；
+    #  所有 FDE 共用 llm-gateway service；无 binding 不生成 LLM 路由 = fail-closed；
+    #  本段实际发布在独立文件 llm-routes.yml，mode 600）
     llm-alice:
       rule: "Host(`llm.<base>`) && ClientIP(`10.200.1.0/29`)"
       entryPoints: [websecure]
       priority: 200
       middlewares: [llm-key-alice]
-      service: llm-provider-<provider id 前 8 位>
+      service: llm-gateway
     # 大 FDE（/28）示例：rule: "Host(`llm.<base>`) && ClientIP(`10.201.7.0/28`)"（subnet 由 fde_networks 派生，topology.md §5.1）
   middlewares:
     fde-auth:
@@ -520,7 +521,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 ## 11. LLM 接入与出口管控
 
-> **方向更新（issue #117，2026-10-03）**：目标从 2026-09-20 的「每 FDE 上游 key 直发」切回「LiteLLM 为每 FDE 铸虚拟 key」。本轮仅交付网关基础设施；portal 的 LLM 调用/租户绑定与 Traefik 路由切换留待后续阶段，现有 `station-mock-llm` 保留并继续占 4000，LiteLLM 暂用回环 4100。以下直接上游 key / provider 绑定细节是此前方案的历史记录，不代表 issue #117 的目标态。
+> **方向与实施更新（issue #117，2026-10-03）**：已恢复 LiteLLM per-FDE virtual key 方案并完成 phase 2：LiteLLM 是 credential 与模型目录真相源；portal admin API 代理 credentials/models，Station binding 存 LiteLLM `model_info.id`、数据面 `model_name` 与 virtual key；Traefik 每 FDE 按来源子网注入 key，所有 router 共用 `llm-gateway` data-plane service。`model_info.id` 与请求体中的 `model_name` 是不同值，不能互换。实现细节见 [`../data/model.md`](../data/model.md) §1.20；本节中注明 2026-09-20 的直连上游描述均为历史方案。
 
 ### 11.1 先拆问题
 
@@ -547,7 +548,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 | B 经 portal | 容器 → portal → 上游 | 否 | 不能 | **是**（SSE 透传） |
 | **C 网络强制（选定）** | 容器 → Traefik（按来源子网注入凭据）→ 网关，**且网关是唯一可达的 LLM 出口**（前提：安全团队网络层出口策略已实施，issue #3） | **否**（H-B 定稿 D-4，issue #5：容器零 LLM 凭据，Traefik 按 `ClientIP` 注入） | **不能** | 否 |
 
-**选 C**：用现成网关做（不自己写流式代理）——~~默认 LiteLLM~~（**2026-09-20 修订，issue #38：去 LiteLLM hub、上游直发 per-FDE key**；下述 1/2/3 的「网关虚拟 key」改为「`fde_llm_bindings` 真实上游 key」，由 Traefik 注入后直连 `llm_providers.base_url`，无 binding 无路由 = fail-closed。选型材料仍见 [llm-gateway/](llm-gateway/llm-gateway-selection.md)），portal 只做：
+**选 C**：用现成网关做（不自己写流式代理），当前采用 LiteLLM；2026-09-20「上游直发 per-FDE key」是已被 issue #117 取代的历史方案。portal 只做：
 
 1. 开通账号时调网关 admin API **建虚拟 key**（额度、模型白名单、别名 `alice@client-x`）——key 随后由 portal（经 reconciler）写入**宿主 Traefik 动态配置**（文件权限 600，仅 portal 可写、Traefik 只读），**不下发容器**
 2. 禁用账号时**吊销**（删 key + 删对应 LLM 注入路由）
@@ -563,7 +564,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 ### 11.4 配套细节
 
-- **容器内零 LLM 凭据**（H-B 定稿 D-4，issue #5）：容器 config 里只有占位 key + `endpoint=https://llm.<base>/v1`（`llm.<base>` 经 §5.3 hosts 注入解析到本 FDE 网关 IP）；真实 key 只存在于 DB（`fde_llm_bindings.api_key`）→ portal 内存 → 宿主 Traefik 动态配置 `llm-routes.yml`（**600**，portal 可写、Traefik 只读；**2026-09-20 修订，issue #38**：允许存 DB——原「绝不存明文」前提是 LiteLLM 持有真 key，该前提已不成立；存储纪律见 model.md §3）。原「key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
+- **容器内零 LLM 凭据**（H-B 定稿 D-4，issue #5）：容器 config 里只有占位 key + `endpoint=https://llm.<base>/v1`（`llm.<base>` 经 §5.3 hosts 注入解析到本 FDE 网关 IP）；Station DB 只存 LiteLLM virtual key（`fde_llm_bindings.api_key`），不存上游 `api_key`；virtual key 由 portal 注入宿主 Traefik 动态配置 `llm-routes.yml`（**600**，portal 可写、Traefik 只读；存储纪律见 [`../data/model.md`](../data/model.md) §1.20）。
 - **judge / fold 用便宜模型**：`ModelConfigProvider.resolve(slot)` 支持 `default` / `audit` / `fold`；长任务 judge 会 +10~30% 调用量
 - **额度用尽**：网关 429 → erix 分类 `KitError(rate_limited, retryable)` → 宿主需友好提示，且避免重试继续烧配额
 - **对账**：网关 usage 与 erix `onUsage` 两套数都要记（差异来自 judge/fold 的额外调用）
