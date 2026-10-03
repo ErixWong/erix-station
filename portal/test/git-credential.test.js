@@ -60,7 +60,6 @@ function recordingPool() {
 
 function assertNoTokenInDbCalls(pool, ...tokens) {
   for (const call of pool.calls) {
-    assert.match(call.sql, /INSERT INTO audit_log/);
     const serialized = JSON.stringify(call.params);
     for (const token of tokens) assert.ok(!serialized.includes(token), 'token must not be written to DB');
   }
@@ -90,7 +89,7 @@ test('write merges hosts, replaces only the target host, and installs 0640 FDE-o
   assert.equal(stat.uid, 1000);
   assert.equal(stat.gid, 1000);
   assertNoTokenInDbCalls(pool, 'ghp:secret@A/?#%', 'glpat-gitlab-B-4567', 'ghp-new-token-9876');
-  assert.deepEqual(pool.calls.map((call) => call.params[1]), [
+  assert.deepEqual(pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log')).map((call) => call.params[1]), [
     'admin.git_credential_set',
     'admin.git_credential_set',
     'admin.git_credential_set',
@@ -156,6 +155,37 @@ test('GET returns a masked credential view and DB audit calls never contain toke
   });
   assert.ok(!JSON.stringify(response).includes(token));
   assertNoTokenInDbCalls(pool, token);
+});
+
+test('setting or deleting the assigned per-FDE PAT updates remote login and awaiting status', async (t) => {
+  const f = fixture(t);
+  const state = { userStatus: 'awaiting_credential', remoteLogin: null };
+  const pool = {
+    calls: [],
+    async query(sql, params = []) {
+      this.calls.push({ sql, params });
+      if (sql.includes('SELECT u.id AS fde_id')) {
+        return { rows: [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url: 'https://github.com' }] };
+      }
+      if (sql.includes('UPDATE fde_git_accounts')) {
+        state.remoteLogin = params[2];
+        return { rows: [] };
+      }
+      if (sql.includes('UPDATE users SET status')) {
+        state.userStatus = params[1];
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+  };
+  const common = { pool, config: f.config, fdeName: 'alice', host: 'github.com' };
+  await setGitCredential({ ...common, username: 'alice-gh', token: 'github-pat-secret' });
+  assert.equal(state.remoteLogin, 'alice-gh');
+  assert.equal(state.userStatus, 'active');
+  await deleteGitCredential({ ...common });
+  assert.equal(state.remoteLogin, null);
+  assert.equal(state.userStatus, 'awaiting_credential');
+  assertNoTokenInDbCalls(pool, 'github-pat-secret');
 });
 
 test('invalid FDE names and symlinked user-space paths are rejected', async (t) => {

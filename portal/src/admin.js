@@ -23,6 +23,7 @@ const safeUser = (row) => ({
   display_name: row.display_name,
   role: row.role,
   fde_name: row.fde_name ?? null,
+  git_host_id: row.git_host_id ?? null,
   auth_source: row.auth_source,
   status: row.status,
   created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
@@ -31,7 +32,8 @@ const safeUser = (row) => ({
 /** 用户列表（无敏感字段：无 password_hash / totp_secret / email）。 */
 export async function listUsers(pool) {
   const r = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, created_at
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, created_at,
+            (SELECT git_host_id FROM fde_git_accounts a WHERE a.fde_id = users.id) AS git_host_id
        FROM users ORDER BY created_at ASC, login ASC`,
   );
   return { items: r.rows.map(safeUser) };
