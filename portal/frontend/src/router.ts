@@ -14,7 +14,32 @@ export const routes: RouteRecordRaw[] = [
   { path: '/', name: 'workbench', component: () => import('./views/WorkbenchView.vue') },
   // issue #55 B1 深链迁入路由层：#/session/<id>（hash 模式下与旧版 URL 形态一致，刷新/分享安全）。
   { path: '/session/:id', name: 'session', component: () => import('./views/WorkbenchView.vue') },
-  { path: '/admin', name: 'admin', component: () => import('./views/AdminView.vue'), meta: { requiresRole: 'admin' } },
+  {
+    path: '/admin',
+    component: () => import('./views/AdminLayout.vue'),
+    meta: { requiresRole: 'admin' },
+    children: [
+      { path: '', redirect: { name: 'admin-users' }, meta: { requiresRole: 'admin' } },
+      {
+        path: 'users',
+        name: 'admin-users',
+        component: () => import('./views/AdminUsersView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+      {
+        path: 'llm',
+        name: 'admin-llm',
+        component: () => import('./views/AdminView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+      {
+        path: 'repos',
+        name: 'admin-repos',
+        component: () => import('./views/AdminReposView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
+    ],
+  },
 ];
 
 // history 可注入（单测用 createMemoryHistory）；默认 hash 模式。

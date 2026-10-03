@@ -1,356 +1,395 @@
 <script setup lang="ts">
-// 管理台（issue #61 P3）：旧 portal/static/admin.html（Bootstrap+jQuery 风格内联页）逐行平移进 Vue SPA。
-// 两段：LLM 供应商（卡片 + 模型明细表 + 增删/启停）与 FDE 管理（用户卡片 + per-user LLM 配置
-// pane + 新增用户一次性 TOTP 盒）。状态/动作在 stores/admin.ts；per-user 配置 pane 在
-// components/UserLlmPane.vue。后端零改动：全部走既有 /api/admin/* 端点。
-import { computed, onMounted, reactive } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
-import { useRouter } from 'vue-router';
-import { useAuthStore } from '../stores/auth';
+import ModalShell from '../components/ModalShell.vue';
 import { MODEL_TYPES, useAdminStore, type LlmModel, type LlmProvider } from '../stores/admin';
-import UserLlmPane from '../components/UserLlmPane.vue';
 
-// issue #101 P3：管理台文案走 i18n（admin.* / common.*）。
-// 顶栏身份文案与工作台顶栏逐字相同 → 直接复用 workbench.who/whoNoFde（同值不重复定义）。
 const { t } = useI18n();
-const router = useRouter();
-const auth = useAuthStore();
 const admin = useAdminStore();
 
-const who = computed(() => {
-  const u = auth.user;
-  if (!u) return '';
-  return u.fde_name
-    ? t('workbench.who', { login: u.login, role: u.role, fde: u.fde_name })
-    : t('workbench.whoNoFde', { login: u.login, role: u.role });
+const showAddProvider = ref(false);
+const editingProvider = ref<LlmProvider | null>(null);
+const selectedProviderId = ref<string | null>(null);
+const editingModel = ref<LlmModel | null>(null);
+const deleting = ref(false);
+
+const providerForm = reactive({ name: '', base_url: '' });
+const providerEditForm = reactive({ base_url: '' });
+const modelForm = reactive({
+  model_id: '',
+  name: '',
+  type: 'text',
+  tool_calling: false,
+  context_window: '',
+});
+const modelEditForm = reactive({ name: '', tool_calling: false, context_window: '' });
+
+type DeleteTarget = { type: 'provider'; provider: LlmProvider } | { type: 'model'; model: LlmModel };
+const deleteTarget = ref<DeleteTarget | null>(null);
+const deleteMessage = computed(() => {
+  const target = deleteTarget.value;
+  if (!target) return '';
+  return target.type === 'provider'
+    ? t('admin.llm.confirmDeleteProvider', { name: target.provider.name })
+    : t('admin.llm.confirmDeleteModel', { model: target.model.model_id });
 });
 
-// ---- 顶部新增供应商表单（旧 #addProviderForm）----
-const providerForm = reactive({ name: '', base_url: '' });
+function clearProviderForm() {
+  providerForm.name = '';
+  providerForm.base_url = '';
+}
+
+function closeAddProvider() {
+  showAddProvider.value = false;
+  clearProviderForm();
+}
 
 async function onAddProvider() {
   const err = await admin.addProvider(providerForm.name.trim(), providerForm.base_url.trim());
-  if (!err) {
-    providerForm.name = '';
-    providerForm.base_url = '';
-  }
+  if (!err && !admin.llmErr) closeAddProvider();
 }
 
-// ---- 供应商下新增模型表单（旧 [data-addmodel] 表单；per-provider 本地表单态）----
-const modelForms = reactive<Record<string, { model_id: string; name: string; type: string; tool_calling: boolean; context_window: string }>>({});
-function modelForm(providerId: string) {
-  if (!modelForms[providerId]) {
-    modelForms[providerId] = { model_id: '', name: '', type: 'text', tool_calling: false, context_window: '' };
-  }
-  return modelForms[providerId];
+function openEditProvider(provider: LlmProvider) {
+  providerEditForm.base_url = provider.base_url;
+  editingProvider.value = provider;
 }
-async function onAddModel(providerId: string) {
-  const f = modelForm(providerId);
+
+async function onUpdateProvider() {
+  const provider = editingProvider.value;
+  if (!provider) return;
+  const err = await admin.updateProvider(provider, providerEditForm.base_url.trim());
+  if (!err) editingProvider.value = null;
+}
+
+function openAddModel(providerId: string) {
+  modelForm.model_id = '';
+  modelForm.name = '';
+  modelForm.type = 'text';
+  modelForm.tool_calling = false;
+  modelForm.context_window = '';
+  selectedProviderId.value = providerId;
+}
+
+function closeAddModel() {
+  selectedProviderId.value = null;
+}
+
+async function onAddModel() {
+  const providerId = selectedProviderId.value;
+  if (!providerId) return;
   const err = await admin.addModel(providerId, {
-    model_id: f.model_id.trim(),
-    name: f.name.trim(),
-    type: f.type,
-    tool_calling: f.tool_calling,
-    context_window: f.context_window ? Number(f.context_window) : null,
+    model_id: modelForm.model_id.trim(),
+    name: modelForm.name.trim(),
+    type: modelForm.type,
+    tool_calling: modelForm.tool_calling,
+    context_window: modelForm.context_window ? Number(modelForm.context_window) : null,
   });
-  if (!err) {
-    f.model_id = '';
-    f.name = '';
-    f.type = 'text';
-    f.tool_calling = false;
-    f.context_window = '';
-  }
+  if (!err && !admin.llmErr) closeAddModel();
 }
 
-// ---- 供应商/模型删除（旧 confirm 文案语义保留，issue #101 P3 走 i18n）----
-function onDeleteProvider(p: LlmProvider) {
-  if (!confirm(t('admin.llm.confirmDeleteProvider', { name: p.name }))) return;
-  admin.removeProvider(p);
-}
-function onDeleteModel(m: LlmModel) {
-  if (!confirm(t('admin.llm.confirmDeleteModel', { model: m.model_id }))) return;
-  admin.removeModel(m);
+function openEditModel(model: LlmModel) {
+  modelEditForm.name = model.name;
+  modelEditForm.tool_calling = model.tool_calling;
+  modelEditForm.context_window = model.context_window === null ? '' : String(model.context_window);
+  editingModel.value = model;
 }
 
-// ---- 新增 FDE 用户表单（旧 #addUserForm）----
-const userForm = reactive({ login: '', display_name: '', password: '', fde_name: '' });
-
-async function onAddUser() {
-  const err = await admin.addUser({
-    login: userForm.login.trim(),
-    display_name: userForm.display_name.trim(),
-    password: userForm.password,
-    ...(userForm.fde_name.trim() ? { fde_name: userForm.fde_name.trim() } : {}),
+async function onUpdateModel() {
+  const model = editingModel.value;
+  if (!model) return;
+  const err = await admin.updateModel(model, {
+    name: modelEditForm.name.trim(),
+    tool_calling: modelEditForm.tool_calling,
+    ...(modelEditForm.context_window ? { context_window: Number(modelEditForm.context_window) } : {}),
   });
-  if (!err) {
-    userForm.login = '';
-    userForm.display_name = '';
-    userForm.password = '';
-    userForm.fde_name = '';
-  }
+  if (!err) editingModel.value = null;
 }
 
-async function onLogout() {
-  await auth.logout();
-  router.replace('/login');
+async function onConfirmDelete() {
+  const target = deleteTarget.value;
+  if (!target || deleting.value) return;
+  deleting.value = true;
+  try {
+    if (target.type === 'provider') await admin.removeProvider(target.provider);
+    else await admin.removeModel(target.model);
+    if (!admin.llmErr) deleteTarget.value = null;
+  } finally {
+    deleting.value = false;
+  }
 }
 
 onMounted(() => {
-  // 旧 boot()：Promise.all([loadProviders(), loadUsers()])。
-  void Promise.all([admin.loadProviders(), admin.loadUsers()]);
+  void admin.loadProviders();
 });
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col bg-white">
-    <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
-      <h1 class="text-xl font-medium mb-0">{{ t('admin.title') }}</h1>
-      <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
-      <router-link to="/" class="text-sm underline">{{ t('admin.backToWorkbench') }}</router-link>
+  <section class="rounded-lg border border-black/10 bg-white">
+    <div class="p-3">
+      <h2 class="text-base font-semibold">{{ t('admin.llm.sectionTitle') }}</h2>
+      <p v-if="admin.llmErr" class="syserr my-1" role="alert">{{ admin.llmErr }}</p>
+
+      <div data-test="provider-list">
+        <p v-if="!admin.providersLoaded" class="muted">{{ t('common.loading') }}</p>
+        <p v-else-if="admin.providers.length === 0" class="muted">{{ t('admin.llm.emptyProviders') }}</p>
+
+        <div
+          v-for="p in admin.providers"
+          :key="p.id"
+          data-test="provider-card"
+          class="mt-2 rounded-lg border border-black/15"
+        >
+          <div class="flex flex-wrap items-center gap-3 px-3 py-2">
+            <span class="font-semibold">{{ p.name }}</span>
+            <span class="text-black/50 text-xs break-all">{{ p.base_url }}</span>
+            <span
+              class="rounded border px-1.5 py-0.5 text-xs font-medium"
+              :class="p.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
+            >{{ p.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
+            <span class="flex-1"></span>
+            <button
+              type="button"
+              class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
+              @click="admin.toggleExpandedProvider(String(p.id))"
+            >{{ admin.expandedProviders.includes(String(p.id)) ? t('admin.llm.collapseModels') : t('admin.llm.modelsCount', { count: p.models.length }) }}</button>
+            <button
+              type="button"
+              class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
+              @click="admin.toggleProvider(p)"
+            >{{ p.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
+            <button
+              type="button"
+              data-test="edit-provider"
+              class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
+              @click="openEditProvider(p)"
+            >{{ t('admin.edit') }}</button>
+            <button
+              type="button"
+              class="rounded-md border border-red-600/60 px-2 py-0.5 text-xs text-red-700 hover:bg-red-50"
+              @click="deleteTarget = { type: 'provider', provider: p }"
+            >{{ t('admin.delete') }}</button>
+          </div>
+
+          <div v-if="admin.expandedProviders.includes(String(p.id))" class="border-t border-dashed border-black/15 px-3 py-2">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="text-left text-black/60">
+                  <th class="py-1 pr-3 font-medium">model_id</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colName') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
+                  <th class="py-1 pr-3 font-medium">tool_calling</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
+                  <th class="py-1 font-medium"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="p.models.length === 0">
+                  <td colspan="7" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
+                </tr>
+                <tr v-for="m in p.models" :key="m.id" data-test="model-row" class="border-t border-black/5">
+                  <td class="py-1 pr-3">{{ m.model_id }}</td>
+                  <td class="py-1 pr-3">{{ m.name }}</td>
+                  <td class="py-1 pr-3">
+                    <span class="rounded border border-sky-600 bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700">{{ m.type }}</span>
+                  </td>
+                  <td class="py-1 pr-3">{{ m.tool_calling ? '✓' : '—' }}</td>
+                  <td class="py-1 pr-3">{{ m.context_window ?? '—' }}</td>
+                  <td class="py-1 pr-3">
+                    <span
+                      class="rounded border px-1.5 py-0.5 text-xs font-medium"
+                      :class="m.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
+                    >{{ m.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
+                  </td>
+                  <td class="py-1 whitespace-nowrap">
+                    <button
+                      type="button"
+                      class="mr-1 rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
+                      @click="admin.toggleModel(m)"
+                    >{{ m.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
+                    <button
+                      type="button"
+                      data-test="edit-model"
+                      class="mr-1 rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
+                      @click="openEditModel(m)"
+                    >{{ t('admin.edit') }}</button>
+                    <button
+                      type="button"
+                      class="rounded-md border border-red-600/60 px-2 py-0.5 text-xs text-red-700 hover:bg-red-50"
+                      @click="deleteTarget = { type: 'model', model: m }"
+                    >{{ t('admin.delete') }}</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <button
+              type="button"
+              data-test="open-add-model"
+              class="mt-2 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover"
+              @click="openAddModel(String(p.id))"
+            >{{ t('admin.llm.addModel') }}</button>
+          </div>
+        </div>
+      </div>
+
       <button
-        class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
-        @click="onLogout"
-      >{{ t('common.logout') }}</button>
-    </header>
+        type="button"
+        data-test="open-add-provider"
+        class="mt-3 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover"
+        @click="showAddProvider = true"
+      >{{ t('admin.llm.addProvider') }}</button>
+    </div>
+  </section>
 
-    <main class="flex-1 p-3 flex flex-col gap-4">
-      <!-- ==================== LLM 供应商（旧 #llmSection）==================== -->
-      <section class="rounded-lg border border-black/10 bg-white">
-        <div class="p-3">
-          <h2 class="text-base font-semibold">{{ t('admin.llm.sectionTitle') }}</h2>
-          <p v-if="admin.llmErr" class="syserr my-1" role="alert">{{ admin.llmErr }}</p>
+  <ModalShell
+    v-if="showAddProvider"
+    :label="t('admin.llm.addProviderTitle')"
+    @close="closeAddProvider"
+  >
+    <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
+      <h2 class="text-sm font-medium">{{ t('admin.llm.addProviderTitle') }}</h2>
+      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="closeAddProvider">✕</button>
+    </div>
+    <form data-test="add-provider-form" class="grid gap-3 px-3 py-3" @submit.prevent="onAddProvider">
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.providerName') }}
+        <input v-model="providerForm.name" required placeholder="openai" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        Base URL
+        <input v-model="providerForm.base_url" required placeholder="https://api.openai.com/v1" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <p v-if="admin.llmErr" class="syserr" role="alert">{{ admin.llmErr }}</p>
+      <div class="flex gap-2">
+        <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addProvider') }}</button>
+        <button type="button" class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="closeAddProvider">{{ t('common.cancel') }}</button>
+      </div>
+    </form>
+  </ModalShell>
 
-          <div data-test="provider-list">
-            <p v-if="!admin.providersLoaded" class="muted">{{ t('common.loading') }}</p>
-            <p v-else-if="admin.providers.length === 0" class="muted">{{ t('admin.llm.emptyProviders') }}</p>
+  <ModalShell
+    v-if="editingProvider"
+    :label="t('admin.llm.editProviderTitle', { name: editingProvider.name })"
+    @close="editingProvider = null"
+  >
+    <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
+      <h2 class="text-sm font-medium">{{ t('admin.llm.editProviderTitle', { name: editingProvider.name }) }}</h2>
+      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="editingProvider = null">✕</button>
+    </div>
+    <form data-test="edit-provider-form" class="grid gap-3 px-3 py-3" @submit.prevent="onUpdateProvider">
+      <p class="text-sm">{{ editingProvider.name }}</p>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        Base URL
+        <input v-model="providerEditForm.base_url" required class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <p v-if="admin.llmErr" class="syserr" role="alert">{{ admin.llmErr }}</p>
+      <div class="flex gap-2">
+        <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.save') }}</button>
+        <button type="button" class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="editingProvider = null">{{ t('common.cancel') }}</button>
+      </div>
+    </form>
+  </ModalShell>
 
-            <!-- 供应商卡片（旧 .card .head + .detail） -->
-            <div
-              v-for="p in admin.providers"
-              :key="p.id"
-              data-test="provider-card"
-              class="mt-2 rounded-lg border border-black/15"
-            >
-              <div class="flex flex-wrap items-center gap-3 px-3 py-2">
-                <span class="font-semibold">{{ p.name }}</span>
-                <span class="text-black/50 text-xs break-all">{{ p.base_url }}</span>
-                <span
-                  class="rounded border px-1.5 py-0.5 text-xs font-medium"
-                  :class="p.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
-                >{{ p.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
-                <span class="flex-1"></span>
-                <button
-                  type="button"
-                  class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
-                  @click="admin.toggleExpandedProvider(String(p.id))"
-                >{{ admin.expandedProviders.includes(String(p.id)) ? t('admin.llm.collapseModels') : t('admin.llm.modelsCount', { count: p.models.length }) }}</button>
-                <button
-                  type="button"
-                  class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
-                  @click="admin.toggleProvider(p)"
-                >{{ p.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
-                <button
-                  type="button"
-                  class="rounded-md border border-red-600/60 px-2 py-0.5 text-xs text-red-700 hover:bg-red-50"
-                  @click="onDeleteProvider(p)"
-                >{{ t('admin.delete') }}</button>
-              </div>
+  <ModalShell
+    v-if="selectedProviderId"
+    :label="t('admin.llm.addModelTitle')"
+    dialog-class="max-h-[90vh] overflow-y-auto md:w-[36rem]"
+    @close="closeAddModel"
+  >
+    <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
+      <h2 class="text-sm font-medium">{{ t('admin.llm.addModelTitle') }}</h2>
+      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="closeAddModel">✕</button>
+    </div>
+    <form data-test="add-model-form" class="grid gap-3 px-3 py-3 sm:grid-cols-2" @submit.prevent="onAddModel">
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        model_id
+        <input v-model="modelForm.model_id" required placeholder="gpt-4o" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colName') }}
+        <input v-model="modelForm.name" required placeholder="GPT-4o" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colType') }}
+        <select v-model="modelForm.type" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+          <option v-for="type in MODEL_TYPES" :key="type" :value="type">{{ type }}</option>
+        </select>
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colContextWindow') }}
+        <input v-model="modelForm.context_window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex items-center gap-1 text-xs text-black/55">
+        <input v-model="modelForm.tool_calling" type="checkbox" class="accent-brand"> tool_calling
+      </label>
+      <p v-if="admin.llmErr" class="syserr sm:col-span-2" role="alert">{{ admin.llmErr }}</p>
+      <div class="flex gap-2 sm:col-span-2">
+        <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addModel') }}</button>
+        <button type="button" class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="closeAddModel">{{ t('common.cancel') }}</button>
+      </div>
+    </form>
+  </ModalShell>
 
-              <!-- 模型明细 + 新增模型表单（旧 .detail） -->
-              <div v-if="admin.expandedProviders.includes(String(p.id))" class="border-t border-dashed border-black/15 px-3 py-2">
-                <table class="w-full text-sm">
-                  <thead>
-                    <tr class="text-left text-black/60">
-                      <th class="py-1 pr-3 font-medium">model_id</th>
-                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colName') }}</th>
-                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
-                      <th class="py-1 pr-3 font-medium">tool_calling</th>
-                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
-                      <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
-                      <th class="py-1 font-medium"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-if="p.models.length === 0">
-                      <td colspan="7" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
-                    </tr>
-                    <tr v-for="m in p.models" :key="m.id" class="border-t border-black/5">
-                      <td class="py-1 pr-3">{{ m.model_id }}</td>
-                      <td class="py-1 pr-3">{{ m.name }}</td>
-                      <td class="py-1 pr-3">
-                        <span class="rounded border border-sky-600 bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700">{{ m.type }}</span>
-                      </td>
-                      <td class="py-1 pr-3">{{ m.tool_calling ? '✓' : '—' }}</td>
-                      <td class="py-1 pr-3">{{ m.context_window ?? '—' }}</td>
-                      <td class="py-1 pr-3">
-                        <span
-                          class="rounded border px-1.5 py-0.5 text-xs font-medium"
-                          :class="m.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
-                        >{{ m.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
-                      </td>
-                      <td class="py-1">
-                        <button
-                          type="button"
-                          class="mr-1 rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
-                          @click="admin.toggleModel(m)"
-                        >{{ m.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
-                        <button
-                          type="button"
-                          class="rounded-md border border-red-600/60 px-2 py-0.5 text-xs text-red-700 hover:bg-red-50"
-                          @click="onDeleteModel(m)"
-                        >{{ t('admin.delete') }}</button>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+  <ModalShell
+    v-if="editingModel"
+    :label="t('admin.llm.editModelTitle', { model: editingModel.model_id })"
+    dialog-class="max-h-[90vh] overflow-y-auto md:w-[36rem]"
+    @close="editingModel = null"
+  >
+    <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
+      <h2 class="text-sm font-medium">{{ t('admin.llm.editModelTitle', { model: editingModel.model_id }) }}</h2>
+      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="editingModel = null">✕</button>
+    </div>
+    <form data-test="edit-model-form" class="grid gap-3 px-3 py-3 sm:grid-cols-2" @submit.prevent="onUpdateModel">
+      <p class="text-sm">model_id: {{ editingModel.model_id }}</p>
+      <p class="text-sm">{{ t('admin.llm.colType') }}: {{ editingModel.type }}</p>
+      <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
+        {{ t('admin.llm.colName') }}
+        <input v-model="modelEditForm.name" required class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colContextWindow') }}
+        <input v-model="modelEditForm.context_window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editContextWindowHint') }}</span>
+      </label>
+      <label class="flex items-center gap-1 text-xs text-black/55">
+        <input v-model="modelEditForm.tool_calling" type="checkbox" class="accent-brand"> tool_calling
+      </label>
+      <p v-if="admin.llmErr" class="syserr sm:col-span-2" role="alert">{{ admin.llmErr }}</p>
+      <div class="flex gap-2 sm:col-span-2">
+        <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.save') }}</button>
+        <button type="button" class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="editingModel = null">{{ t('common.cancel') }}</button>
+      </div>
+    </form>
+  </ModalShell>
 
-                <!-- 供应商下新增模型表单（旧 [data-addmodel]） -->
-                <form data-test="add-model-form" class="mt-2 flex flex-wrap items-end gap-2" @submit.prevent="onAddModel(String(p.id))">
-                  <label class="flex flex-col gap-1 text-xs text-black/55">
-                    model_id
-                    <input
-                      v-model="modelForm(String(p.id)).model_id" required placeholder="gpt-4o"
-                      class="rounded-md border border-black/20 px-2 py-1 text-sm"
-                    >
-                  </label>
-                  <label class="flex flex-col gap-1 text-xs text-black/55">
-                    {{ t('admin.llm.colName') }}
-                    <input
-                      v-model="modelForm(String(p.id)).name" required placeholder="GPT-4o"
-                      class="rounded-md border border-black/20 px-2 py-1 text-sm"
-                    >
-                  </label>
-                  <label class="flex flex-col gap-1 text-xs text-black/55">
-                    {{ t('admin.llm.colType') }}
-                    <select
-                      v-model="modelForm(String(p.id)).type"
-                      class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
-                    >
-                      <option v-for="t in MODEL_TYPES" :key="t" :value="t">{{ t }}</option>
-                    </select>
-                  </label>
-                  <label class="flex flex-col gap-1 text-xs text-black/55">
-                    {{ t('admin.llm.colContextWindow') }}
-                    <input
-                      v-model="modelForm(String(p.id)).context_window" type="number" min="1" placeholder="128000"
-                      class="rounded-md border border-black/20 px-2 py-1 text-sm"
-                    >
-                  </label>
-                  <label class="flex items-center gap-1 pb-1.5 text-xs text-black/55">
-                    <input v-model="modelForm(String(p.id)).tool_calling" type="checkbox" class="accent-brand"> tool_calling
-                  </label>
-                  <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addModel') }}</button>
-                </form>
-              </div>
-            </div>
-          </div>
-
-          <!-- 顶部新增供应商表单（旧 #addProviderForm） -->
-          <form data-test="add-provider-form" class="mt-3 flex flex-wrap items-end gap-2" @submit.prevent="onAddProvider">
-            <label class="flex flex-col gap-1 text-xs text-black/55">
-              {{ t('admin.llm.providerName') }}
-              <input
-                v-model="providerForm.name" required placeholder="openai"
-                class="rounded-md border border-black/20 px-2 py-1 text-sm"
-              >
-            </label>
-            <label class="flex flex-col gap-1 text-xs text-black/55">
-              Base URL
-              <input
-                v-model="providerForm.base_url" required placeholder="https://api.openai.com/v1"
-                class="rounded-md border border-black/20 px-2 py-1 text-sm"
-              >
-            </label>
-            <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addProvider') }}</button>
-          </form>
-        </div>
-      </section>
-
-      <!-- ==================== FDE 管理（旧 #fdeSection）==================== -->
-      <section class="rounded-lg border border-black/10 bg-white">
-        <div class="p-3">
-          <h2 class="text-base font-semibold">{{ t('admin.fde.sectionTitle') }}</h2>
-          <p v-if="admin.fdeErr" class="syserr my-1" role="alert">{{ admin.fdeErr }}</p>
-
-          <!-- 一次性 TOTP 展示盒（旧 #totpOnce / .totpbox，仅此一次显示） -->
-          <div
-            v-if="admin.totpOnce"
-            data-test="totp-box"
-            class="my-2 rounded-lg border border-brand bg-green-50 p-3 text-[0.85rem]"
-          >
-            <img :src="admin.totpOnce.qr" :alt="t('admin.fde.qrAlt')" class="my-2 block h-48 w-48" style="image-rendering: pixelated">
-            <i18n-t keypath="admin.fde.totpCreated" tag="div" scope="global">
-              <template #login><b>{{ admin.totpOnce.login }}</b></template>
-              <template #onlyOnce><b>{{ t('admin.fde.totpOnlyOnce') }}</b></template>
-            </i18n-t>
-            <div>{{ t('admin.fde.otpauthUri') }}<code class="break-all select-all">{{ admin.totpOnce.uri }}</code></div>
-            <div>{{ t('admin.fde.totpSecret') }}<code class="break-all select-all">{{ admin.totpOnce.secret }}</code></div>
-            <div>{{ t('admin.fde.nextStep') }}</div>
-          </div>
-
-          <div data-test="user-list">
-            <p v-if="!admin.usersLoaded" class="muted">{{ t('common.loading') }}</p>
-            <p v-else-if="admin.users.length === 0" class="muted">{{ t('admin.fde.emptyUsers') }}</p>
-
-            <!-- 用户卡片（旧 .head.row-head：点卡片头展开，按钮除外） -->
-            <div
-              v-for="u in admin.users"
-              :key="u.id"
-              data-test="user-card"
-              class="mt-2 rounded-lg border border-black/15"
-            >
-              <div
-                class="flex flex-wrap items-center gap-3 px-3 py-2 cursor-pointer hover:bg-green-50"
-                @click="admin.toggleExpandedUser(String(u.id))"
-              >
-                <span class="font-semibold">{{ u.login }}</span>
-                <span class="text-black/50 text-xs">{{ u.display_name }}</span>
-                <span class="rounded border border-sky-600 bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700">{{ u.role }}</span>
-                <span v-if="u.fde_name" class="rounded border border-green-600 bg-green-50 px-1.5 py-0.5 text-xs font-medium text-green-700">{{ u.fde_name }}</span>
-                <span v-else class="muted">{{ t('admin.fde.noFdeName') }}</span>
-                <span
-                  class="rounded border px-1.5 py-0.5 text-xs font-medium"
-                  :class="u.status === 'active' ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
-                >{{ u.status }}</span>
-                <span class="flex-1"></span>
-                <button
-                  type="button"
-                  class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
-                  @click.stop="admin.toggleExpandedUser(String(u.id))"
-                >{{ admin.expandedUsers.includes(String(u.id)) ? t('admin.collapse') : t('admin.expand') }}</button>
-              </div>
-
-              <!-- per-user LLM 配置 pane（旧 [data-pane="llm"]；无 fde_name 的提示文案走 admin.fde.noFdeNameHint） -->
-              <div v-if="admin.expandedUsers.includes(String(u.id))" class="border-t border-dashed border-black/15 px-3 py-2">
-                <p v-if="!u.fde_name" class="muted">{{ t('admin.fde.noFdeNameHint') }}</p>
-                <UserLlmPane v-else :user="u" :providers="admin.providers" />
-              </div>
-            </div>
-          </div>
-
-          <!-- 新增 FDE 用户表单（旧 #addUserForm） -->
-          <h2 class="mt-4 text-base font-semibold">{{ t('admin.fde.addUserTitle') }}</h2>
-          <form data-test="add-user-form" class="mt-2 flex flex-wrap items-end gap-2" @submit.prevent="onAddUser">
-            <label class="flex flex-col gap-1 text-xs text-black/55">
-              {{ t('admin.fde.loginLabel') }}
-              <input v-model="userForm.login" required autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-            </label>
-            <label class="flex flex-col gap-1 text-xs text-black/55">
-              {{ t('admin.fde.displayNameLabel') }}
-              <input v-model="userForm.display_name" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-            </label>
-            <label class="flex flex-col gap-1 text-xs text-black/55">
-              {{ t('admin.fde.passwordLabel') }}
-              <input v-model="userForm.password" type="password" required autocomplete="new-password" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-            </label>
-            <label class="flex flex-col gap-1 text-xs text-black/55">
-              {{ t('admin.fde.fdeNameLabel') }}
-              <input v-model="userForm.fde_name" placeholder="alice" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-            </label>
-            <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.fde.addUser') }}</button>
-          </form>
-        </div>
-      </section>
-    </main>
-  </div>
+  <ModalShell
+    v-if="deleteTarget"
+    :label="t('admin.confirmDeleteTitle')"
+    @close="deleteTarget = null"
+  >
+    <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
+      <h2 class="text-sm font-medium">{{ t('admin.confirmDeleteTitle') }}</h2>
+      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="deleteTarget = null">✕</button>
+    </div>
+    <div class="p-3">
+      <p>{{ deleteMessage }}</p>
+      <p v-if="admin.llmErr" class="syserr mt-2" role="alert">{{ admin.llmErr }}</p>
+      <div class="mt-3 flex gap-2">
+        <button
+          type="button"
+          data-test="confirm-delete"
+          :disabled="deleting"
+          class="flex-1 rounded-md bg-red-700 px-2.5 py-1 text-sm text-white hover:bg-red-800 disabled:opacity-50"
+          @click="onConfirmDelete"
+        >{{ t('admin.delete') }}</button>
+        <button
+          type="button"
+          class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
+          @click="deleteTarget = null"
+        >{{ t('common.cancel') }}</button>
+      </div>
+    </div>
+  </ModalShell>
 </template>
