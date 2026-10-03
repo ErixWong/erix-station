@@ -151,7 +151,7 @@ export const zhCN = {
   preview: {
     title: '预览 {path}',
   },
-  // 管理台（views/AdminView.vue + components/UserLlmPane.vue + stores/admin.ts）
+  // 管理台（views/AdminLayout.vue / AdminUsersView.vue / AdminView.vue + components/UserLlmPane.vue）
   // 注：服务端透传的 error.message 一律不译，仅译前端自产文案（含「错误：」前缀与 409 拒绝前缀）。
   admin: {
     title: 'FDE Station 管理台',
@@ -162,8 +162,17 @@ export const zhCN = {
     enabled: '启用',
     disabled: '停用',
     delete: '删除',
+    edit: '编辑',
+    save: '保存',
+    confirmDeleteTitle: '确认删除',
     expand: '展开',
     collapse: '收起',
+    tabs: {
+      label: '管理台栏目',
+      users: '用户管理',
+      llm: 'LLM 管理',
+      repos: '仓库管理',
+    },
     // LLM 供应商/模型区（AdminView #llmSection + UserLlmPane）
     llm: {
       sectionTitle: 'LLM 供应商',
@@ -177,8 +186,13 @@ export const zhCN = {
       colContextWindow: '上下文窗口',
       colStatus: '状态',
       addModel: '＋ 新增模型',
+      addModelTitle: '新增模型',
       providerName: '供应商名',
       addProvider: '＋ 新增供应商',
+      addProviderTitle: '新增供应商',
+      editProviderTitle: '编辑供应商 {name}',
+      editModelTitle: '编辑模型 {model}',
+      editContextWindowHint: '留空保持现有值；当前 API 不支持清空该值。',
       confirmDeleteProvider: '确认删除供应商 {name}？其下模型将一并删除。',
       confirmDeleteModel: '确认删除模型 {model}？',
       // per-user LLM 配置 pane（UserLlmPane.vue）
@@ -216,6 +230,7 @@ export const zhCN = {
       passwordLabel: '口令',
       fdeNameLabel: 'fde_name（可空）',
       addUser: '＋ 创建用户',
+      totpTitle: '用户已创建 · TOTP 设置',
       qrAlt: 'TOTP 认证器二维码',
       // 一次性 TOTP 盒：{login} 与 {onlyOnce} 由模板插槽加粗（见 AdminView 模板）
       totpCreated: '用户 {login} 已创建。请用认证器 App 录入以下 otpauth URI 或种子（{onlyOnce}）：',
@@ -223,6 +238,10 @@ export const zhCN = {
       otpauthUri: 'otpauth URI：',
       totpSecret: 'TOTP 种子：',
       nextStep: '下一步：展开该用户卡片 → 配置 LLM 上游 → 点击 provision 容器；将登录名/口令与本二维码交给用户扫码录入认证器。',
+    },
+    repos: {
+      title: '仓库管理',
+      placeholder: '待后续实现。',
     },
   },
   // 运行时错误/兜底提示（api.ts + workbench store + 目录树）

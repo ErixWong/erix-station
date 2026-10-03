@@ -1,4 +1,4 @@
-// 全局守卫单测：/api/me 401 → /login；已登录访问 /login → /；非 admin 访问 /admin → /。
+// 全局守卫单测：/api/me 401 → /login；已登录访问 /login → /；管理台子路由均限制 admin。
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
@@ -61,11 +61,19 @@ describe('全局路由守卫', () => {
     expect(router.currentRoute.value.path).toBe('/');
   });
 
-  it('admin 访问 /admin → 放行', async () => {
+  it('admin 访问 /admin → 重定向到用户管理页', async () => {
     fetchMe(200, { user: ADMIN_USER });
     const router = await freshRouter();
     await router.push('/admin');
-    expect(router.currentRoute.value.path).toBe('/admin');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+    expect(router.currentRoute.value.name).toBe('admin-users');
+  });
+
+  it('非 admin 访问任一管理台 tab → 回工作台', async () => {
+    fetchMe(200, { user: FDE_USER });
+    const router = await freshRouter();
+    await router.push('/admin/llm');
+    expect(router.currentRoute.value.path).toBe('/');
   });
 
   it('无 session cookie（无响应体 401）也能落到 /login', async () => {

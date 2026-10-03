@@ -25,7 +25,7 @@ interface LoginResponse {
   expires_in?: number;
 }
 
-// afterLoginRoute：admin 且无 fde_name（平台管理员）→ /admin；其余回工作台（旧版 location.reload() 等价）。
+// afterLoginRoute：admin 且无 fde_name（平台管理员）→ /admin（默认重定向至 /admin/users）；其余回工作台。
 export function afterLoginRoute(user: AuthUser): string {
   if (user && user.role === 'admin' && !user.fde_name) return '/admin';
   return '/';
