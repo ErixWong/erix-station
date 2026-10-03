@@ -57,6 +57,7 @@ class LlmFakePool {
     this.gatewayCalls = [];
     this.generatedKeys = [];
     this.nextGatewayId = 0;
+    this.updateKeyError = null;
     this.activeRun = false;     // N2/N3：fdeHasActiveRun 同口径的活跃 run 开关（llm.js 事务内复检用）
   }
 
@@ -200,6 +201,12 @@ class LlmFakePool {
     const key = `sk-test-virtual-${++this.nextGatewayId}`;
     this.generatedKeys.push(key);
     return { key, key_id: `key-id-${this.nextGatewayId}`, key_alias: body.key_alias };
+  }
+
+  async updateKey(body) {
+    this.gatewayCalls.push({ method: 'updateKey', body });
+    if (this.updateKeyError) throw this.updateKeyError;
+    return { key: body.key, models: body.models };
   }
 
   async deleteKey(body) {
@@ -416,7 +423,10 @@ class LlmFakePool {
           api_key: apiKey, main_model_name: mainModelName, embedding_model_name: embeddingModelName,
           vision_model_name: visionModelName, state: 'active', revoked_at: null, updated_at: new Date(),
         });
-        if (incrementGeneration) b.generation = (b.generation ?? 1) + 1;
+        if (incrementGeneration) {
+          b.generation = (b.generation ?? 1) + 1;
+          b.rotated_at = new Date();
+        }
       }
       return { rows: [], rowCount: b ? 1 : 0 };
     }
@@ -625,7 +635,7 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
   assert.ok(iBindLock < iContainers, 'binding lock precedes the container row lock');
 });
 
-test('setFdeLlmConfig rechecks active runs before model-binding changes; force permits rotation', async () => {
+test('setFdeLlmConfig rechecks active runs before model-binding changes; force permits allowlist changes', async () => {
   const pool = seedPool();
   await saveFdeConfig(pool, { fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main' });
   const outboxBase = pool.outbox.length;
@@ -635,7 +645,8 @@ test('setFdeLlmConfig rechecks active runs before model-binding changes; force p
   // Changing the credential/model allowlist while a run is active is rejected.
   await assert.rejects(
     () => saveFdeConfig(pool, { fdeName: 'alice', provider_id: 'p2', main_model_id: 'm-other-provider' }),
-    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409,
+    (e) => e instanceof LlmError && e.code === 'active_run_conflict' && e.httpStatus === 409
+      && /白名单/.test(e.message) && !/轮换/.test(e.message),
   );
 
   // Upstream credentials cannot be submitted through per-FDE configuration.
@@ -653,9 +664,14 @@ test('setFdeLlmConfig rechecks active runs before model-binding changes; force p
   assert.equal(ok1.api_key, maskKey(firstKey));
   assert.equal(pool.outbox.length, outboxBase);
 
-  const ok2 = await saveFdeConfig(pool, { fdeName: 'alice', provider_id: 'p2', main_model_id: 'm-other-provider', force: true });
-  assert.equal(ok2.api_key, maskKey(pool.generatedKeys.at(-1)));
-  assert.notEqual(pool.generatedKeys.at(-1), firstKey, 'rotation mints a new restricted virtual key');
+  const ok2 = await saveFdeConfig(pool, {
+    fdeName: 'alice', provider_id: 'p2', main_model_id: 'm-other-provider', force: true,
+  });
+  assert.equal(ok2.api_key, maskKey(firstKey), 'force permits an in-place allowlist update');
+  assert.equal(pool.generatedKeys.length, 1, 'allowlist change does not mint a replacement key');
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'updateKey').length, 1);
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
+  assert.equal(pool.bindings[0].generation, 1, 'in-place allowlist updates do not bump generation');
   assert.equal(pool.outbox.length, outboxBase + 1, 'forced change writes its binding outbox');
 
   const seq = pool.sqlLog.map((e) => e.sql);
@@ -800,6 +816,8 @@ test('setFdeLlmConfig：成功 → upsert + route outbox（llm_binding）+ audit
   assert.equal(pool.audit.length, 1);
   assert.equal(pool.audit[0].action, 'llm.config_updated');
   assert.equal(pool.audit[0].target, 'alice');
+  assert.equal(JSON.parse(pool.audit[0].details).virtual_key_action, 'created');
+  assert.equal(JSON.parse(pool.audit[0].details).virtual_key_rotated, false);
   assert.ok(!pool.audit[0].details.includes(b.api_key), 'audit details 不含 virtual key');
   assert.ok(pool.audit[0].details.includes('deepseek-flash'));
 
@@ -811,6 +829,72 @@ test('setFdeLlmConfig：成功 → upsert + route outbox（llm_binding）+ audit
       }
     }
   }
+});
+
+test('setFdeLlmConfig：active LiteLLM key 原地更新白名单，不铸新 key 且 generation 不变', async () => {
+  const pool = seedPool();
+  const first = await saveFdeConfig(pool, {
+    fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main',
+  });
+  const rotatedAt = new Date('2026-01-01T00:00:00.000Z');
+  pool.bindings[0].rotated_at = rotatedAt;
+  const original = { ...pool.bindings[0] };
+
+  const updated = await saveFdeConfig(pool, {
+    fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main', embedding_model_id: 'm-emb',
+  });
+
+  assert.deepEqual(
+    pool.gatewayCalls.filter((call) => call.method === 'updateKey').map((call) => call.body),
+    [{ key: original.api_key, models: ['deepseek-flash', 'text-embedding-3'] }],
+  );
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
+  assert.equal(updated.api_key, first.api_key);
+  assert.equal(pool.bindings[0].api_key, original.api_key);
+  assert.equal(pool.bindings[0].key_id, original.key_id);
+  assert.equal(pool.bindings[0].key_alias, original.key_alias);
+  assert.equal(pool.bindings[0].generation, original.generation);
+  assert.equal(pool.bindings[0].rotated_at, rotatedAt, 'allowlist update does not change rotated_at');
+  assert.equal(pool.outbox.length, 2, '修改白名单仍发布新的 binding');
+  const audit = JSON.parse(pool.audit.at(-1).details);
+  assert.equal(audit.virtual_key_action, 'allowlist_updated');
+  assert.equal(audit.virtual_key_rotated, false);
+});
+
+test('setFdeLlmConfig：active key 在 LiteLLM 不存在时回退铸新 key', async () => {
+  const pool = seedPool();
+  await saveFdeConfig(pool, { fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main' });
+  const oldKey = pool.bindings[0].api_key;
+  pool.generatedKeys = [];
+  pool.updateKeyError = Object.assign(new Error('Virtual key not found'), { status: 404 });
+
+  const updated = await saveFdeConfig(pool, {
+    fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main', embedding_model_id: 'm-emb',
+  });
+
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'updateKey').length, 1);
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 2);
+  assert.notEqual(pool.bindings[0].api_key, oldKey);
+  assert.equal(pool.bindings[0].api_key, pool.generatedKeys[0]);
+  assert.equal(pool.bindings[0].key_alias, 'fde-alice');
+  assert.equal(pool.bindings[0].generation, 2, 'repair mint replaces the missing active key');
+  assert.equal(updated.api_key, maskKey(pool.bindings[0].api_key));
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'deleteKey').length, 0,
+    'do not try to revoke the key already reported missing');
+  const audit = JSON.parse(pool.audit.at(-1).details);
+  assert.equal(audit.virtual_key_action, 'rotated');
+  assert.equal(audit.virtual_key_rotated, true);
+});
+
+test('setFdeLlmConfig：无旧 binding 的首次配置仍调用 generateKey', async () => {
+  const pool = seedPool();
+  const config = await saveFdeConfig(pool, {
+    fdeName: 'alice', provider_id: 'p1', main_model_id: 'm-main',
+  });
+
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'updateKey').length, 0);
+  assert.equal(config.api_key, maskKey(pool.bindings[0].api_key));
 });
 
 test('setFdeLlmConfig：相同 binding 幂等复用 virtual key；generation 不变且不重复发 outbox', async () => {
@@ -1049,7 +1133,7 @@ test('HTTP：credential/model 管理、虚拟 key 绑定与掩码回显', async 
   }
 });
 
-test('HTTP：active run blocks model allowlist rotation; force permits it, upstream API keys are rejected', async () => {
+test('HTTP：active run blocks model allowlist changes; force permits them, upstream API keys are rejected', async () => {
   const { base, pool, admin, close } = await startAdminServer({
     providers: [
       { id: 'p1', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', enabled: true },
@@ -1083,7 +1167,7 @@ test('HTTP：active run blocks model allowlist rotation; force permits it, upstr
     assert.equal((await res.json()).error.code, 'validation_failed');
     assert.equal(pool.llm.outbox.length, outboxBase, '409 路径不得写 outbox');
 
-    // force=true rotates the LiteLLM key with the new restricted model allowlist.
+    // force=true updates the existing LiteLLM key's restricted model allowlist.
     res = await put({ provider_id: 'p2', main_model_id: 'm-x', force: true });
     assert.equal(res.status, 200, `force=true 应放行：${JSON.stringify(await res.json())}`);
     assert.equal(pool.llm.outbox.length, outboxBase + 1, 'force 放行必须写 outbox');
@@ -1096,7 +1180,7 @@ test('HTTP：active run blocks model allowlist rotation; force permits it, upstr
     assert.equal((await res.json()).error.code, 'active_run_conflict');
     assert.equal(pool.llm.outbox.length, outboxBase + 1);
 
-    // No active run → model change rotates normally.
+    // No active run → model allowlist change succeeds normally.
     pool.activeRun = false;
     res = await put({ provider_id: 'p2', main_model_id: 'm-x2' });
     assert.equal(res.status, 200);
