@@ -18,13 +18,13 @@ const ADMIN_USER = {
 const PROVIDERS = {
   items: [
     {
-      id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true,
+      id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
       models: [
         { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true },
         { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: false },
       ],
     },
-    { id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com', enabled: false, models: [] },
+    { id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com', models: [] },
   ],
 };
 const USERS = {
@@ -132,7 +132,7 @@ describe('Admin console routing and layout', () => {
 });
 
 describe('AdminView · LLM 管理', () => {
-  it('供应商卡片保留启停行为，并以确认 modal 执行删除', async () => {
+  it('供应商卡片不渲染启停状态或按钮，并以确认 modal 执行删除', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
       if (url === '/api/admin/llm/providers/p1' && init?.method === 'DELETE') return new Response(null, { status: 204 });
       return undefined;
@@ -140,13 +140,10 @@ describe('AdminView · LLM 管理', () => {
     const cards = wrapper.findAll('[data-test="provider-card"]');
     expect(cards[0].text()).toContain('openai');
     expect(cards[0].text()).toContain('https://api.openai.com/v1');
-    expect(cards[0].text()).toContain('启用');
-    expect(cards[1].text()).toContain('停用');
-
-    await cards[0].findAll('button')[1].trigger('click');
-    await flushPromises();
-    const toggle = callsTo(fetchFn, 'PATCH', '/api/admin/llm/providers/p1')[0];
-    expect(JSON.parse(String(toggle[1]?.body))).toEqual({ enabled: false });
+    for (const card of cards) {
+      expect(card.text()).not.toMatch(/启用|停用/);
+      expect(card.findAll('button').map((button) => button.text()).join(' ')).not.toMatch(/启用|停用/);
+    }
 
     await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')
       .find((button) => button.text() === '删除')!.trigger('click');
@@ -157,7 +154,7 @@ describe('AdminView · LLM 管理', () => {
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
   });
 
-  it('新增供应商 modal 提交原有 POST body；编辑只提交 base_url', async () => {
+  it('新增和编辑供应商可提交上游 API key；留空时不提交 key', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
       if (url === '/api/admin/llm/providers' && init?.method === 'POST') return jsonResponse(201, {});
       if (url === '/api/admin/llm/providers/p1' && init?.method === 'PATCH') return jsonResponse(200, {});
@@ -168,16 +165,34 @@ describe('AdminView · LLM 管理', () => {
     const addForm = wrapper.get('[data-test="add-provider-form"]');
     await addForm.findAll('input')[0].setValue('new-provider');
     await addForm.findAll('input')[1].setValue('https://llm.example/v1');
+    const addKey = addForm.get('[data-test="add-provider-api-key"]');
+    expect(addKey.attributes('type')).toBe('password');
+    expect(addKey.attributes('autocomplete')).toBe('new-password');
+    expect(addKey.attributes('required')).toBeUndefined();
+    await addKey.setValue(' sk-upstream-add ');
     await addForm.trigger('submit.prevent');
     await flushPromises();
     expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/llm/providers')[0][1]?.body)))
-      .toEqual({ name: 'new-provider', base_url: 'https://llm.example/v1' });
+      .toEqual({ name: 'new-provider', base_url: 'https://llm.example/v1', api_key: ' sk-upstream-add ' });
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+
+    await wrapper.get('[data-test="open-add-provider"]').trigger('click');
+    const addWithoutKey = wrapper.get('[data-test="add-provider-form"]');
+    await addWithoutKey.findAll('input')[0].setValue('mock-provider');
+    await addWithoutKey.findAll('input')[1].setValue('http://mock-llm/v1');
+    await addWithoutKey.trigger('submit.prevent');
+    await flushPromises();
+    expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/llm/providers')[1][1]?.body)))
+      .toEqual({ name: 'mock-provider', base_url: 'http://mock-llm/v1' });
 
     await wrapper.findAll('[data-test="provider-card"]')[0].get('[data-test="edit-provider"]').trigger('click');
     const editForm = wrapper.get('[data-test="edit-provider-form"]');
-    expect(editForm.findAll('input')).toHaveLength(1);
-    await editForm.get('input').setValue('https://new.openai.com/v1');
+    expect(editForm.findAll('input')).toHaveLength(2);
+    const editKey = editForm.get('[data-test="edit-provider-api-key"]');
+    expect(editKey.attributes('type')).toBe('password');
+    expect(editKey.attributes('autocomplete')).toBe('new-password');
+    expect((editKey.element as HTMLInputElement).value).toBe('');
+    await editForm.findAll('input')[0].setValue('https://new.openai.com/v1');
     await editForm.trigger('submit.prevent');
     await flushPromises();
     const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/providers/p1').find(
@@ -185,6 +200,18 @@ describe('AdminView · LLM 管理', () => {
     );
     expect(JSON.parse(String(patch?.[1]?.body))).toEqual({ base_url: 'https://new.openai.com/v1' });
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+
+    await wrapper.findAll('[data-test="provider-card"]')[0].get('[data-test="edit-provider"]').trigger('click');
+    const editWithKey = wrapper.get('[data-test="edit-provider-form"]');
+    await editWithKey.get('[data-test="edit-provider-api-key"]').setValue('sk-upstream-edit');
+    await editWithKey.trigger('submit.prevent');
+    await flushPromises();
+    const keyedPatch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/providers/p1').find(
+      ([, init]) => JSON.parse(String(init?.body)).api_key === 'sk-upstream-edit',
+    );
+    expect(JSON.parse(String(keyedPatch?.[1]?.body))).toEqual({
+      base_url: 'https://api.openai.com/v1', api_key: 'sk-upstream-edit',
+    });
   });
 
   it('模型启停不变；新增和编辑分别保留不可编辑字段并 PATCH 允许字段', async () => {

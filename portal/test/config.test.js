@@ -122,16 +122,19 @@ test('issue #117 phase 1：gateway 配置默认 self，并从环境读取 admin 
   const base = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
   const defaults = loadConfig(base);
   assert.equal(defaults.llmGatewayMode, 'self');
+  assert.equal(defaults.llmGatewayUrl, 'http://127.0.0.1:4100');
   assert.equal(defaults.llmGatewayAdminUrl, 'http://station-litellm:4000');
   assert.equal(defaults.llmGatewayMasterKey, '');
 
   const configured = loadConfig({
     ...base,
     LLM_GATEWAY_MODE: 'external',
+    LLM_GATEWAY_HOST: 'https://gateway.example.test',
     LLM_GATEWAY_ADMIN_URL: 'https://gateway.example.test',
     LLM_GATEWAY_MASTER_KEY: 'sk-test-only',
   });
   assert.equal(configured.llmGatewayMode, 'external');
+  assert.equal(configured.llmGatewayUrl, 'https://gateway.example.test');
   assert.equal(configured.llmGatewayAdminUrl, 'https://gateway.example.test');
   assert.equal(configured.llmGatewayMasterKey, 'sk-test-only');
 });

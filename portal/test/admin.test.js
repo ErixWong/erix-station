@@ -73,22 +73,17 @@ class AdminPool extends FakePool {
       );
       return { rows: hit ? [{ '?column?': 1 }] : [] };
     }
-    // getFdeLlmConfig 的 JOIN（GET llm 回显用）：有 binding → 拼一行
-    if (sql.includes('FROM fde_llm_bindings b') && sql.includes('main_upstream')) {
+    // getFdeLlmConfig 的直接 binding 读取（id 与数据面 model_name 分列保存）。
+    if (sql.includes('FROM fde_llm_bindings') && sql.includes('main_model_id')) {
       if (!this.llm?.binding) return { rows: [] };
       const b = this.llm.binding;
-      const m = (id) => this.llm.models.find((x) => x.id === id);
-      const slot = (id) => (id == null ? null : m(id));
-      const sMain = slot(b.main_model_id);
-      const sEmb = slot(b.embedding_model_id ?? null);
-      const sVis = slot(b.vision_model_id ?? null);
       return {
         rows: [{
-          fde_id: b.fde_id, api_key: b.api_key ?? null, state: b.state,
-          provider_id: this.llm.provider.id, provider_name: this.llm.provider.name, base_url: this.llm.provider.base_url,
-          main_upstream: sMain?.model_id ?? null, main_name: sMain?.name ?? null, main_type: sMain?.type ?? null,
-          embedding_upstream: sEmb?.model_id ?? null, embedding_name: sEmb?.name ?? null, embedding_type: sEmb?.type ?? null,
-          vision_upstream: sVis?.model_id ?? null, vision_name: sVis?.name ?? null, vision_type: sVis?.type ?? null,
+          provider_id: b.provider_id, api_key: b.api_key ?? null, gateway: b.gateway ?? 'litellm',
+          gateway_user_id: b.gateway_user_id ?? null, key_id: b.key_id ?? null, key_alias: b.key_alias ?? null,
+          state: b.state, main_model_id: b.main_model_id, main_model_name: b.main_model_name ?? null,
+          embedding_model_id: b.embedding_model_id ?? null, vision_model_id: b.vision_model_id ?? null,
+          embedding_model_name: b.embedding_model_name ?? null, vision_model_name: b.vision_model_name ?? null,
         }],
       };
     }
@@ -259,7 +254,7 @@ test('admin provision：未知 fde → 500 provision_failed（对账循环后台
 
 test('GET llm 响应附加 active_run：有 queued/running/cancelling run → true，否则 false', async () => {
   const llm = {
-    binding: { fde_id: FDE_USER.id, state: 'active', api_key: 'sk-test-1234', provider_id: 'p1', main_model_id: 'm1', embedding_model_id: null, vision_model_id: null },
+    binding: { fde_id: FDE_USER.id, state: 'active', gateway: 'litellm', api_key: 'sk-test-1234', provider_id: 'p1', main_model_id: 'm1', main_model_name: 'deepseek-flash', embedding_model_id: null, vision_model_id: null },
     provider: { id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1' },
     models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text' }],
   };
@@ -270,7 +265,8 @@ test('GET llm 响应附加 active_run：有 queued/running/cancelling run → tr
     assert.equal(res.status, 200);
     let body = await res.json();
     assert.equal(body.active_run, false);
-    assert.equal(body.config.main.model_id, 'gpt-4o');
+    assert.equal(body.config.main.model_id, 'm1');
+    assert.equal(body.config.main.name, 'deepseek-flash');
     assert.equal(body.config.api_key, 'sk-...1234', 'key 只给掩码');
   } finally {
     await a.close();

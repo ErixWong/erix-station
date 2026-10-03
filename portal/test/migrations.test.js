@@ -49,8 +49,8 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
-  // issue #88 起 0009 为最后编号；本断言随新迁移递增（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 9, '0009 是最后编号（连续无空洞）');
+  // 新迁移追加在序列末尾（README：编号连续无空洞）。
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 10, '0010 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -82,7 +82,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 9, '0009 是最后编号（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 10, '0010 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -111,4 +111,26 @@ test('baseline 冻结：docs/data/schema.sql 不含 0009 的 title_source/auto_t
   );
   assert.ok(!/title_source/.test(chatSessions), 'baseline chat_sessions 不得回写 title_source 列');
   assert.ok(!/auto_title_seq/.test(chatSessions), 'baseline chat_sessions 不得回写 auto_title_seq 列');
+});
+
+test('迁移 0010-litellm-bindings：模型槽转 text、旧目录保留退役、旧直连 key 与模型槽清空', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0010-litellm-bindings.sql'), '0010 存在');
+  const sql = fs.readFileSync(path.join(dir, '0010-litellm-bindings.sql'), 'utf8');
+  assert.match(sql, /ALTER COLUMN main_model_id TYPE text/);
+  assert.match(sql, /ALTER COLUMN embedding_model_id TYPE text/);
+  assert.match(sql, /ALTER COLUMN vision_model_id TYPE text/);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS gateway_user_id text/);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS main_model_name text/);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS embedding_model_name text/);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS vision_model_name text/);
+  assert.match(sql, /RENAME TO llm_providers_retired/);
+  assert.match(sql, /RENAME TO llm_models_retired/);
+  assert.match(sql, /DROP CONSTRAINT IF EXISTS fde_llm_bindings_main_model_id_fkey/);
+  assert.match(sql, /api_key = NULL/);
+  assert.match(sql, /main_model_id = NULL/);
+  assert.doesNotMatch(sql, /DROP TABLE/i, '退役目录保留，DROP 应由后续迁移执行');
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('gateway_user_id'), '0010 DDL 不回写冻结 baseline');
 });

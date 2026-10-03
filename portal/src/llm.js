@@ -1,40 +1,11 @@
-// LLM 配置存储层（issue #38 Phase A）：供应商/模型目录 CRUD + per-FDE LLM 配置读写。
-// 依据：docs/data/model.md §1.20、deploy/migrations/0002-llm-config.sql。
-//
-// 已定稿设计（issue #38，用户决策 2026-09-19）：去 LiteLLM hub，上游直发 per-FDE key，
-// 平台存储明文 key（单机自托管，同机加密是安全剧场）。三条存储纪律（本模块强制）：
-//   ① 容器永不持有真 key（key 只存在于 DB → portal 内存 → Traefik 动态配置 mode 600）；
-//   ② API 回显只给掩码（sk-...last4），编辑需重输（maskKey / getFdeLlmEcho）；
-//   ③ key 不进日志/审计/错误信息（audit details 与 route outbox payload 均不含 key）。
-// outbox 联动与 projects.js createProject 的 port_allocation 写法完全同构
-//（enqueueRouteChange：route_revisions head + route_outbox 行，同事务）。
-//
-// N3/D2（Round C/D 评审）锁序论证——postMessage（sessions.js）取锁序：
-//   chat_sessions(FOR UPDATE) → llm-binding advisory → llm-provider advisory → containers(FOR UPDATE)
-//                                → runs/run_queue（新插入）
-// 其余路径锁序列（行锁仅列显式锁；普通 SELECT/INSERT 新行不产生等待边）：
-//   setFdeLlmConfig/delete/恢复： llm-binding advisory → fde_llm_bindings(UPDATE)
-//   updateProvider（D2）：        llm-provider advisory（事务开头，首锁）→ llm_providers(UPDATE 本行)
-//                                （活跃 run 复检/受影响 bindings 均为无锁 SELECT，不产生锁边）
-//   offboard 前置事务（provisioner.js）：containers(UPDATE) → fde_networks(UPDATE) → fde_llm_bindings(UPDATE)
-//                                （**不取** advisory——若取则与 postMessage「advisory→containers」成环，
-//                                故 revokeFdeLlmConfigTx 明确只吃调用方事务、不加本锁）
-//   deleteProvider/createProvider/model CRUD：无 advisory、无 FOR UPDATE → 不产生等待边
-//   onboard/deprovision 外层：   pg_advisory_lock('fde:<name>') 会话锁（另一 key 空间，仅 provisioner 持有）
-// 偏序 chat_sessions < llm-binding < llm-provider < containers < fde_llm_bindings 覆盖全部锁边：
-// 唯一同时碰 binding 与 provider 的路径是 postMessage（固定 binding→provider）；唯一持有 provider 锁的
-// updateProvider 从不取 binding 锁 → 无 provider→binding 反向边 → 无环 → 无死锁。
-// 竞态窗口关闭原理：① N3——建 run 与 FDE 配置写入经同一把 llm-binding advisory 全序：配置先提交则
-// run 建在新配置之后（run 边界语义：新 run 本就该用新上游/凭据，模型本就是 run 边界快照）；run 先提交
-// 则配置事务的 N3 事务内复检必见其 → 409。② D2——provider PATCH（updateProvider）在事务开头取
-// llm-provider advisory，postMessage 在 llm-binding 锁下读当前 binding 的 provider_id（该锁串行化全部
-// binding 写入方，读到的是已提交快照；provider_id 可被 setFdeLlmConfig 更新，但该更新同样持
-// llm-binding 锁与本读串行——要么先提交（本读得新值），要么后提交（其事务内复检必见本 run →
-// 409/force）），锁 key 与本 run 实际使用的 provider 必然同指）后取同 key
-// 锁：provider PATCH 先提交则 run 用新上游（run 边界语义）；postMessage 先提交则 updateProvider 拿锁后
-// 的 N2 事务内复检必见其 run → 409。Round C 残留的「provider PATCH 与建 run 之间的提交序窗口」关闭。
+// LLM binding and LiteLLM admin API adapters (issue #117 phase 2).
+// LiteLLM owns credentials and the model catalog; Station stores only per-FDE
+// bindings and the virtual key returned once by /key/generate.
 
 import { enqueueRouteChange } from './outbox.js';
+import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
+
+export { LlmGatewayError };
 
 export const LLM_MODEL_TYPES = ['text', 'embedding', 'vision', 'rerank', 'audio-tts', 'audio-stt', 'image-gen'];
 
@@ -47,511 +18,523 @@ export class LlmError extends Error {
   }
 }
 
-/** API 回显掩码：sk-...last4；过短/空 → '***'（编辑需重输，不回显真 key）。 */
-export function maskKey(k) {
-  if (typeof k !== 'string' || k.length === 0) return '***';
-  if (k.length < 8) return '***';
-  return `sk-...${k.slice(-4)}`;
+export function maskKey(key) {
+  if (typeof key !== 'string' || key.length < 8) return '***';
+  return `sk-...${key.slice(-4)}`;
 }
 
-// ---------------------------------------------------------------------------
-// 行映射
-// ---------------------------------------------------------------------------
+function getGatewayClient(candidate) {
+  if (candidate && typeof candidate === 'object' && [
+    'listModels', 'generateKey', 'deleteKey', 'listCredentials', 'createCredential',
+  ].some((method) => typeof candidate[method] === 'function')) {
+    return candidate;
+  }
+  const config = candidate ?? {};
+  return createLlmGatewayClient({
+    adminUrl: config.llmGatewayAdminUrl ?? process.env.LLM_GATEWAY_ADMIN_URL ?? 'http://station-litellm:4000',
+    masterKey: config.llmGatewayMasterKey ?? process.env.LLM_GATEWAY_MASTER_KEY ?? '',
+    fetchImpl: config.fetchImpl ?? fetch,
+    timeoutMs: config.timeoutMs,
+  });
+}
 
-export function toProvider(row, models = []) {
+function rowsFrom(payload, keys) {
+  if (Array.isArray(payload)) return payload;
+  for (const key of keys) {
+    if (Array.isArray(payload?.[key])) return payload[key];
+  }
+  return [];
+}
+
+function credentialName(row) {
+  return row?.credential_name ?? row?.name ?? row?.credential_info?.credential_name ?? '';
+}
+
+function credentialValues(row) {
+  return row?.credential_values ?? row?.values ?? {};
+}
+
+function redactCredential(value) {
+  if (Array.isArray(value)) return value.map(redactCredential);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+    key,
+    /^(api[_-]?key|master[_-]?key)$/i.test(key) && typeof child === 'string' ? maskKey(child) : redactCredential(child),
+  ]));
+}
+
+function gatewayModels(payload) {
+  return rowsFrom(payload, ['data', 'models']);
+}
+
+function modelCredentialName(model) {
+  return model?.litellm_params?.litellm_credential_name
+    ?? model?.litellm_params?.credential_name
+    ?? model?.model_info?.litellm_credential_name
+    ?? model?.model_info?.metadata?.credential_name
+    ?? '';
+}
+
+function modelType(model) {
+  const info = model?.model_info ?? {};
+  const metadata = info.metadata ?? {};
+  const mode = String(info.mode ?? model?.litellm_params?.mode ?? '').toLowerCase();
+  const explicit = info.type ?? info.model_type ?? metadata.type ?? metadata.model_type;
+  if (LLM_MODEL_TYPES.includes(explicit)) return explicit;
+  if (mode === 'embedding') return 'embedding';
+  if (mode === 'image_generation') return 'image-gen';
+  if (mode === 'rerank') return 'rerank';
+  return 'text';
+}
+
+function modelToolCalling(model) {
+  const info = model?.model_info ?? {};
+  const metadata = info.metadata ?? {};
+  const value = info.tool_calling ?? info.supports_function_calling ?? metadata.tool_calling;
+  return value === undefined ? modelType(model) === 'text' : value === true;
+}
+
+function isModelBlocked(model) {
+  return model?.model_info?.blocked === true;
+}
+
+function modelId(model) {
+  return model?.model_info?.id ?? model?.id ?? null;
+}
+
+function toModel(model) {
+  const id = modelId(model);
+  const modelName = model?.model_name ?? '';
+  const params = model?.litellm_params ?? {};
+  const info = model?.model_info ?? {};
+  const metadata = info.metadata ?? {};
+  const type = modelType(model);
   return {
-    id: row.id,
-    name: row.name,
-    base_url: row.base_url,
-    api_format: row.api_format,
-    enabled: row.enabled,
+    id,
+    provider_id: modelCredentialName(model),
+    model_id: id,
+    model_name: modelName,
+    name: info.display_name ?? metadata.display_name ?? modelName,
+    type,
+    tool_calling: modelToolCalling(model),
+    context_window: info.context_window ?? metadata.context_window ?? null,
+    enabled: !isModelBlocked(model),
+    litellm_params: redactCredential(params),
+    model_info: redactCredential(info),
+  };
+}
+
+function toProvider(credential, models) {
+  const name = credentialName(credential);
+  const values = credentialValues(credential);
+  const info = credential?.credential_info ?? {};
+  return {
+    id: name,
+    name: info.display_name ?? info.name ?? name,
+    base_url: values.api_base ?? values.base_url ?? '',
+    api_format: 'openai',
+    credential_info: redactCredential(info),
+    credential_values: redactCredential(values),
     models,
-    created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
-    updated_at: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
   };
 }
 
-export function toModel(row) {
+export async function listModels(gateway) {
+  const client = getGatewayClient(gateway);
+  return { items: gatewayModels(await client.listModels()).map(toModel) };
+}
+
+export async function listProviders(gateway) {
+  const client = getGatewayClient(gateway);
+  const [credentialPayload, modelPayload] = await Promise.all([client.listCredentials(), client.listModels()]);
+  const models = gatewayModels(modelPayload).map(toModel);
   return {
-    id: row.id,
-    provider_id: row.provider_id,
-    model_id: row.model_id,
-    name: row.name,
-    type: row.type,
-    tool_calling: row.tool_calling,
-    context_window: row.context_window == null ? null : Number(row.context_window),
-    enabled: row.enabled,
-    created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
-    updated_at: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+    items: rowsFrom(credentialPayload, ['credentials', 'data']).map((credential) => {
+      const name = credentialName(credential);
+      return toProvider(credential, models.filter((model) => model.provider_id === name));
+    }),
   };
 }
 
-// ---------------------------------------------------------------------------
-// provider CRUD（全局供应商）
-// ---------------------------------------------------------------------------
-
-/** 供应商列表（各含 models 数组）。 */
-export async function listProviders(pool) {
-  const r = await pool.query(
-    `SELECT id, name, base_url, api_format, enabled, created_at, updated_at
-       FROM llm_providers ORDER BY name`,
-  );
-  const items = [];
-  for (const row of r.rows) {
-    const m = await pool.query(
-      `SELECT id, provider_id, model_id, name, type, tool_calling, context_window, enabled, created_at, updated_at
-         FROM llm_models WHERE provider_id = $1 ORDER BY model_id`,
-      [row.id],
-    );
-    items.push(toProvider(row, m.rows.map(toModel)));
+export async function createProvider(gateway, input = {}) {
+  const client = getGatewayClient(gateway);
+  const name = input.credential_name ?? input.name;
+  if (typeof name !== 'string' || !name.trim()) {
+    throw new LlmError('validation_failed', 'name 为必填字段', { details: { field: 'name' } });
   }
-  return { items };
+  const info = input.credential_info ?? {
+    credential_name: name.trim(),
+    description: input.description ?? name.trim(),
+  };
+  const values = { ...(input.credential_values ?? {}) };
+  if (input.base_url !== undefined) values.api_base = input.base_url;
+  if (input.api_key !== undefined) values.api_key = input.api_key;
+  const result = await client.createCredential({
+    credential_name: name.trim(),
+    credential_info: info,
+    credential_values: values,
+  });
+  return toProvider(result?.credential ?? result ?? { credential_name: name.trim(), credential_info: info, credential_values: values }, []);
 }
 
-function validateProviderInput({ name, base_url } = {}) {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new LlmError('validation_failed', 'name 为必填字段', { httpStatus: 400, details: { field: 'name' } });
-  }
-  let parsed;
-  try {
-    parsed = new URL(base_url);
-  } catch {
-    throw new LlmError('validation_failed', 'base_url 非法', { httpStatus: 400, details: { field: 'base_url' } });
-  }
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    throw new LlmError('validation_failed', 'base_url 仅支持 http/https', { httpStatus: 400, details: { field: 'base_url' } });
-  }
-}
-
-export async function createProvider(pool, { name, base_url } = {}) {
-  validateProviderInput({ name, base_url });
-  const dup = await pool.query(`SELECT 1 FROM llm_providers WHERE name = $1`, [name.trim()]);
-  if (dup.rows.length > 0) {
-    throw new LlmError('name_conflict', `供应商 ${name} 已存在`, { httpStatus: 409 });
-  }
-  const r = await pool.query(
-    `INSERT INTO llm_providers (name, base_url)
-     VALUES ($1, $2)
-     RETURNING id, name, base_url, api_format, enabled, created_at, updated_at`,
-    [name.trim(), base_url.trim()],
-  );
-  return toProvider(r.rows[0], []);
-}
-
-/**
- * 更新 base_url / enabled（name 不可改，防 UNIQUE 混乱）。
- * F2：base_url / enabled 任一变更都会改变路由发布事实（Traefik 仍会用旧 URL / 停用 provider 的路由），
- * 因此在同一事务内为受影响的 active bindings 写 route outbox（aggregate='llm_binding'，aggregateId=fde_id，
- * 复用 enqueueRouteChange），触发 reconciler 全量重建收敛；payload 不含 api_key（红线 ③）。
- * 无任何变更字段（base_url/enabled 均缺省）时不动 outbox。
- *
- * N2（Round C 评审）：base_url/enabled 变更会改变运行中 run 的上游路由（换上游/摘路由），与 F6 同口径
- * 在**本事务内**拦活跃 run——先查受影响 active bindings，再逐 FDE 按 admin.fdeHasActiveRun 同口径查
- * queued/running/cancelling run；命中且 force!==true → 抛 active_run_conflict（409），UPDATE 与 outbox
- * 一概不写（整个事务回滚，fail-visible）。force=true 放行（管理员知情确认）。
- *
- * D1（Round D 评审）：「事实变化」按**值**比较（与 N1 同口径），而非「字段是否传入」——事务内先读当前
- * 行，base_url/enabled 与当前值相同 → 不是事实变化：不触发活跃 run 守卫、不写 outbox，且整体跳过
- * UPDATE（updated_at 不动），正常返回 200。杜绝①活跃 run 下同值 PATCH 误 409、②无活跃 run 下同值
- * PATCH 写 outbox 触发无意义发布。
- *
- * D2（Round D 评审）：事务开头取 per-provider advisory lock（首锁），与 postMessage 在 llm-binding
- * 锁下按 binding 读到的 provider_id 所取之锁同 key——「provider PATCH vs 建 run」提交序窗口关闭
- * （全序论证见本文件头注释）。
- */
-export async function updateProvider(pool, id, { base_url, enabled, force = false } = {}) {
-  if (base_url !== undefined) {
-    try {
-      const parsed = new URL(base_url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('bad protocol');
-    } catch {
-      throw new LlmError('validation_failed', 'base_url 非法', { httpStatus: 400, details: { field: 'base_url' } });
-    }
-  }
-  if (enabled !== undefined && typeof enabled !== 'boolean') {
-    throw new LlmError('validation_failed', 'enabled 必须为 boolean', { httpStatus: 400, details: { field: 'enabled' } });
-  }
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // D2（Round D 评审）：per-provider advisory lock（事务首锁）——与 postMessage 取同 key 的锁
-    //（postMessage 在 llm-binding 锁下读 binding 的 provider_id 后取本锁），使「provider PATCH」与
-    //「建 run」全序：PATCH 先提交则新 run 用新上游（run 边界语义）；run 先提交则本事务内 N2 复检必见
-    // 其 → 409。锁序：本锁是事务首锁且无反向 binding 边（见文件头论证），无环。
-    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-provider:${id}`]);
-
-    // D1：事务内先读当前值，按值判定事实变化（同值 PATCH 不算变更）。
-    // 本 SELECT 在 provider 锁之下读到的是已提交值，同值/真变判定与并发 PATCH 全序。
-    const cur = await client.query(
-      `SELECT id, name, base_url, api_format, enabled, created_at, updated_at
-         FROM llm_providers WHERE id = $1`,
-      [id],
-    );
-    if (cur.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-    const current = cur.rows[0];
-    const changed = (base_url !== undefined && base_url !== current.base_url)
-      || (enabled !== undefined && enabled !== current.enabled);
-
-    // N2：守卫先于 UPDATE（命中即抛，事务回滚 → 不写任何变更、不写 outbox）。
-    // 受影响 bindings = 该 provider 下仍 active 的绑定（revoked 的不发布路由，无需守卫/触发）。
-    let affectedRows = [];
-    if (changed) {
-      const affected = await client.query(
-        `SELECT fde_id FROM fde_llm_bindings WHERE provider_id = $1 AND state = 'active'`,
-        [id],
-      );
-      affectedRows = affected.rows;
-      if (force !== true) {
-        for (const b of affectedRows) {
-          const act = await client.query(
-            `SELECT 1
-               FROM runs r
-               JOIN chat_sessions s ON s.id = r.session_id
-              WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
-              LIMIT 1`,
-            [b.fde_id],
-          );
-          if (act.rows.length > 0) {
-            throw new LlmError('active_run_conflict',
-              '存在绑定该供应商且有进行中 run 的 FDE：变更 base_url/enabled 会改变运行中 run 的上游路由。'
-              + '确认无影响请带 force=true 重试。', { httpStatus: 409 });
-          }
-        }
-      }
-    }
-
-    // D1：同值 PATCH（含两字段均缺省）→ 无任何写（updated_at 不动、无 outbox），返回当前值。
-    if (!changed) {
-      await client.query('COMMIT');
-      return toProvider(current, []);
-    }
-
-    const r = await client.query(
-      `UPDATE llm_providers
-        SET base_url = COALESCE($2, base_url),
-            enabled  = COALESCE($3, enabled),
-            updated_at = now()
-      WHERE id = $1
-      RETURNING id, name, base_url, api_format, enabled, created_at, updated_at`,
-      [id, base_url ?? null, enabled ?? null],
-    );
-    if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-
-    // 逐 FDE 一条 outbox 行，与 setFdeLlmConfig 的 aggregate/aggregateId 口径一致。
-    for (const b of affectedRows) {
-      await enqueueRouteChange(client, {
-        aggregate: 'llm_binding',
-        aggregateId: b.fde_id,
-        op: 'upsert',
-        payload: { provider_id: id, base_url_changed: base_url !== undefined, enabled_changed: enabled !== undefined },
-      });
-    }
-
-    await client.query('COMMIT');
-    return toProvider(r.rows[0], []);
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-/** 物理删；被 fde_llm_bindings 引用 → 409 provider_in_use。 */
-export async function deleteProvider(pool, id) {
-  const r = await pool.query(`SELECT 1 FROM llm_providers WHERE id = $1`, [id]);
-  if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-  const refs = await pool.query(`SELECT 1 FROM fde_llm_bindings WHERE provider_id = $1 LIMIT 1`, [id]);
-  if (refs.rows.length > 0) {
-    throw new LlmError('provider_in_use', '供应商仍被 FDE LLM 配置引用，无法删除', { httpStatus: 409 });
-  }
-  await pool.query(`DELETE FROM llm_models WHERE provider_id = $1`, [id]);
-  await pool.query(`DELETE FROM llm_providers WHERE id = $1`, [id]);
-}
-
-// ---------------------------------------------------------------------------
-// model CRUD（模型目录）
-// ---------------------------------------------------------------------------
-
-function validateModelInput({ model_id, name, type } = {}) {
-  if (typeof model_id !== 'string' || model_id.trim() === '') {
-    throw new LlmError('validation_failed', 'model_id 为必填字段', { httpStatus: 400, details: { field: 'model_id' } });
-  }
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new LlmError('validation_failed', 'name 为必填字段', { httpStatus: 400, details: { field: 'name' } });
-  }
-  if (!LLM_MODEL_TYPES.includes(type)) {
-    throw new LlmError('validation_failed', `type 必须为 ${LLM_MODEL_TYPES.join('/')}`, {
-      httpStatus: 400,
-      details: { field: 'type', allowed: LLM_MODEL_TYPES },
+export async function updateProvider(gateway, name, { base_url, enabled, credential_info, credential_values } = {}) {
+  const client = getGatewayClient(gateway);
+  if (enabled !== undefined) {
+    throw new LlmError('validation_failed', 'LiteLLM credential 不支持启停；请删除 credential 或管理其模型', {
+      details: { field: 'enabled' },
     });
   }
+  let values = credential_values;
+  if (base_url !== undefined && !values) {
+    const payload = await client.listCredentials();
+    const current = rowsFrom(payload, ['credentials', 'data']).find((item) => credentialName(item) === name);
+    if (!current) throw new LlmError('not_found', 'credential not found', { httpStatus: 404 });
+    values = { ...credentialValues(current), api_base: base_url };
+  }
+  const body = {
+    ...(credential_info === undefined ? {} : { credential_info }),
+    ...(values === undefined ? {} : { credential_values: values }),
+  };
+  const result = await client.updateCredential(name, body);
+  return toProvider(result?.credential ?? result ?? { credential_name: name, credential_info, credential_values: values }, []);
 }
 
-export async function createModel(pool, { provider_id, model_id, name, type, tool_calling, context_window } = {}) {
-  validateModelInput({ model_id, name, type });
-  const p = await pool.query(`SELECT id, enabled FROM llm_providers WHERE id = $1`, [provider_id]);
-  if (p.rows.length === 0) {
-    throw new LlmError('validation_failed', 'provider 不存在', { httpStatus: 400, details: { field: 'provider_id' } });
-  }
-  if (!p.rows[0].enabled) {
-    throw new LlmError('validation_failed', 'provider 已停用，无法挂接模型', { httpStatus: 400, details: { field: 'provider_id' } });
-  }
-  const dup = await pool.query(`SELECT 1 FROM llm_models WHERE provider_id = $1 AND model_id = $2`, [provider_id, model_id.trim()]);
-  if (dup.rows.length > 0) {
-    throw new LlmError('name_conflict', `模型 ${model_id} 在该供应商下已存在`, { httpStatus: 409 });
-  }
-  const r = await pool.query(
-    `INSERT INTO llm_models (provider_id, model_id, name, type, tool_calling, context_window)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id, provider_id, model_id, name, type, tool_calling, context_window, enabled, created_at, updated_at`,
-    [provider_id, model_id.trim(), name.trim(), type, tool_calling === true, context_window ?? null],
-  );
-  return toModel(r.rows[0]);
+export async function deleteProvider(gateway, name) {
+  return getGatewayClient(gateway).deleteCredential(name);
 }
 
-/** 更新 name / enabled / tool_calling / context_window（model_id 与 type 不可改）。 */
-export async function updateModel(pool, id, { name, enabled, tool_calling, context_window } = {}) {
-  if (name !== undefined && (typeof name !== 'string' || name.trim() === '')) {
-    throw new LlmError('validation_failed', 'name 为必填字段', { httpStatus: 400, details: { field: 'name' } });
+export async function createModel(gateway, input = {}) {
+  const client = getGatewayClient(gateway);
+  const modelName = input.model_name ?? input.model_id;
+  if (typeof modelName !== 'string' || !modelName.trim()) {
+    throw new LlmError('validation_failed', 'model_id 为必填字段', { details: { field: 'model_id' } });
   }
-  for (const [field, v] of [['enabled', enabled], ['tool_calling', tool_calling]]) {
-    if (v !== undefined && typeof v !== 'boolean') {
-      throw new LlmError('validation_failed', `${field} 必须为 boolean`, { httpStatus: 400, details: { field } });
-    }
-  }
-  const r = await pool.query(
-    `UPDATE llm_models
-        SET name = COALESCE($2, name),
-            enabled = COALESCE($3, enabled),
-            tool_calling = COALESCE($4, tool_calling),
-            context_window = COALESCE($5, context_window),
-            updated_at = now()
-      WHERE id = $1
-      RETURNING id, provider_id, model_id, name, type, tool_calling, context_window, enabled, created_at, updated_at`,
-    [id, name ?? null, enabled ?? null, tool_calling ?? null, context_window ?? null],
-  );
-  if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-  return toModel(r.rows[0]);
+  const params = input.litellm_params ?? {
+    model: input.model ?? input.model_id,
+    litellm_credential_name: input.provider_id,
+  };
+  const suppliedInfo = input.model_info ?? {};
+  const metadata = {
+    ...(suppliedInfo.metadata ?? {}),
+    ...(input.type === undefined ? {} : { type: input.type }),
+    ...(input.tool_calling === undefined ? {} : { tool_calling: input.tool_calling === true }),
+    ...(input.context_window === undefined ? {} : { context_window: input.context_window }),
+  };
+  const model_info = {
+    ...suppliedInfo,
+    ...(input.name === undefined ? {} : { display_name: input.name }),
+    ...(input.type === undefined ? {} : { type: input.type }),
+    ...(input.tool_calling === undefined ? {} : { tool_calling: input.tool_calling === true }),
+    ...(input.context_window === undefined ? {} : { context_window: input.context_window }),
+    ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
+  };
+  return client.createModel({ model_name: modelName.trim(), litellm_params: params, model_info });
 }
 
-/** 物理删；被 fde_llm_bindings 任一模型位引用 → 409 model_in_use。 */
-export async function deleteModel(pool, id) {
-  const r = await pool.query(`SELECT 1 FROM llm_models WHERE id = $1`, [id]);
-  if (r.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-  const refs = await pool.query(
-    `SELECT 1 FROM fde_llm_bindings
-      WHERE main_model_id = $1 OR embedding_model_id = $1 OR vision_model_id = $1 LIMIT 1`,
-    [id],
-  );
-  if (refs.rows.length > 0) {
-    throw new LlmError('model_in_use', '模型仍被 FDE LLM 配置引用，无法删除', { httpStatus: 409 });
-  }
-  await pool.query(`DELETE FROM llm_models WHERE id = $1`, [id]);
+async function findGatewayModel(client, id) {
+  const models = gatewayModels(await client.listModels());
+  const found = models.find((model) => String(modelId(model)) === String(id));
+  if (!found) throw new LlmError('not_found', 'model not found', { httpStatus: 404 });
+  return found;
 }
 
-// ---------------------------------------------------------------------------
-// per-FDE LLM 配置
-// ---------------------------------------------------------------------------
+export async function updateModel(gateway, id, { name, enabled, tool_calling, context_window } = {}) {
+  const client = getGatewayClient(gateway);
+  const current = await findGatewayModel(client, id);
+  const currentEnabled = !isModelBlocked(current);
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    throw new LlmError('validation_failed', 'enabled 必须为 boolean', { details: { field: 'enabled' } });
+  }
+  if (enabled !== undefined && enabled !== currentEnabled) {
+    if (enabled) await client.unblockModel(id);
+    else await client.blockModel(id);
+  }
+  if (name !== undefined || tool_calling !== undefined || context_window !== undefined) {
+    const info = current.model_info ?? {};
+    const metadata = { ...(info.metadata ?? {}) };
+    if (tool_calling !== undefined) metadata.tool_calling = tool_calling === true;
+    if (context_window !== undefined) metadata.context_window = context_window;
+    await client.updateModel({
+      model_id: id,
+      model_info: {
+        ...info,
+        ...(name === undefined ? {} : { display_name: name }),
+        ...(tool_calling === undefined ? {} : { tool_calling: tool_calling === true }),
+        ...(context_window === undefined ? {} : { context_window }),
+        metadata,
+      },
+    });
+  }
+  return toModel(await findGatewayModel(client, id));
+}
 
-/**
- * 读取 FDE LLM 配置（内部全量，api_key 明文）。
- * 供心跳下行 / 发布器用；**调用方不得把 api_key 写进日志/响应**。
- * api_key 为 NULL = 未配置（该 FDE 无 LLM 可用）。
- * @returns null（无配置或非 active）| { provider_id, provider_name, base_url, api_key, main, embedding, vision }
- */
+export async function deleteModel(gateway, id) {
+  const client = getGatewayClient(gateway);
+  const current = await findGatewayModel(client, id);
+  return client.deleteModel(current.model_info?.id ?? id);
+}
+
+function slot(model_id, name, type) {
+  if (model_id == null) return null;
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new LlmGatewayError(502, 'Active LiteLLM binding is missing the data-plane model name');
+  }
+  return { model_id, name, type };
+}
+
+/** Internal full binding read. api_key is the LiteLLM virtual key and must not be logged or exposed. */
 export async function getFdeLlmConfig(pool, userId) {
   const r = await pool.query(
-    `SELECT b.fde_id, b.api_key, b.state,
-            p.id AS provider_id, p.name AS provider_name, p.base_url,
-            mm.model_id AS main_upstream, mm.name AS main_name, mm.type AS main_type,
-            em.model_id AS embedding_upstream, em.name AS embedding_name, em.type AS embedding_type,
-            vm.model_id AS vision_upstream, vm.name AS vision_name, vm.type AS vision_type
-       FROM fde_llm_bindings b
-       JOIN llm_providers p ON p.id = b.provider_id
-       LEFT JOIN llm_models mm ON mm.id = b.main_model_id
-       LEFT JOIN llm_models em ON em.id = b.embedding_model_id
-       LEFT JOIN llm_models vm ON vm.id = b.vision_model_id
-      WHERE b.fde_id = $1 AND b.state = 'active'`,
+    `SELECT provider_id, api_key, gateway, gateway_user_id, key_id, key_alias, state,
+            main_model_id, main_model_name, embedding_model_id, embedding_model_name,
+            vision_model_id, vision_model_name
+       FROM fde_llm_bindings
+      WHERE fde_id = $1 AND state = 'active' AND gateway = 'litellm'`,
     [userId],
   );
   const row = r.rows[0];
   if (!row) return null;
-  const slot = (upstream, name, type) => (upstream == null ? null : { model_id: upstream, name, type });
   return {
     provider_id: row.provider_id,
-    provider_name: row.provider_name,
-    base_url: row.base_url,
-    api_key: row.api_key,
-    main: slot(row.main_upstream, row.main_name, row.main_type),
-    embedding: slot(row.embedding_upstream, row.embedding_name, row.embedding_type),
-    vision: slot(row.vision_upstream, row.vision_name, row.vision_type),
+    provider_name: row.provider_id,
+    gateway: row.gateway,
+    gateway_user_id: row.gateway_user_id ?? null,
+    key_id: row.key_id ?? null,
+    key_alias: row.key_alias,
+    api_key: row.api_key ?? null,
+    main: slot(row.main_model_id, row.main_model_name, 'text'),
+    embedding: slot(row.embedding_model_id, row.embedding_model_name, 'embedding'),
+    vision: slot(row.vision_model_id, row.vision_model_name, 'vision'),
   };
 }
 
-/**
- * 心跳下行模型集（issue #38 Phase B2）：agent 用真模型名的传导通道。
- * 单条轻量 JOIN（fde_llm_bindings active + provider enabled），**不含 api_key**——key 绝不进心跳响应。
- * main 仅取 tool_calling=true 的模型（setFdeLlmConfig 写入时已校验，此处再过滤防目录被改后下行失真）。
- * @returns null（无 active binding / provider 停用 / 无可用模型）| { main?, embedding?, vision? }（均为上游 model_id）
- */
+/** Model ids are LiteLLM model_info.id strings and need no join to a Station-owned catalog. */
 export async function getFdeLlmHeartbeatModels(pool, userId) {
   const r = await pool.query(
-    `SELECT mm.model_id AS main_upstream,
-            em.model_id AS embedding_upstream,
-            vm.model_id AS vision_upstream
-       FROM fde_llm_bindings b
-       JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
-       LEFT JOIN llm_models mm ON mm.id = b.main_model_id AND mm.enabled = true AND mm.tool_calling = true
-       LEFT JOIN llm_models em ON em.id = b.embedding_model_id AND em.enabled = true AND em.type = 'embedding'
-       LEFT JOIN llm_models vm ON vm.id = b.vision_model_id AND vm.enabled = true AND vm.type = 'vision'
-      WHERE b.fde_id = $1 AND b.state = 'active'`,
+    `SELECT main_model_id, main_model_name,
+            embedding_model_id, embedding_model_name,
+            vision_model_id, vision_model_name
+       FROM fde_llm_bindings
+      WHERE fde_id = $1 AND state = 'active' AND gateway = 'litellm'
+        AND api_key IS NOT NULL AND api_key <> ''`,
     [userId],
   );
   const row = r.rows[0];
-  if (!row) return null;
-  const models = {};
-  if (row.main_upstream != null) models.main = { model: row.main_upstream, type: 'text' };
-  if (row.embedding_upstream != null) models.embedding = { model: row.embedding_upstream, type: 'embedding' };
-  if (row.vision_upstream != null) models.vision = { model: row.vision_upstream, type: 'vision' };
-  // 不下发空对象：main 为必备位（setFdeLlmConfig 强制），它缺失说明目录被改到不可用 → 整体不下行。
-  if (!models.main) return null;
+  if (!row?.main_model_id) return null;
+  if (!row.main_model_name) {
+    throw new LlmGatewayError(502, 'Active LiteLLM binding is missing the data-plane model name');
+  }
+  if ((row.embedding_model_id && !row.embedding_model_name) || (row.vision_model_id && !row.vision_model_name)) {
+    throw new LlmGatewayError(502, 'Active LiteLLM binding is missing a data-plane model name');
+  }
+  const models = { main: { model: row.main_model_name, type: 'text' } };
+  if (row.embedding_model_id) {
+    models.embedding = { model: row.embedding_model_name, type: 'embedding' };
+  }
+  if (row.vision_model_id) {
+    models.vision = { model: row.vision_model_name, type: 'vision' };
+  }
   return models;
 }
 
-/** admin 回显版：api_key 只给掩码（红线 ②）；无配置 → null。 */
 export async function getFdeLlmEcho(pool, fdeName) {
   const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
   if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-  const cfg = await getFdeLlmConfig(pool, u.rows[0].id);
-  if (!cfg) return null;
-  return { ...cfg, api_key: cfg.api_key == null ? null : maskKey(cfg.api_key) };
+  const config = await getFdeLlmConfig(pool, u.rows[0].id);
+  if (!config) return null;
+  return { ...config, api_key: config.api_key == null ? null : maskKey(config.api_key) };
 }
 
-/**
- * 按模型位加载并校验模型行（应用层校验，PG 无法跨表查能力标记）。
- * main：type='text' 且 tool_calling=true；embedding/vision：type 匹配。三者均须 enabled 且 provider 匹配。
- */
-async function loadSlotModel(client, { slot, modelId, providerId, expectType, requireToolCalling }) {
-  const fail = (reason) => {
-    throw new LlmError('validation_failed', reason, { httpStatus: 400, details: { field: slot, model_id: modelId } });
+function validateSlotModel(model, { slotName, modelId, providerId, expectedType, requireToolCalling }) {
+  const fail = (message) => {
+    throw new LlmError('validation_failed', message, {
+      details: { field: slotName, model_id: modelId },
+    });
   };
-  const r = await client.query(
-    `SELECT id, model_id, name, type, tool_calling, enabled, provider_id FROM llm_models WHERE id = $1`,
-    [modelId],
-  );
-  const m = r.rows[0];
-  if (!m) fail(`${slot} 模型不存在`);
-  if (!m.enabled) fail(`${slot} 模型已停用`);
-  if (m.provider_id !== providerId) fail(`${slot} 模型与 provider 不匹配`);
-  if (m.type !== expectType) fail(`${slot} 模型类型不匹配（期望 ${expectType}，实际 ${m.type}）`);
-  if (requireToolCalling && !m.tool_calling) fail(`${slot} 模型不支持 tool_calling`);
-  return m;
+  if (isModelBlocked(model)) fail(`${slotName} 模型已停用`);
+  const actualCredential = modelCredentialName(model);
+  if (providerId && actualCredential !== providerId) fail(`${slotName} 模型与 credential 不匹配`);
+  const type = modelType(model);
+  if (type !== expectedType) fail(`${slotName} 模型类型不匹配（期望 ${expectedType}，实际 ${type}）`);
+  if (requireToolCalling && !modelToolCalling(model)) fail(`${slotName} 模型不支持 tool_calling`);
+  return model;
+}
+
+async function selectGatewayModels(gateway, { providerId, mainModelId, embeddingModelId, visionModelId }) {
+  const client = getGatewayClient(gateway);
+  const models = gatewayModels(await client.listModels());
+  const select = (slotName, id, expectedType, requireToolCalling = false) => {
+    if (id == null) return null;
+    const model = models.find((item) => String(modelId(item)) === String(id));
+    if (!model) {
+      throw new LlmError('validation_failed', `${slotName} 模型不存在`, {
+        details: { field: slotName, model_id: id },
+      });
+    }
+    return validateSlotModel(model, {
+      slotName, modelId: id, providerId, expectedType, requireToolCalling,
+    });
+  };
+  return {
+    client,
+    main: select('main', mainModelId, 'text', true),
+    embedding: select('embedding', embeddingModelId, 'embedding'),
+    vision: select('vision', visionModelId, 'vision'),
+  };
+}
+
+async function ensureGatewayUser(client, { fdeName, userId }) {
+  const result = await client.createUser({ user_email: `fde-${fdeName}@station.invalid` });
+  const gatewayUserId = result?.user_id ?? result?.id;
+  if (typeof gatewayUserId !== 'string' || !gatewayUserId) {
+    throw new LlmGatewayError(502, 'LiteLLM did not return a user_id');
+  }
+  return gatewayUserId;
+}
+
+async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedModels }) {
+  const userId = gatewayUserId || await ensureGatewayUser(client, { fdeName, userId: fdeId });
+  const modelNames = [selectedModels.main, selectedModels.embedding, selectedModels.vision]
+    .filter(Boolean)
+    .map((model) => model.model_name)
+    .filter((name) => typeof name === 'string' && name.length > 0);
+  const result = await client.generateKey({
+    models: [...new Set(modelNames)],
+    user_id: userId,
+    key_alias: `fde-${fdeName}`,
+    metadata: { fde_id: fdeId, fde_name: fdeName },
+  });
+  if (typeof result?.key !== 'string' || !result.key) {
+    throw new LlmGatewayError(502, 'LiteLLM did not return a virtual key');
+  }
+  return {
+    gatewayUserId: userId,
+    apiKey: result.key,
+    keyId: result.key_id ?? result.token_id ?? result.id ?? null,
+    keyAlias: result.key_alias ?? `fde-${fdeName}`,
+  };
 }
 
 /**
- * 写入 FDE LLM 配置（admin）：单事务 upsert fde_llm_bindings + route outbox（aggregate='llm_binding'）
- * + audit_log（details 不含 key）。api_key 缺省 = 保留旧值；首次写入须给 api_key（否则该 FDE 无 LLM 可用）。
- * @returns 掩码回显（同 getFdeLlmEcho 形状，api_key 掩码）
+ * Save a binding and mint its model-restricted virtual key. `api_key` is no longer
+ * an upstream credential; upstream secrets belong to LiteLLM credentials.
  */
 export async function setFdeLlmConfig(pool, {
   actorId = null, fdeName, provider_id, api_key, main_model_id, embedding_model_id = null, vision_model_id = null,
-  force = false,
+  force = false, gateway,
 } = {}) {
   if (typeof provider_id !== 'string' || provider_id === '') {
-    throw new LlmError('validation_failed', 'provider_id 为必填字段', { httpStatus: 400, details: { field: 'provider_id' } });
+    throw new LlmError('validation_failed', 'provider_id 为必填字段', { details: { field: 'provider_id' } });
   }
   if (typeof main_model_id !== 'string' || main_model_id === '') {
-    throw new LlmError('validation_failed', 'main_model_id 为必填字段', { httpStatus: 400, details: { field: 'main_model_id' } });
+    throw new LlmError('validation_failed', 'main_model_id 为必填字段', { details: { field: 'main_model_id' } });
   }
-  if (api_key !== undefined && api_key !== null && (typeof api_key !== 'string' || api_key === '')) {
-    throw new LlmError('validation_failed', 'api_key 必须为字符串', { httpStatus: 400, details: { field: 'api_key' } });
+  if (api_key !== undefined && api_key !== null && api_key !== '') {
+    throw new LlmError('validation_failed', '上游 API key 必须保存在 LiteLLM credential 中，不得按 FDE 提交', {
+      details: { field: 'api_key' },
+    });
   }
 
+  const gatewayClient = getGatewayClient(gateway);
+  const selected = await selectGatewayModels(gatewayClient, {
+    providerId: provider_id, mainModelId: main_model_id, embeddingModelId: embedding_model_id, visionModelId: vision_model_id,
+  });
   const client = await pool.connect();
+  let oldKey = null;
+  let oldWasGatewayKey = false;
+  let generated = null;
   try {
     await client.query('BEGIN');
-    // 串行化同 FDE 的配置写入（与 projects.js lockUserProjectSpace 同模式）。
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
-
     const u = await client.query(`SELECT id, fde_name FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
     if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
     const userId = u.rows[0].id;
-
-    const p = await client.query(`SELECT id, name, enabled FROM llm_providers WHERE id = $1`, [provider_id]);
-    if (p.rows.length === 0 || !p.rows[0].enabled) {
-      throw new LlmError('validation_failed', 'provider 不存在或已停用', { httpStatus: 400, details: { field: 'provider_id' } });
-    }
-
-    // 模型位校验：type / enabled / provider 匹配 / main 必须 tool_calling（应用层，migration 头注释同款说明）。
-    const main = await loadSlotModel(client, {
-      slot: 'main', modelId: main_model_id, providerId: provider_id, expectType: 'text', requireToolCalling: true,
-    });
-    const embedding = embedding_model_id == null ? null : await loadSlotModel(client, {
-      slot: 'embedding', modelId: embedding_model_id, providerId: provider_id, expectType: 'embedding', requireToolCalling: false,
-    });
-    const vision = vision_model_id == null ? null : await loadSlotModel(client, {
-      slot: 'vision', modelId: vision_model_id, providerId: provider_id, expectType: 'vision', requireToolCalling: false,
-    });
-
     const existing = await client.query(
-      `SELECT provider_id, api_key FROM fde_llm_bindings WHERE fde_id = $1`,
+      `SELECT provider_id, api_key, gateway, gateway_user_id, key_id, key_alias, state,
+              main_model_id, main_model_name, embedding_model_id, embedding_model_name,
+              vision_model_id, vision_model_name, generation
+         FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
       [userId],
     );
-    const oldKey = existing.rows[0]?.api_key ?? null;
-    const oldProvider = existing.rows[0]?.provider_id ?? null;
-    const newKey = api_key === undefined ? oldKey : api_key;
+    const current = existing.rows[0] ?? null;
+    const sameBinding = current?.state === 'active'
+      && current.gateway === 'litellm'
+      && current.api_key
+      && current.provider_id === provider_id
+      && current.main_model_id === main_model_id
+      && (current.embedding_model_id ?? null) === (embedding_model_id ?? null)
+      && (current.vision_model_id ?? null) === (vision_model_id ?? null)
+      && current.main_model_name === selected.main.model_name
+      && (current.embedding_model_name ?? null) === (selected.embedding?.model_name ?? null)
+      && (current.vision_model_name ?? null) === (selected.vision?.model_name ?? null);
 
-    // N3（Round C 评审）：F6 守卫的**权威复检**必须在本事务内（advisory lock 已持有）执行：
-    // http.js 的预检在事务外，挡不住「两个并发 PUT 双双通过预检后都提交」；此处对**已提交**状态复检。
-    // 「事实变化」口径与 http.js 预检一致（api_key 缺省=保留旧值不算变化；显式 null=清空算变化；
-    // 首次配置 current=null，给 provider/key 都算事实变化）。命中活跃 run 且未 force → 409，
-    // UPDATE/INSERT/outbox 一概不写（事务回滚）。并发安全：postMessage 建 run 取同一把 advisory
-    // lock（锁序论证见本文件头注释）→ 两事务全序，「PUT 查到无活跃 run → 并发建 run → PUT 提交」窗口关闭。
-    if (force !== true) {
-      const providerChanged = provider_id !== oldProvider;
-      const keyChanged = api_key !== undefined && (api_key ?? null) !== oldKey;
-      if (providerChanged || keyChanged) {
-        const act = await client.query(
-          `SELECT 1
-             FROM runs r
-             JOIN chat_sessions s ON s.id = r.session_id
-            WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
-            LIMIT 1`,
-          [userId],
-        );
-        if (act.rows.length > 0) {
-          throw new LlmError('active_run_conflict',
-            '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。'
-            + '确认无影响请带 force=true 重试。', { httpStatus: 409 });
-        }
+    if (!sameBinding && force !== true && current?.state === 'active') {
+      const activeRun = await client.query(
+        `SELECT 1 FROM runs r
+          JOIN chat_sessions s ON s.id = r.session_id
+         WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
+         LIMIT 1`,
+        [userId],
+      );
+      if (activeRun.rows.length > 0) {
+        throw new LlmError('active_run_conflict',
+          '该 FDE 有进行中的 run：更改模型白名单会轮换 LiteLLM key。确认无影响请带 force=true 重试。',
+          { httpStatus: 409 });
       }
     }
 
-    if (existing.rows.length > 0) {
-      // 更新：gateway 语义收敛为 'direct'（上游直连），generation 不变（无代次轮换语义）。
+    if (sameBinding) {
+      await client.query('COMMIT');
+      return {
+        provider_id,
+        provider_name: provider_id,
+        gateway: 'litellm',
+        key_id: current.key_id ?? null,
+        key_alias: current.key_alias,
+        api_key: maskKey(current.api_key),
+        main: { model_id: modelId(selected.main), name: selected.main.model_name, type: 'text' },
+        embedding: selected.embedding ? { model_id: modelId(selected.embedding), name: selected.embedding.model_name, type: 'embedding' } : null,
+        vision: selected.vision ? { model_id: modelId(selected.vision), name: selected.vision.model_name, type: 'vision' } : null,
+      };
+    }
+
+    generated = await generateFdeKey(gatewayClient, {
+      fdeId: userId,
+      fdeName,
+      gatewayUserId: current?.gateway_user_id ?? null,
+      selectedModels: selected,
+    });
+    oldKey = current?.api_key ?? null;
+    oldWasGatewayKey = current?.gateway === 'litellm' && oldKey !== null;
+    if (current) {
       await client.query(
         `UPDATE fde_llm_bindings
-            SET provider_id = $2, api_key = $3, main_model_id = $4, embedding_model_id = $5, vision_model_id = $6,
-                gateway = 'direct', state = 'active', updated_at = now()
+            SET provider_id = $2, api_key = $3, key_id = $4, key_alias = $5, gateway = 'litellm',
+                gateway_user_id = $6, state = 'active', revoked_at = NULL,
+                main_model_id = $7, main_model_name = $8,
+                embedding_model_id = $9, embedding_model_name = $10,
+                vision_model_id = $11, vision_model_name = $12,
+                generation = CASE WHEN $13 THEN generation + 1 ELSE generation END,
+                rotated_at = CASE WHEN $13 THEN now() ELSE rotated_at END,
+                updated_at = now()
           WHERE fde_id = $1`,
-        [userId, provider_id, newKey, main.id, embedding?.id ?? null, vision?.id ?? null],
+        [userId, provider_id, generated.apiKey, generated.keyId, generated.keyAlias, generated.gatewayUserId,
+          modelId(selected.main), selected.main.model_name,
+          selected.embedding ? modelId(selected.embedding) : null, selected.embedding?.model_name ?? null,
+          selected.vision ? modelId(selected.vision) : null, selected.vision?.model_name ?? null, oldWasGatewayKey],
       );
     } else {
-      if (newKey == null) {
-        throw new LlmError('validation_failed', '首次配置必须提供 api_key', { httpStatus: 400, details: { field: 'api_key' } });
-      }
       await client.query(
         `INSERT INTO fde_llm_bindings
-           (fde_id, gateway, key_alias, state, generation, provider_id, api_key, main_model_id, embedding_model_id, vision_model_id)
-         VALUES ($1, 'direct', $2, 'active', 1, $3, $4, $5, $6, $7)`,
-        [userId, `${fdeName}@llm`, provider_id, newKey, main.id, embedding?.id ?? null, vision?.id ?? null],
+           (fde_id, gateway, gateway_user_id, key_id, key_alias, state, generation, provider_id, api_key,
+            main_model_id, main_model_name, embedding_model_id, embedding_model_name, vision_model_id, vision_model_name)
+         VALUES ($1, 'litellm', $2, $3, $4, 'active', 1, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [userId, generated.gatewayUserId, generated.keyId, generated.keyAlias, provider_id, generated.apiKey,
+          modelId(selected.main), selected.main.model_name,
+          selected.embedding ? modelId(selected.embedding) : null, selected.embedding?.model_name ?? null,
+          selected.vision ? modelId(selected.vision) : null, selected.vision?.model_name ?? null],
       );
     }
-
-    // outbox 联动：与 projects.js createProject 的 port_allocation 写法完全同构
-    //（route_revisions head 同事务递增 + route_outbox 行）。payload 不含 api_key（红线 ③）。
     await enqueueRouteChange(client, {
       aggregate: 'llm_binding',
       aggregateId: userId,
@@ -559,68 +542,75 @@ export async function setFdeLlmConfig(pool, {
       payload: {
         fde_name: fdeName,
         provider_id,
-        main_model_id: main.id,
-        embedding_model_id: embedding?.id ?? null,
-        vision_model_id: vision?.id ?? null,
-        has_api_key: newKey != null,
+        gateway: 'litellm',
+        main_model_id: modelId(selected.main),
+        embedding_model_id: selected.embedding ? modelId(selected.embedding) : null,
+        vision_model_id: selected.vision ? modelId(selected.vision) : null,
+        has_api_key: true,
       },
     });
-
-    // audit：details 只含供应商/模型名，不含 key（红线 ③）。
     await client.query(
       `INSERT INTO audit_log (actor_id, action, target, details)
        VALUES ($1, 'llm.config_updated', $2, $3)`,
-      [
-        actorId,
-        fdeName,
-        JSON.stringify({
-          fde_name: fdeName,
-          provider_name: p.rows[0].name,
-          main_model: main.model_id,
-          embedding_model: embedding?.model_id ?? null,
-          vision_model: vision?.model_id ?? null,
-          api_key_provided: api_key !== undefined && api_key !== null,
-        }),
-      ],
+      [actorId, fdeName, JSON.stringify({
+        fde_name: fdeName,
+        provider_id,
+        main_model: selected.main.model_name,
+        embedding_model: selected.embedding?.model_name ?? null,
+        vision_model: selected.vision?.model_name ?? null,
+        virtual_key_rotated: true,
+      })],
     );
-
     await client.query('COMMIT');
-    return {
-      provider_id,
-      provider_name: p.rows[0].name,
-      api_key: newKey == null ? null : maskKey(newKey),
-      main: { model_id: main.model_id, name: main.name, type: main.type },
-      embedding: embedding ? { model_id: embedding.model_id, name: embedding.name, type: embedding.type } : null,
-      vision: vision ? { model_id: vision.model_id, name: vision.name, type: vision.type } : null,
-    };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (generated?.apiKey) {
+      try {
+        await gatewayClient.deleteKey({ keys: [generated.apiKey] });
+      } catch {
+        throw new LlmGatewayError(502, 'Binding save failed and the newly generated LiteLLM key could not be cleaned up');
+      }
+    }
     throw err;
   } finally {
     client.release();
   }
+
+  if (oldWasGatewayKey && oldKey && oldKey !== generated.apiKey) {
+    await gatewayClient.deleteKey({ keys: [oldKey] });
+  }
+  return {
+    provider_id,
+    provider_name: provider_id,
+    gateway: 'litellm',
+    key_id: generated.keyId,
+    key_alias: generated.keyAlias,
+    api_key: maskKey(generated.apiKey),
+    main: { model_id: modelId(selected.main), name: selected.main.model_name, type: 'text' },
+    embedding: selected.embedding ? { model_id: modelId(selected.embedding), name: selected.embedding.model_name, type: 'embedding' } : null,
+    vision: selected.vision ? { model_id: modelId(selected.vision), name: selected.vision.model_name, type: 'vision' } : null,
+  };
 }
 
-/**
- * 吊销事务内联动（issue #38 Phase B1，deprovisionFde 前置事务调用）。
- * fde_llm_bindings active → revoked（revoked_at=now()）+ outbox tombstone（aggregate='llm_binding'，op='delete'）。
- *
- * **评审重点**：本函数只接受调用方事务的 client、绝不自行 connect——LLM 吊销必须与 containers/token
- * 吊销**同一事务**。若在独立连接上先吊销容器 token、再独立吊销 LLM，两事务之间会留下「容器已死但
- * Traefik 仍向该 FDE 子网注入上游 api_key」的窗口（且反向顺序亦然）；offboard 语义要求凭据失效
- * 与「离开 desired」原子发生（topology §8 offboarding 行、审计 #34 F-B 同款推理）。
- * tombstone payload 不含 api_key（红线 ③）；本函数不写 audit（offboard 整体审计由调用方负责）。
- *
- * @returns boolean 是否实际吊销了一行 active binding（无行/已 revoked → false，不写 outbox）
- */
-export async function revokeFdeLlmConfigTx(client, { fdeId, fdeName } = {}) {
-  const r = await client.query(
+/** Delete the LiteLLM key before committing offboarding; a failed revoke aborts the DB transaction. */
+export async function revokeFdeLlmConfigTx(client, { fdeId, fdeName, gateway } = {}) {
+  const current = await client.query(
+    `SELECT api_key, key_alias, gateway FROM fde_llm_bindings
+      WHERE fde_id = $1 AND state = 'active' FOR UPDATE`,
+    [fdeId],
+  );
+  const row = current.rows[0];
+  if (!row) return false;
+  if (row.gateway === 'litellm') {
+    await getGatewayClient(gateway).deleteKey({ keys: [row.api_key ?? row.key_alias] });
+  }
+  const result = await client.query(
     `UPDATE fde_llm_bindings
-        SET state = 'revoked', revoked_at = now(), updated_at = now()
+        SET state = 'revoked', api_key = NULL, revoked_at = now(), updated_at = now()
       WHERE fde_id = $1 AND state = 'active'`,
     [fdeId],
   );
-  if (r.rowCount === 0) return false;
+  if (result.rowCount === 0) return false;
   await enqueueRouteChange(client, {
     aggregate: 'llm_binding',
     aggregateId: fdeId,
@@ -630,27 +620,23 @@ export async function revokeFdeLlmConfigTx(client, { fdeId, fdeName } = {}) {
   return true;
 }
 
-/**
- * onboard 恢复联动（issue #38 Phase B1，onboardFde 调用；独立小事务，容器/网络已就绪后执行）。
- *
- *  - 复用分支（restoreRevoked=true）：binding state='revoked' → 恢复 'active'（revoked_at=NULL）+ outbox
- *    upsert（同事务）——与 #37 revoked_at 复活防御同思路：重新 onboard 的 FDE 其 LLM 配置应复活。
- *    注意复活对象是 **fde_llm_bindings.revoked_at**（本表），与 containers.revoked_at（#22 F1）是两张表，
- *    互不干扰——containers 行复用的 UPDATE 不会顺带清本表状态。
- *  - 全新 onboard（restoreRevoked=false）：**不自动复活** revoked 配置（offboard 是管理员意图，LLM 恢复
- *    应经 admin 重新确认）；仅对仍 'active' 的配置做幂等 upsert 发布（保证 Traefik 动态配置齐全，
- *    幂等可重复执行）。
- *
- * @returns { restored, republished }
- */
-export async function syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restoreRevoked = false } = {}) {
+/** Onboard republishes an existing virtual key or rotates one after a revoked binding is restored. */
+export async function syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restoreRevoked = false, gateway } = {}) {
+  const gatewayClient = getGatewayClient(gateway);
   const client = await pool.connect();
+  let oldKey = null;
+  let oldWasGatewayKey = false;
+  let generated = null;
+  let restored = false;
+  let republished = false;
   try {
     await client.query('BEGIN');
-    // 与 setFdeLlmConfig 同 advisory key，串行化同 FDE 的配置写入/恢复。
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
     const r = await client.query(
-      `SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
+      `SELECT state, provider_id, api_key, key_id, key_alias, gateway, gateway_user_id,
+              main_model_id, main_model_name, embedding_model_id, embedding_model_name,
+              vision_model_id, vision_model_name
+         FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
       [fdeId],
     );
     const row = r.rows[0];
@@ -658,60 +644,108 @@ export async function syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restore
       await client.query('COMMIT');
       return { restored: false, republished: false };
     }
-    let restored = false;
-    if (row.state === 'revoked' && restoreRevoked) {
+    const shouldRestore = row.state === 'revoked' && restoreRevoked && row.main_model_id != null;
+    const needsKey = shouldRestore
+      || (row.state === 'active' && (
+        row.gateway !== 'litellm'
+        || !row.api_key
+        || !row.main_model_name
+        || (row.embedding_model_id && !row.embedding_model_name)
+        || (row.vision_model_id && !row.vision_model_name)
+      ));
+    let effective = row.state === 'active';
+    if (needsKey) {
+      const selected = await selectGatewayModels(gatewayClient, {
+        providerId: row.provider_id,
+        mainModelId: row.main_model_id,
+        embeddingModelId: row.embedding_model_id,
+        visionModelId: row.vision_model_id,
+      });
+      if (!selected.main) {
+        await client.query('COMMIT');
+        return { restored: false, republished: false };
+      }
+      generated = await generateFdeKey(gatewayClient, {
+        fdeId,
+        fdeName,
+        gatewayUserId: row.gateway_user_id ?? null,
+        selectedModels: selected,
+      });
+      oldKey = row.api_key ?? null;
+      oldWasGatewayKey = row.gateway === 'litellm' && oldKey !== null;
       await client.query(
         `UPDATE fde_llm_bindings
-            SET state = 'active', revoked_at = NULL, updated_at = now()
+            SET gateway = 'litellm', gateway_user_id = $2, key_id = $3, key_alias = $4,
+                api_key = $5, state = 'active', revoked_at = NULL,
+                main_model_name = $6, embedding_model_name = $7, vision_model_name = $8,
+                generation = CASE WHEN $9 THEN generation + 1 ELSE generation END,
+                rotated_at = CASE WHEN $9 THEN now() ELSE rotated_at END,
+                updated_at = now()
+          WHERE fde_id = $1`,
+        [fdeId, generated.gatewayUserId, generated.keyId, generated.keyAlias, generated.apiKey,
+          selected.main.model_name, selected.embedding?.model_name ?? null, selected.vision?.model_name ?? null,
+          row.state === 'active' && oldWasGatewayKey],
+      );
+      restored = shouldRestore;
+      effective = true;
+    } else if (shouldRestore) {
+      restored = true;
+      effective = true;
+      await client.query(
+        `UPDATE fde_llm_bindings SET state = 'active', revoked_at = NULL, updated_at = now()
           WHERE fde_id = $1`,
         [fdeId],
       );
-      restored = true;
     }
-    // active（原本或刚恢复）→ 幂等 upsert，触发 reconciler 重发布（tombstone 批量 offboard 后
-    // 的 re-onboard 场景也靠它补齐 Traefik 配置）。
-    const effective = restored || row.state === 'active';
     if (effective) {
       await enqueueRouteChange(client, {
         aggregate: 'llm_binding',
         aggregateId: fdeId,
         op: 'upsert',
-        payload: { fde_name: fdeName, restored },
+        payload: { fde_name: fdeName, restored, gateway: 'litellm' },
       });
+      republished = true;
     }
     await client.query('COMMIT');
-    return { restored, republished: effective };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (generated?.apiKey) {
+      try {
+        await gatewayClient.deleteKey({ keys: [generated.apiKey] });
+      } catch {
+        throw new LlmGatewayError(502, 'Onboard failed and the newly generated LiteLLM key could not be cleaned up');
+      }
+    }
     throw err;
   } finally {
     client.release();
   }
+  if (oldWasGatewayKey && oldKey && generated?.apiKey !== oldKey) {
+    await gatewayClient.deleteKey({ keys: [oldKey] });
+  }
+  return { restored, republished };
 }
 
-/**
- * 删除 FDE LLM 配置（tombstone op='delete'，与 port_allocation 释放同构）。Phase B/C 使用。
- * @returns boolean 是否存在配置行
- */
-export async function deleteFdeLlmConfig(pool, { actorId = null, fdeName } = {}) {
+export async function deleteFdeLlmConfig(pool, { actorId = null, fdeName, gateway } = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
-    const u = await client.query(`SELECT id, fde_name FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
-    if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
-    const userId = u.rows[0].id;
-    const existing = await client.query(`SELECT 1 FROM fde_llm_bindings WHERE fde_id = $1`, [userId]);
-    if (existing.rows.length === 0) {
+    const u = await client.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+    if (!u.rows.length) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
+    const binding = await client.query(
+      `SELECT api_key, key_alias, gateway FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE`,
+      [u.rows[0].id],
+    );
+    if (!binding.rows.length) {
       await client.query('COMMIT');
       return false;
     }
-    await client.query(`DELETE FROM fde_llm_bindings WHERE fde_id = $1`, [userId]);
+    const row = binding.rows[0];
+    if (row.gateway === 'litellm') await getGatewayClient(gateway).deleteKey({ keys: [row.api_key ?? row.key_alias] });
+    await client.query(`DELETE FROM fde_llm_bindings WHERE fde_id = $1`, [u.rows[0].id]);
     await enqueueRouteChange(client, {
-      aggregate: 'llm_binding',
-      aggregateId: userId,
-      op: 'delete',
-      payload: { fde_name: fdeName },
+      aggregate: 'llm_binding', aggregateId: u.rows[0].id, op: 'delete', payload: { fde_name: fdeName },
     });
     await client.query(
       `INSERT INTO audit_log (actor_id, action, target, details)

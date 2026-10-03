@@ -19,11 +19,11 @@ export class FakeInternalPool {
     this.approvals = seed.approvals ?? [];
     this.toolCalls = seed.toolCalls ?? [];
     this.usage = seed.usage ?? [];
-    // issue #38 Phase B2：心跳下行模型集（fde_llm_bindings / llm_providers / llm_models）。
+    // issue #117：binding slots hold LiteLLM model_info.id strings; credentials/models live upstream.
     this.llm = {
-      providers: seed.llm?.providers ?? [],   // [{id, enabled}]
-      models: seed.llm?.models ?? [],         // [{id, provider_id, model_id, type, tool_calling, enabled}]
-      bindings: seed.llm?.bindings ?? [],     // [{fde_id, state, provider_id, main_model_id, embedding_model_id, vision_model_id}]
+      providers: seed.llm?.providers ?? [],
+      models: seed.llm?.models ?? [],
+      bindings: seed.llm?.bindings ?? [],     // [{fde_id, state, gateway, api_key, main_model_id, ...}]
     };
     this.auditLog = [];
     this._claim = 0;
@@ -229,24 +229,21 @@ export class FakeInternalPool {
       return { rows: [] };
     }
 
-    // ---- heartbeat：LLM 下行模型集（getFdeLlmHeartbeatModels：bindings JOIN providers JOIN models）----
-    if (sql.includes('FROM fde_llm_bindings b') && sql.includes('JOIN llm_providers')) {
+    // ---- heartbeat：LLM serving names read alongside the text model_info.id slots ----
+    if (sql.includes('FROM fde_llm_bindings') && sql.includes('main_model_id, main_model_name')) {
       const [userId] = params;
-      const b = this.llm.bindings.find((x) => x.fde_id === userId && x.state === 'active');
+      const b = this.llm.bindings.find((x) =>
+        x.fde_id === userId && x.state === 'active' && x.gateway === 'litellm' && x.api_key,
+      );
       if (!b) return { rows: [] };
-      const p = this.llm.providers.find((x) => x.id === b.provider_id && x.enabled !== false);
-      if (!p) return { rows: [] };
-      const upstream = (id, ok) => {
-        if (id == null) return null;
-        const m = this.llm.models.find((x) => x.id === id);
-        if (!m || m.enabled === false || !ok(m)) return null;
-        return m.model_id;
-      };
       return {
         rows: [{
-          main_upstream: upstream(b.main_model_id, (m) => m.type === 'text' && m.tool_calling === true),
-          embedding_upstream: upstream(b.embedding_model_id ?? null, (m) => m.type === 'embedding'),
-          vision_upstream: upstream(b.vision_model_id ?? null, (m) => m.type === 'vision'),
+          main_model_id: b.main_model_id ?? null,
+          main_model_name: b.main_model_name ?? null,
+          embedding_model_id: b.embedding_model_id ?? null,
+          embedding_model_name: b.embedding_model_name ?? null,
+          vision_model_id: b.vision_model_id ?? null,
+          vision_model_name: b.vision_model_name ?? null,
         }],
       };
     }

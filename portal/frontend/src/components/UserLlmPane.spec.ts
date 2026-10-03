@@ -14,7 +14,7 @@ const FDE_USER = {
 
 const PROVIDERS = [
   {
-    id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1', enabled: true,
+    id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
     models: [
       { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true },
       { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: true },
@@ -22,7 +22,7 @@ const PROVIDERS = [
     ],
   },
   {
-    id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com', enabled: true,
+    id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com',
     models: [
       { id: 'm4', provider_id: 'p2', model_id: 'claude-sonnet', name: 'Sonnet', type: 'text', tool_calling: true, context_window: 200000, enabled: false },
     ],
@@ -79,10 +79,11 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('UserLlmPane · LLM 配置表单', () => {
-  it('加载 config + active_run：warnbox 与 key 掩码提示展示；模型下拉按类型/能力过滤并回填', async () => {
+  it('加载 config + active_run：warnbox 与只读虚拟 key 展示；模型下拉按类型/能力过滤并回填', async () => {
     const { wrapper } = await mountPane();
     expect(wrapper.text()).toContain('⚠️ 有活跃 run：更换供应商或 API key 会被服务端拒绝');
-    expect(wrapper.find('[data-test="key-hint"]').text()).toBe('已配置 sk•••，重输以修改');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('当前虚拟 key：sk•••');
+    expect(wrapper.find('input[type="password"]').exists()).toBe(false);
 
     // 主模型下拉：仅 text 且 tool_calling 的启用模型（m1 gpt-4o；m3 无 tool_calling 被过滤）
     const mainOpts = wrapper.find('[data-test="main-model"]').findAll('option');
@@ -98,7 +99,7 @@ describe('UserLlmPane · LLM 配置表单', () => {
     expect(wrapper.find('[data-test="main-model"]').findAll('option').map((o) => o.text())).toEqual(['（不配置）']);
   });
 
-  it('保存成功：展示「已保存：主模型 …」并清空 API key 输入框', async () => {
+  it('保存成功：不提交上游 key，展示保存状态和只读的虚拟 key 掩码', async () => {
     const { wrapper, fetchFn } = await mountPane((url, init) => {
       if (String(url).includes('/llm') && init?.method === 'PUT') {
         return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'gpt-4o' } } });
@@ -108,8 +109,11 @@ describe('UserLlmPane · LLM 配置表单', () => {
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     expect(wrapper.text()).toContain('已保存：主模型 gpt-4o');
-    expect((wrapper.find('input[type="password"]').element as HTMLInputElement).value).toBe('');
-    expect(putCalls(fetchFn)).toHaveLength(1);
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('当前虚拟 key：sk•••');
+    expect(wrapper.find('input[type="password"]').exists()).toBe(false);
+    const puts = putCalls(fetchFn);
+    expect(puts).toHaveLength(1);
+    expect('api_key' in JSON.parse(String(puts[0][1]?.body))).toBe(false);
   });
 
   it('409 active_run_conflict：首次 PUT 不带 force 字段；显式点击「确认无影响，强制保存」才带 force=true 重试', async () => {
@@ -136,6 +140,7 @@ describe('UserLlmPane · LLM 配置表单', () => {
     const firstPut = putCalls(fetchFn)[0];
     const firstBody = JSON.parse(String(firstPut[1]?.body));
     expect('force' in firstBody).toBe(false); // 首次提交绝不带 force 字段
+    expect('api_key' in firstBody).toBe(false);
     expect(wrapper.text()).toContain('已拒绝（409）：该 FDE 有进行中的 run');
     const forceBtn = wrapper.find('[data-test="force-save"]');
     expect(forceBtn.exists()).toBe(true);
@@ -187,12 +192,11 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain('⚠️ Active run: changing the provider or API key');
-    expect(wrapper.find('[data-test="key-hint"]').text()).toBe('sk••• configured; re-enter to change');
-    expect(wrapper.find('input[type="password"]').attributes('placeholder')).toBe('leave blank to keep unchanged');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('Current virtual key: sk•••');
+    expect(wrapper.find('input[type="password"]').exists()).toBe(false);
 
     const form = wrapper.find('form').text();
     expect(form).toContain('Provider');
-    expect(form).toContain('API Key (');
     expect(form).toContain('Main model (text · tool_calling)');
     expect(form).toContain('Embedding (optional)');
     expect(form).toContain('Vision (optional)');
@@ -208,7 +212,7 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
   });
 
   it('切 English：保存成功 / 409 拒绝 / provision 完成 / 错误前缀文案英文', async () => {
-    // ① 保存成功（含 key 后缀）
+    // ① 保存成功；虚拟 key 在独立只读区域展示，不拼入保存状态文案。
     const { wrapper, fetchFn } = await mountPane((url, init) => {
       if (String(url).includes('/llm') && init?.method === 'PUT') {
         return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'gpt-4o' } } });
@@ -223,7 +227,8 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
 
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    expect(wrapper.text()).toContain('Saved: main model gpt-4o (key sk•••)');
+    expect(wrapper.text()).toContain('Saved: main model gpt-4o');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('Current virtual key: sk•••');
 
     // ② provision 完成文案
     await wrapper.findAll('form button')[1].trigger('click');

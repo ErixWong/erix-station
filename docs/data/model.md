@@ -37,7 +37,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 用量与审计 | `usage_ledger` / `audit_log` | 规格 §11.4 / §14 |
 | 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
 | 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
-| LLM 配置 | `fde_llm_bindings`（扩列，migration 0002）/ `llm_providers` / `llm_models`（master-detail，migration 0002 新增） | issue #38（去 LiteLLM hub、上游直发 per-FDE key） |
+| LLM 配置 | `fde_llm_bindings`（模型目录与上游凭据归 LiteLLM；旧 `llm_providers` / `llm_models` 于 migration 0010 改名为 `_retired`） | issue #117 phase 2 |
 | 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
 | 迁移台账 | `schema_migrations` | deploy-contract.md §3（A6 定稿） |
 
@@ -220,22 +220,23 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 > **`tool_call_id` canonical 规则（`tool_outputs` / `approvals` 一致）**：外部 ID = `tool_calls.call_id`（事件流 `tool_use`/`tool_result`/`tool_call_delta` 的 `tool_call_id`，字符串如 `tc_301`）；`tool_calls.id` 是**内部主键（uuid），不外露、不进 API 载荷**。两表都以复合外键 `(run_id, tool_call_id) REFERENCES tool_calls (run_id, call_id)` 关联（`tool_calls` 有 `UNIQUE(run_id, call_id)`）。
 > ⚠️ **审批契约（issue #10）**：超时语义已定稿（`pending → expired`，由 portal 打标，topology.md §4-L6）；`tool_call_id` 是否改判为 UUID 仍待 #10 确认——若改判则同步 `approvals` / `tool_outputs` 两表。
 
-### 1.20 `fde_llm_bindings` — FDE ↔ LLM 网关虚拟 key 绑定（规格 §11.3）
+### 1.20 `fde_llm_bindings` — FDE ↔ LiteLLM 虚拟 key 绑定（规格 §11.3，migration 0010）
 
 | 关键字段 | 语义 |
 |---|---|
 | `fde_id` | → `users.id`，主键：每 FDE 一行 |
-| `gateway` / `key_id` | 网关标识与网关侧 key id（创建成功后回填） |
-| `key_alias` | 业务别名（如 `alice@client-x`），供用量对账映射（规格 §11.3） |
-| `state` / `generation` | 状态机见 §2.7；`generation` 为虚拟 key 代次（轮换 +1，旧代次在网关吊销） |
+| `gateway` / `gateway_user_id` | 固定为 `litellm`；LiteLLM user id 用于同一 FDE 后续轮换 key 时复用用户 |
+| `key_id` / `key_alias` | LiteLLM key id 与业务别名 `fde-<fde_name>`，供用量对账映射 |
+| `state` / `generation` | 状态机见 §2.7；`generation` 为虚拟 key 代次（轮换 +1，旧 key 在 LiteLLM 删除） |
 | `revoked_at` / `rotated_at` | 吊销/轮换时刻 |
-| `provider_id` | → `llm_providers.id`（上游供应商；migration 0002 新增列） |
-| `api_key` | per-FDE 上游明文 key（migration 0002 新增列）；`NULL` = 未配置（该 FDE 无 LLM 可用，心跳下行空模型集） |
-| `main_model_id` / `embedding_model_id` / `vision_model_id` | → `llm_models.id`（migration 0002 新增列）；`main` 必须 `tool_calling=true` 由**应用层**校验（PG 无法跨表查能力标记） |
+| `provider_id` | LiteLLM credential 名称（兼容旧列名；无本地表外键） |
+| `api_key` | LiteLLM per-FDE 虚拟 key 明文，供 portal 注入 Traefik；上游凭据仅存在 LiteLLM credential。`NULL` = 未配置 |
+| `main_model_id` / `embedding_model_id` / `vision_model_id` | LiteLLM `model_info.id` 字符串（`text`，无外键）；`main` 必须是未 block、支持 `tool_calling` 的文本模型，由应用层校验 |
+| `main_model_name` / `embedding_model_name` / `vision_model_name` | 对应 LiteLLM `model_name`（数据面请求体使用的别名）；与 `model_info.id` 分开保存，因为二者不是同一标识 |
 
-**红线（2026-09-19 修订，用户决策：去 LiteLLM hub、上游直发 key）**：真 key 允许存 DB（原「绝不存明文」前提是 LiteLLM 持有真 key，该前提已不成立），但必须：①容器永不持有（key 只存在于 DB → portal 内存 → Traefik 动态配置 mode 600）；②API 回显只给掩码（sk-…last4），编辑需重输；③不进日志/审计/错误信息。`gateway` 列语义更新：值 `'direct'` 表示上游直连（不再要求网关名）；旧值保留兼容。
+**凭据边界（issue #117 phase 2）**：上游 API key 与 `api_base` 由 LiteLLM credential 管理；Station 只存 LiteLLM 虚拟 key，不把上游明文复制进自身 DB。虚拟 key 只由 portal 用于 Traefik 动态配置（文件 mode 600），容器不持有；管理 API 回显掩码，日志/审计/错误信息不含 key。`llm_providers` 与 `llm_models` 在 migration 0010 中改名为 `llm_providers_retired` / `llm_models_retired` 留作回滚与人工核对；待所有部署不再读取旧表后，由后续迁移 DROP。
 
-**运行中变更守卫（2026-09-20 修订，issue #38（PR #39 评审 F6）：UI 提示不足以保证 fail-visible，改服务端拒绝）**：`PUT /api/admin/fdes/:name/llm` 在「该 FDE 有活跃 run（口径同 sessions.js `ACTIVE_RUN_STATES` = queued/running/cancelling）**且**本次变更改变上游/凭据事实」时返回 **`409 active_run_conflict`**，不写 outbox；请求体显式 `force: true`（管理员知情确认）才放行，放行后仍正常写 outbox。判定的「上游/凭据事实」＝① `provider_id` 值变化（无旧配置时首次给上游 = 从「无路由」变「有路由」，同样算）；② 显式携带 `api_key`（缺省＝保留旧值，任何显式新 key 都算换凭据）。**纯模型变更（`main_model_id`/`embedding_model_id`/`vision_model_id`）不受守卫**——模型本就是 run 边界生效（RUN_START 只快照 models，见 runner-integration/agentd），运行中改模型不影响已锁定的 run；而 provider/key 由 Traefik 当前路由即时决定，运行中变更会**静默**改运行中 run 的上游，故必须服务端拒绝 + 显式 force。原「换 provider 撞活跃 run＝admin UI 黄条提示缓解」口径作废（黄条仍在但只是知情提示，真正拦截在服务端）。
+**运行中变更守卫**：`PUT /api/admin/fdes/:name/llm` 在活跃 run（queued/running/cancelling）期间若改变 credential 或任一模型槽（该槽变化会轮换 LiteLLM key 白名单），返回 `409 active_run_conflict`；管理员显式传 `force: true` 才放行。相同 binding 为幂等重试，不重复铸 key 或写 outbox。上游 API key 不能经 FDE binding API 提交，需在 LiteLLM credential 管理入口更新。
 
 ### 1.21 `preview_grants` — 预览授权凭证（portal.md §2.7/§2.8）
 

@@ -27,7 +27,6 @@ export interface LlmProvider {
   id: string;
   name: string;
   base_url: string;
-  enabled: boolean;
   models: LlmModel[];
 }
 
@@ -124,12 +123,14 @@ export const useAdminStore = defineStore('admin', {
     },
 
     /** 旧 addProviderForm 提交：POST /api/admin/llm/providers。 */
-    async addProvider(name: string, baseUrl: string): Promise<string | null> {
+    async addProvider(name: string, baseUrl: string, apiKey?: string): Promise<string | null> {
       this.llmErr = null;
       try {
+        const body: Record<string, string> = { name, base_url: baseUrl };
+        if (apiKey) body.api_key = apiKey;
         await api('/api/admin/llm/providers', {
           method: 'POST',
-          body: JSON.stringify({ name, base_url: baseUrl }),
+          body: JSON.stringify(body),
         });
         await this.loadProviders();
         return null;
@@ -139,33 +140,21 @@ export const useAdminStore = defineStore('admin', {
       }
     },
 
-    /** 编辑供应商地址：PATCH /api/admin/llm/providers/<id> { base_url }。 */
-    async updateProvider(p: LlmProvider, baseUrl: string): Promise<string | null> {
+    /** 编辑供应商地址及可选上游 key：PATCH /api/admin/llm/providers/<id>。 */
+    async updateProvider(p: LlmProvider, baseUrl: string, apiKey?: string): Promise<string | null> {
       this.llmErr = null;
       try {
+        const body: Record<string, string> = { base_url: baseUrl };
+        if (apiKey) body.api_key = apiKey;
         await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}`, {
           method: 'PATCH',
-          body: JSON.stringify({ base_url: baseUrl }),
+          body: JSON.stringify(body),
         });
         await this.loadProviders();
         return this.llmErr;
       } catch (e) {
         this.llmErr = t('admin.errorPrefix') + this.errText(e);
         return this.llmErr;
-      }
-    },
-
-    /** 旧 provider toggle 按钮：PATCH { enabled: !p.enabled }。 */
-    async toggleProvider(p: LlmProvider) {
-      this.llmErr = null;
-      try {
-        await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ enabled: !p.enabled }),
-        });
-        await this.loadProviders();
-      } catch (e) {
-        this.llmErr = t('admin.errorPrefix') + this.errText(e);
       }
     },
 
