@@ -117,3 +117,28 @@ test('issue #114：sessionAutoTitle 默认关；仅显式 ERIX_SESSION_AUTO_TITL
   assert.equal(loadConfig({ ...base, ERIX_SESSION_AUTO_TITLE: 'yes' }).sessionAutoTitle, false, '非 1 值不视为开');
   assert.equal(loadConfig(base).sessionAutoTitleMinNew, 3, '防抖阈值缺省不变');
 });
+
+test('issue #117 phase 1：gateway 配置默认 self，并从环境读取 admin API 和 master key', () => {
+  const base = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
+  const defaults = loadConfig(base);
+  assert.equal(defaults.llmGatewayMode, 'self');
+  assert.equal(defaults.llmGatewayAdminUrl, 'http://station-litellm:4000');
+  assert.equal(defaults.llmGatewayMasterKey, '');
+
+  const configured = loadConfig({
+    ...base,
+    LLM_GATEWAY_MODE: 'external',
+    LLM_GATEWAY_ADMIN_URL: 'https://gateway.example.test',
+    LLM_GATEWAY_MASTER_KEY: 'sk-test-only',
+  });
+  assert.equal(configured.llmGatewayMode, 'external');
+  assert.equal(configured.llmGatewayAdminUrl, 'https://gateway.example.test');
+  assert.equal(configured.llmGatewayMasterKey, 'sk-test-only');
+});
+
+test('issue #117 phase 1：拒绝未知 gateway mode', () => {
+  assert.throws(
+    () => loadConfig({ ...DEV, FDE_IMAGE: 'traefik/whoami', LLM_GATEWAY_MODE: 'proxy' }),
+    /LLM_GATEWAY_MODE/,
+  );
+});

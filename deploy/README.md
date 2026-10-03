@@ -52,4 +52,5 @@ sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml
 ## 说明
 
 - 开发期 `COOKIE_PROFILE=dev-http` → cookie 名 `fde_session_dev`、无 `Secure`（仅本机 HTTP 联调；部署配置必须 `prod`）。
-- 本轮平台栈三个容器（edge/portal/db）+ `station-docker-proxy`；FDE 容器 / LLM 网关（P1 为 `station-mock-llm`）/ materializer / 路由 reconciler 均已随 WP2a–WP3b 交付（`station-docker-proxy` 亦已落地，见 deploy-contract §5.1）。
+- 默认开发栈包含 edge/portal/db、`station-docker-proxy` 与 `station-mock-llm`；`station-litellm` 需显式启用 profile。
+- LiteLLM 迁移基础设施（issue #117 phase 1）作为可选 `litellm` profile 提供，不替换 `station-mock-llm`；数据库准备、启动及模型 seed 见 [`litellm/README.md`](litellm/README.md)。
