@@ -127,6 +127,7 @@ export function createLlmGatewayClient({
   }
 
   const post = (path, body) => request('POST', path, { body });
+  const patch = (path, body) => request('PATCH', path, { body });
   const namePath = (name) => `/credentials/${encodeURIComponent(name)}`;
   return Object.freeze({
     createUser: (body) => post('/user/new', body),
@@ -138,7 +139,7 @@ export function createLlmGatewayClient({
     keyInfo: (key) => request('GET', '/key/info', { query: { key } }),
     listModels: () => request('GET', '/model/info'),
     createModel: (body) => post('/model/new', body),
-    updateModel: (body) => post('/model/update', body),
+    updateModel: ({ model_id, ...body }) => patch(`/model/${encodeURIComponent(model_id)}/update`, body),
     deleteModel: (id) => post('/model/delete', { id }),
     blockModel: (modelId) => post('/model/block', { model_id: modelId }),
     unblockModel: (modelId) => post('/model/unblock', { model_id: modelId }),

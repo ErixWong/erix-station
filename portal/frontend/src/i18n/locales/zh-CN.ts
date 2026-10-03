@@ -184,6 +184,7 @@ export const zhCN = {
       colName: '名称',
       colType: '类型',
       colContextWindow: '上下文窗口',
+      upstreamModelId: '上游模型 ID',
       colStatus: '状态',
       addModel: '＋ 新增模型',
       addModelTitle: '新增模型',
@@ -196,6 +197,7 @@ export const zhCN = {
       providerApiKeyEditHint: '留空保持原值不变；出于安全考虑不会回显已保存的 key。',
       editModelTitle: '编辑模型 {model}',
       editContextWindowHint: '留空保持现有值；当前 API 不支持清空该值。',
+      editUpstreamModelHint: '填写 LiteLLM 使用的完整模型 ID（例如 openai/gpt-4o）；留空保持原值不变。',
       confirmDeleteProvider: '确认删除供应商 {name}？其下模型将一并删除。',
       confirmDeleteModel: '确认删除模型 {model}？',
       // per-user LLM 配置 pane（UserLlmPane.vue）

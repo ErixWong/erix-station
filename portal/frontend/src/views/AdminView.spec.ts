@@ -20,7 +20,7 @@ const PROVIDERS = {
     {
       id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
       models: [
-        { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true },
+        { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
         { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: false },
       ],
     },
@@ -309,14 +309,18 @@ describe('AdminView · LLM 管理', () => {
     await wrapper.get('[data-test="open-add-model"]').trigger('click');
     const addForm = wrapper.get('[data-test="add-model-form"]');
     await addForm.findAll('input')[0].setValue('gpt-4o-mini');
-    await addForm.findAll('input')[1].setValue('GPT-4o mini');
+    const addUpstreamModel = addForm.get('[data-test="add-model-upstream-id"]');
+    expect(addUpstreamModel.attributes('required')).toBeDefined();
+    expect(addUpstreamModel.attributes('placeholder')).toBe('openai/<model>');
+    await addUpstreamModel.setValue('openai/gpt-4o-mini');
+    await addForm.findAll('input')[2].setValue('GPT-4o mini');
     await addForm.get('select').setValue('text');
     await addForm.find('input[type="checkbox"]').setValue(true);
     await addForm.trigger('submit.prevent');
     await flushPromises();
     const post = callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0];
     expect(JSON.parse(String(post[1]?.body))).toEqual({
-      model_id: 'gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: true, context_window: null,
+      model_id: 'gpt-4o-mini', model: 'openai/gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: true, context_window: null,
     });
 
     const refreshedRow = wrapper.get('[data-test="model-row"]');
@@ -324,8 +328,11 @@ describe('AdminView · LLM 管理', () => {
     const editForm = wrapper.get('[data-test="edit-model-form"]');
     expect(editForm.text()).toContain('model_id: gpt-4o');
     expect(editForm.text()).toContain('类型: text');
-    await editForm.findAll('input')[0].setValue('GPT-4o edited');
-    await editForm.findAll('input')[1].setValue('65536');
+    const editUpstreamModel = editForm.get('[data-test="edit-model-upstream-id"]');
+    expect((editUpstreamModel.element as HTMLInputElement).value).toBe('openai/gpt-4o');
+    await editUpstreamModel.setValue('openai/gpt-4o-edited');
+    await editForm.findAll('input')[1].setValue('GPT-4o edited');
+    await editForm.findAll('input')[2].setValue('65536');
     await editForm.find('input[type="checkbox"]').setValue(false);
     await editForm.trigger('submit.prevent');
     await flushPromises();
@@ -333,7 +340,7 @@ describe('AdminView · LLM 管理', () => {
       ([, init]) => JSON.parse(String(init?.body)).name === 'GPT-4o edited',
     );
     expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
-      name: 'GPT-4o edited', tool_calling: false, context_window: 65536,
+      model: 'openai/gpt-4o-edited', name: 'GPT-4o edited', tool_calling: false, context_window: 65536,
     });
 
     const deleteButton = wrapper.get('[data-test="model-row"]').findAll('button')
@@ -349,6 +356,23 @@ describe('AdminView · LLM 管理', () => {
     await wrapper.get('[data-test="confirm-delete"]').trigger('click');
     await flushPromises();
     expect(callsTo(fetchFn, 'DELETE', '/api/admin/llm/models/m1')).toHaveLength(1);
+  });
+
+  it('编辑模型的上游模型 id 留空时保持不变', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[0].trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    await editForm.get('[data-test="edit-model-upstream-id"]').setValue('');
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0];
+    expect(JSON.parse(String(patch[1]?.body))).not.toHaveProperty('model');
+    wrapper.unmount();
   });
 
   it('删除请求失败时确认 modal 保持打开并展示错误', async () => {

@@ -57,6 +57,8 @@ class LlmFakePool {
     this.gatewayCalls = [];
     this.generatedKeys = [];
     this.nextGatewayId = 0;
+    this.createModelError = null;
+    this.deleteModelError = null;
     this.updateKeyError = null;
     this.activeRun = false;     // N2/N3：fdeHasActiveRun 同口径的活跃 run 开关（llm.js 事务内复检用）
   }
@@ -128,7 +130,7 @@ class LlmFakePool {
     return {
       data: this.models.map((m) => ({
         model_name: m.model_id,
-        litellm_params: { model: m.model_id, litellm_credential_name: m.provider_id },
+        litellm_params: { model: m.upstream_model ?? m.model_id, litellm_credential_name: m.provider_id },
         model_info: {
           id: m.id,
           type: m.type,
@@ -154,8 +156,10 @@ class LlmFakePool {
       type,
       tool_calling: body.model_info?.tool_calling ?? body.model_info?.metadata?.tool_calling ?? false,
       context_window: body.model_info?.context_window ?? body.model_info?.metadata?.context_window ?? null,
+      upstream_model: body.litellm_params?.model,
       enabled: true,
     });
+    if (this.createModelError) throw this.createModelError;
     return { model_id: id };
   }
 
@@ -167,11 +171,13 @@ class LlmFakePool {
     if (info.display_name !== undefined) m.name = info.display_name;
     if (info.tool_calling !== undefined) m.tool_calling = info.tool_calling;
     if (info.context_window !== undefined) m.context_window = info.context_window;
+    if (body.litellm_params?.model !== undefined) m.upstream_model = body.litellm_params.model;
     return { model_id: m.id };
   }
 
   async deleteModel(id) {
     this.gatewayCalls.push({ method: 'deleteModel', id });
+    if (this.deleteModelError) throw this.deleteModelError;
     if (!this.models.some((m) => m.id === id)) throw this.#gatewayError(404, 'model not found');
     this.models = this.models.filter((m) => m.id !== id);
     return { deleted: true };
@@ -489,7 +495,7 @@ test('credential CRUD：create → list（含 models）→ update base_url → d
   assert.equal('enabled' in p, false, 'LiteLLM credential 没有供应商启停字段');
   assert.equal(pool.gatewayCalls.find((call) => call.method === 'createCredential').body.credential_values.api_key, 'sk-test-upstream-secret');
 
-  await createModel(pool, { provider_id: p.id, model_id: 'deepseek-flash', name: 'DeepSeek Flash', type: 'text', tool_calling: true, context_window: 128000 });
+  await createModel(pool, { provider_id: p.id, model_id: 'deepseek-flash', model: 'deepseek/deepseek-chat', name: 'DeepSeek Flash', type: 'text', tool_calling: true, context_window: 128000 });
   const { items } = await listProviders(pool);
   assert.equal(items.length, 1);
   assert.equal(items[0].models.length, 1);
@@ -684,20 +690,119 @@ test('setFdeLlmConfig rechecks active runs before model-binding changes; force p
 // model CRUD
 // ---------------------------------------------------------------------------
 
-test('model create：proxy sends LiteLLM model name, credential and metadata', async () => {
+test('model create：proxy sends explicit upstream model, credential and metadata', async () => {
   const pool = new LlmFakePool({
     providers: [
       { id: 'p1', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', enabled: true },
     ],
   });
-  const m = await createModel(pool, { provider_id: 'p1', model_id: 'deepseek-flash', name: 'DeepSeek Flash', type: 'text', tool_calling: true });
+  const m = await createModel(pool, {
+    provider_id: 'p1',
+    model_id: 'deepseek-flash',
+    model: 'deepseek/deepseek-chat',
+    name: 'DeepSeek Flash',
+    type: 'text',
+    tool_calling: true,
+  });
   assert.equal(m.model_id, 'm1');
   const call = pool.gatewayCalls.find((entry) => entry.method === 'createModel');
   assert.equal(call.body.model_name, 'deepseek-flash');
+  assert.equal(call.body.litellm_params.model, 'deepseek/deepseek-chat');
   assert.equal(call.body.litellm_params.litellm_credential_name, 'p1');
   assert.equal(call.body.model_info.type, 'text');
   assert.equal(call.body.model_info.tool_calling, true);
   assert.deepEqual(LLM_MODEL_TYPES, ['text', 'embedding', 'vision', 'rerank', 'audio-tts', 'audio-stt', 'image-gen']);
+});
+
+test('model create：缺少上游 model id 时拒绝且不访问网关', async () => {
+  const pool = new LlmFakePool();
+  await assert.rejects(
+    () => createModel(pool, { provider_id: 'p1', model_id: 'display-name' }),
+    (error) => error instanceof LlmError
+      && error.code === 'validation_failed'
+      && error.details.field === 'model',
+  );
+  assert.equal(pool.gatewayCalls.length, 0);
+});
+
+test('model create：创建失败后回滚新增同名记录但保留既有记录', async () => {
+  const failure = new Error('model reload failed');
+  const pool = new LlmFakePool({
+    models: [
+      { id: 'existing', provider_id: 'p1', model_id: 'tmp-model', upstream_model: 'openai/original', name: 'Existing', type: 'text' },
+      { id: 'other', provider_id: 'p1', model_id: 'other-model', upstream_model: 'openai/other', name: 'Other', type: 'text' },
+    ],
+  });
+  pool.createModelError = failure;
+  await assert.rejects(
+    () => createModel(pool, {
+      provider_id: 'p1',
+      model_id: 'tmp-model',
+      model: 'openai/tmp-model',
+      name: 'Temporary',
+    }),
+    (error) => error === failure,
+  );
+  assert.deepEqual(pool.models.map((model) => model.id), ['existing', 'other']);
+  assert.deepEqual(
+    pool.gatewayCalls.filter((call) => call.method === 'deleteModel'),
+    [{ method: 'deleteModel', id: 'm1' }],
+  );
+});
+
+test('model create：回滚删除失败时仍抛原始创建错误', async () => {
+  const createFailure = new Error('model reload failed');
+  const pool = new LlmFakePool();
+  pool.createModelError = createFailure;
+  pool.deleteModelError = new Error('delete failed');
+  const originalConsoleError = console.error;
+  const logged = [];
+  console.error = (...args) => logged.push(args);
+  try {
+    await assert.rejects(
+      () => createModel(pool, {
+        provider_id: 'p1',
+        model_id: 'tmp-model',
+        model: 'openai/tmp-model',
+      }),
+      (error) => error === createFailure,
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0][0], '[llm] LiteLLM model create rollback failed');
+  assert.equal(logged[0][1].model_id, 'm1');
+});
+
+test('model update：透传上游 model，并同时更新 model_info 与 metadata', async () => {
+  const pool = new LlmFakePool({
+    models: [{
+      id: 'm1',
+      provider_id: 'p1',
+      model_id: 'gpt-4o',
+      upstream_model: 'openai/gpt-4o',
+      name: 'GPT-4o',
+      type: 'text',
+      tool_calling: true,
+      context_window: 128000,
+    }],
+  });
+  await updateModel(pool, 'm1', {
+    model: ' openai/gpt-4o-updated ',
+    tool_calling: false,
+    context_window: 4096,
+  });
+  const call = pool.gatewayCalls.find((entry) => entry.method === 'updateModel');
+  assert.deepEqual(call.body.litellm_params, { model: 'openai/gpt-4o-updated' });
+  assert.equal(call.body.model_info.tool_calling, false);
+  assert.equal(call.body.model_info.context_window, 4096);
+  assert.equal(call.body.model_info.metadata.tool_calling, false);
+  assert.equal(call.body.model_info.metadata.context_window, 4096);
+  assert.equal(pool.models[0].upstream_model, 'openai/gpt-4o-updated');
+
+  await updateModel(pool, 'm1', { model: ' ' });
+  assert.equal(pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').length, 1);
 });
 
 test('model delete：forwards the LiteLLM model_info.id; missing model propagates 404', async () => {
@@ -1287,9 +1392,10 @@ test('HTTP：credential/model admin endpoints proxy create, update, block and de
     const p2 = (await res.json()).provider;
     res = await fetch(`${base}/api/admin/llm/providers/${p2.id}/models`, {
       method: 'POST', headers: H,
-      body: JSON.stringify({ model_id: 'deepseek-flash', name: 'DeepSeek Flash', type: 'text', tool_calling: true, context_window: 200000 }),
+      body: JSON.stringify({ model_id: 'deepseek-flash', model: 'deepseek/deepseek-chat', name: 'DeepSeek Flash', type: 'text', tool_calling: true, context_window: 200000 }),
     });
     assert.equal(res.status, 201);
+    assert.equal(pool.llm.models.find((model) => model.provider_id === p2.id).upstream_model, 'deepseek/deepseek-chat');
 
     // Credential base_url update; credential enable/disable is unsupported.
     res = await fetch(`${base}/api/admin/llm/providers/${p2.id}`, { method: 'PATCH', headers: H, body: JSON.stringify({ enabled: false }) });
