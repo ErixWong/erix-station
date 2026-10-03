@@ -1,0 +1,12 @@
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  disable_error_logs: true
+  proxy_batch_write_at: 60
+  trusted_proxy_ranges:
+    - 172.30.0.0/24
+
+litellm_settings:
+  set_verbose: false
+  json_logs: true
