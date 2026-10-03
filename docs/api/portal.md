@@ -36,6 +36,9 @@
 | 项目 | `GET /api/projects/:id` | 项目详情（含端口） |
 | 项目 | `PATCH /api/projects/:id` | 改名等 |
 | 项目 | `DELETE /api/projects/:id` | 删除项目（回收端口） |
+| 管理 | `GET /api/admin/fdes/:fdeName/git-credential` | 查询 Git 凭据主机、用户名与掩码 |
+| 管理 | `PUT /api/admin/fdes/:fdeName/git-credential` | 配置一个 Git 主机凭据 |
+| 管理 | `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>` | 删除一个 Git 主机凭据 |
 | 会话 | `GET /api/sessions` | 会话列表 |
 | 会话 | `POST /api/sessions` | 创建会话 |
 | 会话 | `GET /api/sessions/:id` | 会话详情（含消息历史 + `last_seq`） |
@@ -472,7 +475,7 @@ station-portal user enable  --login <login>
 | 字段 | 说明 |
 |---|---|
 | `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`（同 schema.sql CHECK，不允许尾随 `-`） |
-| `repo_url` | 可选仓库地址，**仅作记录/展示元数据**；不填时为 `null`。平台不 clone、不物化该目录、不下发 git 凭据；clone 与 git 凭据由 FDE 在容器内自行配置（规格 §7.2/§12.2，决策者 2026-09，issue #3 评论） |
+| `repo_url` | 可选仓库地址，**仅作记录/展示元数据**；不填时为 `null`。平台不 clone、不物化该目录；Git 凭据可由 FDE 自行配置，或由 admin 通过凭据端点投放（规格 §7.2/§12.2，user-space.md §4.1.1） |
 | `slot` | 项目端口块序号（决定 `4000 + slot*8` 起始端口，规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
 
@@ -521,7 +524,7 @@ station-portal user enable  --login <login>
 | 409 | `name_conflict` | 同名项目已存在 |
 | 409 | `port_quota_exceeded` | 用户端口总配额超限（规格 §8.2：**明确报错**而非静默漂移） |
 
-> **边界（决策者 2026-09，issue #3 评论；issue #52 方案 A）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 是可选登记元数据。**平台不负责 clone，也不下发 git 凭据**——提供地址时仓库目录由 FDE 在容器内自行 `git clone` 并配置凭据；不提供地址时项目就是 `~/projects/<name>` 下的空工作目录，FDE 不需要知道仓库概念（等同他自己的开发机，规格 §7.2/§12.2）。
+> **边界（issue #52 方案 A）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 是可选登记元数据。**平台不负责 clone**——提供地址时仓库目录由 FDE 在容器内自行 `git clone`；git 凭据可由 FDE 配置或由 admin 凭据端点投放（user-space.md §4.1.1）。不提供地址时项目就是 `~/projects/<name>` 下的空工作目录，FDE 不需要知道仓库概念（等同他自己的开发机，规格 §7.2/§12.2）。
 
 ### 3.4 `GET /api/projects/:id`
 
@@ -1636,3 +1639,35 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 | 5xx（含 503）/ 网络错误 | — | portal/DB 抖动 | **无限指数退避重试**（1s→2s→5s→10s→30s 封顶，抖动 ±20%）；事件缓冲走背压与 spool（runner §7.4） |
 
 > ✅ 已统一：internal 通道的 `validation_failed` **与公开端点一致为 `400`**（原 422 已作废）；runner §4.5 也已同步为 400。
+
+## 10. Admin Git credential endpoints
+
+All three routes require the existing `requireAdmin` authorization (`401` without a session, `403` for a non-admin). `fdeName` uses the project FDE-name grammar; `host` must be a DNS hostname. Invalid fields return `400 validation_failed`.
+
+### `PUT /api/admin/fdes/:fdeName/git-credential`
+
+Request:
+
+```json
+{ "host": "github.com", "username": "x-access-token", "token": "<secret>" }
+```
+
+`host`, `username`, and non-empty `token` are required. The token is URL-encoded and written through to `<userSpaceRoot>/<fdeName>/home/.git-credentials`; it is not stored in the database or passed in container environment variables. The file is atomically replaced with mode `0640` and the configured FDE UID/GID. The audit entry records the FDE and host only.
+
+Response `200` (the token is never returned):
+
+```json
+{ "host": "github.com", "username": "x-access-token", "configured": true }
+```
+
+### `GET /api/admin/fdes/:fdeName/git-credential`
+
+Response `200`:
+
+```json
+{ "hosts": [{ "host": "github.com", "username": "x-access-token", "token": "****last4" }] }
+```
+
+### `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>`
+
+Removes all stored credential lines for the exact host, leaving other hosts intact; the credential file remains present even when empty. Response `200` is `{ "host": "github.com", "deleted": true }`. Audit details contain the host and deletion result, never token text.

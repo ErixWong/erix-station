@@ -54,7 +54,7 @@ RUN npm install -g playwright@1.63.0 \
 # sharedRepository=group：git 原生机制，init/clone 自动把 .git 调成 2775 组写——免约定，
 #   对任意入口（docker exec shell umask 022 / agent bash）都生效；agentd(1001) 才能 worktree add。
 # 配合 agentd/worker 的 umask 0002（user-space §6.2）：agentd checkout 的 worktree 文件 664，worker(1002) 可写。
-RUN printf '[safe]\n\tdirectory = *\n\n[core]\n\tsharedRepository = group\n' > /etc/gitconfig
+RUN printf '[safe]\n\tdirectory = *\n\n[core]\n\tsharedRepository = group\n\n[credential]\n\thelper = store\n' > /etc/gitconfig
 
 WORKDIR /opt/erix
 
