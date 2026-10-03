@@ -209,10 +209,13 @@ export async function createModel(gateway, input = {}) {
   if (typeof modelName !== 'string' || !modelName.trim()) {
     throw new LlmError('validation_failed', 'model_id 为必填字段', { details: { field: 'model_id' } });
   }
-  const params = input.litellm_params ?? {
-    model: input.model ?? input.model_id,
-    litellm_credential_name: input.provider_id,
-  };
+  const upstreamModel = input.model ?? input.litellm_params?.model;
+  if (typeof upstreamModel !== 'string' || !upstreamModel.trim()) {
+    throw new LlmError('validation_failed', 'model 为必填字段', { details: { field: 'model' } });
+  }
+  const params = input.litellm_params == null
+    ? { model: upstreamModel.trim(), litellm_credential_name: input.provider_id }
+    : { ...input.litellm_params, model: upstreamModel.trim() };
   const suppliedInfo = input.model_info ?? {};
   const metadata = {
     ...(suppliedInfo.metadata ?? {}),
@@ -228,7 +231,47 @@ export async function createModel(gateway, input = {}) {
     ...(input.context_window === undefined ? {} : { context_window: input.context_window }),
     ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
   };
-  return client.createModel({ model_name: modelName.trim(), litellm_params: params, model_info });
+  const normalizedModelName = modelName.trim();
+  const existingIds = new Set(
+    gatewayModels(await client.listModels())
+      .map(modelId)
+      .filter((id) => id != null)
+      .map(String),
+  );
+  try {
+    return await client.createModel({
+      model_name: normalizedModelName,
+      litellm_params: params,
+      model_info,
+    });
+  } catch (createError) {
+    try {
+      const modelsAfterFailure = gatewayModels(await client.listModels());
+      const newlyAddedModels = modelsAfterFailure.filter((model) => {
+        const id = modelId(model);
+        return model?.model_name === normalizedModelName
+          && id != null
+          && !existingIds.has(String(id));
+      });
+      for (const model of newlyAddedModels) {
+        const id = modelId(model);
+        try {
+          await client.deleteModel(id);
+        } catch (rollbackError) {
+          console.error('[llm] LiteLLM model create rollback failed', {
+            model_id: id,
+            status: rollbackError?.status ?? null,
+          });
+        }
+      }
+    } catch (rollbackError) {
+      console.error('[llm] LiteLLM model create rollback failed', {
+        stage: 'list_models',
+        status: rollbackError?.status ?? null,
+      });
+    }
+    throw createError;
+  }
 }
 
 async function findGatewayModel(client, id) {
@@ -238,8 +281,15 @@ async function findGatewayModel(client, id) {
   return found;
 }
 
-export async function updateModel(gateway, id, { name, enabled, tool_calling, context_window } = {}) {
+export async function updateModel(gateway, id, { name, enabled, tool_calling, context_window, model } = {}) {
   const client = getGatewayClient(gateway);
+  let upstreamModel;
+  if (model !== undefined) {
+    if (typeof model !== 'string') {
+      throw new LlmError('validation_failed', 'model 必须为字符串', { details: { field: 'model' } });
+    }
+    upstreamModel = model.trim() || undefined;
+  }
   const current = await findGatewayModel(client, id);
   const currentEnabled = !isModelBlocked(current);
   if (enabled !== undefined && typeof enabled !== 'boolean') {
@@ -249,21 +299,28 @@ export async function updateModel(gateway, id, { name, enabled, tool_calling, co
     if (enabled) await client.unblockModel(id);
     else await client.blockModel(id);
   }
-  if (name !== undefined || tool_calling !== undefined || context_window !== undefined) {
+  if (
+    name !== undefined
+    || tool_calling !== undefined
+    || context_window !== undefined
+    || upstreamModel !== undefined
+  ) {
     const info = current.model_info ?? {};
     const metadata = { ...(info.metadata ?? {}) };
     if (tool_calling !== undefined) metadata.tool_calling = tool_calling === true;
     if (context_window !== undefined) metadata.context_window = context_window;
-    await client.updateModel({
-      model_id: id,
-      model_info: {
+    const update = { model_id: id };
+    if (name !== undefined || tool_calling !== undefined || context_window !== undefined) {
+      update.model_info = {
         ...info,
         ...(name === undefined ? {} : { display_name: name }),
         ...(tool_calling === undefined ? {} : { tool_calling: tool_calling === true }),
         ...(context_window === undefined ? {} : { context_window }),
         metadata,
-      },
-    });
+      };
+    }
+    if (upstreamModel !== undefined) update.litellm_params = { model: upstreamModel };
+    await client.updateModel(update);
   }
   return toModel(await findGatewayModel(client, id));
 }

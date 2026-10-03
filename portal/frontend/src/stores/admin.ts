@@ -21,6 +21,7 @@ export interface LlmModel {
   tool_calling: boolean;
   context_window: number | null;
   enabled: boolean;
+  litellm_params?: { model?: string };
 }
 
 export interface LlmProvider {
@@ -292,7 +293,7 @@ export const useAdminStore = defineStore('admin', {
     /** 旧供应商下新增模型表单：POST /api/admin/llm/providers/<id>/models。 */
     async addModel(
       providerId: string,
-      fields: { model_id: string; name: string; type: string; tool_calling: boolean; context_window: number | null },
+      fields: { model_id: string; model: string; name: string; type: string; tool_calling: boolean; context_window: number | null },
     ): Promise<string | null> {
       this.llmErr = null;
       try {
@@ -313,7 +314,7 @@ export const useAdminStore = defineStore('admin', {
     /** 编辑模型可变字段：PATCH /api/admin/llm/models/<id>。 */
     async updateModel(
       m: LlmModel,
-      fields: { name: string; tool_calling: boolean; context_window?: number },
+      fields: { name: string; tool_calling: boolean; context_window?: number; model?: string },
     ): Promise<string | null> {
       this.llmErr = null;
       try {
