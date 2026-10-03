@@ -71,6 +71,10 @@ function defaultStaticDir() {
 export function loadConfig(env = process.env) {
   const sessionTtlSeconds = intEnv(env, 'SESSION_TTL_SECONDS', DEFAULT_SESSION_TTL_SECONDS);
   const cookieProfile = env.COOKIE_PROFILE || 'prod';
+  const llmGatewayMode = env.LLM_GATEWAY_MODE || 'self';
+  if (llmGatewayMode !== 'self' && llmGatewayMode !== 'external') {
+    throw new Error('LLM_GATEWAY_MODE 必须为 self 或 external');
+  }
   // 生产判定：FDE_DEV_MODE=1 显式开发（即使镜像内 NODE_ENV=production 也按开发）；
   // FDE_DEV_MODE=0 显式生产；未设时按 NODE_ENV=production 判生产，否则开发。
   const fdeDevMode =
@@ -220,6 +224,9 @@ export function loadConfig(env = process.env) {
     // LLM 网关数据面回环地址。issue #38 Phase B1 起 LLM 路由直连 llm_providers.base_url
     // （不再经 llm-hub），本键暂保留兼容（外部脚本/文档引用），routes.js 已不再消费。
     llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4000',
+    llmGatewayMode,
+    llmGatewayAdminUrl: env.LLM_GATEWAY_ADMIN_URL || 'http://station-litellm:4000',
+    llmGatewayMasterKey: env.LLM_GATEWAY_MASTER_KEY || '',
     // 端口配额 / 默认池 / 保留网段（IPAM；fde-platform §8.2 / topology §3）。
     portQuota: intEnv(env, 'PORT_QUOTA', 40),
     fdePool: env.FDE_POOL || 'default',

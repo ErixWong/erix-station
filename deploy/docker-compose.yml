@@ -2,7 +2,7 @@
 # erix-station 本地开发栈（P1 walking skeleton）
 # 依据：docs/design/deploy-contract.md §2 + docs/env.md §0（开发期参数）
 # 服务：station-db / station-docker-proxy / station-portal / station-edge
-#   （FDE 容器、LLM 网关、materializer、路由 reconciler 归后续轮次）
+#   station-mock-llm 持续用于本地验收；station-litellm 仅通过 litellm profile opt-in。
 # ============================================================================
 name: station
 
@@ -183,8 +183,12 @@ services:
       PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}
-      # LLM 网关数据面回环地址（P1 mock/占位，真实网关 P3 接入；topology §4-L7）。
+      # LLM 网关数据面兼容地址；当前 mock 占 4000，LiteLLM phase 1 暂用 4100。
       LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4000}
+      # issue #117：预留 gateway admin 配置供后续阶段使用；当前 portal 不调用这些配置。
+      LLM_GATEWAY_MODE: ${LLM_GATEWAY_MODE:-self}
+      LLM_GATEWAY_ADMIN_URL: ${LLM_GATEWAY_ADMIN_URL:-http://station-litellm:4000}
+      LLM_GATEWAY_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
       PORT_QUOTA: ${PORT_QUOTA:-40}
       FDE_POOL: ${FDE_POOL:-default}
       IPAM_RESERVED_SUBNETS: ${IPAM_RESERVED_SUBNETS:-}
@@ -226,8 +230,7 @@ services:
   # P1 mock LLM 网关（dev-only，零真实凭据，deploy-contract §7.3）：OpenAI-compatible
   # /v1/chat/completions（流式/非流式）。数据面 publish 仅宿主回环 127.0.0.1:4000，供 Traefik
   # `llm.<base>` 路由回环访问（topology §4-L7）。
-  # 2026-09-20 修订（issue #38）：LLM 出口已定 per-FDE 上游直发（fde_llm_bindings → 注入真实上游 key），
-  # 不建 LiteLLM hub；P3 如需接真实上游，只需把 admin API 里 provider 的 base_url 指到真实端点。
+  # issue #117 phase 1 保留 mock，不切换 portal 数据面；LiteLLM 另以 litellm profile 暂用 4100。
   station-mock-llm:
     container_name: "${STATION_MOCK_LLM_NAME:-station-mock-llm}"
     build:
@@ -261,6 +264,54 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+
+  # Issue #117 phase 1: opt-in LiteLLM infrastructure; keep the dev mock on 4000.
+  station-litellm:
+    container_name: "${STATION_LITELLM_NAME:-station-litellm}"
+    image: ghcr.io/berriai/litellm:v1.103.2@sha256:f63fb81b831b170ec16851e23c36ac5bf52ef106b271406429524a2ed730bbfd
+    profiles:
+      - litellm
+    restart: unless-stopped
+    networks:
+      - backend
+    depends_on:
+      station-db:
+        condition: service_healthy
+    user: "65532:65532"
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:mode=1777,uid=65532,gid=65532
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    environment:
+      HOME: /home/nonroot
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+      DATABASE_URL: postgresql://${LITELLM_DB_USER:-litellm}:${LITELLM_DB_PASSWORD:-}@station-db:5432/litellm
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-}
+      LITELLM_MODE: PRODUCTION
+      LITELLM_NON_ROOT: "true"
+    command:
+      - --config
+      - /app/config.yaml
+      - --port
+      - "4000"
+    ports:
+      # Transitional data-plane port: once portal switches, the mock vacates 4000
+      # and LiteLLM moves back to 127.0.0.1:4000.
+      - "127.0.0.1:4100:4000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/readiness', timeout=5)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
 
   station-edge:
     container_name: "${STATION_EDGE_NAME:-station-edge}"
