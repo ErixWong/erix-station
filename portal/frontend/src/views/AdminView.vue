@@ -17,12 +17,13 @@ const providerForm = reactive({ name: '', base_url: '', api_key: '' });
 const providerEditForm = reactive({ base_url: '', api_key: '' });
 const modelForm = reactive({
   model_id: '',
+  model: '',
   name: '',
   type: 'text',
   tool_calling: false,
   context_window: '',
 });
-const modelEditForm = reactive({ name: '', tool_calling: false, context_window: '' });
+const modelEditForm = reactive({ model: '', name: '', tool_calling: false, context_window: '' });
 
 type DeleteTarget = { type: 'provider'; provider: LlmProvider } | { type: 'model'; model: LlmModel };
 const deleteTarget = ref<DeleteTarget | null>(null);
@@ -79,6 +80,7 @@ async function onUpdateProvider() {
 
 function openAddModel(providerId: string) {
   modelForm.model_id = '';
+  modelForm.model = '';
   modelForm.name = '';
   modelForm.type = 'text';
   modelForm.tool_calling = false;
@@ -95,6 +97,7 @@ async function onAddModel() {
   if (!providerId) return;
   const err = await admin.addModel(providerId, {
     model_id: modelForm.model_id.trim(),
+    model: modelForm.model.trim(),
     name: modelForm.name.trim(),
     type: modelForm.type,
     tool_calling: modelForm.tool_calling,
@@ -104,6 +107,7 @@ async function onAddModel() {
 }
 
 function openEditModel(model: LlmModel) {
+  modelEditForm.model = model.litellm_params?.model ?? '';
   modelEditForm.name = model.name;
   modelEditForm.tool_calling = model.tool_calling;
   modelEditForm.context_window = model.context_window === null ? '' : String(model.context_window);
@@ -114,6 +118,7 @@ async function onUpdateModel() {
   const model = editingModel.value;
   if (!model) return;
   const err = await admin.updateModel(model, {
+    ...(modelEditForm.model.trim() ? { model: modelEditForm.model.trim() } : {}),
     name: modelEditForm.name.trim(),
     tool_calling: modelEditForm.tool_calling,
     ...(modelEditForm.context_window ? { context_window: Number(modelEditForm.context_window) } : {}),
@@ -336,6 +341,16 @@ onMounted(() => {
         <input v-model="modelForm.model_id" required placeholder="gpt-4o" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.upstreamModelId') }}
+        <input
+          v-model="modelForm.model"
+          data-test="add-model-upstream-id"
+          required
+          placeholder="openai/&lt;model&gt;"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.colName') }}
         <input v-model="modelForm.name" required placeholder="GPT-4o" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
@@ -373,6 +388,16 @@ onMounted(() => {
     <form data-test="edit-model-form" class="grid gap-3 px-3 py-3 sm:grid-cols-2" @submit.prevent="onUpdateModel">
       <p class="text-sm">model_id: {{ editingModel.model_id }}</p>
       <p class="text-sm">{{ t('admin.llm.colType') }}: {{ editingModel.type }}</p>
+      <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
+        {{ t('admin.llm.upstreamModelId') }}
+        <input
+          v-model="modelEditForm.model"
+          data-test="edit-model-upstream-id"
+          placeholder="openai/&lt;model&gt;"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editUpstreamModelHint') }}</span>
+      </label>
       <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
         {{ t('admin.llm.colName') }}
         <input v-model="modelEditForm.name" required class="rounded-md border border-black/20 px-2 py-1 text-sm">
