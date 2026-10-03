@@ -44,6 +44,7 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
   try {
     const userBody = { user_email: 'fde-alice@station.invalid' };
     const keyBody = { models: ['deepseek-flash'], user_id: 'u1', key_alias: 'fde-alice', metadata: { fde_name: 'alice' } };
+    const updateKeyBody = { key: 'sk-existing-test-key', models: ['deepseek-flash'] };
     const modelBody = {
       model_name: 'deepseek-flash',
       litellm_params: { model: 'deepseek/deepseek-chat', litellm_credential_name: 'deepseek' },
@@ -57,6 +58,7 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
 
     await client.createUser(userBody);
     await client.generateKey(keyBody);
+    await client.updateKey(updateKeyBody);
     await client.deleteKey({ keys: ['sk-delete-test'] });
     await client.blockKey({ key: 'sk-block-test' });
     await client.unblockKey({ key: 'sk-unblock-test' });
@@ -75,6 +77,7 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
     assert.deepEqual(calls.map(({ method, path }) => [method, path]), [
       ['POST', '/user/new'],
       ['POST', '/key/generate'],
+      ['POST', '/key/update'],
       ['POST', '/key/delete'],
       ['POST', '/key/block'],
       ['POST', '/key/unblock'],
@@ -92,17 +95,43 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
     ]);
     assert.deepEqual(calls[0].body, userBody);
     assert.deepEqual(calls[1].body, keyBody);
-    assert.deepEqual(calls[7].body, modelBody);
-    assert.deepEqual(calls[8].body, { model_id: 'model-id-1', model_info: { display_name: 'Renamed' } });
-    assert.deepEqual(calls[9].body, { id: 'model-id-2' });
-    assert.deepEqual(calls[10].body, { model_id: 'model-id-3' });
-    assert.deepEqual(calls[11].body, { model_id: 'model-id-4' });
-    assert.deepEqual(calls[13].body, credentialBody);
-    assert.deepEqual(calls[14].body, { credential_values: { api_base: 'https://new.example.test' } });
+    assert.deepEqual(calls[2].body, updateKeyBody);
+    assert.deepEqual(calls[8].body, modelBody);
+    assert.deepEqual(calls[9].body, { model_id: 'model-id-1', model_info: { display_name: 'Renamed' } });
+    assert.deepEqual(calls[10].body, { id: 'model-id-2' });
+    assert.deepEqual(calls[11].body, { model_id: 'model-id-3' });
+    assert.deepEqual(calls[12].body, { model_id: 'model-id-4' });
+    assert.deepEqual(calls[14].body, credentialBody);
+    assert.deepEqual(calls[15].body, { credential_values: { api_base: 'https://new.example.test' } });
     assert.ok(calls.every((call) => call.authorization === 'Bearer master-secret-test'));
     assert.equal(
       calls.find((call) => call.method === 'POST' && call.path === '/credentials').raw.includes('provider-secret-test'),
       true,
+    );
+  } finally {
+    await stub.close();
+  }
+});
+
+test('LiteLLM key-update errors preserve status and redact the supplied virtual key', async () => {
+  const virtualKey = 'sk-virtual-update-secret';
+  const stub = await startStub(async (req, res) => {
+    const { body } = await readRequest(req);
+    assert.equal(req.method, 'POST');
+    assert.equal(req.url, '/key/update');
+    assert.deepEqual(body, { key: virtualKey, models: ['deepseek-flash'] });
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ detail: `Virtual key ${virtualKey} not found` }));
+  });
+  const client = createLlmGatewayClient({ adminUrl: stub.url, masterKey: 'master-secret-key-update' });
+  try {
+    await assert.rejects(
+      () => client.updateKey({ key: virtualKey, models: ['deepseek-flash'] }),
+      (err) => err instanceof LlmGatewayError
+        && err.status === 404
+        && !err.message.includes(virtualKey)
+        && !err.upstreamMessage.includes(virtualKey)
+        && err.message.includes('[redacted]'),
     );
   } finally {
     await stub.close();

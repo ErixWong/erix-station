@@ -25,7 +25,7 @@ export function maskKey(key) {
 
 function getGatewayClient(candidate) {
   if (candidate && typeof candidate === 'object' && [
-    'listModels', 'generateKey', 'deleteKey', 'listCredentials', 'createCredential',
+    'listModels', 'generateKey', 'updateKey', 'deleteKey', 'listCredentials', 'createCredential',
   ].some((method) => typeof candidate[method] === 'function')) {
     return candidate;
   }
@@ -392,14 +392,24 @@ async function ensureGatewayUser(client, { fdeName, userId }) {
   return gatewayUserId;
 }
 
-async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedModels }) {
-  const userId = gatewayUserId || await ensureGatewayUser(client, { fdeName, userId: fdeId });
-  const modelNames = [selectedModels.main, selectedModels.embedding, selectedModels.vision]
+function selectedModelNames(selectedModels) {
+  return [...new Set([selectedModels.main, selectedModels.embedding, selectedModels.vision]
     .filter(Boolean)
     .map((model) => model.model_name)
-    .filter((name) => typeof name === 'string' && name.length > 0);
+    .filter((name) => typeof name === 'string' && name.length > 0))];
+}
+
+function isMissingGatewayKeyError(error) {
+  const message = [error?.upstreamMessage, error?.message, error?.code]
+    .filter((value) => typeof value === 'string')
+    .join(' ');
+  return /(?:\b(?:virtual\s+)?key\b|\btoken\b).{0,80}\b(?:not found|does not exist|doesn't exist|not exist|unknown|missing|not present|could not be found|cannot be found)\b|\b(?:not found|does not exist|doesn't exist|not exist|unknown|missing|not present|could not be found|cannot be found).{0,80}\b(?:key|token)\b|\bno (?:such )?(?:virtual )?key\b/i.test(message);
+}
+
+async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedModels }) {
+  const userId = gatewayUserId || await ensureGatewayUser(client, { fdeName, userId: fdeId });
   const result = await client.generateKey({
-    models: [...new Set(modelNames)],
+    models: selectedModelNames(selectedModels),
     user_id: userId,
     key_alias: `fde-${fdeName}`,
     metadata: { fde_id: fdeId, fde_name: fdeName },
@@ -416,8 +426,8 @@ async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedM
 }
 
 /**
- * Save a binding and mint its model-restricted virtual key. `api_key` is no longer
- * an upstream credential; upstream secrets belong to LiteLLM credentials.
+ * Save a binding and reconcile its model-restricted virtual key. `api_key` is no
+ * longer an upstream credential; upstream secrets belong to LiteLLM credentials.
  */
 export async function setFdeLlmConfig(pool, {
   actorId = null, fdeName, provider_id, api_key, main_model_id, embedding_model_id = null, vision_model_id = null,
@@ -443,6 +453,8 @@ export async function setFdeLlmConfig(pool, {
   let oldKey = null;
   let oldWasGatewayKey = false;
   let generated = null;
+  let updatedExistingKey = false;
+  let oldKeyMissing = false;
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
@@ -478,7 +490,7 @@ export async function setFdeLlmConfig(pool, {
       );
       if (activeRun.rows.length > 0) {
         throw new LlmError('active_run_conflict',
-          '该 FDE 有进行中的 run：更改模型白名单会轮换 LiteLLM key。确认无影响请带 force=true 重试。',
+          '该 FDE 有进行中的 run：更改模型白名单会在 run 执行中途生效，影响后续请求。确认无影响请带 force=true 重试。',
           { httpStatus: 409 });
       }
     }
@@ -498,14 +510,36 @@ export async function setFdeLlmConfig(pool, {
       };
     }
 
-    generated = await generateFdeKey(gatewayClient, {
-      fdeId: userId,
-      fdeName,
-      gatewayUserId: current?.gateway_user_id ?? null,
-      selectedModels: selected,
-    });
     oldKey = current?.api_key ?? null;
     oldWasGatewayKey = current?.gateway === 'litellm' && oldKey !== null;
+    if (current?.state === 'active' && current.gateway === 'litellm'
+      && typeof current.api_key === 'string' && current.api_key.length > 0) {
+      try {
+        await gatewayClient.updateKey({
+          key: current.api_key,
+          models: selectedModelNames(selected),
+        });
+        generated = {
+          gatewayUserId: current.gateway_user_id ?? null,
+          apiKey: current.api_key,
+          keyId: current.key_id ?? null,
+          keyAlias: current.key_alias,
+        };
+        updatedExistingKey = true;
+      } catch (err) {
+        if (!isMissingGatewayKeyError(err)) throw err;
+        oldKeyMissing = true;
+        oldKey = null;
+      }
+    }
+    if (!updatedExistingKey) {
+      generated = await generateFdeKey(gatewayClient, {
+        fdeId: userId,
+        fdeName,
+        gatewayUserId: current?.gateway_user_id ?? null,
+        selectedModels: selected,
+      });
+    }
     if (current) {
       await client.query(
         `UPDATE fde_llm_bindings
@@ -521,7 +555,8 @@ export async function setFdeLlmConfig(pool, {
         [userId, provider_id, generated.apiKey, generated.keyId, generated.keyAlias, generated.gatewayUserId,
           modelId(selected.main), selected.main.model_name,
           selected.embedding ? modelId(selected.embedding) : null, selected.embedding?.model_name ?? null,
-          selected.vision ? modelId(selected.vision) : null, selected.vision?.model_name ?? null, oldWasGatewayKey],
+          selected.vision ? modelId(selected.vision) : null, selected.vision?.model_name ?? null,
+          oldWasGatewayKey && !updatedExistingKey],
       );
     } else {
       await client.query(
@@ -558,13 +593,14 @@ export async function setFdeLlmConfig(pool, {
         main_model: selected.main.model_name,
         embedding_model: selected.embedding?.model_name ?? null,
         vision_model: selected.vision?.model_name ?? null,
-        virtual_key_rotated: true,
+        virtual_key_action: updatedExistingKey ? 'allowlist_updated' : (oldWasGatewayKey ? 'rotated' : 'created'),
+        virtual_key_rotated: oldWasGatewayKey && !updatedExistingKey,
       })],
     );
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    if (generated?.apiKey) {
+    if (generated?.apiKey && !updatedExistingKey) {
       try {
         await gatewayClient.deleteKey({ keys: [generated.apiKey] });
       } catch {
@@ -576,7 +612,7 @@ export async function setFdeLlmConfig(pool, {
     client.release();
   }
 
-  if (oldWasGatewayKey && oldKey && oldKey !== generated.apiKey) {
+  if (oldWasGatewayKey && oldKey && !oldKeyMissing && oldKey !== generated.apiKey) {
     await gatewayClient.deleteKey({ keys: [oldKey] });
   }
   return {

@@ -131,6 +131,7 @@ export function createLlmGatewayClient({
   return Object.freeze({
     createUser: (body) => post('/user/new', body),
     generateKey: (body) => post('/key/generate', body),
+    updateKey: (body) => post('/key/update', body),
     deleteKey: (body) => post('/key/delete', body),
     blockKey: (body) => post('/key/block', body),
     unblockKey: (body) => post('/key/unblock', body),
