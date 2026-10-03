@@ -13,8 +13,8 @@ const selectedProviderId = ref<string | null>(null);
 const editingModel = ref<LlmModel | null>(null);
 const deleting = ref(false);
 
-const providerForm = reactive({ name: '', base_url: '' });
-const providerEditForm = reactive({ base_url: '' });
+const providerForm = reactive({ name: '', base_url: '', api_key: '' });
+const providerEditForm = reactive({ base_url: '', api_key: '' });
 const modelForm = reactive({
   model_id: '',
   name: '',
@@ -37,6 +37,13 @@ const deleteMessage = computed(() => {
 function clearProviderForm() {
   providerForm.name = '';
   providerForm.base_url = '';
+  providerForm.api_key = '';
+}
+
+function closeEditProvider() {
+  editingProvider.value = null;
+  providerEditForm.base_url = '';
+  providerEditForm.api_key = '';
 }
 
 function closeAddProvider() {
@@ -45,20 +52,29 @@ function closeAddProvider() {
 }
 
 async function onAddProvider() {
-  const err = await admin.addProvider(providerForm.name.trim(), providerForm.base_url.trim());
+  const err = await admin.addProvider(
+    providerForm.name.trim(),
+    providerForm.base_url.trim(),
+    providerForm.api_key,
+  );
   if (!err && !admin.llmErr) closeAddProvider();
 }
 
 function openEditProvider(provider: LlmProvider) {
   providerEditForm.base_url = provider.base_url;
+  providerEditForm.api_key = '';
   editingProvider.value = provider;
 }
 
 async function onUpdateProvider() {
   const provider = editingProvider.value;
   if (!provider) return;
-  const err = await admin.updateProvider(provider, providerEditForm.base_url.trim());
-  if (!err) editingProvider.value = null;
+  const err = await admin.updateProvider(
+    provider,
+    providerEditForm.base_url.trim(),
+    providerEditForm.api_key,
+  );
+  if (!err) closeEditProvider();
 }
 
 function openAddModel(providerId: string) {
@@ -142,21 +158,12 @@ onMounted(() => {
           <div class="flex flex-wrap items-center gap-3 px-3 py-2">
             <span class="font-semibold">{{ p.name }}</span>
             <span class="text-black/50 text-xs break-all">{{ p.base_url }}</span>
-            <span
-              class="rounded border px-1.5 py-0.5 text-xs font-medium"
-              :class="p.enabled ? 'border-green-600 bg-green-50 text-green-700' : 'border-black/30 bg-black/5 text-black/50'"
-            >{{ p.enabled ? t('admin.enabled') : t('admin.disabled') }}</span>
             <span class="flex-1"></span>
             <button
               type="button"
               class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
               @click="admin.toggleExpandedProvider(String(p.id))"
             >{{ admin.expandedProviders.includes(String(p.id)) ? t('admin.llm.collapseModels') : t('admin.llm.modelsCount', { count: p.models.length }) }}</button>
-            <button
-              type="button"
-              class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
-              @click="admin.toggleProvider(p)"
-            >{{ p.enabled ? t('admin.disabled') : t('admin.enabled') }}</button>
             <button
               type="button"
               data-test="edit-provider"
@@ -260,6 +267,17 @@ onMounted(() => {
         Base URL
         <input v-model="providerForm.base_url" required placeholder="https://api.openai.com/v1" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.providerApiKeyLabel') }}
+        <input
+          v-model="providerForm.api_key"
+          data-test="add-provider-api-key"
+          type="password"
+          autocomplete="new-password"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.providerApiKeyAddHint') }}</span>
+      </label>
       <p v-if="admin.llmErr" class="syserr" role="alert">{{ admin.llmErr }}</p>
       <div class="flex gap-2">
         <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.addProvider') }}</button>
@@ -271,11 +289,11 @@ onMounted(() => {
   <ModalShell
     v-if="editingProvider"
     :label="t('admin.llm.editProviderTitle', { name: editingProvider.name })"
-    @close="editingProvider = null"
+    @close="closeEditProvider"
   >
     <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
       <h2 class="text-sm font-medium">{{ t('admin.llm.editProviderTitle', { name: editingProvider.name }) }}</h2>
-      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="editingProvider = null">✕</button>
+      <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="closeEditProvider">✕</button>
     </div>
     <form data-test="edit-provider-form" class="grid gap-3 px-3 py-3" @submit.prevent="onUpdateProvider">
       <p class="text-sm">{{ editingProvider.name }}</p>
@@ -283,10 +301,21 @@ onMounted(() => {
         Base URL
         <input v-model="providerEditForm.base_url" required class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.providerApiKeyLabel') }}
+        <input
+          v-model="providerEditForm.api_key"
+          data-test="edit-provider-api-key"
+          type="password"
+          autocomplete="new-password"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.providerApiKeyEditHint') }}</span>
+      </label>
       <p v-if="admin.llmErr" class="syserr" role="alert">{{ admin.llmErr }}</p>
       <div class="flex gap-2">
         <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.save') }}</button>
-        <button type="button" class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="editingProvider = null">{{ t('common.cancel') }}</button>
+        <button type="button" class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="closeEditProvider">{{ t('common.cancel') }}</button>
       </div>
     </form>
   </ModalShell>

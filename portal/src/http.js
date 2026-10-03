@@ -17,6 +17,7 @@ import * as preview from './preview.js';
 import * as internal from './internal.js';
 import * as artifacts from './artifacts.js';
 import * as llm from './llm.js';
+import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
 import * as admin from './admin.js';
 import * as dirs from './dirs.js';
 import * as gitCredential from './git-credential.js';
@@ -198,7 +199,7 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
   }
 }
 
-export function createServer({ pool, config, log = console, docker = null }) {
+export function createServer({ pool, config, log = console, docker = null, llmGateway = null }) {
   const loginLimiter = createRateLimiter(config.loginRateLimit);
   // TOTP 失败限流按「账户 + IP」计数（防换新 pending_token 绕过）；单 token 尝试上限单独计。
   const totpLimiter = createRateLimiter({
@@ -224,7 +225,13 @@ export function createServer({ pool, config, log = console, docker = null }) {
     blockMs: 60 * 1000,
     maxEntries: 10000,
   });
-  const ctx = { pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter, docker };
+  const ctx = {
+    pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter, docker,
+    llmGateway: llmGateway ?? createLlmGatewayClient({
+      adminUrl: config.llmGatewayAdminUrl ?? 'http://station-litellm:4000',
+      masterKey: config.llmGatewayMasterKey ?? '',
+    }),
+  };
   // issue #38 Phase B2 admin UI：portal serve 进程本就有 config.dockerHost（cli.js serve 的
   // startProvisionerLoop 也用它自建 client——调查结论见 Phase B2 报告），故 provision 端点**可实现**：
   // 按需懒建并缓存 docker client（不持有连接，仅 HTTP 工厂）。测试可经 createServer({ docker }) 注入。
@@ -267,6 +274,10 @@ export function createServer({ pool, config, log = console, docker = null }) {
       }
       if (err instanceof llm.LlmError) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof LlmGatewayError) {
+        sendJson(res, err.status, errorBody('llm_gateway_error', err.message));
         return;
       }
       if (err instanceof gitCredential.GitCredentialError) {
@@ -531,35 +542,29 @@ async function handleAdminApi(req, res, ctx, url) {
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
-  // 供应商 CRUD
+  // LiteLLM credential proxy (a supplier maps 1:1 to a credential).
   if (pathname === '/api/admin/llm/providers') {
     if (req.method === 'GET') {
-      return sendJson(res, 200, await llm.listProviders(ctx.pool));
+      return sendJson(res, 200, await llm.listProviders(ctx.llmGateway));
     }
     if (req.method === 'POST') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      const provider = await llm.createProvider(ctx.pool, { name: body?.name, base_url: body?.base_url });
+      const provider = await llm.createProvider(ctx.llmGateway, body);
       return sendJson(res, 201, { provider });
     }
   }
   const adminProviderMatch = pathname.match(/^\/api\/admin\/llm\/providers\/([^/]+)$/);
   if (adminProviderMatch) {
-    const providerId = decodeUuid(adminProviderMatch[1]);
+    const providerId = decodeURIComponent(adminProviderMatch[1]);
     if (req.method === 'PATCH') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      // N2（Round C 评审）：base_url/enabled 变更撞活跃 run 由 updateProvider 在**同一事务内**守卫
-      // （409 active_run_conflict，不写变更/不写 outbox）；force=true 透传放行。
-      const provider = await llm.updateProvider(ctx.pool, providerId, {
-        base_url: body?.base_url,
-        enabled: body?.enabled,
-        force: body?.force === true,
-      });
+      const provider = await llm.updateProvider(ctx.llmGateway, providerId, body);
       return sendJson(res, 200, { provider });
     }
     if (req.method === 'DELETE') {
-      await llm.deleteProvider(ctx.pool, providerId);
+      await llm.deleteProvider(ctx.llmGateway, providerId);
       res.writeHead(204);
       res.end();
       return;
@@ -569,38 +574,40 @@ async function handleAdminApi(req, res, ctx, url) {
   if (adminProviderModelsMatch && req.method === 'POST') {
     requireJson(req);
     const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-    const model = await llm.createModel(ctx.pool, {
-      provider_id: decodeUuid(adminProviderModelsMatch[1]),
-      model_id: body?.model_id,
-      name: body?.name,
-      type: body?.type,
-      tool_calling: body?.tool_calling,
-      context_window: body?.context_window,
+    const model = await llm.createModel(ctx.llmGateway, {
+      ...body,
+      provider_id: decodeURIComponent(adminProviderModelsMatch[1]),
     });
     return sendJson(res, 201, { model });
   }
 
-  // 模型 CRUD
+  if (pathname === '/api/admin/llm/models' && req.method === 'GET') {
+    return sendJson(res, 200, await llm.listModels(ctx.llmGateway));
+  }
+
+  // LiteLLM model proxy. A provider's enabled flag has no meaning; model enabled maps to block/unblock.
   const adminModelMatch = pathname.match(/^\/api\/admin\/llm\/models\/([^/]+)$/);
   if (adminModelMatch) {
-    const modelId = decodeUuid(adminModelMatch[1]);
+    const modelId = decodeURIComponent(adminModelMatch[1]);
     if (req.method === 'PATCH') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      const model = await llm.updateModel(ctx.pool, modelId, {
-        name: body?.name,
-        enabled: body?.enabled,
-        tool_calling: body?.tool_calling,
-        context_window: body?.context_window,
-      });
+      const model = await llm.updateModel(ctx.llmGateway, modelId, body);
       return sendJson(res, 200, { model });
     }
     if (req.method === 'DELETE') {
-      await llm.deleteModel(ctx.pool, modelId);
+      await llm.deleteModel(ctx.llmGateway, modelId);
       res.writeHead(204);
       res.end();
       return;
     }
+  }
+  const adminModelBlockMatch = pathname.match(/^\/api\/admin\/llm\/models\/([^/]+)\/(block|unblock)$/);
+  if (adminModelBlockMatch && req.method === 'POST') {
+    const modelId = decodeURIComponent(adminModelBlockMatch[1]);
+    if (adminModelBlockMatch[2] === 'block') await ctx.llmGateway.blockModel(modelId);
+    else await ctx.llmGateway.unblockModel(modelId);
+    return sendJson(res, 200, { model_id: modelId, enabled: adminModelBlockMatch[2] === 'unblock' });
   }
 
   // admin 用户管理（issue #38 Phase B2 admin UI）
@@ -650,7 +657,7 @@ async function handleAdminApi(req, res, ctx, url) {
     });
   }
 
-  // per-FDE LLM 配置（回显只给掩码；api_key 缺省 = 保留旧值）
+  // per-FDE LLM 配置（虚拟 key 由服务端铸造；响应只回显掩码，不接受上游 api_key）
   const adminFdeLlmMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/llm$/);
   if (adminFdeLlmMatch) {
     const fdeName = decodeURIComponent(adminFdeLlmMatch[1]);
@@ -659,8 +666,8 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (req.method === 'GET') {
       // 无配置 200 + null；api_key 永不出响应（只掩码）。
-      // active_run（口径同 sessions.js ACTIVE_RUN_STATES）：true 时 UI 提示「换供应商/key 将被服务端 409
-      // 拒绝（F6 守卫见 PUT 分支）」；纯模型变更不受影响（run 边界生效）。
+      // active_run（口径同 sessions.js ACTIVE_RUN_STATES）：true 时更改 credential/模型会触发 409
+      // 守卫（除非 force=true），避免活跃 run 的 key 白名单中途轮换。
       const config = await llm.getFdeLlmEcho(ctx.pool, fdeName);
       let activeRun = false;
       if (config) {
@@ -672,33 +679,6 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'PUT') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      // F6（Round B 评审，fail-visible）：运行中换 provider/key 会**静默**改变运行中 run 的上游
-      //（RUN_START 只快照 models，provider/key 由 Traefik 当前路由决定）——撞活跃 run 时服务端拒绝：
-      //   ① provider 事实变化（provider_id 值变化；无旧配置时首次给上游 = 从「无路由」变「有路由」）；
-      //   ② 凭据事实变化（与当前配置值比较：缺省=保留旧值不算变化；显式新 key 或显式 null=清空都算）。
-      // 纯模型变更（main/embedding/vision）不受守卫：模型本就是 run 边界生效（RUN_START 快照），不误伤。
-      // 显式 force=true 放行（管理员知情确认），放行后仍正常写 outbox。
-      if (body?.force !== true) {
-        const u = await ctx.pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
-        const userId = u.rows[0]?.id;
-        if (userId && await admin.fdeHasActiveRun(ctx.pool, userId)) {
-          // N1（Round C 评审）：判定「凭据事实是否真的变化」——与**当前配置值**比较，而不是
-          // 「是否显式传了非空值」。旧口径把显式 api_key:null 当「无变更」放过，而 llm.js 会把它
-          // 写成 api_key=NULL → 运行中静默清空凭据（路由消失，run 的 LLM 调用直接失败）。
-          // current 含明文 key：仅用于内存比较，绝不写进日志/错误（红线 ③）。
-          // 注：这只是事务外预检（快路径）；权威复检在 setFdeLlmConfig 事务内（N3，防并发 PUT）。
-          const current = await llm.getFdeLlmConfig(ctx.pool, userId);
-          const providerChanged = body?.provider_id !== undefined && body.provider_id !== (current?.provider_id ?? null);
-          const keyChanged = body?.api_key !== undefined && (body.api_key ?? null) !== (current?.api_key ?? null);
-          if (providerChanged || keyChanged) {
-            throw new HttpError(409, 'active_run_conflict',
-              '该 FDE 有进行中的 run：更换供应商或 API key 会改变运行中 run 的上游/凭据。'
-              + '确认无影响请带 force=true 重试。');
-          }
-        }
-      }
-      // N3：force 透传——权威复检在 setFdeLlmConfig 事务内（advisory lock 之后、写入之前），
-      // 上方事务外预检只是快路径（提前 409，不进事务）。
       const config = await llm.setFdeLlmConfig(ctx.pool, {
         actorId: session.user.id,
         fdeName,
@@ -708,6 +688,7 @@ async function handleAdminApi(req, res, ctx, url) {
         embedding_model_id: body?.embedding_model_id,
         vision_model_id: body?.vision_model_id,
         force: body?.force === true,
+        gateway: ctx.llmGateway,
       });
       return sendJson(res, 200, { config });
     }
@@ -791,6 +772,7 @@ async function handleAiTitle(req, res, ctx, sessionId) {
   const updated = await sessions.generateAiTitle(ctx.pool, {
     userId: session.user.id,
     sessionId,
+    gatewayUrl: ctx.config.llmGatewayAdminUrl ?? ctx.config.llmGatewayUrl,
     log: ctx.log,
     notify: internal.notifySessionEvents,
   });
@@ -821,8 +803,8 @@ async function handlePostMessage(req, res, ctx, sessionId) {
     ctx.pool,
     { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }), log: ctx.log },
     async (record) => {
-      // issue #41：建 run 前预检该 FDE 是否已绑定可用 LLM 上游（active binding + enabled provider +
-      // 非空 api_key；SQL 口径同 routes.js llmRows / llm.js getFdeLlmHeartbeatModels 的 JOIN 条件）。
+      // issue #117：建 run 前预检该 FDE 是否已绑定可用 LiteLLM 上游（active binding +
+      // 非空 virtual key + main model slot）。
       // 未配置 → 409 llm_not_configured fail-fast：不入队 run（否则 run 永久排队，等一个永远不会
       // 出现的 LLM 出口）。
       // 评审 MEDIUM-1：预检必须放在 fn 内（executeWithIdempotency 之后）——回放优先（findDone 在
@@ -831,8 +813,8 @@ async function handlePostMessage(req, res, ctx, sessionId) {
       const bound = await ctx.pool.query(
         `SELECT 1
            FROM fde_llm_bindings b
-           JOIN llm_providers p ON p.id = b.provider_id AND p.enabled = true
-          WHERE b.fde_id = $1 AND b.state = 'active' AND b.api_key IS NOT NULL AND b.api_key <> ''
+          WHERE b.fde_id = $1 AND b.state = 'active' AND b.gateway = 'litellm'
+            AND b.api_key IS NOT NULL AND b.api_key <> '' AND b.main_model_id IS NOT NULL
           LIMIT 1`,
         [session.user.id],
       );

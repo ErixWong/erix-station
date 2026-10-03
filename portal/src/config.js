@@ -221,9 +221,8 @@ export function loadConfig(env = process.env) {
     // 由 ERIX_STATION_BASE_URL（agentd）与 config.json endpoint（worker provider）使用。
     portalPublicBaseUrl: resolvePublicBaseUrl(env, 'PORTAL_PUBLIC_BASE_URL', env.PORTAL_HOST || `station.${env.BASE_DOMAIN || 'localhost'}`),
     llmPublicBaseUrl: resolvePublicBaseUrl(env, 'LLM_PUBLIC_BASE_URL', env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`),
-    // LLM 网关数据面回环地址。issue #38 Phase B1 起 LLM 路由直连 llm_providers.base_url
-    // （不再经 llm-hub），本键暂保留兼容（外部脚本/文档引用），routes.js 已不再消费。
-    llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4000',
+    // Traefik 在 host 网络；LiteLLM 迁移期通过宿主回环 4100 暴露数据面。
+    llmGatewayUrl: env.LLM_GATEWAY_HOST || 'http://127.0.0.1:4100',
     llmGatewayMode,
     llmGatewayAdminUrl: env.LLM_GATEWAY_ADMIN_URL || 'http://station-litellm:4000',
     llmGatewayMasterKey: env.LLM_GATEWAY_MASTER_KEY || '',

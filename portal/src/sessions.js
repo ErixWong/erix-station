@@ -336,34 +336,12 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       throw new SessionError('run_in_progress', 'session has an active run', { httpStatus: 409 });
     }
 
-    // N3（Round C 评审）：取与 setFdeLlmConfig 相同的 per-FDE advisory lock，使「建 run」与
-    // 「LLM 配置写入」全序——关闭「F6 守卫检查在配置事务外 → PUT 查到无活跃 run → 并发建 run
-    // 提交 → PUT 提交」的竞态窗口。锁序：chat_sessions（上，FOR UPDATE）→ 本 advisory →（D2 起
-    // 中间还有 llm-provider advisory，见下）→ containers（下，FOR UPDATE）——与全系统偏序
-    // chat_sessions < llm-binding < llm-provider < containers 一致（完整论证见 llm.js 文件头注释），
-    // 无环、无死锁。
+    // 同 setFdeLlmConfig 使用 per-FDE advisory lock，使新 run 与 key/model binding 变更全序。
+    // 锁序：chat_sessions（上，FOR UPDATE）→ llm-binding → containers（下，FOR UPDATE）。
     // fde_name 为 null 的账户不可能有 fde_llm_bindings 行（配置按 fde_name 寻址），跳过不取锁。
     const fde = await client.query(`SELECT fde_name FROM users WHERE id = $1`, [userId]);
     if (fde.rows[0]?.fde_name) {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fde.rows[0].fde_name}`]);
-    }
-
-    // D2（Round D 评审）：该 FDE 当前 active binding 的 provider 再取 per-provider advisory lock
-    //（key 与 updateProvider 事务开头所取同），使「provider PATCH（换上游/停用）」与「建 run」全序——
-    // 关闭「PATCH 在建 run 的『无活跃 run』检查之后提交、已启动 run 的上游被改」的窗口：PATCH 先提交则
-    // 本 run 用新上游（run 边界语义）；本 run 先提交则 updateProvider 拿锁后的 N2 事务内复检必见其 → 409。
-    // 锁序：本锁在 llm-binding 之后、containers FOR UPDATE 之前（chat_sessions < llm-binding <
-    // llm-provider < containers），无环（完整论证见 llm.js 文件头注释）。
-    // 一致性：本 SELECT 在 llm-binding 锁之下——该锁串行化 setFdeLlmConfig/deleteFdeLlmConfig/syncFde
-    // 全部 binding 写入方，读到的是已提交快照（provider_id 本身可被 setFdeLlmConfig 更新，
-    // 但该更新同样必须持 llm-binding 锁——与本读串行：要么先提交（本读得新值），要么后提交
-    // （其事务内活跃 run 复检必见本 run → 409/force）），故锁 key 与本 run 实际使用的 provider 同指。
-    const binding = await client.query(
-      `SELECT provider_id FROM fde_llm_bindings WHERE fde_id = $1 AND state = 'active'`,
-      [userId],
-    );
-    if (binding.rows[0]?.provider_id) {
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-provider:${binding.rows[0].provider_id}`]);
     }
 
     // issue #37 评审（major）：必须同时排除 revoked_at 非空的容器——deprovision 前置事务先吊销 token
@@ -559,36 +537,16 @@ export function chatCompletionsUrl(baseUrl) {
   return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
 }
 
-/**
- * provider 解析（issue #114）：① 会话属主 FDE 的 active LLM binding（llm.js 既有读取面）优先；
- * ② 回退第一个启用的 text provider + model；③ 都没有 → 409 llm_not_configured（清晰文案）。
- *
- * 回退分支为何不带凭据：`llm_providers` 表**不存 api_key**——key 只存在于 per-FDE 的
- * `fde_llm_bindings`（红线 ①「容器永不持有真 key」的同源纪律：key 按 FDE 隔离）。
- * 因此该回退只适用于无需鉴权的自建 OpenAI 兼容端点；带鉴权的上游必须为对应 FDE 配 binding。
- */
-export async function resolveAiTitleProvider(pool, userId) {
-  // ① FDE binding（llm.js 既有读取面）：DB 故障不吞（fetchSession 已证明 DB 可用，抛错走 500 更诚实）。
+/** AI 改名必须使用该 FDE 的 LiteLLM 虚拟 key；不再回退到 Station 本地 provider 目录。 */
+export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http://127.0.0.1:4000' } = {}) {
   const cfg = await getFdeLlmConfig(pool, userId);
-  const mainModel = cfg?.main?.model_id;
-  if (cfg?.base_url && cfg?.api_key && mainModel) {
-    return { base_url: cfg.base_url, api_key: cfg.api_key, model: mainModel, source: 'fde_binding' };
-  }
-  const res = await pool.query(
-    `SELECT p.base_url, m.model_id
-       FROM llm_providers p
-       JOIN llm_models m ON m.provider_id = p.id
-      WHERE p.enabled = true AND m.enabled = true AND m.type = 'text'
-      ORDER BY p.created_at ASC, m.created_at ASC
-      LIMIT 1`,
-  );
-  const row = res.rows?.[0];
-  if (row?.base_url && row?.model_id) {
-    return { base_url: row.base_url, api_key: null, model: row.model_id, source: 'first_text_provider' };
+  const mainModel = cfg?.main?.name;
+  if (cfg?.api_key && mainModel) {
+    return { base_url: gatewayUrl, api_key: cfg.api_key, model: mainModel, source: 'fde_binding' };
   }
   throw new SessionError(
     'llm_not_configured',
-    '未配置可用的 LLM 上游（AI 改名需要一次 LLM 调用）：请在管理台为该 FDE 配置 LLM 供应商与模型，或至少启用一个 text 模型',
+    '该 FDE 未配置 LiteLLM 虚拟 key（AI 改名需要一次 LLM 调用）：请在管理台配置 LiteLLM 模型',
     { httpStatus: 409 },
   );
 }
@@ -601,7 +559,7 @@ export async function resolveAiTitleProvider(pool, userId) {
  * @returns 更新后的会话行（rowToSession 形状）
  */
 export async function generateAiTitle(pool, {
-  userId, sessionId, fetchImpl = fetch, timeoutMs = AI_TITLE_TIMEOUT_MS, notify, log = console,
+  userId, sessionId, gatewayUrl, fetchImpl = fetch, timeoutMs = AI_TITLE_TIMEOUT_MS, notify, log = console,
 } = {}) {
   await fetchSession(pool, sessionId, userId);
 
@@ -616,7 +574,7 @@ export async function generateAiTitle(pool, {
     throw new SessionError('no_user_messages', '会话还没有用户消息，无法生成标题', { httpStatus: 409 });
   }
 
-  const provider = await resolveAiTitleProvider(pool, userId);
+  const provider = await resolveAiTitleProvider(pool, userId, { gatewayUrl });
 
   // 超时用显式 AbortController + clearTimeout（不依赖 AbortSignal.timeout 的定时器语义）。
   const controller = new AbortController();

@@ -829,6 +829,13 @@ function makeB1Pool({ llmRowCount = 1, seq, paramsLog }) {
           paramsLog.push({ sql, params });
           if (sql === 'BEGIN') seq.push('tx:begin');
           if (sql === 'COMMIT') seq.push('tx:commit');
+          if (sql.includes('SELECT api_key, key_alias, gateway FROM fde_llm_bindings')) {
+            return {
+              rows: llmRowCount > 0
+                ? [{ api_key: 'sk-test-retired', key_alias: 'fde-alice', gateway: 'direct' }]
+                : [],
+            };
+          }
           if (sql.includes('UPDATE containers SET revoked_at')) seq.push('sql:revoke-token');
           if (sql.includes('UPDATE fde_llm_bindings') && sql.includes("SET state = 'revoked'")) {
             seq.push(llmRowCount > 0 ? 'sql:revoke-llm' : 'sql:revoke-llm-noop');
@@ -883,13 +890,13 @@ test('issue #38 Phase B1：deprovision 前置事务内吊销 LLM（state=revoked
   assert.ok(!payloadStr.includes('sk-test'), 'payload 不得含 api_key 明文（红线 ③）');
 });
 
-test('issue #38 Phase B1：无 LLM 配置的 FDE deprovision 正常（rowCount=0 → 不写 llm outbox，Docker 照常清理）', async () => {
+test('issue #117：无 LLM binding 的 FDE deprovision skips the update/outbox and still cleans Docker', async () => {
   const seq = [];
   const paramsLog = [];
   const pool = makeB1Pool({ llmRowCount: 0, seq, paramsLog });
   await deprovisionForTest(pool, {}, { fdeName: 'alice', docker: makeB1Docker(seq) });
   assert.ok(!seq.includes('sql:revoke-llm'), '无 active binding 不得产生实际吊销');
-  assert.ok(seq.includes('sql:revoke-llm-noop'), 'UPDATE 仍会下发（幂等空转，匹配 0 行）');
+  assert.ok(!seq.includes('sql:revoke-llm-noop'), 'missing active binding skips the UPDATE');
   assert.ok(!seq.some((s) => s.includes('outbox:llm_binding')), '无 active binding 不得写 llm outbox');
   assert.ok(seq.includes('sql:revoke-token') && seq.includes('docker:rm'), 'token 吊销与 Docker 清理照常');
 });
@@ -908,7 +915,7 @@ test('issue #38 Phase B1：onboard 复用分支恢复 LLM / 全新不复活（�
   const llmSrc = await import('node:fs').then((fs) => fs.promises.readFile(
     new URL('../src/llm.js', import.meta.url), 'utf8'));
   assert.ok(
-    llmSrc.includes('syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restoreRevoked = false } = {})'),
+    llmSrc.includes('syncFdeLlmBindingOnOnboard(pool, { fdeId, fdeName, restoreRevoked = false, gateway } = {})'),
     'llm.js 的 syncFdeLlmBindingOnOnboard 必须按 fdeId 解构（与 provisioner 调用点参数名一致）',
   );
   // deprovisionFde：① 前置事务块内、COMMIT 之前必须调 revokeFdeLlmConfigTx（同事务是评审重点）。
@@ -927,7 +934,25 @@ test('issue #38 Phase B1：onboard 复用分支恢复 LLM / 全新不复活（�
 test('F1（Round B 评审）：syncFdeLlmBindingOnOnboard（真实函数）restoreRevoked=true → revoked→active + outbox upsert 命中该 FDE 的 id', async () => {
   const seq = [];
   const paramsLog = [];
-  const state = { 'u1': { state: 'revoked', revokeParams: null } }; // 内存态：fdb 行按 fde_id 索引
+  const state = {
+    u1: {
+      state: 'revoked', provider_id: 'deepseek', api_key: null, key_id: null, key_alias: null,
+      gateway: 'litellm', gateway_user_id: null, main_model_id: 'deepseek-flash',
+      embedding_model_id: null, vision_model_id: null, revokeParams: null,
+    },
+  }; // 内存态：binding 行按 fde_id 索引
+  const gateway = {
+    async listModels() {
+      return { data: [{
+        model_name: 'deepseek-flash',
+        litellm_params: { model: 'deepseek-flash', litellm_credential_name: 'deepseek' },
+        model_info: { id: 'deepseek-flash', type: 'text', tool_calling: true },
+      }] };
+    },
+    async createUser() { return { user_id: 'gateway-user-alice' }; },
+    async generateKey(body) { return { key: 'sk-test-onboard-virtual', key_id: 'key-onboard', key_alias: body.key_alias }; },
+    async deleteKey() { return { deleted: true }; },
+  };
   const pool = {
     async connect() {
       return {
@@ -935,11 +960,11 @@ test('F1（Round B 评审）：syncFdeLlmBindingOnOnboard（真实函数）resto
           paramsLog.push({ sql, params });
           if (sql === 'BEGIN') seq.push('tx:begin');
           if (sql === 'COMMIT') seq.push('tx:commit');
-          if (sql.includes('SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE')) {
+          if (sql.includes('SELECT state, provider_id, api_key, key_id, key_alias, gateway, gateway_user_id')) {
             const row = state[params[0]];
-            return { rows: row ? [{ state: row.state }] : [] };
+            return { rows: row ? [{ ...row }] : [] };
           }
-          if (sql.includes("UPDATE fde_llm_bindings") && sql.includes("SET state = 'active'")) {
+          if (sql.includes('UPDATE fde_llm_bindings') && sql.includes("SET gateway = 'litellm'")) {
             const row = state[params[0]];
             if (!row) return { rows: [], rowCount: 0 };
             row.state = 'active';
@@ -962,11 +987,11 @@ test('F1（Round B 评审）：syncFdeLlmBindingOnOnboard（真实函数）resto
   };
 
   // 等价于 onboardFde 复用分支的调用（provisioner 侧参数名修复后即此形状）：
-  const out = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: true });
+  const out = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: true, gateway });
   assert.deepEqual(out, { restored: true, republished: true }, 'revoked binding 必须被恢复且重发布 outbox');
 
   // 命中的是「该 FDE 的 id」：所有 WHERE/SET fde_id = $1 的参数都是 u1（若为 NULL 则无行命中 → 静默 no-op）。
-  const hit = paramsLog.find((e) => e.sql.includes('SELECT state FROM fde_llm_bindings WHERE fde_id = $1 FOR UPDATE'));
+  const hit = paramsLog.find((e) => e.sql.includes('SELECT state, provider_id, api_key, key_id, key_alias, gateway, gateway_user_id'));
   assert.equal(hit.params[0], 'u1', 'FOR UPDATE 锁行参数必须是该 FDE 的 id');
   assert.equal(state.u1.state, 'active', 'revoked → active 已发生');
   assert.equal(state.u1.revokeParams[0], 'u1', 'UPDATE fde_id = 该 FDE 的 id');

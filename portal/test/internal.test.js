@@ -769,28 +769,24 @@ test('B：session hub 溢出只影响溢出客户端；live 客户端继续收�
 });
 
 // ---------------------------------------------------------------------------
-// issue #38 Phase B2：心跳下行模型集（agent 用真模型名的传导通道）
+// issue #117：heartbeat carries LiteLLM serving names while Station stores model_info.id slots.
 // ---------------------------------------------------------------------------
 
-/** 心跳 models 现场构造：active binding + enabled provider + 三槽位模型。 */
+/** 心跳 models 现场构造：active LiteLLM binding + three text-valued model slots. */
 function seedLlmHeartbeat(overrides = {}) {
   const base = seedClaimable();
-  base.pool.llm.providers = [{ id: 'p1', enabled: true }];
-  base.pool.llm.models = [
-    { id: 'm-main', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', tool_calling: true, enabled: true },
-    { id: 'm-emb', provider_id: 'p1', model_id: 'text-embedding-3', type: 'embedding', tool_calling: false, enabled: true },
-    { id: 'm-vis', provider_id: 'p1', model_id: 'gpt-4o-vision', type: 'vision', tool_calling: false, enabled: true },
-  ];
   base.pool.llm.bindings = [{
-    fde_id: base.userId, state: 'active', provider_id: 'p1',
-    main_model_id: 'm-main', embedding_model_id: 'm-emb', vision_model_id: 'm-vis',
+    fde_id: base.userId, gateway: 'litellm', api_key: 'sk-test-virtual', state: 'active', provider_id: 'credential',
+    main_model_id: 'model-info-id-main', main_model_name: 'deepseek-flash',
+    embedding_model_id: 'model-info-id-embedding', embedding_model_name: 'deepseek-flash',
+    vision_model_id: 'model-info-id-vision', vision_model_name: 'deepseek-flash',
   }];
   Object.assign(base.pool.llm, overrides.llm ?? {});
   if (overrides.binding) Object.assign(base.pool.llm.bindings[0], overrides.binding);
   return base;
 }
 
-test('心跳下行模型集：active binding → 下发 main/embedding/vision（上游 model_id，非 uuid）', async () => {
+test('心跳下行模型集：DB 存 model_info.id，agent 收到 deepseek-flash serving name', async () => {
   const { pool, userId, containerId } = seedLlmHeartbeat();
   const hb = await heartbeat(pool, {
     container: { id: containerId, user_id: userId },
@@ -798,12 +794,10 @@ test('心跳下行模型集：active binding → 下发 main/embedding/vision（
     body: { agent_version: '0.1', runs: [] },
   });
   assert.deepEqual(hb.models, {
-    main: { model: 'gpt-4o', type: 'text' },
-    embedding: { model: 'text-embedding-3', type: 'embedding' },
-    vision: { model: 'gpt-4o-vision', type: 'vision' },
+    main: { model: 'deepseek-flash', type: 'text' },
+    embedding: { model: 'deepseek-flash', type: 'embedding' },
+    vision: { model: 'deepseek-flash', type: 'vision' },
   });
-  const all = JSON.stringify(hb.models);
-  assert.ok(!all.includes('m-main'), '下行的是上游 model_id，不是模型行 uuid');
 });
 
 test('心跳下行模型集：仅 main 位 → 只下发 main；binding revoked / 无配置 → models=null（不下发空对象）', async () => {
@@ -814,7 +808,7 @@ test('心跳下行模型集：仅 main 位 → 只下发 main；binding revoked 
     user: { id: a.userId, login: 'alice' },
     body: { runs: [] },
   });
-  assert.deepEqual(hbA.models, { main: { model: 'gpt-4o', type: 'text' } });
+  assert.deepEqual(hbA.models, { main: { model: 'deepseek-flash', type: 'text' } });
 
   // revoked → null
   const b = seedLlmHeartbeat({ binding: { state: 'revoked' } });
@@ -835,23 +829,12 @@ test('心跳下行模型集：仅 main 位 → 只下发 main；binding revoked 
   assert.equal(hbC.models, null);
 });
 
-test('心跳下行模型集：provider 停用 / main 位 tool_calling=false → models=null（不下发半残配置）', async () => {
-  // provider 停用 → null
-  const a = seedLlmHeartbeat({ llm: { providers: [{ id: 'p1', enabled: false }] } });
+test('心跳下行模型集：无 virtual key → models=null（未绑定时不下发半残配置）', async () => {
+  const a = seedLlmHeartbeat({ binding: { api_key: null } });
   const hbA = await heartbeat(a.pool, {
     container: { id: a.containerId, user_id: a.userId },
     user: { id: a.userId, login: 'alice' },
     body: { runs: [] },
   });
   assert.equal(hbA.models, null);
-
-  // main 模型 tool_calling 被目录改掉 → 缺 main → 整体 null
-  const b = seedLlmHeartbeat();
-  b.pool.llm.models.find((m) => m.id === 'm-main').tool_calling = false;
-  const hbB = await heartbeat(b.pool, {
-    container: { id: b.containerId, user_id: b.userId },
-    user: { id: b.userId, login: 'alice' },
-    body: { runs: [] },
-  });
-  assert.equal(hbB.models, null);
 });

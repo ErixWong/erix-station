@@ -1,6 +1,6 @@
 // HTTP 级测试：issue #114「AI 改名」端点 POST /api/sessions/:id/ai-title。
-// 三态（issue 验收）：成功（mock fetch 上游）/ 无 provider 409 / LLM 失败 502；
-// 另覆盖：属主鉴权 404、无用户消息 409、回退 provider（无 binding）、key 纪律（不进响应/日志）。
+// 三态（issue 验收）：成功（mock LiteLLM 数据面）/ 无 binding 409 / LLM 失败 502；
+// 另覆盖：属主鉴权 404、无用户消息 409、无本地 provider 回退、key 纪律（不进响应/日志）。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool + 桩掉上游 fetch，不碰真实 DB / 网络。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,7 +25,7 @@ const API_KEY = 'sk-test-secret-key-123456';
 
 /**
  * 内存 pool：登录会话（FakePool）+ AI 改名链路的四条查询
- * （fetchSession / 首 3 条 user 消息 / FDE binding / 回退 provider）+ 落库 UPDATE。
+ * （fetchSession / 首 3 条 user 消息 / FDE binding）+ 落库 UPDATE。
  */
 class AiTitlePool extends FakePool {
   constructor({ binding = null, providerRow = null, messages = [], ownerId = USER.id } = {}) {
@@ -53,8 +53,7 @@ class AiTitlePool extends FakePool {
     if (s.includes('FROM messages') && s.includes("role = 'user'")) {
       return { rows: this.messages.slice(0, params[1] ?? 3).map((c) => ({ content: c })) };
     }
-    if (s.includes('FROM fde_llm_bindings b')) return { rows: this.binding ? [this.binding] : [] };
-    if (s.includes('FROM llm_providers p')) return { rows: this.providerRow ? [this.providerRow] : [] };
+    if (s.includes('FROM fde_llm_bindings')) return { rows: this.binding ? [this.binding] : [] };
     if (s.startsWith('UPDATE chat_sessions SET title')) {
       this.titleUpdates.push({ sql: s, params });
       this.sessionRow.title = params[1];
@@ -65,13 +64,11 @@ class AiTitlePool extends FakePool {
   }
 }
 
-/** FDE binding 行（llm.js getFdeLlmConfig 的 JOIN 形状）。 */
+/** FDE binding row: Station stores model_info.id and sends LiteLLM model_name to the data plane. */
 const bindingRow = (over = {}) => ({
-  fde_id: USER.id, api_key: API_KEY, state: 'active',
-  provider_id: 'p1', provider_name: 'upstream', base_url: 'https://llm.example.com/v1',
-  main_upstream: 'gpt-4o-mini', main_name: 'GPT-4o mini', main_type: 'text',
-  embedding_upstream: null, embedding_name: null, embedding_type: null,
-  vision_upstream: null, vision_name: null, vision_type: null,
+  fde_id: USER.id, api_key: API_KEY, state: 'active', gateway: 'litellm',
+  provider_id: 'deepseek', main_model_id: 'model-info-id-deepseek-flash', main_model_name: 'deepseek-flash',
+  embedding_model_id: null, vision_model_id: null,
   ...over,
 });
 
@@ -90,6 +87,8 @@ async function startServer(poolOpts = {}) {
     kdfQueueLimit: 100,
     kdfQueueTimeoutMs: 30000,
     maxBodyBytes: 64 * 1024,
+    llmGatewayUrl: 'http://127.0.0.1:4000',
+    llmGatewayAdminUrl: 'http://station-litellm:4000',
     maxLoginLength: 128,
     maxPasswordLength: 256,
     staticDir,
@@ -163,11 +162,11 @@ test('issue #114 成功态：一次 chat/completions → sanitizeTitle 清洗 �
 
     // 上游请求形状：OpenAI 兼容 chat/completions，一次往返，带 Bearer key
     assert.equal(stub.calls.length, 1);
-    assert.equal(stub.calls[0].url, 'https://llm.example.com/v1/chat/completions', 'base 已含 /v1 不重复拼接');
+    assert.equal(stub.calls[0].url, 'http://station-litellm:4000/v1/chat/completions', 'portal 使用 backend 上 LiteLLM 地址，Traefik 则使用 host-network 回环 URL');
     assert.equal(stub.calls[0].init.method, 'POST');
     assert.equal(stub.calls[0].init.headers.Authorization, `Bearer ${API_KEY}`);
     const payload = JSON.parse(stub.calls[0].init.body);
-    assert.equal(payload.model, 'gpt-4o-mini', '用 binding 的 main 模型位');
+    assert.equal(payload.model, 'deepseek-flash', '用 binding 保存的 LiteLLM data-plane model_name');
     assert.equal(payload.stream, false);
     assert.equal(payload.messages.length, 2);
     assert.equal(payload.messages[0].role, 'system');
@@ -200,21 +199,18 @@ test('issue #114：上游超长标题 → sanitizeTitle 截断 ≤30 字', async
   }
 });
 
-test('issue #114：无 FDE binding → 回退第一个启用的 text provider+model（无 key，不带 Authorization）', async () => {
+test('issue #114：无 FDE binding → 不回退到已退役的本地 provider/model 目录', async () => {
   const s = await startServer({
     binding: null,
-    providerRow: { base_url: 'http://127.0.0.1:4000', model_id: 'local-text-7b' },
+    providerRow: { base_url: 'http://127.0.0.1:4000', model_id: 'deepseek-flash' },
     messages: ['本地自建端点'],
   });
   const stub = stubUpstreamFetch(() => jsonResponse(200, { choices: [{ message: { content: '本地端点命名' } }] }));
   try {
     const r = await callAiTitle(s);
-    assert.equal(r.status, 200);
-    assert.equal((await r.json()).session.title, '本地端点命名');
-    assert.equal(stub.calls.length, 1);
-    assert.equal(stub.calls[0].url, 'http://127.0.0.1:4000/v1/chat/completions', 'base 不含 /v1 → 补 /v1');
-    assert.equal('Authorization' in stub.calls[0].init.headers, false, 'provider 表无 key（红线 ①）→ 不带鉴权头');
-    assert.equal(JSON.parse(stub.calls[0].init.body).model, 'local-text-7b');
+    assert.equal(r.status, 409);
+    assert.equal((await r.json()).error.code, 'llm_not_configured');
+    assert.equal(stub.calls.length, 0, '不允许回退到退役目录表');
   } finally {
     stub.restore();
     await s.close();
