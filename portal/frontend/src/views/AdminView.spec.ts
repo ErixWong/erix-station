@@ -33,6 +33,14 @@ const USERS = {
     { id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null, status: 'active' },
   ],
 };
+const GIT_HOSTS = {
+  items: [
+    {
+      id: 'gh1', name: 'Gitea', provider: 'gitea', base_url: 'https://git.example.com',
+      admin_key: '****4567', admin_key_configured: true, mode: 'minted', enabled: true,
+    },
+  ],
+};
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -54,6 +62,7 @@ function defaultHandler(url: string): Response {
   if (url === '/api/me') return jsonResponse(200, { user: ADMIN_USER });
   if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS);
   if (url === '/api/admin/users') return jsonResponse(200, USERS);
+  if (url === '/api/admin/git-hosts') return jsonResponse(200, GIT_HOSTS);
   return jsonResponse(404, { error: { code: 'not_found', message: 'not found' } });
 }
 
@@ -123,11 +132,76 @@ describe('Admin console routing and layout', () => {
     }
   });
 
-  it('repository tab is an empty placeholder and performs no admin API calls', async () => {
+  it('repository tab loads and renders configured Git hosts', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/repos');
-    expect(wrapper.text()).toContain('待后续实现');
-    expect(fetchFn.mock.calls.map(([url]) => String(url))).toEqual(['/api/me']);
+    expect(wrapper.text()).toContain('Gitea');
+    expect(wrapper.text()).toContain('https://git.example.com');
+    expect(wrapper.get('[data-test="mode-badge"]').text()).toBe('代铸');
+    expect(wrapper.get('[data-test="admin-key-mask"]').text()).toContain('****4567');
+    expect(fetchFn.mock.calls.filter(([url]) => String(url) === '/api/admin/git-hosts')).toHaveLength(1);
     wrapper.unmount();
+  });
+});
+
+describe('AdminReposView · Git host registry', () => {
+  it('adds, edits, toggles, and deletes hosts through modals without exposing admin key', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/repos', (url, init) => {
+      if (url === '/api/admin/git-hosts' && init?.method === 'POST') return jsonResponse(201, { host: {} });
+      if (url === '/api/admin/git-hosts/gh1' && init?.method === 'PATCH') return jsonResponse(200, { host: {} });
+      if (url === '/api/admin/git-hosts/gh1' && init?.method === 'DELETE') return new Response(null, { status: 204 });
+      return undefined;
+    });
+    try {
+      await wrapper.get('[data-test="open-add-git-host"]').trigger('click');
+      const addForm = wrapper.get('[data-test="git-host-form"]');
+      const addInputs = addForm.findAll('input');
+      await addInputs[0].setValue('GitLab');
+      await addForm.get('select').setValue('gitlab');
+      await addInputs[1].setValue('https://gitlab.example.com');
+      await addInputs[2].setValue('admin-secret-not-echoed');
+      await addForm.trigger('submit.prevent');
+      await flushPromises();
+      const post = callsTo(fetchFn, 'POST', '/api/admin/git-hosts')[0];
+      expect(JSON.parse(String(post[1]?.body))).toEqual({
+        name: 'GitLab',
+        provider: 'gitlab',
+        base_url: 'https://gitlab.example.com',
+        admin_key: 'admin-secret-not-echoed',
+      });
+      expect(wrapper.text()).not.toContain('admin-secret-not-echoed');
+      expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+
+      await wrapper.get('[data-test="edit-git-host"]').trigger('click');
+      const editForm = wrapper.get('[data-test="git-host-form"]');
+      await editForm.findAll('input')[0].setValue('Gitea renamed');
+      await editForm.findAll('input')[1].setValue('https://git-new.example.com');
+      await editForm.findAll('input')[2].setValue('new-admin-secret');
+      await editForm.trigger('submit.prevent');
+      await flushPromises();
+      const patch = callsTo(fetchFn, 'PATCH', '/api/admin/git-hosts/gh1')
+        .find(([, init]) => String(init?.body).includes('new-admin-secret'));
+      expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+        name: 'Gitea renamed',
+        provider: 'gitea',
+        base_url: 'https://git-new.example.com',
+        admin_key: 'new-admin-secret',
+      });
+
+      await wrapper.get('[data-test="toggle-git-host"]').trigger('click');
+      await flushPromises();
+      const toggle = callsTo(fetchFn, 'PATCH', '/api/admin/git-hosts/gh1')
+        .find(([, init]) => JSON.parse(String(init?.body)).enabled === false);
+      expect(JSON.parse(String(toggle?.[1]?.body))).toEqual({ enabled: false });
+
+      await wrapper.get('[data-test="delete-git-host"]').trigger('click');
+      expect(wrapper.get('[role="dialog"]').text()).toContain('确认删除 Git host「Gitea」？');
+      await wrapper.get('[data-test="confirm-delete-git-host"]').trigger('click');
+      await flushPromises();
+      expect(callsTo(fetchFn, 'DELETE', '/api/admin/git-hosts/gh1')).toHaveLength(1);
+      expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
   });
 });
 

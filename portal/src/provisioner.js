@@ -20,7 +20,8 @@ import { enqueueRouteChange } from './outbox.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
-import { removeGitCredentialFile } from './git-credential.js';
+import { removeGitCredentialFile, setGitCredential } from './git-credential.js';
+import { mintGitAccount } from './git-mint.js';
 
 // ---------------------------------------------------------------------------
 // 代码层 Docker API 白名单（写死）
@@ -614,17 +615,37 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
   return stats;
 }
 
-/** onboarding：分配子网（IPAM）→ 单点生成 token（hash 入 DB + 明文只进 create env）→ 建网络 + 容器 → status running。幂等。 */
-export async function onboardFde(pool, config, { fdeName, docker, log = console } = {}) {
+/** onboarding：分配子网（IPAM）→ 可选配置 Git host → 建网络 + 容器。幂等。 */
+export async function onboardFde(pool, config, { fdeName, gitHostId = null, docker, log = console } = {}) {
   return withFdeLock(pool, fdeName, async () => {
     const stackId = config.stackId ?? 'default'; // F9：本栈所有权 id
     const user = await pool.query(
-      `SELECT id, fde_name, status FROM users WHERE fde_name = $1 AND status = 'active'`,
+      `SELECT id, fde_name, login, status FROM users
+        WHERE fde_name = $1 AND status IN ('active', 'awaiting_credential')`,
       [fdeName],
     );
     const u = user.rows[0];
     if (!u) throw new Error(`no active user with fde_name=${fdeName}`);
     const userId = u.id;
+
+    let gitHost = null;
+    let gitAccount = null;
+    if (gitHostId) {
+      const hostResult = await pool.query(
+        `SELECT id, provider, base_url, admin_key, mode, enabled FROM git_hosts WHERE id = $1`,
+        [gitHostId],
+      );
+      gitHost = hostResult.rows[0] ?? null;
+      if (!gitHost) throw new Error('git host does not exist');
+      if (!gitHost.enabled) throw new Error('git host is disabled');
+      gitAccount = (await pool.query(
+        `SELECT git_host_id, remote_login, token_ref FROM fde_git_accounts WHERE fde_id = $1`,
+        [userId],
+      )).rows[0] ?? null;
+      if (gitAccount && gitAccount.git_host_id !== gitHost.id) {
+        throw new Error('FDE is already assigned to another git host');
+      }
+    }
 
     const net = await allocateNetwork(pool, userId, fdeName, {
       poolName: config.fdePool ?? 'default',
@@ -661,10 +682,11 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
         containerId = dbRow.id;
       } else {
         const row = await pool.query(
-          `INSERT INTO containers (user_id, fde_name, container_name, runner_token_hash, token_generation, status, image, agent_version)
-           VALUES ($1, $2, $3, $4, 1, 'creating', $5, $6)
+          `INSERT INTO containers
+             (user_id, fde_name, container_name, runner_token_hash, token_generation, status, image, agent_version, git_provider)
+           VALUES ($1, $2, $3, $4, 1, 'creating', $5, $6, $7)
            RETURNING id`,
-          [userId, fdeName, containerName, tokenHash, config.fdeImage, config.fdeAgentVersion ?? 'dev'],
+          [userId, fdeName, containerName, tokenHash, config.fdeImage, config.fdeAgentVersion ?? 'dev', gitHost?.provider ?? null],
         );
         containerId = row.rows[0].id;
       }
@@ -677,6 +699,57 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
       gid: config.fdeGid ?? 1000,
       log,
     });
+
+    let accountStatus = u.status;
+    if (gitHost) {
+      const hostName = new URL(gitHost.base_url).host;
+      if (gitHost.mode === 'minted') {
+        if (!gitAccount?.token_ref) {
+          const minted = await mintGitAccount({
+            provider: gitHost.provider,
+            mode: gitHost.mode,
+            baseUrl: gitHost.base_url,
+            adminKey: gitHost.admin_key,
+            login: fdeName,
+          });
+          await setGitCredential({
+            pool,
+            config,
+            fdeName,
+            host: hostName,
+            username: minted.remoteLogin,
+            token: minted.tokenPlaintext,
+          });
+          await pool.query(
+            `INSERT INTO fde_git_accounts (fde_id, git_host_id, remote_login, token_ref)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (fde_id) DO UPDATE
+               SET git_host_id = EXCLUDED.git_host_id, remote_login = EXCLUDED.remote_login,
+                   token_ref = EXCLUDED.token_ref, updated_at = now()`,
+            [userId, gitHost.id, minted.remoteLogin, minted.tokenRef],
+          );
+        }
+        await pool.query(`UPDATE users SET status = 'active' WHERE id = $1 AND status = 'awaiting_credential'`, [userId]);
+        accountStatus = 'active';
+      } else {
+        if (!gitAccount) {
+          await pool.query(
+            `INSERT INTO fde_git_accounts (fde_id, git_host_id, remote_login, token_ref)
+             VALUES ($1, $2, NULL, NULL)`,
+            [userId, gitHost.id],
+          );
+          gitAccount = { remote_login: null, token_ref: null };
+        }
+        if (gitAccount.token_ref || gitAccount.remote_login) {
+          await pool.query(`UPDATE users SET status = 'active' WHERE id = $1 AND status = 'awaiting_credential'`, [userId]);
+          accountStatus = 'active';
+        } else {
+          await pool.query(`UPDATE users SET status = 'awaiting_credential' WHERE id = $1 AND status = 'active'`, [userId]);
+          accountStatus = 'awaiting_credential';
+        }
+      }
+      await pool.query(`UPDATE containers SET git_provider = $2, updated_at = now() WHERE id = $1`, [containerId, gitHost.provider]);
+    }
 
     const subnet = net.subnet;
     const gateway = net.gateway;
@@ -724,6 +797,8 @@ export async function onboardFde(pool, config, { fdeName, docker, log = console 
       subnet,
       gateway,
       containerName,
+      gitProvider: gitHost?.provider ?? null,
+      status: accountStatus,
     };
   });
 }

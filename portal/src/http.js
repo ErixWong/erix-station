@@ -21,6 +21,7 @@ import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
 import * as admin from './admin.js';
 import * as dirs from './dirs.js';
 import * as gitCredential from './git-credential.js';
+import * as gitHosts from './git-hosts.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
@@ -281,6 +282,10 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
         return;
       }
       if (err instanceof gitCredential.GitCredentialError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof gitHosts.GitHostError) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
@@ -635,6 +640,37 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
+  // Git host 注册表（issue #118）。
+  if (pathname === '/api/admin/git-hosts') {
+    if (req.method === 'GET') {
+      return sendJson(res, 200, await gitHosts.listGitHosts(ctx.pool));
+    }
+    if (req.method === 'POST') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const host = await gitHosts.createGitHost(ctx.pool, body);
+      return sendJson(res, 201, { host });
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  const adminGitHostMatch = pathname.match(/^\/api\/admin\/git-hosts\/([^/]+)$/);
+  if (adminGitHostMatch) {
+    const hostId = decodeUuid(adminGitHostMatch[1]);
+    if (req.method === 'PATCH') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const host = await gitHosts.updateGitHost(ctx.pool, hostId, body);
+      return sendJson(res, 200, { host });
+    }
+    if (req.method === 'DELETE') {
+      await gitHosts.deleteGitHost(ctx.pool, hostId);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
   // FDE 容器 provision（调查结论：portal serve 进程有 config.dockerHost，client 懒建，端点可实现）
   const adminProvisionMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/provision$/);
   if (adminProvisionMatch && req.method === 'POST') {
@@ -642,9 +678,16 @@ async function handleAdminApi(req, res, ctx, url) {
     if (!projects.validateFdeName(fdeName).ok) {
       throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
     }
+    requireJson(req);
+    const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+    const gitHostId = body?.git_host_id == null || body.git_host_id === ''
+      ? null
+      : decodeUuid(String(body.git_host_id));
     let out;
     try {
-      out = await onboardFde(ctx.pool, ctx.config, { fdeName, docker: ctx.adminDocker(), log: ctx.log });
+      out = await onboardFde(ctx.pool, ctx.config, {
+        fdeName, gitHostId, docker: ctx.adminDocker(), log: ctx.log,
+      });
     } catch (err) {
       // 对账循环仍在后台跑，失败不致命——把原因回给 admin（无敏感信息）。
       throw new HttpError(500, 'provision_failed', String(err?.message ?? err));
@@ -654,6 +697,8 @@ async function handleAdminApi(req, res, ctx, url) {
       network: out.networkName,
       subnet: out.subnet,
       container: out.containerName,
+      status: out.status,
+      git_provider: out.gitProvider,
     });
   }
 

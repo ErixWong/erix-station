@@ -8,15 +8,17 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api, ApiError } from '../api';
-import type { AdminUser, LlmModel, LlmProvider } from '../stores/admin';
+import { useAdminStore, type AdminUser, type GitHost, type LlmModel, type LlmProvider } from '../stores/admin';
 
 // issue #101 P3：pane 文案走 i18n（admin.llm.*）；服务端透传的 error.message 不译，
 // 仅前缀（「错误：」/「已拒绝（409）：」）走 t()。
 const { t } = useI18n();
+const admin = useAdminStore();
 
 const props = defineProps<{
   user: AdminUser;
   providers: LlmProvider[];
+  gitHosts: GitHost[];
 }>();
 
 // config 回显结构（GET /api/admin/fdes/<fde>/llm → { config, active_run }；
@@ -47,6 +49,15 @@ const okMsg = ref(''); // 旧 [data-llmmsg] 内的 .okmsg
 const errMsg = ref(''); // 旧 [data-llmmsg] 内的 .syserr
 const conflictMsg = ref(''); // 409 拒绝原因（旧 submitLlm 的显式确认分支）
 const showForce = ref(false); // 「确认无影响，强制保存」按钮可见性
+const gitHostId = ref(props.user.git_host_id ?? '');
+const credentialUsername = ref('');
+const credentialToken = ref('');
+const credentialErr = ref('');
+const credentialSaved = ref(false);
+const savingCredential = ref(false);
+const awaitingCredential = ref(props.user.status === 'awaiting_credential');
+const selectedGitHost = computed(() => props.gitHosts.find((host) => host.id === gitHostId.value) ?? null);
+const enabledGitHosts = computed(() => props.gitHosts.filter((host) => host.enabled));
 
 // 当前供应商下启用中的模型（旧 ms = (p?.models ?? []).filter((m) => m.enabled)）。
 const enabledModels = computed<LlmModel[]>(() => {
@@ -141,13 +152,44 @@ async function onProvision() {
   okMsg.value = '';
   errMsg.value = '';
   try {
-    const r = await api<{ container: string; network: string; subnet: string }>(`/api/admin/fdes/${fde}/provision`, {
+    const r = await api<{ container: string; network: string; subnet: string; status?: string }>(`/api/admin/fdes/${fde}/provision`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify(gitHostId.value ? { git_host_id: gitHostId.value } : {}),
     });
-    okMsg.value = t('admin.llm.provisionDone', { container: r.container, network: r.network, subnet: r.subnet });
+    okMsg.value = r.status === 'awaiting_credential'
+      ? t('admin.repos.credentialHint')
+      : t('admin.llm.provisionDone', { container: r.container, network: r.network, subnet: r.subnet });
+    awaitingCredential.value = r.status === 'awaiting_credential';
+    await admin.loadUsers();
   } catch (e) {
     errMsg.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function onSaveGitCredential() {
+  const host = selectedGitHost.value;
+  if (!host || savingCredential.value) return;
+  credentialErr.value = '';
+  credentialSaved.value = false;
+  savingCredential.value = true;
+  try {
+    const hostname = new URL(host.base_url).host;
+    await api(`/api/admin/fdes/${fde}/git-credential`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        host: hostname,
+        username: credentialUsername.value,
+        token: credentialToken.value,
+      }),
+    });
+    credentialToken.value = '';
+    credentialSaved.value = true;
+    awaitingCredential.value = false;
+    await admin.loadUsers();
+  } catch (e) {
+    credentialErr.value = t('admin.errorPrefix') + (e instanceof Error ? e.message : String(e));
+  } finally {
+    savingCredential.value = false;
   }
 }
 
@@ -178,6 +220,15 @@ onMounted(loadPane);
       <p v-if="cfg?.api_key" data-test="virtual-key" class="self-end pb-1 text-xs text-black/55">
         {{ t('admin.llm.virtualKeyLabel', { key: cfg.api_key }) }}
       </p>
+      <label class="flex flex-col gap-0.5 text-xs text-black/55">
+        {{ t('admin.repos.selectHost') }}
+        <select v-model="gitHostId" data-test="git-host-select" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+          <option value="">{{ t('admin.repos.noHost') }}</option>
+          <option v-for="host in enabledGitHosts" :key="host.id" :value="host.id">
+            {{ host.name }} · {{ host.provider }} · {{ host.mode === 'minted' ? t('admin.repos.modeMinted') : t('admin.repos.modeCredential') }}
+          </option>
+        </select>
+      </label>
       <label class="flex flex-col gap-0.5 text-xs text-black/55">
         {{ t('admin.llm.mainModelLabel') }}
         <select v-model="mainModelId" data-test="main-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
@@ -220,5 +271,33 @@ onMounted(loadPane);
         >{{ t('admin.llm.forceSave') }}</button>
       </template>
     </div>
+
+    <form
+      v-if="awaitingCredential && selectedGitHost?.mode === 'per_fde_pat'"
+      data-test="git-credential-form"
+      class="mt-3 grid gap-2 rounded-md border border-amber-500 bg-amber-50 p-3"
+      @submit.prevent="onSaveGitCredential"
+    >
+      <p class="text-sm font-medium">{{ t('admin.repos.credentialTitle') }}</p>
+      <p class="text-xs text-black/55">{{ t('admin.repos.credentialHint') }}</p>
+      <label class="flex flex-col gap-0.5 text-xs text-black/55">
+        {{ t('admin.repos.credentialUsername') }}
+        <input v-model="credentialUsername" required autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-0.5 text-xs text-black/55">
+        {{ t('admin.repos.credentialToken') }}
+        <input v-model="credentialToken" type="password" required autocomplete="new-password" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <p v-if="credentialErr" class="syserr" role="alert">{{ credentialErr }}</p>
+      <button
+        type="submit"
+        data-test="save-git-credential"
+        :disabled="savingCredential"
+        class="justify-self-start rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
+      >{{ t('admin.repos.saveCredential') }}</button>
+    </form>
+    <p v-if="credentialSaved" data-test="git-credential-saved" class="mt-2 text-sm text-green-700">
+      {{ t('admin.repos.credentialSaved') }}
+    </p>
   </template>
 </template>

@@ -1642,7 +1642,7 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 
 ## 10. Admin Git credential endpoints
 
-All three routes require the existing `requireAdmin` authorization (`401` without a session, `403` for a non-admin). `fdeName` uses the project FDE-name grammar; `host` must be a DNS hostname. Invalid fields return `400 validation_failed`.
+All three routes require the existing `requireAdmin` authorization (`401` without a session, `403` for a non-admin). `fdeName` uses the project FDE-name grammar; `host` must be a DNS hostname with an optional port. Invalid fields return `400 validation_failed`.
 
 ### `PUT /api/admin/fdes/:fdeName/git-credential`
 
@@ -1660,6 +1660,8 @@ Response `200` (the token is never returned):
 { "host": "github.com", "username": "x-access-token", "configured": true }
 ```
 
+If this host is the FDE's assigned `per_fde_pat` Git host, a successful write records the remote login and changes `users.status` from `awaiting_credential` to `active`. Deleting that credential moves the account back to `awaiting_credential`.
+
 ### `GET /api/admin/fdes/:fdeName/git-credential`
 
 Response `200`:
@@ -1671,3 +1673,27 @@ Response `200`:
 ### `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>`
 
 Removes all stored credential lines for the exact host, leaving other hosts intact; the credential file remains present even when empty. Response `200` is `{ "host": "github.com", "deleted": true }`. Audit details contain the host and deletion result, never token text.
+
+## 11. Admin Git host registry (issue #118)
+
+All routes require the existing `requireAdmin` authorization. `git_hosts.mode` is derived by the server; clients must not set it. `admin_key` is accepted only on create or when replacing the key, and responses contain only a masked value plus `admin_key_configured`. The key is never included in audit details. `provider='azure'` is reserved in the database constraint but rejected by the current API.
+
+### `GET /api/admin/git-hosts`
+
+Returns `{ "items": [host, ...] }`, where each host contains `id`, `name`, `provider`, `base_url`, masked `admin_key`, `admin_key_configured`, derived `mode` (`minted` or `per_fde_pat`), and `enabled`.
+
+### `POST /api/admin/git-hosts`
+
+Request fields: `name`, `provider` (`gitea` / `github` / `gitlab`), `base_url`, optional `admin_key`, and optional `enabled`. A Gitea/GitLab admin key selects `minted`; no key selects `per_fde_pat`; GitHub always requires `per_fde_pat`. Returns `201 { "host": ... }`.
+
+### `PATCH /api/admin/git-hosts/:id`
+
+Updates supplied host fields and returns `{ "host": ... }`. Omitting `admin_key` preserves it; `clear_admin_key: true` removes it and recomputes `mode`. `mode` is read-only. Changing provider or base URL is rejected with `409 host_in_use` while an FDE is bound.
+
+### `DELETE /api/admin/git-hosts/:id`
+
+Returns `204` when deleted; returns `409 host_in_use` while `fde_git_accounts` references the host.
+
+### `POST /api/admin/fdes/:fdeName/provision`
+
+The JSON body may contain `git_host_id`. The selected provider is recorded in `containers.git_provider`. `minted` hosts provision an account and scoped token; token plaintext is written to the FDE `.git-credentials` file and never stored in the database. `per_fde_pat` hosts finish with `users.status='awaiting_credential'` until the administrator writes the FDE's PAT through the Git credential endpoint. The response includes `status` and `git_provider`.

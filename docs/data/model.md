@@ -38,6 +38,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
 | 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
 | LLM 配置 | `fde_llm_bindings`（模型目录与上游凭据归 LiteLLM；旧 `llm_providers` / `llm_models` 于 migration 0010 改名为 `_retired`） | issue #117 phase 2 |
+| Git host 配置 | `git_hosts` / `fde_git_accounts`（migration 0011） | issue #118（多 Git host、按 host 能力选择代铸或逐 FDE 凭据） |
 | 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
 | 迁移台账 | `schema_migrations` | deploy-contract.md §3（A6 定稿） |
 
@@ -54,10 +55,10 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | `auth_source` / `oidc_sub` | `local` / `oidc`；OIDC JIT 建档按 `email` + `oidc_sub`（规格 §7.1）。P1 恒为 `local`（portal.md §2.1） |
 | `password_hash` / `totp_secret` | 本地账号：argon2id 哈希 + **强制 TOTP**（规格 §7.1）；TOTP 种子只经 bootstrap 下发，不走公开 API（portal.md §2.1） |
 | `last_totp_step` | TOTP 单码防重放（portal.md §2.9.4）：最近成功校验的时间步长（`bigint`，`floor(unix_seconds/30)`）；同时间窗内同码（步长 ≤ 已记录值）拒绝，成功校验原子推进 |
-| `status` / `disabled_at` | `active` / `disabled`。offboarding 停用（规格 §7.3），与 IdP 对账任务的写入目标 |
+| `status` / `disabled_at` | `active` / `disabled` / `awaiting_credential`。per-FDE PAT host 开户后暂为 `awaiting_credential`；对应 Git 凭据成功写入后恢复 `active`；offboarding 停用（规格 §7.3） |
 
-**状态机**：`active → disabled`（单向；恢复 = 管理操作重新置 `active`，无自动路径）。
-产生方：onboarding workflow / 对账任务（规格 §7.3）；消费方：登录（disabled 拒绝）、forward-auth、容器调度（disabled 用户的容器应停）。
+**状态机**：常规账号 `active → disabled`；Git 开户 `active → awaiting_credential → active`（必须写入指定 host 的 PAT）；offboarding 可从任一态转为 `disabled`。
+产生方：onboarding workflow / Git credential 管理 / 对账任务；消费方：登录、forward-auth、容器调度（仅 `active` 可运行）。
 
 ### 1.2 `login_sessions` — 登录会话
 
@@ -75,6 +76,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `runner_token_hash` / `token_generation` / `revoked_at` / `rotated_at` | per-container token（规格 §10.3 / issue #12）：**仅存哈希**。建容器时生成原文、注入容器 env `ERIX_STATION_TOKEN`；**容器 → portal 单向出示原文**（internal API Bearer），portal 只校验哈希、不再向容器出示。`token_generation` 是代次（轮换/重建 +1），`revoked_at` / `rotated_at` 记录吊销/轮换时刻——旧代次哈希失配 → `401 token_revoked`（原子吊销，topology.md §6 第 9 条）。严禁明文入 DB/日志/镜像/仓库（原理 §5 清单）。**容器除此之外无任何平台凭据，尤其没有 DB 凭据**（D1'） |
 | `status` | `creating / running / stopped / exited / removed`（状态机见 §2.4） |
 | `agent_version` | erix-agent 版本 pin / canary 的记录点（规格 §14 容器升级流程） |
+| `git_provider` | onboarding 选定的 Git host provider（`gitea` / `github` / `gitlab`）；host 详细绑定见 `fde_git_accounts` |
 | `last_heartbeat` | agentd 心跳（15s ⚠️，经 internal API 上报、portal 落库，runner-integration §4.2 U4）；3 次丢失（45s ⚠️）判容器死（视 `exited`），run 级处置走租约到期 re-claim（runner-integration §6.4） |
 
 ### 1.5 `projects` — 项目（容器内仓库目录）
@@ -308,6 +310,22 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 | `created_at` | 双用途：① TTL 基准——命中判定带 `created_at > now() - interval '24 hours'`；② `in_progress` 陈旧判定基准。过期行由 portal reaper 低频（≈1h）物理 `DELETE`（`idempotency.js` `purgeExpired`）；`idempotency_keys_created_idx` 供该扫描 |
 
 并发同 key（先到先得）：占位期间（< 5 分钟）的后续请求 → `409 idempotency_conflict`（`retryable: true`，**不执行** fn）；执行抛错 → 删除占位行释放 key；首执行完成后重发 → 回放首次结果。**记账与业务写入同事务**（fn 事务内 `record()`）→ 同 key 至多一次副作用；未接入 `record` 的调用方退回「业务提交后补记」路径（仍有残留窗口，portal.md §1.4）。写入方 = portal（HTTP 层包装，`portal/src/idempotency.js`）；读取方 = 同样只读本表命中判定（无其它消费者，不参与 SSE/状态机）。
+
+### 1.26 `git_hosts` — Git host 注册表（issue #118）
+
+来源为 [`deploy/migrations/0011-git-hosts.sql`](../../deploy/migrations/0011-git-hosts.sql)，baseline 冻结、不回写 `schema.sql`。
+
+| 关键字段 | 语义 |
+|---|---|
+| `provider` | 支持 `gitea` / `github` / `gitlab`；CHECK 保留 `azure`，但当前 portal API 明确拒绝创建 Azure host |
+| `base_url` | Git 服务 API 根地址；仅接受无 URL 凭据、查询与片段的 `http(s)` URL |
+| `admin_key` | 可选管理凭据。只对 Gitea/GitLab 用于代建账号与铸 token；API 仅掩码回显、不进日志/审计。`CHECK ((mode='minted') = (admin_key IS NOT NULL))` 保证 key 与 mode 一致 |
+| `mode` | 应用按 provider 能力与 admin key 自动计算：支持代铸且有 key → `minted`；否则 `per_fde_pat` |
+| `enabled` | 禁用 host 后不可用于新的 FDE provisioning；已有绑定保留 |
+
+### 1.27 `fde_git_accounts` — FDE 与远端 Git 账号绑定（issue #118）
+
+每个 FDE 最多绑定一个注册 host；删除 host 前检查本表引用。`token_ref` 是远端 token ID（吊销用），不是 token 内容；`remote_login` 只记远端用户名。`per_fde_pat` 等待管理员设置凭据时两者可空；PAT 内容仅写入 FDE 用户空间 `.git-credentials`，绝不落数据库。设置匹配 host 的凭据后用户状态从 `awaiting_credential` 恢复 `active`。
 
 ---
 
