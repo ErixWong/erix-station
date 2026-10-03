@@ -49,7 +49,7 @@ function closeTotp() {
 }
 
 onMounted(() => {
-  void Promise.all([admin.loadUsers(), admin.loadProviders()]);
+  void Promise.all([admin.loadUsers(), admin.loadProviders(), admin.loadGitHosts()]);
 });
 
 onBeforeUnmount(() => {
@@ -96,7 +96,7 @@ onBeforeUnmount(() => {
 
           <div v-if="admin.expandedUsers.includes(String(u.id))" class="border-t border-dashed border-black/15 px-3 py-2">
             <p v-if="!u.fde_name" class="muted">{{ t('admin.fde.noFdeNameHint') }}</p>
-            <UserLlmPane v-else :user="u" :providers="admin.providers" />
+            <UserLlmPane v-else :user="u" :providers="admin.providers" :git-hosts="admin.gitHosts" />
           </div>
         </div>
       </div>

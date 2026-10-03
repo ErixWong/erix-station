@@ -4,8 +4,9 @@
 //   附带：活跃 run warnbox、供应商下拉联动过滤模型下拉、provision 成功文案。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
 import UserLlmPane from './UserLlmPane.vue';
-import type { AdminUser, LlmProvider } from '../stores/admin';
+import type { AdminUser, GitHost, LlmProvider } from '../stores/admin';
 import { i18n, setLocale } from '../i18n';
 
 const FDE_USER = {
@@ -28,6 +29,19 @@ const PROVIDERS = [
     ],
   },
 ] as LlmProvider[];
+
+const GIT_HOSTS: GitHost[] = [
+  {
+    id: 'gh1',
+    name: 'GitHub',
+    provider: 'github',
+    base_url: 'https://github.com',
+    admin_key: null,
+    admin_key_configured: false,
+    mode: 'per_fde_pat',
+    enabled: true,
+  },
+];
 
 const GET_CONFIG = {
   config: {
@@ -59,13 +73,24 @@ function putCalls(fetchFn: ReturnType<typeof fetchMock>) {
     String(u).includes('/api/admin/fdes/alice/llm') && i?.method === 'PUT');
 }
 
-async function mountPane(extra?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined) {
+async function mountPane(
+  extra?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined,
+  user: AdminUser = FDE_USER,
+  gitHosts: GitHost[] = [],
+) {
   const fetchFn = fetchMock((url, init) => extra?.(url, init)
     ?? (url === '/api/admin/fdes/alice/llm' && !init?.method
       ? jsonResponse(200, GET_CONFIG)
+      : url === '/api/admin/users'
+        ? jsonResponse(200, { items: [user] })
       : jsonResponse(404, { error: { code: 'not_found', message: 'not found' } })));
   vi.stubGlobal('fetch', fetchFn);
-  const wrapper = mount(UserLlmPane, { props: { user: FDE_USER, providers: PROVIDERS }, global: { plugins: [i18n] } });
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(UserLlmPane, {
+    props: { user, providers: PROVIDERS, gitHosts },
+    global: { plugins: [pinia, i18n] },
+  });
   await flushPromises();
   return { wrapper, fetchFn };
 }
@@ -181,6 +206,42 @@ describe('UserLlmPane · LLM 配置表单', () => {
     expect(wrapper.text()).toContain('provision 完成：fde-alice（fde-alice 10.0.0.0/29）');
     expect(fetchFn.mock.calls.some(([u, i]) =>
       String(u).includes('/api/admin/fdes/alice/provision') && i?.method === 'POST')).toBe(true);
+  });
+
+  it('选择 per_fde_pat host 后录入凭据；token 成功提交后清空且不再显示表单', async () => {
+    const { wrapper, fetchFn } = await mountPane((url, init) => {
+      if (String(url).includes('/provision') && init?.method === 'POST') {
+        return jsonResponse(200, {
+          fde: 'alice', network: 'fde-alice', subnet: '10.0.0.0/29', container: 'fde-alice',
+          status: 'awaiting_credential',
+        });
+      }
+      if (String(url).endsWith('/git-credential') && init?.method === 'PUT') return jsonResponse(200, {});
+      return undefined;
+    }, FDE_USER, GIT_HOSTS);
+
+    await wrapper.get('[data-test="git-host-select"]').setValue('gh1');
+    await wrapper.findAll('form button')[1].trigger('click');
+    await flushPromises();
+    const provisionCall = fetchFn.mock.calls.find(([url]) => String(url).includes('/provision'));
+    expect(JSON.parse(String(provisionCall?.[1]?.body))).toEqual({ git_host_id: 'gh1' });
+    expect(wrapper.find('[data-test="git-credential-form"]').exists()).toBe(true);
+
+    const form = wrapper.get('[data-test="git-credential-form"]');
+    await form.findAll('input')[0].setValue('alice-gh');
+    await form.findAll('input')[1].setValue('ghp-secret-value');
+    await form.trigger('submit.prevent');
+    await flushPromises();
+    const credentialCall = fetchFn.mock.calls.find(([url, init]) =>
+      String(url).endsWith('/git-credential') && init?.method === 'PUT');
+    expect(JSON.parse(String(credentialCall?.[1]?.body))).toEqual({
+      host: 'github.com',
+      username: 'alice-gh',
+      token: 'ghp-secret-value',
+    });
+    expect(wrapper.find('[data-test="git-credential-form"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('ghp-secret-value');
+    expect(wrapper.text()).toContain('凭据已保存，FDE 账号已启用。');
   });
 });
 

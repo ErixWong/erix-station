@@ -26,12 +26,21 @@ function validateFde(fdeName) {
 
 function validateHost(host) {
   if (typeof host !== 'string' || host.length > 253) fail('host', 'host 必须是有效 DNS 主机名');
-  const normalized = host.toLowerCase();
-  const labels = normalized.split('.');
+  let parsed;
+  try {
+    parsed = new URL(`https://${host}`);
+  } catch {
+    fail('host', 'host 必须是有效 DNS 主机名');
+  }
+  if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    fail('host', 'host 必须是有效 DNS 主机名');
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const labels = hostname.split('.');
   if (labels.some((label) => label.length > 63 || !DNS_LABEL_RE.test(label))) {
     fail('host', 'host 必须是有效 DNS 主机名');
   }
-  return normalized;
+  return parsed.host.toLowerCase();
 }
 
 function getCredentialPath(config, fdeName) {
@@ -126,7 +135,7 @@ function parseCredentialLine(line) {
     const parsed = new URL(line);
     if (!parsed.hostname) return null;
     return {
-      host: parsed.hostname.toLowerCase(),
+      host: parsed.host.toLowerCase(),
       username: decodeURIComponent(parsed.username),
       token: decodeURIComponent(parsed.password),
     };
@@ -137,7 +146,7 @@ function parseCredentialLine(line) {
 
 function credentialHost(line) {
   try {
-    return new URL(line).hostname.toLowerCase() || null;
+    return new URL(line).host.toLowerCase() || null;
   } catch {
     return null;
   }
@@ -179,6 +188,37 @@ async function writeAudit(pool, actorId, action, fdeName, details) {
   );
 }
 
+async function updateAssignedAccount(pool, fdeName, host, username, configured) {
+  const result = await pool.query(
+    `SELECT u.id AS fde_id, a.git_host_id, h.base_url
+       FROM users u
+       JOIN fde_git_accounts a ON a.fde_id = u.id AND a.token_ref IS NULL
+       JOIN git_hosts h ON h.id = a.git_host_id
+      WHERE u.fde_name = $1`,
+    [fdeName],
+  );
+  for (const row of result.rows) {
+    let assignedHost;
+    try {
+      assignedHost = new URL(row.base_url).host.toLowerCase();
+    } catch {
+      continue;
+    }
+    if (assignedHost !== host) continue;
+    await pool.query(
+      `UPDATE fde_git_accounts
+          SET remote_login = $3, updated_at = now()
+        WHERE fde_id = $1 AND git_host_id = $2 AND token_ref IS NULL`,
+      [row.fde_id, row.git_host_id, configured ? username : null],
+    );
+    await pool.query(
+      `UPDATE users SET status = $2
+        WHERE id = $1 AND status = $3`,
+      [row.fde_id, configured ? 'active' : 'awaiting_credential', configured ? 'awaiting_credential' : 'active'],
+    );
+  }
+}
+
 function validateUsername(username) {
   if (typeof username !== 'string' || username.length === 0 || username.length > 255 || /[\u0000-\u001f\u007f]/.test(username)) {
     fail('username', 'username 必须是非空文本');
@@ -215,6 +255,7 @@ export async function setGitCredential({ pool, actorId = null, config, fdeName, 
     fde_name: fdeName,
     host: normalizedHost,
   });
+  await updateAssignedAccount(pool, fdeName, normalizedHost, username, true);
   return { host: normalizedHost, username, configured: true };
 }
 
@@ -238,6 +279,7 @@ export async function deleteGitCredential({ pool, actorId = null, config, fdeNam
     host: normalizedHost,
     deleted,
   });
+  if (deleted) await updateAssignedAccount(pool, fdeName, normalizedHost, null, false);
   return { host: normalizedHost, deleted };
 }
 
