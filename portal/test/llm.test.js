@@ -26,6 +26,7 @@ import {
   syncFdeLlmBindingOnOnboard,
   LlmError,
   LLM_MODEL_TYPES,
+  typeToMode,
 } from '../src/llm.js';
 import { createServer } from '../src/http.js';
 import { postMessage } from '../src/sessions.js';
@@ -126,6 +127,7 @@ class LlmFakePool {
         model_info: {
           id: m.id,
           type: m.type,
+          mode: m.mode,
           blocked: m.enabled === false,
           tool_calling: m.tool_calling,
           context_window: m.context_window,
@@ -146,6 +148,7 @@ class LlmFakePool {
       model_id: body.model_name,
       name: body.model_info?.display_name ?? body.model_name,
       type,
+      mode: body.model_info?.mode,
       tool_calling: body.model_info?.tool_calling ?? body.model_info?.metadata?.tool_calling ?? false,
       context_window: body.model_info?.context_window ?? body.model_info?.metadata?.context_window ?? null,
       upstream_model: body.litellm_params?.model,
@@ -161,6 +164,9 @@ class LlmFakePool {
     if (!m) throw this.#gatewayError(404, 'model not found');
     const info = body.model_info ?? {};
     if (info.display_name !== undefined) m.name = info.display_name;
+    if (info.type !== undefined) m.type = info.type;
+    if (info.metadata?.type !== undefined) m.type = info.metadata.type;
+    if (info.mode !== undefined) m.mode = info.mode;
     if (info.tool_calling !== undefined) m.tool_calling = info.tool_calling;
     if (info.context_window !== undefined) m.context_window = info.context_window;
     if (body.litellm_params?.model !== undefined) m.upstream_model = body.litellm_params.model;
@@ -682,6 +688,22 @@ test('setFdeLlmConfig rechecks active runs before model-binding changes; force p
 // model CRUD
 // ---------------------------------------------------------------------------
 
+test('typeToMode：模型用途映射，未知类型默认 chat', () => {
+  for (const [type, mode] of [
+    ['text', 'chat'],
+    ['vision', 'chat'],
+    ['embedding', 'embedding'],
+    ['rerank', 'rerank'],
+    ['audio-tts', 'audio_speech'],
+    ['audio-stt', 'audio_transcription'],
+    ['image-gen', 'image_generation'],
+    [undefined, 'chat'],
+    ['unknown', 'chat'],
+  ]) {
+    assert.equal(typeToMode(type), mode);
+  }
+});
+
 test('model create：proxy sends explicit upstream model, credential and metadata', async () => {
   const pool = new LlmFakePool({
     providers: [
@@ -702,6 +724,7 @@ test('model create：proxy sends explicit upstream model, credential and metadat
   assert.equal(call.body.litellm_params.model, 'deepseek/deepseek-chat');
   assert.equal(call.body.litellm_params.litellm_credential_name, 'p1');
   assert.equal(call.body.model_info.type, 'text');
+  assert.equal(call.body.model_info.mode, 'chat');
   assert.equal(call.body.model_info.tool_calling, true);
   assert.deepEqual(LLM_MODEL_TYPES, ['text', 'embedding', 'vision', 'rerank', 'audio-tts', 'audio-stt', 'image-gen']);
 });
@@ -782,19 +805,31 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
   });
   await updateModel(pool, 'm1', {
     model: ' openai/gpt-4o-updated ',
+    type: 'embedding',
     tool_calling: false,
     context_window: 4096,
   });
   const call = pool.gatewayCalls.find((entry) => entry.method === 'updateModel');
   assert.deepEqual(call.body.litellm_params, { model: 'openai/gpt-4o-updated' });
+  assert.equal(call.body.model_info.type, 'embedding');
+  assert.equal(call.body.model_info.mode, 'embedding');
+  assert.equal(call.body.model_info.metadata.type, 'embedding');
   assert.equal(call.body.model_info.tool_calling, false);
   assert.equal(call.body.model_info.context_window, 4096);
   assert.equal(call.body.model_info.metadata.tool_calling, false);
   assert.equal(call.body.model_info.metadata.context_window, 4096);
   assert.equal(pool.models[0].upstream_model, 'openai/gpt-4o-updated');
+  assert.equal(pool.models[0].type, 'embedding');
+  assert.equal(pool.models[0].mode, 'embedding');
+
+  await updateModel(pool, 'm1', { name: 'Embedding renamed' });
+  const nameOnlyCall = pool.gatewayCalls.filter((entry) => entry.method === 'updateModel')[1];
+  assert.equal(nameOnlyCall.body.model_info.type, 'embedding');
+  assert.equal(nameOnlyCall.body.model_info.mode, 'embedding');
+  assert.equal(nameOnlyCall.body.model_info.metadata.type, 'embedding');
 
   await updateModel(pool, 'm1', { model: ' ' });
-  assert.equal(pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').length, 1);
+  assert.equal(pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').length, 2);
 });
 
 test('model delete：forwards the LiteLLM model_info.id; missing model propagates 404', async () => {

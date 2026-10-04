@@ -4,6 +4,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import App from '../App.vue';
 import { createAppRouter } from '../router';
+import { useAdminStore } from '../stores/admin';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
 
@@ -212,7 +213,65 @@ describe('AdminReposView · Git host registry', () => {
 });
 
 describe('AdminView · LLM 管理', () => {
-  it('供应商卡片不渲染启停状态或按钮，并以确认 modal 执行删除', async () => {
+  it('新增供应商按钮位于 LLM 区块标题行末尾', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm');
+    const sectionTitle = wrapper.findAll('h2').find((heading) => heading.text() === 'LLM 供应商');
+    expect(sectionTitle).toBeDefined();
+    const headingRow = sectionTitle!.element.parentElement;
+    expect(headingRow).not.toBeNull();
+    if (!headingRow) throw new Error('LLM section heading row is missing');
+
+    const trigger = wrapper.get('[data-test="open-add-provider"]');
+    expect(headingRow.classList.contains('flex')).toBe(true);
+    expect(headingRow.classList.contains('items-center')).toBe(true);
+    expect(Array.from(headingRow.children).map((child) => child.tagName)).toEqual(['H2', 'SPAN', 'BUTTON']);
+    expect(headingRow.children[1].classList.contains('flex-1')).toBe(true);
+    expect(headingRow.lastElementChild).toBe(trigger.element);
+    expect(wrapper.get('[data-test="provider-list"]').find('[data-test="open-add-provider"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('默认展开全部供应商；手动折叠后 reload 保留选择并展开新供应商', async () => {
+    let providerItems = PROVIDERS.items;
+    const { wrapper, pinia } = await mountAdmin('/admin/llm', (url) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, { items: providerItems });
+      return undefined;
+    });
+    const store = useAdminStore(pinia);
+    expect(store.expandedProviders).toEqual(['p1', 'p2']);
+    expect(wrapper.findAll('[data-test="provider-card"]')[0].find('[data-test="model-row"]').exists()).toBe(true);
+
+    store.toggleExpandedProvider('p1');
+    providerItems = [
+      ...providerItems,
+      { id: 'p3', name: 'new-provider', base_url: 'https://new.example/v1', models: [] },
+    ];
+    await store.loadProviders();
+    expect(store.expandedProviders).toEqual(['p2', 'p3']);
+    expect(wrapper.findAll('[data-test="provider-card"]')[0].find('[data-test="model-row"]').exists()).toBe(false);
+    expect(wrapper.findAll('[data-test="provider-card"]')[2].text()).toContain('new-provider');
+    wrapper.unmount();
+  });
+
+  it('删除供应商会保留用户的展开状态偏好', async () => {
+    let providerItems = PROVIDERS.items;
+    const { wrapper, pinia } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, { items: providerItems });
+      if (url === '/api/admin/llm/providers/p1' && init?.method === 'DELETE') {
+        providerItems = providerItems.filter((provider) => provider.id !== 'p1');
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    const store = useAdminStore(pinia);
+    expect(store.expansionTouched).toBe(false);
+    await store.removeProvider(store.providers[0]);
+    expect(store.expansionTouched).toBe(true);
+    expect(store.expandedProviders).toEqual(['p2']);
+    wrapper.unmount();
+  });
+
+  it('供应商标题不渲染启停状态或按钮，并以确认 modal 执行删除', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
       if (url === '/api/admin/llm/providers/p1' && init?.method === 'DELETE') return new Response(null, { status: 204 });
       return undefined;
@@ -220,9 +279,13 @@ describe('AdminView · LLM 管理', () => {
     const cards = wrapper.findAll('[data-test="provider-card"]');
     expect(cards[0].text()).toContain('openai');
     expect(cards[0].text()).toContain('https://api.openai.com/v1');
+    const providerHeader = cards[0].get('[data-test="provider-header"]');
+    expect(providerHeader.findAll('button')[0].attributes('data-test')).toBe('open-add-model');
+    expect(providerHeader.findAll('button')[1].attributes('data-test')).toBe('toggle-provider-models');
     for (const card of cards) {
-      expect(card.text()).not.toMatch(/启用|停用/);
-      expect(card.findAll('button').map((button) => button.text()).join(' ')).not.toMatch(/启用|停用/);
+      const header = card.get('[data-test="provider-header"]');
+      expect(header.text()).not.toMatch(/启用|停用/);
+      expect(header.findAll('button').map((button) => button.text()).join(' ')).not.toMatch(/启用|停用/);
     }
 
     await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')
@@ -301,10 +364,9 @@ describe('AdminView · LLM 管理', () => {
       if (url === '/api/admin/llm/models/m1' && init?.method === 'DELETE') return new Response(null, { status: 204 });
       return undefined;
     });
-    const firstCard = wrapper.findAll('[data-test="provider-card"]')[0];
-    await firstCard.findAll('button')[0].trigger('click');
-    await flushPromises();
     const modelRow = wrapper.get('[data-test="model-row"]');
+    expect(modelRow.findAll('td')).toHaveLength(6);
+    expect(modelRow.text()).not.toContain('gpt-4o');
     await modelRow.findAll('button')[0].trigger('click');
     await flushPromises();
     const toggle = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1').find(
@@ -314,6 +376,7 @@ describe('AdminView · LLM 管理', () => {
 
     await wrapper.get('[data-test="open-add-model"]').trigger('click');
     const addForm = wrapper.get('[data-test="add-model-form"]');
+    expect(addForm.findAll('input')[0].attributes('required')).toBeDefined();
     await addForm.findAll('input')[0].setValue('gpt-4o-mini');
     const addUpstreamModel = addForm.get('[data-test="add-model-upstream-id"]');
     expect(addUpstreamModel.attributes('required')).toBeDefined();
@@ -332,13 +395,16 @@ describe('AdminView · LLM 管理', () => {
     const refreshedRow = wrapper.get('[data-test="model-row"]');
     await refreshedRow.get('[data-test="edit-model"]').trigger('click');
     const editForm = wrapper.get('[data-test="edit-model-form"]');
-    expect(editForm.text()).toContain('model_id: gpt-4o');
-    expect(editForm.text()).toContain('类型: text');
+    expect(editForm.text()).not.toContain('model_id');
+    expect(wrapper.get('[role="dialog"]').text()).toContain('编辑模型 GPT-4o');
+    const editType = editForm.get('[data-test="edit-model-type"]');
+    expect((editType.element as HTMLSelectElement).value).toBe('text');
     const editUpstreamModel = editForm.get('[data-test="edit-model-upstream-id"]');
     expect((editUpstreamModel.element as HTMLInputElement).value).toBe('openai/gpt-4o');
     await editUpstreamModel.setValue('openai/gpt-4o-edited');
     await editForm.findAll('input')[1].setValue('GPT-4o edited');
     await editForm.findAll('input')[2].setValue('65536');
+    await editType.setValue('embedding');
     await editForm.find('input[type="checkbox"]').setValue(false);
     await editForm.trigger('submit.prevent');
     await flushPromises();
@@ -346,13 +412,13 @@ describe('AdminView · LLM 管理', () => {
       ([, init]) => JSON.parse(String(init?.body)).name === 'GPT-4o edited',
     );
     expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
-      model: 'openai/gpt-4o-edited', name: 'GPT-4o edited', tool_calling: false, context_window: 65536,
+      model: 'openai/gpt-4o-edited', name: 'GPT-4o edited', type: 'embedding', tool_calling: false, context_window: 65536,
     });
 
     const deleteButton = wrapper.get('[data-test="model-row"]').findAll('button')
       .find((button) => button.text() === '删除')!;
     await deleteButton.trigger('click');
-    expect(wrapper.find('[role="dialog"]').text()).toContain('确认删除模型 gpt-4o？');
+    expect(wrapper.find('[role="dialog"]').text()).toContain('确认删除模型 GPT-4o？');
     await wrapper.find('[role="dialog"]').findAll('button')
       .find((button) => button.text() === '取消')!.trigger('click');
     expect(callsTo(fetchFn, 'DELETE', '/api/admin/llm/models/m1')).toHaveLength(0);
@@ -369,8 +435,6 @@ describe('AdminView · LLM 管理', () => {
       if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
       return undefined;
     });
-    await wrapper.findAll('[data-test="provider-card"]')[0].findAll('button')[0].trigger('click');
-    await flushPromises();
     await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
     const editForm = wrapper.get('[data-test="edit-model-form"]');
     await editForm.get('[data-test="edit-model-upstream-id"]').setValue('');

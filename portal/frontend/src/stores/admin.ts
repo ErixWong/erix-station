@@ -99,6 +99,7 @@ export const useAdminStore = defineStore('admin', {
     fdeErr: null as string | null,
     gitHostsErr: null as string | null,
     expandedProviders: [] as string[], // 旧 S.expanded（Set<string>，provider id）
+    expansionTouched: false,
     totpOnce: null as TotpOnce | null, // 旧 #totpOnce 内联盒
     usersLoading: false,
   }),
@@ -113,6 +114,7 @@ export const useAdminStore = defineStore('admin', {
     },
 
     toggleExpandedProvider(id: string) {
+      this.expansionTouched = true;
       const i = this.expandedProviders.indexOf(id);
       if (i >= 0) this.expandedProviders.splice(i, 1);
       else this.expandedProviders.push(id);
@@ -123,7 +125,20 @@ export const useAdminStore = defineStore('admin', {
       this.llmErr = null;
       try {
         const data = await api<ProvidersResponse>('/api/admin/llm/providers');
-        this.providers = data.items ?? [];
+        const providers = data.items ?? [];
+        const providerIds = providers.map((provider) => String(provider.id));
+        if (!this.expansionTouched) {
+          this.expandedProviders = providerIds;
+        } else {
+          const previousProviderIds = new Set(this.providers.map((provider) => String(provider.id)));
+          this.expandedProviders = this.expandedProviders.filter((id) => providerIds.includes(id));
+          for (const id of providerIds) {
+            if (!previousProviderIds.has(id) && !this.expandedProviders.includes(id)) {
+              this.expandedProviders.push(id);
+            }
+          }
+        }
+        this.providers = providers;
         this.providersLoaded = true;
       } catch (e) {
         this.llmErr = t('admin.errorPrefix') + this.errText(e);
@@ -307,6 +322,7 @@ export const useAdminStore = defineStore('admin', {
       this.llmErr = null;
       try {
         await api(`/api/admin/llm/providers/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+        this.expansionTouched = true;
         const i = this.expandedProviders.indexOf(p.id);
         if (i >= 0) this.expandedProviders.splice(i, 1);
         await this.loadProviders();
@@ -364,7 +380,7 @@ export const useAdminStore = defineStore('admin', {
     /** 编辑模型可变字段：PATCH /api/admin/llm/models/<id>。 */
     async updateModel(
       m: LlmModel,
-      fields: { name: string; tool_calling: boolean; context_window?: number; model?: string },
+      fields: { name: string; type?: string; tool_calling: boolean; context_window?: number; model?: string },
     ): Promise<string | null> {
       this.llmErr = null;
       try {
