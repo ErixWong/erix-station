@@ -145,7 +145,7 @@ export function createLlmGatewayClient({
     unblockModel: (modelId) => post('/model/unblock', { model_id: modelId }),
     listCredentials: () => request('GET', '/credentials'),
     createCredential: (body) => post('/credentials', body),
-    updateCredential: (name, body) => request('PUT', namePath(name), { body }),
+    updateCredential: (name, body) => patch(namePath(name), body),
     deleteCredential: (name) => request('DELETE', namePath(name)),
   });
 }

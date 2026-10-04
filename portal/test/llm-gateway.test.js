@@ -94,7 +94,7 @@ test('LiteLLM admin API request contract: all client methods, paths, verbs, auth
       ['POST', '/model/unblock'],
       ['GET', '/credentials'],
       ['POST', '/credentials'],
-      ['PUT', '/credentials/deepseek%20%2F%20prod'],
+      ['PATCH', '/credentials/deepseek%20%2F%20prod'],
       ['DELETE', '/credentials/deepseek%20%2F%20prod'],
     ]);
     assert.deepEqual(calls[0].body, userBody);

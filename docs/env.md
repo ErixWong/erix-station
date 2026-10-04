@@ -87,9 +87,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | `TRAEFIK_WEB_PORT` | Traefik `web` entrypoint 的监听端口（Traefik 跑 **host 网络**，独占；对外唯一入口之一。H-B 定稿，issue #5） | 平台规范固定（规格 §5：只有 ingress 占 80/443）+ 目标环境探测（可用性，见 §9） | `80` |
 | `TRAEFIK_WEBSECURE_PORT` | Traefik `websecure` entrypoint 的监听端口（同上，host 网络） | 同上 | `443`（目标环境冲突未解时过渡用 `8443`，见 §5.1 与 §8.3） |
 | portal 8080 | portal 服务端口，**publish 仅 `127.0.0.1:8080`（回环）**：portal 在 `backend` 网络，回环 publish 供 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN（H-B 定稿 D-3，issue #5，规格 §5） | 平台规范固定 + 目标环境探测（回环 8080 可用性，§9 第 7 项） | `127.0.0.1:8080`（⚠️ 参考实例 A 上宿主 8080 已被 `gitea_act_runner` 占用，见 §8.2——该机部署需迁移占用者或改 publish 端口） |
-| mock 数据面 4000 | 保留的 `station-mock-llm` 使用；仅 dev/验收，当前 portal 不再指向它 | 平台规范固定（迁移期） | `127.0.0.1:4000` |
-| LiteLLM 数据面 4100 | issue #117 phase 2 当前端口，`station-litellm` 以 `litellm` profile 启动；仅绑定 `127.0.0.1`。Traefik 通过 `LLM_GATEWAY_HOST` 访问；portal 容器内 AI-title 使用 `LLM_GATEWAY_ADMIN_URL`（同 LiteLLM 服务的 backend 地址） | 平台规范固定（迁移期） | `127.0.0.1:4100` |
-| mock 调试面 4001（`MOCK_DEBUG_PORT`） | **仅 dev/验收**（P1 mock 网关）：只提供 `GET /__debug/last-request`（返回全局最近请求的 `Authorization`＝Traefik 注入的真实上游 key），**publish 仅 `127.0.0.1:${MOCK_DEBUG_PORT:-4001}`（回环）**；数据面 4000 对 `/__debug/*` 一律 404，FDE 容器/Traefik 均不可达（**2026-09-20 修订，issue #38 PR #39 评审 F4**：debug 端点原与数据面同端口且 LLM router 无 path 限制，任一 FDE 可经 `llm.<base>` 读到全局 Authorization＝跨 FDE 泄露 key）。生产网关（P3）无此端点 | 目标环境探测（回环 4001 可用性，§9 第 7 项） | `127.0.0.1:4001` |
+| LiteLLM 数据面/管理面 | `station-litellm` 仅在 `litellm` profile 启动；宿主只发布到 `127.0.0.1`，默认端口由 `LITELLM_HOST_PORT` 控制。Traefik 通过 `LLM_GATEWAY_HOST` 访问；portal 容器内 AI-title 使用 `LLM_GATEWAY_ADMIN_URL`（backend 地址） | 平台规范固定 + 目标环境探测 | `127.0.0.1:4100`（默认） |
 | station-db 5432 | 数据库端口，**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机；station-db 是独立 postgres 容器，与宿主既有实例互不可见 | 平台规范固定 | —（同上） |
 
 ### 5.1 通用部署前检查：ingress 端口可用性
@@ -151,7 +149,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | 用例 | 期望 |
 |---|---|
 | FDE → 宿主 `:443`（Traefik） | ✅ 通 |
-| FDE → 宿主 `:8080` / `:4000`（portal / LLM 网关数据面回环） | ❌ 拒 |
+| FDE → 宿主 portal / LLM 网关回环发布端口 | ❌ 拒 |
 | FDE → 宿主 publish `gitea:3000` / `mssql:1433` / `portainer:9000` | ❌ 拒 |
 | FDE → 互联网 HTTPS | 按安全团队出口策略（issue #3） |
 | FDE → DNS | ✅（netns `127.0.0.11`；外部 resolver 按上文放行 53） |
@@ -222,9 +220,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 80 | ✅ 空闲（`ss -tlnp` 无监听） | Traefik `web` entrypoint（唯一 publish 之一） | 参考实例 A 上可用 |
 | 443 | ⚠️ **已被容器 `nginx_reverse_proxy` 占用**（`0.0.0.0:443->443/tcp`，nginx，默认 vhost 对 `https://127.0.0.1/` 返回 `502 Bad Gateway`；同容器另映射 9001/9002） | Traefik `websecure` entrypoint | 参考实例 A 上冲突，处理选项见 §8.3 |
 | 8080 | 已被容器 `gitea_act_runner` 占用（host 网络，进程直接监听 `:::8080`，Go 服务：`http://127.0.0.1:8080/` 返回 `404 text/plain`） | portal（H-B：**publish `127.0.0.1:8080` 回环**，规格 §5） | ⚠️ **参考实例 A 上有冲突**：回环 8080 被占 → 该机部署需迁移占用者或改 portal publish 端口；目标环境按 §9 第 7 项重新核实 |
-| 4000 | `ss -tlnp` 未见宿主监听（2026-05） | 保留的 station-mock-llm 数据面（dev/验收） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
-| 4100 | `ss -tlnp` 未见宿主监听（2026-05） | LiteLLM data plane（H-B：**publish `127.0.0.1:4100` 回环**；admin 面仅 backend 网络可达） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
-| 4001 | `ss -tlnp` 未见宿主监听（2026-05） | mock 调试面（dev/验收专用，**publish `127.0.0.1:4001` 回环**，`MOCK_DEBUG_PORT`；F4 起与数据面分离，见 §5） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
+| 4100 | `ss -tlnp` 未见宿主监听（2026-05） | LiteLLM data plane/admin plane（`LITELLM_HOST_PORT` 默认值；**publish `127.0.0.1:4100` 回环**） | 参考实例 A 上可用；目标环境按 §9 第 7 项重新核实 |
 | 5432 | 已被容器 `postgresql` 占用（`0.0.0.0:5432->5432/tcp`） | station-db（**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机） | 无冲突——station-db 是独立 postgres 容器，只对 `backend` 网络暴露 5432，与宿主既有实例互不可见（同上） |
 
 ### 8.3 443 占用处理记录（参考实例 A 的候选方案）
@@ -255,7 +251,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 4 | 内存 | `free -h` | 记录总量/可用 | §7 资源 | |
 | 5 | 磁盘 | `df -h /`；及 `df -h <DATA_ROOT> <USER_SPACE_ROOT>` | 按目标规模估算是否充裕 | §7 资源 / §6 路径 | |
 | 6 | ingress 端口可用性（🕓 部署期事项，P1 开发无需执行） | `ss -tlnp \| grep -E ':(80\|443)\b'` | 80/443 无监听，或占用者已按 §5.1 评估 | §5 `TRAEFIK_WEB_PORT` / `TRAEFIK_WEBSECURE_PORT` | |
-| 7 | 其他端口占用 | `ss -tlnp \| grep -E ':(8080\|4000\|4100\|5432)\b'` | portal publish `127.0.0.1:8080`、mock `127.0.0.1:4000`、LiteLLM `127.0.0.1:4100`（回环，需对应端口空闲）；station-db 不 publish，理论上无冲突 | §5 | |
+| 7 | 其他端口占用 | `ss -tlnp \| grep -E ':(8080\|4100\|5432)\b'` | portal publish `127.0.0.1:8080`、LiteLLM `127.0.0.1:${LITELLM_HOST_PORT:-4100}`（回环，需对应端口空闲）；station-db 不 publish，理论上无冲突 | §5 | |
 | 8 | Portainer 是否存在 | `docker ps --format '{{.Names}} {{.Ports}}' \| grep -i portainer` | 记录容器名/监听地址 | §7 Portainer | |
 | 9 | 既有容器命名冲突 | `docker ps -a --format '{{.Names}}' \| grep -E '^(station-\|fde-)'` | 无输出，或冲突容器已评估 | §6 容器命名 | |
 | 10 | 内网 DNS 泛解析（🕓 部署期事项，P1 开发无需执行） | `dig station.<base> @<内网DNS>`；`dig test.fde.<base> @<内网DNS>` | 两条均解析到宿主机内网 IP；不支持泛解析时走 §1 降级方案 | §1 DNS 泛解析 | |
@@ -299,12 +295,12 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
 | `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8；**已决 2026-09-18，issue #27**） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
-| `LLM_GATEWAY_HOST` | Traefik host-network 使用的 LiteLLM 数据面回环地址（docker-compose 已提供该变量；按迁移期端口指向 4100） | `http://127.0.0.1:4100` |
-| `LLM_GATEWAY_PORT` | `station-mock-llm` 数据面在宿主的回环发布端口；issue #117 迁移期 mock 继续占用 4000 | `4000` |
+| `LLM_GATEWAY_HOST` | Traefik host-network 使用的 LiteLLM 数据面回环地址 | `http://127.0.0.1:4100` |
+| `LITELLM_HOST_PORT` | LiteLLM 在宿主回环发布的端口；隔离栈必须指定与其它栈不同的端口 | `4100` |
 | `LLM_GATEWAY_MODE` / `LLM_GATEWAY_ADMIN_URL` | portal LiteLLM admin API 配置；该 LiteLLM 版本管理面与数据面同服务。`self` 使用 backend 上的本栈 LiteLLM，`external` 指向外部网关。AI-title 从 portal 容器经此 backend URL 调用数据面 | `self` / `http://station-litellm:4000` |
 | `LITELLM_MASTER_KEY` / `LLM_GATEWAY_MASTER_KEY` | LiteLLM proxy admin key（`sk-` 前缀）；Compose 把同一秘密映射到 portal 配置项；只放 `deploy/.env`（600），不得提交 | 独立强随机值 |
 | `LITELLM_SALT_KEY` | LiteLLM 加密 DB 凭据的 salt；写入 `litellm` 库数据后不可更改；只放 `deploy/.env`（600） | 独立强随机值 |
-| `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD` | 独立 LiteLLM 数据库角色；容器 `DATABASE_URL` 指向 `station-db:5432/litellm`，不得复用 portal 的 DB 角色 | `litellm` / 独立随机值 |
+| `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD` | 独立 LiteLLM 数据库角色；新建 DB 数据目录时由 `deploy/db-init/01-litellm.sh` 创建角色与库；容器 `DATABASE_URL` 指向 `station-db:5432/litellm`，不得复用 portal 的 DB 角色 | `litellm` / 独立随机值 |
 | `DATABASE_URL`（LiteLLM 容器） | Compose 内部构造的 PostgreSQL URL，连接 `station-db` 上的 `litellm` 数据库 | `postgresql://litellm:…@station-db:5432/litellm` |
 | `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
@@ -339,12 +335,11 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `PORTAL_PUBLIC_BASE_URL` | portal 对外完整 URL（cookie 域 / 跳转生成用，portal 运行时） | 空 = 由 `PORTAL_HOST` 派生 |
 | `LLM_PUBLIC_BASE_URL` | LLM 网关对外完整 URL（`llm.<base>`，路由生成与占位 endpoint 用） | 空 = 由 `LLM_HOST` 派生 |
 | `SESSION_TTL_SECONDS` | portal 登录会话 TTL | `604800`（7 天） |
-| `FDE_IPAM_POOLS` | IPAM 池（逗号分隔 CIDR；proxy/portal 双侧校验） | `10.200.0.0/16,10.201.0.0/16` |
+| `FDE_IPAM_POOLS` | IPAM 池（逗号分隔 CIDR；proxy/portal 双侧校验；隔离 e2e 必须使用与宿主网络不重叠的专用池） | `10.200.0.0/16,10.201.0.0/16` |
 | `FDE_ALLOWED_USERS` | FDE 容器允许的 `uid:gid` 白名单（create 参数级校验，deploy-contract §5.1） | `1001:1000` |
 | `FDE_MEMORY_LIMIT_MAX` / `FDE_PIDS_LIMIT_MAX` | FDE 容器资源限额上限（`0` = 不限；透传 station-docker-proxy） | `0` / `0` |
 | `FDE_DEV_MODE` | 显式开发模式（F12/F14 松约束；生产必须 `0` 或 `NODE_ENV=production`） | 开发 `1` / 生产 `0` |
 | `FDE_DEV_USER` | 开发期容器 `--user`（whoami 镜像无双 UID 用户时兑底） | `1001:1000` |
-| `MOCK_LATENCY_MS` | station-mock-llm 注入延迟（联调用，dev-only） | `0` |
 
 ### 10.2 补登：agentd 容器侧环境变量（runner 运行时，2026-09-24 登记）
 

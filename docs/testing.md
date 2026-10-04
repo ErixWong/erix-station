@@ -481,13 +481,13 @@ curl -s -o /dev/null -w '%{http_code}' -H 'Last-Event-ID: 999999999' .../events
 
 ### 3.9 P1 对话验收的 LLM mock 网关（deploy §7.3）
 
-> P1 对话走**无真实凭据的 OpenAI-compatible mock**（deploy §7.3），验证「请求发出 + 错误码映射」而非真实推理。
+> 集成对话通过 LiteLLM 原生 `mock_response` 验证真实产品链路，不访问真实上游 LLM。
 
 | 用例 | 动作 | 期望 | 判定 |
 |---|---|---|---|
-| L1 请求发出 | 起 mock（§2.2 同法 dev 容器/进程，`127.0.0.1:4000`），worker 发 `/v1/chat/completions` | mock 收到请求（`Authorization` 为占位 key 或 mock 哨兵值，**无真实 key**） | 请求到达 + 响应可解析 |
-| L2 错误码映射 | mock 注入 `429` → 断言 run `rate_limited`；注入 `5xx` 后恢复 → 断言重试；store 写入失败注入 → `checkpoint_failed`（§6.2） | 各错误码按 portal §6 映射 | 逐条匹配 |
-| L3 零凭据断言 | `grep -rn "LLM_DEV_API_KEY\|sk-" portal/ runner/ deploy/ docs/`（不含 mock 哨兵值） | 无真实 LLM key | 无命中（deploy §7.3 红线） |
+| L1 请求发出 | 经管理台 API 建 LiteLLM credential/mock model 并绑定 FDE；worker 经 Traefik 发 `/v1/chat/completions` | LiteLLM 原生 mock response 回到 assistant 消息，run `finished` | 请求经过真实路由与 key 注入链 |
+| L2 模型白名单 | 使用 FDE virtual key 请求已选模型、未选模型及 `/v1/models` | 已选模型 200；未选模型 403；列表仅含允许模型 | WP6 e2e |
+| L3 零真实凭据 | 检查 runner 配置、容器环境与 LiteLLM 测试 credential | FDE 不持有真实上游凭据；测试 credential 不含真实 key | deploy §7.3 红线 |
 
 ---
 

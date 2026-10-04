@@ -87,7 +87,7 @@ async function startServer(poolOpts = {}) {
     kdfQueueLimit: 100,
     kdfQueueTimeoutMs: 30000,
     maxBodyBytes: 64 * 1024,
-    llmGatewayUrl: 'http://127.0.0.1:4000',
+    llmGatewayUrl: 'http://127.0.0.1:4100',
     llmGatewayAdminUrl: 'http://station-litellm:4000',
     maxLoginLength: 128,
     maxPasswordLength: 256,
@@ -202,7 +202,7 @@ test('issue #114：上游超长标题 → sanitizeTitle 截断 ≤30 字', async
 test('issue #114：无 FDE binding → 不回退到已退役的本地 provider/model 目录', async () => {
   const s = await startServer({
     binding: null,
-    providerRow: { base_url: 'http://127.0.0.1:4000', model_id: 'deepseek-flash' },
+    providerRow: { base_url: 'http://127.0.0.1:4100', model_id: 'deepseek-flash' },
     messages: ['本地自建端点'],
   });
   const stub = stubUpstreamFetch(() => jsonResponse(200, { choices: [{ message: { content: '本地端点命名' } }] }));

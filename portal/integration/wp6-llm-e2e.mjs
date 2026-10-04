@@ -1,114 +1,219 @@
-// WP6 端到端（issue #38 Phase C）：LLM 注入链路 + admin 配置面全链路验证。
-// 链路：FDE 容器 agentd/worker（占位 config.json，endpoint=llm.<baseDomain>）→ Traefik
-//   （llm-routes.yml：per-FDE router Host(llmHost)+ClientIP(精确 subnet)，middleware 注入真 key）
-//   → provider service url（http://127.0.0.1:4000，Traefik host 网络回环可达）→ mock-llm。
-// 另验证：迁移 0002 生效、admin API 掩码回显、心跳下行模型集（run 边界生效）、
-//   换模型 key 保留、非 admin 403、deprovision 收敛、无 LLM 配置 FDE（bob）旧格式兼容。
-// 骨架与起栈方式同 wp2b-e2e/wp5-e2e（docker/psql/api helper、STATION_DB_DIR、compose up/down）。
-// ⚠️ 不可与其它 e2e 并行（独占本机 station 栈 + DB 目录）。key 只进断言/配置，不进日志输出。
-// 运行：npm run test:integration:wp6
+// WP6 end-to-end: LiteLLM admin setup, per-FDE key injection, allow-listing, and lifecycle regression.
+// Must run with unique compose/container names, temporary DB storage, and isolated host ports.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
+import { ensureLlmBinding } from './lib/llm-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
-const PORTAL = 'http://127.0.0.1:18080';
-const MOCK = 'http://127.0.0.1:4000'; // 数据面（FDE→Traefik→mock 链路）
-// F4（评审）：/__debug/last-request 只在独立调试端口（MOCK_DEBUG_PORT，默认 4001，仅宿主回环）
-// 提供；数据面 4000 对 /__debug/* 一律 404（防 FDE 经 llm.<base> 读全局 Authorization 跨 FDE 泄露 key）。
-const MOCK_DEBUG = 'http://127.0.0.1:4001';
-const FDE_IMAGE = 'erix-station/fde:local';
-// e2e 专用上游 key（形态有意非 erix-*：mock 虚拟 key 校验按设计 401——注入断言靠
-// __debug/last-request 记录而非响应；run 因此以 failed 终态完成属预期，见各断言注释）。
-const API_KEY = 'sk-e2e-abcdef123456';
-const API_KEY_MASK = `sk-...${API_KEY.slice(-4)}`;
-// agentd 心跳周期 15s（runner/agentd.js CFG.heartbeatMs 默认）：下行模型集至少等 2 个周期 + 余量。
+const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
+const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
+const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
+const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
+const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
+const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
+const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
+const FDE_NAMES = {
+  alice: process.env.WP6_FDE_ALICE || 'alice',
+  bob: process.env.WP6_FDE_BOB || 'bob',
+};
+const FDE_IMAGE = process.env.FDE_IMAGE || 'erix-station/fde:local';
+const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
+const ADMIN_PASSWORD = 'wp6-admin-pass-123';
 const HEARTBEAT_MS = 15000;
 
-// llmHost 唯一口径 = config.llmHost（portal/src/config.js）：env.LLM_HOST || `llm.${BASE_DOMAIN}`；
-// compose 以 LLM_HOST=llm.${BASE_DOMAIN:-localhost} 注入 → 与本函数同源于 deploy/.env 的 BASE_DOMAIN。
-function resolveLlmHost() {
-  let baseDomain = 'localhost';
-  try {
-    const envText = fs.readFileSync(path.join(REPO_ROOT, 'deploy/.env'), 'utf8');
-    const m = /^BASE_DOMAIN=(.+)$/m.exec(envText);
-    if (m && m[1].trim()) baseDomain = m[1].trim();
-  } catch { /* 缺 .env → 用 compose 默认 localhost */ }
-  return `llm.${baseDomain}`;
-}
-const LLM_HOST = resolveLlmHost();
+const LLM_HOST = 'llm.localhost';
 
-// Traefik web entrypoint 端口（容器内 llm.<base> 走 http + 该端口，同源于 config.js resolvePublicBaseUrl）。
-function resolveTraefikWebPort() {
-  try {
-    const envText = fs.readFileSync(path.join(REPO_ROOT, 'deploy/.env'), 'utf8');
-    const m = /^TRAEFIK_WEB_PORT=(.+)$/m.exec(envText);
-    if (m && m[1].trim()) return m[1].trim();
-  } catch { /* 缺 .env → 用 compose 默认 8090 */ }
-  return '8090';
+function assertIsolatedEnvironment() {
+  const required = [
+    'STATION_DB_DIR', 'COMPOSE_PROJECT_NAME', 'STATION_STACK_ID',
+    'STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME',
+    'STATION_EDGE_NAME', 'STATION_LITELLM_NAME', 'PORTAL_HOST_PORT',
+    'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
+    'STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE',
+    'WP6_FDE_ALICE', 'WP6_FDE_BOB', 'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS',
+  ];
+  for (const name of required) assert.ok(process.env[name], `${name} must be set for isolated e2e`);
+  const dbRelativePath = path.relative(os.tmpdir(), path.resolve(process.env.STATION_DB_DIR));
+  assert.ok(dbRelativePath && !dbRelativePath.startsWith('..') && !path.isAbsolute(dbRelativePath),
+    'STATION_DB_DIR must be inside the OS temporary directory');
+  assert.ok(!fs.existsSync(process.env.STATION_DB_DIR), 'STATION_DB_DIR must be a fresh, nonexistent directory');
+  for (const [name, forbidden] of [
+    ['COMPOSE_PROJECT_NAME', 'station'],
+    ['STATION_STACK_ID', 'default'],
+    ['STATION_DB_NAME', 'station-db'],
+    ['STATION_PORTAL_NAME', 'station-portal'],
+    ['STATION_DOCKER_PROXY_NAME', 'station-docker-proxy'],
+    ['STATION_EDGE_NAME', 'station-edge'],
+    ['STATION_LITELLM_NAME', 'station-litellm'],
+    ['PORTAL_HOST_PORT', '18080'],
+    ['LITELLM_HOST_PORT', '4100'],
+    ['TRAEFIK_WEB_PORT', '8090'],
+    ['TRAEFIK_WEBSECURE_PORT', '8443'],
+    ['BACKEND_SUBNET', '172.32.0.0/24'],
+    ['STATION_PORTAL_IMAGE', 'erix-station/portal:local'],
+    ['STATION_DOCKER_PROXY_IMAGE', 'erix-station/fde-proxy:local'],
+    ['FDE_IMAGE', 'erix-station/fde:local'],
+    ['WP6_FDE_ALICE', 'alice'],
+    ['WP6_FDE_BOB', 'bob'],
+  ]) assert.notEqual(process.env[name], forbidden, `${name} must not target the shared stack`);
+  assert.equal(process.env.FDE_POOL, 'large', 'isolated e2e must use the dedicated large FDE pool');
+  const fdeIpamPools = process.env.FDE_IPAM_POOLS.split(',').map((pool) => pool.trim()).filter(Boolean);
+  assert.deepEqual(fdeIpamPools, ['10.201.0.0/16'], 'proxy IPAM pool must match the isolated FDE pool');
+  assert.equal(process.env.COMPOSE_PROJECT_NAME, process.env.STATION_STACK_ID,
+    'compose project and stack label must use the same unique ID');
+  for (const name of ['STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME', 'STATION_EDGE_NAME', 'STATION_LITELLM_NAME']) {
+    assert.ok(process.env[name].endsWith(`-${process.env.STATION_STACK_ID}`), `${name} must include the unique stack ID`);
+  }
+  for (const name of ['STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE']) {
+    assert.ok(process.env[name].endsWith(`:${process.env.STATION_STACK_ID}`), `${name} must use a unique image tag`);
+  }
+  assert.match(FDE_NAMES.alice, /^[a-z0-9][a-z0-9-]{0,62}$/);
+  assert.match(FDE_NAMES.bob, /^[a-z0-9][a-z0-9-]{0,62}$/);
+  assert.ok(FDE_NAMES.alice.includes(process.env.STATION_STACK_ID), 'WP6_FDE_ALICE must include the unique stack ID');
+  assert.ok(FDE_NAMES.bob.includes(process.env.STATION_STACK_ID), 'WP6_FDE_BOB must include the unique stack ID');
+  assert.notEqual(FDE_NAMES.alice, FDE_NAMES.bob, 'isolated FDE names must be distinct');
+  const ports = ['PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT']
+    .map((name) => process.env[name]);
+  assert.equal(new Set(ports).size, ports.length, 'isolated e2e ports must be distinct');
+  for (const port of ports) {
+    assert.match(port, /^\d{2,5}$/);
+    assert.ok(Number(port) <= 65535);
+    assert.ok(!['4000', '4001', '4100', '8090', '8443', '18080'].includes(port),
+      `isolated e2e must not use a shared-stack port (${port})`);
+  }
+  assert.equal(process.env.LLM_GATEWAY_HOST, `http://127.0.0.1:${LITELLM_HOST_PORT}`,
+    'LLM_GATEWAY_HOST must target the isolated LiteLLM publish port');
 }
-const TRAEFIK_WEB_PORT = resolveTraefikWebPort();
+
+async function assertHostPortsAvailable() {
+  for (const port of [PORTAL_HOST_PORT, LITELLM_HOST_PORT, TRAEFIK_WEB_PORT, process.env.TRAEFIK_WEBSECURE_PORT]) {
+    const server = net.createServer();
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(Number(port), '127.0.0.1', () => server.close(resolve));
+    }).catch((error) => {
+      throw new Error(`isolated e2e port ${port} is unavailable: ${error.message}`);
+    });
+  }
+}
+
+function writeTraefikStatic(dir) {
+  const source = fs.readFileSync(TRAEFIK_DEFAULT_STATIC, 'utf8');
+  assert.ok(source.includes('address: ":8090"') && source.includes('address: ":8443"'),
+    'Traefik static config has the expected entrypoint addresses');
+  const output = source
+    .replace('address: ":8090"', `address: ":${TRAEFIK_WEB_PORT}"`)
+    .replace('address: ":8443"', `address: ":${process.env.TRAEFIK_WEBSECURE_PORT}"`);
+  const target = path.join(dir, 'traefik.yml');
+  fs.writeFileSync(target, output);
+  return target;
+}
 
 function docker(args) {
-  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, { encoding: 'utf8', stdio: 'pipe', cwd: REPO_ROOT });
+  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
+    encoding: 'utf8',
+    stdio: 'pipe',
+    cwd: REPO_ROOT,
+  });
 }
+
 function dockerStdin(args, input) {
-  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], cwd: REPO_ROOT });
+  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
+    encoding: 'utf8',
+    input,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: REPO_ROOT,
+  });
 }
-const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
+
+const DB_DIR = (process.env.STATION_DB_DIR || '').replace(/\/+$/, '');
+
 function removeDbDir() {
   const parent = path.posix.dirname(DB_DIR);
   const name = path.posix.basename(DB_DIR);
   safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
 }
+
 function compose(args, env = {}) {
-  return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, { encoding: 'utf8', stdio: 'pipe', cwd: REPO_ROOT, env: { ...process.env, ...env } });
+  return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
+    encoding: 'utf8',
+    stdio: 'pipe',
+    cwd: REPO_ROOT,
+    env: { ...process.env, ...env },
+  });
 }
-function safe(fn) { try { return fn(); } catch { return null; } }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function safe(fn) {
+  try {
+    return fn();
+  } catch {
+    return null;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function waitFor(fn, { label, timeoutMs, intervalMs = 500 }) {
-  const t0 = Date.now();
-  let lastErr;
-  while (Date.now() - t0 < timeoutMs) {
+  const startedAt = Date.now();
+  let lastError;
+  while (Date.now() - startedAt < timeoutMs) {
     try {
-      const v = await fn();
-      if (v) return v;
-    } catch (e) { lastErr = e; }
+      const value = await fn();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
     await sleep(intervalMs);
   }
-  throw new Error(`timeout waiting for ${label}${lastErr ? `: ${lastErr.message}` : ''}`);
+  throw new Error(`timeout waiting for ${label}${lastError ? `: ${lastError.message}` : ''}`);
 }
+
+async function restartPortalAndWaitForConfigs(fdeNames) {
+  // Test users are created after startup; use the documented DB+volume rebuild path for their files.
+  docker(`restart ${STATION_PORTAL_NAME}`);
+  await waitFor(async () => (await fetch(`${PORTAL}/healthz`).catch(() => null))?.status === 200,
+    { label: 'portal healthz after materializer rebuild', timeoutMs: 120000, intervalMs: 500 });
+  for (const fdeName of fdeNames) {
+    const configPath = path.join(S.userspaceRoot, fdeName, 'home', '.erix', 'config.json');
+    await waitFor(() => (fs.existsSync(configPath) ? configPath : null),
+      { label: `${fdeName} config.json materialized`, timeoutMs: 60000, intervalMs: 250 });
+  }
+}
+
 function psql(query) {
-  return docker(`exec station-db psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
+  return docker(`exec ${STATION_DB_NAME} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
 }
+
 function readCookie(setCookie) {
-  const m = /fde_session_dev=([^;]+)/.exec(setCookie ?? '');
-  return m ? m[1] : null;
+  const match = /fde_session_dev=([^;]+)/.exec(setCookie ?? '');
+  return match ? match[1] : null;
 }
-// llm-routes.yml 是 root:root 0600（portal 容器内写入），e2e 进程非 root 无法直读——
-// 经 docker（root）读宿主 bind mount 目录：既拿到内容也拿到真实权限位。
-const readLlmRoutes = () => safe(() => docker(`run --rm -v ${S.dynamicRoot}:/d:ro alpine cat /d/llm-routes.yml 2>/dev/null`)) ?? '';
-const llmRoutesMode = () => safe(() => docker(`run --rm -v ${S.dynamicRoot}:/d:ro alpine stat -c %a /d/llm-routes.yml 2>/dev/null`))?.trim() ?? '';
-async function mockLastRequest() {
-  const r = await fetch(`${MOCK_DEBUG}/__debug/last-request`);
-  if (r.status === 204) return null;
-  assert.equal(r.status, 200, 'debug 端点 200');
-  return r.json();
-}
+
+const readLlmRoutes = () =>
+  safe(() => docker(`run --rm -v ${S.dynamicRoot}:/d:ro alpine cat /d/llm-routes.yml 2>/dev/null`)) ?? '';
+const llmRoutesMode = () =>
+  safe(() => docker(`run --rm -v ${S.dynamicRoot}:/d:ro alpine stat -c %a /d/llm-routes.yml 2>/dev/null`))?.trim() ?? '';
 
 const S = {
   userspaceRoot: null,
   dynamicRoot: null,
+  staticRoot: null,
+  artifactsRoot: null,
+  staticFile: null,
   password: 'correct horse battery staple',
   adminCookie: null,
-  adminTotp: null,
-  users: {}, // name -> { cookie, totpSecret, projectId, sessionId }
+  users: {},
 };
 
 const FDE_ENV = {
@@ -117,8 +222,11 @@ const FDE_ENV = {
   FDE_DEV_USER: '',
   FDE_DEV_MODE: '1',
   FDE_AGENT_VERSION: '0.1.0',
-  MOCK_LATENCY_MS: '0',
 };
+
+function fdeContainer(alias) {
+  return `fde-${FDE_NAMES[alias]}`;
+}
 
 async function login(loginName, secret, password = S.password) {
   const step1 = await fetch(`${PORTAL}/api/auth/login`, {
@@ -127,11 +235,11 @@ async function login(loginName, secret, password = S.password) {
     body: JSON.stringify({ login: loginName, password }),
   });
   assert.equal(step1.status, 200, `login step1 (${loginName})`);
-  const { pending_token } = await step1.json();
+  const { pending_token: pendingToken } = await step1.json();
   const step2 = await fetch(`${PORTAL}/api/auth/login/totp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pending_token, code: totp.totp(secret) }),
+    body: JSON.stringify({ pending_token: pendingToken, code: totp.totp(secret) }),
   });
   assert.equal(step2.status, 200, `login step2 (${loginName})`);
   const cookie = readCookie(step2.headers.get('set-cookie'));
@@ -139,295 +247,420 @@ async function login(loginName, secret, password = S.password) {
   return cookie;
 }
 
-async function api(cookie, p, opts = {}) {
-  const r = await fetch(`${PORTAL}${p}`, {
-    method: opts.method ?? 'GET',
-    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${cookie}`, ...(opts.headers ?? {}) },
-    body: opts.body,
+async function api(cookie, pathname, options = {}) {
+  const response = await fetch(`${PORTAL}${pathname}`, {
+    method: options.method ?? 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: `fde_session_dev=${cookie}`,
+      ...(options.headers ?? {}),
+    },
+    body: options.body,
   });
-  const body = await r.json().catch(() => ({}));
-  return { status: r.status, body };
+  const body = await response.json().catch(() => ({}));
+  return { status: response.status, body };
 }
 
-/** admin API（S.adminCookie 会话）。 */
-async function adminApi(p, opts = {}) {
-  return api(S.adminCookie, p, opts);
+async function adminApi(pathname, options = {}) {
+  return api(S.adminCookie, pathname, options);
 }
 
-/** bootstrap-admin CLI（口令不含空格，避开 shell 引号传递歧义）→ 解析一次性 TOTP 种子。 */
-const ADMIN_PASSWORD = 'wp6-admin-pass-123';
 function bootstrapAdmin(loginName) {
-  const out = docker(`exec station-portal node portal/src/cli.js bootstrap-admin --login ${loginName} --password ${ADMIN_PASSWORD}`);
-  const m = /种子（[^\n]*）：([A-Z2-7]{16,})/.exec(out);
-  assert.ok(m, 'bootstrap-admin 输出含 TOTP 种子行（输出不入日志）');
-  return m[1];
+  const output = docker(
+    `exec ${STATION_PORTAL_NAME} node portal/src/cli.js bootstrap-admin --login ${loginName} --password ${ADMIN_PASSWORD}`,
+  );
+  const seedMatch = /种子（[^\n]*）：([A-Z2-7]{16,})/.exec(output);
+  assert.ok(seedMatch, 'bootstrap-admin output contains the one-time TOTP seed');
+  return seedMatch[1];
 }
 
-/** 经 admin API 建 FDE 用户（响应一次性下发 totp_secret）。 */
 async function createFdeUser(loginName) {
-  const r = await adminApi('/api/admin/users', {
+  const response = await adminApi('/api/admin/users', {
     method: 'POST',
-    body: JSON.stringify({ login: loginName, display_name: loginName, password: S.password, fde_name: loginName }),
+    body: JSON.stringify({
+      login: loginName,
+      display_name: loginName,
+      password: S.password,
+      fde_name: FDE_NAMES[loginName],
+    }),
   });
-  assert.equal(r.status, 201, `create user ${loginName}: ${JSON.stringify(r.body)}`);
-  assert.ok(r.body.totp_secret, 'totp_secret 一次性下发');
-  return r.body.totp_secret;
+  assert.equal(response.status, 201, `create user ${loginName}`);
+  assert.ok(response.body.totp_secret, 'totp_secret is returned once');
+  return response.body.totp_secret;
 }
 
-async function createProject(name) {
-  const r = await api(S.users[name].cookie, '/api/projects', {
+async function createSession(alias) {
+  const response = await api(S.users[alias].cookie, '/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ name: 'proj1', repo_url: `https://git.example/${name}/proj1.git`, template: 'node' }),
+    body: JSON.stringify({ cwd: '~/projects/proj1', title: 'wp6' }),
   });
-  assert.equal(r.status, 201, `create project (${name}): ${JSON.stringify(r.body)}`);
-  S.users[name].projectId = r.body.project.id;
+  assert.equal(response.status, 201, `create session (${alias}): ${JSON.stringify(response.body)}`);
+  S.users[alias].sessionId = response.body.session.id;
 }
 
-async function createSession(name) {
-  const r = await api(S.users[name].cookie, '/api/sessions', {
-    method: 'POST',
-    body: JSON.stringify({ project_id: S.users[name].projectId, title: 'wp6' }),
-  });
-  assert.equal(r.status, 201, `create session (${name}): ${JSON.stringify(r.body)}`);
-  S.users[name].sessionId = r.body.session.id;
+async function provisionFde(alias) {
+  const fdeName = FDE_NAMES[alias];
+  const container = fdeContainer(alias);
+  docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js provision-fde --fde-name ${fdeName}`);
+  await waitFor(
+    () => (docker(`inspect ${container} --format {{.State.Status}}`).trim() === 'running' ? true : null),
+    { label: `${container} running`, timeoutMs: 120000 },
+  );
+  await waitFor(
+    () => (docker(`logs ${container} 2>&1`).includes('sse ping received') ? true : null),
+    { label: `${container} agentd SSE ping`, timeoutMs: 90000, intervalMs: 1000 },
+  );
 }
 
-/** 发消息建 run → 等终态（finished/failed）。mock 对非 erix-* key 按设计 401 → run 以 failed
- *  终态完成属预期：本 e2e 的注入证据是 mock 记录的请求头/模型，不是 run 成败。 */
-async function sendMessageAndWait(name, content, timeoutMs = 180000) {
-  const sent = await api(S.users[name].cookie, `/api/sessions/${S.users[name].sessionId}/messages`, {
+async function sendMessageAndWait(alias, content, timeoutMs = 180000) {
+  const response = await api(S.users[alias].cookie, `/api/sessions/${S.users[alias].sessionId}/messages`, {
     method: 'POST',
     body: JSON.stringify({ content }),
   });
-  assert.equal(sent.status, 202, `send message (${name}): ${JSON.stringify(sent.body)}`);
-  const runId = sent.body.run.id;
-  const st = await waitFor(() => {
-    const s = psql(`SELECT status FROM runs WHERE id='${runId}'`);
-    return s === 'finished' || s === 'failed' ? s : null;
+  assert.equal(response.status, 202, `send message (${alias}): ${JSON.stringify(response.body)}`);
+  const runId = response.body.run.id;
+  const status = await waitFor(() => {
+    const value = psql(`SELECT status FROM runs WHERE id='${runId}'`);
+    return value === 'finished' || value === 'failed' ? value : null;
   }, { label: `run ${runId} terminal`, timeoutMs, intervalMs: 500 });
-  return { runId, status: st };
+  return { runId, status };
 }
 
-async function provisionFde(name) {
-  docker(`exec station-portal node portal/src/cli.js provision-fde --fde-name ${name}`);
-  await waitFor(() => (docker(`inspect fde-${name} --format {{.State.Status}}`).trim() === 'running' ? true : null),
-    { label: `fde-${name} running`, timeoutMs: 90000 });
-  await waitFor(() => (docker(`logs fde-${name} 2>&1`).includes('sse ping received') ? true : null),
-    { label: `fde-${name} agentd sse ping`, timeoutMs: 90000, intervalMs: 1000 });
-}
-
-/** 等心跳下行模型集落 agentd 内存（2 个心跳周期 + 余量；下行无文件/日志可观测，固定等待）。 */
 async function waitHeartbeatDownlink(cycles = 2) {
   await sleep(cycles * HEARTBEAT_MS + 5000);
 }
 
-test('WP6 端到端：LLM 注入链路（config → admin API → Traefik 注入 → 心跳下行 → run 生效）+ 全量回归', { timeout: 20 * 60 * 1000 }, async (t) => {
+function requestFromFde(alias, pathname, { method = 'GET', virtualKey, gatewayIp, body } = {}) {
+  assert.ok(gatewayIp, 'FDE gateway IP is required for the Traefik probe');
+  const request = {
+    url: `http://${gatewayIp}:${TRAEFIK_WEB_PORT}${pathname}`,
+    method,
+    headers: {
+      Host: LLM_HOST,
+      Authorization: `Bearer ${virtualKey}`,
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  };
+  const script = [
+    'const http=require("node:http");',
+    `const req=${JSON.stringify(request)};`,
+    'const outgoing=http.request(req.url,{method:req.method,headers:req.headers},response=>{',
+    'let body="";response.setEncoding("utf8");response.on("data",chunk=>body+=chunk);',
+    'response.on("end",()=>console.log(JSON.stringify({status:response.statusCode,body})));',
+    '});',
+    'outgoing.on("error",error=>{console.error(error.message);process.exitCode=1});',
+    'if(req.body)outgoing.write(req.body);outgoing.end();',
+  ].join('');
+  const output = docker(`exec ${fdeContainer(alias)} node -e ${JSON.stringify(script)}`).trim();
+  return JSON.parse(output);
+}
+
+async function createMockModel(providerId, modelName, responseText) {
+  const created = await adminApi(`/api/admin/llm/providers/${encodeURIComponent(providerId)}/models`, {
+    method: 'POST',
+    body: JSON.stringify({
+      model_id: modelName,
+      name: modelName,
+      type: 'text',
+      tool_calling: true,
+      model: 'openai/none',
+      litellm_params: {
+        model: 'openai/none',
+        mock_response: responseText,
+        mock_delay: 0,
+        litellm_credential_name: providerId,
+      },
+    }),
+  });
+  assert.equal(created.status, 201, `create mock model (${modelName})`);
+  const listed = await adminApi('/api/admin/llm/models');
+  assert.equal(listed.status, 200, 'list models');
+  const model = (listed.body.items ?? []).find(
+    (item) => item.provider_id === providerId && item.model_name === modelName,
+  );
+  assert.ok(model?.id, `LiteLLM model ${modelName} is listed`);
+  return model;
+}
+
+test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and binding lifecycle', {
+  timeout: 20 * 60 * 1000,
+}, async (t) => {
+  assertIsolatedEnvironment();
+  await assertHostPortsAvailable();
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp6-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp6-'));
+  S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp6-'));
+  S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp6-'));
+  S.staticFile = writeTraefikStatic(S.staticRoot);
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
+  fs.chmodSync(S.staticRoot, 0o755);
+  fs.chmodSync(S.artifactsRoot, 0o755);
+  const composePaths = {
+    ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+    TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+    TRAEFIK_STATIC_HOST: S.staticFile,
+    ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
+    BASE_DOMAIN: 'localhost',
+    PORTAL_HOST: 'station.localhost',
+    PORTAL_PUBLIC_BASE_URL: `http://station.localhost:${TRAEFIK_WEB_PORT}`,
+    LLM_HOST: 'llm.localhost',
+    LLM_PUBLIC_BASE_URL: `http://llm.localhost:${TRAEFIK_WEB_PORT}`,
+  };
 
   const cleanup = () => {
-    safe(() => docker('rm -f fde-alice fde-bob 2>/dev/null || true'));
-    safe(() => docker('network rm fde-alice fde-bob 2>/dev/null || true'));
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local erix-station/mock-llm:local 2>/dev/null || true'));
+    safe(() => docker(`rm -f ${fdeContainer('alice')} ${fdeContainer('bob')} 2>/dev/null || true`));
+    safe(() => docker(`network rm fde-${FDE_NAMES.alice} fde-${FDE_NAMES.bob} 2>/dev/null || true`));
+    safe(() => compose('down -v', composePaths));
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
+    safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
+    safe(() => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
     removeDbDir();
   };
   t.after(cleanup);
 
   try {
-    // 0) 预清理 + 重建 runner 镜像（含真实 agentd/worker）
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
+    safe(() => compose('down -v', composePaths));
     removeDbDir();
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     docker(`build -t ${FDE_IMAGE} runner/`);
-
-    // 1) 起栈（build 含 mock-gateway 重建；MIGRATE_ON_START=1 真实迁移 runner）
     compose('up -d --build', {
-      ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
-      TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+      ...composePaths,
       MIGRATE_ON_START: '1',
+      LITELLM_HOST_PORT,
+      LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}`,
       ...FDE_ENV,
     });
     await waitFor(async () => {
-      const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
-      return r && r.status === 200;
+      const response = await fetch(`${PORTAL}/healthz`).catch(() => null);
+      return response?.status === 200;
     }, { label: 'portal healthz', timeoutMs: 240000, intervalMs: 1000 });
+    await waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${LITELLM_HOST_PORT}/health/readiness`).catch(() => null);
+      return response?.status === 200;
+    }, { label: `LiteLLM readiness (${STATION_LITELLM_NAME})`, timeoutMs: 180000, intervalMs: 1000 });
 
-    // 2) 迁移 0002 已应用 + 三表/新列存在（baseline schema.sql 冻结，只能来自增量迁移）
-    assert.equal(psql(`SELECT count(*) FROM schema_migrations WHERE version='0002-llm-config'`), '1',
-      '增量迁移 0002 已落 schema_migrations');
-    assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='llm_providers'`), '1', 'llm_providers 存在');
-    assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='llm_models'`), '1', 'llm_models 存在');
-    for (const col of ['provider_id', 'api_key', 'main_model_id', 'embedding_model_id', 'vision_model_id']) {
+    // Incremental migrations are the source of all post-baseline DDL.
+    for (const version of ['0002-llm-config', '0010-litellm-bindings', '0011-git-hosts']) {
       assert.equal(
-        psql(`SELECT count(*) FROM information_schema.columns WHERE table_name='fde_llm_bindings' AND column_name='${col}'`),
+        psql(`SELECT count(*) FROM schema_migrations WHERE version='${version}'`),
         '1',
-        `fde_llm_bindings.${col} 存在`,
+        `migration ${version} is applied`,
+      );
+    }
+    for (const table of ['llm_providers', 'llm_models']) {
+      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '0',
+        `${table} is retired`);
+      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}_retired'`), '1',
+        `${table}_retired is retained`);
+    }
+    for (const table of ['git_hosts', 'fde_git_accounts']) {
+      assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '1',
+        `${table} from migration 0011 exists`);
+    }
+    for (const column of ['provider_id', 'api_key', 'key_id', 'main_model_id', 'main_model_name']) {
+      assert.equal(
+        psql(`SELECT count(*) FROM information_schema.columns WHERE table_name='fde_llm_bindings' AND column_name='${column}'`),
+        '1',
+        `fde_llm_bindings.${column} exists`,
       );
     }
 
-    // 3) admin（bootstrap CLI）+ FDE 用户（admin API，totp_secret 一次性下发）
-    S.adminTotp = bootstrapAdmin('admin-wp6');
-    S.adminCookie = await login('admin-wp6', S.adminTotp, ADMIN_PASSWORD);
-    for (const name of ['alice', 'bob']) {
-      const secret = await createFdeUser(name);
-      S.users[name] = { cookie: await login(name, secret), totpSecret: secret };
+    const adminTotp = bootstrapAdmin('admin-wp6');
+    S.adminCookie = await login('admin-wp6', adminTotp, ADMIN_PASSWORD);
+    for (const alias of ['alice', 'bob']) {
+      const secret = await createFdeUser(alias);
+      S.users[alias] = {
+        cookie: await login(alias, secret),
+        fdeName: FDE_NAMES[alias],
+      };
+    }
+    await restartPortalAndWaitForConfigs([FDE_NAMES.alice, FDE_NAMES.bob]);
+    for (const alias of ['alice', 'bob']) {
+      await provisionFde(alias);
     }
 
-    // 4) admin API：provider（base_url 宿主回环 mock；Traefik host network 可达）+ 模型 A + alice 绑定
-    const provider = await adminApi('/api/admin/llm/providers', {
-      method: 'POST',
-      body: JSON.stringify({ name: 'mock-e2e', base_url: `${MOCK}` }),
+    // All resources, including the virtual key, are created through the product admin API.
+    const binding = await ensureLlmBinding({
+      docker,
+      dynamicDir: S.dynamicRoot,
+      fdeName: FDE_NAMES.alice,
+      portal: PORTAL,
+      portalContainerName: STATION_PORTAL_NAME,
+      dbContainerName: STATION_DB_NAME,
+      adminCookie: S.adminCookie,
+      modelName: 'e2e-mock-model',
+      modelResponse: 'E2E-MOCK-OK',
     });
-    assert.equal(provider.status, 201, `create provider: ${JSON.stringify(provider.body)}`);
-    const providerId = provider.body.provider.id;
-    const modelA = await adminApi(`/api/admin/llm/providers/${providerId}/models`, {
-      method: 'POST',
-      body: JSON.stringify({ model_id: 'mock-model-a', name: 'Mock A', type: 'text', tool_calling: true }),
-    });
-    assert.equal(modelA.status, 201, `create model A: ${JSON.stringify(modelA.body)}`);
-    const modelAId = modelA.body.model.id;
-    const put1 = await adminApi('/api/admin/fdes/alice/llm', {
-      method: 'PUT',
-      body: JSON.stringify({ provider_id: providerId, api_key: API_KEY, main_model_id: modelAId }),
-    });
-    assert.equal(put1.status, 200, `put fde llm: ${JSON.stringify(put1.body)}`);
-    // 红线 ②：响应只给掩码，绝不回显真 key
-    assert.equal(put1.body.config.api_key, API_KEY_MASK, 'api_key 掩码回显（sk-...last4）');
-    assert.ok(!JSON.stringify(put1.body).includes(API_KEY), '响应体不含真 key');
-    const getEcho = await adminApi('/api/admin/fdes/alice/llm');
+    const virtualKey = binding.virtualKey;
+    const keyMask = `sk-...${virtualKey.slice(-4)}`;
+    assert.equal(binding.modelName, 'e2e-mock-model');
+    assert.equal(binding.providerName, `e2e-cred-${FDE_NAMES.alice}`);
+    assert.equal(binding.bindingConfig.api_key, keyMask, 'PUT response masks the virtual key');
+    assert.ok(!JSON.stringify(binding.bindingConfig).includes(virtualKey), 'binding response does not echo the virtual key');
+    const getEcho = await adminApi(`/api/admin/fdes/${FDE_NAMES.alice}/llm`);
     assert.equal(getEcho.status, 200);
-    assert.equal(getEcho.body.config.api_key, API_KEY_MASK, 'GET 回显同掩码');
-    assert.ok(getEcho.body.active_run === false, '无 active run');
+    assert.equal(getEcho.body.config.api_key, keyMask, 'GET response also masks the virtual key');
+    assert.equal(getEcho.body.active_run, false, 'there is no active run');
 
-    // 5) provision alice（CLI 真建容器/网络）→ 等路由发布
-    await createProject('alice');
-    await provisionFde('alice');
-    const aliceSubnet = psql(`SELECT subnet FROM fde_networks n JOIN users u ON u.id=n.fde_id WHERE u.fde_name='alice'`);
-    assert.ok(aliceSubnet, 'alice subnet 分配');
+    const outsideModel = await createMockModel(binding.providerId, 'e2e-outside-model', 'OUTSIDE');
+    const nextModel = await createMockModel(binding.providerId, 'e2e-mock-model-b', 'E2E-MOCK-B');
+    assert.ok(outsideModel.id && nextModel.id);
+
+    const networkRow = psql(
+      `SELECT n.subnet, n.gateway FROM fde_networks n JOIN users u ON u.id=n.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`,
+    );
+    const [aliceSubnet, aliceGateway] = networkRow.split('|').map((value) => value.trim());
+    assert.ok(aliceSubnet, 'alice subnet allocated');
+    assert.ok(aliceGateway, 'alice network gateway allocated');
     await waitFor(() => {
-      const txt = readLlmRoutes();
-      return txt.includes('llm-alice:') ? txt : null;
-    }, { label: 'llm-routes.yml 含 llm-alice', timeoutMs: 60000 });
+      const text = readLlmRoutes();
+      return text.includes(`llm-${FDE_NAMES.alice}:`) ? text : null;
+    }, { label: `llm-routes.yml contains llm-${FDE_NAMES.alice}`, timeoutMs: 60000 });
 
-    // 6) 发布物断言：per-FDE router + 精确 subnet + key 注入 + mode 600 + 模型名不进 Traefik
+    // Published LLM routes carry only ingress restrictions, key injection, and the shared gateway service.
     const routes1 = readLlmRoutes();
-    assert.ok(routes1.includes(`llm-alice:`), 'router llm-alice 存在');
-    assert.ok(routes1.includes(`Host(\`${LLM_HOST}\`)`), `Host 规则用 llmHost=${LLM_HOST}（config 同源）`);
-    assert.ok(routes1.includes(`ClientIP(\`${aliceSubnet}\`)`), 'ClientIP 精确 subnet（alice /29）');
-    assert.ok(routes1.includes(`llm-key-alice`), 'key middleware 成对');
-    assert.ok(routes1.includes(`Bearer ${API_KEY}`), 'llm-routes.yml 含注入的上游 key（明文仅在此 mode 600 文件）');
-    assert.ok(!routes1.includes('mock-model-a'), '模型名不进 Traefik 配置（不进路由文件）');
-    assert.equal(llmRoutesMode(), '600', 'llm-routes.yml mode 600（宿主侧权限位）');
+    assert.ok(routes1.includes(`llm-${FDE_NAMES.alice}:`), 'per-FDE router exists');
+    assert.ok(routes1.includes(`Host(\`${LLM_HOST}\`)`), 'router matches configured llmHost');
+    assert.ok(routes1.includes(`ClientIP(\`${aliceSubnet}\`)`), 'router restricts the exact FDE subnet');
+    assert.ok(routes1.includes(`middlewares: [llm-key-${FDE_NAMES.alice}]`), 'router uses its paired key middleware');
+    assert.ok(routes1.includes(`llm-key-${FDE_NAMES.alice}:`), 'per-FDE key middleware exists');
+    assert.ok(routes1.includes(`Bearer ${virtualKey}`), 'middleware injects the virtual key');
+    assert.ok(routes1.includes('service: llm-gateway'), 'router uses the shared llm-gateway service');
+    assert.ok(routes1.includes(`- url: "http://127.0.0.1:${LITELLM_HOST_PORT}"`), 'shared service targets isolated LiteLLM');
+    assert.equal(routes1.split('\n').filter((line) => line === '    llm-gateway:').length, 1,
+      'exactly one shared service is emitted');
+    assert.ok(!routes1.includes('e2e-mock-model'), 'model names do not enter the route file');
+    assert.ok(!routes1.includes('e2e-cred-'), 'credential names do not enter the route file');
+    assert.equal(llmRoutesMode(), '600', 'llm-routes.yml mode is 600');
 
-    // 7) 心跳下行模型集 → run 边界生效：注入链路实测（authorization + model 双证据）
+    // The FDE's key can call only the selected model; another registered model is denied.
     await waitHeartbeatDownlink(2);
-    await createSession('alice');
-    const run1 = await sendMessageAndWait('alice', 'WP6 注入链路验收：请回复任意内容');
-    assert.equal(run1.status, 'failed', 'mock 按设计 401 非 erix-* key → run failed 终态（注入证据见下）');
-    const seen1 = await mockLastRequest();
-    assert.ok(seen1, 'mock 收到经 Traefik 注入的请求（FDE 容器 → Traefik → 127.0.0.1:4000 链路成立）');
-    // 注入成功：Authorization 被换成真 key（掩码后四位 3456）；下行生效：model 用真模型名
-    assert.ok(seen1.authorization === `Bearer ${API_KEY}`, `注入 key 命中（掩码 …${API_KEY.slice(-4)}）`);
-    assert.equal(seen1.model, 'mock-model-a', '心跳下行模型集生效：run 请求体 model=mock-model-a');
-
-    // F4 反向断言（评审）：/__debug/last-request 只存在于宿主回环调试端口——
-    // ① 宿主直连数据面 4000 → 404；② FDE 容器内经 LLM 路由（llm.<base>:webPort，无 path 限制
-    // 必达 mock 数据面）→ 404。堵住「任一 FDE 读到全局 Authorization（= 他人注入的真实 key）」。
-    const dp = await fetch(`${MOCK}/__debug/last-request`);
-    assert.equal(dp.status, 404, `宿主直连数据面 4000 的 /__debug 必须 404（得 ${dp.status}）`);
-    const viaLlm = docker(`exec fde-alice node -e ${JSON.stringify(
-      `fetch('http://${LLM_HOST}:${TRAEFIK_WEB_PORT}/__debug/last-request').then(r=>{console.log(r.status)}).catch(e=>{console.log('ERR '+e.message)})`,
-    )}`).trim();
-    assert.equal(viaLlm, '404', `FDE 容器经 LLM 路由访问 /__debug 必须 404（得 ${viaLlm}）`);
-
-    // 8) 换模型（不传 api_key = 保留旧值）→ 心跳刷新 → 新 run：model 变、key 不变
-    const modelB = await adminApi(`/api/admin/llm/providers/${providerId}/models`, {
+    const allowed = requestFromFde('alice', '/v1/chat/completions', {
       method: 'POST',
-      body: JSON.stringify({ model_id: 'mock-model-b', name: 'Mock B', type: 'text', tool_calling: true }),
+      virtualKey,
+      gatewayIp: aliceGateway,
+      body: { model: binding.modelName, messages: [{ role: 'user', content: 'allow-list check' }] },
     });
-    assert.equal(modelB.status, 201, `create model B: ${JSON.stringify(modelB.body)}`);
-    const put2 = await adminApi('/api/admin/fdes/alice/llm', {
+    assert.equal(allowed.status, 200, 'allow-listed model returns 200');
+    assert.equal(JSON.parse(allowed.body).choices?.[0]?.message?.content, 'E2E-MOCK-OK',
+      'LiteLLM native mock response is returned');
+    const denied = requestFromFde('alice', '/v1/chat/completions', {
+      method: 'POST',
+      virtualKey,
+      gatewayIp: aliceGateway,
+      body: { model: 'e2e-outside-model', messages: [{ role: 'user', content: 'deny-list check' }] },
+    });
+    assert.equal(denied.status, 403, 'registered but non-allow-listed model returns 403');
+    const visibleModels = requestFromFde('alice', '/v1/models', { virtualKey, gatewayIp: aliceGateway });
+    assert.equal(visibleModels.status, 200, 'FDE models endpoint returns 200');
+    assert.deepEqual(
+      JSON.parse(visibleModels.body).data.map((model) => model.id),
+      [binding.modelName],
+      'GET /v1/models returns only the allow-listed model',
+    );
+
+    // Heartbeat downlink selects the model at run time; the run completes normally.
+    await createSession('alice');
+    const run1 = await sendMessageAndWait('alice', 'WP6 allow-listed model should reply normally');
+    assert.equal(run1.status, 'finished', 'mock_response produces a finished run');
+    assert.equal(
+      psql(`SELECT count(*) FROM messages WHERE run_id='${run1.runId}' AND role='assistant' AND content LIKE '%E2E-MOCK-OK%'`),
+      '1',
+      'assistant message contains the LiteLLM mock response',
+    );
+    const keyIdBefore = psql(
+      `SELECT b.key_id FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`,
+    );
+    assert.ok(keyIdBefore, 'LiteLLM key id is stored on the binding');
+
+    // Change the selected model; /key/update must preserve both the key and its key_id.
+    const put2 = await adminApi(`/api/admin/fdes/${FDE_NAMES.alice}/llm`, {
       method: 'PUT',
-      body: JSON.stringify({ provider_id: providerId, main_model_id: modelB.body.model.id }),
+      body: JSON.stringify({ provider_id: binding.providerId, main_model_id: nextModel.id }),
     });
-    assert.equal(put2.status, 200, `put fde llm (model B, no api_key): ${JSON.stringify(put2.body)}`);
-    assert.equal(put2.body.config.api_key, API_KEY_MASK, 'api_key 未重传 = 保留旧值（掩码不变）');
+    assert.equal(put2.status, 200, `update selected model: ${JSON.stringify(put2.body)}`);
+    assert.equal(put2.body.config.api_key, keyMask, 'model update keeps the same masked key');
     await waitHeartbeatDownlink(2);
-    const run2 = await sendMessageAndWait('alice', 'WP6 换模型验收：请回复任意内容');
-    assert.equal(run2.status, 'failed', 'run2 同样 401 终态（预期）');
-    const seen2 = await mockLastRequest();
-    assert.equal(seen2.model, 'mock-model-b', '换模型生效：新 run 的 model=mock-model-b');
-    assert.ok(seen2.authorization === `Bearer ${API_KEY}`, `key 未重传仍保留（掩码 …${API_KEY.slice(-4)}）`);
+    const run2 = await sendMessageAndWait('alice', 'WP6 updated model should reply normally');
+    assert.equal(run2.status, 'finished', 'updated mock model produces a finished run');
+    assert.equal(
+      psql(`SELECT count(*) FROM messages WHERE run_id='${run2.runId}' AND role='assistant' AND content LIKE '%E2E-MOCK-B%'`),
+      '1',
+      'heartbeat downlink selected the updated model',
+    );
+    assert.equal(
+      psql(`SELECT b.key_id FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`),
+      keyIdBefore,
+      'model update retains the existing LiteLLM key_id',
+    );
+    assert.equal(
+      psql(`SELECT b.api_key FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`),
+      virtualKey,
+      'model update retains the same virtual key',
+    );
     const routes2 = readLlmRoutes();
-    assert.ok(routes2.includes('llm-alice:') && routes2.includes(`Bearer ${API_KEY}`), '换模型后路由仍在且 key 不变');
-    assert.ok(!routes2.includes('mock-model-b'), '模型名仍不进 Traefik 配置');
+    assert.ok(routes2.includes(`llm-${FDE_NAMES.alice}:`), 'router remains after model update');
+    assert.ok(routes2.includes(`Bearer ${virtualKey}`), 'key injected after model update is unchanged');
+    assert.ok(!routes2.includes('e2e-mock-model-b'), 'updated model name still does not enter the route file');
 
-    // 9) 非 admin 403：FDE 用户会话调 admin API
+    // Non-admins cannot use the management API.
     const forbiddenGet = await api(S.users.alice.cookie, '/api/admin/llm/providers');
-    assert.equal(forbiddenGet.status, 403, `非 admin GET admin API → 403（得 ${forbiddenGet.status}）`);
-    const forbiddenPut = await api(S.users.alice.cookie, '/api/admin/fdes/alice/llm', {
+    assert.equal(forbiddenGet.status, 403, 'non-admin GET to the admin API is forbidden');
+    const forbiddenPut = await api(S.users.alice.cookie, `/api/admin/fdes/${FDE_NAMES.alice}/llm`, {
       method: 'PUT',
-      body: JSON.stringify({ provider_id: providerId, api_key: 'sk-should-not-work', main_model_id: modelAId }),
+      body: JSON.stringify({ provider_id: binding.providerId, main_model_id: binding.modelId }),
     });
-    assert.equal(forbiddenPut.status, 403, `非 admin PUT admin API → 403（得 ${forbiddenPut.status}）`);
+    assert.equal(forbiddenPut.status, 403, 'non-admin PUT to the admin API is forbidden');
 
-    // 10) deprovision alice：路由收敛（llm-alice 消失、binding revoked）+ mock 不再收到新请求
-    const tsBeforeDeprovision = (await mockLastRequest())?.ts ?? 0;
-    docker('exec station-portal node portal/src/cli.js deprovision-fde --fde-name alice');
-    await waitFor(() => {
-      const gone = safe(() => docker('inspect fde-alice --format {{.Id}}').trim());
-      return gone ? null : true;
-    }, { label: 'fde-alice container removed', timeoutMs: 90000 });
-    await waitFor(() => {
-      const txt = readLlmRoutes();
-      return !txt.includes('llm-alice') ? true : null;
-    }, { label: 'llm-routes.yml 收敛（无 llm-alice）', timeoutMs: 60000 });
-    assert.equal(psql(`SELECT state FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='alice'`), 'revoked',
-      'offboard 同事务吊销 binding（revoked）');
-    await sleep(3000);
-    const seenAfter = await mockLastRequest();
-    assert.ok(!seenAfter || seenAfter.ts === tsBeforeDeprovision, 'deprovision 后 mock 无新请求（last-request ts 不变）');
+    // Deprovision revokes the binding and removes its published route.
+    docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js deprovision-fde --fde-name ${FDE_NAMES.alice}`);
+    await waitFor(
+      () => (safe(() => docker(`inspect ${fdeContainer('alice')} --format {{.Id}}`).trim()) ? null : true),
+      { label: `${fdeContainer('alice')} removed`, timeoutMs: 90000 },
+    );
+    await waitFor(
+      () => (readLlmRoutes().includes(`llm-${FDE_NAMES.alice}`) ? null : true),
+      { label: 'LLM route converges after deprovision', timeoutMs: 60000 },
+    );
+    assert.equal(
+      psql(`SELECT state FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`),
+      'revoked',
+      'deprovision revokes the LiteLLM binding',
+    );
 
-    // 11) 旧格式兼容：无 LLM 配置的 FDE（bob）provision + run 正常收敛（占位模型名路径不崩）
-    await createProject('bob');
-    await provisionFde('bob');
-    await waitFor(() => {
-      const txt = readLlmRoutes();
-      return !txt.includes('llm-bob') ? true : null;
-    }, { label: 'llm-routes.yml 无 llm-bob（fail-closed 不发布）', timeoutMs: 60000 });
+    // An FDE without a binding has no LLM router; message creation fails fast before queuing a run.
     await createSession('bob');
-    const tsBeforeBob = (await mockLastRequest())?.ts ?? 0;
-    const runBob = await sendMessageAndWait('bob', 'WP6 旧格式兼容验收：无 LLM 配置的 FDE');
-    assert.ok(['finished', 'failed'].includes(runBob.status), `bob run 终态收敛（得 ${runBob.status}）`);
-    const seenBob = await mockLastRequest();
-    assert.ok(!seenBob || seenBob.ts === tsBeforeBob,
-      'bob 无 LLM 路由：请求未达 mock（fail-closed，last-request ts 不变）');
-    // bob 容器/agentd 仍健康（心跳链路不受无配置影响）
-    assert.equal(docker(`inspect fde-bob --format {{.State.Status}}`).trim(), 'running', 'bob 容器仍 running');
-    const routesFinal = readLlmRoutes();
-    assert.ok(!routesFinal.includes('llm-bob'), 'llm-routes.yml 始终无 llm-bob');
+    const unboundMessage = await api(S.users.bob.cookie, `/api/sessions/${S.users.bob.sessionId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content: 'WP6 no-binding FDE must fail fast' }),
+    });
+    assert.equal(unboundMessage.status, 409, 'an FDE without an LLM binding cannot queue a run');
+    assert.equal(unboundMessage.body.error.code, 'llm_not_configured');
+    assert.equal(
+      psql(`SELECT count(*) FROM runs WHERE session_id='${S.users.bob.sessionId}'`),
+      '0',
+      'unbound FDE rejection does not create a run',
+    );
+    assert.equal(docker(`inspect ${fdeContainer('bob')} --format {{.State.Status}}`).trim(), 'running',
+      'unbound FDE container remains running');
+    assert.ok(!readLlmRoutes().includes(`llm-${FDE_NAMES.bob}`), 'no route is published for an unbound FDE');
 
-    // eslint-disable-next-line no-console
-    console.log(`\n[wp6] ✅ LLM 注入链路全绿：llmHost=${LLM_HOST} subnet=${aliceSubnet} ` +
-      `注入=Bearer…${API_KEY.slice(-4)} model=mock-model-a→mock-model-b（心跳下行） key 保留 掩码=${API_KEY_MASK} ` +
-      '非 admin 403 / deprovision 收敛 / bob 旧格式兼容');
-  } catch (err) {
+    console.log('[wp6] ✅ LiteLLM model allow-list, per-FDE key injection, mask, key stability, and deprovision checks passed');
+  } catch (error) {
     try {
-      // eslint-disable-next-line no-console
       console.log('\n[wp6] --- portal logs ---');
-      // eslint-disable-next-line no-console
-      console.log(docker('logs station-portal --tail 80 2>&1'));
-      // eslint-disable-next-line no-console
-      console.log('\n[wp6] --- fde-alice logs ---');
-      // eslint-disable-next-line no-console
-      console.log(safe(() => docker('logs fde-alice --tail 60 2>&1')) ?? '(container gone)');
-    } catch { /* 尽力 */ }
-    throw err;
+      console.log(docker(`logs ${STATION_PORTAL_NAME} --tail 80 2>&1`));
+      console.log(`\n[wp6] --- ${fdeContainer('alice')} logs ---`);
+      console.log(safe(() => docker(`logs ${fdeContainer('alice')} --tail 60 2>&1`)) ?? '(container gone)');
+      console.log(`\n[wp6] --- ${STATION_LITELLM_NAME} logs ---`);
+      console.log(safe(() => docker(`logs ${STATION_LITELLM_NAME} --tail 60 2>&1`)) ?? '(container gone)');
+    } catch {
+      // Keep the original test failure.
+    }
+    throw error;
   }
 });

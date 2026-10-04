@@ -52,7 +52,7 @@ safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
 docker(`build -t ${FDE_IMAGE} runner/`);
 compose('up -d --build', {
   ERIX_USERSPACE_ROOT_HOST: userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: dynamicRoot,
-  FDE_IMAGE, FDE_CMD: '[]', FDE_DEV_USER: '', FDE_DEV_MODE: '1', FDE_AGENT_VERSION: '0.1.0', MOCK_LATENCY_MS: '8000',
+  FDE_IMAGE, FDE_CMD: '[]', FDE_DEV_USER: '', FDE_DEV_MODE: '1', FDE_AGENT_VERSION: '0.1.0',
 });
 await waitFor(async () => {
   const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
