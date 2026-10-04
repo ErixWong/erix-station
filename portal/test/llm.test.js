@@ -94,13 +94,9 @@ class LlmFakePool {
       enabled: true,
       created_at: new Date(),
       updated_at: new Date(),
-    };
+    }
     this.providers.push(p);
-    return {
-      credential_name: p.id,
-      credential_info: body.credential_info,
-      credential_values: body.credential_values,
-    };
+    return { success: true, message: 'Credential created successfully' };
   }
 
   async updateCredential(name, body) {
@@ -111,11 +107,7 @@ class LlmFakePool {
     if (body.credential_values?.api_base !== undefined) p.base_url = body.credential_values.api_base;
     if (body.credential_values?.api_key !== undefined) p.api_key = body.credential_values.api_key;
     p.updated_at = new Date();
-    return {
-      credential_name: p.id,
-      credential_info: body.credential_info ?? { credential_name: p.id, display_name: p.name },
-      credential_values: body.credential_values ?? { api_base: p.base_url },
-    };
+    return { success: true, message: 'Credential updated successfully' };
   }
 
   async deleteCredential(name) {

@@ -1,22 +1,109 @@
 // WP5 端到端：对话链路（portal.md §4/§5）——会话 → 发消息建 run → 浏览器 SSE → 工具卡片事件 →
 // 停止（cancel_requested_at → cancelling → aborted run_end）→ assistant 回写 → 归档。
-// 复用 wp3b/wp4 验收环境（真实 runner 镜像 + mock LLM）。
-// ⚠️ 不可与其它 e2e 并行（down 本机 station 栈 / 删 /docker/station-db，同 wp2b/wp3a/wp3b/wp4 约定）。
+// 复用真实 runner + LiteLLM mock model；必须显式传入独立的栈名、容器名、端口和临时 DB 路径。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
-import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
+import { ensureLlmBinding } from './lib/llm-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
-const PORTAL = 'http://127.0.0.1:18080';
-const FDE_IMAGE = 'erix-station/fde:local';
+const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
+const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
+const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
+const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
+const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
+const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
+const FDE_NAME = process.env.FDE_NAME || 'alice';
+const FDE_CONTAINER = `fde-${FDE_NAME}`;
+const FDE_IMAGE = process.env.FDE_IMAGE || 'erix-station/fde:local';
+const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
+
+function assertIsolatedEnvironment() {
+  const required = [
+    'STATION_DB_DIR', 'COMPOSE_PROJECT_NAME', 'STATION_STACK_ID',
+    'STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME',
+    'STATION_EDGE_NAME', 'STATION_LITELLM_NAME', 'PORTAL_HOST_PORT',
+    'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
+    'STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_NAME', 'FDE_IMAGE',
+    'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS',
+  ];
+  for (const name of required) assert.ok(process.env[name], `${name} must be set for isolated e2e`);
+  const dbRelativePath = path.relative(os.tmpdir(), path.resolve(process.env.STATION_DB_DIR));
+  assert.ok(dbRelativePath && !dbRelativePath.startsWith('..') && !path.isAbsolute(dbRelativePath),
+    'STATION_DB_DIR must be inside the OS temporary directory');
+  assert.ok(!fs.existsSync(process.env.STATION_DB_DIR), 'STATION_DB_DIR must be a fresh, nonexistent directory');
+  for (const [name, forbidden] of [
+    ['COMPOSE_PROJECT_NAME', 'station'],
+    ['STATION_STACK_ID', 'default'],
+    ['STATION_DB_NAME', 'station-db'],
+    ['STATION_PORTAL_NAME', 'station-portal'],
+    ['STATION_DOCKER_PROXY_NAME', 'station-docker-proxy'],
+    ['STATION_EDGE_NAME', 'station-edge'],
+    ['STATION_LITELLM_NAME', 'station-litellm'],
+    ['PORTAL_HOST_PORT', '18080'],
+    ['LITELLM_HOST_PORT', '4100'],
+    ['TRAEFIK_WEB_PORT', '8090'],
+    ['TRAEFIK_WEBSECURE_PORT', '8443'],
+    ['BACKEND_SUBNET', '172.32.0.0/24'],
+    ['FDE_NAME', 'alice'],
+  ]) assert.notEqual(process.env[name], forbidden, `${name} must not target the shared stack`);
+  assert.equal(process.env.FDE_POOL, 'large', 'isolated e2e must use the dedicated large FDE pool');
+  const fdeIpamPools = process.env.FDE_IPAM_POOLS.split(',').map((pool) => pool.trim()).filter(Boolean);
+  assert.deepEqual(fdeIpamPools, ['10.201.0.0/16'], 'proxy IPAM pool must match the isolated FDE pool');
+  assert.equal(process.env.COMPOSE_PROJECT_NAME, process.env.STATION_STACK_ID,
+    'compose project and stack label must use the same unique ID');
+  for (const name of ['STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME', 'STATION_EDGE_NAME', 'STATION_LITELLM_NAME']) {
+    assert.ok(process.env[name].endsWith(`-${process.env.STATION_STACK_ID}`), `${name} must include the unique stack ID`);
+  }
+  for (const name of ['STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE']) {
+    assert.ok(process.env[name].endsWith(`:${process.env.STATION_STACK_ID}`), `${name} must use a unique image tag`);
+  }
+  assert.match(FDE_NAME, /^[a-z0-9][a-z0-9-]{0,62}$/);
+  assert.ok(FDE_NAME.includes(process.env.STATION_STACK_ID), 'FDE_NAME must include the unique stack ID');
+  const ports = ['PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT']
+    .map((name) => process.env[name]);
+  assert.equal(new Set(ports).size, ports.length, 'isolated e2e ports must be distinct');
+  for (const port of ports) {
+    assert.match(port, /^\d{2,5}$/);
+    assert.ok(Number(port) <= 65535);
+    assert.ok(!['4000', '4001', '4100', '8090', '8443', '18080'].includes(port),
+      `isolated e2e must not use a shared-stack port (${port})`);
+  }
+  assert.equal(process.env.LLM_GATEWAY_HOST, `http://127.0.0.1:${LITELLM_HOST_PORT}`,
+    'LLM_GATEWAY_HOST must target the isolated LiteLLM publish port');
+}
+
+async function assertHostPortsAvailable() {
+  for (const port of [PORTAL_HOST_PORT, LITELLM_HOST_PORT, TRAEFIK_WEB_PORT, process.env.TRAEFIK_WEBSECURE_PORT]) {
+    const server = net.createServer();
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(Number(port), '127.0.0.1', () => server.close(resolve));
+    }).catch((error) => {
+      throw new Error(`isolated e2e port ${port} is unavailable: ${error.message}`);
+    });
+  }
+}
+
+function writeTraefikStatic(dir) {
+  const source = fs.readFileSync(TRAEFIK_DEFAULT_STATIC, 'utf8');
+  assert.ok(source.includes('address: ":8090"') && source.includes('address: ":8443"'),
+    'Traefik static config has the expected entrypoint addresses');
+  const output = source
+    .replace('address: ":8090"', `address: ":${TRAEFIK_WEB_PORT}"`)
+    .replace('address: ":8443"', `address: ":${process.env.TRAEFIK_WEBSECURE_PORT}"`);
+  const target = path.join(dir, 'traefik.yml');
+  fs.writeFileSync(target, output);
+  return target;
+}
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, { encoding: 'utf8', stdio: 'pipe', cwd: REPO_ROOT });
@@ -24,7 +111,7 @@ function docker(args) {
 function dockerStdin(args, input) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], cwd: REPO_ROOT });
 }
-const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
+const DB_DIR = (process.env.STATION_DB_DIR || '').replace(/\/+$/, '');
 function removeDbDir() {
   const parent = path.posix.dirname(DB_DIR);
   const name = path.posix.basename(DB_DIR);
@@ -35,6 +122,7 @@ function compose(args, env = {}) {
 }
 function safe(fn) { try { return fn(); } catch { return null; } }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function waitHeartbeatDownlink(cycles = 2) { await sleep(cycles * 15_000 + 5_000); }
 function waitFor(fn, { label, timeoutMs, intervalMs = 200 }) {
   const t0 = Date.now();
   return new Promise((resolve, reject) => {
@@ -46,19 +134,37 @@ function waitFor(fn, { label, timeoutMs, intervalMs = 200 }) {
     tick();
   });
 }
+async function restartPortalAndWaitForConfig(fdeName) {
+  // Users are inserted after stack startup; exercise the documented DB+volume rebuild path.
+  docker(`restart ${STATION_PORTAL_NAME}`);
+  await waitFor(async () => (await fetch(`${PORTAL}/healthz`).catch(() => null))?.status === 200,
+    { label: 'portal healthz after materializer rebuild', timeoutMs: 120000, intervalMs: 500 });
+  const configPath = path.join(S.userspaceRoot, fdeName, 'home', '.erix', 'config.json');
+  await waitFor(() => (fs.existsSync(configPath) ? configPath : null),
+    { label: `${fdeName} config.json materialized`, timeoutMs: 60000, intervalMs: 250 });
+}
 function psql(query) {
-  return docker(`exec station-db psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
+  return docker(`exec ${STATION_DB_NAME} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
 }
 function psqlStdin(sql) {
-  dockerStdin('exec -i station-db psql -U station -d station -v ON_ERROR_STOP=1', sql);
+  dockerStdin(`exec -i ${STATION_DB_NAME} psql -U station -d station -v ON_ERROR_STOP=1`, sql);
 }
 function readCookie(setCookie) {
   const m = /fde_session_dev=([^;]+)/.exec(setCookie ?? '');
   return m ? m[1] : null;
 }
 
-const S = { userspaceRoot: null, dynamicRoot: null, password: 'correct horse battery staple', totpSecret: null, cookie: null };
-const FDE_ENV = { FDE_IMAGE, FDE_CMD: '[]', FDE_DEV_USER: '', FDE_DEV_MODE: '1', FDE_AGENT_VERSION: '0.1.0', MOCK_LATENCY_MS: '5000' };
+const S = {
+  userspaceRoot: null,
+  dynamicRoot: null,
+  staticRoot: null,
+  artifactsRoot: null,
+  staticFile: null,
+  password: 'correct horse battery staple',
+  totpSecret: null,
+  cookie: null,
+};
+const FDE_ENV = { FDE_IMAGE, FDE_CMD: '[]', FDE_DEV_USER: '', FDE_DEV_MODE: '1', FDE_AGENT_VERSION: '0.1.0' };
 
 async function insertUser(loginName) {
   const suffix = loginName === 'alice' ? 'a1' : 'a2';
@@ -67,7 +173,7 @@ async function insertUser(loginName) {
   const secret = totp.generateSecret(20);
   psqlStdin(`
     INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status, password_hash, totp_secret)
-    VALUES ('${userId}', '${loginName}', '${loginName}', 'fde', '${loginName}', 'local', 'active', '${passwordHash}', '${secret}');
+    VALUES ('${userId}', '${loginName}', '${loginName}', 'fde', '${loginName === 'alice' ? FDE_NAME : loginName}', 'local', 'active', '${passwordHash}', '${secret}');
   `);
   if (loginName === 'alice') { S.userId = userId; S.totpSecret = secret; }
   return secret;
@@ -138,25 +244,44 @@ async function readSse(sessionId, { until, timeoutMs, lastEventId = null }) {
 }
 
 test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 → 回写 → 归档', { timeout: 15 * 60 * 1000 }, async (t) => {
+  assertIsolatedEnvironment();
+  await assertHostPortsAvailable();
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp5-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp5-'));
+  S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp5-'));
+  S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp5-'));
+  S.staticFile = writeTraefikStatic(S.staticRoot);
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
+  fs.chmodSync(S.staticRoot, 0o755);
+  fs.chmodSync(S.artifactsRoot, 0o755);
+  const composePaths = {
+    ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+    TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+    TRAEFIK_STATIC_HOST: S.staticFile,
+    ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
+    BASE_DOMAIN: 'localhost',
+    PORTAL_HOST: 'station.localhost',
+    PORTAL_PUBLIC_BASE_URL: `http://station.localhost:${TRAEFIK_WEB_PORT}`,
+    LLM_HOST: 'llm.localhost',
+    LLM_PUBLIC_BASE_URL: `http://llm.localhost:${TRAEFIK_WEB_PORT}`,
+  };
 
   const cleanup = () => {
-    safe(() => docker('rm -f fde-alice 2>/dev/null || true'));
-    safe(() => docker('network rm fde-alice 2>/dev/null || true'));
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local erix-station/mock-llm:local 2>/dev/null || true'));
+    safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
+    safe(() => docker(`network rm fde-${FDE_NAME} 2>/dev/null || true`));
+    safe(() => compose('down -v', composePaths));
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
+    safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
+    safe(() => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
     removeDbDir();
   };
   t.after(cleanup);
 
   try {
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
+    safe(() => compose('down -v', composePaths));
     removeDbDir();
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     docker(`build -t ${FDE_IMAGE} runner/`);
@@ -164,13 +289,20 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     //   0001 提供 → 本 e2e 以 MIGRATE_ON_START=1 跑**真实迁移 runner**（portal 在监听端口前以
     //   station_platform 应用 baseline 之后的增量）。这不仅让表存在，也验证了「增量生效」链路。
     compose('up -d --build', {
-      ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
-      MIGRATE_ON_START: '1', ...FDE_ENV,
+      ...composePaths,
+      MIGRATE_ON_START: '1',
+      LITELLM_HOST_PORT,
+      LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}`,
+      ...FDE_ENV,
     });
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
       return r && r.status === 200;
     }, { label: 'portal healthz', timeoutMs: 240000, intervalMs: 1000 });
+    await waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${LITELLM_HOST_PORT}/health/readiness`).catch(() => null);
+      return response?.status === 200;
+    }, { label: 'LiteLLM readiness', timeoutMs: 180000, intervalMs: 1000 });
 
     // 迁移链路对账：0001 已应用 + 表/state 列存在（baseline 未提供此表）
     assert.equal(psql(`SELECT count(*) FROM schema_migrations WHERE version='0001-idempotency-keys'`), '1',
@@ -181,29 +313,33 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
       'state 列（先占位后执行）存在');
 
     await insertUser('alice');
+    await restartPortalAndWaitForConfig(FDE_NAME);
     S.cookie = await login('alice');
-    const proj = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name: 'proj1', repo_url: 'https://git.example/alice/proj1.git', template: 'node' }) });
-    assert.equal(proj.status, 201, 'create project');
-    const projectId = proj.body.project.id;
-
-    docker('exec station-portal node portal/src/cli.js provision-fde --fde-name alice');
-    await waitFor(() => (psql(`SELECT status FROM containers WHERE fde_name='alice'`) === 'running' ? true : null),
-      { label: 'fde-alice running', timeoutMs: 60000 });
-    await waitFor(() => (docker('logs fde-alice 2>&1').includes('sse ping received') ? true : null),
+    docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js provision-fde --fde-name ${FDE_NAME}`);
+    await waitFor(() => (psql(`SELECT status FROM containers WHERE fde_name='${FDE_NAME}'`) === 'running' ? true : null),
+      { label: `${FDE_CONTAINER} running`, timeoutMs: 60000 });
+    await waitFor(() => (docker(`logs ${FDE_CONTAINER} 2>&1`).includes('sse ping received') ? true : null),
       { label: 'agentd sse ping', timeoutMs: 90000, intervalMs: 1000 });
 
-    // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
-    // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、发消息之前补 binding。
-    await ensureMockLlmBinding({
+    // 配置 LiteLLM credential/model 和 FDE binding；5 秒 mock 延迟保留并发 409 验收窗口。
+    await ensureLlmBinding({
       docker,
       dynamicDir: S.dynamicRoot,
-      fdeName: 'alice',
+      fdeName: FDE_NAME,
+      portal: PORTAL,
+      portalContainerName: STATION_PORTAL_NAME,
+      dbContainerName: STATION_DB_NAME,
+      mockDelay: 5,
       adminLogin: 'wp5-admin',
       adminPassword: 'wp5-admin-pass-123',
     });
+    await waitHeartbeatDownlink();
 
     // 1) 建会话 + 详情
-    const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ project_id: projectId, title: 'wp5' }) });
+    const created = await api('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ cwd: '~/projects/proj1', title: 'wp5' }),
+    });
     assert.equal(created.status, 201, `create session: ${JSON.stringify(created.body)}`);
     const sessionId = created.body.session.id;
     const readSseDuring = (runId, fromSeq) => readSse(sessionId, {
@@ -253,8 +389,12 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     assert.equal(dup.body.error.code, 'run_in_progress');
 
     // 5) run 终态先行（确定性），再用 SSE replay 断言事件流完整 + seq 连续
-    await waitFor(() => (psql(`SELECT status FROM runs WHERE id='${run1}'`) === 'finished' ? true : null),
-      { label: 'run1 finished', timeoutMs: 120000, intervalMs: 500 });
+    const run1Status = await waitFor(() => {
+      const status = psql(`SELECT status FROM runs WHERE id='${run1}'`);
+      return status === 'finished' || status === 'failed' ? status : null;
+    }, { label: 'run1 terminal', timeoutMs: 120000, intervalMs: 500 });
+    assert.equal(run1Status, 'finished',
+      `run1 failed: ${psql(`SELECT termination::text FROM runs WHERE id='${run1}'`)}`);
     const userSeq = sent.body.message.seq;
     const events = await readSseDuring(run1, userSeq);
     assert.ok(events.find((e) => e.type === 'round_start'), 'SSE 含 round_start');
@@ -419,9 +559,9 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
   } catch (err) {
     try {
       console.log('\n[wp5] --- portal logs ---');
-      console.log(docker('logs station-portal --tail 60 2>&1'));
-      console.log('\n[wp5] --- fde-alice logs ---');
-      console.log(docker('logs fde-alice --tail 60 2>&1'));
+      console.log(docker(`logs ${STATION_PORTAL_NAME} --tail 60 2>&1`));
+      console.log(`\n[wp5] --- ${FDE_CONTAINER} logs ---`);
+      console.log(docker(`logs ${FDE_CONTAINER} --tail 60 2>&1`));
     } catch { /* 尽力 */ }
     throw err;
   }

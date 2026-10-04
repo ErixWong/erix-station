@@ -40,7 +40,7 @@
 >
 > **镜像预拉取**：portal **不授 IMAGES**（station-docker-proxy 路径白名单仅 containers/networks，§5.1）。FDE 镜像由**宿主在部署时预拉取**——有 registry 时 `docker pull`（pin 形态 ① `image@sha256:…`，RepoDigests 取自 push/pull 后 inspect）；**P1 目标机本地 build 时 `docker build` 后取 image ID**（`docker inspect --format '{{.Id}}'`，pin 形态 ② `sha256:<imageId>`——本地 build 无 RepoDigests，issue #27）；版本 pin 走 `containers.agent_version` + canary，规格 §14。镜像升级 = 宿主预拉/重建新不可变引用 + 重建容器，不经过 portal 的 Docker API。
 >
-> **LLM 网关（issue #117 phase 1）字段契约**：`station-litellm` 只接 `backend`，以官方固定版本 `v1.103.2` 运行；Compose `litellm` profile 默认关闭，避免改变既有 dev 栈。LiteLLM 暂发布 `127.0.0.1:4100`，现有 `station-mock-llm` 保留并继续占用 `127.0.0.1:4000`； portal-side 切换后 mock 让出 4000，LiteLLM 再改回该端口。LiteLLM 使用独立 `litellm` 数据库，模型只存 DB（无 `model_list`）；管理 API 与数据面共用容器 listener，未单独发布 admin 端口，宿主仅能经 loopback 访问。此阶段不改 portal LLM 业务逻辑。详细 DB/seed/key 约定见 [`../../deploy/litellm/README.md`](../../deploy/litellm/README.md)。
+> **LLM 网关（issue #117 phase 2）字段契约**：`station-litellm` 只接 `backend`，以官方固定版本 `v1.103.2` 运行；Compose `litellm` profile 默认关闭。LiteLLM 默认发布 `127.0.0.1:4100`（`LITELLM_HOST_PORT` 可覆盖），作为 Traefik 数据面唯一上游；管理 API 与数据面共用容器 listener，portal 仅经 `backend` 网络访问管理 API。LiteLLM 使用独立 `litellm` 数据库，模型只存 DB（无 `model_list`）；新建 station DB 数据目录时 `01-litellm.sh` 创建角色和数据库。per-FDE virtual key 的白名单由 portal 管理绑定更新，Traefik 所有 FDE 路由共用单一 `llm-gateway` service。详细配置见 [`../../deploy/litellm/README.md`](../../deploy/litellm/README.md)。
 
 ---
 
@@ -323,7 +323,7 @@
 
 ### 7.1 P1 包含
 
-- **4 个 compose 服务**：`station-edge`（Traefik，host 网络）+ `station-portal` + `station-db` + `station-docker-proxy`（P1 即此四服务 + station-mock-llm 开发期）（§2）。
+- **平台 compose 服务**：`station-edge`（Traefik，host 网络）+ `station-portal` + `station-db` + `station-docker-proxy`；`station-litellm` 是显式 opt-in 的 `litellm` profile（§2）。
 - **单 FDE 容器**（含 `station-agentd`/`station-runner`/erix-agent）✅ **WP2b 已交付**：FDE 容器的动态创建（portal 经 Docker API + socket-proxy，§6）由 `portal/src/provisioner.js` 实现（开发期默认 `traefik/whoami` 站台，生产切 runner 镜像）。
 - **登录**（本地账号 + `crypto.scrypt` 口令哈希（P1 骨架，argon2id 待决策者确认后按自描述哈希平滑迁移，portal §2.9.4）+ 强制 TOTP，bootstrap CLI，portal §2.9）、**项目列表/创建**（含项目级**单端口**分配 + `ports.json` 物化，规格 §8.2/§8.5）、**对话（SSE）**、**停止**。
 - **internal API**（agentd ↔ portal 全出站通道）+ **防火墙应用**（§4.4）+ **DB 迁移**（§3）。
@@ -338,11 +338,13 @@
 | **run 级端口块 + 事件重放 UI** | P2 | 只做项目级单端口（规格 §8.2）；run 级端口分配/URL 带 runId 不启用 |
 | **工具审批** | P2 | **完全不部署**审批单/审批 UI/审批中转（tools 直接执行；judge 拦截链 P2 再接，runner §10 端点 P2 才启用） |
 | **SSO / OIDC** | P2 | **不部署** OIDC（P1 恒 `auth_source=local`，env §4/portal §2.1） |
-| **LLM 网关（issue #117）** | P1 phase 1 infra；portal 接入与用量记账后续 | 可选 `station-litellm` profile，数据库驱动模型目录、loopback `127.0.0.1:4100`；不改 portal LLM 调用、不删除 mock（mock 继续占 `127.0.0.1:4000`）。portal 切换后 LiteLLM 才迁回 4000 |
+| **LLM 网关（issue #117）** | P1（phase 2 已接入） | 可选 `station-litellm` profile；LiteLLM 是模型目录和上游 credential 的唯一真相源，默认 loopback `127.0.0.1:4100`；portal admin API 为其薄代理，Traefik 的 per-FDE routers 共用 `llm-gateway` service。旧 `station-mock-llm` 已删除；集成测试使用 LiteLLM 原生 `mock_response`。 |
 | **通知通道**（邮件/IM webhook） | P2+ | 不部署；告警**状态**（`failed`+code）P1 落库可查（规格 §14 / user-space §7.3） |
 | **备份/高可用** | 系统级方案（issue #3） | 不部署；平台只保证数据落卷、DB 处于可被系统级备份的形态（规格 §14） |
 
-### 7.3 P1 对话验收的 LLM mock 网关（dev-only，零真实凭据）
+### 7.3 LLM 集成测试模型
+
+> **状态：下方历史方案已废止。** 当前集成 e2e 经管理台 API 创建 LiteLLM credential 和原生 mock model（`litellm_params.mock_response` / `mock_delay`），再通过正常 binding API 铸造 per-FDE virtual key。测试验证模型白名单、经 Traefik 的 key 注入和 run 终态；不部署独立 mock gateway，也不引入产品测试后门。
 
 > 红线（topology D-4 / 规格 §11.4）：容器内**零真实 LLM 凭据**——P1 **也不例外**。已删除「`LLM_DEV_BASE_URL` + `LLM_DEV_API_KEY` 注入容器」的临时豁免路径：**任何真实 LLM key 都不经 portal env 注入、不进 `config.json`、不进容器 env/镜像**。
 

@@ -75,7 +75,8 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 **已知遗留**（详见 #117）
 - LiteLLM 成本表不含自定义模型名 → 虚拟 key 的 `spend` 恒为 `0.0`，用量记账待补定价
-- **集成 e2e（`wp3a`/`wp3b`/`wp4`/`wp5`/`wp6`）仍假设旧架构**（mock 在数据面路径上、binding 带 `api_key`）→ **当前跑不通**，待重写；`station-mock-llm` 同批删除
+- 集成 e2e（`wp3a`/`wp3b`/`wp4`/`wp5`/`wp6`）通过管理台 API 建 LiteLLM credential/mock model 和 FDE binding，覆盖虚拟 key 白名单与注入链路；已不依赖旧架构
+- `station-mock-llm` 与 `portal/mock-gateway/` 已删除；端到端 mock 响应由 LiteLLM 原生 `mock_response` 提供
 
 ## 5. 端口登记（本机，避让已有占用）
 
@@ -83,8 +84,7 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 |---|---|
 | 80 / 443 | Traefik ingress（唯一对外；**生产值**——开发期本机 80/443 被 nginx 占用，按 env.md §0 用 8090/8443） |
 | 8080 | portal（backend 网络 + publish 仅 `127.0.0.1:8080` 回环，供 Traefik 反代/forwardAuth；开发期本机映射 `18080`，env.md §0） |
-| 4000 | **迁移期遗留**：`station-mock-llm` 数据面（publish 仅 `127.0.0.1:4000` 回环）。**portal 已不再指向它**（issue #117 phase 2 起走 LiteLLM），仅集成 e2e 仍在用；待删（#117） |
-| 4100 | **LLM 网关数据面**：`station-litellm`（`litellm` profile），publish 仅 `127.0.0.1:4100` 回环，Traefik 经 `LLM_GATEWAY_HOST` 访问；管理面同端口、仅 backend 网络可达。见 §4.2 |
+| 4100 | **LLM 网关数据面/管理面**：`station-litellm`（`litellm` profile），默认 publish 到 `127.0.0.1:4100` 回环（`LITELLM_HOST_PORT` 可覆盖），Traefik 经 `LLM_GATEWAY_HOST` 访问；portal 经 backend 网络访问管理 API。见 §4.2 |
 | 5432 | DB（backend 网络内，不 publish） |
 
 FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机 publish。
