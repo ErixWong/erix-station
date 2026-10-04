@@ -1,13 +1,23 @@
-# LiteLLM gateway (issue #117, phase 1)
+# LiteLLM gateway (issue #117)
 
-`station-litellm` is opt-in (`--profile litellm`) while the portal still uses
-the existing `station-mock-llm` on `127.0.0.1:4000`. LiteLLM is temporarily
-published on `127.0.0.1:4100`; after the portal-side switch, the mock will
-relinquish port 4000 and LiteLLM will move to `127.0.0.1:4000`. The admin API
-has no separate published port; the proxy listener is reachable from the host
-only through loopback. In this release the admin routes share that listener,
-so host-local clients can reach them with the master key; they are not exposed
-on a separate port or to the LAN.
+LiteLLM is the platform's LLM gateway: the **single source of truth for the
+model catalogue and upstream credentials** (`store_model_in_db: true`).
+
+`station-litellm` is opt-in (`--profile litellm`). **The portal routes LLM
+traffic through it** as of phase 2: the LLM Traefik section publishes a single
+`llm-gateway` service pointing at LiteLLM, and the admin console's LLM tab is a
+thin proxy over the LiteLLM admin API.
+
+LiteLLM is published on `127.0.0.1:4100` (host loopback). The admin API has no
+separate published port; the proxy listener is reachable from the host only
+through loopback, and in-network clients (the portal) use
+`http://station-litellm:4000` via `LLM_GATEWAY_ADMIN_URL`. Admin routes share
+that listener, so host-local clients can reach them with the master key; they
+are not exposed on a separate port or to the LAN.
+
+`station-mock-llm` still occupies `127.0.0.1:4000` during the migration window.
+It is **no longer on the data-plane path** (only the integration e2e suites
+still use it); it will be removed together with the e2e rewrite (#117).
 
 The image is pinned to the official `v1.103.2` release and its resolved
 manifest digest: [`BerriAI/litellm v1.103.2`](https://github.com/BerriAI/litellm/releases/tag/v1.103.2).
