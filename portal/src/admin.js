@@ -292,6 +292,31 @@ export async function resetUserPassword(pool, userId, password, { actorId = null
   return { ok: true };
 }
 
+/** 铸造新的 TOTP 绑定并吊销全部现存登录会话；种子仅在本次响应下发。 */
+export async function enrollUserTotp(pool, userId, { actorId = null, totpIssuer = 'erix-station' } = {}) {
+  const totpSecret = totp.generateSecret(20);
+  const result = await pool.query(
+    `WITH target AS (
+       UPDATE users SET totp_secret = $2, last_totp_step = NULL
+        WHERE id = $1
+        RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+                  (totp_secret IS NOT NULL) AS totp_enabled
+     ), revoked AS (
+       UPDATE login_sessions SET revoked_at = now()
+        WHERE user_id = (SELECT id FROM target)
+          AND revoked_at IS NULL
+        RETURNING id
+     )
+     SELECT target.*, NULL::timestamptz AS last_login_at FROM target`,
+    [userId, totpSecret],
+  );
+  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  const user = safeUser(result.rows[0]);
+  const totpUri = totp.otpauthUri(totpSecret, { issuer: totpIssuer, label: user.login });
+  await recordAdminAudit(pool, actorId, 'admin.user_totp_enroll', user.login);
+  return { user, totp_secret: totpSecret, totp_uri: totpUri };
+}
+
 /** 清除 TOTP 绑定并吊销全部现存登录会话，不返回种子。 */
 export async function resetUserTotp(pool, userId, { actorId = null } = {}) {
   const result = await pool.query(
