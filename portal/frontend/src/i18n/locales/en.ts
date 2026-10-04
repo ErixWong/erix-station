@@ -167,8 +167,9 @@ export const en = {
       activeRunWarn:
         '⚠️ Active run: changing the provider or API key will be rejected by the server (it would affect the in-flight run); model-only changes are unaffected.',
       providerLabel: 'Provider',
-      virtualKeyLabel: 'Current virtual key: {key}',
-      mainModelLabel: 'Main model (text · tool_calling)',
+      virtualKeyLabel: 'Current virtual key:',
+      mainModelLabel: 'Main model',
+      mainModelCapabilities: 'text · tool_calling',
       embeddingLabel: 'Embedding (optional)',
       visionLabel: 'Vision (optional)',
       notConfigured: '(not configured)',

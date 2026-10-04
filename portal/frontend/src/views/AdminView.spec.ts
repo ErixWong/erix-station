@@ -500,6 +500,21 @@ describe('AdminView · FDE 用户', () => {
     wrapper.unmount();
   });
 
+  it('详情抽屉中弱化未启用 MFA 并强调已启用状态', async () => {
+    const { wrapper } = await mountAdmin();
+    const rows = wrapper.findAll('[data-test="user-row"]');
+
+    await rows[0].trigger('click');
+    let mfa = wrapper.get('[data-test="user-drawer"]').findAll('dd').find((item) => item.text() === '已启用');
+    expect(mfa?.classes()).toContain('text-green-700');
+
+    await wrapper.get('[data-test="user-drawer"] button[aria-label="关闭"]').trigger('click');
+    await rows[1].trigger('click');
+    mfa = wrapper.get('[data-test="user-drawer"]').findAll('dd').find((item) => item.text() === '未启用');
+    expect(mfa?.classes()).toContain('text-black/45');
+    wrapper.unmount();
+  });
+
   it('用户搜索按登录名、显示名和 FDE 名称不区分大小写过滤', async () => {
     const { wrapper } = await mountAdmin();
     const search = wrapper.get('[data-test="user-search"]');
