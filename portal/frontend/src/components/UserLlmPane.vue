@@ -58,6 +58,7 @@ const savingCredential = ref(false);
 const awaitingCredential = ref(props.user.status === 'awaiting_credential');
 const selectedGitHost = computed(() => props.gitHosts.find((host) => host.id === gitHostId.value) ?? null);
 const enabledGitHosts = computed(() => props.gitHosts.filter((host) => host.enabled));
+const actionButtonSizeClass = 'inline-flex min-h-8 items-center whitespace-nowrap rounded-md px-2.5 py-1.5 text-sm';
 
 // 当前供应商下启用中的模型（旧 ms = (p?.models ?? []).filter((m) => m.enabled)）。
 const enabledModels = computed<LlmModel[]>(() => {
@@ -68,6 +69,15 @@ const enabledModels = computed<LlmModel[]>(() => {
 const mainOptions = computed(() => enabledModels.value.filter((m) => m.type === 'text' && m.tool_calling === true));
 const embeddingOptions = computed(() => enabledModels.value.filter((m) => m.type === 'embedding'));
 const visionOptions = computed(() => enabledModels.value.filter((m) => m.type === 'vision'));
+
+function modelOptionTitle(model: LlmModel) {
+  return `${model.model_id} — ${model.name}`;
+}
+
+function selectedModelTitle(options: LlmModel[], id: string) {
+  const model = options.find((item) => item.id === id);
+  return model ? modelOptionTitle(model) : '';
+}
 
 async function loadPane() {
   loading.value = true;
@@ -206,53 +216,92 @@ onMounted(loadPane);
       class="my-2 rounded-lg border border-amber-500 bg-amber-50 px-3 py-2 text-[0.83rem] text-amber-800"
     >{{ t('admin.llm.activeRunWarn') }}</div>
 
-    <form class="mt-2 grid gap-2" style="grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr))" @submit.prevent="submitLlm(false)">
-      <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        {{ t('admin.llm.providerLabel') }}
+    <form class="mt-2 grid gap-3" @submit.prevent="submitLlm(false)">
+      <label class="grid min-w-0 grid-cols-[minmax(7rem,9rem)_minmax(0,1fr)] items-center gap-x-3 text-xs text-black/55">
+        <span>{{ t('admin.llm.providerLabel') }}</span>
         <select
           v-model="providerId"
           data-test="provider-select"
-          class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+          :title="providers.find((p) => p.id === providerId)?.name ?? ''"
+          class="min-w-0 w-full truncate rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
         >
           <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
         </select>
       </label>
-      <p v-if="cfg?.api_key" data-test="virtual-key" class="self-end pb-1 text-xs text-black/55">
-        {{ t('admin.llm.virtualKeyLabel', { key: cfg.api_key }) }}
-      </p>
-      <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        {{ t('admin.repos.selectHost') }}
-        <select v-model="gitHostId" data-test="git-host-select" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+      <div
+        v-if="cfg?.api_key"
+        data-test="virtual-key"
+        class="grid min-w-0 grid-cols-[minmax(7rem,9rem)_minmax(0,1fr)] items-center gap-x-3"
+      >
+        <span class="text-xs text-black/55">{{ t('admin.llm.virtualKeyLabel') }}</span>
+        <span :title="cfg.api_key" class="min-w-0 truncate font-mono text-sm text-black/70">{{ cfg.api_key }}</span>
+      </div>
+      <label class="grid min-w-0 grid-cols-[minmax(7rem,9rem)_minmax(0,1fr)] items-center gap-x-3 text-xs text-black/55">
+        <span>{{ t('admin.repos.selectHost') }}</span>
+        <select
+          v-model="gitHostId"
+          data-test="git-host-select"
+          :title="selectedGitHost?.name ?? ''"
+          class="min-w-0 w-full truncate rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+        >
           <option value="">{{ t('admin.repos.noHost') }}</option>
           <option v-for="host in enabledGitHosts" :key="host.id" :value="host.id">
             {{ host.name }} · {{ host.provider }} · {{ host.mode === 'minted' ? t('admin.repos.modeMinted') : t('admin.repos.modeCredential') }}
           </option>
         </select>
       </label>
-      <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        {{ t('admin.llm.mainModelLabel') }}
-        <select v-model="mainModelId" data-test="main-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+      <label class="grid min-w-0 grid-cols-[minmax(7rem,9rem)_minmax(0,1fr)] items-center gap-x-3 text-xs text-black/55">
+        <span class="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+          <span>{{ t('admin.llm.mainModelLabel') }}</span>
+          <span class="text-xs text-black/45">{{ t('admin.llm.mainModelCapabilities') }}</span>
+        </span>
+        <select
+          v-model="mainModelId"
+          data-test="main-model"
+          :title="selectedModelTitle(mainOptions, mainModelId)"
+          class="min-w-0 w-full truncate rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+        >
           <option value="">{{ t('admin.llm.notConfigured') }}</option>
-          <option v-for="m in mainOptions" :key="m.id" :value="m.id">{{ m.model_id }} — {{ m.name }}</option>
+          <option v-for="m in mainOptions" :key="m.id" :value="m.id" :title="modelOptionTitle(m)">
+            {{ modelOptionTitle(m) }}
+          </option>
         </select>
       </label>
-      <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        {{ t('admin.llm.embeddingLabel') }}
-        <select v-model="embeddingModelId" data-test="embedding-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+      <label class="grid min-w-0 grid-cols-[minmax(7rem,9rem)_minmax(0,1fr)] items-center gap-x-3 text-xs text-black/55">
+        <span>{{ t('admin.llm.embeddingLabel') }}</span>
+        <select
+          v-model="embeddingModelId"
+          data-test="embedding-model"
+          :title="selectedModelTitle(embeddingOptions, embeddingModelId)"
+          class="min-w-0 w-full truncate rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+        >
           <option value="">{{ t('admin.llm.notConfigured') }}</option>
-          <option v-for="m in embeddingOptions" :key="m.id" :value="m.id">{{ m.model_id }} — {{ m.name }}</option>
+          <option v-for="m in embeddingOptions" :key="m.id" :value="m.id" :title="modelOptionTitle(m)">
+            {{ modelOptionTitle(m) }}
+          </option>
         </select>
       </label>
-      <label class="flex flex-col gap-0.5 text-xs text-black/55">
-        {{ t('admin.llm.visionLabel') }}
-        <select v-model="visionModelId" data-test="vision-model" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+      <label class="grid min-w-0 grid-cols-[minmax(7rem,9rem)_minmax(0,1fr)] items-center gap-x-3 text-xs text-black/55">
+        <span>{{ t('admin.llm.visionLabel') }}</span>
+        <select
+          v-model="visionModelId"
+          data-test="vision-model"
+          :title="selectedModelTitle(visionOptions, visionModelId)"
+          class="min-w-0 w-full truncate rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+        >
           <option value="">{{ t('admin.llm.notConfigured') }}</option>
-          <option v-for="m in visionOptions" :key="m.id" :value="m.id">{{ m.model_id }} — {{ m.name }}</option>
+          <option v-for="m in visionOptions" :key="m.id" :value="m.id" :title="modelOptionTitle(m)">
+            {{ modelOptionTitle(m) }}
+          </option>
         </select>
       </label>
-      <div class="flex items-end gap-2">
-        <button type="submit" class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.llm.save') }}</button>
-        <button type="button" class="rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5" @click="onProvision">{{ t('admin.llm.provision') }}</button>
+      <div class="flex flex-wrap gap-2">
+        <button type="submit" :class="[actionButtonSizeClass, 'bg-brand text-white hover:bg-brand-hover']">{{ t('admin.llm.save') }}</button>
+        <button
+          type="button"
+          :class="[actionButtonSizeClass, 'border border-black/20 hover:bg-black/5']"
+          @click="onProvision"
+        >{{ t('admin.llm.provision') }}</button>
       </div>
     </form>
 
