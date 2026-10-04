@@ -24,11 +24,13 @@ const ADMIN_TOKEN = 'tok-admin-b2-test';
 /** admin 测试 pool：FakePool（会话/audit）+ users CRUD / active run / llm echo 的最小模拟。 */
 class AdminPool extends FakePool {
   constructor(seed = {}) {
-    super({ users: [ADMIN, FDE_USER] });
+    super({ users: [ADMIN, FDE_USER].map((user) => ({ ...user })) });
     this.runs = seed.runs ?? [];               // [{id, session_id, status}]
     this.chatSessions = seed.chatSessions ?? []; // [{id, user_id}]
+    this.containers = seed.containers ?? [];     // [{user_id, status}]
     this.llm = seed.llm ?? null;               // { binding, provider, models } | null
     this.nextUser = 0;
+    this.sqlLog = [];
     this.sessions.push({
       id: 'ls-admin', user_id: ADMIN.id, token_hash: auth.hashToken(ADMIN_TOKEN),
       created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
@@ -36,12 +38,85 @@ class AdminPool extends FakePool {
   }
 
   async query(sql, params = []) {
+    this.sqlLog.push({ sql, params });
     // 建用户：login / fde_name 唯一性核查（含非 active 行——真实 DB 有 UNIQUE 约束）
     if (sql.includes('SELECT 1 FROM users WHERE login')) {
       return { rows: this.users.filter((u) => u.login === params[0]).map(() => ({ '?column?': 1 })) };
     }
     if (sql.includes('SELECT 1 FROM users WHERE fde_name')) {
-      return { rows: this.users.filter((u) => u.fde_name === params[0]).map(() => ({ '?column?': 1 })) };
+      return {
+        rows: this.users
+          .filter((u) => u.fde_name === params[0] && (!sql.includes('id <>') || u.id !== params[1]))
+          .map(() => ({ '?column?': 1 })),
+      };
+    }
+    if (sql.includes('SELECT id, login FROM users WHERE id')) {
+      const user = this.users.find((u) => u.id === params[0]);
+      return { rows: user ? [{ id: user.id, login: user.login }] : [] };
+    }
+    if (sql.includes('WITH updated AS') && sql.includes('UPDATE users SET')) {
+      const user = this.users.find((u) => u.id === params[0]);
+      if (!user) return { rows: [] };
+      const field = (name) => {
+        const match = sql.match(new RegExp(`${name} = \\$([0-9]+)`));
+        return match ? params[Number(match[1]) - 1] : undefined;
+      };
+      for (const name of ['display_name', 'role', 'fde_name']) {
+        const value = field(name);
+        if (value !== undefined) user[name] = value;
+      }
+      const status = field('status');
+      if (status !== undefined) {
+        user.status = status;
+        user.disabled_at = status === 'disabled' ? new Date() : null;
+      }
+      if (user.status === 'disabled') {
+        for (const session of this.sessions) {
+          if (session.user_id === user.id && session.revoked_at === null) session.revoked_at = new Date();
+        }
+      }
+      return {
+        rows: [{
+          id: user.id, login: user.login, display_name: user.display_name, role: user.role,
+          fde_name: user.fde_name ?? null, auth_source: user.auth_source, status: user.status,
+          created_at: user.created_at ?? new Date(), totp_enabled: user.totp_secret != null,
+          last_login_at: null,
+        }],
+      };
+    }
+    if (sql.includes('WITH target AS') && sql.includes('UPDATE users SET')) {
+      const user = this.users.find((u) => u.id === params[0]);
+      if (!user) return { rows: [] };
+      if (sql.includes('password_hash')) user.password_hash = params[1];
+      if (sql.includes('totp_secret = NULL')) {
+        user.totp_secret = null;
+        user.last_totp_step = null;
+      }
+      for (const session of this.sessions) {
+        if (session.user_id === user.id && session.revoked_at === null) session.revoked_at = new Date();
+      }
+      return { rows: [{ id: user.id, login: user.login }] };
+    }
+    if (sql.includes('SELECT 1 FROM containers WHERE user_id')) {
+      return { rows: this.containers.some((container) => container.user_id === params[0] && container.status !== 'removed') ? [{ '?column?': 1 }] : [] };
+    }
+    if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
+      const user = this.users.find((u) => u.id === params[0]);
+      return { rows: user ? [{ id: user.id, login: user.login }] : [] };
+    }
+    if (sql.includes('DELETE FROM login_sessions WHERE user_id')) {
+      this.sessions = this.sessions.filter((session) => session.user_id !== params[0]);
+      return { rows: [] };
+    }
+    if (sql.includes('DELETE FROM login_pending WHERE user_id')) {
+      this.pending = this.pending.filter((pending) => pending.user_id !== params[0]);
+      return { rows: [] };
+    }
+    if (sql.includes('DELETE FROM users WHERE id')) {
+      const index = this.users.findIndex((user) => user.id === params[0]);
+      if (index === -1) return { rows: [] };
+      this.users.splice(index, 1);
+      return { rows: [{ id: params[0] }] };
     }
     // 建用户 INSERT（RETURNING 安全字段）
     if (sql.includes('INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
@@ -52,13 +127,19 @@ class AdminPool extends FakePool {
         password_hash: params[2], totp_secret: params[3], created_at: new Date(),
       };
       this.users.push(row);
-      return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at }] };
+      return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at, totp_enabled: true }] };
     }
     // 用户列表
-    if (sql.includes('FROM users ORDER BY')) {
+    if (sql.includes('FROM users') && sql.includes('LEFT JOIN')) {
       const rows = this.users.map((u) => ({
         id: u.id, login: u.login, display_name: u.display_name, role: u.role,
         fde_name: u.fde_name ?? null, auth_source: u.auth_source, status: u.status, created_at: u.created_at ?? new Date(),
+        totp_enabled: u.totp_secret != null,
+        last_login_at: this.sessions
+          .filter((session) => session.user_id === u.id)
+          .map((session) => session.created_at)
+          .filter(Boolean)
+          .sort((a, b) => new Date(b) - new Date(a))[0] ?? null,
       }));
       return { rows };
     }
@@ -143,15 +224,28 @@ test('admin 用户管理：建用户 201（role=fde，totp_secret 仅本次响�
     assert.equal(body.user.role, 'fde');
     assert.equal(body.user.fde_name, 'bob');
     assert.equal(body.user.status, 'active');
+    assert.equal(body.user.totp_enabled, true);
     assert.match(body.totp_secret, /^[A-Z2-7]{32}$/, 'TOTP 种子 base32（20 字节）');
     assert.ok(body.totp_uri.startsWith('otpauth://totp/'), '给 otpauth provisioning URI');
     assert.ok(!('password_hash' in body.user) && !('totp_secret' in body.user), 'user 对象无敏感字段');
 
     // 列表：含新用户，但绝不回显 totp_secret / password_hash
+    const olderLogin = new Date('2026-10-03T01:00:00.000Z');
+    const latestLogin = new Date('2026-10-04T01:00:00.000Z');
+    const createdUser = pool.users.find((u) => u.login === 'bob');
+    pool.sessions.push(
+      { id: 'ls-bob-old', user_id: createdUser.id, created_at: olderLogin, revoked_at: null },
+      { id: 'ls-bob-new', user_id: createdUser.id, created_at: latestLogin, revoked_at: new Date(0) },
+    );
     const list = await (await fetch(`${base}/api/admin/users`, { headers: { cookie } })).json();
     const bob = list.items.find((u) => u.login === 'bob');
     assert.ok(bob, '列表含新用户');
     assert.equal(bob.fde_name, 'bob');
+    assert.equal(bob.totp_enabled, true);
+    assert.equal(bob.last_login_at, latestLogin.toISOString());
+    const root = list.items.find((u) => u.login === 'root');
+    assert.equal(root.totp_enabled, false);
+    assert.ok(root.last_login_at);
     const raw = JSON.stringify(list);
     assert.ok(!raw.includes('totp_secret'), '列表响应无 totp_secret 键');
     assert.ok(!raw.includes(body.totp_secret), '列表响应无 TOTP 种子值');
@@ -201,6 +295,179 @@ test('admin 用户管理：重复 login → 409；缺字段 / 非法 fde_name �
   }
 });
 
+test('admin 用户管理：PATCH 更新资料并在禁用时吊销会话；重新启用清空 disabled_at', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  pool.sessions.push(
+    { id: 'ls-alice-active', user_id: FDE_USER.id, created_at: new Date(), revoked_at: null },
+    { id: 'ls-alice-revoked', user_id: FDE_USER.id, created_at: new Date(), revoked_at: new Date(0) },
+  );
+  try {
+    const res = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+      method: 'PATCH',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ display_name: ' Alice Wong ', role: 'admin', fde_name: 'alice-new', status: 'disabled' }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      { display_name: body.user.display_name, role: body.user.role, fde_name: body.user.fde_name, status: body.user.status },
+      { display_name: 'Alice Wong', role: 'admin', fde_name: 'alice-new', status: 'disabled' },
+    );
+    assert.ok(pool.users.find((user) => user.id === FDE_USER.id).disabled_at instanceof Date);
+    assert.ok(pool.sessions.find((session) => session.id === 'ls-alice-active').revoked_at);
+    assert.equal(pool.sessions.find((session) => session.id === 'ls-alice-revoked').revoked_at.getTime(), 0);
+    assert.ok(pool.sqlLog.some(({ sql }) => sql.includes('UPDATE login_sessions SET revoked_at = now()')));
+
+    const enabled = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+      method: 'PATCH',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'active' }),
+    });
+    assert.equal(enabled.status, 200);
+    assert.equal((await enabled.json()).user.status, 'active');
+    assert.equal(pool.users.find((user) => user.id === FDE_USER.id).disabled_at, null);
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：PATCH 至少一个字段且拒绝不可改 login、非法字段与重复 fde_name', async () => {
+  const { base, cookie, close } = await startAdminServer();
+  try {
+    const patch = (id, body) => fetch(`${base}/api/admin/users/${id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    for (const body of [{}, { login: 'alice-2' }, { role: 'owner' }, { status: 'pending' }, { fde_name: 'BAD_NAME' }]) {
+      const res = await patch(FDE_USER.id, body);
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.equal((await res.json()).error.code, 'validation_failed');
+    }
+    let res = await patch(ADMIN.id, { fde_name: 'alice' });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error.code, 'fde_name_conflict');
+
+    res = await fetch(`${base}/api/admin/users/not-a-uuid`, { headers: { cookie } });
+    assert.equal(res.status, 400);
+    res = await patch('c0000000-0000-4000-8000-000000000003', { role: 'admin' });
+    assert.equal(res.status, 404);
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖用户删除会清理会话', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  pool.sessions.push({ id: 'ls-alice-delete', user_id: FDE_USER.id, created_at: new Date(), revoked_at: null });
+  pool.pending.push({ id: 'pending-alice', user_id: FDE_USER.id });
+  try {
+    let res = await fetch(`${base}/api/admin/users/${ADMIN.id}`, { method: 'DELETE', headers: { cookie } });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error.code, 'self_delete');
+
+    const withContainer = await startAdminServer({ seed: { containers: [{ user_id: FDE_USER.id, status: 'running' }] } });
+    try {
+      res = await fetch(`${withContainer.base}/api/admin/users/${FDE_USER.id}`, {
+        method: 'DELETE', headers: { cookie: withContainer.cookie },
+      });
+      assert.equal(res.status, 409);
+      assert.equal((await res.json()).error.code, 'user_has_active_fde');
+    } finally {
+      await withContainer.close();
+    }
+    const withRun = await startAdminServer({
+      seed: { chatSessions: [{ id: 's1', user_id: FDE_USER.id }], runs: [{ id: 'r1', session_id: 's1', status: 'cancelling' }] },
+    });
+    try {
+      res = await fetch(`${withRun.base}/api/admin/users/${FDE_USER.id}`, {
+        method: 'DELETE', headers: { cookie: withRun.cookie },
+      });
+      assert.equal(res.status, 409);
+      assert.equal((await res.json()).error.code, 'user_has_active_fde');
+    } finally {
+      await withRun.close();
+    }
+
+    res = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, { method: 'DELETE', headers: { cookie } });
+    assert.equal(res.status, 204);
+    assert.equal(pool.users.some((user) => user.id === FDE_USER.id), false);
+    assert.equal(pool.sessions.some((session) => session.user_id === FDE_USER.id), false);
+    assert.equal(pool.pending.some((pending) => pending.user_id === FDE_USER.id), false);
+
+    res = await fetch(`${base}/api/admin/users/c0000000-0000-4000-8000-000000000003`, {
+      method: 'DELETE', headers: { cookie },
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：重置口令校验长度、更新 scrypt hash 并吊销会话', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  const user = pool.users.find((row) => row.id === FDE_USER.id);
+  user.password_hash = 'scrypt$old';
+  pool.sessions.push(
+    { id: 'ls-alice-password', user_id: user.id, created_at: new Date(), revoked_at: null },
+    { id: 'ls-alice-password-old', user_id: user.id, created_at: new Date(), revoked_at: new Date(0) },
+  );
+  try {
+    let res = await fetch(`${base}/api/admin/users/${user.id}/reset-password`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ password: '' }),
+    });
+    assert.equal(res.status, 400);
+    res = await fetch(`${base}/api/admin/users/${user.id}/reset-password`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'x'.repeat(257) }),
+    });
+    assert.equal(res.status, 400);
+
+    res = await fetch(`${base}/api/admin/users/${user.id}/reset-password`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'new-secret-1' }),
+    });
+    assert.equal(res.status, 200);
+    const response = await res.text();
+    assert.equal(response, '{"ok":true}');
+    assert.ok(user.password_hash.startsWith('scrypt$'));
+    assert.notEqual(user.password_hash, 'new-secret-1');
+    assert.ok(pool.sessions.find((session) => session.id === 'ls-alice-password').revoked_at);
+    assert.equal(pool.sessions.find((session) => session.id === 'ls-alice-password-old').revoked_at.getTime(), 0);
+    assert.ok(pool.sqlLog.some(({ sql }) => sql.includes('UPDATE login_sessions SET revoked_at = now()')));
+
+    res = await fetch(`${base}/api/admin/users/c0000000-0000-4000-8000-000000000003/reset-password`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ password: 'new-secret-1' }),
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：重置 TOTP 清空重放步并吊销会话，绝不回显种子', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  const user = pool.users.find((row) => row.id === FDE_USER.id);
+  user.totp_secret = 'JBSWY3DPEHPK3PXP';
+  user.last_totp_step = 1234;
+  pool.sessions.push({ id: 'ls-alice-totp', user_id: user.id, created_at: new Date(), revoked_at: null });
+  try {
+    const res = await fetch(`${base}/api/admin/users/${user.id}/totp-reset`, { method: 'POST', headers: { cookie } });
+    assert.equal(res.status, 200);
+    const raw = await res.text();
+    assert.equal(raw, '{"ok":true}');
+    assert.equal(raw.includes('JBSWY3DPEHPK3PXP'), false);
+    assert.equal(user.totp_secret, null);
+    assert.equal(user.last_totp_step, null);
+    assert.ok(pool.sessions.find((session) => session.id === 'ls-alice-totp').revoked_at);
+
+    const missing = await fetch(`${base}/api/admin/users/c0000000-0000-4000-8000-000000000003/totp-reset`, {
+      method: 'POST', headers: { cookie },
+    });
+    assert.equal(missing.status, 404);
+  } finally {
+    await close();
+  }
+});
+
 test('admin 用户管理 + provision + llm：非 admin 一律 403，无 cookie 401', async () => {
   const { base, pool, cookie, close } = await startAdminServer();
   try {
@@ -212,6 +479,10 @@ test('admin 用户管理 + provision + llm：非 admin 一律 403，无 cookie 4
     const endpoints = [
       ['GET', '/api/admin/users'],
       ['POST', '/api/admin/users', '{}'],
+      ['PATCH', `/api/admin/users/${FDE_USER.id}`, '{}'],
+      ['DELETE', `/api/admin/users/${FDE_USER.id}`],
+      ['POST', `/api/admin/users/${FDE_USER.id}/reset-password`, '{}'],
+      ['POST', `/api/admin/users/${FDE_USER.id}/totp-reset`],
       ['POST', '/api/admin/fdes/alice/provision', '{}'],
       ['GET', '/api/admin/fdes/alice/llm'],
     ];
