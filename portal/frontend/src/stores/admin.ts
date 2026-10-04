@@ -35,9 +35,11 @@ export interface AdminUser {
   id: string;
   login: string;
   display_name: string | null;
-  role: string;
+  role: 'fde' | 'admin';
   fde_name: string | null;
-  status: string;
+  status: 'active' | 'disabled' | 'awaiting_credential';
+  totp_enabled: boolean;
+  last_login_at: string | null;
   git_host_id?: string | null;
 }
 
@@ -81,6 +83,10 @@ interface CreateUserResponse {
   totp_uri: string;
 }
 
+export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'role' | 'fde_name'>> & {
+  status?: 'active' | 'disabled';
+};
+
 export const useAdminStore = defineStore('admin', {
   state: () => ({
     providers: [] as LlmProvider[],
@@ -93,8 +99,8 @@ export const useAdminStore = defineStore('admin', {
     fdeErr: null as string | null,
     gitHostsErr: null as string | null,
     expandedProviders: [] as string[], // 旧 S.expanded（Set<string>，provider id）
-    expandedUsers: [] as string[], // 旧 S.userExpanded
     totpOnce: null as TotpOnce | null, // 旧 #totpOnce 内联盒
+    usersLoading: false,
   }),
 
   actions: {
@@ -112,12 +118,6 @@ export const useAdminStore = defineStore('admin', {
       else this.expandedProviders.push(id);
     },
 
-    toggleExpandedUser(id: string) {
-      const i = this.expandedUsers.indexOf(id);
-      if (i >= 0) this.expandedUsers.splice(i, 1);
-      else this.expandedUsers.push(id);
-    },
-
     /** 旧 loadProviders：GET /api/admin/llm/providers。 */
     async loadProviders() {
       this.llmErr = null;
@@ -131,14 +131,64 @@ export const useAdminStore = defineStore('admin', {
     },
 
     /** 旧 loadUsers：GET /api/admin/users。 */
-    async loadUsers() {
+    async loadUsers(): Promise<string | null> {
+      this.usersLoading = true;
       this.fdeErr = null;
       try {
         const data = await api<UsersResponse>('/api/admin/users');
         this.users = data.items ?? [];
         this.usersLoaded = true;
+        return null;
       } catch (e) {
         this.fdeErr = t('admin.errorPrefix') + this.errText(e);
+        return this.fdeErr;
+      } finally {
+        this.usersLoading = false;
+      }
+    },
+
+    async updateUser(id: string, fields: AdminUserUpdate): Promise<string | null> {
+      this.fdeErr = null;
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(fields),
+        });
+        return await this.loadUsers();
+      } catch (e) {
+        return t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async deleteUser(id: string): Promise<string | null> {
+      this.fdeErr = null;
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        this.users = this.users.filter((user) => user.id !== id);
+        return null;
+      } catch (e) {
+        return t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async resetPassword(id: string, password: string): Promise<string | null> {
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(id)}/reset-password`, {
+          method: 'POST',
+          body: JSON.stringify({ password }),
+        });
+        return null;
+      } catch (e) {
+        return t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async resetTotp(id: string): Promise<string | null> {
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(id)}/totp-reset`, { method: 'POST' });
+        return await this.loadUsers();
+      } catch (e) {
+        return t('admin.errorPrefix') + this.errText(e);
       }
     },
 
