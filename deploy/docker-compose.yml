@@ -164,6 +164,7 @@ services:
       TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
       TRAEFIK_DYNAMIC_FILE: routes.yml
       PORTAL_HOST: ${PORTAL_HOST:-station.localhost}
+      PORTAL_INTERNAL_HOSTS: ${PORTAL_INTERNAL_HOSTS:-}
       PORTAL_BACKEND_URL: http://127.0.0.1:${PORTAL_HOST_PORT:-18080}
       # issue #64 R1：run 终态产物持久卷（容器内路径；宿主路径经 ERIX_ARTIFACTS_ROOT_HOST 注入）。
       ERIX_ARTIFACTS_ROOT: /srv/erix/artifacts

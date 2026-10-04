@@ -30,11 +30,23 @@ function sleep(ms) {
 
 // DNS label：小写字母数字，不以 - 开头/结尾（hostname grammar，fde-platform §8.5）。
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const IPV4_LITERAL_SHAPE_RE = /^\d+(?:\.\d+){3}$/;
 
 /** 严格 hostname grammar 校验（拒绝换行/控制字符/大写/下划线/非法字符；DB 无 CHECK，代码层先挡）。 */
 export function isValidHostname(h) {
   if (typeof h !== 'string' || h.length === 0 || h.length > 253) return false;
   return h.split('.').every((label) => DNS_LABEL_RE.test(label));
+}
+
+function isValidInternalHost(host) {
+  if (typeof host !== 'string') return false;
+  if (!IPV4_LITERAL_SHAPE_RE.test(host)) return isValidHostname(host);
+  try {
+    parseCidr(`${host}/32`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** allocation/router key：`fde-<hostname 首段>`（需先 isValidHostname，否则拒绝）。 */
@@ -126,6 +138,7 @@ function assertHttpUrl(value, label) {
  */
 export function generateTraefikConfig({
   portalHost,
+  portalInternalHosts = [],
   portalBackendUrl,
   entryPoint,
   allocations,
@@ -133,6 +146,9 @@ export function generateTraefikConfig({
 }) {
   // F9：渲染边界严格校验，拒绝换行/控制字符/非法字符（DB 无 CHECK，代码层挡）。
   if (!isValidHostname(portalHost)) throw new Error(`invalid portal hostname: ${JSON.stringify(portalHost)}`);
+  for (const host of portalInternalHosts) {
+    if (!isValidInternalHost(host)) throw new Error(`invalid portal internal hostname: ${JSON.stringify(host)}`);
+  }
   for (const a of allocations) {
     if (!isValidHostname(a.hostname)) throw new Error(`invalid allocation hostname: ${JSON.stringify(a.hostname)}`);
   }
@@ -153,7 +169,10 @@ export function generateTraefikConfig({
   lines.push('      service: portal');
   lines.push('    internal:');
   lines.push(`      entryPoints: [${entryPoint}]`);
-  lines.push(`      rule: ${yq(`Host(\`${portalHost}\`) && PathPrefix(\`/api/internal\`)`)}`);
+  const internalHostRule = portalInternalHosts.length === 0
+    ? `Host(\`${portalHost}\`)`
+    : `(${[portalHost, ...portalInternalHosts].map((host) => `Host(\`${host}\`)`).join(' || ')})`;
+  lines.push(`      rule: ${yq(`${internalHostRule} && PathPrefix(\`/api/internal\`)`)}`);
   lines.push('      priority: 200');
   lines.push('      middlewares: [internal-allow]');
   lines.push('      service: portal');
@@ -478,6 +497,7 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
   const state = await readRouteDesiredState(pool, config);
   const text = generateTraefikConfig({
     portalHost: config.portalHost,
+    portalInternalHosts: config.portalInternalHosts,
     portalBackendUrl: config.portalBackendUrl,
     entryPoint: config.traefikEntryPoint,
     allocations: state.allocations,
