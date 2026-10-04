@@ -39,10 +39,10 @@
 │  Traefik（host 网络，独占 80/443，--api=false）                        │
 │    ├─ station.<base>        → http://127.0.0.1:8080 （portal，回环）   │
 │    ├─ *.fde.<base>          → http://10.200.<n>.2:<port>（预览）      │
-│    ├─ llm.<base>            → http://127.0.0.1:4000 （LLM 网关数据面） │
+│    ├─ llm.<base>            → http://127.0.0.1:4100 （LiteLLM 数据面） │
 │    └─ /api/internal/*       → http://127.0.0.1:8080 （ipAllowList）    │
 │                                                                      │
-│  backend 网络（172.30.0.0/24）：portal（publish 127.0.0.1:8080）+ station-db + station-docker-proxy + station-mock-llm（P1）+ LLM 网关（P3）│
+│  backend 网络（172.30.0.0/24）：portal（publish 127.0.0.1:8080）+ station-db + station-docker-proxy + station-litellm（litellm profile）│
 │                                                                      │
 │  fde-alice 10.200.1.0/29：alice 主容器(.2) + 她的自有服务(.3)…          │
 │  fde-bob   10.200.2.0/29：bob 主容器(.2) + …                          │
@@ -56,7 +56,7 @@
 | Traefik | **host** | 宿主 80/443（唯一 ingress） |
 | portal | `backend` | 仅 `127.0.0.1:8080`（回环） |
 | station-db | `backend` | 无（仅 portal 可达） |
-| LLM 网关 | `backend` | 数据面 `127.0.0.1:4000`（回环）；admin 面**不发布** |
+| `station-litellm` | `backend` | 数据面/管理面共用 `127.0.0.1:4100`（回环）；portal 通过 backend 网络访问管理 API |
 | FDE 容器 | **仅自己的 `/29`** | 无 publish（预览经 Traefik） |
 | ~~`edge` 网络~~ | **取消** | Traefik 在 host，不需要 |
 | ~~`control` 网络~~ | **取消** | 共享网络是横向越权的根因（issue #5 正文的证据），D-1 取消 |
@@ -66,7 +66,7 @@
 | 网络 | 类型 | 成员 | 子网 |
 |---|---|---|---|
 | host | 宿主网络栈 | Traefik（host 网络模式） | —（不占 docker 网络） |
-| `backend` | docker bridge（compose 管理，`subnet` 显式声明） | portal + station-db + station-docker-proxy + station-mock-llm（P1 开发期）+ LLM 网关（P3 加入；成员表以 deploy-contract §2.1 为准） | **显式 `172.30.0.0/24`**（与 FDE 池 `10.200.0.0/16` / `10.201.0.0/16` 彻底隔离） |
+| `backend` | docker bridge（compose 管理，`subnet` 显式声明） | portal + station-db + station-docker-proxy + station-litellm（`litellm` profile opt-in） | **显式 `172.30.0.0/24`**（与 FDE 池 `10.200.0.0/16` / `10.201.0.0/16` 彻底隔离） |
 | `fde-<name>` | docker bridge（portal 经 Docker API 按 `--subnet` 显式创建） | 该 FDE 的主容器 + 其自有服务（db/redis/sidecar） | `10.200.<n>.0/29`（大 FDE 为 `10.201.<n>.0/28`，见 §3） |
 
 ---
@@ -142,7 +142,9 @@ N 个 worker ──IPC──▶ agentd（唯一 HTTP 客户端、唯一持 token
 
 `worker 在 executeTool await` → IPC → agentd → L3 → portal 建审批单 → 用户浏览器（L1）决定 → portal 写库 → agentd（下行）→ worker 继续/拒绝；**超时 10min 由 portal 打 `expired`**（修 issue #10 的审计失真）。
 
-### L7 LLM 调用（**Traefik 注入凭据**）
+### L7 LLM 调用（**Traefik 注入 per-FDE virtual key**）
+
+> **当前实现（issue #117 phase 2）**：本节早期流量记录仅作历史背景；目前 Traefik 覆盖 `Authorization` 为该 FDE 的 LiteLLM virtual key，所有 FDE router 共用 `llm-gateway` service，LiteLLM 对 virtual key 强制模型白名单。上游 credential 由 LiteLLM 管理。详见 [`../data/model.md`](../data/model.md) §1.20。
 
 ```
 worker（零凭据，占位 key + endpoint=https://llm.<base>/v1；`llm.<base>` 经 L3 的 hosts 注入解析到本 FDE 网关 IP）
@@ -150,9 +152,8 @@ worker（零凭据，占位 key + endpoint=https://llm.<base>/v1；`llm.<base>` 
   ▼
 Traefik(host:443)
   ① router：Host(`llm.<base>`) && ClientIP(`<该 FDE 精确 subnet>`)   ← 身份来自网络来源，非自报；subnet 由 fde_networks 精确派生：默认池 `10.200.<n>.0/29`、大 FDE `10.201.<n>.0/28`（§5.1）
-  ② middleware：customRequestHeaders 覆盖 Authorization: Bearer <该 FDE binding 的真实上游 api_key>
-     （2026-09-20 修订，issue #38：无独立网关再校验，不再注入 X-FDE-Identity；无 binding 则无此路由）
-  ③ service → llm_providers.base_url（如 http://127.0.0.1:4000 mock 数据面，回环；per-provider 上游直发）
+  ② middleware：customRequestHeaders 覆盖 Authorization 为该 FDE 的 LiteLLM virtual key；LiteLLM 执行模型白名单
+  ③ service → 单一 `llm-gateway` service → LiteLLM（默认宿主回环 `http://127.0.0.1:4100`）；上游 credential 由 LiteLLM 管理
   ▼
 上游 provider（额度/模型白名单/用量由上游 key 自身承担）
 ```
@@ -230,7 +231,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 1. `redirect`（scheme http→https）——挂在 entryPoint 层，先于一切
 2. `ipAllowList`（来源白名单，internal 路由）——**必须在任何业务中间件之前**，先挡非白名单来源
 3. `forwardAuth`（身份 + 授权，预览路由 `fde-auth`）——在代理到上游**之前**执行
-4. `headers`（LLM 凭据注入，`llm-key-<fde>`；**2026-09-20 修订，issue #38**：注入该 FDE 的真实上游 key，不再有独立网关再校验）——在代理到上游**之前**注入并覆盖
+4. `headers`（LLM 凭据注入，`llm-key-<fde>`）：在代理前覆盖为该 FDE 的 LiteLLM virtual key，由 LiteLLM 执行模型白名单
 
 > `redirect`（scheme http→https）只挂在 **entryPoint 层**，不参与 router 中间件链，因此恒先于一切业务中间件。router 中间件链按需叠加：internal=`ipAllowList`；预览=`forwardAuth` → `strip-cookie`；LLM=`headers`。若将来同路由叠加多类，顺序恒为 `ipAllowList` → `forwardAuth` → `headers`。
 
@@ -241,7 +242,7 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | **① 浏览器 → portal**（`station.<base>`） | TLS 终结 → Host 匹配 → portal 自身 session cookie 校验（按 `login_sessions.token_hash` 查库）→ 路由 handler | TLS/主机不匹配 → 连接失败 / `404`；session 无效 → `401 unauthorized`（JSON） | `401` 前端跳登录页 | portal 写登录/登出/关键动作 `audit_log`；Traefik access log 仅原始 |
 | **② 浏览器 → 预览**（`*.fde.<base>`） | TLS → Host 精确匹配（per-allocation router）→ `forwardAuth`（`fde-auth`，回调 `127.0.0.1:8080/api/forward-auth`）：①hostname 查 `port_allocations` ②state ③凭证（ticket 优先 / 预览 cookie）④exposure 判定 → service（容器 IP:port） | hostname 无 → `404`；state released → `403`；无凭证 → `403 forbidden（preview_ticket_required）`（**`public` exposure 例外：跳过凭证校验，仍须过 hostname/state**）；ticket 过期/无效 → `401`；ticket 已用/撤销/不匹配 → `403`；exposure 越权/用户禁用 → `403`；forwardAuth 自身 5xx/超时 → **deny-all** | `403`（凭证类）→ Traefik 透传；登录引导由 portal 前端按 `preview_ticket_required` 处理 | forwardAuth **每次判定**（pass/fail）写 `audit_log` |
 | **③ 容器 → internal API**（`/api/internal/*`） | TLS（容器→Traefik）→ `Host(station) && PathPrefix(/api/internal)` + **`ipAllowList`（remote address，每 FDE 精确 subnet）** → service portal → portal Bearer 校验（`containers.runner_token_hash` 按代次比对）→ 归属校验（`run → session → user_id`）→ handler | 来源不在白名单 → `403`（Traefik）；Bearer 缺失/错 → `401 token_invalid`；吊销 → `401 token_revoked`；归属不符 → `403 run_ownership_mismatch`（或 `404`） | 否（容器不是浏览器，不 302） | portal 对关键动作（claim/心跳/吊销/越权）写 `audit_log` |
-| **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`llm-key-<fde>` 注入并覆盖 `Authorization` 为该 FDE binding 的真实上游 key）→ service `llm-provider-<id>`（= `llm_providers.base_url`，上游直发；**2026-09-20 修订，issue #38**：去 `llm-hub`/LiteLLM hub） | 无匹配 ClientIP → `404`（无兜底路由）；**无 `fde_llm_bindings`（含 api_key）binding → 不生成路由（fail-closed，2026-09-20 修订，issue #38）**；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走 `usage_ledger`，Traefik access log 原始 |
+| **④ LLM 数据面**（`llm.<base>`） | TLS（容器→Traefik）→ `Host(llm) && ClientIP(精确 subnet)`（身份=网络来源，无匹配来源 404）→ `headers`（`llm-key-<fde>` 注入并覆盖 `Authorization` 为该 FDE 的 LiteLLM virtual key）→ 共享 service `llm-gateway` → LiteLLM（上游 credential 与模型目录由 LiteLLM 管理） | 无匹配 ClientIP → `404`（无兜底路由）；无 active binding → 不生成路由（fail-closed）；TLS → 连接失败 | 否 | 不逐请求写 portal `audit_log`（量太大）；用量/成本走 `usage_ledger`，Traefik access log 原始 |
 
 #### 失败语义与信任边界（写死）
 
@@ -264,10 +265,10 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | 2 | **头别名防伪造** | `entryPoints.<name>.http.aliasHeadersStrategy: delete`（或 `reject`） | 实测警告：`X_FDE_Identity` 之类别名头可绕过注入（§10 证据 9）。**必须挂在 `http` 层级下**——写成 `entryPoints.<name>.aliasHeadersStrategy` 会错层 → Traefik 启动失败（fde-platform.md §6.4 注释） |
 | 3 | **禁止兜底路由** | 不写 `Host(llm.<base>)` 的通配路由（无 ClientIP 条件） | 实测：无匹配来源 404 = 默认拒绝，兜底等于开门 |
 | 4 | internal 路由来源白名单 | `/api/internal/*` 加 `ipAllowList`（从 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，§5.1） | internal API 走 ingress，必须限制来源（含大 FDE `/28` 段） |
-| 5 | 流式 | LLM service（`llm-provider-*`；**2026-09-20 修订，issue #38**：由 hub service 改为 per-provider）`responseForwarding.flushInterval` 调小（≤100ms） | 否则 token 流被缓冲成整段 |
-| 6 | 网关 admin 面隔离 | admin 端口不发布，只在 `backend` 网络 | 否则 FDE 能自开额度/建 key（**2026-09-20 修订，issue #38**：随 LiteLLM hub 取消，本约束不再适用——provider 配置走 portal admin API；provider 自身若有 admin 面仍按此原则隔离） |
+| 5 | 流式 | 共享 LiteLLM service（`llm-gateway`）`responseForwarding.flushInterval` 调小（≤100ms） | 否则 token 流被缓冲成整段 |
+| 6 | LiteLLM admin API 隔离 | 管理 API 与数据面共用 listener；宿主仅 loopback publish，portal 通过 backend 网络访问；master key 只由 portal 配置 | FDE 只能经 Traefik 的受限数据面访问，不可直达管理 API |
 | 7 | **容器 → 宿主服务收紧（分层）** | INPUT（宿主本地服务）+ DOCKER-USER（转发/publish）两层，见 §6.1 | **实测**：FDE 容器可达宿主 `gitea:3000`/`mssql:1433`/`portainer:9000`（所有方案共同缺口）；原「只写 DOCKER-USER」不成立（§6.1） |
-| 8 | Traefik 动态配置含全部上游 key（`llm-routes.yml`；**2026-09-20 修订，issue #38**：由「虚拟 key」改为 per-FDE 真实上游 key，独立文件 mode 600） | 宿主文件权限 **600**，仅 portal 可写、Traefik 只读 | 凭据集中点，必须锁死 |
+| 8 | Traefik 动态配置含 per-FDE LiteLLM virtual key（`llm-routes.yml`，独立文件 mode 600） | 宿主文件权限 **600**，仅 portal 可写、Traefik 只读 | 凭据集中点，必须锁死 |
 | 9 | per-container token | 仅存哈希 + `generation/revoked_at`；原文只注入容器 env、portal 不存明文；容器重建/离职原子吊销 | 见 issue #12；边界与残余风险见 §6.2 |
 | 10 | SSE 与长轮询超时 | 路由 read/write timeout ≥ 5min；SSE 禁缓冲 | claim 长轮询与 SSE 都用长连接 |
 
@@ -368,6 +369,8 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 ---
 
 ## 10. 实测证据（9 项，本机真跑：`traefik:v3` + 真实 docker 网络/容器）
+
+> LLM 证据 8 与下方旧配置示例记录的是 issue #117 phase 2 之前的历史实现；当前由 per-FDE LiteLLM virtual key 和共享 `llm-gateway` service 实现，见本节 L7 当前口径。
 
 | # | 测试 | 结果 | 支撑的决策 |
 |---|---|---|---|

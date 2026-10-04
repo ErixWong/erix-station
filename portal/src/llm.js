@@ -139,6 +139,16 @@ function toProvider(credential, models) {
   };
 }
 
+function toProviderMutationResult(result, { name, info = {}, values = {} }) {
+  const credential = result?.credential ?? result;
+  return toProvider(
+    credentialName(credential)
+      ? credential
+      : { credential_name: name, credential_info: info, credential_values: values },
+    [],
+  );
+}
+
 export async function listModels(gateway) {
   const client = getGatewayClient(gateway);
   return { items: gatewayModels(await client.listModels()).map(toModel) };
@@ -174,7 +184,7 @@ export async function createProvider(gateway, input = {}) {
     credential_info: info,
     credential_values: values,
   });
-  return toProvider(result?.credential ?? result ?? { credential_name: name.trim(), credential_info: info, credential_values: values }, []);
+  return toProviderMutationResult(result, { name: name.trim(), info, values });
 }
 
 export async function updateProvider(gateway, name, { base_url, enabled, credential_info, credential_values } = {}) {
@@ -189,14 +199,14 @@ export async function updateProvider(gateway, name, { base_url, enabled, credent
     const payload = await client.listCredentials();
     const current = rowsFrom(payload, ['credentials', 'data']).find((item) => credentialName(item) === name);
     if (!current) throw new LlmError('not_found', 'credential not found', { httpStatus: 404 });
-    values = { ...credentialValues(current), api_base: base_url };
+    values = { api_base: base_url };
   }
   const body = {
-    ...(credential_info === undefined ? {} : { credential_info }),
+    credential_info: credential_info ?? {},
     ...(values === undefined ? {} : { credential_values: values }),
   };
   const result = await client.updateCredential(name, body);
-  return toProvider(result?.credential ?? result ?? { credential_name: name, credential_info, credential_values: values }, []);
+  return toProviderMutationResult(result, { name, info: body.credential_info, values });
 }
 
 export async function deleteProvider(gateway, name) {

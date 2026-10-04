@@ -12,10 +12,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
-import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
+import { ensureLlmBinding } from './lib/llm-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
 const TRAEFIK_WEB = 'http://127.0.0.1:8090';
 const FDE_IMAGE = 'erix-station/fde:local';
@@ -111,7 +111,6 @@ const FDE_ENV = {
   FDE_DEV_USER: '',
   FDE_DEV_MODE: '1',
   FDE_AGENT_VERSION: '0.1.0',
-  MOCK_LATENCY_MS: '5000',
 };
 
 const RUNNER = {
@@ -182,7 +181,7 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     safe(() => docker('rm -f fde-alice fde-bob 2>/dev/null || true'));
     safe(() => docker('network rm fde-alice fde-bob 2>/dev/null || true'));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local erix-station/mock-llm:local 2>/dev/null || true')); // m2：compose up --build 构建的镜像也清（与 wp3b 口径一致）
+    safe(() => docker('rmi -f erix-station/portal:local 2>/dev/null || true')); // m2：compose up --build 构建的镜像也清（与 wp3b 口径一致）
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
@@ -197,8 +196,7 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     removeDbDir();
     safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
     docker(`build -t ${FDE_IMAGE} runner/`);
-    // MIGRATE_ON_START=1：迁移 0002（llm_providers/llm_models + fde_llm_bindings 扩列）必须已应用，
-    // 下方 ensureMockLlmBinding 的 admin API 才有表/列可用（与 wp5/wp6 同口径）。
+    // 启动迁移完成后，管理台 API 才能创建 LiteLLM credential/model/binding。
     compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1', ...FDE_ENV });
 
     await waitFor(async () => {
@@ -223,7 +221,7 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
 
     // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings 生成，无 binding 无 LLM 出口。
     // 只给 alice 配 mock binding（bob 必须保持无配置——本脚本断言 bob 不受影响）。
-    await ensureMockLlmBinding({
+    await ensureLlmBinding({
       docker,
       dynamicDir: S.dynamicRoot,
       fdeName: 'alice',
