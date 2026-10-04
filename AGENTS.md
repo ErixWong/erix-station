@@ -53,13 +53,38 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 - 测试账号：`admin / admin123`（role=admin → 管理台）、`eric / admin123`（fde:eric → 工作台）——两账号均未注册 TOTP，密码直通（**2026-10-03 实测修正**：原写 `eric-admin`，实际 `users.login` 为 `admin`，用错名字登录会报「用户名或口令错误」）
 - 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`（bootstrap-admin 不能重置已存在账号）
 
+### 4.2 LLM 网关（LiteLLM，issue #117）
+
+平台的 LLM 网关**外包给自托管 LiteLLM**：**模型目录与上游凭据的唯一真相源是 LiteLLM 的 DB**（`store_model_in_db: true`）。管理台的 LLM tab 只是它的**薄代理**（`portal/src/llm-gateway.js`），不再是我们的 `llm_providers`/`llm_models`（已迁 `*_retired`）。
+
+**起栈与地址**
+- `station-litellm` 是**可选 `litellm` profile**，需显式启用：`docker compose --profile litellm up -d`
+- 数据面与管理面**同端口**：宿主回环 `http://127.0.0.1:4100`（Traefik host 网络用），容器内 `http://station-litellm:4000`（portal 用 `LLM_GATEWAY_ADMIN_URL`）
+
+**数据面路由**
+- LLM 段只发**单一 service `llm-gateway`**（上游 = LiteLLM）；per-FDE router 仍带 `ClientIP(<该 FDE 的 /29>)` 限定，middleware 注入该 FDE 的**虚拟 key**
+- **per-FDE 虚拟 key**：开户/改配置时 portal 调 `/key/generate` 铸（models 白名单 = 该 FDE 选中的模型）；**明文只存 `fde_llm_bindings.api_key`**（Traefik 注入需要明文）。**改配置走 `/key/update` 原地更新白名单，不轮换 key**（同 alias 铸新 key 会撞 LiteLLM 的唯一约束）
+- 旧 `api_key`（上游真 key）在迁移 `0010` 被清除并置 `revoked`——**上游真 key 现在只存在于 LiteLLM credential**
+
+**管理台口径**
+- **供应商 = LiteLLM Credential**（含上游 `api_key`，加密存 LiteLLM DB）；credential **没有启停语义**（模型启停映射到 `/model/block|unblock`）
+- **上游模型 id 格式**：`<provider 前缀>/<上游模型>`，如 `openai/deepseek-flash`——管理台「Upstream model id」字段，**不会自动加前缀**（显式优于隐式）
+- **不对外暴露 LiteLLM 自带 UI**（不在验收面上，其前端有已知缺陷）
+
+**凭据**：`deploy/.env`（600，gitignore）→ `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` / `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD`。⚠️ **`LITELLM_SALT_KEY` 一旦写过凭据就不能再改**（旧密文将无法解密）
+
+**已知遗留**（详见 #117）
+- LiteLLM 成本表不含自定义模型名 → 虚拟 key 的 `spend` 恒为 `0.0`，用量记账待补定价
+- **集成 e2e（`wp3a`/`wp3b`/`wp4`/`wp5`/`wp6`）仍假设旧架构**（mock 在数据面路径上、binding 带 `api_key`）→ **当前跑不通**，待重写；`station-mock-llm` 同批删除
+
 ## 5. 端口登记（本机，避让已有占用）
 
 | 端口 | 用途 |
 |---|---|
 | 80 / 443 | Traefik ingress（唯一对外；**生产值**——开发期本机 80/443 被 nginx 占用，按 env.md §0 用 8090/8443） |
 | 8080 | portal（backend 网络 + publish 仅 `127.0.0.1:8080` 回环，供 Traefik 反代/forwardAuth；开发期本机映射 `18080`，env.md §0） |
-| 4000 | LLM 网关数据面（publish 仅 `127.0.0.1:4000` 回环；P1 由 station-mock-llm 占据，P3 由真实网关占据） |
+| 4000 | **迁移期遗留**：`station-mock-llm` 数据面（publish 仅 `127.0.0.1:4000` 回环）。**portal 已不再指向它**（issue #117 phase 2 起走 LiteLLM），仅集成 e2e 仍在用；待删（#117） |
+| 4100 | **LLM 网关数据面**：`station-litellm`（`litellm` profile），publish 仅 `127.0.0.1:4100` 回环，Traefik 经 `LLM_GATEWAY_HOST` 访问；管理面同端口、仅 backend 网络可达。见 §4.2 |
 | 5432 | DB（backend 网络内，不 publish） |
 
 FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机 publish。
