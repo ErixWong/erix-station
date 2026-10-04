@@ -557,7 +557,9 @@ onBeforeUnmount(() => {
                 <dd>{{ selectedUser.role === 'admin' ? t('admin.fde.roleAdmin') : t('admin.fde.roleFde') }}</dd>
                 <dt class="text-black/55">{{ t('admin.fde.colFde') }}</dt><dd>{{ selectedUser.fde_name || '—' }}</dd>
                 <dt class="text-black/55">{{ t('admin.fde.colMfa') }}</dt>
-                <dd>{{ selectedUser.totp_enabled ? t('admin.fde.mfaEnabled') : t('admin.fde.mfaDisabled') }}</dd>
+                <dd :class="selectedUser.totp_enabled ? 'font-medium text-green-700' : 'text-black/45'">
+                  {{ selectedUser.totp_enabled ? t('admin.fde.mfaEnabled') : t('admin.fde.mfaDisabled') }}
+                </dd>
                 <dt class="text-black/55">{{ t('admin.fde.lastLogin') }}</dt>
                 <dd>{{ formatLastLogin(selectedUser.last_login_at) }}</dd>
                 <dt class="text-black/55">{{ t('admin.fde.colStatus') }}</dt>
