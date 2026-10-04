@@ -564,6 +564,57 @@ describe('AdminView · FDE 用户', () => {
     wrapper.unmount();
   });
 
+  it('为存量用户绑定 TOTP 经确认后只展示一次新密钥；已绑定用户显示重绑文案', async () => {
+    const enrolled = {
+      user: { ...USERS.items[1], totp_enabled: true },
+      totp_uri: 'otpauth://totp/erix-station:bob?secret=TEST_ONLY_TOTP_SEED&issuer=erix-station',
+      totp_secret: 'TEST_ONLY_TOTP_SEED',
+    };
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users/u2/totp-enroll' && init?.method === 'POST') {
+        return jsonResponse(200, enrolled);
+      }
+      return undefined;
+    });
+    const bobRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('bob'));
+    if (!bobRow) throw new Error('bob row not found');
+    await bobRow.get('[data-test="user-menu-button"]').trigger('click');
+    const bindAction = wrapper.findAll('[role="menuitem"]').find((button) => button.text() === '绑定 TOTP');
+    expect(bindAction).toBeDefined();
+    if (!bindAction) throw new Error('TOTP bind action not found');
+    await bindAction.trigger('click');
+    expect(wrapper.get('[role="dialog"]').text()).toContain('确认绑定 TOTP');
+    expect(wrapper.get('[role="dialog"]').text()).toContain('密钥仅本次显示');
+    expect(callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')).toHaveLength(0);
+
+    await wrapper.get('[data-test="confirm-totp-enroll"]').trigger('click');
+    await flushPromises();
+    const post = callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')[0];
+    expect(post).toBeDefined();
+    expect(post?.[1]?.body).toBeUndefined();
+    const totp = wrapper.get('[data-test="totp-box"]');
+    expect(totp.text()).toContain('仅此一次显示');
+    expect(totp.text()).toContain(enrolled.totp_uri);
+    expect(totp.text()).toContain(enrolled.totp_secret);
+    expect(totp.find('img').attributes('src')).toBe('data:image/png;base64,MOCKQR');
+    expect(totp.find('[data-test="copy-totp-uri"]').exists()).toBe(true);
+    expect(totp.find('[data-test="copy-totp-secret"]').exists()).toBe(true);
+    await wrapper.get('[data-test="totp-saved"]').trigger('click');
+    expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain(enrolled.totp_secret);
+
+    const aliceRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('alice'));
+    if (!aliceRow) throw new Error('alice row not found');
+    await aliceRow.get('[data-test="user-menu-button"]').trigger('click');
+    expect(wrapper.get('[role="menu"]').text()).toContain('重绑 TOTP（旧码作废）');
+    const rebindAction = wrapper.findAll('[role="menuitem"]').find((button) => button.text() === '重绑 TOTP（旧码作废）');
+    if (!rebindAction) throw new Error('TOTP rebind action not found');
+    await rebindAction.trigger('click');
+    expect(wrapper.get('[role="dialog"]').text()).toContain('旧密钥将立即作废');
+    expect(callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')).toHaveLength(1);
+    wrapper.unmount();
+  });
+
   it('详情抽屉中弱化未启用 MFA 并强调已启用状态', async () => {
     const { wrapper } = await mountAdmin();
     const rows = wrapper.findAll('[data-test="user-row"]');
