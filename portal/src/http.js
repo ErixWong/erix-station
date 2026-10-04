@@ -312,6 +312,19 @@ function decodeUuid(raw) {
   return decodeURIComponent(raw).toLowerCase();
 }
 
+function decodeAdminUserUuid(raw) {
+  let id;
+  try {
+    id = decodeUuid(raw);
+  } catch {
+    throw new HttpError(400, 'validation_failed', '用户 id 必须是 UUID', { details: { field: 'id' } });
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+    throw new HttpError(400, 'validation_failed', '用户 id 必须是 UUID', { details: { field: 'id' } });
+  }
+  return id;
+}
+
 async function route(req, res, ctx) {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
@@ -638,6 +651,36 @@ async function handleAdminApi(req, res, ctx, url) {
       // totp_secret 仅此响应出现一次（红线）；列表/其它端点永不回显。
       return sendJson(res, 201, created);
     }
+  }
+  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset))?$/);
+  if (adminUserMatch) {
+    const userId = decodeAdminUserUuid(adminUserMatch[1]);
+    const action = adminUserMatch[2] ?? null;
+    if (action === 'reset-password' && req.method === 'POST') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await admin.resetUserPassword(ctx.pool, userId, body?.password, {
+        actorId: session.user.id,
+        limits: { maxPasswordLength: ctx.config.maxPasswordLength },
+      });
+      return sendJson(res, 200, result);
+    }
+    if (action === 'totp-reset' && req.method === 'POST') {
+      const result = await admin.resetUserTotp(ctx.pool, userId, { actorId: session.user.id });
+      return sendJson(res, 200, result);
+    }
+    if (action === null && req.method === 'PATCH') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      return sendJson(res, 200, await admin.updateUser(ctx.pool, userId, body, { actorId: session.user.id }));
+    }
+    if (action === null && req.method === 'DELETE') {
+      await admin.deleteUser(ctx.pool, { actorId: session.user.id, userId });
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
   // Git host 注册表（issue #118）。
