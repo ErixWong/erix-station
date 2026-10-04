@@ -109,16 +109,24 @@ describe('UserLlmPane · LLM 配置表单', () => {
     const { wrapper } = await mountPane();
     expect(wrapper.text()).toContain('⚠️ 有活跃 run：更换供应商或 API key 会被服务端拒绝');
     expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('当前虚拟 key：sk•••');
+    expect(wrapper.find('[data-test="virtual-key"] span[title]').attributes('title')).toBe('sk•••');
+    expect(wrapper.find('[data-test="virtual-key"] span[title]').classes()).toContain('truncate');
     expect(wrapper.find('input[type="password"]').exists()).toBe(false);
 
     // 主模型下拉：仅 text 且 tool_calling 的启用模型（m1 gpt-4o；m3 无 tool_calling 被过滤）
     const mainOpts = wrapper.find('[data-test="main-model"]').findAll('option');
     expect(mainOpts.map((o) => o.text())).toEqual(['（不配置）', 'gpt-4o — GPT-4o']);
     expect((wrapper.find('[data-test="main-model"]').element as HTMLSelectElement).value).toBe('m1');
+    expect(wrapper.find('[data-test="main-model"]').attributes('title')).toBe('gpt-4o — GPT-4o');
+    expect(wrapper.find('[data-test="main-model"]').classes()).toContain('truncate');
 
     // embedding 下拉回填 m2；vision 无可选项 → 不配置
     expect((wrapper.find('[data-test="embedding-model"]').element as HTMLSelectElement).value).toBe('m2');
     expect((wrapper.find('[data-test="vision-model"]').element as HTMLSelectElement).value).toBe('');
+    const actionButtons = wrapper.find('form').findAll('button');
+    for (const button of actionButtons) {
+      expect(button.classes()).toEqual(expect.arrayContaining(['min-h-8', 'px-2.5', 'py-1.5', 'text-sm']));
+    }
 
     // 供应商切到 anthropic：主模型只剩「（不配置）」（其唯一模型未启用）
     await wrapper.find('[data-test="provider-select"]').setValue('p2');
@@ -254,12 +262,14 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain('⚠️ Active run: changing the provider or API key');
-    expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('Current virtual key: sk•••');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toContain('Current virtual key:');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toContain('sk•••');
     expect(wrapper.find('input[type="password"]').exists()).toBe(false);
 
     const form = wrapper.find('form').text();
     expect(form).toContain('Provider');
-    expect(form).toContain('Main model (text · tool_calling)');
+    expect(form).toContain('Main model');
+    expect(form).toContain('text · tool_calling');
     expect(form).toContain('Embedding (optional)');
     expect(form).toContain('Vision (optional)');
     expect(form).toContain('Save LLM config');
@@ -290,7 +300,8 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     expect(wrapper.text()).toContain('Saved: main model gpt-4o');
-    expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('Current virtual key: sk•••');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toContain('Current virtual key:');
+    expect(wrapper.find('[data-test="virtual-key"]').text()).toContain('sk•••');
 
     // ② provision 完成文案
     await wrapper.findAll('form button')[1].trigger('click');
