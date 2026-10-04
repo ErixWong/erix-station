@@ -39,6 +39,12 @@
 | 管理 | `GET /api/admin/fdes/:fdeName/git-credential` | 查询 Git 凭据主机、用户名与掩码 |
 | 管理 | `PUT /api/admin/fdes/:fdeName/git-credential` | 配置一个 Git 主机凭据 |
 | 管理 | `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>` | 删除一个 Git 主机凭据 |
+| 管理 | `GET /api/admin/users` | 用户列表（不含密码哈希/TOTP 种子） |
+| 管理 | `POST /api/admin/users` | 创建本地 FDE 用户 |
+| 管理 | `PATCH /api/admin/users/:id` | 更新用户资料、角色、FDE 名称或状态 |
+| 管理 | `DELETE /api/admin/users/:id` | 删除无活动资源的用户 |
+| 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
+| 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 会话 | `GET /api/sessions` | 会话列表 |
 | 会话 | `POST /api/sessions` | 创建会话 |
 | 会话 | `GET /api/sessions/:id` | 会话详情（含消息历史 + `last_seq`） |
@@ -1697,3 +1703,27 @@ Returns `204` when deleted; returns `409 host_in_use` while `fde_git_accounts` r
 ### `POST /api/admin/fdes/:fdeName/provision`
 
 The JSON body may contain `git_host_id`. The selected provider is recorded in `containers.git_provider`. `minted` hosts provision an account and scoped token; token plaintext is written to the FDE `.git-credentials` file and never stored in the database. `per_fde_pat` hosts finish with `users.status='awaiting_credential'` until the administrator writes the FDE's PAT through the Git credential endpoint. The response includes `status` and `git_provider`.
+
+## 12. Admin user management (issue #128)
+
+All user-management routes require `requireAdmin`: no session returns `401 unauthorized`; a non-admin session returns `403 forbidden`. User IDs are UUIDs. User responses never contain `password_hash` or `totp_secret`.
+
+### `GET /api/admin/users`
+
+Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), and `last_login_at` (the newest `login_sessions.created_at`, or `null`). Revoked sessions remain part of login history.
+
+### `PATCH /api/admin/users/:id`
+
+Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
+
+### `DELETE /api/admin/users/:id`
+
+Returns `204` after deleting the user and explicitly removing `login_sessions` and `login_pending` rows (neither table has `ON DELETE CASCADE`). Deleting the current administrator returns `409 self_delete`. A user with a non-removed FDE container or a `queued`, `running`, or `cancelling` run returns `409 user_has_active_fde`; remaining database references that prevent deletion return `409 user_has_related_data`.
+
+### `POST /api/admin/users/:id/reset-password`
+
+Request: `{ "password": "..." }`; password length must be 1–256 characters (the configured portal limit applies). The password is stored as the existing self-describing scrypt hash. Returns `{ "ok": true }` and revokes every unrevoked login session; the plaintext and hash are never returned.
+
+### `POST /api/admin/users/:id/totp-reset`
+
+Clears `totp_secret` and `last_totp_step`, then revokes every unrevoked login session. Returns `{ "ok": true }`; the previous TOTP seed is never returned.
