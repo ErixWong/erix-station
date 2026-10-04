@@ -81,12 +81,17 @@ interface GitHostsResponse {
 
 interface TotpProvisionResponse {
   user: AdminUser;
+  totp_secret?: string;
+  totp_uri?: string;
+}
+
+interface TotpEnrollmentResponse extends TotpProvisionResponse {
   totp_secret: string;
   totp_uri: string;
 }
 
 async function makeTotpOnce(
-  response: TotpProvisionResponse,
+  response: TotpEnrollmentResponse,
   purpose: TotpOnce['purpose'],
 ): Promise<TotpOnce> {
   const qr = await QRCode.toDataURL(response.totp_uri, { errorCorrectionLevel: 'M', scale: 4, margin: 8 });
@@ -97,6 +102,10 @@ async function makeTotpOnce(
     qr,
     purpose,
   };
+}
+
+function hasTotpProvision(response: TotpProvisionResponse): response is TotpEnrollmentResponse {
+  return typeof response.totp_secret === 'string' && typeof response.totp_uri === 'string';
 }
 
 export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'role' | 'fde_name'>> & {
@@ -226,7 +235,7 @@ export const useAdminStore = defineStore('admin', {
     async enrollTotp(id: string): Promise<string | null> {
       this.fdeErr = null;
       try {
-        const response = await api<TotpProvisionResponse>(
+        const response = await api<TotpEnrollmentResponse>(
           `/api/admin/users/${encodeURIComponent(id)}/totp-enroll`,
           { method: 'POST' },
         );
@@ -428,19 +437,20 @@ export const useAdminStore = defineStore('admin', {
       }
     },
 
-    /** 旧 addUserForm 提交：POST /api/admin/users → 一次性 TOTP 盒（qrcode data URL）。 */
-    async addUser(fields: { login: string; display_name: string; password: string; fde_name?: string }): Promise<string | null> {
+    /** POST /api/admin/users；仅启用 TOTP 时创建一次性种子展示盒。 */
+    async addUser(fields: { login: string; display_name: string; password: string; fde_name?: string; totpEnabled?: boolean }): Promise<string | null> {
       this.fdeErr = null;
       try {
-        const body: Record<string, string> = {
+        const body: { login: string; display_name: string; password: string; fde_name?: string; totp_enabled: boolean } = {
           login: fields.login,
           display_name: fields.display_name,
           password: fields.password,
+          totp_enabled: fields.totpEnabled === true,
         };
         if (fields.fde_name) body.fde_name = fields.fde_name;
         const r = await api<TotpProvisionResponse>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
-        // TOTP 种子仅此一次显示（红线）：创建与补绑共用同一只一次性展示盒。
-        this.totpOnce = await makeTotpOnce(r, 'created');
+        // TOTP 种子仅此一次显示（红线）：只在服务端返回种子时构造展示盒。
+        this.totpOnce = hasTotpProvision(r) ? await makeTotpOnce(r, 'created') : null;
         await this.loadUsers();
         return null;
       } catch (e) {

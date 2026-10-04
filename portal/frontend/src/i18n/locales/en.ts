@@ -255,6 +255,8 @@ export const en = {
       displayNameLabel: 'Display name',
       passwordLabel: 'Password',
       fdeNameLabel: 'fde_name (optional)',
+      totpEnabledOpt: 'Enable TOTP',
+      totpEnabledHint: 'Off by default. If enabled, scan the QR code with an authenticator app to bind it.',
       addUser: 'Create user',
       totpTitle: 'User created · TOTP setup',
       totpEnrollTitle: 'TOTP bound · one-time secret',
