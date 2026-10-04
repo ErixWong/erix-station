@@ -23,7 +23,7 @@ const modelForm = reactive({
   tool_calling: false,
   context_window: '',
 });
-const modelEditForm = reactive({ model: '', name: '', tool_calling: false, context_window: '' });
+const modelEditForm = reactive({ model: '', name: '', type: 'text', tool_calling: false, context_window: '' });
 
 type DeleteTarget = { type: 'provider'; provider: LlmProvider } | { type: 'model'; model: LlmModel };
 const deleteTarget = ref<DeleteTarget | null>(null);
@@ -32,7 +32,7 @@ const deleteMessage = computed(() => {
   if (!target) return '';
   return target.type === 'provider'
     ? t('admin.llm.confirmDeleteProvider', { name: target.provider.name })
-    : t('admin.llm.confirmDeleteModel', { model: target.model.model_id });
+    : t('admin.llm.confirmDeleteModel', { model: target.model.name });
 });
 
 function clearProviderForm() {
@@ -109,6 +109,7 @@ async function onAddModel() {
 function openEditModel(model: LlmModel) {
   modelEditForm.model = model.litellm_params?.model ?? '';
   modelEditForm.name = model.name;
+  modelEditForm.type = model.type;
   modelEditForm.tool_calling = model.tool_calling;
   modelEditForm.context_window = model.context_window === null ? '' : String(model.context_window);
   editingModel.value = model;
@@ -120,6 +121,7 @@ async function onUpdateModel() {
   const err = await admin.updateModel(model, {
     ...(modelEditForm.model.trim() ? { model: modelEditForm.model.trim() } : {}),
     name: modelEditForm.name.trim(),
+    type: modelEditForm.type,
     tool_calling: modelEditForm.tool_calling,
     ...(modelEditForm.context_window ? { context_window: Number(modelEditForm.context_window) } : {}),
   });
@@ -160,12 +162,19 @@ onMounted(() => {
           data-test="provider-card"
           class="mt-2 rounded-lg border border-black/15"
         >
-          <div class="flex flex-wrap items-center gap-3 px-3 py-2">
+          <div data-test="provider-header" class="flex flex-wrap items-center gap-3 px-3 py-2">
             <span class="font-semibold">{{ p.name }}</span>
             <span class="text-black/50 text-xs break-all">{{ p.base_url }}</span>
             <span class="flex-1"></span>
             <button
               type="button"
+              data-test="open-add-model"
+              class="rounded-md bg-brand px-2 py-0.5 text-xs text-white hover:bg-brand-hover"
+              @click="openAddModel(String(p.id))"
+            >{{ t('admin.llm.addModel') }}</button>
+            <button
+              type="button"
+              data-test="toggle-provider-models"
               class="rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
               @click="admin.toggleExpandedProvider(String(p.id))"
             >{{ admin.expandedProviders.includes(String(p.id)) ? t('admin.llm.collapseModels') : t('admin.llm.modelsCount', { count: p.models.length }) }}</button>
@@ -186,7 +195,6 @@ onMounted(() => {
             <table class="w-full text-sm">
               <thead>
                 <tr class="text-left text-black/60">
-                  <th class="py-1 pr-3 font-medium">model_id</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colName') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
                   <th class="py-1 pr-3 font-medium">tool_calling</th>
@@ -197,10 +205,9 @@ onMounted(() => {
               </thead>
               <tbody>
                 <tr v-if="p.models.length === 0">
-                  <td colspan="7" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
+                  <td colspan="6" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
                 </tr>
                 <tr v-for="m in p.models" :key="m.id" data-test="model-row" class="border-t border-black/5">
-                  <td class="py-1 pr-3">{{ m.model_id }}</td>
                   <td class="py-1 pr-3">{{ m.name }}</td>
                   <td class="py-1 pr-3">
                     <span class="rounded border border-sky-600 bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700">{{ m.type }}</span>
@@ -234,13 +241,6 @@ onMounted(() => {
                 </tr>
               </tbody>
             </table>
-
-            <button
-              type="button"
-              data-test="open-add-model"
-              class="mt-2 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover"
-              @click="openAddModel(String(p.id))"
-            >{{ t('admin.llm.addModel') }}</button>
           </div>
         </div>
       </div>
@@ -377,17 +377,15 @@ onMounted(() => {
 
   <ModalShell
     v-if="editingModel"
-    :label="t('admin.llm.editModelTitle', { model: editingModel.model_id })"
+    :label="t('admin.llm.editModelTitle', { model: editingModel.name })"
     dialog-class="max-h-[90vh] overflow-y-auto md:w-[36rem]"
     @close="editingModel = null"
   >
     <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
-      <h2 class="text-sm font-medium">{{ t('admin.llm.editModelTitle', { model: editingModel.model_id }) }}</h2>
+      <h2 class="text-sm font-medium">{{ t('admin.llm.editModelTitle', { model: editingModel.name }) }}</h2>
       <button type="button" :aria-label="t('common.close')" class="ml-auto rounded-md px-2 py-1 text-sm hover:bg-black/5" @click="editingModel = null">✕</button>
     </div>
     <form data-test="edit-model-form" class="grid gap-3 px-3 py-3 sm:grid-cols-2" @submit.prevent="onUpdateModel">
-      <p class="text-sm">model_id: {{ editingModel.model_id }}</p>
-      <p class="text-sm">{{ t('admin.llm.colType') }}: {{ editingModel.type }}</p>
       <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
         {{ t('admin.llm.upstreamModelId') }}
         <input
@@ -401,6 +399,12 @@ onMounted(() => {
       <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
         {{ t('admin.llm.colName') }}
         <input v-model="modelEditForm.name" required class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colType') }}
+        <select v-model="modelEditForm.type" data-test="edit-model-type" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+          <option v-for="type in MODEL_TYPES" :key="type" :value="type">{{ type }}</option>
+        </select>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.colContextWindow') }}

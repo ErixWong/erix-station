@@ -9,6 +9,25 @@ export { LlmGatewayError };
 
 export const LLM_MODEL_TYPES = ['text', 'embedding', 'vision', 'rerank', 'audio-tts', 'audio-stt', 'image-gen'];
 
+export function typeToMode(type) {
+  switch (type) {
+    case 'embedding':
+      return 'embedding';
+    case 'rerank':
+      return 'rerank';
+    case 'audio-tts':
+      return 'audio_speech';
+    case 'audio-stt':
+      return 'audio_transcription';
+    case 'image-gen':
+      return 'image_generation';
+    case 'text':
+    case 'vision':
+    default:
+      return 'chat';
+  }
+}
+
 export class LlmError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
     super(message);
@@ -235,6 +254,7 @@ export async function createModel(gateway, input = {}) {
   };
   const model_info = {
     ...suppliedInfo,
+    mode: typeToMode(input.type),
     ...(input.name === undefined ? {} : { display_name: input.name }),
     ...(input.type === undefined ? {} : { type: input.type }),
     ...(input.tool_calling === undefined ? {} : { tool_calling: input.tool_calling === true }),
@@ -291,7 +311,7 @@ async function findGatewayModel(client, id) {
   return found;
 }
 
-export async function updateModel(gateway, id, { name, enabled, tool_calling, context_window, model } = {}) {
+export async function updateModel(gateway, id, { name, type, enabled, tool_calling, context_window, model } = {}) {
   const client = getGatewayClient(gateway);
   let upstreamModel;
   if (model !== undefined) {
@@ -311,18 +331,21 @@ export async function updateModel(gateway, id, { name, enabled, tool_calling, co
   }
   if (
     name !== undefined
+    || type !== undefined
     || tool_calling !== undefined
     || context_window !== undefined
     || upstreamModel !== undefined
   ) {
     const info = current.model_info ?? {};
     const metadata = { ...(info.metadata ?? {}) };
+    if (type !== undefined) metadata.type = type;
     if (tool_calling !== undefined) metadata.tool_calling = tool_calling === true;
     if (context_window !== undefined) metadata.context_window = context_window;
     const update = { model_id: id };
-    if (name !== undefined || tool_calling !== undefined || context_window !== undefined) {
+    if (name !== undefined || type !== undefined || tool_calling !== undefined || context_window !== undefined) {
       update.model_info = {
         ...info,
+        ...(type === undefined ? {} : { type, mode: typeToMode(type) }),
         ...(name === undefined ? {} : { display_name: name }),
         ...(tool_calling === undefined ? {} : { tool_calling: tool_calling === true }),
         ...(context_window === undefined ? {} : { context_window }),
