@@ -1,5 +1,5 @@
 // WP3a 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
-// 流程：起栈（含 mock LLM 网关）→ 建用户 + provision FDE → 假 agentd（真实 token + FDE 网络路径）
+// 流程：起栈（含 LiteLLM）→ 建用户 + provision FDE → 假 agentd（真实 token + FDE 网络路径）
 //   → SSE 连接 + claim → 事件 seq 递增 → finish → 断线重连 re-claim（方案 B）→ 并发 claim 竞态
 //   → mock 网关经 Traefik 注入链流式响应 → 回收。
 // 运行：npm run test:integration:wp3a
@@ -11,10 +11,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseCidr, intToIp } from '../src/ipam.js';
-import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
+import { ensureLlmBinding } from './lib/llm-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
 const TRAEFIK_WEB = 'http://127.0.0.1:8090';
 
@@ -133,7 +133,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     safe(() => docker('rm -f fde-alice 2>/dev/null || true'));
     safe(() => docker('network rm fde-alice 2>/dev/null || true'));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local erix-station/mock-llm:local 2>/dev/null || true'));
+    safe(() => docker('rmi -f erix-station/portal:local 2>/dev/null || true'));
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     removeDbDir();
@@ -145,8 +145,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
     removeDbDir();
 
-    // 1) 起栈（含 station-mock-llm）；MIGRATE_ON_START=1：迁移 0002（llm_providers/llm_models +
-    // fde_llm_bindings 扩列）必须已应用，下方 ensureMockLlmBinding 的 admin API 才有表/列可用。
+    // 1) 起栈（含 station-litellm）；启动迁移完成后，管理台 API 才能创建 credential/model/binding。
     compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1' });
 
     await waitFor(async () => {
@@ -155,9 +154,9 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     }, { label: 'portal healthz', timeoutMs: 240000 });
 
     await waitFor(async () => {
-      const r = await fetch('http://127.0.0.1:4000/healthz').catch(() => null);
+      const r = await fetch('http://127.0.0.1:4100/health/readiness').catch(() => null);
       return r && r.status === 200;
-    }, { label: 'mock-llm healthz', timeoutMs: 120000 });
+    }, { label: 'LiteLLM readiness', timeoutMs: 120000 });
 
     // 2) 建用户（provision 前提）+ provision FDE（复用 WP2b 路径）
     psqlStdin(`INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status) VALUES ('${S.userId}', 'alice', 'Alice', 'fde', 'alice', 'local', 'active');`);
@@ -183,7 +182,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
 
     // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
     // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、跑 run 之前补 binding。
-    await ensureMockLlmBinding({
+    await ensureLlmBinding({
       docker,
       dynamicDir: S.dynamicRoot,
       fdeName: 'alice',
@@ -276,9 +275,9 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
       // eslint-disable-next-line no-console
       console.log(docker('logs station-portal --tail 80'));
       // eslint-disable-next-line no-console
-      console.log('\n[e2e] --- mock-llm logs ---');
+      console.log('\n[e2e] --- LiteLLM logs ---');
       // eslint-disable-next-line no-console
-      console.log(docker('logs station-mock-llm --tail 40'));
+      console.log(docker('logs station-litellm --tail 40'));
     } catch {}
     throw err;
   }

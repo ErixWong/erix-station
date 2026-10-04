@@ -1,18 +1,18 @@
 // WP3b 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
-// 流程：起栈（含 mock LLM 网关）→ 建用户 + 两步登录 → 建项目（触发 materializer 写 config.json）
+// 流程：起栈（含 LiteLLM）→ 建用户 + 两步登录 → 建项目（触发 materializer 写 config.json）
 //   → provision FDE（真实 runner 镜像）→ agentd SSE 连接 + ping → 种子 run（真实 internal API claim）
-//   → worker 跑 erix-agent runToolLoop（mock LLM 网关）→ 事件 seq 落库 → 终态 + run_end + usage 记账
+//   → worker 跑 erix-agent runToolLoop（LiteLLM mock model）→ 事件 seq 落库 → 终态 + run_end + usage 记账
 //   → 崩溃恢复：run 进行中 docker restart FDE → agentd 重启 → re-claim（attempt+1、resume=true）→ 终态。
 // 运行：npm run test:integration:wp3b
 //
 // 并行隔离用法（F8）：不拆共享栈（station-*）的前提下跑隔离栈——所有固定名/端口经 env 派生：
 //   STATION_DB_DIR=/tmp/station-db-43 COMPOSE_PROJECT_NAME=station-e2e-43 \
 //   STATION_DB_NAME=station-db-43 STATION_PORTAL_NAME=station-portal-43 STATION_STACK_ID=station-e2e-43 \
-//   PORTAL_HOST_PORT=28080 LLM_GATEWAY_PORT=4400 MOCK_DEBUG_PORT=4401 \
+//   PORTAL_HOST_PORT=28080 LITELLM_HOST_PORT=24400 \
 //   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=alice43 \
 //   node portal/integration/wp3b-e2e.mjs
 // （fde 容器/网络名 = fde-<FDE_NAME>，由 portal provisioner 生成；compose() 已透传进程 env，
-//   COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 现状：18080/4000/4001、station-*、alice。
+//   COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 18080/4100/8090/8443、station-*、alice。
 //   TRAEFIK_STATIC_HOST 无需手传：脚本每次 up 前自动生成「仅替换入口端口」的临时 traefik.yml
 //   并经 compose env 注入（Traefik v3 带 --configFile 时 CLI 覆盖不生效，必须整体替换配置文件）。）
 import test from 'node:test';
@@ -24,18 +24,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
-import { ensureMockLlmBinding } from './lib/llm-mock-binding.mjs';
+import { ensureLlmBinding } from './lib/llm-binding.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 // F8 并行隔离：固定名/端口全部 env 派生（缺省 = 现状值，共享栈零影响）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
-const LLM_GATEWAY_PORT = process.env.LLM_GATEWAY_PORT || '4000';
-const MOCK_DEBUG_PORT = process.env.MOCK_DEBUG_PORT || '4001';
+const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
 const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
 const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
 const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
+const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
 const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner 命名规则：fde-<fde_name>
 const FDE_IMAGE = 'erix-station/fde:local';
@@ -158,8 +158,6 @@ const FDE_ENV = {
   FDE_DEV_USER: '',
   FDE_DEV_MODE: '1',
   FDE_AGENT_VERSION: '0.1.0',
-  // mock LLM 人为延迟：让 run 保持 running 足够久，e2e 才能在 run 进行中 docker restart（崩溃恢复）。
-  MOCK_LATENCY_MS: '5000',
 };
 
 async function insertUser() {
@@ -243,7 +241,7 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
     safe(() => docker(`network rm fde-${FDE_NAME} 2>/dev/null || true`));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, TRAEFIK_STATIC_HOST: S.staticFile }));
-    safe(() => docker('rmi -f erix-station/portal:local erix-station/mock-llm:local erix-station/fde:local 2>/dev/null || true'));
+    safe(() => docker('rmi -f erix-station/portal:local erix-station/fde:local 2>/dev/null || true'));
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
@@ -260,14 +258,15 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     // 1) 构建真实 runner 镜像（build context runner/）
     docker(`build -t ${FDE_IMAGE} runner/`);
 
-    // 2) 起栈（含 mock LLM；FDE 用真实 runner 镜像：tag + dev-mode + 无 --user）。
-    // MIGRATE_ON_START=1：迁移 0002（llm_providers/llm_models + fde_llm_bindings 扩列）必须已应用，
-    // 下方 ensureMockLlmBinding 的 admin API 才有表/列可用。
+    // 2) 起栈（含 LiteLLM；FDE 用真实 runner 镜像：tag + dev-mode + 无 --user）。
+    // MIGRATE_ON_START=1：启动迁移完成后，管理台 API 才能创建 credential/model/binding。
     compose('up -d --build', {
       ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
       TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
       TRAEFIK_STATIC_HOST: S.staticFile,
       MIGRATE_ON_START: '1',
+      LITELLM_HOST_PORT,
+      LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}`,
       ...FDE_ENV,
     });
 
@@ -277,9 +276,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     }, { label: 'portal healthz', timeoutMs: 240000 });
 
     await waitFor(async () => {
-      const r = await fetch(`http://127.0.0.1:${LLM_GATEWAY_PORT}/healthz`).catch(() => null);
+      const r = await fetch(`http://127.0.0.1:${LITELLM_HOST_PORT}/health/readiness`).catch(() => null);
       return r && r.status === 200;
-    }, { label: 'mock-llm healthz', timeoutMs: 120000 });
+    }, { label: `LiteLLM readiness (${STATION_LITELLM_NAME})`, timeoutMs: 120000 });
 
     // 3) 建用户 + 两步登录 + 建项目（触发 materializer 写 config.json）
     await insertUser();
@@ -316,13 +315,14 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
 
     // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
     // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、跑 run 之前补 binding。
-    await ensureMockLlmBinding({
+    await ensureLlmBinding({
       docker,
       dynamicDir: S.dynamicRoot,
       fdeName: FDE_NAME,
       portal: PORTAL,
       portalContainerName: STATION_PORTAL_NAME,
-      baseUrl: `http://127.0.0.1:${LLM_GATEWAY_PORT}`,
+      dbContainerName: STATION_DB_NAME,
+      mockDelay: 5,
       adminLogin: `wp3b-admin-${FDE_NAME}`,
       adminPassword: 'wp3b-admin-pass-123',
     });

@@ -52,5 +52,5 @@ sg docker -c 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml
 ## 说明
 
 - 开发期 `COOKIE_PROFILE=dev-http` → cookie 名 `fde_session_dev`、无 `Secure`（仅本机 HTTP 联调；部署配置必须 `prod`）。
-- 默认开发栈包含 edge/portal/db 与 `station-docker-proxy`；`station-litellm` 需显式启用 profile（`--profile litellm`），`station-mock-llm` 为迁移期遗留。
-- **portal 自 issue #117 phase 2 起经 LiteLLM 走 LLM**（LLM 路由只发单一 `llm-gateway` service，上游 = `station-litellm`）；`station-mock-llm` 已不在数据面路径上，仅集成 e2e 仍在用，待删。数据库准备、启动及模型管理见 [`litellm/README.md`](litellm/README.md) 与项目 `AGENTS.md` §4.2。
+- 默认开发栈包含 edge/portal/db 与 `station-docker-proxy`；`station-litellm` 需显式启用 profile（`--profile litellm`）。
+- **LiteLLM 是唯一 LLM 网关**（LLM 路由只发单一 `llm-gateway` service，上游 = `station-litellm`）；集成 e2e 通过管理台 API 创建 LiteLLM mock model 并验证白名单。新建 DB 数据目录时 `01-litellm.sh` 按 `deploy/.env` 的 `LITELLM_DB_PASSWORD` 创建专用角色和数据库。启动及模型管理见 [`litellm/README.md`](litellm/README.md) 与项目 `AGENTS.md` §4.2。

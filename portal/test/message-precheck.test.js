@@ -153,6 +153,20 @@ test('issue #41：FDE 未配置 LLM 上游（JOIN 空）→ 409 llm_not_configur
   }
 });
 
+test('message precheck hides another user session before checking the caller LLM binding', async () => {
+  const s = await startServer({ llmUpstreamOk: false });
+  try {
+    s.pool.sessionRow.user_id = 'another-user';
+    const r = await postMessage(s, { content: 'hi', attachments: [] });
+    assert.equal(r.status, 404);
+    assert.equal((await r.json()).error.code, 'not_found');
+    assert.equal(s.pool.connected, 0, 'cross-user rejection does not open the message transaction');
+    assert.equal(s.pool.idem.size, 0, 'cross-user rejection releases the idempotency claim');
+  } finally {
+    await s.close();
+  }
+});
+
 test('issue #41：已配置（active LiteLLM binding + 虚拟 key + main model）→ 预检放行 → 202', async () => {
   const s = await startServer({ llmUpstreamOk: true });
   try {

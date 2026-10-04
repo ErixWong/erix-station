@@ -2,7 +2,7 @@
 # erix-station 本地开发栈（P1 walking skeleton）
 # 依据：docs/design/deploy-contract.md §2 + docs/env.md §0（开发期参数）
 # 服务：station-db / station-docker-proxy / station-portal / station-edge
-#   station-mock-llm 持续用于本地验收；station-litellm 仅通过 litellm profile opt-in。
+#   station-litellm 通过 litellm profile opt-in。
 # ============================================================================
 name: station
 
@@ -36,6 +36,8 @@ services:
       # 首次初始化（空数据目录时执行一次）：建角色 + 设口令 + baseline + bootstrap + ownership 归正。
       # 角色口令经 600 权限的 deploy/.env 注入（deploy-contract §2.4），不进镜像/仓库。
       - ./db-init/00-init.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
+      # 可选 LiteLLM 的专用角色/数据库；仅新建数据目录时运行，已有数据库不受影响。
+      - ./db-init/01-litellm.sh:/docker-entrypoint-initdb.d/01-litellm.sh:ro
       - ../docs/data/schema.sql:/init-sql/schema.sql:ro
       - ../docs/data/bootstrap.sql:/init-sql/bootstrap.sql:ro
     environment:
@@ -45,6 +47,7 @@ services:
       # 迁移/运行时角色口令（init 脚本读取后 ALTER ROLE ... PASSWORD）
       PLATFORM_DB_PASSWORD: ${PLATFORM_DB_PASSWORD:-change-me-dev-only}
       PORTAL_DB_PASSWORD: ${PORTAL_DB_PASSWORD:-change-me-dev-only}
+      LITELLM_DB_PASSWORD: ${LITELLM_DB_PASSWORD:-}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
@@ -108,7 +111,7 @@ services:
     build:
       context: ..
       dockerfile: portal/Dockerfile
-    image: erix-station/portal:local
+    image: ${STATION_PORTAL_IMAGE:-erix-station/portal:local}
     restart: unless-stopped
     networks:
       - backend
@@ -184,7 +187,7 @@ services:
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}
       # issue #117 phase 2：portal 已切到 LiteLLM 数据面。Traefik 跑 host 网络，故此处是宿主回环
-      # 地址；LiteLLM 迁移期发布在 4100（4000 仍被 dev mock 占用，待 e2e 基建重写后回收）。
+      # 地址；LiteLLM 默认发布在 4100，可通过 LITELLM_HOST_PORT 为隔离栈指定独立端口。
       LLM_GATEWAY_HOST: ${LLM_GATEWAY_HOST:-http://127.0.0.1:4100}
       # issue #117：预留 gateway admin 配置供后续阶段使用；当前 portal 不调用这些配置。
       LLM_GATEWAY_MODE: ${LLM_GATEWAY_MODE:-self}
@@ -228,45 +231,7 @@ services:
       retries: 5
       start_period: 30s
 
-  # P1 mock LLM 网关（dev-only，零真实凭据，deploy-contract §7.3）：OpenAI-compatible
-  # /v1/chat/completions（流式/非流式）。数据面 publish 仅宿主回环 127.0.0.1:4000，供 Traefik
-  # `llm.<base>` 路由回环访问（topology §4-L7）。
-  # issue #117 phase 1 保留 mock，不切换 portal 数据面；LiteLLM 另以 litellm profile 暂用 4100。
-  station-mock-llm:
-    container_name: "${STATION_MOCK_LLM_NAME:-station-mock-llm}"
-    build:
-      context: ../portal/mock-gateway
-      dockerfile: Dockerfile
-    image: erix-station/mock-llm:local
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp
-    environment:
-      # 可选人为延迟（ms）：e2e 崩溃恢复需要 run 进行中重启容器，用延迟让 run 保持 running。默认 0。
-      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-0}
-      # F4（评审）：dev/验收专用调试端口（仅提供 /__debug/last-request，返回全局最近请求的
-      # Authorization=注入的真实 key）——只 publish 宿主回环，Traefik/容器网络均不可达。
-      # 容器内固定 4001；MOCK_DEBUG_PORT 只决定宿主侧 publish 端口。
-      MOCK_DEBUG_PORT: 4001
-    ports:
-      # 仅回环发布（topology §4-L7 / env §5）；LLM 网关数据面 admin 面不发布
-      - "127.0.0.1:${LLM_GATEWAY_PORT:-4000}:4000"
-      # dev/验收专用调试面（F4）：仅宿主回环；不可经 Traefik 到达（FDE 容器无此路由，数据面对
-      # /__debug/* 一律 404——防止任一 FDE 经 llm.<base> 读到全局 Authorization 跨 FDE 泄露 key）。
-      - "127.0.0.1:${MOCK_DEBUG_PORT:-4001}:4001"
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
-  # Issue #117 phase 1: opt-in LiteLLM infrastructure; keep the dev mock on 4000.
+  # LiteLLM is the sole LLM gateway for both admin and data-plane traffic.
   station-litellm:
     container_name: "${STATION_LITELLM_NAME:-station-litellm}"
     image: ghcr.io/berriai/litellm:v1.103.2@sha256:f63fb81b831b170ec16851e23c36ac5bf52ef106b271406429524a2ed730bbfd
@@ -300,9 +265,8 @@ services:
       - --port
       - "4000"
     ports:
-      # Transitional data-plane port: once portal switches, the mock vacates 4000
-      # and LiteLLM moves back to 127.0.0.1:4000.
-      - "127.0.0.1:4100:4000"
+      # Host network Traefik reaches the data plane through this loopback-only publish.
+      - "127.0.0.1:${LITELLM_HOST_PORT:-4100}:4000"
     healthcheck:
       test:
         - CMD

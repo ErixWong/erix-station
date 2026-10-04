@@ -61,6 +61,8 @@
 
 ## 3. 总体架构
 
+> **issue #117 phase 2 当前口径**：本文件后续保留的旧 LLM 网关细节若提及真实上游 key、per-provider 直发或 station-mock-llm，均属历史方案；当前由 LiteLLM 持有模型目录和上游 credential，Traefik 注入 per-FDE virtual key 并将所有 FDE 路由送往单一 `llm-gateway` service。运行契约见 [`../data/model.md`](../data/model.md) §1.20 与 [`../../deploy/litellm/README.md`](../../deploy/litellm/README.md)。
+
 ```
                           ┌──────────────────────────────────────────────┐
    FDE 浏览器 ───────────▶│  ingress: Traefik（host 网络，独占 80/443，   │
@@ -74,7 +76,7 @@
                     │  用户/项目/端口   │  │  /29，如 10.200.1.0/29）    │ │ LLM 网关      │
                     │  容器生命周期     │  │  station-agentd（守护/桥接）   │ │（backend 网络；│
                     │  事件/SSE        │  │  station-runner（每 run 子进程）│ │ 数据面 publish │
-                    └────────┬─────────┘  │  :4000+ dev servers          │ │ 127.0.0.1:4000 │
+                    └────────┬─────────┘  │  :4000+ dev servers          │ │ 127.0.0.1:4100 │
                     backend 网络           │  workspace volume            │ │ admin 不发布） │
                     publish 仅            └──────────────┬───────────────┘ └───────────────┘
                     127.0.0.1:8080       唯一业务写方      │ 全出站（零监听）：
@@ -89,7 +91,7 @@
 **网络**（H-B 定稿，决策者 2026-09，issue #5）：
 ```
 Traefik：host 网络（零 docker 网络接入；宿主天然是每座 bridge 的 .1 端点，可达所有 /29）
-docker network: backend    ← portal + station-db + LLM 网关（compose 管理）
+docker network: backend    ← portal + station-db + station-litellm（litellm profile）
 docker network: fde-alice  ← 只给 alice 的容器（10.200.1.0/29，portal 管 IPAM）
 docker network: fde-bob    ← ...（10.200.2.0/29）
 ~~edge / control~~ 已取消：Traefik 在 host 不需要 edge；control 共享网络是横向越权根源（§5）
@@ -149,7 +151,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 
 - **预览**：Traefik（host）→ forwardAuth（`http://127.0.0.1:8080/api/forward-auth`）→ 直连容器 IP `http://10.200.<n>.2:<port>`（每 allocation 一条 router+service，§6.4；topology.md §4-L2）
 - **平台通道全出站经 Traefik**（方向反转为决策者 2026-09 裁定，issue #3 评论；经 Traefik 为 H-B 定稿 D-5，issue #5）：容器内不再有 runner 监听端口（3000 角色取消，§12.3），portal **不主动访问容器**；`station-agentd` 全出站——`https://station.<base>/api/internal/*`（容器侧 `--add-host station.<base>:<网关IP>`），Traefik 上以 `ipAllowList`（由 `fde_networks` 精确派生，每 `subnet` 一条 `/29` 或 `/28`，topology.md §5.1）限源后回环到 portal `127.0.0.1:8080`（SSE 下行 + POST 上行，§10.3；取舍对比见 [runner-integration.md](runner-integration.md) §11.2；topology.md §4-L3）
-- **LLM 调用**：worker → `https://llm.<base>` → Traefik 按来源子网注入凭据 → 网关数据面回环 `127.0.0.1:4000`（§11；topology.md §4-L7）
+- **LLM 调用**：worker → `https://llm.<base>` → Traefik 按来源子网注入 per-FDE LiteLLM virtual key → 单一 `llm-gateway` service → LiteLLM（默认宿主回环 `127.0.0.1:4100`；topology.md §4-L7）
 - **hosts 注入（创建 FDE 容器时，docker `--add-host` 或等价受控方式）**：容器内解析 `station.<base>` 与 `llm.<base>` 都**不走内网/公网 DNS**，映射到该 FDE 的 bridge 网关 IP（默认池 `10.200.<n>.1`；大 FDE `10.201.<n>.1`）。开发期 `*.localhost` 变通对容器无效，必须同样注入（env.md §0/§1；topology.md §4-L3）
 
 ---
@@ -644,7 +646,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 >
 > （注：任务原文写「§12 部署段」，但本文 §12 是「容器模板与工作区约定」，部署段实为 §14——按实际位置引用，本节即原「部署与运维」段。）
 
-- 平台栈用 `deploy/docker-compose.yml`：`station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`）+ `station-portal`（`backend` 网络，publish 仅 `127.0.0.1:8080` 回环）+ `station-db`（`backend` 网络，不 publish）+ `station-docker-proxy`（`backend` 网络，仅 portal 可达；开发期另有 `station-mock-llm`，成员表以 deploy-contract §2.1 为准）（H-B 定稿，issue #5；**compose 字段/healthcheck/volume/镜像 pin 见 deploy-contract.md §2/§3**）
+- 平台栈用 `deploy/docker-compose.yml`：`station-edge`（Traefik，**host 网络**，独占 80/443，`--api=false`）+ `station-portal`（`backend` 网络，publish 仅 `127.0.0.1:8080` 回环）+ `station-db`（`backend` 网络，不 publish）+ `station-docker-proxy`（`backend` 网络，仅 portal 可达）；`station-litellm` 为显式 opt-in 的 `litellm` profile（H-B 定稿，issue #5；**compose 字段/healthcheck/volume/镜像 pin 见 deploy-contract.md §2/§3**）
 - FDE 容器由 portal 通过 Docker API 动态创建（模板化，非 compose）；**创建契约（网络 `--subnet`/`--add-host`/UID-GID/capability/agentd 命令）见 deploy-contract.md §5**
 - **数据持久化**：bind mount 一律 `/docker/<名称>/`（平台统一约定）；用户空间 `/srv/erix/users/<fde>/`（宿主路径，FDE 容器内映射 `/home/<user>`，见 [`user-space.md`](user-space.md) §2）；**宿主源↔容器目标↔权限见 deploy-contract.md §2**
 - `restart: unless-stopped`；DB 与 portal 配 healthcheck（**阈值与 readiness 语义见 deploy-contract.md §2/§8**）

@@ -103,6 +103,10 @@ async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {})
   return row;
 }
 
+export async function assertSessionOwner(pool, { userId, sessionId }) {
+  await fetchSession(pool, sessionId, userId);
+}
+
 /**
  * issue #94：keyset 游标编解码（不透明串）——base64url(JSON {u: updated_at ISO, i: id})。
  * 旧格式（纯 UUID）与任何非法值一律 validation_failed（游标与查询条件绑定，跨条件复用本就失效，
@@ -538,7 +542,7 @@ export function chatCompletionsUrl(baseUrl) {
 }
 
 /** AI 改名必须使用该 FDE 的 LiteLLM 虚拟 key；不再回退到 Station 本地 provider 目录。 */
-export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http://127.0.0.1:4000' } = {}) {
+export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http://127.0.0.1:4100' } = {}) {
   const cfg = await getFdeLlmConfig(pool, userId);
   const mainModel = cfg?.main?.name;
   if (cfg?.api_key && mainModel) {

@@ -848,6 +848,7 @@ async function handlePostMessage(req, res, ctx, sessionId) {
     ctx.pool,
     { userId: session.user.id, endpoint, key, requestHash: idempotency.requestHash({ content, attachments }), log: ctx.log },
     async (record) => {
+      await sessions.assertSessionOwner(ctx.pool, { userId: session.user.id, sessionId });
       // issue #117：建 run 前预检该 FDE 是否已绑定可用 LiteLLM 上游（active binding +
       // 非空 virtual key + main model slot）。
       // 未配置 → 409 llm_not_configured fail-fast：不入队 run（否则 run 永久排队，等一个永远不会
