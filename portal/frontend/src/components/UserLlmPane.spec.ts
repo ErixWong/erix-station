@@ -11,6 +11,7 @@ import { i18n, setLocale } from '../i18n';
 
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', status: 'active',
+  totp_enabled: true, last_login_at: null,
 } as AdminUser;
 
 const PROVIDERS = [
