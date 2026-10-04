@@ -29,8 +29,14 @@ const PROVIDERS = {
 };
 const USERS = {
   items: [
-    { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', status: 'active' },
-    { id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null, status: 'active' },
+    {
+      id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
+      status: 'active', totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+    },
+    {
+      id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null,
+      status: 'active', totp_enabled: false, last_login_at: null,
+    },
   ],
 };
 const GIT_HOSTS = {
@@ -446,7 +452,7 @@ describe('Admin modals', () => {
 });
 
 describe('AdminView · FDE 用户', () => {
-  it('用户卡片保留无 fde_name 提示和 UserLlmPane 挂载；新用户成功后展示一次性 TOTP modal', async () => {
+  it('表格行打开详情抽屉；新用户成功后展示一次性 TOTP modal', async () => {
     const created = {
       user: { id: 'u3', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: 'carol', status: 'active' },
       totp_uri: 'otpauth://totp/erix-station:carol?secret=JBSWY3DPEHPK3PXP&issuer=erix-station',
@@ -458,15 +464,22 @@ describe('AdminView · FDE 用户', () => {
     });
     const list = wrapper.find('[data-test="user-list"]');
     expect(list.text()).toContain('alice');
-    expect(list.text()).toContain('无 fde_name');
-    await wrapper.findAll('[data-test="user-card"]')[1].find('button').trigger('click');
+    expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
+    expect(list.text()).toContain('✓');
+    await wrapper.findAll('[data-test="user-row"]')[1].trigger('click');
     await flushPromises();
-    expect(wrapper.find('[data-test="user-list"]').text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
+    expect(wrapper.get('[data-test="user-drawer"]').text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
 
     await wrapper.get('[data-test="open-add-user"]').trigger('click');
     const form = wrapper.get('[data-test="add-user-form"]');
     await form.findAll('input')[0].setValue('carol');
     await form.findAll('input')[1].setValue('Carol');
+    await form.get('[data-test="generate-password"]').trigger('click');
+    const generatedPassword = (form.get('#new-user-password').element as HTMLInputElement).value;
+    expect(generatedPassword).toHaveLength(16);
+    expect(generatedPassword).toMatch(/[a-z]/);
+    expect(generatedPassword).toMatch(/[A-Z]/);
+    expect(generatedPassword).toMatch(/[0-9]/);
     await form.findAll('input')[2].setValue('pass123');
     await form.findAll('input')[3].setValue('carol');
     await form.trigger('submit.prevent');
@@ -480,9 +493,111 @@ describe('AdminView · FDE 用户', () => {
     expect(totp.text()).toContain(created.totp_uri);
     expect(totp.text()).toContain(created.totp_secret);
     expect(totp.find('img').attributes('src')).toBe('data:image/png;base64,MOCKQR');
-    await wrapper.get('[data-test="totp-box"] button').trigger('click');
+    expect(totp.find('[data-test="copy-totp-uri"]').exists()).toBe(true);
+    expect(totp.find('[data-test="copy-totp-secret"]').exists()).toBe(true);
+    await wrapper.get('[data-test="totp-saved"]').trigger('click');
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
     wrapper.unmount();
+  });
+
+  it('用户搜索按登录名、显示名和 FDE 名称不区分大小写过滤', async () => {
+    const { wrapper } = await mountAdmin();
+    const search = wrapper.get('[data-test="user-search"]');
+    await search.setValue('ALIce');
+    expect(wrapper.findAll('[data-test="user-row"]')).toHaveLength(1);
+    expect(wrapper.find('[data-test="user-row"]').text()).toContain('alice');
+
+    await search.setValue('bOB');
+    expect(wrapper.findAll('[data-test="user-row"]')).toHaveLength(1);
+    expect(wrapper.find('[data-test="user-row"]').text()).toContain('bob');
+
+    await search.setValue('ALPHA-FDE');
+    expect(wrapper.findAll('[data-test="user-row"]')).toHaveLength(1);
+    expect(wrapper.find('[data-test="user-row"]').text()).toContain('alpha-fde');
+    wrapper.unmount();
+  });
+
+  it('切换状态向用户 PATCH status 并刷新表格', async () => {
+    let users = USERS.items.map((user) => ({ ...user }));
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, { items: users });
+      if (url === '/api/admin/users/u1' && init?.method === 'PATCH') {
+        const fields = JSON.parse(String(init.body)) as { status: string };
+        users = users.map((user) => user.id === 'u1' ? { ...user, ...fields } : user);
+        return jsonResponse(200, { user: users[0] });
+      }
+      return undefined;
+    });
+    await wrapper.find('[data-test="user-row"] button[aria-label="停用"]').trigger('click');
+    await flushPromises();
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')[0];
+    expect(JSON.parse(String(patch[1]?.body))).toEqual({ status: 'disabled' });
+    expect(wrapper.find('[data-test="user-row"]').text()).toContain('停用');
+    expect(wrapper.find('[data-test="user-row"] button[aria-label="启用"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('删除必须输入登录名确认；409 原样显示在确认弹窗与用户行内', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users/u1' && init?.method === 'DELETE') {
+        return jsonResponse(409, {
+          error: { code: 'user_has_active_fde', message: 'user still has an active FDE container' },
+        });
+      }
+      return undefined;
+    });
+    await wrapper.get('[data-test="user-menu-button"]').trigger('click');
+    await wrapper.get('[role="menu"] button.text-red-700').trigger('click');
+    const confirmation = wrapper.get('[data-test="delete-login-confirmation"]');
+    const confirmButton = wrapper.get('[data-test="confirm-user-delete"]');
+    expect((confirmButton.element as HTMLButtonElement).disabled).toBe(true);
+    expect(callsTo(fetchFn, 'DELETE', '/api/admin/users/u1')).toHaveLength(0);
+
+    await confirmation.setValue('alice');
+    expect((confirmButton.element as HTMLButtonElement).disabled).toBe(false);
+    await confirmButton.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'DELETE', '/api/admin/users/u1')).toHaveLength(1);
+    expect(wrapper.find('[role="alert"]').text()).toContain('user still has an active FDE container');
+    expect(wrapper.find('[data-test="user-list"]').text()).toContain('user still has an active FDE container');
+    wrapper.unmount();
+  });
+
+  it('当前登录者的菜单与详情抽屉都不显示删除入口', async () => {
+    const self = {
+      ...ADMIN_USER,
+      status: 'active',
+      totp_enabled: true,
+      last_login_at: null,
+    };
+    const { wrapper } = await mountAdmin('/admin/users', (url, init) =>
+      url === '/api/admin/users' && !init?.method ? jsonResponse(200, { items: [self] }) : undefined);
+    await wrapper.get('[data-test="user-menu-button"]').trigger('click');
+    expect(wrapper.find('[role="menu"]').text()).not.toContain('删除用户');
+    await wrapper.find('[data-test="user-row"]').trigger('click');
+    expect(wrapper.get('[data-test="user-drawer"]').text()).not.toContain('删除用户');
+    wrapper.unmount();
+  });
+
+  it('空列表显示创建引导；用户请求加载中显示三条 skeleton 行', async () => {
+    const empty = await mountAdmin('/admin/users', (url, init) =>
+      url === '/api/admin/users' && !init?.method ? jsonResponse(200, { items: [] }) : undefined);
+    expect(empty.wrapper.find('[data-test="user-list"]').text()).toContain('暂无用户。');
+    expect(empty.wrapper.find('[data-test="user-list"] [data-test="open-add-user"]').exists()).toBe(false);
+    expect(empty.wrapper.find('[data-test="open-add-user"]').exists()).toBe(true);
+    empty.wrapper.unmount();
+
+    let resolveUsers: ((response: Response) => void) | undefined;
+    const loading = await mountAdmin('/admin/users', (url, init) =>
+      url === '/api/admin/users' && !init?.method
+        ? new Promise<Response>((resolve) => { resolveUsers = resolve; })
+        : undefined);
+    expect(loading.wrapper.get('[data-test="user-skeleton"]').findAll('div')).toHaveLength(3);
+    resolveUsers?.(jsonResponse(200, USERS));
+    await flushPromises();
+    expect(loading.wrapper.find('[data-test="user-skeleton"]').exists()).toBe(false);
+    expect(loading.wrapper.findAll('[data-test="user-row"]')).toHaveLength(2);
+    loading.wrapper.unmount();
   });
 
   it('新增用户时空 fde_name 仍从 POST body 省略', async () => {
