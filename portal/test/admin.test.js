@@ -89,12 +89,25 @@ class AdminPool extends FakePool {
       const user = this.users.find((u) => u.id === params[0]);
       if (!user) return { rows: [] };
       if (sql.includes('password_hash')) user.password_hash = params[1];
+      if (sql.includes('totp_secret = $2')) {
+        user.totp_secret = params[1];
+        user.last_totp_step = null;
+      }
       if (sql.includes('totp_secret = NULL')) {
         user.totp_secret = null;
         user.last_totp_step = null;
       }
       for (const session of this.sessions) {
         if (session.user_id === user.id && session.revoked_at === null) session.revoked_at = new Date();
+      }
+      if (sql.includes('totp_secret = $2')) {
+        return {
+          rows: [{
+            id: user.id, login: user.login, display_name: user.display_name, role: user.role,
+            fde_name: user.fde_name ?? null, auth_source: user.auth_source, status: user.status,
+            created_at: user.created_at ?? new Date(), totp_enabled: true, last_login_at: null,
+          }],
+        };
       }
       return { rows: [{ id: user.id, login: user.login }] };
     }
@@ -532,6 +545,52 @@ test('admin 用户管理：重置 TOTP 清空重放步并吊销会话，绝不�
   }
 });
 
+test('admin 用户管理：补绑/重绑 TOTP 只响应一次下发种子，清重放步、吊销会话并审计', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  const user = pool.users.find((row) => row.id === FDE_USER.id);
+  user.totp_secret = 'PREVIOUS_TEST_TOTP_SEED';
+  user.last_totp_step = 1234;
+  pool.sessions.push(
+    { id: 'ls-alice-enroll', user_id: user.id, created_at: new Date(), revoked_at: null },
+    { id: 'ls-alice-enroll-old', user_id: user.id, created_at: new Date(), revoked_at: new Date(0) },
+  );
+  try {
+    const res = await fetch(`${base}/api/admin/users/${user.id}/totp-enroll`, {
+      method: 'POST', headers: { cookie },
+    });
+    assert.equal(res.status, 200);
+    const raw = await res.text();
+    const body = JSON.parse(raw);
+    assert.match(body.totp_secret, /^[A-Z2-7]{32}$/, '新种子为 20 字节 base32');
+    assert.notEqual(body.totp_secret, 'PREVIOUS_TEST_TOTP_SEED');
+    assert.match(body.totp_uri, new RegExp(`secret=${body.totp_secret}`));
+    assert.match(body.totp_uri, /issuer=erix-station-test/);
+    assert.equal(body.user.login, 'alice');
+    assert.equal(body.user.totp_enabled, true);
+    assert.ok(!('totp_secret' in body.user) && !('password_hash' in body.user));
+    assert.equal(user.totp_secret, body.totp_secret);
+    assert.equal(user.last_totp_step, null);
+    assert.ok(pool.sessions.find((session) => session.id === 'ls-alice-enroll').revoked_at);
+    assert.equal(pool.sessions.find((session) => session.id === 'ls-alice-enroll-old').revoked_at.getTime(), 0);
+    const enrollAudit = pool.audit.find((event) => event.action === 'admin.user_totp_enroll');
+    assert.deepEqual(enrollAudit, {
+      actor_id: ADMIN.id, action: 'admin.user_totp_enroll', target: 'alice', details: '{}',
+    });
+    assert.ok(pool.sqlLog.some(({ sql }) => sql.includes('UPDATE login_sessions SET revoked_at = now()')));
+
+    const list = await (await fetch(`${base}/api/admin/users`, { headers: { cookie } })).text();
+    assert.ok(!list.includes(body.totp_secret), '后续列表不再回显种子');
+    assert.ok(!list.includes(body.totp_uri), '后续列表不再回显 otpauth URI');
+
+    const missing = await fetch(`${base}/api/admin/users/c0000000-0000-4000-8000-000000000003/totp-enroll`, {
+      method: 'POST', headers: { cookie },
+    });
+    assert.equal(missing.status, 404);
+  } finally {
+    await close();
+  }
+});
+
 test('admin 用户管理 + provision + llm：非 admin 一律 403，无 cookie 401', async () => {
   const { base, pool, cookie, close } = await startAdminServer();
   try {
@@ -547,6 +606,7 @@ test('admin 用户管理 + provision + llm：非 admin 一律 403，无 cookie 4
       ['DELETE', `/api/admin/users/${FDE_USER.id}`],
       ['POST', `/api/admin/users/${FDE_USER.id}/reset-password`, '{}'],
       ['POST', `/api/admin/users/${FDE_USER.id}/totp-reset`],
+      ['POST', `/api/admin/users/${FDE_USER.id}/totp-enroll`],
       ['POST', '/api/admin/fdes/alice/provision', '{}'],
       ['GET', '/api/admin/fdes/alice/llm'],
     ];

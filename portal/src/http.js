@@ -648,11 +648,11 @@ async function handleAdminApi(req, res, ctx, url) {
           maxPasswordLength: ctx.config.maxPasswordLength,
         },
       });
-      // totp_secret 仅此响应出现一次（红线）；列表/其它端点永不回显。
+      // 创建与补绑各自只在对应响应下发种子（红线）；列表/其它端点永不回显。
       return sendJson(res, 201, created);
     }
   }
-  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset))?$/);
+  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset|totp-enroll))?$/);
   if (adminUserMatch) {
     const userId = decodeAdminUserUuid(adminUserMatch[1]);
     const action = adminUserMatch[2] ?? null;
@@ -667,6 +667,13 @@ async function handleAdminApi(req, res, ctx, url) {
     }
     if (action === 'totp-reset' && req.method === 'POST') {
       const result = await admin.resetUserTotp(ctx.pool, userId, { actorId: session.user.id });
+      return sendJson(res, 200, result);
+    }
+    if (action === 'totp-enroll' && req.method === 'POST') {
+      const result = await admin.enrollUserTotp(ctx.pool, userId, {
+        actorId: session.user.id,
+        totpIssuer: ctx.config.totp?.issuer,
+      });
       return sendJson(res, 200, result);
     }
     if (action === null && req.method === 'PATCH') {

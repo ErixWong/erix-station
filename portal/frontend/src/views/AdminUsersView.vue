@@ -21,7 +21,7 @@ const showTotp = ref(false);
 const submitting = ref(false);
 const userForm = reactive({ login: '', display_name: '', password: '', fde_name: '' });
 
-type UserModalAction = 'edit' | 'password' | 'totp' | 'delete';
+type UserModalAction = 'edit' | 'password' | 'totp' | 'enroll' | 'delete';
 const modalAction = ref<UserModalAction | null>(null);
 const modalUserId = ref<string | null>(null);
 const modalError = ref('');
@@ -244,6 +244,24 @@ async function confirmTotpReset() {
     else {
       rowMessages[user.id] = t('admin.fde.totpResetDone');
       closeUserModal();
+    }
+  } finally {
+    modalBusy.value = false;
+  }
+}
+
+async function confirmTotpEnroll() {
+  const user = actionUser.value;
+  if (!user || modalBusy.value) return;
+  modalBusy.value = true;
+  modalError.value = '';
+  try {
+    const error = await admin.enrollTotp(user.id);
+    if (error) setModalError(user, error);
+    else {
+      rowMessages[user.id] = t('admin.fde.totpEnrollDone');
+      closeUserModal();
+      showTotp.value = true;
     }
   } finally {
     modalBusy.value = false;
@@ -488,6 +506,12 @@ onBeforeUnmount(() => {
                           type="button"
                           role="menuitem"
                           class="block w-full px-3 py-1.5 text-left text-sm hover:bg-black/5"
+                          @click="openUserModal('enroll', user)"
+                        >{{ user.totp_enabled ? t('admin.fde.reenrollTotp') : t('admin.fde.enrollTotp') }}</button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          class="block w-full px-3 py-1.5 text-left text-sm hover:bg-black/5"
                           @click="openUserModal('totp', user)"
                         >{{ t('admin.fde.resetTotp') }}</button>
                         <button
@@ -610,6 +634,11 @@ onBeforeUnmount(() => {
                 <button
                   type="button"
                   class="rounded-md border border-black/20 bg-white px-2.5 py-1.5 text-sm hover:bg-black/5"
+                  @click="openUserModal('enroll', selectedUser)"
+                >{{ selectedUser.totp_enabled ? t('admin.fde.reenrollTotp') : t('admin.fde.enrollTotp') }}</button>
+                <button
+                  type="button"
+                  class="rounded-md border border-black/20 bg-white px-2.5 py-1.5 text-sm hover:bg-black/5"
                   @click="openUserModal('totp', selectedUser)"
                 >{{ t('admin.fde.resetTotp') }}</button>
                 <button
@@ -687,16 +716,22 @@ onBeforeUnmount(() => {
 
   <ModalShell
     v-if="showTotp && admin.totpOnce"
-    :label="t('admin.fde.totpTitle')"
+    :label="admin.totpOnce.purpose === 'enrolled' ? t('admin.fde.totpEnrollTitle') : t('admin.fde.totpTitle')"
     dialog-class="max-h-[90vh] overflow-y-auto md:w-[32rem]"
     @close="ignoreTotpDismiss"
   >
     <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
-      <h2 class="text-sm font-medium">{{ t('admin.fde.totpTitle') }}</h2>
+      <h2 class="text-sm font-medium">
+        {{ admin.totpOnce.purpose === 'enrolled' ? t('admin.fde.totpEnrollTitle') : t('admin.fde.totpTitle') }}
+      </h2>
     </div>
     <div data-test="totp-box" class="grid gap-3 p-3 text-[0.85rem]">
       <img :src="admin.totpOnce.qr" :alt="t('admin.fde.qrAlt')" class="my-1 block h-48 w-48" style="image-rendering: pixelated">
-      <i18n-t keypath="admin.fde.totpCreated" tag="div" scope="global">
+      <i18n-t v-if="admin.totpOnce.purpose === 'created'" keypath="admin.fde.totpCreated" tag="div" scope="global">
+        <template #login><b>{{ admin.totpOnce.login }}</b></template>
+        <template #onlyOnce><b>{{ t('admin.fde.totpOnlyOnce') }}</b></template>
+      </i18n-t>
+      <i18n-t v-else keypath="admin.fde.totpEnrolled" tag="div" scope="global">
         <template #login><b>{{ admin.totpOnce.login }}</b></template>
         <template #onlyOnce><b>{{ t('admin.fde.totpOnlyOnce') }}</b></template>
       </i18n-t>
@@ -744,6 +779,8 @@ onBeforeUnmount(() => {
         ? t('admin.fde.resetPasswordTitle')
         : modalAction === 'totp'
           ? t('admin.fde.resetTotpTitle')
+          : modalAction === 'enroll'
+            ? actionUser.totp_enabled ? t('admin.fde.reenrollTotpTitle') : t('admin.fde.enrollTotpTitle')
           : t('admin.fde.deleteUserTitle')"
     dialog-class="md:w-[30rem]"
     @close="closeUserModal"
@@ -756,6 +793,8 @@ onBeforeUnmount(() => {
             ? t('admin.fde.resetPasswordTitle')
             : modalAction === 'totp'
               ? t('admin.fde.resetTotpTitle')
+              : modalAction === 'enroll'
+                ? actionUser.totp_enabled ? t('admin.fde.reenrollTotpTitle') : t('admin.fde.enrollTotpTitle')
               : t('admin.fde.deleteUserTitle') }}
       </h2>
       <button
@@ -818,6 +857,23 @@ onBeforeUnmount(() => {
           class="rounded-md bg-red-700 px-3 py-1.5 text-sm text-white hover:bg-red-800 disabled:opacity-50"
           @click="confirmTotpReset"
         >{{ t('admin.fde.confirmTotpReset') }}</button>
+      </div>
+    </div>
+
+    <div v-else-if="modalAction === 'enroll'" class="grid gap-3 p-3">
+      <p class="text-sm text-black/65">
+        {{ actionUser.totp_enabled ? t('admin.fde.reenrollTotpHint') : t('admin.fde.enrollTotpHint') }}
+      </p>
+      <p v-if="modalError" class="syserr" role="alert">{{ modalError }}</p>
+      <div class="flex justify-end gap-2">
+        <button type="button" class="rounded-md border border-black/20 px-3 py-1.5 text-sm" @click="closeUserModal">{{ t('common.cancel') }}</button>
+        <button
+          type="button"
+          data-test="confirm-totp-enroll"
+          :disabled="modalBusy"
+          class="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
+          @click="confirmTotpEnroll"
+        >{{ t('admin.fde.confirmTotpEnroll') }}</button>
       </div>
     </div>
 

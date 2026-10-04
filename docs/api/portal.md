@@ -45,6 +45,7 @@
 | 管理 | `DELETE /api/admin/users/:id` | 删除无活动资源的用户 |
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
+| 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
 | 会话 | `GET /api/sessions` | 会话列表 |
 | 会话 | `POST /api/sessions` | 创建会话 |
 | 会话 | `GET /api/sessions/:id` | 会话详情（含消息历史 + `last_seq`） |
@@ -1727,3 +1728,7 @@ Request: `{ "password": "..." }`; password length must be 1–256 characters (th
 ### `POST /api/admin/users/:id/totp-reset`
 
 Clears `totp_secret` and `last_totp_step`, then revokes every unrevoked login session. Returns `{ "ok": true }`; the previous TOTP seed is never returned.
+
+### `POST /api/admin/users/:id/totp-enroll`
+
+Creates a new 20-byte TOTP seed for an existing user (replacing any previous binding), clears `last_totp_step`, and atomically revokes every unrevoked login session. Returns `{ "user": <safe user>, "totp_secret": "...", "totp_uri": "otpauth://..." }`; the seed is shown only in this response and never appears in user listings or later endpoints. A missing user returns `404 not_found`; a non-admin session returns `403 forbidden`.
