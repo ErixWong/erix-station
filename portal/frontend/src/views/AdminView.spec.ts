@@ -558,11 +558,12 @@ describe('AdminView · FDE 用户', () => {
     expect(generatedPassword).toMatch(/[0-9]/);
     await form.findAll('input')[2].setValue('pass123');
     await form.findAll('input')[3].setValue('carol');
+    await form.get('[data-test="user-totp-enabled"]').setValue(true);
     await form.trigger('submit.prevent');
     await flushPromises();
 
     expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
-      login: 'carol', display_name: 'Carol', password: 'pass123', fde_name: 'carol',
+      login: 'carol', display_name: 'Carol', password: 'pass123', fde_name: 'carol', totp_enabled: true,
     });
     const totp = wrapper.get('[data-test="totp-box"]');
     expect(totp.text()).toContain('仅此一次显示');
@@ -574,6 +575,34 @@ describe('AdminView · FDE 用户', () => {
     await wrapper.get('[data-test="totp-saved"]').trigger('click');
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
     wrapper.unmount();
+  });
+
+  it('默认不勾选 TOTP；创建响应无种子时关闭表单且不展示一次性盒', async () => {
+    const created = {
+      user: { id: 'u4', login: 'dave', display_name: 'Dave', role: 'fde', fde_name: null, status: 'active', totp_enabled: false },
+    };
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
+      return undefined;
+    });
+    try {
+      await wrapper.get('[data-test="open-add-user"]').trigger('click');
+      const form = wrapper.get('[data-test="add-user-form"]');
+      const totpCheckbox = form.get('[data-test="user-totp-enabled"]').element as HTMLInputElement;
+      expect(totpCheckbox.checked).toBe(false);
+      await form.findAll('input')[0].setValue('dave');
+      await form.get('#new-user-password').setValue('pass123');
+      await form.trigger('submit.prevent');
+      await flushPromises();
+
+      expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
+        login: 'dave', display_name: '', password: 'pass123', totp_enabled: false,
+      });
+      expect(wrapper.find('[data-test="add-user-form"]').exists()).toBe(false);
+      expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
   });
 
   it('为存量用户绑定 TOTP 经确认后只展示一次新密钥；已绑定用户显示重绑文案', async () => {
@@ -759,7 +788,7 @@ describe('AdminView · FDE 用户', () => {
     await form.trigger('submit.prevent');
     await flushPromises();
     expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
-      login: 'dave', display_name: '', password: 'pass123',
+      login: 'dave', display_name: '', password: 'pass123', totp_enabled: false,
     });
   });
 

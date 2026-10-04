@@ -19,7 +19,7 @@ const busyUserId = ref<string | null>(null);
 const showAddUser = ref(false);
 const showTotp = ref(false);
 const submitting = ref(false);
-const userForm = reactive({ login: '', display_name: '', password: '', fde_name: '' });
+const userForm = reactive({ login: '', display_name: '', password: '', fde_name: '', totpEnabled: false });
 
 type UserModalAction = 'edit' | 'password' | 'totp' | 'enroll' | 'delete';
 const modalAction = ref<UserModalAction | null>(null);
@@ -56,6 +56,7 @@ function resetUserForm() {
   userForm.display_name = '';
   userForm.password = '';
   userForm.fde_name = '';
+  userForm.totpEnabled = false;
 }
 
 function closeAddUser() {
@@ -102,10 +103,11 @@ async function onAddUser() {
       display_name: userForm.display_name.trim(),
       password: userForm.password,
       ...(userForm.fde_name.trim() ? { fde_name: userForm.fde_name.trim() } : {}),
+      totpEnabled: userForm.totpEnabled,
     });
-    if (!err && admin.totpOnce) {
+    if (!err) {
       closeAddUser();
-      showTotp.value = true;
+      if (admin.totpOnce) showTotp.value = true;
     }
   } finally {
     submitting.value = false;
@@ -698,6 +700,18 @@ onBeforeUnmount(() => {
         {{ t('admin.fde.fdeNameLabel') }}
         <input v-model="userForm.fde_name" placeholder="alice" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
+      <div class="flex flex-col gap-1 text-xs text-black/55">
+        <label class="flex items-center gap-2">
+          <input
+            v-model="userForm.totpEnabled"
+            data-test="user-totp-enabled"
+            type="checkbox"
+            class="rounded border-black/20"
+          >
+          {{ t('admin.fde.totpEnabledOpt') }}
+        </label>
+        <p>{{ t('admin.fde.totpEnabledHint') }}</p>
+      </div>
       <p v-if="admin.fdeErr" class="syserr" role="alert">{{ admin.fdeErr }}</p>
       <div class="flex gap-2">
         <button

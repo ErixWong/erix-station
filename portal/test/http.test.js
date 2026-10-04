@@ -77,6 +77,79 @@ class TotpEnrollHttpPool extends FakePool {
   }
 }
 
+class AdminCreateHttpPool extends FakePool {
+  constructor(options) {
+    super(options);
+    this.createdTotpSecrets = [];
+  }
+
+  async query(sql, params = []) {
+    if (sql.includes('INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
+      const [login, displayName, passwordHash, totpSecret, fdeName] = params;
+      this.createdTotpSecrets.push(totpSecret);
+      const row = {
+        id: `created-${this.createdTotpSecrets.length}`,
+        login,
+        display_name: displayName,
+        role: 'fde',
+        fde_name: fdeName,
+        auth_source: 'local',
+        status: 'active',
+        password_hash: passwordHash,
+        totp_secret: totpSecret,
+        created_at: new Date(),
+      };
+      this.users.push(row);
+      return {
+        rows: [{
+          id: row.id, login: row.login, display_name: row.display_name, role: row.role,
+          fde_name: row.fde_name, auth_source: row.auth_source, status: row.status,
+          created_at: row.created_at, totp_enabled: row.totp_secret !== null,
+        }],
+      };
+    }
+    return super.query(sql, params);
+  }
+}
+
+test('admin 创建用户路由：仅布尔 true 启用 TOTP，其它值关闭', async () => {
+  const admin = {
+    id: 'a0000000-0000-4000-8000-000000000001', login: 'admin', display_name: 'Admin',
+    role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+  };
+  const pool = new AdminCreateHttpPool({ users: [admin] });
+  const now = new Date();
+  pool.sessions.push({
+    id: 'admin-create-session', user_id: admin.id, token_hash: auth.hashToken('admin-create-token'),
+    created_at: now, expires_at: new Date(Date.now() + 3_600_000), last_seen_at: now, revoked_at: null,
+  });
+  const s = await startServer({ pool });
+  const headers = { 'content-type': 'application/json', cookie: 'fde_session_dev=admin-create-token' };
+  try {
+    const enabled = await fetch(`${s.base}/api/admin/users`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ login: 'totp-user', password: 'secret-pass-1', totp_enabled: true }),
+    });
+    assert.equal(enabled.status, 201);
+    const enabledBody = await enabled.json();
+    assert.equal(enabledBody.user.totp_enabled, true);
+    assert.notEqual(pool.createdTotpSecrets[0], null, 'boolean true 经路由透传并创建种子');
+    assert.equal(typeof enabledBody.totp_uri, 'string');
+
+    const invalid = await fetch(`${s.base}/api/admin/users`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ login: 'password-only', password: 'secret-pass-1', totp_enabled: 'true' }),
+    });
+    assert.equal(invalid.status, 201);
+    const invalidBody = await invalid.json();
+    assert.equal(invalidBody.user.totp_enabled, false);
+    assert.equal(pool.createdTotpSecrets[1], null, '非布尔值按 false 处理');
+    assert.ok(!Object.hasOwn(invalidBody, 'totp_secret') && !Object.hasOwn(invalidBody, 'totp_uri'));
+  } finally {
+    await s.close();
+  }
+});
+
 test('admin TOTP 补绑路由：仅 admin POST；其它方法 405，缺失用户 404', async () => {
   const admin = {
     id: 'a0000000-0000-4000-8000-000000000001', login: 'admin', display_name: 'Admin',

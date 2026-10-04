@@ -68,10 +68,10 @@ export async function listUsers(pool) {
 }
 
 /**
- * 建 FDE 用户（role='fde'、auth_source='local'、status='active'，TOTP 强制）。
- * @returns { user, totp_secret, totp_uri } —— totp_secret 仅此一次下发（调用方不得再读/再显）。
+ * 建 FDE 用户（role='fde'、auth_source='local'、status='active'；默认不启用 TOTP，见 issue #139）。
+ * @returns { { user } | { user, totp_secret, totp_uri } } —— 启用时种子仅此一次下发（调用方不得再读/再显）。
  */
-export async function createUser(pool, { actorId = null, login, display_name, password, fde_name, totpIssuer = 'erix-station', limits = {} } = {}) {
+export async function createUser(pool, { actorId = null, login, display_name, password, fde_name, totp_enabled = false, totpIssuer = 'erix-station', limits = {} } = {}) {
   const maxLogin = limits.maxLoginLength ?? 128;
   const maxPassword = limits.maxPasswordLength ?? 256;
   if (typeof login !== 'string' || login.trim() === '') {
@@ -98,7 +98,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   }
 
   const passwordHash = await auth.hashPassword(password); // 与 bootstrap-admin 同口径（scrypt 自描述）
-  const totpSecret = totp.generateSecret(20);
+  const totpSecret = totp_enabled === true ? totp.generateSecret(20) : null;
   const r = await pool.query(
     `INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)
      VALUES ($1, $2, 'fde', 'local', 'active', $3, $4, $5)
@@ -107,13 +107,15 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
     [trimmedLogin, typeof display_name === 'string' && display_name.trim() !== '' ? display_name.trim() : trimmedLogin, passwordHash, totpSecret, fde_name ?? null],
   );
   const user = safeUser(r.rows[0]);
-  const totpUri = totp.otpauthUri(totpSecret, { issuer: totpIssuer, label: user.login });
+  const totpUri = totpSecret ? totp.otpauthUri(totpSecret, { issuer: totpIssuer, label: user.login }) : null;
   // 审计：details 不含口令/种子（红线）。
   await pool.query(
     `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, 'admin.user_created', $2, $3)`,
     [actorId, trimmedLogin, JSON.stringify({ login: trimmedLogin, fde_name: fde_name ?? null })],
   ).catch(() => {});
-  return { user, totp_secret: totpSecret, totp_uri: totpUri };
+  return totpSecret
+    ? { user, totp_secret: totpSecret, totp_uri: totpUri }
+    : { user };
 }
 
 /** 更新管理员允许编辑的用户字段；禁用时原子吊销已有登录会话。 */
