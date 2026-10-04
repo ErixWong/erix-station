@@ -21,8 +21,8 @@ const PROVIDERS = {
     {
       id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
       models: [
-        { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
-        { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: false },
+        { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, max_tokens: 16384, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
+        { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, max_tokens: null, enabled: false },
       ],
     },
     { id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com', models: [] },
@@ -365,7 +365,9 @@ describe('AdminView · LLM 管理', () => {
       return undefined;
     });
     const modelRow = wrapper.get('[data-test="model-row"]');
-    expect(modelRow.findAll('td')).toHaveLength(6);
+    expect(modelRow.findAll('td')).toHaveLength(7);
+    expect(modelRow.findAll('td')[4].text()).toBe('16384');
+    expect(wrapper.findAll('[data-test="model-row"]')[1].findAll('td')[4].text()).toBe('—');
     expect(modelRow.text()).not.toContain('gpt-4o');
     await modelRow.findAll('button')[0].trigger('click');
     await flushPromises();
@@ -383,13 +385,17 @@ describe('AdminView · LLM 管理', () => {
     expect(addUpstreamModel.attributes('placeholder')).toBe('openai/<model>');
     await addUpstreamModel.setValue('openai/gpt-4o-mini');
     await addForm.findAll('input')[2].setValue('GPT-4o mini');
+    const addMaxTokens = addForm.get('[data-test="add-model-max-tokens"]');
+    expect(addMaxTokens.attributes('type')).toBe('number');
+    expect(addMaxTokens.attributes('min')).toBe('1');
+    await addMaxTokens.setValue('2048');
     await addForm.get('select').setValue('text');
     await addForm.find('input[type="checkbox"]').setValue(true);
     await addForm.trigger('submit.prevent');
     await flushPromises();
     const post = callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0];
     expect(JSON.parse(String(post[1]?.body))).toEqual({
-      model_id: 'gpt-4o-mini', model: 'openai/gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: true, context_window: null,
+      model_id: 'gpt-4o-mini', model: 'openai/gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: true, context_window: null, max_tokens: 2048,
     });
 
     const refreshedRow = wrapper.get('[data-test="model-row"]');
@@ -401,7 +407,11 @@ describe('AdminView · LLM 管理', () => {
     expect((editType.element as HTMLSelectElement).value).toBe('text');
     const editUpstreamModel = editForm.get('[data-test="edit-model-upstream-id"]');
     expect((editUpstreamModel.element as HTMLInputElement).value).toBe('openai/gpt-4o');
+    const editMaxTokens = editForm.get('[data-test="edit-model-max-tokens"]');
+    expect(editMaxTokens.attributes('min')).toBe('1');
+    expect((editMaxTokens.element as HTMLInputElement).value).toBe('16384');
     await editUpstreamModel.setValue('openai/gpt-4o-edited');
+    await editMaxTokens.setValue('4096');
     await editForm.findAll('input')[1].setValue('GPT-4o edited');
     await editForm.findAll('input')[2].setValue('65536');
     await editType.setValue('embedding');
@@ -412,7 +422,7 @@ describe('AdminView · LLM 管理', () => {
       ([, init]) => JSON.parse(String(init?.body)).name === 'GPT-4o edited',
     );
     expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
-      model: 'openai/gpt-4o-edited', name: 'GPT-4o edited', type: 'embedding', tool_calling: false, context_window: 65536,
+      model: 'openai/gpt-4o-edited', name: 'GPT-4o edited', type: 'embedding', tool_calling: false, context_window: 65536, max_tokens: 4096,
     });
 
     const deleteButton = wrapper.get('[data-test="model-row"]').findAll('button')
@@ -438,10 +448,12 @@ describe('AdminView · LLM 管理', () => {
     await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
     const editForm = wrapper.get('[data-test="edit-model-form"]');
     await editForm.get('[data-test="edit-model-upstream-id"]').setValue('');
+    await editForm.get('[data-test="edit-model-max-tokens"]').setValue('');
     await editForm.trigger('submit.prevent');
     await flushPromises();
     const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0];
     expect(JSON.parse(String(patch[1]?.body))).not.toHaveProperty('model');
+    expect(JSON.parse(String(patch[1]?.body))).not.toHaveProperty('max_tokens');
     wrapper.unmount();
   });
 
