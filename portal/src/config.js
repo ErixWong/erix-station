@@ -213,6 +213,10 @@ export function loadConfig(env = process.env) {
     traefikLlmDynamicFile: env.TRAEFIK_LLM_DYNAMIC_FILE || 'llm-routes.yml',
     // portal 域名与后端（reconciler 生成 portal 路由与 forwardAuth 地址用）。
     portalHost: env.PORTAL_HOST || `station.${env.BASE_DOMAIN || 'localhost'}`,
+    portalInternalHosts: (env.PORTAL_INTERNAL_HOSTS || '')
+      .split(',')
+      .map((host) => host.trim())
+      .filter(Boolean),
     portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
     traefikEntryPoint: env.TRAEFIK_ENTRYPOINT || 'web',
     llmHost: env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`,

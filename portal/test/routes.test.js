@@ -36,11 +36,41 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     allocations: [],
     sourceRanges: ['10.200.1.0/29', '10.201.7.0/28'],
   });
-  // internal 前缀 + Host(station) 双条件；priority 200 > portal 100
-  assert.ok(text.includes('Host(`station.localhost`) && PathPrefix(`/api/internal`)'));
-  assert.match(text, /    internal:\n      entryPoints: \[web\]\n      rule: "Host\(`station\.localhost`\) && PathPrefix\(`\/api\/internal`\)"\n      priority: 200/);
-  // portal 路由 priority 100 < internal 200
-  assert.match(text, /    portal:\n      entryPoints: \[web\]\n      rule: "Host\(`station\.localhost`\)"\n      priority: 100/);
+  // 不设额外 Host 时，完整 routes.yml 保持改动前字节快照。
+  assert.equal(text, [
+    'http:',
+    '  routers:',
+    '    portal:',
+    '      entryPoints: [web]',
+    '      rule: "Host(`station.localhost`)"',
+    '      priority: 100',
+    '      service: portal',
+    '    internal:',
+    '      entryPoints: [web]',
+    '      rule: "Host(`station.localhost`) && PathPrefix(`/api/internal`)"',
+    '      priority: 200',
+    '      middlewares: [internal-allow]',
+    '      service: portal',
+    '  middlewares:',
+    '    fde-auth:',
+    '      forwardAuth:',
+    '        address: "http://127.0.0.1:18080/api/forward-auth"',
+    '        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]',
+    '        authResponseHeaders: [X-Auth-User]',
+    '    strip-cookie:',
+    '      headers:',
+    '        customRequestHeaders:',
+    '          Cookie: ""',
+    '    internal-allow:',
+    '      ipAllowList:',
+    '        sourceRange: ["10.200.1.0/29", "10.201.7.0/28"]',
+    '  services:',
+    '    portal:',
+    '      loadBalancer:',
+    '        servers:',
+    '          - url: "http://127.0.0.1:18080"',
+    '',
+  ].join('\n'));
   // ipAllowList 精确 /29 与 /28，不含 /16 池
   assert.match(text, /sourceRange: \["10\.200\.1\.0\/29", "10\.201\.7\.0\/28"\]/);
   assert.ok(!text.includes('10.200.0.0/16'));
@@ -48,6 +78,21 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
   // internal 挂 internal-allow 中间件（ipAllowList），无 forwardAuth
   assert.ok(text.includes('middlewares: [internal-allow]'));
   assert.ok(!/    internal:\n(?:.*\n)*?forwardAuth:/.test(text));
+});
+
+test('internal router：额外域名与 IPv4 Host 只扩展 internal 规则并明确分组', () => {
+  const text = generateTraefikConfig({
+    portalHost: 'station.localhost',
+    portalInternalHosts: ['100.100.0.3', 'internal.example.test'],
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: [],
+  });
+  assert.ok(text.includes(
+    'rule: "(Host(`station.localhost`) || Host(`100.100.0.3`) || Host(`internal.example.test`)) && PathPrefix(`/api/internal`)"',
+  ));
+  assert.ok(text.includes('rule: "Host(`station.localhost`)"'), 'portal UI 入口仍只匹配 PORTAL_HOST');
 });
 
 test('deriveSourceRanges：非 FDE 网段（backend 等）不在 allowlist（只取传入的 fde_networks 行）', () => {
@@ -243,6 +288,23 @@ test('generateTraefikConfig：hostname/router key 注入面拒绝（换行/控�
   assert.throws(() => generateTraefikConfig({ ...base, portalHost: 'station.localhost\n' }), /invalid portal hostname/);
 });
 
+test('generateTraefikConfig：internal Host 校验拒绝注入字符和非法 IPv4', () => {
+  const base = {
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: [],
+  };
+  for (const host of ['bad\nhost', '*', 'bad\u0001host', '999.100.0.3']) {
+    assert.throws(
+      () => generateTraefikConfig({ ...base, portalInternalHosts: [host] }),
+      /invalid portal internal hostname/,
+      `必须拒绝：${JSON.stringify(host)}`,
+    );
+  }
+});
+
 test('LLM gateway service 含 responseForwarding.flushInterval ≤ 100ms（流式必需）', () => {
   const text = generateLlmTraefikConfig(llmArgs([BINDING_ALICE]));
   assert.ok(text.includes('    llm-gateway:'));
@@ -387,6 +449,24 @@ test('B1：无 LLM 配置的 FDE 发布——llm 文件不存在（null 契约�
   assert.ok(mainText.includes('Host(`station.localhost`)'), '无 LLM 配置不影响主路由发布');
   assert.equal(fs.statSync(out.target).mode & 0o777, 0o644, '主文件 644（无密钥）');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('rebuildRoutes：透传额外 internal Host 到 routes.yml', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-internal-hosts-'));
+  try {
+    const out = await rebuildRoutes(makePublishPool({ bindings: [] }), {
+      ...PUBLISH_CONFIG_BASE,
+      portalInternalHosts: ['100.100.0.3'],
+      traefikDynamicDir: dir,
+    });
+    const text = fs.readFileSync(out.target, 'utf8');
+    assert.ok(text.includes(
+      'rule: "(Host(`station.localhost`) || Host(`100.100.0.3`)) && PathPrefix(`/api/internal`)"',
+    ));
+    assert.ok(text.includes('rule: "Host(`station.localhost`)"'), 'portal UI 入口不扩展');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

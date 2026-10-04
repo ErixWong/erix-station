@@ -145,3 +145,15 @@ test('issue #117 phase 1：拒绝未知 gateway mode', () => {
     /LLM_GATEWAY_MODE/,
   );
 });
+
+test('PORTAL_INTERNAL_HOSTS：缺省为空，逗号分隔值 trim 并过滤空项', () => {
+  const base = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
+  assert.deepEqual(loadConfig(base).portalInternalHosts, []);
+  assert.deepEqual(
+    loadConfig({
+      ...base,
+      PORTAL_INTERNAL_HOSTS: ' 100.100.0.3, , internal.example.test ,, ',
+    }).portalInternalHosts,
+    ['100.100.0.3', 'internal.example.test'],
+  );
+});

@@ -270,6 +270,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 |---|---|---|
 | `BASE_DOMAIN` | 决策者提供（§1 ⚠️） | `erix.vip` |
 | `PORTAL_HOST` | 平台规范固定 = `station.` + `BASE_DOMAIN`（§1） | `station.erix.vip` |
+| `PORTAL_INTERNAL_HOSTS` | internal API router 的额外 Host（逗号分隔；只接受合法 hostname 或 IPv4，不改变 portal UI Host） | 空（仅匹配 `PORTAL_HOST`） |
 | `FDE_WILDCARD_HOST` | 平台规范固定 = `*.fde.` + `BASE_DOMAIN`（§1） | `*.fde.erix.vip` |
 | `LLM_HOST` | 平台规范固定 = `llm.` + `BASE_DOMAIN`（§1；容器内 hosts 注入解析，不进 DNS，仅证书 SAN 用） | `llm.erix.vip` |
 | `TRAEFIK_WEB_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `80` |
