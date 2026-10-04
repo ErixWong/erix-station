@@ -22,8 +22,9 @@ const modelForm = reactive({
   type: 'text',
   tool_calling: false,
   context_window: '',
+  max_tokens: '',
 });
-const modelEditForm = reactive({ model: '', name: '', type: 'text', tool_calling: false, context_window: '' });
+const modelEditForm = reactive({ model: '', name: '', type: 'text', tool_calling: false, context_window: '', max_tokens: '' });
 
 type DeleteTarget = { type: 'provider'; provider: LlmProvider } | { type: 'model'; model: LlmModel };
 const deleteTarget = ref<DeleteTarget | null>(null);
@@ -85,6 +86,7 @@ function openAddModel(providerId: string) {
   modelForm.type = 'text';
   modelForm.tool_calling = false;
   modelForm.context_window = '';
+  modelForm.max_tokens = '';
   selectedProviderId.value = providerId;
 }
 
@@ -102,6 +104,7 @@ async function onAddModel() {
     type: modelForm.type,
     tool_calling: modelForm.tool_calling,
     context_window: modelForm.context_window ? Number(modelForm.context_window) : null,
+    max_tokens: modelForm.max_tokens ? Number(modelForm.max_tokens) : null,
   });
   if (!err && !admin.llmErr) closeAddModel();
 }
@@ -112,6 +115,7 @@ function openEditModel(model: LlmModel) {
   modelEditForm.type = model.type;
   modelEditForm.tool_calling = model.tool_calling;
   modelEditForm.context_window = model.context_window === null ? '' : String(model.context_window);
+  modelEditForm.max_tokens = model.max_tokens === null ? '' : String(model.max_tokens);
   editingModel.value = model;
 }
 
@@ -124,6 +128,7 @@ async function onUpdateModel() {
     type: modelEditForm.type,
     tool_calling: modelEditForm.tool_calling,
     ...(modelEditForm.context_window ? { context_window: Number(modelEditForm.context_window) } : {}),
+    ...(modelEditForm.max_tokens ? { max_tokens: Number(modelEditForm.max_tokens) } : {}),
   });
   if (!err) editingModel.value = null;
 }
@@ -208,13 +213,14 @@ onMounted(() => {
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
                   <th class="py-1 pr-3 font-medium">tool_calling</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colMaxOutput') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
                   <th class="py-1 font-medium"></th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-if="p.models.length === 0">
-                  <td colspan="6" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
+                  <td colspan="7" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
                 </tr>
                 <tr v-for="m in p.models" :key="m.id" data-test="model-row" class="border-t border-black/5">
                   <td class="py-1 pr-3">{{ m.name }}</td>
@@ -223,6 +229,7 @@ onMounted(() => {
                   </td>
                   <td class="py-1 pr-3">{{ m.tool_calling ? '✓' : '—' }}</td>
                   <td class="py-1 pr-3">{{ m.context_window ?? '—' }}</td>
+                  <td class="py-1 pr-3">{{ m.max_tokens ?? '—' }}</td>
                   <td class="py-1 pr-3">
                     <span
                       class="rounded border px-1.5 py-0.5 text-xs font-medium"
@@ -367,6 +374,10 @@ onMounted(() => {
         {{ t('admin.llm.colContextWindow') }}
         <input v-model="modelForm.context_window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colMaxOutput') }}
+        <input v-model="modelForm.max_tokens" data-test="add-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
       <label class="flex items-center gap-1 text-xs text-black/55">
         <input v-model="modelForm.tool_calling" type="checkbox" class="accent-brand"> tool_calling
       </label>
@@ -413,6 +424,11 @@ onMounted(() => {
         {{ t('admin.llm.colContextWindow') }}
         <input v-model="modelEditForm.context_window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editContextWindowHint') }}</span>
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colMaxOutput') }}
+        <input v-model="modelEditForm.max_tokens" data-test="edit-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputHint') }}</span>
       </label>
       <label class="flex items-center gap-1 text-xs text-black/55">
         <input v-model="modelEditForm.tool_calling" type="checkbox" class="accent-brand"> tool_calling
