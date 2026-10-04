@@ -149,7 +149,16 @@ onMounted(() => {
 <template>
   <section class="rounded-lg border border-black/10 bg-white">
     <div class="p-3">
-      <h2 class="text-base font-semibold">{{ t('admin.llm.sectionTitle') }}</h2>
+      <div class="flex items-center gap-3">
+        <h2 class="text-base font-semibold">{{ t('admin.llm.sectionTitle') }}</h2>
+        <span class="flex-1"></span>
+        <button
+          type="button"
+          data-test="open-add-provider"
+          class="rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover"
+          @click="showAddProvider = true"
+        >{{ t('admin.llm.addProvider') }}</button>
+      </div>
       <p v-if="admin.llmErr" class="syserr my-1" role="alert">{{ admin.llmErr }}</p>
 
       <div data-test="provider-list">
@@ -245,12 +254,6 @@ onMounted(() => {
         </div>
       </div>
 
-      <button
-        type="button"
-        data-test="open-add-provider"
-        class="mt-3 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover"
-        @click="showAddProvider = true"
-      >{{ t('admin.llm.addProvider') }}</button>
     </div>
   </section>
 

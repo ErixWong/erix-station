@@ -213,6 +213,24 @@ describe('AdminReposView · Git host registry', () => {
 });
 
 describe('AdminView · LLM 管理', () => {
+  it('新增供应商按钮位于 LLM 区块标题行末尾', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm');
+    const sectionTitle = wrapper.findAll('h2').find((heading) => heading.text() === 'LLM 供应商');
+    expect(sectionTitle).toBeDefined();
+    const headingRow = sectionTitle!.element.parentElement;
+    expect(headingRow).not.toBeNull();
+    if (!headingRow) throw new Error('LLM section heading row is missing');
+
+    const trigger = wrapper.get('[data-test="open-add-provider"]');
+    expect(headingRow.classList.contains('flex')).toBe(true);
+    expect(headingRow.classList.contains('items-center')).toBe(true);
+    expect(Array.from(headingRow.children).map((child) => child.tagName)).toEqual(['H2', 'SPAN', 'BUTTON']);
+    expect(headingRow.children[1].classList.contains('flex-1')).toBe(true);
+    expect(headingRow.lastElementChild).toBe(trigger.element);
+    expect(wrapper.get('[data-test="provider-list"]').find('[data-test="open-add-provider"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it('默认展开全部供应商；手动折叠后 reload 保留选择并展开新供应商', async () => {
     let providerItems = PROVIDERS.items;
     const { wrapper, pinia } = await mountAdmin('/admin/llm', (url) => {
