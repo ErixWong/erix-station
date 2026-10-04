@@ -137,6 +137,7 @@ function toModel(model) {
     type,
     tool_calling: modelToolCalling(model),
     context_window: info.context_window ?? metadata.context_window ?? null,
+    max_tokens: params.max_tokens ?? null,
     enabled: !isModelBlocked(model),
     litellm_params: redactCredential(params),
     model_info: redactCredential(info),
@@ -232,8 +233,16 @@ export async function deleteProvider(gateway, name) {
   return getGatewayClient(gateway).deleteCredential(name);
 }
 
+function validateMaxTokens(value) {
+  if (value === undefined || value === null) return;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new LlmError('validation_failed', 'max_tokens 必须为正整数', { details: { field: 'max_tokens' } });
+  }
+}
+
 export async function createModel(gateway, input = {}) {
   const client = getGatewayClient(gateway);
+  validateMaxTokens(input.max_tokens);
   const modelName = input.model_name ?? input.model_id;
   if (typeof modelName !== 'string' || !modelName.trim()) {
     throw new LlmError('validation_failed', 'model_id 为必填字段', { details: { field: 'model_id' } });
@@ -245,6 +254,8 @@ export async function createModel(gateway, input = {}) {
   const params = input.litellm_params == null
     ? { model: upstreamModel.trim(), litellm_credential_name: input.provider_id }
     : { ...input.litellm_params, model: upstreamModel.trim() };
+  if (input.max_tokens === null) delete params.max_tokens;
+  else if (input.max_tokens !== undefined) params.max_tokens = input.max_tokens;
   const suppliedInfo = input.model_info ?? {};
   const metadata = {
     ...(suppliedInfo.metadata ?? {}),
@@ -311,8 +322,9 @@ async function findGatewayModel(client, id) {
   return found;
 }
 
-export async function updateModel(gateway, id, { name, type, enabled, tool_calling, context_window, model } = {}) {
+export async function updateModel(gateway, id, { name, type, enabled, tool_calling, context_window, max_tokens, model } = {}) {
   const client = getGatewayClient(gateway);
+  validateMaxTokens(max_tokens);
   let upstreamModel;
   if (model !== undefined) {
     if (typeof model !== 'string') {
@@ -334,6 +346,7 @@ export async function updateModel(gateway, id, { name, type, enabled, tool_calli
     || type !== undefined
     || tool_calling !== undefined
     || context_window !== undefined
+    || max_tokens !== undefined
     || upstreamModel !== undefined
   ) {
     const info = current.model_info ?? {};
@@ -352,7 +365,13 @@ export async function updateModel(gateway, id, { name, type, enabled, tool_calli
         metadata,
       };
     }
-    if (upstreamModel !== undefined) update.litellm_params = { model: upstreamModel };
+    if (upstreamModel !== undefined || max_tokens !== undefined) {
+      const params = { ...(current.litellm_params ?? {}) };
+      if (upstreamModel !== undefined) params.model = upstreamModel;
+      if (max_tokens === null) delete params.max_tokens;
+      else if (max_tokens !== undefined) params.max_tokens = max_tokens;
+      update.litellm_params = params;
+    }
     await client.updateModel(update);
   }
   return toModel(await findGatewayModel(client, id));

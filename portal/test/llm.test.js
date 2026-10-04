@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import {
   maskKey,
   listProviders,
+  listModels,
   createProvider,
   updateProvider,
   deleteProvider,
@@ -48,7 +49,7 @@ class LlmFakePool {
       api_format: 'openai', enabled: true, created_at: new Date(), updated_at: new Date(), ...p,
     }));
     this.models = models.map((m) => ({
-      tool_calling: false, context_window: null, enabled: true, created_at: new Date(), updated_at: new Date(), ...m,
+      tool_calling: false, context_window: null, max_tokens: null, enabled: true, created_at: new Date(), updated_at: new Date(), ...m,
     }));
     this.bindings = bindings.map((b) => ({ gateway: 'litellm', ...b }));
     this.revisions = new Map(); // `${aggregate}:${aggregateId}` -> revision
@@ -123,7 +124,11 @@ class LlmFakePool {
     return {
       data: this.models.map((m) => ({
         model_name: m.model_id,
-        litellm_params: { model: m.upstream_model ?? m.model_id, litellm_credential_name: m.provider_id },
+        litellm_params: {
+          model: m.upstream_model ?? m.model_id,
+          litellm_credential_name: m.provider_id,
+          ...(m.max_tokens == null ? {} : { max_tokens: m.max_tokens }),
+        },
         model_info: {
           id: m.id,
           type: m.type,
@@ -151,6 +156,7 @@ class LlmFakePool {
       mode: body.model_info?.mode,
       tool_calling: body.model_info?.tool_calling ?? body.model_info?.metadata?.tool_calling ?? false,
       context_window: body.model_info?.context_window ?? body.model_info?.metadata?.context_window ?? null,
+      max_tokens: body.litellm_params?.max_tokens ?? null,
       upstream_model: body.litellm_params?.model,
       enabled: true,
     });
@@ -169,7 +175,11 @@ class LlmFakePool {
     if (info.mode !== undefined) m.mode = info.mode;
     if (info.tool_calling !== undefined) m.tool_calling = info.tool_calling;
     if (info.context_window !== undefined) m.context_window = info.context_window;
-    if (body.litellm_params?.model !== undefined) m.upstream_model = body.litellm_params.model;
+    if (body.litellm_params !== undefined) {
+      m.upstream_model = body.litellm_params.model;
+      m.provider_id = body.litellm_params.litellm_credential_name;
+      m.max_tokens = body.litellm_params.max_tokens ?? null;
+    }
     return { model_id: m.id };
   }
 
@@ -717,16 +727,62 @@ test('model create：proxy sends explicit upstream model, credential and metadat
     name: 'DeepSeek Flash',
     type: 'text',
     tool_calling: true,
+    max_tokens: 4096,
   });
   assert.equal(m.model_id, 'm1');
   const call = pool.gatewayCalls.find((entry) => entry.method === 'createModel');
   assert.equal(call.body.model_name, 'deepseek-flash');
   assert.equal(call.body.litellm_params.model, 'deepseek/deepseek-chat');
   assert.equal(call.body.litellm_params.litellm_credential_name, 'p1');
+  assert.equal(call.body.litellm_params.max_tokens, 4096);
   assert.equal(call.body.model_info.type, 'text');
   assert.equal(call.body.model_info.mode, 'chat');
   assert.equal(call.body.model_info.tool_calling, true);
   assert.deepEqual(LLM_MODEL_TYPES, ['text', 'embedding', 'vision', 'rerank', 'audio-tts', 'audio-stt', 'image-gen']);
+});
+
+test('model create：max_tokens 为 undefined 或 null 时不写入 LiteLLM 参数', async () => {
+  for (const max_tokens of [undefined, null]) {
+    const pool = new LlmFakePool();
+    await createModel(pool, {
+      provider_id: 'p1',
+      model_id: 'gpt-4o',
+      model: 'openai/gpt-4o',
+      max_tokens,
+    });
+    const call = pool.gatewayCalls.find((entry) => entry.method === 'createModel');
+    assert.equal(Object.hasOwn(call.body.litellm_params, 'max_tokens'), false);
+  }
+});
+
+test('model list：toModel exposes max_tokens and defaults missing values to null', async () => {
+  const pool = new LlmFakePool({
+    models: [
+      { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', max_tokens: 8192 },
+      { id: 'm2', provider_id: 'p1', model_id: 'gpt-4o-mini' },
+    ],
+  });
+  const { items } = await listModels(pool);
+  assert.equal(items[0].max_tokens, 8192);
+  assert.equal(items[1].max_tokens, null);
+});
+
+test('model create：max_tokens 只接受正整数', async () => {
+  const pool = new LlmFakePool();
+  for (const max_tokens of [0, -1, 1.5, '1024', true]) {
+    await assert.rejects(
+      () => createModel(pool, {
+        provider_id: 'p1',
+        model_id: 'gpt-4o',
+        model: 'openai/gpt-4o',
+        max_tokens,
+      }),
+      (error) => error instanceof LlmError
+        && error.code === 'validation_failed'
+        && error.details.field === 'max_tokens',
+    );
+  }
+  assert.equal(pool.gatewayCalls.length, 0);
 });
 
 test('model create：缺少上游 model id 时拒绝且不访问网关', async () => {
@@ -801,6 +857,7 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
       type: 'text',
       tool_calling: true,
       context_window: 128000,
+      max_tokens: 4096,
     }],
   });
   await updateModel(pool, 'm1', {
@@ -808,9 +865,14 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
     type: 'embedding',
     tool_calling: false,
     context_window: 4096,
+    max_tokens: 8192,
   });
   const call = pool.gatewayCalls.find((entry) => entry.method === 'updateModel');
-  assert.deepEqual(call.body.litellm_params, { model: 'openai/gpt-4o-updated' });
+  assert.deepEqual(call.body.litellm_params, {
+    model: 'openai/gpt-4o-updated',
+    litellm_credential_name: 'p1',
+    max_tokens: 8192,
+  });
   assert.equal(call.body.model_info.type, 'embedding');
   assert.equal(call.body.model_info.mode, 'embedding');
   assert.equal(call.body.model_info.metadata.type, 'embedding');
@@ -821,6 +883,7 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
   assert.equal(pool.models[0].upstream_model, 'openai/gpt-4o-updated');
   assert.equal(pool.models[0].type, 'embedding');
   assert.equal(pool.models[0].mode, 'embedding');
+  assert.equal(pool.models[0].max_tokens, 8192);
 
   await updateModel(pool, 'm1', { name: 'Embedding renamed' });
   const nameOnlyCall = pool.gatewayCalls.filter((entry) => entry.method === 'updateModel')[1];
@@ -830,6 +893,29 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
 
   await updateModel(pool, 'm1', { model: ' ' });
   assert.equal(pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').length, 2);
+
+  await updateModel(pool, 'm1', { max_tokens: null });
+  const clearMaxTokensCall = pool.gatewayCalls.filter((entry) => entry.method === 'updateModel')[2];
+  assert.deepEqual(clearMaxTokensCall.body.litellm_params, {
+    model: 'openai/gpt-4o-updated',
+    litellm_credential_name: 'p1',
+  });
+  assert.equal(pool.models[0].max_tokens, null);
+});
+
+test('model update：max_tokens 只接受 null 或正整数', async () => {
+  const pool = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', upstream_model: 'openai/gpt-4o' }],
+  });
+  for (const max_tokens of [0, -1, 1.5, '1024', true]) {
+    await assert.rejects(
+      () => updateModel(pool, 'm1', { max_tokens }),
+      (error) => error instanceof LlmError
+        && error.code === 'validation_failed'
+        && error.details.field === 'max_tokens',
+    );
+  }
+  assert.equal(pool.gatewayCalls.length, 0);
 });
 
 test('model delete：forwards the LiteLLM model_info.id; missing model propagates 404', async () => {
