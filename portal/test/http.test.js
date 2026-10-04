@@ -54,6 +54,77 @@ async function startServer({ users = [], overrides = {}, pool: customPool } = {}
   };
 }
 
+class TotpEnrollHttpPool extends FakePool {
+  async query(sql, params = []) {
+    if (sql.includes('WITH target AS') && sql.includes('UPDATE users SET totp_secret = $2')) {
+      const [userId, secret] = params;
+      const user = this.users.find((row) => row.id === userId);
+      if (!user) return { rows: [] };
+      user.totp_secret = secret;
+      user.last_totp_step = null;
+      for (const session of this.sessions) {
+        if (session.user_id === userId && session.revoked_at === null) session.revoked_at = new Date();
+      }
+      return {
+        rows: [{
+          id: user.id, login: user.login, display_name: user.display_name, role: user.role,
+          fde_name: user.fde_name ?? null, auth_source: user.auth_source, status: user.status,
+          created_at: user.created_at ?? new Date(), totp_enabled: true,
+        }],
+      };
+    }
+    return super.query(sql, params);
+  }
+}
+
+test('admin TOTP 补绑路由：仅 admin POST；其它方法 405，缺失用户 404', async () => {
+  const admin = {
+    id: 'a0000000-0000-4000-8000-000000000001', login: 'admin', display_name: 'Admin',
+    role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+  };
+  const fde = {
+    id: 'b0000000-0000-4000-8000-000000000002', login: 'alice', display_name: 'Alice',
+    role: 'fde', fde_name: 'alice', auth_source: 'local', status: 'active',
+  };
+  const pool = new TotpEnrollHttpPool({ users: [admin, fde] });
+  const now = new Date();
+  for (const [user, token] of [[admin, 'admin-enroll-token'], [fde, 'fde-enroll-token']]) {
+    pool.sessions.push({
+      id: `session-${user.login}`, user_id: user.id, token_hash: auth.hashToken(token),
+      created_at: now, expires_at: new Date(Date.now() + 3_600_000),
+      last_seen_at: now, revoked_at: null,
+    });
+  }
+  const s = await startServer({ pool });
+  const adminCookie = 'fde_session_dev=admin-enroll-token';
+  const fdeCookie = 'fde_session_dev=fde-enroll-token';
+  const userId = admin.id;
+  try {
+    const wrongMethod = await fetch(`${s.base}/api/admin/users/${userId}/totp-enroll`, {
+      headers: { cookie: adminCookie },
+    });
+    assert.equal(wrongMethod.status, 405);
+    assert.equal((await wrongMethod.json()).error.code, 'method_not_allowed');
+
+    const missing = await fetch(`${s.base}/api/admin/users/c0000000-0000-4000-8000-000000000003/totp-enroll`, {
+      method: 'POST', headers: { cookie: adminCookie },
+    });
+    assert.equal(missing.status, 404);
+    assert.equal((await missing.json()).error.code, 'not_found');
+
+    const anonymous = await fetch(`${s.base}/api/admin/users/${userId}/totp-enroll`, { method: 'POST' });
+    assert.equal(anonymous.status, 401);
+
+    const forbidden = await fetch(`${s.base}/api/admin/users/${userId}/totp-enroll`, {
+      method: 'POST', headers: { cookie: fdeCookie },
+    });
+    assert.equal(forbidden.status, 403);
+    assert.equal((await forbidden.json()).error.code, 'forbidden');
+  } finally {
+    await s.close();
+  }
+});
+
 test('P5：POST /api/projects → 410 project_api_retired（项目注册制退役，写端点不再进 projects.js）', async () => {
   const user = {
     id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice',

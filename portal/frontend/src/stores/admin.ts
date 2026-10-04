@@ -64,6 +64,7 @@ export interface TotpOnce {
   uri: string;
   secret: string;
   qr: string; // qrcode data URL（旧版 qrcode(0,'M') + createDataURL(4,8) 的等价物）
+  purpose: 'created' | 'enrolled';
 }
 
 interface ProvidersResponse {
@@ -78,10 +79,24 @@ interface GitHostsResponse {
   items: GitHost[];
 }
 
-interface CreateUserResponse {
+interface TotpProvisionResponse {
   user: AdminUser;
   totp_secret: string;
   totp_uri: string;
+}
+
+async function makeTotpOnce(
+  response: TotpProvisionResponse,
+  purpose: TotpOnce['purpose'],
+): Promise<TotpOnce> {
+  const qr = await QRCode.toDataURL(response.totp_uri, { errorCorrectionLevel: 'M', scale: 4, margin: 8 });
+  return {
+    login: response.user.login,
+    uri: response.totp_uri,
+    secret: response.totp_secret,
+    qr,
+    purpose,
+  };
 }
 
 export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'role' | 'fde_name'>> & {
@@ -205,6 +220,22 @@ export const useAdminStore = defineStore('admin', {
         return await this.loadUsers();
       } catch (e) {
         return t('admin.errorPrefix') + this.errText(e);
+      }
+    },
+
+    async enrollTotp(id: string): Promise<string | null> {
+      this.fdeErr = null;
+      try {
+        const response = await api<TotpProvisionResponse>(
+          `/api/admin/users/${encodeURIComponent(id)}/totp-enroll`,
+          { method: 'POST' },
+        );
+        this.totpOnce = await makeTotpOnce(response, 'enrolled');
+        await this.loadUsers();
+        return null;
+      } catch (e) {
+        this.fdeErr = t('admin.errorPrefix') + this.errText(e);
+        return this.fdeErr;
       }
     },
 
@@ -407,10 +438,9 @@ export const useAdminStore = defineStore('admin', {
           password: fields.password,
         };
         if (fields.fde_name) body.fde_name = fields.fde_name;
-        const r = await api<CreateUserResponse>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
-        // TOTP 种子仅此一次显示（红线）：旧版 qrcode(0,'M') + createDataURL(4,8) → toDataURL({M, scale:4, margin:8})。
-        const qr = await QRCode.toDataURL(r.totp_uri, { errorCorrectionLevel: 'M', scale: 4, margin: 8 });
-        this.totpOnce = { login: r.user.login, uri: r.totp_uri, secret: r.totp_secret, qr };
+        const r = await api<TotpProvisionResponse>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
+        // TOTP 种子仅此一次显示（红线）：创建与补绑共用同一只一次性展示盒。
+        this.totpOnce = await makeTotpOnce(r, 'created');
         await this.loadUsers();
         return null;
       } catch (e) {
