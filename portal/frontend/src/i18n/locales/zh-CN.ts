@@ -294,6 +294,8 @@ export const zhCN = {
       displayNameLabel: '显示名',
       passwordLabel: '口令',
       fdeNameLabel: 'fde_name（可空）',
+      totpEnabledOpt: '启用 TOTP',
+      totpEnabledHint: '默认不启用；启用后需用认证器 App 扫码绑定。',
       addUser: '创建用户',
       totpTitle: '用户已创建 · TOTP 设置',
       totpEnrollTitle: 'TOTP 已绑定 · 一次性密钥',

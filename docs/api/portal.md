@@ -1705,13 +1705,19 @@ Returns `204` when deleted; returns `409 host_in_use` while `fde_git_accounts` r
 
 The JSON body may contain `git_host_id`. The selected provider is recorded in `containers.git_provider`. `minted` hosts provision an account and scoped token; token plaintext is written to the FDE `.git-credentials` file and never stored in the database. `per_fde_pat` hosts finish with `users.status='awaiting_credential'` until the administrator writes the FDE's PAT through the Git credential endpoint. The response includes `status` and `git_provider`.
 
-## 12. Admin user management (issue #128)
+## 12. Admin user management (issues #128, #139)
 
-All user-management routes require `requireAdmin`: no session returns `401 unauthorized`; a non-admin session returns `403 forbidden`. User IDs are UUIDs. User responses never contain `password_hash` or `totp_secret`.
+All user-management routes require `requireAdmin`: no session returns `401 unauthorized`; a non-admin session returns `403 forbidden`. User IDs are UUIDs. User objects never contain `password_hash` or `totp_secret`.
 
 ### `GET /api/admin/users`
 
 Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), and `last_login_at` (the newest `login_sessions.created_at`, or `null`). Revoked sessions remain part of login history.
+
+### `POST /api/admin/users`
+
+Creates a local FDE user. Request fields: `login` (required), `password` (required), `display_name` (optional), `fde_name` (optional), and `totp_enabled` (optional boolean, default `false`). Only the boolean value `true` enables TOTP; other values are treated as `false`.
+
+With the default `false`, `totp_secret` is stored as `NULL`, the response contains only `{ "user": <safe user> }`, and the user signs in with password only (the existing behavior for accounts without TOTP enrollment). This is the intentional deviation from the force-TOTP design target recorded in issue #139. With `totp_enabled: true`, the response also includes `totp_secret` and `totp_uri`; the seed is shown only in this creation response and must be saved and bound with an authenticator app.
 
 ### `PATCH /api/admin/users/:id`
 

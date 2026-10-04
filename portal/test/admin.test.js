@@ -141,7 +141,7 @@ class AdminPool extends FakePool {
         password_hash: params[2], totp_secret: params[3], created_at: new Date(),
       };
       this.users.push(row);
-      return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at, totp_enabled: true }] };
+      return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at, totp_enabled: row.totp_secret !== null }] };
     }
     // 用户列表
     if (sql.includes('FROM users') && sql.includes('LEFT JOIN')) {
@@ -224,7 +224,7 @@ async function startAdminServer({ seed = {}, docker = null } = {}) {
   };
 }
 
-test('admin 用户管理：建用户 201（role=fde，totp_secret 仅本次响应）→ 列表无敏感字段', async () => {
+test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无种子', async () => {
   const { base, cookie, pool, close } = await startAdminServer();
   try {
     const H = { cookie, 'content-type': 'application/json' };
@@ -238,9 +238,9 @@ test('admin 用户管理：建用户 201（role=fde，totp_secret 仅本次响�
     assert.equal(body.user.role, 'fde');
     assert.equal(body.user.fde_name, 'bob');
     assert.equal(body.user.status, 'active');
-    assert.equal(body.user.totp_enabled, true);
-    assert.match(body.totp_secret, /^[A-Z2-7]{32}$/, 'TOTP 种子 base32（20 字节）');
-    assert.ok(body.totp_uri.startsWith('otpauth://totp/'), '给 otpauth provisioning URI');
+    assert.equal(body.user.totp_enabled, false);
+    assert.equal(pool.users.find((u) => u.login === 'bob').totp_secret, null, '未启用时 DB totp_secret 为 NULL');
+    assert.ok(!Object.hasOwn(body, 'totp_secret') && !Object.hasOwn(body, 'totp_uri'), '未启用时响应不含一次性种子字段');
     assert.ok(!('password_hash' in body.user) && !('totp_secret' in body.user), 'user 对象无敏感字段');
 
     // 列表：含新用户，但绝不回显 totp_secret / password_hash
@@ -255,17 +255,41 @@ test('admin 用户管理：建用户 201（role=fde，totp_secret 仅本次响�
     const bob = list.items.find((u) => u.login === 'bob');
     assert.ok(bob, '列表含新用户');
     assert.equal(bob.fde_name, 'bob');
-    assert.equal(bob.totp_enabled, true);
+    assert.equal(bob.totp_enabled, false);
     assert.equal(bob.last_login_at, latestLogin.toISOString());
     const root = list.items.find((u) => u.login === 'root');
     assert.equal(root.totp_enabled, false);
     assert.ok(root.last_login_at);
     const raw = JSON.stringify(list);
     assert.ok(!raw.includes('totp_secret'), '列表响应无 totp_secret 键');
-    assert.ok(!raw.includes(body.totp_secret), '列表响应无 TOTP 种子值');
     assert.ok(!raw.includes('password_hash'), '列表响应无口令哈希键');
     assert.ok(!raw.includes('secret-pass-1'), '任何响应不含明文口令');
     assert.equal(pool.users.find((u) => u.login === 'bob').password_hash.startsWith('scrypt$'), true, 'DB 侧 scrypt 哈希（bootstrap-admin 同口径）');
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：显式启用 TOTP 时一次性下发种子与 URI，审计不含种子', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  try {
+    const res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ login: 'totp-bob', password: 'secret-pass-1', totp_enabled: true }),
+    });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.user.totp_enabled, true);
+    assert.match(body.totp_secret, /^[A-Z2-7]{32}$/, 'TOTP 种子仍为 20 字节 base32');
+    assert.match(body.totp_uri, new RegExp(`secret=${body.totp_secret}`));
+    assert.match(body.totp_uri, /issuer=erix-station-test/);
+    assert.equal(pool.users.find((u) => u.login === 'totp-bob').totp_secret, body.totp_secret);
+    assert.ok(!('totp_secret' in body.user), 'user 对象仍无敏感字段');
+    const audit = pool.sqlLog.find(({ sql, params }) =>
+      sql.includes("'admin.user_created'") && sql.includes('INSERT INTO audit_log') && params[1] === 'totp-bob');
+    assert.ok(audit, '用户创建仍写审计');
+    assert.ok(!JSON.stringify(audit).includes(body.totp_secret), '审计不含 TOTP 种子');
   } finally {
     await close();
   }

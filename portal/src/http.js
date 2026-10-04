@@ -642,6 +642,7 @@ async function handleAdminApi(req, res, ctx, url) {
         display_name: body?.display_name,
         password: body?.password,
         fde_name: body?.fde_name,
+        totp_enabled: body?.totp_enabled === true,
         totpIssuer: ctx.config.totp?.issuer,
         limits: {
           maxLoginLength: ctx.config.maxLoginLength,
