@@ -219,6 +219,7 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
     throw new AdminError('self_delete', '管理员不能删除自己的账号', { httpStatus: 409 });
   }
 
+  let deletedLogin;
   let client;
   try {
     client = await pool.connect();
@@ -228,6 +229,7 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
       [userId],
     );
     if (!target.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+    deletedLogin = target.rows[0].login;
 
     const container = await client.query(
       `SELECT 1 FROM containers WHERE user_id = $1 AND status <> 'removed' LIMIT 1`,
@@ -253,10 +255,6 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
     await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
     const deleted = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id`, [userId]);
     if (!deleted.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
-    await client.query(
-      `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, 'admin.user_deleted', $2, $3)`,
-      [actorId, target.rows[0].login, JSON.stringify({ user_id: userId })],
-    ).catch(() => {});
     await client.query('COMMIT');
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
@@ -268,6 +266,7 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
   } finally {
     client?.release();
   }
+  await recordAdminAudit(pool, actorId, 'admin.user_deleted', deletedLogin, { user_id: userId });
   return { ok: true };
 }
 

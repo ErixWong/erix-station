@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { deleteUser } from '../src/admin.js';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
@@ -400,6 +401,69 @@ test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖�
   } finally {
     await close();
   }
+});
+
+test('deleteUser：审计写入失败不回滚已提交的用户删除', async () => {
+  const calls = [];
+  const auditError = Object.assign(new Error('audit foreign key violation'), { code: '23503' });
+  let transactionAborted = false;
+  let deletedInTransaction = false;
+  let userStillExists = true;
+  const client = {
+    async query(sql) {
+      calls.push({ executor: 'client', sql });
+      if (sql === 'BEGIN') return { rows: [] };
+      if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
+        return { rows: [{ id: 'deleted-user', login: 'alice' }] };
+      }
+      if (sql.includes('FROM containers WHERE user_id') || sql.includes('FROM runs r')) {
+        return { rows: [] };
+      }
+      if (sql.includes('DELETE FROM users WHERE id')) {
+        deletedInTransaction = true;
+        return { rows: [{ id: 'deleted-user' }] };
+      }
+      if (sql.includes('INSERT INTO audit_log')) {
+        transactionAborted = true;
+        throw auditError;
+      }
+      if (sql === 'COMMIT') {
+        // PostgreSQL treats COMMIT in an aborted transaction as ROLLBACK without throwing.
+        if (!transactionAborted) userStillExists = !deletedInTransaction;
+        return { rows: [] };
+      }
+      if (sql === 'ROLLBACK' || sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')) {
+        return { rows: [] };
+      }
+      throw new Error(`Unexpected transaction query: ${sql}`);
+    },
+    release() {
+      calls.push({ executor: 'client', sql: 'RELEASE' });
+    },
+  };
+  const pool = {
+    async connect() {
+      return client;
+    },
+    async query(sql, params) {
+      calls.push({ executor: 'pool', sql, params });
+      if (sql.includes('INSERT INTO audit_log')) {
+        throw auditError;
+      }
+      throw new Error(`Unexpected pool query: ${sql}`);
+    },
+  };
+
+  assert.deepEqual(await deleteUser(pool, { actorId: 'missing-admin', userId: 'deleted-user' }), { ok: true });
+  assert.equal(userStillExists, false);
+  const commitIndex = calls.findIndex((call) => call.executor === 'client' && call.sql === 'COMMIT');
+  const releaseIndex = calls.findIndex((call) => call.executor === 'client' && call.sql === 'RELEASE');
+  const auditIndex = calls.findIndex((call) => call.executor === 'pool' && call.sql.includes('INSERT INTO audit_log'));
+  assert.ok(commitIndex >= 0 && commitIndex < releaseIndex && releaseIndex < auditIndex);
+  assert.equal(calls.some((call) => call.executor === 'client' && call.sql.includes('INSERT INTO audit_log')), false);
+  assert.deepEqual(calls[auditIndex].params, [
+    'missing-admin', 'admin.user_deleted', 'alice', JSON.stringify({ user_id: 'deleted-user' }),
+  ]);
 });
 
 test('admin 用户管理：重置口令校验长度、更新 scrypt hash 并吊销会话', async () => {
