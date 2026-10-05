@@ -317,6 +317,8 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 
 > **边界**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立），也不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点写入 `home/.git-credentials`；此 write-through 凭据文件不进 DB/日志/audit payload，细节见 [`user-space.md`](user-space.md) §4.1.1。
 
+**开户执行（issue #111 A）**：管理台新建 FDE 时 email、`fde_name` 和启用中的非 Azure Git host 必填；用户、Git host 绑定与 `fde_onboarding` 队列记录在同一 DB 事务内写入。portal 后台循环异步依次执行 provision 与用户空间 materialize，并持久化各步骤状态；失败任务不自动重试，由管理员显式重试，已完成步骤跳过。全部步骤完成后，用户若仍需录入 Git PAT，开户终态为 `awaiting_credential`。
+
 ### 7.3 offboarding 必须同样脚本化
 
 ```

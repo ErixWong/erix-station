@@ -42,12 +42,17 @@ export interface AdminUser {
   totp_enabled: boolean;
   last_login_at: string | null;
   git_host_id?: string | null;
+  onboarding: {
+    state: 'pending' | 'running' | 'awaiting_credential' | 'done' | 'failed';
+    step?: string | null;
+    error?: string | null;
+  } | null;
 }
 
 export interface GitHost {
   id: string;
   name: string;
-  provider: 'gitea' | 'github' | 'gitlab';
+  provider: 'gitea' | 'github' | 'gitlab' | 'azure';
   base_url: string;
   admin_key: string | null;
   admin_key_configured: boolean;
@@ -248,6 +253,16 @@ export const useAdminStore = defineStore('admin', {
       }
     },
 
+    async retryOnboarding(id: string): Promise<string | null> {
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(id)}/onboard/retry`, { method: 'POST' });
+        return await this.loadUsers();
+      } catch (e) {
+        this.fdeErr = t('admin.errorPrefix') + this.errText(e);
+        return this.fdeErr;
+      }
+    },
+
     async loadGitHosts() {
       this.gitHostsErr = null;
       try {
@@ -438,16 +453,26 @@ export const useAdminStore = defineStore('admin', {
     },
 
     /** POST /api/admin/users；仅启用 TOTP 时创建一次性种子展示盒。 */
-    async addUser(fields: { login: string; display_name: string; password: string; fde_name?: string; totpEnabled?: boolean }): Promise<string | null> {
+    async addUser(fields: {
+      login: string;
+      display_name: string;
+      password: string;
+      email: string;
+      fde_name: string;
+      git_host_id: string;
+      totpEnabled?: boolean;
+    }): Promise<string | null> {
       this.fdeErr = null;
       try {
-        const body: { login: string; display_name: string; password: string; fde_name?: string; totp_enabled: boolean } = {
+        const body = {
           login: fields.login,
           display_name: fields.display_name,
           password: fields.password,
+          email: fields.email,
+          fde_name: fields.fde_name,
+          git_host_id: fields.git_host_id,
           totp_enabled: fields.totpEnabled === true,
         };
-        if (fields.fde_name) body.fde_name = fields.fde_name;
         const r = await api<TotpProvisionResponse>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
         // TOTP 种子仅此一次显示（红线）：只在服务端返回种子时构造展示盒。
         this.totpOnce = hasTotpProvision(r) ? await makeTotpOnce(r, 'created') : null;
