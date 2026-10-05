@@ -11,6 +11,8 @@ import * as auth from '../src/auth.js';
 import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
 
+const TEST_GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
+
 async function startServer({ users = [], overrides = {}, pool: customPool } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
@@ -81,15 +83,34 @@ class AdminCreateHttpPool extends FakePool {
   constructor(options) {
     super(options);
     this.createdTotpSecrets = [];
+    this.gitHosts = [{ id: TEST_GIT_HOST_ID, provider: 'gitea', enabled: true }];
+    this.onboardings = [];
+    this.gitAccounts = [];
   }
 
   async query(sql, params = []) {
-    if (sql.includes('INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
-      const [login, displayName, passwordHash, totpSecret, fdeName] = params;
+    if (sql.includes('SELECT id, provider, enabled FROM git_hosts WHERE id')) {
+      return { rows: this.gitHosts.filter((host) => host.id === params[0]) };
+    }
+    if (sql.includes('SELECT 1 FROM users WHERE email')) {
+      return { rows: this.users.filter((user) => user.email === params[0]).map(() => ({ '?column?': 1 })) };
+    }
+    if (sql.includes('INSERT INTO fde_onboarding')) {
+      const [fdeId, steps] = params;
+      this.onboardings.push({ fde_id: fdeId, state: 'pending', steps: JSON.parse(steps), last_error: null });
+      return { rows: [] };
+    }
+    if (sql.includes('INSERT INTO fde_git_accounts')) {
+      this.gitAccounts.push({ fde_id: params[0], git_host_id: params[1] });
+      return { rows: [] };
+    }
+    if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
+      const [login, email, displayName, passwordHash, totpSecret, fdeName] = params;
       this.createdTotpSecrets.push(totpSecret);
       const row = {
         id: `created-${this.createdTotpSecrets.length}`,
         login,
+        email,
         display_name: displayName,
         role: 'fde',
         fde_name: fdeName,
@@ -110,6 +131,10 @@ class AdminCreateHttpPool extends FakePool {
     }
     return super.query(sql, params);
   }
+
+  async connect() {
+    return { query: (sql, params) => this.query(sql, params), release() {} };
+  }
 }
 
 test('admin 创建用户路由：仅布尔 true 启用 TOTP，其它值关闭', async () => {
@@ -128,23 +153,98 @@ test('admin 创建用户路由：仅布尔 true 启用 TOTP，其它值关闭', 
   try {
     const enabled = await fetch(`${s.base}/api/admin/users`, {
       method: 'POST', headers,
-      body: JSON.stringify({ login: 'totp-user', password: 'secret-pass-1', totp_enabled: true }),
+      body: JSON.stringify({
+        login: 'totp-user', password: 'secret-pass-1', email: 'totp-user@example.test',
+        fde_name: 'totp-user', git_host_id: TEST_GIT_HOST_ID, totp_enabled: true,
+      }),
     });
     assert.equal(enabled.status, 201);
     const enabledBody = await enabled.json();
     assert.equal(enabledBody.user.totp_enabled, true);
+    assert.deepEqual(enabledBody.onboarding, { state: 'pending', step: 'provision', error: null });
+    assert.deepEqual(pool.onboardings[0].steps, {
+      provision: { state: 'pending' }, materialize: { state: 'pending' },
+    });
     assert.notEqual(pool.createdTotpSecrets[0], null, 'boolean true 经路由透传并创建种子');
     assert.equal(typeof enabledBody.totp_uri, 'string');
 
     const invalid = await fetch(`${s.base}/api/admin/users`, {
       method: 'POST', headers,
-      body: JSON.stringify({ login: 'password-only', password: 'secret-pass-1', totp_enabled: 'true' }),
+      body: JSON.stringify({
+        login: 'password-only', password: 'secret-pass-1', email: 'password-only@example.test',
+        fde_name: 'password-only', git_host_id: TEST_GIT_HOST_ID, totp_enabled: 'true',
+      }),
     });
     assert.equal(invalid.status, 201);
     const invalidBody = await invalid.json();
     assert.equal(invalidBody.user.totp_enabled, false);
     assert.equal(pool.createdTotpSecrets[1], null, '非布尔值按 false 处理');
     assert.ok(!Object.hasOwn(invalidBody, 'totp_secret') && !Object.hasOwn(invalidBody, 'totp_uri'));
+  } finally {
+    await s.close();
+  }
+});
+
+test('admin 建用户路由：缺少开户必填字段返回 400', async () => {
+  const admin = {
+    id: 'a0000000-0000-4000-8000-000000000001', login: 'admin', display_name: 'Admin',
+    role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+  };
+  const pool = new AdminCreateHttpPool({ users: [admin] });
+  pool.sessions.push({
+    id: 'admin-create-session', user_id: admin.id, token_hash: auth.hashToken('admin-create-token'),
+    created_at: new Date(), expires_at: new Date(Date.now() + 3_600_000), last_seen_at: new Date(), revoked_at: null,
+  });
+  const s = await startServer({ pool });
+  try {
+    const response = await fetch(`${s.base}/api/admin/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: 'fde_session_dev=admin-create-token' },
+      body: JSON.stringify({
+        login: 'missing-email', password: 'secret-pass-1', fde_name: 'missing-email',
+        git_host_id: TEST_GIT_HOST_ID,
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'email');
+    assert.equal(pool.users.some((user) => user.login === 'missing-email'), false);
+  } finally {
+    await s.close();
+  }
+});
+
+test('admin 建用户路由：拒绝停用或 Azure Git host 且不插入用户', async () => {
+  const admin = {
+    id: 'a0000000-0000-4000-8000-000000000001', login: 'admin', display_name: 'Admin',
+    role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+  };
+  const pool = new AdminCreateHttpPool({ users: [admin] });
+  pool.sessions.push({
+    id: 'admin-create-session', user_id: admin.id, token_hash: auth.hashToken('admin-create-token'),
+    created_at: new Date(), expires_at: new Date(Date.now() + 3_600_000), last_seen_at: new Date(), revoked_at: null,
+  });
+  const s = await startServer({ pool });
+  try {
+    const postUser = () => fetch(`${s.base}/api/admin/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: 'fde_session_dev=admin-create-token' },
+      body: JSON.stringify({
+        login: 'not-created', password: 'secret-pass-1', email: 'not-created@example.test',
+        fde_name: 'not-created', git_host_id: TEST_GIT_HOST_ID,
+      }),
+    });
+    pool.gitHosts[0].enabled = false;
+    let response = await postUser();
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'git_host_id');
+    assert.equal(pool.users.length, 1);
+
+    pool.gitHosts[0].enabled = true;
+    pool.gitHosts[0].provider = 'azure';
+    response = await postUser();
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'git_host_id');
+    assert.equal(pool.users.length, 1);
   } finally {
     await s.close();
   }

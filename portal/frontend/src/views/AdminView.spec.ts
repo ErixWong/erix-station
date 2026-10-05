@@ -33,10 +33,12 @@ const USERS = {
     {
       id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
       status: 'active', totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+      onboarding: { state: 'failed', step: 'provision', error: 'Docker unavailable' },
     },
     {
       id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null,
       status: 'active', totp_enabled: false, last_login_at: null,
+      onboarding: { state: 'done', step: null, error: null },
     },
   ],
 };
@@ -542,14 +544,17 @@ describe('AdminView · FDE 用户', () => {
     expect(list.text()).toContain('alice');
     expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
     expect(list.text()).toContain('✓');
-    expect(list.findAll('thead th')).toHaveLength(8);
-    expect(list.findAll('thead th')[6].text()).toBe('最近登录');
+    expect(list.findAll('thead th')).toHaveLength(9);
+    expect(list.findAll('thead th')[6].text()).toBe('开户状态');
+    expect(list.findAll('thead th')[7].text()).toBe('最近登录');
     const rows = list.findAll('[data-test="user-row"]');
-    expect(rows[0].findAll('td')).toHaveLength(8);
-    expect(rows[0].findAll('td')[6].text())
+    expect(rows[0].findAll('td')).toHaveLength(9);
+    expect(rows[0].findAll('td')[6].text()).toContain('失败');
+    expect(rows[0].findAll('td')[6].find('span').attributes('title')).toBe('Docker unavailable');
+    expect(rows[0].findAll('td')[7].text())
       .toBe(new Date('2026-10-03T12:00:00.000Z').toLocaleString('zh-CN'));
-    expect(rows[1].findAll('td')[6].text()).toBe('从未登录');
-    expect(rows[0].findAll('button')).toHaveLength(2);
+    expect(rows[1].findAll('td')[7].text()).toBe('从未登录');
+    expect(rows[0].findAll('button')).toHaveLength(3);
     expect(list.find('[data-test="user-menu-button"]').exists()).toBe(false);
     expect(rows[0].attributes('tabindex')).toBeUndefined();
     await rows[0].trigger('click');
@@ -575,14 +580,17 @@ describe('AdminView · FDE 用户', () => {
     expect(generatedPassword).toMatch(/[a-z]/);
     expect(generatedPassword).toMatch(/[A-Z]/);
     expect(generatedPassword).toMatch(/[0-9]/);
-    await form.findAll('input')[2].setValue('pass123');
-    await form.findAll('input')[3].setValue('carol');
+    await form.get('#new-user-password').setValue('pass123');
+    await form.get('[data-test="user-email"]').setValue('carol@example.test');
+    await form.get('[data-test="user-fde-name"]').setValue('carol');
+    await form.get('[data-test="new-user-git-host"]').setValue('gh1');
     await form.get('[data-test="user-totp-enabled"]').setValue(true);
     await form.trigger('submit.prevent');
     await flushPromises();
 
     expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
-      login: 'carol', display_name: 'Carol', password: 'pass123', fde_name: 'carol', totp_enabled: true,
+      login: 'carol', display_name: 'Carol', password: 'pass123', email: 'carol@example.test',
+      fde_name: 'carol', git_host_id: 'gh1', totp_enabled: true,
     });
     const totp = wrapper.get('[data-test="totp-box"]');
     expect(totp.text()).toContain('仅此一次显示');
@@ -659,7 +667,7 @@ describe('AdminView · FDE 用户', () => {
 
   it('默认不勾选 TOTP；创建响应无种子时关闭表单且不展示一次性盒', async () => {
     const created = {
-      user: { id: 'u4', login: 'dave', display_name: 'Dave', role: 'fde', fde_name: null, status: 'active', totp_enabled: false },
+      user: { id: 'u4', login: 'dave', display_name: 'Dave', role: 'fde', fde_name: 'dave', status: 'active', totp_enabled: false },
     };
     const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
       if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
@@ -672,11 +680,15 @@ describe('AdminView · FDE 用户', () => {
       expect(totpCheckbox.checked).toBe(false);
       await form.findAll('input')[0].setValue('dave');
       await form.get('#new-user-password').setValue('pass123');
+      await form.get('[data-test="user-email"]').setValue('dave@example.test');
+      await form.get('[data-test="user-fde-name"]').setValue('dave');
+      await form.get('[data-test="new-user-git-host"]').setValue('gh1');
       await form.trigger('submit.prevent');
       await flushPromises();
 
       expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
-        login: 'dave', display_name: '', password: 'pass123', totp_enabled: false,
+        login: 'dave', display_name: '', password: 'pass123', email: 'dave@example.test',
+        fde_name: 'dave', git_host_id: 'gh1', totp_enabled: false,
       });
       expect(wrapper.find('[data-test="add-user-form"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
@@ -947,25 +959,51 @@ describe('AdminView · FDE 用户', () => {
     loading.wrapper.unmount();
   });
 
-  it('新增用户时空 fde_name 仍从 POST body 省略', async () => {
-    const created = {
-      user: { id: 'u4', login: 'dave', display_name: '', role: 'fde', fde_name: null, status: 'active' },
-      totp_uri: 'otpauth://totp/x',
-      totp_secret: 'SECRET',
-    };
-    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
-      if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
-      return undefined;
-    });
+  it('开户必填字段有原生校验；没有可用 Git host 时提示并禁用提交', async () => {
+    const { wrapper } = await mountAdmin('/admin/users', (url) =>
+      url === '/api/admin/git-hosts' ? jsonResponse(200, { items: [] }) : undefined);
     await wrapper.get('[data-test="open-add-user"]').trigger('click');
     const form = wrapper.get('[data-test="add-user-form"]');
-    await form.findAll('input')[0].setValue('dave');
-    await form.findAll('input')[2].setValue('pass123');
-    await form.trigger('submit.prevent');
-    await flushPromises();
-    expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
-      login: 'dave', display_name: '', password: 'pass123', totp_enabled: false,
+    expect(form.get('[data-test="user-email"]').attributes('type')).toBe('email');
+    expect(form.get('[data-test="user-email"]').attributes('required')).toBeDefined();
+    expect(form.get('[data-test="user-fde-name"]').attributes('required')).toBeDefined();
+    expect(form.get('[data-test="new-user-git-host"]').attributes('required')).toBeDefined();
+    expect(form.text()).toContain('没有可用的 Git host');
+    expect((form.get('button[type="submit"]').element as HTMLButtonElement).disabled).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('失败开户状态显示错误并可重试，编辑资料 tab 同样展示状态', async () => {
+    type TestUser = Omit<typeof USERS.items[number], 'onboarding'> & {
+      onboarding: { state: string; step: string | null; error: string | null };
+    };
+    let users: TestUser[] = USERS.items.map((user) => ({ ...user }));
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, { items: users });
+      if (url === '/api/admin/users/u1/onboard/retry' && init?.method === 'POST') {
+        users = users.map((user) => user.id === 'u1'
+          ? { ...user, onboarding: { state: 'pending', step: 'provision', error: null } }
+          : user);
+        return jsonResponse(200, { onboarding: users[0]?.onboarding });
+      }
+      return undefined;
     });
+    const row = wrapper.findAll('[data-test="user-row"]').find((item) => item.text().includes('alice'));
+    if (!row) throw new Error('alice row not found');
+    expect(row.text()).toContain('失败');
+    await row.get('[data-test="edit-user"]').trigger('click');
+    const editor = wrapper.get('[data-test="edit-panel-profile"]');
+    expect(editor.get('[data-test="profile-onboarding"]').text()).toContain('失败');
+    expect(editor.text()).toContain('Docker unavailable');
+    expect(editor.findAll('[data-test="retry-onboarding-profile"]')).toHaveLength(1);
+    await wrapper.get('[data-test="user-edit-modal"] button[aria-label="关闭"]').trigger('click');
+
+    await row.get('[data-test="retry-onboarding"]').trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'POST', '/api/admin/users/u1/onboard/retry')).toHaveLength(1);
+    expect(row.text()).toContain('开户中');
+    expect(row.findAll('[data-test="retry-onboarding"]')).toHaveLength(0);
+    wrapper.unmount();
   });
 
   it('shared header identity continues to update with the English locale', async () => {
