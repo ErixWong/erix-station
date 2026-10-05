@@ -432,8 +432,7 @@ onBeforeUnmount(() => {
         {{ t('admin.fde.searchEmpty') }}
       </div>
 
-      <div v-else-if="admin.usersLoaded" class="overflow-x-auto">
-        <table class="w-full min-w-[56rem] table-fixed text-left text-sm">
+      <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
             <col class="w-[13%]">
             <col class="w-[16%]">
@@ -524,7 +523,6 @@ onBeforeUnmount(() => {
             </template>
           </tbody>
         </table>
-      </div>
     </div>
   </section>
 
