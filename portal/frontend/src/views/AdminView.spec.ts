@@ -528,7 +528,7 @@ describe('Admin modals', () => {
 });
 
 describe('AdminView · FDE 用户', () => {
-  it('表格行打开详情抽屉；新用户成功后展示一次性 TOTP modal', async () => {
+  it('查看按钮打开详情 modal 并显示最近登录；新用户成功后展示一次性 TOTP modal', async () => {
     const created = {
       user: { id: 'u3', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: 'carol', status: 'active' },
       totp_uri: 'otpauth://totp/erix-station:carol?secret=JBSWY3DPEHPK3PXP&issuer=erix-station',
@@ -542,9 +542,25 @@ describe('AdminView · FDE 用户', () => {
     expect(list.text()).toContain('alice');
     expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
     expect(list.text()).toContain('✓');
-    await wrapper.findAll('[data-test="user-row"]')[1].trigger('click');
+    expect(list.findAll('thead th')).toHaveLength(8);
+    expect(list.findAll('thead th')[6].text()).toBe('最近登录');
+    const rows = list.findAll('[data-test="user-row"]');
+    expect(rows[0].findAll('td')).toHaveLength(8);
+    expect(rows[0].findAll('td')[6].text())
+      .toBe(new Date('2026-10-03T12:00:00.000Z').toLocaleString('zh-CN'));
+    expect(rows[1].findAll('td')[6].text()).toBe('从未登录');
+    expect(rows[0].findAll('button')).toHaveLength(3);
+    expect(list.find('[data-test="user-menu-button"]').exists()).toBe(false);
+    expect(rows[0].attributes('tabindex')).toBeUndefined();
+    await rows[0].trigger('click');
+    expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
+    await rows[1].get('[data-test="view-user"]').trigger('click');
     await flushPromises();
-    expect(wrapper.get('[data-test="user-drawer"]').text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
+    const details = wrapper.get('[data-test="user-details-modal"]');
+    expect(details.text()).toContain('bob');
+    expect(details.text()).toContain('Bob');
+    expect(details.text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
+    await details.get('[aria-label="关闭"]').trigger('click');
 
     await wrapper.get('[data-test="open-add-user"]').trigger('click');
     const form = wrapper.get('[data-test="add-user-form"]');
@@ -605,7 +621,7 @@ describe('AdminView · FDE 用户', () => {
     }
   });
 
-  it('为存量用户绑定 TOTP 经确认后只展示一次新密钥；已绑定用户显示重绑文案', async () => {
+  it('在编辑 modal 中绑定或重绑 TOTP 后只展示一次新密钥', async () => {
     const enrolled = {
       user: { ...USERS.items[1], totp_enabled: true },
       totp_uri: 'otpauth://totp/erix-station:bob?secret=TEST_ONLY_TOTP_SEED&issuer=erix-station',
@@ -619,16 +635,14 @@ describe('AdminView · FDE 用户', () => {
     });
     const bobRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('bob'));
     if (!bobRow) throw new Error('bob row not found');
-    await bobRow.get('[data-test="user-menu-button"]').trigger('click');
-    const bindAction = wrapper.findAll('[role="menuitem"]').find((button) => button.text() === '绑定 TOTP');
-    expect(bindAction).toBeDefined();
-    if (!bindAction) throw new Error('TOTP bind action not found');
-    await bindAction.trigger('click');
-    expect(wrapper.get('[role="dialog"]').text()).toContain('确认绑定 TOTP');
-    expect(wrapper.get('[role="dialog"]').text()).toContain('密钥仅本次显示');
+    await bobRow.get('[data-test="edit-user"]').trigger('click');
+    const editor = wrapper.get('[data-test="user-edit-modal"]');
+    expect(editor.text()).toContain('TOTP 设置');
+    expect(editor.text()).toContain('绑定 TOTP');
+    expect(editor.find('[data-test="confirm-totp-reset"]').exists()).toBe(false);
     expect(callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')).toHaveLength(0);
 
-    await wrapper.get('[data-test="confirm-totp-enroll"]').trigger('click');
+    await editor.get('[data-test="confirm-totp-enroll"]').trigger('click');
     await flushPromises();
     const post = callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')[0];
     expect(post).toBeDefined();
@@ -641,33 +655,99 @@ describe('AdminView · FDE 用户', () => {
     expect(totp.find('[data-test="copy-totp-uri"]').exists()).toBe(true);
     expect(totp.find('[data-test="copy-totp-secret"]').exists()).toBe(true);
     await wrapper.get('[data-test="totp-saved"]').trigger('click');
+    await flushPromises();
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
     expect(wrapper.text()).not.toContain(enrolled.totp_secret);
+    expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(true);
 
     const aliceRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('alice'));
     if (!aliceRow) throw new Error('alice row not found');
-    await aliceRow.get('[data-test="user-menu-button"]').trigger('click');
-    expect(wrapper.get('[role="menu"]').text()).toContain('重绑 TOTP（旧码作废）');
-    const rebindAction = wrapper.findAll('[role="menuitem"]').find((button) => button.text() === '重绑 TOTP（旧码作废）');
-    if (!rebindAction) throw new Error('TOTP rebind action not found');
-    await rebindAction.trigger('click');
-    expect(wrapper.get('[role="dialog"]').text()).toContain('旧密钥将立即作废');
+    await wrapper.get('[data-test="user-edit-modal"]').get('[aria-label="关闭"]').trigger('click');
+    await aliceRow.get('[data-test="edit-user"]').trigger('click');
+    expect(wrapper.get('[data-test="user-edit-modal"]').text()).toContain('重绑 TOTP（旧码作废）');
+    expect(wrapper.find('[data-test="confirm-totp-reset"]').exists()).toBe(true);
     expect(callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')).toHaveLength(1);
     wrapper.unmount();
   });
 
-  it('详情抽屉中弱化未启用 MFA 并强调已启用状态', async () => {
-    const { wrapper } = await mountAdmin();
+  it('重置 TOTP 保留编辑 modal 并按最新状态隐藏重置动作', async () => {
+    let users = USERS.items.map((user) => ({ ...user }));
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, { items: users });
+      if (url === '/api/admin/users/u1/totp-reset' && init?.method === 'POST') {
+        users = users.map((user) => user.id === 'u1' ? { ...user, totp_enabled: false } : user);
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    const aliceRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('alice'));
+    if (!aliceRow) throw new Error('alice row not found');
+    await aliceRow.get('[data-test="edit-user"]').trigger('click');
+    const editor = wrapper.get('[data-test="user-edit-modal"]');
+    expect(editor.text()).toContain('重绑 TOTP（旧码作废）');
+    const reset = editor.get('[data-test="confirm-totp-reset"]');
+    expect(reset.classes()).toContain('bg-red-700');
+    await reset.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'POST', '/api/admin/users/u1/totp-reset')).toHaveLength(1);
+    expect(wrapper.get('[data-test="user-edit-modal"]').text()).toContain('TOTP 已重置');
+    expect(wrapper.get('[data-test="user-edit-modal"]').text()).toContain('绑定 TOTP');
+    expect(wrapper.find('[data-test="confirm-totp-reset"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('用户资料与密码分区独立提交并各自反馈', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users/u1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      if (url === '/api/admin/users/u1/reset-password' && init?.method === 'POST') {
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    const aliceRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('alice'));
+    if (!aliceRow) throw new Error('alice row not found');
+    await aliceRow.get('[data-test="edit-user"]').trigger('click');
+
+    const profileForm = wrapper.get('[data-test="user-profile-form"]');
+    await profileForm.findAll('input')[0].setValue('Alice Updated');
+    await profileForm.findAll('input')[1].setValue('alpha-renamed');
+    await profileForm.trigger('submit.prevent');
+    await flushPromises();
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')[0];
+    expect(JSON.parse(String(patch[1]?.body))).toEqual({
+      display_name: 'Alice Updated', role: 'fde', fde_name: 'alpha-renamed',
+    });
+    expect(profileForm.text()).toContain('资料已更新');
+
+    const passwordForm = wrapper.get('[data-test="user-password-form"]');
+    await passwordForm.get('input').setValue('new-password');
+    await passwordForm.trigger('submit.prevent');
+    await flushPromises();
+    expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users/u1/reset-password')[0][1]?.body)))
+      .toEqual({ password: 'new-password' });
+    expect(passwordForm.text()).toContain('密码已重置');
+    expect(profileForm.text()).toContain('资料已更新');
+    expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('查看 modal 通过行内查看按钮打开；行本身不再触发详情', async () => {
+    const { wrapper } = await mountAdmin('/admin/users', (url) =>
+      url === '/api/admin/fdes/alpha-fde/llm'
+        ? jsonResponse(200, { config: null, active_run: false })
+        : undefined);
     const rows = wrapper.findAll('[data-test="user-row"]');
 
     await rows[0].trigger('click');
-    let mfa = wrapper.get('[data-test="user-drawer"]').findAll('dd').find((item) => item.text() === '已启用');
-    expect(mfa?.classes()).toContain('text-green-700');
-
-    await wrapper.get('[data-test="user-drawer"] button[aria-label="关闭"]').trigger('click');
-    await rows[1].trigger('click');
-    mfa = wrapper.get('[data-test="user-drawer"]').findAll('dd').find((item) => item.text() === '未启用');
-    expect(mfa?.classes()).toContain('text-black/45');
+    expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
+    await rows[0].get('[data-test="view-user"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('[data-test="user-details-modal"]').text()).toContain('alice');
+    expect(wrapper.get('[data-test="user-details-modal"]').text()).toContain('Alice');
+    expect(wrapper.find('[data-test="user-details-modal"] [data-test="provider-select"]').exists()).toBe(true);
+    await wrapper.get('[data-test="user-details-modal"] [aria-label="关闭"]').trigger('click');
+    await rows[1].get('[data-test="view-user"]').trigger('click');
+    expect(wrapper.get('[data-test="user-details-modal"]').text()).toContain('bob');
     wrapper.unmount();
   });
 
@@ -717,8 +797,12 @@ describe('AdminView · FDE 用户', () => {
       }
       return undefined;
     });
-    await wrapper.get('[data-test="user-menu-button"]').trigger('click');
-    await wrapper.get('[role="menu"] button.text-red-700').trigger('click');
+    await wrapper.get('[data-test="user-row"]').get('[data-test="edit-user"]').trigger('click');
+    await wrapper.get('[data-test="open-user-delete"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="user-delete-modal"]').text()).toContain('此操作不可撤销');
+    expect(document.body.style.overflow).toBe('hidden');
     const confirmation = wrapper.get('[data-test="delete-login-confirmation"]');
     const confirmButton = wrapper.get('[data-test="confirm-user-delete"]');
     expect((confirmButton.element as HTMLButtonElement).disabled).toBe(true);
@@ -729,12 +813,18 @@ describe('AdminView · FDE 用户', () => {
     await confirmButton.trigger('click');
     await flushPromises();
     expect(callsTo(fetchFn, 'DELETE', '/api/admin/users/u1')).toHaveLength(1);
-    expect(wrapper.find('[role="alert"]').text()).toContain('user still has an active FDE container');
+    expect(wrapper.get('[data-test="user-delete-modal"] [role="alert"]').text())
+      .toContain('user still has an active FDE container');
     expect(wrapper.find('[data-test="user-list"]').text()).toContain('user still has an active FDE container');
+    await wrapper.get('[data-test="user-delete-modal"] button').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="user-delete-modal"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(true);
+    expect(document.body.style.overflow).toBe('hidden');
     wrapper.unmount();
   });
 
-  it('当前登录者的菜单与详情抽屉都不显示删除入口', async () => {
+  it('当前登录者的编辑 modal 不显示删除入口；行内菜单不存在', async () => {
     const self = {
       ...ADMIN_USER,
       status: 'active',
@@ -743,10 +833,12 @@ describe('AdminView · FDE 用户', () => {
     };
     const { wrapper } = await mountAdmin('/admin/users', (url, init) =>
       url === '/api/admin/users' && !init?.method ? jsonResponse(200, { items: [self] }) : undefined);
-    await wrapper.get('[data-test="user-menu-button"]').trigger('click');
-    expect(wrapper.find('[role="menu"]').text()).not.toContain('删除用户');
-    await wrapper.find('[data-test="user-row"]').trigger('click');
-    expect(wrapper.get('[data-test="user-drawer"]').text()).not.toContain('删除用户');
+    expect(wrapper.find('[data-test="user-menu-button"]').exists()).toBe(false);
+    await wrapper.get('[data-test="user-row"]').get('[data-test="edit-user"]').trigger('click');
+    expect(wrapper.find('[data-test="user-edit-modal"] [data-test="open-user-delete"]').exists()).toBe(false);
+    await wrapper.get('[data-test="user-edit-modal"] [aria-label="关闭"]').trigger('click');
+    await wrapper.get('[data-test="user-row"] [data-test="view-user"]').trigger('click');
+    expect(wrapper.get('[data-test="user-details-modal"]').text()).not.toContain('删除用户');
     wrapper.unmount();
   });
 
