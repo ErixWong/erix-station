@@ -433,7 +433,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-else-if="admin.usersLoaded" class="overflow-x-auto">
-        <table class="w-full min-w-[64rem] table-fixed text-left text-sm">
+        <table class="w-full min-w-[56rem] table-fixed text-left text-sm">
           <colgroup>
             <col class="w-[13%]">
             <col class="w-[16%]">
