@@ -528,7 +528,7 @@ describe('Admin modals', () => {
 });
 
 describe('AdminView · FDE 用户', () => {
-  it('查看按钮打开详情 modal 并显示最近登录；新用户成功后展示一次性 TOTP modal', async () => {
+  it('编辑 modal 展示用户与 LLM 提示、最近登录；新用户成功后展示一次性 TOTP modal', async () => {
     const created = {
       user: { id: 'u3', login: 'carol', display_name: 'Carol', role: 'fde', fde_name: 'carol', status: 'active' },
       totp_uri: 'otpauth://totp/erix-station:carol?secret=JBSWY3DPEHPK3PXP&issuer=erix-station',
@@ -549,18 +549,21 @@ describe('AdminView · FDE 用户', () => {
     expect(rows[0].findAll('td')[6].text())
       .toBe(new Date('2026-10-03T12:00:00.000Z').toLocaleString('zh-CN'));
     expect(rows[1].findAll('td')[6].text()).toBe('从未登录');
-    expect(rows[0].findAll('button')).toHaveLength(3);
+    expect(rows[0].findAll('button')).toHaveLength(2);
     expect(list.find('[data-test="user-menu-button"]').exists()).toBe(false);
     expect(rows[0].attributes('tabindex')).toBeUndefined();
     await rows[0].trigger('click');
     expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
-    await rows[1].get('[data-test="view-user"]').trigger('click');
+    expect(wrapper.find('[data-test="view-user"]').exists()).toBe(false);
+    await rows[1].get('[data-test="edit-user"]').trigger('click');
     await flushPromises();
-    const details = wrapper.get('[data-test="user-details-modal"]');
-    expect(details.text()).toContain('bob');
-    expect(details.text()).toContain('Bob');
-    expect(details.text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
-    await details.get('[aria-label="关闭"]').trigger('click');
+    const editor = wrapper.get('[data-test="user-edit-modal"]');
+    expect(editor.text()).toContain('bob');
+    expect((editor.get('[data-test="user-profile-form"] input').element as HTMLInputElement).value).toBe('Bob');
+    expect(editor.get('[data-test="edit-tab-profile"]').attributes('aria-selected')).toBe('true');
+    await editor.get('[data-test="edit-tab-llm"]').trigger('click');
+    expect(editor.get('[data-test="edit-panel-llm"]').text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
+    await editor.get('[aria-label="关闭"]').trigger('click');
 
     await wrapper.get('[data-test="open-add-user"]').trigger('click');
     const form = wrapper.get('[data-test="add-user-form"]');
@@ -590,6 +593,67 @@ describe('AdminView · FDE 用户', () => {
     expect(totp.find('[data-test="copy-totp-secret"]').exists()).toBe(true);
     await wrapper.get('[data-test="totp-saved"]').trigger('click');
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('编辑 modal 默认显示资料 tab；四个 tab 可访问切换且保留资料表单输入', async () => {
+    const { wrapper } = await mountAdmin('/admin/users', (url) =>
+      url === '/api/admin/fdes/alpha-fde/llm'
+        ? jsonResponse(200, { config: null, active_run: false })
+        : undefined);
+    const row = wrapper.findAll('[data-test="user-row"]').find((item) => item.text().includes('alice'));
+    if (!row) throw new Error('alice row not found');
+    await row.get('[data-test="edit-user"]').trigger('click');
+
+    const editor = wrapper.get('[data-test="user-edit-modal"]');
+    const tabNames = ['profile', 'security', 'llm', 'danger'] as const;
+    expect(editor.get('[role="tablist"]').classes()).toContain('flex-wrap');
+    expect(wrapper.find('[data-test="view-user"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
+    expect(editor.get('[data-test="edit-panel-profile"]').isVisible()).toBe(true);
+    await editor.get('[data-test="user-profile-form"] input').setValue('Edited but not saved');
+    setLocale('en');
+    await flushPromises();
+    expect(editor.get('[data-test="edit-tab-profile"]').text()).toBe('Profile');
+    expect(editor.get('[data-test="edit-tab-security"]').text()).toBe('Security');
+    expect(editor.get('[data-test="edit-tab-llm"]').text()).toBe('LLM & Repository');
+    expect(editor.get('[data-test="edit-tab-danger"]').text()).toBe('Danger zone');
+    setLocale('zh-CN');
+    await flushPromises();
+
+    for (const name of tabNames) {
+      const tab = editor.get(`[data-test="edit-tab-${name}"]`);
+      const panel = editor.get(`[data-test="edit-panel-${name}"]`);
+      await tab.trigger('click');
+      if (name === 'llm') await flushPromises();
+      expect(tab.attributes('aria-selected')).toBe('true');
+      expect(tab.attributes('aria-controls')).toBe(`edit-panel-${name}`);
+      expect(panel.attributes('role')).toBe('tabpanel');
+      expect(panel.attributes('aria-labelledby')).toBe(`edit-tab-${name}`);
+      expect(panel.isVisible()).toBe(true);
+      if (name === 'security') {
+        expect(panel.text()).toContain('重置用户密码');
+        expect(panel.text()).toContain('TOTP 设置');
+      } else if (name === 'llm') {
+        await panel.get('[data-test="provider-select"]').setValue('p2');
+      }
+      for (const otherName of tabNames.filter((candidate) => candidate !== name)) {
+        expect(editor.get(`[data-test="edit-tab-${otherName}"]`).attributes('aria-selected')).toBe('false');
+        expect(editor.get(`[data-test="edit-panel-${otherName}"]`).isVisible()).toBe(false);
+      }
+    }
+
+    await editor.get('[data-test="edit-tab-llm"]').trigger('click');
+    expect((editor.get('[data-test="edit-panel-llm"] [data-test="provider-select"]').element as HTMLSelectElement).value)
+      .toBe('p2');
+    await editor.get('[data-test="edit-tab-profile"]').trigger('click');
+    expect((editor.get('[data-test="user-profile-form"] input').element as HTMLInputElement).value)
+      .toBe('Edited but not saved');
+    await editor.get('[data-test="edit-tab-danger"]').trigger('click');
+    await editor.get('[aria-label="关闭"]').trigger('click');
+    await row.get('[data-test="edit-user"]').trigger('click');
+    expect(wrapper.get('[data-test="user-edit-modal"] [data-test="edit-tab-profile"]').attributes('aria-selected'))
+      .toBe('true');
     wrapper.unmount();
   });
 
@@ -637,6 +701,7 @@ describe('AdminView · FDE 用户', () => {
     if (!bobRow) throw new Error('bob row not found');
     await bobRow.get('[data-test="edit-user"]').trigger('click');
     const editor = wrapper.get('[data-test="user-edit-modal"]');
+    await editor.get('[data-test="edit-tab-security"]').trigger('click');
     expect(editor.text()).toContain('TOTP 设置');
     expect(editor.text()).toContain('绑定 TOTP');
     expect(editor.find('[data-test="confirm-totp-reset"]').exists()).toBe(false);
@@ -658,13 +723,17 @@ describe('AdminView · FDE 用户', () => {
     await flushPromises();
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
     expect(wrapper.text()).not.toContain(enrolled.totp_secret);
-    expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(true);
+    const resumedEditor = wrapper.get('[data-test="user-edit-modal"]');
+    expect(resumedEditor.get('[data-test="edit-tab-security"]').attributes('aria-selected')).toBe('true');
+    expect(resumedEditor.get('[data-test="edit-panel-security"]').isVisible()).toBe(true);
 
     const aliceRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('alice'));
     if (!aliceRow) throw new Error('alice row not found');
-    await wrapper.get('[data-test="user-edit-modal"]').get('[aria-label="关闭"]').trigger('click');
+    await resumedEditor.get('[aria-label="关闭"]').trigger('click');
     await aliceRow.get('[data-test="edit-user"]').trigger('click');
-    expect(wrapper.get('[data-test="user-edit-modal"]').text()).toContain('重绑 TOTP（旧码作废）');
+    const aliceEditor = wrapper.get('[data-test="user-edit-modal"]');
+    await aliceEditor.get('[data-test="edit-tab-security"]').trigger('click');
+    expect(aliceEditor.text()).toContain('重绑 TOTP（旧码作废）');
     expect(wrapper.find('[data-test="confirm-totp-reset"]').exists()).toBe(true);
     expect(callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')).toHaveLength(1);
     wrapper.unmount();
@@ -684,6 +753,7 @@ describe('AdminView · FDE 用户', () => {
     if (!aliceRow) throw new Error('alice row not found');
     await aliceRow.get('[data-test="edit-user"]').trigger('click');
     const editor = wrapper.get('[data-test="user-edit-modal"]');
+    await editor.get('[data-test="edit-tab-security"]').trigger('click');
     expect(editor.text()).toContain('重绑 TOTP（旧码作废）');
     const reset = editor.get('[data-test="confirm-totp-reset"]');
     expect(reset.classes()).toContain('bg-red-700');
@@ -719,6 +789,7 @@ describe('AdminView · FDE 用户', () => {
     });
     expect(profileForm.text()).toContain('资料已更新');
 
+    await wrapper.get('[data-test="user-edit-modal"] [data-test="edit-tab-security"]').trigger('click');
     const passwordForm = wrapper.get('[data-test="user-password-form"]');
     await passwordForm.get('input').setValue('new-password');
     await passwordForm.trigger('submit.prevent');
@@ -726,12 +797,13 @@ describe('AdminView · FDE 用户', () => {
     expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users/u1/reset-password')[0][1]?.body)))
       .toEqual({ password: 'new-password' });
     expect(passwordForm.text()).toContain('密码已重置');
+    await wrapper.get('[data-test="user-edit-modal"] [data-test="edit-tab-profile"]').trigger('click');
     expect(profileForm.text()).toContain('资料已更新');
     expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(true);
     wrapper.unmount();
   });
 
-  it('查看 modal 通过行内查看按钮打开；行本身不再触发详情', async () => {
+  it('编辑 modal 的 LLM tab 按用户切换配置面板或无 FDE 提示', async () => {
     const { wrapper } = await mountAdmin('/admin/users', (url) =>
       url === '/api/admin/fdes/alpha-fde/llm'
         ? jsonResponse(200, { config: null, active_run: false })
@@ -740,14 +812,22 @@ describe('AdminView · FDE 用户', () => {
 
     await rows[0].trigger('click');
     expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
-    await rows[0].get('[data-test="view-user"]').trigger('click');
+    expect(wrapper.find('[data-test="view-user"]').exists()).toBe(false);
+
+    await rows[0].get('[data-test="edit-user"]').trigger('click');
+    const aliceEditor = wrapper.get('[data-test="user-edit-modal"]');
+    await aliceEditor.get('[data-test="edit-tab-llm"]').trigger('click');
     await flushPromises();
-    expect(wrapper.get('[data-test="user-details-modal"]').text()).toContain('alice');
-    expect(wrapper.get('[data-test="user-details-modal"]').text()).toContain('Alice');
-    expect(wrapper.find('[data-test="user-details-modal"] [data-test="provider-select"]').exists()).toBe(true);
-    await wrapper.get('[data-test="user-details-modal"] [aria-label="关闭"]').trigger('click');
-    await rows[1].get('[data-test="view-user"]').trigger('click');
-    expect(wrapper.get('[data-test="user-details-modal"]').text()).toContain('bob');
+    expect(aliceEditor.text()).toContain('alice');
+    expect((aliceEditor.get('[data-test="user-profile-form"] input').element as HTMLInputElement).value).toBe('Alice');
+    expect(aliceEditor.get('[data-test="edit-panel-llm"]').findAll('[data-test="provider-select"]')).toHaveLength(1);
+    await aliceEditor.get('[aria-label="关闭"]').trigger('click');
+
+    await rows[1].get('[data-test="edit-user"]').trigger('click');
+    const bobEditor = wrapper.get('[data-test="user-edit-modal"]');
+    await bobEditor.get('[data-test="edit-tab-llm"]').trigger('click');
+    expect(bobEditor.get('[data-test="edit-panel-llm"]').text()).toContain('该用户未配置 fde_name，无需 LLM 配置。');
+    expect(bobEditor.findAll('[data-test="provider-select"]')).toHaveLength(0);
     wrapper.unmount();
   });
 
@@ -798,6 +878,7 @@ describe('AdminView · FDE 用户', () => {
       return undefined;
     });
     await wrapper.get('[data-test="user-row"]').get('[data-test="edit-user"]').trigger('click');
+    await wrapper.get('[data-test="user-edit-modal"] [data-test="edit-tab-danger"]').trigger('click');
     await wrapper.get('[data-test="open-user-delete"]').trigger('click');
     await flushPromises();
     expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(false);
@@ -819,7 +900,9 @@ describe('AdminView · FDE 用户', () => {
     await wrapper.get('[data-test="user-delete-modal"] button').trigger('click');
     await flushPromises();
     expect(wrapper.find('[data-test="user-delete-modal"]').exists()).toBe(false);
-    expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(true);
+    const resumedEditor = wrapper.get('[data-test="user-edit-modal"]');
+    expect(resumedEditor.get('[data-test="edit-tab-danger"]').attributes('aria-selected')).toBe('true');
+    expect(resumedEditor.get('[data-test="edit-panel-danger"]').isVisible()).toBe(true);
     expect(document.body.style.overflow).toBe('hidden');
     wrapper.unmount();
   });
@@ -835,10 +918,11 @@ describe('AdminView · FDE 用户', () => {
       url === '/api/admin/users' && !init?.method ? jsonResponse(200, { items: [self] }) : undefined);
     expect(wrapper.find('[data-test="user-menu-button"]').exists()).toBe(false);
     await wrapper.get('[data-test="user-row"]').get('[data-test="edit-user"]').trigger('click');
-    expect(wrapper.find('[data-test="user-edit-modal"] [data-test="open-user-delete"]').exists()).toBe(false);
-    await wrapper.get('[data-test="user-edit-modal"] [aria-label="关闭"]').trigger('click');
-    await wrapper.get('[data-test="user-row"] [data-test="view-user"]').trigger('click');
-    expect(wrapper.get('[data-test="user-details-modal"]').text()).not.toContain('删除用户');
+    const editor = wrapper.get('[data-test="user-edit-modal"]');
+    await editor.get('[data-test="edit-tab-danger"]').trigger('click');
+    expect(editor.find('[data-test="open-user-delete"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="view-user"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
     wrapper.unmount();
   });
 

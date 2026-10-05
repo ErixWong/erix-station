@@ -19,9 +19,10 @@ const resumeEditAfterTotp = ref(false);
 const submitting = ref(false);
 const userForm = reactive({ login: '', display_name: '', password: '', fde_name: '', totpEnabled: false });
 
-const detailsUserId = ref<string | null>(null);
 const editUserId = ref<string | null>(null);
 const editModalOpen = ref(false);
+type EditTab = 'profile' | 'security' | 'llm' | 'danger';
+const editTab = ref<EditTab>('profile');
 const deleteUserId = ref<string | null>(null);
 const returnToEditAfterDelete = ref(false);
 const editForm = reactive({ display_name: '', role: 'fde' as AdminUser['role'], fde_name: '' });
@@ -41,9 +42,6 @@ const totpError = ref('');
 const totpMessage = ref('');
 const deleteError = ref('');
 
-const detailsUser = computed(() =>
-  admin.users.find((user) => user.id === detailsUserId.value) ?? null,
-);
 const editUser = computed(() =>
   admin.users.find((user) => user.id === editUserId.value) ?? null,
 );
@@ -131,6 +129,7 @@ function closeTotp() {
   copiedTotpValue.value = '';
   totpCopyError.value = '';
   if (resumeEditAfterTotp.value && editUserId.value) {
+    editTab.value = 'security';
     void nextTick(() => {
       editModalOpen.value = true;
     });
@@ -150,14 +149,6 @@ async function copyTotpValue(key: string, value: string) {
   } catch (error) {
     totpCopyError.value = t('admin.fde.copyFailed') + (error instanceof Error ? error.message : String(error));
   }
-}
-
-function openDetailsModal(user: AdminUser) {
-  detailsUserId.value = user.id;
-}
-
-function closeDetailsModal() {
-  detailsUserId.value = null;
 }
 
 function isCurrentUser(user: AdminUser): boolean {
@@ -196,6 +187,7 @@ function clearSectionFeedback() {
 function openEditModal(user: AdminUser) {
   clearFeedback(user.id);
   editUserId.value = user.id;
+  editTab.value = 'profile';
   editModalOpen.value = true;
   editForm.display_name = user.display_name ?? '';
   editForm.role = user.role;
@@ -207,6 +199,7 @@ function openEditModal(user: AdminUser) {
 function closeEditModal() {
   editModalOpen.value = false;
   editUserId.value = null;
+  editTab.value = 'profile';
 }
 
 function openDeleteModal(user: AdminUser) {
@@ -216,6 +209,7 @@ function openDeleteModal(user: AdminUser) {
   deleteError.value = '';
   returnToEditAfterDelete.value = editModalOpen.value && editUserId.value === user.id;
   if (returnToEditAfterDelete.value) {
+    editTab.value = 'danger';
     editModalOpen.value = false;
     void nextTick(() => {
       deleteUserId.value = user.id;
@@ -344,7 +338,6 @@ async function confirmUserDelete() {
     } else {
       delete rowErrors[user.id];
       delete rowMessages[user.id];
-      if (detailsUserId.value === user.id) closeDetailsModal();
       if (editUserId.value === user.id) closeEditModal();
       deleteUserId.value = null;
       returnToEditAfterDelete.value = false;
@@ -404,7 +397,7 @@ onBeforeUnmount(() => {
       >{{ t('common.retry') }}</button>
     </p>
 
-    <div data-test="user-list" class="overflow-hidden rounded-lg border border-black/10 bg-white">
+    <div data-test="user-list" class="rounded-lg border border-black/10 bg-white">
       <div
         v-if="!admin.usersLoaded && admin.usersLoading"
         data-test="user-skeleton"
@@ -435,13 +428,13 @@ onBeforeUnmount(() => {
       <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
             <col class="w-[13%]">
-            <col class="w-[16%]">
+            <col class="w-[18%]">
             <col class="w-[9%]">
-            <col class="w-[12%]">
+            <col class="w-[14%]">
             <col class="w-[7%]">
             <col class="w-[9%]">
-            <col class="w-[16%]">
             <col class="w-[18%]">
+            <col class="w-[12%]">
           </colgroup>
           <thead class="border-b border-black/10 bg-black/[0.025] text-xs text-black/55">
             <tr>
@@ -501,12 +494,6 @@ onBeforeUnmount(() => {
                     >{{ user.status === 'disabled' ? t('admin.fde.enableUser') : t('admin.fde.disableUser') }}</button>
                     <button
                       type="button"
-                      data-test="view-user"
-                      class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
-                      @click.stop="openDetailsModal(user)"
-                    >{{ t('admin.fde.viewAction') }}</button>
-                    <button
-                      type="button"
                       data-test="edit-user"
                       class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5"
                       @click.stop="openEditModal(user)"
@@ -525,40 +512,6 @@ onBeforeUnmount(() => {
         </table>
     </div>
   </section>
-
-  <ModalShell
-    v-if="detailsUser"
-    data-test="user-details-modal"
-    :label="detailsUser.login"
-    dialog-class="max-h-[90vh] overflow-y-auto md:w-[36rem]"
-    @close="closeDetailsModal"
-  >
-    <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
-      <div class="min-w-0">
-        <h2 class="truncate text-sm font-medium">{{ detailsUser.login }}</h2>
-        <p class="truncate text-xs text-black/55">{{ detailsUser.display_name || detailsUser.login }}</p>
-      </div>
-      <button
-        type="button"
-        :aria-label="t('common.close')"
-        class="ml-auto shrink-0 rounded-md px-2 py-1 text-sm hover:bg-black/5"
-        @click="closeDetailsModal"
-      >✕</button>
-    </header>
-    <section class="p-3">
-      <h3 class="mb-2 font-semibold">{{ t('admin.fde.llmSection') }}</h3>
-      <div class="rounded-lg border border-black/10 p-3">
-        <p v-if="!detailsUser.fde_name" class="muted">{{ t('admin.fde.noFdeNameHint') }}</p>
-        <UserLlmPane
-          v-else
-          :key="`${detailsUser.id}:${detailsUser.fde_name}`"
-          :user="detailsUser"
-          :providers="admin.providers"
-          :git-hosts="admin.gitHosts"
-        />
-      </div>
-    </section>
-  </ModalShell>
 
   <ModalShell v-if="showAddUser" :label="t('admin.fde.addUserTitle')" @close="closeAddUser">
     <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
@@ -692,10 +645,10 @@ onBeforeUnmount(() => {
     v-if="editModalOpen && editUser"
     data-test="user-edit-modal"
     :label="t('admin.fde.editUserTitle')"
-    dialog-class="max-h-[90vh] overflow-y-auto md:w-[36rem]"
+    dialog-class="flex max-h-[90vh] flex-col overflow-y-auto md:w-[40rem]"
     @close="closeEditModal"
   >
-    <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
+    <header class="flex shrink-0 items-center gap-3 border-b border-black/10 px-3 py-2">
       <div class="min-w-0">
         <h2 class="truncate text-sm font-medium">{{ t('admin.fde.editUserTitle') }}</h2>
         <p class="truncate text-xs text-black/55">{{ editUser.login }}</p>
@@ -707,8 +660,63 @@ onBeforeUnmount(() => {
         @click="closeEditModal"
       >✕</button>
     </header>
-    <div class="space-y-3 p-3">
-      <section class="rounded-lg border border-black/10 p-3">
+    <div role="tablist" class="flex shrink-0 flex-wrap gap-1 border-b border-black/10 px-3 py-2">
+      <button
+        id="edit-tab-profile"
+        type="button"
+        role="tab"
+        data-test="edit-tab-profile"
+        :aria-selected="editTab === 'profile'"
+        aria-controls="edit-panel-profile"
+        :class="editTab === 'profile' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="editTab = 'profile'"
+      >{{ t('admin.fde.editTabProfile') }}</button>
+      <button
+        id="edit-tab-security"
+        type="button"
+        role="tab"
+        data-test="edit-tab-security"
+        :aria-selected="editTab === 'security'"
+        aria-controls="edit-panel-security"
+        :class="editTab === 'security' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="editTab = 'security'"
+      >{{ t('admin.fde.editTabSecurity') }}</button>
+      <button
+        id="edit-tab-llm"
+        type="button"
+        role="tab"
+        data-test="edit-tab-llm"
+        :aria-selected="editTab === 'llm'"
+        aria-controls="edit-panel-llm"
+        :class="editTab === 'llm' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="editTab = 'llm'"
+      >{{ t('admin.fde.editTabLlm') }}</button>
+      <button
+        id="edit-tab-danger"
+        type="button"
+        role="tab"
+        data-test="edit-tab-danger"
+        :aria-selected="editTab === 'danger'"
+        aria-controls="edit-panel-danger"
+        :class="editTab === 'danger' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="editTab = 'danger'"
+      >{{ t('admin.fde.editTabDanger') }}</button>
+    </div>
+
+    <div class="min-h-0 flex-1 overflow-y-auto p-3">
+      <section
+        id="edit-panel-profile"
+        v-show="editTab === 'profile'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-profile"
+        aria-labelledby="edit-tab-profile"
+        class="rounded-lg border border-black/10 p-3"
+      >
         <h3 class="mb-2 font-semibold">{{ t('admin.fde.basicProfileSection') }}</h3>
         <form data-test="user-profile-form" class="grid gap-3" @submit.prevent="saveProfile">
           <label class="flex flex-col gap-1 text-xs text-black/55">
@@ -736,53 +744,92 @@ onBeforeUnmount(() => {
         </form>
       </section>
 
-      <section class="rounded-lg border border-black/10 p-3">
-        <h3 class="font-semibold">{{ t('admin.fde.resetPasswordTitle') }}</h3>
-        <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.resetPasswordHint') }}</p>
-        <form data-test="user-password-form" class="mt-3 grid gap-3" @submit.prevent="submitPasswordReset">
-          <label class="flex flex-col gap-1 text-xs text-black/55">
-            {{ t('admin.fde.newPassword') }}
-            <input v-model="resetPasswordValue" type="password" required autocomplete="new-password" class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black">
-          </label>
-          <p v-if="passwordError" class="syserr" role="alert">{{ passwordError }}</p>
-          <p v-if="passwordMessage" class="text-sm text-green-700" role="status">{{ passwordMessage }}</p>
-          <button
-            type="submit"
-            :disabled="passwordBusy"
-            class="justify-self-end rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
-          >{{ t('admin.fde.submitPasswordReset') }}</button>
-        </form>
+      <section
+        id="edit-panel-security"
+        v-show="editTab === 'security'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-security"
+        aria-labelledby="edit-tab-security"
+        class="space-y-3"
+      >
+        <section class="rounded-lg border border-black/10 p-3">
+          <h3 class="font-semibold">{{ t('admin.fde.resetPasswordTitle') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.resetPasswordHint') }}</p>
+          <form data-test="user-password-form" class="mt-3 grid gap-3" @submit.prevent="submitPasswordReset">
+            <label class="flex flex-col gap-1 text-xs text-black/55">
+              {{ t('admin.fde.newPassword') }}
+              <input v-model="resetPasswordValue" type="password" required autocomplete="new-password" class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black">
+            </label>
+            <p v-if="passwordError" class="syserr" role="alert">{{ passwordError }}</p>
+            <p v-if="passwordMessage" class="text-sm text-green-700" role="status">{{ passwordMessage }}</p>
+            <button
+              type="submit"
+              :disabled="passwordBusy"
+              class="justify-self-end rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
+            >{{ t('admin.fde.submitPasswordReset') }}</button>
+          </form>
+        </section>
+
+        <section class="rounded-lg border border-black/10 p-3">
+          <h3 class="font-semibold">{{ t('admin.fde.totpSection') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.totpSectionHint') }}</p>
+          <p class="mt-2 text-sm text-black/65">
+            {{ editUser.totp_enabled ? t('admin.fde.reenrollTotpHint') : t('admin.fde.enrollTotpHint') }}
+          </p>
+          <p v-if="editUser.totp_enabled" class="mt-2 text-sm text-black/65">{{ t('admin.fde.resetTotpHint') }}</p>
+          <p v-if="totpError" class="syserr mt-2" role="alert">{{ totpError }}</p>
+          <p v-if="totpMessage" class="mt-2 text-sm text-green-700" role="status">{{ totpMessage }}</p>
+          <div class="mt-3 flex flex-wrap justify-end gap-2">
+            <button
+              type="button"
+              data-test="confirm-totp-enroll"
+              :disabled="totpBusy"
+              class="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
+              @click="confirmTotpEnroll"
+            >{{ editUser.totp_enabled ? t('admin.fde.reenrollTotp') : t('admin.fde.enrollTotp') }}</button>
+            <button
+              v-if="editUser.totp_enabled"
+              type="button"
+              data-test="confirm-totp-reset"
+              :disabled="totpBusy"
+              class="rounded-md bg-red-700 px-3 py-1.5 text-sm text-white hover:bg-red-800 disabled:opacity-50"
+              @click="confirmTotpReset"
+            >{{ t('admin.fde.confirmTotpReset') }}</button>
+          </div>
+        </section>
       </section>
 
-      <section class="rounded-lg border border-black/10 p-3">
-        <h3 class="font-semibold">{{ t('admin.fde.totpSection') }}</h3>
-        <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.totpSectionHint') }}</p>
-        <p class="mt-2 text-sm text-black/65">
-          {{ editUser.totp_enabled ? t('admin.fde.reenrollTotpHint') : t('admin.fde.enrollTotpHint') }}
-        </p>
-        <p v-if="editUser.totp_enabled" class="mt-2 text-sm text-black/65">{{ t('admin.fde.resetTotpHint') }}</p>
-        <p v-if="totpError" class="syserr mt-2" role="alert">{{ totpError }}</p>
-        <p v-if="totpMessage" class="mt-2 text-sm text-green-700" role="status">{{ totpMessage }}</p>
-        <div class="mt-3 flex flex-wrap justify-end gap-2">
-          <button
-            type="button"
-            data-test="confirm-totp-enroll"
-            :disabled="totpBusy"
-            class="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
-            @click="confirmTotpEnroll"
-          >{{ editUser.totp_enabled ? t('admin.fde.reenrollTotp') : t('admin.fde.enrollTotp') }}</button>
-          <button
-            v-if="editUser.totp_enabled"
-            type="button"
-            data-test="confirm-totp-reset"
-            :disabled="totpBusy"
-            class="rounded-md bg-red-700 px-3 py-1.5 text-sm text-white hover:bg-red-800 disabled:opacity-50"
-            @click="confirmTotpReset"
-          >{{ t('admin.fde.confirmTotpReset') }}</button>
+      <section
+        id="edit-panel-llm"
+        v-show="editTab === 'llm'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-llm"
+        aria-labelledby="edit-tab-llm"
+      >
+        <h3 class="mb-2 font-semibold">{{ t('admin.fde.llmSection') }}</h3>
+        <div class="rounded-lg border border-black/10 p-3">
+          <p v-if="!editUser.fde_name" class="muted">{{ t('admin.fde.noFdeNameHint') }}</p>
+          <UserLlmPane
+            v-else
+            :key="`${editUser.id}:${editUser.fde_name}`"
+            :user="editUser"
+            :providers="admin.providers"
+            :git-hosts="admin.gitHosts"
+          />
         </div>
       </section>
 
-      <section class="rounded-lg border border-red-200 bg-red-50/50 p-3">
+      <section
+        id="edit-panel-danger"
+        v-show="editTab === 'danger'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-danger"
+        aria-labelledby="edit-tab-danger"
+        class="rounded-lg border border-red-200 bg-red-50/50 p-3"
+      >
         <h3 class="mb-2 font-semibold text-red-800">{{ t('admin.fde.dangerSection') }}</h3>
         <button
           v-if="!isCurrentUser(editUser)"
