@@ -9,12 +9,14 @@ import { assertSafePath, atomicWriteFile, ensureDirSafe } from './fsutil.js';
 // gh: https://github.com/cli/cli/blob/v2.102.0/internal/config/config.go
 //     https://github.com/cli/cli/blob/v2.102.0/internal/config/migration/multi_account.go
 // glab: https://gitlab.com/gitlab-org/cli/-/blob/v1.121.0/internal/config/schema.go
+// Issue #148: glab 1.121.0 hard-rejects config.yml unless it is exactly 0600.
+// Agent shells run as workerUid with HOME=/home/erix (runner/agentd.js childEnv),
+// so glab's config must be worker-owned; tea and gh remain FDE-owned/group-readable.
 const CLI_CONFIGS = Object.freeze({
-  gitea: ['.config', 'tea', 'config.yml'],
-  github: ['.config', 'gh', 'hosts.yml'],
-  gitlab: ['.config', 'glab-cli', 'config.yml'],
+  gitea: { path: ['.config', 'tea', 'config.yml'], mode: 0o640, owner: 'fde' },
+  github: { path: ['.config', 'gh', 'hosts.yml'], mode: 0o640, owner: 'fde' },
+  gitlab: { path: ['.config', 'glab-cli', 'config.yml'], mode: 0o600, owner: 'worker' },
 });
-const FILE_MODE = 0o640;
 const DIR_MODE = 0o750;
 
 function isMap(value) {
@@ -45,8 +47,7 @@ function yamlError() {
 
 function getConfigPath(root, homeDir, provider) {
   if (!Object.hasOwn(CLI_CONFIGS, provider)) return null;
-  const parts = CLI_CONFIGS[provider];
-  const target = path.join(homeDir, ...parts);
+  const target = path.join(homeDir, ...CLI_CONFIGS[provider].path);
   try {
     assertSafePath(root, target);
     const rootReal = fs.realpathSync(root);
@@ -104,16 +105,19 @@ function readYamlDocument(target) {
   }
 }
 
-function writeYamlDocument(target, document, { root, config }) {
+function writeYamlDocument(target, document, { root, config, provider }) {
   let contents;
   try {
     contents = stringify(document, { lineWidth: 0 });
   } catch {
     throw yamlError();
   }
+  const configFile = CLI_CONFIGS[provider];
   atomicWriteFile(target, contents, {
-    mode: FILE_MODE,
-    uid: config.fdeUid ?? 1000,
+    mode: configFile.mode,
+    uid: configFile.owner === 'worker'
+      ? config.workerUid ?? 1002
+      : config.fdeUid ?? 1000,
     gid: config.fdeGid ?? 1000,
     root,
   });
@@ -213,7 +217,7 @@ export function upsertGitCliConfig({ root, homeDir, config, provider, host, user
   ensureConfigDirectories(root, homeDir, target, config);
   const { document } = readYamlDocument(target);
   handler.upsert(document, host, username, token, protocol);
-  writeYamlDocument(target, document, { root, config });
+  writeYamlDocument(target, document, { root, config, provider });
 }
 
 export function deleteGitCliConfig({ root, homeDir, config, provider, host }) {
@@ -222,7 +226,7 @@ export function deleteGitCliConfig({ root, homeDir, config, provider, host }) {
   const target = getConfigPath(root, homeDir, provider);
   const { exists, document } = readYamlDocument(target);
   if (!exists || !handler.remove(document, host)) return;
-  writeYamlDocument(target, document, { root, config });
+  writeYamlDocument(target, document, { root, config, provider });
 }
 
 function unlinkConfigFile(root, homeDir, provider) {
