@@ -12,6 +12,7 @@ import {
 
 const UID = 1000;
 const GID = 1000;
+const WORKER_UID = 1002;
 const CONFIG_PATHS = {
   gitea: ['.config', 'tea', 'config.yml'],
   github: ['.config', 'gh', 'hosts.yml'],
@@ -26,7 +27,7 @@ function fixture(t) {
   return {
     root,
     homeDir,
-    config: { userSpaceRoot: root, fdeUid: UID, fdeGid: GID },
+    config: { userSpaceRoot: root, fdeUid: UID, fdeGid: GID, workerUid: WORKER_UID },
   };
 }
 
@@ -46,10 +47,31 @@ function cliPath(homeDir, provider) {
   return path.join(homeDir, ...CONFIG_PATHS[provider]);
 }
 
-function assertFdeFile(filePath) {
+function captureWorkerChown(t) {
+  const requests = [];
+  // Rootless test hosts cannot chown to the worker UID; capture the requested owner instead.
+  if (process.getuid() !== 0 && (process.getuid() !== WORKER_UID || process.getgid() !== GID)) {
+    const fchownSync = fs.fchownSync;
+    t.mock.method(fs, 'fchownSync', (fd, uid, gid) => {
+      if (uid === WORKER_UID && gid === GID) {
+        requests.push({ uid, gid });
+        return;
+      }
+      return fchownSync(fd, uid, gid);
+    });
+  }
+  return requests;
+}
+
+function assertCliFile(filePath, provider, workerChownRequests = []) {
   const stat = fs.statSync(filePath);
-  assert.equal(stat.mode & 0o777, 0o640);
-  assert.equal(stat.uid, UID);
+  assert.equal(stat.mode & 0o777, provider === 'gitlab' ? 0o600 : 0o640);
+  if (provider === 'gitlab' && workerChownRequests.length > 0) {
+    assert.ok(workerChownRequests.some(({ uid, gid }) => uid === WORKER_UID && gid === GID));
+    assert.equal(stat.uid, process.getuid());
+  } else {
+    assert.equal(stat.uid, provider === 'gitlab' ? WORKER_UID : UID);
+  }
   assert.equal(stat.gid, GID);
 }
 
@@ -85,6 +107,7 @@ function hostConfig(provider, host, username, token) {
 
 test('set writes escaped provider-specific YAML with FDE ownership and permissions', async (t) => {
   const f = fixture(t);
+  const workerChownRequests = captureWorkerChown(t);
   const hosts = [
     { base_url: 'https://gitea.example.test', provider: 'gitea' },
     { base_url: 'https://github.example.test', provider: 'github' },
@@ -103,7 +126,7 @@ test('set writes escaped provider-specific YAML with FDE ownership and permissio
     const file = cliPath(f.homeDir, provider);
     assert.ok(fs.existsSync(file), `${provider} config is written to its documented location`);
     assert.deepEqual(parse(fs.readFileSync(file, 'utf8')), hostConfig(provider, host, username, token));
-    assertFdeFile(file);
+    assertCliFile(file, provider, workerChownRequests);
     assertFdeDirectory(path.join(f.homeDir, '.config'));
     assertFdeDirectory(path.dirname(file));
   }
@@ -114,6 +137,7 @@ test('set writes escaped provider-specific YAML with FDE ownership and permissio
 
 test('set upserts each provider host on rotation and delete removes only that host', async (t) => {
   const f = fixture(t);
+  const workerChownRequests = captureWorkerChown(t);
   const hosts = [
     { provider: 'gitea', first: 'gitea-one.example.test', second: 'gitea-two.example.test' },
     { provider: 'github', first: 'github-one.example.test', second: 'github-two.example.test' },
@@ -133,6 +157,7 @@ test('set upserts each provider host on rotation and delete removes only that ho
 
     const provider = hosts.find((entry) => entry.first === first).provider;
     const file = cliPath(f.homeDir, provider);
+    assertCliFile(file, provider, workerChownRequests);
     const document = parse(fs.readFileSync(file, 'utf8'));
     if (provider === 'gitea') {
       assert.equal(document.logins.length, 2);
@@ -149,6 +174,7 @@ test('set upserts each provider host on rotation and delete removes only that ho
     }
 
     assert.deepEqual(await deleteGitCredential({ ...common, host: first }), { host: first, deleted: true });
+    assertCliFile(file, provider, workerChownRequests);
     const afterDelete = parse(fs.readFileSync(file, 'utf8'));
     if (provider === 'gitea') {
       assert.deepEqual(afterDelete.logins.map((login) => login.url), [`https://${second}`]);
@@ -200,6 +226,7 @@ test('symlinked CLI config directories are rejected without writing outside the 
 
 test('offboarding removes all CLI configs, including when git credentials are already absent', async (t) => {
   const f = fixture(t);
+  captureWorkerChown(t);
   const hosts = [
     { base_url: 'https://gitea.example.test', provider: 'gitea' },
     { base_url: 'https://github.example.test', provider: 'github' },

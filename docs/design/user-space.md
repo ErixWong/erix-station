@@ -145,9 +145,9 @@
 | `/home/<user>/.git-credentials` | FDE 经 portal 自助凭据端点 write-through 写入宿主 bind mount；Git 的 `credential.helper=store` 供 agent/worker 读取 | FDE UID:GID（默认 `1000:1000`），`0640`（owner 与同组 worker 可读） | **不写入 manifest，不进入 materializer 对账覆盖集**；stale 清理不得删除。offboarding 删除该文件。 |
 | `/home/<user>/.config/tea/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitea` upsert；tea CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
 | `/home/<user>/.config/gh/hosts.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=github` upsert；gh CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
-| `/home/<user>/.config/glab-cli/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitlab` upsert；glab CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
+| `/home/<user>/.config/glab-cli/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitlab` upsert；glab CLI 读取 | worker UID（默认 `1002`），`0600`；父目录保持 FDE UID:GID（默认 `1000:1000`）、`0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
 
-> **兼容性限制（2026-10-06 实测）**：glab 1.121.0 的 `HasSecurePerms` 只接受 `0600`，会拒绝本契约要求的 `0640`，因此当前 glab 不能读取 portal 投放的配置。此实现遵循已裁决的 `0640` 文件权限，不擅自改成 `0600`；需要另行裁决权限契约或 glab 的凭据接入方式。
+> **glab 特例（issue #148；2026-10-06 实测并裁决）**：glab 1.121.0 硬性要求配置文件恰为 `0600`。agent shell 以 worker UID（默认 `1002`）运行且 `HOME=/home/erix`（`runner/agentd.js` 的 `childEnv`），因此配置文件属主必须是 worker；FDE 的 `erix` 用户（UID `1000`）不能读取该配置，此代价已接受。父目录仍为 `erix:erix`、`0750`，其余 CLI 凭据配置仍为 FDE 所有、`0640`。
 
 Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 的 HOME，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
 
