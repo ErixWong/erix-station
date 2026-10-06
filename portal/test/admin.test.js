@@ -22,6 +22,24 @@ const FDE_USER = {
 };
 const ADMIN_TOKEN = 'tok-admin-b2-test';
 const TEST_GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
+const TEST_LLM = { provider_id: 'mock-provider', main_model_id: 'mock-main' };
+
+function createTestLlmGateway() {
+  return {
+    async listCredentials() {
+      return { credentials: [{ credential_name: 'mock-provider', credential_info: { credential_name: 'mock-provider' } }] };
+    },
+    async listModels() {
+      return {
+        data: [{
+          model_name: 'mock-chat',
+          litellm_params: { litellm_credential_name: 'mock-provider' },
+          model_info: { id: 'mock-main', type: 'text', tool_calling: true },
+        }],
+      };
+    },
+  };
+}
 
 /** admin 测试 pool：FakePool（会话/audit）+ users CRUD / active run / llm echo 的最小模拟。 */
 class AdminPool extends FakePool {
@@ -250,7 +268,7 @@ class AdminPool extends FakePool {
   }
 }
 
-async function startAdminServer({ seed = {}, docker = null } = {}) {
+async function startAdminServer({ seed = {}, docker = null, llmGateway = createTestLlmGateway() } = {}) {
   // P4：旧 index.html/admin.html 静态页已退役（serveStatic 只服务注入的 app/），fixture 不再写文件。
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-admin-static-'));
   const config = {
@@ -270,7 +288,9 @@ async function startAdminServer({ seed = {}, docker = null } = {}) {
     staticDir,
   };
   const pool = new AdminPool(seed);
-  const server = createServer({ pool, config, docker, log: { error: () => {}, warn: () => {}, log: () => {} } });
+  const server = createServer({
+    pool, config, docker, llmGateway, log: { error: () => {}, warn: () => {}, log: () => {} },
+  });
   await new Promise((res) => server.listen(0, '127.0.0.1', res));
   const base = `http://127.0.0.1:${server.address().port}`;
   const cookie = `${config.cookie.name}=${ADMIN_TOKEN}`;
@@ -288,7 +308,7 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
       method: 'POST', headers: H,
       body: JSON.stringify({
         login: 'bob', display_name: 'Bob', password: 'secret-pass-1',
-        email: 'bob@example.test', fde_name: 'bob', git_host_id: TEST_GIT_HOST_ID,
+        email: 'bob@example.test', fde_name: 'bob', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
       }),
     });
     assert.equal(res.status, 201);
@@ -297,7 +317,9 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
     assert.equal(body.user.role, 'fde');
     assert.equal(body.user.fde_name, 'bob');
     assert.equal(body.user.status, 'active');
-    assert.deepEqual(body.onboarding, { state: 'pending', step: 'provision', error: null });
+    assert.deepEqual(body.onboarding, {
+      state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
+    });
     assert.equal(pool.gitAccounts.find((row) => row.fde_id === body.user.id)?.git_host_id, TEST_GIT_HOST_ID);
     assert.equal(body.user.totp_enabled, false);
     assert.equal(pool.users.find((u) => u.login === 'bob').totp_secret, null, '未启用时 DB totp_secret 为 NULL');
@@ -326,7 +348,9 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
     assert.ok(!raw.includes('password_hash'), '列表响应无口令哈希键');
     assert.ok(!raw.includes('secret-pass-1'), '任何响应不含明文口令');
     assert.ok(!raw.includes('bob@example.test'), '用户列表不返回 email');
-    assert.deepEqual(bob.onboarding, { state: 'pending', step: 'provision', error: null });
+    assert.deepEqual(bob.onboarding, {
+      state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
+    });
     assert.equal(pool.users.find((u) => u.login === 'bob').password_hash.startsWith('scrypt$'), true, 'DB 侧 scrypt 哈希（bootstrap-admin 同口径）');
   } finally {
     await close();
@@ -341,7 +365,7 @@ test('admin 用户管理：显式启用 TOTP 时一次性下发种子与 URI，�
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({
         login: 'totp-bob', password: 'secret-pass-1', email: 'totp-bob@example.test',
-        fde_name: 'totp-bob', git_host_id: TEST_GIT_HOST_ID, totp_enabled: true,
+        fde_name: 'totp-bob', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM, totp_enabled: true,
       }),
     });
     assert.equal(res.status, 201);
@@ -365,7 +389,7 @@ test('admin 用户管理：email / fde_name 必填校验与重复 login、email 
   const { base, cookie, pool, close } = await startAdminServer();
   try {
     const H = { cookie, 'content-type': 'application/json' };
-    const fields = { email: 'carol@example.test', git_host_id: TEST_GIT_HOST_ID };
+    const fields = { email: 'carol@example.test', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM };
     // 重复 login
     let res = await fetch(`${base}/api/admin/users`, {
       method: 'POST', headers: H,
@@ -376,7 +400,7 @@ test('admin 用户管理：email / fde_name 必填校验与重复 login、email 
     // 缺 password
     res = await fetch(`${base}/api/admin/users`, {
       method: 'POST', headers: H,
-      body: JSON.stringify({ login: 'carol', password: 'whatever-1', fde_name: 'carol', git_host_id: TEST_GIT_HOST_ID }),
+      body: JSON.stringify({ login: 'carol', password: 'whatever-1', fde_name: 'carol', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM }),
     });
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error.details.field, 'email');
@@ -433,7 +457,7 @@ test('admin 用户管理：email / fde_name 必填校验与重复 login、email 
     res = await fetch(`${base}/api/admin/users`, {
       method: 'POST', headers: H,
       body: JSON.stringify({
-        email: 'race@example.test', git_host_id: TEST_GIT_HOST_ID,
+        email: 'race@example.test', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
         login: 'email-race', password: 'whatever-1', fde_name: 'email-race',
       }),
     });

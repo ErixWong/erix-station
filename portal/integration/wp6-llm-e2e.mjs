@@ -214,6 +214,7 @@ const S = {
   password: 'correct horse battery staple',
   adminCookie: null,
   gitHostId: null,
+  onboardingLlm: null,
   users: {},
 };
 
@@ -276,6 +277,7 @@ function bootstrapAdmin(loginName) {
 }
 
 async function createFdeUser(loginName) {
+  assert.ok(S.onboardingLlm, 'onboarding LiteLLM model is configured before account creation');
   const response = await adminApi('/api/admin/users', {
     method: 'POST',
     body: JSON.stringify({
@@ -285,11 +287,17 @@ async function createFdeUser(loginName) {
       email: `${loginName}@station.invalid`,
       fde_name: FDE_NAMES[loginName],
       git_host_id: S.gitHostId,
+      llm: {
+        provider_id: S.onboardingLlm.providerId,
+        main_model_id: S.onboardingLlm.modelId,
+      },
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
   assert.ok(response.body.totp_secret, 'totp_secret is returned once');
-  assert.deepEqual(response.body.onboarding, { state: 'pending', step: 'provision', error: null });
+  assert.deepEqual(response.body.onboarding, {
+    state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
+  });
   const onboarding = await waitFor(async () => {
     const list = await adminApi('/api/admin/users');
     return list.body.items?.find((user) => user.login === loginName)?.onboarding?.state === 'awaiting_credential'
@@ -399,6 +407,21 @@ async function createMockModel(providerId, modelName, responseText) {
   return model;
 }
 
+async function createOnboardingMockModel() {
+  const providerName = `e2e-onboarding-${process.env.STATION_STACK_ID}`;
+  const created = await adminApi('/api/admin/llm/providers', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: providerName,
+      credential_info: { credential_name: providerName, description: 'WP6 onboarding mock' },
+      credential_values: { api_base: 'http://mock.invalid' },
+    }),
+  });
+  assert.equal(created.status, 201, `create onboarding LiteLLM credential: ${JSON.stringify(created.body)}`);
+  const model = await createMockModel(created.body.provider.id, 'e2e-onboarding-model', 'E2E-ONBOARDING-OK');
+  S.onboardingLlm = { providerId: created.body.provider.id, modelId: model.id };
+}
+
 test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and binding lifecycle', {
   timeout: 20 * 60 * 1000,
 }, async (t) => {
@@ -497,12 +520,20 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     });
     assert.equal(gitHost.status, 201, `create Git host: ${JSON.stringify(gitHost.body)}`);
     S.gitHostId = gitHost.body.host.id;
+    await createOnboardingMockModel();
     for (const alias of ['alice', 'bob']) {
       const secret = await createFdeUser(alias);
       S.users[alias] = {
         cookie: await login(alias, secret),
         fdeName: FDE_NAMES[alias],
       };
+    }
+    for (const alias of ['alice', 'bob']) {
+      assert.equal(
+        psql(`SELECT provider_id || '|' || main_model_id || '|' || state FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES[alias]}'`),
+        `${S.onboardingLlm.providerId}|${S.onboardingLlm.modelId}|active`,
+        `${alias} received the model selected in the creation form`,
+      );
     }
     await restartPortalAndWaitForConfigs([FDE_NAMES.alice, FDE_NAMES.bob]);
     for (const alias of ['alice', 'bob']) {
@@ -658,24 +689,20 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
       'deprovision revokes the LiteLLM binding',
     );
 
-    // An FDE without a binding has no LLM router; message creation fails fast before queuing a run.
+    // The second new account has a binding from its creation form and can start a first conversation.
     await createSession('bob');
-    const unboundMessage = await api(S.users.bob.cookie, `/api/sessions/${S.users.bob.sessionId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ content: 'WP6 no-binding FDE must fail fast' }),
-    });
-    assert.equal(unboundMessage.status, 409, 'an FDE without an LLM binding cannot queue a run');
-    assert.equal(unboundMessage.body.error.code, 'llm_not_configured');
+    const firstBobRun = await sendMessageAndWait('bob', 'WP6 onboarding-selected model should reply normally');
+    assert.equal(firstBobRun.status, 'finished', 'the onboarding-selected mock model supports the first conversation');
     assert.equal(
-      psql(`SELECT count(*) FROM runs WHERE session_id='${S.users.bob.sessionId}'`),
-      '0',
-      'unbound FDE rejection does not create a run',
+      psql(`SELECT count(*) FROM messages WHERE run_id='${firstBobRun.runId}' AND role='assistant' AND content LIKE '%E2E-ONBOARDING-OK%'`),
+      '1',
+      'first conversation uses the model selected at account creation',
     );
     assert.equal(docker(`inspect ${fdeContainer('bob')} --format {{.State.Status}}`).trim(), 'running',
-      'unbound FDE container remains running');
-    assert.ok(!readLlmRoutes().includes(`llm-${FDE_NAMES.bob}`), 'no route is published for an unbound FDE');
+      'FDE container remains running after the first conversation');
+    assert.ok(readLlmRoutes().includes(`llm-${FDE_NAMES.bob}`), 'onboarding publishes the FDE LLM route');
 
-    console.log('[wp6] ✅ LiteLLM model allow-list, per-FDE key injection, mask, key stability, and deprovision checks passed');
+    console.log('[wp6] ✅ onboarding model selection, LiteLLM key injection, allow-list, key stability, and deprovision checks passed');
   } catch (error) {
     try {
       console.log('\n[wp6] --- portal logs ---');

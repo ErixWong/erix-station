@@ -12,8 +12,28 @@ import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
 
 const TEST_GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
+const TEST_LLM = { provider_id: 'mock-provider', main_model_id: 'mock-main' };
 
-async function startServer({ users = [], overrides = {}, pool: customPool } = {}) {
+function createTestLlmGateway({ unavailable = false } = {}) {
+  return {
+    async listCredentials() {
+      if (unavailable) throw new Error('catalog secret must not be returned');
+      return { credentials: [{ credential_name: 'mock-provider', credential_info: { credential_name: 'mock-provider' } }] };
+    },
+    async listModels() {
+      if (unavailable) throw new Error('catalog secret must not be returned');
+      return {
+        data: [{
+          model_name: 'mock-chat',
+          litellm_params: { litellm_credential_name: 'mock-provider' },
+          model_info: { id: 'mock-main', type: 'text', tool_calling: true },
+        }],
+      };
+    },
+  };
+}
+
+async function startServer({ users = [], overrides = {}, pool: customPool, llmGateway = createTestLlmGateway() } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   // issue #61 P2：Vue SPA dist 由 Docker 注入 staticDir/app/（见 portal/Dockerfile），/ 翻转后服务它。
@@ -43,7 +63,7 @@ async function startServer({ users = [], overrides = {}, pool: customPool } = {}
     ...overrides,
   };
   const pool = customPool || new FakePool({ users });
-  const server = createServer({ pool, config });
+  const server = createServer({ pool, config, llmGateway });
   await new Promise((res) => server.listen(0, '127.0.0.1', res));
   const base = `http://127.0.0.1:${server.address().port}`;
   return {
@@ -155,15 +175,22 @@ test('admin 创建用户路由：仅布尔 true 启用 TOTP，其它值关闭', 
       method: 'POST', headers,
       body: JSON.stringify({
         login: 'totp-user', password: 'secret-pass-1', email: 'totp-user@example.test',
-        fde_name: 'totp-user', git_host_id: TEST_GIT_HOST_ID, totp_enabled: true,
+        fde_name: 'totp-user', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM, totp_enabled: true,
       }),
     });
     assert.equal(enabled.status, 201);
     const enabledBody = await enabled.json();
     assert.equal(enabledBody.user.totp_enabled, true);
-    assert.deepEqual(enabledBody.onboarding, { state: 'pending', step: 'provision', error: null });
+    assert.deepEqual(enabledBody.onboarding, {
+      state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
+    });
     assert.deepEqual(pool.onboardings[0].steps, {
-      provision: { state: 'pending' }, materialize: { state: 'pending' },
+      provision: { state: 'pending' },
+      materialize: { state: 'pending' },
+      'llm-binding': {
+        state: 'pending',
+        models: { ...TEST_LLM, embedding_model_id: null, vision_model_id: null },
+      },
     });
     assert.notEqual(pool.createdTotpSecrets[0], null, 'boolean true 经路由透传并创建种子');
     assert.equal(typeof enabledBody.totp_uri, 'string');
@@ -172,7 +199,7 @@ test('admin 创建用户路由：仅布尔 true 启用 TOTP，其它值关闭', 
       method: 'POST', headers,
       body: JSON.stringify({
         login: 'password-only', password: 'secret-pass-1', email: 'password-only@example.test',
-        fde_name: 'password-only', git_host_id: TEST_GIT_HOST_ID, totp_enabled: 'true',
+        fde_name: 'password-only', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM, totp_enabled: 'true',
       }),
     });
     assert.equal(invalid.status, 201);
@@ -182,6 +209,82 @@ test('admin 创建用户路由：仅布尔 true 启用 TOTP，其它值关闭', 
     assert.ok(!Object.hasOwn(invalidBody, 'totp_secret') && !Object.hasOwn(invalidBody, 'totp_uri'));
   } finally {
     await s.close();
+  }
+});
+
+test('admin 创建用户路由：LLM provider 和模型必填且必须存在于 LiteLLM 目录；目录不可达时 fail-closed', async () => {
+  const admin = {
+    id: 'a0000000-0000-4000-8000-000000000001', login: 'admin', display_name: 'Admin',
+    role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
+  };
+  const pool = new AdminCreateHttpPool({ users: [admin] });
+  pool.sessions.push({
+    id: 'admin-create-session', user_id: admin.id, token_hash: auth.hashToken('admin-create-token'),
+    created_at: new Date(), expires_at: new Date(Date.now() + 3_600_000), last_seen_at: new Date(), revoked_at: null,
+  });
+  const s = await startServer({ pool });
+  const headers = { 'content-type': 'application/json', cookie: 'fde_session_dev=admin-create-token' };
+  const post = (body) => fetch(`${s.base}/api/admin/users`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      login: 'no-llm-user', password: 'secret-pass-1', email: 'no-llm-user@example.test',
+      fde_name: 'no-llm-user', git_host_id: TEST_GIT_HOST_ID, ...body,
+    }),
+  });
+  try {
+    let response = await post({});
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'llm.provider_id');
+
+    response = await post({ llm: null });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'llm');
+
+    response = await post({ llm: { provider_id: 'mock-provider', main_model_id: '   ' } });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'llm.main_model_id');
+
+    response = await post({ llm: { provider_id: 'mock-provider', main_model_id: '' } });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'llm.main_model_id');
+
+    response = await post({ llm: { provider_id: 'missing-provider', main_model_id: 'mock-main' } });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'llm.provider_id');
+
+    response = await post({ llm: { provider_id: 'mock-provider', main_model_id: 'missing-model' } });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.details.field, 'llm.main_model_id');
+    assert.equal(pool.users.length, 1, 'invalid selections never create the user');
+  } finally {
+    await s.close();
+  }
+
+  const unavailablePool = new AdminCreateHttpPool({ users: [admin] });
+  unavailablePool.sessions.push({
+    id: 'admin-create-session', user_id: admin.id, token_hash: auth.hashToken('admin-create-token'),
+    created_at: new Date(), expires_at: new Date(Date.now() + 3_600_000), last_seen_at: new Date(), revoked_at: null,
+  });
+  const unavailable = await startServer({
+    pool: unavailablePool,
+    llmGateway: createTestLlmGateway({ unavailable: true }),
+  });
+  try {
+    const response = await fetch(`${unavailable.base}/api/admin/users`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        login: 'unavailable-user', password: 'secret-pass-1', email: 'unavailable@example.test',
+        fde_name: 'unavailable-user', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.equal(body.error.code, 'llm_catalog_unavailable');
+    assert.match(body.error.message, /enable or repair|启用或修复/i);
+    assert.ok(!JSON.stringify(body).includes('catalog secret'));
+    assert.equal(unavailablePool.users.length, 1, 'catalog failure never creates the user');
+  } finally {
+    await unavailable.close();
   }
 });
 
@@ -202,7 +305,7 @@ test('admin 建用户路由：缺少开户必填字段返回 400', async () => {
       headers: { 'content-type': 'application/json', cookie: 'fde_session_dev=admin-create-token' },
       body: JSON.stringify({
         login: 'missing-email', password: 'secret-pass-1', fde_name: 'missing-email',
-        git_host_id: TEST_GIT_HOST_ID,
+        git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
       }),
     });
     assert.equal(response.status, 400);
@@ -230,7 +333,7 @@ test('admin 建用户路由：拒绝停用或 Azure Git host 且不插入用户'
       headers: { 'content-type': 'application/json', cookie: 'fde_session_dev=admin-create-token' },
       body: JSON.stringify({
         login: 'not-created', password: 'secret-pass-1', email: 'not-created@example.test',
-        fde_name: 'not-created', git_host_id: TEST_GIT_HOST_ID,
+        fde_name: 'not-created', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
       }),
     });
     pool.gitHosts[0].enabled = false;

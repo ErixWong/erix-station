@@ -901,16 +901,18 @@ test('issue #117：无 LLM binding 的 FDE deprovision skips the update/outbox a
   assert.ok(seq.includes('sql:revoke-token') && seq.includes('docker:rm'), 'token 吊销与 Docker 清理照常');
 });
 
-test('issue #38 Phase B1：onboard 复用分支恢复 LLM / 全新不复活（源码契约锚点）+ deprovision 吊销在事务块内', async () => {
+test('issue #38 Phase B1：provision 按容器复用状态同步 LLM + deprovision 吊销在事务块内', async () => {
   const src = await import('node:fs').then((fs) => fs.promises.readFile(
     new URL('../src/provisioner.js', import.meta.url), 'utf8'));
-  // onboardFde：LLM 联动必须挂在容器就绪之后，且 restoreRevoked 与复用判定（needRecreate）绑定——
-  // 复用（false）→ 复活 revoked；全新（true）→ 只幂等 upsert active，不复活 revoked。
+  // onboardFde：LLM 联动必须挂在容器就绪之后，且 restoreRevoked 与复用判定（needRecreate）绑定。
   // F1（Round B 评审）：参数名必须叫 fdeId 且值必须是该 FDE 的 id（userId = users.id =
   // fde_llm_bindings.fde_id）——传 userId 键会被 llm.js 的解构静默丢弃 → fde_id=NULL → 无行命中，
   // 恢复/重发布静默 no-op（曾因此复用容器时 revoked binding 不恢复）。
   const onboardCall = 'syncFdeLlmBindingOnOnboard(pool, { fdeId: userId, fdeName, restoreRevoked: !needRecreate })';
   assert.ok(src.includes(onboardCall), `onboardFde 必须调用 LLM 恢复联动且参数名为 fdeId：${onboardCall}`);
+  assert.ok(!src.includes('skipLlmSync'), 'onboardFde 不得跳过 LLM sync：容器重建时 active route 必须重新发布');
+  assert.ok(src.indexOf(onboardCall) > src.indexOf('const res = await ensureFdeContainer('),
+    'LLM 路由发布必须等容器与 FDE 网络就绪');
   // 跨模块契约锚点：llm.js 侧按 { fdeId, ... } 解构——两侧参数名漂移会被此断言拦截。
   const llmSrc = await import('node:fs').then((fs) => fs.promises.readFile(
     new URL('../src/llm.js', import.meta.url), 'utf8'));

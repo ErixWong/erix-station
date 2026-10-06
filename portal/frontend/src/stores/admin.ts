@@ -46,6 +46,10 @@ export interface AdminUser {
     state: 'pending' | 'running' | 'awaiting_credential' | 'done' | 'failed';
     step?: string | null;
     error?: string | null;
+    llm_binding?: {
+      state: 'pending' | 'running' | 'done' | 'failed';
+      error?: string | null;
+    };
   } | null;
 }
 
@@ -460,6 +464,12 @@ export const useAdminStore = defineStore('admin', {
       email: string;
       fde_name: string;
       git_host_id: string;
+      llm: {
+        provider_id: string;
+        main_model_id: string;
+        embedding_model_id?: string | null;
+        vision_model_id?: string | null;
+      };
       totpEnabled?: boolean;
     }): Promise<string | null> {
       this.fdeErr = null;
@@ -471,6 +481,7 @@ export const useAdminStore = defineStore('admin', {
           email: fields.email,
           fde_name: fields.fde_name,
           git_host_id: fields.git_host_id,
+          llm: fields.llm,
           totp_enabled: fields.totpEnabled === true,
         };
         const r = await api<TotpProvisionResponse>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });

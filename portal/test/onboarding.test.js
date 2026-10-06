@@ -9,13 +9,23 @@ import {
 
 const FDE_ID = 'b0000000-0000-4000-8000-000000000002';
 const GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
+const LLM_SELECTION = {
+  provider_id: 'mock-provider',
+  main_model_id: 'mock-main',
+  embedding_model_id: null,
+  vision_model_id: null,
+};
 
 class OnboardingPool {
   constructor({ state = 'pending', steps, userStatus = 'active' } = {}) {
     this.onboarding = {
       fde_id: FDE_ID,
       state,
-      steps: steps ?? { provision: { state: 'pending' }, materialize: { state: 'pending' } },
+      steps: steps ?? {
+        provision: { state: 'pending' },
+        materialize: { state: 'pending' },
+        'llm-binding': { state: 'pending', models: structuredClone(LLM_SELECTION) },
+      },
       last_error: null,
       attempt: 0,
     };
@@ -127,11 +137,12 @@ class OnboardingPool {
   }
 }
 
-function workflow(pool, { provision, materialize, log = { warn() {} } } = {}) {
+function workflow(pool, { provision, materialize, bindLlm, log = { warn() {} } } = {}) {
   return runOnboardingOnce(pool, {}, {
     docker: {},
     log,
     provision: provision ?? (async () => {}),
+    bindLlm: bindLlm ?? (async () => {}),
     materialize: materialize ?? (async (targetPool) => {
       targetPool.outbox.at(-1).state = 'published';
     }),
@@ -143,14 +154,18 @@ test('enqueueOnboarding 幂等写入待办步骤并更新 Git host 映射', asyn
   pool.onboarding.attempt = 3;
   pool.gitAccount.remote_login = 'old-login';
   pool.gitAccount.token_ref = 'old-token-ref';
-  await enqueueOnboarding(pool, { fdeId: FDE_ID, gitHostId: GIT_HOST_ID });
+  await enqueueOnboarding(pool, { fdeId: FDE_ID, gitHostId: GIT_HOST_ID, llm: LLM_SELECTION });
   assert.equal(pool.gitAccount.remote_login, 'old-login');
   assert.equal(pool.gitAccount.token_ref, 'old-token-ref');
-  await enqueueOnboarding(pool, { fdeId: FDE_ID, gitHostId: 'c0000000-0000-4000-8000-000000000012' });
+  await enqueueOnboarding(pool, {
+    fdeId: FDE_ID, gitHostId: 'c0000000-0000-4000-8000-000000000012', llm: LLM_SELECTION,
+  });
 
   assert.equal(pool.onboarding.state, 'pending');
   assert.deepEqual(pool.onboarding.steps, {
-    provision: { state: 'pending' }, materialize: { state: 'pending' },
+    provision: { state: 'pending' },
+    materialize: { state: 'pending' },
+    'llm-binding': { state: 'pending', models: LLM_SELECTION },
   });
   assert.equal(pool.onboarding.attempt, 0);
   assert.equal(pool.gitAccount.git_host_id, 'c0000000-0000-4000-8000-000000000012');
@@ -179,6 +194,7 @@ test('runOnboardingOnce 按序执行并在每步后持久化，materialize 写�
   assert.deepEqual(pool.stepWrites, [
     ['provision', 'running'], ['provision', 'done'],
     ['materialize', 'running'], ['materialize', 'done'],
+    ['llm-binding', 'running'], ['llm-binding', 'done'],
   ]);
   assert.deepEqual(pool.outbox.map(({ op, state }) => ({ op, state })), [{ op: 'upsert', state: 'published' }]);
   assert.deepEqual(result, { claimed: true, fdeId: FDE_ID, state: 'done' });
@@ -220,7 +236,11 @@ test('续跑会跳过已完成步骤，只执行失败步骤之后的工作', as
 
   assert.equal(provisionCalls, 0);
   assert.equal(materializeCalls, 1);
-  assert.deepEqual(pool.stepWrites, [['materialize', 'running'], ['materialize', 'done']]);
+  assert.deepEqual(pool.stepWrites, [
+    ['materialize', 'running'], ['materialize', 'done'],
+    ['llm-binding', 'running'], ['llm-binding', 'done'],
+  ]);
+  assert.deepEqual(pool.onboarding.steps['llm-binding'], { state: 'done', skipped: true });
   assert.equal(result.state, 'done');
 });
 
@@ -247,6 +267,61 @@ test('所有步骤完成后，awaiting_credential 用户进入对应终态', asy
 
   assert.equal(result.state, 'awaiting_credential');
   assert.equal(pool.onboarding.state, 'awaiting_credential');
+  assert.equal(pool.onboarding.steps['llm-binding'].state, 'done');
+});
+
+test('LLM binding 失败只标记独立步骤，不阻断开户；可单独重试且保留表单模型', async () => {
+  const pool = new OnboardingPool({
+    userStatus: 'awaiting_credential',
+    steps: {
+      provision: { state: 'done' },
+      materialize: { state: 'done' },
+      'llm-binding': { state: 'pending', models: structuredClone(LLM_SELECTION) },
+    },
+  });
+  const warnings = [];
+  const failed = await workflow(pool, {
+    bindLlm: async () => { throw new Error('gateway error included sk-never-log-this'); },
+    log: { warn: (message) => warnings.push(message) },
+  });
+  assert.deepEqual(failed, { claimed: true, fdeId: FDE_ID, state: 'awaiting_credential' });
+  assert.equal(pool.onboarding.state, 'awaiting_credential');
+  assert.deepEqual(pool.onboarding.steps['llm-binding'], {
+    state: 'failed',
+    models: LLM_SELECTION,
+    error: 'LLM binding setup failed; check LiteLLM and database availability before retrying',
+  });
+  assert.ok(!warnings.join('\n').includes('sk-never-log-this'));
+
+  const retry = await retryOnboarding(pool, FDE_ID);
+  assert.equal(retry.state, 'pending');
+  assert.equal(retry.step, 'llm-binding');
+  assert.deepEqual(pool.onboarding.steps['llm-binding'], {
+    state: 'pending',
+    models: LLM_SELECTION,
+  });
+
+  let bindCalls = 0;
+  const completed = await workflow(pool, {
+    bindLlm: async (_targetPool, options) => {
+      bindCalls += 1;
+      assert.deepEqual({
+        provider_id: options.provider_id,
+        main_model_id: options.main_model_id,
+        embedding_model_id: options.embedding_model_id,
+        vision_model_id: options.vision_model_id,
+        allowAwaitingCredential: options.allowAwaitingCredential,
+        onlyIfMissing: options.onlyIfMissing,
+      }, {
+        ...LLM_SELECTION,
+        allowAwaitingCredential: true,
+        onlyIfMissing: true,
+      });
+    },
+  });
+  assert.equal(completed.state, 'awaiting_credential');
+  assert.equal(bindCalls, 1);
+  assert.equal(pool.onboarding.steps['llm-binding'].state, 'done');
 });
 
 test('retryOnboarding 只把 failed 任务重新排队并跳过已完成步骤', async () => {
