@@ -315,7 +315,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 4. 在 LLM 网关建**虚拟 key**（额度、模型白名单、别名 `alice@client-x`）；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
 5. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 
-> **边界**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立），也不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点写入 `home/.git-credentials`；此 write-through 凭据文件不进 DB/日志/audit payload，细节见 [`user-space.md`](user-space.md) §4.1.1。
+> **边界**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。**平台不假设 git host 是 Gitea**（GitHub / Gitea / 其他自托管均可，git host 中立）；agent 代劳 clone，Git 凭据由 FDE 经 portal 投放（#110）到 `home/.git-credentials`。此 write-through 凭据文件不进 DB/日志/audit payload，细节见 [`user-space.md`](user-space.md) §4.1.1。平台不下发 SSH key（SSH 强制私钥 `0600` 与组可读 `0640` 冲突）。
 
 **开户执行（issue #111 A）**：管理台新建 FDE 时 email、`fde_name` 和启用中的非 Azure Git host 必填；用户、Git host 绑定与 `fde_onboarding` 队列记录在同一 DB 事务内写入。portal 后台循环异步依次执行 provision 与用户空间 materialize，并持久化各步骤状态；失败任务不自动重试，由管理员显式重试，已完成步骤跳过。全部步骤完成后，用户若仍需录入 Git PAT，开户终态为 `awaiting_credential`。
 
@@ -600,7 +600,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 - 回流走 fork/PR，不直接在主干改
 - `git worktree` 的**创建与清理（`worktree remove` / `worktree prune`）归 agentd**（run 启动前必须存在、结束后由 agentd 回收，见 runner-integration §6.2）；worktree 内的**内容由 agent（FDE）在容器内自行管理**（改代码、commit、分支），平台不代管内容（决策者 2026-09，issue #3 评论）；`.git` 是共享的，清理时别误删其他 run 的 worktree
 - `node_modules` 每个 worktree 一份 → 用 pnpm store / npm cache 共享
-- FDE 自行执行 clone；Git 凭据可自助配置，或由 admin 通过 portal 凭据端点投放到 `~/.git-credentials`（`0640`、FDE 属主、不进 DB/环境变量；见 [`user-space.md`](user-space.md) §4.1.1）
+- agent 代劳执行 clone；Git 凭据由 FDE 经 portal 投放到 `~/.git-credentials`（#110，`0640`、FDE 属主、不进 DB/环境变量；见 [`user-space.md`](user-space.md) §4.1.1）。平台不下发 SSH key（SSH 强制私钥 `0600` 与组可读 `0640` 冲突）。
 
 > **平台文件读取纪律**：`ports.json` / `config.json` 一律经 `manifest.json` 校验后再读（防跨文件混合版本），见 [`user-space.md`](user-space.md) §3/§5.4。
 

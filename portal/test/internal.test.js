@@ -96,6 +96,34 @@ test('assembleTicket：P5 cwd 权威下行 + project 快照兼容旧 agentd（�
   assert.equal(legacy.run.cwd, null);
 });
 
+test('assembleTicket：git identity 优先用户邮箱、缺失时回退，身份不可得时不注入', () => {
+  const base = {
+    queueId: 'q1', claimToken: 'ct1', leaseUntil: new Date(),
+    run: { id: 'run1', session_id: 's1', model: 'm' },
+    project: { name: 'p', root_path: '~/p' }, message: null, attempts: 1,
+  };
+  const storedEmail = assembleTicket({
+    ...base,
+    gitIdentity: { login: 'alice', display_name: 'Alice Wong', email: 'alice@corp.example' },
+    baseDomain: 'station.example',
+  });
+  assert.deepEqual(storedEmail.run.git_identity, { name: 'Alice Wong', email: 'alice@corp.example' });
+
+  const fallbackEmail = assembleTicket({
+    ...base,
+    gitIdentity: { login: 'alice', display_name: null, email: null },
+    baseDomain: 'station.example',
+  });
+  assert.deepEqual(fallbackEmail.run.git_identity, { name: 'alice', email: 'alice@station.example' });
+
+  const noIdentity = assembleTicket({
+    ...base,
+    gitIdentity: { login: null, display_name: null, email: null },
+    baseDomain: 'station.example',
+  });
+  assert.equal(Object.hasOwn(noIdentity.run, 'git_identity'), false);
+});
+
 test('truncateHistory：先按条数截尾（保最新），再按 UTF-8 字节从头丢到符合（issue #69）', () => {
   const msgs = (n) => Array.from({ length: n }, (_, i) => ({ role: 'user', content: `m${i + 1}` }));
   // 条数截尾：保最新 3 条
@@ -256,6 +284,8 @@ test('authenticateContainer：token 鉴权三路径（valid/invalid/revoked）',
   const ok = await authenticateContainer(pool, token);
   assert.equal(ok.container.id, containerId);
   assert.equal(ok.user.id, userId);
+  assert.equal(ok.user.display_name, 'Alice');
+  assert.equal(ok.user.email, 'alice@example.test');
 
   await assert.rejects(() => authenticateContainer(pool, 'wrong'), (e) => e instanceof InternalError && e.status === 401 && e.code === 'token_invalid');
   await assert.rejects(() => authenticateContainer(pool, ''), (e) => e.code === 'token_invalid');
@@ -280,6 +310,18 @@ test('claimRun：领到任务返回 ticket（attempt=1/resume=false）；无任�
   // 第二次 claim（无 pending）→ null（hold 短）
   const none = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
   assert.equal(none, null);
+});
+
+test('claimRun：下行 git identity 使用用户 email 或 baseDomain 回退', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  const ticket = await claimRun(pool, {
+    container: { id: containerId, user_id: userId },
+    user: { id: userId, login: 'alice', display_name: 'Alice', email: null },
+    capacity: 1,
+    holdMs: 10,
+    baseDomain: 'station.example',
+  });
+  assert.deepEqual(ticket.run.git_identity, { name: 'Alice', email: 'alice@station.example' });
 });
 
 test('claimRun：capacity/hold_ms 越界 → 400 validation_failed', async () => {

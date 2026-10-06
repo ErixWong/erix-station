@@ -5,6 +5,7 @@ import { assertSafePath, atomicWriteFile } from './fsutil.js';
 
 const CREDENTIAL_FILE = '.git-credentials';
 const FILE_MODE = 0o640;
+const MAX_TOKEN_LENGTH = 4096;
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 export class GitCredentialError extends Error {
@@ -220,13 +221,14 @@ async function updateAssignedAccount(pool, fdeName, host, username, configured) 
 }
 
 function validateUsername(username) {
-  if (typeof username !== 'string' || username.length === 0 || username.length > 255 || /[\u0000-\u001f\u007f]/.test(username)) {
+  if (typeof username !== 'string' || username.trim().length === 0 || username.length > 255 || /[\u0000-\u001f\u007f]/.test(username)) {
     fail('username', 'username 必须是非空文本');
   }
 }
 
 function validateToken(token) {
-  if (typeof token !== 'string' || token.length === 0) fail('token', 'token 不能为空');
+  if (typeof token !== 'string' || token.trim().length === 0) fail('token', 'token 不能为空');
+  if (token.length > MAX_TOKEN_LENGTH) fail('token', `token 长度不能超过 ${MAX_TOKEN_LENGTH}`);
 }
 
 function assertAuditPool(pool) {

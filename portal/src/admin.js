@@ -8,6 +8,7 @@ import * as auth from './auth.js';
 import * as totp from './totp.js';
 import * as projects from './projects.js';
 import { onboardingStatus } from './onboarding.js';
+import { removeGitCredentialFile } from './git-credential.js';
 
 export class AdminError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -246,12 +247,13 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
 }
 
 /** 删除用户；活动资源与 run 先 fail closed，登录令牌因 FK 无级联而显式清理。 */
-export async function deleteUser(pool, { actorId, userId } = {}) {
+export async function deleteUser(pool, { actorId, userId, config, log = console } = {}) {
   if (actorId === userId) {
     throw new AdminError('self_delete', '管理员不能删除自己的账号', { httpStatus: 409 });
   }
 
   let deletedLogin;
+  let deletedFdeName;
   let client;
   try {
     client = await pool.connect();
@@ -297,8 +299,9 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
 
     await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
     await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
-    const deleted = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id`, [userId]);
+    const deleted = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id, fde_name`, [userId]);
     if (!deleted.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+    deletedFdeName = deleted.rows[0].fde_name;
     await client.query('COMMIT');
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
@@ -309,6 +312,13 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
     throw err;
   } finally {
     client?.release();
+  }
+  if (deletedFdeName) {
+    try {
+      removeGitCredentialFile({ config, fdeName: deletedFdeName });
+    } catch (err) {
+      log.warn?.(`[admin] deleted user git credential cleanup failed for ${deletedFdeName}: ${String(err?.message ?? err)}`);
+    }
   }
   await recordAdminAudit(pool, actorId, 'admin.user_deleted', deletedLogin, { user_id: userId });
   return { ok: true };

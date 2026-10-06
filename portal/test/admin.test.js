@@ -578,6 +578,69 @@ test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖�
   }
 });
 
+function makeDeleteUserPool(fdeName) {
+  const calls = [];
+  const client = {
+    async query(sql, params = []) {
+      calls.push(sql);
+      if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+      if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
+        return { rows: [{ id: FDE_USER.id, login: FDE_USER.login }] };
+      }
+      if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) return { rows: [] };
+      if (sql.includes('FROM containers WHERE user_id') || sql.includes('FROM runs r')) return { rows: [] };
+      if (sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')) return { rows: [] };
+      if (sql.includes('DELETE FROM users WHERE id')) return { rows: [{ id: FDE_USER.id, fde_name: fdeName }] };
+      throw new Error(`Unexpected transaction query: ${sql}`);
+    },
+    release() {},
+  };
+  return {
+    calls,
+    pool: {
+      async connect() { return client; },
+      async query(sql) {
+        calls.push(sql);
+        if (sql.includes('INSERT INTO audit_log')) return { rows: [] };
+        throw new Error(`Unexpected pool query: ${sql}`);
+      },
+    },
+  };
+}
+
+test('deleteUser：提交删除后按 RETURNING 的 fde_name 删除凭据文件', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-delete-user-'));
+  const home = path.join(root, 'alice', 'home');
+  fs.mkdirSync(home, { recursive: true });
+  const credentialPath = path.join(home, '.git-credentials');
+  fs.writeFileSync(credentialPath, 'https://alice:secret@github.com\n', { mode: 0o640 });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const { pool, calls } = makeDeleteUserPool('alice');
+
+  assert.deepEqual(await deleteUser(pool, {
+    actorId: ADMIN.id,
+    userId: FDE_USER.id,
+    config: { userSpaceRoot: root },
+    log: { warn() {} },
+  }), { ok: true });
+  assert.ok(calls.includes('DELETE FROM users WHERE id = $1 RETURNING id, fde_name'));
+  assert.equal(fs.existsSync(credentialPath), false);
+});
+
+test('deleteUser：凭据文件删除失败只告警，不影响已提交删除', async () => {
+  const missingRoot = path.join(os.tmpdir(), `station-delete-missing-${Date.now()}-${Math.random()}`);
+  const { pool } = makeDeleteUserPool('alice');
+  const warnings = [];
+  assert.deepEqual(await deleteUser(pool, {
+    actorId: ADMIN.id,
+    userId: FDE_USER.id,
+    config: { userSpaceRoot: missingRoot },
+    log: { warn: (message) => warnings.push(message) },
+  }), { ok: true });
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('git credential cleanup failed'));
+});
+
 test('deleteUser：审计写入失败不回滚已提交的用户删除', async () => {
   const calls = [];
   const auditError = Object.assign(new Error('audit foreign key violation'), { code: '23503' });
