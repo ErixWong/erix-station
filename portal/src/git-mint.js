@@ -120,7 +120,16 @@ async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutM
           authorization: `Basic ${Buffer.from(`${remoteLogin}:${password}`).toString('base64')}`,
           'content-type': 'application/json',
         },
-        body: { name: `erix-station-${crypto.randomBytes(8).toString('hex')}`, scopes: ['write:repository'] },
+        // #148 real-host acceptance: tea repos create rejected the old token with
+        // "Error: token does not have at least one of required scope(s),
+        // required=[write:user], token scope=write:repository". write:user allows
+        // creating repositories under the FDE's own account; write:repository allows
+        // repository access and push. `--owner <org>` instead requires
+        // write:organization, intentionally not granted pending a separate decision.
+        body: {
+          name: `erix-station-${crypto.randomBytes(8).toString('hex')}`,
+          scopes: ['write:user', 'write:repository'],
+        },
       });
       const { tokenRef, tokenPlaintext } = tokenResult('gitea', token);
       return { remoteLogin, tokenRef, tokenPlaintext };
@@ -178,6 +187,10 @@ async function mintGitlab({ baseUrl, adminKey, login, fetchImpl = fetch, timeout
       headers,
       body: {
         name: `erix-station-${crypto.randomBytes(8).toString('hex')}`,
+        // glab repo create creates a project, but GitLab's CLI docs do not state its
+        // minimum scope. write_repository supports Git-over-HTTP only, not API auth;
+        // `api` is the documented API read/write scope. Do not treat this token as
+        // sufficient for API-based project creation; leave unchanged pending a decision.
         scopes: ['write_repository'],
       },
     });
