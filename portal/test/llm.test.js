@@ -32,6 +32,7 @@ import {
 import { createServer } from '../src/http.js';
 import { postMessage } from '../src/sessions.js';
 import { cookieSettings } from '../src/config.js';
+import { runOnboardingOnce } from '../src/onboarding.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
 
@@ -960,6 +961,62 @@ function seedPool({ userStatus = 'active' } = {}) {
   });
 }
 
+function onboardingPoolForLlm(llmPool) {
+  const onboarding = {
+    fde_id: 'u1',
+    state: 'pending',
+    steps: {
+      provision: { state: 'done' },
+      materialize: { state: 'done' },
+      'llm-binding': {
+        state: 'pending',
+        models: { provider_id: 'p1', main_model_id: 'm-main', embedding_model_id: null, vision_model_id: null },
+      },
+    },
+  };
+  const dispatch = (sql, params = []) => {
+    if (sql.includes('SELECT o.fde_id, o.steps, u.fde_name, a.git_host_id')) {
+      return onboarding.state === 'pending'
+        ? { rows: [{ fde_id: 'u1', steps: structuredClone(onboarding.steps), fde_name: 'alice', git_host_id: 'git1' }] }
+        : { rows: [] };
+    }
+    if (sql.includes('UPDATE fde_onboarding') && sql.includes("SET state = 'running'")) {
+      onboarding.state = 'running';
+      return { rows: [{ attempt: 1 }] };
+    }
+    if (sql.includes('UPDATE fde_onboarding') && sql.includes('SET steps = jsonb_set')) {
+      onboarding.steps[params[1]] = JSON.parse(params[2]);
+      return { rows: [] };
+    }
+    if (sql.includes('SELECT status FROM users WHERE id')) {
+      return { rows: llmPool.users.filter((user) => user.id === params[0]).map((user) => ({ status: user.status })) };
+    }
+    if (sql.includes('UPDATE fde_onboarding') && sql.includes('SET state = $2')) {
+      onboarding.state = params[1];
+      return { rows: [] };
+    }
+    return undefined;
+  };
+  return {
+    onboarding,
+    async query(sql, params = []) {
+      const result = dispatch(sql, params);
+      if (result !== undefined) return result;
+      throw new Error(`Unexpected onboarding test query: ${sql}`);
+    },
+    async connect() {
+      const llmClient = await llmPool.connect();
+      return {
+        async query(sql, params = []) {
+          const result = dispatch(sql, params);
+          return result === undefined ? llmClient.query(sql, params) : result;
+        },
+        release: () => llmClient.release(),
+      };
+    },
+  };
+}
+
 const FULL_KEY = 'sk-live-abcdef1234567890xyz';
 const saveFdeConfig = (pool, options) => setFdeLlmConfig(pool, { ...options, gateway: pool });
 
@@ -1151,6 +1208,57 @@ test('setFdeLlmConfig：开户可为 awaiting_credential 用户建 key；onlyIfM
   assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
   assert.equal(pool.gatewayCalls.filter((call) => call.method === 'listModels').length, modelCatalogCalls,
     'idempotent onboarding does not require a gateway lookup');
+});
+
+test('onboarding llm-binding 步骤会恢复 revoked binding 并发布新路由 revision', async () => {
+  const llmPool = seedPool();
+  llmPool.bindings.push({
+    fde_id: 'u1', gateway: 'litellm', gateway_user_id: null, provider_id: 'p1',
+    api_key: null, key_id: null, key_alias: 'fde-alice', state: 'revoked', revoked_at: new Date(),
+    generation: 1, main_model_id: 'deepseek-flash', main_model_name: 'DeepSeek Flash',
+    embedding_model_id: null, embedding_model_name: null, vision_model_id: null, vision_model_name: null,
+  });
+  const pool = onboardingPoolForLlm(llmPool);
+
+  const result = await runOnboardingOnce(pool, llmPool, {
+    bindLlm: setFdeLlmConfig,
+    log: { warn() {} },
+  });
+
+  assert.deepEqual(result, { claimed: true, fdeId: 'u1', state: 'done' });
+  assert.equal(pool.onboarding.steps['llm-binding'].state, 'done');
+  assert.equal('skipped' in pool.onboarding.steps['llm-binding'], false);
+  assert.equal(llmPool.bindings[0].state, 'active');
+  assert.equal(llmPool.bindings[0].revoked_at, null);
+  assert.equal(llmPool.bindings[0].api_key, llmPool.generatedKeys[0], 'revoked key is freshly minted');
+  assert.equal(llmPool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
+  assert.equal(llmPool.outbox.length, 1);
+  assert.deepEqual(
+    { aggregate: llmPool.outbox[0].aggregate, op: llmPool.outbox[0].op, revision: llmPool.outbox[0].revision },
+    { aggregate: 'llm_binding', op: 'upsert', revision: 1 },
+  );
+});
+
+test('onboarding llm-binding 步骤遇到 active binding 时仍幂等跳过且不覆盖', async () => {
+  const llmPool = seedPool();
+  llmPool.bindings.push({
+    fde_id: 'u1', gateway: 'litellm', gateway_user_id: 'gateway-user-alice', provider_id: 'p1',
+    api_key: 'sk-existing-active-key', key_id: 'key-existing', key_alias: 'fde-alice', state: 'active',
+    generation: 2, main_model_id: 'deepseek-flash', main_model_name: 'DeepSeek Flash',
+    embedding_model_id: null, embedding_model_name: null, vision_model_id: null, vision_model_name: null,
+  });
+  const original = structuredClone(llmPool.bindings[0]);
+  const pool = onboardingPoolForLlm(llmPool);
+
+  const result = await runOnboardingOnce(pool, llmPool, {
+    bindLlm: setFdeLlmConfig,
+    log: { warn() {} },
+  });
+
+  assert.equal(result.state, 'done');
+  assert.deepEqual(llmPool.bindings[0], original, 'active binding is not overwritten');
+  assert.equal(llmPool.gatewayCalls.length, 0, 'active skip does not call LiteLLM');
+  assert.equal(llmPool.outbox.length, 0, 'active skip does not change the route by itself');
 });
 
 test('setFdeLlmConfig：默认仍拒绝 awaiting_credential 用户，LLM tab 不放宽 active 限制', async () => {
@@ -1672,7 +1780,7 @@ test('B1：syncFdeLlmBindingOnOnboard——复用分支 revoked → active（rev
   assert.ok(!JSON.stringify(ups[0].payload).includes(b.api_key), 'payload 不得含 virtual key');
 });
 
-test('B1：syncFdeLlmBindingOnOnboard——全新 onboard（restoreRevoked=false）不复活 revoked 配置', async () => {
+test('B1：syncFdeLlmBindingOnOnboard——restoreRevoked=false 不恢复 revoked binding', async () => {
   const pool = new LlmFakePool({
     bindings: [{
       fde_id: 'u1', provider_id: 'p1', api_key: 'sk-test-1234567890', state: 'revoked',
@@ -1681,11 +1789,11 @@ test('B1：syncFdeLlmBindingOnOnboard——全新 onboard（restoreRevoked=false
   });
   const out = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: false, gateway: pool });
   assert.deepEqual(out, { restored: false, republished: false });
-  assert.equal(pool.bindings[0].state, 'revoked', 'offboard 是管理员意图，全新 onboard 不得自动恢复 LLM');
+  assert.equal(pool.bindings[0].state, 'revoked', 'restoreRevoked=false 的 provision sync 不恢复 revoked binding');
   assert.equal(pool.outbox.length, 0);
 });
 
-test('B1：syncFdeLlmBindingOnOnboard——active 配置幂等 upsert（revision 递增）；无 binding 行 → no-op', async () => {
+test('B1：syncFdeLlmBindingOnOnboard——needRecreate 时 active binding 仍发布 upsert revision；无 binding → no-op', async () => {
   const pool = new LlmFakePool({
     bindings: [{
       fde_id: 'u1', provider_id: 'p1', gateway: 'litellm', key_alias: 'fde-alice',
@@ -1695,14 +1803,23 @@ test('B1：syncFdeLlmBindingOnOnboard——active 配置幂等 upsert（revision
   });
   const out1 = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: false, gateway: pool });
   assert.deepEqual(out1, { restored: false, republished: true });
+  assert.equal(pool.outbox.length, 1);
+  assert.deepEqual(
+    { op: pool.outbox[0].op, revision: pool.outbox[0].revision },
+    { op: 'upsert', revision: 1 },
+    'recreated container 的 active route 必须产生新 outbox revision',
+  );
   const rev = pool.revisions.get('llm_binding:u1');
   const out2 = await syncFdeLlmBindingOnOnboard(pool, { fdeId: 'u1', fdeName: 'alice', restoreRevoked: false, gateway: pool });
   assert.deepEqual(out2, { restored: false, republished: true });
   assert.equal(pool.revisions.get('llm_binding:u1'), rev + 1, '每次 upsert revision 递增（head 语义，与 setFdeLlmConfig 同构）');
+  assert.equal(pool.outbox.length, 2);
 
   const empty = new LlmFakePool({});
   assert.deepEqual(
     await syncFdeLlmBindingOnOnboard(empty, { fdeId: 'u9', fdeName: 'nobody', restoreRevoked: true, gateway: empty }),
     { restored: false, republished: false },
   );
+  assert.equal(empty.outbox.length, 0, '新 FDE 没有 binding 时，provision sync 不写路由 outbox');
+  assert.equal(empty.gatewayCalls.length, 0, '新 FDE 没有 binding 时，provision sync 不调用 LiteLLM');
 });
