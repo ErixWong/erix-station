@@ -61,6 +61,10 @@
 ├── home/                       # 容器 HOME 的内容（挂到 /home/<user>）
 │   ├── AGENTS.md               # 平台文件（容器级约定）
 │   ├── .git-credentials        # 凭据类文件（admin 按需投放，不进 manifest，§4.1.1）
+│   ├── .config/
+│   │   ├── tea/config.yml      # Gitea CLI 凭据（按 git_hosts provider 投放，§4.1.1）
+│   │   ├── gh/hosts.yml        # GitHub CLI 凭据（同上）
+│   │   └── glab-cli/config.yml # GitLab CLI 凭据（同上）
 │   ├── .erix/
 │   │   ├── config.json         # 平台文件（LLM 占位 key + endpoint + model slots）
 │   │   ├── mcp.json            # 平台文件（本期空骨架；MCP 本期不做）
@@ -139,8 +143,13 @@
 | 文件（容器路径） | 写方 / 读方 | 属主与权限 | 物化 / 生命周期 |
 |---|---|---|---|
 | `/home/<user>/.git-credentials` | FDE 经 portal 自助凭据端点 write-through 写入宿主 bind mount；Git 的 `credential.helper=store` 供 agent/worker 读取 | FDE UID:GID（默认 `1000:1000`），`0640`（owner 与同组 worker 可读） | **不写入 manifest，不进入 materializer 对账覆盖集**；stale 清理不得删除。offboarding 删除该文件。 |
+| `/home/<user>/.config/tea/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitea` upsert；tea CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
+| `/home/<user>/.config/gh/hosts.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=github` upsert；gh CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
+| `/home/<user>/.config/glab-cli/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitlab` upsert；glab CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
 
-凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；token 明文只存在这个 FDE 的 HOME 文件中，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。API 只回显 host、username 与 token 掩码。
+> **兼容性限制（2026-10-06 实测）**：glab 1.121.0 的 `HasSecurePerms` 只接受 `0600`，会拒绝本契约要求的 `0640`，因此当前 glab 不能读取 portal 投放的配置。此实现遵循已裁决的 `0640` 文件权限，不擅自改成 `0600`；需要另行裁决权限契约或 glab 的凭据接入方式。
+
+Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 的 HOME，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
 
 该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户删除时 portal 尝试删除此文件；失败只告警，不回滚用户删除。
 
