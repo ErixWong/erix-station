@@ -5,6 +5,7 @@ import { assertSafePath, atomicWriteFile } from './fsutil.js';
 
 const CREDENTIAL_FILE = '.git-credentials';
 const FILE_MODE = 0o640;
+const MAX_TOKEN_LENGTH = 4096;
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 export class GitCredentialError extends Error {
@@ -136,6 +137,7 @@ function parseCredentialLine(line) {
     if (!parsed.hostname) return null;
     return {
       host: parsed.host.toLowerCase(),
+      protocol: parsed.protocol.slice(0, -1),
       username: decodeURIComponent(parsed.username),
       token: decodeURIComponent(parsed.password),
     };
@@ -220,13 +222,35 @@ async function updateAssignedAccount(pool, fdeName, host, username, configured) 
 }
 
 function validateUsername(username) {
-  if (typeof username !== 'string' || username.length === 0 || username.length > 255 || /[\u0000-\u001f\u007f]/.test(username)) {
+  if (typeof username !== 'string' || username.trim().length === 0 || username.length > 255 || /[\u0000-\u001f\u007f]/.test(username)) {
     fail('username', 'username 必须是非空文本');
   }
 }
 
 function validateToken(token) {
-  if (typeof token !== 'string' || token.length === 0) fail('token', 'token 不能为空');
+  if (typeof token !== 'string' || token.trim().length === 0) fail('token', 'token 不能为空');
+  if (token.length > MAX_TOKEN_LENGTH) fail('token', `token 长度不能超过 ${MAX_TOKEN_LENGTH}`);
+}
+
+function validateProtocol(protocol) {
+  if (protocol === undefined) return undefined;
+  if (protocol !== 'http' && protocol !== 'https') fail('protocol', 'protocol 必须是 http 或 https');
+  return protocol;
+}
+
+async function resolveConfiguredProtocol(pool, host) {
+  const result = await pool.query('SELECT base_url FROM git_hosts');
+  for (const row of result.rows) {
+    try {
+      const baseUrl = new URL(row.base_url);
+      if (baseUrl.host.toLowerCase() !== host) continue;
+      if (baseUrl.protocol === 'http:') return 'http';
+      if (baseUrl.protocol === 'https:') return 'https';
+    } catch {
+      // Invalid configuration rows cannot identify a credential host.
+    }
+  }
+  return 'https';
 }
 
 function assertAuditPool(pool) {
@@ -235,15 +259,17 @@ function assertAuditPool(pool) {
   }
 }
 
-export async function setGitCredential({ pool, actorId = null, config, fdeName, host, username, token } = {}) {
+export async function setGitCredential({ pool, actorId = null, config, fdeName, host, username, token, protocol } = {}) {
   const normalizedHost = validateHost(host);
   validateFde(fdeName);
   validateUsername(username);
   validateToken(token);
+  const requestedProtocol = validateProtocol(protocol);
   assertAuditPool(pool);
   const { root, target } = getCredentialPath(config, fdeName);
   const contents = readCredentialFile(target);
-  const credentialLine = `https://${encodeUserInfo(username)}:${encodeUserInfo(token)}@${normalizedHost}`;
+  const scheme = requestedProtocol ?? await resolveConfiguredProtocol(pool, normalizedHost);
+  const credentialLine = `${scheme}://${encodeUserInfo(username)}:${encodeUserInfo(token)}@${normalizedHost}`;
   const nextContents = replaceHostLine(contents, normalizedHost, credentialLine);
   atomicWriteFile(target, nextContents, {
     mode: FILE_MODE,
@@ -291,6 +317,7 @@ export async function listGitCredentials({ config, fdeName } = {}) {
     if (!credential?.username || !credential.token) continue;
     hosts.push({
       host: credential.host,
+      protocol: credential.protocol,
       username: credential.username,
       token: maskToken(credential.token),
     });

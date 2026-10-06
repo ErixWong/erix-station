@@ -43,3 +43,27 @@ test('P5：capacity 默认 1 → 2（同项目并行放行，pi 对齐；env 可
   // 本测试进程未设 ERIX_AGENTD_CAPACITY → 模块加载快照应取新默认 2。
   assert.equal(agentd.testConfig.capacity, 2);
 });
+
+test('buildWorkerEnv：git identity 覆盖继承值，旧 portal 未下发时保持原值', () => {
+  const inherited = {
+    GIT_AUTHOR_NAME: 'inherited author',
+    GIT_AUTHOR_EMAIL: 'author@inherited.test',
+    GIT_COMMITTER_NAME: 'inherited committer',
+    GIT_COMMITTER_EMAIL: 'committer@inherited.test',
+    ERIX_STATION_TOKEN: 'must-not-reach-worker',
+  };
+  const withIdentity = agentd.buildWorkerEnv({
+    git_identity: { name: 'FDE Name', email: 'fde@example.test' },
+  }, inherited);
+  assert.equal(withIdentity.GIT_AUTHOR_NAME, 'FDE Name');
+  assert.equal(withIdentity.GIT_AUTHOR_EMAIL, 'fde@example.test');
+  assert.equal(withIdentity.GIT_COMMITTER_NAME, 'FDE Name');
+  assert.equal(withIdentity.GIT_COMMITTER_EMAIL, 'fde@example.test');
+  assert.equal(Object.hasOwn(withIdentity, 'ERIX_STATION_TOKEN'), false);
+
+  const legacy = agentd.buildWorkerEnv({}, inherited);
+  assert.equal(legacy.GIT_AUTHOR_NAME, inherited.GIT_AUTHOR_NAME);
+  assert.equal(legacy.GIT_AUTHOR_EMAIL, inherited.GIT_AUTHOR_EMAIL);
+  assert.equal(legacy.GIT_COMMITTER_NAME, inherited.GIT_COMMITTER_NAME);
+  assert.equal(legacy.GIT_COMMITTER_EMAIL, inherited.GIT_COMMITTER_EMAIL);
+});

@@ -68,7 +68,7 @@
 │   │   ├── skills/             # FDE/agent 自管（平台不物化内容）
 │   │   └── todos/              # FDE/agent 自管（平台不物化内容）
 │   └── .cache/station/spool/   # 事件 spool（agentd/worker 写，平台不碰）
-├── projects/<project>/         # 仓库目录（FDE clone 目标）
+├── projects/<project>/         # 仓库目录（agent clone 目标）
 │   ├── .gitignore              # 平台文件（忽略 .erix/ 等，§11）
 │   └── .erix/
 │       ├── ports.json          # 平台文件（该项目的端口派生视图）
@@ -138,17 +138,19 @@
 
 | 文件（容器路径） | 写方 / 读方 | 属主与权限 | 物化 / 生命周期 |
 |---|---|---|---|
-| `/home/<user>/.git-credentials` | portal admin 凭据端点写宿主 bind mount；Git 的 `credential.helper=store` 供 worker 读取 | FDE UID:GID（默认 `1000:1000`），`0640`（owner 与同组 worker 可读） | **不写入 manifest，不进入 materializer 对账覆盖集**；stale 清理不得删除。offboarding 删除该文件。 |
+| `/home/<user>/.git-credentials` | FDE 经 portal 自助凭据端点 write-through 写入宿主 bind mount；Git 的 `credential.helper=store` 供 agent/worker 读取 | FDE UID:GID（默认 `1000:1000`），`0640`（owner 与同组 worker 可读） | **不写入 manifest，不进入 materializer 对账覆盖集**；stale 清理不得删除。offboarding 删除该文件。 |
 
-凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；token 明文只存在这个 FDE 的 HOME 文件中，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。管理 API 只回显 host、username 与 token 掩码。
+凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；token 明文只存在这个 FDE 的 HOME 文件中，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。API 只回显 host、username 与 token 掩码。
 
-该文件是显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。
+该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户删除时 portal 尝试删除此文件；失败只告警，不回滚用户删除。
+
+平台不下发 SSH 私钥：OpenSSH 要求私钥仅属主可读（通常 `0600`），与 worker 通过组权限读取凭据的 `0640` 契约冲突；本契约仅支持 Git HTTPS credential-store 凭据。宿主侧有权访问用户空间的进程仍可读取该明文文件，这是宿主侧残余风险，文件权限不是安全边界。
 
 ### 4.2 FDE / agent 所有（平台不物化内容，只保证目录存在与属主正确）
 
 | 路径（容器路径） | 写方 | 说明 |
 |---|---|---|
-| `/home/<user>/projects/<project>/`（仓库内容） | FDE clone + agent 编辑 | 平台只创建空目录与平台文件，不代为 clone；Git 凭据可由 FDE 自行配置或由 admin 通过凭据端点投放（§4.1.1） |
+| `/home/<user>/projects/<project>/`（仓库内容） | agent 代劳 clone + FDE/agent 编辑 | 平台只创建空目录与平台文件；Git 凭据由 FDE 经 portal 投放（#110，§4.1.1） |
 | `/home/<user>/worktrees/<project>-<runId>/` | **agentd**（`git worktree add`，runner §6.2） | **worktree 元数据无文件**：run↔worktree 绑定在 DB（`runs.id` + 路径约定 `~/worktrees/<project>-<runId>`），不在用户空间物化任何元数据文件（避免与 git 自身元数据冲突、避免双真相） |
 | `/home/<user>/.cache/station/spool/<runId>.jsonl` | agentd / worker（事件缓冲，runner §7.5） | **JSONL**（append-only，每行一个事件信封）；run 结束后清排；平台不读不写 |
 | `/home/<user>/cache/` | FDE / agent（pnpm store / npm / pip） | 依赖缓存，平台不代管 |
@@ -429,11 +431,11 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 
 ### 9.1 项目目录不存在时谁创建
 
-- **portal（materializer）创建空目录 + 平台文件**，**FDE clone 仓库内容**，两者分工不重叠（规格 §7.2 边界：平台交付到「容器内一个仓库目录 + 端口分配 + 模板」为止）。
+- **portal（materializer）创建空目录 + 平台文件**，**agent 代劳 clone 仓库内容**；FDE 先经 portal 投放 Git HTTPS 凭据（#110，§4.1.1），两者分工不重叠。
 - 时序（建项目，`POST /api/projects`）：
   1. DB 事务写 `projects` + `port_allocations` + route outbox（portal.md §3.3）。
   2. materializer 在宿主创建 `projects/<project>/`（`chown 1000:1000`、`chmod 2770`）→ 写 `.gitignore`（含 `.erix/`）→ 写 `.erix/ports.json`、`.erix/AGENTS.md` → 更新 `manifest.json`。
-  3. FDE 在容器内自行 `git clone`；git 凭据可由 FDE 自行配置，或由 admin 通过凭据端点投放到 `home/.git-credentials`（§4.1.1）。**平台不代为 clone**。
+  3. FDE 经 portal 投放 Git HTTPS 凭据（#110，写入 `home/.git-credentials`），由 agent 在项目目录代劳 clone。平台不下发 SSH key（SSH 私钥强制 `0600` 与组可读 `0640` 冲突）。
 
 ### 9.2 用户 clone 覆盖平台文件怎么办
 
@@ -491,7 +493,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | 项 | 结论 |
 |---|---|
 | 文件权限是安全边界吗 | **不是**（principles §1 原理四）。只防误改；真正边界是网络（每 FDE 独立 `/29`、不 publish、ingress 唯一、LLM 唯一出口）。 |
-| 平台文件泄漏什么 | 物化平台文件无真实密钥：占位 key 无价值、endpoint 是内网 `llm.<base>`、`ports.json` 是 FDE 自己的端口。`.git-credentials` 是单独授权的 Git 主机凭据文件；**真实 LLM key / DB 凭据 / runner token 永不进入用户空间文件**。 |
+| 平台文件泄漏什么 | 物化平台文件无真实密钥：占位 key 无价值、endpoint 是内网 `llm.<base>`、`ports.json` 是 FDE 自己的端口。`.git-credentials` 是 FDE 单独授权的 Git 主机凭据文件；**真实 LLM key / DB 凭据 / runner token 永不进入用户空间文件**。宿主侧有权访问该用户空间的进程可读取 Git token 明文，这是接受的残余风险。 |
 | FDE 能否破坏自己 | 能（有 root）——**接受**（runner §11.3 同口径）；只保证「他人/平台状态不被单个 FDE 破坏」。 |
 | 跨 FDE 隔离 | bind mount 每 FDE 只挂自己的 `/srv/erix/users/<fde>/`；materializer 只按 DB `fde_id` 写对应目录；名字白名单 + 无 `..`（§6.3）防越目录。 |
 | 单 FDE 写入路径 | materializer 不读回用户空间内容做决策（§6.3-4），杜绝「FDE 篡改文件反灌平台」。 |
