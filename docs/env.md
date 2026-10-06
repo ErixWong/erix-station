@@ -319,6 +319,14 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `IPAM_RESERVED_SUBNETS` | IPAM 保留网段（逗号分隔；避开宿主既有网段，开发期可置空，因 FDE 池 10.200/10.201 与 backend 172.32 天然隔离） | 目标环境探测 | ``（空） |
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（user-space §6.1） | 平台规范固定 | `1000` / `1000` |
 
+> **本机重建 FDE 镜像**：当前构建环境访问 GitHub、GitLab 和 Gitea 下载站需经代理，且 Docker build 容器需使用 host 网络才能访问宿主代理；代理地址是构建环境配置，不写入 Dockerfile。重建时传入代理 build args，例如：
+> ```sh
+> docker build runner/ -t erix-station/fde:local --network=host \
+>   --build-arg HTTP_PROXY=http://172.20.0.35:19001 \
+>   --build-arg HTTPS_PROXY=http://172.20.0.35:19001 \
+>   --build-arg NO_PROXY=127.0.0.1,localhost
+> ```
+
 > **口令必须改 + 600 权限存放**：`POSTGRES_PASSWORD` / `PLATFORM_DB_PASSWORD` / `PORTAL_DB_PASSWORD` 在生产环境必须把 `change-me-dev-only` 占位全部改掉，并以 **600 权限 `deploy/.env`** 存放（不入库、不进 compose 正文、不进镜像，见 deploy-contract §2.4）。
 >
 > **镜像 pin 策略（deploy-contract.md §2 的完整契约，此处只记取值口径；双轨定稿见 issue #27，2026-09-18）**：`deploy/` 内的 compose/镜像引用**不得使用浮动 tag**（`latest` / 裸 `:16` / 裸 `:v3`）。生产部署对每个镜像最终以**不可变引用**锁定，两种形态（F12 校验均接受）：**① repo digest** `image@sha256:…`——push/pull 后 `docker inspect --format '{{index .RepoDigests 0}}'` 取；**② image ID** `sha256:<imageId>`——目标机本地 build（RepoDigests 为空）用 `docker inspect --format '{{.Id}}'` 取。P1 开发期可暂用 `<major>.<minor>` 类 tag，但必须在 `docker inspect` 后把 resolved digest 记录进部署记录（env 附录 B / runbook）。`⚠️ 待决策者确认`：`postgres:16` / `traefik:v3` 的具体 patch 号与 digest 是部署期事实，本文不虚构；P1 开发按 §0 即可，目标环境按 §9 探测后再 pin。**运行时强制范围（审计 #34 F-E）**：程序内 fail-closed 校验的只有 `FDE_IMAGE`（portal `config.js` F12 双轨两形态）；`PORTAL_IMAGE`/`POSTGRES_IMAGE`/`TRAEFIK_IMAGE`/`STATION_DOCKER_PROXY_IMAGE` 由 compose 变量注入，portal 进程内看不到其实际引用 → **由部署流程保证**（部署记录留存 `docker inspect` 解析的 digest），不属运行时校验。**F12 校验口径（审计 #34 F-D）**：这是**形态门**——只做「三类前缀（image ID / 多标签域名·localhost·单标签+端口）+ 严格 `@sha256:<64hex>` 后缀」判别，用于 fail-closed 挡住浮动 tag 与伪 sha256 尾缀；**不声称 docker reference 语法完备**（引用最终合法性由 Docker 裁决）。已知 fail-open 边界：`foo__bar.example.com/fde` 这类「首段含 `.` 但域名含非法字符」会被放行（docker 会拒）。
