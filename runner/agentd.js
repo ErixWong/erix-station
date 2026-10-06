@@ -787,18 +787,28 @@ function abortRun(ctx, reason) {
 // ---------------------------------------------------------------------------
 // worker 生命周期（§5/§6）
 // ---------------------------------------------------------------------------
-function spawnWorker(ctx, runStart) {
-  const childEnv = { ...process.env };
+function buildWorkerEnv(runStart, baseEnv = process.env) {
+  const childEnv = { ...baseEnv };
   // §11：worker 无凭据——剔除 token；HOME 指向 erix（工作区属主）。
   delete childEnv.ERIX_STATION_TOKEN;
   childEnv.HOME = CFG.home;
   childEnv.FDE_CONTAINER_USER = CFG.homeUser;
+  const identity = runStart?.git_identity;
+  if (typeof identity?.name === 'string' && typeof identity.email === 'string') {
+    childEnv.GIT_AUTHOR_NAME = identity.name;
+    childEnv.GIT_AUTHOR_EMAIL = identity.email;
+    childEnv.GIT_COMMITTER_NAME = identity.name;
+    childEnv.GIT_COMMITTER_EMAIL = identity.email;
+  }
+  return childEnv;
+}
 
+function spawnWorker(ctx, runStart) {
   const child = fork(WORKER_PATH, [], {
     uid: CFG.workerUid,
     gid: CFG.workerGid,
     detached: true, // M2：独立进程组，watchdog/abort 可整组杀
-    env: childEnv,
+    env: buildWorkerEnv(runStart),
     cwd: runStart.cwd,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
@@ -1069,6 +1079,7 @@ async function handleTicket(ticket) {
     // issue #38 Phase B2：模型快照，run 边界生效——此处取的是 **run 启动瞬间**的 state.llmModels，
     // 之后心跳刷新 state.llmModels 不影响本 run（进行中 run 的模型名在其生命周期内锁定）。
     models: state.llmModels,
+    ...(run.git_identity ? { git_identity: run.git_identity } : {}),
   };
   try {
     spawnWorker(ctx, runStart);
@@ -1272,4 +1283,7 @@ if (isDirectRun) {
 // 测试导出（issue #64：终态清场路径的捕获触发用 node:test + stub fetch 覆盖；非对外契约）。
 // issue #79：initialHeartbeatGate/state 供冷启动顺序单测注入桩断言（非对外契约）。
 // P5：resolveRunCwd 供 cwd 解析/回退语义单测；testConfig 仅暴露 capacity 默认值断言（非对外契约）。
-export { onWorkerFinished, onWorkerExit, initialHeartbeatGate, state, handleStoreRequest, resolveRunCwd, CFG as testConfig };
+export {
+  onWorkerFinished, onWorkerExit, initialHeartbeatGate, state, handleStoreRequest,
+  resolveRunCwd, buildWorkerEnv, CFG as testConfig,
+};

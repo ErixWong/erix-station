@@ -106,7 +106,20 @@ export function validateTransition(from, to) {
  *  P5 去项目化：run.cwd = 会话绑定 cwd（~/projects/<name> 相对形式）为权威下行；run.project 保留
  *  项目名/根路径快照仅为**旧 agentd** 过渡兼容（部署序 portal 先上、FDE 镜像后上，新 agentd 优先读
  *  run.cwd）。 */
-export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, message, attempts, history }) {
+export function assembleTicket({
+  queueId, claimToken, leaseUntil, run, project, message, attempts, history, gitIdentity, baseDomain,
+}) {
+  const gitName = typeof gitIdentity?.display_name === 'string' && gitIdentity.display_name.length > 0
+    ? gitIdentity.display_name
+    : typeof gitIdentity?.login === 'string' && gitIdentity.login.length > 0
+      ? gitIdentity.login
+      : undefined;
+  const gitEmail = typeof gitIdentity?.email === 'string' && gitIdentity.email.length > 0
+    ? gitIdentity.email
+    : typeof gitIdentity?.login === 'string' && gitIdentity.login.length > 0 &&
+        typeof baseDomain === 'string' && baseDomain.length > 0
+      ? `${gitIdentity.login}@${baseDomain}`
+      : undefined;
   return {
     queue_id: queueId,
     claim_token: claimToken,
@@ -123,6 +136,7 @@ export function assembleTicket({ queueId, claimToken, leaseUntil, run, project, 
       resume: attempts > 1,
       attachments: Array.isArray(message?.attachments) ? message.attachments : [],
       history: Array.isArray(history) ? history : [],
+      ...(gitName || gitEmail ? { git_identity: { name: gitName, email: gitEmail } } : {}),
     },
   };
 }
@@ -148,7 +162,7 @@ export async function authenticateContainer(pool, token, { now = new Date() } = 
   const res = await pool.query(
     `SELECT c.id AS container_id, c.user_id, c.revoked_at, c.status AS container_status,
             c.fde_name, c.container_name, c.token_generation,
-            u.login, u.status AS user_status
+            u.login, u.display_name, u.email, u.status AS user_status
        FROM containers c
        JOIN users u ON u.id = c.user_id
       WHERE c.runner_token_hash = $1`,
@@ -166,7 +180,7 @@ export async function authenticateContainer(pool, token, { now = new Date() } = 
       fde_name: row.fde_name,
       container_name: row.container_name,
     },
-    user: { id: row.user_id, login: row.login },
+    user: { id: row.user_id, login: row.login, display_name: row.display_name, email: row.email },
   };
 }
 
@@ -216,7 +230,7 @@ function isTerminal(status) {
 // ---------------------------------------------------------------------------
 
 /** 单次原子认领（FOR UPDATE SKIP LOCKED，schema.sql §8 认领 SQL）。返回 ticket 或 null。 */
-async function tryClaim(pool, { container, user, capacity, now = new Date(), historyBudget, log } = {}) {
+async function tryClaim(pool, { container, user, capacity, now = new Date(), historyBudget, baseDomain, log } = {}) {
   const claimToken = crypto.randomBytes(24).toString('base64url');
   const claimed = await pool.query(
     `UPDATE run_queue q
@@ -299,6 +313,8 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
     message: message.rows?.[0],
     attempts: Number(row.attempts),
     history,
+    gitIdentity: user,
+    baseDomain,
   });
 }
 
@@ -493,7 +509,9 @@ export function hubStats() {
 // U1 claim（含 hold 长轮询）
 // ---------------------------------------------------------------------------
 
-export async function claimRun(pool, { container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), historyBudget, log = console } = {}) {
+export async function claimRun(pool, {
+  container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), historyBudget, baseDomain, log = console,
+} = {}) {
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 64) {
     throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' } });
   }
@@ -501,7 +519,7 @@ export async function claimRun(pool, { container, user, capacity = 1, holdMs = H
     throw new InternalError(400, 'validation_failed', `hold_ms 越界（1..${HOLD_MS_MAX}）`, { details: { field: 'hold_ms' } });
   }
 
-  const ticket = await tryClaim(pool, { container, user, capacity, now, historyBudget, log });
+  const ticket = await tryClaim(pool, { container, user, capacity, now, historyBudget, baseDomain, log });
   if (ticket) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: ticket.run.id, details: { attempt: ticket.run.attempt } }).catch(() => {});
     return ticket;
@@ -509,7 +527,7 @@ export async function claimRun(pool, { container, user, capacity = 1, holdMs = H
 
   const deadline = Date.now() + holdMs;
   await waitForWakeup(user.id, deadline);
-  const retry = await tryClaim(pool, { container, user, capacity, now, historyBudget, log });
+  const retry = await tryClaim(pool, { container, user, capacity, now, historyBudget, baseDomain, log });
   if (retry) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: retry.run.id, details: { attempt: retry.run.attempt } }).catch(() => {});
     return retry;
