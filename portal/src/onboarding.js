@@ -216,7 +216,15 @@ export async function retryOnboarding(pool, fdeId) {
   });
 }
 
-/** Re-queue work left running when the previous portal process exited. */
+/**
+ * Re-queue work left running when the previous portal process exited.
+ *
+ * 单实例假设（决策者 2026-10-06：本平台限定单实例，内部使用，不做多实例/HA）：
+ * 本函数会把**所有** running 行改回 pending，故不能与另一个共享同一 DB 的 portal 实例并存
+ * （多实例下会把对方在跑的开户任务重排；实际执行仍有 pg_advisory_lock 串行化 + onboardFde 幂等兜底，
+ * 不会损坏数据，但会重复执行）。若将来真要多实例：给 fde_onboarding 加 lease_until/worker_id
+ * （照抄 materialize_outbox），启动恢复只回收租约过期的行。
+ */
 export async function recoverInterruptedOnboardings(pool) {
   const result = await pool.query(
     `UPDATE fde_onboarding
