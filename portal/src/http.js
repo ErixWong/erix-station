@@ -411,6 +411,44 @@ async function routeApi(req, res, ctx, url) {
     if (renewed) headers['Set-Cookie'] = sessionCookieHeader(config.cookie, token);
     return sendJson(res, 200, { user: session.user }, headers);
   }
+  if (pathname === '/api/me/git-credential') {
+    const session = await requireSession(req, ctx);
+    const fdeName = session.user.fde_name;
+    if (!fdeName) {
+      throw new admin.AdminError('fde_name_required', '当前用户未分配 fde_name，无法管理 Git 凭据', { httpStatus: 400 });
+    }
+    if (req.method === 'GET') {
+      const result = await gitCredential.listGitCredentials({ config: ctx.config, fdeName });
+      return sendJson(res, 200, { items: result.hosts });
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await gitCredential.setGitCredential({
+        pool: ctx.pool,
+        actorId: session.user.id,
+        config: ctx.config,
+        fdeName,
+        host: body?.host,
+        username: body?.username,
+        token: body?.token,
+      });
+      return sendJson(res, 200, result);
+    }
+    if (req.method === 'DELETE') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await gitCredential.deleteGitCredential({
+        pool: ctx.pool,
+        actorId: session.user.id,
+        config: ctx.config,
+        fdeName,
+        host: body?.host,
+      });
+      return sendJson(res, 200, result);
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
 
   // 边缘授权回调（Traefik forwardAuth）：非浏览器 API，不要求 session cookie。
   if (pathname === '/api/forward-auth') {
@@ -740,7 +778,12 @@ async function handleAdminApi(req, res, ctx, url) {
       return sendJson(res, 200, await admin.updateUser(ctx.pool, userId, body, { actorId: session.user.id }));
     }
     if (action === null && req.method === 'DELETE') {
-      await admin.deleteUser(ctx.pool, { actorId: session.user.id, userId });
+      await admin.deleteUser(ctx.pool, {
+        actorId: session.user.id,
+        userId,
+        config: ctx.config,
+        log: ctx.log,
+      });
       res.writeHead(204);
       res.end();
       return;
@@ -1588,7 +1631,9 @@ async function handleInternal(req, res, ctx, url) {
     const holdMs = body.hold_ms ?? 30000;
     // issue #69：会话历史预算经 config 注入（env：STATION_HISTORY_MAX_MESSAGES / STATION_HISTORY_MAX_BYTES）。
     const historyBudget = { maxMessages: ctx.config.historyMaxMessages, maxBytes: ctx.config.historyMaxBytes };
-    const ticket = await internal.claimRun(ctx.pool, { container, user, capacity, holdMs, historyBudget });
+    const ticket = await internal.claimRun(ctx.pool, {
+      container, user, capacity, holdMs, historyBudget, baseDomain: ctx.config.baseDomain,
+    });
     if (!ticket) {
       res.writeHead(204);
       res.end();

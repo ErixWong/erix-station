@@ -69,6 +69,8 @@ export class FakeInternalPool {
             container_name: c.container_name,
             token_generation: c.token_generation ?? 1,
             login: u?.login ?? '',
+            display_name: u?.display_name ?? null,
+            email: u?.email ?? null,
             user_status: u?.status ?? 'active',
           },
         ],
@@ -516,7 +518,7 @@ export class FakeInternalPool {
 /** 便捷构造：一套最小可认领的 run 现场。 */
 export function seedClaimable({ userId = 'u1', containerId = 'c1', runId = 'run1', sessionId = 's1', projectId = 'p1', token = 'tok_plain' } = {}) {
   const pool = new FakeInternalPool({
-    users: [{ id: userId, login: 'alice', status: 'active' }],
+    users: [{ id: userId, login: 'alice', display_name: 'Alice', email: 'alice@example.test', status: 'active' }],
     containers: [{ id: containerId, user_id: userId, runner_token_hash: hashToken(token), status: 'running', fde_name: 'alice', container_name: 'fde-alice', token_generation: 1 }],
     projects: [{ id: projectId, name: 'proj1', root_path: '~/projects/proj1' }],
     sessions: [{ id: sessionId, user_id: userId, project_id: projectId, cwd: '~/projects/proj1', model: 'mock-model', last_seq: 0 }],

@@ -213,6 +213,25 @@ test('invalid FDE names and symlinked user-space paths are rejected', async (t) 
   assert.equal(pool.calls.length, 0);
 });
 
+test('credential inputs reject whitespace-only values and tokens above the length limit', async (t) => {
+  const f = fixture(t);
+  const pool = recordingPool();
+  const common = { pool, config: f.config, fdeName: 'alice', host: 'github.com' };
+  await assert.rejects(
+    setGitCredential({ ...common, username: '  ', token: 'valid-token' }),
+    (err) => err instanceof GitCredentialError && err.details.field === 'username',
+  );
+  await assert.rejects(
+    setGitCredential({ ...common, username: 'alice', token: ' '.repeat(2) }),
+    (err) => err instanceof GitCredentialError && err.details.field === 'token',
+  );
+  await assert.rejects(
+    setGitCredential({ ...common, username: 'alice', token: 't'.repeat(4097) }),
+    (err) => err instanceof GitCredentialError && err.details.field === 'token',
+  );
+  assert.equal(pool.calls.length, 0);
+});
+
 test('materializer stale cleanup never removes the out-of-manifest credential file', async (t) => {
   const f = fixture(t);
   const contents = 'https://x-access-token:secret-token@github.com\n';
@@ -316,4 +335,122 @@ test('admin HTTP endpoints require admin auth and never echo the submitted token
   assert.equal(remove.status, 200);
   assert.deepEqual(await remove.json(), { host: 'github.com', deleted: true });
   assert.ok(pool.audit.every((entry) => !entry.details.includes(token)));
+});
+
+test('FDE self-service credentials use login ownership, write atomically, and never store or echo plaintext token', async (t) => {
+  const f = fixture(t);
+  const noFdeUser = {
+    ...ADMIN,
+    id: 'c0000000-0000-4000-8000-000000000003',
+    login: 'unassigned',
+    role: 'fde',
+  };
+  const pool = new FakePool({ users: [FDE_USER, noFdeUser] });
+  const calls = [];
+  const query = pool.query.bind(pool);
+  pool.query = async (sql, params = []) => {
+    calls.push({ sql, params });
+    return query(sql, params);
+  };
+  const fdeToken = 'git-credential-self-session';
+  const unassignedToken = 'git-credential-unassigned-session';
+  for (const [id, token] of [[FDE_USER.id, fdeToken], [noFdeUser.id, unassignedToken]]) {
+    pool.sessions.push({
+      id: `session-${id}`,
+      user_id: id,
+      token_hash: auth.hashToken(token),
+      created_at: new Date(),
+      expires_at: new Date(Date.now() + 60_000),
+      last_seen_at: new Date(),
+      revoked_at: null,
+    });
+  }
+  const config = {
+    cookie: cookieSettings('git-credential-self', 600),
+    sessionTtlSeconds: 600,
+    sessionRenewIntervalSeconds: 3600,
+    loginRateLimit: { maxFailures: 20, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
+    totpRateLimit: {
+      maxFailures: 20, windowMs: 60_000, blockMs: 60_000, perTokenMaxFailures: 20, maxEntries: 100,
+    },
+    kdfConcurrency: 1,
+    kdfQueueLimit: 10,
+    kdfQueueTimeoutMs: 1000,
+    maxBodyBytes: 64 * 1024,
+    userSpaceRoot: f.root,
+    fdeUid: 1000,
+    fdeGid: 1000,
+  };
+  const server = createServer({ pool, config, log: { error() {}, warn() {} } });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const endpoint = `http://127.0.0.1:${server.address().port}/api/me/git-credential`;
+  const cookie = (token) => `${config.cookie.name}=${token}`;
+
+  assert.equal((await fetch(endpoint)).status, 401);
+  const noFde = await fetch(endpoint, { headers: { cookie: cookie(unassignedToken) } });
+  assert.equal(noFde.status, 400);
+  assert.deepEqual((await noFde.json()).error, {
+    code: 'fde_name_required',
+    message: '当前用户未分配 fde_name，无法管理 Git 凭据',
+    retryable: false,
+  });
+
+  const initial = await fetch(endpoint, { headers: { cookie: cookie(fdeToken) } });
+  assert.equal(initial.status, 200);
+  assert.deepEqual(await initial.json(), { items: [] });
+
+  const secret = 'github-pat-self-service-super-secret';
+  const set = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { cookie: cookie(fdeToken), 'content-type': 'application/json' },
+    body: JSON.stringify({ host: 'github.com', username: 'alice-token', token: secret }),
+  });
+  assert.equal(set.status, 200);
+  const setBody = await set.json();
+  assert.deepEqual(setBody, { host: 'github.com', username: 'alice-token', configured: true });
+  assert.ok(!JSON.stringify(setBody).includes(secret));
+  assert.equal(fs.statSync(f.target).mode & 0o777, 0o640);
+  const initialContents = fs.readFileSync(f.target, 'utf8');
+  assert.ok(initialContents.includes(secret));
+  assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials'], 'atomic rename leaves no temporary file');
+
+  const get = await fetch(endpoint, { headers: { cookie: cookie(fdeToken) } });
+  assert.equal(get.status, 200);
+  const getBody = await get.json();
+  assert.deepEqual(getBody, { items: [{ host: 'github.com', username: 'alice-token', token: '****cret' }] });
+  assert.ok(!JSON.stringify(getBody).includes(secret));
+
+  const originalRename = fs.renameSync;
+  fs.renameSync = (from, to, ...args) => {
+    if (to === f.target) throw new Error('injected rename failure');
+    return originalRename(from, to, ...args);
+  };
+  try {
+    const failedReplace = await fetch(endpoint, {
+      method: 'PUT',
+      headers: { cookie: cookie(fdeToken), 'content-type': 'application/json' },
+      body: JSON.stringify({ host: 'github.com', username: 'alice-token', token: 'replacement-secret' }),
+    });
+    assert.equal(failedReplace.status, 500);
+    assert.ok(!(await failedReplace.text()).includes('replacement-secret'));
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.equal(fs.readFileSync(f.target, 'utf8'), initialContents, 'failed rename preserves old credential');
+  assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials']);
+
+  const deleteResponse = await fetch(endpoint, {
+    method: 'DELETE',
+    headers: { cookie: cookie(fdeToken), 'content-type': 'application/json' },
+    body: JSON.stringify({ host: 'github.com' }),
+  });
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(await deleteResponse.json(), { host: 'github.com', deleted: true });
+
+  for (const call of calls) {
+    assert.ok(!JSON.stringify(call.params).includes(secret), 'plaintext token must not reach DB parameters');
+    assert.ok(!JSON.stringify(call.params).includes('replacement-secret'), 'failed-write token must not reach DB parameters');
+  }
+  assert.ok(pool.audit.every((entry) => !entry.details.includes(secret)));
 });
