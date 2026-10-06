@@ -2,6 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { validateFdeName } from './projects.js';
 import { assertSafePath, atomicWriteFile } from './fsutil.js';
+import {
+  deleteGitCliConfig,
+  removeAllGitCliConfigFiles,
+  upsertGitCliConfig,
+} from './git-cli-config.js';
 
 const CREDENTIAL_FILE = '.git-credentials';
 const FILE_MODE = 0o640;
@@ -68,7 +73,7 @@ function getCredentialPath(config, fdeName) {
     }
     throw err;
   }
-  return { root, target };
+  return { root, target, homeDir };
 }
 
 export function removeGitCredentialFile({ config, fdeName } = {}) {
@@ -97,19 +102,19 @@ export function removeGitCredentialFile({ config, fdeName } = {}) {
     throw err;
   }
 
-  const { target } = getCredentialPath(config, fdeName);
+  const { root: safeRoot, target } = getCredentialPath(config, fdeName);
   let stat;
   try {
     stat = fs.lstatSync(target);
   } catch (err) {
-    if (err?.code === 'ENOENT') return false;
-    throw err;
+    if (err?.code !== 'ENOENT') throw err;
   }
-  if (!stat.isFile()) {
+  if (stat && !stat.isFile()) {
     throw new GitCredentialError('credential_file_invalid', 'git credential file must be a regular file', { httpStatus: 500 });
   }
-  fs.unlinkSync(target);
-  return true;
+  if (stat) fs.unlinkSync(target);
+  removeAllGitCliConfigFiles({ root: safeRoot, homeDir });
+  return Boolean(stat);
 }
 
 function readCredentialFile(target) {
@@ -238,19 +243,21 @@ function validateProtocol(protocol) {
   return protocol;
 }
 
-async function resolveConfiguredProtocol(pool, host) {
-  const result = await pool.query('SELECT base_url FROM git_hosts');
+async function resolveGitHost(pool, host) {
+  const result = await pool.query('SELECT base_url, provider FROM git_hosts');
   for (const row of result.rows) {
     try {
       const baseUrl = new URL(row.base_url);
       if (baseUrl.host.toLowerCase() !== host) continue;
-      if (baseUrl.protocol === 'http:') return 'http';
-      if (baseUrl.protocol === 'https:') return 'https';
+      return {
+        protocol: baseUrl.protocol === 'http:' ? 'http' : baseUrl.protocol === 'https:' ? 'https' : undefined,
+        provider: row.provider,
+      };
     } catch {
       // Invalid configuration rows cannot identify a credential host.
     }
   }
-  return 'https';
+  return {};
 }
 
 function assertAuditPool(pool) {
@@ -266,9 +273,10 @@ export async function setGitCredential({ pool, actorId = null, config, fdeName, 
   validateToken(token);
   const requestedProtocol = validateProtocol(protocol);
   assertAuditPool(pool);
-  const { root, target } = getCredentialPath(config, fdeName);
+  const { root, target, homeDir } = getCredentialPath(config, fdeName);
   const contents = readCredentialFile(target);
-  const scheme = requestedProtocol ?? await resolveConfiguredProtocol(pool, normalizedHost);
+  const registeredHost = await resolveGitHost(pool, normalizedHost);
+  const scheme = requestedProtocol ?? registeredHost.protocol ?? 'https';
   const credentialLine = `${scheme}://${encodeUserInfo(username)}:${encodeUserInfo(token)}@${normalizedHost}`;
   const nextContents = replaceHostLine(contents, normalizedHost, credentialLine);
   atomicWriteFile(target, nextContents, {
@@ -276,6 +284,16 @@ export async function setGitCredential({ pool, actorId = null, config, fdeName, 
     uid: config.fdeUid ?? 1000,
     gid: config.fdeGid ?? 1000,
     root,
+  });
+  upsertGitCliConfig({
+    root,
+    homeDir,
+    config,
+    provider: registeredHost.provider,
+    host: normalizedHost,
+    username,
+    token,
+    protocol: scheme,
   });
   await writeAudit(pool, actorId, 'admin.git_credential_set', fdeName, {
     fde_name: fdeName,
@@ -289,7 +307,8 @@ export async function deleteGitCredential({ pool, actorId = null, config, fdeNam
   const normalizedHost = validateHost(host);
   validateFde(fdeName);
   assertAuditPool(pool);
-  const { root, target } = getCredentialPath(config, fdeName);
+  const { root, target, homeDir } = getCredentialPath(config, fdeName);
+  const registeredHost = await resolveGitHost(pool, normalizedHost);
   const contents = readCredentialFile(target);
   const lines = fileLines(contents);
   const nextLines = lines.filter((line) => credentialHost(line) !== normalizedHost);
@@ -299,6 +318,13 @@ export async function deleteGitCredential({ pool, actorId = null, config, fdeNam
     uid: config.fdeUid ?? 1000,
     gid: config.fdeGid ?? 1000,
     root,
+  });
+  deleteGitCliConfig({
+    root,
+    homeDir,
+    config,
+    provider: registeredHost.provider,
+    host: normalizedHost,
   });
   await writeAudit(pool, actorId, 'admin.git_credential_deleted', fdeName, {
     fde_name: fdeName,

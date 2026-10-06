@@ -197,11 +197,11 @@
 ### Q7 portal 技术栈与依赖政策
 
 - **约束（来自原理，不是偏好）**：必须能长时间持有任务、能写 DB、能操作 Docker API、能被 Traefik forwardAuth 调用
-- **候选**：(a) 零依赖 `node:http` + 原生前端；(b) 框架（Next.js 等）
+- **候选**：(a) 原生 `node:http` + 原生前端、零 Web 框架；(b) 框架（Next.js 等）
 - **影响面**：整体实现；也决定由谁来做前端
 - **当前倾向**：(a)——与 erix 家族的零依赖传统一致，自托管场景不需要构建链；代价是 UI 要自己写
 
-> **Q7 已定稿（P1 walking skeleton 落地）**：采用 (a) 零依赖 `node:http` + 原生前端。**运行时依赖的唯一例外 = `pg`**（Postgres 驱动）——HTTP/UI 零框架，而「DB 是状态真相」（原理三）要求平台直连中心库，`pg` 是必需驱动、无内置替代。口令哈希在 P1 暂用 Node 内置 `crypto.scrypt`（不加依赖），argon2id 待决策者确认后按自描述哈希平滑迁移（portal.md §2.9.4）。
+> **Q7 已定稿（P1 walking skeleton 落地）**：采用 (a) 原生 `node:http` + 原生前端、零 Web 框架。运行时依赖为 `pg`（Postgres 驱动）和 `yaml`（安全读写 provider CLI 配置）；`pg` 是「DB 是状态真相」（原理三）的必需驱动，`yaml` 用于保留并安全更新 CLI 自有 YAML 配置。口令哈希在 P1 暂用 Node 内置 `crypto.scrypt`（不新增依赖），argon2id 待决策者确认后按自描述哈希平滑迁移（portal.md §2.9.4）。
 
 ---
 
