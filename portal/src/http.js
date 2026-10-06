@@ -23,6 +23,7 @@ import * as dirs from './dirs.js';
 import * as gitCredential from './git-credential.js';
 import * as gitHosts from './git-hosts.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
+import * as onboarding from './onboarding.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -636,27 +637,83 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'POST') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      const created = await admin.createUser(ctx.pool, {
+      const rawGitHostId = body?.git_host_id;
+      if (typeof rawGitHostId !== 'string'
+          || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawGitHostId)) {
+        throw new HttpError(400, 'validation_failed', 'git_host_id 必须是有效 UUID', { details: { field: 'git_host_id' } });
+      }
+      const gitHostId = rawGitHostId.toLowerCase();
+      const client = await ctx.pool.connect();
+      let created;
+      let onboardingStatus;
+      try {
+        await client.query('BEGIN');
+        const hostResult = await client.query(
+          `SELECT id, provider, enabled FROM git_hosts WHERE id = $1 FOR SHARE`,
+          [gitHostId],
+        );
+        const gitHost = hostResult.rows[0];
+        if (!gitHost) {
+          throw new admin.AdminError('validation_failed', 'git_host_id 不存在', { details: { field: 'git_host_id' } });
+        }
+        if (!gitHost.enabled) {
+          throw new admin.AdminError('validation_failed', 'git host 已停用', { details: { field: 'git_host_id' } });
+        }
+        if (gitHost.provider === 'azure') {
+          throw new admin.AdminError('validation_failed', 'azure provider 尚不支持开户', { details: { field: 'git_host_id' } });
+        }
+
+        created = await admin.createUser(client, {
+          actorId: session.user.id,
+          login: body?.login,
+          display_name: body?.display_name,
+          password: body?.password,
+          email: body?.email,
+          fde_name: body?.fde_name,
+          totp_enabled: body?.totp_enabled === true,
+          totpIssuer: ctx.config.totp?.issuer,
+          limits: {
+            maxLoginLength: ctx.config.maxLoginLength,
+            maxPasswordLength: ctx.config.maxPasswordLength,
+          },
+          deferAudit: true,
+        });
+        onboardingStatus = await onboarding.enqueueOnboarding(client, {
+          fdeId: created.user.id,
+          gitHostId,
+        });
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+      await admin.writeUserCreatedAudit(ctx.pool, {
         actorId: session.user.id,
-        login: body?.login,
-        display_name: body?.display_name,
-        password: body?.password,
-        fde_name: body?.fde_name,
-        totp_enabled: body?.totp_enabled === true,
-        totpIssuer: ctx.config.totp?.issuer,
-        limits: {
-          maxLoginLength: ctx.config.maxLoginLength,
-          maxPasswordLength: ctx.config.maxPasswordLength,
-        },
+        login: created.user.login,
+        fde_name: created.user.fde_name,
       });
       // 创建与补绑各自只在对应响应下发种子（红线）；列表/其它端点永不回显。
-      return sendJson(res, 201, created);
+      return sendJson(res, 201, { ...created, onboarding: onboardingStatus });
     }
   }
-  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset|totp-enroll))?$/);
+  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset|totp-enroll|onboard\/retry))?$/);
   if (adminUserMatch) {
     const userId = decodeAdminUserUuid(adminUserMatch[1]);
     const action = adminUserMatch[2] ?? null;
+    if (action === 'onboard/retry' && req.method === 'POST') {
+      const result = await onboarding.retryOnboarding(ctx.pool, userId);
+      if (!result) {
+        const user = await ctx.pool.query(`SELECT 1 FROM users WHERE id = $1`, [userId]);
+        if (!user.rows[0]) throw new admin.AdminError('not_found', '用户不存在', { httpStatus: 404 });
+        throw new admin.AdminError('onboarding_not_found', '用户没有开户任务', { httpStatus: 409 });
+      }
+      if (result.state === 'running') {
+        throw new admin.AdminError('onboarding_running', '开户任务正在运行', { httpStatus: 409 });
+      }
+      return sendJson(res, 200, { onboarding: result });
+    }
     if (action === 'reset-password' && req.method === 'POST') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
