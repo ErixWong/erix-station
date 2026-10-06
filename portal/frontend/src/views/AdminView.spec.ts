@@ -153,6 +153,19 @@ describe('Admin console routing and layout', () => {
 });
 
 describe('AdminReposView · Git host registry', () => {
+  it('provider dropdown lists Gitea and GitLab but not GitHub', async () => {
+    const { wrapper } = await mountAdmin('/admin/repos');
+    try {
+      await wrapper.get('[data-test="open-add-git-host"]').trigger('click');
+      const providerSelect = wrapper.get('[data-test="git-host-form"] select');
+      expect(providerSelect.find('option[value="gitea"]').exists()).toBe(true);
+      expect(providerSelect.find('option[value="gitlab"]').exists()).toBe(true);
+      expect(providerSelect.find('option[value="github"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
   it('adds, edits, toggles, and deletes hosts through modals without exposing admin key', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/repos', (url, init) => {
       if (url === '/api/admin/git-hosts' && init?.method === 'POST') return jsonResponse(201, { host: {} });
