@@ -432,6 +432,7 @@ async function routeApi(req, res, ctx, url) {
         host: body?.host,
         username: body?.username,
         token: body?.token,
+        protocol: body?.protocol,
       });
       return sendJson(res, 200, result);
     }

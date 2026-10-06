@@ -47,12 +47,15 @@ function fixture(t) {
   };
 }
 
-function recordingPool() {
+function recordingPool(gitHostBaseUrls = []) {
   const calls = [];
   return {
     calls,
-    query: async (sql, params) => {
+    query: async (sql, params = []) => {
       calls.push({ sql, params });
+      if (sql === 'SELECT base_url FROM git_hosts') {
+        return { rows: gitHostBaseUrls.map((base_url) => ({ base_url })) };
+      }
       return { rows: [] };
     },
   };
@@ -122,7 +125,7 @@ test('atomic replacement leaves the old credential intact on rename failure', as
   const common = { pool, actorId: 'admin-id', config: f.config, fdeName: 'alice' };
   await setGitCredential({ ...common, host: 'github.com', username: 'x-access-token', token: 'old-secret-token' });
   const previous = fs.readFileSync(f.target, 'utf8');
-  const auditCount = pool.calls.length;
+  const auditCount = pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log')).length;
   const originalRename = fs.renameSync;
   fs.renameSync = (from, to, ...args) => {
     if (to === f.target) throw new Error('injected rename failure');
@@ -137,8 +140,96 @@ test('atomic replacement leaves the old credential intact on rename failure', as
     fs.renameSync = originalRename;
   }
   assert.equal(fs.readFileSync(f.target, 'utf8'), previous);
-  assert.equal(pool.calls.length, auditCount, 'failed writes are not audited as successful');
+  assert.equal(
+    pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log')).length,
+    auditCount,
+    'failed writes are not audited as successful',
+  );
   assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials'], 'temporary file is removed');
+});
+
+test('credential protocol follows matching git_hosts configuration and defaults to HTTPS without a match', async (t) => {
+  const f = fixture(t);
+  const cases = [
+    {
+      host: 'gitea.example.test:3000',
+      baseUrls: ['https://gitea.example.test:3001', 'http://gitea.example.test:3000'],
+      protocol: 'http',
+    },
+    {
+      host: 'secure.example.test:8443',
+      baseUrls: ['https://secure.example.test:8443'],
+      protocol: 'https',
+    },
+    {
+      host: 'unlisted.example.test:3000',
+      baseUrls: ['http://another.example.test:3000'],
+      protocol: 'https',
+    },
+  ];
+
+  for (const [index, { host, baseUrls, protocol }] of cases.entries()) {
+    await setGitCredential({
+      pool: recordingPool(baseUrls),
+      config: f.config,
+      fdeName: 'alice',
+      host,
+      username: `user-${index}`,
+      token: `token-${index}`,
+    });
+    const lines = fs.readFileSync(f.target, 'utf8').trimEnd().split('\n');
+    const line = lines.find((entry) => new URL(entry).host === host);
+    assert.ok(line?.startsWith(`${protocol}://`), `${host} should use ${protocol}`);
+  }
+});
+
+test('explicit protocol overrides git_hosts and invalid protocol is rejected', async (t) => {
+  const f = fixture(t);
+  const pool = recordingPool(['http://git.example.test:3000']);
+  await setGitCredential({
+    pool,
+    config: f.config,
+    fdeName: 'alice',
+    host: 'git.example.test:3000',
+    username: 'alice',
+    token: 'secret',
+    protocol: 'https',
+  });
+  assert.ok(fs.readFileSync(f.target, 'utf8').startsWith('https://'));
+
+  const invalidPool = recordingPool(['http://git.example.test:3000']);
+  await assert.rejects(
+    setGitCredential({
+      pool: invalidPool,
+      config: f.config,
+      fdeName: 'alice',
+      host: 'invalid.example.test',
+      username: 'alice',
+      token: 'secret',
+      protocol: 'ftp',
+    }),
+    (err) => err instanceof GitCredentialError && err.code === 'validation_failed' && err.details.field === 'protocol',
+  );
+  assert.equal(invalidPool.calls.length, 0);
+});
+
+test('changing protocol replaces the existing host line without leaving a duplicate', async (t) => {
+  const f = fixture(t);
+  const common = {
+    config: f.config,
+    fdeName: 'alice',
+    host: 'git.example.test:3000',
+    username: 'alice',
+    token: 'secret',
+  };
+  await setGitCredential({ ...common, pool: recordingPool(['https://git.example.test:3000']) });
+  assert.ok(fs.readFileSync(f.target, 'utf8').startsWith('https://'));
+
+  await setGitCredential({ ...common, pool: recordingPool(['http://git.example.test:3000']) });
+  const lines = fs.readFileSync(f.target, 'utf8').trimEnd().split('\n');
+  assert.equal(lines.length, 1);
+  assert.equal(new URL(lines[0]).host, common.host);
+  assert.equal(new URL(lines[0]).protocol, 'http:');
 });
 
 test('GET returns a masked credential view and DB audit calls never contain token text', async (t) => {
@@ -151,7 +242,7 @@ test('GET returns a masked credential view and DB audit calls never contain toke
   });
   const response = await listGitCredentials({ config: f.config, fdeName: 'alice' });
   assert.deepEqual(response, {
-    hosts: [{ host: 'github.com', username: 'x-access-token', token: '****3456' }],
+    hosts: [{ host: 'github.com', protocol: 'https', username: 'x-access-token', token: '****3456' }],
   });
   assert.ok(!JSON.stringify(response).includes(token));
   assertNoTokenInDbCalls(pool, token);
@@ -325,7 +416,9 @@ test('admin HTTP endpoints require admin auth and never echo the submitted token
   const get = await fetch(endpoint, { headers: { cookie: adminCookie } });
   assert.equal(get.status, 200);
   const getBody = await get.json();
-  assert.deepEqual(getBody, { hosts: [{ host: 'github.com', username: 'x-access-token', token: '****alue' }] });
+  assert.deepEqual(getBody, {
+    hosts: [{ host: 'github.com', protocol: 'https', username: 'x-access-token', token: '****alue' }],
+  });
   assert.ok(!JSON.stringify(getBody).includes(token));
 
   const remove = await fetch(`${endpoint}?host=github.com`, {
@@ -350,6 +443,7 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   const query = pool.query.bind(pool);
   pool.query = async (sql, params = []) => {
     calls.push({ sql, params });
+    if (sql === 'SELECT base_url FROM git_hosts') return { rows: [{ base_url: 'http://github.com' }] };
     return query(sql, params);
   };
   const fdeToken = 'git-credential-self-session';
@@ -411,15 +505,41 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   assert.deepEqual(setBody, { host: 'github.com', username: 'alice-token', configured: true });
   assert.ok(!JSON.stringify(setBody).includes(secret));
   assert.equal(fs.statSync(f.target).mode & 0o777, 0o640);
-  const initialContents = fs.readFileSync(f.target, 'utf8');
+  let initialContents = fs.readFileSync(f.target, 'utf8');
+  assert.ok(initialContents.startsWith('http://alice-token:'));
   assert.ok(initialContents.includes(secret));
   assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials'], 'atomic rename leaves no temporary file');
 
   const get = await fetch(endpoint, { headers: { cookie: cookie(fdeToken) } });
   assert.equal(get.status, 200);
   const getBody = await get.json();
-  assert.deepEqual(getBody, { items: [{ host: 'github.com', username: 'alice-token', token: '****cret' }] });
+  assert.deepEqual(getBody, {
+    items: [{ host: 'github.com', protocol: 'http', username: 'alice-token', token: '****cret' }],
+  });
   assert.ok(!JSON.stringify(getBody).includes(secret));
+
+  const override = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { cookie: cookie(fdeToken), 'content-type': 'application/json' },
+    body: JSON.stringify({ host: 'github.com', username: 'alice-token', token: secret, protocol: 'https' }),
+  });
+  assert.equal(override.status, 200);
+  initialContents = fs.readFileSync(f.target, 'utf8');
+  assert.ok(initialContents.startsWith('https://alice-token:'));
+
+  const invalidProtocol = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { cookie: cookie(fdeToken), 'content-type': 'application/json' },
+    body: JSON.stringify({ host: 'github.com', username: 'alice-token', token: secret, protocol: 'ftp' }),
+  });
+  assert.equal(invalidProtocol.status, 400);
+  assert.deepEqual((await invalidProtocol.json()).error, {
+    code: 'validation_failed',
+    message: 'protocol 必须是 http 或 https',
+    retryable: false,
+    details: { field: 'protocol' },
+  });
+  assert.equal(fs.readFileSync(f.target, 'utf8'), initialContents);
 
   const originalRename = fs.renameSync;
   fs.renameSync = (from, to, ...args) => {
