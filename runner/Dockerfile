@@ -55,22 +55,22 @@ ARG GLAB_CLI_VERSION=1.121.0
 RUN set -eu; \
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT; \
   mkdir -p "$tmp/gh" "$tmp/glab"; \
-  curl --fail --silent --show-error --location \
+  curl --fail --silent --show-error --location --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors \
     "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
     -o "$tmp/gh.tar.gz"; \
   tar -xzf "$tmp/gh.tar.gz" -C "$tmp/gh"; \
   install -o root -g root -m 0755 "$tmp/gh/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \
-  curl --fail --silent --show-error --location \
+  curl --fail --silent --show-error --location --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors \
     "https://dl.gitea.io/tea/${TEA_CLI_VERSION}/tea-${TEA_CLI_VERSION}-linux-amd64" \
     -o "$tmp/tea"; \
   install -o root -g root -m 0755 "$tmp/tea" /usr/local/bin/tea; \
-  curl --fail --silent --show-error --location \
+  curl --fail --silent --show-error --location --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors \
     "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_CLI_VERSION}/downloads/glab_${GLAB_CLI_VERSION}_linux_amd64.tar.gz" \
     -o "$tmp/glab.tar.gz"; \
   tar -xzf "$tmp/glab.tar.gz" -C "$tmp/glab"; \
   install -o root -g root -m 0755 "$tmp/glab/bin/glab" /usr/local/bin/glab; \
   gh --version | grep -F "gh version ${GH_CLI_VERSION} (" >/dev/null; \
-  tea --version | grep -F "Version: ${TEA_CLI_VERSION}" >/dev/null; \
+  tea --version | sed 's/\x1b\[[0-9;]*m//g' | grep -F "Version: ${TEA_CLI_VERSION}" >/dev/null; \
   glab --version | grep -F "glab ${GLAB_CLI_VERSION} " >/dev/null
 
 # ---- git 跨 UID 协作（实测发现，issue #27 记录）----
