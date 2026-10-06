@@ -4,7 +4,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import App from '../App.vue';
 import { createAppRouter } from '../router';
-import { useAdminStore } from '../stores/admin';
+import { useAdminStore, type AdminUser } from '../stores/admin';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
 
@@ -597,13 +597,17 @@ describe('AdminView · FDE 用户', () => {
     await form.get('[data-test="user-email"]').setValue('carol@example.test');
     await form.get('[data-test="user-fde-name"]').setValue('carol');
     await form.get('[data-test="new-user-git-host"]').setValue('gh1');
+    await form.get('[data-test="new-user-llm-provider"]').setValue('p1');
+    await form.get('[data-test="new-user-main-model"]').setValue('m1');
     await form.get('[data-test="user-totp-enabled"]').setValue(true);
     await form.trigger('submit.prevent');
     await flushPromises();
 
     expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
       login: 'carol', display_name: 'Carol', password: 'pass123', email: 'carol@example.test',
-      fde_name: 'carol', git_host_id: 'gh1', totp_enabled: true,
+      fde_name: 'carol', git_host_id: 'gh1',
+      llm: { provider_id: 'p1', main_model_id: 'm1', embedding_model_id: null, vision_model_id: null },
+      totp_enabled: true,
     });
     const totp = wrapper.get('[data-test="totp-box"]');
     expect(totp.text()).toContain('仅此一次显示');
@@ -696,15 +700,52 @@ describe('AdminView · FDE 用户', () => {
       await form.get('[data-test="user-email"]').setValue('dave@example.test');
       await form.get('[data-test="user-fde-name"]').setValue('dave');
       await form.get('[data-test="new-user-git-host"]').setValue('gh1');
+      await form.get('[data-test="new-user-llm-provider"]').setValue('p1');
+      await form.get('[data-test="new-user-main-model"]').setValue('m1');
       await form.trigger('submit.prevent');
       await flushPromises();
 
       expect(JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/users')[0][1]?.body))).toEqual({
         login: 'dave', display_name: '', password: 'pass123', email: 'dave@example.test',
-        fde_name: 'dave', git_host_id: 'gh1', totp_enabled: false,
+        fde_name: 'dave', git_host_id: 'gh1',
+        llm: { provider_id: 'p1', main_model_id: 'm1', embedding_model_id: null, vision_model_id: null },
+        totp_enabled: false,
       });
       expect(wrapper.find('[data-test="add-user-form"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('创建用户表单必须先选择有效主模型；目录不可用时显示错误并禁止提交', async () => {
+    const { wrapper, fetchFn, pinia } = await mountAdmin();
+    try {
+      await wrapper.get('[data-test="open-add-user"]').trigger('click');
+      await flushPromises();
+      const form = wrapper.get('[data-test="add-user-form"]');
+      await form.findAll('input')[0].setValue('no-model');
+      await form.get('#new-user-password').setValue('pass123');
+      await form.get('[data-test="user-email"]').setValue('no-model@example.test');
+      await form.get('[data-test="user-fde-name"]').setValue('no-model');
+      await form.get('[data-test="new-user-git-host"]').setValue('gh1');
+      const submit = form.get('button[type="submit"]');
+      expect((submit.element as HTMLButtonElement).disabled).toBe(true);
+      await form.trigger('submit.prevent');
+      expect(callsTo(fetchFn, 'POST', '/api/admin/users')).toHaveLength(0);
+
+      await form.get('[data-test="new-user-llm-provider"]').setValue('p1');
+      await form.get('[data-test="new-user-main-model"]').setValue('m1');
+      expect((submit.element as HTMLButtonElement).disabled).toBe(false);
+
+      const store = useAdminStore(pinia);
+      store.providersLoaded = false;
+      store.llmErr = 'LiteLLM is unavailable';
+      await flushPromises();
+      expect(form.find('[role="alert"]').text()).toMatch(/启用或修复|Enable or repair/i);
+      expect((submit.element as HTMLButtonElement).disabled).toBe(true);
+      await form.trigger('submit.prevent');
+      expect(callsTo(fetchFn, 'POST', '/api/admin/users')).toHaveLength(0);
     } finally {
       wrapper.unmount();
     }
@@ -1016,6 +1057,42 @@ describe('AdminView · FDE 用户', () => {
     expect(callsTo(fetchFn, 'POST', '/api/admin/users/u1/onboard/retry')).toHaveLength(1);
     expect(row.text()).toContain('开户中');
     expect(row.findAll('[data-test="retry-onboarding"]')).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it('整体开户已完成但 LLM 绑定失败时仍显示错误并可重试', async () => {
+    let users: AdminUser[] = [{
+      id: 'u-llm', login: 'llm-user', display_name: 'LLM User', role: 'fde', fde_name: 'llm-user',
+      status: 'awaiting_credential', totp_enabled: false, last_login_at: null,
+      onboarding: {
+        state: 'awaiting_credential', step: null, error: null,
+        llm_binding: { state: 'failed', error: 'LiteLLM virtual-key setup failed (HTTP 502)' },
+      },
+    }];
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, { items: users });
+      if (url === '/api/admin/users/u-llm/onboard/retry' && init?.method === 'POST') {
+        users = users.map((user) => ({
+          ...user,
+          onboarding: {
+            state: 'pending', step: 'llm-binding', error: null,
+            llm_binding: { state: 'pending', error: null },
+          },
+        }));
+        return jsonResponse(200, { onboarding: users[0]?.onboarding });
+      }
+      return undefined;
+    });
+    const row = wrapper.get('[data-test="user-row"]');
+    const status = row.get('[data-test="onboarding-status"]');
+    expect(status.text()).toMatch(/待凭据\s+·\s+LLM 绑定失败/);
+    expect(status.attributes('title'))
+      .toBe('LiteLLM virtual-key setup failed (HTTP 502)');
+    await row.get('[data-test="retry-onboarding"]').trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'POST', '/api/admin/users/u-llm/onboard/retry')).toHaveLength(1);
+    expect(row.text()).toContain('开户中');
+    expect(row.find('[data-test="retry-onboarding"]').exists()).toBe(false);
     wrapper.unmount();
   });
 

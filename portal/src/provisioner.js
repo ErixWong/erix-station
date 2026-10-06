@@ -616,7 +616,9 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
 }
 
 /** onboarding：分配子网（IPAM）→ 可选配置 Git host → 建网络 + 容器。幂等。 */
-export async function onboardFde(pool, config, { fdeName, gitHostId = null, docker, log = console } = {}) {
+export async function onboardFde(pool, config, {
+  fdeName, gitHostId = null, docker, log = console, skipLlmSync = false,
+} = {}) {
   return withFdeLock(pool, fdeName, async () => {
     const stackId = config.stackId ?? 'default'; // F9：本栈所有权 id
     const user = await pool.query(
@@ -788,7 +790,9 @@ export async function onboardFde(pool, config, { fdeName, gitHostId = null, dock
     // F1（Round B 评审）：参数名必须叫 fdeId——llm.js 的 syncFdeLlmBindingOnOnboard 按
     // { fdeId, fdeName, restoreRevoked } 解构，传 userId 会被静默丢弃 → fde_id=NULL → 无行命中，
     // 恢复/重发布静默 no-op。此处 userId 即该 FDE 的 users.id（= fde_llm_bindings.fde_id）。
-    await syncFdeLlmBindingOnOnboard(pool, { fdeId: userId, fdeName, restoreRevoked: !needRecreate });
+    if (!skipLlmSync) {
+      await syncFdeLlmBindingOnOnboard(pool, { fdeId: userId, fdeName, restoreRevoked: !needRecreate });
+    }
 
     return {
       userId,

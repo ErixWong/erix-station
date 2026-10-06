@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
-import { useAdminStore, type AdminUser } from '../stores/admin';
+import { useAdminStore, type AdminUser, type LlmModel, type LlmProvider } from '../stores/admin';
 import { useAuthStore } from '../stores/auth';
 
 const { t, locale } = useI18n();
@@ -17,7 +17,10 @@ const showAddUser = ref(false);
 const showTotp = ref(false);
 const resumeEditAfterTotp = ref(false);
 const submitting = ref(false);
-const userForm = reactive({ login: '', display_name: '', password: '', email: '', fde_name: '', git_host_id: '', totpEnabled: false });
+const userForm = reactive({
+  login: '', display_name: '', password: '', email: '', fde_name: '', git_host_id: '', totpEnabled: false,
+  llm: { provider_id: '', main_model_id: '', embedding_model_id: '', vision_model_id: '' },
+});
 
 const editUserId = ref<string | null>(null);
 const editModalOpen = ref(false);
@@ -63,6 +66,45 @@ const deleteMatchesLogin = computed(() =>
 const onboardableGitHosts = computed(() =>
   admin.gitHosts.filter((host) => host.enabled && host.provider !== 'azure'),
 );
+const isEnabledModel = (model: LlmModel) => model.enabled;
+const onboardableLlmProviders = computed<LlmProvider[]>(() =>
+  admin.providers.filter((provider) =>
+    provider.models.some((model) => isEnabledModel(model) && model.type === 'text' && model.tool_calling)),
+);
+const selectedNewLlmProvider = computed(() =>
+  onboardableLlmProviders.value.find((provider) => provider.id === userForm.llm.provider_id) ?? null,
+);
+const newMainModelOptions = computed(() =>
+  (selectedNewLlmProvider.value?.models ?? [])
+    .filter((model) => isEnabledModel(model) && model.type === 'text' && model.tool_calling),
+);
+const newEmbeddingModelOptions = computed(() =>
+  (selectedNewLlmProvider.value?.models ?? []).filter((model) => isEnabledModel(model) && model.type === 'embedding'),
+);
+const newVisionModelOptions = computed(() =>
+  (selectedNewLlmProvider.value?.models ?? []).filter((model) => isEnabledModel(model) && model.type === 'vision'),
+);
+const addUserLlmValid = computed(() =>
+  admin.providersLoaded
+  && !admin.llmErr
+  && newMainModelOptions.value.some((model) => model.id === userForm.llm.main_model_id),
+);
+const canSubmitAddUser = computed(() =>
+  !submitting.value
+  && admin.gitHostsLoaded
+  && onboardableGitHosts.value.some((host) => host.id === userForm.git_host_id)
+  && addUserLlmValid.value
+  && userForm.login.trim() !== ''
+  && userForm.password !== ''
+  && userForm.email.trim() !== ''
+  && userForm.fde_name.trim() !== '',
+);
+
+watch(() => userForm.llm.provider_id, () => {
+  userForm.llm.main_model_id = '';
+  userForm.llm.embedding_model_id = '';
+  userForm.llm.vision_model_id = '';
+});
 
 function resetUserForm() {
   userForm.login = '';
@@ -72,6 +114,10 @@ function resetUserForm() {
   userForm.fde_name = '';
   userForm.git_host_id = '';
   userForm.totpEnabled = false;
+  userForm.llm.provider_id = '';
+  userForm.llm.main_model_id = '';
+  userForm.llm.embedding_model_id = '';
+  userForm.llm.vision_model_id = '';
 }
 
 function closeAddUser() {
@@ -110,7 +156,7 @@ function fillRandomPassword() {
 }
 
 async function onAddUser() {
-  if (submitting.value) return;
+  if (!canSubmitAddUser.value) return;
   submitting.value = true;
   try {
     const err = await admin.addUser({
@@ -120,6 +166,12 @@ async function onAddUser() {
       email: userForm.email.trim(),
       fde_name: userForm.fde_name.trim(),
       git_host_id: userForm.git_host_id,
+      llm: {
+        provider_id: userForm.llm.provider_id,
+        main_model_id: userForm.llm.main_model_id,
+        embedding_model_id: userForm.llm.embedding_model_id || null,
+        vision_model_id: userForm.llm.vision_model_id || null,
+      },
       totpEnabled: userForm.totpEnabled,
     });
     if (!err) {
@@ -529,12 +581,19 @@ onBeforeUnmount(() => {
                 <td class="px-2 py-2.5">
                   <span
                     v-if="user.onboarding"
-                    :title="user.onboarding.state === 'failed' ? user.onboarding.error ?? '' : undefined"
-                    :class="user.onboarding.state === 'failed' ? 'text-red-700' : 'text-black/65'"
-                  >{{ t(`admin.fde.onboarding.${user.onboarding.state}`) }}</span>
+                    data-test="onboarding-status"
+                    :title="user.onboarding.llm_binding?.state === 'failed'
+                      ? user.onboarding.llm_binding.error ?? ''
+                      : user.onboarding.state === 'failed' ? user.onboarding.error ?? '' : undefined"
+                    :class="user.onboarding.state === 'failed' || user.onboarding.llm_binding?.state === 'failed'
+                      ? 'text-red-700' : 'text-black/65'"
+                  >
+                    {{ t(`admin.fde.onboarding.${user.onboarding.state}`) }}
+                    <span v-if="user.onboarding.llm_binding?.state === 'failed'"> · {{ t('admin.fde.llmBindingFailed') }}</span>
+                  </span>
                   <span v-else class="text-black/35">—</span>
                   <button
-                    v-if="user.onboarding?.state === 'failed'"
+                    v-if="user.onboarding?.state === 'failed' || user.onboarding?.llm_binding?.state === 'failed'"
                     type="button"
                     data-test="retry-onboarding"
                     class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
@@ -630,6 +689,77 @@ onBeforeUnmount(() => {
         </select>
         <span v-if="admin.gitHostsLoaded && onboardableGitHosts.length === 0" class="text-amber-800">{{ t('admin.fde.noOnboardableGitHosts') }}</span>
       </label>
+      <section class="grid gap-2 rounded-md border border-black/10 p-2" data-test="new-user-llm">
+        <h3 class="text-xs font-medium text-black/70">{{ t('admin.fde.llmModelSection') }}</h3>
+        <p v-if="admin.llmErr" class="syserr" role="alert">
+          {{ t('admin.fde.llmCatalogError', { error: admin.llmErr }) }}
+          <button type="button" class="ml-1 underline" @click="admin.loadProviders()">
+            {{ t('admin.fde.retryLlmCatalog') }}
+          </button>
+        </p>
+        <p v-else-if="!admin.providersLoaded" class="text-xs text-black/55" role="status">
+          {{ t('admin.fde.loadingLlmCatalog') }}
+        </p>
+        <p v-else-if="onboardableLlmProviders.length === 0" class="text-xs text-amber-800" role="alert">
+          {{ t('admin.fde.noOnboardableLlmModels') }}
+        </p>
+        <label class="flex flex-col gap-1 text-xs text-black/55">
+          {{ t('admin.fde.llmProviderLabel') }}
+          <select
+            v-model="userForm.llm.provider_id"
+            data-test="new-user-llm-provider"
+            required
+            :disabled="!admin.providersLoaded || Boolean(admin.llmErr) || onboardableLlmProviders.length === 0"
+            class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+          >
+            <option disabled value="">{{ t('admin.fde.selectLlmProvider') }}</option>
+            <option v-for="provider in onboardableLlmProviders" :key="provider.id" :value="provider.id">{{ provider.name }}</option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-black/55">
+          {{ t('admin.fde.llmMainModelLabel') }}
+          <select
+            v-model="userForm.llm.main_model_id"
+            data-test="new-user-main-model"
+            required
+            :disabled="!selectedNewLlmProvider || Boolean(admin.llmErr)"
+            class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+          >
+            <option disabled value="">{{ t('admin.fde.selectLlmMainModel') }}</option>
+            <option v-for="model in newMainModelOptions" :key="model.id" :value="model.id">
+              {{ model.model_id }} — {{ model.name }}
+            </option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-black/55">
+          {{ t('admin.fde.llmEmbeddingModelLabel') }}
+          <select
+            v-model="userForm.llm.embedding_model_id"
+            data-test="new-user-embedding-model"
+            :disabled="!selectedNewLlmProvider || Boolean(admin.llmErr)"
+            class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+          >
+            <option value="">{{ t('admin.fde.llmModelNotConfigured') }}</option>
+            <option v-for="model in newEmbeddingModelOptions" :key="model.id" :value="model.id">
+              {{ model.model_id }} — {{ model.name }}
+            </option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-black/55">
+          {{ t('admin.fde.llmVisionModelLabel') }}
+          <select
+            v-model="userForm.llm.vision_model_id"
+            data-test="new-user-vision-model"
+            :disabled="!selectedNewLlmProvider || Boolean(admin.llmErr)"
+            class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm"
+          >
+            <option value="">{{ t('admin.fde.llmModelNotConfigured') }}</option>
+            <option v-for="model in newVisionModelOptions" :key="model.id" :value="model.id">
+              {{ model.model_id }} — {{ model.name }}
+            </option>
+          </select>
+        </label>
+      </section>
       <div class="flex flex-col gap-1 text-xs text-black/55">
         <label class="flex items-center gap-2">
           <input
@@ -646,7 +776,7 @@ onBeforeUnmount(() => {
       <div class="flex gap-2">
         <button
           type="submit"
-          :disabled="submitting || !admin.gitHostsLoaded || onboardableGitHosts.length === 0"
+          :disabled="!canSubmitAddUser"
           class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
         >{{ t('admin.fde.addUser') }}</button>
         <button

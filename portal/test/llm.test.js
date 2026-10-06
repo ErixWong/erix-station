@@ -292,7 +292,14 @@ class LlmFakePool {
     if (sql.includes('FROM users WHERE fde_name')) {
       const [fdeName] = params;
       const wantActive = sql.includes("status = 'active'");
-      return { rows: this.users.filter((u) => u.fde_name === fdeName && (!wantActive || u.status === 'active')) };
+      const allowAwaitingCredential = sql.includes("status IN ('active', 'awaiting_credential')");
+      return {
+        rows: this.users.filter((u) =>
+          u.fde_name === fdeName
+          && (allowAwaitingCredential
+            ? ['active', 'awaiting_credential'].includes(u.status)
+            : (!wantActive || u.status === 'active'))),
+      };
     }
 
     // llm_providers
@@ -935,9 +942,9 @@ test('model delete：forwards the LiteLLM model_info.id; missing model propagate
 // FDE LLM 配置写入：校验 400 + outbox 联动 + audit 不含 key
 // ---------------------------------------------------------------------------
 
-function seedPool() {
+function seedPool({ userStatus = 'active' } = {}) {
   return new LlmFakePool({
-    users: [{ id: 'u1', fde_name: 'alice', status: 'active' }],
+    users: [{ id: 'u1', fde_name: 'alice', status: userStatus }],
     providers: [
       { id: 'p1', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', enabled: true },
       { id: 'p2', name: 'other', base_url: 'https://other.example.com', enabled: true },
@@ -1113,6 +1120,52 @@ test('setFdeLlmConfig：无旧 binding 的首次配置仍调用 generateKey', as
   assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
   assert.equal(pool.gatewayCalls.filter((call) => call.method === 'updateKey').length, 0);
   assert.equal(config.api_key, maskKey(pool.bindings[0].api_key));
+});
+
+test('setFdeLlmConfig：开户可为 awaiting_credential 用户建 key；onlyIfMissing 不覆盖已有 binding', async () => {
+  const pool = seedPool({ userStatus: 'awaiting_credential' });
+  const config = await setFdeLlmConfig(pool, {
+    fdeName: 'alice',
+    provider_id: 'p1',
+    main_model_id: 'm-main',
+    allowAwaitingCredential: true,
+    onlyIfMissing: true,
+    gateway: pool,
+  });
+  assert.equal(config.api_key, maskKey(pool.bindings[0].api_key));
+  assert.equal(pool.bindings[0].state, 'active');
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
+
+  const original = structuredClone(pool.bindings[0]);
+  const modelCatalogCalls = pool.gatewayCalls.filter((call) => call.method === 'listModels').length;
+  const skipped = await setFdeLlmConfig(pool, {
+    fdeName: 'alice',
+    provider_id: 'p1',
+    main_model_id: 'm-emb',
+    allowAwaitingCredential: true,
+    onlyIfMissing: true,
+    gateway: pool,
+  });
+  assert.deepEqual(skipped, { skipped: true });
+  assert.deepEqual(pool.bindings[0], original, 'existing binding is never overwritten');
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 1);
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'listModels').length, modelCatalogCalls,
+    'idempotent onboarding does not require a gateway lookup');
+});
+
+test('setFdeLlmConfig：默认仍拒绝 awaiting_credential 用户，LLM tab 不放宽 active 限制', async () => {
+  const pool = seedPool({ userStatus: 'awaiting_credential' });
+  await assert.rejects(
+    () => setFdeLlmConfig(pool, {
+      fdeName: 'alice',
+      provider_id: 'p1',
+      main_model_id: 'm-main',
+      gateway: pool,
+    }),
+    (error) => error.httpStatus === 404,
+  );
+  assert.equal(pool.bindings.length, 0);
+  assert.equal(pool.gatewayCalls.filter((call) => call.method === 'generateKey').length, 0);
 });
 
 test('setFdeLlmConfig：相同 binding 幂等复用 virtual key；generation 不变且不重复发 outbox', async () => {

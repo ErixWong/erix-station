@@ -186,6 +186,82 @@ export async function listProviders(gateway) {
   };
 }
 
+export async function validateFdeLlmSelection(gateway, input = {}) {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new LlmError('validation_failed', 'llm 必须是对象', {
+      details: { field: 'llm' },
+    });
+  }
+  const {
+    provider_id,
+    main_model_id,
+    embedding_model_id = null,
+    vision_model_id = null,
+  } = input;
+  if (typeof provider_id !== 'string' || provider_id.trim() === '') {
+    throw new LlmError('validation_failed', 'provider_id 为必填字段', {
+      details: { field: 'llm.provider_id' },
+    });
+  }
+  if (typeof main_model_id !== 'string' || main_model_id.trim() === '') {
+    throw new LlmError('validation_failed', 'main_model_id 为必填字段', {
+      details: { field: 'llm.main_model_id' },
+    });
+  }
+  for (const [field, value] of [
+    ['embedding_model_id', embedding_model_id],
+    ['vision_model_id', vision_model_id],
+  ]) {
+    if (value != null && value !== '' && typeof value !== 'string') {
+      throw new LlmError('validation_failed', `${field} 必须是字符串或空值`, {
+        details: { field: `llm.${field}` },
+      });
+    }
+  }
+
+  let providers;
+  try {
+    providers = (await listProviders(gateway)).items;
+  } catch {
+    throw new LlmError(
+      'llm_catalog_unavailable',
+      'LiteLLM 模型目录不可用；请先启用或修复可选 LiteLLM profile 后再开户',
+      { httpStatus: 503 },
+    );
+  }
+  const provider = providers.find((item) => item.id === provider_id);
+  if (!provider) {
+    throw new LlmError('validation_failed', '所选 LiteLLM credential 不存在', {
+      details: { field: 'llm.provider_id' },
+    });
+  }
+  const select = (slotName, id, expectedType, requireToolCalling = false) => {
+    if (id == null || id === '') return null;
+    const model = provider.models.find((item) => String(modelId(item)) === id);
+    if (!model) {
+      throw new LlmError('validation_failed', `${slotName} 模型不存在或不属于所选 provider`, {
+        details: { field: `llm.${slotName}`, model_id: id },
+      });
+    }
+    return validateSlotModel(model, {
+      slotName: `llm.${slotName}`,
+      modelId: id,
+      providerId: provider_id,
+      expectedType,
+      requireToolCalling,
+    });
+  };
+  select('main_model_id', main_model_id, 'text', true);
+  select('embedding_model_id', embedding_model_id, 'embedding');
+  select('vision_model_id', vision_model_id, 'vision');
+  return {
+    provider_id,
+    main_model_id,
+    embedding_model_id: embedding_model_id || null,
+    vision_model_id: vision_model_id || null,
+  };
+}
+
 export async function createProvider(gateway, input = {}) {
   const client = getGatewayClient(gateway);
   const name = input.credential_name ?? input.name;
@@ -540,7 +616,7 @@ async function generateFdeKey(client, { fdeId, fdeName, gatewayUserId, selectedM
  */
 export async function setFdeLlmConfig(pool, {
   actorId = null, fdeName, provider_id, api_key, main_model_id, embedding_model_id = null, vision_model_id = null,
-  force = false, gateway,
+  force = false, allowAwaitingCredential = false, onlyIfMissing = false, gateway,
 } = {}) {
   if (typeof provider_id !== 'string' || provider_id === '') {
     throw new LlmError('validation_failed', 'provider_id 为必填字段', { details: { field: 'provider_id' } });
@@ -555,9 +631,12 @@ export async function setFdeLlmConfig(pool, {
   }
 
   const gatewayClient = getGatewayClient(gateway);
-  const selected = await selectGatewayModels(gatewayClient, {
-    providerId: provider_id, mainModelId: main_model_id, embeddingModelId: embedding_model_id, visionModelId: vision_model_id,
-  });
+  let selected;
+  if (!onlyIfMissing) {
+    selected = await selectGatewayModels(gatewayClient, {
+      providerId: provider_id, mainModelId: main_model_id, embeddingModelId: embedding_model_id, visionModelId: vision_model_id,
+    });
+  }
   const client = await pool.connect();
   let oldKey = null;
   let oldWasGatewayKey = false;
@@ -567,7 +646,10 @@ export async function setFdeLlmConfig(pool, {
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`llm-binding:${fdeName}`]);
-    const u = await client.query(`SELECT id, fde_name FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
+    const statusFilter = allowAwaitingCredential
+      ? `status IN ('active', 'awaiting_credential')`
+      : `status = 'active'`;
+    const u = await client.query(`SELECT id, fde_name FROM users WHERE fde_name = $1 AND ${statusFilter}`, [fdeName]);
     if (u.rows.length === 0) throw new LlmError('not_found', 'not found', { httpStatus: 404 });
     const userId = u.rows[0].id;
     const existing = await client.query(
@@ -578,6 +660,13 @@ export async function setFdeLlmConfig(pool, {
       [userId],
     );
     const current = existing.rows[0] ?? null;
+    if (onlyIfMissing && current) {
+      await client.query('COMMIT');
+      return { skipped: true };
+    }
+    selected ??= await selectGatewayModels(gatewayClient, {
+      providerId: provider_id, mainModelId: main_model_id, embeddingModelId: embedding_model_id, visionModelId: vision_model_id,
+    });
     const sameBinding = current?.state === 'active'
       && current.gateway === 'litellm'
       && current.api_key
