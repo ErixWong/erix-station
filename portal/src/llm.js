@@ -660,7 +660,7 @@ export async function setFdeLlmConfig(pool, {
       [userId],
     );
     const current = existing.rows[0] ?? null;
-    if (onlyIfMissing && current) {
+    if (onlyIfMissing && current?.state === 'active') {
       await client.query('COMMIT');
       return { skipped: true };
     }

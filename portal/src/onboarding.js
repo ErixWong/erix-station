@@ -186,12 +186,13 @@ export async function runOnboardingOnce(pool, config, {
         if (!row.fde_name || !row.git_host_id) {
           throw new Error('onboarding requires fde_name and git host assignment');
         }
+        // Keep provision's LLM sync: it republishes active routes after container recreation.
+        // With no binding it is a no-op; this later step enqueues an upsert when it creates/restores the selection.
         await provision(pool, config, {
           fdeName: row.fde_name,
           gitHostId: row.git_host_id,
           docker,
           log,
-          skipLlmSync: true,
         });
       } else if (step === 'materialize') {
         const revision = await withTransaction(pool, (client) =>
