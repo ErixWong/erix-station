@@ -21,6 +21,7 @@ const FDE_USER = {
   role: 'fde', fde_name: 'alice', auth_source: 'local', status: 'active',
 };
 const ADMIN_TOKEN = 'tok-admin-b2-test';
+const TEST_GIT_HOST_ID = 'c0000000-0000-4000-8000-000000000011';
 
 /** admin 测试 pool：FakePool（会话/audit）+ users CRUD / active run / llm echo 的最小模拟。 */
 class AdminPool extends FakePool {
@@ -32,6 +33,12 @@ class AdminPool extends FakePool {
     this.llm = seed.llm ?? null;               // { binding, provider, models } | null
     this.nextUser = 0;
     this.sqlLog = [];
+    this.gitHosts = seed.gitHosts ?? [{
+      id: TEST_GIT_HOST_ID, provider: 'gitea', enabled: true, base_url: 'https://git.example.test',
+    }];
+    this.gitAccounts = [];
+    this.onboardings = [];
+    this.forceEmailConflict = false;
     this.sessions.push({
       id: 'ls-admin', user_id: ADMIN.id, token_hash: auth.hashToken(ADMIN_TOKEN),
       created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
@@ -44,6 +51,9 @@ class AdminPool extends FakePool {
     if (sql.includes('SELECT 1 FROM users WHERE login')) {
       return { rows: this.users.filter((u) => u.login === params[0]).map(() => ({ '?column?': 1 })) };
     }
+    if (sql.includes('SELECT 1 FROM users WHERE email')) {
+      return { rows: this.users.filter((u) => u.email === params[0]).map(() => ({ '?column?': 1 })) };
+    }
     if (sql.includes('SELECT 1 FROM users WHERE fde_name')) {
       return {
         rows: this.users
@@ -54,6 +64,38 @@ class AdminPool extends FakePool {
     if (sql.includes('SELECT id, login FROM users WHERE id')) {
       const user = this.users.find((u) => u.id === params[0]);
       return { rows: user ? [{ id: user.id, login: user.login }] : [] };
+    }
+    if (sql.includes('SELECT id, provider, enabled FROM git_hosts WHERE id')) {
+      return { rows: this.gitHosts.filter((host) => host.id === params[0]) };
+    }
+    if (sql.includes('INSERT INTO fde_onboarding')) {
+      const [fdeId, steps] = params;
+      const row = {
+        fde_id: fdeId, state: 'pending', steps: JSON.parse(steps), last_error: null, attempt: 0,
+      };
+      const existing = this.onboardings.find((item) => item.fde_id === fdeId);
+      if (existing) Object.assign(existing, row);
+      else this.onboardings.push(row);
+      return { rows: [] };
+    }
+    if (sql.includes('INSERT INTO fde_git_accounts')) {
+      const [fdeId, gitHostId] = params;
+      const existing = this.gitAccounts.find((item) => item.fde_id === fdeId);
+      if (existing) existing.git_host_id = gitHostId;
+      else this.gitAccounts.push({ fde_id: fdeId, git_host_id: gitHostId });
+      return { rows: [] };
+    }
+    if (sql.includes('SELECT state, steps, last_error FROM fde_onboarding')) {
+      const row = this.onboardings.find((item) => item.fde_id === params[0]);
+      return { rows: row ? [{ state: row.state, steps: row.steps, last_error: row.last_error }] : [] };
+    }
+    if (sql.includes('UPDATE fde_onboarding') && sql.includes('SET state = \'pending\'')) {
+      const row = this.onboardings.find((item) => item.fde_id === params[0]);
+      if (!row) return { rows: [] };
+      row.state = 'pending';
+      row.steps = JSON.parse(params[1]);
+      row.last_error = null;
+      return { rows: [{ state: row.state, steps: row.steps, last_error: row.last_error }] };
     }
     if (sql.includes('WITH updated AS') && sql.includes('UPDATE users SET')) {
       const user = this.users.find((u) => u.id === params[0]);
@@ -118,6 +160,10 @@ class AdminPool extends FakePool {
       const user = this.users.find((u) => u.id === params[0]);
       return { rows: user ? [{ id: user.id, login: user.login }] : [] };
     }
+    if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) {
+      const row = this.onboardings.find((item) => item.fde_id === params[0]);
+      return { rows: row ? [{ state: row.state }] : [] };
+    }
     if (sql.includes('DELETE FROM login_sessions WHERE user_id')) {
       this.sessions = this.sessions.filter((session) => session.user_id !== params[0]);
       return { rows: [] };
@@ -133,12 +179,18 @@ class AdminPool extends FakePool {
       return { rows: [{ id: params[0] }] };
     }
     // 建用户 INSERT（RETURNING 安全字段）
-    if (sql.includes('INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
+    if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
+      if (this.forceEmailConflict) {
+        const error = new Error('duplicate email');
+        error.code = '23505';
+        error.constraint = 'users_email_key';
+        throw error;
+      }
       this.nextUser += 1;
       const row = {
-        id: `u-new-${this.nextUser}`, login: params[0], display_name: params[1],
-        role: 'fde', fde_name: params[4] ?? null, auth_source: 'local', status: 'active',
-        password_hash: params[2], totp_secret: params[3], created_at: new Date(),
+        id: `u-new-${this.nextUser}`, login: params[0], email: params[1], display_name: params[2],
+        role: 'fde', fde_name: params[5], auth_source: 'local', status: 'active',
+        password_hash: params[3], totp_secret: params[4], created_at: new Date(),
       };
       this.users.push(row);
       return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at, totp_enabled: row.totp_secret !== null }] };
@@ -154,6 +206,10 @@ class AdminPool extends FakePool {
           .map((session) => session.created_at)
           .filter(Boolean)
           .sort((a, b) => new Date(b) - new Date(a))[0] ?? null,
+        git_host_id: this.gitAccounts.find((account) => account.fde_id === u.id)?.git_host_id ?? null,
+        onboarding_state: this.onboardings.find((entry) => entry.fde_id === u.id)?.state ?? null,
+        onboarding_steps: this.onboardings.find((entry) => entry.fde_id === u.id)?.steps ?? null,
+        onboarding_error: this.onboardings.find((entry) => entry.fde_id === u.id)?.last_error ?? null,
       }));
       return { rows };
     }
@@ -230,7 +286,10 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
     const H = { cookie, 'content-type': 'application/json' };
     const res = await fetch(`${base}/api/admin/users`, {
       method: 'POST', headers: H,
-      body: JSON.stringify({ login: 'bob', display_name: 'Bob', password: 'secret-pass-1', fde_name: 'bob' }),
+      body: JSON.stringify({
+        login: 'bob', display_name: 'Bob', password: 'secret-pass-1',
+        email: 'bob@example.test', fde_name: 'bob', git_host_id: TEST_GIT_HOST_ID,
+      }),
     });
     assert.equal(res.status, 201);
     const body = await res.json();
@@ -238,6 +297,8 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
     assert.equal(body.user.role, 'fde');
     assert.equal(body.user.fde_name, 'bob');
     assert.equal(body.user.status, 'active');
+    assert.deepEqual(body.onboarding, { state: 'pending', step: 'provision', error: null });
+    assert.equal(pool.gitAccounts.find((row) => row.fde_id === body.user.id)?.git_host_id, TEST_GIT_HOST_ID);
     assert.equal(body.user.totp_enabled, false);
     assert.equal(pool.users.find((u) => u.login === 'bob').totp_secret, null, '未启用时 DB totp_secret 为 NULL');
     assert.ok(!Object.hasOwn(body, 'totp_secret') && !Object.hasOwn(body, 'totp_uri'), '未启用时响应不含一次性种子字段');
@@ -264,6 +325,8 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
     assert.ok(!raw.includes('totp_secret'), '列表响应无 totp_secret 键');
     assert.ok(!raw.includes('password_hash'), '列表响应无口令哈希键');
     assert.ok(!raw.includes('secret-pass-1'), '任何响应不含明文口令');
+    assert.ok(!raw.includes('bob@example.test'), '用户列表不返回 email');
+    assert.deepEqual(bob.onboarding, { state: 'pending', step: 'provision', error: null });
     assert.equal(pool.users.find((u) => u.login === 'bob').password_hash.startsWith('scrypt$'), true, 'DB 侧 scrypt 哈希（bootstrap-admin 同口径）');
   } finally {
     await close();
@@ -276,7 +339,10 @@ test('admin 用户管理：显式启用 TOTP 时一次性下发种子与 URI，�
     const res = await fetch(`${base}/api/admin/users`, {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ login: 'totp-bob', password: 'secret-pass-1', totp_enabled: true }),
+      body: JSON.stringify({
+        login: 'totp-bob', password: 'secret-pass-1', email: 'totp-bob@example.test',
+        fde_name: 'totp-bob', git_host_id: TEST_GIT_HOST_ID, totp_enabled: true,
+      }),
     });
     assert.equal(res.status, 201);
     const body = await res.json();
@@ -295,28 +361,50 @@ test('admin 用户管理：显式启用 TOTP 时一次性下发种子与 URI，�
   }
 });
 
-test('admin 用户管理：重复 login → 409；缺字段 / 非法 fde_name → 400', async () => {
-  const { base, cookie, close } = await startAdminServer();
+test('admin 用户管理：email / fde_name 必填校验与重复 login、email 冲突', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
   try {
     const H = { cookie, 'content-type': 'application/json' };
+    const fields = { email: 'carol@example.test', git_host_id: TEST_GIT_HOST_ID };
     // 重复 login
     let res = await fetch(`${base}/api/admin/users`, {
-      method: 'POST', headers: H, body: JSON.stringify({ login: 'alice', password: 'whatever-1' }),
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'alice', password: 'whatever-1', fde_name: 'carol' }),
     });
     assert.equal(res.status, 409);
     assert.equal((await res.json()).error.code, 'login_conflict');
     // 缺 password
-    res = await fetch(`${base}/api/admin/users`, { method: 'POST', headers: H, body: JSON.stringify({ login: 'carol' }) });
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ login: 'carol', password: 'whatever-1', fde_name: 'carol', git_host_id: TEST_GIT_HOST_ID }),
+    });
     assert.equal(res.status, 400);
+    assert.equal((await res.json()).error.details.field, 'email');
+    // 邮箱格式错误。
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, email: 'not-an-email', login: 'carol', password: 'whatever-1', fde_name: 'carol' }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error.details.field, 'email');
+    // fde_name 缺失也拒绝。
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'carol', password: 'whatever-1' }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error.details.field, 'fde_name');
     // 非法 fde_name
     res = await fetch(`${base}/api/admin/users`, {
-      method: 'POST', headers: H, body: JSON.stringify({ login: 'carol', password: 'whatever-1', fde_name: 'BAD_NAME' }),
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'carol', password: 'whatever-1', fde_name: 'BAD_NAME' }),
     });
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error.details.field, 'fde_name');
     // 尾随连字符会被 DB CHECK 拒绝，必须在落库前返回 validation_failed
     res = await fetch(`${base}/api/admin/users`, {
-      method: 'POST', headers: H, body: JSON.stringify({ login: 'dave', password: 'whatever-1', fde_name: 'abc-' }),
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'dave', password: 'whatever-1', fde_name: 'abc-' }),
     });
     assert.equal(res.status, 400);
     const invalidFde = await res.json();
@@ -324,10 +412,60 @@ test('admin 用户管理：重复 login → 409；缺字段 / 非法 fde_name �
     assert.equal(invalidFde.error.details.field, 'fde_name');
     // fde_name 被占用
     res = await fetch(`${base}/api/admin/users`, {
-      method: 'POST', headers: H, body: JSON.stringify({ login: 'carol', password: 'whatever-1', fde_name: 'alice' }),
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'carol', password: 'whatever-1', fde_name: 'alice' }),
     });
     assert.equal(res.status, 409);
     assert.equal((await res.json()).error.code, 'fde_name_conflict');
+    // email 冲突
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'carol', password: 'whatever-1', fde_name: 'carol' }),
+    });
+    assert.equal(res.status, 201);
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'carol-2', password: 'whatever-1', fde_name: 'carol-2' }),
+    });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error.code, 'email_conflict');
+    pool.forceEmailConflict = true;
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({
+        email: 'race@example.test', git_host_id: TEST_GIT_HOST_ID,
+        login: 'email-race', password: 'whatever-1', fde_name: 'email-race',
+      }),
+    });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).error.code, 'email_conflict');
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：开户重试只重排 failed，running 返回 409，未知用户返回 404', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  try {
+    const H = { cookie, 'content-type': 'application/json' };
+    pool.onboardings.push({
+      fde_id: FDE_USER.id, state: 'failed',
+      steps: { provision: { state: 'failed', error: 'docker unavailable' }, materialize: { state: 'pending' } },
+      last_error: 'docker unavailable', attempt: 1,
+    });
+    let response = await fetch(`${base}/api/admin/users/${FDE_USER.id}/onboard/retry`, { method: 'POST', headers: H });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).onboarding, { state: 'pending', step: 'provision', error: null });
+    assert.equal(pool.onboardings[0].steps.provision.state, 'pending');
+
+    pool.onboardings[0].state = 'running';
+    response = await fetch(`${base}/api/admin/users/${FDE_USER.id}/onboard/retry`, { method: 'POST', headers: H });
+    assert.equal(response.status, 409);
+
+    response = await fetch(`${base}/api/admin/users/c0000000-0000-4000-8000-000000000099/onboard/retry`, {
+      method: 'POST', headers: H,
+    });
+    assert.equal(response.status, 404);
   } finally {
     await close();
   }
@@ -453,6 +591,9 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
       if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
         return { rows: [{ id: 'deleted-user', login: 'alice' }] };
       }
+      if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) {
+        return { rows: [] };
+      }
       if (sql.includes('FROM containers WHERE user_id') || sql.includes('FROM runs r')) {
         return { rows: [] };
       }
@@ -501,6 +642,29 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
   assert.deepEqual(calls[auditIndex].params, [
     'missing-admin', 'admin.user_deleted', 'alice', JSON.stringify({ user_id: 'deleted-user' }),
   ]);
+});
+
+test('deleteUser：拒绝与正在运行的开户任务并发删除', async () => {
+  const client = {
+    async query(sql) {
+      if (sql === 'BEGIN') return { rows: [] };
+      if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
+        return { rows: [{ id: FDE_USER.id, login: FDE_USER.login }] };
+      }
+      if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) {
+        return { rows: [{ state: 'running' }] };
+      }
+      if (sql === 'ROLLBACK') return { rows: [] };
+      throw new Error(`Unexpected delete query: ${sql}`);
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } };
+
+  await assert.rejects(
+    deleteUser(pool, { actorId: 'admin', userId: FDE_USER.id }),
+    (err) => err.code === 'user_onboarding_running' && err.httpStatus === 409,
+  );
 });
 
 test('admin 用户管理：重置口令校验长度、更新 scrypt hash 并吊销会话', async () => {

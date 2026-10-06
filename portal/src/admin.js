@@ -7,6 +7,7 @@
 import * as auth from './auth.js';
 import * as totp from './totp.js';
 import * as projects from './projects.js';
+import { onboardingStatus } from './onboarding.js';
 
 export class AdminError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -29,6 +30,13 @@ const safeUser = (row) => ({
   totp_enabled: Boolean(row.totp_enabled),
   last_login_at: row.last_login_at instanceof Date ? row.last_login_at.toISOString() : row.last_login_at ?? null,
   created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  onboarding: row.onboarding_state
+    ? onboardingStatus({
+      state: row.onboarding_state,
+      steps: row.onboarding_steps,
+      last_error: row.onboarding_error,
+    })
+    : null,
 });
 
 function validatePassword(password, limits = {}) {
@@ -55,8 +63,11 @@ export async function listUsers(pool) {
             users.auth_source, users.status, users.created_at,
             (users.totp_secret IS NOT NULL) AS totp_enabled,
             sessions.last_login_at,
-            (SELECT git_host_id FROM fde_git_accounts a WHERE a.fde_id = users.id) AS git_host_id
+            (SELECT git_host_id FROM fde_git_accounts a WHERE a.fde_id = users.id) AS git_host_id,
+            onboarding.state AS onboarding_state, onboarding.steps AS onboarding_steps,
+            onboarding.last_error AS onboarding_error
        FROM users
+       LEFT JOIN fde_onboarding onboarding ON onboarding.fde_id = users.id
        LEFT JOIN (
          SELECT user_id, MAX(created_at) AS last_login_at
            FROM login_sessions
@@ -67,11 +78,18 @@ export async function listUsers(pool) {
   return { items: r.rows.map(safeUser) };
 }
 
+export async function writeUserCreatedAudit(pool, { actorId = null, login, fde_name } = {}) {
+  await pool.query(
+    `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, 'admin.user_created', $2, $3)`,
+    [actorId, login, JSON.stringify({ login, fde_name })],
+  ).catch(() => {});
+}
+
 /**
  * 建 FDE 用户（role='fde'、auth_source='local'、status='active'；默认不启用 TOTP，见 issue #139）。
  * @returns { { user } | { user, totp_secret, totp_uri } } —— 启用时种子仅此一次下发（调用方不得再读/再显）。
  */
-export async function createUser(pool, { actorId = null, login, display_name, password, fde_name, totp_enabled = false, totpIssuer = 'erix-station', limits = {} } = {}) {
+export async function createUser(pool, { actorId = null, login, display_name, password, email, fde_name, totp_enabled = false, totpIssuer = 'erix-station', limits = {}, deferAudit = false } = {}) {
   const maxLogin = limits.maxLoginLength ?? 128;
   const maxPassword = limits.maxPasswordLength ?? 256;
   if (typeof login !== 'string' || login.trim() === '') {
@@ -82,7 +100,12 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
     throw new AdminError('validation_failed', `login 长度超过上限 ${maxLogin}`, { details: { field: 'login' } });
   }
   validatePassword(password, { maxPasswordLength: maxPassword });
-  if (fde_name !== undefined && fde_name !== null && !projects.validateFdeName(fde_name).ok) {
+  if (typeof email !== 'string' || email.trim() === '' || email.trim().length > 320
+      || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    throw new AdminError('validation_failed', 'email 必须是有效邮箱地址', { details: { field: 'email' } });
+  }
+  const trimmedEmail = email.trim();
+  if (typeof fde_name !== 'string' || !projects.validateFdeName(fde_name).ok) {
     throw new AdminError('validation_failed', 'fde_name 非法（小写字母/数字/连字符，≤63）', { details: { field: 'fde_name' } });
   }
 
@@ -90,29 +113,36 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   if (dup.rows.length > 0) {
     throw new AdminError('login_conflict', `login ${trimmedLogin} 已存在`, { httpStatus: 409 });
   }
-  if (fde_name != null) {
-    const dupFde = await pool.query(`SELECT 1 FROM users WHERE fde_name = $1`, [fde_name]);
-    if (dupFde.rows.length > 0) {
-      throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
-    }
+  const dupEmail = await pool.query(`SELECT 1 FROM users WHERE email = $1`, [trimmedEmail]);
+  if (dupEmail.rows.length > 0) {
+    throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+  }
+  const dupFde = await pool.query(`SELECT 1 FROM users WHERE fde_name = $1`, [fde_name]);
+  if (dupFde.rows.length > 0) {
+    throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
   }
 
   const passwordHash = await auth.hashPassword(password); // 与 bootstrap-admin 同口径（scrypt 自描述）
   const totpSecret = totp_enabled === true ? totp.generateSecret(20) : null;
   const r = await pool.query(
-    `INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)
-     VALUES ($1, $2, 'fde', 'local', 'active', $3, $4, $5)
+    `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)
+     VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6)
      RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
                (totp_secret IS NOT NULL) AS totp_enabled`,
-    [trimmedLogin, typeof display_name === 'string' && display_name.trim() !== '' ? display_name.trim() : trimmedLogin, passwordHash, totpSecret, fde_name ?? null],
-  );
+    [trimmedLogin, trimmedEmail, typeof display_name === 'string' && display_name.trim() !== '' ? display_name.trim() : trimmedLogin, passwordHash, totpSecret, fde_name],
+  ).catch((err) => {
+    if (err?.code === '23505'
+        && (err.constraint === 'users_email_key' || String(err.detail ?? '').includes('(email)'))) {
+      throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+    }
+    throw err;
+  });
   const user = safeUser(r.rows[0]);
   const totpUri = totpSecret ? totp.otpauthUri(totpSecret, { issuer: totpIssuer, label: user.login }) : null;
   // 审计：details 不含口令/种子（红线）。
-  await pool.query(
-    `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, 'admin.user_created', $2, $3)`,
-    [actorId, trimmedLogin, JSON.stringify({ login: trimmedLogin, fde_name: fde_name ?? null })],
-  ).catch(() => {});
+  if (!deferAudit) {
+    await writeUserCreatedAudit(pool, { actorId, login: trimmedLogin, fde_name });
+  }
   return totpSecret
     ? { user, totp_secret: totpSecret, totp_uri: totpUri }
     : { user };
@@ -232,6 +262,18 @@ export async function deleteUser(pool, { actorId, userId } = {}) {
     );
     if (!target.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
     deletedLogin = target.rows[0].login;
+
+    const onboarding = await client.query(
+      `SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE`,
+      [userId],
+    );
+    if (onboarding.rows[0]?.state === 'running') {
+      throw new AdminError(
+        'user_onboarding_running',
+        '用户开户仍在进行中，请等待开户结束后再删除',
+        { httpStatus: 409 },
+      );
+    }
 
     const container = await client.query(
       `SELECT 1 FROM containers WHERE user_id = $1 AND status <> 'removed' LIMIT 1`,

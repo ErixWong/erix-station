@@ -50,7 +50,7 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
   // 新迁移追加在序列末尾（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 11, '0011 是最后编号（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 12, '0012 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -82,7 +82,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 11, '0011 是最后编号（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 12, '0012 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -139,7 +139,7 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0011-git-hosts.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 11, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 12, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0011-git-hosts.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS git_hosts/);
@@ -154,4 +154,20 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
   assert.ok(!baseline.includes('git_hosts'), 'baseline 不得回写 Git host DDL');
   assert.ok(!/\bgit_provider\s+text/.test(baseline), 'baseline 不得回写 git_provider 列');
+});
+
+test('迁移 0012-onboarding：开户队列状态、步骤和索引全在增量 DDL', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0012-onboarding.sql'));
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 12, '迁移编号连续');
+
+  const sql = fs.readFileSync(path.join(dir, '0012-onboarding.sql'), 'utf8');
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS fde_onboarding/);
+  assert.match(sql, /fde_id\s+uuid PRIMARY KEY REFERENCES users \(id\) ON DELETE CASCADE/);
+  assert.match(sql, /state IN \('pending','running','awaiting_credential','done','failed'\)/);
+  assert.match(sql, /steps\s+jsonb NOT NULL DEFAULT '\{\}'::jsonb/);
+  assert.match(sql, /CREATE INDEX IF NOT EXISTS fde_onboarding_state_idx ON fde_onboarding \(state\)/);
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('fde_onboarding'), 'baseline 不得回写 onboarding DDL');
 });

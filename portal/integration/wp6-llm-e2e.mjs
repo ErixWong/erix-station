@@ -213,6 +213,7 @@ const S = {
   staticFile: null,
   password: 'correct horse battery staple',
   adminCookie: null,
+  gitHostId: null,
   users: {},
 };
 
@@ -281,11 +282,26 @@ async function createFdeUser(loginName) {
       login: loginName,
       display_name: loginName,
       password: S.password,
+      email: `${loginName}@station.invalid`,
       fde_name: FDE_NAMES[loginName],
+      git_host_id: S.gitHostId,
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
   assert.ok(response.body.totp_secret, 'totp_secret is returned once');
+  assert.deepEqual(response.body.onboarding, { state: 'pending', step: 'provision', error: null });
+  const onboarding = await waitFor(async () => {
+    const list = await adminApi('/api/admin/users');
+    return list.body.items?.find((user) => user.login === loginName)?.onboarding?.state === 'awaiting_credential'
+      ? true
+      : null;
+  }, { label: `${loginName} onboarding awaits Git credential`, timeoutMs: 240000, intervalMs: 1000 });
+  assert.equal(onboarding, true);
+  const credential = await adminApi(`/api/admin/fdes/${FDE_NAMES[loginName]}/git-credential`, {
+    method: 'PUT',
+    body: JSON.stringify({ host: 'github.com', username: loginName, token: `wp6-temporary-${loginName}` }),
+  });
+  assert.equal(credential.status, 200, `set Git credential ${loginName}`);
   return response.body.totp_secret;
 }
 
@@ -444,7 +460,7 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     }, { label: `LiteLLM readiness (${STATION_LITELLM_NAME})`, timeoutMs: 180000, intervalMs: 1000 });
 
     // Incremental migrations are the source of all post-baseline DDL.
-    for (const version of ['0002-llm-config', '0010-litellm-bindings', '0011-git-hosts']) {
+    for (const version of ['0002-llm-config', '0010-litellm-bindings', '0011-git-hosts', '0012-onboarding']) {
       assert.equal(
         psql(`SELECT count(*) FROM schema_migrations WHERE version='${version}'`),
         '1',
@@ -457,9 +473,9 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
       assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}_retired'`), '1',
         `${table}_retired is retained`);
     }
-    for (const table of ['git_hosts', 'fde_git_accounts']) {
+    for (const table of ['git_hosts', 'fde_git_accounts', 'fde_onboarding']) {
       assert.equal(psql(`SELECT count(*) FROM information_schema.tables WHERE table_name='${table}'`), '1',
-        `${table} from migration 0011 exists`);
+        `${table} from migrations 0011/0012 exists`);
     }
     for (const column of ['provider_id', 'api_key', 'key_id', 'main_model_id', 'main_model_name']) {
       assert.equal(
@@ -471,6 +487,16 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
 
     const adminTotp = bootstrapAdmin('admin-wp6');
     S.adminCookie = await login('admin-wp6', adminTotp, ADMIN_PASSWORD);
+    const gitHost = await adminApi('/api/admin/git-hosts', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: `wp6-github-${process.env.STATION_STACK_ID}`,
+        provider: 'github',
+        base_url: 'https://github.com',
+      }),
+    });
+    assert.equal(gitHost.status, 201, `create Git host: ${JSON.stringify(gitHost.body)}`);
+    S.gitHostId = gitHost.body.host.id;
     for (const alias of ['alice', 'bob']) {
       const secret = await createFdeUser(alias);
       S.users[alias] = {

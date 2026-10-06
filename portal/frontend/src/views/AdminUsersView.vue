@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
@@ -17,7 +17,7 @@ const showAddUser = ref(false);
 const showTotp = ref(false);
 const resumeEditAfterTotp = ref(false);
 const submitting = ref(false);
-const userForm = reactive({ login: '', display_name: '', password: '', fde_name: '', totpEnabled: false });
+const userForm = reactive({ login: '', display_name: '', password: '', email: '', fde_name: '', git_host_id: '', totpEnabled: false });
 
 const editUserId = ref<string | null>(null);
 const editModalOpen = ref(false);
@@ -36,6 +36,7 @@ const totpBusy = ref(false);
 const deleteBusy = ref(false);
 const profileError = ref('');
 const profileMessage = ref('');
+const onboardingBusyId = ref<string | null>(null);
 const passwordError = ref('');
 const passwordMessage = ref('');
 const totpError = ref('');
@@ -59,12 +60,17 @@ const filteredUsers = computed(() => {
 const deleteMatchesLogin = computed(() =>
   Boolean(deleteUser.value && deleteConfirmation.value === deleteUser.value.login),
 );
+const onboardableGitHosts = computed(() =>
+  admin.gitHosts.filter((host) => host.enabled && host.provider !== 'azure'),
+);
 
 function resetUserForm() {
   userForm.login = '';
   userForm.display_name = '';
   userForm.password = '';
+  userForm.email = '';
   userForm.fde_name = '';
+  userForm.git_host_id = '';
   userForm.totpEnabled = false;
 }
 
@@ -111,7 +117,9 @@ async function onAddUser() {
       login: userForm.login.trim(),
       display_name: userForm.display_name.trim(),
       password: userForm.password,
-      ...(userForm.fde_name.trim() ? { fde_name: userForm.fde_name.trim() } : {}),
+      email: userForm.email.trim(),
+      fde_name: userForm.fde_name.trim(),
+      git_host_id: userForm.git_host_id,
       totpEnabled: userForm.totpEnabled,
     });
     if (!err) {
@@ -120,6 +128,24 @@ async function onAddUser() {
     }
   } finally {
     submitting.value = false;
+  }
+}
+
+async function retryOnboarding(user: AdminUser) {
+  if (onboardingBusyId.value) return;
+  clearFeedback(user.id);
+  onboardingBusyId.value = user.id;
+  try {
+    const error = await admin.retryOnboarding(user.id);
+    if (error) {
+      rowErrors[user.id] = error;
+      if (editUserId.value === user.id) profileError.value = error;
+    } else {
+      rowMessages[user.id] = t('admin.fde.onboardingRetryQueued');
+      if (editUserId.value === user.id) profileMessage.value = rowMessages[user.id];
+    }
+  } finally {
+    onboardingBusyId.value = null;
   }
 }
 
@@ -357,7 +383,25 @@ onMounted(() => {
   void Promise.all([admin.loadUsers(), admin.loadProviders(), admin.loadGitHosts()]);
 });
 
+let onboardingPoll: ReturnType<typeof setInterval> | null = null;
+watch(
+  () => admin.users.some((user) => user.onboarding?.state === 'pending' || user.onboarding?.state === 'running'),
+  (active) => {
+    if (active && onboardingPoll === null) {
+      onboardingPoll = setInterval(() => {
+        if (!admin.usersLoading) void admin.loadUsers();
+      }, 3000);
+    } else if (!active && onboardingPoll !== null) {
+      clearInterval(onboardingPoll);
+      onboardingPoll = null;
+    }
+  },
+  { immediate: true },
+);
+
 onBeforeUnmount(() => {
+  if (onboardingPoll !== null) clearInterval(onboardingPoll);
+  onboardingPoll = null;
   if (admin.totpOnce) admin.dismissTotpOnce();
 });
 </script>
@@ -427,14 +471,15 @@ onBeforeUnmount(() => {
 
       <table v-else-if="admin.usersLoaded" data-test="user-table" class="w-full table-fixed text-left text-sm">
           <colgroup>
-            <col class="w-[13%]">
-            <col class="w-[18%]">
-            <col class="w-[9%]">
-            <col class="w-[14%]">
-            <col class="w-[7%]">
-            <col class="w-[9%]">
-            <col class="w-[18%]">
+            <col class="w-[11%]">
+            <col class="w-[15%]">
+            <col class="w-[8%]">
             <col class="w-[12%]">
+            <col class="w-[5%]">
+            <col class="w-[8%]">
+            <col class="w-[13%]">
+            <col class="w-[15%]">
+            <col class="w-[13%]">
           </colgroup>
           <thead class="border-b border-black/10 bg-black/[0.025] text-xs text-black/55">
             <tr>
@@ -444,6 +489,7 @@ onBeforeUnmount(() => {
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colFde') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colMfa') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colStatus') }}</th>
+              <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colOnboarding') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.lastLogin') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colActions') }}</th>
             </tr>
@@ -480,6 +526,22 @@ onBeforeUnmount(() => {
                     <span aria-hidden="true">○</span>{{ t('admin.fde.statusAwaitingCredential') }}
                   </span>
                 </td>
+                <td class="px-2 py-2.5">
+                  <span
+                    v-if="user.onboarding"
+                    :title="user.onboarding.state === 'failed' ? user.onboarding.error ?? '' : undefined"
+                    :class="user.onboarding.state === 'failed' ? 'text-red-700' : 'text-black/65'"
+                  >{{ t(`admin.fde.onboarding.${user.onboarding.state}`) }}</span>
+                  <span v-else class="text-black/35">—</span>
+                  <button
+                    v-if="user.onboarding?.state === 'failed'"
+                    type="button"
+                    data-test="retry-onboarding"
+                    class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
+                    :disabled="onboardingBusyId !== null"
+                    @click.stop="retryOnboarding(user)"
+                  >{{ t('admin.fde.retryOnboarding') }}</button>
+                </td>
                 <td class="truncate px-3 py-2.5" :title="formatLastLogin(user.last_login_at)">
                   {{ formatLastLogin(user.last_login_at) }}
                 </td>
@@ -502,7 +564,7 @@ onBeforeUnmount(() => {
                 </td>
               </tr>
               <tr v-if="rowErrors[user.id] || rowMessages[user.id]" class="border-b border-black/10">
-                <td colspan="8" class="px-3 py-1.5 text-xs">
+                <td colspan="9" class="px-3 py-1.5 text-xs">
                   <p v-if="rowErrors[user.id]" class="syserr" role="alert">{{ rowErrors[user.id] }}</p>
                   <p v-else class="text-green-700" role="status">{{ rowMessages[user.id] }}</p>
                 </td>
@@ -553,8 +615,20 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.fde.emailLabel') }}
+        <input v-model="userForm.email" data-test="user-email" type="email" required autocomplete="email" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.fde.fdeNameLabel') }}
-        <input v-model="userForm.fde_name" placeholder="alice" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        <input v-model="userForm.fde_name" data-test="user-fde-name" required placeholder="alice" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.fde.gitHostLabel') }}
+        <select v-model="userForm.git_host_id" data-test="new-user-git-host" required class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+          <option disabled value="">{{ t('admin.fde.selectGitHost') }}</option>
+          <option v-for="host in onboardableGitHosts" :key="host.id" :value="host.id">{{ host.name }} ({{ host.provider }})</option>
+        </select>
+        <span v-if="admin.gitHostsLoaded && onboardableGitHosts.length === 0" class="text-amber-800">{{ t('admin.fde.noOnboardableGitHosts') }}</span>
       </label>
       <div class="flex flex-col gap-1 text-xs text-black/55">
         <label class="flex items-center gap-2">
@@ -572,7 +646,7 @@ onBeforeUnmount(() => {
       <div class="flex gap-2">
         <button
           type="submit"
-          :disabled="submitting"
+          :disabled="submitting || !admin.gitHostsLoaded || onboardableGitHosts.length === 0"
           class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
         >{{ t('admin.fde.addUser') }}</button>
         <button
@@ -742,6 +816,21 @@ onBeforeUnmount(() => {
             class="justify-self-end rounded-md bg-brand px-3 py-1.5 text-sm text-white disabled:opacity-50"
           >{{ t('admin.fde.updateProfile') }}</button>
         </form>
+        <section v-if="editUser?.onboarding" data-test="profile-onboarding" class="mt-4 grid gap-2 border-t border-black/10 pt-3 text-sm">
+          <h4 class="font-semibold">{{ t('admin.fde.colOnboarding') }}</h4>
+          <p>{{ t(`admin.fde.onboarding.${editUser.onboarding.state}`) }}</p>
+          <p v-if="editUser.onboarding.error" class="break-words text-red-700" :title="editUser.onboarding.error">
+            {{ editUser.onboarding.error }}
+          </p>
+          <button
+            v-if="editUser.onboarding.state === 'failed'"
+            type="button"
+            data-test="retry-onboarding-profile"
+            class="justify-self-start rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5 disabled:opacity-50"
+            :disabled="onboardingBusyId !== null"
+            @click="retryOnboarding(editUser)"
+          >{{ t('admin.fde.retryOnboarding') }}</button>
+        </section>
       </section>
 
       <section
