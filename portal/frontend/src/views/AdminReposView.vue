@@ -163,7 +163,6 @@ onMounted(() => {
         {{ t('admin.repos.provider') }}
         <select v-model="form.provider" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
           <option value="gitea">Gitea</option>
-          <option value="github">GitHub</option>
           <option value="gitlab">GitLab</option>
         </select>
       </label>

@@ -1683,7 +1683,7 @@ Removes all stored credential lines for the exact host, leaving other hosts inta
 
 ## 11. Admin Git host registry (issue #118)
 
-All routes require the existing `requireAdmin` authorization. `git_hosts.mode` is derived by the server; clients must not set it. `admin_key` is accepted only on create or when replacing the key, and responses contain only a masked value plus `admin_key_configured`. The key is never included in audit details. `provider='azure'` is reserved in the database constraint but rejected by the current API.
+All routes require the existing `requireAdmin` authorization. `git_hosts.mode` is derived by the server; clients must not set it. `admin_key` is accepted only on create or when replacing the key, and responses contain only a masked value plus `admin_key_configured`. The key is never included in audit details. `provider='azure'` and `provider='github'` remain reserved in the database constraint but are rejected when creating a host; GitHub is temporarily unsupported because the platform cannot mint per-FDE credentials for it. Enterprise-internal deployments should use Gitea or GitLab with platform-minted credentials.
 
 ### `GET /api/admin/git-hosts`
 
@@ -1691,11 +1691,11 @@ Returns `{ "items": [host, ...] }`, where each host contains `id`, `name`, `prov
 
 ### `POST /api/admin/git-hosts`
 
-Request fields: `name`, `provider` (`gitea` / `github` / `gitlab`), `base_url`, optional `admin_key`, and optional `enabled`. A Gitea/GitLab admin key selects `minted`; no key selects `per_fde_pat`; GitHub always requires `per_fde_pat`. Returns `201 { "host": ... }`.
+Request fields: `name`, `provider` (`gitea` / `github` / `gitlab`), `base_url`, optional `admin_key`, and optional `enabled`. Creating a GitHub host returns `400 provider_unsupported` with `details.field='provider'`. A Gitea/GitLab admin key selects `minted`; no key selects `per_fde_pat`. Returns `201 { "host": ... }`.
 
 ### `PATCH /api/admin/git-hosts/:id`
 
-Updates supplied host fields and returns `{ "host": ... }`. Omitting `admin_key` preserves it; `clear_admin_key: true` removes it and recomputes `mode`. `mode` is read-only. Changing provider or base URL is rejected with `409 host_in_use` while an FDE is bound.
+Updates supplied host fields and returns `{ "host": ... }`. Omitting `admin_key` preserves it; `clear_admin_key: true` removes it and recomputes `mode`. `mode` is read-only. Switching to GitHub returns `400 provider_unsupported`; existing GitHub rows remain available and can be updated without changing their provider. Changing provider or base URL is rejected with `409 host_in_use` while an FDE is bound.
 
 ### `DELETE /api/admin/git-hosts/:id`
 
