@@ -676,6 +676,7 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'POST') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const llmSelection = await llm.validateFdeLlmSelection(ctx.llmGateway, body?.llm);
       const rawGitHostId = body?.git_host_id;
       if (typeof rawGitHostId !== 'string'
           || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawGitHostId)) {
@@ -720,6 +721,7 @@ async function handleAdminApi(req, res, ctx, url) {
         onboardingStatus = await onboarding.enqueueOnboarding(client, {
           fdeId: created.user.id,
           gitHostId,
+          llm: llmSelection,
         });
         await client.query('COMMIT');
       } catch (err) {

@@ -1715,9 +1715,31 @@ Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, 
 
 ### `POST /api/admin/users`
 
-Creates a local FDE user. Request fields: `login` (required), `password` (required), `display_name` (optional), `fde_name` (optional), and `totp_enabled` (optional boolean, default `false`). Only the boolean value `true` enables TOTP; other values are treated as `false`.
+Creates a local FDE user. Request fields: `login`, `password`, `email`, `fde_name`, and `git_host_id` are required; `display_name` is optional. `llm` is required and has the same model-slot shape as the per-FDE LLM endpoint:
 
-With the default `false`, `totp_secret` is stored as `NULL`, the response contains only `{ "user": <safe user> }`, and the user signs in with password only (the existing behavior for accounts without TOTP enrollment). This is the intentional deviation from the force-TOTP design target recorded in issue #139. With `totp_enabled: true`, the response also includes `totp_secret` and `totp_uri`; the seed is shown only in this creation response and must be saved and bound with an authenticator app.
+```json
+{
+  "login": "alice",
+  "password": "...",
+  "email": "alice@example.test",
+  "fde_name": "alice",
+  "git_host_id": "...",
+  "llm": {
+    "provider_id": "mock-provider",
+    "main_model_id": "model-info-id",
+    "embedding_model_id": null,
+    "vision_model_id": null
+  }
+}
+```
+
+`llm.provider_id` and `llm.main_model_id` must be non-empty. The selected provider and models must exist in the LiteLLM catalog; the main model must be enabled, text-capable, and support tool calling. Embedding and vision slots are optional and, when selected, must be enabled models of the matching type under that provider. Missing or invalid selections return `400 validation_failed` with `details.field`. If the optional LiteLLM profile's catalog cannot be read, creation fails closed with `503 llm_catalog_unavailable`; enable or repair LiteLLM before retrying.
+
+The selected model configuration is persisted with the onboarding workflow. After provisioning and user-space materialization, Station creates a per-FDE virtual key restricted to those models. This LLM binding step is independent: key creation failures are recorded in `onboarding.llm_binding` and do not fail the user account or change its `done` / `awaiting_credential` onboarding state. An administrator can retry it with `POST /api/admin/users/:id/onboard/retry`; an existing binding is left untouched. The LLM tab can later change the model allowlist through its normal save path without rotating the key.
+
+`totp_enabled` is an optional boolean defaulting to `false`. Only the boolean value `true` enables TOTP; other values are treated as `false`.
+
+With the default `false`, `totp_secret` is stored as `NULL`, the response contains `{ "user": <safe user>, "onboarding": ... }`, and the user signs in with password only (the existing behavior for accounts without TOTP enrollment). This is the intentional deviation from the force-TOTP design target recorded in issue #139. With `totp_enabled: true`, the response also includes `totp_secret` and `totp_uri`; the seed is shown only in this creation response and must be saved and bound with an authenticator app.
 
 ### `PATCH /api/admin/users/:id`
 

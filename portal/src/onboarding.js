@@ -2,8 +2,9 @@
 import { enqueueMaterializeChange } from './outbox.js';
 import { runMaterializerOnce } from './materializer.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
+import { LlmError, LlmGatewayError, setFdeLlmConfig } from './llm.js';
 
-const STEPS = ['provision', 'materialize'];
+const STEPS = ['provision', 'materialize', 'llm-binding'];
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MATERIALIZE_TIMEOUT_MS = 120000;
 
@@ -26,6 +27,12 @@ export function onboardingStatus(row) {
     state: row.state,
     step: ['done', 'awaiting_credential'].includes(row.state) ? null : currentStep(steps),
     error: row.last_error ?? null,
+    ...(steps['llm-binding'] ? {
+      llm_binding: {
+        state: steps['llm-binding'].state,
+        error: steps['llm-binding'].error ?? null,
+      },
+    } : {}),
   };
 }
 
@@ -44,14 +51,27 @@ async function withTransaction(pool, work) {
   }
 }
 
-/** Enqueue a user and persist its host assignment in the caller's transaction. */
-export async function enqueueOnboarding(client, { fdeId, gitHostId }) {
+/** Enqueue a user and persist its host assignment and selected models in the caller's transaction. */
+export async function enqueueOnboarding(client, { fdeId, gitHostId, llm }) {
+  const steps = {
+    provision: { state: 'pending' },
+    materialize: { state: 'pending' },
+    'llm-binding': {
+      state: 'pending',
+      models: {
+        provider_id: llm.provider_id,
+        main_model_id: llm.main_model_id,
+        embedding_model_id: llm.embedding_model_id ?? null,
+        vision_model_id: llm.vision_model_id ?? null,
+      },
+    },
+  };
   await client.query(
     `INSERT INTO fde_onboarding (fde_id, state, steps)
      VALUES ($1, 'pending', $2::jsonb)
      ON CONFLICT (fde_id) DO UPDATE
        SET state = 'pending', steps = EXCLUDED.steps, last_error = NULL, attempt = 0, updated_at = now()`,
-    [fdeId, JSON.stringify({ provision: { state: 'pending' }, materialize: { state: 'pending' } })],
+    [fdeId, JSON.stringify(steps)],
   );
   await client.query(
     `INSERT INTO fde_git_accounts (fde_id, git_host_id)
@@ -65,7 +85,7 @@ export async function enqueueOnboarding(client, { fdeId, gitHostId }) {
            updated_at = now()`,
     [fdeId, gitHostId],
   );
-  return { state: 'pending', step: 'provision', error: null };
+  return onboardingStatus({ state: 'pending', steps, last_error: null });
 }
 
 async function claimOne(pool) {
@@ -102,7 +122,7 @@ async function saveStep(pool, fdeId, stepName, value) {
   );
 }
 
-async function saveFailure(pool, fdeId, stepName, error) {
+async function saveFailure(pool, fdeId, stepName, value, error) {
   const message = String(error?.message ?? error);
   await pool.query(
     `UPDATE fde_onboarding
@@ -110,8 +130,14 @@ async function saveFailure(pool, fdeId, stepName, error) {
             steps = jsonb_set(steps, ARRAY[$2]::text[], $3::jsonb, true),
             last_error = $4, updated_at = now()
       WHERE fde_id = $1`,
-    [fdeId, stepName, JSON.stringify({ state: 'failed', error: message }), message],
+    [fdeId, stepName, JSON.stringify(value), message],
   );
+}
+
+function safeLlmBindingError(error) {
+  if (error instanceof LlmError) return error.message;
+  if (error instanceof LlmGatewayError) return `LiteLLM virtual-key setup failed (HTTP ${error.status})`;
+  return 'LLM binding setup failed; check LiteLLM and database availability before retrying';
 }
 
 async function publishMaterializeRevision(pool, config, fdeId, revision, { log, materialize }) {
@@ -142,6 +168,7 @@ export async function runOnboardingOnce(pool, config, {
   log = console,
   provision = onboardFde,
   materialize = runMaterializerOnce,
+  bindLlm = setFdeLlmConfig,
 } = {}) {
   const row = await claimOne(pool);
   if (!row) return { claimed: false };
@@ -152,25 +179,51 @@ export async function runOnboardingOnce(pool, config, {
     for (const step of STEPS) {
       if (steps[step]?.state === 'done') continue;
       activeStep = step;
-      await saveStep(pool, row.fde_id, step, { state: 'running' });
+      const stepValue = { ...steps[step], state: 'running' };
+      await saveStep(pool, row.fde_id, step, stepValue);
 
       if (step === 'provision') {
         if (!row.fde_name || !row.git_host_id) {
           throw new Error('onboarding requires fde_name and git host assignment');
         }
+        // Keep provision's LLM sync: it republishes active routes after container recreation.
+        // With no binding it is a no-op; this later step enqueues an upsert when it creates/restores the selection.
         await provision(pool, config, {
           fdeName: row.fde_name,
           gitHostId: row.git_host_id,
           docker,
           log,
         });
-      } else {
+      } else if (step === 'materialize') {
         const revision = await withTransaction(pool, (client) =>
           enqueueMaterializeChange(client, { fdeId: row.fde_id, op: 'upsert' }));
         await publishMaterializeRevision(pool, config, row.fde_id, revision, { log, materialize });
+      } else if (!stepValue.models) {
+        steps[step] = { ...stepValue, state: 'done', skipped: true };
+        await saveStep(pool, row.fde_id, step, steps[step]);
+        continue;
+      } else {
+        try {
+          await bindLlm(pool, {
+            actorId: null,
+            fdeName: row.fde_name,
+            ...stepValue.models,
+            allowAwaitingCredential: true,
+            onlyIfMissing: true,
+            gateway: config,
+          });
+        } catch (err) {
+          const message = safeLlmBindingError(err);
+          steps[step] = { ...stepValue, state: 'failed', error: message };
+          await saveStep(pool, row.fde_id, step, steps[step]);
+          log.warn?.(`[onboarding] failed fde=${row.fde_id} step=${step}: ${message}`);
+          activeStep = null;
+          continue;
+        }
       }
 
-      steps[step] = { state: 'done' };
+      steps[step] = { ...stepValue, state: 'done' };
+      delete steps[step].error;
       await saveStep(pool, row.fde_id, step, steps[step]);
     }
 
@@ -184,14 +237,15 @@ export async function runOnboardingOnce(pool, config, {
     return { claimed: true, fdeId: row.fde_id, state };
   } catch (err) {
     const failedStep = activeStep ?? currentStep(steps) ?? STEPS.at(-1);
-    const message = String(err?.message ?? err);
-    await saveFailure(pool, row.fde_id, failedStep, message);
+    const message = failedStep === 'llm-binding' ? safeLlmBindingError(err) : String(err?.message ?? err);
+    const value = { ...steps[failedStep], state: 'failed', error: message };
+    await saveFailure(pool, row.fde_id, failedStep, value, message);
     log.warn?.(`[onboarding] failed fde=${row.fde_id} step=${failedStep}: ${message}`);
     return { claimed: true, fdeId: row.fde_id, state: 'failed', step: failedStep, error: message };
   }
 }
 
-/** Move failed work back to pending; all other states are returned unchanged. */
+/** Re-queue failed workflow steps, including an independent LLM failure on a terminal onboarding. */
 export async function retryOnboarding(pool, fdeId) {
   return withTransaction(pool, async (client) => {
     const result = await client.query(
@@ -200,11 +254,17 @@ export async function retryOnboarding(pool, fdeId) {
     );
     const row = result.rows[0];
     if (!row) return null;
-    if (row.state !== 'failed') return onboardingStatus(row);
-
     const steps = parseSteps(row.steps);
+    const hasFailedLlmBinding = steps['llm-binding']?.state === 'failed';
+    if (row.state !== 'failed' && !(
+      hasFailedLlmBinding && ['done', 'awaiting_credential'].includes(row.state)
+    )) return onboardingStatus(row);
+
     const failedStep = STEPS.find((step) => steps[step]?.state === 'failed');
-    if (failedStep) steps[failedStep] = { state: 'pending' };
+    if (failedStep) {
+      steps[failedStep] = { ...steps[failedStep], state: 'pending' };
+      delete steps[failedStep].error;
+    }
     const updated = await client.query(
       `UPDATE fde_onboarding
           SET state = 'pending', steps = $2::jsonb, last_error = NULL, updated_at = now()
