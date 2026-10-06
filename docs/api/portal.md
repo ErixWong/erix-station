@@ -5,7 +5,7 @@
 >
 > **本文只定义「契约形状」**（端点、schema、错误语义、事件信封），不定义实现。前端可只依据本文 + mock 数据开发；后端实现与本文冲突时以规格为准并提 issue。
 >
-✅ **Q7 已定稿**（零依赖 `node:http` + 原生前端，principles §4；fde-platform 附录 A）：不影响本文任何契约形状；文中实现注记按定稿口径给出。
+✅ **Q7 已定稿**（原生 `node:http` + 原生前端、零 Web 框架，运行时依赖 `pg` 与 YAML 配置解析器，principles §4；fde-platform 附录 A）：不影响本文任何契约形状；文中实现注记按定稿口径给出。
 
 ---
 
@@ -438,7 +438,7 @@ station-portal user enable  --login <login>
 | TOTP 重置 | `station-portal user reset-totp --login <login>`：重生成种子并输出 otpauth URI/二维码；**强制该用户重新走两步登录** |
 | 限流 | 登录爆破与 TOTP 连续失败走 §2.2/§2.3 的 `429 rate_limited`（`Retry-After`） |
 
-> **口令哈希实现注（P1 skeleton）**：⚠️ P1 骨架实现暂用 Node 内置 `crypto.scrypt`（零依赖，满足「运行时依赖仅 `pg`」）；argon2id 的参数本身仍待决策者确认，切换时按自描述哈希（`algo$…$salt$hash`）平滑迁移，登录成功时对旧格式自动 rehash。
+> **口令哈希实现注（P1 skeleton）**：⚠️ P1 骨架实现暂用 Node 内置 `crypto.scrypt`（不新增依赖）；argon2id 的参数本身仍待决策者确认，切换时按自描述哈希（`algo$…$salt$hash`）平滑迁移，登录成功时对旧格式自动 rehash。
 >
 > **TOTP 强制范围（现状，issue #50）**：未注册 TOTP（`totp_secret` 为 NULL 或空串）的本地账号登录**口令直通建会话**，不强制第二因素（用户决策 2026-09-22，实现 d605015）；经 CLI 建号（§2.9.1/§2.9.2）与 `reset-totp`（上）一律下发种子，故这些账号仍是强制两步。表格中的「**强制**」是规格 §7.1 的设计目标，现状按本注执行（详见 §2.1）。
 >

@@ -53,8 +53,8 @@ function recordingPool(gitHostBaseUrls = []) {
     calls,
     query: async (sql, params = []) => {
       calls.push({ sql, params });
-      if (sql === 'SELECT base_url FROM git_hosts') {
-        return { rows: gitHostBaseUrls.map((base_url) => ({ base_url })) };
+      if (sql === 'SELECT base_url, provider FROM git_hosts') {
+        return { rows: gitHostBaseUrls.map((base_url) => ({ base_url, provider: null })) };
       }
       return { rows: [] };
     },
@@ -443,7 +443,9 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   const query = pool.query.bind(pool);
   pool.query = async (sql, params = []) => {
     calls.push({ sql, params });
-    if (sql === 'SELECT base_url FROM git_hosts') return { rows: [{ base_url: 'http://github.com' }] };
+    if (sql === 'SELECT base_url, provider FROM git_hosts') {
+      return { rows: [{ base_url: 'http://github.com', provider: 'github' }] };
+    }
     return query(sql, params);
   };
   const fdeToken = 'git-credential-self-session';
@@ -508,7 +510,7 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   let initialContents = fs.readFileSync(f.target, 'utf8');
   assert.ok(initialContents.startsWith('http://alice-token:'));
   assert.ok(initialContents.includes(secret));
-  assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials'], 'atomic rename leaves no temporary file');
+  assert.deepEqual(fs.readdirSync(f.home), ['.config', '.git-credentials'], 'atomic rename leaves no temporary file');
 
   const get = await fetch(endpoint, { headers: { cookie: cookie(fdeToken) } });
   assert.equal(get.status, 200);
@@ -558,7 +560,7 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
     fs.renameSync = originalRename;
   }
   assert.equal(fs.readFileSync(f.target, 'utf8'), initialContents, 'failed rename preserves old credential');
-  assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials']);
+  assert.deepEqual(fs.readdirSync(f.home), ['.config', '.git-credentials']);
 
   const deleteResponse = await fetch(endpoint, {
     method: 'DELETE',
