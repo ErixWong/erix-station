@@ -1083,7 +1083,9 @@ async function handleStopSession(req, res, ctx, sessionId) {
 /** 浏览器 SSE（portal.md §5）：先注册（缓冲）→ DB 补发（Last-Event-ID / ?last_event_id）→ flush 后转 live；15s 心跳。 */
 async function handleSessionStream(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
-  const s = await sessions.getSession(ctx.pool, { userId: session.user.id, sessionId, limit: 1 });
+  const s = await sessions.getSession(ctx.pool, {
+    userId: session.user.id, sessionId, limit: 1, includeMessages: false,
+  });
   const url = new URL(req.url, 'http://x');
   // 无 Last-Event-ID（首连）不补发历史（§5.2.3）；非法值 400（header/query 同口径）。
   const raw = req.headers['last-event-id'] ?? url.searchParams.get('last_event_id');
