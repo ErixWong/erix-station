@@ -79,11 +79,11 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **P0** | 本设计定稿；上游 issue（resume + new user turn）；#77 跟踪 | — | 本文档 |
 | **P1** | #64 R1：产物回收 + **终态清场语义修正**（真相层归档 TTL 替代物理删除，只清视图/临时物；`ERIX_RUN_DATA_TTL_HOURS` 语义扩展为归档而非删除） | — | 待派工 |
 | **P2** | #81 P2：store key 切 session 维度（**照抄 CLI 预写入+resume 模式，引擎零改动**）：portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息预写入（dedupKey 幂等判据） | 无（CLI 已验证模式） | **已实施**（`feat-260924-06-session-transcript`：迁移 0006 + portal S1–S6 端点 + worker 三分支装配；部署顺序：portal 先上、FDE 镜像后上） |
-| **P3** | messages 表降级 UI 投影；#70 文本注入退役（仅保留 transcript 缺失兜底） | P2 稳定（已实施） | **契约已定稿（§6）**，按三个 PR 推进（①读路径投影 → ②停双写+先落树 → ③退役注入） |
+| **P3** | messages 表降级 UI 投影；#70 文本注入退役（仅保留 transcript 缺失兜底） | P2 稳定（已实施） | **契约已定稿（§6）**，按 PR①、②a、②b、③推进（读路径投影 → POST 事务落 transcript → 停双写/切终态与标题数据源 → 退役注入） |
 
 ## 6. P3 实施契约（2026-10-08 定稿）
 
-> 决策者拍板（对话记录）：①「一说话就该写入 store」；②「投影不是上下文创建，是同一份数据换个角度」；③「折叠的是上下文，显示的是历史消息」；④「无 transcript 的旧会话清理掉，按新的来」。
+> 决策者拍板（对话记录）：①「一说话就该写入 store」；②「投影不是上下文创建，是同一份数据换个角度」；③「折叠的是上下文，显示的是历史消息」。④ 经 PR① 真机检查后修订：历史会话不删除，增量回填可投影的 transcript 输入行。
 > 上游缺口已提 issue：`git.erix.vip/eric/erix-llm-kit#95`（宿主展示投影契约缺失，含反模式与 helper 请求）。
 
 ### 契约四条（实现必须遵守）
@@ -93,24 +93,25 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **①** | **portal 在 POST 消息的事务内直写 session transcript**（沿用既有幂等键 `dedupKey = <sessionId>:input:<messageId>`）；**删除 runner 的「预写入」分支** | 现在 portal 先写 `messages` + 入队、runner 领活后才补写 transcript → 中间有窗口（消息已可见、transcript 未落）→ 断层 → 只能靠文本注入兜底。写入时机提前到消息落库那一刻，写入方由 runner 改为 portal（portal 本就是 DB 权威，无需经 S2 writer 租约端点） |
 | **②** | 消息列表**读时从 transcript 派生**（投影）：`id` 按确定性规则生成（刷新前后稳定）、`seq` 沿用现有 `chat_sessions.last_seq` 分配器（与 `run_events` 共用序列）、`attachments`/`run` 归属留在 `messages` **锚点行**；**内容不再双写**、**不引入物化表/缓存**（实测慢再议） | 重叠的只是「文本内容」；`messages` 独占的是 UI 元数据（seq/附件/run 归属），transcript 独占的是协议细节（工具调用、推理、结构化 parts、折叠状态）。让重叠部分单一来源、非重叠部分各留各的 → 结构上不可能再分叉 |
 | **③** | **UI 一律显示 `record` 全量**；`folded`/`foldedPayload` **只作用于模型上下文**（上下文节流），不作为展示内容 | 决策者原话「折叠的是上下文，显示的是历史消息」 |
-| **④** | **不做老数据兼容**：无 transcript 的旧会话（P2 迁移前产生、只有 `messages` 行）**清理**；代码**不留 `messages` 兜底读分支** | 决策者原话「清理掉好了，按新的来」；上线前的会话不保证可读 |
+| **④** | **不保留读时老数据兼容分支**：一次性增量迁移为缺少 transcript 文本证据的历史 user message 补 `:input:<messageId>` 行；**不删除旧会话**，投影代码不读 `messages.content` 兜底 | 真机证据表明删除会丢失仍需展示的数据；迁移只增不改，既保留旧对话，又允许移除投影兜底 |
 
 用户消息的投影归属也必须确定性：`<sessionId>:input:<messageId>` 按 message ID 精确映射，优先于文本匹配；其它 transcript 行（无论是否带 `run_id`）按 `record.messages` 顺序遍历全部 user 文本，与同 session 尚未认领的非合成 user 锚点按 `seq` 升序精确匹配，认领第一个相同文本。按文本分组的锚点队列使用单调游标，避免每条候选反复扫描全部锚点。没有精确匹配就留空；不得因行的 `run_id`、时间/位置顺序或 `messages` 锚点内容推测归属。助手文本仍按 run 归组：显式 `run_id` 行使用该 ID，session-scoped 行沿用 transcript 分段得到的 run。
 
 ### 落点与可替换性
 
 - **投影逻辑收敛到单一模块**（如 `portal/src/session-view.js`），读路径只经它 —— 上游若提供官方 `projectTranscriptForDisplay`（#95），**直接替换该模块并删除自研部分**。
-- 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧「预写入 + resume」多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛）。
+- 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧由 portal 先提交 session transcript、worker 再 resume 的多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛）。
 
-### 拆解（三个可独立验收的 PR）
+### 拆解（四个可独立验收的 PR）
 
 | PR | 内容 | 验收 |
 |---|---|---|
 | **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退）；带**过渡兜底**：当前写路径尚未把用户输入落入 transcript 时，缺少可派生内容的锚点暂回退到自身内容 | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
-| **②停内容双写 + 先落树再入队** | portal POST 事务内写 transcript；删 runner 预写入分支；终态幂等比较从 `messages.final_text` 换到 transcript；`messages` 降级为锚点行（不再写 `content`）；**删除 PR① 过渡兜底** | 根 `npm test`、`wp3a`/`wp3b`/`wp5` e2e；真机：同 session 多轮 + 崩溃 resume 不丢会话；等价性检查断言 `fallbackCount === 0` |
-| **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径）；AI 标题的首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
+| **②a 先落树再入队（本 PR）** | portal POST 事务内写 session transcript；删 runner 预写入分支；新增 0015 一次性回填历史 user 输入；删除 PR① 投影内容兜底 | 根 `npm test`、前端 typecheck/vitest；真机由主 agent 验证同 session 多轮、崩溃 resume 与 transcript/投影等价性（所有非合成消息内容有 transcript 证据且非空） |
+| **②b 停内容双写与切换数据源** | `messages` 降级为锚点行（停止写 `content`）；终态幂等比较从 `messages.final_text` 换到 transcript；AI 标题首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3a`/`wp3b`/`wp5` e2e |
+| **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径） | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
 
-> **过渡兜底与实测依据**：兜底存在的唯一原因是当前写路径尚未把用户输入落进 transcript，正是 PR②「先落树再入队」要修复的问题；PR① 以 `fallbackCount` 观测命中数，PR② 必须删除兜底并以命中数为 0 验收。真机全库检查发现 64 个会话中仅 2 个有 `:input:<messageId>` 行；抽查会话中用户文本在整份 transcript 的 `record::text` 检索为 0 命中。
+> **过渡兜底、回填决策与实测依据**：PR① 过渡兜底曾命中 30 次。真机全库检查发现 64 个会话中仅 2 个有 `:input:<messageId>` 行；抽查会话 `d86dda63-fc52-481c-9994-65ff29cb5eee` 的用户文本在整份 transcript 的 `record::text` 检索为 0 命中。原因是旧 POST 写路径只写 `messages`，未写 transcript。选择迁移 0015 回填而非删除旧会话，以保留历史数据并让旧会话继续渲染；回填只 INSERT、可幂等重放，随后删除投影兜底，缺证据内容留空。
 
 ### 待决策（UI 轮号口径，遗留项）
 

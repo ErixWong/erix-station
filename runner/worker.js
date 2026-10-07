@@ -277,32 +277,23 @@ async function startRun(msg) {
     return registry.executeTool(options.name, options.input, options.context);
   };
 
-  // issue #81 P2：CLI「预写入 + resume」模式（planTranscriptSeed 三分支，见 lib/transcript-seed.js）：
-  // 空本子 → 不 resume（initialMessages/initialUserMessage 全新路径，引擎 round 0 种子入档）；
-  // 新消息未入档 → 宿主预写 dedupKey=`<key>:input:<messageId>` → resume=true；
-  // 已入档（崩溃重跑）→ 直接 resume=true 不重复写（幂等红线）。
+  // P3 PR②a：portal 已在 POST 事务内预写 `:input:<messageId>`。
+  // 空本子（旧 ticket）走引擎 round 0 seed；已有档案直接 resume；旧 ticket 沿用 ticket.resume。
   // resume=true 对齐 repl.js:656：不传 initialMessages/initialUserMessage（恢复记录即完整上文）。
-  // ⚠️ 放在 runToolLoop 主 try 之外：load/预写失败 = 崩溃语义（exit 1 无 RUN_FINISHED）——
-  // agentd 视同为 worker 崩溃走 releaseAndRequeue（attempt+1 重试，dedupKey 幂等收敛）；
+  // ⚠️ 放在 runToolLoop 主 try 之外：load 失败 = 崩溃语义（exit 1 无 RUN_FINISHED）——
+  // agentd 视同为 worker 崩溃走 releaseAndRequeue；
   // 不发 RUN_FINISHED failed（那才是 U2 终态，瞬时不应把用户 run 打死）。
-  let transcriptPlan = { resume: msg.resume === true, record: null };
+  let transcriptPlan = { resume: msg.resume === true };
   if (sessionId && messageId) {
     try {
       const records = await store.load(transcriptKey);
       transcriptPlan = planTranscriptSeed({
-        records, transcriptKey, messageId, attempt, task, legacyResume: msg.resume === true,
+        records, transcriptKey, messageId, legacyResume: msg.resume === true,
       });
-      if (transcriptPlan.record) {
-        await store.appendRound(transcriptKey, transcriptPlan.record);
-        sendIpc(process, {
-          type: MSG.LOG, run_id: runId, level: 'info',
-          msg: `transcript prewrite: key=${transcriptKey} round=${transcriptPlan.record.round} dedup=${transcriptPlan.record.dedupKey}`,
-        });
-      }
     } catch (err) {
       sendIpc(process, {
         type: MSG.LOG, run_id: runId, level: 'warn',
-        msg: `transcript seed failed, exit for requeue: ${String(err?.message ?? err)}`,
+        msg: `transcript load failed, exit for requeue: ${String(err?.message ?? err)}`,
       });
       // 延迟退出让 LOG 入队（同 finally 的 200ms 约定）。
       setTimeout(() => process.exit(1), 200);
@@ -339,8 +330,8 @@ async function startRun(msg) {
       onObserverError: (err) => {
         sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: `observer error: ${String(err?.message ?? err)}` });
       },
-      // 1) task 显式传（§1.3 硬注意-1）；2) 本轮用户输入经 transcript 预写入/引擎种子入档，
-      //    resume 时不再传 initialMessages/initialUserMessage（对齐 repl.js:656）。
+      // task 显式传（§1.3 硬注意-1）；resume 时不传 initialMessages/initialUserMessage，
+      // 对齐上游 CLI 的 ...(resume ? {} : {...}) 模式。
       task,
       ...(transcriptPlan.resume ? {} : {
         // issue #69：会话历史下行——非 resume 时把 RUN_START.history 映射为引擎 initialMessages

@@ -192,9 +192,24 @@ test('updateSession：改 title → title_source=manual', async () => {
 
 const PM_SESSION_ID = 'a1b2c3d4-1111-4111-8111-abcdefabcdef';
 
-/** postMessage 的业务事务 fake client：记录 SQL 顺序，模拟 chat_sessions 的标题守卫语义。 */
-function postMessageClient({ title = '', title_source = 'auto' } = {}) {
-  const state = { title, title_source };
+/** postMessage 的业务事务 fake client：记录 SQL 顺序，模拟 transcript 唯一键与标题守卫。 */
+function postMessageClient({
+  title = '',
+  title_source = 'auto',
+  existingRounds = [],
+  createdAt = new Date('2026-10-07T11:00:00.000Z'),
+} = {}) {
+  const state = {
+    title,
+    title_source,
+    createdAt,
+    transcriptRows: existingRounds.map((round, index) => ({
+      transcriptKey: PM_SESSION_ID,
+      dedupKey: `existing-${index}`,
+      round,
+    })),
+    transcriptInsertAttempts: 0,
+  };
   const order = [];
   const client = {
     async query(sql, params = []) {
@@ -211,7 +226,28 @@ function postMessageClient({ title = '', title_source = 'auto' } = {}) {
       if (s.includes('FROM containers')) return { rows: [{ id: 'c1' }] };
       if (s.includes('UPDATE chat_sessions SET last_seq')) return { rows: [{ last_seq: 1 }] };
       if (s.startsWith('INSERT INTO messages')) {
-        return { rows: [{ id: 'm1', seq: 1, role: 'user', content: params[2], attachments: '[]', created_at: new Date() }] };
+        return { rows: [{ id: 'm1', seq: 1, role: 'user', content: params[2], attachments: '[]', created_at: state.createdAt }] };
+      }
+      if (s.startsWith('SELECT COALESCE(MAX(round), 0)')) {
+        const rounds = state.transcriptRows
+          .filter((row) => row.transcriptKey === params[0])
+          .map((row) => row.round);
+        return { rows: [{ round: Math.max(0, ...rounds) }] };
+      }
+      if (s.startsWith('INSERT INTO transcript_rounds')) {
+        state.transcriptInsertAttempts += 1;
+        const [transcriptKey, dedupKey, round, record, messages] = params;
+        if (state.transcriptRows.some((row) => row.transcriptKey === transcriptKey && row.dedupKey === dedupKey)) {
+          return { rows: [] };
+        }
+        state.transcriptRows.push({
+          transcriptKey,
+          dedupKey,
+          round,
+          record: JSON.parse(record),
+          messages: JSON.parse(messages),
+        });
+        return { rows: [{ id: `tr-${state.transcriptRows.length}` }] };
       }
       // 首条消息默认标题落库：WHERE 守卫与真实 SQL 同语义（title 非空 / 非 auto → 0 行）。
       if (s.startsWith('UPDATE chat_sessions SET title =')) {
@@ -259,6 +295,71 @@ test('issue #114：首条消息 >30 字 → 标题 = 前 30 字 + `…`（零 LL
   const iCommit = order.findIndex((e) => e.sql === 'COMMIT');
   assert.ok(iCommit !== -1 && order.indexOf(stmt) < iCommit, '标题 UPDATE 在事务内');
   assert.deepEqual(titles, [stmt.params[1]], 'COMMIT 后回调一次新标题（供 SSE 推送）');
+});
+
+test('P3 PR②a：POST 在同一事务内先写 transcript 再入队，round/record 与 runner 预写形态一致', async () => {
+  const content = '来自 POST 入参的用户文本';
+  const { pool, order, state } = postMessageClient({ existingRounds: [2, 7, 4] });
+  const posted = await postMessage(pool, {
+    userId: 'u1',
+    sessionId: PM_SESSION_ID,
+    content,
+    attachments: [{ kind: 'file', path: '/repo/readme.md', name: 'readme.md' }],
+  });
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const messageInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO messages'));
+  const maxRound = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT COALESCE(MAX(round), 0)'));
+  const transcriptInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO transcript_rounds'));
+  const runQueueInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO run_queue'));
+  const begin = order.findIndex(({ sql }) => sql === 'BEGIN');
+  const commit = order.findIndex(({ sql }) => sql === 'COMMIT');
+
+  assert.ok(begin < messageInsert && messageInsert < maxRound && maxRound < transcriptInsert);
+  assert.ok(transcriptInsert < runQueueInsert && runQueueInsert < commit, 'transcript INSERT 位于入队之前且同属提交事务');
+  assert.ok(begin < transcriptInsert && transcriptInsert < commit);
+  assert.equal(state.transcriptRows.length, 4);
+  assert.equal(posted.run.status, 'queued');
+
+  const insert = order[transcriptInsert];
+  const sql = normalize(insert.sql);
+  assert.match(sql, /VALUES \(NULL, \$1, \$2, \$3, \$4, false, \$5, NULL\)/);
+  assert.match(sql, /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/);
+  assert.deepEqual(order[maxRound].params, [PM_SESSION_ID], '只用本 session 的 max(round)');
+  assert.deepEqual(insert.params.slice(0, 3), [PM_SESSION_ID, `${PM_SESSION_ID}:input:m1`, 7]);
+  const userMessageInsert = order[messageInsert];
+  assert.equal(JSON.parse(userMessageInsert.params[3])[0].name, 'readme.md', '附件仍写在锚点行');
+  const expectedMessages = [{ role: 'user', content: [{ type: 'text', text: content }] }];
+  const record = JSON.parse(insert.params[3]);
+  assert.deepEqual(record, {
+    round: 7,
+    roundKey: `${PM_SESSION_ID}:input:m1`,
+    dedupKey: `${PM_SESSION_ID}:input:m1`,
+    messages: expectedMessages,
+    ts: record.ts,
+  });
+  assert.equal(typeof record.ts, 'string');
+  assert.equal(new Date(record.ts).toISOString(), record.ts);
+  assert.deepEqual(JSON.parse(insert.params[4]), expectedMessages);
+  assert.equal(state.transcriptRows.at(-1).round, 7, 'round 从该 session 现有 max(round) 取得');
+});
+
+test('P3 PR②a：重放相同 transcript INSERT 时，部分唯一冲突使 transcript 只保留一行', async () => {
+  const { pool, order, state } = postMessageClient();
+  await postMessage(pool, {
+    userId: 'u1',
+    sessionId: PM_SESSION_ID,
+    content: '重放文本',
+    attachments: [],
+  });
+  const transcriptWrite = order.find(({ sql }) => sql.includes('INSERT INTO transcript_rounds'));
+  const client = await pool.connect();
+  await client.query(transcriptWrite.sql, transcriptWrite.params);
+  client.release();
+
+  assert.equal(state.transcriptInsertAttempts, 2);
+  assert.equal(state.transcriptRows.length, 1);
+  assert.ok(order.filter(({ sql }) => sql.includes('INSERT INTO transcript_rounds'))
+    .every(({ sql }) => /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/.test(sql)));
 });
 
 test('issue #114：首条消息 ≤30 字 → 标题 = 原文（不加 `…`）', async () => {
