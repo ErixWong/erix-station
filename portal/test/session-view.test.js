@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getSession } from '../src/sessions.js';
 import { projectSessionMessages } from '../src/session-view.js';
+import { projectTranscriptForDisplay } from 'erix-agent';
 
 const SESSION_ID = '10000000-0000-4000-8000-000000000001';
 const LEGACY_SESSION_ID = '10000000-0000-4000-8000-000000000002';
@@ -223,9 +224,10 @@ test('GET session projects user and final assistant text while preserving anchor
   assertTranscriptBacked(result, transcriptRows);
   assert.ok(pool.queries.some((query) => query.sql.includes('FROM transcript_rounds')));
   assert.ok(pool.queries.some((query) => query.sql.includes('ORDER BY seq DESC LIMIT $2')));
+  // 契约 ④：锚点侧只读合成行的内容（助手/用户正文无证据则留空，不取 messages.content 兜底）。
   assert.match(
     pool.queries.find((query) => query.sql.includes('ORDER BY seq DESC LIMIT $2')).sql,
-    /CASE WHEN synthetic OR role = 'assistant' THEN content END AS content/,
+    /CASE WHEN synthetic THEN content END AS content/,
   );
   assert.match(
     pool.queries.find((query) => query.sql.includes('FROM transcript_rounds')).sql,
@@ -837,4 +839,215 @@ test('metadata-only session read skips messages and transcript queries', async (
   assert.equal(result.last_seq, 8);
   assert.equal(pool.queries.some((query) => query.sql.includes('FROM messages')), false);
   assert.equal(pool.queries.some((query) => query.sql.includes('FROM transcript_rounds')), false);
+});
+
+// ---------------------------------------------------------------------------
+// P3 PR②b：读侧已换用上游官方投影 `projectTranscriptForDisplay`（erix-agent 0.15.0，上游 #95）。
+// 以下用例断言的是**官方投影的展示规则在我们 DTO 上的可观测结果**——自研推导若被重新引入就会失败。
+// ---------------------------------------------------------------------------
+
+test('official projection keeps reasoning out of the displayed answer text', () => {
+  const anchors = [
+    message('reasoning-assistant', 1, 'assistant', 'stale anchor text', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(1, `${RUN_1}:engine:round:1`, {
+      dedupKey: `${RUN_1}:engine:round:1`,
+      response: {
+        content: [
+          { type: 'reasoning', text: 'PRIVATE CHAIN OF THOUGHT' },
+          { type: 'text', text: 'public answer' },
+        ],
+        stopReason: 'end_turn',
+      },
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+
+  assert.equal(projection[0].content, 'public answer');
+  assert.equal(projection[0].content.includes('PRIVATE CHAIN OF THOUGHT'), false);
+});
+
+test('folded rounds render the official summary and range, never foldedPayload raw content', () => {
+  const anchors = [
+    message('folded-assistant', 1, 'assistant', 'stale anchor text', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(9, `${RUN_1}:engine:round:9`, {
+      dedupKey: `${RUN_1}:engine:round:9`,
+      round: 9,
+      folded: true,
+      foldedRoundRange: { from: 1, to: 5 },
+      summary: { action: '调研代码', note: '定位到 store 层' },
+      navigationRecord: { roundFrom: 1, roundTo: 5, artifacts: [{ path: 'a.txt' }, { path: 'b.txt' }] },
+      foldedPayload: [{ role: 'user', content: text('RAW FOLDED PAYLOAD MUST NOT BE RENDERED') }],
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+
+  const content = projection[0].content;
+  assert.match(content, /早期第 1–5 轮已折叠/);
+  assert.match(content, /调研代码/);
+  assert.match(content, /2 个归档产物/);
+  assert.equal(content.includes('RAW FOLDED PAYLOAD MUST NOT BE RENDERED'), false);
+});
+
+test('a folded round still shows its own historical answer in preference to the fold summary', () => {
+  const anchors = [
+    message('folded-final-assistant', 1, 'assistant', 'stale anchor text', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(4, `${RUN_1}:engine:round:4`, {
+      dedupKey: `${RUN_1}:engine:round:4`,
+      folded: true,
+      foldedRoundRange: { from: 1, to: 3 },
+      foldedPayload: [{ role: 'user', content: text('RAW FOLDED PAYLOAD MUST NOT BE RENDERED') }],
+      response: { content: text('historical answer of the folded round'), stopReason: 'end_turn' },
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+
+  assert.equal(projection[0].content, 'historical answer of the folded round');
+});
+
+test('user anchors map by meta.dedupKey even when the DB dedup_key column is null', () => {
+  const anchors = [
+    message('record-keyed', 1, 'user', 'stale anchor text', RUN_1),
+    message('text-twin', 2, 'user', 'transcript input text', RUN_2),
+  ];
+  const transcriptRows = [
+    // dedup_key 列为 NULL，但 record.dedupKey 带着 `<sessionId>:input:<messageId>` → 仍走精确映射。
+    transcript(3, null, {
+      dedupKey: `${SESSION_ID}:input:record-keyed`,
+      messages: [{ role: 'user', content: text('transcript input text') }],
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: anchors.map(({ id, run_id, seq, synthetic, content }) => ({
+      id, run_id, seq, synthetic, anchor_text: content,
+    })),
+    transcriptRows,
+  });
+
+  assert.equal(projection[0].content, 'transcript input text', 'mapped by meta.dedupKey');
+  assert.equal(projection[1].content, '', 'content matching is not consulted once meta.dedupKey resolves');
+});
+
+test('engine-injected synthetic turns never claim a real user anchor', () => {
+  const anchors = [
+    message('real-user', 1, 'user', 'same injected text', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(2, `${SESSION_ID}:engine:round:2`, {
+      dedupKey: `${SESSION_ID}:engine:round:2`,
+      messages: [{
+        role: 'user',
+        content: text('same injected text'),
+        meta: { source: 'judge-control' },
+      }],
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [{
+      id: 'real-user', run_id: RUN_1, seq: 1, synthetic: false, anchor_text: 'same injected text',
+    }],
+    transcriptRows,
+  });
+
+  assert.equal(projection[0].content, '', 'meta.synthetic turns are labelled by the projection and excluded');
+});
+
+test('tool-call rounds contribute no answer text and leave the anchor empty', () => {
+  const anchors = [
+    message('tool-only-assistant', 1, 'assistant', 'stale anchor text', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(1, `${SESSION_ID}:engine:round:1`, {
+      dedupKey: `${SESSION_ID}:engine:round:1`,
+      response: {
+        content: [{ type: 'tool_use', id: 't1', name: 'read', input: { path: 'src/a.js' } }],
+        stopReason: 'tool_use',
+      },
+      messages: [{
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 't1', content: 'RAW TOOL OUTPUT' }],
+      }],
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+
+  assert.deepEqual(projection.map((row) => row.content), ['']);
+});
+
+test('a resumed seed record keeps the engine fold summary out of the user bubble', () => {
+  const FOLD_MARK = '【上下文折叠·v1·erix-9f6e2c】';
+  const anchors = [
+    message('seed-user', 1, 'user', '我的问题是：帮我修一下登录。', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(0, `${SESSION_ID}:input:seed-user`, {
+      dedupKey: `${SESSION_ID}:input:seed-user`,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: `${FOLD_MARK}早期第 1–3 轮（共 3 轮）已折叠。工具足迹：read×2。` },
+          { type: 'text', text: '我的问题是：帮我修一下登录。' },
+        ],
+      }],
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [{ id: 'seed-user', run_id: RUN_1, seq: 1, synthetic: false, anchor_text: '我的问题是：帮我修一下登录。' }],
+    transcriptRows,
+  });
+
+  assert.equal(
+    projection[0].content,
+    '我的问题是：帮我修一下登录。',
+    'the projection splits the fold summary into its own system turn instead of the user text',
+  );
+});
+
+test('the projection is fed records in (round, created_at) order — per-row calls match the whole-store call', () => {
+  const { transcriptRows } = fixture();
+  const ordered = [...transcriptRows].sort((a, b) => (a.round - b.round) || (a.created_at - b.created_at));
+  const whole = projectTranscriptForDisplay(ordered.map((row) => row.record));
+  const perRow = ordered.flatMap((row) => projectTranscriptForDisplay([row.record]));
+
+  assert.deepEqual(perRow.map(({ role, text, round }) => ({ role, text, round })),
+    whole.map(({ role, text, round }) => ({ role, text, round })),
+    '行级调用与整表调用产出同一展示序列（投影是逐记录展开的纯函数）');
 });
