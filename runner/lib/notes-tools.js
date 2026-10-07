@@ -1,10 +1,10 @@
 // station note 工具装配（issue #46）：erix-agent 0.10.0 装配工厂形态。
 // createBuiltinNotesTools 是包根公开导出（src/index.js），一次调用绑定 runId 作用域 +
 // notesDir + 单一 NotesStore 实例，返回双视图（executors 位置参数 / executeTool 结构化）
-// 与 lifecycle（onRunStart=janitor / onRunComplete=completeRun→janitor）。宿主作用域
+// 与 lifecycle（onRunComplete=completeRun）。宿主作用域
 // （runId/notesDir/notesStore）由工厂内部强制注入并覆盖任何调用方伪造的 __erix——
 // 本文件零深路径 import、零手写 __erix。
-// 参考：erix-llm-kit docs/host-consumer-contract.md「Tier 2 工厂用法」与 bin/cli.js try/finally。
+// 参考：erix-llm-kit docs/host-consumer-contract.md「Tier 2 工厂用法」。
 // 降级语义不变：工厂模块加载失败 → 抛错，由 worker 捕获（warn + 无 note 工具，不中断 run）。
 export async function createNotesTools({ runId, notesDir }) {
   // 动态 import：加载失败要能被调用方降级处理（静态 import 失败会直接炸掉 worker 进程）。
@@ -18,9 +18,10 @@ export async function createNotesTools({ runId, notesDir }) {
     runId: runId === undefined ? undefined : String(runId),
     notesDir: notesDir === undefined ? undefined : String(notesDir),
   });
-  if (!assembler || typeof assembler.executeTool !== 'function' || !assembler.lifecycle
+  if (!assembler || typeof assembler.executeTool !== 'function'
+      || typeof assembler.lifecycle?.onRunComplete !== 'function'
       || !Array.isArray(assembler.definitions)) {
-    throw new Error('createBuiltinNotesTools 返回值缺 executeTool/lifecycle/definitions');
+    throw new Error('createBuiltinNotesTools 返回值缺 executeTool/lifecycle.onRunComplete/definitions');
   }
 
   return {
@@ -36,8 +37,7 @@ export async function createNotesTools({ runId, notesDir }) {
     // 结构化（runToolLoop/checkpoint-executor 调用约定，也兼容位置参数形态）。
     executors: assembler.executors,
     executeTool: assembler.executeTool,
-    // 生命周期：onRunStart=janitor（runToolLoop 前）；onRunComplete=completeRun→janitor，
-    // 收尾错误收集在返回的 errors[]（不抛出覆盖主错误）。
+    // 生命周期仅有 onRunComplete（completeRun）；收尾错误收集在 errors[]（不覆盖主错误）。
     lifecycle: assembler.lifecycle,
     // ADR-015 semantic 槽位：worker 已透传 runToolLoop 的 semanticStateProvider 参数
     // （宿主契约 docs/host-consumer-contract.md §Run state：折叠重建 run state 时回调）。

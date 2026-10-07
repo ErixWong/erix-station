@@ -128,34 +128,24 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 8. erix-agent 依赖与升级（0.3.5 → 0.9.0，2026-09 分析）
+## 8. erix-agent 依赖与升级（当前 pin：0.14.0）
 
-- **源仓库**：`~/projects/erix-llm-kit`（npm 包名就是 `erix-agent`；本地无同名目录，别再找错）。宿主契约 `docs/host-consumer-contract.md`；0.6.0 升级指南 `docs/host-upgrade-guide-0.6.0.md`；破坏性变化以 CHANGELOG 为准。
-- runner 锁 `0.3.5`（runner/package.json），最新 `0.9.0`。升级为**大改动**：走分支 + PR + §6.1 评审。
+- **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
+- runner 当前 pin：`0.14.0`。升级仍走分支 + PR + §6.1 评审。
 
-### 必改项（breaking，不改跑不起来）
+### 0.14.0 当前宿主契约
 
-1. **`erix-agent/tools` 四个导入断供**（0.9.0 只剩 `createToolRegistry` + tool providers）：
-   - `createJail` / `createFileTools` → 0.6.0 删除（ADR-009：库不提供沙箱）→ runner 自带 file 工具与 jail 路径边界（牢笼仍由本项目提供，不变式 1）；
-   - `createRecallTool` → 0.8.0 随 recall 工具退役删除 → 删该工具，档案取回改 note 工作流（`note_take`/`note_read`/`note_list`，引擎要求 NotesStore；实现放 `src/store/notes.js` 导出 `createFileNotesStore`/`assertNotesStore`）。
-2. **TranscriptStore 必需方法变 8 个**（0.6.0 起 run 前 fail-closed 校验，缺即 TypeError）：station 现有 7 个，缺 **`saveRunState`/`loadRunState`** → 三段链路都补：worker `makeStore`（IPC）→ agentd `handleStoreState` 加 case → portal internal 新端点（`PUT/GET /runs/:id/runstate`，落 `runs.run_state jsonb`，与不变式 3「DB 是状态真相」一致）。契约要求：写失败向上抛、runState 对象含 `state`/`stateVersion`。
-3. **store.recall 不再必需**：引擎 0.8.0 起不再调用；agentd/portal 的 recall 端点可保留或删（升级时拍板，别留孤儿）。
-4. **未知顶层选项抛 TypeError**：worker 现有传参已逐项核对在契约白名单内，无需改（后续加参数必须先对 `host-consumer-contract.md` 选项清单）。
-
-### 需拍板的行为差异（不 crash，但改模型可见面/成本）
-
-- `maxRounds: 8 + judge 已开`（`reflection: { enabled: true, roundJudge: true }`，用户 2026-09-22 拍板，推翻「P1 mock 关 judge」）→ 长任务 nearLimit 可经 round judge `extend` 扩轮；judge 请求失败 fail-closed 不扩轮（`roundJudgeFailures` 限 3 后本轮禁用）；judgeIntercept 默认开（工具透明审计）。
-- 新默认值：output hygiene 4096（超限工具结果归档+截断提示）、工具结果 TTL 折叠（`ERIX_TOOL_RESULT_TTL` 默认 2）、retry `attempts:2`；单轮聚合预算在未传窗口配置时不生效（同 0.6.0 行为）。
-- resume 语义拆分（0.7.0）：轮号跨 resume 连续，轮预算每次 run 从 0 起计 → wp3b-e2e 的 resume 用例要按新口径核对。
-
-### 随动同步项
-
-- `termination` 新枚举 `final_guard_unverified`（docs/data/schema.sql 注释还按 0.3.5 写）；`usage` 增可选 `cacheRead`/`cacheWrite`；新事件类型 `compaction`/`final_guard`、judge 事件带 `extend`/`passThrough` 决策 → portal 事件白名单/前端枚举核对。
-- provider 导出 `createOpenAIProvider`/`createJsonFileModelConfigProvider` 与 `registry.executeTool(name, input, context)` 签名未变；worker 的 executeTool 已是结构化包装，无需改。
-- 升级后对 station store adapter 跑 `erix-agent/contract-tests`（`transcriptStoreContract` 0.6.0 起更严：checkpoint 字节保真、多 runId 隔离、runState round-trip）。
-- `runner/package.json` 版本号 + lock、wp3b-e2e、本节状态在 PR 内同步更新。
+- `TranscriptStore` **必需仅** `appendRound` + `load`；`saveRunSnapshot` / `loadLatestRunSnapshot`（latest-only crash snapshot）及 `saveRunState` / `loadRunState` / `markRunState` 为可选能力。快照方法已由 `saveCheckpoint` / `loadLatestCheckpoint` 更名；不要再把旧名暴露给引擎。station 仍把内部 HTTP 路径 `/checkpoint` 保留作传输实现细节。
+- `saveRunState` 保存 deterministic/semantic run-state 数据，不写顶层 `state`；`markRunState` 写独立状态通道。宿主读 `loadRunStateStatus` 不属于引擎能力校验；上游实际 store 契约返回状态字符串，portal 响应记录由 adapter 读取 `status?.status`。旧 JSONB 快照里的 `state` 仍可回退读取，不需要数据回填。
+- portal 以 `runs.run_state` / `chat_sessions.engine_run_state` 保存快照数据，以 `runs.run_state_status` / `chat_sessions.engine_run_state_status` 保存状态记录；增量迁移 `0014-run-state-status.sql` 提供新列，baseline `docs/data/schema.sql` 保持冻结。
+- notes 工厂生命周期只有 `onRunComplete()`：完成 active → done，返回 `{ completed: {status, completed}, errors }`；**不再有 `onRunStart`，也不在生命周期内 purge/janitor**。notes maintenance 改宿主调度属于 PR B（ADR-018 D7）。
+- `NotesStore` 六方法（`write/read/list/complete/revoke/purge`）由 `createBuiltinNotesTools` 在工厂创建时 fail-closed 校验。`note_list` 仅接收 `tag` / `includeInactive`；不传 `cursor` / `limit` / `source` / `minRelevance`。
+- `worker.js` 只从包根导入 `createJsonFileModelConfigProvider`、`createOpenAIProvider`、`runToolLoop`；`createToolRegistry` 只从 `erix-agent/tools` 导入。`erix-agent/tools` 不再公开凭据 helper；notes 写侧凭据检测也已退役。本项目没有深路径 `src/loop.js` 导入。
+- 不实现 0.14.0 的 opt-in tool replay 声明与 `partialPersistence`；维持默认行为。后续启用 partial persistence 必须同时启用 `stream: true`。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
+
+> 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
 
 - [x] **必改项 1**：`erix-agent/tools` 四导入断供 → runner 自带 jail + file 工具（`runner/lib/file-tools.js`，0.3.5 语义移植）；recall 工具删除，档案取回归 note 工作流（`runner/lib/notes-tools.js`，复用随包 notes 技能模块 + `createFileNotesStore`，落盘 `<worktree>/.notes`）。
 - [x] **必改项 2**：store adapter 补 `saveRunState`/`loadRunState`（`runner/lib/store.js`，transport 可注入）→ agentd `handleStoreRequest` 两 case → portal `PUT/GET /runs/:id/runstate`（落 `runs.run_state jsonb`，迁移 `0003-run-state.sql`）。markRunState 双路：`'running'` → U2；引擎终态标记 → runstate 合并 `state`（不动 `runs.status`）。
@@ -167,10 +157,20 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 
 ### 8.2 0.10.0 迁移记录（feat-260922-01-erix-agent-010-notes，issue #46，2026-09-22）
 
+> 历史记录：其中 `onRunStart` / janitor 语义已在 0.12.0 删除；当前行为以本节及 8.3 为准。
+
 - [x] **notes 装配迁工厂**：`runner/lib/notes-tools.js` 重写——`createBuiltinNotesTools`（包根公开导出，零深路径 import、零手写 `__erix`，宿主作用域工厂内部强制注入）；返回工厂全套（definitions/executors/executeTool 双视图 + lifecycle + semanticStateProvider）；降级逻辑保留（动态 import，失败 → warn + 无 note 工具，不中断 run）。
 - [x] **worker 接生命周期**（上游 `bin/cli.js` try/finally 模式）：`onRunStart`（janitor）在 runToolLoop 前（失败仅告警）；`onRunComplete`（completeRun→janitor）在 finally；返回的 `errors[]` 逐条 IPC warn 记账，**不覆盖 run 主错误**。note_* 走工厂结构化 `executeTool`，file 工具维持自带 registry。
 - [x] **resume 丢 notes 修复（选项 A，logical-run 作用域）**：notesDir 从 `<worktree>/.notes` 迁 **run 数据目录** `<CFG.home>/runs/<runId>/notes/`（agentd claim 后备好、RUN_START 下行 `notes_dir`；旧 agentd 无该字段 → worker 回退 worktree 内 `.notes` 并 warn）。`cleanupWorktree` 照旧只清 worktree、**不再连带 notes**；`releaseAndRequeue`（resume/崩溃重排队）与 lease_lost 路径**不删** run 数据目录——attempt 间 notes 必保留。
 - [x] **run 数据目录终态清理**：仅 U2 确认终态（finishRun 成功或 409 run_terminal 幂等命中）后 `cleanupRunData`；stop 路径（dropReason=stop_request/stop_heartbeat 补报 aborted）同判终态。清理失败/异常退出遗留的兜底 = **下次 agentd 启动 sweep**（`sweepRunDataDir`，claimLoop 之前跑）——**sweep 只删 mtime 超过保留期的目录**（默认 24h，`ERIX_RUN_DATA_TTL_HOURS` 可调，0=禁用；评审 HIGH 修正：启动时活跃集为空，无 TTL 会把崩溃后待 resume re-claim 的 notes 当残留删光，race 推导与单测见 `runner/lib/run-data.js`）。权限坑：file store 写时 chmod 0700/0600（属主 worker UID 1002），agentd（1001）直删 EACCES → `cleanupRunData` 直删失败后以 fork worker 同款 uid/gid 起一次性 helper 删（agentd 持 SETUID/SETGID ambient caps）。
 - [x] **依赖**：`runner/package.json` erix-agent 0.9.0 → **0.10.0** + lockfile 同步（`npm view` 确认 0.10.0 已发布，含上游 PR #54 装配工厂）。
 - [x] **测试**：`runner/test/notes-tools.test.js` 按工厂 API 重写（4 用例：工厂装配闭环、lifecycle errors[] 语义、**resume 跨实例不断档**、scope 非 run）；`runner/test/run-data.test.js` 覆盖 run 数据目录生命周期（sweep 新鲜保留/过期清扫/TTL 边界/禁用清扫、终态清理幂等）；不断言 `__erix` 细节（工厂内部行为）。既有 store-contract/file-tools 套件不动，根 `npm test` 全绿。
-- [ ] **待办**：worker 暂未接 `semanticStateProvider`（ADR-015 槽位，工厂已透出，将来接 runToolLoop 参数时零成本）；wp3b-e2e resume 用例的 notes 断言属主 agent 范围（本 PR 不跑 docker/e2e）。
+- [x] **后续接线**：worker 已将工厂的 `semanticStateProvider` 传给 `runToolLoop`（`runner/worker.js`；contract shape 与降级路径见 `runner/test/notes-tools.test.js`）。
+- [ ] **待办**：wp3b-e2e resume 用例的 notes 断言属主 agent 范围（本 PR 不跑 docker/e2e）。
+
+### 8.3 0.14.0 迁移记录（issue #162，PR A）
+
+- [x] 依赖与 lockfile 更新至 `0.14.0`；adapter 暴露新快照方法，契约测试使用上游 `transcriptStoreContract`。
+- [x] run-state 快照与 `markRunState` status 拆分；新状态列走 migration `0014`，旧快照内嵌 `state` 由 status reader 兼容，无数据回填。
+- [x] 删除 `onRunStart` 调用；completion 错误只记日志、不覆盖 run 主错误。
+- [ ] PR B：为 notes retention/purge 与 active orphan cleanup 实现宿主自调度（ADR-018 D7/session clock）；本 PR 不实现 tool replay 或 partial persistence。
