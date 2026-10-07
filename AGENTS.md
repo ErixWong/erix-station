@@ -128,10 +128,10 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 8. erix-agent 依赖与升级（当前 pin：0.14.0）
+## 8. erix-agent 依赖与升级（当前 pin：0.15.0）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
-- runner 当前 pin：`0.14.0`。升级仍走分支 + PR + §6.1 评审。
+- runner 当前 pin：`0.15.0`；portal（根 package.json，运行时依赖）自 P3 前置起也 pin `0.15.0`（写侧预写改走引擎 `appendUserTurn`，见 §8.4）。升级仍走分支 + PR + §6.1 评审。
 
 ### 0.14.0 当前宿主契约
 
@@ -142,6 +142,14 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - `NotesStore` 六方法（`write/read/list/complete/revoke/purge`）由 `createBuiltinNotesTools` 在工厂创建时 fail-closed 校验。`note_list` 仅接收 `tag` / `includeInactive`；不传 `cursor` / `limit` / `source` / `minRelevance`。
 - `worker.js` 只从包根导入 `createJsonFileModelConfigProvider`、`createOpenAIProvider`、`runToolLoop`；`createToolRegistry` 只从 `erix-agent/tools` 导入。`erix-agent/tools` 不再公开凭据 helper；notes 写侧凭据检测也已退役。本项目没有深路径 `src/loop.js` 导入。
 - 不实现 0.14.0 的 opt-in tool replay 声明与 `partialPersistence`；维持默认行为。后续启用 partial persistence 必须同时启用 `stream: true`。
+
+### 8.4 0.15.0 迁移记录（P3 前置，portal 写侧接 `appendUserTurn`）
+
+- [x] **依赖**：`runner/package.json` 0.14.0 → **0.15.0**（增量、无破坏性变更，见 host-upgrade-guide-0.15.0）；**根 `package.json` 新增运行时依赖 `erix-agent: 0.15.0`**（非 dev：portal POST 事务直写 `appendUserTurn`，`portal/Dockerfile` 的 `npm ci --omit=dev` 必须能装到；包体积 ~百 KB 量级，镜像增量可忽略，已验证 omit=dev 安装面含 `src/` 与 `test/contract/`）；两处 lockfile 同步。
+- [x] **写侧换 API**：POST 消息事务内的用户输入预写不再手搋 record，改引擎 `appendUserTurn(store, { key: sessionId, text, messageId })`（上游 #97）：round 推导（复用现有最大 round，空 store=0）、dedupKey（`<sessionId>:input:<messageId>`）、record 形态、幂等判据全在引擎侧。station 只提供极小 store 适配器 `portal/src/transcript-store.js`（`load`/`appendRound` 复用调用方事务 client，落库列形态与原手搋逐列等价：`run_id=NULL`、`folded=false`、`messages=record.messages` 派生列、`ON CONFLICT … DO NOTHING` 保留作并发最后防线）。顺序红线不变：先写 transcript、后入队 run（测试断言 BEGIN < messages INSERT < store load < transcript INSERT < run_queue < COMMIT，同一 client 流水）。
+- [x] **空白 text 语义**：`appendUserTurn` 对纯空白 text 抛 `TypeError`；HTTP 路径不可达（`validateMessageBody` 已先行 400 `validation_failed`），`sessions.js` 仍做兜底捕获转同一错误码，保证不升格 500。
+- [x] **契约自检**：`portal/test/engine-api-contract.test.js` 接入上游 `engineApiContract`（`erix-agent/contract-tests`），锁包入口导出面与最小预写行为；runner 侧 `transcriptStoreContract` 套件不动。
+- [ ] **未接线（PR②b 及后续范围）**：读侧 `projectTranscriptForDisplay`（#95，替换 `session-view.js` 自研投影）；`loadRunStateStatus` 终态比较复核（#96，host-upgrade-guide-0.15.0 §3：0.14.0 升级指南示例读 `status?.status` 有误，引擎解析为状态字符串；station 侧 `runner/lib/store.js` 读的是自家 IPC 信封后经 adapter 返回字符串，语义已对齐——PR②b 终态比较切 transcript 时一并复核）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
