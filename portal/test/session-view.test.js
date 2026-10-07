@@ -326,6 +326,124 @@ test('run-id legacy rows, session-key rows, and mixed rows project identically t
   }
 });
 
+test('legacy run snapshot claims its previous-turn user by text and leaves its current anchor blank', async () => {
+  const previousText = 'the previous turn user message';
+  const currentText = 'the current turn is missing from the snapshot';
+  const snapshotMessages = [
+    { role: 'user', content: text('session opening task') },
+    ...Array.from({ length: 17 }, (_, index) => ({
+      role: 'assistant',
+      content: text(`recovered history message ${index + 1}`),
+    })),
+    { role: 'user', content: text(previousText) },
+  ];
+  const anchors = [
+    message('previous-user', 1, 'user', previousText, RUN_1),
+    message('current-user', 3, 'user', currentText, RUN_2),
+  ];
+  const transcriptRows = [
+    transcript(0, null, { messages: snapshotMessages }, at(4), RUN_2),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: SESSION_ID,
+    limit: 20,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.equal(snapshotMessages.length, 19);
+  assert.equal(snapshotMessages[0].content[0].text, 'session opening task');
+  assert.equal(snapshotMessages.at(-1).content[0].text, previousText);
+  assert.equal(transcriptRows.some((row) => row.run_id === RUN_1), false);
+  assert.equal(projected.get('previous-user').content, previousText);
+  assert.equal(projected.get('current-user').content, '');
+});
+
+test('users missing their own rows are recovered from later run snapshots by exact text', async () => {
+  const anchors = [
+    message('crashed-a', 1, 'user', 'crashed turn alpha', RUN_1),
+    message('crashed-b', 2, 'user', 'crashed turn beta', RUN_2),
+    message('crashed-c', 3, 'user', 'crashed turn gamma', RUN_4),
+    message('current-d', 4, 'user', 'unpersisted current turn', LEGACY_RUN),
+  ];
+  const snapshotRunIds = [
+    '40000000-0000-4000-8000-000000000001',
+    '40000000-0000-4000-8000-000000000002',
+    '40000000-0000-4000-8000-000000000003',
+  ];
+  const transcriptRows = [
+    transcript(0, null, {
+      messages: [
+        { role: 'user', content: text('session opening task') },
+        { role: 'user', content: text('crashed turn alpha') },
+      ],
+    }, at(1), snapshotRunIds[0]),
+    transcript(0, null, {
+      messages: [
+        { role: 'user', content: text('crashed turn alpha') },
+        { role: 'user', content: text('crashed turn beta') },
+      ],
+    }, at(2), snapshotRunIds[1]),
+    transcript(0, null, {
+      messages: [
+        { role: 'user', content: text('crashed turn beta') },
+        { role: 'user', content: text('crashed turn gamma') },
+      ],
+    }, at(3), snapshotRunIds[2]),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: SESSION_ID,
+    limit: 20,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  for (const anchor of anchors) {
+    assert.equal(
+      transcriptRows.some((row) => row.run_id === anchor.run_id),
+      false,
+      `${anchor.id} has no transcript row for its own run`,
+    );
+  }
+  assert.equal(projected.get('crashed-a').content, 'crashed turn alpha');
+  assert.equal(projected.get('crashed-b').content, 'crashed turn beta');
+  assert.equal(projected.get('crashed-c').content, 'crashed turn gamma');
+  assert.equal(projected.get('current-d').content, '');
+});
+
+test('content matching takes duplicate texts in seq order and claims each anchor once', async () => {
+  const anchors = [
+    message('first-repeat', 1, 'user', 'repeated request', RUN_1),
+    message('second-repeat', 2, 'user', 'repeated request', RUN_2),
+  ];
+  const transcriptRows = [
+    transcript(0, null, {
+      messages: [{ role: 'user', content: text('repeated request') }],
+    }, at(1)),
+    transcript(1, null, {
+      messages: [{ role: 'user', content: text('repeated request') }],
+    }, at(2), RUN_4),
+    transcript(2, null, {
+      messages: [{ role: 'user', content: text('repeated request') }],
+    }, at(3), LEGACY_RUN),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: SESSION_ID,
+    limit: 20,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.equal(projected.get('first-repeat').content, 'repeated request');
+  assert.equal(projected.get('second-repeat').content, 'repeated request');
+});
+
 test('legacy row, seed, input row, and a transcript-less crashed run map without time guessing', async () => {
   const crashRun = RUN_2;
   const anchors = [

@@ -50,6 +50,12 @@ function assistantText(record) {
   return messageText || null;
 }
 
+function lastUserText(record) {
+  const messages = Array.isArray(record?.messages) ? record.messages : [];
+  const lastUser = messages.findLast((message) => message?.role === 'user');
+  return textFromContent(lastUser?.content);
+}
+
 function compareTranscriptRows(a, b) {
   const roundDiff = Number(a.round) - Number(b.round);
   if (Number.isFinite(roundDiff) && roundDiff !== 0) return roundDiff;
@@ -67,12 +73,6 @@ function compareTranscriptRows(a, b) {
 export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows }) {
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
-  const userByRunId = new Map();
-  for (const anchor of users) {
-    if (anchor.synthetic !== true && anchor.run_id && !userByRunId.has(anchor.run_id)) {
-      userByRunId.set(anchor.run_id, anchor);
-    }
-  }
   const runIds = new Set([
     ...users.map((anchor) => anchor.run_id),
     ...anchors.map((anchor) => anchor.run_id),
@@ -82,45 +82,48 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   const assistantContent = new Map();
   let currentRunId = null;
 
-  // Explicit legacy run IDs are authoritative; session-scoped keys segment newer rows.
   for (const row of [...transcriptRows].sort(compareTranscriptRows)) {
     const record = row.record;
-    if (typeof row.run_id === 'string' && row.run_id.length > 0) {
-      const lastUser = Array.isArray(record?.messages)
-        ? record.messages.findLast((message) => message?.role === 'user')
-        : null;
-      const userText = textFromContent(lastUser?.content);
-      const userAnchor = userByRunId.get(row.run_id);
-      if (userText !== null) currentRunId = row.run_id;
-      if (userAnchor && userText !== null) {
-        const anchorId = String(userAnchor.id);
-        if (!claimedUserAnchors.has(anchorId)) {
-          claimedUserAnchors.add(anchorId);
-          userContent.set(anchorId, userText);
-        }
-      }
+    const keys = recordKeys(row, record);
+    const messageId = inputMessageId(keys, sessionId);
+    const userText = lastUserText(record);
+    let matchedUserAnchor = null;
 
+    // Snapshot rows can end at an earlier turn; run_id alone does not establish user ownership.
+    if (messageId !== null) {
+      matchedUserAnchor = userById.get(messageId) ?? null;
+      if (
+        matchedUserAnchor
+        && matchedUserAnchor.synthetic !== true
+        && userText !== null
+        && !claimedUserAnchors.has(String(matchedUserAnchor.id))
+      ) {
+        const anchorId = String(matchedUserAnchor.id);
+        claimedUserAnchors.add(anchorId);
+        userContent.set(anchorId, userText);
+      }
+    } else if (userText !== null) {
+      matchedUserAnchor = users.find((anchor) => (
+        anchor.synthetic !== true
+        && anchor.anchor_text === userText
+        && !claimedUserAnchors.has(String(anchor.id))
+      )) ?? null;
+      if (matchedUserAnchor) {
+        const anchorId = String(matchedUserAnchor.id);
+        claimedUserAnchors.add(anchorId);
+        userContent.set(anchorId, userText);
+      }
+    }
+
+    if (typeof row.run_id === 'string' && row.run_id.length > 0) {
+      if (userText !== null) currentRunId = row.run_id;
       const text = assistantText(record);
       if (text) assistantContent.set(row.run_id, text);
       continue;
     }
 
-    const keys = recordKeys(row, record);
-    if (keys.length === 0) continue;
-    const messageId = inputMessageId(keys, sessionId);
     if (messageId !== null) {
-      const anchor = userById.get(messageId);
-      currentRunId = anchor?.run_id ?? null;
-      const messages = Array.isArray(record?.messages) ? record.messages : [];
-      const lastUser = messages.findLast((message) => message?.role === 'user');
-      const text = textFromContent(lastUser?.content);
-      if (anchor && anchor.synthetic !== true && text !== null) {
-        const anchorId = String(anchor.id);
-        if (!claimedUserAnchors.has(anchorId)) {
-          claimedUserAnchors.add(anchorId);
-          userContent.set(anchorId, text);
-        }
-      }
+      currentRunId = matchedUserAnchor?.run_id ?? null;
       continue;
     }
 
@@ -131,22 +134,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
 
     const isSeed = keys.some((key) => key.endsWith(':seed'));
     if (isSeed) {
-      const messages = Array.isArray(record?.messages) ? record.messages : [];
-      const lastUser = messages.findLast((message) => message?.role === 'user');
-      const text = textFromContent(lastUser?.content);
-      const seedUser = text === null
-        ? null
-        : users.find((anchor) => (
-          anchor.synthetic !== true
-          && anchor.anchor_text === text
-          && !claimedUserAnchors.has(String(anchor.id))
-        ));
-      if (seedUser) {
-        const anchorId = String(seedUser.id);
-        claimedUserAnchors.add(anchorId);
-        userContent.set(anchorId, text);
-        currentRunId = seedUser.run_id ?? null;
-      }
+      if (matchedUserAnchor) currentRunId = matchedUserAnchor.run_id ?? null;
       continue;
     }
 
