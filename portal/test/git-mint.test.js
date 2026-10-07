@@ -67,7 +67,7 @@ test('Gitea creates FDE user and a repository-creation/push/PR token using the g
   ]);
 });
 
-test('Gitea reuses an existing user, resets its password, and mints the scoped token', async () => {
+async function assertGiteaReuse(loginName, expectedLoginName) {
   const calls = [];
   const fetchImpl = async (url, options) => {
     const call = {
@@ -83,10 +83,10 @@ test('Gitea reuses an existing user, resets its password, and mints the scoped t
     }
     if (call.method === 'GET' && call.path === '/api/v1/users/alice') {
       assert.match(call.auth, /^token gitea-admin-key$/);
-      return jsonResponse(200, { id: 42, login: 'alice', login_name: 'alice', source_id: 0 });
+      return jsonResponse(200, { id: 42, login: 'alice', login_name: loginName, source_id: 0 });
     }
     if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') {
-      assert.equal(call.body.login_name, 'alice');
+      assert.equal(call.body.login_name, expectedLoginName);
       assert.equal(call.body.source_id, 0);
       assert.equal(call.body.must_change_password, false);
       assert.ok(call.body.password.length >= 32);
@@ -119,6 +119,18 @@ test('Gitea reuses an existing user, resets its password, and mints the scoped t
     'PATCH /api/v1/admin/users/alice',
     'POST /api/v1/users/alice/tokens',
   ]);
+}
+
+test('Gitea reuses an existing user and preserves a non-empty login_name', async () => {
+  await assertGiteaReuse('alice', 'alice');
+});
+
+test('Gitea falls back to username when the existing user login_name is empty', async () => {
+  await assertGiteaReuse('', 'alice');
+});
+
+test('Gitea falls back to username when the existing user login_name is whitespace', async () => {
+  await assertGiteaReuse('  ', 'alice');
 });
 
 test('Gitea does not delete a reused user when token minting fails', async () => {
