@@ -38,7 +38,7 @@
 
 - `/docker/<名称>/`（`DATA_ROOT`）是**平台服务自身的持久数据**（`station-db` 的 pg data、`station-edge` 的 acme.json / 动态配置）。它的生命周期、备份口径、属主都跟平台服务绑定（env §6）。
 - `/srv/erix/users/<fde>/` 是**FDE 的私人工作区**，属「用户数据」，与平台服务数据分属两类：
-  1. **生命周期不同**：offboarding 时平台服务数据继续存在，而用户工作区按「保留 N 天」单独处置（规格 §7.3）。
+  1. **生命周期不同**：offboarding 时平台服务数据继续存在，而用户工作区由 portal 按 `ERIX_WORKSPACE_RETENTION_DAYS`（默认 30 天）保留；到期 sweep 安全删除工作区与用户 DB 行，配置 `0` 禁用自动清理（规格 §7.3）。
   2. **访问主体不同**：用户空间要被 FDE 容器 bind mount（读/写）；平台服务数据**绝不**挂进 FDE 容器（否则 FDE 可读 pg data / traefik 配置）。
   3. **属主/容量隔离不同**：用户空间按 FDE 分目录、按 FDE 计容量；平台服务数据按服务分目录。
 - 选 `/srv`（FHS：本机提供的服务的数据目录）+ `/erix/users/` 命名空间，语义为「erix 平台服务的用户数据」，与 `/docker/` 平台数据在**顶层就分开**，避免备份脚本/运维误把两者混为一谈。

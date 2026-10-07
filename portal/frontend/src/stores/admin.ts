@@ -51,6 +51,12 @@ export interface AdminUser {
       error?: string | null;
     };
   } | null;
+  offboarding?: {
+    state: 'pending' | 'running' | 'done' | 'failed';
+    step?: string | null;
+    error?: string | null;
+    workspace_purge_after: string | null;
+  } | null;
 }
 
 export interface GitHost {
@@ -213,8 +219,7 @@ export const useAdminStore = defineStore('admin', {
       this.fdeErr = null;
       try {
         await api(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        this.users = this.users.filter((user) => user.id !== id);
-        return null;
+        return await this.loadUsers();
       } catch (e) {
         return t('admin.errorPrefix') + this.errText(e);
       }
@@ -260,6 +265,16 @@ export const useAdminStore = defineStore('admin', {
     async retryOnboarding(id: string): Promise<string | null> {
       try {
         await api(`/api/admin/users/${encodeURIComponent(id)}/onboard/retry`, { method: 'POST' });
+        return await this.loadUsers();
+      } catch (e) {
+        this.fdeErr = t('admin.errorPrefix') + this.errText(e);
+        return this.fdeErr;
+      }
+    },
+
+    async retryOffboarding(id: string): Promise<string | null> {
+      try {
+        await api(`/api/admin/users/${encodeURIComponent(id)}/offboarding/retry`, { method: 'POST' });
         return await this.loadUsers();
       } catch (e) {
         this.fdeErr = t('admin.errorPrefix') + this.errText(e);

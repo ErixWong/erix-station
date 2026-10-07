@@ -10,6 +10,7 @@ import * as totp from './totp.js';
 import { createServer } from './http.js';
 import { startMaterializerLoop } from './materializer.js';
 import { startOnboardingLoop } from './onboarding.js';
+import { startOffboardingLoop } from './offboarding.js';
 import { startRoutesLoop } from './routes.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
 import {
@@ -56,6 +57,7 @@ async function serve() {
   // 启动物化、开户、路由与容器对账循环；开户与 reconcile 独立避免慢 provision 阻塞对账。
   const materializerLoop = startMaterializerLoop(pool, config);
   const onboardingLoop = startOnboardingLoop(pool, config);
+  const offboardingLoop = startOffboardingLoop(pool, config);
   const routesLoop = startRoutesLoop(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);
   const reaperLoop = startReaperLoop(pool);
@@ -70,11 +72,13 @@ async function serve() {
     );
     // eslint-disable-next-line no-console
     console.log('[portal] onboarding loop started');
+    console.log('[portal] offboarding loop started');
   });
   // 进程退出时停循环（优雅关闭）。
   const shutdown = () => {
     materializerLoop.stop();
     onboardingLoop.stop();
+    offboardingLoop.stop();
     routesLoop.stop();
     provisionerLoop.stop();
     reaperLoop.stop();

@@ -422,6 +422,11 @@ async function withFdeLock(pool, fdeName, fn, { requireLock = false } = {}) {
   }
 }
 
+/** Hold the same per-FDE lock used by provisioning while an offboarding workflow runs. */
+export async function withFdeProvisioningLock(pool, fdeName, fn) {
+  return withFdeLock(pool, fdeName, fn, { requireLock: true });
+}
+
 /** 同步 upsert containers 行（F7/F8：ON CONFLICT 幂等 + 含 token hash），消除 DB/容器分裂。 */
 async function upsertContainerRow(pool, { userId, fdeName, containerName, tokenHash, image, agentVersion }) {
   await pool.query(

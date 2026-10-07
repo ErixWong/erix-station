@@ -24,6 +24,7 @@ import * as gitCredential from './git-credential.js';
 import * as gitHosts from './git-hosts.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import * as onboarding from './onboarding.js';
+import * as offboarding from './offboarding.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -739,11 +740,15 @@ async function handleAdminApi(req, res, ctx, url) {
       return sendJson(res, 201, { ...created, onboarding: onboardingStatus });
     }
   }
-  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset|totp-enroll|onboard\/retry))?$/);
+  const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)(?:\/(reset-password|totp-reset|totp-enroll|onboard\/retry|offboarding\/retry))?$/);
   if (adminUserMatch) {
     const userId = decodeAdminUserUuid(adminUserMatch[1]);
     const action = adminUserMatch[2] ?? null;
     if (action === 'onboard/retry' && req.method === 'POST') {
+      const offboardingRow = await ctx.pool.query(`SELECT 1 FROM fde_offboarding WHERE fde_id = $1`, [userId]);
+      if (offboardingRow.rows.length > 0) {
+        throw new admin.AdminError('user_offboarding', '用户正在下线或处于保留期，不能重试开户', { httpStatus: 409 });
+      }
       const result = await onboarding.retryOnboarding(ctx.pool, userId);
       if (!result) {
         const user = await ctx.pool.query(`SELECT 1 FROM users WHERE id = $1`, [userId]);
@@ -754,6 +759,18 @@ async function handleAdminApi(req, res, ctx, url) {
         throw new admin.AdminError('onboarding_running', '开户任务正在运行', { httpStatus: 409 });
       }
       return sendJson(res, 200, { onboarding: result });
+    }
+    if (action === 'offboarding/retry' && req.method === 'POST') {
+      const result = await offboarding.retryOffboarding(ctx.pool, userId);
+      if (!result) {
+        const user = await ctx.pool.query(`SELECT 1 FROM users WHERE id = $1`, [userId]);
+        if (!user.rows[0]) throw new admin.AdminError('not_found', '用户不存在', { httpStatus: 404 });
+        throw new admin.AdminError('offboarding_not_found', '用户没有下线任务', { httpStatus: 409 });
+      }
+      if (result.state === 'running') {
+        throw new admin.AdminError('offboarding_running', '下线任务正在运行', { httpStatus: 409 });
+      }
+      return sendJson(res, 200, { offboarding: result });
     }
     if (action === 'reset-password' && req.method === 'POST') {
       requireJson(req);
@@ -781,12 +798,13 @@ async function handleAdminApi(req, res, ctx, url) {
       return sendJson(res, 200, await admin.updateUser(ctx.pool, userId, body, { actorId: session.user.id }));
     }
     if (action === null && req.method === 'DELETE') {
-      await admin.deleteUser(ctx.pool, {
+      const result = await admin.deleteUser(ctx.pool, {
         actorId: session.user.id,
         userId,
         config: ctx.config,
         log: ctx.log,
       });
+      if (result.offboarding) return sendJson(res, 202, { offboarding: result.offboarding });
       res.writeHead(204);
       res.end();
       return;

@@ -12,6 +12,11 @@ function intEnv(env, key, fallback) {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+function nonNegativeIntEnv(env, key, fallback) {
+  const v = Number(env[key] ?? fallback);
+  return Number.isSafeInteger(v) && v >= 0 ? v : fallback;
+}
+
 /**
  * cookie 属性随 COOKIE_PROFILE 切换（portal.md §2.5）。
  * - prod     -> __Host-fde_session + Secure=true（__Host- 前缀强制 Secure+Path=/+无 Domain）
@@ -203,6 +208,8 @@ export function loadConfig(env = process.env) {
     userSpaceRoot: env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
     // F3：bind source 用的**宿主**路径（Docker API bind source 必须是宿主路径，与容器内 userSpaceRoot 解耦）。
     userSpaceRootHost: env.ERIX_USERSPACE_ROOT_HOST || env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
+    // Offboarding 完成后保留 workspace 的天数；0 表示禁用自动清理。
+    workspaceRetentionDays: nonNegativeIntEnv(env, 'ERIX_WORKSPACE_RETENTION_DAYS', 30),
     // FDE 工作区属主 UID/GID（user-space §6.1：1000/1000）。
     fdeUid: intEnv(env, 'FDE_USER_UID', 1000),
     fdeGid: intEnv(env, 'FDE_USER_GID', 1000),
