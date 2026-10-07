@@ -27,6 +27,13 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+function jsonResponse(status, body) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
 test('Gitea creates FDE user and a repository-creation/push/PR token using the generated user password', async () => {
   const calls = [];
   await withServer((req, res, text) => {
@@ -58,6 +65,138 @@ test('Gitea creates FDE user and a repository-creation/push/PR token using the g
     'POST /api/v1/admin/users',
     'POST /api/v1/users/alice/tokens',
   ]);
+});
+
+test('Gitea reuses an existing user, resets its password, and mints the scoped token', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = {
+      method: options.method,
+      path: new URL(url).pathname,
+      auth: options.headers.authorization,
+      body: options.body ? JSON.parse(options.body) : null,
+    };
+    calls.push(call);
+    if (call.method === 'POST' && call.path === '/api/v1/admin/users') {
+      assert.match(call.auth, /^token gitea-admin-key$/);
+      return jsonResponse(422, { message: 'user already exists' });
+    }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice') {
+      assert.match(call.auth, /^token gitea-admin-key$/);
+      return jsonResponse(200, { id: 42, login: 'alice', login_name: 'alice', source_id: 0 });
+    }
+    if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') {
+      assert.equal(call.body.login_name, 'alice');
+      assert.equal(call.body.source_id, 0);
+      assert.equal(call.body.must_change_password, false);
+      assert.ok(call.body.password.length >= 32);
+      return jsonResponse(200, {});
+    }
+    if (call.method === 'POST' && call.path === '/api/v1/users/alice/tokens') {
+      const credentials = Buffer.from(call.auth.slice('Basic '.length), 'base64').toString();
+      assert.equal(credentials, `alice:${calls[2].body.password}`);
+      assert.deepEqual(call.body.scopes, ['write:user', 'write:repository', 'read:issue']);
+      return jsonResponse(201, { id: 43, sha1: 'reused-user-token' });
+    }
+    assert.fail(`unexpected request: ${call.method} ${call.path}`);
+  };
+
+  const result = await mintGiteaAccount({
+    baseUrl: 'https://gitea.example',
+    adminKey: 'gitea-admin-key',
+    login: 'alice',
+    fetchImpl,
+  });
+
+  assert.deepEqual(result, {
+    remoteLogin: 'alice',
+    tokenRef: '43',
+    tokenPlaintext: 'reused-user-token',
+  });
+  assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
+    'POST /api/v1/admin/users',
+    'GET /api/v1/users/alice',
+    'PATCH /api/v1/admin/users/alice',
+    'POST /api/v1/users/alice/tokens',
+  ]);
+});
+
+test('Gitea does not delete a reused user when token minting fails', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = {
+      method: options.method,
+      path: new URL(url).pathname,
+      body: options.body ? JSON.parse(options.body) : null,
+    };
+    calls.push(call);
+    if (call.method === 'POST' && call.path === '/api/v1/admin/users') {
+      return jsonResponse(422, { message: 'user already exists' });
+    }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice') {
+      return jsonResponse(200, { id: 42, login: 'alice', login_name: 'alice', source_id: 0 });
+    }
+    if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') {
+      return jsonResponse(200, {});
+    }
+    if (call.method === 'POST' && call.path === '/api/v1/users/alice/tokens') {
+      return jsonResponse(500, { message: 'token mint failed' });
+    }
+    assert.fail(`unexpected request: ${call.method} ${call.path}`);
+  };
+
+  await assert.rejects(
+    mintGiteaAccount({
+      baseUrl: 'https://gitea.example',
+      adminKey: 'gitea-admin-key',
+      login: 'alice',
+      fetchImpl,
+    }),
+    (err) => err instanceof GitMintError && err.code === 'git_host_request_failed',
+  );
+  assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
+    'POST /api/v1/admin/users',
+    'GET /api/v1/users/alice',
+    'PATCH /api/v1/admin/users/alice',
+    'POST /api/v1/users/alice/tokens',
+  ]);
+});
+
+test('Gitea only reuses an account when the HTTP error body indicates a duplicate user', async () => {
+  for (const [status, body] of [
+    [500, { message: 'temporary server failure' }],
+    [409, { message: 'unrelated conflict' }],
+  ]) {
+    const paths = [];
+    await assert.rejects(
+      mintGiteaAccount({
+        baseUrl: 'https://gitea.example',
+        adminKey: 'gitea-admin-key',
+        login: 'alice',
+        fetchImpl: async (url) => {
+          paths.push(new URL(url).pathname);
+          return jsonResponse(status, body);
+        },
+      }),
+      (err) => err instanceof GitMintError && err.code === 'git_host_request_failed',
+    );
+    assert.deepEqual(paths, ['/api/v1/admin/users']);
+  }
+
+  let calls = 0;
+  await assert.rejects(
+    mintGiteaAccount({
+      baseUrl: 'https://gitea.example',
+      adminKey: 'gitea-admin-key',
+      login: 'alice',
+      fetchImpl: async () => {
+        calls += 1;
+        throw new Error('network unavailable');
+      },
+    }),
+    (err) => err instanceof GitMintError && err.code === 'git_host_unreachable',
+  );
+  assert.equal(calls, 1);
 });
 
 test('GitLab creates FDE user and a write_repository-only impersonation token', async () => {
