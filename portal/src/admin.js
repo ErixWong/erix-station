@@ -271,14 +271,14 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   return { user: safeUser(result.rows[0]) };
 }
 
-/** 有 FDE 资源时排队下线并立即禁用；无资源用户保留原有同步删除语义。 */
+/** 有 FDE 资源时排队下线；无资源用户立即禁用。用户行永久保留。 */
 export async function deleteUser(pool, { actorId, userId, config, log = console } = {}) {
   if (actorId === userId) {
-    throw new AdminError('self_delete', '管理员不能删除自己的账号', { httpStatus: 409 });
+    throw new AdminError('self_delete', '管理员不能停用自己的账号', { httpStatus: 409 });
   }
 
-  let deletedLogin;
-  let deletedFdeName;
+  let userLogin;
+  let fdeName;
   let offboarding = null;
   let client;
   try {
@@ -289,8 +289,8 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
       [userId],
     );
     if (!target.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
-    deletedLogin = target.rows[0].login;
-    deletedFdeName = target.rows[0].fde_name;
+    userLogin = target.rows[0].login;
+    fdeName = target.rows[0].fde_name;
 
     const resources = await client.query(
       `SELECT (
@@ -309,11 +309,11 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
       [userId],
     );
 
-    if (resources.rows[0]?.has_resources || workspaceExists(config, deletedFdeName)) {
-      if (!deletedFdeName || !projects.validateFdeName(deletedFdeName).ok) {
+    if (resources.rows[0]?.has_resources || workspaceExists(config, fdeName)) {
+      if (!fdeName || !projects.validateFdeName(fdeName).ok) {
         throw new AdminError('user_fde_name_missing', '有关联资源的用户缺少有效 fde_name，无法安全下线', { httpStatus: 409 });
       }
-      offboarding = await enqueueOffboarding(client, { fdeId: userId, fdeName: deletedFdeName });
+      offboarding = await enqueueOffboarding(client, { fdeId: userId, fdeName });
       await client.query(
         `UPDATE users SET status = 'disabled', disabled_at = COALESCE(disabled_at, now()) WHERE id = $1`,
         [userId],
@@ -329,15 +329,19 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
         [userId],
       );
     } else {
+      await client.query(
+        `UPDATE users SET status = 'disabled', disabled_at = COALESCE(disabled_at, now()) WHERE id = $1`,
+        [userId],
+      );
       await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM api_tokens WHERE user_id = $1`, [userId]);
-      await client.query(`DELETE FROM preview_grants WHERE user_id = $1 OR issuer_id = $1`, [userId]);
-      await client.query(`UPDATE approvals SET decided_by = NULL WHERE decided_by = $1`, [userId]);
-      await client.query(`UPDATE audit_log SET actor_id = NULL WHERE actor_id = $1`, [userId]);
-      const deleted = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id, fde_name`, [userId]);
-      if (!deleted.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
-      deletedFdeName = deleted.rows[0].fde_name;
+      await client.query(
+        `UPDATE preview_grants
+            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now()), used_at = NULL
+          WHERE state IN ('active', 'used') AND (user_id = $1 OR issuer_id = $1)`,
+        [userId],
+      );
     }
     await client.query('COMMIT');
   } catch (err) {
@@ -351,20 +355,20 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
     client?.release();
   }
   if (offboarding) {
-    await recordAdminAudit(pool, actorId, 'admin.user_offboarding_started', deletedLogin, {
+    await recordAdminAudit(pool, actorId, 'admin.user_offboarding_started', userLogin, {
       user_id: userId,
-      fde_name: deletedFdeName,
+      fde_name: fdeName,
     });
     return { ok: true, offboarding };
   }
-  if (deletedFdeName) {
+  if (fdeName) {
     try {
-      removeGitCredentialFile({ config, fdeName: deletedFdeName });
+      removeGitCredentialFile({ config, fdeName });
     } catch (err) {
-      log.warn?.(`[admin] deleted user git credential cleanup failed for ${deletedFdeName}: ${String(err?.message ?? err)}`);
+      log.warn?.(`[admin] disabled user git credential cleanup failed for ${fdeName}: ${String(err?.message ?? err)}`);
     }
   }
-  await recordAdminAudit(pool, actorId, 'admin.user_deleted', deletedLogin, { user_id: userId });
+  await recordAdminAudit(pool, actorId, 'admin.user_disabled', userLogin, { user_id: userId });
   return { ok: true };
 }
 

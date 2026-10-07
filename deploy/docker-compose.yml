@@ -161,8 +161,8 @@ services:
       ERIX_USERSPACE_ROOT: /srv/erix/users
       # F3：bind source 用宿主路径（与容器内 ERIX_USERSPACE_ROOT 解耦）
       ERIX_USERSPACE_ROOT_HOST: ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}
-      # offboarding 完成后的 workspace 保留天数；0 禁用自动清理。
-      ERIX_WORKSPACE_RETENTION_DAYS: ${ERIX_WORKSPACE_RETENTION_DAYS:-30}
+      # workspace 自动清理默认关闭；显式正数才启用目录清理（数据库记录永久保留）。
+      ERIX_WORKSPACE_RETENTION_DAYS: ${ERIX_WORKSPACE_RETENTION_DAYS:-0}
       TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
       TRAEFIK_DYNAMIC_FILE: routes.yml
       PORTAL_HOST: ${PORTAL_HOST:-station.localhost}

@@ -248,12 +248,7 @@ class AdminPool extends FakePool {
         }],
       };
     }
-    if (sql.includes('DELETE FROM users WHERE id')) {
-      const index = this.users.findIndex((user) => user.id === params[0]);
-      if (index === -1) return { rows: [] };
-      const [user] = this.users.splice(index, 1);
-      return { rows: [{ id: params[0], fde_name: user.fde_name }] };
-    }
+    if (sql.includes('DELETE FROM users')) assert.fail('user rows must never be deleted');
     // 建用户 INSERT（RETURNING 安全字段）
     if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
       if (this.forceEmailConflict) {
@@ -617,7 +612,7 @@ test('admin 用户管理：PATCH 至少一个字段且拒绝不可改 login、�
   }
 });
 
-test('admin 用户管理：DELETE 自删冲突；有资源时入队并立即禁用，无资源仍立即删除', async () => {
+test('admin 用户管理：DELETE 自停用冲突；有资源时入队，无资源时立即禁用但保留用户行', async () => {
   const { base, cookie, pool, close } = await startAdminServer();
   pool.sessions.push({ id: 'ls-alice-delete', user_id: FDE_USER.id, created_at: new Date(), revoked_at: null });
   pool.pending.push({ id: 'pending-alice', user_id: FDE_USER.id });
@@ -660,7 +655,8 @@ test('admin 用户管理：DELETE 自删冲突；有资源时入队并立即禁�
 
     res = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, { method: 'DELETE', headers: { cookie } });
     assert.equal(res.status, 204);
-    assert.equal(pool.users.some((user) => user.id === FDE_USER.id), false);
+    assert.equal(pool.users.some((user) => user.id === FDE_USER.id), true);
+    assert.equal(pool.users.find((user) => user.id === FDE_USER.id).status, 'disabled');
     assert.equal(pool.sessions.some((session) => session.user_id === FDE_USER.id), false);
     assert.equal(pool.pending.some((pending) => pending.user_id === FDE_USER.id), false);
 
@@ -680,6 +676,7 @@ test('admin 用户管理：offboarding 失败任务可重试且不可重新启�
     'revoke-runner-token': { state: 'pending' },
     'revoke-llm-key': { state: 'pending' },
     'delete-git-credential': { state: 'pending' },
+    'revoke-git-account-access': { state: 'pending' },
     'release-network-routes': { state: 'pending' },
     'schedule-workspace-purge': { state: 'pending' },
   };
@@ -726,25 +723,29 @@ test('admin 用户管理：offboarding 失败任务可重试且不可重新启�
 
 function makeDeleteUserPool(fdeName) {
   const calls = [];
+  const user = { id: FDE_USER.id, login: FDE_USER.login, fde_name: fdeName, status: 'active' };
   const client = {
     async query(sql, params = []) {
       calls.push(sql);
       if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
       if (sql.includes('SELECT id, login, fde_name FROM users WHERE id = $1 FOR UPDATE')) {
-        return { rows: [{ id: FDE_USER.id, login: FDE_USER.login, fde_name: fdeName }] };
+        return { rows: [user] };
       }
       if (sql.includes('AS has_resources')) return { rows: [{ has_resources: false }] };
       if (sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')) return { rows: [] };
       if (sql.includes('DELETE FROM api_tokens') || sql.includes('DELETE FROM preview_grants')
-        || sql.includes('UPDATE preview_grants') || sql.includes('UPDATE approvals')
-        || sql.includes('UPDATE audit_log')) return { rows: [] };
-      if (sql.includes('DELETE FROM users WHERE id')) return { rows: [{ id: FDE_USER.id, fde_name: fdeName }] };
+        || sql.includes('UPDATE preview_grants')) return { rows: [] };
+      if (sql.includes("UPDATE users SET status = 'disabled'")) {
+        user.status = 'disabled';
+        return { rows: [] };
+      }
       throw new Error(`Unexpected transaction query: ${sql}`);
     },
     release() {},
   };
   return {
     calls,
+    user,
     pool: {
       async connect() { return client; },
       async query(sql) {
@@ -756,14 +757,14 @@ function makeDeleteUserPool(fdeName) {
   };
 }
 
-test('deleteUser：只按配置的用户空间根判断 workspace', async (t) => {
+test('deleteUser：只按配置的用户空间根判断 workspace，禁用后保留用户行', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-delete-user-'));
   const home = path.join(root, 'alice', 'home');
   fs.mkdirSync(home, { recursive: true });
   const credentialPath = path.join(home, '.git-credentials');
   fs.writeFileSync(credentialPath, 'https://alice:secret@github.com\n', { mode: 0o640 });
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const { pool, calls } = makeDeleteUserPool('alice');
+  const { pool, calls, user } = makeDeleteUserPool('alice');
 
   assert.deepEqual(await deleteUser(pool, {
     actorId: ADMIN.id,
@@ -771,7 +772,9 @@ test('deleteUser：只按配置的用户空间根判断 workspace', async (t) =>
     config: { userSpaceRoot: path.join(root, 'configured-users') },
     log: { warn() {} },
   }), { ok: true });
-  assert.ok(calls.includes('DELETE FROM users WHERE id = $1 RETURNING id, fde_name'));
+  assert.ok(calls.some((sql) => sql.includes("UPDATE users SET status = 'disabled'")));
+  assert.equal(user.status, 'disabled');
+  assert.equal(calls.some((sql) => sql.includes('DELETE FROM users')), false);
   assert.equal(fs.existsSync(credentialPath), true, '路径不在配置的用户空间根内时不得触碰');
 });
 
@@ -788,12 +791,13 @@ test('deleteUser：用户空间已不存在时凭据清理按幂等成功处理'
   assert.equal(warnings.length, 0, 'workspace 根目录或凭据已不存在时按幂等清理成功处理');
 });
 
-test('deleteUser：审计写入失败不回滚已提交的用户删除', async () => {
+test('deleteUser：审计写入失败不回滚已提交的停用，用户行永久保留', async () => {
   const calls = [];
   const auditError = Object.assign(new Error('audit foreign key violation'), { code: '23503' });
   let transactionAborted = false;
   let deletedInTransaction = false;
   let userStillExists = true;
+  let userStatus = 'active';
   const client = {
     async query(sql) {
       calls.push({ executor: 'client', sql });
@@ -802,6 +806,10 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
         return { rows: [{ id: 'deleted-user', login: 'alice', fde_name: null }] };
       }
       if (sql.includes('AS has_resources')) return { rows: [{ has_resources: false }] };
+      if (sql.includes("UPDATE users SET status = 'disabled'")) {
+        userStatus = 'disabled';
+        return { rows: [] };
+      }
       if (sql.includes('DELETE FROM users WHERE id')) {
         deletedInTransaction = true;
         return { rows: [{ id: 'deleted-user' }] };
@@ -816,9 +824,7 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
         return { rows: [] };
       }
       if (sql === 'ROLLBACK' || sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')
-        || sql.includes('DELETE FROM api_tokens') || sql.includes('DELETE FROM preview_grants')
-        || sql.includes('UPDATE preview_grants') || sql.includes('UPDATE approvals')
-        || sql.includes('UPDATE audit_log')) {
+        || sql.includes('DELETE FROM api_tokens') || sql.includes('UPDATE preview_grants')) {
         return { rows: [] };
       }
       throw new Error(`Unexpected transaction query: ${sql}`);
@@ -841,14 +847,15 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
   };
 
   assert.deepEqual(await deleteUser(pool, { actorId: 'missing-admin', userId: 'deleted-user' }), { ok: true });
-  assert.equal(userStillExists, false);
+  assert.equal(userStillExists, true);
+  assert.equal(userStatus, 'disabled');
   const commitIndex = calls.findIndex((call) => call.executor === 'client' && call.sql === 'COMMIT');
   const releaseIndex = calls.findIndex((call) => call.executor === 'client' && call.sql === 'RELEASE');
   const auditIndex = calls.findIndex((call) => call.executor === 'pool' && call.sql.includes('INSERT INTO audit_log'));
   assert.ok(commitIndex >= 0 && commitIndex < releaseIndex && releaseIndex < auditIndex);
   assert.equal(calls.some((call) => call.executor === 'client' && call.sql.includes('INSERT INTO audit_log')), false);
   assert.deepEqual(calls[auditIndex].params, [
-    'missing-admin', 'admin.user_deleted', 'alice', JSON.stringify({ user_id: 'deleted-user' }),
+    'missing-admin', 'admin.user_disabled', 'alice', JSON.stringify({ user_id: 'deleted-user' }),
   ]);
 });
 

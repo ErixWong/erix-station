@@ -42,7 +42,7 @@
 | 管理 | `GET /api/admin/users` | 用户列表（不含密码哈希/TOTP 种子） |
 | 管理 | `POST /api/admin/users` | 创建本地 FDE 用户 |
 | 管理 | `PATCH /api/admin/users/:id` | 更新用户资料、角色、FDE 名称或状态 |
-| 管理 | `DELETE /api/admin/users/:id` | 无 FDE 资源时立即删除；否则立即禁用并异步下线 |
+| 管理 | `DELETE /api/admin/users/:id` | 停用用户；有 FDE 资源时异步下线（用户行永久保留） |
 | 管理 | `POST /api/admin/users/:id/offboarding/retry` | 重试失败的 FDE 下线任务 |
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
@@ -1748,7 +1748,7 @@ Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `r
 
 ### `DELETE /api/admin/users/:id`
 
-For a user with FDE resources (including a workspace), persists an offboarding task, immediately sets `users.status='disabled'`, revokes login sessions and pending login tokens, and returns `202`:
+This endpoint requests **disable/offboarding; it never deletes the platform account**. The `users` row is retained permanently with `status='disabled'`. For a user with FDE resources (including a workspace), the portal persists an offboarding task, immediately sets `users.status='disabled'`, revokes login sessions and pending login tokens, and returns `202`:
 
 ```json
 {
@@ -1761,7 +1761,7 @@ For a user with FDE resources (including a workspace), persists an offboarding t
 }
 ```
 
-The portal worker then stops active runs and the FDE container, revokes the runner token and LLM virtual key, removes Git credentials, releases routes/network allocations, and records the workspace purge deadline. Failed steps are durable and can be retried; the account stays disabled. After `ERIX_WORKSPACE_RETENTION_DAYS` (default `30`), the sweep deletes only workspaces whose offboarding task is `done`, then clears the user's database rows. Setting the retention to `0` disables automatic purging. A user without FDE resources or a workspace retains the existing synchronous deletion behavior and returns `204`.
+The portal worker then stops active runs and the FDE container, revokes the runner token and LLM virtual key, removes local Git credentials, revokes access to a platform-minted Gitea account by setting `prohibit_login=true` (without deleting the upstream user or token), releases routes/network allocations, and records a workspace purge deadline only when retention is explicitly enabled. User-managed Git credentials are not used to disable the employee's upstream account; GitLab upstream revocation is deferred. Failed steps are durable and can be retried; the account stays disabled. `ERIX_WORKSPACE_RETENTION_DAYS` defaults to `0`, which leaves `workspace_purge_after` NULL and disables sweeping. An explicit positive value enables a sweep that deletes only the workspace directory after its deadline; **all database rows remain**. A user without FDE resources or a workspace is disabled synchronously and returns `204`; the user row remains.
 
 Deleting the current administrator returns `409 self_delete`. Resources with an invalid/missing `fde_name` return `409 user_fde_name_missing` rather than attempting unsafe cleanup.
 
