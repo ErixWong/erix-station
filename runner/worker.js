@@ -311,18 +311,6 @@ async function startRun(msg) {
   }
 
   try {
-    // issue #46：notes 生命周期——onRunStart（janitor）在 runToolLoop 前（上游 bin/cli.js 模式）；
-    // 失败只告警不中断 run（档案工具仍在，仅清扫未跑）。
-    if (noteTools.lifecycle) {
-      try {
-        await noteTools.lifecycle.onRunStart();
-      } catch (err) {
-        sendIpc(process, {
-          type: MSG.LOG, run_id: runId, level: 'warn',
-          msg: `notes onRunStart (janitor) failed, run continues: ${String(err?.message ?? err)}`,
-        });
-      }
-    }
     const result = await runToolLoop({
       provider,
       // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
@@ -362,7 +350,7 @@ async function startRun(msg) {
       }),
       tools,
       executeTool,
-      // AGENTS.md §8.2 待办（ADR-015 槽位）：notes 工厂 semanticStateProvider 透传——引擎在
+      // ADR-015：notes 工厂 semanticStateProvider 透传——引擎在
       // context 折叠重建 run state 时回调（宿主契约 §Run state），返回 {text, version, status}
       // 注入 run-state 的 semantic 段；undefined/非函数时引擎按「未提供」跳过（工厂加载失败的
       // 降级路径同样安全：noteTools 回退对象无此字段）。
@@ -429,11 +417,17 @@ async function startRun(msg) {
       },
     });
   } finally {
-    // issue #46：onRunComplete（completeRun→janitor）在 finally 收尾；errors[] 只记日志，
-    // 不覆盖 run 主错误（上游 bin/cli.js 同款 completionErrors 模式）。
+    // issue #46：onRunComplete 仅完成 active notes；收尾错误只记日志，不覆盖 run 主错误。
     if (noteTools.lifecycle) {
       try {
         const completion = await noteTools.lifecycle.onRunComplete();
+        const completedCount = completion?.completed?.completed;
+        if (Number.isInteger(completedCount) && completedCount > 0) {
+          sendIpc(process, {
+            type: MSG.LOG, run_id: runId, level: 'info',
+            msg: `notes completed: ${completedCount}`,
+          });
+        }
         for (const failure of completion?.errors ?? []) {
           sendIpc(process, {
             type: MSG.LOG, run_id: runId, level: 'warn',

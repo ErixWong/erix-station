@@ -390,17 +390,32 @@ export class FakeInternalPool {
       return { rows: s ? [{ id: s.id, user_id: s.user_id }] : [] };
     }
 
-    // ---- session 引擎 run state（chat_sessions.engine_run_state 合并写，issue #81 P2）----
+    // ---- session 引擎 run state / status（issue #81 P2 + erix-agent 0.14.0）----
     if (sql.includes('UPDATE chat_sessions') && sql.includes('engine_run_state')) {
-      const [key, patchJson] = params;
+      const [key, patchJson, userId, writerRunId, claimToken] = params;
       const s = this._session(key);
-      if (s) s.engine_run_state = { ...(s.engine_run_state ?? {}), ...JSON.parse(patchJson) };
-      return { rows: [] };
+      const r = this._run(writerRunId);
+      const q = this._queue(writerRunId);
+      if (!s || s.user_id !== userId || !r || r.session_id !== key || !q
+          || q.claim_token !== claimToken || q.lease_until == null || q.lease_until <= Date.now()
+          || !['queued', 'running', 'cancelling'].includes(r.status)) {
+        return { rows: [] };
+      }
+      if (sql.includes('SET engine_run_state_status')) {
+        s.engine_run_state_status = JSON.parse(patchJson);
+      } else {
+        s.engine_run_state = { ...(s.engine_run_state ?? {}), ...JSON.parse(patchJson) };
+      }
+      return { rows: [{ id: key }] };
     }
-    if (sql.includes('SELECT engine_run_state FROM chat_sessions WHERE id')) {
+    if (sql.includes('SELECT engine_run_state') && sql.includes('FROM chat_sessions WHERE id')) {
       const key = params[0];
       const s = this._session(key);
-      return { rows: s ? [{ engine_run_state: s.engine_run_state ?? null }] : [] };
+      return { rows: s ? [{
+        engine_run_state: s.engine_run_state ?? null,
+        engine_run_state_status: s.engine_run_state_status ?? null,
+        has_engine_run_state_status: s.engine_run_state_status != null,
+      }] : [] };
     }
 
     // ---- transcript rounds ----
@@ -437,7 +452,7 @@ export class FakeInternalPool {
       return { rows: c ? [{ snapshot: c.snapshot, revision: c.revision, updated_at: new Date() }] : [] };
     }
 
-    // ---- runstate（0.9.0 引擎 8 方法契约；F2：单条条件 UPDATE，非终态+属主+有效租约全进 WHERE）----
+    // ---- runstate snapshot/status（F2：条件 UPDATE 包含非终态+属主+有效租约）----
     if (sql.includes('UPDATE runs r') && sql.includes('SET run_state')) {
       const [runId, claimToken, userId, patchJson] = params;
       const r = this._run(runId);
@@ -447,13 +462,21 @@ export class FakeInternalPool {
       if (q.claim_token !== claimToken) return { rows: [] };
       if (q.lease_until == null || q.lease_until <= Date.now()) return { rows: [] };
       if (!['queued', 'running', 'cancelling'].includes(r.status)) return { rows: [] };
-      r.run_state = { ...(r.run_state ?? {}), ...JSON.parse(patchJson) };
+      if (sql.includes('SET run_state_status')) {
+        r.run_state_status = JSON.parse(patchJson);
+      } else {
+        r.run_state = { ...(r.run_state ?? {}), ...JSON.parse(patchJson) };
+      }
       return { rows: [{ id: runId }] };
     }
-    if (sql.includes('SELECT run_state FROM runs WHERE id')) {
+    if (sql.includes('SELECT run_state') && sql.includes('FROM runs WHERE id')) {
       const runId = params[0];
       const r = this._run(runId);
-      return { rows: r && r.run_state != null ? [{ run_state: r.run_state }] : [{ run_state: null }] };
+      return { rows: r ? [{
+        run_state: r.run_state ?? null,
+        run_state_status: r.run_state_status ?? null,
+        has_run_state_status: r.run_state_status != null,
+      }] : [] };
     }
 
     // ---- approvals ----

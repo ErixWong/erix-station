@@ -1,5 +1,5 @@
 // HTTP 层路由测试：internal runstate 端点（PUT/GET /api/internal/runs/:id/runstate，issue #43）。
-// 0.9.0 引擎 8 方法契约的 portal 落库端（runs.run_state jsonb）：写入需有效租约 + 非终态；
+// 0.14.0 status 与快照分列（runs.run_state / runs.run_state_status）：写入需有效租约 + 非终态；
 // 终态后写 409 run_terminal、读放宽（同 U9 口径）。fake pool，不碰真实 DB。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -60,6 +60,8 @@ test('runstate 路由：PUT/GET 往返、租约校验、终态后写 409/读放�
     // 未落库前 GET → 204
     const empty = await fetch(`${s.base}/api/internal/runs/${runId}/runstate`, { headers: claimHeaders });
     assert.equal(empty.status, 204);
+    const emptyStatus = await fetch(`${s.base}/api/internal/runs/${runId}/runstate/status`, { headers: claimHeaders });
+    assert.equal(emptyStatus.status, 204);
 
     // PUT saveRunState（引擎形态 {run_state}）
     const put = await fetch(`${s.base}/api/internal/runs/${runId}/runstate`, {
@@ -77,14 +79,17 @@ test('runstate 路由：PUT/GET 往返、租约校验、终态后写 409/读放�
     });
     assert.equal(mark.status, 200);
 
-    // GET 往返：合并语义 + runId 并入
+    // GET 往返：快照不包含终态 status。
     const got = await fetch(`${s.base}/api/internal/runs/${runId}/runstate`, { headers: claimHeaders });
     assert.equal(got.status, 200);
     const body = await got.json();
-    assert.equal(body.run_state.state, 'succeeded');
+    assert.equal(Object.hasOwn(body.run_state, 'state'), false);
     assert.equal(body.run_state.stateVersion, 3);
     assert.deepEqual(body.run_state.deterministic, { rounds: 2 });
     assert.equal(body.run_state.runId, runId);
+    const statusResponse = await fetch(`${s.base}/api/internal/runs/${runId}/runstate/status`, { headers: claimHeaders });
+    assert.equal(statusResponse.status, 200);
+    assert.equal((await statusResponse.json()).status.status, 'succeeded');
     assert.equal(pool.runs[0].status, 'queued', 'mark 不触碰 runs.status');
 
     // 无租约写 → 409 lease_lost
@@ -122,7 +127,21 @@ test('runstate 路由：PUT/GET 往返、租约校验、终态后写 409/读放�
     assert.equal(putAfter.status, 409);
     const gotAfter = await fetch(`${s.base}/api/internal/runs/${runId}/runstate`, { headers: auth });
     assert.equal(gotAfter.status, 200);
-    assert.equal((await gotAfter.json()).run_state.state, 'succeeded');
+    assert.equal((await gotAfter.json()).run_state.stateVersion, 3);
+    const statusAfter = await fetch(`${s.base}/api/internal/runs/${runId}/runstate/status`, { headers: auth });
+    assert.equal(statusAfter.status, 200, '终态后 status 仍可读');
+    assert.equal((await statusAfter.json()).status.status, 'succeeded');
+
+    // 旧版快照内嵌 state 无需迁移，由新 status reader 回退读取。
+    pool.runs[0].run_state_status = null;
+    pool.runs[0].run_state.state = 'legacy-succeeded';
+    const legacyStatus = await fetch(`${s.base}/api/internal/runs/${runId}/runstate/status`, { headers: auth });
+    assert.equal(legacyStatus.status, 200);
+    assert.equal((await legacyStatus.json()).status.status, 'legacy-succeeded');
+    pool.runs[0].run_state_status = { status: 7 };
+    const corruptStatus = await fetch(`${s.base}/api/internal/runs/${runId}/runstate/status`, { headers: auth });
+    assert.equal(corruptStatus.status, 500, '损坏的新状态不可静默回退');
+    assert.equal((await corruptStatus.json()).error.code, 'run_state_status_corrupt');
 
     // 方法白名单：POST → 405
     const post = await fetch(`${s.base}/api/internal/runs/${runId}/runstate`, {

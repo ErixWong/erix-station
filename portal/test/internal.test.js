@@ -23,6 +23,7 @@ import {
   getLatestCheckpoint,
   saveRunState,
   loadRunState,
+  loadRunStateStatus,
   registerSseClient,
   unregisterSseClient,
   broadcastStopRequest,
@@ -436,7 +437,7 @@ test('putCheckpoint：revision CAS（前进 200 / 旧 revision 409 checkpoint_st
   assert.equal(latest.checkpoint.revision, 2);
 });
 
-test('saveRunState/loadRunState：run_state 合并写 + 引擎终态标记（mark）+ 终态后读放宽（0.9.0 八方法契约）', async () => {
+test('saveRunState/loadRunStateStatus：快照与终态 status 分离，legacy state 可读', async () => {
   const { pool, userId, containerId, runId } = seedClaimable();
   const container = { id: containerId, user_id: userId };
   const user = { id: userId, login: 'alice' };
@@ -447,18 +448,19 @@ test('saveRunState/loadRunState：run_state 合并写 + 引擎终态标记（mar
   // loadRunState：无 → null
   assert.equal(await loadRunState(pool, { container, user, runId, claimToken }), null);
 
-  // saveRunState 全量合并（reference 语义 = previous + state）
-  await saveRunState(pool, { container, user, runId, claimToken, body: { run_state: { stateVersion: 3, deterministic: { rounds: 2 } } } });
+  // saveRunState 合并快照但不写 state。
+  await saveRunState(pool, { container, user, runId, claimToken, body: { run_state: { state: 'must-not-be-saved', stateVersion: 3, deterministic: { rounds: 2 } } } });
   await saveRunState(pool, { container, user, runId, claimToken, body: { run_state: { semantic: { text: 'summary', version: 1 } } } });
 
-  // markRunState 终态标记（引擎 succeeded）只合并 state 字段，不动 runs.status
+  // markRunState 终态状态写入独立列，不动 runs.status。
   await saveRunState(pool, { container, user, runId, claimToken, body: { state: 'succeeded' } });
 
   const state = await loadRunState(pool, { container, user, runId, claimToken });
-  assert.equal(state.run_state.state, 'succeeded');
+  assert.equal(Object.hasOwn(state.run_state, 'state'), false);
   assert.equal(state.run_state.stateVersion, 3);
   assert.deepEqual(state.run_state.deterministic, { rounds: 2 });
   assert.deepEqual(state.run_state.semantic, { text: 'summary', version: 1 });
+  assert.equal((await loadRunStateStatus(pool, { container, user, runId, claimToken })).status.status, 'succeeded');
   assert.equal(pool.runs[0].status, 'running', 'mark 不触碰 runs.status');
 
   // 校验失败：非对象 run_state / 空 body
@@ -481,7 +483,35 @@ test('saveRunState/loadRunState：run_state 合并写 + 引擎终态标记（mar
     (e) => e.code === 'run_terminal',
   );
   const after = await loadRunState(pool, { container, user, runId, claimToken: null });
-  assert.equal(after.run_state.state, 'succeeded', '终态后仍可读');
+  assert.equal(after.run_state.stateVersion, 3, '终态后快照仍可读');
+  assert.equal((await loadRunStateStatus(pool, { container, user, runId, claimToken: null })).status.status, 'succeeded');
+});
+
+test('loadRunStateStatus：旧快照的内嵌 state 可回退；损坏的新 status 不回退', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+
+  pool.runs[0].run_state = { state: 'succeeded', stateVersion: 2 };
+  assert.deepEqual(
+    (await loadRunStateStatus(pool, { container, user, runId, claimToken })).status,
+    { status: 'succeeded' },
+  );
+
+  pool.runs[0].run_state_status = { status: 7 };
+  await assert.rejects(
+    () => loadRunStateStatus(pool, { container, user, runId, claimToken }),
+    (error) => error.code === 'run_state_status_corrupt',
+  );
+
+  pool.runs[0].run_state_status = null;
+  pool.runs[0].run_state = 'malformed legacy snapshot';
+  await assert.rejects(
+    () => loadRunStateStatus(pool, { container, user, runId, claimToken }),
+    (error) => error.code === 'run_state_status_corrupt',
+  );
 });
 
 test('saveRunState：F2 原子写——租约过期/re-claim 后旧 worker 的迟到写被 fencing（409 lease_lost，状态不被覆盖）', async () => {
