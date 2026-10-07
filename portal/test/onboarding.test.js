@@ -17,7 +17,7 @@ const LLM_SELECTION = {
 };
 
 class OnboardingPool {
-  constructor({ state = 'pending', steps, userStatus = 'active' } = {}) {
+  constructor({ state = 'pending', steps, userStatus = 'active', offboardingState = null } = {}) {
     this.onboarding = {
       fde_id: FDE_ID,
       state,
@@ -30,6 +30,7 @@ class OnboardingPool {
       attempt: 0,
     };
     this.user = { id: FDE_ID, fde_name: 'alice', status: userStatus };
+    this.offboardingState = offboardingState;
     this.gitAccount = { fde_id: FDE_ID, git_host_id: GIT_HOST_ID };
     this.outbox = [];
     this.revision = 0;
@@ -62,6 +63,7 @@ class OnboardingPool {
     }
     if (sql.includes('SELECT o.fde_id, o.steps, u.fde_name, a.git_host_id')) {
       return this.onboarding.state === 'pending'
+        && !['pending', 'running'].includes(this.offboardingState)
         ? { rows: [{
           fde_id: FDE_ID,
           steps: structuredClone(this.onboarding.steps),
@@ -199,6 +201,36 @@ test('runOnboardingOnce 按序执行并在每步后持久化，materialize 写�
   assert.deepEqual(pool.outbox.map(({ op, state }) => ({ op, state })), [{ op: 'upsert', state: 'published' }]);
   assert.deepEqual(result, { claimed: true, fdeId: FDE_ID, state: 'done' });
   assert.equal(pool.onboarding.attempt, 1);
+});
+
+test('provision 成功后消费并清除一次性的旧 Git token 引用', async () => {
+  const pool = new OnboardingPool({
+    steps: {
+      provision: { state: 'pending', previousTokenRef: 'old-token-id' },
+      materialize: { state: 'pending' },
+      'llm-binding': { state: 'pending', models: structuredClone(LLM_SELECTION) },
+    },
+  });
+  let previousTokenRef;
+  const result = await workflow(pool, {
+    provision: async (_pool, _config, options) => { previousTokenRef = options.previousTokenRef; },
+  });
+
+  assert.equal(result.state, 'done');
+  assert.equal(previousTokenRef, 'old-token-id');
+  assert.equal(Object.hasOwn(pool.onboarding.steps.provision, 'previousTokenRef'), false);
+});
+
+test('重激活后保留的 done offboarding 历史不阻止 onboarding；活动中的 offboarding 仍阻止认领', async () => {
+  const completedHistory = new OnboardingPool({ offboardingState: 'done' });
+  const result = await workflow(completedHistory);
+  assert.equal(result.claimed, true);
+  assert.equal(result.state, 'done');
+
+  for (const offboardingState of ['pending', 'running']) {
+    const activeTask = new OnboardingPool({ offboardingState });
+    assert.deepEqual(await workflow(activeTask), { claimed: false });
+  }
 });
 
 test('provision 失败记录步骤与错误且不继续执行 materialize', async () => {

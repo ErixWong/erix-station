@@ -44,7 +44,7 @@ function createTestLlmGateway() {
 /** admin 测试 pool：FakePool（会话/audit）+ users CRUD / active run / llm echo 的最小模拟。 */
 class AdminPool extends FakePool {
   constructor(seed = {}) {
-    super({ users: [ADMIN, FDE_USER].map((user) => ({ ...user })) });
+    super({ users: (seed.users ?? [ADMIN, FDE_USER]).map((user) => ({ ...user })) });
     this.runs = seed.runs ?? [];               // [{id, session_id, status}]
     this.chatSessions = seed.chatSessions ?? []; // [{id, user_id}]
     this.containers = seed.containers ?? [];     // [{user_id, status}]
@@ -54,10 +54,11 @@ class AdminPool extends FakePool {
     this.gitHosts = seed.gitHosts ?? [{
       id: TEST_GIT_HOST_ID, provider: 'gitea', enabled: true, base_url: 'https://git.example.test',
     }];
-    this.gitAccounts = [];
-    this.onboardings = [];
+    this.gitAccounts = seed.gitAccounts ?? [];
+    this.onboardings = seed.onboardings ?? [];
     this.offboardings = seed.offboardings ?? [];
     this.forceEmailConflict = false;
+    this.apiTokens = seed.apiTokens ?? [];
     this.sessions.push({
       id: 'ls-admin', user_id: ADMIN.id, token_hash: auth.hashToken(ADMIN_TOKEN),
       created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000), last_seen_at: new Date(), revoked_at: null,
@@ -68,10 +69,31 @@ class AdminPool extends FakePool {
     this.sqlLog.push({ sql, params });
     // 建用户：login / fde_name 唯一性核查（含非 active 行——真实 DB 有 UNIQUE 约束）
     if (sql.includes('SELECT 1 FROM users WHERE login')) {
-      return { rows: this.users.filter((u) => u.login === params[0]).map(() => ({ '?column?': 1 })) };
+      return {
+        rows: this.users
+          .filter((u) => u.login === params[0] && (!sql.includes('id <>') || u.id !== params[1]))
+          .map(() => ({ '?column?': 1 })),
+      };
     }
     if (sql.includes('SELECT 1 FROM users WHERE email')) {
-      return { rows: this.users.filter((u) => u.email === params[0]).map(() => ({ '?column?': 1 })) };
+      return {
+        rows: this.users
+          .filter((u) => u.email === params[0] && (!sql.includes('id <>') || u.id !== params[1]))
+          .map(() => ({ '?column?': 1 })),
+      };
+    }
+    if (sql.includes('SELECT id, status FROM users WHERE fde_name')) {
+      const user = this.users.find((u) => u.fde_name === params[0]);
+      return { rows: user ? [{ id: user.id, status: user.status }] : [] };
+    }
+    if (sql.includes('SELECT git_host_id, token_ref FROM fde_git_accounts')) {
+      const account = this.gitAccounts.find((item) => item.fde_id === params[0]);
+      return { rows: account ? [{ git_host_id: account.git_host_id, token_ref: account.token_ref }] : [] };
+    }
+    if (sql.includes('FROM fde_offboarding') && sql.includes("state IN ('pending', 'running')")) {
+      const row = this.offboardings.find((entry) =>
+        entry.fde_id === params[0] && ['pending', 'running'].includes(entry.state));
+      return { rows: row ? [{ state: row.state }] : [] };
     }
     if (sql.includes('SELECT 1 FROM users WHERE fde_name')) {
       return {
@@ -107,6 +129,30 @@ class AdminPool extends FakePool {
       if (existing) existing.git_host_id = gitHostId;
       else this.gitAccounts.push({ fde_id: fdeId, git_host_id: gitHostId });
       return { rows: [] };
+    }
+    if (sql.includes('UPDATE fde_git_accounts') && sql.includes('token_ref = NULL')) {
+      const account = this.gitAccounts.find((item) => item.fde_id === params[0]);
+      if (account) {
+        account.remote_login = null;
+        account.token_ref = null;
+      }
+      return { rows: [] };
+    }
+    if (sql.includes('UPDATE users') && sql.includes('SET login = $2')) {
+      const [id, login, email, displayName, passwordHash, totpSecret] = params;
+      const user = this.users.find((u) => u.id === id && u.status === 'disabled');
+      if (!user) return { rows: [] };
+      Object.assign(user, {
+        login, email, display_name: displayName, password_hash: passwordHash,
+        totp_secret: totpSecret, last_totp_step: null, status: 'active', disabled_at: null,
+      });
+      return {
+        rows: [{
+          id: user.id, login: user.login, display_name: user.display_name, role: user.role,
+          fde_name: user.fde_name, auth_source: user.auth_source, status: user.status,
+          created_at: user.created_at, totp_enabled: user.totp_secret != null,
+        }],
+      };
     }
     if (sql.includes('SELECT state, steps, last_error FROM fde_onboarding')) {
       const row = this.onboardings.find((item) => item.fde_id === params[0]);
@@ -205,6 +251,10 @@ class AdminPool extends FakePool {
     }
     if (sql.includes('DELETE FROM login_pending WHERE user_id')) {
       this.pending = this.pending.filter((pending) => pending.user_id !== params[0]);
+      return { rows: [] };
+    }
+    if (sql.includes('DELETE FROM api_tokens WHERE user_id')) {
+      this.apiTokens = this.apiTokens.filter((token) => token.user_id !== params[0]);
       return { rows: [] };
     }
     if (sql.includes("UPDATE users SET status = 'disabled'")) {
@@ -414,6 +464,108 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
   }
 });
 
+test('admin 用户管理：同名 disabled FDE 原行重新激活、清凭据并完整重排开户', async () => {
+  const disabledUser = {
+    ...FDE_USER,
+    id: 'b0000000-0000-4000-8000-000000000022',
+    login: 'alice-old',
+    email: 'alice-old@example.test',
+    status: 'disabled',
+    disabled_at: new Date(),
+    password_hash: 'old-hash',
+    totp_secret: 'old-totp-secret',
+    last_totp_step: 123,
+  };
+  const gitAccount = {
+    fde_id: disabledUser.id, git_host_id: TEST_GIT_HOST_ID,
+    remote_login: 'alice', token_ref: 'old-gitea-token-id',
+  };
+  const onboarding = {
+    fde_id: disabledUser.id,
+    state: 'done',
+    steps: {
+      provision: { state: 'done' },
+      materialize: { state: 'done' },
+      'llm-binding': { state: 'done', models: TEST_LLM },
+    },
+    last_error: null,
+    attempt: 3,
+  };
+  const offboarding = {
+    fde_id: disabledUser.id, fde_name: 'alice', state: 'done',
+    steps: { 'disable-user': { state: 'done' } }, last_error: null,
+  };
+  const { base, cookie, pool, close } = await startAdminServer({
+    seed: {
+      users: [ADMIN, disabledUser],
+      gitAccounts: [gitAccount],
+      onboardings: [onboarding],
+      offboardings: [offboarding],
+      apiTokens: [{ id: 'api-old', user_id: disabledUser.id }],
+    },
+  });
+  pool.sessions.push({ id: 'ls-old-user', user_id: disabledUser.id, revoked_at: null });
+  pool.pending.push({ id: 'lp-old-user', user_id: disabledUser.id });
+  try {
+    const response = await fetch(`${base}/api/admin/users`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        login: 'alice-rehired', display_name: 'Alice Rehired', password: 'new-secret-1',
+        email: 'alice-rehired@example.test', fde_name: 'alice',
+        git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    const responseText = await response.text();
+    assert.equal(response.status, 201, responseText);
+    const body = JSON.parse(responseText);
+    const reactivatedUser = pool.users.find((user) => user.id === disabledUser.id);
+    assert.equal(body.reactivated, true);
+    assert.equal(Object.hasOwn(body, 'previousTokenRef'), false);
+    assert.equal(Object.hasOwn(body, 'previousGitHostId'), false);
+    assert.equal(body.user.id, disabledUser.id, 'the permanent user row is reused');
+    assert.equal(body.user.login, 'alice-rehired');
+    assert.equal(body.user.status, 'active');
+    assert.equal(body.user.totp_enabled, false);
+    assert.deepEqual(body.onboarding, {
+      state: 'pending', step: 'provision', error: null,
+      llm_binding: { state: 'pending', error: null },
+    });
+    assert.equal(reactivatedUser.email, 'alice-rehired@example.test');
+    assert.equal(reactivatedUser.display_name, 'Alice Rehired');
+    assert.match(reactivatedUser.password_hash, /^scrypt\$/);
+    assert.equal(reactivatedUser.totp_secret, null);
+    assert.equal(reactivatedUser.last_totp_step, null);
+    assert.equal(reactivatedUser.disabled_at, null);
+    assert.equal(pool.sqlLog.some(({ sql }) => sql.includes('INSERT INTO users (login, email')), false);
+    const update = pool.sqlLog.find(({ sql }) => sql.includes('UPDATE users') && sql.includes('SET login = $2'));
+    assert.ok(update, 'reactivation updates users in place');
+    assert.ok(pool.sqlLog.some(({ sql }) => sql.includes('DELETE FROM login_sessions WHERE user_id')));
+    assert.ok(pool.sqlLog.some(({ sql }) => sql.includes('DELETE FROM login_pending WHERE user_id')));
+    assert.ok(pool.sqlLog.some(({ sql }) => sql.includes('DELETE FROM api_tokens WHERE user_id')));
+    assert.equal(pool.sessions.some((session) => session.user_id === disabledUser.id), false);
+    assert.equal(pool.pending.some((pending) => pending.user_id === disabledUser.id), false);
+    assert.equal(pool.apiTokens.some((token) => token.user_id === disabledUser.id), false);
+    assert.equal(gitAccount.token_ref, null);
+    assert.equal(gitAccount.remote_login, null);
+    assert.equal(onboarding.state, 'pending');
+    assert.deepEqual(onboarding.steps, {
+      provision: { state: 'pending', previousTokenRef: 'old-gitea-token-id' },
+      materialize: { state: 'pending' },
+      'llm-binding': {
+        state: 'pending',
+        models: { ...TEST_LLM, embedding_model_id: null, vision_model_id: null },
+      },
+    });
+    assert.equal(offboarding.state, 'done', 'offboarding history remains intact');
+    assert.ok(pool.audit.some((entry) =>
+      entry.action === 'admin.user_reactivated' && entry.target === 'alice-rehired'
+        && JSON.parse(entry.details).reactivated === true));
+  } finally {
+    await close();
+  }
+});
+
 test('admin 用户管理：显式启用 TOTP 时一次性下发种子与 URI，审计不含种子', async () => {
   const { base, cookie, pool, close } = await startAdminServer();
   try {
@@ -434,9 +586,41 @@ test('admin 用户管理：显式启用 TOTP 时一次性下发种子与 URI，�
     assert.equal(pool.users.find((u) => u.login === 'totp-bob').totp_secret, body.totp_secret);
     assert.ok(!('totp_secret' in body.user), 'user 对象仍无敏感字段');
     const audit = pool.sqlLog.find(({ sql, params }) =>
-      sql.includes("'admin.user_created'") && sql.includes('INSERT INTO audit_log') && params[1] === 'totp-bob');
+      sql.includes('INSERT INTO audit_log') && params[1] === 'admin.user_created' && params[2] === 'totp-bob');
     assert.ok(audit, '用户创建仍写审计');
     assert.ok(!JSON.stringify(audit).includes(body.totp_secret), '审计不含 TOTP 种子');
+  } finally {
+    await close();
+  }
+});
+
+test('admin 用户管理：disabled 同名重激活时，登录名被其他用户占用会返回字段冲突', async () => {
+  const disabledUser = {
+    ...FDE_USER, id: 'b0000000-0000-4000-8000-000000000022',
+    login: 'alice-old', status: 'disabled',
+  };
+  const otherUser = {
+    ...FDE_USER, id: 'b0000000-0000-4000-8000-000000000033',
+    login: 'taken-login', fde_name: 'other-fde',
+  };
+  const { base, cookie, pool, close } = await startAdminServer({
+    seed: { users: [ADMIN, disabledUser, otherUser] },
+  });
+  try {
+    const response = await fetch(`${base}/api/admin/users`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        login: 'taken-login', password: 'new-secret-1', email: 'new@example.test',
+        fde_name: 'alice', git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.equal(body.error.code, 'login_conflict');
+    assert.equal(body.error.details.field, 'login');
+    assert.equal(disabledUser.status, 'disabled');
+    assert.equal(pool.sqlLog.some(({ sql }) => sql.includes('UPDATE users') && sql.includes('SET login = $2')), false);
   } finally {
     await close();
   }

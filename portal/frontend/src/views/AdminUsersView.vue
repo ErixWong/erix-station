@@ -176,6 +176,10 @@ async function onAddUser() {
       totpEnabled: userForm.totpEnabled,
     });
     if (!err) {
+      if (admin.lastReactivatedUserId) {
+        delete rowErrors[admin.lastReactivatedUserId];
+        rowMessages[admin.lastReactivatedUserId] = t('admin.fde.userReactivated');
+      }
       closeAddUser();
       if (admin.totpOnce) showTotp.value = true;
     }
@@ -837,18 +841,30 @@ onBeforeUnmount(() => {
 
   <ModalShell
     v-if="showTotp && admin.totpOnce"
-    :label="admin.totpOnce.purpose === 'enrolled' ? t('admin.fde.totpEnrollTitle') : t('admin.fde.totpTitle')"
+    :label="admin.totpOnce.purpose === 'enrolled'
+      ? t('admin.fde.totpEnrollTitle')
+      : admin.totpOnce.purpose === 'reactivated'
+        ? t('admin.fde.totpReactivatedTitle')
+        : t('admin.fde.totpTitle')"
     dialog-class="max-h-[90vh] overflow-y-auto md:w-[32rem]"
     @close="ignoreTotpDismiss"
   >
     <div class="flex items-center gap-2 border-b border-black/10 px-3 py-2">
       <h2 class="text-sm font-medium">
-        {{ admin.totpOnce.purpose === 'enrolled' ? t('admin.fde.totpEnrollTitle') : t('admin.fde.totpTitle') }}
+        {{ admin.totpOnce.purpose === 'enrolled'
+          ? t('admin.fde.totpEnrollTitle')
+          : admin.totpOnce.purpose === 'reactivated'
+            ? t('admin.fde.totpReactivatedTitle')
+            : t('admin.fde.totpTitle') }}
       </h2>
     </div>
     <div data-test="totp-box" class="grid gap-3 p-3 text-[0.85rem]">
       <img :src="admin.totpOnce.qr" :alt="t('admin.fde.qrAlt')" class="my-1 block h-48 w-48" style="image-rendering: pixelated">
       <i18n-t v-if="admin.totpOnce.purpose === 'created'" keypath="admin.fde.totpCreated" tag="div" scope="global">
+        <template #login><b>{{ admin.totpOnce.login }}</b></template>
+        <template #onlyOnce><b>{{ t('admin.fde.totpOnlyOnce') }}</b></template>
+      </i18n-t>
+      <i18n-t v-else-if="admin.totpOnce.purpose === 'reactivated'" keypath="admin.fde.totpReactivated" tag="div" scope="global">
         <template #login><b>{{ admin.totpOnce.login }}</b></template>
         <template #onlyOnce><b>{{ t('admin.fde.totpOnlyOnce') }}</b></template>
       </i18n-t>
