@@ -246,7 +246,7 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   msgs.rows.reverse(); // 升序返回
   const userAnchors = msgs.rows.length > 0
     ? await pool.query(
-      // Seed rows have no message ID; retain anchor text for exact matching and the temporary projection fallback.
+      // Seed rows have no message ID; retain anchor text only for exact transcript matching.
       `SELECT id, run_id, seq, synthetic, content AS anchor_text, created_at
          FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`,
       [sessionId],
@@ -272,7 +272,7 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   });
   return {
     session: { ...rowToSession(s), active_run_id: active.rows[0]?.id ?? null },
-    messages: projection.messages,
+    messages: projection,
     last_seq: Number(s.last_seq),
     // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
     next_cursor: hasOlder ? Number(msgs.rows[0].seq) : null,
@@ -325,7 +325,8 @@ export async function archiveSession(pool, { userId, sessionId }) {
 /**
  * POST /api/sessions/:id/messages —— 发用户消息 + 建 run 入队（portal.md §4.3）。
  * 事务内：锁 session（串行化并发发送）→ 活跃 run 检查（409 run_in_progress）→
- * seq 原子分配写 user 消息 → 建 run + run_queue → **幂等台账转 done（record，同事务）** → COMMIT
+ * seq 原子分配写 user 消息 + session transcript → 建 run + run_queue →
+ * **幂等台账转 done（record，同事务）** → COMMIT
  * → 唤醒 claim（runner §4.2）。
  * 拉模型（终态）语义：落库即 202，FDE 不在线时 run 在队列等待（§6.3）。
  *
@@ -395,6 +396,34 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
        VALUES ($1, $2, 'user', $3, $4)
        RETURNING id, seq, role, content, attachments, created_at`,
       [s.id, seq, safeContent, JSON.stringify(safeAttachments)],
+    );
+
+    // P3 PR②a：同事务先将用户输入落入 session transcript，再创建/入队 run。
+    // 文本直接取 POST 入参（与 messages.content 一致）；附件仍只保留在锚点行。
+    const latestRound = await client.query(
+      `SELECT COALESCE(MAX(round), 0) AS round
+         FROM transcript_rounds WHERE transcript_key = $1`,
+      [s.id],
+    );
+    const round = Number(latestRound.rows[0].round);
+    const dedupKey = `${s.id}:input:${msg.rows[0].id}`;
+    const transcriptMessages = [{
+      role: 'user',
+      content: [{ type: 'text', text: safeContent }],
+    }];
+    const transcriptRecord = {
+      round,
+      roundKey: dedupKey,
+      dedupKey,
+      messages: transcriptMessages,
+      ts: new Date().toISOString(),
+    };
+    await client.query(
+      `INSERT INTO transcript_rounds
+         (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
+       VALUES (NULL, $1, $2, $3, $4, false, $5, NULL)
+       ON CONFLICT (transcript_key, dedup_key) WHERE transcript_key IS NOT NULL DO NOTHING`,
+      [s.id, dedupKey, round, JSON.stringify(transcriptRecord), JSON.stringify(transcriptMessages)],
     );
 
     // issue #114：默认标题 = 首条用户消息截断（零 LLM）。

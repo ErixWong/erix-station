@@ -636,6 +636,8 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
       if (s.startsWith('INSERT INTO messages')) {
         return { rows: [{ id: 'm1', seq: 1, role: 'user', content: 'hi', attachments: '[]', created_at: new Date() }] };
       }
+      if (s.startsWith('SELECT COALESCE(MAX(round), 0)')) return { rows: [{ round: 0 }] };
+      if (s.startsWith('INSERT INTO transcript_rounds')) return { rows: [] };
       if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
       if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
       if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
