@@ -79,9 +79,42 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **P0** | 本设计定稿；上游 issue（resume + new user turn）；#77 跟踪 | — | 本文档 |
 | **P1** | #64 R1：产物回收 + **终态清场语义修正**（真相层归档 TTL 替代物理删除，只清视图/临时物；`ERIX_RUN_DATA_TTL_HOURS` 语义扩展为归档而非删除） | — | 待派工 |
 | **P2** | #81 P2：store key 切 session 维度（**照抄 CLI 预写入+resume 模式，引擎零改动**）：portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息预写入（dedupKey 幂等判据） | 无（CLI 已验证模式） | **已实施**（`feat-260924-06-session-transcript`：迁移 0006 + portal S1–S6 端点 + worker 三分支装配；部署顺序：portal 先上、FDE 镜像后上） |
-| **P3** | messages 表降级 UI 投影；#70 文本注入退役（保留为 transcript 缺失时的兜底） | P2 稳定 | 待 P2 |
+| **P3** | messages 表降级 UI 投影；#70 文本注入退役（仅保留 transcript 缺失兜底） | P2 稳定（已实施） | **契约已定稿（§6）**，按三个 PR 推进（①读路径投影 → ②停双写+先落树 → ③退役注入） |
 
-## 6. 红线与验收口径
+## 6. P3 实施契约（2026-10-08 定稿）
+
+> 决策者拍板（对话记录）：①「一说话就该写入 store」；②「投影不是上下文创建，是同一份数据换个角度」；③「折叠的是上下文，显示的是历史消息」；④「无 transcript 的旧会话清理掉，按新的来」。
+> 上游缺口已提 issue：`git.erix.vip/eric/erix-llm-kit#95`（宿主展示投影契约缺失，含反模式与 helper 请求）。
+
+### 契约四条（实现必须遵守）
+
+| # | 定稿 | 理由/依据 |
+|---|---|---|
+| **①** | **portal 在 POST 消息的事务内直写 session transcript**（沿用既有幂等键 `dedupKey = <sessionId>:input:<messageId>`）；**删除 runner 的「预写入」分支** | 现在 portal 先写 `messages` + 入队、runner 领活后才补写 transcript → 中间有窗口（消息已可见、transcript 未落）→ 断层 → 只能靠文本注入兜底。写入时机提前到消息落库那一刻，写入方由 runner 改为 portal（portal 本就是 DB 权威，无需经 S2 writer 租约端点） |
+| **②** | 消息列表**读时从 transcript 派生**（投影）：`id` 按确定性规则生成（刷新前后稳定）、`seq` 沿用现有 `chat_sessions.last_seq` 分配器（与 `run_events` 共用序列）、`attachments`/`run` 归属留在 `messages` **锚点行**；**内容不再双写**、**不引入物化表/缓存**（实测慢再议） | 重叠的只是「文本内容」；`messages` 独占的是 UI 元数据（seq/附件/run 归属），transcript 独占的是协议细节（工具调用、推理、结构化 parts、折叠状态）。让重叠部分单一来源、非重叠部分各留各的 → 结构上不可能再分叉 |
+| **③** | **UI 一律显示 `record` 全量**；`folded`/`foldedPayload` **只作用于模型上下文**（上下文节流），不作为展示内容 | 决策者原话「折叠的是上下文，显示的是历史消息」 |
+| **④** | **不做老数据兼容**：无 transcript 的旧会话（P2 迁移前产生、只有 `messages` 行）**清理**；代码**不留 `messages` 兜底读分支** | 决策者原话「清理掉好了，按新的来」；上线前的会话不保证可读 |
+
+### 落点与可替换性
+
+- **投影逻辑收敛到单一模块**（如 `portal/src/session-view.js`），读路径只经它 —— 上游若提供官方 `projectTranscriptForDisplay`（#95），**直接替换该模块并删除自研部分**。
+- 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧「预写入 + resume」多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛）。
+
+### 拆解（三个可独立验收的 PR）
+
+| PR | 内容 | 验收 |
+|---|---|---|
+| **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退） | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
+| **②停内容双写 + 先落树再入队** | portal POST 事务内写 transcript；删 runner 预写入分支；终态幂等比较从 `messages.final_text` 换到 transcript；`messages` 降级为锚点行（不再写 `content`） | 根 `npm test`、`wp3a`/`wp3b`/`wp5` e2e；真机：同 session 多轮 + 崩溃 resume 不丢会话 |
+| **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径）；AI 标题的首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
+
+### 待决策（UI 轮号口径，遗留项）
+
+「轮号跨轮累计 vs 每 run 重置」仍未定（§7 已列）——PR① 实现投影时**先按现状口径**（不改变现有展示语义），单独评估后再改。
+
+---
+
+## 7. 红线与验收口径
 
 - 红线：会话内容只走 IPC 内存、不进日志（对齐 #38 models 纪律）；引擎包改动只经上游 issue，station 不 fork 引擎
 - token 预算：交给引擎 compaction 语义，宿主不再手动截断字节（#70 的截断保留为兜底）
