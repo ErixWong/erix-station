@@ -42,7 +42,8 @@
 | 管理 | `GET /api/admin/users` | 用户列表（不含密码哈希/TOTP 种子） |
 | 管理 | `POST /api/admin/users` | 创建本地 FDE 用户 |
 | 管理 | `PATCH /api/admin/users/:id` | 更新用户资料、角色、FDE 名称或状态 |
-| 管理 | `DELETE /api/admin/users/:id` | 删除无活动资源的用户 |
+| 管理 | `DELETE /api/admin/users/:id` | 无 FDE 资源时立即删除；否则立即禁用并异步下线 |
+| 管理 | `POST /api/admin/users/:id/offboarding/retry` | 重试失败的 FDE 下线任务 |
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
@@ -1711,7 +1712,7 @@ All user-management routes require `requireAdmin`: no session returns `401 unaut
 
 ### `GET /api/admin/users`
 
-Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), and `last_login_at` (the newest `login_sessions.created_at`, or `null`). Revoked sessions remain part of login history.
+Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), `last_login_at` (the newest `login_sessions.created_at`, or `null`), and `offboarding` (`null` or `{ "state", "step", "error", "workspace_purge_after" }`). Offboarding `state` is `pending`, `running`, `done`, or `failed`; `step` identifies the current/failed workflow step and is `null` when complete. Revoked sessions remain part of login history.
 
 ### `POST /api/admin/users`
 
@@ -1747,7 +1748,26 @@ Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `r
 
 ### `DELETE /api/admin/users/:id`
 
-Returns `204` after deleting the user and explicitly removing `login_sessions` and `login_pending` rows (neither table has `ON DELETE CASCADE`). Deleting the current administrator returns `409 self_delete`. A user with a non-removed FDE container or a `queued`, `running`, or `cancelling` run returns `409 user_has_active_fde`; remaining database references that prevent deletion return `409 user_has_related_data`.
+For a user with FDE resources (including a workspace), persists an offboarding task, immediately sets `users.status='disabled'`, revokes login sessions and pending login tokens, and returns `202`:
+
+```json
+{
+  "offboarding": {
+    "state": "pending",
+    "step": "disable-user",
+    "error": null,
+    "workspace_purge_after": null
+  }
+}
+```
+
+The portal worker then stops active runs and the FDE container, revokes the runner token and LLM virtual key, removes Git credentials, releases routes/network allocations, and records the workspace purge deadline. Failed steps are durable and can be retried; the account stays disabled. After `ERIX_WORKSPACE_RETENTION_DAYS` (default `30`), the sweep deletes only workspaces whose offboarding task is `done`, then clears the user's database rows. Setting the retention to `0` disables automatic purging. A user without FDE resources or a workspace retains the existing synchronous deletion behavior and returns `204`.
+
+Deleting the current administrator returns `409 self_delete`. Resources with an invalid/missing `fde_name` return `409 user_fde_name_missing` rather than attempting unsafe cleanup.
+
+### `POST /api/admin/users/:id/offboarding/retry`
+
+Requeues a failed offboarding task and resets only its failed step to `pending`; completed steps are preserved. Returns `200 { "offboarding": ... }`. A missing user returns `404 not_found`; a user without an offboarding task or an already-running task returns `409`.
 
 ### `POST /api/admin/users/:id/reset-password`
 

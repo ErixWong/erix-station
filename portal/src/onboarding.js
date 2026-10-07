@@ -96,6 +96,8 @@ async function claimOne(pool) {
          JOIN users u ON u.id = o.fde_id
          JOIN fde_git_accounts a ON a.fde_id = o.fde_id
         WHERE o.state = 'pending'
+          AND u.status = 'active'
+          AND NOT EXISTS (SELECT 1 FROM fde_offboarding off WHERE off.fde_id = o.fde_id)
         ORDER BY o.created_at, o.fde_id
         FOR UPDATE OF o SKIP LOCKED
         LIMIT 1`,

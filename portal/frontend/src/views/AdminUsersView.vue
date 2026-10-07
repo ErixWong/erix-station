@@ -40,6 +40,7 @@ const deleteBusy = ref(false);
 const profileError = ref('');
 const profileMessage = ref('');
 const onboardingBusyId = ref<string | null>(null);
+const offboardingBusyId = ref<string | null>(null);
 const passwordError = ref('');
 const passwordMessage = ref('');
 const totpError = ref('');
@@ -198,6 +199,24 @@ async function retryOnboarding(user: AdminUser) {
     }
   } finally {
     onboardingBusyId.value = null;
+  }
+}
+
+async function retryOffboarding(user: AdminUser) {
+  if (offboardingBusyId.value) return;
+  clearFeedback(user.id);
+  offboardingBusyId.value = user.id;
+  try {
+    const error = await admin.retryOffboarding(user.id);
+    if (error) {
+      rowErrors[user.id] = error;
+      if (editUserId.value === user.id) profileError.value = error;
+    } else {
+      rowMessages[user.id] = t('admin.fde.offboardingRetryQueued');
+      if (editUserId.value === user.id) profileMessage.value = rowMessages[user.id];
+    }
+  } finally {
+    offboardingBusyId.value = null;
   }
 }
 
@@ -415,7 +434,11 @@ async function confirmUserDelete() {
       rowErrors[user.id] = error;
     } else {
       delete rowErrors[user.id];
-      delete rowMessages[user.id];
+      if (admin.users.some((entry) => entry.id === user.id && entry.offboarding)) {
+        rowMessages[user.id] = t('admin.fde.offboardingQueued');
+      } else {
+        delete rowMessages[user.id];
+      }
       if (editUserId.value === user.id) closeEditModal();
       deleteUserId.value = null;
       returnToEditAfterDelete.value = false;
@@ -435,25 +458,27 @@ onMounted(() => {
   void Promise.all([admin.loadUsers(), admin.loadProviders(), admin.loadGitHosts()]);
 });
 
-let onboardingPoll: ReturnType<typeof setInterval> | null = null;
+let lifecyclePoll: ReturnType<typeof setInterval> | null = null;
 watch(
-  () => admin.users.some((user) => user.onboarding?.state === 'pending' || user.onboarding?.state === 'running'),
+  () => admin.users.some((user) =>
+    user.onboarding?.state === 'pending' || user.onboarding?.state === 'running'
+    || user.offboarding?.state === 'pending' || user.offboarding?.state === 'running'),
   (active) => {
-    if (active && onboardingPoll === null) {
-      onboardingPoll = setInterval(() => {
+    if (active && lifecyclePoll === null) {
+      lifecyclePoll = setInterval(() => {
         if (!admin.usersLoading) void admin.loadUsers();
       }, 3000);
-    } else if (!active && onboardingPoll !== null) {
-      clearInterval(onboardingPoll);
-      onboardingPoll = null;
+    } else if (!active && lifecyclePoll !== null) {
+      clearInterval(lifecyclePoll);
+      lifecyclePoll = null;
     }
   },
   { immediate: true },
 );
 
 onBeforeUnmount(() => {
-  if (onboardingPoll !== null) clearInterval(onboardingPoll);
-  onboardingPoll = null;
+  if (lifecyclePoll !== null) clearInterval(lifecyclePoll);
+  lifecyclePoll = null;
   if (admin.totpOnce) admin.dismissTotpOnce();
 });
 </script>
@@ -541,7 +566,7 @@ onBeforeUnmount(() => {
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colFde') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colMfa') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colStatus') }}</th>
-              <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colOnboarding') }}</th>
+              <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colLifecycle') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.lastLogin') }}</th>
               <th scope="col" class="px-3 py-2 font-medium">{{ t('admin.fde.colActions') }}</th>
             </tr>
@@ -579,27 +604,48 @@ onBeforeUnmount(() => {
                   </span>
                 </td>
                 <td class="px-2 py-2.5">
-                  <span
-                    v-if="user.onboarding"
-                    data-test="onboarding-status"
-                    :title="user.onboarding.llm_binding?.state === 'failed'
-                      ? user.onboarding.llm_binding.error ?? ''
-                      : user.onboarding.state === 'failed' ? user.onboarding.error ?? '' : undefined"
-                    :class="user.onboarding.state === 'failed' || user.onboarding.llm_binding?.state === 'failed'
-                      ? 'text-red-700' : 'text-black/65'"
+                  <div v-if="user.onboarding" class="mb-1">
+                    <span
+                      data-test="onboarding-status"
+                      :title="user.onboarding.llm_binding?.state === 'failed'
+                        ? user.onboarding.llm_binding.error ?? ''
+                        : user.onboarding.state === 'failed' ? user.onboarding.error ?? '' : undefined"
+                      :class="user.onboarding.state === 'failed' || user.onboarding.llm_binding?.state === 'failed'
+                        ? 'text-red-700' : 'text-black/65'"
+                    >
+                      {{ t(`admin.fde.onboarding.${user.onboarding.state}`) }}
+                      <span v-if="user.onboarding.llm_binding?.state === 'failed'"> · {{ t('admin.fde.llmBindingFailed') }}</span>
+                    </span>
+                    <button
+                      v-if="!user.offboarding && (user.onboarding?.state === 'failed' || user.onboarding?.llm_binding?.state === 'failed')"
+                      type="button"
+                      data-test="retry-onboarding"
+                      class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
+                      :disabled="onboardingBusyId !== null"
+                      @click.stop="retryOnboarding(user)"
+                    >{{ t('admin.fde.retryOnboarding') }}</button>
+                  </div>
+                  <div
+                    v-if="user.offboarding"
+                    data-test="offboarding-status"
+                    :title="user.offboarding.error ?? undefined"
+                    :class="user.offboarding.state === 'failed' ? 'text-red-700' : 'text-black/65'"
                   >
-                    {{ t(`admin.fde.onboarding.${user.onboarding.state}`) }}
-                    <span v-if="user.onboarding.llm_binding?.state === 'failed'"> · {{ t('admin.fde.llmBindingFailed') }}</span>
-                  </span>
-                  <span v-else class="text-black/35">—</span>
-                  <button
-                    v-if="user.onboarding?.state === 'failed' || user.onboarding?.llm_binding?.state === 'failed'"
-                    type="button"
-                    data-test="retry-onboarding"
-                    class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
-                    :disabled="onboardingBusyId !== null"
-                    @click.stop="retryOnboarding(user)"
-                  >{{ t('admin.fde.retryOnboarding') }}</button>
+                    {{ t(`admin.fde.offboarding.${user.offboarding.state}`) }}
+                    <span v-if="user.offboarding.step"> · {{ t(`admin.fde.offboardingSteps.${user.offboarding.step}`) }}</span>
+                    <span v-if="user.offboarding.workspace_purge_after">
+                      · {{ t('admin.fde.workspacePurgeAfter', { date: formatLastLogin(user.offboarding.workspace_purge_after) }) }}
+                    </span>
+                    <button
+                      v-if="user.offboarding.state === 'failed'"
+                      type="button"
+                      data-test="retry-offboarding"
+                      class="ml-1 rounded border border-black/15 px-1 py-0.5 text-xs hover:bg-black/5 disabled:opacity-50"
+                      :disabled="offboardingBusyId !== null"
+                      @click.stop="retryOffboarding(user)"
+                    >{{ t('admin.fde.retryOffboarding') }}</button>
+                  </div>
+                  <span v-if="!user.onboarding && !user.offboarding" class="text-black/35">—</span>
                 </td>
                 <td class="truncate px-3 py-2.5" :title="formatLastLogin(user.last_login_at)">
                   {{ formatLastLogin(user.last_login_at) }}
@@ -607,6 +653,7 @@ onBeforeUnmount(() => {
                 <td class="px-2 py-2">
                   <div class="flex flex-wrap items-center justify-end gap-1">
                     <button
+                      v-if="!user.offboarding"
                       type="button"
                       class="rounded-md border border-black/15 px-2 py-1 text-xs hover:bg-black/5 disabled:opacity-50"
                       :disabled="busyUserId !== null"
@@ -953,13 +1000,33 @@ onBeforeUnmount(() => {
             {{ editUser.onboarding.error }}
           </p>
           <button
-            v-if="editUser.onboarding.state === 'failed'"
+            v-if="editUser.onboarding.state === 'failed' && !editUser.offboarding"
             type="button"
             data-test="retry-onboarding-profile"
             class="justify-self-start rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5 disabled:opacity-50"
             :disabled="onboardingBusyId !== null"
             @click="retryOnboarding(editUser)"
           >{{ t('admin.fde.retryOnboarding') }}</button>
+        </section>
+        <section v-if="editUser?.offboarding" data-test="profile-offboarding" class="mt-4 grid gap-2 border-t border-black/10 pt-3 text-sm">
+          <h4 class="font-semibold">{{ t('admin.fde.offboardingTitle') }}</h4>
+          <p>{{ t(`admin.fde.offboarding.${editUser.offboarding.state}`) }}
+            <span v-if="editUser.offboarding.step"> · {{ t(`admin.fde.offboardingSteps.${editUser.offboarding.step}`) }}</span>
+          </p>
+          <p v-if="editUser.offboarding.workspace_purge_after">
+            {{ t('admin.fde.workspacePurgeAfter', { date: formatLastLogin(editUser.offboarding.workspace_purge_after) }) }}
+          </p>
+          <p v-if="editUser.offboarding.error" class="break-words text-red-700" :title="editUser.offboarding.error">
+            {{ editUser.offboarding.error }}
+          </p>
+          <button
+            v-if="editUser.offboarding.state === 'failed'"
+            type="button"
+            data-test="retry-offboarding-profile"
+            class="justify-self-start rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5 disabled:opacity-50"
+            :disabled="offboardingBusyId !== null"
+            @click="retryOffboarding(editUser)"
+          >{{ t('admin.fde.retryOffboarding') }}</button>
         </section>
       </section>
 

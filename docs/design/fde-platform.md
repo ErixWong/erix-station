@@ -319,13 +319,19 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 
 **开户执行（issue #111 A；LLM 绑定按 issue #146 更新）**：管理台新建 FDE 时 email、`fde_name`、启用中的 Gitea/GitLab Git host，以及 LiteLLM 目录中的 provider 和至少一个启用且支持 tool-calling 的主模型必填。目录不可达（LiteLLM profile 未启用或故障）时 fail-closed，拒绝创建用户。用户、模型选择（保存在 `fde_onboarding.steps` JSONB）、Git host 绑定与队列记录在同一 DB 事务内写入。portal 后台依次执行 provision、用户空间 materialize、`llm-binding` 并持久化步骤状态；LLM key 创建失败只将该步骤记为 `failed`，不阻断账户主体，整体终态仍按 Git 凭据状态取 `done` / `awaiting_credential`。管理员可用 onboarding retry 重试该独立步骤；若已有 binding（例如管理员先手配），开户步骤跳过且不覆盖。其他步骤失败仍由管理员显式重试，已完成步骤跳过。
 
-### 7.3 offboarding 必须同样脚本化
+### 7.3 offboarding（issue #110，已实现）
 
 ```
-停容器 + 吊销 runner token + 吊销 LLM 虚拟 key + 删除 `.git-credentials` + 失效登录会话 + 保留 workspace 卷 N 天
+立即停用账号/失效登录会话并停止活动 run
+→ 停容器 + 吊销 runner token + 吊销 LLM 虚拟 key + 删除 Git 凭据与 CLI 配置
+→ 释放网络、端口与路由
+→ 保留 workspace N 天
+→ 安全删除 workspace 并清除用户及子表数据
 ```
 
-并配一个**定时与 IdP 对账**的任务（拉 IdP 用户列表 → 比对 → 停用）。SSO 侧停用 ≠ 本平台停用——**onboarding 和 offboarding 是同一 workflow 的两端，只做前者是内部平台最常见的腐烂方式**。
+管理台 `DELETE /api/admin/users/:id` 对有 FDE 资源的用户返回 `202`：事务内立即设 `status='disabled'`、撤销登录会话并持久化 offboarding 队列；worker 按步骤幂等执行，失败可由管理员重试。没有 FDE 资源的用户仍同步删除（`204`）。`ERIX_WORKSPACE_RETENTION_DAYS` 默认 `30`；到期 sweep 只处理 `fde_offboarding.state='done'` 的记录，先用真实路径守护删除 `/srv/erix/users/<fde_name>`，再逐条清除用户与子表并写审计。配置为 `0` 时禁用自动 purge；已完成的下线记录及 workspace 会保留，直到运维另行处置。
+
+并配一个**定时与 IdP 对账**的任务（拉 IdP 用户列表 → 比对 → 停用；issue #135，SSO 范围，尚未实现）。SSO 侧停用 ≠ 本平台停用——**onboarding 和 offboarding 是同一 workflow 的两端，只做前者是内部平台最常见的腐烂方式**。
 
 ---
 
