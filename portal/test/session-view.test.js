@@ -15,6 +15,44 @@ const USER_ID = '30000000-0000-4000-8000-000000000001';
 const at = (second) => new Date(Date.UTC(2026, 9, 7, 0, 0, second));
 const text = (value) => [{ type: 'text', text: value }];
 
+function transcriptTexts(transcriptRows) {
+  const values = new Set();
+  const addContent = (content) => {
+    const value = typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content
+          .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text)
+          .join('')
+        : null;
+    if (value !== null) values.add(value);
+  };
+
+  for (const { record } of transcriptRows) {
+    const messages = Array.isArray(record?.messages) ? record.messages : [];
+    for (const transcriptMessage of messages) {
+      if (transcriptMessage?.role === 'user' || transcriptMessage?.role === 'assistant') {
+        addContent(transcriptMessage.content);
+      }
+    }
+    addContent(record?.response?.content);
+  }
+  return values;
+}
+
+function assertTranscriptBacked(result, transcriptRows) {
+  const sourceTexts = transcriptTexts(transcriptRows);
+  for (const projected of result.messages) {
+    if (projected.synthetic !== true && projected.content !== '') {
+      assert.ok(
+        sourceTexts.has(projected.content),
+        `non-synthetic ${projected.role} ${projected.id} must come from transcript text`,
+      );
+    }
+  }
+}
+
 function message(id, seq, role, content, runId, {
   synthetic = false,
   attachments = [],
@@ -181,6 +219,7 @@ test('GET session projects user and final assistant text while preserving anchor
   assert.equal(result.messages[0].created_at, at(1).toISOString());
   assert.equal(result.last_seq, 8);
   assert.equal(result.next_cursor, null);
+  assertTranscriptBacked(result, transcriptRows);
   assert.ok(pool.queries.some((query) => query.sql.includes('FROM transcript_rounds')));
   assert.ok(pool.queries.some((query) => query.sql.includes('ORDER BY seq DESC LIMIT $2')));
   assert.match(
@@ -415,7 +454,76 @@ test('users missing their own rows are recovered from later run snapshots by exa
   assert.equal(projected.get('current-d').content, '');
 });
 
-test('content matching takes duplicate texts in seq order and claims each anchor once', async () => {
+test('a historical snapshot claims every matching user message in record order without guessing', async () => {
+  const anchors = [
+    message('intro-user', 1, 'user', '用一句话介绍你自己。', RUN_1),
+    message('ok-user', 2, 'user', '你好，请回复 ok', RUN_2),
+    message('verify-user', 3, 'user', '做个最简单的验证：回复 done', RUN_4),
+    message('fourth-user', 4, 'user', 'another recovered turn', LEGACY_RUN),
+    message('missing-user', 5, 'user', 'this text is absent from the snapshot', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(19, null, {
+      messages: [
+        { role: 'user', content: text('session opening turn with no anchor') },
+        { role: 'assistant', content: text('earlier assistant response') },
+        { role: 'user', content: text('你好，请回复 ok') },
+        { role: 'user', content: text('做个最简单的验证：回复 done') },
+        { role: 'assistant', content: text('verification recorded') },
+        { role: 'user', content: text('用一句话介绍你自己。') },
+        { role: 'user', content: text('another recovered turn') },
+      ],
+    }, at(5), '40000000-0000-4000-8000-000000000009'),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: SESSION_ID,
+    limit: 20,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.equal(transcriptRows.length, 1, 'these user turns have no individual transcript rows');
+  assert.deepEqual(
+    anchors.map((anchor) => projected.get(anchor.id).content),
+    [
+      '用一句话介绍你自己。',
+      '你好，请回复 ok',
+      '做个最简单的验证：回复 done',
+      'another recovered turn',
+      '',
+    ],
+  );
+  assertTranscriptBacked(result, transcriptRows);
+});
+
+test('input message IDs take precedence over content matching', async () => {
+  const anchors = [
+    message('input-target', 1, 'user', 'stale anchor text', RUN_1),
+    message('text-collision', 2, 'user', 'authoritative input text', RUN_2),
+  ];
+  const transcriptRows = [
+    transcript(0, `${SESSION_ID}:input:input-target`, {
+      dedupKey: `${SESSION_ID}:input:input-target`,
+      messages: [{ role: 'user', content: text('authoritative input text') }],
+    }, at(1)),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: SESSION_ID,
+    limit: 20,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.equal(projected.get('input-target').content, 'authoritative input text');
+  assert.equal(projected.get('text-collision').content, '');
+  assertTranscriptBacked(result, transcriptRows);
+});
+
+test('content matching takes duplicate texts in seq order and claims each anchor once across snapshots', async () => {
   const anchors = [
     message('first-repeat', 1, 'user', 'repeated request', RUN_1),
     message('second-repeat', 2, 'user', 'repeated request', RUN_2),
@@ -425,7 +533,10 @@ test('content matching takes duplicate texts in seq order and claims each anchor
       messages: [{ role: 'user', content: text('repeated request') }],
     }, at(1)),
     transcript(1, null, {
-      messages: [{ role: 'user', content: text('repeated request') }],
+      messages: [
+        { role: 'user', content: text('repeated request') },
+        { role: 'user', content: text('repeated request') },
+      ],
     }, at(2), RUN_4),
     transcript(2, null, {
       messages: [{ role: 'user', content: text('repeated request') }],
