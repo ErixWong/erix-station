@@ -112,7 +112,11 @@ function giteaExistingUser(data) {
       || typeof data?.source_id !== 'number') {
     throw new GitMintError('git_host_invalid_response', 'gitea API omitted user details');
   }
-  return { login: data.login, loginName: data.login_name, sourceId: data.source_id };
+  // #148 real-host repro (Gitea 1.27.2): POST /admin/users without login_name
+  // returns login_name: ""; PATCH /admin/users/{login} requires a non-empty LoginName
+  // (422 [LoginName]: Required), so fall back to the username.
+  const loginName = data.login_name.trim() ? data.login_name : data.login;
+  return { login: data.login, loginName, sourceId: data.source_id };
 }
 
 async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS }) {
@@ -164,8 +168,8 @@ async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutM
         url: apiUrl(base, `/api/v1/admin/users/${encodeURIComponent(remoteLogin)}`),
         method: 'PATCH',
         headers: { authorization, 'content-type': 'application/json' },
-        // Gitea rejects PATCH without login_name and source_id (422 [LoginName]: Required);
-        // preserve both values returned by GET while resetting only the password.
+        // Gitea rejects PATCH without login_name and source_id; login_name has already
+        // fallen back to the username if GET returned an empty or whitespace-only value.
         body: {
           login_name: existing.loginName,
           source_id: existing.sourceId,
