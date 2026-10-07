@@ -26,6 +26,11 @@ export function runArchiveDir(home, runId) {
   return path.join(home, 'runs-archive', String(runId));
 }
 
+export function touchRunDataDir(home, runId) {
+  const now = new Date();
+  fs.utimesSync(runDataDir(home, runId), now, now);
+}
+
 // claim 后、fork 前备好目录（run 目录仍为 agentd 所有，notes 根目录属于 worker）。
 export function prepareRunDataDir(home, runId, { workerUid, workerGid }) {
   const dir = runDataDir(home, runId);
@@ -183,8 +188,8 @@ export function archiveRunData({ home, runId, workerUid, workerGid, log, moveFn 
  * 调用），因此**不能**用「不在活跃集」当删除判据——崩溃恢复场景 attempt1 worker 崩溃 → portal
  * re-claim 同一 run（resume=true，notes 全在 run 数据目录里）→ 恰好赶在 agentd 重启之后、新 attempt
  * claim 之前被 sweep 删光，选项 A 要保的跨 attempt 语义被启动清扫自己破坏。故只删「mtime 超过保留期」
- * 的目录：崩溃后 resume re-claim 必然在分钟级窗口内发生，目录 mtime 新鲜（prepareRunDataDir /
- * worker 写 notes 都会刷新），不会误删；真正的残留（终态清理失败/异常退出）在保留期内无人再碰，
+ * 的目录：崩溃后 resume re-claim 必然在分钟级窗口内发生，目录 mtime 新鲜（活跃 run 的 agentd
+ * 心跳刷新顶层目录 mtime），不会误删；真正的残留（终态清理失败/异常退出）在保留期内无人再碰，
  * mtime 过期后安全清除。
  *
  * runs-archive/ 扫描无此 race：归档只发生在 U2 终态确认之后，终态 run 永不再被 claim
