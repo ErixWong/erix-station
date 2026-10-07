@@ -27,7 +27,7 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-test('Gitea creates FDE user and a repository-creation/push token using the generated user password', async () => {
+test('Gitea creates FDE user and a repository-creation/push/PR token using the generated user password', async () => {
   const calls = [];
   await withServer((req, res, text) => {
     calls.push({ method: req.method, path: req.url, auth: req.headers.authorization, body: text ? JSON.parse(text) : null });
@@ -40,7 +40,7 @@ test('Gitea creates FDE user and a repository-creation/push token using the gene
     }
     if (req.url === '/api/v1/users/alice/tokens' && req.method === 'POST') {
       assert.match(calls[1].auth, /^Basic /);
-      assert.deepEqual(calls[1].body.scopes, ['write:user', 'write:repository']);
+      assert.deepEqual(calls[1].body.scopes, ['write:user', 'write:repository', 'read:issue']);
       const credentials = Buffer.from(calls[1].auth.slice('Basic '.length), 'base64').toString();
       assert.equal(credentials.split(':')[0], 'alice');
       return json(res, 201, { id: 42, sha1: 'gitea-token-secret' });
