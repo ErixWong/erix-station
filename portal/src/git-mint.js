@@ -120,15 +120,18 @@ async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutM
           authorization: `Basic ${Buffer.from(`${remoteLogin}:${password}`).toString('base64')}`,
           'content-type': 'application/json',
         },
-        // #148 real-host acceptance: tea repos create rejected the old token with
-        // "Error: token does not have at least one of required scope(s),
-        // required=[write:user], token scope=write:repository". write:user allows
-        // creating repositories under the FDE's own account; write:repository allows
-        // repository access and push. `--owner <org>` instead requires
-        // write:organization, intentionally not granted pending a separate decision.
+        // #148 real-host acceptance (Gitea 1.27.2, worker UID 1002, delivered tea
+        // config): tea pulls create failed with "token does not have at least one of
+        // required scope(s), required=[read:issue], token scope=write:repository,write:user".
+        // `read:issue` supports PR/issue reads and PR creation; both read:issue and
+        // write:issue variants created a PR in acceptance, so grant the minimum.
+        // Do not grant write:issue: issue creation/comments are out of scope pending
+        // a future decision. write:user allows repo creation under the FDE account;
+        // write:repository allows repository access and push. `--owner <org>` instead
+        // requires write:organization, intentionally not granted pending a decision.
         body: {
           name: `erix-station-${crypto.randomBytes(8).toString('hex')}`,
-          scopes: ['write:user', 'write:repository'],
+          scopes: ['write:user', 'write:repository', 'read:issue'],
         },
       });
       const { tokenRef, tokenPlaintext } = tokenResult('gitea', token);
