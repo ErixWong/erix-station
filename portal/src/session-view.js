@@ -121,6 +121,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
         matchedUserAnchor
         && matchedUserAnchor.synthetic !== true
         && lastUserText !== null
+        && lastUserText !== ''
         && !claimedUserAnchors.has(String(matchedUserAnchor.id))
       ) {
         const anchorId = String(matchedUserAnchor.id);
@@ -129,7 +130,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       }
     } else {
       for (const userText of candidateUserTexts) {
-        if (userText === null) continue;
+        if (userText === null || userText === '') continue;
         const candidate = claimUserAnchor(userText, userAnchorsByText, claimedUserAnchors);
         if (candidate) {
           matchedUserAnchor = candidate;
@@ -172,14 +173,26 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     if (text) assistantContent.set(currentRunId, text);
   }
 
-  return anchors.map((anchor) => {
+  let fallbackCount = 0;
+  const messages = anchors.map((anchor) => {
     let content = '';
     if (anchor.synthetic === true) {
       content = anchor.content;
     } else if (anchor.role === 'user') {
-      content = userContent.get(String(anchor.id)) ?? '';
+      const anchorId = String(anchor.id);
+      if (userContent.has(anchorId)) {
+        content = userContent.get(anchorId);
+      } else {
+        content = userById.get(anchorId)?.anchor_text ?? '';
+        fallbackCount += 1;
+      }
     } else if (anchor.role === 'assistant') {
-      content = assistantContent.get(anchor.run_id) ?? '';
+      if (assistantContent.has(anchor.run_id)) {
+        content = assistantContent.get(anchor.run_id);
+      } else {
+        content = anchor.content ?? '';
+        fallbackCount += 1;
+      }
     }
     return {
       id: anchor.id,
@@ -192,4 +205,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       created_at: anchor.created_at?.toISOString?.() ?? anchor.created_at,
     };
   });
+
+  // PR① 的过渡兜底唯一原因是写路径尚未把用户输入落进 transcript（由 PR② 修复）。
+  // PR② 必须删除此兜底，并把 fallbackCount === 0 作为验收断言。
+  return { messages, fallbackCount };
 }
