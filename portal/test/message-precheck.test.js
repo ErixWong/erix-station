@@ -88,7 +88,7 @@ class MessagePool extends FakePool {
     if (sql.includes('INSERT INTO messages')) {
       return { rows: [{ id: 'm1', seq: 6, content: params[2], created_at: new Date('2026-09-22T00:00:00Z') }] };
     }
-    if (sql.includes('SELECT COALESCE(MAX(round), 0)')) return { rows: [{ round: 0 }] };
+    if (sql.includes('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的 load(key)
     if (sql.includes('INSERT INTO transcript_rounds')) return { rows: [] };
     if (sql.includes('INSERT INTO runs')) return { rows: [{ id: params[0], status: 'queued' }] };
     return super.query(sql, params);
