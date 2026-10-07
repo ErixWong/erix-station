@@ -82,6 +82,12 @@ function compareTranscriptRows(a, b) {
 export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows }) {
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
+  const userByRunId = new Map();
+  for (const anchor of users) {
+    if (anchor.synthetic !== true && anchor.run_id && !userByRunId.has(anchor.run_id)) {
+      userByRunId.set(anchor.run_id, anchor);
+    }
+  }
   const runIds = new Set([
     ...users.map((anchor) => anchor.run_id),
     ...anchors.map((anchor) => anchor.run_id),
@@ -90,11 +96,24 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   const assistantContent = new Map();
   let currentRunId = null;
 
-  // Query order follows round, then created_at. Same-round prewrites therefore form
-  // an unambiguous boundary between runs even though current station keys are session-scoped.
+  // Explicit legacy run IDs are authoritative; session-scoped keys segment newer rows.
   for (const row of [...transcriptRows].sort(compareTranscriptRows)) {
     const record = row.record;
+    if (typeof row.run_id === 'string' && row.run_id.length > 0) {
+      const lastUser = Array.isArray(record?.messages)
+        ? record.messages.findLast((message) => message?.role === 'user')
+        : null;
+      const userText = textFromContent(lastUser?.content);
+      const userAnchor = userByRunId.get(row.run_id);
+      if (userAnchor && userText) userContent.set(String(userAnchor.id), userText);
+
+      const text = assistantText(record);
+      if (text) assistantContent.set(row.run_id, text);
+      continue;
+    }
+
     const keys = recordKeys(row, record);
+    if (keys.length === 0) continue;
     const isSeed = keys.some((key) => key.endsWith(':seed'));
     const messageId = inputMessageId(keys, sessionId);
     if (messageId !== null) {
@@ -107,9 +126,6 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       continue;
     }
 
-    // Prefer an explicit execution run id when present. Station's current worker passes
-    // the session transcript key to runToolLoop, so engine records otherwise inherit the
-    // most recent input marker; the first seed is associated by its persisted timestamp.
     const keyedRunId = recordRunId(keys, runIds);
     if (keyedRunId !== null) {
       currentRunId = keyedRunId;

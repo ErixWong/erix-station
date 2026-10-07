@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import { getSession } from '../src/sessions.js';
 
 const SESSION_ID = '10000000-0000-4000-8000-000000000001';
+const LEGACY_SESSION_ID = '10000000-0000-4000-8000-000000000002';
+const NEW_SESSION_ID = '10000000-0000-4000-8000-000000000003';
+const MIXED_SESSION_ID = '10000000-0000-4000-8000-000000000004';
 const RUN_1 = '20000000-0000-4000-8000-000000000001';
 const RUN_2 = '20000000-0000-4000-8000-000000000002';
 const LEGACY_RUN = '20000000-0000-4000-8000-000000000003';
+const RUN_4 = '20000000-0000-4000-8000-000000000004';
 const USER_ID = '30000000-0000-4000-8000-000000000001';
 
 const at = (second) => new Date(Date.UTC(2026, 9, 7, 0, 0, second));
@@ -28,12 +32,13 @@ function message(id, seq, role, content, runId, {
   };
 }
 
-function transcript(round, dedupKey, record, createdAt) {
-  return { round, dedup_key: dedupKey, record, created_at: createdAt };
+function transcript(round, dedupKey, record, createdAt, runId = null) {
+  return { run_id: runId, round, dedup_key: dedupKey, record, created_at: createdAt };
 }
 
 class SessionViewPool {
-  constructor({ anchors, transcriptRows }) {
+  constructor({ sessionId = SESSION_ID, anchors, transcriptRows }) {
+    this.sessionId = sessionId;
     this.anchors = anchors;
     this.transcriptRows = transcriptRows;
     this.queries = [];
@@ -44,7 +49,7 @@ class SessionViewPool {
     if (sql.includes('FROM chat_sessions s')) {
       return {
         rows: [{
-          id: SESSION_ID,
+          id: this.sessionId,
           user_id: USER_ID,
           project_id: null,
           cwd: '~/projects/demo',
@@ -61,7 +66,9 @@ class SessionViewPool {
         rows: this.anchors
           .filter((anchor) => anchor.role === 'user')
           .sort((a, b) => a.seq - b.seq)
-          .map(({ id, run_id, seq, created_at }) => ({ id, run_id, seq, created_at })),
+          .map(({ id, run_id, seq, synthetic, created_at }) => ({
+            id, run_id, seq, synthetic, created_at,
+          })),
       };
     }
     if (sql.includes('FROM messages')) {
@@ -71,7 +78,7 @@ class SessionViewPool {
       return { rows };
     }
     if (sql.includes('FROM transcript_rounds')) {
-      assert.equal(params[0], SESSION_ID, 'transcript lookup is scoped to this session key');
+      assert.equal(params[0], this.sessionId, 'transcript lookup is scoped to this session key');
       return { rows: [...this.transcriptRows].sort((a, b) => a.round - b.round || a.created_at - b.created_at) };
     }
     if (sql.includes('FROM runs')) return { rows: [] };
@@ -176,6 +183,10 @@ test('GET session projects user and final assistant text while preserving anchor
   assert.equal(result.next_cursor, null);
   assert.ok(pool.queries.some((query) => query.sql.includes('FROM transcript_rounds')));
   assert.ok(pool.queries.some((query) => query.sql.includes('ORDER BY seq DESC LIMIT $2')));
+  assert.match(
+    pool.queries.find((query) => query.sql.includes('FROM transcript_rounds')).sql,
+    /SELECT run_id, round, dedup_key, record, created_at/,
+  );
 });
 
 test('projection resolves explicit run-id keys and never falls back for non-synthetic legacy anchors', async () => {
@@ -195,6 +206,145 @@ test('projection resolves explicit run-id keys and never falls back for non-synt
   const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
   assert.equal(result.messages[0].content, 'from final assistant message');
   assert.equal(result.messages[1].content, '');
+});
+
+test('run-id legacy rows, session-key rows, and mixed rows project identically to their anchors', async () => {
+  const legacyAnchors = [
+    message('legacy-m1', 1, 'user', 'legacy first request', RUN_1),
+    message('legacy-a1', 2, 'assistant', 'legacy first final', RUN_1),
+    message('legacy-m2', 3, 'user', 'legacy second request', RUN_2),
+    message('legacy-a2', 4, 'assistant', 'legacy second final', RUN_2),
+  ];
+  const legacyRows = [
+    transcript(0, null, {
+      messages: [{ role: 'user', content: text('legacy first request') }],
+    }, at(1), RUN_1),
+    transcript(0, null, {
+      messages: [{ role: 'user', content: text('legacy second request') }],
+    }, at(2), RUN_2),
+    transcript(1, null, {
+      response: { content: text('legacy first intermediate') },
+      messages: [{ role: 'assistant', content: text('legacy first intermediate') }],
+    }, at(3), RUN_1),
+    transcript(1, null, {
+      response: { content: text('legacy first final') },
+      messages: [{ role: 'assistant', content: text('legacy first final') }],
+    }, at(4), RUN_1),
+    transcript(1, null, {
+      response: { content: text('legacy second final') },
+      messages: [{ role: 'assistant', content: text('legacy second final') }],
+    }, at(5), RUN_2),
+  ];
+
+  const newAnchors = [
+    message('new-m1', 1, 'user', 'new first request', RUN_1),
+    message('new-a1', 2, 'assistant', 'new first final', RUN_1),
+    message('new-m2', 3, 'user', 'new second request', RUN_2),
+    message('new-a2', 4, 'assistant', 'new second final', RUN_2),
+  ];
+  const newRows = [
+    transcript(0, `${NEW_SESSION_ID}:input:new-m1`, {
+      roundKey: `${NEW_SESSION_ID}:input:new-m1`,
+      dedupKey: `${NEW_SESSION_ID}:input:new-m1`,
+      messages: [{ role: 'user', content: text('new first request') }],
+    }, at(1)),
+    transcript(1, `${NEW_SESSION_ID}:engine:round:1`, {
+      roundKey: `${NEW_SESSION_ID}:round:1`,
+      dedupKey: `${NEW_SESSION_ID}:engine:round:1`,
+      response: { content: text('new first final') },
+    }, at(2)),
+    transcript(1, `${NEW_SESSION_ID}:input:new-m2`, {
+      roundKey: `${NEW_SESSION_ID}:input:new-m2`,
+      dedupKey: `${NEW_SESSION_ID}:input:new-m2`,
+      messages: [{ role: 'user', content: text('new second request') }],
+    }, at(3)),
+    transcript(2, `${NEW_SESSION_ID}:engine:round:2`, {
+      roundKey: `${NEW_SESSION_ID}:round:2`,
+      dedupKey: `${NEW_SESSION_ID}:engine:round:2`,
+      response: { content: text('new second final') },
+    }, at(4)),
+  ];
+
+  const mixedAnchors = [
+    message('mixed-old-m', 1, 'user', 'mixed legacy request', RUN_1),
+    message('mixed-old-a', 2, 'assistant', 'mixed legacy final', RUN_1),
+    message('mixed-new-m', 3, 'user', 'mixed new request', RUN_2),
+    message('mixed-judge', 4, 'user', 'synthetic anchor text', RUN_2, { synthetic: true }),
+    message('mixed-new-a', 5, 'assistant', 'mixed new final', RUN_2),
+  ];
+  const mixedRows = [
+    transcript(0, null, {
+      messages: [{ role: 'user', content: text('mixed legacy request') }],
+    }, at(1), RUN_1),
+    transcript(0, `${MIXED_SESSION_ID}:input:mixed-new-m`, {
+      roundKey: `${MIXED_SESSION_ID}:input:mixed-new-m`,
+      dedupKey: `${MIXED_SESSION_ID}:input:mixed-new-m`,
+      messages: [{ role: 'user', content: text('mixed new request') }],
+    }, at(2)),
+    transcript(1, null, {
+      response: { content: text('mixed legacy final') },
+    }, at(3), RUN_1),
+    transcript(1, `${MIXED_SESSION_ID}:engine:round:1`, {
+      roundKey: `${MIXED_SESSION_ID}:round:1`,
+      dedupKey: `${MIXED_SESSION_ID}:engine:round:1`,
+      response: { content: text('mixed new final') },
+    }, at(4)),
+  ];
+
+  const cases = [
+    { sessionId: LEGACY_SESSION_ID, anchors: legacyAnchors, transcriptRows: legacyRows },
+    { sessionId: NEW_SESSION_ID, anchors: newAnchors, transcriptRows: newRows },
+    { sessionId: MIXED_SESSION_ID, anchors: mixedAnchors, transcriptRows: mixedRows },
+  ];
+  assert.ok(legacyRows.every((row) => (
+    row.run_id !== null
+    && row.dedup_key === null
+    && !('dedupKey' in row.record)
+    && !('roundKey' in row.record)
+  )));
+  assert.ok(
+    new Set(legacyRows.map((row) => row.round)).size < legacyRows.length,
+    'legacy rows include duplicate rounds',
+  );
+  assert.ok(newRows.every((row) => row.run_id === null && row.dedup_key !== null));
+  assert.ok(mixedRows.some((row) => row.run_id !== null && row.dedup_key === null));
+  assert.ok(mixedRows.some((row) => row.run_id === null && row.dedup_key !== null));
+  for (const { sessionId, anchors, transcriptRows } of cases) {
+    const pool = new SessionViewPool({ sessionId, anchors, transcriptRows });
+    const result = await getSession(pool, { userId: USER_ID, sessionId, limit: 100 });
+    const projected = new Map(result.messages.map((row) => [row.id, row]));
+    for (const anchor of anchors.filter((candidate) => candidate.synthetic !== true)) {
+      assert.equal(
+        projected.get(anchor.id).content,
+        anchor.content,
+        `projection for ${sessionId}/${anchor.id} matches transcript-backed anchor`,
+      );
+    }
+    for (const anchor of anchors.filter((candidate) => candidate.synthetic === true)) {
+      assert.equal(projected.get(anchor.id).content, anchor.content);
+    }
+  }
+});
+
+test('transcript rows without a run ID or any key remain unattributed', async () => {
+  const anchors = [
+    message('unattributed-user', 1, 'user', 'anchor must not be read', RUN_4),
+    message('unattributed-assistant', 2, 'assistant', 'anchor must not be read', RUN_4),
+  ];
+  const pool = new SessionViewPool({
+    anchors,
+    transcriptRows: [
+      transcript(0, null, {
+        messages: [{ role: 'user', content: text('guessed user text') }],
+      }, at(1)),
+      transcript(1, null, {
+        response: { content: text('guessed assistant text') },
+      }, at(2)),
+    ],
+  });
+
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
+  assert.deepEqual(result.messages.map((row) => row.content), ['', '']);
 });
 
 test('message cursor still filters anchor rows before transcript projection', async () => {

@@ -246,14 +246,14 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   msgs.rows.reverse(); // 升序返回
   const userAnchors = msgs.rows.length > 0
     ? await pool.query(
-      `SELECT id, run_id, seq, created_at
+      `SELECT id, run_id, seq, synthetic, created_at
          FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`,
       [sessionId],
     )
     : { rows: [] };
   const transcript = msgs.rows.length > 0
     ? await pool.query(
-      `SELECT round, dedup_key, record, created_at
+      `SELECT run_id, round, dedup_key, record, created_at
          FROM transcript_rounds WHERE transcript_key = $1
          ORDER BY round ASC, created_at ASC`,
       [sessionId],
