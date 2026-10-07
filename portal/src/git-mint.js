@@ -55,7 +55,9 @@ async function requestJson({ fetchImpl, timeoutMs, provider, url, method, header
       try {
         data = JSON.parse(text);
       } catch {
-        throw new GitMintError('git_host_invalid_response', `${provider} API returned invalid JSON`);
+        if (response.ok) {
+          throw new GitMintError('git_host_invalid_response', `${provider} API returned invalid JSON`);
+        }
       }
     }
     if (!response.ok) {
@@ -175,6 +177,10 @@ async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutM
           source_id: existing.sourceId,
           password,
           must_change_password: false,
+          // Offboarding policy (#110) disables rather than deletes Gitea users.
+          // Real Gitea 1.27.2 repro showed Basic auth then returns 401, so a later
+          // same-login reprovision must explicitly re-enable before minting.
+          prohibit_login: false,
         },
       });
     }
@@ -286,6 +292,43 @@ async function mintGitlab({ baseUrl, adminKey, login, fetchImpl = fetch, timeout
 
 export async function mintGiteaAccount(options = {}) {
   return mintGitea(options);
+}
+
+export async function disableGiteaAccount({
+  baseUrl, adminKey, login, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+  const base = inputBase(baseUrl, adminKey, login);
+  const authorization = `token ${adminKey}`;
+  let existing;
+  try {
+    existing = giteaExistingUser(await requestJson({
+      fetchImpl,
+      timeoutMs,
+      provider: 'gitea',
+      url: apiUrl(base, `/api/v1/users/${encodeURIComponent(login)}`),
+      method: 'GET',
+      headers: { authorization },
+    }));
+  } catch (err) {
+    if (httpErrorResponses.get(err)?.status === 404) return { disabled: false, reason: 'absent' };
+    throw err;
+  }
+
+  await requestJson({
+    fetchImpl,
+    timeoutMs,
+    provider: 'gitea',
+    url: apiUrl(base, `/api/v1/admin/users/${encodeURIComponent(existing.login)}`),
+    method: 'PATCH',
+    headers: { authorization, 'content-type': 'application/json' },
+    body: {
+      login_name: existing.loginName,
+      source_id: existing.sourceId,
+      prohibit_login: true,
+      must_change_password: false,
+    },
+  });
+  return { disabled: true, reason: 'prohibited' };
 }
 
 export async function mintGitlabAccount(options = {}) {

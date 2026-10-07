@@ -38,7 +38,7 @@
 
 - `/docker/<名称>/`（`DATA_ROOT`）是**平台服务自身的持久数据**（`station-db` 的 pg data、`station-edge` 的 acme.json / 动态配置）。它的生命周期、备份口径、属主都跟平台服务绑定（env §6）。
 - `/srv/erix/users/<fde>/` 是**FDE 的私人工作区**，属「用户数据」，与平台服务数据分属两类：
-  1. **生命周期不同**：offboarding 时平台服务数据继续存在，而用户工作区由 portal 按 `ERIX_WORKSPACE_RETENTION_DAYS`（默认 30 天）保留；到期 sweep 安全删除工作区与用户 DB 行，配置 `0` 禁用自动清理（规格 §7.3）。
+  1. **生命周期不同**：offboarding 只停用账号；平台 `users` 行永久保留，workspace 默认不自动清理。只有显式设置 `ERIX_WORKSPACE_RETENTION_DAYS > 0` 才会到期删除 workspace 目录，且不会删除用户或关联 DB 行。
   2. **访问主体不同**：用户空间要被 FDE 容器 bind mount（读/写）；平台服务数据**绝不**挂进 FDE 容器（否则 FDE 可读 pg data / traefik 配置）。
   3. **属主/容量隔离不同**：用户空间按 FDE 分目录、按 FDE 计容量；平台服务数据按服务分目录。
 - 选 `/srv`（FHS：本机提供的服务的数据目录）+ `/erix/users/` 命名空间，语义为「erix 平台服务的用户数据」，与 `/docker/` 平台数据在**顶层就分开**，避免备份脚本/运维误把两者混为一谈。
@@ -151,11 +151,13 @@
 
 **Gitea token scope（issue #148 真机验收）**：代铸 token 使用 `write:user`（在 FDE 本人账号下建仓）、`write:repository`（仓库访问与 push）和 `read:issue`（PR/issue 读取与提 PR）。真实 Gitea 1.27.2、worker UID 1002、使用交付的 tea 配置验收时，`tea pulls create` 报 `token does not have at least one of required scope(s), required=[read:issue], token scope=write:repository,write:user`；在同一实例验证 `read:issue` 与 `write:issue` 两种 scope 组合均成功创建 PR，因此采用最小权限 `read:issue`。**不授予 `write:issue`**：创建 issue、评论等写操作不在当前范围，未来需要时再单独决策。指定 `--owner <组织>` 还需 `write:organization`，当前不授予，未来需要时另行决策。GitLab 当前代铸的 `write_repository` 支持 Git-over-HTTP push，但**不支持 API 认证**；官方 [`glab repo create`](https://docs.gitlab.com/cli/repo/create/) 文档说明该命令创建项目，官方 [token scope 文档](https://docs.gitlab.com/security/tokens/access_token_scopes/)说明 `api` 授予 API 读写、`read_api` 仅读，`write_repository` 不支持 API 认证。官方文档未明确列出该命令的最小 scope；因此现有 impersonation token 的 `write_repository` 足以支持 push、但不足以支持基于 API 的 `glab repo create`，`api` 是文档列出的 API 写 scope。本次不扩大其权限。
 
-**Gitea 已存在账号（issue #148）**：代铸遇到同名账号时复用该账号并重置为新随机口令，再以该口令铸上述 scope 的 token；Gitea 没有管理员代铸 token 的 API，且 token 换 token 返回 401。PATCH 必须带 GET 返回的 `login_name` 与 `source_id`，否则 Gitea 返回 422。#148 真机复验发现，平台通过 `POST /admin/users` 创建且未指定 `login_name` 的账号，GET 会返回 `login_name: ""`，但 PATCH 要求非空 `LoginName`（422 `[LoginName]: Required`），因此 `login_name` 为空或纯空白时改用用户名；`source_id` 仍沿用 GET 值。此分支失败不得删除复用账号。minted 模式下平台持有 Gitea admin key，因而能重置平台代管账号口令；这是该模式的固有能力与预期行为。**offboarding 不删除上游 Gitea 账号**，因此同名 FDE 重建与 token 轮换依赖此复用分支。
+**Gitea 已存在账号（issue #148）**：代铸遇到同名账号时复用该账号并重置为新随机口令，再以该口令铸上述 scope 的 token；Gitea 没有管理员代铸 token 的 API，且 token 换 token 返回 401。PATCH 必须带 GET 返回的 `login_name` 与 `source_id`，否则 Gitea 返回 422。#148 真机复验发现，平台通过 `POST /admin/users` 创建且未指定 `login_name` 的账号，GET 会返回 `login_name: ""`，但 PATCH 要求非空 `LoginName`（422 `[LoginName]: Required`），因此 `login_name` 为空或纯空白时改用用户名；`source_id` 仍沿用 GET 值。此分支失败不得删除复用账号。minted 模式下平台持有 Gitea admin key，因而能重置平台代管账号口令；这是该模式的固有能力与预期行为。**offboarding 不删除上游 Gitea 账号**，因此同名 FDE 重建与 token 轮换依赖此复用分支；复用被停用的账号时必须将 `prohibit_login` 设回 `false`，否则 Gitea 1.27.2 的 Basic auth 会返回 401。
+
+**Offboarding 与保留策略（决策者政策）**：用户下线是永久保留 `users` 行并设为 `disabled`，不删除账号。Gitea `minted` 账号通过管理员 API 设置 `prohibit_login=true` 吊销访问，不删上游用户或 token；员工自行提供的凭据（数据库 `git_hosts.mode='per_fde_pat'`，即用户管理的账号）不触碰，GitLab 上游吊销暂缓。workspace 自动清理默认关闭（`ERIX_WORKSPACE_RETENTION_DAYS=0`）；只有显式正数才启用 sweep，且 sweep 仅删除 workspace 目录，所有用户、Git 绑定、offboarding 与其他 DB 记录继续保留。
 
 Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 的 HOME，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
 
-该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户删除时 portal 尝试删除此文件；失败只告警，不回滚用户删除。
+该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户下线时 portal 尝试删除此文件；失败只告警，不回滚停用。
 
 平台不下发 SSH 私钥：OpenSSH 要求私钥仅属主可读（通常 `0600`），与 worker 通过组权限读取凭据的 `0640` 契约冲突；本契约仅支持 Git HTTPS credential-store 凭据。宿主侧有权访问用户空间的进程仍可读取该明文文件，这是宿主侧残余风险，文件权限不是安全边界。
 

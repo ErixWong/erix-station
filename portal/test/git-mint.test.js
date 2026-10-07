@@ -6,6 +6,7 @@ import {
   mintGitAccount,
   mintGiteaAccount,
   mintGitlabAccount,
+  disableGiteaAccount,
 } from '../src/git-mint.js';
 
 async function withServer(handler, run) {
@@ -89,6 +90,7 @@ async function assertGiteaReuse(loginName, expectedLoginName) {
       assert.equal(call.body.login_name, expectedLoginName);
       assert.equal(call.body.source_id, 0);
       assert.equal(call.body.must_change_password, false);
+      assert.equal(call.body.prohibit_login, false);
       assert.ok(call.body.password.length >= 32);
       return jsonResponse(200, {});
     }
@@ -131,6 +133,75 @@ test('Gitea falls back to username when the existing user login_name is empty', 
 
 test('Gitea falls back to username when the existing user login_name is whitespace', async () => {
   await assertGiteaReuse('  ', 'alice');
+});
+
+test('Gitea offboarding prohibits login using a non-empty fallback login_name', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = {
+      method: options.method,
+      path: new URL(url).pathname,
+      auth: options.headers.authorization,
+      body: options.body ? JSON.parse(options.body) : null,
+    };
+    calls.push(call);
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice') {
+      assert.match(call.auth, /^token gitea-admin-key$/);
+      return jsonResponse(200, { id: 42, login: 'alice', login_name: '  ', source_id: 0 });
+    }
+    if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') {
+      assert.match(call.auth, /^token gitea-admin-key$/);
+      return jsonResponse(200, {});
+    }
+    assert.fail(`unexpected request: ${call.method} ${call.path}`);
+  };
+
+  const result = await disableGiteaAccount({
+    baseUrl: 'https://gitea.example',
+    adminKey: 'gitea-admin-key',
+    login: 'alice',
+    fetchImpl,
+  });
+
+  assert.deepEqual(result, { disabled: true, reason: 'prohibited' });
+  assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
+    'GET /api/v1/users/alice',
+    'PATCH /api/v1/admin/users/alice',
+  ]);
+  assert.deepEqual(calls[1].body, {
+    login_name: 'alice',
+    source_id: 0,
+    prohibit_login: true,
+    must_change_password: false,
+  });
+});
+
+test('Gitea offboarding treats an absent account as an idempotent success', async () => {
+  const paths = [];
+  const result = await disableGiteaAccount({
+    baseUrl: 'https://gitea.example',
+    adminKey: 'gitea-admin-key',
+    login: 'alice',
+    fetchImpl: async (url) => {
+      paths.push(new URL(url).pathname);
+      return new Response('Not Found', { status: 404 });
+    },
+  });
+
+  assert.deepEqual(result, { disabled: false, reason: 'absent' });
+  assert.deepEqual(paths, ['/api/v1/users/alice']);
+});
+
+test('Gitea offboarding surfaces non-404 API failures as GitMintError', async () => {
+  await assert.rejects(
+    disableGiteaAccount({
+      baseUrl: 'https://gitea.example',
+      adminKey: 'gitea-admin-key',
+      login: 'alice',
+      fetchImpl: async () => jsonResponse(503, { message: 'temporarily unavailable' }),
+    }),
+    (err) => err instanceof GitMintError && err.code === 'git_host_request_failed',
+  );
 });
 
 test('Gitea does not delete a reused user when token minting fails', async () => {
