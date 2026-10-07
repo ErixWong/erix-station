@@ -23,7 +23,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
-import { archiveRunData, prepareRunDataDir, sweepRunDataDir } from './lib/run-data.js';
+import { archiveRunData, prepareRunDataDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1152,6 +1152,11 @@ async function heartbeatLoop() {
     const now = Date.now();
     for (const ctx of state.runs.values()) {
       if (!ctx.worker || ctx.finishing) continue;
+      try {
+        touchRunDataDir(CFG.home, ctx.runId);
+      } catch (err) {
+        log('warn', 'run data activity refresh failed', { run_id: ctx.runId, err: String(err?.message ?? err) });
+      }
       const silentMs = now - ctx.lastIpcAt;
       if (silentMs > CFG.watchdogMs) {
         log('warn', 'watchdog: worker silent, killing', {
