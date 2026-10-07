@@ -12,6 +12,7 @@ import path from 'node:path';
 import { ensureDirSafe } from './fsutil.js';
 import { clipTitleFromMessage, sanitizeTitle, AUTO_TITLE_MAX_LEN } from './session-title.js';
 import { getFdeLlmConfig } from './llm.js';
+import { projectSessionMessages } from './session-view.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -217,8 +218,9 @@ export async function createSession(pool, { userId, projectId, title, model, con
 /**
  * GET /api/sessions/:id —— 会话详情 + 消息列表 + last_seq + active_run_id（§4.1 ChatSession 契约）。
  * 消息 keyset 分页（§1.3）：默认/无 cursor 取**最新** limit 条（升序返回）；cursor=更早一批的最小 seq，取 seq < cursor 的最新一批。
+ * includeMessages=false 供 SSE 仅校验 session/last_seq 时使用，避免无用 transcript 读取。
  */
-export async function getSession(pool, { userId, sessionId, limit = 20, messagesCursor }) {
+export async function getSession(pool, { userId, sessionId, limit = 20, messagesCursor, includeMessages = true }) {
   const s = await fetchSession(pool, sessionId, userId);
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [sessionId, n];
@@ -230,30 +232,45 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     params.push(Number(messagesCursor));
     where += ` AND seq < $3`;
   }
-  const msgs = await pool.query(
-    `SELECT id, run_id, seq, role, content, synthetic, attachments, created_at
-       FROM messages WHERE ${where} ORDER BY seq DESC LIMIT $2`,
-    params,
-  );
+  const msgs = includeMessages
+    ? await pool.query(
+      `SELECT id, run_id, seq, role,
+              CASE WHEN synthetic THEN content END AS content,
+              synthetic, attachments, created_at
+         FROM messages WHERE ${where} ORDER BY seq DESC LIMIT $2`,
+      params,
+    )
+    : { rows: [] };
   const hasOlder = msgs.rows.length > n; // 多取的 1 条存在 ⇒ 还有更早消息
   if (hasOlder) msgs.rows.pop();
   msgs.rows.reverse(); // 升序返回
+  const userAnchors = msgs.rows.length > 0
+    ? await pool.query(
+      `SELECT id, run_id, seq, created_at
+         FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`,
+      [sessionId],
+    )
+    : { rows: [] };
+  const transcript = msgs.rows.length > 0
+    ? await pool.query(
+      `SELECT round, dedup_key, record, created_at
+         FROM transcript_rounds WHERE transcript_key = $1
+         ORDER BY round ASC, created_at ASC`,
+      [sessionId],
+    )
+    : { rows: [] };
   const active = await pool.query(
     `SELECT id, status FROM runs WHERE session_id = $1 AND status IN ${ACTIVE_RUN_STATES} ORDER BY queued_at DESC LIMIT 1`,
     [sessionId],
   );
   return {
     session: { ...rowToSession(s), active_run_id: active.rows[0]?.id ?? null },
-    messages: msgs.rows.map((m) => ({
-      id: m.id,
-      run_id: m.run_id,
-      seq: Number(m.seq),
-      role: m.role,
-      content: m.content,
-      synthetic: m.synthetic,
-      attachments: m.attachments ?? [],
-      created_at: m.created_at?.toISOString?.() ?? m.created_at,
-    })),
+    messages: projectSessionMessages({
+      sessionId,
+      anchors: msgs.rows,
+      userAnchors: userAnchors.rows,
+      transcriptRows: transcript.rows,
+    }),
     last_seq: Number(s.last_seq),
     // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
     next_cursor: hasOlder ? Number(msgs.rows[0].seq) : null,
