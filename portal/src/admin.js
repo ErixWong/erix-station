@@ -8,6 +8,7 @@ import * as auth from './auth.js';
 import * as totp from './totp.js';
 import * as projects from './projects.js';
 import { onboardingStatus } from './onboarding.js';
+import { enqueueOffboarding, offboardingStatus, workspaceExists } from './offboarding.js';
 import { removeGitCredentialFile } from './git-credential.js';
 
 export class AdminError extends Error {
@@ -38,6 +39,14 @@ const safeUser = (row) => ({
       last_error: row.onboarding_error,
     })
     : null,
+  offboarding: row.offboarding_state
+    ? offboardingStatus({
+      state: row.offboarding_state,
+      steps: row.offboarding_steps,
+      last_error: row.offboarding_error,
+      workspace_purge_after: row.workspace_purge_after,
+    })
+    : null,
 });
 
 function validatePassword(password, limits = {}) {
@@ -66,9 +75,13 @@ export async function listUsers(pool) {
             sessions.last_login_at,
             (SELECT git_host_id FROM fde_git_accounts a WHERE a.fde_id = users.id) AS git_host_id,
             onboarding.state AS onboarding_state, onboarding.steps AS onboarding_steps,
-            onboarding.last_error AS onboarding_error
+            onboarding.last_error AS onboarding_error,
+            offboarding.state AS offboarding_state, offboarding.steps AS offboarding_steps,
+            offboarding.last_error AS offboarding_error,
+            offboarding.workspace_purge_after
        FROM users
        LEFT JOIN fde_onboarding onboarding ON onboarding.fde_id = users.id
+       LEFT JOIN fde_offboarding offboarding ON offboarding.fde_id = users.id
        LEFT JOIN (
          SELECT user_id, MAX(created_at) AS last_login_at
            FROM login_sessions
@@ -183,11 +196,12 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     throw new AdminError('validation_failed', 'display_name 必须是字符串', { details: { field: 'display_name' } });
   }
 
-  const existing = await pool.query(`SELECT id, login FROM users WHERE id = $1`, [userId]);
+  const existing = await pool.query(`SELECT id, login, fde_name FROM users WHERE id = $1`, [userId]);
   if (!existing.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
   const current = existing.rows[0];
+  const changesFdeName = Object.hasOwn(updates, 'fde_name') && updates.fde_name !== current.fde_name;
 
-  if (Object.hasOwn(updates, 'fde_name') && updates.fde_name != null) {
+  if (changesFdeName && updates.fde_name != null) {
     const duplicate = await pool.query(
       `SELECT 1 FROM users WHERE fde_name = $1 AND id <> $2`,
       [updates.fde_name, userId],
@@ -217,10 +231,13 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
 
   let result;
   try {
+    const offboardingGuard = updates.status === 'active' || changesFdeName
+      ? `AND NOT EXISTS (SELECT 1 FROM fde_offboarding WHERE fde_id = users.id)`
+      : '';
     result = await pool.query(
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
-          WHERE id = $1
+          WHERE id = $1 ${offboardingGuard}
           RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
@@ -239,14 +256,22 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     }
     throw err;
   }
-  if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  if (!result.rows[0]) {
+    const offboarding = updates.status === 'active' || changesFdeName
+      ? await pool.query(`SELECT 1 FROM fde_offboarding WHERE fde_id = $1`, [userId])
+      : { rows: [] };
+    if (offboarding.rows.length > 0) {
+      throw new AdminError('user_offboarding', '用户正在下线或处于保留期，不能重新启用或修改 FDE 名称', { httpStatus: 409 });
+    }
+    throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+  }
   await recordAdminAudit(pool, actorId, 'admin.user_updated', current.login, {
     fields: fields.filter((field) => field !== 'login'),
   });
   return { user: safeUser(result.rows[0]) };
 }
 
-/** 删除用户；活动资源与 run 先 fail closed，登录令牌因 FK 无级联而显式清理。 */
+/** 有 FDE 资源时排队下线并立即禁用；无资源用户保留原有同步删除语义。 */
 export async function deleteUser(pool, { actorId, userId, config, log = console } = {}) {
   if (actorId === userId) {
     throw new AdminError('self_delete', '管理员不能删除自己的账号', { httpStatus: 409 });
@@ -254,54 +279,66 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
 
   let deletedLogin;
   let deletedFdeName;
+  let offboarding = null;
   let client;
   try {
     client = await pool.connect();
     await client.query('BEGIN');
     const target = await client.query(
-      `SELECT id, login FROM users WHERE id = $1 FOR UPDATE`,
+      `SELECT id, login, fde_name FROM users WHERE id = $1 FOR UPDATE`,
       [userId],
     );
     if (!target.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
     deletedLogin = target.rows[0].login;
+    deletedFdeName = target.rows[0].fde_name;
 
-    const onboarding = await client.query(
-      `SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE`,
+    const resources = await client.query(
+      `SELECT (
+         EXISTS (SELECT 1 FROM containers WHERE user_id = $1)
+         OR EXISTS (SELECT 1 FROM fde_networks WHERE fde_id = $1)
+         OR EXISTS (SELECT 1 FROM port_allocations WHERE fde_id = $1)
+         OR EXISTS (SELECT 1 FROM fde_llm_bindings WHERE fde_id = $1)
+         OR EXISTS (SELECT 1 FROM fde_git_accounts WHERE fde_id = $1)
+         OR EXISTS (SELECT 1 FROM fde_onboarding WHERE fde_id = $1)
+         OR EXISTS (SELECT 1 FROM fde_offboarding WHERE fde_id = $1)
+         OR EXISTS (SELECT 1 FROM projects WHERE user_id = $1)
+         OR EXISTS (SELECT 1 FROM chat_sessions WHERE user_id = $1)
+         OR EXISTS (SELECT 1 FROM usage_ledger WHERE user_id = $1)
+         OR EXISTS (SELECT 1 FROM materialize_revisions WHERE fde_id = $1)
+       ) AS has_resources`,
       [userId],
     );
-    if (onboarding.rows[0]?.state === 'running') {
-      throw new AdminError(
-        'user_onboarding_running',
-        '用户开户仍在进行中，请等待开户结束后再删除',
-        { httpStatus: 409 },
+
+    if (resources.rows[0]?.has_resources || workspaceExists(config, deletedFdeName)) {
+      if (!deletedFdeName || !projects.validateFdeName(deletedFdeName).ok) {
+        throw new AdminError('user_fde_name_missing', '有关联资源的用户缺少有效 fde_name，无法安全下线', { httpStatus: 409 });
+      }
+      offboarding = await enqueueOffboarding(client, { fdeId: userId, fdeName: deletedFdeName });
+      await client.query(
+        `UPDATE users SET status = 'disabled', disabled_at = COALESCE(disabled_at, now()) WHERE id = $1`,
+        [userId],
       );
-    }
-
-    const container = await client.query(
-      `SELECT 1 FROM containers WHERE user_id = $1 AND status <> 'removed' LIMIT 1`,
-      [userId],
-    );
-    const activeRun = await client.query(
-      `SELECT 1
-         FROM runs r
-         JOIN chat_sessions s ON s.id = r.session_id
-        WHERE s.user_id = $1 AND r.status IN ('queued', 'running', 'cancelling')
-        LIMIT 1`,
-      [userId],
-    );
-    if (container.rows.length > 0 || activeRun.rows.length > 0) {
-      throw new AdminError(
-        'user_has_active_fde',
-        '用户仍有关联的 FDE 容器或未终结 run，请先完成下线',
-        { httpStatus: 409 },
+      await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
+      await client.query(
+        `UPDATE preview_grants
+            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now()), used_at = NULL
+          WHERE state IN ('active', 'used')
+            AND (user_id = $1 OR issuer_id = $1
+              OR allocation_id IN (SELECT id FROM port_allocations WHERE fde_id = $1))`,
+        [userId],
       );
+    } else {
+      await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM api_tokens WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM preview_grants WHERE user_id = $1 OR issuer_id = $1`, [userId]);
+      await client.query(`UPDATE approvals SET decided_by = NULL WHERE decided_by = $1`, [userId]);
+      await client.query(`UPDATE audit_log SET actor_id = NULL WHERE actor_id = $1`, [userId]);
+      const deleted = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id, fde_name`, [userId]);
+      if (!deleted.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
+      deletedFdeName = deleted.rows[0].fde_name;
     }
-
-    await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
-    await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
-    const deleted = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id, fde_name`, [userId]);
-    if (!deleted.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
-    deletedFdeName = deleted.rows[0].fde_name;
     await client.query('COMMIT');
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
@@ -312,6 +349,13 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
     throw err;
   } finally {
     client?.release();
+  }
+  if (offboarding) {
+    await recordAdminAudit(pool, actorId, 'admin.user_offboarding_started', deletedLogin, {
+      user_id: userId,
+      fde_name: deletedFdeName,
+    });
+    return { ok: true, offboarding };
   }
   if (deletedFdeName) {
     try {

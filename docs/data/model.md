@@ -39,6 +39,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
 | LLM 配置 | `fde_llm_bindings`（模型目录与上游凭据归 LiteLLM；旧 `llm_providers` / `llm_models` 于 migration 0010 改名为 `_retired`） | issue #117 phase 2 |
 | Git host 配置 | `git_hosts` / `fde_git_accounts`（migration 0011） | issue #118（多 Git host、按 host 能力选择代铸或逐 FDE 凭据） |
+| 用户下线 | `fde_offboarding`（migration 0013） | 规格 §7.3 / issue #110 |
 | 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
 | 迁移台账 | `schema_migrations` | deploy-contract.md §3（A6 定稿） |
 
@@ -73,7 +74,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | 关键字段 | 语义 |
 |---|---|
 | `fde_name` / `container_name` | 均唯一；`container_name = fde-<name>`（docker 容器名）。该容器名只在其自己的 `/29` 网络内按 docker DNS 解析（供其自有服务）；portal **不**按容器名/容器 IP 访问它——平台通道全出站经 Traefik（H-B，topology.md §2/§4；`control` 已取消） |
-| `runner_token_hash` / `token_generation` / `revoked_at` / `rotated_at` | per-container token（规格 §10.3 / issue #12）：**仅存哈希**。建容器时生成原文、注入容器 env `ERIX_STATION_TOKEN`；**容器 → portal 单向出示原文**（internal API Bearer），portal 只校验哈希、不再向容器出示。`token_generation` 是代次（轮换/重建 +1），`revoked_at` / `rotated_at` 记录吊销/轮换时刻——旧代次哈希失配 → `401 token_revoked`（原子吊销，topology.md §6 第 9 条）。严禁明文入 DB/日志/镜像/仓库（原理 §5 清单）。**容器除此之外无任何平台凭据，尤其没有 DB 凭据**（D1'） |
+| `runner_token_hash` / `token_generation` / `revoked_at` / `rotated_at` | per-container token（规格 §10.3 / issue #12）：**仅存哈希**。建容器时生成原文、注入容器 env `ERIX_STATION_TOKEN`；**容器 → portal 单向出示原文**（internal API Bearer），portal 只校验哈希、不再向容器出示。`token_generation` 是代次（轮换/重建 +1），`revoked_at` / `rotated_at` 记录吊销/轮换时刻——旧代次哈希失配 → `401 token_revoked`（原子吊销，topology.md §6 第 9 条）。Offboarding 吊销时将 `runner_token_hash` 置 `NULL` 并增加代次（nullable 由 migration 0013 提供）。严禁明文入 DB/日志/镜像/仓库（原理 §5 清单）。**容器除此之外无任何平台凭据，尤其没有 DB 凭据**（D1'） |
 | `status` | `creating / running / stopped / exited / removed`（状态机见 §2.4） |
 | `agent_version` | erix-agent 版本 pin / canary 的记录点（规格 §14 容器升级流程） |
 | `git_provider` | onboarding 选定的 Git host provider（`gitea` / `github` / `gitlab`）；host 详细绑定见 `fde_git_accounts` |
@@ -326,6 +327,17 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 ### 1.27 `fde_git_accounts` — FDE 与远端 Git 账号绑定（issue #118）
 
 每个 FDE 最多绑定一个注册 host；删除 host 前检查本表引用。`token_ref` 是远端 token ID（吊销用），不是 token 内容；`remote_login` 只记远端用户名。`per_fde_pat` 等待管理员设置凭据时两者可空；PAT 内容仅写入 FDE 用户空间 `.git-credentials`，绝不落数据库。设置匹配 host 的凭据后用户状态从 `awaiting_credential` 恢复 `active`。
+
+### 1.28 `fde_offboarding` — FDE 下线任务（issue #110）
+
+由 `deploy/migrations/0013-offboarding.sql` 增量创建；不设到 `users` 的外键，以便 workspace 保留期内保留禁用用户行，任务记录只在 purge 完成后删除。
+
+| 关键字段 | 语义 |
+|---|---|
+| `fde_id` / `fde_name` | 被下线用户的稳定 ID 与名称快照；workspace purge 只使用已完成任务中的名称并经真实路径校验 |
+| `state` / `steps` | `pending → running → done` 或 `failed`；JSONB 保存各个幂等步骤状态，管理员 retry 只重置失败步骤 |
+| `attempt` / `last_error` | 每次 claim 增加尝试次数；最近失败原因用于管理台排障 |
+| `workspace_purge_after` | 下线步骤全部完成后按 `ERIX_WORKSPACE_RETENTION_DAYS`（默认 30）设定；仅到期且 `state='done'` 的行可被 sweep 清理，配置 `0` 禁用自动 purge |
 
 ---
 
