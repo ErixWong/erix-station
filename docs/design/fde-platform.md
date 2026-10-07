@@ -481,12 +481,12 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 ### 9.3 store 适配器（接 erix-agent）
 
-实现 `TranscriptStore`，6 方法：`appendRound / load / recall / saveCheckpoint / loadLatestCheckpoint / markRunState`（`appendCheckpoint` = `saveCheckpoint` 的别名，adapter 两者都接；接口面以 runner-integration §1.3 为准）。
+实现 erix-agent 0.14.0 的 `TranscriptStore`：必需 `appendRound / load`；配对的 `saveRunSnapshot / loadLatestRunSnapshot`、`saveRunState / loadRunState`、`markRunState` 是可选能力。Station adapter 通过 `erix-agent/contract-tests` 校验；详见 runner-integration §9。
 
 四条注意：
 
-1. **checkpoint 必须成对**（save + load）。不成对 → 恢复保护静默失效；成对 → **fail-closed**：工具执行前写失败则抛 `checkpoint_failed`，任务直接失败。
-2. **store adapter 必须包 retry**，并把 `checkpoint_failed` 识别为**可重试**（erix ≤0.3.5 无内建重试）。adapter = 调 portal internal 端点的 HTTP adapter（不直连 DB，D1'/D2'），重试参数见 [runner-integration.md](runner-integration.md) §9.2。
+1. **run snapshot 能力须成对**（`saveRunSnapshot` + `loadLatestRunSnapshot`）。adapter 成对暴露时引擎启用 crash-resume 持久化；写入失败经 adapter retry 后仍抛 `checkpoint_failed`，不会静默降级。
+2. **store adapter 必须包 retry**，并把 `checkpoint_failed` 识别为**可重试**。adapter = 调 portal internal 端点的 HTTP adapter（不直连 DB，D1'/D2'），重试参数见 [runner-integration.md](runner-integration.md) §9.2。
 3. **runId 用 UUID**，不要用 cwd 派生（多用户下会撞）。
 4. `run_events` / 用量 / session 状态**不属于** `TranscriptStore` 契约 → 由 portal 在 internal 端点侧补齐（事件落库与 seq 分配、`last_seq` 推进、`usage_ledger` 记账；agentd 只负责上报，runner-integration §4.2/§7）。
 
@@ -633,7 +633,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 
 宿主组装逻辑（config → provider → store → session → 组装 `runToolLoop` 参数）平台需要自己的一份。原设想「在 erix-agent 抽 `src/session/`（`createSession` / `submit` / `stop` / `history`）发 0.4.0」**不会发生**：上游把会话管理明确列为**永久非目标**——erix-agent `docs/requirements.md` §2「非目标（永远不做）」原文：「❌ agent 人格/skills/会话管理/TUI/MCP」。因此该 P0 **作废删除**（决策者 2026-09，issue #3 评论）。
 
-→ **会话层与宿主组装由本平台实现**：portal（会话 CRUD / 入队 / 状态收敛）+ FDE 容器内 `station-agentd` / `station-runner`（claim / 执行 / 上报）+ DB。对上游的依赖**只剩 run 级接口面**：`runToolLoop` + `TranscriptStore` 接口（6 方法）+ `erix-agent/tools`（jail / file-tools / registry / recall）+ `erix-agent/contract-tests` + `config/*`。
+→ **会话层与宿主组装由本平台实现**：portal（会话 CRUD / 入队 / 状态收敛）+ FDE 容器内 `station-agentd` / `station-runner`（claim / 执行 / 上报）+ DB。对上游的依赖**只剩 run 级接口面**：`runToolLoop` + `TranscriptStore` 接口（`appendRound` / `load` 必需，分层能力可选）+ `erix-agent/tools`（tool registry / providers；jail、file 与 notes 由宿主或 notes 工厂装配）+ `erix-agent/contract-tests` + `config/*`。
 
 完整进程模型、出站协议、store adapter 与 run 生命周期设计见 [`runner-integration.md`](runner-integration.md)。
 

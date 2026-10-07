@@ -1219,32 +1219,64 @@ export async function getSessionLatestCheckpoint(pool, { container, user, key, c
   return { checkpoint: { snapshot: row.snapshot, revision: Number(row.revision), updated_at: row.updated_at } };
 }
 
-/** session 引擎 run state 合并写（saveRunState 全量合并 / markRunState 终态标记仅合并 state 字段）。
+function runStateStatusRecord(statusRecord, hasStatusRecord, runState, key) {
+  if (hasStatusRecord) {
+    if (!statusRecord || typeof statusRecord !== 'object' || Array.isArray(statusRecord)
+        || typeof statusRecord.status !== 'string' || statusRecord.status.length === 0) {
+      throw new InternalError(500, 'run_state_status_corrupt', `run-state status record is malformed (${key})`);
+    }
+    return statusRecord;
+  }
+  if (runState != null && (typeof runState !== 'object' || Array.isArray(runState))) {
+    throw new InternalError(500, 'run_state_status_corrupt', `legacy run-state snapshot is malformed (${key})`);
+  }
+  if (runState && Object.hasOwn(runState, 'state')) {
+    if (typeof runState.state !== 'string' || runState.state.length === 0) {
+      throw new InternalError(500, 'run_state_status_corrupt', `legacy run-state status is malformed (${key})`);
+    }
+    return { status: runState.state };
+  }
+  return null;
+}
+
+/** session 引擎 run state 快照合并写；markRunState 的状态落独立 status 列。
  *  blob 并入 runId = transcript key（reference 语义 = 上游 file store 的 {...state, runId}，
  *  引擎契约 loadRunState(key).runId === key）。不动 runs.status（宿主终态唯一权威仍是 U2，不变式 3）。 */
 export async function saveSessionRunState(pool, { container, user, key, claimToken, writerRunId, body }) {
   let patch;
+  let statusRecord;
   if (body?.run_state !== undefined) {
     if (!body.run_state || typeof body.run_state !== 'object' || Array.isArray(body.run_state)) {
       throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' } });
     }
-    patch = body.run_state;
+    patch = Object.fromEntries(Object.entries(body.run_state).filter(([name]) => name !== 'state'));
   } else if (typeof body?.state === 'string' && body.state) {
-    patch = { state: body.state };
+    statusRecord = { status: body.state, runId: key, ts: new Date().toISOString() };
   } else {
     throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' } });
   }
 
   await fetchSession(pool, key, user.id);
-  await fetchWriterRun(pool, writerRunId, user.id, key);
+  const writerRun = await fetchWriterRun(pool, writerRunId, user.id, key);
   await assertClaimToken(pool, writerRunId, claimToken);
 
-  await pool.query(
-    `UPDATE chat_sessions
-        SET engine_run_state = COALESCE(engine_run_state, '{}'::jsonb) || $2::jsonb
-      WHERE id = $1 AND user_id = $3`,
-    [key, JSON.stringify({ ...patch, runId: key }), user.id],
+  const column = statusRecord ? 'engine_run_state_status' : 'engine_run_state';
+  const value = statusRecord ?? { ...patch, runId: key };
+  const result = await pool.query(
+    `UPDATE chat_sessions s
+        SET ${column} = ${statusRecord ? '$2::jsonb' : "COALESCE(s.engine_run_state, '{}'::jsonb) || $2::jsonb"}
+       FROM runs r, run_queue q
+      WHERE s.id = $1 AND s.user_id = $3
+        AND r.id = $4 AND r.session_id = s.id
+        AND q.run_id = r.id AND q.claim_token = $5 AND q.lease_until > now()
+        AND r.status IN ('queued','running','cancelling')
+      RETURNING s.id`,
+    [key, JSON.stringify(value), user.id, writerRunId, claimToken],
   );
+  if (result.rowCount === 0) {
+    if (isTerminal(writerRun.status)) throw new InternalError(409, 'run_terminal', 'run already terminal');
+    throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
+  }
   return { ok: true };
 }
 
@@ -1260,38 +1292,59 @@ export async function loadSessionRunState(pool, { container, user, key, claimTok
   return { run_state: row.engine_run_state };
 }
 
+/** session 引擎 run-state 终态状态通道；兼容读取旧 engine_run_state.state。 */
+export async function loadSessionRunStateStatus(pool, { container, user, key, claimToken, writerRunId }) {
+  await fetchSession(pool, key, user.id);
+  const writerRun = await fetchWriterRun(pool, writerRunId, user.id, key);
+  if (!isTerminal(writerRun.status)) await assertClaimToken(pool, writerRunId, claimToken);
+
+  const res = await pool.query(
+    `SELECT engine_run_state, engine_run_state_status,
+            engine_run_state_status IS NOT NULL AS has_engine_run_state_status
+       FROM chat_sessions WHERE id = $1`,
+    [key],
+  );
+  const row = res.rows?.[0];
+  const status = runStateStatusRecord(
+    row?.engine_run_state_status, row?.has_engine_run_state_status === true, row?.engine_run_state, key,
+  );
+  return status === null ? null : { status };
+}
+
 // ---------------------------------------------------------------------------
-// runstate（0.9.0 起引擎 8 方法契约：saveRunState/loadRunState，落 runs.run_state jsonb）
+// runstate（run-state snapshot 与终态 status 独立存储）
 // ---------------------------------------------------------------------------
 
 /**
- * 保存/合并引擎 run state（deterministic + semantic，0.6.0+ schema）。
- * body 两种形态：① {run_state: <object>}——saveRunState 全量合并（reference 语义 = 上游 file store
- * 的 previous + state 合并写）；② {state: <string>}——markRunState 引擎终态标记（succeeded /
- * unverified_error / guard_error / failed / aborted），仅合并 state 字段，不触碰 runs.status
- *（宿主终态唯一权威仍是 U2 setRunState，§6.3-9 / 不变式 3）。
+ * body 两种形态：① {run_state: <object>}——saveRunState 快照合并写（不写 state）；
+ * ② {state: <string>}——markRunState 写入 run_state_status 独立列，不触碰 runs.status。
  */
 export async function saveRunState(pool, { container, user, runId, claimToken, body }) {
   let patch;
+  let statusRecord;
   if (body?.run_state !== undefined) {
     if (!body.run_state || typeof body.run_state !== 'object' || Array.isArray(body.run_state)) {
       throw new InternalError(400, 'validation_failed', 'run_state 必须为对象', { details: { field: 'run_state' } });
     }
-    patch = body.run_state;
+    patch = Object.fromEntries(Object.entries(body.run_state).filter(([name]) => name !== 'state'));
   } else if (typeof body?.state === 'string' && body.state) {
-    patch = { state: body.state };
+    statusRecord = { status: body.state, runId, ts: new Date().toISOString() };
   } else {
     throw new InternalError(400, 'validation_failed', 'body 需含 run_state 对象或 state 字符串', { details: { field: 'body' } });
   }
 
-  // runId 并入 blob（reference 语义 = 上游 file store saveRunState 的 {...state, runId}）。
+  // runId 并入快照；status 记录由 markRunState 单独写入。
   // F2（issue #43 评审）：单条条件 UPDATE、写本身原子——非终态 + 属主 + 有效租约/claim 全部进
   // WHERE（口径同 setRunState markRunning 的 CAS），0 行才二次分类错误（fetchRun 补 404/403，
   // 终态 → run_terminal，否则 lease_lost）。杜绝 check-then-update 竞态：租约过期/re-claim 后
   // 旧 worker 的迟到写不可能覆盖新 worker 的 run_state。
+  const assignment = statusRecord
+    ? 'run_state_status = $4::jsonb'
+    : "run_state = COALESCE(r.run_state, '{}'::jsonb) || $4::jsonb";
+  const value = statusRecord ?? { ...patch, runId };
   const res = await pool.query(
     `UPDATE runs r
-        SET run_state = COALESCE(r.run_state, '{}'::jsonb) || $4::jsonb
+        SET ${assignment}
        FROM run_queue q, chat_sessions s
       WHERE r.id = $1
         AND r.session_id = s.id
@@ -1300,7 +1353,7 @@ export async function saveRunState(pool, { container, user, runId, claimToken, b
         AND q.claim_token = $2
         AND q.lease_until > now()
         AND r.status IN ('queued','running','cancelling')`,
-    [runId, claimToken, user.id, JSON.stringify({ ...patch, runId })],
+    [runId, claimToken, user.id, JSON.stringify(value)],
   );
   if (res.rowCount === 0) {
     const run = await fetchRun(pool, runId, user.id); // 404/403 在此抛
@@ -1319,6 +1372,23 @@ export async function loadRunState(pool, { container, user, runId, claimToken })
   const row = res.rows?.[0];
   if (!row || row.run_state == null) return null;
   return { run_state: row.run_state };
+}
+
+/** 读取引擎 run-state status；兼容回退到旧 run_state.state。 */
+export async function loadRunStateStatus(pool, { container, user, runId, claimToken }) {
+  const run = await fetchRun(pool, runId, user.id);
+  if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
+
+  const res = await pool.query(
+    `SELECT run_state, run_state_status, run_state_status IS NOT NULL AS has_run_state_status
+       FROM runs WHERE id = $1`,
+    [runId],
+  );
+  const row = res.rows?.[0];
+  const status = runStateStatusRecord(
+    row?.run_state_status, row?.has_run_state_status === true, row?.run_state, runId,
+  );
+  return status === null ? null : { status };
 }
 
 // ---------------------------------------------------------------------------

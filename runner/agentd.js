@@ -440,9 +440,8 @@ function resolveRunCwd(run) {
 // ---------------------------------------------------------------------------
 // store_request → internal 端点映射（§9.1；issue #81 P2 起 session 维度）
 // ---------------------------------------------------------------------------
-// transcript key = ctx.sessionId（引擎 store key，worker 以它调用 8 方法并自检与 RUN_START 一致）。
-// P2 起七个方法（appendRound/load/saveCheckpoint/loadLatestCheckpoint/saveRunState/loadRunState/
-// markRunState 终态标记）走新 session 端点 `/transcript/:key/...`；writer fencing = 真 runId 经
+// transcript key = ctx.sessionId（引擎 store key，worker 以它调用 TranscriptStore 方法并自检）。
+// P2 起 transcript、快照、run-state/status 方法走新 session 端点 `/transcript/:key/...`；writer fencing = 真 runId 经
 // ?run_id= query 参数 + X-Claim-Token（portal 校验 writer run 属于该 session 且持有效租约）。
 // markRunState('running') 仍走 U2 真 runId（runs 表生命周期，sessionId 绝不进 U2）。
 // 旧 portal（ctx.sessionId = null）→ 全部回退 run 作用域旧端点（向后兼容，语义 = main 现状）。
@@ -515,8 +514,7 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
     case 'markRunState': {
       // 双路语义（issue #81 P2，容易错）：
       // 'running' → U2 /runs/:真runId/state（runs 表生命周期，sessionId 绝不进 U2）；
-      // 引擎终态标记（succeeded/unverified_error/guard_error）→ session transcript runstate
-      // 合并写（键 = args.runId = sessionId，writer fencing = 真 runId）。
+      // 引擎状态（含终态）→ session run-state status 通道（键 = args.runId = sessionId）。
       const state = args?.state ?? 'running';
       if (state === 'running' || !sessionKey) {
         const endpoint = state === 'running' ? 'state' : 'runstate';
@@ -534,7 +532,7 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
       return r.data;
     }
     case 'saveRunState': {
-      // 0.6.0 起引擎持久化确定性 run state（run 前 fail-closed 校验 8 方法之一）。
+      // run-state 快照与终态 status 分通道；快照方法属于可选的 TranscriptStore 分层能力。
       const runState = args?.runState ?? {};
       if (sessionKey) {
         const key = assertSessionKey(ctx, args);
@@ -570,35 +568,50 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
       log('info', 'store loadRunState', { run_id: runId, restored: r?.data?.run_state != null });
       return r.data; // {run_state} 或 204 → null
     }
-    case 'saveCheckpoint': {
+    case 'loadRunStateStatus': {
+      if (sessionKey) {
+        const key = assertSessionKey(ctx, args);
+        const r = await withRetry(
+          () => request('GET', `/transcript/${encodeURIComponent(key)}/runstate/status${writerQs}`, { claimToken: ctx.claimToken }),
+          { what: `loadRunStateStatus key=${key}` },
+        );
+        return r.data; // {status:{status,...}}；无状态时 204 → null
+      }
+      const r = await withRetry(
+        () => request('GET', `/runs/${runId}/runstate/status`, { claimToken: ctx.claimToken }),
+        { what: `loadRunStateStatus run=${runId}` },
+      );
+      return r.data;
+    }
+    case 'saveRunSnapshot': {
       const revision = Number(args?.revision ?? 0);
       const snapshot = args?.snapshot ?? {};
       if (sessionKey) {
         const key = assertSessionKey(ctx, args);
         const r = await withRetry(
           () => request('PUT', `/transcript/${encodeURIComponent(key)}/checkpoint${writerQs}`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
-          { what: `saveCheckpoint key=${key} rev=${revision}` },
+          { what: `saveRunSnapshot key=${key} rev=${revision}` },
         );
         return r.data;
       }
       const r = await withRetry(
         () => request('PUT', `/runs/${runId}/checkpoint`, { body: { revision, snapshot }, claimToken: ctx.claimToken }),
-        { what: `saveCheckpoint run=${runId} rev=${revision}` },
+        { what: `saveRunSnapshot run=${runId} rev=${revision}` },
       );
       return r.data;
     }
-    case 'loadLatestCheckpoint': {
+    case 'loadLatestRunSnapshot': {
       if (sessionKey) {
         const key = assertSessionKey(ctx, args);
         const r = await withRetry(
           () => request('GET', `/transcript/${encodeURIComponent(key)}/checkpoint/latest${writerQs}`, { claimToken: ctx.claimToken }),
-          { what: `loadLatestCheckpoint key=${key}` },
+          { what: `loadLatestRunSnapshot key=${key}` },
         );
         return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
       }
       const r = await withRetry(
         () => request('GET', `/runs/${runId}/checkpoint/latest`, { claimToken: ctx.claimToken }),
-        { what: `loadLatestCheckpoint run=${runId}` },
+        { what: `loadLatestRunSnapshot run=${runId}` },
       );
       return r.data; // {checkpoint:{snapshot,revision,updated_at}} 或 204 → null
     }

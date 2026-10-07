@@ -105,9 +105,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `id` | **portal 生成的 UUID**，随任务下发给容器；禁止 cwd 派生（规格 §9.3-3：多用户会撞） |
 | `status` | 状态机见 §2.1 |
-| `termination` | run 结束时由 `runToolLoop` 返回值透传：**对象** `{reason, detail?}` jsonb，`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, reflection_stop, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed}`（0.9.0 起新增 `final_guard_unverified`：finalGuard 修订重试耗尽 fail-closed，host-consumer-contract.md「Final-answer verification」；依据：erix-agent v0.9.0；portal.md §4.1/§5.3）；运行中为 `NULL` |
+| `termination` | run 结束时由 `runToolLoop` 返回值透传：**对象** `{reason, detail?}` jsonb，当前 0.14.0 `reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed}`（依据：`erix-agent/src/loop/orchestrator.js` termination typedef；`final_guard_unverified` 表示 finalGuard 修订重试耗尽 fail-closed）；历史数据可能保留旧版 `reflection_stop`；运行中为 `NULL` |
 | `usage` / `cost` | `usage` 为 `{input_tokens, output_tokens}` jsonb（run_end 汇总）；`cost` ⚠️ 待决策者确认（Q1/Q4，P1 可空，见 §5） |
-| `run_state` | 引擎确定性 run state（0.9.0 八方法契约 `saveRunState`/`loadRunState`，issue #43；DDL：`deploy/migrations/0003-run-state.sql`，**baseline 已冻结故不写入 schema.sql**）；合并写（`COALESCE(run_state,'{}') || patch`），`markRunState` 终态标记只并 `state` 字段（`succeeded`/`unverified_error`/`guard_error`/`failed`/`aborted`）；`runs.status` 终态仍由 U2 收敛，本列是引擎侧断点/恢复事实（不变式 3） |
+| `run_state` | 引擎 run-state 快照（0.14.0 `saveRunState` / `loadRunState` 可选能力；DDL：`deploy/migrations/0003-run-state.sql`，**baseline 已冻结故不写入 schema.sql**）；合并写时剔除顶层 `state`。终态由 `markRunState` 写入独立 `run_state_status`（migration `0014-run-state-status.sql`），而非快照；`loadRunStateStatus` 先读新状态列，若缺失则兼容读取 legacy 快照 `state`（不回填），损坏状态抛错。`runs.status` 终态仍由 U2 收敛，本列是引擎侧断点/恢复事实（不变式 3）。会话作用域对应列为 `chat_sessions.engine_run_state` 与 `engine_run_state_status` |
 | `error` | 失败时为 `{code, message, retryable}`；run 级错误码见 portal.md §6.4（`rate_limited` / `checkpoint_failed` / `container_exited` / …） |
 | `cancel_requested_at` | 停止标记：portal 写、runner 轮询（`AbortController` 跨不了进程，规格 §10.3） |
 
@@ -138,11 +138,11 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 见 §3。`UNIQUE(run_id, round)`。**`record` jsonb 存上游 RoundRecord 全量原样，是全量真相**——store 的 `load()` 原样返回它（resume / fold 的输入）；`messages` / `folded` / `folded_payload` 是**派生/加速列**，供 SQL 查询与 UI 使用（决策者 2026-09，D2' 对齐；上游 RoundRecord 形状见 runner-integration §9.1）。fold 只影响视图，**档案完整不删**（规格 §9.2）；fold 后原轮 `UPDATE`（`folded=true` + `folded_payload`），不插新行（runner-integration §9.3）。写入方 = portal internal 端点（`PUT .../transcript/rounds/:round`，按 round 幂等 + `dedupKey` 双保险）；runner 侧是 HTTP adapter 调用方，不直连 DB。
 
-### 1.11 `run_checkpoints` — checkpoint（fail-closed 的落点）
+### 1.11 `run_checkpoints` — run snapshot（crash-resume 的落点）
 
-**每 run 一行**（`run_id` 即主键）：上游 store 的 `saveCheckpoint` 是**覆盖写单份**（tmp+rename 原子覆盖）、`loadLatestCheckpoint(runId)` 无参数（依据：erix-agent v0.3.5 `src/store/file.js:279-297`，已 grep 复核）。写入语义 = `INSERT ... ON CONFLICT (run_id) DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9）。**必须成对**（save + load）：工具执行前写失败 → `checkpoint_failed`，任务直接失败（规格 §9.3-1）；HTTP adapter 必须包 retry 且识别其为可重试（规格 §9.3-2，runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
+**每 transcript key 一行**（run 模式以 run 为 key，session 模式以 session 为 key）：erix-agent 0.14.0 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 是**latest-only 覆盖读写**。写入语义 = `INSERT ... ON CONFLICT ... WHERE run_checkpoints.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9）。这组 optional snapshot 能力成对实现时提供 crash-resume；写失败经 HTTP adapter retry 后仍抛 `checkpoint_failed`（runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
 
-**单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 run 的**单调版本号**。worker 每 run 从 0 起递增；portal 端 `DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume（方案 B re-claim）时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker 从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
+**单调性（revision CAS，issue #8）**：`revision bigint NOT NULL DEFAULT 0` 是每 transcript key 的**单调版本号**。worker 每实例从 0 起递增；portal 端 `DO UPDATE ... WHERE run_checkpoints.revision < EXCLUDED.revision`——**旧 revision 的覆盖写被拒（0 行更新 → `409 checkpoint_stale`）**，解决「延迟到达的旧快照覆盖新快照」。resume 时 worker 经 U9 读回当前 `revision`，继续从 `revision+1` 起计，避免新 worker从 0 起计被 CAS 误拒。`seq` 仍是**调用方本地元数据、不落库**（其值在数值上可等于 revision，但不具权威性；runner-integration §9.5）。
 
 ### 1.12 `run_events` — 第③层：流式事件日志
 
@@ -364,7 +364,7 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
    （例外 A2：容器已死 + cancelling → portal（reaper）收敛 finished/aborted，绝不回 pending 续跑）
 ```
 
-> UI 上「已取消」是**宿主展示态**：由 `cancel_requested_at` + `termination.reason='aborted'` 推导，不是引擎的 termination 取值（引擎 reason 集合见 §1.7，依据：erix-agent v0.3.5 `src/loop.js:622`/`712`）。
+> UI 上「已取消」是**宿主展示态**：由 `cancel_requested_at` + `termination.reason='aborted'` 推导，不是独立的引擎 termination 值（当前引擎 reason 集合见 §1.7）。
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
@@ -567,7 +567,7 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 |---|---|---|
 | `run_events` | **热保留，当前不删除**。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记 | 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
-| `run_checkpoints` | **每 run 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestCheckpoint` 无参数、只读最新（唯一消费者），覆盖写天然无积累 |
+| `run_checkpoints` | **每 transcript key 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestRunSnapshot` 只读最新（唯一消费者），覆盖写天然无积累 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
 | `usage_ledger` / `audit_log` | 永久保留，只追加 | 记账与审计语义（规格 §14 看板/对账）；量小（每 run 数行 / 每请求一行） |
 | `port_allocations`（released） | reaper 定期硬删 `released_at` 过期的记录（规格 §8.2） | 历史归属信息已由 `audit_log`（`port.allocate` / `port.release` 动作）承载 |
