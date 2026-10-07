@@ -95,6 +95,8 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **③** | **UI 一律显示 `record` 全量**；`folded`/`foldedPayload` **只作用于模型上下文**（上下文节流），不作为展示内容 | 决策者原话「折叠的是上下文，显示的是历史消息」 |
 | **④** | **不做老数据兼容**：无 transcript 的旧会话（P2 迁移前产生、只有 `messages` 行）**清理**；代码**不留 `messages` 兜底读分支** | 决策者原话「清理掉好了，按新的来」；上线前的会话不保证可读 |
 
+用户消息的投影归属也必须确定性：`<sessionId>:input:<messageId>` 按 message ID 精确映射；其它 transcript 行（无论是否带 `run_id`）取 `record.messages` 末条 user 文本，与同 session 尚未认领的非合成 user 锚点按 `seq` 升序精确匹配，认领第一个相同文本。没有精确匹配就留空；不得因行的 `run_id`、时间/位置顺序或 `messages` 锚点内容推测归属。助手文本仍按 run 归组：显式 `run_id` 行使用该 ID，session-scoped 行沿用 transcript 分段得到的 run。
+
 ### 落点与可替换性
 
 - **投影逻辑收敛到单一模块**（如 `portal/src/session-view.js`），读路径只经它 —— 上游若提供官方 `projectTranscriptForDisplay`（#95），**直接替换该模块并删除自研部分**。
