@@ -92,14 +92,28 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 |---|---|---|
 | **①** | **portal 在 POST 消息的事务内直写 session transcript**（沿用既有幂等键 `dedupKey = <sessionId>:input:<messageId>`）；**删除 runner 的「预写入」分支** | 现在 portal 先写 `messages` + 入队、runner 领活后才补写 transcript → 中间有窗口（消息已可见、transcript 未落）→ 断层 → 只能靠文本注入兜底。写入时机提前到消息落库那一刻，写入方由 runner 改为 portal（portal 本就是 DB 权威，无需经 S2 writer 租约端点） |
 | **②** | 消息列表**读时从 transcript 派生**（投影）：`id` 按确定性规则生成（刷新前后稳定）、`seq` 沿用现有 `chat_sessions.last_seq` 分配器（与 `run_events` 共用序列）、`attachments`/`run` 归属留在 `messages` **锚点行**；**内容不再双写**、**不引入物化表/缓存**（实测慢再议） | 重叠的只是「文本内容」；`messages` 独占的是 UI 元数据（seq/附件/run 归属），transcript 独占的是协议细节（工具调用、推理、结构化 parts、折叠状态）。让重叠部分单一来源、非重叠部分各留各的 → 结构上不可能再分叉 |
-| **③** | **UI 一律显示 `record` 全量**；`folded`/`foldedPayload` **只作用于模型上下文**（上下文节流），不作为展示内容 | 决策者原话「折叠的是上下文，显示的是历史消息」 |
+| **③** | **UI 一律显示 `record` 全量**；`folded`/`foldedPayload` **只作用于模型上下文**（上下文节流），不作为展示内容（PR②b 细化：「record 全量」= 官方投影给的展示字段，`foldedPayload` 按官方规则只展示「摘要 + 范围 + 导航指针」） | 决策者原话「折叠的是上下文，显示的是历史消息」 |
 | **④** | **不保留读时老数据兼容分支**：一次性增量迁移为缺少 transcript 文本证据的历史 user message 补 `:input:<messageId>` 行；**不删除旧会话**，投影代码不读 `messages.content` 兜底 | 真机证据表明删除会丢失仍需展示的数据；迁移只增不改，既保留旧对话，又允许移除投影兜底 |
 
-用户消息的投影归属也必须确定性：`<sessionId>:input:<messageId>` 按 message ID 精确映射，优先于文本匹配；其它 transcript 行（无论是否带 `run_id`）按 `record.messages` 顺序遍历全部 user 文本，与同 session 尚未认领的非合成 user 锚点按 `seq` 升序精确匹配，认领第一个相同文本。按文本分组的锚点队列使用单调游标，避免每条候选反复扫描全部锚点。没有精确匹配就留空；不得因行的 `run_id`、时间/位置顺序或 `messages` 锚点内容推测归属。助手文本仍按 run 归组：显式 `run_id` 行使用该 ID，session-scoped 行沿用 transcript 分段得到的 run。
+用户消息的投影归属也必须确定性：`<sessionId>:input:<messageId>` 按 message ID 精确映射（PR②b 后判据 = 官方投影带出的 `meta.dedupKey`，DB `dedup_key` 列与 record 内字段任一存在即生效），**一旦命中就不再参与文本匹配**；其它 transcript 行（无论是否带 `run_id`）按投影输出顺序遍历其 user 文本（`meta.synthetic` 的注入文本排除在外，引擎注入不得抢认真实用户锚点），与同 session 尚未认领的非合成 user 锚点按 `seq` 升序精确匹配，认领第一个相同文本。按文本分组的锚点队列使用单调游标，避免每条候选反复扫描全部锚点。没有精确匹配就留空；不得因行的 `run_id`、时间/位置顺序或 `messages` 锚点内容推测归属。助手文本仍按 run 归组：显式 `run_id` 行使用该 ID，session-scoped 行沿用 transcript 分段得到的 run（单 run 会话兜底，见 PR②a/#81）。
 
 ### 落点与可替换性
 
-- **投影逻辑收敛到单一模块**（如 `portal/src/session-view.js`），读路径只经它 —— 上游若提供官方 `projectTranscriptForDisplay`（#95），**直接替换该模块并删除自研部分**。（上游 0.15.0 已交付该 API；接线属 PR②b，本 PR 未动读路径。）
+- **投影逻辑收敛到单一模块** `portal/src/session-view.js`，读路径只经它。**读侧已换上游官方投影（#95 闭环）**：
+  「文本 / blocks / reasoning / 折叠」的推导自 PR②b 起由 `erix-agent` 0.15.0 的
+  `projectTranscriptForDisplay(records)`（`docs/host-consumer-contract.md` → "Host display projection"）提供，
+  **自研部分只剩锚点元数据映射**。官方投影不承担、仍由 station 承担的三条规则：
+  ① **锚点元数据**（`id`/`seq`/`run_id`/`attachments`/`synthetic`/`created_at` 取自 `messages` 锚点行——引擎没有「消息行」概念）；
+  ② **助手文本的 run 归属**（投影输出不带 `run_id`，而 UI 的助手气泡必须落到某个 run：显式 `run_id` 列 → 该 run、
+  session-scoped 行沿用 transcript 分段、单 run 会话兜底）；
+  ③ **非 `:input:` 行的 user 锚点认领**（引擎轮记录带的是**轮级** dedupKey、没有 messageId，崩溃 run 的用户文本又只存在于
+  后续 run 的历史快照里 → 这类行仍按「内容精确相等」认领；带 `<sessionId>:input:<messageId>` 的行一律用
+  `meta.dedupKey` 精确映射，不再参与内容匹配）。
+  按官方契约，**投影输出形状是稳定契约面**（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`folded`/`round`/`ts`/`meta`），
+  `RoundRecord` 内部字段不是 → 本模块不再读 `messages`/`response`/`foldedPayload` 的结构；未知 `meta` 键忽略。
+  展示口径的两点细化：`reasoning` 与正文分离（不进 DTO `content`）；折叠轮按官方规则展示
+  「摘要 + 范围 + 导航指针」，`foldedPayload` 原文不进对话流（DTO 是锚点驱动的、没有可承载官方 system 折叠行的锚点，
+  故折叠摘要只在该 run 无自身助手正文时顶上——与契约 ③「显示的是历史消息」一致）。
 - **写侧（契约①）实现分工已换到引擎 API**（erix-agent 0.15.0 `appendUserTurn`，上游 #97 闭环）：POST 事务内的预写由引擎承担 round 推导、dedupKey 生成、record 形态与幂等判据；station 只提供极小 store 适配器 `portal/src/transcript-store.js`（`load`/`appendRound` 复用调用方事务 client，落库列形态与原手搋时代逐列等价，「先写 transcript 再入队」顺序不变）。幂等主判据从 DB `ON CONFLICT` 换为引擎按 dedupKey 的 load 判据（顺序重放），`ON CONFLICT` 保留作并发最后防线（同 key 并发由 session `FOR UPDATE` 串行化，满足引擎「在接收事务内发起」的前提）。
 - 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧由 portal 先提交 session transcript、worker 再 resume 的多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛，0.15.0 后由 `appendUserTurn` 承接）。
 
@@ -110,6 +124,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退）；带**过渡兜底**：当前写路径尚未把用户输入落入 transcript 时，缺少可派生内容的锚点暂回退到自身内容 | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
 | **②a 先落树再入队（本 PR）** | portal POST 事务内写 session transcript；删 runner 预写入分支；新增 0015 一次性回填历史 user 输入；删除 PR① 投影内容兜底 | 根 `npm test`、前端 typecheck/vitest；真机由主 agent 验证同 session 多轮、崩溃 resume 与 transcript/投影等价性（所有非合成消息内容有 transcript 证据且非空） |
 | **②b 停内容双写与切换数据源** | `messages` 降级为锚点行（停止写 `content`）；终态幂等比较从 `messages.final_text` 换到 transcript；AI 标题首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3a`/`wp3b`/`wp5` e2e |
+| **②b-读侧（已完成，`feat-261008-11-display-projection`）** | 读侧文本/blocks/reasoning/折叠推导改由上游官方 `projectTranscriptForDisplay` 提供（#95 闭环），自研只剩锚点元数据映射；删除 PR① 的内容匹配用于 `:input:` 行的分支（改 `meta.dedupKey` 精确映射） | 根 `npm test`（0 失败）、前端 `vue-tsc` + vitest（272 项）；真机全库等价性由主 agent 复验 |
 | **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径） | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
 
 > **过渡兜底、回填决策与实测依据**：PR① 过渡兜底曾命中 30 次。真机全库检查发现 64 个会话中仅 2 个有 `:input:<messageId>` 行；抽查会话 `d86dda63-fc52-481c-9994-65ff29cb5eee` 的用户文本在整份 transcript 的 `record::text` 检索为 0 命中。原因是旧 POST 写路径只写 `messages`，未写 transcript。选择迁移 0015 回填而非删除旧会话，以保留历史数据并让旧会话继续渲染；回填只 INSERT、可幂等重放，随后删除投影兜底，缺证据内容留空。
