@@ -95,6 +95,8 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **③** | **UI 一律显示 `record` 全量**；`folded`/`foldedPayload` **只作用于模型上下文**（上下文节流），不作为展示内容 | 决策者原话「折叠的是上下文，显示的是历史消息」 |
 | **④** | **不做老数据兼容**：无 transcript 的旧会话（P2 迁移前产生、只有 `messages` 行）**清理**；代码**不留 `messages` 兜底读分支** | 决策者原话「清理掉好了，按新的来」；上线前的会话不保证可读 |
 
+用户消息的投影归属也必须确定性：`<sessionId>:input:<messageId>` 按 message ID 精确映射，优先于文本匹配；其它 transcript 行（无论是否带 `run_id`）按 `record.messages` 顺序遍历全部 user 文本，与同 session 尚未认领的非合成 user 锚点按 `seq` 升序精确匹配，认领第一个相同文本。按文本分组的锚点队列使用单调游标，避免每条候选反复扫描全部锚点。没有精确匹配就留空；不得因行的 `run_id`、时间/位置顺序或 `messages` 锚点内容推测归属。助手文本仍按 run 归组：显式 `run_id` 行使用该 ID，session-scoped 行沿用 transcript 分段得到的 run。
+
 ### 落点与可替换性
 
 - **投影逻辑收敛到单一模块**（如 `portal/src/session-view.js`），读路径只经它 —— 上游若提供官方 `projectTranscriptForDisplay`（#95），**直接替换该模块并删除自研部分**。
@@ -104,9 +106,11 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 
 | PR | 内容 | 验收 |
 |---|---|---|
-| **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退） | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
-| **②停内容双写 + 先落树再入队** | portal POST 事务内写 transcript；删 runner 预写入分支；终态幂等比较从 `messages.final_text` 换到 transcript；`messages` 降级为锚点行（不再写 `content`） | 根 `npm test`、`wp3a`/`wp3b`/`wp5` e2e；真机：同 session 多轮 + 崩溃 resume 不丢会话 |
+| **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退）；带**过渡兜底**：当前写路径尚未把用户输入落入 transcript 时，缺少可派生内容的锚点暂回退到自身内容 | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
+| **②停内容双写 + 先落树再入队** | portal POST 事务内写 transcript；删 runner 预写入分支；终态幂等比较从 `messages.final_text` 换到 transcript；`messages` 降级为锚点行（不再写 `content`）；**删除 PR① 过渡兜底** | 根 `npm test`、`wp3a`/`wp3b`/`wp5` e2e；真机：同 session 多轮 + 崩溃 resume 不丢会话；等价性检查断言 `fallbackCount === 0` |
 | **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径）；AI 标题的首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
+
+> **过渡兜底与实测依据**：兜底存在的唯一原因是当前写路径尚未把用户输入落进 transcript，正是 PR②「先落树再入队」要修复的问题；PR① 以 `fallbackCount` 观测命中数，PR② 必须删除兜底并以命中数为 0 验收。真机全库检查发现 64 个会话中仅 2 个有 `:input:<messageId>` 行；抽查会话中用户文本在整份 transcript 的 `record::text` 检索为 0 命中。
 
 ### 待决策（UI 轮号口径，遗留项）
 

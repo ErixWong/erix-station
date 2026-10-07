@@ -40,21 +40,6 @@ function timestamp(value) {
   return Number.isFinite(time) ? time : null;
 }
 
-function latestUserAnchorAt(userAnchors, time, runId = null) {
-  if (time === null) return null;
-  let latest = null;
-  for (const anchor of userAnchors) {
-    const createdAt = timestamp(anchor.created_at);
-    if (
-      anchor.run_id
-      && (runId === null || anchor.run_id === runId)
-      && createdAt !== null
-      && createdAt <= time
-    ) latest = anchor;
-  }
-  return latest;
-}
-
 function assistantText(record) {
   const responseText = textFromContent(record?.response?.content);
   if (responseText) return responseText;
@@ -63,6 +48,24 @@ function assistantText(record) {
   const lastAssistant = messages.findLast((message) => message?.role === 'assistant');
   const messageText = textFromContent(lastAssistant?.content);
   return messageText || null;
+}
+
+function userTexts(record) {
+  const messages = Array.isArray(record?.messages) ? record.messages : [];
+  return messages
+    .filter((message) => message?.role === 'user')
+    .map((message) => textFromContent(message?.content));
+}
+
+function claimUserAnchor(text, anchorsByText, claimedUserAnchors) {
+  const queue = anchorsByText.get(text);
+  if (!queue) return null;
+
+  while (queue.cursor < queue.anchors.length) {
+    const anchor = queue.anchors[queue.cursor++];
+    if (!claimedUserAnchors.has(String(anchor.id))) return anchor;
+  }
+  return null;
 }
 
 function compareTranscriptRows(a, b) {
@@ -82,49 +85,86 @@ function compareTranscriptRows(a, b) {
 export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows }) {
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
+  const userAnchorsByText = new Map();
+  // Text buckets stay seq-ordered; monotone cursors make each candidate O(1) amortized
+  // instead of rescanning all user anchors for every message in historical snapshots.
+  for (const anchor of users) {
+    if (anchor.synthetic === true || typeof anchor.anchor_text !== 'string') continue;
+    let queue = userAnchorsByText.get(anchor.anchor_text);
+    if (!queue) {
+      queue = { anchors: [], cursor: 0 };
+      userAnchorsByText.set(anchor.anchor_text, queue);
+    }
+    queue.anchors.push(anchor);
+  }
   const runIds = new Set([
     ...users.map((anchor) => anchor.run_id),
     ...anchors.map((anchor) => anchor.run_id),
   ].filter((runId) => typeof runId === 'string' && runId.length > 0));
   const userContent = new Map();
+  const claimedUserAnchors = new Set();
   const assistantContent = new Map();
   let currentRunId = null;
 
-  // Query order follows round, then created_at. Same-round prewrites therefore form
-  // an unambiguous boundary between runs even though current station keys are session-scoped.
   for (const row of [...transcriptRows].sort(compareTranscriptRows)) {
     const record = row.record;
     const keys = recordKeys(row, record);
-    const isSeed = keys.some((key) => key.endsWith(':seed'));
     const messageId = inputMessageId(keys, sessionId);
+    const candidateUserTexts = userTexts(record);
+    const lastUserText = candidateUserTexts.at(-1) ?? null;
+    let matchedUserAnchor = null;
+
+    // Snapshot rows can end at an earlier turn; run_id alone does not establish user ownership.
     if (messageId !== null) {
-      const anchor = userById.get(messageId);
-      currentRunId = anchor?.run_id ?? null;
-      const messages = Array.isArray(record?.messages) ? record.messages : [];
-      const lastUser = messages.findLast((message) => message?.role === 'user');
-      const text = textFromContent(lastUser?.content);
-      if (anchor && text !== null) userContent.set(String(anchor.id), text);
+      matchedUserAnchor = userById.get(messageId) ?? null;
+      if (
+        matchedUserAnchor
+        && matchedUserAnchor.synthetic !== true
+        && lastUserText !== null
+        && lastUserText !== ''
+        && !claimedUserAnchors.has(String(matchedUserAnchor.id))
+      ) {
+        const anchorId = String(matchedUserAnchor.id);
+        claimedUserAnchors.add(anchorId);
+        userContent.set(anchorId, lastUserText);
+      }
+    } else {
+      for (const userText of candidateUserTexts) {
+        if (userText === null || userText === '') continue;
+        const candidate = claimUserAnchor(userText, userAnchorsByText, claimedUserAnchors);
+        if (candidate) {
+          matchedUserAnchor = candidate;
+          const anchorId = String(candidate.id);
+          claimedUserAnchors.add(anchorId);
+          userContent.set(anchorId, userText);
+        }
+      }
+    }
+
+    if (typeof row.run_id === 'string' && row.run_id.length > 0) {
+      if (lastUserText !== null) currentRunId = row.run_id;
+      const text = assistantText(record);
+      if (text) assistantContent.set(row.run_id, text);
       continue;
     }
 
-    // Prefer an explicit execution run id when present. Station's current worker passes
-    // the session transcript key to runToolLoop, so engine records otherwise inherit the
-    // most recent input marker; the first seed is associated by its persisted timestamp.
+    if (messageId !== null) {
+      currentRunId = matchedUserAnchor?.run_id ?? null;
+      continue;
+    }
+
     const keyedRunId = recordRunId(keys, runIds);
     if (keyedRunId !== null) {
       currentRunId = keyedRunId;
-    } else if (isSeed && isSessionRound(keys, sessionId) && currentRunId === null) {
-      currentRunId = latestUserAnchorAt(users, timestamp(row.created_at))?.run_id ?? null;
-    } else if (!isSessionRound(keys, sessionId)) {
+    }
+
+    const isSeed = keys.some((key) => key.endsWith(':seed'));
+    if (isSeed) {
+      if (matchedUserAnchor) currentRunId = matchedUserAnchor.run_id ?? null;
       continue;
     }
 
-    if (isSeed) {
-      const seedUser = latestUserAnchorAt(users, timestamp(row.created_at), currentRunId);
-      const messages = Array.isArray(record?.messages) ? record.messages : [];
-      const lastUser = messages.findLast((message) => message?.role === 'user');
-      const text = textFromContent(lastUser?.content);
-      if (seedUser && text !== null) userContent.set(String(seedUser.id), text);
+    if (keyedRunId === null && !isSessionRound(keys, sessionId)) {
       continue;
     }
 
@@ -133,14 +173,26 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     if (text) assistantContent.set(currentRunId, text);
   }
 
-  return anchors.map((anchor) => {
+  let fallbackCount = 0;
+  const messages = anchors.map((anchor) => {
     let content = '';
     if (anchor.synthetic === true) {
       content = anchor.content;
     } else if (anchor.role === 'user') {
-      content = userContent.get(String(anchor.id)) ?? '';
+      const anchorId = String(anchor.id);
+      if (userContent.has(anchorId)) {
+        content = userContent.get(anchorId);
+      } else {
+        content = userById.get(anchorId)?.anchor_text ?? '';
+        fallbackCount += 1;
+      }
     } else if (anchor.role === 'assistant') {
-      content = assistantContent.get(anchor.run_id) ?? '';
+      if (assistantContent.has(anchor.run_id)) {
+        content = assistantContent.get(anchor.run_id);
+      } else {
+        content = anchor.content ?? '';
+        fallbackCount += 1;
+      }
     }
     return {
       id: anchor.id,
@@ -153,4 +205,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       created_at: anchor.created_at?.toISOString?.() ?? anchor.created_at,
     };
   });
+
+  // PR① 的过渡兜底唯一原因是写路径尚未把用户输入落进 transcript（由 PR② 修复）。
+  // PR② 必须删除此兜底，并把 fallbackCount === 0 作为验收断言。
+  return { messages, fallbackCount };
 }

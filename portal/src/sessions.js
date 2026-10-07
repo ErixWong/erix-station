@@ -235,7 +235,7 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   const msgs = includeMessages
     ? await pool.query(
       `SELECT id, run_id, seq, role,
-              CASE WHEN synthetic THEN content END AS content,
+              CASE WHEN synthetic OR role = 'assistant' THEN content END AS content,
               synthetic, attachments, created_at
          FROM messages WHERE ${where} ORDER BY seq DESC LIMIT $2`,
       params,
@@ -246,14 +246,15 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   msgs.rows.reverse(); // 升序返回
   const userAnchors = msgs.rows.length > 0
     ? await pool.query(
-      `SELECT id, run_id, seq, created_at
+      // Seed rows have no message ID; retain anchor text for exact matching and the temporary projection fallback.
+      `SELECT id, run_id, seq, synthetic, content AS anchor_text, created_at
          FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`,
       [sessionId],
     )
     : { rows: [] };
   const transcript = msgs.rows.length > 0
     ? await pool.query(
-      `SELECT round, dedup_key, record, created_at
+      `SELECT run_id, round, dedup_key, record, created_at
          FROM transcript_rounds WHERE transcript_key = $1
          ORDER BY round ASC, created_at ASC`,
       [sessionId],
@@ -263,14 +264,15 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     `SELECT id, status FROM runs WHERE session_id = $1 AND status IN ${ACTIVE_RUN_STATES} ORDER BY queued_at DESC LIMIT 1`,
     [sessionId],
   );
+  const projection = projectSessionMessages({
+    sessionId,
+    anchors: msgs.rows,
+    userAnchors: userAnchors.rows,
+    transcriptRows: transcript.rows,
+  });
   return {
     session: { ...rowToSession(s), active_run_id: active.rows[0]?.id ?? null },
-    messages: projectSessionMessages({
-      sessionId,
-      anchors: msgs.rows,
-      userAnchors: userAnchors.rows,
-      transcriptRows: transcript.rows,
-    }),
+    messages: projection.messages,
     last_seq: Number(s.last_seq),
     // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
     next_cursor: hasOlder ? Number(msgs.rows[0].seq) : null,
