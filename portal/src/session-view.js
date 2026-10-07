@@ -50,10 +50,22 @@ function assistantText(record) {
   return messageText || null;
 }
 
-function lastUserText(record) {
+function userTexts(record) {
   const messages = Array.isArray(record?.messages) ? record.messages : [];
-  const lastUser = messages.findLast((message) => message?.role === 'user');
-  return textFromContent(lastUser?.content);
+  return messages
+    .filter((message) => message?.role === 'user')
+    .map((message) => textFromContent(message?.content));
+}
+
+function claimUserAnchor(text, anchorsByText, claimedUserAnchors) {
+  const queue = anchorsByText.get(text);
+  if (!queue) return null;
+
+  while (queue.cursor < queue.anchors.length) {
+    const anchor = queue.anchors[queue.cursor++];
+    if (!claimedUserAnchors.has(String(anchor.id))) return anchor;
+  }
+  return null;
 }
 
 function compareTranscriptRows(a, b) {
@@ -73,6 +85,18 @@ function compareTranscriptRows(a, b) {
 export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows }) {
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
+  const userAnchorsByText = new Map();
+  // Text buckets stay seq-ordered; monotone cursors make each candidate O(1) amortized
+  // instead of rescanning all user anchors for every message in historical snapshots.
+  for (const anchor of users) {
+    if (anchor.synthetic === true || typeof anchor.anchor_text !== 'string') continue;
+    let queue = userAnchorsByText.get(anchor.anchor_text);
+    if (!queue) {
+      queue = { anchors: [], cursor: 0 };
+      userAnchorsByText.set(anchor.anchor_text, queue);
+    }
+    queue.anchors.push(anchor);
+  }
   const runIds = new Set([
     ...users.map((anchor) => anchor.run_id),
     ...anchors.map((anchor) => anchor.run_id),
@@ -86,7 +110,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     const record = row.record;
     const keys = recordKeys(row, record);
     const messageId = inputMessageId(keys, sessionId);
-    const userText = lastUserText(record);
+    const candidateUserTexts = userTexts(record);
+    const lastUserText = candidateUserTexts.at(-1) ?? null;
     let matchedUserAnchor = null;
 
     // Snapshot rows can end at an earlier turn; run_id alone does not establish user ownership.
@@ -95,28 +120,28 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       if (
         matchedUserAnchor
         && matchedUserAnchor.synthetic !== true
-        && userText !== null
+        && lastUserText !== null
         && !claimedUserAnchors.has(String(matchedUserAnchor.id))
       ) {
         const anchorId = String(matchedUserAnchor.id);
         claimedUserAnchors.add(anchorId);
-        userContent.set(anchorId, userText);
+        userContent.set(anchorId, lastUserText);
       }
-    } else if (userText !== null) {
-      matchedUserAnchor = users.find((anchor) => (
-        anchor.synthetic !== true
-        && anchor.anchor_text === userText
-        && !claimedUserAnchors.has(String(anchor.id))
-      )) ?? null;
-      if (matchedUserAnchor) {
-        const anchorId = String(matchedUserAnchor.id);
-        claimedUserAnchors.add(anchorId);
-        userContent.set(anchorId, userText);
+    } else {
+      for (const userText of candidateUserTexts) {
+        if (userText === null) continue;
+        const candidate = claimUserAnchor(userText, userAnchorsByText, claimedUserAnchors);
+        if (candidate) {
+          matchedUserAnchor = candidate;
+          const anchorId = String(candidate.id);
+          claimedUserAnchors.add(anchorId);
+          userContent.set(anchorId, userText);
+        }
       }
     }
 
     if (typeof row.run_id === 'string' && row.run_id.length > 0) {
-      if (userText !== null) currentRunId = row.run_id;
+      if (lastUserText !== null) currentRunId = row.run_id;
       const text = assistantText(record);
       if (text) assistantContent.set(row.run_id, text);
       continue;
