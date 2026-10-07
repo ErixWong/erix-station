@@ -1054,7 +1054,10 @@ async function handleTicket(ticket) {
 
   // issue #46（选项 A）：备 run 数据目录（notes 落点，跨 attempt 保留）。
   try {
-    ctx.runDataPath = prepareRunDataDir(CFG.home, runId);
+    ctx.runDataPath = prepareRunDataDir(CFG.home, runId, {
+      workerUid: CFG.workerUid,
+      workerGid: CFG.workerGid,
+    });
   } catch (err) {
     log('warn', 'run data dir prep failed', { run_id: runId, err: String(err?.message ?? err) });
     await releaseAndRequeue(ctx, 'run_data_failed');

@@ -26,10 +26,11 @@ export function runArchiveDir(home, runId) {
   return path.join(home, 'runs-archive', String(runId));
 }
 
-// claim 后、fork 前备好目录（0775 & umask 0002，worker UID 1002 同 GID 组可写）。
-export function prepareRunDataDir(home, runId) {
+// claim 后、fork 前备好目录（run 目录仍为 agentd 所有，notes 根目录属于 worker）。
+export function prepareRunDataDir(home, runId, { workerUid, workerGid }) {
   const dir = runDataDir(home, runId);
-  fs.mkdirSync(path.join(dir, 'notes'), { recursive: true, mode: 0o775 });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o775 });
+  runAsWorker(NOTES_DIR_HELPER, [path.join(dir, 'notes')], { workerUid, workerGid });
   return dir;
 }
 
@@ -64,6 +65,50 @@ function runAsWorker(script, args, { workerUid, workerGid }) {
 }
 
 const REMOVE_HELPER = "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true });";
+
+// NotesStore (erix-agent >= 0.12.0) chmods its root to 0700 on every write, which
+// requires directory ownership. 真机曾实测 notes 属于 agentd(1001)、worker 为
+// 1002，写笔记时报 chmod EPERM；因此新目录必须由 worker 创建。升级时也以 worker
+// 身份迁移旧 agentd-owned 目录并保留内容。
+const NOTES_DIR_HELPER = `
+const fs = require('node:fs');
+const path = require('node:path');
+const [directory] = process.argv.slice(1);
+let stat;
+try {
+  stat = fs.lstatSync(directory);
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+  process.exit(0);
+}
+if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('notes path is not a directory');
+if (stat.uid !== process.getuid() || stat.gid !== process.getgid()) {
+  const staging = fs.mkdtempSync(path.join(path.dirname(directory), '.notes-worker-'));
+  const stagedNotes = path.join(staging, 'notes');
+  const legacyNotes = path.join(staging, 'legacy');
+  try {
+    fs.cpSync(directory, stagedNotes, { recursive: true });
+    fs.chmodSync(stagedNotes, 0o700);
+  } catch (error) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
+  fs.renameSync(directory, legacyNotes);
+  try {
+    fs.renameSync(stagedNotes, directory);
+  } catch (error) {
+    fs.renameSync(legacyNotes, directory);
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
+  fs.rmSync(legacyNotes, { recursive: true });
+  fs.rmdirSync(staging);
+} else {
+  fs.chmodSync(directory, 0o700);
+}
+`;
 
 // 归档 helper：mkdir archiveRoot → 清同名旧归档 → rename（EXDEV 复制兜底）→ mtime 刷新为归档时刻。
 // 与 archiveRunData 直走路径语义逐行对应，改动需双侧同步。
