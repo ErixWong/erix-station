@@ -106,9 +106,11 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 
 | PR | 内容 | 验收 |
 |---|---|---|
-| **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退） | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
-| **②停内容双写 + 先落树再入队** | portal POST 事务内写 transcript；删 runner 预写入分支；终态幂等比较从 `messages.final_text` 换到 transcript；`messages` 降级为锚点行（不再写 `content`） | 根 `npm test`、`wp3a`/`wp3b`/`wp5` e2e；真机：同 session 多轮 + 崩溃 resume 不丢会话 |
+| **①读路径投影** | 定义投影 DTO 与派生规则（`id`/`seq`/`attachments`/`run` 归属/折叠呈现），`GET /api/sessions/:id` 改走投影；`messages` 仍双写（本 PR 不动写路径，保证可回退）；带**过渡兜底**：当前写路径尚未把用户输入落入 transcript 时，缺少可派生内容的锚点暂回退到自身内容 | 根 `npm test`、前端 `vue-tsc` + vitest、`wp3a`/`wp5` e2e；DTO 字段与语义不变 → **前端零改动** |
+| **②停内容双写 + 先落树再入队** | portal POST 事务内写 transcript；删 runner 预写入分支；终态幂等比较从 `messages.final_text` 换到 transcript；`messages` 降级为锚点行（不再写 `content`）；**删除 PR① 过渡兜底** | 根 `npm test`、`wp3a`/`wp3b`/`wp5` e2e；真机：同 session 多轮 + 崩溃 resume 不丢会话；等价性检查断言 `fallbackCount === 0` |
 | **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径）；AI 标题的首条用户文本改从 transcript 取 | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
+
+> **过渡兜底与实测依据**：兜底存在的唯一原因是当前写路径尚未把用户输入落进 transcript，正是 PR②「先落树再入队」要修复的问题；PR① 以 `fallbackCount` 观测命中数，PR② 必须删除兜底并以命中数为 0 验收。真机全库检查发现 64 个会话中仅 2 个有 `:input:<messageId>` 行；抽查会话中用户文本在整份 transcript 的 `record::text` 检索为 0 命中。
 
 ### 待决策（UI 轮号口径，遗留项）
 
