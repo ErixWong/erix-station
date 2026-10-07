@@ -40,21 +40,6 @@ function timestamp(value) {
   return Number.isFinite(time) ? time : null;
 }
 
-function latestUserAnchorAt(userAnchors, time, runId = null) {
-  if (time === null) return null;
-  let latest = null;
-  for (const anchor of userAnchors) {
-    const createdAt = timestamp(anchor.created_at);
-    if (
-      anchor.run_id
-      && (runId === null || anchor.run_id === runId)
-      && createdAt !== null
-      && createdAt <= time
-    ) latest = anchor;
-  }
-  return latest;
-}
-
 function assistantText(record) {
   const responseText = textFromContent(record?.response?.content);
   if (responseText) return responseText;
@@ -93,6 +78,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     ...anchors.map((anchor) => anchor.run_id),
   ].filter((runId) => typeof runId === 'string' && runId.length > 0));
   const userContent = new Map();
+  const claimedUserAnchors = new Set();
   const assistantContent = new Map();
   let currentRunId = null;
 
@@ -105,7 +91,14 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
         : null;
       const userText = textFromContent(lastUser?.content);
       const userAnchor = userByRunId.get(row.run_id);
-      if (userAnchor && userText) userContent.set(String(userAnchor.id), userText);
+      if (userText !== null) currentRunId = row.run_id;
+      if (userAnchor && userText !== null) {
+        const anchorId = String(userAnchor.id);
+        if (!claimedUserAnchors.has(anchorId)) {
+          claimedUserAnchors.add(anchorId);
+          userContent.set(anchorId, userText);
+        }
+      }
 
       const text = assistantText(record);
       if (text) assistantContent.set(row.run_id, text);
@@ -114,7 +107,6 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
 
     const keys = recordKeys(row, record);
     if (keys.length === 0) continue;
-    const isSeed = keys.some((key) => key.endsWith(':seed'));
     const messageId = inputMessageId(keys, sessionId);
     if (messageId !== null) {
       const anchor = userById.get(messageId);
@@ -122,25 +114,43 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       const messages = Array.isArray(record?.messages) ? record.messages : [];
       const lastUser = messages.findLast((message) => message?.role === 'user');
       const text = textFromContent(lastUser?.content);
-      if (anchor && text !== null) userContent.set(String(anchor.id), text);
+      if (anchor && anchor.synthetic !== true && text !== null) {
+        const anchorId = String(anchor.id);
+        if (!claimedUserAnchors.has(anchorId)) {
+          claimedUserAnchors.add(anchorId);
+          userContent.set(anchorId, text);
+        }
+      }
       continue;
     }
 
     const keyedRunId = recordRunId(keys, runIds);
     if (keyedRunId !== null) {
       currentRunId = keyedRunId;
-    } else if (isSeed && isSessionRound(keys, sessionId) && currentRunId === null) {
-      currentRunId = latestUserAnchorAt(users, timestamp(row.created_at))?.run_id ?? null;
-    } else if (!isSessionRound(keys, sessionId)) {
-      continue;
     }
 
+    const isSeed = keys.some((key) => key.endsWith(':seed'));
     if (isSeed) {
-      const seedUser = latestUserAnchorAt(users, timestamp(row.created_at), currentRunId);
       const messages = Array.isArray(record?.messages) ? record.messages : [];
       const lastUser = messages.findLast((message) => message?.role === 'user');
       const text = textFromContent(lastUser?.content);
-      if (seedUser && text !== null) userContent.set(String(seedUser.id), text);
+      const seedUser = text === null
+        ? null
+        : users.find((anchor) => (
+          anchor.synthetic !== true
+          && anchor.anchor_text === text
+          && !claimedUserAnchors.has(String(anchor.id))
+        ));
+      if (seedUser) {
+        const anchorId = String(seedUser.id);
+        claimedUserAnchors.add(anchorId);
+        userContent.set(anchorId, text);
+        currentRunId = seedUser.run_id ?? null;
+      }
+      continue;
+    }
+
+    if (keyedRunId === null && !isSessionRound(keys, sessionId)) {
       continue;
     }
 
