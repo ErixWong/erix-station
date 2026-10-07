@@ -101,6 +101,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     ...users.map((anchor) => anchor.run_id),
     ...anchors.map((anchor) => anchor.run_id),
   ].filter((runId) => typeof runId === 'string' && runId.length > 0));
+  const soleRunId = runIds.size === 1 ? runIds.values().next().value : null;
   const userContent = new Map();
   const claimedUserAnchors = new Set();
   const assistantContent = new Map();
@@ -164,10 +165,17 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       continue;
     }
 
-    if (keyedRunId === null && !isSessionRound(keys, sessionId)) {
+    const sessionRound = keyedRunId === null && isSessionRound(keys, sessionId);
+    if (keyedRunId === null && !sessionRound) {
       continue;
     }
 
+    // Real sessions showed migration-0015 input rows sorting after session rounds
+    // by both round and created_at, leaving currentRunId unset. A sole anchored run
+    // makes attribution of otherwise-unassigned session rounds unambiguous.
+    if (!currentRunId && sessionRound && soleRunId !== null) {
+      currentRunId = soleRunId;
+    }
     if (!currentRunId) continue;
     const text = assistantText(record);
     if (text) assistantContent.set(currentRunId, text);
