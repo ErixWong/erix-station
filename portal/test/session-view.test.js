@@ -650,6 +650,55 @@ test('seed claims the first unmatched exact-text anchor only once', async () => 
   assert.equal(projected.get('second-match').content, '', 'only one matching user text exists in the transcript');
 });
 
+test('single-run session rounds project assistant text before a backfilled input row', async () => {
+  const anchors = [
+    message('backfilled-user', 1, 'user', 'the request', RUN_1),
+    message('backfilled-assistant', 2, 'assistant', 'stale assistant anchor', RUN_1),
+  ];
+  const transcriptRows = [
+    transcript(1, `${SESSION_ID}:engine:round:1`, {
+      response: { content: text('intermediate answer') },
+    }, at(1)),
+    transcript(16, `${SESSION_ID}:engine:round:16`, {
+      response: { content: text('final assistant answer') },
+    }, at(2)),
+    transcript(17, `${SESSION_ID}:input:backfilled-user`, {
+      dedupKey: `${SESSION_ID}:input:backfilled-user`,
+      messages: [{ role: 'user', content: text('the request') }],
+    }, at(50)),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.ok(transcriptRows[2].round > transcriptRows[1].round);
+  assert.ok(transcriptRows[2].created_at > transcriptRows[1].created_at);
+  assert.equal(projected.get('backfilled-assistant').content, 'final assistant answer');
+});
+
+test('session-scoped rounds remain unattributed when multiple runs have no input rows', async () => {
+  const anchors = [
+    message('run-one-assistant', 1, 'assistant', 'stale run one text', RUN_1),
+    message('run-two-assistant', 2, 'assistant', 'stale run two text', RUN_2),
+  ];
+  const pool = new SessionViewPool({
+    anchors,
+    transcriptRows: [
+      transcript(1, `${SESSION_ID}:engine:round:1`, {
+        response: { content: text('unassigned answer one') },
+      }, at(1)),
+      transcript(2, `${SESSION_ID}:engine:round:2`, {
+        response: { content: text('unassigned answer two') },
+      }, at(2)),
+    ],
+  });
+
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
+
+  assert.deepEqual(result.messages.map((row) => row.content), ['', '']);
+});
+
 test('transcript rows without a run ID or key remain unattributed; unmatched anchors stay empty', async () => {
   const anchors = [
     message('unattributed-user', 1, 'user', 'user anchor fallback', RUN_4),
