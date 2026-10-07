@@ -13,6 +13,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { clipTitleFromMessage, sanitizeTitle, AUTO_TITLE_MAX_LEN } from './session-title.js';
 import { getFdeLlmConfig } from './llm.js';
 import { projectSessionMessages } from './session-view.js';
+import { appendUserInputTurn } from './transcript-store.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -398,33 +399,23 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       [s.id, seq, safeContent, JSON.stringify(safeAttachments)],
     );
 
-    // P3 PR②a：同事务先将用户输入落入 session transcript，再创建/入队 run。
-    // 文本直接取 POST 入参（与 messages.content 一致）；附件仍只保留在锚点行。
-    const latestRound = await client.query(
-      `SELECT COALESCE(MAX(round), 0) AS round
-         FROM transcript_rounds WHERE transcript_key = $1`,
-      [s.id],
-    );
-    const round = Number(latestRound.rows[0].round);
-    const dedupKey = `${s.id}:input:${msg.rows[0].id}`;
-    const transcriptMessages = [{
-      role: 'user',
-      content: [{ type: 'text', text: safeContent }],
-    }];
-    const transcriptRecord = {
-      round,
-      roundKey: dedupKey,
-      dedupKey,
-      messages: transcriptMessages,
-      ts: new Date().toISOString(),
-    };
-    await client.query(
-      `INSERT INTO transcript_rounds
-         (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
-       VALUES (NULL, $1, $2, $3, $4, false, $5, NULL)
-       ON CONFLICT (transcript_key, dedup_key) WHERE transcript_key IS NOT NULL DO NOTHING`,
-      [s.id, dedupKey, round, JSON.stringify(transcriptRecord), JSON.stringify(transcriptMessages)],
-    );
+    // P3 契约①（erix-agent 0.15.0 起，写侧由引擎 appendUserTurn 承担）：同事务先将用户输入
+    // 落入 session transcript，再创建/入队 run。round 推导（复用现有最大 round，空=0）、
+    // dedupKey 生成（`<sessionId>:input:<messageId>`）、record 形态与幂等判据均在引擎内；
+    // store 适配器复用本事务 client（portal/src/transcript-store.js），落库列形态与原手搓一致。
+    // 顺序红线：必须发生在 run 入队之前（session FOR UPDATE 串行化同 key 并发追加，满足引擎
+    // 「在接收事务内发起」的并发前提）。
+    // 错误语义：appendUserTurn 对纯空白 text 抛 TypeError——本路径不可达（validateMessageBody
+    // 已在幂等与事务之前以 400 validation_failed 拒绝空白 content）；兜底捕获转同一错误码，
+    // 保证任何回归都不把 400 语义升格成 500。
+    try {
+      await appendUserInputTurn(client, { key: s.id, text: safeContent, messageId: msg.rows[0].id });
+    } catch (err) {
+      if (err instanceof TypeError) {
+        throw new SessionError('validation_failed', err.message, { details: { field: 'content' } });
+      }
+      throw err;
+    }
 
     // issue #114：默认标题 = 首条用户消息截断（零 LLM）。
     // 幂等：仅当标题为空（NULL/空串/纯空白）且 title_source='auto' 时写；已有标题（手工/AI 改名）不动。

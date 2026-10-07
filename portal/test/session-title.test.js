@@ -228,11 +228,12 @@ function postMessageClient({
       if (s.startsWith('INSERT INTO messages')) {
         return { rows: [{ id: 'm1', seq: 1, role: 'user', content: params[2], attachments: '[]', created_at: state.createdAt }] };
       }
-      if (s.startsWith('SELECT COALESCE(MAX(round), 0)')) {
-        const rounds = state.transcriptRows
+      if (s.startsWith('SELECT round, dedup_key, record')) {
+        // session transcript store 适配器 load(key)：按 transcript_key 取权威列，引擎侧推导 round/幂等。
+        const rows = state.transcriptRows
           .filter((row) => row.transcriptKey === params[0])
-          .map((row) => row.round);
-        return { rows: [{ round: Math.max(0, ...rounds) }] };
+          .map((row) => ({ round: row.round, dedup_key: row.dedupKey, record: row.record ?? null }));
+        return { rows };
       }
       if (s.startsWith('INSERT INTO transcript_rounds')) {
         state.transcriptInsertAttempts += 1;
@@ -297,7 +298,7 @@ test('issue #114：首条消息 >30 字 → 标题 = 前 30 字 + `…`（零 LL
   assert.deepEqual(titles, [stmt.params[1]], 'COMMIT 后回调一次新标题（供 SSE 推送）');
 });
 
-test('P3 PR②a：POST 在同一事务内先写 transcript 再入队，round/record 与 runner 预写形态一致', async () => {
+test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 transcript 再入队，round/record 与 runner 预写形态一致', async () => {
   const content = '来自 POST 入参的用户文本';
   const { pool, order, state } = postMessageClient({ existingRounds: [2, 7, 4] });
   const posted = await postMessage(pool, {
@@ -308,15 +309,18 @@ test('P3 PR②a：POST 在同一事务内先写 transcript 再入队，round/rec
   });
   const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
   const messageInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO messages'));
-  const maxRound = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT COALESCE(MAX(round), 0)'));
+  const storeLoad = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT round, dedup_key, record'));
   const transcriptInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO transcript_rounds'));
   const runQueueInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO run_queue'));
   const begin = order.findIndex(({ sql }) => sql === 'BEGIN');
   const commit = order.findIndex(({ sql }) => sql === 'COMMIT');
 
-  assert.ok(begin < messageInsert && messageInsert < maxRound && maxRound < transcriptInsert);
+  assert.ok(begin < messageInsert && messageInsert < storeLoad && storeLoad < transcriptInsert);
   assert.ok(transcriptInsert < runQueueInsert && runQueueInsert < commit, 'transcript INSERT 位于入队之前且同属提交事务');
   assert.ok(begin < transcriptInsert && transcriptInsert < commit);
+  // 预写与读取都只用传入的事务 client（同一连接：order 是单 client 的流水）。
+  assert.equal(order.filter(({ sql }) => normalize(sql).startsWith('SELECT round, dedup_key, record')).length, 1,
+    'appendUserTurn 只 load 一次，且与业务写入同一事务连接');
   assert.equal(state.transcriptRows.length, 4);
   assert.equal(posted.run.status, 'queued');
 
@@ -324,7 +328,7 @@ test('P3 PR②a：POST 在同一事务内先写 transcript 再入队，round/rec
   const sql = normalize(insert.sql);
   assert.match(sql, /VALUES \(NULL, \$1, \$2, \$3, \$4, false, \$5, NULL\)/);
   assert.match(sql, /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/);
-  assert.deepEqual(order[maxRound].params, [PM_SESSION_ID], '只用本 session 的 max(round)');
+  assert.deepEqual(order[storeLoad].params, [PM_SESSION_ID], 'load 只取本 session key 的轮记录');
   assert.deepEqual(insert.params.slice(0, 3), [PM_SESSION_ID, `${PM_SESSION_ID}:input:m1`, 7]);
   const userMessageInsert = order[messageInsert];
   assert.equal(JSON.parse(userMessageInsert.params[3])[0].name, 'readme.md', '附件仍写在锚点行');
@@ -340,7 +344,7 @@ test('P3 PR②a：POST 在同一事务内先写 transcript 再入队，round/rec
   assert.equal(typeof record.ts, 'string');
   assert.equal(new Date(record.ts).toISOString(), record.ts);
   assert.deepEqual(JSON.parse(insert.params[4]), expectedMessages);
-  assert.equal(state.transcriptRows.at(-1).round, 7, 'round 从该 session 现有 max(round) 取得');
+  assert.equal(state.transcriptRows.at(-1).round, 7, 'round 由引擎 appendUserTurn 从 load 结果复用现有 max(round)');
 });
 
 test('P3 PR②a：重放相同 transcript INSERT 时，部分唯一冲突使 transcript 只保留一行', async () => {
@@ -360,6 +364,38 @@ test('P3 PR②a：重放相同 transcript INSERT 时，部分唯一冲突使 tra
   assert.equal(state.transcriptRows.length, 1);
   assert.ok(order.filter(({ sql }) => sql.includes('INSERT INTO transcript_rounds'))
     .every(({ sql }) => /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/.test(sql)));
+});
+
+test('0.15.0 appendUserTurn：load 命中同 dedupKey 时引擎直接判幂等，不再发起第二笔 INSERT', async () => {
+  // 崩溃重跑/顺序重放语义：同 messageId 的预写在 store 已有同 dedupKey 记录时 written=false，
+  // 引擎不发 appendRound（DB 的 ON CONFLICT 只作并发防线，不再是幂等主判据）。
+  const { pool, order, state } = postMessageClient();
+  await postMessage(pool, {
+    userId: 'u1', sessionId: PM_SESSION_ID, content: '首轮文本', attachments: [],
+  });
+  // 同一 fake client 再发一次：messages INSERT 仍返回同一 messageId（m1）→ dedupKey 相同。
+  await postMessage(pool, {
+    userId: 'u1', sessionId: PM_SESSION_ID, content: '首轮文本', attachments: [],
+  });
+
+  assert.equal(state.transcriptInsertAttempts, 1, '第二次 postMessage 因 appendUserTurn 幂等判据命中，不发起 INSERT');
+  assert.equal(state.transcriptRows.length, 1);
+  const loads = order.filter(({ sql }) => sql.replace(/\s+/g, ' ').trim().startsWith('SELECT round, dedup_key, record'));
+  assert.equal(loads.length, 2, '两次调用各 load 一次（幂等判据读自同一事务内的 load）');
+});
+
+test('0.15.0 appendUserTurn：空 transcript 首轮预写 round=0，有历史轮时复用现有最大 round（不 +1）', async () => {
+  const roundFor = async (existingRounds) => {
+    const { pool, order } = postMessageClient({ existingRounds });
+    await postMessage(pool, {
+      userId: 'u1', sessionId: PM_SESSION_ID, content: '新输入', attachments: [],
+    });
+    const insert = order.find(({ sql }) => sql.replace(/\s+/g, ' ').trim().startsWith('INSERT INTO transcript_rounds'));
+    return insert.params[2];
+  };
+  assert.equal(await roundFor([]), 0, '空 transcript：种子路径 round=0');
+  assert.equal(await roundFor([0]), 0, '只有 round 0：复用它（引擎 resume 从最大 round 续起，预写不得 +1）');
+  assert.equal(await roundFor([3, 1, 2]), 3, '多轮取最大');
 });
 
 test('issue #114：首条消息 ≤30 字 → 标题 = 原文（不加 `…`）', async () => {
