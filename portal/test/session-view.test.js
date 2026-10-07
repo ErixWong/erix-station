@@ -66,8 +66,8 @@ class SessionViewPool {
         rows: this.anchors
           .filter((anchor) => anchor.role === 'user')
           .sort((a, b) => a.seq - b.seq)
-          .map(({ id, run_id, seq, synthetic, created_at }) => ({
-            id, run_id, seq, synthetic, created_at,
+          .map(({ id, run_id, seq, synthetic, content, created_at }) => ({
+            id, run_id, seq, synthetic, anchor_text: content, created_at,
           })),
       };
     }
@@ -326,6 +326,96 @@ test('run-id legacy rows, session-key rows, and mixed rows project identically t
   }
 });
 
+test('legacy row, seed, input row, and a transcript-less crashed run map without time guessing', async () => {
+  const crashRun = RUN_2;
+  const anchors = [
+    message('first-user', 1, 'user', 'first task', RUN_1, { createdAt: at(1) }),
+    message('first-assistant', 2, 'assistant', 'first answer', RUN_1, { createdAt: at(2) }),
+    message('crashed-user', 3, 'user', 'please answer me in English.', crashRun, { createdAt: at(2) }),
+    message('input-user', 4, 'user', 'hello', RUN_4, { createdAt: at(6) }),
+    message('input-assistant', 5, 'assistant', 'hello response', RUN_4, { createdAt: at(7) }),
+  ];
+  const transcriptRows = [
+    transcript(0, null, {
+      messages: [{ role: 'user', content: text('first task') }],
+    }, at(1), RUN_1),
+    transcript(0, `${MIXED_SESSION_ID}:engine:round:0:seed`, {
+      roundKey: `${MIXED_SESSION_ID}:round:0`,
+      dedupKey: `${MIXED_SESSION_ID}:engine:round:0:seed`,
+      messages: [{ role: 'user', content: text('first task') }],
+    }, at(3)),
+    transcript(1, null, {
+      response: { content: text('first answer') },
+    }, at(4), RUN_1),
+    transcript(8, `${MIXED_SESSION_ID}:input:input-user`, {
+      roundKey: `${MIXED_SESSION_ID}:input:input-user`,
+      dedupKey: `${MIXED_SESSION_ID}:input:input-user`,
+      messages: [{ role: 'user', content: text('hello') }],
+    }, at(5)),
+    transcript(9, `${MIXED_SESSION_ID}:engine:round:9`, {
+      roundKey: `${MIXED_SESSION_ID}:round:9`,
+      dedupKey: `${MIXED_SESSION_ID}:engine:round:9`,
+      response: { content: text('hello response') },
+    }, at(6)),
+  ];
+  const pool = new SessionViewPool({
+    sessionId: MIXED_SESSION_ID,
+    anchors,
+    transcriptRows,
+  });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: MIXED_SESSION_ID,
+    limit: 100,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.equal(transcriptRows.some((row) => row.run_id === crashRun), false, 'crashed run has no transcript rows');
+  assert.equal(projected.get('first-user').content, 'first task', 'legacy run row owns the first anchor');
+  assert.equal(projected.get('crashed-user').content, '', 'transcript-less crashed anchor remains blank');
+  assert.equal(projected.get('input-user').content, 'hello', 'input key maps by message ID');
+  for (const anchor of anchors.filter((candidate) => candidate.id !== 'crashed-user')) {
+    assert.equal(
+      projected.get(anchor.id).content,
+      anchor.content,
+      `projection for ${anchor.id} matches its anchor text`,
+    );
+  }
+});
+
+test('seed claims the first unmatched exact-text anchor only once', async () => {
+  const anchors = [
+    message('first-match', 1, 'user', 'repeated request', RUN_1, { createdAt: at(1) }),
+    message('second-match', 2, 'user', 'repeated request', RUN_2, { createdAt: at(2) }),
+  ];
+  const transcriptRows = [
+    transcript(0, `${NEW_SESSION_ID}:engine:round:0:seed`, {
+      dedupKey: `${NEW_SESSION_ID}:engine:round:0:seed`,
+      messages: [{ role: 'user', content: text('repeated request') }],
+    }, at(3)),
+    transcript(1, `${NEW_SESSION_ID}:input:first-match`, {
+      dedupKey: `${NEW_SESSION_ID}:input:first-match`,
+      messages: [{ role: 'user', content: text('duplicate input must not overwrite') }],
+    }, at(4)),
+  ];
+  const pool = new SessionViewPool({
+    sessionId: NEW_SESSION_ID,
+    anchors,
+    transcriptRows,
+  });
+
+  const result = await getSession(pool, {
+    userId: USER_ID,
+    sessionId: NEW_SESSION_ID,
+    limit: 20,
+  });
+  const projected = new Map(result.messages.map((row) => [row.id, row]));
+
+  assert.equal(projected.get('first-match').content, 'repeated request');
+  assert.equal(projected.get('second-match').content, '');
+});
+
 test('transcript rows without a run ID or any key remain unattributed', async () => {
   const anchors = [
     message('unattributed-user', 1, 'user', 'anchor must not be read', RUN_4),
@@ -345,6 +435,18 @@ test('transcript rows without a run ID or any key remain unattributed', async ()
 
   const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
   assert.deepEqual(result.messages.map((row) => row.content), ['', '']);
+});
+
+test('session without transcript rows does not fall back to message content', async () => {
+  const anchors = [
+    message('unprojected-user', 1, 'user', 'must remain hidden without a transcript', RUN_4),
+    message('synthetic-user', 2, 'user', 'synthetic content', RUN_4, { synthetic: true }),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows: [] });
+
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
+
+  assert.deepEqual(result.messages.map((row) => row.content), ['', 'synthetic content']);
 });
 
 test('message cursor still filters anchor rows before transcript projection', async () => {

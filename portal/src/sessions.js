@@ -246,7 +246,8 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   msgs.rows.reverse(); // 升序返回
   const userAnchors = msgs.rows.length > 0
     ? await pool.query(
-      `SELECT id, run_id, seq, synthetic, created_at
+      // Seed rows have no message ID; this text is only an exact-match key, never a projection fallback.
+      `SELECT id, run_id, seq, synthetic, content AS anchor_text, created_at
          FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`,
       [sessionId],
     )
