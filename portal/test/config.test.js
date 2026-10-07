@@ -139,12 +139,12 @@ test('issue #117 phase 1：gateway 配置默认 self，并从环境读取 admin 
   assert.equal(configured.llmGatewayMasterKey, 'sk-test-only');
 });
 
-test('issue #110：workspace retention 默认 30 天，0 禁用且拒绝负数', () => {
+test('issue #110：workspace retention 默认 0（永不自动清理），正数显式开启且拒绝负数', () => {
   const base = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
-  assert.equal(loadConfig(base).workspaceRetentionDays, 30);
+  assert.equal(loadConfig(base).workspaceRetentionDays, 0);
   assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '0' }).workspaceRetentionDays, 0);
   assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '14' }).workspaceRetentionDays, 14);
-  assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '-1' }).workspaceRetentionDays, 30);
+  assert.equal(loadConfig({ ...base, ERIX_WORKSPACE_RETENTION_DAYS: '-1' }).workspaceRetentionDays, 0);
 });
 
 test('issue #117 phase 1：拒绝未知 gateway mode', () => {

@@ -310,7 +310,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `DB_DATA_DIR` | 平台规范固定（由 `DATA_ROOT` 派生） | `/docker/station-db/`（pg data；见 §6） |
 | `ERIX_USERSPACE_ROOT` | portal 运行时环境变量：用户空间根（portal **容器内路径**，固定 `/srv/erix/users`，与宿主 bind mount 同路径，user-space §2.2） | 平台规范固定 | `/srv/erix/users` |
 | `ERIX_USERSPACE_ROOT_HOST` | compose 插值：宿主用户空间根路径（默认 `/srv/erix/users`；开发期可指向临时目录隔离，结构不变） | 平台规范固定 + 开发期隔离 | `/srv/erix/users` |
-| `ERIX_WORKSPACE_RETENTION_DAYS` | 用户 offboarding 完成后的 workspace 与用户 DB 数据保留天数；到期由 portal sweep 安全清理，`0` 禁用自动清理 | 平台规范固定，可运维配置 | `30` |
+| `ERIX_WORKSPACE_RETENTION_DAYS` | workspace 自动清理保留天数；默认 `0` 永不自动清理，显式正数只删除 workspace 目录、不删除用户或关联 DB 行 | 默认关闭，可运维显式开启 | `0` |
 | `TRAEFIK_DYNAMIC_DIR` | portal 运行时环境变量：Traefik 动态配置目录（portal **容器内路径**，reconciler 单一写方，deploy-contract §4.2） | 平台规范固定 | `/etc/traefik/dynamic` |
 | `TRAEFIK_DYNAMIC_DIR_HOST` | compose 插值：Traefik 动态配置宿主目录（portal 写方与 Traefik 只读方共享；生产 `/docker/station-edge/dynamic/`，开发期默认 `./traefik/dynamic`） | 平台规范固定 + 开发期隔离 | `./traefik/dynamic` |
 | `PORTAL_BACKEND_URL` | portal 后端回环地址（reconciler 生成 portal service 与 forwardAuth 地址用） | 平台规范固定 + 目标环境探测（回环端口） | `http://127.0.0.1:8080`（开发期 `http://127.0.0.1:18080`，§0） |
