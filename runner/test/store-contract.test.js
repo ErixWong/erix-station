@@ -1,8 +1,8 @@
 // station store adapter（runner/lib/store.js，IPC 版 TranscriptStore）契约测试 harness。
-// 对 adapter 跑上游 transcriptStoreContract（erix-agent/contract-tests，0.6.0 起更严：
-// checkpoint 字节保真、多 runId 隔离、runState round-trip、写失败向上抛）。
-// agentd + portal 用内存 IPC peer 桩掉（语义 = portal internal 端点：checkpoint revision CAS、
-// runstate 合并写、多 runId 隔离），transport 注入 adapter——不 fork 进程、不碰网络/DB。
+// 对 adapter 跑上游 transcriptStoreContract（erix-agent/contract-tests，0.14.0：
+// latest-only run snapshot、独立状态通道、多 runId 隔离、写失败向上抛）。
+// agentd + portal 用内存 IPC peer 桩掉（语义 = portal internal 端点：snapshot revision CAS、
+// run-state 快照/状态分列、多 runId 隔离），transport 注入 adapter——不 fork 进程、不碰网络/DB。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { transcriptStoreContract } from 'erix-agent/contract-tests';
@@ -12,8 +12,9 @@ import { STORE_METHODS } from '../lib/ipc.js';
 /** 内存 IPC peer 桩：模拟 agentd → portal internal 端点的 store 语义。 */
 function createFakeAgentdPeer() {
   const transcripts = new Map(); // runId -> round records[]
-  const checkpoints = new Map(); // runId -> {snapshot, revision}
+  const snapshots = new Map(); // runId -> {snapshot, revision}
   const runStates = new Map();   // runId -> object
+  const runStateStatuses = new Map(); // runId -> {status}
 
   const peer = {
     calls: [],
@@ -41,8 +42,7 @@ function createFakeAgentdPeer() {
         case 'recall':
           return { text: '' };
         case 'markRunState': {
-          // reference 语义：mark 合并 {state, runId}（上游 file store markRunState）。
-          runStates.set(runId, { ...(runStates.get(runId) ?? {}), state: args.state, runId });
+          runStateStatuses.set(runId, { status: args.state, runId });
           return { ok: true };
         }
         case 'saveRunState': {
@@ -53,8 +53,14 @@ function createFakeAgentdPeer() {
           const state = runStates.get(runId);
           return state === undefined ? null : { run_state: structuredClone(state) };
         }
-        case 'saveCheckpoint': {
-          const current = checkpoints.get(runId);
+        case 'loadRunStateStatus': {
+          const status = runStateStatuses.get(runId);
+          if (status) return { status: structuredClone(status) };
+          const legacy = runStates.get(runId)?.state;
+          return typeof legacy === 'string' ? { status: { status: legacy } } : null;
+        }
+        case 'saveRunSnapshot': {
+          const current = snapshots.get(runId);
           const revision = Number(args.revision ?? 0);
           if (current && revision <= current.revision) {
             const err = new Error('checkpoint revision 不大于当前');
@@ -62,11 +68,11 @@ function createFakeAgentdPeer() {
             err.retryable = false;
             throw err;
           }
-          checkpoints.set(runId, { snapshot: structuredClone(args.snapshot), revision });
+          snapshots.set(runId, { snapshot: structuredClone(args.snapshot), revision });
           return { revision };
         }
-        case 'loadLatestCheckpoint': {
-          const cp = checkpoints.get(runId);
+        case 'loadLatestRunSnapshot': {
+          const cp = snapshots.get(runId);
           if (!cp) return null;
           return { checkpoint: { snapshot: structuredClone(cp.snapshot), revision: cp.revision } };
         }
@@ -78,24 +84,26 @@ function createFakeAgentdPeer() {
   return peer;
 }
 
-test('STORE_METHODS：0.9.0 引擎契约 8 方法（含 appendCheckpoint 别名）全在 IPC 白名单内；recall 为 legacy 兼容项', async () => {
+test('STORE_METHODS：0.14.0 必需/可选契约与 status 读接口在 IPC 白名单内；recall 为 legacy 兼容项', async () => {
   const upstreamContract = [
-    'appendRound', 'load',
-    'saveCheckpoint', 'appendCheckpoint', 'loadLatestCheckpoint',
+    'appendRound', 'load', 'saveRunSnapshot', 'loadLatestRunSnapshot',
     'saveRunState', 'loadRunState', 'markRunState',
+    'loadRunStateStatus',
   ];
   for (const m of upstreamContract) {
     assert.ok(STORE_METHODS.has(m), `STORE_METHODS 缺 ${m}`);
   }
-  // adapter 暴露面 = 上游 8 方法（上游 transcriptStoreContract 的调用面）。
+  // adapter 覆盖两个必需方法及所有可选能力/宿主 status reader。
   const peer = createFakeAgentdPeer();
   const store = makeStore('surface-run', { request: (method, args) => peer.handle(method, args) });
   for (const m of upstreamContract) {
     assert.equal(typeof store[m], 'function', `adapter 缺 ${m}`);
   }
+  assert.equal(typeof store.saveCheckpoint, 'undefined', '旧快照方法名不得暴露给引擎');
+  assert.equal(typeof store.loadLatestCheckpoint, 'undefined', '旧快照方法名不得暴露给引擎');
   // recall：legacy（0.8.0 退役），保留但标注为非契约方法。
   assert.ok(STORE_METHODS.has('recall'), 'recall 保留（legacy 只读兼容）');
-  assert.ok(!upstreamContract.includes('recall'), 'recall 不属于 0.9.0 契约 8 方法');
+  assert.ok(!upstreamContract.includes('recall'), 'recall 不属于 0.14.0 TranscriptStore 能力');
 });
 
 // 上游契约套件（transcriptStoreContract 会注册多个 node:test 用例）。
@@ -127,4 +135,20 @@ test('station-ipc-store：agentd 写入失败向上抛（IPC error 透传，fail
   const loaded = await flakyStore.load('run-x');
   assert.equal(loaded.length, 1);
   assert.equal(calls, 2);
+});
+
+test('run-state status reader：读 status?.status、legacy fallback、malformed response 抛错', async () => {
+  const statusPeer = {
+    async handle(method) {
+      if (method === 'loadRunStateStatus') return { status: { status: 'succeeded' } };
+      throw new Error(`unexpected method ${method}`);
+    },
+  };
+  const store = makeStore('run-status', { request: (method, args) => statusPeer.handle(method, args) });
+  assert.equal(await store.loadRunStateStatus('run-status'), 'succeeded');
+
+  const malformedStore = makeStore('run-status', {
+    request: async () => ({ status: { status: 7 } }),
+  });
+  await assert.rejects(() => malformedStore.loadRunStateStatus('run-status'), /malformed run-state status/);
 });

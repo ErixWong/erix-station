@@ -20,10 +20,10 @@ export const MSG = {
 
 /**
  * store_request 支持的 method（runner §9.1 映射表）。
- * 0.9.0 引擎契约 8 方法（run 前 fail-closed 校验，缺即 TypeError）+ `appendCheckpoint`——上游
- * file store 即 `saveCheckpoint` 别名（runner/lib/store.js 同口径实现，经同一 IPC method 走 U8）。
+ * 0.14.0 TranscriptStore 必需 appendRound/load；快照与 run-state 是可选能力。
+ * `loadRunStateStatus` 是 station 的宿主读接口，不属于引擎能力校验。
  * `recall` 为 **legacy 兼容项**（0.8.0 recall 退役：引擎不再调用、worker 不注册 recall 工具；
- * U7 端点保留只读兼容，见 issue #43 拍板）——不属于 0.9.0 契约 8 方法。
+ * U7 端点保留只读兼容，见 issue #43 拍板）——不属于 TranscriptStore 契约。
  */
 export const STORE_METHODS = new Set([
   'appendRound',
@@ -31,9 +31,9 @@ export const STORE_METHODS = new Set([
   'markRunState',
   'saveRunState',
   'loadRunState',
-  'saveCheckpoint',
-  'appendCheckpoint',
-  'loadLatestCheckpoint',
+  'loadRunStateStatus',
+  'saveRunSnapshot',
+  'loadLatestRunSnapshot',
   // legacy（0.8.0 recall 退役，非 0.9.0 契约方法）：
   'recall',
 ]);

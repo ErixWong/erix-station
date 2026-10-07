@@ -1737,6 +1737,16 @@ async function handleInternal(req, res, ctx, url) {
       }
       return sendJson(res, 200, result);
     }
+    if (sub === '/runstate/status') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const result = await internal.loadSessionRunStateStatus(ctx.pool, base);
+      if (result === null) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      return sendJson(res, 200, result);
+    }
     if (sub === '/runstate') {
       if (req.method === 'PUT') {
         requireJson(req);
@@ -1803,8 +1813,17 @@ async function handleInternal(req, res, ctx, url) {
       }
       return sendJson(res, 200, result);
     }
+    if (sub === '/runstate/status') {
+      if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+      const result = await internal.loadRunStateStatus(ctx.pool, { container, user, runId, claimToken });
+      if (result === null) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      return sendJson(res, 200, result);
+    }
     if (sub === '/runstate') {
-      // 0.9.0 起引擎 8 方法契约：saveRunState（PUT {run_state}）/ loadRunState（GET）。
       if (req.method === 'PUT') {
         requireJson(req);
         const body = await readJsonBody(req, INTERNAL_CHECKPOINT_LIMIT);

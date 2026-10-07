@@ -338,7 +338,7 @@ test('session checkpoint：CAS 前进 / 旧 revision 409 / 跨 run 同 key revis
   }
 });
 
-test('session runstate：saveRunState 合并 + markRunState 终态标记 + loadRunState 往返（runId=key 并 blob）', async () => {
+test('session runstate：快照与终态 status 分离，status API 回退 legacy state', async () => {
   const { pool, token, runId, sessionId } = seedClaimable();
   const s = await startServer(pool);
   try {
@@ -356,7 +356,7 @@ test('session runstate：saveRunState 合并 + markRunState 终态标记 + loadR
 
     // saveRunState（引擎形态）
     const put = await fetch(`${s.base}/api/internal/transcript/${sessionId}/runstate${qs}`, {
-      method: 'PUT', headers: h, body: JSON.stringify({ run_state: { stateVersion: 3, deterministic: { rounds: 2 } } }),
+      method: 'PUT', headers: h, body: JSON.stringify({ run_state: { state: 'must-not-be-saved', stateVersion: 3, deterministic: { rounds: 2 } } }),
     });
     assert.equal(put.status, 200);
 
@@ -369,16 +369,33 @@ test('session runstate：saveRunState 合并 + markRunState 终态标记 + loadR
     const got = await fetch(`${s.base}/api/internal/transcript/${sessionId}/runstate${qs}`, { headers: h });
     assert.equal(got.status, 200);
     const body = await got.json();
-    assert.equal(body.run_state.state, 'succeeded');
+    assert.equal(Object.hasOwn(body.run_state, 'state'), false);
     assert.equal(body.run_state.stateVersion, 3);
     assert.deepEqual(body.run_state.deterministic, { rounds: 2 });
     assert.equal(body.run_state.runId, sessionId, 'blob runId = transcript key（引擎契约）');
+    const statusResponse = await fetch(`${s.base}/api/internal/transcript/${sessionId}/runstate/status${qs}`, { headers: h });
+    assert.equal(statusResponse.status, 200);
+    assert.equal((await statusResponse.json()).status.status, 'succeeded');
     // 不动 runs 表（U2 仍是宿主终态唯一权威）
     assert.equal(pool.runs[0].status, 'queued');
 
-    // runs 表不被写入（session runstate 落 chat_sessions.engine_run_state）
+    // session 快照与状态分别存储，runs 表仍不被写入。
     assert.equal(pool.runs[0].run_state, undefined);
-    assert.equal(pool.sessions[0].engine_run_state.state, 'succeeded');
+    assert.equal(Object.hasOwn(pool.sessions[0].engine_run_state, 'state'), false);
+    assert.equal(pool.sessions[0].engine_run_state_status.status, 'succeeded');
+
+    // 无新 status 列值时兼容旧 JSONB 内嵌 state。
+    pool.sessions[0].engine_run_state_status = null;
+    pool.sessions[0].engine_run_state.state = 'legacy-succeeded';
+    const legacyStatus = await fetch(`${s.base}/api/internal/transcript/${sessionId}/runstate/status${qs}`, { headers: h });
+    assert.equal(legacyStatus.status, 200);
+    assert.equal((await legacyStatus.json()).status.status, 'legacy-succeeded');
+
+    // 新 status 列格式损坏要显式报错，不静默回退 legacy state。
+    pool.sessions[0].engine_run_state_status = { status: 7 };
+    const corruptStatus = await fetch(`${s.base}/api/internal/transcript/${sessionId}/runstate/status${qs}`, { headers: h });
+    assert.equal(corruptStatus.status, 500);
+    assert.equal((await corruptStatus.json()).error.code, 'run_state_status_corrupt');
   } finally {
     await s.close();
   }

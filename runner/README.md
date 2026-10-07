@@ -13,7 +13,7 @@ FDE 容器内两个进程（依据 `docs/design/runner-integration.md`）：
 docker build -t erix-station/fde:local runner/
 ```
 
-镜像契约见 [`docs/design/deploy-contract.md`](../docs/design/deploy-contract.md) §1/§6：三用户 1000/1001/1002 同 GID 1000、`node:22-slim`、非 root 运行路径、root→drop 1001、erix-agent v0.3.5（npm）。
+镜像契约见 [`docs/design/deploy-contract.md`](../docs/design/deploy-contract.md) §1/§6：三用户 1000/1001/1002 同 GID 1000、`node:22-slim`、非 root 运行路径、root→drop 1001、erix-agent v0.14.0（npm）。
 
 ## 环境变量（容器内，deploy-contract §6.2）
 
@@ -27,8 +27,11 @@ docker build -t erix-station/fde:local runner/
 
 ## 范围与偏差
 
+- **erix-agent 0.14.0 store 契约**：`appendRound` / `load` 是仅有的必需方法；配对的 `saveRunSnapshot` / `loadLatestRunSnapshot`、`saveRunState` / `loadRunState`、`markRunState` 是可选能力。Station 通过 `transcriptStoreContract` 验证 adapter；`loadRunStateStatus` 是宿主扩展，不是引擎必需方法。
+- **run state 分路**：`saveRunState` 写快照但剔除顶层 `state`；`markRunState` 写独立状态列。新状态字段由迁移 `0014-run-state-status.sql` 提供，legacy 快照中的 `state` 仍可读。
+- **notes 生命周期**：只调用 `onRunComplete()` 完成 active notes 并记录 `{completed, errors}`；0.12.0 已删除 `onRunStart`，notes purge/janitor 不再由 run lifecycle 驱动，宿主自调度待 PR B。
 - **P1 单实例**：`capacity=1`（单容器串行，runner §13）；多 run 并发 P2。
 - **approvals 不实现**（路径留空，P2 接入，runner §10）。
 - **spool 不落盘**（runner §7.5 待定项）；事件投递为内存缓冲 + 无限退避重试（§7.2/§4.5）。
-- **erix-agent v0.3.5 实测差异**：`createJsonFileModelConfigProvider` 读 `slots.{default,audit,fold}` 嵌套结构且字段为 `endpoint`（非 `baseURL`）——materializer 已按实测修正 config.json（见 WP3b 报告偏差记录）。
+- **历史兼容记录（v0.3.5）**：`createJsonFileModelConfigProvider` 读取 `slots.{default,audit,fold}` 嵌套结构且字段为 `endpoint`（非 `baseURL`）——materializer 已按当时实测修正 config.json（见 WP3b 报告偏差记录）。
 - **项目目录（D8 修订 2026-09-24，AGENTS.md §7）**：worker cwd 直达 `~/projects/<project>`，agentd 只确保目录存在（mkdir -p），不再 `git worktree add`；项目目录是用户资产，清场绝不删除。

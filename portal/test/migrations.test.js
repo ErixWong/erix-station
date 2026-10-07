@@ -50,7 +50,7 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
   // 新迁移追加在序列末尾（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 13, '0013 是最后编号（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 14, '0014 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -82,7 +82,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 13, '0013 是最后编号（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 14, '0014 是最后编号（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -139,7 +139,7 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0011-git-hosts.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 13, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 14, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0011-git-hosts.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS git_hosts/);
@@ -160,7 +160,7 @@ test('迁移 0012-onboarding：开户队列状态、步骤和索引全在增量 
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0012-onboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 13, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 14, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0012-onboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS fde_onboarding/);
@@ -176,7 +176,7 @@ test('迁移 0013-offboarding：增量队列可保留已停用用户并吊销 ru
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0013-offboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 13, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 14, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0013-offboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE fde_offboarding/);
@@ -189,4 +189,19 @@ test('迁移 0013-offboarding：增量队列可保留已停用用户并吊销 ru
   const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
   assert.ok(!baseline.includes('fde_offboarding'), 'baseline 不得回写 offboarding DDL');
   assert.match(baseline, /runner_token_hash text NOT NULL/, 'token nullability change remains in the migration');
+});
+
+test('迁移 0014-run-state-status：终态 status 独立列，旧快照由读取层兼容', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0014-run-state-status.sql'));
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 14, '迁移编号连续');
+
+  const sql = fs.readFileSync(path.join(dir, '0014-run-state-status.sql'), 'utf8');
+  assert.match(sql, /runs ADD COLUMN IF NOT EXISTS run_state_status jsonb/);
+  assert.match(sql, /chat_sessions ADD COLUMN IF NOT EXISTS engine_run_state_status jsonb/);
+  assert.doesNotMatch(sql, /\bUPDATE\b/i, '不回填旧数据，读取时兼容 legacy state');
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('run_state_status'), 'baseline 不得回写 runs status 列');
+  assert.ok(!baseline.includes('engine_run_state_status'), 'baseline 不得回写 session status 列');
 });
