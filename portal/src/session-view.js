@@ -173,7 +173,6 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     if (text) assistantContent.set(currentRunId, text);
   }
 
-  let fallbackCount = 0;
   const messages = anchors.map((anchor) => {
     let content = '';
     if (anchor.synthetic === true) {
@@ -182,16 +181,10 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       const anchorId = String(anchor.id);
       if (userContent.has(anchorId)) {
         content = userContent.get(anchorId);
-      } else {
-        content = userById.get(anchorId)?.anchor_text ?? '';
-        fallbackCount += 1;
       }
     } else if (anchor.role === 'assistant') {
       if (assistantContent.has(anchor.run_id)) {
         content = assistantContent.get(anchor.run_id);
-      } else {
-        content = anchor.content ?? '';
-        fallbackCount += 1;
       }
     }
     return {
@@ -206,7 +199,5 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     };
   });
 
-  // PR① 的过渡兜底唯一原因是写路径尚未把用户输入落进 transcript（由 PR② 修复）。
-  // PR② 必须删除此兜底，并把 fallbackCount === 0 作为验收断言。
-  return { messages, fallbackCount };
+  return messages;
 }

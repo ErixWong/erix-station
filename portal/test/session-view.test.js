@@ -42,14 +42,13 @@ function transcriptTexts(transcriptRows) {
   return values;
 }
 
-function assertTranscriptOrAnchorBacked(result, transcriptRows, anchors) {
+function assertTranscriptBacked(result, transcriptRows) {
   const sourceTexts = transcriptTexts(transcriptRows);
-  const anchorTexts = new Map(anchors.map((anchor) => [String(anchor.id), anchor.content]));
   for (const projected of result.messages) {
     if (projected.synthetic !== true && projected.content !== '') {
       assert.ok(
-        sourceTexts.has(projected.content) || anchorTexts.get(String(projected.id)) === projected.content,
-        `non-synthetic ${projected.role} ${projected.id} must come from transcript or its anchor`,
+        sourceTexts.has(projected.content),
+        `non-synthetic ${projected.role} ${projected.id} must come from transcript`,
       );
     }
   }
@@ -134,7 +133,7 @@ function fixture() {
     message('m2', 3, 'user', 'second question', RUN_2, { createdAt: at(5) }),
     message('a2', 4, 'assistant', 'second final answer', RUN_2, { createdAt: at(9) }),
     message('judge-1', 5, 'user', 'anchor: judge injection', RUN_2, { synthetic: true, createdAt: at(10) }),
-    message('old-user', 6, 'user', 'legacy user anchor fallback', LEGACY_RUN, { createdAt: at(11) }),
+    message('old-user', 6, 'user', 'legacy user anchor text', LEGACY_RUN, { createdAt: at(11) }),
   ];
 
   const transcriptRows = [
@@ -204,7 +203,7 @@ test('GET session projects user and final assistant text while preserving anchor
       { id: 'm2', seq: 3, role: 'user', content: 'second question', synthetic: false, attachments: [] },
       { id: 'a2', seq: 4, role: 'assistant', content: 'second final answer', synthetic: false, attachments: [] },
       { id: 'judge-1', seq: 5, role: 'user', content: 'anchor: judge injection', synthetic: true, attachments: [] },
-      { id: 'old-user', seq: 6, role: 'user', content: 'legacy user anchor fallback', synthetic: false, attachments: [] },
+      { id: 'old-user', seq: 6, role: 'user', content: '', synthetic: false, attachments: [] },
     ],
   );
   for (const id of ['m1', 'a1', 'm2', 'a2', 'judge-1']) {
@@ -221,8 +220,7 @@ test('GET session projects user and final assistant text while preserving anchor
   assert.equal(result.messages[0].created_at, at(1).toISOString());
   assert.equal(result.last_seq, 8);
   assert.equal(result.next_cursor, null);
-  assertTranscriptOrAnchorBacked(result, transcriptRows, anchors);
-  assert.equal('fallbackCount' in result, false, 'fallback metrics stay out of the GET session DTO');
+  assertTranscriptBacked(result, transcriptRows);
   assert.ok(pool.queries.some((query) => query.sql.includes('FROM transcript_rounds')));
   assert.ok(pool.queries.some((query) => query.sql.includes('ORDER BY seq DESC LIMIT $2')));
   assert.match(
@@ -235,7 +233,7 @@ test('GET session projects user and final assistant text while preserving anchor
   );
 });
 
-test('projection prefers transcript evidence and temporarily falls back for missing user content', async () => {
+test('projection prefers transcript evidence and leaves missing user content empty', async () => {
   const assistant = message('a1', 1, 'assistant', 'stale anchor text', RUN_1);
   const legacy = message('legacy', 2, 'user', 'legacy-only text', LEGACY_RUN);
   const pool = new SessionViewPool({
@@ -251,7 +249,7 @@ test('projection prefers transcript evidence and temporarily falls back for miss
 
   const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
   assert.equal(result.messages[0].content, 'from final assistant message');
-  assert.equal(result.messages[1].content, 'legacy-only text');
+  assert.equal(result.messages[1].content, '');
 });
 
 test('run-id legacy rows, session-key rows, and mixed rows project identically to their anchors', async () => {
@@ -372,7 +370,7 @@ test('run-id legacy rows, session-key rows, and mixed rows project identically t
   }
 });
 
-test('legacy run snapshot claims its previous-turn user and falls back for its current anchor', async () => {
+test('legacy run snapshot claims its previous-turn user and leaves current unmatched anchor empty', async () => {
   const previousText = 'the previous turn user message';
   const currentText = 'the current turn is missing from the snapshot';
   const snapshotMessages = [
@@ -404,7 +402,7 @@ test('legacy run snapshot claims its previous-turn user and falls back for its c
   assert.equal(snapshotMessages.at(-1).content[0].text, previousText);
   assert.equal(transcriptRows.some((row) => row.run_id === RUN_1), false);
   assert.equal(projected.get('previous-user').content, previousText);
-  assert.equal(projected.get('current-user').content, currentText);
+  assert.equal(projected.get('current-user').content, '');
 });
 
 test('users missing their own rows are recovered from later run snapshots by exact text', async () => {
@@ -458,7 +456,7 @@ test('users missing their own rows are recovered from later run snapshots by exa
   assert.equal(projected.get('crashed-a').content, 'crashed turn alpha');
   assert.equal(projected.get('crashed-b').content, 'crashed turn beta');
   assert.equal(projected.get('crashed-c').content, 'crashed turn gamma');
-  assert.equal(projected.get('current-d').content, 'unpersisted current turn');
+  assert.equal(projected.get('current-d').content, '');
 });
 
 test('a historical snapshot claims every matching user message in record order without guessing', async () => {
@@ -499,10 +497,10 @@ test('a historical snapshot claims every matching user message in record order w
       '你好，请回复 ok',
       '做个最简单的验证：回复 done',
       'another recovered turn',
-      'this text is absent from the snapshot',
+      '',
     ],
   );
-  assertTranscriptOrAnchorBacked(result, transcriptRows, anchors);
+  assertTranscriptBacked(result, transcriptRows);
 });
 
 test('input message IDs take precedence over content matching', async () => {
@@ -526,8 +524,8 @@ test('input message IDs take precedence over content matching', async () => {
   const projected = new Map(result.messages.map((row) => [row.id, row]));
 
   assert.equal(projected.get('input-target').content, 'authoritative input text');
-  assert.equal(projected.get('text-collision').content, 'authoritative input text');
-  assertTranscriptOrAnchorBacked(result, transcriptRows, anchors);
+  assert.equal(projected.get('text-collision').content, '', 'an input ID does not lend its text to another anchor');
+  assertTranscriptBacked(result, transcriptRows);
 });
 
 test('content matching takes duplicate texts in seq order and claims each anchor once across snapshots', async () => {
@@ -609,7 +607,7 @@ test('legacy row, seed, input row, and a transcript-less crashed run map without
 
   assert.equal(transcriptRows.some((row) => row.run_id === crashRun), false, 'crashed run has no transcript rows');
   assert.equal(projected.get('first-user').content, 'first task', 'legacy run row owns the first anchor');
-  assert.equal(projected.get('crashed-user').content, 'please answer me in English.', 'transcript-less anchor uses the temporary fallback');
+  assert.equal(projected.get('crashed-user').content, '', 'transcript-less non-synthetic anchor stays empty');
   assert.equal(projected.get('input-user').content, 'hello', 'input key maps by message ID');
   for (const anchor of anchors.filter((candidate) => candidate.id !== 'crashed-user')) {
     assert.equal(
@@ -649,10 +647,10 @@ test('seed claims the first unmatched exact-text anchor only once', async () => 
   const projected = new Map(result.messages.map((row) => [row.id, row]));
 
   assert.equal(projected.get('first-match').content, 'repeated request');
-  assert.equal(projected.get('second-match').content, 'repeated request');
+  assert.equal(projected.get('second-match').content, '', 'only one matching user text exists in the transcript');
 });
 
-test('transcript rows without a run ID or any key remain unattributed and use anchor fallback', async () => {
+test('transcript rows without a run ID or key remain unattributed; unmatched anchors stay empty', async () => {
   const anchors = [
     message('unattributed-user', 1, 'user', 'user anchor fallback', RUN_4),
     message('unattributed-assistant', 2, 'assistant', 'assistant anchor fallback', RUN_4),
@@ -671,12 +669,12 @@ test('transcript rows without a run ID or any key remain unattributed and use an
 
   const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
   assert.deepEqual(result.messages.map((row) => row.content), [
-    'user anchor fallback',
-    'assistant anchor fallback',
+    '',
+    '',
   ]);
 });
 
-test('session without transcript rows temporarily falls back for user and assistant anchors', async () => {
+test('session without transcript rows leaves non-synthetic message content empty', async () => {
   const anchors = [
     message('unprojected-user', 1, 'user', 'user anchor content', RUN_4),
     message('unprojected-assistant', 2, 'assistant', 'assistant anchor content', RUN_4),
@@ -687,13 +685,13 @@ test('session without transcript rows temporarily falls back for user and assist
   const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 20 });
 
   assert.deepEqual(result.messages.map((row) => row.content), [
-    'user anchor content',
-    'assistant anchor content',
+    '',
+    '',
     'synthetic content',
   ]);
 });
 
-test('projection uses transcript content when available without counting fallback hits', () => {
+test('projection uses transcript content when available', () => {
   const anchors = [
     message('evidenced-user', 1, 'user', 'stale user anchor', RUN_1),
     message('evidenced-assistant', 2, 'assistant', 'stale assistant anchor', RUN_1),
@@ -719,14 +717,13 @@ test('projection uses transcript content when available without counting fallbac
 
   const projection = projectSessionMessages({ sessionId: SESSION_ID, anchors, userAnchors, transcriptRows });
 
-  assert.deepEqual(projection.messages.map((row) => row.content), [
+  assert.deepEqual(projection.map((row) => row.content), [
     'authoritative transcript user',
     'authoritative transcript assistant',
   ]);
-  assert.equal(projection.fallbackCount, 0);
 });
 
-test('projection falls back to user and assistant anchor content and counts both hits', () => {
+test('projection leaves unmatched user and assistant anchors empty while retaining synthetic content', () => {
   const anchors = [
     message('missing-user', 1, 'user', 'user anchor fallback', RUN_1),
     message('missing-assistant', 2, 'assistant', 'assistant anchor fallback', RUN_1),
@@ -753,12 +750,11 @@ test('projection falls back to user and assistant anchor content and counts both
     transcriptRows: [],
   });
 
-  assert.deepEqual(projection.messages.map((row) => row.content), [
-    'user anchor fallback',
-    'assistant anchor fallback',
+  assert.deepEqual(projection.map((row) => row.content), [
+    '',
+    '',
     'synthetic anchor content',
   ]);
-  assert.equal(projection.fallbackCount, 2);
 });
 
 test('message cursor still filters anchor rows before transcript projection', async () => {

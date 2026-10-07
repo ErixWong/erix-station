@@ -40,8 +40,8 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0014-run-state-status.sql`（erix-agent 0.14.0：终态 status 与 run-state 快照分列；
-  旧内嵌状态由读取层兼容）。**P1 compose 显式设
+  `0015-backfill-user-input-transcript.sql`（回填旧会话缺失的用户输入 transcript 行；只增不改、幂等）。
+  **P1 compose 显式设
   `MIGRATE_ON_START: "1"`**——单实例平台起栈即自动补增量，不再需要人工补跑（deploy-contract §3.1）；
   多实例部署必须置 `0` 并外部跑迁移。
 
