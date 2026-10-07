@@ -622,7 +622,7 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
 
 /** onboarding：分配子网（IPAM）→ 可选配置 Git host → 建网络 + 容器。幂等。 */
 export async function onboardFde(pool, config, {
-  fdeName, gitHostId = null, docker, log = console,
+  fdeName, gitHostId = null, previousTokenRef = null, docker, log = console,
 } = {}) {
   return withFdeLock(pool, fdeName, async () => {
     const stackId = config.stackId ?? 'default'; // F9：本栈所有权 id
@@ -718,6 +718,7 @@ export async function onboardFde(pool, config, {
             baseUrl: gitHost.base_url,
             adminKey: gitHost.admin_key,
             login: fdeName,
+            previousTokenRef,
           });
           await setGitCredential({
             pool,

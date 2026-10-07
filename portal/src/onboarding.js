@@ -52,9 +52,12 @@ async function withTransaction(pool, work) {
 }
 
 /** Enqueue a user and persist its host assignment and selected models in the caller's transaction. */
-export async function enqueueOnboarding(client, { fdeId, gitHostId, llm }) {
+export async function enqueueOnboarding(client, { fdeId, gitHostId, llm, previousTokenRef = null }) {
   const steps = {
-    provision: { state: 'pending' },
+    provision: {
+      state: 'pending',
+      ...(previousTokenRef == null ? {} : { previousTokenRef }),
+    },
     materialize: { state: 'pending' },
     'llm-binding': {
       state: 'pending',
@@ -97,7 +100,10 @@ async function claimOne(pool) {
          JOIN fde_git_accounts a ON a.fde_id = o.fde_id
         WHERE o.state = 'pending'
           AND u.status = 'active'
-          AND NOT EXISTS (SELECT 1 FROM fde_offboarding off WHERE off.fde_id = o.fde_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM fde_offboarding off
+             WHERE off.fde_id = o.fde_id AND off.state IN ('pending', 'running')
+          )
         ORDER BY o.created_at, o.fde_id
         FOR UPDATE OF o SKIP LOCKED
         LIMIT 1`,
@@ -193,6 +199,7 @@ export async function runOnboardingOnce(pool, config, {
         await provision(pool, config, {
           fdeName: row.fde_name,
           gitHostId: row.git_host_id,
+          previousTokenRef: stepValue.previousTokenRef,
           docker,
           log,
         });
@@ -225,6 +232,7 @@ export async function runOnboardingOnce(pool, config, {
       }
 
       steps[step] = { ...stepValue, state: 'done' };
+      if (step === 'provision') delete steps[step].previousTokenRef;
       delete steps[step].error;
       await saveStep(pool, row.fde_id, step, steps[step]);
     }
