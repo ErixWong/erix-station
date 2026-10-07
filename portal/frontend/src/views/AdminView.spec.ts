@@ -558,7 +558,7 @@ describe('AdminView · FDE 用户', () => {
     expect(list.findAll('[data-test="user-row"]')).toHaveLength(2);
     expect(list.text()).toContain('✓');
     expect(list.findAll('thead th')).toHaveLength(9);
-    expect(list.findAll('thead th')[6].text()).toBe('开户状态');
+    expect(list.findAll('thead th')[6].text()).toBe('开户 / 下线');
     expect(list.findAll('thead th')[7].text()).toBe('最近登录');
     const rows = list.findAll('[data-test="user-row"]');
     expect(rows[0].findAll('td')).toHaveLength(9);
@@ -948,7 +948,7 @@ describe('AdminView · FDE 用户', () => {
     await wrapper.get('[data-test="open-user-delete"]').trigger('click');
     await flushPromises();
     expect(wrapper.find('[data-test="user-edit-modal"]').exists()).toBe(false);
-    expect(wrapper.get('[data-test="user-delete-modal"]').text()).toContain('此操作不可撤销');
+    expect(wrapper.get('[data-test="user-delete-modal"]').text()).toContain('账号将立即停用并开始 FDE 下线');
     expect(document.body.style.overflow).toBe('hidden');
     const confirmation = wrapper.get('[data-test="delete-login-confirmation"]');
     const confirmButton = wrapper.get('[data-test="confirm-user-delete"]');
@@ -1093,6 +1093,81 @@ describe('AdminView · FDE 用户', () => {
     expect(callsTo(fetchFn, 'POST', '/api/admin/users/u-llm/onboard/retry')).toHaveLength(1);
     expect(row.text()).toContain('开户中');
     expect(row.find('[data-test="retry-onboarding"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('下线 DELETE 返回 202 后保留用户并显示下线中状态', async () => {
+    let users: AdminUser[] = [{
+      id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
+      status: 'active',
+      totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+      onboarding: null,
+      offboarding: null,
+    }];
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, { items: users });
+      if (url === '/api/admin/users/u1' && init?.method === 'DELETE') {
+        users = users.map((user) => ({
+          ...user,
+          status: 'disabled',
+          offboarding: {
+            state: 'pending', step: 'disable-user', error: null, workspace_purge_after: null,
+          },
+        }));
+        return jsonResponse(202, { offboarding: users[0]?.offboarding });
+      }
+      return undefined;
+    });
+    const row = wrapper.get('[data-test="user-row"]');
+    await row.get('[data-test="edit-user"]').trigger('click');
+    await wrapper.get('[data-test="user-edit-modal"] [data-test="edit-tab-danger"]').trigger('click');
+    await wrapper.get('[data-test="open-user-delete"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="delete-login-confirmation"]').setValue('alice');
+    await wrapper.get('[data-test="confirm-user-delete"]').trigger('click');
+    await flushPromises();
+
+    expect(callsTo(fetchFn, 'DELETE', '/api/admin/users/u1')).toHaveLength(1);
+    expect(wrapper.findAll('[data-test="user-row"]')).toHaveLength(1);
+    expect(row.get('[data-test="offboarding-status"]').text()).toContain('下线中');
+    expect(wrapper.text()).toContain('已开始下线；账号立即停用');
+    expect(row.text()).toContain('停用');
+    wrapper.unmount();
+  });
+
+  it('失败下线状态展示失败步骤并可重试', async () => {
+    let users: AdminUser[] = [{
+      id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
+      status: 'disabled',
+      totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+      onboarding: null,
+      offboarding: {
+        state: 'failed', step: 'stop-container', error: 'Docker unavailable',
+        workspace_purge_after: null,
+      },
+    }];
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, { items: users });
+      if (url === '/api/admin/users/u1/offboarding/retry' && init?.method === 'POST') {
+        users = users.map((user) => ({
+          ...user,
+          offboarding: {
+            state: 'pending', step: 'stop-container', error: null, workspace_purge_after: null,
+          },
+        }));
+        return jsonResponse(200, { offboarding: users[0]?.offboarding });
+      }
+      return undefined;
+    });
+    const row = wrapper.get('[data-test="user-row"]');
+    expect(row.get('[data-test="offboarding-status"]').text()).toContain('下线失败');
+    expect(row.get('[data-test="offboarding-status"]').text()).toContain('停止 FDE 容器');
+    expect(row.get('[data-test="offboarding-status"]').attributes('title')).toBe('Docker unavailable');
+    await row.get('[data-test="retry-offboarding"]').trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'POST', '/api/admin/users/u1/offboarding/retry')).toHaveLength(1);
+    expect(row.get('[data-test="offboarding-status"]').text()).toContain('下线中');
+    expect(row.find('[data-test="retry-offboarding"]').exists()).toBe(false);
     wrapper.unmount();
   });
 

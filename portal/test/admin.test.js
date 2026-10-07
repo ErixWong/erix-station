@@ -56,6 +56,7 @@ class AdminPool extends FakePool {
     }];
     this.gitAccounts = [];
     this.onboardings = [];
+    this.offboardings = seed.offboardings ?? [];
     this.forceEmailConflict = false;
     this.sessions.push({
       id: 'ls-admin', user_id: ADMIN.id, token_hash: auth.hashToken(ADMIN_TOKEN),
@@ -82,6 +83,10 @@ class AdminPool extends FakePool {
     if (sql.includes('SELECT id, login FROM users WHERE id')) {
       const user = this.users.find((u) => u.id === params[0]);
       return { rows: user ? [{ id: user.id, login: user.login }] : [] };
+    }
+    if (sql.includes('SELECT id, login, fde_name FROM users WHERE id')) {
+      const user = this.users.find((u) => u.id === params[0]);
+      return { rows: user ? [{ id: user.id, login: user.login, fde_name: user.fde_name ?? null }] : [] };
     }
     if (sql.includes('SELECT id, provider, enabled FROM git_hosts WHERE id')) {
       return { rows: this.gitHosts.filter((host) => host.id === params[0]) };
@@ -117,6 +122,10 @@ class AdminPool extends FakePool {
     }
     if (sql.includes('WITH updated AS') && sql.includes('UPDATE users SET')) {
       const user = this.users.find((u) => u.id === params[0]);
+      if (user && sql.includes('NOT EXISTS (SELECT 1 FROM fde_offboarding')
+        && this.offboardings.some((row) => row.fde_id === user.id)) {
+        return { rows: [] };
+      }
       if (!user) return { rows: [] };
       const field = (name) => {
         const match = sql.match(new RegExp(`${name} = \\$([0-9]+)`));
@@ -171,12 +180,20 @@ class AdminPool extends FakePool {
       }
       return { rows: [{ id: user.id, login: user.login }] };
     }
-    if (sql.includes('SELECT 1 FROM containers WHERE user_id')) {
+    if (sql.includes('SELECT 1 FROM containers WHERE user_id') && !sql.includes('AS has_resources')) {
       return { rows: this.containers.some((container) => container.user_id === params[0] && container.status !== 'removed') ? [{ '?column?': 1 }] : [] };
     }
-    if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
+    if (sql.includes('AS has_resources')) {
+      const userId = params[0];
+      const hasResources = this.containers.some((container) => container.user_id === userId)
+        || this.chatSessions.some((session) => session.user_id === userId)
+        || this.onboardings.some((row) => row.fde_id === userId)
+        || this.offboardings.some((row) => row.fde_id === userId);
+      return { rows: [{ has_resources: hasResources }] };
+    }
+    if (sql.includes('SELECT id, login, fde_name FROM users WHERE id = $1 FOR UPDATE')) {
       const user = this.users.find((u) => u.id === params[0]);
-      return { rows: user ? [{ id: user.id, login: user.login }] : [] };
+      return { rows: user ? [{ id: user.id, login: user.login, fde_name: user.fde_name }] : [] };
     }
     if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) {
       const row = this.onboardings.find((item) => item.fde_id === params[0]);
@@ -190,11 +207,52 @@ class AdminPool extends FakePool {
       this.pending = this.pending.filter((pending) => pending.user_id !== params[0]);
       return { rows: [] };
     }
+    if (sql.includes("UPDATE users SET status = 'disabled'")) {
+      const user = this.users.find((item) => item.id === params[0]);
+      if (user) {
+        user.status = 'disabled';
+        user.disabled_at = new Date();
+      }
+      return { rows: [] };
+    }
+    if (sql.includes('INSERT INTO fde_offboarding')) {
+      const [fdeId, fdeName, steps] = params;
+      if (!this.offboardings.some((row) => row.fde_id === fdeId)) {
+        this.offboardings.push({
+          fde_id: fdeId, fde_name: fdeName, state: 'pending', steps: JSON.parse(steps),
+          last_error: null, workspace_purge_after: null,
+        });
+      }
+      return { rows: [] };
+    }
+    if (sql.includes('FROM fde_offboarding WHERE fde_id = $1')) {
+      const row = this.offboardings.find((item) => item.fde_id === params[0]);
+      if (sql.includes('SELECT 1')) return { rows: row ? [{ '?column?': 1 }] : [] };
+      return {
+        rows: row ? [{
+          state: row.state, steps: row.steps, last_error: row.last_error,
+          workspace_purge_after: row.workspace_purge_after,
+        }] : [],
+      };
+    }
+    if (sql.includes('UPDATE fde_offboarding') && sql.includes("SET state = 'pending'")) {
+      const row = this.offboardings.find((item) => item.fde_id === params[0]);
+      if (!row) return { rows: [] };
+      row.state = 'pending';
+      row.steps = JSON.parse(params[1]);
+      row.last_error = null;
+      return {
+        rows: [{
+          state: row.state, steps: row.steps, last_error: row.last_error,
+          workspace_purge_after: row.workspace_purge_after,
+        }],
+      };
+    }
     if (sql.includes('DELETE FROM users WHERE id')) {
       const index = this.users.findIndex((user) => user.id === params[0]);
       if (index === -1) return { rows: [] };
-      this.users.splice(index, 1);
-      return { rows: [{ id: params[0] }] };
+      const [user] = this.users.splice(index, 1);
+      return { rows: [{ id: params[0], fde_name: user.fde_name }] };
     }
     // 建用户 INSERT（RETURNING 安全字段）
     if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
@@ -228,6 +286,10 @@ class AdminPool extends FakePool {
         onboarding_state: this.onboardings.find((entry) => entry.fde_id === u.id)?.state ?? null,
         onboarding_steps: this.onboardings.find((entry) => entry.fde_id === u.id)?.steps ?? null,
         onboarding_error: this.onboardings.find((entry) => entry.fde_id === u.id)?.last_error ?? null,
+        offboarding_state: this.offboardings.find((entry) => entry.fde_id === u.id)?.state ?? null,
+        offboarding_steps: this.offboardings.find((entry) => entry.fde_id === u.id)?.steps ?? null,
+        offboarding_error: this.offboardings.find((entry) => entry.fde_id === u.id)?.last_error ?? null,
+        workspace_purge_after: this.offboardings.find((entry) => entry.fde_id === u.id)?.workspace_purge_after ?? null,
       }));
       return { rows };
     }
@@ -555,7 +617,7 @@ test('admin 用户管理：PATCH 至少一个字段且拒绝不可改 login、�
   }
 });
 
-test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖用户删除会清理会话', async () => {
+test('admin 用户管理：DELETE 自删冲突；有资源时入队并立即禁用，无资源仍立即删除', async () => {
   const { base, cookie, pool, close } = await startAdminServer();
   pool.sessions.push({ id: 'ls-alice-delete', user_id: FDE_USER.id, created_at: new Date(), revoked_at: null });
   pool.pending.push({ id: 'pending-alice', user_id: FDE_USER.id });
@@ -566,11 +628,20 @@ test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖�
 
     const withContainer = await startAdminServer({ seed: { containers: [{ user_id: FDE_USER.id, status: 'running' }] } });
     try {
+      const userSession = {
+        id: 'ls-fde-delete', user_id: FDE_USER.id, token_hash: auth.hashToken('fde-delete-token'),
+        created_at: new Date(), expires_at: new Date(Date.now() + 86_400_000),
+        last_seen_at: new Date(), revoked_at: null,
+      };
+      withContainer.pool.sessions.push(userSession);
       res = await fetch(`${withContainer.base}/api/admin/users/${FDE_USER.id}`, {
         method: 'DELETE', headers: { cookie: withContainer.cookie },
       });
-      assert.equal(res.status, 409);
-      assert.equal((await res.json()).error.code, 'user_has_active_fde');
+      assert.equal(res.status, 202);
+      assert.equal((await res.json()).offboarding.state, 'pending');
+      assert.equal(withContainer.pool.users.find((user) => user.id === FDE_USER.id).status, 'disabled');
+      assert.equal(withContainer.pool.sessions.some((session) => session.id === userSession.id), false);
+      assert.equal(withContainer.pool.offboardings[0].fde_name, FDE_USER.fde_name);
     } finally {
       await withContainer.close();
     }
@@ -581,8 +652,8 @@ test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖�
       res = await fetch(`${withRun.base}/api/admin/users/${FDE_USER.id}`, {
         method: 'DELETE', headers: { cookie: withRun.cookie },
       });
-      assert.equal(res.status, 409);
-      assert.equal((await res.json()).error.code, 'user_has_active_fde');
+      assert.equal(res.status, 202);
+      assert.equal(withRun.pool.users.find((user) => user.id === FDE_USER.id).status, 'disabled');
     } finally {
       await withRun.close();
     }
@@ -602,18 +673,71 @@ test('admin 用户管理：DELETE 自删冲突、活动资源保护；无依赖�
   }
 });
 
+test('admin 用户管理：offboarding 失败任务可重试且不可重新启用或改 FDE 名称', async () => {
+  const steps = {
+    'disable-user': { state: 'done' },
+    'stop-container': { state: 'failed', error: 'Docker unavailable' },
+    'revoke-runner-token': { state: 'pending' },
+    'revoke-llm-key': { state: 'pending' },
+    'delete-git-credential': { state: 'pending' },
+    'release-network-routes': { state: 'pending' },
+    'schedule-workspace-purge': { state: 'pending' },
+  };
+  const { base, cookie, pool, close } = await startAdminServer({
+    seed: {
+      offboardings: [{
+        fde_id: FDE_USER.id, fde_name: FDE_USER.fde_name, state: 'failed', steps,
+        last_error: 'Docker unavailable', workspace_purge_after: null,
+      }],
+    },
+  });
+  try {
+    let response = await fetch(`${base}/api/admin/users/${FDE_USER.id}/offboarding/retry`, {
+      method: 'POST', headers: { cookie },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).offboarding.state, 'pending');
+    assert.equal(pool.offboardings[0].steps['stop-container'].state, 'pending');
+    assert.equal(pool.offboardings[0].last_error, null);
+
+    response = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ display_name: 'Alice 2', fde_name: FDE_USER.fde_name }),
+    });
+    assert.equal(response.status, 200, 'unchanged FDE name must not block unrelated profile edits');
+
+    response = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'active' }),
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.code, 'user_offboarding');
+
+    response = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ fde_name: 'alice-renamed' }),
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.code, 'user_offboarding');
+  } finally {
+    await close();
+  }
+});
+
 function makeDeleteUserPool(fdeName) {
   const calls = [];
   const client = {
     async query(sql, params = []) {
       calls.push(sql);
       if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
-      if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
-        return { rows: [{ id: FDE_USER.id, login: FDE_USER.login }] };
+      if (sql.includes('SELECT id, login, fde_name FROM users WHERE id = $1 FOR UPDATE')) {
+        return { rows: [{ id: FDE_USER.id, login: FDE_USER.login, fde_name: fdeName }] };
       }
-      if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) return { rows: [] };
-      if (sql.includes('FROM containers WHERE user_id') || sql.includes('FROM runs r')) return { rows: [] };
+      if (sql.includes('AS has_resources')) return { rows: [{ has_resources: false }] };
       if (sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')) return { rows: [] };
+      if (sql.includes('DELETE FROM api_tokens') || sql.includes('DELETE FROM preview_grants')
+        || sql.includes('UPDATE preview_grants') || sql.includes('UPDATE approvals')
+        || sql.includes('UPDATE audit_log')) return { rows: [] };
       if (sql.includes('DELETE FROM users WHERE id')) return { rows: [{ id: FDE_USER.id, fde_name: fdeName }] };
       throw new Error(`Unexpected transaction query: ${sql}`);
     },
@@ -632,7 +756,7 @@ function makeDeleteUserPool(fdeName) {
   };
 }
 
-test('deleteUser：提交删除后按 RETURNING 的 fde_name 删除凭据文件', async (t) => {
+test('deleteUser：只按配置的用户空间根判断 workspace', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-delete-user-'));
   const home = path.join(root, 'alice', 'home');
   fs.mkdirSync(home, { recursive: true });
@@ -644,14 +768,14 @@ test('deleteUser：提交删除后按 RETURNING 的 fde_name 删除凭据文件'
   assert.deepEqual(await deleteUser(pool, {
     actorId: ADMIN.id,
     userId: FDE_USER.id,
-    config: { userSpaceRoot: root },
+    config: { userSpaceRoot: path.join(root, 'configured-users') },
     log: { warn() {} },
   }), { ok: true });
   assert.ok(calls.includes('DELETE FROM users WHERE id = $1 RETURNING id, fde_name'));
-  assert.equal(fs.existsSync(credentialPath), false);
+  assert.equal(fs.existsSync(credentialPath), true, '路径不在配置的用户空间根内时不得触碰');
 });
 
-test('deleteUser：凭据文件删除失败只告警，不影响已提交删除', async () => {
+test('deleteUser：用户空间已不存在时凭据清理按幂等成功处理', async () => {
   const missingRoot = path.join(os.tmpdir(), `station-delete-missing-${Date.now()}-${Math.random()}`);
   const { pool } = makeDeleteUserPool('alice');
   const warnings = [];
@@ -661,8 +785,7 @@ test('deleteUser：凭据文件删除失败只告警，不影响已提交删除'
     config: { userSpaceRoot: missingRoot },
     log: { warn: (message) => warnings.push(message) },
   }), { ok: true });
-  assert.equal(warnings.length, 1);
-  assert.ok(warnings[0].includes('git credential cleanup failed'));
+  assert.equal(warnings.length, 0, 'workspace 根目录或凭据已不存在时按幂等清理成功处理');
 });
 
 test('deleteUser：审计写入失败不回滚已提交的用户删除', async () => {
@@ -675,15 +798,10 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
     async query(sql) {
       calls.push({ executor: 'client', sql });
       if (sql === 'BEGIN') return { rows: [] };
-      if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
-        return { rows: [{ id: 'deleted-user', login: 'alice' }] };
+      if (sql.includes('SELECT id, login, fde_name FROM users WHERE id = $1 FOR UPDATE')) {
+        return { rows: [{ id: 'deleted-user', login: 'alice', fde_name: null }] };
       }
-      if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) {
-        return { rows: [] };
-      }
-      if (sql.includes('FROM containers WHERE user_id') || sql.includes('FROM runs r')) {
-        return { rows: [] };
-      }
+      if (sql.includes('AS has_resources')) return { rows: [{ has_resources: false }] };
       if (sql.includes('DELETE FROM users WHERE id')) {
         deletedInTransaction = true;
         return { rows: [{ id: 'deleted-user' }] };
@@ -697,7 +815,10 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
         if (!transactionAborted) userStillExists = !deletedInTransaction;
         return { rows: [] };
       }
-      if (sql === 'ROLLBACK' || sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')) {
+      if (sql === 'ROLLBACK' || sql.includes('DELETE FROM login_sessions') || sql.includes('DELETE FROM login_pending')
+        || sql.includes('DELETE FROM api_tokens') || sql.includes('DELETE FROM preview_grants')
+        || sql.includes('UPDATE preview_grants') || sql.includes('UPDATE approvals')
+        || sql.includes('UPDATE audit_log')) {
         return { rows: [] };
       }
       throw new Error(`Unexpected transaction query: ${sql}`);
@@ -729,29 +850,6 @@ test('deleteUser：审计写入失败不回滚已提交的用户删除', async (
   assert.deepEqual(calls[auditIndex].params, [
     'missing-admin', 'admin.user_deleted', 'alice', JSON.stringify({ user_id: 'deleted-user' }),
   ]);
-});
-
-test('deleteUser：拒绝与正在运行的开户任务并发删除', async () => {
-  const client = {
-    async query(sql) {
-      if (sql === 'BEGIN') return { rows: [] };
-      if (sql.includes('SELECT id, login FROM users WHERE id = $1 FOR UPDATE')) {
-        return { rows: [{ id: FDE_USER.id, login: FDE_USER.login }] };
-      }
-      if (sql.includes('SELECT state FROM fde_onboarding WHERE fde_id = $1 FOR UPDATE')) {
-        return { rows: [{ state: 'running' }] };
-      }
-      if (sql === 'ROLLBACK') return { rows: [] };
-      throw new Error(`Unexpected delete query: ${sql}`);
-    },
-    release() {},
-  };
-  const pool = { async connect() { return client; } };
-
-  await assert.rejects(
-    deleteUser(pool, { actorId: 'admin', userId: FDE_USER.id }),
-    (err) => err.code === 'user_onboarding_running' && err.httpStatus === 409,
-  );
 });
 
 test('admin 用户管理：重置口令校验长度、更新 scrypt hash 并吊销会话', async () => {

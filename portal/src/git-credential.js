@@ -83,7 +83,12 @@ export function removeGitCredentialFile({ config, fdeName } = {}) {
   }
 
   const root = path.resolve(config.userSpaceRoot);
-  fs.realpathSync(root);
+  try {
+    fs.realpathSync(root);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return false;
+    throw err;
+  }
   const fdeDir = path.join(root, fdeName);
   assertSafePath(root, fdeDir);
   try {
