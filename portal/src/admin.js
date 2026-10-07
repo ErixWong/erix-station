@@ -92,16 +92,24 @@ export async function listUsers(pool) {
   return { items: r.rows.map(safeUser) };
 }
 
-export async function writeUserCreatedAudit(pool, { actorId = null, login, fde_name } = {}) {
+export async function writeUserCreatedAudit(pool, {
+  actorId = null, login, fde_name, reactivated = false,
+} = {}) {
   await pool.query(
-    `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, 'admin.user_created', $2, $3)`,
-    [actorId, login, JSON.stringify({ login, fde_name })],
+    `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, $2, $3, $4)`,
+    [
+      actorId,
+      reactivated ? 'admin.user_reactivated' : 'admin.user_created',
+      login,
+      JSON.stringify({ login, fde_name, ...(reactivated ? { reactivated: true } : {}) }),
+    ],
   ).catch(() => {});
 }
 
 /**
- * 建 FDE 用户（role='fde'、auth_source='local'、status='active'；默认不启用 TOTP，见 issue #139）。
- * @returns { { user } | { user, totp_secret, totp_uri } } —— 启用时种子仅此一次下发（调用方不得再读/再显）。
+ * 建 FDE 用户，或复用同名 disabled 用户行重新激活；默认不启用 TOTP，见 issue #139。
+ * @returns { { user, reactivated } | { user, reactivated, totp_secret, totp_uri } }
+ * —— 启用时种子仅此一次下发（调用方不得再读/再显）。
  */
 export async function createUser(pool, { actorId = null, login, display_name, password, email, fde_name, totp_enabled = false, totpIssuer = 'erix-station', limits = {}, deferAudit = false } = {}) {
   const maxLogin = limits.maxLoginLength ?? 128;
@@ -123,43 +131,128 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
     throw new AdminError('validation_failed', 'fde_name 非法（小写字母/数字/连字符，≤63）', { details: { field: 'fde_name' } });
   }
 
-  const dup = await pool.query(`SELECT 1 FROM users WHERE login = $1`, [trimmedLogin]);
-  if (dup.rows.length > 0) {
-    throw new AdminError('login_conflict', `login ${trimmedLogin} 已存在`, { httpStatus: 409 });
-  }
-  const dupEmail = await pool.query(`SELECT 1 FROM users WHERE email = $1`, [trimmedEmail]);
-  if (dupEmail.rows.length > 0) {
-    throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
-  }
-  const dupFde = await pool.query(`SELECT 1 FROM users WHERE fde_name = $1`, [fde_name]);
-  if (dupFde.rows.length > 0) {
+  const existingResult = await pool.query(
+    `SELECT id, status FROM users WHERE fde_name = $1 FOR UPDATE`,
+    [fde_name],
+  );
+  const existing = existingResult.rows[0] ?? null;
+  if (existing && existing.status !== 'disabled') {
     throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
+  }
+  let previousGitAccount = null;
+  if (existing) {
+    const offboarding = await pool.query(
+      `SELECT state FROM fde_offboarding
+        WHERE fde_id = $1 AND state IN ('pending', 'running')
+        FOR UPDATE`,
+      [existing.id],
+    );
+    if (offboarding.rows.length > 0) {
+      throw new AdminError('user_offboarding', '用户下线任务仍在运行，不能重新激活', { httpStatus: 409 });
+    }
+    const gitAccount = await pool.query(
+      `SELECT git_host_id, token_ref FROM fde_git_accounts WHERE fde_id = $1`,
+      [existing.id],
+    );
+    previousGitAccount = gitAccount.rows[0] ?? null;
+  }
+
+  const duplicateLogin = await pool.query(
+    existing
+      ? `SELECT 1 FROM users WHERE login = $1 AND id <> $2`
+      : `SELECT 1 FROM users WHERE login = $1`,
+    existing ? [trimmedLogin, existing.id] : [trimmedLogin],
+  );
+  if (duplicateLogin.rows.length > 0) {
+    throw new AdminError('login_conflict', `login ${trimmedLogin} 已被占用`, {
+      httpStatus: 409, details: { field: 'login' },
+    });
+  }
+  const duplicateEmail = await pool.query(
+    existing
+      ? `SELECT 1 FROM users WHERE email = $1 AND id <> $2`
+      : `SELECT 1 FROM users WHERE email = $1`,
+    existing ? [trimmedEmail, existing.id] : [trimmedEmail],
+  );
+  if (duplicateEmail.rows.length > 0) {
+    throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
   }
 
   const passwordHash = await auth.hashPassword(password); // 与 bootstrap-admin 同口径（scrypt 自描述）
   const totpSecret = totp_enabled === true ? totp.generateSecret(20) : null;
-  const r = await pool.query(
-    `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)
-     VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6)
-     RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
-               (totp_secret IS NOT NULL) AS totp_enabled`,
-    [trimmedLogin, trimmedEmail, typeof display_name === 'string' && display_name.trim() !== '' ? display_name.trim() : trimmedLogin, passwordHash, totpSecret, fde_name],
-  ).catch((err) => {
-    if (err?.code === '23505'
-        && (err.constraint === 'users_email_key' || String(err.detail ?? '').includes('(email)'))) {
-      throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+  let r;
+  try {
+    if (existing) {
+      r = await pool.query(
+        `UPDATE users
+            SET login = $2, email = $3, display_name = $4, password_hash = $5,
+                totp_secret = $6, last_totp_step = NULL, status = 'active', disabled_at = NULL
+          WHERE id = $1 AND status = 'disabled'
+          RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+                    (totp_secret IS NOT NULL) AS totp_enabled`,
+        [
+          existing.id, trimmedLogin, trimmedEmail,
+          typeof display_name === 'string' && display_name.trim() !== '' ? display_name.trim() : trimmedLogin,
+          passwordHash, totpSecret,
+        ],
+      );
+      if (!r.rows[0]) {
+        throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
+      }
+      await pool.query(`DELETE FROM login_sessions WHERE user_id = $1`, [existing.id]);
+      await pool.query(`DELETE FROM login_pending WHERE user_id = $1`, [existing.id]);
+      await pool.query(`DELETE FROM api_tokens WHERE user_id = $1`, [existing.id]);
+      await pool.query(
+        `UPDATE fde_git_accounts
+            SET remote_login = NULL, token_ref = NULL, updated_at = now()
+          WHERE fde_id = $1`,
+        [existing.id],
+      );
+    } else {
+      r = await pool.query(
+        `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)
+         VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6)
+         RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+                   (totp_secret IS NOT NULL) AS totp_enabled`,
+        [
+          trimmedLogin, trimmedEmail,
+          typeof display_name === 'string' && display_name.trim() !== '' ? display_name.trim() : trimmedLogin,
+          passwordHash, totpSecret, fde_name,
+        ],
+      );
+    }
+  } catch (err) {
+    if (err instanceof AdminError) throw err;
+    if (err?.code === '23505') {
+      if (err.constraint === 'users_login_key' || String(err.detail ?? '').includes('(login)')) {
+        throw new AdminError('login_conflict', `login ${trimmedLogin} 已被占用`, {
+          httpStatus: 409, details: { field: 'login' },
+        });
+      }
+      if (err.constraint === 'users_email_key' || String(err.detail ?? '').includes('(email)')) {
+        throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+      }
+      if (err.constraint === 'users_fde_name_key' || String(err.detail ?? '').includes('(fde_name)')) {
+        throw new AdminError('fde_name_conflict', `fde_name ${fde_name} 已被占用`, { httpStatus: 409 });
+      }
     }
     throw err;
-  });
+  }
   const user = safeUser(r.rows[0]);
   const totpUri = totpSecret ? totp.otpauthUri(totpSecret, { issuer: totpIssuer, label: user.login }) : null;
   // 审计：details 不含口令/种子（红线）。
   if (!deferAudit) {
-    await writeUserCreatedAudit(pool, { actorId, login: trimmedLogin, fde_name });
+    await writeUserCreatedAudit(pool, { actorId, login: trimmedLogin, fde_name, reactivated: Boolean(existing) });
   }
-  return totpSecret
-    ? { user, totp_secret: totpSecret, totp_uri: totpUri }
-    : { user };
+  return {
+    user,
+    reactivated: Boolean(existing),
+    ...(previousGitAccount?.token_ref != null ? {
+      previousTokenRef: previousGitAccount.token_ref,
+      previousGitHostId: previousGitAccount.git_host_id,
+    } : {}),
+    ...(totpSecret ? { totp_secret: totpSecret, totp_uri: totpUri } : {}),
+  };
 }
 
 /** 更新管理员允许编辑的用户字段；禁用时原子吊销已有登录会话。 */
@@ -320,6 +413,7 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
       );
       await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM api_tokens WHERE user_id = $1`, [userId]);
       await client.query(
         `UPDATE preview_grants
             SET state = 'revoked', revoked_at = COALESCE(revoked_at, now()), used_at = NULL

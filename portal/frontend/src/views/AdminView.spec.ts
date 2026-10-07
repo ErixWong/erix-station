@@ -682,9 +682,10 @@ describe('AdminView · FDE 用户', () => {
     wrapper.unmount();
   });
 
-  it('默认不勾选 TOTP；创建响应无种子时关闭表单且不展示一次性盒', async () => {
+  it('默认不勾选 TOTP；重激活响应显示提示且不展示一次性盒', async () => {
     const created = {
-      user: { id: 'u4', login: 'dave', display_name: 'Dave', role: 'fde', fde_name: 'dave', status: 'active', totp_enabled: false },
+      user: { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde', status: 'active', totp_enabled: false },
+      reactivated: true,
     };
     const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
       if (url === '/api/admin/users' && init?.method === 'POST') return jsonResponse(201, created);
@@ -713,6 +714,7 @@ describe('AdminView · FDE 用户', () => {
       });
       expect(wrapper.find('[data-test="add-user-form"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+      expect(wrapper.text()).toContain('已重新激活既有 FDE 账号');
     } finally {
       wrapper.unmount();
     }

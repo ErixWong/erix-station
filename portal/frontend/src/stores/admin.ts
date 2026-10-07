@@ -79,7 +79,7 @@ export interface TotpOnce {
   uri: string;
   secret: string;
   qr: string; // qrcode data URL（旧版 qrcode(0,'M') + createDataURL(4,8) 的等价物）
-  purpose: 'created' | 'enrolled';
+  purpose: 'created' | 'reactivated' | 'enrolled';
 }
 
 interface ProvidersResponse {
@@ -98,6 +98,7 @@ interface TotpProvisionResponse {
   user: AdminUser;
   totp_secret?: string;
   totp_uri?: string;
+  reactivated?: boolean;
 }
 
 interface TotpEnrollmentResponse extends TotpProvisionResponse {
@@ -141,6 +142,7 @@ export const useAdminStore = defineStore('admin', {
     expandedProviders: [] as string[], // 旧 S.expanded（Set<string>，provider id）
     expansionTouched: false,
     totpOnce: null as TotpOnce | null, // 旧 #totpOnce 内联盒
+    lastReactivatedUserId: null as string | null,
     usersLoading: false,
   }),
 
@@ -488,6 +490,7 @@ export const useAdminStore = defineStore('admin', {
       totpEnabled?: boolean;
     }): Promise<string | null> {
       this.fdeErr = null;
+      this.lastReactivatedUserId = null;
       try {
         const body = {
           login: fields.login,
@@ -500,8 +503,11 @@ export const useAdminStore = defineStore('admin', {
           totp_enabled: fields.totpEnabled === true,
         };
         const r = await api<TotpProvisionResponse>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
+        this.lastReactivatedUserId = r.reactivated === true ? r.user.id : null;
         // TOTP 种子仅此一次显示（红线）：只在服务端返回种子时构造展示盒。
-        this.totpOnce = hasTotpProvision(r) ? await makeTotpOnce(r, 'created') : null;
+        this.totpOnce = hasTotpProvision(r)
+          ? await makeTotpOnce(r, r.reactivated === true ? 'reactivated' : 'created')
+          : null;
         await this.loadUsers();
         return null;
       } catch (e) {
