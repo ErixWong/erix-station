@@ -208,8 +208,8 @@ export function loadConfig(env = process.env) {
     userSpaceRoot: env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
     // F3：bind source 用的**宿主**路径（Docker API bind source 必须是宿主路径，与容器内 userSpaceRoot 解耦）。
     userSpaceRootHost: env.ERIX_USERSPACE_ROOT_HOST || env.ERIX_USERSPACE_ROOT || '/srv/erix/users',
-    // Offboarding 完成后保留 workspace 的天数；0 表示禁用自动清理。
-    workspaceRetentionDays: nonNegativeIntEnv(env, 'ERIX_WORKSPACE_RETENTION_DAYS', 30),
+    // Workspace 自动清理默认关闭；显式正数才会设置 purge deadline 并启用目录 sweep。
+    workspaceRetentionDays: nonNegativeIntEnv(env, 'ERIX_WORKSPACE_RETENTION_DAYS', 0),
     // FDE 工作区属主 UID/GID（user-space §6.1：1000/1000）。
     fdeUid: intEnv(env, 'FDE_USER_UID', 1000),
     fdeGid: intEnv(env, 'FDE_USER_GID', 1000),

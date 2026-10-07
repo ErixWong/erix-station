@@ -1,4 +1,4 @@
-// Durable FDE offboarding queue and delayed workspace/database purge.
+// Durable FDE offboarding workflow and optional workspace-directory cleanup.
 import fs from 'node:fs';
 import path from 'node:path';
 import { enqueueMaterializeChange, enqueueRouteChange } from './outbox.js';
@@ -7,6 +7,7 @@ import { revokeFdeLlmConfigTx } from './llm.js';
 import { removeGitCredentialFile } from './git-credential.js';
 import { assertSafePath } from './fsutil.js';
 import { validateFdeName } from './projects.js';
+import { disableGiteaAccount } from './git-mint.js';
 
 const STEPS = [
   'disable-user',
@@ -14,6 +15,7 @@ const STEPS = [
   'revoke-runner-token',
   'revoke-llm-key',
   'delete-git-credential',
+  'revoke-git-account-access',
   'release-network-routes',
   'schedule-workspace-purge',
 ];
@@ -256,6 +258,7 @@ async function releaseNetworkRoutes(pool, row, config, docker, log) {
 }
 
 async function scheduleWorkspacePurge(pool, fdeId, retentionDays) {
+  if (retentionDays === 0) return;
   await pool.query(
     `UPDATE fde_offboarding
         SET workspace_purge_after = COALESCE(workspace_purge_after, now() + ($2 * interval '1 day')),
@@ -263,6 +266,40 @@ async function scheduleWorkspacePurge(pool, fdeId, retentionDays) {
       WHERE fde_id = $1`,
     [fdeId, retentionDays],
   );
+}
+
+async function revokeGitAccountAccess(pool, fdeId, disableAccount = disableGiteaAccount) {
+  const result = await pool.query(
+    `SELECT a.remote_login, h.provider, h.base_url, h.admin_key, h.mode
+       FROM fde_git_accounts a
+       LEFT JOIN git_hosts h ON h.id = a.git_host_id
+      WHERE a.fde_id = $1`,
+    [fdeId],
+  );
+  const account = result.rows[0];
+  if (!account) return { note: 'No linked Git account' };
+  if (!account.provider) return { note: 'Git host is absent; no upstream access to revoke' };
+  if (account.mode !== 'minted') {
+    return { note: 'Skipped: user-managed Git account remains enabled' };
+  }
+  if (account.provider === 'gitlab') {
+    return { note: 'Skipped: GitLab account revocation is deferred' };
+  }
+  if (account.provider !== 'gitea') {
+    return { note: `Skipped: upstream account revocation is unsupported for ${account.provider}` };
+  }
+  if (!account.remote_login) return { note: 'No minted Git account exists' };
+
+  const outcome = await disableAccount({
+    baseUrl: account.base_url,
+    adminKey: account.admin_key,
+    login: account.remote_login,
+  });
+  return {
+    note: outcome.reason === 'absent'
+      ? 'Gitea account is already absent'
+      : 'Gitea account access disabled with prohibit_login',
+  };
 }
 
 /**
@@ -276,8 +313,9 @@ export async function runOffboardingOnce(pool, config, {
   stop = stopContainer,
   revokeKey = revokeLlmKey,
   removeCredential = removeGitCredentialFile,
+  disableGitAccount = disableGiteaAccount,
   releaseRoutes = releaseNetworkRoutes,
-  retentionDays = config.workspaceRetentionDays ?? 30,
+  retentionDays = config.workspaceRetentionDays ?? 0,
 } = {}) {
   const row = await claimOne(pool);
   if (!row) return { claimed: false };
@@ -303,6 +341,9 @@ export async function runOffboardingOnce(pool, config, {
           await revokeKey(pool, row, config);
         } else if (step === 'delete-git-credential') {
           removeCredential({ config, fdeName: row.fde_name });
+        } else if (step === 'revoke-git-account-access') {
+          const outcome = await revokeGitAccountAccess(pool, row.fde_id, disableGitAccount);
+          if (outcome.note) stepValue.note = outcome.note;
         } else if (step === 'release-network-routes') {
           await releaseRoutes(pool, row, config, docker, log);
         } else if (step === 'schedule-workspace-purge') {
@@ -409,84 +450,9 @@ function deleteWorkspaceDirectory(root, fdeName) {
   return true;
 }
 
-const USER_PURGE_QUERIES = [
-  `DELETE FROM idempotency_keys WHERE user_id = $1`,
-  `DELETE FROM api_tokens WHERE user_id = $1`,
-  `DELETE FROM login_sessions WHERE user_id = $1`,
-  `DELETE FROM login_pending WHERE user_id = $1`,
-  `DELETE FROM preview_grants
-    WHERE kind = 'session' AND parent_ticket_id IN (
-      SELECT id FROM preview_grants
-       WHERE user_id = $1 OR allocation_id IN (SELECT id FROM port_allocations WHERE fde_id = $1)
-    )`,
-  `DELETE FROM preview_grants
-    WHERE user_id = $1 OR allocation_id IN (SELECT id FROM port_allocations WHERE fde_id = $1)`,
-  `UPDATE preview_grants SET issuer_id = NULL WHERE issuer_id = $1`,
-  `UPDATE approvals SET decided_by = NULL WHERE decided_by = $1`,
-  `DELETE FROM run_queue
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM run_queue
-    WHERE container_id IN (SELECT id FROM containers WHERE user_id = $1)
-       OR owner_container_id IN (SELECT id FROM containers WHERE user_id = $1)`,
-  `DELETE FROM tool_outputs
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM approvals
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM tool_calls
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM judge_decisions
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM run_checkpoints
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM transcript_rounds
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM run_events
-    WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM artifacts
-  WHERE run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)`,
-  `DELETE FROM messages WHERE session_id IN (SELECT id FROM chat_sessions WHERE user_id = $1)`,
-  `DELETE FROM usage_ledger
-    WHERE user_id = $1
-       OR run_id IN (SELECT r.id FROM runs r JOIN chat_sessions s ON s.id = r.session_id WHERE s.user_id = $1)
-       OR project_id IN (SELECT id FROM projects WHERE user_id = $1)`,
-  `DELETE FROM port_allocations WHERE fde_id = $1`,
-  `DELETE FROM runs
-    WHERE session_id IN (SELECT id FROM chat_sessions WHERE user_id = $1)`,
-  `DELETE FROM chat_sessions WHERE user_id = $1`,
-  `DELETE FROM projects WHERE user_id = $1`,
-  `DELETE FROM materialize_outbox WHERE fde_id = $1`,
-  `DELETE FROM materialize_revisions WHERE fde_id = $1`,
-  `DELETE FROM fde_llm_bindings WHERE fde_id = $1`,
-  `DELETE FROM fde_git_accounts WHERE fde_id = $1`,
-  `DELETE FROM fde_onboarding WHERE fde_id = $1`,
-  `DELETE FROM fde_networks WHERE fde_id = $1`,
-  `DELETE FROM containers WHERE user_id = $1`,
-  `UPDATE audit_log SET actor_id = NULL WHERE actor_id = $1`,
-];
-
-async function purgeUserRows(pool, row, now) {
-  for (const sql of USER_PURGE_QUERIES) {
-    await pool.query(sql, [row.fde_id]);
-  }
-  await pool.query(`DELETE FROM users WHERE id = $1`, [row.fde_id]);
-  await pool.query(
-    `INSERT INTO audit_log (actor_id, action, target, details)
-     VALUES (NULL, 'admin.user_offboarded', $1, $2::jsonb)`,
-    [row.fde_name, JSON.stringify({
-      fde_id: row.fde_id,
-      workspace_purge_after: isoDate(row.workspace_purge_after),
-    })],
-  );
-  await pool.query(
-    `DELETE FROM fde_offboarding
-      WHERE fde_id = $1 AND state = 'done' AND workspace_purge_after <= $2`,
-    [row.fde_id, now],
-  );
-}
-
 /**
- * Remove only completed, expired offboarding workspaces. Every DB statement commits
- * independently so a failure can resume from the same done row on the next sweep.
+ * Remove only completed, explicitly scheduled offboarding workspaces. User and
+ * offboarding database rows remain as permanent account and audit records.
  */
 export async function sweepOffboardedWorkspaces(pool, config, {
   log = console,
@@ -495,7 +461,7 @@ export async function sweepOffboardedWorkspaces(pool, config, {
   removeWorkspace = deleteWorkspaceDirectory,
   lockFde = withFdeProvisioningLock,
 } = {}) {
-  if ((config.workspaceRetentionDays ?? 30) === 0) return { disabled: true, purged: 0, failed: 0 };
+  if ((config.workspaceRetentionDays ?? 0) === 0) return { disabled: true, purged: 0, failed: 0 };
   const expired = await pool.query(
     `SELECT fde_id, fde_name, workspace_purge_after
        FROM fde_offboarding
@@ -510,7 +476,6 @@ export async function sweepOffboardedWorkspaces(pool, config, {
     try {
       await lockFde(pool, row.fde_name, async () => {
         removeWorkspace(config.userSpaceRoot, row.fde_name);
-        await purgeUserRows(pool, row, now);
       });
       purged += 1;
     } catch (err) {

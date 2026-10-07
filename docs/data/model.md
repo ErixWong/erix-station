@@ -330,14 +330,14 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 
 ### 1.28 `fde_offboarding` — FDE 下线任务（issue #110）
 
-由 `deploy/migrations/0013-offboarding.sql` 增量创建；不设到 `users` 的外键，以便 workspace 保留期内保留禁用用户行，任务记录只在 purge 完成后删除。
+由 `deploy/migrations/0013-offboarding.sql` 增量创建；不设到 `users` 的外键。用户行与 offboarding 记录永久保留，便于长期审计。
 
 | 关键字段 | 语义 |
 |---|---|
-| `fde_id` / `fde_name` | 被下线用户的稳定 ID 与名称快照；workspace purge 只使用已完成任务中的名称并经真实路径校验 |
+| `fde_id` / `fde_name` | 被下线用户的稳定 ID 与名称快照；workspace sweep 只使用已完成任务中的名称并经真实路径校验 |
 | `state` / `steps` | `pending → running → done` 或 `failed`；JSONB 保存各个幂等步骤状态，管理员 retry 只重置失败步骤 |
 | `attempt` / `last_error` | 每次 claim 增加尝试次数；最近失败原因用于管理台排障 |
-| `workspace_purge_after` | 下线步骤全部完成后按 `ERIX_WORKSPACE_RETENTION_DAYS`（默认 30）设定；仅到期且 `state='done'` 的行可被 sweep 清理，配置 `0` 禁用自动 purge |
+| `workspace_purge_after` | `ERIX_WORKSPACE_RETENTION_DAYS=0`（默认）时保持 `NULL`；显式正数才设置到期时间。到期 sweep 只删 workspace 目录，用户、Git 绑定、此任务及其他 DB 行均永久保留 |
 
 ---
 

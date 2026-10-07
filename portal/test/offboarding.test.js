@@ -19,6 +19,7 @@ class OffboardingPool {
     steps = initialOffboardingSteps(),
     purgeAfter = null,
     llmBinding = null,
+    gitAccount = null,
   } = {}) {
     this.job = {
       fde_id: FDE_ID,
@@ -29,14 +30,14 @@ class OffboardingPool {
       attempt: 0,
       workspace_purge_after: purgeAfter,
     };
-    this.user = { id: FDE_ID, status: 'active' };
+    this.user = { id: FDE_ID, status: state === 'done' ? 'disabled' : 'active' };
     this.sessions = [{ user_id: FDE_ID }];
     this.pending = [{ user_id: FDE_ID }];
     this.runs = [{ user_id: FDE_ID, status: 'running' }];
     this.containers = [{ user_id: FDE_ID, runner_token_hash: 'old-hash', status: 'running' }];
     this.llmBinding = llmBinding;
+    this.gitAccount = gitAccount;
     this.queryLog = [];
-    this.purgedUser = false;
     this.auditRows = [];
   }
 
@@ -47,6 +48,9 @@ class OffboardingPool {
   async query(sql, params = []) {
     const normalized = sql.replace(/\s+/g, ' ').trim();
     this.queryLog.push({ sql: normalized, params });
+    if (/^DELETE FROM (?:users|fde_git_accounts|fde_offboarding)\b/.test(normalized)) {
+      assert.fail(`offboarding must retain database records: ${normalized}`);
+    }
     if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(normalized) || normalized.startsWith('SELECT pg_advisory')) {
       return { rows: [] };
     }
@@ -119,6 +123,9 @@ class OffboardingPool {
     if (normalized.startsWith('SELECT api_key, key_alias, gateway FROM fde_llm_bindings')) {
       return { rows: this.llmBinding?.state === 'active' ? [this.llmBinding] : [] };
     }
+    if (normalized.includes('FROM fde_git_accounts a')) {
+      return { rows: this.gitAccount ? [this.gitAccount] : [] };
+    }
     if (normalized.startsWith('UPDATE fde_llm_bindings')) {
       if (this.llmBinding) {
         this.llmBinding.state = 'revoked';
@@ -172,16 +179,8 @@ class OffboardingPool {
       if (this.job) this.job.last_error = params[1];
       return { rows: [] };
     }
-    if (normalized.startsWith('DELETE FROM users')) {
-      this.purgedUser = true;
-      return { rows: [] };
-    }
     if (normalized.startsWith('INSERT INTO audit_log')) {
       this.auditRows.push(params);
-      return { rows: [] };
-    }
-    if (normalized.startsWith('DELETE FROM fde_offboarding')) {
-      this.job = null;
       return { rows: [] };
     }
     return { rows: [] };
@@ -228,7 +227,18 @@ test('offboarding runs every step idempotently when external resources are alrea
   assert.equal(pool.runs[0].status, 'cancelling');
   assert.equal(pool.containers[0].runner_token_hash, null);
   assert.equal(pool.containers[0].status, 'removed');
-  assert.deepEqual(Object.values(pool.job.steps).map((step) => step.state), Array(7).fill('done'));
+  assert.deepEqual(Object.keys(initialOffboardingSteps()), [
+    'disable-user',
+    'stop-container',
+    'revoke-runner-token',
+    'revoke-llm-key',
+    'delete-git-credential',
+    'revoke-git-account-access',
+    'release-network-routes',
+    'schedule-workspace-purge',
+  ]);
+  assert.deepEqual(Object.values(pool.job.steps).map((step) => step.state), Array(8).fill('done'));
+  assert.equal(pool.job.steps['revoke-git-account-access'].note, 'No linked Git account');
   assert.ok(pool.job.workspace_purge_after instanceof Date);
   assert.deepEqual(docker.calls, [
     ['stop', 'fde-alice'], ['remove-container', 'fde-alice'], ['remove-network', 'fde-alice'],
@@ -313,6 +323,100 @@ test('offboarding revokes an active LiteLLM key and retries a gateway failure', 
   assert.equal(pool.job.steps['stop-container'].state, 'done');
 });
 
+test('offboarding disables minted Gitea accounts but leaves user-managed accounts and GitLab untouched', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-offboarding-git-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const account = {
+    remote_login: 'alice',
+    provider: 'gitea',
+    mode: 'minted',
+    base_url: 'https://gitea.example',
+    admin_key: 'gitea-admin-key',
+  };
+  const giteaPool = new OffboardingPool({ gitAccount: account });
+  const calls = [];
+  const options = {
+    docker: fakeDocker(),
+    lockFde: async (_pool, _name, work) => work(),
+    disableGitAccount: async (input) => {
+      calls.push(input);
+      return { disabled: true, reason: 'prohibited' };
+    },
+    log: { warn() {} },
+  };
+  const config = { userSpaceRoot: root, workspaceRetentionDays: 0, dockerHost: 'unused' };
+  await runOffboardingOnce(giteaPool, config, options);
+  assert.deepEqual(calls, [{
+    baseUrl: 'https://gitea.example',
+    adminKey: 'gitea-admin-key',
+    login: 'alice',
+  }]);
+  assert.match(giteaPool.job.steps['revoke-git-account-access'].note, /prohibit_login/);
+
+  const missingHostPool = new OffboardingPool({
+    gitAccount: { remote_login: 'alice', provider: null, mode: null },
+  });
+  calls.length = 0;
+  await runOffboardingOnce(missingHostPool, config, options);
+  assert.deepEqual(calls, []);
+  assert.equal(missingHostPool.job.steps['revoke-git-account-access'].state, 'done');
+  assert.match(missingHostPool.job.steps['revoke-git-account-access'].note, /host is absent/);
+
+  for (const mode of ['per_fde_pat', 'self_token']) {
+    const personalPool = new OffboardingPool({
+      gitAccount: { ...account, mode },
+    });
+    calls.length = 0;
+    await runOffboardingOnce(personalPool, config, options);
+    assert.deepEqual(calls, [], `${mode} must not disable the employee-owned account`);
+    assert.match(personalPool.job.steps['revoke-git-account-access'].note, /user-managed/);
+  }
+
+  const gitlabPool = new OffboardingPool({
+    gitAccount: { ...account, provider: 'gitlab' },
+  });
+  calls.length = 0;
+  await runOffboardingOnce(gitlabPool, config, options);
+  assert.deepEqual(calls, [], 'GitLab upstream revocation is deferred');
+  assert.match(gitlabPool.job.steps['revoke-git-account-access'].note, /GitLab.*deferred/);
+});
+
+test('offboarding retries a failed upstream Gitea access revocation', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-offboarding-git-retry-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pool = new OffboardingPool({
+    gitAccount: {
+      remote_login: 'alice',
+      provider: 'gitea',
+      mode: 'minted',
+      base_url: 'https://gitea.example',
+      admin_key: 'gitea-admin-key',
+    },
+  });
+  let attempts = 0;
+  const options = {
+    docker: fakeDocker(),
+    lockFde: async (_pool, _name, work) => work(),
+    disableGitAccount: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('Gitea unavailable');
+      return { disabled: true, reason: 'prohibited' };
+    },
+    log: { warn() {} },
+  };
+  const config = { userSpaceRoot: root, workspaceRetentionDays: 0, dockerHost: 'unused' };
+
+  const failed = await runOffboardingOnce(pool, config, options);
+  assert.equal(failed.state, 'failed');
+  assert.equal(failed.step, 'revoke-git-account-access');
+  assert.equal(pool.job.steps['revoke-git-account-access'].state, 'failed');
+
+  await retryOffboarding(pool, FDE_ID);
+  const completed = await runOffboardingOnce(pool, config, options);
+  assert.equal(completed.state, 'done');
+  assert.equal(attempts, 2);
+});
+
 test('workspace sweep leaves future jobs untouched, purges expired jobs, and honors retention 0', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-workspace-purge-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -327,17 +431,31 @@ test('workspace sweep leaves future jobs untouched, purges expired jobs, and hon
   }, { now, lockFde: async (_pool, _name, work) => work() });
   assert.deepEqual(result, { disabled: false, purged: 0, failed: 0 });
   assert.equal(fs.existsSync(workspace), true);
-  assert.equal(futurePool.purgedUser, false);
+  assert.equal(futurePool.user.status, 'disabled');
+  assert.equal(futurePool.job.state, 'done');
 
-  const expiredPool = new OffboardingPool({ state: 'done', purgeAfter: new Date(now.getTime() - 1) });
+  const expiredPool = new OffboardingPool({
+    state: 'done',
+    purgeAfter: new Date(now.getTime() - 1),
+    gitAccount: {
+      remote_login: 'alice',
+      provider: 'gitea',
+      mode: 'minted',
+      base_url: 'https://gitea.example',
+      admin_key: 'gitea-admin-key',
+    },
+  });
   result = await sweepOffboardedWorkspaces(expiredPool, {
     userSpaceRoot: root, workspaceRetentionDays: 30,
   }, { now, lockFde: async (_pool, _name, work) => work() });
   assert.deepEqual(result, { disabled: false, purged: 1, failed: 0 });
   assert.equal(fs.existsSync(workspace), false);
-  assert.equal(expiredPool.purgedUser, true);
-  assert.equal(expiredPool.job, null);
-  assert.equal(expiredPool.auditRows.length, 1);
+  assert.equal(expiredPool.user.status, 'disabled');
+  assert.equal(expiredPool.gitAccount.remote_login, 'alice');
+  assert.equal(expiredPool.job.state, 'done');
+  assert.equal(expiredPool.job.workspace_purge_after.getTime(), now.getTime() - 1);
+  assert.deepEqual(expiredPool.auditRows, []);
+  assert.equal(expiredPool.queryLog.some(({ sql }) => /DELETE FROM (?:users|fde_git_accounts|fde_offboarding)/.test(sql)), false);
 
   fs.mkdirSync(workspace);
   const disabledPool = new OffboardingPool({ state: 'done', purgeAfter: new Date(now.getTime() - 1) });
@@ -346,7 +464,32 @@ test('workspace sweep leaves future jobs untouched, purges expired jobs, and hon
   }, { now, lockFde: async (_pool, _name, work) => work() });
   assert.deepEqual(result, { disabled: true, purged: 0, failed: 0 });
   assert.equal(fs.existsSync(workspace), true);
-  assert.equal(disabledPool.purgedUser, false);
+  assert.equal(disabledPool.user.status, 'disabled');
+  assert.equal(disabledPool.job.state, 'done');
+  assert.equal(disabledPool.queryLog.some(({ sql }) => sql.includes('SELECT fde_id, fde_name, workspace_purge_after')), false);
+});
+
+test('retention 0 leaves workspace_purge_after NULL and both startup/hourly sweeps idle', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-workspace-retention-off-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pool = new OffboardingPool();
+  const result = await runOffboardingOnce(pool, {
+    userSpaceRoot: root, workspaceRetentionDays: 0, dockerHost: 'unused',
+  }, {
+    docker: fakeDocker(),
+    lockFde: async (_pool, _name, work) => work(),
+    log: { warn() {} },
+  });
+  assert.equal(result.state, 'done');
+  assert.equal(pool.job.workspace_purge_after, null);
+  assert.equal(pool.queryLog.some(({ sql }) => sql.includes('workspace_purge_after = COALESCE')), false);
+
+  pool.job.state = 'done';
+  const sweep = await sweepOffboardedWorkspaces(pool, { userSpaceRoot: root }, {
+    lockFde: async (_pool, _name, work) => work(),
+  });
+  assert.deepEqual(sweep, { disabled: true, purged: 0, failed: 0 });
+  assert.equal(pool.queryLog.some(({ sql }) => sql.includes('SELECT fde_id, fde_name, workspace_purge_after')), false);
 });
 
 test('workspace sweep rejects a symlink escape and retains the DB job for retry', async (t) => {
@@ -368,10 +511,9 @@ test('workspace sweep rejects a symlink escape and retains the DB job for retry'
     lockFde: async (_pool, _name, work) => work(),
     log: { warn: (message) => warnings.push(message) },
   });
-
   assert.deepEqual(result, { disabled: false, purged: 0, failed: 1 });
   assert.equal(fs.readFileSync(sentinel, 'utf8'), 'keep');
-  assert.equal(pool.purgedUser, false);
+  assert.equal(pool.user.status, 'disabled');
   assert.ok(pool.job.last_error);
   assert.equal(warnings.length, 1);
 });
