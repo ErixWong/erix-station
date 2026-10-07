@@ -15,6 +15,7 @@ import {
   runArchiveDir,
   runDataDir,
   sweepRunDataDir,
+  touchRunDataDir,
 } from '../lib/run-data.js';
 
 function makeEnv() {
@@ -102,6 +103,25 @@ test('sweep：保留期内（接近但未超 TTL）的目录保留', () => {
     sweepRunDataDir(env);
 
     assert.ok(fs.existsSync(runDataDir(home, 'run-edge')), '边界目录保留（<= TTL 不删）');
+  } finally {
+    cleanup();
+  }
+});
+
+test('活跃 run 心跳刷新顶层 mtime，避免深层 notes 写入后 resume 数据被误清', () => {
+  const { home, env, cleanup } = makeEnv();
+  try {
+    prepareRunDataDir(home, 'run-active', env);
+    const notePath = path.join(runDataDir(home, 'run-active'), 'notes', 'run', 'run-active', 'progress.json');
+    fs.mkdirSync(path.dirname(notePath), { recursive: true });
+    fs.writeFileSync(notePath, '{}');
+    ageDir(runDataDir(home, 'run-active'), 25);
+
+    touchRunDataDir(home, 'run-active');
+    sweepRunDataDir(env);
+
+    assert.ok(fs.existsSync(notePath), '活跃 run 的 notes 与 run 目录应一起保留');
+    assert.ok(fs.existsSync(runDataDir(home, 'run-active')));
   } finally {
     cleanup();
   }
