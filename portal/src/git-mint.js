@@ -121,7 +121,41 @@ function giteaExistingUser(data) {
   return { login: data.login, loginName, sourceId: data.source_id };
 }
 
-async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+async function revokePlatformGiteaTokens({
+  base, login, password, previousTokenRef, fetchImpl, timeoutMs,
+}) {
+  const userAuthorization = `Basic ${Buffer.from(`${login}:${password}`).toString('base64')}`;
+  const tokens = await requestJson({
+    fetchImpl,
+    timeoutMs,
+    provider: 'gitea',
+    url: apiUrl(base, `/api/v1/users/${encodeURIComponent(login)}/tokens`),
+    method: 'GET',
+    headers: { authorization: userAuthorization },
+  });
+  if (!Array.isArray(tokens)) {
+    throw new GitMintError('git_host_invalid_response', 'gitea API returned invalid token list');
+  }
+
+  for (const token of tokens) {
+    if (typeof token?.name !== 'string' || token.name === '') continue;
+    const isPreviousToken = previousTokenRef !== undefined && previousTokenRef !== null
+      && String(previousTokenRef) !== '' && String(token.id) === String(previousTokenRef);
+    if (!token.name.startsWith('erix-station-') && !isPreviousToken) continue;
+    await requestJson({
+      fetchImpl,
+      timeoutMs,
+      provider: 'gitea',
+      url: apiUrl(base, `/api/v1/users/${encodeURIComponent(login)}/tokens/${encodeURIComponent(token.name)}`),
+      method: 'DELETE',
+      headers: { authorization: userAuthorization },
+    });
+  }
+}
+
+async function mintGitea({
+  baseUrl, adminKey, login, previousTokenRef, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+}) {
   const base = inputBase(baseUrl, adminKey, login);
   const password = randomPassword();
   const authorization = `token ${adminKey}`;
@@ -182,6 +216,18 @@ async function mintGitea({ baseUrl, adminKey, login, fetchImpl = fetch, timeoutM
           // same-login reprovision must explicitly re-enable before minting.
           prohibit_login: false,
         },
+      });
+
+      // Gitea 1.27.2 repro: old tokens become valid again after prohibit_login=false.
+      // Its token DELETE endpoint addresses tokens by name (not id) and needs Basic auth,
+      // so list/revoke platform tokens with the password just reset above before minting.
+      await revokePlatformGiteaTokens({
+        base,
+        login: remoteLogin,
+        password,
+        previousTokenRef,
+        fetchImpl,
+        timeoutMs,
       });
     }
 

@@ -94,6 +94,11 @@ async function assertGiteaReuse(loginName, expectedLoginName) {
       assert.ok(call.body.password.length >= 32);
       return jsonResponse(200, {});
     }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice/tokens') {
+      const credentials = Buffer.from(call.auth.slice('Basic '.length), 'base64').toString();
+      assert.equal(credentials, `alice:${calls[2].body.password}`);
+      return jsonResponse(200, []);
+    }
     if (call.method === 'POST' && call.path === '/api/v1/users/alice/tokens') {
       const credentials = Buffer.from(call.auth.slice('Basic '.length), 'base64').toString();
       assert.equal(credentials, `alice:${calls[2].body.password}`);
@@ -119,6 +124,7 @@ async function assertGiteaReuse(loginName, expectedLoginName) {
     'POST /api/v1/admin/users',
     'GET /api/v1/users/alice',
     'PATCH /api/v1/admin/users/alice',
+    'GET /api/v1/users/alice/tokens',
     'POST /api/v1/users/alice/tokens',
   ]);
 }
@@ -133,6 +139,114 @@ test('Gitea falls back to username when the existing user login_name is empty', 
 
 test('Gitea falls back to username when the existing user login_name is whitespace', async () => {
   await assertGiteaReuse('  ', 'alice');
+});
+
+test('Gitea reuse revokes only Station tokens by name before minting a replacement', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = {
+      method: options.method,
+      path: new URL(url).pathname,
+      auth: options.headers.authorization,
+      body: options.body ? JSON.parse(options.body) : null,
+    };
+    calls.push(call);
+    if (call.method === 'POST' && call.path === '/api/v1/admin/users') {
+      return jsonResponse(422, { message: 'user already exists' });
+    }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice') {
+      return jsonResponse(200, { id: 42, login: 'alice', login_name: 'alice', source_id: 0 });
+    }
+    if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') {
+      return jsonResponse(200, {});
+    }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice/tokens') {
+      const credentials = Buffer.from(call.auth.slice('Basic '.length), 'base64').toString();
+      assert.equal(credentials, `alice:${calls[2].body.password}`);
+      return jsonResponse(200, [
+        { id: 91, name: 'erix-station-old-one' },
+        { id: 92, name: 'legacy-platform-token' },
+        { id: 93, name: 'tea-personal-token' },
+      ]);
+    }
+    if (call.method === 'DELETE' && call.path === '/api/v1/users/alice/tokens/erix-station-old-one') {
+      assert.equal(Buffer.from(call.auth.slice('Basic '.length), 'base64').toString(), `alice:${calls[2].body.password}`);
+      return new Response(null, { status: 204 });
+    }
+    if (call.method === 'DELETE' && call.path === '/api/v1/users/alice/tokens/legacy-platform-token') {
+      assert.equal(Buffer.from(call.auth.slice('Basic '.length), 'base64').toString(), `alice:${calls[2].body.password}`);
+      return new Response(null, { status: 204 });
+    }
+    if (call.method === 'POST' && call.path === '/api/v1/users/alice/tokens') {
+      return jsonResponse(201, { id: 94, sha1: 'new-platform-token' });
+    }
+    assert.fail(`unexpected request: ${call.method} ${call.path}`);
+  };
+
+  await mintGiteaAccount({
+    baseUrl: 'https://gitea.example',
+    adminKey: 'gitea-admin-key',
+    login: 'alice',
+    previousTokenRef: '92',
+    fetchImpl,
+  });
+
+  assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
+    'POST /api/v1/admin/users',
+    'GET /api/v1/users/alice',
+    'PATCH /api/v1/admin/users/alice',
+    'GET /api/v1/users/alice/tokens',
+    'DELETE /api/v1/users/alice/tokens/erix-station-old-one',
+    'DELETE /api/v1/users/alice/tokens/legacy-platform-token',
+    'POST /api/v1/users/alice/tokens',
+  ]);
+});
+
+test('Gitea reuse without previousTokenRef still removes named Station tokens and preserves personal tokens', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = {
+      method: options.method,
+      path: new URL(url).pathname,
+      auth: options.headers.authorization,
+    };
+    calls.push(call);
+    if (call.method === 'POST' && call.path === '/api/v1/admin/users') {
+      return jsonResponse(422, { message: 'user already exists' });
+    }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice') {
+      return jsonResponse(200, { id: 42, login: 'alice', login_name: 'alice', source_id: 0 });
+    }
+    if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') return jsonResponse(200, {});
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice/tokens') {
+      return jsonResponse(200, [
+        { id: 95, name: 'erix-station-legacy' },
+        { id: 96, name: 'tea-personal-token' },
+      ]);
+    }
+    if (call.method === 'DELETE' && call.path === '/api/v1/users/alice/tokens/erix-station-legacy') {
+      return new Response(null, { status: 204 });
+    }
+    if (call.method === 'POST' && call.path === '/api/v1/users/alice/tokens') {
+      return jsonResponse(201, { id: 97, sha1: 'new-platform-token' });
+    }
+    assert.fail(`unexpected request: ${call.method} ${call.path}`);
+  };
+
+  await mintGiteaAccount({
+    baseUrl: 'https://gitea.example',
+    adminKey: 'gitea-admin-key',
+    login: 'alice',
+    fetchImpl,
+  });
+  assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
+    'POST /api/v1/admin/users',
+    'GET /api/v1/users/alice',
+    'PATCH /api/v1/admin/users/alice',
+    'GET /api/v1/users/alice/tokens',
+    'DELETE /api/v1/users/alice/tokens/erix-station-legacy',
+    'POST /api/v1/users/alice/tokens',
+  ]);
 });
 
 test('Gitea offboarding prohibits login using a non-empty fallback login_name', async () => {
@@ -222,6 +336,9 @@ test('Gitea does not delete a reused user when token minting fails', async () =>
     if (call.method === 'PATCH' && call.path === '/api/v1/admin/users/alice') {
       return jsonResponse(200, {});
     }
+    if (call.method === 'GET' && call.path === '/api/v1/users/alice/tokens') {
+      return jsonResponse(200, []);
+    }
     if (call.method === 'POST' && call.path === '/api/v1/users/alice/tokens') {
       return jsonResponse(500, { message: 'token mint failed' });
     }
@@ -241,6 +358,7 @@ test('Gitea does not delete a reused user when token minting fails', async () =>
     'POST /api/v1/admin/users',
     'GET /api/v1/users/alice',
     'PATCH /api/v1/admin/users/alice',
+    'GET /api/v1/users/alice/tokens',
     'POST /api/v1/users/alice/tokens',
   ]);
 });

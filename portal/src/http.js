@@ -719,10 +719,15 @@ async function handleAdminApi(req, res, ctx, url) {
           },
           deferAudit: true,
         });
+        const previousTokenRef = created.previousTokenRef;
+        const previousGitHostId = created.previousGitHostId;
+        delete created.previousTokenRef;
+        delete created.previousGitHostId;
         onboardingStatus = await onboarding.enqueueOnboarding(client, {
           fdeId: created.user.id,
           gitHostId,
           llm: llmSelection,
+          previousTokenRef: previousGitHostId === gitHostId ? previousTokenRef : null,
         });
         await client.query('COMMIT');
       } catch (err) {
@@ -735,6 +740,7 @@ async function handleAdminApi(req, res, ctx, url) {
         actorId: session.user.id,
         login: created.user.login,
         fde_name: created.user.fde_name,
+        reactivated: created.reactivated,
       });
       // 创建与补绑各自只在对应响应下发种子（红线）；列表/其它端点永不回显。
       return sendJson(res, 201, { ...created, onboarding: onboardingStatus });
@@ -745,7 +751,11 @@ async function handleAdminApi(req, res, ctx, url) {
     const userId = decodeAdminUserUuid(adminUserMatch[1]);
     const action = adminUserMatch[2] ?? null;
     if (action === 'onboard/retry' && req.method === 'POST') {
-      const offboardingRow = await ctx.pool.query(`SELECT 1 FROM fde_offboarding WHERE fde_id = $1`, [userId]);
+      const offboardingRow = await ctx.pool.query(
+        `SELECT 1 FROM fde_offboarding
+          WHERE fde_id = $1 AND state IN ('pending', 'running')`,
+        [userId],
+      );
       if (offboardingRow.rows.length > 0) {
         throw new admin.AdminError('user_offboarding', '用户正在下线或处于保留期，不能重试开户', { httpStatus: 409 });
       }
