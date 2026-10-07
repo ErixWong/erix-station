@@ -235,8 +235,10 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   }
   const msgs = includeMessages
     ? await pool.query(
+      // 内容双写尚未停（下一单），但锚点侧只还需要合成行的内容：
+      // 用户/助手正文一律由官方投影提供（契约 ④：无证据留空，不读 messages.content 兜底）。
       `SELECT id, run_id, seq, role,
-              CASE WHEN synthetic OR role = 'assistant' THEN content END AS content,
+              CASE WHEN synthetic THEN content END AS content,
               synthetic, attachments, created_at
          FROM messages WHERE ${where} ORDER BY seq DESC LIMIT $2`,
       params,
@@ -247,7 +249,8 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
   msgs.rows.reverse(); // 升序返回
   const userAnchors = msgs.rows.length > 0
     ? await pool.query(
-      // Seed rows have no message ID; retain anchor text only for exact transcript matching.
+      // Seed / 引擎轮 / 历史快照行没有 message ID（投影的 meta.dedupKey 是轮级键），
+      // 故仅这类行仍保留锚点文本做精确内容匹配；`:input:<messageId>` 行走 meta.dedupKey 映射，不读此列。
       `SELECT id, run_id, seq, synthetic, content AS anchor_text, created_at
          FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`,
       [sessionId],
