@@ -347,11 +347,11 @@ export class FakeInternalPool {
 
     // ---- session transcript rounds（issue #81 P2：键 = transcript_key，唯一性 = (key, dedup_key)）----
     if (sql.includes('INSERT INTO transcript_rounds') && sql.includes('transcript_key')) {
-      const [key, dedupKey, round, record, folded, messages] = params;
+      const [key, dedupKey, round, record, folded, messages, foldedPayload] = params;
       if (this.rounds.some((x) => x.transcript_key === key && x.dedup_key === dedupKey)) return { rows: [] };
       // append_seq = 插入序（真实 schema 由迁移 0016 的序列保证；fake 用同一自增计数器模拟）。
       const seq = ++this._claim;
-      this.rounds.push({ transcript_key: key, dedup_key: dedupKey, run_id: null, round, record: JSON.parse(record), folded, messages: JSON.parse(messages), created_at: seq, append_seq: seq });
+      this.rounds.push({ transcript_key: key, dedup_key: dedupKey, run_id: null, round, record: JSON.parse(record), folded, messages: JSON.parse(messages), folded_payload: foldedPayload ? JSON.parse(foldedPayload) : null, created_at: seq, append_seq: seq });
       return { rows: [{ id: 'sr' + this.rounds.length }] };
     }
     if (sql.includes('FROM transcript_rounds WHERE transcript_key') && sql.includes('dedup_key')) {
@@ -360,14 +360,26 @@ export class FakeInternalPool {
       return { rows: r ? [{ record: r.record, folded: r.folded }] : [] };
     }
     if (sql.includes('UPDATE transcript_rounds SET record') && sql.includes('transcript_key')) {
-      const [key, dedupKey, record, folded, messages] = params;
+      const [key, dedupKey, record, folded, messages, foldedPayload] = params;
       const r = this.rounds.find((x) => x.transcript_key === key && x.dedup_key === dedupKey);
       if (r) {
         r.record = JSON.parse(record);
         r.folded = folded === true;
         r.messages = JSON.parse(messages);
+        r.folded_payload = foldedPayload ? JSON.parse(foldedPayload) : r.folded_payload ?? null;
       }
       return { rows: [] };
+    }
+    // #189/#195：recallTranscript 的取数面（round 区间 + record/folded_payload 两列，同 append_seq 保序）。
+    if (sql.includes('FROM transcript_rounds') && sql.includes('round BETWEEN')) {
+      const [runId, from, to] = params;
+      const rows = this.rounds
+        .filter((x) => x.run_id === runId && x.round >= from && x.round <= to)
+        .sort((a, b) => (a.round - b.round)
+          || ((a.append_seq ?? a.created_at ?? 0) - (b.append_seq ?? b.created_at ?? 0)))
+        .slice(0, 2000)
+        .map((x) => ({ round: x.round, record: x.record, folded_payload: x.folded_payload ?? null }));
+      return { rows };
     }
     if (sql.includes('SELECT round, record FROM transcript_rounds') && sql.includes('transcript_key')) {
       const [key, cursor, limit] = params;
@@ -451,9 +463,9 @@ export class FakeInternalPool {
 
     // ---- transcript rounds ----
     if (sql.includes('INSERT INTO transcript_rounds')) {
-      const [runId, round, record, folded, messages] = params;
+      const [runId, round, record, folded, messages, foldedPayload] = params;
       if (this.rounds.some((x) => x.run_id === runId && x.round === round)) return { rows: [] };
-      this.rounds.push({ run_id: runId, round, record: JSON.parse(record), folded, messages: JSON.parse(messages) });
+      this.rounds.push({ run_id: runId, round, record: JSON.parse(record), folded, messages: JSON.parse(messages), folded_payload: foldedPayload ? JSON.parse(foldedPayload) : null });
       return { rows: [{ id: 'r' + this.rounds.length }] };
     }
     if (sql.includes('FROM transcript_rounds WHERE run_id') && sql.includes('AND round')) {
