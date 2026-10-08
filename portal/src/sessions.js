@@ -85,14 +85,22 @@ export function validateMessageBody(body) {
 }
 
 /** session 属主校验 + 取行；不存在/不属本人/已归档/非法 UUID 一律 404（不泄露存在性，portal.md §1.2 惯例）。
- *  P5：projects 表退役留档——不再 JOIN projects（project_id 可空，cwd 为权威绑定）。 */
-async function fetchSession(pool, sessionId, userId, { forUpdate = false } = {}) {
+ *  P5：projects 表退役留档——不再 JOIN projects（project_id 可空，cwd 为权威绑定）。
+ *  withMessageCount（issue #197）：仅 getSession 置 true——同一条 SQL 内嵌 messages 相关子查询带出
+ *  会话消息总数（口径与 listSessions 的 message_count 同源：该会话 messages 表全量行数、含 synthetic、
+ *  不按 role/synthetic/分页过滤）。写在这里而非另发 COUNT：零额外往返；其余调用方（postMessage/
+ *  stop/archive/SSE 校验等）不带该列，热路径 SQL 逐字不变。 */
+async function fetchSession(pool, sessionId, userId, { forUpdate = false, withMessageCount = false } = {}) {
   if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) {
     throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
   }
   const lock = forUpdate ? ' FOR UPDATE' : '';
+  // 与 listSessions 那条内嵌子查询逐字同款（索引同理：UNIQUE (session_id, seq) 首列等值 COUNT）。
+  const countCol = withMessageCount
+    ? `,\n            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count`
+    : '';
   const res = await pool.query(
-    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.status, s.last_seq
+    `SELECT s.id, s.user_id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.status, s.last_seq${countCol}
        FROM chat_sessions s
       WHERE s.id = $1${lock}`,
     [sessionId],
@@ -234,7 +242,8 @@ export async function createSession(pool, { userId, projectId, title, model, con
  * includeMessages=false 供 SSE 仅校验 session/last_seq 时使用，避免无用 transcript 读取。
  */
 export async function getSession(pool, { userId, sessionId, limit = 20, messagesCursor, includeMessages = true }) {
-  const s = await fetchSession(pool, sessionId, userId);
+  // issue #197：withMessageCount → 会话总数与属主校验同一条 SQL 取回（见 fetchSession）。
+  const s = await fetchSession(pool, sessionId, userId, { withMessageCount: true });
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const params = [sessionId, n];
   let where = `session_id = $1`;
@@ -289,7 +298,14 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     transcriptRows: transcript.rows,
   });
   return {
-    session: { ...rowToSession(s), active_run_id: active.rows[0]?.id ?? null },
+    session: {
+      ...rowToSession(s),
+      active_run_id: active.rows[0]?.id ?? null,
+      // issue #197：会话消息总数（前端头部状态行的权威源）。口径与列表 API 的 message_count 同源
+      // （fetchSession 内嵌相关子查询：messages 全量行数、含 synthetic、不受下方 limit 分页窗口影响）。
+      // fake pool 缺列时置 null（前端按「缺失」回退已加载条数），真库恒为数字。
+      message_count: s.message_count == null ? null : Number(s.message_count),
+    },
     messages: projection,
     last_seq: Number(s.last_seq),
     // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
