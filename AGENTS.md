@@ -74,7 +74,7 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 **凭据**：`deploy/.env`（600，gitignore）→ `LITELLM_MASTER_KEY` / `LITELLM_SALT_KEY` / `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD`。⚠️ **`LITELLM_SALT_KEY` 一旦写过凭据就不能再改**（旧密文将无法解密）
 
 **已知遗留**（详见 #117）
-- LiteLLM 成本表不含自定义模型名 → 虚拟 key 的 `spend` 恒为 `0.0`，用量记账待补定价
+- ~~LiteLLM 成本表不含自定义模型名 → 虚拟 key 的 `spend` 恒为 `0.0`~~（issue #164 已补：自定义模型定价写在 `litellm_params.input_cost_per_token/output_cost_per_token`，管理台可填并显式标注未设定价；口径见 `docs/design/fde-platform.md` §11.5。`max_budget` 仍未下发）
 - 集成 e2e（`wp3a`/`wp3b`/`wp4`/`wp5`/`wp6`）通过管理台 API 建 LiteLLM credential/mock model 和 FDE binding，覆盖虚拟 key 白名单与注入链路；已不依赖旧架构
 - `station-mock-llm` 与 `portal/mock-gateway/` 已删除；端到端 mock 响应由 LiteLLM 原生 `mock_response` 提供
 

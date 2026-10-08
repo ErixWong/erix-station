@@ -121,6 +121,48 @@ function modelId(model) {
   return model?.model_info?.id ?? model?.id ?? null;
 }
 
+/** A finite, non-negative number, or null for anything else (LiteLLM may echo null/strings). */
+function costOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function pricingOverrideFields(model) {
+  const overrides = model?.model_info?.pricing_overrides;
+  return Array.isArray(overrides) ? overrides : [];
+}
+
+/**
+ * Custom per-model pricing (issue #164).
+ *
+ * LiteLLM v1.103.2 resolves cost by model name against its built-in cost map; a custom
+ * catalog name is not in that map, so the virtual key's `spend` stays 0. The authoritative
+ * place to declare a rate for a custom deployment is `litellm_params` (the server mirrors
+ * those fields onto `model_info` and strips any pricing echoed back in `model_info`).
+ *
+ * `pricing_configured` is true only when both per-token rates are known, because LiteLLM
+ * needs both to bill a request completely. When false the caller must surface it explicitly
+ * instead of letting usage silently record 0.
+ */
+function modelPricing(model) {
+  const params = model?.litellm_params ?? {};
+  const info = model?.model_info ?? {};
+  const explicitInput = costOrNull(params.input_cost_per_token);
+  const explicitOutput = costOrNull(params.output_cost_per_token);
+  const overrides = pricingOverrideFields(model);
+  const overrideInput = explicitInput ?? (overrides.includes('input_cost_per_token') ? costOrNull(info.input_cost_per_token) : null);
+  const overrideOutput = explicitOutput ?? (overrides.includes('output_cost_per_token') ? costOrNull(info.output_cost_per_token) : null);
+  const input = overrideInput ?? costOrNull(info.input_cost_per_token);
+  const output = overrideOutput ?? costOrNull(info.output_cost_per_token);
+  const hasOverride = overrideInput !== null || overrideOutput !== null;
+  const hasCostMap = costOrNull(info.input_cost_per_token) !== null || costOrNull(info.output_cost_per_token) !== null;
+  return {
+    input_cost_per_token: input,
+    output_cost_per_token: output,
+    pricing_configured: input !== null && output !== null,
+    pricing_source: hasOverride ? 'override' : (hasCostMap ? 'cost_map' : 'none'),
+  };
+}
+
 function toModel(model) {
   const id = modelId(model);
   const modelName = model?.model_name ?? '';
@@ -139,6 +181,7 @@ function toModel(model) {
     context_window: info.context_window ?? metadata.context_window ?? null,
     max_tokens: params.max_tokens ?? null,
     enabled: !isModelBlocked(model),
+    ...modelPricing(model),
     litellm_params: redactCredential(params),
     model_info: redactCredential(info),
   };
@@ -316,9 +359,24 @@ function validateMaxTokens(value) {
   }
 }
 
+/**
+ * Validate a per-token USD rate. `undefined` means "leave unchanged"; `null` means "clear";
+ * a finite non-negative number sets the rate. Units are USD per token, matching LiteLLM's
+ * `input_cost_per_token` / `output_cost_per_token`.
+ */
+function validateCost(value, field) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new LlmError('validation_failed', `${field} 必须为非负数字（USD / token）`, { details: { field } });
+  }
+  return value;
+}
+
 export async function createModel(gateway, input = {}) {
   const client = getGatewayClient(gateway);
   validateMaxTokens(input.max_tokens);
+  const inputCost = validateCost(input.input_cost_per_token, 'input_cost_per_token');
+  const outputCost = validateCost(input.output_cost_per_token, 'output_cost_per_token');
   const modelName = input.model_name ?? input.model_id;
   if (typeof modelName !== 'string' || !modelName.trim()) {
     throw new LlmError('validation_failed', 'model_id 为必填字段', { details: { field: 'model_id' } });
@@ -332,6 +390,9 @@ export async function createModel(gateway, input = {}) {
     : { ...input.litellm_params, model: upstreamModel.trim() };
   if (input.max_tokens === null) delete params.max_tokens;
   else if (input.max_tokens !== undefined) params.max_tokens = input.max_tokens;
+  // Pricing belongs on litellm_params (LiteLLM strips pricing echoed back in model_info).
+  if (inputCost !== null) params.input_cost_per_token = inputCost;
+  if (outputCost !== null) params.output_cost_per_token = outputCost;
   const suppliedInfo = input.model_info ?? {};
   const metadata = {
     ...(suppliedInfo.metadata ?? {}),
@@ -398,9 +459,15 @@ async function findGatewayModel(client, id) {
   return found;
 }
 
-export async function updateModel(gateway, id, { name, type, enabled, tool_calling, context_window, max_tokens, model } = {}) {
+export async function updateModel(gateway, id, {
+  name, type, enabled, tool_calling, context_window, max_tokens, model,
+  input_cost_per_token, output_cost_per_token,
+} = {}) {
   const client = getGatewayClient(gateway);
   validateMaxTokens(max_tokens);
+  const inputCost = validateCost(input_cost_per_token, 'input_cost_per_token');
+  const outputCost = validateCost(output_cost_per_token, 'output_cost_per_token');
+  const pricingTouched = input_cost_per_token !== undefined || output_cost_per_token !== undefined;
   let upstreamModel;
   if (model !== undefined) {
     if (typeof model !== 'string') {
@@ -424,6 +491,7 @@ export async function updateModel(gateway, id, { name, type, enabled, tool_calli
     || context_window !== undefined
     || max_tokens !== undefined
     || upstreamModel !== undefined
+    || pricingTouched
   ) {
     const info = current.model_info ?? {};
     const metadata = { ...(info.metadata ?? {}) };
@@ -441,11 +509,18 @@ export async function updateModel(gateway, id, { name, type, enabled, tool_calli
         metadata,
       };
     }
-    if (upstreamModel !== undefined || max_tokens !== undefined) {
+    if (upstreamModel !== undefined || max_tokens !== undefined || pricingTouched) {
       const params = { ...(current.litellm_params ?? {}) };
       if (upstreamModel !== undefined) params.model = upstreamModel;
       if (max_tokens === null) delete params.max_tokens;
       else if (max_tokens !== undefined) params.max_tokens = max_tokens;
+      // Explicit null clears the rate: LiteLLM removes a field that arrives as null from
+      // both litellm_params and model_info (NULL_CLEARABLE_LITELLM_PARAMS). Omitting it
+      // would instead leave the stored value untouched.
+      if (input_cost_per_token === null) params.input_cost_per_token = null;
+      else if (inputCost !== null) params.input_cost_per_token = inputCost;
+      if (output_cost_per_token === null) params.output_cost_per_token = null;
+      else if (outputCost !== null) params.output_cost_per_token = outputCost;
       update.litellm_params = params;
     }
     await client.updateModel(update);

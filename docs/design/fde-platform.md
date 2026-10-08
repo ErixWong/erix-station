@@ -589,6 +589,32 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 - **出口 allowlist 移交给安全团队的网络层策略**（白名单内容由安全团队维护）：npm registry、pypi、GitHub/内部 git、镜像仓库；**LLM 域名不在白名单**——这是「唯一出口」的实现方式（决策者 2026-09，issue #3）。平台对安全团队的接口：容器网络名/命名规范（`fde-<name>`）+ 子网段 `10.200.0.0/16` 与 `10.201.0.0/16`（默认池 `/29` 与大 FDE `/28` 池；均保留给 FDE 网络专用，`control` 已取消，H-B 定稿 issue #5）、审计事件、以及「上游 LLM 只经网关」的架构事实
 - 若安全团队的出口策略未实施 → 「防用外部 key」降级为**审计 + 告警**，须管理层**书面知情**（性质不同）
 
+### 11.5 用量与计费（定价、未知定价、spend 与 429）（issue #164）
+
+> 背景：管理台铸出的 per-FDE 虚拟 key `spend` 曾恒为 `0.0`——LiteLLM 成本表**按模型名匹配**，而我们的模型目录是自定义名（`deepseek-v4-pro`、`glm-5.3-flash-awq` 等），内置价目表里没有这些名字 → 金额算不出来。
+
+**定价从哪来（LiteLLM v1.103.2 口径，已实测）**
+
+- 单价单位是 **USD / token**（不是每 1M）。管理台 UI 以「USD / 1M tokens」呈现，提交前换算为每 token（÷1e6）。
+- 自定义模型必须**显式**声明单价，写在 **`litellm_params.input_cost_per_token` / `litellm_params.output_cost_per_token`**。
+- ⚠️ **不要写在 `model_info`**：v1.103.2 在 `/model/new` 与 `/model/{id}/update` 上用 `without_server_derived_pricing()` 剥离 `model_info` 里的定价字段（`model_info` 是服务端派生/展示数据）；真正生效的是 `litellm_params`，`Deployment.__init__` 再把它镜像进 `model_info`。`GET /model/info` 的 `model_info.pricing_overrides` 列出该 deployment 显式覆盖的定价字段，可用来区分「显式定价」与「价目表自动命中」。
+- 清空定价：`PATCH /model/{id}/update` 的 `litellm_params` 带显式 `null`（`NULL_CLEARABLE_LITELLM_PARAMS` 会把该字段从 `litellm_params` 与 `model_info` 两处移除）；字段缺省则保持原值。
+
+**未知定价必须显式（不静默为 0）**
+
+- 管理台 `GET /api/admin/llm/models`（及 providers 内嵌的 models）为每个模型带：
+  - `pricing_configured: boolean` —— **input/output 两项都有**才为 `true`（LiteLLM 需要两项才能完整计价；只填一半仍视为未配置）。
+  - `pricing_source: 'override' | 'cost_map' | 'none'` —— 显式定价 / 命中 LiteLLM 内置价目表 / 无。
+  - `input_cost_per_token`、`output_cost_per_token` —— 生效值（每 token）。
+- 前端 LLM tab 对 `pricing_configured=false` 的模型显式展示「未设定价」徽标（不静默展示 0），新增/编辑表单也给出「留空 → 该模型用量金额将记 0」的提示。编辑表单只回填**显式**定价，不回填价目表自动命中的值（避免把当日价目表冻结成覆盖值）。
+- 网关侧：未定价模型 `spend` 记 `0`（LiteLLM 会 WARNING 提示缺 `input_cost_per_token/output_cost_per_token`）；若开启 `block_requests_for_models_without_pricing`，未定价模型的请求会被**直接拒绝**而非记 0。
+
+**spend 与 `max_budget` / 429**
+
+- `spend` 由 LiteLLM 按「token 数 × 该模型单价」累计到虚拟 key / user；定价配好后管理台铸出的 key `spend` 才会增长。
+- `max_budget` 超限 → LiteLLM 对数据面请求返回 **429**；erix-agent `classifyHttpError`（`src/providers/errors.js`）把 429 归类为 `code='rate_limited'`、`retryable=true`（`RETRYABLE_CODES` 含 `rate_limited`）→ 宿主需友好提示且避免继续重试烧配额（与 §11.4「额度用尽」一致）。
+- **现状**：portal 铸 key（`generateKey`）**暂未下发 `max_budget`**；LiteLLM 客户端是透传 body，需要时可加。因此当前无法仅靠管理台触发「budget 超限 429」，真机验收需直接在 LiteLLM 侧给 key 设 `max_budget`（见 issue #164 报告）。
+
 ---
 
 ## 12. 容器模板与工作区约定

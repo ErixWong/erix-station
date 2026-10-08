@@ -129,6 +129,8 @@ class LlmFakePool {
           model: m.upstream_model ?? m.model_id,
           litellm_credential_name: m.provider_id,
           ...(m.max_tokens == null ? {} : { max_tokens: m.max_tokens }),
+          ...(m.input_cost_per_token == null ? {} : { input_cost_per_token: m.input_cost_per_token }),
+          ...(m.output_cost_per_token == null ? {} : { output_cost_per_token: m.output_cost_per_token }),
         },
         model_info: {
           id: m.id,
@@ -138,6 +140,15 @@ class LlmFakePool {
           tool_calling: m.tool_calling,
           context_window: m.context_window,
           display_name: m.name,
+          // LiteLLM mirrors litellm_params pricing onto model_info and lists explicitly
+          // overridden fields in pricing_overrides. cost_map_* stands in for rates LiteLLM
+          // resolves from its built-in cost map for a known model name.
+          input_cost_per_token: m.input_cost_per_token ?? m.cost_map_input_cost_per_token ?? null,
+          output_cost_per_token: m.output_cost_per_token ?? m.cost_map_output_cost_per_token ?? null,
+          pricing_overrides: [
+            ...(m.input_cost_per_token == null ? [] : ['input_cost_per_token']),
+            ...(m.output_cost_per_token == null ? [] : ['output_cost_per_token']),
+          ],
           metadata: { type: m.type, tool_calling: m.tool_calling, context_window: m.context_window },
         },
       })),
@@ -158,6 +169,8 @@ class LlmFakePool {
       tool_calling: body.model_info?.tool_calling ?? body.model_info?.metadata?.tool_calling ?? false,
       context_window: body.model_info?.context_window ?? body.model_info?.metadata?.context_window ?? null,
       max_tokens: body.litellm_params?.max_tokens ?? null,
+      input_cost_per_token: body.litellm_params?.input_cost_per_token ?? null,
+      output_cost_per_token: body.litellm_params?.output_cost_per_token ?? null,
       upstream_model: body.litellm_params?.model,
       enabled: true,
     });
@@ -180,6 +193,12 @@ class LlmFakePool {
       m.upstream_model = body.litellm_params.model;
       m.provider_id = body.litellm_params.litellm_credential_name;
       m.max_tokens = body.litellm_params.max_tokens ?? null;
+      if ('input_cost_per_token' in body.litellm_params) {
+        m.input_cost_per_token = body.litellm_params.input_cost_per_token ?? null;
+      }
+      if ('output_cost_per_token' in body.litellm_params) {
+        m.output_cost_per_token = body.litellm_params.output_cost_per_token ?? null;
+      }
     }
     return { model_id: m.id };
   }
@@ -775,6 +794,126 @@ test('model list：toModel exposes max_tokens and defaults missing values to nul
   const { items } = await listModels(pool);
   assert.equal(items[0].max_tokens, 8192);
   assert.equal(items[1].max_tokens, null);
+});
+
+// --- issue #164：自定义模型定价（虚拟 key spend 恒 0） -------------------------------
+
+test('model create：定价写入 litellm_params（USD/token），不写进 model_info', async () => {
+  const pool = new LlmFakePool();
+  await createModel(pool, {
+    provider_id: 'p1',
+    model_id: 'deepseek-v4-pro',
+    model: 'openai/deepseek-flash',
+    name: 'DeepSeek V4 Pro',
+    type: 'text',
+    input_cost_per_token: 0.0000003,
+    output_cost_per_token: 0.0000012,
+  });
+  const call = pool.gatewayCalls.find((entry) => entry.method === 'createModel');
+  // LiteLLM v1.103.2 strips pricing echoed in model_info; the authoritative blob is litellm_params.
+  assert.equal(call.body.litellm_params.input_cost_per_token, 0.0000003);
+  assert.equal(call.body.litellm_params.output_cost_per_token, 0.0000012);
+  assert.equal(Object.hasOwn(call.body.model_info, 'input_cost_per_token'), false);
+  assert.equal(Object.hasOwn(call.body.model_info, 'output_cost_per_token'), false);
+});
+
+test('model create：未填定价时请求体不含 cost 字段（由 list 的 pricing_configured 显式标记）', async () => {
+  const pool = new LlmFakePool();
+  await createModel(pool, {
+    provider_id: 'p1',
+    model_id: 'deepseek-v4-pro',
+    model: 'openai/deepseek-flash',
+    type: 'text',
+  });
+  const call = pool.gatewayCalls.find((entry) => entry.method === 'createModel');
+  assert.equal(Object.hasOwn(call.body.litellm_params, 'input_cost_per_token'), false);
+  assert.equal(Object.hasOwn(call.body.litellm_params, 'output_cost_per_token'), false);
+});
+
+test('model list：pricing_configured 标记未定价 / 显式定价 / 价目表命中', async () => {
+  const pool = new LlmFakePool({
+    models: [
+      // 自定义名，无定价 → 必须显式暴露未配置（不再静默为 0）
+      { id: 'm-none', provider_id: 'p1', model_id: 'deepseek-v4-pro', type: 'text' },
+      // 显式填了两项定价
+      {
+        id: 'm-override', provider_id: 'p1', model_id: 'glm-5.3-flash-awq', type: 'text',
+        input_cost_per_token: 0.0000001, output_cost_per_token: 0.0000004,
+      },
+      // 只填了 input：LiteLLM 无法完整计价 → 仍视为未配置
+      { id: 'm-partial', provider_id: 'p1', model_id: 'partial-model', type: 'text', input_cost_per_token: 0.0000001 },
+      // 名字命中 LiteLLM 内置价目表 → 自动计价
+      {
+        id: 'm-costmap', provider_id: 'p1', model_id: 'gpt-4o', type: 'text',
+        cost_map_input_cost_per_token: 0.0000025, cost_map_output_cost_per_token: 0.00001,
+      },
+    ],
+  });
+  const { items } = await listModels(pool);
+  const byId = Object.fromEntries(items.map((m) => [m.id, m]));
+  assert.equal(byId['m-none'].pricing_configured, false);
+  assert.equal(byId['m-none'].pricing_source, 'none');
+  assert.equal(byId['m-none'].input_cost_per_token, null);
+  assert.equal(byId['m-override'].pricing_configured, true);
+  assert.equal(byId['m-override'].pricing_source, 'override');
+  assert.equal(byId['m-override'].input_cost_per_token, 0.0000001);
+  assert.equal(byId['m-override'].output_cost_per_token, 0.0000004);
+  assert.equal(byId['m-partial'].pricing_configured, false);
+  assert.equal(byId['m-costmap'].pricing_configured, true);
+  assert.equal(byId['m-costmap'].pricing_source, 'cost_map');
+});
+
+test('model update：定价写入 litellm_params；null 清空；undefined 保持不变', async () => {
+  const pool = new LlmFakePool({
+    models: [
+      {
+        id: 'm1', provider_id: 'p1', model_id: 'deepseek-v4-pro', name: 'V4', type: 'text',
+        upstream_model: 'openai/deepseek-flash',
+        input_cost_per_token: 0.0000003, output_cost_per_token: 0.0000012,
+      },
+    ],
+  });
+
+  // 只改名字：不带定价 → 请求体不触碰 litellm_params
+  await updateModel(pool, 'm1', { name: 'V4 renamed' });
+  let call = pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').at(-1);
+  assert.equal(call.body.litellm_params, undefined);
+
+  // 改定价：写入 litellm_params
+  await updateModel(pool, 'm1', { input_cost_per_token: 0.0000005, output_cost_per_token: 0.000002 });
+  call = pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').at(-1);
+  assert.equal(call.body.litellm_params.input_cost_per_token, 0.0000005);
+  assert.equal(call.body.litellm_params.output_cost_per_token, 0.000002);
+  assert.equal(pool.models[0].input_cost_per_token, 0.0000005);
+
+  // null 清空：显式发 null（LiteLLM 才会从两个 blob 移除）
+  await updateModel(pool, 'm1', { input_cost_per_token: null, output_cost_per_token: null });
+  call = pool.gatewayCalls.filter((entry) => entry.method === 'updateModel').at(-1);
+  assert.equal(call.body.litellm_params.input_cost_per_token, null);
+  assert.equal(call.body.litellm_params.output_cost_per_token, null);
+  assert.equal(pool.models[0].input_cost_per_token, null);
+  assert.equal(pool.models[0].output_cost_per_token, null);
+});
+
+test('model create/update：定价必须是有限非负数', async () => {
+  const pool = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'x', type: 'text', upstream_model: 'openai/x' }],
+  });
+  for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY, '0.1', true]) {
+    await assert.rejects(
+      () => createModel(pool, { provider_id: 'p1', model_id: 'x', model: 'openai/x', input_cost_per_token: value }),
+      (error) => error instanceof LlmError
+        && error.code === 'validation_failed'
+        && error.details.field === 'input_cost_per_token',
+    );
+    await assert.rejects(
+      () => updateModel(pool, 'm1', { output_cost_per_token: value }),
+      (error) => error instanceof LlmError
+        && error.code === 'validation_failed'
+        && error.details.field === 'output_cost_per_token',
+    );
+  }
+  assert.equal(pool.gatewayCalls.length, 0);
 });
 
 test('model create：max_tokens 只接受正整数', async () => {
@@ -1668,10 +1807,19 @@ test('HTTP：credential/model admin endpoints proxy create, update, block and de
     const p2 = (await res.json()).provider;
     res = await fetch(`${base}/api/admin/llm/providers/${p2.id}/models`, {
       method: 'POST', headers: H,
-      body: JSON.stringify({ model_id: 'deepseek-flash', model: 'deepseek/deepseek-chat', name: 'DeepSeek Flash', type: 'text', tool_calling: true, context_window: 200000 }),
+      body: JSON.stringify({ model_id: 'deepseek-flash', model: 'deepseek/deepseek-chat', name: 'DeepSeek Flash', type: 'text', tool_calling: true, context_window: 200000, input_cost_per_token: 0.0000003, output_cost_per_token: 0.0000012 }),
     });
     assert.equal(res.status, 201);
-    assert.equal(pool.llm.models.find((model) => model.provider_id === p2.id).upstream_model, 'deepseek/deepseek-chat');
+    const created = pool.llm.models.find((model) => model.provider_id === p2.id);
+    assert.equal(created.upstream_model, 'deepseek/deepseek-chat');
+    // issue #164：定价经 HTTP 透传到 litellm_params，list 响应带 pricing_configured。
+    assert.equal(created.input_cost_per_token, 0.0000003);
+    assert.equal(created.output_cost_per_token, 0.0000012);
+    res = await fetch(`${base}/api/admin/llm/models`, { headers: { cookie: admin.cookie } });
+    assert.equal(res.status, 200);
+    const listed = (await res.json()).items.find((model) => model.id === created.id);
+    assert.equal(listed.pricing_configured, true);
+    assert.equal(listed.pricing_source, 'override');
 
     // Credential base_url update; credential enable/disable is unsupported.
     res = await fetch(`${base}/api/admin/llm/providers/${p2.id}`, { method: 'PATCH', headers: H, body: JSON.stringify({ enabled: false }) });

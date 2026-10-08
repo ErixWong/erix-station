@@ -15,6 +15,8 @@ const deleting = ref(false);
 
 const providerForm = reactive({ name: '', base_url: '', api_key: '' });
 const providerEditForm = reactive({ base_url: '', api_key: '' });
+// issue #164：定价以「USD / 1M tokens」呈现（LiteLLM 存的是每 token 单价，提交前换算）。
+const PER_MILLION = 1_000_000;
 const modelForm = reactive({
   model_id: '',
   model: '',
@@ -23,8 +25,35 @@ const modelForm = reactive({
   tool_calling: false,
   context_window: '',
   max_tokens: '',
+  input_cost_per_1m: '' as string | number,
+  output_cost_per_1m: '' as string | number,
 });
-const modelEditForm = reactive({ model: '', name: '', type: 'text', tool_calling: false, context_window: '', max_tokens: '' });
+const modelEditForm = reactive({
+  model: '', name: '', type: 'text', tool_calling: false, context_window: '', max_tokens: '',
+  input_cost_per_1m: '' as string | number, output_cost_per_1m: '' as string | number, clear_pricing: false,
+});
+
+/** 每 token 单价 → 「每 1M tokens」输入框字符串（空值保持为空）。 */
+function perTokenToInput(value?: number | null): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '';
+  return String(Number((value * PER_MILLION).toPrecision(6)));
+}
+
+/** 「每 1M tokens」输入 → 每 token 单价；空值返回 undefined（表示「不变/不填」）。 */
+function inputToPerToken(raw: string | number | null | undefined): number | undefined {
+  if (raw === null || raw === undefined || raw === '') return undefined;
+  const value = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(value) || value < 0) return undefined;
+  return value / PER_MILLION;
+}
+
+/** 表格展示：每 token 单价 → 每 1M tokens 的可读字符串。 */
+function formatPerMillion(value?: number | null): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  return `$${Number((value * PER_MILLION).toPrecision(6))}`;
+}
+
+const editPricingFromCostMap = computed(() => editingModel.value?.pricing_source === 'cost_map');
 
 type DeleteTarget = { type: 'provider'; provider: LlmProvider } | { type: 'model'; model: LlmModel };
 const deleteTarget = ref<DeleteTarget | null>(null);
@@ -87,6 +116,8 @@ function openAddModel(providerId: string) {
   modelForm.tool_calling = false;
   modelForm.context_window = '';
   modelForm.max_tokens = '';
+  modelForm.input_cost_per_1m = '';
+  modelForm.output_cost_per_1m = '';
   selectedProviderId.value = providerId;
 }
 
@@ -97,6 +128,8 @@ function closeAddModel() {
 async function onAddModel() {
   const providerId = selectedProviderId.value;
   if (!providerId) return;
+  const inputCost = inputToPerToken(modelForm.input_cost_per_1m);
+  const outputCost = inputToPerToken(modelForm.output_cost_per_1m);
   const err = await admin.addModel(providerId, {
     model_id: modelForm.model_id.trim(),
     model: modelForm.model.trim(),
@@ -105,6 +138,8 @@ async function onAddModel() {
     tool_calling: modelForm.tool_calling,
     context_window: modelForm.context_window ? Number(modelForm.context_window) : null,
     max_tokens: modelForm.max_tokens ? Number(modelForm.max_tokens) : null,
+    ...(inputCost === undefined ? {} : { input_cost_per_token: inputCost }),
+    ...(outputCost === undefined ? {} : { output_cost_per_token: outputCost }),
   });
   if (!err && !admin.llmErr) closeAddModel();
 }
@@ -116,12 +151,19 @@ function openEditModel(model: LlmModel) {
   modelEditForm.tool_calling = model.tool_calling;
   modelEditForm.context_window = model.context_window === null ? '' : String(model.context_window);
   modelEditForm.max_tokens = model.max_tokens === null ? '' : String(model.max_tokens);
+  // 只回填本模型「显式」定价；价目表自动命中时不回填，避免把当日价目表冻结成覆盖值。
+  const hasOverride = model.pricing_source === 'override';
+  modelEditForm.input_cost_per_1m = hasOverride ? perTokenToInput(model.input_cost_per_token) : '';
+  modelEditForm.output_cost_per_1m = hasOverride ? perTokenToInput(model.output_cost_per_token) : '';
+  modelEditForm.clear_pricing = false;
   editingModel.value = model;
 }
 
 async function onUpdateModel() {
   const model = editingModel.value;
   if (!model) return;
+  const inputCost = modelEditForm.clear_pricing ? null : inputToPerToken(modelEditForm.input_cost_per_1m);
+  const outputCost = modelEditForm.clear_pricing ? null : inputToPerToken(modelEditForm.output_cost_per_1m);
   const err = await admin.updateModel(model, {
     ...(modelEditForm.model.trim() ? { model: modelEditForm.model.trim() } : {}),
     name: modelEditForm.name.trim(),
@@ -129,6 +171,8 @@ async function onUpdateModel() {
     tool_calling: modelEditForm.tool_calling,
     ...(modelEditForm.context_window ? { context_window: Number(modelEditForm.context_window) } : {}),
     ...(modelEditForm.max_tokens ? { max_tokens: Number(modelEditForm.max_tokens) } : {}),
+    ...(inputCost === undefined ? {} : { input_cost_per_token: inputCost }),
+    ...(outputCost === undefined ? {} : { output_cost_per_token: outputCost }),
   });
   if (!err) editingModel.value = null;
 }
@@ -214,13 +258,14 @@ onMounted(() => {
                   <th class="py-1 pr-3 font-medium">tool_calling</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colMaxOutput') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colPricing') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
                   <th class="py-1 font-medium"></th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-if="p.models.length === 0">
-                  <td colspan="7" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
+                  <td colspan="8" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
                 </tr>
                 <tr v-for="m in p.models" :key="m.id" data-test="model-row" class="border-t border-black/5">
                   <td class="py-1 pr-3">{{ m.name }}</td>
@@ -230,6 +275,16 @@ onMounted(() => {
                   <td class="py-1 pr-3">{{ m.tool_calling ? '✓' : '—' }}</td>
                   <td class="py-1 pr-3">{{ m.context_window ?? '—' }}</td>
                   <td class="py-1 pr-3">{{ m.max_tokens ?? '—' }}</td>
+                  <td class="py-1 pr-3">
+                    <span
+                      v-if="!m.pricing_configured"
+                      data-test="model-pricing-missing"
+                      class="rounded border border-amber-600 bg-amber-50 px-1.5 py-0.5 text-xs font-medium text-amber-700"
+                    >{{ t('admin.llm.pricingMissing') }}</span>
+                    <span v-else data-test="model-pricing" class="text-xs text-black/70">
+                      {{ formatPerMillion(m.input_cost_per_token) }} / {{ formatPerMillion(m.output_cost_per_token) }}<span class="text-black/40"> · /1M</span>
+                    </span>
+                  </td>
                   <td class="py-1 pr-3">
                     <span
                       class="rounded border px-1.5 py-0.5 text-xs font-medium"
@@ -378,6 +433,15 @@ onMounted(() => {
         {{ t('admin.llm.colMaxOutput') }}
         <input v-model="modelForm.max_tokens" data-test="add-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.inputCostLabel') }}
+        <input v-model="modelForm.input_cost_per_1m" data-test="add-model-input-cost" type="number" min="0" step="any" placeholder="0.28" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.outputCostLabel') }}
+        <input v-model="modelForm.output_cost_per_1m" data-test="add-model-output-cost" type="number" min="0" step="any" placeholder="1.10" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+      </label>
+      <p class="text-[0.7rem] text-black/45 sm:col-span-2">{{ t('admin.llm.pricingHintAdd') }}</p>
       <label class="flex items-center gap-1 text-xs text-black/55">
         <input v-model="modelForm.tool_calling" type="checkbox" class="accent-brand"> tool_calling
       </label>
@@ -430,8 +494,25 @@ onMounted(() => {
         <input v-model="modelEditForm.max_tokens" data-test="edit-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputHint') }}</span>
       </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.inputCostLabel') }}
+        <input v-model="modelEditForm.input_cost_per_1m" data-test="edit-model-input-cost" type="number" min="0" step="any" :disabled="modelEditForm.clear_pricing" class="rounded-md border border-black/20 px-2 py-1 text-sm disabled:bg-black/5">
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.outputCostLabel') }}
+        <input v-model="modelEditForm.output_cost_per_1m" data-test="edit-model-output-cost" type="number" min="0" step="any" :disabled="modelEditForm.clear_pricing" class="rounded-md border border-black/20 px-2 py-1 text-sm disabled:bg-black/5">
+      </label>
+      <p class="text-[0.7rem] text-black/45 sm:col-span-2">
+        <template v-if="editPricingFromCostMap">{{ t('admin.llm.pricingFromCostMap') }} </template>{{ t('admin.llm.pricingHintEdit') }}
+      </p>
       <label class="flex items-center gap-1 text-xs text-black/55">
         <input v-model="modelEditForm.tool_calling" type="checkbox" class="accent-brand"> tool_calling
+      </label>
+      <label
+        v-if="editingModel?.pricing_source === 'override'"
+        class="flex items-center gap-1 text-xs text-black/55"
+      >
+        <input v-model="modelEditForm.clear_pricing" data-test="edit-model-clear-pricing" type="checkbox" class="accent-brand"> {{ t('admin.llm.pricingClear') }}
       </label>
       <p v-if="admin.llmErr" class="syserr sm:col-span-2" role="alert">{{ admin.llmErr }}</p>
       <div class="flex gap-2 sm:col-span-2">
