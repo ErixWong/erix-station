@@ -88,7 +88,10 @@ class MessagePool extends FakePool {
     if (sql.includes('INSERT INTO messages')) {
       return { rows: [{ id: 'm1', seq: 6, content: params[2], created_at: new Date('2026-09-22T00:00:00Z') }] };
     }
-    if (sql.includes('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的 load(key)
+    if (sql.includes('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的回退路径 load(key)
+    // 0.17.0 成对快路径探针（#193）：本 fake 不种子 transcript 行 → 点查未命中 + max_round null。
+    if (sql.includes('SELECT record FROM transcript_rounds')) return { rows: [] };
+    if (sql.includes('SELECT MAX(round)')) return { rows: [{ max_round: null }] };
     if (sql.includes('INSERT INTO transcript_rounds')) return { rows: [] };
     if (sql.includes('INSERT INTO runs')) return { rows: [{ id: params[0], status: 'queued' }] };
     return super.query(sql, params);
