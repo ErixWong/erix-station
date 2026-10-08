@@ -3,7 +3,8 @@
 //   + 重启 portal 触发物化写 config.json → provision FDE（真实 runner 镜像）→ agentd SSE 连接 + ping
 //   → 发消息建 run（真实 API：同事务落 transcript 用户轮次 + run 入队，§4.3）
 //   → worker 跑 erix-agent runToolLoop（LiteLLM mock model）→ 事件 seq 落库 → 终态 + run_end + usage 记账
-//   → 崩溃恢复：run 进行中 docker restart FDE → agentd 重启 → re-claim（attempt+1、resume=true）→ 终态。
+//   → 崩溃恢复：run 进行中 docker kill FDE（SIGKILL，不给优雅 drain 机会）→ docker 依
+//     RestartPolicy=unless-stopped 自动拉起 → 新 agentd re-claim（attempt+1、resume=true）→ 终态。
 // 运行：npm run test:integration:wp3b
 //
 // 并行隔离用法（F8）：不拆共享栈（station-*）的前提下跑隔离栈——所有固定名/端口经 env 派生：
@@ -13,14 +14,36 @@
 //   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=alice43 \
 //   BACKEND_SUBNET=172.33.0.0/24 STATION_LITELLM_NAME=station-litellm-43 \
 //   STATION_DOCKER_PROXY_NAME=station-docker-proxy-43 STATION_EDGE_NAME=station-edge-43 \
+//   IPAM_RESERVED_SUBNETS=10.200.0.0/29,10.200.0.32/29 \
+//   PORTAL_PUBLIC_BASE_URL=http://station.localhost:18090 \
+//   PORTAL_INTERNAL_HOSTS=station.localhost \
 //   FDE_IMAGE=erix-station/fde:e2e-43 STATION_PORTAL_IMAGE=erix-station/portal:e2e-43 \
 //   node portal/integration/wp3b-e2e.mjs
-// （⚠️ 除端口/固定名外，**子网与三个容器名（litellm/docker-proxy/edge）也必须派生**——
-//   否则与共享栈撞 subnet/container_name（compose 缺省 172.32.0.0/24 与 station-* 容器名）。）
-// （fde 容器/网络名 = fde-<FDE_NAME>，由 portal provisioner 生成；compose() 已透传进程 env，
-//   COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 18080/4100/8090/8443、station-*、alice。
-//   TRAEFIK_STATIC_HOST 无需手传：脚本每次 up 前自动生成「仅替换入口端口」的临时 traefik.yml
-//   并经 compose env 注入（Traefik v3 带 --configFile 时 CLI 覆盖不生效，必须整体替换配置文件）。）
+//
+// —— 隔离栈必传 env 清单（每条一句为什么）——
+//   STATION_LITELLM_NAME / STATION_DOCKER_PROXY_NAME / STATION_EDGE_NAME：compose 用它们做
+//     **容器名**（deploy/docker-compose.yml:239/62/285），不派生会与共享栈撞名（container name already in use）。
+//   BACKEND_SUBNET：compose backend 网络子网（deploy/docker-compose.yml:13，缺省 172.32.0.0/24），
+//     不派生会 **Pool overlaps**。
+//   IPAM_RESERVED_SUBNETS：portal 的 IPAM 池**硬编码**（portal/src/ipam.js:12-15，10.200.0.0/16，**非 env 可配**），
+//     隔离栈 DB 是空的 → 会从池头分配 10.200.0.0/29，与共享栈已占段**重叠**（实测 403 Pool overlaps）；
+//     必须把**其他栈已用的 fde-* 子网**列进来。
+//   PORTAL_PUBLIC_BASE_URL：决定 FDE 容器内 ERIX_STATION_BASE_URL（portal/src/provisioner.js:183）；
+//     .env 里是共享栈值（http://100.100.0.3:8090），不派生 → agentd 会去连**共享栈的 Traefik**；
+//     本栈应为 http://station.localhost:<TRAEFIK_WEB_PORT>（FDE 容器 /etc/hosts 已把 station.localhost
+//     指向本 FDE 网络网关=宿主）。
+//   PORTAL_INTERNAL_HOSTS：决定 internal 路由的 Host 白名单（portal/src/routes.js:170-176）；.env 里是
+//     100.100.0.3，不含 station.localhost → agentd 请求 **404 page not found**（实测）。本栈需含 station.localhost。
+//   （⚠️ 除端口/固定名外，**子网与三个容器名（litellm/docker-proxy/edge）也必须派生**——
+//     否则与共享栈撞 subnet/container_name（compose 缺省 172.32.0.0/24 与 station-* 容器名）。）
+//   （自动派生：**仅在隔离模式**（显式设了 STATION_STACK_ID 或任一入口端口/固定名 env）下，脚本对**未显式设置**的
+//     IPAM_RESERVED_SUBNETS（扫 `docker network ls` 的其他 fde-* 子网，排除本栈 fde-<FDE_NAME>）、
+//     PORTAL_PUBLIC_BASE_URL、PORTAL_INTERNAL_HOSTS 自动补齐 → 上表三条可不手传；
+//     显式设置一律优先，**共享栈缺省零注入**（见 isolationComposeEnv()）。
+//     fde 容器/网络名 = fde-<FDE_NAME>，由 portal provisioner 生成；compose() 已透传进程 env，
+//     COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 18080/4100/8090/8443、station-*、alice。
+//     TRAEFIK_STATIC_HOST 无需手传：脚本每次 up 前自动生成「仅替换入口端口」的临时 traefik.yml
+//     并经 compose env 注入（Traefik v3 带 --configFile 时 CLI 覆盖不生效，必须整体替换配置文件）。）
 //
 // ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab，
 //   本机直连被墙）。脚本构建时显式传三个 proxy build arg 并按需加 `--network=host`，
@@ -99,11 +122,14 @@ function removeDbDir() {
 }
 
 function compose(args, env = {}) {
+  // F8：隔离模式下注入自动派生 env（IPAM 保留段 / public base url / internal hosts）。
+  // 共享栈缺省（isolationComposeEnv() 返回 {}）→ 注入零变化。派生值只进 compose 的 env 对象，
+  // **不改 process.env 全局**；shell env 优先级高于 --env-file，故可覆盖 deploy/.env 的共享栈值。
   return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...isolationComposeEnv(), ...env },
   });
 }
 
@@ -117,6 +143,67 @@ function safe(fn) {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// F8：隔离模式自动派生 env（仅在「隔离栈」下生效；共享栈缺省 = 零注入）。
+// ---------------------------------------------------------------------------
+
+// 隔离信号：显式设了栈标识 / 固定名 / 端口 / 子网 / DB / FDE 名任一 → 判定为隔离栈。
+// 共享栈跑法（不带任何这些 env）→ 一个都不命中 → 返回 {}，行为与改造前完全一致。
+const ISOLATION_SIGNAL_KEYS = [
+  'STATION_STACK_ID', 'COMPOSE_PROJECT_NAME', 'STATION_DB_DIR', 'STATION_DB_NAME',
+  'STATION_PORTAL_NAME', 'STATION_LITELLM_NAME', 'STATION_DOCKER_PROXY_NAME',
+  'STATION_EDGE_NAME', 'BACKEND_SUBNET', 'FDE_NAME',
+  'PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
+];
+
+/**
+ * 推导隔离栈应注入 compose 的 env（未显式设置时）。返回 {} 表示共享栈缺省、不注入任何值。
+ * 三项均遵循「显式设置优先」：process.env 已有值则不动。
+ */
+function deriveIsolationEnv() {
+  if (!ISOLATION_SIGNAL_KEYS.some((k) => process.env[k])) return {};
+  const out = {};
+
+  // IPAM_RESERVED_SUBNETS：portal 的 IPAM 池硬编码（portal/src/ipam.js:12-15，10.200.0.0/16），
+  // 非 env 可配；隔离栈 DB 为空 → 默认从池头分配 10.200.0.0/29，与共享栈已占段重叠（403 Pool overlaps）。
+  // 收集「其他栈」的 fde-* 网络 subnet（排除本栈自己的 fde-<FDE_NAME>）作为保留段。
+  if (!process.env.IPAM_RESERVED_SUBNETS) {
+    const own = `fde-${FDE_NAME}`;
+    const names = (safe(() => docker('network ls --format {{.Name}}')) || '')
+      .split('\n').map((s) => s.trim())
+      .filter((n) => n.startsWith('fde-') && n !== own);
+    const subnets = [...new Set(names.map((n) => safe(() => {
+      // format 含空格，必须单引号包裹（docker() 把整条命令包进 sg docker -c "..."，
+      // 内层 sh 会对未引用的 {{json .IPAM.Config}} 做词拆分 → Go 模板 unclosed action）。
+      const cfg = JSON.parse(docker(`network inspect ${n} --format '{{json .IPAM.Config}}'`));
+      return cfg?.[0]?.Subnet || null;
+    })).filter(Boolean))];
+    if (subnets.length > 0) out.IPAM_RESERVED_SUBNETS = subnets.join(',');
+  }
+
+  // PORTAL_PUBLIC_BASE_URL：决定 FDE 容器内 ERIX_STATION_BASE_URL（portal/src/provisioner.js:183）。
+  // .env 是共享栈值 → 不派生 agentd 会去连共享栈 Traefik；本栈走 station.localhost:<TRAEFIK_WEB_PORT>
+  // （FDE 容器 /etc/hosts 已把 station.localhost 指向本 FDE 网络网关=宿主）。
+  if (!process.env.PORTAL_PUBLIC_BASE_URL) {
+    out.PORTAL_PUBLIC_BASE_URL = `http://station.localhost:${TRAEFIK_WEB_PORT}`;
+  }
+
+  // PORTAL_INTERNAL_HOSTS：internal 路由 Host 白名单（portal/src/routes.js:170-176）。
+  // .env 是 100.100.0.3，不含 station.localhost → agentd 请求 404。本栈需含 station.localhost。
+  if (!process.env.PORTAL_INTERNAL_HOSTS) {
+    out.PORTAL_INTERNAL_HOSTS = 'station.localhost';
+  }
+
+  return out;
+}
+
+// 惰性求值 + 记忆化：首个 compose 调用（预清理 down）时算一次即可，避免每次 compose 都查 docker。
+let isolationEnvCache;
+function isolationComposeEnv() {
+  if (isolationEnvCache === undefined) isolationEnvCache = deriveIsolationEnv();
+  return isolationEnvCache;
 }
 
 async function waitFor(fn, { timeoutMs = 120000, intervalMs = 500, label = 'condition' } = {}) {
@@ -428,8 +515,8 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     const grepToken = docker(`exec ${FDE_CONTAINER} sh -c "grep -rl '${S.token}' /home /opt 2>/dev/null || true"`).trim();
     assert.equal(grepToken, '', '容器文件系统内无明文 token');
 
-    // 9) 崩溃恢复：run 2（同一 session 第二轮，贴近真实多轮）进行中 docker restart → agentd 重启
-    //    → re-claim（attempt+1、resume=true）→ 终态
+    // 9) 崩溃恢复：run 2（同一 session 第二轮，贴近真实多轮）进行中 docker kill（SIGKILL，硬崩溃）
+    //    → docker 依 RestartPolicy 自动拉起 → 新 agentd re-claim（attempt+1、resume=true）→ 终态
     const run2 = await sendMessage(S.sessionId, '修复登录页的样式问题');
 
     // 等 run 2 进入 running（agentd 已 claim + spawn worker）
@@ -439,8 +526,17 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
       return st === 'running' && at === '1' ? st : null;
     }, { label: 'run 2 running attempts=1', timeoutMs: 60000, intervalMs: 50 });
 
-    // 容器重启（run 进行中）
-    docker(`restart ${FDE_CONTAINER}`);
+    // 容器硬崩溃（run 进行中）：必须用 `docker kill`（缺省 SIGKILL），**不能改回 `docker restart`**。
+    // 为什么：restart 走 SIGTERM → agentd **优雅停机**（"shutdown: draining runs" → abort run
+    //   reason:agent_shutdown）→ portal 把 run abort 并**重排队**（attempt 2）；脚本随后再强制
+    //   lease 过期 → claim 又 +1 → 最终 attempt=3，与下方 attempts=2 断言对不上（主 agent 真机实测：
+    //   restart 路径 worker exit code:0 + 新 agentd 直接 "worker spawned run2 attempt:3 resume:true"）。
+    //   SIGKILL 不给 drain 机会 → run 仍是 running 且租约陈旧（run_queue.status=claimed + lease 过期，
+    //   见 portal/src/internal.js:225 可重领分支）→ 脚本强制 lease 过期 → re-claim 正好 attempt 2 +
+    //   resume=true，与下方 :2: 前缀 / attempts=2 断言自洽。
+    // FDE 容器 RestartPolicy=unless-stopped（portal/src/provisioner.js:201；docker inspect fde-* 同值）
+    //   → SIGKILL 后 docker 自动拉起 = 真「崩溃 + 重启」。请勿改回 restart。
+    docker(`kill ${FDE_CONTAINER}`);
     await waitFor(() => {
       const st = safe(() => docker(`inspect ${FDE_CONTAINER} --format {{.State.Status}}`).trim());
       return st === 'running' ? st : null;
