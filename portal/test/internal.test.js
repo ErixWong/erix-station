@@ -11,6 +11,7 @@ import {
   validateEventPayload,
   authenticateContainer,
   claimRun,
+  releaseUndeliveredClaim,
   setRunState,
   postEvents,
   releaseRun,
@@ -236,6 +237,122 @@ test('claimRun：capacity/hold_ms 越界 → 400 validation_failed', async () =>
   await assert.rejects(() => claimRun(pool, { container, user, capacity: 0, holdMs: 10 }), (e) => e.code === 'validation_failed');
   await assert.rejects(() => claimRun(pool, { container, user, capacity: 1, holdMs: 0 }), (e) => e.code === 'validation_failed');
   await assert.rejects(() => claimRun(pool, { container, user, capacity: 1, holdMs: 30001 }), (e) => e.code === 'validation_failed');
+});
+
+// ---------------------------------------------------------------------------
+// issue #180：孤儿化 claim（客户端断开 → 中断等待 + 释放未送达 claim、还回 attempt）
+// ---------------------------------------------------------------------------
+
+async function until(fn, { timeoutMs = 1000, intervalMs = 5 } = {}) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (fn()) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error('until: condition not met within timeout');
+}
+
+test('#180 claimRun：等待期间客户端断开（abort）→ 返回 null，不为死连接领 ticket（attempts 不变/无 claim 占用）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+
+  // 先把行置为「已被别人持有且租约未过期」→ 首次 tryClaim 失败，进入长轮询等待。
+  const q = pool.queue[0];
+  q.status = 'claimed';
+  q.claim_token = 'other-dead-agent';
+  q.owner_container_id = 'dead-container';
+  q.claimed_at = Date.now();
+  q.lease_until = Date.now() + 90000;
+  q.attempts = 1;
+  pool.runs[0].status = 'running';
+
+  const ac = new AbortController();
+  const pending = claimRun(pool, { container, user, capacity: 1, holdMs: 5000, signal: ac.signal });
+  await until(() => hubStats().claimWaiters === 1); // 确认已挂起等待
+
+  // 模拟 reaper 把 run 重排队（claim 被回收）→ 本应可领；同时客户端已死 → abort。
+  q.status = 'pending';
+  q.claim_token = null;
+  q.lease_until = null;
+  q.claimed_at = null;
+  ac.abort();
+  notifyRunEnqueued(userId, { run_id: runId, queue_id: q.id }); // 唤醒（此时 waiter 已因 abort 摘除）
+
+  const result = await pending;
+  assert.equal(result, null, 'abort 后不得返回 ticket');
+  assert.equal(q.attempts, 1, 'attempts 未增加（未为死连接消耗重试预算）');
+  assert.equal(q.status, 'pending', '未提交 claim（仍为 pending）');
+  assert.equal(q.claim_token, null, '无 claim_token 占用');
+  assert.equal(hubStats().claimWaiters, 0, 'claimWaiters 无泄漏');
+});
+
+test('#180 claimRun：signal 已 abort 时不再进入等待（不领 ticket）', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const q = pool.queue[0];
+  q.status = 'claimed';
+  q.claim_token = 'other';
+  q.lease_until = Date.now() + 90000;
+  q.attempts = 1;
+  pool.runs[0].status = 'running';
+
+  const ac = new AbortController();
+  ac.abort();
+  const result = await claimRun(pool, { container, user, capacity: 1, holdMs: 5000, signal: ac.signal });
+  assert.equal(result, null);
+  assert.equal(q.attempts, 1);
+  assert.equal(hubStats().claimWaiters, 0);
+});
+
+test('#180 releaseUndeliveredClaim：claimed 行释放 → pending、attempts-1、清 claim_token/lease', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  pool.queue[0].attempts = 1; // claim 后 attempts=2，便于断言 N-1
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  assert.equal(pool.queue[0].attempts, 2);
+  assert.equal(pool.queue[0].status, 'claimed');
+
+  const warns = [];
+  const res = await releaseUndeliveredClaim(pool, { runId, claimToken: ticket.claim_token, log: { warn: (m) => warns.push(String(m)) } });
+  assert.equal(res.released, true);
+  assert.equal(res.attempts, 1);
+  assert.equal(pool.queue[0].status, 'pending');
+  assert.equal(pool.queue[0].attempts, 1, 'attempts = N-1（还回未送达的 attempt）');
+  assert.equal(pool.queue[0].claim_token, null);
+  assert.equal(pool.queue[0].lease_until, null);
+  assert.equal(pool.queue[0].claimed_at, null);
+  assert.equal(pool.queue[0].owner_container_id, null);
+  assert.equal(warns.length, 1, '记 warn 日志');
+  assert.ok(warns[0].includes(runId));
+
+  // 还回后该行仍可被重新认领（attempts=1 < max_attempts=3）。
+  const reclaim = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  assert.ok(reclaim, '释放后可被重新认领');
+  assert.equal(reclaim.run.attempt, 2);
+});
+
+test('#180 releaseUndeliveredClaim：claim_token 不匹配 / 非 claimed → no-op（不改 attempts）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const before = pool.queue[0].attempts;
+
+  // token 不匹配 → no-op
+  const wrong = await releaseUndeliveredClaim(pool, { runId, claimToken: 'wrong-token', log: { warn: () => {} } });
+  assert.equal(wrong.released, false);
+  assert.equal(pool.queue[0].attempts, before, 'token 不匹配不改 attempts');
+  assert.equal(pool.queue[0].status, 'claimed', 'token 不匹配不改状态');
+
+  // 行已非 claimed（如已被收敛为 done）→ 即便 token 匹配也 no-op
+  pool.queue[0].status = 'done';
+  const notClaimed = await releaseUndeliveredClaim(pool, { runId, claimToken: ticket.claim_token, log: { warn: () => {} } });
+  assert.equal(notClaimed.released, false);
+  assert.equal(pool.queue[0].attempts, before, '非 claimed 不改 attempts');
+  assert.equal(pool.queue[0].status, 'done');
 });
 
 test('setRunState：queued→running 写 started_at；非法转换 409 invalid_transition', async () => {
