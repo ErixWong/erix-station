@@ -838,6 +838,44 @@ describe('issue #189：折叠段 folded 字段与原文懒加载', () => {
     expect(store.sessionStats).toEqual({ messages: 3, folded: 1 });
   });
 
+  it('#197 sessionStats：消息数优先 DTO 的 message_count（长会话 messages 是分页窗口会少报），实时新增不被旧快照吃掉', async () => {
+    const window = Array.from({ length: 20 }, (_, i) => ({
+      id: `m${i}`, role: i % 2 ? 'assistant' : 'user', content: 'x', seq: i + 1,
+    }));
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        // 真机场景（会话 e67eaef5）：DB 23 条，DTO messages 只有分页窗口 20 条。
+        return { status: 200, body: { session: { id: 's1', active_run_id: null, message_count: 23 }, messages: window, last_seq: 20 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.entries.filter((e) => e.kind === 'msg').length).toBe(20); // 渲染窗口仍是 20（分页行为不动）
+    expect(store.sessionStats).toEqual({ messages: 23, folded: 0 }); // 头部用后端总数，与侧栏同源
+
+    // DTO 快照后实时新增消息：两数取大（21 entries < 23 仍报 23；超过后跟已加载数）。
+    store.addMessage({ id: 'live-1', role: 'assistant', content: 'live' });
+    expect(store.sessionStats?.messages).toBe(23);
+  });
+
+  it('#197 DTO 无 message_count（旧后端/createSession 等其他入口）→ sessionStats 回退已加载条数', async () => {
+    const window = Array.from({ length: 20 }, (_, i) => ({
+      id: `m${i}`, role: i % 2 ? 'assistant' : 'user', content: 'x', seq: i + 1,
+    }));
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: window, last_seq: 20 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionStats).toEqual({ messages: 20, folded: 0 }); // 缺失 → 回退 messages 长度口径
+  });
+
   it('loadFoldedOriginal：200 → loaded(turns)；按 (sessionId, round) 缓存不重发；不同轮各自加载', async () => {
     let calls = 0;
     mockFetch((url) => {
