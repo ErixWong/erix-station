@@ -1,6 +1,7 @@
 // WP3b 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
-// 流程：起栈（含 LiteLLM）→ 建用户 + 两步登录 → 建项目（触发 materializer 写 config.json）
-//   → provision FDE（真实 runner 镜像）→ agentd SSE 连接 + ping → 种子 run（真实 internal API claim）
+// 流程：起栈（含 LiteLLM）→ 建用户 + 两步登录 → 建会话（P5「目录即项目」：POST /api/sessions 建目录）
+//   + 重启 portal 触发物化写 config.json → provision FDE（真实 runner 镜像）→ agentd SSE 连接 + ping
+//   → 发消息建 run（真实 API：同事务落 transcript 用户轮次 + run 入队，§4.3）
 //   → worker 跑 erix-agent runToolLoop（LiteLLM mock model）→ 事件 seq 落库 → 终态 + run_end + usage 记账
 //   → 崩溃恢复：run 进行中 docker restart FDE → agentd 重启 → re-claim（attempt+1、resume=true）→ 终态。
 // 运行：npm run test:integration:wp3b
@@ -10,8 +11,12 @@
 //   STATION_DB_NAME=station-db-43 STATION_PORTAL_NAME=station-portal-43 STATION_STACK_ID=station-e2e-43 \
 //   PORTAL_HOST_PORT=28080 LITELLM_HOST_PORT=24400 \
 //   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=alice43 \
+//   BACKEND_SUBNET=172.33.0.0/24 STATION_LITELLM_NAME=station-litellm-43 \
+//   STATION_DOCKER_PROXY_NAME=station-docker-proxy-43 STATION_EDGE_NAME=station-edge-43 \
 //   FDE_IMAGE=erix-station/fde:e2e-43 STATION_PORTAL_IMAGE=erix-station/portal:e2e-43 \
 //   node portal/integration/wp3b-e2e.mjs
+// （⚠️ 除端口/固定名外，**子网与三个容器名（litellm/docker-proxy/edge）也必须派生**——
+//   否则与共享栈撞 subnet/container_name（compose 缺省 172.32.0.0/24 与 station-* 容器名）。）
 // （fde 容器/网络名 = fde-<FDE_NAME>，由 portal provisioner 生成；compose() 已透传进程 env，
 //   COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 18080/4100/8090/8443、station-*、alice。
 //   TRAEFIK_STATIC_HOST 无需手传：脚本每次 up 前自动生成「仅替换入口端口」的临时 traefik.yml
@@ -153,7 +158,6 @@ const S = {
   password: 'correct horse battery staple',
   totpSecret: null,
   cookie: null,
-  projectId: null,
   sessionId: null,
   token: null,
   gateway: null,
@@ -200,31 +204,53 @@ async function login() {
   assert.ok(S.cookie, 'session cookie');
 }
 
-async function createProject() {
-  const r = await fetch(`${PORTAL}/api/projects`, {
+/**
+ * 建会话（P5「目录即项目」）：`POST /api/sessions` 校验 cwd 形态（portal/src/sessions.js CWD_RE
+ * `~/projects/<一级目录名>`）并按需 mkdir，同时落 chat_sessions 行。
+ * 旧项目注册（POST /api/projects）已退役（410 project_api_retired），目录与「项目」由本端点自动创建。
+ */
+async function createSession() {
+  const r = await fetch(`${PORTAL}/api/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${S.cookie}` },
-    body: JSON.stringify({ name: 'proj1', repo_url: 'https://git.example/alice/proj1.git', template: 'node' }),
+    body: JSON.stringify({ cwd: '~/projects/proj1', title: 'wp3b' }),
   });
   const body = await r.json();
-  assert.equal(r.status, 201, `create project: ${JSON.stringify(body)}`);
-  S.projectId = body.project.id;
-  assert.ok(S.projectId, 'project id');
+  assert.equal(r.status, 201, `create session: ${JSON.stringify(body)}`);
+  S.sessionId = body.session.id;
+  assert.ok(S.sessionId, 'session id');
 }
 
-/** 种子 run + 用户消息（run 创建 API 尚未交付——P1 由 DB 直接入队，与 WP3a 同口径）。 */
-function seedRun({ runId, queueId, sessionId, messageId, task }) {
-  const sql = `
-    INSERT INTO chat_sessions (id, user_id, project_id, title, model, last_seq)
-    VALUES ('${sessionId}', '${S.userId}', '${S.projectId}', 'wp3b', 'mock-model', 1)
-    ON CONFLICT (id) DO NOTHING;
-    INSERT INTO runs (id, session_id, status) VALUES ('${runId}', '${sessionId}', 'queued');
-    INSERT INTO messages (id, session_id, run_id, seq, role, content)
-    VALUES ('${messageId}', '${sessionId}', '${runId}', 1, 'user', '${task.replace(/'/g, "''")}');
-    INSERT INTO run_queue (id, run_id, container_id, status)
-    VALUES ('${queueId}', '${runId}', '${S.containerId}', 'pending');
-  `;
-  psqlStdin(sql);
+/**
+ * 真实写路径发用户消息（P3 起 transcript 为正文单一真相）：`POST /api/sessions/:id/messages`
+ * 在同一事务内 appendUserInputTurn（引擎落 transcript 用户轮次）+ 建 run + 入队 run_queue
+ * （portal/src/sessions.js postMessage）。
+ * run id 由 portal 生成（§9.3-3 禁止 cwd 派生）——调用方只能从 202 响应体取，脚本不再自造 id。
+ */
+async function sendMessage(sessionId, content) {
+  const r = await fetch(`${PORTAL}/api/sessions/${sessionId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: `fde_session_dev=${S.cookie}` },
+    body: JSON.stringify({ content }),
+  });
+  const body = await r.json();
+  assert.equal(r.status, 202, `send message: ${JSON.stringify(body)}`);
+  assert.equal(body.run?.status, 'queued', 'run 入队（queued）');
+  assert.ok(body.run?.id, 'run id from response');
+  return body.run.id;
+}
+
+/**
+ * 重启 portal 触发启动全量重物化（user-space §8.1 rebuildAllFdes）。
+ * 为什么必须做：P5 起 `POST /api/sessions` 只建目录+会话、**不再 enqueue materialize**
+ * （退役的 `POST /api/projects` 曾同事务写 materialize outbox），而 worker 的模型 provider
+ * 读 `~/.erix/config.json`（runner/worker.js:207）——不重启则 config.json 永不出现。
+ * 口径与 wp5/wp6 e2e 一致。
+ */
+async function restartPortal() {
+  docker(`restart ${STATION_PORTAL_NAME}`);
+  await waitFor(async () => (await fetch(`${PORTAL}/healthz`).catch(() => null))?.status === 200,
+    { label: 'portal healthz after restart', timeoutMs: 120000, intervalMs: 500 });
 }
 
 function readTokenFromContainer() {
@@ -292,10 +318,14 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
       return r && r.status === 200;
     }, { label: `LiteLLM readiness (${STATION_LITELLM_NAME})`, timeoutMs: 120000 });
 
-    // 3) 建用户 + 两步登录 + 建项目（触发 materializer 写 config.json）
+    // 3) 建用户 + 两步登录 + 建会话（P5 目录即项目：自动建 ~/projects/proj1 + chat_sessions 行）
     await insertUser();
     await login();
-    await createProject();
+    await createSession();
+
+    // P5 起 POST /api/sessions 不再 enqueue materialize（退役的 POST /api/projects 才会）——
+    // 经 portal 重启触发启动全量重物化，让 worker 读的 ~/.erix/config.json 落盘。
+    await restartPortal();
 
     // 等 config.json 物化（materializer 250ms 循环；路径段 = fde_name）
     const configJsonPath = path.join(S.userspaceRoot, FDE_NAME, 'home', '.erix', 'config.json');
@@ -350,16 +380,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     const agentdUid = docker(`exec ${FDE_CONTAINER} sh -c "ps -eo uid=,args= | grep 'node /opt/erix/agentd.js' | head -1"`).trim().split(/\s+/)[0];
     assert.equal(agentdUid, '1001', 'agentd 以 UID 1001 运行');
 
-    // 7) run 1：claim → worker runToolLoop（mock LLM）→ 事件 seq → 终态 + run_end + usage
-    seedRun({
-      runId: '00000000-0000-0000-0000-000000000100',
-      queueId: '00000000-0000-0000-0000-000000000200',
-      sessionId: '00000000-0000-0000-0000-000000000020',
-      messageId: '00000000-0000-0000-0000-000000000030',
-      task: '把登录按钮改成品牌色',
-    });
-
-    const run1 = '00000000-0000-0000-0000-000000000100';
+    // 7) run 1：真实发消息（POST /api/sessions/:id/messages → 同事务落 transcript 用户轮次 + run 入队）
+    //    → agentd claim → worker runToolLoop（mock LLM）→ 事件 seq → 终态 + run_end + usage
+    const run1 = await sendMessage(S.sessionId, '把登录按钮改成品牌色');
     await waitFor(() => {
       const st = psql(`SELECT status FROM runs WHERE id='${run1}'`);
       return (st === 'finished' || st === 'failed') ? st : null;
@@ -368,8 +391,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     assert.equal(psql(`SELECT status FROM runs WHERE id='${run1}'`), 'finished', 'run 1 finished');
     assert.equal(psql(`SELECT attempts FROM run_queue WHERE run_id='${run1}'`), '1', 'run 1 attempts=1');
 
-    // 事件 seq 无空洞（session 内 messages + run_events 共享 last_seq）
-    const sessionId = '00000000-0000-0000-0000-000000000020';
+    // 事件 seq 无空洞（session 内 messages 锚点行 + run_events 共享 last_seq 原子分配器；
+    // transcript_rounds 用 round 而非 seq，不参与本口径）
+    const sessionId = S.sessionId;
     const allSeq = psql(`SELECT string_agg(seq::text, ',' ORDER BY seq) FROM (SELECT seq FROM run_events WHERE session_id='${sessionId}' UNION SELECT seq FROM messages WHERE session_id='${sessionId}') x`);
     const seqList = allSeq.split(',').map(Number);
     assert.ok(seqList.length > 0 && seqList.every((v, i) => v === i + 1), `session seq 严格递增无空洞：${allSeq}`);
@@ -381,11 +405,14 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     assert.equal(psql(`SELECT count(*) FROM messages WHERE run_id='${run1}' AND role='assistant'`), '1', 'assistant 消息回写');
 
     // issue #43（erix-agent 0.9.0 八方法契约）：saveRunState/loadRunState 全链路
-    // （worker IPC → agentd → portal PUT /runs/:id/runstate → runs.run_state jsonb）。
-    // 引擎 finish 时 markRunState('succeeded') 合并进 blob；runs.status 终态仍由 U2 收敛。
-    assert.equal(psql(`SELECT run_state IS NOT NULL FROM runs WHERE id='${run1}'`), 't', 'run 1 run_state 已落库（saveRunState 链路通）');
-    assert.equal(psql(`SELECT run_state->>'state' FROM runs WHERE id='${run1}'`), 'succeeded', '引擎终态标记合并进 run_state');
-    assert.ok(psql(`SELECT run_state->>'stateVersion' FROM runs WHERE id='${run1}'`), 'run_state 含 stateVersion');
+    // （worker IPC → agentd → portal PUT /transcript/:key/runstate → chat_sessions.engine_run_state）。
+    // 0.14.0 起快照与终态 status 分通道，且 store key = sessionId（runner/lib/store.js:12-18 映射表；
+    // portal/src/internal.js:1242 选列 / 1299 注释）——故断言落在 chat_sessions 两列，
+    // runs.run_state/run_state_status 是旧 run 作用域遗留列，新路径恒不写（dev 库实证：
+    // runs.run_state_status 全 NULL，runs.run_state 最后写入停在 2026-09-24 的旧 runner 时代）。
+    assert.equal(psql(`SELECT engine_run_state IS NOT NULL FROM chat_sessions WHERE id='${sessionId}'`), 't', 'run 1 快照落 chat_sessions.engine_run_state（saveRunState 链路通）');
+    assert.equal(psql(`SELECT engine_run_state_status->>'status' FROM chat_sessions WHERE id='${sessionId}'`), 'succeeded', '引擎终态 status 落 chat_sessions.engine_run_state_status');
+    assert.ok(psql(`SELECT engine_run_state->>'stateVersion' FROM chat_sessions WHERE id='${sessionId}'`), 'run-state 快照含 stateVersion');
 
     // 事件含 mock LLM 驱动的 delta + round 事件（worker 经 IPC 回 agentd 批量上报）
     const evTypes = psql(`SELECT string_agg(DISTINCT type, ',' ORDER BY type) FROM run_events WHERE run_id='${run1}'`);
@@ -401,15 +428,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     const grepToken = docker(`exec ${FDE_CONTAINER} sh -c "grep -rl '${S.token}' /home /opt 2>/dev/null || true"`).trim();
     assert.equal(grepToken, '', '容器文件系统内无明文 token');
 
-    // 9) 崩溃恢复：run 2 进行中 docker restart → agentd 重启 → re-claim（attempt+1、resume=true）→ 终态
-    seedRun({
-      runId: '00000000-0000-0000-0000-000000000101',
-      queueId: '00000000-0000-0000-0000-000000000201',
-      sessionId: '00000000-0000-0000-0000-000000000021',
-      messageId: '00000000-0000-0000-0000-000000000031',
-      task: '修复登录页的样式问题',
-    });
-    const run2 = '00000000-0000-0000-0000-000000000101';
+    // 9) 崩溃恢复：run 2（同一 session 第二轮，贴近真实多轮）进行中 docker restart → agentd 重启
+    //    → re-claim（attempt+1、resume=true）→ 终态
+    const run2 = await sendMessage(S.sessionId, '修复登录页的样式问题');
 
     // 等 run 2 进入 running（agentd 已 claim + spawn worker）
     await waitFor(() => {
@@ -441,18 +462,23 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     assert.equal(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`), '2', '崩溃恢复 re-claim attempts=2');
     assert.equal(psql(`SELECT status FROM runs WHERE id='${run2}'`), 'finished', 'run 2 终态 finished');
 
-    // issue #43：resume 路径经 loadRunState 恢复（0.7.0 轮号/轮预算拆分语义），终态标记仍合并落库。
-    assert.equal(psql(`SELECT run_state IS NOT NULL FROM runs WHERE id='${run2}'`), 't', 'run 2 run_state 已落库（resume + saveRunState 链路通）');
-    assert.equal(psql(`SELECT run_state->>'state' FROM runs WHERE id='${run2}'`), 'succeeded', 'run 2 引擎终态标记合并进 run_state');
+    // issue #43：resume 路径经 loadRunState 恢复（0.7.0 轮号/轮预算拆分语义），终态 status 仍落 session 列。
+    // 同一 session 两轮 → 列本身不能区分轮次，故额外用 status 记录的 ts 晚于 run 2 入队时间，
+    // 证明它是 **run 2 自己**的 markRunState 写入（否则 run 1 的旧值也能让断言假绿）。
+    assert.equal(psql(`SELECT engine_run_state IS NOT NULL FROM chat_sessions WHERE id='${sessionId}'`), 't', 'run 2 快照仍在 chat_sessions.engine_run_state（resume + saveRunState 链路通）');
+    assert.equal(psql(`SELECT engine_run_state_status->>'status' FROM chat_sessions WHERE id='${sessionId}'`), 'succeeded', 'run 2 引擎终态 status 落 chat_sessions.engine_run_state_status');
+    assert.equal(psql(`SELECT (engine_run_state_status->>'ts')::timestamptz > (SELECT queued_at FROM runs WHERE id='${run2}') FROM chat_sessions WHERE id='${sessionId}'`), 't', 'run 2 终态 status 记录由 run 2 自己写入（ts 晚于入队）');
 
     // F3（issue #43 评审）sentinel：attempt1 崩溃前的 run_state 已在库中（attempt1 独有写）；
     // 断言恢复侧**确实发生了 loadRunState 读**——agentd 对该方法留痕（仅引擎 resume 路径调用，
     // attempt ≥ 2），read 痕迹与 write 痕迹（saveRunState）可区分：若无此读，说明 attempt2
-    // 未走恢复路径（此时只剩 attempt2 自己的写也能让上面两条断言假绿）。
+    // 未走恢复路径（此时只剩 attempt2 自己的写也能让上面的写侧断言假绿）。
     await waitFor(() => {
-      const trace = new RegExp(`"msg":"store loadRunState","fde":"${FDE_NAME}","run_id":"${run2}"`);
+      // store key 已切 session 维度（runner/lib/store.js:12-18）：session 路径日志字段是 `session_key`
+      // （runner/agentd.js:558），不再是旧 run 作用域的 `run_id`（:568）。restored=true = 真读到了快照。
+      const trace = new RegExp(`"msg":"store loadRunState","fde":"${FDE_NAME}","session_key":"${sessionId}","restored":true`);
       return trace.test(agentdLogs()) ? true : null;
-    }, { label: 'run 2 resume 经 loadRunState 恢复（agentd 读痕迹）', timeoutMs: 30000 });
+    }, { label: 'run 2 resume 经 loadRunState 恢复（agentd 读痕迹 + restored=true）', timeoutMs: 30000 });
 
     // 事件含 attempt 2 前缀（resume=true 后新 attempt 事件不碰撞）
     const rcEvents = psql(`SELECT string_agg(client_event_id, ',' ORDER BY seq) FROM run_events WHERE run_id='${run2}' AND type <> 'run_end'`);
