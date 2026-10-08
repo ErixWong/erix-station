@@ -22,6 +22,13 @@ export interface LlmModel {
   context_window: number | null;
   max_tokens: number | null;
   enabled: boolean;
+  // issue #164：每 token 单价（USD），由后端从 LiteLLM 读回。pricing_configured 为 false 时
+  // 该模型用量金额会记 0，UI 必须显式提示而不是静默。pricing_source='cost_map' 表示价格来自
+  // LiteLLM 内置价目表（不是本模型显式设定）。
+  input_cost_per_token?: number | null;
+  output_cost_per_token?: number | null;
+  pricing_configured?: boolean;
+  pricing_source?: 'override' | 'cost_map' | 'none';
   litellm_params?: { model?: string };
 }
 
@@ -436,7 +443,7 @@ export const useAdminStore = defineStore('admin', {
     /** 旧供应商下新增模型表单：POST /api/admin/llm/providers/<id>/models。 */
     async addModel(
       providerId: string,
-      fields: { model_id: string; model: string; name: string; type: string; tool_calling: boolean; context_window: number | null; max_tokens: number | null },
+      fields: { model_id: string; model: string; name: string; type: string; tool_calling: boolean; context_window: number | null; max_tokens: number | null; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
     ): Promise<string | null> {
       this.llmErr = null;
       try {
@@ -457,7 +464,7 @@ export const useAdminStore = defineStore('admin', {
     /** 编辑模型可变字段：PATCH /api/admin/llm/models/<id>。 */
     async updateModel(
       m: LlmModel,
-      fields: { name: string; type?: string; tool_calling: boolean; context_window?: number; max_tokens?: number | null; model?: string },
+      fields: { name: string; type?: string; tool_calling: boolean; context_window?: number; max_tokens?: number | null; model?: string; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
     ): Promise<string | null> {
       this.llmErr = null;
       try {

@@ -426,7 +426,7 @@ describe('AdminView · LLM 管理', () => {
       return undefined;
     });
     const modelRow = wrapper.get('[data-test="model-row"]');
-    expect(modelRow.findAll('td')).toHaveLength(7);
+    expect(modelRow.findAll('td')).toHaveLength(8);
     expect(modelRow.findAll('td')[4].text()).toBe('16384');
     expect(wrapper.findAll('[data-test="model-row"]')[1].findAll('td')[4].text()).toBe('—');
     expect(modelRow.text()).not.toContain('gpt-4o');
@@ -532,6 +532,71 @@ describe('AdminView · LLM 管理', () => {
     await flushPromises();
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
     expect(wrapper.find('[role="dialog"]').text()).toContain('delete failed');
+  });
+
+  // issue #164：定价（虚拟 key spend 恒 0）
+  it('定价：按 USD/1M 填写并换算成每 token；未设定价显式提示；可清空', async () => {
+    const providers = {
+      items: [
+        {
+          id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
+          models: [
+            {
+              id: 'm1', provider_id: 'p1', model_id: 'deepseek-v4-pro', name: 'V4', type: 'text',
+              tool_calling: true, context_window: 128000, max_tokens: 16384, enabled: true,
+              litellm_params: { model: 'openai/deepseek-flash' },
+              input_cost_per_token: 0.00000028, output_cost_per_token: 0.0000011,
+              pricing_configured: true, pricing_source: 'override',
+            },
+            {
+              id: 'm2', provider_id: 'p1', model_id: 'glm-5.3-flash-awq', name: 'GLM', type: 'text',
+              tool_calling: false, context_window: null, max_tokens: null, enabled: true,
+              pricing_configured: false, pricing_source: 'none',
+            },
+          ],
+        },
+      ],
+    };
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, providers);
+      if (url === '/api/admin/llm/providers/p1/models' && init?.method === 'POST') return jsonResponse(201, {});
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    const rows = wrapper.findAll('[data-test="model-row"]');
+    // 已设定价：展示 USD/1M
+    expect(rows[0].get('[data-test="model-pricing"]').text()).toContain('$0.28');
+    // 未设定价：显式提示，不静默为 0
+    expect(rows[1].get('[data-test="model-pricing-missing"]').text()).toBe('未设定价');
+
+    // 新增：填 USD/1M → 提交为每 token（0.5 / 1.5 → 5e-7 / 1.5e-6）
+    await wrapper.get('[data-test="open-add-model"]').trigger('click');
+    const addForm = wrapper.get('[data-test="add-model-form"]');
+    await addForm.findAll('input')[0].setValue('new-model');
+    await addForm.get('[data-test="add-model-upstream-id"]').setValue('openai/new-model');
+    await addForm.findAll('input')[2].setValue('New');
+    await addForm.get('[data-test="add-model-input-cost"]').setValue('0.5');
+    await addForm.get('[data-test="add-model-output-cost"]').setValue('1.5');
+    await addForm.trigger('submit.prevent');
+    await flushPromises();
+    const post = callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0];
+    const postBody = JSON.parse(String(post[1]?.body));
+    expect(postBody.input_cost_per_token).toBeCloseTo(0.0000005, 12);
+    expect(postBody.output_cost_per_token).toBeCloseTo(0.0000015, 12);
+
+    // 编辑：回填显式定价（2.8e-7 → 0.28）
+    await rows[0].get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    expect((editForm.get('[data-test="edit-model-input-cost"]').element as HTMLInputElement).value).toBe('0.28');
+    // 清空定价 → PATCH 发 null
+    await editForm.get('[data-test="edit-model-clear-pricing"]').setValue(true);
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0];
+    const patchBody = JSON.parse(String(patch[1]?.body));
+    expect(patchBody.input_cost_per_token).toBeNull();
+    expect(patchBody.output_cost_per_token).toBeNull();
+    wrapper.unmount();
   });
 });
 
