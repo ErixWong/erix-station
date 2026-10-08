@@ -34,13 +34,6 @@ function cleanProvider(value) {
   if (value === 'azure') {
     throw new GitHostError('provider_unsupported', 'azure provider 尚不支持', { httpStatus: 400, details: { field: 'provider' } });
   }
-  if (value === 'github') {
-    throw new GitHostError(
-      'provider_unsupported',
-      'github provider 暂不支持；企业内部场景请使用 gitea/gitlab 代铸',
-      { httpStatus: 400, details: { field: 'provider' } },
-    );
-  }
   if (typeof value !== 'string' || !PROVIDERS.has(value)) {
     fail('provider', 'provider 必须是 gitea、github 或 gitlab');
   }
@@ -150,10 +143,7 @@ export async function updateGitHost(pool, id, fields = {}) {
   }
 
   const name = fields.name === undefined ? current.name : cleanName(fields.name);
-  let provider = current.provider;
-  if (fields.provider !== undefined && !(current.provider === 'github' && fields.provider === 'github')) {
-    provider = cleanProvider(fields.provider);
-  }
+  const provider = fields.provider === undefined ? current.provider : cleanProvider(fields.provider);
   const baseUrl = fields.base_url === undefined ? current.base_url : cleanBaseUrl(fields.base_url);
   let adminKey = current.admin_key;
   if (fields.clear_admin_key === true) adminKey = null;

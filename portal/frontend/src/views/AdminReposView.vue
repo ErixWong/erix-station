@@ -49,7 +49,7 @@ async function saveHost() {
       name: form.name.trim(),
       provider: form.provider,
       base_url: form.base_url.trim(),
-      ...(form.admin_key ? { admin_key: form.admin_key } : {}),
+      ...(form.admin_key && form.provider !== 'github' ? { admin_key: form.admin_key } : {}),
       ...(host && form.clear_admin_key ? { clear_admin_key: true } : {}),
     };
     const err = host
@@ -161,9 +161,10 @@ onMounted(() => {
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.repos.provider') }}
-        <select v-model="form.provider" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
+        <select v-model="form.provider" data-test="git-host-provider" class="rounded-md border border-black/20 bg-white px-2 py-1 text-sm">
           <option value="gitea">Gitea</option>
           <option value="gitlab">GitLab</option>
+          <option value="github">GitHub</option>
         </select>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
@@ -174,12 +175,17 @@ onMounted(() => {
         {{ t('admin.repos.adminKey') }}
         <input
           v-model="form.admin_key"
+          data-test="git-host-admin-key"
           type="password"
           autocomplete="new-password"
+          :disabled="form.provider === 'github'"
           :placeholder="editingHost?.admin_key_configured ? t('admin.repos.adminKeyKeep') : t('admin.repos.adminKeyPlaceholder')"
-          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm disabled:bg-black/5 disabled:text-black/40"
         >
       </label>
+      <p v-if="form.provider === 'github'" data-test="git-host-github-hint" class="rounded-md border border-amber-500 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+        {{ t('admin.repos.githubHint') }}
+      </p>
       <p v-if="editingHost?.admin_key_configured" class="text-xs text-black/45">
         {{ t('admin.repos.adminKeyConfigured', { key: editingHost.admin_key }) }}
       </p>
