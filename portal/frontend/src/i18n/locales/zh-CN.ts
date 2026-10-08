@@ -94,6 +94,8 @@ export const zhCN = {
     // issue #114：「AI 改名」按钮（点击才调一次 LLM 生成标题）+ 行内 loading 提示
     aiRename: 'AI 改名',
     aiRenaming: 'AI 命名中…',
+    // issue #197：会话列表项副行的每会话消息数（口径同头部状态行：全量 messages 行含 synthetic）
+    messageCount: '{count} 条消息',
   },
   // 目录树面板（components/DirectoryTree.vue）
   tree: {

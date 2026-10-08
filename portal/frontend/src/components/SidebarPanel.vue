@@ -142,6 +142,16 @@ async function aiRename(s: Session) {
 function isActive(s: Session): boolean {
   return String(s.id) === String(store.sessionId);
 }
+
+/**
+ * issue #197：列表项副行的消息数后缀（「 · N 条消息」，口径同头部状态行：后端 listSessions
+ * COUNT 全量 messages 行含 synthetic）。缺失（旧后端/非列表来源）或 0（与头部状态行
+ * messages > 0 才显示的阈值一致，新会话不显示「0 条」）→ 返回空串不渲染。
+ */
+function messageCountSuffix(s: Session): string {
+  const n = s.message_count;
+  return typeof n === 'number' && n > 0 ? ` · ${t('sidebar.messageCount', { count: n })}` : '';
+}
 </script>
 
 <template>
@@ -223,8 +233,8 @@ function isActive(s: Session): boolean {
               <div class="flex min-w-0 items-center gap-1.5 text-[12px] leading-[1.4]">
                 <span class="min-w-0 truncate" :class="isActive(s) ? 'font-medium' : ''">{{ s.title || t('common.unnamedSession') }}</span>
               </div>
-              <!-- 副行：11px / text-dim / marginTop 2 -->
-              <div class="mt-0.5 truncate text-[11px] leading-[1.4] text-black/50">{{ store.sessMeta(s) }}</div>
+              <!-- 副行：11px / text-dim / marginTop 2；issue #197：尾部追加「 · N 条消息」（同字体克制灰字，缺失/0 不显示） -->
+              <div class="mt-0.5 truncate text-[11px] leading-[1.4] text-black/50">{{ store.sessMeta(s) }}{{ messageCountSuffix(s) }}</div>
               <p v-if="editError?.id === String(s.id)" class="syserr mt-0.5" role="alert">{{ editError.text }}</p>
             </div>
             <!-- @click.stop：重命名入口不得误触「选中会话」 -->
