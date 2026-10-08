@@ -33,14 +33,18 @@ function fixture(t) {
 
 function makePool(gitHosts) {
   const calls = [];
-  return {
+  const pool = {
     calls,
     async query(sql, params = []) {
       calls.push({ sql, params });
       if (sql === 'SELECT base_url, provider FROM git_hosts') return { rows: gitHosts };
       return { rows: [] };
     },
+    async connect() {
+      return { query: (sql, params) => pool.query(sql, params), release() {} };
+    },
   };
+  return pool;
 }
 
 function cliPath(homeDir, provider) {
