@@ -54,9 +54,12 @@ test('0.16.0 同 round 保序：src 中不存在按 created_at 排序的 transcr
   }
 });
 
-test('transcript-store 头注释标注 0.16.0（appendUserTurn 消费面版本）', () => {
+test('transcript-store 头注释标注 0.17.0（appendUserTurn 消费面版本）+ 成对探针齐备（#193）', () => {
   const src = read('transcript-store.js');
-  assert.match(src.split('\n')[0], /erix-agent 0\.16\.0/);
+  assert.match(src.split('\n')[0], /erix-agent 0\.17\.0/);
+  // 成对红线：只实现其一 = 引擎整块退回全量 load（缺一如缺二），两方法必须同时在源码里。
+  assert.match(src, /async loadByDedupKey\(key, dedupKey\)/, '#193：loadByDedupKey 探针不得单独缺失');
+  assert.match(src, /async loadMaxRound\(key\)/, '#193：loadMaxRound 探针不得单独缺失');
 });
 
 // ② 行为级护栏：镜像 sessions.js getSession / session-text.js TRANSCRIPT_SQL 的 fake，

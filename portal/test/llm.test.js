@@ -655,7 +655,10 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
       if (s.startsWith('INSERT INTO messages')) {
         return { rows: [{ id: 'm1', seq: 1, role: 'user', content: 'hi', attachments: '[]', created_at: new Date() }] };
       }
-      if (s.startsWith('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的 load(key)
+      if (s.startsWith('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的回退路径 load(key)
+      // 0.17.0 成对快路径探针（#193）：空 transcript → 未命中 + max_round null（round 仍为 0）。
+      if (s.startsWith('SELECT record FROM transcript_rounds')) return { rows: [] };
+      if (s.startsWith('SELECT MAX(round)')) return { rows: [{ max_round: null }] };
       if (s.startsWith('INSERT INTO transcript_rounds')) return { rows: [] };
       if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
       if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
