@@ -4,7 +4,7 @@
 
 **定位一句话**：`erix-agent` 是引擎（无头 agent 运行时），`erix-station` 是宿主平台（谁在用、在哪台机器上跑、怎么访问、花了多少钱）。
 
-- 状态：**P1 实现中**（设计定稿，portal/runner/deploy 已落地，`npm test` 168 pass）
+- 状态：**P1 实现中**（设计定稿，portal/runner/deploy 已落地，根 `npm test` 730 通过 / 1 跳过，2026-10-08 快照；单测数随开发漂移，不作验收依据）
 - **入口文档**：[`docs/README.md`](docs/README.md) —— 文档地图 + 待补齐清单（实现者从这里开始）
 - 主规格：[`docs/design/fde-platform.md`](docs/design/fde-platform.md)
 - 设计原理与取舍：[`docs/design/principles.md`](docs/design/principles.md)
@@ -17,7 +17,7 @@
 | `docs/` | 文档地图（`docs/README.md`）：现有文档 + 待补齐清单与验收标准 |
 | `docs/design/` | 主规格（拓扑 / 网络 / 授权 / 端口 / 数据模型 / 分期）+ 设计原理与被否决方案 |
 | `deploy/` | Traefik + portal + DB 的 compose、FDE 容器模板、迁移脚本 |
-| `portal/` | 管理平台服务（internal API + 用户面 API + mock LLM 网关）；用户面前端为 Vue 3 SPA（`portal/frontend/`，issue #61：Vite + TS + vue-router + pinia + Tailwind v4，`/` 服务构建产物） |
+| `portal/` | 管理平台服务（internal API + 用户面 API + LLM 网关薄代理，上游为自托管 LiteLLM，AGENTS.md §4.2）；用户面前端为 Vue 3 SPA（`portal/frontend/`，issue #61：Vite + TS + vue-router + pinia + Tailwind v4，`/` 服务构建产物） |
 | `runner/` | 容器内 agent worker（agentd + worker，接 erix-agent `runToolLoop`） |
 
 ## 三条不变式（红线）
