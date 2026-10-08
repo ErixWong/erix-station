@@ -1,6 +1,9 @@
 // WP5 端到端：对话链路（portal.md §4/§5）——会话 → 发消息建 run → 浏览器 SSE → 工具卡片事件 →
 // 停止（cancel_requested_at → cancelling → aborted run_end）→ assistant 回写 → 归档。
 // 复用真实 runner + LiteLLM mock model；必须显式传入独立的栈名、容器名、端口和临时 DB 路径。
+// ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab）；
+//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）——本脚本**绝不删除共享镜像 tag**
+//   （issue #178，口径集中在 lib/fde-image.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -12,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -23,7 +27,7 @@ const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
 const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
 const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`;
-const FDE_IMAGE = process.env.FDE_IMAGE || 'erix-station/fde:local';
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
 
 function assertIsolatedEnvironment() {
@@ -271,7 +275,7 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
     safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
     safe(() => docker(`network rm fde-${FDE_NAME} 2>/dev/null || true`));
     safe(() => compose('down -v', composePaths));
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
+    // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose/docker build 按需失效缓存）。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
@@ -283,8 +287,7 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
   try {
     safe(() => compose('down -v', composePaths));
     removeDbDir();
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
-    docker(`build -t ${FDE_IMAGE} runner/`);
+    buildFdeImage(FDE_IMAGE);
     // F2：baseline（docs/data/schema.sql）自 P1 冻结、**不含** idempotency_keys；该表只能由增量迁移
     //   0001 提供 → 本 e2e 以 MIGRATE_ON_START=1 跑**真实迁移 runner**（portal 在监听端口前以
     //   station_platform 应用 baseline 之后的增量）。这不仅让表存在，也验证了「增量生效」链路。

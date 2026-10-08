@@ -1,5 +1,8 @@
 // WP5 UI 验收环境准备：起栈（留活）+ 种子用户 alice（口令+TOTP）+ 建项目 + provision FDE。
 // 用法：node portal/integration/wp5-ui-setup.mjs   （验收后 node .../wp5-ui-teardown.mjs）
+// ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab）；
+//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）——本脚本**绝不删除共享镜像 tag**
+//   （issue #178，口径集中在 lib/fde-image.mjs）。
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -7,11 +10,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
+import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
-const FDE_IMAGE = 'erix-station/fde:local';
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 const STATE_FILE = '/tmp/hb/wp5-ui-state.json';
 
 function docker(args) {
@@ -48,8 +52,8 @@ const userId = '00000000-0000-4000-8000-0000000000a1';
 
 safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: dynamicRoot }));
 safe(() => execSync(`sg docker -c ${JSON.stringify(`docker run --rm -v /docker:/host alpine rm -rf /host/station-db`)}`));
-safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
-docker(`build -t ${FDE_IMAGE} runner/`);
+// issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；docker build 按 build context 变更自动失效缓存）。
+buildFdeImage(FDE_IMAGE);
 compose('up -d --build', {
   ERIX_USERSPACE_ROOT_HOST: userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: dynamicRoot,
   FDE_IMAGE, FDE_CMD: '[]', FDE_DEV_USER: '', FDE_DEV_MODE: '1', FDE_AGENT_VERSION: '0.1.0',

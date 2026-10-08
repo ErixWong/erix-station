@@ -10,11 +10,19 @@
 //   STATION_DB_NAME=station-db-43 STATION_PORTAL_NAME=station-portal-43 STATION_STACK_ID=station-e2e-43 \
 //   PORTAL_HOST_PORT=28080 LITELLM_HOST_PORT=24400 \
 //   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=alice43 \
+//   FDE_IMAGE=erix-station/fde:e2e-43 STATION_PORTAL_IMAGE=erix-station/portal:e2e-43 \
 //   node portal/integration/wp3b-e2e.mjs
 // （fde 容器/网络名 = fde-<FDE_NAME>，由 portal provisioner 生成；compose() 已透传进程 env，
 //   COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 18080/4100/8090/8443、station-*、alice。
 //   TRAEFIK_STATIC_HOST 无需手传：脚本每次 up 前自动生成「仅替换入口端口」的临时 traefik.yml
 //   并经 compose env 注入（Traefik v3 带 --configFile 时 CLI 覆盖不生效，必须整体替换配置文件）。）
+//
+// ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab，
+//   本机直连被墙）。脚本构建时显式传三个 proxy build arg 并按需加 `--network=host`，
+//   且以流式输出构建日志（issue #178，口径集中在 lib/fde-image.mjs）。
+// ⚠️ 隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）：脚本**绝不删除共享镜像 tag**
+//   （`erix-station/fde:local`/`erix-station/portal:local`）——曾实测 rmi 掉共享 fde 镜像后，
+//   共享栈 provision FDE 报 `No such image`。重建走 build context 变更自动失效缓存，不靠删镜像。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -25,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { DEFAULT_FDE_IMAGE, DEFAULT_PORTAL_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -38,7 +47,8 @@ const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
 const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
 const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner 命名规则：fde-<fde_name>
-const FDE_IMAGE = 'erix-station/fde:local';
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
+const PORTAL_IMAGE = process.env.STATION_PORTAL_IMAGE || DEFAULT_PORTAL_IMAGE;
 const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
 
 // F8：生成「仅替换入口端口」的隔离栈专用 traefik 静态配置。
@@ -241,7 +251,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
     safe(() => docker(`network rm fde-${FDE_NAME} 2>/dev/null || true`));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, TRAEFIK_STATIC_HOST: S.staticFile }));
-    safe(() => docker('rmi -f erix-station/portal:local erix-station/fde:local 2>/dev/null || true'));
+    // issue #178：**不删镜像**。镜像名已 env 派生（FDE_IMAGE/STATION_PORTAL_IMAGE）→ 隔离栈有自己的
+    // tag；默认共享 tag 绝不能被 e2e 删除（曾把共享 fde 镜像删掉，共享栈 provision 报 No such image）。
+    // compose up -d --build 与 docker build 按 build context 变更自动失效缓存，无需靠删镜像强制重建。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
@@ -253,10 +265,10 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     // 0) 预清理
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, TRAEFIK_STATIC_HOST: S.staticFile }));
     removeDbDir();
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
+    console.log(`[wp3b] 镜像：FDE=${FDE_IMAGE} PORTAL=${PORTAL_IMAGE}（默认共享 tag 一律不动，issue #178）`);
 
-    // 1) 构建真实 runner 镜像（build context runner/）
-    docker(`build -t ${FDE_IMAGE} runner/`);
+    // 1) 构建真实 runner 镜像（build context runner/；带 proxy build args + 流式输出）
+    buildFdeImage(FDE_IMAGE);
 
     // 2) 起栈（含 LiteLLM；FDE 用真实 runner 镜像：tag + dev-mode + 无 --user）。
     // MIGRATE_ON_START=1：启动迁移完成后，管理台 API 才能创建 credential/model/binding。
