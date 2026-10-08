@@ -524,8 +524,11 @@ export class FakeInternalPool {
     }
 
     // ---- messages assistant 回写（role 为字面量 'assistant'）----
+    // P3 PR②b B2：写侧不再把正文当参数（`content` 恒为空串字面量），故从 SQL 文本里取该字面量——
+    // 测试因此能钉住「新行 content = ''」；将来若回到写正文，正则取不到而是 undefined，用例自会红。
     if (sql.includes('INSERT INTO messages')) {
-      const [sessionId, runId, seq, content] = params;
+      const [sessionId, runId, seq] = params;
+      const content = sql.match(/'assistant',\s*'([^']*)'/)?.[1];
       this.messages.push({ id: 'm' + (this.messages.length + 1), session_id: sessionId, run_id: runId, seq, role: 'assistant', content });
       return { rows: [] };
     }
