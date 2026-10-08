@@ -30,10 +30,18 @@ P1 本地开发（写代码、起栈联调）只需：
 | socket-proxy | 开发期**同样启用**：`station-docker-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API（不直挂 socket）；白名单见 deploy-contract §5.1（自研 admission proxy：方法+路径白名单 12 条 + create 参数级校验；**不再用** tecnativa 类别级 env 门） |
 | DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**。增量迁移（`deploy/migrations/*.sql`）**由 portal 自己跑**：`MIGRATE_ON_START=1`（compose 显式值），portal 在监听端口前应用（§10） |
 | 域名 | **开发期已使用真实泛解析域名（2026-10-08 定稿，issue #57）**：`*.fde.erix.vip` 泛解析 → 宿主机 Tailscale IP `100.100.0.3`（比 DHCP LAN IP 稳定），浏览器/playwright/FDE 均可达；入口带端口 `:8090`（dev Traefik 不在 80/443）。`/etc/hosts` 逐条与 `*.localhost` 变通**降级为历史兜底**（仅本机无 DNS 可用时），不再是主路径。⚠️ 容器内解析与宿主无关：`station.<伞域>` / `llm.<伞域>` 恒走创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1），不依赖外部 DNS |
-| TLS | 自签证书，或直接 http 联调（cookie `Secure`/`SameSite` 属性按实际域名方案调试，正式语义仍以 portal.md §2.5 为准） |
+| TLS | 自签证书，或直接 http 联调（当前 dev 采用 **http**：cookie 无 `Secure`，预览 URL 按 http 生成；升 https 时同步 `PORTAL_PUBLIC_BASE_URL`，见 §2 与验收清单） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
 
-> **容器内域名解析（开发期同样适用）**：FDE 容器内 `station-agentd` 访问 `station.<base>`、worker 访问 `llm.<base>` 都走 HTTPS 到 Traefik（host:443）。容器内**不走宿主 `/etc/hosts`、也不走 `*.localhost` 变通**——创建 FDE 容器时用 docker `--add-host station.<base>:<该 FDE 网关 IP>` + `--add-host llm.<base>:<该 FDE 网关 IP>`（默认池 `10.200.<n>.1`；大 FDE `10.201.<n>.1`；H-B，topology.md §4-L3/L7）。开发期自签证书需同时覆盖这两个域名（§0 TLS / §2 SAN）。
+> **容器内域名解析（开发期同样适用）**：FDE 容器内 `station-agentd` 访问 `station.<伞域>`、worker 访问 `llm.<伞域>` 都走 HTTPS 到 Traefik（伞域命名与平台规范同构，与 dev/prod 无关；端口按 §0 表，生产 443）。容器内解析**与宿主 DNS/`/etc/hosts` 无关**：创建 FDE 容器时注入 `--add-host station.<伞域>:<该 FDE 网关 IP>` + `--add-host llm.<伞域>:<该 FDE 网关 IP>`（默认池 `10.200.<n>.1`；大 FDE `10.201.<n>.1`；H-B，topology.md §4-L3/L7）。**ExtraHosts 在容器创建时定死**：切换 `BASE_DOMAIN` 后必须重建既有 FDE 容器才改到新域名。开发期自签/缺证书下 agentd 走 `rejectUnauthorized:false`（生产换系统信任，见 topology.md §4）。
+
+**上线验收清单（切伞域上线前按序过一遍，每项都要真跑；#57 阶段2 实测记录见 issue #57）**
+
+- [ ] 前置：`*.fde.erix.vip` 泛解析已配（§0 DNS 行 ✅）；`deploy/.env` 三项改齐（BASE_DOMAIN / PORTAL_HOST / PORTAL_PUBLIC_BASE_URL）；重建 portal + force-create edge + **重建 FDE 容器**（ExtraHosts 创建时定，见上注）；清 dev 旧 `*.fde.localhost` 分配记录
+- [ ] 浏览器（无 hosts 条目）`http://station.fde.erix.vip:8090` 登录成功；工作台正常
+- [ ] 签发预览票据 → URL = `http://<fde>-p-<port>.fde.erix.vip:8090?preview_ticket=…`（scheme/端口随公开入口）；兑换 302 的 Location 保留端口；Set-Cookie 为 host-only（无 Domain 属性）
+- [ ] 预览页渲染容器 dev server 内容；cookie 复访免票；无凭证直访 → 403 `preview_ticket_required`（fail-closed）
+- [ ] https 变体：☑ dev 实测 8443 可达但路由暂只挂 `web` 入口（P4 现状，伞域 8443 暂 404，非回归）——生产接 ACME 时同批挂 websecure，本项随生产验证
 
 ---
 
