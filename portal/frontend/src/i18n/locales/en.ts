@@ -332,6 +332,7 @@ export const en = {
       adminKeyConfigured: 'Key configured: {key}',
       clearAdminKey: 'Clear configured key (use per-FDE credentials)',
       modeAuto: 'Mode is derived from provider and admin key. GitHub and hosts without an admin key require each FDE to provide credentials.',
+      githubHint: 'The platform cannot mint GitHub credentials: do not configure an admin key, the host mode is always “Credential required”. Each FDE must submit its own PAT via the portal (gh CLI reads ~/.config/gh/hosts.yml inside the container).',
       modeMinted: 'Platform-minted',
       modeCredential: 'Credential required',
       confirmDelete: 'Delete Git host “{name}”? A host assigned to an FDE cannot be deleted.',

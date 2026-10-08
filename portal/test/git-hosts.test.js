@@ -176,22 +176,12 @@ test('Git host CRUD derives mode, returns a key mask, and never echoes the admin
   assert.equal(gitlab.admin_key_configured, false);
 });
 
-test('Git host validation rejects Azure and GitHub, invalid URLs, and client-selected mode', async () => {
+test('Git host validation rejects Azure, invalid URLs, and client-selected mode', async () => {
   const pool = new GitHostPool();
   await assert.rejects(
     createGitHost(pool, { name: 'Azure', provider: 'azure', base_url: 'https://dev.azure.com' }),
-    (err) => err instanceof GitHostError && err.code === 'provider_unsupported' && err.httpStatus === 400,
-  );
-  await assert.rejects(
-    createGitHost(pool, { name: 'GitHub', provider: 'github', base_url: 'https://github.com' }),
-    (err) => {
-      assert.ok(err instanceof GitHostError);
-      assert.equal(err.code, 'provider_unsupported');
-      assert.equal(err.httpStatus, 400);
-      assert.deepEqual(err.details, { field: 'provider' });
-      assert.match(err.message, /github.*暂不支持.*企业内部场景.*gitea\/gitlab.*代铸/);
-      return true;
-    },
+    (err) => err instanceof GitHostError && err.code === 'provider_unsupported'
+      && err.httpStatus === 400 && err.details.field === 'provider',
   );
   await assert.rejects(
     createGitHost(pool, { name: 'Bad URL', provider: 'gitea', base_url: 'https://user:pass@git.example.test' }),
@@ -201,6 +191,7 @@ test('Git host validation rejects Azure and GitHub, invalid URLs, and client-sel
     createGitHost(pool, { name: 'Bad object', provider: 'gitea', base_url: 'https://git.example.test', mode: 'minted' }),
     (err) => err instanceof GitHostError && err.code === 'validation_failed',
   );
+  assert.equal(pool.hosts.length, 0);
 
   const host = await createGitHost(pool, {
     name: 'Gitea',
@@ -211,9 +202,18 @@ test('Git host validation rejects Azure and GitHub, invalid URLs, and client-sel
   await assert.rejects(
     updateGitHost(pool, host.id, { provider: 'github' }),
     (err) => err instanceof GitHostError
-      && err.code === 'provider_unsupported'
+      && err.code === 'admin_key_unsupported'
       && err.httpStatus === 400
-      && err.details.field === 'provider',
+      && err.details.field === 'admin_key',
+  );
+  assert.equal(pool.hosts.find((row) => row.id === host.id).provider, 'gitea', 'a rejected switch leaves the provider untouched');
+  const switched = await updateGitHost(pool, host.id, { provider: 'github', clear_admin_key: true });
+  assert.equal(switched.provider, 'github');
+  assert.equal(switched.mode, 'per_fde_pat');
+  assert.equal(switched.admin_key, null);
+  await assert.rejects(
+    updateGitHost(pool, host.id, { admin_key: 'github-minted' }),
+    (err) => err instanceof GitHostError && err.code === 'admin_key_unsupported' && err.details.field === 'admin_key',
   );
 
   pool.hosts.push({
@@ -243,6 +243,33 @@ test('Git host validation rejects Azure and GitHub, invalid URLs, and client-sel
   const cleared = await updateGitHost(pool, host.id, { clear_admin_key: true });
   assert.equal(cleared.mode, 'per_fde_pat');
   assert.equal(cleared.admin_key, null);
+});
+
+test('GitHub hosts are created in per_fde_pat mode and reject admin_key', async () => {
+  const pool = new GitHostPool();
+  const created = await createGitHost(pool, {
+    name: 'GitHub',
+    provider: 'github',
+    base_url: 'https://github.com',
+  });
+  assert.equal(created.provider, 'github');
+  assert.equal(created.mode, 'per_fde_pat');
+  assert.equal(created.admin_key, null);
+  assert.equal(created.admin_key_configured, false);
+
+  await assert.rejects(
+    createGitHost(pool, {
+      name: 'GitHub with key',
+      provider: 'github',
+      base_url: 'https://github.com',
+      admin_key: 'gh-pat',
+    }),
+    (err) => err instanceof GitHostError
+      && err.code === 'admin_key_unsupported'
+      && err.httpStatus === 400
+      && err.details.field === 'admin_key',
+  );
+  assert.equal(pool.hosts.length, 1, 'a rejected GitHub admin key does not persist a row');
 });
 
 test('Git host delete refuses referenced hosts and reports missing ids', async () => {
@@ -278,16 +305,15 @@ test('admin Git host HTTP routes enforce requireAdmin and bind GET/POST/PATCH/DE
       method: 'POST',
       headers: { cookie: adminCookie, 'content-type': 'application/json' },
       body: JSON.stringify({
-        name: 'GitHub',
-        provider: 'github',
-        base_url: 'https://github.com',
+        name: 'Azure',
+        provider: 'azure',
+        base_url: 'https://dev.azure.com',
       }),
     });
     assert.equal(response.status, 400);
-    const githubError = await response.json();
-    assert.equal(githubError.error.code, 'provider_unsupported');
-    assert.deepEqual(githubError.error.details, { field: 'provider' });
-    assert.match(githubError.error.message, /github.*暂不支持.*企业内部场景.*gitea\/gitlab.*代铸/);
+    const azureError = await response.json();
+    assert.equal(azureError.error.code, 'provider_unsupported');
+    assert.deepEqual(azureError.error.details, { field: 'provider' });
     assert.equal(pool.hosts.length, 0);
 
     const secret = 'never-return-this-git-host-key';
@@ -328,6 +354,55 @@ test('admin Git host HTTP routes enforce requireAdmin and bind GET/POST/PATCH/DE
       }),
     });
     assert.equal(response.status, 201);
+    response = await fetch(`${collection}/${ID}`, { method: 'DELETE', headers: { cookie: adminCookie } });
+    assert.equal(response.status, 204);
+    assert.equal(pool.hosts.length, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('admin Git host HTTP routes create GitHub hosts as per_fde_pat and reject admin_key', async () => {
+  const { base, pool, adminCookie, close } = await startHttpServer();
+  try {
+    const collection = `${base}/api/admin/git-hosts`;
+    let response = await fetch(collection, {
+      method: 'POST',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'GitHub', provider: 'github', base_url: 'https://github.com' }),
+    });
+    assert.equal(response.status, 201);
+    const githubHost = (await response.json()).host;
+    assert.equal(githubHost.provider, 'github');
+    assert.equal(githubHost.mode, 'per_fde_pat');
+    assert.equal(githubHost.admin_key, null);
+    assert.equal(githubHost.admin_key_configured, false);
+    assert.equal(pool.hosts.length, 1);
+
+    response = await fetch(collection, {
+      method: 'POST',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'GitHub with key',
+        provider: 'github',
+        base_url: 'https://github.com',
+        admin_key: 'gh-pat-secret',
+      }),
+    });
+    assert.equal(response.status, 400);
+    const githubKeyError = await response.json();
+    assert.equal(githubKeyError.error.code, 'admin_key_unsupported');
+    assert.deepEqual(githubKeyError.error.details, { field: 'admin_key' });
+    assert.equal(pool.hosts.length, 1, 'a rejected key does not persist a second host');
+
+    response = await fetch(`${collection}/${ID}`, {
+      method: 'PATCH',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'github', admin_key: 'gh-pat-secret' }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, 'admin_key_unsupported');
+
     response = await fetch(`${collection}/${ID}`, { method: 'DELETE', headers: { cookie: adminCookie } });
     assert.equal(response.status, 204);
     assert.equal(pool.hosts.length, 0);
