@@ -56,6 +56,7 @@
 | Traefik | **host** | 宿主 80/443（唯一 ingress） |
 | portal | `backend` | 仅 `127.0.0.1:8080`（回环） |
 | station-db | `backend` | 无（仅 portal 可达） |
+| `station-docker-proxy` | `backend` | 无（仅 portal 经 `tcp://station-docker-proxy:2375` 可达；`docker.sock` 唯一挂载点，自研 admission proxy，deploy-contract §5.1） |
 | `station-litellm` | `backend` | 数据面/管理面共用 `127.0.0.1:4100`（回环）；portal 通过 backend 网络访问管理 API |
 | FDE 容器 | **仅自己的 `/29`** | 无 publish（预览经 Traefik） |
 | ~~`edge` 网络~~ | **取消** | Traefik 在 host，不需要 |
