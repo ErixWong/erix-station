@@ -907,11 +907,11 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段） |
 | 11 | `tool_call_delta` | `onToolCall`（参数增量） | `tool_call_id: string`，`name?: string`（仅首帧），`arguments_delta: string`（JSON 文本片段，前端按序拼接得完整入参） |
 | 12 | `judge` | `onJudge` | `kind: "round"\|"intercept"`，`action: "judge_done"\|"nudge"\|"continue"\|"executed"\|"blocked"\|"degraded"`，`decision: {done, confidence, reason, evidence} \| null`，可选 `error: "timeout"\|"error"\|"parse"`，可选 `tool: {id?, name?, input?}`（依据：erix-agent v0.3.5 `src/loop.js:545-552` JudgeEvent typedef；对应 `judge_decisions` 表） |
-| 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；依据：`src/loop.js:622`），`usage: { input_tokens, output_tokens }`（整 run 汇总），`compaction_stats: array`（宿主侧字段名：值为引擎返回值 `compactionStats` **数组**原样透传，元素 `{compacted, foldedRounds, tokensBefore, tokensAfter}`，依据：erix-agent v0.3.5 `src/loop.js:624`；snake_case 命名为宿主约定），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6） |
+| 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；依据：`src/loop.js:622`），`usage: { input_tokens, output_tokens }`（整 run 汇总），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6） |
 
 > 说明与边界：
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
-> - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（`{text}` / `{termination, usage, compaction_stats}`——`compaction_stats` 为引擎返回值 `compactionStats`（`src/loop.js:624`）经 U2 载荷透传，runner §7.6 同字段；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。
+> - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（`{text}` / `{termination, usage, compaction_stats}`；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。**注（#21 审计决策 ②）**：规格 §10.1 曾写作 `compaction_stats`（本决策已一并删除），该字段在宿主全链路（`runner/`、`portal/src/`）无透传实现、U2 终态载荷不携带——本表与 §9.6 统一按**实际字段集** `termination` / `usage` / `rounds` / `final_text`（+ `attempt`，失败时 `error`）描述，不再引用 `compaction_stats`。
 > - `termination` 是**对象** `{reason, detail?}`，`reason` 取值集合以 erix-agent v0.3.5 `runToolLoop` 返回值契约为准（`src/loop.js:622`）：`end_turn` / `no_tool` / `stall` / `max_rounds_cap` / `reflection_stop` / `judge_done` / `continuation_exhausted` / `aborted` / `failed`。宿主映射：用户主动停止 → `aborted`（`src/loop.js:712`）；引擎失败 → `failed`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。
 > - **assistant 完整消息不单独发事件**：前端拼接 `assistant_delta` 流渲染气泡；run 结束后的持久对话内容以 `GET /api/sessions/:id` 的 `messages` 为准（`run_events` 是流式日志，`messages` 是人看的对话，两层不混，规格 §9.2）。
 > - 审批请求的出现通过 `judge` 事件（`action` 指示需审批）+ `GET /api/approvals` 列表体现，不单独设事件类型。
@@ -1257,7 +1257,6 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
   "usage": { "input_tokens": 15230, "output_tokens": 2104 },
   "rounds": 3,
   "final_text": "已完成：登录按钮已改为品牌色……",
-  "compaction_stats": [ { "compacted": true, "foldedRounds": 2, "tokensBefore": 41200, "tokensAfter": 9800 } ],
   "error": null
 }
 ```
@@ -1268,12 +1267,11 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `termination` | 引擎 `runToolLoop` 返回值透传，对象 `{reason, detail?}`，`reason` 取值集合见 §4.1 |
 | `usage` | 整 run 用量汇总；portal 同事务写 `runs.usage` + `usage_ledger`（`source='erix'`，一 run 一条，`UNIQUE(run_id, source)`）——见 §9.9 |
 | `rounds` / `final_text` | 轮数与 assistant 最终文本；portal 同事务回写 `messages` assistant 行 |
-| `compaction_stats` | 引擎返回值 `compactionStats`（erix-agent v0.3.5 `src/loop.js:624`）**原样透传**（数组，元素 `{compacted, foldedRounds, tokensBefore, tokensAfter}`；snake_case 为宿主约定）；portal 写入 `run_end` 事件（§5.3 第 13 类） |
 | `error` | 失败时 `{code, message, retryable}`（run 级错误码见 §6.4）；成功为 `null` |
 
 响应 `200`（portal 终态事务：runs 置终态 + `run_queue → done/cancelled` + messages 回写 + usage_ledger，runner §6.1）。
 
-**重复终态语义（同载荷 vs 不同载荷）**：portal 以 `(termination, usage, rounds, final_text, compaction_stats, error)` 的**规范化 JSON 哈希**判定是否同载荷。
+**重复终态语义（同载荷 vs 不同载荷）**：portal 以 `(termination, usage, rounds, final_text, error)` 的**规范化 JSON 哈希**判定是否同载荷。
 
 | 情形 | 响应 | 语义 |
 |---|---|---|
@@ -1609,7 +1607,7 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 |---|---|---|
 | `X-Claim-Token` 失配（run 已被 re-claim） | 拒绝，不产生任何状态变化 | —（`409 lease_lost`） |
 | `run_queue.status = 'cancelled'` 或 `runs.status = 'cancelling'`（用户已 stop） | queue → `cancelled`；runs → `finished`（`termination.reason='aborted'`） | `cancelled` |
-| `attempts < max_attempts` | queue → `pending`（清 `claim_token`/`owner_container_id`/`lease_until`）；`runs.status` **不变**（attempt 级失败不写 runs，同 run re-claim 后 `attempt > 1` 续跑，model.md §2.8 A1/runner-integration U12） | `requeued` |
+| `attempts < max_attempts` | queue → `pending`（清 `owner_container_id`/`lease_until`/`claimed_at`，**保留 `claim_token`** 供重复 release 幂等重放，fencing 由清空 lease_until 保证）；`runs.status` → `queued`（**U12 自有路径回退，不经 U2 转换表**——§9.6 U2 表的 `running→queued` 仍为非法，互不影响；同 run re-claim 后 `attempt > 1` 续跑，model.md §2.8 A1/runner-integration U12） | `requeued` |
 | `attempts >= max_attempts` | queue → `done`；runs → `failed`（`max_attempts_exceeded`） | `failed_max_attempts` |
 
 **组合语义**：

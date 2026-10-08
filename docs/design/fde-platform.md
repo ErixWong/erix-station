@@ -512,7 +512,7 @@ hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
 | `onDelta` / `onReasoningDelta` | `{type:"assistant_delta"｜"reasoning_delta", text}` |
 | `onToolCall`（参数增量） | `{type:"tool_call_delta", ...}` |
 | `onJudge` | `{type:"judge", kind, action, decision}` |
-| `runToolLoop` 返回值 | 喂 U2 终态载荷（`termination`/`usage`/`rounds`/`final_text`/`compaction_stats`），**不直接产事件**——`run_end` 事件由 portal 在 U2 终态事务合成（runner §7.6） |
+| `runToolLoop` 返回值 | 喂 U2 终态载荷（`termination`/`usage`/`rounds`/`final_text`），**不直接产事件**——`run_end` 事件由 portal 在 U2 终态事务合成（runner §7.6） |
 
 `seq`（erix 不提供）由宿主在落库时分配。
 
