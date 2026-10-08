@@ -26,6 +26,12 @@ import { syncFdeLlmBindingOnOnboard } from '../src/llm.js';
 const DEPROVISION_USER_SPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'station-provisioner-users-'));
 test.after(() => fs.rmSync(DEPROVISION_USER_SPACE_ROOT, { recursive: true, force: true }));
 
+// 测试隔离（§2.1）：reconcileOnce 用例会 ensureUserSpaceMountDirs → mkdir 真实 userSpaceRoot。
+// 此前写死真实 /srv/erix/users（root:root 0755）→ 非 root 单测 EACCES（仅靠残留测试目录可写才偶然过）。
+// 照拄上方 DEPROVISION 模式注入临时根；userSpaceRootHost（bind source 断言用）保持原值不动。
+const RECONCILE_USER_SPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'station-provisioner-users-'));
+test.after(() => fs.rmSync(RECONCILE_USER_SPACE_ROOT, { recursive: true, force: true }));
+
 function deprovisionForTest(pool, config, options) {
   const useInjectedRoot = typeof config?.userSpaceRoot === 'string';
   const userSpaceRoot = useInjectedRoot
@@ -352,7 +358,7 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
     },
   };
   const config = {
-    userSpaceRoot: '/srv/erix/users',
+    userSpaceRoot: RECONCILE_USER_SPACE_ROOT,
     userSpaceRootHost: '/tmp/erix-users-test',
     fdeUid: 1000,
     fdeGid: 1000,
@@ -437,7 +443,7 @@ test('F6：create 成功 + DB update 失败 → 重试重建后容器 env token 
     async listNetworks() { return { status: 200, data: [] }; },
   };
   const config = {
-    userSpaceRoot: '/srv/erix/users',
+    userSpaceRoot: RECONCILE_USER_SPACE_ROOT,
     userSpaceRootHost: '/tmp/erix-users-f6',
     fdeUid: 1000, fdeGid: 1000, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
     fdeMemoryLimit: '512m', fdeAgentVersion: 'dev', fdeDevUser: '1001:1000',
@@ -501,7 +507,7 @@ test('F7：reconcile 幂等——两轮后第二轮不重建（同一容器）',
     async listNetworks() { return { status: 200, data: [] }; },
   };
   const config = {
-    userSpaceRoot: '/srv/erix/users', userSpaceRootHost: '/tmp/erix-users-f7',
+    userSpaceRoot: RECONCILE_USER_SPACE_ROOT, userSpaceRootHost: '/tmp/erix-users-f7',
     fdeUid: 1000, fdeGid: 1000, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
     fdeMemoryLimit: '512m', fdeAgentVersion: 'dev', fdeDevUser: '1001:1000',
     baseDomain: 'localhost', llmHost: 'llm.localhost',

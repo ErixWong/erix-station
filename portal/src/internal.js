@@ -943,7 +943,9 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   const record = body;
   const folded = body.folded === true;
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const foldedPayload = body.foldedPayload ?? null;
+  // #195：runner 不发 body.foldedPayload（引擎把原文写在 record.foldedPayload）→ 回退提取，派生列才名副其实
+  const foldedPayload = body.foldedPayload
+    ?? (Array.isArray(record?.foldedPayload) ? record.foldedPayload : null);
 
   const inserted = await pool.query(
     `INSERT INTO transcript_rounds (run_id, round, record, folded, messages, folded_payload)
@@ -1036,6 +1038,11 @@ function collectRoundText(row) {
   const msgs = row.record?.messages;
   if (Array.isArray(msgs)) {
     for (const m of msgs) if (typeof m?.content === 'string') parts.push(m.content);
+  }
+  // #195：折叠原文挂在 record.foldedPayload（Message[]，content 可为 string）——一并纳入 recall 检索面。
+  const foldedMsgs = row.record?.foldedPayload;
+  if (Array.isArray(foldedMsgs)) {
+    for (const m of foldedMsgs) if (typeof m?.content === 'string') parts.push(m.content);
   }
   if (row.folded_payload && typeof row.folded_payload === 'object') {
     parts.push(JSON.stringify(row.folded_payload));
@@ -1155,7 +1162,9 @@ export async function putSessionRound(pool, { container, user, key, round, claim
   const record = body;
   const folded = body.folded === true;
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const foldedPayload = body.foldedPayload ?? null;
+  // #195：runner 不发 body.foldedPayload（引擎把原文写在 record.foldedPayload）→ 回退提取，派生列才名副其实
+  const foldedPayload = body.foldedPayload
+    ?? (Array.isArray(record?.foldedPayload) ? record.foldedPayload : null);
 
   const inserted = await pool.query(
     `INSERT INTO transcript_rounds (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
