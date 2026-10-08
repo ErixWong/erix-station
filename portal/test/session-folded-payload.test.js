@@ -41,8 +41,8 @@ class FoldedPayloadPool extends FakePool {
     this.transcriptRows = []; // [{ transcript_key, round, folded_payload }]
   }
 
-  seedFold(transcriptKey, round, foldedPayload) {
-    this.transcriptRows.push({ transcript_key: transcriptKey, round, folded_payload: foldedPayload });
+  seedFold(transcriptKey, round, foldedPayload, record) {
+    this.transcriptRows.push({ transcript_key: transcriptKey, round, folded_payload: foldedPayload, record });
   }
 
   async query(sql, params = []) {
@@ -51,9 +51,10 @@ class FoldedPayloadPool extends FakePool {
       return { rows: s ? [s] : [] };
     }
     if (sql.includes('FROM transcript_rounds')) {
+      // 对齐 #195 回退后的 SQL：无 IS NOT NULL 过滤，行面含 folded_payload 与 record（列 NULL 时靠 record 回退）。
       const [key, round] = params;
       const rows = this.transcriptRows
-        .filter((x) => x.transcript_key === key && x.round === round && x.folded_payload != null)
+        .filter((x) => x.transcript_key === key && x.round === round)
         .slice(0, 1);
       return { rows };
     }
@@ -126,10 +127,10 @@ test('非属主 → 404 not_found（不泄露存在性）；未登录 → 401', 
   } finally { await s.close(); }
 });
 
-test('payload 缺失（无行 / 列为 NULL）→ 404 folded_payload_not_found', async () => {
+test('payload 缺失（无行 / 列与 record 都无原文）→ 404 folded_payload_not_found', async () => {
   const s = await startServer();
   try {
-    s.pool.seedFold(SESSION_ID, 5, null); // 有行但列为 NULL → 被 IS NOT NULL 过滤
+    s.pool.seedFold(SESSION_ID, 5, null); // 有行但列为 NULL、record 无 foldedPayload → 仍 404
     const miss = await fetch(`${s.base}/api/sessions/${SESSION_ID}/folded/5`, { headers: { Cookie: s.cookieHeader } });
     assert.equal(miss.status, 404);
     assert.equal((await miss.json()).error.code, 'folded_payload_not_found');
@@ -137,5 +138,20 @@ test('payload 缺失（无行 / 列为 NULL）→ 404 folded_payload_not_found',
     const noRow = await fetch(`${s.base}/api/sessions/${SESSION_ID}/folded/77`, { headers: { Cookie: s.cookieHeader } });
     assert.equal(noRow.status, 404);
     assert.equal((await noRow.json()).error.code, 'folded_payload_not_found');
+  } finally { await s.close(); }
+});
+
+test('#195 存量行回退：folded_payload 列为 NULL 但 record.foldedPayload 有原文 → 200 且 turns 非空', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seedFold(SESSION_ID, 12, null, { foldedPayload: RAW }); // 列 NULL、原文在 record（与写侧 putSessionRound 同规则）
+    const res = await fetch(`${s.base}/api/sessions/${SESSION_ID}/folded/12`, { headers: { Cookie: s.cookieHeader } });
+    assert.equal(res.status, 200, '存量行不得误 404');
+    const body = await res.json();
+    assert.equal(body.round, 12);
+    assert.ok(Array.isArray(body.turns) && body.turns.length >= 2, 'turns 非空（同一上游投影）');
+    const all = JSON.stringify(body.turns);
+    assert.match(all, /RAW FOLDED QUESTION/);
+    assert.match(all, /RAW FOLDED ANSWER/);
   } finally { await s.close(); }
 });

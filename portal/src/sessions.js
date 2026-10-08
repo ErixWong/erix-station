@@ -290,10 +290,12 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
 /**
  * issue #189：折叠原文只读端点（GET /api/sessions/:id/folded/:round）。
  * 属主/存在性/active 校验同 fetchSession 口径（非属主/不存在一律 404，不泄露存在性）；
- * 取该 session 该 round 的 folded_payload 派生列（#195 修复后由引擎 record.foldedPayload 回退提取写入），
+ * 取该 session 该 round 的折叠原文：优先 `folded_payload` 派生列（#195 修复后由引擎 record.foldedPayload
+ * 回退提取写入），存量行（列 NULL）回退 `record.foldedPayload`——与 #195 的读侧 collectRoundText（internal.js）、
+ * 写侧 putSessionRound 同一规则。
  * 为空/无行 → 404 folded_payload_not_found。命中时原文一律走同一个上游投影
  * `projectTranscriptForDisplay`（不另造折叠渲染，#95 红线），返回 { round, turns }。
- * 同 round 多行（append_seq 保序）：取最早一条带原文的行（原文内容同源，首条即可）。
+ * 同 round 多行（append_seq 保序）：取最早一条（原文内容同源，首条即可）。
  */
 export async function getFoldedPayload(pool, { userId, sessionId, round }) {
   await fetchSession(pool, sessionId, userId);
@@ -302,12 +304,16 @@ export async function getFoldedPayload(pool, { userId, sessionId, round }) {
     throw new SessionError('validation_failed', 'round 必须为非负整数', { details: { field: 'round' } });
   }
   const res = await pool.query(
-    `SELECT round, folded_payload FROM transcript_rounds
-      WHERE transcript_key = $1 AND round = $2 AND folded_payload IS NOT NULL
+    `SELECT round, folded_payload, record FROM transcript_rounds
+      WHERE transcript_key = $1 AND round = $2
       ORDER BY append_seq ASC LIMIT 1`,
     [sessionId, n],
   );
-  const payload = res.rows?.[0]?.folded_payload;
+  // #195 一致性：列优先、record.foldedPayload 回退（存量行列值为 NULL、原文只在 record 里，不得误 404）。
+  const row = res.rows?.[0];
+  const payload = Array.isArray(row?.folded_payload)
+    ? row.folded_payload
+    : (Array.isArray(row?.record?.foldedPayload) ? row.record.foldedPayload : null);
   if (!Array.isArray(payload) || payload.length === 0) {
     throw new SessionError('folded_payload_not_found', 'folded payload not found', { httpStatus: 404 });
   }
