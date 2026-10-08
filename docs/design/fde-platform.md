@@ -410,18 +410,25 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 1. 端口一律从 `.erix/ports.json` 取，**不要自己挑**
 2. dev server 必须绑 **`0.0.0.0`**（容器内）——与常规安全建议相反，因为容器网络私有且只有 ingress 能进；绑 `127.0.0.1` 会导致 ingress 够不着
 
-### 8.5 hostname grammar（写死；P5 去项目化后无项目名段）
+### 8.5 hostname grammar（写死；P5 去项目化后无项目名段；#57 阶段2 伞域修订）
 
-> **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」；实现唯一入口 `portal/src/projects.js` `buildHostname`），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
+> **`BASE_DOMAIN` 语义 = 伞域（#57 定稿）**：`BASE_DOMAIN` 不再是「可注册域」，而是**伞域** `fde.<可注册域>`（现取 `fde.erix.vip`）。
+> 派生结果：portal = `station.<BASE_DOMAIN>` = `station.fde.erix.vip`、LLM = `llm.<BASE_DOMAIN>` = `llm.fde.erix.vip`（两条生成式在 `config.js`，不动）；
+> 预览域 = `<fde>-p-<port4>.<BASE_DOMAIN>` = `eric-p-8001.fde.erix.vip`——**语法里写死的 `.fde.` 段已删除**（伞域本身已含 `fde.`，否则叠加成 `.fde.fde.erix.vip`）。
+> 代码默认兜底 = `BASE_DOMAIN=localhost`（`config.js`，本地起服不改环境变量的形态；要给本地也套伞域则显式配 `BASE_DOMAIN=fde.localhost`）；dev 走 `http://…:8090`、生产走 `https/443`，**同一代码路径**（URL 的 scheme/端口从公开入口 `config.portalPublicBaseUrl` 派生，见 `projects.previewUrl`）。
+
+> **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」；实现唯一入口 `portal/src/projects.js` `buildHostname`，URL 另见同模块 `previewUrl`），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
 > **长度约束（DNS 标签安全的前提，#202 如实写）**：单标签上限 **63** 字符、整域名 ≤ **253**（RFC 1035）。首标签 `<fde>-p-<port4>` 的固定段（`-p-` + 恒 4 位端口）占 7 字符 ⇒ **FDE 名参与预览域名的预算 = 56**（旧文档的「项目名段 / 最长 134」形态已随 P5 去项目化作废，存量 hostname 由迁移 0008 重写）。
 > **强制点（三层，同一口径逐标签 ≤63 + 总长 ≤253）**：① 开户即 400（`admin.js createUser` → `projects.validateFdeNameForHostname`，对**最终 hostname** 整体校验，错误文案含实际长度与「缩短到 56 以内」）；② 路由生成 fail-closed（`routes.js isValidHostname`）；③ DB 兜底 CHECK（迁移 **0017**，整域名正则，NOT VALID）。FDE_NAME_RE（≤63）本身不改：目录名/容器名/git-credential 路径不受 DNS 标签约束，57..63 字符在那些路径仍合法。
 
 **grammar**（小写、DNS 标签安全）：
 
 ```
-hostname := <fde> "-p-" <port4> "." "fde" "." <base>
+hostname := <fde> "-p-" <port4> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> 即伞域 fde.<可注册域>，语法不再插 .fde. 段
 <fde>    := [a-z0-9]([a-z0-9-]{0,54}[a-z0-9])?   -- users.fde_name；字符集同 schema.sql CHECK，预览域名长度预算 ≤56（见上）
 <port4>  := [0-9]{4}                              -- 恒 4 位（4000..4999，零填充）→ 首标签长度与端口取值无关
+
+-- 完整域示例：eric-p-8001.fde.erix.vip（= <fde>-p-<port4> + 伞域 fde.erix.vip）
 ```
 
 | 段 | 字符集 | 长度 | 生成规则 |

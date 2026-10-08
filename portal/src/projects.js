@@ -1,10 +1,11 @@
 // 项目注册制的退役留档（P5 去项目化，docs/design/directory-as-project.md 定稿）。
 // 原职责验尸：会话归属/run cwd/脚手架/slot/template 全部字符串化或退役，仅剩「端口分配锚点」——
-// 也随 hostname/url 重写（<fde>-p-<port>.fde.<base>，URL 去项目名段）去项目化。
+// 也随 hostname/url 重写（<fde>-p-<port>.<伞域>，URL 去项目名段）去项目化。
 // 本模块现状：
 //   - 写路径（createProject/renameProject/deleteProject）已整体删除——应用层不再产生 projects 行；
 //   - 读路径保留（listProjects/getProject + GET 端点），projects 表留档只读（迁移 0008 保留该表）；
 //   - buildHostname 新语法 + toPort 映射仍被读路径与 traefik reconciler 的消费链路使用。
+//     hostname 语法（#57 阶段2 伞域修订）：<fde>-p-<port4>.<BASE_DOMAIN>，BASE_DOMAIN 本身即伞域 fde.<可注册域>。
 // 目录枚举/会话绑定见 dirs.js / sessions.js（cwd）。
 
 export const PROJECT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -34,13 +35,17 @@ export function validateFdeName(fdeName) {
 }
 
 /**
- * hostname grammar（P5 去项目化，directory-as-project §3）：
- *   <fde>-p-<port4>.fde.<base>
+ * hostname grammar（P5 去项目化，directory-as-project §3；#57 阶段2 伞域修订）：
+ *   <fde>-p-<port4>.<baseDomain>
  * URL 去项目名段——顺带消灭「目录名 → 域名段」的合法化清洗；存量行由迁移 0008 重写。
+ * `baseDomain` 语义 = **伞域**（#57：BASE_DOMAIN 从「可注册域」改为伞域 `fde.<可注册域>`，
+ * 如 `fde.erix.vip`）⇒ 预览完整域 `eric-p-8001.fde.erix.vip`。语法里原先写死的 `.fde.` 段随之删除
+ * （否则伞域下会叠加成 `.fde.fde.erix.vip`）。portal / llm 两条生成式（config.js `station.`/`llm.` 前缀）
+ * 在新语义下自动正确，不受本函数影响。
  */
 export function buildHostname({ fdeName, port, baseDomain }) {
   const port4 = String(port).padStart(4, '0');
-  return `${fdeName}-p-${port4}.fde.${baseDomain}`;
+  return `${fdeName}-p-${port4}.${baseDomain}`;
 }
 
 // —— #202 预览域名预算（开户时前置校验，与路由生成期 routes.js isValidHostname 同口径）——
@@ -101,8 +106,36 @@ export function validateFdeNameForHostname(fdeName, { baseDomain = null } = {}) 
   return { ok: true };
 }
 
+/**
+ * 预览 URL（#57 阶段2）：**不再写死 scheme**——从公开入口配置（config.portalPublicBaseUrl，
+ * 即容器/浏览器实际可达的 Traefik 入口 `scheme://host[:port]`）派生 scheme 与非默认端口，
+ * 保证 dev（`http://station.fde.erix.vip:8090`）与生产（`https://station.fde.erix.vip`）走同一代码路径：
+ *   public = http://station.fde.erix.vip:8090 → http://eric-p-8001.fde.erix.vip:8090
+ *   public = https://station.fde.erix.vip      → https://eric-p-8001.fde.erix.vip（https 默认端口不进 URL）
+ * 预览 host 恒等于 hostname（无端口形态），端口后缀原样继承公开入口。
+ * @param {string} hostname port_allocations.hostname（无端口）
+ * @param {{ publicBaseUrl?: string | null }} [opts] 公开入口 base URL（config.portalPublicBaseUrl）；
+ *        缺省/不可解析时退化为 https 无端口（等价旧 buildUrl 行为，单测与离线路径可用）
+ */
+export function previewUrl(hostname, { publicBaseUrl = null } = {}) {
+  let scheme = 'https';
+  let port = '';
+  if (typeof publicBaseUrl === 'string' && publicBaseUrl !== '') {
+    try {
+      const u = new URL(publicBaseUrl);
+      scheme = u.protocol === 'http:' ? 'http' : 'https';
+      // URL.port 对默认端口（http:80 / https:443）返回空串 ⇒ 默认端口天然不进 URL。
+      port = u.port ? `:${u.port}` : '';
+    } catch {
+      // 不可解析的 publicBaseUrl：保持 https 无端口的保守形态（不猜端口，避免生成不可达 URL）。
+    }
+  }
+  return `${scheme}://${hostname}${port}`;
+}
+
+/** 兼容旧名（等价 previewUrl(hostname)，https 无端口）；新代码请用 previewUrl。 */
 export function buildUrl(hostname) {
-  return `https://${hostname}`;
+  return previewUrl(hostname);
 }
 
 /** 把一个 project 行映射为 Project 对象（portal.md §3.1；留档只读的响应形状不变）。 */
