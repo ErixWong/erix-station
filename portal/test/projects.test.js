@@ -6,6 +6,9 @@ import assert from 'node:assert/strict';
 import {
   validateProjectName,
   validateFdeName,
+  validateHostnameGrammar,
+  validateFdeNameForHostname,
+  MAX_FDE_NAME_LEN_FOR_HOSTNAME,
   buildHostname,
   buildUrl,
   toProject,
@@ -59,6 +62,49 @@ test('buildHostname：不含项目名段——目录名含 - / 下划线也不�
   assert.doesNotMatch(h, /proj/);
   // 旧语法对照（迁移 0008 把存量 hostname 重写为该形态）。
   assert.notEqual(h, 'alice-p-proj1-4016.fde.localhost');
+});
+
+// #202：FDE 名参与预览域名的预算 = 63 − 7（"-p-" + 4 位端口）= 56。校验对**最终 hostname**
+// 整体做（逐标签 ≤63 + 总长 ≤253），57..63 字符的名字在开户期就被拒，而不是路由生成期。
+test('validateHostnameGrammar：整域名逐标签 ≤63 + 总长 ≤253', () => {
+  assert.equal(validateHostnameGrammar('alice-p-4000.fde.localhost').ok, true);
+  assert.equal(validateHostnameGrammar(`${'a'.repeat(63)}.fde.localhost`).ok, true);
+  assert.equal(validateHostnameGrammar(`${'a'.repeat(64)}.fde.localhost`).ok, false);
+  assert.equal(validateHostnameGrammar(`${'a'.repeat(60)}.${'b'.repeat(64)}.local`).ok, false);
+  assert.equal(validateHostnameGrammar('a-b').ok, true);
+  assert.equal(validateHostnameGrammar('a..b').ok, false);
+  assert.equal(validateHostnameGrammar('').ok, false);
+  assert.equal(validateHostnameGrammar('a'.repeat(254)).ok, false);
+  // 总长 ≤253：33 个 63 字符标签 + 32 个点 = 2157 > 253，但每标签都 ≤63 → 因总长被拒。
+  const longDomain = Array.from({ length: 33 }, () => 'a'.repeat(63)).join('.');
+  const r = validateHostnameGrammar(longDomain);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /253/);
+});
+
+test('validateFdeNameForHostname：56 以内通过；57..63 拒绝且文案可操作（#202）', () => {
+  assert.equal(MAX_FDE_NAME_LEN_FOR_HOSTNAME, 56);
+  // 56 字符名字：首标签恰 63（56 + "-p-" + 4 位端口）→ 通过。
+  assert.equal(validateFdeNameForHostname('a'.repeat(56)).ok, true);
+  assert.equal(validateFdeNameForHostname('a'.repeat(56), { baseDomain: 'erix.vip' }).ok, true);
+  assert.equal(validateFdeNameForHostname('alice', { baseDomain: 'localhost' }).ok, true);
+  // 57 字符名字：首标签 64 > 63 → 拒绝，错误信息含实际长度与可操作口径（缩短到 56 以内）。
+  const r57 = validateFdeNameForHostname('a'.repeat(57), { baseDomain: 'localhost' });
+  assert.equal(r57.ok, false);
+  assert.match(r57.message, /FDE 名过长/);
+  assert.match(r57.message, /64 字符/);
+  assert.match(r57.message, /超过 DNS 上限 63/);
+  assert.match(r57.message, /缩短到 56 以内/);
+  // 63 字符（旧口径上限，FDE_NAME_RE 仍允许）同样在开户期就被拒。
+  assert.match(validateFdeNameForHostname('a'.repeat(63)).message, /70 字符/);
+  // 形态非法与超预算分开报（先形态后长度）。
+  const bad = validateFdeNameForHostname('BAD_NAME');
+  assert.equal(bad.ok, false);
+  assert.match(bad.message, /fde_name 非法/);
+  // base 域标签超预算 → 拒绝（不只看 FDE 段；整域名逐标签校验）。
+  const badBase = validateFdeNameForHostname('alice', { baseDomain: `${'b'.repeat(64)}.example` });
+  assert.equal(badBase.ok, false);
+  assert.match(badBase.message, /base 域标签/);
 });
 
 test('buildUrl：https 前缀', () => {

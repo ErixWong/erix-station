@@ -193,7 +193,7 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
       "port": 4000,
       "role": "frontend",
       "run_id": null,
-      "url": "https://alice-p-proj1-4000.fde.erix.vip",
+      "url": "https://alice-p-4000.fde.erix.vip",
       "exposure": "private",
       "state": "allocated"
     },
@@ -202,7 +202,7 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
       "port": 4001,
       "role": "backend",
       "run_id": "6f1c2a34-9b8e-4f2d-a1c5-7d8e0f1a2b3c",
-      "url": "https://alice-r3a7fq-4001.fde.erix.vip",
+      "url": "https://alice-p-4001.fde.erix.vip",
       "exposure": "private",
       "state": "active"
     }

@@ -723,6 +723,8 @@ async function handleAdminApi(req, res, ctx, url) {
             maxLoginLength: ctx.config.maxLoginLength,
             maxPasswordLength: ctx.config.maxPasswordLength,
           },
+          // #202：用真实 base 域拼最终预览 hostname 做整体校验（逐标签 ≤63 + 总长 ≤253）。
+          baseDomain: ctx.config.baseDomain,
           deferAudit: true,
         });
         const previousTokenRef = created.previousTokenRef;
