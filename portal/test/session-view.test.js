@@ -1250,13 +1250,14 @@ test('#189 折叠轮正文走折叠摘要兜底时，DTO 带 folded（foldedRoun
 
   assert.match(projection[0].content, /早期第 1–5 轮已折叠/, '正文行为不变：仍是官方折叠摘要');
   assert.deepEqual(projection[0].folded, {
+    text: projection[0].content, // 折叠摘要原文（与 foldedTurnText 同源：即该折叠 turn 自己的 text）
     foldedRoundRange: { from: 1, to: 5 },
     navigationRecord: navigation,
     foldedPayloadMessages: 2,
-  }, '三元组逐字透传（上游原名、不改名、不重推导）');
+  }, 'text + 三元组逐字透传（上游原名、不改名、不重推导）');
 });
 
-test('#189 折叠轮显示自身历史正文（非摘要兜底）时不挂 folded；无折叠轮的 run 也不带 folded 键', () => {
+test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍带 folded（text + 三元组）；无折叠轮不带该键', () => {
   const anchors = [
     message('folded-own-answer', 1, 'assistant', 'stale anchor text', RUN_1),
     message('plain-answer', 2, 'assistant', 'stale anchor text', RUN_2),
@@ -1277,8 +1278,13 @@ test('#189 折叠轮显示自身历史正文（非摘要兜底）时不挂 folde
 
   const projection = projectSessionMessages({ sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows });
 
-  assert.equal(projection[0].content, 'historical answer of the folded round');
-  assert.equal('folded' in projection[0], false, '正文来自该轮自身答复（未命中折叠兜底分支）→ 不写 folded 键');
+  assert.equal(projection[0].content, 'historical answer of the folded round', '正文仍优先自身历史答复（兜底行为不变）');
+  const folded = projection[0].folded;
+  assert.ok(folded, '只要有折叠轮就挂 folded（正文是该 run 自身助手正文时也必须出现）');
+  assert.deepEqual(folded.foldedRoundRange, { from: 1, to: 3 }, '三元组原名透传');
+  assert.equal(typeof folded.text, 'string');
+  assert.ok(folded.text !== '', 'text = 折叠 turn 的摘要原文（与 foldedTurnText 同源）');
+  assert.notEqual(folded.text, projection[0].content, '标记里的原文不顶替正文');
   assert.equal(projection[1].content, 'plain answer');
   assert.equal('folded' in projection[1], false, '无折叠轮的 run 不带 folded 键');
 });
