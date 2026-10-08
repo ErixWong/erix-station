@@ -351,6 +351,21 @@ function agentdLogs() {
   return docker(`logs ${FDE_CONTAINER} --tail 200 2>&1`);
 }
 
+// 全量 agentd 日志（不带 --tail）：用于跨「容器重启」边界仍能看到的证据（resume=true spawn、
+// ping 计数切片）。--tail 窗口滚动会让早期行丢失，故这些口径必须用全量。
+function agentdFullLogs() {
+  return docker(`logs ${FDE_CONTAINER} 2>&1`);
+}
+
+// 崩溃恢复弱等待收紧（issue #180 报告遗留项 1）：`docker logs` 跨容器重启保留历史，且 agentd 的
+// `sse ping received` 每个进程**只记一次**（runner/agentd.js:303-306 `state.sawPing` 单次守卫）——
+// 所以「日志里出现过 ping」在 kill 后被【旧 agentd】的历史秒过（= 没等新 agentd 上线）。
+// 改为切片比对：kill 前记录出现次数作基线，kill 后等待出现【更多】的那一条（次数 +1 = 新 agentd
+// 进程已连上 SSE 并收到首个 ping）。用全量日志保证「次数只增不减」（--tail 滚动会破坏该前提）。
+function countAgentdPings() {
+  return (agentdFullLogs().match(/sse ping received/g) || []).length;
+}
+
 test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃恢复', { timeout: 15 * 60 * 1000 }, async (t) => {
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp3b-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp3b-'));
@@ -529,34 +544,58 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     // 容器硬崩溃（run 进行中）：必须用 `docker kill`（缺省 SIGKILL），**不能改回 `docker restart`**。
     // 为什么：restart 走 SIGTERM → agentd **优雅停机**（"shutdown: draining runs" → abort run
     //   reason:agent_shutdown）→ portal 把 run abort 并**重排队**（attempt 2）；脚本随后再强制
-    //   lease 过期 → claim 又 +1 → 最终 attempt=3，与下方 attempts=2 断言对不上（主 agent 真机实测：
-    //   restart 路径 worker exit code:0 + 新 agentd 直接 "worker spawned run2 attempt:3 resume:true"）。
-    //   SIGKILL 不给 drain 机会 → run 仍是 running 且租约陈旧（run_queue.status=claimed + lease 过期，
-    //   见 portal/src/internal.js:225 可重领分支）→ 脚本强制 lease 过期 → re-claim 正好 attempt 2 +
-    //   resume=true，与下方 :2: 前缀 / attempts=2 断言自洽。
+    //   lease 过期 → claim 又 +1 → 最终 attempt=3（主 agent 真机实测：restart 路径 worker exit code:0
+    //   + 新 agentd 直接 "worker spawned run2 attempt:3 resume:true"）。SIGKILL 不给 drain 机会 →
+    //   run 仍是 running 且租约陈旧（run_queue.status=claimed + lease 过期，见 portal/src/internal.js:225
+    //   可重领分支）→ 脚本强制 lease 过期 → re-claim 同一 run + resume=true。
+    // ⚠️ 崩溃后 attempt 数**不是固定值**（issue #180）：旧 agentd 的悬挂长轮询 claim 请求在容器
+    //   SIGKILL 后未被识别为断开，portal 重排队瞬间该请求立刻认领成功（attempts 只在 claim 处 +1，
+    //   portal/src/internal.js:215；重排队不 +1，见同文件 :1567 注释）→ 响应写入死连接 → **ticket
+    //   孤儿化**，run 只能等 90s 租约自然到期才被新 agentd 领走。真机实测时序：
+    //     worker spawned attempt:1 → kill → 新 agentd 上线（~28s 后心跳监控重排队）→
+    //     claim att=2（无 worker spawned，ticket 发给了死连接）→ 90s 租约到期 → attempt:3 resume:true 真恢复。
+    //   即 attempt 数 = 2 还是 3 取决于竞态 → 下方断言一律用「语义口径」（attempts >= 2 且 <= max_attempts、
+    //   动态 attempt 前缀、resume=true 痕迹），**不得写死**。
     // FDE 容器 RestartPolicy=unless-stopped（portal/src/provisioner.js:201；docker inspect fde-* 同值）
     //   → SIGKILL 后 docker 自动拉起 = 真「崩溃 + 重启」。请勿改回 restart。
+    const pingsBeforeRestart = countAgentdPings(); // 新 agentd 上线的切片基线（见 countAgentdPings()）
     docker(`kill ${FDE_CONTAINER}`);
     await waitFor(() => {
       const st = safe(() => docker(`inspect ${FDE_CONTAINER} --format {{.State.Status}}`).trim());
       return st === 'running' ? st : null;
     }, { label: `${FDE_CONTAINER} restarted`, timeoutMs: 60000 });
 
-    // 新 agentd 上线（SSE + ping）
-    await waitFor(() => (agentdLogs().includes('sse ping received') ? true : null), { label: 'agentd reconnect after restart', timeoutMs: 60000 });
+    // 新 agentd 上线（SSE + ping）：必须等到**新增**的一条（次数 > kill 前基线），
+    // 否则被旧 agentd 的历史 ping 秒过（等于没等新 agentd，issue #180 报告遗留项 1）。
+    await waitFor(() => (countAgentdPings() > pingsBeforeRestart ? true : null),
+      { label: 'agentd reconnect after restart（新增 sse ping）', timeoutMs: 60000 });
 
     // 强制租约过期（模拟 90s lease 到期），让 claim 立即 re-claim 同一 run
     psqlStdin(`UPDATE run_queue SET lease_until = now() - interval '1 second' WHERE run_id = '${run2}';`);
 
-    // 等 re-claim（attempt 2）+ 终态
+    // 等 re-claim（attempts 至少 +1）+ 终态。语义口径（issue #180）：崩溃后 attempt 数是 2 还是 3
+    // 取决于 ticket 是否孤儿化（竞态），故只断言「确实发生了 re-claim」= attempts >= 2，不写死。
+    // （`>= 2` 已足以证明崩溃后确实发生了 re-claim：run 2 进入 running 时已验证 attempts === 1。）
     await waitFor(() => {
       const st = psql(`SELECT status FROM runs WHERE id='${run2}'`);
-      const at = psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`);
-      return (st === 'finished' || st === 'failed') && at === '2' ? { st, at } : null;
-    }, { label: 'run 2 re-claimed attempts=2 terminal', timeoutMs: 120000 });
+      const at = Number(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`));
+      return (st === 'finished' || st === 'failed') && at >= 2 ? { st, at } : null;
+    }, { label: 'run 2 re-claimed attempts>=2 terminal', timeoutMs: 120000 });
 
-    assert.equal(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`), '2', '崩溃恢复 re-claim attempts=2');
+    // 该 run 最终实际 attempts（恢复后真正执行的那次 = 最后一次 claim）→ 下方动态前缀 / resume 断言用。
+    const rcAttempts = Number(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`));
+    const rcMaxAttempts = Number(psql(`SELECT max_attempts FROM run_queue WHERE run_id='${run2}'`));
+    assert.ok(rcAttempts >= 2, `崩溃恢复确实发生了 re-claim（attempts >= 2）：attempts=${rcAttempts}`);
+    assert.ok(rcAttempts <= rcMaxAttempts, `attempts 未越界（<= max_attempts=${rcMaxAttempts}）：attempts=${rcAttempts}`);
     assert.equal(psql(`SELECT status FROM runs WHERE id='${run2}'`), 'finished', 'run 2 终态 finished');
+
+    // resume=true：恢复走 resume 路径的**硬证据**（agentd 日志）——attempt >= 2 的那次 worker spawn
+    // 必须带 resume:true（runner/agentd.js:1102；ctx.resume = run.resume === true，:1040）。
+    // 用该 run 最终实际 attempts 精确匹配（区分 attempt:1 的 resume:false）。
+    await waitFor(() => {
+      const re = new RegExp(`"msg":"worker spawned","fde":"${FDE_NAME}","run_id":"${run2}","attempt":${rcAttempts},"resume":true`);
+      return re.test(agentdFullLogs()) ? true : null;
+    }, { label: `run 2 resume=true worker spawned（attempt=${rcAttempts}）`, timeoutMs: 30000 });
 
     // issue #43：resume 路径经 loadRunState 恢复（0.7.0 轮号/轮预算拆分语义），终态 status 仍落 session 列。
     // 同一 session 两轮 → 列本身不能区分轮次，故额外用 status 记录的 ts 晚于 run 2 入队时间，
@@ -567,8 +606,8 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
 
     // F3（issue #43 评审）sentinel：attempt1 崩溃前的 run_state 已在库中（attempt1 独有写）；
     // 断言恢复侧**确实发生了 loadRunState 读**——agentd 对该方法留痕（仅引擎 resume 路径调用，
-    // attempt ≥ 2），read 痕迹与 write 痕迹（saveRunState）可区分：若无此读，说明 attempt2
-    // 未走恢复路径（此时只剩 attempt2 自己的写也能让上面的写侧断言假绿）。
+    // attempt ≥ 2），read 痕迹与 write 痕迹（saveRunState）可区分：若无此读，说明恢复那次 attempt
+    // 未走恢复路径（此时只剩它自己的写也能让上面的写侧断言假绿）。
     await waitFor(() => {
       // store key 已切 session 维度（runner/lib/store.js:12-18）：session 路径日志字段是 `session_key`
       // （runner/agentd.js:558），不再是旧 run 作用域的 `run_id`（:568）。restored=true = 真读到了快照。
@@ -576,9 +615,12 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
       return trace.test(agentdLogs()) ? true : null;
     }, { label: 'run 2 resume 经 loadRunState 恢复（agentd 读痕迹 + restored=true）', timeoutMs: 30000 });
 
-    // 事件含 attempt 2 前缀（resume=true 后新 attempt 事件不碰撞）
+    // 恢复后那次 attempt 的事件带**自身 attempt 号**：client_event_id = `<runId>:<attempt>:<n>`
+    // （runner/worker.js:116）。attempt 号动态取自该 run 最终实际 attempts（issue #180：2 还是 3
+    // 取决于竞态，写死 :2: 必假红）——不是「随便有个冒号」，而是精确匹配该 attempt 的前缀 + 首事件
+    // 序号 0（每个 attempt 是全新 worker 进程，eventCounter 从 0 起 → 首事件即 `:<attempt>:0`）。
     const rcEvents = psql(`SELECT string_agg(client_event_id, ',' ORDER BY seq) FROM run_events WHERE run_id='${run2}' AND type <> 'run_end'`);
-    assert.ok(rcEvents.includes(':2:0'), `attempt 2 事件存在：${rcEvents}`);
+    assert.ok(rcEvents.includes(`:${rcAttempts}:0`), `恢复后 attempt=${rcAttempts} 的事件带自身 attempt 号（前缀 :${rcAttempts}:0）：${rcEvents}`);
     const rcRunEnd = psql(`SELECT type FROM run_events WHERE run_id='${run2}' ORDER BY seq DESC LIMIT 1`);
     assert.equal(rcRunEnd, 'run_end', '崩溃恢复后 run_end 仍为最后一条');
 
