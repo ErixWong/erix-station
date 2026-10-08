@@ -1688,7 +1688,7 @@ Removes all stored credential lines for the exact host, leaving other hosts inta
 
 ## 11. Admin Git host registry (issue #118)
 
-All routes require the existing `requireAdmin` authorization. `git_hosts.mode` is derived by the server; clients must not set it. `admin_key` is accepted only on create or when replacing the key, and responses contain only a masked value plus `admin_key_configured`. The key is never included in audit details. `provider='azure'` and `provider='github'` remain reserved in the database constraint but are rejected when creating a host; GitHub is temporarily unsupported because the platform cannot mint per-FDE credentials for it. Enterprise-internal deployments should use Gitea or GitLab with platform-minted credentials.
+All routes require the existing `requireAdmin` authorization. `git_hosts.mode` is derived by the server; clients must not set it. `admin_key` is accepted only on create or when replacing the key, and responses contain only a masked value plus `admin_key_configured`. The key is never included in audit details. `provider='azure'` remains reserved in the database constraint but is rejected when creating a host. GitHub is supported in `per_fde_pat` mode: the platform cannot mint credentials for it, so each FDE supplies its own PAT, and configuring an `admin_key` on a GitHub host returns `400 admin_key_unsupported`. Enterprise-internal deployments can still use Gitea or GitLab with platform-minted credentials.
 
 ### `GET /api/admin/git-hosts`
 
@@ -1696,11 +1696,11 @@ Returns `{ "items": [host, ...] }`, where each host contains `id`, `name`, `prov
 
 ### `POST /api/admin/git-hosts`
 
-Request fields: `name`, `provider` (`gitea` / `github` / `gitlab`), `base_url`, optional `admin_key`, and optional `enabled`. Creating a GitHub host returns `400 provider_unsupported` with `details.field='provider'`. A Gitea/GitLab admin key selects `minted`; no key selects `per_fde_pat`. Returns `201 { "host": ... }`.
+Request fields: `name`, `provider` (`gitea` / `github` / `gitlab`), `base_url`, optional `admin_key`, and optional `enabled`. A GitHub host always uses `per_fde_pat`; supplying `admin_key` for it returns `400 admin_key_unsupported` with `details.field='admin_key'`. `provider='azure'` returns `400 provider_unsupported` with `details.field='provider'`. A Gitea/GitLab admin key selects `minted`; no key selects `per_fde_pat`. Returns `201 { "host": ... }`.
 
 ### `PATCH /api/admin/git-hosts/:id`
 
-Updates supplied host fields and returns `{ "host": ... }`. Omitting `admin_key` preserves it; `clear_admin_key: true` removes it and recomputes `mode`. `mode` is read-only. Switching to GitHub returns `400 provider_unsupported`; existing GitHub rows remain available and can be updated without changing their provider. Changing provider or base URL is rejected with `409 host_in_use` while an FDE is bound.
+Updates supplied host fields and returns `{ "host": ... }`. Omitting `admin_key` preserves it; `clear_admin_key: true` removes it and recomputes `mode`. `mode` is read-only. Switching a host to GitHub is allowed and forces `per_fde_pat`; supplying `admin_key` on a GitHub host (including switching a host that still carries one) returns `400 admin_key_unsupported`, so clear the key first. Changing provider or base URL is rejected with `409 host_in_use` while an FDE is bound.
 
 ### `DELETE /api/admin/git-hosts/:id`
 
