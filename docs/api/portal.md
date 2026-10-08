@@ -1100,6 +1100,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `run.attempt` | **本次 claim 后的 `run_queue.attempts`**（1-based）。worker 用它生成 `client_event_id` 的 attempt 前缀（§9.4）与审计；`resume = attempt > 1`（runner §4.2/§16.2-R16） |
 | `run.task` | 本轮用户输入，worker 必须显式传给引擎（runner §6.3） |
 | `run.resume` | `true` = re-claim 场景（`attempt > 1`），引擎从 checkpoint 恢复（runner §6.3-5） |
+| `run.history` | **已删除（P3 PR③，issue #69 下行退役）**：claim ticket 不再下发历史文本，worker 也永不传引擎 `initialMessages`——会话上下文唯一来源 = transcript（§9.8）；`run.task` 保留（空本子由引擎 round 0 种子入档，亦是 notes/标题的输入） |
 
 派单与挂起语义（runner §4.2）：
 
@@ -1498,7 +1499,10 @@ query 参数 + `X-Claim-Token` 头——writer run 必须属于该 session（否
 
 **runner 侧接线**：`markRunState('running')` 仍走 U2 真 runId（runs 表生命周期，sessionId 绝不进 U2）；
 宿主预写 dedupKey = `<key>:input:<messageId>`（`messageId` 经 U1 ticket `run.message_id` 下行）；
-resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即完整上文）。部署顺序：
+resume=true 时不传 initialMessages/initialUserMessage（引擎恢复记录即完整上文）；**P3 PR③ 起两侧都永不传 `initialMessages`**
+（issue #69 的「文本注入」链路已整体退役：ticket `run.history`、`RUN_START.history`、`runner/lib/history.js`
+与 env `STATION_HISTORY_MAX_*` 全部删除；非 resume 只传 `initialUserMessage = run.task`，对齐上游 CLI 的
+`...(resume ? {} : { initialUserMessage })`）。部署顺序：
 **portal 先上（S 端点纯增量，旧 runner 无感），FDE 镜像（runner/agentd/worker）后上**。
 
 ### 9.9 usage 上报

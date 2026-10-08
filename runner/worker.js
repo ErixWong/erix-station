@@ -30,8 +30,7 @@ import { createFileTools, createJail } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
-import { planTranscriptSeed } from './lib/transcript-seed.js';
-import { mapHistoryToInitialMessages } from './lib/history.js';
+import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { generateSessionTitle, resolveFirstUserContent } from './lib/session-title.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
@@ -330,15 +329,12 @@ async function startRun(msg) {
       onObserverError: (err) => {
         sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: `observer error: ${String(err?.message ?? err)}` });
       },
-      // task 显式传（§1.3 硬注意-1）；resume 时不传 initialMessages/initialUserMessage，
-      // 对齐上游 CLI 的 ...(resume ? {} : {...}) 模式。
+      // task 显式传（§1.3 硬注意-1）；种子片段对齐上游 CLI 的 `...(resume ? {} : { initialUserMessage })`：
+      // resume 不传任何种子选项（恢复记录即完整上文），空本子只种 `task`。
+      // P3 PR③：会话历史文本注入（issue #69）已退役 —— 两个分支都永不传 `initialMessages`，
+      // 上下文唯一来源 = transcript（conversation-state.md §6 契约③）。
       task,
-      ...(transcriptPlan.resume ? {} : {
-        // issue #69：会话历史下行——非 resume 时把 RUN_START.history 映射为引擎 initialMessages
-        // （纯函数非法入参回退 []；#70 注入本 PR 保留，P3 随 transcript 投影退役）。
-        initialMessages: mapHistoryToInitialMessages(msg.history),
-        initialUserMessage: task,
-      }),
+      ...buildEngineSeedOptions({ resume: transcriptPlan.resume === true, task }),
       tools,
       executeTool,
       // ADR-015：notes 工厂 semanticStateProvider 透传——引擎在
@@ -373,7 +369,8 @@ async function startRun(msg) {
     if (process.env.ERIX_SESSION_AUTO_TITLE !== '0') {
       title = await generateSessionTitle({
         provider,
-        firstUserContent: resolveFirstUserContent({ history: msg.history, task }),
+        // P3 PR③：历史下行退役后，标题输入 = 本轮 task（首启时会话首条用户消息就是它）。
+        firstUserContent: resolveFirstUserContent({ task }),
         finalText: result.finalText ?? '',
         // 失败 warn 走 IPC LOG → agentd 日志（与 worker 其它日志同径，stderr 兜底在 lib 内）。
         log: { warn: (m) => sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: m }) },

@@ -179,9 +179,6 @@ export function loadConfig(env = process.env) {
       perTokenMaxFailures: intEnv(env, 'TOTP_TOKEN_RATE_LIMIT_MAX_FAILURES', 5),
       maxEntries: intEnv(env, 'RATE_LIMIT_MAX_ENTRIES', 10000),
     },
-    // issue #69：会话历史下行预算（claim ticket 注入 run.history，超限保最新丢最旧）
-    historyMaxMessages: intEnv(env, 'STATION_HISTORY_MAX_MESSAGES', 20),
-    historyMaxBytes: intEnv(env, 'STATION_HISTORY_MAX_BYTES', 16384),
     kdfConcurrency: intEnv(env, 'KDF_CONCURRENCY', 4),
     // KDF 等待队列上限与排队超时：队列满/超时快速失败（503 kdf_busy），不让请求无限排队。
     kdfQueueLimit: intEnv(env, 'KDF_QUEUE_LIMIT', 100),

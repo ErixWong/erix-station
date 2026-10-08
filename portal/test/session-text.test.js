@@ -7,7 +7,6 @@ import {
   fetchInputTextByMessageId,
   fetchUserTextTurns,
   fetchRunAssistantText,
-  fetchConversationTurns,
 } from '../src/session-text.js';
 import { createSessionTextHandler, inputTranscriptRow, engineTranscriptRow } from './fake-session-text.js';
 
@@ -85,25 +84,6 @@ test('fetchRunAssistantText：按 run 取 assistant 终态正文；无锚点行�
   assert.equal(await fetchRunAssistantText(pool, { sessionId: SESSION_ID, runId: 'nope' }), null);
 });
 
-test('fetchConversationTurns：排除当前 message、返回升序、正文取 transcript（预算仍归 truncateHistory）', async () => {
-  const pool = textPool({
-    messages: [
-      userAnchor('m1', 1, '锚点问一'),
-      assistantAnchor('a1', 2, '锚点答一', RUN_1),
-      userAnchor('m2', 3, '当前这条'),
-    ],
-    transcriptRows: [
-      inputTranscriptRow({ sessionId: SESSION_ID, messageId: 'm1', text: 'transcript 问一', round: 1 }),
-      engineTranscriptRow({ sessionId: SESSION_ID, runId: RUN_1, round: 2, assistantText: 'transcript 答一' }),
-    ],
-  });
-  const turns = await fetchConversationTurns(pool, { sessionId: SESSION_ID, maxMessages: 20, excludeMessageId: 'm2' });
-  assert.deepEqual(turns.map((t) => [t.role, t.content]), [
-    ['user', 'transcript 问一'],
-    ['assistant', 'transcript 答一'],
-  ], '升序 + 排除当前 message');
-});
-
 // ---------------------------------------------------------------------------
 // P3 PR②b B2：`messages.content` 降级为锚点行（停写正文）后的读侧语义
 // ---------------------------------------------------------------------------
@@ -143,7 +123,6 @@ test('P3 PR②b B2 前瞻规则：synthetic=true 的注入行必须仍写正文�
   assert.deepEqual(turns.map((t) => [t.text, t.source]), [['judge 方向提示正文', 'anchor']],
     '合成行正文来自锚点自身（不经投影、不算 legacy）');
 
-  const history = await fetchConversationTurns(pool, { sessionId: SESSION_ID, maxMessages: 20, excludeMessageId: 'none' });
-  assert.deepEqual(history.map((t) => [t.role, t.content]), [['user', 'judge 方向提示正文']],
-    '历史上行同样保留合成行正文');
+  // 注：本用例原本还断言「历史上行也保留合成行正文」（fetchConversationTurns）；
+  // 该读取点已随 P3 PR③ 文本注入退役而删除，合成行正文约束由上面的 user 读取点继续钉住。
 });
