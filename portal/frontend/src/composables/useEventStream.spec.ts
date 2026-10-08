@@ -177,6 +177,69 @@ describe('useEventStream（mock EventSource）', () => {
     expect(hooks.onSep).not.toHaveBeenCalledWith(expect.stringContaining('run 结束'));
   });
 
+  // issue #212：worker 透传引擎 termination 后，这两个 reason 必须到工作台前台（红色 syserr），
+  // 绝不能落到灰色中性分隔条分支——尤其 persistence_failed（快照没落盘 = 崩溃恢复可能重复副作用）。
+  it('run_end 分级（#212）：persistence_failed 红色 syserr，并显示 operation/phase/sideEffect', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', {
+      seq: 2,
+      run_id: 'run-1',
+      termination: {
+        reason: 'persistence_failed',
+        detail: 'Checkpoint persistence failed before tool execution (runId=sess-1, round=3)',
+        operation: 'saveRunState',
+        phase: 'checkpoint_before_tool',
+        sideEffect: 'not_started',
+      },
+      usage: { input_tokens: 3, output_tokens: 5 },
+    });
+    expect(hooks.onSysErr).toHaveBeenCalledWith(
+      'run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用） · 落盘细节 saveRunState/checkpoint_before_tool/not_started · tokens 3+5',
+    );
+    expect(hooks.onSep).not.toHaveBeenCalled(); // 关键：不是灰色分隔条
+    expect(hooks.onCurrentRunEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('run_end 分级（#212）：final_guard_unverified 红色 syserr 带标签；缺 phase 时不拼细节；未列入红色集合的原因仍走灰色 sep', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    // 无 operation/phase/sideEffect（例如 final guard 分支）：只有标签，不出现「落盘细节」
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', { seq: 3, run_id: 'run-1', termination: { reason: 'persistence_failed' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用）');
+    s.activeRunId.value = 'run-2';
+    lastES().emit('run_end', { seq: 4, run_id: 'run-2', termination: { reason: 'final_guard_unverified', detail: 'guard retries exhausted' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：final_guard_unverified — 终稿未经核验');
+    // 截断类 reason（引擎给出但不在红色集合）保持灰色中性分隔条——本次决策不动它
+    s.activeRunId.value = 'run-3';
+    lastES().emit('run_end', { seq: 5, run_id: 'run-3', termination: { reason: 'continuation_exhausted' } });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：continuation_exhausted');
+    expect(hooks.onSysErr).toHaveBeenCalledTimes(2); // 只有两次红色，灰色那条不算
+  });
+
+  it('run_end 分级（#212）：en 语言下新原因给英文标签（双语齐全，不是只写中文）', () => {
+    setLocale('en');
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', {
+      seq: 6,
+      run_id: 'run-1',
+      termination: { reason: 'persistence_failed', operation: 'markRunState', phase: 'checkpoint_after_tool', sideEffect: 'maybe_started' },
+    });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith(
+      'run ended: persistence_failed — run snapshot not persisted (side effects may repeat on resume) · persistence detail markRunState/checkpoint_after_tool/maybe_started',
+    );
+    s.activeRunId.value = 'run-2';
+    lastES().emit('run_end', { seq: 7, run_id: 'run-2', termination: { reason: 'final_guard_unverified' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: final_guard_unverified — final answer not verified');
+  });
+
   it('tool_use/tool_call_delta/tool_result 卡片生命周期（callId 去重、ok/err、摘要截 120 字）', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);

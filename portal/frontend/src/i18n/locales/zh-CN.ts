@@ -144,6 +144,19 @@ export const zhCN = {
       runEnd: 'run 结束：{reason}{usage}',
       runEndNormal: '正常完成',
       runFailed: 'run 失败：{code} — {message}',
+      // issue #212：新增失败原因的用户可读标签（双语必须同时补，en.ts 的 `satisfies MessageSchema`
+      // 会在漏译时编译报错）。只给新值加标签：既有 failed / aborted / max_rounds_cap 保持原样
+      // 透传引擎枚举（不改既有中文基线与既有断言）。键名故意用引擎 reason 原文（不 camelCase），
+      // 以便与 lib/terminationReasons.ts 的 EXPLAINED_FAIL_REASONS 逐项对齐。
+      runEndReason: {
+        // 快照没落盘 → 崩溃恢复可能重复工具副作用，语义最重（裁决理由见 docs/data/model.md §1.7）
+        persistence_failed: '快照未落盘（崩溃恢复可能重复副作用）',
+        // 终稿未经 final guard 核验 → 用户必须自己复核
+        final_guard_unverified: '终稿未经核验',
+      },
+      // issue #212：persistence_failed 的落盘细节（worker 透传引擎 termination 的
+      // operation/phase/sideEffect；工作台必须能看见 phase）
+      runEndPersistence: '落盘细节 {operation}/{phase}/{sideEffect}',
       // 工具卡片结果行（tool_result：ok/err 标记 + 摘要 + 耗时）
       toolResult: '{mark} {digest}（{ms}ms）',
       // 可选后缀片段（调用方按条件传空串占位）

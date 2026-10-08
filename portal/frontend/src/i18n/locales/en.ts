@@ -114,6 +114,19 @@ export const en = {
       runEnd: 'run ended: {reason}{usage}',
       runEndNormal: 'completed normally',
       runFailed: 'run failed: {code} — {message}',
+      // issue #212: user-readable labels for the newly surfaced fail reasons (keys are the raw
+      // engine reason strings, not camelCase, so they line up 1:1 with EXPLAINED_FAIL_REASONS in
+      // lib/terminationReasons.ts). Existing failed / aborted / max_rounds_cap keep passing the
+      // raw enum through — unchanged baseline.
+      runEndReason: {
+        // the run snapshot never reached the store → crash recovery may replay tool side effects
+        persistence_failed: 'run snapshot not persisted (side effects may repeat on resume)',
+        // the final answer never passed the final guard → the user must review it
+        final_guard_unverified: 'final answer not verified',
+      },
+      // issue #212: persistence detail forwarded from the engine termination
+      // (operation/phase/sideEffect) — the workbench must show the phase
+      runEndPersistence: 'persistence detail {operation}/{phase}/{sideEffect}',
       toolResult: '{mark} {digest} ({ms}ms)',
       dash: ' — {value}',
       paren: ' ({value})',
