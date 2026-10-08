@@ -1662,15 +1662,38 @@ async function handleInternal(req, res, ctx, url) {
     const body = await readJsonBody(req, ctx.config.maxBodyBytes);
     const capacity = body.capacity ?? 1;
     const holdMs = body.hold_ms ?? 30000;
-    const ticket = await internal.claimRun(ctx.pool, {
-      container, user, capacity, holdMs, baseDomain: ctx.config.baseDomain,
-    });
-    if (!ticket) {
-      res.writeHead(204);
-      res.end();
-      return;
+
+    // issue #180：客户端（agentd）在响应写出前断开 → 中断长轮询，不为死连接领 ticket（否则 attempts+1、
+    // 占住租约，ticket 写向死连接而丢失，崩溃恢复白等 90s 自然到期）。
+    // Node 语义坑：`req` 的 'close' 在请求体读完时也会触发（HTTP/1.1 语义），不能单独用；
+    // 以 `res` 的 'close' + `!res.writableEnded` 判定「响应没写完就断了」（正常响应 end() 后 writableEnded=true，
+    // 同 socket keep-alive 复用的下一个请求有各自的 res，不会误判）。
+    const ac = new AbortController();
+    const onClientClose = () => { if (!res.writableEnded) ac.abort(); };
+    res.on('close', onClientClose);
+    // 防御：断开发生在监听器安装前（'close' 已错过）→ 以 destroyed 补判。
+    if (res.destroyed || res.socket?.destroyed) ac.abort();
+    try {
+      const ticket = await internal.claimRun(ctx.pool, {
+        container, user, capacity, holdMs, baseDomain: ctx.config.baseDomain, signal: ac.signal, log: ctx.log,
+      });
+      if (!ticket) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      // ② 兜底：claim 已提交（attempts+1、租约占用）但响应写不出去（客户端已断）→ 释放认领并把 attempt 还回去。
+      if (ac.signal.aborted) {
+        await internal.releaseUndeliveredClaim(ctx.pool, { runId: ticket.run.id, claimToken: ticket.claim_token, log: ctx.log });
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      return sendJson(res, 200, ticket);
+    } finally {
+      res.removeListener('close', onClientClose);
     }
-    return sendJson(res, 200, ticket);
   }
 
   // U4 heartbeat（§9.5）

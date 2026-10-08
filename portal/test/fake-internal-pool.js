@@ -301,6 +301,20 @@ export class FakeInternalPool {
       return { rows: [] };
     }
 
+    // ---- releaseUndeliveredClaim（issue #180：孤儿化 claim 回滚；attempts 递减 + RETURNING）----
+    if (sql.includes('UPDATE run_queue') && sql.includes('GREATEST(attempts - 1, 0)')) {
+      const [runId, claimToken] = params;
+      const q = this._queue(runId);
+      if (!q || q.claim_token !== claimToken || q.status !== 'claimed') return { rows: [] };
+      q.status = 'pending';
+      q.claimed_at = null;
+      q.lease_until = null;
+      q.owner_container_id = null;
+      q.claim_token = null;
+      q.attempts = Math.max(q.attempts - 1, 0);
+      return { rows: [{ attempts: q.attempts, max_attempts: q.max_attempts }] };
+    }
+
     // ---- release/reaper：queue 收敛（字面量 status）----
     if (sql.includes('UPDATE run_queue SET status=')) {
       const [runId] = params;
