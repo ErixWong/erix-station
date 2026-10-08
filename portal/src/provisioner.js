@@ -379,7 +379,11 @@ export async function removeFdeNetwork(docker, networkName, { log = console } = 
 // DB 是状态真相：对账 / onboarding / offboarding
 // ---------------------------------------------------------------------------
 
-/** 该 FDE 应「有容器」的 desired state（fde_networks allocated/active + user active + fde_name）。 */
+/** 该 FDE 应「有容器」的 desired state（fde_networks allocated/active + user 活 + fde_name）。
+ *  issue #185：`awaiting_credential` 也是「活」状态（工位/容器/工作区都在，只是 Git 凭据待补），
+ *  必须留在期望集内——否则删/换凭据把状态翻成 `awaiting_credential` 时，reconcileOnce 会把既有容器
+ *  判为 orphan 删除重建（正在跑的 run 被杀）。口径与 materializer（#183）、llm.js:650、下方 onboard 一致。
+ *  **`disabled` 仍必须排除**：offboarding 后不该再保容器（容器应被当孤儿清掉）。 */
 export async function readFdeDesired(pool) {
   const r = await pool.query(
     `SELECT u.id AS user_id, u.fde_name,
@@ -388,7 +392,7 @@ export async function readFdeDesired(pool) {
        FROM users u
        JOIN fde_networks n ON n.fde_id = u.id AND n.state IN ('allocated', 'active')
        LEFT JOIN containers c ON c.user_id = u.id
-      WHERE u.status = 'active' AND u.fde_name IS NOT NULL
+      WHERE u.status IN ('active', 'awaiting_credential') AND u.fde_name IS NOT NULL
       ORDER BY n.subnet`,
   );
   return r.rows;
