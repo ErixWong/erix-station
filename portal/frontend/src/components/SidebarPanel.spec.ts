@@ -720,3 +720,44 @@ describe('SidebarPanel · AI 改名（issue #114）', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #197：会话列表项副行的每会话消息数（后端 listSessions 的 message_count，
+// 口径同头部状态行：全量 messages 行含 synthetic）。渲染 = 「{meta} · N 条消息」同灰字；
+// message_count 缺失或 0 → 不显示（无「0 条」、无占位，副行恒等于 sessMeta）。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · 会话消息数（issue #197）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+  /** 第 i 个会话行的副行元素（11px 灰字 meta 行）。 */
+  const metaOf = (wrapper: Awaited<ReturnType<typeof mountPanel>>, i = 0) =>
+    Array.from(paneEls(wrapper).list.querySelectorAll<HTMLElement>('[data-session-row]'))[i]
+      .querySelector('div[class~="mt-0.5"]')!;
+
+  it('message_count > 0 → 副行追加「 · N 条消息」（i18n 中文，复用副行灰字样式）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1', message_count: 42 }] });
+    const store = useWorkbenchStore();
+    const meta = metaOf(wrapper);
+    expect(meta.textContent).toBe(`${store.sessMeta(store.sessions[0])} · 42 条消息`);
+    expect(meta.classList).toContain('text-[11px]'); // 不新增视觉层级：就是原副行
+    expect(meta.classList).toContain('text-black/50');
+  });
+
+  it('message_count 缺失 / 0 → 不显示（无「0 条」无占位；副行逐字等于 sessMeta）', async () => {
+    const wrapper = await mountPanel({
+      dirs: DIR,
+      sessions: [{ id: '1', title: 'a' }, { id: '2', title: 'b', message_count: 0 }],
+    });
+    const store = useWorkbenchStore();
+    expect(metaOf(wrapper, 0).textContent).toBe(store.sessMeta(store.sessions[0])); // 字段缺失
+    expect(metaOf(wrapper, 1).textContent).toBe(store.sessMeta(store.sessions[1])); // 计数为 0
+    expect(paneEls(wrapper).list.textContent).not.toContain('条消息');
+  });
+
+  it('i18n：切 English 后消息数文案对译（禁止硬编码中文）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1', message_count: 3 }] });
+    setLocale('en');
+    await flushPromises();
+    expect(metaOf(wrapper).textContent).toContain('· 3 messages');
+    expect(metaOf(wrapper).textContent).not.toContain('条消息');
+  });
+});

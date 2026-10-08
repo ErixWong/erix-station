@@ -156,14 +156,24 @@ export async function listSessions(pool, { userId, projectId, cwd, cursor, limit
   params.push(n + 1);
   const res = await pool.query(
     `SELECT s.id, s.project_id, s.cwd, s.title, s.title_source, s.model, s.last_seq, s.created_at, s.updated_at,
-            (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id
+            (SELECT r.id FROM runs r WHERE r.session_id = s.id AND r.status IN ${ACTIVE_RUN_STATES} ORDER BY r.queued_at DESC LIMIT 1) AS active_run_id,
+            -- issue #197：每会话消息数（侧栏列表展示）。口径与头部状态行同源（StreamPanel sessionStats ←
+            -- getSession DTO 的 messages 长度）：= 该会话在 messages 表的全部行数，含 synthetic、
+            -- 不按 role/synthetic/分页过滤，故 COUNT(*) 全量计数。
+            -- 索引：messages 无 session_id 专列索引，但 UNIQUE (session_id, seq) 隐式唯一索引首列即
+            -- session_id，等值 COUNT 可走该索引（schema baseline 冻结，不新增迁移）。
+            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count
        FROM chat_sessions s
       WHERE ${where}
       ORDER BY s.updated_at DESC, s.id DESC
       LIMIT $${params.length}`,
     params,
   );
-  const items = res.rows.slice(0, n).map((r) => ({ ...rowToSession(r), active_run_id: r.active_run_id ?? null }));
+  const items = res.rows.slice(0, n).map((r) => ({
+    ...rowToSession(r),
+    active_run_id: r.active_run_id ?? null,
+    message_count: Number(r.message_count), // 与头部状态行同源口径（见上方 SQL 注释）
+  }));
   const nextCursor = res.rows.length > n ? encodeSessionCursor(res.rows[n - 1]) : null;
   return { items, next_cursor: nextCursor };
 }

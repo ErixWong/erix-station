@@ -72,6 +72,8 @@ export const en = {
     // issue #114：AI rename entry (one LLM call on click) + inline loading hint
     aiRename: 'AI rename',
     aiRenaming: 'Naming with AI…',
+    // issue #197: per-session message count in the sidebar list sub-line (same counting rule as the session header stats line: all message rows incl. synthetic)
+    messageCount: '{count} messages',
   },
   tree: {
     title: 'Directory tree',

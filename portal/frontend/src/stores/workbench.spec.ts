@@ -101,6 +101,18 @@ describe('workbench store（P5 目录即项目）', () => {
     expect(url.searchParams.get('limit')).toBeNull(); // 评审裁决瘦身：回退后端默认（20）
   });
 
+  it('loadSessions：message_count 透传与缺失容忍（#197 侧栏消息数，列表项原样携带后端计数）', async () => {
+    mockFetch(dirsAwareHandler({
+      '~/projects/demo': [
+        { id: 's1', cwd: '~/projects/demo', message_count: 42 },
+        { id: 's2', cwd: '~/projects/demo' }, // 旧后端无此字段 → 不得补 0/占位，保持 undefined
+      ],
+    }));
+    const store = useWorkbenchStore();
+    await store.initWorkspace(USER);
+    expect(store.sessions.map((s) => s.message_count)).toEqual([42, undefined]);
+  });
+
   it('平台管理员空态：newDir 禁用 + 管理台引导 placeholder', async () => {
     mockFetch(() => ({ status: 200, body: { dirs: [] } }));
     const store = useWorkbenchStore();

@@ -40,6 +40,9 @@ export interface Session {
   updated_at?: string;
   active_run_id?: string | null;
   cwd?: string; // issue #84 P5：会话绑定目录（响应带 cwd）
+  /** issue #197：会话消息数（后端 listSessions COUNT 全量 messages 行、含 synthetic，
+   * 与头部状态行 sessionStats 同源口径）；旧后端/其列表外来源（createSession 响应）可能缺失 → 不显示。 */
+  message_count?: number;
 }
 
 /**
