@@ -5,9 +5,16 @@
 // 语义不变式：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内可写；越界路径抛 JailError。
 import fs from 'node:fs';
 import path from 'node:path';
+import { throwIfAborted, yieldToEventLoop } from './abort.js';
 
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TREE_ENTRIES = 500;
+// issue #211：rg / tree 是纯同步遍历——同步跑起来时 event loop 转不动，agentd 下行的
+// MSG.ABORT 处理器根本执行不了，光检查 signal.aborted 是「永远为 false」的空检查。
+// 所以每 N 次目录/文件操作让出一次事件循环（setImmediate）+ 查一次中止，把「不可中断的
+// 整趟遍历」切成「最多 N 个条目不可中断」的有限块（单文件读本身仍不可抢，上限 1MiB）。
+// 32 = 取响应性与开销的折中；无 signal 时完全不插入让出，非中止路径行为与开销零变化。
+const ABORT_CHECKPOINT_EVERY = 32;
 
 function isWithin(root, target) {
   const relative = path.relative(root, target);
@@ -182,7 +189,15 @@ const schemas = [
  * @returns {{schemas:object[], executors:Record<string, Function>}}
  */
 export function createFileTools(jail) {
-  async function readFile({ path: filePath, offset = 0, limit = 200 }) {
+  // issue #211：四个 executor 都接第二参 context（引擎经 registry.js:143 executor(input, context)
+  // 原样下传，run 的 abort signal 由 worker.js executeTool 包装注入 context.signal）。
+  // 语义分级（代价已写进 issue 报告）：
+  //   - rg / tree：可真中断——遍历内每 ABORT_CHECKPOINT_EVERY 次操作让出 + 检查，抛 AbortError。
+  //   - readFile / writeFile：单次同步 syscall，syscall 本身不可抢，只能在入口检查（已中止则
+  //     不开工）；在途那次读/写跑完才可能观察到中止（单文件 ≤ MAX_FILE_BYTES，毫秒量级）。
+  // 不传 context / 未中止时，四个工具行为与修前逐字一致。
+  async function readFile({ path: filePath, offset = 0, limit = 200 }, context = {}) {
+    throwIfAborted(context?.signal);
     jail.assertReadable(filePath);
     const resolvedPath = jail.resolve(filePath);
     const text = fs.readFileSync(resolvedPath, 'utf8');
@@ -199,7 +214,19 @@ export function createFileTools(jail) {
     return selected.join('\n');
   }
 
-  async function rg({ pattern, path: searchPath = '.', maxResults = 50 }) {
+  async function rg({ pattern, path: searchPath = '.', maxResults = 50 }, context = {}) {
+    const signal = context?.signal;
+    throwIfAborted(signal);
+    // 无 signal = 不插让出点（保持旧同步行为与吞吐）。
+    const interruptible = signal != null;
+    let checkpointOps = 0;
+    const checkpoint = async () => {
+      if (!interruptible) return;
+      checkpointOps += 1;
+      if (checkpointOps % ABORT_CHECKPOINT_EVERY !== 0) return;
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    };
     const expression = new RegExp(String(pattern));
     const resultLimit = normalizeNonNegativeInteger(maxResults, 50);
     const resolvedSearchPath = readablePath(jail, searchPath);
@@ -225,8 +252,9 @@ export function createFileTools(jail) {
       }
     };
 
-    const visit = (lexicalPath) => {
+    const visit = async (lexicalPath) => {
       if (results.length >= resultLimit) return;
+      await checkpoint();
       const currentPath = readablePath(jail, lexicalPath);
       if (currentPath === null) return;
       const stat = fs.statSync(currentPath);
@@ -241,15 +269,26 @@ export function createFileTools(jail) {
         .sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
         if (results.length >= resultLimit) return;
-        visit(path.join(currentPath, entry.name));
+        await visit(path.join(currentPath, entry.name));
       }
     };
 
-    visit(resolvedSearchPath);
+    await visit(resolvedSearchPath);
     return results.join('\n');
   }
 
-  async function tree({ path: treePath = '.', depth = 3 }) {
+  async function tree({ path: treePath = '.', depth = 3 }, context = {}) {
+    const signal = context?.signal;
+    throwIfAborted(signal);
+    const interruptible = signal != null;
+    let checkpointOps = 0;
+    const checkpoint = async () => {
+      if (!interruptible) return;
+      checkpointOps += 1;
+      if (checkpointOps % ABORT_CHECKPOINT_EVERY !== 0) return;
+      await yieldToEventLoop();
+      throwIfAborted(signal);
+    };
     const resolvedTreePath = readablePath(jail, treePath);
     if (resolvedTreePath === null) return '';
     const maxDepth = normalizeNonNegativeInteger(depth, 3);
@@ -260,8 +299,9 @@ export function createFileTools(jail) {
     const visitedDirectories = new Set();
     let entries = 1;
 
-    const visit = (currentPath, currentDepth) => {
+    const visit = async (currentPath, currentDepth) => {
       if (entries >= MAX_TREE_ENTRIES || currentDepth >= maxDepth) return;
+      await checkpoint();
       if (!fs.statSync(currentPath).isDirectory()) return;
       if (visitedDirectories.has(currentPath)) return;
       visitedDirectories.add(currentPath);
@@ -270,23 +310,25 @@ export function createFileTools(jail) {
         .sort((left, right) => left.name.localeCompare(right.name));
       for (const child of children) {
         if (entries >= MAX_TREE_ENTRIES) return;
+        await checkpoint(); // 宽目录（单目录上千条目）也要能中断：checkpoint 落在条目循环里，不只落在目录递归上
         const childPath = path.join(currentPath, child.name);
         const readable = readablePath(jail, childPath);
         if (readable === null) continue;
         const childStat = fs.statSync(readable);
         lines.push(`${'  '.repeat(currentDepth + 1)}${child.name}${childStat.isDirectory() ? '/' : ''}`);
         entries += 1;
-        if (childStat.isDirectory()) visit(readable, currentDepth + 1);
+        if (childStat.isDirectory()) await visit(readable, currentDepth + 1);
       }
     };
 
     if (rootStat.isDirectory()) {
-      visit(resolvedTreePath, 0);
+      await visit(resolvedTreePath, 0);
     }
     return lines.join('\n');
   }
 
-  async function writeFile({ path: filePath, content }) {
+  async function writeFile({ path: filePath, content }, context = {}) {
+    throwIfAborted(context?.signal);
     if (typeof content !== 'string') {
       throw new TypeError('writeFile content must be a string');
     }

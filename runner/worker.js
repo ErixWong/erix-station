@@ -273,7 +273,18 @@ async function startRun(msg) {
     if (noteTools.executeTool && noteToolNames.has(options.name)) {
       return noteTools.executeTool(options);
     }
-    return registry.executeTool(options.name, options.input, options.context);
+    // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
+    // options.signal（erix-agent 0.17.0 orchestrator.js:324 声明 + run-snapshot-executor.js:237
+    // `signal: ctx.toolSignal` 实传），而 registry.executeTool 只有 (name, input, context) 三个
+    // 位置参数、没有 signal 槽位——所以 signal 只能搭 context 下去（registry.js:143
+    // `executor(input, context)` 原样转给 executor）。此前包装只转 name/input/context，
+    // signal 在这一步被丢弃：shell/rg 完全收不到中止，用户点「停止」后引擎侧靠
+    // awaitWithAbort 竞速先返回了，但 spawn 出去的命令没人杀，要等满超时（默认 60s，
+    // env 放宽可到 3600s）才停——本行是这条链路的唯一入口，别在重构中再丢一次。
+    return registry.executeTool(options.name, options.input, {
+      ...options.context,
+      signal: options.signal,
+    });
   };
 
   // P3 PR②a：portal 已在 POST 事务内预写 `:input:<messageId>`。
