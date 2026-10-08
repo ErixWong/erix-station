@@ -12,6 +12,7 @@ import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
 import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle, AGENT_TITLE_MAX_LEN } from './session-title.js';
+import { fetchConversationTurns, fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -276,28 +277,46 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
     name: projectName,
     root_path: typeof runRow.cwd === 'string' ? runRow.cwd : '',
   };
+  // P3 PR②b B1 ④（**运行关键路径**）：ticket 的 task 文本改从 transcript 输入行取
+  // （dedupKey = `<sessionId>:input:<messageId>` 单行精确命中）。回退顺序（写死在此）：
+  //   ① 输入行存在且投影有 user 正文 → 用它（新会话恒命中）；
+  //   ② 取不到 → legacy 回退 `messages.content`（仅迁移 0015 之前入档的行；legacy-only，不用于新会话）；
+  //   ③ 两者都空 → 空串（`assembleTicket` 既有 `?? ''` 语义，不阻断 claim）。
+  // `attachments` 仍从 `messages` 取（附件是本平台自有元数据，不在 transcript 里）。
   const message = await pool.query(
     `SELECT id, content, attachments FROM messages
       WHERE run_id = $1 AND role = 'user' ORDER BY seq DESC LIMIT 1`,
     [row.run_id],
   );
+  const currentMessage = message.rows?.[0] ?? null;
+  let taskText = null;
+  try {
+    taskText = await fetchInputTextByMessageId(pool, {
+      sessionId: runRow.session_id, messageId: currentMessage?.id,
+    });
+  } catch (err) {
+    // 输入行查询异常同样走 ② legacy 回退（关键路径不因投影读失败而中断 claim）。
+    log?.warn?.(`[internal] task transcript projection read failed, claim falls back to message anchor: ${String(err?.message ?? err)}`);
+  }
+  if (typeof taskText !== 'string' || taskText === '') {
+    taskText = typeof currentMessage?.content === 'string' ? currentMessage.content : ''; // ② legacy-only
+  }
 
-  // issue #69：会话历史下行——该 run 所属 session 最近 user/assistant 消息，排除当前这条（message_id），
-  // 查最近 maxMessages 条（DESC），截断后升序注入 ticket。预算超限保最新丢最旧，不注入合成消息。
-  // 评审修正：history 是增强物不是关键路径——查询失败 best-effort 回退空历史，绝不阻断 claim
+  // issue #69：会话历史上行——该 run 所属 session 最近 user/assistant 消息，排除当前这条（message_id），
+  // 取最近 maxMessages 条（DESC）后翻回升序注入 ticket。预算超限保最新丢最旧，不注入合成消息。
+  // 评审修正：history 是增强物不是关键路径——取数失败 best-effort 回退空历史，绝不阻断 claim
   // （claim 已 UPDATE run_queue，炸在这里要等 lease reaper 自愈，白损延迟）。日志只记 err 摘要。
+  // P3 PR②b B1 ⑤：锚点集合/排除语义/预算截断完全不变，**只有正文改从 transcript 投影取**。
   let history = [];
   try {
     const budget = normalizeHistoryBudget(historyBudget);
-    const currentMessageId = message.rows?.[0]?.id ?? crypto.randomUUID();
-    const historyRows = await pool.query(
-      `SELECT role, content FROM messages
-        WHERE session_id = $1 AND role IN ('user', 'assistant') AND id <> $2
-        ORDER BY seq DESC LIMIT $3`,
-      [runRow.session_id, currentMessageId, budget.maxMessages],
-    );
+    const currentMessageId = currentMessage?.id ?? crypto.randomUUID();
     history = truncateHistory(
-      [...(historyRows.rows ?? [])].reverse().map((m) => ({ role: m.role, content: m.content })),
+      (await fetchConversationTurns(pool, {
+        sessionId: runRow.session_id,
+        maxMessages: budget.maxMessages,
+        excludeMessageId: currentMessageId,
+      })).map(({ role, content }) => ({ role, content })), // 只留契约字段（source 仅供排障）
       budget,
     );
   } catch (err) {
@@ -310,7 +329,7 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
     leaseUntil: row.lease_until,
     run: { id: runRow.id, session_id: runRow.session_id, model: runRow.model, cwd: runRow.cwd ?? null },
     project,
-    message: message.rows?.[0],
+    message: { ...currentMessage, content: taskText },
     attempts: Number(row.attempts),
     history,
     gitIdentity: user,
@@ -596,13 +615,10 @@ async function terminalPayloadMatches(pool, run, body) {
   };
   // M4：final_text 落在 messages（assistant、synthetic=false）而非 runs 行——
   // 幂等重放需一并比对，否则不同 final_text 的重放会被误判为幂等成功。
-  const msg = await pool.query(
-    `SELECT content FROM messages
-      WHERE run_id = $1 AND role = 'assistant' AND synthetic = false
-      ORDER BY seq DESC LIMIT 1`,
-    [run.id],
-  );
-  stored.final_text = msg.rows?.[0]?.content ?? '';
+  // P3 PR②b B1 ⑥：锚点定位不变（该 run 最新的非合成 assistant 行），**正文改从 transcript 投影取**；
+  // 投影对该轮无证据时才 legacy 回退 `messages.content`（迁移 0015 之前的行）。
+  const storedAssistant = await fetchRunAssistantText(pool, { sessionId: run.session_id, runId: run.id });
+  stored.final_text = storedAssistant?.text ?? '';
   incoming.final_text = typeof body?.final_text === 'string' ? body.final_text : '';
   return canonicalHash(stored) === canonicalHash(incoming);
 }
