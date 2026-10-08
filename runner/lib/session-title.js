@@ -52,21 +52,14 @@ export function buildTitlePrompt({ firstUserContent, finalText }) {
 }
 
 /**
- * 从 RUN_START 数据推「首条用户消息」（纯函数）：history（claim ticket 下行，时间升序）
- * 里第一条 user 消息；无 history/无 user 消息 → 当前 task 即首条。都取不到 → null。
+ * 从 RUN_START 数据推「首条用户消息」（纯函数）：P3 PR③ 后历史下行已退役，只取当前 `task`
+ * （首启时会话首条用户消息就是它）；取不到 → null。
+ * （旧实现曾优先取 ticket.history 的首条 user 消息；`run.history` 下行已随文本注入链路退役。）
  * @param {object} arg
- * @param {Array<{role:string, content:string}>} [arg.history]
  * @param {string} [arg.task]
  * @returns {string|null}
  */
-export function resolveFirstUserContent({ history, task } = {}) {
-  if (Array.isArray(history)) {
-    for (const m of history) {
-      if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim() !== '') {
-        return m.content;
-      }
-    }
-  }
+export function resolveFirstUserContent({ task } = {}) {
   if (typeof task === 'string' && task.trim() !== '') return task;
   return null;
 }

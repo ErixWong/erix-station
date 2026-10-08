@@ -2,7 +2,8 @@
 //
 // 背景：`messages.content` 的文本真相正在迁到 `transcript_rounds`（P3 PR②a 已把对话流 DTO 改为
 // 官方投影输出）。本模块承载**其余文本读取点**（AI 改名上下文 / 自动标题降级链 / claim ticket 的
-// task 与历史下行 / 终态幂等比较的 final_text），使这些点在下一单停写 `messages.content` 之后仍能取到文本。
+// task / 终态幂等比较的 final_text），使这些点在停写 `messages.content`（PR②b B2）之后仍能取到文本。
+// （原第四个读取点「claim ticket 的历史下行 `run.history`」已随 **P3 PR③** 退役，见文件尾 ④ 注。）
 //
 // 不重复实现投影：文本一律由 `session-view.js` 的 `projectSessionMessages`（内部逐行调用上游官方纯函数
 // `projectTranscriptForDisplay`，并用 `recordForProjection` 把 `dedup_key` 列合成进 record）派生——
@@ -161,30 +162,7 @@ export async function fetchRunAssistantText(executor, { sessionId, runId, contex
   return { messageId: first.row.id, seq: Number(first.row.seq), ...withLegacy(first.anchor, first.row.content) };
 }
 
-/**
- * ④ 会话历史下行（issue #69：claim ticket 的 `run.history`）。
- *
- * 锚点集合与排除语义与旧实现逐字一致（该 session 最近 `maxMessages` 条 user/assistant、
- * 排除当前 message、返回升序），**只有文本改由投影派生**。预算截断仍归调用方的
- * `truncateHistory`（本函数不改预算语义），best-effort 回退空历史也仍由调用方负责。
- *
- * @returns {Promise<Array<{ role, content, source }>>} seq 升序（`content` 即下行正文，与旧实现同形状）
- */
-export async function fetchConversationTurns(executor, {
-  sessionId, maxMessages, excludeMessageId, context,
-} = {}) {
-  const rows = await projectAnchors(executor, {
-    sessionId,
-    context: context ?? (await loadTextContext(executor, { sessionId })),
-    anchorSql: `SELECT ${ANCHOR_COLUMNS}
-         FROM messages WHERE session_id = $1 AND role IN ('user', 'assistant') AND id <> $2
-        ORDER BY seq DESC LIMIT $3`,
-    params: [sessionId, excludeMessageId, Number(maxMessages)],
-  });
-  return rows
-    .map(({ row, anchor }) => {
-      const { text, source } = withLegacy(anchor, row.content);
-      return { role: row.role, content: text, source }; // content：ticket 下行契约字段（勿改名）
-    })
-    .reverse(); // 锚点是 seq DESC 取的 → 翻回升序（与旧实现 `[...rows].reverse()` 同语义）
-}
+// ④ 会话历史下行（issue #69：claim ticket 的 `run.history`）**已随 P3 PR③ 退役**，`fetchConversationTurns`
+// 已删除：resume 路径下引擎本就忽略 initialMessages，而正常新会话必然走 resume（用户输入已在 POST 事务内
+// 落树），文本注入成为死重（且 thinking 模型会因 `reasoning_content must be passed back` 被上游拒）。
+// 会话上下文唯一来源 = transcript resume；空本子靠 ticket 的 `task`（引擎 round 0 种子）。

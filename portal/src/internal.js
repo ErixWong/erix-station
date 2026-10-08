@@ -12,41 +12,13 @@ import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
 import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle, AGENT_TITLE_MAX_LEN } from './session-title.js';
-import { fetchConversationTurns, fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
+import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
 const IDEMPOTENCY_PURGE_INTERVAL_MS = 60 * 60 * 1000; // 幂等键过期清理间隔（TTL 24h，1h 扫一次足够）
 const HOLD_MS_MAX = 30000; // claim 长轮询 hold 上限
 
-/** issue #69：会话历史下行预算默认值（env 可调：STATION_HISTORY_MAX_MESSAGES / STATION_HISTORY_MAX_BYTES）。 */
-export const HISTORY_DEFAULTS = { maxMessages: 20, maxBytes: 16384 };
-
-/** 预算注入值的规范化：非正整数/缺省回退默认（claim 链路不做硬失败）。纯函数，供单测。 */
-export function normalizeHistoryBudget(budget = {}) {
-  const maxMessages = Number(budget?.maxMessages);
-  const maxBytes = Number(budget?.maxBytes);
-  return {
-    maxMessages: Number.isInteger(maxMessages) && maxMessages > 0 ? maxMessages : HISTORY_DEFAULTS.maxMessages,
-    maxBytes: Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : HISTORY_DEFAULTS.maxBytes,
-  };
-}
-
-/** 历史预算截断（纯函数，供单测）：先按条数截尾（保最新），再按 content UTF-8 字节从头丢到符合。
- *  入参按升序（旧→新）；不注入任何合成消息。 */
-export function truncateHistory(messages, budget = {}) {
-  if (!Array.isArray(messages)) return [];
-  const { maxMessages, maxBytes } = normalizeHistoryBudget(budget);
-  const kept = messages.slice(-maxMessages); // 保最新 maxMessages 条
-  const bytesOf = (m) => Buffer.byteLength(String(m?.content ?? ''), 'utf8');
-  let total = kept.reduce((n, m) => n + bytesOf(m), 0);
-  let start = 0;
-  while (total > maxBytes && start < kept.length) {
-    total -= bytesOf(kept[start]); // 丢最旧
-    start += 1;
-  }
-  return kept.slice(start);
-}
 const MAX_EVENTS_PER_BATCH = 200; // runner §7.2
 const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
 const MAX_ROUND_BYTES = 1024 * 1024; // portal.md §9.7
@@ -102,13 +74,14 @@ export function validateTransition(from, to) {
 }
 
 /** claim ticket 组装（纯函数，供单测）。resume = attempt > 1（方案 B）。
- *  issue #69：history = 该 session 最近的 user/assistant 消息（[{role, content:string}]，已按预算截断、
- *  升序、排除当前 message），由调用方（tryClaim）查库 + truncateHistory 后注入。
+ *  P3 PR③（issue #69 下行退役）：ticket **不再带 `history`**——会话上下文唯一来源 = transcript resume
+ *  （写侧：用户输入已在 POST 事务内由引擎 `appendUserTurn` 落树；读侧：正文真相 = transcript）。
+ *  `run.task` 保留：空本子（引擎 round 0 种子）路径与 notes/标题仍需要它。
  *  P5 去项目化：run.cwd = 会话绑定 cwd（~/projects/<name> 相对形式）为权威下行；run.project 保留
  *  项目名/根路径快照仅为**旧 agentd** 过渡兼容（部署序 portal 先上、FDE 镜像后上，新 agentd 优先读
  *  run.cwd）。 */
 export function assembleTicket({
-  queueId, claimToken, leaseUntil, run, project, message, attempts, history, gitIdentity, baseDomain,
+  queueId, claimToken, leaseUntil, run, project, message, attempts, gitIdentity, baseDomain,
 }) {
   const gitName = typeof gitIdentity?.display_name === 'string' && gitIdentity.display_name.length > 0
     ? gitIdentity.display_name
@@ -136,7 +109,6 @@ export function assembleTicket({
       model: run.model ?? null,
       resume: attempts > 1,
       attachments: Array.isArray(message?.attachments) ? message.attachments : [],
-      history: Array.isArray(history) ? history : [],
       ...(gitName || gitEmail ? { git_identity: { name: gitName, email: gitEmail } } : {}),
     },
   };
@@ -231,7 +203,7 @@ function isTerminal(status) {
 // ---------------------------------------------------------------------------
 
 /** 单次原子认领（FOR UPDATE SKIP LOCKED，schema.sql §8 认领 SQL）。返回 ticket 或 null。 */
-async function tryClaim(pool, { container, user, capacity, now = new Date(), historyBudget, baseDomain, log } = {}) {
+async function tryClaim(pool, { container, user, capacity, now = new Date(), baseDomain, log } = {}) {
   const claimToken = crypto.randomBytes(24).toString('base64url');
   const claimed = await pool.query(
     `UPDATE run_queue q
@@ -302,26 +274,10 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
     taskText = typeof currentMessage?.content === 'string' ? currentMessage.content : ''; // ② legacy-only
   }
 
-  // issue #69：会话历史上行——该 run 所属 session 最近 user/assistant 消息，排除当前这条（message_id），
-  // 取最近 maxMessages 条（DESC）后翻回升序注入 ticket。预算超限保最新丢最旧，不注入合成消息。
-  // 评审修正：history 是增强物不是关键路径——取数失败 best-effort 回退空历史，绝不阻断 claim
-  // （claim 已 UPDATE run_queue，炸在这里要等 lease reaper 自愈，白损延迟）。日志只记 err 摘要。
-  // P3 PR②b B1 ⑤：锚点集合/排除语义/预算截断完全不变，**只有正文改从 transcript 投影取**。
-  let history = [];
-  try {
-    const budget = normalizeHistoryBudget(historyBudget);
-    const currentMessageId = currentMessage?.id ?? crypto.randomUUID();
-    history = truncateHistory(
-      (await fetchConversationTurns(pool, {
-        sessionId: runRow.session_id,
-        maxMessages: budget.maxMessages,
-        excludeMessageId: currentMessageId,
-      })).map(({ role, content }) => ({ role, content })), // 只留契约字段（source 仅供排障）
-      budget,
-    );
-  } catch (err) {
-    log?.warn?.(`[internal] history query failed, claim continues with empty history: ${String(err?.message ?? err)}`);
-  }
+  // P3 PR③（issue #69 下行退役）：此处原本查「session 最近 user/assistant 文本」拼成 ticket.history。
+  // 已删：resume 路径下引擎本来忽略 initialMessages，而正常新会话必然走 resume（输入行已在 POST
+  // 事务内落树），注入成为死重；thinking 模型还会因 `reasoning_content must be passed back` 被上游拒
+  // （deploy/migrations/0007 头部实证）。会话上下文唯一来源 = transcript resume。
 
   return assembleTicket({
     queueId: row.queue_id,
@@ -331,7 +287,6 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), his
     project,
     message: { ...currentMessage, content: taskText },
     attempts: Number(row.attempts),
-    history,
     gitIdentity: user,
     baseDomain,
   });
@@ -529,7 +484,7 @@ export function hubStats() {
 // ---------------------------------------------------------------------------
 
 export async function claimRun(pool, {
-  container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), historyBudget, baseDomain, log = console,
+  container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), baseDomain, log = console,
 } = {}) {
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 64) {
     throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' } });
@@ -538,7 +493,7 @@ export async function claimRun(pool, {
     throw new InternalError(400, 'validation_failed', `hold_ms 越界（1..${HOLD_MS_MAX}）`, { details: { field: 'hold_ms' } });
   }
 
-  const ticket = await tryClaim(pool, { container, user, capacity, now, historyBudget, baseDomain, log });
+  const ticket = await tryClaim(pool, { container, user, capacity, now, baseDomain, log });
   if (ticket) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: ticket.run.id, details: { attempt: ticket.run.attempt } }).catch(() => {});
     return ticket;
@@ -546,7 +501,7 @@ export async function claimRun(pool, {
 
   const deadline = Date.now() + holdMs;
   await waitForWakeup(user.id, deadline);
-  const retry = await tryClaim(pool, { container, user, capacity, now, historyBudget, baseDomain, log });
+  const retry = await tryClaim(pool, { container, user, capacity, now, baseDomain, log });
   if (retry) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: retry.run.id, details: { attempt: retry.run.attempt } }).catch(() => {});
     return retry;
