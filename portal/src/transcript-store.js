@@ -1,4 +1,4 @@
-// portal 侧最小 transcript store 适配器（erix-agent 0.15.0 `appendUserTurn` 消费面）。
+// portal 侧最小 transcript store 适配器（erix-agent 0.16.0 `appendUserTurn` 消费面）。
 //
 // 背景（P3 契约① / 上游 issue #97，docs/design/conversation-state.md §6）：
 // POST 消息事务内的用户输入预写入自 0.15.0 起由引擎 API `appendUserTurn(store, {key, text, messageId})`
@@ -23,10 +23,12 @@ export function createSessionTranscriptStore(client) {
     /** 读该 key 的全部轮记录（round/dedup_key 以权威列合成进 record，供引擎推导与幂等判据）。 */
     async load(key) {
       const res = await client.query(
+        // 0.16.0 契约（host-upgrade-guide §1 same-round ordering）：同 round 多行必须按持久化
+        // 追加序返回，引擎不再二次排序 → 用 append_seq（迁移 0016，恒非空），不再依赖 created_at。
         `SELECT round, dedup_key, record
            FROM transcript_rounds
           WHERE transcript_key = $1
-          ORDER BY round, created_at`,
+          ORDER BY round, append_seq`,
         [key],
       );
       return (res.rows ?? []).map((row) => {

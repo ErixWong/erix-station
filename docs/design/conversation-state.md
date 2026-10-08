@@ -119,8 +119,10 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
   宿主独有的 UI 元数据（`id`/`run_id`/`seq`/`attachments`/`synthetic`/`created_at`）语义与命名不变。
   前端**加载/刷新路径**据此重建工具卡片与推理展示（reasoning 与正文分离、默认收起可展开），与实时/历史事件流
   **共用同一 `toolCards` Map 按 callId 幂等归并** → 同一调用只渲染一张卡片；实时增量流（SSE）行为不变。
-  已知上游缺口：`toolCalls[].id` 可选/可重复（provider 决定，erix-llm-kit#100）——缺失时前端回退到
-  「锚点消息 id + 投影内块序号」稳定键（宿主不向上游形状注入字段，见 #95 红线）。
+  erix-agent 0.16.0 起投影提供稳定的视图键 `turn.key` / `toolCalls[].key`（单次投影内唯一、同输入确定性、
+  由输入位置生成；**不是持久 ID、也不是 provider `tool_use.id`**）——上游 #100（`toolCalls[].id` 可选/可重复）
+  由此交付：DTO 逐字透传 `toolCalls[].key` 与 `turnKeys`（run 聚合各轮的 `turn.key`），前端在 provider `id`
+  缺失时用上游 `key`，仅当两者都缺失才回退「锚点消息 id + 投影内块序号」兜底键（宿主不向上游形状注入字段，#95 红线）。
 - **写侧（契约①）实现分工已换到引擎 API**（erix-agent 0.15.0 `appendUserTurn`，上游 #97 闭环）：POST 事务内的预写由引擎承担 round 推导、dedupKey 生成、record 形态与幂等判据；station 只提供极小 store 适配器 `portal/src/transcript-store.js`（`load`/`appendRound` 复用调用方事务 client，落库列形态与原手搋时代逐列等价，「先写 transcript 再入队」顺序不变）。幂等主判据从 DB `ON CONFLICT` 换为引擎按 dedupKey 的 load 判据（顺序重放），`ON CONFLICT` 保留作并发最后防线（同 key 并发由 session `FOR UPDATE` 串行化，满足引擎「在接收事务内发起」的前提）。
 - 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧由 portal 先提交 session transcript、worker 再 resume 的多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛，0.15.0 后由 `appendUserTurn` 承接）。
 

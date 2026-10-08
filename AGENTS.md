@@ -128,10 +128,10 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 8. erix-agent 依赖与升级（当前 pin：0.15.0）
+## 8. erix-agent 依赖与升级（当前 pin：0.16.0）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
-- runner 当前 pin：`0.15.0`；portal（根 package.json，运行时依赖）自 P3 前置起也 pin `0.15.0`（写侧预写改走引擎 `appendUserTurn`，见 §8.4）。升级仍走分支 + PR + §6.1 评审。
+- runner 当前 pin：`0.16.0`；portal（根 package.json，运行时依赖）自 P3 前置起也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5）。升级仍走分支 + PR + §6.1 评审。
 
 ### 0.14.0 当前宿主契约
 
@@ -150,6 +150,17 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [x] **空白 text 语义**：`appendUserTurn` 对纯空白 text 抛 `TypeError`；HTTP 路径不可达（`validateMessageBody` 已先行 400 `validation_failed`），`sessions.js` 仍做兜底捕获转同一错误码，保证不升格 500。
 - [x] **契约自检**：`portal/test/engine-api-contract.test.js` 接入上游 `engineApiContract`（`erix-agent/contract-tests`），锁包入口导出面与最小预写行为；runner 侧 `transcriptStoreContract` 套件不动。
 - [ ] **未接线（PR②b 及后续范围）**：读侧 `projectTranscriptForDisplay`（#95，替换 `session-view.js` 自研投影）；`loadRunStateStatus` 终态比较复核（#96，host-upgrade-guide-0.15.0 §3：0.14.0 升级指南示例读 `status?.status` 有误，引擎解析为状态字符串；station 侧 `runner/lib/store.js` 读的是自家 IPC 信封后经 adapter 返回字符串，语义已对齐——PR②b 终态比较切 transcript 时一并复核）。
+
+### 8.5 0.16.0 迁移记录（store 保序迁移 + 投影 key 采用）
+
+依据：`erix-agent/docs/host-upgrade-guide-0.16.0.md`。0.16.0 无 API 删除、无调用点变更，只有两条 store 硬要求 + 投影增补字段。
+
+- **变更①（store 保真）**：store 必须**原样往返**完整 `RoundRecord`/message（含宿主未知字段），不得按白名单重建；`messages[].meta.source` 是引擎保留标记（分类合成消息），宿主不得当自己的 source 标签。**station 状态：已合规**——`transcript_rounds.record` 整条走 JSONB（读侧 `{ round, ...record }` 原样返回），契约套件「RoundRecord 与 message 未知字段及 source 标记完整往返」通过。
+- **变更②（同 round 保序）**：`load()` 必须按**持久化追加顺序**返回同 `round` 记录（引擎不再二次排序）；不得依赖 DB 执行计划、主键扫描顺序或偶然行布局。**station 本次修复**：真机 `transcript_rounds` 有 58 组重复 `(transcript_key, round)`、共 183 行，且存在 `created_at` 完全相同的同轮行 → 原 `ORDER BY round, created_at` 顺序不确定。新增迁移 `0016-transcript-append-seq.sql`（`append_seq` 单调列 + 存量按 `created_at, id` 确定性回填 + `(transcript_key, round, append_seq)` 索引）；`getSessionTranscript` / legacy `getTranscript` 改 `ORDER BY round ASC, append_seq ASC`。**全部 6 处多行读点统一**：另含 `transcript-store.js` 的 `load`（`appendUserTurn` 消费面）、`sessions.js` / `session-text.js`（显示与文本读取）、`recallTranscript`（命中集 + `LIMIT 2000` 截断确定性）；按 `(run_id, round)` / `(transcript_key, dedup_key)` **点查单行**的 3 处由约束保证 ≤1 行，不需要排序。护栏：`portal/test/append-seq-ordering.test.js` 源码级断言 6 个读点必须含 `append_seq` 排序且无 `created_at` 排序残留。
+- **变更③（投影增补）**：`projectTranscriptForDisplay` 新增轮级 `turn.key` 与 `toolCalls[].key`（单次投影内唯一、同输入确定性、由输入位置生成；**不是持久 ID、也不是 provider `tool_use.id`**），以及 `meta.sourceInferred`（仅按文本前缀分类合成消息时出现）。**station 采用**：对话流 DTO 逐字透传 `toolCalls[].key` 与 `turnKeys`（run 聚合各轮的 `turn.key`）；前端工具卡片在 provider `id` 缺失时用上游 `key`，不再自造 `proj:<锚点 id>:<序号>`（上游 #100 已由 0.16.0 交付）。
+- **契约套件转绿**：上游 `test/contract/transcript-store.js` 新增「保真往返」「同轮保序」两条断言（指南明说：故意让不合规 store 失败——那是迁移信号，不是要放宽的测试）。runner 契约桩（`runner/test/store-contract.test.js` 内存 IPC peer）改为新语义：同 round 不同 dedupKey 共存、`load` 保追加序、dedupKey 幂等；`node --test runner/test/store-contract.test.js` 17/17 全绿。
+- **依赖**：根 `package.json` 与 `runner/package.json` → `erix-agent: 0.16.0`，两处 lockfile 同步（无 API 变更，应用调用点不动）。
+- **`UNIQUE (run_id, round)` 处置**：**保留不动**——session 维度行 `run_id IS NULL`（NULL 在唯一索引里互不相等）本就不受该约束限制（真机 58 组重复即 session 行）；legacy run 维度 `putRound` 仍以它做 ON CONFLICT 幂等，而 0.16.0 引擎 store 自 P2 起只走 session 端点，改它属「为改而改」（见迁移 0016 头注释）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
