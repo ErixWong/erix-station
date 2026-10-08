@@ -133,7 +133,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     safe(() => docker('rm -f fde-alice 2>/dev/null || true'));
     safe(() => docker('network rm fde-alice 2>/dev/null || true'));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local 2>/dev/null || true'));
+    // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose up --build 按需重建）。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     removeDbDir();

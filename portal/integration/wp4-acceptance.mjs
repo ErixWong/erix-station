@@ -2,7 +2,10 @@
 // 断言清单（issue #13）：① 跨 FDE 隔离 ② 未认证 403 ③ cookie 不透传上游 ④ 未分配端口不可达 ⑤ 事件落 DB ⑥ SSE 收到。
 // 拓扑：FDE alice = 真实 runner 镜像（agentd 跑 run，断言 ⑤⑥）；FDE bob = 同镜像 + docker exec 起 echo server（断言 ①②③④）。
 // 依据：docs/design/fde-platform.md §8/§9、topology.md §4-L3/§5、portal.md §2.7/§2.8/§9。
-// ⚠️ 不可与其它 e2e 并行：会 down 掉本机 station 栈、删 /docker/station-db（或 STATION_DB_DIR）、删共享镜像 tag（与 wp2b/wp3a/wp3b 同约定）。
+// ⚠️ 不可与其它 e2e 并行：会 down 掉本机 station 栈、删 /docker/station-db（或 STATION_DB_DIR）。
+// ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab）；
+//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）——本脚本**绝不删除共享镜像 tag**
+//   （issue #178，口径集中在 lib/fde-image.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync, spawn } from 'node:child_process';
@@ -13,12 +16,13 @@ import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
 const TRAEFIK_WEB = 'http://127.0.0.1:8090';
-const FDE_IMAGE = 'erix-station/fde:local';
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
@@ -181,8 +185,7 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     safe(() => docker('rm -f fde-alice fde-bob 2>/dev/null || true'));
     safe(() => docker('network rm fde-alice fde-bob 2>/dev/null || true'));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local 2>/dev/null || true')); // m2：compose up --build 构建的镜像也清（与 wp3b 口径一致）
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
+    // issue #178：不删镜像——compose up --build 按需重建；共享 tag 绝不能被 e2e 删除（见文件头）。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     if (S.logDir) safe(() => fs.rmSync(S.logDir, { recursive: true, force: true }));
@@ -194,8 +197,7 @@ test('WP4 端到端验收：6 条真机断言（隔离/403/cookie 边界/未分�
     // 0) 预清理 + 构建 + 起栈
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
     removeDbDir();
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
-    docker(`build -t ${FDE_IMAGE} runner/`);
+    buildFdeImage(FDE_IMAGE);
     // 启动迁移完成后，管理台 API 才能创建 LiteLLM credential/model/binding。
     compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1', ...FDE_ENV });
 
