@@ -1139,3 +1139,130 @@ test('F9：隔离栈（stackId=station-e2e-43）只清本栈——无标签与 d
   assert.equal(stats.orphansRemoved, 1);
   assert.equal(stats.orphanNetworksRemoved, 1);
 });
+
+// ---------------------------------------------------------------------------
+// issue #185：readFdeDesired 的「活」状态口径——awaiting_credential 必须留在期望集内（否则删/换 git
+// 凭据把状态翻成 awaiting_credential 时，既有容器被判 orphan 删除重建，正在跑的 run 被杀）；
+// disabled 仍必须排除（offboarding 后容器应被清）。与 #183 的 materializer 用例同手法：允许集合从 SQL
+// 里解析，同时锁住「行为」与「SQL 契约」——一旦退回 `status = 'active'`，awaiting_credential 用例即失败。
+// ---------------------------------------------------------------------------
+const FDE185_TOKEN = 'tok-185-existing';
+
+function statusFilterPool185({ userStatus }) {
+  // 该 FDE 的网段是否仍分配：disabled = offboarding 已释放（与用户状态无关的独立事实）。
+  const networkAllocated = userStatus !== 'disabled';
+  const allowedStatuses = (sql) => (sql.includes("'awaiting_credential'") ? ['active', 'awaiting_credential'] : ['active']);
+  const state = { audit: [], orphanRemovedRows: [], desiredSql: null };
+  const query = async (sql, params = []) => {
+    // readFdeDesired（FROM users u … JOIN fde_networks n）——按 SQL 里的状态集合过滤用户。
+    if (sql.includes('FROM users u') && sql.includes('JOIN fde_networks n')) {
+      state.desiredSql = sql;
+      if (!allowedStatuses(sql).includes(userStatus)) return { rows: [] };
+      return {
+        rows: [{
+          user_id: 'u1', fde_name: 'alice', subnet: '10.200.1.0/29', gateway: '10.200.1.1',
+          network_name: 'fde-alice', container_id: 'cid-existing', container_name: 'fde-alice',
+          container_status: 'running', runner_token_hash: hashToken(FDE185_TOKEN),
+        }],
+      };
+    }
+    // reconcile 锁内重确认（SELECT 1 FROM fde_networks WHERE fde_id …）——只看网段是否仍分配，不看 status。
+    if (sql.includes('SELECT 1 FROM fde_networks WHERE fde_id')) return { rows: networkAllocated ? [{ '?column?': 1 }] : [] };
+    // 孤儿网络锁内重读（JOIN users u，按 fde_name + n.state）——同样不看 users.status。
+    if (sql.includes('FROM fde_networks n') && sql.includes('JOIN users u')) return { rows: networkAllocated ? [{ '?column?': 1 }] : [] };
+    if (sql.includes('orphan_removed')) {
+      state.audit.push({ action: sql.includes('network.') ? 'network.orphan_removed' : 'container.orphan_removed', target: params[0] });
+      return { rows: [] };
+    }
+    if (sql.includes('UPDATE containers c SET status')) {
+      state.orphanRemovedRows.push(params[0]);
+      return { rows: [] };
+    }
+    return { rows: [] };
+  };
+  return {
+    state,
+    query,
+    async connect() { return { query: (s, p) => query(s, p), release() {} }; },
+    async end() {},
+  };
+}
+
+function make185Docker() {
+  const removed = { containers: [], networks: [] };
+  return {
+    removed,
+    async inspectContainer() {
+      // 既有容器：running + env token 与 DB hash 一致 → 对账不应重建（正对应「凭据轮换不该换容器 id」）。
+      return { status: 200, data: { Id: 'cid-existing', State: { Status: 'running' }, Config: { Env: [`ERIX_STATION_TOKEN=${FDE185_TOKEN}`] } } };
+    },
+    async inspectNetwork() {
+      // 既有网络：契约一致（managed + fde.name + subnet/gateway）→ 不重建。
+      return {
+        status: 200,
+        data: {
+          Id: 'nid-existing',
+          Labels: { 'station.managed': 'true', 'fde.name': 'alice' },
+          IPAM: { Config: [{ Subnet: '10.200.1.0/29', Gateway: '10.200.1.1' }] },
+        },
+      };
+    },
+    async startContainer() { return { status: 304 }; },
+    async stopContainer() { return { status: 204 }; },
+    async removeContainer(name) { removed.containers.push(name); return { status: 204 }; },
+    async listContainers() {
+      return { status: 200, data: [{ Names: ['/fde-alice'], Id: 'cid-existing', Labels: { 'station.managed': 'true', 'fde.name': 'alice' } }] };
+    },
+    async listNetworks() {
+      return { status: 200, data: [{ Name: 'fde-alice', Id: 'nid-existing', Labels: { 'station.managed': 'true' } }] };
+    },
+    async removeNetwork(name) { removed.networks.push(name); return { status: 204 }; },
+  };
+}
+
+const CONFIG185 = (root) => ({
+  userSpaceRoot: root,
+  fdeUid: 1000,
+  fdeGid: 1000,
+  fdeImage: 'img',
+  fdeAgentVersion: 'dev',
+  baseDomain: 'localhost',
+  llmHost: 'llm.localhost',
+});
+
+test('issue #185：awaiting_credential 的 FDE 仍在 desired → 既有容器/网络不被判 orphan（删/换凭据不拆容器）', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-prov-185-'));
+  try {
+    const pool = statusFilterPool185({ userStatus: 'awaiting_credential' });
+    const docker = make185Docker();
+    const stats = await reconcileOnce(pool, CONFIG185(root), { docker });
+    assert.match(pool.state.desiredSql, /u\.status IN \('active', 'awaiting_credential'\)/,
+      'readFdeDesired 必须把 awaiting_credential 当「活」状态');
+    assert.equal(stats.ensured, 1, 'awaiting_credential 的 FDE 仍须被纳入对账');
+    assert.equal(stats.orphansRemoved, 0, 'awaiting_credential 的容器不得被当孤儿删除');
+    assert.equal(stats.rebuilt, 0, '凭据待补不应触发容器重建');
+    assert.deepEqual(docker.removed.containers, [], '容器不得被删除/重建（容器 id 必须保持不变）');
+    assert.deepEqual(docker.removed.networks, [], 'desired 网络不得被删');
+    assert.equal(stats.orphanNetworksRemoved, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('issue #185 回归：disabled 的 FDE 仍在 desired 之外 → 容器/网络照常被清（offboarding 后）', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-prov-185-'));
+  try {
+    const pool = statusFilterPool185({ userStatus: 'disabled' });
+    const docker = make185Docker();
+    const stats = await reconcileOnce(pool, CONFIG185(root), { docker });
+    assert.equal(stats.ensured, 0, 'disabled 不得进入期望集');
+    assert.equal(stats.orphansRemoved, 1, 'disabled 的容器必须仍被清理');
+    assert.deepEqual(docker.removed.containers, ['fde-alice']);
+    assert.equal(stats.orphanNetworksRemoved, 1);
+    assert.deepEqual(docker.removed.networks, ['fde-alice']);
+    assert.deepEqual(pool.state.orphanRemovedRows, ['alice']);
+    assert.ok(pool.state.audit.some((a) => a.action === 'container.orphan_removed' && a.target === 'fde-alice'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
