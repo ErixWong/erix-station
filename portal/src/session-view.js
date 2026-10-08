@@ -11,6 +11,10 @@
 //   输出形状（role/text/blocks/toolCalls/reasoning/folded/round/ts/meta）是稳定契约面；
 //   `RoundRecord` 内部字段不是，本模块不读它。
 //
+// issue #188：投影的 `toolCalls`/`reasoning`/`blocks` 随助手锚点**逐字透传**进对话流 DTO（原名、不裁剪、
+// 不重推导；无则不写该键），供前端加载/刷新路径重建工具卡片与推理展示。宿主不向上游形状注入字段
+//（#95 红线）——`toolCalls[].id` 可选/可重复是上游已知缺口（git.erix.vip/eric/erix-llm-kit#100）。
+//
 // 官方投影**不承担**、仍由本模块承担的部分（都是宿主/UI 概念，契约面里没有）：
 //   1. **锚点元数据**：DTO 的 `id`/`seq`/`run_id`/`attachments`/`synthetic`/`created_at` 一律取自
 //      `messages` 锚点行——引擎没有「消息行」概念，`seq`/附件是本平台的分配器与外键。
@@ -130,6 +134,32 @@ function foldedTurnText(turns) {
 }
 
 /**
+ * issue #188：单条 transcript 行里、官方投影助手轮上的展示字段（逐字透传，不裁剪/不改名/不重推导）。
+ *
+ * 投影的 `DisplayTurn` 契约面里，助手轮除 `text` 外还带 `blocks`（原始 content blocks 数组）、
+ * `toolCalls?`（`{name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`，预览长度由上游
+ * 定：args 120 / result 400）与 `reasoning?`（与正文分离的推理文本）。这三者此前没有进入对话流 DTO，
+ * 导致前端刷新后丢失工具卡片与推理。本函数把它们从助手轮上取出（**只取字段值，不做任何加工**）。
+ *
+ * 全部为空时返回 null，调用方据此**不写该键**（契约：有则透传、无则 DTO 不出现该键）。
+ */
+function assistantTurnFields(turns) {
+  const assistantTurns = turns.filter((turn) => turn.role === 'assistant');
+  if (assistantTurns.length === 0) return null;
+  const toolCalls = assistantTurns.flatMap((turn) => (Array.isArray(turn.toolCalls) ? turn.toolCalls : []));
+  const reasonings = assistantTurns
+    .map((turn) => turn.reasoning)
+    .filter((value) => typeof value === 'string' && value !== '');
+  const blocks = assistantTurns.flatMap((turn) => (Array.isArray(turn.blocks) ? turn.blocks : []));
+  return {
+    toolCalls: toolCalls.length > 0 ? toolCalls : null,
+    // 一个 run 可含多条助手轮，推理文本按投影顺序以 '\n' 连接（与上游 joinBlocks 同一连接符）。
+    reasoning: reasonings.length > 0 ? reasonings.join('\n') : null,
+    blocks: blocks.length > 0 ? blocks : null,
+  };
+}
+
+/**
  * Build the existing message DTO from the official display projection plus message anchor metadata.
  * Synthetic rows (for example judge/wrapup injections) have no required transcript
  * text match yet, so their content intentionally remains sourced from the anchor.
@@ -168,11 +198,27 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   const userContent = new Map();
   const assistantContent = new Map();
   const foldContent = new Map();
+  // issue #188：DTO 是「一个 run 一条助手锚点」，而投影是「一轮一条助手 turn」——按 run 累积该 run
+  // 全部助手轮的透传字段（toolCalls/blocks 逐元素拼接、reasoning 逐段收集，均在输出前保持上游原值）。
+  const runToolCalls = new Map();
+  const runReasoning = new Map();
+  const runBlocks = new Map();
   let currentRunId = null;
 
-  const setRunText = (runId, assistantText, foldText) => {
+  const setRunText = (runId, assistantText, foldText, turns) => {
     if (assistantText !== null) assistantContent.set(runId, assistantText);
     if (foldText !== null) foldContent.set(runId, foldText);
+    const fields = assistantTurnFields(turns);
+    if (fields === null) return;
+    if (fields.toolCalls !== null) {
+      runToolCalls.set(runId, [...(runToolCalls.get(runId) ?? []), ...fields.toolCalls]);
+    }
+    if (fields.reasoning !== null) {
+      runReasoning.set(runId, [...(runReasoning.get(runId) ?? []), fields.reasoning]);
+    }
+    if (fields.blocks !== null) {
+      runBlocks.set(runId, [...(runBlocks.get(runId) ?? []), ...fields.blocks]);
+    }
   };
 
   for (const row of [...transcriptRows].sort(compareTranscriptRows)) {
@@ -220,7 +266,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
 
     if (typeof row.run_id === 'string' && row.run_id.length > 0) {
       if (lastUserText !== null) currentRunId = row.run_id;
-      setRunText(row.run_id, assistantText, foldText);
+      setRunText(row.run_id, assistantText, foldText, turns);
       continue;
     }
 
@@ -252,7 +298,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       currentRunId = soleRunId;
     }
     if (!currentRunId) continue;
-    setRunText(currentRunId, assistantText, foldText);
+    setRunText(currentRunId, assistantText, foldText, turns);
   }
 
   const messages = anchors.map((anchor) => {
@@ -271,7 +317,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
         content = foldContent.get(anchor.run_id);
       }
     }
-    return {
+    const dto = {
       id: anchor.id,
       run_id: anchor.run_id,
       seq: Number(anchor.seq),
@@ -281,6 +327,18 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       attachments: anchor.attachments ?? [],
       created_at: anchor.created_at?.toISOString?.() ?? anchor.created_at,
     };
+    // issue #188：助手锚点透传上游投影字段（逐字、原名）。宿主独有的 UI 元数据（id/run_id/seq/
+    // attachments/synthetic/created_at）保持 snake_case 且语义不变；这三项**有则出现、无则不写键**，
+    // 不塞 undefined/null 占位。合成助手行（synthetic）正文来自锚点本身、不经 transcript 投影，故不透传。
+    if (anchor.role === 'assistant' && anchor.synthetic !== true) {
+      const toolCalls = runToolCalls.get(anchor.run_id);
+      if (toolCalls !== undefined) dto.toolCalls = toolCalls;
+      const reasoning = runReasoning.get(anchor.run_id);
+      if (reasoning !== undefined) dto.reasoning = reasoning.join('\n');
+      const blocks = runBlocks.get(anchor.run_id);
+      if (blocks !== undefined) dto.blocks = blocks;
+    }
+    return dto;
   });
 
   return messages;

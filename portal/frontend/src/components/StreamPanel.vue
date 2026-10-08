@@ -54,10 +54,40 @@ function statusMark(card: ToolCardState): string {
   return '…';
 }
 
+// issue #188：展开区取数——事件流卡片有完整 args/out；投影卡片（加载/刷新路径）只有上游摘要/预览
+// （argsSummary 120 字 / resultPreview 400 字，全文在 DTO blocks，不在此重建）。
+function cardArgs(card: ToolCardState): string {
+  return card.args || card.argsSummary || '';
+}
+
+function cardOut(card: ToolCardState): string {
+  if (card.out) return card.out;
+  return [card.executionStatus, card.resultPreview].filter((part) => !!part).join(' · ');
+}
+
+// issue #188：推理块展开态（组件内，默认收起）——与工具卡片同一按钮+chevron 交互风格，不新造一套。
+// 仅加载/刷新路径产出推理块（实时推理增量不展示），entries 不会被流式事件重建，故局部状态足够。
+const expandedReasoning = reactive(new Set<string>());
+
+function isReasoningExpanded(id: string): boolean {
+  return expandedReasoning.has(id);
+}
+
+function toggleReasoning(id: string): void {
+  if (expandedReasoning.has(id)) expandedReasoning.delete(id);
+  else expandedReasoning.add(id);
+}
+
+// 收起时的单行摘要：取推理文本首行截 120 字（与卡片摘要同口径，防溢出）。
+function reasoningSummary(text: string): string {
+  return text.split('\n')[0].slice(0, 120);
+}
+
 function entryKey(en: StreamEntry, i: number): string {
   switch (en.kind) {
     case 'msg': return 'm' + en.id;
     case 'tool': return 't' + en.callId;
+    case 'reasoning': return 'r' + en.id;
     case 'delta': return 'd' + i;
     default: return 's' + i;
   }
@@ -125,9 +155,31 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       </button>
       <!-- 展开态：完整 args（pre 块永不溢出）+ 结果摘要行（tool_result 只带 digest，不虚构全文） -->
       <template v-if="isExpanded(en.callId)">
-        <pre class="mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ store.es.toolCards.get(en.callId)!.args }}</pre>
-        <div class="font-normal text-black/50">{{ store.es.toolCards.get(en.callId)!.out }}</div>
+        <pre class="mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ cardArgs(store.es.toolCards.get(en.callId)!) }}</pre>
+        <div class="font-normal text-black/50">{{ cardOut(store.es.toolCards.get(en.callId)!) }}</div>
       </template>
+    </div>
+    <!-- issue #188：推理块（与正文分离、默认收起、可展开）——沿用工具卡片的按钮+chevron 折叠风格 -->
+    <div
+      v-else-if="en.kind === 'reasoning'"
+      class="my-1.5 max-w-[46rem] rounded-md border border-black/10 border-l-4 border-l-neutral-400 bg-black/[0.02] px-3 py-1.5 text-sm"
+    >
+      <button
+        type="button"
+        class="flex w-full min-w-0 items-center gap-2 text-left"
+        :aria-expanded="isReasoningExpanded(en.id)"
+        @click="toggleReasoning(en.id)"
+      >
+        <span class="shrink-0 font-semibold text-black/60">🧠 {{ t('stream.reasoning') }}</span>
+        <span class="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-normal text-black/40">
+          {{ reasoningSummary(en.text) }}
+        </span>
+        <span
+          class="shrink-0 text-black/50 transition-transform duration-150"
+          :class="{ 'rotate-180': isReasoningExpanded(en.id) }"
+        >▾</span>
+      </button>
+      <pre v-if="isReasoningExpanded(en.id)" class="mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ en.text }}</pre>
     </div>
   </template>
 </template>

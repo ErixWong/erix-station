@@ -42,6 +42,19 @@ export interface Session {
   cwd?: string; // issue #84 P5：会话绑定目录（响应带 cwd）
 }
 
+/**
+ * issue #188：DTO 透传的上游投影工具调用（`DisplayTurn.toolCalls[]` 逐字）。`id` 可选（provider 决定，
+ * 可缺失/可重复 → 上游缺口 git.erix.vip/eric/erix-llm-kit#100）；预览长度上游已定（args 120 / result 400）。
+ */
+export interface ProjectedToolCall {
+  name: string;
+  id?: string;
+  argsSummary?: string;
+  resultPreview?: string;
+  isError?: boolean;
+  executionStatus?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: string;
@@ -49,6 +62,10 @@ export interface ChatMessage {
   synthetic?: boolean;
   run_id?: string | null;
   seq?: number; // issue #89：刷新后历史归并回放（与 run_events 共用分配器，按 seq 穿插）
+  // issue #188：上游投影字段逐字透传（有则出现、无则不写键）。加载/刷新路径据此重建工具卡片与推理。
+  toolCalls?: ProjectedToolCall[];
+  reasoning?: string;
+  blocks?: unknown[]; // 原始 content blocks（全文在此；卡片预览已由上游截断，本单不渲染）
 }
 
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
@@ -57,6 +74,7 @@ export type StreamEntry =
   | { kind: 'sep'; text: string; variant?: 'judge' }
   | { kind: 'syserr'; text: string }
   | { kind: 'tool'; callId: string }
+  | { kind: 'reasoning'; id: string; text: string }
   | { kind: 'delta'; text: string };
 
 interface SessionDetail {
@@ -76,6 +94,19 @@ interface WorkbenchHooks {
 let workbenchHooks: WorkbenchHooks = {};
 export function setWorkbenchHooks(h: WorkbenchHooks): void {
   workbenchHooks = h;
+}
+
+/**
+ * issue #188 工具卡片 key：优先上游 provider `id`——它与实时/历史事件流的 `tool_call_id` 同源，
+ * 两条路据此天然幂等归并（同一调用只渲染一张卡片）。`id` 缺失/重复是上游已知缺口
+ * （git.erix.vip/eric/erix-llm-kit#100，provider 决定，可缺失/可重复）——缺失时回退到
+ * 「锚点消息 id + 投影内块序号」：DTO 是锚点驱动、按投影顺序聚合该 run 的 toolCalls，同一 transcript
+ * 刷新前后顺序稳定，故该键刷新前后稳定。宿主不向上游 `toolCalls[]` 注入字段（#95 红线：只透传），
+ * 故 key 在渲染层合成；锚点 DTO 不携带轮号（不属本单透传字段），故用稳定的锚点 id 作定位。
+ */
+function toolCallKey(messageId: string, call: ProjectedToolCall, index: number): string {
+  if (typeof call.id === 'string' && call.id !== '') return call.id;
+  return `proj:${messageId}:${index}`;
 }
 
 export const useWorkbenchStore = defineStore('workbench', () => {
@@ -153,6 +184,18 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (renderedIds.value) {
       if (renderedIds.value.has(m.id)) return; // 去重（refresh 与流式缓冲竞态）
       renderedIds.value.add(m.id);
+    }
+    // issue #188：加载/刷新路径由 DTO 的投影字段重建工具卡片与推理展示（实时/历史事件路径不变）。
+    // reasoning 与正文分离、默认收起（StreamPanel 可展开）；仅加载/刷新路径产出（实时推理增量不展示）。
+    if (typeof m.reasoning === 'string' && m.reasoning !== '') {
+      entries.value.push({ kind: 'reasoning', id: m.id, text: m.reasoning });
+    }
+    // 工具卡片与实时路径**共用同一** es.toolCards Map（按 callId 幂等）→ 历史事件已建卡片时不再占位，
+    // 同一调用不会渲染两张卡片；仅凭 DTO（无事件）也能渲染卡片。卡片排在正文气泡前（先工具后答复）。
+    if (Array.isArray(m.toolCalls)) {
+      m.toolCalls.forEach((call, index) => {
+        es.projectToolCard(toolCallKey(m.id, call, index), call);
+      });
     }
     // 仅助手终稿渲染 Markdown 子集（先转义后格式化，XSS 安全）；用户消息与系统注入
     // （synthetic）保持纯文本。流式增量（delta）全程文本追加，run_end 终稿经
