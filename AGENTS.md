@@ -162,7 +162,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - **依赖**：根 `package.json` 与 `runner/package.json` → `erix-agent: 0.16.0`，两处 lockfile 同步（无 API 变更，应用调用点不动）。
 - **`UNIQUE (run_id, round)` 处置**：**保留不动**——session 维度行 `run_id IS NULL`（NULL 在唯一索引里互不相等）本就不受该约束限制（真机 58 组重复即 session 行）；legacy run 维度 `putRound` 仍以它做 ON CONFLICT 幂等，而 0.16.0 引擎 store 自 P2 起只走 session 端点，改它属「为改而改」（见迁移 0016 头注释）。
 
-### 8.6 0.17.0 迁移记录（issue #193，PR 编号待定）
+### 8.6 0.17.0 迁移记录（issue #193，PR #210）
 
 依据：`erix-agent/docs/host-upgrade-guide-0.17.0.md`。0.17.0 **纯增量**：无 API 删除、无调用点变更、无强制 store 改动，0.16.x 宿主可直接升；唯一的 opt-in 是 `appendUserTurn` 的**成对可选快路径探针**（上游 #157）。
 
@@ -180,7 +180,8 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   - **关键：#157 成对探针用例对真实产品探针执行全绿**（夹具直接转发产品的 `load`/`appendRound`/`loadByDedupKey`/`loadMaxRound`）：含成对约束、未命中 null、命中 record 逐字段 deepEqual（含未知字段）、roundKey-only 回退匹配、`loadMaxRound == MAX(round)`、空 store 返回 null。
 - **随动的测试侧镜像**（新 SQL 面进入各 fake pool，否则 strict fake 报 `unexpected SQL`）：`portal/test/session-title.test.js`（postMessage 流水顺序红线改为「`BEGIN < messages INSERT < 点查 < transcript INSERT < run_queue < COMMIT`」，并新增「事务内零全量 load」断言）、`portal/test/llm.test.js`、`portal/test/message-precheck.test.js`（两者原本对全量 load 返回空行，行为等价）。**产品侧 `load`/`appendRound` 的 SQL 与 client 绑定方式一字未改**，`load` 作为回退路径保留。
 - **gate**：根 `npm test` **767 项：766 通过 / 1 跳过 / 0 失败**（基线 746，本 PR 净增 21 = 6 条探针行为单测 + 15 条上游契约用例；唯一跳过项为既有）；`node --test runner/test/store-contract.test.js` **18/18 全绿**（较 0.16.0 基线 17 多出的 1 项即上游新增的成对探针用例——runner 内存 peer 两探针**都不实现**，成对断言 `hasDedup === hasMax` 天然通过，故 runner 源码不改）；`portal/test/transcript-store.test.js` 27/27（12 条宿主断言 + 15 条契约）；`node --check` 对 6 个改动 JS 文件全过。
-- **已知语义差（低危，实测确认）**：若存在 `transcript_key` 非空但 `dedup_key` **列为 NULL**、而 `record` 内自带 dedupKey 的历史行（既有单测红线④标为「理论不该发生」），全量 `load` 路径会因列→record 回退合成而幂等命中，**点查快路径则会 miss 并多写一行**（已用脚本实测：同 messageId 重放从 `written:false` 变 `written:true`）。可达性很低：`transcript_key` 与 `dedup_key` 两列同在迁移 0006 加入，写入方（`putSessionRound`/`appendRound`/迁移 0015 回填）均强制填 dedup_key；但**新写迁移不得引入 `dedup_key IS NULL` 的 session 行**，否则预写幂等会降级为「靠 `ON CONFLICT` 兜并发、不兜顺序重放」。
+- **已知语义差（真机实测定性：对预写幂等不可达）**：若存在 `transcript_key` 非空但 `dedup_key` **列为 NULL**、而 `record` 内自带 dedupKey 的历史行，全量 `load` 路径会因列→record 回退合成而幂等命中，**点查快路径则会 miss 并多写一行**（容器内真 PG 直接验证：列 NULL + record 有键 → `loadByDedupKey` 返 null；`loadMaxRound=MAX(round)` 含这类行不受影响）。dev 真机盘点（2026-10-08）：共 96 行此类形状，**全部属 `:engine:round:*` 命名空间**（旧写路径遗留，2026-09-24 后零新增）；预写幂等键空间是 `:input:<messageId>`，与 `:engine:round:` 不相交（`:input:` 形态的 NULL 列行 = 0）→ 语义差对预写顺序重放**实际不可达**，无需数据修补迁移。巡检口径：监控「`transcript_key IS NOT NULL AND dedup_key IS NULL AND record->>'dedupKey' LIKE '%:input:%'`」应为 0（而非笼统的 NULL 列计数）；新写迁移/写点仍不得引入 `dedup_key IS NULL` 的 session 行，否则预写幂等会降级为「靠 `ON CONFLICT` 兜并发、不兜顺序重放」。
+
 - **未采纳**：上游 #160（内置 file store 幂等缓存）属包内部优化，对 station 无动作；#158 为仓库侧文档示例校验。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
