@@ -1,4 +1,6 @@
 // WP5 UI 验收环境拆除（与 wp5-ui-setup.mjs 配对）：删 FDE 容器/网络、down -v、删临时目录与 DB 目录。
+// issue #178：**不删镜像 tag**——共享 tag（erix-station/fde:local / portal:local / mock-llm:local）
+// 归共享栈所有，e2e 删它会把共享栈打坏（实测 provision 报 No such image）。
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,7 +27,7 @@ safe(() => execSync(
   `sg docker -c ${JSON.stringify(`${COMPOSE} down -v`)}`,
   { encoding: 'utf8', stdio: 'pipe', cwd: REPO_ROOT, env: { ...process.env, ERIX_USERSPACE_ROOT_HOST: userspaceRoot ?? '/tmp/x', TRAEFIK_DYNAMIC_DIR_HOST: dynamicRoot ?? '/tmp/x' } },
 ));
-safe(() => docker('rmi -f erix-station/fde:local erix-station/portal:local erix-station/mock-llm:local'));
+// issue #178：不删镜像 tag（共享 tag 归共享栈所有，见文件头）。
 safe(() => execSync(`sg docker -c ${JSON.stringify('docker run --rm -v /docker:/host alpine rm -rf /host/station-db')}`));
 if (userspaceRoot) safe(() => fs.rmSync(path.join('/tmp', userspaceRoot), { recursive: true, force: true }));
 if (dynamicRoot) safe(() => fs.rmSync(path.join('/tmp', dynamicRoot), { recursive: true, force: true }));
