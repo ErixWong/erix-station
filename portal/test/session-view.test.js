@@ -1091,14 +1091,16 @@ test('issue #188: projection toolCalls/reasoning/blocks ride along the assistant
   assert.equal(dto.content, 'public answer');
   assert.equal(dto.reasoning, 'think about it');
   assert.deepEqual(dto.toolCalls, [{
+    key: '1#0:0:t0',
     name: 'read',
     id: 'call-1',
     argsSummary: 'path=src/a.js',
     resultPreview: 'FILE BODY',
     isError: false,
     executionStatus: 'succeeded',
-  }], 'toolCalls 逐字透传（含上游预览字段，不裁剪）');
+  }], 'toolCalls 逐字透传（含 0.16.0 视图键 key 与上游预览字段，不裁剪）');
   assert.deepEqual(dto.blocks, assistantBlocks, 'blocks 逐字透传（原始 content blocks）');
+  assert.deepEqual(dto.turnKeys, ['1#0:0'], '0.16.0 轮级视图键 turn.key 逐字透传');
 });
 
 test('issue #188: a run aggregates toolCalls across its rounds in projection order', () => {
@@ -1133,9 +1135,12 @@ test('issue #188: a run aggregates toolCalls across its rounds in projection ord
 
   assert.equal(dto.content, 'done');
   assert.deepEqual(dto.toolCalls.map((call) => [call.name, call.id]), [['read', 'c1'], ['bash', 'c2']]);
+  assert.deepEqual(dto.toolCalls.map((call) => call.key), ['1#0:0:t0', '2#0:0:t0'],
+    'toolCalls[].key 按投影顺序（0.16.0 视图键）');
+  assert.deepEqual(dto.turnKeys, ['1#0:0', '2#0:0'], 'turnKeys 聚合该 run 各轮的 turn.key');
 });
 
-test('issue #188: assistant DTO omits projection keys when the projection has none', () => {
+test('issue #188: assistant DTO omits toolCalls/reasoning when the projection has none (0.16.0 turnKeys 恒在)', () => {
   const anchors = [message('plain-assistant', 2, 'assistant', 'stale anchor text', RUN_1)];
   const transcriptRows = [
     transcript(1, `${RUN_1}:engine:round:1`, {
@@ -1155,6 +1160,8 @@ test('issue #188: assistant DTO omits projection keys when the projection has no
   assert.equal(dto.content, 'plain answer');
   assert.equal('toolCalls' in dto, false, '无 toolCalls 时不出现该键（不塞 undefined/null 占位）');
   assert.equal('reasoning' in dto, false, '无 reasoning 时不出现该键');
+  // 0.16.0：每条助手轮都有视图键 turn.key → turnKeys 恒在（逐字透传，非宿主自造）。
+  assert.deepEqual(dto.turnKeys, ['1#0:0']);
   // blocks 是上游对每条带 content 的助手轮都会给的字段（这里是文本块）——有则原样透传。
   assert.deepEqual(dto.blocks, [{ type: 'text', text: 'plain answer' }]);
 });

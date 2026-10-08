@@ -982,10 +982,11 @@ export async function getTranscript(pool, { container, user, runId, claimToken, 
 
   const lim = Math.min(Math.max(1, Number(limit) || 10000), 10000);
   const cur = cursor == null ? -1 : Number(cursor);
+  // 0.16.0 同 round 保序：按持久化追加序列（append_seq，迁移 0016）排序，不再依赖执行计划/扫描顺序。
   const res = await pool.query(
     `SELECT round, record FROM transcript_rounds
       WHERE run_id = $1 AND round > $2
-      ORDER BY round ASC LIMIT $3`,
+      ORDER BY round ASC, append_seq ASC LIMIT $3`,
     [runId, cur, lim],
   );
   const records = res.rows.map((r) => ({ round: Number(r.round), ...r.record }));
@@ -1122,7 +1123,16 @@ async function fetchWriterRun(pool, runId, userId, key) {
 }
 
 /** session transcript 写入（宿主预写 + 引擎轮记录）。行唯一性 = (transcript_key, dedup_key)——
- *  CLI 模式下行号可复用（宿主预写行与上一轮引擎记录同行号），dedupKey 才是幂等判据（迁移 0006）。 */
+ *  CLI 模式下行号可复用（宿主预写行与上一轮引擎记录同行号），dedupKey 才是幂等判据（迁移 0006）。
+ *
+ *  0.16.0 同 round 共存：同一 round 下**不同 dedup_key** 的记录合法共存（不再 409）——CLI 行号复用
+ *  + 引擎 `:resume` 补跑重落盘都会同轮多行；读侧按 append_seq 还原追加序（迁移 0016，
+ *  getSessionTranscript 的 ORDER BY round, append_seq）。
+ *  并发幂等方案：由部分唯一索引 `transcript_rounds_session_dedup_uidx`
+ *  （(transcript_key, dedup_key) WHERE transcript_key IS NOT NULL，迁移 0006）+ 本语句的
+ *  `ON CONFLICT (transcript_key, dedup_key) DO NOTHING` 保证——并发同 dedupKey 重放只会命中一条，
+ *  不会因「先查后插」的检查-插入竞态产生重复 user 消息（崩溃重跑红线）；同 dedupKey 不同 body
+ *  才 409 round_conflict（真冲突），folded false→true 仍走 UPDATE。 */
 export async function putSessionRound(pool, { container, user, key, round, claimToken, writerRunId, body }) {
   if (!Number.isInteger(round) || round < 0) {
     throw new InternalError(400, 'validation_failed', 'round 必须为非负整数');
@@ -1176,9 +1186,11 @@ export async function putSessionRound(pool, { container, user, key, round, claim
   throw new InternalError(409, 'round_conflict', '同 dedupKey 已存在且 body 不同', { details: { dedupKey } });
 }
 
-/** session transcript 全量读取（load 分页；行序 = round ASC, created_at ASC——行号可复用，
- *  同 round 多行按入档时间序，恢复后的消息顺序才正确）。cursor 以 round 为游标：同 round
- *  行必同页（LIMIT 截断的极端大会话才可能出现跨页同行号，单会话 >10000 轮超出 P2 范围）。 */
+/** session transcript 全量读取（load 分页；行序 = round ASC, append_seq ASC——行号可复用，
+ *  同 round 多行按**持久化追加序**（迁移 0016 的 append_seq），恢复后的消息顺序才正确；
+ *  erix-agent 0.16.0 起引擎不再二次排序，故宿主必须显式保序，不得依赖 created_at/执行计划）。
+ *  cursor 以 round 为游标：同 round 行必同页（LIMIT 截断的极端大会话才可能出现跨页同行号，
+ *  单会话 >10000 轮超出 P2 范围）。 */
 export async function getSessionTranscript(pool, { container, user, key, claimToken, writerRunId, limit = 10000, cursor = null }) {
   await fetchSession(pool, key, user.id);
   await fetchWriterRun(pool, writerRunId, user.id, key);
@@ -1189,7 +1201,7 @@ export async function getSessionTranscript(pool, { container, user, key, claimTo
   const res = await pool.query(
     `SELECT round, record FROM transcript_rounds
       WHERE transcript_key = $1 AND round > $2
-      ORDER BY round ASC, created_at ASC
+      ORDER BY round ASC, append_seq ASC
       LIMIT $3`,
     [key, cur, lim],
   );

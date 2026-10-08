@@ -44,9 +44,12 @@ export interface Session {
 
 /**
  * issue #188：DTO 透传的上游投影工具调用（`DisplayTurn.toolCalls[]` 逐字）。`id` 可选（provider 决定，
- * 可缺失/可重复 → 上游缺口 git.erix.vip/eric/erix-llm-kit#100）；预览长度上游已定（args 120 / result 400）。
+ * 可缺失/可重复）；erix-agent 0.16.0 为每个 toolCall 提供稳定的视图键 `key`（单次投影内唯一、同输入
+ * 确定性、由输入位置生成——**不是持久 ID、也不是 provider `tool_use.id`**），上游 #100 由此交付。
+ * 预览长度上游已定（args 120 / result 400）。
  */
 export interface ProjectedToolCall {
+  key?: string;
   name: string;
   id?: string;
   argsSummary?: string;
@@ -66,6 +69,7 @@ export interface ChatMessage {
   toolCalls?: ProjectedToolCall[];
   reasoning?: string;
   blocks?: unknown[]; // 原始 content blocks（全文在此；卡片预览已由上游截断，本单不渲染）
+  turnKeys?: string[]; // 0.16.0：聚合进本 run 的助手轮视图键（`turn.key`，逐字透传）
 }
 
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
@@ -98,14 +102,14 @@ export function setWorkbenchHooks(h: WorkbenchHooks): void {
 
 /**
  * issue #188 工具卡片 key：优先上游 provider `id`——它与实时/历史事件流的 `tool_call_id` 同源，
- * 两条路据此天然幂等归并（同一调用只渲染一张卡片）。`id` 缺失/重复是上游已知缺口
- * （git.erix.vip/eric/erix-llm-kit#100，provider 决定，可缺失/可重复）——缺失时回退到
- * 「锚点消息 id + 投影内块序号」：DTO 是锚点驱动、按投影顺序聚合该 run 的 toolCalls，同一 transcript
- * 刷新前后顺序稳定，故该键刷新前后稳定。宿主不向上游 `toolCalls[]` 注入字段（#95 红线：只透传），
- * 故 key 在渲染层合成；锚点 DTO 不携带轮号（不属本单透传字段），故用稳定的锚点 id 作定位。
+ * 两条路据此天然幂等归并（同一调用只渲染一张卡片）。`id` 缺失/重复由 provider 决定（可缺失/可重复）；
+ * erix-agent 0.16.0 起上游为每个 toolCall 提供稳定视图键 `call.key`（由输入位置生成、单次投影内唯一、
+ * 同输入确定性；**不是持久 ID、也不是 provider `tool_use.id`**）→ `id` 缺失时用它作卡片身份，
+ * 不再自造 `proj:<锚点 id>:<序号>`（仅当 `id`/`key` 都缺失时保留该兜底）。
  */
 function toolCallKey(messageId: string, call: ProjectedToolCall, index: number): string {
   if (typeof call.id === 'string' && call.id !== '') return call.id;
+  if (typeof call.key === 'string' && call.key !== '') return call.key;
   return `proj:${messageId}:${index}`;
 }
 
