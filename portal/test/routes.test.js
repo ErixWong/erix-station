@@ -55,6 +55,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '    fde-auth:',
     '      forwardAuth:',
     '        address: "http://127.0.0.1:18080/api/forward-auth"',
+    '        trustForwardHeader: false',
     '        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]',
     '        authResponseHeaders: [X-Auth-User]',
     '    strip-cookie:',

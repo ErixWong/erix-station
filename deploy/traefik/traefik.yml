@@ -2,21 +2,18 @@
 # 依据：docs/design/deploy-contract.md §4.1 + docs/design/topology.md §6
 api: false
 
-# forwardedHeaders 口径（#57 阶段2）：Traefik 跑在 host 网络直连客户端，入口收到的 X-Forwarded-*
-# 不可信 ⇒ trustForwardHeader: false（不信入站 XFF，自己定 Host/scheme），同时消除 station-edge 的 WRN。
+# forwardedHeaders 口径（#57 阶段2）：host 网络直连 ⇒ 不信入站 X-Forwarded-*。该口径的正确落点不在
+# 入口级（entryPoints.forwardedHeaders 只有 trustedIPs/trustedProxies），而在 forwardAuth 中间件
+# 的 `trustForwardHeader: false`——由 portal routes.js 生成（消 station-edge WRN；入口级写它会让 Traefik 拒配置崩退）。
 entryPoints:
   web:
     # WP3a：web 入口需对 FDE 容器可达（容器经自身 bridge 网关 IP → 宿主 → Traefik，topology §4-L3/L7），
     # 故开发期绑定 0.0.0.0（127.0.0.1 对容器不可达）。生产入口为 80（对外）与 FDE 白名单网关路径。
     address: ":8090"
-    forwardedHeaders:
-      trustForwardHeader: false
     http:
       aliasHeadersStrategy: delete
   websecure:
     address: ":8443"
-    forwardedHeaders:
-      trustForwardHeader: false
     http:
       aliasHeadersStrategy: delete
 
