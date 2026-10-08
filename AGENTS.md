@@ -187,6 +187,18 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 
 - **未采纳**：上游 #160（内置 file store 幂等缓存）属包内部优化，对 station 无动作；#158 为仓库侧文档示例校验。
 
+### 8.7 0.17.0 后续修正：失败/中止终态透传与 reason 口径对齐（issue #212，2026-10-09）
+
+- [x] **worker 透传引擎 termination**（`runner/worker.js` catch → `runner/lib/termination.js`）：0.17.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上（`erix-agent/src/loop/orchestrator.js:758-771` 定 reason 并挂 `operation`/`phase`/`sideEffect`，`src/loop/termination.js:40-49` `annotateTermination`）。此前 station 拍平成 `{reason:'failed'}`，`persistence_failed`（run snapshot / `markRunState` 没落盘 → 崩溃恢复可能重复副作用，**语义最重**）与落盘 phase 全丢。现原样透传，引擎没给才回退旧口径；唯一保留的本地修正是竞态兜底（signal 已 abort 而引擎给兜底值 `failed` → 以 `aborted` 呈现，保住「停止」= finished，并消除旧写法下 `error.code='aborted'` 与 `termination.reason='failed'` 自相矛盾的窗口）。
+  - **已接受的边界**：abort 与持久化失败同时发生时（abort 晚于 `persistence_failed` 落地），`termination.reason` 仍以引擎为准 `persistence_failed`、而 `error.code` 为 `aborted`。不算回归（旧行为下会被拍平成 `failed`），但 UI 会从「已取消」变成红色失败；不再叠本地修正，避免遮蔽真实的落盘失败。
+- [x] **`error.retryable` 与上游对齐**：判据 = `err.retryable === true` 或码属 `{timeout, rate_limited, server, disconnect, checkpoint_failed}`（上游 `src/providers/errors.js:1` + `checkpoint_failed`）。此前是手写半截清单（只认 `checkpoint_failed` / `rate_limited`），`timeout`/`server`/`disconnect` 被误判为不可重试。
+- [x] **前端红色集合补两值**（`portal/frontend/src/lib/terminationReasons.ts` 的 `RUN_FAIL_REASONS`：+`persistence_failed`、+`final_guard_unverified`，两者都走 `.syserr` 红色告警；`persistence_failed` 额外显示 `operation/phase/sideEffect`）+ i18n 双语标签（zh-CN/en）。**必须与上一条同 PR**：先透传再扩集合，否则 `persistence_failed` 会被渲染成灰色中性分隔条。
+- [x] **单一常量落点**：`portal/frontend/src/lib/terminationReasons.ts`（零 import、只 erasable 语法；前端运行时 + vitest + `node --test`（Node 22 类型剥离）三端共用）。runner 侧因 FDE 镜像只 `COPY runner/*` 保留运行时镜像 `runner/lib/termination.js`，由测试钉住一致。**不新增依赖、不动 pin、不装包**。
+- [x] **防漂移测试**：`portal/test/termination-contract.test.js` 断言「常量 ↔ 文档枚举表（`docs/data/model.md` §1.7、`docs/api/portal.md` §4.1/§5.3/§6.4 的 `<!-- DRIFT:* -->` 锚点）↔ erix-agent 包源码（typedef 9 值 + `persistence_failed` 字面量 + provider `RETRYABLE_CODES`）↔ runner 镜像」逐项一致，并断言引擎版本 == 常量声明版本 == 两处 package.json pin（升级引擎即 tripwire）。前端侧 `portal/frontend/src/lib/terminationReasons.spec.ts` 锁「常量 ↔ `useEventStream` 同一 Set 实例 ↔ i18n 双语键集」。
+- [x] **`docs/data/schema.sql` 采用方案 A：一个字节未改**（`git diff` 为空）。理由（已写进 `docs/data/model.md` §1.7 口径注）：`portal/src/migrate.js:138` 对**整个 schema.sql 文本（含注释）**算 sha256，`:154-172` 与库中 baseline checksum 不符即 `refusing to start`，且该校验在增量迁移循环（`:185`）**之前**——「加一条迁移去 UPDATE checksum」救不了它。权威 reason 枚举落在 model.md §1.7 与 portal.md §4.1/§5.3，schema.sql 内那段注释（v0.3.5 + 已不存在的 `reflection_stop`）明确降级为「baseline 冻结的历史快照，不作为真值来源」；`deploy/migrations/` 亦未新增。
+- [x] **测试**（合并 #213 后的全量口径）：根 `npm test` **796 项：795 通过 / 1 跳过 / 0 失败**（基线 767 = 本次净增 15（防漂移契约 6 + runner 终态信封 9）+ #211 净增 14）；`cd runner && node --test` **150/150**（基线 127 + #211 14 + 本次 9）；前端 `npm run typecheck` 干净、`npm test` **23 文件 / 317 通过**（基线 22/308，净增 9）。唯一跳过项为基线既有。
+- [ ] **待办（主 agent）**：真机 e2e——造一次快照写失败，确认工作台红色告警且能看到 `phase`（步骤见 issue #212 / 本次交付报告）；以及 reason 全集若随引擎变更，按本节流程重开 issue。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
