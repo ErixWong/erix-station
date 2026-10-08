@@ -33,7 +33,8 @@
 | **端到端（e2e）** | 真机走通「登录→建项目→对话→工具卡片→停止」 | 本机 docker compose 平台栈 + Playwright MCP | §1.4 P1 验收清单 + §3.7 浏览器流程 | 十分钟级 | 截图 + vision 读图确认 + 关键断言通过 |
 | **安全回归（security）** | 网络隔离 / 认证 / 凭据红线，**必须真机** | 目标环境（部分可在本机开发环境跑通，见 §3.1） | §3.1/§3.2 命令 | 分钟级 | 逐条对应 topology §6.1 验收矩阵 |
 
-> **当前仓库状态（前置条件，B8）**：`portal/`、`runner/`、`deploy/` 已落地（含 `package.json`），单测当前 **168 pass / 0 fail**（`npm test`，node --test）。§1 的代码类命令（`npm test`、`node --check <文件>`）现可运行；本文命令随实现演进，以仓库现状为准。
+> **当前仓库状态（前置条件，B8）**：`portal/`、`runner/`、`deploy/` 已落地（含 `package.json`）。§1 的代码类命令（`npm test`、`node --check <文件>`）现可运行；本文命令随实现演进，**以仓库现状为准**。
+> 单测数量会随开发漂移，**不要把它当验收依据**——只看退出码与 failed 数。2026-10-08 快照：根 `npm test` **722 项 / 721 通过 / 1 跳过**、`runner/` **126 全绿**、`portal/frontend/` **283 全绿**（+ `vue-tsc`）。
 
 ### 1.2 分层命令与判定
 
@@ -54,7 +55,7 @@ node --check "$RUNNER_JS"
 
 ```bash
 cd /home/eric/projects/erix-station
-# ✅ 前置条件已满足：portal/ 与 package.json 已落地，npm test 当前 168 pass / 0 fail（见 §1.1 注）
+# ✅ 前置条件已满足：portal/ 与 package.json 已落地（数量见 §1.1 注，以实际输出为准）
 npm test                                    # 默认 Node 22
 PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node 24）
 ```

@@ -7,6 +7,10 @@
 > **baseline 已冻结**：`docs/data/schema.sql`（`version='0000_baseline'`）自 P1 起不可再改——
 > 改它会让 `00-init.sh`/runner 记录的真实 `sha256` 失配，runner 直接拒绝启动（§3.2 防改历史）。
 > 新增 DDL 一律写成新编号迁移文件（本目录），**不**回写 baseline。
+>
+> **已应用的迁移文件同样不可再改（2026-10-08 实测确认）**：runner 对**每个**已应用迁移记录 `sha256`
+> （`schema_migrations.checksum`），失配即拒绝启动——**连注释都不能改**。因此「补一句说明/修一个 typo」
+> 的正确做法是写进本文档或新迁移，**绝不回改历史迁移文件**；排查线索也写在这里（见文末「排障」）。
 
 ## 目录职责
 
@@ -40,10 +44,17 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0015-backfill-user-input-transcript.sql`（回填旧会话缺失的用户输入 transcript 行；只增不改、幂等）。
+  `0016-transcript-append-seq.sql`（transcript 同 round 保序：新增 `append_seq` + 存量按 `created_at, id` 确定性回填 + 部分索引；只增不改、幂等）。
   **P1 compose 显式设
   `MIGRATE_ON_START: "1"`**——单实例平台起栈即自动补增量，不再需要人工补跑（deploy-contract §3.1）；
   多实例部署必须置 `0` 并外部跑迁移。
 
 > 迁移身份 = `station_platform`（DDL，表 owner）；运行时身份 = `station_portal`（最小 DML）。
 > 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。
+
+## 排障
+
+- **`column "claim_token" does not exist`（或其他基线列缺失）**：说明目标库**不是由 0001 建的表**
+  （典型：手工建库 / 导入了不匹配的 dump）。runner 不会自愈——请**重建库**后重跑迁移，不要靠改迁移文件绕过。
+- **`checksum mismatch` / runner 拒启**：有人改过已应用迁移或 baseline。从 `git log` 取回原文件内容即可，
+  **不要**删 `schema_migrations` 行去「重放」（那会跳过 DDL，留下半成品 schema）。
