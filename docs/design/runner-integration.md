@@ -346,7 +346,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 3. **tools / executeTool**：`createJail`（jail 根 = `run_start.cwd`，即项目目录）+ `createFileTools` + `createShellTools` + `createNotesTools` + `createToolRegistry`（file + shell + note 三组工具，PR #74 / issue #72）；`executeTool` 外包一层审批钩子（§10）与工具事件上报。code-server 清退（issue #71）后，容器内「跑命令」职能由 **shell 工具**承接（issue #72，PR #74）。
 4. **store**：IPC 版 HTTP adapter（§9），`runId` = `run_start.run_id`（portal 生成的 UUID，规格 §9.3-3）。
 5. **resume**：`run_start.resume === true`（即 `attempt > 1` 的 re-claim）时传 `resume: true`（引擎从 checkpoint 恢复，跳过已执行工具——`executedToolIds` 去重，`src/loop.js:1179-1180`；副作用工具按 tool id 幂等，host-upgrade-guide §0-4）。resume 时 adapter 先经 U9 读回当前 checkpoint 的 `revision`，本地计数从 `revision+1` 续起（§9.5），避免新 worker 从 0 起计被 CAS 误拒。
-6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge` 全部桥接到 IPC `event`；**`onUsage` 不产 IPC `event`**——其值随 U2 终态载荷上报（含 usage 与 compaction_stats，§7.6）；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
+6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge` 全部桥接到 IPC `event`；**`onUsage` 不产 IPC `event`**——其值随 U2 终态载荷上报（含 usage，§7.6）；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
 7. **signal**：worker 持有 `AbortController`，IPC `abort` 时触发。
 8. **reflection**：显式传（不依赖 `maxRounds>=16` 的默认开启，§1.3 硬注意-3）；`wrapup` 显式传（对话型宿主参照 host-upgrade-guide §1 touwaka 的先例评估 `wrapup: false` ⚠️）。
 9. **结束**：resolve → `run_finished {ok:true, termination, usage, rounds, final_text}`；reject → 按 `error.code`（`checkpoint_failed` / `rate_limited` / abort→`aborted`）映射 `run_finished {ok:false, error}`。引擎 abort 时 `termination.reason="aborted"`（`src/loop.js:712-717` 的 `fail()`：`signal?.aborted ? "aborted" : "failed"`）。
@@ -498,9 +498,9 @@ portal：事务内 chat_sessions.last_seq 逐条 +1 分配 seq
 | 方案 | 说明 | 取舍 |
 |---|---|---|
 | (a) worker 经 U3 发 `run_end` 事件 | worker 把 `runToolLoop` 返回值作为 `type:"run_end"` 事件走事件批量上报 | 存在「`run_end` 事件先到、后续事件后到」的排序间隙；worker 在「发 run_end 后、U2 前」崩溃会留下无终态的事件 |
-| (b) portal 由 U2 合成（**已定**） | worker 不发 `run_end` 事件；portal 在 U2 终态事务里**合成**一条 `run_end` 事件（新 seq，payload 取 U2 的 termination/usage/rounds/final_text/compaction_stats） | 终态状态 + `run_end` 事件**同事务原子提交**，无排序间隙；`run_end` 恒为 run 内最后一条事件 |
+| (b) portal 由 U2 合成（**已定**） | worker 不发 `run_end` 事件；portal 在 U2 终态事务里**合成**一条 `run_end` 事件（新 seq，payload 取 U2 的 termination/usage/rounds/final_text） | 终态状态 + `run_end` 事件**同事务原子提交**，无排序间隙；`run_end` 恒为 run 内最后一条事件 |
 
-选 (b) 的理由：U2 终态载荷本就携带 `termination/usage/rounds/final_text/compaction_stats`（§4.2 U2），portal 合成只是把它写成一条带 seq 的事件；单写方、单事务，消除「事件在终态之后到达」整类 bug。worker 侧不再产生 `run_end` 事件（引擎返回值只喂 U2）。
+选 (b) 的理由：U2 终态载荷本就携带 `termination/usage/rounds/final_text`（§4.2 U2），portal 合成只是把它写成一条带 seq 的事件；单写方、单事务，消除「事件在终态之后到达」整类 bug。worker 侧不再产生 `run_end` 事件（引擎返回值只喂 U2）。
 
 **确定性 `client_event_id` 与 DB 唯一性（A4）**：合成事件的 `client_event_id` 固定为 `run_id:final:run_end`（与 worker 事件的 `run_id:attempt:计数` 命名空间不碰撞）。schema.sql 已有两条兑底：① `UNIQUE(run_id, client_event_id)`（同 id 重放用 `ON CONFLICT DO NOTHING` 去重）；② 部分唯一索引 `UNIQUE(run_id) WHERE type='run_end'`（`run_events_run_end_key`）——**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**。
 
