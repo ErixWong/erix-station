@@ -128,10 +128,10 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 8. erix-agent 依赖与升级（当前 pin：0.16.0）
+## 8. erix-agent 依赖与升级（当前 pin：0.17.0）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
-- runner 当前 pin：`0.16.0`；portal（根 package.json，运行时依赖）自 P3 前置起也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5）。升级仍走分支 + PR + §6.1 评审。
+- runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6）。升级仍走分支 + PR + §6.1 评审。
 
 ### 0.14.0 当前宿主契约
 
@@ -161,6 +161,27 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - **契约套件转绿**：上游 `test/contract/transcript-store.js` 新增「保真往返」「同轮保序」两条断言（指南明说：故意让不合规 store 失败——那是迁移信号，不是要放宽的测试）。runner 契约桩（`runner/test/store-contract.test.js` 内存 IPC peer）改为新语义：同 round 不同 dedupKey 共存、`load` 保追加序、dedupKey 幂等；`node --test runner/test/store-contract.test.js` 17/17 全绿。
 - **依赖**：根 `package.json` 与 `runner/package.json` → `erix-agent: 0.16.0`，两处 lockfile 同步（无 API 变更，应用调用点不动）。
 - **`UNIQUE (run_id, round)` 处置**：**保留不动**——session 维度行 `run_id IS NULL`（NULL 在唯一索引里互不相等）本就不受该约束限制（真机 58 组重复即 session 行）；legacy run 维度 `putRound` 仍以它做 ON CONFLICT 幂等，而 0.16.0 引擎 store 自 P2 起只走 session 端点，改它属「为改而改」（见迁移 0016 头注释）。
+
+### 8.6 0.17.0 迁移记录（issue #193，PR 编号待定）
+
+依据：`erix-agent/docs/host-upgrade-guide-0.17.0.md`。0.17.0 **纯增量**：无 API 删除、无调用点变更、无强制 store 改动，0.16.x 宿主可直接升；唯一的 opt-in 是 `appendUserTurn` 的**成对可选快路径探针**（上游 #157）。
+
+- **依赖**：根 `package.json` 与 `runner/package.json` 的 `erix-agent` 两处 pin `0.16.0` → **`0.17.0`**（exact 风格不变），**两份 lockfile 同步**（根 + `runner/`，均仅 `erix-agent` 一项变动）。未动其他依赖、未动 `runner/` 源码（runner 的内存 peer **故意不实现探针**，见下）。
+- **探针采纳理由**：POST 消息事务内的用户输入预写（`portal/src/transcript-store.js`，P3 契约①）原先每次都靠全量 `load(key)`（`SELECT round, dedup_key, record … ORDER BY round, append_seq`）仅为了两件小事：按 dedupKey 判幂等 + 取最大 round。该读的成本随 session **行数与 payload 字节数双向增长**，而它坐在接收消息的事务里（契约 Timing 要求），长会话下把 messages 插入与 run 入队一起拖长。station 的行形态（每轮一行、`record` 整块 JSONB）正好适合点查 → 采纳两探针。内置 file store 故意不实现（点查对 JSONL 无意义），station 不跟随。
+- **实现**（`createSessionTranscriptStore(client)` 返回对象内、`appendRound` 之后新增两方法，**依旧复用闭包里的事务 client**，绝不换 pool）：
+  - `loadByDedupKey(key, dedupKey)` → `SELECT record FROM transcript_rounds WHERE transcript_key = $1 AND dedup_key = $2 LIMIT 1`，未命中 **返回 `null`（不是抛错）**。
+  - `loadMaxRound(key)` → `SELECT MAX(round) AS max_round FROM transcript_rounds WHERE transcript_key = $1`，空 key 返回 `null`（引擎派生 round 0，与全量路径语义一致），非空时 `Number(max_round)` 兼容驱动包装层返字符串的情况。
+  - **成对红线**：只实现其一 = 完全不生效（引擎整块退回全量 `load`）。`portal/test/append-seq-ordering.test.js` 的源码护栏已改为同时钉住两方法都在源码里；`portal/test/transcript-store.test.js` 钉住行为（全新预写 SQL 流水 = `loadByDedupKey → loadMaxRound → appendRound`，全程**零全量 load**；命中即返回，不再取 MAX、不再 INSERT）。
+- **命中保真决策**：命中时**原样返回 `record` JSONB，不合成列字段**（不同于 `load` 把 `round`/`dedup_key` 以权威列合入 record 的既有 shape）。理由：0.16.0 起的保真要求是「宿主不得按白名单重建 record」，而引擎命中面直接透传该 record（`round`/`dedupKey` 由引擎从 record 自取），点查再合成列字段只会多出一个契约 deepEqual 不期望的字段。契约套件的「命中 record 与 append 入参 deepEqual」因此直接通过，包括宿主未知字段。
+- **谓词等价注记**：契约谓词为 `(record.dedupKey ?? record.roundKey) === dedupKey`，station 点查用的是**列等值** `dedup_key = $2`。等价性成立因为 `dedup_key` 列在 `appendRound` 写入时恒等于 `record.dedupKey ?? record.roundKey`（迁移 0006 部分唯一索引列，`appendRound` 开头就是这条派生）；roundKey-only 记录的回退匹配因此天然成立（契约套件该用例也过）。已在 `transcript-store.js` 方法注释里写明该等价推导。
+- **上游契约套件接入结果**：`erix-agent/contract-tests` 的 `transcriptStoreContract` 已在 `portal/test/transcript-store.test.js` 末尾接入，**15/15 全绿**——但接入点是 `contractShapeFixture()`（测试侧夹具）而非裸适配器：裸适配器直跑为 **4 过 / 11 失败**，11 项全源于 station 既有 shape（按红线不用产品代码迁就）：
+  - **5 项**（`append/load 往返保真`、`RoundRecord 与 message 未知字段…往返`、`多 runId 隔离`、`round 0 种子记录与保序`、`folded/foldedPayload 元数据往返`）：上游用例的记录**不带 dedupKey/roundKey**，而 station 的 `appendRound` 把 dedupKey 当硬前置（幂等主判据与迁移 0006 部分唯一索引 `(transcript_key, dedup_key)` 全依赖它；`dedup_key` 列本身 nullable，但 0006 头注释定口径为「session 行必填」）→ 裸适配器抛 `transcript store: record.dedupKey is required`。夹具：写入时造合成键、读出时剥掉（同时消除 station `load` 合成 `dedupKey` 列与上游严格 deepEqual 的 shape 差异）。
+  - **6 项**（run snapshot 往返/未知 runId/多 runId 隔离、run-state 保真/终态不入快照/未知 runId）：run snapshot / run-state 在 station **不由 transcript store 承担**——真相在 `portal/src/internal.js` 的 `chat_sessions.engine_run_state*` / `runs.run_state*` 列与 `runner/lib/store.js` 的 IPC 契约面（已由 `runner/test/store-contract.test.js` 覆盖），portal 适配器不实现 → 夹具给内存桩。
+  - **关键：#157 成对探针用例对真实产品探针执行全绿**（夹具直接转发产品的 `load`/`appendRound`/`loadByDedupKey`/`loadMaxRound`）：含成对约束、未命中 null、命中 record 逐字段 deepEqual（含未知字段）、roundKey-only 回退匹配、`loadMaxRound == MAX(round)`、空 store 返回 null。
+- **随动的测试侧镜像**（新 SQL 面进入各 fake pool，否则 strict fake 报 `unexpected SQL`）：`portal/test/session-title.test.js`（postMessage 流水顺序红线改为「`BEGIN < messages INSERT < 点查 < transcript INSERT < run_queue < COMMIT`」，并新增「事务内零全量 load」断言）、`portal/test/llm.test.js`、`portal/test/message-precheck.test.js`（两者原本对全量 load 返回空行，行为等价）。**产品侧 `load`/`appendRound` 的 SQL 与 client 绑定方式一字未改**，`load` 作为回退路径保留。
+- **gate**：根 `npm test` **767 项：766 通过 / 1 跳过 / 0 失败**（基线 746，本 PR 净增 21 = 6 条探针行为单测 + 15 条上游契约用例；唯一跳过项为既有）；`node --test runner/test/store-contract.test.js` **18/18 全绿**（较 0.16.0 基线 17 多出的 1 项即上游新增的成对探针用例——runner 内存 peer 两探针**都不实现**，成对断言 `hasDedup === hasMax` 天然通过，故 runner 源码不改）；`portal/test/transcript-store.test.js` 27/27（12 条宿主断言 + 15 条契约）；`node --check` 对 6 个改动 JS 文件全过。
+- **已知语义差（低危，实测确认）**：若存在 `transcript_key` 非空但 `dedup_key` **列为 NULL**、而 `record` 内自带 dedupKey 的历史行（既有单测红线④标为「理论不该发生」），全量 `load` 路径会因列→record 回退合成而幂等命中，**点查快路径则会 miss 并多写一行**（已用脚本实测：同 messageId 重放从 `written:false` 变 `written:true`）。可达性很低：`transcript_key` 与 `dedup_key` 两列同在迁移 0006 加入，写入方（`putSessionRound`/`appendRound`/迁移 0015 回填）均强制填 dedup_key；但**新写迁移不得引入 `dedup_key IS NULL` 的 session 行**，否则预写幂等会降级为「靠 `ON CONFLICT` 兜并发、不兜顺序重放」。
+- **未采纳**：上游 #160（内置 file store 幂等缓存）属包内部优化，对 station 无动作；#158 为仓库侧文档示例校验。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
