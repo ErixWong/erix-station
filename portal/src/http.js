@@ -1497,10 +1497,10 @@ async function requireSession(req, ctx) {
  */
 async function handleForwardAuth(req, res, ctx) {
   // dev 端口（8090/8443）下浏览器 Host 恒带端口后缀（如 `xxx.fde.localhost:8090`），而
-  // port_allocations.hostname 按无端口 hostname 存储（fix-250923-01）：剥离 `:port` 再做
-  // 精确匹配（生产 80/443 无端口后缀，行为不变）。
+  // port_allocations.hostname 按无端口 hostname 存储（fix-250923-01）：剥端口 + 小写后再做
+  // 精确匹配（生产 80/443 无端口后缀，行为不变）。归一化**口径唯一入口** = preview.normalizeHostHeader（#57 收口）。
   const rawHost = req.headers['x-forwarded-host'] || req.headers.host;
-  const host = typeof rawHost === 'string' ? rawHost.replace(/:\d+$/, '') : rawHost;
+  const host = preview.normalizeHostHeader(rawHost);
   const uri = req.headers['x-forwarded-uri'] || req.url;
   const method = req.headers['x-forwarded-method'] || req.method;
   const scheme = req.headers['x-forwarded-proto'] || 'https';

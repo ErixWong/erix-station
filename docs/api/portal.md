@@ -11,11 +11,11 @@
 
 ## 0. 总览
 
-> **环境取值纪律**：契约形状只由规格 + principles 决定，**与环境无关**。文中一切域名/URL 以 env.md §10 的部署变量（`BASE_DOMAIN` / `PORTAL_HOST` / `FDE_WILDCARD_HOST`）为准；JSON 示例中出现的具体域名（`station.erix.vip`、`*.fde.erix.vip` 等）均假设 `BASE_DOMAIN=erix.vip`（env §1 ⚠️ 待决策者确认），仅作 mock 示例，不构成设计约束。部署目标环境不一定是任何已实测的机器。
+> **环境取值纪律**：契约形状只由规格 + principles 决定，**与环境无关**。文中一切域名/URL 以 env.md §10 的部署变量（`BASE_DOMAIN` / `PORTAL_HOST` / `FDE_WILDCARD_HOST`）为准；JSON 示例中出现的具体域名（`station.fde.erix.vip`、`eric-p-8001.fde.erix.vip` 等）均假设 **`BASE_DOMAIN=fde.erix.vip`（#57 定稿：`BASE_DOMAIN` = **伞域** = `fde.<可注册域>`，不再是可注册域）**，仅作 mock 示例，不构成设计约束。**`*.localhost` 不是“开发期变通”**：它是 `BASE_DOMAIN` 的**代码默认兜底值（本地起服，env §0/§1）**，代码默认值为 `localhost`（即本地起服 `http://station.localhost:8090`，不套伞域前缀），代码路径与生产完全一致（dev `http://station.<BASE_DOMAIN>:8090`，生产 `https://station.<BASE_DOMAIN>`，scheme/端口从公开入口配置派生）。部署目标环境不一定是任何已实测的机器。
 
 | 项 | 取值 | 来源 |
 |---|---|---|
-| Base URL | `https://<PORTAL_HOST>`（`PORTAL_HOST = station.<BASE_DOMAIN>`，如 `https://station.erix.vip`） | env §1/§10 ⚠️ 待决策者确认 |
+| Base URL | `https://<PORTAL_HOST>`（`PORTAL_HOST = station.<BASE_DOMAIN>`，BASE_DOMAIN 为伞域 ⇒ 如 `https://station.fde.erix.vip`）；本地起服默认兜底 `http://station.localhost:8090`（`BASE_DOMAIN` 代码缺省 = `localhost`） | env §1/§10（#57 定稿伞域口径） |
 | 服务监听 | portal 容器内 `:8080`，publish **仅 `127.0.0.1:8080`（宿主回环）**，由 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN | 规格 §5.3 / §6.4 / topology.md §2.2 |
 | 字符集 / 格式 | 全部 `application/json; charset=utf-8`（SSE 端点除外） | — |
 | 时间格式 | ISO 8601 UTC（如 `2026-09-12T08:30:00.000Z`） | — |
@@ -291,7 +291,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 | 头 | 用途 |
 |---|---|
-| `X-Forwarded-Host` | 形如 `<fde>-<token>-<port>.fde.<BASE_DOMAIN>`（示例：`alice-r3a7fq-4001.fde.erix.vip`）；Traefik 以真实 `Host` 覆盖 |
+| `X-Forwarded-Host` | 形如 `<fde>-p-<port4>.<BASE_DOMAIN>`（伞域口径，#57；示例：`eric-p-8001.fde.erix.vip`，dev 带端口后缀 `:8090`）；Traefik 以真实 `Host` 覆盖。portal 查表前**剥端口 + 小写**（唯一实现 `preview.normalizeHostHeader`），302 `Location` 仍保留原始 Host（含端口） |
 | `X-Forwarded-Uri` / `X-Forwarded-Method` | 从 `X-Forwarded-Uri` 解析 `preview_ticket` 查询参数；方法用于审计 |
 | `Cookie` | 只看 `__Host-fde_preview`（本 host 的预览 cookie） |
 
@@ -344,7 +344,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 ```json
 {
   "ticket": "pt_<随机 256-bit base64url>",
-  "url": "https://alice-r3a7fq-4001.fde.erix.vip/?preview_ticket=pt_…",
+  "url": "https://eric-p-8001.fde.erix.vip?preview_ticket=pt_…",
   "expires_in": 60
 }
 ```
@@ -352,7 +352,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 字段 | 说明 |
 |---|---|
 | `ticket` | 一次性、短 TTL 的不透明 token；只可经 `?preview_ticket=` 使用一次 |
-| `url` | allocation.url + `?preview_ticket=`，前端**直接跳转/作为 iframe src**，不得自行拼接（规格 §8.1 同源） |
+| `url` | **预览完整域**（`<fde>-p-<port4>.<BASE_DOMAIN>`，fde-platform §8.5）+ `?preview_ticket=`，前端**直接跳转/作为 iframe src**，不得自行拼接（规格 §8-4）。scheme/端口按**公开入口**派生（#57：dev `http://…:8090`、生产 https 默认端口不进 URL；实现 `projects.previewUrl(hostname, { publicBaseUrl: portalPublicBaseUrl })`） |
 | `expires_in` | TTL 秒数（**60s ⚠️ 待决策者确认**） |
 
 签发规则：
@@ -977,7 +977,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | # | 事项 | 当前倾向（principles §4） | 影响 |
 |---|---|---|---|
 | 1 | ~~Q7 portal 技术栈~~ ✅ 已定稿：(a) 零依赖 `node:http` + 原生前端（principles §4；WP1 落地） | — | 仅实现注记，**契约形状无关** |
-| 2 | `BASE_DOMAIN`（影响示例 URL 与 cookie 生效 host；当前倾向 `erix.vip`） | env §1 ⚠️ | §0 / §2.5 |
+| 2 | `BASE_DOMAIN`（影响示例 URL 与 cookie 生效 host；**#57 定稿：语义为伞域 `fde.<可注册域>`，现取 `fde.erix.vip`；代码默认兜底 `localhost`（本地起服，不套伞域前缀）**） | env §1 | §0 / §2.5 / fde-platform §8.5 |
 | 3 | P1 认证 = 本地账号 + 强制 TOTP（OIDC 延后 P2；**现状**：未注册 TOTP 的账号口令直通，见 §2.1） | env §4 / Q3 倾向 (a) | §2.1 |
 | 4 | Q5 端口分级：先只做项目级 | 倾向 (b) 起步 | §4.7（`scope`/`run_id` 字段保留） |
 | 5 | 任务下发 push→pull 演进 | **拉模型为终态**；push 仅作 P2 优化后置（⚠️ 待决策者确认，不作默认契约） | §6.3（`container_unreachable` 出现条件） |

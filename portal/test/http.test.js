@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
+import { hashToken } from '../src/auth.js';
 import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
 
@@ -968,10 +969,10 @@ test('KDF 队列满 → 503 kdf_busy（快速失败，不无限排队）', async
   }
 });
 
-test('forward-auth fail-closed：无预览凭证 403 / 未知 host 404 / released 403', async () => {
+test('forward-auth fail-closed：无预览凭证 403 / 未知 host 404（可操作提示）/ released 403', async () => {
   const allocs = new Map([
-    ['alice-p-proj1-4016.fde.localhost', { id: 'pa1', fde_id: 'u1', state: 'allocated', fde_name: 'alice' }],
-    ['bob-p-proj1-4016.fde.localhost', { id: 'pa2', fde_id: 'u2', state: 'released', fde_name: 'bob' }],
+    ['alice-p-4016.fde.erix.vip', { id: 'pa1', fde_id: 'u1', state: 'allocated', fde_name: 'alice' }],
+    ['bob-p-4016.fde.erix.vip', { id: 'pa2', fde_id: 'u2', state: 'released', fde_name: 'bob' }],
   ]);
   const pool = {
     async query(sql, params) {
@@ -986,16 +987,82 @@ test('forward-auth fail-closed：无预览凭证 403 / 未知 host 404 / release
   };
   const s = await startServer({ pool });
   try {
-    const unknown = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'nope.fde.localhost' } });
+    const unknown = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'nope.fde.erix.vip' } });
     assert.equal(unknown.status, 404);
+    // #57：404 文案换成可操作提示（错误码不变）。
+    const unknownBody = await unknown.json();
+    assert.equal(unknownBody.error.code, 'not_found');
+    assert.match(unknownBody.error.message, /preview host not found/);
+    assert.match(unknownBody.error.message, /unassigned preview domain or stale bookmark/);
 
-    const nocred = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'alice-p-proj1-4016.fde.localhost' } });
+    const nocred = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'alice-p-4016.fde.erix.vip' } });
     assert.equal(nocred.status, 403);
     assert.equal((await nocred.json()).error.code, 'preview_ticket_required');
 
-    const released = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'bob-p-proj1-4016.fde.localhost' } });
+    const released = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': 'bob-p-4016.fde.erix.vip' } });
     assert.equal(released.status, 403);
     assert.equal((await released.json()).error.code, 'allocation_released');
+  } finally {
+    await s.close();
+  }
+});
+
+// #57 阶段2 Host 收口 + #58（fix-250923-01）回归：dev 公开入口带端口（:8090）时，
+// 查表用剥端口 + 小写的 host（归一化唯一入口 = preview.normalizeHostHeader），
+// 302 Location 仍保留**原始 Host（含端口）**。
+test('forward-auth：Host 带端口（dev :8090）——cookie 已签发路径 2xx 放行（#57 Host 收口 + #58 回归）', async () => {
+  const HOST = 'alice-p-4000.fde.erix.vip';
+  const sessionToken = 's_steady_cookie_with_port';
+  const grants = new Map([[hashToken(sessionToken), {
+    id: 'g1', token_hash: hashToken(sessionToken), user_id: 'u1', allocation_id: 'pa1',
+    kind: 'session', state: 'active', expires_at: new Date(Date.now() + 600_000), revoked_at: null,
+  }]]);
+  const pool = {
+    async query(sql, params = []) {
+      if (sql.includes('FROM port_allocations a')) {
+        // 查表入参必须是**剥端口后**的 host（大小写也被归一）。
+        const a = { id: 'pa1', fde_id: 'u1', state: 'active', exposure: 'private', hostname: HOST, fde_name: 'alice', user_status: 'active' };
+        return { rows: params[0] === HOST.toLowerCase() ? [a] : [] };
+      }
+      if (sql.includes("FROM preview_grants WHERE token_hash = $1 AND kind = 'session'")) {
+        const g = grants.get(params[0]);
+        return { rows: g ? [g] : [] };
+      }
+      if (sql.includes('SELECT id, role, status FROM users WHERE id = $1')) {
+        return { rows: [{ id: 'u1', role: 'fde', status: 'active' }] };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+  const s = await startServer({ pool, overrides: {
+    previewSessionTtlSeconds: 900,
+    previewCookie: { name: 'fde_preview_dev', secure: false, httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 900 },
+  } });
+  try {
+    // ① cookie 已签发 + Host 带端口 → 2xx 放行（不因端口后缀查不到而 404）
+    const allowed = await fetch(`${s.base}/api/forward-auth`, {
+      headers: {
+        'x-forwarded-host': `${HOST}:8090`,
+        'x-forwarded-proto': 'http',
+        Cookie: `fde_preview_dev=${sessionToken}`,
+      },
+    });
+    assert.equal(allowed.status, 200, `带端口 Host 的 cookie 路径应放行，实际 ${allowed.status}`);
+    assert.equal(allowed.headers.get('x-auth-user'), 'alice');
+
+    // ② Host 大小写混写 + 带端口 → 仍能查到（归一化 = 剥端口 + 小写）
+    const upper = await fetch(`${s.base}/api/forward-auth`, {
+      headers: {
+        'x-forwarded-host': 'Alice-P-4000.FDE.ERIX.VIP:8090',
+        'x-forwarded-proto': 'http',
+        Cookie: `fde_preview_dev=${sessionToken}`,
+      },
+    });
+    assert.equal(upper.status, 200);
+
+    // ③ ticket 路径的 302 Location 保留端口 → 在 test/preview.test.js 以函数级断言覆盖
+    //（不起真服务器：node fetch keep-alive 会让 server.close() 挂住，见 #57 阶段2 实施记录）。
   } finally {
     await s.close();
   }
@@ -1038,7 +1105,7 @@ test('POST /api/ports/:id/preview-ticket：无会话 401；有会话 201 且存�
         return { rows: [{ id: user.id, login: user.login, display_name: user.display_name, role: user.role, fde_name: user.fde_name, auth_source: user.auth_source, status: user.status, session_id: this.session.id, expires_at: this.session.expires_at, last_seen_at: this.session.last_seen_at }] };
       }
       if (sql.includes('FROM port_allocations WHERE id = $1')) {
-        return { rows: [{ id: 'pa1', fde_id: 'u1', state: 'allocated', exposure: 'private', url: 'https://alice-p-proj1-4000.fde.localhost' }] };
+        return { rows: [{ id: 'pa1', fde_id: 'u1', state: 'allocated', exposure: 'private', hostname: 'alice-p-4000.fde.erix.vip', url: 'https://alice-p-4000.fde.erix.vip' }] };
       }
       if (sql.includes('INSERT INTO preview_grants')) {
         grants.push({ token_hash: params[0], kind: 'ticket', user_id: params[1], issuer_id: params[2], allocation_id: params[3], expires_at: params[4] });
@@ -1084,7 +1151,7 @@ test('F2：forward-auth 审计不记 query（含 ?preview_ticket=<明文>）', a
     const secret = 'pt_S3CRET_TICKET_LEAK_CHECK';
     const res = await fetch(`${s.base}/api/forward-auth`, {
       headers: {
-        'x-forwarded-host': 'alice-p-proj1-4000.fde.localhost',
+        'x-forwarded-host': 'alice-p-4000.fde.erix.vip',
         'x-forwarded-uri': `/?preview_ticket=${secret}&extra=1`,
       },
     });
