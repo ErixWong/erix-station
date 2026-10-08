@@ -136,6 +136,32 @@ function foldedTurnText(turns) {
 }
 
 /**
+ * issue #189：折叠轮的上游元数据三元组（范围 / 导航指针 / 被折叠消息条数），逐字透传
+ * （#95 红线：上游原名、不改名、不重推导）。只从 `turn.folded === true` 的轮取；
+ * 三个字段都缺 → null（调用方据此不写 `folded` 键，与 toolCalls 同规矩）。
+ * 上游把这三项放在折叠 turn 的 meta 面上（erix-agent display/projection.js：meta.foldedRoundRange /
+ * meta.navigationRecord / meta.foldedPayloadMessages），这里只取字段值、不另造推导。
+ */
+function foldedTurnFields(turns) {
+  for (const turn of [...turns].reverse()) {
+    if (turn?.folded !== true) continue;
+    const pick = (key) => (turn[key] !== undefined && turn[key] !== null
+      ? turn[key]
+      : (turn.meta?.[key] !== undefined && turn.meta?.[key] !== null ? turn.meta[key] : undefined));
+    const range = pick('foldedRoundRange');
+    const navigation = pick('navigationRecord');
+    const payloadMessages = pick('foldedPayloadMessages');
+    if (range === undefined && navigation === undefined && payloadMessages === undefined) continue;
+    return {
+      ...(range === undefined ? {} : { foldedRoundRange: range }),
+      ...(navigation === undefined ? {} : { navigationRecord: navigation }),
+      ...(payloadMessages === undefined ? {} : { foldedPayloadMessages: payloadMessages }),
+    };
+  }
+  return null;
+}
+
+/**
  * issue #188：单条 transcript 行里、官方投影助手轮上的展示字段（逐字透传，不裁剪/不改名/不重推导）。
  *
  * 投影的 `DisplayTurn` 契约面里，助手轮除 `text` 外还带 `blocks`（原始 content blocks 数组）、
@@ -212,11 +238,15 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   const runBlocks = new Map();
   // 0.16.0：轮级视图键（`turn.key`）逐字透传（与 toolCalls[].key 同源，后者是其前缀 + `:t<i>`）。
   const runTurnKeys = new Map();
+  // issue #189：折叠轮元数据（按 run 收集，写法同 runToolCalls/runTurnKeys；后到行覆盖前行，与 foldContent 同语义）。
+  const runFolded = new Map();
   let currentRunId = null;
 
   const setRunText = (runId, assistantText, foldText, turns) => {
     if (assistantText !== null) assistantContent.set(runId, assistantText);
     if (foldText !== null) foldContent.set(runId, foldText);
+    const foldedFields = foldedTurnFields(turns);
+    if (foldedFields !== null) runFolded.set(runId, foldedFields);
     const fields = assistantTurnFields(turns);
     if (fields === null) return;
     if (fields.toolCalls !== null) {
@@ -315,6 +345,7 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
 
   const messages = anchors.map((anchor) => {
     let content = '';
+    let foldMeta = null;
     if (anchor.synthetic === true) {
       content = anchor.content;
     } else if (anchor.role === 'user') {
@@ -327,6 +358,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
         content = assistantContent.get(anchor.run_id);
       } else if (foldContent.has(anchor.run_id)) {
         content = foldContent.get(anchor.run_id);
+        // issue #189：正文来自折叠摘要 → 携带折叠元数据（有则出现、无则不写键，同 toolCalls 规矩）。
+        foldMeta = runFolded.get(anchor.run_id) ?? null;
       }
     }
     const dto = {
@@ -352,6 +385,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       // 0.16.0 轮级视图键（`turn.key`，逐字透传；run 可聚合多轮 → 数组，与 toolCalls 同为「有则出现」）。
       const turnKeys = runTurnKeys.get(anchor.run_id);
       if (turnKeys !== undefined) dto.turnKeys = turnKeys;
+      // issue #189：折叠元数据仅在「正文 = 折叠摘要」时出现（上游三元组，逐字透传）。
+      if (foldMeta !== null) dto.folded = foldMeta;
     }
     return dto;
   });

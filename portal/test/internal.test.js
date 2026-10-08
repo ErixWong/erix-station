@@ -19,6 +19,9 @@ import {
   reapExpiredRuns,
   putCheckpoint,
   getLatestCheckpoint,
+  putRound,
+  putSessionRound,
+  recallTranscript,
   saveRunState,
   loadRunState,
   loadRunStateStatus,
@@ -1091,4 +1094,78 @@ test('P3 PR②b ⑥ legacy 兜底：transcript 对该 run 无证据 → final_te
   anchor.content = 'done';
   const replay = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
   assert.equal(replay.idempotent, true, '老会话（无 transcript 证据）幂等重放仍成立');
+});
+
+// ---------------------------------------------------------------------------
+// issue #189/#195：折叠原文数据通路（run 作用域 putRound / session 作用域 putSessionRound 的
+// folded_payload 派生列写入 + recallTranscript 检索面纳入 record.foldedPayload 原文）。
+// ---------------------------------------------------------------------------
+
+test('#195 putRound：折叠轮的 folded_payload 派生列被写入（引擎原文随 record 落库）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+
+  const res = await putRound(pool, {
+    container, user, runId, round: 3, claimToken: ticket.claim_token,
+    body: {
+      dedupKey: 'dk-3', round: 3, folded: true,
+      foldedRoundRange: { from: 1, to: 2 },
+      messages: [],
+      foldedPayload: [{ role: 'user', content: 'RAW FOLDED TEXT run-scope' }],
+    },
+  });
+  assert.equal(res.inserted, true);
+  const row = pool.rounds.find((x) => x.run_id === runId && x.round === 3);
+  assert.ok(row, '轮已落库');
+  assert.ok(Array.isArray(row.folded_payload), 'folded_payload 列写入（不再是恒 NULL）');
+  assert.equal(row.folded_payload[0].content, 'RAW FOLDED TEXT run-scope');
+});
+
+test('#195 putSessionRound：折叠轮的 folded_payload 派生列被写入（session 作用域同语义）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+
+  const res = await putSessionRound(pool, {
+    container, user, key: sessionId, round: 7, claimToken: ticket.claim_token, writerRunId: runId,
+    body: {
+      dedupKey: `${sessionId}:engine:round:7`, round: 7, folded: true,
+      foldedRoundRange: { from: 5, to: 6 },
+      messages: [],
+      foldedPayload: [{ role: 'assistant', content: 'RAW FOLDED TEXT session-scope' }],
+    },
+  });
+  assert.equal(res.inserted, true);
+  const row = pool.rounds.find((x) => x.transcript_key === sessionId && x.dedup_key === `${sessionId}:engine:round:7`);
+  assert.ok(row, '轮已落库');
+  assert.ok(Array.isArray(row.folded_payload), 'folded_payload 列写入（不再是恒 NULL）');
+  assert.equal(row.folded_payload[0].content, 'RAW FOLDED TEXT session-scope');
+});
+
+test('#195 recallTranscript：record.foldedPayload 的 string 正文进入检索面（老行派生列 NULL 也检索得到）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  // 模拟修复前落库的老折叠轮：folded_payload 列 NULL，原文只在 record.foldedPayload。
+  pool.rounds.push({
+    run_id: runId, round: 4,
+    record: {
+      round: 4, dedupKey: 'dk-4', folded: true, messages: [],
+      foldedPayload: [
+        { role: 'user', content: 'FOLD-ONLY-TEXT-XYZ original inside record' },
+        { role: 'assistant', content: [{ type: 'text', text: 'block form not required' }] },
+      ],
+    },
+    folded: true, messages: [], folded_payload: null, append_seq: 1,
+  });
+
+  const hit = await recallTranscript(pool, {
+    container, user, runId, claimToken: ticket.claim_token, pattern: 'FOLD-ONLY-TEXT-XYZ',
+  });
+  assert.equal(hit.matched_rounds, 1, '折叠原文可被 recall 命中（#195 主症状）');
+  assert.match(hit.text, /FOLD-ONLY-TEXT-XYZ/);
 });

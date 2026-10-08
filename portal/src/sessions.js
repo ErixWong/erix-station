@@ -13,6 +13,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { clipTitleFromMessage, sanitizeTitle, AUTO_TITLE_MAX_LEN } from './session-title.js';
 import { getFdeLlmConfig } from './llm.js';
 import { projectSessionMessages } from './session-view.js';
+import { projectTranscriptForDisplay } from 'erix-agent';
 import { fetchUserTextTurns } from './session-text.js';
 import { appendUserInputTurn } from './transcript-store.js';
 
@@ -284,6 +285,34 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     // 还有更早的消息时给出 cursor（客户端用它取历史；对齐 §1.3 响应形状）
     next_cursor: hasOlder ? Number(msgs.rows[0].seq) : null,
   };
+}
+
+/**
+ * issue #189：折叠原文只读端点（GET /api/sessions/:id/folded/:round）。
+ * 属主/存在性/active 校验同 fetchSession 口径（非属主/不存在一律 404，不泄露存在性）；
+ * 取该 session 该 round 的 folded_payload 派生列（#195 修复后由引擎 record.foldedPayload 回退提取写入），
+ * 为空/无行 → 404 folded_payload_not_found。命中时原文一律走同一个上游投影
+ * `projectTranscriptForDisplay`（不另造折叠渲染，#95 红线），返回 { round, turns }。
+ * 同 round 多行（append_seq 保序）：取最早一条带原文的行（原文内容同源，首条即可）。
+ */
+export async function getFoldedPayload(pool, { userId, sessionId, round }) {
+  await fetchSession(pool, sessionId, userId);
+  const n = Number(round);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new SessionError('validation_failed', 'round 必须为非负整数', { details: { field: 'round' } });
+  }
+  const res = await pool.query(
+    `SELECT round, folded_payload FROM transcript_rounds
+      WHERE transcript_key = $1 AND round = $2 AND folded_payload IS NOT NULL
+      ORDER BY append_seq ASC LIMIT 1`,
+    [sessionId, n],
+  );
+  const payload = res.rows?.[0]?.folded_payload;
+  if (!Array.isArray(payload) || payload.length === 0) {
+    throw new SessionError('folded_payload_not_found', 'folded payload not found', { httpStatus: 404 });
+  }
+  const turns = projectTranscriptForDisplay([{ round: n, messages: payload }]);
+  return { round: n, turns };
 }
 
 /** PATCH /api/sessions/:id —— 改标题（CAS 限定 active，防归档后仍改成功）。 */

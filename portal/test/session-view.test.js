@@ -1221,3 +1221,64 @@ test('issue #188: host-owned anchor metadata is untouched and user anchors carry
   assert.equal(assistant.created_at, at(4).toISOString());
   assert.deepEqual(assistant.attachments, []);
 });
+
+// ---------------------------------------------------------------------------
+// issue #189：折叠轮的 DTO 折叠标记（上游三元组逐字透传；正文行为不变）。
+// ---------------------------------------------------------------------------
+
+test('#189 折叠轮正文走折叠摘要兜底时，DTO 带 folded（foldedRoundRange/navigationRecord/foldedPayloadMessages 原名透传）', () => {
+  const anchors = [
+    message('folded-flag-assistant', 1, 'assistant', 'stale anchor text', RUN_1),
+  ];
+  const navigation = { roundFrom: 1, roundTo: 5, artifacts: [{ path: 'a.txt' }, { path: 'b.txt' }] };
+  const transcriptRows = [
+    transcript(9, `${RUN_1}:engine:round:9`, {
+      dedupKey: `${RUN_1}:engine:round:9`,
+      round: 9,
+      folded: true,
+      foldedRoundRange: { from: 1, to: 5 },
+      summary: { action: '调研代码', note: '定位到 store 层' },
+      navigationRecord: navigation,
+      foldedPayload: [
+        { role: 'user', content: text('raw one') },
+        { role: 'assistant', content: text('raw two') },
+      ],
+    }, at(1)),
+  ];
+
+  const projection = projectSessionMessages({ sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows });
+
+  assert.match(projection[0].content, /早期第 1–5 轮已折叠/, '正文行为不变：仍是官方折叠摘要');
+  assert.deepEqual(projection[0].folded, {
+    foldedRoundRange: { from: 1, to: 5 },
+    navigationRecord: navigation,
+    foldedPayloadMessages: 2,
+  }, '三元组逐字透传（上游原名、不改名、不重推导）');
+});
+
+test('#189 折叠轮显示自身历史正文（非摘要兜底）时不挂 folded；无折叠轮的 run 也不带 folded 键', () => {
+  const anchors = [
+    message('folded-own-answer', 1, 'assistant', 'stale anchor text', RUN_1),
+    message('plain-answer', 2, 'assistant', 'stale anchor text', RUN_2),
+  ];
+  const transcriptRows = [
+    transcript(4, `${RUN_1}:engine:round:4`, {
+      dedupKey: `${RUN_1}:engine:round:4`,
+      folded: true,
+      foldedRoundRange: { from: 1, to: 3 },
+      foldedPayload: [{ role: 'user', content: text('raw') }],
+      response: { content: text('historical answer of the folded round'), stopReason: 'end_turn' },
+    }, at(1), RUN_1),
+    transcript(5, `${RUN_2}:engine:round:5`, {
+      dedupKey: `${RUN_2}:engine:round:5`,
+      response: { content: text('plain answer'), stopReason: 'end_turn' },
+    }, at(2), RUN_2),
+  ];
+
+  const projection = projectSessionMessages({ sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows });
+
+  assert.equal(projection[0].content, 'historical answer of the folded round');
+  assert.equal('folded' in projection[0], false, '正文来自该轮自身答复（未命中折叠兜底分支）→ 不写 folded 键');
+  assert.equal(projection[1].content, 'plain answer');
+  assert.equal('folded' in projection[1], false, '无折叠轮的 run 不带 folded 键');
+});

@@ -518,6 +518,12 @@ async function routeApi(req, res, ctx, url) {
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events\/history$/.test(pathname)) {
     return handleSessionEventsHistory(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events\/history$/)[1]));
   }
+  // issue #189：折叠原文只读端点 GET /api/sessions/:id/folded/:round（鉴权/错误映射同 events/history：
+  // 非属主/不存在 404 不泄露存在性；payload 缺失 404 folded_payload_not_found 由 SessionError 链路透传）。
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/folded\/(\d+)$/.test(pathname)) {
+    const foldedMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/folded\/(\d+)$/);
+    return handleSessionFoldedPayload(req, res, ctx, decodeUuid(foldedMatch[1]), Number(foldedMatch[2]));
+  }
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events$/.test(pathname)) {
     return handleSessionStream(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
   }
@@ -1196,6 +1202,17 @@ function truncateHistoryPayload(value, depth = 0) {
     return out;
   }
   return value;
+}
+
+/**
+ * issue #189：GET /api/sessions/:id/folded/:round —— 折叠原文只读端点。
+ * 鉴权同 GET /api/sessions/:id（属主校验在 sessions.getFoldedPayload 内的 fetchSession，
+ * 404 不泄露存在性）；SessionError（含 404 folded_payload_not_found）由顶层统一错误映射转发。
+ */
+async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
+  const session = await requireSession(req, ctx);
+  const result = await sessions.getFoldedPayload(ctx.pool, { userId: session.user.id, sessionId, round });
+  return sendJson(res, 200, result);
 }
 
 async function handleSessionEventsHistory(req, res, ctx, sessionId) {
