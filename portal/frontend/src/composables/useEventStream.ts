@@ -59,6 +59,12 @@ export interface ToolCardState {
   // issue #85：tool_result 的 duration_ms 原值（可选，tool_result 回填），卡片头部耗时显示用；
   // out 文案的拼接语义不变。
   dur?: number;
+  // issue #188：DTO 投影来源的卡片字段（加载/刷新路径）——直接透传上游 `toolCalls[]` 同名键，
+  // 事件流路径不填。argsSummary = 上游 120 字参数摘要；resultPreview = 上游 400 字结果预览；
+  // executionStatus = 上游执行状态串。全文在 DTO `blocks` 里（不在卡片展开区重建）。
+  argsSummary?: string;
+  resultPreview?: string;
+  executionStatus?: string;
 }
 
 export interface RunEndPayload {
@@ -136,6 +142,44 @@ export function useEventStream(hooks: EventStreamHooks) {
     toolCards.set(callId, card);
     hooks.onToolCardCreated(callId);
     return card;
+  }
+
+  /**
+   * issue #188：DTO 投影工具卡片登记（加载/刷新路径）。与实时/历史事件路径**共用同一** `toolCards`
+   * Map 与 `onToolCardCreated` 占位 → 两条路收敛到 StreamPanel 同一渲染；同一 callId 幂等
+   * （事件流先建时只补全投影才有的字段，不重复占位）。callId 由宿主给出：优先上游 provider `id`
+   *（与实时 `tool_call_id` 同源 → 天然归并），缺失时用宿主合成的稳定键（见 workbench.ts，上游 #100）。
+   */
+  function projectToolCard(callId: string, fields: {
+    name: string;
+    argsSummary?: string;
+    resultPreview?: string;
+    isError?: boolean;
+    executionStatus?: string;
+  }): void {
+    const existing = toolCards.get(callId);
+    if (existing) {
+      // 事件流先建：只补投影才有的摘要/预览/状态，不覆盖实时路径已有的完整数据。
+      if (fields.argsSummary !== undefined && existing.argsSummary === undefined) existing.argsSummary = fields.argsSummary;
+      if (fields.resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = fields.resultPreview;
+      if (fields.executionStatus !== undefined && existing.executionStatus === undefined) existing.executionStatus = fields.executionStatus;
+      if (existing.ok === null && (fields.isError !== undefined || fields.resultPreview !== undefined || fields.executionStatus !== undefined)) {
+        existing.ok = fields.isError !== true;
+      }
+      return;
+    }
+    const hasResult = fields.isError !== undefined || fields.resultPreview !== undefined || fields.executionStatus !== undefined;
+    toolCards.set(callId, {
+      name: fields.name,
+      dig: fields.argsSummary ?? '',
+      args: '',
+      ok: hasResult ? fields.isError !== true : null,
+      out: '',
+      argsSummary: fields.argsSummary,
+      resultPreview: fields.resultPreview,
+      executionStatus: fields.executionStatus,
+    });
+    hooks.onToolCardCreated(callId);
   }
 
   function handleEvent(type: string, e: MessageEvent) {
@@ -302,7 +346,7 @@ export function useEventStream(hooks: EventStreamHooks) {
     lastSeq, esSessionId, activeRunId, deltaText, toolCards,
     connect, closeEs, resetStreamState,
     // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）；
-    // replayEvent 供 openSession 历史归并回放驱动（issue #89）。
-    handleEvent, toolCard, replayEvent,
+    // replayEvent 供 openSession 历史归并回放驱动（issue #89）；projectToolCard 供 DTO 投影路径（#188）。
+    handleEvent, toolCard, replayEvent, projectToolCard,
   };
 }

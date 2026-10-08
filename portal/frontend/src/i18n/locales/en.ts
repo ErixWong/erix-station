@@ -81,6 +81,7 @@ export const en = {
     chooseOrNewSession: 'Select or create a session',
     argsPending: '(generating arguments…)',
     argsStreaming: '(arguments streaming…)',
+    reasoning: 'Reasoning',
     event: {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',

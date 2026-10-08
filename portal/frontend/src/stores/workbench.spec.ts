@@ -637,3 +637,118 @@ describe('workbench store · renameSession（issue #107）', () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe('issue #188：DTO 投影字段（toolCalls/reasoning/blocks）加载路径渲染', () => {
+  it('仅凭 DTO（无事件）也能渲染工具卡片与推理块；toolCalls 排在正文气泡前', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            messages: [
+              { id: 'm1', role: 'user', content: '任务', seq: 1 },
+              {
+                id: 'm2',
+                role: 'assistant',
+                content: '完成',
+                seq: 2,
+                reasoning: '先看文件\n再看结果',
+                toolCalls: [{
+                  name: 'read', id: 'c1', argsSummary: 'path=src/a.js',
+                  resultPreview: 'FILE BODY', isError: false, executionStatus: 'succeeded',
+                }],
+                blocks: [{ type: 'tool_use', id: 'c1', name: 'read' }],
+              },
+            ],
+            last_seq: 2,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+
+    expect(store.entries.map((e) => e.kind)).toEqual(['msg', 'reasoning', 'tool', 'msg']);
+    const card = store.es.toolCards.get('c1');
+    expect(card?.name).toBe('read');
+    expect(card?.argsSummary).toBe('path=src/a.js');
+    expect(card?.resultPreview).toBe('FILE BODY');
+    expect(card?.executionStatus).toBe('succeeded');
+    expect(card?.ok).toBe(true);
+    const reasoning = store.entries.find((e) => e.kind === 'reasoning');
+    expect(reasoning && 'text' in reasoning ? reasoning.text : '').toBe('先看文件\n再看结果');
+  });
+
+  it('同一 tool 调用（DTO 投影 + 历史事件）只渲染一张卡片（按 provider id 幂等归并）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) {
+        return {
+          status: 200,
+          body: {
+            events: [
+              { seq: 2, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'read', input: { path: 'src/a.js' } } },
+              { seq: 3, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: true, result_digest: 'ok', duration_ms: 5 } },
+            ],
+            next_cursor: null,
+          },
+        };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            messages: [
+              { id: 'm1', role: 'user', content: '任务', seq: 1 },
+              {
+                id: 'm2', role: 'assistant', content: '完成', seq: 4,
+                toolCalls: [{ name: 'read', id: 'c1', argsSummary: 'path=src/a.js' }],
+              },
+            ],
+            last_seq: 4,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+
+    expect(store.entries.filter((e) => e.kind === 'tool').length).toBe(1);
+    // 事件流先建卡片：完整 args 保留，投影只补全缺失字段
+    expect(store.es.toolCards.get('c1')?.args).toBe('{"path":"src/a.js"}');
+    expect(store.es.toolCards.get('c1')?.argsSummary).toBe('path=src/a.js');
+  });
+
+  it('provider id 缺失时回退到「锚点消息 id + 投影内块序号」稳定键（上游 #100）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            messages: [
+              { id: 'm1', role: 'user', content: '任务', seq: 1 },
+              {
+                id: 'm2', role: 'assistant', content: '完成', seq: 2,
+                toolCalls: [{ name: 'a', argsSummary: 'x=1' }, { name: 'b', argsSummary: 'y=2' }],
+              },
+            ],
+            last_seq: 2,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+
+    expect(store.entries.filter((e) => e.kind === 'tool').length).toBe(2);
+    expect(store.es.toolCards.has('proj:m2:0')).toBe(true);
+    expect(store.es.toolCards.has('proj:m2:1')).toBe(true);
+  });
+});
