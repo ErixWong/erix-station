@@ -297,16 +297,22 @@ async function tryClaim(pool, { container, user, capacity, now = new Date(), bas
 const claimWaiters = new Map(); // userId -> Set<wake fn>
 const sseClients = new Map(); // containerId -> { userId, res }
 
-function waitForWakeup(userId, deadlineMs) {
+// issue #180：`signal` 用于「客户端在响应写出前断开」时提前结束等待——否则旧 agentd 的悬挂请求会
+// 在 reaper 重排队唤醒的瞬间为死连接领走 ticket（attempts+1、占租约），直到 90s 自然到期才恢复。
+// signal 已在等待前 abort 也立即 resolve（不注册 waiter）。注册/清理语义不变，无泄漏。
+function waitForWakeup(userId, deadlineMs, signal) {
   return new Promise((resolve) => {
     const remaining = deadlineMs - Date.now();
-    if (remaining <= 0) return resolve();
+    if (remaining <= 0 || signal?.aborted) return resolve();
     let settled = false;
     const timer = setTimeout(() => finish(), remaining);
-    const wake = () => { clearTimeout(timer); finish(); };
+    const wake = () => finish();
+    const onAbort = () => finish();
     function finish() {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
       const set = claimWaiters.get(userId);
       if (set) {
         set.delete(wake);
@@ -314,6 +320,7 @@ function waitForWakeup(userId, deadlineMs) {
       }
       resolve();
     }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
     let set = claimWaiters.get(userId);
     if (!set) {
       set = new Set();
@@ -484,7 +491,7 @@ export function hubStats() {
 // ---------------------------------------------------------------------------
 
 export async function claimRun(pool, {
-  container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), baseDomain, log = console,
+  container, user, capacity = 1, holdMs = HOLD_MS_MAX, now = new Date(), baseDomain, log = console, signal,
 } = {}) {
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 64) {
     throw new InternalError(400, 'validation_failed', 'capacity 越界（1..64）', { details: { field: 'capacity' } });
@@ -499,14 +506,50 @@ export async function claimRun(pool, {
     return ticket;
   }
 
+  // issue #180：客户端（agentd）已断开时不再进入/继续长轮询——为死连接领 ticket 会白耗一次 attempt。
+  if (signal?.aborted) return null;
   const deadline = Date.now() + holdMs;
-  await waitForWakeup(user.id, deadline);
+  await waitForWakeup(user.id, deadline, signal);
+  // 等待被 abort 中断（客户端断开）→ 不 tryClaim（否则 attempts+1、占租约，响应却写向死连接）。
+  if (signal?.aborted) return null;
   const retry = await tryClaim(pool, { container, user, capacity, now, baseDomain, log });
   if (retry) {
     await audit(pool, { actorId: user.id, action: 'run.claim', target: retry.run.id, details: { attempt: retry.run.attempt } }).catch(() => {});
     return retry;
   }
   return null;
+}
+
+/**
+ * issue #180：claim 已提交但 ticket 未能送达 worker（客户端在响应写出前断开）→ 释放认领并把 attempt 还回去。
+ *
+ * 与 `releaseRun` 的区别（**不要复用**）：`releaseRun` 是 agentd 主动上报路径（claim 已送达、worker 失败），
+ * 需要完整 body/reason 校验、且**不还 attempt**；本函数只处理「ticket 从未送达任何 worker」的孤儿认领。
+ *
+ * 语义：
+ *  - 仅当 `claim_token` 匹配且 `status='claimed'` 才生效；否则静默 no-op（不踩已被别人重领/收敛的行）。
+ *  - 回到 `pending`、清 `claimed_at`/`lease_until`/`owner_container_id`/`claim_token`；
+ *    `attempts = GREATEST(attempts - 1, 0)`（未送达即不消耗重试预算；schema 的 `CHECK (attempts <= max_attempts)`
+ *    只约束上界，递减方向不冲突）。
+ *  - 记 warn 日志（run_id/attempts），便于运维观察孤儿认领频次。
+ */
+export async function releaseUndeliveredClaim(pool, { runId, claimToken, log = console } = {}) {
+  const updated = await pool.query(
+    `UPDATE run_queue
+        SET status = 'pending',
+            claimed_at = NULL,
+            lease_until = NULL,
+            owner_container_id = NULL,
+            claim_token = NULL,
+            attempts = GREATEST(attempts - 1, 0)
+      WHERE run_id = $1 AND claim_token = $2 AND status = 'claimed'
+      RETURNING attempts, max_attempts`,
+    [runId, claimToken],
+  );
+  const row = updated.rows?.[0];
+  if (!row) return { released: false };
+  log?.warn?.(`[internal] released undelivered claim (client gone before response): run_id=${runId} attempts=${row.attempts}/${row.max_attempts}`);
+  return { released: true, attempts: Number(row.attempts) };
 }
 
 // ---------------------------------------------------------------------------
