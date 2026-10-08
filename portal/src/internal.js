@@ -1635,7 +1635,7 @@ function sleepReaper(ms) {
  * 单次 reaper 扫描：把 lease_until 过期的 claimed 行按矩阵收敛。
  *   ① cancelling（用户已 stop 但容器死）→ queue cancelled + runs finished（aborted，A2）；
  *   ② attempts >= max_attempts → queue done + runs failed(max_attempts_exceeded)（A1 耗尽）；
- *   ③ attempts < max_attempts → 回 pending（attempts 不变，claim 时已 +1）。
+ *   ③ attempts < max_attempts → 回 pending（attempts 不变，claim 时已 +1）；**runs.status 不变**（#207 选 A，A5 口径，与 U12 release 对齐）。
  * 终态分支（①/②）同事务合成 run_end（F3 口径，runner §7.6）。
  * @returns {Array<{run_id, outcome, run_status}>}
  */
@@ -1700,9 +1700,9 @@ export async function reapExpiredRuns(pool) {
         committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
         results.push({ run_id: runId, outcome: 'failed_max_attempts', run_status: 'failed' });
       } else {
+        // #207 选 A：requeue 不回写 runs.status（A5：attempt 级失败不动状态）；认领 SQL 按 queued/running 一起筛，不依赖回写。
         await client.query(`UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
-        await client.query(`UPDATE runs SET status='queued' WHERE id=$1`, [runId]);
-        results.push({ run_id: runId, outcome: 'requeued', run_status: 'queued' });
+        results.push({ run_id: runId, outcome: 'requeued', run_status: r.status });
       }
       await client.query('COMMIT');
       try {

@@ -673,7 +673,8 @@ test('F2：reaper 收敛——过期 claimed 行按矩阵（requeue/耗尽/cance
   const ra = await reapExpiredRuns(a.pool);
   assert.equal(ra[0].outcome, 'requeued');
   assert.equal(a.pool.queue[0].status, 'pending');
-  assert.equal(a.pool.runs[0].status, 'queued');
+  assert.equal(ra[0].run_status, 'running', '#207/A：响应 run_status = 实际 runs.status（不回写 queued）');
+  assert.equal(a.pool.runs[0].status, 'running', '#207/A：reaper requeue 不回跳 runs.status（A5，与 U12 口径一致）');
   assert.equal(a.pool.queue[0].attempts, 1, 'reaper 回 pending 不递增 attempts');
 
   // ② attempts >= max → done + failed(max_attempts_exceeded) + run_end
