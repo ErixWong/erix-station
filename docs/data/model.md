@@ -119,6 +119,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 见 §3 边界说明。要点：`role` 仅 `user / assistant`；`synthetic` 默认 `false`，judge/wrapup 注入的合成消息置 `true`，**UI 必须显著标记**（规格 §9.2 红线）；`seq` 与 `run_events` 共用 `chat_sessions.last_seq` 分配器，`UNIQUE(session_id, seq)`；`run_id` 关联产生它的 run（用户消息 = 它触发的 run）。
 
+> **`content` 列语义（P3 PR②b B2，conversation-state.md §6）**：本表已降级为**纯锚点行**——两个写入点（POST 用户行 / 终态 assistant 行）的 `content` 恒写空串（列仍是 `text NOT NULL`，baseline `schema.sql` 冻结不改），正文单一来源是 `transcript_rounds.record`（UI 文本由官方展示投影派生）。因此 `content` **只对两类行有意义**：`synthetic = true` 的宿主注入行（judge/wrapup，transcript 里无对应轮次，正文只能落在本列）与迁移 0015/B2 之前的 **legacy 老行**（仅供 `portal/src/session-text.js` 的 legacy 兜底读）。上表「内容」列描述的仍是**人读层的语义归属**（本行代表哪段对话），而非正文的物理存储位置。
+
 ### 1.9 `port_allocations` — 端口分配（DB 是真相，规格 §8.1）
 
 | 关键字段 | 语义 |

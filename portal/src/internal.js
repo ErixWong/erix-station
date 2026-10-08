@@ -690,12 +690,20 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
     );
 
     // 回写 assistant 消息（人看的对话层，§9.6）。
+    // P3 PR②b B2（docs/design/conversation-state.md §6）：**停止正文双写**——`messages` 降级为纯锚点行。
+    // `finalText` 的前置条件保持不变（它决定「是否产生一条 assistant 锚点」，无终态文本就不建行），
+    // 但写入的 `content` 恒为空串：终态正文的真相在 `transcript_rounds`（引擎落树），读侧
+    // （`session-view.js` / `session-text.fetchRunAssistantText`）由投影派生，新行不再依赖本列。
+    // 列是 `text NOT NULL`（不改 DDL），故写 `''`。
+    // 前瞻性例外（当前无此类写入点，约束先钉住）：**合成行（`synthetic = true`，judge/wrapup 等宿主
+    // 注入）必须继续写正文**——它在 transcript 里没有对应轮次，读侧只能取锚点自身文本
+    // （`session-view.js` 的 `anchor.synthetic === true` 分支）。本路径写的恒是 `synthetic = false`。
     if (typeof finalText === 'string' && finalText.length > 0) {
       const seq = await allocSeq(client, r.session_id);
       await client.query(
         `INSERT INTO messages (session_id, run_id, seq, role, content, synthetic)
-         VALUES ($1, $2, $3, 'assistant', $4, false)`,
-        [r.session_id, runId, seq, finalText],
+         VALUES ($1, $2, $3, 'assistant', '', false)`,
+        [r.session_id, runId, seq],
       );
     }
 

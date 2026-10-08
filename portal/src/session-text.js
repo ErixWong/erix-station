@@ -8,13 +8,17 @@
 // `projectTranscriptForDisplay`，并用 `recordForProjection` 把 `dedup_key` 列合成进 record）派生——
 // 与 `GET /api/sessions/:id` 对话流**同一口径**，同一轮文本在两处必然一致。
 //
-// legacy 兜底（红线）：仅当**投影对该锚点无证据**（投影输出空文本）时，才最小回退 `messages.content`
-// （迁移 0015 之前入档、既无 `:input:` 行也无历史快照的老行）。**legacy-only，不用于新会话**：
-// 0015 之后的会话恒有 transcript 证据，不会走到这条兜底；下一单停写 `messages.content` 时本兜底一并退役。
+// legacy 兜底（红线）：仅当**投影对该锚点无证据**（投影输出空文本）时，才最小回退 `messages.content`。
+// P3 PR②b B2 已生效（停写 `messages.content`）：**两个写入点的新行 content 恒为空串**，
+// 所以本兜底**只对老数据有意义**（迁移 0015 之前入档、正文仍留在 `messages.content` 的行）——
+// 新会话恒有 transcript 证据，不会走到兜底（即使走到也只是空串）。**不得删除**：删了老会话就地丢正文。
+// 例外：`synthetic = true` 的锚点行（judge/wrapup 等宿主注入）在 transcript 里没有对应轮次，
+// 其**正文本就应写在 `messages.content`**（故 SQL 用 `CASE WHEN synthetic THEN content END`），不参与兜底语义。
 import { projectTranscriptForDisplay } from 'erix-agent';
 import { projectSessionMessages, recordForProjection, userTurnTexts } from './session-view.js';
 
-/** 锚点列集：展示元数据取自 `messages`，正文取自投影；`legacy_content` 只服务于 legacy 兜底。 */
+/** 锚点列集：展示元数据取自 `messages`，正文取自投影；`legacy_content` 只服务于 legacy 兜底
+ * （P3 PR②b B2 后新行恒为空串，故只对迁移 0015 之前的老行有意义）。 */
 const ANCHOR_COLUMNS = `id, run_id, seq, role, synthetic, attachments, created_at,
               CASE WHEN synthetic THEN content END AS content,
               content AS legacy_content`;
