@@ -234,10 +234,24 @@ function postMessageClient({
       }
       if (s.startsWith('SELECT round, dedup_key, record')) {
         // session transcript store 适配器 load(key)：按 transcript_key 取权威列，引擎侧推导 round/幂等。
+        // 0.17.0 快路径（#193）下 appendUserTurn 不再走这里（只给回退路径与读侧镜像保留）。
         const rows = state.transcriptRows
           .filter((row) => row.transcriptKey === params[0])
           .map((row) => ({ round: row.round, dedup_key: row.dedupKey, record: row.record ?? null }));
         return { rows };
+      }
+      // 0.17.0 成对快路径探针（#193）：仍然只能出现在**同一事务 client** 的流水里。
+      if (s.startsWith('SELECT record FROM transcript_rounds')) {
+        const hit = state.transcriptRows.find(
+          (row) => row.transcriptKey === params[0] && row.dedupKey === params[1],
+        );
+        return { rows: hit?.record != null ? [{ record: hit.record }] : [] };
+      }
+      if (s.startsWith('SELECT MAX(round)')) {
+        const rounds = state.transcriptRows
+          .filter((row) => row.transcriptKey === params[0])
+          .map((row) => Number(row.round));
+        return { rows: [{ max_round: rounds.length === 0 ? null : Math.max(...rounds) }] };
       }
       if (s.startsWith('INSERT INTO transcript_rounds')) {
         state.transcriptInsertAttempts += 1;
@@ -313,18 +327,23 @@ test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 trans
   });
   const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
   const messageInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO messages'));
+  // 0.17.0 快路径（#193）：store 在事务内的读点 = dedupKey 点查 + MAX(round) 两点查，全量 load 不再出现。
+  const storeProbe = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT record FROM transcript_rounds'));
   const storeLoad = order.findIndex(({ sql }) => normalize(sql).startsWith('SELECT round, dedup_key, record'));
   const transcriptInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO transcript_rounds'));
   const runQueueInsert = order.findIndex(({ sql }) => normalize(sql).startsWith('INSERT INTO run_queue'));
   const begin = order.findIndex(({ sql }) => sql === 'BEGIN');
   const commit = order.findIndex(({ sql }) => sql === 'COMMIT');
 
-  assert.ok(begin < messageInsert && messageInsert < storeLoad && storeLoad < transcriptInsert);
+  assert.ok(begin < messageInsert && messageInsert < storeProbe && storeProbe < transcriptInsert);
   assert.ok(transcriptInsert < runQueueInsert && runQueueInsert < commit, 'transcript INSERT 位于入队之前且同属提交事务');
   assert.ok(begin < transcriptInsert && transcriptInsert < commit);
   // 预写与读取都只用传入的事务 client（同一连接：order 是单 client 的流水）。
-  assert.equal(order.filter(({ sql }) => normalize(sql).startsWith('SELECT round, dedup_key, record')).length, 1,
-    'appendUserTurn 只 load 一次，且与业务写入同一事务连接');
+  assert.equal(storeLoad, -1, '0.17.0 成对探针已接入 → 事务内不得再出现全量 load SELECT');
+  assert.equal(order.filter(({ sql }) => normalize(sql).startsWith('SELECT record FROM transcript_rounds')).length, 1,
+    'appendUserTurn 只点查一次，且与业务写入同一事务连接');
+  assert.equal(order.filter(({ sql }) => normalize(sql).startsWith('SELECT MAX(round)')).length, 1,
+    '未命中后取一次 MAX(round)');
   assert.equal(state.transcriptRows.length, 4);
   assert.equal(posted.run.status, 'queued');
 
@@ -332,7 +351,8 @@ test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 trans
   const sql = normalize(insert.sql);
   assert.match(sql, /VALUES \(NULL, \$1, \$2, \$3, \$4, false, \$5, NULL\)/);
   assert.match(sql, /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/);
-  assert.deepEqual(order[storeLoad].params, [PM_SESSION_ID], 'load 只取本 session key 的轮记录');
+  assert.deepEqual(order[storeProbe].params, [PM_SESSION_ID, `${PM_SESSION_ID}:input:m1`],
+    '点查只取本 session key + 该 messageId 的 dedupKey');
   assert.deepEqual(insert.params.slice(0, 3), [PM_SESSION_ID, `${PM_SESSION_ID}:input:m1`, 7]);
   const userMessageInsert = order[messageInsert];
   // P3 PR②b B2（写入点①）：用户行的 `content` 恒为空串字面量（正文不再写进 messages），
@@ -354,7 +374,7 @@ test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 trans
   assert.equal(typeof record.ts, 'string');
   assert.equal(new Date(record.ts).toISOString(), record.ts);
   assert.deepEqual(JSON.parse(insert.params[4]), expectedMessages);
-  assert.equal(state.transcriptRows.at(-1).round, 7, 'round 由引擎 appendUserTurn 从 load 结果复用现有 max(round)');
+  assert.equal(state.transcriptRows.at(-1).round, 7, 'round 由引擎 appendUserTurn 从 loadMaxRound 结果复用现有 max(round)');
 });
 
 test('P3 PR②a：重放相同 transcript INSERT 时，部分唯一冲突使 transcript 只保留一行', async () => {
@@ -376,7 +396,7 @@ test('P3 PR②a：重放相同 transcript INSERT 时，部分唯一冲突使 tra
     .every(({ sql }) => /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/.test(sql)));
 });
 
-test('0.15.0 appendUserTurn：load 命中同 dedupKey 时引擎直接判幂等，不再发起第二笔 INSERT', async () => {
+test('0.17.0 appendUserTurn：点查命中同 dedupKey 时引擎直接判幂等，不再发第二笔 INSERT、也不再取 MAX(round)', async () => {
   // 崩溃重跑/顺序重放语义：同 messageId 的预写在 store 已有同 dedupKey 记录时 written=false，
   // 引擎不发 appendRound（DB 的 ON CONFLICT 只作并发防线，不再是幂等主判据）。
   const { pool, order, state } = postMessageClient();
@@ -390,8 +410,10 @@ test('0.15.0 appendUserTurn：load 命中同 dedupKey 时引擎直接判幂等�
 
   assert.equal(state.transcriptInsertAttempts, 1, '第二次 postMessage 因 appendUserTurn 幂等判据命中，不发起 INSERT');
   assert.equal(state.transcriptRows.length, 1);
-  const loads = order.filter(({ sql }) => sql.replace(/\s+/g, ' ').trim().startsWith('SELECT round, dedup_key, record'));
-  assert.equal(loads.length, 2, '两次调用各 load 一次（幂等判据读自同一事务内的 load）');
+  const n = (prefix) => order.filter(({ sql }) => sql.replace(/\s+/g, ' ').trim().startsWith(prefix)).length;
+  assert.equal(n('SELECT record FROM transcript_rounds'), 2, '两次调用各点查一次（幂等判据读自同一事务连接）');
+  assert.equal(n('SELECT MAX(round)'), 1, '第二次点查即命中→不再取 MAX(round)');
+  assert.equal(n('SELECT round, dedup_key, record'), 0, '全程零全量 load');
 });
 
 test('0.15.0 appendUserTurn：空 transcript 首轮预写 round=0，有历史轮时复用现有最大 round（不 +1）', async () => {
