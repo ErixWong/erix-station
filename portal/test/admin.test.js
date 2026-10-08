@@ -709,6 +709,38 @@ test('admin 用户管理：email / fde_name 必填校验与重复 login、email 
   }
 });
 
+// #202：FDE 名 57..63 字符会使预览域名首标签（<fde>-p-<port4>）超过 DNS 单标签上限 63。
+// 开户（POST /api/admin/users）必须当场 400 且文案可操作，而不是事后「预览打不开」。
+test('admin 用户管理：FDE 名超长（预览域名预算 56）开户即 400，≤56 正常建号（#202）', async () => {
+  const { base, cookie, close } = await startAdminServer();
+  try {
+    const H = { cookie, 'content-type': 'application/json' };
+    const fields = { git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM, password: 'whatever-1', email: 'long@example.test' };
+    // 57 字符：首标签 64 > 63 → 400，错误信息含实际长度与「缩短到 56 以内」口径。
+    let res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'longname', fde_name: 'a'.repeat(57) }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.code, 'validation_failed');
+    assert.equal(body.error.details.field, 'fde_name');
+    assert.match(body.error.message, /FDE 名过长/);
+    assert.match(body.error.message, /64 字符/);
+    assert.match(body.error.message, /超过 DNS 上限 63/);
+    assert.match(body.error.message, /缩短到 56 以内/);
+    // 56 字符（预算内，首标签恰 63）→ 正常建号 201。
+    res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ ...fields, login: 'maxname', email: 'max@example.test', fde_name: 'b'.repeat(56) }),
+    });
+    assert.equal(res.status, 201);
+    assert.equal((await res.json()).user.fde_name, 'b'.repeat(56));
+  } finally {
+    await close();
+  }
+});
+
 test('admin 用户管理：开户重试只重排 failed，running 返回 409，未知用户返回 404', async () => {
   const { base, cookie, pool, close } = await startAdminServer();
   try {

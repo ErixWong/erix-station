@@ -179,7 +179,7 @@ docker network: fde-bob    ← ...（10.200.2.0/29）
 
 | 坑 | 解法 |
 |---|---|
-| **SameSite 打死 iframe**：portal 在 `station.a.com`、预览在 `b.com` → cross-site → iframe 里 cookie 不发送，预览显示登录页 | **把 FDE 页面放在与 portal 同一 registrable domain 下**：portal = `station.<base>`，预览 = `alice-p-proj1-4000.fde.<base>`。同 site → `SameSite=Lax` 在 iframe 内正常发送。⚠️ **P1 预览凭证不再是 portal session cookie**：portal 签发一次性 ticket，forwardAuth 换取**预览 host 的 host-only 预览 cookie**（portal session cookie 为 host-only、绝不发到预览域）——同 registrable domain 布局仍保留，是为让「预览 host 自己的 cookie」在 iframe 内为 same-site；细节见 [portal.md](../api/portal.md) §2.5/§2.7/§2.8 |
+| **SameSite 打死 iframe**：portal 在 `station.a.com`、预览在 `b.com` → cross-site → iframe 里 cookie 不发送，预览显示登录页 | **把 FDE 页面放在与 portal 同一 registrable domain 下**：portal = `station.<base>`，预览 = `alice-p-4000.fde.<base>`。同 site → `SameSite=Lax` 在 iframe 内正常发送。⚠️ **P1 预览凭证不再是 portal session cookie**：portal 签发一次性 ticket，forwardAuth 换取**预览 host 的 host-only 预览 cookie**（portal session cookie 为 host-only、绝不发到预览域）——同 registrable domain 布局仍保留，是为让「预览 host 自己的 cookie」在 iframe 内为 same-site；细节见 [portal.md](../api/portal.md) §2.5/§2.7/§2.8 |
 | CSP / 缓存 / Referer 泄漏 | `Content-Security-Policy: frame-ancestors https://station.<base>`；`Cache-Control: private, no-store`；`Referrer-Policy: no-referrer` |
 
 ### 6.4 Traefik 骨架（H-B，决策者 2026-09 定稿，issue #5）
@@ -221,12 +221,12 @@ http:
     # 预览：每 allocation 一条 router + 一条 service（Host 精确匹配，各自独立 priority）。
     # 否决原「单条 HostRegexp + service: fde-dynamic」的「零 per-port 配置」方案——
     # 单 service 无法表达 per-allocation 的后端地址与生命周期（issue #9，topology.md §5）
-    fde-alice-4000:
-      rule: "Host(`alice-p-proj1-4000.fde.<base>`)"
+    fde-alice-p-4000:
+      rule: "Host(`alice-p-4000.fde.<base>`)"
       entryPoints: [websecure]
       priority: 200
       middlewares: [fde-auth, strip-cookie]
-      service: fde-alice-4000
+      service: fde-alice-p-4000
     # LLM 注入：每 FDE 一条 router + 一条 headers middleware（各自独立 priority）；
     # 身份来自网络来源（ClientIP），非自报；禁止写无 ClientIP 条件的兜底路由（无匹配 404 = 默认拒绝）
     # （issue #117 phase 2：按 fde_llm_bindings 逐 binding 注入 LiteLLM virtual key；
@@ -361,7 +361,7 @@ DB: port_allocations（权威，唯一写入口）
 reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router+service，§6.4）
         │ portal 单向写出（直写宿主 bind mount，D-6/issue #7，无需容器网络可达；契约见 user-space.md）
         ▼
-容器内 ~/projects/<project>/.erix/ports.json（agent 只读，永不写）
+容器内 ~/.erix/ports.json（FDE 级单一文件，P5 去项目化，directory-as-project §3；agent 只读，永不写）
 ```
 
 **为什么 DB 是真相**：URL 与 Traefik 路由必须同源（不一致 = 502 的来源）；主机/portal/Traefik 重启后由 reconciler 凭 DB 全量重建全部 JSON + 路由（自愈，topology.md §8）；并发申请靠唯一约束 + 事务；谁在用、何时回收、给谁看过只有 DB 装得下。
@@ -388,7 +388,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 ### 8.3 `ports.json` 结构
 
-> **canonical schema 以 [`user-space.md`](user-space.md) §4.3.1 为准**（含 `schema`/`generation` 包裹与 `state` 字段）；下方仅为字段语义示意。字段名用 snake_case，`run_id` 恒为 run UUID（run-tok 只出现在 hostname/url 里）。
+> **canonical schema 以 [`user-space.md`](user-space.md) §4.3.1 为准**（含 `schema`/`generation` 包裹与 `state` 字段）；下方仅为字段语义示意。字段名用 snake_case，`run_id` 恒为 run UUID（P5 后 hostname/url 不再含项目名段/run-tok，统一 `<fde>-p-<port4>`，§8.5）。
 
 ```json
 {
@@ -398,9 +398,9 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
   "fde": "alice",
   "allocations": [
     { "scope": "project", "port": 4000, "role": "frontend", "run_id": null, "state": "allocated",
-      "url": "https://alice-p-proj1-4000.fde.erix.vip", "exposure": "private" },
+      "url": "https://alice-p-4000.fde.erix.vip", "exposure": "private" },
     { "scope": "run", "port": 4001, "role": "backend", "run_id": "6f1c2a34-9b8e-4f2d-a1c5-7d8e0f1a2b3c", "state": "allocated",
-      "url": "https://alice-r3a7fq-4001.fde.erix.vip", "exposure": "private" }
+      "url": "https://alice-p-4001.fde.erix.vip", "exposure": "private" }
   ]
 }
 ```
@@ -410,35 +410,29 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 1. 端口一律从 `.erix/ports.json` 取，**不要自己挑**
 2. dev server 必须绑 **`0.0.0.0`**（容器内）——与常规安全建议相反，因为容器网络私有且只有 ingress 能进；绑 `127.0.0.1` 会导致 ingress 够不着
 
-### 8.5 hostname grammar 与 `<tok>` 生成（写死）
+### 8.5 hostname grammar（写死；P5 去项目化后无项目名段）
 
-> **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
-> **总长约束（DNS 标签安全的前提）**：首标签 = `<fde>"-"<tok>"-"<port>`，DNS 标签上限 63 字符——portal 生成前必须校验 `<fde>` + `<tok>` 段总长 ≤ 57（63 − 2 个分隔符 − 4 位端口）；schema 层字符集 CHECK 不校验长度组合，应用层强制（含不得以 `-` 开头/结尾）。
+> **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」；实现唯一入口 `portal/src/projects.js` `buildHostname`），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
+> **长度约束（DNS 标签安全的前提，#202 如实写）**：单标签上限 **63** 字符、整域名 ≤ **253**（RFC 1035）。首标签 `<fde>-p-<port4>` 的固定段（`-p-` + 恒 4 位端口）占 7 字符 ⇒ **FDE 名参与预览域名的预算 = 56**（旧文档的「项目名段 / 最长 134」形态已随 P5 去项目化作废，存量 hostname 由迁移 0008 重写）。
+> **强制点（三层，同一口径逐标签 ≤63 + 总长 ≤253）**：① 开户即 400（`admin.js createUser` → `projects.validateFdeNameForHostname`，对**最终 hostname** 整体校验，错误文案含实际长度与「缩短到 56 以内」）；② 路由生成 fail-closed（`routes.js isValidHostname`）；③ DB 兜底 CHECK（迁移 **0017**，整域名正则，NOT VALID）。FDE_NAME_RE（≤63）本身不改：目录名/容器名/git-credential 路径不受 DNS 标签约束，57..63 字符在那些路径仍合法。
 
 **grammar**（小写、DNS 标签安全）：
 
 ```
-hostname       := <fde> "-" <tok> "-" <port> "." "fde" "." <base>
-<fde>          := [a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?   -- users.fde_name，小写（同 schema.sql CHECK）
-<tok>          := <project-tok> | <run-tok>
-<project-tok>  := "p-" <project-name>              -- project-name = [a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?（schema CHECK）
-<run-tok>      := "r" <runid-short>                -- runid-short = [a-z0-9]{5,8}
-<port>         := [0-9]{4}                          -- 恒 4 位（4000..4999）
+hostname := <fde> "-p-" <port4> "." "fde" "." <base>
+<fde>    := [a-z0-9]([a-z0-9-]{0,54}[a-z0-9])?   -- users.fde_name；字符集同 schema.sql CHECK，预览域名长度预算 ≤56（见上）
+<port4>  := [0-9]{4}                              -- 恒 4 位（4000..4999，零填充）→ 首标签长度与端口取值无关
 ```
 
 | 段 | 字符集 | 长度 | 生成规则 |
 |---|---|---|---|
-| `<fde>` | `[a-z0-9-]`，小写，不以 `-` 开头/结尾 | 1..63 | `users.fde_name`（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段） |
-| `<project-tok>` | `p-` + `[a-z0-9-]` | `p-` + 1..63 | `"p-" + projects.name`（项目名快照） |
-| `<run-tok>` | `r` + `[a-z0-9]`（**不含 `-`**，避免与段分隔符歧义） | `r` + 5..8 | `"r" + base32(run_id UUID，RFC 4648 小写无 padding) 的前 5 位`；碰撞时递增到 6/7/8 位重试 |
-| `<port>` | `[0-9]` | 4 | `4000..4999` 的十进制，零填充到 4 位 |
+| `<fde>` | `[a-z0-9-]`，小写，不以 `-` 开头/结尾 | 1..56（预览域名预算；字符集本身允许到 63，仅开户的域名口径收紧） | `users.fde_name`（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段） |
+| `-p-` | 字面量 | 3 | 固定标记（P5 去项目化：原 `p-<project-name>` 的项目名段已删除） |
+| `<port4>` | `[0-9]` | 4 | `4000..4999` 的十进制，零填充到 4 位 |
 
-- **base32 字母表**：`abcdefghijklmnopqrstuvwxyz234567`（小写、无 padding），天然满足「无 `-`、小写、字母数字」，与示例 `r3a7fq`（`r` + 5 位）一致。
 - **不可变性（写死）**：`hostname` / `url` 是 allocation 的**一次性分配标识，一旦生成永不改写**。保证书签/分享链接/iframe/预览卡片不漂移（原理三「URL 稳定」，§8.2 项目级固定端口用途）。
-- **碰撞处理**：`project-tok` 天然无碰撞（`fde_name` 全局唯一 + `projects.name` 用户内唯一 + hostname 含两者，schema.sql `port_allocations_live_hostname_key` 兜底）；`run-tok` 靠 base32 熵（5 位 ≈ 25 bits）+ `port_allocations_live_hostname_key` 唯一索引兜底，碰撞时**递增位数重试**（5→6→7→8，8 位 ≈ 40 bits，单 FDE 活跃 run 规模下碰撞概率可忽略）。
-- **项目改名行为（写死）**：`PATCH /api/projects/:id` 改名**不重生成**已有 allocation 的 `hostname`/`url`——hostname 里的 `<project-name>` 是**分配时的项目名快照**；改名只影响 `projects.name`（容器内目录名）与**后续新建** run 的 hostname，旧 hostname 保持可访问（书签不破）。
-
-> ⚠️ 跨文件同步点：portal.md §3.5 已同步为「改名不重生成 hostname/url，旧 hostname 保持（项目名快照）」（与本条不可变性一致，B9）；schema.sql `users.fde_name` 目前无 `CHECK`（仅 `UNIQUE`），本 grammar 的 `<fde>` 字符集需在应用层强制（已落地：schema.sql §2 `users.fde_name` 与 §4 `projects.name` 均有同构字符集 CHECK，grammar 与 CHECK 同源；应用层另须校验段长组合，见本节总长约束。）
+- **碰撞处理**：`fde_name` 全局唯一 + 同 FDE 端口唯一 ⇒ hostname 天然无碰撞；`port_allocations_live_hostname_key` 唯一索引兜底（schema.sql）。
+- **段长组合不在 schema 层**：schema.sql `users.fde_name` CHECK 只管字符集/单段 ≤63，不管「63 − 7」这类组合预算——组合口径由上述三层应用/DB 强制点执行（#202）。
 
 ### 8.6 `allocated → active` 的触发条件与幂等更新（写死）
 
