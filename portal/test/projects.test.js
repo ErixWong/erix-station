@@ -11,6 +11,7 @@ import {
   MAX_FDE_NAME_LEN_FOR_HOSTNAME,
   buildHostname,
   buildUrl,
+  previewUrl,
   toProject,
   toPort,
   listProjects,
@@ -41,24 +42,35 @@ test('validateFdeName：合法 / 非法', () => {
   assert.equal(validateFdeName('-alice').ok, false);
 });
 
-test('buildHostname：P5 新语法 <fde>-p-<port4>.fde.<base>（URL 去项目名段）', () => {
+test('buildHostname：#57 伞域语法 <fde>-p-<port4>.<BASE_DOMAIN>（去写死的 .fde. 段）', () => {
+  // BASE_DOMAIN = 伞域（fde.<可注册域>），不再是可注册域；本地兜底伞域 = fde.localhost。
   assert.equal(
-    buildHostname({ fdeName: 'alice', port: 4016, baseDomain: 'localhost' }),
+    buildHostname({ fdeName: 'alice', port: 4016, baseDomain: 'fde.localhost' }),
     'alice-p-4016.fde.localhost',
   );
+  // 生产伞域 fde.erix.vip ⇒ 预览完整域 = alice-p-4000.fde.erix.vip（无 .fde.fde. 叠加）。
   assert.equal(
-    buildHostname({ fdeName: 'alice', port: 4000, baseDomain: 'erix.vip' }),
+    buildHostname({ fdeName: 'alice', port: 4000, baseDomain: 'fde.erix.vip' }),
     'alice-p-4000.fde.erix.vip',
+  );
+  assert.ok(
+    !buildHostname({ fdeName: 'eric', port: 4000, baseDomain: 'fde.erix.vip' }).includes('.fde.fde.'),
+    '不得出现 .fde.fde. 叠加',
+  );
+  // 旧语义（baseDomain = 可注册域）仍可用：语法层只拼接，不插 .fde. 段。
+  assert.equal(
+    buildHostname({ fdeName: 'eric', port: 4000, baseDomain: 'localhost' }),
+    'eric-p-4000.localhost',
   );
   // 端口恒 4 位（4000..4999 区间天然 4 位；语法层仍 pad 保底）。
   assert.equal(
-    buildHostname({ fdeName: 'eric', port: 4000, baseDomain: 'localhost' }),
-    'eric-p-4000.fde.localhost',
+    buildHostname({ fdeName: 'eric', port: 8, baseDomain: 'fde.localhost' }),
+    'eric-p-0008.fde.localhost',
   );
 });
 
 test('buildHostname：不含项目名段——目录名含 - / 下划线也不需要合法化清洗', () => {
-  const h = buildHostname({ fdeName: 'alice', port: 4016, baseDomain: 'localhost' });
+  const h = buildHostname({ fdeName: 'alice', port: 4016, baseDomain: 'fde.localhost' });
   assert.doesNotMatch(h, /proj/);
   // 旧语法对照（迁移 0008 把存量 hostname 重写为该形态）。
   assert.notEqual(h, 'alice-p-proj1-4016.fde.localhost');
@@ -107,8 +119,41 @@ test('validateFdeNameForHostname：56 以内通过；57..63 拒绝且文案可�
   assert.match(badBase.message, /base 域标签/);
 });
 
-test('buildUrl：https 前缀', () => {
-  assert.equal(buildUrl('alice-p-4016.fde.localhost'), 'https://alice-p-4016.fde.localhost');
+test('buildUrl：默认 https 前缀（无公开入口时的保守形态）', () => {
+  assert.equal(buildUrl('alice-p-4016.fde.erix.vip'), 'https://alice-p-4016.fde.erix.vip');
+});
+
+// #57 阶段2：预览 URL 的 scheme/端口从**公开入口**（config.portalPublicBaseUrl）派生——
+// dev（http + 高端口）与生产（https/443）同一代码路径，只是入参不同。
+test('previewUrl：按公开入口派生 scheme/端口（#57）', () => {
+  const H = 'eric-p-8001.fde.erix.vip';
+  // ① dev：http 带端口 → 端口进 URL
+  assert.equal(
+    previewUrl(H, { publicBaseUrl: 'http://station.fde.erix.vip:8090' }),
+    'http://eric-p-8001.fde.erix.vip:8090',
+  );
+  // ② 生产：https 默认端口 → 端口不进 URL
+  assert.equal(
+    previewUrl(H, { publicBaseUrl: 'https://station.fde.erix.vip' }),
+    'https://eric-p-8001.fde.erix.vip',
+  );
+  // ③ https 带非标端口（dev websecure 8443）→ 端口进 URL
+  assert.equal(
+    previewUrl(H, { publicBaseUrl: 'https://station.fde.erix.vip:8443' }),
+    'https://eric-p-8001.fde.erix.vip:8443',
+  );
+  // 补充：http 显式 80 / https 显式 443 = 默认端口，URL.port 为空 ⇒ 不进 URL
+  assert.equal(
+    previewUrl(H, { publicBaseUrl: 'http://station.fde.erix.vip:80' }),
+    'http://eric-p-8001.fde.erix.vip',
+  );
+  assert.equal(
+    previewUrl(H, { publicBaseUrl: 'https://station.fde.erix.vip:443' }),
+    'https://eric-p-8001.fde.erix.vip',
+  );
+  // 公开入口缺失/不可解析 → 退化为 https 无端口（等价旧 buildUrl，不猜端口）
+  assert.equal(previewUrl(H), 'https://eric-p-8001.fde.erix.vip');
+  assert.equal(previewUrl(H, { publicBaseUrl: 'not-a-url' }), 'https://eric-p-8001.fde.erix.vip');
 });
 
 test('toProject / toPort 映射（留档只读形状不变）', () => {
@@ -130,8 +175,8 @@ test('toProject / toPort 映射（留档只读形状不变）', () => {
     port: 4016,
     role: 'frontend',
     run_id: null,
-    hostname: 'alice-p-4016.fde.localhost',
-    url: 'https://alice-p-4016.fde.localhost',
+    hostname: 'alice-p-4016.fde.erix.vip',
+    url: 'https://alice-p-4016.fde.erix.vip',
     exposure: 'private',
     state: 'allocated',
     released_at: null,

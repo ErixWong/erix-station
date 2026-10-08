@@ -7,6 +7,7 @@
 
 import crypto from 'node:crypto';
 import { hashToken } from './auth.js';
+import * as projects from './projects.js';
 
 /** 确定性派生预览 session token（portal.md §2.7 第 6 步；重放时能重放同一 token）。 */
 export function derivePreviewSessionToken(ticket, signingKey) {
@@ -96,6 +97,18 @@ async function findActiveSessionByParent(pool, parentTicketId, now) {
   if (!s) return null;
   if (s.state === 'active' && !s.revoked_at && new Date(s.expires_at) > now) return s;
   return null;
+}
+
+/**
+ * Host 头归一化（#57 阶段2 收口；沿 fix-250923-01 的既有语义）：**剥端口 + 小写**。
+ * 查表（port_allocations.hostname 按无端口、小写存储）必须用本函数的输出；
+ * **302 Location 仍用原始 Host 头（含非默认端口）**，dev 8090/8443 否则跳 :80 拒连（fix-250923-01 行为不变）。
+ * 全仓只保留这一份实现（http.js forwardAuth 与任何后续 Host 消费方均复用）。
+ * IPv6 字面量 `[::1]:8090` 的端口后缀同样被剥到 `[::1]`。
+ */
+export function normalizeHostHeader(rawHost) {
+  if (typeof rawHost !== 'string') return '';
+  return rawHost.trim().replace(/:\d+$/, '').toLowerCase();
 }
 
 /** 校验一次性 ticket 凭证（portal.md §2.7 第 4/6 步）。 */
@@ -240,7 +253,8 @@ export async function authorizeForwardAuth(pool, config, { hostname, hostHeader 
     [hostname],
   );
   const allocation = r.rows?.[0];
-  if (!allocation) return deny(404, 'not_found', 'not found');
+  // #57：给可操作提示，替代 bare not found（书签失效/未分配预览域时用户看不出发生了什么）。
+  if (!allocation) return deny(404, 'not_found', 'preview host not found (unassigned preview domain or stale bookmark)');
   if (allocation.state === 'released') {
     return deny(403, 'allocation_released', 'allocation released', { allocation });
   }
@@ -281,7 +295,7 @@ export async function authorizeForwardAuth(pool, config, { hostname, hostHeader 
  */
 export async function issuePreviewTicket(pool, config, { allocationId, session, ip = null, ua = null, now = new Date() } = {}) {
   const r = await pool.query(
-    `SELECT id, fde_id, state, exposure, url FROM port_allocations WHERE id = $1`,
+    `SELECT id, fde_id, state, exposure, hostname, url FROM port_allocations WHERE id = $1`,
     [allocationId],
   );
   const allocation = r.rows?.[0];
@@ -308,9 +322,16 @@ export async function issuePreviewTicket(pool, config, { allocationId, session, 
     [tokenHash, user.id, user.id, allocation.id, expiresAt, ip, ua],
   );
 
+  // 预览 URL 的 scheme/端口按**公开入口**派生（#57 阶段2，dev http:8090 / 生产 https 同一代码路径）：
+  // 有 hostname 时用 projects.previewUrl(hostname, { publicBaseUrl: config.portalPublicBaseUrl }) 生成；
+  // 无 hostname（存量旧形 / 测试桩）时回退库内 url，行为与旧口径一致。
+  const base = allocation.hostname
+    ? projects.previewUrl(allocation.hostname, { publicBaseUrl: config?.portalPublicBaseUrl ?? null })
+    : allocation.url;
+
   return {
     ticket,
-    url: `${allocation.url}?preview_ticket=${ticket}`,
+    url: `${base}?preview_ticket=${ticket}`,
     expires_in: config.previewTicketTtlSeconds,
   };
 }
