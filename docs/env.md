@@ -29,7 +29,7 @@ P1 本地开发（写代码、起栈联调）只需：
 | backend 子网 | **`172.32.0.0/24`**（本机 `172.30.0.0/16` 已被运行中的 `voiceprint_default` 占用（`br-8e3857476b83` / `172.30.0.1`）→ 开发期 `backend` 用 `172.32.0.0/24`，`BACKEND_SUBNET=172.32.0.0/24`；部署期规范值仍为 §5.2 的 `172.30.0.0/24`，由 `BACKEND_SUBNET` 覆盖） |
 | socket-proxy | 开发期**同样启用**：`station-docker-proxy` 单独挂 `/var/run/docker.sock`（RO），portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问 Docker API（不直挂 socket）；白名单见 deploy-contract §5.1（自研 admission proxy：方法+路径白名单 12 条 + create 参数级校验；**不再用** tecnativa 类别级 env 门） |
 | DB 首次初始化 | 由 `deploy/db-init/00-init.sh` 在 `station-db` **首次启动（空数据目录）**时以超级用户完成一次：`schema.sql`（baseline）→ 设两角色口令 → 回填 baseline checksum → `bootstrap.sql`（授权 + ownership 归正）→ 收紧跨库 CONNECT；**开发期同样**。增量迁移（`deploy/migrations/*.sql`）**由 portal 自己跑**：`MIGRATE_ON_START=1`（compose 显式值），portal 在监听端口前应用（§10） |
-| 域名 | 不依赖 DNS 泛解析：用 `/etc/hosts` 逐条指到 127.0.0.1，或用 `*.localhost` 变通（`station.localhost` / `alice-r3a7fq-4001.fde.localhost`，多数系统 localhost 子域自动回环到 127.0.0.1）。⚠️ **`*.localhost` 变通只对浏览器/宿主有效，对容器无效**：容器内解析 `station.<base>` / `llm.<base>` 用创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1） |
+| 域名 | **开发期已使用真实泛解析域名（2026-10-08 定稿，issue #57）**：`*.fde.erix.vip` 泛解析 → 宿主机 Tailscale IP `100.100.0.3`（比 DHCP LAN IP 稳定），浏览器/playwright/FDE 均可达；入口带端口 `:8090`（dev Traefik 不在 80/443）。`/etc/hosts` 逐条与 `*.localhost` 变通**降级为历史兜底**（仅本机无 DNS 可用时），不再是主路径。⚠️ 容器内解析与宿主无关：`station.<伞域>` / `llm.<伞域>` 恒走创建容器时注入的 hosts 映射（`--add-host` → 该 FDE 的 bridge 网关 IP，见本节末注与 §1），不依赖外部 DNS |
 | TLS | 自签证书，或直接 http 联调（cookie `Secure`/`SameSite` 属性按实际域名方案调试，正式语义仍以 portal.md §2.5 为准） |
 | 证书方式 / DNS-01 / VPN-only / 公网可达性 / 443 冲突处理 | **一律部署期再管**（见 §2/§3/§5.1/§8.3 的「部署期事项」标注） |
 
@@ -39,15 +39,15 @@ P1 本地开发（写代码、起栈联调）只需：
 
 ## 1. 域名与 DNS 参数
 
-> 本节参数名与域名规则（portal = `station.<base>`、预览 = `*.fde.<base>`）开发期仍然成立，只是取值用 §0 的 hosts/localhost 变通；**DNS 泛解析行是部署期事项（P1 开发不需要）**。
+> 本节域名规则采用**伞域**语义（2026-10-08 定稿，issue #57）：`BASE_DOMAIN` = 伞域 `fde.<registrable domain>`，portal / LLM / 预览全部直接挂在伞域下、由**同一条**泛解析 `*.fde.erix.vip` 覆盖——「DNS 泛解析是部署期事项（P1 开发不需要）」的旧口径已废：**开发期即使用真域名**（2026-10-08 已配，见下表 DNS 行），dev 与生产同一代码路径（URL 的 scheme/端口按公开入口生成）。
 
 | 参数 | 语义 | 取值来源 | 示例值 |
 |---|---|---|---|
-| `BASE_DOMAIN` | base domain，portal 与预览域名的公共后缀 | 决策者提供 ⚠️ | `erix.vip`（倾向：与参考实例 A 的 git host `git.erix.vip` 同域，规格 §8.3 示例 URL 亦用 `fde.erix.vip`） |
-| `PORTAL_HOST` | portal 域名 = `station.` + base domain | 平台规范固定（规格 §6.3） | `station.erix.vip` |
-| `FDE_WILDCARD_HOST` | 预览泛域名；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（如 `alice-r3a7fq-4001.fde.erix.vip`） |
-| DNS 泛解析 | 内网 DNS 添加两条 A 记录：`station.<base>` 与 `*.fde.<base>` → 宿主机内网 IP。**部署期事项（P1 开发不需要**，开发期用 §0 的 hosts/localhost 变通，决策者 2026-09，issue #3 评论**）** | 目标环境探测 + 决策者确认 ⚠️（倾向：平台 VPN-only/内网（见 §3），泛解析只需内网 DNS 支持） | 探测命令见 §9。若内网 DNS 不支持泛解析，降级方案是 portal 生成显式路由 + 逐条 A 记录，控制面复杂度上升（见 principles §3「每个端口一条手工路由」被否决项的权衡） |
-| `llm.<base>`（LLM 数据面域名） | **不进内网/公网 DNS**：只被 FDE 容器（worker）访问，容器内用 hosts 注入（`--add-host llm.<base>:<该 FDE 网关 IP>`）解析到 Traefik（host:443）；证书 SAN 仍需覆盖（§2）。浏览器从不直接访问 `llm.<base>` | 平台规范固定（topology.md §4-L7，H-B） | `llm.erix.vip`（仅作证书 SAN / 容器 hosts 注入用，不做 A 记录） |
+| `BASE_DOMAIN` | **伞域** = `fde.` + registrable domain；portal/LLM/预览的公共后缀（#57 定稿，旧语义「可注册域」作废） | 决策者定稿（2026-10-08） | `fde.erix.vip` |
+| `PORTAL_HOST` | portal 域名 = `station.` + 伞域 | 平台规范固定（规格 §6.3） | `station.fde.erix.vip` |
+| `FDE_WILDCARD_HOST` | 预览泛域名 = `*.<伞域>`（伞域名恰含 `fde`，不再额外拼 `.fde.` 段——`buildHostname` 的 `.fde.` 硬编码已随 #57 拆除）；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（如 `eric-p-8001.fde.erix.vip`，grammar=`<fde>-p-<port4>.<伞域>`） |
+| DNS 泛解析 | ✅ **已配置（2026-10-08）**：一条 A 记录 `*.fde.erix.vip → 100.100.0.3`（宿主机 Tailscale IP）即覆盖 portal/llm/预览全部名字（`*.` 不覆盖裸域，平台无服务落裸域）。原「两条内网 A 记录 + 部署期事项」口径作废；解析器负缓存（路由器 dnsmasq 负 TTL）为唯一已知 dev 期坑，公共 DNS 正常 | 已落地 | 全球生效实测（权威 NS/阿里/Google 一致） |
+| `llm.<伞域>`（LLM 数据面域名） | 解析双通道：容器内恒用 hosts 注入（`--add-host llm.<伞域>:<该 FDE 网关 IP>`）解析到 Traefik，**不依赖 DNS**（机制不变）；伞域收敛后该名字（`llm.fde.erix.vip`）也**顺带被 `*.fde.erix.vip` 泛解析覆盖**（浏览器偶访可达，dev http 下够用），无需单独 A 记录 | 平台规范固定（topology.md §4-L7，H-B） | `llm.fde.erix.vip` |
 | 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点 write-through 到用户空间文件（见 `design/user-space.md` §4.1.1） | 决策者提供 | `git.erix.vip`（内网自托管 Gitea——**仅为参考实例 A 的情况**，见 §8.1，非设计约束） |
 
 ## 2. 证书参数
@@ -56,7 +56,7 @@ P1 本地开发（写代码、起栈联调）只需：
 
 | 参数 | 语义 | 取值来源 | 示例值 |
 |---|---|---|---|
-| 证书方式 | 预览域名是泛域名，HTTP-01 无法签泛域名证书；DNS-01 是唯一能覆盖 `*.fde.` 泛域名的免费方案。**证书 SAN 必须同时包含 `station.<base>`、`*.fde.<base>` 与 `llm.<base>`**——`llm.<base>` 由 worker（容器内）经 HTTPS 访问 Traefik，缺它则 TLS 握手失败（H-B，topology.md §4-L7） | 决策者提供 ⚠️ | 倾向：**Let's Encrypt DNS-01**（SAN = `station.erix.vip` + `*.fde.erix.vip` + `llm.erix.vip`）。前提：`erix.vip` 的公网 DNS zone 可通过 API 操作（Traefik 支持主流 DNS provider）。**降级方案**：若 zone 不可 API 操作，改用内部 CA（自签根 + 下发到公司设备），代价是每台访问设备需装根证书；自签仅作本地开发兜底，不用于交付 |
+| 证书方式 | 预览域名是泛域名，HTTP-01 无法签泛域名证书；DNS-01 是唯一免费方案。**伞域收敛后 SAN 简化为一张通配 `*.fde.erix.vip`**——`station.*`/`llm.*`/全部预览都落在同一单标签覆盖内（旧三条 SAN `station.<base>`+`*.fde.<base>`+`llm.<base>` 并集口径作废，#57）；所有 router 统一 `tls.domains=[{main:"*.fde.erix.vip"}]` 共享同一张证，规避 per-host 签发限速 | 决策者定稿方向（2026-10-08） | **Let's Encrypt DNS-01**（SAN=`*.fde.erix.vip`）。前提：`erix.vip` zone 可 API 操作（DNSPod，已确认 NS）；DNS-01 纯出站，**与 A 记录指向无关**（100.100.0.3 不影响签发/续期）。**降级方案**：zone 不可 API 操作时改内部 CA（自签根下发到设备）；自签仅作本地兜底 |
 | `ACME_EMAIL` | ACME 账号注册邮箱 | 决策者提供 ⚠️ | 待填 |
 | `DNS_PROVIDER` / DNS-01 API token | DNS-01 的 provider 名称与 API 凭据；凭据经环境变量注入（见 §6），不写进配置文件 | 决策者提供 ⚠️，凭据文件注入 | 待填 |
 
@@ -232,7 +232,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 按 §5.1 的优先级展开（参考实例 A 语境）：
 
 1. **迁移 443 上的现有服务**（推荐）：占用者已定位为容器 `nginx_reverse_proxy`（映射 443、9001、9002，另有 8443 暴露未映射）。评估：把它的现有路由迁到 Traefik 之后（Traefik 作唯一 ingress，nginx 退为后端服务），或让其改听其他端口，然后 Traefik 按规格独占 443。（注意该 nginx 当前默认 vhost 返回 502，说明它是否仍在承载有效业务需先确认。）
-2. **Traefik `websecure` 暂用 8443**：URL 带端口号（`https://station.erix.vip:8443`），仅作联调过渡；正式使用前必须回到方案 1。
+2. **Traefik `websecure` 暂用 8443**：URL 带端口号（`https://station.fde.erix.vip:8443`），仅作联调过渡；正式使用前必须回到方案 1。
 3. ~~复用现有 443 反代，把 station/fde 域名转发给 Traefik~~：**不推荐**（理由见 §5.1）。
 
 > 部署配置（`deploy/`）应把 Traefik 的 publish 端口做成变量（见 §10），使方案 1/2 切换只改一处。
@@ -254,7 +254,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | 7 | 其他端口占用 | `ss -tlnp \| grep -E ':(8080\|4100\|5432)\b'` | portal publish `127.0.0.1:8080`、LiteLLM `127.0.0.1:${LITELLM_HOST_PORT:-4100}`（回环，需对应端口空闲）；station-db 不 publish，理论上无冲突 | §5 | |
 | 8 | Portainer 是否存在 | `docker ps --format '{{.Names}} {{.Ports}}' \| grep -i portainer` | 记录容器名/监听地址 | §7 Portainer | |
 | 9 | 既有容器命名冲突 | `docker ps -a --format '{{.Names}}' \| grep -E '^(station-\|fde-)'` | 无输出，或冲突容器已评估 | §6 容器命名 | |
-| 10 | 内网 DNS 泛解析（🕓 部署期事项，P1 开发无需执行） | `dig station.<base> @<内网DNS>`；`dig test.fde.<base> @<内网DNS>` | 两条均解析到宿主机内网 IP；不支持泛解析时走 §1 降级方案 | §1 DNS 泛解析 | |
+| 10 | DNS 泛解析（✅ 已配，2026-10-08 #57：`*.fde.erix.vip → 100.100.0.3`） | `dig test-9527.fde.erix.vip`（任意子名）；异常时对照 `dig … @223.5.5.5` 区分本地/路由器负缓存 | 解析到 100.100.0.3；若仅本机解析不出而公共 DNS 正常，是递归解析器负缓存，等 TTL 或重启路由器 dnsmasq | §1 DNS 泛解析 | |
 | 11 | 公网 DNS zone 可 API 操作（🕓 部署期事项，P1 开发无需执行） | 决策者确认 DNS provider 及其 API 能力 | 支持则 DNS-01；不支持则内部 CA | §2 证书方式 | |
 | 12 | 出口正向代理 | `env \| grep -i proxy`；`curl -sI --max-time 5 https://registry.npmjs.org/` | 无强制代理可直连；有代理则记录代理地址，影响 §3 egress 落地 | §3 正向代理 | |
 | 13 | 路径可写 | `ls -ld <DATA_ROOT> <USER_SPACE_ROOT>`；不存在则 `mkdir -p` 验证 | 可创建且归属 docker 可写用户 | §6 路径 | |
@@ -268,11 +268,11 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 
 | 变量 | 取值来源 | 示例值 |
 |---|---|---|
-| `BASE_DOMAIN` | 决策者提供（§1 ⚠️） | `erix.vip` |
-| `PORTAL_HOST` | 平台规范固定 = `station.` + `BASE_DOMAIN`（§1） | `station.erix.vip` |
+| `BASE_DOMAIN` | 伞域，决策者定稿（§1，#57） | `fde.erix.vip` |
+| `PORTAL_HOST` | 平台规范固定 = `station.` + `BASE_DOMAIN`（§1） | `station.fde.erix.vip` |
 | `PORTAL_INTERNAL_HOSTS` | internal API router 的额外 Host（逗号分隔；只接受合法 hostname 或 IPv4，不改变 portal UI Host） | 空（仅匹配 `PORTAL_HOST`） |
 | `FDE_WILDCARD_HOST` | 平台规范固定 = `*.fde.` + `BASE_DOMAIN`（§1） | `*.fde.erix.vip` |
-| `LLM_HOST` | 平台规范固定 = `llm.` + `BASE_DOMAIN`（§1；容器内 hosts 注入解析，不进 DNS，仅证书 SAN 用） | `llm.erix.vip` |
+| `LLM_HOST` | 平台规范固定 = `llm.` + `BASE_DOMAIN`（§1；容器内 hosts 注入解析为主、不依赖 DNS；伞域下顺带被泛解析覆盖） | `llm.fde.erix.vip` |
 | `TRAEFIK_WEB_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `80` |
 | `TRAEFIK_WEBSECURE_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `443`（冲突未解时 `8443`，见 §5.1/§8.3） |
 | `BACKEND_SUBNET` | 平台规范固定（deploy-contract.md §2.1）；须避开宿主既有网段 | `172.30.0.0/24`（开发期本机为 `172.32.0.0/24`，见 §0） |

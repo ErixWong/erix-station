@@ -207,10 +207,10 @@ INSERT INTO fde_networks (fde_id, network_name, subnet, prefix_len, gateway, poo
 INSERT INTO port_allocations (id, fde_id, scope, project_id, run_id, port, role, hostname, url, exposure, state) VALUES
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a1',
    'project', '00000000-0000-0000-0000-0000000000c1', NULL,
-   4000, 'frontend', 'alice-p-proj1-4000.fde.test', 'https://alice-p-proj1-4000.fde.test', 'private', 'allocated'),
+   4000, 'frontend', 'alice-p-4000.fde.test', 'https://alice-p-4000.fde.test', 'private', 'allocated'),
   ('00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000a2',
    'project', '00000000-0000-0000-0000-0000000000c2', NULL,
-   4000, 'frontend', 'bob-p-proj1-4000.fde.test',   'https://bob-p-proj1-4000.fde.test',   'private', 'allocated');
+   4000, 'frontend', 'bob-p-4000.fde.test',   'https://bob-p-4000.fde.test',   'private', 'allocated');
 SQL
 ```
 
@@ -273,8 +273,8 @@ SQL
 
 | 用例 | 动作 | 期望返回码 + code | 判定 |
 |---|---|---|---|
-| B1 未认证访问任意 `*.fde.<base>` | `curl -s -o /dev/null -w '%{http_code}' https://alice-p-proj1-4000.fde.<base>/` | `403`（`preview_ticket_required`；无 ticket 无预览 cookie）| 403，且**响应/上游不含 `__Host-fde_session`** |
-| B2 hostname 无对应 allocation | 访问 `https://nope-x-4000.fde.<base>/` | `404`（`not_found`） | 404（「路由表里没有 = 不可达」） |
+| B1 未认证访问任意 `*.fde.<base>` | `curl -s -o /dev/null -w '%{http_code}' https://alice-p-4000.fde.<base>/` | `403`（`preview_ticket_required`；无 ticket 无预览 cookie）| 403，且**响应/上游不含 `__Host-fde_session`** |
+| B2 hostname 无对应 allocation | 访问 `https://nope-p-4000.fde.<base>/` | `404`（`not_found`） | 404（「路由表里没有 = 不可达」；dev 实机下为带 #57 可操作提示的正文） |
 | B3 ticket 过期 / 不存在 / 格式非法 | `?preview_ticket=<过期/假>` | `401`（`preview_ticket_expired`/`preview_ticket_invalid`） | 401 |
 | B4 ticket 已用（重放） | 同一 ticket 第二次 | `403`（`preview_ticket_used`） | 403，重放防护 |
 | B5 ticket 已撤销 | `revoked_at` 置位后再用 | `403`（`preview_ticket_revoked`） | 403 |
