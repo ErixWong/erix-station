@@ -8,6 +8,7 @@ import {
   derivePreviewSessionToken,
   issuePreviewTicket,
   authorizeForwardAuth,
+  normalizeHostHeader,
 } from '../src/preview.js';
 import { hashToken } from '../src/auth.js';
 
@@ -109,8 +110,9 @@ const ALLOC = {
   fde_id: 'u1',
   state: 'allocated',
   exposure: 'private',
-  hostname: 'alice-p-proj1-4000.fde.localhost',
-  url: 'https://alice-p-proj1-4000.fde.localhost',
+  // #57 阶段2 伞域 grammar：<fde>-p-<port4>.<BASE_DOMAIN>（BASE_DOMAIN = fde.<可注册域>）。
+  hostname: 'alice-p-4000.fde.erix.vip',
+  url: 'https://alice-p-4000.fde.erix.vip',
   fde_name: 'alice',
   user_status: 'active',
 };
@@ -127,6 +129,10 @@ const config = {
   previewSessionTtlSeconds: 900,
   previewSessionSigningKey: KEY,
 };
+
+// #57：无 portalPublicBaseUrl 时 previewUrl 退化为 https 无端口（与旧 buildUrl 行为等价）；
+// 带公开入口时按入口派生 scheme/端口（dev http:8090 与生产 https 同一代码路径）。
+const devConfig = { ...config, portalPublicBaseUrl: 'http://station.fde.erix.vip:8090' };
 
 // ---- 纯函数 ----
 test('parsePreviewTicket / stripPreviewTicket：解析与脱敏', () => {
@@ -156,7 +162,7 @@ test('issuePreviewTicket：private owner 可签、存哈希不存明文、他人
   });
   assert.ok(out.ticket.startsWith('pt_'));
   assert.equal(out.expires_in, 60);
-  assert.equal(out.url, `https://alice-p-proj1-4000.fde.localhost?preview_ticket=${out.ticket}`);
+  assert.equal(out.url, `https://alice-p-4000.fde.erix.vip?preview_ticket=${out.ticket}`);
   assert.equal(grants.length, 1);
   assert.equal(grants[0].token_hash, hashToken(out.ticket)); // 只存哈希
   assert.notEqual(grants[0].token_hash, out.ticket);
@@ -289,7 +295,7 @@ test('authorizeForwardAuth：private 越权（非 owner 主体）→ 403', async
 });
 
 test('F13：已消费 ticket 跨 hostname 重放 → 403 preview_ticket_mismatch（先于安全重放，不派发 session 到别的 allocation）', async () => {
-  const allocB = { ...ALLOC, id: 'pa2', hostname: 'bob-p-proj1-4000.fde.localhost', url: 'https://bob-p-proj1-4000.fde.localhost' };
+  const allocB = { ...ALLOC, id: 'pa2', hostname: 'bob-p-4000.fde.erix.vip', url: 'https://bob-p-4000.fde.erix.vip' };
   const { pool, grants } = makePool({ allocations: [ALLOC, allocB] });
   const ticket = 'pt_cross_host';
   // 已消费 ticket（allocation_id=pa1）+ 已派生活跃 session（安全重放分支的诱饵）
@@ -309,4 +315,81 @@ test('F13：已消费 ticket 跨 hostname 重放 → 403 preview_ticket_mismatch
   assert.equal(res.outcome, 'deny');
   assert.equal(res.status, 403);
   assert.equal(res.code, 'preview_ticket_mismatch');
+});
+
+// ---- #57 阶段2：伞域接入的三条口径（Host 归一化 / 可操作 404 / URL 按公开入口派生）----
+test('#57 normalizeHostHeader：剥端口 + 小写（查表口径唯一实现）', async () => {
+  assert.equal(normalizeHostHeader('eric-p-8001.fde.erix.vip:8090'), 'eric-p-8001.fde.erix.vip');
+  assert.equal(normalizeHostHeader('Eric-P-8001.FDE.ERIX.VIP'), 'eric-p-8001.fde.erix.vip');
+  assert.equal(normalizeHostHeader('[::1]:8443'), '[::1]');
+  assert.equal(normalizeHostHeader(' eric-p-8001.fde.erix.vip:80 '), 'eric-p-8001.fde.erix.vip');
+  // 非字符串 / 缺失 → 空串（调用方据此走 404，不抛）
+  assert.equal(normalizeHostHeader(undefined), '');
+  assert.equal(normalizeHostHeader(null), '');
+});
+
+test('#57 authorizeForwardAuth：查表用剥端口 host 能放行，且 cookie 已签发路径 200', async () => {
+  const cookie = 's_cookie_port_host';
+  const { pool, grants } = makePool();
+  grants.push({
+    id: 'g-p1', token_hash: hashToken(cookie), user_id: 'u1', issuer_id: null, allocation_id: 'pa1',
+    parent_ticket_id: 'g-parent', kind: 'session', state: 'active', expires_at: later(600), used_at: null, revoked_at: null,
+  });
+  // 浏览器 Host 带端口（dev 8090）：http.js 先 normalizeHostHeader 再传入，这里同口径。
+  const res = await authorizeForwardAuth(pool, config, {
+    hostname: normalizeHostHeader(`${ALLOC.hostname}:8090`),
+    hostHeader: `${ALLOC.hostname}:8090`,
+    cookieValue: cookie,
+    now: NOW,
+  });
+  assert.equal(res.outcome, 'allow');
+  assert.equal(res.status, 200);
+  assert.equal(res.fdeName, 'alice');
+});
+
+test('#58 回归：302 Location 保留原始 Host 的端口（归一化只用于查表，不影响 Location）', async () => {
+  const { pool, grants } = makePool();
+  const ticket = 'pt_port_in_location';
+  grants.push({
+    id: 'g-p2', token_hash: hashToken(ticket), user_id: 'u1', issuer_id: 'u1', allocation_id: 'pa1',
+    parent_ticket_id: null, kind: 'ticket', state: 'active', expires_at: later(60), used_at: null, revoked_at: null,
+  });
+  const res = await authorizeForwardAuth(pool, config, {
+    hostname: normalizeHostHeader(`${ALLOC.hostname}:8090`),
+    hostHeader: `${ALLOC.hostname}:8090`,
+    uri: `/?preview_ticket=${ticket}`,
+    scheme: 'http',
+    now: NOW,
+  });
+  assert.equal(res.outcome, 'redirect');
+  assert.equal(res.location, `http://${ALLOC.hostname}:8090/`, 'Location 必须带非默认端口，否则浏览器跳 :80 拒连');
+});
+
+test('#57 authorizeForwardAuth：未分配预览域 / 失效书签 → 404 且提示可操作（错误码不变）', async () => {
+  const { pool } = makePool();
+  const res = await authorizeForwardAuth(pool, config, { hostname: 'stale-p-9000.fde.erix.vip', now: NOW });
+  assert.equal(res.outcome, 'deny');
+  assert.equal(res.status, 404);
+  assert.equal(res.code, 'not_found', '错误码不变');
+  assert.match(res.message, /preview host not found/, '可操作提示替代 bare not found');
+  assert.match(res.message, /unassigned preview domain or stale bookmark/);
+});
+
+test('#57 issuePreviewTicket：返回的预览 URL 按公开入口派生（dev http:8090 / 生产 https）', async () => {
+  const session = { user: { id: 'u1', role: 'fde' } };
+  // dev：http + 高端口 → 端口进 URL
+  const dev = await issuePreviewTicket(makePool().pool, devConfig, { allocationId: 'pa1', session, now: NOW });
+  assert.equal(
+    dev.url,
+    `http://alice-p-4000.fde.erix.vip:8090?preview_ticket=${dev.ticket}`,
+    'dev 公开入口的 scheme/端口必须透传到预览 URL',
+  );
+  // 生产：https 默认端口 → 端口不进 URL
+  const prodConfig = { ...config, portalPublicBaseUrl: 'https://station.fde.erix.vip' };
+  const prod = await issuePreviewTicket(makePool().pool, prodConfig, { allocationId: 'pa1', session, now: NOW });
+  assert.equal(prod.url, `https://alice-p-4000.fde.erix.vip?preview_ticket=${prod.ticket}`);
+  // https 带非标端口（dev websecure 8443）→ 端口进 URL
+  const tlsConfig = { ...config, portalPublicBaseUrl: 'https://station.fde.erix.vip:8443' };
+  const tls = await issuePreviewTicket(makePool().pool, tlsConfig, { allocationId: 'pa1', session, now: NOW });
+  assert.equal(tls.url, `https://alice-p-4000.fde.erix.vip:8443?preview_ticket=${tls.ticket}`);
 });

@@ -26,7 +26,7 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mat-test-'));
 }
 
-const ALLOC = { scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-4016.fde.localhost', exposure: 'private', state: 'allocated' };
+const ALLOC = { scope: 'project', port: 4016, role: 'frontend', run_id: null, url: 'https://alice-p-4016.fde.erix.vip', exposure: 'private', state: 'allocated' };
 
 function snapshot(overrides = {}) {
   return {

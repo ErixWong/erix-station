@@ -55,6 +55,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '    fde-auth:',
     '      forwardAuth:',
     '        address: "http://127.0.0.1:18080/api/forward-auth"',
+    '        trustForwardHeader: false',
     '        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]',
     '        authResponseHeaders: [X-Auth-User]',
     '    strip-cookie:',
@@ -127,13 +128,13 @@ test('generateTraefikConfig：portal 路由 + internal ipAllowList + 每 allocat
     portalBackendUrl: 'http://127.0.0.1:18080',
     entryPoint: 'web',
     allocations: [
-      { id: 'pa1', hostname: 'alice-p-proj1-4016.fde.localhost', port: 4016, backendUrl: 'http://10.200.1.2:4016' },
+      { id: 'pa1', hostname: 'alice-p-4016.fde.erix.vip', port: 4016, backendUrl: 'http://10.200.1.2:4016' },
     ],
     sourceRanges: ['10.200.1.0/29'],
   });
   // 显式 router（非通配）
-  assert.match(text, /fde-alice-p-proj1-4016:/);
-  assert.match(text, /Host\(`alice-p-proj1-4016\.fde\.localhost`\)/);
+  assert.match(text, /fde-alice-p-4016:/);
+  assert.match(text, /Host\(`alice-p-4016\.fde\.erix\.vip`\)/);
   // 每 allocation 一条 service，backend 为该容器 IP:port
   assert.match(text, /url: "http:\/\/10\.200\.1\.2:4016"/);
   // portal 路由沿用
@@ -153,7 +154,7 @@ test('generateTraefikConfig：大 FDE /28 来源规则精确写入', () => {
     portalHost: 'station.localhost',
     portalBackendUrl: 'http://127.0.0.1:18080',
     entryPoint: 'web',
-    allocations: [{ id: 'pa1', hostname: 'bob-p-proj1-4000.fde.localhost', port: 4000, backendUrl: 'http://10.201.7.2:4000' }],
+    allocations: [{ id: 'pa1', hostname: 'bob-p-4000.fde.erix.vip', port: 4000, backendUrl: 'http://10.201.7.2:4000' }],
     sourceRanges: ['10.201.7.0/28'],
   });
   assert.match(text, /sourceRange: \["10\.201\.7\.0\/28"\]/);
@@ -161,8 +162,8 @@ test('generateTraefikConfig：大 FDE /28 来源规则精确写入', () => {
 });
 
 test('validateTraefikConfig：结构断言 / 控制字符 / 重复 router 名拒绝', () => {
-  const allocs = [{ hostname: 'alice-p-proj1-4016.fde.localhost' }];
-  const name = 'fde-alice-p-proj1-4016';
+  const allocs = [{ hostname: 'alice-p-4016.fde.erix.vip' }];
+  const name = 'fde-alice-p-4016';
   const good = ['http:', '  routers:', `    ${name}:`, '  middlewares:', '  services:', `    ${name}:`].join('\n');
   assert.equal(validateTraefikConfig(good, allocs), true);
   assert.throws(() => validateTraefikConfig('', allocs), /empty/);
@@ -278,7 +279,7 @@ test('generateTraefikConfig：hostname/router key 注入面拒绝（换行/控�
     sourceRanges: [],
   };
   assert.throws(
-    () => generateTraefikConfig({ ...base, allocations: [{ id: 'pa1', hostname: 'alice-p-proj1-4016.fde.localhost\nbad', port: 4016, backendUrl: 'http://10.200.1.2:4016' }] }),
+    () => generateTraefikConfig({ ...base, allocations: [{ id: 'pa1', hostname: 'alice-p-4016.fde.erix.vip\nbad', port: 4016, backendUrl: 'http://10.200.1.2:4016' }] }),
     /invalid allocation hostname/,
   );
   assert.throws(
@@ -326,8 +327,8 @@ test('M3：含换行/控制字符的 portalBackendUrl/entryPoint 拒绝（不落
 });
 
 test('validateTraefikConfig：tab/CR 控制字符拒绝（不含合法换行分隔符）', () => {
-  const allocs = [{ hostname: 'alice-p-proj1-4016.fde.localhost' }];
-  const name = 'fde-alice-p-proj1-4016';
+  const allocs = [{ hostname: 'alice-p-4016.fde.erix.vip' }];
+  const name = 'fde-alice-p-4016';
   const good = ['http:', '  routers:', `    ${name}:`, '  middlewares:', '  services:', `    ${name}:`].join('\n');
   assert.equal(validateTraefikConfig(good, allocs), true);
   assert.throws(() => validateTraefikConfig(`${good}\n\t`, allocs), /control/);

@@ -145,7 +145,7 @@
 | public entryPoint `forwardedHeaders.insecure` | **不配**（不信任客户端 `X-Forwarded-*`） | topology §5 公共约定 |
 | `providers.file.directory` | `/etc/traefik/dynamic/`（动态配置目录，reconciler 写出的 file provider） | topology §5 |
 | `providers.file.watch` | `true`（文件替换后自动 reload；配合 reconciler 的临时文件+原子替换） | topology §8 |
-| `certificatesResolvers.le.acme.dnsChallenge` | Let's Encrypt **DNS-01**，`provider`/凭据经环境变量注入（**不写进 traefik.yml**），SAN = `station.<base>` + `*.fde.<base>` + `llm.<base>` | env §2（🕓 部署期事项；P1 开发自签/http，env §0） |
+| `certificatesResolvers.le.acme.dnsChallenge` | Let's Encrypt **DNS-01**，`provider`/凭据经环境变量注入（**不写进 traefik.yml**），SAN = 伞域通配一张 `*.fde.erix.vip`（station/llm/预览全在单标签覆盖内，env §2 #57；旧三条 SAN 并集口径作废） | env §2（🕓 部署期启用；P1 开发自签/http，env §0） |
 | `log.level` | **`INFO`**（生产）；P1 联调可 `DEBUG`。`--api=false` 下 access log 仍正常输出 | — |
 | `accessLog.filePath` | `/var/log/traefik/access.log`（原始日志，**不作审计依据**，topology §5.2） | — |
 

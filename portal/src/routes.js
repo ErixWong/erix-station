@@ -193,6 +193,9 @@ export function generateTraefikConfig({
   lines.push('    fde-auth:');
   lines.push('      forwardAuth:');
   lines.push(`        address: ${yq(forwardAuthAddress)}`);
+  // #57：trustForwardHeader 是 **forwardAuth 中间件**字段（非 entryPoint 级）：host 网络直连，
+  // 不信入站 X-Forwarded-*，由 Traefik 自己按真实连接覆写（同时消 station-edge 启动 WRN）。
+  lines.push('        trustForwardHeader: false');
   lines.push('        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]');
   lines.push('        authResponseHeaders: [X-Auth-User]');
   lines.push('    strip-cookie:');
