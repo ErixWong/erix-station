@@ -349,7 +349,9 @@ export class FakeInternalPool {
     if (sql.includes('INSERT INTO transcript_rounds') && sql.includes('transcript_key')) {
       const [key, dedupKey, round, record, folded, messages] = params;
       if (this.rounds.some((x) => x.transcript_key === key && x.dedup_key === dedupKey)) return { rows: [] };
-      this.rounds.push({ transcript_key: key, dedup_key: dedupKey, run_id: null, round, record: JSON.parse(record), folded, messages: JSON.parse(messages), created_at: ++this._claim });
+      // append_seq = 插入序（真实 schema 由迁移 0016 的序列保证；fake 用同一自增计数器模拟）。
+      const seq = ++this._claim;
+      this.rounds.push({ transcript_key: key, dedup_key: dedupKey, run_id: null, round, record: JSON.parse(record), folded, messages: JSON.parse(messages), created_at: seq, append_seq: seq });
       return { rows: [{ id: 'sr' + this.rounds.length }] };
     }
     if (sql.includes('FROM transcript_rounds WHERE transcript_key') && sql.includes('dedup_key')) {
@@ -369,9 +371,11 @@ export class FakeInternalPool {
     }
     if (sql.includes('SELECT round, record FROM transcript_rounds') && sql.includes('transcript_key')) {
       const [key, cursor, limit] = params;
+      // 0.16.0 同 round 保序：round 内按 append_seq（持久化追加序；fake 用 created_at 兼容种子行）。
       const rows = this.rounds
         .filter((x) => x.transcript_key === key && x.round > cursor)
-        .sort((a, b) => (a.round - b.round) || (a.created_at - b.created_at))
+        .sort((a, b) => (a.round - b.round)
+          || ((a.append_seq ?? a.created_at ?? 0) - (b.append_seq ?? b.created_at ?? 0)))
         .slice(0, limit)
         .map((x) => ({ round: x.round, record: x.record }));
       return { rows };
@@ -382,7 +386,8 @@ export class FakeInternalPool {
       const [runId, cursor, limit] = params;
       const rows = this.rounds
         .filter((x) => x.run_id === runId && x.round > cursor)
-        .sort((a, b) => a.round - b.round)
+        .sort((a, b) => (a.round - b.round)
+          || ((a.append_seq ?? a.created_at ?? 0) - (b.append_seq ?? b.created_at ?? 0)))
         .slice(0, limit)
         .map((x) => ({ round: x.round, record: x.record }));
       return { rows };

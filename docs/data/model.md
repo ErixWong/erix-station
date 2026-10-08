@@ -142,6 +142,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 见 §3。`UNIQUE(run_id, round)`。**`record` jsonb 存上游 RoundRecord 全量原样，是全量真相**——store 的 `load()` 原样返回它（resume / fold 的输入）；`messages` / `folded` / `folded_payload` 是**派生/加速列**，供 SQL 查询与 UI 使用（决策者 2026-09，D2' 对齐；上游 RoundRecord 形状见 runner-integration §9.1）。fold 只影响视图，**档案完整不删**（规格 §9.2）；fold 后原轮 `UPDATE`（`folded=true` + `folded_payload`），不插新行（runner-integration §9.3）。写入方 = portal internal 端点（`PUT .../transcript/rounds/:round`，按 round 幂等 + `dedupKey` 双保险）；runner 侧是 HTTP adapter 调用方，不直连 DB。
 
+**`append_seq` 与同 round 保序（迁移 0016，erix-agent 0.16.0）**：同一 `(transcript_key, round)` 可有多行（CLI 行号复用 + 引擎 `:resume` 补跑重落盘；session 行 `run_id IS NULL` 不受 `UNIQUE(run_id, round)` 限制）。`append_seq bigint`（默认 `nextval`）是**持久化追加序列**，新行由序列保证严格追加序；存量行按 `created_at, id` 确定性回填（历史行近似还原）。`load()` 契约要求按追加序返回同 round 记录（引擎不再二次排序），故 `getSessionTranscript` / legacy `getTranscript` 用 `ORDER BY round ASC, append_seq ASC`——不得依赖 `created_at`、执行计划或主键扫描顺序（真机已存在 `created_at` 完全相同的同轮行）。
+
 ### 1.11 `run_checkpoints` — run snapshot（crash-resume 的落点）
 
 **每 transcript key 一行**（run 模式以 run 为 key，session 模式以 session 为 key）：erix-agent 0.14.0 的 `saveRunSnapshot` / `loadLatestRunSnapshot` 是**latest-only 覆盖读写**。写入语义 = `INSERT ... ON CONFLICT ... WHERE run_checkpoints.revision < EXCLUDED.revision`（单行覆盖 + **revision CAS**，重试同一 revision 安全；portal.md §9）。这组 optional snapshot 能力成对实现时提供 crash-resume；写失败经 HTTP adapter retry 后仍抛 `checkpoint_failed`（runner-integration §9.2）。原「本地 file 优先 + DB 异步复制」装饰器建议已按决策者裁定**不采纳**（D2' 纯 DB；代价见 runner-integration §9.4）。
