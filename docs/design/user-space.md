@@ -434,6 +434,8 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | **FDE 容器重建** | reconciler 检测容器 recreate → materializer 重物化该 FDE | 该 FDE 全量（保证新容器拿到完整、自洽文件；bind mount 数据本就在，重物化是幂等确认） |
 | 定时对账 | materializer（周期，如每 5min ⚠️） | 漂移检测：manifest 记录 vs DB 派生 vs 磁盘实际，三向比对，漂移即修 + 告警 |
 
+> **物化状态范围（issue #183）**：materializer 对 `users.status ∈ {active, awaiting_credential}` 的 FDE 都物化——`awaiting_credential`（容器/工作区已在、Git 凭据待补）也是「活」状态，凭据待补**不**阻塞平台文件（否则 agent run 会因缺 `~/.erix/config.json` 而 ENOENT 崩溃）；**`disabled`（offboarding 后）不物化**。凭据到达把状态翻回 `active` 时，portal 会在**同一事务**内补入队一次物化 revision（幂等，head/latest-wins）。
+
 ### 8.2 幂等规则
 
 1. **纯函数**：文件内容 = `f(DB 快照)`，DB 快照相同 → 字节级相同（§5.5）。

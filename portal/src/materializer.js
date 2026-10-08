@@ -344,8 +344,11 @@ function sleep(ms) {
 }
 
 async function readFdeDesiredState(pool, fdeId, config) {
+  // issue #183：awaiting_credential 也是「活」状态（容器/工作区已在，只是 Git 凭据待补），
+  // 平台文件应照常物化——凭据待补不应阻塞 ~/.erix（否则 agent 每次 run 都 ENOENT config.json）。
+  // 仅排除 disabled（offboarding 后不再物化）。
   const user = await pool.query(
-    `SELECT id, fde_name FROM users WHERE id = $1 AND status = 'active'`,
+    `SELECT id, fde_name FROM users WHERE id = $1 AND status IN ('active', 'awaiting_credential')`,
     [fdeId],
   );
   if (user.rows.length === 0) return null;
@@ -485,7 +488,8 @@ export async function rebuildAllFdes(pool, config, { log = console } = {}) {
     log,
   });
   const users = await pool.query(
-    `SELECT id, fde_name FROM users WHERE fde_name IS NOT NULL AND status = 'active'`,
+    // issue #183：与 readFdeDesiredState 同口径——awaiting_credential 照常物化，disabled 跳过。
+    `SELECT id, fde_name FROM users WHERE fde_name IS NOT NULL AND status IN ('active', 'awaiting_credential')`,
   );
   for (const u of users.rows) {
     const state = await readFdeDesiredState(pool, u.id, config);

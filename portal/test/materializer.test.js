@@ -16,6 +16,7 @@ import {
   buildFilePlan,
   createMaterializer,
   runMaterializerOnce,
+  rebuildAllFdes,
   hostPathFor,
   CONTAINER_HOME,
 } from '../src/materializer.js';
@@ -167,6 +168,83 @@ test('runMaterializerOnce：P5 不再查询 projects；allocations 平铺落 FDE
     assert.equal(ports.fde, 'alice');
     assert.equal(ports.allocations.length, 1);
     assert.equal(ports.allocations[0].url, ALLOC.url);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * issue #183：按 users.status 过滤的 fake pool——允许集合从 SQL 里解析（存在 'awaiting_credential'
+ * 即允许该状态），只有当前状态被允许时才返回用户行。这样测试同时锁住「行为」与「SQL 契约」：
+ * 一旦过滤退回 status = 'active'，awaiting_credential 用例就会落空。
+ */
+function statusFilterPool({ userStatus, allocations = [ALLOC] } = {}) {
+  const allowedStatuses = (sql) => (sql.includes("'awaiting_credential'") ? ['active', 'awaiting_credential'] : ['active']);
+  const userMatches = (sql) => allowedStatuses(sql).includes(userStatus);
+  return {
+    async query(sql) {
+      if (sql.includes('FROM users')) {
+        return { rows: userMatches(sql) ? [{ id: 'u1', fde_name: 'alice' }] : [] };
+      }
+      if (sql.includes('FROM port_allocations')) return { rows: allocations.map((a) => ({ ...a })) };
+      if (sql.includes('FROM materialize_revisions')) return { rows: [{ revision: 1 }] };
+      if (sql.startsWith('UPDATE materialize_outbox')) return { rows: [] };
+      throw new Error(`unexpected pool query: ${sql}`);
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+          if (sql.includes('RETURNING o.id')) {
+            return { rows: [{ id: 'outbox-1', fde_id: 'u1', revision: 1, op: 'upsert' }] };
+          }
+          if (sql.startsWith('UPDATE materialize_outbox')) return { rows: [] };
+          throw new Error(`unexpected client query: ${sql}`);
+        },
+        release() {},
+      };
+    },
+  };
+}
+
+const MATERIALIZER_CONFIG = (root) => ({
+  userSpaceRoot: root,
+  llmPublicBaseUrl: 'http://llm.localhost:8090',
+  baseDomain: 'localhost',
+});
+
+function configJsonPath(root) {
+  return path.join(root, 'alice', 'home', '.erix', 'config.json');
+}
+
+test('runMaterializerOnce：awaiting_credential 的 FDE 照常物化平台文件（issue #183）', async () => {
+  const root = tmpdir();
+  try {
+    const result = await runMaterializerOnce(statusFilterPool({ userStatus: 'awaiting_credential' }), MATERIALIZER_CONFIG(root));
+    assert.deepEqual(result, { processed: 1, claimed: 1 }, 'awaiting_credential 不得被物化过滤丢弃');
+    assert.ok(fs.existsSync(configJsonPath(root)), '凭据待补不阻塞 ~/.erix/config.json 落盘');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runMaterializerOnce：disabled 的 FDE 仍被跳过（回归，offboarding 后不再物化）', async () => {
+  const root = tmpdir();
+  try {
+    const result = await runMaterializerOnce(statusFilterPool({ userStatus: 'disabled' }), MATERIALIZER_CONFIG(root));
+    assert.deepEqual(result, { processed: 0, claimed: 1 });
+    assert.equal(fs.existsSync(configJsonPath(root)), false, 'disabled 不得物化');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rebuildAllFdes：启动全量重物化覆盖 awaiting_credential（存量自愈）', async () => {
+  const root = tmpdir();
+  try {
+    const count = await rebuildAllFdes(statusFilterPool({ userStatus: 'awaiting_credential' }), MATERIALIZER_CONFIG(root));
+    assert.equal(count, 1);
+    assert.ok(fs.existsSync(configJsonPath(root)), 'rebuildAllFdes 必须把 awaiting_credential 也纳入');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

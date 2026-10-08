@@ -7,6 +7,7 @@ import {
   removeAllGitCliConfigFiles,
   upsertGitCliConfig,
 } from './git-cli-config.js';
+import { enqueueMaterializeChange } from './outbox.js';
 
 const CREDENTIAL_FILE = '.git-credentials';
 const FILE_MODE = 0o640;
@@ -200,35 +201,68 @@ async function writeAudit(pool, actorId, action, fdeName, details) {
   );
 }
 
-async function updateAssignedAccount(pool, fdeName, host, username, configured) {
-  const result = await pool.query(
-    `SELECT u.id AS fde_id, a.git_host_id, h.base_url
-       FROM users u
-       JOIN fde_git_accounts a ON a.fde_id = u.id AND a.token_ref IS NULL
-       JOIN git_hosts h ON h.id = a.git_host_id
-      WHERE u.fde_name = $1`,
-    [fdeName],
-  );
-  for (const row of result.rows) {
-    let assignedHost;
-    try {
-      assignedHost = new URL(row.base_url).host.toLowerCase();
-    } catch {
-      continue;
-    }
-    if (assignedHost !== host) continue;
-    await pool.query(
-      `UPDATE fde_git_accounts
-          SET remote_login = $3, updated_at = now()
-        WHERE fde_id = $1 AND git_host_id = $2 AND token_ref IS NULL`,
-      [row.fde_id, row.git_host_id, configured ? username : null],
-    );
-    await pool.query(
-      `UPDATE users SET status = $2
-        WHERE id = $1 AND status = $3`,
-      [row.fde_id, configured ? 'active' : 'awaiting_credential', configured ? 'awaiting_credential' : 'active'],
-    );
+async function withTransaction(pool, work) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
+}
+
+/**
+ * 写回 FDE 的 Git 账户/用户状态。
+ *
+ * configured=true（投放凭据）时 awaiting_credential→active，并在**同一事务**内入队一次物化
+ * revision（issue #183）：凭据到达前 FDE 处于 awaiting_credential，其平台文件可能尚未物化；
+ * 状态翻转后必须补一次，否则 ~/.erix 永远缺失 → agent run ENOENT config.json 崩溃。
+ * 重复入队无害（materialize revision 为 head/latest-wins，见 materializer.js 消费逻辑）。
+ * configured=false（删除凭据）active→awaiting_credential 不触发物化——凭据移除不改平台文件。
+ */
+async function updateAssignedAccount(pool, fdeName, host, username, configured) {
+  await withTransaction(pool, async (client) => {
+    const result = await client.query(
+      `SELECT u.id AS fde_id, a.git_host_id, h.base_url
+         FROM users u
+         JOIN fde_git_accounts a ON a.fde_id = u.id AND a.token_ref IS NULL
+         JOIN git_hosts h ON h.id = a.git_host_id
+        WHERE u.fde_name = $1`,
+      [fdeName],
+    );
+    const materializeEnqueued = new Set();
+    for (const row of result.rows) {
+      let assignedHost;
+      try {
+        assignedHost = new URL(row.base_url).host.toLowerCase();
+      } catch {
+        continue;
+      }
+      if (assignedHost !== host) continue;
+      await client.query(
+        `UPDATE fde_git_accounts
+            SET remote_login = $3, updated_at = now()
+          WHERE fde_id = $1 AND git_host_id = $2 AND token_ref IS NULL`,
+        [row.fde_id, row.git_host_id, configured ? username : null],
+      );
+      const flipped = await client.query(
+        `UPDATE users SET status = $2
+          WHERE id = $1 AND status = $3
+          RETURNING id`,
+        [row.fde_id, configured ? 'active' : 'awaiting_credential', configured ? 'awaiting_credential' : 'active'],
+      );
+      // 仅「凭据到达且确实从 awaiting_credential 翻到 active」时补物化（同事务）。
+      if (configured && flipped.rows.length > 0 && !materializeEnqueued.has(row.fde_id)) {
+        await enqueueMaterializeChange(client, { fdeId: row.fde_id, op: 'upsert' });
+        materializeEnqueued.add(row.fde_id);
+      }
+    }
+  });
 }
 
 function validateUsername(username) {
