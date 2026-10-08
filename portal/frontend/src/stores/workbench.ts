@@ -58,6 +58,18 @@ export interface ProjectedToolCall {
   executionStatus?: string;
 }
 
+/**
+ * issue #189：助手消息 DTO 的折叠段信息（后端契约：只在有折叠时出现，无则不写 `folded` 键）。
+ * 字段名与上游一致（foldedRoundRange / navigationRecord / foldedPayloadMessages），原样透传；
+ * `navigationRecord` 本单不渲染，原样存着即可。
+ */
+export interface FoldedInfo {
+  text: string;
+  foldedRoundRange?: { from?: number; to?: number };
+  navigationRecord?: unknown;
+  foldedPayloadMessages?: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: string;
@@ -70,11 +82,34 @@ export interface ChatMessage {
   reasoning?: string;
   blocks?: unknown[]; // 原始 content blocks（全文在此；卡片预览已由上游截断，本单不渲染）
   turnKeys?: string[]; // 0.16.0：聚合进本 run 的助手轮视图键（`turn.key`，逐字透传）
+  // issue #189：折叠段（compaction）摘要（有折叠才出现）；渲染为独立横幅，绑定在该助手消息上。
+  folded?: FoldedInfo;
 }
+
+/**
+ * issue #189：原文端点（GET /api/sessions/:id/folded/:round）返回的 DisplayTurn 形状。
+ * 本单只渲染 `text`（纯文本），其余字段原样保留不解读。
+ */
+export interface FoldedOriginalTurn {
+  text?: string;
+  [key: string]: unknown;
+}
+
+/** 原文懒加载状态：missing=后端 404（folded_payload_not_found，友好提示，不抛红）；error=其他错误（可重试）。 */
+export type FoldedOriginalState =
+  | { status: 'loading' }
+  | { status: 'loaded'; turns: FoldedOriginalTurn[] }
+  | { status: 'missing' }
+  | { status: 'error'; message: string };
 
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
 export type StreamEntry =
-  | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null }
+  | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null; sessionId: string | null }
+  // issue #189：折叠横幅独立 entry（**方案说明**：独立 kind 而非在 msg entry 加 folded 字段——
+  // msg 分支渲染 .msg 气泡，加字段会诱导把横幅画进气泡内；独立 kind 天然渲染成独立分隔条
+  // （非 .msg 类），并与该助手消息绑定（id=消息 id，排在正文气泡前）。renderedIds 去重、
+  // 消息顺序、会话切换复位都自动沿用既有链路。）
+  | { kind: 'folded'; id: string; sessionId: string | null; folded: FoldedInfo }
   | { kind: 'sep'; text: string; variant?: 'judge' }
   | { kind: 'syserr'; text: string }
   | { kind: 'tool'; callId: string }
@@ -204,6 +239,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // 仅助手终稿渲染 Markdown 子集（先转义后格式化，XSS 安全）；用户消息与系统注入
     // （synthetic）保持纯文本。流式增量（delta）全程文本追加，run_end 终稿经
     // refreshSession → addMessage 整体渲染（半截 ``` 不炸布局）。
+    // issue #189：有折叠时在正文气泡前推一条独立折叠横幅 entry（绑定消息 id，非 .msg 气泡视觉）。
+    if (m.folded && typeof m.folded === 'object' && typeof m.folded.text === 'string') {
+      entries.value.push({ kind: 'folded', id: m.id, sessionId: sessionId.value, folded: m.folded });
+    }
     const isMd = m.role === 'assistant' && !m.synthetic;
     entries.value.push({
       kind: 'msg',
@@ -212,8 +251,69 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       synthetic: !!m.synthetic,
       text: (m.synthetic ? t('workbench.systemInjection', { content: m.content }) : m.content),
       html: isMd ? renderMarkdown(m.content) : null,
+      sessionId: sessionId.value, // issue #189：横幅「查看原文」按 (会话, 轮) 调端点，绑定所属会话
     });
   }
+
+  // ---- issue #189：折叠段原文懒加载（GET /api/sessions/:id/folded/:round，只读）----
+  // 按 (sessionId, round) 缓存；404（folded_payload_not_found）视为「无原文」（missing 态，友好提示不抛红）；
+  // 其他错误可重试。loading/loaded/missing/error 四态暴露给 StreamPanel。
+  const foldedOriginals = ref<Record<string, FoldedOriginalState>>({});
+
+  function foldedOriginalKey(sid: string, round: number): string {
+    return `${sid}:${round}`;
+  }
+
+  /** 取当前折叠原文状态（无记录 = 尚未加载，组件按 idle 处理）。 */
+  function getFoldedOriginal(sid: string, round: number): FoldedOriginalState | undefined {
+    return foldedOriginals.value[foldedOriginalKey(sid, round)];
+  }
+
+  /**
+   * 懒加载某轮折叠前原文。已加载/加载中直接返回（缓存命中不重发）；error 态由组件传
+   * force=true 重试。返回加载后的状态，便于调用方/测试断言。
+   */
+  async function loadFoldedOriginal(
+    sid: string,
+    round: number,
+    opts: { force?: boolean } = {},
+  ): Promise<FoldedOriginalState> {
+    const key = foldedOriginalKey(sid, round);
+    const cur = foldedOriginals.value[key];
+    if (cur && !(opts.force && cur.status === 'error')) return cur;
+    foldedOriginals.value[key] = { status: 'loading' };
+    try {
+      const data = await api<{ round: number; turns: FoldedOriginalTurn[] }>(
+        `/api/sessions/${encodeURIComponent(sid)}/folded/${encodeURIComponent(String(round))}`,
+      );
+      const next: FoldedOriginalState = { status: 'loaded', turns: Array.isArray(data.turns) ? data.turns : [] };
+      foldedOriginals.value[key] = next;
+      return next;
+    } catch (e) {
+      const next: FoldedOriginalState =
+        e instanceof ApiError && (e.status === 404 || e.code === 'folded_payload_not_found')
+          ? { status: 'missing' }
+          : { status: 'error', message: e instanceof Error ? e.message : String(e) };
+      foldedOriginals.value[key] = next;
+      return next;
+    }
+  }
+
+  /**
+   * issue #189（追加）：当前会话头部状态行数据（前端已有数据，不改后端/不加 API）：
+   * messages = 已加载消息条数（msg entry 数），folded = DTO 带 folded 字段的消息条数
+   * （每有折叠的消息只推一条 folded entry，故两者相等）。无选中会话 → null（不渲染）。
+   */
+  const sessionStats = computed(() => {
+    if (!sessionId.value) return null;
+    let messages = 0;
+    let folded = 0;
+    for (const en of entries.value) {
+      if (en.kind === 'msg') messages++;
+      else if (en.kind === 'folded') folded++;
+    }
+    return { messages, folded };
+  });
 
   // ---- 流式增量气泡（旧 S.deltaBuf DOM 的数组等价：round_start 后半截增量留在流里）----
   let deltaEntry: Extract<StreamEntry, { kind: 'delta' }> | null = null;
@@ -625,5 +725,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, send, stop, refreshSession,
+    // issue #189：折叠段原文懒加载 + 会话头部状态行计数
+    foldedOriginals, getFoldedOriginal, loadFoldedOriginal, sessionStats,
   };
 });

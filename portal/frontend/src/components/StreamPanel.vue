@@ -4,7 +4,7 @@
 // roundsep/syserr 分隔行、流式增量气泡。自动跟随/「↓ 最新」由父级持有（scroll 容器也在父级）。
 import { reactive, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
-import { useWorkbenchStore, type StreamEntry } from '../stores/workbench';
+import { useWorkbenchStore, type StreamEntry, type FoldedInfo, type FoldedOriginalState } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
 // issue #85：卡片折叠（默认收起）+ 单行摘要防溢出，方案对齐 pi web ToolCallBlock。
 import { getToolPreview } from '../lib/toolSummary';
@@ -83,9 +83,64 @@ function reasoningSummary(text: string): string {
   return text.split('\n')[0].slice(0, 120);
 }
 
+// issue #189：折叠横幅展开态（组件内，默认收起），与推理块同一交互风格。
+type FoldedEntry = Extract<StreamEntry, { kind: 'folded' }>;
+
+const expandedFolded = reactive(new Set<string>());
+
+function isFoldedExpanded(id: string): boolean {
+  return expandedFolded.has(id);
+}
+
+function toggleFolded(id: string): void {
+  if (expandedFolded.has(id)) expandedFolded.delete(id);
+  else expandedFolded.add(id);
+}
+
+// 横幅标题分级降级：count+范围 → countOnly → bare（字段缺失时逐级退回，不拼半截文案）。
+function foldedTitle(folded: FoldedInfo): string {
+  const count = folded.foldedPayloadMessages;
+  const range = folded.foldedRoundRange;
+  const from = range?.from;
+  const to = range?.to;
+  if (typeof count === 'number' && typeof from === 'number' && typeof to === 'number') {
+    return t('stream.folded.range', { count, from, to });
+  }
+  if (typeof count === 'number') return t('stream.folded.countOnly', { count });
+  return t('stream.folded.bare');
+}
+
+// 「查看原文」端点按单轮取数：取折叠范围末端 to（缺则 from）；两者都缺时无轮号可查 → 隐藏按钮。
+function foldedQueryRound(folded: FoldedInfo): number | null {
+  const to = folded.foldedRoundRange?.to;
+  const from = folded.foldedRoundRange?.from;
+  if (typeof to === 'number') return to;
+  if (typeof from === 'number') return from;
+  return null;
+}
+
+function loadOriginal(en: FoldedEntry): void {
+  const round = foldedQueryRound(en.folded);
+  if (en.sessionId == null || round == null) return;
+  void store.loadFoldedOriginal(en.sessionId, round);
+}
+
+function retryOriginal(en: FoldedEntry): void {
+  const round = foldedQueryRound(en.folded);
+  if (en.sessionId == null || round == null) return;
+  void store.loadFoldedOriginal(en.sessionId, round, { force: true });
+}
+
+function foldedOriginalState(en: FoldedEntry): FoldedOriginalState | undefined {
+  const round = foldedQueryRound(en.folded);
+  if (en.sessionId == null || round == null) return undefined;
+  return store.getFoldedOriginal(en.sessionId, round);
+}
+
 function entryKey(en: StreamEntry, i: number): string {
   switch (en.kind) {
     case 'msg': return 'm' + en.id;
+    case 'folded': return 'f' + en.id;
     case 'tool': return 't' + en.callId;
     case 'reasoning': return 'r' + en.id;
     case 'delta': return 'd' + i;
@@ -103,6 +158,12 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
 </script>
 
 <template>
+  <!-- issue #189（追加）：当前会话头部状态行「N 条消息 · 已压缩 M 次」（M=0 降级只显示条数；无选中会话不渲染）
+       + 仅 M≥1 时一句克制提示（无弹窗/动画） -->
+  <p v-if="store.sessionStats && store.sessionStats.messages > 0" class="session-stats mb-2 text-xs text-black/40">
+    {{ t('stream.sessionStats', { count: store.sessionStats.messages }) }}<template v-if="store.sessionStats.folded > 0"> · {{ t('stream.sessionStatsCompacted', { count: store.sessionStats.folded }) }}</template>
+    <span v-if="store.sessionStats.folded >= 1" class="session-compaction-hint block">{{ t('stream.sessionCompactionHint') }}</span>
+  </p>
   <!-- 空态：旧版「选择或新建会话」默认文案（平台管理员进管理台引导） -->
   <div v-if="store.entries.length === 0">
     <p v-if="store.noDir && store.isPlatformAdmin" class="muted">
@@ -120,6 +181,52 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
          类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
     <div v-else-if="en.kind === 'delta'" class="msg assistant md" v-html="renderMarkdown(en.text)"></div>
+    <!-- issue #189：折叠横幅（**独立视觉**：非 .msg 气泡，琥珀色左边框 + 虚线分隔条，绑定助手消息 id，
+         排在正文气泡前）。标题带压缩条数/轮范围（缺字段逐级降级）；摘要默认收起，点击展开；
+         「查看原文」→ 只读懒加载原文 turns（loading / 404 友好提示 / error+重试）。 -->
+    <div
+      v-else-if="en.kind === 'folded'"
+      class="folded-banner my-1.5 max-w-[46rem] rounded-md border border-dashed border-black/20 border-l-4 border-l-amber-500 bg-amber-50/60 px-3 py-1.5 text-sm"
+    >
+      <button
+        type="button"
+        class="folded-toggle flex w-full min-w-0 items-center gap-2 text-left"
+        :aria-expanded="isFoldedExpanded(en.id)"
+        @click="toggleFolded(en.id)"
+      >
+        <span class="shrink-0 font-semibold text-black/60">🗜 {{ foldedTitle(en.folded) }}</span>
+        <span
+          class="shrink-0 text-black/50 transition-transform duration-150"
+          :class="{ 'rotate-180': isFoldedExpanded(en.id) }"
+        >▾</span>
+      </button>
+      <!-- 摘要：默认收起，展开后纯文本全文 -->
+      <pre v-if="isFoldedExpanded(en.id)" class="folded-summary mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ en.folded.text }}</pre>
+      <!-- 查看原文（轮号可推导才展示；只读懒加载，按 (会话,轮) 缓存） -->
+      <div v-if="en.sessionId != null && foldedQueryRound(en.folded) != null" class="mt-1 flex items-center gap-2">
+        <button
+          type="button"
+          class="view-original rounded-md border border-black/20 px-2 py-0.5 text-xs hover:bg-black/5"
+          @click="loadOriginal(en)"
+        >{{ t('stream.folded.viewOriginal') }}</button>
+      </div>
+      <div v-if="foldedOriginalState(en)" class="folded-original mt-1">
+        <div v-if="foldedOriginalState(en)!.status === 'loading'" class="text-xs text-black/40">{{ t('common.loading') }}</div>
+        <div v-else-if="foldedOriginalState(en)!.status === 'missing'" class="folded-original-missing text-xs text-black/40">{{ t('stream.folded.originalMissing') }}</div>
+        <template v-else-if="foldedOriginalState(en)!.status === 'loaded'">
+          <div
+            v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns"
+            :key="ti"
+            class="folded-original-turn whitespace-pre-wrap break-all text-black/70"
+          >{{ (turn as { text?: string }).text || t('stream.folded.originalEmpty') }}</div>
+          <div v-if="(foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns.length === 0" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>
+        </template>
+        <div v-else-if="foldedOriginalState(en)!.status === 'error'" class="folded-original-error flex items-center gap-2 text-xs text-red-600">
+          <span>{{ t('stream.folded.originalError', { message: (foldedOriginalState(en) as { status: 'error'; message: string }).message }) }}</span>
+          <button type="button" class="retry-original rounded-md border border-black/20 px-2 py-0.5 hover:bg-black/5" @click="retryOriginal(en)">{{ t('common.retry') }}</button>
+        </div>
+      </div>
+    </div>
     <!-- roundsep / 系统分隔行（judge 事件以 variant='judge' 走黄色面板样式） -->
     <div v-else-if="en.kind === 'sep'" :class="en.variant === 'judge' ? 'roundsep judge-panel' : 'roundsep'">{{ en.text }}</div>
     <!-- issue #42：红色系统错误行 -->
