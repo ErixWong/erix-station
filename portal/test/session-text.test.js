@@ -103,3 +103,47 @@ test('fetchConversationTurns：排除当前 message、返回升序、正文取 t
     ['assistant', 'transcript 答一'],
   ], '升序 + 排除当前 message');
 });
+
+// ---------------------------------------------------------------------------
+// P3 PR②b B2：`messages.content` 降级为锚点行（停写正文）后的读侧语义
+// ---------------------------------------------------------------------------
+
+test('P3 PR②b B2：新行 content=\'\' → 读侧仍取 transcript；老行（content 有值）走 legacy 兜底', async () => {
+  const pool = textPool({
+    messages: [
+      userAnchor('new-user', 1, ''),            // B2 之后的新行：锚点无正文
+      userAnchor('legacy-user', 3, '老行正文'),  // 迁移 0015/B2 之前入档：锚点仍带正文
+    ],
+    transcriptRows: [inputTranscriptRow({ sessionId: SESSION_ID, messageId: 'new-user', text: '新行正文', round: 1 })],
+  });
+  const turns = await fetchUserTextTurns(pool, { sessionId: SESSION_ID });
+  assert.deepEqual(turns.map((t) => [t.seq, t.text, t.source]), [
+    [1, '新行正文', 'transcript'],
+    [3, '老行正文', 'legacy'],
+  ], '新行不写正文也不掉文本；兜底只对老数据生效');
+});
+
+test('P3 PR②b B2：content=\'\' 且投影无证据 → 空串（新行不报错、不回填假正文）', async () => {
+  const pool = textPool({ messages: [userAnchor('m-new', 1, '')], transcriptRows: [] });
+  const turns = await fetchUserTextTurns(pool, { sessionId: SESSION_ID });
+  assert.deepEqual(turns.map((t) => [t.text, t.source]), [['', 'empty']]);
+});
+
+test('P3 PR②b B2 前瞻规则：synthetic=true 的注入行必须仍写正文，读侧取锚点自身文本', async () => {
+  // judge/wrapup 之类宿主注入行在 transcript 里没有对应轮次，正文只能落在 `messages.content`。
+  // 当前无此类写入点（全库 synthetic 恒 false），本用例以构造行钉住这条约束：
+  // 写侧将来实现注入时若误写空串，本用例的读侧形状会先给出可诊断的空正文。
+  const injected = {
+    id: 'judge-1', session_id: SESSION_ID, run_id: RUN_1, seq: 2, role: 'user',
+    content: 'judge 方向提示正文', synthetic: true, attachments: [],
+  };
+  const pool = textPool({ messages: [injected], transcriptRows: [] });
+
+  const turns = await fetchUserTextTurns(pool, { sessionId: SESSION_ID });
+  assert.deepEqual(turns.map((t) => [t.text, t.source]), [['judge 方向提示正文', 'anchor']],
+    '合成行正文来自锚点自身（不经投影、不算 legacy）');
+
+  const history = await fetchConversationTurns(pool, { sessionId: SESSION_ID, maxMessages: 20, excludeMessageId: 'none' });
+  assert.deepEqual(history.map((t) => [t.role, t.content]), [['user', 'judge 方向提示正文']],
+    '历史上行同样保留合成行正文');
+});

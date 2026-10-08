@@ -396,11 +396,19 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
       [s.id],
     );
     const seq = Number(seqRes.rows[0].last_seq);
+    // P3 PR②b B2（docs/design/conversation-state.md §6）：**停止正文双写**——`messages` 降级为纯锚点行。
+    // `content` 恒写空串：用户输入的文本真相已由下方 `appendUserInputTurn` 落在 `transcript_rounds`，
+    // 读侧（`session-view.js` / `session-text.js`）一律从官方投影取文，本列对**新行**不再有语义。
+    // 列本身仍是 `text NOT NULL`（不改 DDL），故写 `''`。
+    // 前瞻性例外（尚未实现，约束先钉住）：**合成行（`synthetic = true`，宿主注入的 judge/wrapup 之类）
+    // 必须继续写正文**——它在 transcript 里没有对应轮次，读侧取的就是锚点自身文本
+    // （`session-view.js` 的 `anchor.synthetic === true` 分支 + `session-text.js` 的 `CASE WHEN synthetic`）。
+    // 本路径（POST 用户消息）恒为非合成行，故可无条件写空串。
     const msg = await client.query(
       `INSERT INTO messages (session_id, seq, role, content, attachments)
-       VALUES ($1, $2, 'user', $3, $4)
+       VALUES ($1, $2, 'user', '', $3)
        RETURNING id, seq, role, content, attachments, created_at`,
-      [s.id, seq, safeContent, JSON.stringify(safeAttachments)],
+      [s.id, seq, JSON.stringify(safeAttachments)],
     );
 
     // P3 契约①（erix-agent 0.15.0 起，写侧由引擎 appendUserTurn 承担）：同事务先将用户输入
@@ -460,7 +468,11 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
         run_id: runId,
         seq: Number(msg.rows[0].seq),
         role: 'user',
-        content: msg.rows[0].content,
+        // P3 PR②b B2：`messages.content` 已降级为锚点元数据（新行恒为空串），故 202 响应体的 `content`
+        // **回显请求正文** `safeContent`（不是从 messages 读回来）：前端 `send()` 直接拿本响应渲染用户
+        // 气泡（portal.md §4.3），写空串会让刚发出的消息渲染成空气泡。此处不违反「不读 messages.content」：
+        // 它是调用方刚提交的入参，且下一句 `appendUserInputTurn` 已把它写入 transcript（文本真相）。
+        content: safeContent,
         synthetic: false,
         attachments: safeAttachments,
         created_at: msg.rows[0].created_at?.toISOString?.() ?? msg.rows[0].created_at,

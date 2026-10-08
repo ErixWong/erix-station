@@ -368,7 +368,11 @@ test('setRunState：终态收敛（finished）合成 run_end + usage_ledger + as
   assert.equal(pool.runs[0].status, 'finished');
   assert.ok(pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run1:final:run_end'));
   assert.equal(pool.usage.length, 1);
-  assert.ok(pool.messages.some((m) => m.content === 'done' && m.role === 'assistant'));
+  // P3 PR②b B2（写入点②）：assistant 锚点仍按「有终态文本才建行」产生，但 **不再写正文**。
+  const assistant = pool.messages.find((m) => m.role === 'assistant');
+  assert.ok(assistant, 'final_text 非空→仍必须产生 assistant 锚点行');
+  assert.equal(assistant.content, '', 'P3 PR②b B2：assistant 锚点 content 恒为空串（正文已迁 transcript）');
+  assert.equal(assistant.run_id, runId);
 });
 
 test('postEvents：seq 单调、无空洞；重复 client_event_id 幂等命中不耗 seq', async () => {
@@ -693,7 +697,7 @@ test('U2 finish：title 字段校验——非字符串 400；超长字符串截�
 });
 
 test('F4：U2 finish 同载荷重放幂等（200），载荷不同 409 run_terminal', async () => {
-  const { pool, userId, containerId, runId } = seedClaimable();
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
   const container = { id: containerId, user_id: userId };
   const user = { id: userId, login: 'alice' };
   const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
@@ -703,6 +707,9 @@ test('F4：U2 finish 同载荷重放幂等（200），载荷不同 409 run_termi
   const payload = { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 10, output_tokens: 3 }, rounds: 1, final_text: 'done' };
   const r1 = await setRunState(pool, { container, user, runId, claimToken, body: payload });
   assert.equal(r1.state, 'finished');
+  // P3 PR②b B2：assistant 锚点不再写正文（content=''）→ final_text 幂等比对只能从 transcript 投影取数。
+  // 真机形态：引擎已将该轮（含终态答复）写入 transcript，此处补上该行以还原取数路径。
+  pool.rounds.push(engineRow(sessionId, runId, 4, 'done'));
 
   // 同载荷重放 → 200 幂等成功（不再 409）。
   const r2 = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
@@ -1077,6 +1084,11 @@ test('P3 PR②b ⑥ legacy 兜底：transcript 对该 run 无证据 → final_te
   await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
   const payload = { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 1, final_text: 'done' };
   await setRunState(pool, { container, user, runId, claimToken, body: payload });
+  // P3 PR②b B2：新写路径 content=''，所以本用例要先把锚点扮成**老数据**（迁移 0015/B2 之前入档、
+  // 正文仍在 `messages.content` 的行）；该 run 无 transcript 行 → 投影无证据 → 必须走 legacy 兜底。
+  const anchor = pool.messages.find((m) => m.role === 'assistant');
+  assert.equal(anchor.content, '', '新写路径本身不写正文（兜底只对老行有效）');
+  anchor.content = 'done';
   const replay = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
   assert.equal(replay.idempotent, true, '老会话（无 transcript 证据）幂等重放仍成立');
 });
