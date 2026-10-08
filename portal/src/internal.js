@@ -1558,10 +1558,15 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       );
       committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
     } else if (Number(qrow.attempts) < Number(qrow.max_attempts)) {
+      // A5（决策者 2026-10-08 选 B：实现随文档）：attempt 级失败**不回写 runs.status、不回跳**。
+      // requeue 只回 `run_queue`（→ pending），`runs.status` 保持实际值（worker 崩溃时通常 running）；
+      // §9.6 U2 转换表的 `running→queued` 仍为非法，release 不再绕过它。
+      // 回写不承重：认领 SQL（tryClaim，见 :218）按 `r.status IN ('queued','running')` + queue `pending`/租约过期过滤，
+      // 故崩溃后停在 running 照样能被重领（attempts < max_attempts + 租约过期即可），不漏消息；
+      // 消息安全靠「同事务写 transcript + 插 run_queue」（P3 红线），与 run 状态无关。
       await client.query(`UPDATE run_queue SET status='pending', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
-      await client.query(`UPDATE runs SET status='queued' WHERE id=$1`, [runId]);
       outcome = 'requeued';
-      runStatus = 'queued';
+      runStatus = r.status; // 反映真实 runs.status（不再回写）：requeue 后仍为 running/queued，不回跳
       queueStatus = 'pending';
     } else {
       await client.query(`UPDATE run_queue SET status='done', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
