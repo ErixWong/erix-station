@@ -231,3 +231,200 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     expect(wrapper.get('pre').text()).toContain('第二行细节');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #189：折叠段（compaction）横幅——独立视觉、摘要默认收起、「查看原文」只读懒加载
+// （loading → turns / 404 友好提示 / error + 重试）；会话头部状态行（N 条消息 · 已压缩 M 次）。
+// ---------------------------------------------------------------------------
+function foldedEntry(over: { id?: string; sessionId?: string | null; folded?: Record<string, unknown> } = {}) {
+  return {
+    kind: 'folded' as const,
+    id: over.id ?? 'm2',
+    sessionId: over.sessionId === undefined ? 's1' : over.sessionId,
+    folded: {
+      text: '折叠摘要全文\n第二行',
+      foldedRoundRange: { from: 2, to: 5 },
+      foldedPayloadMessages: 9,
+      ...(over.folded ?? {}),
+    },
+  };
+}
+
+function mockFoldedFetch(handler: (url: string) => { status: number; body: unknown }) {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) =>
+    new Response(JSON.stringify(handler(url).body), {
+      status: handler(url).status,
+      headers: { 'Content-Type': 'application/json' },
+    })));
+}
+
+describe('issue #189：折叠横幅渲染', () => {
+  it('有折叠 → 独立横幅（非 .msg 气泡）：标题「已压缩 9 条消息（第 2–5 轮）」', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    const banner = wrapper.get('.folded-banner');
+    expect(banner.classes()).not.toContain('msg'); // 独立视觉：不是普通气泡
+    expect(banner.text()).toContain('已压缩 9 条消息（第 2–5 轮）');
+    expect(wrapper.findAll('.msg')).toHaveLength(0);
+  });
+
+  it('无折叠消息 → 不渲染横幅', () => {
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'assistant', content: '普通消息' });
+    const plain = mountPanel();
+    expect(plain.find('.folded-banner').exists()).toBe(false);
+    expect(store.sessionStats?.folded).toBe(0);
+  });
+
+  it('字段缺失逐级降级：缺范围 → 「已压缩 N 条消息」；再缺条数 → 「已压缩」', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { foldedRoundRange: undefined } }));
+    store.entries.push(foldedEntry({ id: 'm3', folded: { text: 'x', foldedRoundRange: undefined, foldedPayloadMessages: undefined } }));
+    const wrapper = mountPanel();
+    const banners = wrapper.findAll('.folded-banner');
+    expect(banners[0].text()).toContain('已压缩 9 条消息');
+    expect(banners[0].text()).not.toContain('第 ');
+    expect(banners[1].text()).toContain('已压缩');
+    expect(banners[1].text()).not.toContain('9');
+  });
+
+  it('摘要默认收起，点击展开显示全文，再点收起', async () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    const btn = wrapper.get('.folded-toggle');
+    expect(btn.attributes('aria-expanded')).toBe('false');
+    expect(wrapper.find('.folded-summary').exists()).toBe(false);
+
+    await btn.trigger('click');
+    expect(wrapper.get('.folded-toggle').attributes('aria-expanded')).toBe('true');
+    expect(wrapper.get('.folded-summary').text()).toContain('折叠摘要全文');
+    expect(wrapper.get('.folded-summary').text()).toContain('第二行');
+
+    await wrapper.get('.folded-toggle').trigger('click');
+    expect(wrapper.find('.folded-summary').exists()).toBe(false);
+  });
+
+  it('「查看原文」→ 调懒加载端点并只读渲染返回 turns；再点不重发（缓存）', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 5, turns: [{ role: 'user', text: '原文甲' }, { role: 'assistant', text: '' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    const fetchUrl = String(vi.mocked(fetch).mock.calls.find(([u]) => String(u).includes('/folded/'))?.[0]);
+    expect(fetchUrl).toBe('/api/sessions/s1/folded/5'); // 取范围末端 to
+    const turns = wrapper.findAll('.folded-original-turn');
+    expect(turns).toHaveLength(2);
+    expect(turns[0].text()).toBe('原文甲');
+    expect(turns[1].text()).toBe('（无文本内容）'); // 空 text 降级占位
+
+    await wrapper.get('.view-original').trigger('click'); // 缓存命中不重发
+    await flushPromises();
+    expect(vi.mocked(fetch).mock.calls.filter(([u]) => String(u).includes('/folded/'))).toHaveLength(1);
+  });
+
+  it('原文 404 → 友好提示（非红错）', async () => {
+    mockFoldedFetch(() => ({ status: 404, body: { error: { code: 'folded_payload_not_found', message: 'gone' } } }));
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.folded-original-missing').text()).toBe('原文已不可用（上游未保留折叠前载荷）');
+    expect(wrapper.find('.folded-original-error').exists()).toBe(false);
+  });
+
+  it('轮范围缺失 → 无从推导查询轮号 → 隐藏「查看原文」按钮', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ id: 'm9', folded: { foldedRoundRange: undefined } }));
+    const w2 = mountPanel();
+    expect(w2.find('.view-original').exists()).toBe(false);
+  });
+
+  it('原文加载失败（5xx）→ 红字 + 重试按钮，重试成功渲染 turns', async () => {
+    let fail = true;
+    mockFoldedFetch(() => fail
+      ? { status: 500, body: { error: { code: 'internal', message: 'boom' } } }
+      : { status: 200, body: { round: 5, turns: [{ text: '重试后原文' }] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.folded-original-error').text()).toContain('boom');
+
+    fail = false;
+    await wrapper.get('.retry-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.folded-original-error').exists()).toBe(false);
+    expect(wrapper.get('.folded-original-turn').text()).toBe('重试后原文');
+  });
+
+  it('守卫断言（产品决策）：普通消息不出现轮号标注——轮号只在折叠横幅范围里出现', () => {
+    const store = useWorkbenchStore();
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'user', content: '任务一' });
+    store.addMessage({ id: 'm2', role: 'assistant', content: '答复一', toolCalls: [{ name: 'bash', id: 'c1' }] });
+    store.addMessage({ id: 'm3', role: 'assistant', content: '答复二', reasoning: '想一想' });
+    const wrapper = mountPanel();
+    for (const msg of wrapper.findAll('.msg')) {
+      expect(msg.text()).not.toMatch(/第\s*\d+\s*轮|round\s*\d+/i);
+    }
+    // 折叠横幅是唯一允许出现轮号的位置
+    store.entries.push(foldedEntry());
+    const w2 = mountPanel();
+    expect(w2.get('.folded-banner').text()).toContain('第 2–5 轮');
+  });
+});
+
+describe('issue #189（追加）：会话头部状态行「N 条消息 · 已压缩 M 次」', () => {
+  it('有会话有折叠 → 计数行含压缩次数 + 克制提示', () => {
+    mockFoldedFetch(() => ({ status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'user', content: 'x' });
+    store.addMessage({ id: 'm2', role: 'assistant', content: 'y', folded: { text: '摘要' } });
+    const wrapper = mountPanel();
+    expect(wrapper.get('.session-stats').text()).toContain('2 条消息');
+    expect(wrapper.get('.session-stats').text()).toContain('已压缩 1 次');
+    expect(wrapper.get('.session-compaction-hint').text()).toBe('上下文已开始压缩；如需保留完整细节，建议新开会话');
+  });
+
+  it('有会话无折叠 → 降级只报条数、无压缩段/提示；无会话 → 整行不渲染', () => {
+    const store = useWorkbenchStore();
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'user', content: 'x' }); // 未选中会话 → 整行缺席
+    const noSess = mountPanel();
+    expect(noSess.find('.session-stats').exists()).toBe(false);
+
+    store.sessionId = 's1';
+    const plain = mountPanel();
+    expect(plain.get('.session-stats').text()).toBe('1 条消息');
+    expect(plain.find('.session-compaction-hint').exists()).toBe(false);
+  });
+
+  it('切 English：横幅与状态行文案即时变英文（无硬编码中文）', async () => {
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'user', content: 'x' });
+    store.addMessage({ id: 'm2', role: 'assistant', content: 'y', folded: { text: 's', foldedPayloadMessages: 3, foldedRoundRange: { from: 1, to: 2 } } });
+    setLocale('en');
+    const wrapper = mountPanel();
+    expect(wrapper.get('.session-stats').text()).toContain('2 messages');
+    expect(wrapper.get('.session-stats').text()).toContain('compacted 1×');
+    expect(wrapper.get('.session-compaction-hint').text())
+      .toBe('Context compaction has started; open a new session if you need to keep full details');
+    expect(wrapper.get('.folded-banner').text()).toContain('Compressed 3 messages');
+    expect(wrapper.get('.view-original').text()).toBe('View original');
+    setLocale('zh-CN');
+  });
+});

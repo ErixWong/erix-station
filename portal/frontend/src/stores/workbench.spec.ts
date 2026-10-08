@@ -784,3 +784,137 @@ describe('issue #188：DTO 投影字段（toolCalls/reasoning/blocks）加载路
     expect(store.es.toolCards.has('proj:m2:1')).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #189：折叠段（compaction）——DTO folded → 独立折叠 entry；原文懒加载（缓存/404/错误重试）。
+// ---------------------------------------------------------------------------
+describe('issue #189：折叠段 folded 字段与原文懒加载', () => {
+  it('有 folded → 正文气泡前推独立 folded entry（绑定消息 id 与会话 id）；无 folded → 不推', async () => {
+    mockFetch(() => ({ status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.addMessage({
+      id: 'm1', role: 'assistant', content: '完成',
+      folded: { text: '摘要全文', foldedRoundRange: { from: 2, to: 5 }, foldedPayloadMessages: 9 },
+    });
+    store.addMessage({ id: 'm2', role: 'assistant', content: '无折叠' });
+
+    expect(store.entries.map((e) => e.kind)).toEqual(['folded', 'msg', 'msg']);
+    const banner = store.entries[0];
+    expect(banner.kind).toBe('folded');
+    if (banner.kind === 'folded') {
+      expect(banner.id).toBe('m1'); // 绑定该助手消息
+      expect(banner.sessionId).toBe('s1');
+      expect(banner.folded.text).toBe('摘要全文');
+      expect(banner.folded.foldedRoundRange).toEqual({ from: 2, to: 5 });
+      expect(banner.folded.foldedPayloadMessages).toBe(9);
+    }
+    expect(store.entries.filter((e) => e.kind === 'folded').length).toBe(1); // m2 无折叠不推
+  });
+
+  it('sessionStats：消息条数 + 折叠次数计数；无选中会话为 null（头部状态行数据源）', () => {
+    mockFetch(() => ({ status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    expect(store.sessionStats).toBeNull(); // 未打开会话 → 不渲染
+
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'user', content: '任务' });
+    store.addMessage({ id: 'm2', role: 'assistant', content: 'ok', folded: { text: 's' } });
+    store.addMessage({ id: 'm3', role: 'assistant', content: 'ok2' });
+    expect(store.sessionStats).toEqual({ messages: 3, folded: 1 });
+  });
+
+  it('loadFoldedOriginal：200 → loaded(turns)；按 (sessionId, round) 缓存不重发；不同轮各自加载', async () => {
+    let calls = 0;
+    mockFetch((url) => {
+      if (url.includes('/folded/')) {
+        calls++;
+        const round = url.split('/folded/')[1];
+        return { status: 200, body: { round: Number(round), turns: [{ role: 'user', text: `原文-${round}` }] } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    const first = await store.loadFoldedOriginal('s1', 3);
+    expect(first).toEqual({ status: 'loaded', turns: [{ role: 'user', text: '原文-3' }] });
+    const again = await store.loadFoldedOriginal('s1', 3); // 缓存命中：不再发请求
+    expect(again.status).toBe('loaded');
+    expect(calls).toBe(1);
+
+    await store.loadFoldedOriginal('s1', 4); // 另一轮：独立键
+    expect(calls).toBe(2);
+    await store.loadFoldedOriginal('s2', 3); // 另一会话：独立键
+    expect(calls).toBe(3);
+    expect(store.getFoldedOriginal('s1', 3)?.status).toBe('loaded');
+    expect(store.getFoldedOriginal('s1', 9)).toBeUndefined(); // 未加载 → undefined（组件按 idle）
+    const url = String(vi.mocked(fetch).mock.calls.find(([u]) => String(u).includes('/folded/'))?.[0]);
+    expect(url).toBe('/api/sessions/s1/folded/3');
+  });
+
+  it('loadFoldedOriginal：404 folded_payload_not_found → missing（友好「无原文」，不抛红不抛错）', async () => {
+    mockFetch((url) => url.includes('/folded/')
+      ? { status: 404, body: { error: { code: 'folded_payload_not_found', message: 'gone' } } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    const st = await store.loadFoldedOriginal('s1', 7);
+    expect(st).toEqual({ status: 'missing' });
+    // missing 也进缓存：重复调用不重发
+    const callsBefore = vi.mocked(fetch).mock.calls.length;
+    await store.loadFoldedOriginal('s1', 7);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(callsBefore);
+  });
+
+  it('loadFoldedOriginal：5xx → error(message)，默认不重发；force 重试成功覆盖为 loaded', async () => {
+    let fail = true;
+    mockFetch((url) => {
+      if (url.includes('/folded/')) {
+        return fail
+          ? { status: 500, body: { error: { code: 'internal', message: 'boom' } } }
+          : { status: 200, body: { round: 2, turns: [{ text: '原文' }] } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    const st = await store.loadFoldedOriginal('s1', 2);
+    expect(st).toEqual({ status: 'error', message: 'boom' });
+    await store.loadFoldedOriginal('s1', 2); // 非 force：不重发
+    expect(vi.mocked(fetch).mock.calls.filter(([u]) => String(u).includes('/folded/')).length).toBe(1);
+
+    fail = false;
+    const retry = await store.loadFoldedOriginal('s1', 2, { force: true });
+    expect(retry.status).toBe('loaded');
+  });
+
+  it('openSession：DTO 带 folded 的消息重建折叠 entry（历史加载路径）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            messages: [
+              { id: 'm1', role: 'user', content: '任务', seq: 1 },
+              {
+                id: 'm2', role: 'assistant', content: '完成', seq: 2,
+                folded: { text: '摘要', foldedRoundRange: { from: 1, to: 3 }, foldedPayloadMessages: 4 },
+              },
+            ],
+            last_seq: 2,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.entries.map((e) => e.kind)).toEqual(['msg', 'folded', 'msg']);
+    const banner = store.entries[1];
+    if (banner.kind === 'folded') {
+      expect(banner.id).toBe('m2');
+      expect(banner.sessionId).toBe('s1');
+    }
+  });
+});
