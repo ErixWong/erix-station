@@ -190,3 +190,44 @@ describe('StreamPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.get('button[aria-expanded]').text()).toContain('(generating arguments…)');
   });
 });
+
+describe('issue #188：投影工具卡片与推理块渲染', () => {
+  it('投影卡片渲染 name/argsSummary/resultPreview/executionStatus；isError 变红；展开显示摘要与结果', async () => {
+    const store = useWorkbenchStore();
+    store.es.toolCards.set('c1', {
+      name: 'read', dig: 'path=src/a.js', args: '', ok: false, out: '',
+      argsSummary: 'path=src/a.js', resultPreview: 'BOOM', executionStatus: 'failed',
+    });
+    store.entries.push({ kind: 'tool', callId: 'c1' });
+    const wrapper = mountPanel();
+
+    const btn = wrapper.get('button[aria-expanded]');
+    expect(btn.text()).toContain('read');
+    expect(btn.text()).toContain('path=src/a.js');
+    expect(btn.text()).toContain('✗');
+    expect(btn.get('span.font-semibold').classes()).toContain('text-red-600');
+    // 默认收起：无 pre
+    expect(wrapper.find('pre').exists()).toBe(false);
+
+    await btn.trigger('click');
+    expect(wrapper.get('pre').text()).toContain('path=src/a.js');
+    expect(wrapper.text()).toContain('failed · BOOM');
+  });
+
+  it('推理块默认收起、可展开；摘要取首行，展开显示全文', async () => {
+    const store = useWorkbenchStore();
+    store.entries.push({ kind: 'reasoning', id: 'm2', text: '第一行推理\n第二行细节' });
+    const wrapper = mountPanel();
+
+    const btn = wrapper.get('button[aria-expanded]');
+    expect(btn.text()).toContain('推理过程');
+    expect(btn.text()).toContain('第一行推理');
+    expect(btn.text()).not.toContain('第二行细节');
+    expect(wrapper.find('pre').exists()).toBe(false);
+
+    await btn.trigger('click');
+    expect(btn.attributes('aria-expanded')).toBe('true');
+    expect(btn.find('.rotate-180').exists()).toBe(true);
+    expect(wrapper.get('pre').text()).toContain('第二行细节');
+  });
+});
