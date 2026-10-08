@@ -141,6 +141,9 @@ function foldedTurnText(turns) {
  * 四项都缺 → null（调用方据此不写 `folded` 键，与 toolCalls 同规矩）。
  * 上游把三元组放在折叠 turn 的 meta 面上（erix-agent display/projection.js：meta.foldedRoundRange /
  * meta.navigationRecord / meta.foldedPayloadMessages），`text` 则与 `foldedTurnText()` 同源（折叠摘要原文）。
+ * `round`（#189 收尾）= **该折叠行自己的 round**（上游 turn.round，实测契约面 {role,text,blocks,folded,round,meta,key}），
+ * 是「查看原文」端点 `GET /api/sessions/:id/folded/:round` 的正确查询键——它与被折叠的轮范围
+ * `foldedRoundRange`（如 1–5）语义不同，前端拿 range 去查会查错行 404。附加字段，不进「四项全缺 → null」判据。
  */
 function foldedTurnFields(turns) {
   for (const turn of [...turns].reverse()) {
@@ -153,12 +156,15 @@ function foldedTurnFields(turns) {
     const payloadMessages = pick('foldedPayloadMessages');
     // 折叠摘要原文（与 foldedTurnText 同源：该折叠 turn 自己的 text，逐字透传）。
     const text = typeof turn.text === 'string' && turn.text !== '' ? turn.text : undefined;
+    // 该折叠行自己的轮号（上游 turn.round，原名；仅整数时带上。非四项判据成员，缺了不影响出现与否）。
+    const round = Number.isInteger(turn.round) ? turn.round : undefined;
     if (range === undefined && navigation === undefined && payloadMessages === undefined && text === undefined) continue;
     return {
       ...(text === undefined ? {} : { text }),
       ...(range === undefined ? {} : { foldedRoundRange: range }),
       ...(navigation === undefined ? {} : { navigationRecord: navigation }),
       ...(payloadMessages === undefined ? {} : { foldedPayloadMessages: payloadMessages }),
+      ...(round === undefined ? {} : { round }),
     };
   }
   return null;

@@ -60,14 +60,17 @@ export interface ProjectedToolCall {
 
 /**
  * issue #189：助手消息 DTO 的折叠段信息（后端契约：只在有折叠时出现，无则不写 `folded` 键）。
- * 字段名与上游一致（foldedRoundRange / navigationRecord / foldedPayloadMessages），原样透传；
+ * 字段名与上游一致（foldedRoundRange / navigationRecord / foldedPayloadMessages / round），原样透传；
  * `navigationRecord` 本单不渲染，原样存着即可。
+ * `round`（#189 收尾）= 该折叠行**自己**的 round（「查看原文」端点的查询键）；
+ * `foldedRoundRange` 是**被折叠的轮范围**，两者语义不同，不可拿 range 代替 round 去查端点。
  */
 export interface FoldedInfo {
   text: string;
   foldedRoundRange?: { from?: number; to?: number };
   navigationRecord?: unknown;
   foldedPayloadMessages?: number;
+  round?: number;
 }
 
 export interface ChatMessage {
