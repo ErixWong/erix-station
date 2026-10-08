@@ -13,7 +13,9 @@
 //
 // issue #188：投影的 `toolCalls`/`reasoning`/`blocks` 随助手锚点**逐字透传**进对话流 DTO（原名、不裁剪、
 // 不重推导；无则不写该键），供前端加载/刷新路径重建工具卡片与推理展示。宿主不向上游形状注入字段
-//（#95 红线）——`toolCalls[].id` 可选/可重复是上游已知缺口（git.erix.vip/eric/erix-llm-kit#100）。
+//（#95 红线）。erix-agent 0.16.0 已提供稳定的投影视图键：`turn.key`（轮级）与 `toolCalls[].key`
+// （单次投影内唯一、同输入确定性、由输入位置生成；**不是持久 ID、也不是 provider `tool_use.id`**）
+// ——上游 erix-llm-kit#100（`toolCalls[].id` 可选/可重复）由此交付视图身份，前端不再自造 key。
 //
 // 官方投影**不承担**、仍由本模块承担的部分（都是宿主/UI 概念，契约面里没有）：
 //   1. **锚点元数据**：DTO 的 `id`/`seq`/`run_id`/`attachments`/`synthetic`/`created_at` 一律取自
@@ -137,9 +139,10 @@ function foldedTurnText(turns) {
  * issue #188：单条 transcript 行里、官方投影助手轮上的展示字段（逐字透传，不裁剪/不改名/不重推导）。
  *
  * 投影的 `DisplayTurn` 契约面里，助手轮除 `text` 外还带 `blocks`（原始 content blocks 数组）、
- * `toolCalls?`（`{name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`，预览长度由上游
+ * `toolCalls?`（`{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`，预览长度由上游
  * 定：args 120 / result 400）与 `reasoning?`（与正文分离的推理文本）。这三者此前没有进入对话流 DTO，
  * 导致前端刷新后丢失工具卡片与推理。本函数把它们从助手轮上取出（**只取字段值，不做任何加工**）。
+ * `turn.key`（0.16.0 新增的轮级视图键）也原样取出（keys），供 DTO 透传（run 聚合轮 → 数组）。
  *
  * 全部为空时返回 null，调用方据此**不写该键**（契约：有则透传、无则 DTO 不出现该键）。
  */
@@ -151,11 +154,15 @@ function assistantTurnFields(turns) {
     .map((turn) => turn.reasoning)
     .filter((value) => typeof value === 'string' && value !== '');
   const blocks = assistantTurns.flatMap((turn) => (Array.isArray(turn.blocks) ? turn.blocks : []));
+  const keys = assistantTurns
+    .map((turn) => turn.key)
+    .filter((value) => typeof value === 'string' && value !== '');
   return {
     toolCalls: toolCalls.length > 0 ? toolCalls : null,
     // 一个 run 可含多条助手轮，推理文本按投影顺序以 '\n' 连接（与上游 joinBlocks 同一连接符）。
     reasoning: reasonings.length > 0 ? reasonings.join('\n') : null,
     blocks: blocks.length > 0 ? blocks : null,
+    keys: keys.length > 0 ? keys : null,
   };
 }
 
@@ -203,6 +210,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   const runToolCalls = new Map();
   const runReasoning = new Map();
   const runBlocks = new Map();
+  // 0.16.0：轮级视图键（`turn.key`）逐字透传（与 toolCalls[].key 同源，后者是其前缀 + `:t<i>`）。
+  const runTurnKeys = new Map();
   let currentRunId = null;
 
   const setRunText = (runId, assistantText, foldText, turns) => {
@@ -212,6 +221,9 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     if (fields === null) return;
     if (fields.toolCalls !== null) {
       runToolCalls.set(runId, [...(runToolCalls.get(runId) ?? []), ...fields.toolCalls]);
+    }
+    if (fields.keys !== null) {
+      runTurnKeys.set(runId, [...(runTurnKeys.get(runId) ?? []), ...fields.keys]);
     }
     if (fields.reasoning !== null) {
       runReasoning.set(runId, [...(runReasoning.get(runId) ?? []), fields.reasoning]);
@@ -337,6 +349,9 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
       if (reasoning !== undefined) dto.reasoning = reasoning.join('\n');
       const blocks = runBlocks.get(anchor.run_id);
       if (blocks !== undefined) dto.blocks = blocks;
+      // 0.16.0 轮级视图键（`turn.key`，逐字透传；run 可聚合多轮 → 数组，与 toolCalls 同为「有则出现」）。
+      const turnKeys = runTurnKeys.get(anchor.run_id);
+      if (turnKeys !== undefined) dto.turnKeys = turnKeys;
     }
     return dto;
   });

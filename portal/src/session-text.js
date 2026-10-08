@@ -28,10 +28,12 @@ const ANCHOR_COLUMNS = `id, run_id, seq, role, synthetic, attachments, created_a
 const USER_ANCHOR_SQL = `SELECT id, run_id, seq, synthetic, content AS anchor_text, created_at
      FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC`;
 
-/** session transcript 行（行序 = round/created_at，与 store.load / getSession 同口径）。 */
+/** session transcript 行（行序 = round/append_seq，与 store.load / getSession 同口径；
+ *  0.16.0 同 round 保序契约：append_seq 为持久化追加序（迁移 0016，恒非空），
+ *  created_at 存在同值行、无法确定性还原同轮顺序，故不再作排序键）。 */
 const TRANSCRIPT_SQL = `SELECT run_id, round, dedup_key, record, created_at
      FROM transcript_rounds WHERE transcript_key = $1
-     ORDER BY round ASC, created_at ASC`;
+     ORDER BY round ASC, append_seq ASC`;
 
 function textOf(value) {
   return typeof value === 'string' ? value : '';

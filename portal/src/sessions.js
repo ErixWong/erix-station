@@ -259,9 +259,11 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     : { rows: [] };
   const transcript = msgs.rows.length > 0
     ? await pool.query(
+      // 0.16.0 同 round 保序：同 (transcript_key, round) 多行按持久化追加序（append_seq，迁移 0016）
+      // 排列，created_at 存在完全相同的行、无法确定性还原 → 对话流 DTO 行序才可复现。
       `SELECT run_id, round, dedup_key, record, created_at
          FROM transcript_rounds WHERE transcript_key = $1
-         ORDER BY round ASC, created_at ASC`,
+         ORDER BY round ASC, append_seq ASC`,
       [sessionId],
     )
     : { rows: [] };

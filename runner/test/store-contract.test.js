@@ -1,8 +1,10 @@
 // station store adapter（runner/lib/store.js，IPC 版 TranscriptStore）契约测试 harness。
-// 对 adapter 跑上游 transcriptStoreContract（erix-agent/contract-tests，0.14.0：
-// latest-only run snapshot、独立状态通道、多 runId 隔离、写失败向上抛）。
-// agentd + portal 用内存 IPC peer 桩掉（语义 = portal internal 端点：snapshot revision CAS、
-// run-state 快照/状态分列、多 runId 隔离），transport 注入 adapter——不 fork 进程、不碰网络/DB。
+// 对 adapter 跑上游 transcriptStoreContract（erix-agent/contract-tests，0.16.0：
+// latest-only run snapshot、独立状态通道、多 runId 隔离、写失败向上抛、RoundRecord/message 保真往返、
+// 同 round 按持久化追加序）。
+// agentd + portal 用内存 IPC peer 桩掉（语义 = portal internal session 端点：snapshot revision CAS、
+// run-state 快照/状态分列、多 runId 隔离、同 round 不同 dedupKey 共存 + dedupKey 幂等），
+// transport 注入 adapter——不 fork 进程、不碰网络/DB。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { transcriptStoreContract } from 'erix-agent/contract-tests';
@@ -23,21 +25,40 @@ function createFakeAgentdPeer() {
       const runId = args.runId;
       switch (method) {
         case 'appendRound': {
+          // 0.16.0 语义（= portal putSessionRound）：同 round、不同 dedupKey 的记录合法共存；
+          // 幂等判据 = dedupKey（同 dedupKey 同内容 → no-op；folded false→true → UPDATE；
+          // 同 dedupKey 不同 body → round_conflict）。无 dedupKey 的契约记录（ROUND_1 等）视为唯一追加。
           const list = transcripts.get(runId) ?? [];
-          if (list.some((r) => r.round === args.record?.round)) {
+          const record = structuredClone(args.record);
+          const dedupKey = typeof record?.dedupKey === 'string' && record.dedupKey !== ''
+            ? record.dedupKey
+            : `__auto:${list.length}`;
+          const existing = list.find((entry) => entry.dedupKey === dedupKey);
+          if (existing) {
+            if (JSON.stringify(existing.record) === JSON.stringify(record)) {
+              return { inserted: false }; // 幂等命中
+            }
+            if (record.folded === true && existing.record.folded !== true) {
+              existing.record = record; // fold 更新（同 dedupKey）
+              return { inserted: true };
+            }
             const err = new Error('round_conflict');
             err.code = 'round_conflict';
             err.retryable = false;
             throw err;
           }
-          list.push(structuredClone(args.record));
+          list.push({ dedupKey, record }); // 数组序 = 持久化追加序
           transcripts.set(runId, list);
           return { inserted: true };
         }
         case 'load': {
-          const list = (transcripts.get(runId) ?? []).map((r) => structuredClone(r));
-          list.sort((a, b) => a.round - b.round);
-          return { records: list };
+          const list = transcripts.get(runId) ?? [];
+          // 同 round 按追加序（数组序，稳定排序）；引擎不再二次排序（0.16.0 契约）。
+          const records = list
+            .map((entry, index) => ({ record: structuredClone(entry.record), index }))
+            .sort((a, b) => (a.record.round - b.record.round) || (a.index - b.index))
+            .map((entry) => entry.record);
+          return { records };
         }
         case 'recall':
           return { text: '' };

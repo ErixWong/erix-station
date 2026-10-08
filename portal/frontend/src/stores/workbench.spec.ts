@@ -723,7 +723,39 @@ describe('issue #188：DTO 投影字段（toolCalls/reasoning/blocks）加载路
     expect(store.es.toolCards.get('c1')?.argsSummary).toBe('path=src/a.js');
   });
 
-  it('provider id 缺失时回退到「锚点消息 id + 投影内块序号」稳定键（上游 #100）', async () => {
+  it('provider id 缺失时用上游投影视图键 call.key（0.16.0 交付，替代自造 proj: 键）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            messages: [
+              { id: 'm1', role: 'user', content: '任务', seq: 1 },
+              {
+                id: 'm2', role: 'assistant', content: '完成', seq: 2,
+                toolCalls: [
+                  { key: '1#0:0:t0', name: 'a', argsSummary: 'x=1' },
+                  { key: '1#0:0:t1', name: 'b', argsSummary: 'y=2' },
+                ],
+              },
+            ],
+            last_seq: 2,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+
+    expect(store.entries.filter((e) => e.kind === 'tool').length).toBe(2);
+    expect(store.es.toolCards.has('1#0:0:t0')).toBe(true);
+    expect(store.es.toolCards.has('1#0:0:t1')).toBe(true);
+  });
+
+  it('provider id 与上游 key 都缺失时保留「锚点消息 id + 投影内块序号」兜底键', async () => {
     mockFetch((url) => {
       if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
       if (url.includes('/api/sessions/s1')) {
