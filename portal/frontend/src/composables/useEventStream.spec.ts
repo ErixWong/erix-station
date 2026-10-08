@@ -436,3 +436,51 @@ describe('useEventStream · i18n（issue #101 P2）', () => {
     expect(hooks.onSysErr).toHaveBeenLastCalledWith('run failed: llm_error — boom');
   });
 });
+
+describe('issue #188：projectToolCard（DTO 投影路径）', () => {
+  it('首次登记占位一次并透传上游字段；同 callId 再登记不重复占位', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+
+    s.projectToolCard('c1', {
+      name: 'read', argsSummary: 'path=src/a.js', resultPreview: 'FILE BODY',
+      isError: false, executionStatus: 'succeeded',
+    });
+    expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
+    expect(hooks.onToolCardCreated).toHaveBeenCalledWith('c1');
+    const card = s.toolCards.get('c1')!;
+    expect(card.name).toBe('read');
+    expect(card.dig).toBe('path=src/a.js');
+    expect(card.argsSummary).toBe('path=src/a.js');
+    expect(card.resultPreview).toBe('FILE BODY');
+    expect(card.executionStatus).toBe('succeeded');
+    expect(card.ok).toBe(true);
+
+    // 第二次（同一调用的另一路 DTO 消息 / 重复加载）→ 幂等：不再占位
+    s.projectToolCard('c1', { name: 'read', argsSummary: 'path=src/a.js' });
+    expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
+  });
+
+  it('事件流先建的卡片：投影只补全缺失字段，不覆盖实时完整数据', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+
+    s.handleEvent('tool_use', { data: JSON.stringify({ tool_call_id: 'c1', name: 'read', input: { path: 'src/a.js' } }) } as MessageEvent);
+    s.projectToolCard('c1', {
+      name: 'read', argsSummary: 'path=src/a.js', resultPreview: 'FILE BODY', executionStatus: 'succeeded',
+    });
+    const card = s.toolCards.get('c1')!;
+    expect(card.args).toBe('{"path":"src/a.js"}'); // 实时路径的完整 args 保留
+    expect(card.argsSummary).toBe('path=src/a.js'); // 投影补全缺失字段
+    expect(card.resultPreview).toBe('FILE BODY');
+    expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
+  });
+
+  it('isError=true → ok=false；仅 name 无结果 → ok=null', () => {
+    const s = useEventStream(makeHooks());
+    s.projectToolCard('err', { name: 'bash', isError: true, resultPreview: 'boom' });
+    s.projectToolCard('pending', { name: 'read' });
+    expect(s.toolCards.get('err')!.ok).toBe(false);
+    expect(s.toolCards.get('pending')!.ok).toBeNull();
+  });
+});

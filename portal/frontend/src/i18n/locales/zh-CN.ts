@@ -107,6 +107,8 @@ export const zhCN = {
     argsPending: '（参数生成中…）',
     // 工具卡片 dig 兜底（tool_call_delta 阶段，args 仍在流式生成）
     argsStreaming: '（参数流式生成中…）',
+    // issue #188：助手推理块标题（与正文分离、默认收起、可展开）
+    reasoning: '推理过程',
     event: {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',

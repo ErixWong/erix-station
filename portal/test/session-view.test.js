@@ -1051,3 +1051,166 @@ test('the projection is fed records in (round, created_at) order — per-row cal
     whole.map(({ role, text, round }) => ({ role, text, round })),
     '行级调用与整表调用产出同一展示序列（投影是逐记录展开的纯函数）');
 });
+
+// ---------------------------------------------------------------------------
+// issue #188：投影的展示字段（toolCalls/reasoning/blocks）随助手锚点透传进对话流 DTO。
+// 只透传、不重推导/不裁剪/不改名（#95 红线）；有则出现、无则不写该键。
+// ---------------------------------------------------------------------------
+
+test('issue #188: projection toolCalls/reasoning/blocks ride along the assistant DTO verbatim', () => {
+  const anchors = [
+    message('tool-assistant', 2, 'assistant', 'stale anchor text', RUN_1),
+  ];
+  const assistantBlocks = [
+    { type: 'reasoning', text: 'think about it' },
+    { type: 'text', text: 'public answer' },
+    { type: 'tool_use', id: 'call-1', name: 'read', input: { path: 'src/a.js' } },
+  ];
+  const transcriptRows = [
+    transcript(1, `${RUN_1}:engine:round:1`, {
+      dedupKey: `${RUN_1}:engine:round:1`,
+      response: { content: assistantBlocks, stopReason: 'tool_use' },
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'tool_result', tool_use_id: 'call-1', content: 'FILE BODY',
+          is_error: false, executionStatus: 'succeeded',
+        }],
+      }],
+    }, at(1), RUN_1),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+  const dto = projection[0];
+
+  assert.equal(dto.content, 'public answer');
+  assert.equal(dto.reasoning, 'think about it');
+  assert.deepEqual(dto.toolCalls, [{
+    name: 'read',
+    id: 'call-1',
+    argsSummary: 'path=src/a.js',
+    resultPreview: 'FILE BODY',
+    isError: false,
+    executionStatus: 'succeeded',
+  }], 'toolCalls 逐字透传（含上游预览字段，不裁剪）');
+  assert.deepEqual(dto.blocks, assistantBlocks, 'blocks 逐字透传（原始 content blocks）');
+});
+
+test('issue #188: a run aggregates toolCalls across its rounds in projection order', () => {
+  const anchors = [message('multi-assistant', 2, 'assistant', 'stale anchor text', RUN_1)];
+  const transcriptRows = [
+    transcript(1, `${RUN_1}:engine:round:1`, {
+      dedupKey: `${RUN_1}:engine:round:1`,
+      response: {
+        content: [{ type: 'tool_use', id: 'c1', name: 'read', input: { path: 'a' } }],
+        stopReason: 'tool_use',
+      },
+    }, at(1), RUN_1),
+    transcript(2, `${RUN_1}:engine:round:2`, {
+      dedupKey: `${RUN_1}:engine:round:2`,
+      response: {
+        content: [
+          { type: 'tool_use', id: 'c2', name: 'bash', input: { command: 'ls' } },
+          { type: 'text', text: 'done' },
+        ],
+        stopReason: 'end_turn',
+      },
+    }, at(2), RUN_1),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+  const dto = projection[0];
+
+  assert.equal(dto.content, 'done');
+  assert.deepEqual(dto.toolCalls.map((call) => [call.name, call.id]), [['read', 'c1'], ['bash', 'c2']]);
+});
+
+test('issue #188: assistant DTO omits projection keys when the projection has none', () => {
+  const anchors = [message('plain-assistant', 2, 'assistant', 'stale anchor text', RUN_1)];
+  const transcriptRows = [
+    transcript(1, `${RUN_1}:engine:round:1`, {
+      dedupKey: `${RUN_1}:engine:round:1`,
+      response: { content: text('plain answer'), stopReason: 'end_turn' },
+    }, at(1), RUN_1),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+  const dto = projection[0];
+
+  assert.equal(dto.content, 'plain answer');
+  assert.equal('toolCalls' in dto, false, '无 toolCalls 时不出现该键（不塞 undefined/null 占位）');
+  assert.equal('reasoning' in dto, false, '无 reasoning 时不出现该键');
+  // blocks 是上游对每条带 content 的助手轮都会给的字段（这里是文本块）——有则原样透传。
+  assert.deepEqual(dto.blocks, [{ type: 'text', text: 'plain answer' }]);
+});
+
+test('issue #188: textPreview-only assistant turns carry no blocks key (upstream gives none)', () => {
+  const anchors = [message('preview-assistant', 2, 'assistant', 'stale anchor text', RUN_1)];
+  const transcriptRows = [
+    transcript(1, `${RUN_1}:engine:round:1`, {
+      dedupKey: `${RUN_1}:engine:round:1`,
+      textPreview: 'preview only',
+    }, at(1), RUN_1),
+  ];
+
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+  });
+  const dto = projection[0];
+
+  assert.equal(dto.content, 'preview only');
+  assert.equal('blocks' in dto, false, '上游 textPreview 兜底轮 blocks 为空数组 → 不写该键');
+  assert.equal('toolCalls' in dto, false);
+  assert.equal('reasoning' in dto, false);
+});
+
+test('issue #188: host-owned anchor metadata is untouched and user anchors carry no projection keys', async () => {
+  const attachments = [{ kind: 'file', path: '/workspace/report.txt', name: 'report.txt' }];
+  const anchors = [
+    message('u1', 1, 'user', 'ask', RUN_1, { attachments, createdAt: at(1) }),
+    message('a1', 2, 'assistant', 'stale anchor text', RUN_1, { createdAt: at(4) }),
+  ];
+  const transcriptRows = [
+    transcript(0, `${SESSION_ID}:input:u1`, {
+      dedupKey: `${SESSION_ID}:input:u1`,
+      messages: [{ role: 'user', content: text('ask') }],
+    }, at(2), RUN_1),
+    transcript(1, `${RUN_1}:engine:round:1`, {
+      dedupKey: `${RUN_1}:engine:round:1`,
+      response: { content: text('answer'), stopReason: 'end_turn' },
+    }, at(3), RUN_1),
+  ];
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
+  const [user, assistant] = result.messages;
+
+  assert.deepEqual(user.attachments, attachments, 'attachments 语义不变');
+  assert.equal(user.run_id, RUN_1);
+  assert.equal(user.seq, 1);
+  assert.equal('toolCalls' in user, false, 'user 锚点不透传投影字段');
+  assert.equal(assistant.content, 'answer');
+  assert.equal(assistant.run_id, RUN_1);
+  assert.equal(assistant.seq, 2);
+  assert.equal(assistant.synthetic, false);
+  assert.equal(assistant.created_at, at(4).toISOString());
+  assert.deepEqual(assistant.attachments, []);
+});
