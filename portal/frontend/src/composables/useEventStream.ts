@@ -16,6 +16,7 @@
 // 协议状态（es/lastSeq/esSessionId/activeRunId/deltaText/toolCards）与事件语义。
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
+import { PERSISTENCE_TERMINATION_REASON, RUN_FAIL_REASONS } from '../lib/terminationReasons';
 
 // 用户可见状态行/错误行文案（issue #101 P2）：非组件上下文（composable 无 setup 实例）→ i18n.global.t。
 // 取词即快照：状态行在事件到达时生成，切语言后旧行不回溯翻译（可接受）。
@@ -31,7 +32,10 @@ const EVENT_TYPES = [
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
-export const RUN_FAIL_REASONS = new Set(['failed', 'max_rounds_cap', 'aborted']);
+// issue #212：集合本体（含补入的 persistence_failed / final_guard_unverified）收敛到
+// `lib/terminationReasons.ts` 单一常量（文档防漂移测试的锚点）；此处 re-export 保留既有引用面
+// —— stores/workbench.ts 的 notifyRunEnd 与本文件用的是**同一个 Set 实例**，不存在第二份枚举。
+export { RUN_FAIL_REASONS };
 
 // issue #89：历史回放（刷新后重建展示层，对齐 pi-web「转录即真相」）可回放的展示类事件白名单——
 // 与后端 GET /api/sessions/:id/events/history 的下发白名单一致。运行态语义事件（run_end/usage/
@@ -67,11 +71,49 @@ export interface ToolCardState {
   executionStatus?: string;
 }
 
+/**
+ * issue #212：引擎 termination 形状。worker 现按原样透传引擎挂在错误上的对象，
+ * 故除 `reason`/`detail` 外，`persistence_failed` 还会带 `operation`/`phase`/`sideEffect`
+ * （erix-agent orchestrator.js:758-771）；未知/额外键按 §5.3 向后兼容原则忽略。
+ */
+export interface RunTermination {
+  reason?: string;
+  detail?: string;
+  operation?: string;
+  phase?: string;
+  sideEffect?: string;
+}
+
 export interface RunEndPayload {
   run_id?: string;
-  termination?: { reason?: string } | null;
+  termination?: RunTermination | null;
   usage?: { input_tokens?: number; output_tokens?: number } | null;
-  error?: { code?: string; message?: string } | null;
+  error?: { code?: string; message?: string; retryable?: boolean } | null;
+}
+
+/**
+ * issue #212：失败原因的**用户可读补充**（拼进 `stream.event.runEnd` 的 `{reason}` 槽）。
+ *   ① 只给本次新增的两值加双语标签——既有 failed / aborted / max_rounds_cap 逐字保持原样
+ *      （不改既有中文基线与既有断言面）；
+ *   ② `persistence_failed` 额外带引擎透传的落盘细节（operation/phase/sideEffect），
+ *      让工作台能看见「哪一步没落盘、副作用是否可能已发生」——这是该 reason 语义最重的部分。
+ */
+function failReasonText(reason: string, termination?: RunTermination | null): string {
+  let text = reason;
+  const label = reason === 'persistence_failed'
+    ? t('stream.event.runEndReason.persistence_failed')
+    : reason === 'final_guard_unverified'
+      ? t('stream.event.runEndReason.final_guard_unverified')
+      : '';
+  if (label) text += t('stream.event.dash', { value: label });
+  if (reason === PERSISTENCE_TERMINATION_REASON && termination?.phase) {
+    text += ` · ${t('stream.event.runEndPersistence', {
+      operation: termination.operation ?? '?',
+      phase: termination.phase,
+      sideEffect: termination.sideEffect ?? '?',
+    })}`;
+  }
+  return text;
 }
 
 export interface EventStreamHooks {
@@ -316,12 +358,18 @@ export function useEventStream(hooks: EventStreamHooks) {
           if (deltaText.value !== null) deltaText.value = null;
           const reason = d.termination?.reason ?? '';
           const usage = d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : '';
-          // issue #42：终止原因分级——failed/max_rounds_cap/aborted 红色告警，end_turn 灰色中性。
-          if (RUN_FAIL_REASONS.has(reason)) hooks.onSysErr(t('stream.event.runEnd', { reason, usage }));
-          else hooks.onSep(t('stream.event.runEnd', {
-            reason: reason === 'end_turn' ? t('stream.event.runEndNormal') : reason,
-            usage,
-          }));
+          // issue #42：终止原因分级——异常集合红色告警，end_turn 灰色中性。
+          // issue #212：集合补 persistence_failed / final_guard_unverified（两者语义都重到「用户必须看见」），
+          // 且必须与「worker 透传引擎 reason」同一个 PR：先透传再扩集合，否则 persistence_failed
+          // 会落到下面 else 分支，被渲染成灰色中性分隔条（语义最重的失败反而最弱）。
+          if (RUN_FAIL_REASONS.has(reason)) {
+            hooks.onSysErr(t('stream.event.runEnd', { reason: failReasonText(reason, d.termination), usage }));
+          } else {
+            hooks.onSep(t('stream.event.runEnd', {
+              reason: reason === 'end_turn' ? t('stream.event.runEndNormal') : reason,
+              usage,
+            }));
+          }
           if (d.error) hooks.onSysErr(t('stream.event.runFailed', { code: d.error.code, message: d.error.message }));
           activeRunId.value = null;
           hooks.onCurrentRunEnd(d);
