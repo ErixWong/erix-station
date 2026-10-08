@@ -21,6 +21,7 @@
 //   （scheduleAutoTitle 包最后一层 catch），绝不影响 run 终态响应。
 import path from 'node:path';
 import { loadConfig } from './config.js';
+import { fetchUserTextTurns } from './session-text.js';
 
 /** 自动标题长度上限（issue #88：≤30 字符左右；agent 侧生成时已按同口径清洗，此处再过一遍幂等）。 */
 export const AUTO_TITLE_MAX_LEN = 30;
@@ -126,17 +127,12 @@ export async function evaluateAutoTitle(pool, { sessionId, runId, agentTitle, co
     if (!s || s.status !== 'active') return null;
     if (s.title_source !== 'auto') return null; // 手工优先：manual 行绝不自动覆盖
 
-    // 首条 / 最新 user 消息 + 距上次自动更新的新 user 轮数（三条小查询；评估每 run 至多一次，量可忽略）
-    const firstRes = await pool.query(
-      `SELECT content, seq FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq ASC LIMIT 1`,
-      [sessionId],
-    );
-    const latestRes = await pool.query(
-      `SELECT content, seq FROM messages WHERE session_id = $1 AND role = 'user' ORDER BY seq DESC LIMIT 1`,
-      [sessionId],
-    );
-    const first = firstRes.rows?.[0];
-    const latest = latestRes.rows?.[0] ?? first;
+    // P3 PR②b B1 ②③：首条 / 最新 user 正文**改从 transcript 投影取**（`fetchUserTextTurns`，
+    // 与对话流 DTO 同一口径）；投影对该轮无证据时才 legacy 回退 `messages.content`
+    // （迁移 0015 之前的行；legacy-only，不用于新会话）。新 user 轮数仍按 messages.seq 计数（不是文本）。
+    const userTurns = await fetchUserTextTurns(pool, { sessionId });
+    const first = userTurns[0] ?? null;
+    const latest = userTurns.at(-1) ?? first;
     if (!first) return null; // 会话内还没有用户消息（不应发生：触发点是终态 run）
     // 新 user 轮数 = seq > auto_title_seq（NULL 游标 = 从未自动更新 → 按全部 user 消息计）
     const newRes = await pool.query(
@@ -145,13 +141,13 @@ export async function evaluateAutoTitle(pool, { sessionId, runId, agentTitle, co
     );
     const newUserCount = Number(newRes.rows?.[0]?.n ?? 0);
 
-    if (!shouldRefreshTitle({ title: s.title, autoTitleSeq: s.auto_title_seq, newUserCount, latestUserContent: latest.content, minNew })) {
+    if (!shouldRefreshTitle({ title: s.title, autoTitleSeq: s.auto_title_seq, newUserCount, latestUserContent: latest.text, minNew })) {
       return null; // 防抖：不到刷新阈值
     }
 
     // 落库标题：agent 上报（再过一遍清洗，幂等）→ 首条消息截断 → cwd basename
     let title = sanitizeTitle(agentTitle);
-    if (title == null) title = clipTitleFromMessage(first.content);
+    if (title == null) title = clipTitleFromMessage(first.text);
     if (title == null) title = fallbackTitleFromCwd(s.cwd);
 
     // 只写 source='auto' 的行（并发手工 PATCH 已置 manual → 0 行，安静放弃）

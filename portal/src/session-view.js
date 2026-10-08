@@ -37,7 +37,7 @@ function attributionKeys(row, metaDedupKey) {
  * 因此把列值合成进 record，避免这类行退化成「无稳定 id」走内容匹配。
  * 这里读 `base.dedupKey`/`base.roundKey` 只为补齐这个键（与 store.load 同口径），不是展示数据源。
  */
-function recordForProjection(row) {
+export function recordForProjection(row) {
   const base = row.record && typeof row.record === 'object' ? row.record : {};
   const dedupKey = row.dedup_key ?? base.dedupKey ?? base.roundKey ?? null;
   return {
@@ -51,13 +51,13 @@ function recordForProjection(row) {
 }
 
 /** 投影带出的 `meta.dedupKey`（同一 record 展开出的各 turn 共享同一个键）。 */
-function projectionDedupKey(turns) {
+export function projectionDedupKey(turns) {
   const turn = turns.find((candidate) => typeof candidate?.meta?.dedupKey === 'string'
     && candidate.meta.dedupKey !== '');
   return turn?.meta?.dedupKey ?? null;
 }
 
-function inputMessageId(dedupKey, sessionId) {
+export function inputMessageId(dedupKey, sessionId) {
   const prefix = `${sessionId}:input:`;
   return typeof dedupKey === 'string' && dedupKey.startsWith(prefix)
     ? dedupKey.slice(prefix.length)
@@ -86,7 +86,7 @@ function timestamp(value) {
   return Number.isFinite(time) ? time : null;
 }
 
-function compareTranscriptRows(a, b) {
+export function compareTranscriptRows(a, b) {
   const roundDiff = Number(a.round) - Number(b.round);
   if (Number.isFinite(roundDiff) && roundDiff !== 0) return roundDiff;
   const aTime = timestamp(a.created_at);
@@ -95,16 +95,18 @@ function compareTranscriptRows(a, b) {
   return 0;
 }
 
-/** 该行的真实用户文本（排除引擎注入的合成消息，避免注入文本抢认锚点）。 */
-function userTurnTexts(turns) {
+/** 该行的真实用户文本（排除引擎注入的合成消息，避免注入文本抢认锚点）。
+ *  P3 PR②b：`session-text.js`（标题 / claim task / 历史上行等文本读取点）复用同一口径，勿另写一份。 */
+export function userTurnTexts(turns) {
   return turns
     .filter((turn) => turn.role === 'user' && turn.meta?.synthetic !== true && turn.folded !== true)
     .map((turn) => turn.text)
     .filter((value) => typeof value === 'string' && value !== '');
 }
 
-/** 该行的助手正文：投影已把 reasoning 与 tool-only 轮次分离，取最后一条非空文本（= 最终答复）。 */
-function assistantTurnText(turns) {
+/** 该行的助手正文：投影已把 reasoning 与 tool-only 轮次分离，取最后一条非空文本（= 最终答复）。
+ *  P3 PR②b：同样供 `session-text.js` 复用（终态幂等比较的 final_text 取数）。 */
+export function assistantTurnText(turns) {
   const text = turns
     .filter((turn) => turn.role === 'assistant' && turn.folded !== true)
     .map((turn) => turn.text)

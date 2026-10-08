@@ -11,6 +11,7 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { generateAiTitle } from '../src/sessions.js';
+import { createSessionTextHandler, inputTranscriptRow } from './fake-session-text.js';
 import { FakePool } from './fake-pool.js';
 
 const USER = {
@@ -28,7 +29,7 @@ const API_KEY = 'sk-test-secret-key-123456';
  * （fetchSession / 首 3 条 user 消息 / FDE binding）+ 落库 UPDATE。
  */
 class AiTitlePool extends FakePool {
-  constructor({ binding = null, providerRow = null, messages = [], ownerId = USER.id } = {}) {
+  constructor({ binding = null, providerRow = null, messages = [], transcriptRows = [], ownerId = USER.id } = {}) {
     super({ users: [USER] });
     this.sessions.push({
       id: 'ls1', user_id: USER.id, token_hash: auth.hashToken(TOKEN),
@@ -42,6 +43,33 @@ class AiTitlePool extends FakePool {
     this.binding = binding;
     this.providerRow = providerRow;
     this.messages = messages;
+    // P3 PR②b B1 ①：AI 改名上下文改走 session-text（锚点 + transcript 投影）。
+    // `messages` 元素：字符串 = 只有锚点正文（legacy 形态）；
+    // `{ anchor, transcript }` = 锚点正文与 transcript 正文**不同**（用来断言取数来源）。
+    this.anchoredMessages = messages.map((content, index) => ({
+      id: `am${index + 1}`,
+      session_id: SESSION_ID,
+      run_id: `ar${index + 1}`,
+      seq: index + 1,
+      role: 'user',
+      content: typeof content === 'string' ? content : content.anchor,
+      synthetic: false,
+      attachments: [],
+    }));
+    this.transcriptRows = transcriptRows ?? [];
+    for (const [index, content] of messages.entries()) {
+      if (typeof content === 'string' || typeof content.transcript !== 'string') continue;
+      this.transcriptRows.push(inputTranscriptRow({
+        sessionId: SESSION_ID,
+        messageId: this.anchoredMessages[index].id,
+        text: content.transcript,
+        round: index + 1,
+        createdAt: new Date(Date.UTC(2026, 9, 1, 0, 0, index + 1)),
+      }));
+    }
+    this.sessionText = createSessionTextHandler({
+      messages: this.anchoredMessages, transcriptRows: this.transcriptRows, sessionId: SESSION_ID,
+    });
     this.titleUpdates = [];
     this.seenSql = [];
   }
@@ -49,10 +77,9 @@ class AiTitlePool extends FakePool {
   async query(sql, params = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
     this.seenSql.push(s);
+    const hit = this.sessionText(s, params);
+    if (hit) return hit;
     if (s.includes('FROM chat_sessions s')) return { rows: [this.sessionRow] };
-    if (s.includes('FROM messages') && s.includes("role = 'user'")) {
-      return { rows: this.messages.slice(0, params[1] ?? 3).map((c) => ({ content: c })) };
-    }
     if (s.includes('FROM fde_llm_bindings')) return { rows: this.binding ? [this.binding] : [] };
     if (s.startsWith('UPDATE chat_sessions SET title')) {
       this.titleUpdates.push({ sql: s, params });
@@ -347,6 +374,47 @@ test('issue #114：非属主 / 未登录 → 404 / 401（不泄露存在性）',
     const badId = await callAiTitle(s, { sessionId: 'not-a-uuid' });
     assert.equal(badId.status, 404);
     assert.equal(stub.calls.length, 0, '鉴权失败不得触达上游');
+  } finally {
+    stub.restore();
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P3 PR②b B1 ①：AI 改名上下文取数来源 = transcript 投影（不再是 messages.content）
+// ---------------------------------------------------------------------------
+
+test('P3 PR②b ①：AI 改名上下文取自 transcript 投影；messages.content 只在投影无证据时 legacy 兜底', async () => {
+  const s = await startServer({
+    binding: bindingRow(),
+    // 每条的锚点正文（messages.content）与 transcript 正文**不同** → 只有取到 transcript 才会命中后者。
+    messages: [
+      { anchor: '锚点旧文A', transcript: 'transcript 正文A' },
+      { anchor: '锚点旧文B', transcript: 'transcript 正文B' },
+    ],
+  });
+  const stub = stubUpstreamFetch(() => jsonResponse(200, { choices: [{ message: { content: '标题' } }] }));
+  try {
+    const r = await callAiTitle(s);
+    assert.equal(r.status, 200);
+    const payload = JSON.parse(stub.calls[0].init.body);
+    assert.match(payload.messages[1].content, /transcript 正文A/);
+    assert.match(payload.messages[1].content, /transcript 正文B/);
+    assert.equal(payload.messages[1].content.includes('锚点旧文A'), false, '正文不得来自 messages.content');
+  } finally {
+    stub.restore();
+    await s.close();
+  }
+});
+
+test('P3 PR②b ① legacy 兜底：投影对该轮无证据（无 transcript 行）→ 回退 messages.content，AI 改名仍可用', async () => {
+  const s = await startServer({ binding: bindingRow(), messages: ['仅锚点正文的一条老消息'] });
+  const stub = stubUpstreamFetch(() => jsonResponse(200, { choices: [{ message: { content: '标题' } }] }));
+  try {
+    const r = await callAiTitle(s);
+    assert.equal(r.status, 200);
+    const payload = JSON.parse(stub.calls[0].init.body);
+    assert.match(payload.messages[1].content, /仅锚点正文的一条老消息/, 'legacy-only 兜底（迁移 0015 之前的行）');
   } finally {
     stub.restore();
     await s.close();
