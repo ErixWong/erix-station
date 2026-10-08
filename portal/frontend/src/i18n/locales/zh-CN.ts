@@ -372,6 +372,7 @@ export const zhCN = {
       adminKeyConfigured: '已配置 key：{key}',
       clearAdminKey: '清除已配置 key（改为需凭据）',
       modeAuto: '模式由提供方与 admin key 自动判定；GitHub 和未配置管理员 key 的 host 需逐 FDE 提供凭据。',
+      githubHint: 'GitHub 无法由平台代铸：请勿配置 admin key，该 host 的模式恒为「需凭据」。每个 FDE 需在 portal 投放自己的 PAT（gh CLI 读取容器内 ~/.config/gh/hosts.yml）。',
       modeMinted: '代铸',
       modeCredential: '需凭据',
       confirmDelete: '确认删除 Git host「{name}」？已分配给 FDE 的 host 不能删除。',

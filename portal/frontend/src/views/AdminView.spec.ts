@@ -153,14 +153,60 @@ describe('Admin console routing and layout', () => {
 });
 
 describe('AdminReposView · Git host registry', () => {
-  it('provider dropdown lists Gitea and GitLab but not GitHub', async () => {
+  it('provider dropdown lists Gitea, GitLab, and GitHub', async () => {
     const { wrapper } = await mountAdmin('/admin/repos');
     try {
       await wrapper.get('[data-test="open-add-git-host"]').trigger('click');
       const providerSelect = wrapper.get('[data-test="git-host-form"] select');
       expect(providerSelect.find('option[value="gitea"]').exists()).toBe(true);
       expect(providerSelect.find('option[value="gitlab"]').exists()).toBe(true);
-      expect(providerSelect.find('option[value="github"]').exists()).toBe(false);
+      expect(providerSelect.find('option[value="github"]').exists()).toBe(true);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('selecting GitHub does not require an admin key and labels the host as credential-required', async () => {
+    const githubHosts = {
+      items: [
+        {
+          id: 'gh-github', name: 'GitHub', provider: 'github', base_url: 'https://github.com',
+          admin_key: null, admin_key_configured: false, mode: 'per_fde_pat', enabled: true,
+        },
+      ],
+    };
+    const { wrapper, fetchFn } = await mountAdmin('/admin/repos', (url, init) => {
+      if (url === '/api/admin/git-hosts' && init?.method === 'POST') return jsonResponse(201, { host: {} });
+      if (url === '/api/admin/git-hosts') return jsonResponse(200, githubHosts);
+      return undefined;
+    });
+    try {
+      // 已配置的 GitHub host 模式徽章必须如实标注为「需凭据」，不能显示成可代铸
+      expect(wrapper.get('[data-test="provider-badge"]').text()).toBe('github');
+      expect(wrapper.get('[data-test="mode-badge"]').text()).toBe('需凭据');
+
+      await wrapper.get('[data-test="open-add-git-host"]').trigger('click');
+      const form = wrapper.get('[data-test="git-host-form"]');
+      const providerSelect = form.get('[data-test="git-host-provider"]');
+      await providerSelect.setValue('github');
+
+      // GitHub 不允许平台代铸：admin key 输入禁用、非必填，并给出「该 FDE 自己的 PAT」提示
+      const adminKeyInput = form.get('[data-test="git-host-admin-key"]');
+      expect(adminKeyInput.attributes('disabled')).toBeDefined();
+      expect(adminKeyInput.attributes('required')).toBeUndefined();
+      expect(form.get('[data-test="git-host-github-hint"]').text()).toContain('PAT');
+
+      const inputs = form.findAll('input');
+      await inputs[0].setValue('GitHub');
+      await inputs[1].setValue('https://github.com');
+      await form.trigger('submit.prevent');
+      await flushPromises();
+      const post = callsTo(fetchFn, 'POST', '/api/admin/git-hosts')[0];
+      expect(JSON.parse(String(post?.[1]?.body))).toEqual({
+        name: 'GitHub',
+        provider: 'github',
+        base_url: 'https://github.com',
+      });
     } finally {
       wrapper.unmount();
     }
