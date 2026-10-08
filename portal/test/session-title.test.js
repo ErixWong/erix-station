@@ -227,7 +227,10 @@ function postMessageClient({
       if (s.includes('FROM containers')) return { rows: [{ id: 'c1' }] };
       if (s.includes('UPDATE chat_sessions SET last_seq')) return { rows: [{ last_seq: 1 }] };
       if (s.startsWith('INSERT INTO messages')) {
-        return { rows: [{ id: 'm1', seq: 1, role: 'user', content: params[2], attachments: '[]', created_at: state.createdAt }] };
+        // P3 PR②b B2：`content` 不再是绑定参数（写侧恒为 SQL 里的空串字面量），故从 SQL 取回该字面量，
+        // 使 fake 的 RETURNING 行与真库一致；附件从本单起上移到 `params[2]`。
+        const content = s.match(/'user',\s*'([^']*)'/)?.[1] ?? '';
+        return { rows: [{ id: 'm1', seq: 1, role: 'user', content, attachments: params[2] ?? '[]', created_at: state.createdAt }] };
       }
       if (s.startsWith('SELECT round, dedup_key, record')) {
         // session transcript store 适配器 load(key)：按 transcript_key 取权威列，引擎侧推导 round/幂等。
@@ -332,7 +335,13 @@ test('P3 PR②a（0.15.0 appendUserTurn）：POST 在同一事务内先写 trans
   assert.deepEqual(order[storeLoad].params, [PM_SESSION_ID], 'load 只取本 session key 的轮记录');
   assert.deepEqual(insert.params.slice(0, 3), [PM_SESSION_ID, `${PM_SESSION_ID}:input:m1`, 7]);
   const userMessageInsert = order[messageInsert];
-  assert.equal(JSON.parse(userMessageInsert.params[3])[0].name, 'readme.md', '附件仍写在锚点行');
+  // P3 PR②b B2（写入点①）：用户行的 `content` 恒为空串字面量（正文不再写进 messages），
+  // 入参只剩 锚点元数据（session_id/seq/attachments）。
+  assert.match(normalize(userMessageInsert.sql), /VALUES \(\$1, \$2, 'user', '', \$3\)/);
+  assert.equal(userMessageInsert.params.length, 3, '用户输入文本不再作为 messages INSERT 的参数');
+  assert.equal(userMessageInsert.params[2], JSON.stringify([{ kind: 'file', path: '/repo/readme.md', name: 'readme.md' }]));
+  assert.ok(!JSON.stringify(userMessageInsert.params).includes(content), '用户正文不得出现在锚点行参数里');
+  assert.equal(posted.message.content, content, '202 响应体回显请求正文（前端气泡渲染依赖）');
   const expectedMessages = [{ role: 'user', content: [{ type: 'text', text: content }] }];
   const record = JSON.parse(insert.params[3]);
   assert.deepEqual(record, {
