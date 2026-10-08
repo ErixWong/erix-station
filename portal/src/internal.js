@@ -1009,9 +1009,11 @@ export async function recallTranscript(pool, { container, user, runId, claimToke
 
   const to = toRound == null ? 2147483647 : toRound;
   const res = await pool.query(
+    // 0.16.0 同 round 保序：命中集与 LIMIT 2000 截断必须可复现 → 按持久化追加序
+    // （append_seq，迁移 0016，恒非空）补序，同 getTranscript / getSessionTranscript 口径。
     `SELECT round, record, folded_payload FROM transcript_rounds
       WHERE run_id = $1 AND round BETWEEN $2 AND $3
-      ORDER BY round ASC LIMIT 2000`,
+      ORDER BY round ASC, append_seq ASC LIMIT 2000`,
     [runId, fromRound, to],
   );
   const hits = [];

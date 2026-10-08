@@ -135,12 +135,14 @@ export function createSessionTextHandler({ messages = [], transcriptRows = [], s
       };
     }
 
-    // ④ 整会话 transcript 行（投影上下文）
+    // ④ 整会话 transcript 行（投影上下文；与 sessions.js / session-text.js 的 SQL 同步：
+    //    同 round 按 append_seq 持久化追加序（迁移 0016），created_at 仅作为无 append_seq 种子行的兜底）
     if (has('FROM transcript_rounds') && has('SELECT run_id, round, dedup_key, record, created_at')) {
       const [key] = params;
       const rows = transcriptRows
         .filter((x) => (x.transcript_key ?? x.transcriptKey) === key)
         .sort((a, b) => (Number(a.round) - Number(b.round))
+          || (Number(a.append_seq ?? -1) - Number(b.append_seq ?? -1))
           || String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
         .map((x) => ({
           run_id: x.run_id ?? null,
