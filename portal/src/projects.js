@@ -43,6 +43,64 @@ export function buildHostname({ fdeName, port, baseDomain }) {
   return `${fdeName}-p-${port4}.fde.${baseDomain}`;
 }
 
+// —— #202 预览域名预算（开户时前置校验，与路由生成期 routes.js isValidHostname 同口径）——
+// buildHostname 的首标签 = <fde> + "-p-" + 4 位端口（port4 恒 4 位）→ 固定段占 7 字符；
+// DNS 单标签上限 63（RFC 1035）⇒ **FDE 名参与预览域名的有效预算 56**（63 − 7）。
+// 57..63 字符的名字能过 FDE_NAME_RE，却要等到路由生成阶段（routes.js）才被拒 →
+// 用户只看到「预览打不开」，看不出是名字太长（#202 实况）。FDE 开户路径必须先挡（admin.js createUser）。
+// 为什么不动 FDE_NAME_RE（≤63）本身：validateFdeName 还被目录名/容器名（fde-<name>）/
+// git-credential/offboarding 等路径复用（dirs.js、provisioner.js、git-credential.js、offboarding.js），
+// 那些消费方不受 DNS 标签约束，57..63 字符仍合法；故**另加**「参与预览域名」口径的校验（本节），
+// 由开户路径显式调用，而不是收窄那个正则的语义。
+export const MAX_FDE_NAME_LEN_FOR_HOSTNAME = 56;
+
+// 与 routes.js DNS_LABEL_RE 同构（单标签 ≤63 = 1+61+1，小写字母数字、不以 - 开头/结尾）。
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** 完整 hostname 校验（不是分段校验）：总长 ≤253（RFC 1035）+ 逐标签 ≤63 且 DNS 字符集。 */
+export function validateHostnameGrammar(hostname) {
+  if (typeof hostname !== 'string' || hostname.length === 0) {
+    return { ok: false, reason: 'hostname 为空' };
+  }
+  if (hostname.length > 253) {
+    return { ok: false, reason: `总长 ${hostname.length} 字符，超过整域名上限 253` };
+  }
+  for (const label of hostname.split('.')) {
+    if (!DNS_LABEL_RE.test(label)) {
+      return { ok: false, reason: `单标签「${label}」${label.length} 字符，超过 DNS 上限 63 或含非法字符`, label };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * 开户（及任何要落 hostname 的路径）的 FDE 名校验：先按 buildHostname 语法拼出**最终 hostname**
+ * 再整体校验（逐标签 ≤63 + 总长 ≤253），不是只验各段。port4 恒 4 位 → 首标签长度只取决于 FDE 名
+ * （len + 7），与端口取值无关；baseDomain 缺省时退化为只校验首标签（预算与 base 域无关）。
+ * 失败回可操作的 400 文案（含超限行长度与 FDE 名预算 56）。
+ */
+export function validateFdeNameForHostname(fdeName, { baseDomain = null } = {}) {
+  if (!validateFdeName(fdeName).ok) {
+    return { ok: false, message: 'fde_name 非法（小写字母/数字/连字符，不以连字符开头或结尾）' };
+  }
+  const firstLabel = `${fdeName}-p-4000`;
+  const hostname = baseDomain ? buildHostname({ fdeName, port: 4000, baseDomain }) : firstLabel;
+  if (hostname.length > 253) {
+    return { ok: false, message: `预览域名过长：生成的预览域名总长 ${hostname.length} 字符，超过整域名上限 253` };
+  }
+  for (const label of hostname.split('.')) {
+    if (DNS_LABEL_RE.test(label)) continue;
+    if (label === firstLabel) {
+      return {
+        ok: false,
+        message: `FDE 名过长：生成的预览域名单标签 ${label.length} 字符，超过 DNS 上限 63（FDE 名请缩短到 ${MAX_FDE_NAME_LEN_FOR_HOSTNAME} 以内）`,
+      };
+    }
+    return { ok: false, message: `预览域名非法：base 域标签「${label}」${label.length} 字符，超过 DNS 上限 63 或含非法字符` };
+  }
+  return { ok: true };
+}
+
 export function buildUrl(hostname) {
   return `https://${hostname}`;
 }
