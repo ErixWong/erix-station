@@ -25,12 +25,12 @@ const HTTP_USER = {
 };
 const TOKEN = 'tok-sessions-list-test';
 
-/** 造一行会话（updated_at 可传 ISO 字符串，fake pool 内转 Date 比较）。 */
-function row(id, { title = `会话 ${id}`, cwd = '~/projects/a', updated_at = T0, status = 'active', active_run_id = null } = {}) {
+/** 造一行会话（updated_at 可传 ISO 字符串，fake pool 内转 Date 比较；message_count 为 #197 列表内嵌子查询列）。 */
+function row(id, { title = `会话 ${id}`, cwd = '~/projects/a', updated_at = T0, status = 'active', active_run_id = null, message_count = 0 } = {}) {
   return {
     id, user_id: UID, project_id: null, cwd, title, title_source: 'auto', model: null,
     status, last_seq: 0, created_at: updated_at, updated_at,
-    active_run_id,
+    active_run_id, message_count,
   };
 }
 
@@ -122,6 +122,19 @@ test('listSessions：排序 updated_at DESC, id DESC（SQL 复合 ORDER BY 落�
   const { items } = await listSessions(pool, { userId: UID });
   assert.match(pool.queries[0].sql, /ORDER BY s\.updated_at DESC, s\.id DESC/);
   assert.equal(items.length, 2);
+});
+
+test('listSessions：message_count（#197）——列表 SQL 内嵌 messages 相关子查询，零额外往返，逐项透传', async () => {
+  const pool = new ListPool([
+    row('11111111-1111-4111-8111-111111111111', { updated_at: '2026-09-26T03:00:00.000Z', message_count: 7 }),
+    row('22222222-2222-4222-8222-222222222222', { updated_at: '2026-09-26T02:00:00.000Z', message_count: 0 }),
+  ]);
+  const { items } = await listSessions(pool, { userId: UID });
+  // 子查询内嵌在同一条列表 SQL 里（口径：全量 messages 行含 synthetic，与头部状态行同源），不多发一次查询
+  assert.match(pool.queries[0].sql, /\(SELECT COUNT\(\*\) FROM messages m WHERE m\.session_id = s\.id\) AS message_count/);
+  assert.equal(pool.queries.length, 1, '仅一条 SQL（子查询非独立往返）');
+  assert.deepEqual(items.map((i) => i.message_count), [7, 0]);
+  assert.equal(Number.isInteger(items[0].message_count), true, '整数（真实 pg 下 COUNT 为 bigint 字符串，映射层 Number() 归一）');
 });
 
 test('listSessions：同 updated_at 多条——keyset 翻页不跳过、不重复', async () => {
@@ -231,8 +244,8 @@ async function startHttp(rows) {
 
 test('HTTP：GET /api/sessions → 200，响应组装 items+next_cursor，无 total 字段、无 COUNT 查询', async () => {
   const rows = [
-    row('11111111-1111-4111-8111-111111111111', { title: '部署脚本', updated_at: '2026-09-26T03:00:00.000Z' }),
-    row('22222222-2222-4222-8222-222222222222', { title: '部署计划', updated_at: '2026-09-26T02:00:00.000Z' }),
+    row('11111111-1111-4111-8111-111111111111', { title: '部署脚本', updated_at: '2026-09-26T03:00:00.000Z', message_count: 5 }),
+    row('22222222-2222-4222-8222-222222222222', { title: '部署计划', updated_at: '2026-09-26T02:00:00.000Z', message_count: 3 }),
     row('33333333-3333-4333-8333-333333333333', { title: '别的', updated_at: '2026-09-26T01:00:00.000Z' }),
   ];
   const s = await startHttp(rows);
@@ -246,7 +259,11 @@ test('HTTP：GET /api/sessions → 200，响应组装 items+next_cursor，无 to
     assert.equal(body.items[0].title, '部署脚本');
     assert.notEqual(body.next_cursor, null, '还有第 3 条 → 有 next_cursor');
     assert.equal(body.total, undefined, '响应无 total 字段（评审裁决已拆除）');
-    assert.equal(s.pool.queries.some((q) => /SELECT COUNT\(\*\)/.test(q.sql)), false, '无 COUNT 查询');
+    assert.equal(
+      s.pool.queries.some((q) => /^\s*SELECT\s+COUNT/i.test(q.sql.trim())), false,
+      '无独立 COUNT 往返查询（#197：message_count 为列表 SQL 内嵌相关子查询，不是另发的 COUNT）',
+    );
+    assert.deepEqual(body.items.map((i) => i.message_count), [5, 3], '#197：每项带 message_count（fake 行直供子查询列）');
 
     // 翻页：cursor 透传到复合行值比较
     s.pool.queries.length = 0;

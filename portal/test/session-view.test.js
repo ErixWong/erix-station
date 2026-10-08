@@ -98,6 +98,8 @@ class SessionViewPool {
           model: null,
           status: 'active',
           last_seq: 8,
+          // #197： getSession 的 fetchSession SQL 内嵌子查询列（真库为 COUNT 结果，可能是 bigint 字符串）。
+          message_count: 23,
         }],
       };
     }
@@ -820,7 +822,10 @@ test('message cursor still filters anchor rows before transcript projection', as
   });
 
   assert.deepEqual(result.messages.map((message) => message.seq), [3, 4]);
-  const anchorQuery = pool.queries.find((query) => query.sql.includes('FROM messages') && !query.sql.includes("role = 'user'"));
+  // 锚点批次查询（排除 chat_sessions 主查询：#197 后它的内嵌子查询也含 "FROM messages"）。
+  const anchorQuery = pool.queries.find((query) => query.sql.includes('FROM messages')
+    && !query.sql.includes("role = 'user'")
+    && !query.sql.includes('FROM chat_sessions s'));
   assert.deepEqual(anchorQuery.params, [SESSION_ID, 2, 5]);
   assert.equal(result.last_seq, 8);
 });
@@ -837,8 +842,38 @@ test('metadata-only session read skips messages and transcript queries', async (
 
   assert.deepEqual(result.messages, []);
   assert.equal(result.last_seq, 8);
-  assert.equal(pool.queries.some((query) => query.sql.includes('FROM messages')), false);
+  // 排除 chat_sessions 主查询（#197 内嵌子查询字面含 FROM messages，但它不是独立的消息表往返）。
+  assert.equal(pool.queries.some((query) => query.sql.includes('FROM messages')
+    && !query.sql.includes('FROM chat_sessions s')), false);
   assert.equal(pool.queries.some((query) => query.sql.includes('FROM transcript_rounds')), false);
+});
+
+// ---------------------------------------------------------------------------
+// issue #197（二）：会话 DTO 的 message_count（头部状态行消息数口径与列表 API 同源）。
+// 断言写法照抄 sessions-list.test.js 同款：子查询内嵌在同一 SQL、无独立 COUNT 往返、Number 归一。
+// ---------------------------------------------------------------------------
+
+test('#197 getSession DTO：session.message_count 来自会话主查询内嵌子查询，零独立 COUNT 往返', async () => {
+  const { anchors, transcriptRows } = fixture();
+  const pool = new SessionViewPool({ anchors, transcriptRows });
+
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 2 });
+
+  const sessionQuery = pool.queries.find((query) => query.sql.includes('FROM chat_sessions s'));
+  // 子查询与会话属主校验同一条 SQL（口径：messages 全量行数含 synthetic，与 listSessions.message_count 同源）
+  assert.match(
+    sessionQuery.sql,
+    /\(SELECT COUNT\(\*\) FROM messages m WHERE m\.session_id = s\.id\) AS message_count/,
+  );
+  assert.equal(
+    pool.queries.some((query) => /^\s*SELECT\s+COUNT/i.test(query.sql.trim())), false,
+    '无独立 COUNT 往返查询（#197：message_count 为内嵌相关子查询，不是另发的 COUNT）',
+  );
+  // DTO 透传：主查询子查询列 → session.message_count（整数；分页窗口 limit=2 不影响总数）。
+  assert.equal(result.session.message_count, 23);
+  assert.equal(Number.isInteger(result.session.message_count), true,
+    '整数（真实 pg 下 COUNT 为 bigint，映射层 Number() 归一）');
+  assert.equal(result.messages.length, 2, 'messages 仍是分页窗口（本单不动分页行为）');
 });
 
 // ---------------------------------------------------------------------------

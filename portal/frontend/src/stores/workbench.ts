@@ -40,6 +40,9 @@ export interface Session {
   updated_at?: string;
   active_run_id?: string | null;
   cwd?: string; // issue #84 P5：会话绑定目录（响应带 cwd）
+  /** issue #197：会话消息数（后端 listSessions COUNT 全量 messages 行、含 synthetic，
+   * 与头部状态行 sessionStats 同源口径）；旧后端/其列表外来源（createSession 响应）可能缺失 → 不显示。 */
+  message_count?: number;
 }
 
 /**
@@ -157,6 +160,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const dirCwd = ref<string | null>(null); // 选中目录（页面级状态）
   const sessions = ref<Session[]>([]);
   const sessionId = ref<string | null>(null);
+  // issue #197：当前会话的消息总数（getSession DTO 的 session.message_count，后端全量口径）。
+  // null=旧后端/非详情入口无此字段 → sessionStats 回退已加载条数（messages 是分页窗口，长会话会少报）。
+  const sessionMessageCount = ref<number | null>(null);
   const noDir = ref(false);
   const projectReqSeq = ref(0); // 迟到响应丢弃（快速 A→B 切换）
   const sessionReqSeq = ref(0);
@@ -303,9 +309,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   /**
-   * issue #189（追加）：当前会话头部状态行数据（前端已有数据，不改后端/不加 API）：
-   * messages = 已加载消息条数（msg entry 数），folded = DTO 带 folded 字段的消息条数
-   * （每有折叠的消息只推一条 folded entry，故两者相等）。无选中会话 → null（不渲染）。
+   * issue #189（追加）：当前会话头部状态行数据：
+   * messages = 消息数：#197 口径修正——优先用后端 DTO 的会话总数 message_count（全量 messages 行、
+   * 含 synthetic，与侧栏列表 message_count 同源）；DTO 的 messages 只是分页窗口（limit 默认 20），
+   * 长会话只按已加载条数会少报。缺失（旧后端/其他入口）回退已加载 msg entry 数；两数取大——
+   * DTO 快照后实时新增的消息（send/SSE）不得被旧快照吃掉回退。folded = DTO 带 folded 字段的消息数。
+   * 无选中会话 → null（不渲染）。
    */
   const sessionStats = computed(() => {
     if (!sessionId.value) return null;
@@ -315,7 +324,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (en.kind === 'msg') messages++;
       else if (en.kind === 'folded') folded++;
     }
-    return { messages, folded };
+    const total = sessionMessageCount.value;
+    return { messages: total != null ? Math.max(total, messages) : messages, folded };
   });
 
   // ---- 流式增量气泡（旧 S.deltaBuf DOM 的数组等价：round_start 后半截增量留在流里）----
@@ -399,6 +409,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     projectReqSeq.value++;
     dirCwd.value = cwd;
     sessionId.value = null;
+    sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
     es.resetStreamState();
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -430,6 +441,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     clearExpandedToolCalls();
     renderedIds.value = new Set();
     entries.value = [];
+    sessionMessageCount.value = null; // #197：先清旧会话的计数，加载失败/竞态丢弃时不得串会话残留
     let data: SessionDetail;
     let history: { events: RunHistoryEvent[] } | null = null;
     try {
@@ -452,6 +464,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return;
     }
     if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value) return;
+    // #197：头部消息数的权威源——后端全量计数（非分页窗口的 messages 长度）；非法/缺失 → null 回退。
+    sessionMessageCount.value = typeof data.session?.message_count === 'number'
+      && Number.isFinite(data.session.message_count)
+      ? data.session.message_count
+      : null;
     es.lastSeq.value = data.last_seq;
     renderedIds.value = new Set();
     // issue #89：messages（addMessage）与历史 run_events（es.replayEvent）按 seq 归并回放——
@@ -522,6 +539,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     projectReqSeq.value++;
     dirCwd.value = cwd;
     sessionId.value = null;
+    sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
     es.resetStreamState();
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -617,6 +635,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // issue #55 A1：popstate 回退也属「离开会话」，先存草稿（空值则清除）。
     saveDraft();
     sessionId.value = null;
+    sessionMessageCount.value = null; // #197：无选中会话 → 不得复用旧会话的计数
     es.resetStreamState();
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -692,6 +711,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     try {
       const data = await api<SessionDetail>(`/api/sessions/${encodeURIComponent(sid!)}`);
       if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value || sessionId.value !== sid) return;
+      // #197：刷新是重取详情——同步刷新头部消息数的权威源（run 终态后总数会变）。
+      sessionMessageCount.value = typeof data.session?.message_count === 'number'
+        && Number.isFinite(data.session.message_count)
+        ? data.session.message_count
+        : null;
       const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
       for (const m of msgs) addMessage(m);
       await loadSessions();
