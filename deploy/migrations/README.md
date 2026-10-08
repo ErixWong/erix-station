@@ -44,7 +44,9 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0016-transcript-append-seq.sql`（transcript 同 round 保序：新增 `append_seq` + 存量按 `created_at, id` 确定性回填 + 部分索引；只增不改、幂等）。
+  `0017-port-allocations-hostname-check.sql`（#202 预览域名 hostname 的 DB 兜底 CHECK：整域名正则
+  逐标签 ≤63 + 总长 ≤253，NOT VALID，存量收敛动作见迁移头注释；前一道 `0016-transcript-append-seq.sql`
+  为 transcript 同 round 保序：新增 `append_seq` + 存量按 `created_at, id` 确定性回填 + 部分索引）。
   **P1 compose 显式设
   `MIGRATE_ON_START: "1"`**——单实例平台起栈即自动补增量，不再需要人工补跑（deploy-contract §3.1）；
   多实例部署必须置 `0` 并外部跑迁移。
