@@ -23,6 +23,7 @@ import {
   evaluateAutoTitle,
 } from '../src/session-title.js';
 import { createSession, updateSession, postMessage } from '../src/sessions.js';
+import { createSessionTextHandler, inputTranscriptRow } from './fake-session-text.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -454,30 +455,35 @@ test('issue #114：并发抢占（UPDATE 命中 0 行）→ 不回调（安静�
 const CFG = { sessionAutoTitle: true, sessionAutoTitleMinNew: 3 };
 
 /** 可编排 fake pool：一张 chat_sessions 行 + messages 数组。 */
-function titlePool({ session = {}, messages = [] } = {}) {
+function titlePool({ session = {}, messages = [], transcriptRows = [] } = {}) {
   const queries = [];
   const sess = {
     id: 's1', user_id: 'u1', title: '', title_source: 'auto', cwd: '~/projects/demo',
     auto_title_seq: null, last_seq: 1, status: 'active', ...session,
   };
+  // P3 PR②b B1：首条 / 最新 user 正文改走 session-text（锚点 + transcript 投影）。
+  const anchored = messages.map((m, index) => ({
+    id: m.id ?? `tu${index + 1}`,
+    session_id: 's1',
+    run_id: m.run_id ?? null,
+    synthetic: false,
+    attachments: [],
+    ...m,
+  }));
+  const sessionText = createSessionTextHandler({ messages: anchored, transcriptRows, sessionId: 's1' });
   const pool = {
     queries,
     updates: [],
+    anchoredMessages: anchored,
     async query(sql, params = []) {
       queries.push({ sql, params });
+      const hit = sessionText(sql, params);
+      if (hit) return hit;
       if (sql.startsWith('SELECT id, user_id, title, title_source')) {
         return { rows: sess.status === 'gone' ? [] : [{ ...sess }] };
       }
-      if (sql.includes("FROM messages") && sql.includes("role = 'user'") && sql.includes('ORDER BY seq ASC LIMIT 1')) {
-        const u = messages.filter((m) => m.role === 'user').sort((a, b) => a.seq - b.seq);
-        return { rows: u[0] ? [{ content: u[0].content, seq: u[0].seq }] : [] };
-      }
-      if (sql.includes("FROM messages") && sql.includes("role = 'user'") && sql.includes('ORDER BY seq DESC LIMIT 1')) {
-        const u = messages.filter((m) => m.role === 'user').sort((a, b) => b.seq - a.seq);
-        return { rows: u[0] ? [{ content: u[0].content, seq: u[0].seq }] : [] };
-      }
       if (sql.includes('count(*)::int')) {
-        const n = messages.filter((m) => m.role === 'user' && m.seq > params[1]).length;
+        const n = anchored.filter((m) => m.role === 'user' && m.seq > params[1]).length;
         return { rows: [{ n }] };
       }
       if (sql.startsWith('UPDATE chat_sessions')) {
@@ -633,4 +639,40 @@ test('evaluateAutoTitle：评估链抛错（DB 故障）→ 吞掉返回 null，
     sessionId: 's1', agentTitle: 'hi', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
+});
+
+// ---------------------------------------------------------------------------
+// P3 PR②b B1 ②③：自动标题降级链（首条）与话题漂移启发式（最新）的取数来源 = transcript 投影
+// ---------------------------------------------------------------------------
+
+test('P3 PR②b ②：降级链首条 user 正文取自 transcript（锚点正文只作 legacy 兜底）', async () => {
+  const pool = titlePool({
+    messages: [{ role: 'user', content: '锚点旧标题文本', seq: 1 }],
+    transcriptRows: [inputTranscriptRow({ sessionId: 's1', messageId: 'tu1', text: 'transcript 首条正文', round: 1 })],
+  });
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', agentTitle: '', config: CFG, log: { warn() {}, info() {} },
+  });
+  assert.equal(title, 'transcript 首条正文', '首条正文取自 transcript，不是 messages.content');
+  assert.equal(pool.updates.length, 1);
+});
+
+test('P3 PR②b ③：话题漂移启发式用 transcript 的最新 user 正文（transcript 与锚点不同 → 以 transcript 判漂移）', async () => {
+  // 现标题与**锚点**正文关键词重合（若仍读 messages.content → 判「未漂移」→ 不刷新），
+  // 但 transcript 里的最新正文是全新话题 → 读 transcript 才判出漂移并刷新。
+  const pool = titlePool({
+    session: { title: '修复登录 bug', auto_title_seq: 5, last_seq: 6 },
+    messages: [
+      { role: 'user', content: '修复登录 bug', seq: 1 },
+      { role: 'user', content: '登录页收尾', seq: 6 }, // 与标题重合（锚点侧）
+    ],
+    transcriptRows: [
+      inputTranscriptRow({ sessionId: 's1', messageId: 'tu2', text: '数据库迁移脚本评审', round: 2 }),
+    ],
+  });
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', agentTitle: '', config: CFG, log: { warn() {}, info() {} },
+  });
+  assert.equal(title, '修复登录 bug', `刷新后降级标题 = 首条 transcript/锚点正文（got ${title}）`);
+  assert.equal(pool.updates.length, 1, 'transcript 最新正文与标题零重合 → 判漂移 → 刷新（读锚点则不会刷新）');
 });

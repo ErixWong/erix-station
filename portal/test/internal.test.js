@@ -910,3 +910,173 @@ test('心跳下行模型集：无 virtual key → models=null（未绑定时不�
   });
   assert.equal(hbA.models, null);
 });
+
+// ---------------------------------------------------------------------------
+// P3 PR②b B1 ④⑤⑥：claim task / 历史下行 / 终态幂等 final_text 的取数来源 = transcript 投影
+// ---------------------------------------------------------------------------
+
+const inputRow = (sessionId, messageId, text, round = 1) => ({
+  transcript_key: sessionId,
+  run_id: null,
+  round,
+  dedup_key: `${sessionId}:input:${messageId}`,
+  folded: false,
+  messages: [],
+  record: {
+    round,
+    dedupKey: `${sessionId}:input:${messageId}`,
+    messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+  },
+  created_at: 100 + round,
+});
+
+const engineRow = (sessionId, runId, round, assistantText, { userText = null } = {}) => {
+  const messages = [];
+  if (userText) messages.push({ role: 'user', content: [{ type: 'text', text: userText }] });
+  return {
+    transcript_key: sessionId,
+    run_id: null,
+    round,
+    dedup_key: `${runId}:round:${round}`,
+    folded: false,
+    messages: [],
+    record: {
+      round,
+      dedupKey: `${runId}:round:${round}`,
+      messages,
+      response: { role: 'assistant', content: [{ type: 'text', text: assistantText }], toolCalls: [] },
+    },
+    created_at: 100 + round,
+  };
+};
+
+test('P3 PR②b ④：claim ticket 的 task 文本取自 transcript 输入行（attachments 仍从 messages 取）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  pool.rounds.push(inputRow(sessionId, 'm1', 'transcript 里的任务文本'));
+  pool.messages[0].attachments = [{ id: 'att1', name: 'a.png' }];
+  const ticket = await claimRun(pool, {
+    container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10,
+  });
+  assert.equal(ticket.run.task, 'transcript 里的任务文本', 'task 正文来自 :input: 行，不是 messages.content("hello")');
+  assert.equal(ticket.run.message_id, 'm1', '锚点 id 仍取自 messages');
+  assert.deepEqual(ticket.run.attachments, [{ id: 'att1', name: 'a.png' }], '附件仍来自 messages（本平台自有元数据）');
+});
+
+test('P3 PR②b ④：输入行取不到 → 按定义顺序回退（transcript → legacy messages.content → 空串）', async () => {
+  const containerOf = (p, u, c) => ({ container: { id: c, user_id: u }, user: { id: u, login: 'alice' } });
+
+  // ② 无 :input: 行（迁移 0015 之前的老会话）→ legacy 回退 messages.content
+  const p1 = seedClaimable();
+  const t1 = await claimRun(p1.pool, { ...containerOf(p1.pool, p1.userId, p1.containerId), capacity: 1, holdMs: 10 });
+  assert.equal(t1.run.task, 'hello', 'legacy-only 兜底：投影无证据时用锚点正文');
+
+  // ③ 输入行与锚点正文都空 → 空串（既有的 ?? '' 语义，不阻断 claim）
+  const p2 = seedClaimable();
+  p2.pool.messages[0].content = '';
+  const t2 = await claimRun(p2.pool, { ...containerOf(p2.pool, p2.userId, p2.containerId), capacity: 1, holdMs: 10 });
+  assert.equal(t2.run.task, '');
+  assert.equal(t2.run.id, 'run1', '取不到正文也不得阻断 claim');
+
+  // 输入行存在但投影无 user 正文（record 空 messages）→ 仍回退锚点正文，绝不丢任务
+  const p3 = seedClaimable();
+  p3.pool.rounds.push({
+    transcript_key: p3.sessionId, run_id: null, round: 1, dedup_key: `${p3.sessionId}:input:m1`,
+    folded: false, messages: [], record: { round: 1, dedupKey: `${p3.sessionId}:input:m1`, messages: [] }, created_at: 101,
+  });
+  const t3 = await claimRun(p3.pool, { ...containerOf(p3.pool, p3.userId, p3.containerId), capacity: 1, holdMs: 10 });
+  assert.equal(t3.run.task, 'hello', '输入行存在但无正文 → 回退锚点正文（关键路径不得变空）');
+});
+
+test('P3 PR②b ④：投影读取抛错 → best-effort 回退锚点正文，claim 不阻断', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  const orig = pool.query.bind(pool);
+  pool.query = (sql, params) => {
+    if (sql.includes('FROM transcript_rounds') && sql.includes('dedup_key = $2')) {
+      return Promise.reject(new Error('transcript db down'));
+    }
+    return orig(sql, params);
+  };
+  const warns = [];
+  const ticket = await claimRun(pool, {
+    container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' },
+    capacity: 1, holdMs: 10, log: { warn: (m) => warns.push(String(m)) },
+  });
+  assert.equal(ticket.run.task, 'hello');
+  assert.ok(warns.some((w) => w.includes('task transcript projection read failed')));
+});
+
+test('P3 PR②b ⑤：claim 历史下行正文取自 transcript（锚点集合/排除语义不变）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  pool.messages.push({ id: 'm2', run_id: 'run0', session_id: sessionId, role: 'assistant', content: '锚点旧答复', seq: 0, attachments: [] });
+  pool.rounds.push(engineRow(sessionId, 'run0', 3, 'transcript 里的答复'));
+  const ticket = await claimRun(pool, {
+    container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10,
+  });
+  assert.deepEqual(ticket.run.history, [{ role: 'assistant', content: 'transcript 里的答复' }]);
+});
+
+test('P3 PR②b ⑤：历史上行预算语义保持（条数/字节截断仍按投影后的正文计）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  for (let i = 2; i <= 6; i += 1) {
+    pool.messages.push({ id: `m${i}`, run_id: `runH${i}`, session_id: sessionId, role: 'assistant', content: `锚点${i}`, seq: i, attachments: [] });
+    pool.rounds.push(engineRow(sessionId, `runH${i}`, 10 + i, `ans${i}`));
+  }
+  const args = { container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10 };
+  const t1 = await claimRun(pool, { ...args, historyBudget: { maxMessages: 3, maxBytes: 16384 } });
+  assert.deepEqual(t1.run.history, [
+    { role: 'assistant', content: 'ans4' },
+    { role: 'assistant', content: 'ans5' },
+    { role: 'assistant', content: 'ans6' },
+  ], '保最新 3 条、升序，且正文来自 transcript');
+
+  const second = seedClaimable();
+  for (let i = 2; i <= 6; i += 1) {
+    second.pool.messages.push({ id: `m${i}`, run_id: `runH${i}`, session_id: 's1', role: 'assistant', content: `锚点${i}`, seq: i, attachments: [] });
+    second.pool.rounds.push(engineRow('s1', `runH${i}`, 10 + i, `ans${i}`));
+  }
+  const t2 = await claimRun(second.pool, {
+    container: { id: second.containerId, user_id: second.userId }, user: { id: second.userId, login: 'alice' },
+    capacity: 1, holdMs: 10, historyBudget: { maxMessages: 20, maxBytes: 10 },
+  });
+  assert.deepEqual(t2.run.history, [
+    { role: 'assistant', content: 'ans5' },
+    { role: 'assistant', content: 'ans6' },
+  ], '字节预算按 transcript 正文计算（丢最旧）');
+});
+
+test('P3 PR②b ⑥：终态幂等比较的 stored.final_text 取自 transcript 投影（无证据才 legacy 回退）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  const payload = { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 1, final_text: 'transcript 终态答复' };
+  await setRunState(pool, { container, user, runId, claimToken, body: payload });
+  // 锚点正文与 transcript 正文不同（模拟两侧不一致）→ 幂等比较以 transcript 为准
+  const anchor = pool.messages.find((m) => m.role === 'assistant');
+  anchor.content = '锚点旧答复';
+  pool.rounds.push(engineRow(sessionId, runId, 4, 'transcript 终态答复'));
+
+  const replay = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
+  assert.equal(replay.idempotent, true, '与 transcript 正文一致 → 幂等成功');
+
+  await assert.rejects(
+    () => setRunState(pool, { container, user, runId, claimToken, body: { ...payload, final_text: '锚点旧答复' } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'run_terminal',
+    '只与锚点一致、与 transcript 不一致 → 不得判幂等',
+  );
+});
+
+test('P3 PR②b ⑥ legacy 兜底：transcript 对该 run 无证据 → final_text 比较回退 messages.content', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  const payload = { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 1, final_text: 'done' };
+  await setRunState(pool, { container, user, runId, claimToken, body: payload });
+  const replay = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
+  assert.equal(replay.idempotent, true, '老会话（无 transcript 证据）幂等重放仍成立');
+});

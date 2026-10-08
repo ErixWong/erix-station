@@ -3,6 +3,7 @@
 // 并发语义：claim 的 UPDATE 在 JS 单线程内同步完成（无内部 await），故并发 claim 只有一个成功（SKIP LOCKED 等价）。
 
 import { hashToken } from '../src/auth.js';
+import { createSessionTextHandler } from './fake-session-text.js';
 
 export class FakeInternalPool {
   constructor(seed = {}) {
@@ -27,6 +28,13 @@ export class FakeInternalPool {
     };
     this.auditLog = [];
     this._claim = 0;
+    // P3 PR②b B1：`session-text.js` 的取数面（投影取文本）。共用 `this.messages` / `this.rounds` 引用，
+    // 所以 putSessionRound / appendUserInputTurn / 终态 assistant 回写的内容对文本读取立即可见。
+    this.sessionText = createSessionTextHandler({
+      messages: this.messages,
+      transcriptRows: this.rounds,
+      sessionId: seed.sessionId ?? null,
+    });
   }
 
   _user(id) {
@@ -52,6 +60,10 @@ export class FakeInternalPool {
   }
 
   async _query(sql, params = []) {
+    // session-text.js（AI 改名 / 自动标题 / claim task / claim 历史 / 终态幂等）的取数 SQL：优先派发。
+    const textHit = this.sessionText(sql, params);
+    if (textHit) return textHit;
+
     // ---- authenticateContainer ----
     if (sql.includes('FROM containers c') && sql.includes('JOIN users u')) {
       const tokenHash = params[0];

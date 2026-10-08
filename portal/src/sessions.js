@@ -13,6 +13,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { clipTitleFromMessage, sanitizeTitle, AUTO_TITLE_MAX_LEN } from './session-title.js';
 import { getFdeLlmConfig } from './llm.js';
 import { projectSessionMessages } from './session-view.js';
+import { fetchUserTextTurns } from './session-text.js';
 import { appendUserInputTurn } from './transcript-store.js';
 
 export class SessionError extends Error {
@@ -609,13 +610,11 @@ export async function generateAiTitle(pool, {
 } = {}) {
   await fetchSession(pool, sessionId, userId);
 
-  const msgs = await pool.query(
-    `SELECT content FROM messages
-      WHERE session_id = $1 AND role = 'user'
-      ORDER BY seq ASC LIMIT $2`,
-    [sessionId, AI_TITLE_CONTEXT_MESSAGES],
-  );
-  const contexts = (msgs.rows ?? []).map((r) => r.content);
+  // P3 PR②b B1 ①（issue #114）：AI 改名上下文的前 N 条 user 文本**改从 transcript 投影取**
+  // （`fetchUserTextTurns` → `projectSessionMessages` 同一口径）。投影对该轮无证据时才 legacy
+  // 回退 `messages.content`（迁移 0015 之前的行；legacy-only，不用于新会话）。
+  const turns = await fetchUserTextTurns(pool, { sessionId, limit: AI_TITLE_CONTEXT_MESSAGES });
+  const contexts = turns.map((turn) => turn.text);
   if (contexts.length === 0) {
     throw new SessionError('no_user_messages', '会话还没有用户消息，无法生成标题', { httpStatus: 409 });
   }
