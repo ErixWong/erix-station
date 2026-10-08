@@ -82,6 +82,20 @@ export const en = {
     argsPending: '(generating arguments…)',
     argsStreaming: '(arguments streaming…)',
     reasoning: 'Reasoning',
+    // issue #189：compaction banner (standalone separator look, summary collapsed by default, read-only lazy load)
+    folded: {
+      range: 'Compressed {count} messages (rounds {from}–{to})',
+      countOnly: 'Compressed {count} messages',
+      bare: 'Compressed',
+      viewOriginal: 'View original',
+      originalEmpty: '(no text content)',
+      originalMissing: 'Original text unavailable (upstream did not retain the folded payload)',
+      originalError: 'Failed to load the original text: {message}',
+    },
+    // issue #189 (addendum): session header stats line "N messages · compacted M times" + restrained hint (M≥1 only)
+    sessionStats: '{count} messages',
+    sessionStatsCompacted: 'compacted {count}×',
+    sessionCompactionHint: 'Context compaction has started; open a new session if you need to keep full details',
     event: {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',

@@ -109,6 +109,23 @@ export const zhCN = {
     argsStreaming: '（参数流式生成中…）',
     // issue #188：助手推理块标题（与正文分离、默认收起、可展开）
     reasoning: '推理过程',
+    // issue #189：折叠段（compaction）横幅：独立分隔条样式 + 摘要默认收起 + 查看原文（只读懒加载）
+    folded: {
+      // 完整态：已压缩 N 条消息（第 r1–r2 轮）；缺字段时逐级降级
+      range: '已压缩 {count} 条消息（第 {from}–{to} 轮）',
+      countOnly: '已压缩 {count} 条消息',
+      bare: '已压缩',
+      viewOriginal: '查看原文',
+      // 原文只读展示
+      originalEmpty: '（无文本内容）',
+      // 404 folded_payload_not_found：友好提示（不是错误）
+      originalMissing: '原文已不可用（上游未保留折叠前载荷）',
+      originalError: '原文加载失败：{message}',
+    },
+    // issue #189（追加）：当前会话头部状态行「N 条消息 · 已压缩 M 次」+ 克制提示（仅 M≥1）
+    sessionStats: '{count} 条消息',
+    sessionStatsCompacted: '已压缩 {count} 次',
+    sessionCompactionHint: '上下文已开始压缩；如需保留完整细节，建议新开会话',
     event: {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',
