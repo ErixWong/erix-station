@@ -177,7 +177,7 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     safe(() => docker(`rm -f ${S.containerName ?? 'fde-alice-svc'} 2>/dev/null || true`));
     safe(() => docker(`network rm ${S.networkName ?? 'fde-alice'} 2>/dev/null || true`));
     safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
-    safe(() => docker('rmi -f erix-station/portal:local 2>/dev/null || true'));
+    // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose up --build 按需重建）。
     // 工作区/动态目录由 materializer/reconciler 以 root 写文件，但目录属主仍为 eric → 直接删。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));

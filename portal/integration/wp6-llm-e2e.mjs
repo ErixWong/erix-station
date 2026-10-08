@@ -1,5 +1,8 @@
 // WP6 end-to-end: LiteLLM admin setup, per-FDE key injection, allow-listing, and lifecycle regression.
 // Must run with unique compose/container names, temporary DB storage, and isolated host ports.
+// e2e 前置：必须导出 HTTP_PROXY/HTTPS_PROXY（FDE 镜像构建要联网下 gh/tea/glab）；隔离栈须派生
+// 镜像 tag（FDE_IMAGE/STATION_PORTAL_IMAGE）——本脚本绝不删除共享镜像 tag（issue #178，
+// 口径集中在 lib/fde-image.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -11,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -25,7 +29,7 @@ const FDE_NAMES = {
   alice: process.env.WP6_FDE_ALICE || 'alice',
   bob: process.env.WP6_FDE_BOB || 'bob',
 };
-const FDE_IMAGE = process.env.FDE_IMAGE || 'erix-station/fde:local';
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
 const ADMIN_PASSWORD = 'wp6-admin-pass-123';
 const HEARTBEAT_MS = 15000;
@@ -452,7 +456,7 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     safe(() => docker(`rm -f ${fdeContainer('alice')} ${fdeContainer('bob')} 2>/dev/null || true`));
     safe(() => docker(`network rm fde-${FDE_NAMES.alice} fde-${FDE_NAMES.bob} 2>/dev/null || true`));
     safe(() => compose('down -v', composePaths));
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
+    // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose/docker build 按需失效缓存）。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
@@ -464,8 +468,7 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
   try {
     safe(() => compose('down -v', composePaths));
     removeDbDir();
-    safe(() => docker(`rmi -f ${FDE_IMAGE} 2>/dev/null || true`));
-    docker(`build -t ${FDE_IMAGE} runner/`);
+    buildFdeImage(FDE_IMAGE);
     compose('up -d --build', {
       ...composePaths,
       MIGRATE_ON_START: '1',
