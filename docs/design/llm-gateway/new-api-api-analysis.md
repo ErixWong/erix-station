@@ -4,7 +4,7 @@
 > **版本状态**：仓库**尚无 v1.0.0 正式版**；最新 tag / GitHub release 为 `v1.0.0-rc.37`（2026-09-11），首个 rc 为 `v1.0.0-rc.1`（2026-04-29），累计 65 个 rc tag。HEAD 在 rc.37 之后又累积 25 个 commit（2026-09-12 ~ 09-15）。
 > **分析日期**：2026-09-16
 > **分析方式**：只读源码分析（Go 后端 + TypeScript 前端 + `docs/`）。clone 到仓外研究目录 `~/projects/.research/new-api`（`--depth 50`），**未改动 erix-station 及其它任何仓库**。因分析环境无 Go 工具链、docker daemon 不可访问，**未做运行时实测**；下文所有结论均给出「文件:行号/函数名」来源，可复核。
-> **用途**：核实选型文档 [`llm-gateway-selection.md`](./llm-gateway-selection.md) §5 第 2 条（本任务中称 §5.2）列为「选择 new-api 前必须实测」的三项，以及 §1 硬需求 #2/#3/#4/#5 在 new-api 侧的可行性。
+> **用途**：核实选型文档 [`llm-gateway-selection.md`](./llm-gateway-selection.md) §5.2 列为「选择 new-api 前必须实测」的三项，以及 §1 硬需求 #2/#3/#4/#5 在 new-api 侧的可行性。
 
 ---
 
@@ -299,20 +299,20 @@ username / token_name / model_name / channel / group / request_id / upstream_req
 
 ---
 
-## 对照选型文档的验证清单（§5「建议」第 2 条三项实测的源码层判定）
+## 对照选型文档的验证清单（§5.2 三项待实测项的源码层判定）
 
-选型文档 §5 第 2 条（本任务表述为 §5.2）要求"选择 new-api 之前必须实测"三项。本次为源码级判定（未运行时实测），判定如下：
+选型文档 §5.2 要求"选择 new-api 之前必须实测"三项。本次为源码级判定（未运行时实测），判定如下：
 
-| §5 第 2 条待实测项 | 源码层判定 | 依据与结论 |
+| §5.2 待实测项 | 源码层判定 | 依据与结论 |
 |---|---|---|
-| **① 额度超限的 HTTP 状态码是否 429** | ❌ **不达标（源码层已可定论，无需实测）** | 令牌已耗尽/过期 → `401` + `{"error":{"message":"Invalid token","type":"new_api_error","code":""}}`（`model/token.go:220-251` + `middleware/auth.go:410-421` + `middleware/utils.go:14-32` + `i18n/locales/en.yaml:47`）；本次预扣不足 → `403` `code=pre_consume_token_quota_failed`（`service/billing_session.go:207-211`、`service/quota.go:396-411`）；用户余额/订阅不足 → `403` `code=insufficient_user_quota`（`service/billing_session.go:388-400`、`relaykit/types/error.go:86`）。429 只用于请求次数限流与上游透传，配额路径无 429，且无配置可改（`service/error.go:140-164` 的 `status_code_mapping` 只作用于 handler 内错误）。→ **agent 侧 `rate_limited, retryable` 无法按设计触发**；按选型文档 §5「任一不达标即回退 LiteLLM」，此项即触发回退条件。 |
+| **① 额度超限的 HTTP 状态码是否 429** | ❌ **不达标（源码层已可定论，无需实测）** | 令牌已耗尽/过期 → `401` + `{"error":{"message":"Invalid token","type":"new_api_error","code":""}}`（`model/token.go:220-251` + `middleware/auth.go:410-421` + `middleware/utils.go:14-32` + `i18n/locales/en.yaml:47`）；本次预扣不足 → `403` `code=pre_consume_token_quota_failed`（`service/billing_session.go:207-211`、`service/quota.go:396-411`）；用户余额/订阅不足 → `403` `code=insufficient_user_quota`（`service/billing_session.go:388-400`、`relaykit/types/error.go:86`）。429 只用于请求次数限流与上游透传，配额路径无 429，且无配置可改（`service/error.go:140-164` 的 `status_code_mapping` 只作用于 handler 内错误）。→ **agent 侧 `rate_limited, retryable` 无法按设计触发**；按选型文档 §6-2 回退规则「任一不达标即回退 LiteLLM」，此项即触发回退条件。 |
 | **② admin API 建/吊销 key 的脚本化可行性** | ⚠️ **可行但不是一等公民**（自动化需要绕过 3 个摩擦点） | 建：`POST /api/token/`（`router/api-router.go:280`），但**响应不含 id/key**（`controller/token.go:355-358`），需 `GET /api/token/search` + `POST /api/token/:id/key`（或 `POST /api/token/batch/keys`，≤100）两段式；吊销：`DELETE /api/token/:id`、批量 `POST /api/token/batch`；鉴权：PAT（`Authorization: Bearer <PAT>`），但 **PAT 不能自举**——`POST /api/user/token` 需要登录会话 + 密码型 `X-Security-Proof`（`controller/access_token.go:24-49`、`middleware/secure_verification.go:39-49`、`docs/authentication.md`「PAT 调用契约」），portal 必须长期持有账号口令；令牌接口全部 user-scoped、无 admin 代建他人令牌（`controller/token.go:333`）；额度还需另调 `POST /api/user/manage` 给用户充值（`service/billing_session.go:388-400`）。→ **可以脚本化，但编排步骤多、依赖口令、且没有"参数即业务概念"的 admin 契约**；对比 LiteLLM `/key/generate`（返回 key、admin 可代建、`budget`/`models`/`alias` 直给）差距明显。 |
 | **③ v1.0 定稿时间 / 接口漂移风险** | ❌ **风险已被证实为现实**（rc 期间接口仍在变，且文档已落后） | 仍无 v1.0.0 正式版：最新 `v1.0.0-rc.37`（2026-09-11），rc 起点 `v1.0.0-rc.1`（2026-04-29），累计 **65 个 rc tag**，最近 6 周发了 **15 个 rc**（rc.23 08-01 → rc.37 09-11，约 2~3 个/周）；HEAD 在 rc.37 之后 **4 天内又有 25 个 commit**。漂移实例：**rc.1 的 `docs/openapi/api.json` 要求 `New-Api-User` 头且以 session cookie 为主鉴权**（`securitySchemes.NewApiUser1.description` = "必须提供"），**HEAD 已改为 PAT、不再要求 `New-Api-User`、并新增 `docs/authentication.md`**（rc.1 中该文件不存在），文档里明写"升级注意事项：旧 session Cookie 不再使用；升级后现有面板登录会失效"——**正是 portal 依赖的那层接口**。此外当前 OpenAPI 文档已落后实现：token/log/data 三组中 7 条在册路由缺失（含必需的 `POST /api/token/{id}/key`、`POST /api/token/batch/keys`），并仍描述 2 条已废弃接口（`controller/log.go:64-77`）；CI 无文档一致性校验。→ **选择 new-api 意味着把接口漂移成本转嫁到我们的 onboarding/offboarding 编排上**，每次升级都要回归这条 5~6 步的鉴权+令牌链路。 |
 
 ### 汇总判断（供选型文档 §5 参考，本文不代改）
 
 - 三项中 **①（429）与 ③（v1.0 定稿风险）为不达标/已证实风险**，② 为"可行但摩擦大"。
-- 按选型文档 §5 第 2 条末句的规则「任一不达标即回退 LiteLLM」，**源码层证据已经构成回退理由**，无需先做实测；若仍要保留 new-api 作为轻量替代，需要同时接受：(a) agent 侧自定义错误分类，(b) 自建/外置 L7 凭据通道过滤（需求 #5），(c) 每次升级回归鉴权与令牌编排。
+- 按选型文档 §6-2（建议第 2 条）的规则「任一不达标即回退 LiteLLM」，**源码层证据已经构成回退理由**，无需先做实测；若仍要保留 new-api 作为轻量替代，需要同时接受：(a) agent 侧自定义错误分类，(b) 自建/外置 L7 凭据通道过滤（需求 #5），(c) 每次升级回归鉴权与令牌编排。
 
 ---
 
