@@ -32,6 +32,7 @@ import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { generateSessionTitle, resolveFirstUserContent } from './lib/session-title.js';
+import { buildFailureEnvelope } from './lib/termination.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -398,22 +399,22 @@ async function startRun(msg) {
       title,
     });
   } catch (err) {
+    // issue #212：失败/中止终态信封（构造逻辑与单测在 runner/lib/termination.js）。
+    // 优先**透传**引擎挂在错误上的完整 termination（reason 可能是 persistence_failed，
+    // 并带 operation/phase/sideEffect），引擎没给才回退旧的拍平口径；retryable 改用与
+    // 上游对齐的码表（旧代码是手写半截清单）。
     const aborted = abortController?.signal?.aborted === true;
-    const code = aborted ? 'aborted' : (err?.code ?? 'failed');
+    const { termination, error } = buildFailureEnvelope({ err, aborted });
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
       ok: false,
-      termination: { reason: aborted ? 'aborted' : 'failed' },
+      termination,
       usage: { input_tokens: 0, output_tokens: 0 },
       rounds: 0,
       final_text: '',
       title: '', // 失败路径不生成标题（portal 降级链兜住）
-      error: {
-        code,
-        message: String(err?.message ?? err),
-        retryable: err?.retryable === true || code === 'checkpoint_failed' || code === 'rate_limited',
-      },
+      error,
     });
   } finally {
     // issue #46：onRunComplete 仅完成 active notes；收尾错误只记日志，不覆盖 run 主错误。
