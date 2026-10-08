@@ -1589,7 +1589,7 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 ```json
 {
   "run_id": "9d3b2f1e-...",
-  "run_status": "queued",
+  "run_status": "running",
   "queue_status": "pending",
   "attempts": 1,
   "max_attempts": 3,
@@ -1607,7 +1607,7 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 |---|---|---|
 | `X-Claim-Token` 失配（run 已被 re-claim） | 拒绝，不产生任何状态变化 | —（`409 lease_lost`） |
 | `run_queue.status = 'cancelled'` 或 `runs.status = 'cancelling'`（用户已 stop） | queue → `cancelled`；runs → `finished`（`termination.reason='aborted'`） | `cancelled` |
-| `attempts < max_attempts` | queue → `pending`（清 `owner_container_id`/`lease_until`/`claimed_at`，**保留 `claim_token`** 供重复 release 幂等重放，fencing 由清空 lease_until 保证）；`runs.status` → `queued`（**U12 自有路径回退，不经 U2 转换表**——§9.6 U2 表的 `running→queued` 仍为非法，互不影响；同 run re-claim 后 `attempt > 1` 续跑，model.md §2.8 A1/runner-integration U12） | `requeued` |
+| `attempts < max_attempts` | `run_queue` → `pending`（清 `owner_container_id`/`lease_until`/`claimed_at`，**保留 `claim_token`** 供重复 release 幂等重放，fencing 由清空 lease_until 保证）；**`runs.status` 不变**（attempt 级失败不回跳，A5 定稿；崩溃现场为 `running` 则重排后仍为 `running`，不回写 `queued`）。§9.6 U2 转换表的 `running→queued` 维持**非法**，release 不再绕过它；重领靠 `tryClaim` 的 `runs.status IN ('queued','running')` + 租约过期/`pending`（与 run 状态无关于消息安全，消息安全靠「同事务写 transcript + 插 `run_queue`」）。同 run re-claim 后 `attempt > 1` 续跑（model.md §2.8 A1/A5） | `requeued` |
 | `attempts >= max_attempts` | queue → `done`；runs → `failed`（`max_attempts_exceeded`） | `failed_max_attempts` |
 
 **组合语义**：

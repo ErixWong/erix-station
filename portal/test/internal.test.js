@@ -423,23 +423,52 @@ test('postEvents：seq 单调、无空洞；重复 client_event_id 幂等命中�
   assert.deepEqual(seqs, [1, 2, 3, 4]);
 });
 
-test('releaseRun：attempts < max → requeue（attempts 不变）；re-claim 后 attempt 递增（方案 B）', async () => {
+test('releaseRun：attempts < max → requeue（runs.status 不回跳 A5/B、attempts 不变）；re-claim 后 attempt 递增', async () => {
   const { pool, userId, containerId, runId } = seedClaimable();
   const container = { id: containerId, user_id: userId };
   const user = { id: userId, login: 'alice' };
   const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
   assert.equal(ticket.run.attempt, 1);
+  // 真实崩溃现场：worker 先置 running（agentd 领到后 markRunning），再崩 → release。
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  assert.equal(pool.runs[0].status, 'running');
 
-  const rel = await releaseRun(pool, { container, user, runId, claimToken: ticket.claim_token, body: { reason: 'worker_crashed' } });
+  const rel = await releaseRun(pool, { container, user, runId, claimToken, body: { reason: 'worker_crashed' } });
   assert.equal(rel.outcome, 'requeued');
   assert.equal(rel.attempts, 1);
-  assert.equal(pool.queue[0].status, 'pending');
+  assert.equal(rel.queue_status, 'pending');
+  // A5/B：attempt 级失败不回写 runs.status、不回跳 → 仍为 running（响应反映真实状态）。
+  assert.equal(rel.run_status, 'running', 'requeue 不回跳：响应 run_status = 实际 runs.status（running）');
+  assert.equal(pool.runs[0].status, 'running', 'A5/B：requeue 后 runs.status 不回跳（保持 running）');
+  assert.equal(pool.queue[0].status, 'pending', 'run_queue → pending（可被重领）');
+  assert.equal(pool.queue[0].claim_token, claimToken, 'release 保留 claim_token（供幂等重放）');
 
   // re-claim 同一 run：attempts 递增到 2，resume=true
   const t2 = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
   assert.equal(t2.run.id, runId);
   assert.equal(t2.run.attempt, 2);
   assert.equal(t2.run.resume, true);
+});
+
+test('#204 B 安全性证据：崩溃后 runs.status=running + run_queue=pending 仍可被 tryClaim 重领（不漏消息）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+
+  // 模拟 worker 崩溃后 agentd 主动 release（requeue）：runs.status 保持 running（不回写），queue 回 pending。
+  await releaseRun(pool, { container, user, runId, claimToken, body: { reason: 'worker_crashed' } });
+  assert.equal(pool.runs[0].status, 'running');
+  assert.equal(pool.queue[0].status, 'pending');
+
+  // 关键：tryClaim 认领过滤为 `r.status IN ('queued','running')` → 停在 running 仍能领到（attempts < max）。
+  const ticket2 = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  assert.ok(ticket2, 'B 承重：runs.status=running + run_queue=pending 下 tryClaim 必须能重领，不漏消息');
+  assert.equal(ticket2.run.id, runId);
+  assert.equal(ticket2.run.attempt, 2);
 });
 
 test('putCheckpoint：revision CAS（前进 200 / 旧 revision 409 checkpoint_stale）', async () => {
@@ -759,6 +788,8 @@ test('F5：U12 release 同 claim_token 重放幂等（不 409）', async () => {
   const user = { id: userId, login: 'alice' };
   const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
   const claimToken = ticket.claim_token;
+  // 真实崩溃现场：先置 running（requeue 后不回跳，应仍为 running）。
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
 
   const r1 = await releaseRun(pool, { container, user, runId, claimToken, body: { reason: 'worker_crashed' } });
   assert.equal(r1.outcome, 'requeued');
@@ -766,7 +797,8 @@ test('F5：U12 release 同 claim_token 重放幂等（不 409）', async () => {
   // 同 claim_token 重放 → 幂等返回首次结果（不 409）。
   const r2 = await releaseRun(pool, { container, user, runId, claimToken, body: { reason: 'worker_crashed' } });
   assert.equal(r2.outcome, 'requeued');
-  assert.equal(r2.run_status, 'queued');
+  // A5/B：requeue 不回跳 runs.status，重放行重建时 run_status 取实际 runs.status（running）。
+  assert.equal(r2.run_status, 'running', '重放行 run_status = 实际 runs.status（不回跳）');
   assert.equal(r2.queue_status, 'pending');
 
   // token 不匹配 → 409 lease_lost。
