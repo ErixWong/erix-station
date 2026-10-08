@@ -49,7 +49,7 @@ function fixture(t) {
 
 function recordingPool(gitHostBaseUrls = []) {
   const calls = [];
-  return {
+  const pool = {
     calls,
     query: async (sql, params = []) => {
       calls.push({ sql, params });
@@ -58,7 +58,11 @@ function recordingPool(gitHostBaseUrls = []) {
       }
       return { rows: [] };
     },
+    async connect() {
+      return { query: (sql, params) => pool.query(sql, params), release() {} };
+    },
   };
+  return pool;
 }
 
 function assertNoTokenInDbCalls(pool, ...tokens) {
@@ -67,6 +71,42 @@ function assertNoTokenInDbCalls(pool, ...tokens) {
     for (const token of tokens) assert.ok(!serialized.includes(token), 'token must not be written to DB');
   }
 }
+
+/**
+ * issue #183：投放/删除 per-FDE PAT 的 fake pool——记录状态翻转与物化入队。
+ * `flip` 控制 UPDATE users 是否返回受影响行（模拟状态确实发生翻转）。
+ */
+function assignedAccountPool({ baseUrl = 'https://github.com', flip = true } = {}) {
+  const calls = [];
+  const pool = {
+    calls,
+    async query(sql, params = []) {
+      calls.push({ sql, params });
+      if (sql === 'SELECT base_url, provider FROM git_hosts') return { rows: [] };
+      return { rows: [] };
+    },
+    async connect() {
+      return {
+        async query(sql, params = []) {
+          calls.push({ sql, params });
+          if (sql.includes('SELECT u.id AS fde_id')) {
+            return { rows: [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url: baseUrl }] };
+          }
+          if (sql.includes('UPDATE users SET status')) {
+            return { rows: flip ? [{ id: params[0] }] : [] };
+          }
+          if (sql.includes('INSERT INTO materialize_revisions')) return { rows: [{ revision: 2 }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+  };
+  return pool;
+}
+
+const materializeOutboxInserts = (pool) => pool.calls.filter((call) => call.sql.includes('INSERT INTO materialize_outbox'));
+const materializeRevisionInserts = (pool) => pool.calls.filter((call) => call.sql.includes('INSERT INTO materialize_revisions'));
 
 test('write merges hosts, replaces only the target host, and installs 0640 FDE-owned file', async (t) => {
   const f = fixture(t);
@@ -268,6 +308,9 @@ test('setting or deleting the assigned per-FDE PAT updates remote login and awai
       }
       return { rows: [] };
     },
+    async connect() {
+      return { query: (sql, params) => pool.query(sql, params), release() {} };
+    },
   };
   const common = { pool, config: f.config, fdeName: 'alice', host: 'github.com' };
   await setGitCredential({ ...common, username: 'alice-gh', token: 'github-pat-secret' });
@@ -277,6 +320,36 @@ test('setting or deleting the assigned per-FDE PAT updates remote login and awai
   assert.equal(state.remoteLogin, null);
   assert.equal(state.userStatus, 'awaiting_credential');
   assertNoTokenInDbCalls(pool, 'github-pat-secret');
+});
+
+test('投放 per-FDE PAT 把 awaiting_credential→active 时同事务入队一次 materialize revision（issue #183）', async (t) => {
+  const f = fixture(t);
+  const pool = assignedAccountPool({ flip: true });
+  await setGitCredential({
+    pool, actorId: 'admin-id', config: f.config, fdeName: 'alice',
+    host: 'github.com', username: 'alice-gh', token: 'github-pat-secret',
+  });
+  const outbox = materializeOutboxInserts(pool);
+  assert.equal(outbox.length, 1, '凭据到达必须补一次物化');
+  assert.deepEqual(outbox[0].params, ['fde-1', 'upsert', 2, '{}']);
+  assert.equal(materializeRevisionInserts(pool).length, 1, 'revision head 必须前进');
+  const begin = pool.calls.findIndex((call) => call.sql === 'BEGIN');
+  const commit = pool.calls.findIndex((call) => call.sql === 'COMMIT');
+  const outboxIdx = pool.calls.findIndex((call) => call.sql.includes('INSERT INTO materialize_outbox'));
+  assert.ok(begin >= 0 && begin < outboxIdx && outboxIdx < commit, '入队必须与状态翻转在同一事务');
+  assertNoTokenInDbCalls(pool, 'github-pat-secret');
+});
+
+test('删除 per-FDE PAT（active→awaiting_credential）不触发物化（issue #183）', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.target, 'https://x-access-token:old-secret@github.com\n', { mode: 0o640 });
+  const pool = assignedAccountPool({ flip: true });
+  const result = await deleteGitCredential({
+    pool, actorId: 'admin-id', config: f.config, fdeName: 'alice', host: 'github.com',
+  });
+  assert.equal(result.deleted, true);
+  assert.equal(materializeOutboxInserts(pool).length, 0, '删除凭据不得入队物化');
+  assert.equal(materializeRevisionInserts(pool).length, 0);
 });
 
 test('invalid FDE names and symlinked user-space paths are rejected', async (t) => {

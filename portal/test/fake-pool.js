@@ -151,4 +151,10 @@ export class FakePool {
   }
 
   async end() {}
+
+  // issue #183：git-credential 的 updateAssignedAccount 现走事务（pool.connect）；
+  // fake pool 用同一 query 处理器充当事务 client（BEGIN/COMMIT 落入默认空行）。
+  async connect() {
+    return { query: (sql, params) => this.query(sql, params), release() {} };
+  }
 }
