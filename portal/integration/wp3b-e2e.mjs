@@ -576,11 +576,19 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     // 等 re-claim（attempts 至少 +1）+ 终态。语义口径（issue #180）：崩溃后 attempt 数是 2 还是 3
     // 取决于 ticket 是否孤儿化（竞态），故只断言「确实发生了 re-claim」= attempts >= 2，不写死。
     // （`>= 2` 已足以证明崩溃后确实发生了 re-claim：run 2 进入 running 时已验证 attempts === 1。）
+    // ⏱️ 超时给 300s（而非 120s）——issue #180 的孤儿化 claim 让真实恢复必然踩满 ~120s：
+    //   SIGKILL → 旧 agentd 的悬挂长轮询 claim 请求未被识别为断开 → portal 重排队瞬间该请求
+    //   立刻认领（attempt 2 白耗，响应写入死连接）→ 该租约只能 **90s 自然到期** 后才被新 agentd
+    //   真正认领（attempt 3）。叠加 ~30s 重排队检测 ≈ 从 kill 到真恢复约 **120s**，之后 run 还需
+    //   数秒跑完。真机实测：kill 04:25:56 → 新 agentd 04:25:59 → worker spawned run2 attempt:3
+    //   resume:true 04:27:59（正好 +120s）→ 04:28:00 events stored。原 120000 会踩在等待窗口
+    //   最后一刻（抖动即假红），故留 ~2.5x 余量。
+    // TODO(#180): 修复孤儿化 claim（portal 识别死连接并立即重发 ticket）后，把该值调回 120000。
     await waitFor(() => {
       const st = psql(`SELECT status FROM runs WHERE id='${run2}'`);
       const at = Number(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`));
       return (st === 'finished' || st === 'failed') && at >= 2 ? { st, at } : null;
-    }, { label: 'run 2 re-claimed attempts>=2 terminal', timeoutMs: 120000 });
+    }, { label: 'run 2 re-claimed attempts>=2 terminal', timeoutMs: 300000 });
 
     // 该 run 最终实际 attempts（恢复后真正执行的那次 = 最后一次 claim）→ 下方动态前缀 / resume 断言用。
     const rcAttempts = Number(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`));
