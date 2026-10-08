@@ -583,7 +583,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     //   数秒跑完。真机实测：kill 04:25:56 → 新 agentd 04:25:59 → worker spawned run2 attempt:3
     //   resume:true 04:27:59（正好 +120s）→ 04:28:00 events stored。原 120000 会踩在等待窗口
     //   最后一刻（抖动即假红），故留 ~2.5x 余量。
-    // TODO(#180): 修复孤儿化 claim（portal 识别死连接并立即重发 ticket）后，把该值调回 120000。
+    // TODO(#180): 已修复——portal 识别死连接（res 'close' + !writableEnded）后中断长轮询，并为写不出的
+    //   claim 调 releaseUndeliveredClaim 还回 attempt；孤儿认领不再发生。保留 300s 作为失败路径余量（不调回
+    //   120000：避免又踩边界抖动；该值只影响超时上限，不影响正常断言）。
     await waitFor(() => {
       const st = psql(`SELECT status FROM runs WHERE id='${run2}'`);
       const at = Number(psql(`SELECT attempts FROM run_queue WHERE run_id='${run2}'`));
