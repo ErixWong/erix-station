@@ -41,11 +41,14 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 | 命令 | 用途 |
 |---|---|
 | `node --check <file>` | 语法保底（零依赖 Node ESM） |
-| `npm test` | 单测（`node --test`） |
+| `npm test` | 单测（`node --test`，仓库根） |
+| `cd runner && node --test` | runner 侧单测（**口径**：`node --test runner/test/` 在本机 Node 22/24 都把目录当模块加载 → `Cannot find module .../runner/test`、rc=1，别怀疑自己的改动；可用形式另含 `node --test 'runner/test/*.test.js'`） |
 | `cd portal/frontend && npm run typecheck && npm test` | 前端 Vue SPA：vue-tsc 类型检查 + vitest 单测（devDependencies 需 `NODE_ENV=development npm install`，本机 NODE_ENV=production 会跳过） |
 | `docker compose -f deploy/docker-compose.yml up -d` | 本地起平台栈 |
 
 测试隔离约定：涉及用户配置/容器网络的测试必须注入路径参数，不碰真实环境。
+
+派工环境约定（2026-10-08 实证）：git worktree **不含未跟踪的 `node_modules`**，worker 进去后测试一律跑不起来；补装极便宜（`npm ci --prefer-offline` 热缓存 ~1.4s），所以派单红线应写「不改依赖版本、不提交 lockfile 变动」，而不是「禁止安装依赖」。
 
 ### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
 
