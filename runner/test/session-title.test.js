@@ -1,7 +1,7 @@
 // 单测：runner 侧会话标题生成（issue #88 修订——agent 侧生成、随 run_finished 上报、portal 落库）。
 // 覆盖：
 //   * 纯函数：sanitizeTitle（自 portal 同函数移植，各守一侧）、buildTitlePrompt（首条用户消息
-//     + finalText 各截 500 字符、≤30 字符约束）、resolveFirstUserContent（history 首条 user → task 回退）。
+//     + finalText 各截 500 字符、≤30 字符约束）、resolveFirstUserContent（P3 PR③ 后只取当前 task）。
 //   * generateSessionTitle（mock provider，零网络）：成功清洗落值、失败/超时/空/纯 reasoning → 空串，
 //     缺 provider → 空串；断言非流式参数（maxTokens 512 / temperature 0.2 / AbortSignal 注入）。
 // 隔离约定（docs/testing.md §2.1）：不碰真实网络 / LLM。
@@ -51,16 +51,16 @@ test('buildTitlePrompt：含首条用户消息 + finalText + 长度约束；fina
   assert.ok(!p3.includes('x'.repeat(501)), '首条用户消息截断在 500 字符');
 });
 
-test('resolveFirstUserContent：history 首条 user → task 回退 → null', () => {
+test('resolveFirstUserContent：P3 PR③ 后只取 task（历史下行已退役）；空白/缺失 → null', () => {
+  assert.equal(resolveFirstUserContent({ task: '当前任务' }), '当前任务');
+  // 旧形状入参（已退役的 history）不再参与推导：只能返回 task。
   assert.equal(
-    resolveFirstUserContent({ history: [{ role: 'assistant', content: 'a' }, { role: 'user', content: '第一条问题' }], task: '当前任务' }),
-    '第一条问题',
-    'history 里第一条 user 才是会话首条用户消息',
+    resolveFirstUserContent({ history: [{ role: 'user', content: '会话首条' }], task: '当前任务' }),
+    '当前任务',
+    'history 已不再是取数源',
   );
-  assert.equal(resolveFirstUserContent({ history: [], task: '当前任务' }), '当前任务', '无 history → 当前 task 即首条');
-  assert.equal(resolveFirstUserContent({ history: null, task: '当前任务' }), '当前任务');
-  assert.equal(resolveFirstUserContent({ history: [{ role: 'user', content: '   ' }], task: '当前任务' }), '当前任务', '空白消息跳过');
-  assert.equal(resolveFirstUserContent({ history: [], task: '' }), null);
+  assert.equal(resolveFirstUserContent({ task: '   ' }), null, '空白 task → null');
+  assert.equal(resolveFirstUserContent({ task: '' }), null);
   assert.equal(resolveFirstUserContent({}), null);
 });
 

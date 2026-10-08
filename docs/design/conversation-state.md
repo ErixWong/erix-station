@@ -79,7 +79,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **P0** | 本设计定稿；上游 issue（resume + new user turn）；#77 跟踪 | — | 本文档 |
 | **P1** | #64 R1：产物回收 + **终态清场语义修正**（真相层归档 TTL 替代物理删除，只清视图/临时物；`ERIX_RUN_DATA_TTL_HOURS` 语义扩展为归档而非删除） | — | 待派工 |
 | **P2** | #81 P2：store key 切 session 维度（**照抄 CLI 预写入+resume 模式，引擎零改动**）：portal 轮记录按 session 索引（表迁移）、worker 变树消费者、新消息预写入（dedupKey 幂等判据） | 无（CLI 已验证模式） | **已实施**（`feat-260924-06-session-transcript`：迁移 0006 + portal S1–S6 端点 + worker 三分支装配；部署顺序：portal 先上、FDE 镜像后上） |
-| **P3** | messages 表降级 UI 投影；#70 文本注入退役（仅保留 transcript 缺失兜底） | P2 稳定（已实施） | **契约已定稿（§6）**，按 PR①、②a、②b、③推进（读路径投影 → POST 事务落 transcript → 停双写/切终态与标题数据源 → 退役注入） |
+| **P3** | messages 表降级 UI 投影；#70 文本注入退役（**PR③ 定稿为整链删除，不留兜底**） | P2 稳定（已实施） | **契约已定稿（§6）**；PR①/②a/②b/③ 已完成（读路径投影 → POST 事务落 transcript → 停双写/切数据源 → 退役注入），仅剩 **②c 残留数据收敛** |
 
 ## 6. P3 实施契约（2026-10-08 定稿）
 
@@ -128,7 +128,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | **②b-B1 文本读取点改源（已完成，`feat-261008-12b-reread-source`）** | `messages.content` 的 **6 个读取点已改源（B1）**：全部改从 transcript 投影取文本（共享模块 `portal/src/session-text.js`，内部复用 `session-view.js` 的 `projectSessionMessages`/`recordForProjection` 口径，不另写一份投影）——① AI 改名上下文、② 自动标题降级链首条、③ 话题漂移最新一条、④ claim ticket 的 `task`（按 `<sessionId>:input:<messageId>` 单行精确命中，`attachments` 仍取 `messages`）、⑤ issue #69 历史上行（锚点集合/排除/预算截断不变，只有正文改源）、⑥ 终态幂等比较的 `stored.final_text`。**本单不停写内容**（行为保持型）：`messages.content` 照旧写入，仅当投影对该锚点无证据时才 legacy 回退该列（迁移 0015 之前的行；legacy-only，不用于新会话） | 根 `npm test`（0 失败，基线 679 项全绿 + 新增 16 项）、前端 `vue-tsc` + vitest（272 项）；每个读取点至少 1 个「正文来自 transcript」断言，② 另含「输入行取不到时的回退顺序」用例 |
 | **②b-B2 停写内容（已完成，`feat-261008-12d-stop-write`）** | **`messages` 降级为纯锚点行**：仅剩的两个 `messages.content` 写入点（POST 用户行 / 终态 assistant 行）改写空串——用户输入的文本真相已由契约① 的 `appendUserTurn` 落树，终态答复由引擎写 transcript。assistant 行的「有终态文本才建行」前置条件**不变**（它决定要不要产生一条锚点），只是不再携带正文；`content` 列仍是 `text NOT NULL`（**baseline `schema.sql` 冻结、不改 DDL**）。**legacy 兜底保留**（新行 content 为空串 → 投影恒有证据 → 不会触发；兜底只对迁移 0015 之前的老行有意义）。`POST .../messages` 的 202 响应体 `message.content` 改为**回显请求正文**（不再从 `messages` 读回），否则前端 `send()` 渲染的用户气泡会变空。前瞻约束：**`synthetic = true` 的宿主注入行（judge/wrapup）必须仍写正文**（它在 transcript 里没有对应轮次，读侧 `session-view.js` 的 `anchor.synthetic === true` 分支与 `session-text.js` 的 `CASE WHEN synthetic THEN content END` 取的就是锚点自身文本）；当前全库无此类写入点，已用构造用例钉住（`session-text.test.js` / `session-view.test.js`） | 根 `npm test`（0 失败，基线 695 项→698 项）、前端 `vue-tsc` + vitest（272 项）；两个写入点各有「落库 content = 空串」断言，读路径既有投影/DTO 用例全绿；真机 `wp3a`/`wp3b`/`wp5` 由主 agent 复验 |
 | **②c 残留数据收敛（待做）** | 把 0015 之前的残留行补齐到 transcript 证据，再收敛/退役 `session-text.js` 的 legacy 兜底分支（B2 只停写、**不删兜底**：删了老会话就地丢正文） | 根 `npm test`、前端两项、e2e |
-| **③退役文本注入** | `history` 仅保留「transcript 缺失」兜底（收窄到旧 ticket/异常路径） | 根 `npm test`、前端两项、`wp3b`/`wp5`/`wp6` e2e |
+| **③退役文本注入（已完成，`feat-261008-13-retire-history-injection`）** | **整链删除，不是收窄兜底**：claim ticket 的 `run.history` 字段、`tryClaim` 的历史查询与 `HISTORY_DEFAULTS`/`normalizeHistoryBudget`/`truncateHistory`、`session-text.js` 的 `fetchConversationTurns`（原第 ⑤ 个文本读取点）、`portal/src/config.js` 的 `historyMaxMessages`/`historyMaxBytes`（env `STATION_HISTORY_MAX_MESSAGES`/`STATION_HISTORY_MAX_BYTES` 一并下线，见 `docs/env.md`）、`RUN_START.history` 与 `history_count` 日志、`runner/lib/history.js`（`mapHistoryToInitialMessages`）全部退役。**定稿口径：会话上下文唯一来源 = transcript resume；空本子靠 ticket 的 `task`（引擎 round 0 种子）——引擎两个分支都永不传 `initialMessages`**（对齐上游 CLI `repl.js` 的 `...(resume ? {} : { initialUserMessage })`）。保留 `run.task`：空本子路径仍需要它，且它是 notes/标题的输入（`resolveFirstUserContent` 随之只取 `task`）。理由：写侧输入已在 POST 事务内由 `appendUserTurn` 落树（PR②a）、读侧正文真相 = transcript（PR②b），注入已成死重；且它正是 thinking 模型被上游拒的肇因（`reasoning_content must be passed back`，`deploy/migrations/0007` 头部实证） | 根 `npm test`（0 失败，691 项：690 通过 1 跳过；注入用例删除、新增 resume/空本子种子回归）、前端 `vue-tsc` + vitest（272 项）；`wp3b`/`wp5`/`wp6` e2e 与 FDE 镜像重建由主 agent 真机复验 |
 
 > **过渡兜底、回填决策与实测依据**：PR① 过渡兜底曾命中 30 次。真机全库检查发现 64 个会话中仅 2 个有 `:input:<messageId>` 行；抽查会话 `d86dda63-fc52-481c-9994-65ff29cb5eee` 的用户文本在整份 transcript 的 `record::text` 检索为 0 命中。原因是旧 POST 写路径只写 `messages`，未写 transcript。选择迁移 0015 回填而非删除旧会话，以保留历史数据并让旧会话继续渲染；回填只 INSERT、可幂等重放，随后删除投影兜底，缺证据内容留空。
 
@@ -139,7 +139,7 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 | `seq` / `attachments` / `run_id` / `synthetic` / `created_at` | **`messages` 独占的 UI 元数据**（引擎没有「消息行」概念：seq 由 `chat_sessions.last_seq` 分配、`run_id` 是本平台外键）——永远从这里取 |
 | `content` | **只有两类行有意义**：① `synthetic = true` 的宿主注入行（judge/wrapup，transcript 里无对应轮次，正文只能落在本列）；② **legacy 数据**（迁移 0015 / B2 之前入档、正文仍留在本列的老行，仅由 `session-text.js` 的 legacy 兜底读）。**B2 之后的新行恒为空串**（列是 `text NOT NULL`，故写 `''` 而非 NULL，不改 DDL） |
 
-两个写入点（`portal/src/sessions.js` 用户行、`portal/src/internal.js` 终态 assistant 行）均写 `''`；读侧（`session-view.js` 对话流 DTO + `session-text.js` 的 6 个文本读取点）一律从 transcript 官方投影取文。**读侧不得往 `content` 加新的兜底读**（除上表两类行）；新行的投影无证据时按契约④ 留空。
+两个写入点（`portal/src/sessions.js` 用户行、`portal/src/internal.js` 终态 assistant 行）均写 `''`；读侧（`session-view.js` 对话流 DTO + `session-text.js` 的 5 个文本读取点——原 6 个中的「claim 历史下行」已随 **PR③** 退役）一律从 transcript 官方投影取文。**读侧不得往 `content` 加新的兜底读**（除上表两类行）；新行的投影无证据时按契约④ 留空。
 
 ### 待决策（UI 轮号口径，遗留项）
 

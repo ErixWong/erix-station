@@ -8,9 +8,6 @@ import {
   isValidClientEventId,
   validateTransition,
   assembleTicket,
-  HISTORY_DEFAULTS,
-  normalizeHistoryBudget,
-  truncateHistory,
   validateEventPayload,
   authenticateContainer,
   claimRun,
@@ -125,136 +122,43 @@ test('assembleTicket：git identity 优先用户邮箱、缺失时回退，身�
   assert.equal(Object.hasOwn(noIdentity.run, 'git_identity'), false);
 });
 
-test('truncateHistory：先按条数截尾（保最新），再按 UTF-8 字节从头丢到符合（issue #69）', () => {
-  const msgs = (n) => Array.from({ length: n }, (_, i) => ({ role: 'user', content: `m${i + 1}` }));
-  // 条数截尾：保最新 3 条
-  assert.deepEqual(truncateHistory(msgs(5), { maxMessages: 3 }), [
-    { role: 'user', content: 'm3' },
-    { role: 'user', content: 'm4' },
-    { role: 'user', content: 'm5' },
-  ]);
-  // 字节截断：maxBytes 内保最新丢最旧（中文 3 字节/字）
-  const cn = [
-    { role: 'user', content: '一二三四五六七八九十' }, // 30B
-    { role: 'assistant', content: 'hello' },            // 5B
-    { role: 'user', content: 'ab' },                    // 2B
-  ];
-  assert.deepEqual(truncateHistory(cn, { maxBytes: 10 }), [
-    { role: 'assistant', content: 'hello' },
-    { role: 'user', content: 'ab' },
-  ]);
-  // 顺序：先条数后字节（条数截完再按字节丢）
-  assert.deepEqual(
-    truncateHistory(cn, { maxMessages: 2, maxBytes: 100 }),
-    [{ role: 'assistant', content: 'hello' }, { role: 'user', content: 'ab' }],
-  );
-  // 非法入参
-  assert.deepEqual(truncateHistory(null), []);
-  assert.deepEqual(truncateHistory('x'), []);
-  // 预算缺省用默认
-  assert.deepEqual(truncateHistory(msgs(25)).length, HISTORY_DEFAULTS.maxMessages);
-});
-
-test('normalizeHistoryBudget：非正整数/缺省回退默认（issue #69）', () => {
-  assert.deepEqual(normalizeHistoryBudget(), HISTORY_DEFAULTS);
-  assert.deepEqual(normalizeHistoryBudget({ maxMessages: 0, maxBytes: -1 }), HISTORY_DEFAULTS);
-  assert.deepEqual(normalizeHistoryBudget({ maxMessages: 'x', maxBytes: 1.5 }), HISTORY_DEFAULTS);
-  assert.deepEqual(normalizeHistoryBudget({ maxMessages: 5, maxBytes: 100 }), { maxMessages: 5, maxBytes: 100 });
-});
-
-test('assembleTicket：history 注入与缺省（issue #69）', () => {
-  const base = {
+test('P3 PR③：assembleTicket 不再携带 history（文本注入链路已退役），task/cwd/project 下行不变', () => {
+  const t = assembleTicket({
     queueId: 'q1', claimToken: 'ct1', leaseUntil: new Date('2026-09-12T00:01:30Z'),
-    run: { id: 'run1', session_id: 's1', model: 'm' }, project: { name: 'p', root_path: '~/p' },
+    run: { id: 'run1', session_id: 's1', model: 'm', cwd: '~/projects/proj1' },
+    project: { name: 'proj1', root_path: '~/projects/proj1' },
     message: { id: 'm1', content: 'hi', attachments: [] }, attempts: 1,
-  };
-  assert.deepEqual(assembleTicket(base).run.history, []);
-  const h = [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }];
-  assert.deepEqual(assembleTicket({ ...base, history: h }).run.history, h);
+  });
+  assert.equal(Object.hasOwn(t.run, 'history'), false, 'run.history 字段已删');
+  assert.equal(t.run.task, 'hi', 'task 保留：空本子（引擎 round 0 种子）与 notes/标题仍需要它');
+  assert.equal(t.run.cwd, '~/projects/proj1', 'P5：ticket 下行会话绑定 cwd（权威）');
+  assert.equal(t.run.project.name, 'proj1', 'project 快照兼容旧 agentd');
 });
 
-test('claimRun：history 下行——session 最近 user/assistant 升序、排除当前消息（issue #69）', async () => {
+test('P3 PR③：claimRun 不再取历史（ticket 无 history、无历史扫描、也不会因历史取数 warn）', async () => {
   const { pool, userId, containerId, runId, sessionId } = seedClaimable();
-  // 现场：m0(assistant, seq0) m1(user 'hello'=当前消息, seq1) m2(assistant, seq2)；m3 属别的 session 不混入
   pool.messages.push(
     { id: 'm0', run_id: 'run0', session_id: sessionId, role: 'assistant', content: 'prev answer', seq: 0, attachments: [] },
     { id: 'm2', run_id: runId, session_id: sessionId, role: 'assistant', content: 'last answer', seq: 2, attachments: [] },
-    { id: 'm3', run_id: 'runX', session_id: 'sX', role: 'assistant', content: 'other session', seq: 9, attachments: [] },
   );
-  const container = { id: containerId, user_id: userId };
-  const user = { id: userId, login: 'alice' };
-
-  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
-  assert.equal(ticket.run.cwd, '~/projects/proj1', 'P5：ticket 下行会话绑定 cwd（权威）');
-  assert.equal(ticket.run.project.name, 'proj1', 'project 快照兼容旧 agentd');
-  assert.deepEqual(ticket.run.history, [
-    { role: 'assistant', content: 'prev answer' },
-    { role: 'assistant', content: 'last answer' },
-  ]);
-});
-
-test('claimRun：history 预算注入——条数截断与字节截断（issue #69）', async () => {
-  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
-  // seq1 为当前消息（seed 自带）；seq2..6 五条 assistant 历史
-  for (let i = 2; i <= 6; i += 1) {
-    pool.messages.push({ id: `m${i}`, run_id: runId, session_id: sessionId, role: 'assistant', content: `ans${i}`, seq: i, attachments: [] });
-  }
-  const container = { id: containerId, user_id: userId };
-  const user = { id: userId, login: 'alice' };
-
-  // 条数：maxMessages=3 → 保最新 3 条（ans4/5/6），升序
-  const t1 = await claimRun(pool, { container, user, capacity: 1, holdMs: 10, historyBudget: { maxMessages: 3, maxBytes: 16384 } });
-  assert.deepEqual(t1.run.history, [
-    { role: 'assistant', content: 'ans4' },
-    { role: 'assistant', content: 'ans5' },
-    { role: 'assistant', content: 'ans6' },
-  ]);
-
-  // 重置现场再测字节：maxBytes=10 → 'ans4'(4B)+'ans5'(4B)+'ans6'(4B)=12B → 丢最旧 ans4，保 ans5/ans6
-  const { pool: pool2, userId: u2, containerId: c2 } = seedClaimable();
-  for (let i = 2; i <= 6; i += 1) {
-    pool2.messages.push({ id: `m${i}`, run_id: 'run1', session_id: 's1', role: 'assistant', content: `ans${i}`, seq: i, attachments: [] });
-  }
-  const t2 = await claimRun(pool2, { container: { id: c2, user_id: u2 }, user: { id: u2, login: 'alice' }, capacity: 1, holdMs: 10, historyBudget: { maxMessages: 20, maxBytes: 10 } });
-  assert.deepEqual(t2.run.history, [
-    { role: 'assistant', content: 'ans5' },
-    { role: 'assistant', content: 'ans6' },
-  ]);
-
-  // 非法注入值回退默认（20 条上限内全保留 5 条）
-  const { pool: pool3, userId: u3, containerId: c3 } = seedClaimable();
-  for (let i = 2; i <= 6; i += 1) {
-    pool3.messages.push({ id: `m${i}`, run_id: 'run1', session_id: 's1', role: 'assistant', content: `ans${i}`, seq: i, attachments: [] });
-  }
-  const t3 = await claimRun(pool3, { container: { id: c3, user_id: u3 }, user: { id: u3, login: 'alice' }, capacity: 1, holdMs: 10, historyBudget: { maxMessages: 0, maxBytes: -5 } });
-  assert.equal(t3.run.history.length, 5);
-  assert.equal(t3.run.history[0].content, 'ans2');
-});
-
-test('claimRun：history 查询抛错 → best-effort 回退空历史，claim 不阻断（issue #69 评审修正）', async () => {
-  const { pool, userId, containerId, sessionId } = seedClaimable();
-  pool.messages.push(
-    { id: 'm0', run_id: 'run0', session_id: sessionId, role: 'assistant', content: 'prev answer', seq: 0, attachments: [] },
-  );
-  // 注入：history 查询抛错（模拟 DB 抖动），其余查询正常——对齐 fake pool 风格，包一层委托。
-  const origQuery = pool.query.bind(pool);
+  const seen = [];
+  const orig = pool.query.bind(pool);
   pool.query = (sql, params) => {
-    if (sql.includes('FROM messages') && sql.includes('role IN')) {
-      return Promise.reject(new Error('history query db down'));
-    }
-    return origQuery(sql, params);
+    seen.push(sql);
+    return orig(sql, params);
   };
   const warns = [];
-  const log = { warn: (msg) => warns.push(msg) };
-
-  const ticket = await claimRun(pool, { container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10, log });
-  assert.ok(ticket); // claim 仍成功（UPDATE run_queue 已生效，ticket 照常发出）
+  const ticket = await claimRun(pool, {
+    container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' },
+    capacity: 1, holdMs: 10, log: { warn: (m) => warns.push(String(m)) },
+  });
+  assert.ok(ticket);
   assert.equal(ticket.run.id, 'run1');
-  assert.deepEqual(ticket.run.history, []); // 历史回退空数组
-  assert.equal(warns.length, 1); // warn 只记 err 摘要
-  assert.ok(warns[0].includes('history query failed'));
-  assert.ok(warns[0].includes('history query db down'));
-  assert.ok(!warns[0].includes('prev answer')); // 红线：history 内容不入日志
+  assert.equal(ticket.run.task, 'hello', '本轮 task 不受影响');
+  assert.equal(Object.hasOwn(ticket.run, 'history'), false);
+  assert.ok(!seen.some((sql) => sql.includes("role IN ('user', 'assistant')")),
+    '历史下行的锚点扫描 SQL 不再发出（会话上下文唯一来源 = transcript resume）');
+  assert.equal(warns.length, 0, '历史取数已从 claim 链路移除，不应再有相关 warn');
 });
 
 test('canonicalJson/canonicalHash：键序无关的稳定规范化', () => {
@@ -1012,43 +916,22 @@ test('P3 PR②b ④：投影读取抛错 → best-effort 回退锚点正文，cl
   assert.ok(warns.some((w) => w.includes('task transcript projection read failed')));
 });
 
-test('P3 PR②b ⑤：claim 历史下行正文取自 transcript（锚点集合/排除语义不变）', async () => {
+test('P3 PR②b ⑤ → PR③：多轮会话不再产生历史扫描（ticket 不带 history，正文读路径仍归 transcript）', async () => {
   const { pool, userId, containerId, runId, sessionId } = seedClaimable();
   pool.messages.push({ id: 'm2', run_id: 'run0', session_id: sessionId, role: 'assistant', content: '锚点旧答复', seq: 0, attachments: [] });
   pool.rounds.push(engineRow(sessionId, 'run0', 3, 'transcript 里的答复'));
+  const seen = [];
+  const orig = pool.query.bind(pool);
+  pool.query = (sql, params) => {
+    seen.push(sql);
+    return orig(sql, params);
+  };
   const ticket = await claimRun(pool, {
     container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10,
   });
-  assert.deepEqual(ticket.run.history, [{ role: 'assistant', content: 'transcript 里的答复' }]);
-});
-
-test('P3 PR②b ⑤：历史上行预算语义保持（条数/字节截断仍按投影后的正文计）', async () => {
-  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
-  for (let i = 2; i <= 6; i += 1) {
-    pool.messages.push({ id: `m${i}`, run_id: `runH${i}`, session_id: sessionId, role: 'assistant', content: `锚点${i}`, seq: i, attachments: [] });
-    pool.rounds.push(engineRow(sessionId, `runH${i}`, 10 + i, `ans${i}`));
-  }
-  const args = { container: { id: containerId, user_id: userId }, user: { id: userId, login: 'alice' }, capacity: 1, holdMs: 10 };
-  const t1 = await claimRun(pool, { ...args, historyBudget: { maxMessages: 3, maxBytes: 16384 } });
-  assert.deepEqual(t1.run.history, [
-    { role: 'assistant', content: 'ans4' },
-    { role: 'assistant', content: 'ans5' },
-    { role: 'assistant', content: 'ans6' },
-  ], '保最新 3 条、升序，且正文来自 transcript');
-
-  const second = seedClaimable();
-  for (let i = 2; i <= 6; i += 1) {
-    second.pool.messages.push({ id: `m${i}`, run_id: `runH${i}`, session_id: 's1', role: 'assistant', content: `锚点${i}`, seq: i, attachments: [] });
-    second.pool.rounds.push(engineRow('s1', `runH${i}`, 10 + i, `ans${i}`));
-  }
-  const t2 = await claimRun(second.pool, {
-    container: { id: second.containerId, user_id: second.userId }, user: { id: second.userId, login: 'alice' },
-    capacity: 1, holdMs: 10, historyBudget: { maxMessages: 20, maxBytes: 10 },
-  });
-  assert.deepEqual(t2.run.history, [
-    { role: 'assistant', content: 'ans5' },
-    { role: 'assistant', content: 'ans6' },
-  ], '字节预算按 transcript 正文计算（丢最旧）');
+  assert.equal(Object.hasOwn(ticket.run, 'history'), false);
+  assert.ok(!seen.some((sql) => sql.includes("role IN ('user', 'assistant')")), '历史锚点扫描 SQL 已移除');
+  assert.equal(ticket.run.task, 'hello', 'task 取数（④ 输入行 → legacy 回退）不受影响');
 });
 
 test('P3 PR②b ⑥：终态幂等比较的 stored.final_text 取自 transcript 投影（无证据才 legacy 回退）', async () => {
