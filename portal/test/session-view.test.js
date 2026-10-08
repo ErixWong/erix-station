@@ -1254,7 +1254,12 @@ test('#189 折叠轮正文走折叠摘要兜底时，DTO 带 folded（foldedRoun
     foldedRoundRange: { from: 1, to: 5 },
     navigationRecord: navigation,
     foldedPayloadMessages: 2,
-  }, 'text + 三元组逐字透传（上游原名、不改名、不重推导）');
+    round: 9, // #189 收尾：该折叠行自己的 round（上游 turn.round 原名透传）
+  }, 'text + 三元组 + round 逐字透传（上游原名、不改名、不重推导）');
+  // 「查看原文」端点的 :round 是折叠行自己的 round，不是被折叠的轮范围：两者必须不同（本单存在的理由）。
+  assert.equal(projection[0].folded.round, 9);
+  assert.notEqual(projection[0].folded.round, projection[0].folded.foldedRoundRange.to, 'round ≠ range.to');
+  assert.notEqual(projection[0].folded.round, projection[0].folded.foldedRoundRange.from, 'round ≠ range.from');
 });
 
 test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍带 folded（text + 三元组）；无折叠轮不带该键', () => {
@@ -1282,6 +1287,10 @@ test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍�
   const folded = projection[0].folded;
   assert.ok(folded, '只要有折叠轮就挂 folded（正文是该 run 自身助手正文时也必须出现）');
   assert.deepEqual(folded.foldedRoundRange, { from: 1, to: 3 }, '三元组原名透传');
+  // #189 收尾：行号 = 该折叠 transcript 行自己的 round（该行 row.round=4），不是被折叠范围 1–3 的任何一端。
+  assert.equal(folded.round, 4, 'round = 折叠行自己的 round（上游 turn.round）');
+  assert.notEqual(folded.round, folded.foldedRoundRange.to);
+  assert.notEqual(folded.round, folded.foldedRoundRange.from);
   assert.equal(typeof folded.text, 'string');
   assert.ok(folded.text !== '', 'text = 折叠 turn 的摘要原文（与 foldedTurnText 同源）');
   assert.notEqual(folded.text, projection[0].content, '标记里的原文不顶替正文');

@@ -110,13 +110,12 @@ function foldedTitle(folded: FoldedInfo): string {
   return t('stream.folded.bare');
 }
 
-// 「查看原文」端点按单轮取数：取折叠范围末端 to（缺则 from）；两者都缺时无轮号可查 → 隐藏按钮。
+// 「查看原文」端点 `GET /api/sessions/:id/folded/:round` 的 :round 是**折叠行自己的 round**
+//（transcript 行的 round，DTO 由 folded.round 逐字透传）。不能用 foldedRoundRange（那是
+// 「被折叠的轮范围」如 1–5，拿 range.to ?? from 去查会查错行、必然 404，#189 收尾根因）。
+// 无 round（整数以外）→ null → 隐藏按钮（保持现状）。
 function foldedQueryRound(folded: FoldedInfo): number | null {
-  const to = folded.foldedRoundRange?.to;
-  const from = folded.foldedRoundRange?.from;
-  if (typeof to === 'number') return to;
-  if (typeof from === 'number') return from;
-  return null;
+  return Number.isInteger(folded.round) ? (folded.round as number) : null;
 }
 
 function loadOriginal(en: FoldedEntry): void {

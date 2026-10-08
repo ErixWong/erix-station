@@ -245,6 +245,7 @@ function foldedEntry(over: { id?: string; sessionId?: string | null; folded?: Re
       text: '折叠摘要全文\n第二行',
       foldedRoundRange: { from: 2, to: 5 },
       foldedPayloadMessages: 9,
+      round: 8, // #189 收尾：折叠行自己的 round（故意≠ range.to=5，验证查的是行号不是范围末端）
       ...(over.folded ?? {}),
     },
   };
@@ -319,7 +320,8 @@ describe('issue #189：折叠横幅渲染', () => {
     await wrapper.get('.view-original').trigger('click');
     await flushPromises();
     const fetchUrl = String(vi.mocked(fetch).mock.calls.find(([u]) => String(u).includes('/folded/'))?.[0]);
-    expect(fetchUrl).toBe('/api/sessions/s1/folded/5'); // 取范围末端 to
+    // #189 收尾：:round = 折叠行自己的 round（folded.round=8），**不是**被折叠范围末端 foldedRoundRange.to=5
+    expect(fetchUrl).toBe('/api/sessions/s1/folded/8');
     const turns = wrapper.findAll('.folded-original-turn');
     expect(turns).toHaveLength(2);
     expect(turns[0].text()).toBe('原文甲');
@@ -341,11 +343,19 @@ describe('issue #189：折叠横幅渲染', () => {
     expect(wrapper.find('.folded-original-error').exists()).toBe(false);
   });
 
-  it('轮范围缺失 → 无从推导查询轮号 → 隐藏「查看原文」按钮', () => {
+  it('无 folded.round → 隐藏「查看原文」按钮（有 range 也不能拿 range.to/from 去查：那是被折叠范围，会 404）', () => {
     const store = useWorkbenchStore();
-    store.entries.push(foldedEntry({ id: 'm9', folded: { foldedRoundRange: undefined } }));
+    store.entries.push(foldedEntry({ id: 'm9', folded: { round: undefined } }));
     const w2 = mountPanel();
     expect(w2.find('.view-original').exists()).toBe(false);
+  });
+
+  it('非整数 round（字符串/小数）同样不渲染按钮（foldedQueryRound 只认整数）', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ id: 'ma', folded: { round: '8' } }));
+    store.entries.push(foldedEntry({ id: 'mb', folded: { round: 2.5 } }));
+    const w = mountPanel();
+    expect(w.findAll('.view-original')).toHaveLength(0);
   });
 
   it('原文加载失败（5xx）→ 红字 + 重试按钮，重试成功渲染 turns', async () => {
@@ -416,7 +426,7 @@ describe('issue #189（追加）：会话头部状态行「N 条消息 · 已压
     store.sessionId = 's1';
     store.renderedIds = new Set();
     store.addMessage({ id: 'm1', role: 'user', content: 'x' });
-    store.addMessage({ id: 'm2', role: 'assistant', content: 'y', folded: { text: 's', foldedPayloadMessages: 3, foldedRoundRange: { from: 1, to: 2 } } });
+    store.addMessage({ id: 'm2', role: 'assistant', content: 'y', folded: { text: 's', foldedPayloadMessages: 3, foldedRoundRange: { from: 1, to: 2 }, round: 3 } });
     setLocale('en');
     const wrapper = mountPanel();
     expect(wrapper.get('.session-stats').text()).toContain('2 messages');
