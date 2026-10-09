@@ -18,10 +18,10 @@
 //      `portal/test/termination-contract.test.js` 的「零 import」断言钉住。
 //
 // 真值来源（引擎 0.18.0，逐值定位）：
-//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:387`（runToolLoop 返回值 typedef）；
-//   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:761`，fail() 里
+//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:511`（runToolLoop 返回值 typedef）；
+//   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:973-977`，fail() 里
 //     「快照/markRunState 没落盘」时定值，并把 operation/phase/sideEffect 挂在 termination 上，
-//     `orchestrator.js:758-771` + `src/loop/termination.js:40-49` annotateTermination）；
+//     `orchestrator.js:973-990` + `src/loop/termination.js:74-91` annotateTermination）；
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
