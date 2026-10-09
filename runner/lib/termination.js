@@ -1,6 +1,6 @@
 // issue #212：run 失败/中止终态信封构造（worker catch 专用；纯函数，可单测 runner/test/termination.test.js）。
 //
-// 背景：erix-agent 0.17.0 的失败/中止走 `fail()` **抛异常**，并把完整 termination 挂在上抛的错误上
+// 背景：erix-agent 0.18.0 的失败/中止走 `fail()` **抛异常**，并把完整 termination 挂在上抛的错误上
 //   （`erix-agent/src/loop/orchestrator.js:734-773` 定 reason + 挂落盘细节，
 //     `erix-agent/src/loop/termination.js:40-49` `annotateTermination` 把对象塞进 `error.termination`）。
 //   于是：
