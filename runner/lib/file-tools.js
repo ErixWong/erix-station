@@ -1,25 +1,17 @@
-// station 自带 file 工具 + jail 路径边界（erix-agent 0.6.0 起库不再提供沙箱，ADR-009：
-// 「库不提供沙箱，牢笼由宿主提供」——不变式 1「容器是信任边界」的落地）。
-// 本文件移植自 erix-agent 0.3.5 的 src/tools/jail.js + src/tools/file-tools.js（上游 #101 删除），
-// 工具 schema/executor 结构与旧 createFileTools 返回的 {executors, schemas} 完全对齐。
-// 语义不变式：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内可写；越界路径抛 JailError。
+// station 文件工具层 = jail 路径边界 + 上游文件工具的薄装配。
 //
-// ⚠ issue #228 现状说明：本文件下方 `createFileTools` 那份 0.3.5 fork executor（readFile/rg/tree/
-// writeFile）正在被上游 erix-agent 0.18.0 的 `createFileTools` 取代（见文末 `createStationFileTools`
-// 薄装配）。jail 与 JailError 不是 fork 的一部分（它们是宿主边界，ADR-009 下合法），逐字保留。
+// jail（本文件前半）：erix-agent 0.6.0 起库不再提供沙箱（ADR-009：「库不提供沙箱，牢笼由宿主
+// 提供」——不变式 1「容器是信任边界」的落地）；移植自 erix-agent 0.3.5 的 src/tools/jail.js（上游
+// #101 删除），**行为与导出逐字保留**：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内
+// 可写；越界/遮蔽/非可写路径抛 JailError。
+//
+// 文件工具（本文件后半，issue #228）：曾经的 0.3.5 fork executor（readFile/rg/tree/writeFile）已于
+// issue #228 退役，改为装配上游 erix-agent 0.18.0 的 `createFileTools`（`createStationFileTools`）。
+// jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 AGENTS.md §8.9 与 docs/design/runner-integration.md。
 import fs from 'node:fs';
 import path from 'node:path';
 import { createFileTools as createUpstreamFileTools } from 'erix-agent/tools';
-import { throwIfAborted, yieldToEventLoop } from './abort.js';
-
-const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_TREE_ENTRIES = 500;
-// issue #211：rg / tree 是纯同步遍历——同步跑起来时 event loop 转不动，agentd 下行的
-// MSG.ABORT 处理器根本执行不了，光检查 signal.aborted 是「永远为 false」的空检查。
-// 所以每 N 次目录/文件操作让出一次事件循环（setImmediate）+ 查一次中止，把「不可中断的
-// 整趟遍历」切成「最多 N 个条目不可中断」的有限块（单文件读本身仍不可抢，上限 1MiB）。
-// 32 = 取响应性与开销的折中；无 signal 时完全不插入让出，非中止路径行为与开销零变化。
-const ABORT_CHECKPOINT_EVERY = 32;
+import { throwIfAborted } from './abort.js';
 
 function isWithin(root, target) {
   const relative = path.relative(root, target);
@@ -97,259 +89,6 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
   return { root: rootPath, resolve, resolveForWrite, assertReadable };
 }
 
-function normalizeNonNegativeInteger(value, fallback) {
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(0, Math.floor(value));
-}
-
-function splitLines(text) {
-  if (text === '') return [];
-  const lines = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  return lines;
-}
-
-function isMasked(error) {
-  return error?.code === 'path_masked';
-}
-
-function readablePath(jail, value) {
-  try {
-    jail.assertReadable(value);
-  } catch (error) {
-    if (isMasked(error)) return null;
-    throw error;
-  }
-  return jail.resolve(value);
-}
-
-function normalizeSchema(schema) {
-  const result = { ...schema };
-  if (result.inputSchema === undefined && result.input_schema !== undefined) {
-    result.inputSchema = result.input_schema;
-    delete result.input_schema;
-  }
-  return result;
-}
-
-const schemas = [
-  {
-    name: 'readFile',
-    description: 'Read a text file by line range.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        offset: { type: 'integer' },
-        limit: { type: 'integer' },
-      },
-      required: ['path'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'rg',
-    description: 'Recursively search text files with a regular expression.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string' },
-        path: { type: 'string' },
-        maxResults: { type: 'integer' },
-      },
-      required: ['pattern'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'tree',
-    description: 'List a directory tree.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        depth: { type: 'integer' },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'writeFile',
-    description: 'Write UTF-8 text inside a writable jail subtree.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        content: { type: 'string' },
-      },
-      required: ['path', 'content'],
-      additionalProperties: false,
-    },
-  },
-].map(normalizeSchema);
-
-/**
- * 创建受 jail 约束的文件系统工具（0.3.5 createFileTools 同名同语义移植）。
- * @param {{resolve:Function, resolveForWrite:Function, assertReadable:Function}} jail
- * @returns {{schemas:object[], executors:Record<string, Function>}}
- */
-export function createFileTools(jail) {
-  // issue #211：四个 executor 都接第二参 context（引擎经 registry.js:143 executor(input, context)
-  // 原样下传，run 的 abort signal 由 worker.js executeTool 包装注入 context.signal）。
-  // 语义分级（代价已写进 issue 报告）：
-  //   - rg / tree：可真中断——遍历内每 ABORT_CHECKPOINT_EVERY 次操作让出 + 检查，抛 AbortError。
-  //   - readFile / writeFile：单次同步 syscall，syscall 本身不可抢，只能在入口检查（已中止则
-  //     不开工）；在途那次读/写跑完才可能观察到中止（单文件 ≤ MAX_FILE_BYTES，毫秒量级）。
-  // 不传 context / 未中止时，四个工具行为与修前逐字一致。
-  async function readFile({ path: filePath, offset = 0, limit = 200 }, context = {}) {
-    throwIfAborted(context?.signal);
-    jail.assertReadable(filePath);
-    const resolvedPath = jail.resolve(filePath);
-    const text = fs.readFileSync(resolvedPath, 'utf8');
-    const lines = splitLines(text);
-    const start = normalizeNonNegativeInteger(offset, 0);
-    const count = normalizeNonNegativeInteger(limit, 200);
-    const selected = lines
-      .slice(start, start + count)
-      .map((line, index) => `${start + index + 1}: ${line}`);
-
-    if (start + count < lines.length) {
-      selected.push(`[共 ${lines.length} 行，offset=${start + count} 继续]`);
-    }
-    return selected.join('\n');
-  }
-
-  async function rg({ pattern, path: searchPath = '.', maxResults = 50 }, context = {}) {
-    const signal = context?.signal;
-    throwIfAborted(signal);
-    // 无 signal = 不插让出点（保持旧同步行为与吞吐）。
-    const interruptible = signal != null;
-    let checkpointOps = 0;
-    const checkpoint = async () => {
-      if (!interruptible) return;
-      checkpointOps += 1;
-      if (checkpointOps % ABORT_CHECKPOINT_EVERY !== 0) return;
-      await yieldToEventLoop();
-      throwIfAborted(signal);
-    };
-    const expression = new RegExp(String(pattern));
-    const resultLimit = normalizeNonNegativeInteger(maxResults, 50);
-    const resolvedSearchPath = readablePath(jail, searchPath);
-    if (resolvedSearchPath === null) return '';
-    const displayBase = jail.resolve('.');
-    const results = [];
-    const visitedDirectories = new Set();
-
-    const displayName = (filePath) => {
-      const relative = path.relative(displayBase, filePath);
-      return (relative || path.basename(filePath)).split(path.sep).join('/');
-    };
-
-    const searchFile = (filePath, stat) => {
-      if (results.length >= resultLimit || stat.size > MAX_FILE_BYTES) return;
-      const bytes = fs.readFileSync(filePath);
-      if (bytes.includes(0)) return;
-      const lines = splitLines(bytes.toString('utf8'));
-      for (let index = 0; index < lines.length; index += 1) {
-        if (!expression.test(lines[index])) continue;
-        results.push(`${displayName(filePath)}:${index + 1}:${lines[index]}`);
-        if (results.length >= resultLimit) return;
-      }
-    };
-
-    const visit = async (lexicalPath) => {
-      if (results.length >= resultLimit) return;
-      await checkpoint();
-      const currentPath = readablePath(jail, lexicalPath);
-      if (currentPath === null) return;
-      const stat = fs.statSync(currentPath);
-      if (stat.isFile()) {
-        searchFile(currentPath, stat);
-        return;
-      }
-      if (!stat.isDirectory() || visitedDirectories.has(currentPath)) return;
-      visitedDirectories.add(currentPath);
-
-      const entries = fs.readdirSync(currentPath, { withFileTypes: true })
-        .sort((left, right) => left.name.localeCompare(right.name));
-      for (const entry of entries) {
-        if (results.length >= resultLimit) return;
-        await visit(path.join(currentPath, entry.name));
-      }
-    };
-
-    await visit(resolvedSearchPath);
-    return results.join('\n');
-  }
-
-  async function tree({ path: treePath = '.', depth = 3 }, context = {}) {
-    const signal = context?.signal;
-    throwIfAborted(signal);
-    const interruptible = signal != null;
-    let checkpointOps = 0;
-    const checkpoint = async () => {
-      if (!interruptible) return;
-      checkpointOps += 1;
-      if (checkpointOps % ABORT_CHECKPOINT_EVERY !== 0) return;
-      await yieldToEventLoop();
-      throwIfAborted(signal);
-    };
-    const resolvedTreePath = readablePath(jail, treePath);
-    if (resolvedTreePath === null) return '';
-    const maxDepth = normalizeNonNegativeInteger(depth, 3);
-    const rootStat = fs.statSync(resolvedTreePath);
-    // 根标签固定 './'：''/'./' 此前会显示 worktree 的 basename，被模型误读为同名子目录 → ENOENT 循环（issue #64 排查发现）
-    const rootLabel = resolvedTreePath === jail.root ? './' : path.basename(resolvedTreePath);
-    const lines = [rootStat.isDirectory() && !rootLabel.endsWith('/') ? rootLabel + '/' : rootLabel];
-    const visitedDirectories = new Set();
-    let entries = 1;
-
-    const visit = async (currentPath, currentDepth) => {
-      if (entries >= MAX_TREE_ENTRIES || currentDepth >= maxDepth) return;
-      await checkpoint();
-      if (!fs.statSync(currentPath).isDirectory()) return;
-      if (visitedDirectories.has(currentPath)) return;
-      visitedDirectories.add(currentPath);
-
-      const children = fs.readdirSync(currentPath, { withFileTypes: true })
-        .sort((left, right) => left.name.localeCompare(right.name));
-      for (const child of children) {
-        if (entries >= MAX_TREE_ENTRIES) return;
-        await checkpoint(); // 宽目录（单目录上千条目）也要能中断：checkpoint 落在条目循环里，不只落在目录递归上
-        const childPath = path.join(currentPath, child.name);
-        const readable = readablePath(jail, childPath);
-        if (readable === null) continue;
-        const childStat = fs.statSync(readable);
-        lines.push(`${'  '.repeat(currentDepth + 1)}${child.name}${childStat.isDirectory() ? '/' : ''}`);
-        entries += 1;
-        if (childStat.isDirectory()) await visit(readable, currentDepth + 1);
-      }
-    };
-
-    if (rootStat.isDirectory()) {
-      await visit(resolvedTreePath, 0);
-    }
-    return lines.join('\n');
-  }
-
-  async function writeFile({ path: filePath, content }, context = {}) {
-    throwIfAborted(context?.signal);
-    if (typeof content !== 'string') {
-      throw new TypeError('writeFile content must be a string');
-    }
-    const target = jail.resolveForWrite(filePath);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    const finalTarget = jail.resolveForWrite(filePath);
-    fs.writeFileSync(finalTarget, content, 'utf8');
-    return Buffer.byteLength(content, 'utf8');
-  }
-
-  return {
-    schemas: schemas.map((schema) => structuredClone(schema)),
-    executors: { readFile, rg, tree, writeFile },
-  };
-}
-
 // ---------------------------------------------------------------------------
 // issue #228：上游 erix-agent 文件工具的薄装配（station 侧唯一的文件工具实现方向）
 //
@@ -366,6 +105,12 @@ export function createFileTools(jail) {
 //      逐字对齐：只挡读，不挡写。
 //   3. **工具面白名单**：station 只暴露 5 个（readFile/searchText/tree/edit/writeFile），不吃上游
 //      两个弃用别名 rg/grep（§3.1）；白名单只列名字，工具清单本身仍取自上游 definitions，不复制。
+//
+// 语义与原 fork 的两处刻意偏离（交付报告的「语义变更清单」同步登记）：
+//   * 越界/非可写/遮蔽路径不再抛 JailError，而是上游统一的「错误：…被宿主边界拒绝：…」文本结果
+//     （jail 仍在内部抛，只是被谓词转成布尔；引擎把文本结果喂回模型，比抛异常更可恢复）；
+//   * 遍历内的中止从「每 32 项让出 + 查中止」换成上游同口径 checkpoint（erix-agent 源码里
+//     ABORT_CHECKPOINT_EVERY = 32），`lib/abort.js` 继续给自己与 shell 工具用。
 // ---------------------------------------------------------------------------
 
 /** station 注册面暴露的文件工具名（工单 D3 §3.1：不含弃用别名 rg / grep）。 */

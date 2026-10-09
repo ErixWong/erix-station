@@ -18,6 +18,15 @@ import { abortError, onAbort, throwIfAborted, yieldToEventLoop } from '../lib/ab
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
 
+/** 读上游 erix-agent 的文件工具源码（issue #228 后，遍历内真中断的实现住在上游）。
+ * erix-agent 的 exports 只暴露 . / ./tools / ./contract-tests，不能 require.resolve 子路径文件，
+ * 所以走「解析包根 + 拼路径」（与下方「上游契约仍在传 signal」那条用例同技法）。 */
+function readUpstreamFileToolsSource() {
+  const require = createRequire(import.meta.url);
+  const pkgRoot = path.dirname(path.dirname(require.resolve('erix-agent')));
+  return fs.readFileSync(path.join(pkgRoot, 'src', 'tools', 'file-tools.js'), 'utf8');
+}
+
 /** 抠出 `const executeTool = async (options) => {` 到配对 `};` 的函数体（源码级断言用）。 */
 function extractExecuteToolWrapper(src) {
   const start = src.indexOf('const executeTool = async (options) =>');
@@ -49,7 +58,7 @@ test('issue #211：worker.js executeTool 包装把 signal 转交 registry（自�
   assert.match(body, /\.\.\.options\.context/, 'context 仍须整体转交（engine 注入的 round/上下文）');
 });
 
-test('issue #211：shell/file 工具执行器都从 context 取 signal（链路下游两段都在）', () => {
+test('issue #211：shell/file 工具执行器都从 context 取 signal（链路下游两段都在）', (t) => {
   const shellSrc = read('lib/shell-tools.js');
   assert.match(shellSrc, /async function shell\([\s\S]{0,200}?context\s*=\s*\{\}\)/,
     'shell 执行器必须接第二参 context');
@@ -64,16 +73,31 @@ test('issue #211：shell/file 工具执行器都从 context 取 signal（链路�
     '收尾必须摘 abort 监听（防在长寿命 run signal 上堆监听器）');
 
   const fileSrc = read('lib/file-tools.js');
-  for (const name of ['readFile', 'writeFile', 'rg', 'tree']) {
-    assert.match(fileSrc, new RegExp(`async function ${name}\\([\\s\\S]{0,160}?context\\s*=\\s*\\{\\}\\)`),
-      `file 工具 ${name} 必须接第二参 context`);
-  }
-  assert.match(fileSrc, /throwIfAborted\(context\?\.signal\)/,
-    'readFile/writeFile 至少要在入口检查中止（不阻塞中止）');
+  // issue #228：fork 的四个 executor 已退役，file 工具的真中断实现搬到上游，所以本文件的
+  // 「下游」分成三段钉：装配层入口查中止 + context/signal 真的下给上游 + 上游自己仍在遍历内检查。
+  assert.match(fileSrc, /import \{ createFileTools as createUpstreamFileTools \} from 'erix-agent\/tools'/,
+    'file 工具必须装配上游 erix-agent/tools 的 createFileTools（不得退回本地 fork）');
   assert.match(fileSrc, /throwIfAborted\(signal\)/,
-    'rg/tree 遍历内必须检查中止（真中断）');
-  assert.match(fileSrc, /yieldToEventLoop\(\)/,
-    'rg/tree 必须周期性让出事件循环——否则同步遍历跑着时 MSG.ABORT 处理器执行不了，signal 永远不会翻');
+    '装配层必须在入口检查中止（上游 readFile/writeFile/edit 不接 context，这一枪只能宿主补）');
+  assert.match(fileSrc, /isStructuredCall\(firstArg\)[\s\S]{0,120}firstArg\.signal[\s\S]{0,80}firstArg\.context\?\.signal/,
+    '结构化调用形态的 signal（引擎放在顶层）也必须被装配层读到');
+  assert.match(fileSrc, /upstream\.executeTool\(firstArg\)/,
+    '结构化调用形态必须整体下给上游（否则上游 checkpoint 拿不到 signal，遍历不能真中断）');
+  assert.match(fileSrc, /upstream\.executeTool\(firstArg, input, context\)/,
+    '位置形态必须把 context 原样下给上游（中止与引擎上下文都搭在里面）');
+
+  // 上游侧：每 32 项让出 + 查中止的实现必须还在（上游把它删了 = station 的「停止」变慢，立刻知道）
+  let upstreamFile = null;
+  try {
+    upstreamFile = readUpstreamFileToolsSource();
+  } catch {
+    t.skip('erix-agent 未安装（runner 单测进程解析不到包根），跳过上游遍历检查点钉');
+    return;
+  }
+  assert.match(upstreamFile, /const ABORT_CHECKPOINT_EVERY = 32/,
+    '上游遍历检查点间隔变了：需复核「同步遍历期间能收到 MSG.ABORT」这条保证是否仍在（issue #211 / #228）');
+  assert.match(upstreamFile, /await new Promise\(\(resolve\) => setImmediate\(resolve\)\);\s*\n\s*throwIfAborted\(signal\)/,
+    '上游遍历必须先让出事件循环再查中止（不让出的 abort 是永远为 false 的空检查，issue #211）');
 });
 
 test('issue #211：上游 erix-agent 契约仍在 executeTool 上传 signal（引擎侧变了要立刻知道）', (t) => {
