@@ -147,7 +147,7 @@ async function createProject() {
   S.port = body.ports[0].port;
   S.hostname = body.ports[0].hostname;
   assert.equal(body.ports[0].state, 'allocated');
-  assert.match(S.hostname, /^alice-p-proj1-\d{4}\./);
+  assert.match(S.hostname, /^alice-p-proj1-\d{4}\.fde\./);
   assert.ok(S.hostname.endsWith(`.${BASE_DOMAIN}`), `hostname uses BASE_DOMAIN=${BASE_DOMAIN}: ${S.hostname}`);
 }
 
