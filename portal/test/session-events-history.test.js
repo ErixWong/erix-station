@@ -208,6 +208,29 @@ test('参数校验：limit/before 非正整数 → 400 validation_failed；超�
   }
 });
 
+// erix-agent #182（0.18.0）：新增诊断事件 `model_metadata_missing` 已在历史回放白名单里
+// （SSE 实时能看到、刷新后也必须在），且它不会把运行态语义事件带进回放。
+test('白名单含 model_metadata_missing（erix-agent 0.18.0 #182）：历史回放不丢该诊断事件', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed(ev(1, 'model_metadata_missing', { model: 'gpt-x', reason: 'no_static_metadata' }));
+    s.pool.seed(ev(2, 'run_end', { run_id: 'r1', termination: { reason: 'end_turn' } })); // 仍白名单外
+    s.pool.seed(ev(3, 'model_metadata_missing', { model: 'gpt-y' }));
+
+    const body = await (await fetch(`${s.base}/api/sessions/${SESSION_ID}/events/history`, {
+      headers: { Cookie: s.cookieHeader },
+    })).json();
+    assert.deepEqual(
+      body.events.map((e) => [e.seq, e.type, e.payload]),
+      [[1, 'model_metadata_missing', { model: 'gpt-x', reason: 'no_static_metadata' }],
+       [3, 'model_metadata_missing', { model: 'gpt-y' }]],
+      '诊断事件可回放，payload 原样下发；run_end 仍不下发',
+    );
+  } finally {
+    await s.close();
+  }
+});
+
 test('payload 大小防护：字符串叶值截 2000 字符 + 标记（JSON 形状保持合法）', async () => {
   const s = await startServer();
   try {

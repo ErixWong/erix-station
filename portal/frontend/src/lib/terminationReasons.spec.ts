@@ -33,7 +33,7 @@ describe('termination reason 单一常量（issue #212）', () => {
       'failed',
       'persistence_failed',
     ]);
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.17.0');
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.18.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 

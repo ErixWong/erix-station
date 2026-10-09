@@ -1,6 +1,6 @@
 // issue #212 防漂移测试：termination reason / 可重试码的**单一常量 ↔ 文档枚举表**逐项一致。
 //
-// 背景：erix-agent 0.17.0 的失败/中止走 fail() 抛异常，上抛错误挂着完整 termination
+// 背景：erix-agent 0.18.0 的失败/中止走 fail() 抛异常，上抛错误挂着完整 termination
 // （reason 可能是 persistence_failed，并带 operation/phase/sideEffect）。station 曾把它拍平成
 // failed，且文档/前端的 reason 集合漏值。本文件钉住四件事：
 //   ① 代码单一常量（portal/frontend/src/lib/terminationReasons.ts）自洽且可被 node 直读；
