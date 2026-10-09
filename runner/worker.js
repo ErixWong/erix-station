@@ -26,7 +26,7 @@ import { createToolRegistry } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
 import { parseMaxRounds } from './lib/config.js';
 import { resolveRunModel } from './lib/llm-models.js';
-import { createFileTools, createJail } from './lib/file-tools.js';
+import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
@@ -232,13 +232,14 @@ async function startRun(msg) {
     model: modelName,
   });
 
-  // 3) tools（§6.3-3：jail + 自带 file 工具（0.6.0 起库不提供，牢笼由本项目提供，不变式 1）
+  // 3) tools（§6.3-3：jail + 文件工具（issue #228 起 = 上游 erix-agent createFileTools 的薄装配，
+  //    边界谓词与 jail **相与**；0.6.0 起库不提供沙箱，牢笼仍由本项目提供，不变式 1）
   //    + note 工作流工具（0.8.0 recall 退役，档案取回归 note_list→note_read；issue #46 起走
   //    0.10.0 装配工厂，notesDir 为 agentd 下行的 run 数据目录，logical-run 作用域跨 attempt 保留）；
   //    approvals 钩子 P2 留空）。
   ensureGitRepo(cwd);
   const jail = createJail({ root: cwd, writable: [cwd] });
-  const fileTools = createFileTools(jail);
+  const fileTools = createStationFileTools({ jail, cwd });
   // issue #46（选项 A，logical-run 作用域）：notesDir 由 agentd 下行（run 数据目录
   // <home>/runs/<runId>/notes，跨 attempt 保留，与 run 工作区生命周期解耦——resume 不再丢 notes）。
   // 旧 agentd 无 notes_dir 字段 → 回退 cwd 内 .notes（旧语义，resume 仍会丢，warn 明示）。
@@ -261,8 +262,9 @@ async function startRun(msg) {
     });
   }
   // issue #72：shell 工具（进程内命令执行，v1 自动执行 + tool 事件审计）——与 file 工具
-  // 同为纯 {executors, schemas} 形态，并入 registry 最简；note_* 例外走工厂结构化 executeTool
-  // （工厂内部强制宿主作用域），保持独立分支不动。
+  // 同为纯 {executors, schemas} 形态（issue #228：file 侧的 executors 是 name→fn 对象，上游
+  // 原生那个 executors 是**函数**、铺进对象会铺出空集），并入 registry 最简；note_* 例外走工厂
+  // 结构化 executeTool（工厂内部强制宿主作用域），保持独立分支不动。
   const shellTools = createShellTools({ worktreeRoot: cwd });
   const registry = createToolRegistry({
     executors: { ...fileTools.executors, ...shellTools.executors },

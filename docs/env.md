@@ -374,6 +374,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `ERIX_SHELL_TIMEOUT_MS` | agent shell 工具默认超时（可被单次调用的 timeout_ms 参数覆盖） | `60000` |
 | `ERIX_SHELL_MAX_TIMEOUT_MS` | agent shell 工具超时上限（单次调用超上限按上限钳制）；DEFAULT 自动钳 ≤ 此值 | `600000` |
 | `ERIX_SHELL_OUTPUT_MAX_BYTES` | agent shell 工具输出截断上限（字节，影响模型可见输出量） | `32768` |
+| `ERIX_FILE_READ_MAX_BYTES` | agent `readFile` 单次返回的字节上限（上游 erix-agent 0.18.0 有界读，钳 1024–4194304；issue #228 迁上游后取代旧 fork 的无上限 `readFileSync`）。**本站不注入**（工单 D3 §3.2）：跟随上游默认值，改值只需在容器 env 里加该变量（下发光纤同 `ERIX_MAX_ROUNDS`），无需重建镜像 | `262144`（256KB，上游默认） |
 
 ### 10.3 补登：portal 侧环境变量（会话自动标题，issue #88，2026-09-25 登记；同日修订为 agent 侧生成）
 
