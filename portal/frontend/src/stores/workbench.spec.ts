@@ -11,12 +11,23 @@ class FakeEventSource {
   static instances: FakeEventSource[] = [];
   url: string;
   closed = false;
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  listeners = new Map<string, ((e: MessageEvent) => void)[]>();
   constructor(url: string) {
     this.url = url;
     FakeEventSource.instances.push(this);
   }
-  addEventListener() {}
+  addEventListener(type: string, fn: (e: MessageEvent) => void) {
+    const callbacks = this.listeners.get(type) ?? [];
+    callbacks.push(fn);
+    this.listeners.set(type, callbacks);
+  }
   close() { this.closed = true; }
+  emit(type: string, data: unknown) {
+    const event = { data: JSON.stringify(data) } as MessageEvent;
+    for (const fn of this.listeners.get(type) ?? []) fn(event);
+  }
 }
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -431,6 +442,85 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(store.sessionId).toBe('s1');
     expect(store.entries.map((e) => e.kind)).toEqual(['msg']); // 仅消息，无 syserr
     expect(store.entries.some((e) => e.kind === 'syserr')).toBe(false);
+  });
+
+  it('issue #217：SSE 重连时 active_run_id=null 清运行态并只提示一次', async () => {
+    mockFetch((url, init) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        return { status: 200, body: { message: { id: 'm1', content: '任务' }, run: { id: 'r1' } } };
+      }
+      if (url === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = '任务';
+    await store.send(); // 用户消息成功入队后本地进入 run 状态
+    expect(store.es.activeRunId).toBe('r1');
+    expect(store.sendDisabled).toBe(true);
+
+    const connection = FakeEventSource.instances.at(-1)!;
+    connection.onerror?.(); // EventSource 断线，期间 run_end 丢失
+    connection.onopen?.(); // 自动重连成功；detail 返回 active_run_id=null
+    const interrupted = '连接中断期间该 run 已结束（详情见运行记录）';
+    await vi.waitFor(() => {
+      expect(store.es.activeRunId).toBeNull();
+      expect(store.sendDisabled).toBe(false);
+      expect(store.entries.filter((e) => e.kind === 'sep' && e.text === interrupted)).toHaveLength(1);
+    });
+
+    connection.onerror?.();
+    connection.onopen?.(); // 后续重连仍为 null，不重复刷提示
+    await vi.waitFor(() => {
+      expect(store.entries.filter((e) => e.kind === 'sep' && e.text === interrupted)).toHaveLength(1);
+    });
+  });
+
+  it('issue #217：重连时 active_run_id 非空保留运行态且不提示已结束', async () => {
+    mockFetch((url, init) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        return { status: 200, body: { message: { id: 'm1', content: '任务' }, run: { id: 'r1' } } };
+      }
+      if (url === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: 'r1' }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = '任务';
+    await store.send();
+
+    const connection = FakeEventSource.instances.at(-1)!;
+    connection.onerror?.();
+    connection.onopen?.();
+    await vi.waitFor(() => expect(store.es.activeRunId).toBe('r1'));
+    expect(store.running).toBe(true);
+    expect(store.sendDisabled).toBe(true);
+    expect(store.entries.some((e) => e.kind === 'sep' && e.text.includes('连接中断期间'))).toBe(false);
+  });
+
+  it('issue #217：在线收到当前 run_end 仍渲染原终态行，不显示断线提示', async () => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: 'r1' }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    FakeEventSource.instances.at(-1)!.emit('run_end', {
+      seq: 1, run_id: 'r1', termination: { reason: 'end_turn' },
+    });
+
+    expect(store.es.activeRunId).toBeNull();
+    expect(store.entries.some((e) => e.kind === 'sep' && e.text === 'run 结束：正常完成')).toBe(true);
+    expect(store.entries.some((e) => e.kind === 'sep' && e.text.includes('连接中断期间'))).toBe(false);
   });
 
   it('openSession 404 → 静默 resetSessionView + onClearRoute 清深链；其他错误保留 + syserr', async () => {
