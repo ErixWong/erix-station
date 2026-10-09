@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { parseCidr, intToIp } from '../src/ipam.js';
+import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -50,7 +51,7 @@ function compose(args, env = {}) {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...composeDomainEnv('8090'), ...env },
   });
 }
 
@@ -146,7 +147,8 @@ async function createProject() {
   S.port = body.ports[0].port;
   S.hostname = body.ports[0].hostname;
   assert.equal(body.ports[0].state, 'allocated');
-  assert.match(S.hostname, /^alice-p-proj1-\d{4}\.fde\.localhost$/);
+  assert.match(S.hostname, /^alice-p-proj1-\d{4}\./);
+  assert.ok(S.hostname.endsWith(`.${BASE_DOMAIN}`), `hostname uses BASE_DOMAIN=${BASE_DOMAIN}: ${S.hostname}`);
 }
 
 function hostPathOf(...rel) {
@@ -254,7 +256,7 @@ test('WP2a 端到端：建项目 → 物化 + 路由 → whoami 可达 → 删�
     // wp2a 场景 alice 不配任何 binding → 断言「文件不存在」。ClientIP 精确 subnet 的覆盖
     // 在 wp6（文件存在但无 llm-bob）+ 单测 portal/test/routes.test.js:157/375，本脚本不再重复。
     assert.ok(!fs.existsSync(path.join(S.dynamicRoot, 'llm-routes.yml')), '零 binding → llm-routes.yml 不存在');
-    assert.ok(!routesText.includes('llm.localhost'), 'routes.yml 不含 llm 路由');
+    assert.ok(!routesText.includes(LLM_HOST), `routes.yml 不含 LLM 路由（${LLM_HOST}）`);
     assert.ok(!routesText.includes('llm-hub'), 'routes.yml 不含 llm-hub service');
     assert.ok(!routesText.includes('fde-alice-llm'), 'routes.yml 不含 fde-alice-llm router');
 

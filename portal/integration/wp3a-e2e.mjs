@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseCidr, intToIp } from '../src/ipam.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { LLM_HOST, PORTAL_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -49,7 +50,7 @@ function compose(args, env = {}) {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...composeDomainEnv('8090'), ...env },
   });
 }
 
@@ -117,7 +118,7 @@ function readTokenFromContainer() {
 }
 
 function runFakeAgentd(phase) {
-  const cmd = `run --rm --network ${S.networkName} -v ${REPO_ROOT}:/app:ro node:22-alpine node /app/portal/integration/fake-agentd.mjs --phase ${phase} --gateway http://${S.gateway}:8090 --token ${S.token} --station-host station.localhost --llm-host llm.localhost`;
+  const cmd = `run --rm --network ${S.networkName} -v ${REPO_ROOT}:/app:ro node:22-alpine node /app/portal/integration/fake-agentd.mjs --phase ${phase} --gateway http://${S.gateway}:8090 --token ${S.token} --station-host ${PORTAL_HOST} --llm-host ${LLM_HOST}`;
   const out = docker(cmd).trim();
   const lines = out.split('\n').filter((l) => l.trim());
   return JSON.parse(lines[lines.length - 1]);
@@ -200,7 +201,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     }, { label: 'routes.yml 含 internal 路由' });
 
     // 4) ipAllowList 负向：宿主来源（127.0.0.1）不在 FDE subnet → 403
-    const curlForbidden = `curl -s -o /dev/null -w '%{http_code}' -H 'Host: station.localhost' -H 'Authorization: Bearer ${S.token}' ${TRAEFIK_WEB}/api/internal/heartbeat`;
+    const curlForbidden = `curl -s -o /dev/null -w '%{http_code}' -H 'Host: ${PORTAL_HOST}' -H 'Authorization: Bearer ${S.token}' ${TRAEFIK_WEB}/api/internal/heartbeat`;
     await waitFor(async () => {
       const c = execSync(curlForbidden, { encoding: 'utf8', stdio: 'pipe' }).trim();
       return c === '403' ? c : null;
