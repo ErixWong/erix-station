@@ -1231,7 +1231,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 ### 9.6 `PUT /api/internal/runs/:id/state`（U2：run 状态收敛）
 
-同一端点覆盖 store `markRunState`（非终态）与 run 终态收敛（runner §4.2 / §9.1）。**所有转换都要求 `X-Claim-Token` 匹配当前有效租约**（不匹配 → `409 lease_lost`）；转换用**条件更新（CAS）**实现——`UPDATE runs SET ... WHERE id=$1 AND status = <期望当前状态>`，0 行受影响即按非法转换处理。
+同一端点覆盖 store `markRunState`（非终态）与 run 终态收敛（runner §4.2 / §9.1）。**所有转换都要求 `X-Claim-Token` 匹配当前有效租约**（不匹配 → `409 lease_lost`；**唯一例外**：`cancelling` 期间的 `{state:"running"}` 幂等 ack 不校验租约，见下「停止期间的 `running` 写入」）；转换用**条件更新（CAS）**实现——`UPDATE runs SET ... WHERE id=$1 AND status = <期望当前状态>`，0 行受影响即按非法转换处理。
 
 **合法状态转换表（U2 可执行的转换）**：
 
@@ -1241,10 +1241,18 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `running` | `running` | `{state: "running"}` | `200`（幂等重放，无变化） |
 | `running` | `finished` | 终态载荷（见下） | `200`（终态事务） |
 | `running` | `failed` | 终态载荷（见下） | `200`（终态事务） |
+| `cancelling` | `running` | `{state: "running"}` | `200` **幂等 ack**（**不改 `runs.status`**、不校验租约，见下） |
 | `cancelling` | `finished` | 终态载荷（`termination.reason` 通常为 `aborted`） | `200`（终态事务） |
 | `cancelling` | `failed` | 终态载荷 | `200`（终态事务） |
 
-**非法转换 → `409 invalid_transition`**（details 附 `{from, to}`）：`running/queued → queued`（回退）；`queued → finished/failed`（跳过 running，须走 U12 release + re-claim）；`cancelling → running`（停止后不得回 running）。**终态 run 的任何写（非终态/终态）统一走 `409 run_terminal`，不归 `invalid_transition`**（见下「重复终态」）。
+**非法转换 → `409 invalid_transition`**（details 附 `{from, to}`）：`running/queued → queued`（回退）；`queued → finished/failed`（跳过 running，须走 U12 release + re-claim）；`cancelling → running`（停止后不得回 running；**例外：该情形返回幂等 ack，不归 `invalid_transition`，见下**）。**终态 run 的任何写（非终态/终态）统一走 `409 run_terminal`，不归 `invalid_transition`**（见下「重复终态」）。
+
+**停止期间的 `running` 写入（issue #220）**：用户 `POST /sessions/:id/stop` 先把 `runs.status` 置 `cancelling`，而停止信号抵达 worker 有延迟；引擎那次**正常**的 `markRunState('running')` 落盘不得被拒（否则会被引擎渲染成 `reason=persistence_failed` 的落盘失败，掩盖真正的取消）。口径：
+
+- `cancelling` + `{state:"running"}` → `200 {"state": "cancelling", "idempotent": true}`（**不伪造成 `running`**）；
+- **`runs.status` 保持 `cancelling`**（§9.6/A2：停止后不回 running；`started_at` 不再前移），`run_queue` 行零改动、不合成 `run_events`——该分支**不改任何仓库状态**；
+- **不校验 `X-Claim-Token`**：真机里该写入到达时 `run_queue.claim_token` 已被停止/收敛路径置 NULL，断言租约只会把 `409 invalid_transition` 换成 `409 lease_lost`；本分支无写入，没有需要 fence 的写（旧 agentd 重放只会得到同一个 ack）；
+- 终态之后的 `{state:"running"}` 写入语义**不变**（仍 `409 run_terminal`）；`queued` + `{state:"running"}` 仍走 CAS（租约失效 → `409 lease_lost`）。
 
 **非终态（markRunState）**——请求：
 
@@ -1252,7 +1260,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 { "state": "running" }
 ```
 
-响应 `200`。幂等：重复 `{state:"running"}` 在 `queued`/`running` 下均为 `200`（覆盖写/无变化）。
+响应 `200`。幂等：重复 `{state:"running"}` 在 `queued`/`running` 下均为 `200`（覆盖写/无变化）；`cancelling` 下的 `{state:"running"}` 见上「停止期间的 `running` 写入」（`200` ack，状态不回退）。
 
 **终态收敛**——请求：
 
@@ -1288,7 +1296,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 > **顺序约束（runner §7.4/§7.6）**：终态收敛**必须在该 run 全部事件批被 `200` 确认后才发送**；portal 在终态事务内**合成** `run_end` 事件（worker 不再经 U3 发 `run_end`，runner §7.6），payload 带 `attempt`。终态 barrier：此后 U3/U5/U8/U10 及 state 写一律 `409 run_terminal`（读端点 U6/U7/U9/U11 不受限；runner-integration §7.6 同口径）。
 
-错误：`400 validation_failed`（终态载荷缺 `termination`/`usage`/`rounds` 等）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 invalid_transition`（非法状态转换）；`409 run_terminal`（终态 run 的写/不同载荷重复终态）；`429 rate_limited`；5xx 无限退避重试（§9.13）。
+错误：`400 validation_failed`（终态载荷缺 `termination`/`usage`/`rounds` 等）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 invalid_transition`（非法状态转换；`cancelling → running` 除外，见上）；`409 run_terminal`（终态 run 的写/不同载荷重复终态）；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
 ### 9.7 transcript rounds（U5/U6/U7）
 
