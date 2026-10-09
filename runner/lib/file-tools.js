@@ -110,7 +110,11 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
 //   * 越界/非可写/遮蔽路径不再抛 JailError，而是上游统一的「错误：…被宿主边界拒绝：…」文本结果
 //     （jail 仍在内部抛，只是被谓词转成布尔；引擎把文本结果喂回模型，比抛异常更可恢复）；
 //   * 遍历内的中止从「每 32 项让出 + 查中止」换成上游同口径 checkpoint（erix-agent 源码里
-//     ABORT_CHECKPOINT_EVERY = 32），`lib/abort.js` 继续给自己与 shell 工具用。
+//     ABORT_CHECKPOINT_EVERY = 32），`lib/abort.js` 继续给自己与 shell 工具用；
+//   * **`tree` 根标签在装配层收口成 `./`**（issue #64 语义保住，见下文 `TREE_ROOT_LABEL` 注记）：
+//     上游只对 `path === "."` 给 `"./"`，`''` / `'./'` / 缺省会给出**工作目录 basename**，真机上模型
+//     拷这个输出再查一次就 ENOENT（#228 真机验收踩到，浪费一轮）。上游侧已另行提单，上游修好后
+//     这条收口可以撤。
 // ---------------------------------------------------------------------------
 
 /** station 注册面暴露的文件工具名（工单 D3 §3.1：不含弃用别名 rg / grep）。 */
@@ -122,6 +126,48 @@ export const STATION_FILE_TOOL_NAMES = Object.freeze([
 function isStructuredCall(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
     && typeof value.name === 'string';
+}
+
+// ---------------------------------------------------------------------------
+// `tree` 根标签收口（issue #64 语义保住；#228 真机验收后的修复）
+//
+// 上游 `createFileTools` 的 tree 里 `path` 只用在三处：解析目标、根标签（
+// `rootLabel = treePath === "." ? "." : path.basename(…)`）、以及拼出首行——**条目、截断
+// marker、排除账一律不引用 `path`**。所以把「根写法」的入参换成 `"."` 只会影响根标签一处，
+// 条目与 marker 逐字节不变（也不需要本站重算目录树）。
+//
+// 真机证据（#228，共享 dev 栈 / fde-eric）：模型 `tree {path:"./"}` 拿到首行 `hello-station/`，
+// 照着再调 `tree {path:"hello-station/"}` → `ENOENT …/hello-station/hello-station`、ok:false，
+// 真的失败一次并浪费一轮——不是「上游语义、我不动」能交差的量级。
+//
+// 两道措施：
+//   1. 入口：根写法（`''` / `'.'` / `'./'` 及尾斜杠变体 / 缺省 / null）归一成 `path: "."`，
+//      让上游走它自己的 `"."` 分支直接输出 `./`（顺带挡掉 `path: null` 会被 `path.resolve`
+//      抛 TypeError 这个隐性坑）；
+//   2. 出口：结果首行如果仍是工作目录 basename（`hello-station` 或 `hello-station/`）就换成 `./`。
+//      这一道同时接管「绝对根路径 / `sub/..` 这类解析后就是根的写法」，并在上游改了 `"."` 分支时兜住。
+// 两者都只动首行根标签；不认的写法（真实子目录名、子树里的文件）一字不动，不过度归一。
+/** `tree` 根标签的归一目标（与上游 `path === "."` 分支的输出逐字一致）。 */
+const TREE_ROOT_LABEL = './';
+
+/** 「根写法」的入参：缺省 / null / `''` / `'.'` / `'./'`（含 `.//`、`./.`、`././` 等尾斜杠变体）。 */
+function isRootFormPath(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (trimmed === '') return true;
+  if (!trimmed.startsWith('.')) return false;   // 真实子目录名（`sub` / `sub/`）与绝对路径一律不算
+  return trimmed.startsWith('./') || trimmed === '.';
+}
+
+/** 解析后就是根的其他写法（绝对根路径、`sub/..`）：也归一根标签，但不改上游入参。 */
+function resolvesToRoot(root, value) {
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  try {
+    return path.resolve(root, value) === root;
+  } catch {
+    return false;
+  }
 }
 
 /** 遮蔽前缀表：相对路径按 root 解析，能 realpath 就 realpath（防用 symlink 绕过遮蔽）。 */
@@ -196,13 +242,34 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
     // readFile / writeFile / edit 是单次同步 syscall、上游不看 signal。装配层在入口统一补一次检查，
     // 保住 station 既有保证。遍历内的**真中断**（同步跑起来时 MSG.ABORT 处理器才有机会执行）由上游
     // checkpoint 负责：每 32 项让出事件循环 + 查中止，比 fork 的入口检查更强。
-    const signal = isStructuredCall(firstArg)
+    const structured = isStructuredCall(firstArg);
+    const signal = structured
       ? (firstArg.signal ?? firstArg.context?.signal)
       : context?.signal;
     throwIfAborted(signal);
-    return isStructuredCall(firstArg)
-      ? upstream.executeTool(firstArg)
-      : upstream.executeTool(firstArg, input, context);
+
+    // tree 根标签收口（issue #64 / #228，详见文件头 TREE_ROOT_LABEL 注记）：只改根标签一处。
+    const isTreeCall = structured ? firstArg.name === 'tree' : firstArg === 'tree';
+    const treePath = structured ? firstArg.input?.path : input?.path;
+    const rootForm = isTreeCall && isRootFormPath(treePath);
+    if (rootForm) {
+      if (structured) firstArg = { ...firstArg, input: { ...(firstArg.input ?? {}), path: '.' } };
+      else input = { ...(input ?? {}), path: '.' };
+    }
+    const treeTargetIsRoot = isTreeCall && (rootForm || resolvesToRoot(root, treePath));
+
+    const result = structured
+      ? await upstream.executeTool(firstArg)
+      : await upstream.executeTool(firstArg, input, context);
+    if (!treeTargetIsRoot || typeof result !== 'string' || result === '') return result;
+
+    // 出口兜底：首行仍是工作目录 basename → 换回 `./`；已是 `./` 或认不出的文本（错误结果等）一律不动。
+    const cut = result.indexOf('\n');
+    const firstLine = cut === -1 ? result : result.slice(0, cut);
+    if (firstLine === TREE_ROOT_LABEL) return result;
+    const baseName = path.basename(root);
+    if (firstLine !== baseName && firstLine !== `${baseName}/`) return result;
+    return `${TREE_ROOT_LABEL}${cut === -1 ? '' : result.slice(cut)}`;
   };
 
   return {

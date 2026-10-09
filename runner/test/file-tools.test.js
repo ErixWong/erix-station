@@ -7,6 +7,8 @@
 //     「错误：读取|写入被宿主边界拒绝：…」**文本结果**（jail 仍在内部抛，被谓词转成布尔）；
 //   * 遍历内中止：旧形态靠本仓库自己的让出点，新形态靠上游 checkpoint——用例相应升级为
 //     「真 signal 在遍历中途抛出真 AbortError」（issue #211 的意图不变、保证更强）。
+//   * `tree` 根标签：**在装配层收口回 `./`**（issue #64 语义保住；#228 真机验收后的修复）——
+//     上游只对 `path === "."` 给 `./`，而真机上模型会把 basename 标签拷回去再查一次并 ENOENT。
 // jail 自身的 4 条用例（#1/#4/#9/#10/#11 的 jail 断言面）逐字不动：createJail / JailError 没迁。
 // 隔离约定：tmp 目录作 jail root，不碰真实环境。
 import test from 'node:test';
@@ -77,30 +79,95 @@ test('createJail：返回对象含 root 且等于传入根的 realpath', () =>
     assert.ok(path.isAbsolute(jail.root));
   }));
 
-test('tree：根标签 ./（空目录）——issue #228 语义变更：只有 "." 与缺省给 ./，""/"./" 给目录名', () =>
+test('tree：根标签 ./（空目录）——五种根写法全部归一（#64 在装配层保住，#228 真机修复）', () =>
   withTools(async (tools, root) => {
-    // fork 时代 ''/'./'/'' 三者都归一成 './'（issue #64 的修复）。上游 createFileTools 只对
-    // treePath === "." 给 "."，其它写法回落到 path.basename(解析结果)——即 '' 与 './' 现在显示
-    // 工作目录名。语义变更已单列清单交主 agent 裁决；这里保留原用例的意图（根标签稳定）并钉住新口径。
-    const fromDefault = await tools.executors.tree({});
-    const fromDot = await tools.executors.tree({ path: '.' });
-    assert.equal(fromDot, './');
-    assert.equal(fromDefault, './');
-    assert.equal(await tools.executors.tree({ path: '' }), `${path.basename(root)}/`);
-    assert.equal(await tools.executors.tree({ path: './' }), `${path.basename(root)}/`);
+    // fork 时代 ''/'./'/'.' /缺省 都归一成 './'（issue #64 的修复）；上游 createFileTools 只覆盖
+    // `path === "."` 那一半，其它写法回落到工作目录 basename——真机上模型拷这个标签再查一次就 ENOENT
+    // （#228 真机验收：tree{"path":"./"} → `hello-station/` → tree{"path":"hello-station/"} → ENOENT）。
+    // station 在装配层把根标签收口回 `./`（只改根标签；上游侧已另行提单，上游修好后本收口可撤）。
+    for (const value of [undefined, null, '', '.', './', './/', './.']) {
+      const out = await tools.executors.tree(value === undefined ? {} : { path: value });
+      assert.equal(String(out).split('\n')[0], './', `根写法 ${JSON.stringify(value)} 的根标签必须是 ./，实际：${String(out).split('\n')[0]}`);
+    }
+    // 绝对根路径（不是根写法，但解析后就是根）也要拿到 ./：走的是出口兜底那一道
+    assert.equal(String(await tools.executors.tree({ path: root })).split('\n')[0], './');
+    // 结构化调用形态（引擎侧形态）同样收口
+    const structured = await tools.executeTool({ id: 't1', name: 'tree', input: { path: './' } });
+    assert.equal(String(structured).split('\n')[0], './');
   }));
 
-test('tree：根标签 ./（含文件目录）——三者输出一致的旧断言改为按新口径分别钉', () =>
+test('tree：根标签 ./（含文件目录）——写法无关，条目与 marker 逐字相同', () =>
   withTools(async (tools, root) => {
     fs.mkdirSync(path.join(root, 'b'), { recursive: true });
     fs.writeFileSync(path.join(root, 'a.txt'), 'x');
     fs.writeFileSync(path.join(root, 'b', 'c.txt'), 'y');
     const expected = './\n  a.txt\n  b/\n    c.txt';
-    assert.equal(await tools.executors.tree({ path: '.' }), expected);
-    assert.equal(await tools.executors.tree({}), expected);
-    const labeled = `${path.basename(root)}/\n  a.txt\n  b/\n    c.txt`;
-    assert.equal(await tools.executors.tree({ path: '' }), labeled);
-    assert.equal(await tools.executors.tree({ path: './' }), labeled);
+    for (const value of [undefined, '', '.', './']) {
+      assert.equal(await tools.executors.tree(value === undefined ? {} : { path: value }), expected,
+        `根写法 ${JSON.stringify(value)} 的输出与预期逐字不一致`);
+    }
+  }));
+
+test('tree：只改根标签——条目/截断与排除 marker 一字不动（两种收口路径输出逐字相等）', () =>
+  withTools(async (tools, root) => {
+    // fixture 同时触发排除账 marker（vendor + 点目录），用来证明收口只动了首行。
+    fs.mkdirSync(path.join(root, 'node_modules', 'pkg'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'deep', 'deeper', 'deepest'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'node_modules', 'pkg', 'i.js'), 'x');
+    fs.writeFileSync(path.join(root, '.git', 'HEAD'), 'x');
+    fs.writeFileSync(path.join(root, 'a.txt'), 'x');
+
+    const fromRootForm = await tools.executors.tree({ path: './', depth: 2 });
+    const fromAbsolutePath = await tools.executors.tree({ path: root, depth: 2 });
+    assert.equal(fromAbsolutePath, fromRootForm, '两种收口路径（入口归一 / 出口兜底）必须逐字相等');
+    assert.equal(fromRootForm.split('\n')[0], './');
+    assert.ok(fromRootForm.includes('\n  a.txt'), '条目原样保留');
+    assert.ok(fromRootForm.includes('未展开'), 'depth 截断 marker 原样保留');
+    assert.ok(fromRootForm.includes('已跳过'), '排除账 marker 原样保留');
+    assert.ok(fromRootForm.includes('include_vendor=true'), 'marker 里的下一步提示原样保留');
+    assert.equal(fromRootForm.split('\n').slice(1).join('\n'), fromAbsolutePath.split('\n').slice(1).join('\n'));
+  }));
+
+test('tree：真实子目录名不过度归一（sub / sub/ / 子路径均保留自己的标签）', () =>
+  withTools(async (tools, root) => {
+    fs.mkdirSync(path.join(root, 'sub', 'deeper'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'sub', 'b.txt'), 'y');
+    fs.writeFileSync(path.join(root, 'sub', 'deeper', 'c.txt'), 'z');
+    fs.writeFileSync(path.join(root, 'a.txt'), 'x');
+    assert.equal(await tools.executors.tree({ path: 'sub' }), 'sub/\n  b.txt\n  deeper/\n    c.txt');
+    assert.equal(await tools.executors.tree({ path: 'sub/' }), 'sub/\n  b.txt\n  deeper/\n    c.txt');
+    assert.equal(String(await tools.executors.tree({ path: 'sub/deeper' })).split('\n')[0], 'deeper/');
+    // 工作目录名作为**相对路径**依旧按普通子目录看待（本目录里并没有这个子目录 → ENOENT），
+    // 不被当成根写法强行归一——过度归一会把「真的不存在」洗成「根目录」，那是另一条谎。
+    await assert.rejects(() => tools.executors.tree({ path: `${path.basename(root)}/` }),
+      (error) => error?.code === 'ENOENT');
+    // 真存在的同名子目录：标签就是它自己，不是 ./
+    fs.mkdirSync(path.join(root, path.basename(root)), { recursive: true });
+    fs.writeFileSync(path.join(root, path.basename(root), 'inner.txt'), 'x');
+    assert.equal(String(await tools.executors.tree({ path: `${path.basename(root)}/` })).split('\n')[0],
+      `${path.basename(root)}/`);
+    assert.ok((await tools.executors.tree({ path: `${path.basename(root)}/` })).includes('inner.txt'));
+  }));
+
+test('回归（真机链路 #228 → #64）：第一次 tree 的首行拿去当第二次的 path，第二次必须成功', () =>
+  withTools(async (tools, root) => {
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'index.js'), 'x');
+    fs.writeFileSync(path.join(root, 'package.json'), '{}');
+
+    // 真机上模型就是这么做的：把工具输出的根标签直接拷回去当下一次 path。
+    const first = await tools.executors.tree({ path: './' });
+    const label = first.split('\n')[0];
+    assert.equal(label, './', '第一步就必须是 ./，否则回归用例测的不是修复后的行为');
+    const second = await tools.executors.tree({ path: label });   // 修复前这里直接 ENOENT 抛异常
+    assert.equal(second.split('\n')[0], './');
+    assert.equal(second, first, '同一个目录两次查询结果逐字一致（模型不会看到新标签）');
+
+    // 反证：这个收口确实在挡真实失败——拿 basename 当相对 path 就是真机那一次的结局
+    await assert.rejects(() => tools.executors.tree({ path: `${path.basename(root)}/` }),
+      (error) => error?.code === 'ENOENT',
+      'basename 当相对路径必须 ENOENT（这正是必须在根标签上收口的原因）');
   }));
 
 test('searchText（原 rg 用例）：正则命中——mode 显式 + 返回 {content, metadata}', () =>
