@@ -16,12 +16,14 @@ import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
+import { composeDomainEnv } from './lib/compose-domain.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
 const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
+const DOMAIN_COMPOSE_ENV = composeDomainEnv(TRAEFIK_WEB_PORT);
 const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
 const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
 const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
@@ -260,15 +262,11 @@ test('WP5 端到端：会话 → 发消息建 run → SSE 事件流 → 停止 �
   fs.chmodSync(S.staticRoot, 0o755);
   fs.chmodSync(S.artifactsRoot, 0o755);
   const composePaths = {
+    ...DOMAIN_COMPOSE_ENV,
     ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
     TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
     TRAEFIK_STATIC_HOST: S.staticFile,
     ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
-    BASE_DOMAIN: 'localhost',
-    PORTAL_HOST: 'station.localhost',
-    PORTAL_PUBLIC_BASE_URL: `http://station.localhost:${TRAEFIK_WEB_PORT}`,
-    LLM_HOST: 'llm.localhost',
-    LLM_PUBLIC_BASE_URL: `http://llm.localhost:${TRAEFIK_WEB_PORT}`,
   };
 
   const cleanup = () => {
