@@ -1251,7 +1251,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 - `cancelling` + `{state:"running"}` → `200 {"state": "cancelling", "idempotent": true}`（**不伪造成 `running`**）；
 - **`runs.status` 保持 `cancelling`**（§9.6/A2：停止后不回 running；`started_at` 不再前移），`run_queue` 行零改动、不合成 `run_events`——该分支**不改任何仓库状态**；
-- **不校验 `X-Claim-Token`**：真机里该写入到达时 `run_queue.claim_token` 已被停止/收敛路径置 NULL，断言租约只会把 `409 invalid_transition` 换成 `409 lease_lost`；本分支无写入，没有需要 fence 的写（旧 agentd 重放只会得到同一个 ack）；
+- **不校验 `X-Claim-Token`**：本分支**零写入**，没有需要 fence 的写（旧 agentd 重放只会得到同一个 ack）；反而若断言租约，就把一个无副作用的 ack 绑上了与它无关的租约竞态——停止/收敛路径会在**任意时刻**清空 `run_queue.claim_token`（#220 取证：停止后 0ms 租约仍在，终态收敛之后才为 NULL），写入稍晚一步就只是把 `409 invalid_transition` 换成 `409 lease_lost`；
 - 终态之后的 `{state:"running"}` 写入语义**不变**（仍 `409 run_terminal`）；`queued` + `{state:"running"}` 仍走 CAS（租约失效 → `409 lease_lost`）。
 
 **非终态（markRunState）**——请求：
