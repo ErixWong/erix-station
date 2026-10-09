@@ -273,6 +273,61 @@ describe('useEventStream（mock EventSource）', () => {
     expect(s.toolCards.has('nope')).toBe(false);
   });
 
+  // issue #228：上游 erix-agent 文件工具的返回形态按工具分三套（readFile/tree/edit → string，
+  // searchText → {content, metadata}，writeFile → number）。事件里给到哪一种都必须能摘要，
+  // 且不得渲染成 "[object Object]"，也不得把 number 0 当成「没有结果」丢掉。
+  it('tool_result 三种返回形态都能摘要（string / {content, metadata} / number；含 0 与缺失）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+
+    // ① string：readFile 的正文（截断信息写在尾部 marker 里）
+    lastES().emit('tool_use', { tool_call_id: 'r', name: 'readFile', input: { path: 'a.txt' } });
+    lastES().emit('tool_result', {
+      tool_call_id: 'r', ok: true, duration_ms: 3,
+      result_digest: '1: hello\n[共 12 行，剩余 7 行；下一步：readFile 传 offset=5 继续]',
+    });
+    expect(s.toolCards.get('r')!.out).toBe('✓ 1: hello\n[共 12 行，剩余 7 行；下一步：readFile 传 offset=5 继续]（3ms）');
+
+    // ② {content, metadata}：searchText 的结构化结果 → 只展示 content（metadata 不上 UI）
+    lastES().emit('tool_use', { tool_call_id: 's', name: 'searchText', input: { pattern: 'hit', mode: 'literal' } });
+    lastES().emit('tool_result', {
+      tool_call_id: 's', ok: true, duration_ms: 7,
+      result_digest: { content: 'a.js:1:hit', metadata: { searchHits: 1, searchSkipped: { vendorDirectories: 2 } } },
+    });
+    const searchCard = s.toolCards.get('s')!;
+    expect(searchCard.out).toBe('✓ a.js:1:hit（7ms）');
+    expect(searchCard.out).not.toContain('[object Object]');
+    expect(searchCard.out).not.toContain('vendorDirectories');
+
+    // ③ number：writeFile 返回写入字节数；0 也必须正常显示（不是「无结果」）
+    lastES().emit('tool_use', { tool_call_id: 'w', name: 'writeFile', input: { path: 'b.txt', content: '' } });
+    lastES().emit('tool_result', { tool_call_id: 'w', ok: true, duration_ms: 1, result_digest: 0 });
+    expect(s.toolCards.get('w')!.out).toBe('✓ 0（1ms）');
+
+    // ④ 缺失（null / undefined）不炸，摘要退化成空串
+    lastES().emit('tool_use', { tool_call_id: 'n', name: 'tree', input: {} });
+    lastES().emit('tool_result', { tool_call_id: 'n', ok: true, duration_ms: 2, result_digest: null });
+    expect(s.toolCards.get('n')!.out).toBe('✓ （2ms）');
+    lastES().emit('tool_result', { tool_call_id: 'n', ok: true, duration_ms: 2 });
+    expect(s.toolCards.get('n')!.out).toBe('✓ （2ms）');
+  });
+
+  it('投影卡片（DTO 路径）的 resultPreview 同样过归一：number/对象不炸、0 不被丢', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.projectToolCard('p1', { name: 'writeFile', argsSummary: 'path=b.txt', resultPreview: 0, executionStatus: 'succeeded' });
+    const card = s.toolCards.get('p1')!;
+    expect(card.resultPreview).toBe('0');
+    expect(card.ok).toBe(true);
+    s.projectToolCard('p2', {
+      name: 'searchText',
+      resultPreview: { content: 'a.js:1:hit', metadata: { searchHits: 1 } },
+      isError: false,
+    });
+    expect(s.toolCards.get('p2')!.resultPreview).toBe('a.js:1:hit');
+  });
+
   it('round/attempt/recovering/judge/compaction/final_guard/forced_final 分隔行文案', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);

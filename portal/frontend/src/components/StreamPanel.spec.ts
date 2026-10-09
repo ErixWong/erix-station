@@ -214,6 +214,32 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     expect(wrapper.text()).toContain('failed · BOOM');
   });
 
+  // issue #228：上游文件工具的返回形态按工具分三套（string / {content, metadata} / number）。
+  // 展开区的结果行必须把 number 与 null 也渲染出来，且绝不出现 "[object Object]"。
+  it('结果行兼容 number / 对象 / 缺失的 resultPreview（issue #228）', async () => {
+    const store = useWorkbenchStore();
+    store.es.toolCards.set('num', {
+      name: 'writeFile', dig: '', args: '', ok: true, out: '',
+      executionStatus: 'succeeded', resultPreview: 0 as unknown as string,
+    });
+    store.es.toolCards.set('obj', {
+      name: 'searchText', dig: '', args: '', ok: true, out: '',
+      executionStatus: 'succeeded',
+      resultPreview: { content: 'a.js:1:hit', metadata: { searchHits: 1 } } as unknown as string,
+    });
+    store.es.toolCards.set('none', {
+      name: 'tree', dig: '', args: '', ok: true, out: '', executionStatus: 'succeeded', resultPreview: null as unknown as string,
+    });
+    store.entries.push({ kind: 'tool', callId: 'num' }, { kind: 'tool', callId: 'obj' }, { kind: 'tool', callId: 'none' });
+    const wrapper = mountPanel();
+    for (const btn of wrapper.findAll('button[aria-expanded]')) await btn.trigger('click');
+    const text = wrapper.text();
+    expect(text).toContain('succeeded · 0'); // number 0 不能被当成「无结果」丢掉
+    expect(text).toContain('succeeded · a.js:1:hit'); // {content, metadata} 只展示 content
+    expect(text).not.toContain('[object Object]');
+    expect(text).toContain('succeeded'); // resultPreview 缺失时只剩状态串，不渲染 null/undefined
+  });
+
   it('推理块默认收起、可展开；摘要取首行，展开显示全文', async () => {
     const store = useWorkbenchStore();
     store.entries.push({ kind: 'reasoning', id: 'm2', text: '第一行推理\n第二行细节' });

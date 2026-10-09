@@ -20,3 +20,43 @@ export function getToolPreview(argsText: string): string {
   }
   return String((input as Record<string, unknown>)[keys[0]]).slice(0, PREVIEW_LEN);
 }
+
+// ---------------------------------------------------------------------------
+// issue #228：工具结果的展示文本（上游 erix-agent 文件工具把返回形态分成了三套）
+//
+// 上游实测：`readFile` / `tree` / `edit` → string（截断信息写在尾部 marker 里）；
+// `searchText` → **对象** `{content, metadata}`（metadata 进 transcript、不上 wire）；
+// `writeFile` → **number**（写入字节数）。引擎会归一一道，但工作台不能依赖「上游永远给字符串」：
+// 历史事件、DTO 投影、后续新工具都可能是三种形态之一，所以入口先收敛一次，
+// 卡片里存的永远是字符串。
+//
+// 口径：
+//   * `{content, metadata}` → 只展示 content。截断/跳过信息已经在 content 自己的 marker 文本里
+//     （「[命中过多…下一步：searchText 传 offset=N 继续]」），不另造 UI、不新增文案；
+//   * number（writeFile 字节数）→ String(0) 必须是 "0"，不能被 falsy 判空吞掉；
+//   * null / undefined → 空串（没结果就是没结果，不能报「undefined」）；
+//   * 其它对象/数组 → JSON 文本（沿用 dig 摘要的老兜底语义），仅这条路走长度闸门。
+// ---------------------------------------------------------------------------
+
+/** 非字符串结果的 JSON 兜底截断长度（与上游 resultPreview 的 400 字预览同口径）。 */
+const RESULT_TEXT_LIMIT = 400;
+
+/** 把任意工具结果（string / {content, metadata} / number / null）归一成展示文本。 */
+export function getToolResultSummary(result: unknown): string {
+  if (result === null || result === undefined) return '';
+  if (typeof result === 'string') return result;
+  if (typeof result === 'number' || typeof result === 'boolean' || typeof result === 'bigint') {
+    return String(result);
+  }
+  if (typeof result === 'object' && !Array.isArray(result)
+    && Object.prototype.hasOwnProperty.call(result, 'content')) {
+    // 结构化结果：content 就是模型看到的正文（含截断/跳过 marker），递归归一防 content 又不是字符串。
+    return getToolResultSummary((result as { content?: unknown }).content);
+  }
+  try {
+    const serialized = JSON.stringify(result);
+    return (typeof serialized === 'string' ? serialized : String(result)).slice(0, RESULT_TEXT_LIMIT);
+  } catch {
+    return String(result).slice(0, RESULT_TEXT_LIMIT);
+  }
+}
