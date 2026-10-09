@@ -56,9 +56,9 @@ export function buildRunTermination({ termination, aborted = false } = {}) {
 }
 
 /**
- * 构造 `run_finished`（IPC）的失败终态片段：`termination` + `error`。
+ * 构造 `run_finished`（IPC）的失败终态片段：`termination` + `error` + `usage` + `rounds`。
  * @param {{ err: any, aborted?: boolean }} input
- * @returns {{ termination: Record<string, unknown>, error: { code: string, message: string, retryable: boolean } }}
+ * @returns {{ termination: Record<string, unknown>, error: { code: string, message: string, retryable: boolean }, usage: Record<string, unknown>, rounds: number }}
  */
 export function buildFailureEnvelope({ err, aborted = false } = {}) {
   const code = aborted ? 'aborted' : (err?.code ?? 'failed');
@@ -70,5 +70,15 @@ export function buildFailureEnvelope({ err, aborted = false } = {}) {
       // 上游显式标记优先，其余按码表判（issue #212：此前只认 checkpoint_failed / rate_limited）。
       retryable: err?.retryable === true || isRetryableErrorCode(code),
     },
+    // erix-agent #180（0.18.0 兑现）：`fail()` 上抛的错误除了 `termination`，还挂与
+    // `makeResult` **同一对象口径**的 `usage`/`rounds`/`finalText`
+    //   （`erix-agent/src/loop/termination.js:74-91` annotateTermination，
+    //     `src/loop/orchestrator.js:950-1008` fail() 尾端 :995-1000 传入 `readLoopPayload()`，
+    //     `src/loop/orchestrator.js:1513/1527/1733` usage 累加器与读取器）。
+    // usage 形状因此与正常路径的 `result.usage` 同形（`{input_tokens, output_tokens,
+    // 可选 cacheRead/cacheWrite}`，`orchestrator.js:514` typedef），故**原样透传**不挑字段。
+    // 引擎没挂（旧版引擎 / runToolLoop 之前抛错 / 非引擎错误）→ 回退零值，绝不抛错。
+    usage: err?.usage ?? { input_tokens: 0, output_tokens: 0 },
+    rounds: err?.rounds ?? 0,
   };
 }
