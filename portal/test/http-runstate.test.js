@@ -159,7 +159,8 @@ test('runstate 路由：PUT/GET 往返、租约校验、终态后写 409/读放�
 // issue #220：用户 stop 把 runs.status 置 cancelling 后，引擎那次正常的 markRunState('running')
 // 走 U2 必须拿到 2xx ack（否则被引擎渲染成 persistence_failed 的落盘失败）。
 // 口径：200 + {state:"cancelling", idempotent:true}，runs.status 不回 running，且**不校验租约**
-// （停止路径已清空 run_queue.claim_token，断言租约会把它变成 409 lease_lost）。
+// （该 ack 零写入、无可 fence 的对象；若去断言租约，claim_token 已被停止路径清空就会变成 409 lease_lost
+// ——清理时机与本次写入无关，口径见 portal.md §9.6）。
 test('U2 /state：cancelling 期间的 running 写入 → 200 幂等 ack（不依赖租约、不回 running）', async () => {
   const { pool, runId, token } = seedClaimable();
   const s = await startServer(pool);

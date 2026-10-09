@@ -388,7 +388,7 @@ test('#220 setRunState：cancelling + state=running → 幂等 ack（不回 runn
   const startedAt = pool.runs[0].started_at;
   assert.ok(startedAt, '前置：queued→running 已写 started_at');
 
-  // 用户 stop：runs.status → cancelling；收敛路径同时清空租约（真机取证 issue #220）。
+  // 用户 stop：runs.status → cancelling；本用例故意连带清空队列行租约，覆盖「写入晚于租约清理」分支（#220）。
   pool.runs[0].status = 'cancelling';
   pool.runs[0].cancel_requested_at = Date.now();
   Object.assign(pool.queue[0], { status: 'cancelled', claim_token: null, owner_container_id: null, lease_until: null, claimed_at: null });

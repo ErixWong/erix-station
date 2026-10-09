@@ -578,12 +578,12 @@ export async function setRunState(pool, { container, user, runId, claimToken, bo
     // 这里承认「这个 run 确实在跑」，但**不把 runs.status 改回 running**：
     //   §9.6 / A2 的「cancelling 不回 running」与取消意图必须保住（改回 running 会让
     //   reaper / claim / dirs 计数把它当未取消的活跃 run）。
-    // ⚠️ 本分支**禁止 assertClaimToken**：真机取证（issue #220）里这条写入到达时 run_queue 行已
-    //   `status=cancelled, claim_token IS NULL`（停止/收敛路径清租约），断言租约只会把 409
-    //   `invalid_transition` 换成 409 `lease_lost`（agentd 还会因此置 ctx.dropped 直接丢租约），
-    //   等于白修。
-    //   理由：这条 ack **不改任何仓库状态**（无 runs / run_queue / messages / events 写入），
-    //   没有需要 fence 的写——旧 agentd 重放这条请求也只会得到同一个无副作用的 ack。
+    // ⚠️ 本分支**禁止 assertClaimToken**：这条 ack **不改任何仓库状态**（无 runs / run_queue /
+    //   messages / events 写入），没有需要 fence 的写——旧 agentd 重放也只会拿到同一个 ack。
+    //   反而若去断言租约，就把一个无副作用的 ack 绑到了与它无关的租约竞态上：停止/收敛路径会在
+    //   **任意时刻**清空 `run_queue.claim_token`（#220 取证：停止后 0ms 时租约仍在，终态收敛之后
+    //   才为 NULL），写入稍晚一步就只是把 409 `invalid_transition` 换成 409 `lease_lost`（agentd
+    //   还会因此置 ctx.dropped 直接丢租约），等于白修。
     if (run.status === 'cancelling') {
       return { state: 'cancelling', idempotent: true };
     }
