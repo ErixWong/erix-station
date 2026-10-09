@@ -177,10 +177,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const drafts = new Map<string, string>();
 
   // SSE 协议状态 + 事件语义（hooks 接回展示层）。
+  let runStateCheckSeq = 0;
   const es = useEventStream({
     onSep: (text, variant) => entries.value.push({ kind: 'sep', text, variant }),
     onSysErr: (text) => entries.value.push({ kind: 'syserr', text }),
     onToolCardCreated: (callId) => entries.value.push({ kind: 'tool', callId }),
+    onConnected: (id) => { void reconcileActiveRun(id); },
     onCurrentRunEnd: (d) => {
       removeDeltaEntry(); // 旧版 run_end 移除流式增量 DOM（终稿由 refreshSession 回写，防双份）
       notifyRunEnd(d);
@@ -346,6 +348,39 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     deltaEntry = null;
   }
 
+  function applyServerRunState(serverRunId: string | null, previousRunId: string | null): string | null {
+    es.activeRunId.value = serverRunId;
+    if (previousRunId === null || serverRunId !== null) return null;
+    es.deltaText.value = null;
+    removeDeltaEntry();
+    entries.value.push({ kind: 'sep', text: t('stream.event.missedRunEnd') });
+    return previousRunId;
+  }
+
+  async function reconcileActiveRun(id: string): Promise<void> {
+    const reqSeq = ++runStateCheckSeq;
+    const ctx = ctxSeq.value;
+    const sessionReq = sessionReqSeq.value;
+    const previousRunId = es.activeRunId.value;
+    try {
+      const data = await api<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`);
+      if (
+        reqSeq !== runStateCheckSeq
+        || ctx !== ctxSeq.value
+        || sessionReq !== sessionReqSeq.value
+        || sessionId.value !== id
+        || es.esSessionId.value !== id
+        || es.activeRunId.value !== previousRunId
+      ) return;
+      const serverRunId = data.session?.active_run_id;
+      if (serverRunId === undefined || serverRunId === '') return;
+      const endedRunId = applyServerRunState(serverRunId, previousRunId);
+      if (endedRunId) refreshSession(endedRunId);
+    } catch (e) {
+      console.error('Failed to reconcile workbench run state after SSE connection', e);
+    }
+  }
+
   // ---- initWorkspace ----
   async function initWorkspace(user: { role: string; fde_name: string | null }) {
     isPlatformAdmin.value = user.role === 'admin' && !user.fde_name;
@@ -429,6 +464,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   async function openSession(id: string) {
+    const previouslyActiveRunId = sessionId.value === id ? es.activeRunId.value : null;
     const reqSeq = ++sessionReqSeq.value;
     const ctx = ctxSeq.value;
     es.closeEs();
@@ -484,8 +520,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (item.msg) addMessage(item.msg);
       else if (item.ev) es.replayEvent(item.ev);
     }
-    if (data.session.active_run_id) {
-      es.activeRunId.value = data.session.active_run_id;
+    const serverRunId = data.session.active_run_id;
+    if (serverRunId === null || (typeof serverRunId === 'string' && serverRunId !== '')) {
+      applyServerRunState(serverRunId, previouslyActiveRunId);
+    } else if (previouslyActiveRunId !== null) {
+      es.activeRunId.value = previouslyActiveRunId;
     }
     es.connect(id);
   }

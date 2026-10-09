@@ -125,6 +125,8 @@ export interface EventStreamHooks {
   onToolCardCreated: (callId: string) => void;
   /** 当前 run 的 run_end（通知 + 终稿回写在宿主侧做：notifyRunEnd / refreshSession）。 */
   onCurrentRunEnd: (d: RunEndPayload & Record<string, unknown>) => void;
+  /** EventSource 首次连通或自动重连恢复时，供宿主与服务端会话运行态对账。 */
+  onConnected?: (sessionId: string) => void;
   /** issue #88：自动标题刷新（portal run 终态后异步评估、经 session SSE 推送）——宿主原地更新列表项。 */
   onSessionUpdated?: (d: { session_id?: string; title?: string } & Record<string, unknown>) => void;
 }
@@ -162,6 +164,7 @@ export function useEventStream(hooks: EventStreamHooks) {
       // 陈旧连接的事件一律忽略（重连后旧连接可能还有在途帧，防重复渲染/重复推进水位线）。
       conn.addEventListener(type, (e) => { if (es !== conn) return; handleEvent(type, e); });
     }
+    conn.onopen = () => { if (es === conn) hooks.onConnected?.(id); };
     conn.onerror = () => { /* EventSource 自动重连，带 Last-Event-ID */ };
   }
 

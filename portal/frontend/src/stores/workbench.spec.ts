@@ -504,6 +504,30 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(store.entries.some((e) => e.kind === 'sep' && e.text.includes('连接中断期间'))).toBe(false);
   });
 
+  it('issue #217：重开同一会话按 active_run_id 清状态并显示英文中性提示', async () => {
+    setLocale('en');
+    let activeRunId: string | null = 'r1';
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: activeRunId }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.running).toBe(true);
+
+    activeRunId = null;
+    await store.openSession('s1');
+    expect(store.es.activeRunId).toBeNull();
+    expect(store.sendDisabled).toBe(false);
+    expect(store.entries.filter((e) => e.kind === 'sep')).toEqual([
+      { kind: 'sep', text: 'This run ended while the connection was interrupted (see run history)' },
+    ]);
+    expect(store.entries.some((e) => e.kind === 'syserr')).toBe(false);
+  });
+
   it('issue #217：在线收到当前 run_end 仍渲染原终态行，不显示断线提示', async () => {
     mockFetch((url) => {
       if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
