@@ -30,24 +30,25 @@
 //     必须把**其他栈已用的 fde-* 子网**列进来。
 //   PORTAL_PUBLIC_BASE_URL：决定 FDE 容器内 ERIX_STATION_BASE_URL（portal/src/provisioner.js:183）；
 //     .env 里是共享栈值（http://100.100.0.3:8090），不派生 → agentd 会去连**共享栈的 Traefik**；
-//     本栈应为 http://station.localhost:<TRAEFIK_WEB_PORT>（FDE 容器 /etc/hosts 已把 station.localhost
+//     本栈应为 http://station.<BASE_DOMAIN>:<TRAEFIK_WEB_PORT>（FDE 容器 /etc/hosts 已把该主机名
 //     指向本 FDE 网络网关=宿主）。
 //   PORTAL_INTERNAL_HOSTS：决定 internal 路由的 Host 白名单（portal/src/routes.js:170-176）；.env 里是
-//     100.100.0.3，不含 station.localhost → agentd 请求 **404 page not found**（实测）。本栈需含 station.localhost。
-//   （⚠️ 除端口/固定名外，**子网与三个容器名（litellm/docker-proxy/edge）也必须派生**——
+//     100.100.0.3，不含 station.<BASE_DOMAIN> → agentd 请求 **404 page not found**（实测）。
+//   BASE_DOMAIN：隔离栈默认显式注入 localhost，若进程环境提供 BASE_DOMAIN 则使用该值；PORTAL_HOST / LLM_HOST、
+//     public URL 与 internal Host 白名单由同一 helper 派生，避免 `--env-file` 恢复为共享伞域。
+//   （⚠️ 除域名/端口/固定名外，**子网与三个容器名（litellm/docker-proxy/edge）也必须派生**——
 //     否则与共享栈撞 subnet/container_name（compose 缺省 172.32.0.0/24 与 station-* 容器名）。）
 //   （自动派生：**仅在隔离模式**（显式设了 STATION_STACK_ID 或任一入口端口/固定名 env）下，脚本对**未显式设置**的
-//     IPAM_RESERVED_SUBNETS（扫 `docker network ls` 的其他 fde-* 子网，排除本栈 fde-<FDE_NAME>）、
-//     PORTAL_PUBLIC_BASE_URL、PORTAL_INTERNAL_HOSTS 自动补齐 → 上表三条可不手传；
-//     显式设置一律优先，**共享栈缺省零注入**（见 isolationComposeEnv()）。
+//     BASE_DOMAIN/PORTAL_HOST/LLM_HOST/public URL/internal Host 白名单用 domain helper 派生；
+//     IPAM_RESERVED_SUBNETS 扫其他 fde-* 子网补齐；显式进程 env 一律优先，**共享栈缺省零注入**
+//     （见 isolationComposeEnv())。
 //     fde 容器/网络名 = fde-<FDE_NAME>，由 portal provisioner 生成；compose() 已透传进程 env，
 //     COMPOSE_PROJECT_NAME 自动生效。缺省（不带 env）= 18080/4100/8090/8443、station-*、alice。
 //     TRAEFIK_STATIC_HOST 无需手传：脚本每次 up 前自动生成「仅替换入口端口」的临时 traefik.yml
 //     并经 compose env 注入（Traefik v3 带 --configFile 时 CLI 覆盖不生效，必须整体替换配置文件）。）
 //
-// ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab，
-//   本机直连被墙）。脚本构建时显式传三个 proxy build arg 并按需加 `--network=host`，
-//   且以流式输出构建日志（issue #178，口径集中在 lib/fde-image.mjs）。
+//   HTTP_PROXY / HTTPS_PROXY：FDE 镜像从 runner/Dockerfile 下载 gh/tea/glab；本机直连 github.com 不通时，
+//     会卡在该下载层重试约半小时。代理与构建口径见 lib/fde-image.mjs 文件头及 docs/env.md「本机重建 FDE 镜像」。
 // ⚠️ 隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）：脚本**绝不删除共享镜像 tag**
 //   （`erix-station/fde:local`/`erix-station/portal:local`）——曾实测 rmi 掉共享 fde 镜像后，
 //   共享栈 provision FDE 报 `No such image`。重建走 build context 变更自动失效缓存，不靠删镜像。
@@ -62,6 +63,7 @@ import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { DEFAULT_FDE_IMAGE, DEFAULT_PORTAL_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
+import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -70,6 +72,8 @@ const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
 const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
 const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
+const DOMAIN_COMPOSE_ENV = composeDomainEnv(TRAEFIK_WEB_PORT);
+const LLM_PUBLIC_BASE_URL = DOMAIN_COMPOSE_ENV.LLM_PUBLIC_BASE_URL.replace(/\/+$/, '');
 const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
 const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
 const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
@@ -164,7 +168,7 @@ const ISOLATION_SIGNAL_KEYS = [
  */
 function deriveIsolationEnv() {
   if (!ISOLATION_SIGNAL_KEYS.some((k) => process.env[k])) return {};
-  const out = {};
+  const out = { ...DOMAIN_COMPOSE_ENV };
 
   // IPAM_RESERVED_SUBNETS：portal 的 IPAM 池硬编码（portal/src/ipam.js:12-15，10.200.0.0/16），
   // 非 env 可配；隔离栈 DB 为空 → 默认从池头分配 10.200.0.0/29，与共享栈已占段重叠（403 Pool overlaps）。
@@ -181,19 +185,6 @@ function deriveIsolationEnv() {
       return cfg?.[0]?.Subnet || null;
     })).filter(Boolean))];
     if (subnets.length > 0) out.IPAM_RESERVED_SUBNETS = subnets.join(',');
-  }
-
-  // PORTAL_PUBLIC_BASE_URL：决定 FDE 容器内 ERIX_STATION_BASE_URL（portal/src/provisioner.js:183）。
-  // .env 是共享栈值 → 不派生 agentd 会去连共享栈 Traefik；本栈走 station.localhost:<TRAEFIK_WEB_PORT>
-  // （FDE 容器 /etc/hosts 已把 station.localhost 指向本 FDE 网络网关=宿主）。
-  if (!process.env.PORTAL_PUBLIC_BASE_URL) {
-    out.PORTAL_PUBLIC_BASE_URL = `http://station.localhost:${TRAEFIK_WEB_PORT}`;
-  }
-
-  // PORTAL_INTERNAL_HOSTS：internal 路由 Host 白名单（portal/src/routes.js:170-176）。
-  // .env 是 100.100.0.3，不含 station.localhost → agentd 请求 404。本栈需含 station.localhost。
-  if (!process.env.PORTAL_INTERNAL_HOSTS) {
-    out.PORTAL_INTERNAL_HOSTS = 'station.localhost';
   }
 
   return out;
@@ -240,6 +231,7 @@ const S = {
   userspaceRoot: null,
   dynamicRoot: null,
   staticRoot: null,
+  artifactsRoot: null,
   staticFile: null,
   userId: '00000000-0000-0000-0000-000000000001',
   password: 'correct horse battery staple',
@@ -370,28 +362,41 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp3b-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp3b-'));
   S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp3b-'));
+  S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp3b-'));
   S.staticFile = writeTraefikStatic(S.staticRoot);
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
   fs.chmodSync(S.staticRoot, 0o755);
+  fs.chmodSync(S.artifactsRoot, 0o755);
 
   const cleanup = () => {
     safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
     safe(() => docker(`network rm fde-${FDE_NAME} 2>/dev/null || true`));
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, TRAEFIK_STATIC_HOST: S.staticFile }));
+    safe(() => compose('down -v', {
+      ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+      TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+      TRAEFIK_STATIC_HOST: S.staticFile,
+      ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
+    }));
     // issue #178：**不删镜像**。镜像名已 env 派生（FDE_IMAGE/STATION_PORTAL_IMAGE）→ 隔离栈有自己的
     // tag；默认共享 tag 绝不能被 e2e 删除（曾把共享 fde 镜像删掉，共享栈 provision 报 No such image）。
     // compose up -d --build 与 docker build 按 build context 变更自动失效缓存，无需靠删镜像强制重建。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
+    safe(() => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
     removeDbDir();
   };
   t.after(cleanup);
 
   try {
     // 0) 预清理
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, TRAEFIK_STATIC_HOST: S.staticFile }));
+    safe(() => compose('down -v', {
+      ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+      TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+      TRAEFIK_STATIC_HOST: S.staticFile,
+      ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
+    }));
     removeDbDir();
     console.log(`[wp3b] 镜像：FDE=${FDE_IMAGE} PORTAL=${PORTAL_IMAGE}（默认共享 tag 一律不动，issue #178）`);
 
@@ -404,6 +409,7 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
       ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
       TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
       TRAEFIK_STATIC_HOST: S.staticFile,
+      ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
       MIGRATE_ON_START: '1',
       LITELLM_HOST_PORT,
       LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}`,
@@ -433,7 +439,8 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
     const configJsonPath = path.join(S.userspaceRoot, FDE_NAME, 'home', '.erix', 'config.json');
     await waitFor(() => (fs.existsSync(configJsonPath) ? fs.readFileSync(configJsonPath, 'utf8') : null), { label: 'config.json materialized' });
     const configJson = JSON.parse(fs.readFileSync(configJsonPath, 'utf8'));
-    assert.equal(configJson.slots.default.endpoint, `http://llm.localhost:${TRAEFIK_WEB_PORT}/v1`, 'config.json endpoint 指向 llm.<base>（dev http+TRAEFIK_WEB_PORT）');
+    assert.equal(configJson.slots.default.endpoint, `${LLM_PUBLIC_BASE_URL}/v1`,
+      `config.json endpoint 指向派生的 LLM 公共地址（BASE_DOMAIN=${BASE_DOMAIN}）`);
     assert.equal(configJson.slots.default.apiKey, 'erix-placeholder', '占位 key（零真实 LLM 凭据）');
 
     // 4) provision FDE（真实 runner 镜像）
@@ -470,6 +477,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
       adminLogin: `wp3b-admin-${FDE_NAME}`,
       adminPassword: 'wp3b-admin-pass-123',
     });
+    // Binding model selection reaches a running FDE on heartbeat; wait two cycles so the
+    // first run cannot race the pre-binding placeholder model (matching WP5/WP6 coverage).
+    await sleep(2 * 15_000 + 5_000);
 
     // 5) agentd 连上 SSE 收 ping（§4.3）+ 首次心跳（containers.last_heartbeat）
     await waitFor(() => (agentdLogs().includes('sse ping received') ? true : null), { label: 'agentd SSE ping received', timeoutMs: 60000 });
@@ -490,7 +500,8 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
       return (st === 'finished' || st === 'failed') ? st : null;
     }, { label: 'run 1 terminal', timeoutMs: 120000 });
 
-    assert.equal(psql(`SELECT status FROM runs WHERE id='${run1}'`), 'finished', 'run 1 finished');
+    assert.equal(psql(`SELECT status FROM runs WHERE id='${run1}'`), 'finished',
+      `run 1 finished: ${psql(`SELECT termination::text FROM runs WHERE id='${run1}'`)}`);
     assert.equal(psql(`SELECT attempts FROM run_queue WHERE run_id='${run1}'`), '1', 'run 1 attempts=1');
 
     // 事件 seq 无空洞（session 内 messages 锚点行 + run_events 共享 last_seq 原子分配器；
