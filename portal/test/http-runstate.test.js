@@ -155,3 +155,48 @@ test('runstate 路由：PUT/GET 往返、租约校验、终态后写 409/读放�
     fs.rmSync(s.staticDir, { recursive: true, force: true });
   }
 });
+
+// issue #220：用户 stop 把 runs.status 置 cancelling 后，引擎那次正常的 markRunState('running')
+// 走 U2 必须拿到 2xx ack（否则被引擎渲染成 persistence_failed 的落盘失败）。
+// 口径：200 + {state:"cancelling", idempotent:true}，runs.status 不回 running，且**不校验租约**
+// （停止路径已清空 run_queue.claim_token，断言租约会把它变成 409 lease_lost）。
+test('U2 /state：cancelling 期间的 running 写入 → 200 幂等 ack（不依赖租约、不回 running）', async () => {
+  const { pool, runId, token } = seedClaimable();
+  const s = await startServer(pool);
+  try {
+    const auth = { Authorization: `Bearer ${token}` };
+    const claim = await fetch(`${s.base}/api/internal/claim`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ capacity: 1, hold_ms: 10 }),
+    });
+    assert.equal(claim.status, 200);
+    const ticket = await claim.json();
+
+    // 正常落一次 running（拿 started_at 基线），再模拟停止 + 租约清空。
+    const headers = { ...auth, 'X-Claim-Token': ticket.claim_token, 'Content-Type': 'application/json' };
+    assert.equal((await fetch(`${s.base}/api/internal/runs/${runId}/state`, {
+      method: 'PUT', headers, body: JSON.stringify({ state: 'running' }),
+    })).status, 200);
+    const startedAt = pool.runs[0].started_at;
+    pool.runs[0].status = 'cancelling';
+    pool.runs[0].cancel_requested_at = Date.now();
+    Object.assign(pool.queue[0], { status: 'cancelled', claim_token: null, lease_until: null, claimed_at: null, owner_container_id: null });
+
+    const ack = await fetch(`${s.base}/api/internal/runs/${runId}/state`, {
+      method: 'PUT',
+      // 故意带已被清空的旧 claim_token：证明这条 ack 不靠租约成立。
+      headers,
+      body: JSON.stringify({ state: 'running' }),
+    });
+    assert.equal(ack.status, 200, `cancelling + running 必须 2xx，得 ${ack.status}: ${JSON.stringify(await ack.clone().json().catch(() => null))}`);
+    assert.deepEqual(await ack.json(), { state: 'cancelling', idempotent: true });
+    assert.equal(pool.runs[0].status, 'cancelling', 'runs.status 不得被改回 running');
+    assert.equal(pool.runs[0].started_at, startedAt, 'started_at 不得再次前移');
+    assert.equal(pool.queue[0].status, 'cancelled');
+    assert.equal(pool.queue[0].claim_token, null, 'ack 不得回填租约');
+  } finally {
+    await s.close();
+    fs.rmSync(s.staticDir, { recursive: true, force: true });
+  }
+});
