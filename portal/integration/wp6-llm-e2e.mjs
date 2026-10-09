@@ -242,6 +242,8 @@ async function login(loginName, secret, password = S.password) {
   });
   assert.equal(step1.status, 200, `login step1 (${loginName})`);
   const { pending_token: pendingToken } = await step1.json();
+  // 两步登录取证：已绑 TOTP 的账号 step1 必须回 pending_token（而非直接发 cookie）。
+  console.log(`[wp6] login step1 ${loginName}: status=${step1.status} pending_token=${pendingToken ? 'present' : 'absent'}`);
   const step2 = await fetch(`${PORTAL}/api/auth/login/totp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -250,6 +252,7 @@ async function login(loginName, secret, password = S.password) {
   assert.equal(step2.status, 200, `login step2 (${loginName})`);
   const cookie = readCookie(step2.headers.get('set-cookie'));
   assert.ok(cookie, `session cookie (${loginName})`);
+  console.log(`[wp6] login step2 ${loginName}: status=${step2.status} totp accepted, session cookie issued`);
   return cookie;
 }
 
@@ -291,6 +294,9 @@ async function createFdeUser(loginName) {
       email: `${loginName}@station.invalid`,
       fde_name: FDE_NAMES[loginName],
       git_host_id: S.gitHostId,
+      // 管理台建号的 TOTP 是 opt-in（见 docs/api/portal.md §12 `POST /api/admin/users`）：
+      // 本用例的 login() 走口令 + /api/auth/login/totp 两步，账号必须显式启用 TOTP 才有种子。
+      totp_enabled: true,
       llm: {
         provider_id: S.onboardingLlm.providerId,
         main_model_id: S.onboardingLlm.modelId,
@@ -298,7 +304,7 @@ async function createFdeUser(loginName) {
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
-  assert.ok(response.body.totp_secret, 'totp_secret is returned once');
+  assert.ok(response.body.totp_secret, 'opt-in TOTP：totp_enabled=true 时种子只在下发一次的创建响应里出现');
   assert.deepEqual(response.body.onboarding, {
     state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
   });
