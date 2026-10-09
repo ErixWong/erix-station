@@ -17,6 +17,7 @@
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
 import { PERSISTENCE_TERMINATION_REASON, RUN_FAIL_REASONS } from '../lib/terminationReasons';
+import { getToolResultSummary } from '../lib/toolSummary';
 
 // 用户可见状态行/错误行文案（issue #101 P2）：非组件上下文（composable 无 setup 实例）→ i18n.global.t。
 // 取词即快照：状态行在事件到达时生成，切语言后旧行不回溯翻译（可接受）。
@@ -66,6 +67,8 @@ export interface ToolCardState {
   // issue #188：DTO 投影来源的卡片字段（加载/刷新路径）——直接透传上游 `toolCalls[]` 同名键，
   // 事件流路径不填。argsSummary = 上游 120 字参数摘要；resultPreview = 上游 400 字结果预览；
   // executionStatus = 上游执行状态串。全文在 DTO `blocks` 里（不在卡片展开区重建）。
+  // issue #228：存进来的一律是 `getToolResultSummary` 归一后的**字符串**（上游三套返回形态在
+  // 入口就收敛掉，number 0 也不会被 `!!part` 判空吞掉）。
   argsSummary?: string;
   resultPreview?: string;
   executionStatus?: string;
@@ -198,22 +201,27 @@ export function useEventStream(hooks: EventStreamHooks) {
   function projectToolCard(callId: string, fields: {
     name: string;
     argsSummary?: string;
-    resultPreview?: string;
+    // issue #228：上游 DTO 理论上给 string，但工具结果本体有三套形态（string / {content, metadata} /
+    // number），这里按 `unknown` 收并在入口归一，不把「上游保证给字符串」当成依赖。
+    resultPreview?: unknown;
     isError?: boolean;
     executionStatus?: string;
   }): void {
+    // 有预览字段 = 归一后仍不为 undefined；归一后的文本另存（number/null 到卡片里就是合法展示串）。
+    const hasPreview = fields.resultPreview !== undefined;
+    const resultPreview = hasPreview ? getToolResultSummary(fields.resultPreview) : undefined;
     const existing = toolCards.get(callId);
     if (existing) {
       // 事件流先建：只补投影才有的摘要/预览/状态，不覆盖实时路径已有的完整数据。
       if (fields.argsSummary !== undefined && existing.argsSummary === undefined) existing.argsSummary = fields.argsSummary;
-      if (fields.resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = fields.resultPreview;
+      if (resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = resultPreview;
       if (fields.executionStatus !== undefined && existing.executionStatus === undefined) existing.executionStatus = fields.executionStatus;
-      if (existing.ok === null && (fields.isError !== undefined || fields.resultPreview !== undefined || fields.executionStatus !== undefined)) {
+      if (existing.ok === null && (fields.isError !== undefined || hasPreview || fields.executionStatus !== undefined)) {
         existing.ok = fields.isError !== true;
       }
       return;
     }
-    const hasResult = fields.isError !== undefined || fields.resultPreview !== undefined || fields.executionStatus !== undefined;
+    const hasResult = fields.isError !== undefined || hasPreview || fields.executionStatus !== undefined;
     toolCards.set(callId, {
       name: fields.name,
       dig: fields.argsSummary ?? '',
@@ -221,7 +229,7 @@ export function useEventStream(hooks: EventStreamHooks) {
       ok: hasResult ? fields.isError !== true : null,
       out: '',
       argsSummary: fields.argsSummary,
-      resultPreview: fields.resultPreview,
+      resultPreview,
       executionStatus: fields.executionStatus,
     });
     hooks.onToolCardCreated(callId);
@@ -292,9 +300,12 @@ export function useEventStream(hooks: EventStreamHooks) {
         if (card) {
           card.ok = !!d.ok;
           card.dur = d.duration_ms ?? 0;
+          // issue #228：result_digest 的理论形状是字符串，但工具结果有三套形态（string /
+          // {content, metadata} / number）——入口归一后「writeFile 写了 0 字节」也能正常展示，
+          // `{content, metadata}` 则只展示 content（截断/跳过信息就在 content 的 marker 文本里）。
           card.out = t('stream.event.toolResult', {
             mark: d.ok ? '✓' : '✗',
-            digest: d.result_digest ?? '',
+            digest: getToolResultSummary(d.result_digest),
             ms: d.duration_ms ?? 0,
           });
         }

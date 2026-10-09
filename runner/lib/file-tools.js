@@ -1,20 +1,17 @@
-// station 自带 file 工具 + jail 路径边界（erix-agent 0.6.0 起库不再提供沙箱，ADR-009：
-// 「库不提供沙箱，牢笼由宿主提供」——不变式 1「容器是信任边界」的落地）。
-// 本文件移植自 erix-agent 0.3.5 的 src/tools/jail.js + src/tools/file-tools.js（上游 #101 删除），
-// 工具 schema/executor 结构与旧 createFileTools 返回的 {executors, schemas} 完全对齐。
-// 语义不变式：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内可写；越界路径抛 JailError。
+// station 文件工具层 = jail 路径边界 + 上游文件工具的薄装配。
+//
+// jail（本文件前半）：erix-agent 0.6.0 起库不再提供沙箱（ADR-009：「库不提供沙箱，牢笼由宿主
+// 提供」——不变式 1「容器是信任边界」的落地）；移植自 erix-agent 0.3.5 的 src/tools/jail.js（上游
+// #101 删除），**行为与导出逐字保留**：worker 无平台凭据、cwd（项目目录，D8 修订 2026-09-24 起）内
+// 可写；越界/遮蔽/非可写路径抛 JailError。
+//
+// 文件工具（本文件后半，issue #228）：曾经的 0.3.5 fork executor（readFile/rg/tree/writeFile）已于
+// issue #228 退役，改为装配上游 erix-agent 0.18.0 的 `createFileTools`（`createStationFileTools`）。
+// jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 AGENTS.md §8.9 与 docs/design/runner-integration.md。
 import fs from 'node:fs';
 import path from 'node:path';
-import { throwIfAborted, yieldToEventLoop } from './abort.js';
-
-const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_TREE_ENTRIES = 500;
-// issue #211：rg / tree 是纯同步遍历——同步跑起来时 event loop 转不动，agentd 下行的
-// MSG.ABORT 处理器根本执行不了，光检查 signal.aborted 是「永远为 false」的空检查。
-// 所以每 N 次目录/文件操作让出一次事件循环（setImmediate）+ 查一次中止，把「不可中断的
-// 整趟遍历」切成「最多 N 个条目不可中断」的有限块（单文件读本身仍不可抢，上限 1MiB）。
-// 32 = 取响应性与开销的折中；无 signal 时完全不插入让出，非中止路径行为与开销零变化。
-const ABORT_CHECKPOINT_EVERY = 32;
+import { createFileTools as createUpstreamFileTools } from 'erix-agent/tools';
+import { throwIfAborted } from './abort.js';
 
 function isWithin(root, target) {
   const relative = path.relative(root, target);
@@ -92,255 +89,197 @@ export function createJail({ root, writable = [], maskedPaths = [] }) {
   return { root: rootPath, resolve, resolveForWrite, assertReadable };
 }
 
-function normalizeNonNegativeInteger(value, fallback) {
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(0, Math.floor(value));
+// ---------------------------------------------------------------------------
+// issue #228：上游 erix-agent 文件工具的薄装配（station 侧唯一的文件工具实现方向）
+//
+// 为什么要装配而不是继续在 fork 上演进（工单 D3 §1）：0.18.0 已把 fork 的两个已知缺陷面在上游
+// 实现好——readFile 有界读（默认 max_bytes=262144 + 流式行窗口，82.9MB 取第 100 万行 349ms）与
+// 搜索的无效正则返回错误文本（fork 的 `new RegExp(...)` 会抛）；遍历类工具还带真中断（每 32 项
+// 让出 + 查中止）。fork 侧不再演进，只保留 jail。
+//
+// 三条不可让的接线（工单 D3 §2/§3）：
+//   1. **谓词相与，不是替换**：上游 allowRead/allowWrite 收到的必须是「调用方谓词 ∧ jail 谓词
+//      ∧ ¬遮蔽」，替换会让宿主注入的谓词静默失效（上游契约有用例钉这条）。
+//   2. **maskedPaths 继续生效**：密钥文件遮蔽是 station 的安全能力，上游契约不覆盖它，必须自己
+//      钉测试（runner/test/file-tools-contract.test.js）。遮蔽口径与 createJail.assertReadable
+//      逐字对齐：只挡读，不挡写。
+//   3. **工具面白名单**：station 只暴露 5 个（readFile/searchText/tree/edit/writeFile），不吃上游
+//      两个弃用别名 rg/grep（§3.1）；白名单只列名字，工具清单本身仍取自上游 definitions，不复制。
+//
+// 语义与原 fork 的两处刻意偏离（交付报告的「语义变更清单」同步登记）：
+//   * 越界/非可写/遮蔽路径不再抛 JailError，而是上游统一的「错误：…被宿主边界拒绝：…」文本结果
+//     （jail 仍在内部抛，只是被谓词转成布尔；引擎把文本结果喂回模型，比抛异常更可恢复）；
+//   * 遍历内的中止从「每 32 项让出 + 查中止」换成上游同口径 checkpoint（erix-agent 源码里
+//     ABORT_CHECKPOINT_EVERY = 32），`lib/abort.js` 继续给自己与 shell 工具用；
+//   * **`tree` 根标签在装配层收口成 `./`**（issue #64 语义保住，见下文 `TREE_ROOT_LABEL` 注记）：
+//     上游只对 `path === "."` 给 `"./"`，`''` / `'./'` / 缺省会给出**工作目录 basename**，真机上模型
+//     拷这个输出再查一次就 ENOENT（#228 真机验收踩到，浪费一轮）。上游侧已提单（erix-agent #215），上游修好后
+//     这条收口可以撤。
+// ---------------------------------------------------------------------------
+
+/** station 注册面暴露的文件工具名（工单 D3 §3.1：不含弃用别名 rg / grep）。 */
+export const STATION_FILE_TOOL_NAMES = Object.freeze([
+  'readFile', 'searchText', 'tree', 'edit', 'writeFile',
+]);
+
+/** 结构化调用形态（引擎 run-snapshot-executor 传 {id,name,input,context,signal}）。 */
+function isStructuredCall(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.name === 'string';
 }
 
-function splitLines(text) {
-  if (text === '') return [];
-  const lines = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  return lines;
+// ---------------------------------------------------------------------------
+// `tree` 根标签收口（issue #64 语义保住；#228 真机验收后的修复）
+//
+// 上游 `createFileTools` 的 tree 里 `path` 只用在三处：解析目标、根标签（
+// `rootLabel = treePath === "." ? "." : path.basename(…)`）、以及拼出首行——**条目、截断
+// marker、排除账一律不引用 `path`**。所以把「根写法」的入参换成 `"."` 只会影响根标签一处，
+// 条目与 marker 逐字节不变（也不需要本站重算目录树）。
+//
+// 真机证据（#228，共享 dev 栈 / fde-eric）：模型 `tree {path:"./"}` 拿到首行 `hello-station/`，
+// 照着再调 `tree {path:"hello-station/"}` → `ENOENT …/hello-station/hello-station`、ok:false，
+// 真的失败一次并浪费一轮——不是「上游语义、我不动」能交差的量级。
+//
+// 两道措施：
+//   1. 入口：根写法（`''` / `'.'` / `'./'` 及尾斜杠变体 / 缺省 / null）归一成 `path: "."`，
+//      让上游走它自己的 `"."` 分支直接输出 `./`（顺带挡掉 `path: null` 会被 `path.resolve`
+//      抛 TypeError 这个隐性坑）；
+//   2. 出口：结果首行如果仍是工作目录 basename（`hello-station` 或 `hello-station/`）就换成 `./`。
+//      这一道同时接管「绝对根路径 / `sub/..` 这类解析后就是根的写法」，并在上游改了 `"."` 分支时兜住。
+// 两者都只动首行根标签；不认的写法（真实子目录名、子树里的文件）一字不动，不过度归一。
+/** `tree` 根标签的归一目标（与上游 `path === "."` 分支的输出逐字一致）。 */
+const TREE_ROOT_LABEL = './';
+
+/** 「根写法」的入参：缺省 / null / `''` / `'.'` / `'./'`（含 `.//`、`./.`、`././` 等尾斜杠变体）。 */
+function isRootFormPath(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (trimmed === '') return true;
+  if (!trimmed.startsWith('.')) return false;   // 真实子目录名（`sub` / `sub/`）与绝对路径一律不算
+  return trimmed.startsWith('./') || trimmed === '.';
 }
 
-function isMasked(error) {
-  return error?.code === 'path_masked';
-}
-
-function readablePath(jail, value) {
+/** 解析后就是根的其他写法（绝对根路径、`sub/..`）：也归一根标签，但不改上游入参。 */
+function resolvesToRoot(root, value) {
+  if (typeof value !== 'string' || value.trim() === '') return false;
   try {
-    jail.assertReadable(value);
-  } catch (error) {
-    if (isMasked(error)) return null;
-    throw error;
+    return path.resolve(root, value) === root;
+  } catch {
+    return false;
   }
-  return jail.resolve(value);
 }
 
-function normalizeSchema(schema) {
-  const result = { ...schema };
-  if (result.inputSchema === undefined && result.input_schema !== undefined) {
-    result.inputSchema = result.input_schema;
-    delete result.input_schema;
-  }
-  return result;
+/** 遮蔽前缀表：相对路径按 root 解析，能 realpath 就 realpath（防用 symlink 绕过遮蔽）。 */
+function maskedPrefixes(root, maskedPaths) {
+  return (Array.isArray(maskedPaths) ? maskedPaths : [])
+    .filter((entry) => typeof entry === 'string' && entry.length > 0)
+    .map((entry) => {
+      const lexical = path.resolve(root, entry);
+      try {
+        return fs.realpathSync(lexical);
+      } catch {
+        return lexical;
+      }
+    });
 }
-
-const schemas = [
-  {
-    name: 'readFile',
-    description: 'Read a text file by line range.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        offset: { type: 'integer' },
-        limit: { type: 'integer' },
-      },
-      required: ['path'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'rg',
-    description: 'Recursively search text files with a regular expression.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string' },
-        path: { type: 'string' },
-        maxResults: { type: 'integer' },
-      },
-      required: ['pattern'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'tree',
-    description: 'List a directory tree.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        depth: { type: 'integer' },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'writeFile',
-    description: 'Write UTF-8 text inside a writable jail subtree.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        content: { type: 'string' },
-      },
-      required: ['path', 'content'],
-      additionalProperties: false,
-    },
-  },
-].map(normalizeSchema);
 
 /**
- * 创建受 jail 约束的文件系统工具（0.3.5 createFileTools 同名同语义移植）。
- * @param {{resolve:Function, resolveForWrite:Function, assertReadable:Function}} jail
- * @returns {{schemas:object[], executors:Record<string, Function>}}
+ * 装配上游 `erix-agent/tools` 的 createFileTools，边界走本站 jail（issue #228）。
+ *
+ * @param {object} [options]
+ * @param {{root:string, assertReadable:Function, resolveForWrite:Function}} [options.jail]
+ *   宿主边界（createJail 的返回值）。jail.root 是 realpath 过的根，未显式传 cwd 时用它做上游的解析根。
+ * @param {string} [options.cwd] 上游相对路径解析根；缺省依次取 jail.root / process.cwd()
+ * @param {string[]} [options.maskedPaths] 密钥遮蔽前缀（相对 cwd 或绝对）；只挡读，不挡写
+ * @param {(absolutePath:string)=>boolean} [options.allowRead] 调用方读谓词（绝对路径），与 jail 谓词**相与**
+ * @param {(absolutePath:string)=>boolean} [options.allowWrite] 调用方写谓词（绝对路径），与 jail 谓词**相与**
+ * @returns {{
+ *   definitions: object[],   // 上游全量 definitions（含 rg/grep 别名）——executeTool 能执行的全集
+ *   schemas: object[],       // station 注册面（STATION_FILE_TOOL_NAMES 白名单过滤后的 5 个）
+ *   executors: Record<string, Function>, // 与 schemas 同集的 name→executor 映射，直接喂 createToolRegistry
+ *   executeTool: Function,   // (name,input,context) 与 {name,input,context,signal} 两种形态
+ *   exposedToolNames: readonly string[],
+ * }}
  */
-export function createFileTools(jail) {
-  // issue #211：四个 executor 都接第二参 context（引擎经 registry.js:143 executor(input, context)
-  // 原样下传，run 的 abort signal 由 worker.js executeTool 包装注入 context.signal）。
-  // 语义分级（代价已写进 issue 报告）：
-  //   - rg / tree：可真中断——遍历内每 ABORT_CHECKPOINT_EVERY 次操作让出 + 检查，抛 AbortError。
-  //   - readFile / writeFile：单次同步 syscall，syscall 本身不可抢，只能在入口检查（已中止则
-  //     不开工）；在途那次读/写跑完才可能观察到中止（单文件 ≤ MAX_FILE_BYTES，毫秒量级）。
-  // 不传 context / 未中止时，四个工具行为与修前逐字一致。
-  async function readFile({ path: filePath, offset = 0, limit = 200 }, context = {}) {
-    throwIfAborted(context?.signal);
-    jail.assertReadable(filePath);
-    const resolvedPath = jail.resolve(filePath);
-    const text = fs.readFileSync(resolvedPath, 'utf8');
-    const lines = splitLines(text);
-    const start = normalizeNonNegativeInteger(offset, 0);
-    const count = normalizeNonNegativeInteger(limit, 200);
-    const selected = lines
-      .slice(start, start + count)
-      .map((line, index) => `${start + index + 1}: ${line}`);
+export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead, allowWrite } = {}) {
+  const root = path.resolve(cwd ?? jail?.root ?? process.cwd());
+  const hostAllowRead = typeof allowRead === 'function' ? allowRead : () => true;
+  const hostAllowWrite = typeof allowWrite === 'function' ? allowWrite : () => true;
+  const maskedRoots = maskedPrefixes(root, maskedPaths);
 
-    if (start + count < lines.length) {
-      selected.push(`[共 ${lines.length} 行，offset=${start + count} 继续]`);
+  const withinMasked = (target) => maskedRoots.some((maskedRoot) => isWithin(maskedRoot, target));
+  // jail 的越界/非可写/遮蔽都是 JailError → 谓词返回 false（上游据此回「错误：…被宿主边界拒绝」文本，
+  // 不再像 fork 那样抛）。非 JailError（例如 realpath 撞 EACCES）照旧上抛，不静默吞。
+  const jailAllows = (resolver, target) => {
+    if (typeof resolver !== 'function') return true;
+    try {
+      resolver(target);
+      return true;
+    } catch (error) {
+      if (error instanceof JailError) return false;
+      throw error;
     }
-    return selected.join('\n');
+  };
+
+  const canRead = (target) => Boolean(hostAllowRead(target))
+    && !withinMasked(target)
+    && jailAllows(jail?.assertReadable, target);
+  const canWrite = (target) => Boolean(hostAllowWrite(target))
+    && jailAllows(jail?.resolveForWrite, target);
+
+  const upstream = createUpstreamFileTools({ cwd: root, allowRead: canRead, allowWrite: canWrite });
+
+  const upstreamByName = new Map(upstream.definitions.map((definition) => [definition.name, definition]));
+  const missing = STATION_FILE_TOOL_NAMES.filter((name) => !upstreamByName.has(name));
+  if (missing.length > 0) {
+    // 上游把白名单里的工具改名/删掉时，宁可在装配期炸掉，也不要静默少暴露一个工具跑半天才发现。
+    throw new Error(`上游 erix-agent definitions 缺少 station 需要暴露的工具：${missing.join(', ')}`);
   }
 
-  async function rg({ pattern, path: searchPath = '.', maxResults = 50 }, context = {}) {
-    const signal = context?.signal;
+  const executeTool = async (firstArg, input, context) => {
+    // issue #211 的「已中止就别开工」在上游只覆盖遍历类工具（tree / searchText 走 checkpoint）；
+    // readFile / writeFile / edit 是单次同步 syscall、上游不看 signal。装配层在入口统一补一次检查，
+    // 保住 station 既有保证。遍历内的**真中断**（同步跑起来时 MSG.ABORT 处理器才有机会执行）由上游
+    // checkpoint 负责：每 32 项让出事件循环 + 查中止，比 fork 的入口检查更强。
+    const structured = isStructuredCall(firstArg);
+    const signal = structured
+      ? (firstArg.signal ?? firstArg.context?.signal)
+      : context?.signal;
     throwIfAborted(signal);
-    // 无 signal = 不插让出点（保持旧同步行为与吞吐）。
-    const interruptible = signal != null;
-    let checkpointOps = 0;
-    const checkpoint = async () => {
-      if (!interruptible) return;
-      checkpointOps += 1;
-      if (checkpointOps % ABORT_CHECKPOINT_EVERY !== 0) return;
-      await yieldToEventLoop();
-      throwIfAborted(signal);
-    };
-    const expression = new RegExp(String(pattern));
-    const resultLimit = normalizeNonNegativeInteger(maxResults, 50);
-    const resolvedSearchPath = readablePath(jail, searchPath);
-    if (resolvedSearchPath === null) return '';
-    const displayBase = jail.resolve('.');
-    const results = [];
-    const visitedDirectories = new Set();
 
-    const displayName = (filePath) => {
-      const relative = path.relative(displayBase, filePath);
-      return (relative || path.basename(filePath)).split(path.sep).join('/');
-    };
-
-    const searchFile = (filePath, stat) => {
-      if (results.length >= resultLimit || stat.size > MAX_FILE_BYTES) return;
-      const bytes = fs.readFileSync(filePath);
-      if (bytes.includes(0)) return;
-      const lines = splitLines(bytes.toString('utf8'));
-      for (let index = 0; index < lines.length; index += 1) {
-        if (!expression.test(lines[index])) continue;
-        results.push(`${displayName(filePath)}:${index + 1}:${lines[index]}`);
-        if (results.length >= resultLimit) return;
-      }
-    };
-
-    const visit = async (lexicalPath) => {
-      if (results.length >= resultLimit) return;
-      await checkpoint();
-      const currentPath = readablePath(jail, lexicalPath);
-      if (currentPath === null) return;
-      const stat = fs.statSync(currentPath);
-      if (stat.isFile()) {
-        searchFile(currentPath, stat);
-        return;
-      }
-      if (!stat.isDirectory() || visitedDirectories.has(currentPath)) return;
-      visitedDirectories.add(currentPath);
-
-      const entries = fs.readdirSync(currentPath, { withFileTypes: true })
-        .sort((left, right) => left.name.localeCompare(right.name));
-      for (const entry of entries) {
-        if (results.length >= resultLimit) return;
-        await visit(path.join(currentPath, entry.name));
-      }
-    };
-
-    await visit(resolvedSearchPath);
-    return results.join('\n');
-  }
-
-  async function tree({ path: treePath = '.', depth = 3 }, context = {}) {
-    const signal = context?.signal;
-    throwIfAborted(signal);
-    const interruptible = signal != null;
-    let checkpointOps = 0;
-    const checkpoint = async () => {
-      if (!interruptible) return;
-      checkpointOps += 1;
-      if (checkpointOps % ABORT_CHECKPOINT_EVERY !== 0) return;
-      await yieldToEventLoop();
-      throwIfAborted(signal);
-    };
-    const resolvedTreePath = readablePath(jail, treePath);
-    if (resolvedTreePath === null) return '';
-    const maxDepth = normalizeNonNegativeInteger(depth, 3);
-    const rootStat = fs.statSync(resolvedTreePath);
-    // 根标签固定 './'：''/'./' 此前会显示 worktree 的 basename，被模型误读为同名子目录 → ENOENT 循环（issue #64 排查发现）
-    const rootLabel = resolvedTreePath === jail.root ? './' : path.basename(resolvedTreePath);
-    const lines = [rootStat.isDirectory() && !rootLabel.endsWith('/') ? rootLabel + '/' : rootLabel];
-    const visitedDirectories = new Set();
-    let entries = 1;
-
-    const visit = async (currentPath, currentDepth) => {
-      if (entries >= MAX_TREE_ENTRIES || currentDepth >= maxDepth) return;
-      await checkpoint();
-      if (!fs.statSync(currentPath).isDirectory()) return;
-      if (visitedDirectories.has(currentPath)) return;
-      visitedDirectories.add(currentPath);
-
-      const children = fs.readdirSync(currentPath, { withFileTypes: true })
-        .sort((left, right) => left.name.localeCompare(right.name));
-      for (const child of children) {
-        if (entries >= MAX_TREE_ENTRIES) return;
-        await checkpoint(); // 宽目录（单目录上千条目）也要能中断：checkpoint 落在条目循环里，不只落在目录递归上
-        const childPath = path.join(currentPath, child.name);
-        const readable = readablePath(jail, childPath);
-        if (readable === null) continue;
-        const childStat = fs.statSync(readable);
-        lines.push(`${'  '.repeat(currentDepth + 1)}${child.name}${childStat.isDirectory() ? '/' : ''}`);
-        entries += 1;
-        if (childStat.isDirectory()) await visit(readable, currentDepth + 1);
-      }
-    };
-
-    if (rootStat.isDirectory()) {
-      await visit(resolvedTreePath, 0);
+    // tree 根标签收口（issue #64 / #228，详见文件头 TREE_ROOT_LABEL 注记）：只改根标签一处。
+    const isTreeCall = structured ? firstArg.name === 'tree' : firstArg === 'tree';
+    const treePath = structured ? firstArg.input?.path : input?.path;
+    const rootForm = isTreeCall && isRootFormPath(treePath);
+    if (rootForm) {
+      if (structured) firstArg = { ...firstArg, input: { ...(firstArg.input ?? {}), path: '.' } };
+      else input = { ...(input ?? {}), path: '.' };
     }
-    return lines.join('\n');
-  }
+    const treeTargetIsRoot = isTreeCall && (rootForm || resolvesToRoot(root, treePath));
 
-  async function writeFile({ path: filePath, content }, context = {}) {
-    throwIfAborted(context?.signal);
-    if (typeof content !== 'string') {
-      throw new TypeError('writeFile content must be a string');
-    }
-    const target = jail.resolveForWrite(filePath);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    const finalTarget = jail.resolveForWrite(filePath);
-    fs.writeFileSync(finalTarget, content, 'utf8');
-    return Buffer.byteLength(content, 'utf8');
-  }
+    const result = structured
+      ? await upstream.executeTool(firstArg)
+      : await upstream.executeTool(firstArg, input, context);
+    if (!treeTargetIsRoot || typeof result !== 'string' || result === '') return result;
+
+    // 出口兜底：首行仍是工作目录 basename → 换回 `./`；已是 `./` 或认不出的文本（错误结果等）一律不动。
+    const cut = result.indexOf('\n');
+    const firstLine = cut === -1 ? result : result.slice(0, cut);
+    if (firstLine === TREE_ROOT_LABEL) return result;
+    const baseName = path.basename(root);
+    if (firstLine !== baseName && firstLine !== `${baseName}/`) return result;
+    return `${TREE_ROOT_LABEL}${cut === -1 ? '' : result.slice(cut)}`;
+  };
 
   return {
-    schemas: schemas.map((schema) => structuredClone(schema)),
-    executors: { readFile, rg, tree, writeFile },
+    definitions: upstream.definitions,
+    schemas: STATION_FILE_TOOL_NAMES.map((name) => structuredClone(upstreamByName.get(name))),
+    executors: Object.fromEntries(STATION_FILE_TOOL_NAMES.map((name) => [
+      name,
+      async (toolInput, context) => executeTool(name, toolInput, context),
+    ])),
+    executeTool,
+    exposedToolNames: STATION_FILE_TOOL_NAMES,
   };
 }
