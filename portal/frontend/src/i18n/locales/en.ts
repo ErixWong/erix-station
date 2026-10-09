@@ -113,6 +113,7 @@ export const en = {
       forcedFinal: 'forced final (round {round}): {reason}',
       runEnd: 'run ended: {reason}{usage}',
       runEndNormal: 'completed normally',
+      missedRunEnd: 'This run ended while the connection was interrupted (see run history)',
       runFailed: 'run failed: {code} — {message}',
       // issue #212: user-readable labels for the newly surfaced fail reasons (keys are the raw
       // engine reason strings, not camelCase, so they line up 1:1 with EXPLAINED_FAIL_REASONS in
