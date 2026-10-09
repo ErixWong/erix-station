@@ -143,6 +143,7 @@ export const zhCN = {
       forcedFinal: 'forced final（round {round}）：{reason}',
       runEnd: 'run 结束：{reason}{usage}',
       runEndNormal: '正常完成',
+      missedRunEnd: '连接中断期间该 run 已结束（详情见运行记录）',
       runFailed: 'run 失败：{code} — {message}',
       // issue #212：新增失败原因的用户可读标签（双语必须同时补，en.ts 的 `satisfies MessageSchema`
       // 会在漏译时编译报错）。只给新值加标签：既有 failed / aborted / max_rounds_cap 保持原样
