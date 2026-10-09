@@ -131,10 +131,10 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 8. erix-agent 依赖与升级（当前 pin：0.17.0）
+## 8. erix-agent 依赖与升级（当前 pin：0.18.0）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
-- runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6）。升级仍走分支 + PR + §6.1 评审。
+- runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
 
 ### 0.14.0 当前宿主契约
 
@@ -198,6 +198,21 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [x] **`docs/data/schema.sql` 采用方案 A：一个字节未改**（`git diff` 为空）。理由（已写进 `docs/data/model.md` §1.7 口径注）：`portal/src/migrate.js:138` 对**整个 schema.sql 文本（含注释）**算 sha256，`:154-172` 与库中 baseline checksum 不符即 `refusing to start`，且该校验在增量迁移循环（`:185`）**之前**——「加一条迁移去 UPDATE checksum」救不了它。权威 reason 枚举落在 model.md §1.7 与 portal.md §4.1/§5.3，schema.sql 内那段注释（v0.3.5 + 已不存在的 `reflection_stop`）明确降级为「baseline 冻结的历史快照，不作为真值来源」；`deploy/migrations/` 亦未新增。
 - [x] **测试**（合并 #213 后的全量口径）：根 `npm test` **796 项：795 通过 / 1 跳过 / 0 失败**（基线 767 = 本次净增 15（防漂移契约 6 + runner 终态信封 9）+ #211 净增 14）；`cd runner && node --test` **150/150**（基线 127 + #211 14 + 本次 9）；前端 `npm run typecheck` 干净、`npm test` **23 文件 / 317 通过**（基线 22/308，净增 9）。唯一跳过项为基线既有。
 - [ ] **待办（主 agent）**：真机 e2e——造一次快照写失败，确认工作台红色告警且能看到 `phase`（步骤见 issue #212 / 本次交付报告）；以及 reason 全集若随引擎变更，按本节流程重开 issue。
+
+### 8.8 0.18.0 迁移记录（上游 #176 / #180 / #182，2026-10-09）
+
+依据：0.18.0 的 CHANGELOG + 包源码逐项核对（本工单不依赖 host-upgrade-guide 走查项）。对本项目是**终态口径的机械升级 + 三条 additive 红利的定点接入**：`reason` 全集、provider `RETRYABLE_CODES`、`persistence_failed` 字面量与我们的常量/文档**逐项一致**，终态语义零变化。
+
+- [x] **依赖**：根 `package.json` 与 `runner/package.json` 的 `erix-agent` 两处 pin `0.17.0` → **`0.18.0`**（exact 风格不变），**两份 lockfile 同步**（根 + `runner/`，diff 里只出现 `erix-agent` 的 version/resolved/integrity 三行），未动其他依赖或任何其他 lockfile 条目；`npm ci` 后两处 `node_modules/erix-agent/package.json` 均为 `0.18.0`。
+- [x] **tripwire 复核无变化**：`portal/test/termination-contract.test.js` **6/6 全绿**（常量 ↔ 文档枚举表 ↔ runner 运行时镜像 ↔ 包源码四条交叉核对零漂移，**未放宽任何断言**）。常量声明版本 `ENGINE_VERSION_FOR_TERMINATION_REASONS` 随 pin 同步为 `0.18.0`（`terminationReasons.ts` 头注与前端 vitest 断言同步跟上）；reason 集合**内容**零改动（0.18.0 全集没变）。注释里引用的上游行号刷新到 0.18.0 实际位置（typedef `orchestrator.js:511`、`persistence_failed` `:973-977`、`annotateTermination` `src/loop/termination.js:74-91`）。§8.5/§8.6/§8.7 与 #193 成对快路径相关历史注释（含 `portal/test/append-seq-ordering.test.js` 钉住的那条头注）**一个字节未动**。
+- [x] **#180 接入（失败终态不再谎报零用量）**：`fail()` 上抛的错误除 `termination` 外还挂与 `makeResult` **同一对象口径**的 `usage`/`rounds`（`orchestrator.js:950-1008` 尾端 `:995-1000` 交 `readLoopPayload()`，`src/loop/termination.js:74-91` 挂载；累加器 `orchestrator.js:1513/1527/1733`），形状与正常路径的 `result.usage` 同形（`{input_tokens, output_tokens, 可选 cacheRead/cacheWrite}`，typedef `:511`）故**原样透传**。落点：`runner/lib/termination.js` 的 `buildFailureEnvelope` 增返回 `usage: err?.usage ?? {input_tokens:0, output_tokens:0}` 与 `rounds: err?.rounds ?? 0`（引擎没挂 → 回退零值，**不抛错**），`runner/worker.js` catch 消费二者（`final_text: ''` / `title: ''` 不变）。测试口径：`runner/test/termination.test.js` **净增 4 例**（①带真值 ②没挂→回退零值、只挂一半各自回退 ③`aborted` 带真值且保留 termination 里的 `partial` ④含 cache/total 类额外字段时原样保留），并把「worker 调用形状」断言由两字段**收紧**为四字段解构。
+- [x] **#182 收口**：诊断事件 `model_metadata_missing` 加入 `portal/src/http.js` 的 `HISTORY_EVENT_TYPES`（此前 SSE 实时能推到、刷新后历史回放被白名单过滤 = 同一事件两种可见性）。**前端零改动**：`useEventStream.ts` 的事件 `switch` 已有 `default: return;`（`:382`）中性忽略未知类型，不新增 UI 元素、不加 i18n 键。`docs/api/portal.md` §5.x 历史端点白名单枚举同步该类型；测试：`portal/test/session-events-history.test.js` 新增一例（该类型可回放且 payload 原样下发，`run_end` 仍不下发）。
+- [x] **#176 只补文档（零运行时改动）**：`reason === 'failed'` 的终局可带 additive 字段 `termination.errorCode`（引擎把错误上已有的分类码原样透出，无分类码则 `unknown`，**值域由引擎定义**；`src/loop/termination.js:43-57` + `orchestrator.js:981-984` 调用）。我们是「原样透传引擎 termination」，运行时零改动即已下发，故只写文档：`docs/api/portal.md` §4.1 字段表 / §5.2 `run_end` 事件行 / §5.3 注，与 `docs/data/model.md` §1.7 口径注；`docs/design/runner-integration.md` §7.5 第 9 步的 reject 载荷同步为 `{ok:false, termination, error, usage, rounds}`。
+- [x] **`docs/data/schema.sql` 沿用方案 A：一个字节未改**（`git diff` 为空），理由同 §8.7：`portal/src/migrate.js:138` 对整个 schema.sql 文本（含注释）算 sha256 做 baseline 校验且它在增量迁移循环**之前**，改注释即 `refusing to start`。
+- [x] **未采纳**：**#181**（provider `defaultHeaders`/`extraBody`）——理由：station 不包装 fetch，`runner/` 内无自包 fetch / 自定义 header 代码，接了是空操作；0.18.0 的 `searchText` / `edit` 新文件工具、`createFileTools` 与 skills loader 导出——属 issue **#228** 迁移范围，另派单（本次 `runner/lib/file-tools.js` 一字未动）。`judge` 的 `writeToolNames` 默认值 0.18.0 变为 `["writeFile","edit"]`，本站 `runner/worker.js` 只传 `reflection: {enabled: true, roundJudge: true}`、未显式传该字段，**不需动**。
+- [x] **测试口径（M6 全量复跑）**：根 `npm test` **807 项：806 通过 / 0 失败 / 1 跳过**（基点 `06b91c8` 基线 800 项：799 通过 / 1 跳过；净增 7 = 上游契约套件 +2、#180 用例 +4、#182 用例 +1）；`cd runner && node --test` **155 通过 / 0 失败**（基线 150；净增 5 = 上游契约 +1、本次 +4）；`node --test portal/test/termination-contract.test.js` **6/6**；唯一跳过项为基线既有。前端（`portal/frontend/node_modules` 本不存在，按工单以 `NODE_ENV=development npm ci` 装上后跑；**未向仓库引入任何前端 lockfile 变动**，装完 `git status` 仍干净）：`npm run typecheck`（`vue-tsc --noEmit`）**干净无报错**、`npm test`（vitest）**23 文件 / 321 测试全通过**（含 `terminationReasons.spec.ts` 里随 pin 同步为 `0.18.0` 的版本断言）。docker / compose / e2e 未跑（真机 e2e 归主 agent）。
+
+
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
