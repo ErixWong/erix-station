@@ -242,6 +242,8 @@ async function login(loginName, secret, password = S.password) {
   });
   assert.equal(step1.status, 200, `login step1 (${loginName})`);
   const { pending_token: pendingToken } = await step1.json();
+  // 两步登录取证：已绑 TOTP 的账号 step1 必须回 pending_token（而非直接发 cookie）。
+  console.log(`[wp6] login step1 ${loginName}: status=${step1.status} pending_token=${pendingToken ? 'present' : 'absent'}`);
   const step2 = await fetch(`${PORTAL}/api/auth/login/totp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -250,6 +252,7 @@ async function login(loginName, secret, password = S.password) {
   assert.equal(step2.status, 200, `login step2 (${loginName})`);
   const cookie = readCookie(step2.headers.get('set-cookie'));
   assert.ok(cookie, `session cookie (${loginName})`);
+  console.log(`[wp6] login step2 ${loginName}: status=${step2.status} totp accepted, session cookie issued`);
   return cookie;
 }
 
@@ -291,6 +294,9 @@ async function createFdeUser(loginName) {
       email: `${loginName}@station.invalid`,
       fde_name: FDE_NAMES[loginName],
       git_host_id: S.gitHostId,
+      // 管理台建号的 TOTP 是 opt-in（见 docs/api/portal.md §12 `POST /api/admin/users`）：
+      // 本用例的 login() 走口令 + /api/auth/login/totp 两步，账号必须显式启用 TOTP 才有种子。
+      totp_enabled: true,
       llm: {
         provider_id: S.onboardingLlm.providerId,
         main_model_id: S.onboardingLlm.modelId,
@@ -298,7 +304,7 @@ async function createFdeUser(loginName) {
     }),
   });
   assert.equal(response.status, 201, `create user ${loginName}`);
-  assert.ok(response.body.totp_secret, 'totp_secret is returned once');
+  assert.ok(response.body.totp_secret, 'opt-in TOTP：totp_enabled=true 时种子只在下发一次的创建响应里出现');
   assert.deepEqual(response.body.onboarding, {
     state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
   });
@@ -356,6 +362,26 @@ async function sendMessageAndWait(alias, content, timeoutMs = 180000) {
 
 async function waitHeartbeatDownlink(cycles = 2) {
   await sleep(cycles * HEARTBEAT_MS + 5000);
+}
+
+/**
+ * 读某个 run 的助手正文（走**产品读路径** GET /api/sessions/:id）。
+ * P3 PR②b B2（a3e732d）后 `messages` 降级为纯锚点行、`content` 恒为空串，终态正文真相在
+ * `transcript_rounds`、由 `session-view.js` 投影到会话 DTO（产品口径，非测试可改项）；
+ * 所以「助手真的用所选 mock 模型回了话」只能这样断言，查 `messages.content` 已无意义。
+ */
+async function assistantTextOfRun(alias, runId) {
+  const anchor = psql(`SELECT count(*) FROM messages WHERE run_id='${runId}' AND role='assistant' AND synthetic = false`);
+  assert.equal(anchor, '1', `assistant anchor row is written for run ${runId}`);
+  const view = await api(S.users[alias].cookie, `/api/sessions/${S.users[alias].sessionId}`);
+  assert.equal(view.status, 200, `read session view (${alias})`);
+  const message = (view.body.messages ?? []).find(
+    (item) => item.run_id === runId && item.role === 'assistant' && item.synthetic !== true,
+  );
+  assert.ok(message, `session view exposes the assistant message of run ${runId}`);
+  const text = String(message.content ?? '');
+  console.log(`[wp6] assistant text (${alias}) run=${runId}: ${JSON.stringify(text.slice(0, 120))}`);
+  return text;
 }
 
 function requestFromFde(alias, pathname, { method = 'GET', virtualKey, gatewayIp, body } = {}) {
@@ -623,11 +649,8 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     await createSession('alice');
     const run1 = await sendMessageAndWait('alice', 'WP6 allow-listed model should reply normally');
     assert.equal(run1.status, 'finished', 'mock_response produces a finished run');
-    assert.equal(
-      psql(`SELECT count(*) FROM messages WHERE run_id='${run1.runId}' AND role='assistant' AND content LIKE '%E2E-MOCK-OK%'`),
-      '1',
-      'assistant message contains the LiteLLM mock response',
-    );
+    assert.match(await assistantTextOfRun('alice', run1.runId), /E2E-MOCK-OK/,
+      'assistant message contains the LiteLLM mock response');
     const keyIdBefore = psql(
       `SELECT b.key_id FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`,
     );
@@ -643,11 +666,8 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     await waitHeartbeatDownlink(2);
     const run2 = await sendMessageAndWait('alice', 'WP6 updated model should reply normally');
     assert.equal(run2.status, 'finished', 'updated mock model produces a finished run');
-    assert.equal(
-      psql(`SELECT count(*) FROM messages WHERE run_id='${run2.runId}' AND role='assistant' AND content LIKE '%E2E-MOCK-B%'`),
-      '1',
-      'heartbeat downlink selected the updated model',
-    );
+    assert.match(await assistantTextOfRun('alice', run2.runId), /E2E-MOCK-B/,
+      'heartbeat downlink selected the updated model');
     assert.equal(
       psql(`SELECT b.key_id FROM fde_llm_bindings b JOIN users u ON u.id=b.fde_id WHERE u.fde_name='${FDE_NAMES.alice}'`),
       keyIdBefore,
@@ -692,11 +712,8 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     await createSession('bob');
     const firstBobRun = await sendMessageAndWait('bob', 'WP6 onboarding-selected model should reply normally');
     assert.equal(firstBobRun.status, 'finished', 'the onboarding-selected mock model supports the first conversation');
-    assert.equal(
-      psql(`SELECT count(*) FROM messages WHERE run_id='${firstBobRun.runId}' AND role='assistant' AND content LIKE '%E2E-ONBOARDING-OK%'`),
-      '1',
-      'first conversation uses the model selected at account creation',
-    );
+    assert.match(await assistantTextOfRun('bob', firstBobRun.runId), /E2E-ONBOARDING-OK/,
+      'first conversation uses the model selected at account creation');
     assert.equal(docker(`inspect ${fdeContainer('bob')} --format {{.State.Status}}`).trim(), 'running',
       'FDE container remains running after the first conversation');
     assert.ok(readLlmRoutes().includes(`llm-${FDE_NAMES.bob}`), 'onboarding publishes the FDE LLM route');
