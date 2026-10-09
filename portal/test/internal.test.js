@@ -376,6 +376,106 @@ test('setRunState：queued→running 写 started_at；非法转换 409 invalid_t
   );
 });
 
+test('#220 setRunState：cancelling + state=running → 幂等 ack（不回 running、不碰队列行、不前移 started_at）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+
+  // 正常跑起来：queued → running（写 started_at）。
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  const startedAt = pool.runs[0].started_at;
+  assert.ok(startedAt, '前置：queued→running 已写 started_at');
+
+  // 用户 stop：runs.status → cancelling；本用例故意连带清空队列行租约，覆盖「写入晚于租约清理」分支（#220）。
+  pool.runs[0].status = 'cancelling';
+  pool.runs[0].cancel_requested_at = Date.now();
+  Object.assign(pool.queue[0], { status: 'cancelled', claim_token: null, owner_container_id: null, lease_until: null, claimed_at: null });
+  const queueBefore = structuredClone(pool.queue[0]);
+  const eventsBefore = pool.events.length;
+
+  // 停止信号尚未抵达 worker：引擎这次正常的 markRunState('running') 不得 409。
+  const ack = await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  assert.equal(ack.state, 'cancelling', 'ack 不得伪造成 running');
+  assert.equal(ack.idempotent, true);
+  assert.equal(pool.runs[0].status, 'cancelling', '§9.6/A2：cancelling 不得被改回 running');
+  assert.equal(pool.runs[0].started_at, startedAt, 'started_at 不得再次前移');
+  assert.deepEqual(pool.queue[0], queueBefore, 'ack 零写入：run_queue 行未被改动');
+
+  // 重放（响应丢失后引擎重试）同样 2xx、同样零副作用。
+  const replay = await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  assert.deepEqual(replay, { state: 'cancelling', idempotent: true });
+  assert.equal(pool.runs[0].status, 'cancelling');
+  assert.deepEqual(pool.queue[0], queueBefore);
+  assert.equal(pool.events.length, eventsBefore, 'ack 不得合成任何 run_events');
+});
+
+test('#220 cancelling + running 的 ack 不因租约已清空而失败（直接构造 claim_token=NULL）', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+
+  // 不经过 finishRun，直接摆出「runs 已 cancelling + 队列行租约已清（token NULL、lease 仍在）」：
+  // assertClaimToken 会因 claim_token !== 传入 token 报 409 lease_lost，所以旧代码下这里必红。
+  pool.runs[0].status = 'cancelling';
+  pool.runs[0].cancel_requested_at = Date.now();
+  pool.queue[0].claim_token = null;
+  pool.queue[0].lease_until = Date.now() + 90000;
+
+  for (const token of [ticket.claim_token, null, 'forged-token']) {
+    const ack = await setRunState(pool, { container, user, runId, claimToken: token, body: { state: 'running' } });
+    assert.equal(ack.state, 'cancelling', `claimToken=${String(token)}：不得拿 lease_lost/invalid_transition 顶掉 ack`);
+  }
+  assert.equal(pool.runs[0].status, 'cancelling');
+  assert.equal(pool.queue[0].claim_token, null, 'ack 不得回填 claim_token');
+});
+
+test('#220 回归护栏：queued 仍按原语义（租约失效 → 409 lease_lost）、终态后不同载荷仍 409 run_terminal', async () => {
+  const containerOf = (s) => ({ id: s.containerId, user_id: s.userId });
+  const user = { id: 'u1', login: 'alice' };
+
+  // ① queued + 有效租约 → 仍真实转 running（新分支不得漏到 queued）。
+  const a = seedClaimable({ runId: 'run-q1' });
+  const ta = await claimRun(a.pool, { container: containerOf(a), user, capacity: 1, holdMs: 10 });
+  const ok = await setRunState(a.pool, { container: containerOf(a), user, runId: a.runId, claimToken: ta.claim_token, body: { state: 'running' } });
+  assert.deepEqual(ok, { state: 'running' });
+  assert.equal(a.pool.runs[0].status, 'running');
+
+  // ② queued + 租约已清（claim_token NULL）→ 仍 409 lease_lost（不得被新分支兼平）。
+  const b = seedClaimable({ runId: 'run-q2' });
+  const tb = await claimRun(b.pool, { container: containerOf(b), user, capacity: 1, holdMs: 10 });
+  b.pool.queue[0].claim_token = null;
+  await assert.rejects(
+    () => setRunState(b.pool, { container: containerOf(b), user, runId: b.runId, claimToken: tb.claim_token, body: { state: 'running' } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'lease_lost',
+  );
+  assert.equal(b.pool.runs[0].status, 'queued', 'queued 语义不变：未授权写入不得改状态');
+
+  // ③ 终态之后的 running 写入：仍 409 run_terminal（新分支在终态判定之后，不得抢跑）。
+  const c = seedClaimable({ runId: 'run-t1' });
+  const tc = await claimRun(c.pool, { container: containerOf(c), user, capacity: 1, holdMs: 10 });
+  await setRunState(c.pool, { container: containerOf(c), user, runId: c.runId, claimToken: tc.claim_token, body: { state: 'running' } });
+  await setRunState(c.pool, {
+    container: containerOf(c), user, runId: c.runId, claimToken: tc.claim_token,
+    body: { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 2, output_tokens: 1 }, rounds: 1, final_text: 'ok' },
+  });
+  await assert.rejects(
+    () => setRunState(c.pool, { container: containerOf(c), user, runId: c.runId, claimToken: tc.claim_token, body: { state: 'running' } }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'run_terminal',
+  );
+  // 终态后不同载荷重放仍 409 run_terminal（幂等重放护栏不动）。
+  await assert.rejects(
+    () => setRunState(c.pool, {
+      container: containerOf(c), user, runId: c.runId, claimToken: tc.claim_token,
+      body: { state: 'finished', termination: { reason: 'aborted' }, usage: { input_tokens: 9, output_tokens: 9 }, rounds: 7, final_text: 'other' },
+    }),
+    (e) => e instanceof InternalError && e.status === 409 && e.code === 'run_terminal',
+  );
+  assert.equal(c.pool.runs[0].status, 'finished');
+});
+
 test('setRunState：终态收敛（finished）合成 run_end + usage_ledger + assistant 回写', async () => {
   const { pool, userId, containerId, runId } = seedClaimable();
   const container = { id: containerId, user_id: userId };
