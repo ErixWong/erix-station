@@ -403,15 +403,17 @@ async function startRun(msg) {
     // 优先**透传**引擎挂在错误上的完整 termination（reason 可能是 persistence_failed，
     // 并带 operation/phase/sideEffect），引擎没给才回退旧的拍平口径；retryable 改用与
     // 上游对齐的码表（旧代码是手写半截清单）。
+    // erix-agent #180（0.18.0）：usage/rounds 也从信封取引擎挂在错误上的真值，
+    // 「停止」/失败的 run 不再是账面上的 0 token（引擎没挂时回退零值）。
     const aborted = abortController?.signal?.aborted === true;
-    const { termination, error } = buildFailureEnvelope({ err, aborted });
+    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted });
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
       ok: false,
       termination,
-      usage: { input_tokens: 0, output_tokens: 0 },
-      rounds: 0,
+      usage,
+      rounds,
       final_text: '',
       title: '', // 失败路径不生成标题（portal 降级链兜住）
       error,
