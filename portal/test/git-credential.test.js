@@ -15,6 +15,13 @@ import {
 } from '../src/git-credential.js';
 import { FakePool } from './fake-pool.js';
 
+// 宿主侧属主跟随进程身份（同 portal/test/git-cli-config.test.js 顶部注释与
+// runner/test/run-data.test.js:28）：非特权进程 chown 只能落在自己的 euid/所属组上，
+// 硬编码 1000 在 uid≠1000 的 runner 上会 EPERM（GitHub Actions run 38041183692）。
+// 生产 portal 是 root（portal/Dockerfile:37），所以产品代码 (`config.fdeUid ?? 1000`) 不动。
+const SELF_UID = process.getuid?.() ?? 1000;
+const SELF_GID = process.getgid?.() ?? 1000;
+
 const ADMIN = {
   id: 'a0000000-0000-4000-8000-000000000001',
   login: 'admin',
@@ -43,7 +50,7 @@ function fixture(t) {
     root,
     home,
     target: path.join(home, '.git-credentials'),
-    config: { userSpaceRoot: root, fdeUid: 1000, fdeGid: 1000 },
+    config: { userSpaceRoot: root, fdeUid: SELF_UID, fdeGid: SELF_GID },
   };
 }
 
@@ -129,8 +136,8 @@ test('write merges hosts, replaces only the target host, and installs 0640 FDE-o
 
   const stat = fs.statSync(f.target);
   assert.equal(stat.mode & 0o777, 0o640);
-  assert.equal(stat.uid, 1000);
-  assert.equal(stat.gid, 1000);
+  assert.equal(stat.uid, SELF_UID, '落盘属主必须等于 config.fdeUid');
+  assert.equal(stat.gid, SELF_GID, '落盘属组必须等于 config.fdeGid');
   assertNoTokenInDbCalls(pool, 'ghp:secret@A/?#%', 'glpat-gitlab-B-4567', 'ghp-new-token-9876');
   assert.deepEqual(pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log')).map((call) => call.params[1]), [
     'admin.git_credential_set',
@@ -154,8 +161,8 @@ test('delete removes only the selected host and retains an empty 0640 file', asy
   assert.equal(fs.readFileSync(f.target, 'utf8'), '');
   const stat = fs.statSync(f.target);
   assert.equal(stat.mode & 0o777, 0o640);
-  assert.equal(stat.uid, 1000);
-  assert.equal(stat.gid, 1000);
+  assert.equal(stat.uid, SELF_UID, '空凭据文件仍由 config.fdeUid 持有');
+  assert.equal(stat.gid, SELF_GID);
   assertNoTokenInDbCalls(pool, 'ghp-github-secret', 'glpat-gitlab-secret');
 });
 
@@ -401,7 +408,7 @@ test('materializer stale cleanup never removes the out-of-manifest credential fi
   const contents = 'https://x-access-token:secret-token@github.com\n';
   fs.writeFileSync(f.target, contents, { mode: 0o640 });
   const materializer = createMaterializer({
-    root: f.root, uid: 1000, gid: 1000, log: { warn() {} },
+    root: f.root, uid: SELF_UID, gid: SELF_GID, log: { warn() {} },
   });
   await materializer.materialize({
     fdeName: 'alice',
@@ -447,8 +454,8 @@ test('admin HTTP endpoints require admin auth and never echo the submitted token
     kdfQueueTimeoutMs: 1000,
     maxBodyBytes: 64 * 1024,
     userSpaceRoot: f.root,
-    fdeUid: 1000,
-    fdeGid: 1000,
+    fdeUid: SELF_UID,
+    fdeGid: SELF_GID,
   };
   const server = createServer({ pool, config, log: { error() {}, warn() {} } });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -547,8 +554,8 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
     kdfQueueTimeoutMs: 1000,
     maxBodyBytes: 64 * 1024,
     userSpaceRoot: f.root,
-    fdeUid: 1000,
-    fdeGid: 1000,
+    fdeUid: SELF_UID,
+    fdeGid: SELF_GID,
   };
   const server = createServer({ pool, config, log: { error() {}, warn() {} } });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -580,6 +587,9 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   assert.deepEqual(setBody, { host: 'github.com', username: 'alice-token', configured: true });
   assert.ok(!JSON.stringify(setBody).includes(secret));
   assert.equal(fs.statSync(f.target).mode & 0o777, 0o640);
+  // 测试名声称「use login ownership」，此处真的锤一下属主（跟 config.fdeUid，非特权环境下即登录身份）。
+  assert.equal(fs.statSync(f.target).uid, SELF_UID, 'FDE 自助写入的凭据文件必须属于该 FDE 的属主');
+  assert.equal(fs.statSync(f.target).gid, SELF_GID, 'FDE 自助写入的凭据文件必须属于该 FDE 的属组');
   let initialContents = fs.readFileSync(f.target, 'utf8');
   assert.ok(initialContents.startsWith('http://alice-token:'));
   assert.ok(initialContents.includes(secret));
