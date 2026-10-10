@@ -1,0 +1,293 @@
+# ============================================================================
+# release —— tag `v*` → 三镜像推 GHCR + digest 清单（station issue #235）
+# 发布→部署（digest pin 到 deploy/.env）流程见 docs/ops/ci-release.md §2
+#
+# 账号侧：GitHub Free，Actions/Packages 预算 $0 + Stop usage=Yes ⇒ 超额是**停跑不是扣费**；
+#   GHCR 容器镜像的存储与带宽目前官方免费（"currently free"，政策变化提前 ≥1 月通知）⇒ 推 GHCR。
+# 凭据：内置 GITHUB_TOKEN（packages: write），**不新增任何 secret**。
+# ============================================================================
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: # 额度被停 / Release 需要先挂附件时手动补跑
+    inputs:
+      tag:
+        description: '要发布的 tag（必须与 package.json version 一致），例：v0.2.0'
+        type: string
+        required: true
+        default: ''
+
+permissions:
+  # contents 必须 write：步骤 ⑧ 的 `gh release upload` 是 release 资产写入，需要 contents:write；
+  # 只给 read 会在 Release 已存在时 403 ⇒ 三镜像已推成功却被这一步染红（假失败）。
+  contents: write
+  packages: write # 推 ghcr.io
+
+# 同一 tag 不并发跑；发布中的 run **不取消**（半成品镜像比慢一次更糟）
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: 版本校验 + 构建推送三镜像 + digest 清单
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # 镜像名**全小写**硬要求（步骤 ⑦ 里有机器自检）
+      IMG_PORTAL: ghcr.io/erixwong/erix-station-portal
+      IMG_FDE: ghcr.io/erixwong/erix-station-fde
+      IMG_PROXY: ghcr.io/erixwong/erix-station-fde-proxy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # 只用于读版本 / 写清单 JSON；镜像内的 node 由各 Dockerfile 决定
+
+      # ---- ① 版本一致性：去掉 `v` 前缀的 tag 必须等于 package.json 的 version ----
+      # 现状（首跑必拦，属预期）：tag v0.1.1 vs package.json 0.1.0 —— 发布前先 bump，见 ci-release.md §7。
+      - name: '① 版本一致性校验（tag ↔ package.json）'
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = 'workflow_dispatch' ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          if [ -z "$tag" ]; then echo "::error::workflow_dispatch 必须填 tag（例 v0.2.0）"; exit 1; fi
+          case "$tag" in v*) version="${tag#v}" ;; *) echo "::error::tag 必须以 v 开头，实际：$tag"; exit 1 ;; esac
+          # tag 形态门（与 portal/src/config.js:118 的 repoTag 同规则 = docker tag 语法）
+          if ! printf '%s' "$tag" | grep -qE '^v[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; then
+            echo "::error::tag $tag 不是合法 docker tag 形态（^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$）"
+            exit 1
+          fi
+          pkg="$(node -p "require('./package.json').version")"
+          runner_pkg="$(node -p "require('./runner/package.json').version")"
+          fe_pkg="$(node -p "require('./portal/frontend/package.json').version")"
+          echo "当前值 → tag=$tag（version=$version）｜package.json=$pkg｜runner/package.json=$runner_pkg｜portal/frontend/package.json=$fe_pkg"
+          if [ "$version" != "$pkg" ]; then
+            echo "::error::版本不一致：tag=$tag ⇒ 期望 version=$version，但 package.json version=$pkg。发布前先对齐版本号再打 tag（docs/ops/ci-release.md §7）。"
+            exit 1
+          fi
+          if [ "$runner_pkg" != "$pkg" ]; then
+            echo "⚠️ 提示（不阻断）：runner/package.json=$runner_pkg 与 package.json=$pkg 不一致；FDE 镜像与宿主引擎同源，建议一并对齐（ci-release.md §7）"
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- ② GHCR 登录（内置 GITHUB_TOKEN，无新增 secret）----
+      - name: '② 登录 GHCR（GITHUB_TOKEN）'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- ③ buildx 驱动 ----
+      # 必须 docker-container 驱动：默认 `docker` 驱动**直接拒绝** attestation
+      #（本机实测 `--provenance=true` → "Attestation is not supported for the docker driver"），
+      # 在那种驱动下 provenance/sbom 开关形同虚设。见 ci-release.md §3。
+      - name: '③ 启用 buildx（docker-container 驱动）'
+        uses: docker/setup-buildx-action@v3
+
+      # ---- ④⑤⑥ 三镜像：单架构 linux/amd64，双标签 <version> + latest，provenance/sbom 关闭 ----
+      # 关 attestations 的原因：否则推上去的 digest 是「attestation index」的 digest，与部署机
+      # `docker image inspect --format '{{.Id}}'`（config blob digest）对不上；而我们拿
+      # `image@sha256:` / `sha256:<imageId>` 当部署 pin（portal/src/config.js:119-123 的两形态门）
+      # ⇒ 人肉核对永远对不上。清单里两种 digest 都记（digest / imageId）。
+      - name: '④ 构建并推送 portal 镜像（context = 仓库根，dockerfile = portal/Dockerfile）'
+        id: portal
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: portal/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMG_PORTAL }}:${{ steps.version.outputs.version }}
+            ${{ env.IMG_PORTAL }}:latest
+
+      - name: '⑤ 构建并推送 FDE 镜像（context = runner/）'
+        id: fde
+        uses: docker/build-push-action@v6
+        with:
+          context: runner
+          file: runner/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMG_FDE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMG_FDE }}:latest
+
+      - name: '⑥ 构建并推送 fde-proxy 镜像（context = deploy/fde-proxy）'
+        id: proxy
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/fde-proxy
+          file: deploy/fde-proxy/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMG_PROXY }}:${{ steps.version.outputs.version }}
+            ${{ env.IMG_PROXY }}:latest
+
+      # ---- ⑦ digest 清单：images-digest.json + job summary（artifact 只放这个小文件）----
+      - name: '⑦ 生成 digest 清单（images-digest.json + job summary）'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST_PORTAL: ${{ steps.portal.outputs.digest }}
+          DIGEST_FDE: ${{ steps.fde.outputs.digest }}
+          DIGEST_PROXY: ${{ steps.proxy.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for img in "$IMG_PORTAL" "$IMG_FDE" "$IMG_PROXY"; do
+            lower="$(printf '%s' "$img" | tr '[:upper:]' '[:lower:]')"
+            if [ "$img" != "$lower" ]; then echo "::error::镜像名必须全小写，实际：$img"; exit 1; fi
+          done
+          # 脚本 A：从 registry manifest 取 config digest（= 部署机 docker image inspect .Id）。
+          # 本机实测等价性：`docker save` 出的 blobs/sha256/<Id>.json 文件名即 .Id，其内容 sha256 又等于该文件名。
+          cat > "$RUNNER_TEMP/inspect-imageid.mjs" <<'MJS'
+          import { execFileSync } from 'node:child_process';
+          const raw = (ref) =>
+            JSON.parse(execFileSync('docker', ['buildx', 'imagetools', 'inspect', '--raw', ref], { encoding: 'utf8' }));
+          const isAttestation = (k) =>
+            k.annotations && k.annotations['vnd.docker.reference.type'] === 'attestation.manifest'
+              ? true
+              : /(provenance|sbom|attestation)/i.test(k.mediaType || '');
+          function imageIdOf(ref) {
+            const m = raw(ref);
+            // 期望形态：单张 image manifest —— 正是 --provenance=false --sbom=false 的直接结果
+            if (m.config && m.config.digest) {
+              return { imageId: m.config.digest, shape: m.mediaType, attestationChildren: 0 };
+            }
+            // 兜底：index（多平台，或 provenance/sbom 泄漏）→ 下钻 linux/amd64 子 manifest，并计数泄漏
+            const kids = m.manifests || [];
+            const img = kids.find((k) => k.platform && k.platform.architecture === 'amd64' && k.platform.os === 'linux');
+            if (!img || !img.digest) throw new Error('manifest 里找不到 linux/amd64 子镜像：' + ref);
+            const child = raw(ref.split('@')[0] + '@' + img.digest);
+            return {
+              imageId: child.config.digest,
+              shape: m.mediaType + ' → ' + child.mediaType,
+              attestationChildren: kids.filter(isAttestation).length,
+            };
+          }
+          const out = [];
+          for (const arg of process.argv.slice(2)) {
+            const eq = arg.indexOf('=');
+            const role = arg.slice(0, eq);
+            const ref = arg.slice(eq + 1);
+            const at = ref.lastIndexOf('@');
+            const name = ref.slice(0, at);
+            const digest = ref.slice(at + 1);
+            if (!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error(name + ' 的 digest 形态异常：' + digest);
+            const info = imageIdOf(ref);
+            if (info.attestationChildren > 0) {
+              console.warn('⚠️ ' + name + ' 的 manifest 里仍有 ' + info.attestationChildren + ' 个 attestation 子清单：provenance/sbom 没关掉');
+            }
+            out.push({ role: role, name: name, ref: ref, digest: digest, imageId: info.imageId, shape: info.shape, attestationChildren: info.attestationChildren });
+          }
+          console.log(JSON.stringify(out));
+          MJS
+          list="$(node "$RUNNER_TEMP/inspect-imageid.mjs" \
+            "portal=$IMG_PORTAL@$DIGEST_PORTAL" \
+            "fde=$IMG_FDE@$DIGEST_FDE" \
+            "proxy=$IMG_PROXY@$DIGEST_PROXY")"
+          # 脚本 B：写 images-digest.json + job summary（含可直接贴进 deploy/.env 的三行 pin）
+          cat > "$RUNNER_TEMP/write-manifest.mjs" <<'MJS'
+          import fs from 'node:fs';
+          const [rowsJson, tag, version, sha, runUrl] = process.argv.slice(2); // 文件形式执行：argv[1] 是脚本路径
+          const rows = JSON.parse(rowsJson);
+          const pin = (role) => {
+            const r = rows.find((x) => x.role === role);
+            return r ? r.name + '@' + r.digest : '';
+          };
+          const deployEnv = {
+            STATION_PORTAL_IMAGE: pin('portal'),
+            FDE_IMAGE: pin('fde'),
+            STATION_DOCKER_PROXY_IMAGE: pin('proxy'),
+          };
+          const manifest = {
+            tag: tag,
+            version: version,
+            gitSha: sha,
+            generatedAt: new Date().toISOString(),
+            runUrl: runUrl,
+            pinNote: 'pin 形态①：<image>@sha256:<digest>（manifest digest）；pin 形态②：sha256:<imageId>（config digest = 部署机 docker image inspect .Id）。两种都被 portal/src/config.js:119-123 接受。',
+            images: rows.map((r) => ({
+              role: r.role,
+              image: r.name,
+              tags: [r.name + ':' + version, r.name + ':latest'],
+              digest: r.digest,
+              imageId: r.imageId,
+              manifestShape: r.shape,
+              attestationChildren: r.attestationChildren,
+            })),
+            deployEnv: deployEnv,
+          };
+          fs.writeFileSync('images-digest.json', JSON.stringify(manifest, null, 2) + '\n');
+          const sum = [
+            '## 发布 ' + tag + '（version ' + version + '，git sha ' + sha.slice(0, 12) + '）',
+            '',
+            '| 镜像 | 标签 | digest（manifest，pin 形态①） | imageId（config = 部署机 .Id，pin 形态②） | manifest 形态 |',
+            '|---|---|---|---|---|',
+          ]
+            .concat(rows.map((r) => '| `' + r.name + '` | `' + version + '`, `latest` | `' + r.digest + '` | `' + r.imageId + '` | ' + r.shape + ' |'))
+            .concat([
+              '',
+              '### 部署机 deploy/.env 可直接贴（不可变 pin，流程见 docs/ops/ci-release.md §2）',
+              '',
+              '```',
+            ])
+            .concat(Object.keys(deployEnv).map((k) => k + '=' + deployEnv[k]))
+            .concat([
+              '```',
+              '',
+              '⚠️ 换 FDE 镜像后必须 `docker rm -f fde-<name>` + `node portal/src/cli.js provision-fde --fde-name <name>`',
+              '—— `ensureFdeContainer`（portal/src/provisioner.js:305-322）只在容器不存在时创建，**不因镜像变化重建**。',
+            ])
+            .join('\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, sum + '\n');
+          MJS
+          node "$RUNNER_TEMP/write-manifest.mjs" "$list" "$TAG" "$VERSION" "$GITHUB_SHA" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo '--- images-digest.json ---'
+          cat images-digest.json
+
+      # ---- ⑧ Release 已存在才挂附件（tag push 不会自动建 Release）----
+      - name: '⑧ 若 GitHub Release 已存在，把清单挂上去'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" images-digest.json --clobber --repo "$GITHUB_REPOSITORY"
+            echo "已把 images-digest.json 附到 Release $TAG"
+          else
+            echo "Release $TAG 尚不存在 ⇒ 跳过上传（tag push 不会自动建 Release）。清单已在 job summary 与 artifact images-digest 里。"
+            echo "要挂到 Release：先 gh release create $TAG --notes 'digest 见 images-digest.json'，再用 workflow_dispatch 重跑本工作流（docs/ops/ci-release.md §2）。"
+          fi
+
+      - name: '⑨ 上传 artifact（只放小文件：Actions 存储与 Packages 共享 500MB 配额）'
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-digest
+          path: images-digest.json
+          retention-days: 14
+          if-no-files-found: error
