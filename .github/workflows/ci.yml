@@ -78,7 +78,19 @@ jobs:
           echo "已 node --check ${n} 个文件（只取 git 跟踪的 *.js / *.mjs；node_modules 天然不在其中）"
           exit $fail
 
-      # ---- ② 根单测：node --test（850 项基线，含 runner/test，见 ci-release.md §1）----
+      # ---- ①′ 运行身份诊断（工单 C2）：uid/gid 相关失败今后一眼可判 ----
+      # fchown 类断言只在「进程能把属主改成目标 uid」时才成立（非特权进程只能改成自己的 euid/所属组），
+      # 而 runner 用户并不恰好是 1000:1000 ⇒ 属主类断言必须跟随进程身份（见 docs/ops/ci-release.md §8）。
+      # 不加 continue-on-error / if: always()：这四行本身要跑成功才有意义。
+      - name: '①′ 运行身份诊断：id -u / id -g / id / uname -a'
+        run: |
+          set -euo pipefail
+          echo "id -u = $(id -u)"
+          echo "id -g = $(id -g)"
+          echo "id    = $(id)"
+          echo "uname = $(uname -a)"
+
+      # ---- ② 根单测：node --test（855 项基线，含 runner/test，见 ci-release.md §1）----
       - name: '② 根 npm ci + npm test'
         run: |
           npm ci --no-audit --no-fund
