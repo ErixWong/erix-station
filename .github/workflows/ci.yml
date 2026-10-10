@@ -1,0 +1,192 @@
+# ============================================================================
+# CI —— 质量门禁（PR/main）+ 镜像构建校验（main，按路径过滤，不推送）
+# 依据：station issue #235；口径、预算语义、被停额度时的人工兜底见 docs/ops/ci-release.md
+#
+# 运行器红线：**ubuntu-latest 单一运行器，禁止任何 matrix**
+#   （GitHub Free 账号 Linux $0.006/min、Windows $0.01/min、macOS 3-core $0.062/min ≈ 10 倍；
+#    matrix 会把分钟数成倍吃掉，而本账号 Actions/Packages 预算 $0 + Stop usage=Yes ⇒ 超额是**停跑**）。
+#
+# e2e（portal/integration/wp*-e2e.mjs）**故意不进 CI**：需要 docker daemon + 固定 IPAM 池 +
+#   泛域名/Tailscale，且 `assertIsolatedEnvironment()` 会硬断言一堆隔离栈 env（ci-release.md §6）。
+#
+# 依赖注：三个 lockfile 的 resolved 全指 registry.npmjs.org（erix-agent 是公开包）⇒ 不需要 NPM_TOKEN。
+# ============================================================================
+name: CI
+
+on:
+  pull_request: # 只跑门禁，不构建镜像
+  push:
+    branches: [main] # 门禁 + 三镜像构建校验（--push 关闭，按路径过滤）
+  workflow_dispatch: # 额度被静默停跑后手动补跑
+    inputs:
+      build_images:
+        description: '镜像构建校验范围（none = 只跑门禁）'
+        type: choice
+        required: false
+        default: 'none'
+        options:
+          - none
+          - all
+
+# 门禁与「只构建不推送」都不需要写权限（release.yml 才有 packages: write）
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: 质量门禁（语法 / 根单测 / runner 单测 / 前端 typecheck+test）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # 同分支只留最新一次：并发堆分钟数是 Free 账号的主要风险
+    concurrency:
+      group: ci-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      # 前端 devDependencies（vite/tailwind/vitest）要求 NODE_ENV 不是 production，否则 npm ci 会跳过 devDeps。
+      # 镜像构建里才是 NODE_ENV=production（portal/Dockerfile:17），两者不冲突。
+      NODE_ENV: development
+    outputs:
+      build_portal: ${{ steps.paths.outputs.portal }}
+      build_fde: ${{ steps.paths.outputs.fde }}
+      build_proxy: ${{ steps.paths.outputs.proxy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 路径过滤要 diff「推入前 ↔ 推入后」，故取全历史（本仓库体量可忽略）
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # 对齐 package.json engines（>=22）；本机基线 22.23.2
+          # 刻意不开 `cache: npm`：Actions cache 与 Packages 共享 500MB 配额（ci-release.md §4），
+          # 三次 npm ci 冷跑共 ~3s，省下的秒数不值配额风险。
+
+      # ---- ① 语法保底：零依赖 node --check 扫全部跟踪的 *.js / *.mjs ----
+      # 仓库是 Node ESM 且 package.json 带 "type": "module"，`node --check` 会按 package.json 的
+      # type 解析（本机实测 portal/src/config.js 与 portal/integration/lib/fde-image.mjs 均 rc=0）。
+      - name: '① 语法保底：node --check 扫全部 *.js / *.mjs'
+        run: |
+          set -euo pipefail
+          n=0; fail=0
+          while IFS= read -r -d '' f; do
+            n=$((n+1))
+            if ! node --check "$f"; then
+              echo "::error file=${f}::node --check 语法失败"
+              fail=1
+            fi
+          done < <(git ls-files -z -- '*.js' '*.mjs')
+          echo "已 node --check ${n} 个文件（只取 git 跟踪的 *.js / *.mjs；node_modules 天然不在其中）"
+          exit $fail
+
+      # ---- ② 根单测：node --test（850 项基线，含 runner/test，见 ci-release.md §1）----
+      - name: '② 根 npm ci + npm test'
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      # ---- ③ runner 单测：`node --test` 不带目录参数（AGENTS.md §4 口径：
+      #      `node --test runner/test/` 会把目录当模块加载 → Cannot find module，别用）----
+      - name: '③ runner npm ci + node --test'
+        working-directory: runner
+        run: |
+          npm ci --no-audit --no-fund
+          node --test
+
+      # ---- ④ 前端：显式 NODE_ENV=development（本机 NODE_ENV=production 会跳过 devDeps）----
+      - name: '④ 前端 npm ci + typecheck + vitest'
+        working-directory: portal/frontend
+        run: |
+          NODE_ENV=development npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+
+      # ---- ⑤ 按路径判定要构建哪些镜像（只在 push / dispatch=all 时需要）----
+      # 口径以**仓库实际构建方式**为准（工单原表 + portal/Dockerfile 的 COPY 面）：
+      #   portal 镜像构建上下文 = 仓库根，除 portal/** 与根 package*.json 外，还 COPY 了
+      #   docs/data/（portal/Dockerfile:31）与 deploy/migrations/（:34），根 .dockerignore 也参与上下文，
+      #   ⇒ 这四类路径变化同样会让镜像内容变化，必须触发构建校验。
+      #   FDE 上下文 = runner/（fde-image.mjs:36 `build -t <img> runner/`）；proxy 上下文 = deploy/fde-proxy/。
+      - name: '⑤ 按路径判定要构建哪些镜像'
+        id: paths
+        if: github.event_name == 'push' || github.event.inputs.build_images == 'all'
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          portal=false; fde=false; proxy=false; files=''
+          if [ "$EVENT" = 'workflow_dispatch' ]; then
+            echo 'workflow_dispatch + build_images=all ⇒ 三个镜像全量构建校验'
+            portal=true; fde=true; proxy=true
+          elif git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            files="$(git diff --name-only "$BEFORE" "$AFTER" || true)"
+            count="$(printf '%s' "$files" | grep -c . || true)"
+            echo "路径判定基线：${BEFORE}..${AFTER}，改动文件数 ${count}"
+            [ "$count" -gt 0 ] && printf '%s\n' "$files" | sed 's/^/    /' || true
+          else
+            echo "⚠️ 推入前的 commit（${BEFORE}）不在本地历史（新分支首推 / force push）⇒ 保守起见全量构建"
+            portal=true; fde=true; proxy=true
+          fi
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files" | grep -qE '^(\.dockerignore|package\.json|package-lock\.json|portal/|docs/data/|deploy/migrations/)' && portal=true || true
+            printf '%s\n' "$files" | grep -qE '^runner/' && fde=true || true
+            printf '%s\n' "$files" | grep -qE '^deploy/fde-proxy/' && proxy=true || true
+          fi
+          {
+            echo "portal=$portal"
+            echo "fde=$fde"
+            echo "proxy=$proxy"
+          } >> "$GITHUB_OUTPUT"
+          echo "构建判定：portal=$portal fde=$fde proxy=$proxy"
+
+  images:
+    name: 镜像构建校验（三镜像，--load 不推送）
+    needs: gate
+    # PR 一律不构建；push main / dispatch=all 且路径命中才构建（单一 ubuntu-latest，无 matrix）
+    if: >-
+      github.event_name != 'pull_request' &&
+      (needs.gate.outputs.build_portal == 'true' ||
+       needs.gate.outputs.build_fde == 'true' ||
+       needs.gate.outputs.build_proxy == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: ci-${{ github.ref }}-images
+      cancel-in-progress: true
+    env:
+      # 与 release.yml 同名（全小写硬要求）；CI 只 --load 到本地，不推送、不碰 :local
+      IMG_PORTAL: ghcr.io/erixwong/erix-station-portal
+      IMG_FDE: ghcr.io/erixwong/erix-station-fde
+      IMG_PROXY: ghcr.io/erixwong/erix-station-fde-proxy
+    steps:
+      - uses: actions/checkout@v4
+
+      # 构建上下文/dockerfile 一律照抄仓库现状，**不传 proxy build args**：
+      # runner/Dockerfile:55-74 从 github.com / dl.gitea.io / gitlab.com 直连下载 gh/tea/glab，
+      # 本机在墙内要 HTTP_PROXY/HTTPS_PROXY/NO_PROXY + --network=host（fde-image.mjs:26-40），
+      # GitHub runner 直连可达；而 build args 参与 Docker 缓存键 ⇒ CI 恒不传，保持稳定。
+      - name: '构建校验：station-portal 镜像（context = 仓库根，dockerfile = portal/Dockerfile）'
+        if: needs.gate.outputs.build_portal == 'true'
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            --tag "${IMG_PORTAL}:ci-${GITHUB_SHA::7}" \
+            --file portal/Dockerfile \
+            .
+
+      - name: '构建校验：FDE 镜像（context = runner/）'
+        if: needs.gate.outputs.build_fde == 'true'
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            --tag "${IMG_FDE}:ci-${GITHUB_SHA::7}" \
+            runner/
+
+      - name: '构建校验：fde-proxy 镜像（context = deploy/fde-proxy）'
+        if: needs.gate.outputs.build_proxy == 'true'
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            --tag "${IMG_PROXY}:ci-${GITHUB_SHA::7}" \
+            deploy/fde-proxy
