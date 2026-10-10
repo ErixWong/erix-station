@@ -22,7 +22,7 @@
 | 偏离 | 单 |
 |---|---|
 | 无 TLS：无服务端身份验证、cookie 无 `Secure`、拿不到 `__Host-` 前缀；两条 https 路线（自建 CA / ACME DNS-01）写在单里 | **#234** |
-| **防火墙应用未实现** ⇒ FDE→宿主端口未收紧（`18080` 直连 portal 可绕过 forwardAuth，违反不变式 2；`9000` Portainer 未认证=Docker 控制面）。当前缓解：入口只在 tailnet + FDE 内跑使用者本人的 agent/项目 | **#233** |
+| **防火墙应用未实现** ⇒ FDE→宿主无出口收紧。**真机实测**（从 `fde-eric` 内）：可达 `8090`(应许) / `9000` Portainer（需认证，仅 `/api/status` 未认证）/ `5432` **别的项目的** Postgres / `443` nginx 反代 / `19001` **开放代理**（可绕审计出网）；`18080` portal、`4100` LiteLLM、`3306`、`22` 因只绑回环而 `ECONNREFUSED`，`8931` playwright 靠自身 localhost 校验挡下（`403`）。⇒ 今天没出事是**靠各服务自己绑回环**，不是平台保证 | **#233** |
 | 镜像未推 registry、无 CI（只有本机 build + image ID pin）；`portal`/`fde-proxy` 仍是 `:local` tag | **#235** |
 | 终止文案不可见（`aborted` 无中文标签 + `run_end` 不入历史白名单 ⇒ 刷新后无终态提示）；空 body POST 强制 `Content-Type`；单次 run 无成本护栏 | **#236** |
 | 文件工具迁上游遗留（`maskedPaths` 只挡文件工具不挡 shell；`SYSTEM_PROMPT` 已在本轮补） | #231 |
