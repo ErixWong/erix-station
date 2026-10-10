@@ -10,8 +10,16 @@ import {
   setGitCredential,
 } from '../src/git-credential.js';
 
-const UID = 1000;
-const GID = 1000;
+// 宿主侧属主必须跟随**运行测试的进程身份**：非特权进程只能把属主改成自己的 euid、
+// 组只能改成自己所属的组（Linux fchown(2) 硬约束）。原先硬编码 `1000` 只是恰好撞上了
+// 「开发机就是 1000:1000」；GitHub Actions 的 runner 用户不是 1000:1000 ⇒
+// `fchown(fd, 1000, 1000)` 直接 EPERM（run 38041183692 / 38041175079：16 项失败）。
+// 生产 portal 以 root 运行（portal/Dockerfile:37 ⇒ 持 CAP_CHOWN），所以这是**测试口径**修正，
+// 产品代码零改动。同口径先例：runner/test/run-data.test.js:28（`process.getuid?.() ?? 0`）。
+const SELF_UID = process.getuid?.() ?? 1000; // 注入 config.fdeUid，同时是落盘断言的期望属主
+const SELF_GID = process.getgid?.() ?? 1000; // 注入 config.fdeGid
+// worker 属主是**产品语义**（glab 配置必须 worker 属主，见 portal/src/git-cli-config.js:118-121），
+// 不跟随进程身份；非 root 且自身不是 1002 时由 captureWorkerChown 捕获请求属主（语义不变）。
 const WORKER_UID = 1002;
 const CONFIG_PATHS = {
   gitea: ['.config', 'tea', 'config.yml'],
@@ -27,7 +35,7 @@ function fixture(t) {
   return {
     root,
     homeDir,
-    config: { userSpaceRoot: root, fdeUid: UID, fdeGid: GID, workerUid: WORKER_UID },
+    config: { userSpaceRoot: root, fdeUid: SELF_UID, fdeGid: SELF_GID, workerUid: WORKER_UID },
   };
 }
 
@@ -51,13 +59,20 @@ function cliPath(homeDir, provider) {
   return path.join(homeDir, ...CONFIG_PATHS[provider]);
 }
 
+let workerChownNoticePrinted = false;
+
 function captureWorkerChown(t) {
   const requests = [];
   // Rootless test hosts cannot chown to the worker UID; capture the requested owner instead.
-  if (process.getuid() !== 0 && (process.getuid() !== WORKER_UID || process.getgid() !== GID)) {
+  // root（含 CI 里以 root 跑的容器）能真的 chown 到 1002 ⇒ 不装 mock，断言走**真实属主**分支。
+  if (process.getuid() !== 0 && (process.getuid() !== WORKER_UID || process.getgid() !== SELF_GID)) {
+    if (!workerChownNoticePrinted) {
+      workerChownNoticePrinted = true;
+      console.log(`# note: 非 root（uid=${process.getuid()}），worker 属主 1002 无法真实 chown ⇒ 改为捕获 fchown 请求（EPERM 不静默吞掉）`);
+    }
     const fchownSync = fs.fchownSync;
     t.mock.method(fs, 'fchownSync', (fd, uid, gid) => {
-      if (uid === WORKER_UID && gid === GID) {
+      if (uid === WORKER_UID && gid === SELF_GID) {
         requests.push({ uid, gid });
         return;
       }
@@ -71,19 +86,23 @@ function assertCliFile(filePath, provider, workerChownRequests = []) {
   const stat = fs.statSync(filePath);
   assert.equal(stat.mode & 0o777, provider === 'gitlab' ? 0o600 : 0o640);
   if (provider === 'gitlab' && workerChownRequests.length > 0) {
-    assert.ok(workerChownRequests.some(({ uid, gid }) => uid === WORKER_UID && gid === GID));
-    assert.equal(stat.uid, process.getuid());
+    // 非 root 分支：属主请求被捕获（断言「确实请求了 worker 属主」），盘上属主仍是进程自身。
+    assert.ok(workerChownRequests.some(({ uid, gid }) => uid === WORKER_UID && gid === SELF_GID));
+    assert.equal(stat.uid, SELF_UID);
   } else {
-    assert.equal(stat.uid, provider === 'gitlab' ? WORKER_UID : UID);
+    // root 分支（或有能力真实 chown 的环境）：盘上属主必须真的等于配置里的 worker / FDE 属主。
+    assert.equal(stat.uid, provider === 'gitlab' ? WORKER_UID : SELF_UID);
   }
-  assert.equal(stat.gid, GID);
+  assert.equal(stat.gid, SELF_GID);
 }
 
 function assertFdeDirectory(dirPath) {
   const stat = fs.statSync(dirPath);
   assert.equal(stat.mode & 0o777, 0o750);
-  assert.equal(stat.uid, UID);
-  assert.equal(stat.gid, GID);
+  // ensureDirSafe 的 chown 是 best-effort（fsutil.js 只告警不抛），所以目录属主只在其确实
+  // 等于配置属主时才有断言价值——配置属主已取进程自身，非特权环境下这一断言必然真实成立。
+  assert.equal(stat.uid, SELF_UID);
+  assert.equal(stat.gid, SELF_GID);
 }
 
 function hostConfig(provider, host, username, token) {
