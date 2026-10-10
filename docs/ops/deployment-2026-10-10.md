@@ -6,13 +6,13 @@
 
 | 项 | 值 |
 |---|---|
-| 版本锚点 | git tag **`v0.1.0`**（= `24d0fe8`，merge PR #232） |
+| 版本锚点 | git tag **`v0.1.1`**（= `f99e49c`，merge PR #237；首个部署锚点 `v0.1.0` = `24d0fe8`，PR #232） |
 | 入口 | **http**，`station.fde.erix.vip:8090`（Traefik `web`；https/ACME 本轮不做 → #234） |
 | 泛域名 | `*.fde.erix.vip` → Tailscale IP **`100.100.0.3`**（客户端流量在 WireGuard 隧道内，非裸明文） |
 | 生产判定 | **`FDE_DEV_MODE=0`**（真·生产口径；非「dev 栈当生产糊」） |
 | `SESSION_SIGNING_KEY` | 已显式注入 64hex 强随机值（生产模式下占位符会**拒绝启动**，`config.js:133`）。⚠️ 轮换它 = 全量会话失效 |
 | `COOKIE_PROFILE` | **`dev-http`**（`fde_session_dev` + `HttpOnly` + `SameSite=Lax`，**无 `Secure`**）——决策者 2026-10-10 口径放行，见 `docs/env.md` §10 |
-| FDE 镜像 pin | **`sha256:3572b989bfeddf758e6af08ac84249813be2d85a6ba980722a57349c380d77ed`**（image ID 形态；`fde-eric` 的 `.Image` 已核等于此值） |
+| FDE 镜像 pin | **`sha256:4c1e70685978b65863d5e21d6877fe39ab873d62366a52c89ff950a3f97fefc5`**（image ID 形态；`fde-eric` 的 `.Image` 已核等于此值。v0.1.0 时的初值是 `sha256:3572b989…`，换 `SYSTEM_PROMPT` 后重建镜像即换 ID —— **这正是「换镜像必须显式改 `.env`」的实例**） |
 | 引擎 | `erix-agent` **0.18.0**（两处 pin 同步） |
 | LLM | `station-litellm`（profile `litellm`，宿主回环 `127.0.0.1:4100`），`spend` 可算（#164 定价），**`max_budget` 未下发** ⇒ 不自动拦（#235） |
 | 容器 | 6 个：`station-edge` / `station-portal` / `station-db` / `station-docker-proxy` / `station-litellm` / `fde-eric`，全 healthy |
@@ -34,6 +34,18 @@
 - ⚠️ 规范位置应是 `/docker/station-backups/`（全局约定），但 `/docker` 是 `root:root 755` 且本机**无免密 sudo** ⇒ 待一次性 `sudo mkdir + chown eric` 后把 `BACKUP_DIR` 改过去（前提记在 #233）
 - 数据卷：`/docker/station-db`（pg data，属主是容器 uid）
 - 首次实跑：`station-20261010-082729.dump`，**16,360,909 bytes**，校验 ok
+
+## 部署后补票：`SYSTEM_PROMPT` 行为验证（v0.1.1，PR #237）
+
+同一个 trivial 任务（「用 searchText 在项目根搜 `react`」，**不提示任何参数**）：
+
+| | v0.1.0（旧提示词） | v0.1.1（新提示词） |
+|---|---|---|
+| 工具调用 | **16 次**（翻 `~/.erix/config.json`、读别的项目、`npm init -y`、写报告两次…） | **7 次**（`searchText`×2 + `shell`×4 + `tree`×1） |
+| `input_tokens` | **166,278**，撞 **`max_rounds_cap`** | **26,591**，`judge_done` 正常终态 |
+| 读到排除账 marker 后的行为 | 认定 flag 无效 → **放弃 searchText 改跑 shell grep** | **自己补 `include_vendor=true, include_hidden=true` 再搜一次**（已从 `tool_use` 入参核实，不是看 marker 文本猜的） |
+
+仍会用 `shell` 做交叉验证（项目里确实没有 `react`，属合理），但**不再因为排除账文案放弃文件工具**。样本 n=1，非基准测试。验收脚本 `~/e2e-diag/prompt-effect.mjs`。
 
 ## 部署验收（P1 口径，全部**经 Traefik 入口**，未用 portal 直连端口）
 
