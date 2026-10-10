@@ -311,7 +311,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `LITELLM_SALT_KEY` | LiteLLM 加密 DB 凭据的 salt；写入 `litellm` 库数据后不可更改；只放 `deploy/.env`（600） | 独立强随机值 |
 | `LITELLM_DB_USER` / `LITELLM_DB_PASSWORD` | 独立 LiteLLM 数据库角色；新建 DB 数据目录时由 `deploy/db-init/01-litellm.sh` 创建角色与库；容器 `DATABASE_URL` 指向 `station-db:5432/litellm`，不得复用 portal 的 DB 角色 | `litellm` / 独立随机值 |
 | `DATABASE_URL`（LiteLLM 容器） | Compose 内部构造的 PostgreSQL URL，连接 `station-db` 上的 `litellm` 数据库 | `postgresql://litellm:…@station-db:5432/litellm` |
-| `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限本机 HTTP 联调，禁止进部署配置**） |
+| `COOKIE_PROFILE` | 平台规范固定（portal.md §2.5 已声明的同步点，本节落地） | `prod`（→ `__Host-fde_session` + `Secure=true`）\| `dev-http`（→ `fde_session_dev` + `Secure=false`，**仅限 HTTP 部署/联调**（无 `Secure` ⇒ 拿不到 `__Host-` 前缀，cookie 被看到即会话被冒用；2026-10-10 首次部署按决策者口径用于私有网 http 部署，代价与 https 两条路线见 #234 与 `docs/ops/deployment-2026-10-10.md`）） |
 | `FIREWALL_ENABLED` | 平台规范固定（topology.md §6.1 / deploy-contract.md） | `1`（生产恒 `1`；`0` 仅限无其它宿主服务的隔离开发机——关闭即放弃「FDE→宿主其它端口」收紧） |
 | `TRAEFIK_CONFIG_DIR` | 平台规范固定（deploy-contract.md；由 `DATA_ROOT` 派生） | `/docker/station-edge/`（静态 `traefik.yml` + `dynamic/` 目录 + `acme.json` + `logs/` + `firewall/` 规则文件） |
 | `FIREWALL_RULES_PATH` | 平台规范固定（deploy-contract.md；由 `TRAEFIK_CONFIG_DIR` 派生） | `/docker/station-edge/firewall/`（规则文件 `rules.v4`，权限 **600**） |
