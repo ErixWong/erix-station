@@ -23,6 +23,13 @@ import {
 import { hashToken } from '../src/auth.js';
 import { syncFdeLlmBindingOnOnboard } from '../src/llm.js';
 
+// 宿主侧属主跟随进程身份（同 portal/test/git-cli-config.test.js 顶部口径）：
+// config.fdeUid/fdeGid 会进 ensureDirSafe 的 chown，硬编码 1000 在 uid≠1000 的 runner 上
+// 只会刷 best-effort 告警（不抛错，但拿不到真实属主）；取自身后 chown 真正成立。
+// ⚠ 容器侧属主（`fdeDevUser: '1001:1000'`、`runUser`）不跟随进程——那是产品口径，不得改。
+const SELF_UID = process.getuid?.() ?? 1000;
+const SELF_GID = process.getgid?.() ?? 1000;
+
 const DEPROVISION_USER_SPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'station-provisioner-users-'));
 test.after(() => fs.rmSync(DEPROVISION_USER_SPACE_ROOT, { recursive: true, force: true }));
 
@@ -360,8 +367,8 @@ test('reconcileOnce：DB 说该有而 Docker 没有 → 重建；孤儿容器 �
   const config = {
     userSpaceRoot: RECONCILE_USER_SPACE_ROOT,
     userSpaceRootHost: '/tmp/erix-users-test',
-    fdeUid: 1000,
-    fdeGid: 1000,
+    fdeUid: SELF_UID,
+    fdeGid: SELF_GID,
     fdeImage: 'traefik/whoami',
     fdeCmd: ['-port', '4000'],
     fdeMemoryLimit: '512m',
@@ -445,7 +452,7 @@ test('F6：create 成功 + DB update 失败 → 重试重建后容器 env token 
   const config = {
     userSpaceRoot: RECONCILE_USER_SPACE_ROOT,
     userSpaceRootHost: '/tmp/erix-users-f6',
-    fdeUid: 1000, fdeGid: 1000, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
+    fdeUid: SELF_UID, fdeGid: SELF_GID, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
     fdeMemoryLimit: '512m', fdeAgentVersion: 'dev', fdeDevUser: '1001:1000',
     baseDomain: 'localhost', llmHost: 'llm.localhost',
   };
@@ -508,7 +515,7 @@ test('F7：reconcile 幂等——两轮后第二轮不重建（同一容器）',
   };
   const config = {
     userSpaceRoot: RECONCILE_USER_SPACE_ROOT, userSpaceRootHost: '/tmp/erix-users-f7',
-    fdeUid: 1000, fdeGid: 1000, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
+    fdeUid: SELF_UID, fdeGid: SELF_GID, fdeImage: 'traefik/whoami', fdeCmd: ['-port', '4000'],
     fdeMemoryLimit: '512m', fdeAgentVersion: 'dev', fdeDevUser: '1001:1000',
     baseDomain: 'localhost', llmHost: 'llm.localhost',
   };
@@ -1228,8 +1235,8 @@ function make185Docker() {
 
 const CONFIG185 = (root) => ({
   userSpaceRoot: root,
-  fdeUid: 1000,
-  fdeGid: 1000,
+  fdeUid: SELF_UID,
+  fdeGid: SELF_GID,
   fdeImage: 'img',
   fdeAgentVersion: 'dev',
   baseDomain: 'localhost',

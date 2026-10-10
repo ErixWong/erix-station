@@ -22,6 +22,13 @@ import {
 } from '../src/materializer.js';
 import { atomicWriteFile, sha256, commitTempFile, writeTempFile } from '../src/fsutil.js';
 
+// 宿主侧属主跟随进程身份（同 portal/test/git-cli-config.test.js 顶部口径）：生产是
+// `uid/gid = fdeUid/fdeGid`（portal/src/materializer.js:441-442 默认 1000），而测试里的 chown
+// 只能落在自己的 euid/所属组上，所以这里取进程自身（硬编码 1000 在 uid≠1000 的 runner 上
+// 会刷 chown 告警、属主也不是配置声称的那个）。
+const SELF_UID = process.getuid?.() ?? 1000;
+const SELF_GID = process.getgid?.() ?? 1000;
+
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mat-test-'));
 }
@@ -275,7 +282,7 @@ test('fsutil.atomicWriteFile：目标路径含 symlink → 拒写且保留旧文
 
 test('materialize：幂等（同一快照两次 → generation 不变、字节级相同、无重写）', async () => {
   const root = tmpdir();
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
   const snap = snapshot({ generation: 5, allocations: [ALLOC] });
   const r1 = await mat.materialize(snap);
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
@@ -318,7 +325,7 @@ function prevManifestWithScaffold(prevManifest, sha = 'c'.repeat(64)) {
 
 test('materialize：P5 新 plan 收敛移除存量项目脚手架（stale 清理，manifest 机制）', async () => {
   const root = tmpdir();
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
   await mat.materialize(snapshot());
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');
   const scaffold = seedLegacyProjectScaffold(root, mat);
@@ -337,7 +344,7 @@ test('materialize：P5 新 plan 收敛移除存量项目脚手架（stale 清理
 
 test('materialize：ports.json generation == manifest generation（跨文件一致性锚点，FDE 级）', async () => {
   const root = tmpdir();
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
   const r = await mat.materialize(snapshot({ generation: 42, allocations: [ALLOC] }));
   const manifest = JSON.parse(r.manifest);
   const ports = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'ports.json'), 'utf8'));
@@ -350,7 +357,7 @@ test('materialize：ports.json generation == manifest generation（跨文件一�
 test('F1：prevManifest 被篡改含 ../ 时，不删除其他 FDE 的文件（跳过 + 告警，不报 500）', async () => {
   const root = tmpdir();
   const warnings = [];
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000, log: { warn: (m) => warnings.push(m) } });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID, log: { warn: (m) => warnings.push(m) } });
   // 受害者：另一个 FDE 的 .erix 文件（不可被删除）。
   const victim = path.join(root, 'bob', 'home', '.erix', 'config.json');
   fs.mkdirSync(path.dirname(victim), { recursive: true });
@@ -377,7 +384,7 @@ test('F1：prevManifest 被篡改含 ../ 时，不删除其他 FDE 的文件（�
 
 test('F6：同内容 symlink 拒绝（lstat 不跟随，不静默保留 symlink）', async () => {
   const root = tmpdir();
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
   const snap = snapshot();
   await mat.materialize(snap);
   const agentsPath = path.join(root, 'alice', 'home', 'AGENTS.md');
@@ -398,7 +405,7 @@ test('F6：同内容 symlink 拒绝（lstat 不跟随，不静默保留 symlink�
 
 test('F8：未传 materializedAt 时同快照仍字节级幂等（沿用旧 materialized_at）', async () => {
   const root = tmpdir();
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
   const snap = snapshot({ generation: 5, allocations: [ALLOC] });
   delete snap.materializedAt; // 走默认 new Date()
   const r1 = await mat.materialize(snap);
@@ -415,7 +422,7 @@ test('F8：未传 materializedAt 时同快照仍字节级幂等（沿用旧 mate
 test('M1：root 内用户自建 .gitignore/AGENTS.md 在 stale 清理后存活（不在平台管理路径集合）', async () => {
   const root = tmpdir();
   const warnings = [];
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000, log: { warn: (m) => warnings.push(m) } });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID, log: { warn: (m) => warnings.push(m) } });
   await mat.materialize(snapshot());
 
   // 用户在 root 内自建嵌套 .gitignore / AGENTS.md（不属于平台管理路径集合）。
@@ -448,7 +455,7 @@ test('M1：root 内用户自建 .gitignore/AGENTS.md 在 stale 清理后存活�
 
 test('M2：stale-only 变更（仅删 stale）时 materialized_at 更新', async () => {
   const root = tmpdir();
-  const mat = createMaterializer({ root, uid: 1000, gid: 1000 });
+  const mat = createMaterializer({ root, uid: SELF_UID, gid: SELF_GID });
   const t1 = new Date('2026-09-12T08:30:00.000Z');
   await mat.materialize(snapshot({ materializedAt: t1 }));
   const manifestPath = path.join(root, 'alice', 'home', '.erix', 'manifest.json');

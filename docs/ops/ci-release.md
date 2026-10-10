@@ -20,15 +20,19 @@
 | `workflow_dispatch`（ci.yml） | 门禁；`build_images=all` 时追加三镜像构建校验 | 同上 |
 | `workflow_dispatch`（release.yml） | 手填 `tag`，跑与 tag push 完全相同的发布流程 | 同上 |
 
-**门禁四步（顺序执行，任一失败即红；`ci.yml` 步骤 ①–④）**
+**门禁步骤（顺序执行，任一失败即红；`ci.yml` 步骤 ①、①′、②–④）**
 
-1. `node --check` 扫全部 git 跟踪的 `*.js` / `*.mjs`（当前 136 个文件；仓库 `type: module`，
+1. （步骤 ①）`node --check` 扫全部 git 跟踪的 `*.js` / `*.mjs`（当前 137 个文件；仓库 `type: module`，
    `node --check` 会按 `package.json` 的 type 解析，ESM 文件实测 rc=0）。
-2. 根 `npm ci` + `npm test` → **850 项 / 849 通过 / 0 失败 / 1 跳过**（基线，2026-10-10 本机复现）。
-   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **850 里已含 runner 的 198 项**。
-3. `cd runner && npm ci && node --test` → **198/198**。口径见 `AGENTS.md` §4：
+2. （步骤 ①′）**运行身份诊断**：`id -u` / `id -g` / `id` / `uname -a`（无 `continue-on-error`、无 `if: always()`）。
+   为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
+   有这四行就不用再猜「今天的 runner 是谁」。
+3. （步骤 ②）根 `npm ci` + `npm test` → **855 项 / 854 通过 / 0 失败 / 1 跳过**（基线，2026-10-10 本机复现；
+   原 850/849 基线上新增 `portal/test/fsutil-chown.test.js` 的 5 条属主语义钉桩）。
+   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **855 里已含 runner 的 198 项**。
+4. （步骤 ③）`cd runner && npm ci && node --test` → **198/198**。口径见 `AGENTS.md` §4：
    **`node --test runner/test/`（目录当参数）在本机 Node 22/24 是坏的**（把目录当模块加载 → `Cannot find module`），别用。
-4. `cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **23 文件 / 329 通过**。
+5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **23 文件 / 329 通过**。
    `NODE_ENV=development` 是**必需**的：devDependencies（vite/tailwind/vitest）在 `NODE_ENV=production` 下会被 `npm ci` 跳过。
 
 **镜像构建校验的路径过滤（`ci.yml` 步骤 ⑤）**
@@ -147,6 +151,8 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
   ```bash
   # ① 语法保底
   git ls-files -z -- '*.js' '*.mjs' | xargs -0 -n1 node --check
+  # ①′ 运行身份诊断（属主类失败先报这个）
+  id -u; id -g; id; uname -a
   # ② 根单测
   npm ci && npm test
   # ③ runner 单测（别用 `node --test runner/test/`）
@@ -207,12 +213,38 @@ CI 只保证「语法 + 单测 + 类型 + 镜像能构建出来」。
 
 ## 8. 已知坑（本工单验证时实测）
 
+- **runner 的 uid/gid 与开发机不同 ⇒ 属主类断言直接 EPERM**（工单 C2，Actions 首跑
+  run 38041183692 / 38041175079：`npm test` 16 项红，错误全部是 `EPERM: operation not permitted, fchown`）。
+  - 根因：非特权进程只能把属主改成**自己的 euid**、把属组改成**自己所属的组**（`chown(2)`/`fchown(2)` 硬约束）。
+    开发机恰好是 `1000:1000`，与产品默认 `FDE_USER_UID/GID=1000`（`portal/src/config.js:211-212`）撞车 ⇒ 问题被掩盖；
+    GitHub runner 的用户不是 `1000:1000` ⇒ `fchown(fd, 1000, 1000)` 当场 EPERM。
+    本机实测复现：`docker run --rm -u 1001:1001 … node --test portal/test/git-credential.test.js portal/test/git-cli-config.test.js`
+    在 `main` 代码上恰好复现出 CI 里那 16 条（名字逐一对得上）。
+  - **口径：测试不得硬编码 uid/gid。**「宿主侧属主」一律取进程自身
+    （`const SELF_UID = process.getuid?.() ?? 1000; const SELF_GID = process.getgid?.() ?? 1000;`，
+    同时注入 `config.fdeUid/fdeGid` 并用作断言期望值）；只取自身并不是放水——断言仍然是
+    「落盘属主 == 配置里给的 fde 属主」，只是那个属主在非特权环境**只能**是自身。
+    确实需要「能 chown 到任意属主」才有意义的断言走 `process.getuid() === 0` 的 **root-only 分支**，
+    跳过时显式打印原因，**不许用 try/catch 把 EPERM 静默吞掉**。
+    语义钉桩见 `portal/test/fsutil-chown.test.js`（自身属主必成功 / 外部 uid 非 root 必 EPERM 且 fail-closed /
+    组侧同受限 / root 分支断言真能 chown 到任意外部属主）。
+  - **这不是产品缺陷**：生产 portal 以 root 运行（`portal/Dockerfile:37` ⇒ 持 `CAP_CHOWN`），
+    `setGitCredential` / `git-cli-config` 里的 `uid: config.fdeUid ?? 1000` 在生产下成立；本轮产品代码零改动。
+    （若将来 portal 改成非 root 跑，`setGitCredential` 会真的 EPERM——那是产品口径变更，需单开工单。）
+  - **可移植性复跑口径**（不需要真 runner）：
+    `docker run --rm -u 1001:1001 -v "$PWD":/work -w /work <node 镜像> npm test`（非 root 分支）
+    与 `-u 0:0`（root 分支）各跑一遍，两次都必须 0 失败。
+    本开发机上 `unshare -r` / `setpriv --reuid` 都不可用（`kernel.apparmor_restrict_unprivileged_userns=1`
+    且没装 `newuidmap`/`newgidmap`）⇒ 用 docker 的 `-u` 代替。
+  - ⚠️ 以 root 跑全量单测另有 4 条**既有**用例会红（`offboarding.test.js` 的 F3/D3、`routes.test.js` 的 F3-5/N5）：
+    它们靠权限位模拟 EACCES，而 root 无视 0000 权限——与本轮属主口径无关（`main` 基线同样红），
+    CI 跑在 uid 1001 上不受影响。
 - **同机并发跑测试会假失败**：`runner/test/shell-tools.test.js` 的两条 abort 用例扫 `/proc` 找残留
   `sleep 30.211 / 30.212`（`runner/test/shell-tools.test.js:145-207`）。若同时有另一份测试在跑
   （例：根 `npm test` 与 `cd runner && node --test` 并行），会看到对方的进程 ⇒ 报「abort 后仍有残留命令」。
-  CI 里四步是**顺序**执行的，不受影响；本机手工复跑时**别并行**。
+  CI 里各步是**顺序**执行的，不受影响；本机手工复跑时**别并行**。
 - `docs/data/schema.sql` 是**冻结 baseline**：`portal/src/migrate.js:137-138` 对整个文件文本（含注释）算
   sha256 做启动校验 ⇒ 一个字节都别改（改了会让已应用 baseline 的库拒绝启动）。
-- `portal/Dockerfile:2` 与本仓 §1 的第 4 步同理：镜像构建阶段也**不能**在 builder 里设 `NODE_ENV=production`。
+- `portal/Dockerfile:2` 与本仓 §1 的前端那一步（步骤 ④）同理：镜像构建阶段也**不能**在 builder 里设 `NODE_ENV=production`。
 - workflow 里嵌 JS 时**不要**用单引号包裹的多行 `node -e '...'`：JS 里的 `''` 会关掉 shell 引号
   （actionlint/shellcheck SC1078 抓到过），一律走 `cat > "$RUNNER_TEMP/x.mjs" <<'MJS'` 再 `node` 执行。
