@@ -251,6 +251,15 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [ ] **待办（主 agent）**：真机 e2e 看三件事——① 模型在新工具面上是否用得顺（尤其 `searchText` 的 `mode` 必填与默认跳过 `node_modules`）；② **`tree` 根标签收口已在装配层落地并有单测，但需真机确认收口真的生效了**（重跑 #228 那条链路：`tree {path:"./"}` 首行应为 `./`，拿它当下一次 `path` 不再 ENOENT）；③ 密钥遮蔽在真实项目（含 `.env` / `.ssh`）上的实际效果。
 
 
+### 8.10 `worker.js` 的 SYSTEM_PROMPT 必须跟着上游工具面走（feat-261010-02，2026-10-10）
+
+背景：#232 把文件工具换成上游 erix-agent 0.18.0 后，`runner/worker.js` 的 `SYSTEM_PROMPT` 还停在退役 fork 的时代（写着「只有 `writeFile`，没有 `edit`」、`grep`/`rg` 当可用工具、完全没提 `mode` 必填与默认跳过 `node_modules`）。模型对工具的错误先验会直接变成真失败：盲发没有 `mode` 的 `searchText`、把 `（无命中）` 当成「工具坏了」去 shell 里 `grep -r`、把 `edit` 的 0 命中当「大致一样」重试。
+
+- [x] **提示词只描述真实注册面**：`readFile` / `searchText` / `tree` / `edit` / `writeFile`（名字以 `createStationFileTools(...).schemas` 为准）；`rg` / `grep` 只能以「退役别名、没注册」的面目出现。要写的语义：`searchText` 的 `mode` 必填无默认值、默认跳过 `node_modules`/`dist`/`build`/`target`/`vendor` 与点目录、尾部 `[已跳过 …]` 是**排除账而不是错误**、`include_vendor=true` / `include_hidden=true` 可撤销、`（无命中）` ≠ `错误：无效正则：…` ≠ `错误：…被宿主边界拒绝：…`；`edit` 是 `edits:[{oldText,newText}]` 且**只有逐字节精确匹配**（0 命中 / 多处命中都失败且整次不落盘）；`readFile` 单次 256KB 上限且截断 marker 自带下一步（`offset=` / `max_bytes`）。
+- [x] **不抽独立模块**（工单留给实现判断）：继续留在 `worker.js`。理由——`worker.js` 是子进程入口，顶层就 `fork`/`process.on` 并起 IPC，抽成可 import 的模块要么入口变双入口（agentd `fork(config.workerPath)` 的路径契约要跟着改），要么在提示词与工具面之间新增一个跨模块契约；而防漂移靠源码级断言已经够（`system-prompt.test.js` 用正则从 `worker.js` 源码抠出 `SYSTEM_PROMPT` 模板字面量，**不 import worker**，避开它的顶层副作用与 `process.send` 判据）。
+- [x] **防漂移测试的工具名来自注册面，不是手抄清单**：`runner/test/system-prompt.test.js` 从 `createStationFileTools(...).schemas` 取名字再逐个断言提示词提到它（与 `file-tools-contract.test.js:400-407` 同思路）。上游改名时，这条测试跟着改名；手写一份名字清单只会多一个会过期的真相源。
+- [ ] **待办（主 agent）**：真机看模型在新提示词下是否不再盲发无 `mode` 的 `searchText`、是否不再把 `（无命中）` 当故障去 shell 里 `grep -r`（§8.9 待办 ① 的后续）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
