@@ -20,7 +20,9 @@ on:
         default: ''
 
 permissions:
-  contents: read
+  # contents 必须 write：步骤 ⑧ 的 `gh release upload` 是 release 资产写入，需要 contents:write；
+  # 只给 read 会在 Release 已存在时 403 ⇒ 三镜像已推成功却被这一步染红（假失败）。
+  contents: write
   packages: write # 推 ghcr.io
 
 # 同一 tag 不并发跑；发布中的 run **不取消**（半成品镜像比慢一次更糟）
