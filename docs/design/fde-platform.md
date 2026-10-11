@@ -243,7 +243,7 @@ http:
     fde-auth:
       forwardAuth:
         address: "http://127.0.0.1:8080/api/forward-auth"   # Traefik 在 host、portal 发布在回环，不再走容器网络寻址
-        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]
+        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie, Origin, Access-Control-Request-Method]   # #241：Origin/ACRM 必须进白名单，否则 portal 无法识别预检、也无法回显 ACAO（白名单外的头一律丢弃）
         authResponseHeaders: [X-Auth-User]
     strip-cookie:
       headers:
@@ -274,6 +274,8 @@ http:
 ```
 
 > **预览链路 Cookie 边界（B2，已用 `traefik:v3` + `traefik/whoami` 实跑验证）**：`fde-auth` 的 `authRequestHeaders` 是**最小 allowlist**——forwardAuth 只收到 `X-Forwarded-*`（Host/Uri/Method/Proto）与 `Cookie`（预览凭证 `__Host-fde_preview`；portal session cookie 为 host-only、到不了预览 host）。放行后 `strip-cookie` 中间件**删除 `Cookie`**，保证预览上游（dev server）收到的请求头里**没有 `Cookie`**（whoami 回显：上游无 `Cookie` 头）。**302 阶段**：forwardAuth 返回 `302 + Set-Cookie + Location` 时，Traefik 把该响应**原样透传给浏览器**（不剥离 `Set-Cookie`、不缓存）；`Location` 必须用**绝对 URL**（portal §2.7 第 6 步已如此，相对路径会被 Traefik 改写成相对 forwardAuth 地址）。
+
+> **预检与 deny 的 CORS（#241，2026-10-11 在 `traefik:v3.7.13` 真机实测）**：① **预检免鉴权在 portal 完成**（不在边缘加 `cors`/`headers` 中间件）：上游 dev server 自己已回 `Access-Control-Allow-Origin`，Traefik 的 CORS 中间件在反向代理**之前**写头、`ReverseProxy` 对后端响应是 **`Add` 而非 `Set`**，叠加后客户端会收到两个 `Access-Control-Allow-Origin` → 浏览器报「contains multiple values」而打断本已正常的带凭据请求。预检被 portal 判为放行后，Traefik 将 `OPTIONS` 原样转发给上游，由应用自己回 `Access-Control-Allow-*`（实测 204 + 全套头）。② **deny 分支的响应头会被 Traefik 透给客户端**：auth 子响应返回 `403` 时，客户端收到的状态码、响应体与**自定义响应头**均为 portal 所发（实测 `Access-Control-Allow-Origin`/`-Allow-Credentials`/`Vary` 均出现；`Connection`/`Keep-Alive` 这类逐跳头会被丢掉）。因此 ACAO 回显只需在 portal 的 deny 分支做（详 portal.md §2.7）。
 
 portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确查 `port_allocations.hostname` → 按 token 哈希查 `preview_grants`（一次性 ticket / host-only 预览 cookie；portal 自身会话才查 `login_sessions`）→ 按 `exposure` 授权**（**不解析 session cookie 的 `sub`**）。端口/槽位白名单、审计日志都在这里做；执行顺序与失败语义见 [portal.md](../api/portal.md) §2.7 与 [topology.md](topology.md) §5.2，此处不重复定义。
 

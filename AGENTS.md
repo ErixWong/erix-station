@@ -262,6 +262,25 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [x] **防漂移测试的工具名来自注册面，不是手抄清单**：`runner/test/system-prompt.test.js` 从 `createStationFileTools(...).schemas` 取名字再逐个断言提示词提到它（与 `file-tools-contract.test.js:400-407` 同思路）。上游改名时，这条测试跟着改名；手写一份名字清单只会多一个会过期的真相源。
 - [ ] **待办（主 agent）**：真机看模型在新提示词下是否不再盲发无 `mode` 的 `searchText`、是否不再把 `（无命中）` 当故障去 shell 里 `grep -r`（§8.9 待办 ① 的后续）。
 
+### 8.11 预览鉴权的 CORS 口径（issue #241，2026-10-11）
+
+背景：前后端分离的 FDE 应用（两个预览 host）在浏览器里“只要用到 `Authorization` 就必挂”。
+真机定位：平台把 CORS 预检（`OPTIONS`）也送去鉴权，而预检按 Fetch 规范**不携带任何凭据**；
+deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-Allow-Origin'`，把「需要预览票据」伪装成「应用 CORS 配错」。
+
+- [x] **两条口径**（实现：`preview.js:isCorsPreflight` + `authorizeForwardAuth` 预检分支、`http.js:corsDenyHeaders` + deny 分支）：
+  ① `OPTIONS` **且**带非空 `Access-Control-Request-Method` → 只免**凭证/exposure** 判定，第 1/2 步 fail-closed 照旧
+  （未知 host 仍 404、已释放仍 403）；不带 ACRM 的裸 `OPTIONS` 仍 403；预检无主体，**不**触发 `allocated→active` 升级。
+  ② deny（401/403/404）一律带 `Access-Control-Allow-Origin`（**回显**而非 `*`，带凭据时规范禁止通配）
+  + `Allow-Credentials: true` + `Vary: Origin`；只接受 `scheme://host[:port]`（含 IPv6）或 `null`，多值/含 CR-LF 不回显（防头注入）；无 `Origin` 则不造 CORS 头（curl 响应体字节不变）。
+- [x] **落点为何在 portal 而不在边缘**（实测依据，不是偏好）：`traefik:v3.7.13` 在 forwardAuth 非 2xx 短路时**会把 auth 子响应的状态码/响应体/自定义响应头透给客户端**（逐跳头 `Connection`/`Keep-Alive` 被丢），所以 portal 自己回显就生效；反之在边缘加 `cors`/`headers` 中间件会与上游 dev server 自带的 ACAO 叠成两个值（`ReverseProxy` 对后端响应是 **`Add` 而非 `Set`**）→ 浏览器报「multiple values」而**打断本已正常的带凭据请求**。预检被放行后由应用自己回 `Access-Control-Allow-*`（平台不代答）。
+- [x] ⚠ **最容易复发的坑**：`forwardAuth.authRequestHeaders` 是**白名单**（不在列的头一律不进 auth 子请求）。portal 想读 `Origin` / `Access-Control-Request-Method` 就必须同时把它们写进**生成器** `portal/src/routes.js`；只改 portal 而忘改白名单，两条修正会**默默失效**（测试只能靠 `routes.test.js` 的字节快照钉住）。生成产物 `deploy/traefik/dynamic/routes.yml` 禁手改。
+- [x] **审计枚举**：`details.grant_kind` 新增 `preflight`（`actor_id` 为 `NULL`），口径已同步 `docs/api/portal.md` §2.7；测试基线 **862/861/0/1**（净增 7 条，`docs/ops/ci-release.md` §1 与 `ci.yml` ② 注释同步）。
+- [ ] **未做（已记录）**：FDE 级 grant（一次签票给整组 host 发 cookie，免「要点两次预览」）在 #241 正文另议；
+  前端 host 自己的 dev server 不答 `OPTIONS`（返 200 + HTML 且无 ACAO）属**应用侧**，不在平台范围。
+
+
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。

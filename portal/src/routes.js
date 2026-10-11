@@ -196,7 +196,10 @@ export function generateTraefikConfig({
   // #57：trustForwardHeader 是 **forwardAuth 中间件**字段（非 entryPoint 级）：host 网络直连，
   // 不信入站 X-Forwarded-*，由 Traefik 自己按真实连接覆写（同时消 station-edge 启动 WRN）。
   lines.push('        trustForwardHeader: false');
-  lines.push('        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]');
+  // #241：authRequestHeaders 是**白名单**——列出的头原样转发进 auth 子请求，其余全丢。
+  // Origin / Access-Control-Request-Method 必须在列：前者是 portal 在 deny 响应里回显 ACAO 的
+  // 唯一来源，后者是它识别 CORS 预检（免凭证）的唯一依据（缺一个则 #241 对应一半默默失效）。
+  lines.push('        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie, Origin, Access-Control-Request-Method]');
   lines.push('        authResponseHeaders: [X-Auth-User]');
   lines.push('    strip-cookie:');
   lines.push('      headers:');
