@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from '../src/http.js';
+import { corsDenyHeaders } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { hashToken } from '../src/auth.js';
@@ -1005,6 +1006,158 @@ test('forward-auth fail-closed：无预览凭证 403 / 未知 host 404（可操�
   } finally {
     await s.close();
   }
+});
+
+// ---- #241：预览预检免鉴权 + 鉴权失败响应必须带 CORS 头 ----
+// 预检按规范不携带凭据，旧行为下被票据校验 403 拦死；deny 不带 ACAO 时浏览器只能报
+// 「No 'Access-Control-Allow-Origin' header is present」，把「需要预览票据」伪装成「应用 CORS 配错」。
+// 方案 B 的真实落点 = portal 自己发的 forwardAuth HTTP 响应（故在 HTTP 层断言，不是只测函数）。
+function preflightPool({ updates = [] } = {}) {
+  const allocs = new Map([
+    ['alice-p-4100.fde.erix.vip', { id: 'pa1', fde_id: 'u1', state: 'allocated', exposure: 'private', hostname: 'alice-p-4100.fde.erix.vip', fde_name: 'alice', user_status: 'active' }],
+    ['bob-p-4100.fde.erix.vip', { id: 'pa2', fde_id: 'u2', state: 'released', exposure: 'private', hostname: 'bob-p-4100.fde.erix.vip', fde_name: 'bob', user_status: 'active' }],
+  ]);
+  return {
+    async query(sql, params = []) {
+      if (sql.includes('FROM port_allocations a')) {
+        const a = allocs.get(params[0]);
+        return { rows: a ? [{ ...a }] : [] };
+      }
+      if (sql.includes('UPDATE port_allocations SET state')) {
+        updates.push(sql);
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+}
+
+const PRE_ORIGIN = 'http://alice-p-4000.fde.erix.vip:8090';
+
+const PRE_HOST = {
+  HOST: 'alice-p-4100.fde.erix.vip',
+  RELEASED: 'bob-p-4100.fde.erix.vip',
+};
+
+test('#241 forward-auth：OPTIONS + Access-Control-Request-Method 无凭证 → 放行（不再 403）', async () => {
+  const updates = [];
+  const s = await startServer({ pool: preflightPool({ updates }) });
+  try {
+    const pre = await fetch(`${s.base}/api/forward-auth`, {
+      method: 'OPTIONS',
+      headers: {
+        'x-forwarded-host': `${PRE_HOST.HOST}:8090`,
+        'x-forwarded-method': 'OPTIONS',
+        'x-forwarded-uri': '/api/leaderboard',
+        'x-forwarded-proto': 'http',
+        origin: PRE_ORIGIN,
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'authorization,content-type',
+      },
+    });
+    assert.notEqual(pre.status, 403, `预检不得再被票据校验拦成 403（实际 ${pre.status}）`);
+    assert.equal(pre.status, 200);
+    assert.equal(pre.headers.get('x-auth-user'), 'alice', '放行仍走 allow 分支（200 + X-Auth-User）');
+    // 预检无主体 → 不参与 allocated→active 升级（升级语义仍是「首次凭证放行」）。
+    assert.equal(updates.length, 0, '预检不得触发 allocated→active 升级');
+
+    // 安全底线：同一 host 的非预检真身请求（无凭证）仍 403 preview_ticket_required。
+    const real = await fetch(`${s.base}/api/forward-auth`, {
+      method: 'POST',
+      headers: {
+        'x-forwarded-host': `${PRE_HOST.HOST}:8090`,
+        'x-forwarded-method': 'POST',
+        'x-forwarded-uri': '/api/leaderboard',
+        origin: PRE_ORIGIN,
+      },
+    });
+    assert.equal(real.status, 403);
+    assert.equal((await real.json()).error.code, 'preview_ticket_required');
+
+    // 裸 OPTIONS（无 ACRM，不是 CORS 预检）仍 403：预检放行只针对完整预检形态。
+    const bare = await fetch(`${s.base}/api/forward-auth`, {
+      method: 'OPTIONS',
+      headers: { 'x-forwarded-host': `${PRE_HOST.HOST}:8090`, 'x-forwarded-method': 'OPTIONS' },
+    });
+    assert.equal(bare.status, 403);
+    assert.equal((await bare.json()).error.code, 'preview_ticket_required');
+
+    // 预检也不得绕过 hostname / state 两条 fail-closed 校验。
+    const unknown = await fetch(`${s.base}/api/forward-auth`, {
+      method: 'OPTIONS',
+      headers: { 'x-forwarded-host': 'nope.fde.erix.vip', 'x-forwarded-method': 'OPTIONS', 'access-control-request-method': 'POST' },
+    });
+    assert.equal(unknown.status, 404);
+    const released = await fetch(`${s.base}/api/forward-auth`, {
+      method: 'OPTIONS',
+      headers: { 'x-forwarded-host': PRE_HOST.RELEASED, 'x-forwarded-method': 'OPTIONS', 'access-control-request-method': 'POST' },
+    });
+    assert.equal(released.status, 403);
+    assert.equal((await released.json()).error.code, 'allocation_released');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#241 forward-auth deny 带 CORS 头：403 preview_ticket_required 仍 403、且 ACAO/ACAC/Vary 齐全', async () => {
+  const s = await startServer({ pool: preflightPool() });
+  try {
+    const res = await fetch(`${s.base}/api/forward-auth`, {
+      headers: { 'x-forwarded-host': `${PRE_HOST.HOST}:8090`, 'x-forwarded-method': 'GET', origin: PRE_ORIGIN },
+    });
+    assert.equal(res.status, 403, '加 CORS 头不得改状态码（安全底线：无票据仍 403）');
+    const body = await res.json();
+    assert.equal(body.error.code, 'preview_ticket_required', '错误信封也不得变');
+    assert.equal(res.headers.get('access-control-allow-origin'), PRE_ORIGIN, '回显请求 Origin（带凭据不能用 *）');
+    assert.equal(res.headers.get('access-control-allow-credentials'), 'true');
+    assert.equal(res.headers.get('vary'), 'Origin');
+
+    // deny 的每一分支都是同一落点：released 403 / 未知 host 404 同样带 CORS 头。
+    const rel = await fetch(`${s.base}/api/forward-auth`, {
+      headers: { 'x-forwarded-host': PRE_HOST.RELEASED, origin: PRE_ORIGIN },
+    });
+    assert.equal(rel.status, 403);
+    assert.equal(rel.headers.get('access-control-allow-origin'), PRE_ORIGIN);
+    const nf = await fetch(`${s.base}/api/forward-auth`, {
+      headers: { 'x-forwarded-host': 'nope.fde.erix.vip', origin: PRE_ORIGIN },
+    });
+    assert.equal(nf.status, 404);
+    assert.equal(nf.headers.get('access-control-allow-origin'), PRE_ORIGIN);
+    assert.equal(nf.headers.get('vary'), 'Origin');
+
+    // 无 Origin → 不凭空造 ACAO（非浏览器调用、curl 对照等保持原样）。
+    const noOrigin = await fetch(`${s.base}/api/forward-auth`, {
+      headers: { 'x-forwarded-host': `${PRE_HOST.HOST}:8090` },
+    });
+    assert.equal(noOrigin.status, 403);
+    assert.equal(noOrigin.headers.get('access-control-allow-origin'), null);
+    assert.equal(noOrigin.headers.get('vary'), null);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#241 corsDenyHeaders：只回显单个合法 Origin（注入面/多值拒绝），绝不发 `*`', () => {
+  assert.deepEqual(corsDenyHeaders(PRE_ORIGIN), {
+    'Access-Control-Allow-Origin': PRE_ORIGIN,
+    'Access-Control-Allow-Credentials': 'true',
+    Vary: 'Origin',
+  });
+  assert.equal(corsDenyHeaders('https://alice-p-4000.fde.erix.vip')['Access-Control-Allow-Origin'], 'https://alice-p-4000.fde.erix.vip');
+  assert.equal(corsDenyHeaders('http://[::1]:8090')['Access-Control-Allow-Origin'], 'http://[::1]:8090', 'IPv6 字面量');
+  assert.equal(corsDenyHeaders('null')['Access-Control-Allow-Origin'], 'null', 'sandboxed iframe / file: 的 opaque origin');
+  // 非法/多余形态 → 不回显（宁缺勿错：宁让浏览器退回原报错，也不发可疑 ACAO）
+  assert.deepEqual(corsDenyHeaders(undefined), {});
+  assert.deepEqual(corsDenyHeaders(''), {});
+  assert.deepEqual(corsDenyHeaders('   '), {});
+  assert.deepEqual(corsDenyHeaders('*'), {}, '绝不发通配（带凭据的请求规范不允许）');
+  assert.deepEqual(corsDenyHeaders('http://a,http://b'), {}, '重复 Origin 头被 Node 拼成逗号形 → 多值拒绝');
+  assert.deepEqual(corsDenyHeaders('http://a b'), {}, '空格');
+  assert.deepEqual(corsDenyHeaders('http://a\r\nX-Evil: 1'), {}, 'CRLF 响应头注入');
+  assert.deepEqual(corsDenyHeaders('javascript:alert(1)'), {}, '非 scheme://authority 形态');
+  assert.deepEqual(corsDenyHeaders('http://a/path'), {}, 'Origin 不带路径 → 带路径即非法');
+  assert.deepEqual(corsDenyHeaders(`http://${'a'.repeat(2100)}`), {}, '长度上限');
 });
 
 // #57 阶段2 Host 收口 + #58（fix-250923-01）回归：dev 公开入口带端口（:8090）时，

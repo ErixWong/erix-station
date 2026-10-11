@@ -100,6 +100,18 @@ async function findActiveSessionByParent(pool, parentTicketId, now) {
 }
 
 /**
+ * CORS 预检形态判定（#241，口径唯一入口）：`OPTIONS` **且**带非空 `Access-Control-Request-Method`。
+ * 这是 Fetch 规范里「预检」的定义；预检请求**按规范不携带任何凭据**（cookie / Authorization 都不发），
+ * 所以它不可能通过票据/预览 cookie 校验——若照旧要求凭证，任何需要自定义头（如 Authorization）的
+ * 跨端口请求会整片不可用（issue #241）。只带 `OPTIONS` 而无 ACRM（非 CORS 预检，如能力探测）
+ * **不算**预检，仍走原鉴权路径（fail-closed 面不扩大）。
+ */
+export function isCorsPreflight({ method = 'GET', accessControlRequestMethod = null } = {}) {
+  if (String(method).toUpperCase() !== 'OPTIONS') return false;
+  return typeof accessControlRequestMethod === 'string' && accessControlRequestMethod.trim() !== '';
+}
+
+/**
  * Host 头归一化（#57 阶段2 收口；沿 fix-250923-01 的既有语义）：**剥端口 + 小写**。
  * 查表（port_allocations.hostname 按无端口、小写存储）必须用本函数的输出；
  * **302 Location 仍用原始 Host 头（含非默认端口）**，dev 8090/8443 否则跳 :80 拒连（fix-250923-01 行为不变）。
@@ -242,8 +254,10 @@ function buildLocation(scheme, hostname, cleanUri, hostHeader = null) {
 /**
  * forward-auth 授权核心（portal.md §2.7）。返回结构化结果，由 http.js 映射为 HTTP 响应。
  * fail-closed：无凭证 / 凭证无效一律 deny，绝不放行。
+ * 唯一例外（#241）：CORS 预检（OPTIONS + Access-Control-Request-Method）免**凭证**，
+ * 但第 1/2 步（hostname 精确查表、`released` 拒绝）**照旧**——未知 host 仍 404、已释放仍 403。
  */
-export async function authorizeForwardAuth(pool, config, { hostname, hostHeader = null, uri = '/', cookieValue = null, method = 'GET', scheme = 'https', now = new Date() } = {}) {
+export async function authorizeForwardAuth(pool, config, { hostname, hostHeader = null, uri = '/', cookieValue = null, method = 'GET', scheme = 'https', accessControlRequestMethod = null, now = new Date() } = {}) {
   const r = await pool.query(
     `SELECT a.id, a.fde_id, a.state, a.exposure, a.hostname, u.fde_name, u.status AS user_status
        FROM port_allocations a
@@ -257,6 +271,22 @@ export async function authorizeForwardAuth(pool, config, { hostname, hostHeader 
   if (!allocation) return deny(404, 'not_found', 'preview host not found (unassigned preview domain or stale bookmark)');
   if (allocation.state === 'released') {
     return deny(403, 'allocation_released', 'allocation released', { allocation });
+  }
+
+  // #241：CORS 预检免凭证放行（预检按规范不带凭据，见 isCorsPreflight）。位置**在 hostname/state
+  // 两条 fail-closed 校验之后**，所以预检不能用来探测未知/已释放的预览 host；也不做 exposure 判定
+  // （预检不携带、不返回任何业务数据）。`preflight: true` 让 http.js 跳过 allocated→active 升级
+  //（升级语义仍是「首次**凭证**放行」，紧随其后的真身请求会照常触发）。
+  if (isCorsPreflight({ method, accessControlRequestMethod })) {
+    return allow(allocation, {
+      subjectId: null,
+      issuerId: null,
+      grantId: null,
+      grantKind: 'preflight',
+      cookieToken: null,
+      fdeName: allocation.fde_name,
+      preflight: true,
+    });
   }
 
   // public：不要求凭证（仍须过 hostname/state 校验）。
