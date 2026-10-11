@@ -76,6 +76,44 @@ function getCookie(req, name) {
   return null;
 }
 
+/**
+ * #241：forwardAuth **deny** 响应的 CORS 头（单一实现，真实落点 = portal 的 deny 分支）。
+ *
+ * 为什么必须带：deny 响应经 Traefik 原样透给浏览器（实测：v3.7.13 把 auth 子响应的
+ * 状态码/响应体/响应头都拷给客户端）。不带 ACAO 时浏览器只报
+ * `No 'Access-Control-Allow-Origin' header is present`，把「需要预览票据」伪装成
+ * 「应用 CORS 配错」——用户永远看不到真实原因（403 preview_ticket_required）。
+ *
+ * 口径：
+ *  - **回显**单个 Origin（不用 `*`：预览流一律 `credentials:'include'`，带凭据时规范禁止通配）。
+ *  - 只接受 `scheme://host[:port]`（含 IPv6 字面量）或字面量 `null`：禁空格/逗号/`/`/`?`/`#`/CR/LF，
+ *    防响应头注入与「一个 ACAO 头里塞两个值」；非法 Origin 直接不回显（宁可退回浏览器原始报错）。
+ *  - `Vary: Origin` 必带（响应随 Origin 变，缓存不得复用）。
+ *  - 状态码与错误信封一律**不变**（安全底线：无票据仍 403，只是让浏览器能读出真相）。
+ */
+const CORS_ORIGIN_RE = new RegExp(
+  ['^',
+    '[A-Za-z][A-Za-z0-9+.-]*:\\/\\/', // scheme "://"
+    '(?:',
+    '[A-Za-z0-9._-]+', // IPv4 / 域名（字母数字与 . _ -）
+    '|\\[[0-9A-Fa-f:]+\\]', // IPv6 字面量 [::1]
+    ')',
+    '(?::\\d{1,5})?', // 端口（dev :8090 必须原样保留，它是 origin 的一部分）
+    '$',
+  ].join(''),
+);
+
+export function corsDenyHeaders(originHeader) {
+  const origin = typeof originHeader === 'string' ? originHeader.trim() : '';
+  if (origin === '' || origin.length > 2048) return {};
+  if (origin !== 'null' && !CORS_ORIGIN_RE.test(origin)) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    Vary: 'Origin',
+  };
+}
+
 /** F2：审计前只记 path，剥离所有 query（?preview_ticket=<明文> 等绝不入审计）。 */
 function pathOnly(uri) {
   if (typeof uri !== 'string') return '/';
@@ -1496,7 +1534,9 @@ async function requireSession(req, ctx) {
  *  ③ 无凭证 → 403 preview_ticket_required；ticket 无效/过期 → 401；撤销/不匹配/重放 → 403；
  *  ④ 凭证校验通过 → exposure 判定（private：owner/admin）；
  *  ⑤ ticket 通过 → 302 + Set-Cookie（换取预览 cookie）；cookie 通过 → 200 + X-Auth-User。
- * 放行（allow/redirect）后执行 allocated→active 幂等升级：
+ * 例外（#241）：CORS 预检（OPTIONS + Access-Control-Request-Method）免凭证过②以后的所有凭证校验
+ * （但 ①② 照旧）；deny 响应一律带 ACAO/ACAC/Vary（#241，见 corsDenyHeaders）。
+ * 放行（allow/redirect）后执行 allocated→active 幂等升级（预检不参与，#241）：
  *   UPDATE port_allocations SET state='active' WHERE id=$1 AND state='allocated'（fde-platform §8.6）。
  */
 async function handleForwardAuth(req, res, ctx) {
@@ -1509,6 +1549,11 @@ async function handleForwardAuth(req, res, ctx) {
   const method = req.headers['x-forwarded-method'] || req.method;
   const scheme = req.headers['x-forwarded-proto'] || 'https';
   const cookieValue = getCookie(req, ctx.config.previewCookie?.name ?? '__Host-fde_preview');
+  // #241：预检识别与 ACAO 回显依赖的两个头——Traefik forwardAuth 只转发 `authRequestHeaders`
+  // 白名单内的头（routes.js 生成），所以 Origin / Access-Control-Request-Method 必须同时在
+  // 白名单里，否则这里永远读到空（预检放行与 CORS 回显双双失效）。
+  const origin = req.headers.origin ?? null;
+  const accessControlRequestMethod = req.headers['access-control-request-method'] ?? null;
 
   const result = await preview.authorizeForwardAuth(ctx.pool, ctx.config, {
     hostname: host || '',
@@ -1518,6 +1563,7 @@ async function handleForwardAuth(req, res, ctx) {
     cookieValue,
     method,
     scheme,
+    accessControlRequestMethod,
   });
 
   // 审计：每次判定（无论通过与否）都写（portal.md §2.7）。details 不记 ticket/cookie 明文，也不记 query（F2：剥离所有 query，只记 path）。
@@ -1539,13 +1585,19 @@ async function handleForwardAuth(req, res, ctx) {
   }).catch(() => {});
 
   if (result.outcome === 'deny') {
-    return sendJson(res, result.status, errorBody(result.code, result.message));
+    // #241：deny 也带 CORS 头（状态码与错误信封不变）。落点在 portal：实测 Traefik v3.7.13
+    // 会把 auth 子响应的头透给客户端，所以无需在边缘再加 cors 中间件（避免与上游应用自带的
+    // ACAO 重复，那会让浏览器报「multiple values」而打断本已正常的带凭据请求）。
+    return sendJson(res, result.status, errorBody(result.code, result.message), corsDenyHeaders(origin));
   }
 
   // 放行 → allocated→active 幂等升级（fde-platform §8.6）；不写 route outbox、不重发路由。
-  await ctx.pool
-    .query(`UPDATE port_allocations SET state = 'active' WHERE id = $1 AND state = 'allocated'`, [result.allocation.id])
-    .catch(() => {});
+  // #241：预检放行**不**参与升级（无主体，升级语义仍是「首次凭证放行」；紧随其后的真身请求照常触发）。
+  if (!result.preflight) {
+    await ctx.pool
+      .query(`UPDATE port_allocations SET state = 'active' WHERE id = $1 AND state = 'allocated'`, [result.allocation.id])
+      .catch(() => {});
+  }
 
   if (result.outcome === 'redirect') {
     const headers = {

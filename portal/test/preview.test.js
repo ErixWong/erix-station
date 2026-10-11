@@ -9,6 +9,7 @@ import {
   issuePreviewTicket,
   authorizeForwardAuth,
   normalizeHostHeader,
+  isCorsPreflight,
 } from '../src/preview.js';
 import { hashToken } from '../src/auth.js';
 
@@ -23,6 +24,7 @@ class PreviewPool {
     this.users = users;
     this.grants = grants;
     this.grantSeq = 100;
+    this.queries = [];
   }
   dispatch(sql, params = []) {
     // 事务原语
@@ -97,6 +99,7 @@ class PreviewPool {
     return { rows: [] };
   }
   async query(sql, params) {
+    this.queries.push(sql); // #241：部分断言需要「有没有发过这条 SQL」（预检不写 grant / 不滚动续期）
     return this.dispatch(sql, params);
   }
   async connect() {
@@ -121,7 +124,7 @@ function makePool(overrides = {}) {
   const allocations = overrides.allocations ?? [ALLOC];
   const users = overrides.users ?? [{ id: 'u1', role: 'fde', status: 'active' }];
   const pool = new PreviewPool({ allocations, users, grants: overrides.grants ?? [] });
-  return { pool, grants: pool.grants };
+  return { pool, grants: pool.grants, queries: pool.queries };
 }
 
 const config = {
@@ -392,4 +395,59 @@ test('#57 issuePreviewTicket：返回的预览 URL 按公开入口派生（dev h
   const tlsConfig = { ...config, portalPublicBaseUrl: 'https://station.fde.erix.vip:8443' };
   const tls = await issuePreviewTicket(makePool().pool, tlsConfig, { allocationId: 'pa1', session, now: NOW });
   assert.equal(tls.url, `https://alice-p-4000.fde.erix.vip:8443?preview_ticket=${tls.ticket}`);
+});
+
+// ---- #241：CORS 预检免凭证（预检按规范不带凭据，要凭证就等于封死一切需自定义头的跳端口请求）----
+test('#241 isCorsPreflight：仅 OPTIONS + 非空 Access-Control-Request-Method 算预检', () => {
+  assert.equal(isCorsPreflight({ method: 'OPTIONS', accessControlRequestMethod: 'POST' }), true);
+  assert.equal(isCorsPreflight({ method: 'options', accessControlRequestMethod: 'GET' }), true, '方法大小写不敏感');
+  // 非预检（fail-closed 面不扩大）：无 ACRM 的 OPTIONS / 非 OPTIONS 带 ACRM / 空 ACRM / 缺 ACRM
+  assert.equal(isCorsPreflight({ method: 'OPTIONS' }), false);
+  assert.equal(isCorsPreflight({ method: 'OPTIONS', accessControlRequestMethod: '   ' }), false);
+  assert.equal(isCorsPreflight({ method: 'GET', accessControlRequestMethod: 'POST' }), false);
+  assert.equal(isCorsPreflight({ method: 'POST', accessControlRequestMethod: 'POST' }), false);
+  assert.equal(isCorsPreflight(), false);
+});
+
+test('#241 authorizeForwardAuth：预检无凭证→放行（grantKind=preflight，不查凭证、不升级状态）', async () => {
+  const { pool, queries } = makePool();
+  const res = await authorizeForwardAuth(pool, config, {
+    hostname: ALLOC.hostname,
+    uri: '/api/leaderboard',
+    method: 'OPTIONS',
+    accessControlRequestMethod: 'POST',
+    scheme: 'http',
+    now: NOW,
+  });
+  assert.equal(res.outcome, 'allow');
+  assert.equal(res.status, 200);
+  assert.equal(res.grantKind, 'preflight');
+  assert.equal(res.preflight, true);
+  assert.equal(res.subjectId, null, '预检无主体');
+  assert.equal(res.grantId, null);
+  assert.equal(res.fdeName, 'alice');
+  // 预检不碰凭证表、不做 allocated→active 升级（升级语义仍是「首次凭证放行」）
+  assert.ok(!queries.some((q) => /INSERT INTO preview_grants/.test(q)), '预检不得写 grant');
+  assert.ok(!queries.some((q) => /SET expires_at/.test(q)), '预检不得滚动续期');
+});
+
+test('#241 authorizeForwardAuth：预检**不能**绕过 hostname/state 两条 fail-closed 校验', async () => {
+  const { pool } = makePool();
+  const pre = { method: 'OPTIONS', accessControlRequestMethod: 'POST', now: NOW };
+  const unknown = await authorizeForwardAuth(pool, config, { hostname: 'nope.fde.localhost', ...pre });
+  assert.equal(unknown.outcome, 'deny');
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.code, 'not_found');
+
+  const { pool: p2 } = makePool({ allocations: [{ ...ALLOC, state: 'released' }] });
+  const rel = await authorizeForwardAuth(p2, config, { hostname: ALLOC.hostname, ...pre });
+  assert.equal(rel.outcome, 'deny');
+  assert.equal(rel.status, 403);
+  assert.equal(rel.code, 'allocation_released');
+
+  // 非预检的裸 OPTIONS（无 ACRM）仍必须 403 preview_ticket_required：安全底线不放宽。
+  const bare = await authorizeForwardAuth(pool, config, { hostname: ALLOC.hostname, method: 'OPTIONS', now: NOW });
+  assert.equal(bare.outcome, 'deny');
+  assert.equal(bare.status, 403);
+  assert.equal(bare.code, 'preview_ticket_required');
 });
