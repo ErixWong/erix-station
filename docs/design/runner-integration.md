@@ -817,6 +817,22 @@ FDE 浏览器        portal                agentd               worker（execute
 
 ---
 
+## 17. 工具风险面（哪个工具能砸什么、靠什么兜着）
+
+> 来源：#249 裁决「不做工具审批」附带的缺口——文档里从来只写「有哪些工具」，没写「哪个能砸东西」。
+> 工具名以**注册面为准**（`createStationFileTools(...).exposedToolNames` + `shell` + 条件装配的 `note_*`），不手抄清单。
+
+| 工具 | 能砸什么 | 靠什么兜着 | 审计落点 |
+|---|---|---|---|
+| `readFile` / `searchText` / `tree` | 读到不该看的字节（密钥、`.env`） | jail `assertReadable` + `maskedPaths`（内容一字节不回传，只进排除账）；单次 ≤ 262144 字节 | `tool_calls` / `tool_outputs` |
+| `writeFile` / `edit` | 覆盖项目内文件、批量改动 | jail **可写边界**＝项目目录；越界**直接失败且不落盘**；`edit` 只吃逐字节精确匹配，0 命中/多处命中整次不落盘 | 同上（成功回显短 diff） |
+| **`shell`** | **最大爆破半径**：`rm -rf`、`git push --force`、`curl \| sh`、往 `$HOME` 别处写、外呼网络 | **只有**：容器隔离（不 publish 端口、单 FDE 网络、LLM 唯一出口）+ 超时（默认 60s／上限 600s）+ 输出 32KB 上限 + cwd 词法 `..` 拒绝（**注释明写不做 symlink/realpath 防御**，`runner/lib/shell-tools.js:7`）+ env 无平台凭据（agentd 剔除 `ERIX_STATION_TOKEN`） | `tool_calls.command` + 退出码；网络侧靠 Traefik/防火墙（**#233 未实现＝已知缺口**） |
+| `note_write` / `note_complete` / `note_revoke` | 污染档案 | 落 run 数据目录（宿主自管，终态清理 + 启动 sweep TTL） | 同上 + run 数据目录 |
+
+**为什么这张表比一个「批准」按钮有用**：出事时的排查路径是「先看 `tool_calls` 里那条记录 → 再看它归哪一列『靠什么兜着』」——若归 `shell`，就去查容器网络与磁盘，而不是去找一个并不存在的审批入口。
+
+---
+
 ## 附录：关键上游事实速查（erix-agent v0.3.5 实测）
 
 | 事实 | 位置 |
