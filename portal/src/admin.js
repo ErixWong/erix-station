@@ -133,9 +133,11 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   // #202：开户口径提前到与路由生成（routes.js isValidHostname）同源——按 buildHostname 语法拼出
   // 最终预览 hostname 后**整体**校验（逐标签 ≤63 + 总长 ≤253），不是只验各段。
   // 不改 FDE_NAME_RE（≤63）本身：它还被目录名/容器名/git-credential 路径复用，那些不受 DNS 标签
-  // 约束；预览域名预算只适用于「参与拼域名」（首标签固定段 "-p-<port4>" 占 7 字符 → FDE 名预算 56，
-  // 理由详见 projects.js #202 注释）。57..63 字符的名字过去要等到路由生成阶段才爆（用户只见
-  // 「预览打不开」），现在开户即 400，文案可操作。baseDomain 缺省时退化为只校验首标签（预算与 base 无关）。
+  // 约束；预览域名预算只适用于「参与拼域名」——首标签固定段 `-p-<port>` 占 **8** 字符（#246 起端口
+  // 在号池 22000–29999，5 位；#240 时代是 4 位 ⇒ 7 字符）⇒ **FDE 名预算 55**（63 − 8；两个数都从
+  // portal/src/previewpool.js 的池边界推导，不在这里写死，理由详见 projects.js #202 注释）。
+  // 56..63 字符的名字过去要等到路由生成阶段才爆（用户只见「预览打不开」），现在开户即 400，文案可操作。
+  // baseDomain 缺省时退化为只校验首标签（预算与 base 无关）。
   const hostnameCheck = projects.validateFdeNameForHostname(fde_name, { baseDomain });
   if (!hostnameCheck.ok) {
     throw new AdminError('validation_failed', hostnameCheck.message, { details: { field: 'fde_name' } });

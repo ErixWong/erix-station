@@ -150,15 +150,17 @@ test('提示词里的 shell 仍是命令执行面（文件工具不执行命令�
   // 本文件不提前断言一个本片还没交付的性质，否则 B 片会依赖 C 片的改动才能绿。
 });
 
-// issue #240：预览域名改为「平台预建 10 条」，提示词必须复述同一口径。
-// 为什么要把端口窗口从 portal 侧常量拿而不是在测试里重打一遍：这条提示词与 portal/src/portalloc.js
-// 是**两个包里的两份文案**，决策者拍的是「告知 + 尽力」，两处数字对不上就是告知失败
-// （容器侧不做端口管控，没有任何机制会替我们发现漂移）。
+// issue #240 引入、#246 交付①改口径：预览端口段由平台从全局号池**分配**，提示词必须复述
+// 「`~/.erix/ports.json` 的清单是唯一真相」。
+// 为什么比 #240 的写法更硬：这条提示词与 portal 侧常量是**两个包里的两份文案**，决策者拍的是
+// 「告知 + 尽力」（容器侧不做端口管控，没有任何机制会替我们发现漂移）。#246 后每个 FDE 拿哪一段是
+// **运行时决定**的（还会被管理员改段）⇒ 提示词里**不许出现任何端口数字**：抄一份号（无论是旧的
+// 4000–4009 还是号池边界 22000–29999）就是埋下一份必然漂移的第二清单。
 /** 抠出「预览域名与端口」整段（从标题行到下一个空行）——按段断言，避免靠关键词跨行凑齐语义。 */
 function previewSection(prompt) {
   const lines = prompt.split('\n');
   const start = lines.findIndex((l) => l.startsWith('预览域名与端口'));
-  assert.notEqual(start, -1, 'SYSTEM_PROMPT 必须有「预览域名与端口」这一段（#240 的告知落点之一）');
+  assert.notEqual(start, -1, 'SYSTEM_PROMPT 必须有「预览域名与端口」这一段（#240/#246 的告知落点之一）');
   const rest = lines.slice(start);
   const end = rest.findIndex((l) => l.trim() === '');
   const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
@@ -166,20 +168,23 @@ function previewSection(prompt) {
   return section;
 }
 
-test('SYSTEM_PROMPT 讲清「平台预建 10 条预览域名」：条数/端口窗口与 portal 侧常量一致', async () => {
+test('SYSTEM_PROMPT 讲清「端口段由平台分配 + ports.json 是唯一真相」，且不拄任何端口数字', async () => {
   const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
-  const { PREVIEW_PORTS, PREVIEW_PORT_START, PREVIEW_PORT_COUNT } = await import('../../portal/src/portalloc.js');
+  const { PREVIEW_PORT_POOL_START, PREVIEW_PORT_POOL_END, PREVIEW_PORT_COUNT } = await import('../../portal/src/previewpool.js');
   const section = previewSection(prompt);
 
-  assert.equal(PREVIEW_PORT_COUNT, 10);
-  assert.equal(PREVIEW_PORT_START, 4000);
-  assert.deepEqual(PREVIEW_PORTS, [4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009]);
-
-  assert.match(section, /预建|已预建/, '必须写明是平台预建（不是让 agent 去申请）');
-  assert.match(section, /10 条/, '必须写明固定 10 条');
-  assert.match(section, new RegExp(`${PREVIEW_PORT_START}[–—-]\\s*${PREVIEW_PORTS.at(-1)}`),
-    `必须写明端口窗口 ${PREVIEW_PORT_START}–${PREVIEW_PORTS.at(-1)}（与 portalloc.js 常量一致）`);
+  assert.equal(PREVIEW_PORT_COUNT, 10, '默认块大小仍是 10（条数可以写，**号码**不许写）');
+  assert.match(section, /平台.*分配|由平台.*分配/, '必须写明端口段由平台分配（不再是人人同一段）');
+  assert.match(section, new RegExp(`默认 ${PREVIEW_PORT_COUNT} 个`), '默认块大小必须与 portal 侧常量一致（不在测试里重打一遍）');
+  assert.match(section, /唯一真相/, '必须把 ports.json 钉成唯一真相（#246）');
   assert.match(section, /~\/\.erix\/ports\.json/, '端口与 URL 的清单来源必须写出来');
+  assert.match(section, /不要凭记忆|不要假设/, '必须阻止 agent 凭旧先验猜端口（#240 时代留下来的习惯）');
+
+  // 端口数字一个都不许出现：旧的 4xxx 窗口已作废，号池边界也不许拄进提示词。
+  assert.doesNotMatch(section, /\b4\d{3}\b/, `不得再出现 #240 时代的固定窗口（\`4000–4009\`）：${section}`);
+  assert.doesNotMatch(section, new RegExp(`\\b${PREVIEW_PORT_POOL_START}\\b|\\b${PREVIEW_PORT_POOL_END}\\b`),
+    `不得把号池边界 ${PREVIEW_PORT_POOL_START}–${PREVIEW_PORT_POOL_END} 拄进提示词（第二份清单必然漂移）`);
+  assert.doesNotMatch(section, /\b\d{4,5}\s*[–—-]\s*\d{4,5}\b/, '不得出现任何端口区间字面量');
 });
 
 test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端口、文件工具去读家目录', () => {
@@ -187,8 +192,8 @@ test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端�
   const section = previewSection(prompt);
   // ① 自造：域名由平台按 <fde>-p-<port> 生成（与路由同源），agent 只能选不能用
   assert.match(section, /不要自造域名或端口|不要自造/, '必须禁止自造域名/端口');
-  assert.match(section, /必须从这 10 个/, '必须把选择范围钉在预建的 10 条里');
-  // ② 索要：固定 10 条 ⇒ 没有 port_quota_exceeded 这回事，也别去提工单
+  assert.match(section, /必须从清单里选/, '必须把选择范围钉在平台给的那一段里');
+  // ② 索要：没有 port_quota_exceeded 这回事，也别去提工单
   assert.match(section, /不要要求平台再加|不要要求平台/, '必须写明不要要求平台加端口（配额语义已删除）');
   // ③ 可达性：jail 根是项目目录，~/.erix/ports.json 只能经 shell 读（说了等于没说会白烧轮次）
   assert.match(section, /shell/, '必须给出读得到 ports.json 的实际手段（文件工具够不到家目录）');

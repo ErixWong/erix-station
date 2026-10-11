@@ -102,7 +102,8 @@
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
-| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名固定预分配 10 条 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码） | 否 |
+| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2） | 是（仅此码） |
+| 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发 | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
@@ -291,7 +292,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 | 头 | 用途 |
 |---|---|
-| `X-Forwarded-Host` | 形如 `<fde>-p-<port4>.<BASE_DOMAIN>`（伞域口径，#57；示例：`eric-p-8001.fde.erix.vip`，dev 带端口后缀 `:8090`）；Traefik 以真实 `Host` 覆盖。portal 查表前**剥端口 + 小写**（唯一实现 `preview.normalizeHostHeader`），302 `Location` 仍保留原始 Host（含端口） |
+| `X-Forwarded-Host` | 形如 `<fde>-p-<portLabel>.<BASE_DOMAIN>`（伞域口径，#57；#246 号池端口 5 位 ⇒ 示例 `eric-p-22000.fde.erix.vip`，dev 带端口后缀 `:8090`）；Traefik 以真实 `Host` 覆盖。portal 查表前**剥端口 + 小写**（唯一实现 `preview.normalizeHostHeader`），302 `Location` 仍保留原始 Host（含端口） |
 | `X-Forwarded-Uri` / `X-Forwarded-Method` | 从 `X-Forwarded-Uri` 解析 `preview_ticket` 查询参数；方法用于审计 |
 | `Cookie` | 只看 `__Host-fde_preview`（本 host 的预览 cookie） |
 | `Origin` / `Access-Control-Request-Method` | CORS 用（#241）：前者是 deny 响应回显 `Access-Control-Allow-Origin` 的唯一来源，后者是识别预检的唯一依据。⚠ 两者必须在 Traefik `forwardAuth.authRequestHeaders` **白名单**内（该白名单外的头一律不进 auth 子请求）；白名单由路由生成器 `portal/src/routes.js` 产出，不得手改生成产物 `deploy/traefik/dynamic/routes.yml` |
@@ -357,17 +358,19 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 字段 | 说明 |
 |---|---|
 | `ticket` | 一次性、短 TTL 的不透明 token；只可经 `?preview_ticket=` 使用一次 |
-| `url` | **预览完整域**（`<fde>-p-<port4>.<BASE_DOMAIN>`，fde-platform §8.5）+ `?preview_ticket=`，前端**直接跳转/作为 iframe src**，不得自行拼接（规格 §8-4）。scheme/端口按**公开入口**派生（#57：dev `http://…:8090`、生产 https 默认端口不进 URL；实现 `projects.previewUrl(hostname, { publicBaseUrl: portalPublicBaseUrl })`） |
+| `url` | **预览完整域**（`<fde>-p-<portLabel>.<BASE_DOMAIN>`，fde-platform §8.5；#246 后端口段是号池里的 5 位号，**不是**固定的 `40XX`）+ `?preview_ticket=`，前端**直接跳转/作为 iframe src**，不得自行拼接（规格 §8-4）。scheme/端口按**公开入口**派生（#57：dev `http://…:8090`、生产 https 默认端口不进 URL；实现 `projects.previewUrl(hostname, { publicBaseUrl: portalPublicBaseUrl })`） |
 | `expires_in` | TTL 秒数（**60s ⚠️ 待决策者确认**） |
 
 签发规则：
 - 当前用户对该 allocation 的可见性必须成立：`private` → 仅 owner **或 admin**（admin 例外，写审计 + 告警）；`org-visible` → 任意已认证用户；`public` → 真公开免凭证（**默认不给，仅 admin 可开**）——签发侧同样仅 admin 可为 `public` allocation 签发 bootstrap ticket。不成立 → `404 not_found`（他人资源不泄露存在性，§1.2）。
 - allocation 必须 `state ∈ {allocated,active}`；已 `released` 视同不存在 → `404`。
-- **每条预览 host 各自签票**（#240：一个 FDE 开户即有 10 条 allocation，端口 `4000–4009`）：
+- **每条预览 host 各自签票**（#240：一个 FDE 开户即有一整段 allocation；#246 交付①把端口来源换成
+  **全局号池 `22000–29999` 里最小的未占用对齐块**（默认 10 个一段，管理员可改），所以**具体是哪几个号
+  运行时才决定**，本文档不写死端口区间——唯一真相是 `~/.erix/ports.json` 与该 FDE 的 allocation 行）：
   ticket 与派生的预览 cookie 都**绑一条 allocation / 一个 host**——`preview_grants.allocation_id` 只指向
-  签票时那一条，`__Host-fde_preview` 是 host-only cookie（本节末），所以 `…-p-4000.…` 上拿到的凭证
-  **不会**让 `…-p-4001.…` 免凭证通过：10 个域名要逐个签票、逐个种 cookie，`forwardAuth` 第 1 步按
-  请求的 hostname 精确查 `port_allocations`（§2.7），换个 host 就查不到那张票。
+  签票时那一条，`__Host-fde_preview` 是 host-only cookie（本节末），所以 `…-p-22000.…` 上拿到的凭证
+  **不会**让 `…-p-22001.…` 免凭证通过：一段里的每个域名都要逐个签票、逐个种 cookie（issue #247 要收掉的
+  就是这个），`forwardAuth` 第 1 步按请求的 hostname 精确查 `port_allocations`（§2.7），换个 host 就查不到那张票。
   反过来也成立：**给某条 allocation 签的票不会让它指向别的 host**（`url` 由该 allocation 自己的
   `hostname` 生成，规格 §8-4 前端不得自行拼接）。
 - portal 生成随机 token，只存 `preview_grants`（`kind='ticket'`，`token_hash=sha256(ticket)`，**`issuer_id` = 当前登录用户（签发者）**、`user_id` = **主体（被授权访问的身份：普通 FDE 自签 = issuer = subject；admin 代签他人 private = subject 为 admin）**、`allocation_id`、`expires_at=now+60s`、`created_ip/created_ua`）。**不存 ticket 明文**（与 `login_sessions.token_hash` 同口径）。
@@ -496,7 +499,7 @@ station-portal user enable  --login <login>
 |---|---|
 | `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`（同 schema.sql CHECK，不允许尾随 `-`） |
 | `repo_url` | 可选仓库地址，**仅作记录/展示元数据**；不填时为 `null`。平台不 clone、不物化该目录；Git 凭据可由 FDE 自行配置，或由 admin 通过凭据端点投放（规格 §7.2/§12.2，user-space.md §4.1.1） |
-| `slot` | 项目端口块序号（决定 `4000 + slot*8` 起始端口，规格 §8.2） |
+| `slot` | 项目端口块序号（**P5 之前的旧机制**，当年决定 `4000 + slot*8` 起始端口；现在端口分配与它无关，见规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
 
 > 项目目录 = 容器内 `/home/<FDE_CONTAINER_USER>/projects/<name>`；当前容器用户为 `erix`。
@@ -520,7 +523,7 @@ station-portal user enable  --login <login>
 
 | 退役端点 | 现在的做法 |
 |---|---|
-| `POST /api/projects`（建项目 + 同事务分配项目级端口） | **不建项目**：`POST /api/sessions` 传 `project_id`（= 目录名，语义是 cwd），服务端按 `~/projects/<name>` 解析并 `mkdir` 目录；会话与 run 直接在该目录工作（D8 修订：隔离单元 = 项目目录）。**端口也不在这里分配**——预览域名已由平台在开户时预建 10 条（`scope='fde'`，端口 `4000–4009`，规格 §7.2 第 3 步 / §8.2），容器内从 `~/.erix/ports.json` 取 |
+| `POST /api/projects`（建项目 + 同事务分配项目级端口） | **不建项目**：`POST /api/sessions` 传 `project_id`（= 目录名，语义是 cwd），服务端按 `~/projects/<name>` 解析并 `mkdir` 目录；会话与 run 直接在该目录工作（D8 修订：隔离单元 = 项目目录）。**端口也不在这里分配**——预览域名已由平台在开户时预建**一整段**（`scope='fde'`；#246 起端口取自全局号池 `22000–29999` 里最小的未占用对齐块，默认 10 个一段，规格 §7.2 第 3 步 / §8.2），容器内从 `~/.erix/ports.json` 取（清单是唯一真相） |
 | `GET /api/projects` | 仍然可调用，但属**留档只读**：只读 `projects` 表历史行，`deleted_at IS NULL` 过滤后**正常返回空 `items`**（新库/新用户本就无行）——这是预期行为，不是故障 |
 | `PATCH` / `DELETE /api/projects/:id` | 一并 `410`：改名/删除项目由 FDE 在容器内对目录自行处置（`git`/`mv`/`rm`），平台不再介入 |
 | `GET /api/projects/:id/ports` | `410`（§4.7）：FDE 级 `~/.erix/ports.json` 是唯一端口视图 |
@@ -533,7 +536,7 @@ station-portal user enable  --login <login>
 
 > 原文（P5 之前）：请求 `{name, repo_url?, template?}` → `201` 返回 Project + 本次分配的 `ports[]`，
 > 错误含 `400 validation_failed` / `409 name_conflict` / `409 port_quota_exceeded`。
-> 其中 `port_quota_exceeded` 已随「固定预分配 10 条」的裁决删除（§1.2 / 规格 §8.2），
+> 其中 `port_quota_exceeded` 已随「一次性预分配一整段」的裁决删除（§1.2 / 规格 §8.2），
 > `name_conflict` 与 `validation_failed` 随整个写端点一起退役。
 
 ### 3.4 `GET /api/projects/:id`

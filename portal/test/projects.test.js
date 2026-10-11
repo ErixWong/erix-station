@@ -18,6 +18,15 @@ import {
   getProject,
   ProjectError,
 } from '../src/projects.js';
+// 预算宽度与预览域名预算都从号池常量推导（不在测试里拄第二份数字）。
+import {
+  DNS_LABEL_MAX_LEN,
+  PREVIEW_PORT_BUDGET_PROBE_PORT,
+  PREVIEW_PORT_LABEL_WIDTH,
+  PREVIEW_PORT_POOL_END,
+  PREVIEW_PORT_SEGMENT,
+  PREVIEW_PORT_SEGMENT_LEN,
+} from '../src/previewpool.js';
 
 test('validateProjectName：合法名 / 非法名（大写、下划线、前导 -、超长）', () => {
   assert.equal(validateProjectName('a').ok, true);
@@ -94,21 +103,42 @@ test('validateHostnameGrammar：整域名逐标签 ≤63 + 总长 ≤253', () =>
   assert.match(r.reason, /253/);
 });
 
-test('validateFdeNameForHostname：56 以内通过；57..63 拒绝且文案可操作（#202）', () => {
-  assert.equal(MAX_FDE_NAME_LEN_FOR_HOSTNAME, 56);
-  // 56 字符名字：首标签恰 63（56 + "-p-" + 4 位端口）→ 通过。
-  assert.equal(validateFdeNameForHostname('a'.repeat(56)).ok, true);
-  assert.equal(validateFdeNameForHostname('a'.repeat(56), { baseDomain: 'erix.vip' }).ok, true);
+// 预览域名预算（#202 引入、#246 交付①改口径）。边界必须钉死在 **55 过 / 56 拒 / 57 拒**：
+// #240 时代端口恒 4 位 ⇒ 固定段 7 ⇒ 预算 56；#246 把端口推进全局号池 22000–29999（**5 位**）
+// ⇒ 固定段 8 ⇒ **预算 55**。⇒ **56 拒** 是本单相对现状的行为变化（旧口径下它能过应用校验，
+// 再到 INSERT 被 0017 的 hostname CHECK 以裸 23514 炸掉，正是 #202 要消灭的那类「预览打不开」）。
+// 断言里的宽度/预算全部从 previewpool 的池边界推导，测试不拄第二份数字。
+test('validateFdeNameForHostname：预算 55 过 / 56 拒 / 57 拒，宽度从号池上界推导（#202/#246）', () => {
+  assert.equal(PREVIEW_PORT_LABEL_WIDTH, String(PREVIEW_PORT_POOL_END).length, '端口段宽度必须 = 池内最大端口的位数');
+  assert.equal(PREVIEW_PORT_SEGMENT_LEN, PREVIEW_PORT_SEGMENT.length + 5, '号池口径下固定段占 8 字符');
+  assert.equal(MAX_FDE_NAME_LEN_FOR_HOSTNAME, DNS_LABEL_MAX_LEN - PREVIEW_PORT_SEGMENT_LEN);
+  assert.equal(MAX_FDE_NAME_LEN_FOR_HOSTNAME, 55, '#246 后预算是 55（#240 时代是 56）');
+
+  // 55 字符名字：首标签恰 63（55 + 8）→ 通过。
+  assert.equal(validateFdeNameForHostname('a'.repeat(55)).ok, true);
+  assert.equal(validateFdeNameForHostname('a'.repeat(55), { baseDomain: 'erix.vip' }).ok, true);
   assert.equal(validateFdeNameForHostname('alice', { baseDomain: 'localhost' }).ok, true);
-  // 57 字符名字：首标签 64 > 63 → 拒绝，错误信息含实际长度与可操作口径（缩短到 56 以内）。
+
+  // 56 字符：本单新行为——首标签 64 > 63 → 拒，文案给出实际长度与可操作建议。
+  const r56 = validateFdeNameForHostname('a'.repeat(56), { baseDomain: 'localhost' });
+  assert.equal(r56.ok, false, '56 字符必须拒（#246 前的行为是放行）');
+  assert.match(r56.message, /FDE 名过长/);
+  assert.match(r56.message, /64 字符/);
+  assert.match(r56.message, /超过 DNS 上限 63/);
+  assert.match(r56.message, /缩短到 55 以内/);
+
+  // 57 / 63 字符（FDE_NAME_RE 仍允许到 63）同样在开户期就拒。
   const r57 = validateFdeNameForHostname('a'.repeat(57), { baseDomain: 'localhost' });
   assert.equal(r57.ok, false);
-  assert.match(r57.message, /FDE 名过长/);
-  assert.match(r57.message, /64 字符/);
-  assert.match(r57.message, /超过 DNS 上限 63/);
-  assert.match(r57.message, /缩短到 56 以内/);
-  // 63 字符（旧口径上限，FDE_NAME_RE 仍允许）同样在开户期就被拒。
-  assert.match(validateFdeNameForHostname('a'.repeat(63)).message, /70 字符/);
+  assert.match(r57.message, /65 字符/);
+  assert.match(validateFdeNameForHostname('a'.repeat(63)).message, /71 字符/);
+
+  // 预算与端口宽度的因果关系：默认探测端口 = 池内最宽的号 ⇒ 探到的是最坏情况。
+  assert.equal(PREVIEW_PORT_BUDGET_PROBE_PORT, PREVIEW_PORT_POOL_END);
+  // 把探测端口换回 #246 前写死的 4000，56 字符就又过关了 —— 正好证明本单的修复点就是那个硬编码。
+  assert.equal(validateFdeNameForHostname('a'.repeat(56), { probePort: 4000 }).ok, true,
+    '4 位探测端口下首标签只 63 字符 ⇒ 旧口径会放行（这就是旧代码让 56 过关的原因，不是默认行为）');
+  assert.equal(validateFdeNameForHostname('a'.repeat(56)).ok, false, '默认路径（不传 probePort）必须拒');
   // 形态非法与超预算分开报（先形态后长度）。
   const bad = validateFdeNameForHostname('BAD_NAME');
   assert.equal(bad.ok, false);
@@ -117,6 +147,14 @@ test('validateFdeNameForHostname：56 以内通过；57..63 拒绝且文案可�
   const badBase = validateFdeNameForHostname('alice', { baseDomain: `${'b'.repeat(64)}.example` });
   assert.equal(badBase.ok, false);
   assert.match(badBase.message, /base 域标签/);
+});
+
+test('buildHostname：端口段不零填充截断——5 位号池端口原样入域名（#246 连锁）', () => {
+  assert.equal(buildHostname({ fdeName: 'eric', port: 22000, baseDomain: 'fde.erix.vip' }), 'eric-p-22000.fde.erix.vip');
+  assert.equal(buildHostname({ fdeName: 'eric', port: 29999, baseDomain: 'fde.erix.vip' }), 'eric-p-29999.fde.erix.vip');
+  // 历史/池外端口仍按旧口径补零到 4 位（读侧与路由生成面靠同一个入口，不能有两套拼法）。
+  assert.equal(buildHostname({ fdeName: 'eric', port: 80, baseDomain: 'fde.erix.vip' }), 'eric-p-0080.fde.erix.vip');
+  assert.equal(buildHostname({ fdeName: 'eric', port: 4000, baseDomain: 'fde.erix.vip' }), 'eric-p-4000.fde.erix.vip');
 });
 
 test('buildUrl：默认 https 前缀（无公开入口时的保守形态）', () => {
