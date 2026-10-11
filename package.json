@@ -1,6 +1,6 @@
 {
   "name": "erix-station",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "FDE Station — 给 FDE 用的开发工位平台（宿主平台）",
