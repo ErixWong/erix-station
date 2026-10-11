@@ -194,7 +194,7 @@ async function runProvisionFde(values) {
     const out = await onboardFde(pool, config, { fdeName, docker });
     // eslint-disable-next-line no-console
     console.log(
-      `[provision-fde] ok fde=${fdeName} network=${out.networkName} subnet=${out.subnet} container=${out.containerName}`,
+      `[provision-fde] ok fde=${fdeName} network=${out.networkName} subnet=${out.subnet} container=${out.containerName} preview_ports=${out.previewPorts.created}/${out.previewPorts.requested} 新写（${out.previewPorts.skipped} 条已存在）`,
     );
     process.exitCode = 0;
   } catch (err) {

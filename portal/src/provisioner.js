@@ -17,6 +17,7 @@ import { ensureDirSafe } from './fsutil.js';
 import { parseCidr, intToIp, allocateNetwork } from './ipam.js';
 import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
+import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
@@ -794,6 +795,16 @@ export async function onboardFde(pool, config, {
 
     await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);
 
+    // issue #240：开户即预分配 10 条 FDE 级预览域名（端口 4000–4009），**写库与 route outbox /
+    // materialize revision 入队同一事务** ⇒ Traefik 路由与容器内 ~/.erix/ports.json 自动跟上，
+    // 不再需要人工 enqueueFullRebuild + runMaterializerOnce（此前 port_allocations 从没被产品代码
+    // 写过，手工插完之后派生链一律不动）。
+    // 位置：网络与容器都已落地之后（路由的 backend 依赖本 FDE 网段）、LLM 联动之前——预览域名
+    // 的正确性不依赖 LiteLLM 是否可达，LiteLLM 挂了也先把预览域名与派生链交付出。
+    // 幂等：部分唯一索引 + ON CONFLICT DO NOTHING ⇒ `cli.js provision-fde` 重跑只补缺口（#240 裁决 7），
+    // 遗留 scope='project' 的存量行既不改也不删（portalloc.js 顶部「存量不迁移」段）。
+    const previewPorts = await provisionFdePreviewPorts(pool, config, { fdeId: userId, fdeName, log });
+
     // issue #38 Phase B1：复用分支（needRecreate=false）可恢复 revoked binding；
     // 需要重建时只发布 active binding，后续 onboarding 的 llm-binding 步骤负责创建/恢复选中配置。
     // 放在容器就绪之后：LLM 路由的 ClientIP 条件依赖本 FDE 网段，先保证网络/容器落地再发布。
@@ -811,6 +822,12 @@ export async function onboardFde(pool, config, {
       containerName,
       gitProvider: gitHost?.provider ?? null,
       status: accountStatus,
+      // issue #240：本次开户新写的预览域名条数（重跑时为 0 ⇒ 已齐备，派生链没动）。
+      previewPorts: {
+        requested: previewPorts.requested,
+        created: previewPorts.inserted.length,
+        skipped: previewPorts.skipped,
+      },
     };
   });
 }

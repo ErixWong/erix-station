@@ -27,10 +27,11 @@
 2. （步骤 ①′）**运行身份诊断**：`id -u` / `id -g` / `id` / `uname -a`（无 `continue-on-error`、无 `if: always()`）。
    为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
    有这四行就不用再猜「今天的 runner 是谁」。
-3. （步骤 ②）根 `npm ci` + `npm test` → **862 项 / 861 通过 / 0 失败 / 1 跳过**（基线，2026-10-11 本机复现；
-   原 855/854 基线上新增 `#241` 预览预检与 deny CORS 的 7 条钉桩，落点 `portal/test/{http,preview,routes}.test.js`）。
-   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **862 里已含 runner 的 198 项**。
-4. （步骤 ③）`cd runner && npm ci && node --test` → **198/198**。口径见 `AGENTS.md` §4：
+3. （步骤 ②）根 `npm ci` + `npm test` → **877 项 / 876 通过 / 0 失败 / 1 跳过**（基线，2026-10-11 本机复现；
+   原 862/861 基线上新增 `#240` 预览域名预分配的 15 项，落点 `portal/test/portalloc.test.js` 与 `portal/test/{migrations,materializer}.test.js`；
+   再往前是 `#241` 预览预检与 deny CORS 的 7 条）。
+   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **877 里已含 runner 的 200 项**。
+4. （步骤 ③）`cd runner && npm ci && node --test` → **200/200**。口径见 `AGENTS.md` §4：
    **`node --test runner/test/`（目录当参数）在本机 Node 22/24 是坏的**（把目录当模块加载 → `Cannot find module`），别用。
 5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **23 文件 / 329 通过**。
    `NODE_ENV=development` 是**必需**的：devDependencies（vite/tailwind/vitest）在 `NODE_ENV=production` 下会被 `npm ci` 跳过。
