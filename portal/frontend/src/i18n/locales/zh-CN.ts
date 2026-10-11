@@ -186,6 +186,64 @@ export const zhCN = {
   preview: {
     title: '预览 {path}',
   },
+  // 预览端口面板（issue #246 交付② 单 B：工作台「预览端口」区块 + 管理台 FDE 详情面板）。
+  // 口径红线（portal.md §4.7a）：`active` 只代表「首次凭证放行过」⇒ 状态文案一律不写「健康 / 运行中」；
+  // 服务端 error.message 原文透传（错误码 + 原文都要显示，不许吞成「操作失败」）。
+  previewPorts: {
+    title: '预览端口',
+    adminTitle: '{fde} 的预览端口',
+    // 工作台折叠条（收起态也要给出可用信息：条数 / 加载失败）
+    toggle: '预览端口',
+    toggleCount: '预览端口（{count} 个）',
+    toggleFailed: '预览端口（加载失败）',
+    colPort: '端口',
+    colHostname: '预览域名',
+    colState: '状态',
+    colActions: '操作',
+    openAction: '打开预览',
+    signing: '签发通行票…',
+    hostnameCopyTitle: '{url}（点击复制完整地址）',
+    copiedUrl: '预览地址已复制到剪贴板。',
+    copyFailed: '复制失败：',
+    state: {
+      // allocated = 已分配但从未放行过；active = 首次凭证放行过（不代表有应用在监听）
+      allocated: '已分配 · 待首次访问',
+      active: '已放行过（仅表示首次放行过）',
+    },
+    stateUnknown: '未知状态（{state}）',
+    stateHint: '「已放行过」只表示该端口首次凭证放行过，不代表容器里有应用在监听。',
+    emptySelf: '你还没有预览端口（平台尚未为账号分段，或已全部释放）。',
+    emptyFde: '该 FDE 没有活着的预览端口（可能尚未开户或已下线）。',
+    loadFailed: '预览端口加载失败（{code}）：{message}',
+    ticketFailed: '签发预览通行票失败（{code}）：{message}',
+    popupBlocked: '浏览器拦截了新标签；',
+    popupBlockedLink: '点此打开预览',
+    noFdeName: '该用户没有 fde_name，因此没有预览端口。',
+    // 管理台改块（搬迁）区（components/FdePreviewPortsPane.vue）
+    admin: {
+      moveTitle: '改块（搬迁预览端口段）',
+      moveAction: '改块…',
+      moving: '搬迁中…',
+      blockStartLabel: '新块起点',
+      blockStartPlaceholder: '例如 22010',
+      blockHint: '号池 22000–29999，每段 10 个，起点必须按 10 对齐；改块是搬迁整段，不是再发一块。',
+      alignHint: '该起点不在号池内或未按 10 对齐：服务端会拒绝（block_start 不合法）。',
+      currentBlock: '当前段：{block}（{count} 条活端口）',
+      currentBlockNone: '当前没有活预览端口段。',
+      notInteger: 'block_start 必须是整数（例如 22010）。',
+      confirmTitle: '确认迁移预览端口段',
+      confirmBody: '把 {fde} 的预览端口段从 {oldBlock} 搬到 {newBlock}（{count} 条活端口）。',
+      confirmBodyNoBlock: '为 {fde} 新建预览端口段 {newBlock}。',
+      confirmWarning: '旧段的预览域名会立刻失效（真机实测直接 404），FDE 手里的旧链接会断，且不可撤销。',
+      confirmOk: '确认搬迁',
+      moved: '搬迁完成：{oldBlock} → {newBlock}；释放 {released} 条旧分配、撤销 {revoked} 条预览凭证、新分配 {inserted} 条。',
+      movedNoop: '目标段 {block} 已经是该 FDE 的现有整块：零写入，什么都没改。',
+      movedPorts: '新段端口：{ports}',
+      fieldErrorBlockStart: '字段 block_start 不合法：{message}',
+      moveFailed: '改块失败（{code}）：{message}',
+      blockTakenHint: '该段已被占用（服务端不会自动换段）：换一个整块空闲的对齐起点后重试。',
+    },
+  },
   // 管理台（views/AdminLayout.vue / AdminUsersView.vue / AdminView.vue + components/UserLlmPane.vue）
   // 注：服务端透传的 error.message 一律不译，仅译前端自产文案（含「错误：」前缀与 409 拒绝前缀）。
   admin: {
@@ -328,6 +386,7 @@ export const zhCN = {
       editTabProfile: '资料',
       editTabSecurity: '安全',
       editTabLlm: 'LLM 与仓库',
+      editTabPorts: '预览端口',
       editTabDanger: '危险操作',
       basicProfileSection: '基本资料',
       llmSection: 'LLM 绑定',

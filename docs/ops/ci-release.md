@@ -42,8 +42,14 @@
    要按上面的拆解核对，别只看总数（实测：在 `portal/test/` 放一个空的 `x.js`，总数立刻 +1）。
 4. （步骤 ③）`cd runner && npm ci && node --test` → **200/200**。口径见 `AGENTS.md` §4：
    **`node --test runner/test/`（目录当参数）在本机 Node 22/24 是坏的**（把目录当模块加载 → `Cannot find module`），别用。
-5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **23 文件 / 329 通过**。
+5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **29 文件 / 391 通过**。
    `NODE_ENV=development` 是**必需**的：devDependencies（vite/tailwind/vitest）在 `NODE_ENV=production` 下会被 `npm ci` 跳过。
+   基线拆解：**23 文件 / 329 通过**（#246 交付② 单 A 与 #252 时的基线）+ `#246 交付② 单 B`（工单 `feat-261011-B2`，纯前端）净增 **6 文件 / 62 项**：
+   预览端口面板的端点与票 URL 拼装 15（`src/lib/previewPorts.spec.ts`）、数据层（签票时机 / 新标签地址 / 改块 body）12
+   （`src/composables/usePreviewPorts.spec.ts`）、列表四态与 `state` 口径 13（`src/components/PreviewPortsPanel.spec.ts`）、
+   工作台区块（进视图拉列表 + **未点击不得签票**）6（`src/views/WorkbenchPreviewPorts.spec.ts`）、
+   管理台改块（**未确认不得发 POST** / 409 全文 / 400 指 `block_start`）10（`src/views/AdminPreviewPorts.spec.ts`）、
+   i18n 双语键集对齐 6（`src/i18n/localeParity.spec.ts`）。既有 329 项一条没改、一条没红。
 
 **镜像构建校验的路径过滤（`ci.yml` 步骤 ⑤）**
 
