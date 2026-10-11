@@ -15,6 +15,8 @@ import StreamPanel from '../components/StreamPanel.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
+import PreviewPortsPanel from '../components/PreviewPortsPanel.vue';
+import { usePreviewPorts } from '../composables/usePreviewPorts';
 
 // issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
 const { t } = useI18n();
@@ -91,7 +93,21 @@ function onPickerSelect(id: string) {
   void onSelectSession(id); // 复用现有深链逻辑（同会话刷新 / 跨目录 / 路由 push）
 }
 
+// ---- issue #246 交付② 单 B：预览端口区块（折叠在顶栏下方，默认收起）----
+// 进视图就拉 GET /api/me/ports（面板常驻 DOM，折叠只是不占位）；但**预览 ticket 绝不预取**
+// ——60 秒过期且一次性，预取等于把它用废（点击当场才签，见 usePreviewPorts.openPreview）。
+const ports = usePreviewPorts();
+const portsOpen = ref(false);
+const portCount = computed(() => ports.items.value.length);
+const portsToggleLabel = computed(() => {
+  if (ports.listError.value !== null) return t('previewPorts.toggleFailed');
+  return portCount.value > 0
+    ? t('previewPorts.toggleCount', { count: portCount.value })
+    : t('previewPorts.toggle');
+});
+
 onMounted(async () => {
+  void ports.load(); // 与 auth 守卫无关：进视图就拉自己的端口列表（admin 无 FDE ⇒ 空列表）
   if (!auth.user) return; // 守卫保证已登录
   await store.initWorkspace(auth.user);
   // issue #55 B1：启动时若路由带 /session/<id>（旧 #/session/<id>），走统一深链解析
@@ -176,6 +192,38 @@ function jumpToLatest() {
         @click="onLogout"
       >{{ t('common.logout') }}</button>
     </header>
+
+    <!-- issue #246 交付② 单 B：预览端口区块（折叠条 + 展开面板）；面板常驻 ⇒ 进视图即拉列表 -->
+    <div class="border-b border-black/10 bg-black/[0.02]">
+      <button
+        type="button"
+        data-test="preview-ports-toggle"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-black/5"
+        :aria-expanded="portsOpen"
+        aria-controls="preview-ports-disclosure"
+        @click="portsOpen = !portsOpen"
+      >
+        <span aria-hidden="true">{{ portsOpen ? '▾' : '▸' }}</span>
+        <span class="font-medium">{{ portsToggleLabel }}</span>
+      </button>
+      <div
+        v-show="portsOpen"
+        id="preview-ports-disclosure"
+        class="max-h-72 overflow-y-auto border-t border-black/10 px-3 py-2"
+      >
+        <PreviewPortsPanel
+          :items="ports.items.value"
+          :loading="ports.loading.value"
+          :loaded="ports.loaded.value"
+          :error="ports.listError.value"
+          :ticket-busy-id="ports.ticketBusyId.value"
+          :ticket-error="ports.ticketError.value"
+          :popup-blocked-url="ports.popupBlockedUrl.value"
+          @retry="ports.load()"
+          @open="(item) => void ports.openPreview(item)"
+        />
+      </div>
+    </div>
 
     <main class="flex flex-1 min-h-0">
       <!-- 移动端抽屉遮罩（旧 #backdrop） -->
