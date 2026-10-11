@@ -25,6 +25,13 @@ import * as gitHosts from './git-hosts.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
 import * as onboarding from './onboarding.js';
 import * as offboarding from './offboarding.js';
+import * as portalloc from './portalloc.js';
+import {
+  PREVIEW_PORT_COUNT,
+  PREVIEW_PORT_POOL_START,
+  isAlignedPreviewBlockStart,
+  isPreviewPortInPool,
+} from './previewpool.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 
 const MIME = {
@@ -525,6 +532,11 @@ async function routeApi(req, res, ctx, url) {
   if (projectPortsMatch) {
     throw new HttpError(410, 'project_api_retired', '项目维度端口列表已退役（P5）：端口一律见 FDE 级 ~/.erix/ports.json');
   }
+  // issue #246 交付②：FDE 本人的预览端口列表（portal.md §4.7a）。GET /api/projects/:id/ports 退役后
+  // 「没有任何列端口的 API」⇒ 签票端点要的 allocation UUID 人看不见。本端点就是那条路（单 B 面板用它）。
+  if (pathname === '/api/me/ports' && req.method === 'GET') {
+    return handleListMyPorts(req, res, ctx);
+  }
   // 预览 ticket 签发（portal.md §2.8）。
   const portTicketMatch = pathname.match(/^\/api\/ports\/([^/]+)\/preview-ticket$/);
   if (portTicketMatch) {
@@ -967,7 +979,139 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
+  // 预览端口（issue #246 交付②，portal.md §4.7a）：列他人端口 + **改块 = 搬迁**。
+  const adminFdePortsMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/ports$/);
+  if (adminFdePortsMatch) {
+    const fdeName = decodeAdminFdeName(adminFdePortsMatch[1]);
+    if (req.method === 'GET') return handleAdminListFdePorts(req, res, ctx, session, fdeName);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  const adminFdePortsBlockMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/ports\/block$/);
+  if (adminFdePortsBlockMatch) {
+    const fdeName = decodeAdminFdeName(adminFdePortsBlockMatch[1]);
+    if (req.method === 'POST') return handleAdminMoveFdePortsBlock(req, res, ctx, session, fdeName);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
   return sendJson(res, 404, errorBody('not_found', 'not found'));
+}
+
+/** 路径参数 :fdeName 的解码 + 语法校验（口径照 admin 面既有端点：非法语法 400 validation_failed）。 */
+function decodeAdminFdeName(raw) {
+  let fdeName;
+  try {
+    fdeName = decodeURIComponent(raw);
+  } catch {
+    throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+  }
+  if (!projects.validateFdeName(fdeName).ok) {
+    throw new HttpError(400, 'validation_failed', 'fde_name 非法', { details: { field: 'fde_name' } });
+  }
+  return fdeName;
+}
+
+/** 按 fde_name 解析用户；不存在 → 404 `not_found`（复用 admin 面现有码，不新造）。 */
+async function resolveAdminFde(ctx, fdeName) {
+  const fde = await portalloc.resolveFdeByName(ctx.pool, fdeName);
+  if (!fde || !fde.id) {
+    throw new admin.AdminError('not_found', `FDE「${fdeName}」不存在`, {
+      httpStatus: 404, details: { field: 'fde_name' },
+    });
+  }
+  return fde;
+}
+
+/**
+ * GET /api/me/ports（#246 交付②）：当前登录用户自己的预览 allocation，只列活行、port ASC。
+ * **admin 自己通常没有 FDE**（`fde_name` 为 NULL）⇒ 返回空列表，不是 404（工单第 1 节）。
+ */
+async function handleListMyPorts(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  if (!session.user.fde_name) return sendJson(res, 200, { items: [] });
+  const items = await portalloc.listFdePreviewPorts(ctx.pool, { fdeId: session.user.id });
+  return sendJson(res, 200, { items });
+}
+
+/**
+ * GET /api/admin/fdes/:fdeName/ports：管理员列他人端口。
+ * 读他人资源**必须显式写一行审计**（不假定框架已自动写——现有 admin GET 并未一致落实，
+ * 见 `admin.recordFdePortsListedAudit` 的注）。
+ */
+async function handleAdminListFdePorts(req, res, ctx, session, fdeName) {
+  const fde = await resolveAdminFde(ctx, fdeName);
+  const items = await portalloc.listFdePreviewPorts(ctx.pool, { fdeId: fde.id });
+  await admin.recordFdePortsListedAudit(ctx.pool, {
+    actorId: session.user.id, fdeName, itemCount: items.length,
+  });
+  return sendJson(res, 200, { items });
+}
+
+/**
+ * POST /api/admin/fdes/:fdeName/ports/block（#246 交付②）：管理员改块 = **搬迁事务**，不是追加。
+ * 校验顺序即判据（块非法 / 名超预算都是 400 且**零 SQL**；块被占是 409 且**零残留**）：
+ *   ① `block_start` 整数 + 在池内 + 10 对齐 → 400 `validation_failed`（用现成的 isPreviewPortInPool /
+ *      isAlignedPreviewBlockStart；**不**把 `preview_port_block_invalid` 直直透给前端，那是开户路径的码）；
+ *   ② FDE 名预览域名预算（portalloc 里走 validateFdeNameForHostname）→ 400 `preview_hostname_invalid`（不降级为 warn）；
+ *   ③ 目标块 == 当前块 → 200 `{changed:false}`，零写库零入队零审计；
+ *   ④ 目标块有**外来**活行 → 409 `preview_port_block_taken`，**禁止**偷偷换成第一个空闲块。
+ * 409 的 `retryable=false`：开户路径同码是 retryable（会自动重算下一段），而改块是管理员显式指定的块，
+ * 盲试同一段必败 ⇒ 要先换一个起点（口径见 portal.md §4.7a）。
+ */
+async function handleAdminMoveFdePortsBlock(req, res, ctx, session, fdeName) {
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const blockStart = body?.block_start;
+  if (!Number.isInteger(blockStart) || !isPreviewPortInPool(blockStart) || !isAlignedPreviewBlockStart(blockStart)) {
+    throw new HttpError(400, 'validation_failed',
+      `block_start 必须是号池 ${PREVIEW_PORT_POOL_START}–${portalloc.PREVIEW_PORT_POOL_END} 内、按 ${PREVIEW_PORT_COUNT} 对齐的整数块起点`
+      + `（合法值：${PREVIEW_PORT_POOL_START}、${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}、…）`,
+      { details: { field: 'block_start' } });
+  }
+  const fde = await resolveAdminFde(ctx, fdeName);
+  // 改块前先读一眼当前块——只为审计里的 from_block_start（多一条 SELECT，不值得在搬迁事务里多开一次取数）。
+  const before = await portalloc.listFdePreviewPorts(ctx.pool, { fdeId: fde.id });
+  const fromBlockStart = before.length > 0
+    ? portalloc.alignedPreviewBlockStart(Math.min(...before.map((item) => item.port)))
+    : null;
+  let moved;
+  try {
+    moved = await portalloc.moveFdePreviewBlock(ctx.pool, ctx.config, {
+      fdeId: fde.id, fdeName: fde.fde_name, blockStart, log: ctx.log,
+    });
+  } catch (err) {
+    if (err?.code === 'preview_port_block_taken') {
+      throw new HttpError(409, 'preview_port_block_taken', String(err?.message ?? err));
+    }
+    if (err?.code === 'preview_hostname_invalid') {
+      throw new HttpError(400, 'preview_hostname_invalid', String(err?.message ?? err), { details: { field: 'fde_name' } });
+    }
+    // 深层又冒上来的时候（入口已前置拦住）：对前端仍是「参数不合法」的 400 validation_failed。
+    if (err?.code === 'preview_port_block_invalid') {
+      throw new HttpError(400, 'validation_failed', String(err?.message ?? err), { details: { field: 'block_start' } });
+    }
+    throw err;
+  }
+  if (moved.changed) {
+    await admin.recordFdePortsBlockMovedAudit(ctx.pool, {
+      actorId: session.user.id,
+      fdeName,
+      fromBlockStart,
+      toBlockStart: moved.blockStart,
+      releasedAllocations: moved.releasedAllocations,
+      inserted: moved.inserted,
+      revokedGrants: moved.revokedGrants,
+    });
+  }
+  return sendJson(res, 200, {
+    changed: moved.changed,
+    fde_name: fdeName,
+    block_start: moved.blockStart,
+    block_end: moved.blockEnd,
+    ports: [...moved.ports],
+    released_allocations: moved.releasedAllocations,
+    revoked_grants: moved.revokedGrants,
+    inserted_allocations: moved.inserted,
+  });
 }
 
 async function handleListSessions(req, res, ctx) {

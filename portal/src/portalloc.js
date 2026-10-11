@@ -84,6 +84,14 @@ function invalidArgs(message) {
   return err;
 }
 
+/** 交付② 的错误工厂（码沿用既有口径：`preview_port_block_taken` / `preview_hostname_invalid`）。 */
+function portsError(code, message, cause) {
+  const err = new Error(message);
+  err.code = code;
+  if (cause) err.cause = cause;
+  return err;
+}
+
 /**
  * 纯函数：一组预览域名的期望态（不落库，供插入与单测逐字段核对）。
  * hostname/url 一律走 projects.js 的唯一生成入口，本模块不自己拼字符串。
@@ -291,8 +299,23 @@ export async function ensureFdePreviewPorts(client, {
  * 独立事务包装：开户 / `cli.js provision-fde` 重跑入口（老 FDE 补齐、管理员指定块都走这里）。
  * 事务边界在这里，是因为「写一组行 + 入队派生链」必须原子；Docker 侧动作不在本事务内
  * （onboardFde 已完成网络/容器），所以本事务只持 port_allocations / outbox 的锁。
+ *
+ * **自动选块的冲突重算（issue #246 交付②，补交付① 的已知边界）**：
+ *   - **未**显式指定 `blockStart` 时，遇到 `preview_port_block_taken`（并发抢号被 0019 的全局唯一索引拒）
+ *     ⇒ **开新事务重算**（重新取全局占用 → `firstFreePreviewBlockStart` 取下一段），总尝试上限
+ *     `PREVIEW_BLOCK_MAX_ATTEMPTS` = **3 次**（含首试）；用尽后抛同一可操作错误码 `preview_port_block_taken`。
+ *   - **显式**指定 `blockStart`（管理员指定块 / `cli.js --block-start`）⇒ **不重算**，直接冒错：
+ *     管理员挑的那一段被占就是「要人去看一眼」的信号，偷偷换成另一段会让他以为分到了指定的号。
+ *
+ * ⚠ **重试只覆盖「端口分配」这一小段，不是整笔开户回滚后重来**（本文件最容易误读的一句）：
+ *   `provisioner.js:809` 的事实是「**网络与容器已落地之后、LLM 联动之前**」才调本函数 ⇒
+ *   冲突时**已经建好的 Docker 网络与容器不会回滚**（它们不在本事务里），而 LLM binding 尚未执行。
+ *   已有的 `withFdeLock` 锁键是 `fde:${fdeName}`，**串行化不了不同 FDE 抢同一空闲块**，
+ *   所以「0019 的全局部分唯一索引 + 新事务重算」才是正解，别指望加锁。
  */
-export async function provisionFdePreviewPorts(pool, config, { fdeId, fdeName, blockStart = null, log = console } = {}) {
+export const PREVIEW_BLOCK_MAX_ATTEMPTS = 3;
+
+async function provisionFdePreviewPortsOnce(pool, config, { fdeId, fdeName, blockStart = null, log = console }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -306,6 +329,208 @@ export async function provisionFdePreviewPorts(pool, config, { fdeId, fdeName, b
     });
     await client.query('COMMIT');
     return out;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function provisionFdePreviewPorts(pool, config, { fdeId, fdeName, blockStart = null, log = console } = {}) {
+  const explicitBlock = blockStart !== null && blockStart !== undefined;
+  const maxAttempts = explicitBlock ? 1 : PREVIEW_BLOCK_MAX_ATTEMPTS;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await provisionFdePreviewPortsOnce(pool, config, { fdeId, fdeName, blockStart, log });
+    } catch (err) {
+      // 只有「抢号失败」值得重算（每次都是新事务 + 重新取占用 ⇒ 会自然落到下一个空闲块）。
+      // 其余错误（池耗尽 / hostname 超预算 / 参数非法）重试一万次也是同样结果 ⇒ 原样冒。
+      if (err?.code !== 'preview_port_block_taken' || attempt === maxAttempts) {
+        if (explicitBlock || err?.code !== 'preview_port_block_taken') throw err;
+        lastErr = err;
+        break;
+      }
+      log.warn?.(`[portalloc] fde=${fdeName} 第 ${attempt}/${maxAttempts} 次抢号冲突（预览端口块），开新事务重算下一段`);
+      lastErr = err;
+    }
+  }
+  throw portsError(
+    'preview_port_block_taken',
+    `${lastErr?.message ?? '预览端口块与既有活行重叠'}（已尝试 ${maxAttempts} 次 = 首试 + 自动重算 ${maxAttempts - 1} 次，`
+    + '每次都是新事务重取占用后取下一个空闲段，仍然冲突 ⇒ 号池里没有「算出来空闲但插不进去」的整块了，'
+    + '请管理员显式改块 POST /api/admin/fdes/:fdeName/ports/block）',
+    lastErr?.cause ?? lastErr,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 交付②（issue #246）：列端口读端点 + 管理员「改块」= **搬迁**事务
+// ---------------------------------------------------------------------------
+
+/**
+ * 列端点的 DTO 列（口径见 docs/api/portal.md §4.7a）：**`id` 必给**——签票端点
+ * `POST /api/ports/:id/preview-ticket` 吃的是 allocation UUID，没有它这个列表就没有意义（#246 的起因）。
+ * 不含 `released_at` 等运维字段：活行口径下它恒 NULL。
+ */
+const PREVIEW_PORT_LIST_COLUMNS = 'id, port, hostname, url, state, scope, role, exposure';
+
+/**
+ * 某个 FDE 的**活行**预览 allocation（`state <> 'released'`），按 `port ASC`。
+ * 两个列端点（本人 / admin 面）共用同一个取数与 DTO，避免两个端点漂成两套字段。
+ * 只读 ⇒ 不加事务、不取锁（列表容忍并发：读到的是「那一刻的活行」，前端每次签票前重取即可）。
+ */
+export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
+  if (!fdeId) throw portsError('preview_ports_invalid_args', 'listFdePreviewPorts: fdeId required');
+  const r = await clientOrPool.query(
+    `SELECT ${PREVIEW_PORT_LIST_COLUMNS} FROM port_allocations
+      WHERE fde_id = $1 AND state <> 'released'
+      ORDER BY port ASC`,
+    [fdeId],
+  );
+  return r.rows.map((row) => ({
+    id: row.id,
+    port: Number(row.port),
+    hostname: row.hostname,
+    url: row.url,
+    state: row.state,
+    scope: row.scope,
+    role: row.role,
+    exposure: row.exposure,
+  }));
+}
+
+/**
+ * 按 `users.fde_name` 取 `{id, fde_name}`；不存在返回 null（调用方 → 404 `not_found`）。
+ * **不按 status 过滤**：offboarding 只停用不删号（fde-platform §7.3），`fde_name` 又带 UNIQUE，
+ * 所以停用中的 FDE 仍是「已知 FDE」⇒ 列端点回空列表（它的行都已 released）而不是 404。
+ */
+export async function resolveFdeByName(clientOrPool, fdeName) {
+  const r = await clientOrPool.query(`SELECT id, fde_name FROM users WHERE fde_name = $1`, [fdeName]);
+  return r.rows[0] ?? null;
+}
+
+/**
+ * **管理员改块 = 搬迁事务**（issue #246 交付②）。不是「追加」：
+ * `ensureFdePreviewPorts` 全文件零 `UPDATE port_allocations`（insert-only），直接复用它补一段
+ * 会让旧 10 条行继续活着占号、旧域名继续可访问（真机就会是 20 条活行）。所以这里
+ * 先在**同一事务**里把本 FDE 的活行按 offboarding 的写法释放 + 撤 grant，再插新块。
+ *
+ * 原子顺序（测试逐序 deepEqual 钉住，`portal/test/preview-ports.test.js`）：
+ *   BEGIN → 取本 FDE 活行 → 取全局活行 →（幂等判定 / 冲突判定，都不写库）
+ *         → UPDATE 旧行 released（released_at=COALESCE(...)）→ UPDATE preview_grants revoked
+ *         → 10× INSERT（ON CONFLICT (fde_id,port) WHERE state<>'released' DO NOTHING）
+ *         → route_revisions → route_outbox → materialize_revisions → materialize_outbox → COMMIT
+ * 任一步失败 ⇒ 整笔 ROLLBACK，零残留（旧行仍活、无新行、两条 outbox 都没有新行）。
+ *
+ * 幂等：目标块已经是本 FDE 的**整块**活行 ⇒ 直接返回 `changed:false`，**一个 SQL 写都不发**
+ * （也不写审计；审计在 http 层、只在 `changed:true` 时落一行）。
+ * 号码回收：`released` 行不占位 ⇒ 搬出去再搬回同一块能成功。
+ *
+ * @returns {Promise<{changed, blockStart, blockEnd, ports, releasedAllocations, revokedGrants,
+ *                    inserted, routeRevisions, materializeRevision}>}
+ * @throws `preview_port_block_invalid`（块起点非法）/ `preview_hostname_invalid`（FDE 名超域名预算）
+ *         / `preview_port_block_taken`（块内有外来活行，或并发抢号导致插入数 ≠ 10）
+ */
+export async function moveFdePreviewBlock(pool, config, {
+  fdeId, fdeName, blockStart, log = console,
+} = {}) {
+  if (!fdeId || !fdeName) {
+    throw portsError('preview_ports_invalid_args', 'moveFdePreviewBlock: fdeId/fdeName required');
+  }
+  if (!config?.baseDomain) {
+    throw portsError('preview_ports_invalid_args', 'moveFdePreviewBlock: baseDomain required（hostname 与路由同源生成，§8.5）');
+  }
+  // 纯校验一律**前置到开事务之前**：400 类错误（块非法 / 名超预算）必须做到零 SQL 就返回。
+  assertAlignedPreviewBlockStart(blockStart);                       // code='preview_port_block_invalid'
+  const grammar = validateFdeNameForHostname(fdeName, { baseDomain: config.baseDomain });
+  if (!grammar.ok) throw portsError('preview_hostname_invalid', `moveFdePreviewBlock: ${grammar.message}`);
+
+  const targetPorts = [...previewBlockPorts(blockStart)];
+  const targetLabel = previewBlockLabel(blockStart);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // 两次取数串行跑（同一连接）：与 ensureFdePreviewPorts 里的候选块取数同理，保证落在同一语句快照上。
+    const ownPorts = await listOccupiedPreviewPorts(client, { fdeId });
+    const occupied = await listOccupiedPreviewPorts(client);
+    const own = new Set(ownPorts);
+
+    // ① 幂等：本 FDE 的活行已经正好是**这一整块** ⇒ 零写返回（不释放、不重插、不入队、不写审计）。
+    //    只有部分行（历史残缺）不当作「已经是这一块」——走完整搬迁，顺手补齐成整块。
+    if (ownPorts.length === PREVIEW_PORT_COUNT && targetPorts.every((port) => own.has(port))) {
+      await client.query('COMMIT');
+      log.log?.(`[portalloc] fde=${fdeName} 已在预览端口块 ${targetLabel}，改块是空操作（零 SQL 写）`);
+      return {
+        changed: false, blockStart, blockEnd: previewBlockEnd(blockStart), ports: targetPorts,
+        releasedAllocations: 0, revokedGrants: 0, inserted: 0,
+        routeRevisions: [], materializeRevision: null,
+      };
+    }
+
+    // ② 冲突：目标块内**有外来活行**就报错，**禁止**偷偷换成第一个空闲块（管理员显式指定的块）。
+    //    本 FDE 自己的活行不算冲突——它们会在本事务里被释放（这也是「搬回自己刚释放的号」能成功的理由）。
+    const foreign = targetPorts.filter((port) => occupied.includes(port) && !own.has(port));
+    if (foreign.length > 0) {
+      throw portsError(
+        'preview_port_block_taken',
+        `预览端口块 ${targetLabel} 已被占用（外来活行端口：${foreign.join(',')}；`
+        + `占用判据 = 全局活行 state <> 'released'，本 FDE 自己的活行不算冲突）：`
+        + `先释放或改走那段，或换一个整块空闲的对齐起点（${PREVIEW_PORT_POOL_START}、`
+        + `${PREVIEW_PORT_POOL_START + PREVIEW_PORT_COUNT}、…，每段 ${PREVIEW_PORT_COUNT} 个）`,
+      );
+    }
+
+    // ③ 释放旧行（照 offboarding.js:217-224 的写法：state='released' + released_at=COALESCE(now())，
+    //    带 RETURNING 供 grant 撤权与「插入数 ≠ 10 也要回滚」的判据用）。
+    const released = await client.query(
+      `UPDATE port_allocations
+          SET state = 'released', released_at = COALESCE(released_at, now())
+        WHERE fde_id = $1 AND state <> 'released'
+        RETURNING id`,
+      [fdeId],
+    );
+    // ④ 撤 grant（同 offboarding.js:225-231：只动 active/used，已 revoked/expired 不打扰）。
+    let revokedGrants = 0;
+    if (released.rows.length > 0) {
+      const revoked = await client.query(
+        `UPDATE preview_grants
+            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+          WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')
+          RETURNING id`,
+        [released.rows.map((row) => row.id)],
+      );
+      revokedGrants = revoked.rows.length;
+    }
+
+    // ⑤ 插新块 + 两条派生链（**复用** ensureFdePreviewPorts：本 FDE 的活行此刻已全部 released，
+    //    所以它不会再「补缺口」，10 条全走真插入 ⇒ route outbox ×10 + materialize revision 各一次）。
+    const out = await ensureFdePreviewPorts(client, {
+      fdeId,
+      fdeName,
+      baseDomain: config.baseDomain,
+      publicBaseUrl: config.portalPublicBaseUrl ?? null,
+      blockStart,
+      log,
+    });
+    // ⑥ 插入数 ≠ 10 ⇒ 一定有并发抢号（占用取数与 INSERT 之间别人落了行，而 DO NOTHING 吃掉了一条），
+    //    整笔回滚，**不许部分提交**（旧行还在 released 状态、但事务未 COMMIT ⇒ 外面看仍是旧的 10 条活行）。
+    if (out.inserted.length !== PREVIEW_PORT_COUNT) {
+      throw portsError(
+        'preview_port_block_taken',
+        `预览端口块 ${targetLabel} 搬迁中途只插入 ${out.inserted.length}/${PREVIEW_PORT_COUNT} 条（并发抢号）：`
+        + '整笔事务判定回滚，旧块保持不变，请重试本次改块',
+      );
+    }
+
+    await client.query('COMMIT');
+    log.log?.(`[portalloc] fde=${fdeName} 改块 → ${targetLabel}：释放旧行 ${released.rows.length} 条、撤 grant ${revokedGrants} 条、新插 ${out.inserted.length} 条，同事务入队 route outbox ×${out.routeRevisions.length} + materialize revision ${out.materializeRevision}`);
+    return {
+      changed: true, blockStart, blockEnd: previewBlockEnd(blockStart), ports: targetPorts,
+      releasedAllocations: released.rows.length, revokedGrants, inserted: out.inserted.length,
+      routeRevisions: out.routeRevisions, materializeRevision: out.materializeRevision,
+    };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
