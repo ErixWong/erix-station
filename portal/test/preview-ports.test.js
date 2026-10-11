@@ -14,10 +14,16 @@
 //   ⑪ 自动选块重算：前 2 次占用第 3 次成功；连 3 次冲突 → 抛错且第 4 次不再试
 //   ⑫ 显式指定 blockStart 冲突 → 不重算（只尝试一次）
 //
+// 以及 **#252**（工单 fix-261011-B）的三条：① 撤权只碰 active（used 保留原状）、② 谓词源码断言、
+// ⑤ fake 必须**真**模拟双向 CHECK（手工发一条「把 used ticket 改 revoked」的 UPDATE 要报 23514）。
+//
 // 隔离约定（docs/testing.md §2.1）：内存 fake，不碰真库/docker。
 // fake 必须**真做事务快照**（BEGIN 打快照 / ROLLBACK 还原），否则「零残留」与「不部分提交」
 // 两句断言就只是在读测试自己写的假数据；同时照真库两条部分唯一索引 + port CHECK 的语义派发
 // （与 portalloc.test.js 的 fake 同口径，注释从简）。
+// **preview_grants 的 CHECK 一律走 `./preview-grant-checks.js`**（baseline 五条 CHECK 逐条同名模拟，
+// 含 `(state='used') = (used_at IS NOT NULL)`，违反 ⇒ 语句级抛 23514）——旧 fake 只模拟
+// `revoked ⇔ revoked_at`，所以上面那个 bug 在单测里**结构上不可能**被发现（#252 的根因）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -27,6 +33,14 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
+// #252 的回归保护：preview_grants 的 baseline CHECK（**双向**的那两条）在 fake 里的等价模拟。
+// 两侧 fake（本文件与 offboarding.test.js）共用一份规则，避免「一边补了、另一边还是摆设」。
+import {
+  applyRevokeGrantsSql,
+  previewGrantCheckError,
+  previewGrantCheckViolation,
+  seedPreviewGrant,
+} from './preview-grant-checks.js';
 import {
   PREVIEW_PORT_COUNT,
   PREVIEW_PORT_POOL_END,
@@ -56,12 +70,23 @@ function sqlError(code, message) {
 
 // ---------------------------------------------------------------------------
 // fake：port_allocations / preview_grants / users 内存表 + **真事务快照** + 两条部分唯一索引
+//        + **preview_grants 全部 baseline CHECK**（含 `(state='used') = (used_at IS NOT NULL)`）
 // ---------------------------------------------------------------------------
+
+/**
+ * 种子补齐成「真库里真能存在的一行」（剩下的由共享规则兜）：
+ * ticket 必有 issuer_id、session 必带 parent_ticket_id、`used` 必带 used_at、`revoked` 必带 revoked_at。
+ * 种子本身就违反 CHECK 的话，测的就是一种真库不存在的状态 ⇒ 当场炸，不往下游传。
+ */
+function seedGrant(grant) {
+  return seedPreviewGrant(grant, { subject: 'u-alice', issuer: 'u-alice' });
+}
+
 class PortsStore {
   constructor({ users = [], rows = [], grants = [] } = {}) {
     this.users = users;                                     // [{id, fde_name}]
     this.rows = rows.map((row, i) => ({ run_id: null, released_at: null, id: `pa-${i + 1}`, ...row }));
-    this.grants = grants.map((grant, i) => ({ id: `pg-${i + 1}`, revoked_at: null, ...grant }));
+    this.grants = grants.map((grant, i) => seedGrant({ id: `pg-${i + 1}`, ...grant }));
     this.seq = [];                                          // SQL 前 3 段，逐序（④ 的顺序断言）
     this.writes = [];                                       // 真正改过库的语句（⑥⑧ 的「零 SQL 写」）
     this.outbox = { route: [], materialize: [] };
@@ -94,8 +119,14 @@ class PortsStore {
     return this.rows.filter((r) => r.state !== 'released' && (fdeId === null || r.fde_id === fdeId));
   }
 
-  grantsOf(allocationIds, states = ['active', 'used']) {
-    return this.grants.filter((g) => allocationIds.includes(g.allocation_id) && states.includes(g.state));
+  /** 手工改一行 preview_grants（#252 的「fake 真会拦」断言用）：改完必须仍过 baseline CHECK。 */
+  setGrant(id, patch) {
+    const grant = this.grants.find((g) => g.id === id);
+    if (!grant) throw new Error(`fake: 没有 preview_grants 行 ${id}`);
+    const violation = previewGrantCheckViolation({ ...grant, ...patch });
+    if (violation) throw previewGrantCheckError(grant, violation);
+    Object.assign(grant, patch);
+    return grant;
   }
 
   /** 返回 null = 本 fake 不管这条 SQL（HTTP pool 交给 FakePool 继续派发）。 */
@@ -148,17 +179,13 @@ class PortsStore {
       return { rows, rowCount: rows.length };
     }
 
-    // 撤 grant（照 offboarding.js:225-231 的写法：只动 active/used）
-    if (s.startsWith('UPDATE preview_grants SET state = ') && s.includes("state IN ('active', 'used')")) {
-      assert.match(s, /revoked_at = COALESCE\(revoked_at, now\(\)\)/, '撤 grant 必须写 revoked_at');
+    // 撤 grant（口径同实现）：**谓词由 SQL 决定**（fake 不另写一套），命中的每一行都要过 baseline
+    // CHECK——任何一条违反 ⇒ **整条语句**抛 23514、零行改动（PG 的语句级原子性）。
+    // #252 的根因就是旧 fake 只认 `revoked ⇔ revoked_at`，「顺带把 used 也撤了」在单测里不会红。
+    if (s.startsWith('UPDATE preview_grants SET state = ') && s.includes("state = 'revoked'")) {
+      const out = applyRevokeGrantsSql({ sql: s, grants: this.grants, allocationIds: params[0] });
       this.writes.push(s);
-      const ids = params[0];
-      const rows = this.grantsOf(ids).map((grant) => {
-        grant.state = 'revoked';
-        grant.revoked_at = grant.revoked_at ?? new Date().toISOString();
-        return { id: grant.id };
-      });
-      return { rows, rowCount: rows.length };
+      return out;
     }
 
     if (s.startsWith('INSERT INTO port_allocations')) {
@@ -244,12 +271,16 @@ function aliceSeed(extraRows = [], extraGrants = []) {
 // ---------------------------------------------------------------------------
 // ③⑤⑧⑨⑩ 搬迁事务（portalloc.moveFdePreviewBlock）
 // ---------------------------------------------------------------------------
-test('③ 搬迁成功：旧 10 行全 released（released_at 非空）、其 grant 全 revoked、新 10 行 hostname/url 与新端口一致、两条派生链各入队', async () => {
+test('③ 搬迁成功：旧 10 行全 released（released_at 非空）、其活凭证全 revoked、新 10 行 hostname/url 与新端口一致、两条派生链各入队', async () => {
+  const usedAt = new Date('2026-09-30T10:00:00Z').toISOString();
   const store = aliceSeed([], [
-    { allocation_id: 'pa-1', state: 'active' },
-    { allocation_id: 'pa-2', state: 'used' },
-    { allocation_id: 'pa-3', state: 'expired' },   // 不打扰（口径同 offboarding）
-    { allocation_id: 'pa-4', state: 'revoked', revoked_at: new Date('2026-10-01T00:00:00Z').toISOString() },
+    { id: 'pg-1', allocation_id: 'pa-1', state: 'active' },
+    // 已消费的 ticket（used_at 非空）：#252 前会被一起抓进 revoked 而撞 preview_grants_check3。
+    { id: 'pg-2', allocation_id: 'pa-2', state: 'used', used_at: usedAt },
+    // 它派生的 session 仍活 ⇒ 这才是「本次要抓的东西」（portal.md §2.8）。
+    { id: 'pg-5', allocation_id: 'pa-2', kind: 'session', state: 'active', parent_ticket_id: 'pg-2' },
+    { id: 'pg-3', allocation_id: 'pa-3', state: 'expired' },   // 不打扰（口径同 offboarding）
+    { id: 'pg-4', allocation_id: 'pa-4', state: 'revoked', revoked_at: new Date('2026-10-01T00:00:00Z').toISOString() },
   ]);
   const out = await moveFdePreviewBlock(store.pool(), CONFIG, {
     fdeId: 'u-alice', fdeName: 'alice', blockStart: SECOND_BLOCK[0], log: LOG,
@@ -260,7 +291,7 @@ test('③ 搬迁成功：旧 10 行全 released（released_at 非空）、其 gr
   assert.equal(out.blockEnd, 22019);
   assert.deepEqual(out.ports, SECOND_BLOCK);
   assert.equal(out.releasedAllocations, PREVIEW_PORT_COUNT);
-  assert.equal(out.revokedGrants, 2, '只撤 active/used（expired/revoked 由 offboarding 同口径排除）');
+  assert.equal(out.revokedGrants, 2, '只撤 active（#252 口径：used 是历史事实、expired/revoked 本就不授予访问）');
   assert.equal(out.inserted, PREVIEW_PORT_COUNT);
   assert.equal(out.materializeRevision, 1);
   assert.deepEqual(out.routeRevisions, Array.from({ length: PREVIEW_PORT_COUNT }, (_, i) => i + 1));
@@ -271,11 +302,14 @@ test('③ 搬迁成功：旧 10 行全 released（released_at 非空）、其 gr
     assert.equal(row.state, 'released', '旧行必须 released（否则 20 条活行、旧域名仍可访问）');
     assert.ok(row.released_at, 'released_at 必须非空（CHECK ((state=\'released\') = (released_at IS NOT NULL))）');
   }
-  const grants = store.grants.filter((g) => ['pg-1', 'pg-2'].includes(g.id));
-  for (const grant of grants) {
-    assert.equal(grant.state, 'revoked');
+  for (const id of ['pg-1', 'pg-5']) {
+    const grant = store.grants.find((g) => g.id === id);
+    assert.equal(grant.state, 'revoked', `${id}（active）必须被抓`);
     assert.ok(grant.revoked_at, 'revoked 必带 revoked_at（CHECK ((state=\'revoked\') = (revoked_at IS NOT NULL))）');
   }
+  const usedTicket = store.grants.find((g) => g.id === 'pg-2');
+  assert.equal(usedTicket.state, 'used', '#252：used ticket 保持原状——它已不再授予访问，拓 revoked 必撞双向 CHECK');
+  assert.equal(usedTicket.used_at, usedAt, 'used_at 是历史事实，不得被清成 NULL');
   assert.equal(store.grants.find((g) => g.id === 'pg-3').state, 'expired', 'expired grant 不动');
   assert.equal(store.grants.find((g) => g.id === 'pg-4').revoked_at.startsWith('2026-10-01'), true, 'COALESCE 不覆盖既有 revoked_at');
 
@@ -320,17 +354,122 @@ test('④ 搬迁事务顺序：BEGIN < 旧行 UPDATE < grant UPDATE < INSERT×10
   ], '事务内语句必须逐条同序（route 先、materialize 后；派生链在 COMMIT 之前）');
 });
 
-test('④ 旧行被释放但未命中任何 grant：撤权语句照发（条件在「释放了行」上，口径同 offboarding）、命中 0 行', async () => {
+test('④ 旧行被释放但未命中任何 grant：撤权语句**无条件照发**（#252：不再挂在「本次释放了行」上）、命中 0 行、不报错', async () => {
   const store = aliceSeed();
-  await moveFdePreviewBlock(store.pool(), CONFIG, {
+  const out = await moveFdePreviewBlock(store.pool(), CONFIG, {
     fdeId: 'u-alice', fdeName: 'alice', blockStart: SECOND_BLOCK[0], log: LOG,
   });
+  assert.equal(out.revokedGrants, 0, '撤 0 行本来就是成功（不是跳过、也不是错）');
   assert.equal(store.seq.filter((x) => x.startsWith('UPDATE preview_grants')).length, 1);
   assert.equal(store.outbox.materialize.length, 1);
   const releaseIdx = store.seq.findIndex((x) => x.startsWith('UPDATE port_allocations'));
   const grantIdx = store.seq.findIndex((x) => x.startsWith('UPDATE preview_grants'));
   const insertIdx = store.seq.findIndex((x) => x.startsWith('INSERT INTO port_allocations'));
   assert.ok(releaseIdx > 0 && releaseIdx < grantIdx && grantIdx < insertIdx, '旧行 UPDATE < grant UPDATE < INSERT');
+});
+
+// ---------------------------------------------------------------------------
+// #252（issue #252 / 工单 fix-261011-B）：撤预览 grant 只撤 `active`，且 fake 必须**真**模拟双向 CHECK
+// ---------------------------------------------------------------------------
+
+/** 抽出源文件里每一条 `UPDATE preview_grants …` 的**模板字符串**（要求以反引号开头，否则会误抽文档注释里的伪 SQL）。 */
+function grantStatementsFrom(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  return [...text.matchAll(/`UPDATE preview_grants[\s\S]*?`/g)].map((m) => m[0].slice(1, -1));
+}
+
+test('#252① 撤权只碰 active：used ticket 原样保留（used_at 不动）、同批 active session 被撤、整笔搬迁不报错', async () => {
+  const usedAt = new Date('2026-10-10T09:00:00Z').toISOString();
+  const store = aliceSeed([], [
+    { id: 'pg-1', allocation_id: 'pa-1', state: 'used', used_at: usedAt },          // ticket|used（真机 45 条那一类）
+    { id: 'pg-2', allocation_id: 'pa-1', kind: 'session', state: 'active', parent_ticket_id: 'pg-1' }, // session|active
+  ]);
+  const out = await moveFdePreviewBlock(store.pool(), CONFIG, {
+    fdeId: 'u-alice', fdeName: 'alice', blockStart: SECOND_BLOCK[0], log: LOG,
+  });
+  assert.equal(out.revokedGrants, 1, '只抓那条 active session（used ticket 不算「还在授予访问」）');
+  assert.equal(store.grants.find((g) => g.id === 'pg-1').state, 'used');
+  assert.equal(store.grants.find((g) => g.id === 'pg-1').used_at, usedAt, 'used_at 是历史事实，不得被动');
+  assert.equal(store.grants.find((g) => g.id === 'pg-1').revoked_at, null, 'used ticket 没被改过');
+  assert.equal(store.grants.find((g) => g.id === 'pg-2').state, 'revoked');
+  assert.ok(store.grants.find((g) => g.id === 'pg-2').revoked_at);
+  assert.equal(store.countTx('COMMIT'), 1, '不撞 CHECK ⇒ 本笔搬迁正常提交（真机就是在这里 500 回滚的）');
+});
+
+test('#252② 谓词源码断言：三处撤权 SQL 只出现 active，不再出现 \'used\'、不清 used_at', () => {
+  const targets = [
+    ['撤权（offboarding release-network-routes）', new URL('../src/offboarding.js', import.meta.url)],
+    ['撤权（portalloc moveFdePreviewBlock）', new URL('../src/portalloc.js', import.meta.url)],
+    // 工单只点了两处，但 admin 的「停用用户」路径是**同一条口径**的第三处（旧写法正是工单禁的
+    // 「顺手清 used_at」），一并钉住，否则文档与代码会打架。
+    ['撤权（admin 停用用户 / 写 admin.user_offboarding_started）', new URL('../src/admin.js', import.meta.url)],
+  ];
+  for (const [label, file] of targets) {
+    const statements = grantStatementsFrom(file);
+    assert.ok(statements.length >= 1, `${label}：找不到 UPDATE preview_grants 语句（被删了？）`);
+    for (const sql of statements) {
+      assert.match(sql, /state = 'active'/, `${label}：撤权谓词必须是 state = 'active'`);
+      assert.doesNotMatch(sql, /'used'/, `${label}：撤权谓词里不得出现 'used'（#252 口径：used 是历史事实）`);
+      assert.doesNotMatch(sql, /used_at\s*=\s*NULL/, `${label}：不得靠清 used_at 把 used 塞进 revoked（篡改历史）`);
+      assert.match(sql, /revoked_at = COALESCE\(revoked_at, now\(\)\)/, `${label}：revoked ⇔ revoked_at 要靠 COALESCE 满足`);
+    }
+  }
+  // 「静默跳过」的守卫也钉住：offboarding 里不得再出现 `if (allocations.rows.length > 0)` 这种括在撤权外的条件。
+  const offboarding = fs.readFileSync(targets[0][1], 'utf8');
+  assert.doesNotMatch(offboarding, /if \(allocations\.rows\.length > 0\)/,
+    '#252：撤权不得再挂在「本次真的释放了行」上（重试路径会静默跳过）');
+});
+
+test('#252⑤ fake 的双向 CHECK 断言：手工把 used ticket 改 revoked ⇒ 像真库一样语句级抛 23514（不是摆设）', async () => {
+  const usedAt = new Date('2026-10-10T09:00:00Z').toISOString();
+  const store = aliceSeed([], [
+    { id: 'pg-1', allocation_id: 'pa-1', state: 'used', used_at: usedAt },
+    { id: 'pg-2', allocation_id: 'pa-2', state: 'active' },
+  ]);
+  // 旧写法（#252 的谓词）：把 used 一起塞进 revoked ⇒ 真库报 preview_grants_check3。
+  const oldPredicate = `UPDATE preview_grants
+                           SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+                         WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')
+                     RETURNING id`;
+  await assert.rejects(
+    () => store.query(oldPredicate, [['pa-1', 'pa-2']]),
+    (err) => {
+      assert.equal(err.code, '23514', '必须是 check_violation 的 SQLSTATE，调用方才走同一条错误路径');
+      assert.match(err.message, /violates check constraint "preview_grants_check3"/, 'constraint 名要与真机一致');
+      assert.match(err.message, /new row for relation "preview_grants"/);
+      return true;
+    },
+  );
+  assert.equal(store.grants.find((g) => g.id === 'pg-1').state, 'used', '语句级失败 = 一行都没改');
+  assert.equal(store.grants.find((g) => g.id === 'pg-2').state, 'active', '同语句里本来合法的那条也不得落盘');
+  assert.deepEqual(store.writes.filter((x) => x.startsWith('UPDATE preview_grants')), [], '失败的语句不算写过库');
+
+  // 同一张表上「只撤 active」必须照旧成功——证明 fake 不是「凡 UPDATE 都抛」。
+  const fixed = `UPDATE preview_grants
+                    SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+                  WHERE allocation_id = ANY($1::uuid[]) AND state = 'active'
+              RETURNING id`;
+  const out = await store.query(fixed, [['pa-1', 'pa-2']]);
+  assert.deepEqual(out.rows, [{ id: 'pg-2' }]);
+  assert.equal(store.grants.find((g) => g.id === 'pg-2').state, 'revoked');
+  assert.equal(store.grants.find((g) => g.id === 'pg-1').state, 'used');
+
+  // 「把 used 塞进 revoked 顺手清 used_at」能过 CHECK（假能改），但它是篡改历史 ⇒ 口径上禁，fake 也拦。
+  await assert.rejects(
+    () => store.query(`UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now()), used_at = NULL
+                        WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')`, [['pa-1']]),
+    /used_at/,
+  );
+
+  // fake 的种子也过 CHECK：造一个「used 但没有 used_at」的种子要当场炸（否则测的是真库不存在的状态）。
+  assert.throws(() => aliceSeed([], [{ allocation_id: 'pa-1', state: 'used' }]), /baseline CHECK/);
+  // `setGrant` 同样拦得住（测试自己也不许造非法状态）。
+  const guard = aliceSeed([], [{ id: 'pg-9', allocation_id: 'pa-1', state: 'active' }]);
+  assert.throws(() => guard.setGrant('pg-9', { state: 'revoked' }), /preview_grants_check4/);
+  assert.equal(previewGrantCheckViolation({ kind: 'session', state: 'active', parent_ticket_id: null }).name,
+    'preview_grants_check2', '不只 used 那一条：kind/父票相关的三条 CHECK 也在同一份规则里');
+  assert.equal(previewGrantCheckViolation({ kind: 'session', state: 'active', parent_ticket_id: 'pg-1', used_at: new Date().toISOString() })?.name,
+    'preview_grants_check', 'session 永不可 used（baseline 第一条 CHECK）');
 });
 
 test('⑤ 搬迁冲突（块内有外来活行）→ preview_port_block_taken，且零残留（旧行没被释放、无新行、两条 outbox 都没有新行）', async () => {

@@ -22,16 +22,24 @@
 
 **门禁步骤（顺序执行，任一失败即红；`ci.yml` 步骤 ①、①′、②–④）**
 
-1. （步骤 ①）`node --check` 扫全部 git 跟踪的 `*.js` / `*.mjs`（当前 141 个文件，按 `git ls-files -- '*.js' '*.mjs'` 实测；
+1. （步骤 ①）`node --check` 扫全部 git 跟踪的 `*.js` / `*.mjs`（当前 142 个文件，按 `git ls-files -- '*.js' '*.mjs'` 实测；
    仓库 `type: module`，`node --check` 会按 `package.json` 的 type 解析，ESM 文件实测 rc=0）。
 2. （步骤 ①′）**运行身份诊断**：`id -u` / `id -g` / `id` / `uname -a`（无 `continue-on-error`、无 `if: always()`）。
    为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
    有这四行就不用再猜「今天的 runner 是谁」。
-3. （步骤 ②）根 `npm ci` + `npm test` → **910 项 / 909 通过 / 0 失败 / 1 跳过**（基线，2026-10-11 本机复现；
-   原 889/888 基线上新增 `#246 交付②` 预览端口列端点与管理员改块的 21 项，落点 `portal/test/preview-ports.test.js`；
-   再往前是 `#246` 交付① 预分配号池块的 15 项（`portal/test/portalloc.test.js` 与 `portal/test/{migrations,materializer}.test.js`）
-   与 `#241` 预览预检与 deny CORS 的 7 条）。
-   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **910 里已含 runner 的 200 项**。
+3. （步骤 ②）根 `npm ci` + `npm test` → **920 项 / 919 通过 / 0 失败 / 1 跳过**（基线，2026-10-11 本机复现；
+   原 910/909 基线上新增 `#252`（工单 `fix-261011-B`）撤预览 grant 只撤 `active` 的 **10 项**：
+   `portal/test/preview-ports.test.js` +3（只撤 active / 谓词源码断言 / fake 真会拦 23514）、
+   `portal/test/offboarding.test.js` +5（只撤 active / **重试路径** / 撤 0 行 / 旧谓词 23514 / 整笔回滚）、
+   `portal/test/migrations.test.js` +1（0020 静态断言）、`portal/test/preview-grant-checks.js` +1
+   （**这是 fake 共用的 CHECK 规则文件，本身没有用例**——见下面的发现规则，`test/` 目录下的每个 `.js` 都占 1 项，
+   `fake-pool.js` 那三个 helper 同理，别把它当成一条真用例）；
+   再往前是 `#246 交付②` 预览端口列端点与管理员改块的 21 项（`portal/test/preview-ports.test.js`）、
+   `#246` 交付① 预分配号池块的 15 项（`portal/test/portalloc.test.js` 与 `portal/test/{migrations,materializer}.test.js`）
+   与 `#241` 预览预检与 deny CORS 的 7 条。
+   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **920 里已含 runner 的 200 项**。
+   ⚠️ 同一条发现规则（`**/test/**/*.js`）也会把 `portal/test/` 下的**非用例 helper**算成 1 项 ⇒ 净增用例数
+   要按上面的拆解核对，别只看总数（实测：在 `portal/test/` 放一个空的 `x.js`，总数立刻 +1）。
 4. （步骤 ③）`cd runner && npm ci && node --test` → **200/200**。口径见 `AGENTS.md` §4：
    **`node --test runner/test/`（目录当参数）在本机 Node 22/24 是坏的**（把目录当模块加载 → `Cannot find module`），别用。
 5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **23 文件 / 329 通过**。
