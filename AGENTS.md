@@ -326,6 +326,22 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 
 
+### 8.13 预览端口全局号池 `22000–29999` 与块分配（issue #246 交付①，PR #248，2026-10-11）
+
+背景：决策者裁决「端口按用户顺序发段、不许重叠，容量给到 800 段」。本节**取代** §8.12 的分配规则（原记录不删，§8.12 顶部已标失效项）。本单只做后端切片（交付①）；面板与列端口 API = 交付②。
+
+- [x] **常量单一来源 `portal/src/previewpool.js`**（新叶模块）：号池 `22000–29999` / 默认块 10 / 800 段 / 块几何 / 域名预算。单独成模块的原因写在文件头：`portalloc.js` 已单向依赖 `projects.js`，反向 import 会构成 ESM 循环，`portalloc.test.js` / `system-prompt.test.js` 这类入口上顶层 `const` 会进 TDZ。
+- [x] **重叠是 DB 保证的硬不变式，不是应用保证的**：迁移 `0019` 建 `port_allocations_live_global_port_key UNIQUE (port) WHERE state <> 'released'`。`portalloc.js` **不做**「先查后插」查重循环（有测试专门钉这一点，防将来「顺手加个查重」）；跨 FDE 抢号 ⇒ `(fde_id,port)` 冲突目标不匹配 ⇒ `23505` 冒出来 ⇒ 翻成 `preview_port_block_taken`。占用判据 = **全局活行端口**（不分 FDE/scope/role，与索引谓词同口径）；`released` 不占位 ⇒ **号码可回收**。判定块时**整块**跳过（段内有一个被占就整段不要），避免把外来行侵吞进自己段里。
+- [x] ⚠ **迁移实际是四步不是三步**（worker 实测修正了工单）：**⓪ 先按名 `DROP` 旧 `port` CHECK** → ① 重排存量活行进池（按 `fde_name` 定序；`hostname`/`url` 同事务重写，base 域从旧 hostname 反推、**不硬编码伞域**；装不下的溢出活行置 `released`）→ **①′ 守卫 DO 块**（池外活行 / hostname 与端口不同步 ⇒ 带表名 RAISE，换掉裸 23514）→ ② `port` CHECK 改**按状态分支**（活行 `BETWEEN 22000 AND 29999`；`released` 行允许 `4000–29999` **保留历史号码**）→ ③ 建全局部分唯一索引。⓪ 不可省：旧区间 `4000–4999` 与新池**不相交**，带着它连 `UPDATE` 进池都当场 23514；`DROP`→`ADD` 之间的无 CHECK 窗口由「迁移 runner 单个显式事务 + `ACCESS EXCLUSIVE` 持到 COMMIT」兜住。
+- [x] ⚠ **PG `lpad` 陷阱**：`lpad('22010',4,'0')` = `'2201'`（**截断**），而写侧 `String(port).padStart(4,'0')` 不截断——用 lpad 会把同块 10 行塑成同一 hostname 当场 23505。重写端口段用「截到旧端口段之前 + 新端口原样十进制 + base 后缀」。
+- [x] **5 位端口连锁**：预算 `56 → 55`，且预算与探测端口都从**池上界宽度**推导（`PREVIEW_PORT_BUDGET_PROBE_PORT = PREVIEW_PORT_POOL_END`）。旧实现把 `4000` 写死在预算校验里，正是 #202 那个「56 字符名过应用校验 → INSERT 被 0017 CHECK 炸成裸 23514」的病根。边界测试：55 过 / 56 拒 / 57 拒（**`56 拒` 是相对现状的行为变化**）。
+- [x] **告知面不再出现端口数字**：`runner/worker.js` 的 `SYSTEM_PROMPT` 与 materializer 生成的 FDE 家目录 `AGENTS.md` 统一改说「段由平台分配，`~/.erix/ports.json` 是唯一真相」；防漂移测试随之**禁止两处出现端口字面量**。真机证据：重绑 Tetris 的那次 run 自己去 `cat ~/.erix/ports.json` 取号，提交的标题就是「适配平台动态端口分配」，没有猜端口。
+- [x] **测试口径**：根 `npm test` **889 / 888 通过 / 0 失败 / 1 跳过**（基线 877，净增 12）；`node --test runner/test/*.test.js` **200/200**；前端 `vue-tsc` 干净、vitest **23 文件 / 329 通过**。`docs/ops/ci-release.md` §1 与 `ci.yml` ② 注释已同步。`docs/data/schema.sql` **一个字节未改**（sha256 baseline 冻结）。
+- [x] **真机验收（主 agent 亲手，不采信 worker 自报）**：临时库重建至 0018 → 灌真库 31 行 → 应用 0019 → 确认旧 CHECK 形态、活行端口全局唯一、eric `22000–22009`、tetris `22010–22019`、原 `4100` 转 `released` 保号、`portsprobe` 的 `4000–4009` 十条未动、`hostname`/`url` 与新端口一致、无 4 位残留、**重放幂等**（全表 md5 不变）；负例：活行 `4005` / 超界 `30001` 被 CHECK 拒、跨 FDE 撞 `22000` 被新索引拒。部署后派生链**三段全自动**：`routes.yml` 自动换成 `220XX` 且旧 `40XX`/`tetris-p-4100` 消失 → 容器内 `ports.json` `generation=3` 新 url → 签票 `302 + Set-Cookie` 且 `allocated→active` 自动升级；#241 的 CORS 行为未回退（无票 403 仍回显 `Access-Control-Allow-Origin`）；旧域名 `eric-p-4000` → 404（路由已撤）。
+- [x] **已接受代价的修复也是真机跑的**：迁移后 Tetris 预览 `502 Bad Gateway`（鉴权已过、`state` 升 `active`，纯粹是应用还听旧端口）——由**平台自己的 agent** 在会话 `b35109c0…` / run `87a31661…`（`judge_done`，↑1.23M/↓12.8k）改绑到 `22010/22011` 并推送，主 agent 复跑应用测试 **22/22**，端到端 `22010` 首页 `200`、`/config.js` 指向新后端、`22011/api/healthz` `200 {"ok":true}`、`/api/leaderboard` `200` 真实数据。
+- [ ] **已知边界（本单未补，交付②一并做）**：`onboardFde` 对 `preview_port_block_taken` **没有重试循环**——错误文案说「由调用方重试」，但开户路径遇错即整笔回滚，需重跑 `cli.js provision-fde`。只在「两个 FDE 同时开户抢同一块」时才触发（当前开户是 CLI/管理台串行），所以不是现实故障，但**不许拿它当已完成**。
+- [ ] **仍未做**：面板 / 列端口 API / 一键签票（#246 交付②）、FDE 级 grant（#247）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
