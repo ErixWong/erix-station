@@ -63,6 +63,9 @@ export function renderHomeAgentsMd({ fdeName }) {
     `- 一个项目 = \`~/projects/<project>\`（本容器用户 ${FDE_CONTAINER_USER}）——目录即项目，无注册`,
     '- 一个 run 直接在项目目录 `~/projects/<project>` 工作，交付物留在项目目录内',
     '- **端口一律从 `~/.erix/ports.json` 取**，不要自己挑；dev server 绑 `0.0.0.0`',
+    // issue #240：端口事实的「告知」落点之一（另一个是 runner 的 SYSTEM_PROMPT）——
+    // 平台已在开户时预建 10 条预览域名，口径与 fde-platform.md §8.2 一致：固定 10 条、不做配额。
+    '- 平台已预建 **10 条预览域名**（端口 `4000–4009`，每条带真实 `url`），**不够用也不会再给**：在这 10 条里选',
     '- 回流走 fork/PR，不直接在主干改',
     '- `node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）',
     '',

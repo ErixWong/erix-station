@@ -149,3 +149,48 @@ test('提示词里的 shell 仍是命令执行面（文件工具不执行命令�
   // 「shell 有意不受文件遮蔽约束」那句不对称属于 maskedPaths 那一片（见 runner/test/masked-paths.test.js）；
   // 本文件不提前断言一个本片还没交付的性质，否则 B 片会依赖 C 片的改动才能绿。
 });
+
+// issue #240：预览域名改为「平台预建 10 条」，提示词必须复述同一口径。
+// 为什么要把端口窗口从 portal 侧常量拿而不是在测试里重打一遍：这条提示词与 portal/src/portalloc.js
+// 是**两个包里的两份文案**，决策者拍的是「告知 + 尽力」，两处数字对不上就是告知失败
+// （容器侧不做端口管控，没有任何机制会替我们发现漂移）。
+/** 抠出「预览域名与端口」整段（从标题行到下一个空行）——按段断言，避免靠关键词跨行凑齐语义。 */
+function previewSection(prompt) {
+  const lines = prompt.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('预览域名与端口'));
+  assert.notEqual(start, -1, 'SYSTEM_PROMPT 必须有「预览域名与端口」这一段（#240 的告知落点之一）');
+  const rest = lines.slice(start);
+  const end = rest.findIndex((l) => l.trim() === '');
+  const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
+  assert.ok(section.length > 80, '该段不该是空壳');
+  return section;
+}
+
+test('SYSTEM_PROMPT 讲清「平台预建 10 条预览域名」：条数/端口窗口与 portal 侧常量一致', async () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  const { PREVIEW_PORTS, PREVIEW_PORT_START, PREVIEW_PORT_COUNT } = await import('../../portal/src/portalloc.js');
+  const section = previewSection(prompt);
+
+  assert.equal(PREVIEW_PORT_COUNT, 10);
+  assert.equal(PREVIEW_PORT_START, 4000);
+  assert.deepEqual(PREVIEW_PORTS, [4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009]);
+
+  assert.match(section, /预建|已预建/, '必须写明是平台预建（不是让 agent 去申请）');
+  assert.match(section, /10 条/, '必须写明固定 10 条');
+  assert.match(section, new RegExp(`${PREVIEW_PORT_START}[–—-]\\s*${PREVIEW_PORTS.at(-1)}`),
+    `必须写明端口窗口 ${PREVIEW_PORT_START}–${PREVIEW_PORTS.at(-1)}（与 portalloc.js 常量一致）`);
+  assert.match(section, /~\/\.erix\/ports\.json/, '端口与 URL 的清单来源必须写出来');
+});
+
+test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端口、文件工具去读家目录', () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  const section = previewSection(prompt);
+  // ① 自造：域名由平台按 <fde>-p-<port> 生成（与路由同源），agent 只能选不能用
+  assert.match(section, /不要自造域名或端口|不要自造/, '必须禁止自造域名/端口');
+  assert.match(section, /必须从这 10 个/, '必须把选择范围钉在预建的 10 条里');
+  // ② 索要：固定 10 条 ⇒ 没有 port_quota_exceeded 这回事，也别去提工单
+  assert.match(section, /不要要求平台再加|不要要求平台/, '必须写明不要要求平台加端口（配额语义已删除）');
+  // ③ 可达性：jail 根是项目目录，~/.erix/ports.json 只能经 shell 读（说了等于没说会白烧轮次）
+  assert.match(section, /shell/, '必须给出读得到 ports.json 的实际手段（文件工具够不到家目录）');
+  assert.match(prompt, /0\.0\.0\.0/, 'dev server 绑 0.0.0.0 的硬约定不能丢（fde-platform §8.4）');
+});

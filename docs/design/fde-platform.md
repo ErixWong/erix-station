@@ -313,7 +313,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 
 1. 建 user 记录（角色来自 claim）
 2. **分配子网（IPAM）→ 建 `fde-<name>` 网络 → 起容器**（H-B 定稿 D-1/D-10，issue #5）：portal 查 `fde_networks` 推荐下一块空闲 `/29`（管理员可改），`docker network create --subnet` 显式创建；容器**只接自己这条网络**（不再有 `control` 接入），bind mount 用户空间
-3. 分配端口块 + **写预览路由**：DB 事务写 `port_allocations` + route outbox/revision，由 reconciler **幂等发布**到 Traefik file provider（§8.1；不再是「路由与 DB 同事务」——PG 事务无法含文件写入）
+3. **预分配 10 条预览域名 + 同事务触发派生链**（issue #240，替代原「分配端口块」；决策者 2026-10-11 裁决）：`portal/src/portalloc.js` 的 `ensureFdePreviewPorts` 在**一个 DB 事务**里写 `port_allocations` **10 行**（`scope='fde'`、端口 `4000–4009`、`role='spare'`、`exposure='private'`、`state='allocated'`，口径见 §8.2），并在**同一事务**内入队 route outbox/revision + materialize revision ⇒ reconciler **幂等发布** Traefik 路由、materializer 重写 `~/.erix/ports.json`，两条派生链都不需要人工触发（PG 事务无法含文件写入，故仍是「事务写 desired state + outbox」、由 reconciler 异步落盘，§8.1；历史上 `port_allocations` 从没被产品代码写过，手工插完之后路由与 `ports.json` 一律不动——这正是 #240 要消灭的动作）。幂等判据 = 既有部分唯一索引 `port_allocations_live_port_key (fde_id, port) WHERE state <> 'released'` + `ON CONFLICT DO NOTHING` ⇒ 重跑 `cli.js provision-fde` 只补缺口、已齐备则零插入零入队
 4. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 5. **创建 LLM 绑定**：按建号表单必选的 LiteLLM provider 与主模型（可选 embedding / vision）创建模型白名单受限的 per-FDE 虚拟 key 并发布 LLM 注入路由；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
 
@@ -351,8 +351,8 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 
 ```
 DB: port_allocations（权威，唯一写入口）
- ├─ id / fde_id / scope(project|run)
- ├─ project_id / run_id
+ ├─ id / fde_id / scope(project|run|fde)      ← 'fde' 由迁移 0018 放开（#240，§8.2）
+ ├─ run_id（scope='fde' 时恒 NULL；project_id 已随 P5 退役，迁移 0008）
  ├─ port / role
  ├─ hostname / url            ← 与 Traefik 路由同源生成
  ├─ exposure(private|org-visible|public)
@@ -370,22 +370,42 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 **为什么还要 JSON**：agent 读端口无需发 API（少一个失败点，可离线）；可 grep、可调试；符合「这台小电脑」的心智模型。
 
-**同步规则**：平台 → 容器**单向**；agent 需要新端口**发 API 申请**，绝不自己挑。
+**同步规则**：平台 → 容器**单向**。#240 起**没有「申请新端口」这条路**：开户时已预建 10 条（§8.2），容器内一律从 `~/.erix/ports.json` 取、绝不自己挑。
 
-### 8.2 分配策略（项目创建分配**单端口**，不是完整端口块）
+**告知的两处落点（容器侧不做端口管控，只告知）**：① `~/.erix/ports.json`（本图的派生终点，10 条 + 每条真实 `url`）；② `runner/worker.js` 的 `SYSTEM_PROMPT`（复述「已预建 10 条 / 必须从这 10 个端口里选 / 不要自造域名或端口 / 不要要求平台再加」）。两处都由同一份 DB 事实派生，防漂移测试：`portal/test/materializer.test.js`、`runner/test/system-prompt.test.js`（端口窗口取自 `portalloc.js` 常量，不在测试里重打一遍）。
 
-> **裁决（消除「run 端口块 `4000 + runIndex*8…+7` 与 `POST /projects` 只返回一个端口」的矛盾）**：端口空间按 **8 端口块（slot）** 划分，但**项目创建只分配块内第一个端口**；块的其余 7 个端口是 **run 级**（P2）。完整端口块是 run 级规则，不属于项目创建。
+### 8.2 分配策略（开户即预分配 **10 条 FDE 级预览域名**；issue #240 定稿）
 
-| 类别 | 用途 | 生命周期 | P1 |
-|---|---|---|---|
-| **项目级固定端口** | URL 稳定：书签、演示、客户 demo、对话页预览卡片 | 项目创建时分配，删除时回收 | ✅ P1 |
-| **run 级临时端口** | 多分支并发开发；URL 带 runId | run 结束回收 | P2 |
+> **裁决（决策者 2026-10-11）**：预览域名按 **FDE 级**在开户（provision）时一次性预分配 **10 条**，
+> 端口固定 `4000–4009`，`hostname`/`url` 仍按 §8.5 语法与读侧同源生成。
+> 原「项目创建分配块首单端口 + 8 端口块（slot）+ 每用户总配额」的方案**整体作废**：
+> 项目注册制已随 P5「目录即项目」退役（`POST /api/projects` 现返回 `410 project_api_retired`，
+> `projects.slot` 不再参与端口分配，`port_allocations.project_id` 已被迁移 0008 DROP），
+> run 级端口块仍是 P2。**固定 10 条 ⇒ 不存在「超限」，错误码 `port_quota_exceeded` 随之删除**
+> （portal.md §1.2 / §3.3；不新造替代错误码）。
 
-- **端口块（slot）**：每 FDE 端口空间按 8 端口块划分，块 `s` = `4000 + s*8 … 4000 + s*8 + 7`。项目创建时分配一个 slot（`projects.slot`，用户内活跃唯一，schema.sql `projects_live_slot_key`）。
-- **项目级固定端口** = 块首 `4000 + s*8`（默认 `role=frontend`）：项目创建时分配**这一个**端口，`POST /api/projects` 返回**这一个**（示例 `4016 = 4000 + 2*8`，slot=2）。项目删除时回收。
-- **run 级端口块**（P2）= 同项目 slot 块内的剩余 7 个端口 `4000 + s*8 + 1 … +7`（`backend` / `debug` / `spare`），run 启动时按需分配、run 结束回收——「run 端口块」指「一个项目块的 run 级部分」，不是独立于项目的第二套编号。
-- 容器固定角色：`3001` **已取消**（code-server 清退，容器唯一交互入口为 FDE 对话界面，issue #71，决策者 2026-09-24；原 `3000` runner 内部 API 同样已取消：容器平台通道零监听、全出站，§10.3，issue #3 评论）
-- 每用户总配额（如 40 个**项目 slot**，即 40×8 = 320 个端口的上限；env.md `PORT_QUOTA`），超限**明确报错**而非静默漂移（`port_quota_exceeded`）
+| 项 | 取值 | 依据 |
+|---|---|---|
+| 粒度 | `scope='fde'`（迁移 **0018** 放开的第三个值；`run_id` 恒 NULL，与 `CHECK ((scope='run') = (run_id IS NOT NULL))` 自洽） | §7.2 第 3 步、迁移 0018 |
+| 条数 | **固定 10 条**，开户一次写完；不做配额、不再追加 | 决策者裁决 1/5 |
+| 端口 | `4000–4009`（`port` CHECK 允许 4000–4999，本窗口天然满足） | schema.sql §4 |
+| 角色 | `role='spare'`（复用既有枚举，不新造） | schema.sql §4 |
+| 可见性 | `exposure='private'`（对外分享走 §2.8 预览 ticket） | §6.5 |
+| 状态 | `state='allocated'`；首次 forward-auth 放行才幂等升 `active` | §8.6 |
+| 容器固定角色 | `3001` **已取消**（code-server 清退，容器唯一交互入口为 FDE 对话界面，issue #71，决策者 2026-09-24；原 `3000` runner 内部 API 同样已取消：容器平台通道零监听、全出站，§10.3，issue #3 评论） | 原 §8.2 保留项 |
+
+- **容器侧不做端口管控**（决策者裁决 2）：平台只保证这 10 条预览域名**有路由**；FDE 容器实际
+  监听什么端口平台**不检查、不限制、不 reconcile**。「严格管理容器内端口」的设想作废，改为
+  **告知 + 尽力**（落点见 §8.1 末段）。
+- **派生必须自动**（决策者裁决 4）：写库与 route outbox / materialize revision 入队**同一事务**，
+  禁止依赖人工 `enqueueFullRebuild` / `runMaterializerOnce`。
+- **幂等与存量补齐**（决策者裁决 7）：`ensureFdePreviewPorts` 的幂等判据是**部分唯一索引 +
+  `ON CONFLICT (fde_id, port) WHERE state <> 'released' DO NOTHING`**（不是「先查后插」，没有 TOCTOU）
+  ⇒ 二次调用零插入、零入队；缺几条补几条；老 FDE 重跑 `node portal/src/cli.js provision-fde --fde-name <name>` 即补齐到 10 条。
+- **遗留行不迁移**：真机现存 4 行全是 P5 之前手工插的 `scope='project'`（含 `tetris` 的 **4100**，
+  在本窗口之外），**既不改也不删**——路由生成（`routes.js` 读期望态）只看 `state <> 'released'`
+  与 `hostname`、不看 `scope`，遗留行继续有效；窗口内若已有同端口行（哪怕 `scope='project'`、
+  `role='frontend'`）也算「已存在」，不重复插（正是那条部分唯一索引给出的语义）。
 - 定期 reaper 回收 `released_at` 过期项；Traefik 配置由 reconciler 按 route outbox 幂等发布（§8.1，H-B）
 
 ### 8.3 `ports.json` 结构
@@ -409,7 +429,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 ### 8.4 容器内两条硬约定
 
-1. 端口一律从 `.erix/ports.json` 取，**不要自己挑**
+1. 端口一律从 `~/.erix/ports.json` 取，**不要自己挑**（#240：平台已预建 10 条、端口 `4000–4009`，且**没有**「申请新端口」这条路，§8.2）
 2. dev server 必须绑 **`0.0.0.0`**（容器内）——与常规安全建议相反，因为容器网络私有且只有 ingress 能进；绑 `127.0.0.1` 会导致 ingress 够不着
 
 ### 8.5 hostname grammar（写死；P5 去项目化后无项目名段；#57 阶段2 伞域修订）
@@ -421,7 +441,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 > **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」；实现唯一入口 `portal/src/projects.js` `buildHostname`，URL 另见同模块 `previewUrl`），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
 > **长度约束（DNS 标签安全的前提，#202 如实写）**：单标签上限 **63** 字符、整域名 ≤ **253**（RFC 1035）。首标签 `<fde>-p-<port4>` 的固定段（`-p-` + 恒 4 位端口）占 7 字符 ⇒ **FDE 名参与预览域名的预算 = 56**（旧文档的「项目名段 / 最长 134」形态已随 P5 去项目化作废，存量 hostname 由迁移 0008 重写）。
-> **强制点（三层，同一口径逐标签 ≤63 + 总长 ≤253）**：① 开户即 400（`admin.js createUser` → `projects.validateFdeNameForHostname`，对**最终 hostname** 整体校验，错误文案含实际长度与「缩短到 56 以内」）；② 路由生成 fail-closed（`routes.js isValidHostname`）；③ DB 兜底 CHECK（迁移 **0017**，整域名正则，NOT VALID）。FDE_NAME_RE（≤63）本身不改：目录名/容器名/git-credential 路径不受 DNS 标签约束，57..63 字符在那些路径仍合法。
+> **强制点（四层，同一口径逐标签 ≤63 + 总长 ≤253）**：① 开户即 400（`admin.js createUser` → `projects.validateFdeNameForHostname`，对**最终 hostname** 整体校验，错误文案含实际长度与「缩短到 56 以内」）；② **预分配前**（#240：`portalloc.js ensureFdePreviewPorts` 写 10 条 hostname 之前按同一函数复检，`code='preview_hostname_invalid'`——否则 10 条里有 1 条拼错就会让 0017 的 DB CHECK 在开户事务中途炸成裸 23514）；③ 路由生成 fail-closed（`routes.js isValidHostname`）；④ DB 兜底 CHECK（迁移 **0017**，整域名正则，NOT VALID）。FDE_NAME_RE（≤63）本身不改：目录名/容器名/git-credential 路径不受 DNS 标签约束，57..63 字符在那些路径仍合法。
 
 **grammar**（小写、DNS 标签安全）：
 
@@ -653,8 +673,8 @@ hostname := <fde> "-p-" <port4> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> 即�
 |---|---|---|
 | ~~3000~~ | ~~`station-runner` 内部 API~~ **已取消**：容器平台通道零监听、全出站（§10.3，决策者 2026-09，issue #3 评论） | — |
 | ~~3001~~ | ~~code-server~~ **已取消**：容器唯一交互入口为 FDE 对话界面（issue #71，决策者 2026-09-24；对齐 3000 取消先例） | — |
-| 4000+ 块首 | 项目级固定端口：dev servers / 浏览器调试（P1） | FDE 私，可分享 |
-| 4000+ 块内其余 | 按 run 分配的 dev servers / 浏览器调试（P2） | FDE 私，可分享 |
+| `4000–4009` | **平台开户即预建的 10 条预览域名**（`scope='fde'`、`role='spare'`）：dev servers / 浏览器调试（#240，§8.2） | FDE 私，可分享 |
+| 4010+ | 未预分配（run 级端口块仍是 P2；平台不做容器侧端口管控，容器爱监听什么监听什么） | — |
 
 > H-B 对齐确认（issue #5）：容器内**无 runner 监听端口**（3000 已取消，平台通道全出站经 Traefik，§5.3/§10.3）；Traefik 不在容器内（host 网络）；以上端口均不 publish，仅经 Traefik 每 allocation 一条路由可达（§6.4）。
 
