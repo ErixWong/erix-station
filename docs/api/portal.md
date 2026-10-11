@@ -61,8 +61,8 @@
 | 端口 | `GET /api/projects/:id/ports` | **已退役 `410`**：端口事实的读取面是 FDE 级 `~/.erix/ports.json`（§4.7 / 规格 §8.2） |
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **无路由，实测 `404`**（文档与实现的差异见 #250） |
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
-| 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **无路由，实测 `404`**（#249） |
-| 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **无路由，实测 `404`**（#249） |
+| 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
+| 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -464,7 +464,7 @@ station-portal user enable  --login <login>
 
 四类主体：`admin`（本地破窗 admin）、`普通 FDE`（本人资源）、`同租户已认证`（`org-visible` 的观者）、`公开`（未认证 / `public` 观者）。资源归属默认按「当前登录用户」过滤，他人资源一律 `404`（§1.2）。
 
-| 主体 | 自己的项目 | 自己的会话/run | 自己的审批 | 预览访问（exposure） | 用户管理 / 全局 |
+| 主体 | 自己的项目 | 自己的会话/run | 自己的审批（**未交付**，§4.8）| 预览访问（exposure） | 用户管理 / 全局 |
 |---|---|---|---|---|---|
 | `admin` | 读/写/删；运维视角可**读全部 FDE 项目**（每次读他人资源写审计 + 告警） | 读/写/stop；运维视角可读全部会话/run | 决定自己的审批单；运维视角可读全部审批单 | 可对任意 allocation 签发 ticket（含 `private` 他人；`issuer_id`=admin、主体 `user_id`=admin，forwardAuth 按主体 + **admin 例外**放行并写审计）与开 `public` | 建/禁用/恢复用户、重置口令/TOTP、吊销会话/ticket、offboarding（§2.9） |
 | `普通 FDE` | 仅本人项目（他人 → `404`） | 仅本人 session/run | 仅本人审批单（他人 → `404`） | 本人 `private` + 任意 `org-visible` + `public`；**不得开 `public`**（`403 forbidden`，§4.7） | 无 |
@@ -818,8 +818,10 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 > 且工作台 SPA（`portal/frontend/src`）零 `approv` 引用 ⇒ **当前根本不会产生「待审批项」**：引擎 `erix-agent 0.18.0`
 > 全文无审批钩子（`grep -rni approval src/` → 0 命中），工具循环不会问宿主；runner 侧只有**接收侧**（`pendingApproval` + `APPROVAL_DECISION`），
 > **无发送方**，`agentd.js:871` 的 `APPROVAL_REQUEST` 分支直接回 `denied` 并注明「P1 留空」（`agentd.js:14`）。
-> 工具审批在 `docs/design/fde-platform.md` 路线表里明列为 **P2**。本节的 Approval 对象与「迟到决定 `409 approval_expired`」
-> 契约因此**仅在 internal 语义层成立**；要做到用户可用，缺的第一块是**上游引擎的「暂停等宿主裁决」钩子**，不是页面按钮（#249）。
+> 工具审批在 `docs/design/fde-platform.md` 路线表里曾列为 P2，**现已裁决不交付**（#249 closed；理由与「什么条件下重新考虑」见 `docs/design/principles.md` §3）。
+> 本节的 Approval 对象与「迟到决定 `409 approval_expired`」**不再是对外承诺的活契约**，只作两个用途：
+> ① **internal 面（§9 U10/U11）与 `approvals` 表保留**作协议留档，将来真要重做不必重新设计；② 解释为何用户面这两行返回 `404`。
+> 若将来重开：缺的第一块仍是**上游引擎的「暂停等宿主裁决」钩子**，不是页面按钮；工具风险面见 `runner-integration.md` §17。
 
 judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls`）。
 

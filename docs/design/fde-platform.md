@@ -740,7 +740,7 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **P1** | Traefik + portal + DB + 单 FDE 容器（含 station-agentd / station-runner）；登录、项目列表、对话（SSE）、停止 | 真机走通「登录→建项目→对话→工具卡片→停止」；playwright + vision 验证 |
-| **P2** | 多 FDE、run 级端口块 + 预览卡片/iframe、事件重放、工具审批、账号生命周期 workflow（项目级端口分配已在 P1，见 §8.2/deploy-contract §7.1） | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
+| **P2** | 多 FDE、run 级端口块 + 预览卡片/iframe、事件重放、~~工具审批~~（**已摘除**：裁决不交付，理由与重新考虑的条件见 principles §3 / issue #249；`approvals` 表与 internal U10/U11 保留作协议留档）、账号生命周期 workflow（项目级端口分配已在 P1，见 §8.2/deploy-contract §7.1） | 断线重连不漏事件；**FDE A 无法访问 FDE B 的任何端口** |
 | **P3** | LLM 网关 + 用量记账 + 审计（出口管控为**外部依赖**：安全团队网络层策略，issue #3，非平台交付项） | 成本可按客户项目归集；安全团队出口策略实施后「改 endpoint 无效」，未实施时降级为审计+告警 |
 
 > **原 P0（「等 erix-agent 抽 `src/session/` 发 0.4.0」）已删除**（决策者 2026-09，issue #3 评论）：上游把会话管理列为永久非目标（§13.1），会话层由本平台自实现。**P1 内容不变，只是解除了外部依赖阻塞**——P1 现为第一阶段。
