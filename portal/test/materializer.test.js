@@ -21,7 +21,7 @@ import {
   CONTAINER_HOME,
 } from '../src/materializer.js';
 import { atomicWriteFile, sha256, commitTempFile, writeTempFile } from '../src/fsutil.js';
-import { previewAllocationPlan, PREVIEW_PORTS } from '../src/portalloc.js';
+import { previewAllocationPlan, PREVIEW_PORTS, PREVIEW_PORT_COUNT } from '../src/portalloc.js';
 
 // 宿主侧属主跟随进程身份（同 portal/test/git-cli-config.test.js 顶部口径）：生产是
 // `uid/gid = fdeUid/fdeGid`（portal/src/materializer.js:441-442 默认 1000），而测试里的 chown
@@ -140,9 +140,16 @@ test('renderHomeAgentsMd：端口指引指向 FDE 级 ~/.erix/ports.json（不�
   const md = renderHomeAgentsMd({ fdeName: 'alice' });
   assert.match(md, /~\/\.erix\/ports\.json/);
   assert.doesNotMatch(md, /projects\/<project>\/\.erix\/ports\.json/);
-  // #240：告知「固定 10 条、端口 4000–4009、不够用不再给」——容器侧不管控，只能靠告知收口
-  assert.match(md, /10 条预览域名/, 'AGENTS.md 必须告知预建 10 条预览域名');
-  assert.match(md, /4000–4009/, '必须写明端口窗口');
+  // #240 引入、#246 交付①改口径：告知的是「段由平台分配 + `~/.erix/ports.json` 是唯一真相」。
+  // 为什么不再断言具体端口窗口（旧断言是 /4000–4009/）：号池里每个 FDE 拿哪一段是运行时决定的，
+  // 把区间抄进家目录 AGENTS.md 就是「第二份清单」，必然与盘上的 ports.json 漂移（#246 的病灶）。
+  assert.match(md, /分配一整段/, 'AGENTS.md 必须写明预览端口段由平台分配（不再是人人同一段）');
+  assert.match(md, new RegExp(`默认 ${PREVIEW_PORT_COUNT} 条`), '默认块大小必须与 portal 侧常量一致（不在测试里重打一遍）');
+  assert.match(md, /唯一真相/, '必须把 ports.json 钉成唯一真相');
+  assert.match(md, /不要凭记忆猜端口|不要自己挑/, '必须挡住 agent 自选端口');
+  assert.match(md, /0\.0\.0\.0/, 'dev server 绑 0.0.0.0 的硬约定不能丢（规格 §8.4）');
+  assert.doesNotMatch(md, /\b4\d{3}\b/, '不得再出现 #240 时代的固定窗口 4000–4009');
+  assert.doesNotMatch(md, /\b22000\b/, '也不得把号池边界抄进 AGENTS.md（同样是第二份清单）');
 });
 
 test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目录 clone . / git init）', () => {

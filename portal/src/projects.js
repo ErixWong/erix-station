@@ -8,6 +8,16 @@
 //     hostname 语法（#57 阶段2 伞域修订）：<fde>-p-<port4>.<BASE_DOMAIN>，BASE_DOMAIN 本身即伞域 fde.<可注册域>。
 // 目录枚举/会话绑定见 dirs.js / sessions.js（cwd）。
 
+// 号池常量与预览域名预算从 previewpool.js 取（叶子模块，零依赖）：本模块与 portalloc.js 都要用这批
+// 常量，而 portalloc 已单向依赖本模块 ⇒ 反向 import 会构成 ESM 循环并在「先加载 portalloc」的入口上
+// 踩 const 的 TDZ。理由与全部常量口径见 portal/src/previewpool.js 顶部。
+import {
+  MAX_FDE_NAME_LEN_FOR_HOSTNAME,
+  PREVIEW_PORT_BUDGET_PROBE_PORT,
+  PREVIEW_PORT_LABEL_MIN_WIDTH,
+  PREVIEW_PORT_SEGMENT,
+} from './previewpool.js';
+
 export const PROJECT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 export const FDE_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -36,7 +46,7 @@ export function validateFdeName(fdeName) {
 
 /**
  * hostname grammar（P5 去项目化，directory-as-project §3；#57 阶段2 伞域修订）：
- *   <fde>-p-<port4>.<baseDomain>
+ *   <fde>-p-<portLabel>.<baseDomain>   // portLabel = 端口十进制，不足 4 位零填充（号池端口 5 位则原样）
  * URL 去项目名段——顺带消灭「目录名 → 域名段」的合法化清洗；存量行由迁移 0008 重写。
  * `baseDomain` 语义 = **伞域**（#57：BASE_DOMAIN 从「可注册域」改为伞域 `fde.<可注册域>`，
  * 如 `fde.erix.vip`）⇒ 预览完整域 `eric-p-8001.fde.erix.vip`。语法里原先写死的 `.fde.` 段随之删除
@@ -44,20 +54,27 @@ export function validateFdeName(fdeName) {
  * 在新语义下自动正确，不受本函数影响。
  */
 export function buildHostname({ fdeName, port, baseDomain }) {
-  const port4 = String(port).padStart(4, '0');
-  return `${fdeName}-p-${port4}.${baseDomain}`;
+  // 端口段宽度：不足 PREVIEW_PORT_LABEL_MIN_WIDTH（4）时零填充，**超过就原样拼**（#246：号池端口是
+  // 5 位，`padStart` 不截断 ⇒ 首标签从 7 字符固定段变 8；预算同步从 56 收到 55，见下方预算段）。
+  const portLabel = String(port).padStart(PREVIEW_PORT_LABEL_MIN_WIDTH, '0');
+  return `${fdeName}${PREVIEW_PORT_SEGMENT}${portLabel}.${baseDomain}`;
 }
 
 // —— #202 预览域名预算（开户时前置校验，与路由生成期 routes.js isValidHostname 同口径）——
-// buildHostname 的首标签 = <fde> + "-p-" + 4 位端口（port4 恒 4 位）→ 固定段占 7 字符；
-// DNS 单标签上限 63（RFC 1035）⇒ **FDE 名参与预览域名的有效预算 56**（63 − 7）。
+// buildHostname 的首标签 = <fde> + 固定段 `-p-<port>` ⇒ 首标签长度只取决于「FDE 名长度 + 固定段宽度」。
+// DNS 单标签上限 63（RFC 1035）⇒ **FDE 名参与预览域名的有效预算 = 63 − 固定段宽度**：
+//   · #240 时代端口恒 4 位 ⇒ 固定段 7 字符 ⇒ 预算 **56**；
+//   · #246 起端口进全局号池 22000–29999（5 位）⇒ 固定段 **8** 字符 ⇒ 预算 **55**。
+// 两个数都从 `previewpool.js` 的池边界**推导**（`MAX_FDE_NAME_LEN_FOR_HOSTNAME`），不写死端口、
+// 也不写死预算：写死 `4000` 就是「56 字符的名字过了应用校验、到 INSERT 才被 0017 的 hostname CHECK
+// 以 23514 炸掉」的直接原因（#202 要消灭的正是这种「预览打不开」）。
 // 57..63 字符的名字能过 FDE_NAME_RE，却要等到路由生成阶段（routes.js）才被拒 →
 // 用户只看到「预览打不开」，看不出是名字太长（#202 实况）。FDE 开户路径必须先挡（admin.js createUser）。
 // 为什么不动 FDE_NAME_RE（≤63）本身：validateFdeName 还被目录名/容器名（fde-<name>）/
 // git-credential/offboarding 等路径复用（dirs.js、provisioner.js、git-credential.js、offboarding.js），
 // 那些消费方不受 DNS 标签约束，57..63 字符仍合法；故**另加**「参与预览域名」口径的校验（本节），
 // 由开户路径显式调用，而不是收窄那个正则的语义。
-export const MAX_FDE_NAME_LEN_FOR_HOSTNAME = 56;
+export { MAX_FDE_NAME_LEN_FOR_HOSTNAME } from './previewpool.js';
 
 // 与 routes.js DNS_LABEL_RE 同构（单标签 ≤63 = 1+61+1，小写字母数字、不以 - 开头/结尾）。
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -80,16 +97,17 @@ export function validateHostnameGrammar(hostname) {
 
 /**
  * 开户（及任何要落 hostname 的路径）的 FDE 名校验：先按 buildHostname 语法拼出**最终 hostname**
- * 再整体校验（逐标签 ≤63 + 总长 ≤253），不是只验各段。port4 恒 4 位 → 首标签长度只取决于 FDE 名
- * （len + 7），与端口取值无关；baseDomain 缺省时退化为只校验首标签（预算与 base 域无关）。
- * 失败回可操作的 400 文案（含超限行长度与 FDE 名预算 56）。
+ * 再整体校验（逐标签 ≤63 + 总长 ≤253），不是只验各段。探测端口固定取**池内最宽**的端口（#246 前是写死
+ * 的 4000）⇒ 首标签长度只取决于 FDE 名（len + 固定段宽），与端口取值无关；baseDomain 缺省时退化为只校验首标签（预算与 base 域无关）。
+ * 失败回可操作的 400 文案（含超限行长度与 FDE 名预算，预算值取自 previewpool 的推导常量）。
  */
-export function validateFdeNameForHostname(fdeName, { baseDomain = null } = {}) {
+export function validateFdeNameForHostname(fdeName, { baseDomain = null, probePort = PREVIEW_PORT_BUDGET_PROBE_PORT } = {}) {
   if (!validateFdeName(fdeName).ok) {
     return { ok: false, message: 'fde_name 非法（小写字母/数字/连字符，不以连字符开头或结尾）' };
   }
-  const firstLabel = `${fdeName}-p-4000`;
-  const hostname = baseDomain ? buildHostname({ fdeName, port: 4000, baseDomain }) : firstLabel;
+  // 探测端口取**池内最宽**的那个（#246）：拼出的首标签就是最坏情况，预算因此不可能被端口位数放宽。
+  const firstLabel = `${fdeName}${PREVIEW_PORT_SEGMENT}${String(probePort).padStart(PREVIEW_PORT_LABEL_MIN_WIDTH, '0')}`;
+  const hostname = baseDomain ? buildHostname({ fdeName, port: probePort, baseDomain }) : firstLabel;
   if (hostname.length > 253) {
     return { ok: false, message: `预览域名过长：生成的预览域名总长 ${hostname.length} 字符，超过整域名上限 253` };
   }

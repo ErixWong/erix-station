@@ -283,6 +283,26 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 ### 8.12 开户预分配 10 条 FDE 级预览域名（issue #240，2026-10-11）
 
+> ⚠ **更正（issue #246 交付①，2026-10-11；原记录不删，只标失效项）**：本节的**分配粒度 = FDE 级**、
+> 一次一段、`scope='fde'` / `role='spare'` / `state='allocated'` / `exposure='private'`、告知两处、
+> 「派生同事务 + 靠部分唯一索引幂等」全部仍然成立；**以下四项已被 #246 取代**：
+> ① **端口不再固定 `4000–4009`**——全局只有一个号池 `22000–29999`（800 段），开户默认发「池内最小的未占用
+> 对齐块」（第 1 个 FDE `22000–22009`、下一个 `22010–22019`…，块大小 10），管理员可覆盖块起点/单端口；
+> 常量单一来源 `portal/src/previewpool.js`（新叶模块，避免 portalloc↔projects 的 ESM 循环依赖）。
+> ② **「该索引不能改成全表 UNIQUE」这句只对 `(fde_id,port)` 成立**：#240 那句「`port` 唯一性只按 FDE 判 ⇒
+> **允许不同 FDE 同端口**」正是 bug 本体（真机 eric 与 tetris 同时持有 4000–4009 ⇒ 10 组重叠域名）。
+> 迁移 **0019** 新增 `port_allocations_live_global_port_key UNIQUE (port) WHERE state <> 'released'`：
+> 重叠在 **DB 层**不可能；`released` 行不占位 ⇒ **号码可回收复用**（这条是 #246 的硬判据）。
+> ③ **「存量不迁移」已作废**：0019 把活行按 `fde_name` 定序重排进号池（`hostname`/`url` 同事务重写，base 域从
+> 旧 hostname 反推、不硬编码伞域），装不进一段的溢出活行（真机只 `tetris` 的 4100）置 `released`；`released`
+> 历史行（真机 `portsprobe` 的 4000–4009）保留旧号码。已接受代价：**eric/tetris 现有预览 URL 全改写**。
+> ④ **预览域名预算 56 → 55**：端口段从 4 位变 5 位（首标签固定段 `-p-`+端口位数 = 8），预算必须从**池宽度**
+> 推导而不是写死端口（写死 `4000` 会让 56 字符名过应用校验、再到 INSERT 被 0017 的 CHECK 炸成裸 23514）。
+> 告知文案（`worker.js` SYSTEM_PROMPT、materializer 的 `AGENTS.md` 行）不再写端口数字，改说「**段由平台从
+> 号池分配，`ports.json` 是唯一真相**」；防漂移测试随之改成「两处都不允许出现端口数字」。
+> 当前全量口径见 fde-platform §8.2 与迁移 `0019-preview-port-pool.sql`；本节里的 `40XX` 域名样例、
+> 「预算（56）」、「存量不迁移」均按上述更正读。
+
 背景：`port_allocations` **从来没被产品代码写入过**（全仓 `INSERT` 0 命中），手工插行后 `routes.yml` 与容器内 `ports.json` 也一律不动，必须人工调
 `enqueueFullRebuild` + `runMaterializerOnce`。本轮按决策者裁决实现「开户即预分配」并消灭那个人工动作。
 
