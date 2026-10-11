@@ -815,8 +815,11 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 > ⚠ **实现状态（#242 端点全量自检，2026-10-11 实测）**：**用户面审批 API 未实现**。
 > 存在的是 **internal 面**（`POST /api/internal/runs/:id/approvals` 创建、`GET /api/internal/approvals/:id` 轮询，见 §9）；
 > `GET /api/approvals` 与 `POST /api/approvals/:id` 在 `http.js` 用户面分派里**无分支**，真机均返回 `404 not_found`，
-> 且工作台 SPA（`portal/frontend/src`）零 `approv` 引用 ⇒ 待审批项当前**没有 FDE 可点的入口**（只能由 judge 自动定）。
-> 本节的 Approval 对象与「迟到决定 `409 approval_expired`」契约因此**仅在 internal 语义层成立**；是否补用户面 + 审批 UI 由 #249 拍定。
+> 且工作台 SPA（`portal/frontend/src`）零 `approv` 引用 ⇒ **当前根本不会产生「待审批项」**：引擎 `erix-agent 0.18.0`
+> 全文无审批钩子（`grep -rni approval src/` → 0 命中），工具循环不会问宿主；runner 侧只有**接收侧**（`pendingApproval` + `APPROVAL_DECISION`），
+> **无发送方**，`agentd.js:871` 的 `APPROVAL_REQUEST` 分支直接回 `denied` 并注明「P1 留空」（`agentd.js:14`）。
+> 工具审批在 `docs/design/fde-platform.md` 路线表里明列为 **P2**。本节的 Approval 对象与「迟到决定 `409 approval_expired`」
+> 契约因此**仅在 internal 语义层成立**；要做到用户可用，缺的第一块是**上游引擎的「暂停等宿主裁决」钩子**，不是页面按钮（#249）。
 
 judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls`）。
 
