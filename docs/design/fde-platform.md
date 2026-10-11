@@ -376,7 +376,7 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 **为什么还要 JSON**：agent 读端口无需发 API（少一个失败点，可离线）；可 grep、可调试；符合「这台小电脑」的心智模型。
 
-**同步规则**：平台 → 容器**单向**。#240 起**没有「申请新端口」这条路**：开户时已预建一整段（§8.2：全局号池里的一个对齐块），#246 起**哪几个号是运行时决定的** ⇒ 容器内一律从 `~/.erix/ports.json` 取（**它就是唯一真相**）、绝不自己挑、也不要凭记忆假定是某几个固定端口。
+**同步规则**：平台 → 容器**单向**。#240 起**没有「申请新端口」这条路**：开户时已预建一整段（§8.2：全局号池里的一个对齐块），#246 起**哪几个号是运行时决定的** ⇒ 容器内一律从 `~/.erix/ports.json` 取（**它就是唯一真相**）、绝不自己挑、也不要凭记忆假定是某几个固定端口。#246 交付② 也**没有**打开 FDE 自服务写入口：改块仍是**管理员端点**（§8.2 表「管理员改块」行 / portal.md §4.7a），FDE 侧只能经 §4.7a 的列端点**读**。
 
 **告知的两处落点（容器侧不做端口管控，只告知）**：① `~/.erix/ports.json`（本图的派生终点，一整段 allocation + 每条真实 `url`）；② `runner/worker.js` 的 `SYSTEM_PROMPT`（复述「端口段由平台分配 / **清单是唯一真相** / 必须从清单里选且绑 `0.0.0.0` / 不要自造域名或端口 / 不要要求平台再加」）。两处都由同一份 DB 事实派生。防漂移测试：`portal/test/materializer.test.js`、`runner/test/system-prompt.test.js`——#246 后这两处**都不允许出现端口数字**（旧写法「复述 4000–4009」本质是拄一份第二清单，换号池时必然漂）；需要时从 `portal/src/previewpool.js` 的常量推导，不在测试里重打一遍。
 
@@ -406,6 +406,9 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 | 角色 | `role='spare'`（复用既有枚举，不新造） | schema.sql §4 |
 | 可见性 | `exposure='private'`（对外分享走 §2.8 预览 ticket） | §6.5 |
 | 状态 | `state='allocated'`；首次 forward-auth 放行才幂等升 `active` | §8.6 |
+| 管理员改块 | **= 搬迁**（#246 交付②）：`POST /api/admin/fdes/:fdeName/ports/block` 在**单个事务**里释放旧块 + 撤 grant + 插新块 + 入队两条派生链；**不是追加**（`ensureFdePreviewPorts` 是 insert-only，只复用它就会留 20 条活行）；目标块被外来活行占住 ⇒ `409 preview_port_block_taken`，**不偷偷换块** | `portalloc.js:moveFdePreviewBlock`、portal.md §4.7a |
+| 列端口的读取面 | `GET /api/me/ports`（本人）与 `GET /api/admin/fdes/:fdeName/ports`（admin，**读他人必写审计**）；只列活行、`port ASC`、DTO 必含 `id`——否则签票端点 `POST /api/ports/:id/preview-ticket` 无法被人用 | portal.md §4.7a |
+| 抢号重试 | 未显式指定块起点 ⇒ 遇 `preview_port_block_taken` 开**新事务重算**，**总尝试 3 次**（`PREVIEW_BLOCK_MAX_ATTEMPTS`）；显式指定 ⇒ 不重算。⚠ 重试**只覆盖端口分配这一小段**（开户里它在网络/容器之后、LLM 联动之前 ⇒ 已建网络/容器不回滚） | `portalloc.js:provisionFdePreviewPorts`、`provisioner.js` 开户步骤序列 |
 | 容器固定角色 | `3001` **已取消**（code-server 清退，容器唯一交互入口为 FDE 对话界面，issue #71，决策者 2026-09-24；原 `3000` runner 内部 API 同样已取消：容器平台通道零监听、全出站，§10.3，issue #3 评论） | 原 §8.2 保留项 |
 
 - **容器侧不做端口管控**（决策者裁决 2）：平台只保证**分给本 FDE 的那一段**预览域名**有路由**；FDE 容器实际
@@ -423,6 +426,17 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
   `hostname`/`url` 同事务重写（base 域从旧 hostname 反推，不硬编码伞域）；装不进一个块的溢出活行（真机只有
   `tetris` 的 **4100**）置 `released`；`released` 历史行（真机 `portsprobe` 的 4000–4009）**保留旧号码不重写**。
   已接受的代价：eric / tetris 现有预览 URL 全部改写，**容器内应用要改监听端口**，旧链接失效。
+- **管理员改块是搬迁事务，不是再发一块**（#246 交付②，本节最容易做错的一句）：`ensureFdePreviewPorts`
+  全文件零 `UPDATE port_allocations`（**insert-only**），所以「改块」若直接复用它补一段，旧 10 条行仍活、
+  继续占号、旧域名仍可访问（真机就会是 20 条活行）。因此 `moveFdePreviewBlock` 在**同一事务**里先按
+  offboarding 的先例释放旧行（`state='released'` + `released_at=COALESCE(…, now())`）并撤销其
+  `preview_grants`（`state='revoked'` + `revoked_at=COALESCE(…, now())`，只动 `active/used`），再插新块；
+  固定顺序与“任一步失败 ⇒ 整笔回滚零残留”由 `portal/test/preview-ports.test.js` 逐序钉住（契约见 portal.md §4.7a）。
+  `released` 行不占位 ⇒ **号码可回收**（搬出去再搬回同一块必须能成功）。
+- **抢号重算不等于整笔开户回滚**（#246 交付② 补交付① 的边界）：重试只覆盖「端口分配」这一小段——开户顺序是
+  「网络与容器已落地之后、LLM 联动之前」调端口分配（`provisioner.js` 已核实）⇒ 冲突时**已建的网络/容器不回滚**，
+  LLM binding 尚未执行。`withFdeLock` 的锁键是 `fde:${fdeName}`，**串行化不了不同 FDE 抢同一个空闲块**，
+  所以「索引 + 新事务重算」才是正解（别指望加锁）；重算上限 3 次，用尽后把兑底动作指给管理员改块端点。
 - 定期 reaper 回收 `released_at` 过期项；Traefik 配置由 reconciler 按 route outbox 幂等发布（§8.1，H-B）
 
 ### 8.3 `ports.json` 结构
