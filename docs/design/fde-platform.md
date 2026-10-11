@@ -290,8 +290,14 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 | 级别 | 含义 |
 |---|---|
 | `private`（默认） | 仅 owner 可访问（owner 预览凭证，或显式 admin 例外——判定主体为预览凭证非 session，见 portal.md §2.7 第 5 步） |
-| `org-visible` | 认证同事可见（需要时再开） |
-| `public` | token 链接 / 真公开（**默认不给**） |
+| `org-visible` | 认证同事可见（需要时再开）——**未启用**：写侧无入口（见下方口径注） |
+| `public` | token 链接 / 真公开（**默认不给**）——**未启用**：同上 |
+
+> ⚠ **交付口径（#250 裁决，2026-10-11）**：本表的三档是**词汇表的完整集**，被交付的只有 `private`。
+> 全仓唯一写点 = 开户时写死 `private`（`portal/src/portalloc.js:101`），**无 UPDATE**（真机 20 条活 allocation 全 `private`）。
+> 理由（决策者）：**预览不对外分享**——测试环境一旦被长期开放，就会被当成生产环境；人对人临时分享走 §2.8 一次性 ticket。
+> 另：访问控制挡得住「访问」，**挡不住「误认」**——外来者唯一看得见的标记是域名（现 `*.fde.erix.vip:8090` 看起来像真站）；
+> 若要对外标示测试性质（候选：`*.lab.erix.vip` 一类伞域），那是**对外品牌决策**，需同时改 Traefik host 与 cookie domain，**未决**。
 
 ---
 

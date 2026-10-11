@@ -59,7 +59,7 @@
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
 | 端口 | `GET /api/projects/:id/ports` | **已退役 `410`**：端口事实的读取面是 FDE 级 `~/.erix/ports.json`（§4.7 / 规格 §8.2） |
-| 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **无路由，实测 `404`**（文档与实现的差异见 #250） |
+| 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
@@ -328,6 +328,12 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | `401` | ticket 无效 / 过期 / 格式非法（`preview_ticket_invalid`/`preview_ticket_expired`）· 预览 cookie 无效 / 过期（`preview_session_invalid`/`preview_session_expired`）——触发登录跳转 |
 | `403` | 无凭证（`preview_ticket_required`）· 已认证但无权（exposure 越权，`forbidden`）/ 端口已释放（`allocation_released`）/ ticket 真·重放（已消费且无活跃派生 session，`preview_ticket_used`）· 已撤销（`preview_ticket_revoked`）· 不匹配（`preview_ticket_mismatch`）/ 用户已禁用 |
 | `404` | hostname 无对应 allocation |
+
+> ⚠ **交付口径（#250 裁决，2026-10-11）**：上面第 5 步的三档里**只有 `private` 被交付**，而且**根本没有任何入口能把一条 allocation 改成别的档位**
+> （全仓唯一写点 = 开户时写死 `private`，`portalloc.js:101`；真机 20 条活 allocation 全 `private`）。
+> `org-visible` / `public` 的判定逻辑（包括 `public` 免票短路）**保留但休眠**——决策口径：**预览不对外分享**，
+> 测试环境不应变成长期可访问的「类生产」入口（会被当成生产环境）；人对人临时分享一律走 §2.8 一次性 ticket。
+> 要启用长期开放，必须先推翻 `principles.md` §3 里那一行否决理由。
 
 **CORS 预检免凭证（#241）**：`OPTIONS` **且**带非空 `Access-Control-Request-Method`（Fetch 规范定义的预检，按规范**不携带任何凭据**）→ 跳过第 3/4/5 步的凭证与 exposure 判定，直接当放行处理（`200` + `X-Auth-User`，审计 `details.grant_kind='preflight'`）； Traefik 于是把预检转发给上游 dev server，由应用自己回 `Access-Control-Allow-*`（平台不代答、也不在边缘叠加 CORS 中间件——上游已自带 `Access-Control-Allow-Origin`，再叠一层会变成浏览器拒收的「multiple values」）。边界（fail-closed 不扩大）：第 1/2 步照旧（未知 host 仍 `404`、已释放仍 `403 allocation_released`）；不带 `Access-Control-Request-Method` 的裸 `OPTIONS` 仍 `403 preview_ticket_required`；预检无主体，故**不**触发 `allocated→active` 升级（升级语义仍是「首次凭证放行」，紧随其后的真身请求照常触发）。
 
@@ -765,7 +771,11 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 > ⚠ **实现状态（#242 端点全量自检，2026-10-11 实测）**：本节只描述 `GET /api/projects/:id/ports`（已退役 `410`，留档只读）与 `POST /api/ports/:id/preview-ticket`（活端点）。
 > 而 **`PATCH /api/ports/:id` 没有实现**：`http.js` 用户面分派（401–583）无该分支，只有 `preview-ticket` 一条子路径正则；真机 `PATCH /api/ports/<真实 id>` → `404 not_found`。
-> 下方的 `200 / 403 / 400 / 404` 契约属**未交付的写入口**（读侧 `exposure` 免票判定在 `preview.js` 已实现，只差写）——去留待 #250 拍定，**不要当可用能力调用**。
+> 下方的 `200 / 403 / 400 / 404` 契约属**未交付的写入口**（读侧 `exposure` 免票判定在 `preview.js` 已实现）——**已裁决不交付**（#250）。
+> 理由：预览不对外分享（测试环境会被当成生产），而 `public` 的语义就是「拿链接就能打开」——补这个写入口等于主动开门。
+> 真要把契约补上，口径是：**UPDATE + 一行审计 + materialize revision，同事务，不碰 route outbox**
+> （实测：`routes.js` 零 `exposure` 分支，每条 router 一律挂 forwardAuth，可见性由 portal 每请求动态判——**不需要重建路由**；
+> 要 materialize 只因 `materializer.js:109` 会把 `exposure` 带进容器内 `ports.json`，否则 FDE 自己看到的可见级别是过期的）。
 
 #### `GET /api/projects/:id/ports`
 
