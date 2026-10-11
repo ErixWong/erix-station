@@ -341,6 +341,22 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - [x] **已接受代价的修复也是真机跑的**：迁移后 Tetris 预览 `502 Bad Gateway`（鉴权已过、`state` 升 `active`，纯粹是应用还听旧端口）——由**平台自己的 agent** 在会话 `b35109c0…` / run `87a31661…`（`judge_done`，↑1.23M/↓12.8k）改绑到 `22010/22011` 并推送，主 agent 复跑应用测试 **22/22**，端到端 `22010` 首页 `200`、`/config.js` 指向新后端、`22011/api/healthz` `200 {"ok":true}`、`/api/leaderboard` `200` 真实数据。
 - [ ] **已知边界（本单未补，交付②一并做）**：`onboardFde` 对 `preview_port_block_taken` **没有重试循环**——错误文案说「由调用方重试」，但开户路径遇错即整笔回滚，需重跑 `cli.js provision-fde`。只在「两个 FDE 同时开户抢同一块」时才触发（当前开户是 CLI/管理台串行），所以不是现实故障，但**不许拿它当已完成**。
 - [ ] **仍未做**：面板 / 列端口 API / 一键签票（#246 交付②）、FDE 级 grant（#247）。
+  ⇒ **列端口 API 已由单 A 交付**（2026-10-11，见 §8.14）；面板与一键签票仍是单 B。
+
+### 8.14 预览端口列端点 + 管理员改块（#246 交付② 单 A）与撤 grant 修正（#252）（PR #251 / #253，2026-10-11）
+
+背录：#246 拆两单——**单 A = 后端契约（本节）**，**单 B = 纯 UI（未做）**。`GET /api/ports` 随 P5 退役后根本没有任何列端口的 API，而签票端点吃的是人看不见的 allocation UUID ⇒ #240/#241 的浏览器验收全靠主 agent 手工 curl。
+
+- [x] **三个端点**（实现全在 `portalloc.js`，`http.js` 只做分派/校验/错误映射/审计）：`GET /api/me/ports`（本人，admin 无 FDE ⇒ 空列表不是 404）、`GET /api/admin/fdes/:fdeName/ports`（**显式写恰好一行审计** `admin.fde_ports_listed`，因为现有 admin GET 并未一致落实）、`POST /api/admin/fdes/:fdeName/ports/block`。DTO 固定 8 列且**必含 `id`**（否则面板拿不到签票入参，本单就白做）。
+- [x] ⚠ **改块 = 搬迁事务，不是追加**（copilot 评审拓出的错判，主 agent 复核确认：`grep -c 'UPDATE port_allocations' portal/src/portalloc.js` 当时 = **0**）：`ensureFdePreviewPorts` 是 insert-only，直接复用会让旧 10 行继续活且占号（真机就是 20 条活行）。口径：同一事务 `BEGIN → 取本 FDE 活行 → 取全局活行 →（幂等/冲突判定，零写）→ UPDATE 旧行 released → UPDATE preview_grants revoked → 10× INSERT（带谓词 ON CONFLICT）→ route 入队 → materialize 入队 → COMMIT`，任一步失败整笔回滚。真机反证：#252 那次 500 之后旧块一字未动。
+- [x] **管理员显式指定的块被占 ⇒ 409 报错，禁止偷偷换块**（偷偷换段会让他以为分到了自己挑的那一段）；只有开户路径的自动选块才重算：`PREVIEW_BLOCK_MAX_ATTEMPTS = 3`（**含首试**，每次**新事务**重取占用）。注释与文档均写明 ⚠ **重试只覆盖端口分配这一段**（网络/容器已落地且不回滚；`withFdeLock` 锁键是 `fde:${fdeName}`，串行化不了不同 FDE 抢同一空闲块 ⇒ 0019 的全局唯一索引 + 新事务重算才是正解）。
+- [x] **零新错误码**（全部复用 `preview_port_block_taken` / `preview_hostname_invalid` / `validation_failed` / `not_found`）；新文档面：`portal.md` **§4.7a**（DTO 理由、五段校验表、事务顺序、审计口径）+ §1.2 `preview_hostname_invalid` 首次入表；改块端点的 409 标 `retryable=false`（同码在开户路径是 retryable，差别就在「管理员指定」）。
+- [x] **#252 是真机拓出来的更老缺陷（不是单 A 引入的）**：`preview_grants` 的 CHECK 是**双向**的 `((state='used') = (used_at IS NOT NULL))`（= `preview_grants_check3`），而先例谓词 `state IN ('active','used')` 会去改已消费的 ticket ⇒ **真机 45 条 `ticket|used` 一改就 23514**。`offboarding.js` 里同一谓词且撤权挂在「本次释放了行」的守卫上 ⇒ 撞 CHECK 的那笔回滚后，重试时本 FDE 已无活行 ⇒ **撤权整段静默跳过**（真机 21 条残渣而步骤记 `done`、`last_error` 空）。修正：三处（offboarding / `moveFdePreviewBlock` / **`admin.js` 停用用户**，后者原写 `used_at = NULL` 绕过 CHECK = **篡改历史**）统一只撤 `state='active'`；offboarding 改成按「本 FDE **全部** allocation ids」**无条件幂等撤**，两个计数分开打日志（`released=0 而 revoked>0` 就是补撤的形状）；数据修补走迁移 **`0020`**（零 DDL、可重放，`used`/`expired`/`revoked` 一律不动）。
+- [x] ⚠ **本轮最值钱的教训：fake 必须模拟真库约束，并用变异测试验收**。#252 在单测里**结构上不可能被发现**（fake 只模拟了 `revoked ⇔ revoked_at`）。新增 `portal/test/preview-grant-checks.js`（baseline 五条 CHECK **同名同序** + **语句级原子**，两个 fake 共用，谓词从 SQL 里解析），主 agent 的**变异测试**：把谓词改回 `IN ('active','used')` ⇒ `preview-ports` 3 红 + `offboarding` 2 红并报真库原文 `23514`。⇒ **往后的约定：声称「fake 拦得住」必须附变异测试结果**（改回旧写法必须红）。
+- [x] **新测试基线：根 `npm test` = 920 项 / 919 通过 / 0 失败 / 1 跳过**（2026-10-11；链路 889 → 910（单 A，+21）→ 920（#252，+9 用例 **+1 个无用例的 helper 文件**）。⚠ **`**/test/**/*.js` 会把 `test/` 目录里的任何 `.js` 算成 1 项**（含 helper，仓库既有 `fake-pool.js` 同理），所以新建共用 helper 会让总数 +1；`docs/ops/ci-release.md` §1 已写明。逐文件：`preview-ports` 24、`offboarding` 13、`migrations` 17、`portalloc` 20、runner 200。
+- [x] **真机验收全绿**（主 agent 亲手，详见 #246 / #252 记录）：列端点/权限/审计恰一行/UUID 签票 302 全过；改块 `22000→22030`（released 10 / inserted 10 / revoked 21，`routes.yml` 自动换段、`ports.json` `generation` 3→4、旧域名 404）→ 幂等 `{changed:false}` 零审计 → 409 零残留 + 文案点名被占端口 → 400（非对齐/池外/非整数）→ **搬回 22000 证明号码回收**；`0020` 启动自动应用 ⇒ 残渣 `active@released` **11 → 0**，`used` 45 条 `used_at` **一字未动**，活 allocation 上 44 条 active 无误伤；人造残渣 + 步骤置 `failed` 后 retry ⇒ 日志「本次释放 allocation 0 条、撤预览 grant（仅 active）1 条」。
+- [ ] **单 B（纯 UI）待做**：工作台列自己的段/域名/状态 + 每行「打开预览」（拿 `id` 调既有签票）；管理台列任意 FDE + 改块入口。⚠ **UI 必须在改块前给一次确认**——改块会让 FDE 手里的旧预览链接立即 404（已记在 #246）。UI 侧不需要新增后端。
+- [ ] 未做（划界）：**#247**（FDE 级授予；因 `preview_grants.token_hash UNIQUE` + `allocation_id NOT NULL` 而定性为 **DDL 级**，已延期）、**#250**（改 exposure，已裁决不交付）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
