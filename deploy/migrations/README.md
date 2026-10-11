@@ -44,11 +44,23 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0018-port-allocations-scope-fde.sql`（#240 开户预分配 10 条 FDE 级预览域名：`port_allocations.scope`
+  `0019-preview-port-pool.sql`（**#246 交付①：预览端口全局号池 `22000–29999` 与块分配**——四条语句的
+  **顺序不可换**：⓪ 按名 `DROP CONSTRAINT IF EXISTS port_allocations_port_check` → ① 重排存量**活行**
+  进号池（按 `fde_name` 定序，一人一个 10 个的对齐块；`hostname`/`url` 的端口段**同事务**重写，base 域从旧
+  hostname 反推、**不硬编码伞域**；装不下的溢出活行置 `released`；`released` 行一律不动⇒ 历史号码保留）
+  → ①′ 守卫 DO 块（池外活行 / hostname 与端口不同步 ⇒ 带表名与例外的 RAISE，换掉裸 23514）
+  → ② `port` CHECK 换为**按状态分支**（活行 `BETWEEN 22000 AND 29999`；`released` 行 `BETWEEN 4000 AND 29999`
+  保留历史号码），建成 **VALID**（正解就是「活行全在池内」，要真校存量）→ ③ 新建全局部分唯一索引
+  **`port_allocations_live_global_port_key UNIQUE (port) WHERE state <> 'released'`**（跨 FDE 不重叠由 DB
+  保证；`released` 不占位 ⇒ 号码可复用；普通 `CREATE UNIQUE INDEX`，**`CONCURRENTLY` 在显式事务里不可用**）。
+  旧 CHECK 的 4000–4999 与新池**不相交** ⇒ 不先摘它，① 自己的 UPDATE 就当场 23514（这就是必须多一步 ⓪ 的原因）。
+  ⚠ PG 的 `lpad(text,n)` 会**截断**超过 n 的串（实测 `lpad('22010',4,'0')='2201'`）⇒ 重写端口段不得用 lpad。
+  `docs/data/schema.sql` 冻结 baseline **一个字节未改**（§8.7/§8.8）；静态断言见 `portal/test/migrations.test.js`。
+  前一道 `0018-port-allocations-scope-fde.sql`（#240 开户预分配 10 条 FDE 级预览域名：`port_allocations.scope`
   的 CHECK 由 `('project','run')` 放开为 `('project','run','fde')`，按名 DROP→ADD 可重放；**只改这一条
   CHECK**——`CHECK ((scope='run') = (run_id IS NOT NULL))` 原样保留（`scope='fde'` 的行 `run_id` 恒 NULL），
   且**不新建索引**（幂等靠 baseline 既有的部分唯一索引 `port_allocations_live_port_key (fde_id, port)
-  WHERE state <> 'released'`，写侧 `ON CONFLICT` 必须带上该谓词才能推断冲突目标）；前一道
+  WHERE state <> 'released'`，写侧 `ON CONFLICT` 必须带上该谓词才能推断冲突目标；#246 后它与新的全局索引**并存**）；前一道
   `0017-port-allocations-hostname-check.sql` 为 #202 预览域名 hostname 的 DB 兜底 CHECK（整域名正则
   逐标签 ≤63 + 总长 ≤253，NOT VALID，存量收敛动作见迁移头注释）；再前一道 `0016-transcript-append-seq.sql`
   为 transcript 同 round 保序：新增 `append_seq` + 存量按 `created_at, id` 确定性回填 + 部分索引）。

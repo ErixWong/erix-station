@@ -90,7 +90,7 @@ jobs:
           echo "id    = $(id)"
           echo "uname = $(uname -a)"
 
-      # ---- ② 根单测：node --test（877 项基线，含 runner/test，见 ci-release.md §1）----
+      # ---- ② 根单测：node --test（889 项基线，含 runner/test，见 ci-release.md §1）----
       - name: '② 根 npm ci + npm test'
         run: |
           npm ci --no-audit --no-fund

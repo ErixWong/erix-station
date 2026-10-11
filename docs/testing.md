@@ -204,13 +204,14 @@ INSERT INTO projects (id, user_id, name, repo_url, root_path, slot) VALUES
 INSERT INTO fde_networks (fde_id, network_name, subnet, prefix_len, gateway, pool, state) VALUES
   ('00000000-0000-0000-0000-0000000000a1', 'fde-testfake-a', '10.200.9.0/29',  29, '10.200.9.1',  'default', 'allocated'),
   ('00000000-0000-0000-0000-0000000000a2', 'fde-testfake-b', '10.200.10.0/29', 29, '10.200.10.1', 'default', 'allocated');
+-- ⚠ 迁移 0019（#246）之后：**未释放**的 port_allocations 行端口必须落在全局号池 22000–29999 内，且**跨 FDE 不得重复**（`port_allocations_live_global_port_key`），否则当场 23514/23505；只有 `state='released'` 的行才允许保留 4000 段历史号码。
 INSERT INTO port_allocations (id, fde_id, scope, project_id, run_id, port, role, hostname, url, exposure, state) VALUES
   ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a1',
    'project', '00000000-0000-0000-0000-0000000000c1', NULL,
-   4000, 'frontend', 'alice-p-4000.fde.test', 'https://alice-p-4000.fde.test', 'private', 'allocated'),
+   22000, 'frontend', 'alice-p-22000.fde.test', 'https://alice-p-22000.fde.test', 'private', 'allocated'),
   ('00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000a2',
    'project', '00000000-0000-0000-0000-0000000000c2', NULL,
-   4000, 'frontend', 'bob-p-4000.fde.test',   'https://bob-p-4000.fde.test',   'private', 'allocated');
+   22010, 'frontend', 'bob-p-22010.fde.test',   'https://bob-p-22010.fde.test',   'private', 'allocated');
 SQL
 ```
 

@@ -313,7 +313,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 
 1. 建 user 记录（角色来自 claim）
 2. **分配子网（IPAM）→ 建 `fde-<name>` 网络 → 起容器**（H-B 定稿 D-1/D-10，issue #5）：portal 查 `fde_networks` 推荐下一块空闲 `/29`（管理员可改），`docker network create --subnet` 显式创建；容器**只接自己这条网络**（不再有 `control` 接入），bind mount 用户空间
-3. **预分配 10 条预览域名 + 同事务触发派生链**（issue #240，替代原「分配端口块」；决策者 2026-10-11 裁决）：`portal/src/portalloc.js` 的 `ensureFdePreviewPorts` 在**一个 DB 事务**里写 `port_allocations` **10 行**（`scope='fde'`、端口 `4000–4009`、`role='spare'`、`exposure='private'`、`state='allocated'`，口径见 §8.2），并在**同一事务**内入队 route outbox/revision + materialize revision ⇒ reconciler **幂等发布** Traefik 路由、materializer 重写 `~/.erix/ports.json`，两条派生链都不需要人工触发（PG 事务无法含文件写入，故仍是「事务写 desired state + outbox」、由 reconciler 异步落盘，§8.1；历史上 `port_allocations` 从没被产品代码写过，手工插完之后路由与 `ports.json` 一律不动——这正是 #240 要消灭的动作）。幂等判据 = 既有部分唯一索引 `port_allocations_live_port_key (fde_id, port) WHERE state <> 'released'` + `ON CONFLICT DO NOTHING` ⇒ 重跑 `cli.js provision-fde` 只补缺口、已齐备则零插入零入队
+3. **预分配一整段预览域名 + 同事务触发派生链**（issue #240 引入、issue #246 交付①把端口来源换成全局号池；决策者 2026-10-11 裁决）：`portal/src/portalloc.js` 的 `ensureFdePreviewPorts` 在**一个 DB 事务**里写 `port_allocations` **一整块 10 行**（`scope='fde'`、端口 = **全局号池 `22000–29999` 里最小的未占用对齐块**（#246；旧实现写死 `4000–4009`）、`role='spare'`、`exposure='private'`、`state='allocated'`，口径见 §8.2），并在**同一事务**内入队 route outbox/revision + materialize revision ⇒ reconciler **幂等发布** Traefik 路由、materializer 重写 `~/.erix/ports.json`，两条派生链都不需要人工触发（PG 事务无法含文件写入，故仍是「事务写 desired state + outbox」、由 reconciler 异步落盘，§8.1；历史上 `port_allocations` 从没被产品代码写过，手工插完之后路由与 `ports.json` 一律不动——这正是 #240 要消灭的动作）。幂等判据 = 既有部分唯一索引 `port_allocations_live_port_key (fde_id, port) WHERE state <> 'released'` + `ON CONFLICT DO NOTHING`（**与 #246 的全局索引并存**：同 FDE 重跑零插入，跳 FDE 撞号则整笔回滚并报 `preview_port_block_taken`）⇒ 重跑 `cli.js provision-fde` 只补缺口、已齐备则零插入零入队，输出行带 `block=<起>-<止>`
 4. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 5. **创建 LLM 绑定**：按建号表单必选的 LiteLLM provider 与主模型（可选 embedding / vision）创建模型白名单受限的 per-FDE 虚拟 key 并发布 LLM 注入路由；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
 
@@ -370,47 +370,58 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 **为什么还要 JSON**：agent 读端口无需发 API（少一个失败点，可离线）；可 grep、可调试；符合「这台小电脑」的心智模型。
 
-**同步规则**：平台 → 容器**单向**。#240 起**没有「申请新端口」这条路**：开户时已预建 10 条（§8.2），容器内一律从 `~/.erix/ports.json` 取、绝不自己挑。
+**同步规则**：平台 → 容器**单向**。#240 起**没有「申请新端口」这条路**：开户时已预建一整段（§8.2：全局号池里的一个对齐块），#246 起**哪几个号是运行时决定的** ⇒ 容器内一律从 `~/.erix/ports.json` 取（**它就是唯一真相**）、绝不自己挑、也不要凭记忆假定是某几个固定端口。
 
-**告知的两处落点（容器侧不做端口管控，只告知）**：① `~/.erix/ports.json`（本图的派生终点，10 条 + 每条真实 `url`）；② `runner/worker.js` 的 `SYSTEM_PROMPT`（复述「已预建 10 条 / 必须从这 10 个端口里选 / 不要自造域名或端口 / 不要要求平台再加」）。两处都由同一份 DB 事实派生，防漂移测试：`portal/test/materializer.test.js`、`runner/test/system-prompt.test.js`（端口窗口取自 `portalloc.js` 常量，不在测试里重打一遍）。
+**告知的两处落点（容器侧不做端口管控，只告知）**：① `~/.erix/ports.json`（本图的派生终点，一整段 allocation + 每条真实 `url`）；② `runner/worker.js` 的 `SYSTEM_PROMPT`（复述「端口段由平台分配 / **清单是唯一真相** / 必须从清单里选且绑 `0.0.0.0` / 不要自造域名或端口 / 不要要求平台再加」）。两处都由同一份 DB 事实派生。防漂移测试：`portal/test/materializer.test.js`、`runner/test/system-prompt.test.js`——#246 后这两处**都不允许出现端口数字**（旧写法「复述 4000–4009」本质是拄一份第二清单，换号池时必然漂）；需要时从 `portal/src/previewpool.js` 的常量推导，不在测试里重打一遍。
 
-### 8.2 分配策略（开户即预分配 **10 条 FDE 级预览域名**；issue #240 定稿）
+### 8.2 分配策略（开户即发**全局号池里的一个对齐块**；issue #246 定稿，取代 #240 的「人人都是 4000–4009」）
 
-> **裁决（决策者 2026-10-11）**：预览域名按 **FDE 级**在开户（provision）时一次性预分配 **10 条**，
-> 端口固定 `4000–4009`，`hostname`/`url` 仍按 §8.5 语法与读侧同源生成。
-> 原「项目创建分配块首单端口 + 8 端口块（slot）+ 每用户总配额」的方案**整体作废**：
-> 项目注册制已随 P5「目录即项目」退役（`POST /api/projects` 现返回 `410 project_api_retired`，
-> `projects.slot` 不再参与端口分配，`port_allocations.project_id` 已被迁移 0008 DROP），
-> run 级端口块仍是 P2。**固定 10 条 ⇒ 不存在「超限」，错误码 `port_quota_exceeded` 随之删除**
-> （portal.md §1.2 / §3.3；不新造替代错误码）。
+> **裁决（决策者 2026-10-11，issue #246）**：全局**只有一个号池 `22000–29999`**（8000 个号 = **800 段**）。
+> 开户默认发「**池内最小的未占用对齐块**」（第 1 个 FDE `22000–22009`，下一个 `22010–22019` …，块大小 10）；
+> **管理员可覆盖**（指定块起点或单个端口）。**重叠 = 硬不变式**（决策者：「分配时候要检查重叠性」）：
+> 活行内 `port` **全局唯一**，由迁移 **0019** 的部分唯一索引 `port_allocations_live_global_port_key
+> UNIQUE (port) WHERE state <> 'released'` 在 **DB 层**保证；`released` 行不占位 ⇒ **号码可回收复用**。
+>
+> **历史（#240，已被本节取代）**：#240 把分配粒度定在 **FDE 级**、但端口写死 `4000–4009`（人人同一段），
+> 而既有索引只按 FDE 判重 ⇒ 真机 `eric` 与 `tetris` 同时持有 4000–4009（**10 组重叠**）。
+> 本单只换「挑哪些号」，**不改** #240 定的其它口径：粒度仍是 FDE 级；原「项目创建分配块首单端口 +
+> 8 端口块（slot）+ 每用户总配额」的方案仍作废（项目注册制已随 P5 退役，`projects.slot` 不再参与端口分配，
+> `port_allocations.project_id` 已被迁移 0008 DROP，run 级端口块仍是 P2）；**仍不存在「超限」，
+> 错误码 `port_quota_exceeded` 仍是已删除状态**（portal.md §1.2 / §3.3；不新造替代错误码）。
 
 | 项 | 取值 | 依据 |
 |---|---|---|
 | 粒度 | `scope='fde'`（迁移 **0018** 放开的第三个值；`run_id` 恒 NULL，与 `CHECK ((scope='run') = (run_id IS NOT NULL))` 自洽） | §7.2 第 3 步、迁移 0018 |
-| 条数 | **固定 10 条**，开户一次写完；不做配额、不再追加 | 决策者裁决 1/5 |
-| 端口 | `4000–4009`（`port` CHECK 允许 4000–4999，本窗口天然满足） | schema.sql §4 |
+| 条数 | 默认**一个块 = 10 个**，开户一次写完；不做配额、不再追加；管理员可改块 | 决策者裁决（#246） |
+| 号池 | 全局唯一池 **`22000–29999`**（800 段）；常量单一来源 `portal/src/previewpool.js`，与迁移 0019 同口径 | 决策者裁决（#246）、迁移 0019 |
+| 端口选取 | **池内最小的未占用对齐块**（起点对齐 10 的倍数）；占用判据 = **全局活行**（`state <> 'released'`，不分 FDE/scope/role），**整块**判定（块内任一号被占就整块跳过） | `previewpool.js:firstFreePreviewBlockStart`、`portalloc.js:choosePreviewBlockStart` |
+| 重叠不变式 | 活行内 `port` **全局唯一**，由 **DB** 保证；应层**不做**「先查后插」查重，只算候选块 + 把 `23505` 翻成 `preview_port_block_taken`（带重试提示）后由调用方重试 | 迁移 **0019** 的 `port_allocations_live_global_port_key` |
+| `port` CHECK | **按状态分支**：活行必须 `BETWEEN 22000 AND 29999`；`state='released'` 行保留历史号码（`BETWEEN 4000 AND 29999`） | 迁移 **0019** |
 | 角色 | `role='spare'`（复用既有枚举，不新造） | schema.sql §4 |
 | 可见性 | `exposure='private'`（对外分享走 §2.8 预览 ticket） | §6.5 |
 | 状态 | `state='allocated'`；首次 forward-auth 放行才幂等升 `active` | §8.6 |
 | 容器固定角色 | `3001` **已取消**（code-server 清退，容器唯一交互入口为 FDE 对话界面，issue #71，决策者 2026-09-24；原 `3000` runner 内部 API 同样已取消：容器平台通道零监听、全出站，§10.3，issue #3 评论） | 原 §8.2 保留项 |
 
-- **容器侧不做端口管控**（决策者裁决 2）：平台只保证这 10 条预览域名**有路由**；FDE 容器实际
+- **容器侧不做端口管控**（决策者裁决 2）：平台只保证**分给本 FDE 的那一段**预览域名**有路由**；FDE 容器实际
   监听什么端口平台**不检查、不限制、不 reconcile**。「严格管理容器内端口」的设想作废，改为
   **告知 + 尽力**（落点见 §8.1 末段）。
 - **派生必须自动**（决策者裁决 4）：写库与 route outbox / materialize revision 入队**同一事务**，
   禁止依赖人工 `enqueueFullRebuild` / `runMaterializerOnce`。
-- **幂等与存量补齐**（决策者裁决 7）：`ensureFdePreviewPorts` 的幂等判据是**部分唯一索引 +
+- **幂等与存量补齐**（决策者裁决 7）：`ensureFdePreviewPorts` 的幂等判据仍是**部分唯一索引 +
   `ON CONFLICT (fde_id, port) WHERE state <> 'released' DO NOTHING`**（不是「先查后插」，没有 TOCTOU）
-  ⇒ 二次调用零插入、零入队；缺几条补几条；老 FDE 重跑 `node portal/src/cli.js provision-fde --fde-name <name>` 即补齐到 10 条。
-- **遗留行不迁移**：真机现存 4 行全是 P5 之前手工插的 `scope='project'`（含 `tetris` 的 **4100**，
-  在本窗口之外），**既不改也不删**——路由生成（`routes.js` 读期望态）只看 `state <> 'released'`
-  与 `hostname`、不看 `scope`，遗留行继续有效；窗口内若已有同端口行（哪怕 `scope='project'`、
-  `role='frontend'`）也算「已存在」，不重复插（正是那条部分唯一索引给出的语义）。
+  ⇒ 二次调用零插入、零入队；缺几条补几条，且**块起点从本 FDE 已有活行反推**（重跑不会又开新段）；
+  老 FDE 重跑 `node portal/src/cli.js provision-fde --fde-name <name>` 即补齐整段（输出行带 `block=<起>-<止>`）。
+- **跳 FDE 侵吞的块不硬补**：如果本 FDE 已有的块里存在**外来**活行（历史手工插行 / 管理员改块都可能造成），
+  就整段换下一个空闲块，而不是在残缺段里插到一半被全局索引拒（`portal/test/portalloc.test.js` 钉住）。
+- **存量已由迁移 0019 一次性重排**（取代 #240 的「遗留行不迁移」）：活行按 `fde_name` 定序重排进号池，
+  `hostname`/`url` 同事务重写（base 域从旧 hostname 反推，不硬编码伞域）；装不进一个块的溢出活行（真机只有
+  `tetris` 的 **4100**）置 `released`；`released` 历史行（真机 `portsprobe` 的 4000–4009）**保留旧号码不重写**。
+  已接受的代价：eric / tetris 现有预览 URL 全部改写，**容器内应用要改监听端口**，旧链接失效。
 - 定期 reaper 回收 `released_at` 过期项；Traefik 配置由 reconciler 按 route outbox 幂等发布（§8.1，H-B）
 
 ### 8.3 `ports.json` 结构
 
-> **canonical schema 以 [`user-space.md`](user-space.md) §4.3.1 为准**（含 `schema`/`generation` 包裹与 `state` 字段）；下方仅为字段语义示意。字段名用 snake_case，`run_id` 恒为 run UUID（P5 后 hostname/url 不再含项目名段/run-tok，统一 `<fde>-p-<port4>`，§8.5）。
+> **canonical schema 以 [`user-space.md`](user-space.md) §4.3.1 为准**（含 `schema`/`generation` 包裹与 `state` 字段）；下方仅为字段语义示意。字段名用 snake_case，`run_id` 恒为 run UUID（P5 后 hostname/url 不再含项目名段/run-tok，统一 `<fde>-p-<portLabel>`，§8.5）。
 
 ```json
 {
@@ -429,38 +440,38 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 ### 8.4 容器内两条硬约定
 
-1. 端口一律从 `~/.erix/ports.json` 取，**不要自己挑**（#240：平台已预建 10 条、端口 `4000–4009`，且**没有**「申请新端口」这条路，§8.2）
+1. 端口一律从 `~/.erix/ports.json` 取，**不要自己挑**（#240 预建、#246 改为号池块：平台从全局号池 22000–29999 里发**属于本工位的一整段**（默认 10 个），且**没有**「申请新端口」这条路，§8.2。端口的**唯一真相就是这份清单**——不要凭记忆假定是某几个固定号）
 2. dev server 必须绑 **`0.0.0.0`**（容器内）——与常规安全建议相反，因为容器网络私有且只有 ingress 能进；绑 `127.0.0.1` 会导致 ingress 够不着
 
 ### 8.5 hostname grammar（写死；P5 去项目化后无项目名段；#57 阶段2 伞域修订）
 
 > **`BASE_DOMAIN` 语义 = 伞域（#57 定稿）**：`BASE_DOMAIN` 不再是「可注册域」，而是**伞域** `fde.<可注册域>`（现取 `fde.erix.vip`）。
 > 派生结果：portal = `station.<BASE_DOMAIN>` = `station.fde.erix.vip`、LLM = `llm.<BASE_DOMAIN>` = `llm.fde.erix.vip`（两条生成式在 `config.js`，不动）；
-> 预览域 = `<fde>-p-<port4>.<BASE_DOMAIN>` = `eric-p-8001.fde.erix.vip`——**语法里写死的 `.fde.` 段已删除**（伞域本身已含 `fde.`，否则叠加成 `.fde.fde.erix.vip`）。
+> 预览域 = `<fde>-p-<portLabel>.<BASE_DOMAIN>` = `eric-p-8001.fde.erix.vip`（#246 后端口段来自号池 ⇒ 实际形态 `eric-p-22000.fde.erix.vip`）——**语法里写死的 `.fde.` 段已删除**（伞域本身已含 `fde.`，否则叠加成 `.fde.fde.erix.vip`）。
 > 代码默认兜底 = `BASE_DOMAIN=localhost`（`config.js`，本地起服不改环境变量的形态；要给本地也套伞域则显式配 `BASE_DOMAIN=fde.localhost`）；dev 走 `http://…:8090`、生产走 `https/443`，**同一代码路径**（URL 的 scheme/端口从公开入口 `config.portalPublicBaseUrl` 派生，见 `projects.previewUrl`）。
 
 > **唯一入口**：`hostname` / `url` 由 **portal 生成**（§8.1「DB 是真相」；实现唯一入口 `portal/src/projects.js` `buildHostname`，URL 另见同模块 `previewUrl`），前端只展示/跳转、agent 只读——**任何其它方不得拼接/改写**（portal.md §8-4 / 本节 §8.4）。
-> **长度约束（DNS 标签安全的前提，#202 如实写）**：单标签上限 **63** 字符、整域名 ≤ **253**（RFC 1035）。首标签 `<fde>-p-<port4>` 的固定段（`-p-` + 恒 4 位端口）占 7 字符 ⇒ **FDE 名参与预览域名的预算 = 56**（旧文档的「项目名段 / 最长 134」形态已随 P5 去项目化作废，存量 hostname 由迁移 0008 重写）。
-> **强制点（四层，同一口径逐标签 ≤63 + 总长 ≤253）**：① 开户即 400（`admin.js createUser` → `projects.validateFdeNameForHostname`，对**最终 hostname** 整体校验，错误文案含实际长度与「缩短到 56 以内」）；② **预分配前**（#240：`portalloc.js ensureFdePreviewPorts` 写 10 条 hostname 之前按同一函数复检，`code='preview_hostname_invalid'`——否则 10 条里有 1 条拼错就会让 0017 的 DB CHECK 在开户事务中途炸成裸 23514）；③ 路由生成 fail-closed（`routes.js isValidHostname`）；④ DB 兜底 CHECK（迁移 **0017**，整域名正则，NOT VALID）。FDE_NAME_RE（≤63）本身不改：目录名/容器名/git-credential 路径不受 DNS 标签约束，57..63 字符在那些路径仍合法。
+> **长度约束（DNS 标签安全的前提，#202 如实写；预算宽度随 #246 号池变宽）**：单标签上限 **63** 字符、整域名 ≤ **253**（RFC 1035）。首标签 `<fde>-p-<portLabel>` 的固定段 = `-p-`（3）+ 端口段宽度（**取池内最大端口的位数**：#240 时代恒 4 位 ⇒ 7；#246 号池是 5 位 ⇒ **8**）⇒ **FDE 名参与预览域名的预算 = 63 − 8 = 55**（旧口径是 56 ⇒ **56 字符的名字现在开户即 400**）。两个数都从 `portal/src/previewpool.js` 的池边界**推导**（`MAX_FDE_NAME_LEN_FOR_HOSTNAME`），不写死端口也不写死预算：写死 `4000` 就会让 56 字符的名字过应用校验、再到 INSERT 被 0017 的 CHECK 以 23514 炸掉（旧实现的真实翻车路径）。`buildHostname` 的 `padStart(4,'0')` **不截断**，5 位端口原样入域名（旧文档的「项目名段 / 最长 134」形态已随 P5 去项目化作废，存量 hostname 由迁移 0008 重写；#246 重排存量时由迁移 0019 重写首标签端口段）。
+> **强制点（四层，同一口径逐标签 ≤63 + 总长 ≤253）**：① 开户即 400（`admin.js createUser` → `projects.validateFdeNameForHostname`，对**最终 hostname** 整体校验，探测端口取**池内最宽**的号 ⇒ 探到最坏情况；错误文案含实际长度与「缩短到 55 以内」）；② **预分配前**（#240：`portalloc.js ensureFdePreviewPorts` 写 hostname 之前按同一函数复检，`code='preview_hostname_invalid'`——否则一段里有 1 条拼错就会让 0017 的 DB CHECK 在开户事务中途炸成裸 23514）；③ 路由生成 fail-closed（`routes.js isValidHostname`）；④ DB 兜底 CHECK（迁移 **0017**，整域名正则，NOT VALID）。FDE_NAME_RE（≤63）本身不改：目录名/容器名/git-credential 路径不受 DNS 标签约束，56..63 字符在那些路径仍合法。
 
 **grammar**（小写、DNS 标签安全）：
 
 ```
-hostname := <fde> "-p-" <port4> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> 即伞域 fde.<可注册域>，语法不再插 .fde. 段
-<fde>    := [a-z0-9]([a-z0-9-]{0,54}[a-z0-9])?   -- users.fde_name；字符集同 schema.sql CHECK，预览域名长度预算 ≤56（见上）
-<port4>  := [0-9]{4}                              -- 恒 4 位（4000..4999，零填充）→ 首标签长度与端口取值无关
+hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> 即伞域 fde.<可注册域>，语法不再插 .fde. 段
+<fde>       := [a-z0-9]([a-z0-9-]{0,53}[a-z0-9])?   -- users.fde_name；字符集同 schema.sql CHECK，预览域名长度预算 ≤55（#246，见上）
+<portLabel> := [0-9]{4,}                        -- 十进制；不足 4 位零填充，**超过 4 位不截断**（号池端口是 5 位）
 
--- 完整域示例：eric-p-8001.fde.erix.vip（= <fde>-p-<port4> + 伞域 fde.erix.vip）
+-- 完整域示例：eric-p-22000.fde.erix.vip（= <fde>-p-<portLabel> + 伞域 fde.erix.vip）
 ```
 
 | 段 | 字符集 | 长度 | 生成规则 |
 |---|---|---|---|
-| `<fde>` | `[a-z0-9-]`，小写，不以 `-` 开头/结尾 | 1..56（预览域名预算；字符集本身允许到 63，仅开户的域名口径收紧） | `users.fde_name`（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段） |
+| `<fde>` | `[a-z0-9-]`，小写，不以 `-` 开头/结尾 | 1..55（预览域名预算；字符集本身允许到 63，仅开户的域名口径收紧） | `users.fde_name`（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段） |
 | `-p-` | 字面量 | 3 | 固定标记（P5 去项目化：原 `p-<project-name>` 的项目名段已删除） |
-| `<port4>` | `[0-9]` | 4 | `4000..4999` 的十进制，零填充到 4 位 |
+| `<portLabel>` | `[0-9]` | ≥4 | 端口十进制：**不足 4 位零填充、超过 4 位不截断**（#246 号池端口是 5 位，如 `22000`；旧口径「恒 4 位、4000..4999」已作废） |
 
-- **不可变性（写死）**：`hostname` / `url` 是 allocation 的**一次性分配标识，一旦生成永不改写**。保证书签/分享链接/iframe/预览卡片不漂移（原理三「URL 稳定」，§8.2 项目级固定端口用途）。
-- **碰撞处理**：`fde_name` 全局唯一 + 同 FDE 端口唯一 ⇒ hostname 天然无碰撞；`port_allocations_live_hostname_key` 唯一索引兜底（schema.sql）。
+- **不可变性（写死）**：`hostname` / `url` 是 allocation 的**一次性分配标识，运行期永不改写**。保证书签/分享链接/iframe/预览卡片不漂移（原理三「URL 稳定」，§8.2 项目级固定端口用途）。**唯一例外**：迁移 **0019** 把存量活行一次性重排进号池时同事务重写首标签端口段（决策者已接受「存量预览 URL 全部改写、旧链接失效」这个代价，§8.2）；除此之外只有 `released` 会让一个 host 退役。
+- **碰撞处理**：`fde_name` 全局唯一 + **端口在活行内全局唯一**（#246 起不再只是「同 FDE 内唯一」）⇒ hostname 天然无碰撞；兜底是两条唯一索引：`port_allocations_live_hostname_key`（schema.sql 既有）+ **`port_allocations_live_global_port_key`（迁移 0019）**。
 - **段长组合不在 schema 层**：schema.sql `users.fde_name` CHECK 只管字符集/单段 ≤63，不管「63 − 7」这类组合预算——组合口径由上述三层应用/DB 强制点执行（#202）。
 
 ### 8.6 `allocated → active` 的触发条件与幂等更新（写死）
@@ -673,8 +684,8 @@ hostname := <fde> "-p-" <port4> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> 即�
 |---|---|---|
 | ~~3000~~ | ~~`station-runner` 内部 API~~ **已取消**：容器平台通道零监听、全出站（§10.3，决策者 2026-09，issue #3 评论） | — |
 | ~~3001~~ | ~~code-server~~ **已取消**：容器唯一交互入口为 FDE 对话界面（issue #71，决策者 2026-09-24；对齐 3000 取消先例） | — |
-| `4000–4009` | **平台开户即预建的 10 条预览域名**（`scope='fde'`、`role='spare'`）：dev servers / 浏览器调试（#240，§8.2） | FDE 私，可分享 |
-| 4010+ | 未预分配（run 级端口块仍是 P2；平台不做容器侧端口管控，容器爱监听什么监听什么） | — |
+| 号池段（默认 `22000–22009`） | **平台开户即预建的一整段预览域名**（`scope='fde'`、`role='spare'`）：dev servers / 浏览器调试（#240 预建、#246 改为从全局号池 `22000–29999` 发对齐块，§8.2）。具体号段看容器内 `~/.erix/ports.json` | FDE 私，可分享 |
+| 其它端口 | 未预分配（run 级端口块仍是 P2；平台不做容器侧端口管控，容器爱监听什么监听什么，但没有 allocation 就没有路由） | — |
 
 > H-B 对齐确认（issue #5）：容器内**无 runner 监听端口**（3000 已取消，平台通道全出站经 Traefik，§5.3/§10.3）；Traefik 不在容器内（host 网络）；以上端口均不 publish，仅经 Traefik 每 allocation 一条路由可达（§6.4）。
 
