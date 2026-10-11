@@ -59,10 +59,10 @@
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
 | 端口 | `GET /api/projects/:id/ports` | **已退役 `410`**：端口事实的读取面是 FDE 级 `~/.erix/ports.json`（§4.7 / 规格 §8.2） |
-| 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure） |
+| 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **无路由，实测 `404`**（文档与实现的差异见 #250） |
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
-| 审批 | `GET /api/approvals` | 待审批工具调用列表 |
-| 审批 | `POST /api/approvals/:id` | 审批决定 |
+| 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **无路由，实测 `404`**（#249） |
+| 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **无路由，实测 `404`**（#249） |
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -763,6 +763,10 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 ### 4.7 端口列表
 
+> ⚠ **实现状态（#242 端点全量自检，2026-10-11 实测）**：本节只描述 `GET /api/projects/:id/ports`（已退役 `410`，留档只读）与 `POST /api/ports/:id/preview-ticket`（活端点）。
+> 而 **`PATCH /api/ports/:id` 没有实现**：`http.js` 用户面分派（401–583）无该分支，只有 `preview-ticket` 一条子路径正则；真机 `PATCH /api/ports/<真实 id>` → `404 not_found`。
+> 下方的 `200 / 403 / 400 / 404` 契约属**未交付的写入口**（读侧 `exposure` 免票判定在 `preview.js` 已实现，只差写）——去留待 #250 拍定，**不要当可用能力调用**。
+
 #### `GET /api/projects/:id/ports`
 
 响应 `200`：
@@ -807,6 +811,12 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 | 404 | `not_found` | allocation 不存在；已 `released` 的 allocation 视同不存在 |
 
 ### 4.8 工具审批（Approvals）
+
+> ⚠ **实现状态（#242 端点全量自检，2026-10-11 实测）**：**用户面审批 API 未实现**。
+> 存在的是 **internal 面**（`POST /api/internal/runs/:id/approvals` 创建、`GET /api/internal/approvals/:id` 轮询，见 §9）；
+> `GET /api/approvals` 与 `POST /api/approvals/:id` 在 `http.js` 用户面分派里**无分支**，真机均返回 `404 not_found`，
+> 且工作台 SPA（`portal/frontend/src`）零 `approv` 引用 ⇒ 待审批项当前**没有 FDE 可点的入口**（只能由 judge 自动定）。
+> 本节的 Approval 对象与「迟到决定 `409 approval_expired`」契约因此**仅在 internal 语义层成立**；是否补用户面 + 审批 UI 由 #249 拍定。
 
 judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls`）。
 
