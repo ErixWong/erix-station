@@ -59,6 +59,9 @@
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
 | 端口 | `GET /api/projects/:id/ports` | **已退役 `410`**：端口事实的读取面是 FDE 级 `~/.erix/ports.json`（§4.7 / 规格 §8.2） |
+| 端口 | `GET /api/me/ports` | **本人预览端口列表**（#246 交付②，§4.7a：只列活行、含签票要的 `id`） |
+| 端口 | `GET /api/admin/fdes/:fdeName/ports` | **管理员列他人预览端口**（#246 交付②，§4.7a；读他人资源**必写审计**） |
+| 端口 | `POST /api/admin/fdes/:fdeName/ports/block` | **管理员改块 = 搬迁事务**（#246 交付②，§4.7a：同事务释放旧块 + 撤 grant + 插新块 + 入队两条派生链） |
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
@@ -102,8 +105,9 @@
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
-| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2） | 是（仅此码） |
-| 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发 | 否 |
+| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2。**#246 交付② 同一码也用在新端点 `POST /api/admin/fdes/:fdeName/ports/block`**：管理员显式指定的块被外来活行占住、或搬迁中途插入数 ≠ 10（并发抢号 ⇒ 整笔回滚）——**那里 `retryable` 是 `false`**（盲试同一段必败，要先换一个起点），口径见 §4.7a） | 是（仅此码；**例外**：§4.7a 的改块 409 为 `false`） |
+| 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
+| 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
@@ -348,6 +352,10 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 #### 签发（`POST /api/ports/:id/preview-ticket`）
 
 浏览器 API，要求有效 session cookie（§2.5）。用于「portal 打开预览」：portal 校验当前用户对该 allocation 的可见性后，签发一次性 ticket 并返回带 ticket 的预览 URL。
+
+> 路径参数 `:id` = `port_allocations.id`（UUID）。它的**读取面**是 §4.7a 的 `GET /api/me/ports` 与
+> `GET /api/admin/fdes/:fdeName/ports`（#246 交付② 补上的那条缺失的路；在那之前没有任何列端口的 API，
+> 签票只能靠人查库）。
 
 请求：无体（空 JSON `{}`）。
 
@@ -769,6 +777,9 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 
 ### 4.7 端口列表
 
+> 本节只覆盖**已退役的项目维度**列表与未交付的 `PATCH /api/ports/:id`。**现役的列端口端点（本人 / 管理员）与
+> 管理员改块（= 搬迁）在 §4.7a**（issue #246 交付②）。
+
 > ⚠ **实现状态（#242 端点全量自检，2026-10-11 实测）**：本节只描述 `GET /api/projects/:id/ports`（已退役 `410`，留档只读）与 `POST /api/ports/:id/preview-ticket`（活端点）。
 > 而 **`PATCH /api/ports/:id` 没有实现**：`http.js` 用户面分派（401–583）无该分支，只有 `preview-ticket` 一条子路径正则；真机 `PATCH /api/ports/<真实 id>` → `404 not_found`。
 > 下方的 `200 / 403 / 400 / 404` 契约属**未交付的写入口**（读侧 `exposure` 免票判定在 `preview.js` 已实现）——**已裁决不交付**（#250）。
@@ -819,6 +830,129 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 | 403 | `forbidden` | 非 admin 申请 `public`（规格 §6.5：public 默认不给） |
 | 400 | `validation_failed` | 请求体非法（如 `exposure` 不在枚举内） |
 | 404 | `not_found` | allocation 不存在；已 `released` 的 allocation 视同不存在 |
+
+### 4.7a 预览端口列表与管理员改块（issue #246 交付②）
+
+> **为什么要这三条端点**：`GET /api/projects/:id/ports` 随 P5 退役后，**没有任何列端口的 API**，
+> 而签票端点 `POST /api/ports/:id/preview-ticket`（§2.8）吃的是 allocation **UUID** ⇒ 普通 FDE 只能靠人
+> 查库。#240/#241 的浏览器验收因此全部是主 agent 手工 curl 签票。本节的读端点就是那条缺失的路（单 B 面板拿 `id` 用它）。
+> **实现**：`portal/src/http.js`（分派/校验/错误映射/审计）+ `portal/src/portalloc.js`（取数与搬迁事务）；
+> 常量仍只来自 `portal/src/previewpool.js`（池 `22000–29999`、每段 10 个、预算 55）。
+
+#### 共同 DTO（两个列端点同形同序）
+
+响应 `200`（信封照既有列表端点 `{ "items": [...] }`，§1.3）：
+
+```json
+{
+  "items": [
+    {
+      "id": "7b0a1f2e-9c3d-4e5f-8a6b-1c2d3e4f5a6b",
+      "port": 22000,
+      "hostname": "alice-p-22000.fde.erix.vip",
+      "url": "http://alice-p-22000.fde.erix.vip:8090",
+      "state": "allocated",
+      "scope": "fde",
+      "role": "spare",
+      "exposure": "private"
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` | `port_allocations.id`（UUID）——**签票端点的路径参数**，缺它本端点就没意义 |
+| `port` / `hostname` / `url` | 号池里本 FDE 那个对齐块的成员；`url` 与路由同源生成（规格 §8.1/§8.5），前端只展示/跳转 |
+| `state` | `allocated` \| `active`（首次 forward-auth 放行才升 `active`，规格 §8.6）；**已 `released` 的行不列** |
+| `scope` / `role` / `exposure` | 恒 `fde` / `spare` / `private`（#250 裁决：`private` 是唯一交付档位） |
+
+**只列活行**（`state <> 'released'`）、**按 `port ASC`**；不游标分页（一块 = 10 行，上限可预期）。
+
+#### `GET /api/me/ports`
+
+任何已登录用户可调用，返回**自己**的活行。未登录 → `401 unauthorized`（既有口径，本端点不自造）。
+**admin 自己通常没有 FDE**（`users.fde_name IS NULL`）⇒ `200 {"items": []}`，**不是 404**。
+本人读自己的资源**不写审计**（forward-auth 已经逐请求留痕，§2.7）。
+
+#### `GET /api/admin/fdes/:fdeName/ports`
+
+`requireAdmin`（同其它 `/api/admin/*`，非 admin → `403 forbidden`）。错误码：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 400 | `validation_failed` | `:fdeName` 不符合 `FDE_NAME_RE`（`details.field='fde_name'`，同 `git-credential`/`provision` 端点） |
+| 404 | `not_found` | **未知 `fdeName`**（复用 admin 面现有码，不新造）。停用中的 FDE 仍算「已知」⇒ 回 `200 {"items": []}`（offboarding 只停用不删号，它的行全已 `released`） |
+
+**审计口径**：读他人资源**必须显式写一行** `audit_log`（不假定框架已自动写——评审已查实现有 admin GET 未一致落实审计）：
+`action='admin.fde_ports_listed'`、`actor_id=` 管理员用户 id、`target=` 被读的 FDE 名、
+`details={fde_name, item_count}`。**恰好一行**（多写也算噪声）；`400/403/404` **不写**审计。
+
+#### `POST /api/admin/fdes/:fdeName/ports/block` —— 改块 = **搬迁**
+
+请求：`{ "block_start": 22010 }`。语义是**整段搬到新块**，不是「再发一块」：
+`ensureFdePreviewPorts` 是 insert-only（`portalloc.js` 全文件零 `UPDATE port_allocations`），
+**只复用它补一段会留下 20 条活行**（旧 10 条继续占号、旧域名继续可访问）——所以旧行必须在本事务里释放。
+
+校验顺序即判据（①② 在任何 SQL 之前，③ 零写，④ 零残留）：
+
+| 序 | 条件 | HTTP / code |
+|---|---|---|
+| ① | `block_start` 不是整数 / 不在池 `22000–29999` 内 / 未按 10 对齐 | `400 validation_failed`（`details.field='block_start'`，文案给合法起点） |
+| ② | FDE 名超预览域名预算（§1.2 的 `preview_hostname_invalid`，预算 55） | `400 preview_hostname_invalid`（**不降级为 warn**） |
+| ③ | 目标块已经是本 FDE 的**整块**活行 | `200 {"changed": false, …}`，**零 SQL 写、零入队、零审计**（幂等） |
+| ④ | 目标块内有**外来**活行（占用判据 = 全局活行 `state <> 'released'`；本 FDE 自己的活行不算冲突） | `409 preview_port_block_taken`（**禁止**「偷偷换成第一个空闲块」，文案要点名被占的号与下一步动作） |
+| ⑤ | 事务内插入数 ≠ 10（并发抢号被 `ON CONFLICT … DO NOTHING` 吃掉） | `409 preview_port_block_taken` + 整笔回滚（**不许部分提交**） |
+
+成功 `200`：
+
+```json
+{
+  "changed": true,
+  "fde_name": "alice",
+  "block_start": 22010,
+  "block_end": 22019,
+  "ports": [22010, 22011, 22012, 22013, 22014, 22015, 22016, 22017, 22018, 22019],
+  "released_allocations": 10,
+  "revoked_grants": 0,
+  "inserted_allocations": 10
+}
+```
+
+**原子性（实现契约，测试逐序钉住 `portal/test/preview-ports.test.js`）**：单事务、固定顺序
+
+```
+BEGIN
+ → SELECT 本 FDE 活行端口 → SELECT 全局活行端口        ← ③④ 在此判定，两者都不写库
+ → UPDATE port_allocations SET state='released', released_at=COALESCE(released_at, now())
+ → UPDATE preview_grants SET state='revoked', revoked_at=COALESCE(revoked_at, now())
+                                                     ← 两句照 offboarding 的先例写法（只动 active/used）
+ → 10× INSERT … ON CONFLICT (fde_id, port) WHERE state <> 'released' DO NOTHING RETURNING id
+ → route_revisions → route_outbox（每条新 allocation 一条）
+ → materialize_revisions → materialize_outbox（每 FDE 一条）
+COMMIT
+```
+
+- 任一步失败 ⇒ 整笔 `ROLLBACK`，**零残留**（旧行仍活、无新行、两条 outbox 都没新行）。
+- 派生链照旧同事务入队 ⇒ Traefik 路由与 `~/.erix/ports.json` 自动跟上（旧 host 的路由消失、新 host 出现），
+  不需要人工 `enqueueFullRebuild` / `runMaterializerOnce`（规格 §8.2「派生必须自动」）。
+- `released` 行**不占位** ⇒ 号码可回收：搬出去再搬回**同一块**必须能成功（测试钉住）。
+- `released ⇔ released_at` / `revoked ⇔ revoked_at` 是 DB CHECK，两句 UPDATE 都写时间戳且不覆盖既有值（`COALESCE`）。
+
+**审计口径**：真搬了才写一行 `action='admin.fde_ports_block_moved'`、`target=` 该 FDE 名、
+`details={fde_name, from_block_start, to_block_start, released_allocations, inserted_allocations, revoked_grants}`；
+`changed:false`（幂等空操作）按上表③ **不写审计**；`400/409` 不写。
+
+#### 自动选块的冲突重算（补交付① 的已知边界，无新契约但影响本端点的用法）
+
+`provisionFdePreviewPorts`：**未**显式指定 `blockStart` 时遇 `preview_port_block_taken` ⇒ 开**新事务**重算
+（重取全局占用 → 取下一个整块空闲对齐块），**总尝试上限 3 次**（首试 + 重算 2 次，`PREVIEW_BLOCK_MAX_ATTEMPTS`）；
+用尽后抛同一码，文案把兜底动作指给本节的改块端点。**显式指定 `blockStart` ⇒ 不重算**（管理员指定的段被占就是要人看一眼）。
+
+> ⚠ **重试只覆盖「端口分配」这一小段**（不是整笔开户回滚重来）：开户顺序是「网络与容器已落地之后、LLM 联动之前」
+> 调端口分配（`provisioner.js` 已核实）⇒ 冲突时**已建的网络/容器不回滚**，LLM binding 尚未执行。
+> 已有的 `withFdeLock` 锁键是 `fde:${fdeName}`，**串行化不了不同 FDE 抢同一个空闲块**，
+> 所以「迁移 0019 的全局部分唯一索引 + 新事务重算」才是正解，不要指望加锁（规格 §8.2）。
 
 ### 4.8 工具审批（Approvals）
 

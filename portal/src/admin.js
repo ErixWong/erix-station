@@ -107,6 +107,32 @@ export async function writeUserCreatedAudit(pool, {
 }
 
 /**
+ * 预览端口列端点（issue #246 交付②）的读审计：**admin 读别人的资源必须留痕**。
+ * 不假定框架已自动写——评审已查实现有 admin GET（`/api/admin/users`、`/api/admin/fdes/:name/llm` 等）
+ * 并未一致落实审计，所以本端点显式调一次 helper（**恰好一行**，多写也算噪声）。
+ * action 命名照本文件既有风格（`admin.user_*`），target = 被读的 FDE 名（同 `writeUserCreatedAudit` 用 login）。
+ */
+export async function recordFdePortsListedAudit(pool, { actorId = null, fdeName, itemCount = 0 } = {}) {
+  await recordAdminAudit(pool, actorId, 'admin.fde_ports_listed', fdeName, {
+    fde_name: fdeName, item_count: itemCount,
+  });
+}
+
+/** 预览端口改块（搬迁）的写审计；只在**真的搬了**时写（幂等空操作按契约零写库，portal.md §4.7a）。 */
+export async function recordFdePortsBlockMovedAudit(pool, {
+  actorId = null, fdeName, fromBlockStart = null, toBlockStart, releasedAllocations = 0, inserted = 0, revokedGrants = 0,
+} = {}) {
+  await recordAdminAudit(pool, actorId, 'admin.fde_ports_block_moved', fdeName, {
+    fde_name: fdeName,
+    from_block_start: fromBlockStart,
+    to_block_start: toBlockStart,
+    released_allocations: releasedAllocations,
+    inserted_allocations: inserted,
+    revoked_grants: revokedGrants,
+  });
+}
+
+/**
  * 建 FDE 用户，或复用同名 disabled 用户行重新激活；默认不启用 TOTP，见 issue #139。
  * @returns { { user, reactivated } | { user, reactivated, totp_secret, totp_uri } }
  * —— 启用时种子仅此一次下发（调用方不得再读/再显）。
