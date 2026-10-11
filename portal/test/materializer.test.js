@@ -21,6 +21,7 @@ import {
   CONTAINER_HOME,
 } from '../src/materializer.js';
 import { atomicWriteFile, sha256, commitTempFile, writeTempFile } from '../src/fsutil.js';
+import { previewAllocationPlan, PREVIEW_PORTS } from '../src/portalloc.js';
 
 // 宿主侧属主跟随进程身份（同 portal/test/git-cli-config.test.js 顶部口径）：生产是
 // `uid/gid = fdeUid/fdeGid`（portal/src/materializer.js:441-442 默认 1000），而测试里的 chown
@@ -70,12 +71,78 @@ test('renderPortsJson：P5 FDE 级单一文件（schema/fde/generation/allocatio
   assert.equal(obj.project, undefined, 'FDE 级文件不再按项目分组');
   assert.equal(obj.allocations.length, 1);
   assert.equal(obj.allocations[0].port, 4016);
+  // 任何一条 allocation 进 ports.json 都必须带 url（#240 起把这条口径钉死在渲染层）
+  assert.deepEqual(obj.allocations.map((a) => a.url), [ALLOC.url]);
+});
+
+// issue #240：开户预分配 10 条 FDE 级预览域名后，ports.json 就是「告知」的第一落点
+// （第二落点是 runner 的 SYSTEM_PROMPT）。口径不放宽：10 条全在、每条都带 url。
+const PREVIEW_ALLOCS = previewAllocationPlan({
+  fdeName: 'alice',
+  baseDomain: 'fde.erix.vip',
+  publicBaseUrl: 'http://station.fde.erix.vip:8090',
+}).map((p) => ({
+  scope: p.scope, port: p.port, role: p.role, run_id: null, url: p.url, exposure: p.exposure, state: p.state,
+}));
+
+test('renderPortsJson：#240 预分配的 10 条预览域名全部出现，且**每条都带 url**', () => {
+  const obj = JSON.parse(renderPortsJson({ fdeName: 'alice', generation: 7, allocations: PREVIEW_ALLOCS }));
+  assert.deepEqual(obj.allocations.map((a) => a.port), PREVIEW_PORTS, '端口 4000–4009 一条不缺');
+  assert.equal(obj.allocations.length, 10);
+  for (const a of obj.allocations) {
+    assert.equal(typeof a.url, 'string');
+    assert.ok(a.url && a.url.length > 0, `端口 ${a.port} 的条目必须带 url（agent 永不自行拼 URL）`);
+    assert.equal(a.url, `http://alice-p-${a.port}.fde.erix.vip:8090`);
+    assert.equal(a.scope, 'fde');
+    assert.equal(a.role, 'spare');
+    assert.equal(a.state, 'allocated');
+  }
+});
+
+test('runMaterializerOnce：#240 开户写入的 10 行落进盘上 ~/.erix/ports.json（读侧 SQL 口径不变）', async () => {
+  const root = tmpdir();
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM users')) return { rows: [{ id: 'u1', fde_name: 'alice' }] };
+      if (sql.includes('FROM port_allocations')) return { rows: PREVIEW_ALLOCS.map((a) => ({ ...a })) };
+      if (sql.includes('UPDATE materialize_outbox SET state =')) return { rows: [] };
+      throw new Error(`unexpected pool query: ${sql}`);
+    },
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+          if (sql.includes('RETURNING o.id')) return { rows: [{ id: 'outbox-1', fde_id: 'u1', revision: 1, op: 'upsert' }] };
+          if (sql.startsWith('UPDATE materialize_outbox')) return { rows: [] };
+          throw new Error(`unexpected client query: ${sql}`);
+        },
+        release() {},
+      };
+    },
+  };
+  try {
+    const result = await runMaterializerOnce(pool, {
+      userSpaceRoot: root,
+      llmPublicBaseUrl: 'http://llm.localhost:8090',
+      baseDomain: 'fde.erix.vip',
+    });
+    assert.deepEqual(result, { processed: 1, claimed: 1 });
+    const ports = JSON.parse(fs.readFileSync(path.join(root, 'alice', 'home', '.erix', 'ports.json'), 'utf8'));
+    assert.equal(ports.allocations.length, 10, '盘上 ports.json 必须是 10 条');
+    assert.deepEqual(ports.allocations.map((a) => a.port), PREVIEW_PORTS);
+    assert.deepEqual(ports.allocations.map((a) => a.url), PREVIEW_PORTS.map((p) => `http://alice-p-${p}.fde.erix.vip:8090`));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('renderHomeAgentsMd：端口指引指向 FDE 级 ~/.erix/ports.json（不再提项目级 .erix/ports.json）', () => {
   const md = renderHomeAgentsMd({ fdeName: 'alice' });
   assert.match(md, /~\/\.erix\/ports\.json/);
   assert.doesNotMatch(md, /projects\/<project>\/\.erix\/ports\.json/);
+  // #240：告知「固定 10 条、端口 4000–4009、不够用不再给」——容器侧不管控，只能靠告知收口
+  assert.match(md, /10 条预览域名/, 'AGENTS.md 必须告知预建 10 条预览域名');
+  assert.match(md, /4000–4009/, '必须写明端口窗口');
 });
 
 test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目录 clone . / git init）', () => {

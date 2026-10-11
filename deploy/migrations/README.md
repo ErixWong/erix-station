@@ -44,8 +44,13 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0017-port-allocations-hostname-check.sql`（#202 预览域名 hostname 的 DB 兜底 CHECK：整域名正则
-  逐标签 ≤63 + 总长 ≤253，NOT VALID，存量收敛动作见迁移头注释；前一道 `0016-transcript-append-seq.sql`
+  `0018-port-allocations-scope-fde.sql`（#240 开户预分配 10 条 FDE 级预览域名：`port_allocations.scope`
+  的 CHECK 由 `('project','run')` 放开为 `('project','run','fde')`，按名 DROP→ADD 可重放；**只改这一条
+  CHECK**——`CHECK ((scope='run') = (run_id IS NOT NULL))` 原样保留（`scope='fde'` 的行 `run_id` 恒 NULL），
+  且**不新建索引**（幂等靠 baseline 既有的部分唯一索引 `port_allocations_live_port_key (fde_id, port)
+  WHERE state <> 'released'`，写侧 `ON CONFLICT` 必须带上该谓词才能推断冲突目标）；前一道
+  `0017-port-allocations-hostname-check.sql` 为 #202 预览域名 hostname 的 DB 兜底 CHECK（整域名正则
+  逐标签 ≤63 + 总长 ≤253，NOT VALID，存量收敛动作见迁移头注释）；再前一道 `0016-transcript-append-seq.sql`
   为 transcript 同 round 保序：新增 `append_seq` + 存量按 `created_at, id` 确定性回填 + 部分索引）。
   **P1 compose 显式设
   `MIGRATE_ON_START: "1"`**——单实例平台起栈即自动补增量，不再需要人工补跑（deploy-contract §3.1）；
