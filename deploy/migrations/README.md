@@ -44,7 +44,12 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0019-preview-port-pool.sql`（**#246 交付①：预览端口全局号池 `22000–29999` 与块分配**——四条语句的
+  `0020-preview-grant-revoke-repair.sql`（**#252：清「已释放 allocation 上仍 `active`」的预览凭证残渣**——
+  纯数据修复、**零 DDL**（baseline 冻结件一字节不动）；谓词与代码同源，**只撤 `state='active'`**，
+  `used` 行按 #252 口径**保留原状**（把 used 塞进 `revoked` 会撞双向 CHECK `(state='used') = (used_at IS NOT NULL)`
+  即真机的 `preview_grants_check3`；顺手清 `used_at` 则篡改历史）；可整体重放（前置 NOTICE 打印待修条数，
+  第二遍必为 0，后置 DO 守卫兜住「谓词被改窄」），真库重放证据见 `DELIVERY.md`）。
+  前一道 `0019-preview-port-pool.sql`（**#246 交付①：预览端口全局号池 `22000–29999` 与块分配**——四条语句的
   **顺序不可换**：⓪ 按名 `DROP CONSTRAINT IF EXISTS port_allocations_port_check` → ① 重排存量**活行**
   进号池（按 `fde_name` 定序，一人一个 10 个的对齐块；`hostname`/`url` 的端口段**同事务**重写，base 域从旧
   hostname 反推、**不硬编码伞域**；装不下的溢出活行置 `released`；`released` 行一律不动⇒ 历史号码保留）

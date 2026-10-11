@@ -491,18 +491,20 @@ export async function moveFdePreviewBlock(pool, config, {
         RETURNING id`,
       [fdeId],
     );
-    // ④ 撤 grant（同 offboarding.js:225-231：只动 active/used，已 revoked/expired 不打扰）。
-    let revokedGrants = 0;
-    if (released.rows.length > 0) {
-      const revoked = await client.query(
-        `UPDATE preview_grants
-            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
-          WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')
-          RETURNING id`,
-        [released.rows.map((row) => row.id)],
-      );
-      revokedGrants = revoked.rows.length;
-    }
+    // ④ 撤 grant（与 offboarding 的 `release-network-routes` **同一口径**，#252）：
+    //    - **只撤 `state = 'active'`**——`used` 是历史事实（已消费的 ticket 本身不再授予访问，它派生的
+    //      session 才是活的东西，而 session 在同一批里会被撤）。把 `used` 塞进 `revoked` 会当场撞
+    //      baseline 的双向 CHECK `(state = 'used') = (used_at IS NOT NULL)`（`preview_grants_check3`），
+    //      真机就是本函数报的 500（issue #252）；而「顺手清 `used_at`」虽过 CHECK，是篡改历史。
+    //    - **无条付发**（不挂在「本次真的释放了行」上）：幂等跟重试都要能走到这里，撤 0 行也是成功。
+    const revoked = await client.query(
+      `UPDATE preview_grants
+          SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+        WHERE allocation_id = ANY($1::uuid[]) AND state = 'active'
+        RETURNING id`,
+      [released.rows.map((row) => row.id)],
+    );
+    const revokedGrants = revoked.rows.length;
 
     // ⑤ 插新块 + 两条派生链（**复用** ensureFdePreviewPorts：本 FDE 的活行此刻已全部 released，
     //    所以它不会再「补缺口」，10 条全走真插入 ⇒ route outbox ×10 + materialize revision 各一次）。

@@ -397,7 +397,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | TTL | **60s ⚠️ 待决策者确认**（覆盖人工点击/iframe 首帧的间隙，又不至于可被长期重放） |
 | 一次性（crash-safe） | 首次校验在**同一 DB 事务**内消费 ticket + 派生 session + 记 `ticket→session` 关联（§2.7 第 6 步）；响应丢失后**同一 ticket 安全重放**（返回同一 bootstrap 结果、不产生第二个 session token）；仅当已消费且派生的 session 已 `revoked`/`expired` 才 `403 preview_ticket_used` |
 | 撤销 | `state='active' → 'revoked'`（同事务置 `revoked_at`）即失效；portal 关闭预览页 / 用户登出 / admin 吊销时可选显式撤销未使用的 ticket |
-| 与 allocation 释放联动 | allocation `state → released`（项目删除 / run 结束 / reaper）时，**同一事务**将该 allocation 的 `active` ticket 全部置 `state='revoked'`（同事务写 `revoked_at`）；且 forwardAuth 第 2 步始终重查 allocation `state`，双保险 |
+| 与 allocation 释放联动 | allocation `state → released`（项目删除 / run 结束 / reaper / offboarding / 管理员改块）时，**同一事务**把该 allocation 上**仍 `state='active'`** 的凭证全部置 `state='revoked'`（同事务写 `revoked_at`）；`used`/`expired`/`revoked` **一律不动**（口径见下方「撤 grant 的口径」）；且 forwardAuth 第 2 步始终重查 allocation `state`，双保险 |
 
 #### 预览 cookie 语义（`preview_grants.kind='session'`）
 
@@ -408,6 +408,25 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | TTL | `Max-Age` 与 `expires_at` 一致：**15 分钟 ⚠️ 待决策者确认**，滚动续期（每次 forwardAuth 成功刷新） |
 | 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` 均失效（forwardAuth 每请求重查） |
 | 上游可见性 | **预览 cookie 与 portal session cookie 都绝不到达预览上游**：二者 host-only、只在各自 host 发送；Traefik `strip-cookie` 中间件在放行后删除 `Cookie`（fde-platform §6.4）——上游 dev server 收到的请求头里**没有 `Cookie`** |
+
+#### 撤 grant 的口径（`state → revoked`，issue #252）
+
+三个写入口共用同一条 UPDATE 形状（`portal/src/offboarding.js` 的 `release-network-routes`、
+`portal/src/portalloc.js` 的 `moveFdePreviewBlock`、`portal/src/admin.js` 的停用用户）：
+
+```sql
+UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+ WHERE allocation_id = ANY($1::uuid[]) AND state = 'active'      -- 只撤 active
+```
+
+| 点 | 口径 | 为什么 |
+|---|---|---|
+| 哪些状态会被撤 | **只有 `state='active'`** | forwardAuth 只认 `state='active'`（§2.7 第 2 步）⇒ 只有它还在授予访问 |
+| `used` 为什么不撤 | 保留原状，连 `used_at` 都不碰 | 已消费的 ticket 是**历史事实**、本身不再授予访问；还活着的是它派生的 `session`（`parent_ticket_id` 指向它），而 session 是 active、同批被单独撤。把 `used` 塞进 `revoked` 会撞 baseline 的双向 CHECK `(state = 'used') = (used_at IS NOT NULL)`（= `preview_grants_check3`，真机即 500）；「顺手 `used_at = NULL`」虽过 CHECK，却抹掉「这张票何时被谁消费」的审计事实（**篡改历史**，禁止） |
+| `expired` / `revoked` | 不动 | 已不授予访问，由 reaper 清理（本节 reaper 语义） |
+| 幂等 | 撤 **0 行也算成功**，语句**无条件发** | offboarding 的撤权**不许**挂在「本次真的释放了行」上：重试路径上本 FDE 的 allocation 早已 `released` ⇒ 守卫为假 ⇒ 撤权整段被**静默跳过**（真机留下 21 条残渣、步骤却记 `done`、`last_error` 空）。因此 id 集合取本 FDE 的**全部** allocation（含历史已 `released` 的），两个计数分开写日志 |
+| 存量残渣 | 一次性由迁移 `deploy/migrations/0020-preview-grant-revoke-repair.sql` 撤掉「已释放 allocation 上仍 `active`」的凭证；`used` 行按同一口径保留 | baseline 冻结（sha256）⇒ 数据修复只走增量迁移；迁移可重放（第二次零行变更），且**不碰任何约束** |
+| 回归保护 | `portal/test/preview-ports.test.js` 与 `portal/test/offboarding.test.js` 的 fake **逐条同名**模拟 `preview_grants` 的 baseline CHECK（含双向的 `used ⇔ used_at`），违反 ⇒ **语句级**抛 `23514`（规则集中在 `portal/test/preview-grant-checks.js`） | 旧 fake 只模拟 `revoked ⇔ revoked_at` ⇒ 这类 bug 在单测里**结构上不可能**被发现（#252 能活到真机的根因） |
 
 > DDL 已落地（schema.sql §4 / model.md §1.21）：`preview_grants` 表（`token_hash UNIQUE`、`kind ∈ {ticket,session}`、`state ∈ {active,used,revoked,expired}`、`user_id`→`users`（主体）、`issuer_id`→`users`（ticket 签发者，session 系统派生可空）、`allocation_id`→`port_allocations`、`parent_ticket_id`→`preview_grants.id`（ticket→session 关联，可空）、`expires_at`、`used_at`、`revoked_at`、`last_seen_at`、`created_at`、`created_ip`、`created_ua`），并加 reaper 定期清理过期行。
 >
@@ -453,7 +472,7 @@ station-portal user disable --login <login> [--reason "..."]
 station-portal user enable  --login <login>
 ```
 
-- `disable`：`users.status → disabled` + `disabled_at=now()`；**同事务**吊销该用户全部 `login_sessions`（`revoked_at`）、`preview_grants`、`api_tokens`。此后登录（§2.2）、forwardAuth（§2.7 第 5 步 `users.status='disabled'`）、internal 归属均拒绝。**容器停止/runner token/LLM 虚拟 key 吊销属 offboarding（规格 §7.3），是独立命令**，不在本命令内。
+- `disable`：`users.status → disabled` + `disabled_at=now()`；**同事务**吊销该用户全部 `login_sessions`（`revoked_at`）、`preview_grants`（**只吊销 `state='active'` 的凭证**——`used` 是历史事实，保留原状，见 §2.8「撤 grant 的口径」/#252）、`api_tokens`。此后登录（§2.2）、forwardAuth（§2.7 第 5 步 `users.status='disabled'`）、internal 归属均拒绝。**容器停止/runner token/LLM 虚拟 key 吊销属 offboarding（规格 §7.3），是独立命令**，不在本命令内。
 - `enable`：`status → active`、清 `disabled_at`；**无自动恢复路径**（model.md §1.1 状态机）。恢复后用户需重新登录、重新签发预览 ticket。
 - 审计：`user.disable` / `user.enable`（actor = 执行 admin）。
 
@@ -926,7 +945,9 @@ BEGIN
  → SELECT 本 FDE 活行端口 → SELECT 全局活行端口        ← ③④ 在此判定，两者都不写库
  → UPDATE port_allocations SET state='released', released_at=COALESCE(released_at, now())
  → UPDATE preview_grants SET state='revoked', revoked_at=COALESCE(revoked_at, now())
-                                                     ← 两句照 offboarding 的先例写法（只动 active/used）
+                                       WHERE allocation_id = ANY(...) AND state='active'
+                                                     ← 两句照 offboarding 的先例写法，**只动 state='active'**
+                                                       （`used` 保留原状、撤权**无条件发**，#252；见 §2.8「撤 grant 的口径」）
  → 10× INSERT … ON CONFLICT (fde_id, port) WHERE state <> 'released' DO NOTHING RETURNING id
  → route_revisions → route_outbox（每条新 allocation 一条）
  → materialize_revisions → materialize_outbox（每 FDE 一条）
