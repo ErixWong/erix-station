@@ -31,11 +31,11 @@
 | 认证 | `POST /api/auth/logout` | 登出 |
 | 认证 | `GET /api/me` | 当前用户信息 |
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
-| 项目 | `GET /api/projects` | 项目列表 |
-| 项目 | `POST /api/projects` | 创建项目（同事务分配项目级端口） |
-| 项目 | `GET /api/projects/:id` | 项目详情（含端口） |
-| 项目 | `PATCH /api/projects/:id` | 改名等 |
-| 项目 | `DELETE /api/projects/:id` | 删除项目（回收端口） |
+| 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
+| 项目 | `POST /api/projects` | **已退役 `410 project_api_retired`**（目录即项目，§3.3） |
+| 项目 | `GET /api/projects/:id` | 项目详情（留档只读；`ports` 恒空，§3.4） |
+| 项目 | `PATCH /api/projects/:id` | **已退役 `410 project_api_retired`**（§3.5） |
+| 项目 | `DELETE /api/projects/:id` | **已退役 `410 project_api_retired`**（§3.6） |
 | 管理 | `GET /api/admin/fdes/:fdeName/git-credential` | 查询 Git 凭据主机、用户名与掩码 |
 | 管理 | `PUT /api/admin/fdes/:fdeName/git-credential` | 配置一个 Git 主机凭据 |
 | 管理 | `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>` | 删除一个 Git 主机凭据 |
@@ -58,7 +58,7 @@
 | 对话 | `GET /api/sessions/:id/events/history` | run_events 展示类事件历史（§4.4a，刷新后重建卡片/面板） |
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
-| 端口 | `GET /api/projects/:id/ports` | 端口分配列表 |
+| 端口 | `GET /api/projects/:id/ports` | **已退役 `410`**：端口事实的读取面是 FDE 级 `~/.erix/ports.json`（§4.7 / 规格 §8.2） |
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure） |
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表 |
@@ -102,7 +102,7 @@
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
-| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `port_quota_exceeded` / `idempotency_key_reuse` | 状态冲突，各端点分别列出 | 否 |
+| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名固定预分配 10 条 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
@@ -363,6 +363,13 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 签发规则：
 - 当前用户对该 allocation 的可见性必须成立：`private` → 仅 owner **或 admin**（admin 例外，写审计 + 告警）；`org-visible` → 任意已认证用户；`public` → 真公开免凭证（**默认不给，仅 admin 可开**）——签发侧同样仅 admin 可为 `public` allocation 签发 bootstrap ticket。不成立 → `404 not_found`（他人资源不泄露存在性，§1.2）。
 - allocation 必须 `state ∈ {allocated,active}`；已 `released` 视同不存在 → `404`。
+- **每条预览 host 各自签票**（#240：一个 FDE 开户即有 10 条 allocation，端口 `4000–4009`）：
+  ticket 与派生的预览 cookie 都**绑一条 allocation / 一个 host**——`preview_grants.allocation_id` 只指向
+  签票时那一条，`__Host-fde_preview` 是 host-only cookie（本节末），所以 `…-p-4000.…` 上拿到的凭证
+  **不会**让 `…-p-4001.…` 免凭证通过：10 个域名要逐个签票、逐个种 cookie，`forwardAuth` 第 1 步按
+  请求的 hostname 精确查 `port_allocations`（§2.7），换个 host 就查不到那张票。
+  反过来也成立：**给某条 allocation 签的票不会让它指向别的 host**（`url` 由该 allocation 自己的
+  `hostname` 生成，规格 §8-4 前端不得自行拼接）。
 - portal 生成随机 token，只存 `preview_grants`（`kind='ticket'`，`token_hash=sha256(ticket)`，**`issuer_id` = 当前登录用户（签发者）**、`user_id` = **主体（被授权访问的身份：普通 FDE 自签 = issuer = subject；admin 代签他人 private = subject 为 admin）**、`allocation_id`、`expires_at=now+60s`、`created_ip/created_ua`）。**不存 ticket 明文**（与 `login_sessions.token_hash` 同口径）。
 
 #### ticket 语义（`preview_grants.kind='ticket'`）
@@ -498,50 +505,40 @@ station-portal user enable  --login <login>
 
 分页列表（§1.3）。响应 `200`：`{ "items": [Project...], "next_cursor": null }`。
 
-### 3.3 `POST /api/projects`
+### 3.3 `POST /api/projects` —— 已退役（issue #242）
 
-请求：
+> **状态：`410 Gone`，`code='project_api_retired'`**（实现：`portal/src/http.js` 的 `routeApi`，
+> P5「去项目化」按 [`directory-as-project.md`](../design/directory-as-project.md) 定稿执行）。
+> 本节保留正文只作**退役说明与迁移指引**，不是可调用契约。
 
-```json
-{ "name": "proj1", "repo_url": "https://git.<BASE_DOMAIN>/client-x/proj1.git", "template": "node" }
-```
+**退役原因**：项目注册制要解决的三件事（会话归属、run cwd、脚手架）都已由**目录本身**承担——
+`projects` 表在应用层**没有任何写入口**（`projects.js` 的 `createProject/renameProject/deleteProject`
+已整体删除），`port_allocations.project_id` 也已被迁移 `0008-deprojectize.sql` DROP，
+「项目 → 端口」这层锚点随之消失。
 
-`repo_url` 可省略（或传空串，服务端按 `null` 落库）；`template` 也可省略（默认模板）。不填仓库时，项目就是容器内 `~/projects/<name>` 下的空工作目录，FDE 无需预先了解仓库概念。
+**替代做法（目录即项目）**：
 
-响应 `201`：Project 对象 + 本次分配的端口（**创建项目与分配项目级端口是同一事务**，规格 §7.2 第 3 步 / §8.2）：
+| 退役端点 | 现在的做法 |
+|---|---|
+| `POST /api/projects`（建项目 + 同事务分配项目级端口） | **不建项目**：`POST /api/sessions` 传 `project_id`（= 目录名，语义是 cwd），服务端按 `~/projects/<name>` 解析并 `mkdir` 目录；会话与 run 直接在该目录工作（D8 修订：隔离单元 = 项目目录）。**端口也不在这里分配**——预览域名已由平台在开户时预建 10 条（`scope='fde'`，端口 `4000–4009`，规格 §7.2 第 3 步 / §8.2），容器内从 `~/.erix/ports.json` 取 |
+| `GET /api/projects` | 仍然可调用，但属**留档只读**：只读 `projects` 表历史行，`deleted_at IS NULL` 过滤后**正常返回空 `items`**（新库/新用户本就无行）——这是预期行为，不是故障 |
+| `PATCH` / `DELETE /api/projects/:id` | 一并 `410`：改名/删除项目由 FDE 在容器内对目录自行处置（`git`/`mv`/`rm`），平台不再介入 |
+| `GET /api/projects/:id/ports` | `410`（§4.7）：FDE 级 `~/.erix/ports.json` 是唯一端口视图 |
 
-```json
-{
-  "project": { "id": "p_8h2k", "name": "proj1", "...": "..." },
-  "ports": [
-    {
-      "id": "pa_1",
-      "scope": "project",
-      "port": 4016,
-      "role": "frontend",
-      "run_id": null,
-      "hostname": "alice-p-proj1-4016.fde.erix.vip",
-      "url": "https://alice-p-proj1-4016.fde.erix.vip",
-      "exposure": "private",
-      "state": "allocated"
-    }
-  ]
-}
-```
-
-错误：
+错误响应：
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 400 | `validation_failed` | name 非法 / 提供了 repo_url 但其地址非法 |
-| 409 | `name_conflict` | 同名项目已存在 |
-| 409 | `port_quota_exceeded` | 用户端口总配额超限（规格 §8.2：**明确报错**而非静默漂移） |
+| 410 | `project_api_retired` | 调用任何项目**写**端点（`POST` / `PATCH` / `DELETE`），或项目维度端口列表端点 |
 
-> **边界（issue #52 方案 A）**：创建项目 = 建 DB 记录 + 分配端口 + 生成项目模板；`repo_url` 是可选登记元数据。**平台不负责 clone**——提供地址时仓库目录由 FDE 在容器内自行 `git clone`；git 凭据可由 FDE 配置或由 admin 凭据端点投放（user-space.md §4.1.1）。不提供地址时项目就是 `~/projects/<name>` 下的空工作目录，FDE 不需要知道仓库概念（等同他自己的开发机，规格 §7.2/§12.2）。
+> 原文（P5 之前）：请求 `{name, repo_url?, template?}` → `201` 返回 Project + 本次分配的 `ports[]`，
+> 错误含 `400 validation_failed` / `409 name_conflict` / `409 port_quota_exceeded`。
+> 其中 `port_quota_exceeded` 已随「固定预分配 10 条」的裁决删除（§1.2 / 规格 §8.2），
+> `name_conflict` 与 `validation_failed` 随整个写端点一起退役。
 
 ### 3.4 `GET /api/projects/:id`
 
-响应 `200`：`{ "project": {...}, "ports": [PortAllocation...] }`（ports 结构同 §4.7，示例见上文 §3.3）。
+响应 `200`：`{ "project": {...}, "ports": [] }`。**留档只读**：`port_allocations.project_id` 已被迁移 0008 DROP，项目维度端口不可推导 ⇒ `ports` 恒为空数组（`http.js` 的 F10 口径）；实时分配见 FDE 级 `~/.erix/ports.json`（规格 §8.2，退役说明见 §3.3）。
 
 ### 3.5 `PATCH /api/projects/:id`
 

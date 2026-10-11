@@ -281,6 +281,31 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 
 
+### 8.12 开户预分配 10 条 FDE 级预览域名（issue #240，2026-10-11）
+
+背景：`port_allocations` **从来没被产品代码写入过**（全仓 `INSERT` 0 命中），手工插行后 `routes.yml` 与容器内 `ports.json` 也一律不动，必须人工调
+`enqueueFullRebuild` + `runMaterializerOnce`。本轮按决策者裁决实现「开户即预分配」并消灭那个人工动作。
+
+- [x] **口径（决策者 2026-10-11）**：分配粒度 = **FDE 级**，固定 **10 条**（端口 `4000–4009`），`scope='fde'` / `role='spare'` / `state='allocated'` / `exposure='private'`；
+  所谓「分配」的实质是 **在 Traefik 侧预建预览路由与域名**，**FDE 容器自己监听什么端口平台不管、不校验、不 reconcile**（「严格管理」这条设想作废，改为告知 + 尽力）。
+  告知两处：容器内 `~/.erix/ports.json`（materializer）+ `runner/worker.js` 的 `SYSTEM_PROMPT`（materializer 还会在 FDE 家目录 `AGENTS.md` 里加一句）。
+- [x] **写入口** `portal/src/portalloc.js`：`ensureFdePreviewPorts`（调用方事务内）+ `provisionFdePreviewPorts`（自起事务）；`onboardFde` 在「网络与容器已落地之后、LLM 联动之前」调用（预览域名正确性不依赖 LiteLLM 可达）。
+  **写库与 route outbox / materialize revision 入队同一事务**，顺序固定：`BEGIN → 10×(INSERT → route_revisions → route_outbox) → materialize_revisions → materialize_outbox → COMMIT`（测试逐序 deepEqual）。
+- [x] ⚠ **幂等只能靠既有部分唯一索引 + 带谓词的 ON CONFLICT**：`ON CONFLICT (fde_id, port) WHERE state <> 'released' DO NOTHING`——**不写谓词真库直接报** `there is no unique or exclusion constraint matching the ON CONFLICT specification`（已在真库复现）。
+  该索引**不能**改成全表 `UNIQUE(fde_id,port)`：`released` 历史行要留档。`RETURNING id` 的行数即新写行数，0 行 ⇒ 完全不入队（不制造空转 revision）。
+- [x] **迁移 `0018-port-allocations-scope-fde.sql`** 只做一件事：`port_allocations_scope_check` 放开为 `('project','run','fde')`；`CHECK ((scope='run') = (run_id IS NOT NULL))` 保留；**不新建索引**；
+  建成 VALID 而非 `NOT VALID`（新集合是旧集合超集，存量必然仍满足）；`docs/data/schema.sql` **一个字节未改**（sha256 baseline 冻结，同 §8.7/§8.8）。
+- [x] **存量不迁移**：遗留 `scope='project'` 行（真机 eric 4000/4008、tetris 4000/**4100**，后者在窗口之外）不改不删不回填；`routes.js:382` 只看 `state <> 'released'` 与 hostname、不看 scope，所以遗留行继续有效。
+  `cli.js provision-fde --fde-name <name>` 重跑即补齐缺口（幂等，裁决第 7 条）。
+- [x] **新决策（主 agent 拍）**：FDE 名超预览域名预算（56）⇒ 开户以 `preview_hostname_invalid` **失败**（`validateFdeNameForHostname` 的第四道强制点），**不降级为 warn**——
+  「静默没有预览域名」正是本单要消灭的那类半截状态，且 0017 的 DB CHECK 反正会在事务中途炸掉（只是文案更烂）。`port_quota_exceeded` 已从文档删除（不再新造错误码）。
+- [x] **真机验收（主 agent 亲手，不依赖 worker 自报）**：新建 FDE `portsprobe` → 开户自动写 10 行 `scope=fde` → `routes.yml` **自动**出现 10 条 `Host(\`portsprobe-p-40XX…\`)` → 容器内 `ports.json` `generation=2` / 10 条带真实 url → 签票 302 与 `allocated→active` 自动升级；
+  eric 重跑 `provision-fde` 得到 `8/10 新写（2 条已存在）` → 第二次 `0/10`，`ports.json` 自动 `generation=3` / 10 条（8 `fde` + 2 遗留）。全量 **877/876/0/1**、runner **200/200**。
+- [ ] **已知缺口（未在本单补）**：**签票入口缺失**（`GET /api/ports` 已随 P5 退役、SPA 内无任何端口列表/预览按钮 ⇒ 人只能靠 curl 调 API 拿票）；票据仍是 **host 级**（10 个端口要点 10 次）；
+  `PORT_QUOTA` 已成死配置（文档已标注，摘除留后续 PR）；容器绑错端口（无人在听）时的可见性未量化。
+
+
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。

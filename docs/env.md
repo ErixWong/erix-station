@@ -323,7 +323,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `TRAEFIK_DYNAMIC_DIR_HOST` | compose 插值：Traefik 动态配置宿主目录（portal 写方与 Traefik 只读方共享；生产 `/docker/station-edge/dynamic/`，开发期默认 `./traefik/dynamic`） | 平台规范固定 + 开发期隔离 | `./traefik/dynamic` |
 | `PORTAL_BACKEND_URL` | portal 后端回环地址（reconciler 生成 portal service 与 forwardAuth 地址用） | 平台规范固定 + 目标环境探测（回环端口） | `http://127.0.0.1:8080`（开发期 `http://127.0.0.1:18080`，§0） |
 | `TRAEFIK_ENTRYPOINT` | reconciler 生成路由挂载的 Traefik entryPoint | 平台规范固定 | `web`（P1 开发 http；生产 `websecure`） |
-| `PORT_QUOTA` | 每用户项目 slot 配额（规格 §8.2：N 个项目 slot = N×8 端口上限） | 平台规范固定 | `40` |
+| `PORT_QUOTA` | **已无消费者**（#240，2026-10-11）：预览域名固定预分配 10 条 ⇒ 配额语义与 `port_quota_exceeded` 一并删除，规格 §8.2。`config.js` 仍解析该变量但全仓无人读取，**待后续 PR 连同 compose/env 项一起摘除** | 平台规范固定 | `40` |
 | `FDE_POOL` | IPAM 默认池选择 | 平台规范固定 | `default`（`large` = 大 FDE `/28` 段） |
 | `IPAM_RESERVED_SUBNETS` | IPAM 保留网段（逗号分隔；避开宿主既有网段，开发期可置空，因 FDE 池 10.200/10.201 与 backend 172.32 天然隔离） | 目标环境探测 | ``（空） |
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（user-space §6.1） | 平台规范固定 | `1000` / `1000` |
