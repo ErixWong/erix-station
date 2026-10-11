@@ -335,13 +335,13 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 立即停用账号/失效登录会话并停止活动 run
 → 停容器 + 吊销 runner token + 吊销 LLM 虚拟 key + 删除 Git 凭据与 CLI 配置
 → 吊销上游 Git 账号访问（minted 账号置 prohibit_login=true；per_fde_pat 用户自管凭据不触碰，GitLab 暂缓）
-→ 释放网络、端口与路由
+→ 释放网络、端口与路由（并撤销该 FDE 全部 allocation 上**仍 `active`** 的预览凭证：按 allocation id 无条件幂等撤，`used` 保留原状——#252，portal.md §2.8）
 → （仅当显式配置保留期时）记录 workspace 到期时间 —— 删除只发生在运维显式开启后的 workspace 目录
 ```
 
 八个幂等步骤（`portal/src/offboarding.js` 的 `STEPS`）：`disable-user` / `stop-container` / `revoke-runner-token` / `revoke-llm-key` / `delete-git-credential` / `revoke-git-account-access` / `release-network-routes` / `schedule-workspace-purge`。
 
-管理台 `DELETE /api/admin/users/:id` **任何情况下都不删除 `users` 行**：事务内立即设 `status='disabled'` + `disabled_at`、清 `login_sessions`/`login_pending`/`api_tokens`、撤销 `preview_grants`；有 FDE 资源或 workspace 存在的返回 `202` 并持久化 offboarding 队列，否则返回 `204`（同样只是停用）。worker 按步骤幂等执行，失败可由管理员重试，账号保持 disabled。
+管理台 `DELETE /api/admin/users/:id` **任何情况下都不删除 `users` 行**：事务内立即设 `status='disabled'` + `disabled_at`、清 `login_sessions`/`login_pending`/`api_tokens`、撤销 `preview_grants`（只撤 `state='active'`，`used` 保留原状，#252）；有 FDE 资源或 workspace 存在的返回 `202` 并持久化 offboarding 队列，否则返回 `204`（同样只是停用）。worker 按步骤幂等执行，失败可由管理员重试，账号保持 disabled。
 
 `ERIX_WORKSPACE_RETENTION_DAYS` 默认 **`0`（永不自动清理）**，此时 `workspace_purge_after` 恒为 `NULL`；显式正数才记录到期时间。到期 sweep 只处理 `fde_offboarding.state='done'` 的记录，先用真实路径守护删除 `/srv/erix/users/<fde_name>`，**不删除任何 DB 行**——用户、Git 绑定、offboarding 记录与审计全部保留。
 
@@ -430,7 +430,9 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
   全文件零 `UPDATE port_allocations`（**insert-only**），所以「改块」若直接复用它补一段，旧 10 条行仍活、
   继续占号、旧域名仍可访问（真机就会是 20 条活行）。因此 `moveFdePreviewBlock` 在**同一事务**里先按
   offboarding 的先例释放旧行（`state='released'` + `released_at=COALESCE(…, now())`）并撤销其
-  `preview_grants`（`state='revoked'` + `revoked_at=COALESCE(…, now())`，只动 `active/used`），再插新块；
+  `preview_grants`（`state='revoked'` + `revoked_at=COALESCE(…, now())`，**只动 `state='active'`**：
+  `used` 是历史事实、保留原状，把它塞进 `revoked` 会撞 baseline 的双向 CHECK `(state='used') = (used_at IS NOT NULL)`
+  即 #252 那个真机 500；撤权**无条件发**，撤 0 行也算成功。口径全文见 portal.md §2.8「撤 grant 的口径」），再插新块；
   固定顺序与“任一步失败 ⇒ 整笔回滚零残留”由 `portal/test/preview-ports.test.js` 逐序钉住（契约见 portal.md §4.7a）。
   `released` 行不占位 ⇒ **号码可回收**（搬出去再搬回同一块必须能成功）。
 - **抢号重算不等于整笔开户回滚**（#246 交付② 补交付① 的边界）：重试只覆盖「端口分配」这一小段——开户顺序是

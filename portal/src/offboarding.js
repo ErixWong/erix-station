@@ -211,8 +211,22 @@ async function revokeLlmKey(pool, row, gateway) {
   }
 }
 
+/**
+ * `release-network-routes` 一步：释放本 FDE 的端口/网络行 + 撤销预览凭证（issue #252 修正后口径）。
+ *
+ * 两条口径（都是真机踩出来的，别再改回去）：
+ *  1. **只撤 `state = 'active'`**。`used` 是历史事实（ticket 已消费 ⇒ `used_at` 非空），它本身不再授予
+ *     访问，派生出的 `session` 行才是活的东西、而 session 会在同一批里被撤。把 `used` 也塞进 `revoked`
+ *     会当场撞 baseline 的双向 CHECK `(state = 'used') = (used_at IS NOT NULL)`（`preview_grants_check3`，
+ *     真机即 `moveFdePreviewBlock` 的 500）；而「顺手 `used_at = NULL`」虽然过 CHECK，却是**篡改历史**。
+ *     同理 `expired` / `revoked` 也不再授予访问，不打扰（reaper 负责清）。
+ *  2. **撤权不许依赖「本次是否释放了行」**。重试路径上本 FDE 的 allocation 已是 `released`（上一次事务
+ *     里释放成功、撤权撞 CHECK 整笔回滚 ⇒ 步骤被记 `done`），守卫为假 ⇒ 撤权整段**静默跳过**，真机
+ *     因此留下 21 条 `active`/`used` 残渣。所以：id 集合取**本 FDE 的全部 allocation**（含早已 released 的），
+ *     撤权**无条件发**（撤 0 行本来就是成功），两个数分别打日志（见函数末尾），别合成一个条件。
+ */
 async function releaseNetworkRoutes(pool, row, config, docker, log) {
-  const changed = await withTransaction(pool, async (client) => {
+  const { releasedCount, revokedCount, changed } = await withTransaction(pool, async (client) => {
     const allocations = await client.query(
       `UPDATE port_allocations
           SET state = 'released', released_at = COALESCE(released_at, now())
@@ -220,13 +234,18 @@ async function releaseNetworkRoutes(pool, row, config, docker, log) {
         RETURNING id`,
       [row.fde_id],
     );
-    if (allocations.rows.length > 0) {
-      await client.query(
-        `UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
-          WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')`,
-        [allocations.rows.map((allocation) => allocation.id)],
-      );
-    }
+    // 撤权的 id 集合 = 本 FDE 的**全部** allocation（本次释放的 + 历史已 released 的），
+    // 否则残渣正好落在「本次没释放行 ⇒ 不撤权」这个守卫选不到的那一侧（#252 的静默丢失）。
+    const allocationsAll = await client.query(
+      `SELECT id FROM port_allocations WHERE fde_id = $1`,
+      [row.fde_id],
+    );
+    const revoked = await client.query(
+      `UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+        WHERE allocation_id = ANY($1::uuid[]) AND state = 'active'
+        RETURNING id`,
+      [allocationsAll.rows.map((allocation) => allocation.id)],
+    );
     const network = await client.query(
       `UPDATE fde_networks
           SET state = 'released', released_at = COALESCE(released_at, now())
@@ -242,10 +261,23 @@ async function releaseNetworkRoutes(pool, row, config, docker, log) {
         payload: { network_name: network.rows[0]?.network_name ?? row.network_name ?? `fde-${row.fde_name}` },
       });
       await enqueueMaterializeChange(client, { fdeId: row.fde_id, op: 'delete' });
-      return true;
+      return {
+        releasedCount: allocations.rows.length,
+        revokedCount: revoked.rows.length,
+        changed: true,
+      };
     }
-    return false;
+    return {
+      releasedCount: allocations.rows.length,
+      revokedCount: revoked.rows.length,
+      changed: false,
+    };
   });
+  // 两个数分开打：`released=0` 而 `revoked>0` 正是「重试补上了上次漏掉的撤权」的形状（#252 的残渣）。
+  log.info?.(
+    `[offboarding] fde=${row.fde_name} release-network-routes: 本次释放 allocation ${releasedCount} 条、`
+    + `撤预览 grant（仅 active）${revokedCount} 条`,
+  );
 
   const networkName = row.network_name || (row.fde_name ? `fde-${row.fde_name}` : null);
   if (networkName) {

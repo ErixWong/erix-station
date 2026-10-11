@@ -9,6 +9,10 @@ import {
   runOffboardingOnce,
   sweepOffboardedWorkspaces,
 } from '../src/offboarding.js';
+// #252 的回归保护：preview_grants 的 baseline CHECK（含双向的 `used ⇔ used_at`）在 fake 里的等价模拟
+// （与 portal/test/preview-ports.test.js 共用一份规则；旧 fake 只模拟 revoked ⇔ revoked_at，
+// 于是「把 used ticket 一并抓 revoked」在单测里结构上不可能红）。
+import { applyRevokeGrantsSql, seedPreviewGrant } from './preview-grant-checks.js';
 
 const FDE_ID = 'b0000000-0000-4000-8000-000000000002';
 const FDE_NAME = 'alice';
@@ -20,6 +24,8 @@ class OffboardingPool {
     purgeAfter = null,
     llmBinding = null,
     gitAccount = null,
+    allocations = [],
+    grants = [],
   } = {}) {
     this.job = {
       fde_id: FDE_ID,
@@ -39,6 +45,42 @@ class OffboardingPool {
     this.gitAccount = gitAccount;
     this.queryLog = [];
     this.auditRows = [];
+    // #252 的靶面：本 FDE 的端口与预览凭证。**默认两张空表** ⇒ 不传这两个参数的既有用例行为一字不变。
+    // 种子自己先过 port_allocations 的双向 CHECK（released ⇔ released_at）：「released 但 released_at 为空」
+    // 这种种子测的是真库不存在的状态。
+    this.allocations = allocations.map((row, index) => {
+      const seed = { fde_id: FDE_ID, state: 'allocated', released_at: null, id: `pa-${index + 1}`, ...row };
+      assert.equal((seed.state === 'released') === (seed.released_at != null), true,
+        `offboarding fake 种子的 port_allocations 行违反 CHECK ((state='released') = (released_at IS NOT NULL))：${JSON.stringify(seed)}`);
+      return seed;
+    });
+    this.grants = grants.map((grant, index) => seedPreviewGrant(
+      { id: `pg-${index + 1}`, ...grant },
+      { subject: FDE_ID, issuer: FDE_ID },
+    ));
+    this.snapshot = null;
+    this.routeRev = 0;
+    this.matRev = 0;
+    this.outbox = { route: [], materialize: [] };   // 派生链留档（断言「空转不重复入队」）
+  }
+
+  cloneTables() {
+    return {
+      allocations: JSON.parse(JSON.stringify(this.allocations)),
+      grants: JSON.parse(JSON.stringify(this.grants)),
+    };
+  }
+
+  /** 拿某张 preview_grants 行（测试断言用）。 */
+  grant(id) {
+    const found = this.grants.find((grant) => grant.id === id);
+    if (!found) assert.fail(`offboarding fake：没有 preview_grants 行 ${id}`);
+    return found;
+  }
+
+  /** 某条 SQL 在整次运行里出现了几次（幂等/无条件发的断言用）。 */
+  countQuery(matcher) {
+    return this.queryLog.filter(({ sql }) => (typeof matcher === 'string' ? sql.includes(matcher) : matcher.test(sql))).length;
   }
 
   async connect() {
@@ -51,7 +93,21 @@ class OffboardingPool {
     if (/^DELETE FROM (?:users|fde_git_accounts|fde_offboarding)\b/.test(normalized)) {
       assert.fail(`offboarding must retain database records: ${normalized}`);
     }
-    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(normalized) || normalized.startsWith('SELECT pg_advisory')) {
+    // 真事务快照（#252：“撤权挂在「本次释放了行」上”与“整笔回滚”都要能真的演出来）。
+    if (normalized === 'BEGIN') {
+      this.snapshot = this.cloneTables();
+      return { rows: [] };
+    }
+    if (normalized === 'COMMIT') {
+      this.snapshot = null;
+      return { rows: [] };
+    }
+    if (normalized === 'ROLLBACK') {
+      if (this.snapshot) Object.assign(this, this.snapshot);
+      this.snapshot = null;
+      return { rows: [] };
+    }
+    if (normalized.startsWith('SELECT pg_advisory')) {
       return { rows: [] };
     }
     if (normalized.includes('FROM fde_offboarding o') && normalized.includes("o.state = 'pending'")) {
@@ -133,10 +189,48 @@ class OffboardingPool {
       }
       return { rowCount: this.llmBinding ? 1 : 0, rows: [] };
     }
+    // 两条派生链（本次真释放了行才会入队）：返真 revision，并留档供测试断言「重试空转不重复入队」。
+    // （`bumpMaterializeRevision` 读 `rows[0].revision`，这里回空行会把 offboarding 当场炸掉。）
     if (normalized.startsWith('INSERT INTO route_revisions')) {
-      return { rows: [{ revision: 1 }] };
+      this.routeRev = (this.routeRev ?? 0) + 1;
+      this.outbox.route.push({ aggregate: params[0], aggregateId: params[1], revision: this.routeRev });
+      return { rows: [{ revision: this.routeRev }] };
     }
-    if (normalized.startsWith('UPDATE port_allocations')) return { rows: [] };
+    if (normalized.startsWith('INSERT INTO route_outbox')) {
+      const last = this.outbox.route.at(-1);
+      if (last) { last.op = params[2]; last.payload = JSON.parse(params[4]); }
+      return { rows: [] };
+    }
+    if (normalized.startsWith('INSERT INTO materialize_revisions')) {
+      this.matRev = (this.matRev ?? 0) + 1;
+      this.outbox.materialize.push({ fdeId: params[0], revision: this.matRev });
+      return { rows: [{ revision: this.matRev }] };
+    }
+    if (normalized.startsWith('INSERT INTO materialize_outbox')) {
+      const last = this.outbox.materialize.at(-1);
+      if (last) { last.op = params[1]; last.payload = JSON.parse(params[3]); }
+      return { rows: [] };
+    }
+    if (normalized.startsWith('UPDATE port_allocations') && normalized.includes("SET state = 'released'")) {
+      // 真发 RETURNING id（幂等与“本次释放了几条”的判据都靠它）。
+      const rows = this.allocations
+        .filter((allocation) => allocation.fde_id === params[0] && allocation.state !== 'released')
+        .map((allocation) => {
+          allocation.state = 'released';
+          allocation.released_at = allocation.released_at ?? new Date().toISOString();
+          return { id: allocation.id };
+        });
+      return { rows, rowCount: rows.length };
+    }
+    if (normalized.startsWith('SELECT id FROM port_allocations WHERE fde_id')) {
+      // 撤权的 id 集合 = 本 FDE 的**全部** allocation（含早已 released 的）——#252 重试路径的机关。
+      return { rows: this.allocations.filter((allocation) => allocation.fde_id === params[0]).map((allocation) => ({ id: allocation.id })) };
+    }
+    if (normalized.startsWith('UPDATE preview_grants')) {
+      // 谓词由 SQL 决定（fake 不另写一套）；命中的每一行都要过 baseline CHECK，任何一条违反
+      // ⇒ **整条语句**抛 23514、零行改动（PG 的语句级原子性）。
+      return applyRevokeGrantsSql({ sql: normalized, grants: this.grants, allocationIds: params[0] });
+    }
     if (normalized.startsWith('UPDATE fde_networks')) return { rows: [] };
     if (normalized.startsWith('SELECT state, steps, last_error, workspace_purge_after FROM fde_offboarding')) {
       return this.job ? {
@@ -516,4 +610,176 @@ test('workspace sweep rejects a symlink escape and retains the DB job for retry'
   assert.equal(pool.user.status, 'disabled');
   assert.ok(pool.job.last_error);
   assert.equal(warnings.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// #252（工单 fix-261011-B）：撤预览 grant 只撤 `active`，且**不许挂在「本次释放了行」上**。
+// 真机形状：PR #251 验收时 `state IN ('active','used')` 撞 `preview_grants_check3` ⇒ 整笔事务回滚，
+// 但步骤被记 `done`、`last_error` 为空；此后重试时本 FDE 已无活行 ⇒ 撤权整段被守卫跳过，
+// 已释放 allocation 上永远留着 `session|active` / `ticket|used` 残渣（实测 21 条）。
+// ---------------------------------------------------------------------------
+
+/** 只留 `release-network-routes` 待跑（= 上一次尝试失败后的重试形状）。 */
+function stepsPendingOnlyRelease() {
+  const steps = initialOffboardingSteps();
+  for (const [name, value] of Object.entries(steps)) {
+    if (name !== 'release-network-routes') steps[name] = { ...value, state: 'done' };
+  }
+  return steps;
+}
+
+function offboardingOptions(t, infos = []) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-offboarding-grants-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return {
+    config: { userSpaceRoot: root, workspaceRetentionDays: 0, dockerHost: 'unused' },
+    options: {
+      docker: fakeDocker(),
+      lockFde: async (_pool, _name, work) => work(),
+      log: { warn() {}, info: (message) => infos.push(message) },
+    },
+  };
+}
+
+test('#252① offboarding 只撤 active：used ticket 原样保留（used_at 不动）、同批 active session 被撤、步骤全 done', async (t) => {
+  const usedAt = new Date('2026-10-10T09:00:00Z').toISOString();
+  const pool = new OffboardingPool({
+    allocations: [
+      { fde_id: FDE_ID, state: 'allocated' },
+      { fde_id: FDE_ID, state: 'allocated' },
+    ],
+    grants: [
+      { id: 'pg-1', allocation_id: 'pa-1', state: 'used', used_at: usedAt },            // ticket|used（真机 45 条那一类）
+      { id: 'pg-2', allocation_id: 'pa-1', kind: 'session', state: 'active', parent_ticket_id: 'pg-1' },
+      { id: 'pg-3', allocation_id: 'pa-2', state: 'active' },
+      { id: 'pg-4', allocation_id: 'pa-2', state: 'expired' },                          // 已过期 ⇒ 不打扰
+      { id: 'pg-5', allocation_id: 'pa-2', state: 'revoked', revoked_at: new Date('2026-10-01T00:00:00Z').toISOString() },
+    ],
+  });
+  const infos = [];
+  const { config, options } = offboardingOptions(t, infos);
+
+  const result = await runOffboardingOnce(pool, config, options);
+
+  assert.equal(result.state, 'done', '撞 CHECK 的 500 修掉后本步必须正常收尾');
+  assert.equal(pool.job.steps['release-network-routes'].state, 'done');
+  assert.equal(pool.job.last_error, null);
+  assert.deepEqual(pool.allocations.map((a) => a.state), ['released', 'released']);
+  assert.ok(pool.allocations.every((a) => a.released_at), 'released ⇔ released_at（baseline CHECK）');
+  for (const id of ['pg-2', 'pg-3']) {
+    assert.equal(pool.grant(id).state, 'revoked', `${id}（active）必须被撤`);
+    assert.ok(pool.grant(id).revoked_at, 'revoked ⇔ revoked_at（baseline CHECK）');
+  }
+  assert.equal(pool.grant('pg-1').state, 'used', '#252：used 是历史事实，不撤（撤了必撞 preview_grants_check3）');
+  assert.equal(pool.grant('pg-1').used_at, usedAt, 'used_at 不得被清成 NULL（那是篡改历史）');
+  assert.equal(pool.grant('pg-1').revoked_at, null, 'used ticket 压根没被碰');
+  assert.equal(pool.grant('pg-4').state, 'expired', 'expired 已不授予访问 ⇒ 由 reaper 清，不打扰');
+  assert.equal(pool.grant('pg-5').revoked_at.startsWith('2026-10-01'), true, 'COALESCE 不覆盖既有 revoked_at');
+  // 两个数分开打（工单第 2 条）：本次释放 2 条、撤权命中 2 条。
+  assert.equal(infos.filter((m) => m.includes('release-network-routes')).length, 1);
+  assert.match(infos.find((m) => m.includes('release-network-routes')), /释放 allocation 2 条、撤预览 grant（仅 active）2 条/);
+});
+
+test('#252③ 重试路径（真机残渣的最小复现）：allocation 已 released、grant 仍 active ⇒ 再跑一次必须把它撤掉', async (t) => {
+  const usedAt = new Date('2026-10-10T09:00:00Z').toISOString();
+  const pool = new OffboardingPool({
+    steps: stepsPendingOnlyRelease(),          // 上一次尝试：本步没做完，其余 done
+    allocations: [{ fde_id: FDE_ID, state: 'released', released_at: '2026-10-10T09:05:00.000Z' }],
+    grants: [
+      { id: 'pg-1', allocation_id: 'pa-1', state: 'used', used_at: usedAt },
+      { id: 'pg-2', allocation_id: 'pa-1', kind: 'session', state: 'active', parent_ticket_id: 'pg-1' },
+    ],
+  });
+  const infos = [];
+  const { config, options } = offboardingOptions(t, infos);
+
+  const result = await runOffboardingOnce(pool, config, options);
+
+  assert.equal(result.state, 'done');
+  assert.equal(pool.grant('pg-2').state, 'revoked',
+    '#252 的核心：本次一条行都没释放（上次已释放），旧写法在这里会**静默跳过**撤权');
+  assert.ok(pool.grant('pg-2').revoked_at);
+  assert.equal(pool.grant('pg-1').state, 'used', 'used 仍原样保留');
+  assert.equal(pool.countQuery('UPDATE preview_grants'), 1, '撤权语句必须照发（无条件、幂等）');
+  assert.equal(pool.countQuery('SELECT id FROM port_allocations WHERE fde_id'), 1, 'id 集合取本 FDE 全部 allocation（含已 released 的）');
+  assert.match(
+    infos.find((m) => m.includes('release-network-routes')),
+    /释放 allocation 0 条、撤预览 grant（仅 active）1 条/,
+    'released=0 而 revoked>0 正是「重试补上了上次漏掉的撤权」的形状',
+  );
+  assert.deepEqual(pool.outbox.route, [], '什么都没释放 ⇒ 不重复入队派生链（撤权与入队是两件事）');
+});
+
+test('#252④ 撤 0 行（这个 FDE 一张 grant 都没有）⇒ 撤权照发、正常返回、不报错', async (t) => {
+  const pool = new OffboardingPool({ allocations: [{ fde_id: FDE_ID, state: 'allocated' }] });
+  const infos = [];
+  const { config, options } = offboardingOptions(t, infos);
+
+  const result = await runOffboardingOnce(pool, config, options);
+
+  assert.equal(result.state, 'done');
+  assert.equal(pool.countQuery('UPDATE preview_grants'), 1, '撤 0 行也是成功：语句照发，不靠条件跳过');
+  assert.match(infos.find((m) => m.includes('release-network-routes')), /撤预览 grant（仅 active）0 条/);
+  assert.deepEqual(pool.grants, []);
+});
+
+test('#252⑤ offboarding 侧的 fake 也拦得住：旧谓词（把 used 一起撤）⇒ 语句级抛 23514 preview_grants_check3', async () => {
+  const usedAt = new Date('2026-10-10T09:00:00Z').toISOString();
+  const pool = new OffboardingPool({
+    allocations: [{ fde_id: FDE_ID, state: 'released', released_at: '2026-10-10T09:05:00.000Z' }],
+    grants: [
+      { id: 'pg-1', allocation_id: 'pa-1', state: 'used', used_at: usedAt },
+      { id: 'pg-2', allocation_id: 'pa-1', kind: 'session', state: 'active', parent_ticket_id: 'pg-1' },
+    ],
+  });
+  // #252 之前的实现写法（工单第 3 件事要求它「在单测里就红」）。
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+        WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')`,
+      [['pa-1']],
+    ),
+    (err) => {
+      assert.equal(err.code, '23514');
+      assert.match(err.message, /new row for relation "preview_grants" violates check constraint "preview_grants_check3"/);
+      return true;
+    },
+  );
+  assert.equal(pool.grant('pg-1').state, 'used', '语句级失败 ⇒ 一行都没改');
+  assert.equal(pool.grant('pg-2').state, 'active', '同语句里合法的那条也不许落盘');
+  assert.equal(pool.grant('pg-2').revoked_at, null);
+
+  // 新写法在真库形状（used 行就在那儿）下必须正常通过——fake 不是「凡 UPDATE 都抛」。
+  const out = await pool.query(
+    `UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+      WHERE allocation_id = ANY($1::uuid[]) AND state = 'active'
+      RETURNING id`,
+    [['pa-1']],
+  );
+  assert.deepEqual(out.rows, [{ id: 'pg-2' }]);
+  assert.equal(pool.grant('pg-2').state, 'revoked');
+  assert.equal(pool.grant('pg-1').state, 'used');
+});
+
+test('#252⑥ 整笔回滚不留下半成品：撤权撞 CHECK ⇒ ROLLBACK 后 allocation 仍活、grant 一字未改', async () => {
+  const usedAt = new Date('2026-10-10T09:00:00Z').toISOString();
+  const pool = new OffboardingPool({
+    allocations: [{ fde_id: FDE_ID, state: 'allocated' }],
+    grants: [{ id: 'pg-1', allocation_id: 'pa-1', state: 'used', used_at: usedAt }],
+  });
+  const before = pool.cloneTables();
+  await pool.query('BEGIN');
+  await pool.query(
+    `UPDATE port_allocations SET state = 'released', released_at = COALESCE(released_at, now())
+      WHERE fde_id = $1 AND state <> 'released' RETURNING id`,
+    [FDE_ID],
+  );
+  assert.equal(pool.allocations[0].state, 'released', '事务内看得见');
+  await assert.rejects(() => pool.query(
+    `UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+      WHERE allocation_id = ANY($1::uuid[]) AND state IN ('active', 'used')`,
+    [['pa-1']],
+  ), (err) => err.code === '23514');
+  await pool.query('ROLLBACK');
+  assert.deepEqual(pool.cloneTables(), before, '回滚 = 整笔还原（真机就是这个形状：500 之后旧行仍活）');
 });
