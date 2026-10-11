@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
+import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
 import { useAdminStore, type AdminUser, type LlmModel, type LlmProvider } from '../stores/admin';
 import { useAuthStore } from '../stores/auth';
 
@@ -24,7 +25,7 @@ const userForm = reactive({
 
 const editUserId = ref<string | null>(null);
 const editModalOpen = ref(false);
-type EditTab = 'profile' | 'security' | 'llm' | 'danger';
+type EditTab = 'profile' | 'security' | 'llm' | 'ports' | 'danger';
 const editTab = ref<EditTab>('profile');
 const deleteUserId = ref<string | null>(null);
 const returnToEditAfterDelete = ref(false);
@@ -289,6 +290,7 @@ function openEditModal(user: AdminUser) {
   clearFeedback(user.id);
   editUserId.value = user.id;
   editTab.value = 'profile';
+  portsPaneMounted.value = false;
   editModalOpen.value = true;
   editForm.display_name = user.display_name ?? '';
   editForm.role = user.role;
@@ -301,6 +303,15 @@ function closeEditModal() {
   editModalOpen.value = false;
   editUserId.value = null;
   editTab.value = 'profile';
+  portsPaneMounted.value = false;
+}
+
+// 预览端口 tab 懒挂载：打开该 tab 才拉 GET /api/admin/fdes/:fde/ports（读他人资源在服务端要落
+// 一行审计 admin.fde_ports_listed ⇒ 没看一眼就发请求是审计噪声），开过一次就保留挂载与已填的起点。
+const portsPaneMounted = ref(false);
+function openPortsTab() {
+  editTab.value = 'ports';
+  portsPaneMounted.value = true;
 }
 
 function openDeleteModal(user: AdminUser) {
@@ -962,6 +973,17 @@ onBeforeUnmount(() => {
         @click="editTab = 'llm'"
       >{{ t('admin.fde.editTabLlm') }}</button>
       <button
+        id="edit-tab-ports"
+        type="button"
+        role="tab"
+        data-test="edit-tab-ports"
+        :aria-selected="editTab === 'ports'"
+        aria-controls="edit-panel-ports"
+        :class="editTab === 'ports' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="openPortsTab"
+      >{{ t('admin.fde.editTabPorts') }}</button>
+      <button
         id="edit-tab-danger"
         type="button"
         role="tab"
@@ -1119,6 +1141,26 @@ onBeforeUnmount(() => {
             :user="editUser"
             :providers="admin.providers"
             :git-hosts="admin.gitHosts"
+          />
+        </div>
+      </section>
+
+      <section
+        id="edit-panel-ports"
+        v-show="editTab === 'ports'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-ports"
+        aria-labelledby="edit-tab-ports"
+      >
+        <h3 class="mb-2 font-semibold">{{ t('previewPorts.title') }}</h3>
+        <div class="rounded-lg border border-black/10 p-3">
+          <!-- #246 交付② 单 B：预览端口 + 管理员改块（搬迁）。列表与改块都只在这一 tab 打开后才拉。 -->
+          <p v-if="!editUser.fde_name" class="muted">{{ t('previewPorts.noFdeName') }}</p>
+          <FdePreviewPortsPane
+            v-else-if="portsPaneMounted"
+            :key="`${editUser.id}:${editUser.fde_name}`"
+            :fde-name="editUser.fde_name"
           />
         </div>
       </section>
