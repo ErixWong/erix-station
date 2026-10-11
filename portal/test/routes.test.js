@@ -56,7 +56,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '      forwardAuth:',
     '        address: "http://127.0.0.1:18080/api/forward-auth"',
     '        trustForwardHeader: false',
-    '        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie]',
+    '        authRequestHeaders: [X-Forwarded-Host, X-Forwarded-Uri, X-Forwarded-Method, X-Forwarded-Proto, Cookie, Origin, Access-Control-Request-Method]',
     '        authResponseHeaders: [X-Auth-User]',
     '    strip-cookie:',
     '      headers:',
@@ -79,6 +79,32 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
   // internal 挂 internal-allow 中间件（ipAllowList），无 forwardAuth
   assert.ok(text.includes('middlewares: [internal-allow]'));
   assert.ok(!/    internal:\n(?:.*\n)*?forwardAuth:/.test(text));
+});
+
+// #241（方案 B）：预检免鉴权与 deny 回显 ACAO 都发生在 portal，但两个依赖头必须先被
+// Traefik 放进 auth 子请求——authRequestHeaders 是**白名单**（未列出的头全丢），所以它属于
+// 路由生成器的契约面，必须在这里钉住（否则 portal 侧代码会默默失效）。
+test('#241 forwardAuth.authRequestHeaders 白名单含 Origin 与 Access-Control-Request-Method，且中间件链不变', () => {
+  const text = generateTraefikConfig({
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [{ id: 'pa1', hostname: 'alice-p-4016.fde.erix.vip', port: 4016, backendUrl: 'http://10.200.1.2:4016' }],
+    sourceRanges: ['10.200.1.0/29'],
+  });
+  const m = text.match(/^\s+authRequestHeaders: \[(.+)\]$/m);
+  assert.ok(m, 'authRequestHeaders 必须存在');
+  const list = m[1].split(',').map((s) => s.trim());
+  for (const h of [
+    'X-Forwarded-Host', 'X-Forwarded-Uri', 'X-Forwarded-Method', 'X-Forwarded-Proto', 'Cookie',
+    'Origin', 'Access-Control-Request-Method',
+  ]) {
+    assert.ok(list.includes(h), `auth 子请求头白名单缺 ${h}`);
+  }
+  // 中间件链**未变**：fde router 仍是 [fde-auth, strip-cookie]，边缘不加 cors/headers 中间件
+  //（上游应用已自带 ACAO，再叠一层会变成「multiple values」而打断本已正常的带凭据请求）。
+  assert.match(text, /middlewares: \[fde-auth, strip-cookie\]/);
+  assert.ok(!/\bcors:/.test(text), '未在边缘引入 Traefik cors 中间件（方案 B）');
 });
 
 test('internal router：额外域名与 IPv4 Host 只扩展 internal 规则并明确分组', () => {

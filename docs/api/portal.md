@@ -294,6 +294,7 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | `X-Forwarded-Host` | 形如 `<fde>-p-<port4>.<BASE_DOMAIN>`（伞域口径，#57；示例：`eric-p-8001.fde.erix.vip`，dev 带端口后缀 `:8090`）；Traefik 以真实 `Host` 覆盖。portal 查表前**剥端口 + 小写**（唯一实现 `preview.normalizeHostHeader`），302 `Location` 仍保留原始 Host（含端口） |
 | `X-Forwarded-Uri` / `X-Forwarded-Method` | 从 `X-Forwarded-Uri` 解析 `preview_ticket` 查询参数；方法用于审计 |
 | `Cookie` | 只看 `__Host-fde_preview`（本 host 的预览 cookie） |
+| `Origin` / `Access-Control-Request-Method` | CORS 用（#241）：前者是 deny 响应回显 `Access-Control-Allow-Origin` 的唯一来源，后者是识别预检的唯一依据。⚠ 两者必须在 Traefik `forwardAuth.authRequestHeaders` **白名单**内（该白名单外的头一律不进 auth 子请求）；白名单由路由生成器 `portal/src/routes.js` 产出，不得手改生成产物 `deploy/traefik/dynamic/routes.yml` |
 
 授权逻辑（顺序，任一失败即短路）：
 
@@ -327,9 +328,13 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | `403` | 无凭证（`preview_ticket_required`）· 已认证但无权（exposure 越权，`forbidden`）/ 端口已释放（`allocation_released`）/ ticket 真·重放（已消费且无活跃派生 session，`preview_ticket_used`）· 已撤销（`preview_ticket_revoked`）· 不匹配（`preview_ticket_mismatch`）/ 用户已禁用 |
 | `404` | hostname 无对应 allocation |
 
+**CORS 预检免凭证（#241）**：`OPTIONS` **且**带非空 `Access-Control-Request-Method`（Fetch 规范定义的预检，按规范**不携带任何凭据**）→ 跳过第 3/4/5 步的凭证与 exposure 判定，直接当放行处理（`200` + `X-Auth-User`，审计 `details.grant_kind='preflight'`）； Traefik 于是把预检转发给上游 dev server，由应用自己回 `Access-Control-Allow-*`（平台不代答、也不在边缘叠加 CORS 中间件——上游已自带 `Access-Control-Allow-Origin`，再叠一层会变成浏览器拒收的「multiple values」）。边界（fail-closed 不扩大）：第 1/2 步照旧（未知 host 仍 `404`、已释放仍 `403 allocation_released`）；不带 `Access-Control-Request-Method` 的裸 `OPTIONS` 仍 `403 preview_ticket_required`；预检无主体，故**不**触发 `allocated→active` 升级（升级语义仍是「首次凭证放行」，紧随其后的真身请求照常触发）。
+
+**deny 响应必须带 CORS 头（#241）**：deny 分支（上表 401/403/404）在**保留原状态码与 §1.1 错误信封**的前提下额外带 `Access-Control-Allow-Origin: <回显请求 Origin>` + `Access-Control-Allow-Credentials: true` + `Vary: Origin`。不带时浏览器只报 `No 'Access-Control-Allow-Origin' header is present`，把「需要预览票据」伪装成「应用 CORS 配错」。口径：带凭据故**回显而非 `*`**；只接受 `scheme://host[:port]`（含 IPv6 字面量）或字面量 `null`，非法/多值/含 CR-LF 的 `Origin` 一律不回显（防响应头注入）；无 `Origin` 则不造 CORS 头（curl 等非浏览器调用响应体字节不变）。本回显在 portal 完成（实测 Traefik v3.7.13 会把 auth 子响应的状态码/响应体/响应头透给客户端）。
+
 失败响应体统一用 §1.1 错误信封（`code` 见上各分支；Traefik 对 401 触发登录跳转、对 4xx/5xx 原样回传，`X-Auth-User` 缺失即不放行）。
 
-每次判定（无论通过与否、无论 ticket/session/public）写 `audit_log`（`action='auth.forward_auth'`，`actor_id` = 凭证**主体** `user_id`（`public`/无凭证时 `NULL`），`target` = hostname，`details` = {uri, method, exposure, result, grant_kind, subject_id, issuer_id}）——「谁在什么时候看了哪个端口」（原理二）。**`details` 不得记录 ticket / cookie 明文**（只记 `grant_id` 与 token 哈希前 8 位）。**forwardAuth 故障（portal 5xx / 连接失败 / 超时）→ Traefik 侧 deny-all**（默认拒绝，绝不放行；可叠加 basic-auth 兜底，规格 §6.2 / topology.md §5.2）。
+每次判定（无论通过与否、无论 ticket/session/public/预检）写 `audit_log`（`action='auth.forward_auth'`，`actor_id` = 凭证**主体** `user_id`（`public`/无凭证/预检时 `NULL`），`target` = hostname，`details` = {uri, method, exposure, result, grant_kind, subject_id, issuer_id}；`grant_kind` ∈ `ticket`/`session`/`public`/`preflight`（#241））——「谁在什么时候看了哪个端口」（原理二）。**`details` 不得记录 ticket / cookie 明文**（只记 `grant_id` 与 token 哈希前 8 位）。**forwardAuth 故障（portal 5xx / 连接失败 / 超时）→ Traefik 侧 deny-all**（默认拒绝，绝不放行；可叠加 basic-auth 兜底，规格 §6.2 / topology.md §5.2）。
 
 ### 2.8 `POST /api/ports/:id/preview-ticket` + 预览 ticket / 预览 cookie 语义
 
