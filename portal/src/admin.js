@@ -452,10 +452,13 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
       await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM api_tokens WHERE user_id = $1`, [userId]);
+      // 撤预览 grant 的口径与 offboarding / 改块**完全一致**（#252）：只撤 `state = 'active'`。
+      // 旧写法把 `used` 一起抓并顺手 `used_at = NULL`：能过双向 CHECK，但抹掉了「这张票何时被消费」
+      // 的审计事实（篡改历史）；而 used 本身早已不授予访问（forwardAuth 只认 active），抓它没有收益。
       await client.query(
         `UPDATE preview_grants
-            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now()), used_at = NULL
-          WHERE state IN ('active', 'used')
+            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+          WHERE state = 'active'
             AND (user_id = $1 OR issuer_id = $1
               OR allocation_id IN (SELECT id FROM port_allocations WHERE fde_id = $1))`,
         [userId],
@@ -468,10 +471,11 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
       await client.query(`DELETE FROM login_sessions WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM login_pending WHERE user_id = $1`, [userId]);
       await client.query(`DELETE FROM api_tokens WHERE user_id = $1`, [userId]);
+      // 同上：只撤 active，不动 used（#252 口径）。
       await client.query(
         `UPDATE preview_grants
-            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now()), used_at = NULL
-          WHERE state IN ('active', 'used') AND (user_id = $1 OR issuer_id = $1)`,
+            SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+          WHERE state = 'active' AND (user_id = $1 OR issuer_id = $1)`,
         [userId],
       );
     }
