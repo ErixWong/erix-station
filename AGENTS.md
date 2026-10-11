@@ -358,6 +358,18 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - [ ] **单 B（纯 UI）待做**：工作台列自己的段/域名/状态 + 每行「打开预览」（拿 `id` 调既有签票）；管理台列任意 FDE + 改块入口。⚠ **UI 必须在改块前给一次确认**——改块会让 FDE 手里的旧预览链接立即 404（已记在 #246）。UI 侧不需要新增后端。
 - [ ] 未做（划界）：**#247**（FDE 级授予；因 `preview_grants.token_hash UNIQUE` + `allocation_id NOT NULL` 而定性为 **DDL 级**，已延期）、**#250**（改 exposure，已裁决不交付）。
 
+### 8.15 v0.1.3 发布与按 digest 部署 + 单 B 真机验收 + 第二轮平台演练（2026-10-12 夜班）
+
+经手：单 B（PR #254，纯前端）、版本 `0.1.3`、tag `v0.1.3`、GHCR 三镜像、按 digest 部署、新建 FDE `todo`、真机 e2e。详见 `docs/ops/drill-2026-10-12.md`。
+
+- [x] **单 B（#246 交付② 预览端口 UI）已合并**：`main@4ec2e28`。**前端基线从 23 文件/329 变为 29 文件/391**（`docs/ops/ci-release.md` §1 步骤 ④ 已同步；**后端基线 920/919 不变**，因 `portal/src/**` 零字节）。主 agent 亲验：红线全净、6 个 spec 全是新增、**自己做的变异测试**（`requestMove()` 改成跳过确认直接搬迁 ⇒ `AdminPreviewPorts.spec.ts` 2 红）。
+- [x] **发布与部署口径跑通（第一次真的拿发布物部署）**：三份 `package.json`+lockfile → `0.1.3`（每份 lockfile 恰好 2 行）→ `release.yml` 绿 → **`images-digest.json` 的 `imageId` 与部署机 `docker image inspect .Id` 三镜像全一致，`RepoDigests` 与清单 `digest` 一致** → `.env` 改形态① pin → `up -d --no-build`。⚠ **tag push 触发的 run 的 `event` 是 `push` 不是 `tag`**（按 `event=tag` 查会查不到）。⚠ `docker manifest inspect` 偶发失败（重试即可），**权威交叉核对走 `docker pull` + `image inspect`**。
+- [x] **新建 FDE `todo` 落在新 FDE 镜像上**：开户 25 秒 done；容器 image ID == 清单 fde `imageId`（旧容器 `fde-eric`/`fde-tetris` 仍在旧镜像，`ensureFdeContainer` 不自动重建）；自动分到下一段 **22020–22029**；`ports.json` `generation=2`；LLM binding active。⚠ 建用户两个必给字段：**`email` 必填且要合法**、`git_host_id` 必须是存在的 UUID。
+- [x] **单 B 真机验收全过（浏览器，不是 curl）**：折叠条 `Preview ports (10)`；10 行升序；`state` 文案无「healthy/running」且带口径行；点「Open preview」→ 新标签干净地址 + **502 Bad Gateway**（无应用监听，不是 403）；Retry 后该行变 `Admitted once`；管理台第 5 个 tab **懒挂载（恰好 1 次 GET，审计恰好 1 行）**；填 22000 点改块 → **确认前 `POST /ports/block` 请求数为 0**，确认条三要素齐全；409 **全文可见**（点名十个被占端口），失败零残留、不写改块审计。
+- [x] **e2e（平台自己的 agent 写前后端分离 to-do）**：建项目 = `POST /api/sessions {cwd}`（服务端 mkdir）。四轮 run（`a08b5ab1` 18 轮 ↑504,200/↓28,326 / `7a54dfe9` 常驻 / `50ab7928` allowedHosts / `c8b24c02` CORS）。**告知面有效**：它自己读 `ports.json` 选了 22020/22021 并在 README 注明出处，没发明端口号。真机结论：多用户隔离（B 看到 `共 0 项`）、刷新持久、SQLite 直读归属正确、`password_hash` 非明文；vision 看图确认 Bootstrap 真生效。**#243 的 DSML 文本化本轮没复现**（终局是正常自然语言报告）——一个正面数据点，不是结案。
+- [x] **本轮定性：预览域名下跑通一个普通前后端分离应用需要 6 条，其中 3 条未告知**（③ dev server `allowedHosts`→#257；④ 跳端口调用要带 `credentials:'include'` 因为通行凭证是 HttpOnly cookie、⑤ 后端 CORS 必须回显 `Origin`+`Allow-Credentials`⇒ #258；⑥ 每个 host 各需一次放行⇒#247）。另开 **#255**（首登不强制改密，需产品决策；**同时更正了 §六 里我上一轮写错的「首登强制改密 ✅」**）与 **#256**（号池占用总览端点，把改块从试错变选段）。**本轮靠我发第 3、4 条消息才把应用修通 ⇒ 缺口在告知面，不在 agent 能力。**
+- [x] **新坑（已写进 drill-2026-10-12 §六）**：① **项目级 playwright 容器（:8935）的 MCP 版本参数名与默认实例不同**——点击/填表用 `target`（不是 `ref`）、`browser_console_messages` 必给 `level`、`browser_network_requests` 必给 `static`、`browser_take_screenshot` 必给 `scale`；② `POST /api/ports/:id/preview-ticket` **要求 `Content-Type: application/json`**（上一轮文档里的 curl 片段少了这个头，已改）；③ `POST /api/sessions/:id/messages` 字段是 **`content`**；④ 预览票据 60 秒过期，跳 host 要各 host 各有一票。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
