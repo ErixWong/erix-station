@@ -53,7 +53,7 @@ P1 本地开发（写代码、起栈联调）只需：
 |---|---|---|---|
 | `BASE_DOMAIN` | **伞域** = `fde.` + registrable domain；portal/LLM/预览的公共后缀（#57 定稿，旧语义「可注册域」作废） | 决策者定稿（2026-10-08） | `fde.erix.vip` |
 | `PORTAL_HOST` | portal 域名 = `station.` + 伞域 | 平台规范固定（规格 §6.3） | `station.fde.erix.vip` |
-| `FDE_WILDCARD_HOST` | 预览泛域名 = `*.<伞域>`（伞域名恰含 `fde`，不再额外拼 `.fde.` 段——`buildHostname` 的 `.fde.` 硬编码已随 #57 拆除）；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（如 `eric-p-8001.fde.erix.vip`，grammar=`<fde>-p-<port4>.<伞域>`） |
+| `FDE_WILDCARD_HOST` | 预览泛域名 = `*.<伞域>`（伞域名恰含 `fde`，不再额外拼 `.fde.` 段——`buildHostname` 的 `.fde.` 硬编码已随 #57 拆除）；必须与 portal 同 registrable domain，否则 SameSite 打死 iframe | 平台规范固定（规格 §6.3） | `*.fde.erix.vip`（#246 号池后的实际形态如 `eric-p-22000.fde.erix.vip`，grammar=`<fde>-p-<portLabel>.<伞域>`） |
 | DNS 泛解析 | ✅ **已配置（2026-10-08）**：一条 A 记录 `*.fde.erix.vip → 100.100.0.3`（宿主机 Tailscale IP）即覆盖 portal/llm/预览全部名字（`*.` 不覆盖裸域，平台无服务落裸域）。原「两条内网 A 记录 + 部署期事项」口径作废；解析器负缓存（路由器 dnsmasq 负 TTL）为唯一已知 dev 期坑，公共 DNS 正常 | 已落地 | 全球生效实测（权威 NS/阿里/Google 一致） |
 | `llm.<伞域>`（LLM 数据面域名） | 解析双通道：容器内恒用 hosts 注入（`--add-host llm.<伞域>:<该 FDE 网关 IP>`）解析到 Traefik，**不依赖 DNS**（机制不变）；伞域收敛后该名字（`llm.fde.erix.vip`）也**顺带被 `*.fde.erix.vip` 泛解析覆盖**（浏览器偶访可达，dev http 下够用），无需单独 A 记录 | 平台规范固定（topology.md §4-L7，H-B） | `llm.fde.erix.vip` |
 | 代码托管（git host） | **git host 中立**：GitHub / Gitea / 其他自托管均可，平台不假设具体 git host；平台不代为 clone。Git 凭据可由 FDE 自行配置，或由 admin 通过 portal 凭据端点 write-through 到用户空间文件（见 `design/user-space.md` §4.1.1） | 决策者提供 | `git.erix.vip`（内网自托管 Gitea——**仅为参考实例 A 的情况**，见 §8.1，非设计约束） |

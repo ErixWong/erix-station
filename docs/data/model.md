@@ -134,7 +134,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 |---|---|
 | `fde_id` | → `users.id`，**FDE 用户**（forward-auth 按预览凭证哈希查 `preview_grants` 解析 `user_id` 后与此列比对，portal.md §2.7；不解析 `cookie.sub`，旧口径作废） |
 | `scope` / `run_id` | `project` 级 `run_id` 必空、`run` 级必带 → `CHECK ((scope='run') = (run_id IS NOT NULL))`。⚠️ 待决策者确认（Q5）：P1 先只做项目级，字段先行保留（principles §4 Q5 倾向 (b)） |
-| `port` | 容器内 dev 端口，`CHECK (port BETWEEN 4000 AND 4999)`；原 3001 code-server / 3000 runner 内部 API 容器固定端口角色均已取消（规格 §12.3，issue #71 / issue #3 评论，决策者 2026-09）——容器平台通道零监听，不入表 |
+| `port` | 容器内 dev 端口，baseline 的 `CHECK (port BETWEEN 4000 AND 4999)` **已被迁移 0019 换成按状态分支**：活行 `BETWEEN 22000 AND 29999`（全局号池，#246），`state='released'` 行放宽到 `BETWEEN 4000 AND 29999` 以保留历史号码；原 3001 code-server / 3000 runner 内部 API 容器固定端口角色均已取消（规格 §12.3，issue #71 / issue #3 评论，决策者 2026-09）——容器平台通道零监听，不入表 |
 | `hostname` / `url` | 由 portal **与 Traefik 路由同源生成**（规格 §8.1）；前端只展示/跳转 `url`，永不拼接（portal.md §8-4） |
 | `exposure` | `private`（默认）/ `org-visible` / `public`（规格 §6.5；非 admin 申请 `public` 被拒，portal.md §4.7） |
 | `state` | 状态机见 §2.2 |
@@ -142,6 +142,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 **唯一性设计（本表核心）**：
 
 - `port_allocations_live_port_key`：部分唯一索引 `(fde_id, port) WHERE state <> 'released'`——同一 FDE 容器内一个端口同一时刻至多一条未释放分配；**并发申请靠它 + 事务兜底**（规格 §8.1），释放后端口可复用。
+- `port_allocations_live_global_port_key`（**迁移 0019 新增**，#246）：部分唯一索引 `(port) WHERE state <> 'released'`——端口在**全部活行范围内**唯一（跨 FDE 不重叠是硬不变式，由 DB 而非应用层保证）；`released` 行不占位 ⇒ 号码可回收复用。写侧 `ON CONFLICT` 仍需带谓词指向 `(fde_id, port)` 那条（同 FDE 幂等），跨 FDE 撞号则由本索引抛 `23505`。
 - `port_allocations_live_hostname_key`：活跃 hostname 全局唯一——forward-auth 按 hostname 精确查（portal.md §2.7 第 1 步），「路由表里没有 = 不可达」（原理二）。
 - `port_allocations_reaper_idx`：支撑 reaper 回收 `released_at` 过期项（规格 §8.2）。
 

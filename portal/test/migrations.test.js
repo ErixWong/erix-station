@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 号池常量：迁移 SQL 与 JS 侧必须是同一份数字（漂移 = 分配出池外号）。
+import { PREVIEW_PORT_COUNT, PREVIEW_PORT_POOL_END, PREVIEW_PORT_POOL_START } from '../src/previewpool.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -50,7 +52,7 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
   // 新迁移追加在序列末尾（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -82,7 +84,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -139,7 +141,7 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0011-git-hosts.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0011-git-hosts.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS git_hosts/);
@@ -160,7 +162,7 @@ test('迁移 0012-onboarding：开户队列状态、步骤和索引全在增量 
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0012-onboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0012-onboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS fde_onboarding/);
@@ -176,7 +178,7 @@ test('迁移 0013-offboarding：增量队列可保留已停用用户并吊销 ru
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0013-offboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0013-offboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE fde_offboarding/);
@@ -195,7 +197,7 @@ test('迁移 0014-run-state-status：终态 status 独立列，旧快照由读�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0014-run-state-status.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移');
 
   const sql = fs.readFileSync(path.join(dir, '0014-run-state-status.sql'), 'utf8');
   assert.match(sql, /runs ADD COLUMN IF NOT EXISTS run_state_status jsonb/);
@@ -210,7 +212,7 @@ test('迁移 0015-backfill-user-input-transcript：只增不改、文本判断�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0015-backfill-user-input-transcript.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移');
 
   const sql = fs.readFileSync(path.join(dir, '0015-backfill-user-input-transcript.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -235,7 +237,7 @@ test('迁移 0016-transcript-append-seq：append 序列、确定性回填、索�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0016-transcript-append-seq.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移');
 
   const sql = fs.readFileSync(path.join(dir, '0016-transcript-append-seq.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -264,7 +266,7 @@ test('迁移 0017-port-allocations-hostname-check：整域名 CHECK、NOT VALID�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0017-port-allocations-hostname-check.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0017-port-allocations-hostname-check.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -290,7 +292,7 @@ test('迁移 0018-port-allocations-scope-fde：scope CHECK 放开含 fde、保�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0018-port-allocations-scope-fde.sql'), '0018 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 18, '0018 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0018-port-allocations-scope-fde.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -321,4 +323,90 @@ test('迁移 0018-port-allocations-scope-fde：scope CHECK 放开含 fde、保�
   assert.ok(/ON CONFLICT \(fde_id, port\) WHERE state <> 'released' DO NOTHING/
     .test(fs.readFileSync(path.join(HERE, '../../portal/src/portalloc.js'), 'utf8')),
   '写侧必须用带谓词的 ON CONFLICT 目标（部分索引不做无谓词推断）');
+});
+
+// 0019（issue #246 交付①）：预览端口**全局号池** 22000–29999 落库。三件事 + 一条前置，顺序不可换：
+//   ⓪ 按名 DROP 旧 port CHECK → ① 重排存量活行进池（含 hostname/url 同步重写）→ ② port CHECK 换成
+//   按状态分支的新口径 → ③ 建全局部分唯一索引 `port_allocations_live_global_port_key`。
+// 本文件按仓库纪律做**静态 SQL 断言**（顺序、幂等、谓词、不硬编码伞域、口径与 JS 常量一致）；
+// 「未重排就加 CHECK / 就建索引」的**真库负例**与整事务 ROLLBACK 的正例在交付报告里（TEMP 克隆实测）。
+test('迁移 0019-preview-port-pool：⓪→①→②→③ 顺序不可换、CHECK 按状态分支、全局部分唯一索引、不硬编码伞域', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0019-preview-port-pool.sql'), '0019 存在');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 19, '0019 为当前最后迁移（连续无空洞）');
+
+  const sql = fs.readFileSync(path.join(dir, '0019-preview-port-pool.sql'), 'utf8');
+  const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
+  const pos = (re) => {
+    const m = executable.search(re);
+    assert.notEqual(m, -1, `0019 里必须出现：${re}`);
+    return m;
+  };
+
+  // —— 顺序（本迁移的全部正确性都建立在这个顺序上）——
+  const pDrop = pos(/^ALTER TABLE port_allocations DROP CONSTRAINT IF EXISTS port_allocations_port_check;$/m);
+  const pWith = pos(/^WITH live AS \($/m);            // ① 的 CTE 链（取数与块几何都在这里）
+  const pUpdate = pos(/^UPDATE port_allocations AS pa$/m);
+  const pGuard = pos(/^DO \$do\$$/m);
+  const pAdd = pos(/^ALTER TABLE port_allocations ADD CONSTRAINT port_allocations_port_check CHECK \($/m);
+  const pIndex = pos(/^CREATE UNIQUE INDEX IF NOT EXISTS port_allocations_live_global_port_key$/m);
+  assert.ok(pDrop < pWith && pWith < pUpdate, '⓪ 旧 CHECK 必须先摘掉：它是 4000–4999，与新池不相交，带着它 ① 自己就 23514');
+  assert.ok(pUpdate < pAdd, '① 重排必须先于 ② 加 CHECK（否则 ADD CONSTRAINT 校验存量当场 23514）');
+  assert.ok(pAdd < pIndex, '② 必须先于 ③：建索引前必须已无重复（PG 16.15 唯一索引不支持 NOT VALID）');
+  assert.ok(pGuard > pUpdate && pGuard < pAdd, '①\' 守卫夹在重排与 CHECK 之间，把裸 23514/23505 换成可操作文案');
+  assert.doesNotMatch(executable, /CREATE (UNIQUE )?INDEX CONCURRENTLY/, 'runner 在显式事务里执行 ⇒ CONCURRENTLY 不可用');
+
+  // —— 只动 port 这一条 CHECK（0017 的 hostname CHECK、0018 的 scope CHECK、两条条件约束都不许碰）——
+  const drops = executable.match(/DROP CONSTRAINT IF EXISTS [a-z0-9_]+/g) ?? [];
+  assert.deepEqual(drops, ['DROP CONSTRAINT IF EXISTS port_allocations_port_check'],
+    `只能按名摘 port 那条 CHECK，实际：${JSON.stringify(drops)}`);
+  assert.doesNotMatch(executable, /port_allocations_scope_check|port_allocations_hostname_dns_check/,
+    '不得连带 scope / hostname 的 CHECK 一起改');
+  assert.ok(!/NOT VALID/.test(executable.slice(pAdd, pIndex)),
+    '② 必须建成 VALID：本迁移的正解就是「活行全部已在池内」，要真校验存量');
+
+  // —— CHECK 按状态分支：活行必须在池内；released 保留历史号码（portsprobe 的 4000–4009 靠这条活）——
+  const checkBody = executable.slice(pAdd, executable.indexOf(';', pAdd));
+  assert.match(checkBody, /state =\s+'released' AND port BETWEEN 4000\s+AND 29999/,
+    'released 分支下界必须是 4000（历史号码留着），上界与号池一致');
+  assert.match(checkBody, /state <> 'released' AND port BETWEEN 22000 AND 29999/, '活行分支必须钉在号池内');
+  assert.equal((checkBody.match(/port BETWEEN/g) ?? []).length, 2, '只有两个分支，没有第三种取值');
+
+  // —— ③ 全局部分唯一索引：跨 FDE 不重叠由 DB 保证；released 不占位 ⇒ 号码可复用 ——
+  const indexDef = executable.slice(pIndex);
+  assert.match(indexDef, /ON port_allocations \(port\) WHERE state <> 'released';/,
+    '索引必须是 (port) 的全局部分唯一索引，谓词与 released 语义一致');
+  assert.ok(!/DROP INDEX/.test(executable), '不删任何既有索引（(fde_id,port) 那条继续做幂等冲突目标）');
+
+  // —— 重排：只动活行、块装不下的溢出槽位置 released、hostname/url 同步重写且不硬编码伞域 ——
+  const updateBody = executable.slice(pWith, pGuard);
+  assert.match(updateBody, /FROM live AS l/, '取数只看活行（released 行不重排）');
+  assert.match(updateBody, /WHERE l\.port NOT BETWEEN 22000 AND 29999/, '只挑池外活行 ⇒ 重放时集合为空（no-op）');
+  assert.match(updateBody, /generate_series\(22000, 29999, 10\)/, '候选块 = 池内 10 个一段的对齐块');
+  assert.match(updateBody, /row_number\(\) OVER \(ORDER BY COALESCE\(u\.fde_name, l\.fde_id::text\)\)/,
+    '确定顺序 = fde_name（无用户时回落 fde_id），第 1 个 FDE 拿 22000 段');
+  assert.match(updateBody, /state\s+= CASE WHEN r\.slot_no <= 10 THEN pa\.state\s+ELSE 'released' END/,
+    '块装不下的第 11 条起置 released（tetris 的 4100 就走这条）');
+  assert.match(updateBody, /released_at = CASE WHEN r\.slot_no <= 10 THEN pa\.released_at ELSE now\(\) END/,
+    "置 released 必须同时写 released_at（CHECK ((state='released') = (released_at IS NOT NULL))）");
+  // hostname：拆「首标签前缀 + 旧端口段 + base」重组 ⇒ base 来自旧 hostname，不写死伞域；
+  // 且**不许用 lpad**（PG 的 lpad 会把 5 位端口截成 4 位，实测 lpad('22010',4,'0')='2201'）。
+  assert.match(updateBody, /substr\(s\.hostname, length\(split_part\(s\.hostname, '\.', 1\)\) \+ 1\)/,
+    'base = 第一段之后的部分（从旧 hostname 反推，不硬编码伞域）');
+  assert.doesNotMatch(updateBody, /\blpad\(/, 'PG lpad 会截断超长串 ⇒ 5 位端口会被写坏，禁止在端口段用 lpad');
+  assert.doesNotMatch(updateBody, /erix\.vip|fde\.[a-z]/, '不得把伞域写死进迁移（base 来自 deploy/.env）');
+  assert.ok(updateBody.includes("regexp_replace(pa.url, '://[^/:]+', '://' || r.new_hostname)"),
+    'url 只换 host 段（scheme 与非默认端口原样保留，形态与 projects.previewUrl 一致）');
+
+  // —— 口径与 JS 侧必须是同一份数字（迁移与 portalloc/previewpool 漂移 = 分配出池外号）——
+  assert.ok(executable.includes(String(PREVIEW_PORT_POOL_START)) && executable.includes(String(PREVIEW_PORT_POOL_END)),
+    'SQL 里的池边界必须等于 previewpool.js 的常量');
+  assert.ok(executable.includes(`generate_series(${PREVIEW_PORT_POOL_START}, ${PREVIEW_PORT_POOL_END}, ${PREVIEW_PORT_COUNT})`),
+    '块大小/对齐粒度必须与 PREVIEW_PORT_COUNT 一致');
+
+  // —— 冻结 baseline 不回写（sha256 失配会让既有部署拒启）——
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('port_allocations_live_global_port_key'), '冻结 baseline 不得回写新索引');
+  assert.ok(!baseline.includes('22000'), '冻结 baseline 的 port CHECK 仍是 4000–4999');
 });

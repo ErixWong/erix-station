@@ -194,7 +194,10 @@ async function runProvisionFde(values) {
     const out = await onboardFde(pool, config, { fdeName, docker });
     // eslint-disable-next-line no-console
     console.log(
-      `[provision-fde] ok fde=${fdeName} network=${out.networkName} subnet=${out.subnet} container=${out.containerName} preview_ports=${out.previewPorts.created}/${out.previewPorts.requested} 新写（${out.previewPorts.skipped} 条已存在）`,
+      `[provision-fde] ok fde=${fdeName} network=${out.networkName} subnet=${out.subnet} container=${out.containerName}`
+      // issue #246 交付①：运维要一眼看到分到哪一段号（块 = 号池里的对齐十连号），不再只报条数。
+      + ` preview_ports=${out.previewPorts.created}/${out.previewPorts.requested} 新写（${out.previewPorts.skipped} 条已存在）`
+      + ` block=${out.previewPorts.blockStart}-${out.previewPorts.blockEnd}`,
     );
     process.exitCode = 0;
   } catch (err) {

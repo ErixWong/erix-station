@@ -795,14 +795,17 @@ export async function onboardFde(pool, config, {
 
     await pool.query(`UPDATE containers SET status = 'running', updated_at = now() WHERE id = $1`, [containerId]);
 
-    // issue #240：开户即预分配 10 条 FDE 级预览域名（端口 4000–4009），**写库与 route outbox /
-    // materialize revision 入队同一事务** ⇒ Traefik 路由与容器内 ~/.erix/ports.json 自动跟上，
-    // 不再需要人工 enqueueFullRebuild + runMaterializerOnce（此前 port_allocations 从没被产品代码
-    // 写过，手工插完之后派生链一律不动）。
+    // issue #240：开户即预分配 FDE 级预览域名，**写库与 route outbox / materialize revision 入队
+    // 同一事务** ⇒ Traefik 路由与容器内 ~/.erix/ports.json 自动跟上，不再需要人工
+    // enqueueFullRebuild + runMaterializerOnce（此前 port_allocations 从没被产品代码写过，手工插完
+    // 之后派生链一律不动）。
     // 位置：网络与容器都已落地之后（路由的 backend 依赖本 FDE 网段）、LLM 联动之前——预览域名
     // 的正确性不依赖 LiteLLM 是否可达，LiteLLM 挂了也先把预览域名与派生链交付出。
-    // 幂等：部分唯一索引 + ON CONFLICT DO NOTHING ⇒ `cli.js provision-fde` 重跑只补缺口（#240 裁决 7），
-    // 遗留 scope='project' 的存量行既不改也不删（portalloc.js 顶部「存量不迁移」段）。
+    // 端口：issue #246 交付①——不再是固定的 4000–4009，而是**全局号池 22000–29999 里最小的未占用
+    // 对齐块**（每段 10 个）；跨 FDE 不重叠由迁移 0019 的全局部分唯一索引保证（抢号失败 ⇒
+    // preview_port_block_taken，整笔开户回滚，调用方重试）。
+    // 幂等：部分唯一索引 + ON CONFLICT DO NOTHING ⇒ `cli.js provision-fde` 重跑只补缺口（#240 裁决 7）；
+    // 重跑时块起点也从已有活行反推，不会新开一段。
     const previewPorts = await provisionFdePreviewPorts(pool, config, { fdeId: userId, fdeName, log });
 
     // issue #38 Phase B1：复用分支（needRecreate=false）可恢复 revoked binding；
@@ -823,10 +826,14 @@ export async function onboardFde(pool, config, {
       gitProvider: gitHost?.provider ?? null,
       status: accountStatus,
       // issue #240：本次开户新写的预览域名条数（重跑时为 0 ⇒ 已齐备，派生链没动）。
+      // issue #246：额外带上**分到的块**（`blockStart/blockEnd`），运维与面板都靠它看号段。
       previewPorts: {
         requested: previewPorts.requested,
         created: previewPorts.inserted.length,
         skipped: previewPorts.skipped,
+        blockStart: previewPorts.blockStart,
+        blockEnd: previewPorts.blockEnd,
+        ports: previewPorts.ports,
       },
     };
   });
