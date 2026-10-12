@@ -45,6 +45,7 @@ function validIsolationEnv() {
     BACKEND_SUBNET: '172.33.0.0/24',
     FDE_POOL: 'large',
     FDE_IPAM_POOLS: '10.201.0.0/16',
+    FDE_DEV_MODE: '1',
     STATION_PORTAL_IMAGE: `erix-station/portal:${stackId}`,
     STATION_DOCKER_PROXY_IMAGE: `erix-station/fde-proxy:${stackId}`,
     FDE_IMAGE: `erix-station/fde:${stackId}`,
@@ -107,6 +108,18 @@ cases.push(expectThrow(`removeDbDir() STATION_DB_DIR=${SHARED_STACK.dbDir}（未
   () => removeDbDir(fakeDocker, { ...validIsolationEnv(), STATION_DB_DIR: SHARED_STACK.dbDir }),
   { namesMustInclude: [SHARED_STACK.dbDir, 'ERIX_E2E_ALLOW_DB_DIR'] }));
 
+// 6) #227.1：FDE_IMAGE 是 image:tag 形态却没显式 FDE_DEV_MODE=1 ⇒ 必须拒（主 agent 真跑 #226 踩的坑：
+//    tag 形态在 portal 非 dev 模式下被生产门拒 provision，护栏要在起栈前就拦下并点名）。
+cases.push(expectThrow('assertIsolatedEnvironment() tag 形态 FDE_IMAGE 缺 FDE_DEV_MODE',
+  () => assertIsolatedEnvironment({ env: (() => { const e = validIsolationEnv(); delete e.FDE_DEV_MODE; return e; })() }),
+  { namesMustInclude: ['FDE_DEV_MODE'] }));
+
+// 7) #227.1：allowSharedReset（wp2b 的共享重置声明）**只豁免共享路径本身**——非临时、非共享的路径
+//    照旧要 ERIX_E2E_ALLOW_DB_DIR=1 豁免（防「加了个选项就变成任意路径都能 rm -rf」）。
+cases.push(expectThrow('resolveDbDir({allowSharedReset:true}) 非共享非临时路径仍拒',
+  () => resolveDbDir({ STATION_DB_DIR: '/var/lib/erix-not-temp-db' }, { allowSharedReset: true }),
+  { namesMustInclude: ['/var/lib/erix-not-temp-db', 'ERIX_E2E_ALLOW_DB_DIR'] }));
+
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
 let positiveError = '';
@@ -123,9 +136,27 @@ try {
   positiveError = String(error?.message ?? error);
 }
 
+// #227.1 的正例补充（独立一组：任一失败同样算正例不过）：
+// • digest 形态 FDE_IMAGE 不要求 FDE_DEV_MODE（生产钉定）；
+// • allowSharedReset 未设 STATION_DB_DIR 时解析到共享库目录并真去 docker 删（wp2b 共享重置语义）。
+try {
+  const digestEnv = { ...validIsolationEnv(), FDE_IMAGE: `erix-station/fde@sha256:${'a'.repeat(64)}` };
+  delete digestEnv.FDE_DEV_MODE;
+  assertIsolatedEnvironment({ env: digestEnv });
+  const beforeReset = dockerCalls.length;
+  const sharedResolved = resolveDbDir({}, { allowSharedReset: true });
+  assert.equal(sharedResolved, SHARED_STACK.dbDir, 'allowSharedReset 下缺省应解析到共享库目录（wp2b 语义）');
+  removeDbDir(fakeDocker, {}, { allowSharedReset: true });
+  assert.ok(dockerCalls.length === beforeReset + 1, 'allowSharedReset 下 removeDbDir 应真的执行 docker');
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}digest/allowSharedReset 正例被拒：${String(error?.message ?? error)}`;
+}
+
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
-// `removeDbDir` 在 wp2b/wp3b/wp4 仍有历史局部副本（共享栈跑法 + 自带缺省库目，本工单未收编，见交付报告）。
+// removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
+// wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable'];
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
@@ -198,6 +229,14 @@ const singleSourceProblems = [];
     if (/2>\/dev\/null \|\| true/.test(wp6Text)) {
       singleSourceProblems.push('wp6-llm-e2e.mjs: cleanup 里又出现 `2>/dev/null || true`（#224 的静默吞错形态）');
     }
+  }
+  // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b
+  // 调用处——别的脚本出现这个选项 = 有人开始打算删共享 dev 库，必须停下来先确认语义。
+  const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs', 'wp2b-e2e.mjs']);
+  const sharedResetOutliers = files.filter((f) => !ALLOW_SHARED_RESET_FILES.has(path.basename(f))
+    && fs.readFileSync(f, 'utf8').includes('allowSharedReset'));
+  if (sharedResetOutliers.length) {
+    singleSourceProblems.push(`allowSharedReset 出现在 lib/wp2b 之外（只有 wp2b 允许声明重置共享 dev 库）：${sharedResetOutliers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ')}`);
   }
   // #227.2：脚本里的 compose 命令串必须显式带 `-p `（隔离系用 `${COMPOSE_PROJECT_NAME:?…}`、共享系用
   // `${COMPOSE_PROJECT_NAME:-station}`）——出现不带 -p 的 `docker compose ` 即红：回到「忘 export 就对

@@ -1,7 +1,8 @@
 // WP6 end-to-end: LiteLLM admin setup, per-FDE key injection, allow-listing, and lifecycle regression.
 // Must run with unique compose/container names, temporary DB storage, and isolated host ports.
 // e2e 前置：必须导出 HTTP_PROXY/HTTPS_PROXY（FDE 镜像构建要联网下 gh/tea/glab）；隔离栈须派生
-// 镜像 tag（FDE_IMAGE/STATION_PORTAL_IMAGE）——本脚本绝不删除共享镜像 tag（issue #178，
+// 镜像 tag（FDE_IMAGE/STATION_PORTAL_IMAGE）并显式 FDE_DEV_MODE=1（#227.1：tag 形态不声明
+// dev 模式会被护栏拒跑，digest 形态豁免）——本脚本绝不删除共享镜像 tag（issue #178，
 // 口径集中在 lib/fde-image.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
