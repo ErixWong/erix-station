@@ -185,6 +185,59 @@ test('SYSTEM_PROMPT 讲清「端口段由平台分配 + ports.json 是唯一真�
   assert.doesNotMatch(section, new RegExp(`\\b${PREVIEW_PORT_POOL_START}\\b|\\b${PREVIEW_PORT_POOL_END}\\b`),
     `不得把号池边界 ${PREVIEW_PORT_POOL_START}–${PREVIEW_PORT_POOL_END} 拄进提示词（第二份清单必然漂移）`);
   assert.doesNotMatch(section, /\b\d{4,5}\s*[–—-]\s*\d{4,5}\b/, '不得出现任何端口区间字面量');
+
+  // #257 的红线扩一条：域名也是**生成值**（docs/env.md §1：BASE_DOMAIN = 伞域，部署变量）。
+  // 旧写法「把 `*.fde.localhost` / `fde.erix.vip` 写进提示词」与拄端口号是同一个病：换域名就漂。
+  // 这里按**形状**禁（而不只禁现网那一个值）：任何带两个点的多段域名字面量都不许进提示词。
+  assert.deepEqual(prompt.match(/\b[a-z0-9-]+\.[a-z0-9-]+\.[a-z]{2,}\b/g) || [], [],
+    '提示词里不得出现多段域名（伞域 / 预览 host 都是生成值，要写也只写「清单里那一条的 url」）');
+  assert.doesNotMatch(prompt, /\berix\.vip\b|\bfde\.localhost\b/i, '不得出现伞域字面量（现网 fde.erix.vip / 旧默认 fde.localhost）');
+});
+
+// ---------------------------------------------------------------------------
+// issue #257 + #258（工单 feat-261012-01）：预览告知的**分工**本身也被钉死。
+// 定稿（#258 `#issuecomment-6117800165`）：应用侧要求链（6 条）的单一真相 = materializer 下发的
+// `~/AGENTS.md`，`SYSTEM_PROMPT` 只留一句强制指针。下面两条成对出现是有原因的：
+//   ① 缺了 ⇒ 「下发了 ≠ 读了」（R-1 新增 P0：真机里 `AGENTS.md` 只在 2 轮出现，1 轮只是 `ls` 扫到，
+//      因为旧提示词压根没提它）；
+//   ② 破了 ⇒ 有人开始把具体规则抄进提示词 = 第二个会过期的真相源（同 §8.10「工具名从注册面取、
+//      不手抄清单」）。抄规则在短期内看起来更“详细”，但它把 portal 文案与容器提示词绑成两份要同步的真相。
+// ---------------------------------------------------------------------------
+
+test('SYSTEM_PROMPT 有「开工先读 ~/AGENTS.md」的强制指针，且自带读得到它的实际手段（#259 前提）', () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  const pointer = linesMentioning(prompt, '~/AGENTS.md');
+  assert.ok(pointer.length > 0, 'SYSTEM_PROMPT 必须指向 ~/AGENTS.md（#258 定稿的强制指针）——缺了模型根本不知道有这份文件');
+  // 措辞必须是「先读」：R-1 P0 的判据是 transcript 里出现读 ~/AGENTS.md 的调用，「可以参考」挡不住。
+  assert.ok(pointer.some((l) => /先读/.test(l)), `强制指针必须写「先读」，实际是：${pointer.join(' / ')}`);
+  // 指针必须落在预览段里（agent 起服务给人访问时才会去翻这一段）。
+  const section = previewSection(prompt);
+  assert.match(section, /~\/AGENTS\.md/, '强制指针必须落在「预览域名与端口」段内（与它的消费时机同段）');
+  assert.match(section, /不复述|不重抄/, '指针必须说明本节有意不复述那些规则（否则下一句就会被人当成可以拄规则）');
+  // ⚠ #259 未落地前 createJail({ root: cwd }) 的读边界只有项目根（无只读例外）⇒
+  //   指针必须自带 shell 手段，否则模型按自然习惯 readFile 会撞「被宿主边界拒绝」白烧一轮。
+  assert.match(section, /文件工具读不到[\s\S]{0,60}用 shell 读/, '家目录读不到的口径与 shell 手段必须同段给出');
+  assert.match(section, /cat ~\/AGENTS\.md/, '必须给出可直接照抄的 `cat ~/AGENTS.md`');
+  assert.match(section, /cat ~\/\.erix\/ports\.json/, 'ports.json 的读取手段不得在改版时丢掉');
+});
+
+test('单一来源防漂移：提示词里不得出现 allowedHosts / credentials / CORS 这三个具体规则词', async () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  for (const word of ['allowedHosts', 'credentials', 'CORS']) {
+    // 用环视做词界（而不是 \b）：allowedHosts 是小驼峰，前缀也可能是字母。
+    assert.doesNotMatch(
+      prompt,
+      new RegExp(`(?<![A-Za-z0-9_])${word}(?![A-Za-z0-9_])`, 'i'),
+      `提示词里出现了“${word}”——应用侧规则正在被抄进 SYSTEM_PROMPT（单一真相在 ~/AGENTS.md，由 materializer 下发）。` +
+      '要加内容就改 portal/src/materializer.js 的 renderHomeAgentsMd()，不要把 6 条抄到提示词里。',
+    );
+  }
+  // 反面兜底：这三条在单一真相里必须真的存在（否则②只是把提示词清空，不是防漂移）。
+  // 取 portal 侧同源实现而不是重抄一衍文案：单一真相被删时这条也要红。
+  const agentsMd = await import('../../portal/src/materializer.js').then((m) => m.renderHomeAgentsMd({ fdeName: 'alice' }));
+  for (const word of ['allowedHosts', 'credentials', 'CORS']) {
+    assert.match(agentsMd, new RegExp(word, 'i'), `单一真相里必须含“${word}”（提示词不抄，文件里必须写）`);
+  }
 });
 
 test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端口、文件工具去读家目录', () => {
