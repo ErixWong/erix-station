@@ -64,6 +64,8 @@ import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { DEFAULT_FDE_IMAGE, DEFAULT_PORTAL_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
+// issue #226：`writeTraefikStatic` 与隔离护栏本体一样收归公共模块（wp2a/wp3a/wp3b/wp5/wp6 共用一份）。
+import { writeTraefikStatic } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -81,23 +83,11 @@ const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner 命名规则：fde-<fde_name>
 const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 const PORTAL_IMAGE = process.env.STATION_PORTAL_IMAGE || DEFAULT_PORTAL_IMAGE;
-const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
 
-// F8：生成「仅替换入口端口」的隔离栈专用 traefik 静态配置。
-// 背景（主 agent 实测根因）：Traefik v3 带 --configFile 时，静态文件里已定义的 entryPoints
-// 会压过 CLI/env 覆盖（file + --entrypoints.web.address=:19090 仍绑 :8090 → 抢共享 edge 端口）。
-// 故隔离栈必须整体替换配置文件；缺省端口（8090/8443）生成结果与共享文件等价。
-function writeTraefikStatic(dir) {
-  const src = fs.readFileSync(TRAEFIK_DEFAULT_STATIC, 'utf8');
-  assert.ok(src.includes('address: ":8090"') && src.includes('address: ":8443"'),
-    'deploy/traefik/traefik.yml 含预期入口端口行（F8 锚点，文件结构变更时同步本函数）');
-  const out = src
-    .replace('address: ":8090"', `address: ":${TRAEFIK_WEB_PORT}"`)
-    .replace('address: ":8443"', `address: ":${process.env.TRAEFIK_WEBSECURE_PORT || '8443'}"`);
-  const target = path.join(dir, 'traefik.yml');
-  fs.writeFileSync(target, out);
-  return target;
-}
+// F8（隔离栈必须整体替换 traefik 静态配置的原因见 lib/isolated-env.mjs:writeTraefikStatic）：
+// Traefik v3 带 --configFile 时，静态文件里已定义的 entryPoints 会压过 CLI/env 覆盖（实测 file +
+// --entrypoints.web.address=:19090 仍绑 :8090 → 抢共享 edge 端口）。#226：生成函数已提到公共模块（与
+// wp2a/wp3a/wp5/wp6 共用一份），本脚本只传入自己的入口端口。
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
@@ -363,7 +353,9 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp3b-'));
   S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp3b-'));
   S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp3b-'));
-  S.staticFile = writeTraefikStatic(S.staticRoot);
+  S.staticFile = writeTraefikStatic(S.staticRoot, {
+    repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: process.env.TRAEFIK_WEBSECURE_PORT || '8443',
+  });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
   fs.chmodSync(S.staticRoot, 0o755);

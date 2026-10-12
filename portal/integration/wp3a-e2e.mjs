@@ -2,7 +2,21 @@
 // 流程：起栈（含 LiteLLM）→ 建用户 + provision FDE → 假 agentd（真实 token + FDE 网络路径）
 //   → SSE 连接 + claim → 事件 seq 递增 → finish → 断线重连 re-claim（方案 B）→ 并发 claim 竞态
 //   → mock 网关经 Traefik 注入链流式响应 → 回收。
-// 运行：npm run test:integration:wp3a
+// 运行：npm run test:integration:wp3a（⚠️ issue #226 起**必须带隔离 env**，见下；缺 env 直接硬失败。）
+//
+// —— 隔离 env 清单（issue #226；与 wp3b/wp5/wp6 同一套，判据集中在 lib/isolated-env.mjs）——
+//   入口 URL / 容器名 / DB 数据目录全部 env 派生（缺省值 = 共享栈现状值，仅为可读；护栏强制显式传）：
+//   STATION_STACK_ID=<唯一栈 id> COMPOSE_PROJECT_NAME=<同一个栈 id>
+//   STATION_DB_DIR=/tmp/station-db-<栈 id>（必须不存在；缺省会 rm -rf 共享 dev 库数据目录）
+//   STATION_DB_NAME/STATION_PORTAL_NAME/STATION_LITELLM_NAME/STATION_DOCKER_PROXY_NAME/STATION_EDGE_NAME
+//     =station-*-<栈 id>（compose 用它们做 container_name，不派生与共享栈撞名）
+//   PORTAL_HOST_PORT=<非 18080> LITELLM_HOST_PORT=<非 4100> TRAEFIK_WEB_PORT=<非 8090> TRAEFIK_WEBSECURE_PORT=<非 8443>
+//   FDE_NAME=<含栈 id 的 FDE 名>（fde-<name> 是全局 docker 网络/容器名，不派生会与共享栈互删）
+//   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large FDE_IPAM_POOLS=10.201.0.0/16
+//   LLM_GATEWAY_HOST=http://127.0.0.1:<LITELLM_HOST_PORT>
+//   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
+//   TRAEFIK_STATIC_HOST 由脚本自动生成（只改入口端口的临时 traefik.yml，F8）。代理构建/镜像与
+//   HTTP_PROXY 口径见 lib/fde-image.mjs；IPAM 保留段等派生注入见 wp3b 的 isolationComposeEnv()。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -13,11 +27,25 @@ import { fileURLToPath } from 'node:url';
 import { parseCidr, intToIp } from '../src/ipam.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { LLM_HOST, PORTAL_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
+import {
+  assertHostPortsAvailable, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+} from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
-const PORTAL = 'http://127.0.0.1:18080';
-const TRAEFIK_WEB = 'http://127.0.0.1:8090';
+// issue #226：入口句柄全部 env 派生（缺省值保留现状值只为可读，隔离跑法由护栏强制显式传）。
+const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
+const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
+const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';
+const TRAEFIK_WEBSECURE_PORT = process.env.TRAEFIK_WEBSECURE_PORT || '8443';
+const TRAEFIK_WEB = `http://127.0.0.1:${TRAEFIK_WEB_PORT}`;
+const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
+const DOMAIN_COMPOSE_ENV = composeDomainEnv(TRAEFIK_WEB_PORT);
+const STATION_DB_NAME = process.env.STATION_DB_NAME || 'station-db';
+const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
+const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
+const FDE_NAME = process.env.FDE_NAME || 'alice';
+const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner/IPAM 命名规则：fde-<fde_name>
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
@@ -36,21 +64,16 @@ function dockerStdin(args, input) {
   });
 }
 
-// M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
-// 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
-const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
-function removeDbDir() {
-  const parent = path.posix.dirname(DB_DIR);
-  const name = path.posix.basename(DB_DIR);
-  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
-}
+// M6/#226：DB 数据目录可参数化（与 deploy/docker-compose.yml 的挂载一致）。**缺省不再回退**
+// /docker/station-db——共享 dev 栈库容器的 bind 源，按缺省 teardown 等于 rm -rf 真机库数据。
+const { removeDbDir } = createDbDirCleaner({ docker });
 
 function compose(args, env = {}) {
   return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...composeDomainEnv('8090'), ...env },
+    env: { ...process.env, ...DOMAIN_COMPOSE_ENV, ...stackPaths(), ...env },
   });
 }
 
@@ -76,16 +99,18 @@ async function waitFor(fn, { timeoutMs = 120000, intervalMs = 500, label = 'cond
 }
 
 function psql(query) {
-  return docker(`exec -i station-db psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
+  return docker(`exec -i ${STATION_DB_NAME} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
 }
 
 function psqlStdin(sql) {
-  dockerStdin('exec -i station-db psql -U station -d station -v ON_ERROR_STOP=1', sql);
+  dockerStdin(`exec -i ${STATION_DB_NAME} psql -U station -d station -v ON_ERROR_STOP=1`, sql);
 }
 
 const S = {
   userspaceRoot: null,
   dynamicRoot: null,
+  staticRoot: null,
+  staticFile: null,
   userId: '00000000-0000-0000-0000-000000000001',
   projectId: '00000000-0000-0000-0000-000000000010',
   sessionId: '00000000-0000-0000-0000-000000000020',
@@ -95,6 +120,16 @@ const S = {
   subnet: null,
   containerId: null,
 };
+
+/** compose 需要的宿主路径（静态配置在 mkdtemp 之前尚未生成 ⇒ 只注入已就绪的键）。 */
+function stackPaths() {
+  const paths = {
+    ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+    TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+    TRAEFIK_STATIC_HOST: S.staticFile,
+  };
+  return Object.fromEntries(Object.entries(paths).filter(([, value]) => value !== undefined && value !== null));
+}
 
 function seedRun({ runId, queueId }) {
   const sql = `
@@ -111,72 +146,87 @@ function seedRun({ runId, queueId }) {
 }
 
 function readTokenFromContainer() {
-  const inspect = JSON.parse(docker('inspect fde-alice'));
+  const inspect = JSON.parse(docker(`inspect ${FDE_CONTAINER}`));
   const env = inspect[0].Config.Env || [];
   const line = env.find((e) => e.startsWith('ERIX_STATION_TOKEN='));
   return line ? line.slice('ERIX_STATION_TOKEN='.length) : null;
 }
 
 function runFakeAgentd(phase) {
-  const cmd = `run --rm --network ${S.networkName} -v ${REPO_ROOT}:/app:ro node:22-alpine node /app/portal/integration/fake-agentd.mjs --phase ${phase} --gateway http://${S.gateway}:8090 --token ${S.token} --station-host ${PORTAL_HOST} --llm-host ${LLM_HOST}`;
+  const cmd = `run --rm --network ${S.networkName} -v ${REPO_ROOT}:/app:ro node:22-alpine node /app/portal/integration/fake-agentd.mjs --phase ${phase} --gateway http://${S.gateway}:${TRAEFIK_WEB_PORT} --token ${S.token} --station-host ${PORTAL_HOST} --llm-host ${LLM_HOST}`;
   const out = docker(cmd).trim();
   const lines = out.split('\n').filter((l) => l.trim());
   return JSON.parse(lines[lines.length - 1]);
 }
 
 test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock 网关注入链', { timeout: 12 * 60 * 1000 }, async (t) => {
+  // issue #226：本脚本以前把入口 URL/容器名/FDE 名写死成共享栈，并把 DB 数据目录缺省指向共享 dev 库；
+  // 结果两种跑法都是错的（假绿 + rm -rf 共享库）。现与 wp5/wp6 一样先过硬隔离护栏。
+  assertIsolatedEnvironment({
+    fdeNames: [{ env: 'FDE_NAME', value: FDE_NAME, sharedDefault: 'alice' }],
+  });
+  await assertHostPortsAvailable([PORTAL_HOST_PORT, LITELLM_HOST_PORT, TRAEFIK_WEB_PORT, TRAEFIK_WEBSECURE_PORT]);
+
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp3a-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp3a-'));
+  S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp3a-'));
+  S.staticFile = writeTraefikStatic(S.staticRoot, {
+    repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: TRAEFIK_WEBSECURE_PORT,
+  });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
+  fs.chmodSync(S.staticRoot, 0o755);
 
   const cleanup = () => {
-    safe(() => docker('rm -f fde-alice 2>/dev/null || true'));
-    safe(() => docker('network rm fde-alice 2>/dev/null || true'));
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
+    safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
+    safe(() => docker(`network rm ${FDE_CONTAINER} 2>/dev/null || true`));
+    safe(() => compose('down -v'));
     // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose up --build 按需重建）。
     safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
     safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
+    safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
+    // STATION_DB_DIR 缺省/越界会在 removeDbDir() 里抛错（不会 rm -rf 共享 dev 库数据目录）。
     removeDbDir();
   };
   t.after(cleanup);
 
   try {
     // 0) 预清理
-    safe(() => compose('down -v', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot }));
+    safe(() => compose('down -v'));
     removeDbDir();
 
     // 1) 起栈（含 station-litellm）；启动迁移完成后，管理台 API 才能创建 credential/model/binding。
-    compose('up -d --build', { ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot, TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot, MIGRATE_ON_START: '1' });
+    // LLM_GATEWAY_HOST 跟隔离栈自己的 LiteLLM publish 端口对齐（host 网络的 Traefik 用）。
+    compose('up -d --build', { MIGRATE_ON_START: '1', LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}` });
 
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
       return r && r.status === 200;
-    }, { label: 'portal healthz', timeoutMs: 240000 });
+    }, { label: `portal healthz (${PORTAL})`, timeoutMs: 240000 });
 
     await waitFor(async () => {
-      const r = await fetch('http://127.0.0.1:4100/health/readiness').catch(() => null);
+      const r = await fetch(`http://127.0.0.1:${LITELLM_HOST_PORT}/health/readiness`).catch(() => null);
       return r && r.status === 200;
-    }, { label: 'LiteLLM readiness', timeoutMs: 120000 });
+    }, { label: `LiteLLM readiness (${STATION_LITELLM_NAME})`, timeoutMs: 120000 });
 
     // 2) 建用户（provision 前提）+ provision FDE（复用 WP2b 路径）
-    psqlStdin(`INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status) VALUES ('${S.userId}', 'alice', 'Alice', 'fde', 'alice', 'local', 'active');`);
-    docker('exec station-portal node portal/src/cli.js provision-fde --fde-name alice');
+    psqlStdin(`INSERT INTO users (id, login, display_name, role, fde_name, auth_source, status) VALUES ('${S.userId}', 'alice', 'Alice', 'fde', '${FDE_NAME}', 'local', 'active');`);
+    docker(`exec ${STATION_PORTAL_NAME} node portal/src/cli.js provision-fde --fde-name ${FDE_NAME}`);
 
     await waitFor(() => {
-      const st = safe(() => docker('inspect fde-alice --format {{.State.Status}}').trim());
+      const st = safe(() => docker(`inspect ${FDE_CONTAINER} --format {{.State.Status}}`).trim());
       return st === 'running' ? st : null;
-    }, { label: 'fde-alice running' });
+    }, { label: `${FDE_CONTAINER} running` });
 
     const netRow = psql(`SELECT network_name, subnet, gateway FROM fde_networks WHERE fde_id='${S.userId}'`);
     const [networkName, subnet, gateway] = netRow.split('|').map((s) => s.trim());
     S.networkName = networkName;
     S.subnet = subnet;
     S.gateway = gateway;
-    assert.equal(networkName, 'fde-alice');
+    assert.equal(networkName, `fde-${FDE_NAME}`);
     assert.ok(gateway, 'fde gateway .1');
 
-    S.containerId = psql(`SELECT id FROM containers WHERE fde_name='alice'`);
+    S.containerId = psql(`SELECT id FROM containers WHERE fde_name='${FDE_NAME}'`);
     assert.ok(S.containerId, 'containers row');
     S.token = readTokenFromContainer();
     assert.ok(S.token, 'ERIX_STATION_TOKEN 已注入容器');
@@ -186,7 +236,12 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     await ensureLlmBinding({
       docker,
       dynamicDir: S.dynamicRoot,
-      fdeName: 'alice',
+      fdeName: FDE_NAME,
+      // issue #226：helper 的缺省值就是共享栈句柄（宿主 18080 上的 portal、容器名 station-portal、库名 station-db）：
+      // 必须显式传派生值，否则隔离栈里它会去改共享栈的管理台资源。
+      portal: PORTAL,
+      portalContainerName: STATION_PORTAL_NAME,
+      dbContainerName: STATION_DB_NAME,
       adminLogin: 'wp3a-admin',
       adminPassword: 'wp3a-admin-pass-123',
     });
@@ -274,11 +329,11 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
       // eslint-disable-next-line no-console
       console.log('\n[e2e] --- portal logs ---');
       // eslint-disable-next-line no-console
-      console.log(docker('logs station-portal --tail 80'));
+      console.log(docker(`logs ${STATION_PORTAL_NAME} --tail 80`));
       // eslint-disable-next-line no-console
       console.log('\n[e2e] --- LiteLLM logs ---');
       // eslint-disable-next-line no-console
-      console.log(docker('logs station-litellm --tail 40'));
+      console.log(docker(`logs ${STATION_LITELLM_NAME} --tail 40`));
     } catch {}
     throw err;
   }
