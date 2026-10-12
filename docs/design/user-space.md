@@ -167,15 +167,15 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 
 `~/AGENTS.md` 不只是「容器级约定」：自 #257/#258 起它同时是**应用侧要求链的唯一可读面**——
 外部浏览器要用一个跑在预览域名上的应用必须满足哪几条、每种失败形态是谁给的，全部写在这一份文件里
-（当前内容：目录约定 / **预览访问 6 条 + 错误形态对照** / clone 方式 / 环境事实 / git）。
+（当前内容：目录约定 / **预览访问 7 条 + 错误形态对照**（#262 起 7 条）/ clone 方式 / 环境事实 / git）。
 
 | 项 | 口径 | 依据 |
 |---|---|---|
 | 为什么落在 `~/AGENTS.md` 而不是 runner 的 `SYSTEM_PROMPT` | 提示词与 portal 文案是**两个包里的两份文案**；规则抄进提示词就是埋下第二个会过期的真相源（同 `AGENTS.md` §8.10「工具名从注册面取、不手抄清单」） | 决策者定稿（#258 `#issuecomment-6117800165`） |
-| `SYSTEM_PROMPT` 的角色 | 只留一句**强制指针**「开工先读 `~/AGENTS.md`」，**不复述规则**；防漂移：`runner/test/system-prompt.test.js`（该测试反向禁 `allowedHosts` / `credentials` / `CORS` 这三个具体规则词进入提示词） | 同上 |
+| `SYSTEM_PROMPT` 的角色 | 只留一句**强制指针**「开工先读 `~/AGENTS.md`」，**不复述规则**；防漂移：`runner/test/system-prompt.test.js`（该测试反向禁 `allowedHosts` / `credentials` / `CORS` / `Set-Cookie` / `localStorage` / `Bearer` 这六个具体规则词进入提示词，后三个随 #262 第 7 条加入） | 同上 |
 | 内容红线 | 本节**不得出现端口数字 / 端口区间 / 伞域字面量**（号段与域名都是生成值，#246 / #57）；host 一律以「取清单里那一条的 `url`」的口径表达 | `portal/test/materializer.test.js` |
 | 「下发了 ≠ 读了」 | 物化落盘不等于 agent 真读了它；`runner/worker.js` 提示词的强制指针就是为这条 P0 存在（真机实测：旧提示词下 `AGENTS.md` 只在 2 轮出现，1 轮只是 `ls` 扫到） | 复测协议 R-1 P0 |
-| 读取边界（#259 未落地前） | `createJail({ root: cwd })` 的读边界只有项目根（**无只读例外**），故 `readFile` 读不到 `~/AGENTS.md`；提示词与 6 条都自带「用 shell（`cat`）读」的口径。#259（家目录只读例外）**不在本单** | `runner/worker.js` 的 jail 装配；前提单 #259 |
+| 读取边界（#259 未落地前） | `createJail({ root: cwd })` 的读边界只有项目根（**无只读例外**），故 `readFile` 读不到 `~/AGENTS.md`；提示词与 7 条都自带「用 shell（`cat`）读」的口径。#259（家目录只读例外）**不在本单** | `runner/worker.js` 的 jail 装配；前提单 #259 |
 
 本节内容的**实证来源**是演练记录 [`../ops/drill-2026-10-12.md`](../ops/drill-2026-10-12.md) §三：一个最普通的前后端分离应用要满足 6 条，其中 3 条当时根本没告知，靠人发第 3、4 条消息才修通——缺口在告知面，不在 agent 能力。
 
