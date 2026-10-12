@@ -418,9 +418,10 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
   **告知 + 尽力**（落点见 §8.1 末段）。
 - **应用侧的要求链以 `~/AGENTS.md` 为准，本文不重抄**（#257 + #258 落点定稿，2026-10-12）：「在预览域名下跑通
   一个应用」还需要满足一组**与端口分配无关、全在应用侧**的条件（主机白名单 / 跳端口带凭据 / 后端 CORS /
-  逐 host 各放行一次等）；它们的**单一真相**是 materializer 下发的 `~/AGENTS.md` 里那一节（口径见
-  [`user-space.md`](user-space.md) §4.1.2），`runner/worker.js` 的 `SYSTEM_PROMPT` 只放「先读它」的强制指针。
-  本节与 §8.4 只登记**口径来源**，不重抄规则（重抄就是第二份会过期的真相源）。
+  逐 host 各放行一次 / 应用自己的登录态不要用 Cookie（#262：边缘全方法剥 `Cookie` 头）等）；它们的**单一真相**
+  是 materializer 下发的 `~/AGENTS.md` 里那一节（口径见 [`user-space.md`](user-space.md) §4.1.2），
+  `runner/worker.js` 的 `SYSTEM_PROMPT` 只放「先读它」的强制指针。本节与 §8.4 只登记**口径来源**，
+  不重抄规则（重抄就是第二份会过期的真相源）。
 - **派生必须自动**（决策者裁决 4）：写库与 route outbox / materialize revision 入队**同一事务**，
   禁止依赖人工 `enqueueFullRebuild` / `runMaterializerOnce`。
 - **幂等与存量补齐**（决策者裁决 7）：`ensureFdePreviewPorts` 的幂等判据仍是**部分唯一索引 +
