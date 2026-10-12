@@ -65,7 +65,7 @@ function dockerStdin(args, input) {
 }
 
 // M6/#226：DB 数据目录可参数化（与 deploy/docker-compose.yml 的挂载一致）。**缺省不再回退**
-// /docker/station-db——那是共享 dev 栈 station-db 的 bind 源，按缺省 teardown 等于 rm -rf 真机库数据。
+// /docker/station-db——共享 dev 栈库容器的 bind 源，按缺省 teardown 等于 rm -rf 真机库数据。
 const { removeDbDir } = createDbDirCleaner({ docker });
 
 function compose(args, env = {}) {

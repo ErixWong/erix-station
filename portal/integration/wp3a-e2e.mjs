@@ -65,7 +65,7 @@ function dockerStdin(args, input) {
 }
 
 // M6/#226：DB 数据目录可参数化（与 deploy/docker-compose.yml 的挂载一致）。**缺省不再回退**
-// /docker/station-db——那是共享 dev 栈 station-db 的 bind 源，按缺省 teardown 等于 rm -rf 真机库数据。
+// /docker/station-db——共享 dev 栈库容器的 bind 源，按缺省 teardown 等于 rm -rf 真机库数据。
 const { removeDbDir } = createDbDirCleaner({ docker });
 
 function compose(args, env = {}) {
@@ -237,7 +237,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
       docker,
       dynamicDir: S.dynamicRoot,
       fdeName: FDE_NAME,
-      // issue #226：helper 的缺省值就是共享栈句柄（http://127.0.0.1:18080 / station-portal / station-db），
+      // issue #226：helper 的缺省值就是共享栈句柄（宿主 18080 上的 portal、容器名 station-portal、库名 station-db）：
       // 必须显式传派生值，否则隔离栈里它会去改共享栈的管理台资源。
       portal: PORTAL,
       portalContainerName: STATION_PORTAL_NAME,
