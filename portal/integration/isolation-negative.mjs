@@ -199,6 +199,17 @@ const singleSourceProblems = [];
       singleSourceProblems.push('wp6-llm-e2e.mjs: cleanup 里又出现 `2>/dev/null || true`（#224 的静默吞错形态）');
     }
   }
+  // #227.2：脚本里的 compose 命令串必须显式带 `-p `（隔离系用 `${COMPOSE_PROJECT_NAME:?…}`、共享系用
+  // `${COMPOSE_PROJECT_NAME:-station}`）——出现不带 -p 的 `docker compose ` 即红：回到「忘 export 就对
+  // 共享 dev 栈 down -v」的隐式兜底（deploy/docker-compose.yml 的 `name: station`）。
+  for (const file of files) {
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    lines.forEach((line, i) => {
+      if (/docker compose\b/.test(line) && !/ -p /.test(line)) {
+        singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}:${i + 1} docker compose 命令没显式带 -p（#227.2：消灭 compose 文件 name: 的隐式兜底）：${line.trim()}`);
+      }
+    });
+  }
 }
 
 // --- 报告 --------------------------------------------------------------------------------

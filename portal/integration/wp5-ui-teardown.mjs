@@ -7,7 +7,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：显式 -p 把「我就是要动共享栈 station」写进命令（不再靠 compose 文件 name: 的隐式兜底；
+// 设了 COMPOSE_PROJECT_NAME 则显式改用该 project）。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --env-file deploy/.env -f deploy/docker-compose.yml';
 const STATE_FILE = '/tmp/hb/wp5-ui-state.json';
 
 function docker(args) {

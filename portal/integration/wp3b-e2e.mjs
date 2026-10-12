@@ -68,7 +68,9 @@ import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mj
 import { writeTraefikStatic } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：显式 -p（双模脚本）：隔离跑法必带 COMPOSE_PROJECT_NAME（=栈 id，护栏硬要求，#227.1 起）→
+// -p 显式指向本栈；共享跑法（无任何隔离信号）显式 station——两种模式都写死在命令里，不留 `name:` 隐式兜底。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 // F8 并行隔离：固定名/端口全部 env 派生（缺省 = 现状值，共享栈零影响）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;

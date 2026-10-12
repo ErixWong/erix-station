@@ -21,7 +21,10 @@ import {
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：compose 一律显式 -p，且用 bash 的 `${VAR:?msg}`——未 export 时展开即非零退出并点名，
+// 不再依赖「COMPOSE_PROJECT_NAME 环境变量压过 compose 文件 name: station」这条隐式优先级
+// （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
 const LITELLM_HOST_PORT = process.env.LITELLM_HOST_PORT || '4100';
