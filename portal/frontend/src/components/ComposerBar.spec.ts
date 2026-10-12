@@ -72,3 +72,82 @@ describe('ComposerBar · i18n（issue #101 P2）', () => {
     expect(wrapper.get('textarea').attributes('placeholder')).toBe('Create a directory first');
   });
 });
+
+// issue #261B：「重试上一条」按钮的三态渲染（显示条件三要素 + in-flight 禁用 + 点击转发）。
+// store 侧状态机（何时点亮 retryAvailable）由 stores/workbench.spec.ts 负责，这里只装配真状态。
+describe('ComposerBar · issue #261B「重试上一条」按钮', () => {
+  /** 点亮重试面（等价「上一条发送以失败终局收场」后的 store 状态）。 */
+  function armRetry(store: ReturnType<typeof useWorkbenchStore>) {
+    store.lastSend = { sessionId: 's1', content: '很长的任务描述' };
+    store.retryAvailable = true;
+  }
+
+  function retryButton(wrapper: ReturnType<typeof mount>) {
+    return wrapper.findAll('button').find((b) => b.text().includes('重试'));
+  }
+
+  it('输入框空 + 无活跃 run + retryAvailable ⇒ 显示「重试上一条」', async () => {
+    const { store, wrapper } = setup();
+    armRetry(store);
+    await flushPromises();
+    const btn = retryButton(wrapper);
+    expect(btn, '三条件全满足时按钮必须出现').toBeDefined();
+    expect(btn!.text()).toBe('重试上一条');
+  });
+
+  it('输入框非空 ⇒ 隐藏（不做覆盖草稿的歧义行为）', async () => {
+    const { store, wrapper } = setup();
+    armRetry(store);
+    store.inputValue = '我正在打的草稿';
+    await flushPromises();
+    expect(retryButton(wrapper)).toBeUndefined();
+    expect(wrapper.text()).not.toContain('重试上一条');
+  });
+
+  it('有活跃 run ⇒ 隐藏（正在跑的时候没有「上一条」可重发）', async () => {
+    const { store, wrapper } = setup();
+    armRetry(store);
+    store.es.activeRunId = 'r1';
+    await flushPromises();
+    expect(retryButton(wrapper)).toBeUndefined();
+  });
+
+  it('retryAvailable=false ⇒ 隐藏（默认态，含只有 lastSend 的半截状态）', async () => {
+    const { store, wrapper } = setup();
+    await flushPromises();
+    expect(retryButton(wrapper)).toBeUndefined();
+    store.lastSend = { sessionId: 's1', content: 'x' };
+    await flushPromises();
+    expect(retryButton(wrapper)).toBeUndefined();
+    // 且默认态下发送/停止按钮文案与顺序一字不动（既有基线）
+    expect(wrapper.findAll('button').map((b) => b.text())).toEqual(['发送']);
+  });
+
+  it('点击 ⇒ 转发 store.retryLast（不自己发请求）', async () => {
+    const { store, wrapper } = setup();
+    armRetry(store);
+    const spy = vi.spyOn(store, 'retryLast').mockImplementation(async () => {});
+    await flushPromises();
+    await retryButton(wrapper)!.trigger('click');
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('in-flight（POST 往返窗口）期间禁用：防双击双发', async () => {
+    const { store, wrapper } = setup();
+    armRetry(store);
+    store.retryInFlight = true;
+    await flushPromises();
+    const btn = retryButton(wrapper)!;
+    expect(btn.attributes('disabled')).toBeDefined();
+  });
+
+  it('English：按钮文案 Retry last（双语齐全）', async () => {
+    const { store, wrapper } = setup();
+    armRetry(store);
+    setLocale('en');
+    await flushPromises();
+    const btn = wrapper.findAll('button').find((b) => b.text().includes('Retry last'));
+    expect(btn, '英文界面必须有 Retry last').toBeDefined();
+    expect(btn!.text()).toBe('Retry last');
+  });
+});

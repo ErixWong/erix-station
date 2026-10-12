@@ -177,6 +177,75 @@ describe('useEventStream（mock EventSource）', () => {
     expect(hooks.onSep).not.toHaveBeenCalledWith(expect.stringContaining('run 结束'));
   });
 
+  // issue #261：引擎 0.18.0 在 `reason === "failed"` 的终局 additive 透出 `termination.errorCode`
+  // （值域由引擎定义，station 原样透传），前端把它贴到失败横幅末尾——R-2 演练里 8 次 provider
+  // 超时杀 run，用户看不出是 timeout 还是 auth，只能盲重发。
+  it('run_end 失败横幅（#261）：termination.errorCode 非空时原文追加（code=…）到终局文案末尾', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', {
+      seq: 1, run_id: 'run-1',
+      termination: { reason: 'failed', detail: 'upstream timeout', errorCode: 'timeout' },
+      usage: { input_tokens: 3, output_tokens: 5 },
+    });
+    // 追加位置在文案**末尾**（tokens 后缀由外层 i18n 模板拼接，故 code 在 reason 片段末尾、tokens 之前）
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：failed（code=timeout） · tokens 3+5');
+    // 与 error 信封并存：两行各自成立，互不覆盖
+    s.activeRunId.value = 'run-2';
+    lastES().emit('run_end', {
+      seq: 2, run_id: 'run-2',
+      termination: { reason: 'failed', errorCode: 'rate_limited' },
+      error: { code: 'rate_limited', message: '429' },
+    });
+    expect(hooks.onSysErr).toHaveBeenNthCalledWith(2, 'run 结束：failed（code=rate_limited）');
+    expect(hooks.onSysErr).toHaveBeenNthCalledWith(3, 'run 失败：rate_limited — 429');
+  });
+
+  it('run_end 失败横幅（#261）：无/空 errorCode 时终局文案逐字不变；非字符串也不渗进文案', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    // 旧 run / 旧引擎：termination 里没有 errorCode 键
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination: { reason: 'failed' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：failed');
+    // 显式空串 / null / 非字符串：一律不追加（不能让 `（code=undefined）` 渗进用户可见文案）
+    s.activeRunId.value = 'run-2';
+    lastES().emit('run_end', { seq: 2, run_id: 'run-2', termination: { reason: 'aborted', errorCode: '' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：aborted');
+    s.activeRunId.value = 'run-3';
+    lastES().emit('run_end', { seq: 3, run_id: 'run-3', termination: { reason: 'aborted', errorCode: null } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：aborted');
+    s.activeRunId.value = 'run-4';
+    lastES().emit('run_end', { seq: 4, run_id: 'run-4', termination: { reason: 'max_rounds_cap', errorCode: 7 } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：max_rounds_cap');
+    // 与既有标签/落盘细节片段共存：errorCode 缺失时 persistence_failed 的老文案一字不动
+    s.activeRunId.value = 'run-5';
+    lastES().emit('run_end', { seq: 5, run_id: 'run-5', termination: { reason: 'persistence_failed' } });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用）');
+    expect(hooks.onSysErr.mock.calls.every((c) => !String(c[0]).includes('code='))).toBe(true);
+  });
+
+  // 技术细节不进 i18n（工单 #261B）：英文界面下同样原样透出，不新增词条、不回落中文。
+  it('run_end 失败横幅（#261）：en 界面下 code 片段同形（不进 i18n）', () => {
+    setLocale('en');
+    try {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.connect('sess-1');
+      s.activeRunId.value = 'run-1';
+      lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination: { reason: 'failed', errorCode: 'timeout' } });
+      expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: failed（code=timeout）');
+      s.activeRunId.value = 'run-2';
+      lastES().emit('run_end', { seq: 2, run_id: 'run-2', termination: { reason: 'failed' } });
+      expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: failed');
+    } finally {
+      setLocale('zh-CN');
+    }
+  });
+
   // issue #212：worker 透传引擎 termination 后，这两个 reason 必须到工作台前台（红色 syserr），
   // 绝不能落到灰色中性分隔条分支——尤其 persistence_failed（快照没落盘 = 崩溃恢复可能重复副作用）。
   it('run_end 分级（#212）：persistence_failed 红色 syserr，并显示 operation/phase/sideEffect', () => {
