@@ -426,6 +426,15 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - ⚠ **既有 FDE 容器（eric/tetris/todo/blind）仍跑旧 runner 代码**——`ERIX_LLM_TIMEOUT_*` 的四相超时在**镜像重建 + 容器重建**前不生效（blind 靠当时热patch的 `/opt/erix/worker.js` 临时吃到；重建即丢）。新开户 FDE 直接落 v0.1.5。重建时机见 #246 交付后的演练窗口，别拿旧容器没超时报回归。
 - #263 当晚证伪收口（见 §8.16 更正块与 drill §九）；#261/#262 均已关闭，衍生小项（四个超时的 per-FDE 下发光纤）登记在 `docs/env.md` §10.4，要调参再开单。
 
+### 8.18 e2e 隔离化与清场红线（2026-10-13 夜班，PR #267/#269，#226/#224 关单、#227 第 1-3 项）
+
+- **护栏单一来源 `portal/integration/lib/isolated-env.mjs`**：`assertIsolatedEnvironment`/`resolveDbDir`/`createDbDirCleaner`/`assertHostPortsAvailable`/`writeTraefikStatic`/`deriveFdeIpamPools`/`defaultFdeIpamPools` 唯一定义处；wp2a/wp3a/wp3b/wp5/wp6 全部 import，`isolation-negative.mjs` 静态钉死（复制第二份即红）。缺省红线：`STATION_DB_DIR` 缺省/指向 `/docker/station-db` ⇒ **起栈前硬失败，一条 docker 不发**（旧行为是默默 `rm -rf` 共享 dev 库数据目录）；全仓 `allowSharedReset` 唯一声明处 = wp2b（有意重置共享 dev 库，豁免只对恰等于该路径生效）。
+- **compose 一律显式 `-p`**（compose 文件 `name: station` 的隐式兜底已死）：隔离系 `${COMPOSE_PROJECT_NAME:?…}`、共享系 `:-station`；wp6 清场逐动作具名记账 + 按 `station.stack`/`com.docker.compose.project` 标签与按名双路零残留断言，**清理失败必须红**（#224 的「残留 fde-bob 却报 pass」在结构上不可能了）。
+- **FDE_IPAM_POOLS 派生口径**：族 `10.201–10.299.0.0/16`、共享段 `10.200.0.0/16` 一律拒；脚本缺省注入 = 派生段 **+ 10.201.0.0/16**——因为 portal `POOLS.large` 钉死 `portal/src/ipam.js:14`（proxy 白名单必须覆盖 portal 实际分配段）。「两栈并行完全不撞池」还差 portal 池参数化，随 #268。
+- **隔离跑法三要件**（主 agent 真跑踩过、全部有现场证据，完整 env 见 #268 评论）：① `FDE_DEV_MODE=1`（tag 形态 FDE_IMAGE 必需，护栏已强制；digest 形态豁免）；② `BASE_DOMAIN=fde.erix.vip` 必 export（否则路由物化成 `station.localhost`，agentd 拿纯文本 404——`PORTAL_PUBLIC_BASE_URL` 与路由 host 必须同源派生）；③ 脚本不带 `buildFdeImage`/`deriveIsolationEnv` 时要手建镜像 + 手传 `IPAM_RESERVED_SUBNETS`，且构建必 export `HTTP_PROXY=172.20.0.35:19001`（下载层 RUN 被墙会卡 ~30 分钟；构建 arg 参与缓存键，带/不带代理两种形态互不命中）。
+- ⚠ **edge file-provider watch 坑（存量，未修）**：traefik 启动时动态目录里没有 `routes.yml` ⇒ 后来 materializer 原子替换的文件**永远不会被 reload**（整栈看起来正常但预览/internal 全 404；`docker restart station-edge-<id>` 立刻通）。修法（routes.yml 桩预写 / edge 重启兜底）已连同复现步骤登记 **#268**；#227 第 4 项（单 test 粒度）有意未拆，拆之前不往单条 test 堆断言。
+- **真机验收口径新增**：e2e 隔离跑的断言必须带 **agentd 双向链路**（`sse connected`/`sse ping received`，或 GET+POST 探针——#263 教训同源：只验读方法会把半通当全通）。基线不变：根 945/944/0/1、runner 221、前端 410（`isolation-negative.mjs` 不在发现面，缺省 rc=1 是负例证据本体，进 CI 用 `--strict`）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
