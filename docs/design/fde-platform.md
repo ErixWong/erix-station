@@ -380,6 +380,8 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 
 **告知的两处落点（容器侧不做端口管控，只告知）**：① `~/.erix/ports.json`（本图的派生终点，一整段 allocation + 每条真实 `url`）；② `runner/worker.js` 的 `SYSTEM_PROMPT`（复述「端口段由平台分配 / **清单是唯一真相** / 必须从清单里选且绑 `0.0.0.0` / 不要自造域名或端口 / 不要要求平台再加」）。两处都由同一份 DB 事实派生。防漂移测试：`portal/test/materializer.test.js`、`runner/test/system-prompt.test.js`——#246 后这两处**都不允许出现端口数字**（旧写法「复述 4000–4009」本质是拄一份第二清单，换号池时必然漂）；需要时从 `portal/src/previewpool.js` 的常量推导，不在测试里重打一遍。
 
+**第三处落点（#257 + #258，2026-10-12 定稿）**：③ `~/AGENTS.md` 是**应用侧要求链的单一真相**（预览访问要满足哪几条 + 每种错误形态是谁给的），② 对它只留「开工先读 `~/AGENTS.md`」的**强制指针**而不复述规则（抄进提示词就是第二份真相）——职责边界、红线与防漂移断言见 [`user-space.md`](user-space.md) §4.1.2。
+
 ### 8.2 分配策略（开户即发**全局号池里的一个对齐块**；issue #246 定稿，取代 #240 的「人人都是 4000–4009」）
 
 > **裁决（决策者 2026-10-11，issue #246）**：全局**只有一个号池 `22000–29999`**（8000 个号 = **800 段**）。
@@ -414,6 +416,11 @@ reconciler 幂等发布 → Traefik file provider（每 allocation 一条 router
 - **容器侧不做端口管控**（决策者裁决 2）：平台只保证**分给本 FDE 的那一段**预览域名**有路由**；FDE 容器实际
   监听什么端口平台**不检查、不限制、不 reconcile**。「严格管理容器内端口」的设想作废，改为
   **告知 + 尽力**（落点见 §8.1 末段）。
+- **应用侧的要求链以 `~/AGENTS.md` 为准，本文不重抄**（#257 + #258 落点定稿，2026-10-12）：「在预览域名下跑通
+  一个应用」还需要满足一组**与端口分配无关、全在应用侧**的条件（主机白名单 / 跳端口带凭据 / 后端 CORS /
+  逐 host 各放行一次等）；它们的**单一真相**是 materializer 下发的 `~/AGENTS.md` 里那一节（口径见
+  [`user-space.md`](user-space.md) §4.1.2），`runner/worker.js` 的 `SYSTEM_PROMPT` 只放「先读它」的强制指针。
+  本节与 §8.4 只登记**口径来源**，不重抄规则（重抄就是第二份会过期的真相源）。
 - **派生必须自动**（决策者裁决 4）：写库与 route outbox / materialize revision 入队**同一事务**，
   禁止依赖人工 `enqueueFullRebuild` / `runMaterializerOnce`。
 - **幂等与存量补齐**（决策者裁决 7）：`ensureFdePreviewPorts` 的幂等判据仍是**部分唯一索引 +

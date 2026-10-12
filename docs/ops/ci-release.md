@@ -27,8 +27,14 @@
 2. （步骤 ①′）**运行身份诊断**：`id -u` / `id -g` / `id` / `uname -a`（无 `continue-on-error`、无 `if: always()`）。
    为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
    有这四行就不用再猜「今天的 runner 是谁」。
-3. （步骤 ②）根 `npm ci` + `npm test` → **920 项 / 919 通过 / 0 失败 / 1 跳过**（基线，2026-10-11 本机复现；
-   原 910/909 基线上新增 `#252`（工单 `fix-261011-B`）撤预览 grant 只撤 `active` 的 **10 项**：
+3. （步骤 ②）根 `npm ci` + `npm test` → **926 项 / 925 通过 / 0 失败 / 1 跳过**（基线，2026-10-12 本机复现；
+   原 920/919 基线上新增 `#257 + #258`（工单 `feat-261012-01`，告知面单一真相落 `~/AGENTS.md`）的 **6 项**：
+   `portal/test/materializer.test.js` +4（预览访问 6 条逐条锚点 / 错误形态对照 / 红线：零端口数字与区间、
+   零伞域字面量 / `isPlatformManagedPath` 认 home 级 `AGENTS.md` 是平台文件）、
+   `runner/test/system-prompt.test.js` +2（强制指针：措辞必须「先读」且同段自带 shell 读法 /
+   单一来源防漂移：提示词里不得出现 `allowedHosts`·`credentials`·`CORS` 三个具体规则词，并反向断言它们必须在
+   单一真相里）；同文件另**只加不减地扩了既有断言**（端口红线从「数字+区间」扩到按形状禁任何多段域名字面量）。
+   再往前：原 910/909 基线上新增 `#252`（工单 `fix-261011-B`）撤预览 grant 只撤 `active` 的 **10 项**：
    `portal/test/preview-ports.test.js` +3（只撤 active / 谓词源码断言 / fake 真会拦 23514）、
    `portal/test/offboarding.test.js` +5（只撤 active / **重试路径** / 撤 0 行 / 旧谓词 23514 / 整笔回滚）、
    `portal/test/migrations.test.js` +1（0020 静态断言）、`portal/test/preview-grant-checks.js` +1
@@ -37,10 +43,11 @@
    再往前是 `#246 交付②` 预览端口列端点与管理员改块的 21 项（`portal/test/preview-ports.test.js`）、
    `#246` 交付① 预分配号池块的 15 项（`portal/test/portalloc.test.js` 与 `portal/test/{migrations,materializer}.test.js`）
    与 `#241` 预览预检与 deny CORS 的 7 条。
-   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **920 里已含 runner 的 200 项**。
+   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **926 里已含 runner 的 202 项**。
    ⚠️ 同一条发现规则（`**/test/**/*.js`）也会把 `portal/test/` 下的**非用例 helper**算成 1 项 ⇒ 净增用例数
    要按上面的拆解核对，别只看总数（实测：在 `portal/test/` 放一个空的 `x.js`，总数立刻 +1）。
-4. （步骤 ③）`cd runner && npm ci && node --test` → **200/200**。口径见 `AGENTS.md` §4：
+4. （步骤 ③）`cd runner && npm ci && node --test` → **202/202**（#257+#258 前是 200/200；新增的 2 项在
+   `runner/test/system-prompt.test.js`）。口径见 `AGENTS.md` §4：
    **`node --test runner/test/`（目录当参数）在本机 Node 22/24 是坏的**（把目录当模块加载 → `Cannot find module`），别用。
 5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **29 文件 / 391 通过**。
    `NODE_ENV=development` 是**必需**的：devDependencies（vite/tailwind/vitest）在 `NODE_ENV=production` 下会被 `npm ci` 跳过。

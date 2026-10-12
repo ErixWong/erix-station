@@ -59,7 +59,7 @@
 ```
 /srv/erix/users/<fde>/
 ├── home/                       # 容器 HOME 的内容（挂到 /home/<user>）
-│   ├── AGENTS.md               # 平台文件（容器级约定）
+│   ├── AGENTS.md               # 平台文件（**工位约定 + 平台约束的单一真相**：含预览访问要求链，§4.1.2）
 │   ├── .git-credentials        # 凭据类文件（admin 按需投放，不进 manifest，§4.1.1）
 │   ├── .config/
 │   │   ├── tea/config.yml      # Gitea CLI 凭据（按 git_hosts provider 投放，§4.1.1）
@@ -131,7 +131,7 @@
 | `/home/<user>/.erix/config.json` | JSON（§4.3.2） | materializer | worker（`createJsonFileModelConfigProvider`）；agentd 启动校验 | `0644`（root:root） | 否（仅 endpoint/占位 key/model slots；与端口无关） |
 | `/home/<user>/.erix/mcp.json` | JSON（`{"mcpServers":{}}` 空骨架） | materializer | 本期无（MCP 本期不做） | `0644` | 否 |
 | `/home/<user>/.erix/manifest.json` | JSON（§4.3.3） | materializer | agentd / worker（多文件一致性校验） | `0444` | 是（generation 随任一批次递增） |
-| `/home/<user>/AGENTS.md` | Markdown（容器级约定） | materializer | FDE / agent（人读 + pi 逐级加载） | `0644` | 否 |
+| `/home/<user>/AGENTS.md` | Markdown（**工位约定 + 平台约束的单一真相**：目录/环境事实/clone 约定 + 预览访问要求链，§4.1.2） | materializer | FDE / agent（人读 + pi 逐级加载）；runner 的 `SYSTEM_PROMPT` 只放「先读它」的强制指针 | `0644` | 否 |
 | `/home/<user>/projects/<project>/.erix/ports.json` | JSON（§4.3.1） | materializer | agentd / worker（取端口，永不写，规格 §8.4） | `0644` | **是**（本文件就是 allocation 的派生视图） |
 | `/home/<user>/projects/<project>/.erix/AGENTS.md` | Markdown（项目级约定 + clone 指引） | materializer | FDE / agent | `0644` | 否 |
 | `/home/<user>/projects/<project>/.gitignore` | 纯文本（含 `.erix/`） | materializer | git（clone/checkout 时忽略平台文件） | `0644` | 否 |
@@ -162,6 +162,22 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户下线时 portal 尝试删除此文件；失败只告警，不回滚停用。
 
 平台不下发 SSH 私钥：OpenSSH 要求私钥仅属主可读（通常 `0600`），与 worker 通过组权限读取凭据的 `0640` 契约冲突；本契约仅支持 Git HTTPS credential-store 凭据。宿主侧有权访问用户空间的进程仍可读取该明文文件，这是宿主侧残余风险，文件权限不是安全边界。
+
+### 4.1.2 `~/AGENTS.md` 的职责边界：平台约束的**单一真相**（issue #257 + #258，2026-10-12）
+
+`~/AGENTS.md` 不只是「容器级约定」：自 #257/#258 起它同时是**应用侧要求链的唯一可读面**——
+外部浏览器要用一个跑在预览域名上的应用必须满足哪几条、每种失败形态是谁给的，全部写在这一份文件里
+（当前内容：目录约定 / **预览访问 6 条 + 错误形态对照** / clone 方式 / 环境事实 / git）。
+
+| 项 | 口径 | 依据 |
+|---|---|---|
+| 为什么落在 `~/AGENTS.md` 而不是 runner 的 `SYSTEM_PROMPT` | 提示词与 portal 文案是**两个包里的两份文案**；规则抄进提示词就是埋下第二个会过期的真相源（同 `AGENTS.md` §8.10「工具名从注册面取、不手抄清单」） | 决策者定稿（#258 `#issuecomment-6117800165`） |
+| `SYSTEM_PROMPT` 的角色 | 只留一句**强制指针**「开工先读 `~/AGENTS.md`」，**不复述规则**；防漂移：`runner/test/system-prompt.test.js`（该测试反向禁 `allowedHosts` / `credentials` / `CORS` 这三个具体规则词进入提示词） | 同上 |
+| 内容红线 | 本节**不得出现端口数字 / 端口区间 / 伞域字面量**（号段与域名都是生成值，#246 / #57）；host 一律以「取清单里那一条的 `url`」的口径表达 | `portal/test/materializer.test.js` |
+| 「下发了 ≠ 读了」 | 物化落盘不等于 agent 真读了它；`runner/worker.js` 提示词的强制指针就是为这条 P0 存在（真机实测：旧提示词下 `AGENTS.md` 只在 2 轮出现，1 轮只是 `ls` 扫到） | 复测协议 R-1 P0 |
+| 读取边界（#259 未落地前） | `createJail({ root: cwd })` 的读边界只有项目根（**无只读例外**），故 `readFile` 读不到 `~/AGENTS.md`；提示词与 6 条都自带「用 shell（`cat`）读」的口径。#259（家目录只读例外）**不在本单** | `runner/worker.js` 的 jail 装配；前提单 #259 |
+
+本节内容的**实证来源**是演练记录 [`../ops/drill-2026-10-12.md`](../ops/drill-2026-10-12.md) §三：一个最普通的前后端分离应用要满足 6 条，其中 3 条当时根本没告知，靠人发第 3、4 条消息才修通——缺口在告知面，不在 agent 能力。
 
 ### 4.2 FDE / agent 所有（平台不物化内容，只保证目录存在与属主正确）
 
@@ -476,7 +492,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | `ports.json` | agent 读到被改的端口视图 | **对账重物化覆盖**（DB 是真相）；同时写 `audit_log`（`materialize.drift`）+ 告警（P2 通知通道，状态 P1 可查） |
 | `config.json` | 手改 endpoint/model/key | **对账重物化覆盖**为平台值；但真正防「改 endpoint」靠网络（`llm.<base>` 唯一可达，Traefik 注入真 key），文件被改**无害**（占位 key 无价值） |
 | `manifest.json`（0444） | 改哈希/删文件可破坏一致性校验 | 读方校验失败 → 重读 → 仍失败则告警 + 暂停领新 run（§5.4）；对账重物化恢复 |
-| `.erix/AGENTS.md`、`~/AGENTS.md`、`.gitignore` | 改约定 | 对账重物化覆盖为平台模板值 |
+| `.erix/AGENTS.md`、`~/AGENTS.md`、`.gitignore` | 改约定（`~/AGENTS.md` 还携带平台约束的单一真相，§4.1.2） | 对账重物化覆盖为平台模板值 |
 | `skills/`、`todos/`、`cache/`、`projects/<p>` 仓库内容、`worktrees/` | **FDE 合法自管内容，平台不碰** | 永不覆盖、永不告警 |
 
 > 统一口径：**平台文件（§4.1 表）一旦漂移，一律「DB 派生值覆盖 + 审计 + 告警」，绝不向 FDE 的改动妥协**；FDE 自管内容（§4.2 表）平台永不干预。这正是「DB 是真相、文件是派生视图」在写边界上的体现（principles §1 原理三）。
