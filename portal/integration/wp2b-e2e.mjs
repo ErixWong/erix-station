@@ -14,9 +14,13 @@ import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { parseCidr, intToIp } from '../src/ipam.js';
+// #227.1：removeDbDir 收编进单一来源公共模块（wp2b 是共享栈跑法，用 allowSharedReset 显式声明）。
+import { createDbDirCleaner } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：显式 -p 把「我就是要动共享栈 station」写进命令（不再靠 compose 文件 name: 的隐式兜底；
+// 设了 COMPOSE_PROJECT_NAME 则显式改用该 project）。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
 const TRAEFIK_WEB = 'http://127.0.0.1:8090';
 
@@ -37,14 +41,11 @@ function dockerStdin(args, input) {
   });
 }
 
-// M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
-// 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
-const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
-function removeDbDir() {
-  const parent = path.posix.dirname(DB_DIR);
-  const name = path.posix.basename(DB_DIR);
-  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
-}
+// #227.1（removeDbDir 收编单一来源）：解析/删除本体在 lib/isolated-env.mjs。
+// wp2b 是**共享栈跑法**：删 /docker/station-db 是**故意**的（重置共享 dev 库）——allowSharedReset
+// 就是这条显式声明，wp2b 是全仓唯一声明处（isolation-negative 的单一来源断言钉住出现处）；
+// **确认这条重置语义前不要复制到别的脚本**。显式传 STATION_DB_DIR 时临时目录规则照旧生效。
+const { removeDbDir } = createDbDirCleaner({ docker, allowSharedReset: true });
 
 function compose(args, env = {}) {
   return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {

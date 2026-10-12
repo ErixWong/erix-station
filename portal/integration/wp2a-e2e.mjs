@@ -13,8 +13,10 @@
 //   STATION_DOCKER_PROXY_NAME=station-docker-proxy-<栈 id> STATION_EDGE_NAME=station-edge-<栈 id>
 //   PORTAL_HOST_PORT=<非 18080> TRAEFIK_WEB_PORT=<非 8090> TRAEFIK_WEBSECURE_PORT=<非 8443>
 //   FDE_NAME=<含栈 id 的 FDE 名>（`fde-<name>` 是全局 docker 网络/容器名，不派生会与共享栈互删）
-//   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large FDE_IPAM_POOLS=10.201.0.0/16
+//   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large（FDE_IPAM_POOLS 可不传：缺省由 defaultFdeIpamPools(栈 id)
+//     派生——派生段+portal large 池段；显式传入优先，#227.3）
 //   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
+//   FDE_DEV_MODE=1（#227.1 起必需：FDE_IMAGE 为 image:tag 形态时须显式声明 dev 模式；digest 形态豁免）
 //   （本栈**不带** litellm profile ⇒ 不需要 LITELLM_HOST_PORT/STATION_LITELLM_NAME。）
 //   TRAEFIK_STATIC_HOST 由脚本自动生成（只改入口端口的临时 traefik.yml）——Traefik v3 带 --configFile
 //   时 CLI 端口覆盖不生效，不替换就会去抢共享 edge 的 8090/8443（F8 实测）。
@@ -30,11 +32,20 @@ import * as auth from '../src/auth.js';
 import { parseCidr, intToIp } from '../src/ipam.js';
 import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 import {
-  assertHostPortsAvailable, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：compose 一律显式 -p，且用 bash 的 `${VAR:?msg}`——未 export 时展开即非零退出并点名，
+// 不再依赖「COMPOSE_PROJECT_NAME 环境变量压过 compose 文件 name: station」这条隐式优先级
+// （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --env-file deploy/.env -f deploy/docker-compose.yml';
+
+// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
+if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
+  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
+}
+
 // issue #226：入口句柄全部 env 派生（缺省值保留现状值只为可读，隔离跑法由护栏强制显式传）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
