@@ -18,6 +18,7 @@ import {
   runMaterializerOnce,
   rebuildAllFdes,
   hostPathFor,
+  isPlatformManagedPath,
   CONTAINER_HOME,
 } from '../src/materializer.js';
 import { atomicWriteFile, sha256, commitTempFile, writeTempFile } from '../src/fsutil.js';
@@ -158,6 +159,114 @@ test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目
   assert.match(md, /git clone <地址> \./);
   assert.match(md, /git init/);
   assert.doesNotMatch(md, /<repo_url>/);
+});
+
+// ---------------------------------------------------------------------------
+// issue #257 + #258（工单 feat-261012-01）：`~/AGENTS.md` = 平台约束的**单一真相**。
+// 为什么钉这一节：真机演练（docs/ops/drill-2026-10-12.md §三）里，一个最普通的前后端分离应用要
+// 满足 6 条才能被外部浏览器用起来，其中 3 条根本没告知——当时靠人发第 3、4 条消息才修通。
+// 决策者定的落点是「结构化」（不是省 token）：6 条全写在下发的 `~/AGENTS.md` 里，runner 的
+// `SYSTEM_PROMPT` 只留「先读它」的强制指针（定稿：#258 `#issuecomment-6117800165`）。
+// ⇒ 这一节从此是「应用侧要求链」的唯一可读面：锚点被删就等于告知面回归到 #257/#258 那个缺口。
+// ---------------------------------------------------------------------------
+
+/** 抠出「预览访问」整节（从 `## 预览访问` 到下一个 `## ` 标题）——按节断言，不靠关键词跳行凑齐。 */
+function previewAccessSection(md) {
+  const lines = md.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('## 预览访问'));
+  assert.notEqual(start, -1, 'AGENTS.md 必须有「## 预览访问」这一节（#257/#258 的单一真相落点）');
+  assert.match(lines[start], /这 6 条/, '节标题必须把「6 条」钉住（与 #258 那张表同源）');
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((l) => l.startsWith('## '));
+  const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
+  assert.ok(section.length > 600, '预览访问节不该是空壳');
+  return section;
+}
+
+test('renderHomeAgentsMd：预览访问节把 6 条要求链逐条写清（#257/#258）', () => {
+  const section = previewAccessSection(renderHomeAgentsMd({ fdeName: 'alice' }));
+  const items = section.split('\n').filter((l) => /^\d\. /.test(l));
+  assert.equal(items.length, 6, `要求链恰好 6 条，实际 ${items.length} 条`);
+
+  // ① 端口不发明（清单是唯一真相）
+  assert.match(items[0], /端口从 `~\/\.erix\/ports\.json` 取/, '① 端口来源必须写死到清单文件');
+  assert.match(items[0], /不要发明端口/, '① 必须挡住「自己编一个端口」');
+  // ② 监听地址
+  assert.match(items[1], /监听 `0\.0\.0\.0`/, '② 绑 0.0.0.0 的硬约定（规格 §8.4）');
+  assert.match(items[1], /127\.0\.0\.1/, '② 必须给出错法（绑 127.0.0.1）长什么样');
+  // ③ dev server 主机白名单（#257）：窄范围优先 + 不许一把梭 + 配置项名字按框架不同
+  assert.match(items[2], /主机白名单/, '③ 必须点名「主机白名单」这件事');
+  assert.match(items[2], /该条分配记录里的 `url`/, '③ 白名单条目必须从分配记录的 url 取（不是拍脑袋填 host）');
+  assert.match(items[2], /窄范围优先/, '③ 必须要求窄范围优先');
+  assert.match(items[2], /整棵子域/, '③ 后缀匹配必须说清它放开整棵子域');
+  assert.match(items[2], /`allowedHosts: true`/, '③ 必须点名 `allowedHosts: true` 这种一把梭');
+  assert.match(items[2], /"all"|'all'/, '③ 同上（webpack 侧写的是 all）');
+  assert.match(items[2], /Vite 是 `server\.allowedHosts`/, '③ 必须给 Vite 的真实配置项名');
+  assert.match(items[2], /webpack[^。]*是 `devServer\.allowedHosts`/, '③ 必须给 webpack-dev-server 的真实配置项名');
+  assert.match(items[2], /各框架不同/, '③ 必须说明配置项名字因框架而异');
+  assert.match(items[2], /其它框架按你实际用的版本核实/, '③ 必须要求对其它框架按实际版本核实');
+  assert.match(items[2], /别一律叫 `allowedHosts`/, '③ 必须禁止把非同名配置项统一叫 allowedHosts');
+  // ④ 跳预览端口调用要带凭据（#258）：通行凭证是 host-only HttpOnly cookie
+  assert.match(items[3], /跨预览端口调用要带凭据/, '④ 必须要求带凭据');
+  assert.match(items[3], /credentials:'include'/, '④ 必须给 fetch 的具体写法');
+  assert.match(items[3], /host-only/, '④ 必须说明凭证是 host-only（每个预览 host 一份）');
+  assert.match(items[3], /HttpOnly/, '④ 必须说明凭证是 HttpOnly（所以不能靠 JS 读 cookie，只能带凭据）');
+  assert.match(items[3], /preview_ticket_required/, '④ 必须给出被边缘拒时的错误码');
+  // ⑤ 后端 CORS（#258）：不能回 *，预检不带凭据要在鉴权之前
+  assert.match(items[4], /CORS 不能回 `\*`/, '⑤ 必须禁止 ACAO 回 `*`');
+  assert.match(items[4], /回显请求的 `Origin`/, '⑤ 必须要求回显 Origin');
+  assert.match(items[4], /Access-Control-Allow-Credentials: true/, '⑤ 必须给凭据头名与取值');
+  assert.match(items[4], /Vary: Origin/, '⑤ 必须要求 Vary: Origin（否则缓存串源）');
+  assert.match(items[4], /OPTIONS[\s\S]{0,40}不带凭据[\s\S]{0,40}鉴权[\s\S]{0,10}之前/, '⑤ 必须写明预检不带凭据、要在鉴权前直接答（#241 的实病）');
+  // ⑥ 每条 host 各需一次放行（#247 未完，现阶段靠用户逐条点）
+  assert.match(items[5], /每条预览 host 各需一次放行/, '⑥ 必须写明逐 host 各自放行');
+  assert.match(items[5], /前端那条 host 有票 ≠ 后端那条也有票/, '⑥ 必须拆穿「前端有票 ≠ 后端有票」这个误判');
+  assert.match(items[5], /打开预览/, '⑥ 必须给出用户实际要做的那个动作');
+});
+
+test('renderHomeAgentsMd：预览访问节给出错误形态对照（谁给的答案 → 改哪一侧）', () => {
+  const section = previewAccessSection(renderHomeAgentsMd({ fdeName: 'alice' }));
+  // 三种真实形态（文本形状取自 portal/src/preview.js:313 + http.js:69 errorBody 与 Vite 自带文案）
+  assert.match(section, /Blocked request\. This host[\s\S]{0,30}is not allowed/, '必须是 dev server 真实文案（模型 grep 得到）');
+  assert.match(section, /\{"error":\{"code":"preview_ticket_required"/, '必须是平台边缘真实 JSON 体形状（errorBody）');
+  assert.match(section, /502 Bad Gateway/, '必须覆盖 502（放行 ≠ 有人监听）');
+  assert.match(section, /应用给的/, '必须把「Blocked request」归给应用（否则 agent 去改平台）');
+  assert.match(section, /平台边缘给的/, '必须把「preview_ticket_required」归给平台边缘');
+  assert.match(section, /没人在监听/, '必须把 502 归因到没监听');
+  // #258 的附带坑：错误被渲染成 [object Object] 后真实原因全丢
+  assert.match(section, /\[object Object\]/, '必须提醒不要把响应对象直接塞进模板');
+  assert.match(section, /`code` \/ `message`/, '必须要求把 code/message 显式渲染出来');
+});
+
+test('renderHomeAgentsMd：预览访问节不出现端口数字与区间，全文不出现伞域字面量（#257 红线）', () => {
+  const md = renderHomeAgentsMd({ fdeName: 'alice' });
+  const section = previewAccessSection(md);
+  // 端口号是生成值（#246 号池）：新节里连一个 4-5 位数字都不许出现（0.0.0.0 / 127.0.0.1 / 403 / 502 不在其中）。
+  assert.deepEqual(md.match(/\b\d{4,5}\b/g) || [], ['0644'],
+    '全文四位数只允许出现文件权限 `0644`；端口号（4xxx / 22xxx / 号池边界）一律不得出现');
+  assert.doesNotMatch(section, /\b\d{4,5}\b/, `预览访问节不得出现任何 4-5 位数字：${section}`);
+  assert.doesNotMatch(section, /\b\d{4,5}\s*[–—-]\s*\d{4,5}\b/, '不得出现端口区间字面量');
+  // 伞域也是部署变量（docs/env.md §1：BASE_DOMAIN = 伞域）——抄进下发的家目录文件就是第二份会过期的真相。
+  assert.doesNotMatch(md, /erix\.vip/i, '不得出现伞域字面量（现网取 fde.erix.vip，但它是部署变量）');
+  assert.doesNotMatch(md, /\bfde\.[a-z0-9-]+\.(vip|com|cn|net|org)\b/i, '不得出现「fde.<可注册域>」形状的伞域字面量');
+  assert.doesNotMatch(md, /localhost/i, '不得把代码默认兑底域拄进下发文件');
+  // 域名与 host 必须以「从清单的 url 取」的口径出现，而不是写某个具体名字。
+  assert.match(section, /该条分配记录里的 `url`/, 'host 来源必须是分配记录里的 url');
+});
+
+test('isPlatformManagedPath：认 home/AGENTS.md 是平台文件（单一真相必须被对账覆盖）', () => {
+  // 精确分支（materializer.js 里 `rel === 'AGENTS.md'`）：预览访问 6 条就住在这个文件里，
+  // 一旦它不再被认作平台文件，stale 清理不再管它、手改也不再被对账重物化覆盖（user-space §9.3）。
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/AGENTS.md`), true, 'home/AGENTS.md 必须是平台管理路径');
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/.erix/manifest.json`), true, '.erix/* 仍属平台文件');
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/projects/p1/.gitignore`), true);
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/projects/p1/.erix/AGENTS.md`), true);
+  // 负面：用户自建的同名文件不能被平台覆盖（M1 行为面用例已覆盖，这里钉住「精确不后缀猜」）。
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/projects/p1/AGENTS.md`), false, '项目根 AGENTS.md 是仓库自带的，平台不写');
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/projects/p1/repo/AGENTS.md`), false, '嵌套 repo 里的 AGENTS.md 不属平台');
+  assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/AGENTS.md.bak`), false, '后缀猜会把用户备份文件误认成平台文件');
+  assert.equal(isPlatformManagedPath('/home/other/AGENTS.md'), false, '只能是本容器家目录');
+  assert.equal(isPlatformManagedPath(undefined), false);
 });
 
 test('renderManifest：files 键字典序 + generation + materialized_at', () => {

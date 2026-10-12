@@ -71,6 +71,32 @@ export function renderHomeAgentsMd({ fdeName }) {
     '- 回流走 fork/PR，不直接在主干改',
     '- `node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）',
     '',
+    // issue #257 + #258（工单 feat-261012-01）：**平台侧应用要求链的单一真相就落在这一节**。
+    // 为什么落在 `~/AGENTS.md` 而不是 runner 的 `SYSTEM_PROMPT`（决策者 2026-10-12 定稿，#258
+    // `#issuecomment-6117800165`）：提示词与 portal 常量是两个包里的两份文案，规则抄进提示词就是
+    // 埋下第二个会过期的真相源（同 AGENTS.md §8.10「工具名从注册面取、不手抄清单」）；提示词只留
+    // 「先读 `~/AGENTS.md`」的强制指针。这 6 条的实证来源是演练记录 docs/ops/drill-2026-10-12.md §三
+    // （一个最普通的前后端分离 to-do 要满足 6 条，当时有 3 条压根没告知，靠人发第 3、4 条消息才修通）。
+    // ⚠ 红线：本节**不许出现端口数字 / 端口区间 / 伞域字面量**（号段与域名都是生成值），由
+    //   portal/test/materializer.test.js 钉死；#259（jail 只读例外）落地前家目录文件只能 `cat`。
+    '## 预览访问：外部浏览器要用这个应用，必须满足这 6 条',
+    '',
+    '> 平台负责把请求送到容器，但**容器内不做端口管控**：下面 6 条全在你这一侧，缺一条就有一种挂法。',
+    '',
+    '1. **端口从 `~/.erix/ports.json` 取**——前后端各占清单里的一条，不要发明端口，也不要凭记忆猜。',
+    '2. **服务监听 `0.0.0.0`**（容器内），绑 `127.0.0.1` 等于没人接。',
+    '3. **把预览 host 加进 dev server 自己的主机白名单**：host 就取该条分配记录里的 `url`（**窄范围优先**，用到的逐条列全）。后缀匹配（一次放开整棵子域）可以接受，但要在注释里说明它放开了整棵子域；**不要 `allowedHosts: true` / `"all"` 一把梭**。配置项名字各框架不同——Vite 是 `server.allowedHosts`，webpack-dev-server 是 `devServer.allowedHosts`，其它框架按你实际用的版本核实，别一律叫 `allowedHosts`。',
+    '4. **跨预览端口调用要带凭据**：前端 `fetch` 传 `credentials:\'include\'`（XHR 用 `withCredentials`）。平台的通行凭证是**每条 host 各自的 host-only `HttpOnly` cookie**，不带凭据会被边缘拒成 `403`，且响应体里的 `code` 是 `preview_ticket_required`。',
+    '5. **后端 CORS 不能回 `*`**：带凭据的请求必须**回显请求的 `Origin`**，并带 `Access-Control-Allow-Credentials: true` 与 `Vary: Origin`（`*` 与凭据不兼容）。`OPTIONS` 预检按规范**不带凭据**，要在鉴权**之前**直接答掉，否则「缺票据」会被伪装成「应用 CORS 配错」。',
+    '6. **每条预览 host 各需一次放行**：前端那条 host 有票 ≠ 后端那条也有票。现阶段用户需逐条点「打开预览」；自测跨 host 调用前，先把用到的每条 host 都各自放行一次。',
+    '',
+    '**错误形态对照**（先分清是谁给的，再决定改哪一侧）：',
+    '',
+    '- `403` + 正文含 `Blocked request. This host (…) is not allowed.` ⇒ **应用给的**（dev server 主机白名单，第 3 条）。',
+    '- `403` + 体形如 `{"error":{"code":"preview_ticket_required",…}}` ⇒ **平台边缘给的**（凭据 / 票据链路，第 4、6 条）。',
+    '- `502 Bad Gateway` ⇒ 平台已放行，但**那个端口上没人在监听**（回到第 1、2 条：端口取清单、绑 `0.0.0.0`）。',
+    '- 前端渲染错误时把响应里的 `code` / `message` 显示出来；把响应对象直接塞进模板会得到 `[object Object]`，把上面这些线索全吃掉。',
+    '',
     '## clone 方式',
     '',
     '- 平台不 clone、不下发 git 凭据；SSH key / token 由你在容器内自行配置（等同你自己的开发机）',
@@ -274,8 +300,13 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
  * 平台管理路径的精确判定（不用「后缀猜」）：只认平台自己会生成的路径——
  * home/.erix 目录、home/AGENTS.md（精确）、projects/<project>/.gitignore（恰好在项目根）、
  * projects/<project>/.erix/*。用户自建的嵌套 .gitignore/AGENTS.md（如 projects/<project>/<repo>/.gitignore）不在此列。
+ *
+ * 导出理由（工单 feat-261012-01）：`~/AGENTS.md` 自 #257/#258 起是平台约束的**单一真相**，
+ * 「它算平台文件」这条判定必须直接钉住（`portal/test/materializer.test.js`）——走行为面只能证伪
+ * 反面（用户嵌套同名文件存活），正面分支（rel === 'AGENTS.md'）因为 AGENTS.md 恒在 desired plan 里
+ * 而无法从 stale 清理路径跑到。
  */
-function isPlatformManagedPath(containerPath) {
+export function isPlatformManagedPath(containerPath) {
   if (typeof containerPath !== 'string' || !containerPath.startsWith(`${CONTAINER_HOME}/`)) return false;
   const rel = containerPath.slice(CONTAINER_HOME.length + 1);
   if (rel === 'AGENTS.md') return true;
