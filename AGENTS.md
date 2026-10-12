@@ -407,8 +407,12 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   `docs/ops/ci-release.md` §1 与 `.github/workflows/ci.yml` 步骤 ② 注释已同步。**前端零改动**（基线 29 文件 / 391 不变；
   本单没跑前端，沙箱里没有 `portal/frontend/node_modules`）。`docs/data/schema.sql` 一字节未动，零 DDL / 零依赖 / 零 lockfile，
   `runner/lib/**` 与 `portal/src/{preview,http}.js` 未动。
-- [ ] **待办（主 agent）**：真机 R-1 **P0：下发了 ≠ 读了** —— 新提示词下复测，先断言 transcript 里出现读 `~/AGENTS.md`
-  的调用（#259 落地前必然是 `shell cat`），为 0 直接判失败；再看第一轮是否不再需要人发第 3、4 条消息。
+- [x] **真机 R-1 已跑并全部通过（v0.1.4，全新工位 `blind`，记录见 `docs/ops/drill-2026-10-12.md` §八）**：**P0 成立**——第 1 轮就 `cat ~/AGENTS.md; cat ~/.erix/ports.json`（起服务在第 6 轮，**读在前**），
+  第 3/7 轮直接引用「AGENTS.md says… / note 4」，**零次「被宿主边界拒绝」**（shell 口径生效）；P3/P3b/P4/P5/P6 逐项过
+  （预检实测 `204` + 回显 Origin + `Allow-Credentials: true` + `Vary: Origin`；`allowedHosts` 是**窄范围逐条**不是 `true`）。
+  **1 条消息、零返修**（run `0831b43c`、27 轮、↑597,315 ↓23,317、`judge_done`），对照组就是夜班自己那 4 条消息。
+  ⚠ **协议里的反向判据我自己写错了**：`messages` 表同时存 user 与 assistant ⇒ 正确口径是 **`role='user'` 计数 == 1**（已在 #258 更正）。
+  ⚠ **#247 现场数据**：跳 host 要**点 2 次**「打开预览」（22030/22031 各一次）——不计入 R-1 失败，但是 #247 该做的又一条实测依据。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
