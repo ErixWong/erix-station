@@ -26,6 +26,7 @@ import { createToolRegistry } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
 import { parseMaxRounds } from './lib/config.js';
 import { resolveRunModel } from './lib/llm-models.js';
+import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
@@ -261,10 +262,14 @@ async function startRun(msg) {
   // 旧 agentd / 无配置（msg 无 models）→ 占位 config 的 model 名（现状行为）。endpoint/key 始终走占位文件。
   // models 只经 IPC 内存传递，**不写任何文件/日志**。
   const modelName = resolveRunModel(defaultCfg.model, msg.models);
+  // issue #261：显式传相超时（四项默认与 env 覆盖见 lib/llm-timeouts.js）。真正要的效果不是数值本身，
+  // 而是「传了显式相 ⇒ 引擎 hasExplicitPhase=true ⇒ legacyTimeoutMs=undefined」，关掉那条从请求发起
+  // 就定死的 120s 绝对死线（重型轮子必撞）。回归门：runner/test/llm-timeouts.test.js ②。
   const provider = createOpenAIProvider({
     endpoint: defaultCfg.endpoint,
     apiKey: defaultCfg.apiKey,
     model: modelName,
+    timeouts: resolveLlmTimeouts(process.env),
   });
 
   // 3) tools（§6.3-3：jail + 文件工具（issue #228 起 = 上游 erix-agent createFileTools 的薄装配，
