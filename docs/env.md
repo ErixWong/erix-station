@@ -385,6 +385,34 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `ERIX_SESSION_AUTO_TITLE` | 会话标题自动生成与自动更新总开关（issue #88）：worker 侧在 `runToolLoop` 正常返回后用既有 provider 发一次轻量非流式补全（首条用户消息 + finalText 各截 500 字符，≤30 字符标题，10s 超时，maxTokens 512），标题随 `run_finished` 上报、portal 异步评估落库（不阻塞消息主链路）；失败/空降级链：首条用户消息截断 → cwd basename。手工改过的标题（`title_source='manual'`）不被覆盖。**下发光纤**：portal env → provisioner Env → FDE 容器 env | `1`（开；`0` = 关闭） |
 | `ERIX_SESSION_AUTO_TITLE_MIN_NEW` | 防抖阈值 N：距上次自动标题更新 ≥ N 轮新 user 消息才刷新（或话题漂移启发式命中：≥1 轮新消息且与现标题关键词零重合）。portal 侧落库评估用，不下发 worker | `3` |
 
+### 10.4 补登：worker 侧 LLM provider 超时相（runner `lib/llm-timeouts.js`，issue #261，2026-10-12 登记）
+
+> 以下四个变量由 FDE 容器内 **worker** 进程读取（`runner/lib/llm-timeouts.js`，`createOpenAIProvider({ timeouts })`），
+> 不经 compose 插值。**立案依据**（issue #261 + R-2 演练实测）：worker 此前不传任何超时 ⇒ 引擎 erix-agent 0.18.0
+> 走 legacy 模式，`legacyDeadline = startedAt + 120000` 是一条**从请求发起就定死的绝对线**（流式有 chunk 回流也不重置），
+> 重型轮子（8-10K 输出 ≈ 100-130s）必撞 ⇒ run 整条 `failed`、`termination.detail="request timed out"`。
+> **真正的修法不是把 120000 换大**：只要传了**任一**显式相超时，引擎就置 `hasExplicitPhase=true` ⇒
+> `legacyTimeoutMs=undefined` ⇒ 那条绝对死线整体消失，改由下面三相分别计时。
+
+| 变量 | 用途 | 默认 / 示例 |
+|---|---|---|
+| `ERIX_LLM_TIMEOUT_FIRST_BYTE_MS` | **首字节前**的静默上限（用户语义：超过 N 秒没返回才算超时）。发请求后迟迟拿不到第一个字节即 `firstByte timed out` | `240000`（240s，真超时） |
+| `ERIX_LLM_TIMEOUT_STREAM_IDLE_MS` | 见到首字节后**相邻两个 chunk 之间**的静默上限——**每来一个 chunk 重新计时**（有返回就不算超时），所以长推理 / 慢生成不会被误杀 | `180000`（180s，真超时） |
+| `ERIX_LLM_TIMEOUT_STREAM_TOTAL_MS` | 一条流的**总时长**上限。默认值是 `2147483647`（=2^31-1 ms ≈24.85 天），语义是**「事实关闭总闸 + 溢出安全」，不是一个超时值**（陷阱说明见下方注） | `2147483647` |
+| `ERIX_LLM_TIMEOUT_REQUEST_MS` | 只兜**非流式**路径（会话标题生成等）的整请求上限，防悬挂；流式路径不受它约束（三相各管各的） | `300000`（300s） |
+
+> **解析口径**（`runner/lib/llm-timeouts.js`）：未设置 / 空串 → 静默取默认；合法 = 有限且 ≥1 的毫秒数；
+> 超上限钳到 `2147483647`；其余非法值（`0` / 负数 / `NaN` / 垃圾串 / **`Infinity`**）**回落默认 + `console.warn` 一次**，
+> 绝不抛错炸 run。**为什么 `streamTotalTimeoutMs` 只能写 `2147483647`**（引擎 0.18.0 源码 + 实测取证，钉在 `runner/test/llm-timeouts.test.js` ③）：
+> 引擎对这一相**没有「显式关闭」的值**——`undefined`/`null` 回落引擎默认 `300000`（重型轮子照样被杀）；
+> `0`/`false` 原样透传后经 `Math.max(0, …)` 变成 `setTimeout(fn, 0)` ⇒ **流一开跑就被杀**（实测 3ms）；
+> `Infinity` 也原样透传，而非流式路径把它直接交给 Node `setTimeout` ⇒ 溢出 `TimeoutOverflowWarning` 钳成 **1ms** ⇒ **立刻 `request timed out`**（实测 7ms，与本单要修的症状同形）。
+> `2147483647` 是 `setTimeout` 不溢出的最大 delay，因此是唯一两条路都安全的「不设总闸」写法——**别改成 `Infinity`**。
+>
+> **下发链路现状**（本单未动 `deploy/`）：这四个名字目前**不在** `deploy/fde-proxy/server.js` 的 `ENV_KEY_ALLOW` 白名单里，
+> 也未进 `portal/src/provisioner.js` 的 Env 下行集，所以现在只能靠**容器创建时直接注入**（或进容器改 env 后重建）生效；
+> 要像 `ERIX_MAX_ROUNDS` 那样走「portal env → provisioner → 容器 env」的光纤，需后续单登记两处（改值本身无需重建镜像）。
+
 ---
 
 ## 11. P1 运行时参数表（超时 / 背压 / 时间权威 / 日志）
