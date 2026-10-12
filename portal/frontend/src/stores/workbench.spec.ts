@@ -1082,3 +1082,210 @@ describe('issue #189：折叠段 folded 字段与原文懒加载', () => {
     }
   });
 });
+
+// issue #261B：一键「重试上一条」——R-2 演练 8 次 provider 超时杀 run，用户全部手打重发长消息。
+// 语义锚点（工单 #261B）：① 失败终局（与红色 syserr 同一个 RUN_FAIL_REASONS 判定集合）才点亮；
+// ② 重试**复用同一条 send() 链路**（断言口径：POST 端点与首条完全相同、content 逐字相同）；
+// ③ 前置守卫任一不满即 no-op；④ 切会话/关会话重置；⑤ 仅内存——本套件不校验持久化（本就不做）。
+describe('issue #261B：一键「重试上一条」（retryAvailable / retryLast）', () => {
+  /** POST /messages 的 content 流水（断言「同一条链路 + 同 content」的唯一真相）。 */
+  let postBodies: string[] = [];
+
+  /** 标准舞台：会话 s1/s2 可开（active_run_id 一律 null），POST /messages 依次回 r1、r2… */
+  function retryStage() {
+    mockFetch((url, init) => {
+      if (url.startsWith('/api/dirs')) return { status: 200, body: { dirs: [DIR_A, DIR_B] } };
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as { content: string };
+        postBodies.push(body.content);
+        return {
+          status: 200,
+          body: { message: { id: `m${postBodies.length}`, content: body.content }, run: { id: `r${postBodies.length}` } },
+        };
+      }
+      const sess = url.match(/^\/api\/sessions\/(s\d)$/);
+      if (sess) return { status: 200, body: { session: { id: sess[1], active_run_id: null }, messages: [], last_seq: 0 } };
+      return { status: 200, body: { items: [] } };
+    });
+  }
+
+  function lastES() {
+    return FakeEventSource.instances.at(-1)!;
+  }
+
+  /** 走完「打开会话 → 发送 → run 失败」的标准前奏，返回 store（此时 retryAvailable 应为 true）。 */
+  async function failedRunStore(content = '很长的任务描述，手打重发很痛') {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = content;
+    await store.send();
+    endCurrentRun(store, { reason: 'failed', errorCode: 'timeout' }, 9);
+    return store;
+  }
+
+  /** 以「当前活跃 run」为 run_id 投递 run_end（run_id 不等于 activeRunId 的事件被 useEventStream 丢弃）。 */
+  function endCurrentRun(store: ReturnType<typeof useWorkbenchStore>, termination: Record<string, unknown>, seq = 99) {
+    lastES().emit('run_end', { seq, run_id: store.es.activeRunId, termination });
+  }
+
+  beforeEach(() => {
+    postBodies = [];
+  });
+
+  it('失败终局（failed ∈ RUN_FAIL_REASONS）→ retryAvailable=true，lastSend 记录同会话同内容', async () => {
+    retryStage();
+    const store = await failedRunStore();
+    expect(store.es.activeRunId).toBeNull(); // run 已结束（无活跃 run）
+    expect(store.retryAvailable).toBe(true);
+    expect(store.lastSend).toEqual({ sessionId: 's1', content: '很长的任务描述，手打重发很痛' });
+  });
+
+  it('红色横幅与重试面同源：非红色集合的终局（end_turn / no_tool）一律不点亮', async () => {
+    retryStage();
+    const store = await failedRunStore();
+    expect(store.retryAvailable).toBe(true);
+    // 正常终局把上一次失败点亮的面收回（下一次 run 是 end_turn，不该继续显示「重试上一条」）
+    store.es.activeRunId = 'r2';
+    endCurrentRun(store, { reason: 'end_turn' }, 10);
+    expect(store.retryAvailable).toBe(false);
+    // no_tool 属「截断但非故障」，不在红色集合 → 同样不点亮
+    store.es.activeRunId = 'r3';
+    endCurrentRun(store, { reason: 'no_tool' }, 11);
+    expect(store.retryAvailable).toBe(false);
+  });
+
+  it('发送成功即记 lastSend，但失败路径不记（POST 没成功就没有可重试的「上一条」）', async () => {
+    mockFetch((url, init) => {
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        return { status: 409, body: { error: { code: 'run_in_progress', message: 'run in progress' } } };
+      }
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = '没发出去的内容';
+    await store.send();
+    expect(store.lastSend).toBeNull();
+    expect(store.retryAvailable).toBe(false);
+    await store.retryLast();
+    expect(postBodies).toEqual([]);
+  });
+
+  it('retryLast：复用同一条 send 链路重发同 content（同端点）+ 成功后清标志', async () => {
+    retryStage();
+    const store = await failedRunStore('重发这条');
+    postBodies = [];
+    await store.retryLast();
+    expect(postBodies).toEqual(['重发这条']); // 新一次 POST、content 逐字相同
+    expect(store.es.activeRunId).toBe('r1'); // 新 run 已置位
+    expect(store.retryAvailable).toBe(false); // 成功即收回
+    expect(store.es.esSessionId).toBe('s1'); // 同一会话，不是另起 api() 的野路子
+  });
+
+  it('retryLast 打到 messages 端点（与首条发送同一 URL，未另起 api() 调用）', async () => {
+    const urls: string[] = [];
+    mockFetch((url, init) => {
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        urls.push(url);
+        const body = JSON.parse(String(init.body)) as { content: string };
+        return { status: 200, body: { message: { id: 'm', content: body.content }, run: { id: `r${urls.length}` } } };
+      }
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = 'A';
+    await store.send();
+    endCurrentRun(store, { reason: 'failed' }, 1);
+    await store.retryLast();
+    expect(urls).toEqual(['/api/sessions/s1/messages', '/api/sessions/s1/messages']);
+  });
+
+  it('前置守卫：无活跃 run 之外任一不满 ⇒ no-op（有活跃 run / 无 lastSend / 输入框有草稿 / in-flight）', async () => {
+    retryStage();
+    const store = await failedRunStore();
+    postBodies = [];
+    // ① 有活跃 run（用户已抢先手动发了新的）
+    store.es.activeRunId = 'rX';
+    await store.retryLast();
+    expect(postBodies).toEqual([]);
+    store.es.activeRunId = null;
+    // ② 输入框有草稿：不吞草稿、也不发（与按钮显隐条件同源）
+    store.inputValue = '我刚打的草稿';
+    await store.retryLast();
+    expect(postBodies).toEqual([]);
+    expect(store.inputValue).toBe('我刚打的草稿');
+    store.inputValue = '';
+    // ③ in-flight 期间（双击）
+    store.retryInFlight = true;
+    await store.retryLast();
+    expect(postBodies).toEqual([]);
+    store.retryInFlight = false;
+    // ④ 无 lastSend（新 store）
+    setActivePinia(createPinia());
+    const fresh = useWorkbenchStore();
+    await fresh.retryLast();
+    expect(fresh.retryAvailable).toBe(false);
+  });
+
+  it('in-flight 期间 retryInFlight 置位、往返结束复位', async () => {
+    retryStage();
+    const store = await failedRunStore();
+    const p = store.retryLast();
+    expect(store.retryInFlight).toBe(true); // POST 往返窗口内（此时 activeRunId 尚未置位）
+    await p;
+    expect(store.retryInFlight).toBe(false);
+  });
+
+  it('重试 POST 失败：retryAvailable 保留（按钮可再点），且不写输入框', async () => {
+    let calls = 0;
+    mockFetch((url, init) => {
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        calls++;
+        return calls === 1
+          ? { status: 200, body: { message: { id: 'm1', content: 'x' }, run: { id: 'r1' } } }
+          : { status: 409, body: { error: { code: 'run_in_progress', message: 'run in progress' } } };
+      }
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = 'x';
+    await store.send();
+    endCurrentRun(store, { reason: 'failed' }, 1);
+    expect(store.retryAvailable).toBe(true);
+    await store.retryLast();
+    expect(store.retryAvailable).toBe(true);
+    expect(store.inputValue).toBe(''); // 重试路径不回填输入框（回填是「用户自己打的那次」的语义）
+  });
+
+  it('切会话 / 关会话 / 切目录 ⇒ 重试面重置，跨会话的失败不误点亮', async () => {
+    retryStage();
+    const store = await failedRunStore();
+    expect(store.retryAvailable).toBe(true);
+    await store.openSession('s2'); // 切会话 ⇒ 重置
+    expect(store.retryAvailable).toBe(false);
+    // 旧会话（s1）的 run 终态不得把当前会话（s2）标成可重试：lastSend 归属核对
+    store.es.activeRunId = 'r1';
+    endCurrentRun(store, { reason: 'failed' }, 12);
+    expect(store.retryAvailable).toBe(false);
+    // 关会话（深链回退 / 会话不存在）⇒ 重置，且 sessionId 已空，随后的终态也不点亮
+    store.resetSessionView();
+    expect(store.retryAvailable).toBe(false);
+    store.es.activeRunId = 'r1';
+    endCurrentRun(store, { reason: 'failed' }, 13);
+    expect(store.retryAvailable).toBe(false);
+    // 切目录：重新走一次「发送 → 失败」再切目录
+    await store.openSession('s1');
+    store.inputValue = '再来一次';
+    await store.send();
+    endCurrentRun(store, { reason: 'failed' }, 14);
+    expect(store.retryAvailable).toBe(true);
+    await store.selectDir(DIR_B.cwd);
+    expect(store.retryAvailable).toBe(false);
+  });
+});
