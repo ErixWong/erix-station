@@ -162,12 +162,15 @@ test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目
 });
 
 // ---------------------------------------------------------------------------
-// issue #257 + #258（工单 feat-261012-01）：`~/AGENTS.md` = 平台约束的**单一真相**。
+// issue #257 + #258（工单 feat-261012-01）+ #262（工单 fix-261012-02）：`~/AGENTS.md` = 平台约束的**单一真相**。
 // 为什么钉这一节：真机演练（docs/ops/drill-2026-10-12.md §三）里，一个最普通的前后端分离应用要
-// 满足 6 条才能被外部浏览器用起来，其中 3 条根本没告知——当时靠人发第 3、4 条消息才修通。
-// 决策者定的落点是「结构化」（不是省 token）：6 条全写在下发的 `~/AGENTS.md` 里，runner 的
+// 满足 6 条才能被外部浏览器用起来，其中 3 条根本没告知——当时靠人发第 3、4 条消息才修通（drill 记录是
+// 当时的事实，作为历史记录不改）。
+// 决策者定的落点是「结构化」（不是省 token）：要求链全写在下发的 `~/AGENTS.md` 里（#262 起 **7 条**），runner 的
 // `SYSTEM_PROMPT` 只留「先读它」的强制指针（定稿：#258 `#issuecomment-6117800165`）。
-// ⇒ 这一节从此是「应用侧要求链」的唯一可读面：锚点被删就等于告知面回归到 #257/#258 那个缺口。
+// 第 7 条（应用自己的登录态不要用 Cookie）来自 R-2 演练：r2-app 用 cookie 会话死了、r1-app 用 Authorization
+// 头活着，差异纯靠运气（#262）；#263 已证伪「只有部分方法被剥」的半通猜想——边缘对 `Cookie` 头全方法剥除。
+// ⇒ 这一节从此是「应用侧要求链」的唯一可读面：锚点被删就等于告知面回归到 #257/#258（以及 #262）那个缺口。
 // ---------------------------------------------------------------------------
 
 /** 抠出「预览访问」整节（从 `## 预览访问` 到下一个 `## ` 标题）——按节断言，不靠关键词跳行凑齐。 */
@@ -175,7 +178,7 @@ function previewAccessSection(md) {
   const lines = md.split('\n');
   const start = lines.findIndex((l) => l.startsWith('## 预览访问'));
   assert.notEqual(start, -1, 'AGENTS.md 必须有「## 预览访问」这一节（#257/#258 的单一真相落点）');
-  assert.match(lines[start], /这 6 条/, '节标题必须把「6 条」钉住（与 #258 那张表同源）');
+  assert.match(lines[start], /这 7 条/, '节标题必须把「7 条」钉住（#258 那张表的 6 条 + #262 补的第 7 条）');
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((l) => l.startsWith('## '));
   const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
@@ -183,10 +186,10 @@ function previewAccessSection(md) {
   return section;
 }
 
-test('renderHomeAgentsMd：预览访问节把 6 条要求链逐条写清（#257/#258）', () => {
+test('renderHomeAgentsMd：预览访问节把 7 条要求链逐条写清（#257/#258 + #262）', () => {
   const section = previewAccessSection(renderHomeAgentsMd({ fdeName: 'alice' }));
   const items = section.split('\n').filter((l) => /^\d\. /.test(l));
-  assert.equal(items.length, 6, `要求链恰好 6 条，实际 ${items.length} 条`);
+  assert.equal(items.length, 7, `要求链恰好 7 条（#262 之前是 6 条），实际 ${items.length} 条`);
 
   // ① 端口不发明（清单是唯一真相）
   assert.match(items[0], /端口从 `~\/\.erix\/ports\.json` 取/, '① 端口来源必须写死到清单文件');
@@ -222,6 +225,20 @@ test('renderHomeAgentsMd：预览访问节把 6 条要求链逐条写清（#257/
   assert.match(items[5], /每条预览 host 各需一次放行/, '⑥ 必须写明逐 host 各自放行');
   assert.match(items[5], /前端那条 host 有票 ≠ 后端那条也有票/, '⑥ 必须拆穿「前端有票 ≠ 后端有票」这个误判');
   assert.match(items[5], /打开预览/, '⑥ 必须给出用户实际要做的那个动作');
+  // ⑦ 应用自己的登录态不要用 Cookie（#262，措辞 = 决策者在 #262 评论里的定稿）。这些锚点是「告知面已补」
+  // 的唯一证据：删任何一条，R-2 那个「登录成功但永远未登录」的坑就重新张开。
+  assert.match(items[6], /应用自己的登录态不要用 Cookie/, '⑦ 必须点名「应用自己的登录态不要用 Cookie」');
+  assert.match(items[6], /剥掉整个请求的 `Cookie` 头/, '⑦ 必须说清剥的是整个 `Cookie` 头（不按名字挑）');
+  assert.match(items[6], /所有方法一致/, '⑦ 必须是全剥口径（#263 已证伪「半通」猜想，写回半通就是假告知）');
+  assert.match(items[6], /by design/, '⑦ 必须写明这是设计行为（否则 agent 会当平台 bug 去报障）');
+  assert.match(items[6], /`Set-Cookie` 能种上/, '⑦ 必须解释「能种上但带不回来」这个最易误判的中间态');
+  assert.match(items[6], /POST 登录成功、GET 立刻 401\/未登录/, '⑦ 必须给出真实故障形状（r2-app 就是这么死的）');
+  assert.match(items[6], /token 放进\*\*响应体\*\*/, '⑦ 正确做法上半段：token 从响应体下发');
+  assert.match(items[6], /`localStorage` 保存/, '⑦ 必须给出 token 的存放位置');
+  assert.match(items[6], /`Authorization: Bearer <token>`/, '⑦ 必须给出后续请求的凭证写法');
+  // 排他说明：缺了它，④（要带 credentials）与 ⑦（cookie 没用）在读者眼里就是自相矛盾。
+  assert.match(items[6], /`credentials:'include'`[\s\S]{0,20}只服务于平台票据 cookie 的放行判定/, '⑦ 必须自带「④ 的 credentials 只服务平台票据」的排他说明');
+  assert.match(items[6], /不改变本条/, '⑦ 必须明确 ④ 不削弱本条结论');
 });
 
 test('renderHomeAgentsMd：预览访问节给出错误形态对照（谁给的答案 → 改哪一侧）', () => {
@@ -236,6 +253,12 @@ test('renderHomeAgentsMd：预览访问节给出错误形态对照（谁给的�
   // #258 的附带坑：错误被渲染成 [object Object] 后真实原因全丢
   assert.match(section, /\[object Object\]/, '必须提醒不要把响应对象直接塞进模板');
   assert.match(section, /`code` \/ `message`/, '必须要求把 code/message 显式渲染出来');
+  // #262 新增形态：cookie 会话被边缘剥光。归属必须钉在「边缘剥 cookie」，且与平台缺票的 403 分清——
+  // R-2 里这条被当成平台鉴权问题查过一轮，全是白工。
+  assert.match(section, /`POST` 登录成功、随后 `GET` 变未登录\/401/, '必须把「POST 登录成功、GET 变未登录」写进错误形态对照');
+  assert.match(section, /应用自己的 cookie 会话被边缘剥光/, '必须把这一形归因到「边缘剥 cookie」，而不是应用代码或平台鉴权');
+  assert.match(section, /（第 7 条）/, '对照表新行必须回指第 7 条（否则读者不知道去哪看正确做法）');
+  assert.match(section, /不是平台鉴权问题[\s\S]{0,80}preview_ticket_required/, '必须用平台缺票的真实形态做反例，防「去改平台」的误修');
 });
 
 test('renderHomeAgentsMd：预览访问节不出现端口数字与区间，全文不出现伞域字面量（#257 红线）', () => {
@@ -255,7 +278,7 @@ test('renderHomeAgentsMd：预览访问节不出现端口数字与区间，全�
 });
 
 test('isPlatformManagedPath：认 home/AGENTS.md 是平台文件（单一真相必须被对账覆盖）', () => {
-  // 精确分支（materializer.js 里 `rel === 'AGENTS.md'`）：预览访问 6 条就住在这个文件里，
+  // 精确分支（materializer.js 里 `rel === 'AGENTS.md'`）：预览访问 7 条就住在这个文件里，
   // 一旦它不再被认作平台文件，stale 清理不再管它、手改也不再被对账重物化覆盖（user-space §9.3）。
   assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/AGENTS.md`), true, 'home/AGENTS.md 必须是平台管理路径');
   assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/.erix/manifest.json`), true, '.erix/* 仍属平台文件');
