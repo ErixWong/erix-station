@@ -2,7 +2,8 @@
 // 停止（cancel_requested_at → cancelling → aborted run_end）→ assistant 回写 → 归档。
 // 复用真实 runner + LiteLLM mock model；必须显式传入独立的栈名、容器名、端口和临时 DB 路径。
 // ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab）；
-//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）——本脚本**绝不删除共享镜像 tag**
+//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）并显式导出 `FDE_DEV_MODE=1`（#227.1：
+//   tag 形态不声明 dev 模式会被护栏拒跑；digest 形态豁免）——本脚本**绝不删除共享镜像 tag**
 //   （issue #178，口径集中在 lib/fde-image.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,11 +19,20 @@ import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { composeDomainEnv } from './lib/compose-domain.mjs';
 // issue #226：护栏/DB 目录解析/Traefik 静态配置生成的一副本均在 lib/isolated-env.mjs。
 import {
-  assertHostPortsAvailable, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：compose 一律显式 -p，且用 bash 的 `${VAR:?msg}`——未 export 时展开即非零退出并点名，
+// 不再依赖「COMPOSE_PROJECT_NAME 环境变量压过 compose 文件 name: station」这条隐式优先级
+// （忘 export 曾经会让脚本自己对共享 dev 栈 down -v）。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME required for isolated e2e}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+
+// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
+if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
+  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
+}
+
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
 const TRAEFIK_WEB_PORT = process.env.TRAEFIK_WEB_PORT || '8090';

@@ -7,17 +7,22 @@
 //     RestartPolicy=unless-stopped 自动拉起 → 新 agentd re-claim（attempt+1、resume=true）→ 终态。
 // 运行：npm run test:integration:wp3b
 //
-// 并行隔离用法（F8）：不拆共享栈（station-*）的前提下跑隔离栈——所有固定名/端口经 env 派生：
-//   STATION_DB_DIR=/tmp/station-db-43 COMPOSE_PROJECT_NAME=station-e2e-43 \
-//   STATION_DB_NAME=station-db-43 STATION_PORTAL_NAME=station-portal-43 STATION_STACK_ID=station-e2e-43 \
+// 并行隔离用法（F8；#227.1 起先过 assertIsolatedEnvironment 硬护栏，不合规直接拒跑）：
+// 不拆共享栈（station-*）的前提下跑隔离栈——所有固定名/端口经 env 派生，容器名/镜像 tag/FDE 名
+// 必须含栈 id，端口/子网/IPAM 池必须区别于共享栈（判据在 lib/isolated-env.mjs）：
+//   STATION_STACK_ID=e2e43 COMPOSE_PROJECT_NAME=e2e43 STATION_DB_DIR=/tmp/station-db-e2e43（必须不存在）\
+//   STATION_DB_NAME=station-db-e2e43 STATION_PORTAL_NAME=station-portal-e2e43 \
+//   STATION_LITELLM_NAME=station-litellm-e2e43 STATION_DOCKER_PROXY_NAME=station-docker-proxy-e2e43 \
+//   STATION_EDGE_NAME=station-edge-e2e43 \
 //   PORTAL_HOST_PORT=28080 LITELLM_HOST_PORT=24400 \
-//   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=alice43 \
-//   BACKEND_SUBNET=172.33.0.0/24 STATION_LITELLM_NAME=station-litellm-43 \
-//   STATION_DOCKER_PROXY_NAME=station-docker-proxy-43 STATION_EDGE_NAME=station-edge-43 \
-//   IPAM_RESERVED_SUBNETS=10.200.0.0/29,10.200.0.32/29 \
+//   TRAEFIK_WEB_PORT=18090 TRAEFIK_WEBSECURE_PORT=18443 FDE_NAME=e2e43alice \
+//   BACKEND_SUBNET=172.33.0.0/24 FDE_POOL=large FDE_DEV_MODE=1 \
+//   IPAM_RESERVED_SUBNETS=10.200.0.0/29,10.200.0.32/29（可选；隔离模式未设时自动派生）\
+//   FDE_IPAM_POOLS（#227.3：未设时由 deriveFdeIpamPools(栈 id) 派生本栈专用段，显式传入优先）\
 //   PORTAL_PUBLIC_BASE_URL=http://station.localhost:18090 \
 //   PORTAL_INTERNAL_HOSTS=station.localhost \
-//   FDE_IMAGE=erix-station/fde:e2e-43 STATION_PORTAL_IMAGE=erix-station/portal:e2e-43 \
+//   FDE_IMAGE=erix-station/fde:e2e43 STATION_PORTAL_IMAGE=erix-station/portal:e2e43 \
+//   STATION_DOCKER_PROXY_IMAGE=erix-station/fde-proxy:e2e43 \
 //   node portal/integration/wp3b-e2e.mjs
 //
 // —— 隔离栈必传 env 清单（每条一句为什么）——
@@ -65,10 +70,15 @@ import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { DEFAULT_FDE_IMAGE, DEFAULT_PORTAL_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 // issue #226：`writeTraefikStatic` 与隔离护栏本体一样收归公共模块（wp2a/wp3a/wp3b/wp5/wp6 共用一份）。
-import { writeTraefikStatic } from './lib/isolated-env.mjs';
+// #227.1：wp3b 隔离跑法从此也过硬护栏（assertIsolatedEnvironment），removeDbDir 同样收编。
+import {
+  SHARED_STACK, assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+} from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：显式 -p（双模脚本）：隔离跑法必带 COMPOSE_PROJECT_NAME（=栈 id，护栏硬要求，#227.1 起）→
+// -p 显式指向本栈；共享跑法（无任何隔离信号）显式 station——两种模式都写死在命令里，不留 `name:` 隐式兜底。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
 // F8 并行隔离：固定名/端口全部 env 派生（缺省 = 现状值，共享栈零影响）。
 const PORTAL_HOST_PORT = process.env.PORTAL_HOST_PORT || '18080';
 const PORTAL = `http://127.0.0.1:${PORTAL_HOST_PORT}`;
@@ -83,6 +93,36 @@ const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner 命名规则：fde-<fde_name>
 const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
 const PORTAL_IMAGE = process.env.STATION_PORTAL_IMAGE || DEFAULT_PORTAL_IMAGE;
+
+// 隔离信号：显式设了栈标识 / 固定名 / 端口 / 子网 / DB / FDE 名任一 → 判定为隔离栈。
+// 共享栈跑法（不带任何这些 env）→ 一个都不命中 → 零注入旧语义（与 #226 改造前一致）。
+// #227.1：同一判据现在也决定护栏开关——隔离跑法必过硬护栏，共享跑法保持零注入旧语义。
+const ISOLATION_SIGNAL_KEYS = [
+  'STATION_STACK_ID', 'COMPOSE_PROJECT_NAME', 'STATION_DB_DIR', 'STATION_DB_NAME',
+  'STATION_PORTAL_NAME', 'STATION_LITELLM_NAME', 'STATION_DOCKER_PROXY_NAME',
+  'STATION_EDGE_NAME', 'BACKEND_SUBNET', 'FDE_NAME',
+  'PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
+];
+const ISOLATED_MODE = ISOLATION_SIGNAL_KEYS.some((k) => process.env[k]);
+
+// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
+if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
+  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
+}
+
+// #227.1：护栏参数按 wp3b 实际句柄传——栈含 LiteLLM；单 FDE 名（必须带栈 id、不得等于共享 alice）；
+// 镜像不得沿用共享 :local tag（同 wp6 口径）。
+function isolatedStackOptions() {
+  return {
+    litellm: true,
+    fdeNames: [{ env: 'FDE_NAME', value: FDE_NAME, sharedDefault: 'alice' }],
+    extraForbiddenEnv: [
+      ['STATION_PORTAL_IMAGE', DEFAULT_PORTAL_IMAGE],
+      ['STATION_DOCKER_PROXY_IMAGE', 'erix-station/fde-proxy:local'],
+      ['FDE_IMAGE', DEFAULT_FDE_IMAGE],
+    ],
+  };
+}
 
 // F8（隔离栈必须整体替换 traefik 静态配置的原因见 lib/isolated-env.mjs:writeTraefikStatic）：
 // Traefik v3 带 --configFile 时，静态文件里已定义的 entryPoints 会压过 CLI/env 覆盖（实测 file +
@@ -106,14 +146,18 @@ function dockerStdin(args, input) {
   });
 }
 
-// M6：DB 数据目录可参数化（STATION_DB_DIR，与 deploy/docker-compose.yml 的挂载一致），
-// 不再硬删共享固定路径 /docker/station-db——并行跑/多栈场景互不误伤。
-const DB_DIR = (process.env.STATION_DB_DIR || '/docker/station-db').replace(/\/+$/, '');
-function removeDbDir() {
-  const parent = path.posix.dirname(DB_DIR);
-  const name = path.posix.basename(DB_DIR);
-  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
-}
+// #227.1（removeDbDir 收编单一来源，解析/删除本体在 lib/isolated-env.mjs）。语义迁移口径：
+// • 隔离跑法 ⇒ 与 wp2a 完全同（缺 STATION_DB_DIR 硬失败 + 只允许删临时目录内的路径）；
+// • 共享跑法（无任何隔离信号）⇒ 保留「重置共享 dev 库 /docker/station-db」的既定语义，但改为
+//   **显式** env 注入（缺省补 STATION_DB_DIR + ERIX_E2E_ALLOW_DB_DIR=1 豁免），不再靠脚本内私有缺省。
+//   （lib 的「共享重置」选项（resolveDbDir 第三参）只允许 wp2b 声明——wp3b 用上面的 env 形态表达同一语义，
+//     选项出现处由 isolation-negative 的单一来源断言钉住。）
+const { removeDbDir } = createDbDirCleaner({
+  docker,
+  env: ISOLATED_MODE
+    ? process.env
+    : { ...process.env, STATION_DB_DIR: process.env.STATION_DB_DIR || SHARED_STACK.dbDir, ERIX_E2E_ALLOW_DB_DIR: '1' },
+});
 
 function compose(args, env = {}) {
   // F8：隔离模式下注入自动派生 env（IPAM 保留段 / public base url / internal hosts）。
@@ -141,16 +185,8 @@ function safe(fn) {
 
 // ---------------------------------------------------------------------------
 // F8：隔离模式自动派生 env（仅在「隔离栈」下生效；共享栈缺省 = 零注入）。
+// （ISOLATION_SIGNAL_KEYS / ISOLATED_MODE 的定义已上移到常量区，#227.1 护栏与 DB cleaner 共用。）
 // ---------------------------------------------------------------------------
-
-// 隔离信号：显式设了栈标识 / 固定名 / 端口 / 子网 / DB / FDE 名任一 → 判定为隔离栈。
-// 共享栈跑法（不带任何这些 env）→ 一个都不命中 → 返回 {}，行为与改造前完全一致。
-const ISOLATION_SIGNAL_KEYS = [
-  'STATION_STACK_ID', 'COMPOSE_PROJECT_NAME', 'STATION_DB_DIR', 'STATION_DB_NAME',
-  'STATION_PORTAL_NAME', 'STATION_LITELLM_NAME', 'STATION_DOCKER_PROXY_NAME',
-  'STATION_EDGE_NAME', 'BACKEND_SUBNET', 'FDE_NAME',
-  'PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
-];
 
 /**
  * 推导隔离栈应注入 compose 的 env（未显式设置时）。返回 {} 表示共享栈缺省、不注入任何值。
@@ -349,6 +385,13 @@ function countAgentdPings() {
 }
 
 test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃恢复', { timeout: 15 * 60 * 1000 }, async (t) => {
+  // #227.1：隔离跑法起栈前必过硬护栏（此前 wp3b 无护栏：端口/容器名/子网与共享栈同值不会挡，
+  // 漏 BACKEND_SUBNET 只得到 Pool overlaps 崩溃）。共享跑法（无任何隔离信号）保持旧语义、跳护栏。
+  if (ISOLATED_MODE) {
+    assertIsolatedEnvironment(isolatedStackOptions());
+    await assertHostPortsAvailable([PORTAL_HOST_PORT, LITELLM_HOST_PORT, TRAEFIK_WEB_PORT,
+      process.env.TRAEFIK_WEBSECURE_PORT || '8443']);
+  }
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp3b-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp3b-'));
   S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp3b-'));
