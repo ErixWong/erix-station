@@ -176,6 +176,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // issue #55 A1：per-session 输入草稿（内存 Map，key=sessionId）；切换会话/项目时保存与恢复。
   const drafts = new Map<string, string>();
 
+  // ---- issue #261B：一键「重试上一条」（provider 超时杀 run 后不必手打重发长消息）----
+  // **仅内存、不持久化**（无 localStorage / 无后端回写）：刷新页面 = 重建 store ⇒ lastSend 与
+  // retryAvailable 双双归零，按钮不再出现。这是 MVP 边界（工单明确不做「刷新后恢复重试面」）。
+  // 刷新后要恢复，得把「最后一条 user 消息 + 该 run 终态」从服务端转录重建，不属本单范围。
+  const lastSend = ref<{ sessionId: string; content: string } | null>(null);
+  const retryAvailable = ref(false);
+  // in-flight 禁用闸（防双击双发）：重试 POST 往返窗口里 activeRunId 尚未置位（send 在 POST
+  // 回来后才置），running 仍为 false —— 只靠 running 拦不住第二次点击。
+  const retryInFlight = ref(false);
+
   // SSE 协议状态 + 事件语义（hooks 接回展示层）。
   let runStateCheckSeq = 0;
   const es = useEventStream({
@@ -186,6 +196,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     onCurrentRunEnd: (d) => {
       removeDeltaEntry(); // 旧版 run_end 移除流式增量 DOM（终稿由 refreshSession 回写，防双份）
       notifyRunEnd(d);
+      applyRetryFaceOnRunEnd(d); // issue #261B：失败终局 → 点亮「重试上一条」
       refreshSession(d.run_id);
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
@@ -227,6 +238,24 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const v = inputValue.value;
     if (v) drafts.set(sessionId.value, v);
     else drafts.delete(sessionId.value);
+  }
+
+  // ---- issue #261B：「重试上一条」面的两个写入点（run 终局 / 离开会话）----
+  /**
+   * run 终局决定重试面（与 useEventStream 推红色 syserr 分隔条走**同一个** RUN_FAIL_REASONS Set
+   * 实例，不存在第二份枚举）：失败集合内 ⇒ 可用；end_turn / no_tool / judge_done 等正常终局 ⇒ 置 false。
+   * 会话归属核对：onCurrentRunEnd 已被 useEventStream 的「仅当前 run」守卫过滤，但 lastSend 仍可能
+   * 属于上一个会话（在 A 发送后切走、当前会话的某个 run 恰此时终局），不得把别人的失败标成可重试。
+   */
+  function applyRetryFaceOnRunEnd(d: RunEndPayload) {
+    const last = lastSend.value;
+    retryAvailable.value = RUN_FAIL_REASONS.has(d.termination?.reason ?? '')
+      && last != null && last.sessionId === sessionId.value;
+  }
+
+  /** 切会话 / 切目录 / 关会话 ⇒ 重试面重置（工单 #261B：不留到另一个会话的输入框上）。 */
+  function clearRetryFace() {
+    retryAvailable.value = false;
   }
 
   // ---- addMessage（issue #40 渲染规则逐行平移）----
@@ -446,6 +475,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
     es.resetStreamState();
+    clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
     renderedIds.value = null;
@@ -473,6 +503,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     inputValue.value = drafts.get(id) ?? '';
     sessionId.value = id;
     es.resetStreamState();
+    clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
     renderedIds.value = new Set();
@@ -580,6 +611,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
     es.resetStreamState();
+    clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
     renderedIds.value = null;
@@ -676,6 +708,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：无选中会话 → 不得复用旧会话的计数
     es.resetStreamState();
+    clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
     renderedIds.value = null;
@@ -684,8 +717,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     workbenchHooks.onClearRoute?.();
   }
 
-  async function send() {
-    const content = inputValue.value.trim();
+  /**
+   * 发送链路（唯一一条）：自动建会话、草稿守卫、ctx/session 代次守卫、失败回填都在此。
+   *
+   * issue #261B：`contentOverride` = 重试链路传入的「上一条内容」。传了就用它作为发送体，
+   * 且**不碰输入框**（不吞用户可能存在的草稿）；缺省（undefined）仍取 inputValue，既有行为逐字不变。
+   * 重试绝不另起一次 api() 调用——绕过这里就等于绕过建会话/草稿/代次守卫（工单硬要求）。
+   */
+  async function send(contentOverride?: string) {
+    const override = typeof contentOverride === 'string';
+    const content = (override ? contentOverride! : inputValue.value).trim();
     if (!content || es.activeRunId.value) return;
     // issue #84 P5 真机验收修正：选了目录但未打开会话时，首条发送自动建会话（原实现 !sid 静默返回，
     // 用户「选目录→打字→发送」没有任何反馈）。目录未选中（空 projects）才保持 no-op。
@@ -704,7 +745,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
       try { Notification.requestPermission().catch(() => {}); } catch { /* 忽略 */ }
     }
-    inputValue.value = '';
+    if (!override) inputValue.value = ''; // 重试（override）不碰输入框：不吞与重试无关的草稿
     try {
       const { message, run } = await api<{ message: ChatMessage; run: { id: string } }>(
         `/api/sessions/${encodeURIComponent(sid)}/messages`,
@@ -712,6 +753,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       );
       // 评审修复：API 成功返回后才删草稿，且在守卫判定之前无条件执行（原先 await 前删，失败即丢草稿）。
       drafts.delete(sid);
+      // issue #261B：POST 成功即记「上一条」（失败路径不记，否则会把没发出去的内容当成可重试面）。
+      // 同时作废旧的失败重试面：用户已主动发新东西，不必再保留上一条的入口。
+      lastSend.value = { sessionId: sid, content };
+      retryAvailable.value = false;
       if (ctx !== ctxSeq.value || sessionId.value !== sid) return;
       addMessage({ ...message, role: 'user' });
       es.activeRunId.value = run.id;
@@ -720,7 +765,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       // 评审修复：草稿按 sid 键，守卫之前写回——发送失败后即使期间切走会话，切回仍可恢复。
       drafts.set(sid, content);
       if (ctx !== ctxSeq.value || sessionId.value !== sid) return;
-      inputValue.value = content; // issue #42：发送失败回填输入，已输入内容不丢
+      if (!override) inputValue.value = content; // issue #42：发送失败回填输入，已输入内容不丢
       const err = e instanceof ApiError ? e : null;
       entries.value.push({
         kind: 'syserr',
@@ -730,6 +775,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           : t('errors.sendFailed', { message: err?.message ?? e })
             + (err?.code === 'run_in_progress' ? t('errors.runInProgress') : ''),
       });
+    }
+  }
+
+  /**
+   * issue #261B：一键重试上一条——同 content、新一次 POST，**复用同一条 send() 链路**。
+   * 前置守卫（任一条不满 ⇒ no-op）：retryAvailable、不在 in-flight、有会话、无活跃 run、
+   * 内容非空且归属于当前会话、输入框无草稿（与 ComposerBar 按钮的显隐条件同源，
+   * 免得把用户刚打的草稿吞掉）。重试 POST 失败 ⇒ retryAvailable 保留（按钮可再点）。
+   */
+  async function retryLast() {
+    const last = lastSend.value;
+    if (!retryAvailable.value || retryInFlight.value) return;
+    if (!sessionId.value || es.activeRunId.value) return;
+    if (!last || last.sessionId !== sessionId.value || !last.content.trim()) return;
+    if (inputValue.value.trim()) return;
+    retryInFlight.value = true; // 按钮禁用（防双击双发）
+    try {
+      await send(last.content);
+    } finally {
+      retryInFlight.value = false;
     }
   }
 
@@ -791,6 +856,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, send, stop, refreshSession,
+    // issue #261B：一键「重试上一条」（lastSend/retryAvailable 仅内存；retryInFlight 驱动按钮禁用）
+    lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数
     foldedOriginals, getFoldedOriginal, loadFoldedOriginal, sessionStats,
   };

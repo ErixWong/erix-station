@@ -26,6 +26,16 @@ function onKeydown(e: KeyboardEvent) {
       :disabled="store.noDir"
       @keydown="onKeydown"
     ></textarea>
+    <!-- issue #261B：一键「重试上一条」（R-2 演练 8 次 provider 超时杀 run，用户全部手打重发长消息）。
+         三个条件全满足才出现（工单口径）：① 输入框为空——有草稿时绝不出现，避免「重试会不会吞我打的字」
+         的歧义行为（store.retryLast() 同源再守一道）；② 无活跃 run；③ store.retryAvailable——上一条
+         发送以 RUN_FAIL_REASONS 终局收场。in-flight（POST 往返窗口，此时 running 仍 false）禁用防双击双发。 -->
+    <button
+      v-if="!store.inputValue.trim() && !store.running && store.retryAvailable"
+      class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
+      :disabled="store.retryInFlight"
+      @click="store.retryLast()"
+    >{{ t('composer.retry') }}</button>
     <button
       class="rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white px-4 disabled:opacity-50"
       :disabled="store.sendDisabled"

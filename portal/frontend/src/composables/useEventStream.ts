@@ -85,6 +85,12 @@ export interface RunTermination {
   operation?: string;
   phase?: string;
   sideEffect?: string;
+  // issue #261（erix-agent 0.18.0 additive 字段，上游 #176）：**仅** `reason === "failed"` 的终局
+  // 额外带该键 —— 引擎把错误上已有的分类码（timeout / rate_limited / auth / server /
+  // checkpoint_failed / …）原样透出，无分类码时引擎回落 `unknown`（docs/api/portal.md §4.1/§5.3、
+  // docs/data/model.md §1.7）。**值域由引擎定义**：前端不解释语义、不维护第二份枚举、不参与
+  // RUN_FAIL_REASONS 判定，只做失败横幅的原样透出（failReasonText）。
+  errorCode?: string;
 }
 
 export interface RunEndPayload {
@@ -99,7 +105,11 @@ export interface RunEndPayload {
  *   ① 只给本次新增的两值加双语标签——既有 failed / aborted / max_rounds_cap 逐字保持原样
  *      （不改既有中文基线与既有断言面）；
  *   ② `persistence_failed` 额外带引擎透传的落盘细节（operation/phase/sideEffect），
- *      让工作台能看见「哪一步没落盘、副作用是否可能已发生」——这是该 reason 语义最重的部分。
+ *      让工作台能看见「哪一步没落盘、副作用是否可能已发生」——这是该 reason 语义最重的部分；
+ *   ③ issue #261：`termination.errorCode`（0.18.0 additive，值域由引擎定义）以
+ *      `（code=<errorCode>）` 追加在文案**末尾**，让 R-2 那类「provider 超时杀 run」在横幅上直接
+ *      看见 `code=timeout` 而不用去翻日志/问后端。**仅当它是非空字符串时**才追加，无 errorCode 时
+ *      文案与既有断言面逐字不变；该片段是技术细节，**不进 i18n**（中英界面同形）。
  */
 function failReasonText(reason: string, termination?: RunTermination | null): string {
   let text = reason;
@@ -116,6 +126,10 @@ function failReasonText(reason: string, termination?: RunTermination | null): st
       sideEffect: termination.sideEffect ?? '?',
     })}`;
   }
+  // issue #261：typeof + 非空双重判定——后端 additive 字段，旧 run / 旧引擎 / 显式 null 都要
+  // 落回「文案零变化」，不能让 `（code=undefined）` 这种字样渗进用户可见文案。
+  const code = termination?.errorCode;
+  if (typeof code === 'string' && code !== '') text += `（code=${code}）`;
   return text;
 }
 

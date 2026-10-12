@@ -136,6 +136,8 @@ export const en = {
   composer: {
     send: 'Send',
     stop: '■ Stop',
+    // issue #261B：上一条发送以失败终局收场时的一键重发（中英双语同口径）。
+    retry: 'Retry last',
   },
   picker: {
     title: 'Browse sessions',
