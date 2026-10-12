@@ -72,7 +72,7 @@ import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mj
 // issue #226：`writeTraefikStatic` 与隔离护栏本体一样收归公共模块（wp2a/wp3a/wp3b/wp5/wp6 共用一份）。
 // #227.1：wp3b 隔离跑法从此也过硬护栏（assertIsolatedEnvironment），removeDbDir 同样收编。
 import {
-  SHARED_STACK, assertHostPortsAvailable, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  SHARED_STACK, assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -104,6 +104,11 @@ const ISOLATION_SIGNAL_KEYS = [
   'PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
 ];
 const ISOLATED_MODE = ISOLATION_SIGNAL_KEYS.some((k) => process.env[k]);
+
+// #227.3：FDE_IPAM_POOLS 未显式传时按栈 id 派生本栈口径（派生段+portal large 池固定段；显式传入优先）。
+if (!process.env.FDE_IPAM_POOLS && process.env.STATION_STACK_ID) {
+  process.env.FDE_IPAM_POOLS = defaultFdeIpamPools(process.env.STATION_STACK_ID);
+}
 
 // #227.1：护栏参数按 wp3b 实际句柄传——栈含 LiteLLM；单 FDE 名（必须带栈 id、不得等于共享 alice）；
 // 镜像不得沿用共享 :local tag（同 wp6 口径）。

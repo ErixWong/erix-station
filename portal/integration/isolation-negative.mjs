@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_STACK, assertIsolatedEnvironment, removeDbDir, resolveDbDir,
+  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir,
 } from './lib/isolated-env.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -44,7 +44,8 @@ function validIsolationEnv() {
     LLM_GATEWAY_HOST: 'http://127.0.0.1:24400',
     BACKEND_SUBNET: '172.33.0.0/24',
     FDE_POOL: 'large',
-    FDE_IPAM_POOLS: '10.201.0.0/16',
+    // #227.3：缺省注入值 = 派生段 + portal large 池固定段（两函数都在 lib，这里不抄字面量）。
+    FDE_IPAM_POOLS: defaultFdeIpamPools(stackId),
     FDE_DEV_MODE: '1',
     STATION_PORTAL_IMAGE: `erix-station/portal:${stackId}`,
     STATION_DOCKER_PROXY_IMAGE: `erix-station/fde-proxy:${stackId}`,
@@ -120,6 +121,21 @@ cases.push(expectThrow('resolveDbDir({allowSharedReset:true}) 非共享非临时
   () => resolveDbDir({ STATION_DB_DIR: '/var/lib/erix-not-temp-db' }, { allowSharedReset: true }),
   { namesMustInclude: ['/var/lib/erix-not-temp-db', 'ERIX_E2E_ALLOW_DB_DIR'] }));
 
+// 8) #227.3：隔离栈把 IPAM 池设成共享段 10.200.0.0/16 ⇒ 必须拒（fail-closed 的红线本体）。
+cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOLS=共享段 10.200.0.0/16',
+  () => assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: SHARED_STACK.fdeIpamPool } }),
+  { namesMustInclude: ['FDE_IPAM_POOLS', '10.200.0.0/16'] }));
+
+// 9) #227.3：compose/--env-file 缺省的两段值（含共享段）也必须拒——「忘了传」偷跑时护栏拦得住。
+cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOLS=缺省两段（含共享段）',
+  () => assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: `${SHARED_STACK.fdeIpamPool},10.201.0.0/16` } }),
+  { namesMustInclude: ['10.200.0.0/16'] }));
+
+// 10) #227.3：族外段（10.99.0.0/16）也必须拒——显式覆盖只能在隔离族内选，fail-closed。
+cases.push(expectThrow('assertIsolatedEnvironment() FDE_IPAM_POOLS=族外段 10.99.0.0/16',
+  () => assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: '10.99.0.0/16' } }),
+  { namesMustInclude: ['FDE_IPAM_POOLS', '10.99.0.0/16'] }));
+
 // --- 正例（夹具 env 必须过护栏；否则上面的负例是「全都抛」的空洞通过）---------------------
 let positiveOk = true;
 let positiveError = '';
@@ -148,16 +164,32 @@ try {
   assert.equal(sharedResolved, SHARED_STACK.dbDir, 'allowSharedReset 下缺省应解析到共享库目录（wp2b 语义）');
   removeDbDir(fakeDocker, {}, { allowSharedReset: true });
   assert.ok(dockerCalls.length === beforeReset + 1, 'allowSharedReset 下 removeDbDir 应真的执行 docker');
+  // #227.3：派生段的口径钉死（变异 c 的红条入口：把 deriveFdeIpamPools 改成恒返回固定段就红）。
+  // e2e226 的全部数字拼接是 '2226'（e2e 里也有个 2）→ 2226 % 99 = 48 → 201+48 = 249。
+  assert.equal(deriveFdeIpamPools('e2e226'), '10.249.0.0/16', '派生段口径：10.(201 + 全部数字拼接 mod 99).0.0/16');
+  assert.equal(deriveFdeIpamPools('E2E-226-stack'), deriveFdeIpamPools('e2e226'), '同数字必同段（按段号可判定）');
+  assert.notEqual(deriveFdeIpamPools('e2e226'), deriveFdeIpamPools('e2e227'), '不同数字（mod 99 不同余）必不同段');
+  const hashed = deriveFdeIpamPools('solo-alpha');
+  assert.match(hashed, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/, '无数字 id 走短哈希，仍限隔离族内');
+  assert.equal(deriveFdeIpamPools('solo-alpha'), hashed, '哈希路径也幂等');
+  for (let i = 1; i <= 300; i += 1) {
+    const p = deriveFdeIpamPools(`stack${i}`);
+    assert.match(p, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/, `stack${i} 派生越族：${p}`);
+    assert.notEqual(p, `${SHARED_STACK.fdeIpamPool}`, `stack${i} 派生命中共享段：${p}`);
+  }
+  // #227.3：显式只传派生段（不含 large 池段）也是合法正规值。
+  assertIsolatedEnvironment({ env: { ...validIsolationEnv(), FDE_IPAM_POOLS: deriveFdeIpamPools('e2e226') } });
 } catch (error) {
   positiveOk = false;
-  positiveError = `${positiveError}${positiveError ? ' | ' : ''}digest/allowSharedReset 正例被拒：${String(error?.message ?? error)}`;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}digest/allowSharedReset/IPAM 派生正例被拒：${String(error?.message ?? error)}`;
 }
 
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
-const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable'];
+const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
+  'deriveFdeIpamPools', 'defaultFdeIpamPools'];
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -249,6 +281,15 @@ const singleSourceProblems = [];
       }
     });
   }
+  // #227.3：等值段字面量「10.201.0.0/16」只允许活在 lib/isolated-env.mjs（PORTAL_LARGE_POOL 定义处）；
+  // 其它 integration 脚本/夹具再出现该字面量 = 有人把「等值 10.201」的旧口径请了回来（派生被绕过）。
+  for (const file of files) {
+    if (path.basename(file) === 'isolated-env.mjs') continue;
+    const text = fs.readFileSync(file, 'utf8');
+    if (text.includes('10.201.0.0/16')) {
+      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又出现等值段字面量 10.201.0.0/16（#227.3 应走 deriveFdeIpamPools/defaultFdeIpamPools 派生）`);
+    }
+  }
 }
 
 // --- 报告 --------------------------------------------------------------------------------
@@ -268,7 +309,7 @@ for (const problem of singleSourceProblems) {
 
 const trapsFired = cases.every((c) => c.fired && c.matched && c.dockerSilent !== false);
 const ok = trapsFired && positiveOk && singleSourceProblems.length === 0;
-console.error(`[isolation-negative] verdict=${ok ? 'TRAPS_FIRED' : 'TRAP_SILENT'}（两个缺省陷阱=${trapsFired ? '均硬失败' : '有失灵'}；单一来源=${singleSourceProblems.length === 0 ? '一份定义' : `${singleSourceProblems.length} 处异常`}${STRICT ? '；--strict 模式' : ''}）`);
+console.error(`[isolation-negative] verdict=${ok ? 'TRAPS_FIRED' : 'TRAP_SILENT'}（全部 ${cases.length} 条陷阱=${trapsFired ? '均硬失败' : '有失灵'}；单一来源=${singleSourceProblems.length === 0 ? '一份定义' : `${singleSourceProblems.length} 处异常`}${STRICT ? '；--strict 模式' : ''}）`);
 if (!ok) console.error('[isolation-negative] TRAP_SILENT = 护栏被改坏（或本夹具过期）：缺省跑法会重新对共享 dev 栈动手。');
 
 // 缺省（负例证据模式）：陷阱如期硬失败是**期望结果**，但工单要求以非零码退出留下证据 ⇒ rc=1；

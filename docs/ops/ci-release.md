@@ -214,9 +214,14 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 `portal/integration/wp*-e2e.mjs` 不进 CI，理由都是硬依赖：
 
 1. 需要 **docker daemon + 起整栈**（postgres / traefik / litellm / portal / proxy / 真 FDE 容器）。
-2. **固定 IPAM 池**：`assertIsolatedEnvironment()` 硬断言 `FDE_IPAM_POOLS` 恰为 `['10.201.0.0/16']`
-   （`wp5-e2e.mjs:65-66`、`wp6-llm-e2e.mjs:73-74`），还断言一堆隔离栈专属 env（容器名、端口、
-   `STATION_DB_DIR` 必须在临时目录且**不存在**）；GitHub runner 上没有这套网络前提。
+2. **按栈派生的 IPAM 池**（#227.3，取代旧「恰为 `['10.201.0.0/16']`」等值口径）：
+   `assertIsolatedEnvironment()`（`lib/isolated-env.mjs`）硬断言 `FDE_IPAM_POOLS` 每一段都在隔离族
+   `10.201.0.0/16–10.299.0.0/16` 内，共享段 `10.200.0.0/16` 一律拒；正规值由
+   `deriveFdeIpamPools(STATION_STACK_ID)` 按栈 id 数字 mod 99 确定性派生（族外/含共享段的显式覆盖都拒，
+   族内显式覆盖放行作为撞段逃生口）。⚠️ portal 侧分配钉死在 `POOLS.large`（`portal/src/ipam.js:14`，
+   非 env 可配），proxy 白名单必须包含 `10.201.0.0/16`，所以脚本缺省注入 `defaultFdeIpamPools`
+   （派生段+large 池段）。护栏还断言一堆隔离栈专属 env（容器名、端口、`FDE_DEV_MODE=1`（tag 形态
+   FDE 镜像必需，#227.1）、`STATION_DB_DIR` 必须在临时目录且**不存在**）；GitHub runner 上没有这套网络前提。
 3. 需要**泛域名解析 + Tailscale**（`*.fde.erix.vip` → `100.100.0.3`）与宿主 Traefik host 网络。
 4. 分钟成本：一条 e2e 链路跑下来在 CI 里要占十几分钟，Free 额度撑不住（§4）。
 
