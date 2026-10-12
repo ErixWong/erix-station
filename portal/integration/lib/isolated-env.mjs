@@ -37,9 +37,57 @@ export const SHARED_STACK = {
   traefikWebPort: '8090',
   traefikWebSecurePort: '8443',
   backendSubnet: '172.32.0.0/24',
-  // 共享栈在宿主回环上占用的端口（含 LiteLLM 容器内 4000/4001 的惯例值）。
+  // #227.3：共享栈在用的 FDE IPAM 段（portal 缺省池；隔离栈的池不得等于它）。
+  fdeIpamPool: '10.200.0.0/16',
+  // 宿主回环上占用的端口（含 LiteLLM 容器内 4000/4001 的惯例值）。
   forbiddenPorts: ['4000', '4001', '4100', '8090', '8443', '18080'],
 };
+
+/**
+ * portal 侧 IPAM「large 池」钉死的分配段（`portal/src/ipam.js:14`，**非 env 可配**，且 portal/src/**
+ * 在护栏脚本的改动范围外）。fde-proxy 对 `network create` 的 subnet 做白名单校验
+ * （deploy/fde-proxy/server.js:343-350/400），因此隔离栈的 FDE_IPAM_POOLS **必须包含这段**，
+ * 否则 provision 建 fde-* 网络会被 proxy 拒（`IPAM.Subnet not in allowed pools`）——#227.3 落地时
+ * 发现的口径冲突，详见交付报告「遗留问题」。
+ */
+export const PORTAL_LARGE_POOL = '10.201.0.0/16';
+
+/**
+ * 由栈 id 确定性派生本隔离栈专用的 FDE IPAM 段（#227.3：两套隔离栈并行时不共用同一段）。
+ *
+ * 规则：取栈 id 里全部数字拼接后 mod 99 ⇒ 段 = `10.(201 + n%99).0.0/16`（族 10.201–10.299，
+ * **天然排除共享段 10.200.0.0/16**）；无数字则用 FNV-1a 短哈希。按段号可判定：段号 ≡ 数字 mod 99，
+ * 不同余数必不同段；同 id 永远同段（幂等）。派生值相同≠一定撞（仅当两栈真的并行分配同一子网段才撞，
+ * 那时用显式覆盖 FDE_IPAM_POOLS 拆开，护栏允许族内显式覆盖）。
+ *
+ * @param {string} stackId STATION_STACK_ID
+ * @returns {string} 形如 `10.229.0.0/16` 的单段 CIDR
+ */
+export function deriveFdeIpamPools(stackId) {
+  const id = String(stackId ?? '');
+  const digits = id.replace(/\D+/g, '');
+  let n;
+  if (digits) {
+    // BigInt 防长数字精度丢失；前导零不影响十进制解析。
+    n = Number(BigInt(digits) % 99n);
+  } else {
+    let h = 2166136261; // FNV-1a 32bit
+    for (let i = 0; i < id.length; i += 1) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
+    n = Math.abs(h) % 99;
+  }
+  return `10.${201 + n}.0.0/16`;
+}
+
+/**
+ * 脚本默认注入的 FDE_IPAM_POOLS（未显式传时）：派生段 + portal large 池固定段（去重，逗号分隔）。
+ * 包含 PORTAL_LARGE_POOL 的原因见其定义处注释（proxy 白名单必须覆盖 portal 实际分配的段）。
+ *
+ * @param {string} stackId STATION_STACK_ID
+ * @returns {string}
+ */
+export function defaultFdeIpamPools(stackId) {
+  return [...new Set([deriveFdeIpamPools(stackId), PORTAL_LARGE_POOL])].join(',');
+}
 
 /**
  * `STATION_DB_DIR` 解析（issue #226 修法第 4 条：缺省即抛，不再回退 `/docker/station-db`）。
@@ -184,8 +232,17 @@ export function assertIsolatedEnvironment(options = {}) {
   }
 
   assert.equal(env.FDE_POOL, 'large', 'isolated e2e must use the dedicated large FDE pool');
+  // #227.3：从「等值 10.201.0.0/16」改为按栈派生。fail-closed 口径：每一段都必须在隔离族
+  // 10.201.0.0/16–10.299.0.0/16 内；共享段 10.200.0.0/16（portal 缺省池/共享栈 FDE 网络所在地）一律拒。
+  // 正规值 = deriveFdeIpamPools(STATION_STACK_ID)；显式覆盖（仍在族内）同样放行——并行撞段时的逃生口。
   const fdeIpamPools = String(env.FDE_IPAM_POOLS).split(',').map((pool) => pool.trim()).filter(Boolean);
-  assert.deepEqual(fdeIpamPools, ['10.201.0.0/16'], 'proxy IPAM pool must match the isolated FDE pool');
+  assert.ok(fdeIpamPools.length > 0, `FDE_IPAM_POOLS=${env.FDE_IPAM_POOLS} 不含任何有效 CIDR`);
+  for (const pool of fdeIpamPools) {
+    assert.notEqual(pool, SHARED_STACK.fdeIpamPool,
+      `FDE_IPAM_POOLS 含共享栈在用的段 ${pool}（portal 缺省池/共享栈 fde-* 网络在此，并行必撞）；本栈应用派生段 deriveFdeIpamPools(STATION_STACK_ID)=${deriveFdeIpamPools(env.STATION_STACK_ID)}`);
+    assert.match(pool, /^10\.2(?:0[1-9]|[1-9][0-9])\.0\.0\/16$/,
+      `FDE_IPAM_POOLS=${pool} 必须留在隔离族 10.201.0.0/16–10.299.0.0/16 内（正规值=派生段 ${deriveFdeIpamPools(env.STATION_STACK_ID)}）`);
+  }
   assert.equal(env.COMPOSE_PROJECT_NAME, env.STATION_STACK_ID,
     'compose project and stack label must use the same unique ID');
   for (const name of containerNames) {
