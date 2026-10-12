@@ -16,7 +16,9 @@ import * as auth from '../src/auth.js';
 import { parseCidr, intToIp } from '../src/ipam.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const COMPOSE = 'docker compose --env-file deploy/.env -f deploy/docker-compose.yml';
+// #227.2：显式 -p 把「我就是要动共享栈 station」写进命令（不再靠 compose 文件 name: 的隐式兜底；
+// 设了 COMPOSE_PROJECT_NAME 则显式改用该 project）。
+const COMPOSE = 'docker compose -p "${COMPOSE_PROJECT_NAME:-station}" --env-file deploy/.env -f deploy/docker-compose.yml';
 const PORTAL = 'http://127.0.0.1:18080';
 const TRAEFIK_WEB = 'http://127.0.0.1:8090';
 
