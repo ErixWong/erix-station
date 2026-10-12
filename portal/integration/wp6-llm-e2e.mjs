@@ -402,16 +402,79 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
     ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
   };
 
+  // #224：清场失败不再静默吞掉。每个动作失败都记名 + console.warn；末尾断言「本栈残留 = 0」——
+  // 清理失败**必须**让测试变红（静默 = 隔离性假象：残留容器下次被复用会被误判成「隔离成功」）。
+  // 动作顺序照工单口径：compose down -v → 散容器（fde-*）→ 网络 → removeDbDir。
+  const teardownFailures = [];
+  const teardown = (action, fn) => {
+    try {
+      fn();
+    } catch (error) {
+      const detail = String(error?.stderr || error?.message || error).trim().split('\n')[0];
+      console.warn(`[wp6] teardown ${action} 失败:`, detail);
+      teardownFailures.push(action);
+    }
+  };
+  const dockerOut = (args) => docker(args).split('\n').map((line) => line.trim()).filter(Boolean);
+  const containerNamesPresent = (...names) => {
+    const wanted = new Set(names);
+    return dockerOut('ps -a --format {{.Names}}').filter((n) => wanted.has(n));
+  };
+  const networkNamesPresent = (...names) => {
+    const wanted = new Set(names);
+    return dockerOut('network ls --format {{.Name}}').filter((n) => wanted.has(n));
+  };
+  const fdeContainers = [fdeContainer('alice'), fdeContainer('bob')];
+  const fdeNetworks = [`fde-${FDE_NAMES.alice}`, `fde-${FDE_NAMES.bob}`];
+
   const cleanup = () => {
-    safe(() => docker(`rm -f ${fdeContainer('alice')} ${fdeContainer('bob')} 2>/dev/null || true`));
-    safe(() => docker(`network rm fde-${FDE_NAMES.alice} fde-${FDE_NAMES.bob} 2>/dev/null || true`));
-    safe(() => compose('down -v', composePaths));
+    teardown('compose down -v', () => compose('down -v', composePaths));
+    teardown(`rm -f ${fdeContainers.join(' ')}`, () => {
+      // 先查在不在再删：资源「本就不存在」不是清理失败（deprovision/上次清场已删）；真失败（daemon 报错）必须记名。
+      const present = containerNamesPresent(...fdeContainers);
+      if (present.length) docker(`rm -f ${present.join(' ')}`);
+    });
+    teardown(`network rm ${fdeNetworks.join(' ')}`, () => {
+      const present = networkNamesPresent(...fdeNetworks);
+      if (present.length) docker(`network rm ${present.join(' ')}`);
+    });
     // issue #178：不删镜像（共享 tag 绝不能被 e2e 删除；compose/docker build 按需失效缓存）。
-    safe(() => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
-    safe(() => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
-    safe(() => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
-    safe(() => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
-    removeDbDir();
+    teardown('rm -rf userspace 临时目录', () => fs.rmSync(S.userspaceRoot, { recursive: true, force: true }));
+    teardown('rm -rf dynamic 临时目录', () => fs.rmSync(S.dynamicRoot, { recursive: true, force: true }));
+    teardown('rm -rf static 临时目录', () => fs.rmSync(S.staticRoot, { recursive: true, force: true }));
+    teardown('rm -rf artifacts 临时目录', () => fs.rmSync(S.artifactsRoot, { recursive: true, force: true }));
+    // lib 的 removeDbDir 对 docker 失败不抛（teardown 语义），以返回 null 记失败——这里翻译成显式失败。
+    teardown('removeDbDir', () => {
+      if (removeDbDir() === null) throw new Error('lib removeDbDir 返回 null（docker 删除执行失败，STATION_DB_DIR 未清掉）');
+    });
+    // #224 零残留复查：本栈标签的容器/网络应为 0。FDE 容器/网络由 portal provisioner 创建时打
+    // station.stack=<栈 id> 标签（portal/src/provisioner.js:198/225，栈 id 即护栏钉的 STATION_STACK_ID）；
+    // compose 资源自带 com.docker.compose.project=<project> 标签。最后再按名复查兜底无标签散资源。
+    // 复查本身跑不动（docker 挂了）同样记失败——不允许「查不了」=「当没残留」。
+    const residual = [];
+    try {
+      const stackId = process.env.STATION_STACK_ID;
+      const project = process.env.COMPOSE_PROJECT_NAME;
+      residual.push(...dockerOut(`ps -a --filter label=station.stack=${stackId} -q`)
+        .map((id) => `容器 ${id}（label station.stack=${stackId}）`));
+      residual.push(...dockerOut(`network ls --filter label=station.stack=${stackId} -q`)
+        .map((id) => `网络 ${id}（label station.stack=${stackId}）`));
+      residual.push(...dockerOut(`ps -a --filter label=com.docker.compose.project=${project} -q`)
+        .map((id) => `容器 ${id}（compose project ${project}）`));
+      residual.push(...dockerOut(`network ls --filter label=com.docker.compose.project=${project} -q`)
+        .map((id) => `网络 ${id}（compose project ${project}）`));
+      residual.push(...containerNamesPresent(...fdeContainers).map((n) => `容器 ${n}（按名复查）`));
+      residual.push(...networkNamesPresent(...fdeNetworks).map((n) => `网络 ${n}（按名复查）`));
+    } catch (error) {
+      const detail = String(error?.stderr || error?.message || error).trim().split('\n')[0];
+      console.warn('[wp6] teardown 零残留复查 执行失败:', detail);
+      teardownFailures.push(`零残留复查执行失败：${detail}`);
+    }
+    const problems = [
+      ...teardownFailures.map((action) => `清理动作失败：${action}`),
+      ...residual.map((item) => `残留资源：${item}`),
+    ];
+    assert.deepEqual(problems, [], `wp6 清场未清干净（#224，清理失败必须红、不允许静默）:\n${problems.join('\n')}`);
   };
   t.after(cleanup);
 

@@ -179,6 +179,26 @@ const singleSourceProblems = [];
       singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 重新给 STATION_DB_DIR 挂了共享栈缺省值 /docker/station-db`);
     }
   }
+  // #224：wp6 cleanup 结构断言——清场失败必须红，不允许回到静默吞错。删掉任一零件（teardown 记录 /
+  // 标签零残留复查 / 末尾断言）或把 `2>/dev/null || true` 请回来，本断言即红（变异自证入口）。
+  {
+    const wp6Text = fs.readFileSync(path.join(HERE, 'wp6-llm-e2e.mjs'), 'utf8');
+    const wp6Required = [
+      [/console\.warn\(`\[wp6\] teardown/, 'teardown 失败逐动作 console.warn 点名'],
+      [/teardownFailures/, '清理失败记进 errors 清单（teardownFailures）'],
+      [/filter label=station\.stack=/, '零残留复查：按 station.stack 标签查本栈容器/网络'],
+      [/filter label=com\.docker\.compose\.project=/, '零残留复查：按 compose project 标签查本栈资源'],
+      [/assert\.deepEqual\(problems, \[\],/, '清场末尾的零失败/零残留断言（有残留必须红）'],
+    ];
+    for (const [pattern, what] of wp6Required) {
+      if (!pattern.test(wp6Text)) {
+        singleSourceProblems.push(`wp6-llm-e2e.mjs: cleanup 缺 #224 零件「${what}」（清场又可能静默吞错了）`);
+      }
+    }
+    if (/2>\/dev\/null \|\| true/.test(wp6Text)) {
+      singleSourceProblems.push('wp6-llm-e2e.mjs: cleanup 里又出现 `2>/dev/null || true`（#224 的静默吞错形态）');
+    }
+  }
 }
 
 // --- 报告 --------------------------------------------------------------------------------
