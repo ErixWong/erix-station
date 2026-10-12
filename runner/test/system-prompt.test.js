@@ -196,7 +196,7 @@ test('SYSTEM_PROMPT 讲清「端口段由平台分配 + ports.json 是唯一真�
 
 // ---------------------------------------------------------------------------
 // issue #257 + #258（工单 feat-261012-01）：预览告知的**分工**本身也被钉死。
-// 定稿（#258 `#issuecomment-6117800165`）：应用侧要求链（6 条）的单一真相 = materializer 下发的
+// 定稿（#258 `#issuecomment-6117800165`）：应用侧要求链（#262 起 7 条）的单一真相 = materializer 下发的
 // `~/AGENTS.md`，`SYSTEM_PROMPT` 只留一句强制指针。下面两条成对出现是有原因的：
 //   ① 缺了 ⇒ 「下发了 ≠ 读了」（R-1 新增 P0：真机里 `AGENTS.md` 只在 2 轮出现，1 轮只是 `ls` 扫到，
 //      因为旧提示词压根没提它）；
@@ -221,21 +221,24 @@ test('SYSTEM_PROMPT 有「开工先读 ~/AGENTS.md」的强制指针，且自带
   assert.match(section, /cat ~\/\.erix\/ports\.json/, 'ports.json 的读取手段不得在改版时丢掉');
 });
 
-test('单一来源防漂移：提示词里不得出现 allowedHosts / credentials / CORS 这三个具体规则词', async () => {
+test('单一来源防漂移：提示词里不得出现那六个具体规则词（allowedHosts / credentials / CORS / Set-Cookie / localStorage / Bearer）', async () => {
   const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
-  for (const word of ['allowedHosts', 'credentials', 'CORS']) {
+  // 后三个是 #262 第 7 条（应用登录态不要用 Cookie）带进来的：规则只住 `~/AGENTS.md`，提示词抄一遍就是
+  // 第二份会过期的真相——现网 #263 一改版（全剥 ↔ 半通），抄进提示词的版本立刻就是错的那一份。
+  const RULE_WORDS = ['allowedHosts', 'credentials', 'CORS', 'Set-Cookie', 'localStorage', 'Bearer'];
+  for (const word of RULE_WORDS) {
     // 用环视做词界（而不是 \b）：allowedHosts 是小驼峰，前缀也可能是字母。
     assert.doesNotMatch(
       prompt,
       new RegExp(`(?<![A-Za-z0-9_])${word}(?![A-Za-z0-9_])`, 'i'),
       `提示词里出现了“${word}”——应用侧规则正在被抄进 SYSTEM_PROMPT（单一真相在 ~/AGENTS.md，由 materializer 下发）。` +
-      '要加内容就改 portal/src/materializer.js 的 renderHomeAgentsMd()，不要把 6 条抄到提示词里。',
+      '要加内容就改 portal/src/materializer.js 的 renderHomeAgentsMd()，不要把 7 条抄到提示词里。',
     );
   }
-  // 反面兜底：这三条在单一真相里必须真的存在（否则②只是把提示词清空，不是防漂移）。
+  // 反面兜底：这六个词在单一真相里必须真的存在（否则②只是把提示词清空，不是防漂移）。
   // 取 portal 侧同源实现而不是重抄一衍文案：单一真相被删时这条也要红。
   const agentsMd = await import('../../portal/src/materializer.js').then((m) => m.renderHomeAgentsMd({ fdeName: 'alice' }));
-  for (const word of ['allowedHosts', 'credentials', 'CORS']) {
+  for (const word of RULE_WORDS) {
     assert.match(agentsMd, new RegExp(word, 'i'), `单一真相里必须含“${word}”（提示词不抄，文件里必须写）`);
   }
 });
