@@ -169,6 +169,8 @@ export const zhCN = {
   composer: {
     send: '发送',
     stop: '■ 停止',
+    // issue #261B：上一条发送以失败终局收场时的一键重发（仅输入框为空 + 无活跃 run 时可见）。
+    retry: '重试上一条',
   },
   // 会话浏览 modal（components/SessionPickerModal.vue）
   picker: {
