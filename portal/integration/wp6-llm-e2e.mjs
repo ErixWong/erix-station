@@ -8,7 +8,6 @@ import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
-import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +15,10 @@ import * as totp from '../src/totp.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
+// issue #226：护栏/DB 目录解析/端口探测/Traefik 静态配置生成的唯一一副本在 lib/isolated-env.mjs。
+import {
+  assertHostPortsAvailable, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+} from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const COMPOSE = 'docker compose --profile litellm --env-file deploy/.env -f deploy/docker-compose.yml';
@@ -32,94 +35,23 @@ const FDE_NAMES = {
   bob: process.env.WP6_FDE_BOB || 'bob',
 };
 const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
-const TRAEFIK_DEFAULT_STATIC = path.join(REPO_ROOT, 'deploy/traefik/traefik.yml');
 const ADMIN_PASSWORD = 'wp6-admin-pass-123';
 const HEARTBEAT_MS = 15000;
 
-function assertIsolatedEnvironment() {
-  const required = [
-    'STATION_DB_DIR', 'COMPOSE_PROJECT_NAME', 'STATION_STACK_ID',
-    'STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME',
-    'STATION_EDGE_NAME', 'STATION_LITELLM_NAME', 'PORTAL_HOST_PORT',
-    'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT',
-    'STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE',
-    'WP6_FDE_ALICE', 'WP6_FDE_BOB', 'BACKEND_SUBNET', 'FDE_POOL', 'FDE_IPAM_POOLS',
-  ];
-  for (const name of required) assert.ok(process.env[name], `${name} must be set for isolated e2e`);
-  const dbRelativePath = path.relative(os.tmpdir(), path.resolve(process.env.STATION_DB_DIR));
-  assert.ok(dbRelativePath && !dbRelativePath.startsWith('..') && !path.isAbsolute(dbRelativePath),
-    'STATION_DB_DIR must be inside the OS temporary directory');
-  assert.ok(!fs.existsSync(process.env.STATION_DB_DIR), 'STATION_DB_DIR must be a fresh, nonexistent directory');
-  for (const [name, forbidden] of [
-    ['COMPOSE_PROJECT_NAME', 'station'],
-    ['STATION_STACK_ID', 'default'],
-    ['STATION_DB_NAME', 'station-db'],
-    ['STATION_PORTAL_NAME', 'station-portal'],
-    ['STATION_DOCKER_PROXY_NAME', 'station-docker-proxy'],
-    ['STATION_EDGE_NAME', 'station-edge'],
-    ['STATION_LITELLM_NAME', 'station-litellm'],
-    ['PORTAL_HOST_PORT', '18080'],
-    ['LITELLM_HOST_PORT', '4100'],
-    ['TRAEFIK_WEB_PORT', '8090'],
-    ['TRAEFIK_WEBSECURE_PORT', '8443'],
-    ['BACKEND_SUBNET', '172.32.0.0/24'],
-    ['STATION_PORTAL_IMAGE', 'erix-station/portal:local'],
-    ['STATION_DOCKER_PROXY_IMAGE', 'erix-station/fde-proxy:local'],
-    ['FDE_IMAGE', 'erix-station/fde:local'],
-    ['WP6_FDE_ALICE', 'alice'],
-    ['WP6_FDE_BOB', 'bob'],
-  ]) assert.notEqual(process.env[name], forbidden, `${name} must not target the shared stack`);
-  assert.equal(process.env.FDE_POOL, 'large', 'isolated e2e must use the dedicated large FDE pool');
-  const fdeIpamPools = process.env.FDE_IPAM_POOLS.split(',').map((pool) => pool.trim()).filter(Boolean);
-  assert.deepEqual(fdeIpamPools, ['10.201.0.0/16'], 'proxy IPAM pool must match the isolated FDE pool');
-  assert.equal(process.env.COMPOSE_PROJECT_NAME, process.env.STATION_STACK_ID,
-    'compose project and stack label must use the same unique ID');
-  for (const name of ['STATION_DB_NAME', 'STATION_PORTAL_NAME', 'STATION_DOCKER_PROXY_NAME', 'STATION_EDGE_NAME', 'STATION_LITELLM_NAME']) {
-    assert.ok(process.env[name].endsWith(`-${process.env.STATION_STACK_ID}`), `${name} must include the unique stack ID`);
-  }
-  for (const name of ['STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE']) {
-    assert.ok(process.env[name].endsWith(`:${process.env.STATION_STACK_ID}`), `${name} must use a unique image tag`);
-  }
-  assert.match(FDE_NAMES.alice, /^[a-z0-9][a-z0-9-]{0,62}$/);
-  assert.match(FDE_NAMES.bob, /^[a-z0-9][a-z0-9-]{0,62}$/);
-  assert.ok(FDE_NAMES.alice.includes(process.env.STATION_STACK_ID), 'WP6_FDE_ALICE must include the unique stack ID');
-  assert.ok(FDE_NAMES.bob.includes(process.env.STATION_STACK_ID), 'WP6_FDE_BOB must include the unique stack ID');
-  assert.notEqual(FDE_NAMES.alice, FDE_NAMES.bob, 'isolated FDE names must be distinct');
-  const ports = ['PORTAL_HOST_PORT', 'LITELLM_HOST_PORT', 'TRAEFIK_WEB_PORT', 'TRAEFIK_WEBSECURE_PORT']
-    .map((name) => process.env[name]);
-  assert.equal(new Set(ports).size, ports.length, 'isolated e2e ports must be distinct');
-  for (const port of ports) {
-    assert.match(port, /^\d{2,5}$/);
-    assert.ok(Number(port) <= 65535);
-    assert.ok(!['4000', '4001', '4100', '8090', '8443', '18080'].includes(port),
-      `isolated e2e must not use a shared-stack port (${port})`);
-  }
-  assert.equal(process.env.LLM_GATEWAY_HOST, `http://127.0.0.1:${LITELLM_HOST_PORT}`,
-    'LLM_GATEWAY_HOST must target the isolated LiteLLM publish port');
-}
-
-async function assertHostPortsAvailable() {
-  for (const port of [PORTAL_HOST_PORT, LITELLM_HOST_PORT, TRAEFIK_WEB_PORT, process.env.TRAEFIK_WEBSECURE_PORT]) {
-    const server = net.createServer();
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(Number(port), '127.0.0.1', () => server.close(resolve));
-    }).catch((error) => {
-      throw new Error(`isolated e2e port ${port} is unavailable: ${error.message}`);
-    });
-  }
-}
-
-function writeTraefikStatic(dir) {
-  const source = fs.readFileSync(TRAEFIK_DEFAULT_STATIC, 'utf8');
-  assert.ok(source.includes('address: ":8090"') && source.includes('address: ":8443"'),
-    'Traefik static config has the expected entrypoint addresses');
-  const output = source
-    .replace('address: ":8090"', `address: ":${TRAEFIK_WEB_PORT}"`)
-    .replace('address: ":8443"', `address: ":${process.env.TRAEFIK_WEBSECURE_PORT}"`);
-  const target = path.join(dir, 'traefik.yml');
-  fs.writeFileSync(target, output);
-  return target;
+// #226：判据本体已提到 lib/isolated-env.mjs；本脚本的参数是两个 FDE 名（都得带栈 id）
+// 与「镜像不得沿用共享栈的 :local 默认 tag」。
+function isolatedStackOptions() {
+  return {
+    fdeNames: [
+      { env: 'WP6_FDE_ALICE', value: FDE_NAMES.alice, sharedDefault: 'alice' },
+      { env: 'WP6_FDE_BOB', value: FDE_NAMES.bob, sharedDefault: 'bob' },
+    ],
+    extraForbiddenEnv: [
+      ['STATION_PORTAL_IMAGE', 'erix-station/portal:local'],
+      ['STATION_DOCKER_PROXY_IMAGE', 'erix-station/fde-proxy:local'],
+      ['FDE_IMAGE', 'erix-station/fde:local'],
+    ],
+  };
 }
 
 function docker(args) {
@@ -139,13 +71,7 @@ function dockerStdin(args, input) {
   });
 }
 
-const DB_DIR = (process.env.STATION_DB_DIR || '').replace(/\/+$/, '');
-
-function removeDbDir() {
-  const parent = path.posix.dirname(DB_DIR);
-  const name = path.posix.basename(DB_DIR);
-  safe(() => docker(`run --rm -v ${JSON.stringify(parent)}:/host alpine rm -rf ${JSON.stringify(`/host/${name}`)}`));
-}
+const { removeDbDir } = createDbDirCleaner({ docker });
 
 function compose(args, env = {}) {
   return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
@@ -455,13 +381,15 @@ async function createOnboardingMockModel() {
 test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and binding lifecycle', {
   timeout: 20 * 60 * 1000,
 }, async (t) => {
-  assertIsolatedEnvironment();
-  await assertHostPortsAvailable();
+  assertIsolatedEnvironment(isolatedStackOptions());
+  await assertHostPortsAvailable([PORTAL_HOST_PORT, LITELLM_HOST_PORT, TRAEFIK_WEB_PORT, process.env.TRAEFIK_WEBSECURE_PORT]);
   S.userspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-users-wp6-'));
   S.dynamicRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dynamic-wp6-'));
   S.staticRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-static-wp6-'));
   S.artifactsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-artifacts-wp6-'));
-  S.staticFile = writeTraefikStatic(S.staticRoot);
+  S.staticFile = writeTraefikStatic(S.staticRoot, {
+    repoRoot: REPO_ROOT, webPort: TRAEFIK_WEB_PORT, websecurePort: process.env.TRAEFIK_WEBSECURE_PORT,
+  });
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
   fs.chmodSync(S.staticRoot, 0o755);
