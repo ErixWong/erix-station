@@ -370,6 +370,46 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - [x] **本轮定性：预览域名下跑通一个普通前后端分离应用需要 6 条，其中 3 条未告知**（③ dev server `allowedHosts`→#257；④ 跳端口调用要带 `credentials:'include'` 因为通行凭证是 HttpOnly cookie、⑤ 后端 CORS 必须回显 `Origin`+`Allow-Credentials`⇒ #258；⑥ 每个 host 各需一次放行⇒#247）。另开 **#255**（首登不强制改密，需产品决策；**同时更正了 §六 里我上一轮写错的「首登强制改密 ✅」**）与 **#256**（号池占用总览端点，把改块从试错变选段）。**本轮靠我发第 3、4 条消息才把应用修通 ⇒ 缺口在告知面，不在 agent 能力。**
 - [x] **新坑（已写进 drill-2026-10-12 §六）**：① **项目级 playwright 容器（:8935）的 MCP 版本参数名与默认实例不同**——点击/填表用 `target`（不是 `ref`）、`browser_console_messages` 必给 `level`、`browser_network_requests` 必给 `static`、`browser_take_screenshot` 必给 `scale`；② `POST /api/ports/:id/preview-ticket` **要求 `Content-Type: application/json`**（上一轮文档里的 curl 片段少了这个头，已改）；③ `POST /api/sessions/:id/messages` 字段是 **`content`**；④ 预览票据 60 秒过期，跳 host 要各 host 各有一票。
 
+### 8.16 预览访问要求链的单一真相落 `~/AGENTS.md`（issue #257 + #258，工单 feat-261012-01，2026-10-12）
+
+背景：§8.15 定性了「预览域名下跑通一个普通前后端分离应用需要 6 条，其中 3 条未告知」，#257/#258 把缺口登记在**告知面**。
+决策者定稿的落点是**结构化**（不是为了省 token）：单一真相进 materializer 下发的 `~/AGENTS.md`，
+`SYSTEM_PROMPT` 只留强制指针（#258 `#issuecomment-6117800165`）。前提单 **#259**（jail 家目录只读例外）与 **#247**
+（FDE 级 grant，消掉第 6 条）**都不在本单**。
+
+- [x] **`portal/src/materializer.js` 的 `renderHomeAgentsMd()` 新增「预览访问：外部浏览器要用这个应用，必须满足这 6 条」节**：
+  ① 端口从 `~/.erix/ports.json` 取（不要发明端口）② 监听 `0.0.0.0` ③ **把预览 host 加进 dev server 自己的主机白名单**
+  （host 取该条 `url`、窄范围优先、后缀匹配要说明它放开整棵子域、**禁 `allowedHosts: true` / `"all"` 一把梭**、
+  Vite `server.allowedHosts` vs webpack-dev-server `devServer.allowedHosts`、其它框架按实际版本核实）
+  ④ **跳预览端口调用要带凭据**（`credentials:'include'`，通行凭证是 host-only `HttpOnly` cookie）
+  ⑤ **后端 CORS 不能回 `*`**（回显 `Origin` + `Access-Control-Allow-Credentials: true` + `Vary: Origin`，
+  `OPTIONS` 预检不带凭据要在鉴权**之前**答）⑥ **每条预览 host 各需一次放行**（前端有票 ≠ 后端有票，现阶段逐条点「打开预览」）。
+  外加**错误形态对照**：`Blocked request. This host … is not allowed.` = 应用给的 / `{"error":{"code":"preview_ticket_required",…}}` =
+  平台边缘给的 / `502 Bad Gateway` = 没人在监听；并要求把 `code`/`message` 渲染出来而不是 `[object Object]`。
+- [x] **红线由测试钉死**：新节零端口数字与端口区间（全文 4 位数只允许出现文件权限 `0644`）、全文零伞域字面量
+  （不只禁现网那个值，也按**形状**禁 `fde.<可注册域>` 与 `localhost`）；`isPlatformManagedPath()` 导出并钉死
+  「home 级 `AGENTS.md` 属平台文件」这个精确分支（它恒在 desired plan 里，从 stale 清理路径跑不到，只能直接钉）。
+- [x] **`runner/worker.js` 的 `SYSTEM_PROMPT` 只加一句强制指针**（预览段首行「开工前先读 `~/AGENTS.md`」+ 本节有意不复述规则），
+  并把「家目录文件工具读不到…用 shell 读」那句从只覆盖 `~/.erix/ports.json` **扩到同时覆盖 `~/AGENTS.md`**
+  （#259 落地前 `createJail({ root: cwd })` 无只读例外，`readFile` 会撞「被宿主边界拒绝」白烧一轮）。**6 条一条也没拄进提示词**。
+- [x] **单一来源防漂移断言（提示词里不得出现 `allowedHosts` / `credentials` / `CORS`）**：这三个词是 6 条里的具体规则词，
+  出现在提示词里就说明有人开了第二份会过期的真相源（同 §8.10「工具名从注册面取、不手抄清单」）。测试同时**反向断言**
+  这三个词必须在 `~/AGENTS.md` 里——否则「把提示词清空」也能假装成防漂移。
+  **变异取证（主 agent 亲手跑的三条，不复用 worker 的）**：① 往提示词预览段插一条含 `allowedHosts` 的规则（反引号转义过的合法变异，
+  `node --check` 仍过）⇒ **恰好 1 条红**（单一来源防漂移）；② 把强制指针整条从预览段**挖到「交付规则」段**（措辞一字不动、只挨位置）
+  ⇒ **恰好 1 条红**（「必须落在预览段内」）；③ 把单一真相里的「**窄范围优先**」改成「范围优先」⇒ **恰好 1 条红**（6 条逐条锚点）。
+  ⚠ 做变异时插裸反引号会**提前截断模板字符串**（我第一次就这么做错了，连带 9 条红）——先 `node --check` 再下结论。
+  主 agent 另复跑全套：根 `npm test` **926/925/0/1**、`node --test runner/test/*.test.js` **202/202**，与交付一致。
+- [x] **口径同步**：`docs/design/user-space.md` 新增 §4.1.2（`~/AGENTS.md` 的职责边界 = 工位约定 + 平台约束单一真相，
+  含读取边界与红线）、`docs/design/fde-platform.md` §8.1 末段「告知落点」由两处改三处 + §8.2 加「应用侧要求链
+  以 `~/AGENTS.md` 为准，本文不重抄」。
+- [x] **测试基线：根 `npm test` 920/919 → 926/925**（0 失败 / 1 跳过不变）、**`node --test runner/test/*.test.js` 200 → 202**；
+  `docs/ops/ci-release.md` §1 与 `.github/workflows/ci.yml` 步骤 ② 注释已同步。**前端零改动**（基线 29 文件 / 391 不变；
+  本单没跑前端，沙箱里没有 `portal/frontend/node_modules`）。`docs/data/schema.sql` 一字节未动，零 DDL / 零依赖 / 零 lockfile，
+  `runner/lib/**` 与 `portal/src/{preview,http}.js` 未动。
+- [ ] **待办（主 agent）**：真机 R-1 **P0：下发了 ≠ 读了** —— 新提示词下复测，先断言 transcript 里出现读 `~/AGENTS.md`
+  的调用（#259 落地前必然是 `shell cat`），为 0 直接判失败；再看第一轮是否不再需要人发第 3、4 条消息。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
