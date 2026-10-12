@@ -2,7 +2,8 @@
 // 停止（cancel_requested_at → cancelling → aborted run_end）→ assistant 回写 → 归档。
 // 复用真实 runner + LiteLLM mock model；必须显式传入独立的栈名、容器名、端口和临时 DB 路径。
 // ⚠️ e2e 前置：**必须导出 `HTTP_PROXY`/`HTTPS_PROXY`**（FDE 镜像构建要联网下 gh/tea/glab）；
-//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）——本脚本**绝不删除共享镜像 tag**
+//   隔离栈须派生镜像 tag（`FDE_IMAGE`/`STATION_PORTAL_IMAGE`）并显式导出 `FDE_DEV_MODE=1`（#227.1：
+//   tag 形态不声明 dev 模式会被护栏拒跑；digest 形态豁免）——本脚本**绝不删除共享镜像 tag**
 //   （issue #178，口径集中在 lib/fde-image.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';

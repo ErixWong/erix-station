@@ -15,6 +15,7 @@
 //   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large FDE_IPAM_POOLS=10.201.0.0/16
 //   LLM_GATEWAY_HOST=http://127.0.0.1:<LITELLM_HOST_PORT>
 //   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
+//   FDE_DEV_MODE=1（#227.1 起必需：FDE_IMAGE 为 image:tag 形态时须显式声明 dev 模式；digest 形态豁免）
 //   TRAEFIK_STATIC_HOST 由脚本自动生成（只改入口端口的临时 traefik.yml，F8）。代理构建/镜像与
 //   HTTP_PROXY 口径见 lib/fde-image.mjs；IPAM 保留段等派生注入见 wp3b 的 isolationComposeEnv()。
 import test from 'node:test';

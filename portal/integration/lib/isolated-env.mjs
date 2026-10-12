@@ -48,12 +48,19 @@ export const SHARED_STACK = {
  *  1. 未设置 ⇒ 抛错，并点名「缺省会 rm -rf 共享 dev 库数据目录」；
  *  2. 设了但不在 OS 临时目录内 ⇒ 也抛（`ERIX_E2E_ALLOW_DB_DIR=1` 是显式豁免，用于真机有意复用某路径）。
  *
+ * `allowSharedReset`（#227.1，**只允许 wp2b 用**）：调用方**显式声明「我就是要重置共享 dev 库」**——
+ * 未设置时不抛、直接解析为共享栈的 `/docker/station-db`；解析结果恰等于该路径时豁免临时目录检查，
+ * 其余路径照旧严格（不把豁免面扩大成「任意非临时路径」）。确认这个重置语义前不要复制到别的脚本
+ * （`isolation-negative.mjs` 的单一来源断言把出现处钉在 lib + wp2b）。
+ *
  * @param {Record<string, string | undefined>} [env]
+ * @param {{ allowSharedReset?: boolean }} [options]
  * @returns {string} 去掉尾斜杠后的 DB 数据目录（绝对路径）
  */
-export function resolveDbDir(env = process.env) {
+export function resolveDbDir(env = process.env, { allowSharedReset = false } = {}) {
   const raw = env.STATION_DB_DIR;
   if (!raw) {
+    if (allowSharedReset) return SHARED_STACK.dbDir;
     throw new Error(
       `STATION_DB_DIR must be set for isolated e2e：缺省值 ${SHARED_STACK.dbDir} 是共享 dev 栈 station-db 的 `
       + 'bind 源，teardown 的 rm -rf 会直接清掉共享 dev 库的数据目录（issue #226）。'
@@ -63,7 +70,8 @@ export function resolveDbDir(env = process.env) {
   const dbDir = String(raw).replace(/\/+$/, '');
   const relative = path.relative(os.tmpdir(), path.resolve(dbDir));
   const insideTempDir = relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
-  if (!insideTempDir && env.ERIX_E2E_ALLOW_DB_DIR !== '1') {
+  const waived = env.ERIX_E2E_ALLOW_DB_DIR === '1' || (allowSharedReset && dbDir === SHARED_STACK.dbDir);
+  if (!insideTempDir && !waived) {
     throw new Error(
       `STATION_DB_DIR=${dbDir} 不在临时目录（os.tmpdir()=${os.tmpdir()}）内：`
       + `非临时路径（例如共享栈的 ${SHARED_STACK.dbDir}）被 rm -rf 会带走真实数据。`
@@ -80,10 +88,11 @@ export function resolveDbDir(env = process.env) {
  *
  * @param {(args: string) => unknown} docker 该脚本的 docker 执行器
  * @param {Record<string, string | undefined>} [env]
+ * @param {{ allowSharedReset?: boolean }} [options] 见 resolveDbDir（只允许 wp2b 声明）
  */
-export function removeDbDir(docker, env = process.env) {
+export function removeDbDir(docker, env = process.env, options = {}) {
   assert.ok(typeof docker === 'function', 'removeDbDir: docker executor is required');
-  const dbDir = resolveDbDir(env);
+  const dbDir = resolveDbDir(env, options);
   const parent = path.posix.dirname(dbDir);
   const name = path.posix.basename(dbDir);
   try {
@@ -97,14 +106,16 @@ export function removeDbDir(docker, env = process.env) {
 /**
  * 生成该脚本专用的 `removeDbDir()` 闭包（各 e2e 的 docker 执行器是本地函数，这样调用点保持零参数）。
  *
- * @param {{ docker: (args: string) => unknown, env?: Record<string, string | undefined> }} opts
+ * @param {{ docker: (args: string) => unknown, env?: Record<string, string | undefined>, allowSharedReset?: boolean }} opts
+ *   allowSharedReset 只允许 wp2b（共享栈重置）传，见 resolveDbDir 与单一来源断言。
  * @returns {{ removeDbDir: () => void, dbDir: () => string }}
  */
-export function createDbDirCleaner({ docker, env = process.env }) {
+export function createDbDirCleaner({ docker, env = process.env, allowSharedReset = false }) {
   assert.ok(typeof docker === 'function', 'createDbDirCleaner: docker executor is required');
+  const options = { allowSharedReset };
   return {
-    dbDir: () => resolveDbDir(env),
-    removeDbDir: () => removeDbDir(docker, env),
+    dbDir: () => resolveDbDir(env, options),
+    removeDbDir: () => removeDbDir(docker, env, options),
   };
 }
 
@@ -181,7 +192,16 @@ export function assertIsolatedEnvironment(options = {}) {
     assert.ok(env[name].endsWith(`-${env.STATION_STACK_ID}`), `${name} must include the unique stack ID`);
   }
   for (const name of ['STATION_PORTAL_IMAGE', 'STATION_DOCKER_PROXY_IMAGE', 'FDE_IMAGE']) {
+    // #227.1：digest 钉定的 FDE 镜像不适用唯一 tag 要求（内容寻址，天然不撞共享 tag）。
+    if (name === 'FDE_IMAGE' && env[name].includes('@sha256:')) continue;
     assert.ok(env[name].endsWith(`:${env.STATION_STACK_ID}`), `${name} must use a unique image tag`);
+  }
+  // #227.1（主 agent 真跑 #226 踩的坑）：`image:tag` 形态的 FDE 镜像必须显式 FDE_DEV_MODE=1——
+  // portal 在非 dev 模式只接受 digest 形态（portal/src/config.js:83-86/122），没显式声明 provision 直接拒；
+  // digest（@sha256:）形态是生产铉定，不要求。
+  if (!String(env.FDE_IMAGE).includes('@sha256:')) {
+    assert.equal(env.FDE_DEV_MODE, '1',
+      'FDE_DEV_MODE must be 1 when FDE_IMAGE is image:tag（tag 形态不显式声明 dev 模式会被 portal 生产门拒跑；digest 形态豁免）');
   }
   for (const fde of fdeNames) {
     assert.match(fde.value, /^[a-z0-9][a-z0-9-]{0,62}$/, `${fde.env} must be a safe FDE name`);
