@@ -173,7 +173,9 @@ async function phaseConcurrent() {
 }
 
 async function phaseLlm() {
-  // 故意带错误 Authorization（STOLEN-KEY）：证明 Traefik 按 ClientIP 覆盖为 erix-placeholder。
+  // 故意带错误 Authorization（STOLEN-KEY）：证明 Traefik 按 ClientIP（llm-<FDE> 路由）把 Authorization
+  // 整体覆盖为该 FDE 的 LiteLLM 虚拟 key——只有覆盖生效，LiteLLM 才认票 200（#268 M3：mock 响应由
+  // LiteLLM 原生 mock_response 提供，请求模型与 ensureLlmBinding 的 modelName 对齐为 mock-model）。
   const text = await new Promise((resolve, reject) => {
     const u = new URL(`${base}/v1/chat/completions`);
     const payload = JSON.stringify({ model: 'mock-model', messages: [{ role: 'user', content: 'ping' }], stream: true });
