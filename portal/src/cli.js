@@ -41,7 +41,11 @@ async function serve() {
     const migratePool = createPool(config.migrateDatabaseUrl);
     const bootstrapPool = createPool(config.bootstrapDatabaseUrl);
     try {
-      const summary = await migrate(migratePool, { bootstrapPool });
+      const summary = await migrate(migratePool, {
+        bootstrapPool,
+        // issue #280：平台库角色点名口径（config.js 的 migrateDatabaseUrl 是同一份配置）。
+        migrateDatabaseUrl: config.migrateDatabaseUrl,
+      });
       // eslint-disable-next-line no-console
       console.log('[migrate] ok', summary);
     } catch (err) {
@@ -93,7 +97,10 @@ async function runMigrate() {
   const pool = createPool(config.migrateDatabaseUrl);
   const bootstrapPool = createPool(config.bootstrapDatabaseUrl);
   try {
-    const summary = await migrate(pool, { bootstrapPool });
+    const summary = await migrate(pool, {
+      bootstrapPool,
+      migrateDatabaseUrl: config.migrateDatabaseUrl,
+    });
     // eslint-disable-next-line no-console
     console.log('[migrate] done', summary);
     process.exitCode = 0;
@@ -128,7 +135,9 @@ async function bootstrapAdmin(values) {
   // bootstrap-admin 属 bootstrap 操作：用 bootstrap 超级用户（BOOTSTRAP_DATABASE_URL）执行迁移与写 users。
   const pool = createPool(config.bootstrapDatabaseUrl);
   try {
-    await migrate(pool, {});
+    // 本命令以 bootstrap 超级用户跑全流程：迁移身份切换（issue #280）按这条连接串点名，
+    // 与当前角色同名时是无副作用 no-op，否则由 runner 量出表属主后 SET ROLE（见 migrate.js）。
+    await migrate(pool, { migrateDatabaseUrl: config.bootstrapDatabaseUrl });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[migrate] failed:', err.message);
