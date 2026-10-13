@@ -54,6 +54,8 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 ⚠ **主工作区 `node_modules` 会被别的 worktree 掏空（同一晚第三次复发）**：症状是 `npm test` 从 1022 项掉到 **510 项 + 34 失败**，且 `node_modules/erix-agent` 不存在——**不是代码回归**，先 `ls -d node_modules/erix-agent` 再下结论，`npm ci --prefer-offline` 重装即回基线。推论：**发版/验收前必须先重装一次并复跑拿到基线数**，别拿一个依赖不完整的树当验收基点。
 
+⚠ **前端判绿只能看退出码，不能 grep 摘要行（2026-10-14 主 agent 自己犯的错，代价是一次返工重打 tag）**：vitest 在存在**未捕获拒绝**时照样打印 `Test Files 33 passed (33) / Tests 488 passed (488)`，**但进程以 rc=1 退出**。我当晚用 `npm test 2>&1 | grep -E "Test Files|Tests "` 连跑 3 次都读到「全绿」，实际每一次都是 rc=1、4 条 `Unhandled Rejection` —— 于是把红灯当绿灯合进了 main，直到 CI 步骤 ④ 红才发现。口径：**判绿 = 退出码 0**；要么直接 `npm test; echo rc=$?`，要么 `npm test && echo GREEN`。附带两条：① 这类泄漏的常见成因是 `onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的 Promise），产品侧实例见 issue #281；② 有 worker 把它归因成「本机 `NODE_ENV=production` ⇒ Vue 生产构建吞掉拒绝」，**该说法在本机已被主 agent 实测否证**（`production` 与 `NODE_ENV=test` 两种模式跑原始文件都是 rc=1）——别拿未在自己机器上复现的成因当结论。
+
 ### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
 
 - 入口：`http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2，2026-10-08 起；旧的 `hp.inteva.vip:8090` 已随 Host 路由切换失效——Traefik 只认 `station.fde.erix.vip` / `100.100.0.3`。本机解析器负缓存解析不出时可用 playwright 容器 `erix_station_playwright`（:8935，resolver MAP 规则）或临时 hosts 条目兑底。deploy 栈 station-portal；代码更新后需 `docker compose build station-portal && docker compose up -d station-portal` 生效）
