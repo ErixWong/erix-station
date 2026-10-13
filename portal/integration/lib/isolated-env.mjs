@@ -322,3 +322,28 @@ export function writeTraefikStatic(dir, { repoRoot = REPO_ROOT, webPort, websecu
   fs.writeFileSync(target, output);
   return target;
 }
+
+/**
+ * compose up **之前**在 Traefik 动态目录预写 `routes.yml` 桩（issue #268 决策 4：edge watch 存量坑修法）。
+ *
+ * 为什么必须预写：Traefik v3 file provider 在**启动时刻**对目录内已存在的文件建立 watch；
+ * 启动时动态目录里没有 `routes.yml`，watch 就落在那个「尚不存在的 inode」上，之后 materializer
+ * 的原子替换（tmp 写 → rename，见 portal/src/routes.js 头部注释）产生的是**新 inode**，
+ * inotify 永远不会把这次替换报给 watch → 整栈健康、DB 有路由、但 internal/预览全 404，
+ * `docker restart <edge>` 立刻通（e2e262 实测复现，AGENTS §8.18「edge file-provider watch 坑」）。
+ * 预写一份 `http: {}` 空桩让启动即有文件可 watch，之后 materializer 的替换就能被 reload 捕获。
+ *
+ * ⚠️ 幂等红线：`routes.yml` **已存在则一字不动**——桩绝不能覆盖 materializer 的产物（把真实路由
+ * 压回 `http: {}` 就等于亲手制造 404）。「存在不覆盖」由 `isolation-negative.mjs` 的桩语义断言钉住
+ * （改成无条件覆盖即红）。
+ *
+ * @param {string} dynamicDir 该脚本的 Traefik 动态临时目录（mkdtemp 之后、任何 compose up 之前调用）
+ * @returns {{ file: string, created: boolean }} 桩路径 + 是否新写（存在而未动 ⇒ created=false）
+ */
+export function writeDynamicStub(dynamicDir) {
+  assert.ok(dynamicDir, 'writeDynamicStub: dynamicDir is required');
+  const target = path.join(dynamicDir, 'routes.yml');
+  if (fs.existsSync(target)) return { file: target, created: false };
+  fs.writeFileSync(target, 'http: {}\n');
+  return { file: target, created: true };
+}

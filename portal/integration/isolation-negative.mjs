@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir,
+  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir, writeDynamicStub,
 } from './lib/isolated-env.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -184,12 +184,42 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}digest/allowSharedReset/IPAM 派生正例被拒：${String(error?.message ?? error)}`;
 }
 
+// #268 M1 的桩语义正例（独立一组，任一失败同样算正例不过）：writeDynamicStub 只在 routes.yml
+// 不存在时写 `http: {}\n`，**已存在则一字不动**——这是 edge watch 坑修法的幂等红线：
+// 变异入口：把 writeDynamicStub 改成无条件覆盖 routes.yml，下方「不覆盖 materializer 产物」即红
+//（桩压掉真实路由 = 亲手制造全 404，比不修更坑）。
+try {
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-stub-trap-'));
+  try {
+    const materialized = 'http:\n  routers:\n    internal-alice:\n      rule: PathPrefix(`/api/internal`)\n';
+    // 1) 已存在（模拟 materializer 产物）：不动、created=false，重复调用也幂等。
+    fs.writeFileSync(path.join(stubDir, 'routes.yml'), materialized);
+    const r1 = writeDynamicStub(stubDir);
+    assert.equal(fs.readFileSync(path.join(stubDir, 'routes.yml'), 'utf8'), materialized,
+      'writeDynamicStub 不得覆盖已存在的 routes.yml（materializer 产物不能被桩压掉）');
+    assert.equal(r1.created, false, '已存在时 created=false（幂等信号）');
+    // 2) 不存在：写入的正文必须是 `http: {}\n`（合法空配置：Traefik 能 watch，且不含任何路由）。
+    fs.rmSync(path.join(stubDir, 'routes.yml'));
+    const r2 = writeDynamicStub(stubDir);
+    assert.equal(fs.readFileSync(path.join(stubDir, 'routes.yml'), 'utf8'), 'http: {}\n',
+      '不存在时应预写 `http: {}\n` 桩');
+    assert.equal(r2.created, true, '新写时 created=true');
+    // 3) 对自己的桩再调一次也不重写（幂等）。
+    assert.equal(writeDynamicStub(stubDir).created, false, '桩自身的二次调用不重写');
+  } finally {
+    fs.rmSync(stubDir, { recursive: true, force: true });
+  }
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}writeDynamicStub 桩语义正例被破坏：${String(error?.message ?? error)}`;
+}
+
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
-  'deriveFdeIpamPools', 'defaultFdeIpamPools'];
+  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub'];
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -260,6 +290,23 @@ const singleSourceProblems = [];
     }
     if (/2>\/dev\/null \|\| true/.test(wp6Text)) {
       singleSourceProblems.push('wp6-llm-e2e.mjs: cleanup 里又出现 `2>/dev/null || true`（#224 的静默吞错形态）');
+    }
+  }
+  // #268 M1（edge watch 桩）：四支隔离 e2e 必须 import 并在 **compose up 之前**调用 writeDynamicStub。
+  // 顺序用源码文本判：首次调用行号 < 首次 `compose('up` 行号（桩晚于起栈 = watch 已经落空，白写）。
+  // 变异自证入口：删掉/注释任一脚本的桩调用 ⇒ 本断言红；把调用搬到 compose up 之后 ⇒ 同样红。
+  const DYNAMIC_STUB_SCRIPTS = ['wp3a-e2e.mjs', 'wp3b-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
+  for (const script of DYNAMIC_STUB_SCRIPTS) {
+    const lines = fs.readFileSync(path.join(HERE, script), 'utf8').split('\n');
+    const stubLine = lines.findIndex((l, i) => /\bwriteDynamicStub\s*\(/.test(l) && !/^\s*(import|\/\/|\*)/.test(l) && i > 0);
+    const upLine = lines.findIndex((l) => /compose\('up\b/.test(l));
+    if (!new RegExp(`writeDynamicStub[,\\s][\\s\\S]*?from\\s+'\\.\\/lib\\/isolated-env\\.mjs'`).test(fs.readFileSync(path.join(HERE, script), 'utf8'))) {
+      singleSourceProblems.push(`${script}: 没有从 ./lib/isolated-env.mjs import writeDynamicStub（桩必须用公共那一份）`);
+    }
+    if (stubLine === -1) {
+      singleSourceProblems.push(`${script}: 没调用 writeDynamicStub()（edge watch 桩没预写，materializer 原子替换会永不被 reload → internal 全 404，#268）`);
+    } else if (upLine !== -1 && stubLine > upLine) {
+      singleSourceProblems.push(`${script}:${stubLine + 1} writeDynamicStub() 在 compose up（:${upLine + 1}）之后才调——桩必须在起栈前预写，否则 watch 已落空（#268）`);
     }
   }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b

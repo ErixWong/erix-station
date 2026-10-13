@@ -19,6 +19,7 @@ import { LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 // issue #226：护栏/DB 目录解析/端口探测/Traefik 静态配置生成的唯一一副本在 lib/isolated-env.mjs。
 import {
   assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  writeDynamicStub,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -404,6 +405,8 @@ test('WP6 end-to-end: LiteLLM virtual key injection, model allow-list, and bindi
   fs.chmodSync(S.dynamicRoot, 0o755);
   fs.chmodSync(S.staticRoot, 0o755);
   fs.chmodSync(S.artifactsRoot, 0o755);
+  // #268 M1：预写 edge watch 桩（坑见 lib/isolated-env.mjs:writeDynamicStub；必须早于 compose up）。
+  writeDynamicStub(S.dynamicRoot);
   const composePaths = {
     ...DOMAIN_COMPOSE_ENV,
     ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
