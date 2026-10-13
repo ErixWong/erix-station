@@ -69,7 +69,7 @@
 4. （步骤 ③）`cd runner && npm ci && node --test` → **221/221**（#261 新增 19 项 `runner/test/llm-timeouts.test.js`；
    再往前 #257+#258 新增 2 项在 `runner/test/system-prompt.test.js`，那之前是 200/200）。口径见 `AGENTS.md` §4：
    **`node --test runner/test/`（目录当参数）在本机 Node 22/24 是坏的**（把目录当模块加载 → `Cannot find module`），别用。
-5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **29 文件 / 410 通过**（#261B「重试上一条」起 391→410：`workbench.spec` +8 状态机/守卫、`ComposerBar.spec` +7 三态渲染与转发、`useEventStream.spec` +4 横幅 errorCode 两态与 i18n 同形；后端与 runner 基线不变）。
+5. （步骤 ④）`cd portal/frontend && NODE_ENV=development npm ci && npm run typecheck && npm test` → typecheck 干净 + **30 文件 / 431 通过**（#255 前端①「强制首登改密屏」起 410→431：新文件 `views/ForcePasswordChangeView.spec.ts` 21 条 —— 闸门渲染、「关不掉」（无 dialog/遮罩/关闭按钮且改 URL 也进不去）、深链刷新重建、`/login` 不是绕过口、成功链路必须重新 `GET /api/me`（禁止本地清旗标）、**false 一切照旧**、双语键集逐字一致、`toDisplayText` 的 `[object Object]` 反证；旧 29 文件一字未改仍全绿。#261B「重试上一条」起 391→410（`workbench.spec` +8 状态机/守卫、`ComposerBar.spec` +7 三态渲染与转发、`useEventStream.spec` +4 横幅 errorCode 两态与 i18n 同形）；后端与 runner 基线不变（1022 / 221）。
    `NODE_ENV=development` 是**必需**的：devDependencies（vite/tailwind/vitest）在 `NODE_ENV=production` 下会被 `npm ci` 跳过。
    基线拆解：**23 文件 / 329 通过**（#246 交付② 单 A 与 #252 时的基线）+ `#246 交付② 单 B`（工单 `feat-261011-B2`，纯前端）净增 **6 文件 / 62 项**：
    预览端口面板的端点与票 URL 拼装 15（`src/lib/previewPorts.spec.ts`）、数据层（签票时机 / 新标签地址 / 改块 body）12
