@@ -361,6 +361,19 @@ const singleSourceProblems = [];
       singleSourceProblems.push('wp3b-e2e.mjs: isolationComposeEnv 不再是 memoizeOnce(…) 包裹（惰性+记忆化语义被拆，每次 compose 都重查 docker）');
     }
   }
+  // #268 M3：wp3a 的 llm 段（LiteLLM mock_response 注入链）以「已配好 binding/虚拟 key」为前提——
+  // ensureLlmBinding() 必须仍在流程里，且模型别名必须与 fake-agentd llm 段请求的 'mock-model' 对齐
+  //（虚拟 key 的模型白名单只含被绑定模型，不对齐 ⇒ LiteLLM 403，即真机 {status:403,chunks:0} 的直接原因）。
+  // 变异自证入口：删掉 binding 调用或改掉 modelName ⇒ 本断言红。
+  {
+    const wp3aText = fs.readFileSync(path.join(HERE, 'wp3a-e2e.mjs'), 'utf8');
+    if (!/await\s+ensureLlmBinding\(\{/.test(wp3aText)) {
+      singleSourceProblems.push('wp3a-e2e.mjs: ensureLlmBinding() 调用消失（LiteLLM binding/虚拟 key 是 llm 段 200 的前提，删掉即回到真机 403 chunks=0 的症状，#268 M3）');
+    }
+    if (!/modelName:\s*'mock-model'/.test(wp3aText)) {
+      singleSourceProblems.push("wp3a-e2e.mjs: ensureLlmBinding 没有显式传 modelName: 'mock-model'（必须与 fake-agentd llm 段请求的模型名对齐；缺省 e2e-mock-model 不在白名单 → 403，#268 M3）");
+    }
+  }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b
   // 调用处——别的脚本出现这个选项 = 有人开始打算删共享 dev 库，必须停下来先确认语义。
   const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs', 'wp2b-e2e.mjs']);
