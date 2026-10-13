@@ -90,7 +90,7 @@ jobs:
           echo "id    = $(id)"
           echo "uname = $(uname -a)"
 
-      # ---- ② 根单测：node --test（1031 项基线 = 1027 通过 + 4 跳过，含 runner/test 的 221 项；#275 起 +7（`portal/test/preview.test.js`：预览 released 历史行遮蔽活行的回归 + 契约锁 + fake 自证部分唯一索引 + 源码级护栏），#234 起 +24（portal/test/csrf-origin.test.js，跨站写请求防线；含同分支返修：判据 b 只认 same-origin、same-site 必落 Origin 比对，+2 枚回归门），#261 起 +19（runner LLM 三相超时），#257+#258 起 +6，#277-A/A2 起 +17（被停止的 queued run 直接终态 + 出队 + 同事务合成 run_end，新文件 portal/test/session-stop-queued.test.js），#255 后端片起 +29（portal/test/must-change-password.test.js 28 + migrations 0021 断言 1），#280 迁移身份起 +9（migrate-role 6 + 真库 migrate-fresh-db 3，无 TEST_DATABASE_URL 时那 3 条 skip ⇒ 跳过数 1→4），拆解见 ci-release.md §1）----
+      # ---- ② 根单测：node --test（1036 项基线 = 1032 通过 + 4 跳过，含 runner/test 的 221 项；#275 起 +7（`portal/test/preview.test.js`：预览 released 历史行遮蔽活行的回归 + 契约锁 + fake 自证部分唯一索引 + 源码级护栏），#234 起 +24（portal/test/csrf-origin.test.js，跨站写请求防线；含同分支返修：判据 b 只认 same-origin、same-site 必落 Origin 比对，+2 枚回归门），#261 起 +19（runner LLM 三相超时），#257+#258 起 +6，#277-A/A2 起 +17（被停止的 queued run 直接终态 + 出队 + 同事务合成 run_end，新文件 portal/test/session-stop-queued.test.js），#255 后端片起 +29（portal/test/must-change-password.test.js 28 + migrations 0021 断言 1），#280 迁移身份起 +9（migrate-role 6 + 真库 migrate-fresh-db 3，无 TEST_DATABASE_URL 时那 3 条 skip ⇒ 跳过数 1→4），#255 收尾 confirm_password 起 +5（must-change-password 28→33），拆解见 ci-release.md §1）----
       - name: '② 根 npm ci + npm test'
         run: |
           npm ci --no-audit --no-fund
