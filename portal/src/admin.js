@@ -49,13 +49,21 @@ const safeUser = (row) => ({
     : null,
 });
 
-function validatePassword(password, limits = {}) {
+/**
+ * 口令策略：**只校验「非空 + ≤上限」，没有最小长度**（现状保持——本单不引入最小长度，
+ * 引入会让所有既有 e2e/账号的口令突然不合法，是另一件事）。
+ *
+ * `field` 只改错误信封里的 `details.field`（默认 `'password'` ⇒ admin 面行为一字不变）。
+ * #255 的自助改密端点要用 `'new_password'` / `'current_password'`：同一个约束在两个字段上，
+ * 前端要靠 field 决定标红哪一格，写死 `'password'` 会让人去改错的那一格。
+ */
+export function validatePassword(password, limits = {}, { field = 'password' } = {}) {
   const maxPassword = limits.maxPasswordLength ?? 256;
   if (typeof password !== 'string' || password.length === 0) {
-    throw new AdminError('validation_failed', 'password 为必填字段', { details: { field: 'password' } });
+    throw new AdminError('validation_failed', `${field} 为必填字段`, { details: { field } });
   }
   if (password.length > maxPassword) {
-    throw new AdminError('validation_failed', `password 长度超过上限 ${maxPassword}`, { details: { field: 'password' } });
+    throw new AdminError('validation_failed', `${field} 长度超过上限 ${maxPassword}`, { details: { field } });
   }
 }
 
@@ -540,6 +548,69 @@ export async function resetUserPassword(pool, userId, password, { actorId = null
   if (!result.rows[0]) throw new AdminError('not_found', '用户不存在', { httpStatus: 404 });
   await recordAdminAudit(pool, actorId, 'admin.user_password_reset', result.rows[0].login);
   return { ok: true };
+}
+
+/**
+ * 本人自助改密（#255 首登强制改密的唯一出口，portal.md §2.6a）。与 `resetUserPassword` 的三点差别：
+ *   ① 要先验**当前口令**（复用 `auth.verifyPassword`——它才是校验 scrypt 自描述哈希的那把尺子，
+ *      自己再写一份就等于给同一个凭据两套判据）；
+ *   ② **保留当前会话**，只吊销该用户**其它** `login_sessions`（`id <> 当前会话`）——
+ *      管理员那条是全量吊销，本端点照抄会把人当场踢下线，「改完密又要重新登录」= 体感改密失败，
+ *      而受限会话门此时已经放行（旗标刚清），用户只会看到「登录又过期了」；
+ *   ③ 成功后清 `must_change_password=false`（这就是改密屏的出口）。
+ *
+ * 错误码复用（**不新造**）：
+ *   - 当前口令不对 → `invalid_credentials` + 401，与登录失败同一个码：语义完全相同
+ *     （同一个主体、同一份凭据、同一个失败原因），新造一个码只会让前端多一条分支、
+ *     并额外泄露「会话有效但口令错」这个此前不存在的事实；
+ *   - 新口令不合规 / 与当前相同 → `validation_failed` + `details.field='new_password'`。
+ *
+ * 口令明文**绝不入审计**（details 只有 login / 计数）。
+ *
+ * @returns {{ok: true, password_change_required: false, sessions_revoked: number}}
+ */
+export async function changeOwnPassword(pool, userId, currentPassword, newPassword, {
+  currentSessionId = null, limits = {}, log = console,
+} = {}) {
+  // 形状先校验：不合规就不该去跑 scrypt（失败路径也便宜）。
+  validatePassword(newPassword, limits, { field: 'new_password' });
+  if (!currentSessionId) {
+    // 没有会话 id 就没法「保留当前会话」——宁可不改，也不要退化成把人踢下线。
+    throw new AdminError('unauthorized', 'unauthorized', { httpStatus: 401 });
+  }
+  const existing = await pool.query(
+    `SELECT id, login, password_hash, auth_source FROM users WHERE id = $1 AND status = 'active'`,
+    [userId],
+  );
+  const row = existing.rows[0];
+  // `password_hash IS NULL`（OIDC 账号 / 未设口令）也落这里：verifyPassword 对 NULL 返回 false。
+  if (!row || !(await auth.verifyPassword(currentPassword, row.password_hash, { log }))) {
+    throw new AdminError('invalid_credentials', '用户名或口令错误', { httpStatus: 401 });
+  }
+  if (newPassword === currentPassword) {
+    throw new AdminError('validation_failed', '新口令不得与当前口令相同', { details: { field: 'new_password' } });
+  }
+  const passwordHash = await auth.hashPassword(newPassword);
+  // 单语句（CTE）⇒ 「换哈希 + 清旗标 + 吊销其它会话」原子完成，不存在「哈希已换但会话没吊销」的中间态。
+  const result = await pool.query(
+    `WITH target AS (
+       UPDATE users SET password_hash = $2, must_change_password = false WHERE id = $1 RETURNING id, login
+     ), revoked AS (
+       UPDATE login_sessions SET revoked_at = now()
+        WHERE user_id = (SELECT id FROM target)
+          AND revoked_at IS NULL
+          AND id <> $3
+        RETURNING id
+     )
+     SELECT id, login, (SELECT count(*) FROM revoked) AS revoked_sessions FROM target`,
+    [userId, passwordHash, currentSessionId],
+  );
+  if (!result.rows[0]) throw new AdminError('unauthorized', 'unauthorized', { httpStatus: 401 });
+  const sessionsRevoked = Number(result.rows[0].revoked_sessions ?? 0);
+  await recordAdminAudit(pool, userId, 'user.password_changed', result.rows[0].login, {
+    login: result.rows[0].login, self_service: true, sessions_revoked: sessionsRevoked,
+  });
+  return { ok: true, password_change_required: false, sessions_revoked: sessionsRevoked };
 }
 
 /** 铸造新的 TOTP 绑定并吊销全部现存登录会话；种子仅在本次响应下发。 */

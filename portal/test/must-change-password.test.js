@@ -328,3 +328,179 @@ test('#255① 迁移 0021 的默认值 = false ⇒ 存量行与新 bootstrap 行
   // 默认值守卫在（漂移即拒启）：bootstrap 与存量行都靠这个默认值保持 false。
   assert.match(sql, /默认值不是 false/);
 });
+
+// ---------------------------------------------------------------------------
+// ② 自助改密端点 `POST /api/me/password`（提交 3）
+// ---------------------------------------------------------------------------
+
+const OLD_PW = 'old-secret-1';
+const NEW_PW = 'new-secret-2';
+
+/** 一个有两条现存会话的用户（当前 + 待吊销），返回 cookie 与 pool 里的用户行。 */
+async function setupSelfService({ mustChange = true } = {}) {
+  const pool = new MustChangePool({ users: [ADMIN] });
+  const user = await seedUser(pool, {
+    login: 'erin', password: OLD_PW, fdeName: 'erin', mustChange,
+  });
+  const s = await startServer({ pool });
+  const current = await loginCookieFor({ ...s, login: 'erin', password: OLD_PW });
+  const other = await auth.createSession(pool, user.id);
+  return { pool, user, server: s.server, config: s.config, base: s.base, close: s.close,
+    cookie: current.cookie, currentToken: current.token, otherToken: other.token };
+}
+
+function postPassword({ base, cookie, body }) {
+  return fetch(`${base}/api/me/password`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(cookie ? { cookie } : {}) },
+    body: JSON.stringify(body),
+  });
+}
+
+test('#255② 成功改密：哈希变、旗标清 false、当前会话保留、其它会话被吊销', async () => {
+  const t = await setupSelfService();
+  try {
+    const before = t.user.password_hash;
+    const res = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(res.status, 200, `应 200（实际 ${res.status}：${await res.clone().text()}）`);
+    const body = await res.json();
+    assert.deepEqual(body, { ok: true, password_change_required: false, sessions_revoked: 1 });
+
+    assert.notEqual(t.user.password_hash, before, 'password_hash 已换');
+    assert.equal(t.user.must_change_password, false, '旗标已清（这就是改密屏的出口）');
+
+    // 当前会话**必须还活着**：照抄管理员那条的全量吊销会把人当场踢下线 = 体感改密失败。
+    const me = await fetch(`${t.base}/api/me`, { headers: { cookie: t.cookie } });
+    assert.equal(me.status, 200, '当前会话改完仍可用（不得被吊销）');
+    assert.equal((await me.json()).user.login, 'erin');
+
+    // 其它会话必须被吊销（换口令的意义之一就是让别人的副本失效）。
+    const stale = await fetch(`${t.base}/api/me`, { headers: { cookie: `${t.config.cookie.name}=${t.otherToken}` } });
+    assert.equal(stale.status, 401, '该用户其它 login_sessions 已吊销');
+
+    // 新口令真的能登录、旧口令真的不能。
+    const reLogin = await fetch(`${t.base}/api/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ login: 'erin', password: NEW_PW }),
+    });
+    assert.equal(reLogin.status, 200, '新口令可登录');
+    const oldLogin = await fetch(`${t.base}/api/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ login: 'erin', password: OLD_PW }),
+    });
+    assert.equal(oldLogin.status, 401, '旧口令已失效');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255② 当前口令不对 → 401 invalid_credentials（复用登录码）且哈希与旗标一字不动', async () => {
+  const t = await setupSelfService();
+  try {
+    const before = t.user.password_hash;
+    const res = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: 'wrong-' + OLD_PW, new_password: NEW_PW } });
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    // 复用登录的错误码（不是新造码）——与 §1.2 里 `invalid_credentials` 的语义一致。
+    assert.equal(body.error.code, 'invalid_credentials');
+    assert.equal(t.user.password_hash, before, '哈希未变');
+    assert.equal(t.user.must_change_password, true, '旗标未被误清');
+    const me = await fetch(`${t.base}/api/me`, { headers: { cookie: t.cookie } });
+    assert.equal(me.status, 200, '改密失败不得动当前会话');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255② 新口令与当前相同 → 400 validation_failed + details.field=new_password（哈希不变）', async () => {
+  const t = await setupSelfService();
+  try {
+    const before = t.user.password_hash;
+    const res = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: OLD_PW, new_password: OLD_PW } });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.code, 'validation_failed');
+    assert.equal(body.error.details.field, 'new_password', '前端要靠 field 标红正确的那一格');
+    assert.equal(t.user.password_hash, before);
+    assert.equal(t.user.must_change_password, true, '被拒的改密不得清旗标');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255② 字段缺失/畸形一律 400 validation_failed 且不消耗 scrypt；非 POST 405', async () => {
+  const t = await setupSelfService();
+  try {
+    for (const [body, field] of [
+      [{ new_password: NEW_PW }, 'current_password'],
+      [{ current_password: OLD_PW }, 'new_password'],
+      [{ current_password: OLD_PW, new_password: '' }, 'new_password'],
+      [{ current_password: '', new_password: NEW_PW }, 'current_password'],
+      [{ current_password: OLD_PW, new_password: 'x'.repeat(257) }, 'new_password'],
+    ]) {
+      const res = await postPassword({ base: t.base, cookie: t.cookie, body });
+      assert.equal(res.status, 400, `${JSON.stringify(body)} 应 400`);
+      const json = await res.json();
+      assert.equal(json.error.code, 'validation_failed');
+      assert.equal(json.error.details?.field, field, `details.field 必须是 ${field}`);
+    }
+    const get = await fetch(`${t.base}/api/me/password`, { headers: { cookie: t.cookie } });
+    assert.equal(get.status, 405);
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255② 未登录 → 401 unauthorized（复用既有码，不新造）', async () => {
+  const t = await setupSelfService();
+  try {
+    const res = await postPassword({ base: t.base, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(res.status, 401);
+    assert.equal((await res.json()).error.code, 'unauthorized');
+    const badCookie = await postPassword({ base: t.base, cookie: `${t.config.cookie.name}=nope`, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(badCookie.status, 401, '会话不存在同样 401');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255② 审计恰好一条 user.password_changed（actor=本人），details 绝不写口令明文', async () => {
+  const t = await setupSelfService();
+  try {
+    const res = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(res.status, 200);
+    const entries = t.pool.audit.filter((a) => a.action === 'user.password_changed');
+    assert.equal(entries.length, 1, '恰一条（不多写噪声、不少写）');
+    assert.equal(entries[0].actor_id, t.user.id, 'actor = 本人');
+    assert.equal(entries[0].target, 'erin');
+    const details = JSON.parse(entries[0].details);
+    assert.equal(details.self_service, true);
+    assert.equal(details.sessions_revoked, 1);
+    const serialized = JSON.stringify(entries[0]);
+    assert.ok(!serialized.includes(OLD_PW), '审计不得出现当前口令明文');
+    assert.ok(!serialized.includes(NEW_PW), '审计不得出现新口令明文');
+    assert.ok(!/password_hash|token_hash/i.test(serialized), '不得把哈希/令牌塞进审计');
+
+    // 失败路径不写这条审计（否则爆破会把审计表刷满噪声）。
+    await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: 'nope', new_password: 'another-3' } });
+    assert.equal(t.pool.audit.filter((a) => a.action === 'user.password_changed').length, 1,
+      '改密失败不得再写 user.password_changed');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255② 当前口令被连续猜错会限流（防「会话 cookie 被偷后爆破当前口令」）', async () => {
+  const t = await setupSelfService();
+  try {
+    let last = null;
+    for (let i = 0; i < 6; i += 1) {
+      last = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: `guess-${i}`, new_password: NEW_PW } });
+    }
+    assert.equal(last.status, 429, `第 6 次应 429（实际 ${last.status}）`);
+    assert.equal((await last.json()).error.code, 'rate_limited');
+    assert.ok(last.headers.get('retry-after'), '带 Retry-After');
+  } finally {
+    await t.close();
+  }
+});

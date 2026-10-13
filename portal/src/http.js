@@ -635,6 +635,11 @@ async function routeApi(req, res, ctx, url) {
     if (renewed) headers['Set-Cookie'] = sessionCookieHeader(config.cookie, token);
     return sendJson(res, 200, { user: session.user }, headers);
   }
+  // ---- #255 自助改密（首登强制改密的唯一出口，portal.md §2.6a）----
+  if (pathname === '/api/me/password') {
+    if (req.method === 'POST') return handleChangeMyPassword(req, res, ctx);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
   if (pathname === '/api/me/git-credential') {
     const session = await requireSession(req, ctx);
     const fdeName = session.user.fde_name;
@@ -1979,6 +1984,73 @@ async function handlePreviewTicket(req, res, ctx, portId) {
   // 记录本次成功签发（作为限流计数），防单用户短时刷 ticket。
   ctx.previewTicketLimiter.recordFailure(rlKey);
   return sendJson(res, 201, result);
+}
+
+/**
+ * `POST /api/me/password`（#255 首登强制改密，portal.md §2.6a）：体 `{current_password, new_password}`。
+ *
+ * 鉴权：`requireSession` —— 没有有效会话就是既有语义的 `401 unauthorized`（不新造码）。
+ * 本端点**同时是受限会话门的放行项**（`RESTRICTED_SESSION_ALLOWLIST`）：旗标为 true 时它是唯一出口，
+ * 把它挡掉 = 死锁。
+ *
+ * 三层既有防线照用，不因为「已登录」就跳过：
+ *  - #234 CSRF 门（POST，见 §2.11）—— 在 routeApi 顶部，本 handler 之前；
+ *  - KDF 并发闸 `ctx.kdfSemaphore`：一次请求跑两次 scrypt（验旧口令 + 铸新哈希），
+ *    已认证 ≠ 可无限重放，队列满/超时同样 `503 kdf_busy`（与登录同一口径，S3）；
+ *  - 复用登录限流器，key 前缀 `password:`（与 `login:` 命名空间不互相污染）：
+ *    防「会话 cookie 被偷后拿当前口令爆破」——`invalid_credentials` 计数，成功即清零。
+ *
+ * 错误映射交给 `createServer` 的统一信封（`AdminError` → status/code/details）：
+ * 当前口令不对 `401 invalid_credentials`（与登录同码，理由见 `admin.changeOwnPassword` 注释），
+ * 新口令不合规或与当前相同 `400 validation_failed` + `details.field='new_password'`。
+ */
+async function handleChangeMyPassword(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const limits = { maxPasswordLength: ctx.config.maxPasswordLength };
+  const currentPassword = body?.current_password;
+  const newPassword = body?.new_password;
+  // 形状校验放在限流/验哈希之前：畸形请求不该消耗 scrypt 配额。
+  admin.validatePassword(currentPassword, limits, { field: 'current_password' });
+  admin.validatePassword(newPassword, limits, { field: 'new_password' });
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  const rlKey = `password:${session.user.id}:${ip}`;
+  const check = ctx.loginLimiter.check(rlKey);
+  if (!check.allowed) {
+    throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(check.retryAfterSeconds) },
+    });
+  }
+
+  try {
+    await ctx.kdfSemaphore.acquire();
+  } catch (err) {
+    if (err?.code === 'kdf_queue_full' || err?.code === 'kdf_queue_timeout') {
+      throw new HttpError(503, 'kdf_busy', '服务繁忙，请稍后重试', {
+        retryable: true,
+        headers: { 'Retry-After': '1' },
+      });
+    }
+    throw err;
+  }
+  let result;
+  try {
+    result = await admin.changeOwnPassword(ctx.pool, session.user.id, currentPassword, newPassword, {
+      currentSessionId: session.session.id,
+      limits,
+      log: ctx.log,
+    });
+  } catch (err) {
+    if (err?.code === 'invalid_credentials') ctx.loginLimiter.recordFailure(rlKey);
+    throw err;
+  } finally {
+    ctx.kdfSemaphore.release();
+  }
+  ctx.loginLimiter.reset(rlKey);
+  return sendJson(res, 200, result);
 }
 
 async function handleListDirs(req, res, ctx) {
