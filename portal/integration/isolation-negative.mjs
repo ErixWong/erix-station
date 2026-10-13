@@ -360,6 +360,16 @@ const singleSourceProblems = [];
     if (!/isolationComposeEnv\s*=\s*memoizeOnce\(/.test(wp3bText)) {
       singleSourceProblems.push('wp3b-e2e.mjs: isolationComposeEnv 不再是 memoizeOnce(…) 包裹（惰性+记忆化语义被拆，每次 compose 都重查 docker）');
     }
+    // #268 主 agent 验收变异逃逸补钉（把 wp3b 的 skip 实参改成恒 false 当时无断言红）：
+    // compose env 的 spread 顺序里派生注入在 process.env **之后**——不按「显式传入」门控，
+    // 扫描值会 spread-覆盖操作者传的 IPAM_RESERVED_SUBNETS，「显式传入优先」作废。
+    if (!/skipIpamReserved:\s*Boolean\(process\.env\.IPAM_RESERVED_SUBNETS\)/.test(wp3bText)) {
+      singleSourceProblems.push('wp3b-e2e.mjs: skipIpamReserved 实参不再是 Boolean(process.env.IPAM_RESERVED_SUBNETS)（显式传入时仍扫描注入会盖掉操作者的值，#268 M2）');
+    }
+    const wp3aCallerText = fs.readFileSync(path.join(HERE, 'wp3a-e2e.mjs'), 'utf8');
+    if (!/process\.env\.IPAM_RESERVED_SUBNETS\s*\?\s*\{\}/.test(wp3aCallerText)) {
+      singleSourceProblems.push('wp3a-e2e.mjs: IPAM_RESERVED_SUBNETS 的显式门控消失（三元为 {} 短路必须在派生前，否则派生值盖掉显式传入，#268 M2）');
+    }
   }
   // #268 M3：wp3a 的 llm 段（LiteLLM mock_response 注入链）以「已配好 binding/虚拟 key」为前提——
   // ensureLlmBinding() 必须仍在流程里，且模型别名必须与 fake-agentd llm 段请求的 'mock-model' 对齐
