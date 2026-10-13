@@ -258,11 +258,26 @@ function buildLocation(scheme, hostname, cleanUri, hostHeader = null) {
  * 但第 1/2 步（hostname 精确查表、`released` 拒绝）**照旧**——未知 host 仍 404、已释放仍 403。
  */
 export async function authorizeForwardAuth(pool, config, { hostname, hostHeader = null, uri = '/', cookieValue = null, method = 'GET', scheme = 'https', accessControlRequestMethod = null, now = new Date() } = {}) {
+  // ⚠ **#275：这条查表必须自带「活行优先」的确定性排序，不能只按 hostname 取第一行。**
+  // `port_allocations_live_hostname_key`（`docs/data/schema.sql` §4，baseline 冻结）与迁移 0019 的
+  // `port_allocations_live_global_port_key` 都是**部分**唯一索引，谓词字面同为 `state <> 'released'`
+  // ⇒ **`released` 行不占位** ⇒ 同一 hostname 允许「1 条活行 + N 条 released 历史行」共存
+  //（#246 交付② 的管理员改块把旧行置 released、又把块搬回**曾用过**的号段（22000→22030→22000）
+  //   就会造出这种形状：新活行的 hostname 与上一轮遗留的 released 行**逐字相同**）。
+  // hostname 上只有部分索引、没有全表索引 ⇒ 无 ORDER BY 的 `LIMIT 1` 拿到的是执行计划扫到的第一行
+  // （真库 `Seq Scan` 先扫到 released 行）⇒ 恒定 403 `allocation_released`，ticket 分支永远走不到。
+  // ⇒ **读侧必须自带优先级**：`(a.state <> 'released') DESC` 让活行恒排在前；同组内再按
+  //   `released_at DESC NULLS LAST, a.id` 定序（AGENTS §8.5：不得依赖行的偶然顺序，released 多行时
+  //   `released_at` 可同值，`a.id` 是全序兜底）。
+  // ⚠ **不能改成只加 `AND a.state <> 'released'` 的过滤**：那会让只有 released 行的 host 落进「查不到」，
+  //   `allocation_released`(403) 变死代码、portal.md §2.7 第 1/2 步的既有契约被改掉
+  //  （契约：**有活行 → 放行**；**只有 released 行 → 403 `allocation_released`**；**完全没有行 → 404**）。
   const r = await pool.query(
     `SELECT a.id, a.fde_id, a.state, a.exposure, a.hostname, u.fde_name, u.status AS user_status
        FROM port_allocations a
        JOIN users u ON u.id = a.fde_id
       WHERE a.hostname = $1
+      ORDER BY (a.state <> 'released') DESC, a.released_at DESC NULLS LAST, a.id
       LIMIT 1`,
     [hostname],
   );
