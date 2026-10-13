@@ -121,6 +121,147 @@ export function corsDenyHeaders(originHeader) {
   };
 }
 
+// ---- #234：跨站请求防线（Origin / Sec-Fetch-Site 同源校验）----
+// 口径的单一真相在 docs/api/portal.md §2.11；这里只放判据本身（纯函数，便于单测）。
+
+/** 参与校验的写方法（portal.md §2.11 判据①）：GET/HEAD/OPTIONS 一律放行。 */
+const CSRF_WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+/** 默认端口表：只在「与该 authority 自己的 scheme 相同」时才剥掉（非默认端口必须原样保留）。 */
+const CSRF_DEFAULT_PORTS = { http: '80', https: '443' };
+/**
+ * Origin 的形状：`scheme://authority`（authority = 域名/IPv4 或 `[IPv6]`，可带端口），**不带路径**。
+ * 与 #241 的 `CORS_ORIGIN_RE` 同一口径（两处若分叉， ACAO 回显与同源判定会互相打脸）。
+ */
+const CSRF_ORIGIN_PARTS_RE = new RegExp(
+  ['^',
+    '([A-Za-z][A-Za-z0-9+.-]*):\\/\\/', // 1 = scheme
+    '(', // 2 = authority（host[:port]）
+    '(?:',
+    '[A-Za-z0-9._-]+', // IPv4 / 域名
+    '|\\[[0-9A-Fa-f:]+\\]', // IPv6 字面量 [::1]
+    ')',
+    '(?::\\d{1,5})?', // 端口（dev 的 :8090 是 origin 的一部分，不得丢）
+    ')$',
+  ].join(''),
+);
+
+/** 小写 + 剥掉**与该 scheme 相同**的默认端口（http:80 / https:443）；非默认端口（dev `:8090`）原样留。 */
+function normalizeCsrfAuthority(authority, scheme) {
+  let value = String(authority).toLowerCase();
+  const def = CSRF_DEFAULT_PORTS[scheme];
+  if (def) value = value.replace(new RegExp(`:${def}$`), '');
+  return value;
+}
+
+/** 单值 + 无空白（含制表/CR/LF）+ 形状合法 ⇒ `{scheme, authority}`；否则 `null`（畸形 ⇒ 拒）。 */
+function parseCsrfOrigin(raw) {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim(); // 首部 OWS 已由 HTTP 解析器剪掉；这里只兑代理粘的空白，内部空白仍按畸形拒
+  if (value === '' || value.length > 2048) return null;
+  if (/[\s,]/.test(value)) return null; // 空格/制表/CR-LF 或多值（重复 Origin 头 Node 会拼成 `a, b`）⇒ 拒
+  const m = CSRF_ORIGIN_PARTS_RE.exec(value);
+  if (!m) return null; // 带路径 / `null` / `javascript:alert(1)` / 不可解析 ⇒ 拒
+  const scheme = m[1].toLowerCase();
+  return { scheme, authority: normalizeCsrfAuthority(m[2], scheme) };
+}
+
+/**
+ * 请求自身的 authority：优先 `X-Forwarded-Host`（本部署 Traefik `trustForwardHeader: false`，
+ * 会按真实连接覆写），无则 `Host`（与 `handleForwardAuth` 取 host 的优先级一致）。
+ * 返回 `null` = 两个头都没（无从判定）；`{malformed: true}` = 有但不合法。
+ */
+function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
+  const raw = [forwardedHostHeader, hostHeader].find(
+    (v) => typeof v === 'string' && v.trim() !== '',
+  );
+  if (raw === undefined) return null;
+  const value = raw.trim();
+  if (value.length > 2048 || /[\s,]/.test(value) || value.includes('://')) return { malformed: true };
+  return { authority: normalizeCsrfAuthority(value, scheme) };
+}
+
+/**
+ * #234：跨站请求防线的**纯判据**（不发响应、不读 cookie，因此可单独单测）。
+ *
+ * 为什么需要：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（portal.md §2.5），Lax 只挡
+ * 「跳站带 cookie」这一半；而本部署 portal 在 Traefik 后面、入口多个（`station.fde.erix.vip` 与
+ * `100.100.0.3`），cookie 本身不区分发起方。这里加一道**不依赖配置项**（同源基线从请求自己的
+ * Host 派生，天然支持多入口）的服务端防线，并把拒绝写审计（可观测）。
+ *
+ * 判据（按顺序，任一命中即定论）：
+ *  a. `Sec-Fetch-Site` 为 `cross-site`/`cross-origin` ⇒ **拒**（fail-closed 优先，即使 Origin 缺失或看起来同源）；
+ *  b. `same-origin`/`same-site` ⇒ **放行**；
+ *  c. 否则有 `Origin` ⇒ **只比 authority**（host[:port]）与请求自身的 authority；
+ *  d. 两者都没有（curl / CLI / 容器内脚本）⇒ **放行**。
+ *
+ * **只比 authority、不比 scheme**（契约点）：本部署处在 http（dev `:8090` / `100.100.0.3:8090`）与
+ * https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；
+ * 拿 scheme 参战会把「同一个站点上的 http/https 两面」误杀成跳站。CSRF 要防的是**别的站点**
+ * 带本站点 cookie 发写请求（同站不同 scheme 不构成这个威胁），故 scheme 只用于默认端口归一化。
+ *
+ * 失败绝不默认同源（「解析失败就当同源」是这道防线唯一不能发的方式）：Origin 畸形（不可解析 /
+ * 多值 / 含空白或 CR-LF / 带路径）与「有 Origin 但没有可比对的 Host」一律拒。
+ *
+ * @returns {{allow: boolean, verdict: string, details?: {origin: string|null, sec_fetch_site: string|null, method: string}}}
+ *          verdict：`exempt` | `read_method` | `same_site` | `origin_match` | `no_evidence`（放行）／
+ *          `cross_site` | `origin_mismatch` | `malformed_origin` | `malformed_request_authority` |
+ *          `missing_request_authority`（拒绝）。
+ */
+export function checkSameOrigin({
+  method = '',
+  originHeader = null,
+  secFetchSiteHeader = null,
+  hostHeader = null,
+  forwardedHostHeader = null,
+} = {}) {
+  const httpMethod = typeof method === 'string' ? method.toUpperCase() : '';
+  const origin = originHeader == null ? null : String(originHeader);
+  // 已知四个 token 走精确小写比对；其余（含多值、拼错的）一律当「无结论」，落到 Origin 判据。
+  const secFetchSite = secFetchSiteHeader == null ? null : String(secFetchSiteHeader).trim().toLowerCase();
+  const details = { origin, sec_fetch_site: secFetchSite, method: httpMethod };
+  const deny = (verdict) => ({ allow: false, verdict, details });
+
+  // ① 只判写方法：SSE `GET /api/sessions/:id/events`、预览 ticket 的 302 兑换都是 GET，不得打断。
+  if (!CSRF_WRITE_METHODS.has(httpMethod)) return { allow: true, verdict: 'read_method' };
+
+  // a. 显式跳站 ⇒ 拒（先看 SFS：它是浏览器给的、不可伪造，优先于可被代理改写的 Origin）。
+  if (secFetchSite === 'cross-site' || secFetchSite === 'cross-origin') return deny('cross_site');
+  // b. 显式同源/同站 ⇒ 放行（即使 Origin 缺失或畸形）。
+  if (secFetchSite === 'same-origin' || secFetchSite === 'same-site') return { allow: true, verdict: 'same_site', details };
+
+  // c. 有 Origin ⇒ 只比 authority。
+  if (origin !== null && origin.trim() !== '') {
+    const parsed = parseCsrfOrigin(origin);
+    if (parsed === null) return deny('malformed_origin');
+    const request = parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, parsed.scheme);
+    if (request === null) return deny('missing_request_authority');
+    if (request.malformed) return deny('malformed_request_authority');
+    if (request.authority !== parsed.authority) return deny('origin_mismatch');
+    return { allow: true, verdict: 'origin_match', details };
+  }
+
+  // d. 两个头都没有 ⇒ 放行（否则 curl / CLI / 容器内脚本与现有 e2e 全挂）。
+  return { allow: true, verdict: 'no_evidence', details };
+}
+
+/**
+ * #234：把 #234 判据接到一个具体请求上，含两类**豁免端点**（无 CSRF 语义）：
+ *  - `/api/internal/*`：容器 → portal，per-container token 鉴权、**不带 cookie**（§9）；
+ *  - `/api/forward-auth`：Traefik 回调，它的 `Origin` 是**被代理页面**的 origin，天然不等于 portal host（§2.7）。
+ */
+export function csrfGateFor(req, pathname) {
+  if (pathname.startsWith('/api/internal/') || pathname === '/api/forward-auth') {
+    return { allow: true, verdict: 'exempt' };
+  }
+  return checkSameOrigin({
+    method: req?.method,
+    originHeader: req?.headers?.origin ?? null,
+    secFetchSiteHeader: req?.headers?.['sec-fetch-site'] ?? null,
+    hostHeader: req?.headers?.host ?? null,
+    forwardedHostHeader: req?.headers?.['x-forwarded-host'] ?? null,
+  });
+}
+
 /** F2：审计前只记 path，剥离所有 query（?preview_ticket=<明文> 等绝不入审计）。 */
 function pathOnly(uri) {
   if (typeof uri !== 'string') return '/';
@@ -409,6 +550,26 @@ async function route(req, res, ctx) {
 async function routeApi(req, res, ctx, url) {
   const { pathname } = url;
   const { pool, config } = ctx;
+
+  // ---- #234：跳站写请求防线（portal.md §2.11）——先于任何 handler 执行，否则 CSRF 会先碰到底层副作用。----
+  // 豁免（在 csrfGateFor 里）：/api/internal/* 与 /api/forward-auth。拒绝：403 `cross_origin_forbidden`
+  // + #241 那套 CORS deny 头（否则浏览器只报 ACAO 缺失、看不到真实原因，AGENTS §8.11）+ 一条审计。
+  const csrf = csrfGateFor(req, pathname);
+  if (!csrf.allow) {
+    // 审计失败不得影响响应（同 §2.7 forward-auth 口径）；details 只记 origin/sec_fetch_site/method，不含 cookie。
+    await auth.audit(pool, {
+      actorId: null,
+      action: 'auth.csrf_denied',
+      target: pathOnly(pathname),
+      details: csrf.details,
+    }).catch(() => {});
+    return sendJson(
+      res,
+      403,
+      errorBody('cross_origin_forbidden', 'cross-origin write request rejected', false, csrf.details),
+      corsDenyHeaders(req.headers.origin),
+    );
+  }
 
   // 兼容旧路径：仅 307 到新路径，不保留旧的单步发 cookie 行为（portal.md §0.1）。
   if (req.method === 'POST' && pathname === '/api/login') {
