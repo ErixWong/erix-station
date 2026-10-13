@@ -846,3 +846,68 @@ test('#255④ 登录失败路径不受影响：错口令仍 401 invalid_credenti
     await t.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ⑤ 文档与实现不漂移（提交 6）：口径的单一真相在 docs/api/portal.md，代码清单必须逐条出现在文档里
+// ---------------------------------------------------------------------------
+
+test('#255⑤ portal.md：新端点、新错误码、登录新字段、§2.11a 门与放行清单逐条对齐（防漂移）', () => {
+  const doc = fs.readFileSync(path.join(HERE, '../../docs/api/portal.md'), 'utf8');
+  const section = (start, end) => {
+    const a = doc.indexOf(start);
+    assert.notEqual(a, -1, `docs/api/portal.md 找不到锚点 ${start}`);
+    const b = doc.indexOf(end, a);
+    assert.notEqual(b, -1, `docs/api/portal.md 锚点 ${start} 之后找不到 ${end}`);
+    return doc.slice(a, b);
+  };
+
+  // §0.1 端点清单
+  const toc = section('### 0.1 端点清单', '## 1. 通用约定');
+  assert.match(toc, /POST \/api\/me\/password/, '新端点必须进端点表');
+
+  // §1.2 错误码表
+  const codes = section('### 1.2 通用错误码', '### 1.3 分页');
+  assert.match(codes, /403 \| `password_change_required`/, '错误码表必须有这一行（前端只按 code 分支）');
+  assert.match(codes, /受限会话被拦/);
+
+  // §2.2 / §2.3 登录响应新字段（两个发会话的分支都要写）
+  const login = section('### 2.2 `POST /api/auth/login`', '### 2.4 `POST /api/auth/logout`');
+  assert.match(login, /"password_change_required"/, '§2.2 的直通响应示例要带这一位');
+  assert.match(login, /`password_change_required`（#255/, '§2.2 要有这一位的字段说明行');
+  assert.match(login, /totp_required.*不带|本响应\*\*不带\*\* `password_change_required`/s, '要写明中间响应不带这一位');
+
+  // §2.6 /api/me 增列
+  const me = section('### 2.6 `GET /api/me`', '### 2.6a ');
+  assert.match(me, /"must_change_password"/);
+  assert.match(me, /`must_change_password`（#255/);
+
+  // §2.6a 自助改密端点：请求/响应/错误码/会话语义（http.js 的注释直接引用这一节，锚点必须在）
+  const ep = section('### 2.6a `POST /api/me/password`', '### 2.7 `GET /api/forward-auth`');
+  assert.match(ep, /current_password/);
+  assert.match(ep, /sessions_revoked/);
+  assert.match(ep, /invalid_credentials/);
+  assert.match(ep, /保留当前会话/);
+  assert.match(ep, /全量吊销/);
+
+  // §2.7 forward-auth 不受门管辖的理由必须留在它自己那一节
+  const fa = section('### 2.7 `GET /api/forward-auth`', '### 2.8 ');
+  assert.match(fa, /不受 #255 受限会话门管辖/);
+  assert.match(fa, /整片预览挂/);
+
+  // §2.11a：门本体 + 放行清单**逐条**对齐代码常量（少写一条就是文档漂移）
+  const gate = section('### 2.11a 受限会话门', '## 3. 项目（Projects）');
+  assert.match(gate, /403/);
+  assert.match(gate, /RESTRICTED_SESSION_ALLOWLIST/);
+  for (const entry of RESTRICTED_SESSION_ALLOWLIST) {
+    const shown = entry.prefix ? `${entry.path}*` : entry.path;
+    assert.ok(gate.includes(shown), `§2.11a 的清单表少了 ${entry.method} ${shown}`);
+  }
+  assert.match(gate, /新旧两条都覆盖/, '新旧登录路径的 307 顺序契约要写进文档');
+  assert.match(gate, /不写审计/, '「门不写审计」是刻意决定，理由要在文档里');
+
+  // §2.9.4 策略表：从「规格愿望」改成「已实现口径」，并保住 bootstrap 不对称这条决策
+  const policy = section('#### 2.9.4 密码 / TOTP 策略', '### 2.10 授权矩阵（P1）');
+  assert.match(policy, /首登强制改密（#255/);
+  assert.match(policy, /0021/);
+  assert.match(policy, /bootstrap-admin` 故意不置/);
+});
