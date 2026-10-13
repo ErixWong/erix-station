@@ -435,7 +435,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **edge file-provider watch 坑（e2e 语境已修，#268 第 3 项）**：traefik 启动时动态目录里没有 `routes.yml` ⇒ 后来 materializer 原子替换的文件**永远不会被 reload**（整栈看起来正常但预览/internal 全 404；`docker restart station-edge-<id>` 立刻通）。修法已落地：`writeDynamicStub` 在 compose up **之前**预写 `http: {}` 桩（wp2a/wp3a/wp3b/wp5/wp6 全部，顺序由 `isolation-negative` 静态钉住）——wp3a/wp2a 真机全程不再需要重启 edge。**人工起栈仍会踩**（drill-2026-10-12 §五 记录保留）；#227 第 4 项（单 test 粒度）有意未拆（新代码自 wp2a 重建起逐段 `t.test`），拆之前不往单条 test 堆断言。
 - **真机验收口径新增**：e2e 隔离跑的断言必须带 **agentd 双向链路**（`sse connected`/`sse ping received`，或 GET+POST 探针——#263 教训同源：只验读方法会把半通当全通）。基线不变：根 945/944/0/1、runner 221、前端 410（`isolation-negative.mjs` 不在发现面，缺省 rc=1 是负例证据本体，进 CI 用 `--strict`）。
 
-### 8.19 v0.1.6：#234 跳站写请求防线 + #275 预览被 released 历史行遮蔽（2026-10-13，PR #276 / issue #275）
+### 8.19 v0.1.6：#234 跨站写请求防线 + #275 预览被 released 历史行遮蔽（2026-10-13，PR #276 / issue #275）
 
 - **载荷**：① **#234** CSRF/Origin 同源门（`routeApi` 统一鉴权步前，覆盖 login/logout/签票等写路；`/api/internal/*` 与 `/api/forward-auth` 豁免；
   ⚠ **`same-site` 不得直接放行**——portal host 与预览 host 共享注册域 `erix.vip`，`SameSite=Lax` 仍会带 host-only cookie，所以必落**注册域精确比对**）；
