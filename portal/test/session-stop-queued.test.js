@@ -38,6 +38,8 @@ class StopPool {
       claimed_at: run.claimed_at ?? null }] : [];
     this.messages = [];
     this.transcript = [];
+    this.events = []; // run_events（#277-A2 返修 2：合成 run_end 的判据面）
+    this.sqlJournal = []; // 按执行顺序记录原始 SQL（事务边界/同事务断言用）
     this.commits = 0;
     this.rollbacks = 0;
     // 竞态注入：在第 1 步（queued 分支）UPDATE **执行前**把 run 改成 running（模拟 claim + markRunState 已提交），
@@ -48,17 +50,31 @@ class StopPool {
   runRow() { return this.runs[0] ?? null; }
   queueFor(runId) { return this.queue.find((q) => q.run_id === runId) ?? null; }
 
+  /** 租约事实的 SQL 表达式仿真：`q.status='claimed'` (+ 可选 `q.lease_until > now()`)。 */
+  claimedFor(runId, { needLease = true } = {}) {
+    return this.queue.some((q) => q.run_id === runId && q.status === 'claimed'
+      && (!needLease || (q.lease_until != null && new Date(q.lease_until).getTime() > Date.now())));
+  }
+  /** 从 SQL 文本里读出守卫写了哪半个条件——**没写就不仿真**（变异测试的支点：删掉守卫，仿真跟着消失）。 */
+  guardOf(sql) {
+    return { claimed: sql.includes("q.status = 'claimed'"), lease: sql.includes('q.lease_until > now()') };
+  }
+
   async query(sql, params = []) {
     const s = sql.replace(/\s+/g, ' ');
+    this.sqlJournal.push({ sql: s, params });
 
     if (/^\s*BEGIN/i.test(s)) return { rows: [] };
     if (/^\s*COMMIT/i.test(s)) { this.commits += 1; return { rows: [] }; }
     if (/^\s*ROLLBACK/i.test(s)) { this.rollbacks += 1; return { rows: [] }; }
 
-    // ---- stopSession 第 1 步：queued → finished（谓词 status='queued'）----
+    // ---- stopSession 第 1 步：queued → finished（谓词 status='queued' + #277-A2 的「未被领走」守卫）----
     if (s.includes('UPDATE runs') && s.includes("SET status = 'finished'") && s.includes("AND status = 'queued'")) {
       if (this.onBeforeQueuedUpdate) await this.onBeforeQueuedUpdate(); // 竞态注入点（UPDATE 前翻转状态）
-      const hit = this.runs.filter((r) => r.session_id === params[0] && r.status === 'queued');
+      const g = this.guardOf(s);
+      const hit = this.runs.filter((r) => r.session_id === params[0] && r.status === 'queued'
+        // 守卫存在时：已领走（可选：且租约有效）的行必须被排除（NOT EXISTS 不命中）
+        && !(g.claimed && this.claimedFor(r.id, { needLease: g.lease })));
       for (const r of hit) {
         r.status = 'finished';
         r.termination = { reason: 'aborted', detail: 'cancelled_before_start' };
@@ -69,9 +85,14 @@ class StopPool {
       return { rows, rowCount: rows.length };
     }
 
-    // ---- stopSession 第 2 步：running → cancelling（谓词 status='running'）----
-    if (s.includes('UPDATE runs') && s.includes("SET status = 'cancelling'") && s.includes("AND status = 'running'")) {
-      const hit = this.runs.filter((r) => r.session_id === params[0] && r.status === 'running');
+    // ---- stopSession 第 2 步：running → cancelling；#277-A2 后额外接住「已领走但仍 queued」的行 ----
+    if (s.includes('UPDATE runs') && s.includes("SET status = 'cancelling'")
+        && s.includes("status = 'running'") && !s.includes("AND status IN ('queued', 'running')")) {
+      const g = this.guardOf(s);
+      const hit = this.runs.filter((r) => r.session_id === params[0]
+        && (r.status === 'running'
+          // 镜像守卫：第 1 步排除的那批（`status='queued'` 且已领走）必须在这里被接住
+          || (g.claimed && r.status === 'queued' && this.claimedFor(r.id, { needLease: g.lease }))));
       for (const r of hit) {
         r.status = 'cancelling';
         r.cancel_requested_at = r.cancel_requested_at ?? new Date();
@@ -253,6 +274,71 @@ test('#277-A 竞态：queued 分支 0 行（run 已被领走并写了 running）
   assert.ok(pool.runRow().cancel_requested_at);
   assert.equal(pool.runRow().ended_at, null);
   assert.equal(pool.queueFor('run-c').status, 'claimed', '0 行的 queued 分支不得误出队（租约留给 worker 报终态）');
+});
+
+// ===========================================================================
+// #277-A2 返修 1：「已被 agentd 领走、还没来得及写 `running`」的 run（runs.status 仍是 `queued`，
+// 认领只写 run_queue）不得被直接终态化。
+// 它必须落到第 2 步 `cancelling`，因为那才是能收敛且**不丢 usage** 的那条路：
+//   ① worker 正常的 markRunState('running') 由 internal.js setRunState 的 #220 ack 分支接住
+//      （无副作用 2xx、不炸成 persistence_failed、也不把状态改回 running——该分支自身的行为由
+//      internal.test.js `#220 setRunState：cancelling + state=running → 幂等 ack` 钉住）；
+//   ② 心跳 stop_run_ids 的谓词要求 `status='cancelling'` 且 run 在 worker 上报列表里 ⇒ 信号能送到活着的 worker；
+//   ③ worker abort 后经 U2 报终态（cancelling → finished|failed，租约未被清 ⇒ 门禁过得去）⇒ 带真实 usage 收敛。
+// 直接终态则：写下一个说谎的 detail='cancelled_before_start'，且 worker 的终态写入被 fencing 拒 ⇒ usage 丢。
+// ===========================================================================
+
+/** 造形：已领走（queue claimed + 租约至 now+leaseMs）但 runs.status 仍 queued。 */
+const claimedButQueued = (leaseMs = 90_000) => ({
+  run: { id: 'run-x', status: 'queued', queue_status: 'claimed', claim_token: 'tok', attempts: 1,
+    owner: CID, lease_until: new Date(Date.now() + leaseMs), claimed_at: new Date() },
+});
+
+test('#277-A2 已领走但未写 running：stop 必须落 cancelling（不是 finished）且不碰租约、不写 termination', async () => {
+  const pool = new StopPool(claimedButQueued());
+  const qBefore = { ...pool.queueFor('run-x') };
+
+  const out = await stop(pool);
+
+  assert.equal(out.run.status, 'cancelling', '已领走的 run 不得被直接终态（无守卫时在此为 finished）');
+  assert.equal(pool.runRow().status, 'cancelling', 'runs.status 必须是 cancelling（等 worker 报终态）');
+  assert.equal(pool.runRow().ended_at, null, 'cancelling 不是终态，不得写 ended_at');
+  assert.equal(pool.runRow().termination, null, 'termination 由 worker 带真实值写，portal 不得预写 cancelled_before_start');
+  assert.ok(pool.runRow().cancel_requested_at, 'cancel_requested_at 必须写（心跳 stop_run_ids 的谓词条件）');
+  assert.deepEqual({ ...pool.queueFor('run-x') }, qBefore, '租约字段一个不得清（清了 worker 写终态就 lease_lost ⇒ 丢 usage）');
+  assert.equal(pool.queueFor('run-x').claim_token, 'tok');
+  assert.ok(pool.queueFor('run-x').lease_until > new Date(), '租约仍是未来时刻');
+  assert.equal(pool.events.length, 0, '未进终态就不得合成 run_end');
+  assert.equal(pool.session.last_seq, 10, 'cancelling 路径不得分配 seq');
+});
+
+test('#277-A2 已领走走 cancelling 后同会话仍不得发新消息（ACTIVE_RUN_STATES 含 cancelling，与 running 分支一致）', async () => {
+  const pool = new StopPool(claimedButQueued());
+  await stop(pool);
+  await assert.rejects(() => send(pool), (e) => e instanceof SessionError && e.code === 'run_in_progress');
+});
+
+test('#277-A2 守卫不误伤：已领走但**租约已过期**（worker 已死，reaper 会回 pending/判 failed）⇒ 仍直接终态', async () => {
+  // 租约过期 = 按 reaper 口径「worker 已死」，没有活着的执行体会再来报终态；
+  // 若守卫写成「排除一切 claimed 行」（少掉 `q.lease_until > now()`）⇒ 本例不再直接终态：只改第 1 步时两步皆 0 行
+  // → 409 `no_active_run`；连第 2 步也跟着改则落 `cancelling`（本例验的是「不得阻止直接终态」，两种都红）。
+  const pool = new StopPool(claimedButQueued(-1_000)); // lease_until 已过期 1s
+
+  const out = await stop(pool);
+
+  assert.equal(out.run.status, 'finished', '过期租约不得阻止直接终态（否则又永久卡住）');
+  assert.equal(pool.runRow().status, 'finished');
+  assert.equal(pool.runRow().termination?.detail, 'cancelled_before_start');
+  assert.equal(pool.queueFor('run-x').status, 'cancelled', '过期租约的队列行照常出队');
+  assert.equal(pool.queueFor('run-x').lease_until, null);
+});
+
+test('#277-A2 未领走（pending）仍是直接终态：守卫只排「已领走」，不得把 queued 全排掉', async () => {
+  const pool = new StopPool({ run: { id: 'run-p', status: 'queued' } }); // queue pending，无租约
+  const out = await stop(pool);
+  assert.equal(out.run.status, 'finished');
+  assert.equal(pool.runRow().termination?.reason, 'aborted');
+  assert.equal(pool.queueFor('run-p').status, 'cancelled');
 });
 
 test('#277-A 无活跃 run ⇒ 409 no_active_run 语义不变', async () => {
