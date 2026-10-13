@@ -28,11 +28,11 @@
    为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
    有这四行就不用再猜「今天的 runner 是谁」。
 3. （步骤 ②）根 `npm ci` + `npm test` → **976 项 / 975 通过 / 0 失败 / 1 跳过**（基线，2026-10-13 本机复现；`#275` 预览 released 历史行遮蔽活行的 **+7**，全在 `portal/test/preview.test.js`：同 hostname 遮蔽回归 2 + 契约锁 3（只有 released 行仍 403 / `released_at` 同值靠 `id` 成全序 / 查不到 404）+ fake 自证部分唯一索引 1 + 源码级护栏 1；
-   原 945/944 基线上新增 `#234`（工单 `feat-261013-01`，跳站写请求防线 Origin / `Sec-Fetch-Site` 同源校验）的 **24 项**（同分支返修 +2，见下）：
+   原 945/944 基线上新增 `#234`（工单 `feat-261013-01`，跨站写请求防线 Origin / `Sec-Fetch-Site` 同源校验）的 **24 项**（同分支返修 +2，见下）：
    全部在新文件 `portal/test/csrf-origin.test.js`（13 项纯判据：`checkSameOrigin` / `csrfGateFor` 的 a/b/c/d 四支 +
    **返修回归门：`same-site` 不得直接放行、必落 Origin 比对** +
    默认端口/非默认端口归一化 + IPv6 + `X-Forwarded-Host` 优先级 + 畸形 Origin + 豁免端点；
-   11 项 HTTP 层：issue 明写的「跳站 POST 带 cookie ⇒ 403 `cross_origin_forbidden`」并断言**拒绝发生在副作用之前**、
+   11 项 HTTP 层：issue 明写的「跨站 POST 带 cookie ⇒ 403 `cross_origin_forbidden`」并断言**拒绝发生在副作用之前**、
    同源 200、无 Origin 放行、`cross-site` 无 Origin 拒、`same-origin` 无 Origin 放行、
    **预览 host 带 `same-site` 写 portal API ⇒ 403（返修回归门，带两个放行对照：Origin 相等 / Origin 缺失）**、
    GET/SSE/HEAD/OPTIONS 不受影响、
