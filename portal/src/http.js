@@ -1440,7 +1440,13 @@ async function handleStopSession(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
   await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）
-  const result = await sessions.stopSession(ctx.pool, { userId: session.user.id, sessionId });
+  const result = await sessions.stopSession(ctx.pool, {
+    userId: session.user.id, sessionId,
+    // #277-A2：「未开始就被直接终态」那条路 portal 是终态的**唯一产出者**，所以 `run_end` 也由它合成，
+    // 并在提交后经 session SSE hub 推给活页面（口径同 finishRun / handleAiTitle 的 `notify` 注入）。
+    // `running → cancelling` 分支不推：那条的 run_end 由 worker 的 U2 终态事务产出。
+    notify: internal.notifySessionEvents,
+  });
   // 即时停止通道：SSE 下行 stop_request 只服务**已领起该 run 且还活着的** worker（#220）。
   // ⚠ 不是「断线兜底」：心跳 `stop_run_ids` 的谓词是 `status='cancelling'` 且 run 在该 worker 上报的
   //   runs 列表里（internal.js heartbeat），而认领 SQL 又排除 `cancelling`、reaper 的候选集也不含它——
