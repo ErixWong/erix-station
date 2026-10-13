@@ -289,9 +289,11 @@ export async function createSession(
 export async function findSessionUser(pool, token, { now = new Date() } = {}) {
   if (!token || typeof token !== 'string') return null;
   const tokenHash = hashToken(token);
+  // #255：`must_change_password` 必须随会话一起读出——受限会话门（http.js `RESTRICTED_SESSION_ALLOWLIST`）
+  // 就坐在这条查表上，另开一条查表就是每个 API 请求多一次往返。
   const res = await pool.query(
     `SELECT u.id, u.login, u.display_name, u.role, u.fde_name, u.auth_source, u.status,
-            s.id AS session_id, s.expires_at, s.last_seen_at
+            u.must_change_password, s.id AS session_id, s.expires_at, s.last_seen_at
        FROM login_sessions s
        JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = $1
@@ -310,6 +312,9 @@ export async function findSessionUser(pool, token, { now = new Date() } = {}) {
       role: row.role,
       fde_name: row.fde_name,
       auth_source: row.auth_source,
+      // **显式收成布尔**：fake/旧驱动可能给 `undefined`、字符串 `'t'` 等形状，门的判据是 `=== true`，
+      // 不能靠真值性（`'false'` 是真值）。additive：既有调用方只读上面几项，多一个字段不影响。
+      must_change_password: row.must_change_password === true,
     },
     session: {
       id: row.session_id,

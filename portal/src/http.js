@@ -279,6 +279,109 @@ export function csrfGateFor(req, pathname) {
   });
 }
 
+// ---- #255 受限会话门（首登强制改密，portal.md §2.11a）----
+
+/**
+ * **受限会话** = 已认证、但 `users.must_change_password = true`（管理员代设/重置过口令，那枚口令
+ * 还没经过本人之手）。这种会话在改密之前只能碰下面这张清单，其余 `/api/*` 一律
+ * `403 password_change_required`（portal.md §2.11a）。
+ *
+ * 写成**显式常量**而不是散在 `if` 里的条件，是因为清单本身就是契约：
+ * **少一条 = 死锁**（唯一出口被自己挡住，人被困在改密屏外），
+ * **多一条 = 漏口**（拿别人设的口令照样能把平台用完，本单等于没做）。
+ * 匹配形状：`{ method, path, reason }`；`method: '*'` = 任意方法；`prefix: true` = 前缀匹配。
+ *
+ * ⚠ **只管 `/api/*`**：静态资源与 SPA 外壳不在本门之下（`serveStatic` 在 `route()` 里另有一条路）——
+ *    改密屏本身就是 SPA 页面，挡掉 JS/CSS 会让人连「去改密」的界面都打不开，那是自我锁死不是防线。
+ */
+export const RESTRICTED_SESSION_ALLOWLIST = Object.freeze([
+  Object.freeze({
+    method: 'GET',
+    path: '/api/me',
+    reason: '受限会话的唯一数据源：前端要靠它拿到「我是谁 + 为什么被弹去改密」（旗标随本端点的 user 对象下发，'
+      + '§2.6）。挡掉它 = SPA 只看见一片 403，不知道该把用户送去哪儿。',
+  }),
+  Object.freeze({
+    method: '*',
+    path: '/api/me/password',
+    reason: '受限状态的**唯一出口**（§2.6a），门必须能从这里出去；把它挡掉就是死锁。'
+      + '整条路径放行而**不限方法**：非 POST 该由路由自己回 `405 method_not_allowed`，'
+      + '而不是被门改成 403——403 会让前端以为「连改密这条路也被锁了」。',
+  }),
+  Object.freeze({
+    method: 'POST',
+    path: '/api/auth/logout',
+    reason: '登出永远可达：不想改密的人至少能换账号/退出。挡住它会把人钉在一个自己进不去的会话里。',
+  }),
+  Object.freeze({
+    method: 'POST',
+    path: '/api/auth/login',
+    reason: '第一步（口令校验）**此刻还没有会话**，本门对无会话请求本就无效（见 `restrictedSessionBlocked`）；'
+      + '列进来是防「受限用户重新登录拿一枚新会话」被自己的旧会话形状误伤，也让清单与 §0.1 端点表对齐。',
+  }),
+  Object.freeze({
+    method: 'POST',
+    path: '/api/auth/login/totp',
+    reason: '第二步（TOTP）同上：注册了 TOTP 的受限账号要能走完两步登录，否则连改密前的会话都拿不到。',
+  }),
+  Object.freeze({
+    method: '*',
+    path: '/api/forward-auth',
+    reason: '⚠ **本单最大的雷**：Traefik forwardAuth 回调（§2.7）。`routes.js` 的 `authRequestHeaders` 白名单里就带 '
+      + '`Cookie`，所以浏览器那侧的 cookie（登录 cookie 与预览 cookie 同源携带的形状，例如测试里同为 127.0.0.1、'
+      + '以及 portal 与预览共享 cookie 作用域的部署形态）会原样进到这条请求；而它的语义是「这片预览该不该放行」，'
+      + '与「本人是否欠一次改密」无关。被本门挡成 `403 password_change_required` 时，**Traefik 只会把它当成一次认证失败** '
+      + '⇒ 该用户的**整片预览平面**（`*.fde.<base>` 全部端口）一起挂掉，而他要改的只是口令。'
+      + '另注：本端点压根不查 `login_sessions`（凭证是 `preview_grants` 的 ticket / 预览 cookie），门在它身上没有可判的主体。',
+  }),
+  Object.freeze({
+    method: '*',
+    path: '/api/internal/',
+    prefix: true,
+    reason: '容器 → portal 的内部通道（§9）：per-container Bearer token 鉴权、**不带登录 cookie**，'
+      + '改密状态与它无关。与 #234 的豁免端点同一批理由（见 `csrfGateFor`）。',
+  }),
+  // 旧路径 `POST /api/login` / `POST /api/logout`（→ 307 到新路径，portal.md §0.1）也**必须进清单**：
+  // 本门挂在 routeApi 顶部、**在那两条 307 重写之前**执行，所以旧路径确实会走到本门（不是「到不了」）。
+  // 两条都在下面的条目里，判据上「新旧两条」是真覆盖，不是注释里的安慰。
+  Object.freeze({
+    method: 'POST',
+    path: '/api/login',
+    reason: '旧登录路径（307 → /api/auth/login）。本门在 307 重写**之前**执行，所以旧路径同样会过门：'
+      + '不列它，一个还带着旧会话 cookie 的受限用户连「重新登录」这个动作都会被 403 锁死。',
+  }),
+  Object.freeze({
+    method: 'POST',
+    path: '/api/logout',
+    reason: '旧登出路径（307 → /api/auth/logout）：同上，两条路径的语义是同一个「退出」，必须一起可达。',
+  }),
+]);
+
+/**
+ * 受限会话门的放行判据（纯函数，`portal/test/must-change-password.test.js` 逐条钉住）。
+ * `HEAD` 按 `GET` 判：HEAD 是 GET 的子集（只去 body），同一份放行理由对它同样成立。
+ */
+export function restrictedSessionAllows(method, pathname) {
+  const m = method === 'HEAD' ? 'GET' : (method ?? 'GET');
+  return RESTRICTED_SESSION_ALLOWLIST.some((entry) => {
+    if (entry.method !== '*' && entry.method !== m) return false;
+    return entry.prefix ? pathname.startsWith(entry.path) : pathname === entry.path;
+  });
+}
+
+/**
+ * #255：本请求是否该被受限会话门挡下。**只在放行清单之外**才去查会话 ⇒ 清单内零额外开销；
+ * 清单外本来就要查一次会话（`requireSession`），这里用 `resolveSession` 的请求内缓存复用同一次查表，
+ * 所以全链路仍然只有**一次** `login_sessions` 查表（不是每个 API 请求多一次往返）。
+ *
+ * 无会话 / 会话无效 ⇒ **不挡**：401 的语义归各 handler 自己（本门的职责只是「已认证但欠一次改密」）。
+ */
+async function restrictedSessionBlocked(req, ctx, pathname) {
+  if (restrictedSessionAllows(req.method, pathname)) return false;
+  const session = await resolveSession(req, ctx);
+  return session?.user?.must_change_password === true;
+}
+
 /** F2：审计前只记 path，剥离所有 query（?preview_ticket=<明文> 等绝不入审计）。 */
 function pathOnly(uri) {
   if (typeof uri !== 'string') return '/';
@@ -588,7 +691,25 @@ async function routeApi(req, res, ctx, url) {
     );
   }
 
+  // ---- #255 受限会话门（首登强制改密，portal.md §2.11a）----
+  // `must_change_password=true` 的会话（口令由管理员代设/重置，还没经过本人之手）在改密前只能碰
+  // `RESTRICTED_SESSION_ALLOWLIST`。落点：紧跟 #234 CSRF 门之后、**分派到任何 handler 之前**（与 #234
+  // 同一层 ⇒ 拒绝一定发生在副作用之前）。不改 #234 的逻辑，也不与它复用豁免表（两张清单理由不同：
+  // CSRF 豁免看「有没有 CSRF 语义」，本清单看「改密前必需不需要」）。
+  if (await restrictedSessionBlocked(req, ctx, pathname)) {
+    // **不写审计**（与 CSRF 门不同，这里是刻意的）：受限会话下 SPA 的每个轮询都会撞门，审计会被客户端重试
+    // 刷成噪声；而「欠改密」这个状态本身已由 `user.password_changed` 与管理员代设/重置那条审计钉住。
+    return sendJson(res, 403, errorBody(
+      'password_change_required',
+      '当前口令由管理员代设，请先修改口令后再使用其它功能',
+      false,
+      { action: 'change_password', endpoint: 'POST /api/me/password' },
+    ));
+  }
+
   // 兼容旧路径：仅 307 到新路径，不保留旧的单步发 cookie 行为（portal.md §0.1）。
+  // ⚠ 顺序契约：本门**在这一对 307 之前**，所以 `POST /api/login` / `POST /api/logout` 两条旧路径
+  // 也要出现在放行清单里（清单条目里写了理由）。
   if (req.method === 'POST' && pathname === '/api/login') {
     res.writeHead(307, { Location: '/api/auth/login' });
     res.end();
@@ -623,10 +744,10 @@ async function routeApi(req, res, ctx, url) {
   }
 
   if (req.method === 'GET' && pathname === '/api/me') {
+    // #255：改走 `requireSession`（与其余端点同一个会话解析 + 同一份请求内缓存）。
+    // 两条 401（无 cookie / 会话失效）与旧写法逐字同义，响应体不变。
+    const session = await requireSession(req, ctx);
     const token = getCookie(req, config.cookie.name);
-    if (!token) throw new HttpError(401, 'unauthorized', 'unauthorized');
-    const session = await auth.findSessionUser(pool, token);
-    if (!session) throw new HttpError(401, 'unauthorized', 'unauthorized');
     const renewed = await auth.renewSession(pool, session.session.id, {
       ttlSeconds: config.sessionTtlSeconds,
       renewIntervalMs: config.sessionRenewIntervalSeconds * 1000,
@@ -1855,11 +1976,26 @@ async function auditLoginSuccess(pool, user, method) {
     .catch(() => {});
 }
 
+/**
+ * 会话解析的**请求内缓存**（#255）。`Symbol` 键挂在 `req` 上：同一请求里受限会话门与
+ * `requireSession` 共用**一次** `login_sessions` 查表，不是每请求两次。
+ * 缓存安全：`findSessionUser` 是纯读（不续期、不写库），而一个请求只有一个 handler。
+ */
+const REQ_SESSION = Symbol('station.request.session');
+
+/** 解析当前请求的会话；无 cookie / 会话失效 ⇒ `null`（**不抛错**，401 的语义归 `requireSession`）。 */
+async function resolveSession(req, ctx) {
+  if (req[REQ_SESSION] !== undefined) return req[REQ_SESSION];
+  const token = getCookie(req, ctx.config.cookie.name);
+  req[REQ_SESSION] = token ? await auth.findSessionUser(ctx.pool, token) : null;
+  return req[REQ_SESSION];
+}
+
 /** 要求有效 session（除登录/forward-auth 外所有公开端点）。 */
 async function requireSession(req, ctx) {
   const token = getCookie(req, ctx.config.cookie.name);
   if (!token) throw new HttpError(401, 'unauthorized', 'unauthorized');
-  const session = await auth.findSessionUser(ctx.pool, token);
+  const session = await resolveSession(req, ctx);
   if (!session) throw new HttpError(401, 'unauthorized', 'unauthorized');
   return session;
 }

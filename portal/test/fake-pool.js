@@ -112,6 +112,10 @@ export class FakePool {
             fde_name: u.fde_name,
             auth_source: u.auth_source,
             status: u.status,
+            // #255：受限会话门的判据就读这一列。**按 SQL 说的做**（AGENTS §8.14）：SELECT 里没这一列
+            // 就不回这一列（=> 产品代码 `=== true` 得 false）⇒ 实现漏选这一列时门会失效、用例会红，
+            // 而不是由 fake 好心兼平。没声明该列的 users 行一律按 false（不被要求改密）。
+            must_change_password: sql.includes('must_change_password') ? u.must_change_password === true : undefined,
             session_id: s.id,
             expires_at: s.expires_at,
             last_seen_at: s.last_seen_at,

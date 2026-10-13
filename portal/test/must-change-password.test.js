@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer } from '../src/http.js';
+import { createServer, RESTRICTED_SESSION_ALLOWLIST, restrictedSessionAllows } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as admin from '../src/admin.js';
 import * as auth from '../src/auth.js';
@@ -500,6 +500,253 @@ test('#255② 当前口令被连续猜错会限流（防「会话 cookie 被偷�
     assert.equal(last.status, 429, `第 6 次应 429（实际 ${last.status}）`);
     assert.equal((await last.json()).error.code, 'rate_limited');
     assert.ok(last.headers.get('retry-after'), '带 Retry-After');
+  } finally {
+    await t.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ③ 受限会话门（提交 4）：`must_change_password=true` ⇒ 除放行清单外的 `/api/*` 一律 403
+// ---------------------------------------------------------------------------
+
+const PREVIEW_HOST = 'erin-p-22000.fde.erix.vip';
+
+/** 受限会话 + 一片预览端口（forward-auth 要用）。 */
+async function setupGate({ mustChange = true, login = 'erin', role = 'fde' } = {}) {
+  const pool = new MustChangePool({
+    users: [ADMIN],
+    allocations: [{
+      id: 'pa-255', fde_id: `u-${login}`, state: 'active', exposure: 'public',
+      hostname: PREVIEW_HOST, url: `https://${PREVIEW_HOST}`, port: 22000,
+    }],
+  });
+  const s = await startServer({ pool });
+  const user = await seedUser(pool, { login, password: OLD_PW, role, fdeName: login, mustChange });
+  const { cookie } = await loginCookieFor({ ...s, login, password: OLD_PW });
+  return { pool, user, ...s, cookie, loginAuditCount: pool.audit.length };
+}
+
+const get = (base, path, cookie) => fetch(`${base}${path}`, { headers: { cookie } });
+
+/** 断言「这个 403 是 forward-auth 自己的判定，不是 #255 的门」——门的 403 一定带这个码。 */
+function expectNotGate(body) {
+  assert.notEqual(body?.error?.code, 'password_change_required',
+    `被受限会话门挡了（清单漏了这一项）：${JSON.stringify(body)}`);
+}
+
+test('#255③ 放行清单是显式常量：每条都有 method/path/reason，必需端点一条不能少', () => {
+  assert.ok(Array.isArray(RESTRICTED_SESSION_ALLOWLIST) && RESTRICTED_SESSION_ALLOWLIST.length >= 8,
+    '清单必须是非空常量数组');
+  for (const entry of RESTRICTED_SESSION_ALLOWLIST) {
+    assert.ok(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', '*'].includes(entry.method), `method 非法：${entry.method}`);
+    assert.ok(typeof entry.path === 'string' && entry.path.startsWith('/api/'), `path 必须是 /api/ 开头：${entry.path}`);
+    assert.ok(typeof entry.reason === 'string' && entry.reason.length >= 20,
+      `${entry.method} ${entry.path} 缺理由——清单就是契约，没有理由的条目会被下一个人顺手删掉`);
+    assert.ok(Object.isFrozen(entry), `${entry.method} ${entry.path} 必须冻结（防运行时被改）`);
+  }
+  // 必需项（工单判据）：少任何一条都是「把自己锁在门外」。
+  for (const [method, path] of [
+    ['GET', '/api/me'], ['POST', '/api/me/password'],
+    ['POST', '/api/auth/logout'], ['POST', '/api/logout'],
+    ['POST', '/api/auth/login'], ['POST', '/api/auth/login/totp'], ['POST', '/api/login'],
+    ['GET', '/api/forward-auth'], ['POST', '/api/forward-auth'],
+  ]) {
+    assert.ok(restrictedSessionAllows(method, path), `放行清单少了 ${method} ${path}`);
+  }
+  assert.ok(restrictedSessionAllows('GET', '/api/internal/claim'), '/api/internal/* 必须整段放行（不带 cookie）');
+  // forward-auth 的理由必须留在清单里（它不在浏览器语义里，最容易被「顺手收紧」）。
+  const fa = RESTRICTED_SESSION_ALLOWLIST.find((e) => e.path === '/api/forward-auth');
+  assert.match(fa.reason, /Traefik|预览/, 'forward-auth 的条目要写明「挡住 = 整片预览挂」');
+});
+
+test('#255③ 纯判据：清单外一律挡，清单内一律放（HEAD 按 GET 判）', () => {
+  assert.equal(restrictedSessionAllows('GET', '/api/sessions'), false);
+  assert.equal(restrictedSessionAllows('POST', '/api/sessions'), false);
+  assert.equal(restrictedSessionAllows('GET', '/api/admin/users'), false);
+  assert.equal(restrictedSessionAllows('GET', '/api/me/ports'), false);
+  assert.equal(restrictedSessionAllows('GET', '/api/sessions/x/events'), false);
+  assert.equal(restrictedSessionAllows('GET', '/api/me'), true);
+  assert.equal(restrictedSessionAllows('HEAD', '/api/me'), true, 'HEAD 是 GET 的子集，同一份放行理由');
+  assert.equal(restrictedSessionAllows('GET', '/api/me/password'), true, '不限方法：非 POST 该拿 405，不是 403');
+  // `/api/me` 的前缀不能顺手写成 startsWith，否则 `/api/me/ports` 会被误放。
+  assert.equal(restrictedSessionAllows('GET', '/api/meeee'), false);
+});
+
+test('#255③ 旗标为真 ⇒ 清单外的 GET /api/sessions 一律 403 password_change_required（且不写审计）', async () => {
+  const t = await setupGate();
+  try {
+    const res = await get(t.base, '/api/sessions', t.cookie);
+    assert.equal(res.status, 403, `应 403（实际 ${res.status}）`);
+    const body = await res.json();
+    assert.equal(body.error.code, 'password_change_required');
+    assert.equal(body.error.retryable, false);
+    assert.equal(body.error.details.endpoint, 'POST /api/me/password', 'details 要告诉前端去哪儿解锁');
+    assert.equal(t.pool.audit.length, t.loginAuditCount,
+      '门不写审计：受限会话下 SPA 每个轮询都会撞门，审计会被客户端重试刷成噪声（刻意的，理由写在 http.js）');
+
+    const adminRes = await fetch(`${t.base}/api/admin/users`, { headers: { cookie: t.cookie } });
+    assert.equal(adminRes.status, 403, '/api/admin/* 同样受限（本例用户不是 admin，但门排在鉴权之前）');
+    assert.equal((await adminRes.json()).error.code, 'password_change_required');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ 清单内不被挡：GET /api/me 200（旗标随 user 下发）', async () => {
+  const t = await setupGate();
+  try {
+    const res = await get(t.base, '/api/me', t.cookie);
+    assert.equal(res.status, 200, `应 200（实际 ${res.status}：${await res.clone().text()}）`);
+    const body = await res.json();
+    assert.equal(body.user.login, 'erin');
+    // 前端就是靠这一列决定把用户弹到改密屏（§2.6）；挡掉 /api/me = SPA 只看见一片 403。
+    assert.equal(body.user.must_change_password, true, 'findSessionUser 必须把旗标带出来');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ 出口不被挡：POST /api/me/password 到得了 handler（删掉清单里这条 ⇒ 本例必须红）', async () => {
+  const t = await setupGate();
+  try {
+    // 用「错当前口令」探：到得了 handler 就是 401 invalid_credentials；被门挡则是 403。
+    const res = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: 'nope', new_password: NEW_PW } });
+    const body = await res.json();
+    assert.notEqual(body?.error?.code, 'password_change_required', '改密出口不得被门挡住（挡住 = 死锁）');
+    assert.equal(res.status, 401, `handler 自己的 401 invalid_credentials（实际 ${res.status}：${JSON.stringify(body)}）`);
+    assert.equal(body.error.code, 'invalid_credentials');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ ⚠ forward-auth 不受限：带着受限会话的 cookie 也照常放行（把 forward-auth 纳入受限 ⇒ 本例必须红）', async () => {
+  const t = await setupGate();
+  try {
+    // Traefik 的 authRequestHeaders 白名单里带 `Cookie`（routes.js），所以这枚受限会话的登录 cookie
+    // 会原样出现在 forward-auth 请求上；本例故意把它发出去，模拟「portal 与预览共享 cookie 作用域」。
+    const edge = { 'x-forwarded-host': PREVIEW_HOST, 'x-forwarded-method': 'GET', 'x-forwarded-uri': '/', cookie: t.cookie };
+    const res = await fetch(`${t.base}/api/forward-auth`, { headers: edge });
+    const body = await res.json().catch(() => ({}));
+    expectNotGate(body);
+    assert.equal(res.status, 200, `public 预览应放行（实际 ${res.status}：${JSON.stringify(body)}）`);
+    assert.equal(res.headers.get('x-auth-user'), 'erin', 'X-Auth-User 照旧下发');
+
+    // 反向确认「不是所有 403 都算过」：private + 无凭证时的 403 必须是 forward-auth 自己的码（§2.7）。
+    t.pool.allocations[0].exposure = 'private';
+    const denied = await fetch(`${t.base}/api/forward-auth`, {
+      headers: { 'x-forwarded-host': PREVIEW_HOST, 'x-forwarded-method': 'GET', 'x-forwarded-uri': '/' },
+    });
+    const deniedBody = await denied.json();
+    expectNotGate(deniedBody);
+    assert.equal(denied.status, 403);
+    assert.equal(deniedBody.error.code, 'preview_ticket_required', 'deny 走 §2.7 自己的码，不是门的码');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ 登录/登出新旧两条路径都不被挡（受限用户必须能退出、能重新登录）', async () => {
+  const t = await setupGate();
+  try {
+    // 旧路径（307）：门在 307 重写**之前**，所以这两条也在清单里。
+    const legacyLogin = await fetch(`${t.base}/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: t.cookie },
+      body: JSON.stringify({ login: 'erin', password: OLD_PW }),
+      redirect: 'manual',
+    });
+    assert.equal(legacyLogin.status, 307, `旧登录路径不得被门挡（实际 ${legacyLogin.status}）`);
+    assert.equal(legacyLogin.headers.get('location'), '/api/auth/login');
+
+    const legacyLogout = await fetch(`${t.base}/api/logout`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: t.cookie },
+      body: '{}',
+      redirect: 'manual',
+    });
+    assert.equal(legacyLogout.status, 307, `旧登出路径不得被门挡（实际 ${legacyLogout.status}）`);
+    assert.equal(legacyLogout.headers.get('location'), '/api/auth/logout');
+
+    // 新路径：登出真身 204 + 会话吊销；重新登录（同一条口令，旗标仍在）照样拿得到会话。
+    const logout = await fetch(`${t.base}/api/auth/logout`, { method: 'POST', headers: { cookie: t.cookie } });
+    assert.equal(logout.status, 204, '登出永远可达');
+    assert.equal((await get(t.base, '/api/me', t.cookie)).status, 401, '会话已吊销');
+
+    const again = await loginCookieFor({ ...t, login: 'erin', password: OLD_PW });
+    assert.equal(again.body.status, 'authenticated', '重新登录不被门挡');
+    assert.equal((await get(t.base, '/api/sessions', again.cookie)).status, 403, '新会话仍然受限（旗标没清）');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ 旗标为假 ⇒ 一切照旧（不得把所有人挡在门外）', async () => {
+  const t = await setupGate({ mustChange: false });
+  try {
+    const res = await get(t.base, '/api/sessions', t.cookie);
+    assert.equal(res.status, 200, `flag=false 必须照旧 200（实际 ${res.status}：${await res.clone().text()}）`);
+    assert.deepEqual(await res.json(), { items: [], next_cursor: null });
+    assert.equal((await get(t.base, '/api/me', t.cookie)).status, 200);
+    assert.equal((await fetch(`${t.base}/api/forward-auth`, {
+      headers: { 'x-forwarded-host': PREVIEW_HOST, 'x-forwarded-method': 'GET', cookie: t.cookie },
+    })).status, 200);
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ 门不改既有语义：无 cookie / 坏 cookie 仍是 401 unauthorized；静态资源与健康检查不受管', async () => {
+  const t = await setupGate();
+  try {
+    for (const headers of [{}, { cookie: `${t.config.cookie.name}=nope` }]) {
+      const res = await fetch(`${t.base}/api/sessions`, { headers });
+      assert.equal(res.status, 401, `未认证仍走 handler 的 401（实际 ${res.status}）`);
+      assert.equal((await res.json()).error.code, 'unauthorized');
+    }
+    // 门只管 `/api/*`：SPA 外壳必须照常（否则「改密屏」这个页面本身都打不开）；
+    // /api/health 在 routeApi **之前**就被 `route()` 接走 ⇒ 根本进不了门（本 fake 的迁移台账不全，
+    // 健康检查自己会回 503，那与门无关）⇒ 这里钉的是「不是 403」，不是 200。
+    assert.equal((await fetch(`${t.base}/`, { headers: { cookie: t.cookie } })).status, 200);
+    const health = await fetch(`${t.base}/api/health`, { headers: { cookie: t.cookie } });
+    assert.notEqual(health.status, 403, '健康检查/探针绝不允许被受限会话门挡（挡了会把「全员欠改密」误判成站点故障）');
+    assert.notEqual((await health.json()).error?.code, 'password_change_required');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255③ 每请求恰查一次 login_sessions（门与 requireSession 共用请求内缓存，不是每请求两次）', async () => {
+  const gated = await setupGate({ mustChange: false }); // flag=false ⇒ 走到 handler，两边都会要会话
+  try {
+    await get(gated.base, '/api/sessions', gated.cookie);
+    const lookups = gated.pool.sqlLog.filter(({ sql }) => sql.includes('FROM login_sessions s')).length;
+    assert.equal(lookups, 1, `放行清单外的请求应只查一次会话（实际 ${lookups} 次）`);
+  } finally {
+    await gated.close();
+  }
+  const blocked = await setupGate({ mustChange: true });
+  try {
+    await get(blocked.base, '/api/sessions', blocked.cookie);
+    assert.equal(blocked.pool.sqlLog.filter(({ sql }) => sql.includes('FROM login_sessions s')).length, 1,
+      '被挡的请求也只查一次（门查完就返回，不会再进 handler）');
+  } finally {
+    await blocked.close();
+  }
+});
+
+test('#255③ 端到端闭环：改完密门立即解锁（清旗标后同一会话可用），错口令期间始终 403', async () => {
+  const t = await setupGate({ mustChange: true });
+  try {
+    assert.equal((await get(t.base, '/api/sessions', t.cookie)).status, 403);
+    const wrong = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: 'nope', new_password: NEW_PW } });
+    assert.equal(wrong.status, 401);
+    assert.equal((await get(t.base, '/api/sessions', t.cookie)).status, 403, '改密失败 ⇒ 仍然受限');
+
+    const ok = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(ok.status, 200, `改密应成功（实际 ${ok.status}：${await ok.clone().text()}）`);
+    const unlocked = await get(t.base, '/api/sessions', t.cookie);
+    assert.equal(unlocked.status, 200, '旗标已清 ⇒ 同一会话立刻解锁（不得要求重新登录）');
   } finally {
     await t.close();
   }
