@@ -112,8 +112,21 @@ const isolationComposeEnv = memoizeOnce(() => (process.env.IPAM_RESERVED_SUBNETS
   ? {}
   : deriveIsolationComposeEnv({ docker, ownFdeNetwork: FDE_CONTAINER })));
 
+// 工单 F-6：命令串进容器要经**两层** shell——`execSync` 解析一次 `sg docker -c "…"`，sg 再把参数交给
+// `sh -c` 解析第二次。命令里的**真实换行**在 JSON.stringify 这一步就变成字面 `\n` 两个字符，而双引号
+// 内的 POSIX shell **不还原**它 ⇒ 下游收到的是 `run_id\n FROM` 这种带反斜杠的垃圾（psql 报
+// `ERROR: syntax error at or near "\"`，工单 F-6 在真机 §⑤ 上撞的就是这个）。
+// ⇒ 换行只许活在**走 stdin 的载荷**里（dockerStdin 的第二个实参、psqlStdin 的 SQL），命令串本身必须单行。
+// 这里当场抛（带着命令原文），别让它跑到 psql 里变成一句看不出所以然的语法错。
+function sgWrapped(cmd) {
+  if (/\n|\r/.test(cmd)) {
+    throw new Error(`经 sg/JSON.stringify 层的命令不得含换行（换行会变成字面 \\n 两字符，见工单 F-6）: ${JSON.stringify(cmd)}`);
+  }
+  return `sg docker -c ${JSON.stringify(cmd)}`;
+}
+
 function docker(args) {
-  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
+  return execSync(sgWrapped(`docker ${args}`), {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
@@ -121,7 +134,7 @@ function docker(args) {
 }
 
 function dockerStdin(args, input) {
-  return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
+  return execSync(sgWrapped(`docker ${args}`), {
     encoding: 'utf8',
     input,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -134,7 +147,7 @@ function dockerStdin(args, input) {
 const { removeDbDir } = createDbDirCleaner({ docker });
 
 function compose(args, env = {}) {
-  return execSync(`sg docker -c ${JSON.stringify(`${COMPOSE} ${args}`)}`, {
+  return execSync(sgWrapped(`${COMPOSE} ${args}`), {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
@@ -176,10 +189,17 @@ function readCookie(setCookie) {
   return nameVal.slice(idx + 1);
 }
 
+/** **单行** SQL 的唯一正确通道：SQL 作为 `-tAc` 的实参进命令串，要过 sg/JSON.stringify 那两层引号
+ *  （见 sgWrapped）。要跑多行 SQL 就用下面的 psqlStdin()——SQL 走 `docker exec -i` 的 stdin，
+ *  不碰引号层，换行天然安全（§③ 的 insertUser 就是这条路，所以它从来没坏过）。 */
 function psql(query) {
+  if (/\n|\r/.test(query)) {
+    throw new Error(`psql() 的 SQL 必须是单行（换行经 sg/JSON.stringify 会变成字面 \\n，psql 实收即 syntax error at or near "\\"；工单 F-6）: ${JSON.stringify(query)}`);
+  }
   return docker(`exec -i ${STATION_DB_NAME} psql -U station -d station -tAc ${JSON.stringify(query)}`).trim();
 }
 
+/** 多行 SQL 走 stdin：`-v ON_ERROR_STOP=1` 让 psql 在首错即停（dockerStdin 不抛 = 语句全过）。 */
 function psqlStdin(sql) {
   dockerStdin(`exec -i ${STATION_DB_NAME} psql -U station -d station -v ON_ERROR_STOP=1`, sql);
 }
@@ -286,10 +306,10 @@ function portalApi(pathname, { method = 'GET', cookie, body } = {}) {
 }
 
 function livePortRows() {
-  const out = psql(
-    `SELECT json_agg(t) FROM (SELECT port, hostname, url, scope, role, exposure, state, run_id
-       FROM port_allocations WHERE fde_id='${S.userId}' AND state <> 'released' ORDER BY port) t`,
-  );
+  // 工单 F-6：这一条**曾经**在 `run_id` 与 `FROM` 之间折了行 ⇒ 经 sg/JSON.stringify 后 psql 实收
+  // `run_id\n FROM port_allocations`，真机 §⑤ 直接 `ERROR: syntax error at or near "\"`（首失败点）。
+  // 整条压成单行；要折行请改写进 psqlStdin()（stdin 不经引号层）。
+  const out = psql(`SELECT json_agg(t) FROM (SELECT port, hostname, url, scope, role, exposure, state, run_id FROM port_allocations WHERE fde_id='${S.userId}' AND state <> 'released' ORDER BY port) t`);
   return out && out !== 'null' ? JSON.parse(out) : [];
 }
 
@@ -599,6 +619,10 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
 
       // 探针容器：共享 FDE 容器 netns（backend 就是 .2），先直连 backend 端口确认可达，
       // 这样后面 Traefik 的 502 只可能来自平台侧，不会和「没人在监听」混在一起。
+      // 工单 F-6 附带的 desk-check（§⑤–⑨ 同类引号隐患）：PROBE_SCRIPT 用**单引号**包在命令里，两层解析
+      // 之后那对单引号才是内层 shell 看到的引号 ⇒ 脚本里一旦出现单引号就当场截断命令，sg/JSON.stringify
+      // 那一层救不回来（它只处理 `"` 与 `\`）。缺省脚本没有单引号，所以把它钉成前提而不是留着等人踩。
+      assert.ok(!PROBE_SCRIPT.includes("'"), "PROBE_SCRIPT 不得含单引号：它在命令里由单引号包裹，出现单引号会截断（双引号/反斜杠会被 JSON.stringify 层正确处理，可以带）");
       docker(`run -d --rm --name ${PROBE_CONTAINER} -e PROBE_PORT=${S.port} --network container:${FDE_CONTAINER} ${PROBE_IMAGE} node -e '${PROBE_SCRIPT}'`);
       await waitFor(async () => (curl({ url: `http://${S.backendIp}:${S.port}/`, out: 'probe-direct' }).status === '200' ? '200' : null),
         { label: `探针在 FDE netns 内应答 ${S.backendIp}:${S.port}`, timeoutMs: 60000 });
@@ -727,8 +751,8 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
         psql(`SELECT count(*) FROM port_allocations WHERE fde_id='${S.userId}' AND state='released' AND released_at IS NULL`),
         '0', 'released 行必须带 released_at（审计事实）');
       assert.equal(
-        psql(`SELECT count(*) FROM preview_grants g JOIN port_allocations a ON a.id=g.allocation_id
-               WHERE a.fde_id='${S.userId}' AND g.state='active'`),
+        // 同样必须单行（工单 F-6 全文 grep 出来的第二处；§⑨ 在真机上从未执行到，所以它比 §⑤ 晚爆）。
+        psql(`SELECT count(*) FROM preview_grants g JOIN port_allocations a ON a.id=g.allocation_id WHERE a.fde_id='${S.userId}' AND g.state='active'`),
         '0', 'active 预览凭证全部撤销（含第⑧段那张未用的票；used 行是历史事实，不撤销 = #252 口径）');
 
       // 「已签未用票据失效」的确定性证法：绕开 Traefik 直接问 portal（allocation 已 released ⇒

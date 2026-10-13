@@ -309,6 +309,137 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}ports.json↔DB 对账件正/负例被破坏：${String(error?.message ?? error)}`;
 }
 
+// 工单 F-6：**经 `sg docker -c ${JSON.stringify(cmd)}` 两层的命令不得含裸换行**（源码级静态钉）。
+// 根因（真机 §⑤ 首失败）：JSON.stringify 把模板里的**真实换行**变成字面 `\n` 两个字符，而双引号内的
+// POSIX shell **不还原**它 ⇒ 下游 psql 实收 `run_id\n FROM` ⇒ `ERROR: syntax error at or near "\"`。
+// 判据只看「会被送进那一层的命令串」（函数第一个实参是模板字面量的位置）：
+//   · 扫 SHELL_QUOTED_FNS（psql/docker/dockerStdin/compose/execSync）；
+//   · **不**扫 psqlStdin：它的 SQL 走 `docker exec -i` 的 stdin，根本不碰这层引号，多行合法
+//     （§③ insertUser 就是这个形状，从来没坏过）；
+//   · `${…}` 表达式整段挖掉后才找换行 ⇒ 「源码为了折行把 ${…} 放在行尾」不算违规
+//     （lib/llm-binding.mjs 正是那个形状，报它就是误伤；夹具里有这条正例）。
+// 变异自证入口：把 wp2a §⑤ 那条已压单行的 SQL 拆回两行 ⇒ 本钉红（行为面夹具同时钉住本扫描不是恒真）。
+const SHELL_QUOTED_FNS = ['psql', 'docker', 'dockerStdin', 'compose', 'execSync'];
+
+/** 跳过引号串（含模板里的 `${…}` 嵌套），返回闭合引号之后的下标。 */
+function skipQuotedSegment(src, i, quote) {
+  let j = i + 1;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === '\\') { j += 2; continue; }
+    if (ch === quote) return j + 1;
+    if (quote === '`' && ch === '$' && src[j + 1] === '{') { j = skipExprSegment(src, j + 1); continue; }
+    j += 1;
+  }
+  throw new Error(`未闭合的引号串（${quote}）`);
+}
+
+/** 跳过 `${…}`（花括号计数 + 内层引号/模板），返回 `}` 之后的下标。 */
+function skipExprSegment(src, i) {
+  let depth = 0;
+  let j = i;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === "'" || ch === '"' || ch === '`') { j = skipQuotedSegment(src, j, ch); continue; }
+    if (ch === '{') { depth += 1; j += 1; continue; }
+    if (ch === '}') { depth -= 1; j += 1; if (depth === 0) return j; continue; }
+    j += 1;
+  }
+  throw new Error('未闭合的 ${…}');
+}
+
+/** 拆模板字面量：只返回**字面片段**（`${…}` 整段挖掉）。每个片段带源文本偏移，且与源同宽
+ *  （转义写成两个占位空格），所以片段内下标可以直接换算回行号。 */
+function scanTemplateLiterals(src, i) {
+  const literals = [];
+  let lit = '';
+  let start = i + 1;
+  let j = i + 1;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === '\\') { lit += '  '; j += 2; continue; }
+    if (ch === '`') { literals.push({ text: lit, offset: start }); return { literals, end: j + 1 }; }
+    if (ch === '$' && src[j + 1] === '{') {
+      literals.push({ text: lit, offset: start });
+      j = skipExprSegment(src, j + 1);
+      lit = '';
+      start = j;
+      continue;
+    }
+    lit += ch;
+    j += 1;
+  }
+  throw new Error('未闭合的模板字面量');
+}
+
+/** 找出「命令串里有裸换行」的调用点 → [{fn, line, sql}]（每个调用点最多报一次）。 */
+function findNakedNewlineCommands(src, { fns = SHELL_QUOTED_FNS } = {}) {
+  const re = new RegExp(`(?:^|[^\\w$.])(${fns.join('|')})\\s*\\(`, 'g');
+  const hits = [];
+  let m;
+  while ((m = re.exec(src))) {
+    let i = m.index + m[0].length;
+    while (i < src.length && /\s/.test(src[i])) i += 1;
+    if (src[i] !== '`') continue;
+    let scanned;
+    try {
+      scanned = scanTemplateLiterals(src, i);
+    } catch {
+      continue; // 解不动的形状（奇异嵌套）不当钉的依据，宁漏不误伤
+    }
+    for (const literal of scanned.literals) {
+      const nl = literal.text.search(/[\n\r]/);
+      if (nl === -1) continue;
+      hits.push({
+        fn: m[1],
+        line: src.slice(0, literal.offset + nl).split('\n').length,
+        sql: /\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b/i.test(literal.text),
+      });
+      break;
+    }
+    re.lastIndex = scanned.end;
+  }
+  return hits;
+}
+
+// 夹具：扫描件本身的行为面正/负例（不依赖 wp2a 内容，“扫不到”与“误伤”都能被发现）。
+// 变异入口：把 findNakedNewlineCommands 改成直接 `return []` ⇒ 下面每一类负例都不再被抓 ⇒ 本组红。
+try {
+  const f = (s) => findNakedNewlineCommands(s);
+  // 正例 1：单行命令串。
+  assert.deepEqual(f('psql(`SELECT a FROM t`)'), [], '单行 SQL 不该报');
+  // 正例 2（关键误伤面）：为了折行把 ${…} 放在行尾 —— 字面片段里没有真换行（llm-binding.mjs 的形状）。
+  assert.deepEqual(f('docker(\n  `exec ${c} psql -tAc ${JSON.stringify(\n  `SELECT b FROM u WHERE x = 1`,\n)}`\n)'), [], '${…} 边界上的源码折行不该报');
+  // 正例 3：psqlStdin 不在名单（SQL 走 stdin，多行合法）。
+  assert.deepEqual(f('psqlStdin(`\n  INSERT INTO t (a) VALUES (1);\n`)'), [], 'psqlStdin 的多行 SQL 不该报');
+  // 正例 4：写源码时就带的转义 `\n`（两字符）不是真换行。
+  assert.deepEqual(f('docker(`echo a\\nb`)'), [], '转义 \\n（字面两字符）不该报');
+  // 负例 1：真机那一条的形状——字面片段里 SELECT…run_id 与 FROM 之间折行。
+  const broken = f('psql(`SELECT a, run_id\n       FROM t WHERE x=1`)');
+  assert.equal(broken.length, 1, '拆成两行的 SQL 必须被抓（工单 F-6 的真机形状）');
+  assert.equal(broken[0].fn, 'psql');
+  assert.equal(broken[0].line, 1);
+  assert.equal(broken[0].sql, true, 'SQL 站点要标出来（文案要指向 psql 的 syntax error）');
+  // 负例 2：非 SQL 的命令串折行同样是 bug（这一层对任何命令都把换行变成字面 \n）。
+  assert.equal(f('docker(`run -d --rm --name p\n  node:22-alpine node -e x`)').length, 1, '非 SQL 命令折行也要抓');
+  // 负例 3：`${…}` **之后**的字面片段里折行（只盯模板开头会漏）。
+  assert.equal(f('docker(`exec ${c} cat /p\n/f`)').length, 1, '${…} 之后的折行也要抓');
+  // 负例 4：CR（CRLF 文件里也一样会坏）。
+  assert.equal(f('psql(`SELECT a\r\nFROM t`)').length, 1, '裸 CR 也要抓');
+  // 负例 5：dockerStdin/compose/execSync 同样在名单里（它们共用同一个包裹）。
+  for (const [snippet, fn] of [['dockerStdin(`exec -i db psql\n-c x`, sql)', 'dockerStdin'], ['compose(`up -d\n--build`)', 'compose'], ['execSync(`sg docker -c x\n-y`)', 'execSync']]) {
+    const got = f(snippet);
+    assert.equal(got.length, 1, `名单漏了 ${fn}：${snippet}`);
+    assert.equal(got[0].fn, fn);
+  }
+  // 正例 5：带参数的前缀不误判（`t.docker(` 是方法调用、`createDbDirCleaner({ docker })` 不是调用）。
+  assert.deepEqual(f('x.docker(`a\nb`)'), [], '方法调用形态不在名单');
+  assert.deepEqual(f('createDbDirCleaner({ docker })'), [], '传函数引用不是调用，不该报');
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}引号层扫描件（工单 F-6）正/负例被破坏：${String(error?.message ?? error)}`;
+}
+
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
@@ -516,6 +647,15 @@ const singleSourceProblems = [];
     const text = fs.readFileSync(file, 'utf8');
     if (text.includes('10.201.0.0/16')) {
       singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又出现等值段字面量 10.201.0.0/16（#227.3 应走 deriveFdeIpamPools/defaultFdeIpamPools 派生）`);
+    }
+  }
+  // 工单 F-6：所有要过 `sg docker -c ${JSON.stringify(cmd)}` 那两层的命令串必须**单行**——真实换行会被
+  // stringify 成字面 `\n`（双引号内 POSIX shell 不还原）⇒ psql 实收 `run_id\n FROM`，真机 §⑤ 就死在这。
+  // 扫描面 = 本目录全部 .mjs（不只 wp2a：同一个包裹件在各脚本里都有副本，以后谁折行都拦）。
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8');
+    for (const hit of findNakedNewlineCommands(text)) {
+      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}:${hit.line} ${hit.fn}() 的命令串含裸换行——经 sg/JSON.stringify 会变成字面 \\n${hit.sql ? '（psql 实收即 syntax error at or near "\\"，工单 F-6；多行 SQL 请改走 psqlStdin/stdin）' : '（命令里任何换行都会原样抵达下游）'}`);
     }
   }
 }
