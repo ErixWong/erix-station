@@ -10,6 +10,7 @@ import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import { afterLoginRoute, useAuthStore } from '../stores/auth';
+import { describeError, errorMeansRelogin } from '../lib/forcePasswordErrors';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 
 const { t } = useI18n();
@@ -24,15 +25,10 @@ const localError = ref<string | null>(null);
 
 const busy = computed(() => auth.loading);
 
-// 失败态（① 的兜底口径）：服务端 error.code / error.message 原样成字符串（api.ts 的 toDisplayText 已把
-// 非字符串退化处理，模板里不会再出现 [object Object]）。完整的错误码→文案映射表留给下一张单。
-const serverError = computed(() => {
-  const err = auth.changePasswordError;
-  if (!err) return '';
-  return err.code
-    ? t('forcePassword.serverError', { code: err.code, message: err.message })
-    : t('forcePassword.genericError', { message: err.message });
-});
+// 失败态（前端 ②）：**码 → 可行动文案**的映射在 lib/forcePasswordErrors.ts（不在本视图里判码），
+// 本视图只把它渲染成一行字符串。`describeError` 内部全部经 `toDisplayText` 退化 ⇒
+// 模板里不可能出现 `[object Object]`（五种畸形形态的断言见 spec）。
+const serverError = computed(() => (auth.changePasswordError ? describeError(auth.changePasswordError) : ''));
 
 async function onSubmit() {
   localError.value = null;
@@ -51,7 +47,18 @@ async function onSubmit() {
   });
   // released=true 的唯一来源是改密后 `GET /api/me` 回答「不受限」⇒ 才允许进正常界面。
   // 会话保留（§2.6a：只吊销其它会话），所以回落地页而不是 /login。
-  if (released && auth.user) router.replace(afterLoginRoute(auth.user));
+  if (released && auth.user) {
+    router.replace(afterLoginRoute(auth.user));
+    return;
+  }
+  // 401 unauthorized（会话过期）⇒ **不要停在改密屏**：手里已经没会话了，重试一次也只是再撞 401。
+  // ⚠ 与 401 invalid_credentials（旧口令打错，仍应留在屏上重输）的区分全在 code 上，
+  // 判据在 lib/forcePasswordErrors.ts（§2.6a：两个 401 共用状态码）。
+  const err = auth.changePasswordError;
+  if (err && errorMeansRelogin(err)) {
+    auth.forgetExpiredSession();
+    router.replace('/login');
+  }
 }
 
 // 出口二：登出（§2.11a 放行清单里有 POST /api/auth/logout）——不想改密的人至少能换账号。
