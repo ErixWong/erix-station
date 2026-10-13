@@ -3,7 +3,7 @@
 //   ① 未注册 TOTP → 密码直通建会话（响应含 user）；② 已注册 → pending_token 切第二步；
 //   ③ 错误展示取服务端 error.message；④ 登出后回到未登录态。
 import { defineStore } from 'pinia';
-import { api, ApiError } from '../api';
+import { api, ApiError, toDisplayText } from '../api';
 
 export interface AuthUser {
   id: string;
@@ -50,23 +50,6 @@ interface ChangePasswordResponse {
 export interface ChangePasswordError {
   code: string;
   message: string;
-}
-
-/**
- * `[object Object]` 防线：api() 把 `body.error.message` 原样透传，服务端若给成对象/数组，
- * 直接插进模板就是 `[object Object]` ⇒ 非字符串退化成 JSON 文本。
- */
-function safeText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'object') {
-    try {
-      return JSON.stringify(value) ?? String(value);
-    } catch {
-      return String(value);
-    }
-  }
-  return String(value);
 }
 
 // afterLoginRoute：admin 且无 fde_name（平台管理员）→ /admin（默认重定向至 /admin/users）；其余回工作台。
@@ -198,8 +181,8 @@ export const useAuthStore = defineStore('auth', {
         await this.refreshMe();
         return !this.passwordChangeRequired;
       } catch (err) {
-        const code = err instanceof ApiError ? safeText(err.code) : '';
-        const message = safeText(err instanceof Error ? err.message : err);
+        const code = err instanceof ApiError ? toDisplayText(err.code) : '';
+        const message = toDisplayText(err instanceof Error ? err.message : err);
         this.changePasswordError = { code, message };
         this.error = message;
         return false;
