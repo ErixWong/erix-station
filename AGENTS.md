@@ -50,6 +50,10 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 派工环境约定（2026-10-08 实证）：git worktree **不含未跟踪的 `node_modules`**，worker 进去后测试一律跑不起来；补装极便宜（`npm ci --prefer-offline` 热缓存 ~1.4s），所以派单红线应写「不改依赖版本、不提交 lockfile 变动」，而不是「禁止安装依赖」。
 
+⚠ **前端跑单条用例的形式（2026-10-14 一晚上连续两次踩同一坑）**：**`npx vitest run <文件>` 在本机会永久挂死**（实测主 agent 900s 零输出被 timeout 杀、worker 又拿同一形式占满 300s 无输出），而项目脚本 **3.4 秒**跑完 21 条。口径：只跑一个文件用 **`cd portal/frontend && timeout 240 npm test -- src/xxx.spec.ts`**（`test` 脚本本身就是 `vitest run`，`--` 后直接跟文件），类型检查用 **`npm run typecheck`**；**不要用 `npx vitest` / `npx vue-tsc`**。给 worker 的工单里写测试命令时**一律带 `timeout 240`**：否则一条挂死的命令看起来既不像成功也不像失败，会一直占着会话（attention 信号也只会被当成「命令开得久」）。
+
+⚠ **主工作区 `node_modules` 会被别的 worktree 掏空（同一晚第三次复发）**：症状是 `npm test` 从 1022 项掉到 **510 项 + 34 失败**，且 `node_modules/erix-agent` 不存在——**不是代码回归**，先 `ls -d node_modules/erix-agent` 再下结论，`npm ci --prefer-offline` 重装即回基线。推论：**发版/验收前必须先重装一次并复跑拿到基线数**，别拿一个依赖不完整的树当验收基点。
+
 ### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
 
 - 入口：`http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2，2026-10-08 起；旧的 `hp.inteva.vip:8090` 已随 Host 路由切换失效——Traefik 只认 `station.fde.erix.vip` / `100.100.0.3`。本机解析器负缓存解析不出时可用 playwright 容器 `erix_station_playwright`（:8935，resolver MAP 规则）或临时 hosts 条目兑底。deploy 栈 station-portal；代码更新后需 `docker compose build station-portal && docker compose up -d station-portal` 生效）
