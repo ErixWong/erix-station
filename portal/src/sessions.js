@@ -573,21 +573,31 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
  * 事务内锁 session 行（与发消息串行化，防「检查无活跃 run → 新 run 提交 → 误停新 run」竞态）；
  * 状态变更一律**条件更新（CAS）**，禁止先查后改；重复停止幂等返回 200。
  *
- * **两条路径（issue #277 第一片）**：
- *  1. `queued`（从未被 worker 领起 ⇒ 没有任何执行体会去报它的终态）：**直接进终态** `finished`
+ * **两条路径（issue #277 第一片；#277-A2 补「已领走」守卫）**：
+ *  1. `queued` 且**未被领走**（没有任何执行体会去报它的终态）：**直接进终态** `finished`
  *     + `termination={"reason":"aborted","detail":"cancelled_before_start"}`，并在同事务把它从
  *     `run_queue` 摘掉（口径同 release/reaper 的 cancelled 分支：queue → `cancelled` + 清租约字段）。
  *     旧实现在这里也写 `cancelling`，而 `cancelling` ①被认领 SQL 排除（internal.js tryClaim 的
  *     `r.status IN ('queued','running')`，A2）、②终态只能由 worker 经 U2 写、③不在 reaper 的收敛集合里
  *     ⇒ 一个从未执行的 run 被停止后**永远没人收敛**，`active_run_id` 恒非空（ACTIVE_RUN_STATES 含
  *     `cancelling`）⇒ 会话锁死：UI 恒「运行中」+ 发新消息恒 409 `run_in_progress`。
- *  2. `running`：仍 → `cancelling`（等 worker abort 后经 U2 报终态；**不回退**，A2 语义不变）。
+ *  2. `running`，以及**已被 agentd 领走但尚未写 `running`** 的 `queued`（#277-A2，见下方守卫注释）：
+ *     → `cancelling`（等 worker abort 后经 U2 报终态；**不回退**，A2 语义不变）。
  *  3. 两步都 0 行 ⇒ 幂等重放：`cancelling` 中的 run、或本端点已直接终态化的 run（按
  *     `termination.detail='cancelled_before_start'` 识别）→ 仍 `200` 且零写入；否则 409 `no_active_run`。
  *
  * ⚠ 竞态（不得吞）：run 在第 1 步之前刚被领走并写了 `running` ⇒ queued 分支 0 行，第 2 步接住它。
- * ⚠ 已领走但尚未写 `running`（runs.status 仍 `queued`）时，第 1 步直接终态 + 出队会清掉租约字段，
- *   worker 后续写入按既有 fencing 得 409 `lease_lost` 而中止——这是租约机制本来的行为，不是新分支的例外。
+ *
+ * ⚠ 已领走但尚未写 `running`（#277-A2 的守卫，见第 1 步 SQL）：**不能**直接终态，理由三条——
+ *   ① 落到 `cancelling` 后，worker 那次**正常**的 `markRunState('running')` 由 internal.js setRunState
+ *      的 issue #220 ack 分支接住（无副作用 2xx，不会炸成 `persistence_failed`，也**不会**把状态改回
+ *      `running`）；
+ *   ② 心跳 `stop_run_ids` 的谓词要求 `status='cancelling'` 且 run 在 worker 上报列表里
+ *      （internal.js heartbeat）⇒ 中止信号能送到**活着的** worker；
+ *   ③ worker abort 后经 U2 报终态（`cancelling → finished|failed` 合法，且我们**没清**租约 ⇒
+ *      finishRun 的租约门禁过得去）⇒ 能收敛，且带**真实 usage 与真实 termination**。
+ *   反过来，若把它直接终态化：worker 后续写终态被 fencing（lease_lost）拒 ⇒ **那一次 attempt 的
+ *   usage 直接丢掉**，并且 `termination.detail='cancelled_before_start'` 是在**说谎**（它已开始执行）。
  *
  * ⚠ 未覆盖（下一片）：`running` 的 run 被停止后若容器死掉 / worker 再不报终态，`cancelling` 无人收敛；
  *   本端点不解决这个问题（心跳 `stop_run_ids` 只把停止信号送给**还活着的** worker）。
@@ -600,6 +610,16 @@ export async function stopSession(pool, { userId, sessionId }) {
 
     // 第 1 步 CAS：queued → 终态（未开始就被取消）。转换合法性见 internal.js validateTransition
     // 的 `queued → finished|failed` 边（portal.md §9.6）。
+    // #277-A2 守卫：`status='queued'` **不足以**判定「从未开始」——认领只写 `run_queue`
+    // （`status='claimed'` + `claim_token` + `owner_container_id` + `lease_until`，见 schema.sql §8），
+    // `runs.status` 要等 worker 的 markRunState 才变 `running`，所以「已领走、还没来得及写 running」的
+    // run 这里仍是 `queued`。把它直接终态会 ①写下说谎的 detail='cancelled_before_start'（它其实已开始）、
+    // ②清掉租约 ⇒ worker 随后写终态被 fencing 拒（lease_lost）⇒ **那一次 attempt 的 usage 丢掉**。
+    // 故用租约事实（已领走 = `q.status='claimed'` 且 `lease_until > now()`）把它排除，让它落到第 2 步
+    // → `cancelling`（为什么 cancelling 才是能收敛的那条路：见本函数 docstring 的三条理由）。
+    // ⚠ 守卫必须带 `lease_until > now()`：租约**已过期**的 claimed 行按 reaper 口径属于「worker 已死」
+    //   （reaper 分支2/3 会把它回 pending 或判 failed），此时没有任何活着的执行体会再来报终态
+    //   ⇒ 仍该直接终态，否则就退回 #277 的卡死态。
     const killedQueued = await client.query(
       `UPDATE runs
           SET status = 'finished',
@@ -607,6 +627,8 @@ export async function stopSession(pool, { userId, sessionId }) {
               cancel_requested_at = COALESCE(cancel_requested_at, now()),
               ended_at = now()
         WHERE session_id = $1 AND status = 'queued'
+          AND NOT EXISTS (SELECT 1 FROM run_queue q
+                           WHERE q.run_id = runs.id AND q.status = 'claimed' AND q.lease_until > now())
         RETURNING id`,
       [s.id],
     );
@@ -623,6 +645,8 @@ export async function stopSession(pool, { userId, sessionId }) {
     }
 
     // 第 2 步 CAS：剩下的 running → cancelling（等 worker 报终态，见上方 ⚠）。
+    // #277-A2：与第 1 步的守卫**互为补集**——「已领走、还没写 running」的 run（runs.status 仍是 `queued`
+    // 且租约有效）在第 1 步被排除，必须由这一步接住，否则两步都 0 行会掉进 409 `no_active_run`。
     let res;
     if (killedQueued.rows.length > 0) {
       res = killedQueued.rows.map((r) => ({ id: r.id, status: 'finished' }));
@@ -630,7 +654,10 @@ export async function stopSession(pool, { userId, sessionId }) {
       const cancelling = await client.query(
         `UPDATE runs
             SET status = 'cancelling', cancel_requested_at = COALESCE(cancel_requested_at, now())
-          WHERE session_id = $1 AND status = 'running'
+          WHERE session_id = $1
+            AND (status = 'running'
+                 OR (status = 'queued' AND EXISTS (SELECT 1 FROM run_queue q
+                        WHERE q.run_id = runs.id AND q.status = 'claimed' AND q.lease_until > now())))
           RETURNING id`,
         [s.id],
       );
