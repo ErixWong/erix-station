@@ -423,7 +423,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **基线**：根 `npm test` **945/944/0/1**（#264 +19，`runner/test/llm-timeouts.test.js`）；runner **221/221**；前端 **29 文件 / 410**（#266 +19）；三处台账均已同步。
 - **发布与部署（第二次按 digest 发版，全程无新坑）**：三份 package.json+lockfile → `0.1.5` → tag `v0.1.5`（run `38280258701`）→ 三镜像 pull+inspect `.Id` 与清单 `imageId` 全一致 → `.env` 形态① pin（备份 `/tmp/deploy.env.bak-015`）→ `up -d --no-build` healthy。
 - **真机已验**：`fde-blind` 的 `/home/erix/AGENTS.md` 由对账**自动**刷出第 7 条（不需重建容器）；#241 预检/deny-CORS 无回归；签票→兑换→预览 200 全链正常；新前端 bundle 含「重试上一条」。超时修复的热patch冒烟（run `18485a78` 「pong」）在部署前已过。
-- ⚠ **既有 FDE 容器（eric/tetris/todo/blind）仍跑旧 runner 代码**——`ERIX_LLM_TIMEOUT_*` 的四相超时在**镜像重建 + 容器重建**前不生效（blind 靠当时热patch的 `/opt/erix/worker.js` 临时吃到；重建即丢）。新开户 FDE 直接落 v0.1.5。重建时机见 #246 交付后的演练窗口，别拿旧容器没超时报回归。
+- ~~既有 FDE 容器仍跑旧 runner 代码~~ **（2026-10-13 上午已完成重建）**：eric/tetris/todo/blind 四台已 `docker rm -f` + portal reconcile 自动重建到 v0.1.5 FDE 镜像（digest `d941e7b8…`，`ensureFdeContainer` 不检测镜像漂移、rm 后由 reconcile 按 `.env` pin 重建是标准姿势）；agentd 四台上线双向 ping、ports.json generations 不变、端到端冒烟 run finished（↑3,848/↓66）。blind 的热patch随重建退役。
 - #263 当晚证伪收口（见 §8.16 更正块与 drill §九）；#261/#262 均已关闭，衍生小项（四个超时的 per-FDE 下发光纤）登记在 `docs/env.md` §10.4，要调参再开单。
 
 ### 8.18 e2e 隔离化与清场红线（2026-10-13 夜班，PR #267/#269，#226/#224 关单、#227 第 1-3 项）
