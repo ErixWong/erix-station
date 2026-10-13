@@ -27,15 +27,22 @@
 2. （步骤 ①′）**运行身份诊断**：`id -u` / `id -g` / `id` / `uname -a`（无 `continue-on-error`、无 `if: always()`）。
    为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
    有这四行就不用再猜「今天的 runner 是谁」。
-3. （步骤 ②）根 `npm ci` + `npm test` → **967 项 / 966 通过 / 0 失败 / 1 跳过**（基线，2026-10-13 本机复现；
-   原 945/944 基线上新增 `#234`（工单 `feat-261013-01`，跳站写请求防线 Origin / `Sec-Fetch-Site` 同源校验）的 **22 项**：
-   全部在新文件 `portal/test/csrf-origin.test.js`（12 项纯判据：`checkSameOrigin` / `csrfGateFor` 的 a/b/c/d 四支 +
+3. （步骤 ②）根 `npm ci` + `npm test` → **969 项 / 968 通过 / 0 失败 / 1 跳过**（基线，2026-10-13 本机复现；
+   原 945/944 基线上新增 `#234`（工单 `feat-261013-01`，跳站写请求防线 Origin / `Sec-Fetch-Site` 同源校验）的 **24 项**（同分支返修 +2，见下）：
+   全部在新文件 `portal/test/csrf-origin.test.js`（13 项纯判据：`checkSameOrigin` / `csrfGateFor` 的 a/b/c/d 四支 +
+   **返修回归门：`same-site` 不得直接放行、必落 Origin 比对** +
    默认端口/非默认端口归一化 + IPv6 + `X-Forwarded-Host` 优先级 + 畸形 Origin + 豁免端点；
-   10 项 HTTP 层：issue 明写的「跳站 POST 带 cookie ⇒ 403 `cross_origin_forbidden`」并断言**拒绝发生在副作用之前**、
-   同源 200、无 Origin 放行、`cross-site` 无 Origin 拒、`same-origin` 无 Origin 放行、GET/SSE/HEAD/OPTIONS 不受影响、
+   11 项 HTTP 层：issue 明写的「跳站 POST 带 cookie ⇒ 403 `cross_origin_forbidden`」并断言**拒绝发生在副作用之前**、
+   同源 200、无 Origin 放行、`cross-site` 无 Origin 拒、`same-origin` 无 Origin 放行、
+   **预览 host 带 `same-site` 写 portal API ⇒ 403（返修回归门，带两个放行对照：Origin 相等 / Origin 缺失）**、
+   GET/SSE/HEAD/OPTIONS 不受影响、
    `/api/internal/*` 与 `/api/forward-auth` 豁免、dev `:8090` 形态端口匹配与不同端口拒绝、畸形 Origin 在 HTTP 层就拒、
    拒绝响应带 ACAO/ACAC/Vary 且状态码仍 403、审计 `auth.csrf_denied` 的 details/target/失败不阻断）。
-   变异自证（各自只红相关处）：删掉 `cross-site` 分支 ⇒ 4 红；Origin「解析失败即放行」⇒ 3 红；端口一律丢掉 ⇒ 5 红。
+   变异自证（各自只红相关处）：删掉 `cross-site` 分支 ⇒ 4 红；Origin「解析失败即放行」⇒ 3 红；端口一律丢掉 ⇒ 5 红；
+   **返修后另两枚（本单）：删掉判据 b 的 `same-origin` ⇒ 1 红（证 b 未成空壳）；把 `same-site` 短路回直接放行
+   ⇒ 只有新增的两枚回归门红（纯判据 + HTTP 层），其余 22 全绿——钉住「同注册域不同 origin 被洗白」这个缺陷本体。**
+   （返修前本行为 **967/966（22 项 = 12 纯 + 10 HTTP）**：`same-site` 直接放行的缺陷修掉后，原「判据 b：`same-site`
+   放行」那枚按新口径改写为「落 Origin 比对后的三种结局」（不删除），并新增纯判据与 HTTP 层各 1 枚回归门 ⇒ +2。）
    原 926/925 基线上新增 `#261`（runner 显式 LLM 三相超时）的 **19 项**：
    `runner/test/llm-timeouts.test.js` +19（helper env 解析 / **回归门：`explicitPhase=true` 且 `legacyTimeoutMs=undefined`**
    ——钉的是「关掉引擎 legacy 120s 总闸」这个机制本身，对照组钉「`timeoutMs:900000` 这种直觉修法根本不关闸」/
@@ -56,7 +63,7 @@
    再往前是 `#246 交付②` 预览端口列端点与管理员改块的 21 项（`portal/test/preview-ports.test.js`）、
    `#246` 交付① 预分配号池块的 15 项（`portal/test/portalloc.test.js` 与 `portal/test/{migrations,materializer}.test.js`）
    与 `#241` 预览预检与 deny CORS 的 7 条。
-   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **967 里已含 runner 的 221 项**。
+   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **969 里已含 runner 的 221 项**。
    ⚠️ 同一条发现规则（`**/test/**/*.js`）也会把 `portal/test/` 下的**非用例 helper**算成 1 项 ⇒ 净增用例数
    要按上面的拆解核对，别只看总数（实测：在 `portal/test/` 放一个空的 `x.js`，总数立刻 +1）。
 4. （步骤 ③）`cd runner && npm ci && node --test` → **221/221**（#261 新增 19 项 `runner/test/llm-timeouts.test.js`；
