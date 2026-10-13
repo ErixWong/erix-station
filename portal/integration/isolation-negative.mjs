@@ -19,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir, writeDynamicStub,
+  deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -214,12 +215,52 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}writeDynamicStub 桩语义正例被破坏：${String(error?.message ?? error)}`;
 }
 
+// #268 M2 派生件正例（deriveIsolationComposeEnv / memoizeOnce，全程假 docker、不碰真 docker）：
+// 扫非本栈 fde-* 网络子网 → IPAM_RESERVED_SUBNETS；排除 ownFdeNetwork；去重；skip 位不扫描；
+// 网络消失（inspect 抛错）不致炸。变异入口：把扫描改成「含本栈网络」或「不去重」，本组即红。
+try {
+  const seen = [];
+  const netFake = (args) => {
+    seen.push(args);
+    if (args.startsWith('network ls')) return 'bridge\nfde-e2e226alice\nfde-alice\nfde-bob\nfde-carol\nfde-gone\nbackend';
+    if (args.includes('inspect fde-alice')) return '[{"Subnet":"10.200.0.0/29"}]';
+    if (args.includes('inspect fde-bob')) return '[{"Subnet":"10.200.0.32/29"}]';
+    if (args.includes('inspect fde-carol')) return '[{"Subnet":"10.200.0.0/29"}]'; // 与 alice 同段 → 去重
+    if (args.includes('inspect fde-gone')) throw new Error('网络在 ls 与 inspect 之间消失（safe 包裹必须吞掉，不致整体炸）');
+    if (args.includes('inspect fde-e2e226alice')) throw new Error('ownFdeNetwork 不该被 inspect（被扫到即测试红）');
+    return null;
+  };
+  const derived = deriveIsolationComposeEnv({
+    docker: netFake, ownFdeNetwork: 'fde-e2e226alice', baseEnv: { BASE_DOMAIN: 'localhost' },
+  });
+  assert.equal(derived.BASE_DOMAIN, 'localhost', 'baseEnv 原样保留');
+  assert.equal(derived.IPAM_RESERVED_SUBNETS, '10.200.0.0/29,10.200.0.32/29',
+    '非本栈 fde-* 子网按扫描顺序拼接、同段去重（carol 与 alice 同段只留一份）');
+  assert.ok(!seen.some((a) => /^network inspect fde-e2e226alice\b/.test(a)),
+    'ownFdeNetwork（本栈自己的网络）不得被 inspect');
+  const beforeSkip = seen.length;
+  const skipped = deriveIsolationComposeEnv({ docker: netFake, ownFdeNetwork: 'fde-x', skipIpamReserved: true });
+  assert.ok(!('IPAM_RESERVED_SUBNETS' in skipped), 'skipIpamReserved=true ⇒ 不注入（显式传优先）');
+  assert.equal(seen.length, beforeSkip, 'skip 时一条 docker 命令都不发（连扫描都不发生）');
+  // 无可扫网络 ⇒ 不注入键（而不是注入空串）。
+  const empty = deriveIsolationComposeEnv({ docker: () => '', ownFdeNetwork: 'fde-own' });
+  assert.ok(!('IPAM_RESERVED_SUBNETS' in empty), '扫无子网时不注入 IPAM_RESERVED_SUBNETS');
+  // memoizeOnce：只算一次（惰性 + 记忆化），后续调用不再碰 docker。
+  let calls = 0;
+  const memo = memoizeOnce(() => { calls += 1; return { n: calls }; });
+  assert.deepEqual([memo(), memo(), memo()], [{ n: 1 }, { n: 1 }, { n: 1 }], 'memoizeOnce 只算一次');
+  assert.equal(calls, 1, 'memoizeOnce 底层函数调用次数 = 1');
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}#268 M2 派生件正例被破坏：${String(error?.message ?? error)}`;
+}
+
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
-  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub'];
+  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -307,6 +348,17 @@ const singleSourceProblems = [];
       singleSourceProblems.push(`${script}: 没调用 writeDynamicStub()（edge watch 桩没预写，materializer 原子替换会永不被 reload → internal 全 404，#268）`);
     } else if (upLine !== -1 && stubLine > upLine) {
       singleSourceProblems.push(`${script}:${stubLine + 1} writeDynamicStub() 在 compose up（:${upLine + 1}）之后才调——桩必须在起栈前预写，否则 watch 已落空（#268）`);
+    }
+  }
+  // #268 M2（派生件提 lib）：wp3b 的 IPAM_RESERVED_SUBNETS 派生必须走 lib 那一份（扫其他栈 fde-*
+  // 子网的扫描体不得再在脚本里内联复制；单一来源扫描已钉住定义，这里钉「wp3b 真的 import 了它」）。
+  {
+    const wp3bText = fs.readFileSync(path.join(HERE, 'wp3b-e2e.mjs'), 'utf8');
+    if (!/deriveIsolationComposeEnv\s*[,\s][\s\S]*?from\s+'\.\/lib\/isolated-env\.mjs'/.test(wp3bText)) {
+      singleSourceProblems.push('wp3b-e2e.mjs: 没有 import lib 的 deriveIsolationComposeEnv（IPAM 保留段派生又变成脚本私有副本了，#268 M2）');
+    }
+    if (!/isolationComposeEnv\s*=\s*memoizeOnce\(/.test(wp3bText)) {
+      singleSourceProblems.push('wp3b-e2e.mjs: isolationComposeEnv 不再是 memoizeOnce(…) 包裹（惰性+记忆化语义被拆，每次 compose 都重查 docker）');
     }
   }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b

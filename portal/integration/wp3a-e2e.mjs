@@ -14,10 +14,13 @@
 //   FDE_NAME=<含栈 id 的 FDE 名>（fde-<name> 是全局 docker 网络/容器名，不派生会与共享栈互删）
 //   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large（FDE_IPAM_POOLS 可不传：缺省由 defaultFdeIpamPools(栈 id) 派生；显式传入优先，#227.3）
 //   LLM_GATEWAY_HOST=http://127.0.0.1:<LITELLM_HOST_PORT>
+//   BASE_DOMAIN=…（**必须 export**，如 fde.erix.vip 或自建域；composeDomainEnv 缺省 localhost ⇒
+//     不 export 时路由 host 物化成 station.localhost/llm.localhost，agentd 全 404）。
 //   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
 //   FDE_DEV_MODE=1（#227.1 起必需：FDE_IMAGE 为 image:tag 形态时须显式声明 dev 模式；digest 形态豁免）
 //   TRAEFIK_STATIC_HOST 由脚本自动生成（只改入口端口的临时 traefik.yml，F8）。代理构建/镜像与
-//   HTTP_PROXY 口径见 lib/fde-image.mjs；IPAM 保留段等派生注入见 wp3b 的 isolationComposeEnv()。
+//   HTTP_PROXY 口径见 lib/fde-image.mjs；IPAM 保留段（IPAM_RESERVED_SUBNETS）#268 M2 起由脚本在 up 前
+//   自动扫其他栈的 fde-* 子网补齐（显式传入优先，派生件与 wp3b 同源于 lib/isolated-env.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -27,10 +30,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseCidr, intToIp } from '../src/ipam.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { LLM_HOST, PORTAL_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 import {
   assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
-  writeDynamicStub,
+  writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -57,6 +61,14 @@ const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
 const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
 const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner/IPAM 命名规则：fde-<fde_name>
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
+
+// #268 M2：IPAM_RESERVED_SUBNETS 用公共派生件补齐（未显式传时扫**其他栈**的 fde-* 网络子网 →
+// 保留段，不传会 Pool overlaps；派生本体在 lib/isolated-env.mjs，与 wp3b 同一份）。
+// 惰性求值 + 记忆化：首次 compose（预清理 down）时查一次 docker，之后不再查；显式传入一律优先。
+const isolationComposeEnv = memoizeOnce(() => (process.env.IPAM_RESERVED_SUBNETS
+  ? {}
+  : deriveIsolationComposeEnv({ docker, ownFdeNetwork: FDE_CONTAINER })));
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
@@ -84,7 +96,7 @@ function compose(args, env = {}) {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...DOMAIN_COMPOSE_ENV, ...stackPaths(), ...env },
+    env: { ...process.env, ...DOMAIN_COMPOSE_ENV, ...isolationComposeEnv(), ...stackPaths(), ...env },
   });
 }
 
@@ -212,7 +224,13 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
 
     // 1) 起栈（含 station-litellm）；启动迁移完成后，管理台 API 才能创建 credential/model/binding。
     // LLM_GATEWAY_HOST 跟隔离栈自己的 LiteLLM publish 端口对齐（host 网络的 Traefik 用）。
-    compose('up -d --build', { MIGRATE_ON_START: '1', LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}` });
+    // #268 M2：up 前自建 FDE_IMAGE（同 wp5/wp6 形态；共享 tag 绝不删，issue #178，口径见 lib/fde-image.mjs）。
+    buildFdeImage(FDE_IMAGE);
+    compose('up -d --build', {
+      MIGRATE_ON_START: '1',
+      LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}`,
+      FDE_IMAGE,
+    });
 
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);

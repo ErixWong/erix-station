@@ -73,7 +73,7 @@ import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mj
 // #227.1：wp3b 隔离跑法从此也过硬护栏（assertIsolatedEnvironment），removeDbDir 同样收编。
 import {
   SHARED_STACK, assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
-  writeDynamicStub,
+  writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -191,38 +191,23 @@ function safe(fn) {
 
 /**
  * 推导隔离栈应注入 compose 的 env（未显式设置时）。返回 {} 表示共享栈缺省、不注入任何值。
- * 三项均遵循「显式设置优先」：process.env 已有值则不动。
+ * 两项均遵循「显式设置优先」：process.env 已有值则不动。
+ * #268 M2：IPAM_RESERVED_SUBNETS 的扫描派生本体已提到 lib/isolated-env.mjs:deriveIsolationComposeEnv
+ *（与 wp3a 共用一份；扫描行为与提 lib 前的内联实现逐字等价，含「排除本栈 fde-<FDE_NAME>」口径）。
  */
 function deriveIsolationEnv() {
   if (!ISOLATION_SIGNAL_KEYS.some((k) => process.env[k])) return {};
-  const out = { ...DOMAIN_COMPOSE_ENV };
-
-  // IPAM_RESERVED_SUBNETS：portal 的 IPAM 池硬编码（portal/src/ipam.js:12-15，10.200.0.0/16），
-  // 非 env 可配；隔离栈 DB 为空 → 默认从池头分配 10.200.0.0/29，与共享栈已占段重叠（403 Pool overlaps）。
-  // 收集「其他栈」的 fde-* 网络 subnet（排除本栈自己的 fde-<FDE_NAME>）作为保留段。
-  if (!process.env.IPAM_RESERVED_SUBNETS) {
-    const own = `fde-${FDE_NAME}`;
-    const names = (safe(() => docker('network ls --format {{.Name}}')) || '')
-      .split('\n').map((s) => s.trim())
-      .filter((n) => n.startsWith('fde-') && n !== own);
-    const subnets = [...new Set(names.map((n) => safe(() => {
-      // format 含空格，必须单引号包裹（docker() 把整条命令包进 sg docker -c "..."，
-      // 内层 sh 会对未引用的 {{json .IPAM.Config}} 做词拆分 → Go 模板 unclosed action）。
-      const cfg = JSON.parse(docker(`network inspect ${n} --format '{{json .IPAM.Config}}'`));
-      return cfg?.[0]?.Subnet || null;
-    })).filter(Boolean))];
-    if (subnets.length > 0) out.IPAM_RESERVED_SUBNETS = subnets.join(',');
-  }
-
-  return out;
+  return deriveIsolationComposeEnv({
+    docker,
+    ownFdeNetwork: FDE_CONTAINER, // = fde-<FDE_NAME>，本栈自己的网络（扫描时排除）
+    baseEnv: DOMAIN_COMPOSE_ENV,
+    // 显式传了 IPAM_RESERVED_SUBNETS ⇒ 不扫描不注入（shell env 本就会压过注入，这里连查都不查）。
+    skipIpamReserved: Boolean(process.env.IPAM_RESERVED_SUBNETS),
+  });
 }
 
 // 惰性求值 + 记忆化：首个 compose 调用（预清理 down）时算一次即可，避免每次 compose 都查 docker。
-let isolationEnvCache;
-function isolationComposeEnv() {
-  if (isolationEnvCache === undefined) isolationEnvCache = deriveIsolationEnv();
-  return isolationEnvCache;
-}
+const isolationComposeEnv = memoizeOnce(deriveIsolationEnv);
 
 async function waitFor(fn, { timeoutMs = 120000, intervalMs = 500, label = 'condition' } = {}) {
   const start = Date.now();
