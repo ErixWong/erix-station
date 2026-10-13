@@ -21,6 +21,9 @@ import {
   SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir, writeDynamicStub,
   deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
+// 工单 F（wp2a 重建）：`ports.json ↔ port_allocations` 对账件是 wp2a 最重的断言；提到纯函数后，
+// 本脚本可以用夹具**行为面**钉住它（无 docker 环境下也能验「不是恒真」）。
+import { reconcilePortsJsonWithDb, PREVIEW_LIVE_STATES } from './lib/ports-reconcile.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
@@ -255,12 +258,197 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}#268 M2 派生件正例被破坏：${String(error?.message ?? error)}`;
 }
 
+// 工单 F（wp2a 重建）：`~/.erix/ports.json` ↔ DB `port_allocations` 对账件的**行为面**
+//（全程夹具，不碰 docker）。这是 wp2a 里最重的一条断言，所以它的「不是恒真」必须能在本脚本里钉住：
+// 变异入口 = 把 lib/ports-reconcile.mjs 的 reconcilePortsJsonWithDb 改成直接 `return { problems: [], summary }`
+//（= 工单自检里的「对账改成恒真」）⇒ 下面「一致夹具零问题」仍绿，但每一类破坏都不再被抓 ⇒ 本组红。
+try {
+  const fdeName = 'e2e226alice';
+  const baseDomain = 'fde.erix.test';
+  const publicBaseUrl = 'http://station.fde.erix.test:18090';
+  const hostOf = (port) => `${fdeName}-p-${port}.${baseDomain}`;
+  const urlOf = (port) => `http://${hostOf(port)}:18090`;
+  const ports = Array.from({ length: 10 }, (_, i) => 22000 + i);
+  const entry = (port, over = {}) => ({ scope: 'fde', port, role: 'spare', run_id: null, url: urlOf(port), exposure: 'private', state: 'allocated', ...over });
+  const row = (port, over = {}) => ({ port, hostname: hostOf(port), url: urlOf(port), scope: 'fde', role: 'spare', exposure: 'private', state: 'allocated', run_id: null, ...over });
+  const jsonOf = (list, over = {}) => ({ schema: 1, fde: fdeName, generation: 7, allocations: list, ...over });
+  const goodJson = jsonOf(ports.map((p) => entry(p)));
+  const goodRows = ports.map((p) => row(p));
+  const run = (portsJson, dbRows) => reconcilePortsJsonWithDb({ portsJson, dbRows, fdeName, baseDomain, publicBaseUrl }).problems;
+
+  // 正例：完全一致的夹具必须零问题（否则下面的负例是「全都报」的空洞通过）。
+  assert.deepEqual(run(goodJson, goodRows), [], '一致的 ports.json/DB 夹具不应报任何问题');
+  assert.deepEqual([...PREVIEW_LIVE_STATES].sort(), ['active', 'allocated'], '活行状态口径 = allocated/active（§8.6）');
+
+  const traps = [
+    ['清单少一条（块没发满）', jsonOf(goodJson.allocations.slice(0, 9)), goodRows],
+    ['generation 不是数值', jsonOf(goodJson.allocations, { generation: '7' }), goodRows],
+    ['fde 字段指向别人', jsonOf(goodJson.allocations, { fde: 'someoneelse' }), goodRows],
+    ['schema 不是 1', jsonOf(goodJson.allocations, { schema: 2 }), goodRows],
+    ['scope 退回 run 级（0019 前的形态）', goodJson, goodRows.map((r, i) => (i === 0 ? { ...r, scope: 'run' } : r))],
+    ['DB 活行里混进 released（清单没跟上）', goodJson, goodRows.map((r, i) => (i === 3 ? { ...r, state: 'released' } : r))],
+    ['json 与 DB 状态不一致', jsonOf(goodJson.allocations.map((e, i) => (i === 1 ? { ...e, state: 'active' } : e))), goodRows],
+    ['清单里的 url 端口不是公开入口的端口', goodJson, goodRows.map((r) => ({ ...r, url: r.url.replace(':18090', ':8090') }))],
+    ['hostname 前缀不是该 FDE', goodJson, goodRows.map((r) => ({ ...r, hostname: r.hostname.replace(fdeName, 'otherfde') }))],
+    ['端口在号池外（旧 4000–4009 时代）', jsonOf([4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009].map((p) => entry(p))),
+      [4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009].map((p) => ({ ...row(p), port: p, hostname: hostOf(p), url: urlOf(p) }))],
+    ['块起点未按 10 对齐', jsonOf([22005, 22006, 22007, 22008, 22009, 22010, 22011, 22012, 22013, 22014].map((p) => entry(p))),
+      [22005, 22006, 22007, 22008, 22009, 22010, 22011, 22012, 22013, 22014].map((p) => row(p))],
+    ['块内端口不连续（缺一条 + 多一条）', jsonOf([...goodJson.allocations.slice(0, 5), ...goodJson.allocations.slice(6), entry(22020)]), goodRows],
+    ['DB 多一条没进清单', goodJson, [...goodRows, row(22030)]],
+    ['FDE 级行带了 run_id（迁移 0019 的 CHECK 面）', goodJson, goodRows.map((r, i) => (i === 2 ? { ...r, run_id: 'x' } : r))],
+    ['json 整体不是对象', null, goodRows],
+    ['DB 行不是数组', goodJson, null],
+  ];
+  for (const [label, portsJson, dbRows] of traps) {
+    const problems = run(portsJson, dbRows);
+    assert.ok(problems.length > 0, `对账夹具负例未被抓：${label}（problems 为空 ⇒ 对账已退化成恒真）`);
+  }
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}ports.json↔DB 对账件正/负例被破坏：${String(error?.message ?? error)}`;
+}
+
+// 工单 F-6：**经 `sg docker -c ${JSON.stringify(cmd)}` 两层的命令不得含裸换行**（源码级静态钉）。
+// 根因（真机 §⑤ 首失败）：JSON.stringify 把模板里的**真实换行**变成字面 `\n` 两个字符，而双引号内的
+// POSIX shell **不还原**它 ⇒ 下游 psql 实收 `run_id\n FROM` ⇒ `ERROR: syntax error at or near "\"`。
+// 判据只看「会被送进那一层的命令串」（函数第一个实参是模板字面量的位置）：
+//   · 扫 SHELL_QUOTED_FNS（psql/docker/dockerStdin/compose/execSync）；
+//   · **不**扫 psqlStdin：它的 SQL 走 `docker exec -i` 的 stdin，根本不碰这层引号，多行合法
+//     （§③ insertUser 就是这个形状，从来没坏过）；
+//   · `${…}` 表达式整段挖掉后才找换行 ⇒ 「源码为了折行把 ${…} 放在行尾」不算违规
+//     （lib/llm-binding.mjs 正是那个形状，报它就是误伤；夹具里有这条正例）。
+// 变异自证入口：把 wp2a §⑤ 那条已压单行的 SQL 拆回两行 ⇒ 本钉红（行为面夹具同时钉住本扫描不是恒真）。
+const SHELL_QUOTED_FNS = ['psql', 'docker', 'dockerStdin', 'compose', 'execSync'];
+
+/** 跳过引号串（含模板里的 `${…}` 嵌套），返回闭合引号之后的下标。 */
+function skipQuotedSegment(src, i, quote) {
+  let j = i + 1;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === '\\') { j += 2; continue; }
+    if (ch === quote) return j + 1;
+    if (quote === '`' && ch === '$' && src[j + 1] === '{') { j = skipExprSegment(src, j + 1); continue; }
+    j += 1;
+  }
+  throw new Error(`未闭合的引号串（${quote}）`);
+}
+
+/** 跳过 `${…}`（花括号计数 + 内层引号/模板），返回 `}` 之后的下标。 */
+function skipExprSegment(src, i) {
+  let depth = 0;
+  let j = i;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === "'" || ch === '"' || ch === '`') { j = skipQuotedSegment(src, j, ch); continue; }
+    if (ch === '{') { depth += 1; j += 1; continue; }
+    if (ch === '}') { depth -= 1; j += 1; if (depth === 0) return j; continue; }
+    j += 1;
+  }
+  throw new Error('未闭合的 ${…}');
+}
+
+/** 拆模板字面量：只返回**字面片段**（`${…}` 整段挖掉）。每个片段带源文本偏移，且与源同宽
+ *  （转义写成两个占位空格），所以片段内下标可以直接换算回行号。 */
+function scanTemplateLiterals(src, i) {
+  const literals = [];
+  let lit = '';
+  let start = i + 1;
+  let j = i + 1;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === '\\') { lit += '  '; j += 2; continue; }
+    if (ch === '`') { literals.push({ text: lit, offset: start }); return { literals, end: j + 1 }; }
+    if (ch === '$' && src[j + 1] === '{') {
+      literals.push({ text: lit, offset: start });
+      j = skipExprSegment(src, j + 1);
+      lit = '';
+      start = j;
+      continue;
+    }
+    lit += ch;
+    j += 1;
+  }
+  throw new Error('未闭合的模板字面量');
+}
+
+/** 找出「命令串里有裸换行」的调用点 → [{fn, line, sql}]（每个调用点最多报一次）。 */
+function findNakedNewlineCommands(src, { fns = SHELL_QUOTED_FNS } = {}) {
+  const re = new RegExp(`(?:^|[^\\w$.])(${fns.join('|')})\\s*\\(`, 'g');
+  const hits = [];
+  let m;
+  while ((m = re.exec(src))) {
+    let i = m.index + m[0].length;
+    while (i < src.length && /\s/.test(src[i])) i += 1;
+    if (src[i] !== '`') continue;
+    let scanned;
+    try {
+      scanned = scanTemplateLiterals(src, i);
+    } catch {
+      continue; // 解不动的形状（奇异嵌套）不当钉的依据，宁漏不误伤
+    }
+    for (const literal of scanned.literals) {
+      const nl = literal.text.search(/[\n\r]/);
+      if (nl === -1) continue;
+      hits.push({
+        fn: m[1],
+        line: src.slice(0, literal.offset + nl).split('\n').length,
+        sql: /\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b/i.test(literal.text),
+      });
+      break;
+    }
+    re.lastIndex = scanned.end;
+  }
+  return hits;
+}
+
+// 夹具：扫描件本身的行为面正/负例（不依赖 wp2a 内容，“扫不到”与“误伤”都能被发现）。
+// 变异入口：把 findNakedNewlineCommands 改成直接 `return []` ⇒ 下面每一类负例都不再被抓 ⇒ 本组红。
+try {
+  const f = (s) => findNakedNewlineCommands(s);
+  // 正例 1：单行命令串。
+  assert.deepEqual(f('psql(`SELECT a FROM t`)'), [], '单行 SQL 不该报');
+  // 正例 2（关键误伤面）：为了折行把 ${…} 放在行尾 —— 字面片段里没有真换行（llm-binding.mjs 的形状）。
+  assert.deepEqual(f('docker(\n  `exec ${c} psql -tAc ${JSON.stringify(\n  `SELECT b FROM u WHERE x = 1`,\n)}`\n)'), [], '${…} 边界上的源码折行不该报');
+  // 正例 3：psqlStdin 不在名单（SQL 走 stdin，多行合法）。
+  assert.deepEqual(f('psqlStdin(`\n  INSERT INTO t (a) VALUES (1);\n`)'), [], 'psqlStdin 的多行 SQL 不该报');
+  // 正例 4：写源码时就带的转义 `\n`（两字符）不是真换行。
+  assert.deepEqual(f('docker(`echo a\\nb`)'), [], '转义 \\n（字面两字符）不该报');
+  // 负例 1：真机那一条的形状——字面片段里 SELECT…run_id 与 FROM 之间折行。
+  const broken = f('psql(`SELECT a, run_id\n       FROM t WHERE x=1`)');
+  assert.equal(broken.length, 1, '拆成两行的 SQL 必须被抓（工单 F-6 的真机形状）');
+  assert.equal(broken[0].fn, 'psql');
+  assert.equal(broken[0].line, 1);
+  assert.equal(broken[0].sql, true, 'SQL 站点要标出来（文案要指向 psql 的 syntax error）');
+  // 负例 2：非 SQL 的命令串折行同样是 bug（这一层对任何命令都把换行变成字面 \n）。
+  assert.equal(f('docker(`run -d --rm --name p\n  node:22-alpine node -e x`)').length, 1, '非 SQL 命令折行也要抓');
+  // 负例 3：`${…}` **之后**的字面片段里折行（只盯模板开头会漏）。
+  assert.equal(f('docker(`exec ${c} cat /p\n/f`)').length, 1, '${…} 之后的折行也要抓');
+  // 负例 4：CR（CRLF 文件里也一样会坏）。
+  assert.equal(f('psql(`SELECT a\r\nFROM t`)').length, 1, '裸 CR 也要抓');
+  // 负例 5：dockerStdin/compose/execSync 同样在名单里（它们共用同一个包裹）。
+  for (const [snippet, fn] of [['dockerStdin(`exec -i db psql\n-c x`, sql)', 'dockerStdin'], ['compose(`up -d\n--build`)', 'compose'], ['execSync(`sg docker -c x\n-y`)', 'execSync']]) {
+    const got = f(snippet);
+    assert.equal(got.length, 1, `名单漏了 ${fn}：${snippet}`);
+    assert.equal(got[0].fn, fn);
+  }
+  // 正例 5：带参数的前缀不误判（`t.docker(` 是方法调用、`createDbDirCleaner({ docker })` 不是调用）。
+  assert.deepEqual(f('x.docker(`a\nb`)'), [], '方法调用形态不在名单');
+  assert.deepEqual(f('createDbDirCleaner({ docker })'), [], '传函数引用不是调用，不该报');
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}引号层扫描件（工单 F-6）正/负例被破坏：${String(error?.message ?? error)}`;
+}
+
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
   'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
+// 工单 F：`ports.json ↔ port_allocations` 对账件的唯一定义处是 lib/ports-reconcile.mjs（不在
+// isolated-env.mjs 里），所以单一来源断言得按名字选归属文件，不能再默认「只有 isolated-env.mjs」。
+const SINGLE_SOURCE_FILES = { reconcilePortsJsonWithDb: 'ports-reconcile.mjs' };
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -273,10 +461,10 @@ const singleSourceProblems = [];
     }
   };
   walk(HERE);
-  for (const name of SINGLE_SOURCE_DEFS) {
+  for (const [name, ownerFile] of [...SINGLE_SOURCE_DEFS.map((n) => [n, 'isolated-env.mjs']), ...Object.entries(SINGLE_SOURCE_FILES)]) {
     const definers = files.filter((file) => new RegExp(`function\\s+${name}\\s*\\(`).test(fs.readFileSync(file, 'utf8')));
-    if (definers.length !== 1 || path.basename(definers[0]) !== 'isolated-env.mjs') {
-      singleSourceProblems.push(`${name}: 期望只在 lib/isolated-env.mjs 有 1 处定义，实际 ${definers.length} 处 → ${definers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ') || '（无）'}`);
+    if (definers.length !== 1 || path.basename(definers[0]) !== ownerFile) {
+      singleSourceProblems.push(`${name}: 期望只在 lib/${ownerFile} 有 1 处定义，实际 ${definers.length} 处 → ${definers.map((f) => path.relative(path.resolve(HERE, '../..'), f)).join(', ') || '（无）'}`);
     }
   }
   for (const script of [...ISOLATION_SCRIPTS, 'wp3b-e2e.mjs']) {
@@ -336,7 +524,8 @@ const singleSourceProblems = [];
   // #268 M1（edge watch 桩）：四支隔离 e2e 必须 import 并在 **compose up 之前**调用 writeDynamicStub。
   // 顺序用源码文本判：首次调用行号 < 首次 `compose('up` 行号（桩晚于起栈 = watch 已经落空，白写）。
   // 变异自证入口：删掉/注释任一脚本的桩调用 ⇒ 本断言红；把调用搬到 compose up 之后 ⇒ 同样红。
-  const DYNAMIC_STUB_SCRIPTS = ['wp3a-e2e.mjs', 'wp3b-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
+  // 工单 F（wp2a 重建）后 wp2a 也走同一套桩，加入名单（删掉 wp2a 的桩调用即红）。
+  const DYNAMIC_STUB_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp3b-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
   for (const script of DYNAMIC_STUB_SCRIPTS) {
     const lines = fs.readFileSync(path.join(HERE, script), 'utf8').split('\n');
     const stubLine = lines.findIndex((l, i) => /\bwriteDynamicStub\s*\(/.test(l) && !/^\s*(import|\/\/|\*)/.test(l) && i > 0);
@@ -384,6 +573,54 @@ const singleSourceProblems = [];
       singleSourceProblems.push("wp3a-e2e.mjs: ensureLlmBinding 没有显式传 modelName: 'mock-model'（必须与 fake-agentd llm 段请求的模型名对齐；缺省 e2e-mock-model 不在白名单 → 403，#268 M3）");
     }
   }
+  // 工单 F（wp2a 重建，#268 决策第 2 条）：wp2a 必须按 P5 + 迁移 0019 的现役语义跑，且最重的那条
+  // 断言（ports.json ↔ port_allocations 对账）不许在脚本里被写软。变异自证入口：
+  //   a) 删 wp2a 的 writeDynamicStub 调用 → 上方 DYNAMIC_STUB_SCRIPTS 红；
+  //   b) 把对账改成恒真 → 上面「ports.json↔DB 对账件正/负例」那组红（行为面，无需 docker）；
+  //   c) 删掉去置备的 404 断言 → 下方 wp2a-conv-404 锚点红。
+  {
+    const wp2aText = fs.readFileSync(path.join(HERE, 'wp2a-e2e.mjs'), 'utf8');
+    const wp2aRequired = [
+      [/from\s+'\.\/lib\/ports-reconcile\.mjs'/, "import './lib/ports-reconcile.mjs'（对账件必须是公共那一份）"],
+      [/reconcilePortsJsonWithDb\(\{/, '调用 reconcilePortsJsonWithDb（ports.json ↔ port_allocations 逐条对账）'],
+      [/assert\.deepEqual\(rec\.problems, \[\]/, '对账末尾的「问题清单 = []」断言（恒真化即被上面的夹具组抓）'],
+      [/provision-fde --fde-name/, 'provision-fde（P5 唯一的 FDE 开户动作）'],
+      [/deprovision-fde --fde-name/, 'deprovision-fde（去置备面）'],
+      [/\/api\/me\/ports/, '#246 交付②：签票要用的 allocation UUID 从产品读侧取'],
+      [/preview-ticket/, 'POST /api/ports/:id/preview-ticket（签票链路）'],
+      [/buildFdeImage\(/, 'up 前自建 FDE 镜像（#268 M2 口径，见 lib/fde-image.mjs）'],
+      [/teardownFailures/, 'teardown 失败逐动作记名（#224/#269：清场失败必须红）'],
+      [/filter label=station\.stack=/, '零残留复查：按 station.stack 标签查本栈资源'],
+      [/assert\.deepEqual\(problems, \[\],/, '清场末尾的零失败/零残留断言'],
+      [/--network container:\$\{FDE_CONTAINER\}/, '探针必须共享 FDE 容器 netns（路由 backend 恒 = .2:<port>，在同一 /29 里另起一个容器不会被路由到）'],
+      // 工单 F-5：userspace 权限口径按**真机现状**钉（工作区目录 permission 位 0770），
+      // 不许改回「代码传了 2770 就断言 2770」——setgid 意图缺口的成因与出路写在 wp2a §④ 注释里。
+      [/assert\.equal\(perm\(dir\), 0o0770/, '工作区目录钉真机现状 permission 位 0770（工单 F-5 返修口径）'],
+    ];
+    for (const [pattern, what] of wp2aRequired) {
+      if (!pattern.test(wp2aText)) {
+        singleSourceProblems.push(`wp2a-e2e.mjs: 缺工单 F 重建口径零件「${what}」（重建后的 wp2a 不允许回到旧形态）`);
+      }
+    }
+    // 去置备收敛的 404 断言锚点：必须是**断言消息的开头**（`'wp2a-conv-404 …'`）且至少 2 条
+    //（对该 host 直连 404 + 未用票据经边缘 404）。只销钉文字不算钉：label/注释里出现 token
+    // 不算，删掉断言就少一条（工单自检 c 的入口：把 404 断言删掉 ⇒ 本项红）。
+    const convAnchors = (wp2aText.match(/'wp2a-conv-404/g) || []).length;
+    if (convAnchors < 2) {
+      singleSourceProblems.push(`wp2a-e2e.mjs: 去置备收敛的 404 断言锚点 'wp2a-conv-404' 只剩 ${convAnchors} 处（要求 ≥2 处且必须是断言消息开头：直连 404 + 未用票据 404）`);
+    }
+    // 前 P5 形态不许回来：项目维度端点拼 id、读 POST /api/projects 的 201 返回体（该写口已 410）。
+    for (const [pattern, what] of [
+      [/\/api\/projects\/\$\{/, '项目维度端点又拼了 id（P5：/api/projects/:id 的 PATCH/DELETE 已 410）'],
+      [/body\.ports\[0\]/, '又在读 POST /api/projects 的 201 返回体（该端点已 410）'],
+      // 工单 F-5：把工作区目录重新按代码意图断言成 2770（真机拿不到 setgid）也算形态回来了。
+      [/assert\.equal\(mode\(dir\), 0o2770/, '工作区目录又按代码意图断言 2770（真机稳定 0770；setgid 缺口见 wp2a §④）'],
+    ]) {
+      if (pattern.test(wp2aText)) {
+        singleSourceProblems.push(`wp2a-e2e.mjs: 前 P5 形态回来了：${what}`);
+      }
+    }
+  }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b
   // 调用处——别的脚本出现这个选项 = 有人开始打算删共享 dev 库，必须停下来先确认语义。
   const ALLOW_SHARED_RESET_FILES = new Set(['isolated-env.mjs', 'wp2b-e2e.mjs']);
@@ -410,6 +647,15 @@ const singleSourceProblems = [];
     const text = fs.readFileSync(file, 'utf8');
     if (text.includes('10.201.0.0/16')) {
       singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}: 又出现等值段字面量 10.201.0.0/16（#227.3 应走 deriveFdeIpamPools/defaultFdeIpamPools 派生）`);
+    }
+  }
+  // 工单 F-6：所有要过 `sg docker -c ${JSON.stringify(cmd)}` 那两层的命令串必须**单行**——真实换行会被
+  // stringify 成字面 `\n`（双引号内 POSIX shell 不还原）⇒ psql 实收 `run_id\n FROM`，真机 §⑤ 就死在这。
+  // 扫描面 = 本目录全部 .mjs（不只 wp2a：同一个包裹件在各脚本里都有副本，以后谁折行都拦）。
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8');
+    for (const hit of findNakedNewlineCommands(text)) {
+      singleSourceProblems.push(`${path.relative(path.resolve(HERE, '../..'), file)}:${hit.line} ${hit.fn}() 的命令串含裸换行——经 sg/JSON.stringify 会变成字面 \\n${hit.sql ? '（psql 实收即 syntax error at or near "\\"，工单 F-6；多行 SQL 请改走 psqlStdin/stdin）' : '（命令里任何换行都会原样抵达下游）'}`);
     }
   }
 }
