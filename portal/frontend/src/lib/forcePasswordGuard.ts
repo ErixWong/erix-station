@@ -64,3 +64,71 @@ export function restrictedNavigationDecision(input: RestrictedNavigationInput): 
   }
   return { action: 'next' };
 }
+
+/**
+ * #255 熔断预算的默认趟数（`createRedirectBudget()` 缺省值；单测钉住它 == 12）。
+ *
+ * 为什么是 12（默认值既不能太小也不能太大，也不能是 Infinity）：
+ * - **语义**：它数的是「同一次导航链里守卫 `beforeEach` 被进来的趟数」。`afterEach` 只在导航
+ *   真正落地时跑，所以重定向期间预算是**连续累计**的——正常链条最多 3~4 趟
+ *   （典型最深：未登录深链 `/session/x` → `/login?redirect=…` → 登录成功回跳 → requiresRole
+ *   不满足再回退 `/`；受限态则是「目标 → /change-password」两趟）。
+ * - **太小会误熔断正常跳转**：取 2~4 会让上面那条合法的三跳深链被判成环，用户表现为
+ *   「深链偶尔进不去 + 一条 warn」，比原 bug 更难查（它是**间歇性**的，且只在链条深的入口出现）。
+ * - **太大就失去熔断意义**：环每趟只是一次微任务，预算 N 就是烧 N 次同步开销——单看一次导航
+ *   N=12 和 N=1000 都不卡人，真正的差别在**测试**：环一旦能被预算掐断，vitest 就会在几秒内
+ *   拿到一条断言失败（本模块单测实测 <3s），而不是像改造前那样微任务饥饿吃掉 testTimeout、
+ *   200 秒零输出 exit 124。所以「有限」比「具体多大」重要，但 12 已经足够贴近「正常链条的 3 倍」
+ *   这个既不误伤、又一眼能读懂的刻度。
+ * - **必须是有限数**：Infinity 会让 spec 里那个 `while (budget.notePass())` 白名单式的循环
+ *   永远转下去——「默认值退化成无界」本身就是一种挂死，与本模块要消灭的失败模式同源。
+ */
+export const REDIRECT_BUDGET_DEFAULT_LIMIT = 12;
+
+/** `createRedirectBudget` 的返回值（守卫只用到这三个成员，故不导出更多表面积）。 */
+export interface RedirectBudget {
+  /**
+   * 记一趟「守卫被进来」。**返回 true = 预算内，正常继续本次导航；false = 已超预算**，
+   * 调用方必须终止本次导航（`return false`）并 `reset()`，绝不能再返回一个重定向目标
+   * ——那正是把「红」变成「挂死」的地方。超预算后恒为 false（直到 `reset()`）。
+   */
+  notePass(): boolean;
+  /** 归零：导航落地（`router.afterEach`）/ 出错（`router.onError`）时调用，保证正常多次跳转不被误熔断。 */
+  reset(): void;
+  /** 当前已用趟数（只读观测口，给断言与调试用；恒 ≤ 预算）。 */
+  readonly used: number;
+}
+
+/**
+ * #255 守卫重定向链条的**熔断器**：把「守卫 A→B→A 的环」从挂死变成可终止。
+ *
+ * 为什么需要它（vue-router 自带的检测不够用）：它的无限重定向保护只认「目标与当前路由相同」的
+ * **自环**，认不出 `/login → / → /change-password → /` 这种**多节点环**——环跑在微任务里，
+ * testTimeout / Promise.race+setTimeout 全被饥饿吃掉，实测 200 秒零输出（exit 124）。
+ * 于是这里自己数趟数：超预算 ⇒ 守卫返回 `false` 掐断链条 ⇒ 测试几秒内变红、线上停在原地留一条 warn。
+ *
+ * 形状（与 `forcePasswordGuard.spec.ts` 的三条用例逐字对齐）：预算内连续 `notePass()` 恒 true，
+ * 越过预算后恒 false；`reset()` 后 `used === 0` 且可继续使用；缺省参数用 {@link REDIRECT_BUDGET_DEFAULT_LIMIT}。
+ *
+ * @param limit 允许的趟数上限；缺省 12（理由见 REDIRECT_BUDGET_DEFAULT_LIMIT）。传入非有限数或负数
+ *              同样退回缺省值——**故意不接受 Infinity/NaN**：那等于没有熔断，而「以为有熔断」比
+ *              「没有熔断」更难排查。`0` 是合法值（一趟都不许过，用于「守卫直接拒绝一切导航」的测试）。
+ */
+export function createRedirectBudget(limit: number = REDIRECT_BUDGET_DEFAULT_LIMIT): RedirectBudget {
+  const maxBudget = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : REDIRECT_BUDGET_DEFAULT_LIMIT;
+  let used = 0;
+  return {
+    notePass(): boolean {
+      // 先判后加 ⇒ used 恒 ≤ maxBudget，且超限后不再累加（超预算的趟数已经不再产生副作用）。
+      if (used >= maxBudget) return false;
+      used += 1;
+      return true;
+    },
+    reset(): void {
+      used = 0;
+    },
+    get used(): number {
+      return used;
+    },
+  };
+}
