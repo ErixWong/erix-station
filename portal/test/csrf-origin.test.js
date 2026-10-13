@@ -37,20 +37,80 @@ test('#234 判据 a：Sec-Fetch-Site=cross-site / cross-origin 一律拒（fail-
   }
 });
 
-test('#234 判据 b：Sec-Fetch-Site=same-origin / same-site 放行（即使 Origin 缺失或畸形）', () => {
-  for (const sfs of ['same-origin', 'same-site', 'SAME-ORIGIN']) {
+test('#234 判据 b：Sec-Fetch-Site=same-origin 放行（即使 Origin 缺失或畸形）', () => {
+  // 返修（#234）后本判据**只认 `same-origin`**（真同源）；`same-site` 见下面那条新回归门。
+  for (const sfs of ['same-origin', 'SAME-ORIGIN', ' same-origin ']) {
     assert.equal(checkSameOrigin({ method: 'POST', secFetchSiteHeader: sfs, hostHeader: DEV_HOST }).allow, true);
     // 无 Origin（Safari 旧版、部分隐私模式）⇒ 判据 b 已定论，不进 Origin 判据
     assert.equal(
       checkSameOrigin({ method: 'PUT', secFetchSiteHeader: sfs, hostHeader: DEV_HOST }).verdict,
-      'same_site',
+      'same_origin',
     );
     // Origin 畸形也不影响：b 在 c 之前定论
     assert.equal(
       checkSameOrigin({ method: 'PATCH', secFetchSiteHeader: sfs, originHeader: 'http://a b', hostHeader: DEV_HOST }).allow,
       true,
     );
+    // 真同源时 Origin 与本入口不等也不拒（代理改写 Host 的形态归 SFS 说了算）
+    assert.equal(
+      checkSameOrigin({ method: 'POST', secFetchSiteHeader: sfs, originHeader: 'https://evil.example', hostHeader: DEV_HOST }).allow,
+      true,
+    );
   }
+});
+
+// 返修单的**核心回归门**（主 agent 亲审发现的缺陷）：`same-site` 不得直接放行。
+// 本站的真实形状：portal 在 `station.fde.erix.vip`、预览在 `eric-p-22000.fde.erix.vip` ⇒ 同注册域 `erix.vip`、
+// 不同 origin ⇒ 浏览器给预览页的 XHR 正好发 `Sec-Fetch-Site: same-site`；而 cookie 是 host-only + `SameSite=Lax`
+// （portal.md §2.5，Lax 也按注册域判）⇒ cookie 照样携带、写副作用真实发生 = 真 CSRF（见 portal.md §2.11）。
+// 本例同时是原「判据 b：same-site 直接放行」那批断言按新口径改写后的去处（三种结局全在一条里）。
+test('#234 回归门（返修）：same-site 不再直接放行，而是落 Origin 比对（预览 host ⇒ 拒 / 相等 ⇒ 放行 / 缺失 ⇒ 落 d）', () => {
+  const r = checkSameOrigin({
+    method: 'POST',
+    secFetchSiteHeader: 'same-site',
+    originHeader: 'http://eric-p-22000.fde.erix.vip',
+    hostHeader: DEV_HOST,
+  });
+  assert.equal(r.allow, false, '同注册域但不同 origin ⇒ 必须拒（旧写法在这里会直接放行，防线失效）');
+  assert.equal(r.verdict, 'origin_mismatch');
+  assert.deepEqual(r.details, {
+    origin: 'http://eric-p-22000.fde.erix.vip', sec_fetch_site: 'same-site', method: 'POST',
+  });
+  // 同一个预览 host 对第二个入口（IP 形态）也是 same-site 吗？不重要：这里只钉 Origin 比对的结论
+  assert.equal(
+    checkSameOrigin({
+      method: 'DELETE',
+      secFetchSiteHeader: 'same-site',
+      originHeader: 'https://eric-p-22000.fde.erix.vip:8443',
+      hostHeader: DEV_HOST,
+    }).verdict,
+    'origin_mismatch',
+    '同站 token 不得洗白端口差异（端口是 origin 的一部分）',
+  );
+  // 畸形 Origin 也不再被同站 token 洗白（返修前：b 在 c 前定论 ⇒ 这例是 allow）
+  assert.equal(
+    checkSameOrigin({
+      method: 'POST', secFetchSiteHeader: 'same-site', originHeader: 'http://a b', hostHeader: DEV_HOST,
+    }).verdict,
+    'malformed_origin',
+  );
+  // 结局二：Origin 确实等于请求自身 authority ⇒ 放行（不因 SFS 写着 same-site 就额外拒，不新造严格性）
+  const match = checkSameOrigin({
+    method: 'POST', secFetchSiteHeader: 'same-site', originHeader: DEV_ORIGIN, hostHeader: DEV_HOST,
+  });
+  assert.equal(match.allow, true);
+  assert.equal(match.verdict, 'origin_match');
+  // 结局三：same-site 且 Origin 缺失 ⇒ 落 d 放行（与返修前口径一致，不新造严格性）
+  const noOrigin = checkSameOrigin({ method: 'POST', secFetchSiteHeader: 'same-site', hostHeader: DEV_HOST });
+  assert.equal(noOrigin.allow, true);
+  assert.equal(noOrigin.verdict, 'no_evidence');
+  // 跳站 token 仍优先（a 先于 b/c）
+  assert.equal(
+    checkSameOrigin({
+      method: 'POST', secFetchSiteHeader: 'same-site, cross-site', originHeader: DEV_ORIGIN, hostHeader: DEV_HOST,
+    }).verdict,
+    'cross_site',
+  );
 });
 
 test('#234 判据 c：Origin 的 authority 与请求自身 authority 比对（相等放行、不等拒）', () => {
@@ -456,6 +516,65 @@ test('#234 用例②/③/④/⑤：同源 200 / 无 Origin 放行 / cross-site �
     assert.equal(crossTotp.status, 403);
     assert.equal((await crossTotp.json()).error.code, 'cross_origin_forbidden');
     assert.equal(csrfDenials(s.pool).length, 2);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#234 用例⑤b（返修回归门，HTTP 层）：预览 host 的页面带 same-site 写 portal API ⇒ 403 cross_origin_forbidden', async () => {
+  // 与纯判据那条同形状：`Sec-Fetch-Site: same-site` + Origin = 预览 host + 请求自身 authority = portal 入口。
+  // 这边走**带 session cookie** 的写请求（本站真实威胁：同注册域 ⇒ Lax 不挡 ⇒ cookie 真会被带上），
+  // 并钉「拒一定发生在副作用之前」。
+  const password = 'correct horse battery staple';
+  const s = await startServer({
+    users: [{
+      id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice',
+      auth_source: 'local', status: 'active', password_hash: await auth.hashPassword(password),
+      totp_secret: null, last_totp_step: null,
+    }],
+  });
+  const previewToken = 'csrf-preview-token';
+  s.pool.sessions.push({
+    id: 'csrf-preview-session', user_id: 'u1', token_hash: auth.hashToken(previewToken),
+    created_at: new Date(), expires_at: new Date(Date.now() + 3_600_000), last_seen_at: new Date(), revoked_at: null,
+  });
+  try {
+    const previewHeaders = {
+      'x-forwarded-host': DEV_HOST,
+      origin: 'http://eric-p-22000.fde.erix.vip',
+      'sec-fetch-site': 'same-site',
+    };
+    // 带 cookie 的登出：预览 host 的页面发得出去（cookie 会跟着走），但必须被拦在 handler 之前
+    const logout = await fetch(`${s.base}/api/auth/logout`, {
+      method: 'POST',
+      headers: { cookie: `${s.config.cookie.name}=${previewToken}`, ...previewHeaders },
+    });
+    assert.equal(logout.status, 403, '同注册域但不同 origin ⇒ 真 CSRF，不得因为 SFS 写着 same-site 就放行');
+    const body = await logout.json();
+    assert.equal(body.error.code, 'cross_origin_forbidden');
+    assert.equal(body.error.retryable, false);
+    assert.deepEqual(body.error.details, {
+      origin: 'http://eric-p-22000.fde.erix.vip', sec_fetch_site: 'same-site', method: 'POST',
+    });
+    assert.equal(s.pool.sessions[0].revoked_at, null, '拒必须发生在副作用之前（会话没被登出）');
+    assert.equal(csrfDenials(s.pool).length, 1);
+    assert.equal(csrfDenials(s.pool)[0].action, 'auth.csrf_denied');
+    // 登录端点同形状（登录 CSRF：预览 host 的页面能把用户种成自己的会话）
+    const crossLogin = await loginWithPassword(s, { extra: previewHeaders });
+    assert.equal(crossLogin.status, 403);
+    assert.equal((await crossLogin.json()).error.code, 'cross_origin_forbidden');
+    assert.equal(csrfDenials(s.pool).length, 2);
+    // 对照一：same-site 且 Origin 确实等于请求自身 authority ⇒ 仍放行（不新造严格性）
+    const allowed = await loginWithPassword(s, {
+      extra: { 'x-forwarded-host': DEV_HOST, origin: DEV_ORIGIN, 'sec-fetch-site': 'same-site' },
+    });
+    assert.equal(allowed.status, 200, 'Origin 比对过了就不得多拒');
+    // 对照二：same-site 且无 Origin ⇒ 落判据 d 放行（返修后口径，与返修前一致）
+    const sameSiteNoOrigin = await loginWithPassword(s, {
+      extra: { 'x-forwarded-host': DEV_HOST, 'sec-fetch-site': 'same-site' },
+    });
+    assert.equal(sameSiteNoOrigin.status, 200);
+    assert.equal(csrfDenials(s.pool).length, 2, '两笔放行不得写审计');
   } finally {
     await s.close();
   }

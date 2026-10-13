@@ -192,9 +192,17 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  *
  * 判据（按顺序，任一命中即定论）：
  *  a. `Sec-Fetch-Site` 为 `cross-site`/`cross-origin` ⇒ **拒**（fail-closed 优先，即使 Origin 缺失或看起来同源）；
- *  b. `same-origin`/`same-site` ⇒ **放行**；
+ *  b. `same-origin` ⇒ **放行**（真同源，即使 Origin 缺失或畸形）；
  *  c. 否则有 `Origin` ⇒ **只比 authority**（host[:port]）与请求自身的 authority；
  *  d. 两者都没有（curl / CLI / 容器内脚本）⇒ **放行**。
+ *
+ * **`same-site` 不直接放行**（#234 返修，2026-10-13 主 agent 亲审发现）：`Sec-Fetch-Site: same-site` 的规范语义是
+ * 「同注册域、不同 origin」，而本站恰好**整站坐在同一个注册域 `erix.vip` 下**（portal 在 `station.fde.erix.vip`、
+ * FDE 预览在 `eric-p-22000.fde.erix.vip`），且 session cookie 是 **host-only + `SameSite=Lax`**（portal.md §2.5）——
+ * `SameSite` 判的同样是注册域 ⇒ 预览 host 的 XHR **照样带上 portal 的会话 cookie**（Lax 不挡同站），CORS 只让它
+ * 读不到响应、**写副作用已经发生** = 教科书意义上的 CSRF。这正是本站最现实的攻击面（预览 host 上跑的、agent 写的
+ * 应用去 POST portal API），所以 `same-site` 必须落到判据 c 的 Origin authority 精确比对（同注册域但不同 origin
+ * ⇒ 不等 ⇒ 拒 `origin_mismatch`）。`same-site` 且 Origin 缺失 ⇒ 落 d 放行（与既有口径一致，不新造严格性）。
  *
  * **只比 authority、不比 scheme**（契约点）：本部署处在 http（dev `:8090` / `100.100.0.3:8090`）与
  * https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；
@@ -205,7 +213,7 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  * 多值 / 含空白或 CR-LF / 带路径）与「有 Origin 但没有可比对的 Host」一律拒。
  *
  * @returns {{allow: boolean, verdict: string, details?: {origin: string|null, sec_fetch_site: string|null, method: string}}}
- *          verdict：`exempt` | `read_method` | `same_site` | `origin_match` | `no_evidence`（放行）／
+ *          verdict：`exempt` | `read_method` | `same_origin` | `origin_match` | `no_evidence`（放行）／
  *          `cross_site` | `origin_mismatch` | `malformed_origin` | `malformed_request_authority` |
  *          `missing_request_authority`（拒绝）。
  */
@@ -229,10 +237,13 @@ export function checkSameOrigin({
   if (!CSRF_WRITE_METHODS.has(httpMethod)) return { allow: true, verdict: 'read_method' };
 
   // a. 显式跳站 ⇒ 拒（先看 SFS：它是浏览器给的、不可伪造，优先于可被代理改写的 Origin）。
+  //    `cross-origin` 是**防御性值**：它不是 `Sec-Fetch-Site` 的合法取值（规范只有 same-origin / same-site /
+  //    cross-site / none 四个），多接一个不存在的值不会漏、方向仍是 fail-closed，别误以为我们漏了个规范值。
   if (sfsTokens.some((token) => token === 'cross-site' || token === 'cross-origin')) return deny('cross_site');
-  // b. 显式同源/同站 ⇒ 放行（即使 Origin 缺失或畸形）。
-  if (sfsTokens.some((token) => token === 'same-origin' || token === 'same-site')) {
-    return { allow: true, verdict: 'same_site', details };
+  // b. 显式**同源** ⇒ 放行（即使 Origin 缺失或畸形）。`same-site` **不在这里**——同注册域不同 origin 就是本站
+  //    最现实的 CSRF 形状（预览 host → portal API，host-only + Lax cookie 照样携带），必须落到 c 比 authority。
+  if (sfsTokens.some((token) => token === 'same-origin')) {
+    return { allow: true, verdict: 'same_origin', details };
   }
 
   // c. 有 Origin ⇒ 只比 authority。
