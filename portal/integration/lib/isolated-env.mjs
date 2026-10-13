@@ -347,3 +347,54 @@ export function writeDynamicStub(dynamicDir) {
   fs.writeFileSync(target, 'http: {}\n');
   return { file: target, created: true };
 }
+
+/**
+ * 隔离栈的 `IPAM_RESERVED_SUBNETS` 派生本体（#268 M2：从 wp3b 的 deriveIsolationEnv() 提出来，
+ * wp3b/wp3a 共用；扫描行为与原实现逐字等价，「是否隔离模式 / 是否已显式传」的开关留给调用方）。
+ *
+ * 为什么要派生：portal 的 IPAM 池**硬编码**（portal/src/ipam.js:12-15，10.200.0.0/16，**非 env 可配**），
+ * 隔离栈 DB 是空的 → 会从池头分配 10.200.0.0/29，与共享栈已占段**重叠**（实测 403 Pool overlaps）；
+ * 故把**其他栈已用的 fde-* 网络子网**（排除本栈自己的 `ownFdeNetwork`）列进保留段。
+ *
+ * @param {object} opts
+ * @param {(args: string) => string} opts.docker 该脚本的 docker 执行器（只读 network ls/inspect）
+ * @param {string} opts.ownFdeNetwork 本栈自己的 fde 网络名（`fde-<FDE_NAME>`，扫描时排除）
+ * @param {Record<string, string>} [opts.baseEnv] 要并入的基础 env（通常是 composeDomainEnv() 的产物；
+ *   不需要就缺省 {}，此时返回值只含派生出的 IPAM_RESERVED_SUBNETS）
+ * @param {boolean} [opts.skipIpamReserved] true = 不扫描不注入（调用方已显式传 IPAM_RESERVED_SUBNETS 的语义）
+ * @returns {Record<string, string>} baseEnv 副本（+ 派生出的 IPAM_RESERVED_SUBNETS，若扫到）
+ */
+export function deriveIsolationComposeEnv({ docker, ownFdeNetwork, baseEnv = {}, skipIpamReserved = false }) {
+  assert.ok(typeof docker === 'function', 'deriveIsolationComposeEnv: docker executor is required');
+  assert.ok(ownFdeNetwork, 'deriveIsolationComposeEnv: ownFdeNetwork is required');
+  const out = { ...baseEnv };
+  if (skipIpamReserved) return out;
+  const safe = (fn) => { try { return fn(); } catch { return null; } };
+  const names = (safe(() => docker('network ls --format {{.Name}}')) || '')
+    .split('\n').map((s) => s.trim())
+    .filter((n) => n.startsWith('fde-') && n !== ownFdeNetwork);
+  const subnets = [...new Set(names.map((n) => safe(() => {
+    // format 含空格，必须单引号包裹（docker() 把整条命令包进 sg docker -c "..."，
+    // 内层 sh 会对未引用的 {{json .IPAM.Config}} 做词拆分 → Go 模板 unclosed action）。
+    const cfg = JSON.parse(docker(`network inspect ${n} --format '{{json .IPAM.Config}}'`));
+    return cfg?.[0]?.Subnet || null;
+  })).filter(Boolean))];
+  if (subnets.length > 0) out.IPAM_RESERVED_SUBNETS = subnets.join(',');
+  return out;
+}
+
+/**
+ * 惰性求值 + 记忆化（#268 M2，原 wp3b 的 isolationEnvCache 形态）：派生要查 docker，
+ * 每次 compose() 都重跑太贵；首次调用算一次，之后永远返回同一结果。
+ *
+ * @param {() => unknown} fn 被记忆化的零参函数
+ * @returns {() => unknown}
+ */
+export function memoizeOnce(fn) {
+  assert.ok(typeof fn === 'function', 'memoizeOnce: function is required');
+  let cache;
+  return () => {
+    if (cache === undefined) cache = fn();
+    return cache;
+  };
+}
