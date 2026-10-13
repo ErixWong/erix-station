@@ -27,7 +27,7 @@
 2. （步骤 ①′）**运行身份诊断**：`id -u` / `id -g` / `id` / `uname -a`（无 `continue-on-error`、无 `if: always()`）。
    为什么要这一步：属主类断言的成败完全取决于 runner 进程的 uid/gid（见 §8 第 1 条），
    有这四行就不用再猜「今天的 runner 是谁」。
-3. （步骤 ②）根 `npm ci` + `npm test` → **1022 项 / 1021 通过 / 0 失败 / 1 跳过**（基线，2026-10-13 本机复现；`#277-A`+`#277-A2` 被停止的 queued run 直接终态 **+17**，全在新文件 `portal/test/session-stop-queued.test.js`：第一步 queued→finished/aborted+出队+会话解锁 9 项，A2 的「已领走未写 running 落 cancelling」守卫 4 项与「同事务合成 `run_end`」4 项（含重复停止只一条、与 runs 终态同事务的源码级断言）；`#255` 强制首登改密后端片 **+29**：新文件 `portal/test/must-change-password.test.js` 28 项（迁移语义 / 代设口令置旗标 / `POST /api/me/password` / 受限会话门与 9 条放行清单 / 登录响应 `password_change_required` / 文档防漂移）+ `portal/test/migrations.test.js` 0021 断言 1 项；`#275` 预览 released 历史行遮蔽活行的 **+7**，全在 `portal/test/preview.test.js`：同 hostname 遮蔽回归 2 + 契约锁 3（只有 released 行仍 403 / `released_at` 同值靠 `id` 成全序 / 查不到 404）+ fake 自证部分唯一索引 1 + 源码级护栏 1；
+3. （步骤 ②）根 `npm ci` + `npm test` → **1031 项 / 1027 通过 / 0 失败 / 4 跳过**（基线，2026-10-14 本机复现；`#280` 迁移身份 **+9**：`portal/test/migrate-role.test.js` 6 条（`SET ROLE` 落点在 bootstrap 之后 / 已是该角色 ⇒ 一条角色语句都不发 / 成功与异常两条路径都 `RESET ROLE` 且早于 unlock 与 release / fail-fast 不静默跳过）+ 新文件 `portal/test/migrate-fresh-db.test.js` 3 条**真库**用例（空库→baseline→bootstrap→全部增量以超级用户跑通到 head、compose 形态幂等且零角色语句、无权限角色 fail-fast）——⚠ **这 3 条在无 `TEST_DATABASE_URL` 时整体 skip，所以跳过数从 1 变 4；本机实跑（一次性 postgres:16）为 3/3 绿**；`#277-A`+`#277-A2` 被停止的 queued run 直接终态 **+17**，全在新文件 `portal/test/session-stop-queued.test.js`：第一步 queued→finished/aborted+出队+会话解锁 9 项，A2 的「已领走未写 running 落 cancelling」守卫 4 项与「同事务合成 `run_end`」4 项（含重复停止只一条、与 runs 终态同事务的源码级断言）；`#255` 强制首登改密后端片 **+29**：新文件 `portal/test/must-change-password.test.js` 28 项（迁移语义 / 代设口令置旗标 / `POST /api/me/password` / 受限会话门与 9 条放行清单 / 登录响应 `password_change_required` / 文档防漂移）+ `portal/test/migrations.test.js` 0021 断言 1 项；`#275` 预览 released 历史行遮蔽活行的 **+7**，全在 `portal/test/preview.test.js`：同 hostname 遮蔽回归 2 + 契约锁 3（只有 released 行仍 403 / `released_at` 同值靠 `id` 成全序 / 查不到 404）+ fake 自证部分唯一索引 1 + 源码级护栏 1；
    原 945/944 基线上新增 `#234`（工单 `feat-261013-01`，跨站写请求防线 Origin / `Sec-Fetch-Site` 同源校验）的 **24 项**（同分支返修 +2，见下）：
    全部在新文件 `portal/test/csrf-origin.test.js`（13 项纯判据：`checkSameOrigin` / `csrfGateFor` 的 a/b/c/d 四支 +
    **返修回归门：`same-site` 不得直接放行、必落 Origin 比对** +
@@ -63,7 +63,7 @@
    再往前是 `#246 交付②` 预览端口列端点与管理员改块的 21 项（`portal/test/preview-ports.test.js`）、
    `#246` 交付① 预分配号池块的 15 项（`portal/test/portalloc.test.js` 与 `portal/test/{migrations,materializer}.test.js`）
    与 `#241` 预览预检与 deny CORS 的 7 条。
-   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **1022 里已含 runner 的 221 项**。
+   ⚠️ 根 `node --test` 的发现规则会把 `runner/test/*.test.js` 一起收进来 ⇒ **1031 里已含 runner 的 221 项**。
    ⚠️ 同一条发现规则（`**/test/**/*.js`）也会把 `portal/test/` 下的**非用例 helper**算成 1 项 ⇒ 净增用例数
    要按上面的拆解核对，别只看总数（实测：在 `portal/test/` 放一个空的 `x.js`，总数立刻 +1）。
 4. （步骤 ③）`cd runner && npm ci && node --test` → **221/221**（#261 新增 19 项 `runner/test/llm-timeouts.test.js`；
