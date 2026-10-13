@@ -40,6 +40,29 @@ export const en = {
     totpSubmit: 'Verify & sign in',
     backToLogin: '← Back to login',
   },
+  // #255 forced first-login password change (views/ForcePasswordChangeView.vue). Restricted session
+  // escape hatch (portal.md §2.11a). No hard-coded port/host; no promise about a minimum length
+  // rule the backend (§2.9.4) does not enforce yet.
+  forcePassword: {
+    title: 'Change your initial password first',
+    intro:
+      'An administrator set your password, so it has never passed through your own hands. Platform features stay locked until you set a new password.',
+    currentLabel: 'Current password',
+    newPasswordLabel: 'New password',
+    confirmPasswordLabel: 'Confirm new password',
+    submit: 'Change password',
+    submitting: 'Changing…',
+    mismatch: 'The two new passwords do not match',
+    incomplete: 'Enter your current password and a new password',
+    // Interim failure surface (①): render the server error.code / error.message verbatim as strings.
+    // The full error-code → copy table lands in the follow-up ticket; no local code table here.
+    serverError: 'Change failed ({code}): {message}',
+    genericError: 'Change failed: {message}',
+    // Session semantics (§2.6a): self-service change keeps the current session and revokes the
+    // others ⇒ never say "you have to sign in again".
+    sessionHint: 'This sign-in stays valid; your sessions elsewhere are revoked.',
+    logout: 'Use another account / sign out',
+  },
   workbench: {
     nav: '☰ Navigation',
     openNavigation: 'Open navigation',

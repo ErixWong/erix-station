@@ -55,6 +55,27 @@ export const zhCN = {
     totpSubmit: '验证并登录',
     backToLogin: '← 返回重新登录',
   },
+  // #255 首登强制改密（views/ForcePasswordChangeView.vue）：受限会话（portal.md §2.11a）的唯一出口界面文案。
+  // 约束：不硬编码端口/域名（部署形态可变、docs/api/portal.md §2.5 cookie 口径与 host 无关），
+  // 也不承诺口令最小长度（后端 §2.9.4 现状无该规则，前端不得先于后端承诺）。
+  forcePassword: {
+    title: '请先修改初始口令',
+    intro: '你的口令由管理员代为设置，还没经过你本人之手。改好新口令之前，平台功能保持锁定。',
+    currentLabel: '当前口令',
+    newPasswordLabel: '新口令',
+    confirmPasswordLabel: '确认新口令',
+    submit: '修改口令',
+    submitting: '修改中…',
+    mismatch: '两次输入的新口令不一致',
+    incomplete: '请填写当前口令和新口令',
+    // 失败态兜底（① 的口径）：把服务端 error.code / error.message 原样渲染成字符串；
+    // 完整的「错误码 → 文案」映射表留给下一张单，此处不做本地码表翻译。
+    serverError: '修改失败（{code}）：{message}',
+    genericError: '修改失败：{message}',
+    // 会话语义（§2.6a）：自助改密保留当前会话、只吊销其它会话 ⇒ 不要写成「需要重新登录」。
+    sessionHint: '改密后本次登录继续有效，你在别处登录的会话会失效。',
+    logout: '换个账号 / 退出登录',
+  },
   // 工作台壳（views/WorkbenchView.vue 顶栏 + workbench store 的展示文案/通知）
   workbench: {
     nav: '☰ 导航',
