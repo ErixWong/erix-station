@@ -72,7 +72,11 @@ beforeAll(() => {
   ).toBe(true);
   process.on('unhandledRejection', onUnhandledRejection);
 });
-afterAll(() => {
+afterAll(async () => {
+  // 文件收尾再兜一层：最后一条用例的 afterEach 之后才飘出来的拒绝也算红（否则又得靠机器快慢）。
+  await closeApps();
+  const stragglers = leakedRejections.splice(0);
+  expect(stragglers.map(describeRejection), '文件收尾：仍有未捕获拒绝飘在本文件里').toEqual([]);
   process.off('unhandledRejection', onUnhandledRejection);
 });
 
