@@ -148,7 +148,9 @@ const CSRF_ORIGIN_PARTS_RE = new RegExp(
 /** 小写 + 剥掉**与该 scheme 相同**的默认端口（http:80 / https:443）；非默认端口（dev `:8090`）原样留。 */
 function normalizeCsrfAuthority(authority, scheme) {
   let value = String(authority).toLowerCase();
-  const def = CSRF_DEFAULT_PORTS[scheme];
+  // hasOwn 而非直取：scheme 是调用方给的，`constructor://x:9990` 这类野值不能让原型链上的 'function'
+  // 充成默认端口表项（它不是端口，拼进正则会把 9990 之外的东西当端口剥）。
+  const def = Object.hasOwn(CSRF_DEFAULT_PORTS, scheme) ? CSRF_DEFAULT_PORTS[scheme] : null;
   if (def) value = value.replace(new RegExp(`:${def}$`), '');
   return value;
 }
@@ -216,8 +218,10 @@ export function checkSameOrigin({
 } = {}) {
   const httpMethod = typeof method === 'string' ? method.toUpperCase() : '';
   const origin = originHeader == null ? null : String(originHeader);
-  // 已知四个 token 走精确小写比对；其余（含多值、拼错的）一律当「无结论」，落到 Origin 判据。
+  // 已知四个 token 走精确小写比对；其余（拼错的、`none`）一律当「无结论」，落到 Origin 判据。
+  // 多值（重复 SFS 头被 Node 拼成 `a, b`）按 token 展开：跳站 token 只要出现过就算跨站（fail-closed）。
   const secFetchSite = secFetchSiteHeader == null ? null : String(secFetchSiteHeader).trim().toLowerCase();
+  const sfsTokens = secFetchSite === null ? [] : secFetchSite.split(',').map((token) => token.trim());
   const details = { origin, sec_fetch_site: secFetchSite, method: httpMethod };
   const deny = (verdict) => ({ allow: false, verdict, details });
 
@@ -225,9 +229,11 @@ export function checkSameOrigin({
   if (!CSRF_WRITE_METHODS.has(httpMethod)) return { allow: true, verdict: 'read_method' };
 
   // a. 显式跳站 ⇒ 拒（先看 SFS：它是浏览器给的、不可伪造，优先于可被代理改写的 Origin）。
-  if (secFetchSite === 'cross-site' || secFetchSite === 'cross-origin') return deny('cross_site');
+  if (sfsTokens.some((token) => token === 'cross-site' || token === 'cross-origin')) return deny('cross_site');
   // b. 显式同源/同站 ⇒ 放行（即使 Origin 缺失或畸形）。
-  if (secFetchSite === 'same-origin' || secFetchSite === 'same-site') return { allow: true, verdict: 'same_site', details };
+  if (sfsTokens.some((token) => token === 'same-origin' || token === 'same-site')) {
+    return { allow: true, verdict: 'same_site', details };
+  }
 
   // c. 有 Origin ⇒ 只比 authority。
   if (origin !== null && origin.trim() !== '') {

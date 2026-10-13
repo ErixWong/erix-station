@@ -90,7 +90,7 @@ jobs:
           echo "id    = $(id)"
           echo "uname = $(uname -a)"
 
-      # ---- ② 根单测：node --test（945 项基线 = 944 通过 + 1 跳过，含 runner/test 的 221 项；#261 起 +19（runner LLM 三相超时），#257+#258 起 +6，拆解见 ci-release.md §1）----
+      # ---- ② 根单测：node --test（967 项基线 = 966 通过 + 1 跳过，含 runner/test 的 221 项；#234 起 +22（portal/test/csrf-origin.test.js，跳站写请求防线），#261 起 +19（runner LLM 三相超时），#257+#258 起 +6，拆解见 ci-release.md §1）----
       - name: '② 根 npm ci + npm test'
         run: |
           npm ci --no-audit --no-fund
