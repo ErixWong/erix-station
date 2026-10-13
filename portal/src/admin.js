@@ -218,13 +218,20 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
 
   const passwordHash = await auth.hashPassword(password); // 与 bootstrap-admin 同口径（scrypt 自描述）
   const totpSecret = totp_enabled === true ? totp.generateSecret(20) : null;
+  // #255（首登强制改密）：**两条分支都写 must_change_password = true**，且写成 SQL 字面量而不是参数
+  //（这条语句永远代表「管理员代设初始口令」，不该由调用方选择要不要置）。新建与「同名 disabled 行
+  // 重新激活」是同一个场景：两条都往 password_hash 里塞了一个**别人知道**的口令，差别只在是否复用旧行
+  // ⇒ 只治新建会漏掉「离职回来重新开户」那条路。
+  // ⚠ 与 `cli.js bootstrap-admin` 的**不对称是刻意的**：bootstrap 的 INSERT 不写这一列（吃 DEFAULT false），
+  //    否则 dev/CI 的 bootstrap 账号会一登录就被锁进改密屏（AGENTS §4.1）。默认值契约由迁移 0021 的守卫钉住。
   let r;
   try {
     if (existing) {
       r = await pool.query(
         `UPDATE users
             SET login = $2, email = $3, display_name = $4, password_hash = $5,
-                totp_secret = $6, last_totp_step = NULL, status = 'active', disabled_at = NULL
+                totp_secret = $6, last_totp_step = NULL, status = 'active', disabled_at = NULL,
+                must_change_password = true
           WHERE id = $1 AND status = 'disabled'
           RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
                     (totp_secret IS NOT NULL) AS totp_enabled`,
@@ -248,8 +255,8 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
       );
     } else {
       r = await pool.query(
-        `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)
-         VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6)
+        `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name, must_change_password)
+         VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6, true)
          RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
                    (totp_secret IS NOT NULL) AS totp_enabled`,
         [
@@ -508,7 +515,12 @@ export async function deleteUser(pool, { actorId, userId, config, log = console 
   return { ok: true };
 }
 
-/** 重置口令并吊销全部现存登录会话。 */
+/**
+ * 重置口令并吊销全部现存登录会话。
+ * #255：同时置 `must_change_password = true`——管理员重置的口令是「管理员选一个、转告本人」的，
+ * 不经过本人之手 ⇒ 重置后仍欠一次改密（清旗标的唯一出口是 `POST /api/me/password`，portal.md §2.6a）。
+ * 对照：同文件的 `enrollUserTotp`/`resetUserTotp` 不动口令 ⇒ 不置旗标。
+ */
 export async function resetUserPassword(pool, userId, password, { actorId = null, limits = {} } = {}) {
   validatePassword(password, limits);
   const existing = await pool.query(`SELECT id, login FROM users WHERE id = $1`, [userId]);
@@ -516,7 +528,7 @@ export async function resetUserPassword(pool, userId, password, { actorId = null
   const passwordHash = await auth.hashPassword(password);
   const result = await pool.query(
     `WITH target AS (
-       UPDATE users SET password_hash = $2 WHERE id = $1 RETURNING id, login
+       UPDATE users SET password_hash = $2, must_change_password = true WHERE id = $1 RETURNING id, login
      ), revoked AS (
        UPDATE login_sessions SET revoked_at = now()
         WHERE user_id = (SELECT id FROM target) AND revoked_at IS NULL
