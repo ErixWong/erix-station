@@ -7,7 +7,7 @@
 // ⇒ 实测 200 秒零输出被 timeout 杀掉（exit 124，零用例完成），CI 里白烧一整段预算。
 // 本文件**既不 import vue-router 也不 mount 组件** ⇒ 变异必须秒级变红，这条就是它的验收判据。
 import { describe, expect, it } from 'vitest';
-import { FORCE_PASSWORD_PATH, restrictedNavigationDecision } from './forcePasswordGuard';
+import { FORCE_PASSWORD_PATH, createRedirectBudget, restrictedNavigationDecision } from './forcePasswordGuard';
 import type { RestrictedNavigationInput } from './forcePasswordGuard';
 import type { AuthUser } from '../stores/auth';
 
@@ -99,5 +99,29 @@ describe('#255 受限态导航判据（函数级，不经过挂载）', () => {
       expect(restrictedNavigationDecision(restricted({ restricted: false, toPath: path })), path)
         .toEqual({ action: 'next' });
     }
+  });
+});
+
+describe('#255 守卫重定向链条的熔断器（失败模式必须是红，不是挂死）', () => {
+  it('预算内一路放行，超过预算立刻要求终止导航', () => {
+    const budget = createRedirectBudget(3);
+    expect([budget.notePass(), budget.notePass(), budget.notePass()]).toEqual([true, true, true]);
+    expect(budget.notePass()).toBe(false);
+    expect(budget.notePass()).toBe(false);
+  });
+
+  it('导航落地（afterEach）后归零：正常的多次跳转不会被误熔断', () => {
+    const budget = createRedirectBudget(2);
+    expect(budget.notePass() && budget.notePass()).toBe(true);
+    budget.reset();
+    expect(budget.used).toBe(0);
+    expect(budget.notePass()).toBe(true);
+  });
+
+  it('环的形状：连续 12 趟（远超正常链条的 3~4 趟）必然触发终止', () => {
+    const budget = createRedirectBudget();
+    let passes = 0;
+    while (budget.notePass()) passes += 1;
+    expect(passes).toBe(12);
   });
 });
