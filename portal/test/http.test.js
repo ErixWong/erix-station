@@ -126,7 +126,7 @@ class AdminCreateHttpPool extends FakePool {
       this.gitAccounts.push({ fde_id: params[0], git_host_id: params[1] });
       return { rows: [] };
     }
-    if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
+    if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name')) {
       const [login, email, displayName, passwordHash, totpSecret, fdeName] = params;
       this.createdTotpSecrets.push(totpSecret);
       const row = {

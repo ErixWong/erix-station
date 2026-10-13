@@ -160,6 +160,12 @@ async function bootstrapAdmin(values) {
     const passwordHash = await auth.hashPassword(password);
     const totpSecret = totp.generateSecret(20);
     const displayName = values['display-name'] || login;
+    // #255（首登强制改密）：这条 INSERT **故意不写 `must_change_password`** ⇒ 吃 DB 默认值 false。
+    // 理由：bootstrap-admin 是「运维自己给自己设第一个 admin」——口令就是这次 CLI 打印出来的那枚，
+    // 已经经过本人之手，再要求「首登改密」是空转；而 dev/CI 的 bootstrap 账号（AGENTS §4.1 的 admin/eric）
+    // 一旦被打上旗标就会被锁进改密屏，而本单不含前端界面 ⇒ 锁了没有出口，dev 栈与 CI 直接不可用。
+    // 对照：admin.js 的 createUser / resetUserPassword 两条分支都写 `must_change_password = true`
+    //（那里是「管理员代设」= 本单要治的场景）。默认值契约由迁移 0021 的 DO 守卫钉住。
     await pool.query(
       `INSERT INTO users (login, display_name, role, auth_source, status, password_hash, totp_secret)
        VALUES ($1, $2, 'admin', 'local', 'active', $3, $4)`,

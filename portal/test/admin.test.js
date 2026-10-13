@@ -12,6 +12,25 @@ import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
 
+/**
+ * #255 fake helper：`UPDATE ... SET ... must_change_password = <literal>` 里该列被赋成指定字面量吗？
+ * fake 必须**按 SQL 说的做**（AGENTS §8.14）：判定只从 SQL 文本读，不另写一套语义。
+ */
+function assignsMustChange(sql, literal) {
+  return new RegExp(`must_change_password\\s*=\\s*${literal}\\b`).test(sql);
+}
+
+/**
+ * #255 fake helper：INSERT 是否把 must_change_password 显式写成 true——
+ * 列清单里有这一列 **且** VALUES 段对应位是字面量 true。删列 ⇒ false（等价真库的 DEFAULT false）。
+ */
+function insertSetsMustChange(sql) {
+  const [columnsPart, valuesPart = ''] = sql.split(/VALUES/i);
+  const columns = columnsPart.slice(columnsPart.lastIndexOf('(') + 1);
+  if (!/must_change_password/.test(columns)) return false;
+  return /,\s*true\s*\)/.test(valuesPart);
+}
+
 const ADMIN = {
   id: 'a0000000-0000-4000-8000-000000000001', login: 'root', display_name: 'root',
   role: 'admin', fde_name: null, auth_source: 'local', status: 'active',
@@ -145,6 +164,8 @@ class AdminPool extends FakePool {
       Object.assign(user, {
         login, email, display_name: displayName, password_hash: passwordHash,
         totp_secret: totpSecret, last_totp_step: null, status: 'active', disabled_at: null,
+        // #255：重新激活也是「管理员代设口令」⇒ 与新建同口径置 true（按 SQL 文本判定，不另写一套谓词）。
+        must_change_password: assignsMustChange(sql, 'true'),
       });
       return {
         rows: [{
@@ -204,6 +225,9 @@ class AdminPool extends FakePool {
       const user = this.users.find((u) => u.id === params[0]);
       if (!user) return { rows: [] };
       if (sql.includes('password_hash')) user.password_hash = params[1];
+      // #255：旗标按 SQL 的字面量落（true = 管理员重置 / false = 本人自助改密），fake 不自己判。
+      if (assignsMustChange(sql, 'true')) user.must_change_password = true;
+      if (assignsMustChange(sql, 'false')) user.must_change_password = false;
       if (sql.includes('totp_secret = $2')) {
         user.totp_secret = params[1];
         user.last_totp_step = null;
@@ -300,7 +324,7 @@ class AdminPool extends FakePool {
     }
     if (sql.includes('DELETE FROM users')) assert.fail('user rows must never be deleted');
     // 建用户 INSERT（RETURNING 安全字段）
-    if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name)')) {
+    if (sql.includes('INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name')) {
       if (this.forceEmailConflict) {
         const error = new Error('duplicate email');
         error.code = '23505';
@@ -312,6 +336,9 @@ class AdminPool extends FakePool {
         id: `u-new-${this.nextUser}`, login: params[0], email: params[1], display_name: params[2],
         role: 'fde', fde_name: params[5], auth_source: 'local', status: 'active',
         password_hash: params[3], totp_secret: params[4], created_at: new Date(),
+        // #255：旗标按 SQL 说的做——INSERT 的列清单里有这一列且 VALUES 对应位是 true 才置；
+        // 删掉列 ⇒ false（与真库 DEFAULT 一致），fake 不自己另写一套判定。
+        must_change_password: insertSetsMustChange(sql),
       };
       this.users.push(row);
       return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at, totp_enabled: row.totp_secret !== null }] };
