@@ -29,7 +29,8 @@
 | 认证 | `POST /api/auth/login` | 第一步：口令校验 |
 | 认证 | `POST /api/auth/login/totp` | 第二步：TOTP 校验，发 cookie |
 | 认证 | `POST /api/auth/logout` | 登出 |
-| 认证 | `GET /api/me` | 当前用户信息 |
+| 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password`，§2.6）|
+| 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
 | 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
 | 项目 | `POST /api/projects` | **已退役 `410 project_api_retired`**（目录即项目，§3.3） |
@@ -69,6 +70,8 @@
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
+> ⚠ **受限会话（#255，工单 `feat-261013-03`）**：`users.must_change_password = true`（口令由管理员代设/重置，还没经过本人之手）的会话，在改密前**只能**碰 §2.11a 的放行清单，其余本表端点一律 `403 password_change_required`（§1.2）。上表不因此改动：受限是「会话的状态」，不是端点的新属性。
+>
 > 容器 → portal 的内部端点（`/api/internal/*`）见 §9（经 Traefik：`https://station.<base>/api/internal/*` + 来源 ipAllowList，H-B 定稿 D-5），不属上表。
 
 ---
@@ -105,6 +108,7 @@
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 403 | `cross_origin_forbidden`（#234，工单 `feat-261013-01`）| **跨站写请求被同源防线拒**（`Sec-Fetch-Site: cross-site` / `Origin` 的 authority 与请求自身不同，**含同注册域的 `same-site`**）。**与 `forbidden` 的关键差别：这是「没资格发这个请求」而不是「没权限做这件事」**，且**未认证也可能拿到**（防线先于 cookie 校验）。`details` = `{origin, sec_fetch_site, method}`（**不含 cookie**）；响应带 #241 那套 CORS deny 头（ACAO/ACAC/Vary）。判据、豁免端点、语义变化见 §2.11 | 否 |
+| 403 | `password_change_required`（#255，工单 `feat-261013-03`）| **受限会话被拦**：已认证，但 `users.must_change_password=true` 且尚未改密 ⇒ 除 §2.11a 放行清单外的 `/api/*` 全部拒。**与 `forbidden` 的关键差别：不是「这件事你没权限」而是「这枚口令还没经过你的手」**；解法只有一个（`POST /api/me/password`），所以 `details` 直接给 `{action, endpoint}`。登录（新旧两条）、登出（新旧两条）、`GET /api/me`、`/api/me/password`、`/api/forward-auth`、`/api/internal/*` 不受限（逐条理由见 §2.11a）；**未认证的 401 语义不变**（门只管已认证的人）。**不写审计**（SPA 轮询会把它刷成噪声，理由见 §2.11a）| 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
 | 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2。**#246 交付② 同一码也用在新端点 `POST /api/admin/fdes/:fdeName/ports/block`**：管理员显式指定的块被外来活行占住、或搬迁中途插入数 ≠ 10（并发抢号 ⇒ 整笔回滚）——**那里 `retryable` 是 `false`**（盲试同一段必败，要先换一个起点），口径见 §4.7a） | 是（仅此码；**例外**：§4.7a 的改块 409 为 `false`） |
 | 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
@@ -175,16 +179,23 @@
 |---|---|
 | `pending_token` | 一次性、短期（默认 120s，`PENDING_TOKEN_TTL_SECONDS` 可配）有效的待决令牌，仅可用于 `/api/auth/login/totp`；服务端只存其 `sha256` |
 
+> 本响应**不带** `password_change_required`（#255）：`totp_required` 时尚未登录、不发 cookie，谈不上「受限会话」；这一位在第二步的成功响应里给（§2.3）。
+
 响应 `200`（**未注册 TOTP 的账号**：口令直通，**此时已登录**）：
 
 ```json
 {
   "status": "authenticated",
+  "password_change_required": true,
   "user": { "id": "u_alice", "login": "alice", "display_name": "Alice", "role": "fde", "fde_name": "alice" }
 }
 ```
 
 同时下发 session cookie（属性见 §2.5）；**无 `pending_token`**，无需（也无法）再调 `/api/auth/login/totp`。
+
+| 字段 | 说明 |
+|---|---|
+| `password_change_required`（#255，工单 `feat-261013-03`，纯 additive）| `true` ⇒ 本次下发的会话是**受限会话**（`users.must_change_password=true`：口令由管理员开户/重置时代设，还没经过本人之手），除 §2.11a 放行清单外的 `/api/*` 一律 `403 password_change_required`（§1.2）。**前端应在拿到 cookie 的那一刻就把用户弹到改密屏**，而不是先碰一个 403 再猜。`false` 也必须**出现**（恒为布尔，不靠缺省省掉）。两个**发会话**的分支都有（本分支与 §2.3 第二步）；`totp_required` 中间响应与所有失败响应（401）**都不带**——还没会话的人谈不上受限，发了反而泄露「这个账号欠一次改密」 |
 
 请求约束（S3）：`Content-Type` 必须为 `application/json`（否则 `400 validation_failed`）；`login` ≤ 128、`password` ≤ 256 字符（否则 `400 validation_failed`）；请求体超过上限（默认 64KiB，`Content-Length` 或流式字节）→ `413 payload_too_large`（标准错误信封）。
 
@@ -209,6 +220,7 @@
 
 ```json
 {
+  "password_change_required": true,
   "user": {
     "id": "u_alice",
     "login": "alice",
@@ -219,7 +231,7 @@
 }
 ```
 
-同时下发 session cookie（属性见 §2.5）。
+同时下发 session cookie（属性见 §2.5）。`password_change_required`（#255）与 §2.2 直通分支同一口径——**第二步才是本分支真正发会话的地方**，所以受限旗标必须在这里带出去（否则注册了 TOTP 的受限账号只能靠「第一个请求返 403」发现自己要改密）；`user` 的键集与 §2.2 逐字相同，**不因这次增字段而变**。
 
 错误：
 
@@ -271,7 +283,8 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
     "display_name": "Alice",
     "role": "fde",
     "fde_name": "alice",
-    "auth_source": "local"
+    "auth_source": "local",
+    "must_change_password": true
   }
 }
 ```
@@ -281,10 +294,58 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 | `role` | `fde` \| `admin`。P1 本地账号在本地表维护；OIDC 接入后来自 group claim（规格 §7.1，⚠️ 待决策者确认） |
 | `fde_name` | 该用户的 FDE 标识（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段），无容器时为 `null` |
 | `auth_source` | `local` \| `oidc`（P1 恒为 `local`） |
+| `must_change_password`（#255，纯 additive）| 当前会话是否**受限**（与 §2.2 登录响应的 `password_change_required` 同源同值，只是载体不同）。本端点在 §2.11a 的放行清单里，因此它是 **SPA 刷新后重建改密屏的唯一数据源**——挡住它，前端就只能看到一片 403 而不知道该把用户送去哪儿 |
+
+### 2.6a `POST /api/me/password`（#255：本人自助改密，受限会话的出口）
+
+受限会话（§2.11a）的唯一出口；但**不要求**先处于受限状态——任何已认证用户都能用它换口令。
+
+请求：
+
+```json
+{ "current_password": "管理员代设的那一枚", "new_password": "本人自己选的" }
+```
+
+响应 `200`：
+
+```json
+{ "ok": true, "password_change_required": false, "sessions_revoked": 1 }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `password_change_required` | 固定 `false`：改完即清 `users.must_change_password` ⇒ 受限门**当场解除**（无需重新登录）|
+| `sessions_revoked` | 本次被吊销的**其它**会话条数（口径见下「会话语义」）|
+
+**会话语义（与管理员重置的关键差别，本单最容易写错的一处）**：
+
+| 动作 | `users.must_change_password` | `login_sessions` |
+|---|---|---|
+| `POST /api/me/password`（本人，本节）| → `false` | **保留当前会话**（SQL 里写死 `id <> 当前会话`），只吊销该用户**其它**活跃会话 |
+| `POST /api/admin/users/:id/reset-password`（管理员，§12）| → `true` | **全量吊销**——管理员知道旧口令 ⇒ 不留任何旧会话 |
+
+照抄管理员那条的全量吊销会把人当场踢下线：旗标刚清却要重新登录，而门此时已经放行 ⇒ 用户只看到「登录又过期了」，体感是「改密失败」。反向照抄（管理员重置也保留当前会话）会把管理员自己那个「拿着旧口令的会话」留在场上，是更糟的方向。
+
+**实现口径**：验当前口令复用 `auth.verifyPassword`（校验 scrypt 自描述哈希的那把尺子，不再写第二套判据）；「换哈希 + 清旗标 + 吊销其它会话」在**单条 CTE 语句**里原子完成，不存在「哈希已换但会话没吊销」的中间态。
+
+错误（**不新造码**）：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 401 | `unauthorized` | 未登录 / 会话失效 |
+| 401 | `invalid_credentials` | `current_password` 不对（与登录失败同一个码：同一主体、同一凭据、同一失败原因；新造一个码只会多一条前端分支，并额外泄露「会话有效但口令错」这个此前不存在的事实）|
+| 400 | `validation_failed` | 新口令缺失 / 空 / 超上限，或**与当前口令相同**；一律带 `details.field`（`new_password` 或 `current_password`）|
+| 405 | `method_not_allowed` | 非 `POST`。本端点在 §2.11a 清单里**不限方法**，正是为了让这个 405 不被门改写成 403 |
+| 429 | `rate_limited` | 当前口令被连续猜错（复用登录限流器，key 前缀 `password:`，与 `login:` 命名空间互不污染；防「会话 cookie 被偷后爆破当前口令」），带 `Retry-After` |
+| 503 | `kdf_busy` | scrypt 并发闸满（一次请求跑两次 scrypt：验旧 + 铸新），带 `Retry-After` |
+
+其它口径：`Content-Type` 必须 `application/json`（否则 `400 validation_failed`）；形状校验在限流与 scrypt **之前**（畸形请求不消耗 KDF 配额）；口令策略沿用 §2.9.4 现状（**无最小长度**，本单不引入）。审计恰一条 `audit_log.action='user.password_changed'`（`actor_id` = 本人、`target` = login、`details` = `{login, self_service: true, sessions_revoked}`）：**口令明文与哈希绝不入库**；失败路径不写这条（否则爆破会把审计刷成噪声）。
 
 ### 2.7 `GET /api/forward-auth`（Traefik 回调，非浏览器 API）
 
 Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先调本端点（规格 §6.4）。**这是状态化授权：按「预览 token 的哈希」查 `preview_grants` 库，解析身份，再做 exposure 判定——不得解析 cookie 的 `sub`**（旧 `cookie.sub` 口径作废；session token 是不透明令牌，见 §2.5）。注意：**本端点不查 `login_sessions`**——portal 自身会话的哈希校验（登录态）才查 `login_sessions`，而 portal session cookie 是 host-only、不会到预览域（见下）。
+
+> **不受 #255 受限会话门管辖（必须放行，否则整片预览挂）**：本端点在 §2.11a 的放行清单里。两个独立理由：① `routes.js` 的 `authRequestHeaders` 白名单带 `Cookie`，浏览器侧的 cookie 会原样进这条回调——生产形态下进来的是 host-only 的**预览** cookie，而一旦 portal 与预览共享 cookie 作用域（同一 host 的部署形态、以及全部集成测试），进来的就是那枚**登录** cookie，门会看到一个看起来「已认证」的请求；② 它的语义是「这片预览该不该放行」，与「本人是否欠一次改密」毫无关系，被门挡成 `403 password_change_required` 时 **Traefik 只会把它当成一次认证失败** ⇒ 该用户名下 `*.fde.<base>` 的**全部**预览端口一起挂掉。另外本端点压根不查 `login_sessions`，门在它身上连可判的主体都没有。
 
 **预览访问分两种凭证（互斥，按优先级取其一）**：
 
@@ -482,8 +543,9 @@ station-portal user enable  --login <login>
 | 项 | 策略 |
 |---|---|
 | 口令哈希 | **argon2id**；参数（⚠️ 待决策者确认，倾向 OWASP 2026）：`m=19 MiB, t=2, p=1`；本地账号与 OIDC 账号分离（OIDC 无 `password_hash`） |
-| 口令强度 | 长度下限 **12**（⚠️ 待决策者确认）；不做复杂组合规则，但拒绝「与 login 相同 / 常见弱口令」；初始口令必须 `must_change`（首次登录强制改密） |
-| 口令重置 | `station-portal user set-password --login <login>`（admin 本地执行）：重置为新随机口令 + `must_change`，并**吊销该用户全部会话**（防旧会话续用）；不通过公开 API 暴露自助找回 |
+| 口令强度 | 长度下限 **12**（⚠️ 待决策者确认；**现状未实现**，`validatePassword` 只校验「非空 + ≤上限」，本单不引入最小长度——见 §2.6a）；不做复杂组合规则；自助改密要求**新口令不得与当前相同**（§2.6a）|
+| 首登强制改密（#255，工单 `feat-261013-03`）| **已实现**：`users.must_change_password`（迁移 `0021`，`NOT NULL DEFAULT false`）+ 受限会话门（§2.11a）+ 出口 `POST /api/me/password`（§2.6a）。置 `true` 的只有两条**代设**路径：`admin.createUser`（新建与同名 disabled 行重新激活**两条分支都置**）与 `admin.resetUserPassword`；**`cli.js bootstrap-admin` 故意不置**（它打印的那枚口令就是本人第一次看到的那一枚，再要求改密是空转，且会把 dev/CI 的 bootstrap 账号锁进改密屏——不对称的理由写在代码注释里，由测试钉住）。存量行不回填（吃 `DEFAULT false`）⇒ 升级不会把已部署环境全员锁死 |
+| 口令重置 | 管理员面 `POST /api/admin/users/:id/reset-password`（§12）：置 `must_change_password=true` 并**吊销该用户全部会话**（防旧会话续用）；CLI `station-portal user set-password --login <login>`（admin 本地执行）同口径。**自助**改密走 §2.6a（保留当前会话、只吊销其它会话），不通过公开 API 暴露「忘记密码找回」 |
 | TOTP | **强制**（规格 §7.1；现状对未注册账号不成立，见下注）：RFC 6238 `SHA-1 / 6 位 / 30s`，校验窗口 ±1 步 + 单码防重放（同 30s 窗口内同码只接受一次）；种子 base32，仅 bootstrap/`user create` 时下发 |
 | TOTP 重置 | `station-portal user reset-totp --login <login>`：重生成种子并输出 otpauth URI/二维码；**强制该用户重新走两步登录** |
 | 限流 | 登录爆破与 TOTP 连续失败走 §2.2/§2.3 的 `429 rate_limited`（`Retry-After`） |
@@ -548,6 +610,46 @@ station-portal user enable  --login <login>
 > ⚠ **语义变化（调用方需知；本单只做到源码级判定，真机浏览器验收另跑）**：原先在**预览 host 的页面里**用 `fetch(portal API, {credentials:'include'})` 的调用方，会被这道防线拒。完整链（返修后口径）：预览 host 与 portal **同注册域不同 origin** ⇒ 浏览器给 `Sec-Fetch-Site: same-site`，而 host-only + `SameSite=Lax` 的 cookie **仍会随请求发出**（Lax 按注册域判，不挡同站），所以它是真 CSRF 而不是「只是 CORS 读不到」⇒ 防线在判据 **c**（Origin authority 比对）把它拒掉（写副作用已发生才拒 = 没有这层就拦不住）。只有在**真跳注册域**（如 `https://evil.example`）时才会命中判据 a。口径：预览应用**本来就不该调 portal API**（#212/#263：portal cookie 在预览 host 会被边缘剥除，**读路径早就断了**），所以这不是回归。要读平台数据请经 portal 自己的页面/路由，或由平台侧下发。
 >
 > 残余风险（不属本单）：① `X-Forwarded-Host` 优先意味着**绕过 Traefik 直连 portal 端口**的客户端可以自选 XFH 来凑成同源（在 docker 网络内才能直连，与「攻击者必须能诱导用户浏览器发请求」的 CSRF 前提不叠）；② 防线只防跨站写请求，**不替代** SameSite 与登录限流；③ http 入口上的 CSRF 仍受「明文信道可被直接 MITM」限制，scheme 不参与判定不会削弱也不会加强这一点（§2.5）。
+
+
+### 2.11a 受限会话门（#255，工单 `feat-261013-03`：首登强制改密）
+
+**要治的是什么**：管理员开户与重置口令都是**代设**——那枚口令由 admin 生成、由 admin 转交，中间任何人（转交渠道、聊天记录、工单）都可能看到它。此前只要把它输进登录框，就能拿它把平台**全用完**，「请首次登录后改口令」在契约里只是一句愿望（§2.9.4 旧行）。本门把它变成机制：**这枚口令还没经过本人的手 ⇒ 除了改它，哪儿也去不了**。
+
+**判据**：会话有效（`login_sessions` 未吊销未过期、`users.status='active'`）且 `users.must_change_password = true` ⇒ 该会话**受限**。受限只改变「能碰哪些 `/api/*`」，不改变身份、不吊销会话、不影响预览（见放行清单最后一条）。
+
+**落点**：`portal/src/http.js` 的常量 `RESTRICTED_SESSION_ALLOWLIST` + 纯判据 `restrictedSessionAllows(method, pathname)`，在 `routeApi` 里**紧跟 #234 CSRF 门之后、分派到任何 handler 之前**执行（与 #234 同一层 ⇒ 拒绝一定发生在副作用之前）。**两道门不共用豁免表**：#234 看「这个请求有没有 CSRF 语义」，本清单看「改密之前必需不必需」，只是恰好有几条重叠。测试：`portal/test/must-change-password.test.js` 第 ③ 段。
+
+**放行清单**（与代码常量逐条一一对应，每条在代码里带 `reason`；用例逐条钉住「必需项一条不能少」）：
+
+| 方法 + 路径 | 为什么必须放行 |
+|---|---|
+| `GET /api/me` | 受限会话的唯一数据源：前端靠它拿「我是谁 + 为什么被弹去改密」（§2.6 的 `must_change_password`）。挡掉它 = SPA 只看见一片 403，不知道该把用户送去哪儿 |
+| `POST /api/me/password`（**不限方法**）| 受限状态的**唯一出口**（§2.6a），挡掉就是死锁。整条路径放行而不挑方法：非 `POST` 该由路由自己回 `405`，不能被门改写成 403——403 会让前端以为「连改密这条路也被锁了」 |
+| `POST /api/auth/logout` | 登出永远可达：不想改密的人至少能换账号/退出；挡住它会把人钉在一个自己进不去的会话里 |
+| `POST /api/auth/login`、`POST /api/auth/login/totp` | 登录两端点不得被挡（§2.2/§2.3）：第一步此刻还没有会话，本门对无会话请求本就无效；列进来是防「受限用户重新登录」被自己的旧会话形状误伤，也让清单与 §0.1 端点表对齐 |
+| `POST /api/login`、`POST /api/logout`（**旧路径**）| ⚠ **新旧两条都覆盖**：`POST /api/login → 307 → /api/auth/login`（§0.1）这对重写在本门**之后**，所以旧路径**确实会走到本门**（不是「到不了所以不用列」）。不列，一个还带着旧会话 cookie 的受限用户连「重新登录」「退出」这两个动作本身都会被 403 锁死 |
+| `* /api/forward-auth` | ⚠ **本单最大的雷**：Traefik forwardAuth 回调（§2.7）。`routes.js` 的 `authRequestHeaders` 白名单带 `Cookie` ⇒ 浏览器 cookie 会原样进这条回调；而它的语义是「这片预览该不该放行」，被门挡成 403 `password_change_required` 时 **Traefik 只把它当成认证失败** ⇒ 该用户 `*.fde.<base>` 名下**全部**预览端口一起挂，而他要改的只是口令 |
+| `* /api/internal/*`（前缀）| 容器 → portal（§9）：per-container Bearer token 鉴权、**不带登录 cookie**，改密状态与它无关（与 #234 的豁免同一批理由）|
+
+清单之外 ⇒ `403` + §1.2 的 `password_change_required`（`details = {action:"change_password", endpoint:"POST /api/me/password"}`）。
+
+**四条边界（写死在实现与测试里）**：
+
+1. **只管 `/api/*`**：静态资源与 SPA 外壳不在本门之下（`serveStatic` 在 `route()` 里另有一条路），`/api/health` 与 `/healthz` 在 `routeApi` **之前**就被 `route()` 接走。改密屏本身就是 SPA 页面，挡掉 JS/CSS 或挡掉探针会让人连「去改密」的界面都打不开 / 把「全员欠改密」误判成站点故障——那是自我锁死，不是防线。
+2. **无会话 / 会话无效 ⇒ 不挡**：401 的语义完全归各 handler（§1.2 `unauthorized`）。本门只处理「已认证但欠一次改密」，所以它**不会**把任何既有 401 变成 403。
+3. **`HEAD` 按 `GET` 判**（HEAD 是 GET 的子集，同一份放行理由同样成立）；清单里 `/api/me` 是**精确匹配**而非前缀，否则 `/api/me/ports` 会被误放。
+4. **`admin` 也被挡**：判据只看那一列，与 `role` 无关——代设口令这个场景对 admin 同样成立。
+
+**成本**：门只在**清单之外**才解析会话，并与 `requireSession` 共用**请求内缓存**（`resolveSession`，`Symbol` 键挂在 `req` 上）⇒ 全链路仍是**每请求一次** `login_sessions` 查表，不是两次（用例 `每请求恰查一次 login_sessions` 钉住放行与拦截两种形状）。`GET /api/me` 原本手写的查表也已收编进同一条路（两条 401 与旧写法逐字同义，响应体不变）。
+
+**不写审计**（与 #234 的 `auth.csrf_denied` 刻意不同）：受限会话下 SPA 的每个轮询都会撞门，审计会被客户端重试刷成噪声；而「欠改密」这个状态本身已经由 `user.password_changed`（§2.6a）与管理员代设/重置那两条审计钉住，可观测性不缺。
+
+**前端怎么知道（两个入口，同一份事实）**：登录响应顶层的 `password_change_required`（§2.2/§2.3，拿到 cookie 的那一刻就知道）与 `GET /api/me` 的 `user.must_change_password`（§2.6，刷新后还能拿到）。二者与门的判定同源（同一个 `users.must_change_password`），不允许各自维护一份。改完密（§2.6a）**当场解锁**：当前会话保留、旗标清零，同一 cookie 的下一个请求就恢复 2xx。
+
+**⚠ 本单不含前端**：迁移默认值不回填 + `bootstrap-admin` 不置旗标 + `createUser`/`resetUserPassword` 才置 `true`，三件事合起来保证「已部署环境升级后不会有人被锁住」；但**被代设过口令的人一旦被门挡住，本单里唯一的出口是 `curl`/API 调用**（改密屏是后续前端工单）。残余风险见本条。
+
+**残余风险**：① 前端未交付 ⇒ 被代设口令的用户目前只能靠 API 自己改密（§2.6a），若忘了这一步会以为自己被锁死；② 门只覆盖 `/api/*`，**不覆盖**已经签出去的预览 ticket / 预览 cookie（§2.8）——受限用户手上已有的预览 cookie 在 TTL 内照样能用，这与「预览归预览、门户归门户」的既有口径一致，本单不收紧。
 
 ---
 
@@ -1974,6 +2076,8 @@ Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, 
 
 ### `POST /api/admin/users`
 
+⚠ **#255（工单 `feat-261013-03`）**：建用户（以及「同名 `disabled` 行重新激活」）**两条分支都置** `users.must_change_password = true`——两条都是往 `password_hash` 里塞一个**别人知道**的口令。`cli.js bootstrap-admin` **故意不置**（它打印的那枚口令就是本人第一次看到的那一枚），口径与理由见 §2.9.4。
+
 Creates a local FDE user. Request fields: `login`, `password`, `email`, `fde_name`, and `git_host_id` are required; `display_name` is optional. `llm` is required and has the same model-slot shape as the per-FDE LLM endpoint:
 
 ```json
@@ -2034,6 +2138,8 @@ Requeues a failed offboarding task and resets only its failed step to `pending`;
 ### `POST /api/admin/users/:id/reset-password`
 
 Request: `{ "password": "..." }`; password length must be 1–256 characters (the configured portal limit applies). The password is stored as the existing self-describing scrypt hash. Returns `{ "ok": true }` and revokes every unrevoked login session; the plaintext and hash are never returned.
+
+⚠ **#255（工单 `feat-261013-03`）**：本端点同时置 `users.must_change_password = true`（别人选的口令没经过本人之手），于是该用户**下一次拿到的会话是受限的**，直到他调 `POST /api/me/password`（§2.6a）为止——清单外的 `/api/*` 一律 `403 password_change_required`（§2.11a）。本端点**全量吊销**会话（与自助端点「保留当前会话」相反）正是这个限制能立刻生效的原因：手里还拿着旧口令副本的那些会话必须一起失效。
 
 ### `POST /api/admin/users/:id/totp-reset`
 
