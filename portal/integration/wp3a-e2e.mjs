@@ -30,6 +30,7 @@ import { ensureLlmBinding } from './lib/llm-binding.mjs';
 import { LLM_HOST, PORTAL_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 import {
   assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  writeDynamicStub,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -186,6 +187,10 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
   fs.chmodSync(S.staticRoot, 0o755);
+  // #268 M1：预写 edge watch 桩（坑见 lib/isolated-env.mjs:writeDynamicStub：edge 启动时目录里没有
+  // routes.yml ⇒ file provider watch 落空 inode，materializer 之后的原子替换永不被 reload，
+  // 整栈健康但 internal 全 404）。必须在任何 compose up 之前。
+  writeDynamicStub(S.dynamicRoot);
 
   const cleanup = () => {
     safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
