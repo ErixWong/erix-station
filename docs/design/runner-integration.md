@@ -365,7 +365,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | re-claim 双写防护 | portal | 旧 `claim_token` 失效 → 旧 agentd（若复活）任何写请求 `409 lease_lost` / 心跳 `lease_lost` → 本地 abort、丢缓冲与 spool | portal 强制 |
 | 容器重建 | portal（offboarding/重建 workflow） | 旧 token 吊销、新 token 注入新容器；在跑 run 走租约到期 re-claim（同上）；**领取按 user_id 路由**（新容器同 user 可领，§4.2） | portal |
 | 租约丢失后的旧 worker 副作用 | —（见 §6.5「副作用策略」） | DB 状态写被 fencing 拒绝；外部副作用（shell/网络/LLM）平台无法物理终止（原理四），由 attempt 边界 + 审计标记隔离 | portal 标记 + agentd 尽力 abort |
-| stop 在 claim 前到达 | portal | queue 行 → `cancelled`、runs → `cancelling` 后由 portal 直接收敛 `finished`（`termination.reason="aborted"`，无 runner 领取路径，model.md §2.1 第一行） | portal |
+| stop 在 claim 前到达 | portal | **一步到位（#277）**：同一事务内 `runs → finished`（`termination.reason="aborted"` + `detail="cancelled_before_start"`）与 queue 行 → `cancelled`（清租约字段）；**不经 `cancelling`**——`cancelling` 的语义是「已执行过、正在等 worker 报终态」，而未被领取的 run 没有 worker 会去报（认领 SQL 排除 `cancelling`、终态只能经 U2 写、reaper 候选集也不含它，写进去就是永久卡死）。旧口径「runs → `cancelling` 后由 portal 直接收敛」已废（真机后果：20 分钟仍 `cancelling`、会话锁死），model.md §2.1 | portal |
 
 ### 6.5 崩溃恢复方案选择（issue #8）⚠️ 待决策者确认
 

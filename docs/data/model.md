@@ -362,17 +362,18 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 ### 2.1 `runs.status`
 
 ```
-                 ┌──────────┐  停止(无 runner 领取)   ┌────────────┐
-                 │  queued  │ ──────────────────────▶ │ cancelling │
-                 └────┬─────┘                         └─────┬──────┘
-        runner 领取/开始│                                     │
-                 ┌────▼─────┐   POST /stop（cancel_requested）│
-                 │ running  │ ◀───────────────────────────────┘ (仅标记，状态仍由 runner 收敛)
-                 └────┬─────┘
+                 ┌──────────┐  停止：未开始 ⇒ portal 直接终态  ┌──────────┐
+                 │  queued  │ ───────────────────────────▶ │ finished │（termination.reason='aborted'，
+                 └────┬─────┘   （#277：同时 run_queue → cancelled）│ detail='cancelled_before_start'）
+        runner 领取/开始│                                        └──────────┘
+                 ┌────▼─────┐   POST /stop（cancel_requested）
+                 │ running  │ ─────────────────────────────▶ cancelling  ──┐
+                 └────┬─────┘   （已执行过，等 worker 报终态；A2：不回 running）│
         run_end 正常  │  异常（checkpoint_failed 重试耗尽 / rate_limited / max_attempts_exceeded）
-                 ┌────▼────┐   ┌────────┐
-                 │ finished│   │ failed │
+                 ┌────▼────┐   ┌────────┐                        worker abort 后 U2 收敛 ─┤
+                 │ finished│   │ failed │                             → finished / failed
                  └─────────┘   └────────┘
+   cancelling 口径（#277 收紧）：**已执行过（被 worker 领起过）、正在等 worker 报终态**；从未执行的 run 被停止不进本态（见 §2.1 表 `queued` 行）
    cancelling 收敛：runner 终止后 → finished（termination.reason='aborted'）或 failed
    （崩溃 ≠ 直接终态：worker/agentd 崩 → §2.8 崩溃恢复，attempts 内 re-claim 续跑）
    （例外 A2：容器已死 + cancelling → portal（reaper）收敛 finished/aborted，绝不回 pending 续跑）
@@ -382,9 +383,9 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 
 | 状态 | 产生方 | 消费方 |
 |---|---|---|
-| `queued` | portal：`POST /api/sessions/:id/messages` 创建 run（portal.md §4.3） | agentd：claim 领取并开始（→ `running`，经 internal API，portal.md §9）；portal：stop 端点（→ `cancelling`）、`runs_one_active_per_session` 约束 |
+| `queued` | portal：`POST /api/sessions/:id/messages` 创建 run（portal.md §4.3） | agentd：claim 领取并开始（→ `running`，经 internal API，portal.md §9）；portal：stop 端点（**#277：未开始就被停止 → 直接 `finished`（`aborted` + `detail='cancelled_before_start'`）+ 同事务 `run_queue` 出队，不再进 `cancelling`**，portal.md §4.5）、`runs_one_active_per_session` 约束 |
 | `running` | agentd 上报 `markRunState`（规格 §9.3），**portal 落库**（D1'） | portal：SSE 状态展示、`GET /api/runs/:id`；FDE：stop / 审批操作的前置状态 |
-| `cancelling` | portal：`POST /api/sessions/:id/stop` 写 `cancel_requested_at` + 状态（portal.md §4.5） | agentd：SSE `stop_request`（主）/ 心跳 `stop_run_ids`（兜底）收到后 abort worker（runner-integration §4.3/§10）；portal：SSE 展示「停止中」 |
+| `cancelling` | portal：`POST /api/sessions/:id/stop` 写 `cancel_requested_at` + 状态（portal.md §4.5）——**仅从 `running` 进入**（#277 收紧：本态含义是「已执行过、正在等 worker 报终态」，未开始的 run 不走本态） | agentd：SSE `stop_request`（主）/ 心跳 `stop_run_ids`（兜底）收到后 abort worker（runner-integration §4.3/§10）；portal：SSE 展示「停止中」 |
 | `finished`（终态） | worker 跑完上报 → agentd 经 internal API 提交终态载荷（含 `termination` / `usage` 汇总，portal.md §5.3-13 / §9），**portal 收敛落库** | portal：消息落 `messages`、用量记 `usage_ledger`、run 级端口释放（→ `released`）；UI：展示 |
 | `failed`（终态） | **仅终态、不可回退（A5 定稿）**：attempt 级失败**绝不**写 `runs.status='failed'`（记入 `run_queue.attempts` + `audit_log`，`runs.status` 保持 `queued/running`）；`failed` 只由**非重试性错误**（`checkpoint_failed` 重试耗尽 / `rate_limited`）或崩溃循环耗尽（`max_attempts_exceeded`）产生（§2.8/§2.9） | portal：错误展示与通知（规格 §14 长任务通知）、用量/端口收尾；FDE：可手动重新提交（新 run，非自动 resume） |
 
