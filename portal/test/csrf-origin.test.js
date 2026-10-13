@@ -185,6 +185,30 @@ test('#234 判据 d：Origin 与 Sec-Fetch-Site 都没有 ⇒ 放行（curl / CL
     checkSameOrigin({ method: 'POST', secFetchSiteHeader: 'whatever', hostHeader: DEV_HOST }).verdict,
     'no_evidence',
   );
+  // 野 scheme 不得让原型链上的键（`constructor` → 'function'）充当默认端口表项
+  assert.equal(
+    checkSameOrigin({ method: 'POST', originHeader: 'constructor://station.fde.erix.vip:8090', hostHeader: DEV_HOST }).allow,
+    true,
+  );
+  assert.equal(
+    checkSameOrigin({ method: 'POST', originHeader: 'constructor://station.fde.erix.vip:8091', hostHeader: DEV_HOST }).allow,
+    false,
+    '端口仍要原样参与比对（没被野 scheme 剥掉）',
+  );
+});
+
+test('#234 判据 a/b：Sec-Fetch-Site 多值（重复头被 Node 拼成 `a, b`）按 token 展开，跳站优先', () => {
+  assert.equal(
+    checkSameOrigin({
+      method: 'POST', secFetchSiteHeader: 'same-origin, cross-site', originHeader: DEV_ORIGIN, hostHeader: DEV_HOST,
+    }).allow,
+    false,
+    '跳站 token 只要出现过就算跨站（fail-closed，不被同站 token 洗白）',
+  );
+  assert.equal(
+    checkSameOrigin({ method: 'POST', secFetchSiteHeader: 'same-origin, same-site', hostHeader: DEV_HOST }).allow,
+    true,
+  );
 });
 
 test('#234 判据①：只有写方法参与校验（GET/HEAD/OPTIONS 一律放行）', () => {
