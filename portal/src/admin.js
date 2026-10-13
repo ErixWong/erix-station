@@ -563,14 +563,18 @@ export async function resetUserPassword(pool, userId, password, { actorId = null
  *   - 当前口令不对 → `invalid_credentials` + 401，与登录失败同一个码：语义完全相同
  *     （同一个主体、同一份凭据、同一个失败原因），新造一个码只会让前端多一条分支、
  *     并额外泄露「会话有效但口令错」这个此前不存在的事实；
- *   - 新口令不合规 / 与当前相同 → `validation_failed` + `details.field='new_password'`。
+ *   - 新口令不合规 / 与当前相同 → `validation_failed` + `details.field='new_password'`；
+ *   - `confirm_password` 带了但与 `new_password` 不同 → `validation_failed` + `details.field='confirm_password'`。
+ *
+ * `confirmPassword`（#255 收尾）：**可选**的客户端一致性校验，见下面 `changeOwnPassword` 体内的注释。
+ * 判定与 `new_password` 走**同一组**（旧口令校验之后的那一组），不另起一套路径。
  *
  * 口令明文**绝不入审计**（details 只有 login / 计数）。
  *
  * @returns {{ok: true, password_change_required: false, sessions_revoked: number}}
  */
 export async function changeOwnPassword(pool, userId, currentPassword, newPassword, {
-  currentSessionId = null, limits = {}, log = console,
+  currentSessionId = null, confirmPassword, limits = {}, log = console,
 } = {}) {
   // 形状先校验：不合规就不该去跑 scrypt（失败路径也便宜）。
   validatePassword(newPassword, limits, { field: 'new_password' });
@@ -586,6 +590,26 @@ export async function changeOwnPassword(pool, userId, currentPassword, newPasswo
   // `password_hash IS NULL`（OIDC 账号 / 未设口令）也落这里：verifyPassword 对 NULL 返回 false。
   if (!row || !(await auth.verifyPassword(currentPassword, row.password_hash, { log }))) {
     throw new AdminError('invalid_credentials', '用户名或口令错误', { httpStatus: 401 });
+  }
+  // ---- 新口令那一组（**旧口令校验之后**才走到，顺序是有意的，见下）----
+  // 客户端一致性校验（#255 收尾）：请求体**带了** `confirm_password` 就必须与 `new_password` 相同。
+  // 「带了」= 传进来的值不是 `undefined`（JSON 里没这个键 ⇒ `undefined` ⇒ 完全不参与）；
+  // `null` / 数字 / 任何不相等的字符串都算「带了且不等」⇒ 400。反向**不要求必填**：
+  // 契约 §2.6a 过去只有两个字段，已有绕过前端的调用方（脚本/集成测试），变成必填就是把它们打挂。
+  //
+  // 为什么挂在这一组（旧口令校验之后），而不是像形状校验那样放在最前面：
+  //   ① 不泄露——这一条比较的两个值都是调用方自己给的，跟库里那枚哈希无关；放在旧口令校验
+  //      **之前**会让「旧口令填错 + 两次新口令也没对齐」的人拿到 400 `validation_failed` 而不是
+  //      401 `invalid_credentials`，即一个还没通过旧口令校验的人因为这条新规则看到了一种新响应，
+  //      而这条新规则本身（「confirm 不等」）成了他唯一能撬开的信号。
+  //   ② 既有语义零漂移——挂在之后 ⇒ 「旧口令错误」那条响应（状态码、code、details、限流计数、
+  //      哈希、旗标、会话）**一字不变**，无论请求带不带 `confirm_password`、带的是什么值。
+  //   ③ 与「新口令不得等于当前口令」同组：两条都是「新口令这一格合不合规」，错误形态同一个口径
+  //      （`validation_failed` + `details.field`，前端靠 field 决定标红哪一格）。
+  // 这条放在 `newPassword === currentPassword` **之前**：它只依赖请求自身，不依赖库里状态，
+  // 先报它泄露的信息最少（「你自己两格打得不一样」是纯客户端事实）。
+  if (confirmPassword !== undefined && confirmPassword !== newPassword) {
+    throw new AdminError('validation_failed', '两次输入的新口令不一致', { details: { field: 'confirm_password' } });
   }
   if (newPassword === currentPassword) {
     throw new AdminError('validation_failed', '新口令不得与当前口令相同', { details: { field: 'new_password' } });
