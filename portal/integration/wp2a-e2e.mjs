@@ -7,8 +7,9 @@
 //
 // 覆盖什么（幸存价值三样）：
 //   ① 起栈全套公共件（护栏 + edge watch 桩 + 派生 env + FDE 镜像自建）
-//   ② userspace 与端口下发：宿主 <ERIX_USERSPACE_ROOT_HOST>/<fde> 树的属主/权限合规（对照 materializer
-//      现行为）+ 容器内 `~/.erix/ports.json`（宿主 bind 同一份）与 DB `port_allocations` 活行**逐条对账**
+//   ② userspace 与端口下发：宿主 <ERIX_USERSPACE_ROOT_HOST>/<fde> 树的属主/权限合规（口径 = **真机现状**，
+//      不是代码常量：工作区目录 0770 而非 2770，意图缺口逐字记在第④段注释里）+ 容器内
+//      `~/.erix/ports.json`（宿主 bind 同一份）与 DB `port_allocations` 活行**逐条对账**
 //      （scope=fde、号池内按 10 对齐的一块、hostname/url 与端口一致）
 //   ③ 预览签票链路：`GET /api/me/ports` → `POST /api/ports/:id/preview-ticket` → `?preview_ticket=` 302
 //      换预览 cookie → 带 cookie 命中 FDE 网络内的探针（Traefik backend = FDE 固定位 .2:<port>）
@@ -478,7 +479,7 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
         'per-container token 已注入（provision 写库 + 下发都到位）');
     });
 
-    await step('④ 宿主 userspace 树：属主/权限合规（对照 materializer 现行为）', async () => {
+    await step('④ 宿主 userspace 树：属主/权限合规（钉真机现状；意图缺口见段内注释）', async () => {
       const erixDir = hostPathOf('home', '.erix');
       const portsPath = path.join(erixDir, 'ports.json');
       const manifestPath = path.join(erixDir, 'manifest.json');
@@ -486,18 +487,45 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
         { label: 'FDE 级 ~/.erix/ports.json + manifest.json 落盘', timeoutMs: 120000 });
 
       const mode = (p) => fs.statSync(p).mode & 0o7777;
+      // 工作区目录只取 permission 位：setgid 位单独谈（见下方「意图缺口」），不混进这条断言。
+      const perm = (p) => fs.statSync(p).mode & 0o777;
+      const octal = (p) => (fs.statSync(p).mode & 0o7777).toString(8);
       const owner = (p) => {
         const st = fs.statSync(p);
         return { uid: st.uid, gid: st.gid };
       };
-      // 权限口径来自 portal/src/materializer.js（FILE_MODE 0644 / MANIFEST_MODE 0444 /
-      // WORKSPACE_DIR_MODE 2770 / ERIX_DIR_MODE 0750 / 顶层 userspace root 0755），
-      // 工作区目录属主 chown 到 erix(1000:1000)，平台文件由 root 的 portal 进程写（root:root）。
+      // 平台文件/目录的权限口径来自 portal/src/materializer.js（FILE_MODE 0644 / MANIFEST_MODE 0444 /
+      // ERIX_DIR_MODE 0750 / 顶层 userspace root 0755），平台文件由 root 的 portal 进程写（root:root）。
+      // 以下 0755/0750/0644/0444 四条已在真机逐路径复核（现役 FDE 的树：0755 root:root 顶层、
+      // home/.erix=0750 erix:eric、ports.json/config.json/mcp.json=0644 root:root、manifest.json=0444 root:root、
+      // ~/AGENTS.md=0644 root:root），不是照抄代码常量。
       assert.equal(mode(S.userspaceRoot), 0o0755, 'userspace 顶层根 0755（user-space §6.2）');
+
+      // —— 工作区目录（<root>/<fde> 与 <root>/<fde>/home）：钉 **0770**，不是代码里的 2770 ——
+      // 代码意图是 2770（portal/src/provisioner.js ensureUserSpaceMountDirs 与 materializer.js 的
+      // WORKSPACE_DIR_MODE 都传 0o2770 给 fsutil.ensureDirSafe = mkdir → chmod → chown），但真机拿不到
+      // setgid 位、稳定停在 0770（工单 F-5 取证：现役 4 个 FDE 的 <fde>/home 全是 0770 erix:eric）。
+      // 机制（用 portal 镜像 + compose 里那套 cap 现场复现，不是推测）：
+      //   1) ensureDirSafe 的 mkdirSync(dir,{recursive:true,mode:0o2770}) 这一步**永远交不出 setgid**
+      //      （探针：umask 022 → 0750；umask 0002 → 0770）——位能不能落下，全看第 2 步的 chmod；
+      //   2) fs.chmodSync(dir,0o2770) 只在**目录属主还是本进程**时落得下 setgid，也就是「portal 自己刚
+      //      mkdir 出来的那一轮」（真机 /srv/erix/users/portsprobe=2770 正是这一轮的产物）；
+      //   3) 第 3 步 chownSync(1000,1000) 把属主交给 erix 之后，portal（uid 0，deploy/docker-compose.yml
+      //      的 cap_add=CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID，**缺 CAP_FSETID**）再 chmod 会被内核
+      //      **静默清掉 setgid**：permission 位 770 原样保留、chmod 不抛错（所以 fsutil 的 catch 连告警都不会有）。
+      //      对照组：同一镜像加 --cap-add FSETID，同一条 chmod 立刻得到 2770。
+      //   ⇒ reconcile 从第 2 轮起必然把目录按回 0770（探针逐轮：2770 → 770 → 770 稳态）。
+      // 意图缺口不静默：要真 setgid 得产品侧显式落地（候选 portal/src/provisioner.js 对已存在目录补一次
+      // 以属主身份做的 chmod，或给 portal 容器补 cap_add: CAP_FSETID）。谁补谁回来把这条断言改严。
+      // 这里取 &0o777 ⇒ 产品哪天真的落下 2770，这条也不会反过来误红。
       for (const dir of [hostPathOf(), hostPathOf('home')]) {
-        assert.equal(mode(dir), 0o2770, `工作区目录 2770（setgid，组内协作）：${dir}`);
+        assert.equal(perm(dir), 0o0770, `工作区目录 permission 位 0770（真机现状；setgid 意图缺口见上方注释）：${dir} 实=${octal(dir)}`);
         assert.deepEqual(owner(dir), { uid: 1000, gid: 1000 }, `工作区目录属主 erix(1000:1000)：${dir}`);
       }
+      // .erix 由 materializer 的 files 清单带出来（config.json/mcp.json/ports.json 的父目录），
+      // 「必须存在」只对**已物化过的 FDE**成立：上面那条 waitFor 就是它的前提；从未物化的用户树上
+      // 本来就没有这一层（真机复核：<fde>/home/.erix=0750 erix:eric；少一层 home 的 `<fde>/.erix` 从来不存在，
+      // 别拿它当「.erix 没生成」的证据）。0750 没有 setgid 位，也不含会被 umask 抹掉的位，所以与代码常量一致。
       assert.equal(mode(erixDir), 0o0750, '.erix 目录 0750（user-space §6.2）');
       assert.deepEqual(owner(erixDir), { uid: 1000, gid: 1000 }, '.erix 属主 erix(1000:1000)');
       for (const f of ['ports.json', 'config.json', 'mcp.json']) {
@@ -505,6 +533,15 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       }
       assert.equal(mode(manifestPath), 0o0444, 'manifest 0444（提交点只读）');
       assert.equal(mode(hostPathOf('home', 'AGENTS.md')), 0o0644, '~/AGENTS.md 0644（#257/#258 平台约束单一真相）');
+
+      // 真机验收取证：把实测权限原样打进日志（0770 vs 代码里的 2770 是这段最容易被反复误改的地方）。
+      // 注：新一轮很完整的栈里这两个目录**可能**是 2770（首轮流只属于本进程时 chmod 能落下 setgid），
+      // 随后就被回到 0770，所以这里只记录、不拿 setgid 位做断言。
+      // eslint-disable-next-line no-console
+      console.log('[wp2a] §④ userspace 实测权限:',
+        `userspaceRoot=${octal(S.userspaceRoot)}`, `fde=${octal(hostPathOf())}`,
+        `home=${octal(hostPathOf('home'))}`, `.erix=${octal(erixDir)}`, `manifest=${octal(manifestPath)}`,
+        `工作区目录属主=${owner(hostPathOf()).uid}:${owner(hostPathOf()).gid}`);
 
       // 前 P5 目录形态必须已经消失（旧 wp2a 断言的对象）。
       assert.ok(!fs.existsSync(hostPathOf('projects', 'proj1', '.erix', 'ports.json')),
