@@ -81,10 +81,56 @@
   多实例部署必须置 `0` 并外部跑迁移。
 
 > 迁移身份 = `station_platform`（DDL，表 owner）；运行时身份 = `station_portal`（最小 DML）。
-> 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。
+> 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。**为什么这是硬约束而不是建议，见下节。**
+
+## 迁移身份：增量迁移**必须**由平台库角色执行（issue #280）
+
+**口径**：跑 `deploy/migrations/*` 的连接必须是**平台库角色**（`deploy/.env` 的 `PLATFORM_DB_USER`，
+缺省 `station_platform`）——即 `MIGRATE_DATABASE_URL` 的用户。只设 `DATABASE_URL` 的走法见下文。
+
+**为什么**（不是洁癖，是 PG 的硬约束）：
+- `docs/data/bootstrap.sql:52-56` 把 `public` 下表与序列的属主**归正给平台库角色**，并声明前提
+  「后续 `deploy/migrations/*` 由其执行」。
+- PG 的 `ALTER SEQUENCE … OWNED BY <table>.<col>` 要求**序列与表同属主**（`routine=process_owned_by`，
+  SQLSTATE 55000）；`CREATE SEQUENCE` 把新序列给**当前连接角色**。两者一撞：迁移角色 ≠ 表属主 ⇒
+  **整个迁移在 `0016-transcript-append-seq.sql` 失败**（报 `sequence must have same owner as table it is linked to`）。
+  同理适用于任何 `… OWNED BY` / 依赖属主的 DDL，不是 0016 独有。
+
+**只设 `DATABASE_URL` 会怎样**：`portal/src/config.js` 的 `migrateDatabaseUrl` **缺省回退 `DATABASE_URL`**
+（通常是 bootstrap 超级用户），于是迁移以超级用户新建序列、表却归平台角色 ⇒ 手工/救灾路径**必炸**；
+compose 路径显式设 `MIGRATE_DATABASE_URL=station_platform`（`deploy/docker-compose.yml:149`）所以不触发。
+
+**runner 的处置（issue #280 起，`portal/src/migrate.js`）**：
+- 落点：`applyBootstrap` **之后**、增量迁移循环**之前**发 `SET ROLE`。必须在 bootstrap 之后——
+  `bootstrap.sql` 要 `CREATE ROLE`/`ALTER ROLE`/`GRANT`（非超级用户跑不动，实测 42501），且「谁是属主」本身是它决定的。
+- 目标角色**不写死**，解析顺序：显式 `opts.platformRole` / `PLATFORM_DB_USER`（配置点名）
+  > `MIGRATE_DATABASE_URL`（回退 `DATABASE_URL`）的用户 > **库内实测表属主**（`schema_migrations` 的
+  `tableowner`，量不到则取 `public` 下最多的那个）。第三档是救灾路径的关键：只设 `DATABASE_URL` 时
+  连接串用户就是超级用户（= 当前角色，等于没点名），而 PG 的约束字面上就是「与表同属主」。
+- **当前角色已是目标角色 ⇒ 无副作用 no-op**（一条 `SET ROLE` 都不发）——compose 路径就长这样，不回退它。
+- **`SET ROLE` 被拒 ⇒ fail fast**，报可操作错误（点名 `MIGRATE_DATABASE_URL` 与两个角色），
+  **不静默跳过**（静默 = 陷阱还在），也不让人到 0016 里去读 PG 内部报错。
+- 循环**结束与异常两条路径**都 `RESET ROLE`：pg 会复用连接，残留的 `SET ROLE` 会把后续同一条连接上
+  查询的属主语义一起改掉（钉桩见 `portal/test/migrate-role.test.js`、`portal/test/migrate-fresh-db.test.js`）。
+- 切角色之后，循环里的 DDL **与 `schema_migrations` 的写入**都以平台角色执行 ⇒ 它必须对该表有
+  INSERT/UPDATE（bootstrap 归正属主后即成立；真库断言见 `migrate-fresh-db.test.js`）。
+
+**为什么没有更早就修好**：把属主同步挪到迁移**前**或迁移**后**都救不了（0016 在循环内部就炸，同步跑不到，
+已实测否决）。也**不能改 `0016-*.sql` 的文件内容**——runner 按 sha256 比对 checksum，改字节 = 现存库全部拒启。
+需要补授权就**新增**编号迁移（并同步 `portal/test/migrations.test.js` 的编号断言），baseline `schema.sql` 不动。
+
+**测试口径**：这条真实顺序（空库 → baseline → bootstrap → 全部增量，且故意以非属主角色跑）的唯一
+真库覆盖是 `portal/test/migrate-fresh-db.test.js`；`TEST_DATABASE_URL` 未设置时整体 skip（无 PG 不假通过）。
 
 ## 排障
 
+- **`sequence must have same owner as table it is linked to`（`routine=process_owned_by`，典型在 0016）**：
+  迁移身份不对——连接角色不是表属主（见上节「迁移身份」）。先看日志有没有
+  `[migrate] SET ROLE <平台角色>`：没有 ⇒ 目标角色解析成了当前角色（库里量到的属主就是它）；
+  有 `[migrate] 迁移身份切换失败` ⇒ 按该消息把 `MIGRATE_DATABASE_URL` 指向平台库角色。
+  **不要**去改 `0016-*.sql` 的内容（checksum 冻结，现存库会全部拒启）。
+- **`[migrate] 迁移身份切换失败：当前连接角色 X 无法 SET ROLE 到平台库角色 Y`**：把 `MIGRATE_DATABASE_URL`
+  改成指向 Y（`deploy/.env` 的 `PLATFORM_DB_USER`），或让 X 成为 Y 的成员。**不要**把它解读成数据问题。
 - **`column "claim_token" does not exist`（或其他基线列缺失）**：说明目标库**不是由 0001 建的表**
   （典型：手工建库 / 导入了不匹配的 dump）。runner 不会自愈——请**重建库**后重跑迁移，不要靠改迁移文件绕过。
 - **`checksum mismatch` / runner 拒启**：有人改过已应用迁移或 baseline。从 `git log` 取回原文件内容即可，
