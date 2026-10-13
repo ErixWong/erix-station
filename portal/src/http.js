@@ -2134,7 +2134,8 @@ async function handlePreviewTicket(req, res, ctx, portId) {
 }
 
 /**
- * `POST /api/me/password`（#255 首登强制改密，portal.md §2.6a）：体 `{current_password, new_password}`。
+ * `POST /api/me/password`（#255 首登强制改密，portal.md §2.6a）：体 `{current_password, new_password}`，
+ * 可选第三个键 `confirm_password`（客户端一致性校验，见下）。
  *
  * 鉴权：`requireSession` —— 没有有效会话就是既有语义的 `401 unauthorized`（不新造码）。
  * 本端点**同时是受限会话门的放行项**（`RESTRICTED_SESSION_ALLOWLIST`）：旗标为 true 时它是唯一出口，
@@ -2149,7 +2150,15 @@ async function handlePreviewTicket(req, res, ctx, portId) {
  *
  * 错误映射交给 `createServer` 的统一信封（`AdminError` → status/code/details）：
  * 当前口令不对 `401 invalid_credentials`（与登录同码，理由见 `admin.changeOwnPassword` 注释），
- * 新口令不合规或与当前相同 `400 validation_failed` + `details.field='new_password'`。
+ * 新口令不合规或与当前相同 `400 validation_failed` + `details.field='new_password'`，
+ * `confirm_password` 带了但与 `new_password` 不同 `400 validation_failed` + `details.field='confirm_password'`。
+ *
+ * `confirm_password`（#255 收尾）：前端表单会多发这一格做一致性校验，而服务端历史上**忽略未知键**
+ * ⇒「两次新口令是否一致」只在前端判，绕过前端的调用可以把两个不同的新口令发上去照样成功。这里把它
+ * **透传**给 `admin.changeOwnPassword`（校验规则落在那里，与 `new_password` 同一组，不另起一套）：
+ * **可选**字段，没带就与旧行为完全一致（向后兼容，已有绕过前端的调用方），带了就必须等于 `new_password`。
+ * 注意它**不走** `validatePassword` 的形状校验：只要 `=== new_password` 就必然合法（`new_password`
+ * 已经过形状校验），再校一遍长度/非空就是「同一个约束两套判据」。
  */
 async function handleChangeMyPassword(req, res, ctx) {
   const session = await requireSession(req, ctx);
@@ -2161,6 +2170,9 @@ async function handleChangeMyPassword(req, res, ctx) {
   // 形状校验放在限流/验哈希之前：畸形请求不该消耗 scrypt 配额。
   admin.validatePassword(currentPassword, limits, { field: 'current_password' });
   admin.validatePassword(newPassword, limits, { field: 'new_password' });
+  // `confirm_password` 故意不在这里比：它是「新口令那一组」的语义校验，要落在旧口令校验**之后**
+  // （不能让一个还没通过旧口令校验的人因为这条新规则看到新响应），理由见 `admin.changeOwnPassword`。
+  const confirmPassword = body?.confirm_password;
 
   const ip = req.socket.remoteAddress || 'unknown';
   const rlKey = `password:${session.user.id}:${ip}`;
@@ -2187,6 +2199,7 @@ async function handleChangeMyPassword(req, res, ctx) {
   try {
     result = await admin.changeOwnPassword(ctx.pool, session.user.id, currentPassword, newPassword, {
       currentSessionId: session.session.id,
+      confirmPassword,
       limits,
       log: ctx.log,
     });
