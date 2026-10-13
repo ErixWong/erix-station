@@ -120,8 +120,41 @@ describe('#255 守卫重定向链条的熔断器（失败模式必须是红，�
 
   it('环的形状：连续 12 趟（远超正常链条的 3~4 趟）必然触发终止', () => {
     const budget = createRedirectBudget();
-    let passes = 0;
-    while (budget.notePass()) passes += 1;
-    expect(passes).toBe(12);
+    // ⚠ **循环上界必须来自测试自己，不能来自被测对象**（上一个 worker 实测）：写成
+    // `while (budget.notePass()) passes += 1;` 时，把 `notePass()` 变异成恒返回 true
+    // 会让这条用例**挂死**（exit 124 / 240s / vitest worker 100% CPU 忙等），而不是变红——
+    // 那正是本模块存在的理由（「挂死」这一失败模式本身要消掉），所以本文件里绝不能再引进来。
+    // 上界 100 远大于预算 12 ⇒ 循环只能靠「预算自己说不」停下来；`passes.length !== 100`
+    // 顺带钉住「是熔断掐断的，不是上界兜住的」。
+    const LOOP_CAP = 100;
+    const passes: number[] = [];
+    for (let i = 0; i < LOOP_CAP && budget.notePass(); i += 1) passes.push(i);
+    expect(passes.length).toBe(12);
+    expect(passes.length).toBeLessThan(LOOP_CAP); // 终止信号来自预算，不是来自循环上界
+  });
+
+  it('超预算后 used 不再增长（恒 ≤ 预算，与 used 的文档口径一致）', () => {
+    // 实现体是「先判后加」（见 forcePasswordGuard.ts 的注释），所以 used 的取值范围被钉在
+    // `0..limit`。本条钉住这个形状：越过预算之后再读 used，必须仍是 limit（不是 limit + 1），
+    // 且继续 notePass() 恒 false、used 也不再往上爬。少了这条，「恒 ≤ 预算」就只是一句
+    // 不可验证的注释——把实现改成「先加后判」（used += 1 后再比大小）时 used 会到 limit + 1，
+    // 而其余用例全绿。
+    const limit = 3;
+    const budget = createRedirectBudget(limit);
+    for (let i = 0; i < limit; i += 1) expect(budget.notePass()).toBe(true);
+    expect(budget.used).toBe(limit);
+
+    // 越界一次 + 再多跑两趟：结论恒 false，used 停在 limit 不动。
+    for (let i = 0; i < 3; i += 1) {
+      expect(budget.notePass()).toBe(false);
+      expect(budget.used).toBeLessThanOrEqual(limit);
+      expect(budget.used, `第 ${i + 1} 次超预算后 used 不应继续增长`).toBe(limit);
+    }
+
+    // 归零后重新计数（used 的上界随 reset 一起回到 0，不是被「借走」的额度）。
+    budget.reset();
+    expect(budget.used).toBe(0);
+    expect(budget.notePass()).toBe(true);
+    expect(budget.used).toBe(1);
   });
 });
