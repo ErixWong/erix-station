@@ -1441,10 +1441,14 @@ async function handleStopSession(req, res, ctx, sessionId) {
   requireJson(req);
   await readJsonBody(req, ctx.config.maxBodyBytes); // 无体（空 JSON {}）
   const result = await sessions.stopSession(ctx.pool, { userId: session.user.id, sessionId });
-  // 即时停止通道：SSE 下行 stop_request（agentd 立即 abort）；若容器离线，靠心跳 stop_run_ids 兼底（15s）。
+  // 即时停止通道：SSE 下行 stop_request 只服务**已领起该 run 且还活着的** worker（#220）。
+  // ⚠ 不是「断线兜底」：心跳 `stop_run_ids` 的谓词是 `status='cancelling'` 且 run 在该 worker 上报的
+  //   runs 列表里（internal.js heartbeat），而认领 SQL 又排除 `cancelling`、reaper 的候选集也不含它——
+  //   ⇒ 容器离线 / worker 已死时，没有任何机制会把 `running → cancelling` 的 run 收敛成终态。
+  //   queued 分支已在本片直接终态（sessions.js stopSession，#277-A）；**运行中 run 的停止对账兜底属下一片**。
   try {
     internal.broadcastStopRequest(session.user.id, { run_id: result.run.id, session_id: sessionId });
-  } catch { /* 心跳兼容 */ }
+  } catch { /* 尽力推送：无 worker 在线不影响停止已落库 */ }
   return sendJson(res, 200, result);
 }
 

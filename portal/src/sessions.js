@@ -569,33 +569,91 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
 }
 
 /**
- * POST /api/sessions/:id/stop —— 写 cancel_requested_at + status='cancelling'（portal.md §4.5）。
+ * POST /api/sessions/:id/stop —— 停止会话上进行中的 run（portal.md §4.5）。
  * 事务内锁 session 行（与发消息串行化，防「检查无活跃 run → 新 run 提交 → 误停新 run」竞态）；
- * 终止结果经 SSE run_end（reason='aborted'）体现；cancelling 重复停止幂等返回 200。
+ * 状态变更一律**条件更新（CAS）**，禁止先查后改；重复停止幂等返回 200。
+ *
+ * **两条路径（issue #277 第一片）**：
+ *  1. `queued`（从未被 worker 领起 ⇒ 没有任何执行体会去报它的终态）：**直接进终态** `finished`
+ *     + `termination={"reason":"aborted","detail":"cancelled_before_start"}`，并在同事务把它从
+ *     `run_queue` 摘掉（口径同 release/reaper 的 cancelled 分支：queue → `cancelled` + 清租约字段）。
+ *     旧实现在这里也写 `cancelling`，而 `cancelling` ①被认领 SQL 排除（internal.js tryClaim 的
+ *     `r.status IN ('queued','running')`，A2）、②终态只能由 worker 经 U2 写、③不在 reaper 的收敛集合里
+ *     ⇒ 一个从未执行的 run 被停止后**永远没人收敛**，`active_run_id` 恒非空（ACTIVE_RUN_STATES 含
+ *     `cancelling`）⇒ 会话锁死：UI 恒「运行中」+ 发新消息恒 409 `run_in_progress`。
+ *  2. `running`：仍 → `cancelling`（等 worker abort 后经 U2 报终态；**不回退**，A2 语义不变）。
+ *  3. 两步都 0 行 ⇒ 幂等重放：`cancelling` 中的 run、或本端点已直接终态化的 run（按
+ *     `termination.detail='cancelled_before_start'` 识别）→ 仍 `200` 且零写入；否则 409 `no_active_run`。
+ *
+ * ⚠ 竞态（不得吞）：run 在第 1 步之前刚被领走并写了 `running` ⇒ queued 分支 0 行，第 2 步接住它。
+ * ⚠ 已领走但尚未写 `running`（runs.status 仍 `queued`）时，第 1 步直接终态 + 出队会清掉租约字段，
+ *   worker 后续写入按既有 fencing 得 409 `lease_lost` 而中止——这是租约机制本来的行为，不是新分支的例外。
+ *
+ * ⚠ 未覆盖（下一片）：`running` 的 run 被停止后若容器死掉 / worker 再不报终态，`cancelling` 无人收敛；
+ *   本端点不解决这个问题（心跳 `stop_run_ids` 只把停止信号送给**还活着的** worker）。
  */
 export async function stopSession(pool, { userId, sessionId }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const s = await fetchSession(client, sessionId, userId, { forUpdate: true });
-    // 先停止 queued/running；已是 cancelling 视为幂等成功（前端重复点击不报错）
-    let res = await client.query(
-      `UPDATE runs SET status = 'cancelling', cancel_requested_at = now()
-        WHERE session_id = $1 AND status IN ('queued', 'running')
+
+    // 第 1 步 CAS：queued → 终态（未开始就被取消）。转换合法性见 internal.js validateTransition
+    // 的 `queued → finished|failed` 边（portal.md §9.6）。
+    const killedQueued = await client.query(
+      `UPDATE runs
+          SET status = 'finished',
+              termination = '{"reason":"aborted","detail":"cancelled_before_start"}'::jsonb,
+              cancel_requested_at = COALESCE(cancel_requested_at, now()),
+              ended_at = now()
+        WHERE session_id = $1 AND status = 'queued'
         RETURNING id`,
       [s.id],
     );
-    if (res.rows.length === 0) {
-      res = await client.query(
-        `SELECT id FROM runs WHERE session_id = $1 AND status = 'cancelling' ORDER BY queued_at DESC LIMIT 1`,
+    // 出队：终态 run 绝不能留在 `run_queue`（照 finishRun / releaseRun / reaper 的 cancelled 写法：
+    // queue → 'cancelled' + 清 claim_token/owner_container_id/lease_until/claimed_at，不发明第三种）。
+    for (const row of killedQueued.rows) {
+      await client.query(
+        `UPDATE run_queue
+            SET status = 'cancelled', claim_token = NULL, owner_container_id = NULL,
+                lease_until = NULL, claimed_at = NULL
+          WHERE run_id = $1`,
+        [row.id],
+      );
+    }
+
+    // 第 2 步 CAS：剩下的 running → cancelling（等 worker 报终态，见上方 ⚠）。
+    let res;
+    if (killedQueued.rows.length > 0) {
+      res = killedQueued.rows.map((r) => ({ id: r.id, status: 'finished' }));
+    } else {
+      const cancelling = await client.query(
+        `UPDATE runs
+            SET status = 'cancelling', cancel_requested_at = COALESCE(cancel_requested_at, now())
+          WHERE session_id = $1 AND status = 'running'
+          RETURNING id`,
         [s.id],
       );
-      if (res.rows.length === 0) {
+      res = cancelling.rows.map((r) => ({ id: r.id, status: 'cancelling' }));
+    }
+
+    if (res.length === 0) {
+      // 幂等重放：已在 cancelling（重复点击），或本端点已把未开始的 run 直接终态（同因重放）。
+      const replay = await client.query(
+        `SELECT id, status FROM runs
+          WHERE session_id = $1
+            AND (status = 'cancelling'
+                 OR (status = 'finished' AND termination ->> 'detail' = 'cancelled_before_start'))
+          ORDER BY queued_at DESC LIMIT 1`,
+        [s.id],
+      );
+      if (replay.rows.length === 0) {
         throw new SessionError('no_active_run', 'no active run on session', { httpStatus: 409 });
       }
+      res = replay.rows;
     }
     await client.query('COMMIT');
-    return { run: { id: res.rows[0].id, status: 'cancelling' } };
+    return { run: { id: res[0].id, status: res[0].status } };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;

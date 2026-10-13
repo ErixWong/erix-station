@@ -47,10 +47,12 @@ test('validateTransition：合法/非法转换（portal.md §9.6）', () => {
   assert.equal(validateTransition('running', 'failed'), true);
   assert.equal(validateTransition('cancelling', 'finished'), true);
   assert.equal(validateTransition('cancelling', 'failed'), true);
-  // 非法：回退 / 跳过 running / 停止后回 running / 终态回退
+  // 非法：回退 / 停止后回 running / 终态回退
   assert.equal(validateTransition('running', 'queued'), false);
-  assert.equal(validateTransition('queued', 'finished'), false);
-  assert.equal(validateTransition('queued', 'failed'), false);
+  // #277-A：`queued → finished|failed` 转为**合法**（未开始就被 stopSession 直接终态；worker 侧走 U2 仍受租约门禁）
+  assert.equal(validateTransition('queued', 'finished'), true);
+  assert.equal(validateTransition('queued', 'failed'), true);
+  assert.equal(validateTransition('queued', 'cancelling'), false, 'queued 不得进 cancelling：无 worker 会报它的终态（#277 根因）');
   assert.equal(validateTransition('cancelling', 'running'), false);
   assert.equal(validateTransition('finished', 'running'), false);
   assert.equal(validateTransition('failed', 'running'), false);

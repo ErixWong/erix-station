@@ -782,19 +782,29 @@ station-portal user enable  --login <login>
 
 ### 4.5 `POST /api/sessions/:id/stop`
 
-停止当前 run。`AbortController` 跨不了进程（规格 §10.3）——portal 写 DB `cancel_requested_at` 标记（+ 单机 push 模式下同步通知 runner ⚠️ 见 §6.3 注），runner 侧终止。
+停止当前 run。`AbortController` 跨不了进程（规格 §10.3）——portal 写 DB `cancel_requested_at` 标记 + 状态推进，按当前 `runs.status` 走**两条路径**（**#277** 定稿；实现：`sessions.js stopSession`，同事务内两步**条件更新（CAS）**，禁止先查后改）：
+
+| 当前状态 | 结果 | 为什么 |
+|---|---|---|
+| `queued`（从未被 worker 领起） | **直接进终态** `finished`，`termination = {"reason":"aborted","detail":"cancelled_before_start"}`，写 `ended_at`，并**同事务从 `run_queue` 摘掉**（queue → `cancelled` + 清 `claim_token/owner_container_id/lease_until/claimed_at`，口径同 §9.11 release / reaper A2） | 没有任何执行体会去报它的终态：`cancelling` 被认领 SQL 排除（§9.3/A2）、终态又只能由 worker 经 U2 写、也不在 reaper 候选集（`q.status='claimed'` 且租约过期）——旧实现在此也写 `cancelling`，导致该 run 永久卡住、会话 `active_run_id` 恒非空 ⇒ UI 恒「运行中」+ 新消息恒 409 `run_in_progress` |
+| `running` | → `cancelling`（**不等终态**） | 已执行过、正在等 worker 报终态：worker abort 后经 U2 收敛 `finished`（`termination.reason='aborted'`）或 `failed` |
 
 请求体：无（空 JSON `{}`）。
 
-响应 `200`：
+响应 `200`（`run.status` = 本次写入的真实状态，不再是写死的 `cancelling`）：
 
 ```json
-{ "run": { "id": "9d3b2f1e-...", "status": "cancelling", "...": "..." } }
+{ "run": { "id": "9d3b2f1e-...", "status": "finished" } }   // queued 分支
+{ "run": { "id": "9d3b2f1e-...", "status": "cancelling" } } // running 分支
 ```
 
-最终终止结果通过 SSE 的 `run_end` 事件（`termination: { "reason": "aborted" }`，依据：erix-agent v0.3.5 `src/loop.js:712`）与 run 状态收敛体现；前端调本端点后应继续听 SSE，不要轮询。
+最终终止结果通过 SSE 的 `run_end` 事件（`termination: { "reason": "aborted" }`，依据：erix-agent v0.3.5 `src/loop.js:712`）与 run 状态收敛体现；前端调本端点后应继续听 SSE，不要轮询。**两条路径的 SSE 差别**：`running` 分支的 `run_end` 由 worker 的 U2 终态合成；`queued` 分支无 worker 参与，portal 已把行写终态（本端点不合成 `run_end` 事件行）——前端的「运行中」靠重取会话详情的 `active_run_id` 摘除。
+
+幂等：重复停止仍 `200`（命中已在 `cancelling` 的行，或本端点已写入的 `termination.detail='cancelled_before_start'` 终态行），**零新增副作用**。
 
 错误：`404 not_found`；`409 no_active_run`（无进行中 run）。
+
+> ⚠ **未覆盖（#277 下一片）**：`running → cancelling` 后若容器死掉 / worker 再不报终态，`cancelling` 无人收敛（reaper 只看已领起且租约过期的行，认领 SQL 又排除 `cancelling`）。心跳 `stop_run_ids` 只把停止信号送给**还活着的** worker，不是通用兜底。
 
 ### 4.5a `POST /api/sessions/:id/ai-title`（issue #114：AI 改名）
 
@@ -1180,7 +1190,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | 端点 | 表现 |
 |---|---|
 | `POST /api/sessions/:id/messages` | 拉模型为终态（runner §4）：消息落库即 `202`，不依赖容器在线（容器恢复后自行 claim）；仅 push 下发（⚠️ 待决策者确认）时同步依赖可达，失败返回 `503 container_unreachable`（`retryable: true`）且**不产生** message/run 记录 |
-| `POST /api/sessions/:id/stop` | 仍返回 `200`：`cancel_requested_at` 是 DB 标记（规格 §10.3），容器恢复后 runner 轮询到即终止；不因此报错 |
+| `POST /api/sessions/:id/stop` | 仍返回 `200`：`cancel_requested_at` 是 DB 标记（规格 §10.3），容器恢复后 runner 轮询到即终止；不因此报错。**#277 补**：`queued`（从未被领起）的停止不等容器——portal 同事务直接收敛 `finished`（`aborted` / `cancelled_before_start`）并出队；`running` 分支的容器死掉对账兜底仍未覆盖（下一片） |
 | `POST /api/projects`（写 `ports.json`） | **不依赖容器网络**：portal 直写宿主 bind mount（H-B D-6，issue #7），不受容器在线影响 |
 | SSE / GET 类 | 不受影响——事件与状态都在 DB（原理三），容器死了历史照样可看 |
 
@@ -1467,6 +1477,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | 当前 `runs.status` | 目标状态 | 载荷要求 | 结果 |
 |---|---|---|---|
 | `queued` | `running` | `{state: "running"}` | `200`（写 `started_at`，若尚未写） |
+| `queued` | `finished` / `failed` | 终态载荷（见下） | `200`（终态事务）——**#277 新增边**：认领后来得及写 `running` 就结束的 worker 路径；同一条边也是 portal `stopSession` 的「未开始就被取消」转换（那条**不经 U2**、不要求租约，见 §4.5） |
 | `running` | `running` | `{state: "running"}` | `200`（幂等重放，无变化） |
 | `running` | `finished` | 终态载荷（见下） | `200`（终态事务） |
 | `running` | `failed` | 终态载荷（见下） | `200`（终态事务） |
@@ -1474,7 +1485,9 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `cancelling` | `finished` | 终态载荷（`termination.reason` 通常为 `aborted`） | `200`（终态事务） |
 | `cancelling` | `failed` | 终态载荷 | `200`（终态事务） |
 
-**非法转换 → `409 invalid_transition`**（details 附 `{from, to}`）：`running/queued → queued`（回退）；`queued → finished/failed`（跳过 running，须走 U12 release + re-claim）；`cancelling → running`（停止后不得回 running；**例外：该情形返回幂等 ack，不归 `invalid_transition`，见下**）。**终态 run 的任何写（非终态/终态）统一走 `409 run_terminal`，不归 `invalid_transition`**（见下「重复终态」）。
+**`cancelling` 的口径（#277 收紧）**：「**已执行过（被 worker 领起过）、正在等 worker 报终态**」。从未执行的 run（`queued`）被停止**不进 `cancelling`**，而是由 portal 直接收敛终态（§4.5）——因为 `cancelling` 的三个属性（不可被认领、终态只能由 worker 写、不在 reaper 候选集）对没有 worker 的 run 全是死路。
+
+**非法转换 → `409 invalid_transition`**（details 附 `{from, to}`）：`running/queued → queued`（回退）；`queued → cancelling`（未开始不得进「等 worker 报终态」态，#277）；`cancelling → running`（停止后不得回 running；**例外：该情形返回幂等 ack，不归 `invalid_transition`，见下**）。**终态 run 的任何写（非终态/终态）统一走 `409 run_terminal`，不归 `invalid_transition`**（见下「重复终态」）。
 
 **停止期间的 `running` 写入（issue #220）**：用户 `POST /sessions/:id/stop` 先把 `runs.status` 置 `cancelling`，而停止信号抵达 worker 有延迟；引擎那次**正常**的 `markRunState('running')` 落盘不得被拒（否则会被引擎渲染成 `reason=persistence_failed` 的落盘失败，掩盖真正的取消）。口径：
 

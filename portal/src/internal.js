@@ -61,10 +61,27 @@ export function isValidClientEventId(runId, clientEventId) {
   );
 }
 
-/** run 状态机合法转换表（portal.md §9.6）。终态不可回退；cancelling 不可回 running。 */
+/** run 状态机合法转换表（portal.md §9.6）。终态不可回退；cancelling 不可回 running。
+ *
+ * `cancelling` 的口径（#277 收紧）：**已执行过（被 worker 领起过）、正在等 worker 报终态**。
+ * 从未执行的 run（`queued`）被停止不进 `cancelling`——没有 worker 会去报它的终态，而认领 SQL
+ * 排除 `cancelling`（A2）、终态又只能由 worker 经 U2 写 ⇒ 那样会永久卡死（#277 真机复现：
+ * 20 分钟仍 `cancelling`，会话 `active_run_id` 恒非空、新消息恒 409）。
+ *
+ * `queued → finished | failed` 两条边的两类写入方：
+ *  - **未开始就被取消**（`queued → finished`，`termination.reason='aborted'` +
+ *    `detail='cancelled_before_start'`）：唯一写入方是 portal 的 `stopSession`（sessions.js，
+ *    portal.md §4.5）——同事务再出队；不经 U2，因此不要求租约。
+ *  - **worker 上报路径**（claim 后尚未写 `running` 就直接上报终态）：经 U2 `finishRun`，
+ *    仍受**有效租约**门禁（lease 不匹配 → 409 `lease_lost`），旧 agentd 不能越权写终态。
+ *    `failed` 边同理由（引擎在第一次 markRunState 之前就失败）。
+ */
 export function validateTransition(from, to) {
   return (
     (from === 'queued' && to === 'running') ||
+    // 未开始就被取消（portal stopSession）/ claim 后未及写 running 就上报（U2，受租约门禁）
+    (from === 'queued' && to === 'finished') ||
+    (from === 'queued' && to === 'failed') ||
     (from === 'running' && to === 'running') ||
     (from === 'running' && to === 'finished') ||
     (from === 'running' && to === 'failed') ||
