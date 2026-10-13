@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
 import {
   parsePreviewTicket,
   stripPreviewTicket,
@@ -17,9 +18,191 @@ const KEY = 'test-signing-key';
 const NOW = new Date('2026-09-16T00:00:00.000Z');
 const later = (s) => new Date(NOW.getTime() + s * 1000);
 
+// ---------------------------------------------------------------------------
+// #275：port_allocations 的「部分唯一索引 + 读侧排序」在 fake 里的等价模拟。
+//
+// 为什么要专门做：#275 那个「预览恒定 403」能在单测全绿的情况下活到真机（v0.1.5 已发布版本），
+// 根因就是这里的 fake 用 `allocations.find(hostname 相等)` 取第一行 —— 它**结构上不可能**同时存在
+// 「同名的活行 + released 行」，而真库的 `port_allocations_live_hostname_key` 是**部分**唯一索引
+// （`WHERE state <> 'released'`，`docs/data/schema.sql` §4）⇒ released 行**不占位**、两行能共存。
+// 照 AGENTS §8.14 的约定（先例 `./preview-grant-checks.js`）：fake 必须**按 SQL 说的做**，
+// 不得自己另写一套谓词/优先级——所以下面既建索引（种子级），也**从 SQL 文本里解析 ORDER BY 再执行**。
+// ---------------------------------------------------------------------------
+
+/** baseline 里 port_allocations 的**表级** CHECK（PG 自动命名 = 表名 + `_check` / `_check1` …，按定义序）。 */
+const PORT_ALLOCATION_TABLE_CHECKS = [
+  { name: 'port_allocations_check', label: "(scope = 'run') = (run_id IS NOT NULL)", ok: (r) => (r.scope === 'run') === (r.run_id != null) },
+  { name: 'port_allocations_check1', label: "(state = 'released') = (released_at IS NOT NULL)", ok: (r) => (r.state === 'released') === (r.released_at != null) },
+];
+/** 与真库同名的 23514 / 23505（`err.code` + 原文案），让调用方走同一条错误路径。 */
+function sqlError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+/**
+ * 种子的 port_allocations 行逐条过 baseline CHECK + **部分**唯一索引。
+ * 部分索引的模拟就是「只对 `state <> 'released'` 的行判重」：released 行不占位 ⇒ 同 hostname
+ * 的多条 released 行合法（真库现状即 1 活行 + 1 released），而两条同名活行必报 23505。
+ */
+function assertPortAllocationSeeds(rows) {
+  const live = [];
+  for (const row of rows) {
+    const violation = PORT_ALLOCATION_TABLE_CHECKS.find((check) => !check.ok(row));
+    if (violation) {
+      throw sqlError('23514', `new row for relation "port_allocations" violates check constraint "${violation.name}"（${violation.label}）：${JSON.stringify(row)}`);
+    }
+    if (row.state === 'released') continue;                      // 部分索引：released 不占位
+    const clash = live.find((r) => r.hostname === row.hostname);
+    if (clash) {
+      throw sqlError('23505', `duplicate key value violates unique constraint "port_allocations_live_hostname_key"`
+        + ` DETAIL: Key (hostname)=(${row.hostname}) already exists. [与行 id=${clash.id} 同为 state=${row.state} 的活行]`);
+    }
+    live.push(row);
+  }
+}
+
+/** 支持的 ORDER BY 表达式（名字与实现里的 SQL 逐字对齐；解析不出来就直接红，防两侧静默漂移）。 */
+const ORDER_BY_EXPRS = [
+  { re: /^\(\s*a\.state\s*<>\s*'released'\s*\)$/i, value: (row) => row.state !== 'released' },
+  { re: /^a\.released_at$/i, value: (row) => row.released_at ?? null },
+  { re: /^a\.created_at$/i, value: (row) => row.created_at ?? null },
+  { re: /^a\.hostname$/i, value: (row) => row.hostname },
+  { re: /^a\.id$/i, value: (row) => row.id },
+];
+
+/**
+ * 把 forward-auth 那条 SELECT 当真库那样执行：WHERE 谓词 → INNER JOIN users → ORDER BY → LIMIT。
+ * fake **不自己另写一套谓词/优先级**，语义全从 SQL 文本里解析（同 `./preview-grant-checks.js` 的口径）：
+ *   - `a.hostname = $n`：精确匹配（调用方已剥端口 + 小写）；
+ *   - `a.state <> 'released'` / `a.state = 'x'`：可选，写了就照它筛 ⇒ 若实现退化成「只加状态过滤」，
+ *     「只有 released 行的 host」就会变成 404，被下面的 released 用例当场拦下（契约：那是 403）；
+ *   - 无 ORDER BY ⇒ 保留**物理序**（种子序；真库对应 Seq Scan 扫到的序）——这正是 #275 的形状，
+ *     所以把实现里的 ORDER BY 删掉（变异测试）就会退化成「先扫到 released 行」⇒ 新用例必红；
+ *   - `JOIN users u` 是 INNER JOIN ⇒ fde_id 查不到用户行就掉行（与真库一致），`fde_name` 取自 users。
+ * 解析不出的 WHERE 残片 / ORDER BY 表达式 ⇒ assert.fail（不默不作声地多过）。
+ */
+function selectPortAllocations({ sql, params, allocations, users }) {
+  const flat = sql.replace(/\s+/g, ' ').trim();
+  const where = (flat.match(/\bWHERE\b(.+?)(?:\bORDER BY\b|\bLIMIT\b|$)/i) ?? [])[1] ?? '';
+
+  const hostMatch = where.match(/\ba\.hostname\s*=\s*\$(\d+)/i);
+  if (!hostMatch) assert.fail(`preview fake 解析不出 hostname 谓词（WHERE：${where.trim()}）`);
+  const host = params[Number(hostMatch[1]) - 1];
+
+  const statePredicates = [...where.matchAll(/\ba\.state\s*(<>|=)\s*'([a-z-]+)'/gi)]
+    .map(([, op, value]) => (row) => (op === '<>' ? row.state !== value : row.state === value));
+  const residue = where
+    .replace(/\ba\.hostname\s*=\s*\$\d+/gi, ' ')
+    .replace(/\ba\.state\s*(<>|=)\s*'[a-z-]+'/gi, ' ')
+    .replace(/\band\b/gi, ' ');
+  if (residue.trim() !== '') {
+    assert.fail(`preview fake 解析不出 WHERE 里的剩余谓词「${residue.trim()}」（完整 WHERE：${where.trim()}）——实现改了查询而 fake 没跟上`);
+  }
+
+  const joined = allocations
+    .filter((row) => row.hostname === host && statePredicates.every((keep) => keep(row)))
+    .map((row) => {
+      const user = users.find((u) => u.id === row.fde_id);
+      return user ? { ...row, fde_name: user.fde_name ?? row.fde_name ?? null, user_status: user.status } : null;
+    })
+    .filter(Boolean);
+
+  return applyOrderByAndLimit(flat, joined).map((row) => ({ ...row }));
+}
+
+/** 把 ORDER BY 子句拆成项（括号内的逗号不算分隔符）。 */
+function splitOrderByTerms(clause) {
+  const terms = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of clause) {
+    if (ch === '(') depth += 1;
+    if (ch === ')') depth -= 1;
+    if (ch === ',' && depth === 0) {
+      terms.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim() !== '') terms.push(current.trim());
+  return terms;
+}
+
+/** 一项 ORDER BY → { 表达式, DESC?, NULLS? }：括号表达式整块取，尾部的 ASC/DESC/NULLS 归修饰词。 */
+function parseOrderTerm(term, clause) {
+  let rest = term.trim();
+  let expression;
+  if (rest.startsWith('(')) {
+    let depth = 0;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '(') depth += 1;
+      if (rest[index] === ')') depth -= 1;
+      if (depth === 0) {
+        expression = rest.slice(0, index + 1);
+        rest = rest.slice(index + 1).trim();
+        break;
+      }
+    }
+    if (expression === undefined) assert.fail(`preview fake：ORDER BY 括号不闭合「${term}」`);
+  } else {
+    [expression, rest = ''] = rest.split(/\s+/);
+  }
+  const expr = ORDER_BY_EXPRS.find((candidate) => candidate.re.test(expression));
+  if (!expr) assert.fail(`preview fake 解析不出 ORDER BY 表达式「${expression}」（完整子句：${clause.trim()}）——实现改了排序而 fake 没跟上`);
+  const modifiers = rest.toUpperCase();
+  return {
+    expr,
+    desc: /\bDESC\b/.test(modifiers),
+    nulls: /\bNULLS\s+FIRST\b/.test(modifiers) ? 'first' : /\bNULLS\s+LAST\b/.test(modifiers) ? 'last' : null,
+  };
+}
+
+/** 从 SQL 里解析 `ORDER BY … LIMIT n`（无 ORDER BY ⇒ 物理序，即种子序）。 */
+function parseOrderByAndLimit(flatSql) {
+  const order = flatSql.match(/\bORDER BY\b(.+?)\bLIMIT\s+(\d+)\s*$/i) ?? flatSql.match(/\bORDER BY\b(.+?)$/i);
+  const limit = flatSql.match(/\bLIMIT\s+(\d+)/i);
+  const keys = order ? splitOrderByTerms(order[1]).map((term) => parseOrderTerm(term, order[1])) : [];
+  return { keys, limit: limit ? Number(limit[1]) : null };
+}
+
+function compareOrderKey(left, right, { desc, nulls }) {
+  const nullLeft = left === null || left === undefined;
+  const nullRight = right === null || right === undefined;
+  if (nullLeft || nullRight) {
+    if (nullLeft && nullRight) return 0;
+    const nullsFirst = nulls ? nulls === 'first' : desc;          // PG 默认：DESC ⇒ NULLS FIRST
+    return (nullLeft ? -1 : 1) * (nullsFirst ? 1 : -1);
+  }
+  const a = typeof left === 'boolean' ? Number(left) : left;
+  const b = typeof right === 'boolean' ? Number(right) : right;
+  const at = a instanceof Date ? a.getTime() : a;
+  const bt = b instanceof Date ? b.getTime() : b;
+  const cmp = at < bt ? -1 : at > bt ? 1 : 0;
+  return desc ? -cmp : cmp;
+}
+
+/** 照 SQL 的 ORDER BY + LIMIT 执行（fake 不自己发明优先级）。 */
+function applyOrderByAndLimit(flatSql, rows) {
+  const { keys, limit } = parseOrderByAndLimit(flatSql);
+  const sorted = keys.length === 0
+    ? rows                                                // 无 ORDER BY ⇒ 物理序（真库 = Seq Scan 扫到的序）
+    : [...rows].sort((left, right) => {
+      for (const key of keys) {
+        const cmp = compareOrderKey(key.expr.value(left), key.expr.value(right), key);
+        if (cmp !== 0) return cmp;
+      }
+      return 0;
+    });
+  return limit === null ? sorted : sorted.slice(0, limit);
+}
+
 /** in-memory preview pool：建模 port_allocations / users / preview_grants（含事务 client）。 */
 class PreviewPool {
   constructor({ allocations = [], users = [], grants = [] } = {}) {
+    assertPortAllocationSeeds(allocations);                // 种子自己先过真库约束（不合约束的种子测的是不存在的状态）
     this.allocations = allocations;
     this.users = users;
     this.grants = grants;
@@ -31,9 +214,8 @@ class PreviewPool {
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
 
     if (sql.includes('FROM port_allocations a')) {
-      const host = params[0];
-      const a = this.allocations.find((x) => x.hostname === host);
-      return { rows: a ? [{ ...a }] : [] };
+      // forward-auth 的 hostname 查表（#275）：WHERE / JOIN / ORDER BY / LIMIT 全按 SQL 说的做。
+      return { rows: selectPortAllocations({ sql, params, allocations: this.allocations, users: this.users }) };
     }
     if (sql.includes('FROM port_allocations WHERE id = $1')) {
       const a = this.allocations.find((x) => x.id === params[0]);
@@ -111,14 +293,23 @@ class PreviewPool {
 const ALLOC = {
   id: 'pa1',
   fde_id: 'u1',
+  scope: 'fde',
+  run_id: null,
   state: 'allocated',
   exposure: 'private',
   // #57 阶段2 伞域 grammar：<fde>-p-<port4>.<BASE_DOMAIN>（BASE_DOMAIN = fde.<可注册域>）。
   hostname: 'alice-p-4000.fde.erix.vip',
   url: 'https://alice-p-4000.fde.erix.vip',
+  // #275：种子行补齐到与真库同形（`released_at` 存不存与 `state` 双向绑定是 baseline CHECK；
+  // `port` 的按状态分支 CHECK 不在本 fake 建模——写侧的端口约束由 `portalloc.test.js` 的 fake 负责）。
+  created_at: NOW,
+  released_at: null,
   fde_name: 'alice',
   user_status: 'active',
 };
+
+/** #275：一条合法的 released 历史行（`released ⇔ released_at` 是 baseline CHECK，缺 released_at 的种子真库进不了表）。 */
+const releasedAlloc = (overrides = {}) => ({ ...ALLOC, state: 'released', released_at: NOW, ...overrides });
 
 function makePool(overrides = {}) {
   const allocations = overrides.allocations ?? [ALLOC];
@@ -179,7 +370,7 @@ test('issuePreviewTicket：private owner 可签、存哈希不存明文、他人
   assert.deepEqual(other, { error: { status: 404, code: 'not_found' } });
 
   // released 视同不存在 → 404
-  const { pool: p2 } = makePool({ allocations: [{ ...ALLOC, state: 'released' }] });
+  const { pool: p2 } = makePool({ allocations: [releasedAlloc()] });
   const rel = await issuePreviewTicket(p2, config, {
     allocationId: 'pa1',
     session: { user: { id: 'u1', role: 'fde' } },
@@ -209,7 +400,7 @@ test('authorizeForwardAuth：无凭证 403 / 未知 host 404 / released 403', as
   assert.equal(nocred.status, 403);
   assert.equal(nocred.code, 'preview_ticket_required');
 
-  const { pool: p2 } = makePool({ allocations: [{ ...ALLOC, state: 'released' }] });
+  const { pool: p2 } = makePool({ allocations: [releasedAlloc()] });
   const rel = await authorizeForwardAuth(p2, config, { hostname: ALLOC.hostname, now: NOW });
   assert.equal(rel.status, 403);
   assert.equal(rel.code, 'allocation_released');
@@ -439,7 +630,7 @@ test('#241 authorizeForwardAuth：预检**不能**绕过 hostname/state 两条 f
   assert.equal(unknown.status, 404);
   assert.equal(unknown.code, 'not_found');
 
-  const { pool: p2 } = makePool({ allocations: [{ ...ALLOC, state: 'released' }] });
+  const { pool: p2 } = makePool({ allocations: [releasedAlloc()] });
   const rel = await authorizeForwardAuth(p2, config, { hostname: ALLOC.hostname, ...pre });
   assert.equal(rel.outcome, 'deny');
   assert.equal(rel.status, 403);
@@ -450,4 +641,134 @@ test('#241 authorizeForwardAuth：预检**不能**绕过 hostname/state 两条 f
   assert.equal(bare.outcome, 'deny');
   assert.equal(bare.status, 403);
   assert.equal(bare.code, 'preview_ticket_required');
+});
+
+// ---------------------------------------------------------------------------
+// issue #275：预览访问恒定 403 `allocation_released`——released 历史行遮蔽了活行。
+//
+// 真机形状（主 agent 在 dev 库 + 已发布的 v0.1.5 镜像上亲手复现）：管理员改块把预览段**搬回曾用号段**
+// （22000→22030→22000）⇒ 新活行的 hostname 与上一轮遗留的 released 行**逐字相同**；
+// `port_allocations_live_hostname_key` 是**部分**唯一索引（`WHERE state <> 'released'`）⇒ 两行合法共存，
+// 而 hostname 上没有全表索引 ⇒ 无 ORDER BY 的 `LIMIT 1` 拿到的是 released ⇒ 第 2 步直接判死：
+// 审计 `result=deny`、`grant_kind=NULL`（ticket 分支根本没走到），而面板显示 Allocated、签票返 201。
+// ⇒ 下面的种子把 released 行放在**物理序前面**、created_at/released_at 也更晚，就是真机那个形状。
+// ---------------------------------------------------------------------------
+
+/** #275 的真机形状：released 历史行（新）在物理序上排在活行（旧）前面。 */
+function shadowedAllocations({ history = [], liveOverrides = {} } = {}) {
+  const live = { ...ALLOC, id: 'pa-live', created_at: new Date('2026-10-11T15:57:00.000Z'), ...liveOverrides };
+  return [...history.map((row) => releasedAlloc(row)), live];
+}
+
+// 真库实测的两列时刻：released 由 01:50 的改块留下，活行是 01:52 搬回来的。
+const SHADOW_HISTORY = [{
+  id: 'pa-hist',
+  released_at: new Date('2026-10-13T01:50:00.000Z'),
+  created_at: new Date('2026-10-13T01:50:00.000Z'),
+}];
+
+test('#275 回归：同 hostname 的 released(较新) 遮蔽 allocated(较旧) ⇒ forward-auth 放行活行（ticket 302、选中 id = 活行）', async () => {
+  const { pool, grants } = makePool({ allocations: shadowedAllocations({ history: SHADOW_HISTORY }) });
+  // 先复现真机的「签票 201」：面板给出的是**活行 id**，签票本身必成。
+  const issued = await issuePreviewTicket(pool, config, {
+    allocationId: 'pa-live',
+    session: { user: { id: 'u1', role: 'fde' } },
+    now: NOW,
+  });
+  assert.ok(issued.ticket, '签票必须成功（真机 201，坏在下一步的 forward-auth）');
+
+  const res = await authorizeForwardAuth(pool, config, {
+    hostname: ALLOC.hostname,
+    uri: `/?preview_ticket=${issued.ticket}`,
+    scheme: 'http',
+    now: NOW,
+  });
+  assert.notEqual(res.code, 'allocation_released', 'released 历史行不得遮蔽活行（#275 的症状本体）');
+  assert.equal(res.outcome, 'redirect');
+  assert.equal(res.status, 302);
+  assert.equal(res.allocation.id, 'pa-live', '选中的 allocation 必须是活行');
+  assert.equal(res.allocation.state, 'allocated');
+  assert.equal(res.fdeName, 'alice');
+  // 凭证判定真的走到了（而不是被第 2 步短路）：ticket 已消费。
+  assert.equal(grants.find((g) => g.kind === 'ticket').state, 'used');
+});
+
+test('#275 回归：同一 shadow 形状下稳态预览 cookie 也照样放行（200 + 活行）', async () => {
+  const cookie = 's_cookie_under_shadow';
+  const { pool, grants } = makePool({ allocations: shadowedAllocations({ history: SHADOW_HISTORY }) });
+  grants.push({
+    id: 'g-shadow', token_hash: hashToken(cookie), user_id: 'u1', issuer_id: null, allocation_id: 'pa-live',
+    parent_ticket_id: 'g-parent', kind: 'session', state: 'active', expires_at: later(600), used_at: null, revoked_at: null,
+  });
+  const res = await authorizeForwardAuth(pool, config, { hostname: ALLOC.hostname, cookieValue: cookie, now: NOW });
+  assert.equal(res.outcome, 'allow');
+  assert.equal(res.status, 200);
+  assert.equal(res.allocation.id, 'pa-live');
+});
+
+test('#275 契约锁：hostname 只有 released 行（两行）⇒ 仍 403 allocation_released（不得变 404 / 不得变死代码）', async () => {
+  // 两条 released 历史行：部分唯一索引对 released **不判重** ⇒ 共存合法；
+  // 种子序故意把「旧的」排前面，选到哪条全看排序子句（AGENTS §8.5：不得依赖偶然行序）。
+  const history = [
+    { id: 'pa-hist-old', released_at: new Date('2026-10-11T06:44:00.000Z'), created_at: new Date('2026-10-11T06:44:00.000Z') },
+    { id: 'pa-hist-new', released_at: new Date('2026-10-13T01:50:00.000Z'), created_at: new Date('2026-10-13T01:50:00.000Z') },
+  ];
+  const { pool } = makePool({ allocations: history.map((row) => releasedAlloc(row)) });
+  const res = await authorizeForwardAuth(pool, config, { hostname: ALLOC.hostname, now: NOW });
+  assert.equal(res.outcome, 'deny');
+  assert.equal(res.status, 403, '只有 released 行⇒403（若实现退化成「只在 WHERE 里过滤 released」，这里会变成 404）');
+  assert.equal(res.code, 'allocation_released');
+  assert.equal(res.allocation.id, 'pa-hist-new', 'released 多行时靠 `released_at DESC NULLS LAST` 定序');
+});
+
+test('#275 契约锁：released_at 同值的两条 released 行 ⇒ 靠 `a.id` 兼容成全序（两种种子序都选出同一行）', async () => {
+  const at = new Date('2026-10-13T01:50:00.000Z');
+  for (const ids of [['pa-h-1', 'pa-h-2'], ['pa-h-2', 'pa-h-1']]) {
+    const { pool } = makePool({ allocations: ids.map((id) => releasedAlloc({ id, released_at: at, created_at: at })) });
+    const res = await authorizeForwardAuth(pool, config, { hostname: ALLOC.hostname, now: NOW });
+    assert.equal(res.status, 403);
+    assert.equal(res.allocation.id, 'pa-h-1', `种子序 [${ids}] 下也必须选出同一行`);
+  }
+});
+
+test('#275 契约锁：hostname 一行都查不到 ⇒ 404 not_found（不得被挤成 403）', async () => {
+  const { pool } = makePool({ allocations: shadowedAllocations({ history: SHADOW_HISTORY }) });
+  const res = await authorizeForwardAuth(pool, config, { hostname: 'nobody-p-22999.fde.erix.vip', now: NOW });
+  assert.equal(res.outcome, 'deny');
+  assert.equal(res.status, 404);
+  // 契约码：§1.2 与 §2.7 第 1 步定的是 `not_found`（#57 已钉「错误码不变」）。
+  // ⚠ issue #275 工单把它叫 `allocation_not_found`，仓内从无此码 ⇒ **不新造错误码**，沿用既有契约。
+  assert.equal(res.code, 'not_found');
+});
+
+test('#275 fake 自证：部分唯一索引真的建模了（released 不占位；两条同名活行 ⇒ 23505 真库原文）', () => {
+  assert.throws(
+    () => new PreviewPool({ allocations: [{ ...ALLOC, id: 'a' }, { ...ALLOC, id: 'b' }] }),
+    (err) => {
+      assert.equal(err.code, '23505', '错误形状必须与真库一致（SQLSTATE）');
+      assert.match(err.message, /duplicate key value violates unique constraint "port_allocations_live_hostname_key"/);
+      assert.match(err.message, /already exists/);
+      return true;
+    },
+    'fake 必须拦同名活行，否则它测的是真库不存在的形状（§8.14）',
+  );
+  // released 行不占位 ⇒ 同名两行 released + 一行活行能共存（不靠这个形状，#275 在读侧根本测不出来）。
+  const ok = new PreviewPool({ allocations: [releasedAlloc({ id: 'h1' }), releasedAlloc({ id: 'h2' }), { ...ALLOC, id: 'live' }] });
+  assert.equal(ok.allocations.length, 3, 'released 不占位 ⇒ 三条同名行合法共存');
+});
+
+test('#275 读侧护栏（源码级）：hostname 查表必须自带「活行优先 + 全序」，不得退化成 WHERE 里过滤 released', async () => {
+  const source = await fs.readFile(new URL('../src/preview.js', import.meta.url), 'utf8');
+  const start = source.indexOf('FROM port_allocations a');
+  const lookup = source.slice(start, source.indexOf('const allocation = r.rows', start));
+  assert.ok(lookup.length > 80, '查表 SQL 块可定位');
+  assert.match(lookup, /WHERE a\.hostname = \$1/, '谓词仍是 hostname 精确匹配');
+  assert.match(
+    lookup,
+    /ORDER BY \(a\.state <> 'released'\) DESC, a\.released_at DESC NULLS LAST, a\.id/,
+    '活行优先 + 确定全序（AGENTS §8.5）',
+  );
+  assert.match(lookup, /\bLIMIT 1\b/, '取单行');
+  const whereClause = lookup.slice(lookup.indexOf('WHERE'), lookup.indexOf('ORDER BY'));
+  assert.doesNotMatch(whereClause, /a\.state\s*<>\s*'released'/, 'WHERE 里不得过滤 released：那会让 allocation_released 变死代码、把 403 改写成 404');
 });

@@ -281,6 +281,7 @@ SQL
 | B5 ticket 已撤销 | `revoked_at` 置位后再用 | `403`（`preview_ticket_revoked`） | 403 |
 | B6 ticket allocation 不匹配 | 用 A 的 ticket 访问 B 的 hostname | `403`（`preview_ticket_mismatch`） | 403 |
 | B7 allocation 已释放 | 释放 allocation 后访问 | `403`（`allocation_released`，portal §2.7 第 2 步） | 403 |
+| B7b 同名 released 历史行遮蔽活行（#275） | 管理台把预览块搬出去再**搬回曾用号段**（如 `22000→22030→22000`，造成同 hostname 的活行 + released 行共存），再点「Open preview」 | **放行**（无凭证时 `403 preview_ticket_required`；带票则 `302`/`200`）——**不是** `allocation_released` | 签票仍 201；审计 `grant_kind` 不为 `NULL`（ticket 分支真的走到了）；`SELECT state,count(*) FROM port_allocations WHERE hostname='<预览 host>' GROUP BY 1` 能同时看到活行与 released 行 |
 | B8 forwardAuth 故障 → deny-all | 停 portal（或 forwardAuth 地址改到不可达）后访问预览 | Traefik **拒**（典型 503），**请求不到达上游** | 上游 whoami 无访问记录（access log 不增加）+ 客户端非 200-from-upstream |
 | B9 不泄露 portal session cookie（贯穿 B1–B8） | 检查预览响应与上游 | 预览链路**任何环节**不出现 `__Host-fde_session`；上游 dev server 永不接收 portal cookie | portal §2.7「forwardAuth 一律忽略 portal session cookie」 |
 

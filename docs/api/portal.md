@@ -304,8 +304,8 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 
 授权逻辑（顺序，任一失败即短路）：
 
-1. **取 `X-Forwarded-Host` → 精确查 `port_allocations.hostname`**（活跃唯一索引）。查不到 → `404 not_found`（「路由表里没有 = 不可达」，原理二；正常不该发生，发生说明路由与 DB 失同步）。
-2. allocation `state` 必须 ∈ {`allocated`,`active`}；`released` → `403 forbidden`（`allocation_released`）。
+1. **取 `X-Forwarded-Host` → 精确查 `port_allocations.hostname`**（活跃唯一索引）。查不到 → `404 not_found`（「路由表里没有 = 不可达」，原理二；正常不该发生，发生说明路由与 DB 失同步）。⚠ **同名多行时以活行为准（#275）**：`port_allocations_live_hostname_key` 是**部分**唯一索引（谓词 `state <> 'released'`，与 0019 的 `port_allocations_live_global_port_key` 同源）⇒ `released` 行**不占位**，管理员把预览块搬回**曾用过的号段**（§4.7a 的搬迁事务，#246）后，同一 hostname 会「1 条活行 + N 条 released 历史行」共存，而 hostname 上没有全表索引⇒ 读侧**必须自带优先级与全序**：`ORDER BY (state <> 'released') DESC, released_at DESC NULLS LAST, id`（不得依赖行的偶然顺序）。
+2. allocation `state` 必须 ∈ {`allocated`,`active`}；`released` → `403 forbidden`（`allocation_released`）。⚠ 该码**只在「本 hostname 只剩 released 历史行」时出现**；第 1 步已取到活行时不得被判成已释放（#275 的错误形状正是 released 历史行遮蔽活行 ⇒ 预览恒定 403，而面板显示 Allocated、签票返 201）。因此**不得把第 1 步改成 `WHERE … AND state <> 'released'` 的过滤**——那会把「只剩 released」的 host 从 403 改写成 404，并让本码变死代码。
 3. **取凭证**：先查 `X-Forwarded-Uri` 的 `preview_ticket` 参数；无 ticket 再查 `__Host-fde_preview` cookie；两者皆无 → `403 forbidden`（`preview_ticket_required`）。ticket 签发 / 预览 cookie 校验 / `allocated→active` 升级已由 WP2b 实现。
 4. **校验凭证（按哈希查库，不解析 `sub`；所有凭证查询显式带 `state='active'`）**：
    - ticket（bootstrap）：`h = sha256(ticket)` → 查 `preview_grants`（`kind='ticket'`）。必须满足：存在、`state='active'`、未 `revoked_at`、未过期（`expires_at > now()`）、`allocation_id` == 第 1 步的 allocation。任一不满足 → 失败分支（见下）。
