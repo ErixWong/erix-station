@@ -27,6 +27,27 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 把服务端错误信封里的**任意**值收成展示字符串（#255）。
+ *
+ * 契约上 `error.message` / `error.code` 是字符串，但前端不赌它：`new Error(非字符串)` 在构造函数里
+ * 就被 ToString 成 `[object Object]`，事后救不回来 ⇒ 必须在**进 Error 之前**退化。
+ * 对象/数组 ⇒ JSON 文本（宁可难看也不丢信息）；无 JSON 表示时 String 兜底。
+ */
+export function toDisplayText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'object') {
+    try {
+      const json = JSON.stringify(value);
+      return json === undefined ? String(value) : json;
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 // 401/403 之外的非预期错误（网络断开等）也会带兜底文案，便于登录页直接展示。
 export async function api<T = unknown>(path: string, opts: RequestInit = {}): Promise<T> {
   const r = await fetch(path, {
@@ -39,9 +60,9 @@ export async function api<T = unknown>(path: string, opts: RequestInit = {}): Pr
   if (!r.ok) {
     // 兜底文案在抛出时取词（非组件上下文：i18n.global.t）；服务端 error.message 原样透传（不在前端翻译范围）。
     throw new ApiError(
-      body?.error?.message || i18n.global.t('errors.requestFailed', { status: r.status }),
+      toDisplayText(body?.error?.message) || i18n.global.t('errors.requestFailed', { status: r.status }),
       r.status,
-      body?.error?.code,
+      body?.error?.code === undefined ? undefined : toDisplayText(body.error.code),
       body?.error?.details,
     );
   }
