@@ -461,6 +461,26 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **已接受代价 / 遗留**：四台 FDE 容器仍在 v0.1.5 runner 镜像上（`ensureFdeContainer` 不检测镜像漂移；runner 代码本轮零改动 ⇒ 不专门 `rm -f` 重建，下次重建自然升级）。
   `#234` 的 https 半边仍卡在 `erix.vip` 泛域名 DNS-01 API token（外部依赖）；本轮只交付 CSRF/Origin 半边。
 
+### 8.20 v0.1.7：#255 强制首登改密 + #277 排队停止收敛 + #280 迁移身份对齐（2026-10-14 夜班，tag `v0.1.7` = `b50d5e8`）
+
+**载荷**（自 v0.1.6）：① **#255** 受限会话门（`RESTRICTED_SESSION_ALLOWLIST` 9 条，少一条=死锁、多一条=漏口）+ 登录响应 `password_change_required` + `POST /api/me/password`（保留当前会话、吊销其他）+ 前端改密屏（`App.vue` 闸门 ∧ `router` 改写 ∧ 三态判据 ∧ 重定向预算熔断）+ 全局 `403 password_change_required` 兜底 + 错误码→文案映射表；② **#277-A/A2** 排队中的 run 被停止 → 同事务 `queued→finished/aborted/cancelled_before_start` + 出队 + 合成 `run_end`（`client_event_id='<runId>:final:run_end'` + `ON CONFLICT DO NOTHING`），claimed 且有活租约的行不许直接终态；③ **#280** `migrate.js` 在 `applyBootstrap` 之后、迁移循环之前 `SET ROLE` 到平台库角色（`finally` 里 `RESET ROLE`），顺带灭掉灾难恢复库「增量表属主错、`station_portal` 写不进去」那颗更老的雷；④ **#255 收尾** `confirm_password` 服务端校验（**可选**字段，带了必须等于 `new_password`，`details.field='confirm_password'`；没带行为不变）。
+
+**基线**：根 **1036/1032/0/4**（有 `TEST_DATABASE_URL` 时另跑 3 条真库迁移用例）、runner **221/221**、前端 **33 文件 / 488 通过**（`docs/ops/ci-release.md` §1 与 `ci.yml` ② 已同步）。
+
+**发布与部署（第三次按 digest，流程无新坑）**：三份 `package.json`+lockfile → `0.1.7`（每份 lockfile 恰好 2 行）→ tag `v0.1.7` → CI+release 双绿 → `docker pull` + `image inspect .Id` 与清单 `imageId` 三镜像全一致 → `deploy/.env` 形态① pin（备份 `/tmp/deploy.env.bak-017`）→ `docker compose -p station -f deploy/docker-compose.yml --profile litellm up -d --no-build`。portal 实跑 `f85e3040…` = 清单 imageId；digest：portal `796095b6eb3c…` / fde `7e406e043c52…` / proxy `1660ef51f7cb…`。
+
+**⚠ tag 挪过一次位**：第一次打 tag 落在 `690a7d5`，那次 **release 成功但 CI 步骤④ 红**——红在 #255 前端新测试自身（`ForcePasswordErrors.spec.ts` 挂整个 `App`，而夹具对所有请求返 403，`WorkbenchView.onMounted` 里两个 `await` 无 catch ⇒ 未捕获拒绝）。修法是消除不确定性（确定成功夹具 + 落地后再冲刷 + **「零未捕获拒绝」自检**），不是加重试；产品代码零字节改动。教训与「判绿看退出码」一并写进 §4。
+
+**迁移与数据（真机，dev 栈）**：日志 `迁移身份已是平台库角色 station_platform（无副作用 no-op，不发 SET ROLE）` → `applying 0021-user-must-change-password`；`must_change_password` = `NOT NULL DEFAULT false`，**存量 6 个用户全部拿到 `false`**（部署不会把任何人锁进改密屏）。另在**真数据拷贝**上单独验过升级路径（`superuser` 只有 `DATABASE_URL` 的形态）：`SET ROLE station_platform` → `applying 0021` → `RESET ROLE`，存量同样全 `false`。
+
+**真机验收**（请求从 host 网络容器 `erix_station_playwright` 发出，避开宿主透明代理假 401）：
+- **#255 后端链 13/13 全过**：建用户（管理员代设口令）→ 本人首登旗标 `true` → 非白名单 GET/POST 均 `403 password_change_required` → 白名单 `/api/me`、`logout` 可用（不死锁）→ `confirm` 不一致 `400 + details.field` → **旧口令错是 `401` 且不带 `details.field`**（不泄露 confirm 判定）→ 自助改密 `200 {ok:true, password_change_required:false, sessions_revoked:1}` → 同会话立即可用不强制重登 → 新口令可重登、旧口令 `401` → **不带 `confirm_password` 仍可改**（向后兼容）。
+- **#255 真浏览器链全过**（截图 `/docker/erix_station_playwright/v017-after-change-password.png`）：登录成功 URL 即被改写为 `#/change-password`；手打深链 `#/session/<uuid>` 也被改回去；改密屏无工作区外壳（router-view 被抑制）；两格不一致**本地先拦**并把红标落到「确认新口令」那一格（不是 `[object Object]`）；改密成功落 `#/` 且会话未被踢。控制台唯一 error 是登录前 `GET /api/me` 的 401（预期噪音）。
+- **预览链无回归**：未知 host `404`；曾被 released 行遮蔽的 `eric-p-22000` 现在 `403 preview_ticket_required`（#275）；deny 仍回显 `Access-Control-Allow-Origin` + `Allow-Credentials`（#241）；带 `Access-Control-Request-Method` 的预检**被放行**（实测 `502`=已过鉴权、到应用但无人监听，CORS 由应用自答）；列端口 `200 {items:10}` → 签票 `201` → 用返回的 `url`（`?preview_ticket=`）兑换 `302 + Set-Cookie` → 带票访问 `502`（鉴权已过）。
+- **#277** 真机只走到「运行中停止」那条支路（agentd `capacity=1` 但取走得快，run 实际跑完 `judge_done`）；**「排队中被停」那条没在真机上出现**，其证据是单测 `portal/test/session-stop-queued.test.js` + 主 agent 三条变异（删租约守卫 2 红 / 删 `ON CONFLICT` 1 红 / 删合成 `run_end` 3 红）。合成 `run_end` 可经 `GET /api/sessions/:id/events/history` 回放已实测（⚠ `/events` 是 SSE，别当历史读，会把调用挂住）。
+
+**已接受代价 / 遗留**：① 四台既有 FDE 容器仍在 v0.1.5 runner 镜像（`ensureFdeContainer` 不检测镜像漂移；runner 逻辑本轮零改动，下次 `docker rm -f` + reconcile 自然升级）；② **#279 不进本版**（dev 数据面 0 复现，完整修法要动 runner ⇒ FDE 重建；判据 SQL 已贴 issue，等决策者在自己部署上跑）；③ **#281**（`WorkbenchView.onMounted` 两个 `await` 无 catch、`workbench.ts:691` 可读 `undefined.cwd`）是新登记的**既有**产品缺口，不在本版；④ `#277` 真机排队支路未跑；⑤ dev 栈遗留测试用户 `pw17*` / `ui17*`（口令是探针里写的一次性口令，非 dev 管理员口令）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 
