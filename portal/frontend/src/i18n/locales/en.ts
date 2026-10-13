@@ -91,6 +91,9 @@ export const en = {
       unknown_code: 'Unrecognised error (HTTP {status}, code {code}). Retry once; if it still fails, hand that status and error code verbatim to an administrator.',
       // Raw evidence appended to every message (server message passed through untranslated).
       detail: 'Server said: {message} (code {code})',
+      // After a 401 bounces the user to the sign-in page, that page has to explain why (the wording
+      // no longer points at a button on the change-password screen).
+      sessionExpiredNotice: 'Your sign-in expired, so the password was not changed. Sign in again and change it once more.',
       no_message: 'the server returned no message',
       no_code: 'no error code',
       field: {

@@ -227,6 +227,10 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/login'));
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(false);
     expect(auth.user).toBeNull();
+    // 登录页必须能解释「为什么人被送回来」：只剩一个空表单会让人以为凭空掉线（#255 前端② 的可行动性要求）。
+    await tick();
+    expect(wrapper.find(ALERT).text()).toMatch('登录已过期');
+    expect(wrapper.find(ALERT).text()).toMatch('重新登录');
     // 没有会话就谈不上受限：旗标必须清掉，否则 App 闸门会把登录页也挡死。
     expect(auth.passwordChangeRequired).toBe(false);
   });

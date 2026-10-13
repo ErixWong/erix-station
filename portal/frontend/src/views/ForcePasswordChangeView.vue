@@ -56,7 +56,10 @@ async function onSubmit() {
   // 判据在 lib/forcePasswordErrors.ts（§2.6a：两个 401 共用状态码）。
   const err = auth.changePasswordError;
   if (err && errorMeansRelogin(err)) {
+    // 登录页顶部的 alert 要能解释「为什么人被送回来」——否则只剩一个空表单，像凭空掉线。
+    const notice = t('forcePassword.errors.sessionExpiredNotice');
     auth.forgetExpiredSession();
+    auth.error = notice;
     router.replace('/login');
   }
 }
