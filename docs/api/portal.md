@@ -311,6 +311,7 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 | `current_password` | 是 | 当前生效的那一枚；不对 ⇒ `401 invalid_credentials`（不新造码，理由见下「错误」）|
 | `new_password` | 是 | 本人选的新口令；不合规或与当前相同 ⇒ `400 validation_failed` + `details.field='new_password'` |
 | `confirm_password`（#255 收尾，纯 additive）| **否** | **客户端一致性校验**：服务端不拿它参与凭据判定，只做一件事——**带了就必须等于 `new_password`**，否则 `400 validation_failed` + `details.field='confirm_password'`。**为什么保留**：改密表单多一格「确认新口令」是防拼写错误把人锁在门外（设完自己登不上）的常规体验，服务端要能接住它，而不是继续当未知键忽略——忽略的后果是「两次是否一致」只在前端判，绕过前端的调用可以把两个不同的新口令发上去照样成功。**为什么不做成必填**：这一节此前只定义了两个字段，已经有绕过前端的调用方（脚本 / 集成测试）在发两个键，变成必填就是把它们当场打挂；⇒ **没带 ⇒ 行为与以前一字不差**（也不要求必填后补默认值） |
+> **与前端 ①/② 的协调口径**：前端表单在提交前本地就拦掉「两格不一致」（`onSubmit()` 不发请求），所以**正常路径看不到这个 400**；真收到时前端按 `details.field='confirm_password'` 把红标落到「确认新口令」那一格（映射表 `portal/frontend/src/lib/forcePasswordErrors.ts`，用例 `forcePasswordErrors.spec.ts`）。
 
 响应 `200`：
 
