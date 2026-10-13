@@ -115,8 +115,10 @@ function getDummyHash() {
  * 返回 { ok, user } 或 { ok:false, reason: 'invalid_credentials' | 'malformed_hash' }。
  */
 export async function authenticate(pool, login, password, { log } = {}) {
+  // #255：多读一列 `must_change_password`，但**不塞进 `user`**（§2.2 的 user DTO 形状不动）：
+  // 登录响应用的是顶层的 `password_change_required`（见 http.js），两条各自自己的口径。
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password
        FROM users WHERE login = $1 AND status = 'active'`,
     [login],
   );
@@ -146,6 +148,8 @@ export async function authenticate(pool, login, password, { log } = {}) {
       fde_name: row.fde_name,
       auth_source: row.auth_source,
     },
+    // #255：登录响应里的 `password_change_required` 就取这一位（收成显式布尔，理由同 findSessionUser）。
+    mustChangePassword: row.must_change_password === true,
   };
 }
 
@@ -214,7 +218,7 @@ export async function verifyTotpForUser(
   } = {},
 ) {
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, totp_secret, last_totp_step
+    `SELECT id, login, display_name, role, fde_name, auth_source, totp_secret, last_totp_step, must_change_password
        FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
   );
@@ -256,6 +260,8 @@ export async function verifyTotpForUser(
       fde_name: row.fde_name,
       auth_source: row.auth_source,
     },
+    // #255：与 `authenticate` 同一口径——第二步才是真正发会话的那一步，所以受限旗标也要在这里带出去。
+    mustChangePassword: row.must_change_password === true,
   };
 }
 

@@ -1874,7 +1874,14 @@ async function handleLoginStep1(req, res, ctx) {
       ttlSeconds: config.sessionTtlSeconds,
     });
     await auditLoginSuccess(pool, result.user, 'password_direct');
-    return sendJson(res, 200, { status: 'authenticated', user: result.user }, {
+    return sendJson(res, 200, {
+      status: 'authenticated',
+      // #255（纯 additive）：登录时就告诉前端「这枚会话是受限的」，不必等它去碰第一个 403。
+      // 两个**发会话**的分支都有（下面是 TOTP 分支）；`totp_required` 中间响应**不带**：
+      // 那一步尚未登录、无 cookie，谈不上受限（口径见 portal.md §2.2/§2.3）。
+      password_change_required: result.mustChangePassword === true,
+      user: result.user,
+    }, {
       'Set-Cookie': sessionCookieHeader(config.cookie, session.token),
     });
   }
@@ -1956,7 +1963,11 @@ async function handleLoginTotp(req, res, ctx) {
   });
   await auditLoginSuccess(pool, result.user, 'totp');
   const cookieHeader = sessionCookieHeader(config.cookie, session.token);
-  return sendJson(res, 200, { user: result.user }, { 'Set-Cookie': cookieHeader });
+  // #255：与上一直通分支同口径——第二步才是本分支真正发会话的地方，受限旗标必须在这里带出去
+  // （否则注册了 TOTP 的受限账号只能靠「第一个请求返 403」发现自己要改密）。
+  return sendJson(res, 200, { password_change_required: result.mustChangePassword === true, user: result.user }, {
+    'Set-Cookie': cookieHeader,
+  });
 }
 
 /**

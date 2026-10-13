@@ -20,6 +20,7 @@ import { createServer, RESTRICTED_SESSION_ALLOWLIST, restrictedSessionAllows } f
 import { cookieSettings } from '../src/config.js';
 import * as admin from '../src/admin.js';
 import * as auth from '../src/auth.js';
+import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -747,6 +748,100 @@ test('#255③ 端到端闭环：改完密门立即解锁（清旗标后同一会
     assert.equal(ok.status, 200, `改密应成功（实际 ${ok.status}：${await ok.clone().text()}）`);
     const unlocked = await get(t.base, '/api/sessions', t.cookie);
     assert.equal(unlocked.status, 200, '旗标已清 ⇒ 同一会话立刻解锁（不得要求重新登录）');
+  } finally {
+    await t.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ④ 登录响应增字段 `password_change_required`（提交 5，纯 additive）
+// ---------------------------------------------------------------------------
+
+const USER_DTO_KEYS = ['id', 'login', 'display_name', 'role', 'fde_name', 'auth_source'].sort();
+
+test('#255④ 口令直通分支：flag 真 / 假两种用户的 password_change_required 各为 true / false', async () => {
+  for (const mustChange of [true, false]) {
+    const t = await setupGate({ mustChange, login: mustChange ? 'flagged' : 'plain' });
+    try {
+      const res = await fetch(`${t.base}/api/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ login: t.user.login, password: OLD_PW }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.ok('password_change_required' in body, '字段必须**存在**（false 也要出现，不能靠缺省省掉）');
+      assert.equal(typeof body.password_change_required, 'boolean', '必须是布尔，不是 undefined/字符串');
+      assert.equal(body.password_change_required, mustChange, `flag=${mustChange} 时字段必须是 ${mustChange}`);
+      // 既有契约不回退（§2.2）：status 与 user DTO 形状一字未动。
+      assert.equal(body.status, 'authenticated');
+      assert.deepEqual(Object.keys(body.user).sort(), USER_DTO_KEYS, 'user DTO 不得被这次增字段改动');
+      assert.ok(res.headers.get('set-cookie')?.includes(t.config.cookie.name), 'cookie 照旧下发');
+    } finally {
+      await t.close();
+    }
+  }
+});
+
+test('#255④ TOTP 分支（第二步才发会话）同样带该字段；中间的 totp_required 响应不受影响', async () => {
+  for (const mustChange of [true, false]) {
+    const pool = new MustChangePool({ users: [ADMIN] });
+    const login = mustChange ? 'totp-flagged' : 'totp-plain';
+    const secret = totp.generateSecret(20);
+    await seedUser(pool, { login, password: OLD_PW, mustChange, totpSecret: secret });
+    const s = await startServer({ pool });
+    try {
+      const step1 = await fetch(`${s.base}/api/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ login, password: OLD_PW }),
+      });
+      const body1 = await step1.json();
+      assert.equal(body1.status, 'totp_required');
+      assert.equal(step1.headers.get('set-cookie'), null, '第一步尚未登录，不发 cookie');
+      // 中间响应**不加**这一位：此刻还没有会话，谈不上受限（口径写进 §2.2/§2.3）。
+      assert.deepEqual(Object.keys(body1).sort(), ['expires_in', 'pending_token', 'status']);
+
+      const step2 = await fetch(`${s.base}/api/auth/login/totp`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pending_token: body1.pending_token, code: totp.totp(secret) }),
+      });
+      assert.equal(step2.status, 200, `第二步应成功（实际 ${step2.status}：${await step2.clone().text()}）`);
+      const body2 = await step2.json();
+      assert.equal(body2.password_change_required, mustChange,
+        `注册了 TOTP 的受限账号必须在第二步就拿到旗标（否则只能靠第一个 403 发现自己要改密）`);
+      assert.deepEqual(Object.keys(body2.user).sort(), USER_DTO_KEYS);
+      assert.ok(step2.headers.get('set-cookie')?.includes(s.config.cookie.name));
+    } finally {
+      await s.close();
+    }
+  }
+});
+
+test('#255④ 闭环：改完密再登录 ⇒ 该位翻成 false（与受限会话门的解锁同一件事实在两处一致）', async () => {
+  const t = await setupGate({ mustChange: true });
+  try {
+    assert.equal((await loginCookieFor({ ...t, login: 'erin', password: OLD_PW })).body.password_change_required, true);
+    const changed = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(changed.status, 200);
+    const after = await loginCookieFor({ ...t, login: 'erin', password: NEW_PW });
+    assert.equal(after.body.password_change_required, false, '改密后再登录 ⇒ 不再受限');
+    assert.equal((await get(t.base, '/api/sessions', after.cookie)).status, 200, '登录响应与门的判定必须一致');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255④ 登录失败路径不受影响：错口令仍 401 invalid_credentials（不新增错误码、不泄露旗标）', async () => {
+  const t = await setupGate({ mustChange: true });
+  try {
+    const res = await fetch(`${t.base}/api/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ login: 'erin', password: 'wrong-' + OLD_PW }),
+    });
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.equal(body.error.code, 'invalid_credentials');
+    assert.equal('password_change_required' in body, false, '失败响应不发这一位（口令错的人本就还没会话）');
+    assert.equal(res.headers.get('set-cookie'), null);
   } finally {
     await t.close();
   }
