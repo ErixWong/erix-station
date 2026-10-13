@@ -225,8 +225,13 @@ docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登�
 3. 需要**泛域名解析 + Tailscale**（`*.fde.erix.vip` → `100.100.0.3`）与宿主 Traefik host 网络。
 4. 分钟成本：一条 e2e 链路跑下来在 CI 里要占十几分钟，Free 额度撑不住（§4）。
 
-**口径**：e2e 由**主 agent 在部署机上、本机隔离栈**跑（`wp3b` / `wp5` / `wp6`），**部署前**执行；
-CI 只保证「语法 + 单测 + 类型 + 镜像能构建出来」。
+**口径**：e2e 由**主 agent 在部署机上、本机隔离栈**跑（`wp2a` / `wp3a` / `wp3b` / `wp5` / `wp6`），**部署前**执行；
+CI 只保证「语法 + 单测 + 类型 + 镜像能构建出来」。其中 `wp2a` 已按 #268 决策第 2 条重建为「FDE 开户 →
+userspace/端口下发对账 → 预览签票链路 → 去置备 + offboarding 收敛」的小包（工单 F，旧形态里「POST
+/api/projects → 项目级 ports.json → 删项目回收端口」的断言对象已从产品里消失），与其余几支共用
+`lib/isolated-env.mjs` 的隔离护栏 / Traefik 静态配置 / edge watch 桩，另加 `lib/ports-reconcile.mjs`
+（`~/.erix/ports.json` ↔ `port_allocations` 逐条对账件）；静态口径由 `portal/integration/isolation-negative.mjs`
+钉住（它不在 `node --test` 发现面里，缺省 rc=1 是负例证据本体，进 CI 用 `--strict`）。
 
 ---
 
