@@ -24,7 +24,7 @@ const localError = ref<string | null>(null);
 
 const busy = computed(() => auth.loading);
 
-// 失败态（① 的兜底口径）：服务端 error.code / error.message 原样成字符串（store 的 safeText 已把
+// 失败态（① 的兜底口径）：服务端 error.code / error.message 原样成字符串（api.ts 的 toDisplayText 已把
 // 非字符串退化处理，模板里不会再出现 [object Object]）。完整的错误码→文案映射表留给下一张单。
 const serverError = computed(() => {
   const err = auth.changePasswordError;
