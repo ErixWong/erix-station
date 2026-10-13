@@ -186,7 +186,7 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  * #234：跨站请求防线的**纯判据**（不发响应、不读 cookie，因此可单独单测）。
  *
  * 为什么需要：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（portal.md §2.5），Lax 只挡
- * 「跳站带 cookie」这一半；而本部署 portal 在 Traefik 后面、入口多个（`station.fde.erix.vip` 与
+ * 「跨站带 cookie」这一半；而本部署 portal 在 Traefik 后面、入口多个（`station.fde.erix.vip` 与
  * `100.100.0.3`），cookie 本身不区分发起方。这里加一道**不依赖配置项**（同源基线从请求自己的
  * Host 派生，天然支持多入口）的服务端防线，并把拒绝写审计（可观测）。
  *
@@ -206,7 +206,7 @@ function parseCsrfRequestAuthority(forwardedHostHeader, hostHeader, scheme) {
  *
  * **只比 authority、不比 scheme**（契约点）：本部署处在 http（dev `:8090` / `100.100.0.3:8090`）与
  * https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；
- * 拿 scheme 参战会把「同一个站点上的 http/https 两面」误杀成跳站。CSRF 要防的是**别的站点**
+ * 拿 scheme 参战会把「同一个站点上的 http/https 两面」误杀成跨站。CSRF 要防的是**别的站点**
  * 带本站点 cookie 发写请求（同站不同 scheme 不构成这个威胁），故 scheme 只用于默认端口归一化。
  *
  * 失败绝不默认同源（「解析失败就当同源」是这道防线唯一不能发的方式）：Origin 畸形（不可解析 /
@@ -227,7 +227,7 @@ export function checkSameOrigin({
   const httpMethod = typeof method === 'string' ? method.toUpperCase() : '';
   const origin = originHeader == null ? null : String(originHeader);
   // 已知四个 token 走精确小写比对；其余（拼错的、`none`）一律当「无结论」，落到 Origin 判据。
-  // 多值（重复 SFS 头被 Node 拼成 `a, b`）按 token 展开：跳站 token 只要出现过就算跨站（fail-closed）。
+  // 多值（重复 SFS 头被 Node 拼成 `a, b`）按 token 展开：跨站 token 只要出现过就算跨站（fail-closed）。
   const secFetchSite = secFetchSiteHeader == null ? null : String(secFetchSiteHeader).trim().toLowerCase();
   const sfsTokens = secFetchSite === null ? [] : secFetchSite.split(',').map((token) => token.trim());
   const details = { origin, sec_fetch_site: secFetchSite, method: httpMethod };
@@ -236,7 +236,7 @@ export function checkSameOrigin({
   // ① 只判写方法：SSE `GET /api/sessions/:id/events`、预览 ticket 的 302 兑换都是 GET，不得打断。
   if (!CSRF_WRITE_METHODS.has(httpMethod)) return { allow: true, verdict: 'read_method' };
 
-  // a. 显式跳站 ⇒ 拒（先看 SFS：它是浏览器给的、不可伪造，优先于可被代理改写的 Origin）。
+  // a. 显式跨站 ⇒ 拒（先看 SFS：它是浏览器给的、不可伪造，优先于可被代理改写的 Origin）。
   //    `cross-origin` 是**防御性值**：它不是 `Sec-Fetch-Site` 的合法取值（规范只有 same-origin / same-site /
   //    cross-site / none 四个），多接一个不存在的值不会漏、方向仍是 fail-closed，别误以为我们漏了个规范值。
   if (sfsTokens.some((token) => token === 'cross-site' || token === 'cross-origin')) return deny('cross_site');
@@ -568,7 +568,7 @@ async function routeApi(req, res, ctx, url) {
   const { pathname } = url;
   const { pool, config } = ctx;
 
-  // ---- #234：跳站写请求防线（portal.md §2.11）——先于任何 handler 执行，否则 CSRF 会先碰到底层副作用。----
+  // ---- #234：跨站写请求防线（portal.md §2.11）——先于任何 handler 执行，否则 CSRF 会先碰到底层副作用。----
   // 豁免（在 csrfGateFor 里）：/api/internal/* 与 /api/forward-auth。拒绝：403 `cross_origin_forbidden`
   // + #241 那套 CORS deny 头（否则浏览器只报 ACAO 缺失、看不到真实原因，AGENTS §8.11）+ 一条审计。
   const csrf = csrfGateFor(req, pathname);

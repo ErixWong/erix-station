@@ -104,7 +104,7 @@ test('#234 回归门（返修）：same-site 不再直接放行，而是落 Orig
   const noOrigin = checkSameOrigin({ method: 'POST', secFetchSiteHeader: 'same-site', hostHeader: DEV_HOST });
   assert.equal(noOrigin.allow, true);
   assert.equal(noOrigin.verdict, 'no_evidence');
-  // 跳站 token 仍优先（a 先于 b/c）
+  // 跨站 token 仍优先（a 先于 b/c）
   assert.equal(
     checkSameOrigin({
       method: 'POST', secFetchSiteHeader: 'same-site, cross-site', originHeader: DEV_ORIGIN, hostHeader: DEV_HOST,
@@ -257,13 +257,13 @@ test('#234 判据 d：Origin 与 Sec-Fetch-Site 都没有 ⇒ 放行（curl / CL
   );
 });
 
-test('#234 判据 a/b：Sec-Fetch-Site 多值（重复头被 Node 拼成 `a, b`）按 token 展开，跳站优先', () => {
+test('#234 判据 a/b：Sec-Fetch-Site 多值（重复头被 Node 拼成 `a, b`）按 token 展开，跨站优先', () => {
   assert.equal(
     checkSameOrigin({
       method: 'POST', secFetchSiteHeader: 'same-origin, cross-site', originHeader: DEV_ORIGIN, hostHeader: DEV_HOST,
     }).allow,
     false,
-    '跳站 token 只要出现过就算跨站（fail-closed，不被同站 token 洗白）',
+    '跨站 token 只要出现过就算跨站（fail-closed，不被同站 token 洗白）',
   );
   assert.equal(
     checkSameOrigin({ method: 'POST', secFetchSiteHeader: 'same-origin, same-site', hostHeader: DEV_HOST }).allow,

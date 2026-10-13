@@ -104,7 +104,7 @@
 | 400 | `validation_failed` | 请求体/参数不合法 | 否 |
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
-| 403 | `cross_origin_forbidden`（#234，工单 `feat-261013-01`）| **跳站写请求被同源防线拒**（`Sec-Fetch-Site: cross-site` / `Origin` 的 authority 与请求自身不同，**含同注册域的 `same-site`**）。**与 `forbidden` 的关键差别：这是「没资格发这个请求」而不是「没权限做这件事」**，且**未认证也可能拿到**（防线先于 cookie 校验）。`details` = `{origin, sec_fetch_site, method}`（**不含 cookie**）；响应带 #241 那套 CORS deny 头（ACAO/ACAC/Vary）。判据、豁免端点、语义变化见 §2.11 | 否 |
+| 403 | `cross_origin_forbidden`（#234，工单 `feat-261013-01`）| **跨站写请求被同源防线拒**（`Sec-Fetch-Site: cross-site` / `Origin` 的 authority 与请求自身不同，**含同注册域的 `same-site`**）。**与 `forbidden` 的关键差别：这是「没资格发这个请求」而不是「没权限做这件事」**，且**未认证也可能拿到**（防线先于 cookie 校验）。`details` = `{origin, sec_fetch_site, method}`（**不含 cookie**）；响应带 #241 那套 CORS deny 头（ACAO/ACAC/Vary）。判据、豁免端点、语义变化见 §2.11 | 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
 | 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2。**#246 交付② 同一码也用在新端点 `POST /api/admin/fdes/:fdeName/ports/block`**：管理员显式指定的块被外来活行占住、或搬迁中途插入数 ≠ 10（并发抢号 ⇒ 整笔回滚）——**那里 `retryable` 是 `false`**（盲试同一段必败，要先换一个起点），口径见 §4.7a） | 是（仅此码；**例外**：§4.7a 的改块 409 为 `false`） |
 | 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
@@ -245,7 +245,7 @@
 | `Path` | `/` | `__Host-` 前缀要求 |
 | `HttpOnly` | 是 | 防 XSS 窃取 |
 | `Secure` | 是 | `__Host-` 前缀要求；生产/自签 HTTPS 恒为 `Secure` |
-| `SameSite` | `Lax` | 门户为顶级站点，`Lax` 覆盖顶级导航与同站子资源；**预览访问不再依赖本 cookie**（见 §2.8：预览走一次性 ticket + host-only 预览 cookie），故不再受 iframe 约束，也不得再以「预览需要」为由放宽为父域 cookie。**注（#234）：`Lax` 不是本站唯一的跳站防线**，服务端另有一道 Origin / `Sec-Fetch-Site` 同源校验（§2.11），两者叠加才构成完整防线；cookie 属性本身本单未改。**注 2（#234 返修）：`SameSite` 与 `Sec-Fetch-Site` 判的都是注册域**，而 portal 与预览 host 同坐 `erix.vip` ⇒ 预览 host 的写请求**会带上本 cookie**（Lax 不挡同站）且 SFS 只报 `same-site`，因此 §2.11 的判据 b **不得因 `same-site` 直接放行**（否则本站最现实的 CSRF 形状会绕过防线）|
+| `SameSite` | `Lax` | 门户为顶级站点，`Lax` 覆盖顶级导航与同站子资源；**预览访问不再依赖本 cookie**（见 §2.8：预览走一次性 ticket + host-only 预览 cookie），故不再受 iframe 约束，也不得再以「预览需要」为由放宽为父域 cookie。**注（#234）：`Lax` 不是本站唯一的跨站防线**，服务端另有一道 Origin / `Sec-Fetch-Site` 同源校验（§2.11），两者叠加才构成完整防线；cookie 属性本身本单未改。**注 2（#234 返修）：`SameSite` 与 `Sec-Fetch-Site` 判的都是注册域**，而 portal 与预览 host 同坐 `erix.vip` ⇒ 预览 host 的写请求**会带上本 cookie**（Lax 不挡同站）且 SFS 只报 `same-site`，因此 §2.11 的判据 b **不得因 `same-site` 直接放行**（否则本站最现实的 CSRF 形状会绕过防线）|
 | `Max-Age` | 7 天，滚动续期（每次活跃请求刷新服务端 `expires_at` 并重发 cookie） | 与 `login_sessions.expires_at` 对应 |
 
 cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只存 `login_sessions.token_hash`（如 `sha256(token)`），可单条吊销——offboarding「失效登录会话」依赖此性质（规格 §7.3）。**任何代码都不得把 cookie 值当作带字段的对象解析**（旧 `cookie.sub` 口径作废，见 §2.7）。
@@ -509,9 +509,9 @@ station-portal user enable  --login <login>
 >
 > **ticket 的 `issuer_id` 与主体 `user_id`（B4，三处口径一致）**：签发（§2.8）记录两者——`issuer_id` = 谁签的（登录用户），`user_id` = 主体（被授权访问的身份）；forwardAuth 的 `private` 判定（§2.7 第 5 步）用**主体** + **admin 例外**；审计（§2.7）同时记 `subject_id`/`issuer_id`。普通 FDE 自签 = issuer = subject = owner；admin 代签他人 private = issuer = subject = admin。
 
-### 2.11 跳站请求防护（#234，工单 `feat-261013-01`）
+### 2.11 跨站请求防护（#234，工单 `feat-261013-01`）
 
-**威胁模型**：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（§2.5）。Lax 只挡「跳站子资源/XHR 携带 cookie」这一半；登录端点在拿到 cookie 前根本不需要 cookie，一发给 `POST /api/auth/login` 就能把用户种成攻击者的会话（登录 CSRF）。本部署又在 Traefik 后面、入口多个（`station.fde.erix.vip` 与 `100.100.0.3`），cookie 自身不区分发起方。故补一道**不读 cookie、不靠配置项**的服务端防线，并把拒绝写审计（可观测）。
+**威胁模型**：session cookie 是 host-only 会话 cookie + `SameSite=Lax`（§2.5）。Lax 只挡「跨站子资源/XHR 携带 cookie」这一半；登录端点在拿到 cookie 前根本不需要 cookie，一发给 `POST /api/auth/login` 就能把用户种成攻击者的会话（登录 CSRF）。本部署又在 Traefik 后面、入口多个（`station.fde.erix.vip` 与 `100.100.0.3`），cookie 自身不区分发起方。故补一道**不读 cookie、不靠配置项**的服务端防线，并把拒绝写审计（可观测）。
 
 **落点**：`portal/src/http.js` 的纯函数 `checkSameOrigin({method, originHeader, secFetchSiteHeader, hostHeader, forwardedHostHeader})` + 豁免包装 `csrfGateFor(req, pathname)`，在 `routeApi` 里、**分派到任何 handler 之前**统一执行（故拒绝一定发生在副作用之前；`POST /api/login` 的 307 兼容跳转也在这道防线之后）。测试：`portal/test/csrf-origin.test.js`。
 
@@ -537,9 +537,9 @@ station-portal user enable  --login <login>
 
 **归一化**：小写、剔首尾空白、剥掉**与该 scheme 相同**的默认端口（`http:80` / `https:443`）；**非默认端口必须保留**（现网 dev 栈就是 `station.fde.erix.vip:8090` 与 `100.100.0.3:8090`，把端口丢了就是拿 8090 与 80 当同源）。同源基线从请求自己的 Host 派生 ⇒ **零新增配置项**，两个入口天然各自成立（互不充当对方的基线）。
 
-**只比 authority、不比 scheme（契约点，理由写进代码注释）**：本部署处在 http（dev `:8090` / `100.100.0.3:8090`）与 https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；拿 scheme 参战会把「同一个站点的 http/https 两面」误杀成跳站。CSRF 要防的是**别的站点**带本站 cookie 发写请求，同站不同 scheme 不构成这个威胁，所以 scheme 只用在上表的默认端口归一化。
+**只比 authority、不比 scheme（契约点，理由写进代码注释）**：本部署处在 http（dev `:8090` / `100.100.0.3:8090`）与 https 共存的过渡期，portal 又常在边缘卸载 TLS，`X-Forwarded-Proto` 与 Origin 的 scheme 不总是同形；拿 scheme 参战会把「同一个站点的 http/https 两面」误杀成跨站。CSRF 要防的是**别的站点**带本站 cookie 发写请求，同站不同 scheme 不构成这个威胁，所以 scheme 只用在上表的默认端口归一化。
 
-**畸形一律拒（绝不「解析失败当同源」）**：`Origin` 不可解析 / 多值（重复头被 Node 拼成 `a, b`）/ 含空白或制表或 CR-LF / 带路径（与 #241 的 CORS 形状口径一致）/ opaque `null` ⇒ 拒；有 `Origin` 但请求自身 authority 缺失或不合法（无 Host、XFH 多值、带 scheme）⇒ 也拒。`Sec-Fetch-Site` 的多值同样按 token 展开：**跳站 token 只要出现过就算跨站**（同站 token 洗不白它，fail-closed）。
+**畸形一律拒（绝不「解析失败当同源」）**：`Origin` 不可解析 / 多值（重复头被 Node 拼成 `a, b`）/ 含空白或制表或 CR-LF / 带路径（与 #241 的 CORS 形状口径一致）/ opaque `null` ⇒ 拒；有 `Origin` 但请求自身 authority 缺失或不合法（无 Host、XFH 多值、带 scheme）⇒ 也拒。`Sec-Fetch-Site` 的多值同样按 token 展开：**跨站 token 只要出现过就算跨站**（同站 token 洗不白它，fail-closed）。
 
 **拒绝响应**：`403` + 新错误码 `cross_origin_forbidden`（`retryable=false`，`details={origin, sec_fetch_site, method}`，**不含 cookie**），响应头带 #241 那套 CORS deny 头（`corsDenyHeaders(origin)`，§1.2）——否则浏览器只报 `No 'Access-Control-Allow-Origin'` 而看不到真实原因（AGENTS §8.11 踩过的坑）；无 Origin / 畸形 Origin 时不回显（防响应头注入），状态码不变。
 
@@ -1221,7 +1221,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | 9 | 开发期 cookie 切换方式 | `COOKIE_PROFILE=prod\|dev-http` | §2.5（已落地 env §10） |
 | 10 | argon2id 参数 / 口令长度下限 | `m=19MiB,t=2,p=1` / 长度 ≥ 12 | §2.9.4 |
 | 11 | 本地 admin 数量上限 | 1~2（或收紧为 1） | §2.9.1 |
-| 12 | #234 跳站写请求防线的两个口径（**已定稿**，工单 `feat-261013-01`，口径修正见同分支返修）：① **只比 authority 不比 scheme**（http/https 混合部署期不得误杀，scheme 只用于默认端口归一化）；② **预览 host 的页面里调 portal API 会被拒**（返修后本条才真的成立：预览 host 与 portal 同注册域 ⇒ SFS 是 `same-site`，而 `same-site` **不直接放行**、落到 Origin 比对后拒；旧实现下它会在判据 b 被放行，第 ② 条名存实亡。口径：预览应用本来就不该调 portal API，#212/#263 下读路径早已断，故不是回归）——第 ② 条是**对外可见的语义变化**，已部署的预览应用如有旧调用需告知 | §1.2 / §2.5 / §2.11 |
+| 12 | #234 跨站写请求防线的两个口径（**已定稿**，工单 `feat-261013-01`，口径修正见同分支返修）：① **只比 authority 不比 scheme**（http/https 混合部署期不得误杀，scheme 只用于默认端口归一化）；② **预览 host 的页面里调 portal API 会被拒**（返修后本条才真的成立：预览 host 与 portal 同注册域 ⇒ SFS 是 `same-site`，而 `same-site` **不直接放行**、落到 Origin 比对后拒；旧实现下它会在判据 b 被放行，第 ② 条名存实亡。口径：预览应用本来就不该调 portal API，#212/#263 下读路径早已断，故不是回归）——第 ② 条是**对外可见的语义变化**，已部署的预览应用如有旧调用需告知 | §1.2 / §2.5 / §2.11 |
 
 ---
 
