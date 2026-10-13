@@ -22,6 +22,108 @@ const MIGRATION_LOCK_KEY = 74452311;
 const BASELINE_SENTINEL = 'sha256:<computed-by-migration-runner>';
 const BASELINE_VERSION = '0000_baseline';
 
+// ---- issue #280：迁移身份必须与业务表属主一致（口径见 deploy/migrations/README.md「迁移身份」）----
+// 事实链：docs/data/bootstrap.sql:52-56 把 public 下表/序列属主**归正给平台库角色**（deploy/.env 的
+//   PLATFORM_DB_USER，缺省 station_platform），并声明前提「后续 deploy/migrations/* 由其执行」。
+//   而 PG 的 `ALTER SEQUENCE … OWNED BY` 要求序列与表**同属主**（routine=process_owned_by）；
+//   0016 正是 CREATE SEQUENCE + OWNED BY 的形状 ⇒ 迁移连接角色 ≠ 表属主时，**整个迁移在 0016 失败**。
+//   触发面：config.js 的 migrateDatabaseUrl 缺省回退 DATABASE_URL（通常是超级用户）⇒ 只设 DATABASE_URL
+//   的手工/救灾路径必炸（compose 显式设 MIGRATE_DATABASE_URL=平台角色，故不触发）。
+// 落点：必须在 applyBootstrap **之后**（bootstrap.sql 要 CREATE ROLE / GRANT / 归正属主，非超级用户
+//   跑不动它，且「谁是属主」这件事本身就是它决定的）、增量迁移循环**之前**。把属主同步挪到迁移前或
+//   迁移后都救不了（0016 在循环内部就炸，同步跑不到——已实测否决）。
+// 不改迁移文件字节：runner 按 sha256 记 checksum，改既有迁移 = 现存库全部拒启。
+const ROLE_IDENTIFIER = /^[a-z_][a-z0-9_$]{0,62}$/i;
+
+/** 角色名是标识符不是值：白名单校验 + 双引号包裹（防注入，且允许 $ / 数字等非默认折叠字符）。 */
+function quoteRoleIdentifier(name, label) {
+  if (typeof name !== 'string' || !ROLE_IDENTIFIER.test(name)) {
+    throw new Error(`${label}「${name}」不是合法的角色标识符（^[a-z_][a-z0-9_$]{0,62}$）`);
+  }
+  return `"${name}"`;
+}
+
+/** 取连接串里的连接角色名（解析不出来 → null）。口径与 config.js 的 migrateDatabaseUrl 一致。 */
+export function roleFromDatabaseUrl(url) {
+  if (typeof url !== 'string' || !url.trim()) return null;
+  try {
+    const user = decodeURIComponent(new URL(url).username || '').trim();
+    return user || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 目标迁移角色 = 必须与业务表同属主的那个角色。**纯函数，不碰 DB**（无 PG 环境也能单测）。
+ * 优先级：显式注入 platformRole / env.PLATFORM_DB_USER（配置点名）> 迁移连接串用户 > 库内实测表属主。
+ * 取不到（或与当前角色同名）⇒ 返回当前角色 ⇒ 调用方必须是**无副作用的 no-op**（compose 路径即此形态）。
+ * 「实测表属主」这一档是救灾路径的关键：只设 DATABASE_URL 时连接串用户就是超级用户（= 当前角色，
+ * 点名等于没说），而 PG 的约束字面上就是「与表同属主」，所以从库里量出来的必然是对的那个角色。
+ */
+export function resolveMigrationRole({ configured, urlRole, measuredOwner, currentRole } = {}) {
+  const current = typeof currentRole === 'string' ? currentRole.trim() : '';
+  for (const candidate of [configured, urlRole, measuredOwner]) {
+    const role = typeof candidate === 'string' ? candidate.trim() : '';
+    if (role && role !== current) return role;
+  }
+  return current;
+}
+
+/** 量出「业务表属主」：优先 schema_migrations（runner 自己写的表），否则取 public 下最多的那个属主。 */
+const OWNER_OF_APPLIED_OBJECTS_SQL = `SELECT COALESCE(
+         (SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'schema_migrations'),
+         (SELECT tableowner FROM pg_tables WHERE schemaname = 'public'
+             GROUP BY tableowner ORDER BY count(*) DESC, tableowner LIMIT 1)
+       ) AS owner`;
+
+/**
+ * 把当前连接切到平台库角色（= 业务表属主）。返回 { changed, target, previous } 供 finally 还原。
+ * 已是该角色 ⇒ 不发任何语句（无副作用 no-op）；SET ROLE 被拒 ⇒ fail fast 报可操作错误，
+ * 不让人到 0016 里去读 PG 内部报错（静默跳过 = 陷阱还在，同样不允许）。
+ */
+async function enterMigrationRole(client, { configuredRole, urlRole, log }) {
+  const measuredOwner = (await client.query(OWNER_OF_APPLIED_OBJECTS_SQL)).rows?.[0]?.owner ?? null;
+  const currentRole = (await client.query('SELECT current_user AS role')).rows?.[0]?.role ?? '';
+  const target = resolveMigrationRole({
+    configured: configuredRole,
+    urlRole,
+    measuredOwner,
+    currentRole,
+  });
+  if (!target) return { changed: false, target: null, previous: currentRole };
+  if (target === currentRole) {
+    log.log(`[migrate] 迁移身份已是平台库角色 ${target}（无副作用 no-op，不发 SET ROLE）`);
+    return { changed: false, target, previous: currentRole };
+  }
+  try {
+    await client.query(`SET ROLE ${quoteRoleIdentifier(target, '目标迁移角色')}`);
+  } catch (err) {
+    throw new Error(
+      `[migrate] 迁移身份切换失败：当前连接角色 ${currentRole} 无法 SET ROLE 到平台库角色 ${target}，` +
+        `无法承担 DDL 属主（迁移内 CREATE … OWNED BY 要求与表同属主，见 0016）。` +
+        `请把 MIGRATE_DATABASE_URL 指向平台库角色 ${target}（= deploy/.env 的 PLATFORM_DB_USER；` +
+        `只设 DATABASE_URL 时 migrateDatabaseUrl 回退成它，通常是超级用户，承担不了 DDL 属主）。` +
+        `原始错误：${err.message}`,
+      { cause: err },
+    );
+  }
+  log.log(`[migrate] SET ROLE ${target}（原连接角色 ${currentRole}；迁移循环结束/异常后还原）`);
+  return { changed: true, target, previous: currentRole };
+}
+
+/** 还原角色：pool 会复用连接，残留 SET ROLE 会把后续同连接查询的属主语义一起改掉（必须还原）。 */
+async function exitMigrationRole(client, state, log) {
+  if (!state || !state.changed) return;
+  try {
+    await client.query('RESET ROLE');
+    log.log(`[migrate] RESET ROLE（还原连接角色 ${state.previous}）`);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    log.log(`[migrate] ⚠️ RESET ROLE 失败：连接归还 pool 后角色可能残留（${state.previous} → ${state.target}）：${err.message}`);
+  }
+}
+
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
@@ -133,6 +235,12 @@ export async function migrate(pool, opts = {}) {
   const log = opts.log ?? console;
   // 迁移身份（station_platform）与 bootstrap 超级用户可分离；未拆分时回退到同一 pool。
   const bootstrapPool = opts.bootstrapPool ?? pool;
+  // 平台库角色点名（issue #280）：显式注入 > PLATFORM_DB_USER > 迁移连接串用户（见 config.js:144-151）。
+  const env = opts.env ?? process.env;
+  const configuredRole = opts.platformRole ?? env.PLATFORM_DB_USER ?? null;
+  const urlRole = roleFromDatabaseUrl(
+    opts.migrateDatabaseUrl ?? env.MIGRATE_DATABASE_URL ?? env.DATABASE_URL,
+  );
 
   const schemaSql = fs.readFileSync(schemaSqlPath, 'utf8');
   const expectedBaselineChecksum = `sha256:${sha256(schemaSql)}`;
@@ -181,33 +289,42 @@ export async function migrate(pool, opts = {}) {
       if (bootstrapPool !== pool) bootstrapClient.release();
     }
 
-    // 增量迁移（deploy/migrations/*.sql，文件名升序）。
-    for (const { version, file } of listMigrationFiles(migrationsDir)) {
-      const content = fs.readFileSync(file, 'utf8');
-      const checksum = `sha256:${sha256(content)}`;
-      const existing = await client.query(
-        `SELECT checksum FROM schema_migrations WHERE version = $1`,
-        [version],
-      );
-      if (existing.rows.length > 0) {
-        if (existing.rows[0].checksum !== checksum) {
-          throw new Error(`migration ${version} checksum mismatch; refusing to start`);
-        }
-        continue;
-      }
-      log.log(`[migrate] applying ${version}`);
-      await client.query('BEGIN');
-      try {
-        await client.query(content);
-        await client.query(
-          `INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)`,
-          [version, checksum],
+    // 迁移身份对齐（issue #280）：上面 applyBootstrap 已把属主归正给平台库角色，这里把**本连接**
+    // 切成那个角色，循环里的 DDL 与 schema_migrations 写入都以它执行（否则 0016 的
+    // `ALTER SEQUENCE … OWNED BY` 撞 `sequence must have same owner as table it is linked to`）。
+    const roleState = await enterMigrationRole(client, { configuredRole, urlRole, log });
+    try {
+      // 增量迁移（deploy/migrations/*.sql，文件名升序）。
+      for (const { version, file } of listMigrationFiles(migrationsDir)) {
+        const content = fs.readFileSync(file, 'utf8');
+        const checksum = `sha256:${sha256(content)}`;
+        const existing = await client.query(
+          `SELECT checksum FROM schema_migrations WHERE version = $1`,
+          [version],
         );
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
+        if (existing.rows.length > 0) {
+          if (existing.rows[0].checksum !== checksum) {
+            throw new Error(`migration ${version} checksum mismatch; refusing to start`);
+          }
+          continue;
+        }
+        log.log(`[migrate] applying ${version}`);
+        await client.query('BEGIN');
+        try {
+          await client.query(content);
+          await client.query(
+            `INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)`,
+            [version, checksum],
+          );
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
       }
+    } finally {
+      // 成功与异常两条路径都必须还原（连接马上要归还 pool 复用）。
+      await exitMigrationRole(client, roleState, log);
     }
 
     return { baselineAppliedNow: !baselineApplied, baselineChecksum: expectedBaselineChecksum };
