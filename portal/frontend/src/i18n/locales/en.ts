@@ -54,14 +54,55 @@ export const en = {
     submitting: 'Changing…',
     mismatch: 'The two new passwords do not match',
     incomplete: 'Enter your current password and a new password',
-    // Interim failure surface (①): render the server error.code / error.message verbatim as strings.
-    // The full error-code → copy table lands in the follow-up ticket; no local code table here.
-    serverError: 'Change failed ({code}): {message}',
-    genericError: 'Change failed: {message}',
+    // The #255 ① stopgap `serverError` / `genericError` keys (which just echoed code/message) are
+    // replaced wholesale by the `errors.*` table below — no second path left for later readers to find.
     // Session semantics (§2.6a): self-service change keeps the current session and revokes the
     // others ⇒ never say "you have to sign in again".
     sessionHint: 'This sign-in stays valid; your sessions elsewhere are revoked.',
     logout: 'Use another account / sign out',
+    // #255 frontend ②: **error code → actionable copy** table (portal.md §1.2 / §2.6a / §2.11 / §2.11a).
+    // Each entry says what to do next; the raw server evidence is appended via `detail` (server
+    // error.message is never translated on the client). Key names = server `error.code`;
+    // `unknown_code` / `*_no_retry` / `no_*` are client-side fallback keys with no server counterpart.
+    errors: {
+      // 401 invalid_credentials: §2.6a says it is deliberately the *same* code as a failed login ⇒
+      // only `code` can tell it apart from 401 unauthorized. A status-based mapping must never win
+      // over the code mapping, or a wrong old password would be read as an expired session.
+      invalid_credentials: 'That current password is wrong. Re-enter the password you are using right now (not the new one you want), or use the sign-out button below and ask an administrator to set a fresh one.',
+      validation_failed: 'The “{field}” field did not pass validation. Fix that field as described and submit again.',
+      // 401 unauthorized: no live session left ⇒ the only way out is signing in again (action=relogin).
+      unauthorized: 'This sign-in has expired, and changing a password needs a live session. Use the sign-out button below to return to the sign-in page and sign in again.',
+      forbidden: 'This account is not allowed to perform the change. Check the account state with an administrator and try again.',
+      // 403 cross_origin_forbidden (#234 same-origin defence, §2.11): “not entitled to send this
+      // request”, not “not allowed to do this”.
+      cross_origin_forbidden: 'The browser marked this submission as cross-site and the same-origin defence rejected it. Open this page directly from the address bar and retry there instead of changing the password from a window embedded in another site.',
+      // 405: §211a deliberately allows any method on this endpoint so it is *not* rewritten to 403 ⇒
+      // seeing 405 means something in between changed the method.
+      method_not_allowed: 'This endpoint only accepts POST: something (a proxy or a cache) most likely rewrote the method. Hard-refresh the page and retry; if it keeps failing, hand the error code below to an administrator.',
+      // 429 / 503 both carry Retry-After (§2.6a): the seconds come from {seconds}; when the header is
+      // absent fall back to the *_no_retry keys.
+      rate_limited: 'Too many password-change attempts, so you are rate limited for {seconds} seconds. Wait it out — clicking again only extends it.',
+      rate_limited_no_retry: 'Too many password-change attempts, so you are rate limited. Wait a little while before submitting again — clicking again only extends it.',
+      kdf_busy: 'The server is busy (its password-derivation gate is full — one change runs scrypt twice). Your password is not the problem; try again in {seconds} seconds.',
+      kdf_busy_no_retry: 'The server is busy (its password-derivation gate is full). Your password is not the problem; try again in a moment.',
+      internal: 'The server failed and this change was not applied. Retry once; if it still fails, hand the error code below to an administrator verbatim.',
+      // Unknown-code fallback: **never silently degrade to a generic error** — carry the code and the
+      // HTTP status verbatim so the failure can be reported.
+      unknown_code: 'Unrecognised error (HTTP {status}, code {code}). Retry once; if it still fails, hand that status and error code verbatim to an administrator.',
+      // Raw evidence appended to every message (server message passed through untranslated).
+      detail: 'Server said: {message} (code {code})',
+      no_message: 'the server returned no message',
+      no_code: 'no error code',
+      field: {
+        current_password: 'current password',
+        new_password: 'new password',
+        confirm_password: 'confirm new password',
+        // The contract only promises a field name; carry anything else through verbatim and say so.
+        other: '{field} (unrecognised field name)',
+        // No `field` in details (or an empty one): never render an empty quote pair.
+        missing: 'an unspecified field',
+      },
+    },
   },
   workbench: {
     nav: '☰ Navigation',

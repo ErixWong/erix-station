@@ -68,13 +68,49 @@ export const zhCN = {
     submitting: '修改中…',
     mismatch: '两次输入的新口令不一致',
     incomplete: '请填写当前口令和新口令',
-    // 失败态兜底（① 的口径）：把服务端 error.code / error.message 原样渲染成字符串；
-    // 完整的「错误码 → 文案」映射表留给下一张单，此处不做本地码表翻译。
-    serverError: '修改失败（{code}）：{message}',
-    genericError: '修改失败：{message}',
+    // 失败态文案：① 留下的 `serverError` / `genericError`（把 code/message 原样拼一句）已被
+    // 下面的 `errors.*` 映射表整取代码（码 → 可行动文案），不在 locale 里留旧键免得后人以为还有两条链路。
     // 会话语义（§2.6a）：自助改密保留当前会话、只吊销其它会话 ⇒ 不要写成「需要重新登录」。
     sessionHint: '改密后本次登录继续有效，你在别处登录的会话会失效。',
     logout: '换个账号 / 退出登录',
+    // #255 前端 ②：**错误码 → 可行动文案**映射表（portal.md §1.2 / §2.6a / §2.11 / §2.11a）。
+    // 每条只写「下一步做什么」；服务端原文与错误码由 `detail` 统一附在句尾（error.message 不在前端翻译范围）。
+    // 键名 = 服务端 `error.code`（`unknown_code` / `no_*` 是前端自造的兜底键，不对应任何码）。
+    errors: {
+      // 401 invalid_credentials：§2.6a 明确「与登录失败同一个码」⇒ 与 401 unauthorized 只能靠 code 区分，
+      // 状态码映射绝不能盖过 code 映射（否则输错旧口令会被当成会话过期踢回登录页）。
+      invalid_credentials: '「当前口令」不对：请重新输入你现在正在用的那一枚（不是准备换上的新口令）；想不起来就点下面的「换个账号 / 退出登录」，请管理员重新代设一枚。',
+      validation_failed: '「{field}」这一项没通过校验：请按说明改好这一项再提交。',
+      // 401 unauthorized：会话没了 ⇒ 改密屏已经没有能改密的会话，唯一出路是重新登录（行为见 action=relogin）。
+      unauthorized: '本次登录已过期：改密需要一枚有效会话，请点下面的「换个账号 / 退出登录」回到登录页重新登录。',
+      forbidden: '当前账号不能执行这次改密：请联系管理员确认账号状态后重试。',
+      // 403 cross_origin_forbidden（#234 同源防线，§2.11）：与 forbidden 的差别是「没资格发这个请求」。
+      cross_origin_forbidden: '浏览器把这次提交判定为跨站请求，已被同源防线拦下：请在浏览器地址栏里直接打开本站页面后重试，别从其它站点内嵌的窗口里改密。',
+      // 405：§2.11a 特意让本端点「不限方法」，就是为了让它不被门改写成 403 ⇒ 见到 405 说明方法在半路被改。
+      method_not_allowed: '这个接口只接受 POST：请求方法多半被代理或缓存改写了，请强制刷新页面后重试，仍然失败就把下面这行错误码交给管理员。',
+      // 429 / 503 都带 Retry-After（§2.6a）：等待秒数由 {seconds} 注入；缺头时退到 *_no_retry 键。
+      rate_limited: '改密尝试太频繁，已被临时限流：请 {seconds} 秒后再提交，期间反复点只会更久。',
+      rate_limited_no_retry: '改密尝试太频繁，已被临时限流：请等一会儿再提交，期间反复点只会更久。',
+      kdf_busy: '服务器正忙（口令派生的并发闸已满，一次改密要跑两次 scrypt）：这不是你的口令有问题，请 {seconds} 秒后重试。',
+      kdf_busy_no_retry: '服务器正忙（口令派生的并发闸已满）：这不是你的口令有问题，请稍后重试。',
+      internal: '服务端出错，这次改密没写成：请稍后重试一次，仍然失败就把下面这行错误码原样交给管理员。',
+      // 未知码兜底：**不许静默成通用错误**，必须把 code 与 HTTP 状态码原样带出来供报障。
+      unknown_code: '未收录的错误（HTTP {status}，错误码 {code}）：请重试一次，仍然失败就把上面这行状态码与错误码原样交给管理员。',
+      // 统一附在句尾的原始证据（服务端 message 原样透传，不翻译）。
+      detail: '服务端说明：{message}（错误码 {code}）',
+      no_message: '服务端未给出说明',
+      no_code: '无错误码',
+      // validation_failed 的 `error.details.field`（§4.7a 口径：把错误指到具体输入框）。
+      field: {
+        current_password: '当前口令',
+        new_password: '新口令',
+        confirm_password: '确认新口令',
+        // 契约只保证 field 是字段名；出现没见过的名字（含非字符串）就原样带出来并明说认不出。
+        other: '{field}（未收录的字段名）',
+        // details 里根本没带 field（或 field 是空串）：不许渲染成空引号「」。
+        missing: '未指明字段',
+      },
+    },
   },
   // 工作台壳（views/WorkbenchView.vue 顶栏 + workbench store 的展示文案/通知）
   workbench: {

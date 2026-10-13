@@ -2,6 +2,7 @@
 // JSON 信封、错误 message 取自 body.error.message，兜底文案走 errors.requestFailed（issue #101 P2）。
 
 import { i18n } from './i18n';
+import { isPasswordChangeRequired, notifyRestrictedSession } from './lib/restrictedSession';
 
 export class ApiError extends Error {
   status: number;
@@ -12,18 +13,26 @@ export class ApiError extends Error {
    * 是哪个字段。纯增量：既有调用方只读 status/code/message，行为不变。
    */
   details: Record<string, unknown> | undefined;
+  /**
+   * `Retry-After` 头里的**秒数**（#255：429 `rate_limited` 与 503 `kdf_busy` 都带它，portal.md §2.6a）。
+   * 没带头 / 头不可解 ⇒ `null`（文案退到不带秒数的版本，而不是显示 "undefined 秒"）。
+   * 纯 additive：既有调用方不读它。
+   */
+  retryAfter: number | null;
 
   constructor(
     message: string,
     status: number,
     code?: string,
     details?: Record<string, unknown>,
+    retryAfter: number | null = null,
   ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.details = details;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -48,6 +57,28 @@ export function toDisplayText(value: unknown): string {
   return String(value);
 }
 
+/**
+ * `Retry-After` 头 → 秒数（#255）。契约上 429/503 带的是「秒」（portal.md §2.6a），
+ * 但 §1.2 的通用口径允许 HTTP-date ⇒ 两种都收，不可解一律 `null`（宁可少说一个数字，不说假数字）。
+ */
+export function parseRetryAfter(value: string | null | undefined): number | null {
+  const text = (value ?? '').trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isFinite(seconds) ? seconds : null;
+  }
+  const at = Date.parse(text);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, Math.round((at - Date.now()) / 1000));
+}
+
+/**
+ * #255 全局兜底（§2.11a）：任意请求撞上受限会话门 ⇒ 在抛出前先把旗标交给集中的监听器
+ * （接线见 lib/restrictedSession.ts + router.ts），于是调用方的 catch 看到的是「旗标已置位」之后的
+ * 世界——切屏不靠每个视图自己判码。监听器里出错绝不能吞掉真正的请求失败，故 try/catch 包住。
+ */
+
 // 401/403 之外的非预期错误（网络断开等）也会带兜底文案，便于登录页直接展示。
 export async function api<T = unknown>(path: string, opts: RequestInit = {}): Promise<T> {
   const r = await fetch(path, {
@@ -59,12 +90,23 @@ export async function api<T = unknown>(path: string, opts: RequestInit = {}): Pr
   } & T;
   if (!r.ok) {
     // 兜底文案在抛出时取词（非组件上下文：i18n.global.t）；服务端 error.message 原样透传（不在前端翻译范围）。
-    throw new ApiError(
+    const code = body?.error?.code === undefined ? undefined : toDisplayText(body.error.code);
+    const error = new ApiError(
       toDisplayText(body?.error?.message) || i18n.global.t('errors.requestFailed', { status: r.status }),
       r.status,
-      body?.error?.code === undefined ? undefined : toDisplayText(body.error.code),
+      code,
       body?.error?.details,
+      parseRetryAfter(r.headers.get('Retry-After')),
     );
+    // #255 全局兜底（§2.11a）：先置旗标再抛出（上面那段注释说明了为什么顺序不能倒）。
+    if (isPasswordChangeRequired(error)) {
+      try {
+        notifyRestrictedSession(error);
+      } catch {
+        /* 接线方的异常不许掩盖真正的 403 */
+      }
+    }
+    throw error;
   }
   return body;
 }

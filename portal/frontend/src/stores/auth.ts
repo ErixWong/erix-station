@@ -44,12 +44,19 @@ interface ChangePasswordResponse {
 }
 
 /**
- * 受限会话改密失败态（① 的兜底口径）：把服务端 `error.code` / `error.message` 原样渲染成字符串；
- * 完整的「错误码 → 文案」映射表留给下一张单。
+ * 受限会话改密失败态（前端 ② 的形状）：除了 `code`/`message`（① 口径：原样成字符串），
+ * 还带 `status` / `details` / `retryAfter` ⇒ 文案映射表能把「下一步做什么」说完整
+ * （哪个框不对、等多少秒、要不要重登），见 lib/forcePasswordErrors.ts。
  */
 export interface ChangePasswordError {
   code: string;
   message: string;
+  /** HTTP 状态码（0 = 非 HTTP 失败，如网络层报错）。 */
+  status: number;
+  /** 服务端 `error.details`（`validation_failed` 靠 `details.field` 指到输入框）。 */
+  details?: Record<string, unknown>;
+  /** `Retry-After` 秒数（429 / 503 带）。 */
+  retryAfter?: number | null;
 }
 
 // afterLoginRoute：admin 且无 fde_name（平台管理员）→ /admin（默认重定向至 /admin/users）；其余回工作台。
@@ -181,14 +188,45 @@ export const useAuthStore = defineStore('auth', {
         await this.refreshMe();
         return !this.passwordChangeRequired;
       } catch (err) {
-        const code = err instanceof ApiError ? toDisplayText(err.code) : '';
-        const message = toDisplayText(err instanceof Error ? err.message : err);
-        this.changePasswordError = { code, message };
-        this.error = message;
+        const apiErr = err instanceof ApiError ? err : null;
+        this.changePasswordError = {
+          code: apiErr ? toDisplayText(apiErr.code) : '',
+          message: toDisplayText(err instanceof Error ? err.message : err),
+          // 非 ApiError（fetch 抛 TypeError 等）没有状态码 ⇒ 0，文案侧退到 unknown_code 带「HTTP 0」。
+          status: apiErr?.status ?? 0,
+          details: apiErr?.details,
+          retryAfter: apiErr?.retryAfter ?? null,
+        };
+        this.error = this.changePasswordError.message;
         return false;
       } finally {
         this.loading = false;
       }
+    },
+
+    /**
+     * #255 全局兜底的**唯一旗标写点**（§2.11a）：任意请求返回 `403 password_change_required`
+     * ⇒ 说明服务端认为这个会话欠一次改密（即便登录响应与上一轮 `GET /api/me` 都没这么说）。
+     *
+     * 调用方：`router.ts` 里注册的全局监听器（接线在 lib/restrictedSession.ts）。**视图不得直接调**：
+     * 判码散进视图 ⇒ 第二个视图接入必漏。这里不改 `user`（会话仍然有效，§2.11a 的判据是「已认证」）。
+     */
+    markRestrictedSession() {
+      this.passwordChangeRequired = true;
+    },
+
+    /**
+     * #255：会话已死（改密时收到 401 `unauthorized`）⇒ 本地收摊，回登录页重登。
+     * 不调服务端 logout（会话本来就没了），也**不能**留在改密屏反复撞 401。
+     * 无会话 ⇒ 受限态一并清掉（否则 App 闸门会把登录页也挡死，与 `logout()` 同口径）。
+     */
+    forgetExpiredSession() {
+      this.user = null;
+      this.pendingToken = null;
+      this.ready = true;
+      this.passwordChangeRequired = false;
+      this.error = null;
+      // 保留 changePasswordError：改密屏已卸载，但下一轮进屏时 onSubmit 会重置它。
     },
 
     /** 返回重新登录：清 pendingToken/错误（旧版 location.reload() 的等价重置）。 */
