@@ -101,7 +101,7 @@ class StopPool {
       return { rows, rowCount: rows.length };
     }
 
-    // ---- 出队：run_queue → cancelled + 清租约字段 ----
+    // ---- 出队：run_queue → cancelled + 清租约字段（RETURNING attempts 供 run_end 载荷的 attempt 字段）----
     if (s.includes('UPDATE run_queue') && s.includes("SET status = 'cancelled'")) {
       const q = this.queueFor(params[0]);
       if (!q) return { rows: [], rowCount: 0 };
@@ -110,6 +110,34 @@ class StopPool {
       q.owner_container_id = null;
       q.lease_until = null;
       q.claimed_at = null;
+      return { rows: [{ attempts: q.attempts }], rowCount: 1 };
+    }
+
+    // ---- 合成 run_end（#277-A2 返修 2）：照 DDL 的两条约束真仿真 ----
+    // UNIQUE (run_id, client_event_id)：被 `ON CONFLICT (run_id, client_event_id) DO NOTHING` 仲裁 → 静默丢弃；
+    //   没有写 arbiter 就抛（否则「幂等」在 fake 里永远假通过）。
+    // 部分唯一索引 run_events_run_end_key ON (run_id) WHERE type='run_end'：同一 run 的第二条 run_end
+    //   （即使 client_event_id 不同）**不被仲裁** → 报错，照真库行为。
+    // UNIQUE (session_id, seq)：seq 不单调/重复分配也报错。
+    if (s.includes('INSERT INTO run_events')) {
+      // 与 finishRun / terminateActiveRuns 同形：type 是 SQL 里的字面量，params 只带 5 个值。
+      const [run_id, session_id, seq, client_event_id, payloadJson, extra] = params;
+      const type = extra ?? (/'run_end'/.test(s) ? 'run_end' : 'unknown');
+      const parsed = { run_id, session_id, seq, client_event_id, type, payload: JSON.parse(payloadJson) };
+      const dupKey = this.events.find((e) => e.run_id === run_id && e.client_event_id === client_event_id);
+      if (dupKey) {
+        if (!/ON CONFLICT \(run_id, client_event_id\) DO NOTHING/i.test(s)) {
+          throw new Error(`duplicate key value violates unique constraint "run_events_run_id_client_event_id_key"`);
+        }
+        return { rows: [], rowCount: 0 };
+      }
+      if (type === 'run_end' && this.events.some((e) => e.run_id === run_id && e.type === 'run_end')) {
+        throw new Error('duplicate key value violates unique constraint "run_events_run_end_key"');
+      }
+      if (this.events.some((e) => e.session_id === session_id && e.seq === seq)) {
+        throw new Error('duplicate key value violates unique constraint "run_events_session_id_seq_key"');
+      }
+      this.events.push(parsed);
       return { rows: [{}], rowCount: 1 };
     }
 
@@ -194,6 +222,10 @@ class StopPool {
   async connect() {
     return { query: (sql, params) => this.query(sql, params), release() {} };
   }
+
+  /** 执行日志里的语句序列（只取影响判据的那几个标记）——用于「同事务」断言。 */
+  journalOf(marker) { return this.sqlJournal.filter((e) => marker.test(e.sql)).map((e) => e.sql); }
+  markerIndex(marker) { return this.sqlJournal.findIndex((e) => marker.test(e.sql)); }
 }
 
 const stop = (pool) => stopSession(pool, { userId: UID, sessionId: SID });
@@ -339,6 +371,125 @@ test('#277-A2 未领走（pending）仍是直接终态：守卫只排「已领�
   assert.equal(out.run.status, 'finished');
   assert.equal(pool.runRow().termination?.reason, 'aborted');
   assert.equal(pool.queueFor('run-p').status, 'cancelled');
+});
+
+// ===========================================================================
+// #277-A2 返修 2：queued 直接终态那条路必须**同事务合成 `run_end`**。
+// 不合成则活页面的输入框要等刷新才能摘「运行中」（用户原话）。写法照 internal.js finishRun /
+// provisioner.js terminateActiveRuns 的先例（client_event_id = `<runId>:final:run_end`、seq 走 allocSeq、
+// ON CONFLICT DO NOTHING、提交后推 SSE）。
+// 注意：`run_end` 在 SSE 实时下发，但**历史回放白名单故意不含它**（http.js HISTORY_EVENT_TYPES，
+// #89 契约）——本组用例断的是「事件确实落了 run_events 表且 seq 单调」，不去断历史端点可见性。
+// ===========================================================================
+
+/** 带 SSE 捕获的 stop：记录推送时刻的 pool.commits，用来断「必须在 COMMIT 之后」。 */
+async function stopWithNotify(pool) {
+  const pushes = [];
+  const out = await stopSession(pool, {
+    userId: UID, sessionId: SID,
+    notify: (sessionId, events) => pushes.push({ sessionId, events, commits: pool.commits }),
+  });
+  return { out, pushes };
+}
+
+test('#277-A2 queued → stop：run_events 落下 run_end（reason=aborted）且 seq 单调、SSE 在提交后', async () => {
+  const pool = new StopPool({ run: { id: 'run-q', status: 'queued' } });
+  const seqBefore = pool.session.last_seq;
+
+  const { out, pushes } = await stopWithNotify(pool);
+
+  assert.equal(out.run.status, 'finished');
+  assert.equal(pool.events.length, 1, '直接终态必须合成一条 run_end（不合成则前端要等刷新）');
+  const ev = pool.events[0];
+  assert.equal(ev.type, 'run_end');
+  assert.equal(ev.run_id, 'run-q');
+  assert.equal(ev.session_id, SID, '冗余列 session_id 必须写（SSE 按 session 补发靠它）');
+  assert.equal(ev.client_event_id, 'run-q:final:run_end', 'client_event_id 口径同 finishRun / offboard');
+  assert.equal(ev.payload.termination.reason, 'aborted', '载荷 reason 必须是 aborted');
+  assert.equal(ev.payload.termination.detail, 'cancelled_before_start');
+  assert.deepEqual(ev.payload.usage, { input_tokens: 0, output_tokens: 0 });
+  assert.equal(ev.payload.rounds, 0);
+  assert.equal(ev.payload.attempt, 0, 'attempt = run_queue.attempts（未被领走过 ⇒ 0），与 finishRun 载荷同构');
+
+  // seq 单调：走 §7.3 统一分配器，严格大于停止前的 last_seq，会话游标同步前移
+  assert.equal(ev.seq, seqBefore + 1, 'seq 必须由 allocSeq 分配（与消息共享同一游标）');
+  assert.equal(pool.session.last_seq, seqBefore + 1, 'last_seq 必须同事务前移');
+
+  // SSE：只推一次，形状与 finishRun 那条同构，且**必须在 COMMIT 之后**
+  assert.equal(pushes.length, 1);
+  assert.equal(pushes[0].sessionId, SID);
+  assert.equal(pushes[0].commits, 1, 'notify 必须在 COMMIT 之后（先于落库到达前端会读到旧状态）');
+  assert.equal(pushes[0].events.length, 1);
+  assert.equal(pushes[0].events[0].type, 'run_end');
+  assert.equal(pushes[0].events[0].seq, ev.seq);
+  assert.equal(pushes[0].events[0].run_id, 'run-q');
+
+  // 同会话第二个 run 再停一次：seq 仍单调递增且无空洞（消息占 1 个 seq，run_end 占 1 个）
+  const second = await send(pool);
+  const secondStop = await stopSession(pool, { userId: UID, sessionId: SID });
+  assert.equal(secondStop.run.id, second.run.id);
+  assert.equal(pool.events.length, 2);
+  assert.ok(pool.events[1].seq > ev.seq, '第二条 run_end 的 seq 必须更大');
+  assert.equal(pool.events[1].seq, pool.session.last_seq, 'seq 无空洞：最后一次分配就是会话游标');
+  assert.equal(pool.session.last_seq, seqBefore + 3, '1 条用户消息 + 2 条 run_end = 3 个 seq');
+});
+
+test('#277-A2 重复停止 ⇒ run_end 仍只有一条（幂等；重放不分配 seq、不重插）', async () => {
+  const pool = new StopPool({ run: { id: 'run-q', status: 'queued' } });
+  await stopSession(pool, { userId: UID, sessionId: SID });
+  const seqAfter = pool.session.last_seq;
+  assert.equal(pool.events.length, 1);
+
+  const second = await stopSession(pool, { userId: UID, sessionId: SID });
+
+  assert.equal(second.run.status, 'finished');
+  assert.equal(pool.events.length, 1, '重复停止不得再插一条 run_end');
+  assert.equal(pool.session.last_seq, seqAfter, '重放路径不得再分配 seq');
+
+  // 幂等的真正护栏：SQL 带 `ON CONFLICT (run_id, client_event_id) DO NOTHING` 仲裁器
+  //（端到端不会重插——第 1 步 CAS 已把终态行排除；但万一重入，只有它能保证不撞唯一约束）。
+  const ins = pool.sqlJournal.find((e) => /INSERT INTO run_events/.test(e.sql));
+  assert.match(ins.sql, /ON CONFLICT \(run_id, client_event_id\) DO NOTHING/, '必须有 run_events 幂等仲裁器');
+  const replay = await pool.query(ins.sql, ins.params);
+  assert.equal(replay.rowCount, 0, '同 client_event_id 重插被仲裁掉（rowCount 0）');
+  assert.equal(pool.events.length, 1, '仲裁后不得多出一行');
+  // 换 client_event_id 的“第二条 run_end”会撞部分唯一索引 run_events_run_end_key ⇒ fake 照真库报错
+  //（证明上面「只有一条」不是 fake pool 没约束换来的）。
+  await assert.rejects(
+    () => pool.query(ins.sql, [ins.params[0], ins.params[1], ins.params[2] + 100, 'other-key', ins.params[4]]),
+    /run_events_run_end_key/,
+  );
+});
+
+test('#277-A2 running → stop 不得多出 run_end（终态事件仍由 worker 的 U2 产出，本片不抢它的活）', async () => {
+  const pool = new StopPool({
+    run: { id: 'run-r', status: 'running', queue_status: 'claimed', claim_token: 'tok', attempts: 1,
+      owner: CID, lease_until: new Date(Date.now() + 90_000), claimed_at: new Date(), started_at: new Date() },
+  });
+
+  const { out, pushes } = await stopWithNotify(pool);
+
+  assert.equal(out.run.status, 'cancelling');
+  assert.equal(pool.events.length, 0, 'cancelling 不是终态：portal 不得提前合成 run_end');
+  assert.equal(pool.session.last_seq, 10, '本路径不得分配 seq');
+  assert.equal(pushes.length, 0, '无事件就不推 SSE');
+});
+
+test('#277-A2 run_end 与 runs 终态同事务：INSERT 必须落在 BEGIN…COMMIT 之间（不照抄 provisioner 的独立小事务 B）', async () => {
+  const pool = new StopPool({ run: { id: 'run-q', status: 'queued' } });
+
+  await stopSession(pool, { userId: UID, sessionId: SID });
+
+  const marks = pool.sqlJournal.map((e) => e.sql);
+  const iUpdate = marks.findIndex((x) => /UPDATE runs/.test(x) && /SET status = 'finished'/.test(x));
+  const iInsert = marks.findIndex((x) => /INSERT INTO run_events/.test(x));
+  const iCommit = marks.findIndex((x) => /^\s*COMMIT/.test(x));
+  assert.ok(iUpdate >= 0 && iInsert >= 0 && iCommit >= 0, '三步都必须存在');
+  assert.ok(iUpdate < iInsert, 'run_end 必须在终态写入之后（同一批副作用）');
+  assert.ok(iInsert < iCommit, 'run_end 必须在 COMMIT 之前——拆成提交后独立小事务就会出现「已终态但无 run_end」的窗口');
+  assert.equal(marks.filter((x) => /^\s*BEGIN/.test(x)).length, 1, '整个停止流程只应有一个事务');
+  assert.equal(marks.filter((x) => /^\s*COMMIT/.test(x)).length, 1);
+  assert.equal(pool.commits, 1);
 });
 
 test('#277-A 无活跃 run ⇒ 409 no_active_run 语义不变', async () => {

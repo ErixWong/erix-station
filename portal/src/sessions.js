@@ -16,6 +16,7 @@ import { projectSessionMessages } from './session-view.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
 import { fetchUserTextTurns } from './session-text.js';
 import { appendUserInputTurn } from './transcript-store.js';
+import { allocSeq } from './seq.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -576,7 +577,8 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
  * **两条路径（issue #277 第一片；#277-A2 补「已领走」守卫）**：
  *  1. `queued` 且**未被领走**（没有任何执行体会去报它的终态）：**直接进终态** `finished`
  *     + `termination={"reason":"aborted","detail":"cancelled_before_start"}`，并在同事务把它从
- *     `run_queue` 摘掉（口径同 release/reaper 的 cancelled 分支：queue → `cancelled` + 清租约字段）。
+ *     `run_queue` 摘掉（口径同 release/reaper 的 cancelled 分支：queue → `cancelled` + 清租约字段），
+ *     并**同事务合成一条 `run_end` 事件**（#277-A2：不合成则活页面的输入框要等刷新才摘「运行中」）。
  *     旧实现在这里也写 `cancelling`，而 `cancelling` ①被认领 SQL 排除（internal.js tryClaim 的
  *     `r.status IN ('queued','running')`，A2）、②终态只能由 worker 经 U2 写、③不在 reaper 的收敛集合里
  *     ⇒ 一个从未执行的 run 被停止后**永远没人收敛**，`active_run_id` 恒非空（ACTIVE_RUN_STATES 含
@@ -601,8 +603,12 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
  *
  * ⚠ 未覆盖（下一片）：`running` 的 run 被停止后若容器死掉 / worker 再不报终态，`cancelling` 无人收敛；
  *   本端点不解决这个问题（心跳 `stop_run_ids` 只把停止信号送给**还活着的** worker）。
+ *
+ * `notify`（#277-A2，可选）：形状即 `internal.js notifySessionEvents(sessionId, events)`，由 http.js 注入；
+ * 只在「直接终态」那一步真的写了 `run_end` 后、在 **COMMIT 之后**调一次（失败不影响 200，同 postMessage
+ * 的 `onSessionTitle` 口径）。`running → cancelling` 分支**不**推：它的 `run_end` 由 worker 的 U2 终态事务产出。
  */
-export async function stopSession(pool, { userId, sessionId }) {
+export async function stopSession(pool, { userId, sessionId, notify }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -634,14 +640,38 @@ export async function stopSession(pool, { userId, sessionId }) {
     );
     // 出队：终态 run 绝不能留在 `run_queue`（照 finishRun / releaseRun / reaper 的 cancelled 写法：
     // queue → 'cancelled' + 清 claim_token/owner_container_id/lease_until/claimed_at，不发明第三种）。
+    // 同时**同事务合成 `run_end`**（#277-A2 返修 2）：不合成则活页面的输入框要等刷新才能摘「运行中」
+    // ——写法照 `internal.js finishRun` / `provisioner.js terminateActiveRuns` 的先例（client_event_id
+    // = `<runId>:final:run_end`、seq 走 §7.3 统一分配器 `allocSeq`、`ON CONFLICT DO NOTHING`），不自创第三种。
+    // 锁序（为何此处**不需要** provisioner 那个独立小事务 B）：本事务已在开头 `fetchSession(..., FOR UPDATE)`
+    // **持住 chat_sessions 单行**，同事务内 `allocSeq`（再改同一行）不引入新锁序也不会自锁；provisioner
+    // 那段注释里「runs → sessions 与 stopSession 反序」的问题在这里根本不存在（它就是 stopSession，
+    // 本来就是 sessions → runs）。后人照抄小事务 B 反而绕远，且会把「终态 + run_end」拆成两次提交。
+    const runEnds = [];
     for (const row of killedQueued.rows) {
-      await client.query(
+      const q = await client.query(
         `UPDATE run_queue
             SET status = 'cancelled', claim_token = NULL, owner_container_id = NULL,
                 lease_until = NULL, claimed_at = NULL
-          WHERE run_id = $1`,
+          WHERE run_id = $1 RETURNING attempts`,
         [row.id],
       );
+      // run_end 载荷形状与 finishRun 合成的那条同构（termination/usage/rounds/attempt）：
+      // 未开始就被取消 ⇒ 零用量、零轮次（与 provisioner offboard 合成那条同口径）。
+      const payload = {
+        termination: { reason: 'aborted', detail: 'cancelled_before_start' },
+        usage: { input_tokens: 0, output_tokens: 0 },
+        rounds: 0,
+        attempt: Number(q.rows?.[0]?.attempts ?? 1),
+      };
+      const seq = await allocSeq(client, s.id);
+      await client.query(
+        `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+         VALUES ($1, $2, $3, $4, 'run_end', $5, now())
+         ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        [row.id, s.id, seq, `${row.id}:final:run_end`, JSON.stringify(payload)],
+      );
+      runEnds.push({ run_id: row.id, seq, payload });
     }
 
     // 第 2 步 CAS：剩下的 running → cancelling（等 worker 报终态，见上方 ⚠）。
@@ -680,6 +710,16 @@ export async function stopSession(pool, { userId, sessionId }) {
       res = replay.rows;
     }
     await client.query('COMMIT');
+    // SSE 推送必须在 COMMIT **之后**（同 finishRun / postMessage 的 `onSessionTitle`）：
+    // 先于落库到达客户端会让前端重取到未提交的旧状态。事件不推也不影响已落库的终态（尽力而为）。
+    // 形状与 finishRun 合成的那条一致（{ seq, ts, run_id, type, payload }），前端无需分路径处理。
+    if (runEnds.length > 0) {
+      try {
+        notify?.(s.id, runEnds.map((e) => ({
+          seq: e.seq, ts: new Date().toISOString(), run_id: e.run_id, type: 'run_end', payload: e.payload,
+        })));
+      } catch { /* 推送失败不影响已落库的终态与事件 */ }
+    }
     return { run: { id: res[0].id, status: res[0].status } };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
