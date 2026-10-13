@@ -98,6 +98,8 @@ export const zhCN = {
       unknown_code: '未收录的错误（HTTP {status}，错误码 {code}）：请重试一次，仍然失败就把上面这行状态码与错误码原样交给管理员。',
       // 统一附在句尾的原始证据（服务端 message 原样透传，不翻译）。
       detail: '服务端说明：{message}（错误码 {code}）',
+      // 401 把人送回登录页后，登录页顶部要能解释「为什么被送回来」（措辞不再指改密屏上的按钮）。
+      sessionExpiredNotice: '登录已过期：本次改密没有生效，请重新登录后再改一次（口令没有被改掉）。',
       no_message: '服务端未给出说明',
       no_code: '无错误码',
       // validation_failed 的 `error.details.field`（§4.7a 口径：把错误指到具体输入框）。
