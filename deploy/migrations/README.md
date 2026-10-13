@@ -44,7 +44,14 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
-  `0020-preview-grant-revoke-repair.sql`（**#252：清「已释放 allocation 上仍 `active`」的预览凭证残渣**——
+  `0021-user-must-change-password.sql`（**#255 首登强制改密**：`users` 加
+  **`must_change_password boolean NOT NULL DEFAULT false`** ——单条 `ADD COLUMN IF NOT EXISTS`（可整体重放，
+  第二遍是零 DDL 空操作；PG 11+ 对常量 DEFAULT 不重写表），后置两个**纯读** DO 块：一个在「列缺失 / 不是
+  NOT NULL / 默认值不是 false」时当场 `RAISE`（默认值是契约：`cli.js bootstrap-admin` 与存量行都靠它保持
+  `false`，漂了就把 dev/CI 的 bootstrap 账号锁进改密屏），一个打印「共 N 行 / 其中 true M 行」作重放证据。
+  **存量行不回填**（`DEFAULT false`）：本单只治「从现在起被代设口令的人」，一次性置 true 会让每个已部署环境
+  一升级就全员被锁（前端界面不在本单，锁了没出口）。静态断言见 `portal/test/migrations.test.js`。
+  前一道 `0020-preview-grant-revoke-repair.sql`（**#252：清「已释放 allocation 上仍 `active`」的预览凭证残渣**——
   纯数据修复、**零 DDL**（baseline 冻结件一字节不动）；谓词与代码同源，**只撤 `state='active'`**，
   `used` 行按 #252 口径**保留原状**（把 used 塞进 `revoked` 会撞双向 CHECK `(state='used') = (used_at IS NOT NULL)`
   即真机的 `preview_grants_check3`；顺手清 `used_at` 则篡改历史）；可整体重放（前置 NOTICE 打印待修条数，
