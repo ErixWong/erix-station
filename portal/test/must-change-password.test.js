@@ -5,6 +5,8 @@
 //      `cli.js bootstrap-admin` ⇒ **不置 true**（否则 dev/CI 的 bootstrap 账号被锁进改密屏，而本单不含前端）。
 //   ② 自助改密端点 `POST /api/me/password`：错当前口令 401（复用 `invalid_credentials`）且哈希不变、
 //      新==旧 400、成功 ⇒ 哈希变 + 旗标清 + **当前会话保留** + 只吊销其它会话、未登录 401、审计恰一条且不含口令。
+//      ②b（#255 收尾）：可选的 `confirm_password` 服务端校验——带了就必须等于 `new_password`（否则
+//      400 `validation_failed` + `details.field='confirm_password'`），没带则行为一字不变（向后兼容）。
 //   ③ 受限会话门：`must_change_password=true` 时除放行清单外的 `/api/*` 一律 403 `password_change_required`；
 //      清单里的 `GET /api/me`、`POST /api/me/password`、登出、`/api/forward-auth`、`/api/internal/*` 不受影响。
 //   ④ 登录响应增字段 `password_change_required`（两个发会话的分支都有，纯 additive）。
@@ -507,6 +509,138 @@ test('#255② 当前口令被连续猜错会限流（防「会话 cookie 被偷�
 });
 
 // ---------------------------------------------------------------------------
+// ②b `confirm_password`（#255 收尾）：服务端补上客户端一致性校验，但**保持可选**
+//
+// 背景：前端表单会多发这一格，而服务端历史上忽略未知键 ⇒「两次新口令是否一致」只在前端判，
+// 绕过前端的调用可以把两个不同的新口令发上去照样成功。这三条用例各自钉住一个方向：
+//   ① 带了且相等 ⇒ 200（成功路径不回退，也钉住「比的是 new_password 而不是 current_password」：
+//      拿它跟 current_password 比的写法在这条上就会报 400）；
+//   ② 带了但不等 ⇒ 400 validation_failed + details.field='confirm_password'（含 confirm==旧口令 这一格，
+//      它是「比错了对象」最直接的探针：跟 current_password 比就会误放行）；
+//   ③ 完全没带 ⇒ 仍 200（向后兼容；把它改成必填就是红在这里）。
+// 另加两条顺序守卫：旧口令错误的响应**不得因这条新规则而改变**（不向未通过旧口令校验的人泄露）。
+// ---------------------------------------------------------------------------
+
+test('#255②b 带了 confirm_password 且与 new_password 相同 → 200（成功路径不回退）且审计仍无明文', async () => {
+  const t = await setupSelfService();
+  try {
+    const before = t.user.password_hash;
+    const res = await postPassword({
+      base: t.base, cookie: t.cookie,
+      body: { current_password: OLD_PW, new_password: NEW_PW, confirm_password: NEW_PW },
+    });
+    assert.equal(res.status, 200, `应 200（实际 ${res.status}：${await res.clone().text()}）`);
+    assert.deepEqual(await res.json(), { ok: true, password_change_required: false, sessions_revoked: 1 });
+    assert.notEqual(t.user.password_hash, before, '哈希已换');
+    assert.equal(t.user.must_change_password, false, '旗标已清');
+
+    // 审计仍恰一条、仍不含明文（confirm_password 走的是校验，不是「多一个要落库的字段」）。
+    const entries = t.pool.audit.filter((a) => a.action === 'user.password_changed');
+    assert.equal(entries.length, 1);
+    const serialized = JSON.stringify(entries[0]);
+    assert.ok(!serialized.includes(OLD_PW) && !serialized.includes(NEW_PW), '审计不得出现口令明文');
+    assert.ok(!serialized.includes('confirm_password'), '审计 details 形状不变（不新增字段）');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255②b 带了 confirm_password 但与 new_password 不同 → 400 validation_failed + details.field=confirm_password', async () => {
+  const t = await setupSelfService();
+  try {
+    const before = t.user.password_hash;
+    for (const [body, why] of [
+      // 两个不同的新口令：就是本单要挡的那个洞（以前服务端照单全收）。
+      [{ current_password: OLD_PW, new_password: NEW_PW, confirm_password: 'typo-' + NEW_PW }, '拼写不一致'],
+      // confirm == **旧**口令：钉住「比的对象是 new_password」——写成比 current_password 就会在这条上误放行。
+      [{ current_password: OLD_PW, new_password: NEW_PW, confirm_password: OLD_PW }, 'confirm 填的是旧口令'],
+      // 畸形值（空串 / null / 非字符串）都是「带了且不等」，同一个口径，不拆成两套判据。
+      [{ current_password: OLD_PW, new_password: NEW_PW, confirm_password: '' }, '空串'],
+      [{ current_password: OLD_PW, new_password: NEW_PW, confirm_password: null }, 'null'],
+      [{ current_password: OLD_PW, new_password: NEW_PW, confirm_password: 123 }, '非字符串'],
+    ]) {
+      const res = await postPassword({ base: t.base, cookie: t.cookie, body });
+      assert.equal(res.status, 400, `${why}：应 400（实际 ${res.status}：${await res.clone().text()}）`);
+      const json = await res.json();
+      assert.equal(json.error.code, 'validation_failed', `${why}：错误码沿用既有口径，不新造码`);
+      assert.equal(json.error.details?.field, 'confirm_password', `${why}：前端要靠 field 标红确认那一格`);
+    }
+
+    assert.equal(t.user.password_hash, before, '被拒的改密不得换哈希');
+    assert.equal(t.user.must_change_password, true, '被拒的改密不得清旗标');
+    assert.equal(t.pool.audit.filter((a) => a.action === 'user.password_changed').length, 0,
+      '校验失败不写 user.password_changed（与其它失败路径同一个口径）');
+    const me = await fetch(`${t.base}/api/me`, { headers: { cookie: t.cookie } });
+    assert.equal(me.status, 200, '改密被拒不得动当前会话');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255②b 完全没带 confirm_password → 仍 200（向后兼容：**不得变成必填**）', async () => {
+  const t = await setupSelfService();
+  try {
+    const res = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: OLD_PW, new_password: NEW_PW } });
+    assert.equal(res.status, 200, `老调用方（不带这一格）应仍 200（实际 ${res.status}：${await res.clone().text()}）`);
+    assert.deepEqual(await res.json(), { ok: true, password_change_required: false, sessions_revoked: 1 });
+    assert.equal(t.user.must_change_password, false, '旗标照旧被清（与带 confirm 的成功路径同一结果）');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255②b 旧口令错误的响应一字不变（带不带 confirm、confirm 对不对都不例外）', async () => {
+  const t = await setupSelfService();
+  try {
+    const before = t.user.password_hash;
+    const without = await postPassword({ base: t.base, cookie: t.cookie, body: { current_password: 'nope', new_password: NEW_PW } });
+    const baselineStatus = without.status;
+    const baselineBody = JSON.stringify(await without.json());
+
+    for (const body of [
+      { current_password: 'nope', new_password: NEW_PW },
+      // 旧口令错 **且** 两次新口令也不一致：必须先报旧口令（401），不得因为新加的这条变成 400。
+      { current_password: 'nope', new_password: NEW_PW, confirm_password: 'typo-' + NEW_PW },
+      { current_password: 'nope', new_password: NEW_PW, confirm_password: NEW_PW },
+      // 旧口令错 + confirm 畸形：同理。
+      { current_password: 'nope', new_password: NEW_PW, confirm_password: null },
+    ]) {
+      const res = await postPassword({ base: t.base, cookie: t.cookie, body });
+      assert.equal(res.status, baselineStatus, `${JSON.stringify(body)}：状态码与不带这一格时相同`);
+      assert.equal(JSON.stringify(await res.json()), baselineBody, `${JSON.stringify(body)}：响应体一字不变`);
+    }
+
+    assert.equal(baselineStatus, 401, '基线就是既有的 401 invalid_credentials');
+    assert.ok(baselineBody.includes('invalid_credentials'), '错误码复用登录那一个（不新造）');
+    assert.ok(!baselineBody.includes('confirm_password'), '旧口令错的人看不到 confirm 那一格的任何信息');
+    assert.equal(t.user.password_hash, before, '哈希未动');
+    assert.equal(t.user.must_change_password, true, '旗标未动');
+  } finally {
+    await t.close();
+  }
+});
+
+test('#255②b confirm_password 不参与限流计数（它是客户端自洽问题，不是凭据猜测）', async () => {
+  const t = await setupSelfService();
+  try {
+    for (let i = 0; i < 6; i += 1) {
+      const res = await postPassword({
+        base: t.base, cookie: t.cookie,
+        body: { current_password: OLD_PW, new_password: NEW_PW, confirm_password: `typo-${i}` },
+      });
+      assert.equal(res.status, 400, `第 ${i + 1} 次仍应是 400（实际 ${res.status}）`);
+    }
+    const ok = await postPassword({
+      base: t.base, cookie: t.cookie,
+      body: { current_password: OLD_PW, new_password: NEW_PW, confirm_password: NEW_PW },
+    });
+    assert.equal(ok.status, 200, '连错 6 次 confirm 不得把限流器打进 429（只有凭据猜错才计数）');
+  } finally {
+    await t.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ③ 受限会话门（提交 4）：`must_change_password=true` ⇒ 除放行清单外的 `/api/*` 一律 403
 // ---------------------------------------------------------------------------
 
@@ -884,6 +1018,7 @@ test('#255⑤ portal.md：新端点、新错误码、登录新字段、§2.11a �
   // §2.6a 自助改密端点：请求/响应/错误码/会话语义（http.js 的注释直接引用这一节，锚点必须在）
   const ep = section('### 2.6a `POST /api/me/password`', '### 2.7 `GET /api/forward-auth`');
   assert.match(ep, /current_password/);
+  assert.match(ep, /confirm_password/, '§2.6a 要把可选的 confirm_password 写清（服务端已校，契约不能接着漏）');
   assert.match(ep, /sessions_revoked/);
   assert.match(ep, /invalid_credentials/);
   assert.match(ep, /保留当前会话/);
