@@ -8,7 +8,7 @@ import {
   type RouteRecordRaw,
 } from 'vue-router';
 import { useAuthStore } from './stores/auth';
-import { FORCE_PASSWORD_PATH, restrictedNavigationDecision } from './lib/forcePasswordGuard';
+import { FORCE_PASSWORD_PATH, createRedirectBudget, restrictedNavigationDecision } from './lib/forcePasswordGuard';
 import { setRestrictedSessionListener } from './lib/restrictedSession';
 
 // #255 强制改密屏的路径：唯一真相在 lib/forcePasswordGuard.ts（守卫判据与它同处）。
@@ -73,7 +73,15 @@ export function createAppRouter(history: RouterHistory = createWebHashHistory())
   //   ⑤ #255 受限会话：一切导航先被改写到 /change-password（「绕不过」的第二道机制，第一道在 App.vue）：
   //      手改 URL、深链 #/session/<id>、前进/后退、已登录访问 /login 全部算「别处」；
   //      旗标清掉后再访 /change-password 则送回落地页（不给正常用户留一个空屏）。
+  // 死循环熔断（判据与理由见 lib/forcePasswordGuard.createRedirectBudget）：环转不起来 ⇒ 测试变红、
+  // 线上停住 + 一条 warn，而不是把 CPU 与 CI 预算一起烧掉。
+  const budget = createRedirectBudget();
   router.beforeEach(async (to) => {
+    if (!budget.notePass()) {
+      budget.reset();
+      console.warn(`[router] 守卫重定向链条超过预算，已终止本次导航（目标 ${to.fullPath}）`);
+      return false;
+    }
     const auth = useAuthStore();
     if (!auth.ready) {
       try {
@@ -108,6 +116,10 @@ export function createAppRouter(history: RouterHistory = createWebHashHistory())
     if (to.meta.requiresRole && auth.user.role !== to.meta.requiresRole) return { path: '/' };
     return true;
   });
+
+  // 链条只在「一次导航真正落地」后归零（重定向期间 beforeEach 反复进来，afterEach 不会跑）。
+  router.afterEach(() => budget.reset());
+  router.onError(() => budget.reset());
 
   // #255 全局兜底的导航侧（§2.11a）：任意请求返回 403 password_change_required ⇒ 除了 store 置旗标
   // （App 闸门负责换画面），这里把 URL 也改到改密屏，否则地址栏会停在 #/session/<id> 上骗人。
