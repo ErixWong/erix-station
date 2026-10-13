@@ -53,7 +53,7 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 ### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
 
 - 入口：`http://station.fde.erix.vip:8090/`（伞域泛解析，#57 阶段2，2026-10-08 起；旧的 `hp.inteva.vip:8090` 已随 Host 路由切换失效——Traefik 只认 `station.fde.erix.vip` / `100.100.0.3`。本机解析器负缓存解析不出时可用 playwright 容器 `erix_station_playwright`（:8935，resolver MAP 规则）或临时 hosts 条目兑底。deploy 栈 station-portal；代码更新后需 `docker compose build station-portal && docker compose up -d station-portal` 生效）
-- 测试账号：`admin / admin123`（role=admin → 管理台）、`eric / admin123`（fde:eric → 工作台）——两账号均未注册 TOTP，密码直通（**2026-10-03 实测修正**：原写 `eric-admin`，实际 `users.login` 为 `admin`，用错名字登录会报「用户名或口令错误」）
+- 测试账号：`admin`（role=admin → 管理台）、`eric`（fde:eric → 工作台），两账号**共用同一口令**——明文**不入库不外传**：存 `~/.config/mcp/creds/station-dev.password`（600，轮换直接改该文件+跑密码重置流程）。两账号未注册 TOTP，密码直通（登录体字段是 `login` 不是 `username`）
 - 密码重置：用 portal 自身 `hashPassword`（scrypt 自描述格式）生成后更新 `users.password_hash`（bootstrap-admin 不能重置已存在账号）
 
 ### 4.2 LLM 网关（LiteLLM，issue #117）
