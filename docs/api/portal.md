@@ -303,8 +303,14 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 请求：
 
 ```json
-{ "current_password": "管理员代设的那一枚", "new_password": "本人自己选的" }
+{ "current_password": "管理员代设的那一枚", "new_password": "本人自己选的", "confirm_password": "本人自己选的（可省）" }
 ```
+
+| 请求字段 | 必填 | 说明 |
+|---|---|---|
+| `current_password` | 是 | 当前生效的那一枚；不对 ⇒ `401 invalid_credentials`（不新造码，理由见下「错误」）|
+| `new_password` | 是 | 本人选的新口令；不合规或与当前相同 ⇒ `400 validation_failed` + `details.field='new_password'` |
+| `confirm_password`（#255 收尾，纯 additive）| **否** | **客户端一致性校验**：服务端不拿它参与凭据判定，只做一件事——**带了就必须等于 `new_password`**，否则 `400 validation_failed` + `details.field='confirm_password'`。**为什么保留**：改密表单多一格「确认新口令」是防拼写错误把人锁在门外（设完自己登不上）的常规体验，服务端要能接住它，而不是继续当未知键忽略——忽略的后果是「两次是否一致」只在前端判，绕过前端的调用可以把两个不同的新口令发上去照样成功。**为什么不做成必填**：这一节此前只定义了两个字段，已经有绕过前端的调用方（脚本 / 集成测试）在发两个键，变成必填就是把它们当场打挂；⇒ **没带 ⇒ 行为与以前一字不差**（也不要求必填后补默认值） |
 
 响应 `200`：
 
@@ -334,12 +340,12 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 |---|---|---|
 | 401 | `unauthorized` | 未登录 / 会话失效 |
 | 401 | `invalid_credentials` | `current_password` 不对（与登录失败同一个码：同一主体、同一凭据、同一失败原因；新造一个码只会多一条前端分支，并额外泄露「会话有效但口令错」这个此前不存在的事实）|
-| 400 | `validation_failed` | 新口令缺失 / 空 / 超上限，或**与当前口令相同**；一律带 `details.field`（`new_password` 或 `current_password`）|
+| 400 | `validation_failed` | 新口令缺失 / 空 / 超上限，或**与当前口令相同**；或**带了 `confirm_password` 且它不等于 `new_password`**（没带就不参与这一条）；一律带 `details.field`（`new_password`、`current_password` 或 `confirm_password`）。**顺序**：旧口令校验**失败时一律 `401`**，不因带不带 / 对不对 `confirm_password` 而改变（否则一个还没通过旧口令校验的人就能拿这条新规则探出口令信息），一致性校验只在过了旧口令校验**之后**才报 |
 | 405 | `method_not_allowed` | 非 `POST`。本端点在 §2.11a 清单里**不限方法**，正是为了让这个 405 不被门改写成 403 |
 | 429 | `rate_limited` | 当前口令被连续猜错（复用登录限流器，key 前缀 `password:`，与 `login:` 命名空间互不污染；防「会话 cookie 被偷后爆破当前口令」），带 `Retry-After` |
 | 503 | `kdf_busy` | scrypt 并发闸满（一次请求跑两次 scrypt：验旧 + 铸新），带 `Retry-After` |
 
-其它口径：`Content-Type` 必须 `application/json`（否则 `400 validation_failed`）；形状校验在限流与 scrypt **之前**（畸形请求不消耗 KDF 配额）；口令策略沿用 §2.9.4 现状（**无最小长度**，本单不引入）。审计恰一条 `audit_log.action='user.password_changed'`（`actor_id` = 本人、`target` = login、`details` = `{login, self_service: true, sessions_revoked}`）：**口令明文与哈希绝不入库**；失败路径不写这条（否则爆破会把审计刷成噪声）。
+其它口径：`Content-Type` 必须 `application/json`（否则 `400 validation_failed`）；形状校验在限流与 scrypt **之前**（畸形请求不消耗 KDF 配额）；口令策略沿用 §2.9.4 现状（**无最小长度**，本单不引入）。`confirm_password` 是例外：它比的是两个自报值，**不单独跑形状校验**（等于 `new_password` 就必然合法），且落在旧口令校验之后。审计恰一条 `audit_log.action='user.password_changed'`（`actor_id` = 本人、`target` = login、`details` = `{login, self_service: true, sessions_revoked}`）：**口令明文与哈希绝不入库**（`confirm_password` 也不入库，details 不因此新增字段）；失败路径不写这条（否则爆破会把审计刷成噪声）。
 
 ### 2.7 `GET /api/forward-auth`（Traefik 回调，非浏览器 API）
 
