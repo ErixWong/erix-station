@@ -18,7 +18,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir,
+  SHARED_STACK, assertIsolatedEnvironment, defaultFdeIpamPools, deriveFdeIpamPools, removeDbDir, resolveDbDir, writeDynamicStub,
+  deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -184,12 +185,82 @@ try {
   positiveError = `${positiveError}${positiveError ? ' | ' : ''}digest/allowSharedReset/IPAM 派生正例被拒：${String(error?.message ?? error)}`;
 }
 
+// #268 M1 的桩语义正例（独立一组，任一失败同样算正例不过）：writeDynamicStub 只在 routes.yml
+// 不存在时写 `http: {}\n`，**已存在则一字不动**——这是 edge watch 坑修法的幂等红线：
+// 变异入口：把 writeDynamicStub 改成无条件覆盖 routes.yml，下方「不覆盖 materializer 产物」即红
+//（桩压掉真实路由 = 亲手制造全 404，比不修更坑）。
+try {
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-stub-trap-'));
+  try {
+    const materialized = 'http:\n  routers:\n    internal-alice:\n      rule: PathPrefix(`/api/internal`)\n';
+    // 1) 已存在（模拟 materializer 产物）：不动、created=false，重复调用也幂等。
+    fs.writeFileSync(path.join(stubDir, 'routes.yml'), materialized);
+    const r1 = writeDynamicStub(stubDir);
+    assert.equal(fs.readFileSync(path.join(stubDir, 'routes.yml'), 'utf8'), materialized,
+      'writeDynamicStub 不得覆盖已存在的 routes.yml（materializer 产物不能被桩压掉）');
+    assert.equal(r1.created, false, '已存在时 created=false（幂等信号）');
+    // 2) 不存在：写入的正文必须是 `http: {}\n`（合法空配置：Traefik 能 watch，且不含任何路由）。
+    fs.rmSync(path.join(stubDir, 'routes.yml'));
+    const r2 = writeDynamicStub(stubDir);
+    assert.equal(fs.readFileSync(path.join(stubDir, 'routes.yml'), 'utf8'), 'http: {}\n',
+      '不存在时应预写 `http: {}\n` 桩');
+    assert.equal(r2.created, true, '新写时 created=true');
+    // 3) 对自己的桩再调一次也不重写（幂等）。
+    assert.equal(writeDynamicStub(stubDir).created, false, '桩自身的二次调用不重写');
+  } finally {
+    fs.rmSync(stubDir, { recursive: true, force: true });
+  }
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}writeDynamicStub 桩语义正例被破坏：${String(error?.message ?? error)}`;
+}
+
+// #268 M2 派生件正例（deriveIsolationComposeEnv / memoizeOnce，全程假 docker、不碰真 docker）：
+// 扫非本栈 fde-* 网络子网 → IPAM_RESERVED_SUBNETS；排除 ownFdeNetwork；去重；skip 位不扫描；
+// 网络消失（inspect 抛错）不致炸。变异入口：把扫描改成「含本栈网络」或「不去重」，本组即红。
+try {
+  const seen = [];
+  const netFake = (args) => {
+    seen.push(args);
+    if (args.startsWith('network ls')) return 'bridge\nfde-e2e226alice\nfde-alice\nfde-bob\nfde-carol\nfde-gone\nbackend';
+    if (args.includes('inspect fde-alice')) return '[{"Subnet":"10.200.0.0/29"}]';
+    if (args.includes('inspect fde-bob')) return '[{"Subnet":"10.200.0.32/29"}]';
+    if (args.includes('inspect fde-carol')) return '[{"Subnet":"10.200.0.0/29"}]'; // 与 alice 同段 → 去重
+    if (args.includes('inspect fde-gone')) throw new Error('网络在 ls 与 inspect 之间消失（safe 包裹必须吞掉，不致整体炸）');
+    if (args.includes('inspect fde-e2e226alice')) throw new Error('ownFdeNetwork 不该被 inspect（被扫到即测试红）');
+    return null;
+  };
+  const derived = deriveIsolationComposeEnv({
+    docker: netFake, ownFdeNetwork: 'fde-e2e226alice', baseEnv: { BASE_DOMAIN: 'localhost' },
+  });
+  assert.equal(derived.BASE_DOMAIN, 'localhost', 'baseEnv 原样保留');
+  assert.equal(derived.IPAM_RESERVED_SUBNETS, '10.200.0.0/29,10.200.0.32/29',
+    '非本栈 fde-* 子网按扫描顺序拼接、同段去重（carol 与 alice 同段只留一份）');
+  assert.ok(!seen.some((a) => /^network inspect fde-e2e226alice\b/.test(a)),
+    'ownFdeNetwork（本栈自己的网络）不得被 inspect');
+  const beforeSkip = seen.length;
+  const skipped = deriveIsolationComposeEnv({ docker: netFake, ownFdeNetwork: 'fde-x', skipIpamReserved: true });
+  assert.ok(!('IPAM_RESERVED_SUBNETS' in skipped), 'skipIpamReserved=true ⇒ 不注入（显式传优先）');
+  assert.equal(seen.length, beforeSkip, 'skip 时一条 docker 命令都不发（连扫描都不发生）');
+  // 无可扫网络 ⇒ 不注入键（而不是注入空串）。
+  const empty = deriveIsolationComposeEnv({ docker: () => '', ownFdeNetwork: 'fde-own' });
+  assert.ok(!('IPAM_RESERVED_SUBNETS' in empty), '扫无子网时不注入 IPAM_RESERVED_SUBNETS');
+  // memoizeOnce：只算一次（惰性 + 记忆化），后续调用不再碰 docker。
+  let calls = 0;
+  const memo = memoizeOnce(() => { calls += 1; return { n: calls }; });
+  assert.deepEqual([memo(), memo(), memo()], [{ n: 1 }, { n: 1 }, { n: 1 }], 'memoizeOnce 只算一次');
+  assert.equal(calls, 1, 'memoizeOnce 底层函数调用次数 = 1');
+} catch (error) {
+  positiveOk = false;
+  positiveError = `${positiveError}${positiveError ? ' | ' : ''}#268 M2 派生件正例被破坏：${String(error?.message ?? error)}`;
+}
+
 // --- 单一来源断言（钉住「护栏只有一份定义」；复制一份出来就会红）---------------------------
 // 只钉 #226 收编的公共实现：护栏本体、缺省陷阱解析、Traefik 静态配置生成、端口预探。
 // removeDbDir 副本：#227.1 已收编 wp2b/wp3b（wp2b 走 allowSharedReset 显式声明共享重置，
 // wp3b 隔离走严格面/共享走显式 env 豁免）；wp4 仍有历史局部副本（共享栈跑法，本工单未收编，见交付报告）。
 const SINGLE_SOURCE_DEFS = ['assertIsolatedEnvironment', 'resolveDbDir', 'writeTraefikStatic', 'assertHostPortsAvailable',
-  'deriveFdeIpamPools', 'defaultFdeIpamPools'];
+  'deriveFdeIpamPools', 'defaultFdeIpamPools', 'writeDynamicStub', 'deriveIsolationComposeEnv', 'memoizeOnce'];
 const ISOLATION_SCRIPTS = ['wp2a-e2e.mjs', 'wp3a-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
 const singleSourceProblems = [];
 {
@@ -260,6 +331,57 @@ const singleSourceProblems = [];
     }
     if (/2>\/dev\/null \|\| true/.test(wp6Text)) {
       singleSourceProblems.push('wp6-llm-e2e.mjs: cleanup 里又出现 `2>/dev/null || true`（#224 的静默吞错形态）');
+    }
+  }
+  // #268 M1（edge watch 桩）：四支隔离 e2e 必须 import 并在 **compose up 之前**调用 writeDynamicStub。
+  // 顺序用源码文本判：首次调用行号 < 首次 `compose('up` 行号（桩晚于起栈 = watch 已经落空，白写）。
+  // 变异自证入口：删掉/注释任一脚本的桩调用 ⇒ 本断言红；把调用搬到 compose up 之后 ⇒ 同样红。
+  const DYNAMIC_STUB_SCRIPTS = ['wp3a-e2e.mjs', 'wp3b-e2e.mjs', 'wp5-e2e.mjs', 'wp6-llm-e2e.mjs'];
+  for (const script of DYNAMIC_STUB_SCRIPTS) {
+    const lines = fs.readFileSync(path.join(HERE, script), 'utf8').split('\n');
+    const stubLine = lines.findIndex((l, i) => /\bwriteDynamicStub\s*\(/.test(l) && !/^\s*(import|\/\/|\*)/.test(l) && i > 0);
+    const upLine = lines.findIndex((l) => /compose\('up\b/.test(l));
+    if (!new RegExp(`writeDynamicStub[,\\s][\\s\\S]*?from\\s+'\\.\\/lib\\/isolated-env\\.mjs'`).test(fs.readFileSync(path.join(HERE, script), 'utf8'))) {
+      singleSourceProblems.push(`${script}: 没有从 ./lib/isolated-env.mjs import writeDynamicStub（桩必须用公共那一份）`);
+    }
+    if (stubLine === -1) {
+      singleSourceProblems.push(`${script}: 没调用 writeDynamicStub()（edge watch 桩没预写，materializer 原子替换会永不被 reload → internal 全 404，#268）`);
+    } else if (upLine !== -1 && stubLine > upLine) {
+      singleSourceProblems.push(`${script}:${stubLine + 1} writeDynamicStub() 在 compose up（:${upLine + 1}）之后才调——桩必须在起栈前预写，否则 watch 已落空（#268）`);
+    }
+  }
+  // #268 M2（派生件提 lib）：wp3b 的 IPAM_RESERVED_SUBNETS 派生必须走 lib 那一份（扫其他栈 fde-*
+  // 子网的扫描体不得再在脚本里内联复制；单一来源扫描已钉住定义，这里钉「wp3b 真的 import 了它」）。
+  {
+    const wp3bText = fs.readFileSync(path.join(HERE, 'wp3b-e2e.mjs'), 'utf8');
+    if (!/deriveIsolationComposeEnv\s*[,\s][\s\S]*?from\s+'\.\/lib\/isolated-env\.mjs'/.test(wp3bText)) {
+      singleSourceProblems.push('wp3b-e2e.mjs: 没有 import lib 的 deriveIsolationComposeEnv（IPAM 保留段派生又变成脚本私有副本了，#268 M2）');
+    }
+    if (!/isolationComposeEnv\s*=\s*memoizeOnce\(/.test(wp3bText)) {
+      singleSourceProblems.push('wp3b-e2e.mjs: isolationComposeEnv 不再是 memoizeOnce(…) 包裹（惰性+记忆化语义被拆，每次 compose 都重查 docker）');
+    }
+    // #268 主 agent 验收变异逃逸补钉（把 wp3b 的 skip 实参改成恒 false 当时无断言红）：
+    // compose env 的 spread 顺序里派生注入在 process.env **之后**——不按「显式传入」门控，
+    // 扫描值会 spread-覆盖操作者传的 IPAM_RESERVED_SUBNETS，「显式传入优先」作废。
+    if (!/skipIpamReserved:\s*Boolean\(process\.env\.IPAM_RESERVED_SUBNETS\)/.test(wp3bText)) {
+      singleSourceProblems.push('wp3b-e2e.mjs: skipIpamReserved 实参不再是 Boolean(process.env.IPAM_RESERVED_SUBNETS)（显式传入时仍扫描注入会盖掉操作者的值，#268 M2）');
+    }
+    const wp3aCallerText = fs.readFileSync(path.join(HERE, 'wp3a-e2e.mjs'), 'utf8');
+    if (!/process\.env\.IPAM_RESERVED_SUBNETS\s*\?\s*\{\}/.test(wp3aCallerText)) {
+      singleSourceProblems.push('wp3a-e2e.mjs: IPAM_RESERVED_SUBNETS 的显式门控消失（三元为 {} 短路必须在派生前，否则派生值盖掉显式传入，#268 M2）');
+    }
+  }
+  // #268 M3：wp3a 的 llm 段（LiteLLM mock_response 注入链）以「已配好 binding/虚拟 key」为前提——
+  // ensureLlmBinding() 必须仍在流程里，且模型别名必须与 fake-agentd llm 段请求的 'mock-model' 对齐
+  //（虚拟 key 的模型白名单只含被绑定模型，不对齐 ⇒ LiteLLM 403，即真机 {status:403,chunks:0} 的直接原因）。
+  // 变异自证入口：删掉 binding 调用或改掉 modelName ⇒ 本断言红。
+  {
+    const wp3aText = fs.readFileSync(path.join(HERE, 'wp3a-e2e.mjs'), 'utf8');
+    if (!/await\s+ensureLlmBinding\(\{/.test(wp3aText)) {
+      singleSourceProblems.push('wp3a-e2e.mjs: ensureLlmBinding() 调用消失（LiteLLM binding/虚拟 key 是 llm 段 200 的前提，删掉即回到真机 403 chunks=0 的症状，#268 M3）');
+    }
+    if (!/modelName:\s*'mock-model'/.test(wp3aText)) {
+      singleSourceProblems.push("wp3a-e2e.mjs: ensureLlmBinding 没有显式传 modelName: 'mock-model'（必须与 fake-agentd llm 段请求的模型名对齐；缺省 e2e-mock-model 不在白名单 → 403，#268 M3）");
     }
   }
   // #227.1：allowSharedReset（wp2b 对「有意重置共享 dev 库」的显式声明）只能出现在 lib 定义与 wp2b

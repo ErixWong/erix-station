@@ -1,7 +1,7 @@
 // WP3a 真机端到端（需 docker；docker 命令经 `sg docker -c` 绕过，env §8.1）。
 // 流程：起栈（含 LiteLLM）→ 建用户 + provision FDE → 假 agentd（真实 token + FDE 网络路径）
 //   → SSE 连接 + claim → 事件 seq 递增 → finish → 断线重连 re-claim（方案 B）→ 并发 claim 竞态
-//   → mock 网关经 Traefik 注入链流式响应 → 回收。
+//   → LiteLLM mock_response 经 Traefik 注入链流式响应 → 回收。
 // 运行：npm run test:integration:wp3a（⚠️ issue #226 起**必须带隔离 env**，见下；缺 env 直接硬失败。）
 //
 // —— 隔离 env 清单（issue #226；与 wp3b/wp5/wp6 同一套，判据集中在 lib/isolated-env.mjs）——
@@ -14,10 +14,13 @@
 //   FDE_NAME=<含栈 id 的 FDE 名>（fde-<name> 是全局 docker 网络/容器名，不派生会与共享栈互删）
 //   BACKEND_SUBNET=<非 172.32.0.0/24> FDE_POOL=large（FDE_IPAM_POOLS 可不传：缺省由 defaultFdeIpamPools(栈 id) 派生；显式传入优先，#227.3）
 //   LLM_GATEWAY_HOST=http://127.0.0.1:<LITELLM_HOST_PORT>
+//   BASE_DOMAIN=…（**必须 export**，如 fde.erix.vip 或自建域；composeDomainEnv 缺省 localhost ⇒
+//     不 export 时路由 host 物化成 station.localhost/llm.localhost，agentd 全 404）。
 //   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
 //   FDE_DEV_MODE=1（#227.1 起必需：FDE_IMAGE 为 image:tag 形态时须显式声明 dev 模式；digest 形态豁免）
 //   TRAEFIK_STATIC_HOST 由脚本自动生成（只改入口端口的临时 traefik.yml，F8）。代理构建/镜像与
-//   HTTP_PROXY 口径见 lib/fde-image.mjs；IPAM 保留段等派生注入见 wp3b 的 isolationComposeEnv()。
+//   HTTP_PROXY 口径见 lib/fde-image.mjs；IPAM 保留段（IPAM_RESERVED_SUBNETS）#268 M2 起由脚本在 up 前
+//   自动扫其他栈的 fde-* 子网补齐（显式传入优先，派生件与 wp3b 同源于 lib/isolated-env.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -27,9 +30,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseCidr, intToIp } from '../src/ipam.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { DEFAULT_FDE_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { LLM_HOST, PORTAL_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 import {
   assertHostPortsAvailable, defaultFdeIpamPools, assertIsolatedEnvironment, createDbDirCleaner, writeTraefikStatic,
+  writeDynamicStub, deriveIsolationComposeEnv, memoizeOnce,
 } from './lib/isolated-env.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -56,6 +61,14 @@ const STATION_PORTAL_NAME = process.env.STATION_PORTAL_NAME || 'station-portal';
 const STATION_LITELLM_NAME = process.env.STATION_LITELLM_NAME || 'station-litellm';
 const FDE_NAME = process.env.FDE_NAME || 'alice';
 const FDE_CONTAINER = `fde-${FDE_NAME}`; // provisioner/IPAM 命名规则：fde-<fde_name>
+const FDE_IMAGE = process.env.FDE_IMAGE || DEFAULT_FDE_IMAGE;
+
+// #268 M2：IPAM_RESERVED_SUBNETS 用公共派生件补齐（未显式传时扫**其他栈**的 fde-* 网络子网 →
+// 保留段，不传会 Pool overlaps；派生本体在 lib/isolated-env.mjs，与 wp3b 同一份）。
+// 惰性求值 + 记忆化：首次 compose（预清理 down）时查一次 docker，之后不再查；显式传入一律优先。
+const isolationComposeEnv = memoizeOnce(() => (process.env.IPAM_RESERVED_SUBNETS
+  ? {}
+  : deriveIsolationComposeEnv({ docker, ownFdeNetwork: FDE_CONTAINER })));
 
 function docker(args) {
   return execSync(`sg docker -c ${JSON.stringify(`docker ${args}`)}`, {
@@ -83,7 +96,7 @@ function compose(args, env = {}) {
     encoding: 'utf8',
     stdio: 'pipe',
     cwd: REPO_ROOT,
-    env: { ...process.env, ...DOMAIN_COMPOSE_ENV, ...stackPaths(), ...env },
+    env: { ...process.env, ...DOMAIN_COMPOSE_ENV, ...isolationComposeEnv(), ...stackPaths(), ...env },
   });
 }
 
@@ -169,7 +182,7 @@ function runFakeAgentd(phase) {
   return JSON.parse(lines[lines.length - 1]);
 }
 
-test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock 网关注入链', { timeout: 12 * 60 * 1000 }, async (t) => {
+test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + LiteLLM mock_response 注入链', { timeout: 12 * 60 * 1000 }, async (t) => {
   // issue #226：本脚本以前把入口 URL/容器名/FDE 名写死成共享栈，并把 DB 数据目录缺省指向共享 dev 库；
   // 结果两种跑法都是错的（假绿 + rm -rf 共享库）。现与 wp5/wp6 一样先过硬隔离护栏。
   assertIsolatedEnvironment({
@@ -186,6 +199,10 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
   fs.chmodSync(S.userspaceRoot, 0o755);
   fs.chmodSync(S.dynamicRoot, 0o755);
   fs.chmodSync(S.staticRoot, 0o755);
+  // #268 M1：预写 edge watch 桩（坑见 lib/isolated-env.mjs:writeDynamicStub：edge 启动时目录里没有
+  // routes.yml ⇒ file provider watch 落空 inode，materializer 之后的原子替换永不被 reload，
+  // 整栈健康但 internal 全 404）。必须在任何 compose up 之前。
+  writeDynamicStub(S.dynamicRoot);
 
   const cleanup = () => {
     safe(() => docker(`rm -f ${FDE_CONTAINER} 2>/dev/null || true`));
@@ -207,7 +224,13 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
 
     // 1) 起栈（含 station-litellm）；启动迁移完成后，管理台 API 才能创建 credential/model/binding。
     // LLM_GATEWAY_HOST 跟隔离栈自己的 LiteLLM publish 端口对齐（host 网络的 Traefik 用）。
-    compose('up -d --build', { MIGRATE_ON_START: '1', LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}` });
+    // #268 M2：up 前自建 FDE_IMAGE（同 wp5/wp6 形态；共享 tag 绝不删，issue #178，口径见 lib/fde-image.mjs）。
+    buildFdeImage(FDE_IMAGE);
+    compose('up -d --build', {
+      MIGRATE_ON_START: '1',
+      LLM_GATEWAY_HOST: `http://127.0.0.1:${LITELLM_HOST_PORT}`,
+      FDE_IMAGE,
+    });
 
     await waitFor(async () => {
       const r = await fetch(`${PORTAL}/healthz`).catch(() => null);
@@ -243,6 +266,9 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
 
     // issue #38 新语义（fail-closed）：LLM 路由按 fde_llm_bindings（必须有 api_key）生成，
     // 无 binding 即无 LLM 出口（worker LLM 调用 404 → run failed）。provision 之后、跑 run 之前补 binding。
+    // #268 M3：模型别名对齐 fake-agentd llm 段请求的 `mock-model`（虚拟 key 的模型白名单只包含被绑定的
+    // 模型，别名不一致 → LiteLLM 403，就是真机那次 {"ok":false,"status":403,"chunks":0} 的直接原因）；
+    // 照抄 wp5 调用形态但 mockDelay=0（wp3a 不需要 wp5 的并发 409 窗口）。
     await ensureLlmBinding({
       docker,
       dynamicDir: S.dynamicRoot,
@@ -252,6 +278,8 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
       portal: PORTAL,
       portalContainerName: STATION_PORTAL_NAME,
       dbContainerName: STATION_DB_NAME,
+      modelName: 'mock-model', // 与 fake-agentd llm 段 / seedRun 的 chat_sessions.model 同源（#268 M3）
+      mockDelay: 0,
       adminLogin: 'wp3a-admin',
       adminPassword: 'wp3a-admin-pass-123',
     });
@@ -321,11 +349,27 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     assert.equal(concurrent.winners, 1);
     assert.equal(concurrent.empty, 1);
 
-    // 8) mock 网关经 Traefik 注入链流式响应（伪造 Authorization 被覆盖为 erix-placeholder）
+    // 8) LiteLLM mock_response 经 Traefik 注入链流式响应（#268 M3：mock-gateway 已随 #117 删除，
+    //    mock 响应由 LiteLLM 原生 mock_response 提供；本段保语义换实现）。
+    //    链路：fake-agentd 从 FDE /29 内携**伪造 Authorization（STOLEN-KEY）**经 Traefik 打 LLM_HOST；
+    //    edge 的 llm-<FDE> 路由按 ClientIP 命中后用 headers.customRequestHeaders 把 Authorization
+    //    **整体覆盖为该 FDE 的 per-FDE 虚拟 key**（portal/src/routes.js generateLlmTraefikConfig）——
+    //    LiteLLM 只有收到注入后的虚拟 key 才 200。失败形态区分：
+    //      404 ⇒ edge 没有可用的 llm 路由（binding 未物化，或 watch 坑没 reload——见 writeDynamicStub）；
+    //      401/403 ⇒ 伪造 Authorization 未被边缘覆盖成虚拟 key（401 坏 key 直达 LiteLLM），
+    //      或注入的 key 对所请求模型（mock-model）无白名单权限（403）。
+    //    wp6 已细验「per-FDE key 注入 + 模型白名单」本体，本段只验「假 agentd 从 FDE 网络出发的
+    //    注入链可达性」，不搬第二份 wp6 断言。
     const llm = runFakeAgentd('llm');
-    assert.equal(llm.ok, true, `llm phase: ${JSON.stringify(llm)}`);
-    assert.equal(llm.has_done, true, '流式以 [DONE] 结束');
-    assert.ok(llm.chunks >= 2, '至少两段流式 chunk');
+    if (llm.status !== 200 || !llm.ok) {
+      // #268 M3.3：403/401 排查辅助——顺手把 LiteLLM 日志尾部打进 console.warn，下次红不用裸奔。
+      // eslint-disable-next-line no-console
+      console.warn(`[wp3a] llm phase 非 200（status=${llm.status}）诊断证据（${STATION_LITELLM_NAME} logs tail 20）:\n${safe(() => docker(`logs ${STATION_LITELLM_NAME} --tail 20 2>&1`)) ?? '（docker logs 拉取失败）'}`);
+    }
+    assert.equal(llm.ok, true,
+      `llm 段（LiteLLM mock_response 经 Traefik 注入链）：${JSON.stringify(llm)} — 200 的前提是伪造 Authorization 被边缘覆盖为虚拟 key；404=edge llm 路由未生效（watch 坑，见 writeDynamicStub），401/403=未覆盖成虚拟 key 或 key 对 mock-model 无白名单权限`);
+    assert.equal(llm.has_done, true, `流式以 [DONE] 结束：${JSON.stringify(llm)}`);
+    assert.ok(llm.chunks >= 2, `至少两段流式 chunk：${JSON.stringify(llm)}`);
 
     // 9) seq 全局不变式：messages + run_events 共享 session last_seq，无空洞、无重号
     const allSeq = psql(`SELECT string_agg(seq::text, ',' ORDER BY seq) FROM (SELECT seq FROM run_events WHERE session_id='${S.sessionId}' UNION SELECT seq FROM messages WHERE session_id='${S.sessionId}') x`);
@@ -333,7 +377,7 @@ test('WP3a 端到端：internal API + run 状态机 + 方案 B re-claim + mock �
     assert.ok(seqList.every((v, i) => v === i + 1), `session 级 seq 严格递增无空洞：${allSeq}`);
 
     // eslint-disable-next-line no-console
-    console.log(`\n[e2e] WP3a OK: internal API + 状态机 + 方案B re-claim + 并发 claim + mock 网关注入链 全部通过`);
+    console.log(`\n[e2e] WP3a OK: internal API + 状态机 + 方案B re-claim + 并发 claim + LiteLLM mock_response 注入链 全部通过`);
   } catch (err) {
     try {
       // eslint-disable-next-line no-console

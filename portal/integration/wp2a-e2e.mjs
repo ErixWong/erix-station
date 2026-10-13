@@ -17,6 +17,8 @@
 //     派生——派生段+portal large 池段；显式传入优先，#227.3）
 //   STATION_PORTAL_IMAGE/STATION_DOCKER_PROXY_IMAGE/FDE_IMAGE=…:<栈 id>
 //   FDE_DEV_MODE=1（#227.1 起必需：FDE_IMAGE 为 image:tag 形态时须显式声明 dev 模式；digest 形态豁免）
+//   BASE_DOMAIN=…（**必须 export**，如 fde.erix.vip 或自建域，#268 M2 警示：不 export 时
+//     composeDomainEnv 缺省 localhost ⇒ 路由 host 物化成 station.localhost、agentd 全 404）
 //   （本栈**不带** litellm profile ⇒ 不需要 LITELLM_HOST_PORT/STATION_LITELLM_NAME。）
 //   TRAEFIK_STATIC_HOST 由脚本自动生成（只改入口端口的临时 traefik.yml）——Traefik v3 带 --configFile
 //   时 CLI 端口覆盖不生效，不替换就会去抢共享 edge 的 8090/8443（F8 实测）。
