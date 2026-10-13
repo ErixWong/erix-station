@@ -435,7 +435,28 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **edge file-provider watch 坑（e2e 语境已修，#268 第 3 项）**：traefik 启动时动态目录里没有 `routes.yml` ⇒ 后来 materializer 原子替换的文件**永远不会被 reload**（整栈看起来正常但预览/internal 全 404；`docker restart station-edge-<id>` 立刻通）。修法已落地：`writeDynamicStub` 在 compose up **之前**预写 `http: {}` 桩（wp2a/wp3a/wp3b/wp5/wp6 全部，顺序由 `isolation-negative` 静态钉住）——wp3a/wp2a 真机全程不再需要重启 edge。**人工起栈仍会踩**（drill-2026-10-12 §五 记录保留）；#227 第 4 项（单 test 粒度）有意未拆（新代码自 wp2a 重建起逐段 `t.test`），拆之前不往单条 test 堆断言。
 - **真机验收口径新增**：e2e 隔离跑的断言必须带 **agentd 双向链路**（`sse connected`/`sse ping received`，或 GET+POST 探针——#263 教训同源：只验读方法会把半通当全通）。基线不变：根 945/944/0/1、runner 221、前端 410（`isolation-negative.mjs` 不在发现面，缺省 rc=1 是负例证据本体，进 CI 用 `--strict`）。
 
+### 8.19 v0.1.6：#234 跳站写请求防线 + #275 预览被 released 历史行遮蔽（2026-10-13，PR #276 / issue #275）
+
+- **载荷**：① **#234** CSRF/Origin 同源门（`routeApi` 统一鉴权步前，覆盖 login/logout/签票等写路；`/api/internal/*` 与 `/api/forward-auth` 豁免；
+  ⚠ **`same-site` 不得直接放行**——portal host 与预览 host 共享注册域 `erix.vip`，`SameSite=Lax` 仍会带 host-only cookie，所以必落**注册域精确比对**）；
+  ② **#275** 预览 hostname 查表改「活行优先 + 全序」（详 `#275` 正文与 `portal/src/preview.js` 注释）。
+- **测试基线：根 `npm test` 976 / 975 通过 / 0 失败 / 1 跳过**（含 runner 221）、runner 221/221、前端 `vue-tsc` 干净 / vitest 410（本轮前端零改动）。
+  台账已同步 `docs/ops/ci-release.md` §1 与 `ci.yml` 步骤 ②（945 → 967 → 969 → **976**）。
+- **两次否掉的修法（主 agent 变异取证，不是偏好）**：#275 的「只加 `AND state <> 'released'`」朴素一行⇒ **5 红（含 #241 既有 2 条）**，
+  因为它把 `allocation_released`(403) 打死并把「只有 released 行」的 host 挤成 404（改掉已有契约）；整段排序删掉 ⇒ 5 红。
+- **发布与部署（第三次按 digest）**：三份 `package.json`+lockfile → `0.1.6`（每份 lockfile 恰好 2 行）→ tag `v0.1.6`（run `38391682946` success）
+  → 三镜像 `docker pull` + `image inspect .Id` 与清单 `imageId` 全一致、`RepoDigests` 与 `digest` 一致 → `deploy/.env` 形态① pin（备份 `/tmp/deploy.env.bak-016`）
+  → `docker compose -p station --profile litellm up -d --no-build`（portal 实跑 `bac03044…` = 清单 imageId）。
+- **真机验收全绿**（请求从 host 网络容器 `erix_station_playwright` 发出，避開宓主透明代理假 401）：被遮蔽的 `eric-p-22000…` 由 `allocation_released` 变 **`preview_ticket_required`**；
+  列端口 200 → 签票 201 → 兑换 **302 + Set-Cookie** → 带 cookie **502**（无人监听＝鉴权已过，修复前根本走不到）；未知 host 仍 404；
+  #241 deny CORS 与预检无回归；#234 经边缘同源登录 200 / 预览 host same-site 写请求 403 `cross_origin_forbidden`；
+  端到端冒烟 run `a300dee9…` **finished**（`judge_done`、↑3,829/↓63，正文落库含 `pong` 且有 1 条助手锢点——即 #278「中止后 0 锢点」的对照面）；
+  FDE `agentd` 在 portal 重启后自愈（`sse disconnected → reconnect → sse connected`）。
+- **已接受代价 / 遗留**：四台 FDE 容器仍在 v0.1.5 runner 镜像上（`ensureFdeContainer` 不检测镜像漂移；runner 代码本轮零改动 ⇒ 不专门 `rm -f` 重建，下次重建自然升级）。
+  `#234` 的 https 半边仍卡在 `erix.vip` 泛域名 DNS-01 API token（外部依赖）；本轮只交付 CSRF/Origin 半边。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
+
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
 
