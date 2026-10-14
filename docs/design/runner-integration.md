@@ -275,6 +275,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `abort` | agentd→worker | `{run_id, reason}` | 停止指令（SSE `stop_request` 或心跳兜底触发）；worker 调 `AbortController.abort()` |
 | `run_finished` | worker→agentd | `{run_id, ok, termination?, usage?, rounds?, final_text?, error?: {code, message, retryable}}` | `runToolLoop` resolve/reject 后发送；worker 随后自行 `process.exit` |
 | `log` | worker→agentd | `{run_id, level, msg}` | stdout/stderr 转发（agentd 加 run 前缀统一输出，§14） |
+| `shell_liveness` | worker→agentd | `{run_id, phase: "spawn"\|"heartbeat"\|"exit", pgid, command?, elapsed_ms?}` | **（issue #288）宿主内部信号，不是事件**：`spawn`/`exit` 报子命令的进程组 id（shell 工具 `spawn(..., {detached:true})` ⇒ 子命令自成一组，**不在 worker 组里**），agentd 记入本次 attempt 的登记集，在每一条 worker 终止路径（watchdog kill / abort / 退出清理）SIGKILL worker 组**之后**逐个 `-pgid` 补杀（否则常驻命令会跨 attempt 无限累加）；`heartbeat`（默认 30s，`ERIX_SHELL_LIVENESS_MS`）是 shell 执行期零引擎 IPC 期间的保活冒泡，依赖「任意 IPC 刷 `lastIpcAt`」这条既有口径防止 F6 watchdog 误杀真在跑的长命令。**两者都不得进事件通道**（不落 `run_events`、不推 SSE），agentd 侧只 `log('debug', …)` 记账 |
 
 > **背压**：`process.send()` 返回 `false` 表示通道缓冲满 → worker 暂停发送并等 `drain`；但引擎回调（`onEvent` 等）是同步 void（`src/loop.js:1124-1126` 的 `emitEvent` 不等待），无法反压引擎。因此 worker 侧维护**内存事件队列**（上限见 §7.4），`event` 消息一律先入队再由发送循环 drain。
 

@@ -371,10 +371,28 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `ERIX_MAX_ROUNDS` | worker `runToolLoop` 轮预算（2026-09-24 用户拍板自 8 上调，与上游 judge 常规搭配 `DEFAULT_REFLECTION_MIN_ROUNDS=16` 对齐；nearLimit 由 round judge 扩轮兜底）。**下发光纤**同上（provisioner Env 注入，issue #84）；非法值回退默认 | `16` |
 | `ERIX_ARTIFACT_MAX_BYTES` | run 终态产物快照的文件内容累计上限（字节），超限截断并 manifest.truncated 标记。**runner 侧（采集）与 portal 侧（存储校验）同名同默认**，2026-09-24 自 20MB → 100MB | `104857600`（100MB） |
 | `ERIX_ARTIFACT_CAPTURE_BUDGET_MS` | 产物快照打包时间预算（ms）：超时停止收录并 truncated 标记——时间预算比字节数更本质，封死「大产物打包久」的痛点 | `60000` |
-| `ERIX_SHELL_TIMEOUT_MS` | agent shell 工具默认超时（可被单次调用的 timeout_ms 参数覆盖） | `60000` |
+| `ERIX_SHELL_TIMEOUT_MS` | agent shell 工具默认超时（可被单次调用的 `timeout_ms` 参数覆盖） | `60000` |
 | `ERIX_SHELL_MAX_TIMEOUT_MS` | agent shell 工具超时上限（单次调用超上限按上限钳制）；DEFAULT 自动钳 ≤ 此值 | `600000` |
 | `ERIX_SHELL_OUTPUT_MAX_BYTES` | agent shell 工具输出截断上限（字节，影响模型可见输出量） | `32768` |
+| `ERIX_SHELL_LIVENESS_MS` | **（issue #288 新增）**shell 子进程执行期间的**保活心跳间隔**（worker → agentd 的 `shell_liveness` IPC）。shell 工具执行期引擎侧零 IPC，agentd 的 F6 watchdog 只看「有没有 IPC」⇒ 会误杀真在跑的长命令（requeue = **同一条命令再跑一遍**）；本间隔就是那条防线。合法区间 `1000–60000`，**上限外一律回落默认**（语义上就不允许 >60s）；非法值（垃圾串/0/负数）同样回落默认 | `30000`（30s） |
+| `ERIX_AGENTD_WATCHDOG_MS` | agentd F6 watchdog：worker 超过此时间无任何 IPC → SIGKILL 整组 + release requeue。**与 `ERIX_SHELL_MAX_TIMEOUT_MS` 有配置关系，见下方 ⚠ 注** | `300000`（5min） |
 | `ERIX_FILE_READ_MAX_BYTES` | agent `readFile` 单次返回的字节上限（上游 erix-agent 0.18.0 有界读，钳 1024–4194304；issue #228 迁上游后取代旧 fork 的无上限 `readFileSync`）。**本站不注入**（工单 D3 §3.2）：跟随上游默认值，改值只需在容器 env 里加该变量（下发光纤同 `ERIX_MAX_ROUNDS`），无需重建镜像 | `262144`（256KB，上游默认） |
+
+> ⚠ **`ERIX_AGENTD_WATCHDOG_MS` 与 `ERIX_SHELL_MAX_TIMEOUT_MS` 的配置关系（issue #288，必须知道的一条）**
+>
+> 默认形态就是 `300000 < 600000`：一条合法到 10 分钟的 shell 命令，能不被 watchdog 误杀，
+> **全靠 `ERIX_SHELL_LIVENESS_MS` 那条心跳**（worker 在 shell 执行期每 30s 发一次 `shell_liveness`，
+> 任意 IPC 天然刷 agentd 的 `lastIpcAt`）。因此：
+>
+> - **心跳通道失效时仍会误杀**（worker 被 `SIGSTOP`、IPC 通道死、事件循环被堵死），
+>   后果就是 #288 的用户可见症状：同一条命令按 attempt 重跑，最后只剩一句 `attempts exhausted`。
+> - agentd **启动时会比较两个值**，`watchdogMs < shellMax` 即打一条 `warn`（点名两个数值 + 「依赖 shell 心跳保活」），
+>   实现见 `runner/agentd.js:warnIfWatchdogBelowShellMax`。**故意不自动抬高 `watchdogMs`**：
+>   抬高会同时拖长「worker 真死」的发现时间（F6 watchdog 的存在理由），拿一个洞换另一个洞。
+>   要让两者天然不冲突，自己选一个：抬 `ERIX_AGENTD_WATCHDOG_MS` ≥ `ERIX_SHELL_MAX_TIMEOUT_MS`（代价：死 worker 发现得更慢），
+>   或降 `ERIX_SHELL_MAX_TIMEOUT_MS`（代价：长构建/长测试被工具自己提前掉断）。
+> - 两个值都由 agentd 从同一份 env 解析（`runner/lib/shell-tools.js:resolveShellMaxTimeoutMs` 与 worker 同源），
+>   改值只需重建容器 env，**无需重建镜像**。
 
 ### 10.3 补登：portal 侧环境变量（会话自动标题，issue #88，2026-09-25 登记；同日修订为 agent 侧生成）
 

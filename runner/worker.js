@@ -320,7 +320,27 @@ async function startRun(msg) {
   // 同为纯 {executors, schemas} 形态（issue #228：file 侧的 executors 是 name→fn 对象，上游
   // 原生那个 executors 是**函数**、铺进对象会铺出空集），并入 registry 最简；note_* 例外走工厂
   // 结构化 executeTool（工厂内部强制宿主作用域），保持独立分支不动。
-  const shellTools = createShellTools({ worktreeRoot: cwd });
+  // issue #288（缺陷 A + D）：liveness = shell 执行期的宿主侧信号上行（默认 30s 一跳，env
+  // `ERIX_SHELL_LIVENESS_MS` 可下调、钳 ≤60s）。本工具执行期间引擎侧**零 IPC**（无 round/tool 回调），
+  // agentd 的 F6 watchdog（默认 300s）会把一条真在跑的长命令当死循环误杀（dev 真机：`sleep 360`
+  // + `timeout_ms:420000` 在 300s 整被杀 → requeue → **同一条命令再跑一遍**，3 次后只给一句
+  // 「没有原因的 attempts exhausted」）。走现有 IPC 通道 ⇒ agentd 天然刷 `lastIpcAt`。
+  // ⚠ `MSG.SHELL_LIVENESS` 是宿主内部信号：走 sendIpc 直发，**绝不得走 emitEvent**
+  //（否则多出一条 run_events/U3 事件，污染用户可见事件流）；工具返回正文逐字节不变。
+  const shellTools = createShellTools({
+    worktreeRoot: cwd,
+    liveness: {
+      onEvent: (ev) => sendIpc(process, {
+        type: MSG.SHELL_LIVENESS,
+        run_id: runId,
+        phase: ev.phase,
+        pgid: ev.pgid,
+        // 只有 spawn/exit 需要带命令文本（agentd 侧 debug 记账用）；心跳不带，避免长命令反复上送。
+        command: ev.phase === 'heartbeat' ? undefined : ev.command,
+        elapsed_ms: ev.elapsed_ms,
+      }),
+    },
+  });
   const registry = createToolRegistry({
     executors: { ...fileTools.executors, ...shellTools.executors },
     schemas: [...fileTools.schemas, ...shellTools.schemas],
