@@ -1304,3 +1304,125 @@ test('#195 recallTranscript：record.foldedPayload 的 string 正文进入检索
   assert.equal(hit.matched_rounds, 1, '折叠原文可被 recall 命中（#195 主症状）');
   assert.match(hit.text, /FOLD-ONLY-TEXT-XYZ/);
 });
+
+// ---------------------------------------------------------------------------
+// issue #283：U3 把 tool_result 的 duration_ms / result_digest 回填进 tool_calls
+//（两列在 baseline schema 里早已存在 = 零 DDL；此前 portal **从来没有** tool_result 的 UPDATE，
+//  于是事件 payload 里有值、表里却全表 NULL）。
+// 夹具：seedClaimable + 领任务 + 置 running（与上方 postEvents 用例同一惯例）。
+// ---------------------------------------------------------------------------
+
+/** 起一个 running run，返回 postEvents 的入参包。 */
+async function runningRun() {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  let counter = 0;
+  const toolUse = (callId, extra = {}) => ({
+    client_event_id: `run1:1:${counter++}`, type: 'tool_use', ts: null,
+    payload: { tool_call_id: callId, round: 1, name: 'shell', input: { command: 'sleep 5' }, ...extra },
+  });
+  const toolResult = (callId, extra = {}) => ({
+    client_event_id: `run1:1:${counter++}`, type: 'tool_result', ts: null,
+    payload: { tool_call_id: callId, round: 1, result_digest: 'exit_code: 0', duration_ms: 5021, ok: true, ...extra },
+  });
+  const post = (events) => postEvents(pool, { container, user, runId, claimToken, body: { batch_id: 'b', events } });
+  const row = (callId) => pool.toolCalls.find((x) => x.call_id === callId);
+  return { pool, runId, post, toolUse, toolResult, row };
+}
+
+/** 统计真正打到 `UPDATE tool_calls` 的次数与 rowCount（fake 的 connect() 走 pool.query，可就地包一层）。 */
+function spyToolCallUpdates(pool) {
+  const calls = [];
+  const original = pool.query.bind(pool);
+  pool.query = async (sql, params) => {
+    const res = await original(sql, params);
+    if (typeof sql === 'string' && sql.includes('UPDATE tool_calls')) calls.push({ rowCount: res.rowCount });
+    return res;
+  };
+  return calls;
+}
+
+test('issue #283 U3：同批 tool_use + tool_result ⇒ tool_calls.duration_ms / result_digest 都写入（零 DDL）', async () => {
+  const { post, toolUse, toolResult, row } = await runningRun();
+  await post([toolUse('tc_1'), toolResult('tc_1', { duration_ms: 5021, result_digest: 'exit_code: 0\nok' })]);
+  const r = row('tc_1');
+  assert.ok(r, 'tool_use 必须仍然建行');
+  assert.equal(r.duration_ms, 5021, '时长必须落到 tool_calls（此前全表 NULL 就是这个 bug）');
+  assert.equal(r.result_digest, 'exit_code: 0\nok');
+  assert.equal(r.name, 'shell');
+});
+
+test('issue #283 U3：顺序陷阱——同批里 tool_result 排在 tool_use **前面**也必须写入（钉 tool_use 循环在前）', async () => {
+  const { post, toolUse, toolResult, row } = await runningRun();
+  await post([toolResult('tc_1', { duration_ms: 1200 }), toolUse('tc_1')]);
+  const r = row('tc_1');
+  assert.ok(r, 'tool_use 仍须建行');
+  assert.equal(r.duration_ms, 1200,
+    'tool_result 循环必须跑在 tool_use 循环之后：把两个循环换个顺序这条就红（UPDATE-only 打空）');
+  assert.equal(r.result_digest, 'exit_code: 0');
+});
+
+test('issue #283 U3：跨批（tool_use 先、tool_result 后）同样写入', async () => {
+  const { post, toolUse, toolResult, row } = await runningRun();
+  await post([toolUse('tc_1')]);
+  assert.equal(row('tc_1').duration_ms, null, '还没有 tool_result 时保持 NULL（不是 0）');
+  await post([toolResult('tc_1', { duration_ms: 33 })]);
+  assert.equal(row('tc_1').duration_ms, 33);
+});
+
+test('issue #283 U3：重复投递同一批（at-least-once 整批重发）⇒ 已写值一字不变', async () => {
+  const { pool, post, toolUse, toolResult, row } = await runningRun();
+  const batch = [toolUse('tc_1'), toolResult('tc_1', { duration_ms: 4321, result_digest: 'first' })];
+  await post(batch);
+  await post(batch);
+  await post(batch);
+  assert.equal(pool.toolCalls.length, 1, 'ON CONFLICT (run_id, call_id) DO NOTHING：不重复建行');
+  assert.equal(row('tc_1').duration_ms, 4321);
+  assert.equal(row('tc_1').result_digest, 'first');
+});
+
+test('issue #283 U3：后到的同 call_id 空值事件不得把已有值擦成 NULL（WHERE ... IS NULL 守卫）', async () => {
+  const { post, toolUse, toolResult, row } = await runningRun();
+  await post([toolUse('tc_1'), toolResult('tc_1', { duration_ms: 4321, result_digest: 'known' })]);
+  // 另一 attempt / 重放：client_event_id 不同（不被事件查重挡掉），但 payload 没有时长
+  await post([toolResult('tc_1', { duration_ms: null, result_digest: null })]);
+  assert.equal(row('tc_1').duration_ms, 4321,
+    '没有时长的 tool_result 不得把已知 4321 擦成 NULL —— 删掉 SQL 里的 `IS NULL` 守卫这条就红（变异③）');
+  assert.equal(row('tc_1').result_digest, 'known', 'result_digest 同口径：先到先得，不被空值覆写');
+});
+
+test('issue #283 U3：只有 tool_result 的批（tool_calls 行缺失）⇒ 0 行更新、不报错、不补记', async () => {
+  const { pool, post, toolResult, row } = await runningRun();
+  const updates = spyToolCallUpdates(pool);
+  await post([toolResult('tc_orphan', { duration_ms: 999 })]);
+  assert.equal(row('tc_orphan'), undefined,
+    'UPDATE-only：行缺失就静默不补记（round/name/input 在 tool_result 里没有可靠来源）');
+  assert.equal(updates.length, 1, '确实发了一次 UPDATE（不是被 if 跳过）');
+  assert.deepEqual(updates.map((u) => u.rowCount), [0], 'rowCount=0：打空但不报错');
+  assert.equal(pool.toolCalls.length, 0);
+});
+
+test('issue #283 U3：result_digest 与事件 payload 逐字一致（不截断、不重排版）', async () => {
+  const { post, toolUse, toolResult, row } = await runningRun();
+  const digest = '中文摘要第一行\n第二行 with spaces  "quoted"  ' + 'x'.repeat(600);
+  await post([toolUse('tc_1'), toolResult('tc_1', { result_digest: digest, duration_ms: 0 })]);
+  assert.equal(row('tc_1').result_digest, digest, '逐字符相等（长度都不许变）');
+  assert.equal(row('tc_1').result_digest.length, digest.length);
+  assert.equal(row('tc_1').duration_ms, 0,
+    '引擎真测出的 0ms 是合法值，必须落 0（区别于「没有时长」的 NULL）');
+});
+
+test('issue #283 U3：duration_ms 缺失 ⇒ 库里是 NULL 而不是 0；无 tool_call_id 的 tool_result 静默跳过', async () => {
+  const { pool, post, toolUse, toolResult, row } = await runningRun();
+  await post([toolUse('tc_1'), toolResult('tc_1', { duration_ms: null })]);
+  assert.equal(row('tc_1').duration_ms, null, '「没有时长」就是 NULL（旧 740 条历史数据同口径，不可回填）');
+  assert.equal(row('tc_1').result_digest, 'exit_code: 0');
+
+  const before = pool.toolCalls.length;
+  await post([{ client_event_id: 'run1:1:99', type: 'tool_result', ts: null, payload: { tool_call_id: null, duration_ms: 7 } }]);
+  assert.equal(pool.toolCalls.length, before, '无 tool_call_id ⇒ 无键可依：不猜、不建行');
+});

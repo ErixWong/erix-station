@@ -18,7 +18,11 @@ export class FakeInternalPool {
     this.rounds = seed.rounds ?? [];
     this.checkpoints = seed.checkpoints ?? [];
     this.approvals = seed.approvals ?? [];
-    this.toolCalls = seed.toolCalls ?? [];
+    // tool_calls 行补齐两列缺省值（NULL 就是 NULL，不是「没这个键」），与真库列默认值同口径。
+    this.toolCalls = (seed.toolCalls ?? []).map((row) => Object.assign({ duration_ms: null, result_digest: null }, row, {
+      duration_ms: row.duration_ms ?? null,
+      result_digest: row.result_digest ?? null,
+    }));
     this.usage = seed.usage ?? [];
     // issue #117：binding slots hold LiteLLM model_info.id strings; credentials/models live upstream.
     this.llm = {
@@ -536,9 +540,45 @@ export class FakeInternalPool {
       return { rows: a ? [a] : [] };
     }
 
-    // ---- tool_calls ----
-    if (sql.includes('FROM tool_calls') || sql.includes('INSERT INTO tool_calls')) {
-      return { rows: [] };
+    // ---- tool_calls（issue #283）----
+    // ⚠ **谓词从 SQL 文本里解析，不是写死行为**（AGENTS §8.14 的教训：fake 必须模拟真库约束，
+    // 否则「幂等 / 不擦写」这类性质在单测里结构上不可能被发现）：
+    //   * INSERT 走 `ON CONFLICT (run_id, call_id) DO NOTHING`（UNIQUE 在真库里存在）；
+    //   * `call_id` NOT NULL ⇒ 给空就报 23502（与真库同形，不许静默吞）；
+    //   * UPDATE 的 `AND duration_ms IS NULL` / `AND result_digest IS NULL` 守卫从 SQL 里读：
+    //     把产品代码里的守卫删掉，本 fake 就会**真的**把已写值擦成 NULL ⇒ 变异测试必须红。
+    if (sql.includes('INSERT INTO tool_calls')) {
+      const [runId, callId, round, name, input] = params;
+      if (typeof callId !== 'string' || callId === '') {
+        throw Object.assign(new Error('null value in column "call_id" of relation "tool_calls" violates not-null constraint'), { code: '23502' });
+      }
+      if (this.toolCalls.some((x) => x.run_id === runId && x.call_id === callId)) return { rows: [], rowCount: 0 };
+      this.toolCalls.push({
+        run_id: runId, call_id: callId,
+        round: round ?? 0, name: name ?? '', input: input ? JSON.parse(input) : {},
+        duration_ms: null, result_digest: null, judged: false, approved: null,
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes('UPDATE tool_calls')) {
+      const [runId, callId, durationMs, digest] = params;
+      const guardDuration = /duration_ms\s+IS\s+NULL/i.test(sql);
+      const guardDigest = /result_digest\s+IS\s+NULL/i.test(sql);
+      let touched = 0;
+      for (const row of this.toolCalls) {
+        if (row.run_id !== runId || row.call_id !== callId) continue;
+        if (guardDuration && row.duration_ms !== null) continue;
+        if (guardDigest && row.result_digest !== null) continue;
+        row.duration_ms = durationMs === undefined ? null : durationMs;
+        row.result_digest = digest === undefined ? null : digest;
+        touched += 1;
+      }
+      return { rows: [], rowCount: touched };
+    }
+    if (sql.includes('FROM tool_calls')) {
+      const [runId, callId] = params;
+      return { rows: this.toolCalls.filter((x) => (runId === undefined || x.run_id === runId)
+        && (callId === undefined || x.call_id === callId)) };
     }
 
     // ---- usage_ledger ----

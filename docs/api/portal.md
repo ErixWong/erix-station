@@ -1248,7 +1248,7 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 4 | `recovered` | 同上 | `round: number`，`attempt: number`（重试成功，依据：`src/loop.js:1413`/`1424`） |
 | 5 | `usage` | 同上 | `round: number`，`usage: object`（嵌套 usage 对象，形如 `{input_tokens, output_tokens}`；依据：`src/loop.js:1355`/`1928`/`1960`。宿主若拍平为顶层 `input_tokens`/`output_tokens`，属宿主侧改写，须显式注明） |
 | 6 | `tool_use` | 同上 | `tool_call_id: string`，`name: string`，`input: object` |
-| 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number`，`ok: boolean` |
+| 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283**：`duration_ms` 可为 `null`——引擎 0.18.0 只在 executor 返回结构化结果时写 duration，对非结构化返回 / 返回 Error / 抛异常的调用**不给时长**；runner 映射时缺失一律 `null`，**不伪装成 0**，前端据此不渲染时长。本站已在装配层包了一层适配器（`runner/lib/tool-duration.js`）让常见形态都有时长，上游 erix-agent #285 落地升版后可撤） |
 | 8 | `round_end` | 同上 | `round: number` |
 | 9 | `assistant_delta` | `onDelta` | `text: string`（增量文本片段） |
 | 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段） |
@@ -1519,6 +1519,20 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `seq_first` / `seq_last` | 本批**新插入**事件分配到的 seq 区间（`seq_first ≤ seq_last`）。**当 `stored == 0`（空批次 或 全重复批次）时两者均为 `null`**——这是「没有新事件落库」的明确信号，agentd 不应据此推进任何游标（本来也没有新 seq）。seq 由 portal 在**同一事务**内 `chat_sessions.last_seq` 逐条 +1 分配（`UNIQUE(session_id, seq)` 兜底）；**seq 只在 portal 产生，worker/agentd 永不自造** |
 
 幂等与重试（runner §7.3）：**at-least-once**——agentd 只有收到 `200` 才确认删除；任何失败重试**整批**，重复批次安全。
+
+**派生写入：同一事务里的 `tool_calls`（issue #283）**
+
+| 事件 | 写法 | 口径 |
+|---|---|---|
+| `tool_use` | `INSERT INTO tool_calls (run_id, call_id, round, name, input) … ON CONFLICT (run_id, call_id) DO NOTHING` | 行的唯一来源（round/name/input 只能从 tool_use 取） |
+| `tool_result` | `UPDATE tool_calls SET duration_ms = $3, result_digest = $4 WHERE run_id = $1 AND call_id = $2 AND duration_ms IS NULL AND result_digest IS NULL` | 回填耗时与结果摘要（两列在 baseline schema 里早已存在 ⇒ **零 DDL**；此前 portal 从来没有这条 UPDATE，导致事件 payload 里有值、表里 741 行全 NULL） |
+
+- **顺序是硬前置**：`tool_use` 循环必须跑在 `tool_result` 循环**之前**——两者可能同批（且批内 `tool_result` 可以排在 `tool_use` 前面）、也可能跨批，而 `tool_result` 只 UPDATE 不 INSERT，行不存在就一枪打空（防漂移用例：同批里把 `tool_result` 放前面仍须写入）。
+- **UPDATE-only，不 INSERT**：`tool_calls` 行缺失（只见到 `tool_result`、没见到对应 `tool_use`）⇒ **更新 0 行、静默不补记**，不为此引入 INSERT（`round`/`name`/`input` 在 `tool_result` 里没有可靠来源）。同理 `payload.tool_call_id` 缺失的 `tool_result` 直接跳过（不猜键）。
+- **幂等且不擦写**：守卫 `AND duration_ms IS NULL AND result_digest IS NULL` ⇒ 整批重发（at-least-once）与「后到的同 `call_id` 空值事件」都不会把已写的值改回 NULL（语义 = 首次观测即真相、先到先得）。两列用同一条 UPDATE 同一口径，不拆成两个逐列守卫：一次工具调用只有一个 `tool_result` 事件（两列同源同时到），拆列只翻倍查询。
+- **取值口径**：`duration_ms` 非有限数（含 `null`）⇒ 写 `NULL`，**不写 0**（引擎未给时长与引擎测出 0ms 是两件事，后者照写 `0`）；`result_digest` 与事件 payload **逐字一致**（portal 不截不断不重排版；worker 侧已按 500 字截断，见 §5.3 第 7 行）。
+- **旧数据不可回填**：历史 `run_events` 里本来就没带 duration（erix-agent 0.18.0 的缺口，上游 erix-agent #285 跟修），因此已存行仍是 NULL，**不跑数据修补、也不拿 `created_at` 之类造一个假时长**。
+- 防漂移：`portal/test/internal.test.js` 的 `issue #283 U3：*` 用例集（同批写入 / 顺序陷阱 / 跨批 / 重复投递 / 空值不擦写 / 行缺失 0 行 / 逐字一致 / NULL 与无键跳过）。`portal/test/fake-internal-pool.js` 的 `tool_calls` 分支**从 SQL 文本里解析 `IS NULL` 谓词**并模拟 `UNIQUE(run_id, call_id)`（AGENTS §8.14：fake 必须模拟真库约束）；变异取证：删掉守卫 ⇒「后到的同 call_id 空值事件不得把已有值擦成 NULL」必须红。
 
 错误：`400 validation_failed`（条数/字节超限、`payload` 非对象、`client_event_id` 格式非法）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 run_terminal`（终态 run 不再接受事件——终态 barrier，runner §7.6）；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
