@@ -324,6 +324,69 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(err && 'text' in err ? err.text : '').toContain('发送失败：该 FDE 未配置 LLM 上游');
   });
 
+  // issue #261014 切片 B2：绑定的 `model_info.id` 在网关里已不存在（模型被删/重建 ⇒ id 变）——
+  // 服务端现在给 `409 llm_model_not_found` + `details={slot, model_id}`，用户要看到一句话说清
+  // 「哪个槽位的哪个模型没了、去哪儿改」。旧的 `sendFailed` 兼容路径不能把这码演成「发送失败：nope」。
+  it('llm_model_not_found 409：syserr 文案带槽位与模型 id，并回填输入', async () => {
+    mockFetch((url, init) => (url.endsWith('/messages') && init?.method === 'POST'
+      ? { status: 409, body: { error: { code: 'llm_model_not_found', message: 'nope', details: { slot: 'main', model_id: 'mid-42' } } } }
+      : { status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.inputValue = '发一条';
+    await store.send();
+    const err = store.entries.filter((e) => e.kind === 'syserr').pop();
+    const text = err && 'text' in err ? err.text : '';
+    expect(text).toContain('本 FDE 绑定的模型在 LLM 网关里已不存在');
+    expect(text).toContain('main');
+    expect(text).toContain('mid-42');
+    expect(text).toContain('管理台');
+    expect(text).not.toContain('[object Object]');
+    // 失败不吞内容（与 llm_not_configured 同口径）
+    expect(store.inputValue).toBe('发一条');
+    expect(store.drafts.get('s1')).toBe('发一条');
+  });
+
+  it('llm_model_not_found 脏 details（嵌套对象 / 数字）：经 toDisplayText 收口，不退化成 [object Object]', async () => {
+    mockFetch((url, init) => (url.endsWith('/messages') && init?.method === 'POST'
+      ? {
+        status: 409,
+        body: { error: { code: 'llm_model_not_found', message: 'nope', details: { slot: { deep: { a: 1 } }, model_id: 7 } } },
+      }
+      : { status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.inputValue = 'x';
+    await store.send();
+    const err = store.entries.filter((e) => e.kind === 'syserr').pop();
+    const text = err && 'text' in err ? err.text : '';
+    expect(text).not.toContain('[object Object]');
+    expect(text).not.toContain('undefined');
+    expect(text).toContain('{"deep":{"a":1}}'); // 脏值以 JSON 文本原样带出，不静默丢
+    expect(text).toContain('7');
+  });
+
+  it('切 English：llm_model_not_found 的发送失败文案是英文（双语成对，不拿中文交差）', async () => {
+    mockFetch((url, init) => (url.endsWith('/messages') && init?.method === 'POST'
+      ? { status: 409, body: { error: { code: 'llm_model_not_found', message: 'nope', details: { slot: 'vision', model_id: 'mid-9' } } } }
+      : { status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.inputValue = 'x';
+    setLocale('en');
+    await store.send();
+    const err = store.entries.filter((e) => e.kind === 'syserr').pop();
+    const text = err && 'text' in err ? err.text : '';
+    expect(text).toContain('the model this FDE is bound to no longer exists in the LLM gateway');
+    expect(text).toContain('vision');
+    expect(text).toContain('mid-9');
+    expect(text).not.toMatch(/[\u4e00-\u9fff]/);
+    setLocale('zh-CN');
+  });
+
   it('run_in_progress 409 错误带「（已有进行中任务）」后缀', async () => {
     mockFetch((url) => url.endsWith('/messages')
       ? { status: 409, body: { error: { code: 'run_in_progress', message: 'run in progress' } } }

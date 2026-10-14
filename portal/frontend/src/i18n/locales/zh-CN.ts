@@ -94,6 +94,10 @@ export const zhCN = {
       kdf_busy: '服务器正忙（口令派生的并发闸已满，一次改密要跑两次 scrypt）：这不是你的口令有问题，请 {seconds} 秒后重试。',
       kdf_busy_no_retry: '服务器正忙（口令派生的并发闸已满）：这不是你的口令有问题，请稍后重试。',
       internal: '服务端出错，这次改密没写成：请稍后重试一次，仍然失败就把下面这行错误码原样交给管理员。',
+      // 409 `llm_model_not_found`（#289 切片 B2，§1.2 / §4.3）：绑定的 `model_info.id` 在网关里已不存在
+      // （模型被删/重建 ⇒ id 变）。与 `forbidden` 的差别：不是没权限，而是**配的那东西没了**；
+      // 解法只有一个（管理员在管理台重新选模型），故文案不带参数（`resolveErrorCode` 不给本键注参数）。
+      llm_model_not_found: '绑定的模型已在 LLM 网关里被删除或重建：请到管理台 /admin 重新选择该槽位的模型后重试（无权限请联系管理员）。',
       // 未知码兜底：**不许静默成通用错误**，必须把 code 与 HTTP 状态码原样带出来供报障。
       unknown_code: '未收录的错误（HTTP {status}，错误码 {code}）：请重试一次，仍然失败就把上面这行状态码与错误码原样交给管理员。',
       // 统一附在句尾的原始证据（服务端 message 原样透传，不翻译）。
@@ -585,6 +589,7 @@ export const zhCN = {
     // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）
     sendFailedLlmNotConfigured: '发送失败：该 FDE 未配置 LLM 上游，请到管理台 /admin 配置（无权限请联系管理员）',
     // 拼在 sendFailed 之后的可选后缀（zh 全角括号、en 前置空格 + 半角括号）
+    sendFailedLlmModelNotFound: '发送失败：本 FDE 绑定的模型在 LLM 网关里已不存在（槽位 {slot}，模型 id {model_id}）：请到管理台 /admin 重新选择模型后再发一次（无权限请联系管理员）',
     runInProgress: '（已有进行中任务）',
     treeLoadFailed: '目录树加载失败：{message}',
     // issue #107：侧栏内联重命名——空串本地拦截 / 提交失败回退旧标题时的轻提示

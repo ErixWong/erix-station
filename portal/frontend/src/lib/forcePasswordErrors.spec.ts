@@ -172,3 +172,64 @@ describe('#255 错误码映射表：码 → 键', () => {
     setLocale('zh-CN');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #261014 切片 B2：`llm_model_not_found`（发消息预检把「绑定的模型 id 已不在网关里」报成
+// 用户看得见的 409）。这里钉三件事：① 码进表且中英两侧都有真文案（不是拿中文交差）；
+// ② 该键 param-free（`resolveErrorCode` 不给它注参数，所以 locale 里不许留 `{xxx}` 占位符）；
+// ③ 脏值（服务端塞嵌套对象/非字符串）不退化成 `[object Object]`。
+// 发送路径那一层的文案在 stores/workbench.spec.ts（同一个码，另一个消费方）。
+// ---------------------------------------------------------------------------
+
+const CJK = /[\u4e00-\u9fff]/;
+
+describe('#261014 B2 llm_model_not_found：进表、双语成对、脏值不退化', () => {
+  it('码在表里，键名与码逐字相同，且不触发 relogin（会话没死，别把人踢回登录页）', () => {
+    expect(ERROR_CODE_KEYS.llm_model_not_found).toBe('llm_model_not_found');
+    expect(resolveErrorCode({ status: 409, code: 'llm_model_not_found' })).toEqual({
+      key: 'llm_model_not_found', params: {}, relogin: false,
+    });
+    // 409 不在 STATUS_KEYS 里：认识 code 时绝不走状态码兜底（表头注释的口径）。
+    expect(resolveErrorCode({ status: 409, code: 'llm_model_not_found' }).key).not.toBe('unknown_code');
+  });
+
+  it('zh-CN 与 en 两侧都有该键、语义都真写了（zh 含汉字、en 不含汉字且不与 zh 同串）', () => {
+    const zh = errorsRoot(zhCN).llm_model_not_found;
+    const english = errorsRoot(en).llm_model_not_found;
+    expect(typeof zh).toBe('string');
+    expect(typeof english).toBe('string');
+    expect(zh).toMatch(CJK);
+    expect(english).not.toMatch(CJK);
+    expect(english).not.toBe(zh);
+  });
+
+  it('本键 param-free：locale 里不许留 i18n 占位符（resolveErrorCode 不给它注参数，留了就是残渣）', () => {
+    for (const locale of ['zh-CN', 'en'] as const) {
+      setLocale(locale);
+      const text = describeError({ status: 409, code: 'llm_model_not_found', message: 'm' });
+      expect(text).not.toMatch(/\{[a-z_]+\}/);
+      expect(text).not.toContain('forcePassword.errors');
+      // 必须给出处置动作（改模型 / 找管理员），不许演成「出错了」。
+      expect(text).toMatch(/重新选择|管理台|管理员|re-select|administrator/);
+    }
+    setLocale('zh-CN');
+  });
+
+  it('脏 details / 脏 message：经 toDisplayText 收口，绝不演成 [object Object] 或 undefined', () => {
+    for (const locale of ['zh-CN', 'en'] as const) {
+      setLocale(locale);
+      const text = describeError({
+        status: 409,
+        code: 'llm_model_not_found',
+        // 服务端按契约给字符串，但 `describeError` 不信任它（再过一次 toDisplayText）——
+        // 这里故意塞非字符串，所以要 `as unknown as string` 把契约外的形状递进去。
+        message: { slot: { deep: [1, 2] } } as unknown as string,
+        details: { slot: {}, model_id: undefined },
+      });
+      expect(text).not.toContain('[object Object]');
+      expect(text).not.toContain('undefined');
+      expect(text).toContain('llm_model_not_found');
+    }
+    setLocale('zh-CN');
+  });
+});
