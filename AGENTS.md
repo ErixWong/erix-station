@@ -648,7 +648,8 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **测试口径**：新文件 `portal/test/message-model-precheck.test.js` 11 条 + 前端 7 条；根 **1127 → 1138**、前端 **533 → 540**（台账三处已同步）。**主 agent 亲跑变异**：`retryable` 不透传 ⇒ 恰 1 红；传一个非单例的网关对象 ⇒ 5 红（fail-open 把 409 吃掉了 ⇒ 反证「必须传单例」这条接线被钉住）。worker 另跑 3 条：删整段预检 6 红 / 网关不可达改 fail-closed 2 红 / 预检挪到写 transcript 之后 1 红（**红在顺序红线断言**：`connected` 由 0 变 1）。
 
-**发版与部署**：`TODO(主 agent)`。真机判据：把某个 dev FDE 绑定的 `main_model_id` 改成不存在的 UUID → 发消息应得 `409 llm_model_not_found` 且**会话里没留下用户消息**；改回来 → 同一条消息 202 且 run 正常。过了才关 #289。
+**发版与部署（已完成）**：PR #298 → tag `v0.1.12`（CI run `38589225119` 绿后打）→ release run `38589937146` → 清单 portal `imageId=fbbbf27c…` / proxy `3580b84d…` 与部署机 `docker image inspect .Id` 一致 → `.env` 形态① pin（备份 `/tmp/deploy.env.bak-0112`）→ `up -d --no-build` ⇒ portal 实跑 `fbbbf27c…`、`/healthz` 200（不动 `runner/` ⇒ 未重建 FDE）。
+**真机四条全过**（dev，把 eric 绑定的 `main_model_id` 改成不存在的 UUID）：① API 契约逐字段对（`409` + `code` + `retryable:true` + `details{slot,model_id}` + 说人话的 message）；② **失败面干净**：`messages 15→15`、`run_queue 130→130`（两次被挡的尝试一字未写）；③ 浏览器里那句 `Send failed: … (slot main, model id 0000…)` **可见、无脏值、输入框原文还在**；④ 把 id 改回去 ⇒ 同一条消息 `202` → run `finished` `err=(无)`、消息 `+1 user +1 assistant`（反向证明 ②）。**#289 已关闭。**
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
