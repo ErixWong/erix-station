@@ -770,3 +770,160 @@ describe('issue #283：投影路径的 durationMs（刷新后不丢）', () => {
     expect(s.toolCards.get('nan')!.dur).toBeUndefined();
   });
 });
+
+// issue #288（缺陷 B）：worker 被 watchdog 杀掉并重排必须是用户看得见的事件。
+// 载荷由 portal 在 release-requeue 分支合成（docs/api/portal.md §5.3 第 14 行）：
+// {attempt, max_attempts, reason, killed_by, silent_ms?}——**不新增 UI 结构**，走 onSep 分隔行。
+describe('#288 attempt_killed（attempt 被杀并重排）', () => {
+  it('实时 SSE：watchdog + silent_ms ⇒ 渲染「第 N/M 次尝试被终止（原因）…（静默 <时长>）」', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('attempt_killed', {
+      seq: 41, run_id: 'run-1', attempt: 1, max_attempts: 3,
+      reason: 'watchdog_silent', killed_by: 'watchdog', silent_ms: 301584,
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      '第 1/3 次尝试被终止（执行期静默超时，被看门狗终止），已重排等待重试（静默 5m 1s）',
+    );
+    expect(s.lastSeq.value).toBe(41); // 与既有事件同轴推进水位线（§5.1）
+  });
+
+  it('crash 且没有 silent_ms ⇒ 整段静默文案不出现（不留空括号、不拿 0 冒充「静默 0ms」）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('attempt_killed', {
+      seq: 1, run_id: 'run-1', attempt: 2, max_attempts: 3, reason: 'worker_crashed', killed_by: 'crash',
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith('第 2/3 次尝试被终止（worker 非预期退出），已重排等待重试');
+    const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+    for (const banned of ['（静默', '（）', '()', 'undefined', 'null', '[object Object]']) {
+      expect(line).not.toContain(banned);
+    }
+  });
+
+  it('silent_ms 是脏值（字符串 / 负数 / NaN）⇒ 同样不显示静默段（后端不给力时前端也不炸）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    for (const bad of ['300000', -1, Number.NaN, null, {}]) {
+      lastES().emit('attempt_killed', { seq: 2, attempt: 1, max_attempts: 3, killed_by: 'watchdog', silent_ms: bad });
+      const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+      // 只钉「静默段」（`（静默 …）`）不出现；watchdog 的原因文案本身就带「静默」二字
+      expect(line, String(bad)).not.toMatch(/（静默|\(silent/);
+      expect(line, String(bad)).toContain('第 1/3 次尝试被终止');
+    }
+  });
+
+  it('未知 / 畸形 killed_by 退化不炸：有 reason 就透出原文，没有就说「原因未知」', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('attempt_killed', { seq: 3, attempt: 1, max_attempts: 3, reason: 'nuclear_freeze', killed_by: 'nuclear' });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('第 1/3 次尝试被终止（nuclear_freeze），已重排等待重试');
+
+    lastES().emit('attempt_killed', { seq: 4, attempt: 1, max_attempts: 3, killed_by: { why: 'x' } });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('第 1/3 次尝试被终止（原因未知），已重排等待重试');
+
+    lastES().emit('attempt_killed', { seq: 5 }); // 整个载荷都不齐
+    const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+    expect(line).toContain('第 ?/? 次尝试被终止');
+    expect(line).not.toMatch(/undefined|\[object Object\]|（）/);
+  });
+
+  it('历史回放（刷新后）走同一渲染路径且不推进水位线（#89 红线）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.replayEvent({
+      seq: 41, run_id: 'run-1', type: 'attempt_killed',
+      payload: { attempt: 1, max_attempts: 3, reason: 'watchdog_silent', killed_by: 'watchdog', silent_ms: 301584 },
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      '第 1/3 次尝试被终止（执行期静默超时，被看门狗终止），已重排等待重试（静默 5m 1s）',
+    );
+    expect(s.lastSeq.value).toBe(0);
+  });
+});
+
+// issue #288（缺陷 C）：崩溃恢复时挂起工具**没被重放**必须让用户看见，且**实时与刷新后一致**。
+// ⚠ 本文件的两条用例分别钉两个独立集合：实时那条靠 `EVENT_TYPES`（EventSource 逐类型挂监听，
+// 漏加 ⇒ 帧根本没投递进来），回放那条靠 `HISTORY_REPLAY_TYPES`（漏加 ⇒ replayEvent 直接 return）。
+// 只写一条的话，另一处漏配永远测不出来——AGENTS §8.8 的坑，本分支已经踩过一次。
+// 载荷口径：docs/api/portal.md §5.3 第 15 行（runner `loopEventPayload` 映射后的 snake_case 字段）。
+describe('#288 tool_replay_decision_required（挂起工具未重放）', () => {
+  const clean = {
+    tool_call_id: 'call-shell-1', engine_run_id: 'sess-1', round: 3, name: 'shell',
+    replay: 'unsafe', requires_host_decision: true, partial_output_available: false,
+  };
+
+  it('实时 SSE：EVENT_TYPES 未注册就一条都收不到 ⇒ 渲染「工具执行被中断，未重放…（shell）」', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('tool_replay_decision_required', { seq: 41, run_id: 'run-1', ...clean });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      '工具执行被中断，未重放，由模型决定是否重试（shell）',
+    );
+    expect(s.lastSeq.value).toBe(41); // 与既有事件同轴推进水位线（§5.1）
+  });
+
+  it('历史回放（刷新后）走同一渲染路径、文案逐字相同、且不推进水位线（#89 红线）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.replayEvent({ seq: 41, run_id: 'run-1', type: 'tool_replay_decision_required', payload: clean });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      '工具执行被中断，未重放，由模型决定是否重试（shell）',
+    );
+    expect(s.lastSeq.value).toBe(0);
+
+    // 两种可见性**逐字一致**：同源 payload 经两条通路必须产出同一个字符串
+    const liveHooks = makeHooks();
+    const live = useEventStream(liveHooks);
+    live.connect('sess-1');
+    lastES().emit('tool_replay_decision_required', { seq: 1, run_id: 'run-1', ...clean });
+    expect(liveHooks.onSep.mock.calls.at(-1)![0]).toBe(hooks.onSep.mock.calls.at(-1)![0]);
+  });
+
+  it('中性呈现：不是错误行（onSysErr 零调用），也不碰工具卡片以外的状态', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('tool_replay_decision_required', { seq: 2, ...clean });
+    expect(hooks.onSep).toHaveBeenCalledTimes(1);
+    expect(hooks.onSysErr).not.toHaveBeenCalled(); // 「没重放」≠ 失败：卡片已由成对 tool_result 亮 ✗
+    expect(hooks.onCurrentRunEnd).not.toHaveBeenCalled(); // 不驱动运行态状态机
+  });
+
+  it('name 是脏值（对象 / 空串 / 数字 / 缺失）⇒ 只去掉后缀片段，主文案照出且绝无 [object Object]', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    for (const bad of [{ name: { deep: 1 } }, '', 0, null, undefined, [], true]) {
+      lastES().emit('tool_replay_decision_required', { seq: 3, ...clean, name: bad });
+      const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+      expect(line, JSON.stringify(bad)).toBe('工具执行被中断，未重放，由模型决定是否重试');
+      expect(line, JSON.stringify(bad)).not.toMatch(/\[object Object\]|undefined|\{name\}|\{tool\}|（）|\(\)/);
+    }
+  });
+
+  it('载荷整个缺失（后端 additive 字段没给）⇒ 文案仍是完整中性句，不出现占位符残留', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('tool_replay_decision_required', { seq: 4 });
+    expect(hooks.onSep).toHaveBeenCalledWith('工具执行被中断，未重放，由模型决定是否重试');
+  });
+
+  it('en 语言下同一事件出英文（双语都真的写了，不是拿中文交差）', () => {
+    setLocale('en');
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('tool_replay_decision_required', { seq: 5, ...clean });
+    const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+    expect(line).toContain('not been replayed');
+    expect(line).toContain('(shell)');
+    expect(line).not.toMatch(/[\u4e00-\u9fff]/);
+  });
+});

@@ -92,6 +92,46 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
     }
   });
 
+  // issue #288（缺陷 B）：`attempt_killed` 的整套文案双语成对，且形状必须支持「缺 silent_ms 就整段不显示」。
+  it('issue #288：stream.event.attemptKilled* 双语成对，且静默段是可选后缀片段', () => {
+    const zh = zhCN.stream.event;
+    const enEv = en.stream.event;
+    for (const [locale, ev] of [['zh-CN', zh], ['en', enEv]] as const) {
+      expect(ev.attemptKilled, locale).toContain('{attempt}');
+      expect(ev.attemptKilled, locale).toContain('{max}');
+      expect(ev.attemptKilled, locale).toContain('{cause}');
+      // {silent} 必须是**末尾的可选片段**（调用方没时长时传空串），文案不得把它放进括号里当必填成分
+      expect(ev.attemptKilled, locale).toMatch(/\{silent\}$/);
+      expect(ev.attemptKilled, locale).not.toMatch(/\{dur\}/); // 时长只出现在 Silent 片段里
+      expect(ev.attemptKilledSilent, locale).toContain('{dur}');
+      expect(ev.attemptKilledSilent, locale).not.toMatch(/ms|undefined|null/); // 单位由 formatDuration 给
+      expect(ev.attemptKilledUnknown, locale).not.toMatch(/undefined|\[object Object\]/);
+      expect(Object.keys(ev.attemptKilledCause as Record<string, string>).sort()).toEqual(['crash', 'watchdog']);
+    }
+    expect(zh.attemptKilled).toMatch(CJK);
+    expect(enEv.attemptKilled).not.toMatch(CJK);
+    expect(enEv.attemptKilled).not.toBe(zh.attemptKilled);
+  });
+
+  // issue #288（缺陷 C）：「挂起工具未重放」的中性文案双语成对，且 {tool} 是可选后缀片段。
+  it('issue #288：stream.event.toolReplay* 双语成对，工具名片段是可选后缀', () => {
+    const zh = zhCN.stream.event;
+    const enEv = en.stream.event;
+    for (const [locale, ev] of [['zh-CN', zh], ['en', enEv]] as const) {
+      // {tool} 必须在**末尾**且独立成片段：调用方名字不可信时传空串，主文案得是完整一句话
+      expect(ev.toolReplaySkipped, locale).toMatch(/\{tool\}$/);
+      expect(ev.toolReplaySkipped, locale).not.toMatch(/\{name\}/); // 名字只出现在 Tool 片段里
+      expect(ev.toolReplayTool, locale).toContain('{name}');
+      // 中性口径：不得把「没重放」写成失败/错误语气（前端走 onSep 分隔行，不是 onSysErr）
+      expect(ev.toolReplaySkipped, locale).not.toMatch(/failed|error|失败|错误/i);
+      expect(ev.toolReplaySkipped, locale).not.toMatch(/undefined|null|\[object Object\]|\{[a-z]+\}\}/);
+      expect(ev.toolReplayTool, locale).not.toMatch(/undefined|null|\[object Object\]/);
+    }
+    expect(zh.toolReplaySkipped).toMatch(CJK);
+    expect(enEv.toolReplaySkipped).not.toMatch(CJK);
+    expect(enEv.toolReplaySkipped).not.toBe(zh.toolReplaySkipped);
+  });
+
   // issue #283：工具结果行的「有时长 / 无时长」两版文案必须双语成对（文件首条用例已经钉「两边
   // 叶子键集合完全一致」，这里额外钉形状）：
   //   * 单位不得硬编码在文案里（时长由 `lib/toolSummary.formatDuration` 连着单位一起给）；

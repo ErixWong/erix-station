@@ -889,7 +889,7 @@ station-portal user enable  --login <login>
 刷新后前端重建工具卡片 / judge 面板的**只读历史通路**（对齐 pi-web「转录即真相」：历史与实时走同一渲染入口）。
 
 - **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
-- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误））；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。
+- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
@@ -1272,14 +1272,26 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段） |
 | 11 | `tool_call_delta` | `onToolCall`（参数增量） | `tool_call_id: string`，`name?: string`（仅首帧），`arguments_delta: string`（JSON 文本片段，前端按序拼接得完整入参） |
 | 12 | `judge` | `onJudge` | `kind: "round"\|"intercept"`，`action: "judge_done"\|"nudge"\|"continue"\|"executed"\|"blocked"\|"degraded"`，`decision: {done, confidence, reason, evidence} \| null`，可选 `error: "timeout"\|"error"\|"parse"`，可选 `tool: {id?, name?, input?}`（依据：erix-agent v0.3.5 `src/loop.js:545-552` JudgeEvent typedef；对应 `judge_decisions` 表） |
-| 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；`persistence_failed` 另带 `operation`/`phase`/`sideEffect`——runner 自 0.17.0 起原样透传引擎挂在错误上的 termination，见 §5.3 注与 issue #212；**0.18.0 起** `reason === "failed"` 的终局另带引擎 additive 字段 `errorCode`（上游 #176，值域由引擎定义，宿主不解释）），`usage: { input_tokens, output_tokens }`（整 run 汇总），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6） |
+| 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；`persistence_failed` 另带 `operation`/`phase`/`sideEffect`——runner 自 0.17.0 起原样透传引擎挂在错误上的 termination，见 §5.3 注与 issue #212；**0.18.0 起** `reason === "failed"` 的终局另带引擎 additive 字段 `errorCode`（上游 #176，值域由引擎定义，宿主不解释）），`usage: { input_tokens, output_tokens }`（整 run 汇总），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6）；**attempts 耗尽那条**（`error.code = max_attempts_exceeded`，§9.11）**issue #288 起 additive 另带** `last_reason: string` / `last_silent_ms: number`（release 上报过 kill 信息时出现，没上报就**没有这两个键**） |
+| 14 | `attempt_killed` | **portal 在 U12 release 的 requeue 分支合成**（issue #288 缺陷 B；不是引擎事件、不经 U3、不进 `run_queue`） | `attempt: number`（死掉的那次尝试，1-based = `run_queue.attempts`），`max_attempts: number`，`reason: string`（release 上报的 reason 原文，如 `watchdog_silent` / `worker_crashed`），`killed_by: "watchdog" | "crash"`（`watchdog` = F6 执行期静默被判死；`crash` = worker 非预期退出），可选 `silent_ms: number`（判死前的静默时长；**只在可信时出现，绝不写 0/null 冒充「有」**），可选 `next_retry_in_ms: number`（预留：portal 侧支持，当前 agentd 不发） |
+| 15 | `tool_replay_decision_required` | `onEvent`（LoopEvent 透传，erix-agent 0.18.0 additive 类型；**仅在 `replayPolicy: "per-tool-declaration"` 下才会发**，本站自 issue #288 缺陷 C 起传该值） | `tool_call_id: string \| null`，`round: number`，`name: string \| null`（被中断的工具），`replay: string \| null`（引擎解析出的声明，当前只可能是 `"unsafe"`），`requires_host_decision: boolean`（引擎恒给 `true`），`partial_output_available: boolean`（快照里有没有已归档的部分输出）。语义：**该工具的上次执行被崩溃打断，引擎没有重放它**，模型同时收到一条 `is_error: true` + `executionStatus: "interrupted"` 的 `tool_result`（第 7 类），**是否重试由模型决定，引擎不自己重试**。⚠ 信封里的 `run_id` 是 station run id，而引擎事件自带的 `runId` 是 store key = `transcriptKey` = `session_id`（issue #81 P2）——runner 映射时落名 `engine_run_id` 以免同义不同（`runner/worker.js loopEventPayload`） |
 
 > 说明与边界：
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
-> - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（`{text}` / `{termination, usage, compaction_stats}`；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。**注（#21 审计决策 ②）**：规格 §10.1 曾写作 `compaction_stats`（本决策已一并删除），该字段在宿主全链路（`runner/`、`portal/src/`）无透传实现、U2 终态载荷不携带——本表与 §9.6 统一按**实际字段集** `termination` / `usage` / `rounds` / `final_text`（+ `attempt`，失败时 `error`）描述，不再引用 `compaction_stats`。
+> - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（**第 14 类 `attempt_killed` 是规格之外的宿主新增事件，规格 §10.1 没有它，字段以本表为准**——additive 新类型不破坏上游契约，§13.2-3）（`{text}` / `{termination, usage, compaction_stats}`；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。**注（#21 审计决策 ②）**：规格 §10.1 曾写作 `compaction_stats`（本决策已一并删除），该字段在宿主全链路（`runner/`、`portal/src/`）无透传实现、U2 终态载荷不携带——本表与 §9.6 统一按**实际字段集** `termination` / `usage` / `rounds` / `final_text`（+ `attempt`，失败时 `error`）描述，不再引用 `compaction_stats`。
 > - `termination` 是**对象** `{reason, detail?}`（`persistence_failed` 另带 `operation`/`phase`/`sideEffect`），`reason` 取值集合以 erix-agent 0.18.0 的 `runToolLoop` 返回值契约为准：<!-- DRIFT:termination-reason:begin -->`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed, persistence_failed}`<!-- DRIFT:termination-reason:end -->（依据：`src/loop/orchestrator.js:511` typedef 的 9 值 + `:973-990` 的 `persistence_failed`；单一真相常量在前端 `lib/terminationReasons.ts`，与 §4.1 及 `docs/data/model.md` §1.7 逐项对齐）。宿主映射（**issue #212 修正**：0.18.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上）：runner 一律**原样透传** `err.termination`，引擎没给才回退 `aborted`/`failed`（`runner/worker.js` catch + `runner/lib/termination.js`）——所以引擎失败可以是 `failed` **或** `persistence_failed`（快照没落盘，崩溃恢复可能重复副作用，语义最重），用户主动停止 → `aborted`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。前端红色告警集合（`RUN_FAIL_REASONS`）含 `failed` / `max_rounds_cap` / `aborted` / `persistence_failed` / `final_guard_unverified`，其余 reason 保持灰色中性分隔条。**erix-agent 0.18.0 起（上游 #176）**，`reason === "failed"` 的终局另带 additive 字段 `errorCode`：引擎把错误上已有的分类码原样透出（`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …），无分类码则为 `unknown`，**值域由引擎定义**；station 原样透传引擎 termination，因此运行时零改动即已下发（依据：`src/loop/termination.js:43-57`，在 `orchestrator.js:981-984` 调用），前端不解释其语义、也不新增枚举。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。
 > - **assistant 完整消息不单独发事件**：前端拼接 `assistant_delta` 流渲染气泡；run 结束后的持久对话内容以 `GET /api/sessions/:id` 的 `messages` 为准（`run_events` 是流式日志，`messages` 是人看的对话，两层不混，规格 §9.2）。
 > - 审批请求的出现通过 `judge` 事件（`action` 指示需审批）+ `GET /api/approvals` 列表体现，不单独设事件类型。
+> - **第 14 类 `attempt_killed` 是宿主合成事件**（issue #288 缺陷 B，实现 `portal/src/internal.js releaseRun`）：「worker 被杀 → 重排」这件事此前对用户**零可见**（requeue 分支只改 `run_queue` + `audit_log`），用户只看到同一个工具卡片亮 3 次、最后拿一句没有原因的 `attempts exhausted`。口径：
+>   - **只有 `requeued` 分支写**；`cancelled`（用户主动 stop）与 `failed_max_attempts`（耗尽）都不写——前者不是被杀，后者由 `run_end` 承载终态（避免同一事实两条展示）。
+>   - **幂等键** `client_event_id = <run_id>:attempt-killed:<attempt>` + `ON CONFLICT (run_id, client_event_id) DO NOTHING`（照 §9.6/#277 合成 `run_end` 的 `<run_id>:final:run_end` 先例；U12 release 是 at-least-once，重试不得写第二条）。第二段用 `attempt-killed` 而非数字，故与 worker 上报的 `<run_id>:<attempt>:<计数>` 命名空间天然不撞（§9.4）。没真插入行（重放）**也不推 SSE**——界面上不会出现两条重试行；代价是重放那一次白烧一个 seq，属 §5.1 实现注记里已裁决的合法空洞（客户端不得拿跳号当重连判据）。
+>   - **零事件面**：`killed_by` 缺省或不是 `{watchdog, crash}`（旧 agentd、以及 `fork_failed` / `prepare_cwd_failed` / `run_data_failed` 这类「压根没起 worker」的 release）⇒ **一条 `attempt_killed` 都不写**，且**不 400**（additive 字段不得弄坏旧 agentd）。`reason` 是自由字符串（§9.11，无枚举白名单），新值 `watchdog_silent` 天然可用。
+>   - **可回放**：已进 §4.4a 历史回放白名单与前端 `HISTORY_REPLAY_TYPES`（实时 SSE 推、刷新后也必须在）。
+> - **第 15 类 `tool_replay_decision_required` 是引擎 additive 事件，本站只是接线**（issue #288 缺陷 C，实现 `runner/worker.js` 传 `replayPolicy: 'per-tool-declaration'`）：
+>   - **为什么需要它**：之前 resume 会把「有 `tool_use`、无 `tool_result`」的挂起工具**从头再执行一遍**（真机：同 `call_id` 在 `run_events` 里出现 3 条 `tool_use`）。`shell` 跑的是 `kill` 旧进程 / 重启 backend / 重跑测试这类**非幂等**命令，每轮真的再掀一次桌。现在挂起工具不重放，本事件就是「没重放」这件事对用户的唯一说明。
+>   - **它总是与一条 `tool_result` 成对出现**（同一 `tool_call_id`，`ok: false`）：工具卡片会亮成失败 + 多一条中性分隔行。**不新增任何 UI 结构**（前端走既有 `onSep` 分隔行），且**不新增运行态语义**：它不改 run 状态、不进 `RUN_FAIL_REASONS`。
+>   - **中性文案**（不是错误行）：引擎不重放不等于失败——模型拿到「没重放」的说明后可以自己决定重跑。所以前端不写 `.syserr`。
+>   - **可回放**：已进 §4.4a 历史回放白名单与前端 `HISTORY_REPLAY_TYPES`；与前端实时具名监听 `EVENT_TYPES` 三处必须同时存在（**只加一边就是「实时收不到」或「刷新后消失」**，本分支已用变异证明过）。
 
 ---
 
@@ -1330,7 +1342,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `rate_limited` | 是（人工/延迟后） | LLM 配额耗尽（§6.1） | 配额用尽，勿自动重试 |
 | `checkpoint_failed` | 是 | checkpoint 写失败，fail-closed 中止，终态（§6.2） | 存储故障，重发产生新 run |
 | `container_exited` | 是 | 容器在 run 进行中退出，且 `attempts >= max_attempts`（耗尽）后由 portal 置终态（否则走租约到期 re-claim，不直接终态，runner §6.4） | 容器异常，平台正在恢复 |
-| `max_attempts_exceeded` | 否 | attempts 耗尽（默认 3，schema.sql `run_queue.max_attempts`），U12 release / reaper 置终态（§9.11） | 多次尝试失败，请手动重新提交 |
+| `max_attempts_exceeded` | 否 | attempts 耗尽（默认 3，schema.sql `run_queue.max_attempts`），U12 release / reaper 置终态（§9.11）。**#288 起**：由 release 合成时，`run_end` 可 additive 带 `last_reason` / `last_silent_ms`（最后一次 kill 的原因），前端仍按本码渲染，不必认识这两个新键 | 多次尝试失败，请手动重新提交 |
 | `spool_full` | 是 | 事件 spool 写满且内存队列也满，worker 主动失败（runner §7.5） | 事件通道拥塞，可重发继续 |
 | `cancelled` | 否 | 用户主动停止（此时 `termination.reason` 为 `"aborted"`，`error` 通常为 `null`，本码仅兜底） | — |
 | `internal` | 否 | 未分类引擎/宿主错误 | 联系管理员，附 run_id |
@@ -1977,9 +1989,20 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 { "reason": "worktree_failed" }
 ```
 
+worker 被杀后重排的上报形态（**issue #288 additive**；没有 kill 就一个额外字段都不发）：
+
+```json
+{ "reason": "watchdog_silent", "killed_by": "watchdog", "silent_ms": 301584 }
+```
+
 | 字段 | 说明 |
 |---|---|
-| `reason` | string，必填，非空，≤ 64 字符。开放值（便于扩新场景），常用：`worktree_failed`（worktree 创建失败）/ `worker_crashed`（worker 非预期退出）/ `fork_failed` / `prep_failed` / `agent_shutdown` |
+| `reason` | string，必填，非空，≤ 64 字符。开放值（便于扩新场景，**无枚举白名单** ⇒ 新值不需协同发版），常用：`worktree_failed`（worktree 创建失败）/ `worker_crashed`（worker 非预期退出）/ `fork_failed` / `prep_failed` / `agent_shutdown`；**#288 起新增 `watchdog_silent`**（F6 执行期静默看门狗判死，之前误报 `worker_crashed`） |
+| `killed_by` | **issue #288 additive**，可选：`watchdog`（F6 执行期静默被判死，缺陷 A 的看门狗）\| `crash`（worker 非预期退出）。**只认这两个值**；缺省或非法值 ⇒ 视为「没有 kill 报告」，**不 400、不写事件**（旧 agentd 与「压根没起 worker」的 release 全走这条路）。它决定 portal 是否合成 `attempt_killed`（§5.3 第 14 类） |
+| `silent_ms` | **issue #288 additive**，可选 number：判死前的静默时长。portal 只在 `Number.isFinite(v) && v >= 0` 时写入事件载荷（四舍五入取整），否则**整个键不出现**——绝不拿 `0` 冒充「有静默时长」（与 #283 的 `duration_ms` 同一口径） |
+| `next_retry_in_ms` | **issue #288 additive**，可选 number：预留给「宿主侧退避」，portal 会原样写进事件载荷；**当前 agentd 不发这个字段**（不发就没有该键） |
+
+**「无 kill ⇒ 零字段」口径（#288，agentd 侧已落实）**：agentd 只有在**真的**杀掉 worker 时才带 `killed_by`/`silent_ms`；`fork_failed` / `prepare_cwd_failed` / `run_data_failed` / `agent_shutdown` 这类 release 一个额外字段都不发，portal 因此一条 `attempt_killed` 都不写（零事件面），旧 agentd 与新版 portal 混跑同样成立。
 
 响应 `200`（返回对象）：
 
@@ -2004,7 +2027,7 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 |---|---|---|
 | `X-Claim-Token` 失配（run 已被 re-claim） | 拒绝，不产生任何状态变化 | —（`409 lease_lost`） |
 | `run_queue.status = 'cancelled'` 或 `runs.status = 'cancelling'`（用户已 stop） | queue → `cancelled`；runs → `finished`（`termination.reason='aborted'`） | `cancelled` |
-| `attempts < max_attempts` | `run_queue` → `pending`（清 `owner_container_id`/`lease_until`/`claimed_at`，**保留 `claim_token`** 供重复 release 幂等重放，fencing 由清空 lease_until 保证）；**`runs.status` 不变**（attempt 级失败不回跳，A5 定稿；崩溃现场为 `running` 则重排后仍为 `running`，不回写 `queued`）。§9.6 U2 转换表的 `running→queued` 维持**非法**，release 不再绕过它；重领靠 `tryClaim` 的 `runs.status IN ('queued','running')` + 租约过期/`pending`（与 run 状态无关于消息安全，消息安全靠「同事务写 transcript + 插 `run_queue`」）。同 run re-claim 后 `attempt > 1` 续跑（model.md §2.8 A1/A5） | `requeued` |
+| `attempts < max_attempts` | `run_queue` → `pending`（清 `owner_container_id`/`lease_until`/`claimed_at`，**保留 `claim_token`** 供重复 release 幂等重放，fencing 由清空 lease_until 保证）；**`runs.status` 不变**（attempt 级失败不回跳，A5 定稿；崩溃现场为 `running` 则重排后仍为 `running`，不回写 `queued`）。**带 `killed_by` 时同事务追加一条 `attempt_killed`（§5.3 第 14 类，幂等键 `<run_id>:attempt-killed:<attempt>` + `ON CONFLICT DO NOTHING`，seq 走 `allocSeq`，提交后推 session SSE）**；§9.6 U2 转换表的 `running→queued` 维持**非法**，release 不再绕过它；重领靠 `tryClaim` 的 `runs.status IN ('queued','running')` + 租约过期/`pending`（与 run 状态无关于消息安全，消息安全靠「同事务写 transcript + 插 `run_queue`」）。同 run re-claim 后 `attempt > 1` 续跑（model.md §2.8 A1/A5） | `requeued` |
 | `attempts >= max_attempts` | queue → `done`；runs → `failed`（`max_attempts_exceeded`） | `failed_max_attempts` |
 
 **组合语义**：
@@ -2012,6 +2035,9 @@ claim 后准备工作（worktree 创建 / worker fork）失败或 worker 崩溃�
 - **`attempts < 3` 且 cancelled**：cancelled 分支优先（用户 stop 优先于 re-queue）——stop 语义不可被 release 反转。
 - **lease_lost**：release 的前提是「agentd 仍持有有效租约」；若 run 已被 re-claim（旧 `claim_token` 失效），release 一律 `409 lease_lost`（防旧 agentd 释放他人已领的 run）。
 - **重复 release**：同 `claim_token` 下、run 尚未被重领时，第二次 release 返回首次结果（幂等，无二次状态迁移）；若首次 release 后 run 已被重领，则旧 `claim_token` → `409 lease_lost`。
+- **kill 报告与事件（#288）**：`attempt_killed` 与队列改写**同一事务**（挪到 `COMMIT` 之后就是缺陷：提交成功但补写事件失败 ⇒ 用户永远看不到那次重排）；`COMMIT` 失败 ⇒ 事件与 seq 一起回滚，不留「说被杀但没重排」的孤儿事件。同一 attempt 的 at-least-once 重复上报 ⇒ 仍恰一条，且第二次不推 SSE。
+- **终态 additive（#288）**：`attempts >= max_attempts` 分支合成 `run_end` 的 `error.code` **仍是 `max_attempts_exceeded`**（既有契约不得改，§6.4）；带 kill 信息时 additive 挂 `last_reason` / `last_silent_ms`（无 kill ⇒ 两个键都不出现）。
+- **新 `reason` 值 `watchdog_silent`（#288）**：F6 执行期静默看门狗判死时用它在 `reapWorker` 的 `onWorkerExit` 里报 `reason`（缺陷 A 之前误报 `worker_crashed`）。`reason` 是自由字符串（无枚举白名单），旧 portal 遇到未知值照旧照常 requeue，**不需要协同发版**。
 
 错误：`400 validation_failed`（`reason` 缺失/超长）；`401 token_invalid / token_revoked`；`403 run_ownership_mismatch`；`404 run_not_found`；`409 lease_lost`；`409 run_terminal`（run 已终态，release 无意义）；`429 rate_limited`；5xx 无限退避重试（§9.13）。
 
