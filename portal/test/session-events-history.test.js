@@ -231,6 +231,29 @@ test('白名单含 model_metadata_missing（erix-agent 0.18.0 #182）：历史�
   }
 });
 
+// issue #288（缺陷 B）：`attempt_killed` 是 portal 在 release-requeue 分支**自己合成**的宿主事件，
+// SSE 实时推了就必须能回放（否则刷新后「第 N 次重试」这条消失，而它正是本单要用户看见的东西）。
+test('白名单含 attempt_killed（#288）：历史回放不丢「attempt 被杀并重排」，且不把 run_end 带进来', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed(ev(4, 'attempt_killed', { attempt: 1, max_attempts: 3, reason: 'watchdog_silent', killed_by: 'watchdog', silent_ms: 301584 }));
+    s.pool.seed(ev(5, 'run_end', { run_id: 'r1', termination: { reason: 'end_turn' } })); // 仍白名单外
+    s.pool.seed(ev(6, 'attempt_killed', { attempt: 2, max_attempts: 3, reason: 'worker_crashed', killed_by: 'crash' }));
+
+    const body = await (await fetch(`${s.base}/api/sessions/${SESSION_ID}/events/history`, {
+      headers: { Cookie: s.cookieHeader },
+    })).json();
+    assert.deepEqual(
+      body.events.map((e) => [e.seq, e.type, e.payload]),
+      [[4, 'attempt_killed', { attempt: 1, max_attempts: 3, reason: 'watchdog_silent', killed_by: 'watchdog', silent_ms: 301584 }],
+       [6, 'attempt_killed', { attempt: 2, max_attempts: 3, reason: 'worker_crashed', killed_by: 'crash' }]],
+      'attempt_killed 可回放且 payload 原样下发（silent_ms 有则出现，没给就不是 null/0）；run_end 仍不下发',
+    );
+  } finally {
+    await s.close();
+  }
+});
+
 test('payload 大小防护：字符串叶值截 2000 字符 + 标记（JSON 形状保持合法）', async () => {
   const s = await startServer();
   try {
