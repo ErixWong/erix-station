@@ -32,6 +32,13 @@ export class FakeInternalPool {
     };
     this.auditLog = [];
     this._claim = 0;
+    // 事务模拟（只为 run_events 的写入建撤销日志）：`failCommitOnce = true` 让下一次 COMMIT 抛错。
+    this._txn = null;
+    this.failCommitOnce = false;
+    // 语句时序日志（`{sql, index, txnId}`）：「同事务」是能被观测的契约——只有「在 BEGIN…COMMIT 窗口里」
+    // 才叫同事务，把 INSERT 挑到 COMMIT 之后就应当红（AGENTS §8.14 的变异验收）。
+    this.sqlLog = [];
+    this._txnId = 0;
     // P3 PR②b B1：`session-text.js` 的取数面（投影取文本）。共用 `this.messages` / `this.rounds` 引用，
     // 所以 putSessionRound / appendUserInputTurn / 终态 assistant 回写的内容对文本读取立即可见。
     this.sessionText = createSessionTextHandler({
@@ -57,7 +64,20 @@ export class FakeInternalPool {
     return this.queue.find((q) => q.run_id === runId);
   }
 
+  /** 已提交 + 本事务未提交暂存的 run_events 合并视图（真库 read-your-writes）。 */
+  _eventVisible(pred) {
+    return [...this.events, ...(this._txn?.events ?? [])].find(pred);
+  }
+
+  _txnEventsPending() {
+    return this._txn ? this._txn.events.length : 0;
+  }
+
   async query(sql, params = []) {
+    const norm = String(sql).replace(/\s+/g, ' ').trim();
+    if (/^BEGIN\b/i.test(norm)) this._txnId += 1;
+    const inTxn = this._txn != null || /^BEGIN\b/i.test(norm);
+    this.sqlLog.push({ sql: norm, index: this.sqlLog.length, txnId: inTxn ? this._txnId : null });
     const res = await this._query(sql, params);
     if (res && res.rows && !('rowCount' in res)) res.rowCount = res.rows.length;
     return res;
@@ -213,30 +233,82 @@ export class FakeInternalPool {
       return { rows: [{ id: runId }] };
     }
 
+    // ---- 事务边界（只为 run_events 的 INSERT / allocSeq 建撤销日志，见文件内 ⚠ 注）----
+    if (/^\s*BEGIN\b/i.test(sql)) {
+      this._txn = { events: [], undo: [] };
+      return { rows: [], rowCount: 0 };
+    }
+    if (/^\s*COMMIT\b/i.test(sql)) {
+      const txn = this._txn ?? { events: [], undo: [] };
+      this._txn = null;
+      if (this.failCommitOnce) {
+        this.failCommitOnce = false;
+        // 真库能在这里失败（串行冲突/死锁/连接掉线）。失败 = 本事务的写一钱不值。
+        for (const undo of [...txn.undo].reverse()) undo();
+        throw Object.assign(new Error('could not serialize access due to concurrent update'), { code: '40001' });
+      }
+      this.events.push(...txn.events);
+      return { rows: [], rowCount: 0 };
+    }
+    if (/^\s*ROLLBACK\b/i.test(sql)) {
+      const txn = this._txn;
+      this._txn = null;
+      if (txn) for (const undo of [...txn.undo].reverse()) undo();
+      return { rows: [], rowCount: 0 };
+    }
+
     // ---- allocSeq ----
     if (sql.includes('SET last_seq = last_seq + 1')) {
       const sessionId = params[0];
       const s = this._session(sessionId);
-      s.last_seq = (s.last_seq ?? 0) + 1;
+      const prev = s.last_seq ?? 0;
+      s.last_seq = prev + 1;
+      if (this._txn) this._txn.undo.push(() => { s.last_seq = prev; }); // 回滚 ⇒ seq 不被消费（真库同一事务）
       return { rows: [{ last_seq: s.last_seq }] };
     }
 
-    // ---- events：查重 ----
+    // ---- events：查重（真库 read-your-writes：同事务内未提交的暂存行也算看见）----
     if (sql.includes('FROM run_events WHERE run_id') && sql.includes('client_event_id')) {
       const [runId, clientEventId] = params;
-      const hit = this.events.find((e) => e.run_id === runId && e.client_event_id === clientEventId);
+      const hit = this._eventVisible((e) => e.run_id === runId && e.client_event_id === clientEventId);
       return { rows: hit ? [{}] : [] };
     }
 
-    // ---- events：插入（run_end 为字面量 type，其余为参数化 type）----
+    // ---- events：插入 ----
+    // ⚠ **type / payload 的位置从 SQL 文本里解析，不是写死两形态**（AGENTS §8.14 的教训：fake 必须
+    // 模拟真库，否则「新事件类型接不上」这类事实在单测里结构上不可能被发现——#288 第一版 fake 只认
+    // `'run_end'` 字面量与「type 在 $5」两种形态，于是 `attempt_killed`（type 是字面量、payload 在 $5）
+    // 被当成 `type = <payload JSON>`，事件凭空「不存在」）。
+    // 同时按 docs/data/schema.sql:360-371 的真库约束裁决（不是无条件吞重复）：
+    //   * `UNIQUE (run_id, client_event_id)` / `UNIQUE (session_id, seq)`：撞约束时**只有** SQL 里真写了
+    //     `ON CONFLICT … DO NOTHING` 才静默跳过（幂等语义由 SQL 提供，不是 fake 白送）；SQL 没写就抛
+    //     23505（与真库同形）⇒ 把产品代码里的 `ON CONFLICT DO NOTHING` 摘掉，幂等用例必须红。
+    //   * `payload jsonb NOT NULL`：拿不到 payload 参数就抛 23502（上面那种错位会当场炸在这里）。
+    // ⚠ 事务语义（#288 变异④「INSERT 挪到 COMMIT 之后」）：run_events 的 INSERT 进**未提交暂存区**，
+    //   `COMMIT` 才落到 `events`、`ROLLBACK` 丢弃；同事务内的读（上面的查重 SELECT）看得见暂存行
+    //   （真库 read-your-writes）。`failCommitOnce` 让下一次 COMMIT 抛错模拟「提交失败/连接掉线」。
     if (sql.includes('INSERT INTO run_events')) {
-      const runEnd = sql.includes("'run_end'");
+      const literalType = sql.match(/VALUES\s*\(\$1,\s*\$2,\s*\$3,\s*\$4,\s*'([a-z_]+)'/)?.[1] ?? null;
       const [runId, sessionId, seq, clientEventId] = params;
-      const type = runEnd ? 'run_end' : params[4];
-      const payload = runEnd ? params[4] : params[5];
-      if (this.events.some((e) => e.run_id === runId && e.client_event_id === clientEventId)) return { rows: [] };
-      this.events.push({ run_id: runId, session_id: sessionId, seq, client_event_id: clientEventId, type, payload });
-      return { rows: [{ id: 'ev' + this.events.length }] };
+      const type = literalType ?? params[4];
+      const payload = literalType !== null ? params[4] : params[5];
+      if (payload === undefined || payload === null) {
+        throw Object.assign(new Error('null value in column "payload" of relation "run_events" violates not-null constraint'), { code: '23502' });
+      }
+      const dupOnConflict = /ON\s+CONFLICT[^;]*?DO\s+NOTHING/i.test(sql);
+      const clash = (key, msg) => {
+        if (dupOnConflict) return { rows: [], rowCount: 0 }; // ON CONFLICT DO NOTHING：0 行
+        throw Object.assign(new Error(msg), { code: '23505' });
+      };
+      if (this._eventVisible((e) => e.run_id === runId && e.client_event_id === clientEventId)) {
+        return clash('ceid', 'duplicate key value violates unique constraint "run_events_run_id_client_event_id_key"');
+      }
+      if (this._eventVisible((e) => e.session_id === sessionId && Number(e.seq) === Number(seq))) {
+        return clash('seq', 'duplicate key value violates unique constraint "run_events_session_id_seq_key"');
+      }
+      const row = { run_id: runId, session_id: sessionId, seq, client_event_id: clientEventId, type, payload };
+      if (this._txn) this._txn.events.push(row); else this.events.push(row);
+      return { rows: [{ id: 'ev' + (this.events.length + this._txnEventsPending()) }], rowCount: 1 };
     }
 
     // ---- heartbeat：更新容器心跳 ----

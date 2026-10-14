@@ -152,7 +152,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - notes 工厂生命周期只有 `onRunComplete()`：完成 active → done，返回 `{ completed: {status, completed}, errors }`；**不再有 `onRunStart`，也不在生命周期内 purge/janitor**。notes maintenance 改宿主调度属于 PR B（ADR-018 D7）。
 - `NotesStore` 六方法（`write/read/list/complete/revoke/purge`）由 `createBuiltinNotesTools` 在工厂创建时 fail-closed 校验。`note_list` 仅接收 `tag` / `includeInactive`；不传 `cursor` / `limit` / `source` / `minRelevance`。
 - `worker.js` 只从包根导入 `createJsonFileModelConfigProvider`、`createOpenAIProvider`、`runToolLoop`；`createToolRegistry` 只从 `erix-agent/tools` 导入。`erix-agent/tools` 不再公开凭据 helper；notes 写侧凭据检测也已退役。本项目没有深路径 `src/loop.js` 导入。
-- 不实现 0.14.0 的 opt-in tool replay 声明与 `partialPersistence`；维持默认行为。后续启用 partial persistence 必须同时启用 `stream: true`。
+- 不实现 0.14.0 的 opt-in tool replay 声明与 `partialPersistence`；维持默认行为。后续启用 partial persistence 必须同时启用 `stream: true`。 **（前半句已撤销，2026-10-14/#288：自该单起 `runToolLoop` 显式传 `replayPolicy: "per-tool-declaration"` 且 `shell` 声明 `replay: "unsafe"`，不再是「维持默认行为」；`partialPersistence` 仍未实现、本句后半仍成立。理由、边界、已测口径见 §8.22。）**
 
 ### 8.4 0.15.0 迁移记录（P3 前置，portal 写侧接 `appendUserTurn`）
 
@@ -498,6 +498,57 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 **发布与部署**：三份 `package.json`+lockfile → `0.1.8`（每份 lockfile 恰好 2 行）→ tag `v0.1.8` → 三镜像按 digest pin。**告知面只需 portal 镜像**（`~/AGENTS.md` 由对账自动刷出第 8 条，不需重建容器）；**#283 的 M1 动 `runner/` ⇒ 必须重建 FDE 镜像 + `docker rm -f` 四台让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）。
 
 - [ ] **真机验收（待做，主 agent）**：**#285 R-1** —— 全新工位起服务，第 1 条回复就给完整可点预览 URL（判据 `role='user'` 计数 == 1，同 §8.16），过了才关 station #285；**#283** —— `sleep 5 && echo ok` 的卡片实时应 `✓ 5.0s` 且**刷新后仍在**，库里两列非 NULL，旧数据只显示 ✓/✗ 不出现 `0ms`，过了才关 #283。
+
+
+### 8.22 #288 缺陷 C：崩溃恢复不再盲目重放（`replayPolicy: "per-tool-declaration"`）
+
+> **草稿（worker 写）**：本节只写「载荷 / 落点 / 测试口径 / 已知边界」。**发版号与真机结论一律留 `TODO(主 agent)` 占位**，不要照抄这里猜的号。
+
+**撤销一条既有决定**：§0.14.0 契约清单里「不实现 0.14.0 的 opt-in tool replay 声明…维持默认行为」那条**自本单作废**（原文就地标注保留）。本站此前从没传过 `replayPolicy` ⇒ 吃的是引擎默认 `"always-replay"`。
+
+**缺陷本体（真机标本）**：一条 `sleep 360` 的 shell 被 watchdog 杀掉后，resume 把**同一个 `tool_use` 从头再执行一遍**——`run_events` 里同 `call_id` 出现 **3 条 `tool_use`**。`shell` 跑的是 `kill` 旧进程 / 重启 backend / 重跑测试这类**非幂等**命令，每轮真的再掀一次桌。这不是引擎缺陷：能力 0.14.0 就有，**本站零接线**。
+
+**引擎读点（erix-agent 0.18.0，逐个核过，别按猜的改）**：
+
+| 位置 | 事实 |
+|---|---|
+| `loop/orchestrator.js:425` | 选项文档 `replayPolicy?: "always-replay"\|"per-tool-declaration"` |
+| `:558` | **默认 `"always-replay"`** ⇒ 不显式传就是缺陷原样复发 |
+| `:634-635` | 取值校验，写错字面量直接 TypeError（不静默退化） |
+| `:667-670` | 工具定义 `replay` 只许 `"safe"\|"unsafe"`，其它值启动即拒 |
+| `:707-715` | 声明会**从送模型的工具定义里剥掉** ⇒ 提示词零漂移（已测） |
+| `:1770-1782` | `replayForToolUse`：**快照已记的值优先**（`:1775-1777`），否则读**工具对象顶层** `replay`（不是 `inputSchema`） |
+| **`:1781`** | `definition?.replay === "safe" ? "safe" : "unsafe"` ⇒ **判据是 `=== "safe"`，「未标注」也落 `unsafe`**（`host-upgrade-guide-0.14.0.md:110-117` 那句「older snapshot with no `replay` field 按非 safe 处理」**与源码一致，已核实**） |
+| `:1783-1786` + `:1808-1818` | 解析结果在崩溃**当时**被盖进 `run snapshot.pendingToolUses[].replay` 落盘 |
+| `resume-manager.js:256-264` | `resumePendingTools` 来自 `snapshot.pendingToolUses`（按 `executedToolIds` / 已有结果过滤） |
+| `:2565-2620` | resume 分支：`:2571` 门不进 ⇒ **不调 executor**，合成 `is_error:true` + `executionStatus:"interrupted"` 的 `tool_result`（`:2586-2597`）+ 发 `tool_replay_decision_required`（`:2605-2614`，`requiresHostDecision:true`）；**引擎自己不重试**，交还模型 |
+
+**载荷**：① `runner/worker.js` 传 `replayPolicy: 'per-tool-declaration'`；② `runner/lib/shell-tools.js` 给 `shell` 声明顶层 `replay: 'unsafe'`；③ 放行新事件三处（`runner/worker.js loopEventPayload` + `portal/src/http.js HISTORY_EVENT_TYPES` + 前端 `EVENT_TYPES` 与 `HISTORY_REPLAY_TYPES`）；④ 前端一条中性分隔行「工具执行被中断，未重放，由模型决定是否重试（shell）」（双语成对、不新增 UI 结构、不走 `.syserr`）；⑤ 文档 `docs/api/portal.md` §5.3 第 15 行 + §4.4a + `docs/design/runner-integration.md`。
+
+**测试口径**（新增，均不碰 LLM/DB/网络）：
+- `runner/test/replay-policy.test.js`（+7，跑**真 `runToolLoop`** + 内存 store + 桩 provider）。判据是「resume 期 executor 有没有收到那个挂起 `call_id`」——⚠ **不能用「executor 被调了几次」**：不重放时模型自己会再要一次工具调用，次数相同，只有 **call_id** 能区分「引擎盲目重放」与「模型主动重试」。
+- **行为断言用的策略值是从 `worker.js` 源码抠出来的**，不是测试里另抄一份字面量 —— 否则「删掉那行」这条变异永远测不出来。另有**反面对照**（`always-replay` ⇒ 真的重放）钉住判据本身不是恒绿。
+- portal：`internal-replay-decision.test.js`（+3，U3 → 落库 + session SSE 实时推；跨层钉三处集合与文档同源）、`session-events-history.test.js`（+1，可回放且 payload 原样）。
+- 前端：`useEventStream.spec.ts` +6（实时 / 回放 + **两条通路逐字一致** / 中性 / 脏值 / 载荷全缺 / en）、`localeParity.spec.ts` +1。
+
+**⚠ 已知的两条「变异不红」，不是测试漏洞，别当巧合交差**：
+1. **摘掉 `shell` 的 `replay` 声明 ⇒ 行为用例仍绿**。引擎 `:1781` 判据是 `=== "safe"`，**未标注同样落 `unsafe`** ⇒ 行为等价。所以改用**能红的方向**代替：把声明写成 `"safe"` ⇒ 恢复时真的重放 ⇒ 主口径与探针用例红；另用一条形状断言（`Object.hasOwn(schema,'replay')`）单独钉「声明必须在」。**显式写出来是刻意的**：口径要留在代码里，不能只活在注释和文档里。
+2. **`EVENT_TYPES` 与 `HISTORY_REPLAY_TYPES` 必须分别单独摘才会分别红**（前者红=实时一条都收不到，后者红=刷新后消失）。这是 §8.8 那个「同一事件两种可见性」坑的**第三次**发作，三处集合的同步已由 `internal-replay-decision.test.js` 的跨层用例常驻钉住，不靠人记。
+
+**已知边界 / 代价**：
+- **未标注 = 不重放 ⇒ 5 个文件工具（`readFile`/`searchText`/`tree`/`edit`/`writeFile`）挂起时同样不重放**。上游 0.18.0 `createFileTools` 一个 `replay` 都没标（`src/tools/*.js` grep `replay:` 零命中），本站**不替上游代签「重放安全」**。写文件本身幂等，选「少跑一次」而不是「多跑一次」（多跑可能覆盖新内容，少跑模型能自己补）。已钉成显式口径用例；上游若将来标了 `safe`，该用例里的源码断言会红提示重评。
+- **「撤销一条已记录的旧决定」不能只改工具定义**：`:1775-1777` 规定快照里已记的 `replay` 值**优先于当前定义**。将来把某工具改成 `replay:"safe"`，**存量挂起快照仍按旧值不重放**；要翻案得同时动 `replayPolicy` 或清快照。
+- **引擎 `runId` 是 `transcriptKey` = `sessionId`**（issue #81 P2），不是 station run id。U3 payload 里落名 `engine_run_id`，与信封 `run_id` 并存但不同义。
+- `partialPersistence` 仍未实现（本单不碰）；启用它必须同时 `stream: true`（已满足，`worker.js` 一直传 `stream: true`）。
+- **0 上游依赖**：不升引擎、不动 pin/lockfile/`erix-agent` 0.18.0；`docs/data/schema.sql` 与 `deploy/migrations/` 零字节改动（**纯 additive 事件类型，无 DDL**）。
+
+**基线（主 agent 亲测复跑，非照抄 worker 自报）**：根 `npm test` **1103 / 1099 通过 / 0 失败 / 4 跳过**（自分支 M1 的 1088/1079/**5 失败**/4 跳过起：M2 +4、M3 +11，5 红全部清零）、`node --test runner/test/*.test.js` **258/258**、前端 `npm run typecheck` rc=0 + `npm test` **33 文件 / 514 通过**、`cd portal && node --test portal/test/*.test.js` rc=0。归属：**runner +28**（A/D `shell-liveness` 21 + C `replay-policy` 7）、**portal +17**（B `internal-attempt-killed` 12 + `session-events-history` 1、C `internal-replay-decision` 3 + `session-events-history` 1）、**前端 +13**（B +6、C +7，两处各含 `localeParity` +1）；§1 台账与 `.github/workflows/ci.yml` 步骤② 已由主 agent 在合并时统一写（1058→1103 / 230→258 / 501→514）。
+
+**主 agent 亲跑的变异（不复用 worker 的结论）**：`replayPolicy` 值改成 `always-replay` ⇒ **2 条具名红**（主口径 + 文件工具刻意保守那条）；把 `loopEventPayload` 的新 case 整段删掉（走 `default` 原样透传）⇒ **1 条红**（证明事件字段映射是被钉住的，不是只靠文档）；前端 `HISTORY_REPLAY_TYPES` 单独摘掉 ⇒ **恰好 1 条红**且实时用例仍绿（症状=刷新后消失，与 `EVENT_TYPES` 摘掉的「一条都收不到」可区分）；`silent_ms` 守卫改 `?? 0` ⇒ 恰 1 条红；`attempt_killed` 幂等键去掉 `:<attempt>` ⇒ 恰 1 条红。另**亲验真库** `run_events` 上确有 `UNIQUE (run_id, client_event_id)` **普通约束**（不是部分索引）⇒ `ON CONFLICT (run_id, client_event_id)` 在真 PG 上成立，fake 与真库同口径（§8.14 那类「fake 结构上拦不住」的坑本次已排）。
+
+**发版与部署**：`TODO(主 agent)`（发版号 / tag / 镜像）。⚠ M1 动 `runner/` ⇒ **必须重建 FDE 镜像 + `docker rm -f` 让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）；老容器不重建就还是旧默认 `always-replay`。
+
+- [ ] **真机验收（`TODO(主 agent)`）**：建议判据 —— 让一条长 shell 被 watchdog 杀掉（缺陷 A 的保活已修掉误杀，要造真崩溃可 `docker kill` worker），resume 后 `run_events` 里**不得**再出现「同 `call_id` 的第 2 条 `tool_use` 紧跟一次真执行」，而是出现一条 `tool_replay_decision_required` + 一条 `ok:false` 的 `tool_result`；界面上刷新前后都能看到那句中性文案。过了才关 #288 缺陷 C。
 
 
 
