@@ -542,7 +542,9 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - `partialPersistence` 仍未实现（本单不碰）；启用它必须同时 `stream: true`（已满足，`worker.js` 一直传 `stream: true`）。
 - **0 上游依赖**：不升引擎、不动 pin/lockfile/`erix-agent` 0.18.0；`docs/data/schema.sql` 与 `deploy/migrations/` 零字节改动（**纯 additive 事件类型，无 DDL**）。
 
-**基线**：`TODO(主 agent)` —— 本单新增 **runner +7 / portal +4 / 前端 +7**（含 `localeParity` +1）。§1 台账与 `.github/workflows/ci.yml` 步骤② 由主 agent 合并时统一写，worker 不动台账。
+**基线（主 agent 亲测复跑，非照抄 worker 自报）**：根 `npm test` **1103 / 1099 通过 / 0 失败 / 4 跳过**（自分支 M1 的 1088/1079/**5 失败**/4 跳过起：M2 +4、M3 +11，5 红全部清零）、`node --test runner/test/*.test.js` **258/258**、前端 `npm run typecheck` rc=0 + `npm test` **33 文件 / 514 通过**、`cd portal && node --test portal/test/*.test.js` rc=0。归属：**runner +28**（A/D `shell-liveness` 21 + C `replay-policy` 7）、**portal +17**（B `internal-attempt-killed` 12 + `session-events-history` 1、C `internal-replay-decision` 3 + `session-events-history` 1）、**前端 +13**（B +6、C +7，两处各含 `localeParity` +1）；§1 台账与 `.github/workflows/ci.yml` 步骤② 已由主 agent 在合并时统一写（1058→1103 / 230→258 / 501→514）。
+
+**主 agent 亲跑的变异（不复用 worker 的结论）**：`replayPolicy` 值改成 `always-replay` ⇒ **2 条具名红**（主口径 + 文件工具刻意保守那条）；把 `loopEventPayload` 的新 case 整段删掉（走 `default` 原样透传）⇒ **1 条红**（证明事件字段映射是被钉住的，不是只靠文档）；前端 `HISTORY_REPLAY_TYPES` 单独摘掉 ⇒ **恰好 1 条红**且实时用例仍绿（症状=刷新后消失，与 `EVENT_TYPES` 摘掉的「一条都收不到」可区分）；`silent_ms` 守卫改 `?? 0` ⇒ 恰 1 条红；`attempt_killed` 幂等键去掉 `:<attempt>` ⇒ 恰 1 条红。另**亲验真库** `run_events` 上确有 `UNIQUE (run_id, client_event_id)` **普通约束**（不是部分索引）⇒ `ON CONFLICT (run_id, client_event_id)` 在真 PG 上成立，fake 与真库同口径（§8.14 那类「fake 结构上拦不住」的坑本次已排）。
 
 **发版与部署**：`TODO(主 agent)`（发版号 / tag / 镜像）。⚠ M1 动 `runner/` ⇒ **必须重建 FDE 镜像 + `docker rm -f` 让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）；老容器不重建就还是旧默认 `always-replay`。
 
