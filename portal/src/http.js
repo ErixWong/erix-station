@@ -1680,6 +1680,11 @@ const HISTORY_EVENT_TYPES = new Set([
   // issue #288（缺陷 B）：portal 在 release-requeue 分支合成的**宿主事件**（attempt 被杀并重排）。
   // 它实时走 session SSE 推给浏览器，**不进白名单则刷新后消失**——与本白名单要修的毛病同构，故列入。
   'attempt_killed',
+  // issue #288（缺陷 C）：崩溃恢复时挂起工具**没被重放**（引擎 `orchestrator.js:2605-2614` 发出，
+  // `requiresHostDecision:true`）。同一个坑另发一次：runner 经 U3 落进 run_events、SSE 实时推得到，
+  // **不进本白名单就「实时看得见、刷新后消失」**（AGENTS §8.8）——它出现的时机正是用户刷新页面来
+  // 看「我这条 run 怎么了」的时刻，不可回放比不推更坑。payload 字段口径见 portal.md §5.3。
+  'tool_replay_decision_required',
   // erix-agent #182（0.18.0）新增的**诊断类**事件：模型元信息缺失时上抛。SSE 实时路径会原样推
   // 给前端（前端 `useEventStream.ts` 的 `default: return;` 中性忽略），若不进白名单则刷新页面
   // 后历史回放会把它过滤掉——同一事件两种可见性就是口径不一致，故列入可回放集合。

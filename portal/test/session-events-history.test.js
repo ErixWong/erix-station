@@ -254,6 +254,39 @@ test('白名单含 attempt_killed（#288）：历史回放不丢「attempt 被�
   }
 });
 
+// issue #288（缺陷 C）：崩溃恢复时「挂起工具没被重放」必须刷新后仍在——它出现的时机正是用户
+// 刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑。
+test('白名单含 tool_replay_decision_required（#288 缺陷 C）：历史回放不丢「未重放」事件', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed(ev(7, 'tool_replay_decision_required', {
+      tool_call_id: 'call-1', engine_run_id: SESSION_ID, round: 3, name: 'shell',
+      replay: 'unsafe', requires_host_decision: true, partial_output_available: false,
+    }));
+    s.pool.seed(ev(8, 'usage', { round: 3, usage: { input_tokens: 10, output_tokens: 2 } })); // 仍白名单外
+    s.pool.seed(ev(9, 'tool_replay_decision_required', {
+      tool_call_id: 'call-9', round: 4, name: 'writeFile', requires_host_decision: true,
+    }));
+
+    const body = await (await fetch(`${s.base}/api/sessions/${SESSION_ID}/events/history`, {
+      headers: { Cookie: s.cookieHeader },
+    })).json();
+    assert.deepEqual(
+      body.events.map((e) => [e.seq, e.type, e.payload]),
+      [[7, 'tool_replay_decision_required', {
+        tool_call_id: 'call-1', engine_run_id: SESSION_ID, round: 3, name: 'shell',
+        replay: 'unsafe', requires_host_decision: true, partial_output_available: false,
+      }],
+      // 缺位字段就是**没有这个键**：不补 null/false 冒充「引擎说没有部分输出」
+       [9, 'tool_replay_decision_required', {
+         tool_call_id: 'call-9', round: 4, name: 'writeFile', requires_host_decision: true, }]],
+      '事件可回放且 payload 原样下发（runner 侧没给的键不得被补成 null/0/false）；usage 仍不下发',
+    );
+  } finally {
+    await s.close();
+  }
+});
+
 test('payload 大小防护：字符串叶值截 2000 字符 + 标记（JSON 形状保持合法）', async () => {
   const s = await startServer();
   try {

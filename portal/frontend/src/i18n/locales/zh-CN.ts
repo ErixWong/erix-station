@@ -205,6 +205,13 @@ export const zhCN = {
       attemptKilledSilent: '（静默 {dur}）',
       // killed_by 是 additive 字段：未知/缺失时的兼容文案（不得出现 [object Object] / undefined）。
       attemptKilledUnknown: '原因未知',
+      // issue #288（缺陷 C）：崩溃恢复时引擎把「有 tool_use、无 tool_result」的挂起工具**不再
+      // 自动重放**（runner 传 `replayPolicy: 'per-tool-declaration'`），是否重试交回模型。中性文案：
+      // 不重放 ≠ 失败（工具卡片已由成对的 tool_result 亮成失败），所以走灰色分隔行而不是错误行。
+      // {tool} 是**可选后缀片段**（同 attemptKilledSilent 口径）：工具名不可信时调用方传空串。
+      toolReplaySkipped: '工具执行被中断，未重放，由模型决定是否重试{tool}',
+      // 工具名后缀：名字来自 payload（引擎透传，属外来数据），脏值在调用方已被 typeof 守卫拦掉。
+      toolReplayTool: '（{name}）',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       judgePassThrough: 'judge：放行（{mode}）',

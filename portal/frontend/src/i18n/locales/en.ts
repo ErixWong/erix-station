@@ -188,6 +188,16 @@ export const en = {
       // killed_by is an additive field: fallback text for unknown/missing values (never [object Object]
       // or "undefined").
       attemptKilledUnknown: 'cause unknown',
+      // issue #288 (defect C): on crash recovery the engine no longer auto-replays a tool left with a
+      // `tool_use` and no `tool_result` (runner now passes `replayPolicy: 'per-tool-declaration'`);
+      // retrying is handed back to the model. Neutral wording on purpose: not replaying is not a failure
+      // (the paired tool_result already marks the card failed), so this is a grey separator, not an error.
+      // {tool} is an OPTIONAL suffix (same convention as attemptKilledSilent): the caller passes an empty
+      // string when the tool name is not trustworthy, so this message must not assume it is non-empty.
+      toolReplaySkipped: 'tool execution was interrupted and has not been replayed; the model decides whether to retry{tool}',
+      // Tool-name suffix: the name comes from the payload (engine pass-through = foreign data); dirty
+      // values are already blocked by a typeof guard at the call site.
+      toolReplayTool: ' ({name})',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       judgePassThrough: 'judge: pass through ({mode})',
