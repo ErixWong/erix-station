@@ -221,8 +221,9 @@ describe('#261014 B2 llm_model_not_found：进表、双语成对、脏值不退�
       const text = describeError({
         status: 409,
         code: 'llm_model_not_found',
-        // 服务端理论上给 {slot, model_id}，但畸形值不许把界面弄坏。
-        message: { slot: { deep: [1, 2] } },
+        // 服务端按契约给字符串，但 `describeError` 不信任它（再过一次 toDisplayText）——
+        // 这里故意塞非字符串，所以要 `as unknown as string` 把契约外的形状递进去。
+        message: { slot: { deep: [1, 2] } } as unknown as string,
         details: { slot: {}, model_id: undefined },
       });
       expect(text).not.toContain('[object Object]');
