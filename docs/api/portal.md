@@ -114,6 +114,7 @@
 | 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
+| 409 | `llm_model_not_found`（#261014 切片 B2，工单 `fix-261014-05b2`）| **发消息预检 fail-fast**：`POST /api/sessions/:id/messages` 在建 run 之前发现「会话属主 active LiteLLM binding 里某个**已配置槽位**的 `model_info.id` 在网关 `/model/info` 里查不到」（模型被删除/重建 ⇒ **id 变**）。**与 `llm_not_configured` 的关键差别：后者是「压根没配」，本码是「配过，但那个模型已经不存在了」**。`details` = `{slot, model_id}`（`slot` 取值 `main` / `embedding` / `vision`）。**选 409 而不是 424**：请求本身合法且已认证，失败原因是「绑定配置与网关目录的状态互相矛盾」，与同端点既有的 `409 llm_not_configured` / `409 run_in_progress` 同族（424 Failed Dependency 语义是「依赖的前置请求失败」，这里没有任何前置请求，且 §4.3 全表无 424 先例）。**只在发消息路径拦**：心跳路径同判据仍只 `warn`（§9.5，`reason: 'unknown_model_id'`）；**网关不可达一律放行**（fail-open，不让网关抖动演成用户发不出消息）| 是（管理员改配后原样重试可成功；本预检零副作用、不写幂等台账，同 `Idempotency-Key` 重试会重新占位，§1.4。**盲目立即重试仍是同一码**——解法只有一个：改配） |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
@@ -874,6 +875,7 @@ station-portal user enable  --login <login>
 | 400 | `validation_failed` | content 为空 |
 | 404 | `not_found` | session 不存在/不属本人 |
 | 409 | `run_in_progress` | 该 session 已有进行中 run |
+| 409 | `llm_model_not_found` | **绑定的模型在网关里已不存在**（#261014 切片 B2）：属主 active binding 的某个已配置槽位 `model_info.id` 不在网关 `/model/info` 里。`details` = `{slot, model_id}`；判据/选型理由见 §1.2。预检位置：体校验与幂等占位之后、**开业务事务与写 transcript 之前** ⇒ 失败时**不留用户消息、不入队 run、不把失败钉进幂等台账**（走 `release` 路径，同 key 可原样重试）。网关不可达时放行（消息照发）；无活绑定由下一条 `llm_not_configured` 负责 |
 | 409 | `no_active_container` | 拉模型补充分支：该用户**从未有过任何容器记录**（containers 无非 removed 行，无法确定 run 归属与入队目标）——落库即 202 前提是存在容器行（runs.container_id 非空）；已有但离线的容器不受此码影响（§6.3） |
 | 429 | `rate_limited` | 已知该用户 LLM 配额耗尽（上次 run 已确认），直接拒绝避免再烧配额（§6.1） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |

@@ -582,7 +582,8 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
         return;
       }
       if (err instanceof llm.LlmError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        // issue #261014 切片 B2：`retryable` 由错误自己带（既有 LlmError 不带 ⇒ 恒 false，行为不变）。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable === true, err.details));
         return;
       }
       if (err instanceof LlmGatewayError) {
@@ -1543,6 +1544,13 @@ async function handlePostMessage(req, res, ctx, sessionId) {
       if (!bound.rows?.length) {
         throw new HttpError(409, 'llm_not_configured', '该 FDE 未配置 LLM 上游，请在管理台配置');
       }
+      // issue #261014 切片 B2：绑定里的 `model_info.id` 在网关里已不存在（模型被删/重建 ⇒ id 变）时，
+      // 消息仍会入队并在 run 里跑出一个看不懂的错 ⇒ 这里 fail-fast（409 llm_model_not_found）。
+      // 位置红线：与 llm_not_configured 同层（幂等 fn 内、**开业务事务与写 transcript 之前**）——
+      // 失败时不留用户消息、不入队 run，且走 release 路径不把失败钉进幂等台账（同 MEDIUM-1 口径）。
+      // ⚠ 必须传 `ctx.llmGateway` 本身：llm.js 的 `model_info.id → model_name` 映射 TTL 缓存按 client
+      //   对象身份分槽（同 §9.5 心跳对账的接线红线）。网关不可达时该函数一律放行（fail-open）。
+      await llm.assertBindingModelsResolvable(ctx.pool, session.user.id, { gateway: ctx.llmGateway });
       const posted = await sessions.postMessage(ctx.pool, {
         userId: session.user.id,
         sessionId,
