@@ -2348,7 +2348,9 @@ async function handleInternal(req, res, ctx, url) {
     if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     requireJson(req);
     const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-    const result = await internal.heartbeat(ctx.pool, { container, user, body });
+    // issue #289：把 serve 进程的 llmGateway 单例透传给心跳对账；必须传 ctx.llmGateway 本身，
+    // 不可在此现造 client——llm.js 的映射 TTL 缓存按 client 对象身份分槽，现造 ⇒ 每次心跳多打一次 GET /model/info。
+    const result = await internal.heartbeat(ctx.pool, { container, user, body, llmGateway: ctx.llmGateway });
     return sendJson(res, 200, result);
   }
 
