@@ -382,6 +382,49 @@ describe('useEventStream（mock EventSource）', () => {
     expect(s.toolCards.get('n')!.out).toBe('✓ （2ms）');
   });
 
+  // issue #283：引擎 0.18.0 只给结构化返回写 duration ⇒ 真库里 98% 的 tool_result 没时长，
+  // 而旧代码 `d.duration_ms ?? 0` 把「没有」伪装成 0（现象：每条工具调用恒显 0s）。
+  it('issue #283：缺 duration_ms ⇒ card.dur 保持 undefined、文案不出现 0ms/undefined/空括号', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+
+    lastES().emit('tool_use', { tool_call_id: 'd1', name: 'shell', input: { command: 'sleep 5' } });
+    lastES().emit('tool_result', { tool_call_id: 'd1', ok: true, result_digest: 'slept' }); // 无 duration_ms
+    const card = s.toolCards.get('d1')!;
+    // 变异取证②：把 `?? 0` 加回 card.dur 就红在本行
+    expect(card.dur).toBeUndefined();
+    expect(card.out).toBe('✓ slept');
+    for (const junk of ['0ms', '0s', 'undefined', 'null', '（）', '()']) expect(card.out).not.toContain(junk);
+
+    // worker 没时长时下发的是 **null**（runner/worker.js 保持 null 语义）⇒ 同样不算有时长
+    lastES().emit('tool_use', { tool_call_id: 'd2', name: 'shell', input: {} });
+    lastES().emit('tool_result', { tool_call_id: 'd2', ok: false, duration_ms: null, result_digest: 'boom' });
+    expect(s.toolCards.get('d2')!.dur).toBeUndefined();
+    expect(s.toolCards.get('d2')!.out).toBe('✗ boom');
+
+    // 非数字（字符串）也不冒充时长：宁可不显示，不给一个假的耗时
+    lastES().emit('tool_use', { tool_call_id: 'd3', name: 'shell', input: {} });
+    lastES().emit('tool_result', { tool_call_id: 'd3', ok: true, duration_ms: '12', result_digest: 'x' });
+    expect(s.toolCards.get('d3')!.dur).toBeUndefined();
+    expect(s.toolCards.get('d3')!.out).toBe('✓ x');
+  });
+
+  it('issue #283：有时长走可读单位三档（999 ⇒ 999ms、4321 ⇒ 4.3s、65000 ⇒ 1m 5s），card.dur 仍是毫秒原值', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    const cases: Array<[number, string]> = [[999, '999ms'], [4321, '4.3s'], [65000, '1m 5s'], [12, '12ms']];
+    for (const [ms, text] of cases) {
+      const callId = `c${ms}`;
+      lastES().emit('tool_use', { tool_call_id: callId, name: 'shell', input: {} });
+      lastES().emit('tool_result', { tool_call_id: callId, ok: true, duration_ms: ms, result_digest: 'done' });
+      const card = s.toolCards.get(callId)!;
+      expect(card.out).toBe(`✓ done（${text}）`);
+      expect(card.dur).toBe(ms); // 卡片存原值毫秒，展示时才格式化
+    }
+  });
+
   it('投影卡片（DTO 路径）的 resultPreview 同样过归一：number/对象不炸、0 不被丢', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);

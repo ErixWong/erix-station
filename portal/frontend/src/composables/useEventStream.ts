@@ -17,7 +17,7 @@
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
 import { PERSISTENCE_TERMINATION_REASON, RUN_FAIL_REASONS } from '../lib/terminationReasons';
-import { getToolResultSummary } from '../lib/toolSummary';
+import { getToolResultSummary, formatDuration } from '../lib/toolSummary';
 
 // 用户可见状态行/错误行文案（issue #101 P2）：非组件上下文（composable 无 setup 实例）→ i18n.global.t。
 // 取词即快照：状态行在事件到达时生成，切语言后旧行不回溯翻译（可接受）。
@@ -313,15 +313,21 @@ export function useEventStream(hooks: EventStreamHooks) {
         const card = toolCards.get(d.tool_call_id);
         if (card) {
           card.ok = !!d.ok;
-          card.dur = d.duration_ms ?? 0;
+          // issue #283：只有事件**真带了**有限时长才写 `card.dur`，缺失就保持 `undefined`（卡片据此
+          // 不渲染时长）。旧写法 `d.duration_ms ?? 0` 把「引擎没给」伪装成 0，就是「恒显 0s」的
+          // 前端共犯；同时也不拿 null/字符串冒充时长。已有值不被「无时长事件」覆写（实时与历史
+          // 重放、投影回填同一路径上都成立，与 M3 的「实时优先」同一口径）。
+          const durMs = Number.isFinite(d.duration_ms) ? (d.duration_ms as number) : undefined;
+          if (durMs !== undefined) card.dur = durMs;
+          const mark = d.ok ? '✓' : '✗';
           // issue #228：result_digest 的理论形状是字符串，但工具结果有三套形态（string /
           // {content, metadata} / number）——入口归一后「writeFile 写了 0 字节」也能正常展示，
           // `{content, metadata}` 则只展示 content（截断/跳过信息就在 content 的 marker 文本里）。
-          card.out = t('stream.event.toolResult', {
-            mark: d.ok ? '✓' : '✗',
-            digest: getToolResultSummary(d.result_digest),
-            ms: d.duration_ms ?? 0,
-          });
+          const digest = getToolResultSummary(d.result_digest);
+          // issue #283：没时长走「无时长」文案——不得出现 `0ms` / `undefined` / 空括号。
+          card.out = durMs === undefined
+            ? t('stream.event.toolResultNoDur', { mark, digest })
+            : t('stream.event.toolResult', { mark, digest, dur: formatDuration(durMs) });
         }
         return;
       }
