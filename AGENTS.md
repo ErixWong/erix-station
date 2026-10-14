@@ -497,7 +497,8 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **发布与部署**：三份 `package.json`+lockfile → `0.1.8`（每份 lockfile 恰好 2 行）→ tag `v0.1.8` → 三镜像按 digest pin。**告知面只需 portal 镜像**（`~/AGENTS.md` 由对账自动刷出第 8 条，不需重建容器）；**#283 的 M1 动 `runner/` ⇒ 必须重建 FDE 镜像 + `docker rm -f` 四台让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）。
 
-- [ ] **真机验收（待做，主 agent）**：**#285 R-1** —— 全新工位起服务，第 1 条回复就给完整可点预览 URL（判据 `role='user'` 计数 == 1，同 §8.16），过了才关 station #285；**#283** —— `sleep 5 && echo ok` 的卡片实时应 `✓ 5.0s` 且**刷新后仍在**，库里两列非 NULL，旧数据只显示 ✓/✗ 不出现 `0ms`，过了才关 #283。
+- [x] **#283 真机验收已过（v0.1.9，2026-10-14 夜班，主 agent 亲手）**：dev 栈会话 `1ead0b1a…` 两次真实调用——`sleep 6` ⇒ 库 `tool_calls.duration_ms=6013`、`sleep 400`（`timeout_ms:420000`）⇒ `duration_ms=400014`，`result_digest` 同批回填；浏览器（`erix_station_playwright` :8935，走 `station.fde.erix.vip:8090`）渲染出 **`6.0s` 与 `6m 40s`**，**`location.reload()` 硬刷新后两行仍在**（走宿主 join 的回放路径），整页 `innerText` **无 `0ms`、无 `undefined`、无 `[object Object]`**（vision 看图复核同一张截图 `/docker/erix_station_playwright/v019-accept-lines.png`）。已关 #283。
+- [ ] **#285 R-1 真机（半条待判）**：全新工位 `acc019`（会话 `116090a0…` / run `9bdcfdb9…`，**`role='user'` 计数 == 1**、零返修）第 1 条回复就给出**两个 host 的完整预览 URL**（`http://acc019-p-22061.fde.erix.vip:8090` 与 `…-p-22060…/api/todos`，端口取自 `ports.json`，不是 `localhost`），还主动写了第 4/5/6 条（`credentials:'include'`、CORS 回显、逐 host 放行）。**但它是裸 URL（`- **http://…**`）不是 markdown 链接**，而 `portal/frontend/src/lib/markdown.ts` 只把 `[text](url)` 转成 `<a>`、**没有 GFM 裸 URL autolink**（实测：`:44-46` 只处理链接语法）⇒ SPA 里**不可点**。第 8 条要求「以 markdown 链接给出、可点」这半条未达成，待判修法（加强告知面措辞并给示例 vs 前端补 autolink）。
 
 
 ### 8.22 #288 缺陷 C：崩溃恢复不再盲目重放（`replayPolicy: "per-tool-declaration"`）
@@ -546,9 +547,14 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **主 agent 亲跑的变异（不复用 worker 的结论）**：`replayPolicy` 值改成 `always-replay` ⇒ **2 条具名红**（主口径 + 文件工具刻意保守那条）；把 `loopEventPayload` 的新 case 整段删掉（走 `default` 原样透传）⇒ **1 条红**（证明事件字段映射是被钉住的，不是只靠文档）；前端 `HISTORY_REPLAY_TYPES` 单独摘掉 ⇒ **恰好 1 条红**且实时用例仍绿（症状=刷新后消失，与 `EVENT_TYPES` 摘掉的「一条都收不到」可区分）；`silent_ms` 守卫改 `?? 0` ⇒ 恰 1 条红；`attempt_killed` 幂等键去掉 `:<attempt>` ⇒ 恰 1 条红。另**亲验真库** `run_events` 上确有 `UNIQUE (run_id, client_event_id)` **普通约束**（不是部分索引）⇒ `ON CONFLICT (run_id, client_event_id)` 在真 PG 上成立，fake 与真库同口径（§8.14 那类「fake 结构上拦不住」的坑本次已排）。
 
-**发版与部署**：`TODO(主 agent)`（发版号 / tag / 镜像）。⚠ M1 动 `runner/` ⇒ **必须重建 FDE 镜像 + `docker rm -f` 让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）；老容器不重建就还是旧默认 `always-replay`。
+**发版与部署（已完成）**：tag `v0.1.9`（commit `466275a`，CI 绿后打）→ release run `38549138366` success → 清单 `images-digest` 三镜像 `docker pull` 后 `docker image inspect .Id` 与 `imageId` **全一致**（portal `c13c099c…` / fde `8e3e4260…` / proxy `8aae5417…`）→ `deploy/.env` 形态① pin（备份 `/tmp/deploy.env.bak-019`）→ `docker compose -p station --profile litellm up -d --no-build`（portal 实跑 `c13c099c…` = 清单 imageId，`/healthz` 200）→ **`docker rm -f` 六台 fde-* 后 reconcile 全部按新 pin 重建**（`fde-eric`/`tetris`/`todo`/`blind`/`pw173jscw`/`ui17kbwg` 镜像 ID 均为 `8e3e4260…`），新建的 `fde-acc019` 直接落在新镜像上。⚠ 本单动 `runner/` ⇒ 重建是**必须**的（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）：不重建就还是旧默认 `always-replay`。⚠ M1 动 `runner/` ⇒ **必须重建 FDE 镜像 + `docker rm -f` 让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）；老容器不重建就还是旧默认 `always-replay`。
 
-- [ ] **真机验收（`TODO(主 agent)`）**：建议判据 —— 让一条长 shell 被 watchdog 杀掉（缺陷 A 的保活已修掉误杀，要造真崩溃可 `docker kill` worker），resume 后 `run_events` 里**不得**再出现「同 `call_id` 的第 2 条 `tool_use` 紧跟一次真执行」，而是出现一条 `tool_replay_decision_required` + 一条 `ok:false` 的 `tool_result`；界面上刷新前后都能看到那句中性文案。过了才关 #288 缺陷 C。
+- [x] **真机验收已过（v0.1.9，主 agent 亲手，一枪同时验 A/B/C/D）**：会话 `1ead0b1a…` 起一条 `sleep 120 && echo REPLAY_PROBE`（`timeout_ms:200000`），工具跑到 30s 时 `docker exec fde-eric kill -9 <worker pid>` 造真崩溃。
+  - **A**：另一条 `sleep 400 / timeout_ms:420000` 在 0.1.9 上**跑满 400s 不被杀**（`tool_calls.duration_ms=400014`，run `judge_done`）——修复前 5:00 必死（标本就是同一台 `fde-eric`、同一台 dev 栈）。
+  - **D**：kill worker 后 12 秒 `docker exec fde-eric ps` 里 `sleep 120` 与它的 bash **一条不剩**（旧行为会留下孤儿并与下一 attempt 并存）。
+  - **B**：`run_events` 出现 `seq 164 attempt_killed {"reason":"worker_crashed","attempt":1,"killed_by":"crash","max_attempts":3}`（**无 `silent_ms` 键**，crash 上报本就没有 ⇒ 印证「有则出现，没有不写」）；界面上渲染「第 1/3 次尝试被终止（worker 非预期退出），已重排等待重试」，**硬刷新后仍在**，`zh-CN` / `en` 两种语言都逐字核对过。
+  - **C**：同一 `call_id call_00_ET_MtdTBEViwR7OHZXeWY184379` 在 resume 后只出现「记录 + `167 tool_replay_decision_required {replay:"unsafe", requires_host_decision:true, engine_run_id=<sessionId>}` + `168 tool_result ok:false`（**无时长**）」，**没有第二次真执行**；模型拿到「被中断」后直接回 `probe-done`，**没有白烧 120s**。中性文案两语可见且刷新后仍在。
+  - **已接受的呈现（不是 bug）**：被中断的那次工具卡片本身是**红色 ✗**——引擎给的合成 `tool_result` 是 `is_error:true`，卡片按失败渲染，解释由下面那行中性文案承担（刻意不把卡片也刷成中性，否则真失败与中断会混色）。
 
 
 
