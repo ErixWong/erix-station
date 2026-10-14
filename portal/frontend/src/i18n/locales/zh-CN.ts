@@ -191,6 +191,20 @@ export const zhCN = {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',
       attempt: 'round {round} · 尝试 {attempt}/{max}',
+      // issue #288（缺陷 B）：worker 被宿主杀掉并重排（之前用户只看到同一个工具卡片亮 3 次，
+      // 最后拿一句没原因的 attempts exhausted）。载荷是 portal 在 release-requeue 分支合成的：
+      // {attempt, max_attempts, reason, killed_by, silent_ms?}。**{silent} 是可选后缀片段**，
+      // 调用方没时长时传空串（同 dash/paren 口径），所以本文案不得依赖 {silent} 非空。
+      attemptKilled: '第 {attempt}/{max} 次尝试被终止（{cause}），已重排等待重试{silent}',
+      // killed_by 只认这两个值（docs/api/portal.md §5.3）；键名用上报值原文，不 camelCase。
+      attemptKilledCause: {
+        watchdog: '执行期静默超时，被看门狗终止',
+        crash: 'worker 非预期退出',
+      },
+      // 静默时长后缀：单位由 lib/toolSummary.formatDuration 连着数值一起给（文案不自带 ms）。
+      attemptKilledSilent: '（静默 {dur}）',
+      // killed_by 是 additive 字段：未知/缺失时的兼容文案（不得出现 [object Object] / undefined）。
+      attemptKilledUnknown: '原因未知',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       judgePassThrough: 'judge：放行（{mode}）',

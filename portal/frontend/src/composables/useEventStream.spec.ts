@@ -770,3 +770,78 @@ describe('issue #283：投影路径的 durationMs（刷新后不丢）', () => {
     expect(s.toolCards.get('nan')!.dur).toBeUndefined();
   });
 });
+
+// issue #288（缺陷 B）：worker 被 watchdog 杀掉并重排必须是用户看得见的事件。
+// 载荷由 portal 在 release-requeue 分支合成（docs/api/portal.md §5.3 第 14 行）：
+// {attempt, max_attempts, reason, killed_by, silent_ms?}——**不新增 UI 结构**，走 onSep 分隔行。
+describe('#288 attempt_killed（attempt 被杀并重排）', () => {
+  it('实时 SSE：watchdog + silent_ms ⇒ 渲染「第 N/M 次尝试被终止（原因）…（静默 <时长>）」', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('attempt_killed', {
+      seq: 41, run_id: 'run-1', attempt: 1, max_attempts: 3,
+      reason: 'watchdog_silent', killed_by: 'watchdog', silent_ms: 301584,
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      '第 1/3 次尝试被终止（执行期静默超时，被看门狗终止），已重排等待重试（静默 5m 1s）',
+    );
+    expect(s.lastSeq.value).toBe(41); // 与既有事件同轴推进水位线（§5.1）
+  });
+
+  it('crash 且没有 silent_ms ⇒ 整段静默文案不出现（不留空括号、不拿 0 冒充「静默 0ms」）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('attempt_killed', {
+      seq: 1, run_id: 'run-1', attempt: 2, max_attempts: 3, reason: 'worker_crashed', killed_by: 'crash',
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith('第 2/3 次尝试被终止（worker 非预期退出），已重排等待重试');
+    const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+    for (const banned of ['（静默', '（）', '()', 'undefined', 'null', '[object Object]']) {
+      expect(line).not.toContain(banned);
+    }
+  });
+
+  it('silent_ms 是脏值（字符串 / 负数 / NaN）⇒ 同样不显示静默段（后端不给力时前端也不炸）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    for (const bad of ['300000', -1, Number.NaN, null, {}]) {
+      lastES().emit('attempt_killed', { seq: 2, attempt: 1, max_attempts: 3, killed_by: 'watchdog', silent_ms: bad });
+      const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+      // 只钉「静默段」（`（静默 …）`）不出现；watchdog 的原因文案本身就带「静默」二字
+      expect(line, String(bad)).not.toMatch(/（静默|\(silent/);
+      expect(line, String(bad)).toContain('第 1/3 次尝试被终止');
+    }
+  });
+
+  it('未知 / 畸形 killed_by 退化不炸：有 reason 就透出原文，没有就说「原因未知」', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('attempt_killed', { seq: 3, attempt: 1, max_attempts: 3, reason: 'nuclear_freeze', killed_by: 'nuclear' });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('第 1/3 次尝试被终止（nuclear_freeze），已重排等待重试');
+
+    lastES().emit('attempt_killed', { seq: 4, attempt: 1, max_attempts: 3, killed_by: { why: 'x' } });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('第 1/3 次尝试被终止（原因未知），已重排等待重试');
+
+    lastES().emit('attempt_killed', { seq: 5 }); // 整个载荷都不齐
+    const line = hooks.onSep.mock.calls.at(-1)![0] as string;
+    expect(line).toContain('第 ?/? 次尝试被终止');
+    expect(line).not.toMatch(/undefined|\[object Object\]|（）/);
+  });
+
+  it('历史回放（刷新后）走同一渲染路径且不推进水位线（#89 红线）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.replayEvent({
+      seq: 41, run_id: 'run-1', type: 'attempt_killed',
+      payload: { attempt: 1, max_attempts: 3, reason: 'watchdog_silent', killed_by: 'watchdog', silent_ms: 301584 },
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      '第 1/3 次尝试被终止（执行期静默超时，被看门狗终止），已重排等待重试（静默 5m 1s）',
+    );
+    expect(s.lastSeq.value).toBe(0);
+  });
+});
