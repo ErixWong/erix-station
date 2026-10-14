@@ -1563,6 +1563,32 @@ export async function getApproval(pool, { container, user, approvalId, claimToke
 // U12 release（主动放弃已领任务）
 // ---------------------------------------------------------------------------
 
+/**
+ * issue #288（缺陷 B）：release 现在可以附带「本次 attempt 是怎么死的」。
+ *
+ * 背景：requeue 分支此前**只改 `run_queue` + 写 `audit_log`**，不追任何 `run_events` ⇒
+ * 用户侧只看到同一个工具卡片亮 3 次，最后拿到的是一句没有原因的 `attempts exhausted`。
+ * 现在 agentd 上报 `killed_by` / `silent_ms`，portal 在 **requeue 分支同事务**追一条
+ * `attempt_killed` 事件（幂等键见下）。
+ *
+ * 口径：
+ * - `killed_by` 只认 `watchdog`（执行期静默被 F6 看门狗杀）与 `crash`（worker 非预期退出）；
+ *   非法/缺省 ⇒ 视为「无 kill 报告」（**不报错、不写事件**）——旧 agentd 与「压根没起 worker」
+ *   的 release（`fork_failed` / `prepare_cwd_failed` / `run_data_failed`）全部落在这里。
+ * - `silent_ms` / `next_retry_in_ms`：**有则出现，没有就不写键**（绝不拿 0 冒充「有」）。
+ */
+const KILL_REPORT_VALUES = new Set(['watchdog', 'crash']);
+
+function parseKillReport(body) {
+  const killedBy = KILL_REPORT_VALUES.has(body?.killed_by) ? body.killed_by : null;
+  const nonNeg = (v) => (Number.isFinite(v) && v >= 0 ? Math.round(v) : null);
+  return {
+    killedBy,
+    silentMs: nonNeg(body?.silent_ms),
+    nextRetryInMs: nonNeg(body?.next_retry_in_ms),
+  };
+}
+
 export async function releaseRun(pool, { container, user, runId, claimToken, body }) {
   const reason = body?.reason;
   if (typeof reason !== 'string' || reason.length === 0 || reason.length > 64) {
@@ -1609,6 +1635,8 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
     let runStatus;
     let queueStatus;
     let committedRunEnd = null; // 提交后推浏览器侧 SSE（aborted/max_attempts 的合成 run_end）
+    // issue #288：requeue 分支的合成事件也要实时推 SSE（刷新后靠历史回放，两者可见性必须一致）。
+    let committedAttemptKilled = null;
     // 注意：release 后保留 claim_token（供幂等重放识别），fencing 由 lease_until 清空保证（旧 token 无法续租/写）。
     if (qrow.status === 'cancelled' || r.status === 'cancelling') {
       await client.query(`UPDATE run_queue SET status='cancelled', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
@@ -1636,6 +1664,35 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       outcome = 'requeued';
       runStatus = r.status; // 反映真实 runs.status（不再回写）：requeue 后仍为 running/queued，不回跳
       queueStatus = 'pending';
+
+      // issue #288（缺陷 B）：把「这一 attempt 是怎么死的」对用户说清楚——**同事务**追一条
+      // `attempt_killed`（与下面的合成 `run_end` 同机制：`client_event_id` + `ON CONFLICT DO NOTHING`，
+      // 先例 #277）。at-least-once：agentd 重试 release 同一条上报不会写两条。
+      const kill = parseKillReport(body);
+      if (kill.killedBy) {
+        const killPayload = {
+          attempt: Number(qrow.attempts),
+          max_attempts: Number(qrow.max_attempts),
+          reason,
+          killed_by: kill.killedBy,
+        };
+        if (kill.silentMs !== null) killPayload.silent_ms = kill.silentMs;
+        if (kill.nextRetryInMs !== null) killPayload.next_retry_in_ms = kill.nextRetryInMs;
+        const killSeq = await allocSeq(client, r.session_id);
+        const killIns = await client.query(
+          `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+           VALUES ($1, $2, $3, $4, 'attempt_killed', $5, now())
+           ON CONFLICT (run_id, client_event_id) DO NOTHING
+           RETURNING id`,
+          [runId, r.session_id, killSeq, `${runId}:attempt-killed:${Number(qrow.attempts)}`, JSON.stringify(killPayload)],
+        );
+        // 没真插入行（at-least-once 重放）就不推 SSE，否则同一个 attempt 在界面上出两条重试行。
+        // 代价：重放的那一次白烧一个 seq——§5.1 的实现注记里事件流单独看本来就有合法空洞，
+        // 前端也明确**不得**拿「seq 跳号」当重连判据（#277 的合成 run_end 同此形态）。
+        if (killIns.rows.length > 0) {
+          committedAttemptKilled = { session_id: r.session_id, seq: killSeq, payload: killPayload };
+        }
+      }
     } else {
       await client.query(`UPDATE run_queue SET status='done', owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
       await client.query(
@@ -1648,6 +1705,13 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
       const runEndSeq = await allocSeq(client, r.session_id);
       const runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
         error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } };
+      // issue #288：**additive 增补**——`error.code` 永远是 `max_attempts_exceeded`（既有契约不得改），
+      // 额外把最后一次 kill 的原因附在旁边，免用户去猜「为什么没理由就失败了」。有则出现，没有不写键。
+      const lastKill = parseKillReport(body);
+      if (lastKill.killedBy) {
+        runEndPayload.last_reason = reason;
+        if (lastKill.silentMs !== null) runEndPayload.last_silent_ms = lastKill.silentMs;
+      }
       await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
          VALUES ($1, $2, $3, $4, 'run_end', $5, now())
@@ -1660,6 +1724,8 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
     await client.query('COMMIT');
     try {
       if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
+      // issue #288：`attempt_killed` 与合成 `run_end` 同级：落库后实时推一把，与刷新后的历史回放同形状。
+      if (committedAttemptKilled) notifySessionEvents(committedAttemptKilled.session_id, [{ seq: committedAttemptKilled.seq, ts: new Date().toISOString(), run_id: runId, type: 'attempt_killed', payload: committedAttemptKilled.payload }]);
     } catch { /* 尽力推送 */ }
     await audit(pool, { actorId: user.id, action: 'run.release', target: runId, details: { reason, outcome } }).catch(() => {});
     return {
