@@ -63,6 +63,9 @@ export interface ToolCardState {
   out: string;
   // issue #85：tool_result 的 duration_ms 原值（可选，tool_result 回填），卡片头部耗时显示用；
   // out 文案的拼接语义不变。
+  // issue #283：**undefined = 没有时长**（引擎没给 / 旧数据 NULL），卡片只出 ✓/✗——绝不拿 0 冒充。
+  // 两个来源：实时/历史 `tool_result` 事件，以及投影路径 DTO 的宿主字段 `durationMs`
+  //（`projectToolCard` 只在它为空的时侯填，实时值优先）。单位换算在 `lib/toolSummary.formatDuration`。
   dur?: number;
   // issue #188：DTO 投影来源的卡片字段（加载/刷新路径）——直接透传上游 `toolCalls[]` 同名键，
   // 事件流路径不填。argsSummary = 上游 120 字参数摘要；resultPreview = 上游 400 字结果预览；
@@ -220,23 +223,31 @@ export function useEventStream(hooks: EventStreamHooks) {
     resultPreview?: unknown;
     isError?: boolean;
     executionStatus?: string;
-  }): void {
+    // issue #283：宿主从自家 `tool_calls` join 进 DTO 的耗时（**不是**引擎投影字段，来源见
+    // `portal/src/session-view.js#attachToolCallDurations`）。只在卡片现有 `dur` 为空时填——
+    // 实时路已拿到的值不许被投影覆盖（两路同 callId 归并时以实时为准）。
+    durationMs?: number;
+  }) {
     // 有预览字段 = 归一后仍不为 undefined；归一后的文本另存（number/null 到卡片里就是合法展示串）。
     const hasPreview = fields.resultPreview !== undefined;
     const resultPreview = hasPreview ? getToolResultSummary(fields.resultPreview) : undefined;
+    // issue #283：库里可能是 NULL（旧数据引擎当年就没发时长）⇒ 不收，也不拿 0 冒充有时长。
+    const projectedDur = Number.isFinite(fields.durationMs) ? (fields.durationMs as number) : undefined;
     const existing = toolCards.get(callId);
     if (existing) {
       // 事件流先建：只补投影才有的摘要/预览/状态，不覆盖实时路径已有的完整数据。
       if (fields.argsSummary !== undefined && existing.argsSummary === undefined) existing.argsSummary = fields.argsSummary;
       if (resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = resultPreview;
       if (fields.executionStatus !== undefined && existing.executionStatus === undefined) existing.executionStatus = fields.executionStatus;
+      // issue #283：刷新后不丢时长——但**只在实时路没给过的时候**用投影值（已有值优先）。
+      if (projectedDur !== undefined && existing.dur == null) existing.dur = projectedDur;
       if (existing.ok === null && (fields.isError !== undefined || hasPreview || fields.executionStatus !== undefined)) {
         existing.ok = fields.isError !== true;
       }
       return;
     }
     const hasResult = fields.isError !== undefined || hasPreview || fields.executionStatus !== undefined;
-    toolCards.set(callId, {
+    const card: ToolCardState = {
       name: fields.name,
       dig: fields.argsSummary ?? '',
       args: '',
@@ -245,7 +256,10 @@ export function useEventStream(hooks: EventStreamHooks) {
       argsSummary: fields.argsSummary,
       resultPreview,
       executionStatus: fields.executionStatus,
-    });
+    };
+    // 没有时长就**不写这个键**（不塞 `dur: undefined` 占位），与 M1 的「缺失保持 undefined」同口径。
+    if (projectedDur !== undefined) card.dur = projectedDur;
+    toolCards.set(callId, card);
     hooks.onToolCardCreated(callId);
   }
 
