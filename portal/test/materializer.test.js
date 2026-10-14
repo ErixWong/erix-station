@@ -166,11 +166,13 @@ test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目
 // 为什么钉这一节：真机演练（docs/ops/drill-2026-10-12.md §三）里，一个最普通的前后端分离应用要
 // 满足 6 条才能被外部浏览器用起来，其中 3 条根本没告知——当时靠人发第 3、4 条消息才修通（drill 记录是
 // 当时的事实，作为历史记录不改）。
-// 决策者定的落点是「结构化」（不是省 token）：要求链全写在下发的 `~/AGENTS.md` 里（#262 起 **7 条**），runner 的
+// 决策者定的落点是「结构化」（不是省 token）：要求链全写在下发的 `~/AGENTS.md` 里（#262 起 7 条、#285 起 **8 条**），runner 的
 // `SYSTEM_PROMPT` 只留「先读它」的强制指针（定稿：#258 `#issuecomment-6117800165`）。
 // 第 7 条（应用自己的登录态不要用 Cookie）来自 R-2 演练：r2-app 用 cookie 会话死了、r1-app 用 Authorization
 // 头活着，差异纯靠运气（#262）；#263 已证伪「只有部分方法被剥」的半通猜想——边缘对 `Cookie` 头全方法剥除。
-// ⇒ 这一节从此是「应用侧要求链」的唯一可读面：锚点被删就等于告知面回归到 #257/#258（以及 #262）那个缺口。
+// 第 8 条（告知义务：报「服务已起」必须给出完整可点预览 URL）来自 issue #285：前 7 条缺一条会挂一种，
+// 第 8 条缺了不挂但用户拿不到能点的地址（预览链路最后一公里断在对话里）——所以它**不进错误形态对照表**。
+// ⇒ 这一节从此是「应用侧要求链」的唯一可读面：锚点被删就等于告知面回归到 #257/#258（以及 #262 / #285）那个缺口。
 // ---------------------------------------------------------------------------
 
 /** 抠出「预览访问」整节（从 `## 预览访问` 到下一个 `## ` 标题）——按节断言，不靠关键词跳行凑齐。 */
@@ -178,7 +180,7 @@ function previewAccessSection(md) {
   const lines = md.split('\n');
   const start = lines.findIndex((l) => l.startsWith('## 预览访问'));
   assert.notEqual(start, -1, 'AGENTS.md 必须有「## 预览访问」这一节（#257/#258 的单一真相落点）');
-  assert.match(lines[start], /这 7 条/, '节标题必须把「7 条」钉住（#258 那张表的 6 条 + #262 补的第 7 条）');
+  assert.match(lines[start], /这 8 条/, '节标题必须把「8 条」钉住（#258 那张表的 6 条 + #262 的第 7 条 + #285 的第 8 条）');
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((l) => l.startsWith('## '));
   const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
@@ -186,10 +188,15 @@ function previewAccessSection(md) {
   return section;
 }
 
-test('renderHomeAgentsMd：预览访问节把 7 条要求链逐条写清（#257/#258 + #262）', () => {
+test('renderHomeAgentsMd：预览访问节把 8 条要求链逐条写清（#257/#258 + #262 + #285）', () => {
   const section = previewAccessSection(renderHomeAgentsMd({ fdeName: 'alice' }));
   const items = section.split('\n').filter((l) => /^\d\. /.test(l));
-  assert.equal(items.length, 7, `要求链恰好 7 条（#262 之前是 6 条），实际 ${items.length} 条`);
+  assert.equal(items.length, 8, `要求链恰好 8 条（#262 之前 6 条、#285 之前 7 条），实际 ${items.length} 条`);
+
+  // 引言必须与节标题同步数，且自带「第 8 条是告知义务、不是一种挂法」那句括号补充（#285）：
+  // 没有它，读者会把「缺一条就有一种挂法」误当成第 8 条也是可用性前提。
+  assert.match(section, /下面 8 条全在你这一侧/, '引言的条数必须跟着节标题一起改（标题 8 / 引言 7 = 半个真相）');
+  assert.match(section, /缺一条就有一种挂法（第 8 条缺了不会挂，但用户拿不到能点的地址）/, '引言必须钉住第 8 条的性质：告知义务，不是故障形态');
 
   // ① 端口不发明（清单是唯一真相）
   assert.match(items[0], /端口从 `~\/\.erix\/ports\.json` 取/, '① 端口来源必须写死到清单文件');
@@ -239,6 +246,20 @@ test('renderHomeAgentsMd：预览访问节把 7 条要求链逐条写清（#257/
   // 排他说明：缺了它，④（要带 credentials）与 ⑦（cookie 没用）在读者眼里就是自相矛盾。
   assert.match(items[6], /`credentials:'include'`[\s\S]{0,20}只服务于平台票据 cookie 的放行判定/, '⑦ 必须自带「④ 的 credentials 只服务平台票据」的排他说明');
   assert.match(items[6], /不改变本条/, '⑦ 必须明确 ④ 不削弱本条结论');
+  // ⑧ 报「服务已起」时必须把用户能点的完整 URL 说出来（issue #285，措辞 = 决策者定稿）。这一条不挡任何一种
+  // 故障（链在容器里是通的），它挡的是「告知断在对话里」：用户拿着一个裸端口号仍然到不了应用。
+  assert.match(items[7], /报「服务已起」时[\s\S]{0,20}把用户能点的那个地址说出来/, '⑧ 必须把告知义务钉在「报服务已起」这个时机上');
+  assert.match(items[7], /从 `~\/\.erix\/ports\.json` 里取/, '⑧ 地址来源必须仍是清单文件（不得自己拼 URL）');
+  assert.match(items[7], /\*\*`url` 原值\*\*/, '⑧ 必须要求用清单里的 `url` 原值（拼/改/缩写都是第二份真相）');
+  assert.match(items[7], /在回复里给出\*\*完整 URL\*\*/, '⑧ 必须明写「完整 URL」这个交付形状');
+  assert.match(items[7], /`markdown 链接`/, '⑧ 必须要求给成 markdown 链接（用户能点才算送达）');
+  assert.match(items[7], /\*\*不要只报端口号\*\*/, '⑧ 必须禁掉「只报端口号」这个现网形状');
+  assert.match(items[7], /对外入口不是 `:<端口>`/, '⑧ 必须给出“为何裸端口号没意义”的理由（只写形状、不写号）');
+  assert.match(items[7], /门户「打开预览」放行/, '⑧ 必须提醒该地址还需从门户放行（否则用户点了还是 403）');
+  assert.match(items[7], /且按第 6 条\*\*每条 host 各需一次\*\*/, '⑧ 逐 host 放行必须**回指第 6 条**，不另起一句重述（同一规则只住一处）');
+  assert.match(items[7], /前后端分离应用要分别放行两次/, '⑧ 必须给出前后端分离场景的实际后果（两次）');
+  // 第 8 条是告知义务，不是一种错误形态 ⇒ 对照表不得多出回指它的行（#285 定稿：表不加行）。
+  assert.doesNotMatch(section, /（第 8 条）/, '错误形态对照表不得出现「（第 8 条）」——第 8 条不是错误形态');
 });
 
 test('renderHomeAgentsMd：预览访问节给出错误形态对照（谁给的答案 → 改哪一侧）', () => {
@@ -278,7 +299,7 @@ test('renderHomeAgentsMd：预览访问节不出现端口数字与区间，全�
 });
 
 test('isPlatformManagedPath：认 home/AGENTS.md 是平台文件（单一真相必须被对账覆盖）', () => {
-  // 精确分支（materializer.js 里 `rel === 'AGENTS.md'`）：预览访问 7 条就住在这个文件里，
+  // 精确分支（materializer.js 里 `rel === 'AGENTS.md'`）：预览访问 8 条就住在这个文件里，
   // 一旦它不再被认作平台文件，stale 清理不再管它、手改也不再被对账重物化覆盖（user-space §9.3）。
   assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/AGENTS.md`), true, 'home/AGENTS.md 必须是平台管理路径');
   assert.equal(isPlatformManagedPath(`${CONTAINER_HOME}/.erix/manifest.json`), true, '.erix/* 仍属平台文件');

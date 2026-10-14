@@ -48,15 +48,17 @@ import { buildFailureEnvelope } from './lib/termination.js';
 // 并在提示词提到未注册的上游别名时要求它处在否定语境里——改工具面必须同步这里。
 //
 // 预览告知的分工（2026-10-12，issue #257 + #258 落点定稿，#issuecomment-6117800165）：
-// **平台约束的单一真相 = materializer 下发的 `~/AGENTS.md`**（预览访问 7 条要求链 + 错误形态对照；
-// 第 7 条「应用自己的登录态不要用 Cookie」来自 #262，边缘全方法剥 `Cookie` 头，#263 复测定口径）
+// **平台约束的单一真相 = materializer 下发的 `~/AGENTS.md`**（预览访问 8 条要求链 + 错误形态对照；
+// 第 7 条「应用自己的登录态不要用 Cookie」来自 #262，边缘全方法剥 `Cookie` 头，#263 复测定口径；
+// 第 8 条「报『服务已起』必须给出清单里那条完整预览 URL 并提醒逐 host 放行」来自 #285，告知义务）
 // 本段只留一句「开工前先读 `~/AGENTS.md`」的**强制指针**，不抄规则——同 §8.10「工具名从注册面取、
 // 不手抄清单」：提示词与 portal 文案是两个包里的两份字，抄一遍就是埋下一份必然过期的第二真相。
 // ⚠ 前提单 **#259** 未落地前 `createJail({ root: cwd })` 的读边界只有项目根（无只读例外），
 //   所以指针必须同时带「家目录用 shell 读」的口径（真机里模型用 `readFile` 读 `~/AGENTS.md` 会撞
 //   「被宿主边界拒绝」白烧一轮）。R-1 复测新增 **P0：下发了 ≠ 读了**，transcript 里读 `~/AGENTS.md`
-//   的调用数为 0 直接判失败。防漂移断言：同文件里的「强制指针存在 / 六个具体规则词不得出现（allowedHosts
-//   · credentials · CORS · Set-Cookie · localStorage · Bearer，后三个是 #262 第 7 条带进来的）/ 不出现
+//   的调用数为 0 直接判失败。防漂移断言：同文件里的「强制指针存在 / 八个具体规则词不得出现（allowedHosts
+//   · credentials · CORS · Set-Cookie · localStorage · Bearer，后三个是 #262 第 7 条带进来的；
+//   最后两个 · 打开预览 · markdown 链接 是 #285 第 8 条带进来的）/ 不出现
 //   伞域字面量」三条。
 const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，工作目录是项目目录 \`~/projects/<project>\`（本次 run 直接在此工作，交付物留在项目目录内）。
 
