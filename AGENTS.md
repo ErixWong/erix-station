@@ -599,6 +599,31 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **发版与部署**：`TODO(主 agent)`。**本单不动 `runner/`**（告知面第 8 条随 portal 镜像下发即可）⇒ 真机复验 = 部署后打开 #285 R-1 那条会话（`116090a0…`），两个预览 URL 现在应是可点 `<a>`；过了才关 #285。
 
+### 8.25 LiteLLM 数据面模型名对账（issue #289 切片 A + B1，2026-10-14）
+
+**观测过的缺陷本体**（我亲手在 dev 复现，非推断）：`fde_llm_bindings.*_model_name` 与 **per-FDE 虚拟 key 的 `models` 白名单**都是**绑定时快照的名字**（`/key/info` 实测 `models: ['deepseek-flash']`；铸/改处 `llm.js:672`/`:793` `selectedModelNames()`）。LiteLLM 侧带外改数据面名（id 不变）⇒ 两处同时过期 ⇒ run 终态是**误导性的** `{"code":"auth","message":"The requested model 'X' is not available for this API key, or the model name is invalid."}`，且**烧了 6 轮**才死；把名字改回 ⇒ 同一条消息 `finished` 零错误（因果闭合）。
+
+**⚠ 两条被推翻的前提（别按我最初的分析去找修复点）**
+- **门户内「改名」不是漂移源**：`updateModel`（`llm.js:462`）把 `name` 写进 **`model_info.display_name`**，**不写 `model_name`**——实测 PATCH 200 后 `/model/info` 的数据面名一字未变。所以「改名后同步 bindings」是修一条不存在的路径；已改成**注释 + 用例钉住这个语义**，误导面另登记 **#296**。
+- **只回写 DB 仍会 403**：key 白名单存的是名字 ⇒ 必须**两处一起**同步。
+
+**载荷**（`llm.js` 新增模块级私有件 + 心跳调用点接线）
+- `getFdeLlmHeartbeatModels(pool, userId, opts={gateway, now, ttlMs=60_000, listModels, updateKey})`：**不传 `gateway` ⇒ 整段跳过对账**（兼容面，`llm.test.js` 5 处旧调用与旧行为逐字节相同，别删）。
+- 判据 = `model_info.id → model_name`（**id 稳定、名字可改**，复用现成 `gatewayModels()` + `modelId()`，不重复解析响应）。
+- 动作顺序**固定**：**先** `updateKey({key: row.api_key, models: [旧名…, 新名…] 去重})`（**新旧并存**，摘旧名会打断在途请求），**后**一条 `UPDATE fde_llm_bindings SET <仅命中列>, updated_at = now()`（多槽位漂移合并成一条）。**反序会造出「DB 新名 / key 旧名」的持续 403 且下一次心跳不自愈。**
+- 三种**保守放行**（都不失败、不写库）：`model_list_unavailable`（网关不可达——心跳路径不能被网关抖动拖死）/ `unknown_model_id`（**只 warn**：这是 agentd 心跳，抛错打不到用户；用户可见 fail-fast 属切片 B2）/ `binding_update_failed`（白名单已双名 ⇒ 继续用旧名仍可服务）。第四种 `/key/update` 失败的 warn **没有 `reason` 字段**（只有 `slots`/`error_status`）——文档 §9.5 按代码逐字写明，别让运维 grep 一个不存在的 reason。
+- **触发点是 U4 心跳**，不是定时器（已接受代价：带外改名到「下次心跳 + TTL」之间仍发旧名，最坏 ≈15s+60s）。
+- ⚠ **TTL 缓存按 client 对象身份分槽** ⇒ 接线必须传 `ctx.llmGateway`（`http.js:539` 的启动单例；`getGatewayClient` 对已具方法的对象**原样返回**，`llm.js:46-50`）。**在心跳里现造 client = 每跳多打一次 `GET /model/info`。**
+- 零 DDL / 零依赖 / 不动 `runner/`；**未新增错误码**（`llm_model_not_found` 属 B2，未登记，别按它 grep）。
+
+**测试口径**：新文件 `portal/test/llm-reconcile.test.js` **15 条**（A 10 + B1 5），根 **1112 → 1127**（1123 通过 / 0 失败 / 4 跳过，台账三处已同步）。B1 的关键一条是**端到端反休眠用例**（真 `createServer` + `POST /api/internal/heartbeat`）：断言下行用新名 **且两跳 `listModels` 只打一次**——后者同时钉住「接线还在」和「传的是单例」。
+
+**主 agent 亲跑变异（不复用 worker 结论）**：① `http.js` 把 `llmGateway` 传成 `null` ⇒ 恰 1 条红（端到端那条）；② 代码里 reason 字面量 `binding_update_failed` 改名 ⇒ 恰 1 条红（文档 §9.5 逐字列的 reason 因此被间接钉住）；③ 切片 A 的 `binding_update_failed` 分支 `return effective` → `throw` 在我**审切片 A 时全绿**（先确认 diff 真变了 1 行，不是空操作）⇒ **定性为真覆盖缺口**，B1 已补第 15 条，补测后同一条变异 ⇒ 恰 1 红。worker 另跑 6 条（顺序反转 / 白名单只发新名 3 红 / TTL 两向各 1 红 / 删接线 1 红 / `Object.assign({},gw)` 造新对象身份 ⇒ 红在网关调用计数上，这才是隔离出性能语义的那条）。
+
+**已知边界**：① 对账是 lazy 的（无启动扫描、无定时器）；② `unknown_model_id` 对用户仍静默（B2 的消息预检 fail-fast 未做）；③ 摘旧名不做（白名单只增不减，长期会攒历史名，未回收）；④ `updateKey` 成功而回写失败 ⇒ 不重试，只 warn；⑤ LiteLLM 侧「删除模型再重建」= **id 变**，本对账只会记 `unknown_model_id` 不回写 ⇒ 需人工改配（未在本单范围）。
+
+**发版与部署**：`TODO(主 agent)`。真机 A/B 判据：带外改 LiteLLM 数据面名 → 等一次心跳 + TTL → `fde_llm_bindings.*_model_name` 自动变新名、`/key/info` 白名单同时含新旧名、**期间发的消息不再出现 `auth` 类失败**；再把名字改回去复验一次。过了才关 #289 的「切片 A+B1」部分（**B2 未完，#289 保持 open**）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。

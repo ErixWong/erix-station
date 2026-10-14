@@ -459,6 +459,8 @@ async function findGatewayModel(client, id) {
   return found;
 }
 
+// #296: `name` maps to `model_info.display_name` only — it never rewrites the data-plane
+// `model_name` that fde_llm_bindings.*_model_name and the virtual key allow-list refer to.
 export async function updateModel(gateway, id, {
   name, type, enabled, tool_calling, context_window, max_tokens, model,
   input_cost_per_token, output_cost_per_token,
@@ -568,12 +570,134 @@ export async function getFdeLlmConfig(pool, userId) {
   };
 }
 
+/**
+ * Data-plane model name drift reconciliation (issue #261014 slice A).
+ *
+ * Both `fde_llm_bindings.*_model_name` and the per-FDE virtual key's `models` allow-list are
+ * snapshots taken at bind time. When LiteLLM's data-plane `model_name` is renamed out-of-band
+ * (model_info.id unchanged) both go stale, and every request is then rejected with a misleading
+ * `auth` error ("The requested model '…' is not available for this API key").
+ *
+ * Order matters: widen the key allow-list **first**, then write the DB back. The reverse order
+ * produces "DB already says the new name, key allow-list still holds the old one" ⇒ still 403.
+ * If `/key/update` fails we do **not** write anything: 宁可继续 403，也不要造出 DB/key 分叉。
+ */
+const HEARTBEAT_NAME_SLOTS = [
+  { slot: 'main', idColumn: 'main_model_id', nameColumn: 'main_model_name' },
+  { slot: 'embedding', idColumn: 'embedding_model_id', nameColumn: 'embedding_model_name' },
+  { slot: 'vision', idColumn: 'vision_model_id', nameColumn: 'vision_model_name' },
+];
+
+/** Single-slot module TTL cache for the gateway `model_info.id → model_name` map. */
+const dataPlaneNameCache = { client: null, at: 0, map: null };
+
+function errorStatus(error) {
+  return error?.httpStatus ?? error?.status ?? error?.cause?.httpStatus ?? null;
+}
+
+function configuredNameSlots(row) {
+  return HEARTBEAT_NAME_SLOTS.filter(({ idColumn, nameColumn }) => Boolean(row[idColumn]) && Boolean(row[nameColumn]));
+}
+
+/** Reuse the module's own response parsing: gatewayModels() + modelId(), never a second parser. */
+async function loadDataPlaneNameMap(client, { listModels }) {
+  const payload = listModels ? await listModels() : await client.listModels();
+  const map = new Map();
+  for (const model of gatewayModels(payload)) {
+    const id = modelId(model);
+    const name = model?.model_name;
+    if (id == null || typeof name !== 'string' || name.length === 0) continue;
+    map.set(String(id), name);
+  }
+  return map;
+}
+
+async function dataPlaneNameMap(client, { now, ttlMs, listModels }) {
+  const at = now();
+  if (ttlMs > 0 && dataPlaneNameCache.client === client && dataPlaneNameCache.map
+    && at - dataPlaneNameCache.at <= ttlMs) {
+    return dataPlaneNameCache.map;
+  }
+  const map = await loadDataPlaneNameMap(client, { listModels });
+  dataPlaneNameCache.client = client;
+  dataPlaneNameCache.at = at;
+  dataPlaneNameCache.map = map;
+  return map;
+}
+
+/**
+ * @returns {Promise<Record<string, string>>} slot → data-plane name to send downstream
+ *          (the new name only for slots that were fully reconciled, the stored name otherwise).
+ */
+async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, listModels, updateKey }) {
+  const slots = configuredNameSlots(row);
+  const effective = Object.fromEntries(slots.map(({ slot, nameColumn }) => [slot, row[nameColumn]]));
+  let map;
+  try {
+    map = await dataPlaneNameMap(client, { now, ttlMs, listModels });
+  } catch (error) {
+    // Gateway is unreachable: the heartbeat path must not be dragged down by gateway flapping.
+    console.warn('[llm] binding model name reconcile skipped', {
+      fde_id: userId, reason: 'model_list_unavailable', error_status: errorStatus(error),
+    });
+    return effective;
+  }
+
+  const drifts = [];
+  for (const { slot, idColumn, nameColumn } of slots) {
+    const current = map.get(String(row[idColumn]));
+    if (current == null) {
+      // Slice A stays silent-fail on purpose: this is the heartbeat path, so throwing only hits
+      // agentd, never the user. The user-visible fail-fast lives in slice B's message precheck.
+      console.warn('[llm] binding model name reconcile skipped', {
+        fde_id: userId, slot, reason: 'unknown_model_id', model_id: String(row[idColumn]),
+      });
+      continue;
+    }
+    if (current !== row[nameColumn]) drifts.push({ slot, nameColumn, from: row[nameColumn], to: current });
+  }
+  if (drifts.length === 0) return effective;
+
+  // Keep the old names in the allow-list: dropping them is not required to fix the 403 and would
+  // risk rejecting in-flight traffic that still carries the stale name.
+  const allowModels = [...new Set([...slots.map(({ nameColumn }) => row[nameColumn]), ...drifts.map((d) => d.to)])];
+  const writeAllowList = updateKey ? (body) => updateKey(body) : (body) => client.updateKey(body);
+  try {
+    await writeAllowList({ key: row.api_key, models: allowModels });
+  } catch (error) {
+    console.warn('[llm] binding model name reconcile failed', {
+      fde_id: userId, slots: drifts.map((d) => d.slot), error_status: errorStatus(error),
+    });
+    return effective;
+  }
+
+  const params = [userId, ...drifts.map((d) => d.to)];
+  const setClauses = drifts.map((d, index) => `${d.nameColumn} = $${index + 2}`);
+  try {
+    await pool.query(
+      `UPDATE fde_llm_bindings SET ${setClauses.join(', ')}, updated_at = now()
+        WHERE fde_id = $1 AND state = 'active'`,
+      params,
+    );
+  } catch (error) {
+    // The allow-list now accepts both names, so keeping the old name downstream stays servable.
+    console.warn('[llm] binding model name reconcile failed', {
+      fde_id: userId, slots: drifts.map((d) => d.slot), reason: 'binding_update_failed', error_status: errorStatus(error),
+    });
+    return effective;
+  }
+
+  for (const drift of drifts) effective[drift.slot] = drift.to;
+  return effective;
+}
+
 /** Model ids are LiteLLM model_info.id strings and need no join to a Station-owned catalog. */
-export async function getFdeLlmHeartbeatModels(pool, userId) {
+export async function getFdeLlmHeartbeatModels(pool, userId, opts = {}) {
   const r = await pool.query(
     `SELECT main_model_id, main_model_name,
             embedding_model_id, embedding_model_name,
-            vision_model_id, vision_model_name
+            vision_model_id, vision_model_name,
+            api_key
        FROM fde_llm_bindings
       WHERE fde_id = $1 AND state = 'active' AND gateway = 'litellm'
         AND api_key IS NOT NULL AND api_key <> ''`,
@@ -587,12 +711,20 @@ export async function getFdeLlmHeartbeatModels(pool, userId) {
   if ((row.embedding_model_id && !row.embedding_model_name) || (row.vision_model_id && !row.vision_model_name)) {
     throw new LlmGatewayError(502, 'Active LiteLLM binding is missing a data-plane model name');
   }
-  const models = { main: { model: row.main_model_name, type: 'text' } };
+  // Backward compatibility: without an injected gateway client nothing is reconciled, so the
+  // heartbeat keeps returning exactly the stored snapshot (internal.js behaviour is unchanged).
+  const { gateway = null, now = Date.now, ttlMs = 60_000, listModels = null, updateKey = null } = opts ?? {};
+  let names = null;
+  if (gateway) {
+    names = await reconcileHeartbeatNames(pool, userId, row, getGatewayClient(gateway), { now, ttlMs, listModels, updateKey });
+  }
+  const nameFor = (slot, stored) => names?.[slot] ?? stored;
+  const models = { main: { model: nameFor('main', row.main_model_name), type: 'text' } };
   if (row.embedding_model_id) {
-    models.embedding = { model: row.embedding_model_name, type: 'embedding' };
+    models.embedding = { model: nameFor('embedding', row.embedding_model_name), type: 'embedding' };
   }
   if (row.vision_model_id) {
-    models.vision = { model: row.vision_model_name, type: 'vision' };
+    models.vision = { model: nameFor('vision', row.vision_model_name), type: 'vision' };
   }
   return models;
 }

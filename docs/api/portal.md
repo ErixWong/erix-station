@@ -1611,6 +1611,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `runs[].lease` | `renewed`（claim_token 匹配，已续租 `lease_until = now + 90s` ⚠️）或 `lease_lost`（claim_token 不匹配——该 run 已被 re-claim / 租约易主） |
 | `runs[].lease_until` | 仅 `lease: renewed` 时返回（续租后的到期时刻） |
 | `runs[].reason` | 仅 `lease: lease_lost` 时返回：`reclaimed`（已 re-claim）/ `released`（已被 U12 释放）/ `terminal`（已终态） |
+| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」 |
 
 语义（与 runner §4.2 U4 一致）：
 
@@ -1621,6 +1622,33 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 幂等：天然幂等（覆盖写 `last_heartbeat`、续 lease）。portal 侧判定：**连续 3 次心跳丢失（45s ⚠️）判容器死**；run 级处置走租约到期 re-claim（runner §6.4）。
 
 错误：`400 validation_failed`（`runs[].claim_token` 缺失/格式非法）；`401 token_invalid / token_revoked`；`429 rate_limited`；5xx 无限退避重试（§9.13）。
+
+#### 模型名对账（#289）
+
+LiteLLM 侧带外改名（管理员在网关 UI 改 `model_name`）后，`fde_llm_bindings.*_model_name` 与 per-FDE virtual key 的 `models` 白名单**两处快照同时过期** ⇒ 数据面按名字拒请求，用户看到的却是 auth 类 403。心跳路径上 portal 会自愈这个漂移。
+
+- **触发点**：**只有 U4 心跳**（`internal.heartbeat` → `getFdeLlmHeartbeatModels(pool, user.id, { gateway: ctx.llmGateway })`）。**不是定时任务**——没有独立循环、没有 portal 启动扫描；FDE 不在跑（无心跳）就完全不产生写。
+- **判据**：`model_info.id → model_name`。id 是稳定身份（Station 槽位存的就是它），名字是可改的别名 ⇒ 拿 id 反查到的名字与库里不同即漂移。
+- **动作顺序（固定，反序会造出持续 403）**：
+  1. 先 `POST /key/update` 把该 FDE virtual key 的 `models` 白名单扩成**新旧名并存**（旧名不摘：摘掉对修 403 无必要，且会打断仍带旧名在飞的流量）；
+  2. 后 `UPDATE fde_llm_bindings SET <命中列>, updated_at = now() WHERE fde_id=$1 AND state='active'`（只 SET 漂移列，多槽位漂移合成一条 UPDATE）。
+
+  反序（先回写 DB、后扩白名单）会留下「DB 已是新名 / key 仍只认旧名」的窗口——下行新名立刻被 key 白名单拒，且这个分叉**不会被下一次心跳自愈**（下一次心跳比对时两边已一致）。
+- **三种保守放行（全部只 `console.warn`、不抛错，心跳照常返回 `200`，下行继续用旧名）**。运维按 `reason` 字面量 grep（前缀 `[llm] binding model name reconcile`）：
+
+  | 情形 | 日志行 | `reason` 字面量 |
+  |---|---|---|
+  | 网关不可达 / `GET /model/info` 抖动 | `... reconcile skipped` | `model_list_unavailable` |
+  | `model_info.id` 不在网关返回的映射里（模型已删/换 id） | `... reconcile skipped` | `unknown_model_id` |
+  | `/key/update` 失败 | `... reconcile failed` | **无 `reason` 字段**（只有 `slots` / `error_status`） |
+  | 白名单已扩但回写 `fde_llm_bindings` 抛错 | `... reconcile failed` | `binding_update_failed` |
+
+  第四行是安全态而非半残态：key 已接受新旧两名 ⇒ 下行旧名照样可服务，绝不下行新名（否则出现「DB 旧名 / 下行新名」分叉）。
+- **已接受代价**：
+  - 带外改名到「下一次心跳 + 映射 TTL」之间仍发旧名，最坏 ≈ 心跳间隔 15s + `model_list` 缓存 60s ⇒ 这段时间的 403 不消除，只是**不再无限持续**；
+  - `unknown_model_id` 在心跳路径**只 warn 不失败**——这条路径上抛错只会砸到 agentd，砸不到用户；用户可见的 fail-fast 在切片 B2（消息发送前预检）。
+- **TTL 缓存按 client 对象身份分槽**（`llm.js` 模块内单槽缓存，`ttlMs` 缺省 60s）⇒ 接线**必须**传 serve 启动时的 `ctx.llmGateway` 单例；在心跳路径里 `createLlmGatewayClient(...)` 现造 client 会让身份比较恒不相等 ⇒ **每次心跳多打一次 `GET /model/info`**。此约束由 `portal/test/llm-reconcile.test.js` 的端到端用例钉住（两跳心跳断言 `listModels` 只被调一次）。
+- **本切片不新增错误码**：`llm_model_not_found` 属切片 B2，尚未登记在 §错误码表，别按它 grep。
 
 ### 9.6 `PUT /api/internal/runs/:id/state`（U2：run 状态收敛）
 

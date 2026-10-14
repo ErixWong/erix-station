@@ -917,7 +917,7 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
 // U4 heartbeat（租约续期 + stop 兜底 + 容器级 revoked）
 // ---------------------------------------------------------------------------
 
-export async function heartbeat(pool, { container, user, body }) {
+export async function heartbeat(pool, { container, user, body, llmGateway = null }) {
   const runs = body?.runs ?? [];
   if (!Array.isArray(runs)) {
     throw new InternalError(400, 'validation_failed', 'runs 必须为数组', { details: { field: 'runs' } });
@@ -981,8 +981,9 @@ export async function heartbeat(pool, { container, user, body }) {
   }
 
   // issue #117：心跳下行 LiteLLM model_name（数据面别名）；DB 槽位仍以 model_info.id 做绑定身份。
-  // 查询只读 binding、不含 api_key；无 active binding → null（agentd 保持旧行为）。
-  const models = await getFdeLlmHeartbeatModels(pool, user.id);
+  // issue #289：投影含 api_key（对账要用它调 /key/update 扩白名单）；无 active binding → null（agentd 保持旧行为）。
+  // llmGateway 为 null/缺省时完全跳过对账 ⇒ 调用方不接线时行为与 #289 之前逐字节相同（兼容面，勿删）。
+  const models = await getFdeLlmHeartbeatModels(pool, user.id, { gateway: llmGateway });
 
   return { now: now.toISOString(), stop_run_ids: stopRunIds, revoked: false, runs: results, models };
 }
