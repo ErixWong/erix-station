@@ -165,6 +165,21 @@ describe('工具卡片折叠（issue #85）', () => {
     expect(cards[1].get('button').find('.text-red-600').exists()).toBe(true);
     expect(cards[2].get('button').text()).toContain('…');
   });
+
+  // issue #283：卡片头部耗时走可读单位三档（`formatDuration`），**没有时长就只出 ✓/✗**。
+  it('issue #283：头部耗时可读单位（4321 ⇒ 4.3s、65000 ⇒ 1m 5s）；无时长不出现 0ms', () => {
+    const { wrapper } = setup({
+      sec: { name: 'a', dig: '', args: '{}', ok: true, out: '', dur: 4321 },
+      min: { name: 'b', dig: '', args: '{}', ok: false, out: '', dur: 65000 },
+      none: { name: 'c', dig: '', args: '{}', ok: true, out: '' }, // 引擎未给时长
+    });
+    const cards = wrapper.findAll('.border-l-4');
+    expect(cards[0].get('button').text()).toContain('✓ 4.3s');
+    expect(cards[1].get('button').text()).toContain('✗ 1m 5s');
+    const header = cards[2].get('button').text();
+    expect(header).toContain('✓');
+    for (const junk of ['0ms', '0s', 'undefined', 'NaN']) expect(header).not.toContain(junk);
+  });
 });
 
 // ---------------------------------------------------------------------------
