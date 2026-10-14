@@ -8,6 +8,8 @@
 // 支持子集：ATX 标题（#~######，支持闭合 #）、围栏代码块（```/~~~ + 语言标注）、
 // 行内代码、粗体/斜体（** __ * _ 及 *** ___）、无序/有序列表（平铺）、表格（含 : 对齐）、
 // 链接（仅 http/https，target=_blank rel=noopener noreferrer，其余协议退化为纯文本）、
+// 裸 URL 自动链接（issue #285 R-1：GFM 风格，同样只放行 http/https；行内代码与围栏代码
+// 内不链、URL 尾部标点不并入 href；`www.` 无协议不链、email/mailto 刻意不做，见 inline()）、
 // 引用（>，递归支持嵌套）。
 //
 // 流式容错：未闭合围栏按「吞到文本末尾」收尾——半截 ``` 不会产出未闭合标签 / 炸布局。
@@ -17,6 +19,44 @@ const esc = (s: unknown): string => String(s).replace(/[&<>"']/g, (c) => ESC[c])
 
 // 占位符用私用区字符（\uE000），与用户文本撞车概率忽略不记（碰撞后果也只是文本轻微错位）。
 const PLACEHOLDER = (n: number): string => '\uE000' + n + '\uE000';
+// 链接占位符另用 U+E001（同在 sanitizePua 的转义区间内）⇒ 与行内代码占位符互不串号。
+const LINK_PLACEHOLDER = (n: number): string => '\uE001' + n + '\uE001';
+
+// ---- 裸 URL 自动链接（GFM 风格，issue #285 R-1）----
+// 协议白名单：只放行 http(s)（正则本身就是白名单，不匹配的一律保持纯文本）——
+// `javascript:alert(1)` / `data:text/html,…` / `file:///etc/passwd` 无 `http(s)://` 开头不链，
+// 裸的 `www.example.com`（无协议）也不链（GFM 同样不链）。email/`mailto:` **刻意不做**：
+// 邮箱不是本次标本的失败形态，且自动包 mailto 会新开一条 href 协议面，属另一条 scope。
+// URL 字符集：可打印 ASCII，再去掉裸 `<`、`>`、引号、反引号、空白与**一切非 ASCII**：
+// · 裸 `<` 是我们自己插的标签边界（`**http://x**` 已被粗斜体换成 `<strong>http://x</strong>`
+//   ⇒ 自动链接在 `</strong>` 前自然停下）；转义产物 `&lt;`/`&amp;` 里没有裸 `<`，不会误停。
+// · 非 ASCII 不入围 ⇒ 中文与全角标点永远不会跟着进 href（`http://x，端口 8090` 只链到 `x`），
+//   占位符字符（U+E000/E001）也落在这个排除区间里——它们不可能出现在真 URL 里。
+//   cmark-gfm 与 linkify-it 同样把自动链接限定在 ASCII 内（未百分号编码的中文路径会截断）。
+const BARE_URL_RE = /https?:\/\/[^\s<>"'`\u0000-\u001f\u007f-\uFFFF]+/gi;
+
+// 尾部标点不算进 href（`见 http://x.` 的句号、`(http://x)` 的右括号、`http://x,` 的逗号、
+// 以及 `;` `:` `!` `?` 与引号），剥下来留在正文。中文标点不会走到这里——它们在字符类
+// 就被挡在 URL 外了（见上），所以这里只需 ASCII 集合。
+const TRAILING_PUNCT = new Set(['.', ',', ';', ':', '!', '?', '>', ')', ']', '}', '"', "'"]);
+// esc() 可能产生的实体（esc 是唯一转义出口 ⇒ 集合封闭）。尾部判定按「整只实体当一个
+// 字符」做：这样 `http://x?a=1&b=2` 转义后的 `&amp;`（解码是 `&`，不是标点）连同它收尾的
+// `;` 会整体留在 URL 里，**不会把 `amp;` 当成尾标点剥掉**；而引号实体 `&quot;`/`&#39;`
+// 解码后是引号 ⇒ 整只剥掉（转义后的文本里根本没有裸引号，不这样做就剥不干净）。
+const ESC_ENTITY: Record<string, string> = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
+const ESC_ENTITIES = Object.keys(ESC_ENTITY);
+
+/** 从自动链接命中的串里剥掉尾部标点：返回 [进 href 的部分, 留在正文的部分]。 */
+function splitTrailing(url: string): [string, string] {
+  let end = url.length;
+  for (;;) {
+    const ent = ESC_ENTITIES.find((e) => url.startsWith(e, end - e.length));
+    const token = ent ?? url.slice(end - 1, end);
+    if (!token || !TRAILING_PUNCT.has(ESC_ENTITY[token] ?? token)) break;
+    end -= token.length;
+  }
+  return [url.slice(0, end), url.slice(end)];
+}
 
 // ---- 行内格式（输入为原始文本，内部先转义） ----
 // 先把输入里的私用区字符（U+E000–U+F8FF）转成数字实体——占位符才可能
@@ -25,6 +65,7 @@ const sanitizePua = (s: string): string => s.replace(/[\uE000-\uF8FF]/g, (c) => 
 
 function inline(text: string): string {
   const codes: string[] = [];
+  const links: string[] = [];
   let s = sanitizePua(esc(text));
   // 1) 行内代码最先占位：其内部不再做任何格式替换（防 `*` 等在代码里被格式化）
   s = s.replace(/`([^`]+)`/g, (_m, c: string) => {
@@ -38,14 +79,27 @@ function inline(text: string): string {
   s = s.replace(/___([^_]+)___/g, '<strong><em>$1</em></strong>');
   s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
   s = s.replace(/_([^_\s](?:[^_]*[^_\s])?)_/g, '<em>$1</em>');
-  // 3) 链接：仅放行 http(s)；href 保持转义形态（&amp;），引号已转义 → 无属性逃逸面。
+  // 3) markdown 链接：仅放行 http(s)；href 保持转义形态（&amp;），引号已转义 → 无属性逃逸面。
   //    非 http(s) 协议（javascript: data: 等）退化为链接文本纯文本。
+  //    ⚠ 产出**先整体占位**、不在 s 里留下真 <a>：否则第 4 步会把已生成的
+  //    `<a href="http://…">` 里那段裸 URL 再链一次，做出 <a> 套 <a>。
   s = s.replace(/\[([^\]]+)\]\(\s*([^)\s]+)\s*\)/g, (_m, t: string, u: string) => {
     const href = u.replace(/&amp;/g, '&');
     if (!/^https?:\/\//i.test(href)) return t;
-    return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + t + '</a>';
+    links.push('<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + t + '</a>');
+    return LINK_PLACEHOLDER(links.length - 1);
   });
-  // 4) 还原行内代码占位
+  // 4) 裸 URL 自动链接（issue #285 R-1）：必须排在 markdown 链接占位**之后**、行内代码还原
+  //    **之前**——行内代码已占位 ⇒ 代码里的 URL 天然不链；围栏代码块走 esc(buf) 不进 inline，
+  //    同样不链。流式容错取舍：末尾没有空格/换行的半截 URL 也允许先链上（下一帧变长后重链），
+  //    代价是渲染中途可能闪一下链接，换来的是不必给渲染器引入任何跨帧状态。
+  s = s.replace(BARE_URL_RE, (m: string) => {
+    const [url, trail] = splitTrailing(m);
+    return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>' + trail;
+  });
+  // 5) 还原链接占位（必须早于代码占位：`[`a`b`](url)` 的文本/href 里可能夹着代码占位符）
+  s = s.replace(/\uE001(\d+)\uE001/g, (_m, n: string) => links[Number(n)]);
+  // 6) 还原行内代码占位
   s = s.replace(/\uE000(\d+)\uE000/g, (_m, n: string) => '<code>' + codes[Number(n)] + '</code>');
   return s;
 }
