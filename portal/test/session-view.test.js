@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getSession } from '../src/sessions.js';
-import { projectSessionMessages } from '../src/session-view.js';
+import { projectSessionMessages, recordForProjection } from '../src/session-view.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
 
 const SESSION_ID = '10000000-0000-4000-8000-000000000001';
@@ -77,10 +77,12 @@ function transcript(round, dedupKey, record, createdAt, runId = null) {
 }
 
 class SessionViewPool {
-  constructor({ sessionId = SESSION_ID, anchors, transcriptRows }) {
+  constructor({ sessionId = SESSION_ID, anchors, transcriptRows, toolCallDurations = [] }) {
     this.sessionId = sessionId;
     this.anchors = anchors;
     this.transcriptRows = transcriptRows;
+    // issue #283：宿主自有 `tool_calls` 的时长行（默认空 = 「库里没时长」，与旧数据同口径）。
+    this.toolCallDurations = toolCallDurations;
     this.queries = [];
   }
 
@@ -124,6 +126,17 @@ class SessionViewPool {
       return { rows: [...this.transcriptRows].sort((a, b) => a.round - b.round || a.created_at - b.created_at) };
     }
     if (sql.includes('FROM runs')) return { rows: [] };
+    // issue #283：宿主自有的时长取数面（`getSession` 为 DTO 的 toolCalls[].durationMs 而查）。
+    // 不写死行为：按 SQL 里的 `run_id = ANY($1)` 与 `duration_ms IS NOT NULL` 真筛（AGENTS §8.14）。
+    if (sql.includes('FROM tool_calls')) {
+      assert.ok(sql.includes('run_id = ANY'), 'tool_calls 取数必须按 run 集合限定（不拿全表）');
+      const runIds = new Set(params[0] ?? []);
+      const skipNull = sql.includes('duration_ms IS NOT NULL');
+      return {
+        rows: this.toolCallDurations.filter((row) => runIds.has(row.run_id)
+          && (!skipNull || row.duration_ms !== null)),
+      };
+    }
     throw new Error(`Unexpected SQL: ${sql}`);
   }
 }
@@ -1331,4 +1344,149 @@ test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍�
   assert.notEqual(folded.text, projection[0].content, '标记里的原文不顶替正文');
   assert.equal(projection[1].content, 'plain answer');
   assert.equal('folded' in projection[1], false, '无折叠轮的 run 不带 folded 键');
+});
+
+// ---------------------------------------------------------------------------
+// issue #283：对话流 DTO 的 `toolCalls[].durationMs`。
+// 引擎官方投影的 toolCalls[] **不带时长**（上游明说该形状没有 duration），所以时长由**宿主**
+// 从自家 `tool_calls`（M2 由 U3 的 tool_result UPDATE 回填）按 `(run_id, call_id)` 取，
+// 并且必须在投影**之后** join——宿主字段不得伪装成引擎给的（#95 红线）。
+// 契约沿用既有口径：有则出现、无则 DTO 不出现该键；旧数据 NULL ⇒ 键不出现，**不许写 0**。
+// ---------------------------------------------------------------------------
+
+/** 一个 run、一个工具调用（provider call id = 'call-1'）的最小 transcript 现场。 */
+function toolCallFixture(runId = RUN_1, callId = 'call-1') {
+  const anchors = [message(`dur-assistant-${runId}`, 2, 'assistant', 'stale anchor text', runId)];
+  const transcriptRows = [
+    transcript(1, `${runId}:engine:round:1`, {
+      dedupKey: `${runId}:engine:round:1`,
+      response: {
+        content: [{ type: 'tool_use', id: callId, name: 'shell', input: { command: 'sleep 5' } }],
+        stopReason: 'tool_use',
+      },
+      messages: [{
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: callId, content: 'exit_code: 0', is_error: false }],
+      }],
+    }, at(1), runId),
+  ];
+  return { anchors, transcriptRows };
+}
+
+const withoutDurationKey = (calls) => calls.map((call) => {
+  const { durationMs, ...rest } = call;
+  return rest;
+});
+
+test('issue #283: DTO toolCalls[].durationMs 有值才出现；库里 NULL / 没这一行 ⇒ 键不出现（绝不写 0）', () => {
+  const { anchors, transcriptRows } = toolCallFixture();
+  const project = (toolCallRows) => projectSessionMessages({
+    sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows, toolCallRows,
+  })[0];
+
+  const withValue = project([{ run_id: RUN_1, call_id: 'call-1', duration_ms: 4321 }]);
+  assert.equal(withValue.toolCalls[0].durationMs, 4321, '宿主 join 命中 ⇒ DTO 带 durationMs');
+
+  const noRows = project(undefined);
+  assert.equal('durationMs' in noRows.toolCalls[0], false, '不传 toolCallRows ⇒ 与旧 DTO 逐字相同');
+  for (const rows of [
+    [],
+    [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
+    [{ run_id: RUN_1, call_id: 'other-call', duration_ms: 4321 }],
+  ]) {
+    const dto = project(rows);
+    assert.equal('durationMs' in dto.toolCalls[0], false,
+      `无时长（旧数据 NULL / 无匹配行）⇒ 不出现该键，实际=${JSON.stringify(dto.toolCalls[0])}`);
+    assert.deepEqual(withoutDurationKey(dto.toolCalls), noRows.toolCalls,
+      '除宿主新增键外，引擎投影字段一字不变');
+  }
+});
+
+test('issue #283：join 点在引擎投影**之后**——引擎产出形状里根本没有 durationMs，宿主也不去改它', () => {
+  const { transcriptRows } = toolCallFixture();
+  // 直接问引擎：官方投影自己给出的形状（宿主未加工）里必须没有时长这个键。
+  // 与产品代码同一口径逐行调用官方投影（`recordForProjection` 补 dedupKey → 纯函数展开）。
+  const engineTurns = transcriptRows
+    .flatMap((row) => projectTranscriptForDisplay([recordForProjection(row).record]));
+  const engineCalls = engineTurns.flatMap((turn) => (Array.isArray(turn.toolCalls) ? turn.toolCalls : []));
+  assert.ok(engineCalls.length > 0, '夹具必须让引擎投影产出 toolCalls');
+  for (const call of engineCalls) {
+    assert.equal('durationMs' in call, false,
+      '引擎投影不带时长 ⇒ 该键只能由宿主 join；若上游哪天自己给了 duration，这条会红 = 可撤宿主 join 的信号');
+  }
+
+  const { anchors } = toolCallFixture();
+  const dto = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 999 }],
+  })[0];
+  assert.deepEqual(withoutDurationKey(dto.toolCalls), engineCalls,
+    'DTO 的 toolCalls 除 durationMs 外必须与引擎投影逐字相同（宿主不裁剪、不改名、不重推导）');
+  assert.deepEqual(
+    Object.keys(dto.toolCalls[0]).filter((key) => key !== 'durationMs'),
+    Object.keys(engineCalls[0]),
+    '宿主字段是 additive 附加（不得覆盖/替换引擎字段的键序）',
+  );
+  for (const call of engineCalls) {
+    assert.equal('durationMs' in call, false, '引擎产出的对象不被就地改写（join 产出新对象，不动上游形状）');
+  }
+});
+
+test('issue #283：按 (run_id, call_id) 复合键 join——同 call_id 跨 run 不串号', () => {
+  const first = toolCallFixture(RUN_1);
+  const second = toolCallFixture(RUN_2);
+  const anchors = [...first.anchors, ...second.anchors];
+  const transcriptRows = [...first.transcriptRows, ...second.transcriptRows];
+  const projection = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+    // 只有 RUN_2 的那次调用有入库时长（RUN_1 是同 call_id 的旧数据）
+    toolCallRows: [{ run_id: RUN_2, call_id: 'call-1', duration_ms: 777 }],
+  });
+  const byRun = new Map(projection.map((dto) => [dto.run_id, dto]));
+  assert.equal('durationMs' in byRun.get(RUN_2).toolCalls[0], true);
+  assert.equal(byRun.get(RUN_2).toolCalls[0].durationMs, 777);
+  assert.equal('durationMs' in byRun.get(RUN_1).toolCalls[0], false,
+    'run_id 不参与 join 就会串号：同 call_id 的另一条必须仍无时长');
+});
+
+test('issue #283：GET /api/sessions/:id 端到端把 durationMs 带进 DTO（旧数据仍是不出现）', async () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1);
+  const pool = new SessionViewPool({
+    anchors,
+    transcriptRows,
+    toolCallDurations: [
+      { run_id: RUN_1, call_id: 'call-1', duration_ms: 5021 },
+      { run_id: RUN_1, call_id: 'call-ghost', duration_ms: 1 },
+    ],
+  });
+  const result = await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
+  const dto = result.messages.find((row) => row.role === 'assistant');
+  assert.equal(dto.toolCalls[0].durationMs, 5021, '刷新后时长仍在（数据源 = 自家 tool_calls）');
+  const toolCallsQuery = pool.queries.find((query) => query.sql.includes('FROM tool_calls'));
+  assert.ok(toolCallsQuery, 'getSession 必须真的去取 tool_calls（漏了就是"表里有值但 DTO 不带"那一类 bug）');
+  assert.deepEqual(toolCallsQuery.params, [[RUN_1]], '取数按本批锚点的 run 集合限定');
+
+  // 旧数据：库里有行但 duration_ms 是 NULL ⇒ 不出现该键（也不写 0）
+  const legacyPool = new SessionViewPool({
+    anchors,
+    transcriptRows,
+    toolCallDurations: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
+  });
+  const legacy = await getSession(legacyPool, { userId: USER_ID, sessionId: SESSION_ID, limit: 100 });
+  const legacyDto = legacy.messages.find((row) => row.role === 'assistant');
+  assert.equal('durationMs' in legacyDto.toolCalls[0], false, '旧 740 条历史数据不可回填 ⇒ 键不出现');
+});
+
+test('issue #283：includeMessages=false（SSE 只校验 last_seq）不多打 tool_calls', async () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1);
+  const pool = new SessionViewPool({ anchors, transcriptRows, toolCallDurations: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 5 }] });
+  await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, includeMessages: false });
+  assert.equal(pool.queries.some((query) => query.sql.includes('FROM tool_calls')), false,
+    '没有消息就没有可 join 的对象 ⇒ 不发这次查询');
 });

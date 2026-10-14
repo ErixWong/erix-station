@@ -195,7 +195,12 @@ export const en = {
       // issue #212: persistence detail forwarded from the engine termination
       // (operation/phase/sideEffect) — the workbench must show the phase
       runEndPersistence: 'persistence detail {operation}/{phase}/{sideEffect}',
-      toolResult: '{mark} {digest} ({ms}ms)',
+      // issue #283: the duration is passed pre-formatted (`12ms` / `4.3s` / `1m 5s`) by
+      // `formatDuration(ms)` — the text must not hard-code the `ms` unit any more.
+      toolResult: '{mark} {digest} ({dur})',
+      // same line without a duration (issue #283: never fake a missing duration as `0ms`,
+      // and never leave empty parentheses)
+      toolResultNoDur: '{mark} {digest}',
       dash: ' — {value}',
       paren: ' ({value})',
     },

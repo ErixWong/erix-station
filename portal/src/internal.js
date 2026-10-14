@@ -853,6 +853,9 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     }
 
     // tool_calls 行由 portal 在 U3 对 tool_use 事件幂等 upsert（portal.md §9.10）。
+    // ⚠ **顺序是本处的硬前置**：`tool_use` 循环必须跑在下面的 `tool_result` 循环**之前**——
+    // 同一批里两者常常共存（worker 的 tool_use 与 tool_result 可以同批上报，也可以 tool_result
+    // 先到、tool_use 还在同一批里排在后面），而下面只 UPDATE 不 INSERT，行不存在就一枪打空。
     for (const ev of events) {
       if (ev.type !== 'tool_use') continue;
       await client.query(
@@ -860,6 +863,39 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (run_id, call_id) DO NOTHING`,
         [runId, ev.payload?.tool_call_id, Number(ev.payload?.round ?? 0) || 0, ev.payload?.name ?? '', JSON.stringify(ev.payload?.input ?? {})],
+      );
+    }
+
+    // issue #283：把 tool_result 的耗时/结果摘要回填到 `tool_calls`（两列**早就在 baseline schema 里**，
+    // `docs/api/portal.md` §9.4 与 schema 表注释都写着「后续 tool_result 按 (run_id, call_id) 更新
+    // result_digest/duration_ms」，但代码里从来没有过这条 UPDATE ⇒ dev 真库 741 行两列全 NULL，
+    // 而事件 payload 里 duration 是有值的。正是上游警告的「引擎发出 X ≠ 你的表里有 X」。
+    //
+    // 口径（为什么这么写）：
+    //   * **UPDATE-only，不 INSERT**：行缺失（只有 tool_result、没见过对应 tool_use，或 call_id 对不上）
+    //     ⇒ 更新 0 行、静默不补记，不为此引入 INSERT（tool_calls 行的身份由 tool_use 事件提供，
+    //     round/name/input 这些必需列在 tool_result 里没有可靠来源）；
+    //   * **幂等且不擦写**：`AND duration_ms IS NULL AND result_digest IS NULL` ⇒ 重复投递（U3 是
+    //     at-least-once，整批重发是常态）与「后到的空值事件」都不会把已写的值改写成 NULL——
+    //     语义是「首次观测即真相、先到先得」。选「两列同口径的单条 UPDATE」而不是逐列两个 UPDATE：
+    //     一次工具调用只有一个 tool_result 事件（两列同源同时到），分列守卫换不来实际收益，却翻倍查询；
+    //   * `duration_ms` 为 null 的事件照发不误（引擎 0.18.0 对非结构化返回不写时长，见
+    //     runner/lib/tool-duration.js 头注释）：「没有时长」在库里就是 NULL，**不写 0**。
+    for (const ev of events) {
+      if (ev.type !== 'tool_result') continue;
+      const callId = ev.payload?.tool_call_id;
+      if (typeof callId !== 'string' || callId === '') continue; // 无键可依：不猜、不报错
+      await client.query(
+        `UPDATE tool_calls
+            SET duration_ms = $3, result_digest = $4
+          WHERE run_id = $1 AND call_id = $2
+            AND duration_ms IS NULL AND result_digest IS NULL`,
+        [
+          runId,
+          callId,
+          Number.isFinite(ev.payload?.duration_ms) ? ev.payload.duration_ms : null,
+          typeof ev.payload?.result_digest === 'string' ? ev.payload.result_digest : null,
+        ],
       );
     }
 

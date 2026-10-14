@@ -30,6 +30,7 @@ import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
+import { wrapToolResultForDuration } from './lib/tool-duration.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { generateSessionTitle, resolveFirstUserContent } from './lib/session-title.js';
@@ -174,7 +175,12 @@ function emitEvent(type, payload) {
   }
 }
 
-function loopEventPayload(event) {
+/**
+ * LoopEvent → U3 事件 payload 的映射（§5/§7.3）。
+ * issue #283：`export` 仅为单测可见面（runner/test/tool-duration.test.js 要钉 `duration_ms` 的
+ * 取值口径：有时长⇒有限数、没时长⇒ `null`，**绝不伪装成 0**）；worker 自身调用方式不变。
+ */
+export function loopEventPayload(event) {
   switch (event?.type) {
     case 'round_start':
       return { round: event.round };
@@ -200,6 +206,11 @@ function loopEventPayload(event) {
         round: event.round,
         name: null,
         result_digest: String(tr.content ?? '').slice(0, 500),
+        // issue #283：**顶层 `tr.duration` 就是正确读点**——引擎在 `run-snapshot-executor.js:329-333`
+        // 把 `execution.metadata` 摊平到 `tool_result` 块顶层（上游 host-upgrade-guide-0.17.0 也要求
+        // 宿主「read `tool_result.duration` and write it」），**不要**改成 `tr.metadata?.duration ?? tr.duration`
+        // （那是 issue #283 正文里被否证的错根因，改了空转）。缺失时保持 `null`（「未知」不是 0）；
+        // 什么时候会缺失见 runner/lib/tool-duration.js 头注释（适配器就是为了让它不缺失）。
         duration_ms: Number.isFinite(tr.duration) ? tr.duration : null,
         ok: tr.is_error !== true,
       };
@@ -316,9 +327,15 @@ async function startRun(msg) {
   });
   const tools = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
+  // issue #283：出口包装——把**非结构化**返回包成 `{ content, metadata: {} }`，让引擎走它会写
+  // `metadata.duration` 的那条分支（引擎 0.18.0 `run-snapshot-executor.js`：:102/:119 写、:111/:80-86
+  // 不写 ⇒ 本站除 searchText 外的工具全无时长）。模型看到的正文逐字节不变（引擎走
+  // `toolResultContent(value.content)`，由 runner/test/tool-duration.test.js 钉死）；本处不自己塞
+  // `metadata.duration`（引擎 :102 无条件覆盖 ⇒ 单一真相仍是引擎）；抛异常的路径**不在这里 catch**
+  // （保持引擎 catch ⇒ 无时长，前端显示成「没有时长」）。⚠ 上游 erix-agent #285 落地并升版后整体可撤。
   const executeTool = async (options) => {
     if (noteTools.executeTool && noteToolNames.has(options.name)) {
-      return noteTools.executeTool(options);
+      return wrapToolResultForDuration(await noteTools.executeTool(options));
     }
     // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
     // options.signal（erix-agent 0.17.0 orchestrator.js:324 声明 + run-snapshot-executor.js:237
@@ -328,10 +345,10 @@ async function startRun(msg) {
     // signal 在这一步被丢弃：shell/rg 完全收不到中止，用户点「停止」后引擎侧靠
     // awaitWithAbort 竞速先返回了，但 spawn 出去的命令没人杀，要等满超时（默认 60s，
     // env 放宽可到 3600s）才停——本行是这条链路的唯一入口，别在重构中再丢一次。
-    return registry.executeTool(options.name, options.input, {
+    return wrapToolResultForDuration(await registry.executeTool(options.name, options.input, {
       ...options.context,
       signal: options.signal,
-    });
+    }));
   };
 
   // P3 PR②a：portal 已在 POST 事务内预写 `:input:<messageId>`。

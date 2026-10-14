@@ -60,3 +60,31 @@ export function getToolResultSummary(result: unknown): string {
     return String(result).slice(0, RESULT_TEXT_LIMIT);
   }
 }
+
+// ---------------------------------------------------------------------------
+// issue #283：工具耗时的可读单位（三档，口径对齐 AGENTS §8.9 第 6 条）。
+//
+// 存进卡片的永远是**原始毫秒**（`ToolCardState.dur`），展示时才格式化；「没有时长」是
+// `dur === undefined`，由调用方走「不渲染时长」分支——**不得把缺失当 0 传进来**
+// （那正是 issue #283「恒显 0s」的前端共犯）。非有限数 / 负数一律返回空串，同样由调用方
+// 当成「没有时长」处理（宁可不显示，也不给一个假的 `0ms`）。
+//
+// 三档：
+//   * `< 1000`          → `Nms`（例 `0` → `0ms`、`432` → `432ms`、`999` → `999ms`）
+//   * `1000 ≤ ms < 60000` → `X.Ys`，**截断**到一位小数（不四舍五入，免得 59999 显示成「60.0s」
+//     这种跨档的值）：`1000` → `1.0s`、`4321` → `4.3s`、`59999` → `59.9s`
+//   * `>= 60000`        → `Xm Ys`（秒取整）：`60000` → `1m 0s`、`125500` → `2m 5s`
+// ---------------------------------------------------------------------------
+
+const MS_PER_SECOND = 1000;
+const MS_PER_MINUTE = 60 * MS_PER_SECOND;
+
+/** 把毫秒时长格式化成 `Nms` / `X.Ys` / `Xm Ys`；非有限数或负数 → 空串（调用方按「无时长」处理）。 */
+export function formatDuration(ms: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
+  if (ms < MS_PER_SECOND) return `${Math.floor(ms)}ms`;
+  if (ms < MS_PER_MINUTE) return `${(Math.floor(ms / 100) / 10).toFixed(1)}s`;
+  const minutes = Math.floor(ms / MS_PER_MINUTE);
+  const seconds = Math.floor((ms % MS_PER_MINUTE) / MS_PER_SECOND);
+  return `${minutes}m ${seconds}s`;
+}

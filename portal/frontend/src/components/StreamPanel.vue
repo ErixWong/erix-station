@@ -7,7 +7,7 @@ import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type StreamEntry, type FoldedInfo, type FoldedOriginalState } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
 // issue #85：卡片折叠（默认收起）+ 单行摘要防溢出，方案对齐 pi web ToolCallBlock。
-import { getToolPreview, getToolResultSummary } from '../lib/toolSummary';
+import { getToolPreview, getToolResultSummary, formatDuration } from '../lib/toolSummary';
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 // pi-web 风格：流式增量也走 markdown 渲染（渲染器先转义后格式化，半截 ``` 容错收尾）。
 import { renderMarkdown } from '../lib/markdown';
@@ -48,9 +48,12 @@ function summaryText(card: ToolCardState): string {
 }
 
 // 折叠态状态位：✓/✗（出错变红）+ 耗时；尚无结果（null）显示 …。
+// issue #283：耗时走 `formatDuration` 三档可读单位（不再裸拼 `${card.dur}ms`）；
+// **没有时长就只出 ✓/✗**（旧实现在 `dur=0` 上伪装不了「引擎未给」，那个伪装在上游已拆）。
 function statusMark(card: ToolCardState): string {
-  if (card.ok === true) return '✓' + (card.dur != null ? ` ${card.dur}ms` : '');
-  if (card.ok === false) return '✗' + (card.dur != null ? ` ${card.dur}ms` : '');
+  const dur = card.dur != null ? formatDuration(card.dur) : '';
+  if (card.ok === true) return '✓' + (dur ? ` ${dur}` : '');
+  if (card.ok === false) return '✗' + (dur ? ` ${dur}` : '');
   return '…';
 }
 

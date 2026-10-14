@@ -1,6 +1,6 @@
 // getToolPreview 单测（issue #85）：语义键优先 / 兜底首键 / 截 120 字 / 非对象 JSON 回退空串。
 import { describe, expect, it } from 'vitest';
-import { getToolPreview, getToolResultSummary } from './toolSummary';
+import { getToolPreview, getToolResultSummary, formatDuration } from './toolSummary';
 
 describe('getToolPreview（工具卡片单行摘要）', () => {
   it('优先取 command/path/file_path/pattern/query 等语义键', () => {
@@ -81,5 +81,39 @@ describe('getToolResultSummary（工具结果 → 展示文本，issue #228）',
     circular.self = circular;
     expect(() => getToolResultSummary(circular)).not.toThrow();
     expect(typeof getToolResultSummary(circular)).toBe('string');
+  });
+});
+
+// issue #283：工具耗时的可读单位三档（StreamPanel 头部与卡片结果行共用同一函数）。
+describe('formatDuration（工具耗时可读单位，issue #283）', () => {
+  it('第一档 <1000ms ⇒ "Nms"（含 0；0 是真实测得的亚毫秒耗时，不是缺失）', () => {
+    expect(formatDuration(0)).toBe('0ms');
+    expect(formatDuration(1)).toBe('1ms');
+    expect(formatDuration(432)).toBe('432ms');
+    expect(formatDuration(999)).toBe('999ms');
+  });
+
+  it('第二档 1000–59999ms ⇒ "X.Ys"（截断到一位小数，不四舍五入）', () => {
+    expect(formatDuration(1000)).toBe('1.0s');   // 下边界换档
+    expect(formatDuration(999.9)).toBe('999ms'); // 上边界仍是毫秒档（全程截断，不会进位成「1000ms」）
+    expect(formatDuration(1099)).toBe('1.0s');
+    expect(formatDuration(4321)).toBe('4.3s');
+    expect(formatDuration(59999)).toBe('59.9s'); // 截断而非进位 ⇒ 不会写出「60.0s」这种跨档值
+  });
+
+  it('第三档 >=60000ms ⇒ "Xm Ys"（秒取整）', () => {
+    expect(formatDuration(60000)).toBe('1m 0s'); // 下边界换档
+    expect(formatDuration(65_432)).toBe('1m 5s');
+    expect(formatDuration(125_500)).toBe('2m 5s');
+    expect(formatDuration(3_600_000)).toBe('60m 0s');
+  });
+
+  it('非有限数 / 负数 ⇒ 空串（「没有时长」由调用方走不渲染分支，绝不编成 0ms）', () => {
+    expect(formatDuration(Number.NaN)).toBe('');
+    expect(formatDuration(Number.POSITIVE_INFINITY)).toBe('');
+    expect(formatDuration(-1)).toBe('');
+    // 运行期脏数据（类型上说这是 number，但 DTO/事件未必）也不得抛
+    expect(formatDuration(undefined as unknown as number)).toBe('');
+    expect(formatDuration('12' as unknown as number)).toBe('');
   });
 });
