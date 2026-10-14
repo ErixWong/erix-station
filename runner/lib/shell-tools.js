@@ -62,12 +62,32 @@ function parseIntEnv(raw, defaultValue, { min, max }) {
 // （MAX_OUTPUT_BYTES 已上移至 env 解析段，与三件套同处定义）
 const TRUNCATION_MARKER = `[... output truncated, showing last ${MAX_OUTPUT_BYTES} bytes ...]`;
 
+// issue #288（缺陷 C）：`replay: 'unsafe'` 是**引擎元数据**，不是 inputSchema 的一部分。
+// 读点（erix-agent **0.18.0** 源码实测，勿按猜的改）：
+//   - `loop/orchestrator.js:1770-1782` `replayForToolUse(toolUse)`：先认快照里已记的值（:1775-1777），
+//     否则回落到**本次传入 `tools` 数组里同名工具定义的顶层 `replay` 键**——
+//     `:1781 return definition?.replay === "safe" ? "safe" : "unsafe";`
+//     ⇒ **字段位置 = 工具对象顶层**（与 name/description/inputSchema 同级），**不在 inputSchema 里**；
+//     ⇒ **判据是 `=== "safe"`，不是 `!== "safe"`**：未标注 / 任何非 "safe" 值一律落到 `"unsafe"`。
+//   - `:667-670` 取值校验：只允许 `"safe"|"unsafe"`，其它值启动即 TypeError（所以这里不能写 "idempotent" 之类）。
+//   - `:707-715` 声明会被引擎从**送给模型**的工具定义里剥掉（`hasReplayDeclarations` 为真时逐工具
+//     `const { replay: _replay, ...providerTool } = tool`）⇒ 模型看到的 schema 不变、无提示词漂移
+//     （由 runner/test/replay-policy.test.js 钉住）。
+//   - 快照侧：`:1783-1786` `withReplayDeclaration` 把解析结果**盖在 pendingToolUses 条目上**，
+//     `:1808-1818` 随 run snapshot 落盘 ⇒ 崩溃恢复读的是**当时记录**的判定（`resume-manager.js:256-264`），
+//     不是恢复时才组装的定义。⚠ 连带后果见 worker.js 的 replayPolicy 注释（「快照优先」= 旧决定会被记下来）。
+// 为什么显式写 `unsafe` 而不靠「未标注也是 unsafe」这条默认：行为上等价（:1781 的 `=== "safe"`），
+// 但**口径要写下来**——shell 跑的是 `kill` / 重启 backend / 重跑测试这类非幂等命令，重放就是再掀一次桌。
+// 上游 0.18.0 的 `createFileTools` **没有给任何工具标 replay**（`src/tools/*.js` grep `replay:` 零命中），
+// 本站不替上游代签「安全」——文件工具因此也一律按非 safe 处理，这是刻意的保守行为（见 §8.22）。
 const schema = {
   name: 'shell',
   description: 'Run a shell command with bash -c inside the run container. '
     + 'Use for verification (build/test/lint) before delivering. '
     + 'Commands run with worker privileges; do not modify state outside the worktree. '
     + 'Output is truncated to the last 32KiB.',
+  // 引擎元数据（读点见上方整段注释）：崩溃恢复时**不得**自动重放本工具。
+  replay: 'unsafe',
   inputSchema: {
     type: 'object',
     properties: {
