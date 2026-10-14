@@ -622,7 +622,33 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **已知边界**：① 对账是 lazy 的（无启动扫描、无定时器）；② `unknown_model_id` 对用户仍静默（B2 的消息预检 fail-fast 未做）；③ 摘旧名不做（白名单只增不减，长期会攒历史名，未回收）；④ `updateKey` 成功而回写失败 ⇒ 不重试，只 warn；⑤ LiteLLM 侧「删除模型再重建」= **id 变**，本对账只会记 `unknown_model_id` 不回写 ⇒ 需人工改配（未在本单范围）。
 
-**发版与部署**：`TODO(主 agent)`。真机 A/B 判据：带外改 LiteLLM 数据面名 → 等一次心跳 + TTL → `fde_llm_bindings.*_model_name` 自动变新名、`/key/info` 白名单同时含新旧名、**期间发的消息不再出现 `auth` 类失败**；再把名字改回去复验一次。过了才关 #289 的「切片 A+B1」部分（**B2 未完，#289 保持 open**）。
+**发版与部署（已完成）**：PR #297 → tag `v0.1.11`（CI 绿后打）→ release run `38582107319` → 清单 portal `imageId=4ca0875f…` / proxy `eabb763d…` 与部署机 `docker image inspect .Id` 逐个一致 → `.env` 形态① pin（备份 `/tmp/deploy.env.bak-0111`）→ `up -d --no-build` ⇒ `station-portal` 实跑 `4ca0875f…`、`/healthz` 200。**本版不动 `runner/` ⇒ 没重建 FDE 容器**（且 v0.1.10/0.1.11 的 `fde` 镜像在 ghcr 反复拉超时 ⇒ `FDE_IMAGE` 仍 pin 在 v0.1.9 摘要，见 `docs/ops/handoff-2026-10-14.md` §9）。
+**真机 A/B 双向通过**（dev，主 agent 亲手）：带外 `PATCH /model/{id}/update` 改名 → **≈55s**（一次心跳 + TTL）后 `main_model_name` 自动回写、`/key/info` 白名单变**新旧并存**、期间消息 run `830404d0…` `finished` 零错误（同场景修复前是 `code=auth` + 烧 6 轮）；把名字改回去 → 反向对账同样成立。
+⚠ **一条实测新事实**：LiteLLM 在改模型名时**自己会把 key 的 `models` 重写成「只有新名」**（改名、改回名各观测一次）⇒ 既实锤「只回写 DB 不够」，也证明我们取**并集**是对的（把 LiteLLM 摘掉的旧名兜了回来，不打断在途请求）。
+
+### 8.26 发消息路径的模型 id fail-fast（issue #289 切片 B2，2026-10-14）
+
+**为什么还要这一片**：切片 A/B1 的对账只挂在**心跳**上，而 `unknown_model_id` 在那里**只 warn**（心跳响应打给 agentd，抛错用户看不见）。当绑定里的 `model_info.id` 在网关里彻底消失（模型被删/重建 ⇒ **id 变**，名字对账救不了），用户发消息仍会正常入队，然后在 run 里跑出一个看不懂的错 ⇒ 这一片把它变成**发送时就说得清的错**。
+
+**新错误码 `llm_model_not_found`（409，`retryable=true`）**
+- 登记在 **`docs/api/portal.md` §1.2 通用错误码表**（工单里我写的「§4.1」是**对象表**、没有错误码表——worker 的纠正成立，别按 §4.1 去找）+ §4.3 发消息错误表补一行。
+- `details = { slot, model_id }`；`message` 带**槽位中文名 + 模型 id + 出路**（去管理台重新选模型）。`retryable=true` 的语义是「**管理员改配后可原样重试**」，盲目立即重试仍是同一码——这句必须写在文档行里，否则前端会做成自动重试。
+- **409 而非 424**：同端点已有 `409 llm_not_configured` / `409 run_in_progress` 同族；424 的语义是「前置**请求**失败」，这里没有前置请求，且全文无 424 先例。
+- 前端：`lib/forcePasswordErrors.ts` 的 `ERROR_CODE_KEYS` 加一条（**param-free**，别给 locale 留 `{xxx}` 残渣）+ 工作台发送失败专用文案 `errors.sendFailedLlmModelNotFound`（槽位/模型 id 取自 `error.details` 并过 `toDisplayText`），**零新增 UI 结构**。
+
+**三条不能改坏的口径**
+1. **预检位置**：`validateMessageBody` 之后、**幂等 `fn` 之内且 `sessions.postMessage` 之前** ⇒ 失败时**不写 transcript、不入队 run、不占幂等位**（`idempotency.js` 只缓存成功，`fn` 抛错走 `release`；有测试钉「失败后同 key 重试能 202」）。
+2. **三种放行**：无活绑定（`no_active_binding`，连 `/model/info` 都不打——「压根没配」是 `llm_not_configured` 的职责）/ 已配置槽位全命中 / **网关不可达 fail-open**（不能因为网关抖一下让用户发不出消息；放行必须留一条 warn）。
+3. **必须传 `ctx.llmGateway` 单例**：`model_info.id → model_name` 的 TTL 缓存是**按 client 对象身份校验的单槽缓存**（⚠ 严格说不是「每 client 一项」，worker 复核纠正了我的措辞；两个 client 交替会互相踢掉，退化成每次打 `/model/info`）。有测试钉「同一 client 连续两次发消息只打一次网关」。
+
+**已接受代价 / 边界**
+- **TTL 窗口内滞留 409**：管理员改好配后，最长 `ttlMs`（60s）内同 client 仍可能拿 409。可选修法（失败时作废该缓存条目）代价是「模型真被删时每次发消息都打一次网关」，**留给下一片拍板**。
+- 只覆盖**发消息**，不覆盖 `POST /api/sessions/:id/ai-title` 与 run 内部——同一个坏 id 在 AI 改名那条路上仍会在上游才炸（**别以为已全覆盖**）。
+- 预检**只读**：零写库、零 `updateKey`（回写仍归心跳）。
+
+**测试口径**：新文件 `portal/test/message-model-precheck.test.js` 11 条 + 前端 7 条；根 **1127 → 1138**、前端 **533 → 540**（台账三处已同步）。**主 agent 亲跑变异**：`retryable` 不透传 ⇒ 恰 1 红；传一个非单例的网关对象 ⇒ 5 红（fail-open 把 409 吃掉了 ⇒ 反证「必须传单例」这条接线被钉住）。worker 另跑 3 条：删整段预检 6 红 / 网关不可达改 fail-closed 2 红 / 预检挪到写 transcript 之后 1 红（**红在顺序红线断言**：`connected` 由 0 变 1）。
+
+**发版与部署**：`TODO(主 agent)`。真机判据：把某个 dev FDE 绑定的 `main_model_id` 改成不存在的 UUID → 发消息应得 `409 llm_model_not_found` 且**会话里没留下用户消息**；改回来 → 同一条消息 202 且 run 正常。过了才关 #289。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 

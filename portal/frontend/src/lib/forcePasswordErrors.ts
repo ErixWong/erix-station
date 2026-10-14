@@ -49,6 +49,9 @@ export const ERROR_CODE_KEYS: Readonly<Record<string, string>> = {
   method_not_allowed: 'method_not_allowed',
   rate_limited: 'rate_limited',
   kdf_busy: 'kdf_busy',
+  // 409 `llm_model_not_found`（#289 切片 B2，§1.2 / §4.3）：发消息预检把「绑定的模型 id 已不在网关里」
+  // 报成用户看得见的失败（`details` = `{slot, model_id}`，服务端 `retryable: true`）。
+  llm_model_not_found: 'llm_model_not_found',
   internal: 'internal',
 };
 

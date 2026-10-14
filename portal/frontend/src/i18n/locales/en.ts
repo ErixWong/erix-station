@@ -86,6 +86,10 @@ export const en = {
       kdf_busy: 'The server is busy (its password-derivation gate is full — one change runs scrypt twice). Your password is not the problem; try again in {seconds} seconds.',
       kdf_busy_no_retry: 'The server is busy (its password-derivation gate is full). Your password is not the problem; try again in a moment.',
       internal: 'The server failed and this change was not applied. Retry once; if it still fails, hand the error code below to an administrator verbatim.',
+      // 409 `llm_model_not_found` (#289 slice B2, §1.2 / §4.3): the bound `model_info.id` is gone from the
+      // gateway (model deleted/recreated ⇒ the id changed). Unlike `forbidden` this is not a permission
+      // problem — the thing you were bound to no longer exists. Param-free (resolveErrorCode injects none).
+      llm_model_not_found: 'The model you are bound to was deleted or recreated in the LLM gateway: re-select the model for that slot in the admin console at /admin, then retry (contact your administrator if you lack access).',
       // Unknown-code fallback: **never silently degrade to a generic error** — carry the code and the
       // HTTP status verbatim so the failure can be reported.
       unknown_code: 'Unrecognised error (HTTP {status}, code {code}). Retry once; if it still fails, hand that status and error code verbatim to an administrator.',
@@ -557,6 +561,8 @@ export const en = {
     sendFailed: 'Send failed: {message}',
     sendFailedLlmNotConfigured:
       'Send failed: this FDE has no LLM upstream configured. Set it up in the admin console at /admin (contact your administrator if you lack access)',
+    sendFailedLlmModelNotFound:
+      'Send failed: the model this FDE is bound to no longer exists in the LLM gateway (slot {slot}, model id {model_id}). Re-select the model in the admin console at /admin and send again (contact your administrator if you lack access)',
     runInProgress: ' (a run is already in progress)',
     treeLoadFailed: 'Failed to load the directory tree: {message}',
     // issue #107：inline rename — blank title blocked locally / hint when the PATCH fails (old title restored)

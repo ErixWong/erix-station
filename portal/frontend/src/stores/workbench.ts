@@ -11,7 +11,7 @@
 // SSE 协议状态在 useEventStream composable 内（M1）。
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
-import { api, ApiError, patchSessionTitle, postSessionAiTitle } from '../api';
+import { api, ApiError, patchSessionTitle, postSessionAiTitle, toDisplayText } from '../api';
 import { i18n } from '../i18n';
 import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
@@ -781,8 +781,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）。
         text: err?.code === 'llm_not_configured'
           ? t('errors.sendFailedLlmNotConfigured')
-          : t('errors.sendFailed', { message: err?.message ?? e })
-            + (err?.code === 'run_in_progress' ? t('errors.runInProgress') : ''),
+          // issue #261014 切片 B2：`llm_model_not_found`（绑定的模型 id 在网关里已不存在）给专用指引；
+          // 槽位与模型 id 取自服务端 `error.details`，一律经 `toDisplayText` 收口
+          // ⇒ 脏值（嵌套对象 / 非字符串）退化成 JSON 文本，绝不演成 `[object Object]`。
+          : err?.code === 'llm_model_not_found'
+            ? t('errors.sendFailedLlmModelNotFound', {
+              slot: toDisplayText(err.details?.slot).trim() || '-',
+              model_id: toDisplayText(err.details?.model_id).trim() || '-',
+            })
+            : t('errors.sendFailed', { message: err?.message ?? e })
+              + (err?.code === 'run_in_progress' ? t('errors.runInProgress') : ''),
       });
     }
   }
