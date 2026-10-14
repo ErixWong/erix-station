@@ -24,6 +24,33 @@ const DEFAULT_TIMEOUT_MS = Math.min(
 const MAX_TIMEOUT_MS = parseIntEnv(process.env.ERIX_SHELL_MAX_TIMEOUT_MS, 600_000, { min: 1_000, max: 3_600_000 });
 const MAX_OUTPUT_BYTES = parseIntEnv(process.env.ERIX_SHELL_OUTPUT_MAX_BYTES, 32 * 1024, { min: 1024, max: 1024 * 1024 });
 
+// issue #288（缺陷 A）：shell 子进程执行期间整个文件零 IPC ⇒ agentd 的 F6 watchdog 只看到
+// 「worker 静默」，把一条**真的在跑**的长命令当死循环杀掉（dev 真机：`sleep 360` + `timeout_ms=420000`
+// 在 300s 整被误杀 → requeue → **同一条命令再跑一遍**，attempt 3 次耗尽后用户只看到
+// 「没有原因的 attempts exhausted」）。执行期保活就是这条防线：命令还活着，worker 就周期性冒个泡。
+// 默认 30s（工单红线「≤60s」），env `ERIX_SHELL_LIVENESS_MS` 可下调但**钳到 ≤60s**——
+// 放宽到 60s 以上会让保活失去意义（watchdog 默认 300s，一次心跳丢失还剩两次机会）。
+const LIVENESS_HEARTBEAT_MS = Math.min(
+  parseIntEnv(process.env.ERIX_SHELL_LIVENESS_MS, 30_000, { min: 1_000, max: 60_000 }),
+  60_000,
+);
+
+/**
+ * shell 超时上限（issue #288 启动不变式用）：agentd 启动时拿它和 watchdog 阈值比较，
+ * 所以必须与 `MAX_TIMEOUT_MS` 同源同口径（同一个 `parseIntEnv`、同一套钳制边界）。
+ * 不直接把 `MAX_TIMEOUT_MS` 导出成常量：那只在**模块首次 import** 时按当时的 env 算一次，
+ * 单测（以及任何「先 import 后改 env」的调用方）拿到的会是过期值；函数形态可注入 env。
+ * @param {Record<string,string|undefined>} [env]
+ */
+export function resolveShellMaxTimeoutMs(env = process.env) {
+  return parseIntEnv(env.ERIX_SHELL_MAX_TIMEOUT_MS, 600_000, { min: 1_000, max: 3_600_000 });
+}
+
+/** 执行期保活间隔（同上：函数形态便于单测注入与断言 ≤60s 红线）。 */
+export function resolveShellLivenessIntervalMs(env = process.env) {
+  return Math.min(parseIntEnv(env.ERIX_SHELL_LIVENESS_MS, 30_000, { min: 1_000, max: 60_000 }), 60_000);
+}
+
 function parseIntEnv(raw, defaultValue, { min, max }) {
   const n = Number(raw);
   if (raw === undefined || raw === null || raw === '' || !Number.isInteger(n) || n < min || n > max) {
@@ -122,9 +149,16 @@ function abortFailure(signal, capturedBytes) {
  * abort 时：① 进进程组 SIGKILL；② 清超时定时器（不留一个已无意义的 60s~3600s 定时器）；
  * ③ 摘 abort 监听（防长 run 多次调用在下行 signal 上越积越多监听）；
  * ④ 等 child 'close' 才 reject——保证「promise 落定 = 子进程真没了」，不在报告里留下孤儿。
+ *
+ * issue #288（缺陷 A + D）：可选 `emitLiveness`/`heartbeatIntervalMs`。spawn 后、close/error 前，
+ * 以 `heartbeatIntervalMs` 为间隔发 `heartbeat`；`spawn` / `exit` 各发一条（携带 pgid）。
+ * **三者都不影响工具返回正文**（`formatResult` 一行未改），也不进事件通道。
+ *
+ * @param {{command:string, workDir:string, timeoutMs:number, signal?:AbortSignal,
+ *   emitLiveness?:Function, heartbeatIntervalMs?:number}} options
  * @returns {Promise<string>} 格式化文本：exit_code/duration_ms/truncated 头 + 输出体；中止则 reject(AbortError)。
  */
-function runCommand({ command, workDir, timeoutMs, signal }) {
+function runCommand({ command, workDir, timeoutMs, signal, emitLiveness = null, heartbeatIntervalMs = 0 }) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     // 已中止（或 abort 比 spawn 更早）：直接不 spawn，免得杀一个刚出生的进程。
@@ -146,6 +180,29 @@ function runCommand({ command, workDir, timeoutMs, signal }) {
       }));
       return;
     }
+
+    // --- issue #288：执行期保活 + 子进程组登记 -------------------------------------------
+    // `detached: true` 使子命令**自成一个进程组**，组 id = child.pid（POSIX setsid 语义）。
+    // 该 pgid 同时服务两件事：① 本文件自己的超时/中止走 `process.kill(-pgid)`；
+    // ② 报给 agentd，让它在杀 worker 组**之后**补杀这些「不在 worker 组里」的子孙（缺陷 D）。
+    const pgid = child.pid;
+    const livenessEnabled = typeof emitLiveness === 'function' && Number.isFinite(pgid);
+    const emit = (phase, extra = {}) => {
+      if (!livenessEnabled) return;
+      emitLiveness({ phase, pgid, command, elapsed_ms: Date.now() - startedAt, ...extra });
+    };
+    emit('spawn');
+    let heartbeatTimer = null;
+    if (livenessEnabled && heartbeatIntervalMs > 0) {
+      heartbeatTimer = setInterval(() => emit('heartbeat'), heartbeatIntervalMs);
+      // ⚠ unref：保活定时器不得拖住事件循环——否则一条已收尾的命令能让 worker 多活一个间隔，
+      // 与 `shell：abort 后不留存活定时器` 那条既有口径相冲。
+      heartbeatTimer.unref?.();
+    }
+    const stopLiveness = () => {
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      emit('exit');
+    };
 
     const stdoutChunks = [];
     const stderrChunks = [];
@@ -177,6 +234,7 @@ function runCommand({ command, workDir, timeoutMs, signal }) {
       // spawn 失败（bash 不存在等）：error 后无 exit/close，这里直接收尾。
       clearTimeout(timer);
       removeAbortListener();
+      stopLiveness();
       if (aborted) {
         reject(abortFailure(signal, 0));
         return;
@@ -193,6 +251,7 @@ function runCommand({ command, workDir, timeoutMs, signal }) {
     child.on('close', (code) => {
       clearTimeout(timer);
       removeAbortListener();
+      stopLiveness();
       // stdout/stderr 各自累计后拼接。
       const combined = Buffer.concat([...stdoutChunks, ...stderrChunks]);
       // 中止优先于超时/退出码：命令是被宿主叫停的，不是一条「跑完了的命令」，
@@ -218,13 +277,29 @@ function runCommand({ command, workDir, timeoutMs, signal }) {
 
 /**
  * 创建 shell 工具（结构与 file-tools.js 同构：{schemas, executors}，worker.js 直接并入 registry）。
- * @param {{worktreeRoot:string}} options worktree 绝对根路径（RUN_START.cwd）。
+ * @param {{worktreeRoot:string, liveness?:{heartbeatIntervalMs?:number, onEvent?:(ev:object)=>void}}} options
+ *   worktreeRoot = 项目目录绝对路径（RUN_START.cwd）；
+ *   liveness = 执行期保活钩子（issue #288 缺陷 A/D），**不传时零行为变化**（单测/旧调用方路径不变）：
+ *     `onEvent({phase:'spawn'|'heartbeat'|'exit', pgid, command, elapsed_ms})` —— worker 侧把它翻成
+ *     一条 `shell_liveness` IPC（宿主内部信号，**不是** run_events/U3 事件）。
  * @returns {{schemas:object[], executors:Record<string, Function>}}
  */
-export function createShellTools({ worktreeRoot }) {
+export function createShellTools({ worktreeRoot, liveness = null }) {
   if (typeof worktreeRoot !== 'string' || worktreeRoot.length === 0) {
     throw new TypeError('createShellTools: worktreeRoot must be a non-empty string');
   }
+  const heartbeatIntervalMs = Number.isFinite(liveness?.heartbeatIntervalMs) && liveness.heartbeatIntervalMs > 0
+    ? liveness.heartbeatIntervalMs
+    : resolveShellLivenessIntervalMs();
+  const emitLiveness = (event) => {
+    if (typeof liveness?.onEvent !== 'function') return;
+    try {
+      liveness.onEvent(event);
+    } catch {
+      // 保活是**附属信号**：它的投递失败绝不能反过来弄挂工具调用（IPC 通道关时 sendIpc 已是 false，
+      // 真出现丢失的后果只是「下一次 watchdog 可能误杀」，而不是「本条命令失败」）。
+    }
+  };
   // realpath 一次定根；cwd 参数只做词法 resolve + isWithin（shell 有意越笼，不做 realpath 防御）。
   const root = fs.realpathSync(path.resolve(worktreeRoot));
 
@@ -237,7 +312,9 @@ export function createShellTools({ worktreeRoot }) {
     }
     const workDir = resolveWorkDir(root, cwd);
     const timeout = normalizeTimeoutMs(timeoutMs);
-    return runCommand({ command, workDir, timeoutMs: timeout, signal: context?.signal });
+    return runCommand({
+      command, workDir, timeoutMs: timeout, signal: context?.signal, emitLiveness, heartbeatIntervalMs,
+    });
   }
 
   return {

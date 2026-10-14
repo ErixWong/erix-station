@@ -25,6 +25,8 @@ import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
 import { archiveRunData, prepareRunDataDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
+// issue #288 启动不变式：只取 shell 超时上限的**解析口径**（与 worker 侧同源），不引入 shell 执行本身。
+import { resolveShellMaxTimeoutMs } from './lib/shell-tools.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(__dirname, 'worker.js');
@@ -120,6 +122,14 @@ function makeRunCtx(runId) {
     // F6：最后一次 IPC 活动（watchdog 用）。D8 修订（2026-09-24）：cwd = 项目目录，无 worktree 清理路径。
     lastIpcAt: Date.now(),
     projectDir: null,
+    // issue #288（缺陷 D）：本次 attempt 内 worker 报上来的 shell 子进程组 id（pgid = child.pid，
+    // 源于 `spawn(..., {detached:true})` 使子命令自成进程组）。**不在 worker 的进程组里**，
+    // 所以 watchdog/abort 的 `-workerPid` 组杀不到它们（dev 真机实测：第一次 kill 后同时存在
+    // attempt 1 的孤儿 `bash -c sleep 360` 与 attempt 2 新起的）⇒ 每一条终止路径补杀整组。
+    // Set 而非单值：同一次 attempt 内可以多次 shell 调用（并发/串行都有）。随 attempt 结束清空。
+    shellPgids: new Set(),
+    // issue #288（缺陷 B）：本 attempt 的死因（watchdog 写入）；null = 还没杀过。
+    killReport: null,
   };
 }
 
@@ -775,9 +785,147 @@ async function reportTerminalAfterDrop(ctx) {
 // abort（§6.4/§6.5）：SIGTERM worker，标记丢弃
 // ---------------------------------------------------------------------------
 // M2：杀整个进程组（worker 以 detached fork 创建，负 pid = 组）；回退单 pid。
-function killProcessGroup(pid, sig) {
-  try { process.kill(-pid, sig); return; } catch {}
-  try { process.kill(pid, sig); } catch {}
+// issue #288：`kill` 可注入（watchdog 单测要「先杀 -workerPid、再杀登记的每个 -pgid」的**真实顺序**，
+// 只靠真进程做不到确定性观测）；缺省仍是 `process.kill`，既有调用点（drain / abort / cleanup）行为不变。
+const defaultProcessKill = (pid, sig) => { process.kill(pid, sig); };
+
+function killProcessGroup(pid, sig, kill = defaultProcessKill) {
+  try { kill(-pid, sig); return; } catch {}
+  try { kill(pid, sig); } catch {}
+}
+
+/**
+ * issue #288（缺陷 D）：补杀本 attempt 内 worker 报上来的**全部 shell 子进程组**。
+ *
+ * 为什么需要：`runner/lib/shell-tools.js:138` 用 `spawn(..., {detached:true})`，子命令因此
+ * **自成一个进程组**，不是 worker 组的成员 ⇒ `killProcessGroup(workerPid)` 杀不到它。
+ * dev 真机（run `e480a06f…`）：第一次 watchdog kill 后同时存在 attempt 1 的孤儿 `bash -c sleep 360`
+ * （etime 05:46）与 attempt 2 新起的（etime 00:18）；`sleep` 自己会退出所以相安无事，
+ * **常驻服务命令会跨 attempt 无限累加**。
+ *
+ * 为什么不能放在 worker 侧 `process.on('exit')`：watchdog 用的是 **SIGKILL**，worker 没机会跑任何
+ * handler（该前提由 `runner/test/shell-liveness.test.js` 的真进程用例钉住）。
+ *
+ * @param {{runId:string, shellPgids?:Set<number>}} ctx
+ * @param {{kill?:(pid:number,sig:string)=>void, log?:(level:string,msg:string,extra?:object)=>void}} [deps]
+ * @returns {number[]} 实际发了信号的 pgid 列表（已清空登记集，重复调用为空）
+ */
+function killShellChildGroups(ctx, { kill = defaultProcessKill, logImpl = log } = {}) {
+  const pgids = [...(ctx.shellPgids ?? [])];
+  if (pgids.length === 0) return [];
+  // 先清空再杀：同一次终止会在多条路径上过（watchdog kill → onWorkerExit → cleanupRun），
+  // 登记集只能被消费一次；杀不掉的（ESRCH=自然退出）也不需要重试。
+  ctx.shellPgids = new Set();
+  const killed = [];
+  for (const pgid of pgids) {
+    try {
+      kill(-pgid, 'SIGKILL');
+      killed.push(pgid);
+    } catch (err) {
+      // ESRCH = 组已自然退出（竞态，正常）；其它失败也不能阻断终止流程，但要留痕。
+      logImpl('warn', 'shell child group kill failed (ignored)', {
+        run_id: ctx.runId, pgid, code: err?.code ?? null, msg: String(err?.message ?? err),
+      });
+    }
+  }
+  if (killed.length > 0) {
+    logImpl('warn', 'orphan shell child groups killed', { run_id: ctx.runId, pgids: killed, count: killed.length });
+  }
+  return killed;
+}
+
+/**
+ * `shell_liveness` 消息的宿主侧账本（issue #288 缺陷 A + D）。**不是**事件通道：绝不进
+ * `enqueueEvent`（⇒ 不产生 U3/run_events 行，模型与前端都看不见它），只刷活动戳 + 记 pgid。
+ * @param {object} ctx RunCtx
+ * @param {{phase?:string, pgid?:number, command?:string}} msg
+ * @param {{now?:()=>number, log?:(level:string,msg:string,extra?:object)=>void}} [deps]
+ * @returns {'spawn'|'exit'|'heartbeat'|'ignored'} 记账结果（`ignored` = 字段不合法，已丢）
+ */
+function applyShellLiveness(ctx, msg, { now = Date.now, logImpl = log } = {}) {
+  const phase = msg?.phase;
+  if (phase !== 'spawn' && phase !== 'exit' && phase !== 'heartbeat') return 'ignored';
+  // 保活的承重动作就是这一行：心跳到达 ⇒ watchdog 的静默计时归零。
+  ctx.lastIpcAt = now();
+  if (phase === 'heartbeat') {
+    logImpl('debug', 'shell liveness heartbeat', { run_id: ctx.runId, pgid: msg.pgid ?? null, silent_ms: 0 });
+    return 'heartbeat';
+  }
+  const pgid = Number(msg.pgid);
+  if (!Number.isInteger(pgid) || pgid <= 0) {
+    logImpl('warn', 'shell liveness without usable pgid', { run_id: ctx.runId, phase, pgid: msg.pgid ?? null });
+    return 'ignored';
+  }
+  if (!ctx.shellPgids) ctx.shellPgids = new Set();
+  if (phase === 'spawn') ctx.shellPgids.add(pgid);
+  else ctx.shellPgids.delete(pgid);
+  logImpl('debug', 'shell child group registered', {
+    run_id: ctx.runId, phase, pgid, pending: ctx.shellPgids.size, command: typeof msg.command === 'string' ? msg.command.slice(0, 120) : undefined,
+  });
+  return phase;
+}
+
+/**
+ * F6 watchdog 单轮巡检（从 heartbeatLoop 里抽出：「谁被杀、按什么顺序杀」必须可被单测确定性驱动）。
+ * 行为与抽出前逐字一致：跳过无 worker / 正在收尾的 ctx → 刷 run 数据目录活动戳 → 静默超阈值则
+ * **先 SIGKILL worker 组，再补杀登记的 shell 子进程组**（issue #288 缺陷 D 的顺序红线）。
+ * @returns {Array<{run_id:string, silent_ms:number}>} 本轮判死的 run
+ */
+function sweepWatchdog({
+  runs = state.runs.values(),
+  now = Date.now(),
+  watchdogMs = CFG.watchdogMs,
+  kill = defaultProcessKill,
+  refreshActivity = (ctx) => touchRunDataDir(CFG.home, ctx.runId),
+  logImpl = log,
+} = {}) {
+  const killedRuns = [];
+  for (const ctx of runs) {
+    if (!ctx.worker || ctx.finishing) continue;
+    try {
+      refreshActivity(ctx);
+    } catch (err) {
+      logImpl('warn', 'run data activity refresh failed', { run_id: ctx.runId, err: String(err?.message ?? err) });
+    }
+    const silentMs = now - ctx.lastIpcAt;
+    if (silentMs > watchdogMs) {
+      logImpl('warn', 'watchdog: worker silent, killing', {
+        run_id: ctx.runId, silent_ms: silentMs, threshold_ms: watchdogMs });
+      // issue #288（缺陷 B）：记下「怎么死的」，供随后真正发生在 `onWorkerExit` 里的 release 上报
+      // （watchdog 只负责杀，release 在 worker 退出之后，两者不同帧）。
+      ctx.killReport = { killed_by: 'watchdog', silent_ms: silentMs };
+      if (ctx.workerPid) killProcessGroup(ctx.workerPid, 'SIGKILL', kill);
+      // 顺序：worker 组先走，否则 shell 子进程还能被活着的 worker 自己收一轮。
+      killShellChildGroups(ctx, { kill, logImpl });
+      killedRuns.push({ run_id: ctx.runId, silent_ms: silentMs });
+    }
+  }
+  return killedRuns;
+}
+
+/**
+ * issue #288 启动不变式：`watchdogMs < shell 超时上限` 时打一条 **warn**，点名本容器对
+ * 「shell 执行期心跳保活」的依赖（心跳通道失效时仍会误杀）并打印两个数值。
+ * ⚠ **故意不自动抬高 watchdogMs**：抬高会同时拖长「worker 真死」的发现时间（F6 watchdog 的存在理由），
+ * 拿一个洞换另一个洞。默认形态（300s / 600s）就落在这条 warn 上——那是设计内的常态，不是故障。
+ * @returns {boolean} 是否打了 warn
+ */
+function warnIfWatchdogBelowShellMax({
+  watchdogMs = CFG.watchdogMs,
+  shellMaxTimeoutMs = resolveShellMaxTimeoutMs(),
+  logImpl = log,
+} = {}) {
+  if (watchdogMs >= shellMaxTimeoutMs) return false;
+  logImpl('warn', 'watchdog threshold below shell max timeout: shell liveness heartbeat is the only guard', {
+    watchdog_ms: watchdogMs,
+    shell_max_timeout_ms: shellMaxTimeoutMs,
+    hint: '长命令（shell 工具 timeout_ms 可到 shell_max_timeout_ms）执行期零引擎 IPC，'
+      + '不误杀全靠 worker 侧 shell 心跳保活（runner/lib/shell-tools.js → agentd `shell_liveness`）；'
+      + '心跳通道失效（worker 被 SIGSTOP / IPC 通道死）时仍会误杀并 requeue。'
+      + '要么抬 ERIX_AGENTD_WATCHDOG_MS ≥ ERIX_SHELL_MAX_TIMEOUT_MS（代价：worker 真死发现得更慢），'
+      + '要么降 ERIX_SHELL_MAX_TIMEOUT_MS。',
+  });
+  return true;
 }
 
 function abortRun(ctx, reason) {
@@ -791,8 +939,15 @@ function abortRun(ctx, reason) {
     setTimeout(() => {
       // 审计 #36-4：只在「仍是同一个在跑的 worker」时强杀——5s 后 pid 可能已被 OS 回收复用给无关进程。
       // 退出时 onWorkerExit 置 ctx.workerPid = null，cleanupRun 使 ctx 离开 state.runs → 两个条件都不成立。
-      if (pid && ctx.workerPid === pid && state.runs.get(ctx.runId) === ctx) killProcessGroup(pid, 'SIGKILL');
+      if (pid && ctx.workerPid === pid && state.runs.get(ctx.runId) === ctx) {
+        killProcessGroup(pid, 'SIGKILL');
+        // issue #288 缺陷 D：worker 组里没有 shell 子命令（detached 自成一族），跟着补一刀。
+        killShellChildGroups(ctx);
+      }
     }, 5000);
+  } else {
+    // 无 IPC 通道（worker 已退出或从未连上）：没有宽限可等，登记过的 shell 组当场就成孤儿。
+    killShellChildGroups(ctx);
   }
   log('info', 'abort run', { run_id: ctx.runId, reason });
 }
@@ -878,6 +1033,15 @@ function onWorkerMessage(ctx, runStart, msg) {
     case MSG.LOG:
       log('info', 'worker log', { run_id: ctx.runId, level: msg.level, msg: msg.msg });
       break;
+    case MSG.SHELL_LIVENESS: {
+      // issue #288（缺陷 A + D）：shell 执行期保活 + 子进程组登记。
+      // ⚠ 上面已统一刷过 `ctx.lastIpcAt = Date.now()`（任意 IPC 都算 worker 活着），
+      // 保活的「刷活动戳」一半是免费的；这里只负责另一半（pgid 账本）。applyShellLiveness 自己
+      // 也会刷一次（单测直接驱动它时不能依赖调用点），两次赋值同义、幂等。
+      // **本分支绝不往事件队列里塞东西**：它是宿主内部信号，不是 run_events/U3 事件。
+      if (msg.run_id === ctx.runId) applyShellLiveness(ctx, msg);
+      break;
+    }
     default:
       break;
   }
@@ -908,7 +1072,11 @@ function onWorkerExit(ctx, code, signal) {
   // 非预期退出且未终态 → release + 重新认领（§6.4 worker 崩溃）。
   if (!ctx.finishing && (code !== 0 || signal)) {
     log('warn', 'worker crashed', { run_id: ctx.runId, code, signal });
-    releaseAndRequeue(ctx, 'worker_crashed');
+    // issue #288（缺陷 B）：被 watchdog 杀掉的也走这条 exit 路（SIGKILL ⇒ 非零退出），**不得**仍按
+    // 「worker 自己崩了」上报，否则用户看到的仍是一个误诊的理由。portal 捨 killed_by 写 attempt_killed。
+    const report = ctx.killReport ?? { killed_by: 'crash' };
+    const reason = report.killed_by === 'watchdog' ? 'watchdog_silent' : 'worker_crashed';
+    releaseAndRequeue(ctx, reason, report);
   }
 }
 
@@ -998,8 +1166,13 @@ function cleanupRun(ctx, { archiveRunData: shouldArchive = false } = {}) {
       // 条件永假 → 强杀失效）。正确判据 = worker 仍未退出（onWorkerExit 会把 workerPid 置 null）。
       setTimeout(() => {
         if (pid && ctx.workerPid === pid) killProcessGroup(pid, 'SIGKILL');
+        // issue #288 缺陷 D：组杀不到 detached 的 shell 子命令，补一刀（登记集已消费过则空操作）。
+        killShellChildGroups(ctx);
       }, 2000);
     }
+  } else {
+    // worker 已退出：还挂在登记集里的就是孤儿（worker 被 SIGKILL 时没机会自己收），当场补杀。
+    killShellChildGroups(ctx);
   }
   // issue #46 + #64 R1 配套：run 数据目录仅在终态清理（archiveRunData=true，onWorkerFinished 收敛成功后）
   // **归档**（runs/ → runs-archive/，conversation-state.md §5 P1 真相层归档 TTL 替代物理删除）；
@@ -1014,9 +1187,17 @@ function cleanupRun(ctx, { archiveRunData: shouldArchive = false } = {}) {
 // 工作区（D8 修订后 = 项目目录，用户资产不删）生命周期完全解耦；终态确认后归档（runs-archive/），
 // 启动 sweep 双扫描（runs/ 残留 TTL + runs-archive/ 归档 TTL，race 推导见该文件头注释）。
 
-async function releaseAndRequeue(ctx, reason) {
+async function releaseAndRequeue(ctx, reason, killReport = null) {
+  // issue #288（缺陷 B）：additive 上报「本 attempt 是怎么死的」，portal 同事务写 attempt_killed。
+  // 无 killReport（fork_failed / prepare_cwd_failed / run_data_failed）⇒ **一个额外字段都不发**，
+  // portal 也不写事件（「无 kill 时零事件」两面都得成立）。
+  // next_retry_in_ms 本站**故意不发**：下一次 attempt 由同一容器的 claim 循环立即接走，没有固定
+  // 延迟可报，拿 0 冒充「立即」就是伪装（portal 侧支持该键，有则写）。
+  const body = { reason };
+  if (killReport?.killed_by) body.killed_by = killReport.killed_by;
+  if (Number.isFinite(killReport?.silent_ms)) body.silent_ms = killReport.silent_ms;
   try {
-    const r = await internalRequest('POST', `/runs/${ctx.runId}/release`, { body: { reason }, claimToken: ctx.claimToken });
+    const r = await internalRequest('POST', `/runs/${ctx.runId}/release`, { body, claimToken: ctx.claimToken });
     log('info', 'release run', { run_id: ctx.runId, reason, outcome: r.data?.outcome });
   } catch (err) {
     log('warn', 'release failed', { run_id: ctx.runId, code: err?.code, msg: String(err?.message ?? err) });
@@ -1148,21 +1329,8 @@ async function heartbeatLoop() {
     await sleep(CFG.heartbeatMs);
     // F6：watchdog——worker 长时间无任何 IPC（SIGSTOP/死循环/管道卡死）→ SIGKILL 整组，
     // exit 路径会 releaseAndRequeue（attempt+1、resume）。阈值远大于正常 LLM 等待。
-    const now = Date.now();
-    for (const ctx of state.runs.values()) {
-      if (!ctx.worker || ctx.finishing) continue;
-      try {
-        touchRunDataDir(CFG.home, ctx.runId);
-      } catch (err) {
-        log('warn', 'run data activity refresh failed', { run_id: ctx.runId, err: String(err?.message ?? err) });
-      }
-      const silentMs = now - ctx.lastIpcAt;
-      if (silentMs > CFG.watchdogMs) {
-        log('warn', 'watchdog: worker silent, killing', {
-          run_id: ctx.runId, silent_ms: silentMs, threshold_ms: CFG.watchdogMs });
-        if (ctx.workerPid) killProcessGroup(ctx.workerPid, 'SIGKILL');
-      }
-    }
+    // issue #288：巡检本体已抽成 sweepWatchdog（可注入 kill，单测能钉「先 worker 组后 shell 组」的顺序）。
+    sweepWatchdog({ now: Date.now() });
     try {
       const data = await heartbeatOnce();
       touchHbOk(); // M5：心跳成功 → 刷新健康标记（healthcheck.sh 读 mtime）
@@ -1223,11 +1391,16 @@ function shutdown() {
   // 兜底 15s > drain 的 5s + kill grace 2s。tini 仍会 reap 孤儿进程。
   const hardExit = setTimeout(() => {
     log('warn', 'shutdown hard exit (drain did not finish)');
+    // issue #288 缺陷 D：process.exit 之后没人再跑 drain/cleanup，孤儿 shell 组必须在这里先杀完。
+    for (const c of ctxs) killShellChildGroups(c);
     process.exit(0);
   }, 15000);
   void drainRuns(ctxs, { deadlineMs: 5000, kill: killProcessGroup, log: (m, e) => log('warn', m, e) })
     .then((r) => {
       log('info', 'shutdown drain done', { drained: r.drained, pending: r.pending });
+      // issue #288 缺陷 D：drain 的 kill 只能杀 worker 组；pending（SIGKILL 都杀不掉的 D 态 worker）
+      // 场景下 onWorkerExit 跑不到 ⇒ cleanupRun 也跑不到 ⇒ 这里兼底。
+      for (const c of ctxs) killShellChildGroups(c);
       return drainPendingReports(); // 同上：drain 期间才产生的新补报
     })
     .finally(() => { clearTimeout(hardExit); process.exit(0); });
@@ -1246,6 +1419,8 @@ async function main() {
   // agentd 建项目目录、fork worker（继承 umask）的文件都需跨 UID（1001/1002）组可写。
   process.umask(0o002);
   log('info', 'agentd starting', { base: CFG.baseUrl, capacity: CFG.capacity, worker_uid: CFG.workerUid });
+  // issue #288 启动不变式：watchdog 阈值 < shell 超时上限 ⇒ 长命令的存活全靠 shell 心跳保活，打 warn 点名。
+  warnIfWatchdogBelowShellMax();
 
   // issue #46 + #64 R1 配套：清扫上次运行残留的 run 数据目录（终态归档失败/异常退出遗留）与
   // 超归档 TTL 的 runs-archive/ 目录。必须在 claimLoop 之前调用；只删 mtime 超过保留期的目录
@@ -1306,4 +1481,6 @@ if (isDirectRun) {
 export {
   onWorkerFinished, onWorkerExit, initialHeartbeatGate, state, handleStoreRequest,
   resolveRunCwd, buildWorkerEnv, CFG as testConfig,
+  // issue #288：watchdog 巡检 / shell 子进程组账本 / 启动不变式，均为**单测可见面**（非对外契约）。
+  sweepWatchdog, killShellChildGroups, applyShellLiveness, warnIfWatchdogBelowShellMax, makeRunCtx,
 };

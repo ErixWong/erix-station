@@ -11,6 +11,15 @@ export const MSG = {
   APPROVAL_REQUEST: 'approval_request',
   RUN_FINISHED: 'run_finished',
   LOG: 'log',
+  /**
+   * issue #288（缺陷 A + D）：shell 子进程执行期信号。**宿主内部信号，不是 run_events/U3 事件**
+   * （agentd 侧只刷 `lastIpcAt` + 记账 pgid，最多 `log('debug', …)`，绝不入事件队列）。
+   * `{ run_id, phase: 'spawn'|'heartbeat'|'exit', pgid, command }`：
+   *   - `spawn` / `exit`：子命令自成进程组（`detached:true` ⇒ pgid = child.pid），agentd 登记/销登记，
+   *     在每一条 worker 终止路径上 SIGKILL worker 组**之后**再逐个 `-pgid` 补杀（缺陷 D）。
+   *   - `heartbeat`：命令在跑但零 IPC 期间的保活心跳（缺陷 A），任意 IPC 天然刷 `lastIpcAt`。
+   */
+  SHELL_LIVENESS: 'shell_liveness',
   // agentd → worker
   RUN_START: 'run_start',
   STORE_RESPONSE: 'store_response',
