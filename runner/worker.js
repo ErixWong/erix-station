@@ -222,6 +222,26 @@ export function loopEventPayload(event) {
         stop_reason: event.stopReason ?? null,
         usage: event.usage ?? null,
       };
+    case 'tool_replay_decision_required': {
+      // issue #288（缺陷 C）：崩溃恢复时挂起工具**没被重放**（引擎 `orchestrator.js:2605-2614` 发出）。
+      // 字段名以**引擎事件对象的实际形状**为准（0.18.0 `:2606-2613` 逐字核过）：
+      //   `{ type, runId, round, toolUseId, toolName, replay, requiresHostDecision, partialOutputAvailable }`
+      // ——引擎只给这几个，**没有** `input` / `command` / `duration`，不要在这里臆造默认值补位。
+      // ⚠ `event.runId` 是**引擎 store key = transcriptKey = sessionId**（worker.js 传 `runId: transcriptKey`，
+      //   issue #81 P2），**不是** station 的 run id。落名 `engine_run_id` 而不是 `run_id`：U3 行本身的
+      //   `run_id` 列已是 station 口径（`makeEvent`/`enqueueEvent`），再塞一个同名不同义的字段就是坑。
+      // 布尔位一律 `=== true` 归一：引擎给的是真布尔，但 additive 字段面对脏值（旧数据/手工注入）
+      // 得退到 false 而不是把 `undefined`/对象透到下游。
+      return {
+        tool_call_id: event.toolUseId ?? null,
+        engine_run_id: event.runId ?? null,
+        round: event.round,
+        name: event.toolName ?? null,
+        replay: typeof event.replay === 'string' ? event.replay : null,
+        requires_host_decision: event.requiresHostDecision === true,
+        partial_output_available: event.partialOutputAvailable === true,
+      };
+    }
     default:
       return event ?? {};
   }
@@ -446,6 +466,28 @@ async function startRun(msg) {
       // 不需重建镜像（provisioner 注入，docs/env.md 登记）。
       maxRounds: parseMaxRounds(process.env.ERIX_MAX_ROUNDS),
       stream: true,
+      // issue #288（缺陷 C）：崩溃恢复时**不再盲目重放**挂起工具 —— 交给引擎 0.18.0 已有的能力，
+      // 本站只是接线。真机标本：一条 `sleep 360` 的 shell 被 watchdog 杀掉后，resume 把**同一个
+      // `tool_use` 从头再执行一遍**（`run_events` 里同 `call_id` 出现 3 条 `tool_use`）——非幂等命令
+      // （kill 旧进程、重启 backend/vite、重跑测试）每轮真的再掀一次桌。
+      // 引擎读点（erix-agent **0.18.0**，已逐个核过行号）：
+      //   - `loop/orchestrator.js:425` 选项文档；`:558` **默认 `"always-replay"`**（= 本站原来的行为）；
+      //     `:634-635` 取值校验（只认两个字面量，写错就 TypeError，不会静默退化）。
+      //   - `:2565-2620` resume 分支：`:2571` 门 `replayPolicy === "per-tool-declaration" && resumePendingTool.replay !== "safe"`
+      //     ⇒ **不调 executor**，合成一条 `is_error: true` + `executionStatus: "interrupted"` 的 tool_result
+      //     （:2586-2597，正文带已捕获的部分输出），并发 `tool_replay_decision_required`
+      //     （:2605-2614，`requiresHostDecision: true`）；**引擎自己不重试**，是否重跑交给模型。
+      //   - `replay` 的值从哪来：`resume-manager.js:256-264` 把 `run snapshot.pendingToolUses` 灌进
+      //     `resumePendingTools`，而条目上的 `replay` 是崩溃**当时**由 `:1783-1786` `withReplayDeclaration`
+      //     按 `:1770-1782` 解析后盖上去的（源头 = 工具定义顶层 `replay` 键，见 lib/shell-tools.js）。
+      // ⚠ 「撤销一条已记录的旧决定」只能改这里，改工具定义不够：`:1775-1777` 规定**快照里已记的
+      //   `replay` 值优先于当前工具定义**（「恢复用当初的意图」是上游故意设计）。所以将来若把某个
+      //   工具改成 `replay: "safe"`，**存量挂起快照仍按旧值不重放**；要翻案就得同时换本选项或清空快照。
+      // 代价（刻意的保守）：上游 0.18.0 `createFileTools` **未给任何工具标 replay**（`src/tools/*.js`
+      // grep `replay:` 零命中），而 `:1781` 的判据是 `=== "safe"` ⇒ **未标注也算非 safe**，
+      // 5 个文件工具挂起时同样不重放（写文件是幂等的，少跑一次比多跑一次安全，模型可自行重试）。
+      // 口径钉在 runner/test/replay-policy.test.js；详细边界见 AGENTS §8.22。
+      replayPolicy: 'per-tool-declaration',
       // 8) reflection / wrapup 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
       // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
       // nearLimit 时可 extend 扩轮；judgeIntercept 默认开（工具透明审计）。judge 输出非法
