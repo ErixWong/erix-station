@@ -481,8 +481,28 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **已接受代价 / 遗留**：① 四台既有 FDE 容器仍在 v0.1.5 runner 镜像（`ensureFdeContainer` 不检测镜像漂移；runner 逻辑本轮零改动，下次 `docker rm -f` + reconcile 自然升级）；② **#279 不进本版**（dev 数据面 0 复现，完整修法要动 runner ⇒ FDE 重建；判据 SQL 已贴 issue，等决策者在自己部署上跑）；③ **#281**（`WorkbenchView.onMounted` 两个 `await` 无 catch、`workbench.ts:691` 可读 `undefined.cwd`）是新登记的**既有**产品缺口，不在本版；④ `#277` 真机排队支路未跑；⑤ dev 栈遗留测试用户 `pw17*` / `ui17*`（口令是探针里写的一次性口令，非 dev 管理员口令）。
 
-### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
+### 8.21 v0.1.8：#285 告知第 8 条（报「服务已起」必须给完整 URL）+ #283 工具时长不再恒显 0s（2026-10-14，PR #287 / #290）
 
+**载荷**（自 v0.1.7）：① **#285** 告知面加「第 8 条」（PR #287）——`~/AGENTS.md` 预览访问节**新增第 8 条**（节标题「必须满足这 7 条」→「8 条」）：服务起着且预览路由已建时，报「已起/可访问/已完成」**不得只给 `localhost:端口` 或裸 host**，必须同时给该端口对应条目的**完整预览 URL**（取 `ports.json` 的 `url`，以 **markdown 链接**给出、可点），多 host 项目逐 host 各给一条，**逐 host 规则回指第 6 条**；第 8 条**不进「错误形态对照」表**（它是告知义务不是故障形态）。`runner/worker.js` 的 `SYSTEM_PROMPT` 只加一句强制指针（**8 条一条也没拄进提示词**，单一真相仍在 `~/AGENTS.md`；双向防漂移的 `RULE_WORDS` 禁词集 **6→8**，新增 `打开预览` / `markdown 链接`）。② **#283** 工具时长（PR #290）——三层各有一个洞：装配层让引擎写 duration（新 `runner/lib/tool-duration.js` + `executeTool` 出口包装）+ U3 回填 `tool_calls.duration_ms`/`result_digest`（UPDATE-only，**零 DDL**）+ 对话流 DTO 在投影**之后** join 宿主 `durationMs`；前端删两处 `?? 0` + 新增 `formatDuration`（`Nms`/`X.Ys`/`Xm Ys`）。
+
+**⚠ #283 的根因更正（原单正文给的修法是空转，值得记一条）**：原单说「runner 读错层级、应读 `tool_result.metadata.duration`」——**否证**：引擎 `run-snapshot-executor.js:329-333` 把 `execution.metadata` 摊平到 `tool_result` **顶层**，宿主读顶层 `tr.duration` 是**正确读点**（上游 `host-upgrade-guide-0.17.0.md:114-117` 也是这么要求的）。真缺陷：引擎**只在 executor 返回结构化结果时**才写 duration（`:102`/`:119` 写；`:111` string/number/裸对象、`:80-86` 返回 Error、`:258-266` 抛异常**不写**），本站除 `searchText` 外全部落「不写」那几条。探针实测四形态 + dev 真库 **740 条 tool_result 只有 12 条带时长**；另外两层各自独立：**U3 从来没写过 `tool_calls` 两列**（只对 `tool_use` INSERT ⇒ 741 行全 NULL）与**引擎投影不带时长**（⇒ 刷新必丢，必须宿主 join）。口径：**抛异常/被中止的调用就是没有时长**（不在 worker 里 catch，不破坏引擎中止语义），前端显示成只有 ✓/✗，**绝不伪装成 `0ms`**；库里旧 740 行不可回填。
+
+**上游**：[erix-agent #285](https://github.com/ErixWong/erix-agent/issues/285)（⚠ **与本站 #285 同号不同仓库**，说事必须带仓库名）——要「所有真执行过的工具都写 duration」+ 把「注入字段×返回形态」表写进 `host-consumer-contract.md`；明确**不要**改 duration 位置、不要给 executor 加参数。本车的适配器是**临时闸**：上游落地升版后整体可撤（先例 §8.9 的 `tree` 根标签收口），`runner/test/tool-duration.test.js` 里的「不包 ⇒ 引擎给不出 duration」就是**哨兵**，届时会红提示。本车 **0 上游依赖**（不升引擎、不动 pin）。
+
+**基线**：根 **1058/1054/0/4**（#285 **+0**：第 8 条的锚点断言**并入既有用例**、防漂移用同一条用例扩禁词集）、#283 **+22**：runner 新建 `tool-duration.test.js` +9、`internal.test.js` +8、`session-view.test.js` +5）、runner **230/230**、前端 **33 文件 / 501**（#283 +13）。台账三处已同步。**两处 fake 按 §8.14 改成真模拟库约束**（`fake-internal-pool.js` 的 `tool_calls` 分支上 `UNIQUE(run_id,call_id)`+`ON CONFLICT`+`call_id NOT NULL`+**从 SQL 文本解析 `IS NULL` 谓词**；`SessionViewPool` 按 SQL 文本真筛）。
+
+**主 agent 亲跑的变异（不复用 worker 的结论）**：① 把 `tool_result` 段挤到 `tool_use` 段之前 ⇒ `internal.test.js` **5 条红**（含具名的「顺序陷阱」那条）⇒ M2 的顺序前置是被测试钉住的；② DTO 给缺失值写 `durationMs: 0` ⇒ **恰好 1 条红**；③ 前端改成投影无条件覆盖实时 `dur` ⇒ **恰好 1 条红**；#285 那三条（节标题退回 7 ⇒ 3 条具名红 / 「完整 URL」改措辞 ⇒ 1 条红 / 把 `markdown 链接` 拄进提示词 ⇒ 防漂移红）见 PR #287。
+
+**⚠ `gh api` 建 PR 的布尔坑（归 §3.7 那一族）**：`gh api -X POST .../pulls -f draft=false` 会建出一个 **draft** PR（form 编码把布尔变成字符串），随后 `PATCH --input '{"draft": false}'` 回读仍 `draft=true`，而 **`gh pr ready <n>` 一发即成**。合并前先回读 `.draft`。
+
+**发布与部署**：三份 `package.json`+lockfile → `0.1.8`（每份 lockfile 恰好 2 行）→ tag `v0.1.8` → 三镜像按 digest pin。**告知面只需 portal 镜像**（`~/AGENTS.md` 由对账自动刷出第 8 条，不需重建容器）；**#283 的 M1 动 `runner/` ⇒ 必须重建 FDE 镜像 + `docker rm -f` 四台让 reconcile 重建**（`ensureFdeContainer` 不检镜像漂移，§8.17 先例）。
+
+- [ ] **真机验收（待做，主 agent）**：**#285 R-1** —— 全新工位起服务，第 1 条回复就给完整可点预览 URL（判据 `role='user'` 计数 == 1，同 §8.16），过了才关 station #285；**#283** —— `sleep 5 && echo ok` 的卡片实时应 `✓ 5.0s` 且**刷新后仍在**，库里两列非 NULL，旧数据只显示 ✓/✗ 不出现 `0ms`，过了才关 #283。
+
+
+
+
+### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
 
