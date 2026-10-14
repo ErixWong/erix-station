@@ -559,6 +559,28 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 
 
+### 8.23 reaper 收敛的重排也可见（issue #292，2026-10-14）
+
+**缺口性质**：#288 缺陷 B 把「attempt 被杀并重排」做成了用户可见，但只覆盖 **agentd 主动上报**（U12 release 带 `killed_by`）那一条路径。而**租约过期才是最常见的真崩溃形状**（agentd 自己被杀 / 容器被 `docker kill` / OOM / 网络断 ⇒ 根本没有上报）。`reapExpiredRuns` 的三条分支此前都不写 `attempt_killed` ⇒ 界面上仍是「同一个工具卡片亮几次，最后没有原因」。
+
+**载荷**（`portal/src/internal.js` reaper 段，常量 `REAPER_KILL_REASON` / `REAPER_KILL_BY`）：
+- 分支 ③（`attempts < max_attempts` → 回 pending）在**同一事务内**合成一条 `attempt_killed`，逐条照 `releaseRun` 的先例（#288/#277）：`allocSeq` + `client_event_id = <run_id>:attempt-killed:<attempt>` + `ON CONFLICT DO NOTHING RETURNING id` + **`rows.length > 0` 才推 SSE**（`COMMIT` 之后推）。**不做「先查重再分配 seq」**（那会让 `ON CONFLICT` 变成装饰），重复轮次白烧一个 seq 是 §5.1 已裁决的合法空洞。
+- 固定字段 `{attempt, max_attempts, reason:'lease_expired', killed_by:'crash'}`：**`killed_by` 保守取 `crash`**（reaper 只看得见「没人续租」，无从区分 F6 看门狗与真崩，不冒认 `watchdog`）；**不写 `silent_ms`/`next_retry_in_ms`**——没有 IPC 上报就没有那个数，写 0 或自造估算都是伪装（#288 口径）。`reason` 是开放值 ⇒ **零新错误码**。
+- 分支 ②（耗尽）的合成 `run_end` additive 挂 `last_reason='lease_expired'`，**`error.code` 逐字仍是 `max_attempts_exceeded`**，且**不带 `last_silent_ms`**。分支 ①（cancelling）零事件（用户点停止不是「被杀」）。
+- **零 DDL**（`docs/data/schema.sql` 与 `deploy/migrations/` 一字节未动）、runner/前端零改动（渲染面 #288 已就位）。
+
+**测试口径**：+9 条**全部并入既有文件** `portal/test/internal-attempt-killed.test.js`（12→21），无新测试文件 ⇒ 根 **1103 → 1112**（1108 通过 / 0 失败 / 4 跳过），runner 258、前端 514 不变。⚠ 同批把 `portal/test/fake-internal-pool.js` 的**事务撤销面收紧**：原本只撤销 `run_events` INSERT + `allocSeq`，现在把 `UPDATE run_queue/runs SET status=…` 的字面量改写也纳入 ⇒「COMMIT 失败只剩半截收敛」在单测里第一次可见（方向是收紧，不是放宽，§8.14）。
+
+**主 agent 亲跑变异（不复用 worker 的结论）**：`REAPER_KILL_BY` 改成 `watchdog` ⇒ 恰 1 条具名红；去掉 `last_reason` ⇒ 恰 1 条红；**把 `attempt_killed` 的 SSE 推送挪到 `COMMIT` 之前 ⇒ 2 条红**（证明「先落库、后推送」的顺序是被钉住的，不靠人记）。worker 另跑 6 条（去 `ON CONFLICT` ⇒ 真库 23505 原文、幂等键去 `:<attempt>` ⇒ 2 红、INSERT 挪提交后 ⇒ 精确变体恰 1 红、硬塞 `silent_ms:0` ⇒ 2 红、去 SSE 门 ⇒ 恰 1 红、改 `error.code` ⇒ 恰 1 红）。
+
+**已知边界（都是刻意口径）**：
+- 界面看到的是「worker 非预期退出」，**不是「租约过期」**——`killed_by` 是已知值 `crash` ⇒ 前端命中固定标签，`reason='lease_expired'` 在界面上根本不出现。**要让二者可区分必须动契约**（新增 `killed_by` 取值 = 破坏「只认 `watchdog`/`crash」的既有契约；或给 payload 加来源判别键），单加一条 i18n 键不够。留作产品判断。
+- **窗口期仍零事件**：worker 已死但租约未过期（≤90s + reaper ≤15s ⇒ 约 ≤105s）内界面没有任何说明；提前播报需要容器级心跳信号（另片）。
+- **第一个写者赢**：分支 ③ 会把 `claim_token` 置空 ⇒ 迟到的 release 必 409 `lease_lost`，所以「reaper 先记 crash、agentd 复活后想报 watchdog」**不会**覆盖同幂等键的既有事件（那次真实死因不再上报）。
+- reaper 循环本来就不写 `audit_log` ⇒「谁改了队列状态」只有事件面可查。
+
+**发版与部署**：`TODO(主 agent)`。真机验收判据见 issue #292 交付报告（`docker pause fde-eric` ⇒ 等 90s+15s ⇒ 恰一条 `attempt_killed(killed_by:'crash', reason:'lease_expired', 无 silent_ms)` + 界面那一行无「（静默 …）」后缀 + 刷新后仍在 + `unpause` 后再 pause 一次应出现**第二条** `attempt:2`）。过了才关 #292。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
