@@ -1677,6 +1677,9 @@ const HISTORY_EVENT_TYPES = new Set([
   'tool_use', 'tool_result', 'tool_call_delta', 'judge',
   'round', 'round_start', 'round_end', 'attempt', 'recovering', 'recovered',
   'compaction', 'final_guard', 'forced_final',
+  // issue #288（缺陷 B）：portal 在 release-requeue 分支合成的**宿主事件**（attempt 被杀并重排）。
+  // 它实时走 session SSE 推给浏览器，**不进白名单则刷新后消失**——与本白名单要修的毛病同构，故列入。
+  'attempt_killed',
   // erix-agent #182（0.18.0）新增的**诊断类**事件：模型元信息缺失时上抛。SSE 实时路径会原样推
   // 给前端（前端 `useEventStream.ts` 的 `default: return;` 中性忽略），若不进白名单则刷新页面
   // 后历史回放会把它过滤掉——同一事件两种可见性就是口径不一致，故列入可回放集合。
