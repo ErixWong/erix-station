@@ -26,7 +26,7 @@ const t = i18n.global.t;
 
 // 具名事件全集（旧 connectEvents 的数组原样，顺序不变）。
 const EVENT_TYPES = [
-  'round_start', 'round_end', 'attempt', 'recovering', 'recovered', 'usage',
+  'round_start', 'round_end', 'attempt', 'attempt_killed', 'recovering', 'recovered', 'usage',
   'tool_use', 'tool_result', 'assistant_delta', 'reasoning_delta',
   'tool_call_delta', 'judge', 'compaction', 'final_guard', 'forced_final',
   'run_end', 'session_updated', 'ping', 'resync', // issue #88：session_updated = 自动标题刷新（live-only，不落 run_events）
@@ -45,6 +45,9 @@ const HISTORY_REPLAY_TYPES = new Set([
   'tool_use', 'tool_result', 'tool_call_delta', 'judge',
   'round', 'round_start', 'round_end', 'attempt', 'recovering', 'recovered',
   'compaction', 'final_guard', 'forced_final',
+  // issue #288（缺陷 B）：宿主在 release-requeue 分支合成的「attempt 被杀并重排」事件；
+  // 与后端 `http.js` 的 HISTORY_EVENT_TYPES 同步加，否则「实时有、刷新后没」。
+  'attempt_killed',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
@@ -134,6 +137,24 @@ function failReasonText(reason: string, termination?: RunTermination | null): st
   const code = termination?.errorCode;
   if (typeof code === 'string' && code !== '') text += `（code=${code}）`;
   return text;
+}
+
+/**
+ * issue #288（缺陷 B）：`attempt_killed` 的「原因」文本——payload 是**宿主自己合成的**（不是引擎透传），
+ * 口径见 docs/api/portal.md §5.3 第 14 行：`killed_by` 只有 `watchdog` / `crash` 两个合法值，
+ * 但它是 additive 字段 ⇒ 未知值/缺失/对象都得退化（照 #261 的 `errorCode` 口径：typeof 守卫，
+ * 绝不 `String(对象)` 把 `[object Object]` 渗进用户可见文案）。未知时退到 release 的 `reason` 原文
+ * （运维排查就靠它），两者都没 ⇒ 走「未知原因」文案。
+ */
+const ATTEMPT_KILLED_CAUSE_KEYS: Record<string, string> = {
+  watchdog: 'stream.event.attemptKilledCause.watchdog',
+  crash: 'stream.event.attemptKilledCause.crash',
+};
+
+function attemptKilledCauseText(killedBy: unknown, reason: unknown): string {
+  const key = typeof killedBy === 'string' ? ATTEMPT_KILLED_CAUSE_KEYS[killedBy] : undefined;
+  if (key) return t(key);
+  return typeof reason === 'string' && reason !== '' ? reason : t('stream.event.attemptKilledUnknown');
 }
 
 export interface EventStreamHooks {
@@ -302,6 +323,24 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'attempt':
         hooks.onSep(t('stream.event.attempt', { round: d.round, attempt: d.attempt, max: d.maxAttempts }));
         return;
+      case 'attempt_killed': {
+        // issue #288（缺陷 B）：worker 被宿主杀掉并重排（F6 执行期静默 watchdog / 非预期退出）。
+        // payload 由 portal 在 release-requeue 分支合成（portal.md §5.3）：{attempt, max_attempts,
+        // reason, killed_by, silent_ms?}。不新增任何 UI 结构：与 attempt/recovering 同一个 onSep 分隔行。
+        const attempt = Number.isFinite(d.attempt) ? d.attempt : '?';
+        const max = Number.isFinite(d.max_attempts) ? d.max_attempts : '?';
+        // silent_ms：**没给就不写这一段**（不拿 0 冒充「静默了 0ms」，也不留空括号，与 #283 同口径）。
+        const silentOk = Number.isFinite(d.silent_ms) && (d.silent_ms as number) >= 0;
+        hooks.onSep(t('stream.event.attemptKilled', {
+          attempt,
+          max,
+          cause: attemptKilledCauseText(d.killed_by, d.reason),
+          silent: silentOk
+            ? t('stream.event.attemptKilledSilent', { dur: formatDuration(d.silent_ms as number) })
+            : '',
+        }));
+        return;
+      }
       case 'recovering':
         hooks.onSep(t('stream.event.recovering', { attempt: d.attempt, max: d.maxAttempts }));
         return;

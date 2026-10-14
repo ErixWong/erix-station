@@ -169,6 +169,25 @@ export const en = {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',
       attempt: 'round {round} · attempt {attempt}/{max}',
+      // issue #288 (defect B): the worker was killed by the host and re-queued. Before this the user
+      // only saw the same tool card light up 3 times and then a reason-less "attempts exhausted".
+      // Payload is synthesized by portal in the release-requeue branch (docs/api/portal.md §5.3):
+      // {attempt, max_attempts, reason, killed_by, silent_ms?}. {silent} is an OPTIONAL suffix the
+      // caller passes as an empty string when there is no duration (same convention as dash/paren),
+      // so this message must not assume {silent} is non-empty.
+      attemptKilled: 'attempt {attempt}/{max} was killed ({cause}), re-queued and waiting for a retry{silent}',
+      // killed_by accepts exactly these two values (docs/api/portal.md §5.3); keys are the raw
+      // reported values, not camelCase.
+      attemptKilledCause: {
+        watchdog: 'execution went silent and the watchdog terminated it',
+        crash: 'the worker exited unexpectedly',
+      },
+      // Silent-duration suffix: the unit comes from lib/toolSummary.formatDuration together with the
+      // number, so the text must not hard-code `ms`.
+      attemptKilledSilent: ' (silent {dur})',
+      // killed_by is an additive field: fallback text for unknown/missing values (never [object Object]
+      // or "undefined").
+      attemptKilledUnknown: 'cause unknown',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       judgePassThrough: 'judge: pass through ({mode})',
