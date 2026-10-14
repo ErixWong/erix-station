@@ -1765,12 +1765,28 @@ function sleepReaper(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// issue #292：reaper 形态的 `attempt_killed` 固定字段（口径 docs/api/portal.md §5.3 第 14 类）。
+// - `killed_by: 'crash'`：reaper 只看得见「租约没人续」，**无从区分** F6 看门狗判死与真崩（上报者已死，
+//   没有报告）⇒ 保守取 `crash`（「worker 非预期退出」是这里唯一诚实的说法），不冒认 `watchdog`。
+// - `reason: 'lease_expired'`：`reason` 是开放值（§9.11 无枚举白名单，前端未知值退化到原文），不新造错误码。
+// - **不写 `silent_ms`**：它的语义是「最后一次 IPC 上报后的静默时长」，只有活着的 agentd 报得出来；
+//   reaper 拿不到这个数 ⇒ 整个键不出现（写 0 或自造「距上次心跳的估算」都是伪装，#288 已定口径）。
+// - **不写 `next_retry_in_ms`**：reaper 之后靠 claim 的即时认领，没有自己定的退避时长。
+const REAPER_KILL_REASON = 'lease_expired';
+const REAPER_KILL_BY = 'crash';
+
 /**
  * 单次 reaper 扫描：把 lease_until 过期的 claimed 行按矩阵收敛。
  *   ① cancelling（用户已 stop 但容器死）→ queue cancelled + runs finished（aborted，A2）；
  *   ② attempts >= max_attempts → queue done + runs failed(max_attempts_exceeded)（A1 耗尽）；
  *   ③ attempts < max_attempts → 回 pending（attempts 不变，claim 时已 +1）；**runs.status 不变**（#207 选 A，A5 口径，与 U12 release 对齐）。
  * 终态分支（①/②）同事务合成 run_end（F3 口径，runner §7.6）。
+ *
+ * issue #292（#288 缺陷 B 的缺口）：**租约过期**才是最常见的真崩溃形状（agentd 自己被杀 / 容器被
+ * `docker kill` / OOM / 网络断 ⇒ 根本没有 U12 release 上报）。此前三条分支都不写 `attempt_killed`
+ * ⇒ reaper 收敛出来的重排在界面上仍是「同一个工具卡片亮几次，没有原因」。现在：
+ *   - 分支 ③ 在**同一事务内**合成一条 `attempt_killed`（§5.3 第 14 类，固定字段见 REAPER_KILL_* 注）；
+ *   - 分支 ② 的合成 `run_end` additive 挂 `last_reason`（`error.code` 仍是 `max_attempts_exceeded`）。
  * @returns {Array<{run_id, outcome, run_status}>}
  */
 export async function reapExpiredRuns(pool) {
@@ -1783,6 +1799,8 @@ export async function reapExpiredRuns(pool) {
   let committedRunEnd = null; // 提交后推浏览器侧 SSE（回收路径的合成 run_end）
   for (const c of candidates.rows ?? []) {
     const runId = c.run_id;
+    // issue #292：分支 ③ 的合成事件同样**提交后**才推 SSE（与 committedRunEnd 同机制；逐 run 复位）。
+    let committedAttemptKilled = null;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -1825,6 +1843,10 @@ export async function reapExpiredRuns(pool) {
         const runEndSeq = await allocSeq(client, r.session_id);
         const runEndPayload = { termination: null, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, attempt: Number(qrow.attempts),
           error: { code: 'max_attempts_exceeded', message: 'attempts exhausted', retryable: false } };
+        // issue #292：**additive**——`error.code` 仍是 `max_attempts_exceeded`（既有契约不得改，§6.4），
+        // 旁边说明「最后这一次是怎么没的」。与 release 路径（§9.11）对齐，但 reaper **不带 `last_silent_ms`**：
+        // 没有 IPC 上报就没有那个数（同 attempt_killed 的 `silent_ms` 口径，绝不拿估算冒充）。
+        runEndPayload.last_reason = REAPER_KILL_REASON;
         await client.query(
           `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
            VALUES ($1, $2, $3, $4, 'run_end', $5, now())
@@ -1836,11 +1858,41 @@ export async function reapExpiredRuns(pool) {
       } else {
         // #207 选 A：requeue 不回写 runs.status（A5：attempt 级失败不动状态）；认领 SQL 按 queued/running 一起筛，不依赖回写。
         await client.query(`UPDATE run_queue SET status='pending', claim_token=NULL, owner_container_id=NULL, lease_until=NULL, claimed_at=NULL WHERE run_id=$1`, [runId]);
+
+        // issue #292：把「这一 attempt 因租约过期被回收重排」对用户说清楚——与队列改写**同一事务**追一条
+        // `attempt_killed`（照 releaseRun requeue 分支的先例 #288：`allocSeq` + `client_event_id` 幂等键 +
+        // `ON CONFLICT DO NOTHING RETURNING id`）。挪到 COMMIT 之后就是缺陷：提交成功但补写事件失败
+        // ⇒ 用户永远看不到那次重排。
+        // `attempt = qrow.attempts`：claim 时已 +1，所以这个数就是**死掉的那一次**（与 release 路径同口径）。
+        // **不做「先查重再分配 seq」**：那会让 `ON CONFLICT` 变成装饰（#288 已定口径）；重复轮次白烧一个
+        // seq 是 §5.1 已裁决的合法空洞（客户端不得拿跳号当重连判据）。
+        const killPayload = {
+          attempt: Number(qrow.attempts),
+          max_attempts: Number(qrow.max_attempts),
+          reason: REAPER_KILL_REASON,
+          killed_by: REAPER_KILL_BY,
+        };
+        const killSeq = await allocSeq(client, r.session_id);
+        const killIns = await client.query(
+          `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+           VALUES ($1, $2, $3, $4, 'attempt_killed', $5, now())
+           ON CONFLICT (run_id, client_event_id) DO NOTHING
+           RETURNING id`,
+          [runId, r.session_id, killSeq, `${runId}:attempt-killed:${Number(qrow.attempts)}`, JSON.stringify(killPayload)],
+        );
+        // 没真插入行（上一轮已写过同一 attempt，例如 reaper 与 release 竞态）就不推 SSE，
+        // 否则同一个 attempt 在界面上出两条重试行。
+        if (killIns.rows.length > 0) {
+          committedAttemptKilled = { session_id: r.session_id, seq: killSeq, payload: killPayload };
+        }
         results.push({ run_id: runId, outcome: 'requeued', run_status: r.status });
       }
       await client.query('COMMIT');
       try {
         if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
+        // issue #292：`attempt_killed` 与合成 `run_end` 同级——落库后实时推一把，与刷新后的历史回放同形状
+        // （该类型已在 §4.4a 回放白名单与前端 HISTORY_REPLAY_TYPES 里，两面可见性必须一致）。
+        if (committedAttemptKilled) notifySessionEvents(committedAttemptKilled.session_id, [{ seq: committedAttemptKilled.seq, ts: new Date().toISOString(), run_id: runId, type: 'attempt_killed', payload: committedAttemptKilled.payload }]);
       } catch { /* 尽力推送 */ }
       committedRunEnd = null;
     } catch (err) {
