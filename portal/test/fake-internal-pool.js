@@ -32,7 +32,8 @@ export class FakeInternalPool {
     };
     this.auditLog = [];
     this._claim = 0;
-    // 事务模拟（只为 run_events 的写入建撤销日志）：`failCommitOnce = true` 让下一次 COMMIT 抛错。
+    // 事务模拟（对 `run_events` 的写入 + `allocSeq` + release/reaper 的 runs/run_queue 状态改写建撤销
+    // 日志，#292 扩到后两项）：`failCommitOnce = true` 让下一次 COMMIT 抛错。
     this._txn = null;
     this.failCommitOnce = false;
     // 语句时序日志（`{sql, index, txnId}`）：「同事务」是能被观测的契约——只有「在 BEGIN…COMMIT 窗口里」
@@ -233,7 +234,7 @@ export class FakeInternalPool {
       return { rows: [{ id: runId }] };
     }
 
-    // ---- 事务边界（只为 run_events 的 INSERT / allocSeq 建撤销日志，见文件内 ⚠ 注）----
+    // ---- 事务边界（run_events 的 INSERT / allocSeq / runs・run_queue 状态改写都建撤销日志，见文件内 ⚠ 注）----
     if (/^\s*BEGIN\b/i.test(sql)) {
       this._txn = { events: [], undo: [] };
       return { rows: [], rowCount: 0 };
@@ -392,10 +393,14 @@ export class FakeInternalPool {
     }
 
     // ---- release/reaper：queue 收敛（字面量 status）----
+    // issue #292：与下方 runs 分支一起登记撤销（真库里它们与 run_events 的 INSERT **同一个事务**，
+    // COMMIT 失败就得一起作废）。原 fake 只给 run_events/allocSeq 建撤销 ⇒「提交失败后只剩半截
+    // 收敛」在单测里结构上不可见（放宽 fake 是禁的，这是反方向的**收紧**）。
     if (sql.includes('UPDATE run_queue SET status=')) {
       const [runId] = params;
       const q = this._queue(runId);
       if (q) {
+        const before = { status: q.status, owner_container_id: q.owner_container_id, lease_until: q.lease_until, claimed_at: q.claimed_at, claim_token: q.claim_token };
         if (sql.includes("status='cancelled'")) q.status = 'cancelled';
         else if (sql.includes("status='pending'")) q.status = 'pending';
         else if (sql.includes("status='done'")) q.status = 'done';
@@ -404,6 +409,7 @@ export class FakeInternalPool {
         q.claimed_at = null;
         // release（U12）保留 claim_token 供幂等重放；reaper 显式 claim_token=NULL 才清。
         if (sql.includes('claim_token=NULL')) q.claim_token = null;
+        if (this._txn) this._txn.undo.push(() => Object.assign(q, before));
       }
       return { rows: [] };
     }
@@ -413,10 +419,15 @@ export class FakeInternalPool {
       const [runId] = params;
       const r = this._run(runId);
       if (r) {
+        const before = { status: r.status, hadEndedAt: 'ended_at' in r, ended_at: r.ended_at };
         if (sql.includes("'finished'")) r.status = 'finished';
         else if (sql.includes("'queued'")) r.status = 'queued';
         else if (sql.includes("'failed'")) r.status = 'failed';
         if (sql.includes('ended_at')) r.ended_at = Date.now();
+        if (this._txn) this._txn.undo.push(() => {
+          r.status = before.status;
+          if (before.hadEndedAt) r.ended_at = before.ended_at; else delete r.ended_at;
+        });
       }
       return { rows: [] };
     }
