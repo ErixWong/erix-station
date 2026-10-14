@@ -29,11 +29,14 @@ export function typeToMode(type) {
 }
 
 export class LlmError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, retryable = false } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #261014 切片 B2：调用方（http.js 的 LlmError 分支）据此填 `error.retryable`。
+    // 缺省 false ⇒ 既有 LlmError 的响应面逐字节不变。
+    this.retryable = retryable;
   }
 }
 
@@ -728,6 +731,78 @@ export async function getFdeLlmHeartbeatModels(pool, userId, opts = {}) {
   }
   return models;
 }
+
+/**
+ * 发消息路径的「绑定的模型 id 还在不在网关里」预检（issue #261014 切片 B2）。
+ *
+ * 为什么需要它：Station 存的是 LiteLLM `model_info.id`。模型被删除/重建 ⇒ **id 变**，
+ * 绑定里的 id 成为孤儿。心跳路径（切片 A）对这种情形只 `warn`（`reason: 'unknown_model_id'`，
+ * 那里只有 agentd 看得见），用户发消息仍会入队，然后在 run 里撞一个看不懂的错。
+ * 本函数把同一判据搬到**发消息**这条路上，变成用户看得见的 409。
+ *
+ * 口径（与切片 A 的三条保守放行同源，但方向相反：这里是 fail-fast）：
+ *   * 只读**活绑定**（谓词逐字同心跳那条 SELECT）；无活绑定 ⇒ 直接放行——「没配 LLM」
+ *     是 `409 llm_not_configured`（§4.3）的既有职责，本函数不插它的队。
+ *   * **逐个已配置槽位**查 `model_info.id`：命中 ⇒ 过；不命中 ⇒ 抛 `llm_model_not_found`。
+ *   * **拿映射本身失败（网关不可达）⇒ 一律放行**：网关抖一下不能让用户发不出消息。
+ *   * **只读**：零写库、零 `updateKey`——名字漂移的回写是心跳对账的事（切片 A/B1）。
+ *
+ * TTL 缓存按 client 对象身份分槽，所以调用方必须复用 `ctx.llmGateway` 单例（同 B1）。
+ *
+ * @param gateway `ctx.llmGateway` 单例（或任何带 `listModels` 的 client）；缺失 ⇒ 不检（`skipped`）。
+ * @param listModels 注入的网关列表替身（测试用，避开真 HTTP）。
+ * @returns {Promise<{status: 'pass'|'skipped', reason: string, slots?: string[], error_status?: number|null}>}
+ *          可观测标记（不放响应体，只供调用方记日志）；抛错才是失败信号。
+ */
+export async function assertBindingModelsResolvable(pool, userId, opts = {}) {
+  const { gateway = null, now = Date.now, ttlMs = 60_000, listModels = null } = opts ?? {};
+  if (!gateway) return { status: 'skipped', reason: 'no_gateway_client' };
+  // 谓词逐字同 getFdeLlmHeartbeatModels（active + litellm + 非空虚拟 key）；只读，不加 FOR UPDATE。
+  const r = await pool.query(
+    `SELECT main_model_id, main_model_name,
+            embedding_model_id, embedding_model_name,
+            vision_model_id, vision_model_name,
+            api_key
+       FROM fde_llm_bindings
+      WHERE fde_id = $1 AND state = 'active' AND gateway = 'litellm'
+        AND api_key IS NOT NULL AND api_key <> ''`,
+    [userId],
+  );
+  const row = r.rows[0];
+  // 无活绑定（或旧数据没主模型槽）：交给 `409 llm_not_configured` 说，本预检不拦截。
+  if (!row?.main_model_id) return { status: 'pass', reason: 'no_active_binding' };
+  const slots = configuredNameSlots(row);
+  if (slots.length === 0) return { status: 'pass', reason: 'no_configured_slot' };
+
+  let map;
+  try {
+    map = await dataPlaneNameMap(getGatewayClient(gateway), { now, ttlMs, listModels });
+  } catch (error) {
+    // fail-open（故意）：网关不可达时用户照常发消息，错误在 run 里由 worker 面报。
+    const observed = { status: 'pass', reason: 'model_list_unavailable', error_status: errorStatus(error) };
+    console.warn('[llm] message precheck skipped', { fde_id: userId, ...observed });
+    return observed;
+  }
+
+  for (const { slot, idColumn } of slots) {
+    const modelId = String(row[idColumn]);
+    if (map.has(modelId)) continue;
+    throw new LlmError(
+      'llm_model_not_found',
+      `绑定的${SLOT_LABELS[slot] ?? slot}在 LLM 网关里已不存在（模型 id ${modelId}）：请到管理台 /admin 重新选模型后再发送（无权限请联系管理员）`,
+      {
+        httpStatus: 409,
+        details: { slot, model_id: modelId },
+        // 「管理员改配后可重试」：本预检零副作用且不写幂等台账，同 key 原样重试能重新占位（§1.4）；
+        // 但盲目立即重试仍是同一码——解法只有一个（改配）。
+        retryable: true,
+      },
+    );
+  }
+  return { status: 'pass', reason: 'all_slots_resolved', slots: slots.map(({ slot }) => slot) };
+}
+
+const SLOT_LABELS = { main: '主模型', embedding: '嵌入模型', vision: '视觉模型' };
 
 export async function getFdeLlmEcho(pool, fdeName) {
   const u = await pool.query(`SELECT id FROM users WHERE fde_name = $1 AND status = 'active'`, [fdeName]);
