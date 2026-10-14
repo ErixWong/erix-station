@@ -59,6 +59,13 @@ export interface ProjectedToolCall {
   resultPreview?: string;
   isError?: boolean;
   executionStatus?: string;
+  /**
+   * issue #283：**宿主 join 进来的耗时（毫秒）**，不是引擎投影字段——官方投影的 `toolCalls[]`
+   * 不带时长，`portal/src/session-view.js` 在投影之后按 `(run_id, call_id)` 从自家
+   * `tool_calls.duration_ms` 补上（数据由 U3 的 tool_result UPDATE 回填）。
+   * 旧数据库里是 NULL ⇒ DTO **不出现该键**（不写 0）；前端只在卡片现有 `dur` 为空时用它。
+   */
+  durationMs?: number;
 }
 
 /**
@@ -273,6 +280,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // 同一调用不会渲染两张卡片；仅凭 DTO（无事件）也能渲染卡片。卡片排在正文气泡前（先工具后答复）。
     if (Array.isArray(m.toolCalls)) {
       m.toolCalls.forEach((call, index) => {
+        // issue #283：整个 call（含宿主 join 的 `durationMs`）一并交给 projectToolCard——
+        // 刷新后卡片仍能显示耗时，但实时路已拿到的值不会被它覆盖（覆盖规则在 composable 里）。
         es.projectToolCard(toolCallKey(m.id, call, index), call);
       });
     }

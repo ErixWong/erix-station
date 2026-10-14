@@ -816,6 +816,24 @@ station-portal user enable  --login <login>
 | `PATCH /api/sessions/:id` | `{ "title": "新标题" }` | `200 ChatSession` |
 | `DELETE /api/sessions/:id` | — | `204`（归档，`status → archived`；有进行中 run 时 `409 run_in_progress`） |
 
+**对话流 DTO 的 `messages[]` 展示字段（`GET /api/sessions/:id`）**
+
+助手锚点上除宿主元数据（`id`/`run_id`/`seq`/`role`/`content`/`synthetic`/`attachments`/`created_at`）外，
+还挂上游官方投影 `projectTranscriptForDisplay` 的展示字段（issue #188/#189：**逐字、原名透传，有则出现、
+无则不写该键**）：`toolCalls[]`、`reasoning`、`blocks`、`turnKeys`、`folded`。
+
+| 字段 | 来源 | 口径 |
+|---|---|---|
+| `messages[].toolCalls[]` | 引擎投影 | `{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`（预览长度由上游定） |
+| `messages[].toolCalls[].durationMs` | **宿主 join**（issue #283） | 毫秒。⚠ **引擎投影不带这个字段**（`DisplayTurn.toolCalls[]` 的形状里没有时长），它由 `portal/src/session-view.js` 在投影**之后**按 `(run_id, call_id)` 从本站 `tool_calls.duration_ms` 补上（数据源 = §9.4 的 U3 `tool_result` UPDATE）。`call_id` 即事件里的 `tool_call_id` = `toolCalls[].id`。 |
+
+- **旧数据口径**：库里 `duration_ms` 为 `NULL`（引擎当年就没给时长的那批历史调用，见 §5.3 第 7 行与
+  erix-agent #285）⇒ **DTO 不出现 `durationMs` 键**，不写 `0`、不塞 `null`、也不拿时间差造一个假时长；
+  前端据此不渲染时长（而不是显示 `0ms`）。旧数据**不可回填**。
+- **取数面**：`getSession` 额外一次 `SELECT run_id, call_id, duration_ms FROM tool_calls WHERE run_id = ANY($1::uuid[]) AND duration_ms IS NOT NULL`（只查本批锚点涉及的 run）；`includeMessages=false`（SSE 只校 `last_seq`）时不发这次查询。
+- **前端归并规则**：实时路（`tool_result` 事件）已拿到的时长优先，投影值只在卡片现有 `dur` 为空时填——
+  同一次调用不会因为刷新而改变显示。
+
 **标题模型（issue #114 修订）**：
 
 - **默认标题 = 首条用户消息截断**（零 LLM）：`POST /api/sessions/:id/messages` 建首条 `user` 消息时，若会话 `title` 为空且 `title_source='auto'`，取该消息前 30 字（被截断时尾加 `…`）落库，并推一条 `session_updated`（列表标题立即到位）。标题非空则幂等不动；与 `ERIX_SESSION_AUTO_TITLE` 开关**解耦**（开关关闭时照样生效）。
