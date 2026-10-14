@@ -165,6 +165,36 @@ describe('工具卡片折叠（issue #85）', () => {
     expect(cards[1].get('button').find('.text-red-600').exists()).toBe(true);
     expect(cards[2].get('button').text()).toContain('…');
   });
+
+  // issue #283：卡片头部耗时走可读单位三档（`formatDuration`），**没有时长就只出 ✓/✗**。
+  it('issue #283：头部耗时可读单位（4321 ⇒ 4.3s、65000 ⇒ 1m 5s）；无时长不出现 0ms', () => {
+    const { wrapper } = setup({
+      sec: { name: 'a', dig: '', args: '{}', ok: true, out: '', dur: 4321 },
+      min: { name: 'b', dig: '', args: '{}', ok: false, out: '', dur: 65000 },
+      none: { name: 'c', dig: '', args: '{}', ok: true, out: '' }, // 引擎未给时长
+    });
+    const cards = wrapper.findAll('.border-l-4');
+    expect(cards[0].get('button').text()).toContain('✓ 4.3s');
+    expect(cards[1].get('button').text()).toContain('✗ 1m 5s');
+    const header = cards[2].get('button').text();
+    expect(header).toContain('✓');
+    for (const junk of ['0ms', '0s', 'undefined', 'NaN']) expect(header).not.toContain(junk);
+  });
+
+  // issue #283 M3：刷新后不丢——卡片由 DTO 投影路径建立（`projectToolCard`），时长来自
+  // 宿主自己 join 的 `durationMs`（引擎投影不带）。
+  it('issue #283：刷新（投影路径）的卡片仍显示可读时长；旧数据无该字段 ⇒ 不显示 0ms', () => {
+    const store = useWorkbenchStore();
+    store.es.projectToolCard('p-dur', { name: 'shell', argsSummary: 'command=sleep 5', resultPreview: 'exit_code: 0', durationMs: 4321 });
+    store.es.projectToolCard('p-legacy', { name: 'shell', argsSummary: 'command=sleep 5', resultPreview: 'exit_code: 0' });
+    store.entries.push({ kind: 'tool', callId: 'p-dur' }, { kind: 'tool', callId: 'p-legacy' });
+    const cards = mountPanel().findAll('.border-l-4');
+    // 变异取证④：摘掉前端对 `durationMs` 的消费（或后端 join）就红在本行
+    expect(cards[0].get('button').text()).toContain('✓ 4.3s');
+    const legacy = cards[1].get('button').text();
+    expect(legacy).toContain('✓');
+    for (const junk of ['0ms', '0s', 'undefined']) expect(legacy).not.toContain(junk);
+  });
 });
 
 // ---------------------------------------------------------------------------

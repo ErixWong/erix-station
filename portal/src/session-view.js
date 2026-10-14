@@ -202,11 +202,46 @@ function assistantTurnFields(turns) {
 }
 
 /**
+ * issue #283：把**宿主自有**的 `tool_calls.duration_ms` join 进上游投影的 `toolCalls[]`。
+ *
+ * ⚙ **来源与位置**（别再当成引擎给的）：引擎官方投影 `projectTranscriptForDisplay` 的
+ * `DisplayTurn.toolCalls[]` 形状里**没有时长**（上游 `src/display/projection.js` 的注释面：
+ * `{key, name, id?, argsSummary?, result_preview..., isError?, executionStatus?}`），而
+ * `assistantTurnFields()` 的职责是**逐字透传**、不向上游形状注字段（#95 红线）——所以本函数必须在
+ * 投影**之后**、在拼 DTO 的那一刻才给元素添 `durationMs`（新对象，不改动引擎产出的那些对象），
+ * 使「引擎字段逐字透传」与「宿主补时长」两件事在代码上可分辨（用例钉住了这点）。
+ *
+ * 口径：
+ *   * 数据源 = 本站 `tool_calls`（M2 由 U3 的 tool_result UPDATE 回填）按 `(run_id, call_id)`；
+ *     `call_id` 就是事件里的 `tool_call_id` = 投影里的 `toolCalls[].id`（provider 的 tool_use id）；
+ *   * **有则出现、无则不写该键**（沿用 `toolCalls`/`folded` 既有契约）——旧数据（引擎当年就没发
+ *     duration 的那批）库里是 NULL ⇒ 键不出现，**绝不写 0**；
+ *   * `durationMs` 是**宿主附加字段**，不属上游契约面：前端只在现有 `dur` 为空时用它（实时路优先）。
+ *
+ * @param {Array<Record<string, unknown>>} toolCalls 引擎投影产出的数组（不被修改）
+ * @param {string} runId 当前助手锚点的 run
+ * @param {Map<string, number>} durations key = `${runId}\u0000${call_id}`
+ */
+function attachToolCallDurations(toolCalls, runId, durations) {
+  if (durations.size === 0) return toolCalls; // 库里一个时长都没有（旧数据/旧后端）⇒ 完全不碰原数组
+  return toolCalls.map((call) => {
+    const callId = typeof call?.id === 'string' ? call.id : null;
+    const ms = callId === null ? undefined : durations.get(`${runId}\u0000${callId}`);
+    // 没命中就**原对象返回**（不拷贝、不加 `durationMs: undefined` 这种伪键）。
+    return ms === undefined ? call : { ...call, durationMs: ms };
+  });
+}
+
+/**
  * Build the existing message DTO from the official display projection plus message anchor metadata.
  * Synthetic rows (for example judge/wrapup injections) have no required transcript
  * text match yet, so their content intentionally remains sourced from the anchor.
+ *
+ * issue #283 可选入参 `toolCallRows`：宿主自有 `tool_calls` 里取出的
+ * `{run_id, call_id, duration_ms}` 行（只带有时长的行）。不传/空数组 ⇒ DTO 的 `toolCalls[]`
+ * 与以前逐字相同（向后兼容，文本取数面 `session-text.js` 就不传）。
  */
-export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows }) {
+export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows, toolCallRows }) {
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
   const userAnchorsByText = new Map();
@@ -249,6 +284,17 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   const runTurnKeys = new Map();
   // issue #189：折叠轮元数据（按 run 收集，写法同 runToolCalls/runTurnKeys；后到行覆盖前行，与 foldContent 同语义）。
   const runFolded = new Map();
+  // issue #283：宿主自有的工具耗时索引（数据源 = 本站 `tool_calls`，**不是**引擎投影）。
+  // key = `${run_id}\u0000${call_id}`；只收「非 null 且有限非负」的值——NULL（旧数据引擎当年就
+  // 没发）/ 脏值一律不入表 ⇒ 下游 join 不命中 ⇒ DTO 里不出现 `durationMs` 键（不写 0）。
+  const durations = new Map();
+  for (const row of Array.isArray(toolCallRows) ? toolCallRows : []) {
+    if (!row || typeof row.run_id !== 'string' || typeof row.call_id !== 'string') continue;
+    if (row.duration_ms === null || row.duration_ms === undefined) continue;
+    const ms = Number(row.duration_ms);
+    if (!Number.isFinite(ms) || ms < 0) continue;
+    durations.set(`${row.run_id}\u0000${row.call_id}`, ms);
+  }
   let currentRunId = null;
 
   const setRunText = (runId, assistantText, foldText, turns) => {
@@ -384,7 +430,8 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     // 不塞 undefined/null 占位。合成助手行（synthetic）正文来自锚点本身、不经 transcript 投影，故不透传。
     if (anchor.role === 'assistant' && anchor.synthetic !== true) {
       const toolCalls = runToolCalls.get(anchor.run_id);
-      if (toolCalls !== undefined) dto.toolCalls = toolCalls;
+      // issue #283：时长由宿主在投影**之后** join（引擎投影不带），有值才添 `durationMs` 键。
+      if (toolCalls !== undefined) dto.toolCalls = attachToolCallDurations(toolCalls, anchor.run_id, durations);
       const reasoning = runReasoning.get(anchor.run_id);
       if (reasoning !== undefined) dto.reasoning = reasoning.join('\n');
       const blocks = runBlocks.get(anchor.run_id);

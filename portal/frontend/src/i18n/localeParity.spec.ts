@@ -91,4 +91,22 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
       expect(admin.confirmBody).toContain('{newBlock}');
     }
   });
+
+  // issue #283：工具结果行的「有时长 / 无时长」两版文案必须双语成对（文件首条用例已经钉「两边
+  // 叶子键集合完全一致」，这里额外钉形状）：
+  //   * 单位不得硬编码在文案里（时长由 `lib/toolSummary.formatDuration` 连着单位一起给）；
+  //   * 无时长版不得带 `{dur}` 占位（否则渲染出 `undefined` / 空括号）。
+  it('issue #283：stream.event.toolResult 与 toolResultNoDur 双语成对，且文案不自带 ms 单位', () => {
+    for (const [locale, root] of [['zh-CN', zhCN], ['en', en]] as const) {
+      const withDur = root.stream.event.toolResult;
+      const noDur = root.stream.event.toolResultNoDur;
+      expect(withDur, locale).toContain('{mark}');
+      expect(withDur, locale).toContain('{digest}');
+      expect(withDur, locale).toContain('{dur}');
+      expect(withDur, locale).not.toMatch(/ms/);
+      expect(noDur, locale).toContain('{mark}');
+      expect(noDur, locale).not.toContain('{dur}');
+      expect(noDur, locale).not.toMatch(/ms|undefined|null/);
+    }
+  });
 });

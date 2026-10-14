@@ -217,8 +217,12 @@ export const zhCN = {
       // issue #212：persistence_failed 的落盘细节（worker 透传引擎 termination 的
       // operation/phase/sideEffect；工作台必须能看见 phase）
       runEndPersistence: '落盘细节 {operation}/{phase}/{sideEffect}',
-      // 工具卡片结果行（tool_result：ok/err 标记 + 摘要 + 耗时）
-      toolResult: '{mark} {digest}（{ms}ms）',
+      // 工具卡片结果行（tool_result：ok/err 标记 + 摘要 + 耗时）。括号里的时长由调用方
+      // `formatDuration(ms)` 给全量可读串（`12ms` / `4.3s` / `1m 5s`），文案不再自带 `ms` 单位
+      //（issue #283：单位与数值必须一起格式化，否则无法支持非毫秒档）。
+      toolResult: '{mark} {digest}（{dur}）',
+      // 没有时长时的同一行（issue #283：引擎未给 duration 的调用不得伪造成 `0ms`，也不得留空括号）
+      toolResultNoDur: '{mark} {digest}',
       // 可选后缀片段（调用方按条件传空串占位）
       dash: ' — {value}',
       paren: '（{value}）',

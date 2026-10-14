@@ -292,11 +292,26 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     `SELECT id, status FROM runs WHERE session_id = $1 AND status IN ${ACTIVE_RUN_STATES} ORDER BY queued_at DESC LIMIT 1`,
     [sessionId],
   );
+  // issue #283：工具耗时由**宿主自己**补——引擎官方投影的 `toolCalls[]` 不带时长（上游明说该形状
+  // 没有 duration），取数面只能是本站 `tool_calls`（数据由 M2 的 U3 tool_result UPDATE 回填）。
+  // 只取本批锚点涉及的 run（锚点分页窗口已是 run 的超集）；`duration_ms IS NOT NULL` ⇒ 旧数据
+  //（引擎当年就没发时长的那批）根本不参与 join ⇒ DTO 不出现 `durationMs` 键，不写 0。
+  const durationRunIds = [...new Set(msgs.rows
+    .map((row) => row.run_id)
+    .filter((runId) => typeof runId === 'string' && runId !== ''))];
+  const toolCallDurations = durationRunIds.length > 0
+    ? await pool.query(
+      `SELECT run_id, call_id, duration_ms
+         FROM tool_calls WHERE run_id = ANY($1::uuid[]) AND duration_ms IS NOT NULL`,
+      [durationRunIds],
+    )
+    : { rows: [] };
   const projection = projectSessionMessages({
     sessionId,
     anchors: msgs.rows,
     userAnchors: userAnchors.rows,
     transcriptRows: transcript.rows,
+    toolCallRows: toolCallDurations.rows,
   });
   return {
     session: {
