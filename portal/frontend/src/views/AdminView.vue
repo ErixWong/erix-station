@@ -29,8 +29,22 @@ const modelForm = reactive({
   output_cost_per_1m: '' as string | number,
 });
 const modelEditForm = reactive({
-  model: '', name: '', type: 'text', tool_calling: false, context_window: '', max_tokens: '',
+  model: '', call_name: '', name: '', type: 'text', tool_calling: false, context_window: '', max_tokens: '',
   input_cost_per_1m: '' as string | number, output_cost_per_1m: '' as string | number, clear_pricing: false,
+});
+// #296：改「调用名」= 改 FDE 手里正在用的那个名字 ⇒ 必须点一次确认（确认前零请求，同 #246 改块先例）。
+// 非 null 就渲染确认框；payload 是已组装好、等确认后才发出去的那一份 PATCH。
+type ModelPatch = Parameters<typeof admin.updateModel>[1];
+const pendingCallName = ref<{ from: string; to: string; payload: ModelPatch } | null>(null);
+const callNameError = ref('');
+
+/** 调用名重复集（跳供应商：LiteLLM 的路由名是全局的）。网关不拦重名 ⇒ 至少让人看出来。 */
+const duplicateCallNames = computed(() => {
+  const counts = new Map<string, number>();
+  for (const provider of admin.providers) {
+    for (const model of provider.models) counts.set(model.model_name, (counts.get(model.model_name) ?? 0) + 1);
+  }
+  return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([name]) => name));
 });
 
 /** 每 token 单价 → 「每 1M tokens」输入框字符串（空值保持为空）。 */
@@ -146,6 +160,8 @@ async function onAddModel() {
 
 function openEditModel(model: LlmModel) {
   modelEditForm.model = model.litellm_params?.model ?? '';
+  // #296：两个名字分开回填——调用名取数据面 model_name，展示名取 name（后端缺省回退成调用名）。
+  modelEditForm.call_name = model.model_name ?? '';
   modelEditForm.name = model.name;
   modelEditForm.type = model.type;
   modelEditForm.tool_calling = model.tool_calling;
@@ -156,16 +172,18 @@ function openEditModel(model: LlmModel) {
   modelEditForm.input_cost_per_1m = hasOverride ? perTokenToInput(model.input_cost_per_token) : '';
   modelEditForm.output_cost_per_1m = hasOverride ? perTokenToInput(model.output_cost_per_token) : '';
   modelEditForm.clear_pricing = false;
+  pendingCallName.value = null;
+  callNameError.value = '';
   editingModel.value = model;
 }
 
-async function onUpdateModel() {
-  const model = editingModel.value;
-  if (!model) return;
+/** 组装 PATCH：调用名**只在真的改了才带**（没改就不去碰数据面，更不触发立即对账）。 */
+function buildModelPatch(callName: string | null): ModelPatch {
   const inputCost = modelEditForm.clear_pricing ? null : inputToPerToken(modelEditForm.input_cost_per_1m);
   const outputCost = modelEditForm.clear_pricing ? null : inputToPerToken(modelEditForm.output_cost_per_1m);
-  const err = await admin.updateModel(model, {
+  return {
     ...(modelEditForm.model.trim() ? { model: modelEditForm.model.trim() } : {}),
+    ...(callName === null ? {} : { call_name: callName }),
     name: modelEditForm.name.trim(),
     type: modelEditForm.type,
     tool_calling: modelEditForm.tool_calling,
@@ -173,8 +191,46 @@ async function onUpdateModel() {
     ...(modelEditForm.max_tokens ? { max_tokens: Number(modelEditForm.max_tokens) } : {}),
     ...(inputCost === undefined ? {} : { input_cost_per_token: inputCost }),
     ...(outputCost === undefined ? {} : { output_cost_per_token: outputCost }),
-  });
-  if (!err) editingModel.value = null;
+  };
+}
+
+async function submitModelEdit(payload: ModelPatch) {
+  const model = editingModel.value;
+  if (!model) return;
+  const err = await admin.updateModel(model, payload);
+  if (!err) {
+    editingModel.value = null;
+    pendingCallName.value = null;
+  }
+}
+
+async function onUpdateModel() {
+  const model = editingModel.value;
+  if (!model) return;
+  const callName = modelEditForm.call_name.trim();
+  if (!callName) {
+    // 不静默回退成旧名：留空就是没填（服务端也会 `validation_failed` + details.field=call_name）。
+    callNameError.value = t('admin.llm.callNameRequired');
+    return;
+  }
+  callNameError.value = '';
+  if (callName !== model.model_name) {
+    // 只到「确认」为止：此刻还一个请求都没发。
+    pendingCallName.value = { from: model.model_name, to: callName, payload: buildModelPatch(callName) };
+    return;
+  }
+  pendingCallName.value = null;
+  await submitModelEdit(buildModelPatch(null));
+}
+
+async function onConfirmCallName() {
+  const pending = pendingCallName.value;
+  if (!pending) return;
+  await submitModelEdit(pending.payload);
+}
+
+function cancelCallName() {
+  pendingCallName.value = null;
 }
 
 async function onConfirmDelete() {
@@ -253,7 +309,8 @@ onMounted(() => {
             <table class="w-full text-sm">
               <thead>
                 <tr class="text-left text-black/60">
-                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colName') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colCallName') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colDisplayName') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
                   <th class="py-1 pr-3 font-medium">tool_calling</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
@@ -265,9 +322,19 @@ onMounted(() => {
               </thead>
               <tbody>
                 <tr v-if="p.models.length === 0">
-                  <td colspan="8" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
+                  <td colspan="9" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
                 </tr>
                 <tr v-for="m in p.models" :key="m.id" data-test="model-row" class="border-t border-black/5">
+                  <td class="py-1 pr-3">
+                    <!-- #296：调用名是**操作面**（FDE 请求实际发的名字）；网关不拦重名 ⇒ 重复就标出来 -->
+                    <span data-test="model-call-name" class="font-mono text-xs">{{ m.model_name }}</span>
+                    <span
+                      v-if="duplicateCallNames.has(m.model_name)"
+                      data-test="model-call-name-duplicate"
+                      :title="t('admin.llm.duplicateCallNameHint')"
+                      class="ml-1 rounded border border-amber-600 bg-amber-50 px-1.5 py-0.5 text-xs font-medium text-amber-700"
+                    >{{ t('admin.llm.duplicateCallName') }}</span>
+                  </td>
                   <td class="py-1 pr-3">{{ m.name }}</td>
                   <td class="py-1 pr-3">
                     <span class="rounded border border-sky-600 bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700">{{ m.type }}</span>
@@ -416,7 +483,7 @@ onMounted(() => {
         >
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.llm.colName') }}
+        {{ t('admin.llm.colDisplayName') }}
         <input v-model="modelForm.name" required placeholder="GPT-4o" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
@@ -475,8 +542,31 @@ onMounted(() => {
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editUpstreamModelHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
-        {{ t('admin.llm.colName') }}
-        <input v-model="modelEditForm.name" required class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        {{ t('admin.llm.colCallName') }}
+        <input
+          v-model="modelEditForm.call_name"
+          data-test="edit-model-call-name"
+          required
+          class="rounded-md border border-black/20 px-2 py-1 text-sm font-mono"
+        >
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editCallNameHint') }}</span>
+        <span
+          v-if="editingModel && duplicateCallNames.has(modelEditForm.call_name.trim()) && modelEditForm.call_name.trim() !== editingModel.model_name"
+          data-test="edit-model-call-name-duplicate"
+          class="text-[0.7rem] text-amber-800"
+          role="status"
+        >{{ t('admin.llm.duplicateCallNameHint') }}</span>
+        <span v-if="callNameError" data-test="edit-model-call-name-error" class="text-[0.7rem] text-red-700" role="alert">{{ callNameError }}</span>
+      </label>
+      <label class="flex flex-col gap-1 text-xs text-black/55 sm:col-span-2">
+        {{ t('admin.llm.colDisplayName') }}
+        <input
+          v-model="modelEditForm.name"
+          data-test="edit-model-display-name"
+          required
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editDisplayNameHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.colType') }}
@@ -486,7 +576,7 @@ onMounted(() => {
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.colContextWindow') }}
-        <input v-model="modelEditForm.context_window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        <input v-model="modelEditForm.context_window" data-test="edit-model-context-window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editContextWindowHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
@@ -514,6 +604,32 @@ onMounted(() => {
       >
         <input v-model="modelEditForm.clear_pricing" data-test="edit-model-clear-pricing" type="checkbox" class="accent-brand"> {{ t('admin.llm.pricingClear') }}
       </label>
+      <!-- #296：改调用名的二次确认——弹出即说明「FDE 手里正在用的名字会变」，**此时仍未发出 PATCH** -->
+      <div
+        v-if="pendingCallName"
+        data-test="call-name-confirm"
+        role="alertdialog"
+        aria-labelledby="call-name-confirm-title"
+        class="rounded-md border border-red-300 bg-white p-2.5 sm:col-span-2"
+      >
+        <h5 id="call-name-confirm-title" class="text-sm font-semibold text-red-800">{{ t('admin.llm.confirmCallNameTitle') }}</h5>
+        <p class="mt-1 text-sm">{{ t('admin.llm.confirmCallNameBody', { from: pendingCallName.from, to: pendingCallName.to }) }}</p>
+        <p class="mt-1 text-sm font-medium text-red-800">{{ t('admin.llm.confirmCallNameWarning') }}</p>
+        <div class="mt-2 flex gap-2">
+          <button
+            type="button"
+            data-test="confirm-call-name"
+            class="flex-1 rounded-md bg-red-700 px-2.5 py-1 text-sm text-white hover:bg-red-800"
+            @click="onConfirmCallName"
+          >{{ t('admin.llm.confirmCallNameAction') }}</button>
+          <button
+            type="button"
+            data-test="cancel-call-name"
+            class="flex-1 rounded-md border border-black/20 px-2.5 py-1 text-sm hover:bg-black/5"
+            @click="cancelCallName"
+          >{{ t('common.cancel') }}</button>
+        </div>
+      </div>
       <p v-if="admin.llmErr" class="syserr sm:col-span-2" role="alert">{{ admin.llmErr }}</p>
       <div class="flex gap-2 sm:col-span-2">
         <button type="submit" class="flex-1 rounded-md bg-brand px-2.5 py-1 text-sm text-white hover:bg-brand-hover">{{ t('admin.save') }}</button>
