@@ -681,7 +681,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **主 agent 亲跑变异（不复用 worker 的 7 条）**：① 拆掉随包套件接入 ⇒ 红在「四套契约套件接入面在册」守卫；② 删前端四形态表里 `writeFile` 一支 ⇒ 红在「表在册」守卫；③ **把存在性判据塞回 `StreamPanel.cardOut()` ⇒ 29 条全绿**——先自证不是空操作（diff 真改 1 行、只在 `executionStatus` 为非特殊值时改变行为）⇒ 定性**真覆盖缺口**（新加的 4 条都在 `useEventStream`，`cardOut` 从没喂过非特殊值），补测后同一变异**恰 1 条红且红在新用例**。④ 顺带修正一处**我们自己刚写下的误导注释**（它把防回装断言指向已删除的 `tool-duration.test.js`）。
 
-**不在本单（已挂账）**：#300 消费 `error.finalText`（停止后助手文本整体消失，上游 §5 点名宿主侧边界）、#301 是否开 `partialPersistence`（需决策）、#303 一代回退清账、`toolCallKey` 接进 UI。
+**不在本单（已挂账）**：#300 消费 `error.finalText`（停止后助手文本整体消失，上游 §5 点名宿主侧边界）、**#301 `partialPersistence` 已评估并决定不开**（决策者口径 + dev 实测「10 天自然崩溃重排 ≈ 1 次」+ 机制与重开条件全在 issue 里；关键辨析：**显示走 `error.finalText`，续跑才走快照通道，后者界面看不见**）、#303 一代回退清账、`toolCallKey` 接进 UI。
 
 **发版与部署（已完成）**：PR #304 → tag `v0.1.13`（main CI 含镜像构建校验全绿后打）→ release run `38696447739` → **三镜像一次拉成功**（前几日反复超时的 `fde` 这次没闹）→ 清单 `imageId` 与部署机 `docker image inspect .Id` 逐个一致（portal `197fd9ba…` / fde `d80973f3…` / proxy `adf566b4…`）→ `deploy/.env` 形态① pin **三个一起换**（含 `FDE_IMAGE`，备份 `/tmp/deploy.env.bak-0113`）→ `up -d --no-build` → **`docker rm -f` 全部 7 台 fde-\* 后 reconcile 全部落在 `d80973f3…` 且 healthy**（§8.17：动 `runner/` 不重建就还是旧引擎）。
 
