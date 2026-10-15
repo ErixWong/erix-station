@@ -300,6 +300,92 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
 });
 
 // ---------------------------------------------------------------------------
+// issue #299 收尾：展开区（cardOut）的 executionStatus 读点必须**拿值比**（`isSpecialExecutionStatus`）
+// —— 这条缺口是主 agent 跑变异发现的：把 `isSpecialExecutionStatus(card.executionStatus)` 换成
+// `card.executionStatus !== undefined`（= 0.19 的旧误读）后，补测前 `StreamPanel.spec.ts` **29 条全绿 rc=0**
+// ⇒ 旧夹具里没有任何「executionStatus 是非特殊值」的卡片，这个读点根本没被值比逻辑覆盖过。
+// 引擎 0.20.0（host-upgrade-guide-0.20.0 §7 + lib/toolSummary 注释）：`erix.executionStatus`
+// **只在** `intercepted` / `interrupted` 两种特殊状态下存在，普通成功/失败块上**缺席**；
+// 上游哪天多写一个普通值（'ok' / 'succeeded' / 任何将来取值）也不许被当成状态渲进展开区，
+// 更不许留下空的「 · 」连接符。
+// `cardOut` 是 `<script setup>` 内部函数、未导出 ⇒ 沿用本文件既有技法（挂载 + 点击展开 +
+// 取结果行 `div.text-black/50`，`<pre>` 是 args 块）读渲染文本，**不为测试改产品码导出面**。
+// 变异靶：
+//   ① `isSpecialExecutionStatus(...)` → `... !== undefined`（存在性误读）⇒ 「非特殊值」那条必须红；
+//   ② 值比写成永返 false（特殊值也不渲染）⇒ 「特殊值正向」那条必须红。
+// ---------------------------------------------------------------------------
+
+/** 全部卡片展开后，按 entries 顺序取结果行正文（结果行 = 展开区里唯一的 div.text-black/50）。 */
+async function expandAllAndReadOutRows(wrapper: ReturnType<typeof mount>): Promise<string[]> {
+  for (const btn of wrapper.findAll('button[aria-expanded]')) await btn.trigger('click');
+  return wrapper.findAll('div')
+    .filter((node) => node.classes().includes('text-black/50'))
+    .map((node) => node.text());
+}
+
+describe('issue #299：展开区 executionStatus 拿值比（非特殊值不得渲染成状态）', () => {
+  // 变异①靶：普通值（上游多写的 / 空串）走值比 ⇒ 结果行只剩结果正文；存在性判据会把值本身渲出来。
+  it('非特殊值（ok/succeeded/running/空串/未知取值）不进展开区：不出现该值、无空「 · 」、无 undefined', async () => {
+    const store = useWorkbenchStore();
+    const fixtures = [
+      // callId, 上游写进 executionStatus 的**非特殊**值, resultPreview
+      ['plain-ok', 'ok', 'BODY-OK'],
+      ['plain-succeeded', 'succeeded', 'BODY-SUCCEEDED'],
+      ['plain-running', 'running', 'BODY-RUNNING'],
+      ['plain-empty', '', 'BODY-EMPTY'],
+      // 上游将来新增取值（我们没登记过）⇒ 同样不许当状态渲染，也不许被当成「没结果」丢掉正文
+      ['plain-unknown', 'cancelled-by-new-policy', 'BODY-UNKNOWN'],
+      // 非特殊值 + 无 resultPreview ⇒ 结果行是空串（存在性判据会在这里单独渲染出状态串）
+      ['plain-nopreview', 'succeeded', undefined],
+    ] as const;
+    for (const [callId, executionStatus, resultPreview] of fixtures) {
+      store.es.toolCards.set(callId, {
+        name: 'readFile', dig: '', args: '', ok: true, out: '',
+        resultPreview: resultPreview as string | undefined,
+        executionStatus,
+      });
+      store.entries.push({ kind: 'tool', callId });
+    }
+    const wrapper = mountPanel();
+    // 默认收起时头部也不该出现状态串（cardOut 只在展开区，但整页文本一起兜底）
+    const rows = await expandAllAndReadOutRows(wrapper);
+    expect(rows).toEqual(['BODY-OK', 'BODY-SUCCEEDED', 'BODY-RUNNING', 'BODY-EMPTY', 'BODY-UNKNOWN', '']);
+    fixtures.forEach(([, status, preview], i) => {
+      // 状态值本身不许出现在结果行（大小写故意分开：正文用大写 BODY-*，不与 'ok'/'succeeded' 撞串）
+      for (const junk of [status, 'undefined', ' · ']) {
+        if (junk) expect(rows[i]).not.toContain(junk);
+      }
+      if (preview) expect(rows[i]).toContain(preview); // 结果正文本身一个字符都不能少
+    });
+    const text = wrapper.text();
+    expect(text).not.toContain('undefined');
+    expect(text).not.toContain(' · '); // 状态段缺席 ⇒ 不能留下空连接符
+    expect(text.match(/✓/g)?.length).toBe(fixtures.length); // 六张卡都判成成功（不是 …/✗）
+  });
+
+  // 变异②靶：值比写成永返 false / 只认其中一种 ⇒ 引擎真写了特殊状态时展开区必须看得见。
+  it('特殊值 interrupted / intercepted 必须渲染（防值比被写成永返 false）', async () => {
+    const store = useWorkbenchStore();
+    store.es.toolCards.set('cut', {
+      name: 'bash', dig: '', args: '', ok: false, out: '',
+      resultPreview: 'KILLED', executionStatus: 'interrupted',
+    });
+    store.es.toolCards.set('blocked', {
+      name: 'bash', dig: '', args: '', ok: false, out: '',
+      resultPreview: 'DENIED', executionStatus: 'intercepted',
+    });
+    // 特殊值 + 没有 resultPreview ⇒ 只出状态串，且不留下尾巴「 · 」
+    store.es.toolCards.set('cut-only', {
+      name: 'bash', dig: '', args: '', ok: null, out: '', executionStatus: 'interrupted',
+    });
+    store.entries.push({ kind: 'tool', callId: 'cut' }, { kind: 'tool', callId: 'blocked' }, { kind: 'tool', callId: 'cut-only' });
+    const wrapper = mountPanel();
+    expect(await expandAllAndReadOutRows(wrapper)).toEqual(['interrupted · KILLED', 'intercepted · DENIED', 'interrupted']);
+    expect(wrapper.text()).not.toContain('undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // issue #189：折叠段（compaction）横幅——独立视觉、摘要默认收起、「查看原文」只读懒加载
 // （loading → turns / 404 友好提示 / error + 重试）；会话头部状态行（N 条消息 · 已压缩 M 次）。
 // ---------------------------------------------------------------------------
