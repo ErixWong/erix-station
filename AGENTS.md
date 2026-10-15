@@ -579,7 +579,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **第一个写者赢**：分支 ③ 会把 `claim_token` 置空 ⇒ 迟到的 release 必 409 `lease_lost`，所以「reaper 先记 crash、agentd 复活后想报 watchdog」**不会**覆盖同幂等键的既有事件（那次真实死因不再上报）。
 - reaper 循环本来就不写 `audit_log` ⇒「谁改了队列状态」只有事件面可查。
 
-**发版与部署**：`TODO(主 agent)`。真机验收判据见 issue #292 交付报告（`docker pause fde-eric` ⇒ 等 90s+15s ⇒ 恰一条 `attempt_killed(killed_by:'crash', reason:'lease_expired', 无 silent_ms)` + 界面那一行无「（静默 …）」后缀 + 刷新后仍在 + `unpause` 后再 pause 一次应出现**第二条** `attempt:2`）。过了才关 #292。
+**发版与部署（已过期补记，2026-10-15 接班核对）**：本单随 **v0.1.10** 发布（`git tag --contains 450e197` 首个 tag = v0.1.10）。**真机复验已在 v0.1.10 完成并据此关掉 #292**（记录在 issue #292 最后一条评论，本文件不重抄）：`docker pause fde-eric` 造租约过期的真崩形状 ⇒ `attempt-killed:1` 与 `:2` **各恰一条**、payload 无 `silent_ms` 键、界面渲染「第 N/3 次尝试被终止（worker 非预期退出）」且**硬刷新后仍在**、zh/en 双语都**无「（静默 …）」后缀**；冻结→落库实测 ≈73s。本轮（v0.1.14 接班）**没重跑 pause 演练**——上面是引用已落地的验收记录，不是我今天亲手跑出来的。
 
 ### 8.24 渲染器补裸 URL 自动链接（#285 收尾，2026-10-14）
 
@@ -597,7 +597,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **已知边界（都钉了用例，不是洞）**：`http://x/中文` 截断到 `http://x/`；`http://…/Foo_(bar)` 少一个 `)`（不做括号配平）；`xhttp://a/x` 会从中间切开（无左边界）；流式半截 URL 提前成链；**成对 `_` 截断 URL**（`http://h/a_b_c` ⇒ `http://h/a<em>b</em>c`，**既有缺陷，markdown 链接分支同样中招**，本单既没扩大也没修）；`见 http://.` 链成 `href="http://"`；大写协议会链（与本文件既有 `/i` 口径一致，与 cmark-gfm 只认小写不同）。
 
-**发版与部署**：`TODO(主 agent)`。**本单不动 `runner/`**（告知面第 8 条随 portal 镜像下发即可）⇒ 真机复验 = 部署后打开 #285 R-1 那条会话（`116090a0…`），两个预览 URL 现在应是可点 `<a>`；过了才关 #285。
+**发版与部署（已过期补记，2026-10-15 接班亲手验）**：本单随 **v0.1.10** 发布（`git tag --contains feec932` 首个 tag = v0.1.10）；**#285 已据此关闭**。原判据「打开 #285 R-1 那条会话」在 dev 栈上**执行不了**——那条会话属 `acc019`，**admin 打开会被踢回 `#/`**（属主校验，不是 bug）。接班在 **v0.1.14** 上另走了一次等价真机：以 `eric` 登录 `station.fde.erix.vip:8090`，会话 `457fe11a…` / run `b87f3601…`（`judge_done`）让助手回一行**裸 URL** ⇒ DOM 里 `a[href="http://acc019-p-22061.fde.erix.vip:8090"]` **真的成了可点链接**（整屏 `a[href]` 计数恰为 1）。**反面同屏可见**：用户消息里同一条裸 URL **没**成链（`addMessage` 的 `isMd = role==='assistant' && !synthetic` 是既有口径，不是漏做）——顺带这也是 v0.1.14 部署后第一跑端到端 run（runner 未变 ⇒ 容器仍是 v0.1.13 镜像，不影响）。
 
 ### 8.25 LiteLLM 数据面模型名对账（issue #289 切片 A + B1，2026-10-14）
 
