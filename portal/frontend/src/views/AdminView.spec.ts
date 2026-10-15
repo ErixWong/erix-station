@@ -21,8 +21,8 @@ const PROVIDERS = {
     {
       id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
       models: [
-        { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, max_tokens: 16384, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
-        { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, max_tokens: null, enabled: false },
+        { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', model_name: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, max_tokens: 16384, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
+        { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', model_name: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, max_tokens: null, enabled: false },
       ],
     },
     { id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com', models: [] },
@@ -426,10 +426,11 @@ describe('AdminView · LLM 管理', () => {
       return undefined;
     });
     const modelRow = wrapper.get('[data-test="model-row"]');
-    expect(modelRow.findAll('td')).toHaveLength(8);
-    expect(modelRow.findAll('td')[4].text()).toBe('16384');
-    expect(wrapper.findAll('[data-test="model-row"]')[1].findAll('td')[4].text()).toBe('—');
-    expect(modelRow.text()).not.toContain('gpt-4o');
+    // #296：两列都在（调用名在最左、是操作面），列数 8 → 9
+    expect(modelRow.findAll('td')).toHaveLength(9);
+    expect(modelRow.findAll('td')[5].text()).toBe('16384');
+    expect(wrapper.findAll('[data-test="model-row"]')[1].findAll('td')[5].text()).toBe('—');
+    expect(modelRow.text, '上游模型 id 不渲染').not.toContain('openai/gpt-4o');
     await modelRow.findAll('button')[0].trigger('click');
     await flushPromises();
     const toggle = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1').find(
@@ -473,8 +474,8 @@ describe('AdminView · LLM 管理', () => {
     expect((editMaxTokens.element as HTMLInputElement).value).toBe('16384');
     await editUpstreamModel.setValue('openai/gpt-4o-edited');
     await editMaxTokens.setValue('4096');
-    await editForm.findAll('input')[1].setValue('GPT-4o edited');
-    await editForm.findAll('input')[2].setValue('65536');
+    await editForm.get('[data-test="edit-model-display-name"]').setValue('GPT-4o edited');
+    await editForm.get('[data-test="edit-model-context-window"]').setValue('65536');
     await editType.setValue('embedding');
     await editForm.find('input[type="checkbox"]').setValue(false);
     await editForm.trigger('submit.prevent');
@@ -542,14 +543,14 @@ describe('AdminView · LLM 管理', () => {
           id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
           models: [
             {
-              id: 'm1', provider_id: 'p1', model_id: 'deepseek-v4-pro', name: 'V4', type: 'text',
+              id: 'm1', provider_id: 'p1', model_id: 'deepseek-v4-pro', model_name: 'deepseek-v4-pro', name: 'V4', type: 'text',
               tool_calling: true, context_window: 128000, max_tokens: 16384, enabled: true,
               litellm_params: { model: 'openai/deepseek-flash' },
               input_cost_per_token: 0.00000028, output_cost_per_token: 0.0000011,
               pricing_configured: true, pricing_source: 'override',
             },
             {
-              id: 'm2', provider_id: 'p1', model_id: 'glm-5.3-flash-awq', name: 'GLM', type: 'text',
+              id: 'm2', provider_id: 'p1', model_id: 'glm-5.3-flash-awq', model_name: 'glm-5.3-flash-awq', name: 'GLM', type: 'text',
               tool_calling: false, context_window: null, max_tokens: null, enabled: true,
               pricing_configured: false, pricing_source: 'none',
             },
@@ -598,6 +599,150 @@ describe('AdminView · LLM 管理', () => {
     expect(patchBody.output_cost_per_token).toBeNull();
     wrapper.unmount();
   });
+
+  // --- #296：两个名字分开（调用名 = 数据面 model_name，显示名 = display_name） -----------------
+  const TWO_NAMES_PROVIDERS = {
+    items: [
+      {
+        id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
+        models: [
+          { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', model_name: 'gpt-4o', name: 'GPT-4o 展示名', type: 'text', tool_calling: true, context_window: 128000, max_tokens: 16384, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
+        ],
+      },
+      {
+        id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com',
+        models: [
+          { id: 'm2', provider_id: 'p2', model_id: 'claude别名', model_name: 'gpt-4o', name: '跨供应商重名', type: 'text', tool_calling: false, context_window: null, max_tokens: null, enabled: true },
+        ],
+      },
+    ],
+  };
+
+  it('#296 列表：调用名与显示名两列都可见，调用名是操作面；重名被标出来（网关不拦重名）', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm', (url) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, TWO_NAMES_PROVIDERS);
+      return undefined;
+    });
+    const head = wrapper.get('[data-test="provider-card"]').get('table thead');
+    expect(head.text()).toContain('调用名');
+    expect(head.text()).toContain('显示名');
+
+    const first = wrapper.findAll('[data-test="model-row"]')[0];
+    expect(first.findAll('td')[0].get('[data-test="model-call-name"]').text(), '调用名列（第一列）').toBe('gpt-4o');
+    expect(first.findAll('td')[1].text(), '显示名列').toBe('GPT-4o 展示名');
+
+    // 跨供应商同名（LiteLLM 的路由名是全局的）⇒ 两边都标出来（重名是对称事实，只标一个会看漏）
+    const second = wrapper.findAll('[data-test="model-row"]')[1];
+    expect(second.get('[data-test="model-call-name"]').text()).toBe('gpt-4o');
+    expect(second.get('[data-test="model-call-name-duplicate"]').text()).toContain('调用名重复');
+    expect(first.get('[data-test="model-call-name-duplicate"]').text()).toContain('调用名重复');
+    expect(wrapper.findAll('[data-test="model-call-name-duplicate"]')).toHaveLength(2);
+    wrapper.unmount();
+  });
+
+  it('#296 编辑表单：两个字段分开，各自带说明；调用名回填的是数据面 model_name', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm', (url) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, TWO_NAMES_PROVIDERS);
+      return undefined;
+    });
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    const callName = editForm.get('[data-test="edit-model-call-name"]');
+    const displayName = editForm.get('[data-test="edit-model-display-name"]');
+    expect((callName.element as HTMLInputElement).value, '调用名预填 model_name（不是显示名）').toBe('gpt-4o');
+    expect((displayName.element as HTMLInputElement).value).toBe('GPT-4o 展示名');
+    expect(callName.attributes('required')).toBeDefined();
+    const labels = editForm.text();
+    expect(labels).toContain('FDE 请求实际发的名字');
+    expect(labels, '显示名一句说明要点明它只影响展示').toContain('不影响 FDE 请求里发的名字');
+    wrapper.unmount();
+  });
+
+  it('#296 改调用名：点提交先出确认（点名旧名→新名），**确认前一个 PATCH 都不发**；取消也不发', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    await editForm.get('[data-test="edit-model-call-name"]').setValue('gpt-4o-new');
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+
+    const confirm = wrapper.get('[data-test="call-name-confirm"]');
+    expect(confirm.attributes('role')).toBe('alertdialog');
+    expect(confirm.text()).toContain('把调用名从 gpt-4o 改成 gpt-4o-new');
+    expect(confirm.text()).toContain('FDE 请求里实际发的名字会跟着变');
+    expect(confirm.text()).toContain('仍在发旧名的请求会失败');
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')).toHaveLength(0);
+
+    await wrapper.get('[data-test="cancel-call-name"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="call-name-confirm"]').exists()).toBe(false);
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it('#296 确认后发出的 PATCH 同时带 call_name 与 name（两个字段各写各的位置）', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    await editForm.get('[data-test="edit-model-call-name"]').setValue('  gpt-4o-new  ');
+    await editForm.get('[data-test="edit-model-display-name"]').setValue('新展示名');
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')).toHaveLength(0);
+
+    await wrapper.get('[data-test="confirm-call-name"]').trigger('click');
+    await flushPromises();
+
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0];
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      model: 'openai/gpt-4o', call_name: 'gpt-4o-new', name: '新展示名', type: 'text',
+      tool_calling: true, context_window: 128000, max_tokens: 16384,
+    });
+    expect(wrapper.find('[data-test="call-name-confirm"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('#296 只改显示名 ⇒ 不出确认、直接提交，且 body 不带 call_name（服务端因此不触发立即对账）', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    await editForm.get('[data-test="edit-model-display-name"]').setValue('只是换个展示名');
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="call-name-confirm"]').exists()).toBe(false);
+    const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0];
+    const body = JSON.parse(String(patch?.[1]?.body));
+    expect(body.name).toBe('只是换个展示名');
+    expect(body, '没改调用名就不要带它（带了服务端会去做一次对账）').not.toHaveProperty('call_name');
+    wrapper.unmount();
+  });
+
+  it('#296 调用名留空 ⇒ 不提交并点名必填（不许静默回退成旧名）', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    await editForm.get('[data-test="edit-model-call-name"]').setValue('   ');
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="edit-model-call-name-error"]').text()).toContain('调用名不能为空');
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')).toHaveLength(0);
+    wrapper.unmount();
+  });
+
 });
 
 describe('Admin modals', () => {

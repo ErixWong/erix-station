@@ -67,6 +67,17 @@
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
+| LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
+| LLM 管理 | `POST /api/admin/llm/providers/:id/models` | 新增模型 |
+| LLM 管理 | `PATCH /api/admin/llm/models/:id` | **改模型：调用名 `call_name`（数据面）与显示名 `name` 是两个字段**（#296，§4.9） |
+| LLM 管理 | `GET /api/admin/llm/models/:id/delete-impact` | 删除前算「会被打断的 run」 |
+| LLM 管理 | `DELETE /api/admin/llm/models/:id` | 删模型（附虚拟 key 清理） |
+
+> LLM 管理这条线**其余**端点（供应商增删、`GET/PUT /api/admin/fdes/:name/llm`、
+> `POST /api/admin/fdes/:name/llm/heartbeat`、`GET /api/admin/llm/model-catalog`、
+> `GET /api/admin/llm/usage`）此前同样不在索引里，本次不逐个补写契约（不在 #296 面上）；
+> 行为以 `portal/src/llm.js` + `portal/test/llm*.test.js` 为准，改名这条线的契约见 §4.9，
+> 心跳对账的口径见 `AGENTS.md` §8.25。登记这几行是为了「端点索引与文档自洽」（§7.13）。
 
 > 所有端点（除 `/api/forward-auth` 与登录两端点外）要求有效 session cookie，否则 `401 unauthorized`。
 >
@@ -111,6 +122,7 @@
 | 403 | `password_change_required`（#255，工单 `feat-261013-03`）| **受限会话被拦**：已认证，但 `users.must_change_password=true` 且尚未改密 ⇒ 除 §2.11a 放行清单外的 `/api/*` 全部拒。**与 `forbidden` 的关键差别：不是「这件事你没权限」而是「这枚口令还没经过你的手」**；解法只有一个（`POST /api/me/password`），所以 `details` 直接给 `{action, endpoint}`。登录（新旧两条）、登出（新旧两条）、`GET /api/me`、`/api/me/password`、`/api/forward-auth`、`/api/internal/*` 不受限（逐条理由见 §2.11a）；**未认证的 401 语义不变**（门只管已认证的人）。**不写审计**（SPA 轮询会把它刷成噪声，理由见 §2.11a）| 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
 | 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2。**#246 交付② 同一码也用在新端点 `POST /api/admin/fdes/:fdeName/ports/block`**：管理员显式指定的块被外来活行占住、或搬迁中途插入数 ≠ 10（并发抢号 ⇒ 整笔回滚）——**那里 `retryable` 是 `false`**（盲试同一段必败，要先换一个起点），口径见 §4.7a） | 是（仅此码；**例外**：§4.7a 的改块 409 为 `false`） |
+| 409 | `model_name_conflict`（#296，工单 `feat-261015-03`）| **管理员改「调用名」时撞了另一个模型正在用的数据面名字**：`PATCH /api/admin/llm/models/:id` 带 `call_name`，而网关目录里**别的** deployment 的顶层 `model_name` 已经是它。`details` = `{field: 'call_name', call_name, conflicting_model_id}`。**为什么门户要拦**：真机实测 LiteLLM **不拦重名**（两条 deployment 都 200 建成），而 `GET /v1/models` 只列一个、按名字路由时请求在两个 deployment 之间**轮询** ⇒ 同名 = 静默的二义性，比报错更难查（§4.9）。同码也用于**调用名没变、但顺手把上游模型 `litellm_params.model` 改成另一个模型正在用的调用名**（网关路由表按顶层名选 deployment，那个新值落进去就是同一件事）。与 `name_conflict` 的差别：那是会话/仓库标题冲突，本码是**数据面路由名**冲突 | 否（换个名字才行）|
 | 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
@@ -1209,6 +1221,53 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 请求：`{ "decision": "approve", "note": "可选备注" }`（`decision`: `approve` \| `deny`）。
 响应 `200`：更新后的 Approval；runner 轮询到决定后继续/终止该工具调用。
 错误：`404 not_found`；`409 already_decided`（已 `approved`/`denied`）；`409 approval_expired`（审批已超时 `expired`，迟到决定被拒，§9.10）。
+
+### 4.9 管理台 LLM 模型管理（`/api/admin/llm/*`，#296）
+
+整条线 **admin-only**（非 admin ⇒ `403 forbidden`，错误体见 §1.1）。本节只覆盖**模型**这条线，
+重点是把「改名」拆成两个字段——其余（供应商增删、用户 LLM 配置、心跳、价目表）行为以代码与测试为准。
+
+**一个模型有两个名字，不是一回事**（#296 的整件事就来自把它们当成同一个）：
+
+| 模型对象字段 | 落在网关的哪里 | 语义 |
+|---|---|---|
+| `model_name`（**调用名**） | deployment **顶层** `model_name` | **操作面**：FDE 请求里实际发的那个名字。`fde_llm_bindings.main_model_id` / `main_model_name`（及 embedding/vision 同名列）与 per-FDE 虚拟 key 的白名单里存的**都是它** |
+| `name`（**显示名**） | `model_info.display_name` | 只影响管理台列表与选择器展示；**缺省时等于调用名**（LiteLLM 的缺省行为，`toModel` 原样回读），改它不影响 FDE 发什么 |
+
+`PATCH /api/admin/llm/models/:id` 请求体字段（全部可选，但至少给一个；`model_info.id` 由服务端按
+路径参数回填，客户端塞了也不算）：
+
+| 字段 | 类型 | 落点 / 校验 |
+|---|---|---|
+| `call_name` | string | **调用名** → 顶层 `model_name`（#296 新增）。必须是非空字符串，服务端 `trim` 后写入；trim 后为空 ⇒ `400 validation_failed` + `details.field='call_name'`；与**另一个**模型的调用名重名 ⇒ `409 model_name_conflict`（见 §1.2）。改它 = 改 FDE 手里正在用的名字 ⇒ 管理台**必须先点一次确认**（确认前零 PATCH，§2 末原则：确认框只准挂在按钮上）；成功后门户立刻对账（下一段） |
+| `name` | string | 显示名 → `model_info.display_name`（**既有语义，一字未动**）。改它不触发任何数据面动作 |
+| `model` | string | 上游模型 id → `litellm_params.model`（不可与别的调用名撞，见上） |
+| `type` | `'text'\|'embedding'\|'rerank'\|'vision'` | 非法值 ⇒ `400 validation_failed`（`details.field='type'`） |
+| `tool_calling` | boolean | 支持 function calling |
+| `context_window` / `max_tokens` | number | `context_window` ≤0 ⇒ `400`（`details.field='context_window'`） |
+| `input_cost_per_token` / `output_cost_per_token` | number \| null | 显式定价（§8.31）；管理台按 **USD/1M** 输入输出、原值回读 |
+
+**带 `call_name` 且调用名真的变了 ⇒ 网关改名成功后门户立刻做一次对账**（#296，判据与 §8.25 心跳完全同一条）：
+
+```
+SELECT fde_id FROM fde_llm_bindings
+ WHERE main_model_id = $1 OR embedding_model_id = $1 OR vision_model_id = $1   -- $1 = model_info.id
+   → 逐个绑定走 getFdeLlmHeartbeatModels（**复用**心跳那条，不另写第二份并集逻辑）
+     → per-FDE 虚拟 key 白名单写成**新旧名并集**（先扩名字空间）
+     → 再回写 *_model_name = 新调用名（*_model_id 不变 ⇒ LiteLLM 不重建、在途不断）
+```
+
+- N 个受影响 FDE 合计**只打一次** `GET /model/info`：改名前那份 60s TTL 映射必须绕开（拿旧映射会判成
+  「没漂移」⇒ 空对账，管理员改了名 FDE 仍 403）。
+- **只传 `ctx.llmGateway` 单例**：那份 TTL 缓存挂在 LlmClient 实例上、按 client 身份分槽，
+  路由里另 `new LlmClient(...)` 等于换一份缓存（§8.25 缓存身份陷阱，单测用注入 gateway 盯不住）。
+- 真机实测（dev 网关 v1.103.2）：改名时 LiteLLM 自己把 key 的 `models` 重写成「只有新名」
+  ⇒ **这个并集是必须的那一手**，不是可选优化。
+- 对账失败/网关不可达 ⇒ 只 `warn`（`[llm] model rename reconcile ...`）：**不改回 `model_name`**。
+  改名已在网关落定，把 PATCH 拖成 500 只会诱导管理员重试第二次改名；不自动回滚的理由同 §8.25。
+- 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
+  暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见 `AGENTS.md` §8.25。
+
 
 ---
 
