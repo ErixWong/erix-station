@@ -749,13 +749,25 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 **主 agent 亲跑变异（不复用 worker 的 8 条）**：① 把「窗口无 run ⇒ 早退」挪到候选查询**之后** ⇒ **恰 1 条具名红**（成本红线是被钉住的）；② store 分流条件改永假 ⇒ **5 条具名红**；③ `truncated` 由 `=== true` 改 `!= null` ⇒ **恰 1 条红**。另我自己补了一条**探覆盖面的变异**：把合成项从「按 seq 归并」改成「追加到末尾」⇒ **17 条全绿**——先 `git diff` 证明不是空操作，再定性：**后端归并顺序不是契约面**（前端 `openSession` 本来按 `seq` 重排），真正的归并位判据在 ② 那条前端用例上。
 
 **已知边界（都是刻意口径，别当 bug 修）**：
-- **刚停止那一刻仍看不到**：合成项只在 `GET /events/history` 里，而该响应只在 `openSession`（打开/刷新/重进会话）时拉；终态后的 `refreshSession` 不重拉 history ⇒ **要刷新一次才出现**（已单独登记产品小单）。
+- **刚停止那一刻仍看不到**：合成项只在 `GET /events/history` 里，而该响应只在 `openSession`（打开/刷新/重进会话）时拉；终态后的 `refreshSession` 不重拉 history ⇒ **要刷新一次才出现**（已登记 [#306](https://github.com/ErixWong/erix-station/issues/306)；**真机实测坐实**：点停止前/后 4s `.msg.partial` 都仍是1 条（只有历史那条），刷新后变 2 条）。
+- **合成项只出现在「该 run 真的落在本次窗口里」的那一页**：真机一个会话有 **14.4 万条事件**，标本 run 在 seq 30785–39411 ⇒ 不翻到那一页就看不到（判据①的必然结果，**不是 bug**；翻到即出现）。
 - **`HISTORY_REPLAY_TYPES` 这条判据目前不承重**：把 `partial_output` 加进去无测试会红（`replayEvent` 无该分支 ⇒ 落 `default` 中性忽略，「加了也看不见」）。**不加新导出面去钉一个没有后果的性质**；防线在 store 侧不喂（变异 ② 恰 5 红）。
-- 聚合把候选 run 的全部 delta 拉回 JS 再截 2000 字（SQL 侧 `LIMIT` 更省，但会改 `chunks` 语义 = 一次口径决定）；`chunks` = **实际拼进正文的片段数**（脏片段不计，文档已写死这句）；合成项的 `seq` 可能落在分页窗口外（whole-run 聚合的必然结果）；语言切换后已渲染的标签不回溯翻译（项目既有「取词即快照」口径）。
+- 聚合把候选 run 的全部 delta 拉回 JS 再截 2000 字（SQL 侧 `LIMIT` 更省，但会改 `chunks` 语义 = 一次口径决定）；`chunks` = **实际拼进正文的片段数**（脏片段不计，文档已写死这句）；合成项的 `seq` 可能落在分页窗口外（whole-run 聚合的必然结果）。
+- ⚠ **标签是响应式回溯翻译的**（真机实测，**推翻我工单里写的「取词即快照」**）：模板直接 `t('stream.partialOutput.label')` ⇒ 不刷新页面把界面从 English 切到中文，**已渲染的那条气泡标签当场变成「已中止 · 部分输出」**。快照口径只适用于 store 侧写进 entry 字段的文本，别拿它当这个元素的现状。
 
 **不在本单**：SSE 通路合成、把 `assistant_delta` 进下发白名单、`reasoning_delta` 聚合、`termination.reason` 参与判据（现在只看 `status`）、单 run 极多片时的熔断上限。
 
-**发版与部署**：`TODO(主 agent)`。**本版不动 `runner/`** ⇒ 按 digest 只 pin portal + proxy，**不重建 FDE 容器**。真机判据（dev）：拿会话 `1ead0b1a…` 的标本 run `72e2577d…` 刷新 ⇒ 应看到**中性助手气泡 + 「已中止 · 部分输出」标签**（zh/en 各一次）、**不是红色告警行**；同会话里 `judge_done` 的 run **不得多出一条**（重复正文）；硬刷新后仍在；整页无 `undefined`/`[object Object]`/空气泡。过了才关 #300。
+**发版与部署（已完成）**：PR **#307** 合并（`ddeead8`，PR CI `38745692367` 绿）→ main CI `38747249886` 绿（含**镜像构建校验**，这是打 tag 的前置）→ tag `v0.1.15` → release run `38747759997` success → 清单 `images-digest` 与部署机 `docker pull` 后 `docker image inspect` **逐个一致**：portal `imageId=edf15e52…` / `digest=3721b8cc…`、proxy `imageId=777d7789…` / `digest=1904b7eb…` → `deploy/.env` 形态① pin（备份 `/tmp/deploy.env.bak-0115`）→ `docker compose -p station --profile litellm up -d --no-build` ⇒ portal 实跑 `edf15e52…`、proxy 实跑 `777d7789…`，两者 healthy，经 Traefik `/healthz` 200。
+⚠ **本版只 pin 两个镜像**：本版 `runner/` 下**只有版本号变动**（`runner/package.json` + lockfile；`git diff --name-only … | grep -c '^runner/.*\.js$'` = **0**）⇒ `FDE_IMAGE` **故意仍 pin 在 v0.1.13 摘要**、**没重建 FDE 容器**（别当漏做；所说「不动 runner」指**不动 runner 代码**）。
+
+**真机验收全过（dev，v0.1.15，主 agent 亲手）**：
+- **API 面四类标本**（从 host 网络容器 `erix_station_playwright` 发，**带 `Origin`**）：`aborted` 25 字（会话 `457fe11a…`/run `9cd252a6…`）与 `aborted` 133 字（`f7eee43c…`/`f3b715a1…`）各**恰一条**，`chunks`/`len` 与库里 `assistant_delta` **逐字相等**（13/25、31/133）；`failed` 37 字（`e67eaef5…`/`f5b6df8e…`）在**深窗**（`before=39412&limit=500`）里拿到恰一条，`chunks=22`/`len=37` 与库同；**工具中被停的那条**（`72e2577d…`：669 条 `reasoning_delta`、**0 条 `assistant_delta`**）**零合成项**——判据③在真机上成立（⚠ **我原先拿它当标本是选错了**：它在工具调用里被停，根本没吐正文，而我先在 §8.30 写的判据就拿它写了「应看到气泡」）。`POST /api/auth/login` **不带 `Origin` 会 400**（#234 同源门），脚本补 `Origin` 后 200。
+- **不重复 / 不占额度**：`assistant_delta` 在四个会话响应里出现次数全为 **0**（不会同一段正文来两遍）；`limit=500` 的深窗返回 **501** 条 = **500 真实事件 + 1 合成项**（「合成项不占 `limit`」在真数据上成立）；含合成项在内 `seq` 全序升序。
+- **浏览器面**：`.msg.partial` **恰好 1 条**，类名 `msg assistant md partial`、**不含 `syserr`**；computed style 实测 `border-left: 3px solid rgba(0,0,0,.18)`（普通助手消息 `0px`）⇒ **中性墨色左竖线**是这个面的唯一视觉标识，未引入新颜色；英/中双语标签逐字对上；正文走助手 markdown；硬刷新后仍在；整页无 `[object Object]`/`NaN`（`undefined` 只出现在一条旧助手消息的 `<code>` 块里，已逐节点定位＝**内容不是脏值**）。
+- **负例与截断都在真机上拿到**：同会话里一条 `judge_done` 长文 run（7400+ 字、**有锚点**）**没多出一条**（`partialCount` 保持 1）；再发一条 12000 字请求、跑到 **7418 字**时点「停止」⇒ 停前/停后 `partialCount` 都是 1（**#306 边界坐实**），**刷新后变 2 条**，新那条 `truncated=true` 带「输出在停止前未生成完全（已截断）」、正文钉在 2000 字。截图 `/docker/erix_station_playwright/v0115-300-partial-paizhao.png`（vision 读图复核：标签中性灰、无红色告警、无脏值；截断提示在气泡尾部、该屏折叠线以下所以图上看不到，DOM 断言已钉）。
+- **dev 残渣**：会话 `457fe11a…` 多了两条我发的探针消息（一篇 3000 字已完成长文 + 一篇停在 7418 字的长文），**故意不清**：它们同时是「有锚点不重复」与「截断」两块面的现成回放标本。
+
+**#300 已关闭。**
 
 
 
