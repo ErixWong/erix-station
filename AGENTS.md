@@ -683,7 +683,13 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **不在本单（已挂账）**：#300 消费 `error.finalText`（停止后助手文本整体消失，上游 §5 点名宿主侧边界）、#301 是否开 `partialPersistence`（需决策）、#303 一代回退清账、`toolCallKey` 接进 UI。
 
-**发版与部署**：`TODO(主 agent)`。⚠ **本单动 `runner/` ⇒ 必须重建 FDE 镜像 + 按 digest pin `FDE_IMAGE` + `docker rm -f` 全部 fde-\* 让 reconcile 重建**（§8.17 先例）；真机判据见交付报告 §6.2（`sleep 2` ⇒ `duration_ms≈2000` 且卡片显 `2.0s`；`writeFile` 空文件 ⇒ 显 `0ms` 不是「无时长」；被中止的那次 ⇒ NULL 且前端不渲染时长；新 run 的 `duration_ms IS NULL` 比例≈0，旧 740 条仍 NULL 是**正确**的）。
+**发版与部署（已完成）**：PR #304 → tag `v0.1.13`（main CI 含镜像构建校验全绿后打）→ release run `38696447739` → **三镜像一次拉成功**（前几日反复超时的 `fde` 这次没闹）→ 清单 `imageId` 与部署机 `docker image inspect .Id` 逐个一致（portal `197fd9ba…` / fde `d80973f3…` / proxy `adf566b4…`）→ `deploy/.env` 形态① pin **三个一起换**（含 `FDE_IMAGE`，备份 `/tmp/deploy.env.bak-0113`）→ `up -d --no-build` → **`docker rm -f` 全部 7 台 fde-\* 后 reconcile 全部落在 `d80973f3…` 且 healthy**（§8.17：动 `runner/` 不重建就还是旧引擎）。
+
+**真机验收（v0.1.13，dev，主 agent 亲手，run `180d90c1…` / `72e2577d…`）**：
+- **三种返回形态各一条**：`shell sleep 2` ⇒ 库 `duration_ms=2016`、界面 `✓ 2.0s`；**`writeFile` 写空文件**（digest `0`）⇒ `duration_ms=4`、界面 `✓ 4ms`（**这正是 #283 当年要靠临时闸才拿得到的那一支**，现在是引擎自己写的）；`readFile` ⇒ `3ms`。整页**无假 `0ms`**、无 `undefined`/`[object Object]`/`NaN`。
+- **NULL 账**：新 run **0/3 为 NULL**；全库 `33 有 / 745 NULL`，745 全是升级前旧记录（不可回填，属**正确**历史，不是待修数据）。
+- **0.20.0 §4 的中止语义**：跑到 25s 点「停止」⇒ `runs.termination = {reason:"aborted", partial:true, usage:{…}, rounds:24}`，**没有谎报 `judge_done`**（修复前那条窗口会给出 success 且**不带 usage/rounds/partial**）；被中止的那次 `shell` 在 `tool_calls` 里 `duration_ms IS NULL` 且无 digest ⇒ 界面不渲染时长（**没伪装成 0ms**）。
+- **顺带在现场复现了 #300**：那次停止的 run `partial:true`（引擎把已生成文本挂在 `error.finalText`），而 `runner/worker.js` 固定 `final_text:''` ⇒ 该 run **零助手锚点**（库里只有 user）。**#300 已带这条实测数据**。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
