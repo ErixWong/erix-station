@@ -380,7 +380,7 @@ async function startRun(msg) {
   // number / `{content,metadata}` / 招异常），所以下面**不再包一层计时**。
   // issue #283 留下的 `wrapToolResultForDuration` 适配闸已撤（撤闸判据 = .work-orders/probe.md 探针 1：
   // 0.20.0 下四种形态无闸均带 `erix.durationMs`，延时 25ms 的执行器给 25ms）；回装会被
-  // `runner/test/tool-duration.test.js` 的防回装断言红掉。本处只保留两件事：note_* 路由，以及
+  // `runner/test/tool-result-envelope-contract.test.js` 的防回装断言红掉（`tool-duration.test.js` 已随撤闸删除）。本处只保留两件事：note_* 路由，以及
   // issue #211 的 abort signal 转交（下面注释）。引擎对抛异常自己 catch ⇒ 本处不 catch。
   const executeTool = async (options) => {
     if (noteTools.executeTool && noteToolNames.has(options.name)) {
