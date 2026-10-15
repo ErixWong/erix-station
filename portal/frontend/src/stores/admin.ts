@@ -16,6 +16,9 @@ export interface LlmModel {
   id: string;
   provider_id: string;
   model_id: string;
+  /** #296：数据面调用名 = LiteLLM 顶层 `model_name`，即 **FDE 请求实际发的那个名字**（操作面）。 */
+  model_name: string;
+  /** #296：展示名 = `model_info.display_name`（后端缺省时回退成调用名，两者不再等价）。 */
   name: string;
   type: string; // text | embedding | vision | rerank | audio-tts | audio-stt | image-gen
   tool_calling: boolean;
@@ -464,7 +467,7 @@ export const useAdminStore = defineStore('admin', {
     /** 编辑模型可变字段：PATCH /api/admin/llm/models/<id>。 */
     async updateModel(
       m: LlmModel,
-      fields: { name: string; type?: string; tool_calling: boolean; context_window?: number; max_tokens?: number | null; model?: string; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
+      fields: { name: string; call_name?: string; type?: string; tool_calling: boolean; context_window?: number; max_tokens?: number | null; model?: string; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
     ): Promise<string | null> {
       this.llmErr = null;
       try {
