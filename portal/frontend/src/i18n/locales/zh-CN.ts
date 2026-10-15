@@ -191,6 +191,13 @@ export const zhCN = {
     sessionStats: '{count} 条消息',
     sessionStatsCompacted: '已压缩 {count} 次',
     sessionCompactionHint: '上下文已开始压缩；如需保留完整细节，建议新开会话',
+    // issue #300：被停止/失败的 run 零助手锚点 ⇒ 正文区本来一片空白；历史端点把已生成的
+    // assistant_delta 聚合成一条合成项下发。**中性口径**：既不说「已完成」（它没完成）也不说
+    // 「错误」（半截正文不是错），zh 语义必为「已中止 · 部分输出」。
+    partialOutput: {
+      label: '已中止 · 部分输出',
+      truncated: '输出在停止前未生成完全（已截断）',
+    },
     event: {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',

@@ -169,6 +169,14 @@ export const en = {
     sessionStats: '{count} messages',
     sessionStatsCompacted: 'compacted {count}×',
     sessionCompactionHint: 'Context compaction has started; open a new session if you need to keep full details',
+    // issue #300: an aborted/failed run has ZERO assistant anchors, so its body area used to render
+    // blank; the history endpoint aggregates its assistant_delta into one synthetic item. NEUTRAL
+    // wording on purpose: not "completed" (it never finished) and not an "error" (a half-written body
+    // is not a fault) -- the paired zh label reads exactly "已中止 · 部分输出".
+    partialOutput: {
+      label: 'Aborted · partial output',
+      truncated: 'Output was not finished before the run stopped (truncated)',
+    },
     event: {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',

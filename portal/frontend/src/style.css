@@ -25,6 +25,10 @@
 .msg.assistant { background: transparent; padding: 0; }
 .msg.synthetic { border-left: 3px solid #ffc107; background: #fff3cd; padding: 8px 12px; border-radius: 0 6px 6px 0; }
 
+/* issue #300：中止/失败 run 的部分正文。**中性视觉**：只拿既有的墨色低透做成一条左竖线（与
+   .roundsep 同色系），**不引入新颜色语义**——.syserr 的 #dc3545 是「错误」，不该被「半截正文」借用。 */
+.msg.partial { border-left: 3px solid rgba(0, 0, 0, .18); padding-left: 10px; }
+
 /* issue #40：Markdown 子集渲染样式（renderMarkdown 输出钩子不变，视觉规格对齐
    pi-web .markdown-body / .markdown-inline-code / .markdown-code-block / .markdown-table-wrap。
    排版基调：14px 基准、line-height 1.7、--bg-subtle 等价 rgba(0,0,0,.03)、
