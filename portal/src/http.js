@@ -1013,6 +1013,15 @@ async function handleAdminApi(req, res, ctx, url) {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
       const model = await llm.updateModel(ctx.llmGateway, modelId, body);
+      // #296：改了「调用名」（`call_name` → 数据面 `model_name`）就是真改名 ⇒ 立刻铺一次 #289 的
+      // 对账，别让人等「心跳 15s + TTL 60s」。两个硬条件：**只传 ctx.llmGateway 单例**（§8.25
+      // 的 TTL 缓存按 client 对象身份分槽，现造 client ⇒ 每个受影响绑定多打一次 /model/info）；
+      // **不另写一份并集逻辑**（动作全在 reconcileDataPlaneNameRename 里转 getFdeLlmHeartbeatModels）。
+      // 它自己吐错 ⇒ 改名已落定，不会被拖成 500；失败退回心跳自愈。
+      if (body && Object.hasOwn(body, 'call_name')) {
+        const rename = await llm.reconcileDataPlaneNameRename(ctx.pool, ctx.llmGateway, modelId);
+        ctx.log.log('[llm] model rename reconcile', { model_id: modelId, ...rename });
+      }
       return sendJson(res, 200, { model });
     }
     if (req.method === 'DELETE') {

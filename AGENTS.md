@@ -605,6 +605,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **⚠ 两条被推翻的前提（别按我最初的分析去找修复点）**
 - **门户内「改名」不是漂移源**：`updateModel`（`llm.js:462`）把 `name` 写进 **`model_info.display_name`**，**不写 `model_name`**——实测 PATCH 200 后 `/model/info` 的数据面名一字未变。所以「改名后同步 bindings」是修一条不存在的路径；已改成**注释 + 用例钉住这个语义**，误导面另登记 **#296**。
+  **#296 就地补注（工单 `feat-261015-03`：这句话本身就是那个「误导面」）**：上面那句**只对「只改展示名」成立**，而它当时的结论「改名后同步 bindings 是修一条不存在的路径」也只在这个前提下成立。管理台的「改名」已拆成两个字段：**显示名** `name`（→ `model_info.display_name`，既有语义一字未动，确实不是漂移源）与**调用名** `call_name`（→ **顶层 `model_name`** = FDE 请求实际发的那个名字，`fde_llm_bindings.*_model_name` 与 per-FDE key 白名单存的都是它）。**改调用名会把引用它的那些 FDE 当场变成漂移**：`*_model_name` 暂时指向旧名，且真机实测（dev 网关 v1.103.2）LiteLLM 在改名时自己把 key 的 `models` 重写成「只有新名」⇒ 不立刻对账就是直接 403。所以带 `call_name` 的 PATCH 成功后**必须立刻走一次上面的对账**（实现 `reconcileDataPlaneNameRename`：**复用** `getFdeLlmHeartbeatModels`、不另写第二份并集逻辑；首跳 `ttlMs=0` 绕开改名前那份旧映射 ⇒ N 个受影响 FDE 合计只打一次 `GET /model/info`；**只传 `ctx.llmGateway` 单例**——本节那条「另 new 一个 LlmClient 等于换一份缓存」的教训在这里一字不差地重演，单测用注入 gateway 盯不住）。旧调用名留在并集里 ⇒ 不再伪装成 auth 错误，但已从路由消失，仍发旧名的请求会失败；改名同样**不自动回滚**（理由同本节）。另一件事：**LiteLLM 不拦同名调用名**（实测两条 deployment 都 200，`GET /v1/models` 却只列一个、请求在两者间轮询）⇒ 门户必须拦，新增 `409 model_name_conflict`。两个名字的端点契约见 `docs/api/portal.md` §4.9。
 - **只回写 DB 仍会 403**：key 白名单存的是名字 ⇒ 必须**两处一起**同步。
 
 **载荷**（`llm.js` 新增模块级私有件 + 心跳调用点接线）
@@ -690,6 +691,28 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **NULL 账**：新 run **0/3 为 NULL**；全库 `33 有 / 745 NULL`，745 全是升级前旧记录（不可回填，属**正确**历史，不是待修数据）。
 - **0.20.0 §4 的中止语义**：跑到 25s 点「停止」⇒ `runs.termination = {reason:"aborted", partial:true, usage:{…}, rounds:24}`，**没有谎报 `judge_done`**（修复前那条窗口会给出 success 且**不带 usage/rounds/partial**）；被中止的那次 `shell` 在 `tool_calls` 里 `duration_ms IS NULL` 且无 digest ⇒ 界面不渲染时长（**没伪装成 0ms**）。
 - **顺带在现场复现了 #300**：那次停止的 run `partial:true`（引擎把已生成文本挂在 `error.finalText`），而 `runner/worker.js` 固定 `final_text:''` ⇒ 该 run **零助手锚点**（库里只有 user）。**#300 已带这条实测数据**。
+
+### 8.29 管理台「改名」变成受管改名：`call_name`（数据面）与 `name`（展示名）分开（issue #296，2026-10-15）
+
+**病根（两行实现，不是概念分歧）**：`llm.js#toModel()` 的 `name = info.display_name ?? metadata.display_name ?? model_name`，而 `updateModel()` 的 `name` **只写** `model_info.display_name` ⇒ 管理台那一列跟着变、**看着生效**，但数据面 `model_name`（FDE 请求实际发的名字、`fde_llm_bindings.*_model_name`、per-FDE key 白名单存的东西）一字未动。
+
+**定稿（两个名字分开，显式优于隐式）**：新增 `call_name` → **顶层 `model_name`**（操作面）；`name` 的既有语义（→ `display_name`）**一字未动**，兼容面保留。列表两列都可见，改调用名**必须先点确认**（同 #246 改块先例：确认前一个 PATCH 都不发）。
+
+**三条实测换来的信息（worker 跑，主 agent 真机复验后落此节）**：
+1. **LiteLLM 不拦同名** —— 两个 deployment 改成同一个 `model_name` 都返 200 ⇒ **拦在门户**：新错误码 `409 model_name_conflict`（登记 `portal.md` §1.2，`details={field:'call_name',call_name,conflicting_model_id}`）。
+2. **改数据面名不会顺手改/清 `display_name`** ⇒ 两个字段确实互不干扰，才敢分开。
+3. 改名时 **LiteLLM 自己把 key 的 `models` 重写成「只有新名」**（§8.25 已实测过一次）⇒ 我们铺**新旧名并集**正是为此，不打断在途请求。
+
+**传播不新写机制**：`reconcileDataPlaneNameRename()` **复用 §8.25 心跳对账那条路径**（动作在里面转调 `getFdeLlmHeartbeatModels`，**禁止复制一份并集逻辑**），`http.js` 在 PATCH 成功后**立即触发一次**，并**必须传 `ctx.llmGateway` 单例**（§8.25 TTL 缓存按 client 对象身份的坑）；心跳仍是兜底。§8.25 那句「门户内『改名』不是漂移源」已**就地标注部分失效**（原句保留）。
+
+**前端呈现**：沿用 `stores/admin.ts:12` 既有口径「服务端透传的 `error.message` 不译，只加本地化前缀」⇒ **不新增文案键**（与 #246「409 全文可见」同形）。
+
+**测试**：根 **1177 → 1187**（+10，全在 `llm-reconcile.test.js`，含端到端「顶层名落网关 + 立刻铺并集与回写」）、前端 **546 → 552**（+6，`AdminView.spec.ts`）；台账三处已同步。
+**主 agent 亲跑变异（不复用 worker 的）**：① 把 `call_name` 的数据面写入摘掉（复现 #296 原病症）⇒ **3 条具名红**；② 立即对账的 `ctx.llmGateway` 传成 `null` ⇒ **恰 1 条红**（端到端那条）；③ 前端确认门改成直接提交 ⇒ **恰 2 条红**（「确认前零请求」+ PATCH 形状）。
+
+**事故记录（§3.0「收尾纪律不能依赖工具调用」又一次发作，这次代价最小）**：worker 主体两个 commit 全落地（后端 +113/+335、前端 +142/+165，沙箱内我复跑 1187/552 全绿），**却被自己一条 `ls /tmp/body-*.html`（glob 无匹配 → 退出码 2）判成终局失败**，报告没写出来。处置：`resume` 同一执行体只补报告、不改代码（主 agent 已并行完成三套复跑 + 三条变异 + 合并）。**口径：给 worker 的工单里，收尾产物一律「直接写文件」，不许用 glob 猜名字。**
+
+**发版与部署**：`TODO(主 agent)`。本单**不动 `runner/`** ⇒ 只需 portal+proxy 两镜像，**不重建 FDE 容器**。真机判据：管理台改调用名 → ① LiteLLM 顶层 `model_name` 变、`display_name` 不变；② `fde_llm_bindings.*_model_name` 回写；③ `/key/info` 的 `models` = **新旧并集**；④ 撞名返 409 且文案点名被谁占用；⑤ 只改展示名 ⇒ 数据面一字不动、不触发对账。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
