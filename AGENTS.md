@@ -730,6 +730,35 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **一条可读性观察（不是缺陷）**：409 的文案用**冲突方的 model id** 点名，不是它的调用名。契约（§1.2 `details.conflicting_model_id`）就是这么定的，但管理员看到的是 UUID；要不要换成人话名字属产品判断，未动。
 
+### 8.30 中止/失败 run 的「部分正文」不再空白：历史端点响应期合成 `partial_output`（issue #300，2026-10-15）
+
+**缺陷本体**：被停止 / 失败的 run **正文区一片空白**（工具卡片在、正文没）。根因：`runner/worker.js` 的 catch 固定 `final_text: ''` ⇒ 该 run 在 `messages` 里**零助手锚点**，而对话正文本来就从锚点渲染。标本：run `72e2577d…` / 会话 `1ead0b1a…`（`termination={reason:"aborted", partial:true, usage, rounds:24}`、助手锚点数 = 0）。
+
+**为什么不动 `runner/`**（这条决定了代价）：原方案「消费 `err.finalText`」要改 runner ⇒ 重建 FDE 镜像 + 一次产品口径变更（半截话进不进模型上文）。但 **`assistant_delta` 本来就逐 chunk 落 `run_events`**（`worker.js:438` → U3，全库 5.4 万条），所以在**只读重建端点**里聚合回来就够了。dev 实测规模：134 条 run 里**只有 4 条**需要它（`failed` 1 / `aborted` 3），内容 37–133 字符 ⇒ **不是刚需，但空白是硬的**。**零 DDL、零依赖、不动 runner、不动 pin、`docs/data/schema.sql` 一字节未改。**
+
+**契约（三条同时成立才出现，一条 run 至多一条）**：① 该 run 出现在本次响应窗口里；② **`runs.status IN ('finished','failed')` 且零助手锚点**（锚点算 `role='assistant'` 的**任意**行，含 `synthetic=true`）；③ 聚合出**非空**文本。字段与既有事件项**同形**（`seq` = 该 run 最后一条 delta 的 seq，**不是新分配**；`payload = {text, chunks, truncated}`）。完整口径在 `docs/api/portal.md` **§4.4a-1**。
+
+**三条最容易做错的地方（都已钉住）**：
+- **「有锚点绝不能再渲染一遍」**是头号坑（`judge_done`/`max_rounds_cap` 那 103 条全在这一侧；后者**本来就有正文**，「失败类一律空白」是误解）。
+- **终态判定不能省**：工单原文只说「无锚点」，但那样**正在跑的 run** 刷新一下就被标成「已中止」⇒ 那是新造的误导，所以判据必须带 `status`（`queued`/`running`/`cancelling` 三态各钉一条用例）。
+- **不落库、不进 SSE、不进两个前端集合**。`partial_output` 只在响应期合成 ⇒ 前端 `EVENT_TYPES`（实时监听）与 `HISTORY_REPLAY_TYPES`（回放）**都不加**，`assistant_delta` 也**不得**进 `HISTORY_EVENT_TYPES`（否则同一段正文来两遍）。前端的落点是 `StreamEntry` 新 `kind:'partial'`，在 `openSession` 归并循环里**于 `es.replayEvent` 之前**分流（幂等靠 `id=partial:<run_id>` 走 `renderedIds`），渲染成**中性助手气泡**（复用 `.msg assistant .md` + 一条墨色左竖线；**不进红色 `.syserr`**：半截正文不是错误）。这是 §8.8「同一事件两种可见性」那个坑的**反方向**——那里是「漏加集合 ⇒ 刷新后消失」，这里是「多加集合 ⇒ 实时一条 + 历史一条」。
+- **成本红线**：窗口 `run_id` 去重后无 run ⇒ **整段跳过、一条额外查询都不发**；有 run 但全有锚点 ⇒ **聚合那条一条都不发**。聚合只对候选发、走既有 `run_events_run_idx (run_id, seq)`（**不新增索引**）。工单里我那句「全有锚点 ⇒ 三条都不发」与判定顺序自相矛盾（想知道有没有锚点就必须查库），worker 按顺序实现并**拆成两条字面判据**（窗口无 run ⇒ 三条都不发 / 全有锚点 ⇒ 聚合那条不发）——**这裁决成立，已采纳**。
+
+**测试**：新文件 `portal/test/session-partial-output.test.js` **+17**（自带 `PartialOutputPool`，按 SQL 文本裁决状态过滤 / `EXISTS` / `ANY` / `ORDER BY`，并记 `sqlLog` 钉成本）；前端 **+17**（`workbench.spec` +10、`StreamPanel.spec` +4、`useEventStream.spec` +2、`localeParity.spec` +1）。基线：根 **1187 → 1204**（1200 通过 / 0 失败 / 4 跳过）、runner **286** 不变、前端 **33 文件 / 552 → 569**，台账三处已同步。
+
+**主 agent 亲跑变异（不复用 worker 的 8 条）**：① 把「窗口无 run ⇒ 早退」挪到候选查询**之后** ⇒ **恰 1 条具名红**（成本红线是被钉住的）；② store 分流条件改永假 ⇒ **5 条具名红**；③ `truncated` 由 `=== true` 改 `!= null` ⇒ **恰 1 条红**。另我自己补了一条**探覆盖面的变异**：把合成项从「按 seq 归并」改成「追加到末尾」⇒ **17 条全绿**——先 `git diff` 证明不是空操作，再定性：**后端归并顺序不是契约面**（前端 `openSession` 本来按 `seq` 重排），真正的归并位判据在 ② 那条前端用例上。
+
+**已知边界（都是刻意口径，别当 bug 修）**：
+- **刚停止那一刻仍看不到**：合成项只在 `GET /events/history` 里，而该响应只在 `openSession`（打开/刷新/重进会话）时拉；终态后的 `refreshSession` 不重拉 history ⇒ **要刷新一次才出现**（已单独登记产品小单）。
+- **`HISTORY_REPLAY_TYPES` 这条判据目前不承重**：把 `partial_output` 加进去无测试会红（`replayEvent` 无该分支 ⇒ 落 `default` 中性忽略，「加了也看不见」）。**不加新导出面去钉一个没有后果的性质**；防线在 store 侧不喂（变异 ② 恰 5 红）。
+- 聚合把候选 run 的全部 delta 拉回 JS 再截 2000 字（SQL 侧 `LIMIT` 更省，但会改 `chunks` 语义 = 一次口径决定）；`chunks` = **实际拼进正文的片段数**（脏片段不计，文档已写死这句）；合成项的 `seq` 可能落在分页窗口外（whole-run 聚合的必然结果）；语言切换后已渲染的标签不回溯翻译（项目既有「取词即快照」口径）。
+
+**不在本单**：SSE 通路合成、把 `assistant_delta` 进下发白名单、`reasoning_delta` 聚合、`termination.reason` 参与判据（现在只看 `status`）、单 run 极多片时的熔断上限。
+
+**发版与部署**：`TODO(主 agent)`。**本版不动 `runner/`** ⇒ 按 digest 只 pin portal + proxy，**不重建 FDE 容器**。真机判据（dev）：拿会话 `1ead0b1a…` 的标本 run `72e2577d…` 刷新 ⇒ 应看到**中性助手气泡 + 「已中止 · 部分输出」标签**（zh/en 各一次）、**不是红色告警行**；同会话里 `judge_done` 的 run **不得多出一条**（重复正文）；硬刷新后仍在；整页无 `undefined`/`[object Object]`/空气泡。过了才关 #300。
+
+
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
