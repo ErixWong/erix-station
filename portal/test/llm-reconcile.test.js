@@ -9,7 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
-import { getFdeLlmHeartbeatModels, updateModel } from '../src/llm.js';
+import { hashToken } from '../src/auth.js';
+import {
+  getFdeLlmHeartbeatModels, reconcileDataPlaneNameRename, updateModel,
+} from '../src/llm.js';
 import { heartbeat } from '../src/internal.js';
 
 const ROW = {
@@ -21,27 +24,37 @@ const ROW = {
 
 /** Strict fake pool: only the heartbeat SELECT and the reconcile UPDATE are legal; anything else throws. */
 function fakePool(rows) {
-  const table = rows.map((row) => ({ ...row }));
-  const state = { selects: 0, updates: [] };
+  const table = rows.map((row) => ({ fde_id: 'u1', ...row }));
+  const state = { selects: 0, updates: [], affected: [{ fde_id: 'u1' }], affectedSelects: 0, affectedParams: null };
   return {
     state,
     async query(sql, params = []) {
       const text = sql.replace(/\s+/g, ' ').trim();
+      // #296 立即对账的「哪些绑定引用了这个 model_info.id」（只读；命中集由 state.affected 控制）
+      if (/^SELECT fde_id FROM fde_llm_bindings/i.test(text)) {
+        state.affectedSelects += 1;
+        state.affectedParams = params;
+        return { rows: state.affected.map((row) => ({ ...row })) };
+      }
       if (/^SELECT/i.test(text)) {
         state.selects += 1;
-        return { rows: table.map((row) => ({ ...row })) };
+        // 按 fde_id 筛（真库是 WHERE fde_id = $1）——不然多 FDE 用例里第二个绑定会看见第一个的回写。
+        const hit = table.filter((row) => row.fde_id === params[0]);
+        return { rows: hit.map((row) => ({ ...row })) };
       }
       if (/^UPDATE fde_llm_bindings/i.test(text)) {
         state.updates.push({ sql: text, params });
         if (state.failUpdate) throw new Error('fake db down');
         const setClause = text.match(/SET\s+(.*?)\s+WHERE/i);
         if (!setClause) throw new Error(`unparsable UPDATE: ${text}`);
+        const target = table.find((row) => row.fde_id === params[0]);
+        if (!target) throw new Error(`UPDATE without a matching binding row: ${params[0]}`);
         for (const part of setClause[1].split(',')) {
           const trimmed = part.trim();
           if (trimmed === 'updated_at = now()') continue;
           const hit = trimmed.match(/^(\w+) = \$(\d+)$/);
           if (!hit) throw new Error(`unexpected SET fragment: ${trimmed}`);
-          table[0][hit[1]] = params[Number(hit[2]) - 1];
+          target[hit[1]] = params[Number(hit[2]) - 1];
         }
         return { rowCount: 1 };
       }
@@ -52,8 +65,9 @@ function fakePool(rows) {
 
 /** Fake gateway client; also serves as the injected listModels/updateKey so counters stay shared. */
 function fakeGateway(models = []) {
-  const state = { listCalls: 0, updateCalls: [], listError: null, updateKeyError: null };
+  const state = { listCalls: 0, updateCalls: [], updateModelCalls: [], listError: null, updateKeyError: null, updateModelError: null };
   const gw = {
+    models, // #296：改名用例要能在两次调用之间把网关里的名字改掉（同一个 client 身份）
     async listModels() {
       state.listCalls += 1;
       if (state.listError) throw state.listError;
@@ -63,6 +77,18 @@ function fakeGateway(models = []) {
       state.updateCalls.push(body);
       if (state.updateKeyError) throw state.updateKeyError;
       return { key: body.key };
+    },
+    // #296：改名用。按真网关实测语义应用：顶层 model_name 只改数据面名（**不动** model_info.display_name，
+    // 也**不动** model_info.id）——探针结论见 #296 工单报告。
+    async updateModel(body) {
+      state.updateModelCalls.push(body);
+      if (state.updateModelError) throw state.updateModelError;
+      const hit = models.find((m) => String(m.model_info?.id) === String(body.model_id));
+      if (!hit) throw Object.assign(new Error('model not found'), { status: 404 });
+      if (body.model_name !== undefined) hit.model_name = body.model_name;
+      if (body.model_info !== undefined) hit.model_info = { ...hit.model_info, ...body.model_info };
+      if (body.litellm_params !== undefined) hit.litellm_params = { ...hit.litellm_params, ...body.litellm_params };
+      return { model_id: hit.model_info.id };
     },
   };
   return { gw, state };
@@ -455,4 +481,301 @@ test('#289 B1 端到端：POST /api/internal/heartbeat ⇒ http 层透传 ctx.ll
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(staticDir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// #296：管理台「改名」拆成两个字段。
+//   * `call_name` → 顶层 `model_name`（数据面：FDE 请求实际发的名字、bindings.*_model_name、
+//     per-FDE key 白名单存的都是它）；
+//   * `name` → `model_info.display_name`（纯展示名，语义一字未动）。
+// 以及「改名成功后立即触发一次对账」——**复用**上面那条心跳路径，不重写并集逻辑。
+// 三条实测事实进了断言（LiteLLM v1.103.2，dev 真机）：
+//   ① 改顶层 `model_name` **不会**顺手改或清 `model_info.display_name`；
+//   ② 它**不拦同名**，且同名后按名字轮询两个 deployment ⇒ 门户必须自己拦；
+//   ③ 改名时 LiteLLM 自己把 key 的 `models` 重写成「只有新名」⇒ 并集是必须的那一手。
+// ---------------------------------------------------------------------------
+
+const CATALOG = () => ([
+  { model_info: { id: 'm-main', display_name: '旧展示名' }, model_name: 'deepseek-flash' },
+  { model_info: { id: 'm-emb', display_name: 'Embedding 3' }, model_name: 'text-embedding-3' },
+]);
+
+test('#296: call_name 只写顶层 model_name（数据面），一个字都不碰 model_info', async () => {
+  const { gw, state } = fakeGateway(CATALOG());
+
+  const model = await updateModel(gw, 'm-main', { call_name: '  deepseek-v4  ' });
+
+  assert.equal(state.updateModelCalls.length, 1);
+  const body = state.updateModelCalls[0];
+  assert.equal(body.model_name, 'deepseek-v4', 'trim 后写进 PATCH 顶层 model_name');
+  assert.deepEqual(Object.keys(body).sort(), ['model_id', 'model_name'],
+    '只给调用名 ⇒ body 只带 model_id + model_name（多了 model_info 就是顺手改展示名，变异①）');
+  assert.equal(model.model_name, 'deepseek-v4', '响应回读新调用名');
+  assert.equal(model.name, '旧展示名', '展示名仍走 display_name，不跟着调用名漂');
+});
+
+test('#296: call_name 与 name 同一条 PATCH ⇒ 两个字段各写各的位置', async () => {
+  const { gw, state } = fakeGateway(CATALOG());
+
+  const model = await updateModel(gw, 'm-main', { call_name: 'new-call', name: '新展示名' });
+
+  const body = state.updateModelCalls[0];
+  assert.equal(body.model_name, 'new-call', '调用名进顶层');
+  assert.equal(body.model_info.display_name, '新展示名', '展示名进 model_info');
+  assert.equal(model.model_name, 'new-call');
+  assert.equal(model.name, '新展示名');
+});
+
+test('#296: call_name 空串/空白/非字符串 ⇒ validation_failed + details.field=call_name，且零 PATCH', async () => {
+  const { gw, state } = fakeGateway(CATALOG());
+
+  for (const bad of ['', '   ', '\t\n', 7, true, {}, [], null]) {
+    await assert.rejects(
+      () => updateModel(gw, 'm-main', { call_name: bad }),
+      (error) => {
+        assert.equal(error.code, 'validation_failed');
+        assert.deepEqual(error.details, { field: 'call_name' });
+        return true;
+      },
+      `call_name=${JSON.stringify(bad)} 必须被拒（数据面名不许空）`,
+    );
+  }
+  assert.equal(state.updateModelCalls.length, 0, '校验阶段就得拦住：一条 PATCH 都不许发出去');
+  assert.equal(state.updateCalls.length, 0, '更不许动 key 白名单');
+});
+
+test('#296: 占用中的调用名 ⇒ 409 model_name_conflict（真网关不拦同名并会轮询 deployment ⇒ 门户拦）', async () => {
+  const { gw, state } = fakeGateway(CATALOG());
+
+  await assert.rejects(
+    () => updateModel(gw, 'm-main', { call_name: 'text-embedding-3' }),
+    (error) => {
+      assert.equal(error.code, 'model_name_conflict');
+      assert.equal(error.httpStatus, 409);
+      assert.equal(error.details.field, 'call_name');
+      assert.equal(error.details.call_name, 'text-embedding-3');
+      assert.equal(error.details.conflicting_model_id, 'm-emb', '把撞车的模型 id 给出去，运维才知道要去动谁');
+      return true;
+    },
+  );
+  assert.equal(state.updateModelCalls.length, 0, '拦在写之前：网关里两个名字都没动');
+
+  // 改成自己现在的名字不算冲突（幂等提交、以及「只改展示名顺带把调用名原样带回」的表单形状）
+  const same = await updateModel(gw, 'm-main', { call_name: 'deepseek-flash', name: '只改展示名' });
+  assert.equal(same.model_name, 'deepseek-flash');
+  assert.equal(same.name, '只改展示名');
+});
+
+test('#296: 改名后的立即对账 ⇒ 复用 #289 那条路径（先 updateKey 扩并集、后回写 bindings）', async () => {
+  const pool = fakePool([ROW]);
+  const { gw, state } = fakeGateway(CATALOG());
+  // 改名已在网关落定（updateModel 的产物），库里还是旧名 ⇒ 这就是漂移
+  gw.models[0].model_name = 'deepseek-v4';
+  const order = [];
+
+  const outcome = await reconcileDataPlaneNameRename(pool, gw, 'm-main', {
+    listModels: async () => { order.push('listModels'); return gw.listModels(); },
+    updateKey: async (body) => { order.push('updateKey'); return gw.updateKey(body); },
+  });
+
+  assert.equal(outcome.status, 'reconciled');
+  assert.deepEqual(outcome.bindings, ['u1']);
+  assert.deepEqual(order, ['listModels', 'updateKey'], '先取映射、再扩白名单（顺序红线同心跳对账）');
+  assert.equal(state.updateCalls.length, 1, '恰一次 /key/update');
+  assert.equal(state.updateCalls[0].key, ROW.api_key);
+  assert.deepEqual([...state.updateCalls[0].models].sort(), ['deepseek-flash', 'deepseek-v4', 'text-embedding-3'].sort(),
+    '白名单 = 新旧名并集（LiteLLM 改名时自己只留新名，旧名靠这里兜回来）');
+  assert.equal(pool.state.updates.length, 1, '后回写 fde_llm_bindings');
+  assert.deepEqual(pool.state.updates[0].params, ['u1', 'deepseek-v4']);
+  assert.match(pool.state.updates[0].sql, /main_model_name = \$2/);
+  assert.deepEqual(pool.state.affectedParams, ['m-main'], '按 model_info.id 找受影响绑定（名字可改、id 稳定）');
+});
+
+test('#296: 立即对账必须绕开改名前那份 TTL 映射，且 N 个受影响绑定只打一次 GET /model/info', async () => {
+  const pool = fakePool([
+    { fde_id: 'u1', ...ROW },
+    { fde_id: 'u2', ...ROW, api_key: 'sk-abcdef123457' },
+  ]);
+  pool.state.affected = [{ fde_id: 'u1' }, { fde_id: 'u2' }];
+  const { gw, state } = fakeGateway(CATALOG());
+
+  // 改名**前**先跑一次心跳 ⇒ 模块级 TTL 缓存里存着旧名，client 身份与后面完全同一个
+  await getFdeLlmHeartbeatModels(pool, 'u1', { gateway: gw });
+  assert.equal(state.listCalls, 1);
+  gw.models[0].model_name = 'deepseek-v4';
+
+  const outcome = await reconcileDataPlaneNameRename(pool, gw, 'm-main');
+
+  assert.deepEqual(outcome.bindings, ['u1', 'u2']);
+  assert.equal(state.listCalls, 2,
+    '改名后必须重取一次映射（拿旧映射会判成「没漂移」⇒ 空对账，改了名仍 403）；但两个绑定合起来只多打这一趟');
+  assert.equal(state.updateCalls.length, 2, '两个受影响 FDE 各扩一次白名单');
+  assert.deepEqual([...new Set(state.updateCalls.map((call) => call.key))].sort(), [ROW.api_key, 'sk-abcdef123457'],
+    '各用各的 per-FDE 虚拟 key（不是拿第一个 key 写两遍）');
+  assert.equal(pool.state.updates.length, 2);
+  assert.deepEqual([...new Set(pool.state.updates.map((u) => u.params[0]))].sort(), ['u1', 'u2']);
+});
+
+test('#296: 没有 FDE 引用这个模型 ⇒ 零网关写；gateway 缺席 ⇒ skipped（接线拆掉时的形状）', async () => {
+  const pool = fakePool([ROW]);
+  pool.state.affected = [];
+  const { gw, state } = fakeGateway(CATALOG());
+  gw.models[0].model_name = 'deepseek-v4';
+
+  const idle = await reconcileDataPlaneNameRename(pool, gw, 'm-orphan');
+  assert.deepEqual(idle, { status: 'no_bindings', bindings: [] });
+  assert.equal(state.listCalls, 0, '没人用的模型不必打网关');
+  assert.equal(pool.state.updates.length, 0);
+
+  const unhooked = await reconcileDataPlaneNameRename(pool, null, 'm-main', {
+    listModels: () => { throw new Error('gateway 缺席时注入点也不该被摸到'); },
+  });
+  assert.equal(unhooked.status, 'skipped');
+  assert.equal(unhooked.reason, 'no_gateway_client');
+  assert.deepEqual(unhooked.bindings, []);
+});
+
+test('#296: 立即对账整条不抛错（改名已落定，不得把 PATCH 拖成 500）', async () => {
+  const pool = fakePool([ROW]);
+  pool.state.failUpdate = true;
+  const { gw, state } = fakeGateway(CATALOG());
+  gw.models[0].model_name = 'deepseek-v4';
+
+  const { value, warnings } = await captureWarnings(() => reconcileDataPlaneNameRename(pool, gw, 'm-main'));
+
+  assert.equal(value.status, 'reconciled', '回写失败 = 白名单已双名的安全态，不是抛错');
+  assert.ok(warnings.some(([tag]) => String(tag).includes('binding model name reconcile failed')),
+    '沿用 #289 那条 warn 口径（运维 grep 前缀不变）');
+
+  // 连「哪些绑定受影响」这条 SELECT 都失败 ⇒ skipped + 自己的 warn，同样不抛
+  const lookupDown = fakePool([ROW]);
+  lookupDown.state.affected = [{ fde_id: 'u1' }];
+  const rawQuery = lookupDown.query.bind(lookupDown);
+  lookupDown.query = async (sql, params) => (
+    /SELECT fde_id FROM fde_llm_bindings/.test(sql) ? Promise.reject(new Error('db down')) : rawQuery(sql, params)
+  );
+  const { value: skipped, warnings: w2 } = await captureWarnings(() => reconcileDataPlaneNameRename(lookupDown, gw, 'm-main'));
+  assert.deepEqual(skipped, { status: 'skipped', reason: 'binding_lookup_failed', bindings: [] });
+  assert.ok(w2.some(([, payload]) => payload?.reason === 'binding_lookup_failed'));
+  assert.equal(state.updateCalls.length, 1, '全程没有第二次白名单写入（失败的这次没走到 key）');
+});
+
+// ---------------------------------------------------------------------------
+// #296 接线断言：PATCH /api/admin/llm/models/:id 带 call_name ⇒ http 层必须把 **ctx.llmGateway
+// 单例**喂给立即对账。把它传成 null（或整段删掉）⇒ 下面第一条红（白名单并集与回写都不发生）。
+// ---------------------------------------------------------------------------
+
+/** 只额外认「admin 会话查表」的严格 fake pool，其余仍走 fakePool。 */
+function adminPool(rows, token) {
+  const inner = fakePool(rows);
+  return {
+    state: inner.state,
+    async query(sql, params = []) {
+      const text = sql.replace(/\s+/g, ' ').trim();
+      if (/FROM login_sessions s JOIN users u/i.test(text)) {
+        return {
+          rows: params[0] === hashToken(token)
+            ? [{
+              id: 'u1', login: 'root', display_name: 'root', role: 'admin', fde_name: null,
+              auth_source: 'local', status: 'active', must_change_password: false,
+              session_id: 'ls-296', expires_at: new Date(Date.now() + 3_600_000), last_seen_at: new Date(),
+            }]
+            : [],
+        };
+      }
+      return inner.query(sql, params);
+    },
+    async end() {},
+  };
+}
+
+function adminServerConfig(staticDir) {
+  return {
+    cookie: cookieSettings('dev-296', 604800),
+    sessionTtlSeconds: 604800,
+    sessionRenewIntervalSeconds: 3600,
+    pendingTokenTtlSeconds: 120,
+    totp: { issuer: 'FDE Station', digits: 6, period: 30, window: 1 },
+    loginRateLimit: { maxFailures: 5, windowMs: 900000, blockMs: 60000, maxEntries: 10000 },
+    totpRateLimit: { maxFailures: 5, windowMs: 900000, perTokenMaxFailures: 5, blockMs: 60000, maxEntries: 10000 },
+    kdfConcurrency: 2,
+    kdfQueueLimit: 100,
+    kdfQueueTimeoutMs: 30000,
+    maxBodyBytes: 64 * 1024,
+    maxLoginLength: 128,
+    maxPasswordLength: 256,
+    staticDir,
+  };
+}
+
+async function withAdminApi(handler) {
+  const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-296-admin-'));
+  const token = 'tok-296-admin';
+  const config = adminServerConfig(staticDir);
+  const server = createServer({ pool: handler.pool, config, llmGateway: handler.gateway, log: { error() {}, warn() {}, log() {} } });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await handler.run({
+      base: `http://127.0.0.1:${server.address().port}`,
+      cookie: `${config.cookie.name}=${token}`,
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(staticDir, { recursive: true, force: true });
+  }
+}
+
+test('#296 端到端：PATCH call_name ⇒ 顶层 model_name 落网关 + 立刻铺并集与回写；只改展示名则零对账', async () => {
+  const pool = adminPool([ROW], 'tok-296-admin');
+  const { gw, state } = fakeGateway(CATALOG());
+
+  await withAdminApi({ pool, gateway: gw, run: async ({ base, cookie }) => {
+    const patch = (body) => fetch(`${base}/api/admin/llm/models/m-main`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify(body),
+    });
+
+    // ① 只改展示名（`name`）⇒ 数据面一字不动、零 key 白名单写入（误导面不许复活成「半条传播」）
+    const displayOnly = await patch({ name: '只改展示名' });
+    assert.equal(displayOnly.status, 200);
+    assert.equal((await displayOnly.json()).model.name, '只改展示名');
+    assert.equal(state.updateCalls.length, 0, '没改调用名就不该去动 key 白名单');
+    assert.equal(pool.state.updates.length, 0);
+
+    // ② 改调用名 ⇒ 顶层 model_name 落网关，并且**本次请求内**就完成「先并集、后回写」
+    const renamed = await patch({ call_name: 'deepseek-v4' });
+    assert.equal(renamed.status, 200);
+    const body = (await renamed.json()).model;
+    assert.equal(body.model_name, 'deepseek-v4', '响应回读新调用名');
+    assert.equal(body.name, '只改展示名', '展示名不跟着动');
+    const renameCalls = state.updateModelCalls.filter((call) => call.model_name === 'deepseek-v4');
+    assert.equal(renameCalls.length, 1);
+    assert.equal('model_info' in renameCalls[0], false, '改调用名不得附带 model_info');
+    assert.equal(state.updateCalls.length, 1, '改名这一次请求内就铺了白名单（不等心跳 15s + TTL 60s）');
+    assert.deepEqual([...state.updateCalls[0].models].sort(), ['deepseek-flash', 'deepseek-v4', 'text-embedding-3'].sort());
+    assert.equal(pool.state.updates.length, 1, '后回写 fde_llm_bindings');
+    assert.deepEqual(pool.state.updates[0].params, ['u1', 'deepseek-v4']);
+  } });
+});
+
+test('#296 端到端：同名调用名被 409 挡住，且不留半截状态', async () => {
+  const pool = adminPool([ROW], 'tok-296-admin');
+  const { gw, state } = fakeGateway(CATALOG());
+
+  await withAdminApi({ pool, gateway: gw, run: async ({ base, cookie }) => {
+    const res = await fetch(`${base}/api/admin/llm/models/m-main`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ call_name: 'text-embedding-3' }),
+    });
+    assert.equal(res.status, 409);
+    const err = await res.json();
+    assert.equal(err.error.code, 'model_name_conflict');
+    assert.equal(err.error.details.field, 'call_name');
+    assert.equal(err.error.details.conflicting_model_id, 'm-emb');
+    assert.equal(state.updateModelCalls.length, 0, '没写网关 ⇒ 也不会有第二次请求里的半截传播');
+    assert.equal(state.updateCalls.length, 0);
+    assert.equal(pool.state.updates.length, 0);
+  } });
 });
