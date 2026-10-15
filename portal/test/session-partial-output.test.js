@@ -99,9 +99,11 @@ class PartialOutputPool extends FakePool {
     // 聚合：SELECT run_id, seq, payload FROM run_events WHERE run_id = ANY($1) AND type='assistant_delta' ORDER BY run_id, seq
     if (flat.includes('run_events') && flat.includes("type = 'assistant_delta'")) {
       const ids = params[0] ?? [];
-      const rows = this.runEvents
-        .filter((e) => ids.includes(e.run_id) && e.type === 'assistant_delta')
-        .sort((a, b) => (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : a.seq - b.seq)); // ORDER BY run_id, seq
+      const rows = this.runEvents.filter((e) => ids.includes(e.run_id) && e.type === 'assistant_delta');
+      // **按 SQL 文本决定要不要排序**（AGENTS §8.14：fake 不得好心兼平）：代码删了 ORDER BY
+      // 就得拿到插入序，而夹具的插入序与 seq 序故意不一致 ⇒ 拼接顺序用例会真红。
+      const ordered = /ORDER BY run_id, seq/.test(flat);
+      if (ordered) rows.sort((a, b) => (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : a.seq - b.seq));
       return { rows };
     }
 

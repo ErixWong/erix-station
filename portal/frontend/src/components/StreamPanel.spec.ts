@@ -591,3 +591,60 @@ describe('issue #189（追加）：会话头部状态行「N 条消息 · 已压
     setLocale('zh-CN');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #300：中止/失败 run 的部分正文（kind:'partial' → **中性助手气泡**，不是红色 .syserr）
+// 双语都断言（zh-CN 由 beforeEach 复位，en 在用例内显式切换后切回）。
+// ---------------------------------------------------------------------------
+describe('issue #300：partial entry 渲染（中性助手气泡 + 双语标签）', () => {
+  function seedPartial(text = '已经生成的**半截正文**', truncated = false) {
+    const store = useWorkbenchStore();
+    store.renderedIds = new Set();
+    store.entries.length = 0; // 同例内二次装配时不得残留上一条（否则 truncated 断言会看到旧 entry）
+    store.entries.push({ kind: 'partial', id: 'partial:r1', text, truncated, sessionId: 's1' });
+    return { store, wrapper: mountPanel() };
+  }
+
+  it('zh-CN：标签「已中止 · 部分输出」+ 正文走助手 markdown；类名不含 syserr', () => {
+    const { wrapper } = seedPartial();
+    const node = wrapper.get('.msg.assistant.partial');
+    expect(node.classes()).toContain('md'); // 与助手终稿同一渲染路径
+    expect(node.find('.partial-label').text()).toBe('已中止 · 部分输出');
+    expect(node.html()).toContain('<strong>半截正文</strong>'); // markdown 渲染（不是纯文本转义）
+    expect(wrapper.find('.syserr').exists()).toBe(false);
+    expect(node.classes()).not.toContain('syserr');
+    expect(node.classes()).not.toContain('roundsep');
+    // 中性口径：标签既不说「已完成」也不说「错误」
+    const label = node.find('.partial-label').text();
+    expect(label).not.toMatch(/完成|错误|失败/);
+  });
+
+  it('en：标签 "Aborted · partial output"，同样不是 syserr', () => {
+    setLocale('en');
+    const { wrapper } = seedPartial();
+    const node = wrapper.get('.msg.assistant.partial');
+    expect(node.find('.partial-label').text()).toBe('Aborted · partial output');
+    expect(wrapper.find('.syserr').exists()).toBe(false);
+    expect(node.find('.partial-label').text()).not.toMatch(/complete|error|fail/i);
+    setLocale('zh-CN');
+  });
+
+  it('truncated=true ⇒ 出截断提示（zh/en 成对）；false ⇒ 一字不出', () => {
+    const { wrapper } = seedPartial('半截', true);
+    expect(wrapper.get('.partial-truncated').text()).toBe('输出在停止前未生成完全（已截断）');
+    setLocale('en');
+    const enWrapper = mountPanel();
+    expect(enWrapper.get('.partial-truncated').text()).toBe('Output was not finished before the run stopped (truncated)');
+    setLocale('zh-CN');
+
+    const plain = seedPartial('半截', false);
+    expect(plain.wrapper.find('.partial-truncated').exists()).toBe(false);
+  });
+
+  it('正文与标签分离：标签不得混进 markdown 正文', () => {
+    const { wrapper } = seedPartial('第一行\n第二行');
+    const body = wrapper.get('.msg.assistant.partial').html();
+    expect(body).toContain('第一行');
+    expect(wrapper.get('.partial-label').text()).not.toContain('第一行');
+  });
+});

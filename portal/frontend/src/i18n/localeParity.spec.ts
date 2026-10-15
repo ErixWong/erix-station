@@ -132,6 +132,25 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
     expect(enEv.toolReplaySkipped).not.toBe(zh.toolReplaySkipped);
   });
 
+  // issue #300：中止/失败 run 的「部分正文」标签。文件首条用例已钉两边叶子键集合完全一致，
+  // 这里额外钉**语义**：既不能说「已完成」（它没完成），也不能说「错误/失败」（半截正文不是错）——
+  // 前端因此可以把它渲染成中性助手气泡而不是红色 .syserr。
+  it('issue #300：stream.partialOutput.* 双语成对，语义是「已中止 · 部分输出」（不是完成、也不是错误）', () => {
+    for (const [locale, root] of [['zh-CN', zhCN], ['en', en]] as const) {
+      const label = root.stream.partialOutput.label;
+      const truncatedText = root.stream.partialOutput.truncated;
+      expect(label, locale).toMatch(/中止|Aborted/);
+      expect(label, locale).toMatch(/部分|partial/i);
+      expect(label, locale).not.toMatch(/完成|错误|失败|complete|success|error|fail/i);
+      // 截断提示必须点名「没生成完」，且不得自带省略号/「已截断」文本以外的形状（后端 payload 里没有文案）
+      expect(truncatedText, locale).toMatch(/未生成完|not finished/);
+      expect(truncatedText, locale).not.toMatch(/undefined|null|\\[object Object\\]/);
+    }
+    expect(zhCN.stream.partialOutput.label).toMatch(CJK);
+    expect(en.stream.partialOutput.label).not.toMatch(CJK);
+    expect(en.stream.partialOutput.label).not.toBe(zhCN.stream.partialOutput.label);
+  });
+
   // issue #283：工具结果行的「有时长 / 无时长」两版文案必须双语成对（文件首条用例已经钉「两边
   // 叶子键集合完全一致」，这里额外钉形状）：
   //   * 单位不得硬编码在文案里（时长由 `lib/toolSummary.formatDuration` 连着单位一起给）；
