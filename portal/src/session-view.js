@@ -174,8 +174,11 @@ function foldedTurnFields(turns) {
  * issue #188：单条 transcript 行里、官方投影助手轮上的展示字段（逐字透传，不裁剪/不改名/不重推导）。
  *
  * 投影的 `DisplayTurn` 契约面里，助手轮除 `text` 外还带 `blocks`（原始 content blocks 数组）、
- * `toolCalls?`（`{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`，预览长度由上游
- * 定：args 120 / result 400）与 `reasoning?`（与正文分离的推理文本）。这三者此前没有进入对话流 DTO，
+ * `toolCalls?`（0.20.0 形状：`{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?,
+ * toolCallKey?, durationMs?}`，预览长度由上游定：args 120 / result 400。⚠ `executionStatus` **只在
+ * 两种特殊状态下存在**（`intercepted`/`interrupted`，guide-0.20.0 §7：普通结果块上是**缺席**，
+ * 不是空串也不是 `ok`），**不得拿「字段在不在」当「这块值得关注」的判据**；`toolCallKey`/`durationMs`
+ * 在 T1 之前的记录上直接缺省）。与 `reasoning?`（与正文分离的推理文本）。这三者此前没有进入对话流 DTO，
  * 导致前端刷新后丢失工具卡片与推理。本函数把它们从助手轮上取出（**只取字段值，不做任何加工**）。
  * `turn.key`（0.16.0 新增的轮级视图键）也原样取出（keys），供 DTO 透传（run 聚合轮 → 数组）。
  *
@@ -202,32 +205,41 @@ function assistantTurnFields(turns) {
 }
 
 /**
- * issue #283：把**宿主自有**的 `tool_calls.duration_ms` join 进上游投影的 `toolCalls[]`。
+ * issue #283 / #299：把工具调用时长补进上游投影的 `toolCalls[]`（**投影优先、宿主回落**）。
  *
- * ⚙ **来源与位置**（别再当成引擎给的）：引擎官方投影 `projectTranscriptForDisplay` 的
- * `DisplayTurn.toolCalls[]` 形状里**没有时长**（上游 `src/display/projection.js` 的注释面：
- * `{key, name, id?, argsSummary?, result_preview..., isError?, executionStatus?}`），而
- * `assistantTurnFields()` 的职责是**逐字透传**、不向上游形状注字段（#95 红线）——所以本函数必须在
- * 投影**之后**、在拼 DTO 的那一刻才给元素添 `durationMs`（新对象，不改动引擎产出的那些对象），
- * 使「引擎字段逐字透传」与「宿主补时长」两件事在代码上可分辨（用例钉住了这点）。
+ * ⚙ **两路来源**（erix-agent 0.20.0 / 上游 #284 之后口径变了，别再只认宿主那一份）：
+ *   1. **引擎投影自己带的 `toolCalls[].durationMs`**（0.20.0 起 `DisplayTurn.toolCalls[]` 新增
+ *      `toolCallKey` 与 `durationMs`，`src/display/projection.js:167-181`）。⚠ T1 之前落盘的记录上
+ *      两者是**直接缺省、不被合成**的（不是 `undefined` 占位、更不是 0）。
+ *   2. **宿主自有的 `tool_calls.duration_ms`**（M2 由 U3 的 tool_result UPDATE 回填），按
+ *      `(run_id, call_id)` join；`call_id` = 事件里的 `tool_call_id` = 投影里的 `toolCalls[].id`
+ *      （provider 的 tool_use id）。
  *
- * 口径：
- *   * 数据源 = 本站 `tool_calls`（M2 由 U3 的 tool_result UPDATE 回填）按 `(run_id, call_id)`；
- *     `call_id` 就是事件里的 `tool_call_id` = 投影里的 `toolCalls[].id`（provider 的 tool_use id）；
- *   * **有则出现、无则不写该键**（沿用 `toolCalls`/`folded` 既有契约）——旧数据（引擎当年就没发
- *     duration 的那批）库里是 NULL ⇒ 键不出现，**绝不写 0**；
- *   * `durationMs` 是**宿主附加字段**，不属上游契约面：前端只在现有 `dur` 为空时用它（实时路优先）。
+ * 优先级（#299 定稿）：**投影有值 ⇒ 用投影值**（单一真相在引擎那侧，且它与 `erix.durationMs` 同值）；
+ * 投影缺省 ⇒ 回落宿主值（老记录唯一的时长来源，别让它退化成「无时长」）；两者都缺 ⇒ **键不存在**。
+ * ⚠ 都缺时**绝不写 0**：0.20.0 把「缺失」定为「不知道」（guide §2：写 `?? 0` = 把未知渲染成「瞬间完成」）。
+ *
+ * 为什么仍在投影**之后**做：`assistantTurnFields()` 的职责是**逐字透传**上游形状、不向引擎字段里注
+ * 水（#95 红线）；宿主补的那一笔在这里加，代码上两件事可分辨（用例钉住了）。产出是**新对象**，
+ * 不改动引擎产出的那些对象。
+ *
+ * `durationMs` 是**宿主附加字段**（回落那条路），不属上游契约面：前端只在现有 `dur` 为空时用它。
+ * 另：0.20.0 投影还发了 **`toolCallKey`**（引擎的耐久身份键）。本单**不接进前端卡片身份**——
+ * 我们 §8.5 的卡片身份用的是投影自造的 `key` + provider `tool_use.id`，接不接 `toolCallKey` 是
+ * 单独的设计决定（#299 (d) 明确不在本单范围），故它只作为透传字段存在，不在此处参与匹配。
  *
  * @param {Array<Record<string, unknown>>} toolCalls 引擎投影产出的数组（不被修改）
  * @param {string} runId 当前助手锚点的 run
  * @param {Map<string, number>} durations key = `${runId}\u0000${call_id}`
  */
 function attachToolCallDurations(toolCalls, runId, durations) {
-  if (durations.size === 0) return toolCalls; // 库里一个时长都没有（旧数据/旧后端）⇒ 完全不碰原数组
   return toolCalls.map((call) => {
+    // ① 投影有值就用投影值（0.20.0 起的新路）；非法值（NaN/字符串）当「没有」处理，不落 0。
+    if (typeof call?.durationMs === 'number' && Number.isFinite(call.durationMs)) return call;
+    if (durations.size === 0) return call; // 库里一个时长都没有（旧数据/旧后端）⇒ 完全不碰原对象
     const callId = typeof call?.id === 'string' ? call.id : null;
     const ms = callId === null ? undefined : durations.get(`${runId}\u0000${callId}`);
-    // 没命中就**原对象返回**（不拷贝、不加 `durationMs: undefined` 这种伪键）。
+    // ② 命中宿主值 ⇒ 新对象添 `durationMs`；③ 没命中就**原对象返回**（不拷贝、不加伪键）。
     return ms === undefined ? call : { ...call, durationMs: ms };
   });
 }

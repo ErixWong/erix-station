@@ -17,7 +17,7 @@
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
 import { PERSISTENCE_TERMINATION_REASON, RUN_FAIL_REASONS } from '../lib/terminationReasons';
-import { getToolResultSummary, formatDuration } from '../lib/toolSummary';
+import { getToolResultSummary, formatDuration, isSpecialExecutionStatus } from '../lib/toolSummary';
 
 // 用户可见状态行/错误行文案（issue #101 P2）：非组件上下文（composable 无 setup 实例）→ i18n.global.t。
 // 取词即快照：状态行在事件到达时生成，切语言后旧行不回溯翻译（可接受）。
@@ -82,6 +82,9 @@ export interface ToolCardState {
   // issue #188：DTO 投影来源的卡片字段（加载/刷新路径）——直接透传上游 `toolCalls[]` 同名键，
   // 事件流路径不填。argsSummary = 上游 120 字参数摘要；resultPreview = 上游 400 字结果预览；
   // executionStatus = 上游执行状态串。全文在 DTO `blocks` 里（不在卡片展开区重建）。
+  // issue #299（guide-0.20.0 §7）：这个字段**只在两种特殊状态下存在**（`intercepted`/`interrupted`），
+  // 普通成功/失败的块上是**缺席**（不是空串、不是 `ok`）⇒ 不得拿「字段在不在」当「这块值得关注」的
+  // 判据；下面需要「值得关注」的地方一律走 `isSpecialExecutionStatus(值)`（lib/toolSummary.ts）。
   // issue #228：存进来的一律是 `getToolResultSummary` 归一后的**字符串**（上游三套返回形态在
   // 入口就收敛掉，number 0 也不会被 `!!part` 判空吞掉）。
   argsSummary?: string;
@@ -270,13 +273,17 @@ export function useEventStream(hooks: EventStreamHooks) {
       if (resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = resultPreview;
       if (fields.executionStatus !== undefined && existing.executionStatus === undefined) existing.executionStatus = fields.executionStatus;
       // issue #283：刷新后不丢时长——但**只在实时路没给过的时候**用投影值（已有值优先）。
+      // issue #299：投影值现在可能来自**引擎自己**（0.20.0 起投影 `toolCalls[].durationMs`），也可能来自
+      // 宿主 join 的回落值（`portal/src/session-view.js`）；前端不分辨来源，只看「有值才用」。
       if (projectedDur !== undefined && existing.dur == null) existing.dur = projectedDur;
-      if (existing.ok === null && (fields.isError !== undefined || hasPreview || fields.executionStatus !== undefined)) {
+      if (existing.ok === null && (fields.isError !== undefined || hasPreview || isSpecialExecutionStatus(fields.executionStatus))) {
         existing.ok = fields.isError !== true;
       }
       return;
     }
-    const hasResult = fields.isError !== undefined || hasPreview || fields.executionStatus !== undefined;
+    // 「值得关注」（= 已经有结果）的判据：**值比对**，不是存在性比对（#299 / guide §7：
+    // 普通块上 executionStatus 缺席 ⇒ 拿存在性当判据会把普通块误判成「没结果」（ok=null 的…态）。
+    const hasResult = fields.isError !== undefined || hasPreview || isSpecialExecutionStatus(fields.executionStatus);
     const card: ToolCardState = {
       name: fields.name,
       dig: fields.argsSummary ?? '',
@@ -285,10 +292,12 @@ export function useEventStream(hooks: EventStreamHooks) {
       out: '',
       argsSummary: fields.argsSummary,
       resultPreview,
-      executionStatus: fields.executionStatus,
     };
     // 没有时长就**不写这个键**（不塞 `dur: undefined` 占位），与 M1 的「缺失保持 undefined」同口径。
     if (projectedDur !== undefined) card.dur = projectedDur;
+    // #299 (c) 同口径：`executionStatus` 在 0.20.0 起**只在特殊状态下存在**，普通块上必须**也不写键**
+    // （否则 DTO 的「缺席」到前端就变成了「有键但值是 undefined」，`in` / `Object.hasOwn` 一类判据会被骗）。
+    if (fields.executionStatus !== undefined) card.executionStatus = fields.executionStatus;
     toolCards.set(callId, card);
     hooks.onToolCardCreated(callId);
   }
