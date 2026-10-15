@@ -17,15 +17,20 @@
 //      且不得 import 任何运行时依赖——否则 `node --test` 直读会挂。由
 //      `portal/test/termination-contract.test.js` 的「零 import」断言钉住。
 //
-// 真值来源（引擎 0.18.0，逐值定位）：
-//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:511`（runToolLoop 返回值 typedef）；
-//   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:973-977`，fail() 里
+// 真值来源（引擎 0.20.0，逐值定位；0.18.0 → 0.19.0 → 0.20.0 三次复核：reason 全集**一字未变**）：
+//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:447-448`（runToolLoop 返回值 typedef。
+//     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块 ⇒ 防漂移测试的取值正则已同步）；
+//   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:1077-1081`，fail() 里
 //     「快照/markRunState 没落盘」时定值，并把 operation/phase/sideEffect 挂在 termination 上，
-//     `orchestrator.js:973-990` + `src/loop/termination.js:74-91` annotateTermination）；
+//     `orchestrator.js:1091` + `src/loop/termination.js:74` annotateTermination）；
+//   * 0.20.0 另有一处**只影响可达性**的变更（guide §4，上游 #282）：终局裁决处 `aborted` 压过
+//     `judge_done` / `final_guard_*` ⇒ 集合不变，但这三值在「用户点过停止」的 run 上不再可达。
+//     我们按 reason 透传分流（`runner/lib/termination.js` 只兜 `failed`⇒`aborted` 的竞态），
+//     无需改动，前端红色集合也不变。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.18.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.20.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。

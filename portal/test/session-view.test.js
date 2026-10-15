@@ -1347,15 +1347,21 @@ test('#189 修正：有折叠轮且该 run 有自己的助手正文 → DTO 仍�
 });
 
 // ---------------------------------------------------------------------------
-// issue #283：对话流 DTO 的 `toolCalls[].durationMs`。
-// 引擎官方投影的 toolCalls[] **不带时长**（上游明说该形状没有 duration），所以时长由**宿主**
-// 从自家 `tool_calls`（M2 由 U3 的 tool_result UPDATE 回填）按 `(run_id, call_id)` 取，
-// 并且必须在投影**之后** join——宿主字段不得伪装成引擎给的（#95 红线）。
-// 契约沿用既有口径：有则出现、无则 DTO 不出现该键；旧数据 NULL ⇒ 键不出现，**不许写 0**。
+// issue #283 → #299：对话流 DTO 的 `toolCalls[].durationMs`（**两条来源 + 优先级**）。
+// erix-agent 0.20.0（#284）起官方投影 `toolCalls[]` **自己就带** `durationMs`/`toolCallKey`
+// （`erix.*` 的投影，见 `src/display/projection.js:167-181`），但 **T1 之前落盘的记录上两者直接
+// 缺省、不被合成** ⇒ 老记录只能靠**宿主**从自家 `tool_calls`（M2 由 U3 的 tool_result UPDATE 回填）
+// 按 `(run_id, call_id)` 回落 join。优先级（#299 定稿）：投影有值 ⇒ 用投影；投影缺省 ⇒ 用宿主；
+// 两者都缺 ⇒ **键不存在**（0.20.0 把「缺失」定义为「不知道」，**绝不写 0**）。
+// 宿主那一笔仍然必须在投影**之后**做——宿主字段不得伪装成引擎给的（#95 红线）。
 // ---------------------------------------------------------------------------
 
 /** 一个 run、一个工具调用（provider call id = 'call-1'）的最小 transcript 现场。 */
-function toolCallFixture(runId = RUN_1, callId = 'call-1') {
+/**
+ * @param {number} [engineDurationMs] 给定时 = **T1 之后的新记录**（结果块带 `erix.durationMs`，
+ *   引擎投影会把它带进 `toolCalls[].durationMs`）；不给 = T1 之前的老记录（只有顶层形状，投影不带时长）。
+ */
+function toolCallFixture(runId = RUN_1, callId = 'call-1', engineDurationMs = undefined) {
   const anchors = [message(`dur-assistant-${runId}`, 2, 'assistant', 'stale anchor text', runId)];
   const transcriptRows = [
     transcript(1, `${runId}:engine:round:1`, {
@@ -1366,7 +1372,14 @@ function toolCallFixture(runId = RUN_1, callId = 'call-1') {
       },
       messages: [{
         role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: callId, content: 'exit_code: 0', is_error: false }],
+        content: [{
+          type: 'tool_result',
+          tool_use_id: callId,
+          content: 'exit_code: 0',
+          is_error: false,
+          // 0.20.0 的新记录：引擎事实住 `erix.*`（顶层 `duration` 已退役、不再写）
+          ...(engineDurationMs === undefined ? {} : { erix: { toolCallKey: 'tc_000000000001', round: 1, durationMs: engineDurationMs, success: true } }),
+        }],
       }],
     }, at(1), runId),
   ];
@@ -1385,7 +1398,7 @@ test('issue #283: DTO toolCalls[].durationMs 有值才出现；库里 NULL / 没
   })[0];
 
   const withValue = project([{ run_id: RUN_1, call_id: 'call-1', duration_ms: 4321 }]);
-  assert.equal(withValue.toolCalls[0].durationMs, 4321, '宿主 join 命中 ⇒ DTO 带 durationMs');
+  assert.equal(withValue.toolCalls[0].durationMs, 4321, '② 投影缺省（老记录）⇒ 回落宿主值，不退化成无时长');
 
   const noRows = project(undefined);
   assert.equal('durationMs' in noRows.toolCalls[0], false, '不传 toolCallRows ⇒ 与旧 DTO 逐字相同');
@@ -1402,7 +1415,7 @@ test('issue #283: DTO toolCalls[].durationMs 有值才出现；库里 NULL / 没
   }
 });
 
-test('issue #283：join 点在引擎投影**之后**——引擎产出形状里根本没有 durationMs，宿主也不去改它', () => {
+test('issue #283/#299：join 点在引擎投影**之后**——老记录上引擎形状不带时长，宿主也不去改引擎对象', () => {
   const { transcriptRows } = toolCallFixture();
   // 直接问引擎：官方投影自己给出的形状（宿主未加工）里必须没有时长这个键。
   // 与产品代码同一口径逐行调用官方投影（`recordForProjection` 补 dedupKey → 纯函数展开）。
@@ -1412,7 +1425,8 @@ test('issue #283：join 点在引擎投影**之后**——引擎产出形状里�
   assert.ok(engineCalls.length > 0, '夹具必须让引擎投影产出 toolCalls');
   for (const call of engineCalls) {
     assert.equal('durationMs' in call, false,
-      '引擎投影不带时长 ⇒ 该键只能由宿主 join；若上游哪天自己给了 duration，这条会红 = 可撤宿主 join 的信号');
+      '0.20.0 的投影只在结果块带 `erix.durationMs` 时才给时长，**T1 之前的记录上直接缺省**（不合成）'
+      + '⇒ 老记录仍必须靠宿主 join（新记录走投影那一路，见下面 #299 的优先级三条）');
   }
 
   const { anchors } = toolCallFixture();
@@ -1433,6 +1447,66 @@ test('issue #283：join 点在引擎投影**之后**——引擎产出形状里�
   for (const call of engineCalls) {
     assert.equal('durationMs' in call, false, '引擎产出的对象不被就地改写（join 产出新对象，不动上游形状）');
   }
+});
+
+// ---- #299 (d)：0.20.0 投影自带 durationMs 之后的**优先级**三条（投影 > 宿主 > 无键） ----
+
+test('#299 ①：投影有值 + 宿主也有值 ⇒ 取**投影**值（单一真相在引擎那侧，宿主不得盖它）', () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1', 111); // 引擎 erix.durationMs=111
+  const dto = projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors,
+    userAnchors: [],
+    transcriptRows,
+    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 999 }], // 宿主库里是另一份
+  })[0];
+  assert.equal(dto.toolCalls[0].durationMs, 111,
+    '投影有值时必须用投影值（宿主那一份是 U3 从同一个 tool_result 抄的，抄漏/抄错都不许覆盖引擎）');
+  // 反向自证：把宿主值当判据的话这条会红（不是空操作）
+  assert.notEqual(dto.toolCalls[0].durationMs, 999);
+});
+
+test('#299 ②：投影缺省（T1 之前的老记录）+ 宿主有值 ⇒ 回落宿主值，老记录不退化成「没有时长」', () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1'); // 无 erix = 老记录
+  const engineCalls = projectTranscriptForDisplay([recordForProjection(transcriptRows[0]).record])
+    .flatMap((turn) => turn.toolCalls ?? []);
+  assert.equal('durationMs' in engineCalls[0], false,
+    '老记录上引擎投影**直接缺省**该键（不合成、不给 0）——这条红了就是上游改成「合成 0」，按 §2 报上游');
+  const dto = projectSessionMessages({
+    sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows,
+    toolCallRows: [{ run_id: RUN_1, call_id: 'call-1', duration_ms: 777 }],
+  })[0];
+  assert.equal(dto.toolCalls[0].durationMs, 777, '投影缺省 ⇒ 必须回落宿主值');
+});
+
+test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个键（禁止写 0）', () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1');
+  for (const rows of [
+    undefined,
+    [],
+    [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
+    // 库里有别的调用有时长、唯独这次没有 ⇒ 走「有 map 但没命中」那一支（这条也会被 `?? 0` 变异抓到）
+    [{ run_id: RUN_1, call_id: 'ghost-call', duration_ms: 42 }],
+  ]) {
+    const dto = projectSessionMessages({
+      sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows, toolCallRows: rows,
+    })[0];
+    assert.equal('durationMs' in dto.toolCalls[0], false,
+      `都缺时必须无键（0.20.0：缺失 = 不知道）；实际=${JSON.stringify(dto.toolCalls[0])}`);
+    assert.notEqual(dto.toolCalls[0].durationMs, 0, '把未知塌成 0 = issue #283 的「恒显 0s」复发');
+  }
+});
+
+test('#299 (c)：executionStatus 只在特殊状态存在 ⇒ 普通块的 DTO 不带该键、也不被当成异常', () => {
+  const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1', 12);
+  const dto = projectSessionMessages({
+    sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows, toolCallRows: [],
+  })[0];
+  assert.equal('executionStatus' in dto.toolCalls[0], false,
+    '普通成功结果块上引擎**不写** executionStatus（guide-0.20.0 §7）⇒ DTO 也不许多造一个键');
+  assert.equal(dto.toolCalls[0].isError, false, '普通块仍按 isError 正常判成成功（不是「值得关注」）');
+  assert.equal(dto.toolCalls[0].toolCallKey, 'tc_000000000001',
+    '0.20.0 投影新增的 toolCallKey 原样透传（本单不接进卡片身份，见 session-view.js 注释）');
 });
 
 test('issue #283：按 (run_id, call_id) 复合键 join——同 call_id 跨 run 不串号', () => {

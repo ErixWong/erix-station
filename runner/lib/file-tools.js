@@ -10,7 +10,7 @@
 // jail 不是 fork 的一部分，它是宿主边界；fork 演进的终点见 AGENTS.md §8.9 与 docs/design/runner-integration.md。
 import fs from 'node:fs';
 import path from 'node:path';
-import { createFileTools as createUpstreamFileTools } from 'erix-agent/tools';
+import { createFileTools as createUpstreamFileTools, classifyFileToolResult } from 'erix-agent/tools';
 import { throwIfAborted } from './abort.js';
 
 function isWithin(root, target) {
@@ -261,15 +261,23 @@ export function createStationFileTools({ jail, cwd, maskedPaths = [], allowRead,
     const result = structured
       ? await upstream.executeTool(firstArg)
       : await upstream.executeTool(firstArg, input, context);
-    if (!treeTargetIsRoot || typeof result !== 'string' || result === '') return result;
+    // 形态判别用**上游导出的 `classifyFileToolResult`**（erix-agent 0.20.0 / #220，从 `erix-agent/tools`
+    // 子路径导出，**不在包根**）。四种成功形态（guide-0.20.0 §6，随包契约套件现在钉着它们）：
+    //   readFile / edit → string（kind='text'）· writeFile → number 字节数（kind='bytes'，**0 是成功**）
+    //   · searchText → { content, metadata }（kind='content-metadata'）· 其它 → kind='unknown'。
+    // ⚠ 两个旧坑：`if (!result)` 把「写了 0 字节」当成失败；`typeof result === 'string'` 也不是成败
+    // 判据（**错误结果也是字符串**，顶层形态与 readFile 一致）。根标签收口只对文本生效，故取 kind。
+    const fact = classifyFileToolResult(result);
+    if (!treeTargetIsRoot || fact.kind !== 'text' || fact.text === '') return result;
+    const treeText = fact.text;
 
     // 出口兜底：首行仍是工作目录 basename → 换回 `./`；已是 `./` 或认不出的文本（错误结果等）一律不动。
-    const cut = result.indexOf('\n');
-    const firstLine = cut === -1 ? result : result.slice(0, cut);
+    const cut = treeText.indexOf('\n');
+    const firstLine = cut === -1 ? treeText : treeText.slice(0, cut);
     if (firstLine === TREE_ROOT_LABEL) return result;
     const baseName = path.basename(root);
     if (firstLine !== baseName && firstLine !== `${baseName}/`) return result;
-    return `${TREE_ROOT_LABEL}${cut === -1 ? '' : result.slice(cut)}`;
+    return `${TREE_ROOT_LABEL}${cut === -1 ? '' : treeText.slice(cut)}`;
   };
 
   return {

@@ -6,7 +6,7 @@
 //
 // 为什么这里的断言必须跑**真引擎**而不是 mock：判据是「引擎在 resume 时到底有没有调 executor」，
 // 这是 `replayPolicy` × 工具声明 × run snapshot 三者交互的结果，mock 出来的只是我对引擎的想象。
-// 技法与 test/tool-duration.test.js 同款：桩 provider + 内存 store + 真 `runToolLoop`，零 LLM/DB/网络。
+// 技法与 test/tool-result-envelope-contract.test.js 同款：桩 provider + 内存 store + 真 `runToolLoop`，零 LLM/DB/网络。
 //
 // ⚠ **变异敏感性的关键**：行为断言用的 `replayPolicy` 值是从 worker.js **源码里抠出来的真值**
 //   （`workerReplayPolicy()`），不是测试里另抄一份字面量。删掉 worker.js 里那行 ⇒ 取到 `undefined`
@@ -212,15 +212,20 @@ test('#288 主口径：worker 传 per-tool-declaration ⇒ 挂起的 shell 不�
   const synthesized = resumed.toolResultEvents.find((tr) => tr?.tool_use_id === PENDING_CALL_ID);
   assert.ok(synthesized, '必须有一条同 tool_use_id 的 tool_result（悬空 tool_use 会让下一趟请求 400）');
   assert.equal(synthesized.is_error, true, 'is_error 必须为 true');
-  assert.equal(synthesized.executionStatus, 'interrupted',
-    'executionStatus 必须是 "interrupted"（orchestrator.js:2586-2597 的合成块形状）');
+  // erix-agent 0.20.0（#284 / guide §2）：引擎事实搬进 `erix.*`，被摊平的顶层 `executionStatus`
+  // 已退役（`TOOL_RESULT_CONTRACT.legacy.written === false`）⇒ 合成块上的中断状态只在 `erix` 里。
+  // 0.18/0.19 的顶层读法在 0.20.0 会读到 undefined（**静默**，不报错），本行按真值改读 erix。
+  assert.equal(synthesized.erix?.executionStatus, 'interrupted',
+    'erix.executionStatus 必须是 "interrupted"（resume 改写产生的特殊状态，orchestrator 的合成块形状）');
+  assert.ok(!Object.hasOwn(synthesized, 'executionStatus'),
+    '退役的顶层 executionStatus 不得再出现在新产出的块上（guide §2 退役名单）');
   assert.match(String(synthesized.content), /not replayed/i,
     '正文必须明说「没重放」，模型才知道要自己决定是否重试');
   // 模型侧真的看到了这块（不是只发了事件）
   const modelSawIt = resumed.modelBlocks.some((b) => (
     b?.type === 'tool_result'
     && b.tool_use_id === PENDING_CALL_ID
-    && b.executionStatus === 'interrupted'
+    && b.erix?.executionStatus === 'interrupted'
   ));
   assert.ok(modelSawIt, '合成结果必须真的进本次送模型的消息（交还决定的前提是模型看得见）');
   assert.equal(resumed.finalText, 'done', 'run 必须能正常收尾（不重放 ≠ 卡死）');

@@ -22,13 +22,24 @@ export function getToolPreview(argsText: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// issue #228：工具结果的展示文本（上游 erix-agent 文件工具把返回形态分成了三套）
+// issue #228 / #299：工具结果的展示文本（上游 erix-agent 文件工具的**四种**成功返回形态）
 //
-// 上游实测：`readFile` / `tree` / `edit` → string（截断信息写在尾部 marker 里）；
-// `searchText` → **对象** `{content, metadata}`（metadata 进 transcript、不上 wire）；
-// `writeFile` → **number**（写入字节数）。引擎会归一一道，但工作台不能依赖「上游永远给字符串」：
-// 历史事件、DTO 投影、后续新工具都可能是三种形态之一，所以入口先收敛一次，
-// 卡片里存的永远是字符串。
+// 0.20.0 把这四形态钉成了契约（guide-0.20.0 §6，上游 #220），并且导出了判别式：
+//   | 工具 | 成功形态 | `classifyFileToolResult().kind` |
+//   | --- | --- | --- |
+//   | `readFile` | `string` | `text` |
+//   | `edit` | `string` | `text` |
+//   | `writeFile` | `number`（写入字节数，**0 = 成功写了空文件**） | `bytes` |
+//   | `searchText` | `{ content, metadata }` | `content-metadata` |
+//   | （其它/错误结果） | 字符串或任意 | `unknown` |
+// 上游判别式 `classifyFileToolResult` 从 **`erix-agent/tools` 子路径**导出（**不在包根**，ADR-005）。
+// 本文件**故意不引它**：前端不依赖 erix-agent（`grep -rE "from ['\"]erix-agent" portal/frontend/src` = 0 命中，
+// 也不在 portal/frontend/package.json 的 deps/devDeps 里，见 #299 报告），所以这里**保持手写**。
+// ⇒ 上游新增第五种形态时，只有随包契约套件与 runner/lib/file-tools.js（已改用判别式）会先红，
+// 本函数会走 JSON 兜底——下一班请**先改上面这张表**再动代码，不要重新发现已有四形态。
+//
+// 两个已被上游点名的坑（别重新踩）：`if (!result)` 把 writeFile 的 0 当失败；
+// `typeof result === 'string'` 不是成败判据（**错误结果也是字符串**）。
 //
 // 口径：
 //   * `{content, metadata}` → 只展示 content。截断/跳过信息已经在 content 自己的 marker 文本里
@@ -87,4 +98,27 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / MS_PER_MINUTE);
   const seconds = Math.floor((ms % MS_PER_MINUTE) / MS_PER_SECOND);
   return `${minutes}m ${seconds}s`;
+}
+
+// ---------------------------------------------------------------------------
+// issue #299（erix-agent 0.20.0 / host-upgrade-guide-0.20.0 §7，上游 #286 追加项）：
+// `executionStatus` 的存在条件——**只在两种特殊状态下存在**
+//   * `intercepted` = 审计拦截（调用从未执行）
+//   * `interrupted` = resume 改写 / 续跑时被中止
+// 普通成功或失败的结果块上这个字段是**缺席**的（`undefined`）——不是空串、也不是 `ok` 占位。
+// 机器可读条件在引擎常量里：`TOOL_RESULT_CONTRACT.engine.fields.executionStatus`
+//   = `{ writtenFor: "special states only", presentValues: ["intercepted","interrupted"] }`。
+//
+// ⚠ 因此**禁止**把「字段存在」当成「这个块值得关注」的判据（那是 0.19 之前的误读）：
+//    判特殊状态请拿值与这两个字符串比，用下面的 `isSpecialExecutionStatus`，不要写 `!== undefined`。
+//    随包 `toolResultEnvelopeContract` 现在会在普通块上**无条件断言其缺席**。
+// ---------------------------------------------------------------------------
+
+/** 引擎 `erix.executionStatus` 的两个合法取值（与上游常量的 presentValues 逐项一致）。 */
+export const SPECIAL_EXECUTION_STATUSES = ['intercepted', 'interrupted'] as const;
+
+/** 值比对（不是存在性比对）：这个 executionStatus 是不是「值得关注」的特殊状态。 */
+export function isSpecialExecutionStatus(status: unknown): boolean {
+  return typeof status === 'string'
+    && (SPECIAL_EXECUTION_STATUSES as readonly string[]).includes(status);
 }
