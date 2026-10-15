@@ -879,8 +879,9 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     //     at-least-once，整批重发是常态）与「后到的空值事件」都不会把已写的值改写成 NULL——
     //     语义是「首次观测即真相、先到先得」。选「两列同口径的单条 UPDATE」而不是逐列两个 UPDATE：
     //     一次工具调用只有一个 tool_result 事件（两列同源同时到），分列守卫换不来实际收益，却翻倍查询；
-    //   * `duration_ms` 为 null 的事件照发不误（引擎 0.18.0 对非结构化返回不写时长，见
-    //     runner/lib/tool-duration.js 头注释）：「没有时长」在库里就是 NULL，**不写 0**。
+    //   * `duration_ms` 为 null 的事件照发不误（erix-agent 0.20.0 起真执行过的四种返回形态都会写
+    //     `erix.durationMs`，仍无值的只剩「judge 拦截 / unsafe 重放被中止 / executor 未 settle 就被中止」
+    //     三种状态，guide-0.20.0 §2）：「没有时长」在库里就是 NULL，**不写 0**。
     for (const ev of events) {
       if (ev.type !== 'tool_result') continue;
       const callId = ev.payload?.tool_call_id;

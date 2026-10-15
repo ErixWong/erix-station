@@ -226,7 +226,9 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     const store = useWorkbenchStore();
     store.es.toolCards.set('c1', {
       name: 'read', dig: 'path=src/a.js', args: '', ok: false, out: '',
-      argsSummary: 'path=src/a.js', resultPreview: 'BOOM', executionStatus: 'failed',
+      // #299/guide §7：引擎只在两种特殊状态下写 executionStatus ⇒ 夹具用**真值** `interrupted`
+      // （旧夹具写的 'failed' 从来不是引擎取值，是凭空造的；普通块上这个键根本不存在）
+      argsSummary: 'path=src/a.js', resultPreview: 'BOOM', executionStatus: 'interrupted',
     });
     store.entries.push({ kind: 'tool', callId: 'c1' });
     const wrapper = mountPanel();
@@ -241,7 +243,7 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
 
     await btn.trigger('click');
     expect(wrapper.get('pre').text()).toContain('path=src/a.js');
-    expect(wrapper.text()).toContain('failed · BOOM');
+    expect(wrapper.text()).toContain('interrupted · BOOM');
   });
 
   // issue #228：上游文件工具的返回形态按工具分三套（string / {content, metadata} / number）。
@@ -250,24 +252,33 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     const store = useWorkbenchStore();
     store.es.toolCards.set('num', {
       name: 'writeFile', dig: '', args: '', ok: true, out: '',
-      executionStatus: 'succeeded', resultPreview: 0 as unknown as string,
+      // #299：普通结果块**没有** executionStatus 键（0.20.0 §7）⇒ 展开区只剩结果正文
+      resultPreview: 0 as unknown as string,
     });
     store.es.toolCards.set('obj', {
       name: 'searchText', dig: '', args: '', ok: true, out: '',
-      executionStatus: 'succeeded',
       resultPreview: { content: 'a.js:1:hit', metadata: { searchHits: 1 } } as unknown as string,
     });
     store.es.toolCards.set('none', {
-      name: 'tree', dig: '', args: '', ok: true, out: '', executionStatus: 'succeeded', resultPreview: null as unknown as string,
+      name: 'tree', dig: '', args: '', ok: true, out: '', resultPreview: null as unknown as string,
     });
     store.entries.push({ kind: 'tool', callId: 'num' }, { kind: 'tool', callId: 'obj' }, { kind: 'tool', callId: 'none' });
     const wrapper = mountPanel();
     for (const btn of wrapper.findAll('button[aria-expanded]')) await btn.trigger('click');
+    // 直接看三张卡片的展开区正文（顺序 = entries 顺序：num / obj / none）
+    // 结果行是 `<div class="font-normal text-black/50">`（`<pre>` 是 args 块），按类名取三张卡的结果行
+    const outs = wrapper.findAll('div')
+      .filter((node) => node.classes().includes('text-black/50'))
+      .map((node) => node.text());
+    expect(outs).toEqual(['0', 'a.js:1:hit', '']);
+    // ↑ number 0 不被当成「无结果」丢掉 / {content,metadata} 只展示 content / null preview ⇒ 空串（不是 "null"）
     const text = wrapper.text();
-    expect(text).toContain('succeeded · 0'); // number 0 不能被当成「无结果」丢掉
-    expect(text).toContain('succeeded · a.js:1:hit'); // {content, metadata} 只展示 content
     expect(text).not.toContain('[object Object]');
-    expect(text).toContain('succeeded'); // resultPreview 缺失时只剩状态串，不渲染 null/undefined
+    // #299 (c)：普通块上 executionStatus **缺席** ⇒ 不得渲染成异常，也不得出现 undefined / 空状态串
+    expect(text).not.toContain('undefined');
+    expect(text).not.toMatch(/\b0ms\b/);  // 「没有时长」不许被渲染成 0ms
+    expect(text).not.toContain(' · ');    // 状态串缺席 ⇒ 不能留下空的「 · 」连接符
+    expect(text.match(/✓/g)?.length).toBe(3); // 三张卡都判成成功（不是 …/✗）
   });
 
   it('推理块默认收起、可展开；摘要取首行，展开显示全文', async () => {

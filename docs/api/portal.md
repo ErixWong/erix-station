@@ -1268,7 +1268,7 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 4 | `recovered` | 同上 | `round: number`，`attempt: number`（重试成功，依据：`src/loop.js:1413`/`1424`） |
 | 5 | `usage` | 同上 | `round: number`，`usage: object`（嵌套 usage 对象，形如 `{input_tokens, output_tokens}`；依据：`src/loop.js:1355`/`1928`/`1960`。宿主若拍平为顶层 `input_tokens`/`output_tokens`，属宿主侧改写，须显式注明） |
 | 6 | `tool_use` | 同上 | `tool_call_id: string`，`name: string`，`input: object` |
-| 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283**：`duration_ms` 可为 `null`——引擎 0.18.0 只在 executor 返回结构化结果时写 duration，对非结构化返回 / 返回 Error / 抛异常的调用**不给时长**；runner 映射时缺失一律 `null`，**不伪装成 0**，前端据此不渲染时长。本站已在装配层包了一层适配器（`runner/lib/tool-duration.js`）让常见形态都有时长，上游 erix-agent #285 落地升版后可撤） |
+| 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283 → #299**：`duration_ms` 可为 `null`。erix-agent **0.20.0** 起引擎把时长写进 `tool_result.erix.durationMs`，**真执行过的四种返回形态（string / number / `{content,metadata}` / 抛异常）都会给值** ⇒ 本站 #283 那层装配期临时计时闸（`runner/lib/tool-duration.js`）已撤。仍没有值的只剩三种状态：judge 拦截、unsafe 重放被中止、executor 未 settle 就被中止（上游 `TOOL_RESULT_CONTRACT.engine.fields.durationMs`）。runner 映射读 `erix.durationMs`，**旧记录**（一代内）回退顶层 `duration`；两者都缺一律 `null`，**不伪装成 0**，前端据此不渲染时长） |
 | 8 | `round_end` | 同上 | `round: number` |
 | 9 | `assistant_delta` | `onDelta` | `text: string`（增量文本片段） |
 | 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段） |

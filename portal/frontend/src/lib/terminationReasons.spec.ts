@@ -36,7 +36,9 @@ describe('termination reason 单一常量（issue #212）', () => {
     // 版本号是**刻意的 tripwire**：升 erix-agent 时必须重新核过 reason 全集（上游 JSDoc 9 值 +
     // fail() 产出的 persistence_failed）才能追号。0.18.0 → 0.19.0（#299）复核：typedef 从单行
     // 变成多行块（orchestrator.js:443-444）但**九值一字未变** ⇒ 只追版本号。
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.19.0');
+    // 0.19.0 → 0.20.0（#299）再核：九值仍一字未变（guide §4 的 `aborted` 优先级只改**可达性**，
+    // 不改值域）⇒ 只追版本号。
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.20.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 

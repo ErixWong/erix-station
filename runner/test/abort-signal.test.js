@@ -75,7 +75,9 @@ test('issue #211：shell/file 工具执行器都从 context 取 signal（链路�
   const fileSrc = read('lib/file-tools.js');
   // issue #228：fork 的四个 executor 已退役，file 工具的真中断实现搬到上游，所以本文件的
   // 「下游」分成三段钉：装配层入口查中止 + context/signal 真的下给上游 + 上游自己仍在遍历内检查。
-  assert.match(fileSrc, /import \{ createFileTools as createUpstreamFileTools \} from 'erix-agent\/tools'/,
+  // 0.20.0 起同一行还导入 `classifyFileToolResult`（四形态判别式）⇒ 允许花括号里有别的名字，
+  // 但仍**逐项要求** `createFileTools as createUpstreamFileTools` 与来源子路径（不得退回本地 fork）。
+  assert.match(fileSrc, /import \{[^}]*\bcreateFileTools as createUpstreamFileTools\b[^}]*\} from 'erix-agent\/tools'/,
     'file 工具必须装配上游 erix-agent/tools 的 createFileTools（不得退回本地 fork）');
   assert.match(fileSrc, /throwIfAborted\(signal\)/,
     '装配层必须在入口检查中止（上游 readFile/writeFile/edit 不接 context，这一枪只能宿主补）');

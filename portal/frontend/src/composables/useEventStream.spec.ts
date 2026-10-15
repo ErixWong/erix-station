@@ -716,6 +716,53 @@ describe('issue #188：projectToolCard（DTO 投影路径）', () => {
 });
 
 // ---------------------------------------------------------------------------
+// issue #299 (c)（erix-agent 0.20.0 / host-upgrade-guide-0.20.0 §7）：
+// `executionStatus` **只在两种特殊状态下存在**（`intercepted` / `interrupted`），普通块上**缺席**。
+// ⇒ 判「值得关注」必须**拿值比**（`isSpecialExecutionStatus`），**不得**拿「字段在不在」当判据。
+// 变异靶：把判据改回 `fields.executionStatus !== undefined` ⇒ 本块必须红。
+// ---------------------------------------------------------------------------
+describe('issue #299：executionStatus 只在特殊状态存在（值比对，不是存在性）', () => {
+  it('普通成功块**不带**该键 ⇒ 卡片正常成 ok=true，不出现异常态', () => {
+    const s = useEventStream(makeHooks());
+    s.projectToolCard('plain', { name: 'readFile', resultPreview: 'FILE BODY' });
+    const card = s.toolCards.get('plain')!;
+    expect(card.ok).toBe(true);
+    expect('executionStatus' in card).toBe(false);
+    expect(card.resultPreview).toBe('FILE BODY');
+  });
+
+  it('引擎若给一个**非特殊值**（历史脏数据/未来新增取值）⇒ 不得仅凭「字段在」就判成有结果', () => {
+    const s = useEventStream(makeHooks());
+    // 既没有 isError 也没有 resultPreview：只有存在性判据会把这张卡判成「已经有结果」
+    s.projectToolCard('odd', { name: 'readFile', executionStatus: 'succeeded' });
+    expect(s.toolCards.get('odd')!.ok).toBeNull();
+    s.projectToolCard('odd2', { name: 'readFile', executionStatus: '' });
+    expect(s.toolCards.get('odd2')!.ok).toBeNull();
+  });
+
+  it('两种真特殊状态（值比对命中）⇒ 仍然算「有结果」，并按 isError 定成败', () => {
+    const s = useEventStream(makeHooks());
+    s.projectToolCard('blocked', { name: 'bash', executionStatus: 'intercepted', isError: true });
+    s.projectToolCard('cut', { name: 'bash', executionStatus: 'interrupted' });
+    expect(s.toolCards.get('blocked')!.ok).toBe(false);
+    expect(s.toolCards.get('cut')!.ok).toBe(true); // 没给 isError ⇒ 与既有口径一致按非失败处理
+    expect(s.toolCards.get('blocked')!.executionStatus).toBe('intercepted');
+  });
+
+  it('实时路已建卡时，投影带特殊状态只补字段、不把已成功的卡片与实时时长翻掉', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    lastES().emit('tool_use', { seq: 1, tool_call_id: 'c1', name: 'bash', input: { cmd: 'ls' } });
+    lastES().emit('tool_result', { seq: 2, tool_call_id: 'c1', ok: true, result_digest: 'done', duration_ms: 5 });
+    s.projectToolCard('c1', { name: 'bash', executionStatus: 'interrupted', durationMs: 9999 });
+    const card = s.toolCards.get('c1')!;
+    expect(card.ok).toBe(true);                 // 实时路判的成功不被投影改写
+    expect(card.dur).toBe(5);                   // 实时时长优先（投影值不许覆盖）
+    expect(card.executionStatus).toBe('interrupted');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // issue #283 M3：刷新后时长不丢——投影路径的宿主字段 `durationMs`（来源 = 本站 tool_calls，
 // 引擎投影不带）进卡片；但实时路已拿到的值不得被投影覆盖，旧数据（无该键）仍是不显示。
 // ---------------------------------------------------------------------------
