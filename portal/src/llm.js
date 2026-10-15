@@ -462,10 +462,16 @@ async function findGatewayModel(client, id) {
   return found;
 }
 
-// #296: `name` maps to `model_info.display_name` only — it never rewrites the data-plane
-// `model_name` that fde_llm_bindings.*_model_name and the virtual key allow-list refer to.
+/**
+ * #296 定稿：模型有两个名字，职责不同，**不得互相顶替**。
+ *   * `name` → `model_info.display_name`：**纯展示名**（既有语义，一字未改，兼容面保留）。
+ *   * `call_name` → **顶层 `model_name`**：数据面调用名，即 FDE 请求实际发的那个名字
+ *     （`fde_llm_bindings.*_model_name` 与 per-FDE 虚拟 key 的 `models` 白名单存的都是它）。
+ * 门户改 `call_name` 会真的改数据面 ⇒ 从「只改展示名的误导面」变成**受管改名**，传播走
+ * `reconcileDataPlaneNameRename()`（复用 #289 心跳对账那条路径，不另写并集逻辑）。
+ */
 export async function updateModel(gateway, id, {
-  name, type, enabled, tool_calling, context_window, max_tokens, model,
+  name, call_name, type, enabled, tool_calling, context_window, max_tokens, model,
   input_cost_per_token, output_cost_per_token,
 } = {}) {
   const client = getGatewayClient(gateway);
@@ -473,6 +479,16 @@ export async function updateModel(gateway, id, {
   const inputCost = validateCost(input_cost_per_token, 'input_cost_per_token');
   const outputCost = validateCost(output_cost_per_token, 'output_cost_per_token');
   const pricingTouched = input_cost_per_token !== undefined || output_cost_per_token !== undefined;
+  // #296: 调用名非空且 trim 后非空；空串/空白/非字符串一律拒（数据面名不能为空，静默清空更不行）。
+  let callName;
+  if (call_name !== undefined) {
+    if (typeof call_name !== 'string' || call_name.trim() === '') {
+      throw new LlmError('validation_failed', 'call_name 必须是非空字符串（数据面调用名）', {
+        details: { field: 'call_name' },
+      });
+    }
+    callName = call_name.trim();
+  }
   let upstreamModel;
   if (model !== undefined) {
     if (typeof model !== 'string') {
@@ -481,6 +497,21 @@ export async function updateModel(gateway, id, {
     upstreamModel = model.trim() || undefined;
   }
   const current = await findGatewayModel(client, id);
+  // #296 实测：LiteLLM **不拦同名**（两个 deployment 改成同一个 model_name 都返 200），而数据面
+  // 按名字选 deployment ⇒ 同名之后同一个名字的请求会在两个 deployment 间轮询（真机探针 5 发
+  // 打出 PROBE_B/PROBE_A 交替），且 `GET /v1/models` 只列一个 ⇒ 完全看不出来。故门户必须拦。
+  // （改名不动 `model_info.id`，所以只有「别的模型占用同名」才算冲突。）
+  if (callName !== undefined && callName !== current.model_name) {
+    const conflicting = gatewayModels(await client.listModels())
+      .filter((model) => String(modelId(model) ?? '') !== String(modelId(current) ?? ''))
+      .find((model) => model?.model_name === callName);
+    if (conflicting) {
+      throw new LlmError('model_name_conflict', `调用名「${callName}」已被模型 ${modelId(conflicting)} 占用`, {
+        httpStatus: 409,
+        details: { field: 'call_name', call_name: callName, conflicting_model_id: String(modelId(conflicting)) },
+      });
+    }
+  }
   const currentEnabled = !isModelBlocked(current);
   if (enabled !== undefined && typeof enabled !== 'boolean') {
     throw new LlmError('validation_failed', 'enabled 必须为 boolean', { details: { field: 'enabled' } });
@@ -491,6 +522,7 @@ export async function updateModel(gateway, id, {
   }
   if (
     name !== undefined
+    || callName !== undefined
     || type !== undefined
     || tool_calling !== undefined
     || context_window !== undefined
@@ -503,7 +535,10 @@ export async function updateModel(gateway, id, {
     if (type !== undefined) metadata.type = type;
     if (tool_calling !== undefined) metadata.tool_calling = tool_calling === true;
     if (context_window !== undefined) metadata.context_window = context_window;
-    const update = { model_id: id };
+    // #296: `call_name` 只进**顶层** `model_name`（数据面）。实测：LiteLLM 改数据面名**不会**
+    // 顺手改或清 `model_info.display_name`（探针：改名后 display_name 原值仍在），所以两个字段
+    // 可以同一条 PATCH 各写各的。
+    const update = { model_id: id, ...(callName === undefined ? {} : { model_name: callName }) };
     if (name !== undefined || type !== undefined || tool_calling !== undefined || context_window !== undefined) {
       update.model_info = {
         ...info,
@@ -730,6 +765,76 @@ export async function getFdeLlmHeartbeatModels(pool, userId, opts = {}) {
     models.vision = { model: nameFor('vision', row.vision_model_name), type: 'vision' };
   }
   return models;
+}
+
+/**
+ * #296：门户「受管改名」（PATCH `call_name` → 数据面 `model_name`）之后的**立即**对账。
+ *
+ * 为什么要它：#289 的对账只挂在 U4 心跳上，最坏 ≈15s（心跳）+ 60s（TTL）才铺平；管理员改完名
+ * 立刻去试仍会拿到误导性的 auth 403。本函数把同一条对账推到改名后立即发生。
+ *
+ * **它是复用者，不是第二份实现**：只负责「哪些绑定受影响」这一句 SELECT，动作逐个交给
+ * `getFdeLlmHeartbeatModels(...)`——判据、**先 `updateKey` 把白名单扩成新旧名并集、后回写
+ * `fde_llm_bindings`** 的顺序、四种保守放行全部沿用 #289。另写一份并集就是第二个会过期的真相源。
+ *
+ * ⚠ **`gateway` 必须是 `ctx.llmGateway` 单例**（§8.25：`model_list` 映射的 TTL 缓存按 client 对象
+ *   身份分槽，现造 client ⇒ 每个受影响绑定多打一次 `GET /model/info`）。
+ * 参数位置单独摆 `gateway` 而不是塞进 opts，就是为了让「接线传 null」在 http.js 里显眼可审。
+ *
+ * 两个刻意的细节：
+ *   * 改名前刚跑过的心跳会把**旧名**留在 TTL 缓存里 ⇒ 直接走默认 TTL 会得出「没漂移」的空对账，
+ *     所以**第一条**绑定用 `ttlMs: 0` 强制重取映射（顺手把共享缓存刷成新名），其余条走默认 TTL
+ *     ⇒ 整次改名**只打一次** `GET /model/info`（有用例钉住）。
+ *   * 改名本身已经在 LiteLLM 落定 ⇒ 对账失败**不得**把 PATCH 拖成 500：整体 try/catch，只结构化
+ *     warn，最坏退回「心跳 ≤15s+60s 自愈」的旧口径。
+ *
+ * @returns {Promise<{status: 'reconciled'|'no_bindings'|'skipped', reason?: string, bindings: string[]}>}
+ *          可观测汇总（不进响应体，与 #289 切片 B2 同一口径）；本函数**不抛错**。
+ */
+export async function reconcileDataPlaneNameRename(pool, gateway, modelId, opts = {}) {
+  if (!gateway) {
+    // 接线缺席（例如没起 LiteLLM profile）：改名照样生效，漂移交心跳。
+    return { status: 'skipped', reason: 'no_gateway_client', bindings: [] };
+  }
+  const { now = Date.now, listModels = null, updateKey = null } = opts ?? {};
+  // 谓词逐字同 getFdeLlmHeartbeatModels（active + litellm + 非空虚拟 key），只多一条「哪个槽位引用了这个 id」。
+  let affected;
+  try {
+    affected = await pool.query(
+      `SELECT fde_id FROM fde_llm_bindings
+        WHERE state = 'active' AND gateway = 'litellm'
+          AND api_key IS NOT NULL AND api_key <> ''
+          AND ($1 IN (main_model_id, embedding_model_id, vision_model_id))`,
+      [String(modelId)],
+    );
+  } catch (error) {
+    console.warn('[llm] rename reconcile skipped', {
+      model_id: String(modelId), reason: 'binding_lookup_failed', error_status: errorStatus(error),
+    });
+    return { status: 'skipped', reason: 'binding_lookup_failed', bindings: [] };
+  }
+  const rows = affected.rows ?? [];
+  if (rows.length === 0) return { status: 'no_bindings', bindings: [] };
+
+  const bindings = [];
+  let primed = false;
+  for (const row of rows) {
+    const fdeId = row.fde_id;
+    try {
+      // 首跳 ttlMs=0：绕过改名前那份旧映射；后续跳复用刚被刷新的缓存。
+      await getFdeLlmHeartbeatModels(pool, fdeId, {
+        gateway, now, ttlMs: primed ? 60_000 : 0, listModels, updateKey,
+      });
+      bindings.push(String(fdeId));
+    } catch (error) {
+      // getFdeLlmHeartbeatModels 里只有「槽位缺数据面名」会抛（502）；对账本体自己 warn 不抛。
+      console.warn('[llm] rename reconcile skipped', {
+        model_id: String(modelId), fde_id: fdeId, reason: 'binding_unreconcilable', error_status: errorStatus(error),
+      });
+    }
+    primed = true; // 映射已被强制取过一次（成不成都不再重取）：N 个受影响绑定只打一次网关
+  }
+  return { status: 'reconciled', bindings };
 }
 
 /**
