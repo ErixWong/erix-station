@@ -692,6 +692,28 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **0.20.0 §4 的中止语义**：跑到 25s 点「停止」⇒ `runs.termination = {reason:"aborted", partial:true, usage:{…}, rounds:24}`，**没有谎报 `judge_done`**（修复前那条窗口会给出 success 且**不带 usage/rounds/partial**）；被中止的那次 `shell` 在 `tool_calls` 里 `duration_ms IS NULL` 且无 digest ⇒ 界面不渲染时长（**没伪装成 0ms**）。
 - **顺带在现场复现了 #300**：那次停止的 run `partial:true`（引擎把已生成文本挂在 `error.finalText`），而 `runner/worker.js` 固定 `final_text:''` ⇒ 该 run **零助手锚点**（库里只有 user）。**#300 已带这条实测数据**。
 
+### 8.29 管理台「改名」变成受管改名：`call_name`（数据面）与 `name`（展示名）分开（issue #296，2026-10-15）
+
+**病根（两行实现，不是概念分歧）**：`llm.js#toModel()` 的 `name = info.display_name ?? metadata.display_name ?? model_name`，而 `updateModel()` 的 `name` **只写** `model_info.display_name` ⇒ 管理台那一列跟着变、**看着生效**，但数据面 `model_name`（FDE 请求实际发的名字、`fde_llm_bindings.*_model_name`、per-FDE key 白名单存的东西）一字未动。
+
+**定稿（两个名字分开，显式优于隐式）**：新增 `call_name` → **顶层 `model_name`**（操作面）；`name` 的既有语义（→ `display_name`）**一字未动**，兼容面保留。列表两列都可见，改调用名**必须先点确认**（同 #246 改块先例：确认前一个 PATCH 都不发）。
+
+**三条实测换来的信息（worker 跑，主 agent 真机复验后落此节）**：
+1. **LiteLLM 不拦同名** —— 两个 deployment 改成同一个 `model_name` 都返 200 ⇒ **拦在门户**：新错误码 `409 model_name_conflict`（登记 `portal.md` §1.2，`details={field:'call_name',call_name,conflicting_model_id}`）。
+2. **改数据面名不会顺手改/清 `display_name`** ⇒ 两个字段确实互不干扰，才敢分开。
+3. 改名时 **LiteLLM 自己把 key 的 `models` 重写成「只有新名」**（§8.25 已实测过一次）⇒ 我们铺**新旧名并集**正是为此，不打断在途请求。
+
+**传播不新写机制**：`reconcileDataPlaneNameRename()` **复用 §8.25 心跳对账那条路径**（动作在里面转调 `getFdeLlmHeartbeatModels`，**禁止复制一份并集逻辑**），`http.js` 在 PATCH 成功后**立即触发一次**，并**必须传 `ctx.llmGateway` 单例**（§8.25 TTL 缓存按 client 对象身份的坑）；心跳仍是兜底。§8.25 那句「门户内『改名』不是漂移源」已**就地标注部分失效**（原句保留）。
+
+**前端呈现**：沿用 `stores/admin.ts:12` 既有口径「服务端透传的 `error.message` 不译，只加本地化前缀」⇒ **不新增文案键**（与 #246「409 全文可见」同形）。
+
+**测试**：根 **1177 → 1187**（+10，全在 `llm-reconcile.test.js`，含端到端「顶层名落网关 + 立刻铺并集与回写」）、前端 **546 → 552**（+6，`AdminView.spec.ts`）；台账三处已同步。
+**主 agent 亲跑变异（不复用 worker 的）**：① 把 `call_name` 的数据面写入摘掉（复现 #296 原病症）⇒ **3 条具名红**；② 立即对账的 `ctx.llmGateway` 传成 `null` ⇒ **恰 1 条红**（端到端那条）；③ 前端确认门改成直接提交 ⇒ **恰 2 条红**（「确认前零请求」+ PATCH 形状）。
+
+**事故记录（§3.0「收尾纪律不能依赖工具调用」又一次发作，这次代价最小）**：worker 主体两个 commit 全落地（后端 +113/+335、前端 +142/+165，沙箱内我复跑 1187/552 全绿），**却被自己一条 `ls /tmp/body-*.html`（glob 无匹配 → 退出码 2）判成终局失败**，报告没写出来。处置：`resume` 同一执行体只补报告、不改代码（主 agent 已并行完成三套复跑 + 三条变异 + 合并）。**口径：给 worker 的工单里，收尾产物一律「直接写文件」，不许用 glob 猜名字。**
+
+**发版与部署**：`TODO(主 agent)`。本单**不动 `runner/`** ⇒ 只需 portal+proxy 两镜像，**不重建 FDE 容器**。真机判据：管理台改调用名 → ① LiteLLM 顶层 `model_name` 变、`display_name` 不变；② `fde_llm_bindings.*_model_name` 回写；③ `/key/info` 的 `models` = **新旧并集**；④ 撞名返 409 且文案点名被谁占用；⑤ 只改展示名 ⇒ 数据面一字不动、不触发对账。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
