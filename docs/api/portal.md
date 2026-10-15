@@ -908,6 +908,53 @@ station-portal user enable  --login <login>
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
 
+#### 4.4a-1 合成项 `partial_output`（issue #300：中止 / 失败 run 的部分正文）
+
+缺陷：`runner/worker.js` 的 catch 固定 `final_text: ''` ⇒ 被停止 / 失败的 run 在 `messages` 里**零助手
+锚点**，而对话正文本来就从锚点渲染 ⇒ 界面上这次 run **正文区一片空白**（工具卡片在、正文没）。它
+**已经说出口的话**其实全在 `run_events` 的 `assistant_delta` 里（逐 chunk 落库），所以下发时在
+**响应期**把它们聚合回来。纯宿主侧只读重建：不动 `runner/`、不消费 `err.finalText`、不写 `messages`。
+
+**存在性判据（三条同时成立才出现，一条 run 至多一条合成项）**：
+
+| # | 条件 | 为什么 |
+|---|---|---|
+| 1 | 该 run 出现在**本次响应窗口**里（窗口行的 `run_id` 去重） | 窗口里没这个 run ⇒ 连候选判定查询都不发 |
+| 2 | `runs.status IN ('finished','failed')` **且**该 run **零助手锚点**（`messages` 里 `role='assistant'` 的任意行，**含 `synthetic = true`**） | `queued`/`running`/`cancelling` 不是终态——「还在跑就标已中止」是新造的误导；**有锚点的 run 绝不能再渲染一遍**（重复正文就是这个坑） |
+| 3 | 聚合出**非空**文本 | 被停在 `sleep` 上的 run 本来就无正文可给，不要空气泡 |
+
+字段（与既有事件项**同形**，前端不需要分支去认「新形状」）：
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `seq` | number | = 该 run **最后一条 `assistant_delta` 的 `seq`**（**不是新分配的 seq**，不改 seq 语义；也不占 `chat_sessions.last_seq`） |
+| `run_id` | string | 所属 run |
+| `type` | string | 固定 `partial_output`（**合成类型，`run_events` 表里查不到这一行**） |
+| `payload.text` | string | 已生成的正文，按 delta 的 `seq` **升序**拼接（与插入顺序无关）；脏片段（`text` 缺键 / 非字符串）**整条跳过**，不拼成 `[object Object]` |
+| `payload.chunks` | number | **实际拼进正文的片段数**（脏片段不计 ⇒ 它≤ 该 run 的 `assistant_delta` 总条数；口径就这一句，将来要改成「总条数」得同时改测试） |
+| `payload.truncated` | boolean | 仅在正文被上限截过时为 `true` |
+
+- **上限**：`PARTIAL_OUTPUT_TEXT_CAP = 2000`（沿用本节既有 2000 字符防护的先例）。超限截到 2000 字符并置 `truncated: true`；**载荷里不塞 `…（已截断）` 文本**，截断标记由前端出——这是与上面「大小防护」的**刻意差别**（合成项要给前端一个可判定的布尔）。
+- **聚合范围 = 整个 run**，**不受 `before` 分页窗口影响**（窗口外的碎片也是这次 run 说过的话；分页只决定本次响应里出现哪些真实事件）。
+- **`reasoning_delta` 不参与**（thinking 文本不在本单面上）。
+- **分页与排序**：合成项**参与升序排序**（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**（那两个仍只由白名单真实事件决定）。
+- **不落库 / 不进 SSE / 不进前端集合**：`partial_output` 只在**本端点的响应**里存在 ⇒ 前端 `EVENT_TYPES`（实时具名监听）与 `HISTORY_REPLAY_TYPES`（回放集合）**都不加它**（加进去就会出现「实时一条 + 历史一条」重复）；`assistant_delta` 也**不得**加进上面的下发白名单（否则同一段正文来两遍）。前端的落点是 `StreamEntry` 的新 `kind: 'partial'`（中性助手气泡 + 「已中止 · 部分输出」标签，**不是**红色错误行）。
+- **成本**：候选判定顺序 = 窗口 `run_id` 去重（无 run ⇒ 整段跳过）→ **一条**查终态与锚点存在性的查询 → **只对「终态且无锚点」的 run** 聚合（`run_id = ANY(...)` + `type = 'assistant_delta'`，走既有 `run_events_run_idx (run_id, seq)`）。**零 DDL、零新索引**；dev 实测 134 条 run 里只有 4 条需要它。
+
+- **已接受边界：刚停止的那一刻不会立刻出现**。合成项只在 `GET /events/history` 响应里存 而该响应只在 `openSession`（打开会话 / 刷新 / 重进会话）时拉；run 终态后的 `refreshSession` 只重取 `/api/sessions/:id`，**不重拉 history** ⇒ 点「停止」当下界面只有 `run_end` 分隔行，**部分正文要刷新一次才出现**（流式那半截气泡在 `run_end` 时被移除）。不是 bug，是落点选择；要即时可见得让 refresh 也重拉一次 history（多一个请求），已单独登记为产品小单。
+- **已接受边界：聚合把候选 run 的全部 delta 行拉回 JS 再截 2000 字**。dev 标本 37–133 字符 / 百余片，无所谓；一个输出几十万字的 run 会把那个量级的 jsonb 读进内存。更省的写法是 SQL 侧 `LIMIT` 前 N 片，但那样 `chunks` 就得从「拼了多少片」改成「看了多少片」——是一次口径决定，不是实现细节（见上表）。
+
+响应里多出来的那一项（与真实事件混在同一 `events` 数组里）：
+
+```jsonc
+{
+  "seq": 168,               // = 该 run 最后一条 assistant_delta 的 seq
+  "run_id": "9d3b2f1e-...",
+  "type": "partial_output", // 合成项：不落库、不进 SSE
+  "payload": { "text": "已经生成出来的正文", "chunks": 352, "truncated": false }
+}
+```
+
 响应 `200`：
 
 ```json
@@ -918,6 +965,8 @@ station-portal user enable  --login <login>
   "next_cursor": null
 }
 ```
+
+> `events` 里可能多出**一条合成项** `partial_output`（中止 / 失败 run 的部分正文，见 §4.4a-1）——它不是 `run_events` 的行。
 
 错误：`401 unauthorized`；`404 not_found`；`400 validation_failed`（`limit` / `before` 非正整数）。
 

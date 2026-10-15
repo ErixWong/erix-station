@@ -3,7 +3,8 @@
 // 语义锚点：旧 index.html 内联 JS + 本 store 头注。消息/草稿/发送守卫用例不受 P5 影响，保留。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
-import { setWorkbenchHooks, useWorkbenchStore } from './workbench';
+import { setWorkbenchHooks, useWorkbenchStore, type StreamEntry } from './workbench';
+import type { RunHistoryEvent } from '../composables/useEventStream';
 import { setLocale } from '../i18n';
 
 /** EventSource 桩（openSession 会 connect；本套件只验证 URL 与状态，不驱动事件帧）。 */
@@ -1350,5 +1351,121 @@ describe('issue #261B：一键「重试上一条」（retryAvailable / retryLast
     expect(store.retryAvailable).toBe(true);
     await store.selectDir(DIR_B.cwd);
     expect(store.retryAvailable).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #300：中止/失败 run 的部分正文（历史合成项 partial_output → 中性 partial entry）
+//
+// 三条判据在前端的落点：① **不喂 replayEvent**（喂了就会「实时一条 + 历史一条」或冒出分隔行/卡片）；
+// ② 有锚点的 run 不重复（后端已不下发，前端这一层再钉「DTO 有 assistant 消息时历史里就没有合成项」
+//    的实际归并结果）；③ 脏载荷退化（不得渲染 undefined/[object Object]）。
+// ---------------------------------------------------------------------------
+describe('issue #300：partial_output 归并成 kind:partial', () => {
+  /** 会话详情（一条 user 消息，零助手锚点 = 被停在半路的 run）+ 历史（含合成项）。 */
+  function partialHandler(historyEvents: unknown[], messages: unknown[] = [{ id: 'm1', role: 'user', content: '任务', seq: 1 }]) {
+    return (url: string) => {
+      if (url.includes('/api/sessions/s1/events/history')) {
+        return { status: 200, body: { events: historyEvents, next_cursor: null } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages, last_seq: 9 } };
+      }
+      return { status: 200, body: { items: [] } };
+    };
+  }
+
+  const partialEvent = (payload: Record<string, unknown>, runId = 'r-abort', seq = 7) => ({
+    seq, run_id: runId, type: 'partial_output', payload,
+  });
+
+  it('历史带 partial_output ⇒ entries 出现 kind:partial，text/truncated 逐字对，**排在 seq 归并位上**', async () => {
+    // 合成项 seq=7，夹在两条真实事件之间 ⇒ 「在循环里就地推」与「循环后补推」两种实现可分辨。
+    mockFetch(partialHandler([
+      { seq: 2, run_id: 'r-abort', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: {} } },
+      partialEvent({ text: '已经做了一半', chunks: 35, truncated: false }),
+      { seq: 8, run_id: 'r-abort', type: 'round_start', payload: { round: 2 } },
+    ]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    // seq：user(1) → tool_use(2) → partial(7) → round_start(8)。「循环后补推」会把它排到最后 ⇒ 可分辨。
+    expect(store.entries.map((e) => e.kind)).toEqual(['msg', 'tool', 'partial', 'sep']);
+    const en = store.entries.find((e) => e.kind === 'partial') as Extract<StreamEntry, { kind: 'partial' }>;
+    expect(en.id).toBe('partial:r-abort');
+    expect(en.text).toBe('已经做了一半');
+    expect(en.truncated).toBe(false);
+    expect(en.sessionId).toBe('s1');
+  });
+
+  it('红线：partial_output 绝不喂 es.replayEvent（喂了就是「实时一条 + 历史一条」重复）', async () => {
+    mockFetch(partialHandler([partialEvent({ text: '半截', chunks: 3, truncated: true })]));
+    const store = useWorkbenchStore();
+    const seen: string[] = [];
+    const original = store.es.replayEvent;
+    store.es.replayEvent = ((raw: RunHistoryEvent) => { seen.push(raw.type); return original(raw); }) as typeof original;
+    await store.openSession('s1');
+    expect(seen).toEqual([]); // 一条都没喂
+    expect(store.entries.filter((e) => e.kind === 'partial')).toHaveLength(1);
+    // 分流不影响真实事件：白名单事件照旧走 replayEvent
+    store.es.replayEvent = original;
+  });
+
+  it('truncated=true 透传到 entry（文案由 StreamPanel 出，store 不拼字符串）', async () => {
+    mockFetch(partialHandler([partialEvent({ text: '很长的半截', chunks: 900, truncated: true })]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const [en] = store.entries.filter((e) => e.kind === 'partial');
+    expect(en && en.kind === 'partial' && en.truncated).toBe(true);
+    expect(en && en.kind === 'partial' && en.text).toBe('很长的半截'); // 没被塞进「…（已截断）」文案
+  });
+
+  it('同 run 有锚点（DTO 里已带 assistant 消息）⇒ 历史里就没有合成项，正文只出现一次', async () => {
+    // 后端判据「有锚点 ⇒ 不合成」；前端这一例钉住后果：有锚点的会话里 partial entry 数为 0，
+    // 正文只有 DTO 那一条（重复正文就是这个坑）。
+    mockFetch(partialHandler(
+      [{ seq: 8, run_id: 'r-done', type: 'tool_use', payload: { tool_call_id: 'c9', name: 'bash', input: {} } }],
+      [
+        { id: 'm1', role: 'user', content: '任务', seq: 1 },
+        { id: 'm2', role: 'assistant', content: '完整终稿', seq: 9, run_id: 'r-done' },
+      ],
+    ));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.entries.filter((e) => e.kind === 'partial')).toHaveLength(0);
+    const texts = store.entries.filter((e) => e.kind === 'msg').map((e) => (e as { text: string }).text);
+    expect(texts).toEqual(['任务', '完整终稿']);
+  });
+
+  it.each([
+    ['缺 text 键', { chunks: 2, truncated: false }],
+    ['text 是对象', { text: { a: 1 }, chunks: 2, truncated: false }],
+    ['text 是数字', { text: 42, chunks: 2, truncated: false }],
+    ['payload 整个是 null 形状', { text: null, truncated: null }],
+  ])('脏载荷：%s ⇒ 不出现 undefined/[object Object]，也不产出空气泡', async (_label, payload) => {
+    mockFetch(partialHandler([partialEvent(payload as Record<string, unknown>)]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const dumped = JSON.stringify(store.entries.map((e) => ('text' in e ? e.text : e.kind)));
+    expect(dumped).not.toContain('[object Object]');
+    expect(dumped).not.toContain('undefined');
+    for (const en of store.entries) {
+      if (en.kind === 'partial') expect(en.text).not.toBe(''); // 脏到没正文 ⇒ 干脆不推 entry
+    }
+  });
+
+  it('同一条合成项重进会话/重开只渲染一次（id=partial:<run_id> 走 renderedIds 幂等）', async () => {
+    mockFetch(partialHandler([partialEvent({ text: '半截', chunks: 1, truncated: false })]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await store.openSession('s1');
+    expect(store.entries.filter((e) => e.kind === 'partial')).toHaveLength(1);
+  });
+
+  it('run_id 缺失的脏合成项 ⇒ 仍不炸，且正文正常（id 退化到 partial:unknown）', async () => {
+    mockFetch(partialHandler([{ seq: 3, run_id: null, type: 'partial_output', payload: { text: '没有 run 归属' } }]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const [en] = store.entries.filter((e) => e.kind === 'partial');
+    expect(en && en.kind === 'partial' && en.text).toBe('没有 run 归属');
   });
 });

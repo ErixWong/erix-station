@@ -1710,6 +1710,17 @@ const HISTORY_EVENT_TYPES = new Set([
 const HISTORY_EVENT_DEFAULT_LIMIT = 500;
 const HISTORY_EVENT_MAX_LIMIT = 2000;
 const HISTORY_PAYLOAD_STRING_CAP = 2000;
+// issue #300：中止/失败 run 的**只读正文重建**。runner 的 catch 固定 `final_text: ''` ⇒ 该 run 在
+// `messages` 里**零助手锚点**，而正文区本来就只从锚点渲染 ⇒ 界面上这次 run 一片空白（实测标本
+// run 72e2577d / 会话 1ead0b1a）。`assistant_delta` 逐 chunk 落 run_events（全库 5.4 万条）⇒ 在
+// 本**只读**端点里按 seq 聚合回一条合成项 `partial_output`。
+// 硬口径：**不落库、不进 SSE、不进前端 EVENT_TYPES/HISTORY_REPLAY_TYPES**（它是响应期合成的，
+// 进集合就变成「实时一条 + 历史一条」重复），也**不进** HISTORY_EVENT_TYPES（`assistant_delta` 同理
+// 不能进白名单，否则同一段正文来两遍）。
+const PARTIAL_OUTPUT_TYPE = 'partial_output';
+// 上限沿用本端点既有 `HISTORY_PAYLOAD_STRING_CAP = 2000` 的先例；**差别是刻意的**：合成项不塞
+// `…（已截断）` 文本，只给 `truncated` 布尔，截断标记由前端出（前端要能判定，见 StreamPanel）。
+const PARTIAL_OUTPUT_TEXT_CAP = 2000;
 
 // 展示 payload 截断：字符串叶值超cap → 截断 + 标记（JSON 形状保持合法，前端 String() 路径原样可用）。
 function truncateHistoryPayload(value, depth = 0) {
@@ -1729,6 +1740,109 @@ function truncateHistoryPayload(value, depth = 0) {
     return out;
   }
   return value;
+}
+
+/**
+ * issue #300：窗口行里的 distinct run_id（保序去重）。一个都没有 ⇒ 调用方**直接跳过整段合成**，
+ * 一条额外查询都不发（成本红线：正常会话每次刷新都走这条端点，绝大多数会话永远用不上合成）。
+ */
+function distinctWindowRunIds(rows) {
+  const ids = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const runId = row.run_id ?? null;
+    if (runId == null || seen.has(runId)) continue;
+    seen.add(runId);
+    ids.push(runId);
+  }
+  return ids;
+}
+
+/**
+ * issue #300 候选判定（**只在窗口里真有 run 时才发这一条查询**）：终态 **且** 零助手锚点。
+ * - 终态口径 `status IN ('finished','failed')`（枚举见 schema.sql:207）。`queued`/`running`/`cancelling`
+ *   **不算终态**——「还在跑就标已中止」是新造的误导。
+ * - 锚点口径 = `messages` 里 `role='assistant'` 的**任意**行，**含 `synthetic = true`**：judge/wrapup
+ *   注入的助手行同样是「这次 run 说过话」的证据。**有锚点就绝不能再合成一遍**（重复正文是本单头号坑）。
+ */
+async function findPartialCandidateRunIds(pool, runIds) {
+  const r = await pool.query(
+    `SELECT r.id AS run_id,
+            EXISTS (SELECT 1 FROM messages m WHERE m.run_id = r.id AND m.role = 'assistant') AS has_anchor
+       FROM runs r
+      WHERE r.id = ANY($1) AND r.status IN ('finished', 'failed')`,
+    [runIds],
+  );
+  return (r.rows ?? [])
+    .filter((row) => row.has_anchor !== true)
+    .map((row) => row.run_id ?? row.id)
+    .filter((id) => id != null);
+}
+
+/**
+ * issue #300 聚合（**只对候选发**，走 `run_events_run_idx (run_id, seq)`，零新索引）：
+ * 整 run 的 `assistant_delta` 按 `seq` 升序拼接（`ORDER BY` 在 SQL 里 ⇒ 与插入顺序无关，测试钉这点）。
+ * 脏载荷：`payload` 缺失/不是对象、`text` 缺键或不是字符串 ⇒ **跳过该片段**，绝不 `String()` 进来
+ * （项目惯例：脏数据不得渲染成 `[object Object]` / `undefined`）。
+ * 返回 Map<runId, 合成项>；聚合后正文为空 ⇒ 不给该项（被停在 `sleep` 上的 run 本来就无正文可给）。
+ */
+async function aggregatePartialOutputs(pool, candidateRunIds) {
+  const out = new Map();
+  if (!candidateRunIds?.length) return out;
+  const r = await pool.query(
+    `SELECT run_id, seq, payload FROM run_events
+      WHERE run_id = ANY($1) AND type = 'assistant_delta'
+      ORDER BY run_id, seq`,
+    [candidateRunIds],
+  );
+  const groups = new Map();
+  for (const row of r.rows ?? []) {
+    const runId = row.run_id ?? null;
+    if (runId == null) continue;
+    const g = groups.get(runId) ?? { parts: [], chunks: 0, seq: null };
+    const text = row.payload?.text; // 可选字段：非字符串就是「没给正文」，不是「正文是 [object Object]」
+    if (typeof text === 'string') {
+      g.parts.push(text);
+      g.chunks += 1;
+    }
+    const seq = Number(row.seq);
+    g.seq = Number.isFinite(seq) ? seq : g.seq; // `seq` 语义 = 该 run 最后一条 delta 的 seq（不是新分配）
+    groups.set(runId, g);
+  }
+  for (const [runId, g] of groups) {
+    if (g.seq == null) continue;
+    const joined = g.parts.join('');
+    if (joined === '') continue; // 空文本不合成
+    const truncated = joined.length > PARTIAL_OUTPUT_TEXT_CAP;
+    out.set(runId, {
+      seq: g.seq,
+      run_id: runId,
+      type: PARTIAL_OUTPUT_TYPE,
+      payload: {
+        text: truncated ? joined.slice(0, PARTIAL_OUTPUT_TEXT_CAP) : joined,
+        chunks: g.chunks, // 可观测性：让人能核对「聚合了多少片」
+        truncated,
+      },
+    });
+  }
+  return out;
+}
+
+/** 合成项参与升序排序，但**不占 limit、不参与 next_cursor/hasOlder**（那两个仍只由真实事件决定）。 */
+function mergePartialOutputsBySeq(realEvents, partialItems) {
+  if (!partialItems.length) return realEvents;
+  const parts = partialItems.slice().sort((a, b) => a.seq - b.seq);
+  const merged = [];
+  let i = 0;
+  let j = 0;
+  while (i < realEvents.length && j < parts.length) {
+    // 同 seq 时真实事件在前（seq 在会话内唯一，理论不撞；撞了也不让合成项插到真实事件前面）
+    if (realEvents[i].seq <= parts[j].seq) merged.push(realEvents[i++]);
+    else merged.push(parts[j++]);
+  }
+  while (i < realEvents.length) merged.push(realEvents[i++]);
+  while (j < parts.length) merged.push(parts[j++]);
+  return merged;
 }
 
 /**
@@ -1773,15 +1887,33 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   );
   const hasOlder = r.rows.length > limit;
   const rows = r.rows.slice(0, limit).reverse(); // 升序返回（展示回放按 seq 归并穿插）
+  const events = rows.map((row) => ({
+    seq: Number(row.seq),
+    run_id: row.run_id ?? null,
+    type: row.type,
+    payload: truncateHistoryPayload(row.payload ?? {}),
+  }));
+  // issue #300：零候选 ⇒ 零额外查询（无 run ⇒ 连候选判定都不发）。
+  // `next_cursor` / `hasOlder` 在上面已由**真实事件**算完，合成项不参与。
+  const partials = await buildPartialOutputEvents(ctx.pool, rows);
   return sendJson(res, 200, {
-    events: rows.map((row) => ({
-      seq: Number(row.seq),
-      run_id: row.run_id ?? null,
-      type: row.type,
-      payload: truncateHistoryPayload(row.payload ?? {}),
-    })),
+    events: mergePartialOutputsBySeq(events, partials),
     next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
   });
+}
+
+/**
+ * issue #300：合成 `partial_output` 响应项（**不落库、不进 SSE**）。
+ * 判据三条（缺一不合成）：① 该 run 出现在本次响应窗口里；② `runs.status IN ('finished','failed')`
+ * 且该 run 零助手锚点；③ 聚合出非空文本。聚合范围 = **整个 run**（不受 `before` 窗口影响：窗口外的
+ * 碎片也是这次 run 说过的话）。一条候选 run 至多一条合成项。契约见 portal.md §4.4a。
+ */
+async function buildPartialOutputEvents(pool, windowRows) {
+  const runIds = distinctWindowRunIds(windowRows);
+  if (runIds.length === 0) return []; // 成本红线：窗口无 run ⇒ 整段跳过，一条查询都不许多发
+  const candidates = await findPartialCandidateRunIds(pool, runIds);
+  const partials = await aggregatePartialOutputs(pool, candidates);
+  return [...partials.values()];
 }
 
 /** GET /api/runs/:id（portal.md §4.6）：run 详情（属主经 session join 校验，不泄露存在性）。 */
