@@ -605,6 +605,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **⚠ 两条被推翻的前提（别按我最初的分析去找修复点）**
 - **门户内「改名」不是漂移源**：`updateModel`（`llm.js:462`）把 `name` 写进 **`model_info.display_name`**，**不写 `model_name`**——实测 PATCH 200 后 `/model/info` 的数据面名一字未变。所以「改名后同步 bindings」是修一条不存在的路径；已改成**注释 + 用例钉住这个语义**，误导面另登记 **#296**。
+  **#296 就地补注（工单 `feat-261015-03`：这句话本身就是那个「误导面」）**：上面那句**只对「只改展示名」成立**，而它当时的结论「改名后同步 bindings 是修一条不存在的路径」也只在这个前提下成立。管理台的「改名」已拆成两个字段：**显示名** `name`（→ `model_info.display_name`，既有语义一字未动，确实不是漂移源）与**调用名** `call_name`（→ **顶层 `model_name`** = FDE 请求实际发的那个名字，`fde_llm_bindings.*_model_name` 与 per-FDE key 白名单存的都是它）。**改调用名会把引用它的那些 FDE 当场变成漂移**：`*_model_name` 暂时指向旧名，且真机实测（dev 网关 v1.103.2）LiteLLM 在改名时自己把 key 的 `models` 重写成「只有新名」⇒ 不立刻对账就是直接 403。所以带 `call_name` 的 PATCH 成功后**必须立刻走一次上面的对账**（实现 `reconcileDataPlaneNameRename`：**复用** `getFdeLlmHeartbeatModels`、不另写第二份并集逻辑；首跳 `ttlMs=0` 绕开改名前那份旧映射 ⇒ N 个受影响 FDE 合计只打一次 `GET /model/info`；**只传 `ctx.llmGateway` 单例**——本节那条「另 new 一个 LlmClient 等于换一份缓存」的教训在这里一字不差地重演，单测用注入 gateway 盯不住）。旧调用名留在并集里 ⇒ 不再伪装成 auth 错误，但已从路由消失，仍发旧名的请求会失败；改名同样**不自动回滚**（理由同本节）。另一件事：**LiteLLM 不拦同名调用名**（实测两条 deployment 都 200，`GET /v1/models` 却只列一个、请求在两者间轮询）⇒ 门户必须拦，新增 `409 model_name_conflict`。两个名字的端点契约见 `docs/api/portal.md` §4.9。
 - **只回写 DB 仍会 403**：key 白名单存的是名字 ⇒ 必须**两处一起**同步。
 
 **载荷**（`llm.js` 新增模块级私有件 + 心跳调用点接线）
