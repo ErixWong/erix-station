@@ -712,7 +712,23 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **事故记录（§3.0「收尾纪律不能依赖工具调用」又一次发作，这次代价最小）**：worker 主体两个 commit 全落地（后端 +113/+335、前端 +142/+165，沙箱内我复跑 1187/552 全绿），**却被自己一条 `ls /tmp/body-*.html`（glob 无匹配 → 退出码 2）判成终局失败**，报告没写出来。处置：`resume` 同一执行体只补报告、不改代码（主 agent 已并行完成三套复跑 + 三条变异 + 合并）。**口径：给 worker 的工单里，收尾产物一律「直接写文件」，不许用 glob 猜名字。**
 
-**发版与部署**：`TODO(主 agent)`。本单**不动 `runner/`** ⇒ 只需 portal+proxy 两镜像，**不重建 FDE 容器**。真机判据：管理台改调用名 → ① LiteLLM 顶层 `model_name` 变、`display_name` 不变；② `fde_llm_bindings.*_model_name` 回写；③ `/key/info` 的 `models` = **新旧并集**；④ 撞名返 409 且文案点名被谁占用；⑤ 只改展示名 ⇒ 数据面一字不动、不触发对账。
+**接班补充（同一条纪律的第二次发作，这次差点丢交付物）**：worker 补出来的报告落在**沙箱的 `.work-orders/`**（未跟踪目录），主树看不到、`git status` 也看不见——上一个 session 在「打完 tag 之前」做上下文压缩时崩掉，接班第一动作若是 `rm -rf` 沙箱（§2.7 的收尾动作），这 26 KB 报告就随沙箱一起没了。**口径：删沙箱前先把 `.work-orders/*` 归档到 `~/worker-reports-<日期>/`**（本单已归档 `~/worker-reports-261015/feat-261015-03-296-report.md`）；并且**沙箱三个 commit 是否真进 main，用 `git patch-id --stable` 逐条比**（cherry-pick 后 SHA 必然不同，`git log main..HEAD` 会一律显示「未合并」，别拿它当丢失证据）。
+
+**发版与部署（已完成，2026-10-15 接班收尾）**：PR #305 合并（`341fae0`）→ main CI `38723692966` 绿（含镜像构建校验，这是打 tag 的前置）→ tag `v0.1.14`（`04ced19`）→ release run `38731694512` success → 清单 `images-digest` 与部署机 `docker pull` 后 `docker image inspect` **逐个一致**：portal `imageId=e64e2c50…` / `digest=8f4b8d30…`、proxy `imageId=0519b5ac…` / `digest=b8a18c9e…` → `deploy/.env` 形态① pin（备份 `/tmp/deploy.env.bak-0114`）→ `docker compose -p station --profile litellm up -d --no-build` ⇒ portal 实跑 `e64e2c50…`、proxy `0519b5ac…`，两者 healthy。
+⚠ **本版只 pin 两个镜像**：`git diff --name-only 5b80dfa..341fae0 | grep -c '^runner/'` = **0** ⇒ `FDE_IMAGE` **故意仍 pin 在 v0.1.13 摘要**（`dbea0545…` = imageId `d80973f3…`，与七台在跑的容器一致），**没重建 FDE 容器**。别把它当漏做。
+
+**真机验收五条全过**（dev 栈，主 agent 亲手；请求从 host 网络容器 `erix_station_playwright` 发出——容器内 node 没有 system DNS（`--host-resolver-rules` 只管 chromium），所以走 `127.0.0.1:8090` + 显式 `Host: station.fde.erix.vip:8090`，**仍然经 Traefik**，不变式 2 没绕过）。标本 = 模型 `1a770ab8…`（调用名 `deepseek-flash`，**只有 fde-eric 一个绑定引用它** ⇒ 影响面最小）：
+1. **判据①** `PATCH {call_name:"acc296-probe"}` ⇒ 200：LiteLLM deployment **顶层 `model_name` 变**、`model_info.display_name` **一字未动**、`litellm_params.model` 不变、目录仍 6 条。
+2. **判据②** `fde_llm_bindings.main_model_name` 回写成新名（`main_model_id` 不变），portal 日志 `[llm] model rename reconcile { status: 'reconciled' }`。
+3. **判据③** `/key/info` 的 `fde-eric` 白名单 = `["deepseek-flash","acc296-probe"]` —— **新旧并集**（实测印证 §8.25 那条：LiteLLM 改名时自己把 key 重写成只剩新名，门户这一手把旧名兜了回来）。
+4. **判据④** 改成别人正在用的 `deepseek-v4-pro` ⇒ `409 model_name_conflict`、`retryable:false`、`details={field:'call_name',call_name,conflicting_model_id:'abfd93f5…'}`、文案「调用名「deepseek-v4-pro」已被模型 abfd93f5-… 占用」；**且网关零部分写入**（顶层名仍是上一个探针值 ⇒ 拦在 PATCH 之前）。
+5. **判据⑤** 只改展示名（干净窗口 `docker logs --since <ts>`）⇒ 该窗口 **0 条** reconcile/rename 日志、顶层 `model_name` 一字未动、binding 与白名单未动。
+
+**UI 侧也走了一次真浏览器**（playwright :8935 + vision 看图，截图 `/docker/erix_station_playwright/v0114-296-ui-confirm.png`）：列表两列并存（表头 `Call name (what FDE requests actually send)` / `Display name`），编辑弹窗两个字段各自带口径说明；改调用名点 Save ⇒ 出 `Confirm call-name change` 确认框（文案点名旧名→新名 + 说明旧名从路由消失、白名单保留），**确认前网络里 PATCH 数 = 0**（`browser_network_requests` 只有 login + providers），点 Rename 才发出那条 PATCH 200 并刷新成新名。**「确认前零请求」在部署后的真机上成立，不只是单测里。**
+
+**探针复原与残渣清理（都做了，别信「应该没事」）**：调用名与展示名都改回基线 ⇒ `/model/info` 与基线**逐行 IDENTICAL**（6 条）、`fde_llm_bindings` 里 `acc296%` 计数 **0**。另手工清了一类**门户自己不会清**的残渣：并集对账只增不减（§8.25 边界），两次改名把 `acc296-probe` / `acc296-ui` 留在了 eric 的虚拟 key 白名单里 ⇒ `/key/update` 收回到 `["deepseek-flash"]`（这是探针造成的，不是历史名，留着会污染下一次人工核对）。
+
+**一条可读性观察（不是缺陷）**：409 的文案用**冲突方的 model id** 点名，不是它的调用名。契约（§1.2 `details.conflicting_model_id`）就是这么定的，但管理员看到的是 UUID；要不要换成人话名字属产品判断，未动。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
