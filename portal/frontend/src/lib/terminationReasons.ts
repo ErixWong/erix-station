@@ -17,15 +17,16 @@
 //      且不得 import 任何运行时依赖——否则 `node --test` 直读会挂。由
 //      `portal/test/termination-contract.test.js` 的「零 import」断言钉住。
 //
-// 真值来源（引擎 0.18.0，逐值定位）：
-//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:511`（runToolLoop 返回值 typedef）；
-//   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:973-977`，fail() 里
+// 真值来源（引擎 0.19.0，逐值定位；0.18.0 → 0.19.0 复核过：reason 全集**一字未变**）：
+//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:443-444`（runToolLoop 返回值 typedef。
+//     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块 ⇒ 防漂移测试的取值正则已同步）；
+//   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:1072-1076`，fail() 里
 //     「快照/markRunState 没落盘」时定值，并把 operation/phase/sideEffect 挂在 termination 上，
-//     `orchestrator.js:973-990` + `src/loop/termination.js:74-91` annotateTermination）；
+//     `orchestrator.js:1086` + `src/loop/termination.js:74` annotateTermination）；
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.18.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.19.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。

@@ -19,6 +19,13 @@
 //   `COPY runner/*`（runner/Dockerfile），运行时拿不到前端文件，所以必须自带一份；两者的逐项一致
 //   由 `portal/test/termination-contract.test.js` 钉死（改一处必改另一处，否则根 npm test 挂）。
 //   `termination.reason` 全集则不在本文件重复：runner 只做透传，不校验取值（§5.3 向后兼容）。
+//
+// ⚠ 0.19.0 起 `termination.errorCode` / 本文件 `error.code` 的**值域新增三值**（上游 #179，见
+//   host-upgrade-guide-0.19.0 §3）：`invalid_request`（400/422）、`not_found`（404）、`conflict`（409）。
+//   它们以前一律是 `unknown`，所以「第一次看见 conflict」不是新 bug，也不需要往下面集合里加：
+//   三个新码上游都给 `retryable: false`，我们的集合也不加它们（逐条钉住见
+//   `portal/test/engine-error-code-contract.test.js`）。`error.code` 的值域由**引擎定义**，
+//   runner 不枚举、不校验（additive 口径同 §5.3）；`unknown` 那一支只是变窄，**没消失**。
 
 /** 上游判定「可重试」的 run 级错误码（与前端 RUN_RETRYABLE_ERROR_CODES 逐项一致）。 */
 export const RETRYABLE_ERROR_CODES = new Set([

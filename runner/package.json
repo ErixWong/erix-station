@@ -8,7 +8,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "erix-agent": "0.18.0"
+    "erix-agent": "0.19.0"
   },
   "scripts": {
     "test": "node --test"

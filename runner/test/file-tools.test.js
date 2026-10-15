@@ -57,8 +57,10 @@ test('writeFile/readFile：往返保真 + 行号输出 + 目录自动创建', ()
     assert.equal(text, '1: l1\n2: l2\n3: l3');
     // offset/limit 窗口 + 续读提示：行号与「共 N 行」口径不变（erix-agent #196 R1.1 把纯状态文本
     // 升级成「剩余行数 + 下一步参数」，所以 marker 字面量比 fork 时代长——刻意，不是回归）。
+    // 0.19.0 又往同一行提示里加了「（文件 9B）」（上游 2026-10-13 并入项：「文件读取工具描述带上
+    // 实测额度事实」，见 host-upgrade-guide-0.19.0 §6）⇒ 按包真值改这里的期望（不放宽：仍逐字节相等）。
     const win = await tools.executors.readFile({ path: 'sub/a.txt', offset: 1, limit: 1 });
-    assert.equal(win, '2: l2\n[共 3 行，剩余 1 行；下一步：readFile 传 offset=2 继续]');
+    assert.equal(win, '2: l2\n[共 3 行（文件 9B），剩余 1 行；下一步：readFile 传 offset=2 继续]');
   }));
 
 test('tree：目录树带深度限制', () =>
