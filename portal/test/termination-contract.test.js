@@ -147,8 +147,11 @@ test('引擎源码交叉核对（升级 erix-agent 时的 tripwire）', async ()
   }
 
   const orchestrator = fs.readFileSync(path.join(engineRoot, 'src/loop/orchestrator.js'), 'utf8');
-  // typedef 的 9 值必须全部落在常量里
-  const typedef = /termination:\{reason:((?:"[a-z_]+"?\|?)+)/.exec(orchestrator);
+  // typedef 的 9 值必须全部落在常量里。⚠ 0.19.0 起 typedef 从单行（0.18.0 `:511`）改成了多行块
+  // （`termination:{` 换行 `* reason:"end_turn"|…`，0.19.0 `:443-444`），所以这里的正则必须容忍
+  // `termination:{` 与 `reason:` 之间的换行与 JSDoc 前导 `*`。**断言强度未变**：仍要求恰好 9 值、
+  // 逐值落在常量里（见下），只是从两个形状都能取到值。
+  const typedef = /termination:\{\s*(?:\*\s*)?reason:((?:"[a-z_]+"?\|?)+)/.exec(orchestrator);
   assert.ok(typedef, '引擎 termination typedef 形状变了：重开 issue 复核 reason 全集');
   const jsDocValues = [...typedef[1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
   assert.equal(jsDocValues.length, 9, `typedef 值数与预期不符：${jsDocValues.join(',')}`);

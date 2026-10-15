@@ -20,7 +20,7 @@ import {
 const CJK = /[\u4e00-\u9fff]/;
 
 describe('termination reason 单一常量（issue #212）', () => {
-  it('引擎 0.17.0 取值面逐项在册：JSDoc 9 值 + persistence_failed，legacy 值不在册', () => {
+  it('引擎取值面逐项在册：JSDoc 9 值 + persistence_failed，legacy 值不在册', () => {
     expect([...TERMINATION_REASONS]).toEqual([
       'end_turn',
       'no_tool',
@@ -33,7 +33,10 @@ describe('termination reason 单一常量（issue #212）', () => {
       'failed',
       'persistence_failed',
     ]);
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.18.0');
+    // 版本号是**刻意的 tripwire**：升 erix-agent 时必须重新核过 reason 全集（上游 JSDoc 9 值 +
+    // fail() 产出的 persistence_failed）才能追号。0.18.0 → 0.19.0（#299）复核：typedef 从单行
+    // 变成多行块（orchestrator.js:443-444）但**九值一字未变** ⇒ 只追版本号。
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.19.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 
