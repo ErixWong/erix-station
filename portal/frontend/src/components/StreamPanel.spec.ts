@@ -226,7 +226,9 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     const store = useWorkbenchStore();
     store.es.toolCards.set('c1', {
       name: 'read', dig: 'path=src/a.js', args: '', ok: false, out: '',
-      argsSummary: 'path=src/a.js', resultPreview: 'BOOM', executionStatus: 'failed',
+      // #299/guide §7：引擎只在两种特殊状态下写 executionStatus ⇒ 夹具用**真值** `interrupted`
+      // （旧夹具写的 'failed' 从来不是引擎取值，是凭空造的；普通块上这个键根本不存在）
+      argsSummary: 'path=src/a.js', resultPreview: 'BOOM', executionStatus: 'interrupted',
     });
     store.entries.push({ kind: 'tool', callId: 'c1' });
     const wrapper = mountPanel();
@@ -241,7 +243,7 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
 
     await btn.trigger('click');
     expect(wrapper.get('pre').text()).toContain('path=src/a.js');
-    expect(wrapper.text()).toContain('failed · BOOM');
+    expect(wrapper.text()).toContain('interrupted · BOOM');
   });
 
   // issue #228：上游文件工具的返回形态按工具分三套（string / {content, metadata} / number）。
@@ -250,24 +252,33 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     const store = useWorkbenchStore();
     store.es.toolCards.set('num', {
       name: 'writeFile', dig: '', args: '', ok: true, out: '',
-      executionStatus: 'succeeded', resultPreview: 0 as unknown as string,
+      // #299：普通结果块**没有** executionStatus 键（0.20.0 §7）⇒ 展开区只剩结果正文
+      resultPreview: 0 as unknown as string,
     });
     store.es.toolCards.set('obj', {
       name: 'searchText', dig: '', args: '', ok: true, out: '',
-      executionStatus: 'succeeded',
       resultPreview: { content: 'a.js:1:hit', metadata: { searchHits: 1 } } as unknown as string,
     });
     store.es.toolCards.set('none', {
-      name: 'tree', dig: '', args: '', ok: true, out: '', executionStatus: 'succeeded', resultPreview: null as unknown as string,
+      name: 'tree', dig: '', args: '', ok: true, out: '', resultPreview: null as unknown as string,
     });
     store.entries.push({ kind: 'tool', callId: 'num' }, { kind: 'tool', callId: 'obj' }, { kind: 'tool', callId: 'none' });
     const wrapper = mountPanel();
     for (const btn of wrapper.findAll('button[aria-expanded]')) await btn.trigger('click');
+    // 直接看三张卡片的展开区正文（顺序 = entries 顺序：num / obj / none）
+    // 结果行是 `<div class="font-normal text-black/50">`（`<pre>` 是 args 块），按类名取三张卡的结果行
+    const outs = wrapper.findAll('div')
+      .filter((node) => node.classes().includes('text-black/50'))
+      .map((node) => node.text());
+    expect(outs).toEqual(['0', 'a.js:1:hit', '']);
+    // ↑ number 0 不被当成「无结果」丢掉 / {content,metadata} 只展示 content / null preview ⇒ 空串（不是 "null"）
     const text = wrapper.text();
-    expect(text).toContain('succeeded · 0'); // number 0 不能被当成「无结果」丢掉
-    expect(text).toContain('succeeded · a.js:1:hit'); // {content, metadata} 只展示 content
     expect(text).not.toContain('[object Object]');
-    expect(text).toContain('succeeded'); // resultPreview 缺失时只剩状态串，不渲染 null/undefined
+    // #299 (c)：普通块上 executionStatus **缺席** ⇒ 不得渲染成异常，也不得出现 undefined / 空状态串
+    expect(text).not.toContain('undefined');
+    expect(text).not.toMatch(/\b0ms\b/);  // 「没有时长」不许被渲染成 0ms
+    expect(text).not.toContain(' · ');    // 状态串缺席 ⇒ 不能留下空的「 · 」连接符
+    expect(text.match(/✓/g)?.length).toBe(3); // 三张卡都判成成功（不是 …/✗）
   });
 
   it('推理块默认收起、可展开；摘要取首行，展开显示全文', async () => {
@@ -285,6 +296,92 @@ describe('issue #188：投影工具卡片与推理块渲染', () => {
     expect(btn.attributes('aria-expanded')).toBe('true');
     expect(btn.find('.rotate-180').exists()).toBe(true);
     expect(wrapper.get('pre').text()).toContain('第二行细节');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #299 收尾：展开区（cardOut）的 executionStatus 读点必须**拿值比**（`isSpecialExecutionStatus`）
+// —— 这条缺口是主 agent 跑变异发现的：把 `isSpecialExecutionStatus(card.executionStatus)` 换成
+// `card.executionStatus !== undefined`（= 0.19 的旧误读）后，补测前 `StreamPanel.spec.ts` **29 条全绿 rc=0**
+// ⇒ 旧夹具里没有任何「executionStatus 是非特殊值」的卡片，这个读点根本没被值比逻辑覆盖过。
+// 引擎 0.20.0（host-upgrade-guide-0.20.0 §7 + lib/toolSummary 注释）：`erix.executionStatus`
+// **只在** `intercepted` / `interrupted` 两种特殊状态下存在，普通成功/失败块上**缺席**；
+// 上游哪天多写一个普通值（'ok' / 'succeeded' / 任何将来取值）也不许被当成状态渲进展开区，
+// 更不许留下空的「 · 」连接符。
+// `cardOut` 是 `<script setup>` 内部函数、未导出 ⇒ 沿用本文件既有技法（挂载 + 点击展开 +
+// 取结果行 `div.text-black/50`，`<pre>` 是 args 块）读渲染文本，**不为测试改产品码导出面**。
+// 变异靶：
+//   ① `isSpecialExecutionStatus(...)` → `... !== undefined`（存在性误读）⇒ 「非特殊值」那条必须红；
+//   ② 值比写成永返 false（特殊值也不渲染）⇒ 「特殊值正向」那条必须红。
+// ---------------------------------------------------------------------------
+
+/** 全部卡片展开后，按 entries 顺序取结果行正文（结果行 = 展开区里唯一的 div.text-black/50）。 */
+async function expandAllAndReadOutRows(wrapper: ReturnType<typeof mount>): Promise<string[]> {
+  for (const btn of wrapper.findAll('button[aria-expanded]')) await btn.trigger('click');
+  return wrapper.findAll('div')
+    .filter((node) => node.classes().includes('text-black/50'))
+    .map((node) => node.text());
+}
+
+describe('issue #299：展开区 executionStatus 拿值比（非特殊值不得渲染成状态）', () => {
+  // 变异①靶：普通值（上游多写的 / 空串）走值比 ⇒ 结果行只剩结果正文；存在性判据会把值本身渲出来。
+  it('非特殊值（ok/succeeded/running/空串/未知取值）不进展开区：不出现该值、无空「 · 」、无 undefined', async () => {
+    const store = useWorkbenchStore();
+    const fixtures = [
+      // callId, 上游写进 executionStatus 的**非特殊**值, resultPreview
+      ['plain-ok', 'ok', 'BODY-OK'],
+      ['plain-succeeded', 'succeeded', 'BODY-SUCCEEDED'],
+      ['plain-running', 'running', 'BODY-RUNNING'],
+      ['plain-empty', '', 'BODY-EMPTY'],
+      // 上游将来新增取值（我们没登记过）⇒ 同样不许当状态渲染，也不许被当成「没结果」丢掉正文
+      ['plain-unknown', 'cancelled-by-new-policy', 'BODY-UNKNOWN'],
+      // 非特殊值 + 无 resultPreview ⇒ 结果行是空串（存在性判据会在这里单独渲染出状态串）
+      ['plain-nopreview', 'succeeded', undefined],
+    ] as const;
+    for (const [callId, executionStatus, resultPreview] of fixtures) {
+      store.es.toolCards.set(callId, {
+        name: 'readFile', dig: '', args: '', ok: true, out: '',
+        resultPreview: resultPreview as string | undefined,
+        executionStatus,
+      });
+      store.entries.push({ kind: 'tool', callId });
+    }
+    const wrapper = mountPanel();
+    // 默认收起时头部也不该出现状态串（cardOut 只在展开区，但整页文本一起兜底）
+    const rows = await expandAllAndReadOutRows(wrapper);
+    expect(rows).toEqual(['BODY-OK', 'BODY-SUCCEEDED', 'BODY-RUNNING', 'BODY-EMPTY', 'BODY-UNKNOWN', '']);
+    fixtures.forEach(([, status, preview], i) => {
+      // 状态值本身不许出现在结果行（大小写故意分开：正文用大写 BODY-*，不与 'ok'/'succeeded' 撞串）
+      for (const junk of [status, 'undefined', ' · ']) {
+        if (junk) expect(rows[i]).not.toContain(junk);
+      }
+      if (preview) expect(rows[i]).toContain(preview); // 结果正文本身一个字符都不能少
+    });
+    const text = wrapper.text();
+    expect(text).not.toContain('undefined');
+    expect(text).not.toContain(' · '); // 状态段缺席 ⇒ 不能留下空连接符
+    expect(text.match(/✓/g)?.length).toBe(fixtures.length); // 六张卡都判成成功（不是 …/✗）
+  });
+
+  // 变异②靶：值比写成永返 false / 只认其中一种 ⇒ 引擎真写了特殊状态时展开区必须看得见。
+  it('特殊值 interrupted / intercepted 必须渲染（防值比被写成永返 false）', async () => {
+    const store = useWorkbenchStore();
+    store.es.toolCards.set('cut', {
+      name: 'bash', dig: '', args: '', ok: false, out: '',
+      resultPreview: 'KILLED', executionStatus: 'interrupted',
+    });
+    store.es.toolCards.set('blocked', {
+      name: 'bash', dig: '', args: '', ok: false, out: '',
+      resultPreview: 'DENIED', executionStatus: 'intercepted',
+    });
+    // 特殊值 + 没有 resultPreview ⇒ 只出状态串，且不留下尾巴「 · 」
+    store.es.toolCards.set('cut-only', {
+      name: 'bash', dig: '', args: '', ok: null, out: '', executionStatus: 'interrupted',
+    });
+    store.entries.push({ kind: 'tool', callId: 'cut' }, { kind: 'tool', callId: 'blocked' }, { kind: 'tool', callId: 'cut-only' });
+    const wrapper = mountPanel();
+    expect(await expandAllAndReadOutRows(wrapper)).toEqual(['interrupted · KILLED', 'intercepted · DENIED', 'interrupted']);
+    expect(wrapper.text()).not.toContain('undefined');
   });
 });
 

@@ -139,7 +139,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 8. erix-agent 依赖与升级（当前 pin：0.18.0）
+## 8. erix-agent 依赖与升级（当前 pin：**0.20.0**，2026-10-15 由 #299 从 0.18.0 两步升上；历史 0.14–0.18 记录见下）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
 - runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
@@ -650,6 +650,40 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 **发版与部署（已完成）**：PR #298 → tag `v0.1.12`（CI run `38589225119` 绿后打）→ release run `38589937146` → 清单 portal `imageId=fbbbf27c…` / proxy `3580b84d…` 与部署机 `docker image inspect .Id` 一致 → `.env` 形态① pin（备份 `/tmp/deploy.env.bak-0112`）→ `up -d --no-build` ⇒ portal 实跑 `fbbbf27c…`、`/healthz` 200（不动 `runner/` ⇒ 未重建 FDE）。
 **真机四条全过**（dev，把 eric 绑定的 `main_model_id` 改成不存在的 UUID）：① API 契约逐字段对（`409` + `code` + `retryable:true` + `details{slot,model_id}` + 说人话的 message）；② **失败面干净**：`messages 15→15`、`run_queue 130→130`（两次被挡的尝试一字未写）；③ 浏览器里那句 `Send failed: … (slot main, model id 0000…)` **可见、无脏值、输入框原文还在**；④ 把 id 改回去 ⇒ 同一条消息 `202` → run `finished` `err=(无)`、消息 `+1 user +1 assistant`（反向证明 ②）。**#289 已关闭。**
+
+### 8.27 erix-agent 0.18.0 → **0.19.0**（issue #299，2026-10-15）
+
+**唯一的宿主可观测面 = `classifyHttpError` 的 4xx 不再一律 `unknown`**（0.19 起 400/422→`invalid_request`、404→`not_found`、409→`conflict`，`retryable` 仍 `false`）。
+- **结论：我们的 `error.retryable` 逐条不变**（判据集合 `{timeout, rate_limited, server, disconnect, checkpoint_failed}` + `err.retryable===true`，4xx 不在里面），变的是 **`error.code` 的取值**（会进 `run_finished.error.code` / `runs.error_code`）。探针实测 0.18/0.19 两版逐 status 对照见 `~/worker-reports-261015/probe-engine-upgrade-299.md`。
+- **不新增判据、不新增错误码**：值域仍「由引擎定义」，但运维侧若曾按 `error_code='unknown'` 统计「请求写错」这类，需要**重新分桶**（`invalid_request`/`not_found`/`conflict` 从 `unknown` 里分出去了）。`runner/lib/termination.js` 注释 + `portal/test/engine-error-code-contract.test.js` 钉住「三个新码都不得进可重试集合」。
+- **两处「按指南说不用动、实际会红」**（都已按包真值改，**没有放宽任何断言**）：① 上游 2026-10-13 并入项把 `readFile` 续读 marker 加了「（文件 N B）」⇒ 逐字钉 marker 的用例红；② `runToolLoop` 返回值 typedef 从单行变多行 JSDoc 块 ⇒ 我们**解析包源码 JSDoc** 的防漂移契约（`portal/test/termination-contract.test.js`）取不到值。修法 = 正则容忍换行 + 前导 `*`，「九值逐项落在常量里」强度一字未放；`reason` 全集经复核**一字未变**，故 `ENGINE_VERSION_FOR_TERMINATION_REASONS` 只追号 + 重定位真值行号。**这两条已回灌上游文档建议（erix-agent #293）**。
+- **`llm-timeouts.test.js` 的 `ENGINE_VERSION_PINNED` tripwire 是按设计红**：复核 = `diff` 上游 `src/providers/payload.js` 与 `src/providers/timeout.js` 在 0.18/0.19/0.20 **三版逐字节相同**（四相超时语义、legacy 120s、`streamTotal` 默认 300s 全不变）⇒ 只追版本号。
+- **随包 `.d.ts` 对我们不适用**，判据是可执行断言而非 grep 命中数（`portal/test/engine-upgrade-299.test.js` 判据①）：前端 `import … from 'erix-agent'` 0 命中、前端 `package.json` 无该依赖、`portal/` 与 `runner/` 无 `tsconfig`（纯 JS，无 `tsc` 编译面）。
+- ⚠ **我给的命令写错被 worker 纠正**：`npm install --exact` 不是有效开关（实测写出 `^0.19.0`，破坏 exact 风格），**必须 `--save-exact`**。
+
+### 8.28 erix-agent 0.19.0 → **0.20.0**（BREAKING：工具事实进 `erix.*`，issue #299，2026-10-15）
+
+**载荷本体**：`tool_result` 的顶层摊平字段**停写**（`TOOL_RESULT_CONTRACT.legacy = {written:false, retireAt:"下一个 minor", aliases:{erixRound→erix.round, duration→erix.durationMs, executionStatus→erix.executionStatus, success→erix.success, <宿主键>→metadata.<键>}}`）。引擎**读侧保留一代兼容**（老记录仍可读顶层），但**不再写**⇒ 顶层读法会**静默**退化，不报错。
+
+**站内顶层读点只有一个**（升级前我按指南 §9 自查清单全量 grep 的结论，不是猜的）：
+- `runner/worker.js` 的 `duration_ms`。现口径 = **`tr.erix?.durationMs ?? tr.duration`**，并把 `#283` 那条**主动误导**的旧注释整段重写（旧注释写着「顶层就是正确读点、别改 metadata」）。回退只为盘上 740+ 条旧 `tool_result` 保留，**挂账在 #303**（下次升引擎 minor 时清；**届时 `#299 ②` 那条用例应当变红——红了才是正确信号，别当回归修回去**）。
+
+**#283 那个「引擎给不出时长」的临时计时闸已撤**（判据 = 探针 12 行，含 25ms 延时对照组、`writeFile` 返回 `0`、抛异常、返回 `Error`、裸对象、`null`）：0.20.0 下**无闸**四种真执行形态都写 `erix.durationMs`（延时 25ms 给 25ms），且落盘块上**没有**顶层 `duration`。⇒ 删 `runner/lib/tool-duration.js` + 出口包装 + 旧测（−9 项），并留**防回装双断言**（源码级：禁 `wrapToolResultForDuration(` 调用/导入、禁 `lib/tool-duration.js` 存在、禁装配层自起计时器；行为级：裸返回四形态都带 `erix.durationMs`——上游若把 erix-agent #285 收回去会红）。
+- ⚠ **`erix.durationMs` 缺失 = 「不知道」，不是 0**（0.20.0 明说 `?? 0` 是把未知渲染成「瞬间完成」）。没值只剩三种情形：judge 拦截、unsafe 重放被中止、executor 未 settle 就被中止——与 #283 既定口径一致。
+
+**`erix.executionStatus` 只在两种特殊状态存在**（`intercepted`/`interrupted`；普通块上**缺席**，不是空串也不是 `ok`）⇒ 站内 5 个读点逐个改成**拿值比**（新 `SPECIAL_EXECUTION_STATUSES` + `isSpecialExecutionStatus()`）：`toolSummary.ts`、`useEventStream.ts`（两处把「字段在」当「这块值得关注」的判据 + 普通块不再写伪键）、`StreamPanel.vue`、`workbench.ts` 类型注释、`session-view.js` DTO 说明。
+
+**投影新增 `toolCallKey` / `durationMs` 的优先级（主 agent 裁决，勿自行改方向）**：`durationMs` = **投影有值用投影值 → 缺省回落宿主 `tool_calls.duration_ms` → 两者都缺则「键不存在」**（禁止 `?? 0`）；`toolCallKey` **不接进前端卡片身份**（§8.5 仍用投影自造 `key` + provider `tool_use.id`），只透传不匹配。
+
+**接入随包 `toolResultEnvelopeContract`**（27 条断言零改动全绿）；`fileToolsContract` 随包 28→31（含 §6 四形态断言）也全绿——**没放宽套件**。`runner/lib/file-tools.js` 的 tree 根标签收口改用上游判别式 **`classifyFileToolResult`（`erix-agent/tools` 子路径，不在包根）**；前端 `toolSummary.ts` 因不依赖该包**保持手写**，但四形态表写进注释并点名判别式（`engine-upgrade-299.test.js` 判据②机器检查，删一支即红）。
+
+**测试口径**：根 **1138 → 1177**（+39：随包信封 27 + 4xx 契约 4 + 三条升级判据 + 时长优先级 4 − 撤闸删 9 + 上游套件自身增长）、runner **258 → 286**、前端 **540 → 546**（台账三处已同步）。
+
+**主 agent 亲跑变异（不复用 worker 的 7 条）**：① 拆掉随包套件接入 ⇒ 红在「四套契约套件接入面在册」守卫；② 删前端四形态表里 `writeFile` 一支 ⇒ 红在「表在册」守卫；③ **把存在性判据塞回 `StreamPanel.cardOut()` ⇒ 29 条全绿**——先自证不是空操作（diff 真改 1 行、只在 `executionStatus` 为非特殊值时改变行为）⇒ 定性**真覆盖缺口**（新加的 4 条都在 `useEventStream`，`cardOut` 从没喂过非特殊值），补测后同一变异**恰 1 条红且红在新用例**。④ 顺带修正一处**我们自己刚写下的误导注释**（它把防回装断言指向已删除的 `tool-duration.test.js`）。
+
+**不在本单（已挂账）**：#300 消费 `error.finalText`（停止后助手文本整体消失，上游 §5 点名宿主侧边界）、#301 是否开 `partialPersistence`（需决策）、#303 一代回退清账、`toolCallKey` 接进 UI。
+
+**发版与部署**：`TODO(主 agent)`。⚠ **本单动 `runner/` ⇒ 必须重建 FDE 镜像 + 按 digest pin `FDE_IMAGE` + `docker rm -f` 全部 fde-\* 让 reconcile 重建**（§8.17 先例）；真机判据见交付报告 §6.2（`sleep 2` ⇒ `duration_ms≈2000` 且卡片显 `2.0s`；`writeFile` 空文件 ⇒ 显 `0ms` 不是「无时长」；被中止的那次 ⇒ NULL 且前端不渲染时长；新 run 的 `duration_ms IS NULL` 比例≈0，旧 740 条仍 NULL 是**正确**的）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 

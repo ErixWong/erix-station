@@ -31,7 +31,13 @@ import { createOpenAIProvider } from 'erix-agent';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_ROOT = path.join(RUNNER_DIR, '..');
-const ENGINE_VERSION_PINNED = '0.18.0';
+// 引擎超时相语义的对齐版本。**本常量的作用是逼人工复核**：升 erix-agent 时必须先 diff
+// `src/providers/payload.js` 与 `src/providers/timeout.js`，确认四相/legacy 口径没变再动它。
+// 0.18.0 → 0.19.0 → 0.20.0 复核结果（#299）：**三个版本上这两个文件逐字节相同**
+// （`diff -q` 对 0.18/0.19/0.20 两两都是 IDENTICAL），
+// resolveProviderTimeouts 的 explicitPhase / legacyTimeoutMs=120_000 / streamTotal 默认 300_000
+// 全部不变 ⇒ 只追版本号，下面所有断言一字未改。
+const ENGINE_VERSION_PINNED = '0.20.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。
@@ -214,7 +220,7 @@ test('② 对照组：什么都不传 = legacy 模式 = 120s 绝对总闸（这�
   const { resolveProviderTimeouts } = await loadEngineTimeoutModules();
   const legacy = resolveProviderTimeouts({});
   assert.equal(legacy.explicitPhase, false);
-  assert.equal(legacy.legacyTimeoutMs, 120_000, '0.18.0 的 legacy 总闸默认值（issue #261 现象值）');
+  assert.equal(legacy.legacyTimeoutMs, 120_000, 'legacy 总闸默认值（issue #261 现象值；0.19.0 复测未变）');
   assert.equal(legacy.requestTimeoutMs, 120_000);
   assert.equal(legacy.streamTotalTimeoutMs, 300_000, '显式模式下引擎自己的 streamTotal 默认仍是 300s');
   // 只传 legacy 入口（timeoutMs）同样不关总闸——所以本单必须传**相**超时，而不是把 120000 换大。

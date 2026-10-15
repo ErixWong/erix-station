@@ -7,7 +7,7 @@ import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type StreamEntry, type FoldedInfo, type FoldedOriginalState } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
 // issue #85：卡片折叠（默认收起）+ 单行摘要防溢出，方案对齐 pi web ToolCallBlock。
-import { getToolPreview, getToolResultSummary, formatDuration } from '../lib/toolSummary';
+import { getToolPreview, getToolResultSummary, formatDuration, isSpecialExecutionStatus } from '../lib/toolSummary';
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 // pi-web 风格：流式增量也走 markdown 渲染（渲染器先转义后格式化，半截 ``` 容错收尾）。
 import { renderMarkdown } from '../lib/markdown';
@@ -68,7 +68,10 @@ function cardOut(card: ToolCardState): string {
   // issue #228：投影路径的 resultPreview 在进卡片前已归一成字符串，这里再走一次是**幂等**防御：
   // 旧 DTO / 其它宿主给到 number、null、`{content, metadata}` 时，既不渲染成 "[object Object]"，
   // 也不会因 `!!0` 把「写了 0 字节」当成「没结果」而丢掉。metadata 不单独上 UI（信息在 content marker 里）。
-  return [card.executionStatus, getToolResultSummary(card.resultPreview)].filter((part) => !!part).join(' · ');
+  // issue #299（guide-0.20.0 §7）：`executionStatus` 只在两种特殊状态下存在，普通块上缺席；这里**拿值比**
+  // （`isSpecialExecutionStatus`）而不是看「在不在」：上游若哪天多写一个普通值，不会被我们当成状态渲进展开区。
+  return [isSpecialExecutionStatus(card.executionStatus) ? card.executionStatus : '',
+    getToolResultSummary(card.resultPreview)].filter((part) => !!part).join(' · ');
 }
 
 // issue #188：推理块展开态（组件内，默认收起）——与工具卡片同一按钮+chevron 交互风格，不新造一套。

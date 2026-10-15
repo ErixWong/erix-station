@@ -58,12 +58,26 @@ export interface ProjectedToolCall {
   argsSummary?: string;
   resultPreview?: string;
   isError?: boolean;
+  /**
+   * issue #299（erix-agent 0.20.0 / guide §7）：**只在两种特殊状态下存在**——`intercepted`（审计拦截）
+   * 与 `interrupted`（续跑改写）；普通成功/失败的块上该键**缺席**（不是空串、不是 `ok`）。
+   * ⚠ 不得把「字段在不在」当「这个块值得关注」的判据，要判就拿值比
+   * （`lib/toolSummary.ts#isSpecialExecutionStatus`）。
+   */
   executionStatus?: string;
   /**
-   * issue #283：**宿主 join 进来的耗时（毫秒）**，不是引擎投影字段——官方投影的 `toolCalls[]`
-   * 不带时长，`portal/src/session-view.js` 在投影之后按 `(run_id, call_id)` 从自家
-   * `tool_calls.duration_ms` 补上（数据由 U3 的 tool_result UPDATE 回填）。
-   * 旧数据库里是 NULL ⇒ DTO **不出现该键**（不写 0）；前端只在卡片现有 `dur` 为空时用它。
+   * erix-agent 0.20.0 起上游投影**自己就带** `toolCallKey`（一次被接受的调用的耐久身份键，
+   * 跨 resume 稳定）。本单**不接进卡片身份**：我们的 §8.5 身份仍是投影自造的 `key` + provider
+   * `tool_use.id`，接不接 `toolCallKey` 是单独的设计决定（见 `portal/src/session-view.js` 同注）。
+   */
+  toolCallKey?: string;
+  /**
+   * 耗时（毫秒）。**两条来源**（#283 → #299）：
+   *   1. erix-agent 0.20.0 起**引擎投影自己带** `durationMs`（`erix.durationMs` 的投影）；
+   *   2. 投影缺省时由 `portal/src/session-view.js` 在投影之后按 `(run_id, call_id)` 从自家
+   *      `tool_calls.duration_ms` **回落 join**（老记录唯一的时长来源）。
+   * 两路都没有 ⇒ DTO **不出现该键**（0.20.0 明说「缺失=不知道」，**绝不写 0**）；
+   * 前端只在卡片现有 `dur` 为空时用它。T1 之前的记录上引擎那一路是直接缺省的（不合成）。
    */
   durationMs?: number;
 }
