@@ -141,7 +141,12 @@ export type StreamEntry =
   | { kind: 'syserr'; text: string }
   | { kind: 'tool'; callId: string }
   | { kind: 'reasoning'; id: string; text: string }
-  | { kind: 'delta'; text: string };
+  | { kind: 'delta'; text: string }
+  // issue #300：被停止/失败的 run **零助手锚点**（runner 的 catch 固定 final_text:''），而正文区
+  // 本来就只从 messages 锚点渲染 ⇒ 界面上这次 run 一片空白。历史端点把它的 assistant_delta 按 seq
+  // 聚合成一条合成项 partial_output（**不落库、不进 SSE**），本 kind 就是它在展示层的落点：
+  // **中性助手气泡**（不是红色 .syserr：「只剩半截正文」不是错误），id=partial:<run_id> 幂等去重。
+  | { kind: 'partial'; id: string; text: string; truncated: boolean; sessionId: string | null };
 
 interface SessionDetail {
   session: Session & { active_run_id?: string | null };
@@ -173,6 +178,20 @@ function toolCallKey(messageId: string, call: ProjectedToolCall, index: number):
   if (typeof call.id === 'string' && call.id !== '') return call.id;
   if (typeof call.key === 'string' && call.key !== '') return call.key;
   return `proj:${messageId}:${index}`;
+}
+
+/**
+ * issue #300：合成项 `partial_output` 的载荷取数（脏载荷一律退化）。
+ * 与 lib/toolSummary.ts 同口径：**拿值比类型**，不 `String()` 兼平（对象 String() 出来就是
+ * `[object Object]`，数字会变成「42」这种看起像正文的脏东西）。
+ */
+function partialText(payload: Record<string, unknown> | undefined): string {
+  return typeof payload?.text === 'string' ? payload.text : '';
+}
+
+/** 同上：`truncated` 只认**真字面量 true**（缺键/脏值一律当「没截断」，不拿脏值冒充提示）。 */
+function partialTruncated(payload: Record<string, unknown> | undefined): boolean {
+  return payload?.truncated === true;
 }
 
 export const useWorkbenchStore = defineStore('workbench', () => {
@@ -280,6 +299,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   // ---- addMessage（issue #40 渲染规则逐行平移）----
+  /**
+   * issue #300：历史合成项 `partial_output` → 中性 partial entry。
+   * 幂等靠 id=`partial:<run_id>` 走 renderedIds（与 addMessage 同一去重集）：同一条在多次归并/
+   * 重进会话时只渲染一次。聚合文本为空（脏载荷只有脏片段）⇒ 不推 entry，界面不出现空气泡。
+   */
+  function addPartialOutput(ev: RunHistoryEvent) {
+    const runId = typeof ev.run_id === 'string' && ev.run_id !== '' ? ev.run_id : 'unknown';
+    const id = `partial:${runId}`;
+    if (renderedIds.value) {
+      if (renderedIds.value.has(id)) return;
+      renderedIds.value.add(id);
+    }
+    const text = partialText(ev.payload);
+    if (text === '') return;
+    entries.value.push({ kind: 'partial', id, text, truncated: partialTruncated(ev.payload), sessionId: sessionId.value });
+  }
+
   function addMessage(m: ChatMessage) {
     if (renderedIds.value) {
       if (renderedIds.value.has(m.id)) return; // 去重（refresh 与流式缓冲竞态）
@@ -572,6 +608,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     merged.sort((a, b) => a.seq - b.seq);
     for (const item of merged) {
       if (item.msg) addMessage(item.msg);
+      // issue #300：**在调 replayEvent 之前**分流。partial_output 只存在于历史响应里（不落库、
+      // 不进 SSE），既不进 EVENT_TYPES 也不进 HISTORY_REPLAY_TYPES ⇒ 自己推 entry；
+      // **不喂 replayEvent**（它拿不到这个 type，自然不产工具卡片/分隔行，也不会「实时一条 + 历史一条」）。
+      else if (item.ev && item.ev.type === 'partial_output') addPartialOutput(item.ev);
       else if (item.ev) es.replayEvent(item.ev);
     }
     const serverRunId = data.session.active_run_id;
@@ -886,7 +926,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // actions
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
-    saveDraft, addMessage, send, stop, refreshSession,
+    saveDraft, addMessage, addPartialOutput, send, stop, refreshSession,
     // issue #261B：一键「重试上一条」（lastSend/retryAvailable 仅内存；retryInFlight 驱动按钮禁用）
     lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数

@@ -145,10 +145,18 @@ function foldedOriginalState(en: FoldedEntry): FoldedOriginalState | undefined {
   return store.getFoldedOriginal(en.sessionId, round);
 }
 
+// issue #300：部分正文走**助手正文的既有渲染路径**（renderMarkdown 先转义后格式化，XSS 安全），
+// 与助手终稿/流式增量一致。text 在 store 里已保证是字符串（脏载荷退化成 '' 后根本不推 entry），
+// 这里再兜一层是为了组件对 entry 形状独立可推：不依赖调用方洁净，也不渲染 undefined。
+function partialHtml(text: string): string {
+  return renderMarkdown(typeof text === 'string' ? text : '');
+}
+
 function entryKey(en: StreamEntry, i: number): string {
   switch (en.kind) {
     case 'msg': return 'm' + en.id;
     case 'folded': return 'f' + en.id;
+    case 'partial': return 'p' + en.id;
     case 'tool': return 't' + en.callId;
     case 'reasoning': return 'r' + en.id;
     case 'delta': return 'd' + i;
@@ -189,6 +197,14 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
          类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
     <div v-else-if="en.kind === 'delta'" class="msg assistant md" v-html="renderMarkdown(en.text)"></div>
+    <!-- issue #300：中止/失败 run 的**部分正文**（历史端点合成的 partial_output entry）。
+         **中性助手气泡**：复用 .msg assistant .md（与助手终稿同一渲染路径），只加一个 `partial`
+         修饰类做视觉区分——**不新增颜色语义**，更不进红色 .syserr（半截正文不是错误）。 -->
+    <div v-else-if="en.kind === 'partial'" class="msg assistant md partial">
+      <div class="partial-label mb-0.5 text-xs text-black/45">{{ t('stream.partialOutput.label') }}</div>
+      <div v-html="partialHtml(en.text)"></div>
+      <div v-if="en.truncated" class="partial-truncated mt-0.5 text-xs text-black/45">{{ t('stream.partialOutput.truncated') }}</div>
+    </div>
     <!-- issue #189：折叠横幅（**独立视觉**：非 .msg 气泡，琥珀色左边框 + 虚线分隔条，绑定助手消息 id，
          排在正文气泡前）。标题带压缩条数/轮范围（缺字段逐级降级）；摘要默认收起，点击展开；
          「查看原文」→ 只读懒加载原文 turns（loading / 404 友好提示 / error+重试）。 -->

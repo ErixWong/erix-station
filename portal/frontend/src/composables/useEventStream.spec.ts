@@ -974,3 +974,29 @@ describe('#288 tool_replay_decision_required（挂起工具未重放）', () => 
     expect(line).not.toMatch(/[\u4e00-\u9fff]/);
   });
 });
+
+// issue #300：合成项 `partial_output` 只存在于**历史响应**里（后端不落库、不推 SSE）。
+// 前端两个集合都**不许**加它：加了 `EVENT_TYPES` ⇒ 实时多挂一个监听（同一 run 变成「实时一条 +
+// 历史一条」的起点）；加了 `HISTORY_REPLAY_TYPES` ⇒ 它会流进展示层状态机（本单要的是中性 entry，
+// 由 store 自己分流，见 stores/workbench.ts 的 addPartialOutput）。
+describe('#300 partial_output 不进 EVENT_TYPES / HISTORY_REPLAY_TYPES', () => {
+  it('实时：EventSource 没有为 partial_output 挂监听（加进 EVENT_TYPES 就红）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    expect(lastES().listeners.has('partial_output')).toBe(false);
+    // 顺手钉住它也不是 assistant_delta 的别名：正文增量仍只有 assistant_delta 一条通路
+    expect(lastES().listeners.has('assistant_delta')).toBe(true);
+    expect(s.lastSeq.value).toBe(0);
+  });
+
+  it('回放：replayEvent 收到 partial_output 时零副作用（未进 HISTORY_REPLAY_TYPES）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.replayEvent({ seq: 41, run_id: 'r1', type: 'partial_output', payload: { text: '半截', chunks: 3, truncated: false } });
+    expect(hooks.onSep).not.toHaveBeenCalled();
+    expect(hooks.onSysErr).not.toHaveBeenCalled();
+    expect(hooks.onToolCardCreated).not.toHaveBeenCalled();
+    expect(s.lastSeq.value).toBe(0);
+  });
+});
