@@ -1481,7 +1481,13 @@ test('#299 ②：投影缺省（T1 之前的老记录）+ 宿主有值 ⇒ 回�
 
 test('#299 ③：投影与宿主**都缺** ⇒ DTO 里没有 durationMs 这个键（禁止写 0）', () => {
   const { anchors, transcriptRows } = toolCallFixture(RUN_1, 'call-1');
-  for (const rows of [undefined, [], [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }]]) {
+  for (const rows of [
+    undefined,
+    [],
+    [{ run_id: RUN_1, call_id: 'call-1', duration_ms: null }],
+    // 库里有别的调用有时长、唯独这次没有 ⇒ 走「有 map 但没命中」那一支（这条也会被 `?? 0` 变异抓到）
+    [{ run_id: RUN_1, call_id: 'ghost-call', duration_ms: 42 }],
+  ]) {
     const dto = projectSessionMessages({
       sessionId: SESSION_ID, anchors, userAnchors: [], transcriptRows, toolCallRows: rows,
     })[0];
