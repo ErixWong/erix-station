@@ -779,3 +779,102 @@ test('#296 端到端：同名调用名被 409 挡住，且不留半截状态', a
     assert.equal(pool.state.updates.length, 0);
   } });
 });
+
+// ---------------------------------------------------------------------------
+// #309 切片 1：心跳下行的模型元数据（只 main 槽位，只在非 null 时带键）。
+// 决策者定稿见 issue #309 §2.3：值与门户模型列表同一来源（同一个 `toModel` 语义），且必须跟
+// **对账后的新名**取自同一个 deployment；没值就整个键不出现，别写 `key: null`。
+// ---------------------------------------------------------------------------
+
+/** 带元数据的目录条目：窗口/预算在 `model_info`，legacy 的 `max_tokens` 在 `litellm_params`。 */
+const metaModel = (id, name, { contextWindow = null, maxOutputTokens = null, legacyMaxTokens = null } = {}) => ({
+  model_info: {
+    id,
+    ...(contextWindow == null ? {} : { context_window: contextWindow }),
+    ...(maxOutputTokens == null ? {} : { max_output_tokens: maxOutputTokens }),
+  },
+  model_name: name,
+  ...(legacyMaxTokens == null ? {} : { litellm_params: { model: `upstream/${id}`, max_tokens: legacyMaxTokens } }),
+});
+
+test('#309 心跳下行：main 带 context_window + max_output_tokens，且取的是**对账后新名**那个 deployment', async () => {
+  const pool = fakePool([ROW]);
+  // binding 存量名是 deepseek-flash，而目录里这个名字现在属于**另一个**部署（8192/2048）；
+  // m-main 的真名是 deepseek-v4（200000/50000）⇒ 按存量旧名取就带错部署，本用例立刻红。
+  const { gw, state } = fakeGateway([
+    metaModel('m-main', 'deepseek-v4', { contextWindow: 200000, maxOutputTokens: 50000 }),
+    metaModel('m-other', 'deepseek-flash', { contextWindow: 8192, maxOutputTokens: 2048 }),
+    metaModel('m-emb', 'text-embedding-3', { contextWindow: 8191, maxOutputTokens: 2047 }),
+  ]);
+
+  const models = await getFdeLlmHeartbeatModels(pool, 'u1', {
+    gateway: gw,
+    now: () => 1000,
+    ttlMs: 0,
+    listModels: () => gw.listModels(),
+    updateKey: () => Promise.resolve({}),
+  });
+
+  assert.deepEqual(models.main, {
+    model: 'deepseek-v4', type: 'text', context_window: 200000, max_output_tokens: 50000,
+  }, 'main 带两个元数据字段，且值来自对账后的新名所在的那个部署');
+  assert.deepEqual(models.embedding, { model: 'text-embedding-3', type: 'embedding' },
+    'embedding / vision 不带元数据（切片 1 只给 main）');
+  assert.equal(Object.hasOwn(models.embedding, 'context_window'), false);
+  assert.equal(Object.hasOwn(models.embedding, 'max_output_tokens'), false);
+  assert.equal(state.listCalls, 1, '元数据必须复用对账那一次 GET /model/info，不得新增网关调用');
+});
+
+test('#309 心跳下行：只有 litellm_params.max_tokens 的存量部署，max_output_tokens 走同一条回退链', async () => {
+  const pool = fakePool([ROW]);
+  const { gw } = fakeGateway([
+    metaModel('m-main', 'deepseek-flash', { contextWindow: 32768, legacyMaxTokens: 4096 }),
+    metaModel('m-emb', 'text-embedding-3'),
+  ]);
+
+  const models = await getFdeLlmHeartbeatModels(pool, 'u1', {
+    gateway: gw,
+    now: () => 1000,
+    ttlMs: 0,
+    listModels: () => gw.listModels(),
+    updateKey: () => Promise.reject(new Error('must not be called')),
+  });
+
+  assert.deepEqual(models.main, {
+    model: 'deepseek-flash', type: 'text', context_window: 32768, max_output_tokens: 4096,
+  }, 'model_info 里没有 max_output_tokens 时回退到 litellm_params.max_tokens（与门户列表同一口径）');
+});
+
+test('#309 心跳下行：没配元数据 ⇒ 键整个不出现（不是 key: null）；只配一项就只出现那一项', async () => {
+  const bare = fakePool([ROW]);
+  const { gw: bareGw } = fakeGateway([metaModel('m-main', 'deepseek-flash'), metaModel('m-emb', 'text-embedding-3')]);
+  const bareModels = await getFdeLlmHeartbeatModels(bare, 'u1', {
+    gateway: bareGw, now: () => 1000, ttlMs: 0, listModels: () => bareGw.listModels(), updateKey: () => Promise.resolve({}),
+  });
+  assert.deepEqual(bareModels.main, { model: 'deepseek-flash', type: 'text' });
+  assert.deepEqual(Object.keys(bareModels.main), ['model', 'type'],
+    '没值就整个键都不要出现：存量部署的下行字节与 #309 之前逐字节相同');
+
+  const partial = fakePool([ROW]);
+  const { gw: partialGw } = fakeGateway([
+    metaModel('m-main', 'deepseek-flash', { contextWindow: 65536 }),
+    metaModel('m-emb', 'text-embedding-3'),
+  ]);
+  const partialModels = await getFdeLlmHeartbeatModels(partial, 'u1', {
+    gateway: partialGw, now: () => 2000, ttlMs: 0, listModels: () => partialGw.listModels(), updateKey: () => Promise.resolve({}),
+  });
+  assert.deepEqual(partialModels.main, { model: 'deepseek-flash', type: 'text', context_window: 65536 },
+    '两个键各自独立：只配了窗口就只出现窗口，不补一个 null 占位');
+  assert.equal(Object.hasOwn(partialModels.main, 'max_output_tokens'), false);
+});
+
+test('#309 心跳下行：目录里找不到这个名字（或目录整体拿不到）⇒ 退回无元数据，不抛错', async () => {
+  const pool = fakePool([ROW]);
+  // 目录只有 embedding：main 的 id 判不出名字（#289 的 unknown_model_id 分支）且按名也取不到部署。
+  const { gw } = fakeGateway([metaModel('m-emb', 'text-embedding-3', { contextWindow: 8192, maxOutputTokens: 2048 })]);
+  const { value: models, warnings } = await captureWarnings(() => getFdeLlmHeartbeatModels(pool, 'u1', {
+    gateway: gw, now: () => 1000, ttlMs: 0, listModels: () => gw.listModels(), updateKey: () => Promise.resolve({}),
+  }));
+  assert.deepEqual(models.main, { model: 'deepseek-flash', type: 'text' });
+  assert.ok(warnings.some(([tag]) => String(tag).includes('reconcile skipped')));
+});
