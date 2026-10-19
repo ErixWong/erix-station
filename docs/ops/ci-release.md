@@ -109,7 +109,17 @@
 → ⑥ 换了 FDE 镜像还要重建 FDE 容器（见下面第 5 条）
 ```
 
-**前置（部署机，只做一次）：`docker login ghcr.io`**
+**前置（部署机）：GHCR 拉取现在可以不带凭据**
+
+仓库 `ErixWong/erix-station` **现为 public**（原为 private；可见性于 2026-10-19 实测确认，转公开的确切日期未考证），
+三个 GHCR 包（`erix-station-portal` / `erix-station-fde` / `erix-station-fde-proxy`）REST `visibility` 均为 `public`
+⇒ **部署机可匿名直接 `docker pull`，不必先 `docker login ghcr.io`**（实测：匿名 token 取 `latest` manifest `200`）。
+
+```bash
+docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 无需凭据
+```
+
+历史口径（包仍为私有的机器，或将来把包改回私有时才需要）：
 
 ```bash
 # 用户名 = GitHub 用户名；口令 = PAT（classic 勾 `read:packages`；
@@ -118,9 +128,13 @@ printf '%s' "$GHCR_PAT" | docker login ghcr.io -u ErixWong --password-stdin
 docker pull ghcr.io/erixwong/erix-station-fde-proxy:latest   # 能拉过 = 登录到位
 ```
 
-⚠️ 仓库 `ErixWong/erix-station` 是**私有**的 ⇒ 首次推送时建的 GHCR 包默认也私有，**未登录拉不动**，
-报 `denied: requested access to the resource is denied`——别误判成「镜像没推上去」（先看 Actions run 是否绿）。
-凭据落在 `~/.docker/config.json`；换 PAT 后需重登。
+凭据落在 `~/.docker/config.json`；换 PAT 后需重登。CI **推**镜像仍走内置 `GITHUB_TOKEN`（`packages: write`），与本节无关。
+
+⚠️ **两类拉取失败别混淆**（都是一副「镜像没推上去」的样子）：
+- `denied: requested access to the resource is denied` = **权限**（包私有 / 未登录 / token 无 `read:packages`）——先看 Actions run 是否绿；
+- `MANIFEST_UNKNOWN … OCI manifest found, but Accept header does not support OCI manifests` = **不是权限**，是探测命令的
+  `Accept` 头少 `application/vnd.oci.image.manifest.v1+json`（用 `curl` 手搓 registry API 时最容易踩，补上即 200）。
+  ⇒ 拿 `curl` 探可见性时，**404 不等于私有**；权威判据是 REST `GET /users/<user>/packages/container/<pkg>` 的 `visibility`。
 
 1. **发布**：`git tag v0.2.0 && git push --follow-tags`。`release.yml` 校验
    `tag` 去掉 `v` 后必须等于 `package.json` 的 `version`，不等就**明确失败并打印两者当前值**。

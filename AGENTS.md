@@ -1,7 +1,7 @@
 # erix-station — 项目 AGENTS.md
 
 > 项目特有规则；共享约定见 `~/projects/AGENTS.md`（全局）。本文件随仓库走。
-> 主远程：`https://github.com/ErixWong/erix-station.git`（私有）。
+> 主远程：`https://github.com/ErixWong/erix-station.git`（**public**；原为 private，现可见性于 2026-10-19 实测确认，转公开的确切日期未考证。三个 GHCR 包随之可匿名拉取，口径见 `docs/ops/ci-release.md` §2）。Issue / PR 在 **GitHub**（不在 Gitea：本仓无项目级 `.mcp.json` 的 gitea 覆盖）。
 
 ## 1. 项目定位
 
