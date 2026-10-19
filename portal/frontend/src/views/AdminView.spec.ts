@@ -528,13 +528,13 @@ describe('AdminView · LLM 管理', () => {
   // --- issue #309 切片 1：`max_output_tokens`（前端只透传，**不做本地数字校验**）-----------
   // 为什么前端不卡 1/4：上限公式只有一个判据才有意义（服务端那一处带 context_window 的现存值，
   // 前端拿不到也不能猜）⇒ 前端只写提示，超限一律由服务端拒并把 message 原样显示。
-  const PROVIDERS_BUDGET = {
+  const PROVIDERS_MAX_OUTPUT = {
     items: [
       {
         id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
         models: [
           { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', model_name: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 200000, max_tokens: 16384, max_output_tokens: 50000, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
-          // 没这个键 = 存量模型（后端读侧会回退到 max_tokens，前端拿到的已经是回退后的值）
+          // 没配过 ⇒ 后端读侧的四级回退也算不出（连 context_window 都没有）⇒ 拿到的是 null
           { id: 'm2', provider_id: 'p1', model_id: 'gpt-4o-mini', model_name: 'gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: false, context_window: null, max_tokens: null, max_output_tokens: null, enabled: true, litellm_params: { model: 'openai/gpt-4o-mini' } },
         ],
       },
@@ -544,13 +544,13 @@ describe('AdminView · LLM 管理', () => {
 
   it('#309 列表渲染输出预算上限（没配则占位符），新增表单带提示且照发越界值', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
-      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_BUDGET);
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_MAX_OUTPUT);
       if (url === '/api/admin/llm/providers/p1/models' && init?.method === 'POST') return jsonResponse(201, {});
       return undefined;
     });
     const rows = wrapper.findAll('[data-test="model-row"]');
-    expect(rows[0].get('[data-test="model-max-output-budget"]').text()).toBe('50000');
-    expect(rows[1].get('[data-test="model-max-output-budget"]').text()).toBe('—');
+    expect(rows[0].get('[data-test="model-max-output-tokens"]').text()).toBe('50000');
+    expect(rows[1].get('[data-test="model-max-output-tokens"]').text()).toBe('—');
 
     await wrapper.get('[data-test="open-add-model"]').trigger('click');
     const addForm = wrapper.get('[data-test="add-model-form"]');
@@ -559,11 +559,11 @@ describe('AdminView · LLM 管理', () => {
     await addForm.findAll('input')[0].setValue('gpt-4o-big');
     await addForm.get('[data-test="add-model-upstream-id"]').setValue('openai/gpt-4o-big');
     await addForm.findAll('input')[2].setValue('Big');
-    const budget = addForm.get('[data-test="add-model-max-output-tokens"]');
-    expect(budget.attributes('type')).toBe('number');
-    expect(budget.attributes('min')).toBe('1');
+    const maxOutputTokensField = addForm.get('[data-test="add-model-max-output-tokens"]');
+    expect(maxOutputTokensField.attributes('type')).toBe('number');
+    expect(maxOutputTokensField.attributes('min')).toBe('1');
     // 故意发一个越界值：前端不卡，照发 ⇒ 由服务端拒（唯一判据）。
-    await budget.setValue('60000');
+    await maxOutputTokensField.setValue('60000');
     await addForm.trigger('submit.prevent');
     await flushPromises();
     const post = JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0]?.[1]?.body));
@@ -574,7 +574,7 @@ describe('AdminView · LLM 管理', () => {
 
   it('#309 编辑表单回填现值（含 ?? 回退）：PATCH 带 model_info 全量字段，服务端超限文案原样显示在页面上', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
-      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_BUDGET);
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_MAX_OUTPUT);
       if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') {
         return jsonResponse(400, { error: { code: 'validation_failed', message: CAP_MESSAGE } });
       }
@@ -582,11 +582,11 @@ describe('AdminView · LLM 管理', () => {
     });
     await wrapper.findAll('[data-test="model-row"]')[0].get('[data-test="edit-model"]').trigger('click');
     const editForm = wrapper.get('[data-test="edit-model-form"]');
-    const budget = editForm.get('[data-test="edit-model-max-output-tokens"]');
-    // 回填的是后端给的值（已含 max_tokens 回退链）。
-    expect((budget.element as HTMLInputElement).value).toBe('50000');
+    const maxOutputTokensField = editForm.get('[data-test="edit-model-max-output-tokens"]');
+    // 回填的是后端给的值（已含回退链，切片 1.5 之后还可能是在门户里算出来的）。
+    expect((maxOutputTokensField.element as HTMLInputElement).value).toBe('50000');
     expect(editForm.text()).toContain('1/4');
-    await budget.setValue('60000');
+    await maxOutputTokensField.setValue('60000');
     await editForm.trigger('submit.prevent');
     await flushPromises();
 
@@ -599,6 +599,31 @@ describe('AdminView · LLM 管理', () => {
     // 取整页文本而不是第一个 [role=alert]：页面与弹层各有一个 alert，错一个就假红。
     expect(wrapper.text()).toContain(CAP_MESSAGE);
     expect(wrapper.get('[role="alert"]').text()).toContain('1/4');
+    wrapper.unmount();
+  });
+
+  it('#309 切片1.5 列表渲染的是后端算好的**生效值**，且前端绝不自己除一个 1/4', async () => {
+    // m-eff：存量模型从未手填过预算 ⇒ 后端读侧回退成 floor(262144/4)=65536，DTO 里已经是这个数
+    //         ⇒ 列表直接显示它（而不是「—」），管理员看到的就是心跳真正下发的值。
+    // m-no-math：故意给一个「有窗口但那一列是 null」的形状 ⇒ 前端**不许**自己算出 65536，
+    //         照原样显示占位符：前端算一遍就是第二套真相源，会与门户读侧/心跳下行漂移。
+    const providers = {
+      items: [{
+        id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
+        models: [
+          { id: 'm-eff', provider_id: 'p1', model_id: 'ctx-big', model_name: 'ctx-big', name: 'CTX Big', type: 'text', tool_calling: true, context_window: 262144, max_tokens: null, max_output_tokens: 65536, enabled: true, litellm_params: { model: 'openai/ctx-big' } },
+          { id: 'm-no', provider_id: 'p1', model_id: 'ctx-raw', model_name: 'ctx-raw', name: 'CTX Raw', type: 'text', tool_calling: true, context_window: 262144, max_tokens: null, max_output_tokens: null, enabled: true, litellm_params: { model: 'openai/ctx-raw' } },
+        ],
+      }],
+    };
+    const { wrapper } = await mountAdmin('/admin/llm', (url) => (
+      url === '/api/admin/llm/providers' ? jsonResponse(200, providers) : undefined
+    ));
+    const rows = wrapper.findAll('[data-test="model-row"]');
+    // 后端回退出来的生效值照原样显示（列表与心跳下行同一个数）
+    expect(rows[0].get('[data-test="model-max-output-tokens"]').text()).toBe('65536');
+    // 前端不自己算 1/4：DTO 里是 null 就显示占位符，不拿 context_window 现场除一个
+    expect(rows[1].get('[data-test="model-max-output-tokens"]').text()).toBe('—');
     wrapper.unmount();
   });
 

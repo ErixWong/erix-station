@@ -325,8 +325,8 @@ onMounted(() => {
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colType') }}</th>
                   <th class="py-1 pr-3 font-medium">tool_calling</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
-                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colMaxOutput') }}</th>
-                  <th class="py-1 pr-3 font-medium" :title="t('admin.llm.maxOutputBudgetHint')">{{ t('admin.llm.colMaxOutputBudget') }}</th>
+                  <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colMaxTokens') }}</th>
+                  <th class="py-1 pr-3 font-medium" :title="t('admin.llm.maxOutputTokensHint')">{{ t('admin.llm.colMaxOutputTokens') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colPricing') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
                   <th class="py-1 font-medium"></th>
@@ -354,7 +354,9 @@ onMounted(() => {
                   <td class="py-1 pr-3">{{ m.tool_calling ? '✓' : '—' }}</td>
                   <td class="py-1 pr-3">{{ m.context_window ?? '—' }}</td>
                   <td class="py-1 pr-3">{{ m.max_tokens ?? '—' }}</td>
-                  <td class="py-1 pr-3" data-test="model-max-output-budget">{{ m.max_output_tokens ?? '—' }}</td>
+                  <!-- #309 切片 1.5：这一列显示的是后端给的**生效值**（没手填过时它是 floor(context_window/4)）
+                       —— 前端不参与算，也就永远不会出现「列表与心跳下行各执一词」。 -->
+                  <td class="py-1 pr-3" data-test="model-max-output-tokens">{{ m.max_output_tokens ?? '—' }}</td>
                   <td class="py-1 pr-3">
                     <span
                       v-if="!m.pricing_configured"
@@ -510,14 +512,14 @@ onMounted(() => {
         <input v-model="modelForm.context_window" type="number" min="1" placeholder="128000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.llm.colMaxOutput') }}
+        {{ t('admin.llm.colMaxTokens') }}
         <input v-model="modelForm.max_tokens" data-test="add-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
       <!-- #309 切片 1：只加提示，**不在前端卡数字**（上限由服务端单一判定，失败文案直接透传）。 -->
       <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.llm.colMaxOutputBudget') }}
+        {{ t('admin.llm.colMaxOutputTokens') }}
         <input v-model="modelForm.max_output_tokens" data-test="add-model-max-output-tokens" type="number" min="1" placeholder="32000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.maxOutputBudgetHint') }}</span>
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.maxOutputTokensHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.inputCostLabel') }}
@@ -599,15 +601,15 @@ onMounted(() => {
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editContextWindowHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.llm.colMaxOutput') }}
+        {{ t('admin.llm.colMaxTokens') }}
         <input v-model="modelEditForm.max_tokens" data-test="edit-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputHint') }}</span>
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxTokensHint') }}</span>
       </label>
       <!-- #309 切片 1：同上——提示可以写，本地校验不要写（否则就是第二套会过期的规则）。 -->
       <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.llm.colMaxOutputBudget') }}
+        {{ t('admin.llm.colMaxOutputTokens') }}
         <input v-model="modelEditForm.max_output_tokens" data-test="edit-model-max-output-tokens" type="number" min="1" placeholder="32000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputBudgetHint') }}</span>
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputTokensHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.inputCostLabel') }}
