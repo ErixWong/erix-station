@@ -25,7 +25,7 @@ import {
 import { createToolRegistry } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
 import { parseMaxRounds } from './lib/config.js';
-import { resolveRunModel } from './lib/llm-models.js';
+import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
@@ -306,6 +306,30 @@ async function startRun(msg) {
   // 旧 agentd / 无配置（msg 无 models）→ 占位 config 的 model 名（现状行为）。endpoint/key 始终走占位文件。
   // models 只经 IPC 内存传递，**不写任何文件/日志**。
   const modelName = resolveRunModel(defaultCfg.model, msg.models);
+  // issue #309 切片 2：把下行元数据（context_window / max_output_tokens）喂给引擎，并**显式**发输出上限。
+  // 为什么值得接：缺这两个数时引擎的压缩总开关不进入（budgetTokens 未定义→overBudget 恒 false）、
+  // 单轮聚合输出预算整体关闭、输出截断上限退回 4096，而此前全链路零告警（真机 92 轮 run compaction=0）。
+  // ⚠ 判据与钳制**全在 lib/llm-models.js 的纯函数 resolveModelMetadata 里**（那里能单测），本处只做
+  // 装配 + 告警，**不要再算一遍**。必须钳的硬红线：引擎启动期算预算无 try/catch
+  // （erix-agent 0.20.0 src/loop/orchestrator.js:1141-1148），越界值抛 KitError invalid_budget ⇒
+  // **每个 run 第 1 轮之前就死**（不是「这一轮不好」，也不是「不压缩」）。
+  const engineModelMetadata = resolveModelMetadata(msg.models);
+  if (engineModelMetadata?.clamped) {
+    // 填错元数据的模型行照跑，但必须留痕：走现成 IPC LOG（**不新增事件类型**，否则污染用户可见事件流）。
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `model metadata clamped: max_output_tokens ${String(engineModelMetadata.clamped_from)}`
+        + ` → ${engineModelMetadata.max_output_tokens}`
+        + ` (limit = floor(context_window/4), context_window=${engineModelMetadata.context_window})`,
+    });
+  } else if (!engineModelMetadata && msg.models?.main) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `model metadata unusable: context_window=${String(msg.models.main.context_window)}`
+        + ' (not a positive integer) → engine metadata and the explicit output cap are not sent;'
+        + ' engine compaction stays off (= 现状)',
+    });
+  }
   // issue #261：显式传相超时（四项默认与 env 覆盖见 lib/llm-timeouts.js）。真正要的效果不是数值本身，
   // 而是「传了显式相 ⇒ 引擎 hasExplicitPhase=true ⇒ legacyTimeoutMs=undefined」，关掉那条从请求发起
   // 就定死的 120s 绝对死线（重型轮子必撞）。回归门：runner/test/llm-timeouts.test.js ②。
@@ -427,6 +451,26 @@ async function startRun(msg) {
   try {
     const result = await runToolLoop({
       provider,
+      // issue #309 切片 2：模型元数据 + 显式 max_tokens（值已在 resolveModelMetadata 里钳过）。
+      // 命名纪律（决策者定稿）：camelCase 三键（contextWindowTokens / maxOutputTokens / maxTokens）
+      // **全站只允许出现在下面这一对 #309 标记之间**（唯一映射点）；防漂移锁：
+      // runner/test/model-metadata.test.js（从 worker.js 源码正则数次数，不 import worker）。
+      // 已知副作用（都核过行号，**不要顺手修**）：
+      //   - wrap-up 归一化 judge 的请求**继承**宿主 maxTokens（orchestrator.js:3115
+      //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
+      //     「provider 默认」变成我们那个数（**变严**，不是变松）；
+      //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
+      //   - fold-llm 压缩 summarizer 也继承 maxTokens（:1175）——本站没显式选 context.strategy，
+      //     超预算时引擎用 createSlidingWindowStrategy() 兜底（:2503），本单**不**顺手选策略。
+      /* #309:engine-model-params:start */
+      ...(engineModelMetadata ? {
+        modelMetadata: {
+          contextWindowTokens: engineModelMetadata.context_window,
+          maxOutputTokens: engineModelMetadata.max_output_tokens,
+        },
+        maxTokens: engineModelMetadata.max_output_tokens,
+      } : {}),
+      /* #309:engine-model-params:end */
       // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
       system: SYSTEM_PROMPT,
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
