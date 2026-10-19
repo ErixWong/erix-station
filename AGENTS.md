@@ -771,6 +771,45 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 
 
 
+### 8.31 模型元数据打通：压缩开关不再是隐含的（issue #309，切片 0/1/1.5/2+2b，2026-10-19，随 **v0.1.16** 发布）
+
+**缺陷本体（全部实跑复现，不是推论）**：erix-agent 0.20.0 的压缩开关是**隐含**的 —— `runToolLoop` 必须**同时**拿到 `modelMetadata.contextWindowTokens` 与 `maxOutputTokens` 才推得出 `budgetTokens`；缺任一 ⇒ `overBudget` 恒 false ⇒ **压缩与单轮聚合输出预算一起关闭** ⇒ 长会话无压缩涨到 `ContextWindowExceededError`，run `failed`。而且是**静默**的：`model_metadata_missing` 那个一次性告警被 `budgetsKnown` 短路（`orchestrator.js:1272`），元数据全缺时反而不发（事故标本：92 轮 `compaction=0`、零告警）。本站两个断点：`runner/worker.js` 全文 `modelMetadata` / `contextWindowTokens` / `maxOutputTokens` **各 0 命中**；`runner/lib/llm-models.js` 的 `parseHeartbeatModels()` 只拷 `{model,type}` ⇒ 心跳新字段在这一层被**静默丢掉**。
+
+**引擎算术（已写死在多处，别再推）**：`budget = ctx − maxOut − max(2000, ⌈10%·ctx⌉)`（`src/compact/budget.js:23-25`，调用点 `orchestrator.js:1141-1148` **无 try/catch**）⇒ `budget ≤ 0` 抛 `KitError invalid_budget`（`retryable:false`，实测文案 `Computed context budget must be positive (got -71)`）⇒ **每个 run 第 1 轮之前就死**。所以「填个更大的输出上限」不是旋钮，是能把自己锁死的闸。
+
+**四个切片**（决策者定稿：1/4 上限 + 上游真值为源 + 非法值按 1/4 兜底 + **显式发 `max_tokens`** + **命名不许发散**）
+
+- **切片 0（数据，零代码）**：dev 6 条 deployment 的 `model_info.max_output_tokens` 与 `litellm_params.max_tokens` 都设 32768（各自 1/4 内）。**另一台服务器仍欠这一步**（那台 `litellm_params.max_tokens=131072` 是事故链另一半：`170393+131072 > 262144`）。
+- **切片 1（PR #311）**：门户 `max_output_tokens` 字段 + 硬上限 `≤ floor(context_window/4)` + `model_info`/`litellm_params.max_tokens` **绑死双写** + 心跳 `models.main` 两键（非 null 才带）。
+- **切片 1.5（PR #312）**：读侧**四级回退** `model_info.max_output_tokens ?? litellm_params.max_tokens ?? floor(正数 ctx/4) ?? null` ⇒ **缺元数据不再等于关压缩**（唯一还关着的是「连 `context_window` 都没配」，那时上游一次性告警就是它的告警）。**1/4 既是手填上限也是回退值** ⇒ 平台永远不会造出被自己校验拒的数（有专测）。决策者**否决**「区分配置值 vs 平台假定值」的字段拆分（原话：有个数字就行）⇒ 没有 `effective_`/`source`。命名统一到 `max_output_tokens`（前端拆掉 `Budget` 拼写，legacy 字段回 `colMaxTokens`），`portal.md` §4.9 加**一个数跨六层的别名对照表**。
+- **切片 2+2b（PR #313）**：`parseHeartbeatModels` 收两键（**只收正整数**，非法形态**整键不写**而非置 `undefined` ⇒ 无元数据时与改前**逐字节相同**）+ 纯函数 `resolveModelMetadata(models, {computeBudget})` 做钳制（判据必须能在纯函数层单测）+ worker **唯一一处**映射（`#309:engine-model-params` 标记包住）成 `modelMetadata.{contextWindowTokens,maxOutputTokens}` 与**显式 `maxTokens`（同一个数）**。
+
+**为什么必须显式发 `max_tokens`**：引擎只保证 `prompt ≤ budget`，安全条件是**实际输出上限 ≤ 假定值**。ctx=262144 / 假定 65536 ⇒ budget 170393；显式 65536 ⇒ 235929 正好卡住窗口；留给网关注入（事故那台 131072）⇒ 301465 **照样撞窗**。
+
+**1/4 钳制保不住的那一支（我审出来、2b 才堵）**：引擎真正的死判据是上面那条公式，**小窗口钳完仍然非正**（`ctx=1001→250→−1249`、`2000→500→−500`、`2666→666→0`，`2667` 才活）⇒ 管理员把 `context_window` 误填成 `2048` 这类笔误会让你整个 FDE **每次 run 启动即死**。堵法**不复制上游公式**：调**包根导出的** `computeBudget({contextWindowTokens, maxOutputTokens})`（⚠ **入参是一个对象**，不是两个位置参数），**抛 ⇒ 整对不传**（压缩关掉、run 照活），且**优先于「钳了」的结论**；`runner/lib/llm-models.js` 里禁止出现 `2000`/`0.1`（源码级用例钉「公式零复制」），worker **必须**注入第二入参（另一条源码级用例）。口径：**配错元数据最多让压缩关掉，绝不能把 run 弄死**。
+
+**测试口径**（合并树 `3f2ca25` 上亲手复跑，判绿=退出码）：根 **1251 / 1247 通过 / 0 失败 / 4 跳过**、`node --test runner/test/*.test.js` **314/314**、前端 `typecheck` 干净 + **33 文件 / 572 通过**（台账三处 1216→1251 / 286→314 / 571→572 已同步）。**变异：worker 7 条 + 主 agent 亲跑 8 条**，无一空转；行为级判据是**桩 provider 收到的请求体里 `max_tokens` 等于生效值**（「显式发」唯一可判证据）+ `model_metadata_missing` 出现/不出现判压缩开关。
+
+**发版与部署（v0.1.16）**：main `556e64d`（main CI 含**三镜像构建校验**全绿后才打 tag）→ release run `39225514910` → 三镜像 `docker pull` 后 `image inspect` 与清单**逐个一致**（portal `eb89d5c6…` / fde `179c3ece…` / proxy `59fc9755…`）→ `deploy/.env` 形态① pin **三项**（本版动 `runner/` ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0116`）→ `up -d --no-build` → **`docker rm -f` 全部 7 台 `fde-*` 后 reconcile 全部落在 `179c3ece…`**（§8.17：不重建就还是旧引擎）。
+
+**真机验收（v0.1.16，dev，主 agent 亲手；会话 `16261d57…` / 项目 `~/projects/probe-309`）** —— 探针手法：把 eric 绑定模型 `deepseek-flash` 的 `context_window` **带外**改成 16000（输出上限仍 32768 ⇒ 必触发钳制，且预算只剩 10000 ⇒ 几条消息就能压）：
+
+- **P1 钳制**：runner 告警逐字 `model metadata clamped: max_output_tokens 32768 → 4000 (limit = floor(context_window/4), context_window=16000)`，且该 run 事件里**没有** `model_metadata_missing`。
+- **P2 压缩真开火**：`compaction` 事件 1 条 + transcript **1 条 `folded` 行**，载荷 `round:7 / slidingWindow triggered:2 / tokensSaved:10520 / tokensBefore:10537 → tokensAfter:17 / foldedRounds:8`（预算算出来正是 10000）。**修复前结构上不可能出现**（标本 92 轮 `compaction=0`）。
+- **P3 小窗口闸（2b）**：ctx 改 2000 ⇒ run `86c41ce5` **`finished`/`judge_done`**（不是 `invalid_budget`）+ `model_metadata_missing` 恰 1 条 + 告警点名两种成因 `… computed context budget is not positive (engine computeBudget rejected this pair, even at the 1/4 cap) → … not sent; engine compaction stays off (= 现状)`。
+- **P4 复原** ctx=512000 ⇒ 零钳制告警、零 missing。
+- **P5 切片 1.5 显示面**：新建一条 LiteLLM **不认识**的上游（`openai/probe309-unknown-xyz`，ctx=262144，不带任何输出字段）⇒ 网关侧 `model_info.max_output_tokens = null` 且 `litellm_params` 无 `max_tokens` 键，**门户列表显示 65536**（第三级回退在真门户上生效）。探针已删，目录回到 6 条且 ctx/两个上限**全部基线**。
+- **用户可见变化**：元数据到位后 `outputHygieneLimit` 从恒定 **4096** 变成 `clamp(⌈15%·ctx⌉, 8192, 100000)`（dev 窗口下 8192 / 39321 / 76800），单轮聚合输出预算同时打开。
+
+**三条实测换来的新事实（都已登记，别按旧口径推）**
+
+1. **LiteLLM 会给「它认识的 upstream」自动注入 `model_info.max_output_tokens`**（用 `openai/k3` 新建、一个输出字段都没传，网关自己填了 `32768` 外加整套定价/能力元数据）⇒ 「目录里都是 `null`」只在**自定义 relay 名**上成立，#309 的成因描述要按这个收窄。
+2. **`PATCH … : null` 在真 LiteLLM v1.103.2 上是 no-op**（手工与门户两条路各实测一次：200 但值一字未动）⇒ 门户文档那句「传 `null` 两处一起清」在真网关上**做不到**（单测钉的是**发给网关的请求形状**，fake 会清）⇒ 已登记 issue，改配路径要么用 LiteLLM 的正确清空语义，要么改成「设值不可清空」的口径。
+3. **探针方法坑（两次假故障都是它）**：undici `fetch` **忽略** `Host` 头覆盖（forbidden header）⇒ 容器里打 `127.0.0.1:8090` + `Host: station.fde.erix.vip` 会被边缘判成无路由 ⇒ **404 假故障**（`curl -H "Host: …"` 带不带 `:8090` 都正常）；另 #234 同源门要求 `Origin` 与请求 Host **逐字同源（含端口）**，`Host` 不带端口 + `Origin` 带 `:8090` 会 `403 cross_origin_forbidden`。
+
+**已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
+
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
