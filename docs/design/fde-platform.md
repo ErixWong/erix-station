@@ -663,7 +663,8 @@ hostname := <fde> "-p-" <portLabel> "." <BASE_DOMAIN>   -- #57：<BASE_DOMAIN> �
 - 自定义模型必须**显式**声明单价，写在 **`litellm_params.input_cost_per_token` / `litellm_params.output_cost_per_token`**。
 - ⚠️ **不要写在 `model_info`**：v1.103.2 在 `/model/new` 与 `/model/{id}/update` 上用 `without_server_derived_pricing()` 剥离 `model_info` 里的定价字段（`model_info` 是服务端派生/展示数据）；真正生效的是 `litellm_params`，`Deployment.__init__` 再把它镜像进 `model_info`。`GET /model/info` 的 `model_info.pricing_overrides` 列出该 deployment 显式覆盖的定价字段，可用来区分「显式定价」与「价目表自动命中」。
 - 清空定价：`PATCH /model/{id}/update` 的 `litellm_params` 带显式 `null`（`NULL_CLEARABLE_LITELLM_PARAMS` 会把该字段从 `litellm_params` 与 `model_info` 两处移除）；字段缺省则保持原值。
-- **`max_output_tokens` 与 `litellm_params.max_tokens` 绑死同值（#309 切片 1）**：门户把「单次响应输出预算上限」写在 `model_info.max_output_tokens`（`model_info` 自带的真字段），并同值写 `litellm_params.max_tokens`（真正生效的那一侧）；清空走同一对（`model_info` 显式 `null` + `litellm_params` 不带键）。读侧 `model_info.max_output_tokens ?? litellm_params.max_tokens ?? null`。写之前必过 **`≤ floor(context_window / 4)`** 硬上限（引擎侧把 `max_tokens` 当预算用，越界的值会让每个 run 启动即死；契约与理由见 [`../api/portal.md`](../api/portal.md) §4.9）。本切片只改门户写/读/心跳下行，**不动 runner**。
+- **`max_output_tokens` 与 `litellm_params.max_tokens` 绑死同值（#309 切片 1）**：门户把「单次响应输出预算上限」写在 `model_info.max_output_tokens`（`model_info` 自带的真字段），并同值写 `litellm_params.max_tokens`（真正生效的那一侧）；清空走同一对（`model_info` 显式 `null` + `litellm_params` 不带键）。写之前必过 **`≤ floor(context_window / 4)`** 硬上限（引擎侧把 `max_tokens` 当预算用，越界的值会让每个 run 启动即死；契约与理由见 [`../api/portal.md`](../api/portal.md) §4.9）。
+  - **读侧是生效值的四级回退（#309 切片 1.5）**：`model_info.max_output_tokens ?? litellm_params.max_tokens ?? floor(正数 context_window / 4) ?? null` —— 都没配就按窗口的 1/4 假定（窗口不可得才算不出），于是**缺元数据不再等于关压缩**：门户总会算出一个生效值并随心跳下行，引擎的压缩开关默认是开的。而这个回退值**恰好等于手填上限**（同为 `floor(ctx/4)`）⇒ 平台自己造不出被自己校验拒的值。不区分「配置值 vs 假定值」（决策者定稿），门户 DTO / 表单 / 心跳下行就一列 `max_output_tokens`；各层名字对照见 portal.md §4.9。本切片只改门户写/读/心跳下行，**不动 runner**。
 
 **未知定价必须显式（不静默为 0）**
 
