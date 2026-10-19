@@ -974,8 +974,11 @@ test('#309 双写：新建传了 ⇒ 两处同值；PATCH 改 ⇒ 两处一起�
   assert.equal(clearBody.model_info.max_output_tokens, null, '显式 null 才是清空语义（缺省是「不动」）');
   assert.equal(Object.hasOwn(clearBody.litellm_params, 'max_tokens'), false, '数据面一侧直接不带该键');
   const cleared = (await listModels(created)).items[0];
-  assert.equal(cleared.max_output_tokens, null);
-  assert.equal(cleared.max_tokens, null, '两处真的都消失了，而不是只清了权威位');
+  // ⚠ 切片 1.5 行为变化（有意）：清空后读侧不再是 null 而是回退值 floor(128000/4)=32000。
+  // 这条断言同时**反证两处真的都清了**：只要 model_info.max_output_tokens 或 litellm_params.max_tokens
+  // 还剩一个（旧值 24576），`??` 链就会让它赢，这里就不可能是 32000。
+  assert.equal(cleared.max_output_tokens, 32000, '两处清空 ⇒ 读侧退到 floor(ctx/4)（而不是退到旧值）');
+  assert.equal(cleared.max_tokens, null, '两处真的都消失了，而不是只清了权威位（legacy 读侧一字未改）');
 });
 
 test('#309 双写优先级：同一次请求同时传 legacy max_tokens 与 max_output_tokens ⇒ 以绑定字段为准', async () => {
@@ -1008,6 +1011,131 @@ test('#309 回退与 legacy：model_info 优先、没有则退 litellm_params.ma
   assert.equal(byId['m-auth'].max_tokens, 1000);
   assert.equal(byId['m-legacy'].max_tokens, 4096);
   assert.equal(byId['m-none'].max_tokens, null);
+});
+
+// --- issue #309 切片 1.5：读侧回退值 = `floor(context_window / 4)` ------------------------------
+// 定稿的四级链（决策者 2026-10-19）：
+//   生效值 = model_info.max_output_tokens          -- 上游配了什么就是什么
+//        ?? litellm_params.max_tokens            -- 同上（今天真正被网关注进请求体的那个）
+//        ?? floor(正数 context_window / 4)         -- 都没配 ⇒ 按窗口 1/4 假定
+//        ?? null                                  -- 连 context_window 都没有 ⇒ 真的没有
+// 意义：**缺元数据不再等于关压缩**（引擎要 ctx 与 maxOutputTokens 同时存在才推得出 budgetTokens）。
+// 决策者否决了「区分配置值 vs 假定值」的字段拆分 ⇒ 断言只能看到一列 `max_output_tokens`。
+
+/** 一批只给窗口、不给预算的存量形状。 */
+function onlyWindowPool(contextWindows) {
+  return new LlmFakePool({
+    models: contextWindows.map(({ id, context_window }) => ({
+      id, provider_id: 'p1', model_id: `m-${id}`, type: 'text', context_window,
+    })),
+  });
+}
+
+async function itemsById(pool) {
+  return Object.fromEntries((await listModels(pool)).items.map((m) => [m.id, m]));
+}
+
+test('#309 切片1.5 回退四级链逐支钉：只 model_info / 只 max_tokens / 都没有但 ctx 有 / 连 ctx 也没有', async () => {
+  const pool = new LlmFakePool({
+    models: [
+      // 第 1 级：model_info 配了（哪怕同时也有 legacy max_tokens）—— 上游配了什么就是什么
+      { id: 'l1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 200000, max_output_tokens: 3000, max_tokens: 1000 },
+      // 第 2 级：只有 litellm_params.max_tokens（写入侧上线前配好的存量模型）
+      { id: 'l2', provider_id: 'p1', model_id: 'b', type: 'text', context_window: 200000, max_tokens: 4096 },
+      // 第 3 级：都没配、但 ctx 可得 ⇒ 按 1/4 假定（200000/4 = 50000）
+      { id: 'l3', provider_id: 'p1', model_id: 'c', type: 'text', context_window: 200000 },
+      // 第 4 级：连 ctx 都没有 ⇒ 真的是 null（不是 0、不是 NaN）
+      { id: 'l4', provider_id: 'p1', model_id: 'd', type: 'text' },
+    ],
+  });
+  const byId = await itemsById(pool);
+  assert.equal(byId.l1.max_output_tokens, 3000, '第 1 级：model_info.max_output_tokens 是权威位，配了就不算');
+  assert.equal(byId.l2.max_output_tokens, 4096, '第 2 级：回退到 litellm_params.max_tokens（网关今天真用的那个）');
+  assert.equal(byId.l3.max_output_tokens, 50000, '第 3 级：都没配 ⇒ floor(ctx/4)，而不是 null');
+  assert.equal(byId.l4.max_output_tokens, null, '第 4 级：连 ctx 都没配才是真的没有');
+  // 形状约束：没有新增「它是怎么来的」这类字段（决策者明确否决），也只有这一个拼写。
+  assert.equal(Object.hasOwn(byId.l3, 'effective_max_output_tokens'), false, '不加 effective_ 前缀的旁证字段');
+  assert.equal(Object.hasOwn(byId.l3, 'max_output_tokens_source'), false, '不加来源字段：就一列数字');
+});
+
+test('#309 切片1.5 回退值是 floor(ctx/4)：边界与取整口径钉死（262144/512000/非 4 的倍数/数字串）', async () => {
+  const cases = [
+    { ctx: 262144, expected: 65536 },
+    { ctx: 512000, expected: 128000 },
+    { ctx: 99999, expected: 24999 },  // 不是 4 的倍数 ⇒ floor，不是四舍五入（25000 就红）
+    { ctx: 999, expected: 249 },
+    { ctx: 7, expected: 1 },           // 商不是整数时也至少留个正整数（7/4=1.75 ⇒ 1），不会下发 0
+    { ctx: '128000', expected: 32000 }, // 历史上存成数字串的窗口：与手填校验同一口径，照样能算
+  ];
+  const pool = onlyWindowPool(cases.map((c, i) => ({ id: `c${i}`, context_window: c.ctx })));
+  const byId = await itemsById(pool);
+  cases.forEach((c, i) => {
+    assert.equal(byId[`c${i}`].max_output_tokens, c.expected,
+      `ctx=${String(c.ctx)} ⇒ 回退值必须是 floor(ctx/4)=${c.expected}`);
+    assert.ok(Number.isInteger(byId[`c${i}`].max_output_tokens) && byId[`c${i}`].max_output_tokens >= 1,
+      `ctx=${String(c.ctx)}：下发的是正整数，不是小数/0/NaN`);
+  });
+});
+
+test('#309 切片1.5 窗口不可得 ⇒ 不算回退（0 / 负数 / 非数字串 / 空串 / NaN ⇒ null，绝不是 0 或 NaN）', async () => {
+  const unusable = [0, -8000, 'abc', '', Number.NaN, -0.5];
+  const pool = onlyWindowPool(unusable.map((ctx, i) => ({ id: `u${i}`, context_window: ctx })));
+  // 对照组：没这个键与显式 null 同样算不可得
+  const baseline = new LlmFakePool({ models: [
+    { id: 'missing', provider_id: 'p1', model_id: 'missing', type: 'text' },
+    { id: 'explicit-null', provider_id: 'p1', model_id: 'explicit-null', type: 'text', context_window: null },
+  ] });
+  const byId = { ...await itemsById(pool), ...await itemsById(baseline) };
+  [...unusable.map((_, i) => `u${i}`), 'missing', 'explicit-null'].forEach((id) => {
+    const value = byId[id].max_output_tokens;
+    assert.equal(value, null, `${id}：窗口不可得 ⇒ 生效值 null（不硬算出 0/NaN 下发）`);
+    assert.ok(!Number.isNaN(value), `${id}：不得把 NaN 下发给 runner`);
+  });
+  // 窗口本身照原样显示（读侧口径没改），只有预算算不出来
+  assert.equal(byId.u0.context_window, 0, 'context_window=0 照原样显示，不被回退逻辑改写');
+});
+
+test('#309 切片1.5 一致性：回退算出的值再提交也合法（1/4 既是上限也是回退，平台不自打）', async () => {
+  for (const context_window of [262144, 512000, 99999, 8000]) {
+    const pool = onlyWindowPool([{ id: 'x1', context_window }]);
+    const fallback = (await itemsById(pool)).x1.max_output_tokens;
+    assert.equal(fallback, Math.floor(context_window / 4));
+
+    // 把回退值当手填值提交回去：必须放行，且两处同值落库
+    await updateModel(pool, 'x1', { max_output_tokens: fallback });
+    const body = pool.gatewayCalls.find((entry) => entry.method === 'updateModel').body;
+    assert.equal(body.model_info.max_output_tokens, fallback, `ctx=${context_window}：回退值自己必须过得了自己的校验`);
+    assert.equal(body.litellm_params.max_tokens, fallback);
+
+    // 上限仍然只高一就不放：回退**没有**把校验抹掉
+    const over = new LlmFakePool({ models: [{ id: 'x1', provider_id: 'p1', model_id: 'x', type: 'text', context_window }] });
+    await assert.rejects(() => updateModel(over, 'x1', { max_output_tokens: fallback + 1 }),
+      (error) => {
+        assert.equal(error.code, 'validation_failed');
+        assert.deepEqual(error.details, { field: 'max_output_tokens', max_allowed: fallback, context_window });
+        return true;
+      }, `ctx=${context_window}：上限仍是 floor(ctx/4)=${fallback}`);
+  }
+});
+
+test('#309 切片1.5 回退不动 legacy 语义：max_tokens 的读侧与写入体一个字节都没改', async () => {
+  const pool = new LlmFakePool({ models: [
+    { id: 'k1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 128000, max_tokens: 1024 },
+    { id: 'k2', provider_id: 'p1', model_id: 'b', type: 'text', max_tokens: 512 },
+  ] });
+  const byId = await itemsById(pool);
+  assert.equal(byId.k1.max_tokens, 1024, 'legacy 读侧只看 litellm_params.max_tokens，不会被回退污染');
+  assert.equal(byId.k2.max_tokens, 512, '没窗口的模型 legacy 值照旧可读（只有 max_output_tokens 变）');
+  assert.equal(byId.k2.max_output_tokens, 512);
+
+  await updateModel(pool, 'k1', { max_tokens: 2048 });
+  const body = pool.gatewayCalls.find((entry) => entry.method === 'updateModel').body;
+  assert.equal(body.litellm_params.max_tokens, 2048);
+  assert.equal(body.model_info, undefined,
+    '只改 legacy max_tokens 不得捎带写权威位（没传 max_output_tokens 就是不动，连 model_info 块都不带）');
+  const after = (await itemsById(pool)).k1;
+  assert.equal(after.max_tokens, 2048, 'legacy 字段照旧只读自己那一位');
+  assert.equal(after.max_output_tokens, 2048, '生效值退到刚写的 max_tokens（第 2 级），而不是退到 ctx/4');
 });
 
 // --- issue #164：自定义模型定价（虚拟 key spend 恒 0） -------------------------------
