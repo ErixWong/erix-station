@@ -24,6 +24,13 @@ export interface LlmModel {
   tool_calling: boolean;
   context_window: number | null;
   max_tokens: number | null;
+  /**
+   * issue #309 切片 1：单次响应**输出预算上限**（引擎侧把 `max_tokens` 当预算用）。
+   * 权威位在 `model_info.max_output_tokens`，后端写侧与 `litellm_params.max_tokens` 绑死同值；
+   * 读侧没有该值时回退到 `max_tokens`（所以存量模型不会显示成「没配」）。
+   * 硬上限由服务端单一判定：**≤ floor(context_window / 4)**——前端不做本地数字校验。
+   */
+  max_output_tokens: number | null;
   enabled: boolean;
   // issue #164：每 token 单价（USD），由后端从 LiteLLM 读回。pricing_configured 为 false 时
   // 该模型用量金额会记 0，UI 必须显式提示而不是静默。pricing_source='cost_map' 表示价格来自
@@ -446,7 +453,7 @@ export const useAdminStore = defineStore('admin', {
     /** 旧供应商下新增模型表单：POST /api/admin/llm/providers/<id>/models。 */
     async addModel(
       providerId: string,
-      fields: { model_id: string; model: string; name: string; type: string; tool_calling: boolean; context_window: number | null; max_tokens: number | null; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
+      fields: { model_id: string; model: string; name: string; type: string; tool_calling: boolean; context_window: number | null; max_tokens: number | null; max_output_tokens?: number | null; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
     ): Promise<string | null> {
       this.llmErr = null;
       try {
@@ -467,7 +474,7 @@ export const useAdminStore = defineStore('admin', {
     /** 编辑模型可变字段：PATCH /api/admin/llm/models/<id>。 */
     async updateModel(
       m: LlmModel,
-      fields: { name: string; call_name?: string; type?: string; tool_calling: boolean; context_window?: number; max_tokens?: number | null; model?: string; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
+      fields: { name: string; call_name?: string; type?: string; tool_calling: boolean; context_window?: number; max_tokens?: number | null; max_output_tokens?: number | null; model?: string; input_cost_per_token?: number | null; output_cost_per_token?: number | null },
     ): Promise<string | null> {
       this.llmErr = null;
       try {

@@ -25,11 +25,14 @@ const modelForm = reactive({
   tool_calling: false,
   context_window: '',
   max_tokens: '',
+  // #309 切片 1：输出预算上限。**前端不做本地数字校验**（服务端是唯一判据，避免第二套规则）。
+  max_output_tokens: '',
   input_cost_per_1m: '' as string | number,
   output_cost_per_1m: '' as string | number,
 });
 const modelEditForm = reactive({
   model: '', call_name: '', name: '', type: 'text', tool_calling: false, context_window: '', max_tokens: '',
+  max_output_tokens: '',
   input_cost_per_1m: '' as string | number, output_cost_per_1m: '' as string | number, clear_pricing: false,
 });
 // #296：改「调用名」= 改 FDE 手里正在用的那个名字 ⇒ 必须点一次确认（确认前零请求，同 #246 改块先例）。
@@ -130,6 +133,7 @@ function openAddModel(providerId: string) {
   modelForm.tool_calling = false;
   modelForm.context_window = '';
   modelForm.max_tokens = '';
+  modelForm.max_output_tokens = '';
   modelForm.input_cost_per_1m = '';
   modelForm.output_cost_per_1m = '';
   selectedProviderId.value = providerId;
@@ -152,6 +156,8 @@ async function onAddModel() {
     tool_calling: modelForm.tool_calling,
     context_window: modelForm.context_window ? Number(modelForm.context_window) : null,
     max_tokens: modelForm.max_tokens ? Number(modelForm.max_tokens) : null,
+    // #309：没填就发 null（后端的「清空/不写」语义），填了就原样发——超限与否由服务端判。
+    max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
     ...(inputCost === undefined ? {} : { input_cost_per_token: inputCost }),
     ...(outputCost === undefined ? {} : { output_cost_per_token: outputCost }),
   });
@@ -167,6 +173,8 @@ function openEditModel(model: LlmModel) {
   modelEditForm.tool_calling = model.tool_calling;
   modelEditForm.context_window = model.context_window === null ? '' : String(model.context_window);
   modelEditForm.max_tokens = model.max_tokens === null ? '' : String(model.max_tokens);
+  // #309：旧后端 / 旧数据可能没这个字段 ⇒ `== null` 一并当「留空（= 不改）」处理。
+  modelEditForm.max_output_tokens = model.max_output_tokens == null ? '' : String(model.max_output_tokens);
   // 只回填本模型「显式」定价；价目表自动命中时不回填，避免把当日价目表冻结成覆盖值。
   const hasOverride = model.pricing_source === 'override';
   modelEditForm.input_cost_per_1m = hasOverride ? perTokenToInput(model.input_cost_per_token) : '';
@@ -189,6 +197,9 @@ function buildModelPatch(callName: string | null): ModelPatch {
     tool_calling: modelEditForm.tool_calling,
     ...(modelEditForm.context_window ? { context_window: Number(modelEditForm.context_window) } : {}),
     ...(modelEditForm.max_tokens ? { max_tokens: Number(modelEditForm.max_tokens) } : {}),
+    // #309：与 `max_tokens`/窗口同口径——**留空 = 不带键 = 保持现有值**（PATCH 里清空是显式 null，
+    // 表单不提供「清空」按钮，避免把「留空」误读成「清空」）。超限由服务端拒，文案直接透传。
+    ...(modelEditForm.max_output_tokens ? { max_output_tokens: Number(modelEditForm.max_output_tokens) } : {}),
     ...(inputCost === undefined ? {} : { input_cost_per_token: inputCost }),
     ...(outputCost === undefined ? {} : { output_cost_per_token: outputCost }),
   };
@@ -315,6 +326,7 @@ onMounted(() => {
                   <th class="py-1 pr-3 font-medium">tool_calling</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colContextWindow') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colMaxOutput') }}</th>
+                  <th class="py-1 pr-3 font-medium" :title="t('admin.llm.maxOutputBudgetHint')">{{ t('admin.llm.colMaxOutputBudget') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colPricing') }}</th>
                   <th class="py-1 pr-3 font-medium">{{ t('admin.llm.colStatus') }}</th>
                   <th class="py-1 font-medium"></th>
@@ -322,7 +334,7 @@ onMounted(() => {
               </thead>
               <tbody>
                 <tr v-if="p.models.length === 0">
-                  <td colspan="9" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
+                  <td colspan="10" class="muted py-1">{{ t('admin.llm.emptyModels') }}</td>
                 </tr>
                 <tr v-for="m in p.models" :key="m.id" data-test="model-row" class="border-t border-black/5">
                   <td class="py-1 pr-3">
@@ -342,6 +354,7 @@ onMounted(() => {
                   <td class="py-1 pr-3">{{ m.tool_calling ? '✓' : '—' }}</td>
                   <td class="py-1 pr-3">{{ m.context_window ?? '—' }}</td>
                   <td class="py-1 pr-3">{{ m.max_tokens ?? '—' }}</td>
+                  <td class="py-1 pr-3" data-test="model-max-output-budget">{{ m.max_output_tokens ?? '—' }}</td>
                   <td class="py-1 pr-3">
                     <span
                       v-if="!m.pricing_configured"
@@ -500,6 +513,12 @@ onMounted(() => {
         {{ t('admin.llm.colMaxOutput') }}
         <input v-model="modelForm.max_tokens" data-test="add-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
       </label>
+      <!-- #309 切片 1：只加提示，**不在前端卡数字**（上限由服务端单一判定，失败文案直接透传）。 -->
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colMaxOutputBudget') }}
+        <input v-model="modelForm.max_output_tokens" data-test="add-model-max-output-tokens" type="number" min="1" placeholder="32000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.maxOutputBudgetHint') }}</span>
+      </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.inputCostLabel') }}
         <input v-model="modelForm.input_cost_per_1m" data-test="add-model-input-cost" type="number" min="0" step="any" placeholder="0.28" class="rounded-md border border-black/20 px-2 py-1 text-sm">
@@ -583,6 +602,12 @@ onMounted(() => {
         {{ t('admin.llm.colMaxOutput') }}
         <input v-model="modelEditForm.max_tokens" data-test="edit-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputHint') }}</span>
+      </label>
+      <!-- #309 切片 1：同上——提示可以写，本地校验不要写（否则就是第二套会过期的规则）。 -->
+      <label class="flex flex-col gap-1 text-xs text-black/55">
+        {{ t('admin.llm.colMaxOutputBudget') }}
+        <input v-model="modelEditForm.max_output_tokens" data-test="edit-model-max-output-tokens" type="number" min="1" placeholder="32000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputBudgetHint') }}</span>
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.inputCostLabel') }}
