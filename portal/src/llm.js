@@ -183,6 +183,10 @@ function toModel(model) {
     tool_calling: modelToolCalling(model),
     context_window: info.context_window ?? metadata.context_window ?? null,
     max_tokens: params.max_tokens ?? null,
+    // issue #309 切片 1：模型「单次响应输出预算上限」的权威位是 `model_info.max_output_tokens`。
+    // 回退到 `litellm_params.max_tokens` 是**刻意的**：写侧两者绑死同值，而存量模型只有后者，
+    // 不回退就会把已经配好的模型显示成「没配」⇒ 管理员重存一次反而把数据面值改掉。
+    max_output_tokens: info.max_output_tokens ?? params.max_tokens ?? null,
     enabled: !isModelBlocked(model),
     ...modelPricing(model),
     litellm_params: redactCredential(params),
@@ -362,6 +366,81 @@ function validateMaxTokens(value) {
   }
 }
 
+/** 可用的正数 `context_window`（兼容历史上存成数字串的值）；拿不到就返回 null。 */
+function positiveNumberOrNull(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * issue #309 切片 1：`max_output_tokens`（引擎侧单次 `generate_response` 的**输出预算上限**）。
+ *
+ * 三态与 `max_tokens`/定价同一口径：`undefined` = 不动、`null` = 清空、正整数 = 设定。
+ *
+ * 硬上限（决策者定稿）：**不得超过 `context_window` 的 1/4**。这条比引擎侧
+ * `computeBudget()` 的临界值 `ctx - max(2000, ⌈10%·ctx⌉) - 1` **更严**（#309 定稿的理由：
+ * 1/4 是管理员能心算的数，不要求他们先去翻一遍预算公式），引擎侧那条作为绝对兜底保留，
+ * **双保险，谁都不许拆**。不拦的后果：超过临界的值会让**每个 run** 在 `call_implementation`
+ * 建 `ChatOpenAI` 时抱 `output_config.budget_tokens` 校验错——run 启动即死，且错误现场
+ * 不指向门户里那个字段。
+ *
+ * 零新错误码（§8.20）：一律 `validation_failed`，细分靠 `details.field` / `details.reason`。
+ */
+function validateMaxOutputTokens(value, contextWindow) {
+  if (value === undefined || value === null) return;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new LlmError('validation_failed', 'max_output_tokens 必须为正整数', {
+      details: { field: 'max_output_tokens' },
+    });
+  }
+  const window = positiveNumberOrNull(contextWindow);
+  if (window === null) {
+    // 没窗口就判不了 1/4 ⇒ 不能只改一半：放行了就是一个「配了预算却没配窗口」的半套配置落库，
+    // 而且这个值能否成立根本无法审计。
+    throw new LlmError('validation_failed', '设置 max_output_tokens 前必须先配置 context_window', {
+      details: { field: 'max_output_tokens', reason: 'context_window_missing' },
+    });
+  }
+  const maxAllowed = Math.floor(window / 4);
+  if (value > maxAllowed) {
+    throw new LlmError(
+      'validation_failed',
+      `max_output_tokens 不能超过上限 = context_window 的 1/4（context_window=${window} ⇒ 上限 ${maxAllowed}，传入 ${value}）`,
+      { details: { field: 'max_output_tokens', max_allowed: maxAllowed, context_window: window } },
+    );
+  }
+}
+
+/**
+ * #309 定稿：`max_output_tokens` 与 `litellm_params.max_tokens` **绑死同值**（一处写、两处落）。
+ *
+ * 为什么必须双写——与 #296 的 `call_name`/`name`「各写各的」结论**相反**：本字段是**数据面参数**
+ * 而不是展示元数据。引擎侧真正送到 provider 的是 `litellm_params.max_tokens`；只写
+ * `model_info.max_output_tokens` 就是「门户显示 2000、数据面仍旧默认值」的第二套真相源
+ * （#296 拆的正是这类坑）。反过来只写 `litellm_params.max_tokens` 则门户列表与心跳下行
+ * 没有权威可读。所以：**设定同值双写、清空一起清**，不存在「只改了一处」的中间态。
+ *
+ * 写入顺序上的约定：本函数**必须在 legacy `max_tokens` 处理之后调用**，同一次请求里两个字段
+ * 都传时以绑定字段为准（不留半套）。`isCreate`：新建无旧值可清，`null` 就是不写该键。
+ */
+function applyMaxOutputTokensWrite(params, modelInfo, value, { isCreate }) {
+  if (value === undefined) return;
+  if (value === null) {
+    // 显式 null 是 LiteLLM 的清空而非缺省语义（NULL_CLEARABLE_LITELLM_PARAMS 会从
+    // litellm_params 与 model_info 两处移除）；params 侧用 delete，两边一起消失。
+    if (isCreate) delete modelInfo.max_output_tokens;
+    else modelInfo.max_output_tokens = null;
+    delete params.max_tokens;
+    return;
+  }
+  modelInfo.max_output_tokens = value;
+  params.max_tokens = value;
+}
+
 /**
  * Validate a per-token USD rate. `undefined` means "leave unchanged"; `null` means "clear";
  * a finite non-negative number sets the rate. Units are USD per token, matching LiteLLM's
@@ -378,6 +457,8 @@ function validateCost(value, field) {
 export async function createModel(gateway, input = {}) {
   const client = getGatewayClient(gateway);
   validateMaxTokens(input.max_tokens);
+  // #309：新建只能拿本次提交的 context_window 判 1/4（没有「现存值」可退）。
+  validateMaxOutputTokens(input.max_output_tokens, input.context_window);
   const inputCost = validateCost(input.input_cost_per_token, 'input_cost_per_token');
   const outputCost = validateCost(input.output_cost_per_token, 'output_cost_per_token');
   const modelName = input.model_name ?? input.model_id;
@@ -412,6 +493,8 @@ export async function createModel(gateway, input = {}) {
     ...(input.context_window === undefined ? {} : { context_window: input.context_window }),
     ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
   };
+  // #309：绑死双写必须在 legacy `max_tokens` 之后（见 applyMaxOutputTokensWrite）。
+  applyMaxOutputTokensWrite(params, model_info, input.max_output_tokens, { isCreate: true });
   const normalizedModelName = modelName.trim();
   const existingIds = new Set(
     gatewayModels(await client.listModels())
@@ -472,6 +555,7 @@ async function findGatewayModel(client, id) {
  */
 export async function updateModel(gateway, id, {
   name, call_name, type, enabled, tool_calling, context_window, max_tokens, model,
+  max_output_tokens,
   input_cost_per_token, output_cost_per_token,
 } = {}) {
   const client = getGatewayClient(gateway);
@@ -497,6 +581,13 @@ export async function updateModel(gateway, id, {
     upstreamModel = model.trim() || undefined;
   }
   const current = await findGatewayModel(client, id);
+  // #309：1/4 校验用的**有效** context_window——本次提交的新值优先（同一条 PATCH 里两者都改时
+  // 不能拿旧窗口判新预算），否则退到该模型现存的 model_info.context_window（走 toModel，与门户
+  // 列表同一个口径，不另取字段）。两者都没有 ⇒ 拒绝，不写半套。
+  validateMaxOutputTokens(
+    max_output_tokens,
+    context_window !== undefined ? context_window : toModel(current).context_window,
+  );
   // #296 实测：LiteLLM **不拦同名**（两个 deployment 改成同一个 model_name 都返 200），而数据面
   // 按名字选 deployment ⇒ 同名之后同一个名字的请求会在两个 deployment 间轮询（真机探针 5 发
   // 打出 PROBE_B/PROBE_A 交替），且 `GET /v1/models` 只列一个 ⇒ 完全看不出来。故门户必须拦。
@@ -527,6 +618,7 @@ export async function updateModel(gateway, id, {
     || tool_calling !== undefined
     || context_window !== undefined
     || max_tokens !== undefined
+    || max_output_tokens !== undefined
     || upstreamModel !== undefined
     || pricingTouched
   ) {
@@ -539,7 +631,8 @@ export async function updateModel(gateway, id, {
     // 顺手改或清 `model_info.display_name`（探针：改名后 display_name 原值仍在），所以两个字段
     // 可以同一条 PATCH 各写各的。
     const update = { model_id: id, ...(callName === undefined ? {} : { model_name: callName }) };
-    if (name !== undefined || type !== undefined || tool_calling !== undefined || context_window !== undefined) {
+    if (name !== undefined || type !== undefined || tool_calling !== undefined || context_window !== undefined
+      || max_output_tokens !== undefined) {
       update.model_info = {
         ...info,
         ...(type === undefined ? {} : { type, mode: typeToMode(type) }),
@@ -549,11 +642,19 @@ export async function updateModel(gateway, id, {
         metadata,
       };
     }
-    if (upstreamModel !== undefined || max_tokens !== undefined || pricingTouched) {
+    if (upstreamModel !== undefined || max_tokens !== undefined || max_output_tokens !== undefined || pricingTouched) {
       const params = { ...(current.litellm_params ?? {}) };
       if (upstreamModel !== undefined) params.model = upstreamModel;
       if (max_tokens === null) delete params.max_tokens;
       else if (max_tokens !== undefined) params.max_tokens = max_tokens;
+      // #309：绑死双写——同一份规则把值落到**两处**：`model_info.max_output_tokens`（权威位，
+      // 门户列表与心跳下行读它）与 `litellm_params.max_tokens`（引擎真正送到 provider 的那个），
+      // 传 null 则两处一起消失（见 applyMaxOutputTokensWrite 的「为什么与 #296 相反」）。
+      // 前提：上面 model_info 块的触发条件已包含 `max_output_tokens !== undefined` ⇒ 这里
+      // `update.model_info` 一定存在，不需要再兼容缺失分支。
+      if (max_output_tokens !== undefined) {
+        applyMaxOutputTokensWrite(params, update.model_info, max_output_tokens, { isCreate: false });
+      }
       // Explicit null clears the rate: LiteLLM removes a field that arrives as null from
       // both litellm_params and model_info (NULL_CLEARABLE_LITELLM_PARAMS). Omitting it
       // would instead leave the stored value untouched.
@@ -626,7 +727,7 @@ const HEARTBEAT_NAME_SLOTS = [
   { slot: 'vision', idColumn: 'vision_model_id', nameColumn: 'vision_model_name' },
 ];
 
-/** Single-slot module TTL cache for the gateway `model_info.id → model_name` map. */
+/** Single-slot module TTL cache for the gateway model catalog (name map + per-name metadata). */
 const dataPlaneNameCache = { client: null, at: 0, map: null };
 
 function errorStatus(error) {
@@ -637,19 +738,37 @@ function configuredNameSlots(row) {
   return HEARTBEAT_NAME_SLOTS.filter(({ idColumn, nameColumn }) => Boolean(row[idColumn]) && Boolean(row[nameColumn]));
 }
 
-/** Reuse the module's own response parsing: gatewayModels() + modelId(), never a second parser. */
-async function loadDataPlaneNameMap(client, { listModels }) {
-  const payload = listModels ? await listModels() : await client.listModels();
-  const map = new Map();
+/**
+ * 一次 `GET /model/info` 同时产出两份索引 ⇒ **只打网关一趟**（缓存只有一份，不能为了元数据再跳一次）：
+ *   * `names`：`model_info.id → model_name`（#289 名字漂移除账用）
+ *   * `byName`：`model_name → toModel(model)`（#309 切片 1：心跳下行元数据用）
+ *
+ * `byName` 特意以**数据面名**为键：心跳要带的是「按对账后的新名选中的那个 deployment」的值，
+ * 按旧名取会带错部署（改名之后旧名根本不存在或已属于另一个）。
+ * 值直接走 `toModel()` ⇒ 与门户模型列表**同一份读侧语义**，不另取字段。
+ */
+function indexGatewayModels(payload) {
+  const names = new Map();
+  const byName = new Map();
   for (const model of gatewayModels(payload)) {
     const id = modelId(model);
     const name = model?.model_name;
     if (id == null || typeof name !== 'string' || name.length === 0) continue;
-    map.set(String(id), name);
+    names.set(String(id), name);
+    // 同名多 deployment（LiteLLM 不拦同名，#296 实测）时取目录里第一个：不猜轮询结果，
+    // 取确定性的那一份，同一个输入永远得同一个输出。
+    if (!byName.has(name)) byName.set(name, toModel(model));
   }
-  return map;
+  return { names, byName };
 }
 
+/** Reuse the module's own response parsing: gatewayModels() + modelId(), never a second parser. */
+async function loadDataPlaneNameMap(client, { listModels }) {
+  const payload = listModels ? await listModels() : await client.listModels();
+  return indexGatewayModels(payload);
+}
+
+/** @returns {Promise<{names: Map<string,string>, byName: Map<string,object>}>} */
 async function dataPlaneNameMap(client, { now, ttlMs, listModels }) {
   const at = now();
   if (ttlMs > 0 && dataPlaneNameCache.client === client && dataPlaneNameCache.map
@@ -664,22 +783,25 @@ async function dataPlaneNameMap(client, { now, ttlMs, listModels }) {
 }
 
 /**
- * @returns {Promise<Record<string, string>>} slot → data-plane name to send downstream
- *          (the new name only for slots that were fully reconciled, the stored name otherwise).
+ * @returns {Promise<{effective: Record<string,string>, byName: Map<string,object>|null}>}
+ *          `effective`：slot → 下行用的数据面名（只对账成功的槽位是新名，其余仍是存量）；
+ *          `byName`：数据面名 → `toModel()` 视图（#309 心跳元数据），**取不到目录时为 null**。
  */
 async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, listModels, updateKey }) {
   const slots = configuredNameSlots(row);
   const effective = Object.fromEntries(slots.map(({ slot, nameColumn }) => [slot, row[nameColumn]]));
-  let map;
+  let index;
   try {
-    map = await dataPlaneNameMap(client, { now, ttlMs, listModels });
+    index = await dataPlaneNameMap(client, { now, ttlMs, listModels });
   } catch (error) {
     // Gateway is unreachable: the heartbeat path must not be dragged down by gateway flapping.
     console.warn('[llm] binding model name reconcile skipped', {
       fde_id: userId, reason: 'model_list_unavailable', error_status: errorStatus(error),
     });
-    return effective;
+    // 目录拿不到 ⇒ 元数据也无从谈起：交回 null，调用方按「无值」处理（键不出现），不抛错。
+    return { effective, byName: null };
   }
+  const map = index.names;
 
   const drifts = [];
   for (const { slot, idColumn, nameColumn } of slots) {
@@ -694,7 +816,7 @@ async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, 
     }
     if (current !== row[nameColumn]) drifts.push({ slot, nameColumn, from: row[nameColumn], to: current });
   }
-  if (drifts.length === 0) return effective;
+  if (drifts.length === 0) return { effective, byName: index.byName };
 
   // Keep the old names in the allow-list: dropping them is not required to fix the 403 and would
   // risk rejecting in-flight traffic that still carries the stale name.
@@ -706,7 +828,7 @@ async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, 
     console.warn('[llm] binding model name reconcile failed', {
       fde_id: userId, slots: drifts.map((d) => d.slot), error_status: errorStatus(error),
     });
-    return effective;
+    return { effective, byName: index.byName };
   }
 
   const params = [userId, ...drifts.map((d) => d.to)];
@@ -722,11 +844,25 @@ async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, 
     console.warn('[llm] binding model name reconcile failed', {
       fde_id: userId, slots: drifts.map((d) => d.slot), reason: 'binding_update_failed', error_status: errorStatus(error),
     });
-    return effective;
+    return { effective, byName: index.byName };
   }
 
   for (const drift of drifts) effective[drift.slot] = drift.to;
-  return effective;
+  return { effective, byName: index.byName };
+}
+
+/**
+ * #309 切片 1：心跳下行的模型元数据（决策者定稿）。
+ *
+ * **只在非 null 时带键**：没有值就整个键都不出现，而不是写 `key: null`——没配过元数据的存量
+ * 部署，下行字节与 #309 之前逐字节相同（runner 切片 2 用「键在不在」判有无，不解析 null）。
+ * 只给 `main`：embedding / vision 的上下文窗口不进 output 预算，切片 1 不下发。
+ * 元数据缺席（网关抖动 / 未注入 client / 目录里找不到这个名字）都走同一条「不写键」路径。
+ */
+function attachHeartbeatModelMetadata(target, model) {
+  if (!model) return;
+  if (model.context_window != null) target.context_window = model.context_window;
+  if (model.max_output_tokens != null) target.max_output_tokens = model.max_output_tokens;
 }
 
 /** Model ids are LiteLLM model_info.id strings and need no join to a Station-owned catalog. */
@@ -753,11 +889,19 @@ export async function getFdeLlmHeartbeatModels(pool, userId, opts = {}) {
   // heartbeat keeps returning exactly the stored snapshot (internal.js behaviour is unchanged).
   const { gateway = null, now = Date.now, ttlMs = 60_000, listModels = null, updateKey = null } = opts ?? {};
   let names = null;
+  // #309：数据面名 → 模型元数据（`toModel` 视图）。**只有注了 gateway 才会有**：旧的两参调用形状
+  // 不碰网关，也就一个字节都不变（兼容面，llm.test.js / llm-reconcile.test.js 钉着）。
+  let metaByName = null;
   if (gateway) {
-    names = await reconcileHeartbeatNames(pool, userId, row, getGatewayClient(gateway), { now, ttlMs, listModels, updateKey });
+    const reconciled = await reconcileHeartbeatNames(pool, userId, row, getGatewayClient(gateway), { now, ttlMs, listModels, updateKey });
+    names = reconciled.effective;
+    metaByName = reconciled.byName;
   }
   const nameFor = (slot, stored) => names?.[slot] ?? stored;
-  const models = { main: { model: nameFor('main', row.main_model_name), type: 'text' } };
+  const mainName = nameFor('main', row.main_model_name);
+  const models = { main: { model: mainName, type: 'text' } };
+  // #309 切片 1：按**对账后的名字**取同一个 deployment 的元数据（按存量旧名取会在改名后带错部署）。
+  attachHeartbeatModelMetadata(models.main, metaByName?.get(mainName) ?? null);
   if (row.embedding_model_id) {
     models.embedding = { model: nameFor('embedding', row.embedding_model_name), type: 'embedding' };
   }
@@ -879,9 +1023,11 @@ export async function assertBindingModelsResolvable(pool, userId, opts = {}) {
   const slots = configuredNameSlots(row);
   if (slots.length === 0) return { status: 'pass', reason: 'no_configured_slot' };
 
-  let map;
+  // #309：同一个 TTL 缓存现在携两份索引（`names` + `byName`）——本预检是第二个消费者，
+  // 拿的是**同一趟** `GET /model/info`（不因为心跳要元数据就多打一次，用例钉着）。
+  let index;
   try {
-    map = await dataPlaneNameMap(getGatewayClient(gateway), { now, ttlMs, listModels });
+    index = await dataPlaneNameMap(getGatewayClient(gateway), { now, ttlMs, listModels });
   } catch (error) {
     // fail-open（故意）：网关不可达时用户照常发消息，错误在 run 里由 worker 面报。
     const observed = { status: 'pass', reason: 'model_list_unavailable', error_status: errorStatus(error) };
@@ -891,7 +1037,7 @@ export async function assertBindingModelsResolvable(pool, userId, opts = {}) {
 
   for (const { slot, idColumn } of slots) {
     const modelId = String(row[idColumn]);
-    if (map.has(modelId)) continue;
+    if (index.names.has(modelId)) continue;
     throw new LlmError(
       'llm_model_not_found',
       `绑定的${SLOT_LABELS[slot] ?? slot}在 LLM 网关里已不存在（模型 id ${modelId}）：请到管理台 /admin 重新选模型后再发送（无权限请联系管理员）`,
