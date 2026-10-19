@@ -21,6 +21,9 @@ import {
   createJsonFileModelConfigProvider,
   createOpenAIProvider,
   runToolLoop,
+  // issue #309 切片 2b：上游预算闸（与 runToolLoop 同源，包根导出）。只作为**依赖注入**传给
+  // resolveModelMetadata——本文件不自己算预算，也不把它的返回值当数据用（只看它抛不抛）。
+  computeBudget,
 } from 'erix-agent';
 import { createToolRegistry } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
@@ -313,7 +316,11 @@ async function startRun(msg) {
   // 装配 + 告警，**不要再算一遍**。必须钳的硬红线：引擎启动期算预算无 try/catch
   // （erix-agent 0.20.0 src/loop/orchestrator.js:1141-1148），越界值抛 KitError invalid_budget ⇒
   // **每个 run 第 1 轮之前就死**（不是「这一轮不好」，也不是「不压缩」）。
-  const engineModelMetadata = resolveModelMetadata(msg.models);
+  // 切片 2b：第二入参把**上游那道闸**注进去（包根 computeBudget，公式不复制到本站）——ctx 合法但
+  // 很小（1001/2000/2666 这类）时 1/4 钳完预算仍非正，闸会抛 ⇒ 纯函数兜成 null ⇒ 同样是「什么都不传」。
+  // 本处不传 probe 则守卫失效（小窗口元数据会把每个 run 炸死），所以**必须传**（源码级锁：
+  // runner/test/model-metadata.test.js）。
+  const engineModelMetadata = resolveModelMetadata(msg.models, { computeBudget });
   if (engineModelMetadata?.clamped) {
     // 填错元数据的模型行照跑，但必须留痕：走现成 IPC LOG（**不新增事件类型**，否则污染用户可见事件流）。
     sendIpc(process, {
@@ -323,10 +330,22 @@ async function startRun(msg) {
         + ` (limit = floor(context_window/4), context_window=${engineModelMetadata.context_window})`,
     });
   } else if (!engineModelMetadata && msg.models?.main) {
+    // 同一个 LOG，但要把**两种成因**说清（共用一条 = 不新增事件类型，文案各自点名）：
+    //   a) context_window 本身不是正整数（纯函数规则 3）；
+    //   b) context_window 合法但很**小**，1/4 钳完预算仍非正——上游闸抛了（纯函数规则 4）。
+    // 两种都落到「什么都不传」= 压缩关掉但 run 照活。⚠ 这里只区分成因、**不重算公式**（本站不许出现
+    // floor(/4) 以外的钳制判据，引擎那两个常量一个也不抄）；候选值也不从返回值拿，直接报下行原值。
+    const ctxRaw = msg.models.main.context_window;
+    const ctxShapeOk = Number.isSafeInteger(ctxRaw) && ctxRaw > 0; // 与规则 3 同一形状判据（非引擎公式）
     sendIpc(process, {
       type: MSG.LOG, run_id: runId, level: 'warn',
-      msg: `model metadata unusable: context_window=${String(msg.models.main.context_window)}`
-        + ' (not a positive integer) → engine metadata and the explicit output cap are not sent;'
+      msg: `model metadata unusable: context_window=${String(ctxRaw)}`
+        + (ctxShapeOk
+          ? ` with max_output_tokens=${String(msg.models.main.max_output_tokens)}`
+            + ' → computed context budget is not positive (engine computeBudget rejected this pair,'
+            + ' even at the 1/4 cap)'
+          : ' (not a positive integer)')
+        + ' → engine metadata and the explicit output cap are not sent;'
         + ' engine compaction stays off (= 现状)',
     });
   }
