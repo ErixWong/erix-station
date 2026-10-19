@@ -1752,7 +1752,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `runs[].lease` | `renewed`（claim_token 匹配，已续租 `lease_until = now + 90s` ⚠️）或 `lease_lost`（claim_token 不匹配——该 run 已被 re-claim / 租约易主） |
 | `runs[].lease_until` | 仅 `lease: renewed` 时返回（续租后的到期时刻） |
 | `runs[].reason` | 仅 `lease: lease_lost` 时返回：`reclaimed`（已 re-claim）/ `released`（已被 U12 释放）/ `terminal`（已终态） |
-| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」。#309 切片 1：`main` 可额外带 `context_window` 与 `max_output_tokens`（与门户模型列表同一条 `toModel` 语义，且**按对账后的新名**取同一个 deployment），**只在非 null 时带键**（没值就整个键不出现，不是 `key: null`）⇒ 未配元数据的存量部署下行字节与 #309 之前逐字节相同；embedding/vision 切片 1 不带。元数据**复用对账那一次 `GET /model/info`**（不新增网关调用），网关抖动/未注入 client 时退回无元数据且不抛错；runner 接线是 #309 切片 2 |
+| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」。#309 切片 1 的下行形状：`{ main: { model, type, context_window?, max_output_tokens? }, embedding?, vision? }` —— `main` 可额外带 `context_window` 与 `max_output_tokens`（与门户模型列表同一条 `toModel` 语义，且**按对账后的新名**取同一个 deployment），**只在非 null 时带键**（没值就整个键不出现，不是 `key: null`）⇒ 未配元数据的存量部署下行字节与 #309 之前逐字节相同；embedding/vision 切片 1 不带。元数据**复用对账那一次 `GET /model/info`**（不新增网关调用），网关抖动/未注入 client 时退回无元数据且不抛错；runner 接线是 #309 切片 2 |
 
 语义（与 runner §4.2 U4 一致）：
 
