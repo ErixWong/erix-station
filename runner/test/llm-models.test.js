@@ -194,3 +194,105 @@ test('#309 全链形状：心跳原文 → parseHeartbeatModels → resolveModel
     '{"context_window":262144,"max_output_tokens":65536,"clamped":true,"clamped_from":200000}',
     '纯函数返回值继续用 snake_case（camelCase 只许在 worker 装配那一站）');
 });
+
+// ---------------------------------------------------------------------------
+// issue #309 切片 2b（工单 §3.1）：候选值还要过**上游自己**那道闸（规则 4）。
+// 闸 = erix-agent 包根导出的 computeBudget({contextWindowTokens, maxOutputTokens})，
+// 用**第二入参注入**——本文件继续保持零依赖（不 import erix-agent），全部用桩闸。
+// 为什么必须补：ctx 合法但很小（1001 / 2000 / 2666）时 1/4 钳完预算仍非正 ⇒ 每个 run 第 1 轮前抛
+// invalid_budget；兜成「不传元数据」才是可接受的后果（压缩关，run 照活）。
+// 三组实测数字（真包，主 agent 与工单一致）：1001/250 → −1249 抛、2000/500 → −500 抛、
+// 2666/666 → 0 抛、2667/666 → 1 活。
+// ---------------------------------------------------------------------------
+
+/** 桩闸：一律抛（= 上游算出非正预算时的形状），并记录被调次数。 */
+function throwingBudget(sink = []) {
+  const fn = (...args) => {
+    sink.push(args);
+    throw new Error('stub: Computed context budget must be positive (got -1249)');
+  };
+  fn.calls = sink;
+  return fn;
+}
+
+/** 桩闸：一律放行，记录每次调用的**实参列表**（用于钉住「单对象 camelCase、值 = 候选值」）。 */
+function recordingBudget(sink) {
+  return (...args) => {
+    sink.push(args);
+    return 1;
+  };
+}
+
+test('#309-2b resolveModelMetadata：probe 抛 ⇒ 返回 null（= 整对不传 = 现状），且**优先于**「钳了」的结论', () => {
+  // 这三组**没有闸时**都会把值喂给引擎（钳后 250 / 原样 500 / 钳后 666），而引擎说预算非正 ⇒
+  // 本单要堵的就是这里：交出这些值 = 该 FDE 每个 run 启动即死且不可重试。
+  const combos = [
+    { models: { main: { model: 'm', context_window: 1001, max_output_tokens: 1000 } }, fed: 250, why: '钳后 250 → 预算 −1249' },
+    { models: { main: { model: 'm', context_window: 2000, max_output_tokens: 500 } }, fed: 500, why: '正好等于 floor(2000/4) 不算钳，仍 → 预算 −500' },
+    { models: { main: { model: 'm', context_window: 2666, max_output_tokens: 667 } }, fed: 666, why: '钳后 666 → 预算正好 0（0 也是非正）' },
+  ];
+  for (const { models, fed, why } of combos) {
+    const before = resolveModelMetadata(models);
+    assert.equal(before?.max_output_tokens, fed,
+      `前置事实：无闸时 ctx=${models.main.context_window} 会把 ${fed} 喂给引擎（${why}）`);
+    assert.equal(resolveModelMetadata(models, { computeBudget: throwingBudget() }), null,
+      `ctx=${models.main.context_window}：闸抛 ⇒ 必须是 null（交出钳后值 = 第 1 轮之前就炸）；${why}`);
+  }
+  // 原样支路（完全没钳）也照样要过闸：闸看的是「窗口 + 候选值」这对组合，不是「有没有被钳」。
+  const passthrough = { main: { model: 'm', context_window: 262144, max_output_tokens: 32000 } };
+  assert.deepEqual(resolveModelMetadata(passthrough),
+    { context_window: 262144, max_output_tokens: 32000, clamped: false, clamped_from: 32000 },
+    '前置：这组无闸时是原样透传');
+  assert.equal(resolveModelMetadata(passthrough, { computeBudget: throwingBudget() }), null,
+    '原样支路里 probe 抛同样 ⇒ null（不许做成「只有被钳了才过闸」）');
+});
+
+test('#309-2b resolveModelMetadata：probe 不抛 ⇒ 返回值与不传 probe 时逐字节相同，且按候选值调一次', () => {
+  const cases = [
+    { models: { main: { model: 'm', context_window: 262144, max_output_tokens: 32000 } }, expected: { context_window: 262144, max_output_tokens: 32000, clamped: false, clamped_from: 32000 } },
+    { models: { main: { model: 'm', context_window: 262144, max_output_tokens: 200000 } }, expected: { context_window: 262144, max_output_tokens: 65536, clamped: true, clamped_from: 200000 } },
+    { models: { main: { model: 'm', context_window: 2667, max_output_tokens: 700 } }, expected: { context_window: 2667, max_output_tokens: 666, clamped: true, clamped_from: 700 } },
+  ];
+  for (const { models, expected } of cases) {
+    const calls = [];
+    const r = resolveModelMetadata(models, { computeBudget: recordingBudget(calls) });
+    assert.equal(JSON.stringify(r), JSON.stringify(expected), '闸放行 ⇒ 生效值不得被改动');
+    assert.equal(JSON.stringify(r), JSON.stringify(resolveModelMetadata(models)),
+      '闸放行 ⇒ 与「不传 probe」的现状逐字节相同（兼容面）');
+    assert.equal(calls.length, 1, '闸必须被调到（恰好一次），否则这条守卫是空的');
+    assert.deepEqual(calls[0],
+      [{ contextWindowTokens: expected.context_window, maxOutputTokens: expected.max_output_tokens }],
+      '调用形状：**一个**对象 + 上游 camelCase 键 + 值是**候选值**（原样或钳后），不是两个位置参数');
+  }
+});
+
+test('#309-2b resolveModelMetadata：不传 probe（或注入位不是函数）⇒ 与切片 2 逐字节相同；ctx 非法支路根本不调闸', () => {
+  const legacy = [
+    [{ main: { model: 'm', context_window: 262144, max_output_tokens: 32000 } },
+      '{"context_window":262144,"max_output_tokens":32000,"clamped":false,"clamped_from":32000}'],
+    [{ main: { model: 'm', context_window: 262144, max_output_tokens: 200000 } },
+      '{"context_window":262144,"max_output_tokens":65536,"clamped":true,"clamped_from":200000}'],
+    [{ main: { model: 'm', context_window: 1001, max_output_tokens: 1000 } },
+      '{"context_window":1001,"max_output_tokens":250,"clamped":true,"clamped_from":1000}'],
+    [{ main: { model: 'm', context_window: 1001 } },
+      '{"context_window":1001,"max_output_tokens":250,"clamped":true}'], // clamped_from=undefined ⇒ 键不在（与切片 2 同）
+    [{ main: { model: 'm', max_output_tokens: 4096 } }, 'null'],
+    [null, 'null'],
+  ];
+  for (const [models, json] of legacy) {
+    assert.equal(JSON.stringify(resolveModelMetadata(models)), json, '不传第二入参 = 现状逐字节不变');
+    assert.equal(JSON.stringify(resolveModelMetadata(models, {})), json, '空依赖对象同样跳过');
+    assert.equal(JSON.stringify(resolveModelMetadata(models, { computeBudget: undefined })), json);
+    assert.equal(JSON.stringify(resolveModelMetadata(models, { computeBudget: 'not-a-function' })), json,
+      '注入位不是函数 ⇒ 按「没闸」处理（不许因为传了个怪东西就顺带把元数据废掉）');
+  }
+  // 闸在钳制**之后**、且在「ctx 非法 ⇒ null」之后：ctx 不合法的支路必须压根不碰闸（否则旧 portal
+  // 的下行会被这道新守卫误伤成另一条路径）。
+  for (const models of [{ main: { model: 'm', context_window: 0, max_output_tokens: 100 } },
+    { main: { model: 'm', context_window: '262144', max_output_tokens: 100 } },
+    { main: { model: 'm' } }, {}]) {
+    const gate = throwingBudget();
+    assert.equal(resolveModelMetadata(models, { computeBudget: gate }), null);
+    assert.equal(gate.calls.length, 0, `ctx 非法/缺失支路不得调闸：${JSON.stringify(models)}`);
+  }
+});
