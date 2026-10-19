@@ -1294,7 +1294,7 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 | `type` | `'text'\|'embedding'\|'rerank'\|'vision'` | 非法值 ⇒ `400 validation_failed`（`details.field='type'`） |
 | `tool_calling` | boolean | 支持 function calling |
 | `context_window` / `max_tokens` | number | `context_window` ≤0 ⇒ `400`（`details.field='context_window'`） |
-| `max_output_tokens` | number \| null | **单次响应的输出预算上限**（#309 切片 1，下一段）。权威位 `model_info.max_output_tokens`，并**同值自动跟随**写 `litellm_params.max_tokens`；`null` = 两处一起清；硬上限 `≤ floor(context_window/4)` ⇒ 超限 `400 validation_failed`。**读侧读到的是生效值**：没手填过时它是 `floor(context_window/4)` 算出来的（切片 1.5，见下） |
+| `max_output_tokens` | number \| null | **单次响应的输出预算上限**（#309 切片 1，下一段）。权威位 `model_info.max_output_tokens`，并**同值自动跟随**写 `litellm_params.max_tokens`；**传 `null` 当前清不掉**：门户会按「清空」发请求（`model_info.max_output_tokens: null` + `litellm_params` 不带 `max_tokens`），但真 LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（实测 200 而值一字未动，issue **#314**）⇒ 门户侧只能**设值**，要清空得走网关。**设值**仍有效；硬上限 `≤ floor(context_window/4)` ⇒ 超限 `400 validation_failed`。**读侧读到的是生效值**：没手填过时它是 `floor(context_window/4)` 算出来的（切片 1.5，见下；`context_window` 的形态口径见「第 3 级」那一条，#316） |
 | `input_cost_per_token` / `output_cost_per_token` | number \| null | 显式定价（§8.31）；管理台按 **USD/1M** 输入输出、原值回读 |
 
 **`max_output_tokens`：单次响应的输出预算上限（#309 切片 1 + 切片 1.5）**
@@ -1310,7 +1310,12 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 
 - **写侧绑死双写**：`model_info.max_output_tokens`（权威位，门户列表与心跳下行读它）与
   `litellm_params.max_tokens`（**调用方没发 `max_tokens` 时由 LiteLLM 注入给上游的那个值** ——
-  #309 事故里那个 131072 就是这么来的）**同值**；传 `null` 两处一起清。
+  #309 事故里那个 131072 就是这么来的）**同值**；传 `null` 门户**按「两处一起清」的形状发请求**。
+  ⚠ **但在真网关上当前清不掉**（#317 改对的原口径是「传 `null` 两处一起清」）：真 LiteLLM v1.103.2 对
+  JSON `null` 是**忽略**语义（手工与门户两条路各实测一次：返 200 但值一字未动，issue **#314**）。
+  单测（`portal/test/llm.test.js`）钉的是**发给网关的请求形状**（fake 会清），不是网关行为。
+  ⇒ 管理台上这是一个「只能设值、不能清空」的字段；又因为编辑表单**留空 = 省略该字段**（下条，#314），
+  管理员不会看到「清空失败」的报错，只会看到「那个数清不掉」。
   为什么必须双写——与上面 `call_name`/`name`「各写各的」**结论相反**：本字段是**数据面参数**
   而不是展示元数据，只写 `model_info` 就是「门户显示 2000、数据面仍是默认值」的第二套真相源
   （#296 拆的正是这类坑）；只写 `litellm_params` 则门户与心跳没有权威可读。
@@ -1320,20 +1325,29 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
   ```
   生效值 = model_info.max_output_tokens          -- 上游 LiteLLM 配了什么就是什么（权威位）
          ?? litellm_params.max_tokens            -- 同上（今天真正被网关注进请求体的那个）
-         ?? floor(正数 context_window / 4)         -- 都没配 ⇒ 按窗口的 1/4 假定（切片 1.5 新增）
-         ?? null                                  -- 连 context_window 都没有 ⇒ 真的没有
+         ?? floor(正整数 context_window / 4)        -- 都没配 ⇒ 按窗口的 1/4 假定（切片 1.5 新增；#316 把
+         ?? null                                  --   「正数」收紧成「正整数」：真小数窗口也算不出来）
   ```
 
   - 第 2 级的回退是**刻意的**：存量模型只有后者，不回退就会把已经配好的显示成「没配」。
   - 第 3 级（**切片 1.5 的回退值**）：`context_window` 的取值口径与门户显示那一行**完全同源**
-    （`model_info.context_window ?? metadata.context_window`），且必须是**正数**才算：
-    `0` / 负数 / 非数字串一律视为「窗口不可得」⇒ 直接走第 4 级的 `null`，**绝不下发 0 或 NaN**；
-    历史上存成数字串的窗口（`"128000"`）与手填校验复用同一个判据，照样能算。
+    （`model_info.context_window ?? metadata.context_window`），且必须是**正整数**才算（#316）：
+    - **数字串**（`"128000"`）与**整值浮点**（`262144.0` / `"262144.0"` / `"1e3"`）⇒ **归一成正整数**后参与计算；
+    - **真小数**（`262144.5`）/ `0` / 负数 / 非数字串 / `NaN` / `Infinity` ⇒ 一律「窗口不可得」⇒ 直接走
+      第 4 级的 `null`，**绝不 floor（那是在替管理员编一个他没填的数）、绝不下发 0 或 NaN**。
+    这条判据与 runner 是**同一条**（`runner/lib/llm-models.js` 的 `positiveIntOrNull()`，镜像测试在对面）：
+    旧口径只要求「正数」，于是 `262144.5` 能在门户算出一个回退值而 runner 不认它 ⇒
+    **门户显示着窗口、压缩静默关**（#316 的病症）。今天「窗口可得」与「runner 能算出预算」是同一件事。
   - **缺元数据不再等于关压缩**（本切片真正要买的性质）：引擎要 `contextWindowTokens` **和**
     `maxOutputTokens` 同时存在才推得出 `budgetTokens`（压缩总开关），而「从没在门户手填过这个数」
     才是存量模型的常态 ⇒ 门户总会算出一个生效值并下发，**引擎的压缩开关因此默认是开的**。
-    唯一还关着的情形是「连 `context_window` 都没配」——那时上游的 `model_metadata_missing`
-    诊断事件照发，就是它的告警。
+    ⚠ **压缩仍关着的情形是三种**（#317：原文写的「唯一还关着的情形是连 `context_window` 都没配」不对）：
+    ① 连 `context_window` 都没配；② 窗口形态 runner 不认（真小数 / `≤0` / 非数字 ⇒ 门户与 runner 同一条
+    `positiveIntOrNull()` 判不可得 ⇒ 回退也算不出、心跳也不带这两个键，见上面第 3 级与
+    `runner/lib/llm-models.js`）；③ 窗口**小到** 1/4 兜底仍算不出正预算（`ctx ≤ 2666`：钳完仍是非正 ⇒
+    runner 注入的上游闸 `computeBudget` 抛 ⇒ 整对不传，见 `AGENTS.md` §8.31）。
+    ① ② 由上游的一次性 `model_metadata_missing` 诊断事件告警；③ 由 runner 的 `model metadata unusable`
+    warn 点名（文案会同时说「下行未带」与「形态非法」两种成因，#316）。
   - **只有一列数字**：决策者明确否决了「区分配置值 vs 假定值」的字段拆分（原话：这有什么关系呢，
     不管怎么来的，有个数字就行）⇒ **没有** `effective_max_output_tokens` / `max_output_tokens_source`
     这类字段，DTO 里就是 `max_output_tokens` 一个键。
@@ -1353,8 +1367,17 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
   不传/传 `null` 时两个键都不写进网关 body。
 - **前端不做本地数字校验**（否则就是第二套会过期的规则）：表单只加提示「上限 = 上下文窗口的 1/4」，
   超限一律由服务端拒且 `error.message` 原样透传（`stores/admin.ts` 的 `errText` 口径）。
+- ⚠ **新建与编辑两个表单的「留空」不是同一个意思**（#317 补；这是看懂上面「清不掉」的前提）：
+  **新建**时留空发的是**显式 `null`**（`portal/frontend/src/views/AdminView.vue:160`
+  `max_output_tokens: modelForm.max_output_tokens ? Number(...) : null`），而**编辑**（PATCH）留空发的是
+  **省略该字段**（`AdminView.vue:202` `...(modelEditForm.max_output_tokens ? { max_output_tokens: ... } : {})`，
+  即 PATCH 的「不动」语义，表单根本没提供「清空」按钮）。后果：真网关上 `null` 是忽略语义（#314）
+  ⇒ **管理员永远看不到「清空失败」这个报错**（编辑表单不发 `null`），他只会看见「那个数清不掉」；
+  而新建时留空确实不写该键，所以「新建一个没配预算的模型」是成立的（读侧退到 `floor(ctx/4)`）。
+  本单（#317）**只把口径写对**，没动前端一行（前端零改动）：真正的修分两条路——用 LiteLLM 的正确
+  清空语义，或把配口改成「设值不可清空」，归 #314。
 
-**别名对照表：同一个东西在五层里有五个名字（#309 切片 1.5）**
+**别名对照表：同一个东西在六层里有六个名字（#309 切片 1.5；runner 那一行是 #317 补的）**
 
 这个概念穿过 LiteLLM 、门户、erix-agent 三个命名空间，**名字不一致但指的是同一件事**——历史上
 #296（两个名字）与 #309（一个数被当两个）都是这类坑。对照表如下，**本项目自己的一侧（门户 DTO /
@@ -1366,6 +1389,7 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 | LiteLLM 权威位 | `model_info.max_output_tokens` | LiteLLM |
 | LiteLLM 请求参数 | `litellm_params.max_tokens` | LiteLLM |
 | 门户 DTO / 表单 / 心跳下行 | `max_output_tokens` | 本项目 |
+| **runner 心跳解析与钳制（#317 补的一行）** | 心跳 snake_case 两键 `context_window` / `max_output_tokens` → **正整数归一**（`positiveIntOrNull`，#316）→ `floor(ctx/4)` 钳制（`resolveModelMetadata`）→ 上游闸抛则**整对不传** | 本项目 |
 | erix-agent 算压缩预算用 | `runToolLoop({modelMetadata:{contextWindowTokens, maxOutputTokens}})` | 上游 |
 | erix-agent 发给模型用 | `runToolLoop({maxTokens})` → 请求体 `max_tokens` | 上游 |
 
@@ -1804,7 +1828,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `runs[].lease` | `renewed`（claim_token 匹配，已续租 `lease_until = now + 90s` ⚠️）或 `lease_lost`（claim_token 不匹配——该 run 已被 re-claim / 租约易主） |
 | `runs[].lease_until` | 仅 `lease: renewed` 时返回（续租后的到期时刻） |
 | `runs[].reason` | 仅 `lease: lease_lost` 时返回：`reclaimed`（已 re-claim）/ `released`（已被 U12 释放）/ `terminal`（已终态） |
-| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」。#309 的下行形状：`{ main: { model, type, context_window?, max_output_tokens? }, embedding?, vision? }` —— `main` 可额外带 `context_window` 与 `max_output_tokens`（与门户模型列表**同一个 `toModel()` 生效值**，且**按对账后的新名**取同一个 deployment；回退口径与别名对照表见 §4.9），**只在非 null 时带键**（没值就整个键不出现，不是 `key: null`）。⚠ **切片 1.5 的行为变化（有意）**：`max_output_tokens` 现在是**生效值**（没手填过则是 `floor(context_window/4)`，§4.9 的四级回退链、同一份算法）⇒ **配了 `context_window` 但从未手填过预算的存量部署现在开始带这两个键**（不再与 #309 之前逐字节相同）——这正是本切片的卖点：缺元数据不再等于关压缩。「两键都不出现」现在只剩**连 `context_window` 都没配**（以及拿不到目录）那几种；而**不注入 gateway 的老调用形状仍逐字节不变**（兼容面，测试钉着）。名字就 `max_output_tokens` 一个拼写（与门户 DTO 同名同值，别名对照表见 §4.9）。embedding/vision 不带元数据。元数据**复用对账那一次 `GET /model/info`**（不新增网关调用），网关抖动/未注入 client 时退回无元数据且不抛错；runner 接线是 #309 切片 2 |
+| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」。#309 的下行形状：`{ main: { model, type, context_window?, max_output_tokens? }, embedding?, vision? }` —— `main` 可额外带 `context_window` 与 `max_output_tokens`（与门户模型列表**同一个 `toModel()` 生效值**，且**按对账后的新名**取同一个 deployment；回退口径与别名对照表见 §4.9），**只在非 null 时带键**（没值就整个键不出现，不是 `key: null`）。⚠ **#316：两个键的值是**归一后的正整数**（门户侧与 runner 同一条 `positiveIntOrNull()` 判据）：存成数字串的窗口（`"262144"`）会**以 number** 下行；真小数（`262144.5`）/ `≤0` / 非数字算「不可得」⇒ 那个键**不出现**（而不是把一个 runner 一定会丢掉的值发下去）。⚠ **切片 1.5 的行为变化（有意）**：`max_output_tokens` 现在是**生效值**（没手填过则是 `floor(context_window/4)`，§4.9 的四级回退链、同一份算法）⇒ **配了 `context_window` 但从未手填过预算的存量部署现在开始带这两个键**（不再与 #309 之前逐字节相同）——这正是本切片的卖点：缺元数据不再等于关压缩。「两键都不出现」现在只剩**连 `context_window` 都没配**（以及拿不到目录）那几种；而**不注入 gateway 的老调用形状仍逐字节不变**（兼容面，测试钉着）。名字就 `max_output_tokens` 一个拼写（与门户 DTO 同名同值，别名对照表见 §4.9）。embedding/vision 不带元数据。元数据**复用对账那一次 `GET /model/info`**（不新增网关调用），网关抖动/未注入 client 时退回无元数据且不抛错；runner 接线是 #309 切片 2 |
 
 语义（与 runner §4.2 U4 一致）：
 

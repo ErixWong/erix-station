@@ -19,9 +19,44 @@
 // 时**必须**用引擎那对 camelCase 键名——那是上游的入参名，不是我们的第四种形态（防漂移用例只扫
 // worker.js 的**构造点**，probe 调用点是入参不是构造点，工单 §2.3 明确允许）。
 
-/** 正整数（且是安全整数）——两个元数据键唯一的合法形态：0/负数/小数/字符串/布尔/NaN 一律不认。 */
+/** 正整数（且是安全整数）——`resolveModelMetadata` 的钳制判据（**本模块内部的第二道闸**，见下面归一函数的注释）。 */
 function isPositiveInt(value) {
   return Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * issue #316：**token 数（`context_window` / `max_output_tokens`）的入口归一 —— 一条规则，两侧各执行一次**。
+ *
+ * 规则（决策者定稿，与 `portal/src/llm.js` 的 `positiveIntOrNull()` 是**同一条**，镜像测试在对面：
+ * `runner/test/llm-models.test.js` ↔ `portal/test/llm.test.js`）：
+ *   1. **正整数**（且是安全整数）→ 原样返回；
+ *   2. **数字串**（`"262144"` / 带空白的 `" 262144 "`）与**整值浮点**（`262144.0`、字符串 `"262144.0"`）
+ *      → **归一成正整数**（返回 number，不是原字符串）；
+ *   3. **真小数**（`262144.5`）、`≤ 0`、`NaN`、`Infinity`、非数字串、布尔、对象 → **返回 `null` = 不可得**。
+ *      ⚠ 判不可得**不是**取整、**不是**兜底成 0。
+ *
+ * 为什么第 2 条要容忍（#316 的病症本体）：门户读侧一直容忍数字串（`llm.js` 里那条同源的窗口判据，
+ * 注释原话「兼容历史上存成数字串的值」⇒ 存量真的存在）。于是「门户列表显示着 262144、runner 解析层
+ * 整键丢掉 ⇒ `resolveModelMetadata` 返回 null ⇒ **压缩静默关闭**」——同一个数在两侧有两种结论。
+ * 让 runner **认下来**比让门户退回「没配」好：前者是「显示有数、压缩真开」，后者是「显示没数、压缩关」。
+ *
+ * 为什么第 3 条不许 floor：`262144.5` 是配错，floor 是在替管理员编一个他没填的数。两侧都判不可得
+ * ⇒ 门户显示 null、心跳不带键、压缩关，**三处一致**，可解释。
+ *
+ * ⚠ 返回值一定是 `number`（或 `null`），**绝不把原字符串往下传**：下游 `resolveModelMetadata` 的
+ * `Math.floor(ctx / 4)` 与引擎的 `computeBudget({contextWindowTokens, maxOutputTokens})` 都按数字算，
+ * 喂字符串就是另一套「两侧各自解释」的坑（`"262144" / 4` 侥幸能算，`"262144" > floor(...)` 这类比较就先错了）。
+ * 归一只做在**入口**（`parseHeartbeatModels`）：`resolveModelMetadata` 继续用严格的 `isPositiveInt`，
+ * 万一有人绕过入口塞了怪值，那道钳制支路的行为与 #309 切片 2 逐字节相同。
+ */
+function positiveIntOrNull(value) {
+  let raw = value;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === '') return null;
+    raw = Number(trimmed);
+  }
+  return isPositiveInt(raw) ? raw : null;
 }
 
 /**
@@ -29,11 +64,11 @@ function isPositiveInt(value) {
  * 只认三个已知槽位且 model 必须是非空字符串；type 以 portal 下行值为准（portal 侧已按槽位校验）。
  *
  * issue #309 切片 2：main（以及 embedding/vision，同一套规则）额外**透传** `context_window` /
- * `max_output_tokens` 两个键——**只收正整数**，其它形态（缺失 / `0` / 负数 / 小数 / `"1e3"` 这类
- * 字符串 / `true` / `NaN`）一律**丢掉该键**（`main.model` 照样解析成功，模型名语义与本单无关）。
- * 丢键而非置 `undefined` 是刻意的：无这两键时返回值与改动前**逐字节相同**（向后兼容面，
- * 见 runner/test/llm-models.test.js 的 deepStrictEqual 用例）。
- * 本函数只管「收到没有」，**合法性钳制不在这里**（那是 resolveModelMetadata 的活）。
+ * `max_output_tokens` 两个键。**issue #316 起这两个键走 `positiveIntOrNull()` 归一**：数字串与整值浮点
+ * 归一成正整数后**以 number 落盘**；真小数 / `0` / 负数 / 非数字串 / `true` / `NaN` 一律**丢掉该键**
+ * （`main.model` 照样解析成功，模型名语义与本单无关）。丢键而非置 `undefined` 是刻意的：无这两键时
+ * 返回值与改动前**逐字节相同**（向后兼容面，见 runner/test/llm-models.test.js 的 deepStrictEqual 用例）。
+ * 本函数只管「收到没有 + 形态归一」，**合法性钳制不在这里**（那是 resolveModelMetadata 的活）。
  */
 export function parseHeartbeatModels(data) {
   const m = data?.models;
@@ -43,10 +78,13 @@ export function parseHeartbeatModels(data) {
     const s = m[slot];
     if (s && typeof s === 'object' && typeof s.model === 'string' && s.model.length > 0) {
       out[slot] = { model: s.model, type: typeof s.type === 'string' ? s.type : slot === 'main' ? 'text' : slot };
-      // issue #309 切片 2：只正整数才收，非法形态整键不写（不是写 undefined——那会让
-      // 「无元数据的下行」在结构与日志面上都跟现状不一样）。
-      if (isPositiveInt(s.context_window)) out[slot].context_window = s.context_window;
-      if (isPositiveInt(s.max_output_tokens)) out[slot].max_output_tokens = s.max_output_tokens;
+      // issue #309 切片 2 + #316：过 `positiveIntOrNull()` 归一，**落盘的是归一后的 number**。
+      // 不可得（含真小数/≤0/非数字串）⇒ 整键不写（不是写 undefined——那会让「无元数据的下行」
+      // 在结构与日志面上都跟现状不一样）。
+      const contextWindow = positiveIntOrNull(s.context_window);
+      if (contextWindow !== null) out[slot].context_window = contextWindow;
+      const maxOutputTokens = positiveIntOrNull(s.max_output_tokens);
+      if (maxOutputTokens !== null) out[slot].max_output_tokens = maxOutputTokens;
     }
   }
   // main 是必备位：portal 有 active binding 时必带；缺 main 视为不完整下行，整体不采用。
