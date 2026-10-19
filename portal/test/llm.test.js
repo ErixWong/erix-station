@@ -140,6 +140,9 @@ class LlmFakePool {
           tool_calling: m.tool_calling,
           context_window: m.context_window,
           display_name: m.name,
+          // #309：`max_output_tokens` 是 LiteLLM `model_info` 自带的真字段。**只在非 null 时发**，
+          // 才能模出「存量模型只有 litellm_params.max_tokens」的形状（读侧回退用例靠它）。
+          ...(m.max_output_tokens == null ? {} : { max_output_tokens: m.max_output_tokens }),
           // LiteLLM mirrors litellm_params pricing onto model_info and lists explicitly
           // overridden fields in pricing_overrides. cost_map_* stands in for rates LiteLLM
           // resolves from its built-in cost map for a known model name.
@@ -169,6 +172,7 @@ class LlmFakePool {
       tool_calling: body.model_info?.tool_calling ?? body.model_info?.metadata?.tool_calling ?? false,
       context_window: body.model_info?.context_window ?? body.model_info?.metadata?.context_window ?? null,
       max_tokens: body.litellm_params?.max_tokens ?? null,
+      max_output_tokens: body.model_info?.max_output_tokens ?? null,
       input_cost_per_token: body.litellm_params?.input_cost_per_token ?? null,
       output_cost_per_token: body.litellm_params?.output_cost_per_token ?? null,
       upstream_model: body.litellm_params?.model,
@@ -189,6 +193,8 @@ class LlmFakePool {
     if (info.mode !== undefined) m.mode = info.mode;
     if (info.tool_calling !== undefined) m.tool_calling = info.tool_calling;
     if (info.context_window !== undefined) m.context_window = info.context_window;
+    // 真网关的 NULL_CLEARABLE 语义：显式 null = 从 model_info 移除（= 清空），缺省 = 不动。
+    if ('max_output_tokens' in info) m.max_output_tokens = info.max_output_tokens ?? null;
     if (body.litellm_params !== undefined) {
       m.upstream_model = body.litellm_params.model;
       m.provider_id = body.litellm_params.litellm_credential_name;
@@ -797,6 +803,211 @@ test('model list：toModel exposes max_tokens and defaults missing values to nul
   const { items } = await listModels(pool);
   assert.equal(items[0].max_tokens, 8192);
   assert.equal(items[1].max_tokens, null);
+});
+
+// --- issue #309 切片 1：`max_output_tokens`（1/4 硬上限 + 绑死双写 + 读侧回退） ----------------
+// 背景：引擎侧算预算用这个值（`budgetTokens = ctx − maxOutput − max(2000, ⌈10%·ctx⌉)`），
+// 填得不合公式会让**每个 run 第 1 轮之前就死**：`computeBudget` 抱 `invalid_budget`（实测文案
+// "Computed context budget must be positive (got -71)"，`erix-agent/src/compact/budget.js:23-25`，
+// 调用点 `orchestrator.js:1141-1148` 无 try/catch）。
+// 门户必须写之前就拦：上限 = floor(context_window / 4)（比引擎临界更严，双保险）。
+
+/** 超限拒的公共断言：零新错误码（§8.20）⇒ 一律 validation_failed，细分看 details。 */
+function assertOverLimit(error, expected) {
+  assert.equal(error.code, 'validation_failed');
+  assert.deepEqual(error.details, expected);
+  return true;
+}
+
+test('#309 max_output_tokens：硬上限就是 floor(context_window/4) —— 边界值放行、+1 被拒', async () => {
+  const cases = [
+    { context_window: 8000, allowed: 2000 },
+    { context_window: 200000, allowed: 50000 },
+    { context_window: 999, allowed: 249 }, // 钉住 Math.floor：不是四舍五入、不是浮点 /4
+  ];
+  for (const { context_window, allowed } of cases) {
+    const pool = new LlmFakePool();
+    await createModel(pool, {
+      provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', type: 'text',
+      context_window, max_output_tokens: allowed,
+    });
+    const body = pool.gatewayCalls.find((entry) => entry.method === 'createModel').body;
+    assert.equal(body.model_info.max_output_tokens, allowed, `ctx=${context_window}：上限 ${allowed} 必须放行`);
+    assert.equal(body.litellm_params.max_tokens, allowed);
+
+    const rejected = new LlmFakePool();
+    const error = await createModel(rejected, {
+      provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', type: 'text',
+      context_window, max_output_tokens: allowed + 1,
+    }).then(() => null, (caught) => caught);
+    assert.ok(error, `ctx=${context_window}：${allowed + 1} 必须被拒`);
+    assertOverLimit(error, { field: 'max_output_tokens', max_allowed: allowed, context_window });
+    // message 要能当人读：点名「上限 = context_window 的 1/4」与两个数字（前端不做本地校验，
+    // 直接透传 error.message ⇒ 这句话就是用户看到的全部）。
+    assert.match(error.message, /1\/4/);
+    assert.match(error.message, new RegExp(String(allowed)));
+    assert.match(error.message, new RegExp(String(allowed + 1)));
+    assert.equal(rejected.gatewayCalls.some((entry) => entry.method === 'createModel'), false,
+      '被校验拦下时不得打到网关');
+  }
+});
+
+test('#309 max_output_tokens：非正整数一律拒（details 只点名字段）', async () => {
+  for (const value of [0, -1, 1.5, '2000', true, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const pool = new LlmFakePool();
+    await assert.rejects(
+      () => createModel(pool, {
+        provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 8000, max_output_tokens: value,
+      }),
+      (error) => assertOverLimit(error, { field: 'max_output_tokens' }),
+      `max_output_tokens=${String(value)} 必须被拒`,
+    );
+    assert.equal(pool.gatewayCalls.length, 0);
+  }
+});
+
+test('#309 max_output_tokens：没有 context_window 就判不了 1/4 ⇒ 拒（context_window_missing），不写半套', async () => {
+  const missing = { field: 'max_output_tokens', reason: 'context_window_missing' };
+
+  const created = new LlmFakePool();
+  await assert.rejects(
+    () => createModel(created, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', max_output_tokens: 2000 }),
+    (error) => assertOverLimit(error, missing),
+  );
+  assert.equal(created.gatewayCalls.some((entry) => entry.method === 'createModel'), false,
+    '新建被拒时不得打到网关');
+
+  // 存量模型真的没窗口（model_info.context_window 为 null）同样拒；且**不产生任何网关写**。
+  const pool = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: null }],
+  });
+  await assert.rejects(() => updateModel(pool, 'm1', { max_output_tokens: 2000 }),
+    (error) => assertOverLimit(error, missing));
+  assert.equal(pool.gatewayCalls.some((entry) => entry.method === 'updateModel'), false,
+    '缺窗口时不得只把 max_tokens 写进数据面（那正是「半套」）');
+
+  // 同一条 PATCH 里补上窗口则可放行（新值优先，不拿旧值判）。
+  const both = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: null }],
+  });
+  await updateModel(both, 'm1', { context_window: 8000, max_output_tokens: 2000 });
+  assert.equal(both.gatewayCalls.find((entry) => entry.method === 'updateModel').body.model_info.max_output_tokens, 2000);
+});
+
+test('#309 max_output_tokens：1/4 用「有效窗口」——本次提交的新值优先，否则退到现存值', async () => {
+  // 存量窗口 8000（上限 2000）：同一条 PATCH 把窗口抬到 200000 并配 50000 ⇒ 必须放行。
+  const grow = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: 8000 }],
+  });
+  await updateModel(grow, 'm1', { context_window: 200000, max_output_tokens: 50000 });
+  const body = grow.gatewayCalls.find((entry) => entry.method === 'updateModel').body;
+  assert.equal(body.model_info.context_window, 200000);
+  assert.equal(body.model_info.max_output_tokens, 50000);
+  assert.equal(body.litellm_params.max_tokens, 50000);
+
+  // 反向：存量 200000，同一条 PATCH 把窗口压到 8000 却仍带 50000 ⇒ 按**新**窗口拒。
+  const shrink = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: 200000 }],
+  });
+  await assert.rejects(() => updateModel(shrink, 'm1', { context_window: 8000, max_output_tokens: 50000 }),
+    (error) => assertOverLimit(error, { field: 'max_output_tokens', max_allowed: 2000, context_window: 8000 }));
+  assert.equal(shrink.gatewayCalls.some((entry) => entry.method === 'updateModel'), false);
+
+  // 不提交窗口 ⇒ 退到该模型现存的 model_info.context_window。
+  const stored = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: 8000 }],
+  });
+  await assert.rejects(() => updateModel(stored, 'm1', { max_output_tokens: 2001 }),
+    (error) => assertOverLimit(error, { field: 'max_output_tokens', max_allowed: 2000, context_window: 8000 }));
+});
+
+test('#309 回归锚：不传 / 传 null ⇒ 写入体与改前一致（model_info 无该键、litellm_params 无 max_tokens）', async () => {
+  for (const value of [undefined, null]) {
+    const pool = new LlmFakePool();
+    await createModel(pool, {
+      provider_id: 'p1', model_id: 'gpt-4o', model: 'openai/gpt-4o', type: 'text', context_window: 128000,
+      ...(value === undefined ? {} : { max_output_tokens: null }),
+    });
+    const body = pool.gatewayCalls.find((entry) => entry.method === 'createModel').body;
+    assert.equal(Object.hasOwn(body.model_info, 'max_output_tokens'), false,
+      `max_output_tokens=${String(value)} 时 model_info 不得多出该键`);
+    assert.equal(Object.hasOwn(body.litellm_params, 'max_tokens'), false,
+      `max_output_tokens=${String(value)} 时 litellm_params 不得多出 max_tokens`);
+  }
+
+  // PATCH 只改展示名：既不带 max_output_tokens 也不带 max_tokens，也不得多出空 litellm_params。
+  const pool = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: 128000 }],
+  });
+  await updateModel(pool, 'm1', { name: '只改展示名' });
+  const body = pool.gatewayCalls.find((entry) => entry.method === 'updateModel').body;
+  assert.equal(Object.hasOwn(body.model_info, 'max_output_tokens'), false);
+  assert.equal(body.litellm_params, undefined, '没碰数据面参数就别带 litellm_params');
+});
+
+test('#309 双写：新建传了 ⇒ 两处同值；PATCH 改 ⇒ 两处一起改；传 null ⇒ 两处一起消失', async () => {
+  const created = new LlmFakePool();
+  await createModel(created, {
+    provider_id: 'p1', model_id: 'gpt-4o', model: 'openai/gpt-4o', type: 'text',
+    context_window: 128000, max_output_tokens: 16384,
+  });
+  const createBody = created.gatewayCalls.find((entry) => entry.method === 'createModel').body;
+  assert.equal(createBody.model_info.max_output_tokens, 16384, '权威位：model_info.max_output_tokens');
+  assert.equal(createBody.litellm_params.max_tokens, 16384,
+    '绑死同值：引擎真正送到 provider 的是 litellm_params.max_tokens，只写 model_info 就是第二套真相源');
+  const createdItem = (await listModels(created)).items[0];
+  assert.equal(createdItem.max_output_tokens, 16384);
+  assert.equal(createdItem.max_tokens, 16384);
+
+  // PATCH 改值：两处一起改。（128000 / 4 = 32000 ⇒ 24576 是合法值，别拿一个越界的数当「改值」。）
+  await updateModel(created, 'm1', { max_output_tokens: 24576 });
+  const patchBody = created.gatewayCalls.filter((entry) => entry.method === 'updateModel').at(-1).body;
+  assert.equal(patchBody.model_info.max_output_tokens, 24576);
+  assert.equal(patchBody.litellm_params.max_tokens, 24576, '同一次 PATCH 里数据面必须跟到新值');
+  const patched = (await listModels(created)).items[0];
+  assert.equal(patched.max_output_tokens, 24576);
+  assert.equal(patched.max_tokens, 24576);
+
+  // 传 null：两处一起消失（不留「model_info 没了、max_tokens 还挂着旧值」的半套）。
+  await updateModel(created, 'm1', { max_output_tokens: null });
+  const clearBody = created.gatewayCalls.filter((entry) => entry.method === 'updateModel').at(-1).body;
+  assert.equal(clearBody.model_info.max_output_tokens, null, '显式 null 才是清空语义（缺省是「不动」）');
+  assert.equal(Object.hasOwn(clearBody.litellm_params, 'max_tokens'), false, '数据面一侧直接不带该键');
+  const cleared = (await listModels(created)).items[0];
+  assert.equal(cleared.max_output_tokens, null);
+  assert.equal(cleared.max_tokens, null, '两处真的都消失了，而不是只清了权威位');
+});
+
+test('#309 双写优先级：同一次请求同时传 legacy max_tokens 与 max_output_tokens ⇒ 以绑定字段为准', async () => {
+  const pool = new LlmFakePool();
+  await createModel(pool, {
+    provider_id: 'p1', model_id: 'gpt-4o', model: 'openai/gpt-4o', type: 'text',
+    context_window: 128000, max_tokens: 1024, max_output_tokens: 8192,
+  });
+  const body = pool.gatewayCalls.find((entry) => entry.method === 'createModel').body;
+  assert.equal(body.litellm_params.max_tokens, 8192, '绑死字段后写 ⇒ 数据面不会出现「两个入口各执一词」的中间态');
+  assert.equal(body.model_info.max_output_tokens, 8192);
+});
+
+test('#309 回退与 legacy：model_info 优先、没有则退 litellm_params.max_tokens、都没有则 null', async () => {
+  const pool = new LlmFakePool({
+    models: [
+      // 两处都有且不同值 ⇒ 读 model_info（权威位）
+      { id: 'm-auth', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 128000, max_output_tokens: 3000, max_tokens: 1000 },
+      // 只有 litellm_params.max_tokens 的存量模型（写入侧上线前配好的）
+      { id: 'm-legacy', provider_id: 'p1', model_id: 'b', type: 'text', context_window: 128000, max_tokens: 4096 },
+      // 什么都没有
+      { id: 'm-none', provider_id: 'p1', model_id: 'c', type: 'text' },
+    ],
+  });
+  const byId = Object.fromEntries((await listModels(pool)).items.map((m) => [m.id, m]));
+  assert.equal(byId['m-auth'].max_output_tokens, 3000, 'model_info.max_output_tokens 是权威位');
+  assert.equal(byId['m-legacy'].max_output_tokens, 4096, '存量模型只有 litellm_params.max_tokens ⇒ 回退必须取到（否则显示成「没配」）');
+  assert.equal(byId['m-none'].max_output_tokens, null);
+  // legacy `max_tokens` 自己的读侧一字未改（兼容面）
+  assert.equal(byId['m-auth'].max_tokens, 1000);
+  assert.equal(byId['m-legacy'].max_tokens, 4096);
+  assert.equal(byId['m-none'].max_tokens, null);
 });
 
 // --- issue #164：自定义模型定价（虚拟 key spend 恒 0） -------------------------------
