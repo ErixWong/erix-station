@@ -572,7 +572,7 @@ describe('AdminView · LLM 管理', () => {
     wrapper.unmount();
   });
 
-  it('#309 编辑表单回填现值、PATCH 只带改过的值；服务端超限文案原样显示在页面上', async () => {
+  it('#309 编辑表单回填现值（含 ?? 回退）：PATCH 带 model_info 全量字段，服务端超限文案原样显示在页面上', async () => {
     const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
       if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_BUDGET);
       if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') {
@@ -592,8 +592,9 @@ describe('AdminView · LLM 管理', () => {
 
     const patch = JSON.parse(String(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0]?.[1]?.body));
     expect(patch.max_output_tokens).toBe(60000);
-    // 没改 legacy `max_tokens` ⇒ 不替它发一个值（双写是**后端**的事，前端不代劳）。
-    expect(patch).not.toHaveProperty('max_tokens');
+    // 没改 legacy `max_tokens` ⇒ 回填的**现值**原样发回（16384），前端不替它双写成 60000
+    // —— 双写是**后端**的事（B-7），前端只负责不代劳（变异靶子：前端代劳双写会藏住后端漏写）。
+    expect(patch.max_tokens).toBe(16384);
     // 服务端 message 透传（stores/admin.ts 的口径：只拼「错误：」前缀，正文不译）。
     // 取整页文本而不是第一个 [role=alert]：页面与弹层各有一个 alert，错一个就假红。
     expect(wrapper.text()).toContain(CAP_MESSAGE);
