@@ -166,6 +166,48 @@ function modelPricing(model) {
   };
 }
 
+/**
+ * #309 切片 1.5（决策者定稿）：`max_output_tokens` 的**回退值** = `floor(context_window / 4)`。
+ *
+ * 为什么要回退（issue #309 的根因）：erix-agent 0.20.0 要 `contextWindowTokens` **和**
+ * `maxOutputTokens` 同时到位才推得出 `budgetTokens`（压缩总开关），缺任一 ⇒ 压缩与单轮聚合输出
+ * 预算一起关闭 ⇒ 长会话无压缩一路涨到 `ContextWindowExceededError`，run `failed`。而「从来没在
+ * 门户手填过这个数」才是存量模型的常态，所以**缺元数据不再等于关压缩**：门户总会算出一个生效值
+ * 并下发，引擎的压缩开关因此默认是开的。唯一还关着的情形是「连 `context_window` 都没配」（算不
+ * 出 1/4，只能交回 `null`）——那时上游的 `model_metadata_missing` 诊断事件照发，就是它的告警。
+ *
+ * 1/4 这个数不是随手取的：**它恰好等于门户手填时的硬上限**（`validateMaxOutputTokens()` 里同为
+ * `floor(window / 4)`）⇒ 平台自己永远不会造出一个被自己校验拒掉的值，回退算出来的数再提交回去也
+ * 合法（同一条 `positiveNumberOrNull()` 判据、同一个 `Math.floor`）——「1/4 既是上限又是回退」的
+ * 一致性依据就是这条，两处若要改数必须一起改。
+ *
+ * 决策者明确否决了「区分配置值 vs 假定值」的字段拆分（原话：这有什么关系呢，不管怎么来的，有个
+ * 数字就行）⇒ **不加** `effective_max_output_tokens` / `max_output_tokens_source` 之类的字段，
+ * 门户 DTO、表单、心跳下行始终只有 `max_output_tokens` 这一列数字。
+ */
+function maxOutputTokensFallback(contextWindow) {
+  // 窗口判据复用现成的 positiveNumberOrNull()（函数声明提升 ⇒ 可前向引用），不另写一份：
+  // 0 / 负数 / 非数字串一律算「窗口不可得」⇒ 交回 null，绝不硬算出 0 或 NaN 下发；
+  // 历史上存成数字串的窗口（"128000"）与手填校验同一口径，照样能算。
+  const window = positiveNumberOrNull(contextWindow);
+  return window === null ? null : Math.floor(window / 4);
+}
+
+/**
+ * 读侧**生效值**：四级回退链（切片 1.5 定稿的最终形态）
+ *   1. `model_info.max_output_tokens`            —— 上游 LiteLLM 配了什么就是什么（权威位）
+ *   2. `litellm_params.max_tokens`               —— 同上（今天真正被网关注进请求体的那个）
+ *   3. `floor(正数 context_window / 4)`           —— 都没配 ⇒ 按窗口的 1/4 假定
+ *   4. `null`                                     —— 连 `context_window` 都没有 ⇒ 真的没有
+ *
+ * 回退到 `litellm_params.max_tokens`（第 2 级）是**刻意的**：写侧两者绑死同值，而存量模型只有
+ * 后者，不回退就会把已经配好的模型显示成「没配」⇒ 管理员重存一次反而把数据面值改掉。
+ * legacy `max_tokens` 字段自身的语义**一字未改**：这里只读它，不写它。
+ */
+function effectiveMaxOutputTokens({ info, params, contextWindow }) {
+  return info.max_output_tokens ?? params.max_tokens ?? maxOutputTokensFallback(contextWindow) ?? null;
+}
+
 function toModel(model) {
   const id = modelId(model);
   const modelName = model?.model_name ?? '';
@@ -173,6 +215,9 @@ function toModel(model) {
   const info = model?.model_info ?? {};
   const metadata = info.metadata ?? {};
   const type = modelType(model);
+  // 口径沿用切片 1 那一行（`model_info.context_window` 优先，历史值可能落在 `metadata.context_window`）
+  // ⇒ 回退值与门户显示的窗口**必然同源**，不会出现「显示 200000 却按别的数算预算」。
+  const contextWindow = info.context_window ?? metadata.context_window ?? null;
   return {
     id,
     provider_id: modelCredentialName(model),
@@ -181,12 +226,13 @@ function toModel(model) {
     name: info.display_name ?? metadata.display_name ?? modelName,
     type,
     tool_calling: modelToolCalling(model),
-    context_window: info.context_window ?? metadata.context_window ?? null,
+    context_window: contextWindow,
     max_tokens: params.max_tokens ?? null,
-    // issue #309 切片 1：模型「单次响应输出预算上限」的权威位是 `model_info.max_output_tokens`。
-    // 回退到 `litellm_params.max_tokens` 是**刻意的**：写侧两者绑死同值，而存量模型只有后者，
-    // 不回退就会把已经配好的模型显示成「没配」⇒ 管理员重存一次反而把数据面值改掉。
-    max_output_tokens: info.max_output_tokens ?? params.max_tokens ?? null,
+    // issue #309 切片 1：模型「单次响应输出预算上限」的权威位是 `model_info.max_output_tokens`；
+    // 切片 1.5 补上后两级回退（`floor(正数 ctx/4)` → `null`）⇒ 存量未配的模型也拿得到一个数。
+    // 值与心跳下行是**同一个 toModel() 生效值**（`indexGatewayModels()` 直接吃 toModel 的产物），
+    // 别在别处再算一次除法。
+    max_output_tokens: effectiveMaxOutputTokens({ info, params, contextWindow }),
     enabled: !isModelBlocked(model),
     ...modelPricing(model),
     litellm_params: redactCredential(params),
@@ -429,6 +475,11 @@ function validateMaxOutputTokens(value, contextWindow) {
  *
  * 写入顺序上的约定：本函数**必须在 legacy `max_tokens` 处理之后调用**，同一次请求里两个字段
  * 都传时以绑定字段为准（不留半套）。`isCreate`：新建无旧值可清，`null` 就是不写该键。
+ *
+ * 为什么今天还要留着 `litellm_params.max_tokens`（切片 1.5 补的口径）：自 #309 切片 2 起 runner
+ * 会在请求体里**显式**发 `max_tokens`，所以网关这份 `litellm_params.max_tokens` 已经**不再是引擎
+ * 取值的来源**，它退化为「非平台调用方」的兜底 —— FDE 自己 curl 这个 endpoint、或在网关 UI 里
+ * 试跑，都不会带 `max_tokens`，靠的就是它。**保留它的理由是这个，不是「引擎读它」**。
  */
 function applyMaxOutputTokensWrite(params, modelInfo, value, { isCreate }) {
   if (value === undefined) return;
@@ -857,8 +908,12 @@ async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, 
 /**
  * #309 切片 1：心跳下行的模型元数据（决策者定稿）。
  *
- * **只在非 null 时带键**：没有值就整个键都不出现，而不是写 `key: null`——没配过元数据的存量
- * 部署，下行字节与 #309 之前逐字节相同（runner 切片 2 用「键在不在」判有无，不解析 null）。
+ * **只在非 null 时带键**：没有值就整个键都不出现，而不是写 `key: null`（runner 切片 2 用「键在不
+ * 在」判有无，不解析 null）。切片 1.5 之后「没值」只剩一种：**连 `context_window` 都没配**——
+ * ⚠ 行为变化（有意）：`context_window` 配了但没手填过预算的存量部署，现在会**开始带**
+ * `context_window` + `max_output_tokens=ctx/4` 两个键，不再与 #309 之前逐字节相同；而**不传
+ * gateway 的老调用形状**一个字节都不变（兼容面，llm.test.js / llm-reconcile.test.js 钉着）。
+ * 值直接取 `toModel()` 的生效值 ⇒ **不在心跳里另算一次除法**，回退生效后这里自然带上。
  * 只给 `main`：embedding / vision 的上下文窗口不进 output 预算，切片 1 不下发。
  * 元数据缺席（网关抖动 / 未注入 client / 目录里找不到这个名字）都走同一条「不写键」路径。
  */
