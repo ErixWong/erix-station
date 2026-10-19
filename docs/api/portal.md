@@ -1299,14 +1299,18 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 
 **`max_output_tokens`：单次响应的输出预算上限（#309 切片 1）**
 
-背景（引擎侧公式已复核，细节见 issue #309）：runner 把 LiteLLM 的 `max_tokens` 当**预算**用，
-而预算模式要求它落在一个窗口里：`max_tokens ≤ ctx − max(2000, ⌈10%·ctx⌉) − 1`，且要求 `ctx ≥ 2000`
-且 `max_tokens > 0`。填了个「看着没事」的绝对值会让**每个 run 启动即死**（在
-`call_implementation` 建 `ChatOpenAI` 时就抱 `output_config.budget_tokens` 校验错），
-而错误现场不指向门户里那个输入框 ⇒ **门户必须写之前拦**。
+背景（**主 agent 已在 pin 的 erix-agent 0.20.0 上实跑复现**，不是推论）：引擎侧算预算的公式是
+`budgetTokens = contextWindow − maxOutputTokens − max(2000, ⌈10%·contextWindow⌉)`
+（`src/compact/budget.js:23-25`，调用点 `src/loop/orchestrator.js:1141-1148`，**那段没有 try/catch**）。
+所以这个数不是「填多少算多少」的旋钮：**一旦算出 `budgetTokens ≤ 0`，`runToolLoop` 在第 1 轮之前就抱
+`KitError code=invalid_budget`（`retryable=false`，实测文案 `Computed context budget must be positive
+(got -71)`）⇒ 每个 run 启动即死**，而错误现场只指向引擎，不指向门户里那个输入框
+⇒ **门户必须写之前拦**。（另一件容易搞错的事：填了个「合法但荒谬」的绝对值（例：`ctx=262144` 填
+`200000`）不会报错，但预算只剩 35929 ⇒ 几乎每轮都在压缩 —— 1/4 上限拦的就是这一类。）
 
 - **写侧绑死双写**：`model_info.max_output_tokens`（权威位，门户列表与心跳下行读它）与
-  `litellm_params.max_tokens`（引擎真正送到 provider 的那个）**同值**；传 `null` 两处一起清。
+  `litellm_params.max_tokens`（**调用方没发 `max_tokens` 时由 LiteLLM 注入给上游的那个值** ——
+  #309 事故里那个 131072 就是这么来的）**同值**；传 `null` 两处一起清。
   为什么必须双写——与上面 `call_name`/`name`「各写各的」**结论相反**：本字段是**数据面参数**
   而不是展示元数据，只写 `model_info` 就是「门户显示 2000、数据面仍是默认值」的第二套真相源
   （#296 拆的正是这类坑）；只写 `litellm_params` 则门户与心跳没有权威可读。

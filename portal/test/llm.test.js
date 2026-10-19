@@ -806,8 +806,10 @@ test('model list：toModel exposes max_tokens and defaults missing values to nul
 });
 
 // --- issue #309 切片 1：`max_output_tokens`（1/4 硬上限 + 绑死双写 + 读侧回退） ----------------
-// 背静：引擎侧把 `max_tokens` 当**单次响应输出预算上限**（预算模式），填得不合公式会让
-// **每个 run 启动即死**（`call_implementation` 建 ChatOpenAI 时就抱 output_config.budget_tokens）。
+// 背景：引擎侧算预算用这个值（`budgetTokens = ctx − maxOutput − max(2000, ⌈10%·ctx⌉)`），
+// 填得不合公式会让**每个 run 第 1 轮之前就死**：`computeBudget` 抱 `invalid_budget`（实测文案
+// "Computed context budget must be positive (got -71)"，`erix-agent/src/compact/budget.js:23-25`，
+// 调用点 `orchestrator.js:1141-1148` 无 try/catch）。
 // 门户必须写之前就拦：上限 = floor(context_window / 4)（比引擎临界更严，双保险）。
 
 /** 超限拒的公共断言：零新错误码（§8.20）⇒ 一律 validation_failed，细分看 details。 */

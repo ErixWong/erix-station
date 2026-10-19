@@ -384,9 +384,11 @@ function positiveNumberOrNull(value) {
  * 硬上限（决策者定稿）：**不得超过 `context_window` 的 1/4**。这条比引擎侧
  * `computeBudget()` 的临界值 `ctx - max(2000, ⌈10%·ctx⌉) - 1` **更严**（#309 定稿的理由：
  * 1/4 是管理员能心算的数，不要求他们先去翻一遍预算公式），引擎侧那条作为绝对兜底保留，
- * **双保险，谁都不许拆**。不拦的后果：超过临界的值会让**每个 run** 在 `call_implementation`
- * 建 `ChatOpenAI` 时抱 `output_config.budget_tokens` 校验错——run 启动即死，且错误现场
- * 不指向门户里那个字段。
+ * **双保险，谁都不许拆**。不拦的后果（主 agent 在 0.20.0 包上实跑复现，不是推论）：值一旦让
+ * `ctx - max(2000, ⌈10%·ctx⌉) - maxOutputTokens ≤ 0`，`runToolLoop` 会在**第 1 轮之前**就抱
+ * `KitError code=invalid_budget`（`retryable=false`，实测文案 `Computed context budget must be
+ * positive (got -71)`，`src/compact/budget.js:23-25`，调用点 `src/loop/orchestrator.js:1141-1148`
+ * **没有 try/catch**）⇒ **每个 run 启动即死**，且错误现场只指向引擎，不指向门户里那个输入框。
  *
  * 零新错误码（§8.20）：一律 `validation_failed`，细分靠 `details.field` / `details.reason`。
  */
@@ -419,7 +421,8 @@ function validateMaxOutputTokens(value, contextWindow) {
  * #309 定稿：`max_output_tokens` 与 `litellm_params.max_tokens` **绑死同值**（一处写、两处落）。
  *
  * 为什么必须双写——与 #296 的 `call_name`/`name`「各写各的」结论**相反**：本字段是**数据面参数**
- * 而不是展示元数据。引擎侧真正送到 provider 的是 `litellm_params.max_tokens`；只写
+ * 而不是展示元数据。`litellm_params.max_tokens` 是「调用方没发 `max_tokens` 时由 LiteLLM 注入给
+ * 上游的那个值」（#309 事故里那个 131072 就是这么来的）；只写
  * `model_info.max_output_tokens` 就是「门户显示 2000、数据面仍旧默认值」的第二套真相源
  * （#296 拆的正是这类坑）。反过来只写 `litellm_params.max_tokens` 则门户列表与心跳下行
  * 没有权威可读。所以：**设定同值双写、清空一起清**，不存在「只改了一处」的中间态。
