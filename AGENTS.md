@@ -807,6 +807,35 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 2. **`PATCH … : null` 在真 LiteLLM v1.103.2 上是 no-op**（手工与门户两条路各实测一次：200 但值一字未动）⇒ 门户文档那句「传 `null` 两处一起清」在真网关上**做不到**（单测钉的是**发给网关的请求形状**，fake 会清）⇒ 已登记 issue，改配路径要么用 LiteLLM 的正确清空语义，要么改成「设值不可清空」的口径。
 3. **探针方法坑（两次假故障都是它）**：undici `fetch` **忽略** `Host` 头覆盖（forbidden header）⇒ 容器里打 `127.0.0.1:8090` + `Host: station.fde.erix.vip` 会被边缘判成无路由 ⇒ **404 假故障**（`curl -H "Host: …"` 带不带 `:8090` 都正常）；另 #234 同源门要求 `Origin` 与请求 Host **逐字同源（含端口）**，`Host` 不带端口 + `Origin` 带 `:8090` 会 `403 cross_origin_forbidden`。
 
+**追加（#316 + #317，2026-10-19，分支 `fix-261019-06-316-317`；上面切片 1.5 / 2 里的三句旧表述以此为准）**：
+
+1. **token 数只有一条规则，两侧各自执行一次**：必须正整数；**数字串与整值浮点归一成正整数**（落盘的是
+   `number`，不是原字符串），**真小数 / `≤0` / `NaN` / `Infinity` / 非数字串判不可得**（不 floor、不兜 0）。
+   实现：`runner/lib/llm-models.js:positiveIntOrNull()`（**入口归一**，在 `parseHeartbeatModels` 里做；
+   `resolveModelMetadata` 的钳制与预算闸**一字未动**，继续用严格的 `isPositiveInt`）↔
+   `portal/src/llm.js:positiveIntOrNull()`（读侧生效值 + 心跳下行取值）。测试 = **两侧镜像的同一张
+   fixture 表**（`TOKEN_FIXTURES` 在 `runner/test/llm-models.test.js` 与 `portal/test/llm.test.js` 各一份，
+   心跳面在 `portal/test/llm-reconcile.test.js`），**改一侧必须改对面**。后果：切片 2 那句「只收正整数、
+   字符串一律丢键」收窄作废（数字串现在认）；切片 1.5 那句 `floor(正数 ctx/4)` 收紧成
+   `floor(正整数 ctx/4)`（真小数窗口不再能算出回退值 ⇒ 与 runner 对齐）。
+   #316 的病症本体（主 agent 在 `631bc46` 上探针复现）：`ctx:"262144"` ⇒ 门户显示着窗口而 runner 整键丢掉
+   ⇒ `resolveModelMetadata` 返回 `null` ⇒ **压缩静默关**。今天的贯通用例走**真 runToolLoop + 真
+   `computeBudget` 闸**，判据是请求体里有 `max_tokens` 且 `model_metadata_missing` 不再出现。
+   ⚠ **dev 现网不活**（网关 6 条 deployment 的 `context_window` 都是整数）⇒ 属历史存量 + 人工填带引号
+   值的隐患修复，不是交付阻塞（也不要因此觉得它无用）。
+2. **压缩仍关着的情形是三种**（不是「唯一一种连窗口都没配」）：① 没配窗口；② 窗口形态 runner 不认
+   （真小数 / `≤0` / 非数字）；③ 窗口小到 1/4 兜底仍算不出正预算（`ctx ≤ 2666`）。① ② 靠上游一次性
+   `model_metadata_missing`，③ 靠 runner 的 `model metadata unusable` warn。`portal.md` §4.9 已按三条改对，
+   别名对照表也从「五层」补成**六层**（补上 runner 那一层，与本节切片 1.5 那句「六层」对齐）。
+3. **runner 告警文案**：不可用支路的成因 a 从 `(not a positive integer)` 改成**同时点名「下行未带」与
+   「形态非法」并指向 `parseHeartbeatModels`**——入口归一后 worker 只能看见「键不在」，根分不出是
+   portal 没发还是发了个不合法的数，旧文案会把运维引向错路。
+4. #317 其余纠偏是**纯文字**（判据一条没改松）：§4.9 两处「传 `null` 两处一起清」改成「当前清不掉：真
+   LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（#314），设值仍有效」，并补上「编辑表单留空 = 省略
+   字段、新建才是显式 `null`」的不对称（⇒ 管理员看不到「清空失败」，只看到「数清不掉」）。
+
+基线与变异取证见 `~/worker-reports-261019/feat-261019-06-316-317.md`（台账三处数字归主 agent 合并时统一写）。
+
 **已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
 

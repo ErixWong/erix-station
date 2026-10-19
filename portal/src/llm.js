@@ -173,12 +173,15 @@ function modelPricing(model) {
  * `maxOutputTokens` 同时到位才推得出 `budgetTokens`（压缩总开关），缺任一 ⇒ 压缩与单轮聚合输出
  * 预算一起关闭 ⇒ 长会话无压缩一路涨到 `ContextWindowExceededError`，run `failed`。而「从来没在
  * 门户手填过这个数」才是存量模型的常态，所以**缺元数据不再等于关压缩**：门户总会算出一个生效值
- * 并下发，引擎的压缩开关因此默认是开的。唯一还关着的情形是「连 `context_window` 都没配」（算不
- * 出 1/4，只能交回 `null`）——那时上游的 `model_metadata_missing` 诊断事件照发，就是它的告警。
+ * 并下发，引擎的压缩开关因此默认是开的。⚠ **三种**还关着压缩的情形（#317：原文写的「唯一一种」不对）：
+ * ① 连 `context_window` 都没配；② 窗口形态 runner 不认（真小数 / `≤0` / 非数字 ⇒ `positiveIntOrNull()`
+ * 判不可得 ⇒ 回退也算不出，口径见 `runner/lib/llm-models.js`）；③ 窗口小到 1/4 兜底仍算不出正预算
+ * （`ctx ≤ 2666`，那道闸在 runner，见 `AGENTS.md` §8.31）。前两种上游的 `model_metadata_missing`
+ * 诊断事件照发，就是它的告警。
  *
  * 1/4 这个数不是随手取的：**它恰好等于门户手填时的硬上限**（`validateMaxOutputTokens()` 里同为
  * `floor(window / 4)`）⇒ 平台自己永远不会造出一个被自己校验拒掉的值，回退算出来的数再提交回去也
- * 合法（同一条 `positiveNumberOrNull()` 判据、同一个 `Math.floor`）——「1/4 既是上限又是回退」的
+ * 合法（同一条 `positiveIntOrNull()` 判据、同一个 `Math.floor`）——「1/4 既是上限又是回退」的
  * 一致性依据就是这条，两处若要改数必须一起改。
  *
  * 决策者明确否决了「区分配置值 vs 假定值」的字段拆分（原话：这有什么关系呢，不管怎么来的，有个
@@ -186,10 +189,10 @@ function modelPricing(model) {
  * 门户 DTO、表单、心跳下行始终只有 `max_output_tokens` 这一列数字。
  */
 function maxOutputTokensFallback(contextWindow) {
-  // 窗口判据复用现成的 positiveNumberOrNull()（函数声明提升 ⇒ 可前向引用），不另写一份：
-  // 0 / 负数 / 非数字串一律算「窗口不可得」⇒ 交回 null，绝不硬算出 0 或 NaN 下发；
-  // 历史上存成数字串的窗口（"128000"）与手填校验同一口径，照样能算。
-  const window = positiveNumberOrNull(contextWindow);
+  // 窗口判据复用现成的 positiveIntOrNull()（函数声明提升 ⇒ 可前向引用），不另写一份：
+  // 真小数 / 0 / 负数 / 非数字串一律算「窗口不可得」⇒ 交回 null，绝不硬算出 0 或 NaN 下发（#316：
+  // 这里算得出而 runner 不认 = 压缩静默关）；历史上存成数字串的窗口（"128000"）照样能算。
+  const window = positiveIntOrNull(contextWindow);
   return window === null ? null : Math.floor(window / 4);
 }
 
@@ -412,14 +415,31 @@ function validateMaxTokens(value) {
   }
 }
 
-/** 可用的正数 `context_window`（兼容历史上存成数字串的值）；拿不到就返回 null。 */
-function positiveNumberOrNull(value) {
-  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
-  if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+/**
+ * issue #316：**token 数的唯一形态判据 = 正整数**，与 `runner/lib/llm-models.js` 的 `positiveIntOrNull()`
+ * 是**同一条规则**（镜像测试在对面：`portal/test/llm.test.js` ↔ `runner/test/llm-models.test.js`）：
+ *   * **数字串**（`"262144"`、带空白的 `" 262144 "`、`"262144.0"`、`"1e3"`）与**整值浮点** → **归一成正整数**（返回 `number`）；
+ *   * **真小数**（`262144.5`）/ `≤ 0` / `NaN` / `Infinity` / 非数字串 / 布尔 / 对象 → `null` = **不可得**。
+ *     ⚠ 判不可得**不是**取整、**不是**兜底成 0：`262144.5` 是配错，floor 是在替管理员编一个他没填的数。
+ *
+ * 旧名字 `positiveNumberOrNull()` 写着「正数」、判据也确实只要求「正数」（注释原话「兼容历史上存成
+ * 数字串的值」），于是 `262144.5` 这类值能在门户算出一个回退值、而 runner 不认它 ⇒
+ * **门户显示着窗口、压缩静默关**（#316 的病症）。今天起「窗口可得」与「runner 能算出预算」是同一件事。
+ *
+ * 影响面（工单 feat-261019-06 定稿）：读侧的**生效值**（`effectiveMaxOutputTokens()` 的第三级回退）与
+ * **心跳下行的取值**（`attachHeartbeatModelMetadata()`）。写侧的 1/4 硬上限本身（`≤ floor(ctx/4)`、
+ * `model_info`/`litellm_params` 双写、`validation_failed`）**一字未动**，只是它读「窗口」用的就是这
+ * 唯一一条判据（不另写一份 ⇒「1/4 既是上限又是回退」的同源性仍成立；真小数窗口现在在写侧也算
+ * 「没窗口」⇒ `context_window_missing`，那是同一个口径的必然结果，不是放宽也不是收紧上限）。
+ */
+function positiveIntOrNull(value) {
+  let raw = value;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === '') return null;
+    raw = Number(trimmed);
   }
-  return null;
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : null;
 }
 
 /**
@@ -445,7 +465,7 @@ function validateMaxOutputTokens(value, contextWindow) {
       details: { field: 'max_output_tokens' },
     });
   }
-  const window = positiveNumberOrNull(contextWindow);
+  const window = positiveIntOrNull(contextWindow);
   if (window === null) {
     // 没窗口就判不了 1/4 ⇒ 不能只改一半：放行了就是一个「配了预算却没配窗口」的半套配置落库，
     // 而且这个值能否成立根本无法审计。
@@ -484,8 +504,12 @@ function validateMaxOutputTokens(value, contextWindow) {
 function applyMaxOutputTokensWrite(params, modelInfo, value, { isCreate }) {
   if (value === undefined) return;
   if (value === null) {
-    // 显式 null 是 LiteLLM 的清空而非缺省语义（NULL_CLEARABLE_LITELLM_PARAMS 会从
+    // 显式 null 是**门户发给网关的请求形状**里的清空语义（NULL_CLEARABLE_LITELLM_PARAMS 会从
     // litellm_params 与 model_info 两处移除）；params 侧用 delete，两边一起消失。
+    // ⚠ 但那是**单测里的 fake** 的行为：真 LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（手工与门户
+    // 两条路各实测一次：返 200 但值一字未动，issue #314）⇒ 真网关上今天**清不掉**，这个字段实际
+    // 是「只能设值」。本文件保留这条形状（钉的是我们发什么，不是网关做什么）；要改行为就改这里
+    // 并同步 portal.md §4.9（口径单一真相），别去把单测改松。
     if (isCreate) delete modelInfo.max_output_tokens;
     else modelInfo.max_output_tokens = null;
     delete params.max_tokens;
@@ -919,8 +943,12 @@ async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, 
  */
 function attachHeartbeatModelMetadata(target, model) {
   if (!model) return;
-  if (model.context_window != null) target.context_window = model.context_window;
-  if (model.max_output_tokens != null) target.max_output_tokens = model.max_output_tokens;
+  // #316：下行的是**归一后的正整数**（同一个 positiveIntOrNull）：真小数 / 非数字串算不出就不带键，
+  // 而不是把一个 runner 一定会丢掉的值发下去（那正是「门户显示着窗口、runner 丢键 ⇒ 压缩静默关」）。
+  const contextWindow = positiveIntOrNull(model.context_window);
+  const maxOutputTokens = positiveIntOrNull(model.max_output_tokens);
+  if (contextWindow !== null) target.context_window = contextWindow;
+  if (maxOutputTokens !== null) target.max_output_tokens = maxOutputTokens;
 }
 
 /** Model ids are LiteLLM model_info.id strings and need no join to a Station-owned catalog. */

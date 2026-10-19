@@ -331,10 +331,13 @@ async function startRun(msg) {
     });
   } else if (!engineModelMetadata && msg.models?.main) {
     // 同一个 LOG，但要把**两种成因**说清（共用一条 = 不新增事件类型，文案各自点名）：
-    //   a) context_window 本身不是正整数（纯函数规则 3）；
+    //   a) `context_window` **下行未带或形态非法**（#316：入口 `parseHeartbeatModels` 把真小数 / ≤0 /
+    //      非数字串这类值**整键丢掉** ⇒ 到这里只能看到「键不在」；数字串与整值浮点已在入口归一成正整数）；
     //   b) context_window 合法但很**小**，1/4 钳完预算仍非正——上游闸抛了（纯函数规则 4）。
     // 两种都落到「什么都不传」= 压缩关掉但 run 照活。⚠ 这里只区分成因、**不重算公式**（本站不许出现
     // floor(/4) 以外的钳制判据，引擎那两个常量一个也不抄）；候选值也不从返回值拿，直接报下行原值。
+    // ⚠ 成因 a 的文案必须同时点名「未带」与「形态非法」两种可能（#316 的运维教训：旧文案只报
+    // `context_window=undefined`，读起来像 portal 根本没发，而真因是形态被入口判不可得）。
     const ctxRaw = msg.models.main.context_window;
     const ctxShapeOk = Number.isSafeInteger(ctxRaw) && ctxRaw > 0; // 与规则 3 同一形状判据（非引擎公式）
     sendIpc(process, {
@@ -344,7 +347,8 @@ async function startRun(msg) {
           ? ` with max_output_tokens=${String(msg.models.main.max_output_tokens)}`
             + ' → computed context budget is not positive (engine computeBudget rejected this pair,'
             + ' even at the 1/4 cap)'
-          : ' (not a positive integer)')
+          : ' (not carried by the downlink, or dropped as an invalid shape by parseHeartbeatModels:'
+            + ' a token count must be a positive integer; see runner/lib/llm-models.js)')
         + ' → engine metadata and the explicit output cap are not sent;'
         + ' engine compaction stays off (= 现状)',
     });
