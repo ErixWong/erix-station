@@ -1294,9 +1294,44 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 | `type` | `'text'\|'embedding'\|'rerank'\|'vision'` | 非法值 ⇒ `400 validation_failed`（`details.field='type'`） |
 | `tool_calling` | boolean | 支持 function calling |
 | `context_window` / `max_tokens` | number | `context_window` ≤0 ⇒ `400`（`details.field='context_window'`） |
+| `max_output_tokens` | number \| null | **单次响应的输出预算上限**（#309 切片 1，下一段）。权威位 `model_info.max_output_tokens`，并**同值自动跟随**写 `litellm_params.max_tokens`；`null` = 两处一起清；硬上限 `≤ floor(context_window/4)` ⇒ 超限 `400 validation_failed` |
 | `input_cost_per_token` / `output_cost_per_token` | number \| null | 显式定价（§8.31）；管理台按 **USD/1M** 输入输出、原值回读 |
 
+**`max_output_tokens`：单次响应的输出预算上限（#309 切片 1）**
+
+背景（**主 agent 已在 pin 的 erix-agent 0.20.0 上实跑复现**，不是推论）：引擎侧算预算的公式是
+`budgetTokens = contextWindow − maxOutputTokens − max(2000, ⌈10%·contextWindow⌉)`
+（`src/compact/budget.js:23-25`，调用点 `src/loop/orchestrator.js:1141-1148`，**那段没有 try/catch**）。
+所以这个数不是「填多少算多少」的旋钮：**一旦算出 `budgetTokens ≤ 0`，`runToolLoop` 在第 1 轮之前就抱
+`KitError code=invalid_budget`（`retryable=false`，实测文案 `Computed context budget must be positive
+(got -71)`）⇒ 每个 run 启动即死**，而错误现场只指向引擎，不指向门户里那个输入框
+⇒ **门户必须写之前拦**。（另一件容易搞错的事：填了个「合法但荒谬」的绝对值（例：`ctx=262144` 填
+`200000`）不会报错，但预算只剩 35929 ⇒ 几乎每轮都在压缩 —— 1/4 上限拦的就是这一类。）
+
+- **写侧绑死双写**：`model_info.max_output_tokens`（权威位，门户列表与心跳下行读它）与
+  `litellm_params.max_tokens`（**调用方没发 `max_tokens` 时由 LiteLLM 注入给上游的那个值** ——
+  #309 事故里那个 131072 就是这么来的）**同值**；传 `null` 两处一起清。
+  为什么必须双写——与上面 `call_name`/`name`「各写各的」**结论相反**：本字段是**数据面参数**
+  而不是展示元数据，只写 `model_info` 就是「门户显示 2000、数据面仍是默认值」的第二套真相源
+  （#296 拆的正是这类坑）；只写 `litellm_params` 则门户与心跳没有权威可读。
+- **读侧**（`toModel`，`GET /api/admin/llm/models` 与 providers 内嵌的 models）：
+  `max_output_tokens = model_info.max_output_tokens ?? litellm_params.max_tokens ?? null`。
+  回退是**刻意的**：存量模型只有后者，不回退就会把已经配好的显示成「没配」。
+  legacy `max_tokens` 字段与其语义**一字未改**（兼容面）；同一次请求两者都传时以绑定字段为准。
+- **硬上限（决策者定稿，服务端是唯一判据）**：`max_output_tokens ≤ floor(context_window / 4)`。
+  有效窗口：本次提交的新值优先（同一条 PATCH 里两者都改时不能拿旧窗口判新预算），否则退到
+  该模型现存的 `model_info.context_window`。两种拒绝都是 `400 validation_failed`（**零新错误码**，§8.20）：
+  - 没窗口 ⇒ `details = {field: 'max_output_tokens', reason: 'context_window_missing'}`（不放行「只改一半」）；
+  - 超限 ⇒ `details = {field: 'max_output_tokens', max_allowed, context_window}`，`message` 点名「上限 = context_window 的 1/4」与两个数字。
+  1/4 **比引擎临界更严**（理由：1/4 是管理员能心算的数，不要求他们先翻一遍预算公式）；引擎侧那条
+  作为绝对兜底保留 ⇒ **双保险，谁都不许拆**。不传该字段时行为与改前逐字节一致（两个键都不出现）。
+- **POST 新建**（`POST /api/admin/llm/providers/:id/models`）接受同一字段，1/4 用**本次提交的** `context_window` 判；
+  不传/传 `null` 时两个键都不写进网关 body。
+- **前端不做本地数字校验**（否则就是第二套会过期的规则）：表单只加提示「上限 = 上下文窗口的 1/4」，
+  超限一律由服务端拒且 `error.message` 原样透传（`stores/admin.ts` 的 `errText` 口径）。
+
 **带 `call_name` 且调用名真的变了 ⇒ 网关改名成功后门户立刻做一次对账**（#296，判据与 §8.25 心跳完全同一条）：
+
 
 ```
 SELECT fde_id FROM fde_llm_bindings
@@ -1721,7 +1756,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `runs[].lease` | `renewed`（claim_token 匹配，已续租 `lease_until = now + 90s` ⚠️）或 `lease_lost`（claim_token 不匹配——该 run 已被 re-claim / 租约易主） |
 | `runs[].lease_until` | 仅 `lease: renewed` 时返回（续租后的到期时刻） |
 | `runs[].reason` | 仅 `lease: lease_lost` 时返回：`reclaimed`（已 re-claim）/ `released`（已被 U12 释放）/ `terminal`（已终态） |
-| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」 |
+| `models` | 下行 LLM 数据面配置（#117）：`{ main: {model, type}, embedding?, vision? }`，值为 LiteLLM 的 `model_name`（**不是** DB 槽位里的 `model_info.id`）；无 active LiteLLM binding → `null`。模型名的漂移对账见下「模型名对账（#289）」。#309 切片 1 的下行形状：`{ main: { model, type, context_window?, max_output_tokens? }, embedding?, vision? }` —— `main` 可额外带 `context_window` 与 `max_output_tokens`（与门户模型列表同一条 `toModel` 语义，且**按对账后的新名**取同一个 deployment），**只在非 null 时带键**（没值就整个键不出现，不是 `key: null`）⇒ 未配元数据的存量部署下行字节与 #309 之前逐字节相同；embedding/vision 切片 1 不带。元数据**复用对账那一次 `GET /model/info`**（不新增网关调用），网关抖动/未注入 client 时退回无元数据且不抛错；runner 接线是 #309 切片 2 |
 
 语义（与 runner §4.2 U4 一致）：
 

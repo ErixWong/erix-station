@@ -426,10 +426,12 @@ describe('AdminView · LLM 管理', () => {
       return undefined;
     });
     const modelRow = wrapper.get('[data-test="model-row"]');
-    // #296：两列都在（调用名在最左、是操作面），列数 8 → 9
-    expect(modelRow.findAll('td')).toHaveLength(9);
+    // #296：两列都在（调用名在最左、是操作面），列数 8 → 9；#309 切片 1 再加一列（输出预算上限）→ 10
+    expect(modelRow.findAll('td')).toHaveLength(10);
     expect(modelRow.findAll('td')[5].text()).toBe('16384');
     expect(wrapper.findAll('[data-test="model-row"]')[1].findAll('td')[5].text()).toBe('—');
+    // #309：新列在 max_tokens 右边一列；共享 fixture 没配这个字段 ⇒ 走回退后的 `—` 占位
+    expect(modelRow.findAll('td')[6].text()).toBe('—');
     expect(modelRow.text, '上游模型 id 不渲染').not.toContain('openai/gpt-4o');
     await modelRow.findAll('button')[0].trigger('click');
     await flushPromises();
@@ -458,6 +460,8 @@ describe('AdminView · LLM 管理', () => {
     const post = callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0];
     expect(JSON.parse(String(post[1]?.body))).toEqual({
       model_id: 'gpt-4o-mini', model: 'openai/gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: true, context_window: null, max_tokens: 2048,
+      // #309：新增表单多一个字段，没填就发 null（= 后端「不写」语义，不是「填了 0」）。
+      max_output_tokens: null,
     });
 
     const refreshedRow = wrapper.get('[data-test="model-row"]');
@@ -516,6 +520,85 @@ describe('AdminView · LLM 管理', () => {
     const patch = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0];
     expect(JSON.parse(String(patch[1]?.body))).not.toHaveProperty('model');
     expect(JSON.parse(String(patch[1]?.body))).not.toHaveProperty('max_tokens');
+    // #309：同口径——输出预算上限留空也是「不带键 = 保持现有值」，不会被误清空。
+    expect(JSON.parse(String(patch[1]?.body))).not.toHaveProperty('max_output_tokens');
+    wrapper.unmount();
+  });
+
+  // --- issue #309 切片 1：`max_output_tokens`（前端只透传，**不做本地数字校验**）-----------
+  // 为什么前端不卡 1/4：上限公式只有一个判据才有意义（服务端那一处带 context_window 的现存值，
+  // 前端拿不到也不能猜）⇒ 前端只写提示，超限一律由服务端拒并把 message 原样显示。
+  const PROVIDERS_BUDGET = {
+    items: [
+      {
+        id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
+        models: [
+          { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', model_name: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 200000, max_tokens: 16384, max_output_tokens: 50000, enabled: true, litellm_params: { model: 'openai/gpt-4o' } },
+          // 没这个键 = 存量模型（后端读侧会回退到 max_tokens，前端拿到的已经是回退后的值）
+          { id: 'm2', provider_id: 'p1', model_id: 'gpt-4o-mini', model_name: 'gpt-4o-mini', name: 'GPT-4o mini', type: 'text', tool_calling: false, context_window: null, max_tokens: null, max_output_tokens: null, enabled: true, litellm_params: { model: 'openai/gpt-4o-mini' } },
+        ],
+      },
+    ],
+  };
+  const CAP_MESSAGE = 'max_output_tokens 不能超过上限 = context_window 的 1/4（context_window=200000 ⇒ 上限 50000，传入 60000）';
+
+  it('#309 列表渲染输出预算上限（没配则占位符），新增表单带提示且照发越界值', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_BUDGET);
+      if (url === '/api/admin/llm/providers/p1/models' && init?.method === 'POST') return jsonResponse(201, {});
+      return undefined;
+    });
+    const rows = wrapper.findAll('[data-test="model-row"]');
+    expect(rows[0].get('[data-test="model-max-output-budget"]').text()).toBe('50000');
+    expect(rows[1].get('[data-test="model-max-output-budget"]').text()).toBe('—');
+
+    await wrapper.get('[data-test="open-add-model"]').trigger('click');
+    const addForm = wrapper.get('[data-test="add-model-form"]');
+    // 提示写「上限 = 上下文窗口的 1/4」（让人知道规则），但不写本地校验。
+    expect(addForm.text()).toContain('1/4');
+    await addForm.findAll('input')[0].setValue('gpt-4o-big');
+    await addForm.get('[data-test="add-model-upstream-id"]').setValue('openai/gpt-4o-big');
+    await addForm.findAll('input')[2].setValue('Big');
+    const budget = addForm.get('[data-test="add-model-max-output-tokens"]');
+    expect(budget.attributes('type')).toBe('number');
+    expect(budget.attributes('min')).toBe('1');
+    // 故意发一个越界值：前端不卡，照发 ⇒ 由服务端拒（唯一判据）。
+    await budget.setValue('60000');
+    await addForm.trigger('submit.prevent');
+    await flushPromises();
+    const post = JSON.parse(String(callsTo(fetchFn, 'POST', '/api/admin/llm/providers/p1/models')[0]?.[1]?.body));
+    // 前端不做本地数字校验 ⇒ 越界值也原样提交给服务端判。
+    expect(post.max_output_tokens).toBe(60000);
+    wrapper.unmount();
+  });
+
+  it('#309 编辑表单回填现值（含 ?? 回退）：PATCH 带 model_info 全量字段，服务端超限文案原样显示在页面上', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_BUDGET);
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') {
+        return jsonResponse(400, { error: { code: 'validation_failed', message: CAP_MESSAGE } });
+      }
+      return undefined;
+    });
+    await wrapper.findAll('[data-test="model-row"]')[0].get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    const budget = editForm.get('[data-test="edit-model-max-output-tokens"]');
+    // 回填的是后端给的值（已含 max_tokens 回退链）。
+    expect((budget.element as HTMLInputElement).value).toBe('50000');
+    expect(editForm.text()).toContain('1/4');
+    await budget.setValue('60000');
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+
+    const patch = JSON.parse(String(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')[0]?.[1]?.body));
+    expect(patch.max_output_tokens).toBe(60000);
+    // 没改 legacy `max_tokens` ⇒ 回填的**现值**原样发回（16384），前端不替它双写成 60000
+    // —— 双写是**后端**的事（B-7），前端只负责不代劳（变异靶子：前端代劳双写会藏住后端漏写）。
+    expect(patch.max_tokens).toBe(16384);
+    // 服务端 message 透传（stores/admin.ts 的口径：只拼「错误：」前缀，正文不译）。
+    // 取整页文本而不是第一个 [role=alert]：页面与弹层各有一个 alert，错一个就假红。
+    expect(wrapper.text()).toContain(CAP_MESSAGE);
+    expect(wrapper.get('[role="alert"]').text()).toContain('1/4');
     wrapper.unmount();
   });
 
