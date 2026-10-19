@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { runToolLoop, createOpenAIProvider } from 'erix-agent';
+import { runToolLoop, createOpenAIProvider, computeBudget } from 'erix-agent';
 import { parseHeartbeatModels, resolveRunModel, resolveModelMetadata } from '../lib/llm-models.js';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -93,11 +93,15 @@ function sseResponse() {
 
 /**
  * 跑一次真 runToolLoop：入参 = worker 源码抠出来的装配段（`extra` 用于变异反证时覆盖）。
+ * `withComputeBudget`（切片 2b）：复现 worker 现在那条真路径——把上游预算闸注入纯函数。
+ * 默认关：既有行为用例的判据一字不动（它们全是正常大窗口，闸不会改变结论）。
  * 返回真 HTTP 请求体、事件流、终局与错误，让断言能指明「红在哪」。
  */
-async function runOnce({ models, extraParams = {} }) {
+async function runOnce({ models, extraParams = {}, withComputeBudget = false }) {
   const snapshot = parseHeartbeatModels({ models });
-  const engineModelMetadata = resolveModelMetadata(snapshot);
+  const engineModelMetadata = withComputeBudget
+    ? resolveModelMetadata(snapshot, { computeBudget })
+    : resolveModelMetadata(snapshot);
   const params = { ...workerEngineModelParams(engineModelMetadata), ...extraParams };
   const bodies = [];
   const events = [];
@@ -314,4 +318,105 @@ test('#309 上游前提：引擎仍然用 modelMetadata/maxTokens 这两个入�
     'model_metadata_missing 诊断事件仍在 ⇒ 「不传 = 可观测」这条判据仍然成立');
   assert.match(orchestrator, /if \(maxTokens !== undefined\) requestForJudge\.maxTokens = maxTokens;/,
     '已知副作用仍在：wrap-up judge 继承宿主 maxTokens（工单 §3，不要顺手修）');
+});
+
+// ---------------------------------------------------------------------------
+// 4) issue #309 切片 2b：小窗口时 1/4 钳完预算仍非正 —— 上游闸（包根 computeBudget）兜成「不传」
+//    工单 §3.2（行为级 = 本单判据本体）与 §3.3（源码级：禁公式复制 + 注入必须真传）
+// ---------------------------------------------------------------------------
+
+test('#309-2b 行为级【判据本体】：ctx=1001/2000/2666 走真闸 ⇒ 不传元数据 ⇒ 请求体无 max_tokens 键 + 引擎发 model_metadata_missing + run 不失败', async () => {
+  // 这三组**没有闸时**都会把值喂给引擎（钳后 250 / 原样 500 / 钳后 666），引擎的预算分别是
+  // −1249 / −500 / 0 —— 全部非正 ⇒ 没有本守卫时该 FDE **每个 run 第 1 轮之前就抛 invalid_budget**。
+  const smallWindows = [
+    { context_window: 1001, max_output_tokens: 1000 },
+    { context_window: 2000, max_output_tokens: 500 },
+    { context_window: 2666, max_output_tokens: 667 },
+  ];
+  for (const meta of smallWindows) {
+    const { bodies, events, error, result, params, engineModelMetadata } = await runOnce({
+      models: { main: { model: 'glm-4.6', type: 'text', ...meta } },
+      withComputeBudget: true,
+    });
+    assert.equal(engineModelMetadata, null,
+      `前置：ctx=${meta.context_window} 经真闸必须是 null（闸没接到 = 本单白做）`);
+    assert.equal(error, undefined,
+      `ctx=${meta.context_window}：兜成「不传」之后 run **必须不失败**；实际 code=${String(error?.code)} message=${String(error?.message)}`);
+    assert.deepEqual(params, {}, 'worker 的装配段必须真的**什么都不传**（改成硬塞钳后值就红在这里）');
+    assert.ok(bodies.length > 0, 'run 至少走了一轮（桩收到了请求）');
+    assert.equal(maxTokensOf(bodies[0]).present, false,
+      `ctx=${meta.context_window}：请求体里必须**没有** max_tokens 键（= 现状：输出上限退回 provider 默认）`);
+    assert.equal(missingEvents(events).length, 1,
+      '压缩关掉必须是**可观测**的：引擎自己发恰好一条一次性 model_metadata_missing');
+    assert.equal(bodies[0].model, 'glm-4.6', '模型名语义仍不变');
+    assert.equal(result?.finalText, 'done', 'run 正常收尾');
+  }
+});
+
+test('#309-2b 行为级反证：同一组小窗口若硬把钳后值塞进 modelMetadata ⇒ run 死在 invalid_budget、一个请求都不发', async () => {
+  // 本条是「这条守卫真的在承重」的证据：不兜 ⇒ 红得有内容（第 1 轮之前就死，且不可重试）。
+  const forced = await runOnce({
+    models: { main: { model: 'glm-4.6', type: 'text', context_window: 1001, max_output_tokens: 1000 } },
+    withComputeBudget: false, // 纯函数仍会钳到 250（无闸），但这里直接覆盖装配段，模拟「把钳后值交出去」
+    extraParams: {
+      modelMetadata: { contextWindowTokens: 1001, maxOutputTokens: 250 },
+      maxTokens: 250,
+    },
+  });
+  assert.equal(forced.error?.code, 'invalid_budget',
+    `硬塞 floor(1001/4)=250 时引擎预算是 −1249 ⇒ 必须抛；实际 code=${String(forced.error?.code)} message=${String(forced.error?.message)}`);
+  assert.equal(forced.bodies.length, 0, '启动期就抛 ⇒ 一次请求都不会发出去（= 第 1 轮之前）');
+
+  // 同一组合走真闸 ⇒ 能跑（对照，证明差异只在「传不传」）。
+  const guarded = await runOnce({
+    models: { main: { model: 'glm-4.6', type: 'text', context_window: 1001, max_output_tokens: 1000 } },
+    withComputeBudget: true,
+  });
+  assert.equal(guarded.error, undefined);
+  assert.equal(guarded.bodies.length > 0, true);
+
+  // 反向边界：闸**不能**误伤正常窗口（否则本单会把切片 2 的成果关掉）。
+  const normal = await runOnce({
+    models: { main: { model: 'glm-4.6', type: 'text', context_window: 262144, max_output_tokens: 32000 } },
+    withComputeBudget: true,
+  });
+  assert.equal(normal.error, undefined);
+  assert.equal(maxTokensOf(normal.bodies[0]).value, 32000, '正常窗口照旧显式发 max_tokens=32000');
+  assert.deepEqual(missingEvents(normal.events), [], '正常窗口照旧进了压缩开关（不发缺元数据事件）');
+});
+
+test('#309-2b 源码级：llm-models.js 里不许出现引擎公式常量（2000 / 0.1）——那道闸只能调上游，不能复制', () => {
+  const code = stripComments(read('lib/llm-models.js')); // 注释里写公式给人看是允许的，**代码**里不许
+  assert.doesNotMatch(code, /2000/, '引擎那个 2000 下限不许抄进本站（随上游版本漂）');
+  assert.doesNotMatch(code, /0\.1/, '引擎那个 10% 比例不许抄进本站');
+  assert.doesNotMatch(code, /Math\.ceil/, 'ceil(0.1*ctx) 这类推导属于上游，不属于本站');
+  // 注入位与调用点都在：闸是**注进来**的，且拿到候选值后真的被调了（只看抛不抛）。
+  assert.match(code, /function resolveModelMetadata\(\s*models,\s*\{\s*computeBudget\s*\}\s*=\s*\{\}\s*\)/,
+    '第二入参必须是可选的依赖注入位（不传 ⇒ 跳过闸 = 兼容面）');
+  assert.match(code, /computeBudget\(\s*\{\s*contextWindowTokens:\s*ctx,\s*maxOutputTokens:\s*candidate\.max_output_tokens\s*\}\s*\)/,
+    '调用形状：**一个**对象、上游 camelCase 键、值是候选值（原样或钳后）');
+  assert.match(code, /catch\s*\{[^}]*return null/, '闸抛 ⇒ 返回 null（= 什么都不传），不是返回候选值');
+});
+
+test('#309-2b 源码级：worker.js 必须从包根 import computeBudget 并作为第二入参传进 resolveModelMetadata', () => {
+  const src = read('worker.js');
+  const code = stripComments(src);
+  assert.match(code, /import \{[^}]*\bcomputeBudget\b[^}]*\} from 'erix-agent'/,
+    '闸必须与 runToolLoop 同源（包根 import），不要在本站另找实现');
+  assert.match(code, /resolveModelMetadata\(\s*msg\.models,\s*\{\s*computeBudget\s*\}\s*\)/,
+    '调用必须带 `{ computeBudget }` 第二入参——不传则守卫静默失效，小窗口元数据会把每个 run 炸死');
+  assert.doesNotMatch(code, /computeBudget\(\s*\{\s*contextWindowTokens/,
+    'worker 里不许出现 camelCase 字面量调用闸（会撞上一条防漂移用例，也是映射点唯一的要求）');
+
+  // 不可用支路：两种成因**共用一条** MSG.LOG，但文案各自点名（不新增事件类型）。
+  const branch = src.match(/\} else if \(!engineModelMetadata && msg\.models\?\.main\) \{([\s\S]*?)\n  \}/);
+  assert.ok(branch, 'worker 必须有「} else if (!engineModelMetadata && msg.models?.main) { … }」这条不可用支路');
+  const body = stripComments(branch[1]);
+  assert.equal(countOccurrences(body, 'type: MSG.LOG'), 1, '两种成因共用一条 LOG（各发一条也行，但本单要求措辞说清是哪一种）');
+  assert.match(body, /level: .warn./);
+  assert.match(body, /model metadata unusable: context_window=/, 'ctx 非法那条文案不得改散（切片 2 的既有锁）');
+  assert.match(body, /not a positive integer/, '成因 a：context_window 不是正整数');
+  assert.match(body, /budget is not positive/, '成因 b（切片 2b 新增）：钳完预算仍非正，文案必须点名');
+  assert.match(body, /max_output_tokens=/, '成因 b 要带上下行的原值，运维才配得出来');
+  assert.doesNotMatch(body, /Math\.floor/, '告警文案不许重算钳制（判据在纯函数里）');
 });
