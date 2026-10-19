@@ -15,6 +15,9 @@
 // 命名纪律（决策者定稿）：整条链只有两种形态——心跳原样的 `context_window`/`max_output_tokens`
 // 与引擎入参的 `contextWindowTokens`/`maxOutputTokens`/`maxTokens`；camelCase 那三个只允许出现在
 // worker 构造引擎入参的那一处（映射点唯一），本模块内一律 snake_case，也不要发明第四个名字。
+// 唯一例外（切片 2b）：本模块调上游 probe `computeBudget({ contextWindowTokens, maxOutputTokens })`
+// 时**必须**用引擎那对 camelCase 键名——那是上游的入参名，不是我们的第四种形态（防漂移用例只扫
+// worker.js 的**构造点**，probe 调用点是入参不是构造点，工单 §2.3 明确允许）。
 
 /** 正整数（且是安全整数）——两个元数据键唯一的合法形态：0/负数/小数/字符串/布尔/NaN 一律不认。 */
 function isPositiveInt(value) {
@@ -71,7 +74,7 @@ export function resolveRunModel(defaultModel, models) {
  * 后果不是「这一轮不好」，而是**每个 run 第 1 轮之前就失败**——比现在「不压缩」更糟。
  *
  * 规则（决策者定稿，非法值按 1/4 兜底）：
- * 1. `context_window` 是正整数且 `max_output_tokens` 是正整数且 `≤ floor(context_window/4)` → 原样；
+ * 1. `context_window` 是正整数且 `max_output_tokens` 是正整数且 `≤ floor(context_window/4)` → 原样（候选）；
  * 2. `max_output_tokens` 非法（非正整数）**或** `> floor(context_window/4)` → **钳成 `floor(context_window/4)`**
  *    （`clamped: true` + `clamped_from` 回报原值，调用方据此发 warn，run 照跑）；
  *    边界：正好等于 `floor(context_window/4)` **不算被钳**（portal 侧 1/4 校验用的就是同一个上限）；
@@ -79,21 +82,40 @@ export function resolveRunModel(defaultModel, models) {
  *    = 「什么都不传」= 现状行为（引擎自己发一次性 `model_metadata_missing`，压缩开关不进入）。
  *    这一支不硬塞 0：`context_window: 0` 会让 computeBudget 直接抛 invalid_budget。
  *
- * 已知边界（本单不覆盖，见工单 §2.2 与报告的「已知边界」）：`context_window` 合法但极小时，
- * 钳后的 1/4 仍可能让引擎那条公式算出非正预算；封它需要在 runner 里复制引擎内部公式，本单不做。
+ * 规则 4（切片 2b 补的最后一条死法）：`context_window` **合法但很小**时，1/4 钳完预算仍然非正 ⇒ 照样炸。
+ * 实测（钳后 `max_output_tokens = floor(ctx/4)`）：ctx=1001 → 预算 −1249、ctx=2000 → −500、
+ * ctx=2666 → 0（都是「抛」）；ctx=2667 → 1（勉强活）。现实触发面是管理员把 `context_window`
+ * 误填成 2048 这类笔误 ⇒ 该 FDE **每次 run 都启动即死**且错误不可重试。
+ * 所以拿到候选值（原样**或**钳后）之后还要再过一道闸，**闸本身来自上游**：
+ * `erix-agent` 包根导出的 `computeBudget({ contextWindowTokens, maxOutputTokens })`（同一个
+ * `src/loop/budget.js`，公式随上游版本漂，我们这边**一个常量都不复制**）。
+ * 它**抛** ⇒ 本函数返回 `null` = 「什么都不传」= 规则 3 的支路（压缩关、run 照活、
+ * 引擎自己发一次性 `model_metadata_missing`）。**这条优先于「钳了」的结论**：钳完还是非正 ⇒ `null`，
+ * 不是把那个钳后值交出去。告警文案由 worker 自己算（它手上就有 ctx 与原值），返回值里不塞第三个概念。
  *
  * @param {{main?:{model?:string,context_window?:unknown,max_output_tokens?:unknown}}|null|undefined} models RUN_START 的下行模型快照
+ * @param {{computeBudget?: (input:{contextWindowTokens:number, maxOutputTokens:number}) => number}} [deps] 依赖注入位：
+ *   `computeBudget` = 上游那道闸（worker 传真包；**不传则跳过规则 4**，与本模块改动前逐字节相同——
+ *   这是纯函数零依赖这个既有性质的保持手段，也是既有 18 条纯函数用例不必改的兼容面）
  * @returns {{context_window:number, max_output_tokens:number, clamped:boolean, clamped_from:unknown}|null}
  */
-export function resolveModelMetadata(models) {
+export function resolveModelMetadata(models, { computeBudget } = {}) {
   const main = models?.main;
   if (!main || typeof main !== 'object') return null; // 无下行（旧 portal / 无配置）→ 现状行为
   const ctx = main.context_window;
   if (!isPositiveInt(ctx)) return null; // 规则 3：ctx 是唯一的「整对不传」判据，maxOut 再体面也没用
   const quarter = Math.floor(ctx / 4);
   const maxOut = main.max_output_tokens;
-  if (isPositiveInt(maxOut) && maxOut <= quarter) {
-    return { context_window: ctx, max_output_tokens: maxOut, clamped: false, clamped_from: maxOut };
+  const candidate = isPositiveInt(maxOut) && maxOut <= quarter
+    ? { context_window: ctx, max_output_tokens: maxOut, clamped: false, clamped_from: maxOut }
+    : { context_window: ctx, max_output_tokens: quarter, clamped: true, clamped_from: maxOut };
+  if (typeof computeBudget !== 'function') return candidate; // 没注入闸 → 切片 2 的现状（兼容面）
+  try {
+    // 规则 4：入参是**一个对象**（不是两个位置参数），键名是上游的 camelCase 入参名。
+    // 只看「抛不抛」，不用返回值——用返回值就得在这里重算公式（= 复制上游，本单明令禁止）。
+    computeBudget({ contextWindowTokens: ctx, maxOutputTokens: candidate.max_output_tokens });
+  } catch {
+    return null; // 预算非正 ⇒ 整对不传（= 现状：压缩关，但 run 不炸）
   }
-  return { context_window: ctx, max_output_tokens: quarter, clamped: true, clamped_from: maxOut };
+  return candidate;
 }
