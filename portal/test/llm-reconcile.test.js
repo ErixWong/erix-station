@@ -845,7 +845,25 @@ test('#309 心跳下行：只有 litellm_params.max_tokens 的存量部署，max
   }, 'model_info 里没有 max_output_tokens 时回退到 litellm_params.max_tokens（与门户列表同一口径）');
 });
 
-test('#309 心跳下行：没配元数据 ⇒ 键整个不出现（不是 key: null）；只配一项就只出现那一项', async () => {
+test('#309 切片1.5 行为变化：配了窗口但从未手填预算的存量模型 ⇒ main 开始带 ctx + max_output_tokens=floor(ctx/4)', async () => {
+  // 这就是本单唯一的行为变化（有意）：切片 1 里这种模型两个键都不出现 ⇒ runner 拿不到元数据 ⇒
+  // 引擎压缩开关关着（#309 事故的形态）。回退生效后它会开始带两个键。
+  const pool = fakePool([ROW]);
+  const { gw } = fakeGateway([
+    metaModel('m-main', 'deepseek-flash', { contextWindow: 262144 }),
+    metaModel('m-emb', 'text-embedding-3'),
+  ]);
+  const models = await getFdeLlmHeartbeatModels(pool, 'u1', {
+    gateway: gw, now: () => 1000, ttlMs: 0, listModels: () => gw.listModels(), updateKey: () => Promise.resolve({}),
+  });
+  assert.deepEqual(models.main, {
+    model: 'deepseek-flash', type: 'text', context_window: 262144, max_output_tokens: 65536,
+  }, 'model_info 里没有 max_output_tokens ⇒ 心跳带的是同一个回退生效值（不在心跳里另算一次除法）');
+  assert.equal(models.main.max_output_tokens, Math.floor(models.main.context_window / 4),
+    '下行值与下行窗口同源（同一个 toModel 生效值）');
+});
+
+test('#309 心跳下行：连 context_window 都没配 ⇒ 两键都不出现（不是 key: null）；只配预算也只出现预算', async () => {
   const bare = fakePool([ROW]);
   const { gw: bareGw } = fakeGateway([metaModel('m-main', 'deepseek-flash'), metaModel('m-emb', 'text-embedding-3')]);
   const bareModels = await getFdeLlmHeartbeatModels(bare, 'u1', {
@@ -853,19 +871,33 @@ test('#309 心跳下行：没配元数据 ⇒ 键整个不出现（不是 key: n
   });
   assert.deepEqual(bareModels.main, { model: 'deepseek-flash', type: 'text' });
   assert.deepEqual(Object.keys(bareModels.main), ['model', 'type'],
-    '没值就整个键都不要出现：存量部署的下行字节与 #309 之前逐字节相同');
+    '算不出回退值（连窗口都没有）就整个键都不出现：宁可不带，也别下发一个 0 或 null');
 
+  // 两个键各自独立：只配了预算（没窗口 ⇒ 算不出但也不需要算）就只出现预算，不补 null 占位。
   const partial = fakePool([ROW]);
   const { gw: partialGw } = fakeGateway([
-    metaModel('m-main', 'deepseek-flash', { contextWindow: 65536 }),
+    metaModel('m-main', 'deepseek-flash', { maxOutputTokens: 2048 }),
     metaModel('m-emb', 'text-embedding-3'),
   ]);
   const partialModels = await getFdeLlmHeartbeatModels(partial, 'u1', {
     gateway: partialGw, now: () => 2000, ttlMs: 0, listModels: () => partialGw.listModels(), updateKey: () => Promise.resolve({}),
   });
-  assert.deepEqual(partialModels.main, { model: 'deepseek-flash', type: 'text', context_window: 65536 },
-    '两个键各自独立：只配了窗口就只出现窗口，不补一个 null 占位');
-  assert.equal(Object.hasOwn(partialModels.main, 'max_output_tokens'), false);
+  assert.deepEqual(partialModels.main, { model: 'deepseek-flash', type: 'text', max_output_tokens: 2048 },
+    '只配了一项就只出现那一项：不补一个 null 占位');
+  assert.equal(Object.hasOwn(partialModels.main, 'context_window'), false);
+});
+
+test('#309 切片1.5 兼容面：不传 gateway 的老调用形状仍逐字节不变（回退不得泄进这条兼容路）', async () => {
+  // 目录里就算躺着带窗口的部署也不能影响这条：老调用形状根本不碰网关 ⇒ 一个字节都不能变。
+  const table = [ROW];
+  const { gw } = fakeGateway([metaModel('m-main', 'deepseek-flash', { contextWindow: 262144, maxOutputTokens: 65536 })]);
+  const legacy = await getFdeLlmHeartbeatModels(fakePool(table), 'u1');
+  const withNullGateway = await getFdeLlmHeartbeatModels(fakePool(table), 'u1', { gateway: null, listModels: () => gw.listModels() });
+  assert.equal(JSON.stringify(legacy), JSON.stringify({
+    main: { model: 'deepseek-flash', type: 'text' },
+    embedding: { model: 'text-embedding-3', type: 'embedding' },
+  }), '不传 gateway ⇒ 仍是存储快照，没多出 context_window / max_output_tokens 任何一个键');
+  assert.deepEqual(withNullGateway, legacy, 'gateway: null 与整个 opts 不传同形');
 });
 
 test('#309 心跳下行：目录里找不到这个名字（或目录整体拿不到）⇒ 退回无元数据，不抛错', async () => {
