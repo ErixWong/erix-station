@@ -338,10 +338,11 @@ test('#309-2b 行为级【判据本体】：ctx=1001/2000/2666 走真闸 ⇒ 不
       models: { main: { model: 'glm-4.6', type: 'text', ...meta } },
       withComputeBudget: true,
     });
-    assert.equal(engineModelMetadata, null,
-      `前置：ctx=${meta.context_window} 经真闸必须是 null（闸没接到 = 本单白做）`);
     assert.equal(error, undefined,
-      `ctx=${meta.context_window}：兜成「不传」之后 run **必须不失败**；实际 code=${String(error?.code)} message=${String(error?.message)}`);
+      `ctx=${meta.context_window}：兜成「不传」之后 run **必须不失败**（删掉闸/吞例外泄 ⇒ 就是这里红，`
+      + `而引擎的答复是真实的 invalid_budget）；实际 code=${String(error?.code)} message=${String(error?.message)}`);
+    assert.equal(engineModelMetadata, null,
+      `前置诊断：ctx=${meta.context_window} 经真闸必须是 null（闸没接到 = 本单白做）`);
     assert.deepEqual(params, {}, 'worker 的装配段必须真的**什么都不传**（改成硬塞钳后值就红在这里）');
     assert.ok(bodies.length > 0, 'run 至少走了一轮（桩收到了请求）');
     assert.equal(maxTokensOf(bodies[0]).present, false,
