@@ -469,7 +469,8 @@ function validateMaxOutputTokens(value, contextWindow) {
   if (window === null) {
     // 没窗口就判不了 1/4 ⇒ 不能只改一半：放行了就是一个「配了预算却没配窗口」的半套配置落库，
     // 而且这个值能否成立根本无法审计。
-    throw new LlmError('validation_failed', '设置 max_output_tokens 前必须先配置 context_window', {
+    throw new LlmError('validation_failed', '设置 max_output_tokens 前必须先配置 context_window'
+      + '（或窗口形态非法：token 数必须是正整数，真小数按未配置处理）', {
       details: { field: 'max_output_tokens', reason: 'context_window_missing' },
     });
   }
