@@ -821,8 +821,11 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
    #316 的病症本体（主 agent 在 `631bc46` 上探针复现）：`ctx:"262144"` ⇒ 门户显示着窗口而 runner 整键丢掉
    ⇒ `resolveModelMetadata` 返回 `null` ⇒ **压缩静默关**。今天的贯通用例走**真 runToolLoop + 真
    `computeBudget` 闸**，判据是请求体里有 `max_tokens` 且 `model_metadata_missing` 不再出现。
-   ⚠ **dev 现网不活**（网关 6 条 deployment 的 `context_window` 都是整数）⇒ 属历史存量 + 人工填带引号
-   值的隐患修复，不是交付阻塞（也不要因此觉得它无用）。
+   ⚠ **dev 现网不活**（网关 6 条 deployment 的 `context_window` 全是整数 `262144`/`512000`，**零实例**）。⚠ **证据边界**
+   （主 agent 验收时否证了 worker 的一句论证）：那句「兼容历史上存成数字串的值」的注释**出自本批 `42cb24c` 自己**，
+   不是存量证据；真正的入口是**写侧对 `input.context_window` 不做类型校验**（`llm.js` 原样透传给网关）⇒ 字符串
+   **结构上能存进来**。⇒ 本单性质 = **隐患收口**，不是正在流血的故障；**根因（写侧不校验类型）本单未闭合**，
+   是否改成「只加写侧一条校验、读侧不必两侧归一」由独立过度设计审计判（工单 `~/worker-reports-261019/copilot-261019-A-order.md`）。
 2. **压缩仍关着的情形是三种**（不是「唯一一种连窗口都没配」）：① 没配窗口；② 窗口形态 runner 不认
    （真小数 / `≤0` / 非数字）；③ 窗口小到 1/4 兜底仍算不出正预算（`ctx ≤ 2666`）。① ② 靠上游一次性
    `model_metadata_missing`，③ 靠 runner 的 `model metadata unusable` warn。`portal.md` §4.9 已按三条改对，
@@ -834,7 +837,14 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
    LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（#314），设值仍有效」，并补上「编辑表单留空 = 省略
    字段、新建才是显式 `null`」的不对称（⇒ 管理员看不到「清空失败」，只看到「数清不掉」）。
 
-基线与变异取证见 `~/worker-reports-261019/feat-261019-06-316-317.md`（台账三处数字归主 agent 合并时统一写）。
+**验收与取证（主 agent 亲手，2026-10-20）**：三套基线在**沙箱合并树**上复跑 —— 根 `npm test` **1261/1257/0/4 rc=0**、
+`node --test runner/test/*.test.js` **320/320 rc=0**、前端 `typecheck` rc=0 + vitest **33 文件/572 rc=0**（前端零改动 ⇒ 计数不变）。
+**主 agent 亲跑变异 4 条全红在具名用例**（每条先证只改 1 行且行为真变）：runner 归一回退成「字符串一律丢」⇒ 3 红；
+runner / portal 各自把真小数 `Math.floor` 掉 ⇒ 4 红 / 2 红；心跳下行不归一（直传 `model.context_window`）⇒ 恰 1 红。
+worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let me review the full diff」，报告是**中途快照**（写着「进行中」）；
+主 agent 用 `git apply` 在一次性沙箱（`~/erix316-sandbox`，`--no-hardlinks` + detached + `remote remove origin`）里落地后逐文件审，
+并以 **`git patch-id --stable` 逐条比对**证明沙箱两个 commit 与主仓分支提交同内容。取证全文见
+`~/worker-reports-261019/feat-261019-06-316-317.md`（已由主 agent 补完）。
 
 **已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
