@@ -1024,8 +1024,10 @@ station-portal user enable  --login <login>
 - ⚠ **接线的硬要求（#322 真机取证；v0.1.20 曾因此静默降级整整一个版本）**：自动改名跑在 `internal.js` 的终态链里，
   那里没有现成的 config ⇒ **`http.js` 必须把 `ctx.config` 交给 `setRunState`，`finishRun` 再透传给 `scheduleAutoTitle`**。
   少任何一跳 ⇒ `title-llm.js` 退回默认网关 `http://127.0.0.1:4100`，而**该地址在 portal 容器内是 ECONNREFUSED**
-  （数据面在容器内只能走 `LLM_GATEWAY_ADMIN_URL=http://station-litellm:4000`）⇒ 每次都静默退到「首条用户消息截断」，
-  而界面**看不出异常**（标题照样变，只是从来不是模型起的）。判据：`portal/test/session-auto-title-wiring.test.js`。
+  （数据面在容器内只能走 `LLM_GATEWAY_ADMIN_URL=http://station-litellm:4000`）⇒ **门槛命中后的每一次生成都静默失败**，退到「首条用户消息截断」，
+  而界面**看不出异常**（标题照样会变，只是不是模型起的）。⚠ **别与另一条独立的静默路径混淆**：防抖门槛未命中时
+  （已有标题且 `auto_title_seq IS NULL` ⇒ 需 ≥3 轮新 user 消息）整段直接 return，**连 warn 都不发**——
+  「标题是首条消息」不等于接线坏了，两者靠日志区分（有 warn = 接线/网关，无日志 = 门槛没命中）。
 - **key 纪律**：LiteLLM virtual key 只进 `Authorization` 头，**绝不进日志/错误信息/响应**（上游回显的 key 亦被脱敏）。
 
 请求体：无（空 JSON `{}`）。
