@@ -476,7 +476,9 @@ async function startRun(msg) {
       provider,
       // issue #309 切片 2：模型元数据 + 显式 max_tokens（值已在 resolveModelMetadata 里钳过）。
       // 命名纪律（决策者定稿）：camelCase 三键（contextWindowTokens / maxOutputTokens / maxTokens）
-      // **全站只允许出现在下面这一对 #309 标记之间**（唯一映射点）；防漂移锁：
+      // **在本文件里只允许出现在下面这一对 #309 标记之间**（引擎入参的唯一映射点）。措辞刻意
+      // 不说「全站」：锁只数 worker.js（见 model-metadata.test.js 那条用例），而 runner 里另有一处
+      // 合法的 `maxTokens: 512`（`lib/session-title.js` 给 provider.chat 用，不是引擎入参映射）；防漂移锁：
       // runner/test/model-metadata.test.js（从 worker.js 源码正则数次数，不 import worker）。
       // 已知副作用（都核过行号，**不要顺手修**）：
       //   - wrap-up 归一化 judge 的请求**继承**宿主 maxTokens（orchestrator.js:3115
