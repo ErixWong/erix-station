@@ -17,6 +17,7 @@ import { projectTranscriptForDisplay } from 'erix-agent';
 import { fetchUserTextTurns } from './session-text.js';
 import { appendUserInputTurn } from './transcript-store.js';
 import { allocSeq } from './seq.js';
+import { chatCompletion, chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-chat.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -755,8 +756,14 @@ export async function stopSession(pool, { userId, sessionId, notify }) {
 // 自动标题放到了 runner（`runner/lib/session-title.js`），于是同一件事有了两份实现；把标题**统一
 // 回 portal 一侧**（撤掉 runner 那份、连「豁免」这个概念一起消失）已登记 issue **#322**。
 //
+// ⚠ 自工单 261020-04（#315 追加）起，「豁免」指的是**「portal 允许直连一次对话」**，不再是
+// 「允许在业务代码里手搓 `fetch`」：请求体的构造 / URL 拼接 / `max_tokens` 必发 / 超时 /
+// 错误映射全部住在 **`portal/src/llm-chat.js`**（portal 侧**对话调用面**的唯一出口；`llm.js` 是
+// 网关**管理面**，不发对话请求）。本文件只留会话业务：取上下文 → 调 client → 清洗标题 → 落库 → 推送。
+// 新加的 portal 直连对话**不许**自己拼 `fetch`，一律走 `llm-chat.js`。
+//
 // key 纪律（llm.js 三条存储纪律 ③）：api_key 只进 Authorization 请求头，
-// 绝不进日志/错误信息/HTTP 响应（redactSecret 做最后一道兜底）。
+// 绝不进日志/错误信息/HTTP 响应（`llm-chat.js` 里的 redactSecret 做最后一道兜底）。
 // ---------------------------------------------------------------------------
 
 /** AI 改名的上下文：会话最早的 N 条 user 消息（单条折叠空白后截 AI_TITLE_CONTEXT_MAX_LEN 字符）。 */
@@ -774,6 +781,9 @@ export const AI_TITLE_TIMEOUT_MS = 15_000;
  * 发 512 的理由：标题 ≤30 字，512 token 绰绰有余，且**与 runner 侧自动标题用的是同一个数**
  * （`runner/lib/session-title.js` 的 `maxTokens: 512`）——两条做同一件事的路径过去只有一设了上限，
  * 那个不一致就是本单的登记理由。测试在对面（`session-ai-title.test.js` 钉 512 与跨路径一致）。
+ * 工单 261020-04（#315 追加）：这个数现在**作为 `maxTokens` 传给 `llm-chat.js`**（本文件不再自己发请求）。
+ * 那个 client 自己也有一个显式默认 `LLM_CHAT_DEFAULT_MAX_TOKENS = 512`，并保证「调用方漏传也不会省略
+ * 该字段」；两边同一个数由 `portal/test/llm-chat.test.js` 钉住。
  */
 export const AI_TITLE_MAX_TOKENS = 512;
 /** 系统提示：与 AUTO_TITLE_MAX_LEN 同口径（≤30 字；落库前仍过一遍 sanitizeTitle）。 */
@@ -792,27 +802,10 @@ export function buildAiTitlePrompt(messages) {
   return `用户消息：\n${list.join('\n')}\n\n请只输出标题。`;
 }
 
-/** 从 OpenAI 兼容响应体取助手文本（纯函数）：content 为字符串或分片数组。 */
-export function extractAssistantText(body) {
-  const content = body?.choices?.[0]?.message?.content;
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) return content.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('');
-  return '';
-}
-
-/** 脱敏（纯函数）：从任意文本里抹掉已知 key 与 sk-* 形态串，并截断长度（纪律 ③ 兜底）。 */
-export function redactSecret(text, secret) {
-  let out = String(text ?? '');
-  if (typeof secret === 'string' && secret.length >= 6) out = out.split(secret).join('***');
-  out = out.replace(/sk-[A-Za-z0-9_-]{6,}/g, 'sk-***');
-  return out.slice(0, 200);
-}
-
-/** OpenAI 兼容 chat/completions URL：base 已带 /v1 则直接用，否则补 /v1（口径同 erix-agent provider）。 */
-export function chatCompletionsUrl(baseUrl) {
-  const base = String(baseUrl ?? '').replace(/\/+$/, '');
-  return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
-}
+// 以下三个「一次对话请求」的通用件（URL 拼接 / 取助手文本 / 脱敏）**已搬到 `llm-chat.js`**——那是
+// portal 侧对话调用面的唯一定义点（工单 261020-04，#315 追加）。此处**重新导出**只为让既有调用方
+// 与文档口径不受影响（名字与行为一字未改）；**新代码请直接从 `./llm-chat.js` 引**。
+export { chatCompletionsUrl, extractAssistantText, redactSecret };
 
 /** AI 改名必须使用该 FDE 的 LiteLLM 虚拟 key；不再回退到 Station 本地 provider 目录。 */
 export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http://127.0.0.1:4100' } = {}) {
@@ -833,6 +826,11 @@ export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http:
  * 属主鉴权同 PATCH（fetchSession：非属主/不存在/已归档一律 404）。
  * 流程：取上下文 → 解析 provider（无 → 409）→ 一次 chat/completions（15s 超时，失败 → 502）
  *       → sanitizeTitle 清洗（≤30 字）→ 落库 title_source='manual'（用户主动触发，自动流程不得覆盖）。
+ * 工单 261020-04（#315 追加）：那条手搓 `fetch`（自拼 URL / 自写超时 / 自填 max_tokens）**已退役**，
+ * 本函数只负责会话业务（取上下文、清洗、落库、推送）；「发一次对话」的口径全在 `llm-chat.js`。
+ * 错误类型仍用 `SessionError`（作为 `ErrorCtor` 递给 client）⇒ `http.js` 的映射不用改，状态码 /
+ * `error.code` / 文案与收口前一致（`error.details` 是错误体里本就可选的附加结构，只放原因与状态码，
+ * 见 `docs/api/portal.md` §4.5a）。
  * @returns 更新后的会话行（rowToSession 形状）
  */
 export async function generateAiTitle(pool, {
@@ -851,59 +849,27 @@ export async function generateAiTitle(pool, {
 
   const provider = await resolveAiTitleProvider(pool, userId, { gatewayUrl });
 
-  // 超时用显式 AbortController + clearTimeout（不依赖 AbortSignal.timeout 的定时器语义）。
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res;
-  try {
-    res = await fetchImpl(chatCompletionsUrl(provider.base_url), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(provider.api_key ? { Authorization: `Bearer ${provider.api_key}` } : {}),
-      },
-      body: JSON.stringify({
-        model: provider.model,
-        messages: [
-          { role: 'system', content: AI_TITLE_SYSTEM_PROMPT },
-          { role: 'user', content: buildAiTitlePrompt(contexts) },
-        ],
-        temperature: 0.2,
-        stream: false,
-        // #315：显式发，否则网关注入 `litellm_params.max_tokens`（模型的输出预算，不是标题的）
-        max_tokens: AI_TITLE_MAX_TOKENS,
-      }),
-      signal: controller.signal,
-    });
-  } catch (err) {
-    // 网络/超时：错误信息里只有原因，绝无请求头（key）；再过一遍脱敏兜底。
-    const reason = controller.signal.aborted
-      ? `上游调用超时（>${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)}s` : `${timeoutMs}ms`}）`
-      : redactSecret(err?.message ?? err, provider.api_key);
-    log?.warn?.(`[ai-title] 上游调用失败（session=${sessionId}）：${reason}`);
-    throw new SessionError('llm_upstream_failed', `LLM 调用失败：${reason}`, { httpStatus: 502 });
-  } finally {
-    clearTimeout(timer);
-  }
+  // portal 侧唯一直连对话出口（`llm-chat.js`）：URL 拼接 / `max_tokens` 必发 / 超时 / 错误映射 /
+  // key 只进 Authorization 头，全部在那个文件里定死。本处只传会话业务需要的东西：
+  // 上下文拼成的 messages、标题的输出预算（`AI_TITLE_MAX_TOKENS`，与 runner 侧同一个数）、
+  // 以及日志用的 tag/session（日志文本与收口前一致）。
+  const { text } = await chatCompletion({
+    provider,
+    messages: [
+      { role: 'system', content: AI_TITLE_SYSTEM_PROMPT },
+      { role: 'user', content: buildAiTitlePrompt(contexts) },
+    ],
+    temperature: 0.2,
+    maxTokens: AI_TITLE_MAX_TOKENS,
+    timeoutMs,
+    fetchImpl,
+    ErrorCtor: SessionError,
+    log,
+    logTag: 'ai-title',
+    logContext: `session=${sessionId}`,
+  });
 
-  const raw = await res.text().catch(() => '');
-  if (!res.ok) {
-    // 只回显上游 error.message（脱敏 + 截断），不回显整个响应体。
-    let hint = '';
-    try {
-      const msg = JSON.parse(raw)?.error?.message;
-      if (typeof msg === 'string' && msg.trim() !== '') hint = `（${redactSecret(msg, provider.api_key)}）`;
-    } catch { /* 非 JSON 响应体：不给细节 */ }
-    const reason = `上游返回 HTTP ${res.status}${hint}`;
-    log?.warn?.(`[ai-title] 上游返回错误（session=${sessionId}）：${reason}`);
-    throw new SessionError('llm_upstream_failed', `LLM 调用失败：${reason}`, { httpStatus: 502 });
-  }
-
-  let parsed = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch { /* 非 JSON：下面统一按「无法解析标题」处理 */ }
-  const title = sanitizeTitle(extractAssistantText(parsed));
+  const title = sanitizeTitle(text);
   if (title == null) {
     log?.warn?.(`[ai-title] 上游未返回可用标题（session=${sessionId}）`);
     throw new SessionError('llm_upstream_failed', 'LLM 未返回可用的标题', { httpStatus: 502 });
