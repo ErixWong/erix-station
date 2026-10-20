@@ -205,6 +205,30 @@ function buildModelPatch(callName: string | null): ModelPatch {
   };
 }
 
+// --- issue #314：「按当前窗口 1/4 重设」 ----------------------------------------------------
+// 为什么不是「清空」：真 LiteLLM v1.103.2 对 `litellm_params.max_tokens` 的显式 JSON `null` 是**忽略**
+// 语义（管理台与手工两条路各实测一次：返 200 但值一字未动；网关源码里能被 `null` 清的字段在一个
+// frozenset 白名单里，`max_tokens` 不在）⇒ 「手填过就再也撤不掉」。而管理员真正想要的不是「清空」，
+// 是「让平台重新按新窗口兜底」⇒ 直接把值设成 `floor(窗口/4)` 就覆盖了这个需求（与门户读侧回退同一个算法）。
+// ⚠ **这里不复制一份服务端的数字校验**（下限 65536 / 1/4 上限只有一处真相源：`portal/src/llm.js`）：
+// 下面的 `floor(/4)` 只是「替人按一下计算器」，填进去的值照样要过服务端，超限就把 `error.message` 原样透出。
+// 写第二套校验 = 多一个会过期的真相源（#309/#314 定死的口径），所以宁可不做本地拦截。
+const editWindowValue = computed<number | null>(() => {
+  // 窗口取**这一行**的现值：弹窗打开时输入框回填的就是它；管理员若在同一次编辑里改了窗口，
+  // 就用改后的那个数（否则「把窗口从 262144 扩到 512000 后按新窗口重设」这个主场景根本成立不了）。
+  const raw = modelEditForm.context_window;
+  const candidate = raw === '' ? editingModel.value?.context_window : Number(raw);
+  return typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate > 0 ? candidate : null;
+});
+const maxOutputQuarterWindow = computed(() => (editWindowValue.value === null ? null : Math.floor(editWindowValue.value / 4)));
+
+/** #314：把输出预算上限**填进输入框**（不提交、不发请求）；用户还能继续改，改完自己点保存。 */
+function resetMaxOutputToQuarterWindow() {
+  const quarter = maxOutputQuarterWindow.value;
+  if (quarter === null) return;
+  modelEditForm.max_output_tokens = String(quarter);
+}
+
 async function submitModelEdit(payload: ModelPatch) {
   const model = editingModel.value;
   if (!model) return;
@@ -605,12 +629,25 @@ onMounted(() => {
         <input v-model="modelEditForm.max_tokens" data-test="edit-model-max-tokens" type="number" min="1" placeholder="16384" class="rounded-md border border-black/20 px-2 py-1 text-sm">
         <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxTokensHint') }}</span>
       </label>
-      <!-- #309 切片 1：同上——提示可以写，本地校验不要写（否则就是第二套会过期的规则）。 -->
-      <label class="flex flex-col gap-1 text-xs text-black/55">
-        {{ t('admin.llm.colMaxOutputTokens') }}
-        <input v-model="modelEditForm.max_output_tokens" data-test="edit-model-max-output-tokens" type="number" min="1" placeholder="32000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
-        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputTokensHint') }}</span>
-      </label>
+      <!-- #309 切片 1：同上——提示可以写，本地校验不要写（否则就是第二套会过期的规则）。
+           #314：字段说明里写死「留空 = 不修改」（PATCH 省略字段），与新建表单的「留空发显式 null」不对称同屏说清；
+           「清空」做不到的事不给它「看起来能做」的错觉，只给一个把值填成 floor(窗口/4) 的重设按钮（不自动提交）。 -->
+      <div class="flex flex-col gap-1 text-xs text-black/55">
+        <label class="flex flex-col gap-1">
+          {{ t('admin.llm.colMaxOutputTokens') }}
+          <input v-model="modelEditForm.max_output_tokens" data-test="edit-model-max-output-tokens" type="number" min="1" placeholder="32000" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        </label>
+        <button
+          type="button"
+          data-test="reset-max-output-tokens"
+          :disabled="maxOutputQuarterWindow === null"
+          :title="maxOutputQuarterWindow === null ? t('admin.llm.maxOutputResetNeedsWindow') : t('admin.llm.maxOutputResetHint')"
+          class="self-start rounded-md border border-black/20 px-2 py-1 text-xs hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-50"
+          @click="resetMaxOutputToQuarterWindow"
+        >{{ t('admin.llm.maxOutputReset') }}</button>
+        <span data-test="edit-model-max-output-tokens-hint" class="text-[0.7rem] text-black/45">{{ t('admin.llm.editMaxOutputTokensHint') }}</span>
+        <span class="text-[0.7rem] text-black/45">{{ t('admin.llm.maxOutputResetHint') }}</span>
+      </div>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.inputCostLabel') }}
         <input v-model="modelEditForm.input_cost_per_1m" data-test="edit-model-input-cost" type="number" min="0" step="any" :disabled="modelEditForm.clear_pricing" class="rounded-md border border-black/20 px-2 py-1 text-sm disabled:bg-black/5">
