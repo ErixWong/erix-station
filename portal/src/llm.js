@@ -416,6 +416,63 @@ function validateMaxTokens(value) {
 }
 
 /**
+ * issue #318：门户**写侧**的上下文窗口硬下限（与 `validateMaxOutputTokens()` 的 1/4 上限并列）。
+ *
+ * ⚠ **定性：这是产品约束，不是引擎安全必需**（与 1/4 上限同一条定性，别当安全不变量）。
+ * 引擎唯一的致命判据是「压缩预算非正」（`erix-agent/src/compact/budget.js`：
+ * `ctx − maxOut − max(2000, ⌈10%·ctx⌉) ≤ 0` ⇒ `KitError invalid_budget`）。
+ * `ctx=32768 / maxOut=8192` 的预算约 **21,507**——引擎**跑得动**，我们拒它是产品决定。
+ * 真正兜住致命面的仍然是 runner 那道上游闸（带外配置根本不经过门户写侧，#309 切片 2b）。
+ *
+ * 为什么恰好是 65,536（2026-10-20 dev 栈实测，不是估的；**下一个人要改这个数请先看这三个数**）：
+ *   * 固定前缀（系统提示词 + 工具定义，实测 `usage.cacheRead`）≈ **3,328 tokens**；
+ *   * 一个「只回两个字」的最省单轮回回来回 = **3,829–4,404 tokens**；
+ *   * 近 7 天 35 条终态 run 的单 run 输入：**平均 27,641 / 最小 3,555 / 最大 257,207**。
+ * ⇒ 64 Ki ≈ 16 个最省的来回、≈ 平均单 run 用量的 **2.3 倍**；**32 Ki 只有 1.2 倍**（约第 8 个来回起
+ * 就开始反复压缩）。引擎「预算非正」的临界在 `ctx ≤ 2666`——那条才是致命线，64k 是**产品地板**。
+ *
+ * 病症（#318）：管理员把窗口手滑配成 2048、输出上限留空 ⇒ 门户**保存成功、零提示**，而 runner 的
+ * 上游闸把整对元数据不发给引擎 ⇒ **压缩静默关闭**（界面上看不见，只有 runner 一条 warn）。
+ * 有了这条下限，`ctx ≤ 2666` 那个死区**在门户里根本进不来**，不需要额外的提示逻辑。
+ */
+export const CONTEXT_WINDOW_MIN = 65_536;
+
+/**
+ * issue #318 + #325：`context_window` 的写侧校验。**三态**与其它字段同口径：
+ *   * `undefined`（PATCH 没带这个键）⇒ 不校验、不改写；
+ *   * `null` ⇒ 「没配窗口」（既有口径，读侧退到 `floor(ctx/4)` 也算不出 ⇒ `context_window_missing`）⇒
+ *     不设下限（#318 正文第 3 条：缺窗口是另一条既有口径，本单不收紧它）；
+ *   * 其它值 ⇒ ① **形态可得**（唯一判据 `positiveIntOrNull()`，#316/#325）② **`>= CONTEXT_WINDOW_MIN`**，
+ *     否则 `400 validation_failed` + `details={field:'context_window', reason:'too_small'|'not_positive_integer', min, value}`
+ *     ——**零新错误码**（§8.20），细分只靠 `details.reason`。
+ *
+ * ⚠ **返回值是归一后的 number**（#325）：调用方一律写这个返回值给网关，**不写原值**——今天写侧是
+ * 原样透传（带外 `PATCH {"context_window":"262144"}` 网关就存成字符串 `'262144'`），于是脏形态会永久
+ * 留在目录里。校验不过 ⇒ 抛错，**在发网关请求之前**返回（与 #296 的 `model_name_conflict` 同形状，
+ * 网关零部分写入）。
+ *
+ * @returns {number|null|undefined} 归一后的窗口值（`undefined` = 本次不改，`null` = 清空/没配）
+ */
+function validateContextWindow(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const window = positiveIntOrNull(value);
+  if (window === null) {
+    throw new LlmError('validation_failed', `上下文窗口必须是正整数（传入 ${value}）`, {
+      details: { field: 'context_window', reason: 'not_positive_integer', min: CONTEXT_WINDOW_MIN, value },
+    });
+  }
+  if (window < CONTEXT_WINDOW_MIN) {
+    throw new LlmError('validation_failed',
+      `上下文窗口不能低于 ${CONTEXT_WINDOW_MIN}（传入 ${value}）。低于此值平台算不出正的压缩预算` +
+      '（`窗口 − 输出上限 − max(2000, 10%×窗口)`），压缩会静默关闭', {
+      details: { field: 'context_window', reason: 'too_small', min: CONTEXT_WINDOW_MIN, value },
+    });
+  }
+  return window;
+}
+
+/**
  * issue #316：**token 数的唯一形态判据 = 正整数**，与 `runner/lib/llm-models.js` 的 `positiveIntOrNull()`
  * 是**同一条规则**（镜像测试在对面：`portal/test/llm.test.js` ↔ `runner/test/llm-models.test.js`）：
  *   * **数字串**（`"262144"`、带空白的 `" 262144 "`、`"262144.0"`、`"1e3"`）与**整值浮点** → **归一成正整数**（返回 `number`）；
@@ -462,9 +519,14 @@ function positiveIntOrNull(value) {
  * 留出窗口空间）。**要改这个比例得过决策者**，不要以「引擎兜得住」为理由自行放宽或拆掉。
  *
  * 零新错误码（§8.20）：一律 `validation_failed`，细分靠 `details.field` / `details.reason`。
+ *
+ * ⚠ **它读「窗口」只走 `positiveIntOrNull()`（#316），且它拿到的窗口已是 `validateContextWindow()` 的归一结果。**
+ * 返回值是给写侧用的**归一后正整数**（#325：落库写归一结果、不写调用方原值）。本函数的入口闸仍比
+ * `positiveIntOrNull()` **更严**（数字串 `"2000"` 今天照旧拒，`#309` 既有用例钉着）⇒ 这一步归一对本字段是
+ * 恒等的，保留它的理由是「写侧永远不拿原值」这条形状不变量，而不是为了兼容数字串。
  */
 function validateMaxOutputTokens(value, contextWindow) {
-  if (value === undefined || value === null) return;
+  if (value === undefined || value === null) return value;
   if (!Number.isInteger(value) || value < 1) {
     throw new LlmError('validation_failed', 'max_output_tokens 必须为正整数', {
       details: { field: 'max_output_tokens' },
@@ -487,6 +549,8 @@ function validateMaxOutputTokens(value, contextWindow) {
       { details: { field: 'max_output_tokens', max_allowed: maxAllowed, context_window: window } },
     );
   }
+  // #325：归一后才是**落库的值**（本函数的入口闸已保证它是正整数 ⇒ 这里是恒等归一，但写侧不再拿原值）。
+  return positiveIntOrNull(value);
 }
 
 /**
@@ -541,8 +605,12 @@ function validateCost(value, field) {
 export async function createModel(gateway, input = {}) {
   const client = getGatewayClient(gateway);
   validateMaxTokens(input.max_tokens);
+  // #318：**次序**——窗口自身的两条判据（形态 + 下限）排在「输出上限 ≤ 窗口 1/4」**之前**。
+  // 否则「窗口 1000 + 上限 500」会先报上限错（上限 250），把真正的病因（窗口配错了）藏起来。
+  // 与 #325 一起：拿到的就是归一后的 number，下面落库一律用它，**不再拿 `input.context_window` 原值**。
+  const contextWindow = validateContextWindow(input.context_window);
   // #309：新建只能拿本次提交的 context_window 判 1/4（没有「现存值」可退）。
-  validateMaxOutputTokens(input.max_output_tokens, input.context_window);
+  const maxOutputTokens = validateMaxOutputTokens(input.max_output_tokens, contextWindow);
   const inputCost = validateCost(input.input_cost_per_token, 'input_cost_per_token');
   const outputCost = validateCost(input.output_cost_per_token, 'output_cost_per_token');
   const modelName = input.model_name ?? input.model_id;
@@ -566,7 +634,7 @@ export async function createModel(gateway, input = {}) {
     ...(suppliedInfo.metadata ?? {}),
     ...(input.type === undefined ? {} : { type: input.type }),
     ...(input.tool_calling === undefined ? {} : { tool_calling: input.tool_calling === true }),
-    ...(input.context_window === undefined ? {} : { context_window: input.context_window }),
+    ...(input.context_window === undefined ? {} : { context_window: contextWindow }),
   };
   const model_info = {
     ...suppliedInfo,
@@ -574,11 +642,11 @@ export async function createModel(gateway, input = {}) {
     ...(input.name === undefined ? {} : { display_name: input.name }),
     ...(input.type === undefined ? {} : { type: input.type }),
     ...(input.tool_calling === undefined ? {} : { tool_calling: input.tool_calling === true }),
-    ...(input.context_window === undefined ? {} : { context_window: input.context_window }),
+    ...(input.context_window === undefined ? {} : { context_window: contextWindow }),
     ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
   };
   // #309：绑死双写必须在 legacy `max_tokens` 之后（见 applyMaxOutputTokensWrite）。
-  applyMaxOutputTokensWrite(params, model_info, input.max_output_tokens, { isCreate: true });
+  applyMaxOutputTokensWrite(params, model_info, maxOutputTokens, { isCreate: true });
   const normalizedModelName = modelName.trim();
   const existingIds = new Set(
     gatewayModels(await client.listModels())
@@ -644,6 +712,12 @@ export async function updateModel(gateway, id, {
 } = {}) {
   const client = getGatewayClient(gateway);
   validateMaxTokens(max_tokens);
+  // #318：**次序与位置**——窗口自身的两条判据（形态 + 下限）既排在「输出上限 ≤ 窗口 1/4」**之前**，
+  // 也排在**任何网关请求之前**（PATCH 要读的 `findGatewayModel` 也算请求）⇒ 窗口配错时网关**零请求**、
+  // 零部分写入（与 #296 的 `model_name_conflict` 同一个形状）。理由：否则「窗口 1000 + 上限 500」会先报
+  // 上限错（上限 250），把真正的病因（窗口配错了）藏起来。
+  // #325：拿到的就是归一后的 number ⇒ 下面 `metadata` / `model_info` 一律写它，**不写调用方原值**。
+  const contextWindow = validateContextWindow(context_window);
   const inputCost = validateCost(input_cost_per_token, 'input_cost_per_token');
   const outputCost = validateCost(output_cost_per_token, 'output_cost_per_token');
   const pricingTouched = input_cost_per_token !== undefined || output_cost_per_token !== undefined;
@@ -668,9 +742,10 @@ export async function updateModel(gateway, id, {
   // #309：1/4 校验用的**有效** context_window——本次提交的新值优先（同一条 PATCH 里两者都改时
   // 不能拿旧窗口判新预算），否则退到该模型现存的 model_info.context_window（走 toModel，与门户
   // 列表同一个口径，不另取字段）。两者都没有 ⇒ 拒绝，不写半套。
-  validateMaxOutputTokens(
+  // ⚠ 本函数在 `validateContextWindow()` **之后**（#318 D2 的次序），且拿的是已归一的窗口值。
+  const maxOutputTokens = validateMaxOutputTokens(
     max_output_tokens,
-    context_window !== undefined ? context_window : toModel(current).context_window,
+    context_window !== undefined ? contextWindow : toModel(current).context_window,
   );
   // #296 实测：LiteLLM **不拦同名**（两个 deployment 改成同一个 model_name 都返 200），而数据面
   // 按名字选 deployment ⇒ 同名之后同一个名字的请求会在两个 deployment 间轮询（真机探针 5 发
@@ -710,7 +785,7 @@ export async function updateModel(gateway, id, {
     const metadata = { ...(info.metadata ?? {}) };
     if (type !== undefined) metadata.type = type;
     if (tool_calling !== undefined) metadata.tool_calling = tool_calling === true;
-    if (context_window !== undefined) metadata.context_window = context_window;
+    if (context_window !== undefined) metadata.context_window = contextWindow;
     // #296: `call_name` 只进**顶层** `model_name`（数据面）。实测：LiteLLM 改数据面名**不会**
     // 顺手改或清 `model_info.display_name`（探针：改名后 display_name 原值仍在），所以两个字段
     // 可以同一条 PATCH 各写各的。
@@ -722,7 +797,7 @@ export async function updateModel(gateway, id, {
         ...(type === undefined ? {} : { type, mode: typeToMode(type) }),
         ...(name === undefined ? {} : { display_name: name }),
         ...(tool_calling === undefined ? {} : { tool_calling: tool_calling === true }),
-        ...(context_window === undefined ? {} : { context_window }),
+        ...(context_window === undefined ? {} : { context_window: contextWindow }),
         metadata,
       };
     }
@@ -737,7 +812,7 @@ export async function updateModel(gateway, id, {
       // 前提：上面 model_info 块的触发条件已包含 `max_output_tokens !== undefined` ⇒ 这里
       // `update.model_info` 一定存在，不需要再兼容缺失分支。
       if (max_output_tokens !== undefined) {
-        applyMaxOutputTokensWrite(params, update.model_info, max_output_tokens, { isCreate: false });
+        applyMaxOutputTokensWrite(params, update.model_info, maxOutputTokens, { isCreate: false });
       }
       // Explicit null clears the rate: LiteLLM removes a field that arrives as null from
       // both litellm_params and model_info (NULL_CLEARABLE_LITELLM_PARAMS). Omitting it

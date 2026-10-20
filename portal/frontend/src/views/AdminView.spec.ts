@@ -627,6 +627,89 @@ describe('AdminView · LLM 管理', () => {
     wrapper.unmount();
   });
 
+  // --- issue #314：「按当前窗口 1/4 重设」与「留空 = 不修改」------------------------------------
+  // 真网关上这个字段**只能设值不能清空**（v1.103.2 对 `litellm_params.max_tokens` 的显式 null 是忽略
+  // 语义）⇒ 不再做「清空」，改给一个把值填成 `floor(窗口/4)` 的动作。**只填值不提交**是这张单的硬要求。
+  it('#314 「按当前窗口 1/4 重设」只填值（PATCH 数为 0），点保存才发出 PATCH 且形状对', async () => {
+    const { wrapper, fetchFn } = await mountAdmin('/admin/llm', (url, init) => {
+      if (url === '/api/admin/llm/providers') return jsonResponse(200, PROVIDERS_MAX_OUTPUT);
+      if (url === '/api/admin/llm/models/m1' && init?.method === 'PATCH') return jsonResponse(200, {});
+      return undefined;
+    });
+    await wrapper.findAll('[data-test="model-row"]')[0].get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    const maxOutput = editForm.get('[data-test="edit-model-max-output-tokens"]');
+    const reset = editForm.get('[data-test="reset-max-output-tokens"]');
+    // 它是个普通按钮，不是提交按钮（否则点一下就发 PATCH 了）。
+    expect(reset.attributes('type')).toBe('button');
+
+    // 先把它改成别的数，否则「重设后的值」与回填值相同，断言分不出重设真的算了还是什么都没做。
+    await maxOutput.setValue('60000');
+    await reset.trigger('click');
+    // 行现值 context_window = 200000 ⇒ floor(200000/4) = 50000（不是 60000、不是窗口本身）。
+    expect((maxOutput.element as HTMLInputElement).value).toBe('50000');
+    // **只是填值**：一个 PATCH 都没发。
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1')).toHaveLength(0);
+
+    // 窗口取的是**这一行**当前那张表单里的窗口：改了窗口再重设 ⇒ 跟着新窗口走
+    // （「把窗口从 200000 改到 262144 后按新窗口重设」就是 #314 的主场景）。
+    await editForm.get('[data-test="edit-model-context-window"]').setValue('262144');
+    await reset.trigger('click');
+    expect((maxOutput.element as HTMLInputElement).value).toBe('65536');
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1'),
+      '重设本身永远不发请求（用户还要继续编辑，提交得由他点保存）').toHaveLength(0);
+
+    await editForm.trigger('submit.prevent');
+    await flushPromises();
+    const patches = callsTo(fetchFn, 'PATCH', '/api/admin/llm/models/m1');
+    expect(patches).toHaveLength(1);
+    const body = JSON.parse(String(patches[0]?.[1]?.body));
+    expect(body.max_output_tokens, '重设填进去的数真的会随保存提交').toBe(65536);
+    expect(body.context_window).toBe(262144);
+    expect(body.name).toBe('GPT-4o');
+    wrapper.unmount();
+  });
+
+  it('#314 没填窗口 ⇒ 重设按钮禁用（不拿 null 去算一个数）', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm', (url) => (
+      url === '/api/admin/llm/providers' ? jsonResponse(200, PROVIDERS_MAX_OUTPUT) : undefined
+    ));
+    await wrapper.findAll('[data-test="model-row"]')[1].get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    // m2：context_window 与 max_output_tokens 都是 null ⇒ 算不出 1/4
+    const reset = editForm.get('[data-test="reset-max-output-tokens"]');
+    expect((reset.element as HTMLButtonElement).disabled).toBe(true);
+    await reset.trigger('click');
+    expect((editForm.get('[data-test="edit-model-max-output-tokens"]').element as HTMLInputElement).value).toBe('');
+    wrapper.unmount();
+  });
+
+  it('#314 字段说明里写明了「留空 = 不修改」，新建侧写明留空 = 不写该字段（两个表单不同义）', async () => {
+    const { wrapper } = await mountAdmin('/admin/llm', (url) => (
+      url === '/api/admin/llm/providers' ? jsonResponse(200, PROVIDERS_MAX_OUTPUT) : undefined
+    ));
+    await wrapper.get('[data-test="model-row"]').get('[data-test="edit-model"]').trigger('click');
+    const editForm = wrapper.get('[data-test="edit-model-form"]');
+    // 说明就挂在这个字段上（不是满屏找一句总括）。
+    const hint = editForm.get('[data-test="edit-model-max-output-tokens-hint"]');
+    expect(hint.text()).toContain('留空 = 不修改');
+    expect(hint.text(), '上限规则一句也要在同一处（前端不做本地校验，只靠文案）').toContain('1/4');
+    // 重设按钮自己说清「只填值、不保存」（避免被当成「点一下就生效」）。
+    expect(editForm.get('[data-test="reset-max-output-tokens"]').text()).toContain('按当前窗口 1/4 重设');
+    expect(editForm.text()).toContain('不会自动保存');
+    wrapper.unmount();
+
+    // 新建表单：留空**不是**「不修改」，发的是显式 null（= 不写该键）⇒ 文案不得两边同句。
+    const add = await mountAdmin('/admin/llm', (url) => (
+      url === '/api/admin/llm/providers' ? jsonResponse(200, PROVIDERS_MAX_OUTPUT) : undefined
+    ));
+    await add.wrapper.get('[data-test="open-add-model"]').trigger('click');
+    const addForm = add.wrapper.get('[data-test="add-model-form"]');
+    expect(addForm.text()).toContain('新建时留空 = 不写这个字段');
+    expect(addForm.text()).not.toContain('留空 = 不修改');
+    add.wrapper.unmount();
+  });
+
   it('删除请求失败时确认 modal 保持打开并展示错误', async () => {
     const { wrapper } = await mountAdmin('/admin/llm', (url, init) => {
       if (url === '/api/admin/llm/providers/p1' && init?.method === 'DELETE') {
