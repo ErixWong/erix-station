@@ -929,6 +929,8 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **发版**：本单**动 `runner/`** ⇒ 三镜像 + `FDE_IMAGE` pin + **`docker rm -f` 七台让 reconcile 重建**（§8.17；不重建就还是容器侧自己起标题）。
 
+**真机验收抓到一格（v0.1.20 静默降级，2026-10-20 夜班，分支 `fix-261020-07-322-gateway`）**：合并树发了 v0.1.20 后我去真机跑「发消息 → run 终态 → 标题自动变」，**标题落的是降级链第 2 级「首条用户消息截断」，portal 日志一条 `[auto-title]` 都没有**。A/B 直接打在 portal 容器里（同一会话同一 run `e11dc9ce…`）：不带 `config` ⇒ `null`/79ms + `LLM 生成失败，退到降级链`；带 `LLM_GATEWAY_ADMIN_URL` ⇒ `"助手能力与交付说明"`/1472ms。**根因是接线，不是生成逻辑**：`http.js → internal.setRunState` 与 `finishRun → scheduleAutoTitle` 两跳都没带 `config` ⇒ `title-llm.js` 退回默认网关 `http://127.0.0.1:4100`，而**该地址在 portal 容器内 ECONNREFUSED**（容器里实测 `curl 127.0.0.1:4100/health/liveliness` = Connection refused；容器内只能走 `http://station-litellm:4000`）⇒ 每次自动改名都静默降级，而**界面看不出异常**（标题照样会变，只是从来不是模型起的）。⇒ 与 §8.25「必须传 `ctx.llmGateway` 单例」同族：**单测全都自己注入 config/gatewayUrl，结构上看不见这两跳**。修法 = 两跳各带 `config`；判据 = 新 `portal/test/session-auto-title-wiring.test.js` 3 条（两跳源码级锁 + 把「缺网关键 ⇒ 打到那个不可达地址」的后果本身钉住，防有人只改默认值就当接线修好了）。主 agent 亲跑变异 2 条各恰 1 条红在对应那条。基线根 **1290 / 1286 / 0 / 4**、runner 311、前端 585（前端零改动）。**教训：把「真机 R-1」留给别人/留给以后 = 把交付判据留空——这格从合并到实测隔了一整个版本。**
+
 **过程账（同一个坑的第二次发作，代价 = 两小时）**：worker 连撞两次 30 分钟超时（我传的 50 分钟未生效，**实测上限就是 1800000ms**），两次都**没有 commit**；第一次的补丁与当时新合并的 PR #326 冲突（整份应用会删掉 `llm-chat.js`）⇒ 只能重做；第二次的补丁基点正好是当前 main ⇒ 主 agent `git apply` 落到分支后测出「只差一把跨文件锁」。**口径：worker 的补丁落主仓后必须先跑一遍数出真实缺口，再决定补哪里；跨文件读源码的锁在被读文件被删时必红，删它必须同时改锁的方向。**
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
