@@ -447,14 +447,19 @@ function positiveIntOrNull(value) {
  *
  * 三态与 `max_tokens`/定价同一口径：`undefined` = 不动、`null` = 清空、正整数 = 设定。
  *
- * 硬上限（决策者定稿）：**不得超过 `context_window` 的 1/4**。这条比引擎侧
- * `computeBudget()` 的临界值 `ctx - max(2000, ⌈10%·ctx⌉) - 1` **更严**（#309 定稿的理由：
- * 1/4 是管理员能心算的数，不要求他们先去翻一遍预算公式），引擎侧那条作为绝对兜底保留，
- * **双保险，谁都不许拆**。不拦的后果（主 agent 在 0.20.0 包上实跑复现，不是推论）：值一旦让
- * `ctx - max(2000, ⌈10%·ctx⌉) - maxOutputTokens ≤ 0`，`runToolLoop` 会在**第 1 轮之前**就抱
- * `KitError code=invalid_budget`（`retryable=false`，实测文案 `Computed context budget must be
- * positive (got -71)`，`src/compact/budget.js:23-25`，调用点 `src/loop/orchestrator.js:1141-1148`
- * **没有 try/catch**）⇒ **每个 run 启动即死**，且错误现场只指向引擎，不指向门户里那个输入框。
+ * 硬上限（决策者定稿）：**不得超过 `context_window` 的 1/4**。⚠ **它的定性是「产品约束」，
+ * 不是「引擎安全的必需条件」**（2026-10-20 独立审计判过我们原来的措辞过度，按它改口）：
+ *  1. 引擎真正的致命判据只有 `ctx - max(2000, ⌈10%·ctx⌉) - maxOutputTokens ≤ 0` ⇒ 抛
+ *     `KitError code=invalid_budget`（`retryable=false`，实测文案 `Computed context budget must be
+ *     positive (got -71)`，`src/compact/budget.js:23-25`，调用点 `src/loop/orchestrator.js:1141-1148`
+ *     **没有 try/catch** ⇒ 第 1 轮之前就死，且错误现场只指向引擎、不指向门户那个输入框）。
+ *  2. 本上限比那条临界**更严**（`ctx=262144`：临界 ≈235928，1/4 = 65536）⇒ 它会拒掉**引擎其实跑得动**
+ *     的值（同一个例子填 `200000`：预算 35929 为正、能跑，只是几乎每轮都在压缩）。所以「不拦就会启动即死」
+ *     只对**超过临界**的值成立，对「超过 1/4 但未超临界」的值不成立 —— 别拿它当安全不变量。
+ *  3. 而且**带外配置根本不经过这里**（直接在 LiteLLM 上改的数、历史存量）⇒ 真正兜住致命面的是
+ *     runner 侧那道注入的上游闸（切片 2b，`runner/lib/llm-models.js`），不是这条写侧校验。
+ * 留着的理由是**产品性的**（决策者 #309 原话：1/4 是管理员能心算的数，不必先去翻预算公式；同时给输入
+ * 留出窗口空间）。**要改这个比例得过决策者**，不要以「引擎兜得住」为理由自行放宽或拆掉。
  *
  * 零新错误码（§8.20）：一律 `validation_failed`，细分靠 `details.field` / `details.reason`。
  */
@@ -934,7 +939,9 @@ async function reconcileHeartbeatNames(pool, userId, row, client, { now, ttlMs, 
  * #309 切片 1：心跳下行的模型元数据（决策者定稿）。
  *
  * **只在非 null 时带键**：没有值就整个键都不出现，而不是写 `key: null`（runner 切片 2 用「键在不
- * 在」判有无，不解析 null）。切片 1.5 之后「没值」只剩一种：**连 `context_window` 都没配**——
+ * 在」判有无，不解析 null）。#316/#317 之后「没值」是**三种**：① 连 `context_window` 都没配；
+ * ② 窗口形态两侧都不认（真小数 / ≤0 / 非数字 ⇒ `positiveIntOrNull()` 判不可得）；③（下行侧不会发生，
+ * 但压缩侧会）窗口小到 1/4 兜底仍算不出正预算 ⇒ runner 那道上游闸把整对拦掉——
  * ⚠ 行为变化（有意）：`context_window` 配了但没手填过预算的存量部署，现在会**开始带**
  * `context_window` + `max_output_tokens=ctx/4` 两个键，不再与 #309 之前逐字节相同；而**不传
  * gateway 的老调用形状**一个字节都不变（兼容面，llm.test.js / llm-reconcile.test.js 钉着）。

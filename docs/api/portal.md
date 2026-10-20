@@ -1003,8 +1003,18 @@ station-portal user enable  --login <login>
 - **上下文**：该会话最早的 3 条 `user` 消息，各折叠空白并截断 200 字符；要求模型只输出标题本身。
 - **provider 解析**：仅使用会话属主 FDE 的 active LiteLLM binding；Station 存储槽位 `model_info.id`，请求体使用配套 LiteLLM `model_name`。不回退已退役的 Station provider/model 目录；没有有效 binding → `409 llm_not_configured`。
 - **调用**：`POST <llmGatewayUrl>[/v1]/chat/completions`（`llmGatewayUrl` 已含 `/v1` 则不重复拼接），使用 per-FDE virtual key，超时 15s。
+- **请求体固定带 `max_tokens: 512`（#315）**：不发时 LiteLLM 会注入该 deployment 的 `litellm_params.max_tokens`
+  （#309 切片 1 起 = 模型级「单次输出预算上限」，现网 32768），那是给整个模型设的预算、不是给一行标题设的；
+  `context_window` 被配得很小时（管理员笔误）上游会按「prompt + 预留 32768」判超限 ⇒ **这条请求被拒**，症状是
+  「点了 AI 改名没反应」（不是 run 失败）。512 与 `runner/lib/session-title.js` 的 `maxTokens: 512` **同一个数**
+  （两条路径干同一件事），由 `portal/test/session-ai-title.test.js` 钉住。
 - **落库**：响应经 `sanitizeTitle` 清洗（去引号/取首行/截 30 字）后写 `title` + `title_source='manual'` + `updated_at`；推一条 `session_updated`（同 #88/#107，不落 `run_events`）。
-- **决策豁免**：issue #88 定下「portal 不持 LLM 客户端」（标题由 agent 侧随 run 终态上报）；本端点是用户拍板（2026-10-01）的**修订豁免**，范围仅限本端点。
+- **例外范围**：本端点是用户拍板（2026-10-01，#114）的一次性命名调用，**仅限本端点**；其余路径不得由 portal 发 LLM 请求。
+  ⚠ **出处更正（2026-10-20）**：此处过去写「原则出自 #88『portal 不持 LLM 客户端』」——**记错了**，#88 原文是
+  「只动 portal + 前端展示；runner/agentd 零改动（标题是 portal 会话元数据，不是引擎事务）」，与该「原则」方向相反。
+  现状是标题有**两份实现**（`runner/lib/session-title.js` ↔ `portal/src/session-title.js` 镜像，`AUTO_TITLE_MAX_LEN=30`
+  与 `sanitizeTitle` 各一份、**无测试锁**）；把标题**统一到 portal 侧**已登记 **issue #322**（那是真减一份代码，
+  #315 就是这份重复开的第一张账单）。
 - **key 纪律**：LiteLLM virtual key 只进 `Authorization` 头，**绝不进日志/错误信息/响应**（上游回显的 key 亦被脱敏）。
 
 请求体：无（空 JSON `{}`）。
