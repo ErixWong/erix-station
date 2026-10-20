@@ -2600,7 +2600,9 @@ async function handleInternal(req, res, ctx, url) {
       if (req.method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
-      const result = await internal.setRunState(ctx.pool, { container, user, runId, claimToken, body });
+      // #322 真机取证：`config` 必须下传 —— 自动改名要在 portal 侧调网关，网关地址只有 ctx.config 里那份
+      // （`llmGatewayAdminUrl`）在容器里可达；漏传 ⇒ 退回 `127.0.0.1:4100` ⇒ ECONNREFUSED ⇒ 静默降级。
+      const result = await internal.setRunState(ctx.pool, { container, user, runId, claimToken, body, config: ctx.config });
       return sendJson(res, 200, result);
     }
     if (sub === '/events') {
