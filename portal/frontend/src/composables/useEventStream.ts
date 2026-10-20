@@ -169,6 +169,94 @@ function attemptKilledCauseText(killedBy: unknown, reason: unknown): string {
   return typeof reason === 'string' && reason !== '' ? reason : t('stream.event.attemptKilledUnknown');
 }
 
+function judgeOptionalDash(value: unknown, max: number): string {
+  return typeof value === 'string' && value !== ''
+    ? t('stream.event.dash', { value: value.slice(0, max) })
+    : '';
+}
+
+// 引擎已知 action 全集（orchestrator 轮末 judge + run-snapshot-executor 中途审计，已对 0.20.0 源码核实）；
+// 集合外的新增值（引擎演进 additive）一律中性透传，不反推任何语义。
+const JUDGE_KNOWN_ACTIONS = new Set([
+  'executed', 'blocked', 'degraded', 'judge_done', 'nudge', 'continue',
+  'extend', 'extend+redirect', 'decline_extend',
+]);
+
+/**
+ * issue #321（erix-station）：judge 事件的展示文本——judge 永远只是**意见**，不是验收；
+ * 「已完成」的唯一来源是 run 终态（run_end 分隔行），本函数绝不驱动运行态状态机。
+ * 分轴拼装（四个维度非互斥，可同时非空）：
+ *   ① 工具审计：只有 `executed`（放行，**非任务完成**）/ `blocked`（拦截）/ `passThrough`（放行+模式）
+ *     是审计结论；`extend` / `extend+redirect` / `decline_extend` 是扩轮处置而非审计结论——实测存在
+ *     kind=intercept 而 action=extend+redirect、真实审计为拦截的情形，从这类 action 反推「工具已执行」
+ *     会被骗，故带工具对象的事件一律走中性「结果未知，执行与否以工具卡片为准」；
+ *   ② 目标判断：done=true 固定文案「评审认为目标已达成（未独立核验；是否收尾由模型自行判定）」——
+ *     本站 runner 不传 finalGuard ⇒ verification 恒 skipped，文案不得写成已完成/已核验；confidence
+ *     仅有限数才原样透出（不虚构 tier、不做成本估算，那些属 #282）；
+ *   ③ 方向：只展示 off_track / uncertain（on_track 是常态不刷屏）；
+ *   ④ 扩轮：取自 decision.extend，与 ②③ 共存，不再提前 return 遮掉其它轴。
+ * degraded（评审调用失败，decision=null）与引擎新增的未知 action 走中性降级：灰色 judge 面板行，
+ * 不刷红、不解读、不承诺。实时流与历史回放（replayEvent→dispatch）共用本函数，红线：两路同文案。
+ */
+function judgeAxesText(d: Record<string, any>): string {
+  const dec = (d.decision !== null && typeof d.decision === 'object') ? d.decision : {};
+  const action = typeof d.action === 'string' ? d.action : '';
+  const passThrough = typeof d.passThrough === 'string' && d.passThrough !== '' ? d.passThrough : '';
+  // 审计面的证据只有 kind=intercept 或 tool 对象：引擎的 extensionDecision 会把事件标成 kind=round
+  // 但仍带 tool（run-snapshot-executor），所以两个判据都要看。
+  const hasToolAudit = d.kind === 'intercept' || (d.tool !== null && typeof d.tool === 'object');
+
+  // 中性降级：评审没给出意见（parse/timeout/error），也不代办工具是否执行了的结论。
+  if (action === 'degraded') {
+    const why = typeof d.error === 'string' && d.error !== '' ? d.error : 'unknown';
+    return t('stream.event.judgeAxes', { axes: t('stream.event.judgeDegraded', { error: why }) });
+  }
+
+  const axes: string[] = [];
+  // ① 工具审计轴（extend 族/轮次处置不落入本轴，带工具时走中性「以工具卡片为准」）。
+  if (passThrough !== '') axes.push(t('stream.event.judgeAuditPassThrough', { mode: passThrough }));
+  else if (action === 'executed') axes.push(t('stream.event.judgeAuditExecuted'));
+  else if (action === 'blocked') axes.push(t('stream.event.judgeAuditBlocked'));
+  else if (hasToolAudit && action !== '') axes.push(t('stream.event.judgeAuditUndecided', { action }));
+  // ② 目标判断轴（纯意见；置信度是带括号的可选后缀片段，直接贴在目标轴尾，同 dash/paren 口径；
+  // reason 作为独立片段，无 done 也不丢信息）。
+  if (dec.done === true || dec.done === false) {
+    let goal = dec.done
+      ? t('stream.event.judgeGoalDoneTrue')
+      : t('stream.event.judgeGoalDoneFalse');
+    if (Number.isFinite(dec.confidence)) {
+      goal += t('stream.event.judgeConfidence', { confidence: dec.confidence });
+    }
+    axes.push(goal);
+  }
+  if (typeof dec.reason === 'string' && dec.reason !== '') {
+    axes.push(t('stream.event.judgeReason', { value: dec.reason.slice(0, 120) }));
+  }
+  // ③ 方向轴。
+  if (dec.direction === 'off_track') {
+    axes.push(t('stream.event.judgeDirectionOffTrack') + judgeOptionalDash(dec.directionReason, 60));
+  } else if (dec.direction === 'uncertain') {
+    axes.push(t('stream.event.judgeDirectionUncertain') + judgeOptionalDash(dec.directionReason, 60));
+  }
+  // ④ 扩轮轴（取自 decision.extend；不反推审计结论）。
+  if (dec.extend === true) {
+    const plan = typeof dec.plan === 'string' && dec.plan !== ''
+      ? t('stream.event.dash', { value: String(dec.plan).slice(0, 80) }) : '';
+    const why = typeof dec.extendReason === 'string' && dec.extendReason !== ''
+      ? t('stream.event.paren', { value: String(dec.extendReason).slice(0, 60) }) : '';
+    axes.push(t('stream.event.judgeExtendSuggest') + plan + why);
+  } else if (dec.extend === false) {
+    axes.push(t('stream.event.judgeExtendDecline') + judgeOptionalDash(dec.extendReason, 80));
+  }
+  // 未知 action（引擎 additive 新值）：中性原样透传，不解读（已有审计/处置轴能说明的不重复追加）。
+  if (action !== '' && !JUDGE_KNOWN_ACTIONS.has(action)) {
+    axes.push(t('stream.event.judgeUnknownAction', { action }));
+  }
+  return t('stream.event.judgeAxes', {
+    axes: axes.length > 0 ? axes.join(' · ') : t('stream.event.judgeNoDetail'),
+  });
+}
+
 export interface EventStreamHooks {
   /** roundsep / 系统分隔行（judge/compaction/run_end 灰色文案等；judge 事件带 variant='judge'，由面板样式高亮）。 */
   onSep: (text: string, variant?: 'judge') => void;
@@ -417,30 +505,10 @@ export function useEventStream(hooks: EventStreamHooks) {
         return;
       }
       case 'judge': {
-        // 0.9.0 引擎载荷（已对源码核实）：extend/extendReason/plan 在 d.decision 内
-        // （orchestrator round judge）；passThrough 挂在 intercept 类事件上
-        // （checkpoint-executor，action='executed' + passThrough='on_track'|'readonly'）。
-        const dec = d.decision ?? {};
-        if (d.passThrough) { hooks.onSep(t('stream.event.judgePassThrough', { mode: d.passThrough }), 'judge'); return; }
-        if (dec.extend === true) {
-          hooks.onSep(t('stream.event.judgeExtend', {
-            dash: dec.plan ? t('stream.event.dash', { value: String(dec.plan).slice(0, 80) }) : '',
-            paren: dec.extendReason ? t('stream.event.paren', { value: String(dec.extendReason).slice(0, 60) }) : '',
-          }), 'judge');
-          return;
-        }
-        if (dec.extend === false) {
-          hooks.onSep(t('stream.event.judgeNoExtend', {
-            dash: dec.extendReason ? t('stream.event.dash', { value: String(dec.extendReason).slice(0, 80) }) : '',
-          }), 'judge');
-          return;
-        }
-        if (d.kind === 'intercept' || d.action) {
-          hooks.onSep(t('stream.event.judgeAction', {
-            action: d.action ?? '',
-            dash: dec.reason ? t('stream.event.dash', { value: dec.reason }) : '',
-          }), 'judge');
-        }
+        // issue #321：唯一生成点（实时帧与历史回放 dispatch 共用），分轴拼装；只出灰色 judge 面板行，
+        // 绝不驱动运行态状态机（意见≠终态，终态只来自 run_end）；旧版 passThrough/extend 提前 return
+        // 会遮掉 done/uncertain，现按轴独立拼装不再互遮蔽。
+        hooks.onSep(judgeAxesText(d), 'judge');
         return;
       }
       // 0.9.0 新事件类型（issue #43）：compaction = 上下文折叠（详情在 d.compaction，

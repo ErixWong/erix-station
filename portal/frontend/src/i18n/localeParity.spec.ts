@@ -168,4 +168,50 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
       expect(noDur, locale).not.toMatch(/ms|undefined|null/);
     }
   });
+
+  // issue #321：judge 是分轴**意见**文案——语义红线双语成对钉死：
+  //   * done=true 必须说「未独立核验 + 是否收尾由模型自行判定」（本站 runner 不传 finalGuard，
+  //     verification 恒 skipped，没有任何独立核验可承诺）；
+  //   * executed 必须自带「非任务完成」语义（ISSUES.md 第 4 条的放大器就是旧文案把放行读成完成）；
+  //   * 审计轴不得出现「已完成/已核验/已验证」这类承诺（zh）/ 肯定式 completed・verified（en）。
+  // 反证锚：文案退回旧措辞（judge：executed / judge：扩轮 / 无「未独立核验」）时本用例变红。
+  it('issue #321：judge 文案是意见不是验收——done=true 声明未独立核验，executed 不得暗示任务完成', () => {
+    const zh = zhCN.stream.event;
+    const enEv = en.stream.event;
+    // 分轴键集必须成对（顶层叶子键对齐用例已综合兜底，这里额外点名本单新增键，防整体重命名躲过检测）。
+    for (const key of [
+      'judgeAxes', 'judgeAuditExecuted', 'judgeAuditPassThrough', 'judgeAuditBlocked', 'judgeAuditUndecided',
+      'judgeGoalDoneTrue', 'judgeGoalDoneFalse', 'judgeConfidence', 'judgeReason',
+      'judgeDirectionOffTrack', 'judgeDirectionUncertain', 'judgeExtendSuggest', 'judgeExtendDecline',
+      'judgeDegraded', 'judgeUnknownAction', 'judgeNoDetail',
+    ] as const) {
+      expect(typeof zh[key], `zh judge.${key}`).toBe('string');
+      expect(typeof enEv[key], `en judge.${key}`).toBe('string');
+    }
+    // done=true：未独立核验 + 收尾自判，两语都在。
+    expect(zh.judgeGoalDoneTrue).toContain('未独立核验');
+    expect(zh.judgeGoalDoneTrue).toContain('是否收尾由模型自行判定');
+    expect(enEv.judgeGoalDoneTrue).toMatch(/not independently verified/);
+    expect(enEv.judgeGoalDoneTrue).toMatch(/model itself decides whether to wrap up/);
+    // executed：必须自带「非任务完成」对语义。
+    expect(zh.judgeAuditExecuted).toContain('非任务完成');
+    expect(enEv.judgeAuditExecuted).toMatch(/not task completion/i);
+    // 承诺红线：审计轴/降级/未知动作文案不得出现已核验/已验证/已完成（zh）；
+    // en 侧除 judgeGoalDoneTrue 的否定式外不得出现裸 verified，也不得出现 completed 承诺。
+    for (const [locale, ev] of [['zh-CN', zh], ['en', enEv]] as const) {
+      for (const [key, value] of Object.entries(ev)) {
+        if (!key.startsWith('judge') || typeof value !== 'string') continue;
+        expect(value, `${locale} judge.${key} 不得承诺核验`).not.toMatch(/已核验|已验证/);
+        if (key === 'judgeGoalDoneTrue') continue; // 唯一允许出现「核验」字样处，且必为「未…核验」
+        expect(value, `${locale} judge.${key} 不得出现核验/完成承诺`).not.toMatch(/核验|已验证|已完成/);
+        if (key !== 'judgeGoalDoneTrue') expect(value, `${locale} judge.${key}`).not.toMatch(/verified/i);
+      }
+      expect(zh.judgeGoalDoneTrue).toMatch(CJK);
+      expect(enEv.judgeGoalDoneTrue).not.toMatch(CJK);
+    }
+    // 分轴模板形状：axes 占位符存在，旧三态互斥模板（{action}{dash} 直接透传引擎枚举）不得回潮。
+    expect(zh.judgeAxes).toContain('{axes}');
+    expect(enEv.judgeAxes).toContain('{axes}');
+    expect(zh.judgeAxes).not.toContain('{action}');
+  });
 });
