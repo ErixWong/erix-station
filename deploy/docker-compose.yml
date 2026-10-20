@@ -183,9 +183,12 @@ services:
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}
       ERIX_SHELL_MAX_TIMEOUT_MS: ${ERIX_SHELL_MAX_TIMEOUT_MS:-600000}
       ERIX_SHELL_OUTPUT_MAX_BYTES: ${ERIX_SHELL_OUTPUT_MAX_BYTES:-32768}
-      # issue #88 修订：会话标题生成移到 worker 侧（随 run_finished 上报，portal 落库）；
-      # 开关同名下发 FDE 容器 env（'0' 关），portal 侧同 env 控制落库评估。下发光纤同 issue #84 P5。
-      ERIX_SESSION_AUTO_TITLE: ${ERIX_SESSION_AUTO_TITLE:-1}
+      # 会话自动改名开关。**默认关（2026-10-21 决策者拍：对齐 issue #114）**——默认标题 = 首条用户提问截断，
+      # 要换成模型起的名字由用户自己点「AI 改名」。#114 把代码默认改成关（省 token）时漏改了这一行（它出自
+      # #88 修订 `125eae9`，那时生成还在 worker 侧），于是「默认关」在任何 compose 部署上从未生效。
+      # ⚠ #322 之后**生成者只有 portal**（runner 那份已删、不再读该 env），所以这里的默认值就是全站默认值；
+      #   与代码默认的一致性由 `portal/test/deploy-env-defaults.test.js` 双向钉住。
+      ERIX_SESSION_AUTO_TITLE: ${ERIX_SESSION_AUTO_TITLE:-0}
       PORTAL_PUBLIC_BASE_URL: ${PORTAL_PUBLIC_BASE_URL:-}
       LLM_PUBLIC_BASE_URL: ${LLM_PUBLIC_BASE_URL:-}
       LLM_HOST: llm.${BASE_DOMAIN:-localhost}
