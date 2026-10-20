@@ -903,6 +903,16 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 **已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
 
+### 8.32 v0.1.19 发版：#318 / #325 / #314 落地 + 真机复验（2026-10-20 晚）
+
+**载荷**（自 v0.1.18）：#324 前端 judge 事件分轴展示、#326 portal 侧对话调用收进统一 `llm-chat.js`（`max_tokens` 必发做成结构性保证）、#327 门户写侧三条（见 §8.31 追加块）。**本版 `runner/` 实质零改动**（`git diff --name-only v0.1.18..main -- runner/` 只有 `package.json` + lockfile）⇒ 只 pin portal + proxy 两镜像、**七台 FDE 容器故意没重建**（§8.19 先例）。
+
+**发版与部署**：`0.1.19`（commit `f52bbf9`）→ main CI `39408033937` 绿（含三镜像构建校验）→ release run `39408039251` 绿 → 清单 `imageId` 与部署机 `docker inspect .Image` 逐个一致（portal `b8c6838c…` / proxy `3b5da731…`）→ `deploy/.env` 形态① pin（备份 `/tmp/deploy.env.bak-0119`）→ `up -d --no-build` ⇒ 两容器 healthy、经 Traefik `healthz=200`。
+⚠ **本版 tag 早于 main CI 结束**（我把「推 tag」与「等 CI」并行了，与 §6 惯例「main CI 绿后才打 tag」不符）。本次结果无害（两条 run 都绿），但**下一次仍应先等 main CI 绿再打 tag**——CI 红时 tag 已推就会发出一个不该存在的版本。
+
+**真机复验（主 agent 亲手，dev 栈）**：`PATCH {"context_window":2048}` ⇒ **400** `details={field:'context_window',reason:'too_small',min:65536,value:2048}`；被拒之后立刻读网关，该 deployment 的 `context_window` **仍是 512000**（「网关零请求、零部分写入」在真机上成立）；`PATCH {"context_window":"262144"}`（故意发字符串）⇒ 200 且**网关真值是整数 `262144`**（`model_info` 与 `metadata` 镜像两处都是 number = #325）；边界 `65536` 放行；探针全部复原（目录 6 条、`ctx` 全整数、两个输出上限 `32768`）；端到端冒烟会话 `16261d57…` ⇒ `202` + run `5c70e920…` + 助手回 `pong`。
+⚠ **两条探针方法坑（都是这次现场踩的，别再踩）**：① `curl` 的 `Host` 与 `Origin` **必须都带 `:8090`**——`Host` 不带端口而 `Origin` 带端口会被 #234 同源门判 `403 cross_origin_forbidden`（`login` 第一次就 403）；② `erix_station_playwright` 容器里**没有 curl**，而宿主机的 undici/`fetch` 会忽略 `Host` 头（forbidden header）⇒ 这类带 `Host` 覆盖的探针一律用**宿主机 `curl --noproxy '*'`**。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
