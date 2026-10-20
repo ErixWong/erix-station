@@ -1,11 +1,12 @@
 // 单测：issue #88 会话标题自动落库与自动更新（portal/src/session-title.js + sessions.js title_source 语义）。
-// 2026-09-25 修订：标题生成移到 agent（worker）侧（runner/lib/session-title.js，随 run_finished 上报），
-// portal 侧 evaluateAutoTitle 不再发任何 HTTP——消费 agentTitle → 防抖判据 → title_source='auto' 守卫
-// 落库 → SSE session_updated。降级链：agent title 缺失/空 → 首条用户消息截断 → cwd basename。
+// issue #322 起：标题的**生成者在 portal 自己**（`generateAutoTitle` → `title-llm.js` → `llm-chat.js`，
+// 输入 = 会话最后一段助手文本），runner 那一份实现已删。评估链形状不变：
+// 防抖判据 → 生成（失败静默）→ title_source='auto' 守卫落库 → SSE `session_updated`。
+// 降级链：生成拿不到（无活绑定 / 网关失败 / 无助手文本 / 清洗后空）→ 首条用户消息截断 → cwd basename。
 // 覆盖：
 //   * title_source 语义：createSession 显式 title → manual / 缺省 → auto；updateSession 改 title → manual；
 //     自动更新 UPDATE 只写 title_source='auto' 的行（manual 行 0 行不覆盖）。
-//   * agentTitle 消费：上报标题清洗落库 + SSE；空/缺失 → 降级链（首条消息截断 / cwd basename）。
+//   * 生成与降级：见文件尾「issue #322」那一节（假 fetch 注入，零网络）。
 //   * 节流判据（shouldRefreshTitle 纯函数 + evaluateAutoTitle 集成）：首启必生成、≥N 轮新 user 消息、
 //     话题漂移启发式（关键词零重合）、manual 行直接跳过、开关关闭 no-op。
 // 隔离约定（docs/testing.md §2.1）：内存 fake pool，不碰真实 DB / 网络。
@@ -21,9 +22,12 @@ import {
   clipTitleFromMessage,
   fallbackTitleFromCwd,
   evaluateAutoTitle,
+  generateAutoTitle,
 } from '../src/session-title.js';
-import { createSession, updateSession, postMessage } from '../src/sessions.js';
-import { createSessionTextHandler, inputTranscriptRow } from './fake-session-text.js';
+import { createSession, updateSession, postMessage, AI_TITLE_SYSTEM_PROMPT, AI_TITLE_MAX_TOKENS } from '../src/sessions.js';
+import { buildAutoTitlePrompt, TITLE_SYSTEM_PROMPT } from '../src/title-llm.js';
+import { LLM_CHAT_DEFAULT_MAX_TOKENS } from '../src/llm-chat.js';
+import { createSessionTextHandler, inputTranscriptRow, engineTranscriptRow } from './fake-session-text.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -480,13 +484,13 @@ test('issue #114：并发抢占（UPDATE 命中 0 行）→ 不回调（安静�
 });
 
 // ---------------------------------------------------------------------------
-// evaluateAutoTitle：fake pool 集成（消费 agent 上报 title，不发任何 HTTP）
+// evaluateAutoTitle：fake pool 集成（#322 起 portal 自己生成标题；测试只注入假 fetch，零网络）
 // ---------------------------------------------------------------------------
 
 const CFG = { sessionAutoTitle: true, sessionAutoTitleMinNew: 3 };
 
-/** 可编排 fake pool：一张 chat_sessions 行 + messages 数组。 */
-function titlePool({ session = {}, messages = [], transcriptRows = [] } = {}) {
+/** 可编排 fake pool：一张 chat_sessions 行 + messages 数组（+ 可选的 FDE 活绑定，#322 自动生成用）。 */
+function titlePool({ session = {}, messages = [], transcriptRows = [], binding = null } = {}) {
   const queries = [];
   const sess = {
     id: 's1', user_id: 'u1', title: '', title_source: 'auto', cwd: '~/projects/demo',
@@ -517,6 +521,11 @@ function titlePool({ session = {}, messages = [], transcriptRows = [] } = {}) {
         const n = anchored.filter((m) => m.role === 'user' && m.seq > params[1]).length;
         return { rows: [{ n }] };
       }
+      // #322：自动生成要读该 FDE 的活绑定（`llm.js` `getFdeLlmConfig`）；缺 binding 时上面的
+      // `return { rows: [] }` 就是「没有活绑定」的自然形态。
+      if (sql.includes('FROM fde_llm_bindings')) {
+        return { rows: binding ? [binding] : [] };
+      }
       if (sql.startsWith('UPDATE chat_sessions')) {
         // 模拟 DB 守卫：UPDATE 只写 title_source='auto' 的行
         if (sess.title_source !== 'auto') return { rows: [], rowCount: 0 };
@@ -531,13 +540,13 @@ function titlePool({ session = {}, messages = [], transcriptRows = [] } = {}) {
   return pool;
 }
 
-test('evaluateAutoTitle：agent 上报标题 → 清洗后落库（auto_title_seq 推进）+ SSE 通知', async () => {
-  const pool = titlePool({
-    messages: [{ role: 'user', content: '帮我修复登录页面的白屏问题', seq: 1 }],
-  });
+test('evaluateAutoTitle：生成成功 → 清洗后落库（auto_title_seq 推进）+ SSE 通知', async () => {
+  // #322：标题由 portal 自己生成（旧「消费 worker 上报」的路径已退役），这里用假 fetch 顶上生成那一层。
+  const pool = withBinding(finishedRunSession());
+  const f = fakeChatFetch({ content: '「修复登录白屏」' });
   const notified = [];
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', runId: 'r1', agentTitle: '「修复登录白屏」', config: CFG,
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl,
     notify: (sid, events) => notified.push({ sid, events }),
     log: { warn() {}, info() {} },
   });
@@ -548,34 +557,39 @@ test('evaluateAutoTitle：agent 上报标题 → 清洗后落库（auto_title_se
   assert.equal(pool.updates.length, 1, '落库一次');
 });
 
-test('evaluateAutoTitle：agent title 缺失/空串 → 降级首条用户消息截断', async () => {
+test('evaluateAutoTitle：生成拿不到（该 FDE 无活绑定）→ 降级首条用户消息截断', async () => {
   const long = '帮我修复登录页面的白屏问题并补充单元测试覆盖边界情况尤其会话过期'.repeat(2);
   const expected = Array.from(long.replace(/\s+/g, ' ').trim()).slice(0, AUTO_TITLE_MAX_LEN).join('');
-  for (const agentTitle of ['', '   ', undefined, null]) {
-    const pool = titlePool({ messages: [{ role: 'user', content: long, seq: 1 }] });
+  for (const withRun of [false, true]) {
+    const pool = titlePool({ messages: [{ role: 'user', content: long, seq: 1, ...(withRun ? { run_id: 'r1' } : {}) }] });
     const title = await evaluateAutoTitle(pool, {
-      sessionId: 's1', agentTitle, config: CFG, log: { warn() {}, info() {} },
+      sessionId: 's1', runId: withRun ? 'r1' : undefined, config: CFG, log: { warn() {}, info() {} },
     });
-    assert.equal(title, expected, `agentTitle=${JSON.stringify(agentTitle)} → 降级 = 首条消息截断 30 字符`);
+    assert.equal(title, expected, `runId=${withRun ? 'r1' : '缺省'} → 降级 = 首条消息截断 30 字符`);
   }
 });
 
-test('evaluateAutoTitle：agent title 超 30 字符 → 清洗截断后落库', async () => {
-  const pool = titlePool({ messages: [{ role: 'user', content: '写个排序脚本', seq: 1 }] });
+test('evaluateAutoTitle：生成的标题超 30 字符 → 清洗截断后落库', async () => {
+  const pool = withBinding(finishedRunSession());
+  const f = fakeChatFetch({ content: '长'.repeat(50) });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '长'.repeat(50), config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl,
+    log: { warn() {}, info() {} },
   });
-  assert.equal(title, '长'.repeat(AUTO_TITLE_MAX_LEN), 'agent 侧已清洗，portal 再过一遍幂等');
+  assert.equal(title, '长'.repeat(AUTO_TITLE_MAX_LEN), '30 字上限（#322 前后一字未变，只是清洗动作只剩一处）');
 });
 
-test('evaluateAutoTitle：agent title 不合规（仅空引号）且首条消息为空 → 末级降级 cwd basename', async () => {
-  const pool = titlePool({
+test('evaluateAutoTitle：生成不合规（仅空引号）且首条消息为空 → 末级降级 cwd basename', async () => {
+  const pool = withBinding(titlePool({
     session: { cwd: '~/projects/meeting_asr_app' },
-    messages: [{ role: 'user', content: '   ', seq: 1 }],
-  });
+    messages: [{ role: 'user', content: '   ', seq: 1, run_id: 'r1' }],
+  }));
+  const f = fakeChatFetch();
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '「」', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl,
+    log: { warn() {}, info() {} },
   });
+  assert.equal(f.calls.length, 0, '这个夹具里没有 assistant 锚点 ⇒ 没有输入 ⇒ 不发请求，直接走降级链');
   assert.equal(title, 'meeting_asr_app', '末级降级 = cwd basename');
 });
 
@@ -585,7 +599,7 @@ test('evaluateAutoTitle：manual 行绝不覆盖（并发手工 PATCH 语义）'
     messages: [{ role: 'user', content: '随便聊聊', seq: 9 }],
   });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '新话题标题', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
   assert.equal(pool.updates.length, 0, 'manual 行零 UPDATE');
@@ -606,7 +620,7 @@ test('evaluateAutoTitle：UPDATE 命中 0 行（评估期间被改 manual）→ 
   };
   const notified = [];
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '修 bug', config: CFG,
+    sessionId: 's1', config: CFG,
     notify: (sid, events) => notified.push(events),
     log: { warn() {}, info() {} },
   });
@@ -623,7 +637,7 @@ test('evaluateAutoTitle：防抖——未到 N 轮且话题未漂移 → 不刷�
     ],
   });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '全新标题', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
   assert.equal(pool.updates.length, 0);
@@ -640,16 +654,17 @@ test('evaluateAutoTitle：≥N 轮新 user 消息 → 刷新（即使话题相�
     ],
   });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '登录页优化', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
-  assert.equal(title, '登录页优化');
+  // 没有活绑定 ⇒ 生成那一层静默跳过（零次上游请求），刷新照旧发生，标题走降级链（首条用户消息）。
+  assert.equal(title, '修复登录 bug', '刷新判据没变，只是标题来源从「容器上报」换成「portal 生成 → 降级链」');
   assert.equal(pool.updates.length, 1);
 });
 
 test('evaluateAutoTitle：开关关闭（ERIX_SESSION_AUTO_TITLE=0）→ no-op', async () => {
   const pool = titlePool({ messages: [{ role: 'user', content: 'hi', seq: 1 }] });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: 'hi', config: { sessionAutoTitle: false, sessionAutoTitleMinNew: 3 },
+    sessionId: 's1', config: { sessionAutoTitle: false, sessionAutoTitleMinNew: 3 },
     log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
@@ -659,7 +674,7 @@ test('evaluateAutoTitle：开关关闭（ERIX_SESSION_AUTO_TITLE=0）→ no-op',
 test('evaluateAutoTitle：会话已归档/不存在 → 安静跳过', async () => {
   const pool = titlePool({ session: { status: 'gone' }, messages: [{ role: 'user', content: 'hi', seq: 1 }] });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: 'hi', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
 });
@@ -667,7 +682,7 @@ test('evaluateAutoTitle：会话已归档/不存在 → 安静跳过', async () 
 test('evaluateAutoTitle：评估链抛错（DB 故障）→ 吞掉返回 null，不向上抛', async () => {
   const pool = { query: async () => { throw new Error('db down'); } };
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: 'hi', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, null);
 });
@@ -682,7 +697,7 @@ test('P3 PR②b ②：降级链首条 user 正文取自 transcript（锚点正�
     transcriptRows: [inputTranscriptRow({ sessionId: 's1', messageId: 'tu1', text: 'transcript 首条正文', round: 1 })],
   });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, 'transcript 首条正文', '首条正文取自 transcript，不是 messages.content');
   assert.equal(pool.updates.length, 1);
@@ -702,8 +717,237 @@ test('P3 PR②b ③：话题漂移启发式用 transcript 的最新 user 正文�
     ],
   });
   const title = await evaluateAutoTitle(pool, {
-    sessionId: 's1', agentTitle: '', config: CFG, log: { warn() {}, info() {} },
+    sessionId: 's1', config: CFG, log: { warn() {}, info() {} },
   });
   assert.equal(title, '修复登录 bug', `刷新后降级标题 = 首条 transcript/锚点正文（got ${title}）`);
   assert.equal(pool.updates.length, 1, 'transcript 最新正文与标题零重合 → 判漂移 → 刷新（读锚点则不会刷新）');
+});
+
+// ---------------------------------------------------------------------------
+// issue #322：自动改名的**生成者换到 portal 自己**（`generateAutoTitle` → `title-llm.js` → `llm-chat.js`）。
+// 这一节钉的四件事：① 确实发了一次形状正确的对话请求（输入 = 会话最后一段助手文本）；
+// ② 绑定缺失 / 网关失败（5xx / 网络错 / 超时）三种情形**一律静默退到降级链**，绝不抛错、绝不新增错误码；
+// ③ 清洗与长度口径与手工改名同一个出口（同一个系统提示、同一个 `max_tokens`）；
+// ④ 旧容器上报的 `title` 仍被接受（兼容面），但不再是生成来源。
+// 隔离约定：注入假 fetch（`llm-chat.js` 的 `fetchImpl`），零网络；LLM 失败路径也不碰真模型。
+// ---------------------------------------------------------------------------
+
+/** 测试用上游 key（断言它绝不出现在日志/返回值里）。 */
+const AUTO_KEY = 'sk-auto-secret-987654';
+/** FDE 活绑定行（形态同 `llm.js` `getFdeLlmConfig` 读的那一行）。 */
+const autoBinding = (over = {}) => ({
+  fde_id: 'u1', api_key: AUTO_KEY, state: 'active', gateway: 'litellm',
+  provider_id: 'deepseek', main_model_id: 'mi-deepseek', main_model_name: 'deepseek-flash',
+  embedding_model_id: null, embedding_model_name: null, vision_model_id: null, vision_model_name: null,
+  ...over,
+});
+/** 带网关地址的 config（生产里由 `loadConfig` 给出；这里手工注入，值与 `config.js` 缺省一致）。 */
+const AUTO_CFG = { sessionAutoTitle: true, sessionAutoTitleMinNew: 3, llmGatewayAdminUrl: 'http://station-litellm:4000' };
+
+/**
+ * 假 fetch：只接对话请求，返回可编排的上游响应。
+ * @param {object} [o] `content`=模型回的文本；`status`=HTTP 码；`reject`=网络错误；`hang`=永不 resolve（测超时）
+ */
+function fakeChatFetch({ content = '登录页白屏修复', status = 200, reject = null, hang = false } = {}) {
+  const calls = [];
+  const fetchImpl = (url, init) => {
+    calls.push({ url, init, body: (() => { try { return JSON.parse(init.body); } catch { return null; } })() });
+    if (reject) return Promise.reject(reject);
+    if (hang) return new Promise(() => {});
+    const ok = status >= 200 && status < 300;
+    return Promise.resolve({
+      ok,
+      status,
+      text: async () => (ok
+        ? JSON.stringify({ choices: [{ message: { content } }] })
+        : JSON.stringify({ error: { message: `upstream said no (key ${init.headers.Authorization})` } })),
+    });
+  };
+  return { calls, fetchImpl };
+}
+
+/** 给 fake pool 装上「该 FDE 有活绑定」（#322 的生成路径要读 `fde_llm_bindings`）。 */
+function withBinding(pool, binding = autoBinding()) {
+  const orig = pool.query.bind(pool);
+  pool.query = async (sql, params) => (sql.includes('FROM fde_llm_bindings') ? { rows: [binding] } : orig(sql, params));
+  return pool;
+}
+
+/** 一条「跑完的 run」的最小会话：1 条 user 锚点 + 同 run 的 assistant 收尾（transcript 有正文）。 */
+function finishedRunSession({ assistantAnchor = '锚点侧收尾旧文', assistantTranscript = '已完成：登录页白屏已修复，并补了回归用例', userText = '帮我修复登录页白屏' } = {}) {
+  return titlePool({
+    messages: [
+      { role: 'user', content: userText, seq: 1, run_id: 'r1' },
+      { role: 'assistant', content: assistantAnchor, seq: 2, run_id: 'r1' },
+    ],
+    transcriptRows: [engineTranscriptRow({ sessionId: 's1', runId: 'r1', round: 1, userText, assistantText: assistantTranscript })],
+  });
+}
+
+test('#322 自动改名会生成：会话最后一段助手文本 → 一次 chat/completions → 清洗落库 + SSE', async () => {
+  const pool = finishedRunSession({ ...{} });
+  pool.query = ((orig) => async (sql, params) => {
+    if (sql.includes('FROM fde_llm_bindings')) { pool.seenBinding = true; return { rows: [autoBinding()] }; }
+    return orig(sql, params);
+  })(pool.query.bind(pool));
+  const f = fakeChatFetch({ content: '「登录页白屏修复」' });
+  const notified = [];
+  const logs = { warn: [], info: [] };
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl,
+    notify: (sid, events) => notified.push(events),
+    log: { warn: (m) => logs.warn.push(String(m)), info: (m) => logs.info.push(String(m)) },
+  });
+
+  assert.equal(f.calls.length, 1, '发了一次对话请求（生成者已是 portal，不再等 worker 上报）');
+  assert.equal(f.calls[0].url, 'http://station-litellm:4000/v1/chat/completions', '走该 FDE 的网关（与手工改名同一个 admin/backend 地址）');
+  assert.equal(f.calls[0].init.headers.Authorization, `Bearer ${AUTO_KEY}`, 'per-FDE 虚拟 key 只进 Authorization 头');
+  const payload = f.calls[0].body;
+  assert.equal(payload.model, 'deepseek-flash', '模型 = 活绑定的 data-plane model_name');
+  assert.equal(payload.max_tokens, LLM_CHAT_DEFAULT_MAX_TOKENS, '#315 不变量：max_tokens 必发，且吃的就是 llm-chat 的默认 512');
+  assert.equal(payload.temperature, 0.2, '与手工改名同一个温度（同一个出口）');
+  assert.equal(payload.messages.length, 2);
+  assert.equal(payload.messages[0].role, 'system');
+  assert.equal(payload.messages[0].content, TITLE_SYSTEM_PROMPT, '系统提示 = title-llm.js 里那一份（两条路径共用）');
+  assert.match(payload.messages[1].content, /已完成：登录页白屏已修复/, '输入 = 会话最后一段助手文本（transcript 投影）');
+  assert.equal(payload.messages[1].content.includes('锚点侧收尾旧文'), false, '正文取自 transcript，不是 messages.content');
+
+  assert.equal(title, '登录页白屏修复', '模型回的引号包裹被 sanitizeTitle 清洗');
+  assert.equal(pool.updates.length, 1, '落库一次（WHERE title_source = auto 守卫不变）');
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0][0].type, 'session_updated');
+  assert.equal(logs.warn.length, 0, '成功路径不写 warn');
+  assert.ok(logs.info.some((m) => m.includes('会话标题已更新')), '沿用既有 [auto-title] 日志口径');
+});
+
+test('#322 输入截断：助手正文进 prompt 前折叠空白并截 500 字（防超长输入白烧 token）', () => {
+  const p = buildAutoTitlePrompt(`${'x'.repeat(600)} 尾部`);
+  assert.equal(p.includes('尾部'), false, '超出 500 字的部分不进 prompt');
+  assert.equal(p.split('\n').length, 4, '正文被折叠成一行（结构：抬头 / 正文 / 空行 / 「请只输出标题。」）');
+  assert.equal(p.includes('助手在本次会话里的收尾回复'), true);
+});
+
+test('#322 降级①：该 FDE 没有活绑定 ⇒ 一次请求都不发、静默退到降级链、不抛错', async () => {
+  const long = '帮我修复登录页面的白屏问题并补充单元测试覆盖边界情况尤其会话过期'.repeat(2);
+  const pool = titlePool({ messages: [{ role: 'user', content: long, seq: 1, run_id: 'r1' }] });
+  const f = fakeChatFetch();
+  const logs = { warn: [], info: [] };
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl,
+    log: { warn: (m) => logs.warn.push(String(m)), info: () => {} },
+  });
+  assert.equal(f.calls.length, 0, '无绑定 ⇒ 不发请求（也不该发：请求根本找不到 model/key）');
+  assert.equal(title, Array.from(long.replace(/\s+/g, ' ').trim()).slice(0, AUTO_TITLE_MAX_LEN).join(''),
+    '标题仍落得下来 = 首条用户消息截断（降级链一级没变）');
+  assert.equal(pool.updates.length, 1);
+  assert.equal(logs.warn.length, 0, '没配置是常态，不刷 warn');
+});
+
+test('#322 降级②：网关 5xx / 网络错误 / 超时 三种失败都静默退到降级链，绝不向上抛', async () => {
+  const cases = [
+    { name: '上游 500', fetch: fakeChatFetch({ status: 500 }), },
+    { name: '网络错误', fetch: fakeChatFetch({ reject: new Error(`connect failed, key=${AUTO_KEY}`) }) },
+    { name: '超时到点', fetch: fakeChatFetch({ hang: true }), timeoutMs: 40 },
+  ];
+  for (const c of cases) {
+    const pool = finishedRunSession();
+    const orig = pool.query.bind(pool);
+    pool.query = async (sql, params) => (sql.includes('FROM fde_llm_bindings') ? { rows: [autoBinding()] } : orig(sql, params));
+    const logs = { warn: [], info: [] };
+    const title = await evaluateAutoTitle(pool, {
+      sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: c.fetch.fetchImpl, timeoutMs: c.timeoutMs,
+      log: { warn: (m) => logs.warn.push(String(m)), info: () => {} },
+    });
+    assert.equal(typeof title, 'string', `${c.name}：仍要落出一个标题（降级链接住）`);
+    assert.ok(title.length > 0 && Array.from(title).length <= AUTO_TITLE_MAX_LEN, `${c.name}：标题非空且 ≤30 字`);
+    assert.equal(pool.updates.length, 1, `${c.name}：落库一次，run 的终态处理不受影响`);
+    assert.ok(logs.warn.some((m) => m.includes('[auto-title]')), `${c.name}：留一条可排障的 warn`);
+    assert.equal(logs.warn.join('\n').includes(AUTO_KEY), false, `${c.name}：key 绝不进日志（连累上游回声也要脱敏）`);
+  }
+});
+
+test('#322 生成清洗口径与手工改名完全一致（同一个出口，不是第二套语义）', async () => {
+  // 与 `portal/test/session-ai-title.test.js` 钉的那条对齐：系统提示与输出预算在两条路径上是**同一个常量**。
+  assert.equal(AI_TITLE_SYSTEM_PROMPT, TITLE_SYSTEM_PROMPT, 'sessions.js 的那个名字只是别名');
+  assert.equal(AI_TITLE_MAX_TOKENS, LLM_CHAT_DEFAULT_MAX_TOKENS, '门户侧的预算就是 llm-chat 的默认（#315 的数只有一个定义点）');
+  const pool = finishedRunSession();
+  const orig = pool.query.bind(pool);
+  pool.query = async (sql, params) => (sql.includes('FROM fde_llm_bindings') ? { rows: [autoBinding()] } : orig(sql, params));
+  const f = fakeChatFetch({ content: `「${'长'.repeat(50)}」` });
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl, log: { warn() {}, info() {} },
+  });
+  assert.equal(title, '长'.repeat(AUTO_TITLE_MAX_LEN), '30 字上限由同一份 sanitizeTitle 兜住');
+});
+
+test('#322 上游回空文本 ⇒ 不写空标题，退到降级链（并留一条 warn）', async () => {
+  const pool = finishedRunSession();
+  const orig = pool.query.bind(pool);
+  pool.query = async (sql, params) => (sql.includes('FROM fde_llm_bindings') ? { rows: [autoBinding()] } : orig(sql, params));
+  const f = fakeChatFetch({ content: '   ' });
+  const logs = [];
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', runId: 'r1', config: AUTO_CFG, fetchImpl: f.fetchImpl,
+    log: { warn: (m) => logs.push(String(m)), info: () => {} },
+  });
+  assert.equal(f.calls.length, 1);
+  assert.equal(title, '帮我修复登录页白屏', '退到降级链（首条用户消息）');
+  assert.ok(logs.some((m) => m.includes('上游未返回可用标题')));
+});
+
+test('#322 title 字段兼容面：容器上报的 title 不再是生成来源（传了也不吃，标题走 portal 生成 → 降级链）', async () => {
+  // `evaluateAutoTitle` 已不接 `agentTitle`；`internal.js` 收包侧只校类型不吃值（用例名见
+  // `portal/test/internal.test.js`「U2 finish：`title` 字段兼容面」）。这里钉「传了也没用」。
+  const pool = titlePool({ messages: [{ role: 'user', content: '随便聊聊', seq: 1, run_id: 'r1' }] });
+  const f = fakeChatFetch();
+  const title = await evaluateAutoTitle(pool, {
+    sessionId: 's1', runId: 'r1', agentTitle: '「旧容器起的标题」', config: AUTO_CFG, fetchImpl: f.fetchImpl,
+    log: { warn() {}, info() {} },
+  });
+  assert.equal(f.calls.length, 0, '没有活绑定 ⇒ 不发请求');
+  assert.equal(title, '随便聊聊', '落库的是降级链标题，**不是**容器上报的那串（旧字段不再生成任何东西）');
+  assert.equal(pool.updates.length, 1);
+});
+
+test('#322 结构锁：自动生成必须经 title-llm.js，不许在 session-title.js 里手搓 fetch/超时/max_tokens', () => {
+  const src = fs.readFileSync(path.resolve(import.meta.dirname, '../src/session-title.js'), 'utf8');
+  assert.match(src, /from '\.\/title-llm\.js'/, '自动改名的生成必须走 portal 侧唯一生成入口 title-llm.js');
+  assert.match(src, /generateTitle\(/, '生成调用点必须存在（删了就是「自动改名整个失效」，本条必须红）');
+  assert.equal(/(?<![A-Za-z0-9_.])fetch\s*\(/.test(src), false, '本文件里不许自己拼 fetch（对话调用面归 llm-chat.js）');
+  assert.equal(src.includes('new AbortController'), false, '超时归 llm-chat.js');
+  assert.equal(/max_tokens\s*:/.test(src), false, '请求体（含 max_tokens 键）归 llm-chat.js 构造');
+  assert.equal(src.includes('/chat/completions'), false, 'URL 拼接归 llm-chat.js');
+});
+
+test('#322 结构锁：portal 侧「发一次对话」只有一个构造点，标题生成只有一个入口', () => {
+  const srcDir = path.resolve(import.meta.dirname, '../src');
+  const read = (n) => fs.readFileSync(path.join(srcDir, n), 'utf8');
+  // 只算**真调用**：llm-chat.js 里那个名字是定义（`export async function chatCompletion(`），不是调用。
+  const callOf = (src) => (src.replace(/export\s+async\s+function\s+chatCompletion\s*\(/g, '')
+    .match(/\bchatCompletion\s*\(/g) ?? []).length;
+  const callers = fs.readdirSync(srcDir)
+    .filter((n) => n.endsWith('.js'))
+    .filter((n) => callOf(read(n)) > 0);
+  assert.deepEqual(callers, ['title-llm.js'],
+    '除定义处外，`chatCompletion(` 的调用点只能有 `title-llm.js` 一个 = portal 侧只有一条标题生成路径');
+  assert.equal(callOf(read('llm-chat.js')), 0, 'llm-chat.js 自己不再调用（它是出口，不是消费者）');
+
+  const titleLlm = read('title-llm.js');
+  assert.equal((titleLlm.match(/\bchatCompletion\s*\(/g) ?? []).length, 1,
+    'title-llm.js 里只能有**一处** chatCompletion 调用（它就是那条唯一生成路径）；多一处 = 又起了第二条');
+  for (const consumer of ['sessions.js', 'session-title.js']) {
+    assert.match(read(consumer), /from '\.\/title-llm\.js'/, `${consumer} 必须从 title-llm.js 取生成能力（手工与自动同一条路径）`);
+    assert.equal(/\bchatCompletion\s*\(/.test(read(consumer)), false, `${consumer} 不许绕过 title-llm.js 直接发对话`);
+  }
+});
+
+test('#322 generateAutoTitle 单元面：没有 runId（拿不到「最后一段助手文本」）⇒ 直接 null，零次上游请求', async () => {
+  const pool = titlePool({ binding: autoBinding(), messages: [{ role: 'user', content: '随便', seq: 1 }] });
+  const f = fakeChatFetch();
+  const logs = [];
+  assert.equal(await generateAutoTitle(pool, {
+    sessionId: 's1', userId: 'u1', config: AUTO_CFG, fetchImpl: f.fetchImpl, log: { warn: (m) => logs.push(String(m)) },
+  }), null);
+  assert.equal(f.calls.length, 0, '无 run ⇒ 无输入 ⇒ 不发请求（而不是发一个空 prompt 的请求）');
+  assert.equal(logs.length, 0, '这条不是错误，不刷日志');
 });

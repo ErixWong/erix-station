@@ -913,6 +913,24 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 **真机复验（主 agent 亲手，dev 栈）**：`PATCH {"context_window":2048}` ⇒ **400** `details={field:'context_window',reason:'too_small',min:65536,value:2048}`；被拒之后立刻读网关，该 deployment 的 `context_window` **仍是 512000**（「网关零请求、零部分写入」在真机上成立）；`PATCH {"context_window":"262144"}`（故意发字符串）⇒ 200 且**网关真值是整数 `262144`**（`model_info` 与 `metadata` 镜像两处都是 number = #325）；边界 `65536` 放行；探针全部复原（目录 6 条、`ctx` 全整数、两个输出上限 `32768`）；端到端冒烟会话 `16261d57…` ⇒ `202` + run `5c70e920…` + 助手回 `pong`。
 ⚠ **两条探针方法坑（都是这次现场踩的，别再踩）**：① `curl` 的 `Host` 与 `Origin` **必须都带 `:8090`**——`Host` 不带端口而 `Origin` 带端口会被 #234 同源门判 `403 cross_origin_forbidden`（`login` 第一次就 403）；② `erix_station_playwright` 容器里**没有 curl**，而宿主机的 undici/`fetch` 会忽略 `Host` 头（forbidden header）⇒ 这类带 `Host` 覆盖的探针一律用**宿主机 `curl --noproxy '*'`**。
 
+### 8.33 会话标题统一到 portal 侧（issue #322，2026-10-20）
+
+**病根不是「标题起得不好」，是同一件事有两份代码**：`runner/lib/session-title.js`（每次 run 终态后在 FDE 容器里自己调模型起标题）↔ `portal/src/sessions.js` 的手工「AI 改名」，两份各自写着 prompt、`sanitizeTitle`、`AUTO_TITLE_MAX_LEN=30`、`max_tokens`，**且无测试锁**。#315 是这份重复开的第一张账单：runner 那份设了 `max_tokens: 512`、portal 那份没设 ⇒ 同一件「起标题」的事，**走哪条路决定要不要吃网关注入的模型级预算**（小窗口模型下请求被拒，症状是「点了 AI 改名没反应」）。当时的修法是「把没设的那边也设上」= 承认有两处要同步。
+
+**分层落点（今后加直连对话不许自己拼 fetch）**：`sessions.js` / `session-title.js` = 会话业务 → **`portal/src/title-llm.js` = 标题业务**（prompt、输入折叠空白并截 500 字、provider 解析、`TITLE_LLM_MAX_TOKENS = LLM_CHAT_DEFAULT_MAX_TOKENS`）→ **`portal/src/llm-chat.js` = 对话调用面唯一出口**；`llm.js` 仍是网关管理面（不发对话）。
+
+**行为变化（用户可见的两条）**：① **自动改名不再从 FDE 容器里发**，改由 portal 在 run 终态后用「该 run 最后一段助手文本」生成 ⇒ 那次调用不再占容器配额、也不再要求容器在线；② U2 的 `title` 字段**摄入退役**——旧容器（v0.1.18 及以前）仍会带真标题，portal **照旧接受不报错**（非字符串照旧 400 `validation_failed`，那是 #88 以来的既有契约，**零新错误码**），但值不再进任何生成链；v0.1.19+ 的 worker **恒发空串**。
+
+**「例外」这个词消失了**：§4.5a 过去把 AI 改名记成「portal 不持 LLM 客户端」的例外，而那条原则的出处本来就记错（#88 原文方向相反，见 §8.31 末）。portal 成为唯一实现点后它不再是例外，文档已改成「portal 是标题的唯一实现点，走 `llm-chat.js`」。
+
+**降级是硬的**：无活绑定 ⇒ 一次请求都不发；网关 5xx / 网络错 / 超时 ⇒ 静默退到降级链（首条用户消息截断 → cwd basename），**绝不向上抛**——自动改名是锦上添花，不能把 run 的终态处理弄失败。
+
+**验收**：根 **1286 → 1287**（+1 净：portal +10、runner 删 −9）、runner **320 → 311**、前端 585 不变、typecheck 干净。**主 agent 亲跑变异 3 条全红在具名用例**：`catch` 里 `return null` 改 `throw err` ⇒ 恰 1 红（降级②）；在 `session-title.js` 另立 `max_tokens: 512` + `new AbortController()`（行为不变纯结构）⇒ 恰 1 红（结构锁）；复活 `runner/lib/session-title.js` ⇒ 恰 1 红（改写后的「单一真相」锁）。⚠ **我有一条变异第一次做错了**：改出语法错 ⇒ 文件级失败（`pass 0`）看着像红。§8.24 说「没红要先证明变异不是空操作」，这是它的**反面**：**红了也要证明红是行为/结构造成的，而不是文件根本没跑起来**。
+
+**发版**：本单**动 `runner/`** ⇒ 三镜像 + `FDE_IMAGE` pin + **`docker rm -f` 七台让 reconcile 重建**（§8.17；不重建就还是容器侧自己起标题）。
+
+**过程账（同一个坑的第二次发作，代价 = 两小时）**：worker 连撞两次 30 分钟超时（我传的 50 分钟未生效，**实测上限就是 1800000ms**），两次都**没有 commit**；第一次的补丁与当时新合并的 PR #326 冲突（整份应用会删掉 `llm-chat.js`）⇒ 只能重做；第二次的补丁基点正好是当前 main ⇒ 主 agent `git apply` 落到分支后测出「只差一把跨文件锁」。**口径：worker 的补丁落主仓后必须先跑一遍数出真实缺口，再决定补哪里；跨文件读源码的锁在被读文件被删时必红，删它必须同时改锁的方向。**
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。

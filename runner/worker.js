@@ -35,7 +35,6 @@ import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
-import { generateSessionTitle, resolveFirstUserContent } from './lib/session-title.js';
 import { buildFailureEnvelope } from './lib/termination.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
@@ -477,9 +476,9 @@ async function startRun(msg) {
       // issue #309 切片 2：模型元数据 + 显式 max_tokens（值已在 resolveModelMetadata 里钳过）。
       // 命名纪律（决策者定稿）：camelCase 三键（contextWindowTokens / maxOutputTokens / maxTokens）
       // **在本文件里只允许出现在下面这一对 #309 标记之间**（引擎入参的唯一映射点）。措辞刻意
-      // 不说「全站」：锁只数 worker.js（见 model-metadata.test.js 那条用例），而 runner 里另有一处
-      // 合法的 `maxTokens: 512`（`lib/session-title.js` 给 provider.chat 用，不是引擎入参映射）；防漂移锁：
-      // runner/test/model-metadata.test.js（从 worker.js 源码正则数次数，不 import worker）。
+      // 不说「全站」：锁只数 worker.js（见 model-metadata.test.js 那条用例）；runner 侧过去另有一处
+      // `maxTokens: 512`（`lib/session-title.js` 给 provider.chat 用），#322 已随该文件一并删除。
+      // 防漂移锁：runner/test/model-metadata.test.js（从 worker.js 源码正则数次数，不 import worker）。
       // 已知副作用（都核过行号，**不要顺手修**）：
       //   - wrap-up 归一化 judge 的请求**继承**宿主 maxTokens（orchestrator.js:3115
       //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
@@ -576,21 +575,12 @@ async function startRun(msg) {
       signal: abortController.signal,
     });
 
-    // issue #88 修订（2026-09-25 用户拍板）：标题改由 agent 侧顺带生成——runToolLoop 正常返回后
-    // 用既有 provider 发一次小请求（非流式、10s 超时、maxTokens 512；思考型模型兼容归引擎 provider
-    // 层管，portal 不再独立调 relay）。开关 ERIX_SESSION_AUTO_TITLE（'0' 关，provisioner 下发链）。
-    // 失败/超时/空 → 空串（portal 走降级链），generateSessionTitle 全链 catch，绝不阻塞终态上报。
-    let title = '';
-    if (process.env.ERIX_SESSION_AUTO_TITLE !== '0') {
-      title = await generateSessionTitle({
-        provider,
-        // P3 PR③：历史下行退役后，标题输入 = 本轮 task（首启时会话首条用户消息就是它）。
-        firstUserContent: resolveFirstUserContent({ task }),
-        finalText: result.finalText ?? '',
-        // 失败 warn 走 IPC LOG → agentd 日志（与 worker 其它日志同径，stderr 兜底在 lib 内）。
-        log: { warn: (m) => sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: m }) },
-      });
-    }
+    // issue #322：标题归 portal 生成（`portal/src/title-llm.js` → `portal/src/llm-chat.js`），
+    // **worker 恒发空串**。本行以前那段「agent 侧顺带生成标题」（跑 `lib/session-title.js` 的
+    // `generateSessionTitle`：终态前再发一次小请求）**已整块删除**——同一件事当时有两份实现
+    //（≤30 字 / `sanitizeTitle` / prompt / `maxTokens: 512` 各一份），#322 把它收回 portal。
+    // 字段本身仍留在信封里（旧 portal 拿到空串 ⇒ 走它的降级链；契约形状不变，见 agentd 透传与
+    // `docs/api/portal.md` §9.6 的 `title` 兼容面）。
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
@@ -599,7 +589,7 @@ async function startRun(msg) {
       usage: result.usage ?? { input_tokens: 0, output_tokens: 0 },
       rounds: result.rounds ?? 0,
       final_text: result.finalText ?? '',
-      title,
+      title: '',   // 标题归 portal 生成，worker 恒发空串（#322）
     });
   } catch (err) {
     // issue #212：失败/中止终态信封（构造逻辑与单测在 runner/lib/termination.js）。
@@ -618,7 +608,7 @@ async function startRun(msg) {
       usage,
       rounds,
       final_text: '',
-      title: '', // 失败路径不生成标题（portal 降级链兜住）
+      title: '', // 失败路径也不生成标题（#322：标题归 portal，worker 恒发空串）
       error,
     });
   } finally {

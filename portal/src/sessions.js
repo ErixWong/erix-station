@@ -11,13 +11,18 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { ensureDirSafe } from './fsutil.js';
 import { clipTitleFromMessage, sanitizeTitle, AUTO_TITLE_MAX_LEN } from './session-title.js';
-import { getFdeLlmConfig } from './llm.js';
+import {
+  buildAiTitlePrompt, generateTitle, resolveTitleLlmProvider,
+  TITLE_CONTEXT_MESSAGES, TITLE_CONTEXT_MAX_LEN, TITLE_LLM_MAX_TOKENS, TITLE_LLM_TIMEOUT_MS, TITLE_SYSTEM_PROMPT,
+} from './title-llm.js';
 import { projectSessionMessages } from './session-view.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
 import { fetchUserTextTurns } from './session-text.js';
 import { appendUserInputTurn } from './transcript-store.js';
 import { allocSeq } from './seq.js';
-import { chatCompletion, chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-chat.js';
+// #322：本文件**不再直接调** `chatCompletion`（手工改名走 `./title-llm.js` 的唯一生成入口）；
+// 下面三个「一次对话请求」的通用件仍在此重新导出，只为既有调用方与文档口径不受影响。
+import { chatCompletionsUrl, extractAssistantText, redactSecret } from './llm-chat.js';
 
 export class SessionError extends Error {
   constructor(code, message, { httpStatus = 400, details } = {}) {
@@ -746,74 +751,59 @@ export async function stopSession(pool, { userId, sessionId, notify }) {
 }
 
 // ---------------------------------------------------------------------------
-// issue #114：「AI 改名」——按需的一次性 LLM 调用（用户点按钮才花钱，不做任何自动刷新）
+// issue #114：「AI 改名」——按需的一次 LLM 调用（用户点按钮才花钱，不做任何自动刷新）
 //
-// 决策豁免说明（2026-10-20 更正出处）：本端点是**用户拍板（2026-10-01，issue #114）**的例外——
-// 用户主动触发的一次性命名请求，走 portal 直连 OpenAI 兼容 chat/completions（一次往返），不重复造
-// agent 链路。豁免范围**仅限本函数**——其余路径不得由 portal 发 LLM 请求。
-// ⚠ 这里过去写着「原则出自 #88」，**记错了**：#88 原文是「只动 portal + 前端展示；runner/agentd
-// 零改动（标题是 portal 会话元数据，不是引擎事务）」，与那条「原则」方向相反。真实成因是实现把
-// 自动标题放到了 runner（`runner/lib/session-title.js`），于是同一件事有了两份实现；把标题**统一
-// 回 portal 一侧**（撤掉 runner 那份、连「豁免」这个概念一起消失）已登记 issue **#322**。
+// **issue #322 起：标题只有一条生成路径。**手工改名（本文件的 `generateAiTitle`）与自动改名
+// （`session-title.js` 的 `evaluateAutoTitle`）**都**调 `portal/src/title-llm.js` 的 `generateTitle()`，
+// 那个文件再调 `portal/src/llm-chat.js`（portal 侧**对话调用面**的唯一出口：URL 拼接 / `max_tokens` 必发 /
+// 超时到点必报错 / 错误映射 / key 只进 `Authorization` 头都在那里）。系统提示、上下文形状、输出预算、
+// provider 形态⇒ **只有一份**，在 `title-llm.js`；本文件只留会话业务：取上下文 → 调生成 → 清洗 → 落库 → 推送。
 //
-// ⚠ 自工单 261020-04（#315 追加）起，「豁免」指的是**「portal 允许直连一次对话」**，不再是
-// 「允许在业务代码里手搓 `fetch`」：请求体的构造 / URL 拼接 / `max_tokens` 必发 / 超时 /
-// 错误映射全部住在 **`portal/src/llm-chat.js`**（portal 侧**对话调用面**的唯一出口；`llm.js` 是
-// 网关**管理面**，不发对话请求）。本文件只留会话业务：取上下文 → 调 client → 清洗标题 → 落库 → 推送。
-// 新加的 portal 直连对话**不许**自己拼 `fetch`，一律走 `llm-chat.js`。
+// 「例外」这个词从本单起消失：过去本端点被写成「决策者批准的例外（portal 允许直连一次对话）」，
+// 而 #322 把生成统一回 portal 后，portal 就是标题的**唯一实现点**，它不再是例外，只是一条正常实现。
+// （另：此处与 `portal.md` §4.5a 过去写「原则出自 #88『portal 不持 LLM 客户端』」是**记错了**——#88 原文是
+// 「只动 portal + 前端展示；runner/agentd 零改动」，方向相反；真实成因是实现把自动标题放到了 runner。）
+//
+// 新加的 portal 直连对话**不许**自己拼 `fetch`，一律走 `llm-chat.js`（`llm.js` 是网关**管理面**，不发对话）。
 //
 // key 纪律（llm.js 三条存储纪律 ③）：api_key 只进 Authorization 请求头，
 // 绝不进日志/错误信息/HTTP 响应（`llm-chat.js` 里的 redactSecret 做最后一道兜底）。
 // ---------------------------------------------------------------------------
 
-/** AI 改名的上下文：会话最早的 N 条 user 消息（单条折叠空白后截 AI_TITLE_CONTEXT_MAX_LEN 字符）。 */
-export const AI_TITLE_CONTEXT_MESSAGES = 3;
-export const AI_TITLE_CONTEXT_MAX_LEN = 200;
-/** 单次上游调用超时（issue #114：~15s）。 */
-export const AI_TITLE_TIMEOUT_MS = 15_000;
 /**
- * #315：AI 改名**显式**发 `max_tokens`，不让网关替我们填。
+ * 以下五个名字是 `title-llm.js` 里那份的**别名**（#322 前这些值由本文件定；现在生成只有一条路径，
+ * 值也只有一个定义点）。保留名字是为了：既有调用方 / 文档 / 测试口径一字不动
+ * （`portal/test/llm-chat.test.js` 钉的就是「与 `sessions.js` 同一个数」）。
  *
- * 不发会怎样：LiteLLM 在调用方没发 `max_tokens` 时，注入该 deployment 的 `litellm_params.max_tokens`
- * （#309 切片 1 起由门户双写成「单次输出预算上限」，现网是 32768）——那是一位**给整个模型**设的预算，
- * 拿它去生成一行标题纯属浪费，而且当 `context_window` 被配得很小（管理员笔误，例：2048）时，
- * 上游会按「prompt + 预留 32768 输出」判超限 ⇒ **这条请求被拒**，表现为「AI 改名点了没反应」。
- * 发 512 的理由：标题 ≤30 字，512 token 绰绰有余，且**与 runner 侧自动标题用的是同一个数**
- * （`runner/lib/session-title.js` 的 `maxTokens: 512`）——两条做同一件事的路径过去只有一设了上限，
- * 那个不一致就是本单的登记理由。测试在对面（`session-ai-title.test.js` 钉 512 与跨路径一致）。
- * 工单 261020-04（#315 追加）：这个数现在**作为 `maxTokens` 传给 `llm-chat.js`**（本文件不再自己发请求）。
- * 那个 client 自己也有一个显式默认 `LLM_CHAT_DEFAULT_MAX_TOKENS = 512`，并保证「调用方漏传也不会省略
- * 该字段」；两边同一个数由 `portal/test/llm-chat.test.js` 钉住。
+ * `AI_TITLE_MAX_TOKENS` 就是 #315 里那个「必发的 512」——它等于 `llm-chat.js` 的显式默认
+ * `LLM_CHAT_DEFAULT_MAX_TOKENS`，不再是本文件自己写的字面量（两条路径共用一个数 = #315 的病因消失）。
+ * 不发会怎样的完整因果链留在 `title-llm.js` 与 `docs/api/portal.md` §4.5a。
  */
-export const AI_TITLE_MAX_TOKENS = 512;
-/** 系统提示：与 AUTO_TITLE_MAX_LEN 同口径（≤30 字；落库前仍过一遍 sanitizeTitle）。 */
-export const AI_TITLE_SYSTEM_PROMPT =
-  '你是会话命名助手。根据用户消息为这次会话生成一个简短标题。'
-  + '要求：不超过 30 个字符；与用户消息的语言一致；只输出标题本身，不要引号、序号、解释或结尾标点。';
+export const AI_TITLE_CONTEXT_MESSAGES = TITLE_CONTEXT_MESSAGES;
+export const AI_TITLE_CONTEXT_MAX_LEN = TITLE_CONTEXT_MAX_LEN;
+export const AI_TITLE_TIMEOUT_MS = TITLE_LLM_TIMEOUT_MS;
+export const AI_TITLE_MAX_TOKENS = TITLE_LLM_MAX_TOKENS;
+/** 系统提示：与 `AUTO_TITLE_MAX_LEN`（30）同口径（落库前仍过一遍 `sanitizeTitle`）；两条路径共用。 */
+export const AI_TITLE_SYSTEM_PROMPT = TITLE_SYSTEM_PROMPT;
 
-/** 拼接改名上下文（纯函数，供单测）：最早 N 条 user 消息，各折叠空白并截断 ~200 字。 */
-export function buildAiTitlePrompt(messages) {
-  const list = (Array.isArray(messages) ? messages : [])
-    .slice(0, AI_TITLE_CONTEXT_MESSAGES)
-    .map((m, i) => {
-      const t = String(m ?? '').replace(/\s+/g, ' ').trim().slice(0, AI_TITLE_CONTEXT_MAX_LEN);
-      return `${i + 1}. ${t}`;
-    });
-  return `用户消息：\n${list.join('\n')}\n\n请只输出标题。`;
-}
+// 拼接改名上下文的纯函数已抽到 `title-llm.js`（两条路径共用），此处重新导出，名字与行为一字未改。
+export { buildAiTitlePrompt };
 
 // 以下三个「一次对话请求」的通用件（URL 拼接 / 取助手文本 / 脱敏）**已搬到 `llm-chat.js`**——那是
 // portal 侧对话调用面的唯一定义点（工单 261020-04，#315 追加）。此处**重新导出**只为让既有调用方
 // 与文档口径不受影响（名字与行为一字未改）；**新代码请直接从 `./llm-chat.js` 引**。
 export { chatCompletionsUrl, extractAssistantText, redactSecret };
 
-/** AI 改名必须使用该 FDE 的 LiteLLM 虚拟 key；不再回退到 Station 本地 provider 目录。 */
+/**
+ * AI 改名必须使用该 FDE 的 **活绑定**（LiteLLM 虚拟 key）；不再回退到 Station 本地 provider 目录。
+ *
+ * 取数与 provider 形态住在 `title-llm.js` 的 `resolveTitleLlmProvider`（手工与自动**共用那一份**，
+ * 它拿不到绑定时返回 `null` 而不抛错）。**是否报错是会话业务的判断**：手工改名是用户主动点的，
+ * 没绑定就 `409 llm_not_configured`（文案与收口前逐字一致）；自动改名则静默退到降级链。
+ */
 export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http://127.0.0.1:4100' } = {}) {
-  const cfg = await getFdeLlmConfig(pool, userId);
-  const mainModel = cfg?.main?.name;
-  if (cfg?.api_key && mainModel) {
-    return { base_url: gatewayUrl, api_key: cfg.api_key, model: mainModel, source: 'fde_binding' };
-  }
+  const provider = await resolveTitleLlmProvider(pool, userId, { gatewayUrl });
+  if (provider) return provider;
   throw new SessionError(
     'llm_not_configured',
     '该 FDE 未配置 LiteLLM 虚拟 key（AI 改名需要一次 LLM 调用）：请在管理台配置 LiteLLM 模型',
@@ -826,8 +816,10 @@ export async function resolveAiTitleProvider(pool, userId, { gatewayUrl = 'http:
  * 属主鉴权同 PATCH（fetchSession：非属主/不存在/已归档一律 404）。
  * 流程：取上下文 → 解析 provider（无 → 409）→ 一次 chat/completions（15s 超时，失败 → 502）
  *       → sanitizeTitle 清洗（≤30 字）→ 落库 title_source='manual'（用户主动触发，自动流程不得覆盖）。
- * 工单 261020-04（#315 追加）：那条手搓 `fetch`（自拼 URL / 自写超时 / 自填 max_tokens）**已退役**，
- * 本函数只负责会话业务（取上下文、清洗、落库、推送）；「发一次对话」的口径全在 `llm-chat.js`。
+ * 工单 261020-04（#315 追加）：那条手搓 `fetch`（自拼 URL / 自写超时 / 自填 max_tokens）**已退役**；
+ * 工单 #322：生成那一层（系统提示 / 上下文形状 / 预算 / provider 形态）**再往上收一层**到
+ * `title-llm.js`，与自动改名共用同一个出口 ⇒ 手工与自动不再可能是两套语义。
+ * 本函数只负责会话业务（取上下文、清洗、落库、推送）；「发一次对话」的口径在 `llm-chat.js`。
  * 错误类型仍用 `SessionError`（作为 `ErrorCtor` 递给 client）⇒ `http.js` 的映射不用改，状态码 /
  * `error.code` / 文案与收口前一致（`error.details` 是错误体里本就可选的附加结构，只放原因与状态码，
  * 见 `docs/api/portal.md` §4.5a）。
@@ -849,18 +841,14 @@ export async function generateAiTitle(pool, {
 
   const provider = await resolveAiTitleProvider(pool, userId, { gatewayUrl });
 
-  // portal 侧唯一直连对话出口（`llm-chat.js`）：URL 拼接 / `max_tokens` 必发 / 超时 / 错误映射 /
-  // key 只进 Authorization 头，全部在那个文件里定死。本处只传会话业务需要的东西：
-  // 上下文拼成的 messages、标题的输出预算（`AI_TITLE_MAX_TOKENS`，与 runner 侧同一个数）、
-  // 以及日志用的 tag/session（日志文本与收口前一致）。
-  const { text } = await chatCompletion({
+  // #322：生成走**唯一入口** `title-llm.js` 的 `generateTitle()`（它再走 `llm-chat.js`：URL 拼接 /
+  // `max_tokens` 必发 / 超时 / 错误映射 / key 只进 Authorization 头都在那里定死）。本处只传会话业务
+  // 需要的东西：上下文拼成的 user 提示、超时、`ErrorCtor`（递 SessionError ⇒ `http.js` 的映射零改动）、
+  // 以及日志用的 tag/session（日志文本与收口前一致）。预算/温度/系统提示不再在本文件出现——它们只
+  // 在 `title-llm.js` 有一份，自动改名吃的是完全同一份。
+  const text = await generateTitle({
     provider,
-    messages: [
-      { role: 'system', content: AI_TITLE_SYSTEM_PROMPT },
-      { role: 'user', content: buildAiTitlePrompt(contexts) },
-    ],
-    temperature: 0.2,
-    maxTokens: AI_TITLE_MAX_TOKENS,
+    userPrompt: buildAiTitlePrompt(contexts),
     timeoutMs,
     fetchImpl,
     ErrorCtor: SessionError,
