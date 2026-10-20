@@ -747,10 +747,13 @@ export async function stopSession(pool, { userId, sessionId, notify }) {
 // ---------------------------------------------------------------------------
 // issue #114：「AI 改名」——按需的一次性 LLM 调用（用户点按钮才花钱，不做任何自动刷新）
 //
-// 决策豁免说明：issue #88 定下「portal 不持 LLM 客户端」（标题由 agent 侧生成随 run 终态上报），
-// 本端点是**用户拍板（2026-10-01，issue #114）的修订豁免**：用户主动触发的一次性命名请求，
-// 走 portal 直连 OpenAI 兼容 chat/completions（一次往返），不重复造 agent 链路。
-// 豁免范围**仅限本函数**——其余自动路径仍不得由 portal 发 LLM 请求。
+// 决策豁免说明（2026-10-20 更正出处）：本端点是**用户拍板（2026-10-01，issue #114）**的例外——
+// 用户主动触发的一次性命名请求，走 portal 直连 OpenAI 兼容 chat/completions（一次往返），不重复造
+// agent 链路。豁免范围**仅限本函数**——其余路径不得由 portal 发 LLM 请求。
+// ⚠ 这里过去写着「原则出自 #88」，**记错了**：#88 原文是「只动 portal + 前端展示；runner/agentd
+// 零改动（标题是 portal 会话元数据，不是引擎事务）」，与那条「原则」方向相反。真实成因是实现把
+// 自动标题放到了 runner（`runner/lib/session-title.js`），于是同一件事有了两份实现；把标题**统一
+// 回 portal 一侧**（撤掉 runner 那份、连「豁免」这个概念一起消失）已登记 issue **#322**。
 //
 // key 纪律（llm.js 三条存储纪律 ③）：api_key 只进 Authorization 请求头，
 // 绝不进日志/错误信息/HTTP 响应（redactSecret 做最后一道兜底）。
