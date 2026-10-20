@@ -11,7 +11,7 @@ import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
 import { getFdeLlmHeartbeatModels } from './llm.js';
-import { scheduleAutoTitle, AGENT_TITLE_MAX_LEN } from './session-title.js';
+import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
@@ -660,15 +660,13 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
   const rounds = body.rounds;
   const finalText = body.final_text;
   const error = body.error ?? null;
-  // issue #88 修订：worker 侧已顺带生成的会话标题随终态上报（字符串；截断 ≤200 入库评估）。
-  // 只进 chat_sessions 评估链（scheduleAutoTitle），不写 runs 行、不参与终态幂等比对
-  // （标题是会话级 best-effort 元数据，重放丢一次评估无妨）。
-  let agentTitle = '';
-  if (body.title !== undefined && body.title !== null) {
-    if (typeof body.title !== 'string') {
-      throw new InternalError(400, 'validation_failed', 'title 必须为字符串', { details: { field: 'title' } });
-    }
-    agentTitle = Array.from(body.title).slice(0, AGENT_TITLE_MAX_LEN).join('');
+  // issue #322：`title` 的**摄入已退役**——标题不再由容器生成，改由 portal 在 run 终态后自己生成
+  //（`session-title.js` → `title-llm.js` → `llm-chat.js`）。**兼容面**：旧容器（v0.1.18 及以前）随
+  // `run_finished` 仍会带一个真标题，U2 必须**照旧接受而不报错**：类型仍按 #88 以来的口径校验
+  //（非字符串 ⇒ 400 `validation_failed`，那是既有契约，不是新增错误码），但**值不再进任何生成链**
+  //（既不截断入库，也不再当降级链的第一级）。既不写 `runs` 行，也不参与终态幂等比对（它从来就不是引擎事务）。
+  if (body.title !== undefined && body.title !== null && typeof body.title !== 'string') {
+    throw new InternalError(400, 'validation_failed', 'title 必须为字符串', { details: { field: 'title' } });
   }
 
   if (!termination || typeof termination !== 'object' || !termination.reason) {
@@ -761,11 +759,11 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
     try {
       notifySessionEvents(r.session_id, [{ seq: runEndSeq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload }]);
     } catch { /* 尽力推送 */ }
-    // issue #88：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
-    // 天然「每 run 至多评估一次」）。标题由 worker 侧生成随终态上报（agentTitle）；经 session
-    // SSE hub 推 'session_updated' 让列表标题实时到达。
+    // issue #88/#322：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
+    // 天然「每 run 至多评估一次」）。**生成者在 portal 自己**（输入 = 该 run 收尾的那段助手文本 +
+    // 该会话属主 FDE 的活绑定）；经 session SSE hub 推 `session_updated` 让列表标题实时到达。
     try {
-      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, agentTitle, notify: notifySessionEvents });
+      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, notify: notifySessionEvents });
     } catch { /* 评估调度失败不影响终态响应 */ }
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
     return { state, queue_status: queueStatus, run_end_seq: runEndSeq };
