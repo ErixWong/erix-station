@@ -850,7 +850,11 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 1. **#315 修好了**：门户的「AI 改名」（`POST /api/sessions/:id/ai-title`）现在**显式**发 `max_tokens: 512`。
    病根不是「忘了走包装层」——`docs/api/portal.md` §4.5a 与 `sessions.js` 注释都记着这个端点是**决策者批准的例外**
-   （范围仅此端点）⇒ 它天生是手搓 `fetch`（全站**只有这一个**裸调用点）。⚠ **那句注释的出处过去记错了**：写着
+   （范围仅此端点）⇒ 它天生是手搓 `fetch`（全站**只有这一个**裸调用点）。
+   **工单 261020-04（#315 追加）已把这一个裸调用点收进 `portal/src/llm-chat.js`**（portal 侧**对话调用面**
+   的唯一出口：URL 拼接 / `max_tokens` 必发 / 超时到点必报错 / 错误映射 / key 只进 `Authorization` 头都在那里，
+   且发出前还有一道「请求体必须有 `max_tokens`」的断言）；`sessions.js` 只留会话业务，`llm.js` 继续当**网关
+   管理面**（不发对话）。⇒ 以后 portal 再加直连对话**不许**自己拼 `fetch`，一律走 `llm-chat.js`。⚠ **那句注释的出处过去记错了**：写着
    「原则出自 #88『portal 不持 LLM 客户端』」，而 #88 原文是「只动 portal + 前端展示；runner/agentd 零改动」——
    **方向相反**。真实成因是实现把自动标题放到了 runner ⇒ 同一件事两份实现（`runner/lib/session-title.js` ↔
    `portal/src/session-title.js` 镜像，`30`/`sanitizeTitle` 各一份、**无测试锁**）。**统一到 portal 侧已登记 #322**

@@ -1003,6 +1003,9 @@ station-portal user enable  --login <login>
 - **上下文**：该会话最早的 3 条 `user` 消息，各折叠空白并截断 200 字符；要求模型只输出标题本身。
 - **provider 解析**：仅使用会话属主 FDE 的 active LiteLLM binding；Station 存储槽位 `model_info.id`，请求体使用配套 LiteLLM `model_name`。不回退已退役的 Station provider/model 目录；没有有效 binding → `409 llm_not_configured`。
 - **调用**：`POST <llmGatewayUrl>[/v1]/chat/completions`（`llmGatewayUrl` 已含 `/v1` 则不重复拼接），使用 per-FDE virtual key，超时 15s。
+  工单 261020-04（#315 追加）起，这条请求由 **`portal/src/llm-chat.js`** 代发（portal 侧**对话调用面**的唯一出口：
+  URL 拼接 / `max_tokens` 必发 / 超时 / 错误映射 / key 只进 `Authorization` 头都在那里）；`sessions.js` 只做会话业务。
+  `llm.js` 仍是**网关管理面**，不发对话请求。⇒ 本端点的 HTTP 面（状态码 / `error.code` / 文案）与收口前一致。
 - **请求体固定带 `max_tokens: 512`（#315）**：不发时 LiteLLM 会注入该 deployment 的 `litellm_params.max_tokens`
   （#309 切片 1 起 = 模型级「单次输出预算上限」，现网 32768），那是给整个模型设的预算、不是给一行标题设的；
   `context_window` 被配得很小时（管理员笔误）上游会按「prompt + 预留 32768」判超限 ⇒ **这条请求被拒**，症状是
@@ -1032,7 +1035,7 @@ station-portal user enable  --login <login>
 | 404 | `not_found` | session 不存在 / 不属本人 / 已归档（同 §4.2 PATCH） |
 | 409 | `llm_not_configured` | 无 FDE binding 且无启用的 text provider+model |
 | 409 | `no_user_messages` | 会话还没有用户消息（无可用上下文） |
-| 502 | `llm_upstream_failed` | 上游超时 / 非 2xx / 响应无可用标题 |
+| 502 | `llm_upstream_failed` | 上游超时 / 非 2xx / 响应无可用标题。`details` 给结构化原因（`{reason: 'timeout', timeoutMs}` / `{reason: 'network'}` / `{reason: 'upstream_status', status}`），**只放状态码与耗时上限，绝不含 key**（#255 起沿用的 `details` 附加结构，见 §2 错误体） |
 
 ### 4.6 `GET /api/runs/:id`
 
