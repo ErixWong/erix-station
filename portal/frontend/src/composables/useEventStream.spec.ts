@@ -462,10 +462,10 @@ describe('useEventStream（mock EventSource）', () => {
       'round 2 · 尝试 1/3',
       '重试中（2/3）',
       '重试成功',
-      'judge：扩轮 — P（R）',
-      'judge：不扩轮 — 够用了',
-      'judge：放行（on_track）',
-      'judge：executed — ok',
+      'judge：建议扩轮 — P（R）',
+      'judge：不建议扩轮 — 够用了',
+      'judge：工具审计：已放行（on_track，非任务完成）',
+      'judge：工具审计：已放行（非任务完成） · 评审理由：ok',
       '上下文折叠（round 2）：3 轮折叠，100 → 40 tokens',
       'final guard：accept — fine',
       'forced final（round 5）：cap',
@@ -481,12 +481,12 @@ describe('useEventStream（mock EventSource）', () => {
     lastES().emit('judge', { decision: { extend: false, extendReason: '够用了' } });
     lastES().emit('judge', { passThrough: 'on_track' });
     lastES().emit('judge', { kind: 'intercept', action: 'executed', decision: { reason: 'ok' } });
-    // judge 四分支均以第二参数 'judge' 产出（面板样式高亮）
+    // judge 四分支均以第二参数 'judge' 产出（面板样式高亮；issue #321 分轴文案）
     expect(hooks.onSep.mock.calls).toEqual([
-      ['judge：扩轮 — P（R）', 'judge'],
-      ['judge：不扩轮 — 够用了', 'judge'],
-      ['judge：放行（on_track）', 'judge'],
-      ['judge：executed — ok', 'judge'],
+      ['judge：建议扩轮 — P（R）', 'judge'],
+      ['judge：不建议扩轮 — 够用了', 'judge'],
+      ['judge：工具审计：已放行（on_track，非任务完成）', 'judge'],
+      ['judge：工具审计：已放行（非任务完成） · 评审理由：ok', 'judge'],
     ]);
 
     // 其余状态行保持无 variant 的灰色分隔行语义
@@ -542,7 +542,7 @@ describe('useEventStream（mock EventSource）', () => {
       s.replayEvent({ seq: 6, run_id: 'r1', type: 'final_guard', payload: { action: 'accept', reason: 'fine' } });
       // vi.fn 不记录末尾 undefined 实参：单参调用表现为 ['文案']
       expect(hooks.onSep.mock.calls).toEqual([
-        ['judge：不扩轮 — 够用了', 'judge'],
+        ['judge：不建议扩轮 — 够用了', 'judge'],
         ['round 1'],
         ['上下文折叠（round 2）：1 轮折叠，9 → 3 tokens'],
         ['final guard：accept — fine'],
@@ -625,7 +625,7 @@ describe('useEventStream · i18n（issue #101 P2）', () => {
     expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
       '重试中（2/3）',
       '上下文折叠（round 1）：2 轮折叠，9 → 4 tokens',
-      'judge：扩轮 — P（R）',
+      'judge：建议扩轮 — P（R）',
       '事件流需重同步（服务端缓冲溢出），正在重连补发…',
     ]);
     expect(s.toolCards.get('c1')!.out).toBe('✓ ok（5ms）');
@@ -648,9 +648,9 @@ describe('useEventStream · i18n（issue #101 P2）', () => {
     expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
       'Retrying (2/3)',
       'Retry succeeded',
-      'judge: extend rounds — P (R)',
-      'judge: no extension — enough',
-      'judge: pass through (on_track)',
+      'judge: suggests extending rounds — P (R)',
+      'judge: suggests no extension — enough',
+      'judge: tool audit: released (on_track; not task completion)',
       'Context compaction (round 1): 2 rounds folded, 9 → 4 tokens',
       'forced final (round 5): cap',
     ]);
@@ -998,5 +998,160 @@ describe('#300 partial_output 不进 EVENT_TYPES / HISTORY_REPLAY_TYPES', () => 
     expect(hooks.onSysErr).not.toHaveBeenCalled();
     expect(hooks.onToolCardCreated).not.toHaveBeenCalled();
     expect(s.lastSeq.value).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #321：judge 分轴文案——judge 只是意见，不是验收；「已完成」唯一来源是 run 终态。
+// 四组红线：executed=工具审计放行（非任务完成）；done=true=「评审认为目标已达成（未独立核验）」
+// 且收尾由模型自判；off_track/uncertain 不被 passThrough/extend 遮掉；extend+redirect 不得被
+// 反推成「工具已执行」（实测存在 kind=intercept 而 action=extend+redirect、真实审计为拦截）。
+// ---------------------------------------------------------------------------
+describe('useEventStream · judge 分轴文案（issue #321）', () => {
+  it('executed = 工具审计放行（非任务完成），done=false 同轴并存', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', {
+      kind: 'intercept', tool: { name: 'shell' }, action: 'executed',
+      decision: { done: false, confidence: 0.8, reason: '继续写测试', direction: 'on_track' },
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      'judge：工具审计：已放行（非任务完成） · 评审认为目标未达成（置信度 0.8） · 评审理由：继续写测试',
+      'judge',
+    );
+    const text = hooks.onSep.mock.calls[0][0];
+    // 旧文案「judge：executed」把用户骗成「任务完成」（ISSUES.md 第 4 条放大器）——新文案不得回退。
+    expect(text).not.toMatch(/已完成|已核验|已验证/);
+    expect(text).not.toMatch(/judge：executed/);
+  });
+
+  it('done=true 是意见不是验收：未独立核验 + 收尾由模型自行判定；不产生终态分隔条', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.activeRunId.value = 'run-1'; // 有活跃 run：judge 若敢驱动终态，这里就会被抓到
+    lastES().emit('judge', {
+      kind: 'round', action: 'judge_done',
+      decision: { done: true, confidence: 0.95, reason: '部署并复验通过', direction: 'on_track' },
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      'judge：评审认为目标已达成（未独立核验；是否收尾由模型自行判定）（置信度 0.95） · 评审理由：部署并复验通过',
+      'judge',
+    );
+    const text = hooks.onSep.mock.calls[0][0];
+    expect(text).toContain('未独立核验');
+    // 终态只有一个来源（run_end）：judge_done 事件不得驱动状态机、不得刷红、不得自称完成/终态分隔。
+    expect(hooks.onSysErr).not.toHaveBeenCalled();
+    expect(hooks.onCurrentRunEnd).not.toHaveBeenCalled();
+    expect(s.activeRunId.value).toBe('run-1');
+    expect(text).not.toMatch(/run 结束|已完成|已核验|已验证/);
+  });
+
+  it('off_track + 扩轮同时展示（各维度非互斥，可同时非空）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', {
+      kind: 'round', action: 'extend+redirect',
+      decision: {
+        done: false, confidence: 0.6, direction: 'off_track', directionReason: '在错的目录里改',
+        extend: true, extendReason: '还差测试', plan: '先回到 src 下',
+      },
+    });
+    expect(hooks.onSep).toHaveBeenCalledWith(
+      'judge：评审认为目标未达成（置信度 0.6） · 方向：可能偏离 — 在错的目录里改 · 建议扩轮 — 先回到 src 下（还差测试）',
+      'judge',
+    );
+  });
+
+  it('实测欺骗形态 kind=intercept + action=extend+redirect：不得解读成「工具已执行」', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', {
+      kind: 'intercept', tool: { name: 'editFile' }, action: 'extend+redirect',
+      decision: { done: false, direction: 'off_track', extend: true, extendReason: '还差测试' },
+    });
+    const text = hooks.onSep.mock.calls[0][0];
+    // 从 action 反推「已放行/已执行」会被骗（真实审计可为拦截）；执行与否以工具卡片为准。
+    expect(text).toContain('工具审计：结果未知（extend+redirect），执行与否以工具卡片为准');
+    expect(text).not.toMatch(/已放行|已执行/);
+    // 且意见轴不被处置遮蔽（三个维度同时非空）。
+    expect(text).toContain('评审认为目标未达成');
+    expect(text).toContain('方向：可能偏离');
+    expect(text).toContain('建议扩轮（还差测试）');
+  });
+
+  it('blocked + uncertain 完整展示；passThrough（readonly）不再提前 return 遮掉 done/uncertain', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', {
+      kind: 'intercept', tool: { name: 'writeFile' }, action: 'blocked',
+      decision: { done: false, confidence: 0.7, direction: 'uncertain', reason: '方向不明就写文件' },
+    });
+    expect(hooks.onSep.mock.calls[0][0]).toBe(
+      'judge：工具审计：已拦截（本次工具调用未执行） · 评审认为目标未达成（置信度 0.7） · 评审理由：方向不明就写文件 · 方向：不确定',
+    );
+    lastES().emit('judge', {
+      kind: 'intercept', tool: { name: 'readFile' }, action: 'executed', passThrough: 'readonly',
+      decision: { done: false, direction: 'uncertain' },
+    });
+    expect(hooks.onSep.mock.calls[1][0]).toBe(
+      'judge：工具审计：已放行（readonly，非任务完成） · 评审认为目标未达成 · 方向：不确定',
+    );
+  });
+
+  it('degraded 与未知 action 走中性降级（灰色 judge 面板行，不刷红、不解读）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', { kind: 'intercept', tool: { name: 'shell' }, action: 'degraded', error: 'parse', decision: null });
+    lastES().emit('judge', { kind: 'round', action: 'degraded' }); // error 缺失 → unknown 兜底
+    lastES().emit('judge', { kind: 'round', action: 'frobnicate', decision: { done: true, confidence: 0.9 } }); // 引擎 additive 新值
+    lastES().emit('judge', {}); // 全脏载荷
+    expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
+      'judge：评审降级（parse），本轮未给出意见',
+      'judge：评审降级（unknown），本轮未给出意见',
+      'judge：评审认为目标已达成（未独立核验；是否收尾由模型自行判定）（置信度 0.9） · 评审动作：frobnicate',
+      'judge：评审事件（无可解读细节）',
+    ]);
+    for (const call of hooks.onSep.mock.calls) expect(call[1]).toBe('judge');
+    expect(hooks.onSysErr).not.toHaveBeenCalled();
+  });
+
+  it('实时流与历史回放（replayEvent）逐字同文案', () => {
+    const payloads: Array<Record<string, unknown>> = [
+      { kind: 'intercept', tool: { name: 'shell' }, action: 'executed', decision: { done: false, confidence: 0.8, reason: '继续写测试', direction: 'on_track' } },
+      { kind: 'round', action: 'judge_done', decision: { done: true, confidence: 0.95, reason: '部署并复验通过', direction: 'on_track' } },
+      { kind: 'intercept', tool: { name: 'editFile' }, action: 'extend+redirect', decision: { done: false, direction: 'off_track', extend: true, extendReason: '还差测试' } },
+      { kind: 'intercept', action: 'degraded', error: 'timeout', decision: null },
+    ];
+    for (const payload of payloads) {
+      const live = makeHooks();
+      const replay = makeHooks();
+      const sLive = useEventStream(live);
+      sLive.connect('sess-1');
+      sLive.activeRunId.value = 'run-1';
+      lastES().emit('judge', payload);
+      const sReplay = useEventStream(replay);
+      sReplay.replayEvent({ seq: 7, run_id: 'r1', type: 'judge', payload });
+      expect(replay.onSep.mock.calls).toEqual(live.onSep.mock.calls);
+      expect(sReplay.activeRunId.value).toBeNull(); // 回放同样不驱动运行态状态机
+    }
+  });
+
+  it('切 English：done=true 意见文案成对（不含承诺式 verified/completed）', () => {
+    setLocale('en');
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('judge', { kind: 'round', action: 'judge_done', decision: { done: true, confidence: 0.95, reason: 'deployed & re-checked', direction: 'on_track' } });
+    const text = hooks.onSep.mock.calls[0][0];
+    expect(text).toContain('not independently verified');
+    // 只允许否定式出现 verified（not independently verified），不得出现承诺式的 completed。
+    expect(text).not.toMatch(/completed/i);
+    expect(text).toContain('judge: goal considered met (not independently verified; the model itself decides whether to wrap up) (confidence 0.95) · reason: deployed & re-checked');
   });
 });

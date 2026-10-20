@@ -212,10 +212,40 @@ export const en = {
       toolReplayTool: ' ({name})',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
-      judgePassThrough: 'judge: pass through ({mode})',
-      judgeExtend: 'judge: extend rounds{dash}{paren}',
-      judgeNoExtend: 'judge: no extension{dash}',
-      judgeAction: 'judge: {action}{dash}',
+      // issue #321 (erix-station): the judge is forever only an **opinion**, never an acceptance — shown on
+      // independent axes (tool audit / goal verdict / direction / extension can all be non-empty at once;
+      // NOT three mutually exclusive states). "Completed" comes solely from the run terminal separator
+      // (run_end); this station's runner never passes finalGuard ⇒ verification is always "skipped", so no
+      // string below may promise "verified". The caller joins axes with " · ".
+      judgeAxes: 'judge: {axes}',
+      // Axis 1 · tool audit: `executed` means "this tool call was released", not task completion
+      // (the amplifier of ISSUES.md item 4).
+      judgeAuditExecuted: 'tool audit: released (not task completion)',
+      judgeAuditPassThrough: 'tool audit: released ({mode}; not task completion)',
+      judgeAuditBlocked: 'tool audit: blocked (this tool call did not run)',
+      // extend / extend+redirect / decline_extend are extension dispositions, not audit verdicts (observed
+      // events exist with kind=intercept yet action=extend+redirect whose real audit was a block) ⇒ never
+      // infer "tool executed" from such actions; the tool card is the source of truth for execution.
+      judgeAuditUndecided: 'tool audit: outcome unknown ({action}); see the tool card for execution',
+      // Axis 2 · goal verdict: done=true is fixed to "judge thinks the goal is met (not independently
+      // verified)" plus the model-decides-the-wrap-up disclaimer — "main work done, chores remain" is a
+      // legal state and must not read as "completed". confidence only shown when a finite number.
+      judgeGoalDoneTrue: 'goal considered met (not independently verified; the model itself decides whether to wrap up)',
+      judgeGoalDoneFalse: 'goal considered not met yet',
+      judgeConfidence: ' (confidence {confidence})',
+      judgeReason: 'reason: {value}',
+      // Axis 3 · direction: on_track is the norm and stays quiet; uncertain / off_track must not be
+      // hidden by the passThrough / extend branches.
+      judgeDirectionOffTrack: 'direction: may have drifted',
+      judgeDirectionUncertain: 'direction: uncertain',
+      // Axis 4 · extension opinion (from decision.extend; no invented tier, no cost estimate — that is #282).
+      judgeExtendSuggest: 'suggests extending rounds',
+      judgeExtendDecline: 'suggests no extension',
+      // Neutral degradation: a failed judge call (degraded) and unknown actions newly added by the engine —
+      // grey judge-panel line, no red, no interpretation.
+      judgeDegraded: 'judge degraded ({error}); no verdict this round',
+      judgeUnknownAction: 'judge action: {action}',
+      judgeNoDetail: 'judge event (no interpretable details)',
       compaction: 'Context compaction (round {round}): {folded} rounds folded, {before} → {after} tokens',
       finalGuard: 'final guard: {action}{dash}',
       forcedFinal: 'forced final (round {round}): {reason}',
