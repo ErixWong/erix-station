@@ -70,13 +70,32 @@ describe('分隔行渲染（roundsep）', () => {
   it('judge variant 渲染为黄色面板 .roundsep.judge-panel；普通 sep 保持灰色 .roundsep', () => {
     const store = useWorkbenchStore();
     store.entries.push({ kind: 'sep', text: 'round 2' });
-    store.entries.push({ kind: 'sep', text: 'judge：扩轮 — P（R）', variant: 'judge' });
+    store.entries.push({ kind: 'sep', text: 'judge：建议扩轮 — P（R）', variant: 'judge' });
     const wrapper = mountPanel();
     const seps = wrapper.findAll('.roundsep');
     expect(seps).toHaveLength(2);
     expect(seps[0].classes()).toEqual(['roundsep']);
     expect(seps[1].classes()).toEqual(['roundsep', 'judge-panel']);
-    expect(seps[1].text()).toBe('judge：扩轮 — P（R）');
+    expect(seps[1].text()).toBe('judge：建议扩轮 — P（R）');
+  });
+
+  // issue #321：judge 意见行（done=true）只是黄色面板分隔行——它**不是**终态分隔条：
+  // 不渲染成 .syserr，也不自带「run 结束」终态文本（终态只由 run_end 产生）。
+  it('issue #321：judge done=true 意见行只产 judge-panel 分隔行，不产终态分隔条（.syserr / run 结束）', () => {
+    const store = useWorkbenchStore();
+    store.entries.push({
+      kind: 'sep',
+      text: i18n.global.t('stream.event.judgeAxes', { axes: i18n.global.t('stream.event.judgeGoalDoneTrue') }),
+      variant: 'judge',
+    });
+    const wrapper = mountPanel();
+    const seps = wrapper.findAll('.roundsep');
+    expect(seps).toHaveLength(1);
+    expect(seps[0].classes()).toEqual(['roundsep', 'judge-panel']);
+    expect(seps[0].text()).toContain('未独立核验');
+    expect(seps[0].text()).not.toMatch(/已完成|已核验|已验证/);
+    expect(wrapper.find('.syserr').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('run 结束');
   });
 });
 

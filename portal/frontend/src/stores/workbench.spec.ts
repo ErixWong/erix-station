@@ -438,7 +438,8 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     const judgeSep = store.entries[2];
     expect(judgeSep.kind).toBe('sep');
     if (judgeSep.kind === 'sep') {
-      expect(judgeSep.text).toBe('judge：不扩轮 — 够用了');
+      // issue #321 分轴文案：extend=false 单轴 → 「不建议扩轮 — {extendReason}」
+      expect(judgeSep.text).toBe('judge：不建议扩轮 — 够用了');
       expect(judgeSep.variant).toBe('judge'); // feat-260925-02 judge 面板高亮 sep
     }
     const card = store.es.toolCards.get('c1');
