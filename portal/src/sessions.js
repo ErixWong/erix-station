@@ -761,6 +761,18 @@ export const AI_TITLE_CONTEXT_MESSAGES = 3;
 export const AI_TITLE_CONTEXT_MAX_LEN = 200;
 /** 单次上游调用超时（issue #114：~15s）。 */
 export const AI_TITLE_TIMEOUT_MS = 15_000;
+/**
+ * #315：AI 改名**显式**发 `max_tokens`，不让网关替我们填。
+ *
+ * 不发会怎样：LiteLLM 在调用方没发 `max_tokens` 时，注入该 deployment 的 `litellm_params.max_tokens`
+ * （#309 切片 1 起由门户双写成「单次输出预算上限」，现网是 32768）——那是一位**给整个模型**设的预算，
+ * 拿它去生成一行标题纯属浪费，而且当 `context_window` 被配得很小（管理员笔误，例：2048）时，
+ * 上游会按「prompt + 预留 32768 输出」判超限 ⇒ **这条请求被拒**，表现为「AI 改名点了没反应」。
+ * 发 512 的理由：标题 ≤30 字，512 token 绰绰有余，且**与 runner 侧自动标题用的是同一个数**
+ * （`runner/lib/session-title.js` 的 `maxTokens: 512`）——两条做同一件事的路径过去只有一设了上限，
+ * 那个不一致就是本单的登记理由。测试在对面（`session-ai-title.test.js` 钉 512 与跨路径一致）。
+ */
+export const AI_TITLE_MAX_TOKENS = 512;
 /** 系统提示：与 AUTO_TITLE_MAX_LEN 同口径（≤30 字；落库前仍过一遍 sanitizeTitle）。 */
 export const AI_TITLE_SYSTEM_PROMPT =
   '你是会话命名助手。根据用户消息为这次会话生成一个简短标题。'
@@ -855,6 +867,8 @@ export async function generateAiTitle(pool, {
         ],
         temperature: 0.2,
         stream: false,
+        // #315：显式发，否则网关注入 `litellm_params.max_tokens`（模型的输出预算，不是标题的）
+        max_tokens: AI_TITLE_MAX_TOKENS,
       }),
       signal: controller.signal,
     });
