@@ -890,6 +890,16 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 - **真机验收（v0.1.18）**：`POST /api/sessions/:id/ai-title` 端到端 **200** + 标题落库（`Shell命令与大文件读取测试`）+ portal 日志 `[ai-title] 会话标题已更新（source=fde_binding）`。
   ⚠ **网关侧独立证据拿不到**：LiteLLM v1.103.2 在本网关配置下 `LiteLLM_SpendLogs.proxy_server_request` 是**空对象**、`metadata` 的键里**没有请求参数** ⇒ 「请求体里确实带了 `max_tokens: 512`」的证据只有**单测**（请求形状断言 + 跨路径锁 + 两条变异各恰 1 红），**不许声称已在网关侧证实**。
 
+**追加（#318 + #325 + #314，2026-10-20，分支 `fix-261020-04-314-318-325`；门户写侧三条，零 DDL、零依赖、不动 `runner/`）**
+
+1. **#318 = 写侧硬下限 `CONTEXT_WINDOW_MIN = 65_536`**（`portal/src/llm.js:validateContextWindow()`）。**定性写进注释与文档**：它和 1/4 上限一样是**产品约束**，不是引擎安全必需（引擎致命判据只有「预算非正」，`ctx=32768/maxOut=8192` 预算 ≈21,507，引擎跑得动）；选 64k 的实测依据：固定前缀 ≈3,328 / 最省单轮回回来回 3,829–4,404 / 近 7 天 35 条 run 单 run 输入平均 27,641（最小 3,555、最大 257,207）⇒ 64k ≈ 平均用量的 2.3 倍，32k 只有 1.2 倍。**为什么不再单独加「压缩已关闭」提示**：下限把 `ctx ≤ 2666` 那个死区在门户里堵死，提示逻辑不必预支（runner 上游闸仍兜带外配置）。
+2. **#325 = 落库写归一结果**（`model_info.context_window` / 镜像的 `metadata.context_window` / 绑死双写的 `max_output_tokens`+`litellm_params.max_tokens` 一律写 `positiveIntOrNull()` 的返回值，**不写调用方原值**）。**PATCH 没出现的字段不做归一写回**（留空 = 不修改）。
+3. **#314 = 「清空」换成「按当前窗口 1/4 重设」**：`litellm_params.max_tokens` **不在** LiteLLM 的 `NULL_CLEARABLE_LITELLM_PARAMS`（源码实测），显式 `null` 是 no-op ⇒ 「手填过就撤不掉」是真限制；管理员真正要的是「让平台重新按新窗口兜底」⇒ 按钮把值填成 `Math.floor(窗口/4)`（与门户读侧回退同一算法），**只填不提交**、无窗口时禁用。两个表单的不对称同屏说清（编辑留空 = 不修改 / 新建留空 = 不写这个字段）。**前端不复制服务端数字校验**（65536 与 1/4 的唯一真相源是 `llm.js`）。
+4. **次序（D2）**：窗口的形态 + 下限排在「输出上限 ≤ 1/4」**之前**，PATCH 里还排在**任何网关请求之前** ⇒ 窗口配错时网关零请求、零部分写入（照 #296 `model_name_conflict` 的形状）；症状「窗口 1000 + 上限 500」报 `context_window/too_small`，不报上限错。**零新错误码**（`validation_failed` + `details.reason='too_small'|'not_positive_integer'`）。
+5. **一处对工单的收窄（主 agent 核可）**：`context_window: null` **不当下限判据**——它是新建表单「留空」的既有拼写，拒它会把「建一个没配窗口的模型」堵死；copilot 那句「null 是非法值」查的是 `positiveIntOrNull()` 的形态面，与「该字段允许表达没配」不冲突。
+
+**验收**：根 **1262 → 1286**（1282 通过 / 0 失败 / 4 跳过；#318+#325 **+5**）、runner **320 不变**、前端 **582 → 585**（#314 **+3**）、typecheck 干净。**主 agent 亲跑变异 3 条全红在具名用例**：拆掉 `window < CONTEXT_WINDOW_MIN` ⇒ 2 条具名红；`model_info.context_window` 回写原值 ⇒ 恰 1 红；重设按钮改成顺手提交 ⇒ 恰 1 红（「PATCH 数为 0」那条）。
+
 **已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
 
