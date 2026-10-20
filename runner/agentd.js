@@ -1099,8 +1099,9 @@ async function onWorkerFinished(ctx, msg) {
     usage: msg.usage ?? { input_tokens: 0, output_tokens: 0 },
     rounds: msg.rounds ?? 0,
     final_text: msg.final_text ?? '',
-    // issue #88 修订：worker 侧已顺带生成会话标题（ERIX_SESSION_AUTO_TITLE 开关），随终态透传；
-    // 缺失/空串 → portal 落库评估走降级链（首条消息截断 → cwd basename）。
+    // issue #322：标题**归 portal 生成**（`session-title.js` → `title-llm.js` → `llm-chat.js`），worker
+    // 侧不再起标题 ⇒ 这个字段现在恒是空串。本行只保留**透传**（契约形状一字未改：旧 portal + 新 agentd
+    // 的组合下拿到空串即走降级链），`title` 在 U2 上的口径见 `docs/api/portal.md` §9.6。
     title: typeof msg.title === 'string' ? msg.title : '',
   };
   if (!msg.ok && msg.termination?.reason !== 'aborted') {

@@ -38,6 +38,7 @@ import {
   notifySessionEvents,
   SESSION_CLIENT_BUFFER_MAX,
 } from '../src/internal.js';
+import fs from 'node:fs';
 import { FakeInternalPool, seedClaimable } from './fake-internal-pool.js';
 
 test('validateTransition：合法/非法转换（portal.md §9.6）', () => {
@@ -825,8 +826,10 @@ test('F3：U12 release 终态分支（cancelling / 耗尽）合成 run_end', asy
   assert.ok(b.pool.events.some((e) => e.type === 'run_end' && e.client_event_id === 'run-b:final:run_end'), '耗尽 release 合成 run_end');
 });
 
-// issue #88 修订：worker 侧生成的会话标题随终态上报——finishRun 收包校验（字符串、截断 ≤200）。
-test('U2 finish：title 字段校验——非字符串 400；超长字符串截断放行（fire-and-forget 评估落库）', async () => {
+// issue #322：`title` 的**摄入已退役**（标题改由 portal 在终态后自己生成），但**兼容面不动**——
+// 旧容器（v0.1.18 及以前）随 `run_finished` 仍会带一个真标题，U2 必须照旧接受、绝不报错。
+// 用例名（工单交付里点名的那条）：`U2 finish：title 字段兼容面——旧容器发的 title 不报错、但不再作为生成来源`
+test('U2 finish：title 字段兼容面——旧容器发的 title 不报错、但不再作为生成来源', async () => {
   const { pool, userId, containerId, runId } = seedClaimable();
   const container = { id: containerId, user_id: userId };
   const user = { id: userId, login: 'alice' };
@@ -844,12 +847,29 @@ test('U2 finish：title 字段校验——非字符串 400；超长字符串截�
   );
   assert.equal(pool.runs[0].status, 'running', '校验失败不写终态');
 
-  // 超长字符串（>200 字符）→ 截断后放行（fire-and-forget 评估链，不阻塞终态响应）。
-  const res = await setRunState(pool, {
-    container, user, runId, claimToken,
-    body: { state: 'finished', termination: { reason: 'end_turn' }, title: '长'.repeat(500), final_text: 'done' },
-  });
-  assert.equal(res.state, 'finished');
+  // 字符串（含 >200 字符的旧口径超长值）→ 照旧放行：摄入退役后**没有截断这一步了**，但绝不因为
+  // 「这个字段我们不再用了」就把旧容器报错（终态响应是 run 的关键路径）。
+  for (const title of ['长'.repeat(500), '旧容器起的标题', '']) {
+    const { pool: p2, userId: u2, containerId: c2, runId: r2 } = seedClaimable();
+    const container2 = { id: c2, user_id: u2 };
+    const user2 = { id: u2, login: 'alice' };
+    const t2 = await claimRun(p2, { container: container2, user: user2, capacity: 1, holdMs: 10 });
+    const res = await setRunState(p2, {
+      container: container2, user: user2, runId: r2, claimToken: t2.claim_token,
+      body: { state: 'finished', termination: { reason: 'end_turn' }, title, final_text: 'done' },
+    });
+    assert.equal(res.state, 'finished', `title=${JSON.stringify(title).slice(0, 24)}… ⇒ 200 终态，绝不报错`);
+    assert.equal(p2.runs[0].status, 'finished');
+  }
+
+  // 兼容面的另一半：**值不再进标题链**。U2 只把字段校个类型就丢掉——源码级钉（`agentTitle` 这个变量
+  // 与 `AGENT_TITLE_MAX_LEN` 的摄入都该消失），行为级钉在 `portal/test/session-title.test.js`
+  // 「#322 title 字段兼容面：容器上报的 title 不再是生成来源」。
+  const internalSrc = fs.readFileSync(new URL('../src/internal.js', import.meta.url), 'utf8');
+  assert.equal(/agentTitle/.test(internalSrc), false, 'internal.js 里不该再有 agentTitle 这条摄入变量');
+  assert.equal(internalSrc.includes('AGENT_TITLE_MAX_LEN'), false, '不再截断摄入（截断上限本身已无消费者）');
+  assert.match(internalSrc, /scheduleAutoTitle\(pool, \{ sessionId: r\.session_id, runId, notify/,
+    'scheduleAutoTitle 的入参里不该再带 title（生成者在 portal 自己）');
 });
 
 test('F4：U2 finish 同载荷重放幂等（200），载荷不同 409 run_terminal', async () => {
