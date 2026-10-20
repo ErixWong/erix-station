@@ -395,8 +395,13 @@ export const en = {
       // #309: these keys serve exactly one field, `max_output_tokens` (one spelling on our side).
       // The list column shows the **effective** value the backend computed (1/4 of the window when unset).
       colMaxOutputTokens: 'Output budget cap (tokens)',
-      maxOutputTokensHint: 'The engine uses this as the output budget cap for a single response. Cap = 1/4 of the context window (validated by the server; anything above is rejected); left blank the backend assumes 1/4 of the window and ships that as the effective value.',
-      editMaxOutputTokensHint: 'Leave blank to keep the current value. Cap = 1/4 of the context window; the server rejects anything above it. The list always shows the effective value (1/4 of the window when nothing was configured).',
+      // #314: "blank = no change" has to be spelled out, together with the create/edit asymmetry
+      // (create sends an explicit `null`, edit omits the field) — that asymmetry is the confusion source.
+      maxOutputTokensHint: 'The engine uses this as the output budget cap for a single response. Cap = 1/4 of the context window (validated by the server; anything above is rejected). On create, leaving it blank means the field is not sent at all (not "no change" — there is nothing to keep yet); the backend then assumes 1/4 of the window and ships that as the effective value.',
+      editMaxOutputTokensHint: 'Blank = no change (the edit form sends a PATCH, so a blank field is simply omitted). Cap = 1/4 of the context window; the server rejects anything above it. The list always shows the effective value (1/4 of the window when nothing was configured).',
+      maxOutputReset: 'Reset to 1/4 of the window',
+      maxOutputResetHint: 'Fills the box above with "1/4 of the current window". It only fills the value — it does not save (the real gateway cannot clear this field, #314; to stop overriding, reset and then save).',
+      maxOutputResetNeedsWindow: 'No window entered, so 1/4 cannot be computed — fill the context window first.',
       colPricing: 'Pricing',
       inputCostLabel: 'Input price (USD / 1M tokens)',
       outputCostLabel: 'Output price (USD / 1M tokens)',
