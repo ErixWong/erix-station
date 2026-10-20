@@ -887,6 +887,44 @@ test('#309 心跳下行：连 context_window 都没配 ⇒ 两键都不出现（
   assert.equal(Object.hasOwn(partialModels.main, 'context_window'), false);
 });
 
+test('#316 心跳下行：数字串窗口归一成正整数后带下去；真小数/非数字 ⇒ 两键都不出现（不是 key: null）', async () => {
+  // #316 的病症：门户列表显示着窗口、runner 解析层整键丢掉 ⇒ 压缩静默关。今天两侧同一条规则
+  //（`portal/src/llm.js` 的 `positiveIntOrNull()` ↔ `runner/lib/llm-models.js`），下行只会带
+  // **归一后的正整数**，算不出来就整个键不出现（runner 用「键在不在」判有无，不解析 null/怪形态）。
+  const cases = [
+    { ctx: '262144', expected: 262144, why: '数字串 ⇒ 归一成 number 带下去（旧行为：原样带字符串下去）' },
+    { ctx: 262144.0, expected: 262144, why: '整值浮点 ⇒ 原样' },
+    { ctx: 262144.5, expected: null, why: '真小数 = 配错 ⇒ 不可得（不 floor，也别把一个 runner 一定丢的数发下去）' },
+    { ctx: 0, expected: null, why: '0 ⇒ 不可得（runner 收到 0 会让 computeBudget 直接抛）' },
+    { ctx: -8000, expected: null, why: '负数 ⇒ 不可得' },
+    { ctx: 'abc', expected: null, why: '非数字串 ⇒ 不可得' },
+  ];
+  for (const { ctx, expected, why } of cases) {
+    const pool = fakePool([ROW]);
+    const { gw } = fakeGateway([
+      // 只给窗口、不给预算：max_output_tokens 走同一条回退链，所以两键的「可得性」必须同源。
+      metaModel('m-main', 'deepseek-flash', { contextWindow: ctx }),
+      metaModel('m-emb', 'text-embedding-3'),
+    ]);
+    const models = await getFdeLlmHeartbeatModels(pool, 'u1', {
+      gateway: gw, now: () => 1000, ttlMs: 0,
+      listModels: () => gw.listModels(), updateKey: () => Promise.resolve({}),
+    });
+    const label = `context_window=${JSON.stringify(ctx)}`;
+    if (expected === null) {
+      assert.deepEqual(models.main, { model: 'deepseek-flash', type: 'text' },
+        `${label}：${why} ⇒ 两键都不出现（回退值也算不出，两者同源）`);
+      assert.deepEqual(Object.keys(models.main), ['model', 'type'], `${label}：不补 null 占位`);
+    } else {
+      assert.deepEqual(models.main, {
+        model: 'deepseek-flash', type: 'text',
+        context_window: expected, max_output_tokens: Math.floor(expected / 4),
+      }, `${label}：${why}，且下行的是 number`);
+      assert.equal(typeof models.main.context_window, 'number', `${label}：下行必须是 number（#316 的核心）`);
+    }
+  }
+});
+
 test('#309 切片1.5 兼容面：不传 gateway 的老调用形状仍逐字节不变（回退不得泄进这条兼容路）', async () => {
   // 目录里就算躺着带窗口的部署也不能影响这条：老调用形状根本不碰网关 ⇒ 一个字节都不能变。
   const table = [ROW];
