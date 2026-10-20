@@ -875,6 +875,17 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
    上面「已接受代价」里那条 wrap-up 副作用要加门：**本站 `worker.js` 传 `wrapup: false`** ⇒ 引擎
    `wrapupEnabled=false`（`orchestrator.js:1268` + `:1297-1300` 共同开门）⇒ 该路径**当前不可达**，不是活风险。
 
+**发版与部署（v0.1.17 / v0.1.18，2026-10-20 上午）**
+
+- **v0.1.17** = `e7eb8a7`（#316 元数据形态口径统一 + #317 文档纠偏，PR #320）：main CI（含三镜像构建校验）绿后打 tag → release run `39354576986` success
+  → 三镜像 `docker pull` 后 `image inspect .Id` 与清单 `imageId` **逐个一致** → `deploy/.env` 形态① pin **三项**（本版动 `runner/` 实质代码 ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0117`）
+  → `up -d --no-build` → **`docker rm -f` 全部 7 台 `fde-*`，reconcile 15 秒内全部落在 fde `imageId=sha256:047eab6c…` 且 healthy**。portal 实跑 `fb4c89ba…`、proxy `4bb20a9b…`，经 Traefik `/healthz` 200。
+- **v0.1.18** = `5a5aacc`（#315 显式 `max_tokens=512` + 审计措辞处置 + #88 出处更正，PR #323）：release run `39363594675` success → 清单三镜像与部署机逐个一致（portal `1f0e32ee…` / fde `543c90bd…` / proxy `8b2d6520…`）
+  → pin 三项（备份 `/tmp/deploy.env.bak-0118`）→ `up -d --no-build` ⇒ portal 实跑 `1f0e32ee…` healthy、`/healthz` 200。
+  ⚠ **本版故意不重建 FDE 容器**（§8.19 先例）：`git diff v0.1.17..v0.1.18 -- runner/` 里非 version 文件只有 `runner/worker.js`，实质差异 **4 行且全是注释**（`// 全站只允许…` → `// 在本文件里只允许…`）⇒ 零行为差异，七台容器仍跑 v0.1.17 镜像 `047eab6c…`，下次重建自然升级。**别把它记成「runner 有改动所以必须重建」的先例。**
+- **真机验收（v0.1.18）**：`POST /api/sessions/:id/ai-title` 端到端 **200** + 标题落库（`Shell命令与大文件读取测试`）+ portal 日志 `[ai-title] 会话标题已更新（source=fde_binding）`。
+  ⚠ **网关侧独立证据拿不到**：LiteLLM v1.103.2 在本网关配置下 `LiteLLM_SpendLogs.proxy_server_request` 是**空对象**、`metadata` 的键里**没有请求参数** ⇒ 「请求体里确实带了 `max_tokens: 512`」的证据只有**单测**（请求形状断言 + 跨路径锁 + 两条变异各恰 1 红），**不许声称已在网关侧证实**。
+
 **已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
 
