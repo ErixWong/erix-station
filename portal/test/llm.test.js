@@ -812,7 +812,8 @@ test('model list：toModel exposes max_tokens and defaults missing values to nul
 // 填得不合公式会让**每个 run 第 1 轮之前就死**：`computeBudget` 抱 `invalid_budget`（实测文案
 // "Computed context budget must be positive (got -71)"，`erix-agent/src/compact/budget.js:23-25`，
 // 调用点 `orchestrator.js:1141-1148` 无 try/catch）。
-// 门户必须写之前就拦：上限 = floor(context_window / 4)（比引擎临界更严，双保险）。
+// 上限 = floor(context_window / 4)：**产品约束**（比引擎临界更严，会拒掉引擎其实跑得动的值）；
+// 真正致命面（预算非正）由 runner 侧上游闸兜 —— 定性见 portal/src/llm.js 的 validateMaxOutputTokens 注释。
 
 /** 超限拒的公共断言：零新错误码（§8.20）⇒ 一律 validation_failed，细分看 details。 */
 function assertOverLimit(error, expected) {

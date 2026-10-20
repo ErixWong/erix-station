@@ -10,7 +10,7 @@ import path from 'node:path';
 import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
-import { generateAiTitle } from '../src/sessions.js';
+import { generateAiTitle, AI_TITLE_MAX_TOKENS } from '../src/sessions.js';
 import { createSessionTextHandler, inputTranscriptRow } from './fake-session-text.js';
 import { FakePool } from './fake-pool.js';
 
@@ -195,6 +195,7 @@ test('issue #114 成功态：一次 chat/completions → sanitizeTitle 清洗 �
     const payload = JSON.parse(stub.calls[0].init.body);
     assert.equal(payload.model, 'deepseek-flash', '用 binding 保存的 LiteLLM data-plane model_name');
     assert.equal(payload.stream, false);
+    assert.equal(payload.max_tokens, AI_TITLE_MAX_TOKENS, '#315：显式带上 max_tokens，不吃网关注入的模型级默认');
     assert.equal(payload.messages.length, 2);
     assert.equal(payload.messages[0].role, 'system');
     assert.match(payload.messages[1].content, /帮我修复登录页白屏/);
@@ -405,6 +406,17 @@ test('P3 PR②b ①：AI 改名上下文取自 transcript 投影；messages.cont
     stub.restore();
     await s.close();
   }
+});
+
+test('#315 跨路径一致：AI 改名发的 max_tokens == runner 自动标题的 maxTokens == 512（不一致就是这张单的本体）', async () => {
+  // 这个数为什么必须两边一样：两条路径干同一件事（给会话起标题），只是执行位置不同
+  //（runner 随 run 终态自动起 / portal 响应用户点「AI 改名」）。历史上只有 runner 那条设了上限
+  // ⇒ 同一次起标题，走哪条路决定了要不要吃网关注入的模型级 max_tokens。
+  assert.equal(AI_TITLE_MAX_TOKENS, 512, '门户侧那个数本身钉在 512（标题 ≤30 字，够用）');
+  const runnerSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../../runner/lib/session-title.js'), 'utf8');
+  assert.match(runnerSrc, /maxTokens:\s*512/,
+    'runner 侧仍是 512 —— 两边任一改动都必须同时改对面（这条用例就是那个提醒）');
 });
 
 test('P3 PR②b ① legacy 兜底：投影对该轮无证据（无 transcript 行）→ 回退 messages.content，AI 改名仍可用', async () => {
