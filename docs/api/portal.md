@@ -1009,15 +1009,18 @@ station-portal user enable  --login <login>
 - **请求体固定带 `max_tokens: 512`（#315）**：不发时 LiteLLM 会注入该 deployment 的 `litellm_params.max_tokens`
   （#309 切片 1 起 = 模型级「单次输出预算上限」，现网 32768），那是给整个模型设的预算、不是给一行标题设的；
   `context_window` 被配得很小时（管理员笔误）上游会按「prompt + 预留 32768」判超限 ⇒ **这条请求被拒**，症状是
-  「点了 AI 改名没反应」（不是 run 失败）。512 与 `runner/lib/session-title.js` 的 `maxTokens: 512` **同一个数**
-  （两条路径干同一件事），由 `portal/test/session-ai-title.test.js` 钉住。
+  「点了 AI 改名没反应」（不是 run 失败）。**#322 起这个数只有一个落点**：`portal/src/title-llm.js`
+  的 `TITLE_LLM_MAX_TOKENS`，它等于 `llm-chat.js` 的缺省值 `LLM_CHAT_DEFAULT_MAX_TOKENS`（512）——
+  不再是「两条路径各自写一遍、靠跨文件读源码的锁提醒对面」。`portal/test/session-ai-title.test.js` 因此改钉
+  两个方向：值仍是 512（#315 的结论不变）+ **`runner/lib/session-title.js` 必须不存在**（存在 = 重复复活）。
 - **落库**：响应经 `sanitizeTitle` 清洗（去引号/取首行/截 30 字）后写 `title` + `title_source='manual'` + `updated_at`；推一条 `session_updated`（同 #88/#107，不落 `run_events`）。
-- **例外范围**：本端点是用户拍板（2026-10-01，#114）的一次性命名调用，**仅限本端点**；其余路径不得由 portal 发 LLM 请求。
-  ⚠ **出处更正（2026-10-20）**：此处过去写「原则出自 #88『portal 不持 LLM 客户端』」——**记错了**，#88 原文是
-  「只动 portal + 前端展示；runner/agentd 零改动（标题是 portal 会话元数据，不是引擎事务）」，与该「原则」方向相反。
-  现状是标题有**两份实现**（`runner/lib/session-title.js` ↔ `portal/src/session-title.js` 镜像，`AUTO_TITLE_MAX_LEN=30`
-  与 `sanitizeTitle` 各一份、**无测试锁**）；把标题**统一到 portal 侧**已登记 **issue #322**（那是真减一份代码，
-  #315 就是这份重复开的第一张账单）。
+- **「例外」已消失（#322，2026-10-20）**：本端点过去被记成「portal 不持 LLM 客户端」这条原则的**例外**（用户拍板于
+  2026-10-01，#114，仅限本端点）。两件事让它不再是例外：① **那条原则的出处本来就是我记错的**（#88 原文是「只动 portal +
+  前端展示；runner/agentd 零改动（标题是 portal 会话元数据，不是引擎事务）」，方向相反）；② **#322 把标题统一到 portal 侧**
+  ⇒ portal 是标题的**唯一实现点**，不存在「破例」。现在的分层：`sessions.js` / `session-title.js` = 会话业务，
+  **`title-llm.js` = 标题业务**（prompt / 输入截断 / provider 解析 / 降级），**`llm-chat.js` = 对话调用面唯一出口**，
+  `llm.js` = 网关管理面（不发对话）。**「自动改名」也在这里**：run 终态后由 portal 用会话最后一段助手文本生成，
+  不经容器（§9.6 `title` 字段）。
 - **key 纪律**：LiteLLM virtual key 只进 `Authorization` 头，**绝不进日志/错误信息/响应**（上游回显的 key 亦被脱敏）。
 
 请求体：无（空 JSON `{}`）。
@@ -1967,6 +1970,7 @@ LiteLLM 侧带外改名（管理员在网关 UI 改 `model_name`）后，`fde_ll
 | `usage` | 整 run 用量汇总；portal 同事务写 `runs.usage` + `usage_ledger`（`source='erix'`，一 run 一条，`UNIQUE(run_id, source)`）——见 §9.9 |
 | `rounds` / `final_text` | 轮数与 assistant 最终文本；portal 同事务回写 `messages` assistant 行 |
 | `error` | 失败时 `{code, message, retryable}`（run 级错误码见 §6.4）；成功为 `null` |
+| `title`（**#322 起摄入退役**） | 旧容器（v0.1.18 及以前）随终态仍会带一个真标题 ⇒ U2 **照旧接受不报错**（非字符串仍 400 `validation_failed`，那是 #88 以来的既有契约，不是新增码），但**值不再进任何生成链**：不截断入库、不当降级链第一级、不参与终态幂等比对。v0.1.19 起的 worker **恒发空串**。标题改由 portal 在 run 终态后自己生成（§4.5a）。 |
 
 响应 `200`（portal 终态事务：runs 置终态 + `run_queue → done/cancelled` + messages 回写 + usage_ledger，runner §6.1）。
 
