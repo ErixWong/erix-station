@@ -10,6 +10,8 @@
 | 验证状态 | **未做运行验证**。行为结论来自 reviewer 的 fake-provider 离线探针 + 源码；无真机模型 run |
 | 版本口径 | 上表版本是 2026-10-20 09:27 的**快照**；erix-agent 依赖 pin 的真相在 `AGENTS.md` §8，部署镜像 pin 的真相在 `deploy/.env` |
 
+> ⚠ **本稿 §3 与 §5 的部分结论已于当日被独立复验更正**（marker 复用、溢出可达性、末次附着、恢复保真等 14 条）：见 **§10**，全文证据见同目录 `analysis-2026-10-20-judge-independent-review.md`。**照本稿施工前先读 §10。**
+
 > 本文的存在理由：本轮分析链上已经发生两次「引用了不存在的东西」的事故（§1）。凡本文未写明的，视为**未确定**。
 
 ---
@@ -142,3 +144,34 @@
 ## 9. 未做清单
 
 上游 `erix-agent` 单**未建**；erix-station 的 judge issue（`ISSUES.md` 第 4 条）**未建**；`#284` 前提更正评论未发；四片代码一行未写；真机验收零。
+
+---
+
+## 10. 勘误与拍板（2026-10-20 下午，独立复验后）
+
+复验载体：同目录 `analysis-2026-10-20-judge-independent-review.md`（执行体 Copilot CLI / `gpt-6.1-sol`；基点 station `9567b05` / erix-agent `9440b1c`；源码复证 + 八个 fake-provider 探针，零真模型）。下列每条均由主 agent 独立抽查复证过，不是照抄复审件。
+
+| 本稿原结论 | 更正 | 证据（`9440b1c` / `9567b05`） |
+|---|---|---|
+| §3① 「必须新增 marker 值，复用 `judge-control` 会**静默不生效**」 | **错**。全仓 `grep '"judge-control"' src/` 只有一处逻辑消费者——`judge.js` 的 `renderConversation()` 自输入排除，**没有任何代码数它**。复用反而天然免疫自读；只有「按共享 marker 数专属配额」才会被 stall/wrapUp 污染 | 主 agent `grep -rn '"judge-control"' src/` = 2 命中（注释 + 过滤） |
+| §5 P3 「上限本版不做：默认 `judgeIntervalRound=10`，单轮攒到 3 条需 ≥30 次工具调用，**场景不可达**」 | **可达**。默认间隔下 33 次工具调用 → 3 次审计 → 第 3 条被 `pendingDirectionHints.slice(0, 2)` + `length=0` 丢弃，正常与 resume 双路径均复现 | interval 默认值 10（`orchestrator.js` 的 `ERIX_JUDGE_INTERVAL` 回退）；探针 `tools=33 audits=3 hints=[true,true,false]` |
+| §2③ 代价之一「被审计那次恰为**最后一次**工具调用时无处附着」 | **错**，被它自己引用的 `probe6` 与本轮补测共同反证（`onJudge` 先于同次 `executeTool`） | `order=["execute:t0","judge:executed","execute:t1"]` |
+| §3「顺带该修」只列 extend / revise / blocked 三处 | **漏两处**：`termination.js` 的 `forceFinalIfNeeded`（`【强制收尾】`无 `meta`）；且「放行态 pending hint 不进快照 + `resume-manager.js` snapshot-only 补落档只选含 tool_use/tool_result 的消息」⇒ **二次 resume 必丢提示** | 三处 `continuationMessage`/`instruction` push 均无 `meta`（主 agent 逐条读源码） |
+| §3⑥ / 文档面「中英契约 73 节骨架」 | 现算 **75**（`#`+`##`+`###` 标题数）；`--self-test` 口径以脚本为准 | `grep -c '^#'` = 76（含文首 `# ` 标题） |
+| §5 P5 「三态文案 `executed`=拦截判定已执行 / …」 | **`executed` = 工具审计已放行，≠任务完成**；且 action / done / direction / 扩轮是**不同维度、可同时非空**，不许做三个互斥态（实测存在 `action=extend+redirect` 而真实审计为拦截） | 探针 `kind=intercept action=extend+redirect actually-intercepted=1` |
+| §6 `#282` 「tokens 定格需先给 `GET /api/runs/:id` 补 `rounds`」 | **错因果**：缺 `rounds` 属实，但终态 tokens 来自已有 usage，与 `rounds` 无前置依赖；`rounds` 是独立的契约修补 | 复审件 §1.4 |
+| §6 `#282` 提到的 `runId ?? '__direct__'` 归组细节 | station 全仓 **查不到**该串，只能作拟实现提醒，不能引用成现存机制 | `grep -rn '__direct__' portal/ runner/` 空 |
+| §6 `#286` 「Traefik 无内建 cookie 中间件 ⇒ **必须**装第三方插件 ⇒ 只走 C 是唯一不引外部依赖的选择」 | **过强**。ForwardAuth 的 `authResponseHeaders`（把自有鉴权端响应头复制进转发请求）是不引第三方插件的空间；「只走 C」可作**范围决策**，但不能称已修复 cookie-session SSR（`X-Auth-User` 是平台身份头，不是应用会话） | 源码 `portal/src/routes.js`（`fde-auth, strip-cookie` / X-Auth-User / Cookie 置空）+ Traefik v3.7 官方文档 |
+| 旧稿 `analysis-261016-judge-advisory.md`「`interceptJudgeDecision` 永不清零」 | **已腐烂**：`orchestrator.js` 每轮开头置 `undefined`，别再照它派单 | `runLoopState.interceptJudgeDecision = undefined`（主 agent 抽查） |
+| §3 报价「4 文件 / 约 25–35 行 / 零配置项」可完整交付六步 | **不够**。含恢复保真、类型面、中英契约与发版成本时，原始拆法合计约 1,100–2,000 行（大头是测试与双语文档）。**但见下方拍板：范围已收缩，实际不再需要这个量级** | 复审件 §4.1 |
+
+### 10.1 用户拍板（2026-10-20，覆盖 §5 的 P1–P5）
+
+1. **达成意见必须让模型知道**（不只是给人看界面）⇒ 走上游引擎实现：erix-agent [#322](https://github.com/ErixWong/erix-agent/issues/322)。
+2. **「已完成」的语义**：judge 只是意见，**是否完成/是否收尾由模型自己判**（任务主体完成但还有扫尾工作是合法状态）；界面上「已完成」只由 run 终态驱动 ⇒ erix-station [#321](https://github.com/ErixWong/erix-station/issues/321)。
+3. **复杂度收缩（用户质疑「是否值得花这个心思」后定）**：
+   - **单槽**投递（同轮重复只更新，不追加）⇒ 溢出问题被设计消灭，**§3④⑤ 的「独立新队列 / 排除改集合 / 新增 marker 值」整组作废**；P3「条数上限」不再是待拍项（无需实现）。
+   - **快照恢复保真不做**（pending 进快照、二次 resume 不丢）⇒ 降为**已知毛刺**记录在 #323，丢一次软提示不产生错误行为。
+   - 保留唯一一处便宜的顺手修：四处注入补 `meta.source` ⇒ erix-agent [#323](https://github.com/ErixWong/erix-agent/issues/323)。
+   - **不在本轮范围**：TPS/tokens 动量指标、成本估算、状态栏完整版（属 [#282](https://github.com/ErixWong/erix-station/issues/282)）。
+4. **载体已建**：#322 / #323 / #321 三张 issue 已建（2026-10-20），`#284` 前提更正评论已发；代码仍一行未写，真机验收零。
