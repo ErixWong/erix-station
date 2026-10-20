@@ -1306,9 +1306,35 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
 | `model` | string | 上游模型 id → `litellm_params.model`（不可与别的调用名撞，见上） |
 | `type` | `'text'\|'embedding'\|'rerank'\|'vision'` | 非法值 ⇒ `400 validation_failed`（`details.field='type'`） |
 | `tool_calling` | boolean | 支持 function calling |
-| `context_window` / `max_tokens` | number | `context_window` ≤0 ⇒ `400`（`details.field='context_window'`） |
-| `max_output_tokens` | number \| null | **单次响应的输出预算上限**（#309 切片 1，下一段）。权威位 `model_info.max_output_tokens`，并**同值自动跟随**写 `litellm_params.max_tokens`；**传 `null` 当前清不掉**：门户会按「清空」发请求（`model_info.max_output_tokens: null` + `litellm_params` 不带 `max_tokens`），但真 LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（实测 200 而值一字未动，issue **#314**）⇒ 门户侧只能**设值**，要清空得走网关。**设值**仍有效；硬上限 `≤ floor(context_window/4)` ⇒ 超限 `400 validation_failed`。**读侧读到的是生效值**：没手填过时它是 `floor(context_window/4)` 算出来的（切片 1.5，见下；`context_window` 的形态口径见「第 3 级」那一条，#316） |
+| `context_window` | number \| null | **写侧两条校验**（#318 下限 + #325 形态归一，下一段）：不带键 = 不改、`null` = 没配窗口、其它值必须**是正整数且 ≥ 65536**。落点是 `model_info.context_window`，并同步镜像 `model_info.metadata.context_window`（门户读侧两处都读，必须同源） |
+| `max_tokens` | number | legacy 数据面参数 → `litellm_params.max_tokens`；只接受正整数或 `null`（`null` = 删键） |
+| `max_output_tokens` | number \| null | **单次响应的输出预算上限**（#309 切片 1，下一段）。权威位 `model_info.max_output_tokens`，并**同值自动跟随**写 `litellm_params.max_tokens`；**传 `null` 当前清不掉**：门户会按「清空」发请求（`model_info.max_output_tokens: null` + `litellm_params` 不带 `max_tokens`），但真 LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（实测 200 而值一字未动，issue **#314**；原因：显式 `null` 只对网关那个 `CLEARABLE_LITELLM_PARAMS` 白名单字段生效，`max_tokens` 不在里面）⇒ 门户侧只能**设值**，要清空得走网关。**出路是 #314 的「按当前窗口 1/4 重设」**（管理台编辑弹窗里的一个按钮，把值填成 `floor(窗口/4)`，只填值不提交），而不是「清空」。硬上限 `≤ floor(context_window/4)` ⇒ 超限 `400 validation_failed`。**读侧读到的是生效值**：没手填过时它是 `floor(context_window/4)` 算出来的（切片 1.5，见下；`context_window` 的形态口径见上面 `context_window` 那两行与「第 3 级」那一条，#316/#325） |
 | `input_cost_per_token` / `output_cost_per_token` | number \| null | 显式定价（§8.31）；管理台按 **USD/1M** 输入输出、原值回读 |
+
+**`context_window` 的写侧校验：硬下限 65536（#318）+ 形态归一（#325）**
+
+两条都在 `portal/src/llm.js` 的 `validateContextWindow()` 一处完成，**零新错误码**（§8.20：一律 `validation_failed`，细分靠 `details.reason`）：
+
+| 校验 | 拒法 | `details` |
+|---|---|---|
+| **形态**：必须是正整数（唯一判据 `positiveIntOrNull()`，#316） | `400 validation_failed` | `{field:'context_window', reason:'not_positive_integer', min:65536, value:<原值>}` |
+| **下限**：`CONTEXT_WINDOW_MIN = 65_536` | `400 validation_failed` | `{field:'context_window', reason:'too_small', min:65536, value:<原值>}` |
+
+- **校验次序（写死了，不得互换）**：`context_window` 的**形态** → `context_window` 的**下限** → 「`max_output_tokens ≤ floor(窗口/4)`」。
+  为什么：否则「窗口 1000 + 上限 500」会先报「上限 250、传入 500」，管理员去改预算，而真正的病因（窗口配错了）被藏起来。
+  PATCH 里这两条还排在**任何网关请求之前**（连读目录那一次都不发）⇒ 窗口配错时**网关零请求、零部分写入**（与 `model_name_conflict` 同一个形状）。
+- **两种 `reason` 的文案都是写给管理员看的**（带算式与出路）：`too_small` → 「上下文窗口不能低于 65536（传入 …）。低于此值平台算不出正的压缩预算（`窗口 − 输出上限 − max(2000, 10%×窗口)`），压缩会静默关闭」；
+  `not_positive_integer` → 「上下文窗口必须是正整数（传入 …）」。前端**不翻译也不自己判**，`error.message` 原样透出（§8.31）。
+- **不带键 / `null` 不设下限**（#318 正文第 3 条）：「没配窗口」是另一条既有口径（配预算时报 `max_output_tokens / context_window_missing`）；
+  而**新建表单留空发的是显式 `null`**（下面「新建与编辑不对称」那一条）⇒ 拒 `null` 会把「建一个没配窗口的模型」（典型：embedding 位）在门户里堵死。
+- **下限只管本次提交的值**：存量/带外配出来的小窗口（例：`context_window: 8000`）仍可以只改预算、只改名字，门户不会因为新下限而拒。
+- ⚠ **落库的是归一后的 `number`，不是调用方原字符串**（#325）：网关 `model_info.context_window`、镜像的 `metadata.context_window`、以及双写的
+  `model_info.max_output_tokens` / `litellm_params.max_tokens` 写的都是 `positiveIntOrNull()` 的结果。此前写侧**原样透传**
+  （带外 `PATCH {"model_info":{"context_window":"262144"}}` 真网关就存成字符串 `'262144'`，2026-10-20 dev 实测）
+  ⇒ 数字串会永久留在目录里。⚠ **读侧（列表 DTO / 心跳下行）仍然原样回读存量值**：写侧归一只保证**今后经门户写入的**永远干净，
+  带外写进来的旧形态靠 #316 的读侧归一兜（runner 不受影响），不靠这里。
+- **定性：产品约束，不是引擎安全必需**（与 1/4 上限同一条定性）；实测依据与「为什么是 64k 而不是 32k」见
+  [`../design/fde-platform.md`](../design/fde-platform.md) §11.5。runner 那道上游闸（#309 切片 2b）**不动**：它兜的是带外配置。
 
 **`max_output_tokens`：单次响应的输出预算上限（#309 切片 1 + 切片 1.5）**
 
@@ -1380,15 +1406,20 @@ judge/工具拦截产生的待审批项（规格 §9.1 `approvals` / `tool_calls
   不传/传 `null` 时两个键都不写进网关 body。
 - **前端不做本地数字校验**（否则就是第二套会过期的规则）：表单只加提示「上限 = 上下文窗口的 1/4」，
   超限一律由服务端拒且 `error.message` 原样透传（`stores/admin.ts` 的 `errText` 口径）。
+  #314 加的那个「按当前窗口 1/4 重设」按钮也不破这条规矩：它只是 `floor(窗口/4)` 把值**填进输入框**
+  （替人按一下计算器），不拦截、不提交、不判上下限，填出来的数照样过服务端。
 - ⚠ **新建与编辑两个表单的「留空」不是同一个意思**（#317 补；这是看懂上面「清不掉」的前提）：
-  **新建**时留空发的是**显式 `null`**（`portal/frontend/src/views/AdminView.vue:160`
+  **新建**时留空发的是**显式 `null`**（`portal/frontend/src/views/AdminView.vue` 的
   `max_output_tokens: modelForm.max_output_tokens ? Number(...) : null`），而**编辑**（PATCH）留空发的是
-  **省略该字段**（`AdminView.vue:202` `...(modelEditForm.max_output_tokens ? { max_output_tokens: ... } : {})`，
+  **省略该字段**（`...(modelEditForm.max_output_tokens ? { max_output_tokens: ... } : {})`，
   即 PATCH 的「不动」语义，表单根本没提供「清空」按钮）。后果：真网关上 `null` 是忽略语义（#314）
   ⇒ **管理员永远看不到「清空失败」这个报错**（编辑表单不发 `null`），他只会看见「那个数清不掉」；
   而新建时留空确实不写该键，所以「新建一个没配预算的模型」是成立的（读侧退到 `floor(ctx/4)`）。
-  本单（#317）**只把口径写对**，没动前端一行（前端零改动）：真正的修分两条路——用 LiteLLM 的正确
-  清空语义，或把配口改成「设值不可清空」，归 #314。
+  **#314 的处置**（本版已做）：不动网关、不要求上游把 `max_tokens` 加进 `CLEARABLE_LITELLM_PARAMS`，而是
+  ① 编辑弹窗里给一个**「按当前窗口 1/4 重设」**（把值填成 `floor(窗口/4)`，与门户读侧回退同一个算法；
+  **只填值、不自动提交**，用户可继续编辑后自己点保存）；② 把「**留空 = 不修改**」写进该字段说明（两个表单的
+  不对称同屏说清：新建 = 不写该字段，编辑 = 省略该字段）；③ 表单里不再出现「清空」字样（做不到的事不给错觉）。
+  服务端零改动（重设只是前端的填值动作）。
 
 **别名对照表：同一个东西在六层里有六个名字（#309 切片 1.5；runner 那一行是 #317 补的）**
 
