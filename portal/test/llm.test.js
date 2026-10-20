@@ -823,10 +823,12 @@ function assertOverLimit(error, expected) {
 }
 
 test('#309 max_output_tokens：硬上限就是 floor(context_window/4) —— 边界值放行、+1 被拒', async () => {
+  // ⚠ #318 上线后写侧多了「窗口 ≥ 65536」硬下限 ⇒ 本用例的窗口值全部改成坐在下限之上的数。
+  // 窗口在这里只是分母：1/4 边界本身（边界放行 / +1 拒 / `Math.floor` 口径）**一条都没放宽**。
   const cases = [
-    { context_window: 8000, allowed: 2000 },
+    { context_window: 262144, allowed: 65536 },
     { context_window: 200000, allowed: 50000 },
-    { context_window: 999, allowed: 249 }, // 钉住 Math.floor：不是四舍五入、不是浮点 /4
+    { context_window: 65538, allowed: 16384 }, // 钉住 Math.floor（16384.5 ⇒ 16384）：不是四舍五入、不是浮点 /4
   ];
   for (const { context_window, allowed } of cases) {
     const pool = new LlmFakePool();
@@ -860,7 +862,7 @@ test('#309 max_output_tokens：非正整数一律拒（details 只点名字段�
     const pool = new LlmFakePool();
     await assert.rejects(
       () => createModel(pool, {
-        provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 8000, max_output_tokens: value,
+        provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 262144, max_output_tokens: value,
       }),
       (error) => assertOverLimit(error, { field: 'max_output_tokens' }),
       `max_output_tokens=${String(value)} 必须被拒`,
@@ -889,11 +891,11 @@ test('#309 max_output_tokens：没有 context_window 就判不了 1/4 ⇒ 拒（
   assert.equal(pool.gatewayCalls.some((entry) => entry.method === 'updateModel'), false,
     '缺窗口时不得只把 max_tokens 写进数据面（那正是「半套」）');
 
-  // 同一条 PATCH 里补上窗口则可放行（新值优先，不拿旧值判）。
+  // 同一条 PATCH 里补上窗口则可放行（新值优先，不拿旧值判；窗口取 ≥ #318 下限 65536 的数）。
   const both = new LlmFakePool({
     models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: null }],
   });
-  await updateModel(both, 'm1', { context_window: 8000, max_output_tokens: 2000 });
+  await updateModel(both, 'm1', { context_window: 262144, max_output_tokens: 2000 });
   assert.equal(both.gatewayCalls.find((entry) => entry.method === 'updateModel').body.model_info.max_output_tokens, 2000);
 });
 
@@ -908,15 +910,17 @@ test('#309 max_output_tokens：1/4 用「有效窗口」——本次提交的新
   assert.equal(body.model_info.max_output_tokens, 50000);
   assert.equal(body.litellm_params.max_tokens, 50000);
 
-  // 反向：存量 200000，同一条 PATCH 把窗口压到 8000 却仍带 50000 ⇒ 按**新**窗口拒。
+  // 反向：存量 200000，同一条 PATCH 把窗口压到 66000（仍在 #318 的 65536 下限之上）却仍带 50000
+  // ⇒ 按**新**窗口拒（本用例钉的是「新值优先」这个优先级，不是某个具体的窗口数）。
   const shrink = new LlmFakePool({
     models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: 200000 }],
   });
-  await assert.rejects(() => updateModel(shrink, 'm1', { context_window: 8000, max_output_tokens: 50000 }),
-    (error) => assertOverLimit(error, { field: 'max_output_tokens', max_allowed: 2000, context_window: 8000 }));
+  await assert.rejects(() => updateModel(shrink, 'm1', { context_window: 66000, max_output_tokens: 50000 }),
+    (error) => assertOverLimit(error, { field: 'max_output_tokens', max_allowed: 16500, context_window: 66000 }));
   assert.equal(shrink.gatewayCalls.some((entry) => entry.method === 'updateModel'), false);
 
-  // 不提交窗口 ⇒ 退到该模型现存的 model_info.context_window。
+  // 不提交窗口 ⇒ 退到该模型现存的 model_info.context_window。存量 8000 低于 #318 的下限，但那条下限
+  // 只管**本次提交的**窗口（带外/存量配错的模型仍得改预算），所以这里报的仍是 1/4 超限而不是 too_small。
   const stored = new LlmFakePool({
     models: [{ id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', type: 'text', context_window: 8000 }],
   });
@@ -1204,7 +1208,7 @@ test('#316 读侧表驱动：窗口形态归一后才算回退值（镜像面在
     '#316 病症那一格：真小数窗口不再算出 floor(262144.5/4)=65536 ⇒ 与 runner 的「丢键」结论对齐');
 });
 
-test('#316 写侧校验一字未动：数字串窗口与整值浮点窗口照旧能算 1/4 上限；真小数算「没窗口」', async () => {
+test('#316 写侧校验一字未动（#325 归一除外）：数字串窗口与整值浮点窗口照旧能算 1/4 上限；真小数拒', async () => {
   // 上限本身（≤ floor(ctx/4)）、双写、validation_failed 三者一个字节都没改；只是读「窗口」用的
   // 是那条唯一判据 ⇒ 真小数窗口不再能定上限（与读侧/runner 同一口径），而不是把上限改宽或改紧。
   for (const context_window of ['262144', 262144.0, '262144.0']) {
@@ -1215,6 +1219,10 @@ test('#316 写侧校验一字未动：数字串窗口与整值浮点窗口照旧
     const body = ok.gatewayCalls.find((entry) => entry.method === 'createModel').body;
     assert.equal(body.model_info.max_output_tokens, 65536, `ctx=${JSON.stringify(context_window)}：归一后上限 65536 放行`);
     assert.equal(body.litellm_params.max_tokens, 65536, '双写照旧（同值两处）');
+    // #325 只加不减：数字串/整值浮点形态**不得落库**，网关收到的必须是归一后的 number。
+    assert.equal(body.model_info.context_window, 262144, `ctx=${JSON.stringify(context_window)}：落库是 number 262144`);
+    assert.equal(typeof body.model_info.context_window, 'number', '字符串形态不得原样存进目录（#325 的病根）');
+    assert.equal(body.model_info.metadata.context_window, 262144, 'metadata 镜像位也必须是归一后的 number');
 
     const over = new LlmFakePool();
     await assert.rejects(
@@ -1227,14 +1235,24 @@ test('#316 写侧校验一字未动：数字串窗口与整值浮点窗口照旧
     assert.equal(over.gatewayCalls.length, 0, '被拦下时不得打到网关');
   }
 
-  // 真小数窗口：写侧也判「没窗口」⇒ 拒（零新错误码，reason 仍是 context_window_missing）。
+  // 真小数窗口：写侧也拒。⚠ **#318 只改了它报哪个 `reason`**：以前要拿窗口去算 1/4 才发现它不可得
+  // ⇒ `max_output_tokens / context_window_missing`；现在窗口自身的形态判据**排在 1/4 之前**（#318 D2）
+  // ⇒ 直接报 `context_window / not_positive_integer`，点名真正的病因。**不是放宽**：同样拒、同样零网关写，
+  // 而且今天连「不带预算只带坏窗口」也拒（以前那条能静默落库）。
   const decimal = new LlmFakePool();
   await assert.rejects(
-    () => createModel(decimal, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 8000.5, max_output_tokens: 2000 }),
-    (error) => assertOverLimit(error, { field: 'max_output_tokens', reason: 'context_window_missing' }),
-    '真小数窗口不再能定 1/4 上限（旧口径会算出 2000 并放行）',
+    () => createModel(decimal, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 262144.5, max_output_tokens: 2000 }),
+    (error) => assertOverLimit(error, { field: 'context_window', reason: 'not_positive_integer', min: 65536, value: 262144.5 }),
+    '真小数窗口在写侧就是非法形态（旧口径会拿它算出 65536 当上限并放行）',
   );
   assert.equal(decimal.gatewayCalls.some((entry) => entry.method === 'createModel'), false);
+  // 不带动预算也拒（#325 补上的那一格：以前静默落库）。
+  const shapeOnly = new LlmFakePool();
+  await assert.rejects(
+    () => createModel(shapeOnly, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 262144.5 }),
+    (error) => assertOverLimit(error, { field: 'context_window', reason: 'not_positive_integer', min: 65536, value: 262144.5 }),
+  );
+  assert.equal(shapeOnly.gatewayCalls.length, 0, '零请求：校验不过不得打网关');
 });
 
 test('#316 一致性仍然成立：真小数归一后的回退值再提交回去也合法（1/4 既是上限也是回退）', async () => {
@@ -1246,6 +1264,193 @@ test('#316 一致性仍然成立：真小数归一后的回退值再提交回去
     assert.equal(body.model_info.max_output_tokens, fallback, `ctx=${JSON.stringify(context_window)}：回退值过得了自己的校验`);
     assert.equal(body.litellm_params.max_tokens, fallback);
   }
+});
+
+// --- issue #318 + #325：门户写侧的「窗口硬下限 65536」与「token 数形态归一」 -------------------------
+// 病症（#318）：管理员把窗口手滑配成 2048、输出上限留空 ⇒ 门户**保存成功、零提示**，而引擎算不出
+// 正的压缩预算 ⇒ runner 那道上游闸把整对元数据不发给引擎 ⇒ **压缩静默关**（界面上看不见）。
+// 病症（#325）：写侧以前**原样透传**——带外 `PATCH {"context_window":"262144"}` 真网关就存成字符串
+// `'262144'`（2026-10-20 dev 实测），脏形态会永久留在目录里。读侧/心跳早已归一（#316），runner 不受影响。
+// 两条都在 `validateContextWindow()` 一处完成：形态（唯一判据 `positiveIntOrNull()`）+ 下限 65536。
+
+/** #318/#325 的拒法：零新错误码 ⇒ `validation_failed` + details 逐字段钉死。 */
+function assertWindowRejected(error, expected) {
+  assert.equal(error.code, 'validation_failed', '零新错误码（§8.20）：细分只能靠 details.reason');
+  assert.deepEqual(error.details, expected, 'details 形状逐字段');
+  return true;
+}
+
+test('#318 窗口硬下限：65536 放行、65535 与 2048 拒（POST/PATCH 都是），details 与文案逐字段钉死', async () => {
+  // 下边界本身：65536 必须**放行**（不是「> 65536」）。
+  const edge = new LlmFakePool();
+  await createModel(edge, {
+    provider_id: 'p1', model_id: 'm-edge', model: 'openai/m-edge', context_window: 65536, max_output_tokens: 16384,
+  });
+  const edgeBody = edge.gatewayCalls.find((e) => e.method === 'createModel').body;
+  assert.equal(edgeBody.model_info.context_window, 65536, '65536 本身必须放行');
+
+  const patched = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 262144 }],
+  });
+  await updateModel(patched, 'm1', { context_window: 65536 });
+  assert.equal(patched.gatewayCalls.find((e) => e.method === 'updateModel').body.model_info.context_window, 65536,
+    'PATCH 把窗口改到恰好下边界也必须放行');
+
+  // 差一（65535）与典型手滑值（2048）：两个入口都拒，且 details 逐字段对。
+  for (const value of [65535, 2048]) {
+    const details = { field: 'context_window', reason: 'too_small', min: 65536, value };
+
+    const post = new LlmFakePool();
+    await assert.rejects(
+      () => createModel(post, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: value }),
+      (error) => assertWindowRejected(error, details),
+      `POST context_window=${value} 必须被拒`,
+    );
+    assert.equal(post.gatewayCalls.length, 0, 'POST 被拦下时不得打网关（连读请求都不发）');
+
+    // 正是 #318 的病症形状：窗口配小、输出上限**留空** ⇒ 以前保存成功、零提示。
+    const patch = new LlmFakePool({
+      models: [{ id: 'm1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 262144 }],
+    });
+    await assert.rejects(() => updateModel(patch, 'm1', { context_window: value }),
+      (error) => assertWindowRejected(error, details), `PATCH context_window=${value} 必须被拒`);
+    assert.equal(patch.gatewayCalls.length, 0, 'PATCH 被拦下时网关零请求（含 findGatewayModel 那次读）');
+  }
+
+  // 文案是写给**管理员**看的：点名下限、传入值、算式与后果（照 §4.9 那条 1/4 上限的写法）。
+  const err = await createModel(new LlmFakePool(), {
+    provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 2048,
+  }).then(() => null, (caught) => caught);
+  assert.match(err.message, /不能低于 65536/);
+  assert.match(err.message, /传入 2048/);
+  assert.match(err.message, /窗口 − 输出上限 − max\(2000, 10%×窗口\)/, '文案必须带算式（否则人不知道为什么是 64k）');
+  assert.match(err.message, /压缩会静默关闭/, '文案必须带后果/出路');
+});
+
+test('#325 写侧形态归一：落到网关的是 number（不是调用方原值）；真小数/0/负数/非数字串拒', async () => {
+  // 数字串→归一成 number 落库（两个入口、三个落点：model_info / metadata / 以及双写的两个预算位）。
+  const created = new LlmFakePool();
+  await createModel(created, {
+    provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: '262144', max_output_tokens: 65536,
+  });
+  const body = created.gatewayCalls.find((e) => e.method === 'createModel').body;
+  assert.equal(body.model_info.context_window, 262144, '#325 病症本体：数字串不得原样落库');
+  assert.equal(typeof body.model_info.context_window, 'number');
+  assert.equal(body.model_info.metadata.context_window, 262144, 'metadata 镜像位同样归一（否则两处形态不一致）');
+  // max_output_tokens 的入口闸比 positiveIntOrNull 更严（#309 既有用例钉着「2000」这类数字串照旧拒），
+  // 所以归一对它是恒等的；这里钉的是「两处落库都是 number」这条形状不变量。
+  assert.equal(body.model_info.max_output_tokens, 65536);
+  assert.equal(body.litellm_params.max_tokens, 65536);
+
+  const patched = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 262144 }],
+  });
+  await updateModel(patched, 'm1', { context_window: ' 512000 ' });
+  const patchBody = patched.gatewayCalls.find((e) => e.method === 'updateModel').body;
+  assert.equal(patchBody.model_info.context_window, 512000, 'PATCH 同样归一（带空白也 trim）');
+  assert.equal(typeof patchBody.model_info.context_window, 'number');
+  assert.equal(patchBody.model_info.metadata.context_window, 512000);
+
+  // 形态不可得一律拒（`details.value` 存的是**调用方原值**，方便对账）。
+  for (const [value, reason] of [[262144.5, 'not_positive_integer'], [0, 'not_positive_integer'],
+    [-1, 'not_positive_integer'], ['abc', 'not_positive_integer'], [true, 'not_positive_integer']]) {
+    const pool = new LlmFakePool();
+    await assert.rejects(
+      () => createModel(pool, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: value }),
+      (error) => assertWindowRejected(error, { field: 'context_window', reason, min: 65536, value }),
+      `context_window=${JSON.stringify(value)} 必须被拒`,
+    );
+    assert.equal(pool.gatewayCalls.length, 0, '形态不可得时零请求');
+    const shapePool = new LlmFakePool();
+    await assert.rejects(
+      () => createModel(shapePool, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: value }),
+      (error) => {
+        assert.match(error.message, /上下文窗口必须是正整数/, '形态错的文案与下限错的文案不同一句');
+        return true;
+      },
+    );
+  }
+  // 整值浮点（JS 里 262144.0 === 262144）仍归一放行：不是「小数」。
+  const wholeFloat = new LlmFakePool();
+  await createModel(wholeFloat, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 262144.0 });
+  assert.equal(wholeFloat.gatewayCalls.find((e) => e.method === 'createModel').body.model_info.context_window, 262144);
+});
+
+test('#318 次序：窗口 1000 + 上限 500 ⇒ 报 too_small（而不是 1/4 上限错），两个入口都是', async () => {
+  // 拿旧顺序跑：1/4 校验会先报「上限 250、传入 500」⇒ 管理员去改预算，真正的病因（窗口配错了）被藏掉。
+  const details = { field: 'context_window', reason: 'too_small', min: 65536, value: 1000 };
+
+  const post = new LlmFakePool();
+  await assert.rejects(
+    () => createModel(post, {
+      provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 1000, max_output_tokens: 500,
+    }),
+    (error) => assertWindowRejected(error, details),
+  );
+  const earlyError = await createModel(new LlmFakePool(), {
+    provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 1000, max_output_tokens: 500,
+  }).then(() => null, (caught) => caught);
+  assert.doesNotMatch(earlyError.message, /1\/4/, '不得抢在 1/4 上限错前面（那会把病因藏起来）');
+  assert.equal(post.gatewayCalls.length, 0);
+
+  const patch = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 262144 }],
+  });
+  await assert.rejects(() => updateModel(patch, 'm1', { context_window: 1000, max_output_tokens: 500 }),
+    (error) => assertWindowRejected(error, details));
+  assert.equal(patch.gatewayCalls.length, 0, 'PATCH 抢在 1/4 之前 ⇒ 连那次读目录的请求都不发');
+});
+
+test('#318/#325 PATCH 省略字段 = 不改（窗口与预算都是），且不因下限而误伤存量小窗口', async () => {
+  const pool = new LlmFakePool({
+    models: [{ id: 'm1', provider_id: 'p1', model_id: 'a', type: 'text', context_window: 262144, max_output_tokens: 65536, max_tokens: 65536 }],
+  });
+  await updateModel(pool, 'm1', { name: '只改展示名' });
+  const body = pool.gatewayCalls.find((e) => e.method === 'updateModel').body;
+  // 没提交窗口/预算 ⇒ 写侧不往 model_info 里新增这两个键（体里出现的只是 `...current.model_info` 原样镜像
+  // 回来的现值，网关自己也是「没带就不动」）；数据面块干脆不带。
+  assert.equal(body.model_info.context_window, 262144, '没提交窗口 ⇒ 镜像回来的仍是现值，没被改写');
+  assert.equal(body.model_info.max_output_tokens, 65536, '没提交预算 ⇒ 现值原样');
+  assert.notEqual(body.model_info.context_window, undefined);
+  assert.equal(body.litellm_params, undefined, '不碰数据面参数就别带 litellm_params');
+  const after = (await listModels(pool)).items[0];
+  assert.equal(after.context_window, 262144, '存量窗口一字不动');
+  assert.equal(after.max_output_tokens, 65536, '存量预算一字不动');
+
+  // 存量小窗口（带外配出来的 8000）仍能只改预算：下限只管**本次提交的**窗口，不回头禁掉存量。
+  const legacy = new LlmFakePool({
+    models: [{ id: 'm2', provider_id: 'p1', model_id: 'b', type: 'text', context_window: 8000 }],
+  });
+  await updateModel(legacy, 'm2', { max_output_tokens: 2000 });
+  const legacyBody = legacy.gatewayCalls.find((e) => e.method === 'updateModel').body;
+  assert.equal(legacyBody.model_info.max_output_tokens, 2000);
+  assert.equal(legacyBody.model_info.context_window, 8000,
+    '没提交窗口就不得替它「顺手归一」一个窗口进去（存量脏值由带外面自己负的责任）');
+});
+
+test('#318 缺窗口不设下限：POST 的 context_window: null（新建表单的「留空」）照旧放行', async () => {
+  // ⚠ 这是对 D1「出现了（非 undefined）就校验」的**唯一一处收窄**，理由全部在代码与工单里：
+  //   1. #318 正文第 3 条把「缺窗口」划为另一条既有口径（输出上限留空 ⇒ `context_window_missing`）；
+  //   2. `positiveIntOrNull(null)` 在 #316 的镜像表里写的是「显式 null = 没配」，不是「配错」；
+  //   3. 新建表单留空发的就是显式 `null`（`AdminView.vue` 的 `context_window: … ? Number(…) : null`）
+  //      ⇒ 拒 `null` 会把「建一个没配窗口的模型」（典型：embedding 位）在门户里直接堵死。
+  const created = new LlmFakePool();
+  await createModel(created, {
+    provider_id: 'p1', model_id: 'm-emb', model: 'openai/embed', type: 'embedding', context_window: null,
+  });
+  const body = created.gatewayCalls.find((e) => e.method === 'createModel').body;
+  assert.equal(body.model_info.context_window, null, '显式 null 仍是「没配窗口」的形状，不得被下限拒');
+  assert.equal(body.model_info.metadata.context_window, null);
+
+  // 没窗口时「配预算」仍按既有口径拒（本单没把它改成「只能配 ≥ 下限的窗口」）。
+  const missing = new LlmFakePool();
+  await assert.rejects(
+    () => createModel(missing, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', max_output_tokens: 2000 }),
+    (error) => {
+      assert.deepEqual(error.details, { field: 'max_output_tokens', reason: 'context_window_missing' });
+      return true;
+    },
+  );
 });
 
 // --- issue #164：自定义模型定价（虚拟 key spend 恒 0） -------------------------------
@@ -1465,7 +1670,7 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
     model: ' openai/gpt-4o-updated ',
     type: 'embedding',
     tool_calling: false,
-    context_window: 4096,
+    context_window: 262144,
     max_tokens: 8192,
   });
   const call = pool.gatewayCalls.find((entry) => entry.method === 'updateModel');
@@ -1478,9 +1683,9 @@ test('model update：透传上游 model，并同时更新 model_info 与 metadat
   assert.equal(call.body.model_info.mode, 'embedding');
   assert.equal(call.body.model_info.metadata.type, 'embedding');
   assert.equal(call.body.model_info.tool_calling, false);
-  assert.equal(call.body.model_info.context_window, 4096);
+  assert.equal(call.body.model_info.context_window, 262144);
   assert.equal(call.body.model_info.metadata.tool_calling, false);
-  assert.equal(call.body.model_info.metadata.context_window, 4096);
+  assert.equal(call.body.model_info.metadata.context_window, 262144);
   assert.equal(pool.models[0].upstream_model, 'openai/gpt-4o-updated');
   assert.equal(pool.models[0].type, 'embedding');
   assert.equal(pool.models[0].mode, 'embedding');
