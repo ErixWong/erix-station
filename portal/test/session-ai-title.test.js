@@ -11,6 +11,7 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { generateAiTitle, AI_TITLE_MAX_TOKENS } from '../src/sessions.js';
+import { TITLE_LLM_MAX_TOKENS } from '../src/title-llm.js';
 import { createSessionTextHandler, inputTranscriptRow } from './fake-session-text.js';
 import { FakePool } from './fake-pool.js';
 
@@ -408,15 +409,18 @@ test('P3 PR②b ①：AI 改名上下文取自 transcript 投影；messages.cont
   }
 });
 
-test('#315 跨路径一致：AI 改名发的 max_tokens == runner 自动标题的 maxTokens == 512（不一致就是这张单的本体）', async () => {
-  // 这个数为什么必须两边一样：两条路径干同一件事（给会话起标题），只是执行位置不同
-  //（runner 随 run 终态自动起 / portal 响应用户点「AI 改名」）。历史上只有 runner 那条设了上限
-  // ⇒ 同一次起标题，走哪条路决定了要不要吃网关注入的模型级 max_tokens。
-  assert.equal(AI_TITLE_MAX_TOKENS, 512, '门户侧那个数本身钉在 512（标题 ≤30 字，够用）');
-  const runnerSrc = fs.readFileSync(
-    path.resolve(import.meta.dirname, '../../runner/lib/session-title.js'), 'utf8');
-  assert.match(runnerSrc, /maxTokens:\s*512/,
-    'runner 侧仍是 512 —— 两边任一改动都必须同时改对面（这条用例就是那个提醒）');
+test('#322 单一真相：手工改名与自动改名的 max_tokens 共用一个出口（旧的两份已删）', () => {
+  // #315 当年是「两条路径干同一件事，只是执行位置不同」⇒ 必须两边同步，于是拿跨文件读源码的锁钉住。
+  // #322 把重复拆了：runner 那份已删，两条路径共用 `portal/src/title-llm.js` ⇒ 「同一个数」从
+  // **跨文件同步问题**降级成**结构不变量**。本用例因此改钉两个方向：① 值仍是 512（#315 的结论不变）；
+  // ② runner 侧不许再有第二份实现（以文件不存在为据——将来有人恢复它，就得同时改回对面，锁会提示）。
+  assert.equal(AI_TITLE_MAX_TOKENS, 512, '标题输出预算钉在 512（标题 ≤30 字，够用）；它等于 llm-chat.js 的默认值');
+  assert.equal(TITLE_LLM_MAX_TOKENS, AI_TITLE_MAX_TOKENS, '手工与 auto 共用同一个常量，不是各抄一份');
+  assert.equal(
+    fs.existsSync(path.resolve(import.meta.dirname, '../../runner/lib/session-title.js')),
+    false,
+    '#322：runner 那份重复实现必须不存在（存在 = 重复复活，两边数字会再次发散）',
+  );
 });
 
 test('P3 PR②b ① legacy 兜底：投影对该轮无证据（无 transcript 行）→ 回退 messages.content，AI 改名仍可用', async () => {
