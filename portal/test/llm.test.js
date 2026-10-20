@@ -193,7 +193,9 @@ class LlmFakePool {
     if (info.mode !== undefined) m.mode = info.mode;
     if (info.tool_calling !== undefined) m.tool_calling = info.tool_calling;
     if (info.context_window !== undefined) m.context_window = info.context_window;
-    // 真网关的 NULL_CLEARABLE 语义：显式 null = 从 model_info 移除（= 清空），缺省 = 不动。
+    // ⚠ fake 的 NULL_CLEARABLE 行为：显式 null = 从 model_info 移除（= 清空），缺省 = 不动。
+    // **那是 fake，不是真网关**：真 LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（实测 200 而值一字
+    // 未动，issue #314）⇒ 这里照 fake 清是为了钉住「门户发了什么形状」（形状用例），不是钉网关行为。
     if ('max_output_tokens' in info) m.max_output_tokens = info.max_output_tokens ?? null;
     if (body.litellm_params !== undefined) {
       m.upstream_model = body.litellm_params.model;
@@ -945,7 +947,10 @@ test('#309 回归锚：不传 / 传 null ⇒ 写入体与改前一致（model_in
   assert.equal(body.litellm_params, undefined, '没碰数据面参数就别带 litellm_params');
 });
 
-test('#309 双写：新建传了 ⇒ 两处同值；PATCH 改 ⇒ 两处一起改；传 null ⇒ 两处一起消失', async () => {
+test('#309 双写（**发给网关的请求形状**）：新建传了 ⇒ 两处同值；PATCH 改 ⇒ 两处一起改；传 null ⇒ 请求体里两处都是「清除」形状', async () => {
+  // ⚠ 用例名里的「形状」是 #317 加的限定词：本用例钉的是**门户往网关发什么**（fake 会按 NULL_CLEARABLE
+  // 真清），而真 LiteLLM v1.103.2 对 JSON `null` 是**忽略**语义（实测 200 但值一字未动，#314）
+  // ⇒ 断言一条都不许改松，也不要把它当「真网关能清空」的证据。
   const created = new LlmFakePool();
   await createModel(created, {
     provider_id: 'p1', model_id: 'gpt-4o', model: 'openai/gpt-4o', type: 'text',
@@ -971,7 +976,7 @@ test('#309 双写：新建传了 ⇒ 两处同值；PATCH 改 ⇒ 两处一起�
   // 传 null：两处一起消失（不留「model_info 没了、max_tokens 还挂着旧值」的半套）。
   await updateModel(created, 'm1', { max_output_tokens: null });
   const clearBody = created.gatewayCalls.filter((entry) => entry.method === 'updateModel').at(-1).body;
-  assert.equal(clearBody.model_info.max_output_tokens, null, '显式 null 才是清空语义（缺省是「不动」）');
+  assert.equal(clearBody.model_info.max_output_tokens, null, '形状：显式 null 才是门户的清空请求（缺省是「不动」）；真网关 v1.103.2 会忽略它（#314）');
   assert.equal(Object.hasOwn(clearBody.litellm_params, 'max_tokens'), false, '数据面一侧直接不带该键');
   const cleared = (await listModels(created)).items[0];
   // ⚠ 切片 1.5 行为变化（有意）：清空后读侧不再是 null 而是回退值 floor(128000/4)=32000。
@@ -1136,6 +1141,110 @@ test('#309 切片1.5 回退不动 legacy 语义：max_tokens 的读侧与写入�
   const after = (await itemsById(pool)).k1;
   assert.equal(after.max_tokens, 2048, 'legacy 字段照旧只读自己那一位');
   assert.equal(after.max_output_tokens, 2048, '生效值退到刚写的 max_tokens（第 2 级），而不是退到 ctx/4');
+});
+
+// --- issue #316：token 数的「正整数」口径归一（与 runner 同一条规则，镜像 fixture） --------------
+// 规则（工单 feat-261019-06 定稿，两侧各执行一次）：数字串与整值浮点**归一成正整数**；
+// 真小数 / ≤0 / NaN / Infinity / 非数字串一律**判不可得**（不 floor、不兜 0）。
+// ⚠ `TOKEN_FIXTURES` 在对面有一份**逐行镜像**：`runner/test/llm-models.test.js`（那边断言解析与下行
+// 形状，这边断言显示与回退值）。判据本身：`portal/src/llm.js` 的 `positiveIntOrNull()`
+// ↔ `runner/lib/llm-models.js` 的 `positiveIntOrNull()`。改一侧必须改对面。
+
+/** #316 两侧镜像的 fixture 表（与 runner 同名同内容）：`accepted` = 归一后的正整数，`null` = 不可得。 */
+const TOKEN_FIXTURES = [
+  { value: 262144, accepted: 262144, why: '正整数：原样' },
+  { value: '262144', accepted: 262144, why: '#316 病症本体：数字串归一（历史存量，门户一直容忍而 runner 不认）' },
+  { value: ' 262144 ', accepted: 262144, why: '带空白的数字串：trim 后同一条规则' },
+  { value: '262144.0', accepted: 262144, why: '整值浮点的字符串形态：值就是 262144' },
+  { value: 262144.0, accepted: 262144, why: '整值浮点（JS 里 262144.0 === 262144）：原样' },
+  { value: 1000, accepted: 1000, why: '小但合法的正整数（能不能算出预算是 runner 那道闸的活）' },
+  { value: '1e3', accepted: 1000, why: '科学计数法数字串：值是整数 1000 ⇒ 归一（沿用旧 `Number()` 口径）' },
+  { value: 262144.5, accepted: null, why: '真小数 = 配错：判不可得，**不 floor**（floor 是替管理员编数）' },
+  { value: '262144.5', accepted: null, why: '真小数字符串形态同样不可得' },
+  { value: 0, accepted: null, why: '0 不可得（绝不能下发 0）' },
+  { value: -5, accepted: null, why: '负数不可得' },
+  { value: 'abc', accepted: null, why: '非数字串不可得' },
+  { value: '', accepted: null, why: '空串不可得' },
+  { value: '   ', accepted: null, why: '空白串不可得（trim 后空）' },
+  { value: null, accepted: null, why: '显式 null = 没配' },
+  { value: undefined, accepted: null, why: '缺键' },
+  { value: Number.NaN, accepted: null, why: 'NaN' },
+  { value: Number.POSITIVE_INFINITY, accepted: null, why: 'Infinity：不是安全整数 ⇒ 不可得（旧口径会当正数算出 NaN）' },
+  { value: true, accepted: null, why: '布尔' },
+  { value: false, accepted: null, why: '布尔' },
+  { value: {}, accepted: null, why: '对象' },
+  { value: [], accepted: null, why: '数组' },
+];
+
+test('#316 读侧表驱动：窗口形态归一后才算回退值（镜像面在 runner/test/llm-models.test.js）', async () => {
+  const pool = onlyWindowPool(TOKEN_FIXTURES.map((f, i) => ({ id: `t${i}`, context_window: f.value })));
+  const byId = await itemsById(pool);
+  TOKEN_FIXTURES.forEach((f, i) => {
+    const item = byId[`t${i}`];
+    const label = `ctx=${JSON.stringify(f.value)}`;
+    // 显示面：`context_window` 照原样回读（切片 1 的既有口径，本单**不改显示**，只改算不算得出预算）。
+    assert.deepEqual(item.context_window ?? null, f.value ?? null, `${label}：显示不被回退逻辑改写`);
+    if (f.accepted === null) {
+      assert.equal(item.max_output_tokens, null,
+        `${label}：窗口判不可得 ⇒ 生效值 null（不 floor、不兜 0、不下发 NaN）：${f.why}`);
+      assert.ok(!Number.isNaN(item.max_output_tokens), `${label}：绝不能把 NaN 下发给 runner`);
+    } else {
+      const expected = Math.floor(f.accepted / 4);
+      assert.equal(item.max_output_tokens, expected,
+        `${label}：先归一成 ${f.accepted} 再算 floor(/4)=${expected}：${f.why}`);
+      assert.ok(Number.isInteger(item.max_output_tokens) && item.max_output_tokens >= 1,
+        `${label}：下发的是正整数：${f.why}`);
+    }
+  });
+  // 本单真正的行为变化（只有真小数那一支）：旧口径把 262144.5 当正数算出 65536 并下发，
+  // 而 runner 整键丢掉 ⇒ 「门户显示 65536、压缩静默关」（#316）。今天两侧同一句：算不出就是 null。
+  const decimal = TOKEN_FIXTURES.findIndex((f) => f.value === 262144.5);
+  assert.equal(byId[`t${decimal}`].max_output_tokens, null,
+    '#316 病症那一格：真小数窗口不再算出 floor(262144.5/4)=65536 ⇒ 与 runner 的「丢键」结论对齐');
+});
+
+test('#316 写侧校验一字未动：数字串窗口与整值浮点窗口照旧能算 1/4 上限；真小数算「没窗口」', async () => {
+  // 上限本身（≤ floor(ctx/4)）、双写、validation_failed 三者一个字节都没改；只是读「窗口」用的
+  // 是那条唯一判据 ⇒ 真小数窗口不再能定上限（与读侧/runner 同一口径），而不是把上限改宽或改紧。
+  for (const context_window of ['262144', 262144.0, '262144.0']) {
+    const ok = new LlmFakePool();
+    await createModel(ok, {
+      provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window, max_output_tokens: 65536,
+    });
+    const body = ok.gatewayCalls.find((entry) => entry.method === 'createModel').body;
+    assert.equal(body.model_info.max_output_tokens, 65536, `ctx=${JSON.stringify(context_window)}：归一后上限 65536 放行`);
+    assert.equal(body.litellm_params.max_tokens, 65536, '双写照旧（同值两处）');
+
+    const over = new LlmFakePool();
+    await assert.rejects(
+      () => createModel(over, {
+        provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window, max_output_tokens: 65537,
+      }),
+      (error) => assertOverLimit(error, { field: 'max_output_tokens', max_allowed: 65536, context_window: 262144 }),
+      `ctx=${JSON.stringify(context_window)}：+1 仍被拒（上限没被改宽）`,
+    );
+    assert.equal(over.gatewayCalls.length, 0, '被拦下时不得打到网关');
+  }
+
+  // 真小数窗口：写侧也判「没窗口」⇒ 拒（零新错误码，reason 仍是 context_window_missing）。
+  const decimal = new LlmFakePool();
+  await assert.rejects(
+    () => createModel(decimal, { provider_id: 'p1', model_id: 'm-a', model: 'openai/m-a', context_window: 8000.5, max_output_tokens: 2000 }),
+    (error) => assertOverLimit(error, { field: 'max_output_tokens', reason: 'context_window_missing' }),
+    '真小数窗口不再能定 1/4 上限（旧口径会算出 2000 并放行）',
+  );
+  assert.equal(decimal.gatewayCalls.some((entry) => entry.method === 'createModel'), false);
+});
+
+test('#316 一致性仍然成立：真小数归一后的回退值再提交回去也合法（1/4 既是上限也是回退）', async () => {
+  for (const context_window of ['262144', 262144.0, 512000]) {
+    const pool = onlyWindowPool([{ id: 'x1', context_window }]);
+    const fallback = (await itemsById(pool)).x1.max_output_tokens;
+    await updateModel(pool, 'x1', { max_output_tokens: fallback });
+    const body = pool.gatewayCalls.find((entry) => entry.method === 'updateModel').body;
+    assert.equal(body.model_info.max_output_tokens, fallback, `ctx=${JSON.stringify(context_window)}：回退值过得了自己的校验`);
+    assert.equal(body.litellm_params.max_tokens, fallback);
+  }
 });
 
 // --- issue #164：自定义模型定价（虚拟 key spend 恒 0） -------------------------------

@@ -66,8 +66,96 @@ test('resolveRunModel：不带 models（旧 agentd / 无配置）→ 占位 conf
 });
 
 // ---------------------------------------------------------------------------
-// issue #309 切片 2 ①：parseHeartbeatModels 接两个元数据键（只收正整数，非法形态丢键不丢模型名）
+// issue #309 切片 2 ① + issue #316：parseHeartbeatModels 接两个元数据键（正整数归一，非法形态丢键不丢模型名）
 // ---------------------------------------------------------------------------
+
+/**
+ * issue #316：**两侧镜像的表驱动 fixture**（工单 feat-261019-06）。
+ * ⚠ 这份表在 `portal/test/llm.test.js` 有一份**逐行镜像**（同一个 `FIXTURES` 内容）：门户那边断言
+ * 「显示与回退值」，这边断言「解析与下行形状」。两侧跑的是同一条规则
+ * （`runner/lib/llm-models.js` 的 `positiveIntOrNull` ↔ `portal/src/llm.js` 的 `positiveIntOrNull`），
+ * **改一侧必须改对面**，否则 #316 的病症（门户显示着窗口、runner 丢键 ⇒ 压缩静默关）会复发。
+ * `accepted` = 应被归一成的正整数；`null` = 判**不可得**（整键不写，不是 0、不是 floor）。
+ */
+const TOKEN_FIXTURES = [
+  { value: 262144, accepted: 262144, why: '正整数：原样' },
+  { value: '262144', accepted: 262144, why: '#316 病症本体：数字串归一成正整数（旧行为是整键丢掉）' },
+  { value: ' 262144 ', accepted: 262144, why: '带空白的数字串：同一条规则（门户旧口径就 trim）' },
+  { value: '262144.0', accepted: 262144, why: '整值浮点的字符串形态：值就是 262144' },
+  { value: 262144.0, accepted: 262144, why: '整值浮点（JS 里 262144.0 === 262144）：原样' },
+  { value: 1000, accepted: 1000, why: '小但合法的正整数（能不能算出预算是 resolveModelMetadata 的活）' },
+  { value: '1e3', accepted: 1000, why: '科学计数法数字串：值是整数 1000 ⇒ 归一（与门户旧口径一致）' },
+  { value: 262144.5, accepted: null, why: '真小数 = 配错：判不可得，**不 floor**（floor 是替管理员编数）' },
+  { value: '262144.5', accepted: null, why: '真小数字符串形态同样不可得' },
+  { value: 0, accepted: null, why: '0 不可得（硬塞 0 会让 computeBudget 直接抛 invalid_budget）' },
+  { value: -5, accepted: null, why: '负数不可得' },
+  { value: 'abc', accepted: null, why: '非数字串不可得' },
+  { value: '', accepted: null, why: '空串不可得' },
+  { value: '   ', accepted: null, why: '空白串不可得（trim 后空）' },
+  { value: null, accepted: null, why: '显式 null = 没配' },
+  { value: undefined, accepted: null, why: '缺键' },
+  { value: Number.NaN, accepted: null, why: 'NaN' },
+  { value: Number.POSITIVE_INFINITY, accepted: null, why: 'Infinity：不是安全整数 ⇒ 不可得' },
+  { value: true, accepted: null, why: '布尔' },
+  { value: false, accepted: null, why: '布尔' },
+  { value: {}, accepted: null, why: '对象' },
+  { value: [], accepted: null, why: '数组' },
+];
+
+test('#316 parseHeartbeatModels：表驱动归一（镜像面在 portal/test/llm.test.js）——两键各自过同一条规则', () => {
+  for (const { value, accepted, why } of TOKEN_FIXTURES) {
+    const out = parseHeartbeatModels({
+      models: { main: { model: 'm', type: 'text', context_window: value, max_output_tokens: value } },
+    });
+    assert.ok(out, `任何元数据形态都不得抖掉整个下行（模型名是 #38 的既有契约）：${String(value)}`);
+    assert.equal(out.main.model, 'm', `main.model 必须照样解析成功：${String(value)}`);
+    for (const key of ['context_window', 'max_output_tokens']) {
+      if (accepted === null) {
+        assert.ok(!Object.hasOwn(out.main, key),
+          `${key}=${String(value)} 判**不可得** ⇒ 整键不写（不是 key: undefined、不是 0、不是 floor）：${why}`);
+      } else {
+        assert.ok(Object.hasOwn(out.main, key), `${key}=${String(value)} 应收下：${why}`);
+        // ⚠ #316 的核心：落盘必须是**归一后的 number**，不是原字符串。下游 `Math.floor(ctx/4)`
+        // 与引擎 `computeBudget({contextWindowTokens, maxOutputTokens})` 都按数字算，喂字符串就是
+        // 第二套「两侧各自解释」的坑（`"262144" > floor(...)` 这类比较先错）。
+        assert.equal(typeof out.main[key], 'number', `${key}=${String(value)} 落盘必须是 number：${why}`);
+        assert.equal(out.main[key], accepted, `${key}=${String(value)} 必须归一成 ${accepted}：${why}`);
+        assert.ok(Number.isSafeInteger(out.main[key]) && out.main[key] > 0, `归一后必须是正整数：${why}`);
+      }
+    }
+  }
+});
+
+test('#316 parseHeartbeatModels：不可得的键整键不在（JSON 文本比 deepStrictEqual 更硬）', () => {
+  const out = parseHeartbeatModels({
+    models: { main: { model: 'm', type: 'text', context_window: 262144.5, max_output_tokens: 'abc' } },
+  });
+  assert.equal(JSON.stringify(out), '{"main":{"model":"m","type":"text"}}',
+    '两个键都不可得 ⇒ 结构与「无元数据的下行」逐字节相同（#309 切片 2 钉住的向后兼容面）');
+  assert.equal(resolveModelMetadata(out), null, '丢键后落到「ctx 缺失 ⇒ 不传」支路（= 现状行为）');
+});
+
+test('#316 贯通【#316 判据本体】：context_window 存成数字串 ⇒ 归一后一路到引擎，压缩真的开着', () => {
+  // 修复前：`ctx:"262144"` 在解析层整键丢掉 ⇒ resolveModelMetadata 返回 null ⇒ 引擎压缩总开关不进入，
+  // 而门户列表明明显示着 262144。主 agent 的探针（631bc46）：parsed 带 ctx=false → resolved=null。
+  const snapshot = parseHeartbeatModels({
+    models: { main: { model: 'glm-4.6', type: 'text', context_window: '262144', max_output_tokens: 32768 } },
+  });
+  assert.deepEqual(snapshot.main,
+    { model: 'glm-4.6', type: 'text', context_window: 262144, max_output_tokens: 32768 },
+    '数字串窗口必须被归一成 number 两键带下去（这里红 = #316 复发）');
+  assert.equal(resolveRunModel('placeholder-model', snapshot), 'glm-4.6', '模型名语义仍不变');
+
+  const calls = [];
+  const gate = (...args) => { calls.push(args); return 1; }; // 不抛 = 引擎认为这对值能算出正预算
+  const r = resolveModelMetadata(snapshot, { computeBudget: gate });
+  assert.deepEqual(r,
+    { context_window: 262144, max_output_tokens: 32768, clamped: false, clamped_from: 32768 },
+    '数字串窗口归一后必须是「原样使用」支路（不是整对不传）');
+  assert.equal(calls.length, 1, '闸必须被调到（恰好一次）');
+  assert.deepEqual(calls[0], [{ contextWindowTokens: 262144, maxOutputTokens: 32768 }],
+    '喂给上游闸的必须是**数字**（字符串 = 归一没做到位）');
+});
 
 test('#309 parseHeartbeatModels：main 带 context_window / max_output_tokens → 原样透传（snake_case）', () => {
   const out = parseHeartbeatModels({
@@ -91,8 +179,10 @@ test('#309 parseHeartbeatModels：embedding / vision 槽位同样接两键（不
   assert.deepEqual(out.vision, { model: 'v', type: 'vision', max_output_tokens: 1024 });
 });
 
-test('#309 parseHeartbeatModels：非法形态（0/负数/小数/"1e3"/true/NaN）⇒ 丢该键但 main.model 照样解析', () => {
-  const bad = [0, -1, -262144, 1.5, Number.NaN, '1e3', '262144', '', true, false, null, undefined, {}, []];
+test('#309 parseHeartbeatModels：非法形态（0/负数/真小数/非数字串/true/NaN）⇒ 丢该键但 main.model 照样解析', () => {
+  // ⚠ #316 后这份列表里**没有**数字串与整值浮点（`"262144"` / `"1e3"` / `262144.0`）——它们现在
+  // 会被归一成正整数（见上面那条表驱动用例）。完整形态表以 `TOKEN_FIXTURES` 为单一真相。
+  const bad = [0, -1, -262144, 1.5, Number.NaN, 'abc', '', true, false, null, undefined, {}, []];
   for (const value of bad) {
     const out = parseHeartbeatModels({
       models: { main: { model: 'm', type: 'text', context_window: value, max_output_tokens: value } },

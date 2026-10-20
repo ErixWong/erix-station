@@ -253,6 +253,72 @@ const countOccurrences = (text, needle) => (typeof needle === 'string'
   ? text.split(needle).length - 1
   : (text.match(new RegExp(needle.source, 'g')) ?? []).length);
 
+// ---------------------------------------------------------------------------
+// 2b) issue #316：形态归一（数字串/整值浮点）在真引擎里生效 —— 压缩不再静默关
+// ---------------------------------------------------------------------------
+
+test('#316 行为级【#316 判据本体】：context_window 存成数字串 ⇒ 归一后一路生效：请求体带 max_tokens、不发 model_metadata_missing', async () => {
+  // 修复前（main 631bc46 上主 agent 的探针已复现）：`ctx:"262144"` 在解析层**整键丢掉** ⇒ resolved=null
+  // ⇒ 装配段「什么都不传」⇒ 引擎压缩总开关不进入、输出上限退回 4096，而门户列表明明显示着 262144。
+  // 今天：入口归一成正整数 ⇒ 真引擎收到这对值 ⇒ 压缩开关真的进了（本文件里「压缩开」的唯一可判证据）。
+  const { bodies, events, error, params, engineModelMetadata, result } = await runOnce({
+    models: { main: { model: 'glm-4.6', type: 'text', context_window: '262144', max_output_tokens: 32768 } },
+    withComputeBudget: true,   // 复现 worker 的真路径：用**真** computeBudget 闸，不桩（不抛 = 引擎认这对值）
+  });
+  assert.equal(error, undefined, `run 不该失败：code=${String(error?.code)} message=${String(error?.message)}`);
+  assert.deepEqual(engineModelMetadata,
+    { context_window: 262144, max_output_tokens: 32768, clamped: false, clamped_from: 32768 },
+    '前置诊断：数字串窗口经入口归一后必须过纯函数（这里拿到 null = #316 复发）');
+  assert.equal(typeof engineModelMetadata.context_window, 'number', '递给引擎的必须是 number，不是原字符串');
+  assert.deepEqual(params, {
+    modelMetadata: { contextWindowTokens: 262144, maxOutputTokens: 32768 },
+    maxTokens: 32768,
+  }, 'worker 装配段必须传出这对值（空对象 = 压缩又静默关了）');
+  assert.ok(bodies.length > 0, '桩必须收到请求');
+  assert.equal(maxTokensOf(bodies[0]).present, true, '显式传 max_tokens 的唯一可判证据 = 请求体里有这个键');
+  assert.equal(maxTokensOf(bodies[0]).value, 32768, 'max_tokens = 生效值');
+  assert.deepEqual(missingEvents(events), [],
+    '压缩开关进去了 ⇒ 引擎不再发 model_metadata_missing（发了 = #316 的病症没好）');
+  assert.equal(bodies[0].model, 'glm-4.6', '模型名语义仍不变');
+  assert.equal(result?.finalText, 'done');
+});
+
+test('#316 行为级：真小数窗口（配错）依旧走「什么都不传」= 现状，而不是 floor 一个管理员没填的数', async () => {
+  const { bodies, events, error, params } = await runOnce({
+    models: { main: { model: 'glm-4.6', type: 'text', context_window: 262144.5, max_output_tokens: 32768 } },
+    withComputeBudget: true,
+  });
+  assert.equal(error, undefined, '配错元数据最多让压缩关掉，绝不能把 run 弄死');
+  assert.deepEqual(params, {}, '真小数 ⇒ 入口就丢掉 context_window ⇒ 整对不传（不 floor、不兜 0）');
+  assert.equal(maxTokensOf(bodies[0]).present, false, '请求体里整键不在（= 现状）');
+  assert.equal(missingEvents(events).length, 1, '压缩关掉仍可观测：恰好一条一次性诊断事件');
+});
+
+test('#316 告警文案：不可用支路的 warn 必须同时点名两种成因（下行未带 / 形态非法）并指向判据', () => {
+  // 把 worker 那条文案拼出来跑两种现值：运维必须能从一行日志里看到「去查 parseHeartbeatModels」，
+  // 而不是被 `context_window=undefined` 引向「portal 根本没发」这条错路（#316 的告警面）。
+  const src = read('worker.js');
+  const branch = src.match(/\} else if \(!engineModelMetadata && msg\.models\?\.main\) \{([\s\S]*?)\n  \}/);
+  assert.ok(branch, '不可用支路没了 ⇒ 本用例的判据对象消失');
+  const expr = branch[1].match(/msg: ([\s\S]*?),\n\s*\}\);/)[1];
+  // 文案里用了 `ctxRaw` / `ctxShapeOk` 两个局部量 ⇒ 把 worker 里那两行**真声明**抠出来一起求值
+  // （技法同本文件顶部的 `workerEngineModelParams`：测试里不另抄一份字面量，否则「删掉那行」这类
+  // 变异永远测不出来）。
+  const decls = branch[1].split('\n').filter((line) => /^\s*const\s+ctx/.test(line)).join('\n');
+  assert.equal(decls.split('\n').length, 2,
+    '不可用支路必须仍带 `ctxRaw` 与 `ctxShapeOk` 两行（本用例靠它们拼文案；少了就红在这里而不是静默测不到）');
+  const build = new Function('msg', `${decls}\nreturn ${expr};`);
+  const illegalShape = build({ models: { main: { model: 'm' } } });   // 形态非法 ⇒ 入口已把键丢掉
+  const smallWindow = build({ models: { main: { model: 'm', context_window: 2000, max_output_tokens: 500 } } });
+  assert.match(illegalShape, /context_window=undefined/, '未带/形态非法两支合流后现值就是 undefined');
+  assert.match(illegalShape, /not carried by the downlink, or dropped as an invalid shape by parseHeartbeatModels/,
+    '两种成因必须并列写在同一行里（只报一种 = 运维被引向错路）');
+  assert.match(illegalShape, /runner\/lib\/llm-models\.js/, '必须把运维指向判据所在');
+  assert.doesNotMatch(illegalShape, /budget is not positive/, '形态非法那一支不得误报成「预算非正」');
+  assert.match(smallWindow, /computed context budget is not positive/, '成因 b 的文案照旧（切片 2b 的既有锁）');
+  assert.match(smallWindow, /context_window=2000/, '成因 b 要报得出下行原值');
+});
+
 test('#309 防漂移：camelCase 三键在 worker.js 里各只出现 1 次，且全在 #309 装配段内', () => {
   const src = read('worker.js');
   const block = src.match(PARAMS_MARKERS);
@@ -415,8 +481,16 @@ test('#309-2b 源码级：worker.js 必须从包根 import computeBudget 并作�
   const body = stripComments(branch[1]);
   assert.equal(countOccurrences(body, 'type: MSG.LOG'), 1, '两种成因共用一条 LOG（各发一条也行，但本单要求措辞说清是哪一种）');
   assert.match(body, /level: .warn./);
-  assert.match(body, /model metadata unusable: context_window=/, 'ctx 非法那条文案不得改散（切片 2 的既有锁）');
-  assert.match(body, /not a positive integer/, '成因 a：context_window 不是正整数');
+  assert.match(body, /model metadata unusable: context_window=/, 'ctx 不可用那条文案不得改散（切片 2 的既有锁）');
+  // #316：成因 a 的文案从「(not a positive integer)」改成同时点名「下行未带」与「形态非法」（外加指向判据）。
+  // 为什么必须两个都说：入口 `parseHeartbeatModels` 把形态非法的值**整键丢掉**了 ⇒ worker 手上只能看见
+  // 「键不在」，根本分不出是 portal 没发还是发了一个不合法的数；旧文案只报一种 ⇒ 运维被引向「portal 没发」
+  // 这条错路（#316 的告警面）。三条子断言各钉一个词，改散就红。
+  assert.match(body, /not carried by the downlink/, '成因 a（#316）：要说「下行未带」');
+  assert.match(body, /or dropped as an invalid shape by parseHeartbeatModels/,
+    '成因 a（#316）：要说「或形态非法被入口丢掉」并点名判据在哪');
+  assert.match(body, /must be a positive integer/, '成因 a（#316）：要写清什么是合法形态（正整数，含数字串归一）');
+  assert.doesNotMatch(body, /\(not a positive integer\)/, '#316 前的旧文案（只报一种成因）不得回流');
   assert.match(body, /budget is not positive/, '成因 b（切片 2b 新增）：钳完预算仍非正，文案必须点名');
   assert.match(body, /max_output_tokens=/, '成因 b 要带上下行的原值，运维才配得出来');
   assert.doesNotMatch(body, /Math\.floor/, '告警文案不许重算钳制（判据在纯函数里）');
