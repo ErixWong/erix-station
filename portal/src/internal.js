@@ -573,7 +573,7 @@ export async function releaseUndeliveredClaim(pool, { runId, claimToken, log = c
 // U2 run 状态收敛（markRunState + 终态）
 // ---------------------------------------------------------------------------
 
-export async function setRunState(pool, { container, user, runId, claimToken, body }) {
+export async function setRunState(pool, { container, user, runId, claimToken, body, config }) {
   const state = body?.state;
   if (state !== 'running' && state !== 'finished' && state !== 'failed') {
     throw new InternalError(400, 'validation_failed', 'state 必须为 running/finished/failed', { details: { field: 'state' } });
@@ -626,7 +626,7 @@ export async function setRunState(pool, { container, user, runId, claimToken, bo
     return { state: 'running' };
   }
 
-  return finishRun(pool, { user, run, runId, claimToken, state, body });
+  return finishRun(pool, { user, run, runId, claimToken, state, body, config });
 }
 
 /** F4：终态载荷一致判定（同 termination/error/rounds/usage/final_text → 幂等成功）。 */
@@ -654,7 +654,7 @@ async function terminalPayloadMatches(pool, run, body) {
 }
 
 /** 终态收敛事务（runner §7.6 加锁顺序：锁 run → 校验租约 → 写终态 → queue 收敛 → messages/usage/run_end）。 */
-async function finishRun(pool, { user, runId, claimToken, state, body }) {
+async function finishRun(pool, { user, runId, claimToken, state, body, config }) {
   const termination = body.termination;
   const usage = body.usage;
   const rounds = body.rounds;
@@ -762,8 +762,13 @@ async function finishRun(pool, { user, runId, claimToken, state, body }) {
     // issue #88/#322：run 终态后异步评估会话自动标题（fire-and-forget：不阻塞本响应，失败全降级，
     // 天然「每 run 至多评估一次」）。**生成者在 portal 自己**（输入 = 该 run 收尾的那段助手文本 +
     // 该会话属主 FDE 的活绑定）；经 session SSE hub 推 `session_updated` 让列表标题实时到达。
+    // ⚠ **`config` 必须一路传下去（#322 真机取证）**：不传 ⇒ `title-llm.js` 退回默认网关地址
+    // `http://127.0.0.1:4100`，而 **portal 容器里这个地址是 ECONNREFUSED**（数据面只能走
+    // `LLM_GATEWAY_ADMIN_URL=http://station-litellm:4000`）⇒ 自动改名**永远静默降级到「首条消息截断」**，
+    // 界面上看不出来（标题照样会变，只是从来不是模型起的）。与 §8.25「必须传 `ctx.llmGateway` 单例」同族。
+    // 接线被判据钉住：`portal/test/session-auto-title-wiring.test.js`。
     try {
-      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, notify: notifySessionEvents });
+      scheduleAutoTitle(pool, { sessionId: r.session_id, runId, notify: notifySessionEvents, config });
     } catch { /* 评估调度失败不影响终态响应 */ }
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
     return { state, queue_status: queueStatus, run_end_seq: runEndSeq };

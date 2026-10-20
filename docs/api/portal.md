@@ -1021,6 +1021,11 @@ station-portal user enable  --login <login>
   **`title-llm.js` = 标题业务**（prompt / 输入截断 / provider 解析 / 降级），**`llm-chat.js` = 对话调用面唯一出口**，
   `llm.js` = 网关管理面（不发对话）。**「自动改名」也在这里**：run 终态后由 portal 用会话最后一段助手文本生成，
   不经容器（§9.6 `title` 字段）。
+- ⚠ **接线的硬要求（#322 真机取证；v0.1.20 曾因此静默降级整整一个版本）**：自动改名跑在 `internal.js` 的终态链里，
+  那里没有现成的 config ⇒ **`http.js` 必须把 `ctx.config` 交给 `setRunState`，`finishRun` 再透传给 `scheduleAutoTitle`**。
+  少任何一跳 ⇒ `title-llm.js` 退回默认网关 `http://127.0.0.1:4100`，而**该地址在 portal 容器内是 ECONNREFUSED**
+  （数据面在容器内只能走 `LLM_GATEWAY_ADMIN_URL=http://station-litellm:4000`）⇒ 每次都静默退到「首条用户消息截断」，
+  而界面**看不出异常**（标题照样变，只是从来不是模型起的）。判据：`portal/test/session-auto-title-wiring.test.js`。
 - **key 纪律**：LiteLLM virtual key 只进 `Authorization` 头，**绝不进日志/错误信息/响应**（上游回显的 key 亦被脱敏）。
 
 请求体：无（空 JSON `{}`）。
