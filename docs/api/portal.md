@@ -1009,7 +1009,12 @@ station-portal user enable  --login <login>
   「点了 AI 改名没反应」（不是 run 失败）。512 与 `runner/lib/session-title.js` 的 `maxTokens: 512` **同一个数**
   （两条路径干同一件事），由 `portal/test/session-ai-title.test.js` 钉住。
 - **落库**：响应经 `sanitizeTitle` 清洗（去引号/取首行/截 30 字）后写 `title` + `title_source='manual'` + `updated_at`；推一条 `session_updated`（同 #88/#107，不落 `run_events`）。
-- **决策豁免**：issue #88 定下「portal 不持 LLM 客户端」（标题由 agent 侧随 run 终态上报）；本端点是用户拍板（2026-10-01）的**修订豁免**，范围仅限本端点。
+- **例外范围**：本端点是用户拍板（2026-10-01，#114）的一次性命名调用，**仅限本端点**；其余路径不得由 portal 发 LLM 请求。
+  ⚠ **出处更正（2026-10-20）**：此处过去写「原则出自 #88『portal 不持 LLM 客户端』」——**记错了**，#88 原文是
+  「只动 portal + 前端展示；runner/agentd 零改动（标题是 portal 会话元数据，不是引擎事务）」，与该「原则」方向相反。
+  现状是标题有**两份实现**（`runner/lib/session-title.js` ↔ `portal/src/session-title.js` 镜像，`AUTO_TITLE_MAX_LEN=30`
+  与 `sanitizeTitle` 各一份、**无测试锁**）；把标题**统一到 portal 侧**已登记 **issue #322**（那是真减一份代码，
+  #315 就是这份重复开的第一张账单）。
 - **key 纪律**：LiteLLM virtual key 只进 `Authorization` 头，**绝不进日志/错误信息/响应**（上游回显的 key 亦被脱敏）。
 
 请求体：无（空 JSON `{}`）。
