@@ -225,10 +225,35 @@ export const zhCN = {
       toolReplayTool: '（{name}）',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
-      judgePassThrough: 'judge：放行（{mode}）',
-      judgeExtend: 'judge：扩轮{dash}{paren}',
-      judgeNoExtend: 'judge：不扩轮{dash}',
-      judgeAction: 'judge：{action}{dash}',
+      // issue #321（erix-station）：judge 永远只是**意见**，不是验收——分轴展示（工具审计 / 目标判断 /
+      // 方向 / 扩轮是不同维度，可同时非空，不做三个互斥态）。「已完成」唯一来源是 run 终态分隔行
+      //（run_end）；本站 runner 不传 finalGuard ⇒ verification 恒 skipped，本组文案一律不得出现
+      //「已核验 / 已验证」这类承诺。axes 之间用「 · 」由调用方拼接。
+      judgeAxes: 'judge：{axes}',
+      // 轴一 · 工具审计：executed 的语义是「本次工具调用被放行」，不是任务完成（ISSUES.md 第 4 条放大器）。
+      judgeAuditExecuted: '工具审计：已放行（非任务完成）',
+      judgeAuditPassThrough: '工具审计：已放行（{mode}，非任务完成）',
+      judgeAuditBlocked: '工具审计：已拦截（本次工具调用未执行）',
+      // extend / extend+redirect / decline_extend 是扩轮处置而非审计结论（实测存在 kind=intercept 而
+      // action=extend+redirect、真实审计为拦截的情形）⇒ 从这类 action 反推「工具已执行」会被骗，
+      // 工具是否真的执行以**工具卡片**为准，这里只做中性说明。
+      judgeAuditUndecided: '工具审计：结果未知（{action}），执行与否以工具卡片为准',
+      // 轴二 · 目标判断：done=true 固定为「评审认为目标已达成（未独立核验）」并声明收尾由模型自判
+      //——「任务主体完成但还有扫尾工作」是合法状态，不许写成「已完成」。confidence 仅有限数才透出。
+      judgeGoalDoneTrue: '评审认为目标已达成（未独立核验；是否收尾由模型自行判定）',
+      judgeGoalDoneFalse: '评审认为目标未达成',
+      judgeConfidence: '（置信度 {confidence}）',
+      judgeReason: '评审理由：{value}',
+      // 轴三 · 方向：on_track 是常态不刷屏；uncertain / off_track 不得被 passThrough/extend 分支遮掉。
+      judgeDirectionOffTrack: '方向：可能偏离',
+      judgeDirectionUncertain: '方向：不确定',
+      // 轴四 · 扩轮意见（来自 decision.extend；不虚构 tier、不做成本估算，那些属 #282）。
+      judgeExtendSuggest: '建议扩轮',
+      judgeExtendDecline: '不建议扩轮',
+      // 中性降级：评审调用失败（degraded）与引擎新增的未知 action——灰色 judge 面板行，不刷红、不解读。
+      judgeDegraded: '评审降级（{error}），本轮未给出意见',
+      judgeUnknownAction: '评审动作：{action}',
+      judgeNoDetail: '评审事件（无可解读细节）',
       compaction: '上下文折叠（round {round}）：{folded} 轮折叠，{before} → {after} tokens',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',
