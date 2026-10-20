@@ -12,3 +12,6 @@ coverage/
 
 # worker 工单与交付报告（本地过程产物，不入库）
 .work-orders/
+
+# 分析/方案文档（本地过程产物，不入库）
+tasks/
