@@ -816,6 +816,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });
       return;
     }
+    // issue #281：`session` 本身可能就是**缺的**（旧后端/网关改写回包、200 但没 `session` 键）。
+    // 旧代码在这里直接读 `session.cwd` ⇒ `TypeError: Cannot read properties of undefined (reading
+    // 'cwd')`，而它在 onMounted 的 await 链上 ⇒ 变成 Unhandled Rejection（AGENTS §8.20 记的那处，
+    // 行号已漂到这一行）。判空后**照样报可见错误**——判空不是吞掉真实错误，只是不再拿 TypeError 代替它。
+    if (session == null || typeof session !== 'object') {
+      entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });
+      return;
+    }
     // issue #84 P5：跨目录深链——会话详情带 cwd，切到其目录（磁盘推导视图必有该目录；
     // 防御性兜底：列表缺项时合成一个，避免下拉空白）。
     const cwd = session.cwd;
@@ -828,6 +836,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await openSession(sid);
     // 评审修复：selectDir 会清路由（旧版抹 hash），这里把深链写回（replace 无害 no-op）。
     workbenchHooks.onDeepLinkRestored?.(sid);
+  }
+
+  /**
+   * issue #281：把一条**人看得见**的错误推进消息流（复用既有 `.syserr` 红色错误行，**不新增 UI
+   * 结构**）。给 `onMounted` 这类「Vue 不等的异步钩子」用：失败必须落到界面上，而不是只活在控制台。
+   * 文案由调用方过 `toDisplayText` 收口（不许渗 `[object Object]` / `undefined`）。
+   */
+  function pushStreamError(text: string): void {
+    entries.value.push({ kind: 'syserr', text });
   }
 
   /** issue #55 B1：会话不存在/popstate 回退 → 静默回默认视图（不动项目/会话列表，只清详情区）。 */
@@ -994,6 +1011,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, addPartialOutput, send, stop, refreshSession,
+    pushStreamError,
     // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。
     repullPartialOutput,
     // issue #261B：一键「重试上一条」（lastSend/retryAvailable 仅内存；retryInFlight 驱动按钮禁用）
