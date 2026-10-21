@@ -46,7 +46,9 @@ async function readStoredRecord(client, key, dedupKey) {
  */
 export function createSessionTranscriptStore(client) {
   return {
-    /** 读该 key 的全部轮记录（round/dedup_key 以权威列合成进 record，供引擎推导与幂等判据）。 */
+    /** 读该 key 的全部轮记录（round/dedup_key 以权威列合成进 record，供引擎推导与幂等判据）。
+     *  issue #337：**故意不折**——这是发消息的**预写幂等**面，`appendUserTurn` 的判据是「能看见自己那条
+     *  `<key>:input:<messageId>` 行」；被折叠吸走就会重复追加同一轮追问。 */
     async load(key) {
       const res = await client.query(
         // 0.16.0 契约（host-upgrade-guide §1 same-round ordering）：同 round 多行必须按持久化
@@ -129,6 +131,8 @@ export function createSessionTranscriptStore(client) {
      * 谓词等价性：契约谓词是 `(record.dedupKey ?? record.roundKey) === dedupKey`，本实现用列等值
      * `dedup_key = $2`——station 的 `dedup_key` 列在 appendRound 写入时恒等于
      * `record.dedupKey ?? record.roundKey`（迁移 0006 部分唯一索引列），故对 station 数据两者等价。
+     *
+     * issue #337：**故意不折**——点查探针是对**原始行**的探针（与上游「两个点查探针不折叠」同口径）。
      */
     async loadByDedupKey(key, dedupKey) {
       // 读面与 appendRound 的冲突判定同源（同一条 SQL）；本探针**只读不判**：签名里只有 key、
@@ -141,6 +145,7 @@ export function createSessionTranscriptStore(client) {
      * 快路径探针②（0.17.0 #157 / station #193，与 loadByDedupKey 成对）：该 key 的最大 round，
      * 等价于全量 load 结果的 `Math.max(0, 安全整数 round…)`。空 store 返回 null（引擎派生 0，
      * 与全量路径语义一致）。round 列是 int、pg 返回 number，Number() 只是对驱动行为的兜底。
+     * issue #337：**故意不折**——同 loadByDedupKey，成对探针只认原始行。
      */
     async loadMaxRound(key) {
       const res = await client.query(
