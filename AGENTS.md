@@ -1046,6 +1046,94 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 ⚠ **本版故意不重建 FDE 容器**：`git diff --name-only v0.1.22..main -- runner/` 里**非版本文件 = 0** ⇒ `FDE_IMAGE` 仍 pin 在 v0.1.22 摘要（`f546a65e…`），七台容器未动（§8.19 先例，别当漏做）；`STATION_DOCKER_PROXY_IMAGE` 已跟着升到 v0.1.23（只影响以后新建的 FDE）。
 **在发布物上重跑一次现场判据**（不是只信本地镜像）：会话 `d724165a…` 已有一条历史 partial（基线 = 1），UI 发一条长正文消息、点「■ Stop」后**新 run 的部分正文 1 秒内出现且全程未刷新**（计数 1→2，两条各自独立 ⇒ 幂等键 `partial:<run_id>` 按 run 分开了，既没重复也没覆盖）。
 
+### 8.37 erix-agent 0.22.0 → **0.23.0**（「存储收敛」，issue #337；本片 = pin + tripwire，展示面折叠另片）（2026-10-21）
+
+**0.23 的宿主可观测面只有一件事**：轮记录**不再写 `messages`**，正文与 `tool_result` 搬进每轮多条 `kind:"message"` 事实行
+（`dedupKey = <key>:msg:<round>:<seq>`，带整数 `seq` 与可空 `partOf`）。`src/providers/**` 与 `src/loop/termination.js`
+经 `diff -r` **逐字节相同**，`termination.reason` 九值**逐字未变** ⇒ 两处版本 tripwire（+ 前端第三处）**只追版本号**。
+
+**三处版本 tripwire**（工单只点名两处，worker 找出第三处，已修）：`runner/test/llm-timeouts.test.js` 的 `ENGINE_VERSION_PINNED`、
+`portal/frontend/src/lib/terminationReasons.ts` 的 `ENGINE_VERSION_FOR_TERMINATION_REASONS`、
+⚠ **`portal/frontend/src/lib/terminationReasons.spec.ts`（vitest 侧也硬写了一份版本号）** —— 不改它前端必红 1 条。
+**约定**：下次升级前先 `grep -rn "0\.23\.0" --include="*.js" --include="*.ts" --exclude-dir=node_modules .` 数一遍断言位（注释里的历史复核记录不算）。
+**主 agent 亲跑的变异（与 worker 的 4 条不重叠）**：把引擎 `payload.js` 的 `legacyTimeoutMs: hasExplicitPhase ? undefined : requestTimeoutMs`
+改成无条件带上 `requestTimeoutMs`（= #261 那个 120s 绝对总闸复活）⇒ **3 条具名红**（含 ②【回归门】与 ③【实测】）
+⇒ 证明超时门**对引擎行为漂移真有牙，不只是版本号**。⚠ 另有两条**故意记下不红的变异**：改 `payload.js:152` 的 `120000` 缺省值
+（改 root 或改 `runner/node_modules` 两份都一样）**不红** —— 先自证不是空操作后定性：本站**永远显式传四相**，
+那个 legacy 缺省在站内**根本不可达** ⇒ 断言没钉它是对的，不是覆盖缺口。
+
+### ❌ 我（主 agent）在 issue 正文里写错、被 worker 推翻并被源码/实测坐实的两处
+
+1. **「同一轮出两条 assistant turn / DTO 重复项」在生产形状下不成立**。session 作用域行 `run_id` 恒 **NULL**
+   （`putSessionRound` 写 `VALUES (NULL, …)`），而 `session-view.js` 的 `isSessionRound` 只认
+   `<sessionId>:round:` / `<sessionId>:engine:round:` 两个前缀 ⇒ 消息行的 dedupKey `<sessionId>:msg:…` **在 `:424` 被整行 `continue` 丢弃**，
+   一次投影都不进。重复只在「`run_id` 非 NULL 的旧 run 作用域账本」这种**非生产形状**下出现（runner 自 P2 起只写 session 行）。
+2. **`recallTranscript` 的 `LIMIT 2000` 风险不成立** —— 它是 `WHERE run_id = $1`（run 作用域 legacy），0.23 的新行是 session 行
+   ⇒ **根本不在命中集里**。真正按行计的是 **`getSessionTranscript` 的 `LIMIT 10000`**（引擎 resume 取上下文走它），
+   实测 **3.33 行/轮** ⇒ 有效轮容量 10000 → **≈3000 轮**，另开 [#338](https://github.com/ErixWong/erix-station/issues/338)。
+
+**生产上真正会坏的只有一件事**（主 agent 独立重做的 A/B：同一份 `session-view.js`、同一场景，只换账本形状）：
+**刷新/重开后每张工具卡片从 `✓`/`✗` 退化成 `…`** —— `resultPreview` / `isError` / `executionStatus` 三件全 `absent`
+⇒ `useEventStream.ts:489-491` 的 `hasResult` 恒假 ⇒ `card.ok = null` ⇒ `StreamPanel.vue` 的 `statusMark` 出 `…`。
+**正文没坏、不重复**（0.22 与 0.23 两侧都是「收工。」）。
+
+**引擎侧结论对、依据要改**（别照我原来那句「裸 flatMap 等价」去论证）：0.23 的 resume 用
+`foldLedgerMessages(records)`（`resume-manager.js:96`，`:102` 注释自己写着「口径不是裸 `records.flatMap(record.messages)`」）。
+裸 flatMap 在**一轮 ≥2 个工具调用**时**不等价**（拆成两条 user 消息 ⇒ `validateMessages` 要求 `tool_use` 由紧随其后的那条 user 结清
+⇒ `invalid_messages`）。⇒ **runner 侧不需要补折叠**（站内 `runner/lib/store.js` 直通，引擎自己折）。
+
+**为什么升级后三套全绿（绿灯不代表展示面没坏）** —— 主 agent 独立取证：`grep -rl "partOf|kind: *'message'" portal/test runner/test portal/integration`
+= **零命中**；把真引擎产出喂进 `projectSessionMessages` 的用例 = **零条**；随包契约套件里 `kind:"message"`/`partOf` 命中 **0**
+⇒ 回归面**完全落在**「站内展示面 × 真账本形状」这个交叉处。⇒ **约定：账本形状类升级必须自带一条「真引擎 → 展示面」的贯通用例**，
+不能只靠随包契约（它们测 store 方法语义，结构上测不到这条链路）。
+
+**运行时新事实**（主 agent 亲跑，供以后查）：0.23 轮行的键集实测为
+`round,roundKey,dedupKey,ts,response,textPreview,toolUses,summary,l0facts,runState` —— **没有 `messages`**；
+`summary` 引擎自己写成字符串 `"missing"`；`l0facts` 仍在（所以下面那条丢失只影响 timeline）。
+**已上报上游** [erix-agent #353](https://github.com/ErixWong/erix-agent/issues/353)：`resume-manager.js:136` 的
+`buildTimeline(record.messages ?? [])` 在 0.23 下恒空 ⇒ **resume 后 governor 的 `timeline` / `filesWritten` 不再从账本重建**
+（上游 `test/` 无恢复路径断言 ⇒ 在他们 CI 里不可见）。**站内无法修**，只登记。
+
+**基线不变**：根 **1341 / 1337 / 0 / 4**、runner **321/321**、前端 `typecheck` rc=0 + **36 文件 / 640**（三套 rc 全 0，
+与升级前逐位相同；台账里前端基线本来就是 36/640，**我派工单时抄成 35 是旧的**）。零 DDL、`docs/data/schema.sql` 与
+`deploy/migrations/` 一字节未动、`portal/src/**` 与 `runner/lib/**` 一字节未动、零新错误码、无新依赖。
+
+**本片是「pin-first」的机械片**（§8.27/§8.35 先例）：折叠行为只能在**真 0.23** 上被测（0.22 账本压根没有消息行，折了也无物可折），
+所以先升 pin 让展示面变红、再在下一片用 test-first 折回来。**读侧折叠已落地 = §8.38。**
+
+### 8.38 0.23 读侧折叠：刷新后工具卡片不再退化成 `…`（issue #337 切片 A+B，2026-10-21）
+
+**单一真相源 `portal/src/transcript-fold.js`**：`MESSAGE_ROW_KIND` / `isFoldableMessageRow` / `foldLedgerRecords(records, {keyOf})`（record 级）
+/ `foldTranscriptRows(rows, {recordOf, withRecord, keyOf})`（DB 行级）——**两种入口共用同一份内部 `planFold` 计划**，不是两套折叠规则。
+谓词与上游 `src/store/message-rows.js` 逐字同构：可折叠 = `kind === "message" && Number.isSafeInteger(seq) && Array.isArray(messages) && messages.length > 0`；
+载体 = key 以 `:round:<n>` 或 `:round:<n>:resume` 结尾的**非消息行**，每轮取**第一个**；`partOf` 只在**该行只有一条消息**时当分片接回（与上游 `message-rows.js:137` 同一守卫）。
+**硬口径：无可折叠行 ⇒ 返回入参本身（`===` 同一数组引用）**，旧 0.22 账本逐字节不变、零迁移。
+
+**接线只有一个点：`session-view.js#projectSessionMessages`**（喂 `projectTranscriptForDisplay` 之前）。理由：它是全站两个业务读点
+（`sessions.js#fetchSession` 对话流、`session-text.js#projectAnchors` 取文本）的**咽喉点**，一处接线不会「改了一个漏一个」；
+源码护栏另钉「折叠模块只有一个消费点」。**故意不折四处**（`transcript-store.js` 的 `load` 与两个点查探针 = 发消息预写幂等面必须看见自己那条 `:input:` 行；
+`session-text.js#fetchInputTextByMessageId` = 按 `dedup_key` 点查单行；`internal.js` 的 `getSessionTranscript`/`getTranscript`/`recallTranscript`/`collectRoundText`
+= 引擎自己 `foldLedgerMessages`、以及 run 作用域 legacy 根本不在命中集）⇒ **正反两个方向都有源码级护栏**，变异⑥（把预写面也折上）恰 1 条红证明反方向有牙。
+
+**`recordOf` 是注入的**（`session-view.js` 传 `recordForProjection`）⇒ `dedupKey`/`round` 的合成口径**只有一份**，折叠模块不复制规则。
+
+**一处与工单措辞的差异（worker 按上游实现，主 agent 核可）**：「载体不在场 ⇒ 分片拼成一条独立记录」是**我写错了**——
+上游 `foldMessageRows` 的语义是「消息行**原样留在数组里**」（各自一条记录、key/round 都是它自己的、`partOf` 保持未合并）。
+两种写法都满足「不许静默丢内容」，但只有上游那种能过对拍 ⇒ **按上游**。另 **`foldMessageRows(records)` 没有 `keyOf` 参数**
+（工单里我写「不传 keyOf 会退化成 `round:<n>`」是错的；站内缺省 `keyOf` 本就与上游同式），显式传 `keyOf` 的真实价值是「防缺省口径将来漂了导致对拍假绿」。
+
+**主 agent 亲跑变异 4 条（与 worker 的 6 条不重叠）**：① 摘咽喉点接线 ⇒ **恰 1 条具名红**（真 0.23 账本那条）；② 抹平轮号 ⇒ **6 条红**；
+③ 先折再排 ⇒ **8 条全绿** ⇒ 先自证非空操作（双载体输入下载体归属随输入序变，本站与上游同形）⇒ 定性「先排序再折」目前**不承重**（注释是意图声明不是契约）；
+④ 拆 `partOf` 的单消息守卫 ⇒ **19 条全绿 = 真覆盖缺口**（上游有同一守卫，但没 fixture 走这条判别支）⇒ **主 agent 自己补一支 fixture**，
+补测后重放同一变异 ⇒ **恰 1 条红在新用例上**（§8.24 口径：「没红」必须先证明变异真的改变行为）。
+
+**顺带发现的一件既有事（不属本片，另开单）**：同一轮同时存在 `…:engine:round:<n>` 与 `…:engine:round:<n>:resume` 时（崩溃恢复后是真的），
+逐行投影会给同一条 `tool_use` 出**两张卡**（一张有结果一张没有）。**0.22 上也一样**（两行都在、都带 `messages`），不是 0.23 引入的；
+上游 `foldLedgerMessages` 根本不认载体（只按序拼消息），所以「取第一个载体」是本站为逐行投影引入的选择。
+
+**基线**：根 **1369 / 1365 / 0 / 4**（+28）、runner **321/321** 不变、前端 `typecheck` rc=0 + **36 文件 / 640** 不变（`runner/`、前端、依赖、DDL 全部零字节）。
+
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 
