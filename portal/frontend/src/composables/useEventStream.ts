@@ -18,6 +18,7 @@ import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
 import { PERSISTENCE_TERMINATION_REASON, RUN_FAIL_REASONS } from '../lib/terminationReasons';
 import { getToolResultSummary, formatDuration, isSpecialExecutionStatus } from '../lib/toolSummary';
+import { eventRoundToken, runSegment, toolCardKey, UNKNOWN_ROUND_TOKEN } from '../lib/toolCardKey';
 
 // 用户可见状态行/错误行文案（issue #101 P2）：非组件上下文（composable 无 setup 实例）→ i18n.global.t。
 // 取词即快照：状态行在事件到达时生成，切语言后旧行不回溯翻译（可接受）。
@@ -257,13 +258,30 @@ function judgeAxesText(d: Record<string, any>): string {
   });
 }
 
+/**
+ * issue #279 关联索引的一条记录：provider `callId` 当前指向哪张卡、那张卡属于哪个 run、
+ * 以及**已知的最细轮号**（`UNKNOWN_ROUND_TOKEN` = 这条路当时拿不到轮号）。
+ * 它只服务两件事：迟到结果找到卡片、投影找不到精确键时归并回既有那张——**都不造身份**。
+ */
+export interface CardAlias {
+  key: string;
+  runId: string | null;
+  roundToken: string;
+  /** provider `tool_call_id`（投影路径把它当 `callId` 传进来）。 */
+  callId?: string;
+}
+
 export interface EventStreamHooks {
   /** roundsep / 系统分隔行（judge/compaction/run_end 灰色文案等；judge 事件带 variant='judge'，由面板样式高亮）。 */
   onSep: (text: string, variant?: 'judge') => void;
   /** .syserr 红色错误行（RUN_FAIL_REASONS / run 失败信封）。 */
   onSysErr: (text: string) => void;
-  /** 工具卡片**首次创建**时通知宿主（宿主负责在消息流中占位，保持插入顺序）。 */
-  onToolCardCreated: (callId: string) => void;
+  /**
+   * 工具卡片**首次创建**时通知宿主（宿主负责在消息流中占位，保持插入顺序）。
+   * issue #279：入参从「裸 provider `tool_call_id`」改成**卡片身份键** `<run>:<轮号>:<callId>`
+   * （见 `lib/toolCardKey.ts`）——宿主拿它当 `toolCards` 的查找键与展开记忆键，语义不变，只是键变了。
+   */
+  onToolCardCreated: (cardKey: string) => void;
   /** 当前 run 的 run_end（通知 + 终稿回写在宿主侧做：notifyRunEnd / refreshSession）。 */
   onCurrentRunEnd: (d: RunEndPayload & Record<string, unknown>) => void;
   /** EventSource 首次连通或自动重连恢复时，供宿主与服务端会话运行态对账。 */
@@ -285,8 +303,19 @@ export function useEventStream(hooks: EventStreamHooks) {
   // 流式增量气泡文本（旧 S.deltaBuf 指向的 DOM 的 textContent；null = 无活动气泡）。
   // round_start 只置 null（旧版不 remove 元素——半截增量留在流里）；当前 run_end 才移除。
   const deltaText = ref<string | null>(null);
-  // callId 去重的工具卡片状态（旧 S.toolCards）。
+  // 工具卡片状态（旧 S.toolCards）。issue #279：**键不再是裸 provider `tool_call_id`**，而是含轮号的
+  // 组合键（`<run>:<轮号>:<callId>`，缺位的段不拼；尺规在 `lib/toolCardKey.ts`，三条路径共用）。
+  // 会话级 Map、只在 resetStreamState 清空 ⇒ 把 run 写进键顺带修掉「同会话两个 run 共用 `c1` 串台」。
   const toolCards = reactive(new Map<string, ToolCardState>());
+  // issue #279 轮号观测面（**实时与历史回放共用**：两条路都走 dispatch，而 round_start 既在
+  // EVENT_TYPES 也在历史下发白名单）。写点只有 round_start/attempt/recovering/recovered
+  // （载荷带轮号且发生在轮内；round_end/usage 不记，因为工具调用总在它们之前）。
+  const roundTokenByRun = new Map<string, string>();
+  // issue #279 关联索引：provider `callId` → **最新一张**卡片的身份键 + 它的 run + 它已知的最细轮号。
+  // 只用于「结果/投影找到已有那张卡」，**不得当身份**（同一个 id 跨轮时身份是两张卡、索引只指向
+  // 最新那张——具名用例钉住）。存结构体而不是只存 key：归并时要能判「跨 run 不许归并」「两侧轮号都
+  // 已知且不同 ⇒ 那是两次调用，也不许归并」，而不靠拆字符串。
+  const cardByCallId = new Map<string, CardAlias>();
   let es: EventSource | null = null;
 
   function closeEs() {
@@ -320,23 +349,100 @@ export function useEventStream(hooks: EventStreamHooks) {
     connect(id, lastSeq.value);
   }
 
-  // toolCard 语义：callId 去重；首次创建时占渲染位并返回状态（旧版返回 DOM，这里返回状态对象）。
-  function toolCard(callId: string, name: string | null | undefined, input: unknown): ToolCardState {
-    const existing = toolCards.get(callId);
+  /** 轮号观测（仅由带轮号的事件写入；载荷脏 ⇒ 记为未知，不拿旧轮号冒充）。 */
+  function observeRound(runId: unknown, round: unknown): void {
+    if (typeof runId !== 'string' || runId === '') return;
+    roundTokenByRun.set(runId, eventRoundToken(round));
+  }
+
+  function roundTokenFor(runId: unknown): string {
+    if (typeof runId !== 'string' || runId === '') return UNKNOWN_ROUND_TOKEN;
+    return roundTokenByRun.get(runId) ?? UNKNOWN_ROUND_TOKEN;
+  }
+
+  /** 事件侧（实时 + 历史回放）的卡片身份键：轮号取本连接观测到的那一个，没观测到就是未知段。 */
+  function cardIdentity(runId: unknown, callId: string): string {
+    return toolCardKey(runId, roundTokenFor(runId), callId);
+  }
+
+  /**
+   * `tool_result` 找卡片（issue #279）：载荷里没有轮号，所以**结果关联不拿轮号当尺**。
+   * 顺序：先试本 run 当前轮的精确身份键（正常形状：结果与调用同轮，两者必得同一张），未命中再退回
+   * callId 索引（它指向「最新那张」= 正在等结果的那次调用；跨 resume 把结果补到下一轮、或实时漏收
+   * round_start 时靠它）。两条都不中 ⇒ 无卡（与旧版「孤儿 tool_result 静默丢弃」同口径）。
+   */
+  function cardForCorrelation(runId: unknown, callId: unknown): ToolCardState | undefined {
+    if (typeof callId !== 'string' || callId === '') return undefined;
+    const exact = toolCards.get(cardIdentity(runId, callId));
+    if (exact) return exact;
+    const indexed = cardByCallId.get(callId);
+    return indexed === undefined ? undefined : toolCards.get(indexed.key);
+  }
+
+  /** 关联索引写入（卡片**新建**时把该 callId 推进到最新那张）。 */
+  function rememberCallAlias(callId: unknown, alias: CardAlias): void {
+    if (typeof callId !== 'string' || callId === '') return;
+    cardByCallId.set(callId, alias);
+  }
+
+  /**
+   * issue #279：投影路径的**归并兜底**——精确身份键没命中时，用 provider `id` 的关联索引去找已经
+   * 存在的那张实时卡（只有两路轮号对不上时才会走到这里：实时靠观测 `round_start`，投影靠上游投影键
+   * 里的轮号段）。**索引在这里只用来「找到已有那张」，从不参与身份生成**。
+   * 两边 `run_id` 都已知且不同 ⇒ **不归并**（那是两个 run 的两张卡）；任一侧 run 未知（旧帧不带
+   * run_id）⇒ 宽松放行，宁可归并也不要拿同一个调用演两张卡。
+   */
+  function mergeTargetByAlias(key: string, alias?: CardAlias): ToolCardState | undefined {
+    if (!alias || typeof alias.callId !== 'string' || alias.callId === '') return undefined;
+    const target = cardByCallId.get(alias.callId);
+    if (target === undefined || target.key === key) return undefined;
+    const want = runSegment(alias.runId);
+    if (want !== null && target.runId !== null && target.runId !== want) return undefined;
+    // 两侧轮号**都**已知且不同 ⇒ 这是同一个 id 的**两次不同调用**（正是 #279 要分开的两张卡），
+    // 不许归并；只有一侧真的拿不到轮号时才兜底归并（那条卡找不到的路，见函数注释）。
+    if (alias.roundToken !== UNKNOWN_ROUND_TOKEN && target.roundToken !== UNKNOWN_ROUND_TOKEN) return undefined;
+    return toolCards.get(target.key);
+  }
+
+  /** 归并成功后把索引里那条的轮号**收紧**到已知的那个（键不变，只是让下一次不同轮的投影不再误归并）。 */
+  function tightenCallAlias(callId: string, target: CardAlias, alias: CardAlias): void {
+    if (alias.roundToken === UNKNOWN_ROUND_TOKEN) return;
+    cardByCallId.set(callId, { ...target, roundToken: alias.roundToken });
+  }
+
+  /** 关联索引的只读探针（单测用）：这个 provider `callId` 当前**关联**到哪个身份键。 */
+  function cardIdentityOfCall(callId: string): string | undefined {
+    return cardByCallId.get(callId)?.key;
+  }
+
+  // toolCard 语义：按**身份键**去重；首次创建时占渲染位并返回状态（旧版返回 DOM，这里返回状态对象）。
+  // issue #279：去重从「裸 callId」换成组合身份键 ⇒ 跳轮复用 id 不再并进第一轮那张卡；`name`
+  // **仍是首写冻结**（命中即返回、不覆盖）——保留它的理由是：身份键已含轮号，同一张卡就是一个真实
+  // 调用，首写的名字就是它的名字。**不**改成「后到覆盖」（那会把真实的同名工具抖动带进来）。
+  function toolCard(key: string, callId: unknown, name: string | null | undefined, input: unknown, runId?: unknown): ToolCardState {
+    const existing = toolCards.get(key);
     if (existing) return existing;
     const card: ToolCardState = { name: name ?? 'tool', dig: digText(input), args: '', ok: null, out: '' };
-    toolCards.set(callId, card);
-    hooks.onToolCardCreated(callId);
+    toolCards.set(key, card);
+    // 索引只记录「这个 provider id 最新对应哪张卡」，供结果/投影关联用；它不参与身份计算。
+    rememberCallAlias(callId, { key, runId: runSegment(runId), roundToken: roundTokenFor(runId) });
+    hooks.onToolCardCreated(key);
     return card;
   }
 
   /**
    * issue #188：DTO 投影工具卡片登记（加载/刷新路径）。与实时/历史事件路径**共用同一** `toolCards`
-   * Map 与 `onToolCardCreated` 占位 → 两条路收敛到 StreamPanel 同一渲染；同一 callId 幂等
-   * （事件流先建时只补全投影才有的字段，不重复占位）。callId 由宿主给出：优先上游 provider `id`
-   *（与实时 `tool_call_id` 同源 → 天然归并），缺失时用宿主合成的稳定键（见 workbench.ts，上游 #100）。
+   * Map 与 `onToolCardCreated` 占位 → 两条路收敛到 StreamPanel 同一渲染；同一**身份键**幂等
+   * （事件流先建时只补全投影才有的字段，不重复占位）。
+   *
+   * issue #279：`key` 不再是裸 provider `id`，而是宿主用同一把尺（`lib/toolCardKey.ts`）拼出的
+   * `<run>:<轮号>:<id>`——轮号来自上游投影键自带的轮号段（`toolCalls[].key` 的 `#` 前段），与事件侧
+   * 观测到的 `round_start.round` 是同一个计数器 ⇒ 实时卡片与刷新后的投影卡片仍归并成一张。
+   * 第三参 `alias`（provider `id` + `run_id`）只在「精确身份键没命中」时用来**找到已有那张卡**
+   * （实时漏收 round_start ⇒ 它那张的轮号段是未知段）：归并而不新建，避免「刷新后卡片翻倍」。
+   * 索引不得自己造身份 ⇒ 不传 alias 时行为与旧版一致（按键直接存取）。
    */
-  function projectToolCard(callId: string, fields: {
+  function projectToolCard(key: string, fields: {
     name: string;
     argsSummary?: string;
     // issue #228：上游 DTO 理论上给 string，但工具结果本体有三套形态（string / {content, metadata} /
@@ -348,14 +454,17 @@ export function useEventStream(hooks: EventStreamHooks) {
     // `portal/src/session-view.js#attachToolCallDurations`）。只在卡片现有 `dur` 为空时填——
     // 实时路已拿到的值不许被投影覆盖（两路同 callId 归并时以实时为准）。
     durationMs?: number;
-  }) {
+  }, alias?: CardAlias) {
     // 有预览字段 = 归一后仍不为 undefined；归一后的文本另存（number/null 到卡片里就是合法展示串）。
     const hasPreview = fields.resultPreview !== undefined;
     const resultPreview = hasPreview ? getToolResultSummary(fields.resultPreview) : undefined;
     // issue #283：库里可能是 NULL（旧数据引擎当年就没发时长）⇒ 不收，也不拿 0 冒充有时长。
     const projectedDur = Number.isFinite(fields.durationMs) ? (fields.durationMs as number) : undefined;
-    const existing = toolCards.get(callId);
+    const mergeKey = alias && typeof alias.callId === 'string' ? cardByCallId.get(alias.callId) : undefined;
+    const existing = toolCards.get(key) ?? mergeTargetByAlias(key, alias);
     if (existing) {
+      // 归并到索引里那张时顺手收紧它的轮号（键不变）：否则同一 id 的下一次不同轮投影会继续误归并。
+      if (alias && mergeKey && mergeKey.key !== key && alias.callId) tightenCallAlias(alias.callId, mergeKey, alias);
       // 事件流先建：只补投影才有的摘要/预览/状态，不覆盖实时路径已有的完整数据。
       if (fields.argsSummary !== undefined && existing.argsSummary === undefined) existing.argsSummary = fields.argsSummary;
       if (resultPreview !== undefined && existing.resultPreview === undefined) existing.resultPreview = resultPreview;
@@ -386,8 +495,10 @@ export function useEventStream(hooks: EventStreamHooks) {
     // #299 (c) 同口径：`executionStatus` 在 0.20.0 起**只在特殊状态下存在**，普通块上必须**也不写键**
     // （否则 DTO 的「缺席」到前端就变成了「有键但值是 undefined」，`in` / `Object.hasOwn` 一类判据会被骗）。
     if (fields.executionStatus !== undefined) card.executionStatus = fields.executionStatus;
-    toolCards.set(callId, card);
-    hooks.onToolCardCreated(callId);
+    toolCards.set(key, card);
+    // 投影路径也要推进关联索引（否则刷新后的卡片在后续 tool_result 面前「隐身」）。
+    if (alias) rememberCallAlias(alias.callId, { ...alias, runId: runSegment(alias.runId) });
+    hooks.onToolCardCreated(key);
   }
 
   function handleEvent(type: string, e: MessageEvent) {
@@ -425,8 +536,11 @@ export function useEventStream(hooks: EventStreamHooks) {
         return;
       case 'round_start':
         if (deltaText.value) { deltaText.value = null; }
+        // issue #279：本 run 的轮号水位线（卡片身份的唯一轮号来源；实时与历史回放都走这里）。
+        observeRound(d.run_id, d.round);
         hooks.onSep(`round ${d.round}`); return;
       case 'attempt':
+        observeRound(d.run_id, d.round); // 重试仍在同一轮内（#279：round_start 漏收时的补点）
         hooks.onSep(t('stream.event.attempt', { round: d.round, attempt: d.attempt, max: d.maxAttempts }));
         return;
       case 'attempt_killed': {
@@ -462,6 +576,7 @@ export function useEventStream(hooks: EventStreamHooks) {
         return;
       }
       case 'recovering':
+        observeRound(d.run_id, d.round); // 同 attempt：轮内重试，轮号仍是当前轮（#279）
         hooks.onSep(t('stream.event.recovering', { attempt: d.attempt, max: d.maxAttempts }));
         return;
       case 'recovered': hooks.onSep(t('stream.event.recovered')); return;
@@ -472,18 +587,22 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'reasoning_delta': return; // 推理增量 P1 不展示
       case 'tool_call_delta': {
         if (d.tool_call_id) {
-          const card = toolCard(d.tool_call_id, d.name ?? '', t('stream.argsStreaming'));
+          // issue #279：增量参数与后来的 tool_use 必须是**同一张**卡 ⇒ 两边用同一个身份键算法。
+          const card = toolCard(cardIdentity(d.run_id, d.tool_call_id), d.tool_call_id, d.name ?? '', t('stream.argsStreaming'), d.run_id);
           card.args = card.args + (d.arguments_delta ?? '');
         }
         return;
       }
       case 'tool_use': {
-        const card = toolCard(d.tool_call_id, d.name, d.input);
+        const card = toolCard(cardIdentity(d.run_id, d.tool_call_id), d.tool_call_id, d.name, d.input, d.run_id);
         card.args = typeof d.input === 'object' ? JSON.stringify(d.input ?? {}) : String(d.input ?? '');
         return;
       }
       case 'tool_result': {
-        const card = toolCards.get(d.tool_call_id);
+        // issue #279：结果关联不再拿裸 id 当身份（`tool_result` 载荷**没有轮号**，契约 §5.3 第 7 类）：
+        // 先试本 run 当前轮的精确身份键，未命中才回落到 callId 索引（它指向最新那张卡 = 正在等结果的
+        // 那次调用）。**关联错了轮 = 把结果写进别人的卡片**，由 `结果不串轮` 具名用例钉住。
+        const card = cardForCorrelation(d.run_id, d.tool_call_id);
         if (card) {
           card.ok = !!d.ok;
           // issue #283：只有事件**真带了**有限时长才写 `card.dur`，缺失就保持 `undefined`（卡片据此
@@ -574,6 +693,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     activeRunId.value = null;
     deltaText.value = null;
     toolCards.clear();
+    // issue #279：轮号观测面与关联索引同生命周期（都得跟着卡片清，不然跨会话串轮号/串卡）。
+    roundTokenByRun.clear();
+    cardByCallId.clear();
     esSessionId.value = null;
   }
 
@@ -582,6 +704,8 @@ export function useEventStream(hooks: EventStreamHooks) {
     connect, closeEs, resetStreamState,
     // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）；
     // replayEvent 供 openSession 历史归并回放驱动（issue #89）；projectToolCard 供 DTO 投影路径（#188）。
-    handleEvent, toolCard, replayEvent, projectToolCard,
+    // cardIdentityOfCall（issue #279）：关联索引的只读探针——存的是「这个 provider id 最新对应哪张卡」，
+    // 存它的唯一目的是**证明索引不是身份**（身份看 toolCards 的键数）。
+    handleEvent, toolCard, replayEvent, projectToolCard, cardIdentityOfCall,
   };
 }

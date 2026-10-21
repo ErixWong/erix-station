@@ -521,7 +521,8 @@ describe('useEventStream（mock EventSource）', () => {
       s.replayEvent({ seq: 3, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: true, result_digest: 'file1', duration_ms: 9 } });
       expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
       expect(s.toolCards.size).toBe(1);
-      const card = s.toolCards.get('c1')!;
+      // issue #279：身份键含 run（这批回放事件没有 round_start ⇒ 轮号段不拼）⇒ 键是 `r1:c1`，不再是裸 `c1`。
+      const card = s.toolCards.get('r1:c1')!;
       expect(card.name).toBe('bash');
       expect(card.args).toBe('{"cmd":"ls"}');
       expect(card.ok).toBe(true);
@@ -581,11 +582,13 @@ describe('useEventStream（mock EventSource）', () => {
       s.replayEvent({ seq: 5, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'bash', input: {} } });
       expect(s.lastSeq.value).toBe(7);
 
-      // 实时路径同 callId 回填（历史与实时同一 toolCards 渲染路径的直接证据）
+      // 实时路径同 callId 回填（历史与实时同一 toolCards 渲染路径的直接证据）。
+      // issue #279：这条实时帧**不带 run_id** ⇒ 精确身份键是裸 `c1`、命不中历史那张 `r1:c1`，
+      // 靠「callId → 最新卡片」的关联索引找回同一张（结果关联不拿轮号当尺，见 cardForCorrelation）。
       s.connect('sess-1');
       lastES().emit('tool_result', { seq: 8, tool_call_id: 'c1', ok: false, result_digest: 'boom', duration_ms: 3 });
-      expect(s.toolCards.get('c1')!.ok).toBe(false);
-      expect(s.toolCards.get('c1')!.out).toBe('✗ boom（3ms）');
+      expect(s.toolCards.get('r1:c1')!.ok).toBe(false);
+      expect(s.toolCards.get('r1:c1')!.out).toBe('✗ boom（3ms）');
       expect(s.lastSeq.value).toBe(8);
     });
   });
@@ -1153,5 +1156,165 @@ describe('useEventStream · judge 分轴文案（issue #321）', () => {
     // 只允许否定式出现 verified（not independently verified），不得出现承诺式的 completed。
     expect(text).not.toMatch(/completed/i);
     expect(text).toContain('judge: goal considered met (not independently verified; the model itself decides whether to wrap up) (confidence 0.95) · reason: deployed & re-checked');
+  });
+});
+
+// ===========================================================================
+// issue #279：provider `tool_call_id` **跨轮复用** ⇒ 卡片身份必须含轮号。
+// 缺陷本体（真机症状「每轮恒 ✓ readFile，edit 卡片看不见」）：`toolCards` 以裸 provider id 为键 +
+// 命中即返回（`name` 首写冻结）⇒ 第二轮起所有调用并进第一轮那张卡。dev 栈不触发（我们的上游 id
+// 带随机后缀），所以只能**造形状**测：同一个 run 内两轮、id 相同而 name 不同。
+// 契约依据：`tool_use`/`tool_result` 载荷**没有** round（docs/api/portal.md §5.3 第 6/7 类），
+// 轮号只能来自 `round_start`（实时 EVENT_TYPES 与历史下发白名单里都有它）。
+// ===========================================================================
+const CROSS_ROUND_EVENTS = [
+  { seq: 1, run_id: 'r1', type: 'round_start', payload: { round: 1 } },
+  { seq: 2, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'readFile', input: { path: 'a.txt' } } },
+  { seq: 3, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: true, result_digest: 'file A', duration_ms: 12 } },
+  { seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 2 } },
+  { seq: 5, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'edit', input: { path: 'a.txt', oldText: 'x' } } },
+  { seq: 6, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: false, result_digest: 'conflict', duration_ms: 7 } },
+] as const;
+
+/** 卡片产出快照（身份键 + 逐字段内容 + 宿主占位顺序）——两条路径拿它做**逐字**比对。 */
+function cardSnapshot(s: ReturnType<typeof useEventStream>, placeholders: unknown[][]): string {
+  return JSON.stringify({
+    keys: [...s.toolCards.keys()],
+    cards: [...s.toolCards.values()],
+    placeholders,
+  });
+}
+
+describe('issue #279：跨轮复用 provider call id ⇒ 卡片身份含轮号', () => {
+  it('实时路：同一 run 两轮同 id 不同名 ⇒ **两张卡**、名字各自正确', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    for (const ev of CROSS_ROUND_EVENTS) {
+      lastES().emit(ev.type, { seq: ev.seq, run_id: ev.run_id, ...ev.payload });
+    }
+    expect([...s.toolCards.keys()]).toEqual(['r1:1:c1', 'r1:2:c1']);
+    expect(s.toolCards.get('r1:1:c1')!.name).toBe('readFile');
+    expect(s.toolCards.get('r1:2:c1')!.name).toBe('edit'); // 缺陷本体：这一张以前根本不存在
+    expect(hooks.onToolCardCreated.mock.calls).toEqual([['r1:1:c1'], ['r1:2:c1']]);
+  });
+
+  it('历史回放路：产出与实时路**逐字一致**（防「实时看着对、刷新后错」）', () => {
+    const liveHooks = makeHooks();
+    const sLive = useEventStream(liveHooks);
+    sLive.connect('sess-1');
+    for (const ev of CROSS_ROUND_EVENTS) {
+      lastES().emit(ev.type, { seq: ev.seq, run_id: ev.run_id, ...ev.payload });
+    }
+    const replayHooks = makeHooks();
+    const sReplay = useEventStream(replayHooks);
+    for (const ev of CROSS_ROUND_EVENTS) sReplay.replayEvent({ ...ev });
+    expect(cardSnapshot(sReplay, replayHooks.onToolCardCreated.mock.calls))
+      .toBe(cardSnapshot(sLive, liveHooks.onToolCardCreated.mock.calls));
+  });
+
+  it('结果关联**不串轮**：第二轮的 tool_result 只写第二轮那张（载荷里没有轮号）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    for (const ev of CROSS_ROUND_EVENTS) {
+      lastES().emit(ev.type, { seq: ev.seq, run_id: ev.run_id, ...ev.payload });
+    }
+    const first = s.toolCards.get('r1:1:c1')!;
+    const second = s.toolCards.get('r1:2:c1')!;
+    expect(first.ok).toBe(true);
+    expect(first.out).toBe('✓ file A（12ms）');
+    expect(first.dur).toBe(12);
+    expect(second.ok).toBe(false); // 若结果写错了卡片，这里会连着名字一起错
+    expect(second.out).toBe('✗ conflict（7ms）');
+    expect(second.dur).toBe(7);
+  });
+
+  it('索引只用于关联，**不当身份**：同 id 跨轮 ⇒ 身份两张卡、索引指向最新那张', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    for (const ev of CROSS_ROUND_EVENTS) {
+      lastES().emit(ev.type, { seq: ev.seq, run_id: ev.run_id, ...ev.payload });
+    }
+    expect(s.toolCards.size).toBe(2); // 身份 = 两张
+    expect(s.cardIdentityOfCall('c1')).toBe('r1:2:c1'); // 关联索引 = 最新那张
+  });
+
+  it('跨 run 复用同一个 id ⇒ 也是两张卡（会话级 Map 不再串台）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('tool_use', { seq: 1, run_id: 'rA', tool_call_id: 'c1', name: 'readFile', input: {} });
+    lastES().emit('tool_use', { seq: 2, run_id: 'rB', tool_call_id: 'c1', name: 'edit', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['rA:c1', 'rB:c1']);
+    expect(s.toolCards.get('rB:c1')!.name).toBe('edit');
+  });
+
+  it('tool_call_delta 与后来的 tool_use 落在**同一张**卡（增量不另起一张）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 1, run_id: 'r1', round: 3 });
+    lastES().emit('tool_call_delta', { seq: 2, run_id: 'r1', tool_call_id: 'c1', name: 'edit', arguments_delta: '{"path"' });
+    lastES().emit('tool_call_delta', { seq: 3, run_id: 'r1', tool_call_id: 'c1', arguments_delta: ':"a.txt"}' });
+    lastES().emit('tool_use', { seq: 4, run_id: 'r1', tool_call_id: 'c1', name: 'edit', input: { path: 'a.txt' } });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']);
+    expect(s.toolCards.get('r1:3:c1')!.args).toBe('{"path":"a.txt"}');
+    expect(hooks.onToolCardCreated).toHaveBeenCalledTimes(1);
+  });
+
+  it('实时漏收 round_start ⇒ 身份退化成 `r1:c1`（**不伪造轮号**），迟到结果仍靠索引找回同一张', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('tool_use', { seq: 9, run_id: 'r1', tool_call_id: 'c1', name: 'readFile', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:c1']); // 没有轮号段，也不拿 0/1 冒充
+    lastES().emit('tool_result', { seq: 10, run_id: 'r1', tool_call_id: 'c1', ok: true, result_digest: 'ok', duration_ms: 4 });
+    expect(s.toolCards.size).toBe(1);
+    expect(s.toolCards.get('r1:c1')!.ok).toBe(true);
+  });
+
+  it('round_start 之外的轮内事件（attempt/recovering）也能立起轮号水位线（重连漏收 round_start 的补点）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('recovering', { seq: 1, run_id: 'r1', round: 7, attempt: 2, maxAttempts: 3 });
+    lastES().emit('tool_use', { seq: 2, run_id: 'r1', tool_call_id: 'c1', name: 'shell', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:7:c1']);
+  });
+
+  // 变异取证补的用例：把 toolCard 的「命中即返回」改成「后到覆盖 name」时，原先 623 条**全绿**。
+  // 它**不是空操作**（at-least-once 重投 / delta 首帧名与 tool_use 名不一致时真会改写卡片）⇒
+  // 属覆盖缺口。身份已含轮号之后「首写冻结」不再是缺陷，而是刻意的口径：同一张卡 = 同一个真实调用。
+  it('同一身份键上后到的名字**不改写**卡片（`name` 首写冻结是保留的决定，不是漏改）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 1, run_id: 'r1', round: 1 });
+    lastES().emit('tool_use', { seq: 2, run_id: 'r1', tool_call_id: 'c1', name: 'readFile', input: { path: 'a.txt' } });
+    // 同一次调用的迟到重投（同一 run 同一轮同一 id）：名字形状不同也不许把卡片改名
+    lastES().emit('tool_use', { seq: 3, run_id: 'r1', tool_call_id: 'c1', name: 'editor', input: { path: 'a.txt' } });
+    lastES().emit('tool_call_delta', { seq: 4, run_id: 'r1', tool_call_id: 'c1', name: 'reader', arguments_delta: '{}' });
+    expect(s.toolCards.size).toBe(1);
+    expect(s.toolCards.get('r1:1:c1')!.name).toBe('readFile');
+    // 投影那条路同口径：命中既有卡片时只补缺字段，不改 name（#188 的「不覆盖实时完整数据」延伸）
+    s.projectToolCard('r1:1:c1', { name: 'editor', argsSummary: 'path=a.txt' }, { key: 'r1:1:c1', runId: 'r1', roundToken: '1', callId: 'c1' });
+    expect(s.toolCards.get('r1:1:c1')!.name).toBe('readFile');
+    expect(s.toolCards.get('r1:1:c1')!.argsSummary).toBe('path=a.txt');
+    expect(s.toolCards.size).toBe(1);
+  });
+
+  it('resetStreamState 连轮号水位线与关联索引一起清（换会话不得串轮号）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 1, run_id: 'r1', round: 4 });
+    lastES().emit('tool_use', { seq: 2, run_id: 'r1', tool_call_id: 'c1', name: 'readFile', input: {} });
+    s.resetStreamState();
+    s.connect('sess-2');
+    lastES().emit('tool_use', { seq: 1, run_id: 'r1', tool_call_id: 'c1', name: 'edit', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:c1']); // 新连接没观测到 round_start ⇒ 退化键
+    expect(s.cardIdentityOfCall('c1')).toBe('r1:c1');
   });
 });

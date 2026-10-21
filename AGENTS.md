@@ -1024,7 +1024,28 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 - **崩溃恢复不误报冲突（M2 的存储侧判据）**：一条 `sleep 60` 的 shell 跑到一半 `docker exec fde-eric kill -9 <worker>` ⇒ run 自动恢复并最终 `finished / judge_done`（16 轮），transcript 行数 16→**19**、**重复 `dedup_key` = 0**、portal 日志**无 `round_conflict` / 无 `persistence_failed`**。⚠ **证据边界**：本轮只证「恢复没有把重放判成冲突、也没有重复行」；**没有**单独证「重放记录恰好只在漂移字段上不同」（那才是新旧判据的分水岭），那一条的分水岭证据在单测（漂 `ts` 重放 ⇒ `{inserted:false}`）+ 真库仿真（`ON CONFLICT` 跳过 + 读回第一次那条 + 缺 `ON CONFLICT` 抛 23505 原文）。
 - **dev 残渣（故意不清，是回放标本）**：会话 `2f980de4…`（含真投出来的 advisory 控制行 round 11）与 `fde-eric:/home/erix/projects/probe-333`（f01–f12、total.txt、done.txt、b01–b10）。
 
+### 8.36 前端三修：卡片身份含轮次（#279）、中止后部分正文当场出现（#306）、工作台加载失败可见（#281）（2026-10-21，v0.1.23）
+
+**零后端、零 `runner/`、零 DDL** —— 三个都是前端缺陷（标本与判据全部来自已关闭的 issue，本单不重抄成因）。
+
+**#279 病根与唯一架构判断：身份与关联必须分开**。卡片身份以前是**裸 provider `tool_call_id`**，而上游 0.20 起明说「id 只保证单次投影内唯一」（`toolCallIdStrategy=cross_round`）⇒ 跨轮复用 id 时两张卡并成一张，**名字还是第一次那个**（用户报的「每轮恒 `✓ readFile`」）。新身份 = **`<run_id>:<round>:<call_id>`**（新 `lib/toolCardKey.ts` 是**唯一构造点**；缺轮次用 `?`，**不伪装成第 0 轮**；投影侧轮次从上游 `key` 首段 `<round>#…` 取 ⇒ 与实时同源，否则会出现永远对不上的两把尺）；而「把 `tool_result` 送回它那一轮那条卡」改用 `callId → 最近一张卡` 的**关联索引**——**索引不是身份**（名字永不被后续结果覆盖 ⇒ #279 的「冻结不覆盖」裁定在新身份下自然成立，不必再特判）。附带修两处同根问题：`attempt`/`replayPending`/`intercepted` 三处原来按 `callId` **全量刷**（一个 run 的 `attempt_killed` 会打上同 callId 的旧轮卡片）⇒ 改按身份精确匹配 + **跳 run 守卫**；`openSession` 原来不透 `item.run_id` 给 `replayEvent`（`liveRunId` 恒 `''`）⇒ 历史重放从入口就丢了归属。
+
+**⚠ 定性：本单是按契约形状改的，不是按 dev 复现改的**。dev 栈 131 个 run / 1161 行 `tool_calls` 里**跳轮复用 0 例**（6 例都是同轮内不同 call_id）⇒ 真机只能验「**不回归 + 两把尺归并**」，新旧判据的分水岭证据在单测（`read_r1`→`read_r2` 复用与 `run-A/run-B` 同轮同 id 两组夹具）。用户部署上是否真的发生过复用，那条 SQL 仍然有效（`GROUP BY run_id, round, tool_call_id HAVING count(*)>1`）。
+
+**#306**：`handleRunEnd` 在终态且 `termination.reason ∈ RUN_FAIL_REASONS`（`aborted` 也在集合内）时**补拉一次 history**（#300 的 `partial_output` 只在 history 里，此前只有 `openSession` 会拉 ⇒ 不刷新永远看不到）。只喂 `partial_output` 进既有幂等 `addPartialOutput`（id `partial:<run_id>`），**不重放 `judge`/`round_start`/`attempt_killed` 等非幂等事件**；三重竞态守卫（`sessionReqSeq`/`ctxSeq`/`sessionId`）；补拉失败静默。**成本红线：成功终态一个额外请求都不发**。**边界（刻意的）**：只覆盖 SSE `run_end` 通路（`reconcileActiveRun` 看不到终态原因，那条路上仍需刷新）；`queued` 被停属 `aborted` 族，会有一次零正文的补拉。
+
+**#281**：`WorkbenchView.onMounted` 两个 await 自己收尾 ⇒ 失败变成界面上看得见的错误行（复用既有 `.syserr`，零新 UI 结构；新键 `errors.workspaceLoadFailed` 双语成对，服务端 message 过 `toDisplayText`）+ 不白屏；`resolveRouteSession` 失败则清锚点回工作台；`onMounted` 永不抛。顺带修一处静默失败：切换项目时 `selectCwd` 失败原先只 console 一下、界面还显示**旧项目**的会话列表。
+
+**过程账（执行体超时的第三次，也是「先报现场再换体」口径的一次止确）**：第一次 30 分钟硬顶时只有 #279 已 commit、#306 半截（8 红）、#281 未做、报告未写。主 agent **没有自己接手**，而是报现场 + 给三个选项；决策者选 **A（续跑同一执行体）** ⇒ 续跑把三件事做完并自测变异。**口径：派单超时不等于可以擅改执行体**（AGENTS §3.0）。
+
+**验收**：前端 `npm run typecheck` rc=0 + `timeout 240 npm test` **36 文件 / 640 通过**（基线 35/601 → **#279 +22、#306 +10、#281 +7（含 `localeParity` +1）**）；根 **1341 / 1337 / 0 / 4** 与 runner **321/321** 不变（`portal/src/` 与 `runner/` 零字节）。**主 agent 亲跑变异 3 条全红在具名用例**（每条先证只改 1–2 行且行为真变）：身份退回裸 `callId` ⇒ 一批具名红（跳轮复用 / 跳 run / 结果关联 / 实时-投影同一身份）；补拉改无条件 ⇒ 具名成本红线红；投影轮次恒 `?` ⇒ 「实时与投影产出同一身份」那条红。
+
+**真机（本地构建 portal 镜像顶掉 digest pin 实跑，验完还原 `.env` 并重新 `up -d`）**：#306 —— UI 发一条长正文消息、流式中建了基线（`.msg.partial` = 0）、点「■ Stop」后 **1 秒内**部分正文就出现且**全程未刷新**，四个采样稳定 1 条、类名 `msg assistant md partial`（**不含 `syserr`**），**硬刷新后仍恰好 1 条**（不重复）。#279 —— 现跑一条三工具任务，实时卡片名字与时长各自正确（`🔧 writeFile p279.txt ✓ 2ms`、`🔧 readFile p279.txt ✓ 3ms`），**硬刷新前后逐字一致**（36 张卡、`byName` 完全相同），无 `undefined`/`[object Object]`/`NaN`。#281 —— 深链一个不存在的会话 ⇒ 重定向回 `#/`、**零未捕获拒绝**、不白屏。⚠ 一个现场发现：停止产生的红色中止行刷新后会消失（既有 #236「刷新后分隔条消失」，**不属本单**）。
+
+**发版**：v0.1.23。本版 `runner/` 只有版本号变动 ⇒ `FDE_IMAGE` **故意仍 pin 在 v0.1.22**、**不重建 FDE 容器**（§8.19 先例，别当漏做）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
+
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
 
