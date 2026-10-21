@@ -1101,7 +1101,13 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 **本片是「pin-first」的机械片**（§8.27/§8.35 先例）：折叠行为只能在**真 0.23** 上被测（0.22 账本压根没有消息行，折了也无物可折），
 所以先升 pin 让展示面变红、再在下一片用 test-first 折回来。**读侧折叠已落地 = §8.38。**
 
-### 8.38 0.23 读侧折叠：刷新后工具卡片不再退化成 `…`（issue #337 切片 A+B，2026-10-21）
+### 8.38 0.23 读侧折叠：刷新后工具卡片不再退化成 `…`（issue #337 切片 A+B，2026-10-21，随 **v0.1.24** 发布）
+
+⚠ **先记一条跨镜像类推的坑（我在 issue 正文里写错过，代价 = 一次发布动作差点漏做）**：
+`runner/Dockerfile:88` 用 `runner/package.json` + lockfile 在 **FDE 镜像里** `npm ci` 装 erix-agent —— **引擎是装在 FDE 容器里的**
+（worker 在 FDE 内跑 `runToolLoop`），portal 那份只用于投影/预写。所以**引擎升 pin 不属于 §8.19「runner 只有版本号变动 ⇒ 不重建容器」那一类**：
+那次先例的前提是「runner **代码**没变」，而这里 `runner/package-lock.json` 换了引擎 ⇒ **FDE 镜像内容变了** ⇒ 必须重建镜像 + `docker rm -f` 全部 `fde-*`。
+真机基线取证（重建前）：`fde-eric` 内 `/opt/erix/node_modules/erix-agent` 是 **0.22.0**；重建后 7 台全部 **0.23.0**。
 
 **单一真相源 `portal/src/transcript-fold.js`**：`MESSAGE_ROW_KIND` / `isFoldableMessageRow` / `foldLedgerRecords(records, {keyOf})`（record 级）
 / `foldTranscriptRows(rows, {recordOf, withRecord, keyOf})`（DB 行级）——**两种入口共用同一份内部 `planFold` 计划**，不是两套折叠规则。
@@ -1132,6 +1138,40 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 上游 `foldLedgerMessages` 根本不认载体（只按序拼消息），所以「取第一个载体」是本站为逐行投影引入的选择。
 
 **基线**：根 **1369 / 1365 / 0 / 4**（+28）、runner **321/321** 不变、前端 `typecheck` rc=0 + **36 文件 / 640** 不变（`runner/`、前端、依赖、DDL 全部零字节）。
+
+**发版与部署（v0.1.24，主 agent 亲手）**：PR 合并后 main `4eef2f7`（折叠）→ `3209c38`（台账）→ `e6fcc39`（版本 0.1.24），三次 main CI 全绿后才打 tag
+→ release run `39639770354` success → 清单 `images-digest`：portal `imageId=ad997919…`/`digest=c0874607…`、fde `imageId=d707535d…`/`digest=941a157c…`、proxy `imageId=6c5a491d…`/`digest=2c64790e…`
+→ **三镜像直连一次拉齐**（§8.35 那个 fde 422MB 单层 0 B/s 没复现），`docker image inspect .Id` 与清单 `imageId` **逐个一致**、`RepoDigests` 含清单 digest
+→ `deploy/.env` 形态① pin **三项**（本版动 `runner/` 依赖 ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0124`）→ `up -d --no-build` ⇒ portal 实跑 `ad997919…`、经 Traefik `healthz=200`
+→ **`docker rm -f` 全部 7 台 `fde-*`，reconcile 60 秒内全部重建在 `d707535d…` 且引擎 `0.23.0`**（§8.17 + 上面那条跨镜像类推的坑）。
+⚠ 清单里 proxy 的镜像名是 **`erix-station-fde-proxy`**（不是 `erix-station-proxy`），照角色名硬拼会 `manifest unknown`。
+
+**真机验收（两次：本地镜像预验 + 发布物复验；本单动引擎与读侧，值这个代价）**
+- **预验路线（§8.34 路线 A 的变体）**：`docker build -f portal/Dockerfile`（30 秒，context=仓库根）+ **把 0.23 引擎整目录热patch 进 `fde-eric`**
+  （`erix-agent` **零运行时依赖** ⇒ `rm -rf` + `docker cp` + `docker restart` 就够，不必构建 FDE 镜像）。⚠ **本地构建 FDE 镜像这条路当时走不通**：
+  第 13 层要从 **github.com** 下 `gh`/`tea`/`glab`，而本机 github.com 直连 `000`（§3.7）；带 `--build-arg HTTP_PROXY=http://172.20.0.35:19001` 也连不上该代理
+  （构建容器到 `prod` 网段不通）⇒ 热patch 是唯一低成本路子，且**它随容器重建自动消失**，不留残渣。
+- **真 run 产出的账本形状（不是造夹具）**：`<sid>:msg:<round>:<seq>` 行 **4 条**（其中一条带 `partOf`，正是主 agent 补的那条守卫的真机样本）、
+  `:engine:round:<n>` 行的 `messages` 是**空数组**（⇒ 不折就配不上 `tool_result`）。
+- **同一批真库行在 portal 容器内的 A/B**（决定性）：`折叠前（修复前的喂法）= tool_use 若干 / 带结果 0`；`折叠后 = toolCalls 2 / 带结果 2`，
+  `resultPreview="1: 24"`、`durationMs=4`。
+- **浏览器面**（DOM 文本断言；vision relay 当时挂了，两次都 `http_request_failed`，DOM 断言更硬）：卡片 `🔧 readFile total.txt ✓ 4ms` / `🔧 shell exit 3 ✓ 10ms`，
+  展开后结果文本 `1: 24` 与 `exit_code` **都在**；**硬刷新后仍是这两条**、无 `undefined`/`[object Object]`/`NaN`。
+  ⚠ 卡片默认**折叠**，结果预览只在展开区（`StreamPanel.vue`）——**判「有没有退化」不能只看 innerText 里有没有 `…`**：
+  实测那两处 `…` 是左侧会话列表 CSS `truncate` 出来的标题省略号，与卡片无关。
+- **旧账本不回归**：0.22 时代会话两条（无 `:msg:` 行、轮行 `messages` 非空）DTO `toolCalls` **79/79 与 33/33 都带 `resultPreview`**，
+  其中一条 `isError=true`（就是当年被杀的那个 `sleep`）；浏览器里 32 张卡片名字/状态/时长/展开结果逐条正常。
+  ⚠ 更早那条会话 `带时长=0` 是**正确**的（早于 #283 回填，NULL = 不知道，不伪装成 `0ms`）。
+- **发布物复验**：删容器重建后重跑一条端到端（会话 `ec8a77b3…` / run `25aa4f7a…`）⇒ 助手回「到」、`toolCalls=2` 且**两条都带预览与时长**、
+  账本仍是 0.23 形状（4 条 `:msg:` + 2 条空 `messages` 轮行）⇒ **热patch 撤掉后结论在发布物上重述一遍成立**。
+
+**验收中顺手发现、不属本片的一件事（另开 issue）**：同一轮同时存在 `…:engine:round:<n>` 与 `…:engine:round:<n>:resume` 时，
+逐行投影会给同一条 `tool_use` 出两张卡（一张有结果一张没有）——**0.22 上同样存在**，不是 0.23 引入的回归。
+
+**环境侧副产品**：本机解析不出 `station.fde.erix.vip`（解析器负缓存）且没有免密 sudo 改 hosts ⇒ 临时起了一个
+`127.0.0.1:18099 → 127.0.0.1:8090` 的 `Host`/`Origin` 改写小代理（`/tmp/hostproxy337.mjs`，验完已 kill）供浏览器验收用；
+`erix_station_playwright` 容器是 **isolated** 实例，自己拿 JSON-RPC 戳它的 `/mcp` 会在页面加载后掉会话（`Session not found`），
+但 pi 的 playwright MCP 走的是它、工作正常——**先用 MCP 工具，别自己手写 JSON-RPC**。
 
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
