@@ -44,7 +44,9 @@ function onChange(e: Event) {
       <option v-for="d in store.dirs" :key="d.cwd" :value="d.cwd">
         {{ d.name }}<template v-if="badge(d) > 0"> ●{{ badge(d) }}</template>
       </option>
-      <option value="__new__" :disabled="store.newDirDisabled">{{ t('sidebar.newDirOption') }}</option>
+      <!-- issue #332：原 `:disabled="store.newDirDisabled"`（平台管理员专用）已随入口拦截拆除——
+           没有工位的平台管理员进不到工作台，这里对「有工位的人」恒可用（服务端仍有 403 写闸）。 -->
+      <option value="__new__">{{ t('sidebar.newDirOption') }}</option>
     </select>
     <!-- ↻ 单按钮双刷：store.refreshDirs()（/api/dirs）+ DirectoryTree.reload()（目录树），SidebarPanel 组装 -->
     <button

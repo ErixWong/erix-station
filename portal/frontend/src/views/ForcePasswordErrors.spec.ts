@@ -43,7 +43,7 @@ const tick = async (ms = 30) => {
 //   TypeError: … reading 'cwd'  ❯ resolveRouteSession src/stores/workbench.ts:691  ❯ WorkbenchView.vue:114
 //   This error originated in "src/views/ForcePasswordErrors.spec.ts" test file
 // 机制（那两个 await 缺 catch 是产品侧问题，已另单，**本单不碰产品代码**）：
-//   `WorkbenchView.vue:109-114` 的 onMounted 里 `await store.initWorkspace(auth.user)` 与
+//   `WorkbenchView.vue:109-114` 的 onMounted 里 `await store.initWorkspace()`（#332 后不再接 user）与
 //   `await store.resolveRouteSession(...)` 都没有 catch ⇒ 夹具只要让 /api/dirs、/api/sessions* 失败或
 //   缺形状，那个 async 钩子的 promise 就拒绝；Vue 的 callWithAsyncErrorHandling 把它交给
 //   handleError → logError(throwInDev=true) **再 throw**（@vue/runtime-core 的 logError），于是 catch
