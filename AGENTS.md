@@ -937,6 +937,22 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **过程账（同一个坑的第二次发作，代价 = 两小时）**：worker 连撞两次 30 分钟超时（我传的 50 分钟未生效，**实测上限就是 1800000ms**），两次都**没有 commit**；第一次的补丁与当时新合并的 PR #326 冲突（整份应用会删掉 `llm-chat.js`）⇒ 只能重做；第二次的补丁基点正好是当前 main ⇒ 主 agent `git apply` 落到分支后测出「只差一把跨文件锁」。**口径：worker 的补丁落主仓后必须先跑一遍数出真实缺口，再决定补哪里；跨文件读源码的锁在被读文件被删时必红，删它必须同时改锁的方向。**
 
+### 8.34 没有工位的平台管理员不再停留 FDE 工作台（issue #332，PR #334，2026-10-21）
+
+**判据本体（别再改错方向）**：「没有工位」= `users.role === 'admin' && !users.fde_name`。⚠ `role` 的 CHECK 是 `('fde','admin')` **单值互斥**（`docs/data/schema.sql:80-81`），而 `fde_name` 是**独立列**（`:82-83`）⇒ 「既是管理员又有工位」的人（`role='admin'` + `fde_name` 有值）**必须照常进得来**。挡的是「没工位」，不是「admin」这个词；判据里 `!fde_name` 与 `role==='admin'` 缺一个都错（只看 role 会误伤第②类人，只看 fde_name 会去挡「fde 但 fde_name 为空」的畸形账号）。这条不变式在单测与真机两侧各有判据。
+
+**单一真相落点**：`portal/frontend/src/lib/workbenchGate.ts`（纯函数、零 vue-router 依赖，照 `lib/forcePasswordGuard.ts` 先例）：`isSeatlessAdmin` / `isWorkbenchPath` / `seatAwareLanding` / `workbenchGateDecision`。**router 守卫与 `auth.afterLoginRoute` 都委派它**（登录落点与入口闸共用一条判据，不许有第二份）。**必须在守卫里做、不能在 `WorkbenchView` 里做**：视图一旦挂载，`onMounted` 就去打 `GET /api/dirs` + `GET /api/sessions` + `GET /api/me/ports` 三趟换一个空壳（这正是 #308 审计量到的形状）。
+
+**#332 原文有一格是我写错的（更正记录）**：写着「服务端没闸，会 mkdir、会建一条派发不出去的会话」—— 不实。`portal/src/sessions.js:213-222` 在 mkdir **之前**就查 `fde_name`，抛 **400 `validation_failed` + `details.field='fde_name'`**（`portal/test/sessions-cwd.test.js:99` 钉着）⇒ 零副作用早已成立。「400 改 403」经决策者判定**不做**（改了没人受益，却要动一条被测试钉住的既有契约）⇒ `sessions.js` 一个字节未动。今后别再按「服务端缺写闸」去找修复点。
+
+**执行体过程账（两条纪律被实证）**：① pi `worker` 撞 **30 分钟硬顶**（`1800000ms` 是上限，传更大不生效）**0 commit**，靠 AGENTS 的「里程碑式写报告」留下了 4.2KB 现场 + 一份 45KB patch（`subagent` 的 `worktree-diffs/…patch` 含 untracked 新文件全文，worktree 被自动清理后仍可全量复活）。② 同一份改动交 `erix_run` 收尾（`maxRounds=100` / `timeoutMs=3600000` / `sessionDir` 必给）⇒ `judge_done`、59 轮、↑3,579,444/↓42,467、扩轮 0/2 未触发、transcript+judge.log+status.json 全落盘。**它抓出上一手虚报的测试**：`router.spec.ts` 当时没改 ⇒ 摘掉守卫**一条都不红**；两处注释引用的 `views/SeatlessAdminGate.spec.ts` **文件不存在** ⇒ §二.2「三趟空请求」其实没被钉。**口径：交接「测试已加」必须自己复跑变异，别信上一手的自报。**⚠ 一条待观察：`judge.log` 里 7 次 `extendDecision` 全 `missing`（引擎口径「缺失 = fail-closed 不扩轮」），本次自然结束无害，但真需要扩轮时这 7 次一次都扩不到。
+
+**验收**：根 **1292 / 1288 / 0 / 4 不变**（`portal/src/` 与 `runner/` 零文件）、runner 311 不变、前端 **33 文件 / 585 → 35 文件 / 601**（+2 文件 / 净 +16，含删掉 2 条变不可达的用例）。主 agent 亲跑变异 2 条：**注释掉 `router.ts` 守卫那两行 ⇒ 4 条具名红**（含深链那条与两条零请求）、**判据删掉 `!fde_name` ⇒ 6 条红**（含「第②类人 → 照常放行」）；两条都先证只改 1-2 行且行为真变。**CI 质量门禁 pass**（镜像构建校验在 PR 上是 skipping，只在 main 跑）。
+
+**真机 5 条全过（路线 A = 先验再合；手法值得复用）**：`docker build -f portal/Dockerfile`（build context = 仓库根，30 秒）→ `deploy/.env` 的 `STATION_PORTAL_IMAGE` 临时指到本地 tag（原值先备份）→ `up -d --no-build station-portal` → 浏览器走 `station.fde.erix.vip:8090`（经 Traefik）→ **验完还原 .env 并重新 `up -d`**（否则 digest pin 就假了）。结果：`admin` 落 `#/admin/users` 且工作台标记不存在；`#/` 与深链 `#/session/<uuid>` 都弹回管理台；三趟请求命中数**恒 0**；`eric` 落 `#/`、标记存在、三趟各发了（命中 3）；临时 `UPDATE users SET fde_name='adm334'` 让 `admin` 变成第②类人 ⇒ 落 `#/`、标记存在（**这条是「挡的是没工位不是 admin」的真机证据**），验完 `fde_name` 改回 NULL、无容器无 allocation 残留。⚠ 探针方法：登录按钮文案是 **`Next`**；`input[type="text"]` 属性选择器抓不到**没写 `type` 属性**的输入框（`.type` 属性读出来才是 `text`）。
+
+**已知边界（都不算洞，且已并给 #308）**：管理台的「← Back to workbench」链接对无工位管理员是死链，但**点了会被守卫弹回**（实测 `#/admin/users` + 零请求），不构成误导，隐藏与否另开小单；`#/sessions` **不是路由**（router 只有 `/login`、`/change-password`、`/`、`/session/:id`、`/admin*`，全仓无人链它）⇒ `isWorkbenchPath` 只认 `/` 与 `/session/` 是对的；`WorkbenchView.spec.ts` / `WorkbenchPreviewPorts.spec.ts:207` 的夹具仍是「无工位管理员」（直接 mount 视图、不过守卫，形状已不可达但全绿，后者是端口空态唯一覆盖）；`workbench.ts` / `DirSelect.vue` 里注释写的「服务端另有 403 写闸」与实际 **400** 不符 ⇒ 纯措辞，随 #308 一并更正。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。
