@@ -97,6 +97,20 @@ const FIXTURES = [
     ],
   },
   {
+    // 主 agent 自己跑变异（拆掉 `row.messages.length === 1` 守卫）时发现 19 条全绿 ⇒ 真覆盖缺口：
+    // **没有任何 fixture 走过这条判别支**（上游 `message-rows.js:137` 有同一个守卫）。
+    // 分片行带**两条**消息 ⇒ 不满足单消息条件，**不算分片**，正文照排。补上后同一变异恰 1 条红。
+    name: '`partOf` 指认了，但分片行带两条消息：不满足单消息条件 ⇒ 不当分片（上游同一支路）',
+    foldable: 3,
+    kept: 1,
+    records: [
+      carrier(1),
+      msg(1, 0, [asstText('先读')]),
+      msg(1, 1, [toolResult('a', 'A')]),
+      msg(1, 2, [toolResult('b', 'B'), toolResult('c', 'C')], { partOf: `${KEY}:msg:1:1` }),
+    ],
+  },
+  {
     name: '控制行（`:control:<slot>`）与 seed 行都在场：控制行不是载体、seed 不是载体',
     foldable: 2,
     kept: 3,
