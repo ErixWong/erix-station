@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { stopSession, postMessage, SessionError } from '../src/sessions.js';
 import { validateTransition, setRunState, claimRun } from '../src/internal.js';
 import { seedClaimable } from './fake-internal-pool.js';
+import { fakeTranscriptRounds } from './fake-transcript-rounds.js';
 
 const UID = '00000000-0000-4000-8000-0000000000a1';
 const SID = 'a1b2c3d4-1111-4111-8111-abcdefabcdef';
@@ -195,12 +196,11 @@ class StopPool {
       if (m) m.run_id = params[1];
       return { rows: [], rowCount: m ? 1 : 0 };
     }
-    if (s.includes('SELECT record') && s.includes('FROM transcript_rounds')) return { rows: [], rowCount: 0 };
-    if (s.includes('SELECT MAX(round) AS max_round')) return { rows: [{ max_round: null }], rowCount: 1 };
-    if (s.includes('INSERT INTO transcript_rounds')) {
-      this.transcript.push({ key: params[0], dedup_key: params[1], round: params[2], record: JSON.parse(params[3]) });
-      return { rows: [], rowCount: 1 };
-    }
+    // #333 M2：transcript_rounds 走共用仿真件（真库约束行为；旧写法则 INSERT 一律「出行」、
+    // 读回一律空 ⇒ 产品把首次预写读成「插入了但取不到正文」，与真库不一致）。
+    const rounds = (this.rounds ??= fakeTranscriptRounds({ rows: this.transcript ?? [] }));
+    const roundHit = rounds.query(sql, params);
+    if (roundHit) return roundHit;
     if (s.includes('INSERT INTO runs')) {
       this.runs.push({ id: params[0], session_id: params[1], status: 'queued', termination: null, error: null,
         usage: null, rounds: 0, cancel_requested_at: null, queued_at: new Date(), started_at: null, ended_at: null });

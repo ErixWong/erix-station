@@ -13,6 +13,7 @@ import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 
 import { FakePool } from './fake-pool.js';
+import { fakeTranscriptRounds } from './fake-transcript-rounds.js';
 
 const USER = {
   id: '00000000-0000-4000-8000-0000000000a1', login: 'alice', display_name: 'alice',
@@ -88,11 +89,12 @@ class MessagePool extends FakePool {
     if (sql.includes('INSERT INTO messages')) {
       return { rows: [{ id: 'm1', seq: 6, content: params[2], created_at: new Date('2026-09-22T00:00:00Z') }] };
     }
-    if (sql.includes('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的回退路径 load(key)
-    // 0.17.0 成对快路径探针（#193）：本 fake 不种子 transcript 行 → 点查未命中 + max_round null。
-    if (sql.includes('SELECT record FROM transcript_rounds')) return { rows: [] };
-    if (sql.includes('SELECT MAX(round)')) return { rows: [{ max_round: null }] };
-    if (sql.includes('INSERT INTO transcript_rounds')) return { rows: [] };
+    // #333 M2：`transcript_rounds` 交给共用仿真件（真库部分唯一索引 + `ON CONFLICT DO NOTHING`
+    // 跳过语义 + 撞键读回**真存着的那条**）。下面原先四律 `return { rows: [] }` ⇒ 首次预写就被产品
+    // 读成「被跳过且读不到既有正文」⇒ 伪冲突（existingFingerprint=sha256:0000…）。
+    const rounds = (this.rounds ??= fakeTranscriptRounds({ rows: this.transcript ?? [] }));
+    const roundHit = rounds.query(sql, params);
+    if (roundHit) return roundHit;
     if (sql.includes('INSERT INTO runs')) return { rows: [{ id: params[0], status: 'queued' }] };
     return super.query(sql, params);
   }

@@ -17,6 +17,7 @@ import * as auth from '../src/auth.js';
 import * as llm from '../src/llm.js';
 
 import { FakePool } from './fake-pool.js';
+import { fakeTranscriptRounds } from './fake-transcript-rounds.js';
 
 const USER = {
   id: '00000000-0000-4000-8000-0000000000b2', login: 'carol', display_name: 'carol',
@@ -133,10 +134,11 @@ class PrecheckPool extends FakePool {
     if (sql.includes('INSERT INTO messages')) {
       return { rows: [{ id: 'm1', seq: 6, content: params[2], created_at: new Date('2026-10-14T00:00:00Z') }] };
     }
-    if (sql.includes('SELECT round, dedup_key, record')) return { rows: [] };
-    if (sql.includes('SELECT record FROM transcript_rounds')) return { rows: [] };
-    if (sql.includes('SELECT MAX(round)')) return { rows: [{ max_round: null }] };
-    if (sql.includes('INSERT INTO transcript_rounds')) return { rows: [] };
+    // #333 M2：`transcript_rounds` 走共用仿真件（真库约束行为，不是一律空行）——
+    // 旧写法首次预写就伪报冲突（见 fake-transcript-rounds.js 头注释）。
+    const rounds = (this.rounds ??= fakeTranscriptRounds({ rows: this.transcript ?? [] }));
+    const roundHit = rounds.query(sql, params);
+    if (roundHit) return roundHit;
     if (sql.includes('INSERT INTO runs')) return { rows: [{ id: params[0], status: 'queued' }] };
     return super.query(sql, params);
   }
