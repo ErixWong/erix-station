@@ -211,7 +211,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const renderedIds = ref<Set<string> | null>(null); // 去重（refresh 与流式缓冲竞态）
   const inputValue = ref(''); // composer 输入（旧 $('input').value）
   const creatingSession = ref(false); // 旧 newSess 按钮禁用语义
-  const isPlatformAdmin = ref(false); // user.role === 'admin' && !user.fde_name（平台管理员）
+  // issue #332：这里原有 `isPlatformAdmin = user.role === 'admin' && !user.fde_name`（+ 派生的
+  // `newDirDisabled`、「＋新建目录」的 disabled、「进管理台」引导文案与占位符）——入口拦截落地后
+  // 这类人**根本进不到工作台**（router 守卫里的 workbenchGateDecision，判据 lib/workbenchGate.ts），
+  // 本 store 的 isPlatformAdmin 永远为 false ⇒ 按仓内纪律（不留不可达分支当「以防万一」）整块拆除。
+  // 服务端另有同名写闸：POST /api/sessions 对无 fde_name 的账号返 403 forbidden（portal.md §4.2）。
 
   // issue #55 A1：per-session 输入草稿（内存 Map，key=sessionId）；切换会话/项目时保存与恢复。
   const drafts = new Map<string, string>();
@@ -254,13 +258,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const running = computed(() => es.activeRunId.value != null);
   const sendDisabled = computed(() => running.value || noDir.value);
   const inputPlaceholder = computed(() =>
-    isPlatformAdmin.value
-      ? t('common.platformAdminHint')
-      : noDir.value
-        ? t('common.createFirstDir')
-        : t('workbench.inputPlaceholder'),
+    // #332：原先第三态「平台管理员：请到管理台…」已随入口拦截拆掉（不可达），两态照旧：
+    // 无目录 → 引导建目录；有目录 → 正常输入提示。
+    noDir.value ? t('common.createFirstDir') : t('workbench.inputPlaceholder'),
   );
-  const newDirDisabled = computed(() => isPlatformAdmin.value);
   const newSessDisabled = computed(() => noDir.value || creatingSession.value);
   // 会话列表项 meta 行（● 运行中 / 本地化时间）
   // issue #105 ③：时间戳按当前 locale 格式化（原硬编码 'zh-CN'，英文界面下仍是中文格式）。
@@ -470,13 +471,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   // ---- initWorkspace ----
-  async function initWorkspace(user: { role: string; fde_name: string | null }) {
-    isPlatformAdmin.value = user.role === 'admin' && !user.fde_name;
+  // issue #332：不再接 `user` 参数（原参数只为算 isPlatformAdmin，而它已不可达）——
+  // 「谁能走到这里」归路由守卫管，不再归 store 管。
+  async function initWorkspace() {
     await loadDirs();
     dirCwd.value = dirs.value[0]?.cwd ?? null;
     updateAvailability();
     if (dirs.value.length === 0) {
-      // issue #42 语义平移：无目录空态（平台管理员引导进管理台）
+      // issue #42 语义平移：无目录空态（「先创建目录」）
       return;
     }
     await loadSessions();
@@ -917,10 +919,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   return {
     // state
     dirs, dirCwd, sessions, sessionId, noDir,
-    entries, renderedIds, inputValue, creatingSession, isPlatformAdmin,
+    entries, renderedIds, inputValue, creatingSession,
     drafts, es,
     // computed
-    currentDir, running, sendDisabled, inputPlaceholder, newDirDisabled, newSessDisabled,
+    currentDir, running, sendDisabled, inputPlaceholder, newSessDisabled,
     // helpers
     sessMeta,
     // actions

@@ -44,13 +44,9 @@ describe('ComposerBar · i18n（issue #101 P2）', () => {
     expect(wrapper.get('textarea').attributes('disabled')).toBeDefined();
   });
 
-  it('平台管理员：占位符引导进管理台', async () => {
-    const { store, wrapper } = setup();
-    store.isPlatformAdmin = true;
-    await flushPromises();
-    expect(wrapper.get('textarea').attributes('placeholder'))
-      .toBe('平台管理员：请到管理台创建 FDE 用户与分配资源');
-  });
+  // issue #332：这里原有「平台管理员：占位符引导进管理台」一条。入口拦截（router 守卫的
+  // workbenchGateDecision）落地后，`admin && !fde_name` 的人**根本进不到工作台**，`store.isPlatformAdmin`
+  // 与 `common.platformAdminHint` 一并拆除 ⇒ 占位符只剩「有目录 / 无目录」两态（上面两条已钉）。
 
   it('切 English：发送/停止/占位符即时变英文', async () => {
     const { store, wrapper } = setup();

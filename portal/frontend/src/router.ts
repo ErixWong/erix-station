@@ -9,6 +9,8 @@ import {
 } from 'vue-router';
 import { useAuthStore } from './stores/auth';
 import { FORCE_PASSWORD_PATH, createRedirectBudget, restrictedNavigationDecision } from './lib/forcePasswordGuard';
+// #332：工作台准入闸（admin 且无 fde_name ⇒ 送管理台）。判据本体在 lib/workbenchGate.ts，这里只接线。
+import { workbenchGateDecision } from './lib/workbenchGate';
 import { setRestrictedSessionListener } from './lib/restrictedSession';
 
 // #255 强制改密屏的路径：唯一真相在 lib/forcePasswordGuard.ts（守卫判据与它同处）。
@@ -113,6 +115,14 @@ export function createAppRouter(history: RouterHistory = createWebHashHistory())
     }
     // 未登录访问受保护路由 → /login，并带 redirect 回跳（登录后恢复原目标，如深链会话）。
     if (!auth.user) return { path: '/login', query: { redirect: to.fullPath } };
+    // #332：没有工位的平台管理员（`role==='admin' && !fde_name`）不得停留在工作台（`/`、`/session/:id`）
+    // ⇒ 一律改写去管理台。接在「未登录 → /login」之后、「requiresRole」之前：
+    //  • 排在这里 ⇒ 拦在**挂载前**，WorkbenchView 的 onMounted（GET /api/dirs + /api/sessions + /api/me/ports）
+    //    根本不跑，三趟空请求一条都不发（工单 §二.2）；深链 `#/session/<id>`（别人的会话）也因此
+    //    不再先踢回 `#/` 再被工作台空转一次（§二.3）。
+    //  • 与 requiresRole 互不干扰：/admin* 不是工作台路由（判据直接 next），而 fde 访 /admin 的回退仍走下面那条。
+    const gate = workbenchGateDecision({ user: auth.user, toPath: to.path });
+    if (gate.action === 'rewrite') return { path: gate.path };
     if (to.meta.requiresRole && auth.user.role !== to.meta.requiresRole) return { path: '/' };
     return true;
   });
