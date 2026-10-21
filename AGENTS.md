@@ -1013,7 +1013,16 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 （部分唯一索引把并发串行化了）⇒ 它的行为面只在 fake 上成立；摘掉 key 白名单里的旧名不做（§8.25 同族）；
 `portal/src/internal.js` 端点侧**没有**真库级行为判据（只有 fake + 源码级「同一把尺」断言）。
 
-**发版与部署 / 真机**：见下（`TODO(主 agent)` 由发版当次填写）。
+**发版与部署（v0.1.22，主 agent 亲手）**：PR **#335** 合并（`f9b5d5c`）→ PR 质量门禁绿 → main CI `39546100010` **两个 job 全绿**（含三镜像构建校验，这是打 tag 的前置，§6 惯例）→ tag `v0.1.22` → release run `39546457093` success → 清单 `images-digest`：portal `imageId=967c1911…`/`digest=4b443f3d…`、fde `imageId=10b47dc5…`/`digest=f546a65e…`、proxy `imageId=d5317d45…`/`digest=8addad01…` → `deploy/.env` 形态① pin **三项**（本版动 `runner/` ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0122`）→ `up -d --no-build` ⇒ portal 实跑 `967c1911…` = 清单 imageId、经 Traefik `/healthz` 200 → **`docker rm -f` 全部 7 台 `fde-*`，reconcile 40 秒内全部落在 `10b47dc5…` 且 healthy**（§8.17：动 `runner/` 不重建就还是 0.20.0 引擎）。
+
+⚠ **本版新踩的运维坑（值得记，下次直接照做）**：GHCR **直连拉 fde 镜像时好时坏**——portal/proxy 一次成功，fde 的 422MB 单层实测 **0 B/s**（docker 不支持断点续传 ⇒ 每轮从 0 重来，永远撞同一层）。解法（**不动 daemon、不重启栈**）：① 从 manifest 读每层声明的 `size`（**别用 HEAD 取 Content-Length**，镜像站 HEAD 不给）；② `curl -C -` 走公共镜像站 `ghcr.nju.edu.cn`（实测 1.7–3.4 MB/s）逐层续传，**每层落盘后校验 sha256 == 文件名摘要**；③ 拼 legacy tar（`manifest.json` 的 `RepoTags` **必须全小写**，`LOCAL-FDE` 会被 docker 拒）+ `docker load`；④ **再按 digest 原样 `docker pull` 一次** —— 层已在本地 ⇒ 全是 `Already exists`，秒回，本地于是有了 `repo@sha256:` 这个 digest 引用，pin 保持形态① 不变（`docker tag` **不接受** digest 形态的目标名，别指望它造引用）。核对点：`docker load` 出来的 `.Id` 必须等于清单 `imageId`（本次逐位一致）。
+
+**真机验收（v0.1.22，dev 栈，主 agent 亲手；会话 `2f980de4…` / 工位 `fde-eric` / 项目 `~/projects/probe-333`）**：
+- **0.22 引擎真在 FDE 里跑**：三条 run 全部正常终态（`judge_done`），第一条 8 轮 / 16 次工具调用 / ↑45,737 ↓1,799；`transcript` 里 `erix.toolCallKey` / `erix.durationMs` / `erix.round` 均在（0.20 的 `erix.*` 形状）。
+- **`judgeDoneAdvisory` 端到端成立（这是它唯一的生效路径，真机拿到了）**：构造「关键步骤已完成、加分项还在做」的任务 ⇒ 中途拦截审计第 1 次 `done:true`（`b06–b10` 尚未创建），引擎**投喂** advisory，模型收到后继续干到第 13 轮再由第 2 次审计正常收尾。advisory 落盘形态逐字确认：`role=user`、`meta.source="judge-control"`、文本以 `（附评审意见：评审认为本任务可能已达成原始目标——…` 开头。
+- **控制文本没有漏进界面面**：`messages` 表含「附评审意见」的行数 = **0**；`GET /api/sessions/:id/events/history` 全文 **0 处**；会话标题仍是首条用户消息截断（未被控制文本污染）⇒ M3 的按条过滤在真数据上生效。
+- **崩溃恢复不误报冲突（M2 的存储侧判据）**：一条 `sleep 60` 的 shell 跑到一半 `docker exec fde-eric kill -9 <worker>` ⇒ run 自动恢复并最终 `finished / judge_done`（16 轮），transcript 行数 16→**19**、**重复 `dedup_key` = 0**、portal 日志**无 `round_conflict` / 无 `persistence_failed`**。⚠ **证据边界**：本轮只证「恢复没有把重放判成冲突、也没有重复行」；**没有**单独证「重放记录恰好只在漂移字段上不同」（那才是新旧判据的分水岭），那一条的分水岭证据在单测（漂 `ts` 重放 ⇒ `{inserted:false}`）+ 真库仿真（`ON CONFLICT` 跳过 + 读回第一次那条 + 缺 `ON CONFLICT` 抛 23505 原文）。
+- **dev 残渣（故意不清，是回放标本）**：会话 `2f980de4…`（含真投出来的 advisory 控制行 round 11）与 `fde-eric:/home/erix/projects/probe-333`（f01–f12、total.txt、done.txt、b01–b10）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
