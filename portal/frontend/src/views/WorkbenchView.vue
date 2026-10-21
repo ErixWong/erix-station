@@ -17,6 +17,7 @@ import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 import PreviewPortsPanel from '../components/PreviewPortsPanel.vue';
 import { usePreviewPorts } from '../composables/usePreviewPorts';
+import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
 
 // issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
 const { t } = useI18n();
@@ -109,9 +110,29 @@ const portsToggleLabel = computed(() => {
 onMounted(async () => {
   void ports.load(); // 与 auth 守卫无关：进视图就拉自己的端口列表（能走到这里的人已由 #332 守卫保证有工位）
   if (!auth.user) return; // 守卫保证已登录
-  await store.initWorkspace();
+  // issue #281：**Vue 不等 onMounted 返回的 Promise** ⇒ 里面每一个 `await` 都必须自己收尾，否则一次
+  // /api/dirs 失败就是 Unhandled Rejection（代价真实发生过：v0.1.7 打 tag 时 CI 步骤④ 就红在这两个
+  // 无 catch 的 await 上，AGENTS §4 与 §8.20）。本地 catch ≠ 加一层重试：**不重试**，只把失败变成
+  // 界面上看得见的错误行（以前是「空着像服务没起」，只有控制台知道）。准入闸（lib/workbenchGate.ts，
+  // #332/#334）不在本钩子里，本钩子只改失败的可观测性，不改谁能进来。
+  try {
+    await store.initWorkspace();
+  } catch (e) {
+    store.pushStreamError(t('errors.workspaceLoadFailed', {
+      message: toDisplayText(e instanceof Error ? e.message : e),
+    }));
+    return; // 目录都没拉到，别再走深链（resolveRouteSession 依赖目录/会话列表）
+  }
   // issue #55 B1：启动时若路由带 /session/<id>（旧 #/session/<id>），走统一深链解析
-  if (route.params.id) await store.resolveRouteSession(String(route.params.id));
+  if (!route.params.id) return;
+  try {
+    await store.resolveRouteSession(String(route.params.id));
+  } catch (e) {
+    // 深链自己内部已经处理了 404（静默回默认视图）与其他 ApiError（已推 syserr）；走到这里的是
+    // **形状意外**（旧后端回包缺键等），同样不许演成未捕获拒绝（#281 的 `session.cwd` TypeError 就属这类）。
+    store.pushStreamError(t('errors.sessionLoadFailed'));
+    console.error('Failed to resolve route session', e);
+  }
 });
 
 // ---- issue #55 B4：移动端抽屉（≤768px，Tailwind max-md: 变体替代旧 offcanvas 桥接）----

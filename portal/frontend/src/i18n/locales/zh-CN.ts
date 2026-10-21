@@ -634,6 +634,9 @@ export const zhCN = {
   errors: {
     requestFailed: '请求失败（HTTP {status}）',
     sessionLoadFailed: '会话加载失败，可刷新重试',
+    // issue #281：工作台初始化（GET /api/dirs 那一站）失败的**可见**文案。此前 onMounted 里的 await
+    // 没人 catch ⇒ 失败只在控制台，界面停在「选择或新建会话」空态，用户以为服务没起。
+    workspaceLoadFailed: '工作台初始化失败：{message}（可刷新重试；持续失败请联系管理员）',
     createSessionFailed: '建会话失败：{message}',
     stopFailed: '停止失败：{message}',
     dirNameInvalid: '目录名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）',

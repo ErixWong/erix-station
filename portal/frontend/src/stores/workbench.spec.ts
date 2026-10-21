@@ -1849,7 +1849,9 @@ describe('issue #306：终态后补拉 history（partial_output 当场出现，�
     // 顺序是关键：**先换会话**（s2 的幂等集是全新的，`partial:r1` 不在里面），再让补拉的响应回来。
     // 反过来做的话 openSession('s2') 自己就把 entries 清空了 ⇒ 迟到的那条被顺手抹掉，守卫没被经过。
     await store.openSession('s2');
-    fire?.();
+    // 断言已经证明它是个函数；这里的一次显式收窄只是喂 vue-tsc —— `fire` 的赋值发生在 fetch 桩的
+    // 闭包里，vue-tsc 不追踪跨闭包赋值，会在调用点把它窄成 `null`（TS2349 never）。**不是**放宽断言。
+    (fire as (() => void) | null)?.();
     await settle();
     expect(store.sessionId).toBe('s2');
     expect(partials(store)).toHaveLength(0); // 守卫生效：不把 s1 的部分正文推进 s2 的流
