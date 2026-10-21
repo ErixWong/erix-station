@@ -259,6 +259,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       notifyRunEnd(d);
       applyRetryFaceOnRunEnd(d); // issue #261B：失败终局 → 点亮「重试上一条」
       refreshSession(d.run_id);
+      repullPartialOutput(d); // issue #306：中止/失败终局 → 补一次 history，让合成项当场出现
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
     onSessionUpdated: (d) => {
@@ -314,6 +315,51 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   /** 切会话 / 切目录 / 关会话 ⇒ 重试面重置（工单 #261B：不留到另一个会话的输入框上）。 */
   function clearRetryFace() {
     retryAvailable.value = false;
+  }
+
+  // ---- issue #306：终态后补一次 history，让 `partial_output` 当场出现（不必刷新）----
+  /**
+   * 要不要重拉。**条件故意窄**：只有 `termination.reason ∈ RUN_FAIL_REASONS` 才拉。
+   * `aborted` 本身就在那一个集合里（`lib/terminationReasons.ts` 的 RUN_FAIL_REASON_LIST），所以
+   * 不另开一份枚举；`end_turn` / `no_tool` / `judge_done` / `stall` 等**零重拉**——那类 run 本来就有
+   * 助手锚点（判据②不成立，后端也不会合成），白打一次 history 是纯成本（dev 一个会话 14.4 万条事件）。
+   */
+  function shouldRepullPartialOutput(d: RunEndPayload): boolean {
+    return RUN_FAIL_REASONS.has(d.termination?.reason ?? '');
+  }
+
+  /**
+   * issue #306：`partial_output` **只在 `GET /events/history` 的响应期合成**（docs/api/portal.md
+   * §4.4a-1：不落库、不进 SSE），而此前只有 `openSession` 拉过 history ⇒ 用户点「停止」的那一刻
+   * 只能看到 `run_end` 分隔行，部分正文要刷新一次才出现。这里在**失败/中止终态**后补拉一次。
+   *
+   * - **复用既有归并路径**：只把 `partial_output` 交给 `addPartialOutput`（与 openSession 同一个
+   *   函数、同一份 `renderedIds` 幂等集，id = `partial:<run_id>`）⇒ 已渲染过就**不会出第二条**。
+   * - **其余事件故意不重放**：工具卡片幂等，但 `judge`/`round_start`/`attempt` 这些分隔行**不幂等**
+   *   （重放一遍就是刷屏），而它们本次也不是来取的东西。
+   * - **窗口参数不变**：openSession 拉 history 不传 `limit`/`before`（后端默认窗口），这里用**同一个
+   *   URL** ⇒ 不为了拿合成项把 limit 拉大到一个新数量级。合成项只出现在「该 run 真落在本次窗口里」
+   *   的那一页，拿不到就维持现状（后端契约的已知边界，不在本单）。
+   * - **失败静默**：不能把终态处理弄失败（§8.33 「自动改名降级是硬的」同口径）；内部全包在 try 里、
+   *   调用处 `void`，**不得漏出未捕获拒绝**。
+   */
+  function repullPartialOutput(d: RunEndPayload): void {
+    const sid = sessionId.value;
+    // renderedIds 为 null = 不在会话详情视图里（切目录/重置）⇒ 没有幂等集，宁可不补也不能重复渲染。
+    if (sid == null || renderedIds.value === null || !shouldRepullPartialOutput(d)) return;
+    const reqSeq = sessionReqSeq.value;
+    const ctx = ctxSeq.value;
+    void (async () => {
+      try {
+        const data = await api<{ events?: RunHistoryEvent[] }>(`/api/sessions/${encodeURIComponent(sid)}/events/history`);
+        if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value || sessionId.value !== sid) return; // 迟到的响应：已换会话
+        for (const ev of data?.events ?? []) {
+          if (ev && ev.type === 'partial_output') addPartialOutput(ev);
+        }
+      } catch {
+        /* 静默降级：界面维持现状（只多一个没成功的请求），终态 UI 与停止按钮不受影响 */
+      }
+    })();
   }
 
   // ---- addMessage（issue #40 渲染规则逐行平移）----
@@ -948,6 +994,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, addPartialOutput, send, stop, refreshSession,
+    // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。
+    repullPartialOutput,
     // issue #261B：一键「重试上一条」（lastSend/retryAvailable 仅内存；retryInFlight 驱动按钮禁用）
     lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数

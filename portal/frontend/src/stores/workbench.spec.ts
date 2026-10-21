@@ -1660,3 +1660,198 @@ describe('issue #279：DTO 投影路径的卡片身份含轮号（刷新后不�
     expect([...store.es.toolCards.keys()]).toEqual(['r1:c1']);
   });
 });
+
+// ===========================================================================
+// issue #306：点「停止」的那一刻就该看到部分正文，不必刷新一次。
+// `partial_output` **只在 GET /events/history 的响应期合成**（docs/api/portal.md §4.4a-1：不落库、
+// 不进 SSE），而此前只有 openSession 拉过 history ⇒ 终态后界面只有 run_end 分隔行。
+// 这里钉三件事：①失败/中止终态补拉**恰好一次**且**不重复渲染**；②成功收尾**零重拉**（成本红线：
+// dev 一个会话 14.4 万条事件）；③补拉失败**静默**（不许漏未捕获拒绝、不许弄坏终态 UI）。
+// ===========================================================================
+describe('issue #306：终态后补拉 history（partial_output 当场出现，成功收尾零重拉）', () => {
+  /** 最近一个 FakeEventSource（本文件里 lastES 定义在 #261B 那组的 describe 内，作用域够不到这里）。 */
+  function lastES() {
+    return FakeEventSource.instances.at(-1)!;
+  }
+
+  const partialEv = (text: string, runId = 'r1', seq = 8) => ({
+    seq, run_id: runId, type: 'partial_output', payload: { text, chunks: 3, truncated: false },
+  });
+
+  /** 二次以后才给出合成项（= 后端只在 run 终态后才合成，首次打开时确实拿不到）。 */
+  function stage(opts: { laterEvents?: unknown[]; failRepull?: boolean } = {}) {
+    const calls: string[] = [];
+    mockFetch((url) => {
+      calls.push(url);
+      if (url.includes('/api/sessions/s1/events/history')) {
+        const n = calls.filter((u) => u.includes('/events/history')).length;
+        if (n > 1 && opts.failRepull) return { status: 500, body: { code: 'internal', message: 'boom' } };
+        return { status: 200, body: { events: n > 1 ? (opts.laterEvents ?? [partialEv('已经做了一半')]) : [], next_cursor: null } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: { session: { id: 's1', active_run_id: 'r1' }, messages: [], last_seq: 7 },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    return { calls, historyCalls: () => calls.filter((u) => u.includes('/events/history')).length };
+  }
+
+  const settle = async () => {
+    for (let i = 0; i < 3; i += 1) await new Promise((r) => setTimeout(r, 0));
+  };
+  const partials = (store: ReturnType<typeof useWorkbenchStore>) => store.entries.filter((e) => e.kind === 'partial');
+
+  it('run_end(aborted) ⇒ 补拉**恰好一次** history，合成项当场出现且**只有一条**', async () => {
+    const stage_ = stage();
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(stage_.historyCalls()).toBe(1); // 打开会话只拉一次
+    expect(partials(store)).toHaveLength(0); // 首拉时后端还没合成 ⇒ 界面确实没有（缺陷现场）
+
+    lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason: 'aborted' } });
+    await settle();
+    expect(stage_.historyCalls()).toBe(2); // 恰一次补拉（窗口参数不变 ⇒ 同一个 URL，不加 limit）
+    expect(partials(store)).toHaveLength(1);
+    const [en] = partials(store);
+    expect(en && en.kind === 'partial' && en.text).toBe('已经做了一半');
+    expect(en && en.kind === 'partial' && en.id).toBe('partial:r1');
+  });
+
+  it('幂等：再来一次失败终态也不会出第二条（同一份 renderedIds）', async () => {
+    const stage_ = stage();
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason: 'aborted' } });
+    await settle();
+    expect(partials(store)).toHaveLength(1);
+    store.es.activeRunId = 'r2';
+    lastES().emit('run_end', { seq: 10, run_id: 'r2', termination: { reason: 'aborted' } });
+    await settle();
+    expect(stage_.historyCalls()).toBe(3); // 又补拉了一次（同一 run 的合成项不会因此重复）
+    expect(partials(store)).toHaveLength(1);
+  });
+
+  it('集合驱动，不只认 aborted：failed / persistence_failed 也补拉', async () => {
+    for (const reason of ['failed', 'persistence_failed', 'max_rounds_cap', 'final_guard_unverified']) {
+      const stage_ = stage();
+      const store = useWorkbenchStore();
+      await store.openSession('s1');
+      lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason } });
+      await settle();
+      expect(stage_.historyCalls(), `reason=${reason} 属 RUN_FAIL_REASONS ⇒ 必须补拉`).toBe(2);
+      expect(partials(store).length, `reason=${reason}`).toBe(1);
+    }
+  });
+
+  it('成本红线：成功收尾（end_turn / judge_done / no_tool）与集合外的截断态 ⇒ **零重拉**', async () => {
+    for (const reason of ['end_turn', 'judge_done', 'no_tool', 'stall', 'continuation_exhausted']) {
+      const stage_ = stage();
+      const store = useWorkbenchStore();
+      await store.openSession('s1');
+      lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason } });
+      await settle();
+      expect(stage_.historyCalls(), `reason=${reason} 不在 RUN_FAIL_REASONS ⇒ 一次 history 都不许多打`).toBe(1);
+      expect(partials(store)).toHaveLength(0);
+    }
+  });
+
+  it('缺 termination（旧帧/脏载荷）⇒ 按「不是失败」处理，零重拉', async () => {
+    const stage_ = stage();
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    lastES().emit('run_end', { seq: 9, run_id: 'r1' });
+    await settle();
+    expect(stage_.historyCalls()).toBe(1);
+  });
+
+  it('补拉失败 ⇒ 静默：漏不出未捕获拒绝，终态 UI（run_end 分隔行 / 停止按钮态）不受影响', async () => {
+    const leaked: unknown[] = [];
+    const hook = (reason: unknown) => { leaked.push(reason); };
+    process.on('unhandledRejection', hook);
+    try {
+      const stage_ = stage({ failRepull: true });
+      const store = useWorkbenchStore();
+      await store.openSession('s1');
+      lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason: 'aborted', detail: 'stopped by user' } });
+      await settle();
+      expect(stage_.historyCalls()).toBe(2); // 确实试过了
+      expect(partials(store)).toHaveLength(0); // 没拿到就维持现状（不推空气泡）
+      // 终态面照常：`aborted ∈ RUN_FAIL_REASONS` ⇒ useEventStream 走 **onSysErr**（红色告警行），
+      // 不是灰色 sep 分隔行（useEventStream.ts 的 run_end 分级分支）——写断言时按那条口径来。
+      const termLines = store.entries.filter((e) => e.kind === 'syserr');
+      expect(termLines.length).toBeGreaterThan(0);
+      expect(termLines.map((e) => ('text' in e ? e.text : '')).join('\n')).toContain('aborted');
+      expect(store.es.activeRunId).toBeNull(); // 运行态状态机照常收尾（store 代理上 ref 已解包，不能 .value）
+      expect(leaked.map(String), `漏出 ${leaked.length} 条未捕获拒绝`).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', hook);
+    }
+  });
+
+  it('没有幂等集（renderedIds=null）⇒ 不补拉：宁可不补，也不能重复渲染', async () => {
+    const stage_ = stage();
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(stage_.historyCalls()).toBe(1);
+    // 唯一变量就是幂等集：会话还在（sessionId 有值），但去重集被摘掉（selectDir/resetSessionView 的态）
+    // ⇒ 少了这道闸，这里就会白打一次请求并**每次都新推一条** partial（没有去重集可用）。
+    store.renderedIds = null;
+    store.repullPartialOutput({ termination: { reason: 'aborted' } } as never);
+    await settle();
+    expect(stage_.historyCalls()).toBe(1);
+    expect(partials(store)).toHaveLength(0);
+  });
+
+  it('补拉复用同一个 URL（**不为了拿合成项放大 limit**）', async () => {
+    const stage_ = stage();
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason: 'aborted' } });
+    await settle();
+    const urls = stage_.calls.filter((u) => u.includes('/events/history'));
+    expect(urls[1]).toBe(urls[0]); // 窗口参数逐字相同
+    expect(urls[0]).not.toMatch(/limit=|before=/);
+  });
+
+  it('迟到响应：补拉回来时已换会话 ⇒ 丢弃（不把上一个会话的部分正文推进当前流）', async () => {
+    // ⚠ 不能用本文件的 mockFetch：它把 handler 的返回值**同步解构**成 {status, body}，给它一个
+    // Promise 会被解成 {undefined, undefined} ⇒ 响应形同失败，守卫根本没被经过（变异试过，全绿）。
+    // 所以这里自己 stub 一个可 await 的 fetch，让**补拉那一次**真的挂到换会话之后才回来。
+    let fire: (() => void) | null = null;
+    let s1HistoryCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/api/sessions/s1/events/history')) {
+        s1HistoryCalls += 1;
+        if (s1HistoryCalls === 2) {
+          await new Promise<void>((r) => { fire = r; }); // 卡住：等用户切走之后再回来
+          return jsonResponse(200, { events: [partialEv('上一个会话的半截', 'r1')], next_cursor: null });
+        }
+        return jsonResponse(200, { events: [], next_cursor: null }); // 首拉：还没有合成项
+      }
+      if (url.includes('/api/sessions/s2')) {
+        return jsonResponse(200, { session: { id: 's2', active_run_id: null }, messages: [], last_seq: 1 });
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return jsonResponse(200, { session: { id: 's1', active_run_id: 'r1' }, messages: [], last_seq: 7 });
+      }
+      return jsonResponse(200, { items: [] });
+    }));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason: 'aborted' } });
+    await settle();
+    expect(s1HistoryCalls, '补拉请求必须真的发出去过（否则这条用例什么都没测）').toBe(2);
+    expect(fire, '补拉必须还挂在途上（已经回来就测不到代次守卫）').toBeTypeOf('function');
+    // 顺序是关键：**先换会话**（s2 的幂等集是全新的，`partial:r1` 不在里面），再让补拉的响应回来。
+    // 反过来做的话 openSession('s2') 自己就把 entries 清空了 ⇒ 迟到的那条被顺手抹掉，守卫没被经过。
+    await store.openSession('s2');
+    fire?.();
+    await settle();
+    expect(store.sessionId).toBe('s2');
+    expect(partials(store)).toHaveLength(0); // 守卫生效：不把 s1 的部分正文推进 s2 的流
+  });
+});
