@@ -9,6 +9,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { transcriptStoreContract } from 'erix-agent/contract-tests';
 import { makeStore } from '../lib/store.js';
+// #333 M2：peer 桩模拟的是 **portal internal 端点**的轮记录语义 ⇒ 幂等/冲突判据必须与 portal
+// 用同一把尺，不得在 runner 侧另抄一份。测试面跨包引 portal 源码有先例
+// （`runner/test/system-prompt.test.js:173` 引 `portal/src/previewpool.js`）；
+// runner 的**运行期**代码（lib/store.js、agentd.js）仍零 portal 依赖——判据本来就在 portal 侧。
+import {
+  payloadFingerprint, samePayload, dedupPayloadConflict, transcriptRecordKey,
+} from '../../portal/src/transcript-payload.js';
 import { STORE_METHODS } from '../lib/ipc.js';
 
 /** 内存 IPC peer 桩：模拟 agentd → portal internal 端点的 store 语义。 */
@@ -30,22 +37,29 @@ function createFakeAgentdPeer() {
           // 同 dedupKey 不同 body → round_conflict）。无 dedupKey 的契约记录（ROUND_1 等）视为唯一追加。
           const list = transcripts.get(runId) ?? [];
           const record = structuredClone(args.record);
-          const dedupKey = typeof record?.dedupKey === 'string' && record.dedupKey !== ''
-            ? record.dedupKey
-            : `__auto:${list.length}`;
+          // 键的取法 = 上游 recordKey / runner lib/ipc.js normalizeRoundRecord 同式
+          // （dedupKey ?? roundKey ?? `<key>:round:<n>`；原先的 `__auto:<n>` 自造哨兵会让契约
+          // 第 22 条的隐式键断言与「同 payload 重放幂等」双双失效）。
+          const dedupKey = transcriptRecordKey(runId, record);
           const existing = list.find((entry) => entry.dedupKey === dedupKey);
           if (existing) {
-            if (JSON.stringify(existing.record) === JSON.stringify(record)) {
-              return { inserted: false }; // 幂等命中
-            }
+            // 判据 = portal 的 payload 指纹（顶层 ts/round 漂了仍算重放；数组顺序/宿主字段算内容）。
+            if (samePayload(existing.record, record)) return { inserted: false }; // 幂等命中
             if (record.folded === true && existing.record.folded !== true) {
               existing.record = record; // fold 更新（同 dedupKey）
               return { inserted: true };
             }
-            const err = new Error('round_conflict');
-            err.code = 'round_conflict';
-            err.retryable = false;
-            throw err;
+            // store 面（引擎看得见的这一面）按随包契约用 `dedup_payload_conflict` 这个 code；
+            // 真系统里 portal internal 端点回的是 409 `round_conflict`（零新错误码），两面同方向
+            // 且都不可重试 ⇒ adapter 一律上抛 ⇒ 引擎按持久化失败处理。
+            throw dedupPayloadConflict({
+              runId,
+              key: dedupKey,
+              existing: existing.record,
+              incoming: record,
+              existingFingerprint: payloadFingerprint(existing.record),
+              incomingFingerprint: payloadFingerprint(record),
+            });
           }
           list.push({ dedupKey, record }); // 数组序 = 持久化追加序
           transcripts.set(runId, list);
