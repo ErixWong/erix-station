@@ -569,7 +569,13 @@ async function startRun(msg) {
       // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
       // nearLimit 时可 extend 扩轮；judgeIntercept 默认开（工具透明审计）。judge 输出非法
       // JSON 时 fail-closed 不扩轮（roundJudgeFailures 限 3 后本轮禁用）。wrapup 保持关（对话型宿主）。
-      reflection: { enabled: true, roundJudge: true },
+      // erix-agent 0.22 新增（**上游缺省 false = 不开**，`orchestrator.js:1304-1308`）：
+      // 评审判「目标已达成」且置信度够（`>= JUDGE_DONE_CONFIDENCE_THRESHOLD`）时，把那句评审意见
+      // **作为一条普通文本消息注入下文**（软提示，不硬断 run、不改 termination）。
+      // 决策：2026-10-21 决策者要求默认开。**故意不给 env 旋钮**（#331 那根死光纤的前例：
+      // 下发一根没人读的光纤 = 多一个假旋钮）。注入行的 marker = `meta.source === 'judge-control'`，
+      // 取数面已在 `portal/src/session-view.js` 里排掉（界面上不显示，也不当用户原话去起标题）。
+      reflection: { enabled: true, roundJudge: true, judgeDoneAdvisory: true },
       wrapup: false,
       // 7) signal
       signal: abortController.signal,

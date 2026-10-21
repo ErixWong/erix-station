@@ -101,16 +101,39 @@ export function compareTranscriptRows(a, b) {
   return 0;
 }
 
-/** 该行的真实用户文本（排除引擎注入的合成消息，避免注入文本抢认锚点）。
+/** 引擎注入的控制文本（erix-agent 0.22 `meta.source === 'judge-control'`）：advisory / 强制收尾指令等，
+ * 不是人说的话 ⇒ 不进标题素材 / 终态比较 / 锚点认领。
+ *
+ * ⚠ **逐条消息判，不按整行判**：0.22 的 `…:control:forced-final` 同一行里**既带** marker 的注入指令
+ * （role=user）**又带**不带 marker 的真终稿（role=assistant），按行过滤会把终稿一起吞掉
+ * （#300 之后那就是「中止/失败 run 正文又空了」）。
+ *
+ * 诚实记录今天的有性（实测，不是推测）：0.22 的 `projectTranscriptForDisplay` 会给带 `meta.source`
+ * 的 **user 角色**消息**另外打 `synthetic: true`** ⇒ 下面那条 `meta?.synthetic !== true` 早已把它拦住
+ * （= 界面正文本来就不漏的真原因）。本条因此是**冗余守卫**：上游一旦不再打 synthetic，没它就漏。
+ * 它只能在「直接喂 turn 对象」的用例里被测到 —— 变异实测：撤掉本条**只有那一条**用例会红。
+ * **assistant 角色故意不加这道守卫**：同一个投影对 assistant 消息会**连 `meta.source` 一起抹掉**
+ * （实测：投影后 `meta` 只剩 `{ synthetic:false, dedupKey }`）⇒ 宿主侧看不到 marker，写了也接不住
+ * （要接住得上游别抹）。该上游口径已钉成用例（portal/test/session-view-judge-control.test.js）。 */
+function isEngineControlTurn(turn) {
+  return turn?.meta?.source === 'judge-control';
+}
+
+/** 该行的真实用户文本（排除引擎注入的合成消息与控制文本，避免注入文本抢认锚点 / 当标题素材）。
  *  P3 PR②b：`session-text.js`（标题 / claim task / 历史上行等文本读取点）复用同一口径，勿另写一份。 */
 export function userTurnTexts(turns) {
   return turns
-    .filter((turn) => turn.role === 'user' && turn.meta?.synthetic !== true && turn.folded !== true)
+    .filter((turn) => turn.role === 'user'
+      && turn.meta?.synthetic !== true
+      && turn.folded !== true
+      && !isEngineControlTurn(turn))
     .map((turn) => turn.text)
     .filter((value) => typeof value === 'string' && value !== '');
 }
 
 /** 该行的助手正文：投影已把 reasoning 与 tool-only 轮次分离，取最后一条非空文本（= 最终答复）。
+ *  故意**不**按 `meta.source` 排控制文本：投影对 assistant 消息已把该字段抹掉，宿主侧无从判据
+ *  （见上方 `isEngineControlTurn` 注释）；0.22 的控制文本也只注入 role=user。
  *  P3 PR②b：同样供 `session-text.js` 复用（终态幂等比较的 final_text 取数）。 */
 export function assistantTurnText(turns) {
   const text = turns

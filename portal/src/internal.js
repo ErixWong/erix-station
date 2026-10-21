@@ -13,6 +13,7 @@ import { allocSeq } from './seq.js';
 import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
+import { samePayload, dedupConflictDetails } from './transcript-payload.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -34,7 +35,10 @@ export class InternalError extends Error {
   }
 }
 
-/** 规范化 JSON（键递归排序）——幂等 body hash 的稳定输入（portal.md §9.6/§9.7）。 */
+/** 规范化 JSON（键递归排序）——幂等 body hash 的稳定输入（portal.md §9.6/§9.7）。
+ *  ⚠ 只适用于「整份载荷逐字比」的场景（终态载荷、请求体幂等位）；**transcript 轮记录的
+ *  幂等/冲突判据不得用它**——它把顶层 `ts`/`round` 也算进哈希，引擎崩溃重跑必伪报冲突（#333 M2），
+ *  那边用 `./transcript-payload.js` 的 payload 指纹。 */
 export function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -1036,7 +1040,12 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   if (ex.record?.dedupKey !== dedupKey) {
     throw new InternalError(409, 'round_conflict', '同 round 已存在且 dedupKey 不同', { details: { round } });
   }
-  if (canonicalHash(ex.record) === canonicalHash(record)) {
+  // #333 M2：轮记录的幂等/冲突判据 = **payload 指纹**（共用件 `./transcript-payload.js`，口径与
+  // 上游 `erix-agent/src/store/transcript-dedup.js` 逐字对齐）：只剔**顶层**
+  // `dedupKey`/`roundKey`/`round`/`ts`（它们就是 key 本身 / 写盘派生 / 墙钟）；嵌套层的 `ts`、
+  // 数组顺序、宿主自有字段照旧算内容。旧判据 `canonicalHash(整条 record)` 把顶层 ts/round 也算
+  // 进哈希 ⇒ 引擎崩溃重跑形状必被伪报成冲突（长注释见 putSessionRound 处）。
+  if (samePayload(ex.record, record)) {
     return { inserted: false }; // 幂等命中
   }
   // fold 更新：同 dedupKey、folded false→true 视为合法 UPDATE（runner §9.3）。
@@ -1048,7 +1057,11 @@ export async function putRound(pool, { container, user, runId, round, claimToken
     );
     return { inserted: true };
   }
-  throw new InternalError(409, 'round_conflict', '同 round 已存在且 body 不同', { details: { round } });
+  // 真冲突：零新错误码——依旧 409 `round_conflict`，只把两份指纹与差异顶层字段附进 details
+  // （错误信封对未知键透传，旧容器不读也不挂）。
+  throw new InternalError(409, 'round_conflict', '同 round 已存在且 body 不同', {
+    details: { round, dedupKey, ...dedupConflictDetails(ex.record, record) },
+  });
 }
 
 export async function getTranscript(pool, { container, user, runId, claimToken, limit = 10000, cursor = null }) {
@@ -1255,7 +1268,17 @@ export async function putSessionRound(pool, { container, user, key, round, claim
   const ex = existing.rows?.[0];
   if (!ex) return { inserted: true }; // 理论上不可达（并发已由 ON CONFLICT 序列化）
 
-  if (canonicalHash(ex.record) === canonicalHash(record)) {
+  // #333 M2（本单最高危的一条）：**引擎轮记录走的就是本端点**（runner `makeStore().appendRound`
+  // → agentd → `PUT /transcript/:key/rounds/:round`），幂等/冲突判据与 U5 putRound 共用同一个件
+  // （`./transcript-payload.js`）：**只剔顶层** `dedupKey`/`roundKey`/`round`/`ts`。
+  // 0.22 引擎新写的三类补充行（`…:control:<slot>` / `…:fold:<fp>` / `…:ttl:<fp>`，
+  // `orchestrator.js:2123`/`:2145`）每次写都带 `ts: new Date()` ⇒ resume 重放同一个 dedupKey
+  // 必然拿到新 ts（宿主预写行的 `round` 同理，它取 store 现有最大 round）；旧「整条 record 哈希」
+  // 判据下本站回 `409 round_conflict`，而 `runner/lib/store.js` 对非 2xx **既不分流也不给可重试
+  // 信号**（全文 grep 不到任何 409 / round_conflict 分支）⇒ 引擎按持久化失败处理，终局
+  // `persistence_failed`。⇒ 同一把尺：**同 key + 同 payload（按上述排除口径）= 幂等 2xx ack**，
+  // **真 payload 差异 = 仍 409 `round_conflict`（零新错误码）**。不发这一半可以，发一半不行。
+  if (samePayload(ex.record, record)) {
     return { inserted: false }; // 幂等命中（崩溃重跑红线：绝不产生重复 user 消息）
   }
   // fold 更新：同 dedupKey、folded false→true 视为合法 UPDATE（同 run 作用域 U5 语义）。
@@ -1267,7 +1290,10 @@ export async function putSessionRound(pool, { container, user, key, round, claim
     );
     return { inserted: true };
   }
-  throw new InternalError(409, 'round_conflict', '同 dedupKey 已存在且 body 不同', { details: { dedupKey } });
+  // 真冲突：同 U5——零新错误码（仍 409 `round_conflict`，details 多带两份指纹 + 差异顶层字段）。
+  throw new InternalError(409, 'round_conflict', '同 dedupKey 已存在且 body 不同', {
+    details: { dedupKey, ...dedupConflictDetails(ex.record, record) },
+  });
 }
 
 /** session transcript 全量读取（load 分页；行序 = round ASC, append_seq ASC——行号可复用，
