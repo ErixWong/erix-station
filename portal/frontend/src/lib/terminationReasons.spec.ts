@@ -41,7 +41,10 @@ describe('termination reason 单一常量（issue #212）', () => {
     // 0.20.0 → 0.22.0（#333）三度核：`src/providers/payload.js`/`timeout.js`/`errors.js` 与 0.20.0
     // **逐字节相同**，对 0.22.0 的 `orchestrator.js` 取到的仍是同一组九值⇒ 仍只追版本号，
     // 下面九值断言一字未改（不放宽任何断言，§8.27 先例）。
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.22.0');
+    // 0.22.0 → 0.23.0（#337 升级片）四度核：整个 `src/providers/` 目录与 `src/loop/termination.js`
+    // 与 0.22.0 **逐字节相同**（`diff` 无输出），0.23.0 的 `orchestrator.js` typedef 取到的仍是同一组
+    // 九值（顺序、拼写全同，只是行号下移 1 行）⇒ 仍只追版本号，下面九值断言一字未改。
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.23.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 
