@@ -4,6 +4,7 @@
 //   ③ 错误展示取服务端 error.message；④ 登出后回到未登录态。
 import { defineStore } from 'pinia';
 import { api, ApiError, toDisplayText } from '../api';
+import { seatAwareLanding } from '../lib/workbenchGate';
 
 export interface AuthUser {
   id: string;
@@ -60,9 +61,11 @@ export interface ChangePasswordError {
 }
 
 // afterLoginRoute：admin 且无 fde_name（平台管理员）→ /admin（默认重定向至 /admin/users）；其余回工作台。
-export function afterLoginRoute(user: AuthUser): string {
-  if (user && user.role === 'admin' && !user.fde_name) return '/admin';
-  return '/';
+// issue #332：判据与落点**不在这里抄第二份**——工作台准入闸（lib/workbenchGate.workbenchGateDecision）
+// 与共用的 `seatAwareLanding` 是同一个函数 ⇒「登录后去哪」与「工作台放不放人」不可能漂移；
+// 第 ② 类人（role=admin 但 fde_name 有值）两边都回 `/`（他能进工作台，也保留管理台入口）。
+export function afterLoginRoute(user: AuthUser | null | undefined): string {
+  return seatAwareLanding(user);
 }
 
 export const useAuthStore = defineStore('auth', {

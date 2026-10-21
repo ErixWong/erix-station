@@ -180,12 +180,10 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
     {{ t('stream.sessionStats', { count: store.sessionStats.messages }) }}<template v-if="store.sessionStats.folded > 0"> · {{ t('stream.sessionStatsCompacted', { count: store.sessionStats.folded }) }}</template>
     <span v-if="store.sessionStats.folded >= 1" class="session-compaction-hint block">{{ t('stream.sessionCompactionHint') }}</span>
   </p>
-  <!-- 空态：旧版「选择或新建会话」默认文案（平台管理员进管理台引导） -->
+  <!-- 空态：旧版「选择或新建会话」默认文案（issue #332：曾按 `noDir && isPlatformAdmin` 分叉去
+       引导「进管理台」，入口拦截后该形状不可达 ⇒ 分支已删，只剩这一条） -->
   <div v-if="store.entries.length === 0">
-    <p v-if="store.noDir && store.isPlatformAdmin" class="muted">
-      {{ t('common.platformAdminHint') }}<br><router-link to="/admin" class="underline">{{ t('common.goToAdmin') }}</router-link>
-    </p>
-    <p v-else class="muted">{{ t('stream.chooseOrNewSession') }}</p>
+    <p class="muted">{{ t('stream.chooseOrNewSession') }}</p>
   </div>
 
   <template v-for="(en, i) in store.entries" :key="entryKey(en, i)">

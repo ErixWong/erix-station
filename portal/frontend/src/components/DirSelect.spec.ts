@@ -57,21 +57,14 @@ describe('DirSelect（目录下拉）', () => {
     expect(select.element.value).toBe('~/projects/a'); // 弹回
   });
 
-  it('无目录：显示占位选项；平台管理员「＋ 新建目录」禁用', async () => {
-    const { store, wrapper } = setup([]);
-    store.noDir = true;
+  it('无目录：显示「（无目录）」占位选项，且「＋ 新建目录」仍可选', async () => {
+    const { wrapper } = setup([]);
     await wrapper.vm.$nextTick();
     expect(wrapper.findAll('option')[0]?.text()).toBe('（无目录）');
-
-    const store2 = useWorkbenchStore();
-    store2.dirs = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
-    store2.dirCwd = '~/projects/a';
-    store2.isPlatformAdmin = true;
-    const wrapper2 = mount(DirSelect, { props: {}, global: { plugins: [i18n] } });
-    await wrapper2.vm.$nextTick();
-    expect(store2.newDirDisabled).toBe(true);
-    const opt = wrapper2.findAll('option').find((o) => o.text() === '＋ 新建目录');
-    expect(opt?.attributes('disabled')).toBeDefined();
+    // issue #332：这里原先还钉「平台管理员 ⇒ 该选项 disabled」。入口拦截后没有工位的平台管理员
+    // 进不到工作台，`store.newDirDisabled` 已拆除 ⇒ 这里改钉「选项恒可用」，防它被顺手加回来。
+    const opt = wrapper.findAll('option').find((o) => o.text() === '＋ 新建目录');
+    expect(opt?.attributes('disabled')).toBeUndefined();
   });
 
   // issue #112：控件收敛——32px 高 / 7px 圆角 / 12px 字号（label 11px）。
