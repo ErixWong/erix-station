@@ -612,6 +612,8 @@ export const en = {
   errors: {
     requestFailed: 'Request failed (HTTP {status})',
     sessionLoadFailed: 'Failed to load the session; refresh to retry',
+    // issue #281：与 zh-CN 成对（localeParity 钉住两份键集一致）。
+    workspaceLoadFailed: 'Failed to initialize the workspace: {message} (refresh to retry; contact your admin if it keeps failing)',
     createSessionFailed: 'Failed to create session: {message}',
     stopFailed: 'Failed to stop: {message}',
     dirNameInvalid:

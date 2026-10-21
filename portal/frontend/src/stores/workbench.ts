@@ -12,8 +12,9 @@
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
 import { api, ApiError, patchSessionTitle, postSessionAiTitle, toDisplayText } from '../api';
+import { projectionRoundToken, runSegment, toolCardKey as buildToolCardKey } from '../lib/toolCardKey';
 import { i18n } from '../i18n';
-import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
+import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
@@ -168,16 +169,32 @@ export function setWorkbenchHooks(h: WorkbenchHooks): void {
 }
 
 /**
- * issue #188 工具卡片 key：优先上游 provider `id`——它与实时/历史事件流的 `tool_call_id` 同源，
- * 两条路据此天然幂等归并（同一调用只渲染一张卡片）。`id` 缺失/重复由 provider 决定（可缺失/可重复）；
- * erix-agent 0.16.0 起上游为每个 toolCall 提供稳定视图键 `call.key`（由输入位置生成、单次投影内唯一、
- * 同输入确定性；**不是持久 ID、也不是 provider `tool_use.id`**）→ `id` 缺失时用它作卡片身份，
- * 不再自造 `proj:<锚点 id>:<序号>`（仅当 `id`/`key` 都缺失时保留该兜底）。
+ * issue #188 工具卡片身份（**投影路径**）。issue #279 后与实时路共用 `lib/toolCardKey.ts` 那一把尺：
+ *   * `id` 在 ⇒ 身份 = `<run_id>:<轮号>:<id>`。轮号**不伪造**：取上游投影键 `call.key` 自带的轮号段
+ *     （erix-agent `projection.js:449-455`：`"<round>#<recordIndex>:<entryIndex>:t<i>"`，轮号缺位时
+ *     上游自己写 `?`）——它与实时路观测到的 `round_start.round` 是引擎同一个轮计数器，所以实时卡片
+ *     与刷新后的投影卡片仍归并成一张（§8.5「与实时 `tool_call_id` 同源 ⇒ 天然归并」仍成立，只是
+ *     现在多了一段轮号）。同时把 `id`/`run_id` 作为**关联别名**交给下游索引：两路轮号真对不上时
+ *     （实时漏收 round_start）用索引归并，不得拿它造身份。
+ *   * `id` 缺、`key` 在 ⇒ 直接用上游 `key`（§8.5，它本身就含轮号 ⇒ 跳轮不碰撞，无需再拼）。
+ *   * 两者都缺 ⇒ `proj:<锚点 id>:<序号>` 兜底照旧。
+ * ⚠ §8.5 那句「投影 `key` 不是持久 ID、也不是 provider `tool_use.id`」仍然成立：这里只**从它里
+ * 面取轮号**，没有把它当跨投影耐久的身份。
  */
-function toolCallKey(messageId: string, call: ProjectedToolCall, index: number): string {
-  if (typeof call.id === 'string' && call.id !== '') return call.id;
-  if (typeof call.key === 'string' && call.key !== '') return call.key;
-  return `proj:${messageId}:${index}`;
+function toolCardIdentity(messageId: string, messageRunId: string | null | undefined, call: ProjectedToolCall, index: number): {
+  key: string;
+  alias?: CardAlias;
+} {
+  const id = typeof call.id === 'string' && call.id !== '' ? call.id : null;
+  if (id !== null) {
+    const roundToken = projectionRoundToken(call.key);
+    return {
+      key: buildToolCardKey(messageRunId, roundToken, id),
+      alias: { key: buildToolCardKey(messageRunId, roundToken, id), runId: runSegment(messageRunId), roundToken, callId: id },
+    };
+  }
+  if (typeof call.key === 'string' && call.key !== '') return { key: call.key };
+  return { key: `proj:${messageId}:${index}` };
 }
 
 /**
@@ -242,6 +259,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       notifyRunEnd(d);
       applyRetryFaceOnRunEnd(d); // issue #261B：失败终局 → 点亮「重试上一条」
       refreshSession(d.run_id);
+      repullPartialOutput(d); // issue #306：中止/失败终局 → 补一次 history，让合成项当场出现
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
     onSessionUpdated: (d) => {
@@ -299,6 +317,51 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     retryAvailable.value = false;
   }
 
+  // ---- issue #306：终态后补一次 history，让 `partial_output` 当场出现（不必刷新）----
+  /**
+   * 要不要重拉。**条件故意窄**：只有 `termination.reason ∈ RUN_FAIL_REASONS` 才拉。
+   * `aborted` 本身就在那一个集合里（`lib/terminationReasons.ts` 的 RUN_FAIL_REASON_LIST），所以
+   * 不另开一份枚举；`end_turn` / `no_tool` / `judge_done` / `stall` 等**零重拉**——那类 run 本来就有
+   * 助手锚点（判据②不成立，后端也不会合成），白打一次 history 是纯成本（dev 一个会话 14.4 万条事件）。
+   */
+  function shouldRepullPartialOutput(d: RunEndPayload): boolean {
+    return RUN_FAIL_REASONS.has(d.termination?.reason ?? '');
+  }
+
+  /**
+   * issue #306：`partial_output` **只在 `GET /events/history` 的响应期合成**（docs/api/portal.md
+   * §4.4a-1：不落库、不进 SSE），而此前只有 `openSession` 拉过 history ⇒ 用户点「停止」的那一刻
+   * 只能看到 `run_end` 分隔行，部分正文要刷新一次才出现。这里在**失败/中止终态**后补拉一次。
+   *
+   * - **复用既有归并路径**：只把 `partial_output` 交给 `addPartialOutput`（与 openSession 同一个
+   *   函数、同一份 `renderedIds` 幂等集，id = `partial:<run_id>`）⇒ 已渲染过就**不会出第二条**。
+   * - **其余事件故意不重放**：工具卡片幂等，但 `judge`/`round_start`/`attempt` 这些分隔行**不幂等**
+   *   （重放一遍就是刷屏），而它们本次也不是来取的东西。
+   * - **窗口参数不变**：openSession 拉 history 不传 `limit`/`before`（后端默认窗口），这里用**同一个
+   *   URL** ⇒ 不为了拿合成项把 limit 拉大到一个新数量级。合成项只出现在「该 run 真落在本次窗口里」
+   *   的那一页，拿不到就维持现状（后端契约的已知边界，不在本单）。
+   * - **失败静默**：不能把终态处理弄失败（§8.33 「自动改名降级是硬的」同口径）；内部全包在 try 里、
+   *   调用处 `void`，**不得漏出未捕获拒绝**。
+   */
+  function repullPartialOutput(d: RunEndPayload): void {
+    const sid = sessionId.value;
+    // renderedIds 为 null = 不在会话详情视图里（切目录/重置）⇒ 没有幂等集，宁可不补也不能重复渲染。
+    if (sid == null || renderedIds.value === null || !shouldRepullPartialOutput(d)) return;
+    const reqSeq = sessionReqSeq.value;
+    const ctx = ctxSeq.value;
+    void (async () => {
+      try {
+        const data = await api<{ events?: RunHistoryEvent[] }>(`/api/sessions/${encodeURIComponent(sid)}/events/history`);
+        if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value || sessionId.value !== sid) return; // 迟到的响应：已换会话
+        for (const ev of data?.events ?? []) {
+          if (ev && ev.type === 'partial_output') addPartialOutput(ev);
+        }
+      } catch {
+        /* 静默降级：界面维持现状（只多一个没成功的请求），终态 UI 与停止按钮不受影响 */
+      }
+    })();
+  }
+
   // ---- addMessage（issue #40 渲染规则逐行平移）----
   /**
    * issue #300：历史合成项 `partial_output` → 中性 partial entry。
@@ -333,7 +396,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       m.toolCalls.forEach((call, index) => {
         // issue #283：整个 call（含宿主 join 的 `durationMs`）一并交给 projectToolCard——
         // 刷新后卡片仍能显示耗时，但实时路已拿到的值不会被它覆盖（覆盖规则在 composable 里）。
-        es.projectToolCard(toolCallKey(m.id, call, index), call);
+        // issue #279：身份键与实时路同一把尺（含轮号），另把 provider `id`/`run_id` 作为关联别名传过去。
+        const ident = toolCardIdentity(m.id, m.run_id, call, index);
+        es.projectToolCard(ident.key, call, ident.alias);
       });
     }
     // 仅助手终稿渲染 Markdown 子集（先转义后格式化，XSS 安全）；用户消息与系统注入
@@ -751,6 +816,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });
       return;
     }
+    // issue #281：`session` 本身可能就是**缺的**（旧后端/网关改写回包、200 但没 `session` 键）。
+    // 旧代码在这里直接读 `session.cwd` ⇒ `TypeError: Cannot read properties of undefined (reading
+    // 'cwd')`，而它在 onMounted 的 await 链上 ⇒ 变成 Unhandled Rejection（AGENTS §8.20 记的那处，
+    // 行号已漂到这一行）。判空后**照样报可见错误**——判空不是吞掉真实错误，只是不再拿 TypeError 代替它。
+    if (session == null || typeof session !== 'object') {
+      entries.value.push({ kind: 'syserr', text: t('errors.sessionLoadFailed') });
+      return;
+    }
     // issue #84 P5：跨目录深链——会话详情带 cwd，切到其目录（磁盘推导视图必有该目录；
     // 防御性兜底：列表缺项时合成一个，避免下拉空白）。
     const cwd = session.cwd;
@@ -763,6 +836,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await openSession(sid);
     // 评审修复：selectDir 会清路由（旧版抹 hash），这里把深链写回（replace 无害 no-op）。
     workbenchHooks.onDeepLinkRestored?.(sid);
+  }
+
+  /**
+   * issue #281：把一条**人看得见**的错误推进消息流（复用既有 `.syserr` 红色错误行，**不新增 UI
+   * 结构**）。给 `onMounted` 这类「Vue 不等的异步钩子」用：失败必须落到界面上，而不是只活在控制台。
+   * 文案由调用方过 `toDisplayText` 收口（不许渗 `[object Object]` / `undefined`）。
+   */
+  function pushStreamError(text: string): void {
+    entries.value.push({ kind: 'syserr', text });
   }
 
   /** issue #55 B1：会话不存在/popstate 回退 → 静默回默认视图（不动项目/会话列表，只清详情区）。 */
@@ -929,6 +1011,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, addPartialOutput, send, stop, refreshSession,
+    pushStreamError,
+    // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。
+    repullPartialOutput,
     // issue #261B：一键「重试上一条」（lastSend/retryAvailable 仅内存；retryInFlight 驱动按钮禁用）
     lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数
