@@ -2,7 +2,8 @@
 //   ① 固定头（shrink-0：DirSelect + ＋新会话按钮，不随列表滚动）
 //   ② 会话列表段（flex-1 min-h-0 overflow-y-auto，独立内部滚动；空态文案在此段内）
 //   ③ 目录树面板（DirectoryTree，固定底部、恒可达，shrink-0 透传到其根元素）
-// 另覆盖：空态文案（「先创建目录」/「暂无会话」/平台管理员提示）、会话点击 emit 语义保持。
+// 另覆盖：空态文案（「先创建目录」/「暂无会话」）、会话点击 emit 语义保持。
+// issue #332：这里原有「平台管理员提示 + 进入管理台链接」的空态分支已随**入口拦截**拆除（`admin && !fde_name` 的人被路由守卫送去 /admin，走不到工作台）；本文件里的 admin 夹具因此换成第 ② 类人（admin **且**有 fde_name）——他才是能站上工作台的管理员。
 // store 状态直填、fetch 桩掉（不碰真实后端）；路由用 memory-history 的真实 router（router-link 渲染需要）。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
@@ -25,7 +26,7 @@ beforeEach(() => {
 });
 
 async function mountPanel(
-  opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; platformAdmin?: boolean; attachTo?: boolean } = {},
+  opts: { dirs?: DirInfo[]; sessions?: Session[]; noDir?: boolean; adminUser?: boolean; attachTo?: boolean } = {},
   attrs: Record<string, unknown> = {},
 ) {
   const store = useWorkbenchStore();
@@ -33,10 +34,11 @@ async function mountPanel(
   store.dirCwd = opts.dirs?.[0]?.cwd ?? null;
   store.sessions = opts.sessions ?? [];
   store.noDir = opts.noDir ?? false;
-  if (opts.platformAdmin) store.isPlatformAdmin = true;
+  // issue #332：isPlatformAdmin 已从 store 拆除；「是不是管理员」只影响顶栏那个「管理台」入口
+  // （判据 `auth.user?.role === 'admin'`），而能站上工作台的 admin 必然**同时有工位** ⇒ 夹具给第 ② 类人。
   const auth = useAuthStore();
-  auth.user = opts.platformAdmin
-    ? { id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local' }
+  auth.user = opts.adminUser
+    ? { id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local' }
     : { id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local' };
   // 已探测过：路由守卫不再打 /api/me（否则 fetch 桩的响应会把刚置的 user 覆写成 undefined）。
   auth.ready = true;
@@ -100,20 +102,20 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
     expect(list.textContent).toContain('s2');
   });
 
-  it('空态文案随列表段：「先创建目录」/「暂无会话」/平台管理员提示都在滚动段内', async () => {
+  it('空态文案随列表段：「先创建目录」/「暂无会话」都在滚动段内', async () => {
     // 无目录普通用户：「先创建目录」
     const w1 = await mountPanel({ noDir: true });
     const { list: l1, head: h1 } = paneEls(w1);
     expect(l1.textContent).toContain('先创建目录');
     expect(h1.textContent).not.toContain('先创建目录');
 
-    // 无目录平台管理员：管理台提示（含「进入管理台」链接）
-    const w2 = await mountPanel({ noDir: true, platformAdmin: true });
+    // issue #332：原本这里还钉「无目录的平台管理员 ⇒ 管理台提示 + 进入管理台链接」。
+    // 入口拦截后他到不了工作台 ⇒ 分支与文案一起删；这里改钉「有工位的人（含第 ② 类人 admin）只看到建目录引导」。
+    const w2 = await mountPanel({ noDir: true, adminUser: true });
     const { list: l2 } = paneEls(w2);
-    expect(l2.textContent).toContain('平台管理员：请到管理台创建 FDE 用户与分配资源');
-    const adminLink = Array.from(l2.querySelectorAll('a')).find((a) => a.textContent === '进入管理台');
-    expect(adminLink).toBeDefined();
-    expect(adminLink!.getAttribute('href')).toContain('/admin');
+    expect(l2.textContent).toContain('先创建目录');
+    expect(l2.textContent).not.toContain('请到管理台');
+    expect(Array.from(l2.querySelectorAll('a'))).toHaveLength(0);
 
     // 有目录无会话：「暂无会话」
     const w3 = await mountPanel({
@@ -227,9 +229,10 @@ describe('SidebarPanel · 左栏视觉收敛（issue #112）', () => {
     expect(p2.textContent).toBe('先创建目录');
     expect(p2.classList).toContain('text-[11px]');
 
-    const w3 = await mountPanel({ noDir: true, platformAdmin: true });
+    // issue #332：第 ② 类人（admin 且有工位）的空态与普通 FDE 同一条文案，字号同 11px。
+    const w3 = await mountPanel({ noDir: true, adminUser: true });
     const p3 = paneEls(w3).list.querySelector('p')!;
-    expect(p3.textContent).toContain('平台管理员');
+    expect(p3.textContent).toBe('先创建目录');
     expect(p3.classList).toContain('text-[11px]');
   });
 
@@ -250,7 +253,7 @@ describe('SidebarPanel · 左栏视觉收敛（issue #112）', () => {
   });
 
   it('侧栏头控件统一 32px 高 / 7px 圆角 / 12px 字号（新会话、🔍、目录下拉、↻、管理台入口）', async () => {
-    const wrapper = await mountPanel({ dirs: DIR, platformAdmin: true });
+    const wrapper = await mountPanel({ dirs: DIR, adminUser: true });
     const { head } = paneEls(wrapper);
     const ctrl = (sel: string) => head.querySelector<HTMLElement>(sel)!;
     const newSess = Array.from(head.querySelectorAll('button')).find((b) => b.textContent?.includes('＋ 新会话'))!;
@@ -321,11 +324,12 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['创建', '取消']);
   });
 
-  it('zh-CN 基线：平台管理员空态提示 + 管理台入口', async () => {
-    const wrapper = await mountPanel({ noDir: true, platformAdmin: true });
+  it('zh-CN 基线：管理员（第 ② 类人：有工位）看得到「管理台」入口，但空态只剩建目录引导', async () => {
+    // issue #332：「平台管理员：请到管理台…」+「进入管理台」两句随入口拦截删除（不可达）；
+    // 顶栏那个「管理台」入口保留——它的判据是 role==='admin'，服务的是**有工位**的管理员。
+    const wrapper = await mountPanel({ noDir: true, adminUser: true });
     const { list } = paneEls(wrapper);
-    expect(list.textContent).toContain('平台管理员：请到管理台创建 FDE 用户与分配资源');
-    expect(list.textContent).toContain('进入管理台');
+    expect(list.textContent).not.toContain('请到管理台');
     expect(wrapper.get('a[href="/admin"]').text()).toBe('管理台');
   });
 
@@ -349,12 +353,15 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['Create', 'Cancel']);
   });
 
-  it('切 English：平台管理员空态提示与管理台入口变英文', async () => {
-    const wrapper = await mountPanel({ noDir: true, platformAdmin: true });
+  it('切 English：管理台入口变英文，且被删掉的两句指路文案不会以任何形态回潮', async () => {
+    // issue #332：zh / en 两侧的 `common.platformAdminHint`、`common.goToAdmin` 必须**成对消失**
+    // （键集对齐另有 localeParity.spec 兜底，这里钉渲染结果）。
+    const wrapper = await mountPanel({ noDir: true, adminUser: true });
     setLocale('en');
     await flushPromises();
-    expect(wrapper.text()).toContain('Platform admin: create FDE users and assign resources in the admin console');
-    expect(wrapper.text()).toContain('Go to admin console');
+    expect(wrapper.text()).toContain('Create a directory first');
+    expect(wrapper.text()).not.toContain('Platform admin');
+    expect(wrapper.text()).not.toContain('Go to admin console');
     expect(wrapper.get('a[href="/admin"]').text()).toBe('Admin console');
   });
 });

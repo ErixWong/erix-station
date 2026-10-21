@@ -107,9 +107,9 @@ const portsToggleLabel = computed(() => {
 });
 
 onMounted(async () => {
-  void ports.load(); // 与 auth 守卫无关：进视图就拉自己的端口列表（admin 无 FDE ⇒ 空列表）
+  void ports.load(); // 与 auth 守卫无关：进视图就拉自己的端口列表（能走到这里的人已由 #332 守卫保证有工位）
   if (!auth.user) return; // 守卫保证已登录
-  await store.initWorkspace(auth.user);
+  await store.initWorkspace();
   // issue #55 B1：启动时若路由带 /session/<id>（旧 #/session/<id>），走统一深链解析
   if (route.params.id) await store.resolveRouteSession(String(route.params.id));
 });
