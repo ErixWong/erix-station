@@ -1064,6 +1064,8 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   });
 }
 
+// issue #337：**故意不折**——run 作用域 legacy 端点；0.23 起新数据只写 session 作用域行
+// （`run_id` 恒 NULL）⇒ 消息行根本不在本端点的命中集里，折了也是空转。
 export async function getTranscript(pool, { container, user, runId, claimToken, limit = 10000, cursor = null }) {
   const run = await fetchRun(pool, runId, user.id);
   if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
@@ -1082,6 +1084,8 @@ export async function getTranscript(pool, { container, user, runId, claimToken, 
   return { records, next_cursor: nextCursor };
 }
 
+// issue #337：**故意不折**——同 `getTranscript`（run 作用域，session 行 `run_id` 为 NULL 不在命中集里）。
+// `LIMIT 2000` 是**按行**截断，且截断口径另记 #338，本单不动。
 export async function recallTranscript(pool, { container, user, runId, claimToken, fromRound = 0, toRound = null, pattern }) {
   if (typeof pattern !== 'string' || pattern.length === 0 || pattern.length > 256) {
     throw new InternalError(400, 'validation_failed', 'pattern 必填且 ≤256 字符');
@@ -1119,6 +1123,8 @@ export async function recallTranscript(pool, { container, user, runId, claimToke
   return { text, truncated, matched_rounds: matchedRounds };
 }
 
+// issue #337：**故意不折**——`record.messages` 分支自 block 化起就是死的（0.22 实测也是 `len=0`：
+// `content` 是 block 数组，`typeof m.content === 'string'` 恒假）；0.23 只是把它彻底变空 ⇒ 无新增损失。
 function collectRoundText(row) {
   const parts = [];
   const msgs = row.record?.messages;
@@ -1300,7 +1306,11 @@ export async function putSessionRound(pool, { container, user, key, round, claim
  *  同 round 多行按**持久化追加序**（迁移 0016 的 append_seq），恢复后的消息顺序才正确；
  *  erix-agent 0.16.0 起引擎不再二次排序，故宿主必须显式保序，不得依赖 created_at/执行计划）。
  *  cursor 以 round 为游标：同 round 行必同页（LIMIT 截断的极端大会话才可能出现跨页同行号，
- *  单会话 >10000 轮超出 P2 范围）。 */
+ *  单会话 >10000 轮超出 P2 范围）。
+ *
+ *  issue #337：**故意不折**——这是引擎 resume 取上下文的面，引擎自己会 `foldLedgerMessages`
+ *  （`resume-manager.js`），站内再折是多余一遍；且 `LIMIT` 按**行**在 SQL 侧生效，折在后面
+ *  对容量无益（容量口径另记 #338）。 */
 export async function getSessionTranscript(pool, { container, user, key, claimToken, writerRunId, limit = 10000, cursor = null }) {
   await fetchSession(pool, key, user.id);
   await fetchWriterRun(pool, writerRunId, user.id, key);

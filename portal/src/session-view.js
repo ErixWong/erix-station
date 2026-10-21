@@ -29,6 +29,7 @@
 //      「内容精确相等」认领尚未认领的 user 锚点（seq 升序、单调游标、一条锚点只被认领一次）。
 //      带 `<sessionId>:input:<messageId>` 的行**一律走 meta.dedupKey 精确映射**，不再参与内容匹配。
 import { projectTranscriptForDisplay } from 'erix-agent';
+import { foldTranscriptRows } from './transcript-fold.js';
 
 // 归属用的键名：DB `dedup_key` 列（宿主自有的幂等键）+ 投影带出的 `meta.dedupKey`。
 // 展示不读 RoundRecord 内部字段；只有「补齐 dedupKey」时会看一眼 dedupKey/roundKey（见 recordForProjection）。
@@ -353,7 +354,18 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     }
   };
 
-  for (const row of [...transcriptRows].sort(compareTranscriptRows)) {
+  // issue #337（erix-agent 0.23.0 读侧折叠）：**折，且只在这里折**。
+  // 0.23 一轮的正文落在 `kind:"message"` 行上（`<key>:msg:<round>:<seq>`），轮记录不再带 `messages`；
+  // 本函数逐行喂投影，而消息行的 key 两个前缀都不是 ⇒ 会在下面的 `isSessionRound` 守卫处被整行丢弃
+  // ⇒ 工具结果配不上对（刷新后卡片全退化成 `…`）。折叠把正文按轮拼回轮行，恢复 0.22 的投影输入形状。
+  // 折在这里是因为它是**咽喉点**：全站两个业务调用方（`sessions.js#fetchSession` 的对话流、
+  // `session-text.js#projectAnchors` 的取文本）都过它，一处接线不会「改了一个漏一个」。
+  // 先排序再折：折叠保留存活行的相对顺序，所以载体行仍在它该在的位置上。
+  // 无消息行的老账本（0.22 及更早）⇒ `foldTranscriptRows` 原样返回入参本身，输出逐字节不变。
+  const foldedRows = foldTranscriptRows([...transcriptRows].sort(compareTranscriptRows), {
+    recordOf: (row) => recordForProjection(row).record,
+  });
+  for (const row of foldedRows) {
     // 逐行调用官方投影：它是按记录独立展开的纯函数（整表调用只做「按 round 排序 + flatMap」），
     // 而本模块要把每个 turn 对应回它的 DB 行（`run_id` 归属、键名分段），行级调用是唯一稳定映射。
     const { record, dedupKey } = recordForProjection(row);
