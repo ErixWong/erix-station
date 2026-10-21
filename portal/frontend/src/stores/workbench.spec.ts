@@ -60,7 +60,6 @@ beforeEach(() => {
   setWorkbenchHooks({});
 });
 
-const USER = { role: 'fde', fde_name: 'alice' };
 const DIR_A = { name: 'demo', cwd: '~/projects/demo', running_count: 1, queued_count: 1 };
 const DIR_B = { name: 'other', cwd: '~/projects/other', running_count: 0, queued_count: 0 };
 
@@ -82,14 +81,14 @@ describe('workbench store（P5 目录即项目）', () => {
   it('initWorkspace：无目录 → noDir 禁用态；有目录 → 选中第一个目录并加载其会话', async () => {
     mockFetch(() => ({ status: 200, body: { dirs: [] } }));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     expect(store.noDir).toBe(true);
     expect(store.inputPlaceholder).toBe('先创建目录');
     expect(store.sessions).toEqual([]);
 
     mockFetch(dirsAwareHandler({ '~/projects/demo': [{ id: 's1', title: 't', cwd: '~/projects/demo' }] }));
     const store2 = useWorkbenchStore();
-    await store2.initWorkspace(USER);
+    await store2.initWorkspace();
     expect(store2.noDir).toBe(false);
     expect(store2.dirCwd).toBe('~/projects/demo');
     expect(store2.currentDir?.name).toBe('demo');
@@ -105,7 +104,7 @@ describe('workbench store（P5 目录即项目）', () => {
       ],
     }));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     expect(store.sessions.map((s) => s.id)).toEqual(['s1']); // s-x 被客户端过滤
     const fetchMock = vi.mocked(fetch);
     const url = new URL(String(fetchMock.mock.calls.find(([u]) => String(u).startsWith('/api/sessions'))?.[0]), 'http://x');
@@ -121,23 +120,19 @@ describe('workbench store（P5 目录即项目）', () => {
       ],
     }));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     expect(store.sessions.map((s) => s.message_count)).toEqual([42, undefined]);
   });
 
-  it('平台管理员空态：newDir 禁用 + 管理台引导 placeholder', async () => {
-    mockFetch(() => ({ status: 200, body: { dirs: [] } }));
-    const store = useWorkbenchStore();
-    await store.initWorkspace({ role: 'admin', fde_name: null });
-    expect(store.isPlatformAdmin).toBe(true);
-    expect(store.newDirDisabled).toBe(true);
-    expect(store.inputPlaceholder).toBe('平台管理员：请到管理台创建 FDE 用户与分配资源');
-  });
+  // issue #332：原本这里有一条「平台管理员空态：newDir 禁用 + 管理台引导 placeholder」。
+  // 入口拦截（router 守卫的 workbenchGateDecision）落地后，`admin && !fde_name` 的人**进不到工作台**，
+  // store 里的 isPlatformAdmin / newDirDisabled 与该文案一并拆除 ⇒ 本文件不再钉这类形状；
+  // 新行为的守门人在 lib/workbenchGate.spec.ts（判据）+ views/SeatlessAdminGate.spec.ts（不挂载/不发请求）。
 
   it('createSession：POST /api/sessions 请求体为 {cwd}（project_id 已退役）', async () => {
     mockFetch(dirsAwareHandler({}));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     const s = await store.createSession();
     expect(s?.id).toBe('s-new');
     expect(lastSessionPostBody).toEqual({ cwd: '~/projects/demo' });
@@ -147,7 +142,7 @@ describe('workbench store（P5 目录即项目）', () => {
   it('createDir：非法名本地校验不发请求；合法名以该 cwd 建会话（服务端 mkdir），切目录并置顶', async () => {
     mockFetch(dirsAwareHandler({}));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
 
     const bad = await store.createDir('Bad_Name');
     expect(bad.error).toContain('目录名必须符合');
@@ -175,7 +170,7 @@ describe('workbench store（P5 目录即项目）', () => {
       return { status: 200, body: { items: lists[cwd] ?? [] } };
     });
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER); // 选中 demo
+    await store.initWorkspace(); // 选中 demo
     await store.refreshDirs(); // 目录未变 → 会话列表不重载（dirCwd 不变）
     expect(store.dirCwd).toBe('~/projects/demo');
 
@@ -192,7 +187,7 @@ describe('workbench store（P5 目录即项目）', () => {
     };
     mockFetch(dirsAwareHandler(lists));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     store.sessionId = 's1';
     store.inputValue = '目录 A 的草稿';
     store.es.activeRunId = 'r1';
@@ -220,7 +215,7 @@ describe('workbench store（P5 目录即项目）', () => {
     const restored: string[] = [];
     setWorkbenchHooks({ onDeepLinkRestored: (sid) => restored.push(sid) });
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     expect(store.dirCwd).toBe('~/projects/demo');
     expect(store.sessions.map((s) => s.id)).toEqual(['in-list']);
 
@@ -643,16 +638,16 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
 // issue #101 P2：store 用户可见文案走 i18n（i18n.global.t；zh-CN 基线逐字不变，切 en 即时生效）
 // ---------------------------------------------------------------------------
 describe('workbench store · i18n（issue #101 P2）', () => {
-  it('zh-CN 基线：占位符三态 / 目录名校验错误 / synthetic 前缀 / 停止分隔行', async () => {
+  it('zh-CN 基线：占位符两态（有目录/无目录）+ 目录名校验错误 / synthetic 前缀 / 停止分隔行', async () => {
     mockFetch(dirsAwareHandler({}));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     expect(store.inputPlaceholder).toBe('输入任务，Enter 发送（Shift+Enter 换行）');
 
     store.noDir = true;
     expect(store.inputPlaceholder).toBe('先创建目录');
-    store.isPlatformAdmin = true;
-    expect(store.inputPlaceholder).toBe('平台管理员：请到管理台创建 FDE 用户与分配资源');
+    // issue #332：原先紧跟一行 `store.isPlatformAdmin = true` 把占位符改成「请到管理台…」——
+    // 入口拦截后这类人进不到工作台，store 已没有 isPlatformAdmin 这个态（占位符恒为两态）。
 
     const bad = await store.createDir('Bad_Name');
     expect(bad.error).toBe('目录名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）');
@@ -666,15 +661,13 @@ describe('workbench store · i18n（issue #101 P2）', () => {
   it('切 English：占位符 / 校验错误 / synthetic 前缀即时变英文（computed 响应式）', async () => {
     mockFetch(dirsAwareHandler({}));
     const store = useWorkbenchStore();
-    await store.initWorkspace(USER);
+    await store.initWorkspace();
     setLocale('en');
     expect(store.inputPlaceholder).toBe('Type a task, Enter to send (Shift+Enter for a newline)');
 
     store.noDir = true;
     expect(store.inputPlaceholder).toBe('Create a directory first');
-    store.isPlatformAdmin = true;
-    expect(store.inputPlaceholder)
-      .toBe('Platform admin: create FDE users and assign resources in the admin console');
+    // issue #332：平台管理员占位符那三行已随入口拦截拆除（同上，zh 侧同口径）。
 
     const bad = await store.createDir('Bad_Name');
     expect(bad.error).toContain('Directory name must be lowercase letters / digits / hyphens');
