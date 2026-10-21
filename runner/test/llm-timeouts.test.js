@@ -40,7 +40,12 @@ const REPO_ROOT = path.join(RUNNER_DIR, '..');
 // 0.20.0 → **0.22.0** 复核结果（#333）：`diff -q` 对 0.20.0（npm pack 解包）与 0.22.0 的
 // `src/providers/payload.js` / `src/providers/timeout.js` / `src/providers/errors.js` 三个文件**逐字节相同**
 // ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
-const ENGINE_VERSION_PINNED = '0.22.0';
+// 0.22.0 → **0.23.0** 复核结果（#337 升级片）：`diff -r` 对 0.22.0（npm pack 解包）与 0.23.0 的
+// **整个 `src/providers/` 目录**（不只是三个文件）无任何输出 ⇒ 逐字节相同；0.23.0 的 `src/` 变更面只有
+// `display/projection.js` / `loop/orchestrator.js` / `loop/resume-manager.js` / `store/file.js` /
+// `store/memory.js` / `store/message-rows.js`(新增) / `tools/file-tools.js`，**providers 一个文件没动**。
+// ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
+const ENGINE_VERSION_PINNED = '0.23.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。
