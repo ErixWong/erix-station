@@ -32,10 +32,17 @@
 //     对 0.22.0 的 `src/loop/orchestrator.js` 跑防漂移正则取到的仍是同一组九值，且 `? "failed" :
 //     "persistence_failed"`、`const reason = signal?.aborted`、`operation: persistenceFailure.operation`
 //     三处形状断言仍然命中 ⇒ **只追版本号，不放宽任何断言**（§8.27 先例）。
+//   * 0.22.0 → 0.23.0（#337 升级片）复核：`diff -q` 对 0.22.0（`npm pack` 解包）与 0.23.0 的
+//     `src/loop/termination.js` **逐字节相同**（`diff` 无输出），对 0.23.0 的 `src/loop/orchestrator.js`
+//     跑防漂移正则取到的仍是同一组九值（`end_turn` / `no_tool` / `stall` / `max_rounds_cap` / `judge_done` /
+//     `continuation_exhausted` / `final_guard_unverified` / `aborted` / `failed`，顺序一字未变，只是 typedef
+//     所在行号因上方新增注释下移一行），且 `? "failed" : "persistence_failed"`、`const reason = signal?.aborted`、
+//     `operation: persistenceFailure.operation` 三处形状断言仍然命中；0.23.0 的 `src/` 变更面（投影 / orchestrator /
+//     resume-manager / store 三个文件 / file-tools）**完全不碰 termination 语义** ⇒ **只追版本号，不放宽任何断言**。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.22.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.23.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。
