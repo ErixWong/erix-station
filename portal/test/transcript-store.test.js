@@ -15,6 +15,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createSessionTranscriptStore, appendUserInputTurn } from '../src/transcript-store.js';
+import { transcriptRecordKey, payloadFingerprint } from '../src/transcript-payload.js';
 import { transcriptStoreContract } from 'erix-agent/contract-tests';
 
 /** 记录 SQL 流水的内存 client；transcriptRows 模拟部分唯一索引 (transcript_key, dedup_key)。 */
@@ -46,13 +47,15 @@ function fakeClient(rows = []) {
         state.insertAttempts += 1;
         const [transcript_key, dedup_key, round, record, messages] = params;
         if (state.rows.some((r) => r.transcript_key === transcript_key && r.dedup_key === dedup_key)) {
-          return { rows: [] }; // ON CONFLICT DO NOTHING
+          // ON CONFLICT DO NOTHING：真库在跳过时 rowCount=0 且 RETURNING 不出行——
+          // #333 M2 的幂等/冲突判定就靠这个「没插进去」的信号去读回既有行，fake 不得两边都给行。
+          return { rows: [], rowCount: 0 };
         }
         state.rows.push({
           transcript_key, dedup_key, round,
           record: JSON.parse(record), messages: JSON.parse(messages),
         });
-        return { rows: [] };
+        return { rows: [{ id: state.rows.length }], rowCount: 1 };
       }
       throw new Error(`unexpected SQL: ${sql}`);
     },
@@ -89,6 +92,10 @@ test('appendRound：逐列形态与手搓时代等价（NULL run_id / folded=fal
   const s = insert.sql.replace(/\s+/g, ' ').trim();
   assert.match(s, /INSERT INTO transcript_rounds \(run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload\) VALUES \(NULL, \$1, \$2, \$3, \$4, false, \$5, NULL\)/);
   assert.match(s, /ON CONFLICT \(transcript_key, dedup_key\) WHERE transcript_key IS NOT NULL DO NOTHING/);
+  // #333 M2：DO NOTHING 降级成并发防线，判幂等要靠「有没有真插进去」⇒ 必须 RETURNING；
+  // 且**未撞键的新写入只发这一笔 INSERT**（撞键才多发一笔读回 SELECT，成本红线）。
+  assert.match(s, /DO NOTHING\s+RETURNING id$/, '未插进去时必须能从返回值里看出来（否则幂等判定失明）');
+  assert.deepEqual(sqlTrace(order), ['appendRound'], '新写入只发一笔 INSERT，不多发读回 SELECT');
   assert.deepEqual(insert.params, [
     KEY, `${KEY}:input:m9`, 4, JSON.stringify(record), JSON.stringify(record.messages),
   ]);
@@ -234,6 +241,8 @@ test('探针（e）：两探针与 load/appendRound 同经**传入的事务 clie
       if (s.startsWith('SELECT round, dedup_key, record')) {
         return { rows: [{ transcript_key: KEY, dedup_key: 'dk', round: 3, record: { round: 3 } }] };
       }
+      // INSERT 面给真返回值（#333 M2：appendRound 靠 RETURNING 出行/不出行区分「插进去」与「被跳过」）。
+      if (s.startsWith('INSERT INTO transcript_rounds')) return { rows: [{ id: 1 }], rowCount: 1 };
       return { rows: [] };
     },
     // pool 形态才会有的方法：store 不得调用（调了就 throw）。
@@ -253,6 +262,116 @@ test('探针（e）：两探针与 load/appendRound 同经**传入的事务 clie
     [KEY, 'dk'], [KEY], [KEY],
     [KEY, 'dk', 3, JSON.stringify({ round: 3, dedupKey: 'dk', messages: [] }), JSON.stringify([])],
   ]);
+});
+
+// ---------- issue #333 M2：写入侧 payload 指纹（幂等 vs 真冲突，本站承重面） ----------
+//
+// 为什么这些用例必须**单独**存在（不能只靠随包契约套件）：契约套件的 record 形状是上游造的，
+// 而 0.22 的真雷长在**引擎自产的三类补充行**上（`…:control:<slot>` / `…:fold:<fp>` / `…:ttl:<fp>`，
+// `orchestrator.js:2123`/`:2145` 每次写都 `ts: new Date()`）。⇒ 下面两条各自用真实键形态与真实
+// 漂移形状，把「幂等」与「冲突」两个方向都钉死：判据必须**只剔顶层** `ts`/`round`（漂了仍幂等），
+// 又必须把数组顺序 / 宿主自有字段算进 payload（换了就是冲突，既不覆盖也不静默丢弃）。
+
+/** 0.22 引擎控制行的真实形状（dedupKey 形态、messages 带 judge-control 标记、顶层 ts/round）。 */
+const controlRow = (key, { round = 3, slot = 'judge-nudge', ts, text = '评审意见：继续' } = {}) => ({
+  round,
+  roundKey: `${key}:round:${round}`,
+  dedupKey: `${key}:engine:round:${round}:control:${slot}`,
+  messages: [{
+    role: 'user',
+    content: [{ type: 'text', text }],
+    meta: { source: 'judge-control' },
+  }],
+  ts,
+});
+
+test('appendRound：resume 重放形状（同 dedupKey，顶层 ts 与 round **都**漂了）判幂等，不新增行也不覆盖', async () => {
+  const { client, order, state } = fakeClient();
+  const first = controlRow(KEY, { round: 3, ts: '2026-10-08T00:00:00.000Z' });
+  assert.deepEqual(await createSessionTranscriptStore(client).appendRound(KEY, first), { inserted: true });
+
+  // 崩溃重跑：dedupKey 稳、正文稳，但 ts = new Date() 且 round 取 store 现有最大 round ⇒ 两个都漂。
+  order.length = 0;
+  const replay = controlRow(KEY, { round: 3, ts: '2026-10-08T00:05:00.000Z' });
+  delete replay.round;
+  replay.round = 9;
+  assert.deepEqual(
+    await createSessionTranscriptStore(client).appendRound(KEY, replay),
+    { inserted: false },
+    '同 key + 同 payload（按排除口径）必须是幂等 ack，不是冲突',
+  );
+  assert.equal(state.rows.length, 1, '幂等重放不得落第二行');
+  assert.deepEqual(state.rows[0].record, first, '先落的那条是事实：后到的重放既不覆盖 round 也不覆盖 ts');
+  assert.deepEqual(
+    sqlTrace(order), ['appendRound', 'loadByDedupKey'],
+    '撞键才读回既有行判幂等（未撞键的新写入不多发 SELECT，见逐列形态那条）',
+  );
+});
+
+test('appendRound：真 payload 差异（数组顺序换了 / 多一个宿主自有字段）⇒ 抛 dedup_payload_conflict，既不覆盖也不静默丢弃', async () => {
+  const cases = [
+    {
+      name: 'messages 数组顺序换了（顺序是语义）',
+      mutate: (row) => ({ ...row, messages: [...row.messages].reverse().concat(row.messages) }),
+      expectedField: 'messages',
+    },
+    {
+      name: '多一个宿主自有字段（宿主记账也算内容）',
+      mutate: (row) => ({ ...row, hostLedger: { stationWritten: true } }),
+      expectedField: 'hostLedger',
+    },
+  ];
+  for (const { name, mutate, expectedField } of cases) {
+    const { client, state } = fakeClient();
+    const first = controlRow(KEY, { round: 4, ts: '2026-10-08T00:00:00.000Z' });
+    await createSessionTranscriptStore(client).appendRound(KEY, first);
+    const incoming = { ...mutate(first), ts: '2026-10-08T00:09:00.000Z' };
+
+    const err = await createSessionTranscriptStore(client)
+      .appendRound(KEY, incoming)
+      .then(() => null, (e) => e);
+    assert.ok(err, `${name}：必须抛错，不得静默接受`);
+    // 判据按 **code** 分流（随包契约第 17–22 条同判据，不看 instanceof）
+    assert.equal(err.code, 'dedup_payload_conflict', name);
+    assert.equal(err.key, first.dedupKey, `${name}：error.key 必须是回落到 dedupKey 的那个值`);
+    assert.match(String(err.existingFingerprint), /^sha256:[0-9a-f]{24}$/, name);
+    assert.match(String(err.incomingFingerprint), /^sha256:[0-9a-f]{24}$/, name);
+    assert.notEqual(err.existingFingerprint, err.incomingFingerprint, name);
+    assert.ok(String(err.message).includes(first.dedupKey), `${name}：消息里必须能指认出 key`);
+    assert.ok(err.differingFields.includes(expectedField), `${name}：差异字段应含 ${expectedField}`);
+    assert.deepEqual(state.rows.map((r) => r.record), [first], `${name}：既不覆盖也不新增行`);
+
+    // 冲突不污染现场：同 payload 重放照旧幂等。
+    assert.deepEqual(
+      await createSessionTranscriptStore(client).appendRound(KEY, controlRow(KEY, {
+        round: 4, ts: '2026-10-08T00:10:00.000Z',
+      })),
+      { inserted: false },
+      `${name}：冲突之后同 payload 的重放仍须幂等`,
+    );
+    assert.equal(state.rows.length, 1);
+  }
+});
+
+test('appendRound：幂等/冲突判据与 internal 端点同源（同一把尺 = payload 指纹，不是整条 record 哈希）', () => {
+  // 结构锁：判据只此一份。把 `ts`/`round` 放回内容里（旧判据形状）就会在这一条红——
+  // 因为本站三处写入面（internal U5 / internal session / 引擎 store 适配器）必须同判据。
+  const key = KEY;
+  const base = controlRow(key, { round: 2, ts: '2026-10-08T00:00:00.000Z' });
+  const drifted = { ...base, round: 77, ts: '2026-10-08T00:11:11.000Z' };
+  assert.equal(payloadFingerprint(base), payloadFingerprint(drifted),
+    '顶层 ts/round 漂了必须同指纹（否则引擎补充行在 resume 重跑时必 409）');
+  assert.notEqual(payloadFingerprint(base), payloadFingerprint({ ...base, ts: undefined, extra: 1 }));
+  assert.notEqual(
+    payloadFingerprint({ ...base, messages: [{ role: 'a' }, { role: 'b' }] }),
+    payloadFingerprint({ ...base, messages: [{ role: 'b' }, { role: 'a' }] }),
+    '数组保序：顺序换了必须不同指纹',
+  );
+  assert.notEqual(
+    payloadFingerprint({ ...base, messages: [{ role: 'a', ts: 'x' }] }),
+    payloadFingerprint({ ...base, messages: [{ role: 'a', ts: 'y' }] }),
+    '**嵌套层**的 ts 算内容（消息正文里的 ts 是内容不是信封）',
+  );
 });
 
 // ---------- 上游契约套件接入（erix-agent/contract-tests，0.17.0 含 #157 成对探针用例） ----------
@@ -290,7 +409,11 @@ function contractShapeFixture() {
     appendRound: async (key, record) => {
       const dk = record?.dedupKey ?? record?.roundKey;
       if (typeof dk === 'string' && dk !== '') return store.appendRound(key, record);
-      const made = `${key}:__contract_auto:${synthetic.size}`;
+      // 隐式键（dedupKey/roundKey 都没有）必须造成**上游 recordKey 的那个形态**
+      // `<key>:round:<round>`（`portal/src/transcript-payload.js` 的 transcriptRecordKey），
+      // 不能造自造哨兵值：契约第 22 条断言 `error.key === 'implicit-run:round:7'`，且
+      // 「同 payload 重放仍幂等」要求同 round 的两条无键记录落到**同一个**键上（自增计数会漏判）。
+      const made = transcriptRecordKey(key, record);
       synthetic.add(made);
       return store.appendRound(key, { ...record, dedupKey: made });
     },
