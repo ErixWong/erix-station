@@ -165,6 +165,61 @@ describe('全局路由守卫', () => {
   });
 });
 
+// issue #332：工作台**准入闸的接线**用例。与 lib/workbenchGate.spec.ts 的分工：那里测「判据算得对」
+// （纯函数），这里测「守卫里真的调了它、并且接在挂载前」。
+// 对应变异：删掉 `router.ts:124-125` 的
+//   const gate = workbenchGateDecision({ user: auth.user, toPath: to.path });
+//   if (gate.action === 'rewrite') return { path: gate.path };
+// ⇒ 前两条必红（线上表现：无工位的管理员照样落在 #/ 上，并白打 /api/dirs + /api/sessions + /api/me/ports）。
+// 第三、四条是反向保险：判据若被写成「role==='admin' 就挡」（漏掉 `!fde_name`）⇒ 第三条红；
+// 若被写成「无条件改写」⇒ 第四条红。（无工位管理员访 /admin 不改写这件事由上面的
+// 「admin 访问 /admin → 重定向到用户管理页」钉着——它的夹具正是无工位的 root。）
+describe('#332 工作台准入闸的守卫接线', () => {
+  /** 第 ③ 类人：`role='admin'` 且 `fde_name` 为 null ⇒ 没有工位，不得停留工作台。 */
+  const SEATLESS_ADMIN = {
+    id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local',
+  } as AuthUser;
+  /** 第 ② 类人：`role='admin'` 但 `fde_name` 有值 ⇒ 有工位，本单必须放他进工作台。 */
+  const ADMIN_WITH_SEAT = {
+    ...SEATLESS_ADMIN, id: 'u9', login: 'root2', display_name: 'Root2', fde_name: 'root',
+  } as AuthUser;
+
+  it('第 ③ 类人访问 / → 落到管理台（#/admin/users），不是工作台 #/', async () => {
+    fetchMe(200, { user: SEATLESS_ADMIN });
+    const router = await freshRouter();
+    await router.push('/');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+    expect(router.currentRoute.value.name).toBe('admin-users');
+  });
+
+  it('第 ③ 类人深链 /session/:id（别人名下的会话）→ 同样落到管理台（工单 §二.3：不再踢回 #/）', async () => {
+    fetchMe(200, { user: SEATLESS_ADMIN });
+    const router = await freshRouter();
+    await router.push('/session/someone-elses-session');
+    expect(router.currentRoute.value.path).toBe('/admin/users');
+  });
+
+  it('第 ② 类人（admin + 有 fde_name）访 / 与 /session/:id → 照常落地（挡的是「没工位」不是 admin）', async () => {
+    fetchMe(200, { user: ADMIN_WITH_SEAT });
+    const router = await freshRouter();
+    await router.push('/');
+    expect(router.currentRoute.value.path).toBe('/');
+    expect(router.currentRoute.value.name).toBe('workbench');
+    await router.push('/session/s1');
+    expect(router.currentRoute.value.path).toBe('/session/s1');
+    expect(router.currentRoute.value.name).toBe('session');
+  });
+
+  it('FDE 访 / 与 /session/:id → 落地不受影响（零回归）', async () => {
+    fetchMe(200, { user: FDE_USER });
+    const router = await freshRouter();
+    await router.push('/');
+    expect(router.currentRoute.value.path).toBe('/');
+    await router.push('/session/s2');
+    expect(router.currentRoute.value.path).toBe('/session/s2');
+  });
+});
+
 // #255 熔断**接线**的行为级用例。与 lib/forcePasswordGuard.spec.ts 的分工：那里测「熔断器本体
 // 算得对」，这里测「它被接对了地方」——两条接线各自对应一条变异：
 //  · `router.afterEach(() => budget.reset())` 被删 → (a) 红（后果：app 累计跳够 12 次就静默停导航）；

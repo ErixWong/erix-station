@@ -194,11 +194,10 @@ function messageCountSuffix(s: Session): string {
     <!-- ② 会话列表段（该目录）：flex-1 min-h-0 + 独立内部滚动；空态文案也放这里（issue #92） -->
     <div class="mt-2 min-h-0 flex-1 overflow-y-auto">
       <!-- issue #112：空态文案 11px / text-dim / padding 8px 10px（对齐 pi-web 空态规格） -->
+      <!-- issue #332：这里原有 `v-if="store.isPlatformAdmin"` 分支（「平台管理员：请到管理台…」+「进入管理台」
+           链接）已删——无工位的平台管理员被路由守卫挡在管理台，该分支在工作台上不可达。 -->
       <div v-if="store.noDir">
-        <p v-if="store.isPlatformAdmin" class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">
-          {{ t('common.platformAdminHint') }}<br><router-link to="/admin" class="underline">{{ t('common.goToAdmin') }}</router-link>
-        </p>
-        <p v-else class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">{{ t('common.createFirstDir') }}</p>
+        <p class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">{{ t('common.createFirstDir') }}</p>
       </div>
       <div v-else>
         <p v-if="store.sessions.length === 0" class="px-2.5 py-2 text-[11px] leading-[1.5] text-black/50">{{ t('sidebar.noSessions') }}</p>

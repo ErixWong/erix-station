@@ -31,11 +31,11 @@ export const zhCN = {
     emptyDir: '（空目录）',
     noDir: '（无目录）',
     createFirstDir: '先创建目录',
-    // 平台管理员引导（侧栏空态 / 消息流空态 / composer 占位符共用）
+    // 顶栏「管理台」入口（role==='admin' 者可见；#332 后能站上工作台的 admin 必然同时有工位）
     adminConsole: '管理台',
     logout: '登出',
-    platformAdminHint: '平台管理员：请到管理台创建 FDE 用户与分配资源',
-    goToAdmin: '进入管理台',
+    // issue #332：`platformAdminHint` / `goToAdmin` 两句已删——无工位的平台管理员被路由守卫
+    // 直接送进管理台，上两句在工作台上永久不可达（不留「以防万一」的死文案）。en.ts 同步删。
   },
   // 语言切换菜单自身文案
   locale: {
