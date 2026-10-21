@@ -87,6 +87,9 @@ async function projectAnchors(executor, { sessionId, context, anchorSql, params 
  * 取数：`transcript_key = sessionId` + `dedup_key = <sessionId>:input:<messageId>` 单行精确命中
  * （迁移 0006 的部分唯一索引，不必整会话读取），正文口径同 `userTurnTexts`（排除合成/折叠轮）。
  *
+ * issue #337：**故意不折**——它点查的是 `appendUserTurn` 写的**用户输入行**（带字符串 `content`，
+ * 0.23 没动 `append-user-turn.js`），一行一个 messageId、天生不需要折。
+ *
  * @returns {Promise<string|null>} 命中输入行且投影有 user 正文 → 文本；否则 **null**，由调用方按
  *   「legacy `messages.content` → 空串」的顺序回退（调用点注释写明了回退顺序）。
  */
