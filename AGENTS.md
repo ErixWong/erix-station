@@ -952,6 +952,68 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 **真机 5 条全过（路线 A = 先验再合；手法值得复用）**：`docker build -f portal/Dockerfile`（build context = 仓库根，30 秒）→ `deploy/.env` 的 `STATION_PORTAL_IMAGE` 临时指到本地 tag（原值先备份）→ `up -d --no-build station-portal` → 浏览器走 `station.fde.erix.vip:8090`（经 Traefik）→ **验完还原 .env 并重新 `up -d`**（否则 digest pin 就假了）。结果：`admin` 落 `#/admin/users` 且工作台标记不存在；`#/` 与深链 `#/session/<uuid>` 都弹回管理台；三趟请求命中数**恒 0**；`eric` 落 `#/`、标记存在、三趟各发了（命中 3）；临时 `UPDATE users SET fde_name='adm334'` 让 `admin` 变成第②类人 ⇒ 落 `#/`、标记存在（**这条是「挡的是没工位不是 admin」的真机证据**），验完 `fde_name` 改回 NULL、无容器无 allocation 残留。⚠ 探针方法：登录按钮文案是 **`Next`**；`input[type="text"]` 属性选择器抓不到**没写 `type` 属性**的输入框（`.type` 属性读出来才是 `text`）。
 
 **已知边界（都不算洞，且已并给 #308）**：管理台的「← Back to workbench」链接对无工位管理员是死链，但**点了会被守卫弹回**（实测 `#/admin/users` + 零请求），不构成误导，隐藏与否另开小单；`#/sessions` **不是路由**（router 只有 `/login`、`/change-password`、`/`、`/session/:id`、`/admin*`，全仓无人链它）⇒ `isWorkbenchPath` 只认 `/` 与 `/session/` 是对的；`WorkbenchView.spec.ts` / `WorkbenchPreviewPorts.spec.ts:207` 的夹具仍是「无工位管理员」（直接 mount 视图、不过守卫，形状已不可达但全绿，后者是端口空态唯一覆盖）；`workbench.ts` / `DirSelect.vue` 里注释写的「服务端另有 403 写闸」与实际 **400** 不符 ⇒ 纯措辞，随 #308 一并更正。
+### 8.35 erix-agent 0.20.0 → **0.22.0**（issue #333，2026-10-21）
+
+**上游事实（先核发布物再说，别照 changelog 推）**：npm 最新 `0.22.0`（2026-10-21 发）；**`0.21.0` 从未发布过**
+（版本号被并进 0.22.0）⇒ 升级是一跳，官方指南 `docs/host-upgrade-guide-0.22.0.md` 也按 0.20→0.22 写。
+`providers/payload.js` / `timeout.js` / `errors.js` 与 `termination.reason` 九值在 0.20↔0.22 之间**逐字节/逐字未变**
+⇒ `llm-timeouts.test.js` 的 `ENGINE_VERSION_PINNED` tripwire 只追版本号（§8.27 同一处置）。
+
+**唯一的宿主必改项 = 「同 dedupKey 异 payload 冲突」的处理**（不是可选能力，是硬要求）
+- 0.22 引擎新写三类行：`<key>:engine:round:<n>:control:<slot>`（`judge-nudge`/`extend`/`guard-revise`/`forced-final`）、
+  `:fold:<fp>`、`:ttl:<fp>`，**每次写都带 `ts: new Date()`** ⇒ resume 重放同一 dedupKey 必然拿到新 `ts`
+  （session 作用域下 `round` 也会漂，宿主取 `MAX(round)+1`）。
+- 本站旧判据是**整条 record 的 sha256**（含顶层 `ts`/`round`）⇒ 重放**伪报 `409 round_conflict`**；
+  而 `runner/lib/store.js` 对非 2xx **一律上抛**（全文件零 409 分支）⇒ 引擎按持久化失败处理 ⇒ 终局
+  **`persistence_failed`**（语义最重的那一类：崩溃恢复可能重复副作用）。
+- 修法 = **三处一把尺**：新 `portal/src/transcript-payload.js`（只剔**顶层** `dedupKey`/`roundKey`/`round`/`ts`；
+  **嵌套层的 `ts` 仍算 payload**）被 `portal/src/internal.js`（U5 `putRound` + 引擎轮记录真通路 `putSessionRound`）、
+  `portal/src/transcript-store.js`（发消息预写适配器）与 `runner/lib/store.js`（IPC peer）**共用**；
+  与上游 `src/store/transcript-dedup.js` 按文件路径**逐字对拍**（该件不在包 exports 面里，import 本身就是 tripwire）。
+  真冲突仍 `409 round_conflict`（**零新错误码**），`details` = `existingFingerprint`/`incomingFingerprint`/`differingFields`（≤8）。
+- ⚠ **改适配器但不改 `internal.js` = 把「静默丢弃」换成「真 run 失败」**——引擎轮记录走的是 U6 那个端点，不是 U5。
+- ⚠ 我一度想加 `409 idempotency_conflict`（发消息幂等位撞车）——**不成立**：`messageId` 由服务端生成
+  （`sessions.js` 用插入行的 `id`），撞幂等位的形状不可达 ⇒ 按「不做测不到的分支」撤掉。
+
+**决策者采纳的两条行为变化**
+1. **`reflection.judgeDoneAdvisory: true`**（`runner/worker.js`）：评审判「已达成」且置信度过阈值时，把那句
+   评审意见作为一条普通文本消息注入下文（软提示，不硬断 run）。**上游缺省是 false**（不显式传 = 没开）；
+   传非布尔被引擎 `TypeError` 拒。**故意不给 env 旋钮**（#331 死光纤前例）。风险如实说：judge 误判「已完成」
+   会让模型提前收手——这条证据只能真机跑，不是单测。
+   ⚠ 生效路径是**中途拦截审计**（`run-snapshot-executor.js:420`），不是 end_turn 那条 `judge_done` 停止分支；
+   测试要跑通它必须真的走 **2 次**工具调用（门槛 `count >= judgeIntervalRound`，计数从 0 起、不审计那次才 +1）。
+2. **引擎控制文本在界面上隐藏**（不新增 UI、不加 i18n 键）。落地时发现我给 worker 的工单有两处**说错了**，
+   以实测为准：① **对话正文本来就不漏**——正文来自 `messages` 锚点 + run 文本表，且投影会给带 `meta.source` 的
+   **user** 消息**另外打 `synthetic: true`**，既有过滤早已拦住（宿主新加的那条 `!isEngineControlTurn` 是**冗余守卫**，
+   变异实测：撤掉它只有「直接喂 turn」那条用例会红）；② 投影对 **assistant** 消息会**连 `meta.source` 一起抹掉**
+   ⇒ 给 assistant 侧加守卫是**结构上接不住**的死代码，故意不加，并把该上游口径钉成用例（红 = 上游开始保留该字段，届时再评）。
+   **必须逐条消息判、不能按整行判**：`…:control:forced-final` 同一行里既有注入指令又有**不带 marker 的真终稿**，
+   按行滤会把终稿一起吞掉（#300 之后那就是「中止/失败 run 正文又空了」）——这条被变异钉住（整行判 ⇒ 2 红）。
+
+**被更正的历史记录**：**#303 重新挂账**（触发条件从「下次升引擎 minor」改成「旧 transcript 行被归档时」——
+`worker.js` 那句 `?? tr.duration` 回退读的是**我们盘上的旧行**，与引擎版本无关，0.22 不触发它）；
+§8.28 那句「`toolCallKey` 不接进卡片身份」被上游新的稳定 `erix.toolCallKey` **推翻**，但 #279 的用户标本未到，
+**本单不动前端卡片键**（没有复现材料就不要改行为，见 #279 重挂的判据）。
+
+**基线**：根 **1341 / 1337 通过 / 0 失败 / 4 跳过**（+49）、`node --test runner/test/*.test.js` **321/321**（+10）、
+前端 `typecheck` 干净 + **35 文件 / 601 通过**（本单前端零改动；基线由 #334 从 33/585 推上来）。台账三处已同步。
+
+⚠ **编号说明**：本节原写为 §8.34，合并 main 时发现 #334 已占用 ⇒ 顺延为 **§8.35**（时间上两单同日）。
+
+**主 agent 亲跑的变异（不复用 worker 的）**：① 把 `samePayload(...)` 改永真 ⇒ 3 条「该 409」红；改永假 ⇒ 3 条「该幂等」红
+（**这两条在本单之前都不红**：曾经跑过 `internal.test.js`+`transcript-store.test.js` = 98 通过 / 0 失败 ⇒ 定性为真覆盖缺口）；
+② `ts` 塞回指纹 ⇒ 4 条具名红；③ 排除表清空 ⇒ 4 条红；④ 与上游对拍时排除表多塞一字段 ⇒ 3 条红；
+⑤ 撤宿主守卫 ⇒ 恰 1 红；⑥ 改整行判 ⇒ 2 红（含 forced-final）。
+
+⚠ **本单我自己的操作教训（代价 = 一次 amend）**：`git checkout -- <file>` 是从 **index** 复原，
+**未 `git add` 的改动会被「变异复原」一起抹掉**——我做 M3 变异时把刚写的守卫抹了，直到全量跑才露出来
+（那条新用例在全量里红、单跑绿）。**口径：做变异前先提交（或先 `git stash` 兜一份），别拿未入库的工作区当基线。**
+
+**已知边界（都是刻意口径，别当 bug 修）**：真 PG 上「撞键 ⇒ 插入出行 ⇒ 之后读回」那条支路**不可达**
+（部分唯一索引把并发串行化了）⇒ 它的行为面只在 fake 上成立；摘掉 key 白名单里的旧名不做（§8.25 同族）；
+`portal/src/internal.js` 端点侧**没有**真库级行为判据（只有 fake + 源码级「同一把尺」断言）。
+
+**发版与部署 / 真机**：见下（`TODO(主 agent)` 由发版当次填写）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 

@@ -17,7 +17,7 @@
 //      且不得 import 任何运行时依赖——否则 `node --test` 直读会挂。由
 //      `portal/test/termination-contract.test.js` 的「零 import」断言钉住。
 //
-// 真值来源（引擎 0.20.0，逐值定位；0.18.0 → 0.19.0 → 0.20.0 三次复核：reason 全集**一字未变**）：
+// 真值来源（引擎 0.22.0，逐值定位；0.18.0 → 0.19.0 → 0.20.0 → 0.22.0 四次复核：reason 全集**一字未变**）：
 //   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:447-448`（runToolLoop 返回值 typedef。
 //     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块 ⇒ 防漂移测试的取值正则已同步）；
 //   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:1077-1081`，fail() 里
@@ -27,10 +27,15 @@
 //     `judge_done` / `final_guard_*` ⇒ 集合不变，但这三值在「用户点过停止」的 run 上不再可达。
 //     我们按 reason 透传分流（`runner/lib/termination.js` 只兜 `failed`⇒`aborted` 的竞态），
 //     无需改动，前端红色集合也不变。
+//   * 0.20.0 → 0.22.0（#333）复核：`diff -q` 对 0.20.0（`npm pack` 解包）与 0.22.0 的
+//     `src/providers/payload.js` / `src/providers/timeout.js` / `src/providers/errors.js` **逐字节相同**，
+//     对 0.22.0 的 `src/loop/orchestrator.js` 跑防漂移正则取到的仍是同一组九值，且 `? "failed" :
+//     "persistence_failed"`、`const reason = signal?.aborted`、`operation: persistenceFailure.operation`
+//     三处形状断言仍然命中 ⇒ **只追版本号，不放宽任何断言**（§8.27 先例）。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.20.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.22.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。

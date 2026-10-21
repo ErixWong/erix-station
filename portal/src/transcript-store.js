@@ -18,6 +18,26 @@
 // 两探针缺任一才回退全量 load）；同 key 并发由 postMessage 的 session FOR UPDATE 串行化，
 // ON CONFLICT 是本事务之外的最后防线。
 import { appendUserTurn } from 'erix-agent';
+import {
+  payloadFingerprint, samePayload, dedupPayloadConflict, transcriptRecordKey,
+} from './transcript-payload.js';
+
+/**
+ * 点查既有 record（与 `loadByDedupKey` 同一条 SQL、同一个谓词）：appendRound 判「同 key 异 payload」
+ * 时的读面——**判据只有一把尺**（`./transcript-payload.js`），读面也必须与探针同源，否则快路径与
+ * 写入路径会对同一条行给出不同结论（随包契约「loadByDedupKey 与 load 事实一致」同源要求）。
+ * @returns {Promise<object|null>}
+ */
+async function readStoredRecord(client, key, dedupKey) {
+  const res = await client.query(
+    `SELECT record
+       FROM transcript_rounds
+      WHERE transcript_key = $1 AND dedup_key = $2
+      LIMIT 1`,
+    [key, dedupKey],
+  );
+  return res.rows?.[0]?.record ?? null;
+}
 
 /**
  * 事务绑定的 session transcript store（引擎 load/appendRound 两方法契约
@@ -47,19 +67,59 @@ export function createSessionTranscriptStore(client) {
         };
       });
     },
-    /** 追加一轮：会话预写行恒为 run_id=NULL / folded=false / folded_payload=NULL（同 PR②a 形态）。 */
+    /**
+     * 追加一轮：会话预写行恒为 run_id=NULL / folded=false / folded_payload=NULL（同 PR②a 形态）。
+     *
+     * 幂等/冲突判据（issue #333 M2，与 `internal.js` 的两个轮记录端点**共用同一个件**
+     * `./transcript-payload.js`，口径与上游 `erix-agent/src/store/transcript-dedup.js` 逐字对齐）：
+     *   · `ON CONFLICT … DO NOTHING` 从「静默丢弃」降级成**并发防线**：真正判幂等的是命中后
+     *     读回既有 record 再比 **payload 指纹**（只剔顶层 `dedupKey`/`roundKey`/`round`/`ts`）：
+     *     同 key + 同 payload ⇒ 幂等 no-op（`{inserted:false}`，不新增行、不覆盖既有行）；
+     *   · 同 key + 异 payload ⇒ 抛 `error.code === 'dedup_payload_conflict'`（随包契约套件第 17–22 条
+     *     按 **code** 分流，不看 instanceof），**既不覆盖也不静默丢弃**——旧行为把真冲突也一起吞了，
+     *     于是契约里「异 payload 必须报错」的 4 条在本站适配器上恒红。
+     * ⚠ 继续复用**调用方事务里的同一个 client**（红线，勿换成 pool）：判冲突的那笔 SELECT 也必须
+     *   落在同一事务里，否则「查既有 → 比对」与 INSERT 会跨事务撕裂。
+     */
     async appendRound(key, record) {
       const dedupKey = record?.dedupKey ?? record?.roundKey;
       if (typeof dedupKey !== 'string' || dedupKey === '') {
         throw new Error('transcript store: record.dedupKey is required');
       }
-      await client.query(
+      const inserted = await client.query(
         `INSERT INTO transcript_rounds
            (run_id, transcript_key, dedup_key, round, record, folded, messages, folded_payload)
          VALUES (NULL, $1, $2, $3, $4, false, $5, NULL)
-         ON CONFLICT (transcript_key, dedup_key) WHERE transcript_key IS NOT NULL DO NOTHING`,
+         ON CONFLICT (transcript_key, dedup_key) WHERE transcript_key IS NOT NULL DO NOTHING
+         RETURNING id`,
         [key, dedupKey, record.round, JSON.stringify(record), JSON.stringify(record.messages ?? [])],
       );
+      if ((inserted.rows?.length ?? 0) > 0) return { inserted: true };
+
+      // (transcript_key, dedup_key) 已被占（同事务重放，或 postMessage 的 session FOR UPDATE 之外的
+      // 并发重放）⇒ 读回既有 record 判「同一份 payload」还是「真冲突」（键的取法与上游 recordKey 同式）。
+      const existing = await readStoredRecord(client, key, dedupKey);
+      if (existing === null) {
+        // ON CONFLICT 已跳过、却又读不到行：唯一可能是并发事务插完后立刻回滚（DO NOTHING 等它落地
+        // 才判跳过）。**不静默成功**：按最保守方向报冲突，让调用方事务回滚重放。
+        throw dedupPayloadConflict({
+          runId: key,
+          key: transcriptRecordKey(key, record),
+          existing: undefined,
+          incoming: record,
+          existingFingerprint: 'sha256:000000000000000000000000',
+          incomingFingerprint: payloadFingerprint(record),
+        });
+      }
+      if (samePayload(existing, record)) return { inserted: false }; // 幂等命中（顶层 ts/round 漂了仍算重放）
+      throw dedupPayloadConflict({
+        runId: key,
+        key: transcriptRecordKey(key, record),
+        existing,
+        incoming: record,
+        existingFingerprint: payloadFingerprint(existing),
+        incomingFingerprint: payloadFingerprint(record),
+      });
     },
     /**
      * 快路径探针①（0.17.0 #157 / station #193，与 loadMaxRound 成对）：按 dedupKey 点查整条已存 record。
@@ -71,14 +131,11 @@ export function createSessionTranscriptStore(client) {
      * `record.dedupKey ?? record.roundKey`（迁移 0006 部分唯一索引列），故对 station 数据两者等价。
      */
     async loadByDedupKey(key, dedupKey) {
-      const res = await client.query(
-        `SELECT record
-           FROM transcript_rounds
-          WHERE transcript_key = $1 AND dedup_key = $2
-          LIMIT 1`,
-        [key, dedupKey],
-      );
-      return res.rows?.[0]?.record ?? null;
+      // 读面与 appendRound 的冲突判定同源（同一条 SQL）；本探针**只读不判**：签名里只有 key、
+      // 没有待写入的 payload，无从比对，而引擎 `appendUserTurn` 快路径命中即 written:false
+      // （随包契约第 15/16 条要求原样返回库内 record）⇒ 真冲突全部由 appendRound 那条面兜
+      // （同事务内 FOR UPDATE 串行化 + ON CONFLICT ⇒ 没有「同 key 异 payload 被静默接受」的窗口）。
+      return readStoredRecord(client, key, dedupKey);
     },
     /**
      * 快路径探针②（0.17.0 #157 / station #193，与 loadByDedupKey 成对）：该 key 的最大 round，
