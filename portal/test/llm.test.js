@@ -30,6 +30,7 @@ import {
   typeToMode,
 } from '../src/llm.js';
 import { createServer } from '../src/http.js';
+import { fakeTranscriptRounds } from './fake-transcript-rounds.js';
 import { postMessage } from '../src/sessions.js';
 import { cookieSettings } from '../src/config.js';
 import { runOnboardingOnce } from '../src/onboarding.js';
@@ -646,6 +647,8 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
   // 按现有 fake pool 测试风格：内存 client 派发 postMessage 的全部 SQL 并记录顺序。
   const order = [];
   const sessionId = '11111111-1111-4111-8111-111111111111';
+  // #333 M2：`transcript_rounds` 走共用仿真件（真库部分唯一索引 + ON CONFLICT 跳过 + 撞键读回真存的行）。
+  const rounds = fakeTranscriptRounds({});
   const client = {
     async query(sql, params = []) {
       order.push({ sql, params });
@@ -663,11 +666,8 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
       if (s.startsWith('INSERT INTO messages')) {
         return { rows: [{ id: 'm1', seq: 1, role: 'user', content: 'hi', attachments: '[]', created_at: new Date() }] };
       }
-      if (s.startsWith('SELECT round, dedup_key, record')) return { rows: [] }; // appendUserTurn 的回退路径 load(key)
-      // 0.17.0 成对快路径探针（#193）：空 transcript → 未命中 + max_round null（round 仍为 0）。
-      if (s.startsWith('SELECT record FROM transcript_rounds')) return { rows: [] };
-      if (s.startsWith('SELECT MAX(round)')) return { rows: [{ max_round: null }] };
-      if (s.startsWith('INSERT INTO transcript_rounds')) return { rows: [] };
+      const roundHit = rounds.query(sql, params);
+      if (roundHit) return roundHit;
       if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
       if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
       if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
