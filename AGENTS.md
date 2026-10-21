@@ -1042,7 +1042,9 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **真机（本地构建 portal 镜像顶掉 digest pin 实跑，验完还原 `.env` 并重新 `up -d`）**：#306 —— UI 发一条长正文消息、流式中建了基线（`.msg.partial` = 0）、点「■ Stop」后 **1 秒内**部分正文就出现且**全程未刷新**，四个采样稳定 1 条、类名 `msg assistant md partial`（**不含 `syserr`**），**硬刷新后仍恰好 1 条**（不重复）。#279 —— 现跑一条三工具任务，实时卡片名字与时长各自正确（`🔧 writeFile p279.txt ✓ 2ms`、`🔧 readFile p279.txt ✓ 3ms`），**硬刷新前后逐字一致**（36 张卡、`byName` 完全相同），无 `undefined`/`[object Object]`/`NaN`。#281 —— 深链一个不存在的会话 ⇒ 重定向回 `#/`、**零未捕获拒绝**、不白屏。⚠ 一个现场发现：停止产生的红色中止行刷新后会消失（既有 #236「刷新后分隔条消失」，**不属本单**）。
 
-**发版**：v0.1.23。本版 `runner/` 只有版本号变动 ⇒ `FDE_IMAGE` **故意仍 pin 在 v0.1.22**、**不重建 FDE 容器**（§8.19 先例，别当漏做）。
+**发版与部署（v0.1.23）**：PR **#336** 合并（`d4ce14d`）→ PR 质量门禁绿 → main CI `39579950588` **两个 job 全绿**（含镜像构建校验，这是打 tag 的前置）→ tag `v0.1.23` → release run `39580472883` success → 清单：portal `imageId=sha256:16e6f314…`/`digest=sha256:f0f2d6a4…`、proxy `imageId=sha256:a73a5661…`/`digest=sha256:dc06c02c…`，两个都是**直连一次拉成**，`docker image inspect .Id` 与清单逐个一致 → `deploy/.env` 形态① pin（**只两个**；备份 `/tmp/deploy.env.bak-0123`）→ `up -d --no-build` ⇒ portal 实跑 `16e6f314…`、healthy、经 Traefik `/healthz` 200。
+⚠ **本版故意不重建 FDE 容器**：`git diff --name-only v0.1.22..main -- runner/` 里**非版本文件 = 0** ⇒ `FDE_IMAGE` 仍 pin 在 v0.1.22 摘要（`f546a65e…`），七台容器未动（§8.19 先例，别当漏做）；`STATION_DOCKER_PROXY_IMAGE` 已跟着升到 v0.1.23（只影响以后新建的 FDE）。
+**在发布物上重跑一次现场判据**（不是只信本地镜像）：会话 `d724165a…` 已有一条历史 partial（基线 = 1），UI 发一条长正文消息、点「■ Stop」后**新 run 的部分正文 1 秒内出现且全程未刷新**（计数 1→2，两条各自独立 ⇒ 幂等键 `partial:<run_id>` 按 run 分开了，既没重复也没覆盖）。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
