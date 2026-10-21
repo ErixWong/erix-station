@@ -937,6 +937,67 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **过程账（同一个坑的第二次发作，代价 = 两小时）**：worker 连撞两次 30 分钟超时（我传的 50 分钟未生效，**实测上限就是 1800000ms**），两次都**没有 commit**；第一次的补丁与当时新合并的 PR #326 冲突（整份应用会删掉 `llm-chat.js`）⇒ 只能重做；第二次的补丁基点正好是当前 main ⇒ 主 agent `git apply` 落到分支后测出「只差一把跨文件锁」。**口径：worker 的补丁落主仓后必须先跑一遍数出真实缺口，再决定补哪里；跨文件读源码的锁在被读文件被删时必红，删它必须同时改锁的方向。**
 
+### 8.34 erix-agent 0.20.0 → **0.22.0**（issue #333，2026-10-21 夜班）
+
+**上游事实（先核发布物再说，别照 changelog 推）**：npm 最新 `0.22.0`（2026-10-21 发）；**`0.21.0` 从未发布过**
+（版本号被并进 0.22.0）⇒ 升级是一跳，官方指南 `docs/host-upgrade-guide-0.22.0.md` 也按 0.20→0.22 写。
+`providers/payload.js` / `timeout.js` / `errors.js` 与 `termination.reason` 九值在 0.20↔0.22 之间**逐字节/逐字未变**
+⇒ `llm-timeouts.test.js` 的 `ENGINE_VERSION_PINNED` tripwire 只追版本号（§8.27 同一处置）。
+
+**唯一的宿主必改项 = 「同 dedupKey 异 payload 冲突」的处理**（不是可选能力，是硬要求）
+- 0.22 引擎新写三类行：`<key>:engine:round:<n>:control:<slot>`（`judge-nudge`/`extend`/`guard-revise`/`forced-final`）、
+  `:fold:<fp>`、`:ttl:<fp>`，**每次写都带 `ts: new Date()`** ⇒ resume 重放同一 dedupKey 必然拿到新 `ts`
+  （session 作用域下 `round` 也会漂，宿主取 `MAX(round)+1`）。
+- 本站旧判据是**整条 record 的 sha256**（含顶层 `ts`/`round`）⇒ 重放**伪报 `409 round_conflict`**；
+  而 `runner/lib/store.js` 对非 2xx **一律上抛**（全文件零 409 分支）⇒ 引擎按持久化失败处理 ⇒ 终局
+  **`persistence_failed`**（语义最重的那一类：崩溃恢复可能重复副作用）。
+- 修法 = **三处一把尺**：新 `portal/src/transcript-payload.js`（只剔**顶层** `dedupKey`/`roundKey`/`round`/`ts`；
+  **嵌套层的 `ts` 仍算 payload**）被 `portal/src/internal.js`（U5 `putRound` + 引擎轮记录真通路 `putSessionRound`）、
+  `portal/src/transcript-store.js`（发消息预写适配器）与 `runner/lib/store.js`（IPC peer）**共用**；
+  与上游 `src/store/transcript-dedup.js` 按文件路径**逐字对拍**（该件不在包 exports 面里，import 本身就是 tripwire）。
+  真冲突仍 `409 round_conflict`（**零新错误码**），`details` = `existingFingerprint`/`incomingFingerprint`/`differingFields`（≤8）。
+- ⚠ **改适配器但不改 `internal.js` = 把「静默丢弃」换成「真 run 失败」**——引擎轮记录走的是 U6 那个端点，不是 U5。
+- ⚠ 我一度想加 `409 idempotency_conflict`（发消息幂等位撞车）——**不成立**：`messageId` 由服务端生成
+  （`sessions.js` 用插入行的 `id`），撞幂等位的形状不可达 ⇒ 按「不做测不到的分支」撤掉。
+
+**决策者采纳的两条行为变化**
+1. **`reflection.judgeDoneAdvisory: true`**（`runner/worker.js`）：评审判「已达成」且置信度过阈值时，把那句
+   评审意见作为一条普通文本消息注入下文（软提示，不硬断 run）。**上游缺省是 false**（不显式传 = 没开）；
+   传非布尔被引擎 `TypeError` 拒。**故意不给 env 旋钮**（#331 死光纤前例）。风险如实说：judge 误判「已完成」
+   会让模型提前收手——这条证据只能真机跑，不是单测。
+   ⚠ 生效路径是**中途拦截审计**（`run-snapshot-executor.js:420`），不是 end_turn 那条 `judge_done` 停止分支；
+   测试要跑通它必须真的走 **2 次**工具调用（门槛 `count >= judgeIntervalRound`，计数从 0 起、不审计那次才 +1）。
+2. **引擎控制文本在界面上隐藏**（不新增 UI、不加 i18n 键）。落地时发现我给 worker 的工单有两处**说错了**，
+   以实测为准：① **对话正文本来就不漏**——正文来自 `messages` 锚点 + run 文本表，且投影会给带 `meta.source` 的
+   **user** 消息**另外打 `synthetic: true`**，既有过滤早已拦住（宿主新加的那条 `!isEngineControlTurn` 是**冗余守卫**，
+   变异实测：撤掉它只有「直接喂 turn」那条用例会红）；② 投影对 **assistant** 消息会**连 `meta.source` 一起抹掉**
+   ⇒ 给 assistant 侧加守卫是**结构上接不住**的死代码，故意不加，并把该上游口径钉成用例（红 = 上游开始保留该字段，届时再评）。
+   **必须逐条消息判、不能按整行判**：`…:control:forced-final` 同一行里既有注入指令又有**不带 marker 的真终稿**，
+   按行滤会把终稿一起吞掉（#300 之后那就是「中止/失败 run 正文又空了」）——这条被变异钉住（整行判 ⇒ 2 红）。
+
+**被更正的历史记录**：**#303 重新挂账**（触发条件从「下次升引擎 minor」改成「旧 transcript 行被归档时」——
+`worker.js` 那句 `?? tr.duration` 回退读的是**我们盘上的旧行**，与引擎版本无关，0.22 不触发它）；
+§8.28 那句「`toolCallKey` 不接进卡片身份」被上游新的稳定 `erix.toolCallKey` **推翻**，但 #279 的用户标本未到，
+**本单不动前端卡片键**（没有复现材料就不要改行为，见 #279 重挂的判据）。
+
+**基线**：根 **1341 / 1337 通过 / 0 失败 / 4 跳过**（+49）、`node --test runner/test/*.test.js` **321/321**（+10）、
+前端 `typecheck` 干净 + **585 不变**（前端零改动）。台账三处已同步。
+
+**主 agent 亲跑的变异（不复用 worker 的）**：① 把 `samePayload(...)` 改永真 ⇒ 3 条「该 409」红；改永假 ⇒ 3 条「该幂等」红
+（**这两条在本单之前都不红**：曾经跑过 `internal.test.js`+`transcript-store.test.js` = 98 通过 / 0 失败 ⇒ 定性为真覆盖缺口）；
+② `ts` 塞回指纹 ⇒ 4 条具名红；③ 排除表清空 ⇒ 4 条红；④ 与上游对拍时排除表多塞一字段 ⇒ 3 条红；
+⑤ 撤宿主守卫 ⇒ 恰 1 红；⑥ 改整行判 ⇒ 2 红（含 forced-final）。
+
+⚠ **本单我自己的操作教训（代价 = 一次 amend）**：`git checkout -- <file>` 是从 **index** 复原，
+**未 `git add` 的改动会被「变异复原」一起抹掉**——我做 M3 变异时把刚写的守卫抹了，直到全量跑才露出来
+（那条新用例在全量里红、单跑绿）。**口径：做变异前先提交（或先 `git stash` 兜一份），别拿未入库的工作区当基线。**
+
+**已知边界（都是刻意口径，别当 bug 修）**：真 PG 上「撞键 ⇒ 插入出行 ⇒ 之后读回」那条支路**不可达**
+（部分唯一索引把并发串行化了）⇒ 它的行为面只在 fake 上成立；摘掉 key 白名单里的旧名不做（§8.25 同族）；
+`portal/src/internal.js` 端点侧**没有**真库级行为判据（只有 fake + 源码级「同一把尺」断言）。
+
+**发版与部署 / 真机**：见下（`TODO(主 agent)` 由发版当次填写）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 > 历史记录：本小节记录 0.9.0 升级时的契约与验收，不代表当前 0.14.0 API。

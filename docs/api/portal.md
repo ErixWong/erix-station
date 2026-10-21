@@ -2029,16 +2029,30 @@ store adapter 契约（runner §9.1）的落库端点；`transcript_rounds.recor
 { "inserted": true }
 ```
 
-**幂等与冲突（body hash）**：portal 落库用 `UNIQUE(run_id, round)` + `dedupKey` 双保险；命中 `(run_id, round)` 冲突时，portal 计算**入参与已存 `record` 的规范化 JSON 哈希**并比较：
+**幂等与冲突（payload 指纹）**：portal 落库用 `UNIQUE` 约束 + `dedupKey` 双保险；撞键时 portal 比较**入参与已存 `record` 的稳定指纹**（`sha256:<24 hex>`）：
+
+指纹口径（#333，与 erix-agent `src/store/transcript-dedup.js` 逐字对齐）：**只剔顶层**四个易变/身份键
+`dedupKey` / `roundKey` / `round` / `ts`，其余字段（**含嵌套层的 `ts`** 与宿主自有未知字段）都算 payload；
+顶层键顺序不影响指纹，数组顺序影响。本站实现 `portal/src/transcript-payload.js` 与上游真件按文件路径
+**逐字对拍**（`portal/test/transcript-payload.test.js`）——上游改算法即红，不是口头承诺。
 
 | 情形 | 响应 |
 |---|---|
 | 新 round（无冲突） | `200 {inserted: true}` |
-| 同 round + 同 `dedupKey` + **同 body（哈希相等）** | `200 {inserted: false}`（幂等命中，对齐上游 dedupKey 语义） |
-| 同 round + 同 `dedupKey` + **不同 body** | `409 round_conflict`（details 附已存 round 摘要；新 body 被拒） |
-| 同 round + **不同 `dedupKey`** | `409 round_conflict`（该 round 已存在，无论 body 是否相同） |
+| 同 key + **同 payload**（只漂顶层 `ts`/`round`） | `200 {inserted: false}`（幂等命中；既有行**一字不覆盖**） |
+| 同 key + **不同 payload** | `409 round_conflict`（`details` = `existingFingerprint` / `incomingFingerprint` / `differingFields`，最多 8 项；新 body 被拒，既有行不变） |
+| 同 round + **不同 `dedupKey`**（仅 U5 run 作用域） | `409 round_conflict`（该 round 已存在，无论 body 是否相同） |
 
-fold 语义（runner §9.3）：`folded` 行与原始行共享 `(run_id, round)` 键空间——fold 后原轮走 `UPDATE`（`folded=true` + `folded_payload`），**不插新行**，档案完整不删。fold 更新同样按上述冲突规则（同 round 同 body → 幂等，不同 body → `409 round_conflict`）。
+⚠ **剔除顶层 `ts`/`round` 是 0.22 的硬需求**（#333）：引擎新增的控制行/事实行每次写都带 `ts: new Date()`
+（`…:engine:round:<n>:control:<slot>` / `:fold:<fp>` / `:ttl:<fp>`），session 作用域下 `round` 也会漂（宿主取
+`MAX(round)+1`）⇒ 旧判据把顶层墙钟也算进哈希 ⇒ resume 重放**伪报 409** ⇒ 引擎按持久化失败处理（终局
+`persistence_failed`）。真冲突（换正文 / 数组换序）仍 `409 round_conflict`，**零新错误码**。
+
+引擎补充行（0.22 新增，同一对写入口）：`…:control:judge-nudge` / `:extend` / `:guard-revise` /
+`:forced-final`（治理注入）与 `:fold:<fp>` / `:ttl:<fp>`（事实行，`messages` 为空）。它们与轮记录同表同规则；
+**对话正文不展示控制文本**（`meta.source === 'judge-control'`，见 §4.4a 注）。
+
+fold 语义（runner §9.3）：`folded` 行与原始行共享同一键空间——fold 后原轮走 `UPDATE`（`folded=true` + `folded_payload`），**不插新行**，档案完整不删。fold 更新同样按上述冲突规则（同 payload → 幂等，不同 payload → `409 round_conflict`）。
 
 #### `GET /api/internal/runs/:id/transcript`（U6：load）
 
