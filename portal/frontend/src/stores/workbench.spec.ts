@@ -437,7 +437,8 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
       expect(judgeSep.text).toBe('judge：不建议扩轮 — 够用了');
       expect(judgeSep.variant).toBe('judge'); // feat-260925-02 judge 面板高亮 sep
     }
-    const card = store.es.toolCards.get('c1');
+    // issue #279：历史事件带 run_id ⇒ 卡片身份键含 run（这批事件无 round_start ⇒ 轮号段不拼）。
+    const card = store.es.toolCards.get('r1:c1');
     expect(card?.ok).toBe(true);
     expect(card?.out).toBe('✓ ok（5ms）');
     expect(store.es.lastSeq).toBe(5);
@@ -476,7 +477,7 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(store.es.activeRunId).toBe('r-active'); // 未被历史 run_end 清掉（停止按钮保持）
     expect(store.es.lastSeq).toBe(3); // 水位线仍按 detail.last_seq
     expect(store.entries.some((e) => e.kind === 'sep' && e.text.includes('run 结束'))).toBe(false);
-    expect(store.es.toolCards.has('c1')).toBe(true); // 展示事件正常重建
+    expect(store.es.toolCards.has('r1:c1')).toBe(true); // 展示事件正常重建（#279：身份键含 run_id）
     expect(store.running).toBe(true);
   });
 
@@ -866,7 +867,7 @@ describe('issue #188：DTO 投影字段（toolCalls/reasoning/blocks）加载路
     expect(reasoning && 'text' in reasoning ? reasoning.text : '').toBe('先看文件\n再看结果');
   });
 
-  it('同一 tool 调用（DTO 投影 + 历史事件）只渲染一张卡片（按 provider id 幂等归并）', async () => {
+  it('同一 tool 调用（DTO 投影 + 历史事件）只渲染一张卡片（同一把尺 + provider id 关联归并）', async () => {
     mockFetch((url) => {
       if (url.includes('/events/history')) {
         return {
@@ -902,9 +903,14 @@ describe('issue #188：DTO 投影字段（toolCalls/reasoning/blocks）加载路
     await store.openSession('s1');
 
     expect(store.entries.filter((e) => e.kind === 'tool').length).toBe(1);
-    // 事件流先建卡片：完整 args 保留，投影只补全缺失字段
-    expect(store.es.toolCards.get('c1')?.args).toBe('{"path":"src/a.js"}');
-    expect(store.es.toolCards.get('c1')?.argsSummary).toBe('path=src/a.js');
+    // 事件流先建卡片：完整 args 保留，投影只补全缺失字段。
+    // issue #279 顺带把这条钉成「两路轮号/run 对不上时仍只一张卡」的证据：事件侧那张的键是
+    // `r1:c1`（有 run_id、无轮号），投影那条**既没 run_id 也没 call.key** ⇒ 精确键是裸 `c1`，
+    // 命不中 ⇒ 走 provider id 的关联索引归并回 `r1:c1`（索引只用于找卡，不造身份）。
+    expect(store.entries.some((e) => e.kind === 'tool' && 'callId' in e && e.callId === 'r1:c1')).toBe(true);
+    expect(store.es.toolCards.get('c1')).toBeUndefined();
+    expect(store.es.toolCards.get('r1:c1')?.args).toBe('{"path":"src/a.js"}');
+    expect(store.es.toolCards.get('r1:c1')?.argsSummary).toBe('path=src/a.js');
   });
 
   it('provider id 缺失时用上游投影视图键 call.key（0.16.0 交付，替代自造 proj: 键）', async () => {
@@ -1461,5 +1467,196 @@ describe('issue #300：partial_output 归并成 kind:partial', () => {
     await store.openSession('s1');
     const [en] = store.entries.filter((e) => e.kind === 'partial');
     expect(en && en.kind === 'partial' && en.text).toBe('没有 run 归属');
+  });
+});
+
+// ===========================================================================
+// issue #279（投影路径）：DTO 的 `toolCalls[]` 在**同一个 run 里跨轮复用 provider id** 时，
+// 卡片身份必须靠「上游投影键自带的轮号段」分开（`call.key = "<round>#<record>:<entry>:t<i>"`）。
+// 这里同时钉住本单最贵的回归：**实时/历史事件卡片与刷新后的投影卡片必须归并成同一张**
+// （两路轮号同源：事件侧观测 round_start.round，投影侧取 call.key 前缀，都是引擎同一个轮计数器）。
+// ===========================================================================
+describe('issue #279：DTO 投影路径的卡片身份含轮号（刷新后不并卡、也不翻倍）', () => {
+  /** 一个 run 两轮、同 provider id、不同工具名（真机 id 复用的形状）。 */
+  const twoRoundMessage = {
+    id: 'm2', role: 'assistant', content: '完成', seq: 6, run_id: 'r1',
+    toolCalls: [
+      { key: '1#0:0:t0', name: 'readFile', id: 'c1', argsSummary: 'path=a.txt', resultPreview: 'FILE A', durationMs: 12 },
+      { key: '2#0:0:t0', name: 'edit', id: 'c1', argsSummary: 'path=a.txt oldText=x', resultPreview: 'conflict', isError: true, durationMs: 7 },
+    ],
+  };
+
+  it('仅凭 DTO（无事件）：同一个 id 两轮 ⇒ **两张卡**、名字各自正确、结果各自独立', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: { session: { id: 's1', active_run_id: null }, messages: [twoRoundMessage], last_seq: 6 },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect([...store.es.toolCards.keys()]).toEqual(['r1:1:c1', 'r1:2:c1']);
+    expect(store.es.toolCards.get('r1:1:c1')!.name).toBe('readFile');
+    expect(store.es.toolCards.get('r1:2:c1')!.name).toBe('edit');
+    expect(store.es.toolCards.get('r1:1:c1')!.ok).toBe(true);
+    expect(store.es.toolCards.get('r1:2:c1')!.ok).toBe(false);
+    expect(store.es.toolCards.get('r1:2:c1')!.resultPreview).toBe('conflict');
+    expect(store.entries.filter((e) => e.kind === 'tool')).toHaveLength(2);
+  });
+
+  it('历史事件 + DTO 同场：两条路**归并成同样两张**（既不并成一张，也不演成四张）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) {
+        return {
+          status: 200,
+          body: {
+            events: [
+              { seq: 2, run_id: 'r1', type: 'round_start', payload: { round: 1 } },
+              { seq: 3, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'readFile', input: { path: 'a.txt' } } },
+              { seq: 4, run_id: 'r1', type: 'tool_result', payload: { tool_call_id: 'c1', ok: true, result_digest: 'file A', duration_ms: 12 } },
+              { seq: 5, run_id: 'r1', type: 'round_start', payload: { round: 2 } },
+              { seq: 6, run_id: 'r1', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'edit', input: { path: 'a.txt', oldText: 'x' } } },
+            ],
+            next_cursor: null,
+          },
+        };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: { session: { id: 's1', active_run_id: null }, messages: [twoRoundMessage], last_seq: 6 },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    // 身份两张（不是四张、也不是一张）；占位也只两次 ⇒ StreamPanel 只会画两张卡
+    expect([...store.es.toolCards.keys()]).toEqual(['r1:1:c1', 'r1:2:c1']);
+    expect(store.entries.filter((e) => e.kind === 'tool')).toHaveLength(2);
+    // 事件侧字段（args/out/dur）保留，投影侧只补缺（#283「实时优先」口径不因本单改变）
+    expect(store.es.toolCards.get('r1:1:c1')!.args).toBe('{"path":"a.txt"}');
+    expect(store.es.toolCards.get('r1:1:c1')!.argsSummary).toBe('path=a.txt');
+    expect(store.es.toolCards.get('r1:1:c1')!.dur).toBe(12);
+    expect(store.es.toolCards.get('r1:2:c1')!.name).toBe('edit');
+    expect(store.es.toolCards.get('r1:2:c1')!.args).toBe('{"path":"a.txt","oldText":"x"}');
+    expect(store.es.toolCards.get('r1:2:c1')!.resultPreview).toBe('conflict');
+    expect(store.es.toolCards.get('r1:2:c1')!.ok).toBe(false); // 第二轮的 isError 不得写进第一轮那张
+  });
+
+  it('provider id 缺失的两轮调用：上游 `call.key` 本身含轮号 ⇒ 仍各一张（§8.5 形状不回归）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            last_seq: 6,
+            messages: [{
+              id: 'm2', role: 'assistant', content: '完成', seq: 6, run_id: 'r1',
+              toolCalls: [{ key: '1#0:0:t0', name: 'readFile' }, { key: '2#0:0:t0', name: 'edit' }],
+            }],
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect([...store.es.toolCards.keys()]).toEqual(['1#0:0:t0', '2#0:0:t0']);
+    expect(store.es.toolCards.get('2#0:0:t0')!.name).toBe('edit');
+  });
+
+  it('id/key 都缺 ⇒ `proj:<消息 id>:<序号>` 兜底仍在（两条各一张，序号不同）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            last_seq: 6,
+            messages: [{
+              id: 'm2', role: 'assistant', content: '完成', seq: 6, run_id: 'r1',
+              toolCalls: [{ name: 'readFile' }, { name: 'edit' }],
+            }],
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect([...store.es.toolCards.keys()]).toEqual(['proj:m2:0', 'proj:m2:1']);
+    expect(store.es.toolCards.get('proj:m2:1')!.name).toBe('edit');
+  });
+
+  // 变异取证补的用例：把 mergeTargetByAlias 的「跨 run 不归并」守卫删掉时，原先 623 条**全绿**
+  // （变异没红有两种成因：覆盖真有缺口 / 变异是空操作。这里实测它**会**改变行为 ⇒ 属覆盖缺口，补上）。
+  it('归并兜底**不跨 run**：别的 run 留下的同 id 卡片不许接走本 run 的投影字段', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) {
+        return {
+          status: 200,
+          body: {
+            events: [
+              // 上一个 run 的同名调用（provider id 复用，且这批事件没有 round_start ⇒ 键是 `rA:c1`）
+              { seq: 2, run_id: 'rA', type: 'tool_use', payload: { tool_call_id: 'c1', name: 'readFile', input: {} } },
+            ],
+            next_cursor: null,
+          },
+        };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            last_seq: 6,
+            messages: [{
+              id: 'm2', role: 'assistant', content: '完成', seq: 6, run_id: 'rB',
+              toolCalls: [{ name: 'edit', id: 'c1', argsSummary: 'path=a.txt', resultPreview: 'B 的预览' }],
+            }],
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect([...store.es.toolCards.keys()]).toEqual(['rA:c1', 'rB:c1']);
+    // 投影字段只落在**本 run** 那张上；`rA:c1` 一个字都不许被隔壁 run 的投影改写
+    expect(store.es.toolCards.get('rB:c1')!.resultPreview).toBe('B 的预览');
+    expect(store.es.toolCards.get('rA:c1')!.resultPreview).toBeUndefined();
+    expect(store.es.toolCards.get('rA:c1')!.name).toBe('readFile');
+    expect(store.entries.filter((e) => e.kind === 'tool')).toHaveLength(2);
+  });
+
+  it('投影键缺轮号（上游写 `?` 或形状不符）⇒ 键退化成 `r1:c1`，**不伪造轮号**', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null },
+            last_seq: 6,
+            messages: [{
+              id: 'm2', role: 'assistant', content: '完成', seq: 6, run_id: 'r1',
+              toolCalls: [{ key: '?#0:0:t0', name: 'readFile', id: 'c1' }],
+            }],
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect([...store.es.toolCards.keys()]).toEqual(['r1:c1']);
   });
 });

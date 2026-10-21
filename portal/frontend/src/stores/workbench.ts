@@ -12,8 +12,9 @@
 import { defineStore } from 'pinia';
 import { computed, ref, watch } from 'vue';
 import { api, ApiError, patchSessionTitle, postSessionAiTitle, toDisplayText } from '../api';
+import { projectionRoundToken, runSegment, toolCardKey as buildToolCardKey } from '../lib/toolCardKey';
 import { i18n } from '../i18n';
-import { useEventStream, RUN_FAIL_REASONS, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
+import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
@@ -168,16 +169,32 @@ export function setWorkbenchHooks(h: WorkbenchHooks): void {
 }
 
 /**
- * issue #188 工具卡片 key：优先上游 provider `id`——它与实时/历史事件流的 `tool_call_id` 同源，
- * 两条路据此天然幂等归并（同一调用只渲染一张卡片）。`id` 缺失/重复由 provider 决定（可缺失/可重复）；
- * erix-agent 0.16.0 起上游为每个 toolCall 提供稳定视图键 `call.key`（由输入位置生成、单次投影内唯一、
- * 同输入确定性；**不是持久 ID、也不是 provider `tool_use.id`**）→ `id` 缺失时用它作卡片身份，
- * 不再自造 `proj:<锚点 id>:<序号>`（仅当 `id`/`key` 都缺失时保留该兜底）。
+ * issue #188 工具卡片身份（**投影路径**）。issue #279 后与实时路共用 `lib/toolCardKey.ts` 那一把尺：
+ *   * `id` 在 ⇒ 身份 = `<run_id>:<轮号>:<id>`。轮号**不伪造**：取上游投影键 `call.key` 自带的轮号段
+ *     （erix-agent `projection.js:449-455`：`"<round>#<recordIndex>:<entryIndex>:t<i>"`，轮号缺位时
+ *     上游自己写 `?`）——它与实时路观测到的 `round_start.round` 是引擎同一个轮计数器，所以实时卡片
+ *     与刷新后的投影卡片仍归并成一张（§8.5「与实时 `tool_call_id` 同源 ⇒ 天然归并」仍成立，只是
+ *     现在多了一段轮号）。同时把 `id`/`run_id` 作为**关联别名**交给下游索引：两路轮号真对不上时
+ *     （实时漏收 round_start）用索引归并，不得拿它造身份。
+ *   * `id` 缺、`key` 在 ⇒ 直接用上游 `key`（§8.5，它本身就含轮号 ⇒ 跳轮不碰撞，无需再拼）。
+ *   * 两者都缺 ⇒ `proj:<锚点 id>:<序号>` 兜底照旧。
+ * ⚠ §8.5 那句「投影 `key` 不是持久 ID、也不是 provider `tool_use.id`」仍然成立：这里只**从它里
+ * 面取轮号**，没有把它当跨投影耐久的身份。
  */
-function toolCallKey(messageId: string, call: ProjectedToolCall, index: number): string {
-  if (typeof call.id === 'string' && call.id !== '') return call.id;
-  if (typeof call.key === 'string' && call.key !== '') return call.key;
-  return `proj:${messageId}:${index}`;
+function toolCardIdentity(messageId: string, messageRunId: string | null | undefined, call: ProjectedToolCall, index: number): {
+  key: string;
+  alias?: CardAlias;
+} {
+  const id = typeof call.id === 'string' && call.id !== '' ? call.id : null;
+  if (id !== null) {
+    const roundToken = projectionRoundToken(call.key);
+    return {
+      key: buildToolCardKey(messageRunId, roundToken, id),
+      alias: { key: buildToolCardKey(messageRunId, roundToken, id), runId: runSegment(messageRunId), roundToken, callId: id },
+    };
+  }
+  if (typeof call.key === 'string' && call.key !== '') return { key: call.key };
+  return { key: `proj:${messageId}:${index}` };
 }
 
 /**
@@ -333,7 +350,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       m.toolCalls.forEach((call, index) => {
         // issue #283：整个 call（含宿主 join 的 `durationMs`）一并交给 projectToolCard——
         // 刷新后卡片仍能显示耗时，但实时路已拿到的值不会被它覆盖（覆盖规则在 composable 里）。
-        es.projectToolCard(toolCallKey(m.id, call, index), call);
+        // issue #279：身份键与实时路同一把尺（含轮号），另把 provider `id`/`run_id` 作为关联别名传过去。
+        const ident = toolCardIdentity(m.id, m.run_id, call, index);
+        es.projectToolCard(ident.key, call, ident.alias);
       });
     }
     // 仅助手终稿渲染 Markdown 子集（先转义后格式化，XSS 安全）；用户消息与系统注入
