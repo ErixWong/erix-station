@@ -2058,6 +2058,11 @@ fold 语义（runner §9.3）：`folded` 行与原始行共享同一键空间—
 
 query（均可选）：`?limit=<1..10000，默认 10000 ⚠️>`、`?cursor=<round>`（返回 `round > cursor` 的记录）。
 
+> **游标口径（#338）**：本端点（run 作用域 legacy）的游标仍是**单个 round 号**，**故意不改**——它的行空间由
+> `UNIQUE (run_id, round)` 约束（迁移 0006 保留至今）⇒ 一轮恒一行 ⇒ 「页边界切在一轮肚子里」在结构上不存在；
+> 且 0.23+ 引擎只走 session 端点（§9.8b），本端点仅**版本错配**可达。session 端点的游标已换成
+> `(round, append_seq)` 真 keyset（见 §9.8b S1）。
+
 响应 `200`：
 
 ```json
@@ -2069,7 +2074,12 @@ query（均可选）：`?limit=<1..10000，默认 10000 ⚠️>`、`?cursor=<rou
 | `records` | 按 `round` **升序**，`record` 列原样返回（每项含 `round`） |
 | `next_cursor` | 本页最后一条的 `round`；无更多记录时为 `null` |
 
-**分页/大小约束**：`limit` 限定单响应对数（默认 10000 ⚠️）；上游 `load(runId)` 语义 = 不带 query 拉全量（run 的 round 数超出 10000 时由 adapter 用 `cursor` 循环拉取）；portal 对单响应序列化体设 **8MB** ⚠️ 上限，单条 record 超限 → `400 response_too_large`（details 附 `round`）。
+**分页/大小约束**：`limit` 限定单响应**行数**（默认 10000 ⚠️）；上游 `load(runId)` 语义 = 不带 query 拉全量（行数超出 `limit` 时由 adapter 用 `cursor` 循环拉取，`next_cursor` 为 `null` 即到底）。
+
+> ⚠ **读侧没有体积闸（2026-10-22 更正）**：本节旧文写着「portal 对单响应序列化体设 8MB 上限，单条 record 超限 → `400 response_too_large`」——
+> `grep -rn response_too_large portal/src` **零命中**，该错误码与那道闸**不存在**（体积闸只在**写**侧：
+> `INTERNAL_ROUND_LIMIT = 1.5MB`，`portal/src/http.js` 的 `PUT …/rounds/:round`；超限是 `413 payload_too_large`）。
+> 读侧的实际上限是**行数** `limit`（≤10000），单条 record 再大也照发（`record` 列写入时已被 1.5MB 卡住）。
 
 **404/终态/lease 语义**：run 不存在 → `404 run_not_found`；不属本容器 → `403 run_ownership_mismatch`；`X-Claim-Token` 失配 → `409 lease_lost`；**终态 run 仍可读**（transcript 是 resume/审计源，不可变但不拒绝读）→ `200`。
 
@@ -2212,12 +2222,30 @@ query 参数 + `X-Claim-Token` 头——writer run 必须属于该 session（否
 
 | 端点 | 语义 |
 |---|---|
-| `GET /api/internal/transcript/:key` | load 全量（`limit`/`cursor` 分页，cursor 以 round 为游标） |
+| `GET /api/internal/transcript/:key` | load 全量（`limit`/`cursor` 分页；**cursor 是不透明串** `<round>:<append_seq>`，见下「S1 分页」） |
 | `PUT /api/internal/transcript/:key/rounds/:round` | appendRound（body = RoundRecord 全量，dedupKey 必填 ≤256 字符，body ≤1MB） |
 | `PUT /api/internal/transcript/:key/checkpoint` | saveCheckpoint / appendCheckpoint（revision CAS，旧 revision 409 `checkpoint_stale`） |
 | `GET /api/internal/transcript/:key/checkpoint/latest` | loadLatestCheckpoint；无 → 204 |
 | `PUT /api/internal/transcript/:key/runstate` | saveRunState `{run_state}` / markRunState 终态标记 `{state}`（合并写，blob 并入 `runId = :key`，引擎契约 `loadRunState(key).runId === key`）；不动 `runs.status` |
 | `GET /api/internal/transcript/:key/runstate` | loadRunState；无 → 204 |
+
+**S1 分页（`GET /api/internal/transcript/:key`，issue #338）**：
+
+- `?limit=<1..10000，默认 10000>`：**按行**截断（量纲是**行**，不是轮——0.23 账本一轮是多行：
+  1 条载体 `:engine:round:<n>` + 1 条 assistant `:msg:<n>:0` + 每个工具调用 1 条 `:msg:`，实测约
+  2–3.3 行/轮 ⇒ 一页 10000 行 ≈ 3000–5000 轮）。
+- `?cursor=<round>:<append_seq>`：**不透明串**，即 `(round, append_seq)` 的**全序断点**（游标值不要自己拼，
+  只把上一页的 `next_cursor` 原样回传）。服务端按 `(round, append_seq) > (cursor_round, cursor_seq)` 取行，
+  索引 `transcript_rounds_session_append_idx (transcript_key, round, append_seq)` 直接支撑（零 DDL）。
+- 响应：`{ "records": [...], "next_cursor": "<round>:<append_seq>" | null }`。`records` 的字段集与
+  **写入口的 record 逐字相同**（`append_seq` 是分页内部列，**不进**返回集）；`next_cursor` = 本页**最后一行**
+  的断点，**本页 0 行时才为 `null`**（取到行就必须给游标，哪怕正好切在一轮中间）。
+- **允许一轮跨页，绝不跳行**：旧实现只带 round 且过滤 `round > cursor`（严格大于）⇒ 页边界切在一轮肚子里时
+  该轮剩余行被**永久跳过** ⇒ 引擎 `foldLedgerMessages` 建出的序列里 `tool_use` 没结清 ⇒ `validateMessages`
+  抛 `invalid_messages`（切点稳定、重试无效）。故 `records` 里**同 round 可能分布在相邻两页**，调用方必须
+  按 `next_cursor` 翻到底再拼，不得用「round 变了」当页边界。
+- 游标形态非法（不匹配 `^[0-9]+:[0-9]+$`，含旧版纯数字游标）⇒ `400 validation_failed`（`details.field = 'cursor'`，
+  **零新错误码**）。**故意不做**纯数字旧游标兼容：唯一消费者是 agentd，它只回传 portal 给的串。
 
 **runner 侧接线**：`markRunState('running')` 仍走 U2 真 runId（runs 表生命周期，sessionId 绝不进 U2）；
 宿主预写 dedupKey = `<key>:input:<messageId>`（`messageId` 经 U1 ticket `run.message_id` 下行）；

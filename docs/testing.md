@@ -376,7 +376,7 @@ internal 通道与公开端点的 `validation_failed` **统一为 `400`**（port
 | U3 events | 空批次 `200 {stored:0,seq_first:null,seq_last:null}`、重复批次 `stored<条数`、`400`（超限/非对象 payload/格式非法）、终态 `409 run_terminal`（portal §9.4） |
 | U4 heartbeat | 逐 run 续租 `renewed` / `lease_lost`（reason 取值）、吊销经 `401 token_revoked`（非 200 `revoked:true`，审计 #34 F-C）、`stop_run_ids` 兑底（portal §9.5） |
 | U5 transcript | 同 round 同 body `200 {inserted:false}` / 不同 body `409 round_conflict` / 不同 dedupKey `409 round_conflict`（portal §9.7） |
-| U6/U7 load/recall | 分页 `next_cursor`、`400 response_too_large`、U7 `501 not_implemented` 降级（P1 可 501，portal §9.7） |
+| U6/U7 load/recall | 分页 `next_cursor`（U6 run 作用域 = round 号；S1 session 作用域 = 不透明串 `<round>:<append_seq>`，portal §9.8b）、U7 `501 not_implemented` 降级（P1 可 501，portal §9.7）。⚠ 旧文列的 `400 response_too_large` **不存在**（`grep -rn response_too_large portal/src` 零命中；读侧无体积闸，见 portal §9.7 更正） |
 | U8/U9 checkpoint | 首次/前进 `200`、`409 checkpoint_stale`、`204`（无）、终态仍可读（portal §9.8） |
 | U10/U11 approvals | 重复创建返回原单 `200`、`409 approval_expired` 迟到决定、U11 轮询（portal §9.10） |
 | U12 release | `requeued`/`failed_max_attempts`/`cancelled` 三分支 + 重复 release 幂等 + `409 lease_lost`（portal §9.11） |
