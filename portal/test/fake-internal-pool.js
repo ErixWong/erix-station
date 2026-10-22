@@ -468,16 +468,36 @@ export class FakeInternalPool {
         .map((x) => ({ round: x.round, record: x.record, folded_payload: x.folded_payload ?? null }));
       return { rows };
     }
-    if (sql.includes('SELECT round, record FROM transcript_rounds') && sql.includes('transcript_key')) {
-      const [key, cursor, limit] = params;
-      // 0.16.0 同 round 保序：round 内按 append_seq（持久化追加序；fake 用 created_at 兼容种子行）。
-      const rows = this.rounds
-        .filter((x) => x.transcript_key === key && x.round > cursor)
-        .sort((a, b) => (a.round - b.round)
-          || ((a.append_seq ?? a.created_at ?? 0) - (b.append_seq ?? b.created_at ?? 0)))
-        .slice(0, limit)
-        .map((x) => ({ round: x.round, record: x.record }));
-      return { rows };
+    // issue #338：session transcript 读面是**按行**的 `(round, append_seq)` 真 keyset。
+    // 规矩：**照 SQL 文本裁决**——谓词写的是行值比较还是只比 round，由 SQL 自己说了算，
+    // 不替产品兜底。旧语义分支留着不是「宽容」：恰恰相反，若 fake 只有 keyset 一支，
+    // 有人把谓词改回 `AND round > $2` 时 fake 会拿旧参数集硬套 keyset 语义，
+    // M1 变异就变成**空操作**（#338 的丢行 bug 在单测里永远复现不出来）。
+    // append_seq 是 bigint：真 pg 驱动把它当**字符串**返回，fake 也返回字符串。
+    if (sql.includes('SELECT round, record, append_seq FROM transcript_rounds') && sql.includes('transcript_key')) {
+      // 种子行可能没有 append_seq（历史测试只填 created_at）⇒ 同排序口径回落，保证全序可比。
+      const seqOf = (x) => Number(x.append_seq ?? x.created_at ?? 0);
+      const sorted = (rows) => rows
+        .sort((a, b) => (a.round - b.round) || (seqOf(a) - seqOf(b)))
+        .map((x) => ({ round: x.round, record: x.record, append_seq: String(seqOf(x)) }));
+      if (sql.includes('(round, append_seq) > (')) {
+        const [key, cursorRound, cursorSeq, limit] = params;
+        const cr = Number(cursorRound);
+        // 断点比较用 BigInt（真库 append_seq 是 bigint，可能超 Number.MAX_SAFE_INTEGER；
+        // Number 比较会把 9007199254740993 和 …992 当相等 ⇒ fake 比真库宽松）。
+        const cs = BigInt(cursorSeq);
+        return {
+          rows: sorted(this.rounds.filter((x) => x.transcript_key === key
+            && (x.round > cr || (x.round === cr && BigInt(seqOf(x)) > cs)))).slice(0, limit),
+        };
+      }
+      // #338 之前的形态（`AND round > $2`，3 个参数）：谓词只看 round ⇒ 同 round 的后继行被跳过。
+      // 只在产品真的回退时才走到这里（正常路径上一分支就 return 了）。
+      const [key, cursorRound, limit] = params;
+      return {
+        rows: sorted(this.rounds.filter((x) => x.transcript_key === key && x.round > Number(cursorRound)))
+          .slice(0, limit),
+      };
     }
 
     // ---- transcript rounds（run 作用域读；session 读分支在前）----
