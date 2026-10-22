@@ -29,7 +29,9 @@ const ORDERED_READS = [
   ['internal.js', 'SELECT round, record, folded_payload FROM transcript_rounds', /ORDER BY round ASC, append_seq ASC LIMIT 2000/],
   // 上游 worker 已改的引擎读路径一并上锁，防止后续回退。
   ['internal.js', 'WHERE run_id = $1 AND round > $2', /ORDER BY round ASC, append_seq ASC LIMIT \$3/],
-  ['internal.js', 'WHERE transcript_key = \$1 AND round > \$2', /ORDER BY round ASC, append_seq ASC/],
+  // issue #338：session 读路径改成 `(round, append_seq)` 真 keyset——断点两列都得进谓词，
+  // 否则页边界切在一轮肚子里就会丢行（旧锚点 `AND round > $2` 已随该修复退役）。
+  ['internal.js', 'WHERE transcript_key = \$1 AND (round, append_seq) > (\$2::int, \$3::bigint)', /ORDER BY round ASC, append_seq ASC/],
 ];
 
 test('0.16.0 同 round 保序：所有 transcript_rounds 多行读 SQL 按 append_seq 排序', () => {
