@@ -1066,6 +1066,11 @@ export async function putRound(pool, { container, user, runId, round, claimToken
 
 // issue #337：**故意不折**——run 作用域 legacy 端点；0.23 起新数据只写 session 作用域行
 // （`run_id` 恒 NULL）⇒ 消息行根本不在本端点的命中集里，折了也是空转。
+// issue #338：**同样的「只带 round 的游标」缺陷故意不在这里改**。理由——本端点只有
+// **版本错配**可达（0.23+ runner 走 session 端点；`agentd` 仅在 `ctx.sessionId == null`，即旧 portal
+// 回退分支才打这里），且它的行空间是 `(run_id, round)`，`UNIQUE (run_id, round)` 从 0006 起就
+// 保证同 round 一行 ⇒ 「页边界切在一轮肚子里」在结构上不存在。改它 = 改一个测不到的端点、
+// 把游标契约分叉成两种，纯负收益。
 export async function getTranscript(pool, { container, user, runId, claimToken, limit = 10000, cursor = null }) {
   const run = await fetchRun(pool, runId, user.id);
   if (!isTerminal(run.status)) await assertClaimToken(pool, runId, claimToken);
@@ -1305,28 +1310,43 @@ export async function putSessionRound(pool, { container, user, key, round, claim
 /** session transcript 全量读取（load 分页；行序 = round ASC, append_seq ASC——行号可复用，
  *  同 round 多行按**持久化追加序**（迁移 0016 的 append_seq），恢复后的消息顺序才正确；
  *  erix-agent 0.16.0 起引擎不再二次排序，故宿主必须显式保序，不得依赖 created_at/执行计划）。
- *  cursor 以 round 为游标：同 round 行必同页（LIMIT 截断的极端大会话才可能出现跨页同行号，
- *  单会话 >10000 轮超出 P2 范围）。
+ *
+ *  **容量口径（#338 更正）**：`LIMIT` 的量纲是**行**，不是轮——0.23 账本一轮是多行（1 条载体
+ *  `:engine:round:<n>` + 1 条 assistant `:msg:<n>:0` + 每个工具调用 1 条 `:msg:`），实测约 2–3.3 行/轮
+ *  ⇒ 一页 10000 行 ≈ 3000–5000 轮（旧注释写「10000 轮」高估了 2–3 倍）。
+ *
+ *  **游标（#338）**：`cursor` 是**不透明串** `"<round>:<append_seq>"`，即**全序断点**——按
+ *  `(round, append_seq)` 做真 keyset（`(round, append_seq) > ($2,$3)`，被索引
+ *  `transcript_rounds_session_append_idx (transcript_key, round, append_seq)` 吃成 Index Cond，零 DDL）。
+ *  旧实现只带 round 且过滤 `round > cursor`（严格大于）⇒ 页边界切在一轮肚子里时该轮剩余行被
+ *  **永久跳过** ⇒ 引擎 `foldLedgerMessages` 建出的消息序列里 `tool_use` 没结清 ⇒ `validateMessages`
+ *  抛 `invalid_messages`（切点稳定、重试无效）。故：**允许一轮跨页，绝不跳行**。
  *
  *  issue #337：**故意不折**——这是引擎 resume 取上下文的面，引擎自己会 `foldLedgerMessages`
  *  （`resume-manager.js`），站内再折是多余一遍；且 `LIMIT` 按**行**在 SQL 侧生效，折在后面
- *  对容量无益（容量口径另记 #338）。 */
+ *  对容量无益。 */
 export async function getSessionTranscript(pool, { container, user, key, claimToken, writerRunId, limit = 10000, cursor = null }) {
   await fetchSession(pool, key, user.id);
   await fetchWriterRun(pool, writerRunId, user.id, key);
   await assertClaimToken(pool, writerRunId, claimToken);
 
   const lim = Math.min(Math.max(1, Number(limit) || 10000), 10000);
-  const cur = cursor == null ? -1 : Number(cursor);
+  // 首屏（无 cursor）= 从头：`(-1, -1)` 严格小于任何真实行（round ≥ 0，append_seq 由 nextval 起恒 ≥ 1）。
+  // append_seq 是 bigint ⇒ **JS 侧全程字符串**（可能超 Number.MAX_SAFE_INTEGER），只在 SQL 侧 ::bigint。
+  const [curRound, curSeq] = cursor == null ? ['-1', '-1'] : String(cursor).split(':');
   const res = await pool.query(
-    `SELECT round, record FROM transcript_rounds
-      WHERE transcript_key = $1 AND round > $2
+    `SELECT round, record, append_seq FROM transcript_rounds
+      WHERE transcript_key = $1 AND (round, append_seq) > ($2::int, $3::bigint)
       ORDER BY round ASC, append_seq ASC
-      LIMIT $3`,
-    [key, cur, lim],
+      LIMIT $4`,
+    [key, curRound, curSeq, lim],
   );
+  // 先算游标、再剥 append_seq：`append_seq` 是分页内部列，**绝不进返回集**（0.23 契约：
+  // 宿主/引擎可见的 record 形状不变）。终止性：只有「本页没取到行」才 null——取到行就必须给游标，
+  // 哪怕正好切在一轮中间（否则最后一页非空 + next_cursor=null 之外的任何「提前收工」都会丢行）。
+  const last = res.rows[res.rows.length - 1];
+  const nextCursor = last ? `${Number(last.round)}:${String(last.append_seq)}` : null;
   const records = res.rows.map((r) => ({ round: Number(r.round), ...r.record }));
-  const nextCursor = records.length > 0 ? records[records.length - 1].round : null;
   return { records, next_cursor: nextCursor };
 }
 

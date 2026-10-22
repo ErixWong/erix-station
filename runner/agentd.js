@@ -491,22 +491,36 @@ async function handleStoreRequest(ctx, method, args, deps = {}) {
       return r.data;
     }
     case 'load': {
-      // 分页循环拉全量（runner §9.1 注：超出 10000 轮时循环；P1 单页足够）。
+      // 分页循环拉全量（runner §9.1 注）：游标是 portal 给的**不透明串** `<round>:<append_seq>`
+      // （issue #338 真 keyset）——原样回传并 encodeURIComponent，**绝不 Number()**（会变 NaN ⇒ 死循环）。
       const records = [];
       let cursor = null;
+      let pages = 0;
+      let maxRound = null;
       const basePath = sessionKey
         ? `/transcript/${encodeURIComponent(assertSessionKey(ctx, args))}`
         : `/runs/${runId}/transcript`;
       for (;;) {
-        const paging = cursor == null ? 'limit=10000' : `limit=10000&cursor=${cursor}`;
+        const paging = cursor == null ? 'limit=10000' : `limit=10000&cursor=${encodeURIComponent(cursor)}`;
         const qs = sessionKey ? `?${paging}&run_id=${encodeURIComponent(runId)}` : `?${paging}`;
         const r = await withRetry(
           () => request('GET', `${basePath}${qs}`, { claimToken: ctx.claimToken }),
           { what: `load ${sessionKey ? `key=${sessionKey}` : `run=${runId}`}` },
         );
-        records.push(...(r.data?.records ?? []));
+        const page = r.data?.records ?? [];
+        pages += 1;
+        records.push(...page);
+        for (const rec of page) {
+          if (Number.isFinite(rec?.round) && (maxRound === null || rec.round > maxRound)) maxRound = rec.round;
+        }
         cursor = r.data?.next_cursor ?? null;
         if (cursor == null) break;
+      }
+      // 纯可观测：分页真的发生过才记一条（不是 run event、不前进 run_events、零新错误码）。
+      if (pages > 1) {
+        log('warn', 'transcript load paged', {
+          key: sessionKey ?? runId, run_id: runId, pages, rows: records.length, max_round: maxRound,
+        });
       }
       return { records };
     }

@@ -2529,7 +2529,14 @@ async function handleInternal(req, res, ctx, url) {
     if (sub === '') {
       if (req.method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
       const limit = Number(url.searchParams.get('limit') || 10000);
-      const cursor = url.searchParams.get('cursor') ? Number(url.searchParams.get('cursor')) : null;
+      // issue #338：游标是**不透明串** `<round>:<append_seq>`（真 keyset 断点），必须**原样透传**——
+      // 旧代码 `Number(...)` 会把 `"1:1070"` 变成 `NaN` ⇒ 第二页从「从头」重读 ⇒ agentd 的分页循环
+      // 永不终止（死循环 + 无限重复行）。形态校验失败 ⇒ 400 `validation_failed`（零新错误码）；
+      // **故意不做**「纯数字旧游标」双形态兼容：唯一消费者是 agentd，它只回传 portal 给的串。
+      const cursor = url.searchParams.get('cursor');
+      if (cursor !== null && !/^[0-9]+:[0-9]+$/.test(cursor)) {
+        throw new HttpError(400, 'validation_failed', 'cursor 必须为 `<round>:<append_seq>` 形式的不透明游标', { details: { field: 'cursor' } });
+      }
       const result = await internal.getSessionTranscript(ctx.pool, { ...base, limit, cursor });
       return sendJson(res, 200, result);
     }
