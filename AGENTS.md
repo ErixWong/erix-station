@@ -1174,6 +1174,37 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 但 pi 的 playwright MCP 走的是它、工作正常——**先用 MCP 工具，别自己手写 JSON-RPC**。
 
 
+### 8.39 session transcript 分页换成 `(round, append_seq)` 真 keyset（issue #338，2026-10-22）
+
+**缺陷本体（真库实测，不是推论）**：`getSessionTranscript` 的 `LIMIT` 量纲是**行**，游标却只带 `round` 且过滤 `round > cursor`（严格大于）⇒ 页边界切在一轮肚子里时，该轮剩余行被**永久跳过**。0.23「一轮 = 多行」把这件事从极端变成常态（dev 实测 2.2–3.3 行/轮）。后果不是「少几行」：引擎 `foldLedgerMessages` 建出的消息序列里 `tool_use` 没结清 ⇒ `validateMessages` 抛 **`invalid_messages`**，而切点由行数决定、稳定重现 ⇒ **重试无效，会话砖化**。
+
+**触发面比「崩溃恢复」宽**：`runner/lib/transcript-seed.js:17-22` 只要账本非空就返回 `resume: true` ⇒ **第二条消息起每一条**都走账本重建。dev 单会话最大 106 行所以现网还没撞；这是「注册过的雷」不是「正在流血」。
+
+**修法 = 真 keyset，不是调大 limit**（调大只是把页边界推远；且 `limit` 已被钳在 10000）。三处一把尺：
+- `portal/src/internal.js#getSessionTranscript`：SQL 用**行值比较** `(round, append_seq) > ($2::int, $3::bigint)`，`ORDER BY round ASC, append_seq ASC` 不变；`next_cursor` = 本页**末行**的 `"<round>:<append_seq>"`，**本页 0 行才 `null`**；**先算游标再剥 `append_seq`** ⇒ 返回 record 的字段集与改前逐字相同（分页内部列不外泄）。
+- `portal/src/http.js`：游标**原样字符串透传**（旧 `Number(...)` 会把 `"1:1070"` 变成 `NaN` ⇒ 第二页从头重读 ⇒ agentd 循环永不终止），形态校验 `^[0-9]+:[0-9]+$`，非法 ⇒ `400 validation_failed` + `details.field='cursor'`（**零新错误码**）。⚠ **`append_seq` 是 bigint**：JS 侧全程字符串、只在 SQL 侧 `::bigint`（`Number()` 在 `> 2^53` 会静默错值）。
+- `runner/agentd.js`：`encodeURIComponent(cursor)` + `pages > 1` 时一条 warn（纯可观测，**不是 run event**、不前进 `run_events`）。
+
+**零 DDL 的实测依据**：PG 的行值构造器能吃既有复合索引 —— `EXPLAIN` 里 `Index Scan using transcript_rounds_session_append_idx`、`Index Cond: ((transcript_key = …) AND (ROW(round, append_seq) > ROW(1, '1070'::bigint)))`。（MySQL/MariaDB 的 range 优化不吃多列构造器，那是**别的库**的告诫，本项目不适用。）
+
+**故意不做的三件事**（都写进了注释/文档，别当漏做）：① **run 作用域 legacy `getTranscript` 不改** —— `UNIQUE (run_id, round)` 保证一轮一行、结构上无跨页，且 0.23+ 只有版本错配可达；② **不做纯数字旧游标双形态兼容** —— 唯一消费者是 agentd，它只回传 portal 给的串，兼容分支不可测；③ **不在服务端折叠**（折叠属另一片，且必须先有「不丢行」的分页，否则半轮被折进去）。
+
+**顺带清掉一处文档假话**：`docs/api/portal.md` 与 `docs/testing.md` 都写着「单响应序列化体 8MB 上限 ⇒ `400 response_too_large`」——`grep -rn response_too_large portal/src` **零命中**，读侧从来没有体积闸（体积闸在**写**侧：`INTERNAL_ROUND_LIMIT = 1.5MB` ⇒ `413 payload_too_large`）。
+
+**测试口径**：根 **1369 → 1378**（1374 通过 / 0 失败 / 4 跳过）、runner **321 → 323**、前端 **36 文件 / 640** 不变（`portal/frontend` 零字节）。判据形状是本案的关键：**分页并集与单页全量按 `[round, dedupKey]` 逐项有序全等**，不是「条数相等」也不是「集合相等」——后两种在旧语义下恰好也成立（少 2 行、无重复）。新 `portal/test/transcript-keyset-wiring.test.js` 跨文件钉三处（SQL 谓词 / http 透传 / agentd 回传）。⚠ **`fake-internal-pool` 保留旧语义分支并按 SQL 文本裁决**：只留 keyset 一支的话，「谓词改回 `AND round > $2`」这条变异会被 fake 用旧参数硬套 keyset 语义兜成**空操作**——fake 不许替 mutant 兜底（§8.14 同族）。既有源码护栏 `append-seq-ordering.test.js` 的锚点随旧谓词退役一起重锚，**保序断言一字未放**（下面变异 ① 证明它还有牙）。
+
+**主 agent 亲跑变异 3 条全红在具名用例**（每条先证只改 1 行且行为真变，不复用 worker 的 5 条）：① `ORDER BY` 丢掉 `append_seq` ⇒ 恰 1 条红在重锚后的保序护栏；② `append_seq` 漏进返回 record ⇒ 恰 1 条红在 P1；③ 游标形态放宽成接受纯数字 ⇒ 恰 1 条红在非法形态负例。worker 另跑 5 条（含「`next_cursor` 只回 round 段」实测**先被 http 形态校验挡成 400**，于是另用「游标取本页首行」证明「重复读」那条断言不是死的 —— 防御有两层，诚实记录命中在哪一层）。
+
+**真机 A/B（同一真库、同一会话 `4becb332…`，7 行 / 3 轮；探针脚本只桩掉「租约断言」那一条查询，transcript SQL 打真库）**：
+- 修复前（**部署中的 v0.1.24 代码**）：`limit=3` 三页并集 **5 行 ≠ 单页 7 行**，被永久跳过的正是 `:msg:1:2` 与 `:engine:round:1`；重复读 0 行（所以「集合/条数」判据确实抓不住语义，但这里连条数都少 ⇒ 有序全等是唯一够硬的判据）。
+- 修复后（`docker build -f portal/Dockerfile` 的本地镜像临时顶掉 digest pin）：游标形态 `"2:1074"`，四页并集 **7 行 = 单页 7 行有序全等**。
+- **混版冒烟**（新 portal + 七台仍是 v0.1.24 runner 的 FDE 容器）：发一条真消息 ⇒ run `da6d955a…` `finished / judge_done`，transcript 正常增长 ⇒ 不透明游标对「只回传不解析」的旧 agentd 天然兼容。⚠ dev 会话最大 106 行 ⇒ **真 agentd 的多页翻页**本身仍是 `[未验]`（要 >10000 行才触发）。
+- 验完还原 `deploy/.env` 并重新 `up -d`，portal 回到 pin 的 `ad997919…`、经 Traefik `healthz=200`。
+
+**已接受代价 / 后续**：① **末页非空也要给游标** ⇒ 每次 `load` 到底多一次空页往返；keyset 下 `rows.length < limit` 是**可靠**的到底信号（旧语义下不可靠，这正是当年不判的原因），改成那样能省一次往返，**留后续单**；② `?cursor=`（空串）从「从头」变成 **400** —— 有意的收紧，agentd 结构上打不出该请求，已在负例钉住；③ 真库 `append_seq` 量级远未到 `2^53`，字符串纪律属**隐患收口**，其超界行为只在 fake 上成立。
+
+**三件后续的顺序（已定，勿自行改方向）**：**B = 本单（已完成）→ C = #339 文档更正 + 夹具哨兵（零产品代码）→ A = 引擎读路径折叠（#353 的站内义务）**。A 必须在 B 之后（否则会把半轮折进一页），且必须等 C 定稿「载体怎么取」——因为 A 会成为 `portal/src/transcript-fold.js` 的**第二个**消费者。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 
