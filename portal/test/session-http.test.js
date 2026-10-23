@@ -8,6 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from '../src/http.js';
@@ -300,6 +301,36 @@ const callStop = (s, { body, headers = {} } = {}) => fetch(`${s.base}/api/sessio
   ...(body === undefined ? {} : { body }),
 });
 
+/**
+ * 手工 `node:http` POST：`fetch` 发不出可控的 `Transfer-Encoding`（forbidden header），
+ * 而「既无 `Content-Length` 又写了 chunk」正是 Node 自己启用 chunked 编码的条件。
+ * ⚠ 夹具退化不会假绿：如果 Node 意外没发出 chunked（也没 CL），`requestHasNoBody` 会返回 true
+ * ⇒ 闸放行 ⇒ 状态变成 409，本用例会直接红在断言上，不会把「没测到」读成「测过了」。
+ */
+function rawPost(s, p, { chunks = [], headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(s.base + p);
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname,
+        method: 'POST',
+        headers: { Cookie: s.cookieHeader, ...headers },
+      },
+      (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { text += c; });
+        res.on('end', () => resolve({ status: res.statusCode, text }));
+      },
+    );
+    req.on('error', reject);
+    for (const chunk of chunks) req.write(chunk);
+    req.end();
+  });
+}
+
 test('#236 空 body + 无 Content-Type 的 POST /stop ⇒ 不再是 400（过了 CT 闸，落到业务判据 409 no_active_run）', async () => {
   const s = await startServer();
   try {
@@ -334,6 +365,23 @@ test('#236 同一端点：声明 json（含 charset）/ 有 body 但没声明 / 
     const emptyWrongCt = await callStop(s, { headers: { 'content-type': 'text/plain' } });
     assert.equal(emptyWrongCt.status, 400);
     assert.equal((await emptyWrongCt.json()).error.message, CT_ERROR);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#236 统一闸 fail-closed：**chunked 带体** + 未声明 `Content-Type` ⇒ 仍 400（主 agent 补的覆盖缺口）', async () => {
+  // 为什么必须单独一条：上面那条组合用例的「有 body 没声明 CT」用的是 `fetch({ body: '{}' })`，
+  // 而 fetch 会自动带上 `Content-Length: 2` ⇒ 它**只走了 `requestHasNoBody` 的 CL 分支**。
+  // chunked 那一格（既无 CL、有 `Transfer-Encoding` ⇒ 体在读完前不可知 → 按有 body 处理）
+  // 在本文件里**从来没被任何请求命中过**：把 `requestHasNoBody` 改成 `return true` 全套仍绿。
+  // 所以这里用手工 `node:http` 请求（不写 CL、写一个 chunk ⇒ Node 自己发 `Transfer-Encoding: chunked`），
+  // 把「放宽只覆盖确定无 body 的请求」这条 fail-closed 口径钉住。
+  const s = await startServer();
+  try {
+    const res = await rawPost(s, `/api/sessions/${SESSION_ID}/stop`, { chunks: ['{}'] });
+    assert.equal(res.status, 400, `chunked 带体不得被放宽，实得 ${res.status}：${res.text}`);
+    assert.equal(JSON.parse(res.text).error.message, CT_ERROR);
   } finally {
     await s.close();
   }
