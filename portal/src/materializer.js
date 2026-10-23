@@ -21,7 +21,10 @@ export const CONTAINER_HOME = `/home/${FDE_CONTAINER_USER}`;
 // 平台文件权限（user-space §6.2）：普通平台文件 0644，manifest 0444。
 const FILE_MODE = 0o644;
 const MANIFEST_MODE = 0o444;
-// 目录权限：工作区目录 2770，.erix 0750（user-space §6.2）。
+// 目录权限：工作区目录传 2770，.erix 0750（user-space §6.2）。
+// 2770 是历史遗留的意图值，**落盘恒为 0770**（mkdir 交不出 setgid；chown 交出属组后的下一轮 chmod
+// 在 portal 缺 CAP_FSETID 时被内核静默清掉）——口径已定 0770，setgid 不承载任何行为。
+// **别补 CAP_FSETID、也别把字面量改成 0o0770**；理由见 docs/design/user-space.md §6.2 / issue #273。
 const WORKSPACE_DIR_MODE = 0o2770;
 const ERIX_DIR_MODE = 0o750;
 
@@ -216,7 +219,7 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
   function ensureWorkspaceDirs(files) {
     // 顶层 userspace root：0755 root:root（仅 portal 可写，user-space §6.2）。
     ensureDirSafe(root, root, { mode: 0o755, uid: null, gid: null, log });
-    // 逐文件父目录：<root>/<fde> 及以下工作区目录 2770，.erix 0750，属主 erix(1000)。
+    // 逐文件父目录：<root>/<fde> 及以下工作区目录传 2770（落盘 0770，见 WORKSPACE_DIR_MODE 注释），.erix 0750，属主 erix(1000)。
     const seen = new Set();
     for (const f of files) {
       const dir = path.dirname(f.hostPath);

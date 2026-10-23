@@ -593,8 +593,8 @@ const singleSourceProblems = [];
       [/filter label=station\.stack=/, '零残留复查：按 station.stack 标签查本栈资源'],
       [/assert\.deepEqual\(problems, \[\],/, '清场末尾的零失败/零残留断言'],
       [/--network container:\$\{FDE_CONTAINER\}/, '探针必须共享 FDE 容器 netns（路由 backend 恒 = .2:<port>，在同一 /29 里另起一个容器不会被路由到）'],
-      // 工单 F-5：userspace 权限口径按**真机现状**钉（工作区目录 permission 位 0770），
-      // 不许改回「代码传了 2770 就断言 2770」——setgid 意图缺口的成因与出路写在 wp2a §④ 注释里。
+      // 工单 F-5 / issue #273：userspace 权限口径按**真机现状 + 定稿口径**钉（工作区目录 permission 位 0770），
+      // 不许改回「代码传了 2770 就断言 2770」——0770 不是临时妥协而是当前设计的正确期望，理由见 wp2a §④ 注释与 user-space §6.2。
       [/assert\.equal\(perm\(dir\), 0o0770/, '工作区目录钉真机现状 permission 位 0770（工单 F-5 返修口径）'],
     ];
     for (const [pattern, what] of wp2aRequired) {
@@ -613,8 +613,8 @@ const singleSourceProblems = [];
     for (const [pattern, what] of [
       [/\/api\/projects\/\$\{/, '项目维度端点又拼了 id（P5：/api/projects/:id 的 PATCH/DELETE 已 410）'],
       [/body\.ports\[0\]/, '又在读 POST /api/projects 的 201 返回体（该端点已 410）'],
-      // 工单 F-5：把工作区目录重新按代码意图断言成 2770（真机拿不到 setgid）也算形态回来了。
-      [/assert\.equal\(mode\(dir\), 0o2770/, '工作区目录又按代码意图断言 2770（真机稳定 0770；setgid 缺口见 wp2a §④）'],
+      // 工单 F-5 / issue #273：把工作区目录重新按代码意图断言成 2770（真机拿不到 setgid，且口径已定 0770）也算形态回来了。
+      [/assert\.equal\(mode\(dir\), 0o2770/, '工作区目录又按代码意图断言 2770（口径已定 0770，非临时妥协；理由见 wp2a §④ 与 user-space §6.2）'],
     ]) {
       if (pattern.test(wp2aText)) {
         singleSourceProblems.push(`wp2a-e2e.mjs: 前 P5 形态回来了：${what}`);

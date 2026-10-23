@@ -175,13 +175,13 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | `FDE_USER_UID` / `FDE_USER_GID` | FDE 工作区属主 UID/GID（工作区目录属主） | 平台规范固定（user-space.md §6） | `1000` / `1000` |
 | `AGENTD_UID` / `WORKER_UID` | agentd（唯一持 per-container token）/ worker（每 run）的 UID；GID 同 `1000` | 平台规范固定（runner-integration §11.3 不同 UID 优先） | `1001` / `1002` |
 | `PORTAL_RUNTIME_UID` | portal 容器运行身份 = materializer 物化写入身份（需 chown 工作区目录、写 Docker API） | 平台规范固定（user-space.md §6.1） | `0`（root） |
-| `USER_SPACE_DIR_MODE` / `USER_SPACE_UMASK` | 工作区目录模式 / 容器进程 umask；平台文件权限固定 | 平台规范固定（user-space.md §6.2） | `2770` / `0002`（平台文件 `0644`，`manifest.json` `0444`） |
+| `USER_SPACE_DIR_MODE` / `USER_SPACE_UMASK` | 工作区目录模式 / 容器进程 umask；平台文件权限固定 | 平台规范固定（user-space.md §6.2） | `0770`（代码传 `2770`，缺 `CAP_FSETID` 时 setgid 被内核静默清掉，落盘恒 `0770`；口径见 user-space §6.2 / issue #273）/ `0002`（平台文件 `0644`，`manifest.json` `0444`） |
 | `backend` / `fde-<name>` | **`backend` = 显式 `172.30.0.0/24`**（compose 声明，与 FDE 池彻底隔离）；`fde-<name>` 每 FDE 一条 `/29`；Traefik 走 host 网络（H-B 定稿，issue #5；~~`edge` / `control`~~ 已取消——共享 `control` 是横向越权根源）。**`10.200.0.0/16` 与 `10.201.0.0/16` 保留给 FDE 网络专用**，其它 compose/自动网络不得使用 | 平台规范固定（规格 §3/§5，topology.md §2） | `backend` 接 portal + station-db + LLM 网关；`fde-<name>` 只接该 FDE 的容器（`10.200.<n>.0/29`，大 FDE `/28` 见 §5.2） |
 | 凭据存放 | 平台凭据（DB 密码、runner token、OIDC client secret、DNS-01 API token）一律环境变量或凭据文件注入（项目 AGENTS.md §6），不进仓库、不进 compose 正文 | 决策者/运维约定 | 参考实例 A：`~/.config/mcp/creds/`，权限 **600**（已实测存在，含 gitea、portainer、mssql 等凭据，见 §8.1）；或 `<DATA_ROOT>/<名称>/` 下 600 文件 |
 
 凭据注入要点（平台规范固定，不随环境变化）：
 
-- 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `2770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
+- 用户空间 UID/GID/权限（`FDE_USER_UID=1000`、`AGENTD_UID=1001`、`WORKER_UID=1002`、目录 `0770`、umask `0002`、平台文件 `0644`）为**平台规范固定**，开发期与目标环境**无差异**（不随机器变化）；开发期仅 `USER_SPACE_ROOT` 可指向仓库内临时目录以隔离（结构不变）。完整契约见 [`design/user-space.md`](design/user-space.md) §6。
 
 - LLM 虚拟 key **不进容器**（容器内零 LLM 凭据，仅占位 key + endpoint：portal（经 reconciler）写宿主 Traefik 动态配置文件，权限 **600**、仅 portal 可写、Traefik 只读（H-B 定稿 D-4，issue #5；规格 §11，topology.md §6 第 8 条）。原「LLM key 经 `ERIX_API_KEY_FILE` 只读文件注入容器」**作废**
 - `docker.sock` **只挂到 `station-docker-proxy`**（不直挂 portal）；portal 经 `DOCKER_HOST=tcp://station-docker-proxy:2375` 访问，路径白名单见 deploy-contract §5.1（自研 admission proxy：12 条契约路径 + create 参数级校验；`VOLUMES` 不授，bind mount 不需 volume API）

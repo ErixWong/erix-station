@@ -226,7 +226,8 @@ export function buildNetworkConfig({ name, subnet, gateway, fdeName, stackId = '
   };
 }
 
-/** 确保 FDE 用户空间 bind mount 宿主目录存在（2770 + uid/gid，user-space §2.4/§6.2）。
+/** 确保 FDE 用户空间 bind mount 宿主目录存在（mode 传 2770、落盘 0770 + uid/gid，user-space §2.4/§6.2）。
+ *  setgid 位不会落盘也不承载行为（口径 0770，issue #273）——别补 CAP_FSETID，详见 fsutil.ensureDirSafe 注释。
  *  D8 修订：worktrees 挂载已拆除（#81 P2.5，cwd 直达项目目录）。 */
 export function ensureUserSpaceMountDirs({ userSpaceRoot, fdeName, uid, gid, log = console }) {
   const root = path.resolve(userSpaceRoot);

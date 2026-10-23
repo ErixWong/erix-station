@@ -521,8 +521,9 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       // ~/AGENTS.md=0644 root:root），不是照抄代码常量。
       assert.equal(mode(S.userspaceRoot), 0o0755, 'userspace 顶层根 0755（user-space §6.2）');
 
-      // —— 工作区目录（<root>/<fde> 与 <root>/<fde>/home）：钉 **0770**，不是代码里的 2770 ——
-      // 代码意图是 2770（portal/src/provisioner.js ensureUserSpaceMountDirs 与 materializer.js 的
+      // —— 工作区目录（<root>/<fde> 与 <root>/<fde>/home）：钉 **0770**，这是**当前设计的正确期望**（issue #273）——
+      // 不是「等将来改严的临时妥协」：口径已在 user-space §6.2 定稿为 0770（无 setgid），这条断言不会再改严。
+      // 代码仍传 0o2770（portal/src/provisioner.js ensureUserSpaceMountDirs 与 materializer.js 的
       // WORKSPACE_DIR_MODE 都传 0o2770 给 fsutil.ensureDirSafe = mkdir → chmod → chown），但真机拿不到
       // setgid 位、稳定停在 0770（工单 F-5 取证：现役 4 个 FDE 的 <fde>/home 全是 0770 erix:eric）。
       // 机制（用 portal 镜像 + compose 里那套 cap 现场复现，不是推测）：
@@ -535,8 +536,10 @@ test('WP2a 重建（P5+0019）：开户 → userspace/端口下发 → 预览签
       //      **静默清掉 setgid**：permission 位 770 原样保留、chmod 不抛错（所以 fsutil 的 catch 连告警都不会有）。
       //      对照组：同一镜像加 --cap-add FSETID，同一条 chmod 立刻得到 2770。
       //   ⇒ reconcile 从第 2 轮起必然把目录按回 0770（探针逐轮：2770 → 770 → 770 稳态）。
-      // 意图缺口不静默：要真 setgid 得产品侧显式落地（候选 portal/src/provisioner.js 对已存在目录补一次
-      // 以属主身份做的 chmod，或给 portal 容器补 cap_add: CAP_FSETID）。谁补谁回来把这条断言改严。
+      // 意图缺口不静默：**不需要**产品侧去落地 setgid（issue #273 选 C：改口径，不加 cap）。理由：GID 继承由写入
+      // 进程主组（三个 UID 主组恒 1000）达成，组写位由 umask 与属组 1000 达成，setgid 不承载任何行为 ⇒ 别补
+      // cap_add: CAP_FSETID（只改一个看不见的数字，不改任何访问语义）；也别把这条断言改回 2770。
+      // 完整理由：docs/design/user-space.md §6.2「为什么是 0770 而不是 2770」。
       // 这里取 &0o777 ⇒ 产品哪天真的落下 2770，这条也不会反过来误红。
       for (const dir of [hostPathOf(), hostPathOf('home')]) {
         assert.equal(perm(dir), 0o0770, `工作区目录 permission 位 0770（真机现状；setgid 意图缺口见上方注释）：${dir} 实=${octal(dir)}`);
