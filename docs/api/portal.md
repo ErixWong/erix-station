@@ -2218,7 +2218,8 @@ query 参数 + `X-Claim-Token` 头——writer run 必须属于该 session（否
 故 S2 的行唯一性判据是 `(transcript_key, dedup_key)` 而非 `(key, round)`；`dedup_key` 幂等——
 崩溃重跑同 dedupKey 重放返回 `{inserted:false}`（**绝不产生重复 user 消息**），同 dedupKey 不同 body
 409 `round_conflict`（fold 更新 false→true 视为合法 UPDATE，同 U5 口径）。S1 行序
-`round ASC, created_at ASC`（同 round 多行按入档时序）。
+`round ASC, append_seq ASC`（迁移 0016 的持久化追加序：同 round 多行按入档**追加**序；`created_at` 会有
+完全相同的行、不能确定性还原——与下面「S1 分页」同一条口径）。
 
 | 端点 | 语义 |
 |---|---|
@@ -2246,6 +2247,12 @@ query 参数 + `X-Claim-Token` 头——writer run 必须属于该 session（否
   按 `next_cursor` 翻到底再拼，不得用「round 变了」当页边界。
 - 游标形态非法（不匹配 `^[0-9]+:[0-9]+$`，含旧版纯数字游标）⇒ `400 validation_failed`（`details.field = 'cursor'`，
   **零新错误码**）。**故意不做**纯数字旧游标兼容：唯一消费者是 agentd，它只回传 portal 给的串。
+- **同轮多行与「载体」**：`records` 里同一 `round` 可能有多个**载体候选行**（`…:engine:round:<n>`、
+  `…:engine:round:<n>:resume`）——这是崩溃恢复的正常形状（0.23 的 `:resume` 行只带引擎控制文本，见
+  `orchestrator.js` 的 `messages: cloneState(resumeEngineText)`）。宿主侧逐行投影**每轮取行序第一个载体**，
+  口径与 #339 定性（已从「待修缺陷」改判为「已钉住的哨兵」）见
+  `docs/design/conversation-state.md` §6「逐行投影的载体口径与 #339 定性更正」。
+  **本端点只负责按 `(round, append_seq)` 原样给行**，不做任何折叠、合并或去重。
 
 **runner 侧接线**：`markRunState('running')` 仍走 U2 真 runId（runs 表生命周期，sessionId 绝不进 U2）；
 宿主预写 dedupKey = `<key>:input:<messageId>`（`messageId` 经 U1 ticket `run.message_id` 下行）；
