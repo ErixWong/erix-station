@@ -129,6 +129,59 @@ runId：退回纯运维身份（runs 表/事件流/租约/计费），不进 sto
 - **写侧（契约①）实现分工已换到引擎 API**（erix-agent 0.15.0 `appendUserTurn`，上游 #97 闭环）：POST 事务内的预写由引擎承担 round 推导、dedupKey 生成、record 形态与幂等判据；station 只提供极小 store 适配器 `portal/src/transcript-store.js`（`load`/`appendRound` 复用调用方事务 client，落库列形态与原手搋时代逐列等价，「先写 transcript 再入队」顺序不变）。幂等主判据从 DB `ON CONFLICT` 换为引擎按 dedupKey 的 load 判据（顺序重放），`ON CONFLICT` 保留作并发最后防线（同 key 并发由 session `FOR UPDATE` 串行化，满足引擎「在接收事务内发起」的前提）。**0.17.0 起预写走点查快路径**（store 成对实现 `loadByDedupKey`/`loadMaxRound`，上游 #157 / station #193）：事务内不再全量 load——先按 dedupKey 点查，命中即返回既有 record；未命中才取 `MAX(round)` 派生 round 后 `appendRound`，成本不再随 session 行数增长（谓词等价性与保真口径见 AGENTS.md §8.6）。
 - 与上游 ADR-018/0.12–0.14 契约的关系：本契约只涉及**读/展示侧**；写侧由 portal 先提交 session transcript、worker 再 resume 的多轮模式见上游 issue #135（本契约 ① 即其实现在 station 的收敛，0.15.0 后由 `appendUserTurn` 承接）。
 
+### 逐行投影的载体口径与 #339 定性更正（issue #339，2026-10-22，零产品代码）
+
+**为什么这里要写一节**：0.23 之后「一轮 = 多行」——载体行 `<key>:engine:round:<n>`（正文已搬进
+`:msg:` 行、`messages` 为空）+ 正文行 `<key>:msg:<n>:<seq>`，崩溃恢复还会多写一行
+`<key>:engine:round:<n>:resume`。而本站 `projectSessionMessages` 是**逐行**喂官方投影的
+（`projectTranscriptForDisplay([record])` 一次一行，因为要把每个 turn 对应回它的 DB 行做 run 归属与键名分段）。
+逐行投影必须先回答一个上游没回答的问题：**这一轮的正文挂在哪个候选行上？** 这就是「载体」口径。
+
+**载体怎么取**（唯一落点 `portal/src/transcript-fold.js#isRoundCarrier` + `planFold`）：
+
+- **候选** = key 以 `:round:<n>` 或 `:round:<n>:resume` 结尾的**非消息行**（`<key>:engine:round:<n>`、
+  `<key>:round:<n>`、`<key>:engine:round:<n>:resume`；谓词与上游 `store/message-rows.js` 同构）。
+- **每轮取行序第一个候选**（`group.carrier === -1` 守卫）；其余候选行**原样保留**（不被吞并、不改写）。
+- **行序** = 生产 SELECT 的 `ORDER BY round ASC, append_seq ASC`（与 `docs/api/portal.md` §9.8b S1 同一口径）；
+  `projectSessionMessages` 内部再用 `compareTranscriptRows`（`round` → `created_at`）**稳定**重排，两者一致时
+  「第一个」就是 `append_seq` 序的第一个。⚠ **已知边界（实测）**：`created_at` 与 `append_seq` 相反（时钟回拨）时
+  载体跟着 `created_at` 走——二级键是 `created_at`，`append_seq` **不参与**排序。两种序都已钉在
+  `portal/test/session-view-resume-carrier.test.js`。⚠ 另：`foldTranscriptRows` / `foldLedgerRecords`
+  **自己不排序**（排序是调用方的责任，与上游同形），所以「第一个载体」的口径只在**调用方排完序**之后成立。
+- **这是本站为「逐行投影」引入的选择，不是上游口径**：上游 `foldLedgerMessages` / `foldMessageRows`
+  **根本不认载体**——只按 `seq` 把消息拼回轮行，`round` 是分组键，没有「选哪个轮行」这一步。
+  所以「取第一个载体」不能当引擎读路径的既有语义去引用。
+- **下一片（引擎读路径折叠）会成为 `transcript-fold.js` 的第二个消费者** ⇒ 它必须复用同一份 `planFold`
+  （`foldTranscriptRows` 把 `recordOf` 注入化就是为了这个），**不许各写一份载体规则**。
+
+**#339 定性更正（原判断有误，保留痕迹）**：§8.38 记的待查事项是「同轮同时存在 `…:engine:round:<n>` 与
+`…:engine:round:<n>:resume` 时，逐行投影可能给同一条 `tool_use` 出两张卡（一张有结果一张没有）」，并附了一句
+「0.22 上同样存在，不是 0.23 引入的回归」。复核后的更正：
+
+- **机制成立**：同轮两个候选行**都带同一条 `tool_use`** 时，投影确实出 **2 张卡**（`call_id` 相同、视图 key 也
+  相同）；`:resume` 那条若不带 `tool_result`，就是「一张有结果一张没有」。已按实测钉成哨兵
+  （`portal/test/session-view-resume-carrier.test.js` 第 3/4 条）。
+- **可达性不成立 ⇒ 从「待修缺陷」改判为「已钉住的哨兵」**：① dev 真库对两种载体行做
+  `GROUP BY transcript_key, round HAVING count(*) > 1` ⇒ **0 行**；② 62 个会话的生产投影按 `(round, call_id)`
+  与 `(run_id, round, call_id)` 两种唯一性判据都是 **0 重复卡片**；③ 0.22 的 `src/loop/resume-manager.js`
+  有同轮互斥守卫（同轮不会两种载体并存）；④ 0.23 的 `src/loop/orchestrator.js` 写 `:resume` 行时是
+  `messages: cloneState(resumeEngineText)`，而 `resumeEngineText` 只收方向提示 / 达成 advisory 两种
+  **引擎控制文本**、不含 `tool_use` ⇒ 结构上给不出第二张卡。
+- **原句「0.22 上同样存在」是当时的误判**：0.22 的**读侧后果**（若真有双载体）与 0.23 同形，但**写侧产生不出**
+  这个形状（互斥守卫）。准确说法：**这个形状在 0.22 与 0.23 的写侧都不可达；它在读侧是已知退化面，由夹具哨兵钉住**。
+- **为什么不「顺手修掉」**：同轮多候选行时「只取一个」**已经就是**现有行为（取第一个）；剩下的差异全在
+  「第二个候选行自带正文」这件事上，而那正是写侧不可达的形状。为零可达面加读侧丢弃逻辑，只会引入
+  「静默丢内容」的风险（见下条底线）。
+- **判据纪律**：所有「是否重复」的判据**不许按 `run_id` 分组**——session 作用域行的 `run_id` 恒 **NULL**
+  （迁移 0015，`putSessionRound` 写 `VALUES (NULL, …)`），按它分组不增加任何信息、只可能把同轮的行判成不同组
+  （实测：一个 `run_id` 有值 + 一个 NULL 的同轮双载体，按 `(run_id, round, call_id)` 判「无重复」而 DTO 里确有
+  2 张卡 ⇒ 判据是死的）。硬判据用 `(round, call_id)`。
+
+**底线：不许静默丢内容**（与上游 `foldMessageRows` 同一语义）：载体**不在场**（分页切在轮中间、崩溃早于轮行
+落盘）时，可折叠的消息行**原样留在数组里**——各自一条记录、`key` 与 `round` 都是它自己的、`partOf` 不合并、
+一个字节不改。**不是**丢掉，也**不是**拼成一条新记录。代价是这一页的投影出不了该轮的工具卡片（正文仍在库里，
+翻到带载体的那一页就能折回来）；这是可接受的降级，「内容丢失」不是。
+
 ### 拆解（四个可独立验收的 PR）
 
 | PR | 内容 | 验收 |
