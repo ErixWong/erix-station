@@ -1329,6 +1329,14 @@ async function handleAdminApi(req, res, ctx, url) {
     }
   }
 
+  // 预览端口号池**占用总览**（issue #256 交付①，portal.md §4.7a）：只读。
+  // 存在的理由：改块原本只能填数字试错（撞 409 preview_port_block_taken 才知道哪段被占），
+  // 有了总览就能**先选空闲段**。鉴权走 handleAdminApi 的 requireAdmin（非 admin ⇒ 403，零新错误码）。
+  if (pathname === '/api/admin/preview-ports/usage') {
+    if (req.method === 'GET') return handleAdminPreviewPortsUsage(req, res, ctx, session, url);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
   // 预览端口（issue #246 交付②，portal.md §4.7a）：列他人端口 + **改块 = 搬迁**。
   const adminFdePortsMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/ports$/);
   if (adminFdePortsMatch) {
@@ -1369,6 +1377,40 @@ async function resolveAdminFde(ctx, fdeName) {
     });
   }
   return fde;
+}
+
+/**
+ * GET /api/admin/preview-ports/usage（issue #256 交付①）：号池占用总览。
+ *
+ * - **只读**：一条 SELECT 拿全局活行（`state <> 'released'`，与 0019 的部分唯一索引同口径），
+ *   不写库、不入队 outbox/revision、不开事务；
+ * - `?limit=`（可选）只控制 `free_blocks.items` 的条数（默认 50）；非法 ⇒ 400 `validation_failed`
+ *   + `details.field='limit'`（复用既有错误码，不新造）；
+ * - 审计**恰好一行** `admin.preview_ports_usage_listed`（读他人资源要留痕，照 `admin.fde_ports_listed`
+ *   的先例）；`details` 只放计数，**不放整份响应体**（那是一整张号池快照，会把审计表撑成数据副本）。
+ */
+async function handleAdminPreviewPortsUsage(req, res, ctx, session, url) {
+  const rawLimit = url.searchParams.get('limit');
+  let freeLimit = portalloc.PREVIEW_USAGE_FREE_LIMIT_DEFAULT;
+  if (rawLimit !== null && rawLimit !== '') {
+    const parsed = /^\d+$/.test(rawLimit) ? Number(rawLimit) : null;
+    const max = portalloc.PREVIEW_PORT_BLOCK_COUNT;
+    if (parsed === null || !Number.isInteger(parsed) || parsed < 1 || parsed > max) {
+      throw new HttpError(400, 'validation_failed',
+        `limit 必须是 1–${max} 的整数（空闲段条数上限，默认 ${portalloc.PREVIEW_USAGE_FREE_LIMIT_DEFAULT}）`,
+        { details: { field: 'limit' } });
+    }
+    freeLimit = parsed;
+  }
+  const usage = await portalloc.previewPortPoolUsage(ctx.pool, { freeLimit });
+  await admin.recordPreviewPortsUsageListedAudit(ctx.pool, {
+    actorId: session.user.id,
+    totalBlocks: usage.summary.total_blocks,
+    freeCount: usage.summary.free,
+    occupiedBlockCount: usage.occupied_blocks.length,
+    limit: usage.free_blocks.limit,
+  });
+  return sendJson(res, 200, usage);
 }
 
 /**
