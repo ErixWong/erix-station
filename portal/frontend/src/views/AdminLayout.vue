@@ -21,6 +21,8 @@ const tabs = [
   { name: 'admin-users', label: 'admin.tabs.users' },
   { name: 'admin-llm', label: 'admin.tabs.llm' },
   { name: 'admin-repos', label: 'admin.tabs.repos' },
+  // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
+  { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
 ] as const;
 
 async function onLogout() {

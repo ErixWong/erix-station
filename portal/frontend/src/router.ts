@@ -58,6 +58,14 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminReposView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #350：预览号池占用总览（只读）。懒加载组件 + 照邻居写 requiresRole；
+      // 请求只在本视图挂载时发（判据①：进管理台不请求，切到这一 tab 才恰好 1 次）。
+      {
+        path: 'preview-pool',
+        name: 'admin-preview-pool',
+        component: () => import('./views/PreviewPoolUsageView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
     ],
   },
 ];
