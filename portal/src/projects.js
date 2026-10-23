@@ -19,6 +19,12 @@ import {
 } from './previewpool.js';
 
 export const PROJECT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+// ↑ 口径（issue #284 校正）：P5 起 hostname **不含项目名**（迁移 `0008-deprojectize.sql`；
+//   hostname = `<fde>-p-<port>.<伞域>`，见本文件 buildHostname）⇒ PROJECT_NAME_RE **不再是**
+//   「目录名 / DNS label」规则，它只服务已退役、只读的 `projects` 表（与 schema.sql 的 CHECK 对档；
+//   应用层已无写入口，validateProjectName 仅剩单测在用）。
+//   目录名在服务端的唯一硬边界是「`~/projects/` 一级目录 + 无路径穿越」——见 sessions.js 的
+//   `CWD_RE` / `validateSessionCwd`（字符集与长度不限，允许下划线；`chat_sessions.cwd` 无 CHECK）。
 export const FDE_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 export class ProjectError extends Error {

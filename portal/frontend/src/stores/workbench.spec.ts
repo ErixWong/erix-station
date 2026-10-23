@@ -145,7 +145,7 @@ describe('workbench store（P5 目录即项目）', () => {
     await store.initWorkspace();
 
     const bad = await store.createDir('Bad_Name');
-    expect(bad.error).toContain('目录名必须符合');
+    expect(bad.error).toContain('目录名只能用');
     expect(lastSessionPostBody).toBeNull(); // 未发请求
 
     const ok = await store.createDir('my-app');
@@ -155,6 +155,27 @@ describe('workbench store（P5 目录即项目）', () => {
     expect(store.dirs.some((d) => d.cwd === '~/projects/my-app')).toBe(true);
     expect(store.sessions[0]?.id).toBe('s-new'); // 新会话置顶，视图可打开
     expect(store.noDir).toBe(false);
+  });
+
+  // issue #284：前端表单原先比后端更严，把下划线目录名误拒（后端 validateSessionCwd 一直允许 `_`）。
+  // 这里走 store 全链路（本地校验 → POST /api/sessions {cwd}）钉「下划线能建」。
+  it('createDir（#284）：带下划线的目录名通过本地校验并以该 cwd 建会话', async () => {
+    mockFetch(dirsAwareHandler({}));
+    const store = useWorkbenchStore();
+    await store.initWorkspace();
+
+    const ok = await store.createDir('cmms_test');
+    expect(ok.error).toBeNull();
+    expect(lastSessionPostBody).toEqual({ cwd: '~/projects/cmms_test' });
+    expect(store.dirCwd).toBe('~/projects/cmms_test');
+
+    // 首尾下划线仍然拒（与 `-x` / `x-` 对称）：本地拦截，不发请求。
+    lastSessionPostBody = null;
+    for (const name of ['_cmms', 'cmms_']) {
+      const bad = await store.createDir(name);
+      expect(bad.error).toContain('目录名只能用');
+      expect(lastSessionPostBody, `${name} 不应发请求`).toBeNull();
+    }
   });
 
   it('refreshDirs：选中目录仍在 → 不动；已消失 → 回退第一个目录并重载会话', async () => {
@@ -651,7 +672,7 @@ describe('workbench store · i18n（issue #101 P2）', () => {
     // 入口拦截后这类人进不到工作台，store 已没有 isPlatformAdmin 这个态（占位符恒为两态）。
 
     const bad = await store.createDir('Bad_Name');
-    expect(bad.error).toBe('目录名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）');
+    expect(bad.error).toBe('目录名只能用小写字母、数字、下划线、连字符；不能以连字符或下划线开头/结尾；最长 63 字符。容器里已存在的目录（哪怕含其它字符）可直接在目录下拉里选中使用。');
 
     store.renderedIds = new Set();
     store.addMessage({ id: 'm1', role: 'assistant', content: '内容', synthetic: true });
@@ -671,7 +692,7 @@ describe('workbench store · i18n（issue #101 P2）', () => {
     // issue #332：平台管理员占位符那三行已随入口拦截拆除（同上，zh 侧同口径）。
 
     const bad = await store.createDir('Bad_Name');
-    expect(bad.error).toContain('Directory name must be lowercase letters / digits / hyphens');
+    expect(bad.error).toContain('Directory names may only use lowercase letters, digits, underscores and hyphens');
 
     store.renderedIds = new Set();
     store.addMessage({ id: 'm1', role: 'assistant', content: 'body', synthetic: true });
