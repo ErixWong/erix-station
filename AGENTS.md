@@ -1342,3 +1342,19 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 **主 agent 亲跑变异 3 条（不采信 worker 自报）**：① 删掉前端 `_` ⇒ **3 条具名红**；② **反向的牙**：给 `validateSessionCwd` 插一条字符集白名单（模拟「将来有人反过来收紧后端」）⇒ **防漂移锁红**，消息逐字「后端对目录名新增了字符集校验」；③ 把「会用作预览域名 DNS label」塞回中文 label ⇒ **文案断言红**。⚠ **第一次变异 ① 是空操作**（sed 模式写错 ⇒ 文件零改动、87 条全绿差点被当成证据），靠「先 `git diff` 自证真改了」抓回来（§8.24 同族，第 N 次发作）。
 
 **已知边界（刻意不做，别当 bug）**：前端仍比后端严——**后端宽得远不止 `_`**（实测还收大写 `Bad_Name`、空格 `My Project`、`中文目录`、前导/尾随 `-`、80 字符长度）。本单只对齐 `_`；「要不要让前端也照 `validateSessionCwd` 放开（代价：UI 能建出 `中文目录`）」是另一个决策，未拍。存量口径由文案兜住：**已有目录永远走目录下拉，不受表单规则约束**。
+
+### 8.45 读侧折叠解 `partOf` 链（引擎写侧链式的站内**临时闸**）+ 会话账本巡检手册（issue #341，2026-10-23，直推 main `c47a692`）
+
+**上游缺陷**（已提 [erix-agent #415](https://github.com/ErixWong/erix-agent/issues/415)，主 agent 在**发布物** 0.23.0 上现跑复现）：写侧 `src/loop/orchestrator.js:3394 / :3396` 每落一片就 `toolResultRowKey = persistedRowKey`（**覆盖**）⇒ 第 3 个并行工具调用起 `partOf` 指向**前一片**（链式 `msg:1:3 → msg:1:2 → msg:1:1`）；而读侧 `src/store/message-rows.js:129-143` 的 `parts` 表**只登记非分片行的 key**（分片行在 `parts.set` 之前就 `continue`）⇒ 链上第 2 跳查不到目标 ⇒ **一轮并行 ≥3 个工具调用**之后任何 resume 都会把一条聚合 `tool_result` 劈成多条 user 消息 ⇒ `validateMessages` 抛 `invalid_messages`，**会话永久卡死**（`retryable:false`、零请求出网）。实测对照：链式 ⇒ 折出 2 条 user 消息 ⇒ 抛 `Invalid message at index 1: tool_result ids do not match assistant tool_use ids`；恒指首片 ⇒ 1 条 ⇒ 通过。触发面 **≥3**（≤2 时链式恰好等于首片式 ⇒ 上游测试没抓到，也是它没被发现的原因）。
+
+**我（主 agent）写错、被 worker 实测推翻的一条（台账按这条改）**：站内 #341 正文与我给工单的前提都写着「本站折叠同样中招 ⇒ 刷新后工具卡片掉 `resultPreview`」——**不成立**。原因：上游 `src/display/projection.js:444` 的 `toolResultsOf(messages)` **扫整条 record 的全部 messages** 并按 `tool_use_id` 建 Map ⇒ 被劈出去那条 user 消息里的结果照样配得上对；纯 `tool_result` 消息 `textOf()` 是空串 ⇒ 也不多冒气泡。**主 agent 独立复核结果**：形状差是真的（同一夹具：撤闸折出 `[assistant, [t1,t2], [t3]]` 3 条，解链后 `[assistant, [t1,t2,t3]]` 2 条），机制也是真的（源码级全扫），但**「DTO 逐字节相同」这一半我只复现到「形状差 + 机制」，没独立复现 DTO 对比**（我自己的夹具产不出非空 DTO）。⇒ 口径：**界面无可见差异，真实伤害在引擎 resume**；`session-view-fold.test.js` 那条贯通用例同时断两件事，**撤闸时红只由「折回 1 条聚合」触发**，别拿卡片那一半当解链证据。
+
+**载荷（产品码只有 1 行）**：`portal/src/transcript-fold.js#planFold` 分片分支 `continue` **之前**加 `if (key !== '') parts.set(key, partTargetIndex);`（分片行也登记、指向它被接进去的那个同一消息下标 ⇒ 链自然解回链头，与上游 #415 建议的读侧修法同形）。判据谓词（`isFoldableMessageRow` / `isRoundCarrier` / 「每轮取行序第一个载体」/「`partOf` 只在单消息行上当分片」）**一字未动**；无链账本输出逐字节不变。
+**这是闸、不是设计**：文件头写明「上游 #415 落地并升 pin 后本段整体可撤」（先例 §8.28 撤 #283 计时闸、§8.9 撤 `tree` 根标签收口），并钉了**源码级哨兵**用例（读 `node_modules/erix-agent/src/store/message-rows.js`，断上游分片分支仍无 `parts.set`、且整个 `foldMessageRows` 里 `parts.set` 恰好一处）。⚠ **哨兵红了不是回归，是提示撤闸**。
+
+**引擎 resume 这条路本站修不了**（引擎自己调 `foldLedgerMessages`）⇒ 中招的会话只能**修数据**。新增 `docs/ops/transcript-ledger-inspection.md`（已在 `docs/README.md` 登记）：巡检 SQL（「`partOf` 指向的行本身也带 `partOf`」计数，期望 **0**）+ 会话/轮定位 + 单轮形状自检 + **递归解链到链头**的幂等可重放 UPDATE + 备份/预演/复验/回滚 + 「别做的事」。dev 现网现状：**0 行链式** ⇒ 本单性质是**隐患收口**，不是正在流血的故障。
+
+**验收（主 agent 亲手复跑，不采信 worker 自报）**：根 **1393 / 1389 通过 / 0 失败 / 4 跳过 rc=0**（基线 1388/1384/4 ⇒ **+5**：`transcript-fold.test.js` +4、`session-view-fold.test.js` +1）、runner **323/323**、前端 **37 文件 / 661 不变**（前端零字节）；`portal/src/**` 只有 `transcript-fold.js` 一个文件；零 DDL、零依赖、两份 lockfile 与 `docs/data/schema.sql`、`deploy/migrations/` 一字节未动。
+**亲跑变异 2 条**（每条先自证锚点唯一匹配，不做空操作）：① 撤掉解链那一行 ⇒ **3 条具名红**；② **反向验哨兵**：在 `node_modules` 的上游真件里模拟 #415 已修（分片分支加 `parts.set`）⇒ **只有哨兵那 1 条红**（跑完已还原 `node_modules`）⇒ 「上游修好就提示撤闸」真有牙。
+
+**剩余（`#341` 保持 open）**：引擎 resume 侧仍待 erix-agent 发版升 pin，或按手册修数据；本站**不做**「检测到链式就告警」的运行时探针（没有消费者，先靠巡检 SQL）。
