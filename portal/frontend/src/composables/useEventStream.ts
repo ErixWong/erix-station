@@ -16,7 +16,7 @@
 // 协议状态（es/lastSeq/esSessionId/activeRunId/deltaText/toolCards）与事件语义。
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
-import { PERSISTENCE_TERMINATION_REASON, RUN_FAIL_REASONS } from '../lib/terminationReasons';
+import { PERSISTENCE_TERMINATION_REASON, RUN_END_LABEL_REASONS, RUN_FAIL_REASONS, RUN_TERMINATION_SYSERR_REASONS } from '../lib/terminationReasons';
 import { getToolResultSummary, formatDuration, isSpecialExecutionStatus } from '../lib/toolSummary';
 import { eventRoundToken, runSegment, toolCardKey, UNKNOWN_ROUND_TOKEN } from '../lib/toolCardKey';
 
@@ -121,8 +121,11 @@ export interface RunEndPayload {
 
 /**
  * issue #212：失败原因的**用户可读补充**（拼进 `stream.event.runEnd` 的 `{reason}` 槽）。
- *   ① 只给本次新增的两值加双语标签——既有 failed / aborted / max_rounds_cap 逐字保持原样
- *      （不改既有中文基线与既有断言面）；
+ *   ① 标签来源：`RUN_END_LABEL_REASONS`（除 `end_turn` 外的每个引擎 reason 一个 i18n 键，双语成对）。
+ *      **issue #236 推翻了 #212 的「既有 failed / aborted / max_rounds_cap 逐字保持原样」**：那条口径的
+ *      理由只是「不改既有中文基线与既有断言面」，而 #236 的验收面明确要求「用户按停止后看到的是母语
+ *      文案，不是裸 `aborted`」；且本单把终态分隔条投影进历史后，任何 reason 都会在重开会话时上屏。
+ *      未知 / 引擎新增的 reason **不在表里** ⇒ 仍逐字打印原文（§5.3 向后兼容，不编造翻译）。
  *   ② `persistence_failed` 额外带引擎透传的落盘细节（operation/phase/sideEffect），
  *      让工作台能看见「哪一步没落盘、副作用是否可能已发生」——这是该 reason 语义最重的部分；
  *   ③ issue #261：`termination.errorCode`（0.18.0 additive，值域由引擎定义）以
@@ -130,14 +133,17 @@ export interface RunEndPayload {
  *      看见 `code=timeout` 而不用去翻日志/问后端。**仅当它是非空字符串时**才追加，无 errorCode 时
  *      文案与既有断言面逐字不变；该片段是技术细节，**不进 i18n**（中英界面同形）。
  */
-function failReasonText(reason: string, termination?: RunTermination | null): string {
-  let text = reason;
-  const label = reason === 'persistence_failed'
-    ? t('stream.event.runEndReason.persistence_failed')
-    : reason === 'final_guard_unverified'
-      ? t('stream.event.runEndReason.final_guard_unverified')
-      : '';
-  if (label) text += t('stream.event.dash', { value: label });
+const RUN_END_REASON_LABEL_KEYS: Record<string, string> = Object.fromEntries(
+  RUN_END_LABEL_REASONS.map((reason) => [reason, `stream.event.runEndReason.${reason}`]),
+);
+
+function runEndReasonText(reason: string, termination?: RunTermination | null): string {
+  // `end_turn` 走既有的「正常完成」文案（不在标签表里，避免两条文案漂移）；
+  // 其余有标签用标签，形状与 #212 一致：`<reason> — <标签>`（reason 原文保留作技术前缀，
+  // 与 `errorCode` 同一种「技术细节留在行上」的口径；未知 reason 就只有 reason 本身）。
+  let text = reason === 'end_turn' ? t('stream.event.runEndNormal') : reason;
+  const labelKey = RUN_END_REASON_LABEL_KEYS[reason];
+  if (labelKey) text += t('stream.event.dash', { value: t(labelKey) });
   if (reason === PERSISTENCE_TERMINATION_REASON && termination?.phase) {
     text += ` · ${t('stream.event.runEndPersistence', {
       operation: termination.operation ?? '?',
@@ -150,6 +156,43 @@ function failReasonText(reason: string, termination?: RunTermination | null): st
   const code = termination?.errorCode;
   if (typeof code === 'string' && code !== '') text += `（code=${code}）`;
   return text;
+}
+
+/**
+ * issue #236：一条 run 终态 → 展示行文案 + 分级（实时 `run_end` 与历史合成项 `run_termination`
+ * **共用**这一个函数：两路同文案、同分级，不然刷新一次颜色就变）。
+ * `usage` 是实时帧才有的片段（历史投影不带用量：刷新后的运行态数字不重建，见 #282 的边界）。
+ */
+function runEndLine(reason: string, termination?: RunTermination | null, usage = ''): {
+  text: string;
+  sysErr: boolean;
+} {
+  return {
+    text: t('stream.event.runEnd', { reason: runEndReasonText(reason, termination), usage }),
+    sysErr: RUN_TERMINATION_SYSERR_REASONS.has(reason),
+  };
+}
+
+/**
+ * issue #236：历史合成项 `run_termination`（`GET /events/history` 的响应期投影，不落库、不进 SSE）
+ * → 展示条目。取词/分级与实时 `run_end` **共用 `runEndLine`**（两路同文案同分级）。
+ *
+ * 红线：它**不是** `run_end` 事件——`run_end` 仍不进 `HISTORY_EVENT_TYPES` / `HISTORY_REPLAY_TYPES`
+ * （#217 / #236 的红线），本函数只吃**响应期合成项**，宿主在调 `replayEvent` **之前**分流
+ * （与 #300 的 `partial_output` 同一种接法）。
+ * 脏载荷（`termination` 缺键 / `reason` 非字符串 / 空串）⇒ `null`：不渲染空行，也不拿 `status` 编一个。
+ */
+function historyRunEndEntry(ev: RunHistoryEvent):
+  | { kind: 'sep'; text: string }
+  | { kind: 'syserr'; text: string }
+  | null {
+  const payload = (ev.payload !== null && typeof ev.payload === 'object') ? ev.payload : {};
+  const raw = payload.termination;
+  const termination = (raw !== null && typeof raw === 'object') ? raw as RunTermination : null;
+  const reason = typeof termination?.reason === 'string' ? termination.reason : '';
+  if (reason === '') return null;
+  const line = runEndLine(reason, termination);
+  return line.sysErr ? { kind: 'syserr', text: line.text } : { kind: 'sep', text: line.text };
 }
 
 /**
@@ -677,18 +720,14 @@ export function useEventStream(hooks: EventStreamHooks) {
           if (deltaText.value !== null) deltaText.value = null;
           const reason = d.termination?.reason ?? '';
           const usage = d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : '';
-          // issue #42：终止原因分级——异常集合红色告警，end_turn 灰色中性。
-          // issue #212：集合补 persistence_failed / final_guard_unverified（两者语义都重到「用户必须看见」），
-          // 且必须与「worker 透传引擎 reason」同一个 PR：先透传再扩集合，否则 persistence_failed
-          // 会落到下面 else 分支，被渲染成灰色中性分隔条（语义最重的失败反而最弱）。
-          if (RUN_FAIL_REASONS.has(reason)) {
-            hooks.onSysErr(t('stream.event.runEnd', { reason: failReasonText(reason, d.termination), usage }));
-          } else {
-            hooks.onSep(t('stream.event.runEnd', {
-              reason: reason === 'end_turn' ? t('stream.event.runEndNormal') : reason,
-              usage,
-            }));
-          }
+          // issue #42 / #212 / #236：终止原因分级——异常集合红色告警，正常收尾灰色中性。
+          // issue #236：分级与取词收敛到 `runEndLine`（与历史合成项 `run_termination` 共用），红色集合
+          // 从 `RUN_FAIL_REASONS` 改为 `RUN_TERMINATION_SYSERR_REASONS`（= 它减掉 `aborted`）：
+          // 用户按停止不是故障 ⇒ 中性分隔条；`failed` / `max_rounds_cap` / `persistence_failed` /
+          // `final_guard_unverified` 仍然红（**没有把红色降级成中性**，AGENTS §8.7 的判据不变）。
+          const line = runEndLine(reason, d.termination, usage);
+          if (line.sysErr) hooks.onSysErr(line.text);
+          else hooks.onSep(line.text);
           if (d.error) hooks.onSysErr(t('stream.event.runFailed', { code: d.error.code, message: d.error.message }));
           activeRunId.value = null;
           hooks.onCurrentRunEnd(d);
@@ -719,6 +758,8 @@ export function useEventStream(hooks: EventStreamHooks) {
     // replayEvent 供 openSession 历史归并回放驱动（issue #89）；projectToolCard 供 DTO 投影路径（#188）。
     // cardIdentityOfCall（issue #279）：关联索引的只读探针——存的是「这个 provider id 最新对应哪张卡」，
     // 存它的唯一目的是**证明索引不是身份**（身份看 toolCards 的键数）。
-    handleEvent, toolCard, replayEvent, projectToolCard, cardIdentityOfCall,
+    // historyRunEndEntry（issue #236）：历史合成项 `run_termination` 的取词/分级入口（宿主在
+    // **调 replayEvent 之前**分流，与 #300 的 `partial_output` 同一种接法）。
+    handleEvent, toolCard, replayEvent, projectToolCard, cardIdentityOfCall, historyRunEndEntry,
   };
 }

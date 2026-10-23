@@ -1800,11 +1800,12 @@ describe('issue #306：终态后补拉 history（partial_output 当场出现，�
       await settle();
       expect(stage_.historyCalls()).toBe(2); // 确实试过了
       expect(partials(store)).toHaveLength(0); // 没拿到就维持现状（不推空气泡）
-      // 终态面照常：`aborted ∈ RUN_FAIL_REASONS` ⇒ useEventStream 走 **onSysErr**（红色告警行），
-      // 不是灰色 sep 分隔行（useEventStream.ts 的 run_end 分级分支）——写断言时按那条口径来。
-      const termLines = store.entries.filter((e) => e.kind === 'syserr');
-      expect(termLines.length).toBeGreaterThan(0);
-      expect(termLines.map((e) => ('text' in e ? e.text : '')).join('\n')).toContain('aborted');
+      // 终态面照常：issue #236 起 `aborted` 走**中性分隔条**（母语「已中止」，用户按停止不是故障），
+      // 不再是红色 syserr——分级口径在 `lib/terminationReasons.ts` 的 RUN_TERMINATION_SYSERR_REASONS。
+      const termLines = store.entries.filter((e) => e.kind === 'sep' && e.text.includes('run 结束'));
+      expect(termLines).toHaveLength(1);
+      expect(termLines.map((e) => ('text' in e ? e.text : '')).join('\n')).toContain('已中止');
+      expect(store.entries.filter((e) => e.kind === 'syserr')).toHaveLength(0);
       expect(store.es.activeRunId).toBeNull(); // 运行态状态机照常收尾（store 代理上 ref 已解包，不能 .value）
       expect(leaked.map(String), `漏出 ${leaked.length} 条未捕获拒绝`).toEqual([]);
     } finally {
@@ -1820,7 +1821,7 @@ describe('issue #306：终态后补拉 history（partial_output 当场出现，�
     // 唯一变量就是幂等集：会话还在（sessionId 有值），但去重集被摘掉（selectDir/resetSessionView 的态）
     // ⇒ 少了这道闸，这里就会白打一次请求并**每次都新推一条** partial（没有去重集可用）。
     store.renderedIds = null;
-    store.repullPartialOutput({ termination: { reason: 'aborted' } } as never);
+    store.repullHistorySynthItems({ termination: { reason: 'aborted' } } as never);
     await settle();
     expect(stage_.historyCalls()).toBe(1);
     expect(partials(store)).toHaveLength(0);
@@ -1876,6 +1877,113 @@ describe('issue #306：终态后补拉 history（partial_output 当场出现，�
     await settle();
     expect(store.sessionId).toBe('s2');
     expect(partials(store)).toHaveLength(0); // 守卫生效：不把 s1 的部分正文推进 s2 的流
+  });
+});
+
+// ===========================================================================
+// issue #236 §1 第 2 条：刷新 / 重开会话后，**终态分隔条**从 run 终态字段投影出来
+//   （历史端点响应期合成项 `run_termination`；`run_end` 仍不进两个白名单集合）。
+//   验收面：aborted ⇒ 一条**中性**分隔条写母语「已中止」；failed ⇒ 红色；硬刷新后仍在且不重复。
+// ===========================================================================
+describe('issue #236：历史投影的终态分隔条（run_termination）', () => {
+  function lastES() {
+    return FakeEventSource.instances.at(-1)!;
+  }
+
+  const termEv = (reason: string, runId = 'r1', seq = 9, extra: Record<string, unknown> = {}) => ({
+    seq, run_id: runId, type: 'run_termination', payload: { status: 'finished', termination: { reason, ...extra } },
+  });
+
+  /** openSession 的 history 响应固定带某几条合成项（模拟「后端从 runs 终态投影」）。 */
+  function stage(events: unknown[] = [], opts: { laterEvents?: unknown[]; activeRunId?: string | null } = {}) {
+    const calls: string[] = [];
+    mockFetch((url) => {
+      calls.push(url);
+      if (url.includes('/api/sessions/s1/events/history')) {
+        const n = calls.filter((u) => u.includes('/events/history')).length;
+        return { status: 200, body: { events: n > 1 ? (opts.laterEvents ?? events) : events, next_cursor: null } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: { session: { id: 's1', active_run_id: opts.activeRunId ?? null }, messages: [], last_seq: 9 },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    return { calls, historyCalls: () => calls.filter((u) => u.includes('/events/history')).length };
+  }
+
+  const settle = async () => {
+    for (let i = 0; i < 3; i += 1) await new Promise((r) => setTimeout(r, 0));
+  };
+  const textOf = (e: StreamEntry) => ('text' in e ? e.text : '');
+  const sepTexts = (store: ReturnType<typeof useWorkbenchStore>) =>
+    store.entries.filter((e) => e.kind === 'sep').map(textOf);
+  const sysErrTexts = (store: ReturnType<typeof useWorkbenchStore>) =>
+    store.entries.filter((e) => e.kind === 'syserr').map(textOf);
+
+  it('aborted：重开会话 ⇒ **一条中性**分隔条写母语「已中止」（不是红色 syserr，不是裸英文）', async () => {
+    stage([termEv('aborted')]);
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(sepTexts(store)).toEqual(['run 结束：aborted — 已中止']);
+    expect(sysErrTexts(store)).toEqual([]); // 用户按停止不是故障
+  });
+
+  it('failed 类：仍走红色 syserr（**没有把红色降级成中性**，AGENTS §8.7 的判据）', async () => {
+    for (const reason of ['failed', 'persistence_failed', 'final_guard_unverified', 'max_rounds_cap']) {
+      stage([termEv(reason)]);
+      const store = useWorkbenchStore();
+      await store.openSession('s1');
+      expect(sysErrTexts(store).length, `reason=${reason} 必须是红色`).toBe(1);
+      expect(sepTexts(store)).toEqual([]);
+    }
+  });
+
+  it('幂等：同一响应里同一 run 出现两次 / 重进会话 ⇒ 一条 run 至多一条分隔条', async () => {
+    stage([termEv('aborted', 'r1', 9), termEv('aborted', 'r1', 10)]);
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(sepTexts(store)).toHaveLength(1);
+    await store.openSession('s1'); // 重进会话：renderedIds 重建，仍是同一条
+    expect(sepTexts(store)).toHaveLength(1);
+  });
+
+  it('实时与历史不给两张：先实时 run_end、再补拉 history（同一 run）⇒ 只有实时那一条', async () => {
+    // 首拉没有合成项（run 还在跑），补拉时后端才给出同一 run 的终态项。
+    const stage_ = stage([], { laterEvents: [termEv('aborted', 'r1')], activeRunId: 'r1' });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(sepTexts(store)).toEqual([]);
+    lastES().emit('run_end', { seq: 9, run_id: 'r1', termination: { reason: 'aborted' } });
+    await settle();
+    expect(stage_.historyCalls()).toBe(2); // #306 的补拉照旧（#236 没新增请求）
+    expect(sepTexts(store)).toEqual(['run 结束：aborted — 已中止']); // 实时那一条，历史项被去重
+  });
+
+  it('脏载荷：无 run_id / 无 termination.reason / 非对象 ⇒ 一条都不出（不编 reason）', async () => {
+    stage([
+      { seq: 1, run_id: null, type: 'run_termination', payload: { termination: { reason: 'aborted' } } },
+      { seq: 2, run_id: 'r2', type: 'run_termination', payload: { status: 'finished' } },
+      { seq: 3, run_id: 'r3', type: 'run_termination', payload: { termination: { reason: 42 } } },
+      { seq: 4, run_id: 'r4', type: 'run_termination', payload: { termination: null } },
+    ]);
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(sepTexts(store)).toEqual([]);
+    expect(sysErrTexts(store)).toEqual([]);
+  });
+
+  it('合成项**不喂 replayEvent**：不会被当成实时 run_end 关掉运行态 / 也不推进水位线', async () => {
+    stage([termEv('aborted', 'r1', 42)]);
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    // 合成项的 seq 不参与 lastSeq（那是 messages/last_seq 的口径，openSession 用详情里的 last_seq）
+    // ⚠ store 代理上的 ref 已解包（见 #261B 那组的同一条注），不能写 `.value`
+    expect(store.es.lastSeq).toBe(9);
+    expect(store.es.activeRunId).toBeNull(); // 会话详情说没有活跃 run
+    expect(store.es.toolCards.size).toBe(0);
   });
 });
 

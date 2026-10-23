@@ -172,7 +172,8 @@ describe('useEventStream（mock EventSource）', () => {
     s.connect('sess-1');
     s.activeRunId.value = 'run-1';
     lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination: { reason: 'failed' }, error: { code: 'llm_error', message: 'boom' } });
-    expect(hooks.onSysErr).toHaveBeenCalledWith('run 结束：failed'); // 无 usage 字段时不拼 tokens 后缀
+    // issue #236：`failed` 也有母语标签了（此前上屏是裸英文 `failed`）
+    expect(hooks.onSysErr).toHaveBeenCalledWith('run 结束：failed — 运行失败'); // 无 usage 字段时不拼 tokens 后缀
     expect(hooks.onSysErr).toHaveBeenCalledWith('run 失败：llm_error — boom');
     expect(hooks.onSep).not.toHaveBeenCalledWith(expect.stringContaining('run 结束'));
   });
@@ -191,7 +192,7 @@ describe('useEventStream（mock EventSource）', () => {
       usage: { input_tokens: 3, output_tokens: 5 },
     });
     // 追加位置在文案**末尾**（tokens 后缀由外层 i18n 模板拼接，故 code 在 reason 片段末尾、tokens 之前）
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：failed（code=timeout） · tokens 3+5');
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：failed — 运行失败（code=timeout） · tokens 3+5');
     // 与 error 信封并存：两行各自成立，互不覆盖
     s.activeRunId.value = 'run-2';
     lastES().emit('run_end', {
@@ -199,7 +200,7 @@ describe('useEventStream（mock EventSource）', () => {
       termination: { reason: 'failed', errorCode: 'rate_limited' },
       error: { code: 'rate_limited', message: '429' },
     });
-    expect(hooks.onSysErr).toHaveBeenNthCalledWith(2, 'run 结束：failed（code=rate_limited）');
+    expect(hooks.onSysErr).toHaveBeenNthCalledWith(2, 'run 结束：failed — 运行失败（code=rate_limited）');
     expect(hooks.onSysErr).toHaveBeenNthCalledWith(3, 'run 失败：rate_limited — 429');
   });
 
@@ -210,22 +211,25 @@ describe('useEventStream（mock EventSource）', () => {
     // 旧 run / 旧引擎：termination 里没有 errorCode 键
     s.activeRunId.value = 'run-1';
     lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination: { reason: 'failed' } });
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：failed');
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：failed — 运行失败');
     // 显式空串 / null / 非字符串：一律不追加（不能让 `（code=undefined）` 渗进用户可见文案）
+    // issue #236：`aborted` 已改判中性分隔条（用户按停止不是故障）⇒ 看 onSep。
     s.activeRunId.value = 'run-2';
     lastES().emit('run_end', { seq: 2, run_id: 'run-2', termination: { reason: 'aborted', errorCode: '' } });
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：aborted');
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：aborted — 已中止');
     s.activeRunId.value = 'run-3';
     lastES().emit('run_end', { seq: 3, run_id: 'run-3', termination: { reason: 'aborted', errorCode: null } });
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：aborted');
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：aborted — 已中止');
     s.activeRunId.value = 'run-4';
     lastES().emit('run_end', { seq: 4, run_id: 'run-4', termination: { reason: 'max_rounds_cap', errorCode: 7 } });
-    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：max_rounds_cap');
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：max_rounds_cap — 达到轮数上限');
     // 与既有标签/落盘细节片段共存：errorCode 缺失时 persistence_failed 的老文案一字不动
     s.activeRunId.value = 'run-5';
     lastES().emit('run_end', { seq: 5, run_id: 'run-5', termination: { reason: 'persistence_failed' } });
     expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：persistence_failed — 快照未落盘（崩溃恢复可能重复副作用）');
-    expect(hooks.onSysErr.mock.calls.every((c) => !String(c[0]).includes('code='))).toBe(true);
+    // 红色与中性两路都不得带 code 片段
+    const allLines = [...hooks.onSysErr.mock.calls, ...hooks.onSep.mock.calls].map((c) => String(c[0]));
+    expect(allLines.every((line) => !line.includes('code='))).toBe(true);
   });
 
   // 技术细节不进 i18n（工单 #261B）：英文界面下同样原样透出，不新增词条、不回落中文。
@@ -237,10 +241,10 @@ describe('useEventStream（mock EventSource）', () => {
       s.connect('sess-1');
       s.activeRunId.value = 'run-1';
       lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination: { reason: 'failed', errorCode: 'timeout' } });
-      expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: failed（code=timeout）');
+      expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: failed — run failed（code=timeout）');
       s.activeRunId.value = 'run-2';
       lastES().emit('run_end', { seq: 2, run_id: 'run-2', termination: { reason: 'failed' } });
-      expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: failed');
+      expect(hooks.onSysErr).toHaveBeenLastCalledWith('run ended: failed — run failed');
     } finally {
       setLocale('zh-CN');
     }
@@ -283,11 +287,50 @@ describe('useEventStream（mock EventSource）', () => {
     s.activeRunId.value = 'run-2';
     lastES().emit('run_end', { seq: 4, run_id: 'run-2', termination: { reason: 'final_guard_unverified', detail: 'guard retries exhausted' } });
     expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 结束：final_guard_unverified — 终稿未经核验');
-    // 截断类 reason（引擎给出但不在红色集合）保持灰色中性分隔条——本次决策不动它
+    // 截断类 reason（引擎给出但不在红色集合）保持灰色中性分隔条——本次决策不动它；
+    // issue #236：文案从裸英文枚举改为母语标签。
     s.activeRunId.value = 'run-3';
     lastES().emit('run_end', { seq: 5, run_id: 'run-3', termination: { reason: 'continuation_exhausted' } });
-    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：continuation_exhausted');
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：continuation_exhausted — 续跑次数耗尽');
     expect(hooks.onSysErr).toHaveBeenCalledTimes(2); // 只有两次红色，灰色那条不算
+  });
+
+  // issue #236 §1 第 1 条：`aborted` 等 reason 的母语标签 + 呈现分级（实时与历史共用一条规则）。
+  it('run_end（#236）：aborted 走**中性**分隔条 + 母语「已中止」；失败类仍红；未知 reason 回落原文', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    // ① 用户按停止 ⇒ 中性分隔条（此前是红色 syserr + 裸英文 aborted）
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination: { reason: 'aborted' } });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：aborted — 已中止');
+    expect(hooks.onSysErr).not.toHaveBeenCalled();
+    // ② failed / persistence_failed / final_guard_unverified 仍是红色（**没有把红色降级成中性**）
+    for (const [i, reason] of ['failed', 'persistence_failed', 'final_guard_unverified'].entries()) {
+      s.activeRunId.value = `run-red-${i}`;
+      lastES().emit('run_end', { seq: 10 + i, run_id: `run-red-${i}`, termination: { reason } });
+      expect(hooks.onSysErr, `reason=${reason} 必须仍走 .syserr`).toHaveBeenCalledTimes(i + 1);
+    }
+    // ③ 引擎新增的未知 reason：不在标签表里 ⇒ 逐字透传原文（不编造翻译，§5.3）
+    s.activeRunId.value = 'run-unknown';
+    lastES().emit('run_end', { seq: 20, run_id: 'run-unknown', termination: { reason: 'some_future_reason' } });
+    expect(hooks.onSep).toHaveBeenLastCalledWith('run 结束：some_future_reason');
+  });
+
+  // issue #236：历史合成项 `run_termination` 的取词/分级入口（**与实时 run_end 共用同一个函数**）。
+  it('historyRunEndEntry（#236）：历史项与实时同文案同分级；脏载荷 ⇒ null（不编 reason）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    const hist = (payload: Record<string, unknown>) => ({ seq: 1, run_id: 'r1', type: 'run_termination', payload });
+    expect(s.historyRunEndEntry(hist({ status: 'finished', termination: { reason: 'aborted' } })))
+      .toEqual({ kind: 'sep', text: 'run 结束：aborted — 已中止' });
+    expect(s.historyRunEndEntry(hist({ termination: { reason: 'failed', errorCode: 'timeout' } })))
+      .toEqual({ kind: 'syserr', text: 'run 结束：failed — 运行失败（code=timeout）' });
+    expect(s.historyRunEndEntry(hist({ termination: { reason: 'end_turn' } })))
+      .toEqual({ kind: 'sep', text: 'run 结束：正常完成' });
+    for (const dirty of [{}, { termination: null }, { termination: { reason: '' } }, { termination: { reason: 7 } }]) {
+      expect(s.historyRunEndEntry(hist(dirty)), `脏载荷不得渲染：${JSON.stringify(dirty)}`).toBeNull();
+    }
   });
 
   it('run_end 分级（#212）：en 语言下新原因给英文标签（双语齐全，不是只写中文）', () => {
