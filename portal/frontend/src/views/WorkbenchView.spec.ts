@@ -18,8 +18,16 @@ import { i18n, setLocale } from '../i18n';
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
 } as AuthUser;
-const ADMIN_USER = {
-  id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local',
+// issue #308（M3）：原夹具是「无工位管理员」（`admin` 且 `fde_name=null`）——#334 的准入闸
+// （lib/workbenchGate.ts）之后这个形状进不到工作台（会被改写到 /admin），拿它当夹具等于给不可达
+// 状态做覆盖。换成第 ② 类人：`admin` **且**有工位（闸放行，顶栏仍有「管理台」入口）。
+const ADMIN_WITH_SEAT = {
+  id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
+} as AuthUser;
+// `who` 的无 fde_name 分支仍然可达：闸只挡「admin 且无工位」，`role='fde'` + `fde_name=null` 的畸形
+// 账号照常进得来（lib/workbenchGate.spec.ts:82 钉着 next）⇒ 这条分支的覆盖改用它，不删。
+const FDE_NO_SEAT = {
+  id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null, auth_source: 'local',
 } as AuthUser;
 const DIRS = [{ name: 'demo', cwd: '~/projects/demo', running_count: 0, queued_count: 0 }];
 
@@ -99,10 +107,16 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     expect(wrapper.find('[role="separator"]').attributes('aria-label')).toBe('调整侧栏宽度');
   });
 
-  it('平台管理员：顶栏「管理台」入口；who 无 fde_name 时只显示 role（全角括号）', async () => {
-    const wrapper = await mountWorkbench(ADMIN_USER);
-    expect(wrapper.find('header span.flex-1').text()).toBe('root（admin）');
+  it('平台管理员（第 ② 类人：admin 且有工位）：顶栏「管理台」入口；who 带 fde_name（全角括号）', async () => {
+    const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
+    expect(wrapper.find('header span.flex-1').text()).toBe('root（admin / root）');
     expect(wrapper.find('header a[href="/admin"]').text()).toBe('管理台');
+  });
+
+  it('who 的无 fde_name 分支（fde 账号缺 fde_name）：只显示 role（全角括号）', async () => {
+    const wrapper = await mountWorkbench(FDE_NO_SEAT);
+    expect(wrapper.find('header span.flex-1').text()).toBe('bob（fde）');
+    expect(wrapper.find('header a[href="/admin"]').exists()).toBe(false);
   });
 
   it('「↓ 最新」悬浮按钮文案走 i18n（离开底部时出现）', async () => {
@@ -113,15 +127,15 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
   });
 
   it('切 English：顶栏 + 嵌套侧栏文案即时变英文（who 改半角括号），并持久化', async () => {
-    const wrapper = await mountWorkbench(ADMIN_USER);
-    expect(wrapper.find('header span.flex-1').text()).toBe('root（admin）');
+    const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
+    expect(wrapper.find('header span.flex-1').text()).toBe('root（admin / root）');
 
     await switchToEnglish(wrapper);
 
     expect(wrapper.find('header button').text()).toBe('☰ Navigation');
     expect(wrapper.find('header button').attributes('aria-label')).toBe('Open navigation');
     expect(wrapper.find('header button[title]').attributes('title')).toBe('~/projects/demo (click to copy)');
-    expect(wrapper.find('header span.flex-1').text()).toBe('root (admin)');
+    expect(wrapper.find('header span.flex-1').text()).toBe('root (admin / root)');
     expect(wrapper.find('header a[href="/admin"]').text()).toBe('Admin console');
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('Sign out');
     expect(wrapper.find('[role="separator"]').attributes('aria-label')).toBe('Resize sidebar');
