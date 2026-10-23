@@ -337,6 +337,19 @@ export const en = {
     colActions: 'Actions',
     openAction: 'Open preview',
     signing: 'Issuing ticket…',
+    // issue #247: open the whole group at once (one click = sign + open; no confirmation dialog,
+    // because tickets expire in 60 seconds)
+    openAllAction: 'Open all previews',
+    batchSigning: 'Issuing tickets…',
+    batchFailed: 'Failed to issue the preview tickets in bulk ({code}): {message}',
+    batchBlocked: 'The browser blocked some new tabs; open them one by one:',
+    // issue #286: human-facing cookie notice (the edge stripping Cookie is by design, not a bug;
+    // agents inside the workspace are told by rule 7 in the container's ~/AGENTS.md, humans are told here)
+    cookieNotice:
+      'Note: the platform edge strips the Cookie header from requests, so do not use cookie-based sessions '
+      + 'on preview channels — pass your session in the Authorization header. '
+      + '(Agents inside the workspace are already told by rule 7 in the container’s ~/AGENTS.md; '
+      + 'this note is for human developers.) This is by design, not a bug.',
     hostnameCopyTitle: '{url} (click to copy the full URL)',
     copiedUrl: 'Preview URL copied to clipboard.',
     copyFailed: 'Copy failed: ',

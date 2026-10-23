@@ -354,6 +354,16 @@ export const zhCN = {
     colActions: '操作',
     openAction: '打开预览',
     signing: '签发通行票…',
+    // issue #247：一键开整组（一次点击 = 签 + 开；不做二次确认——票 60 秒过期）
+    openAllAction: '打开全部预览',
+    batchSigning: '批量签发中…',
+    batchFailed: '批量签发预览通行票失败（{code}）：{message}',
+    batchBlocked: '浏览器拦截了部分新标签，逐个点开：',
+    // issue #286：面向**人**的 Cookie 告知（边缘整体剥 Cookie 头是 by design，不是 bug；
+    // 工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知）
+    cookieNotice:
+      '说明：平台边缘会剥掉请求的 Cookie 头，预览通道上请勿使用 Cookie 会话——登录态请走 Authorization 头。'
+      + '（工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知。）这是平台的既有设计，不是故障。',
     hostnameCopyTitle: '{url}（点击复制完整地址）',
     copiedUrl: '预览地址已复制到剪贴板。',
     copyFailed: '复制失败：',

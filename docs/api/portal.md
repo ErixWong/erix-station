@@ -65,6 +65,7 @@
 | 端口 | `POST /api/admin/fdes/:fdeName/ports/block` | **管理员改块 = 搬迁事务**（#246 交付②，§4.7a：同事务释放旧块 + 撤 grant + 插新块 + 入队两条派生链） |
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
+| 端口 | `POST /api/me/ports/batch-tickets` | **一键放行整组：一次请求签 N 张预览票**（#247，§4.7a：上限 = 号池块大小、越界 `404`、审计逐张、零新错误码） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
@@ -465,8 +466,9 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
   运行时才决定**，本文档不写死端口区间——唯一真相是 `~/.erix/ports.json` 与该 FDE 的 allocation 行）：
   ticket 与派生的预览 cookie 都**绑一条 allocation / 一个 host**——`preview_grants.allocation_id` 只指向
   签票时那一条，`__Host-fde_preview` 是 host-only cookie（本节末），所以 `…-p-22000.…` 上拿到的凭证
-  **不会**让 `…-p-22001.…` 免凭证通过：一段里的每个域名都要逐个签票、逐个种 cookie（issue #247 要收掉的
-  就是这个），`forwardAuth` 第 1 步按请求的 hostname 精确查 `port_allocations`（§2.7），换个 host 就查不到那张票。
+  **不会**让 `…-p-22001.…` 免凭证通过：一段里的每个域名都要逐个签票、逐个种 cookie——**#247 交付的批量端点**
+  （§4.7a `POST /api/me/ports/batch-tickets`）把「逐个签」收成**一次请求签 N 张**，票仍是逐张 per-host；
+  `forwardAuth` 第 1 步按请求的 hostname 精确查 `port_allocations`（§2.7），换个 host 就查不到那张票。
   反过来也成立：**给某条 allocation 签的票不会让它指向别的 host**（`url` 由该 allocation 自己的
   `hostname` 生成，规格 §8-4 前端不得自行拼接）。
 - portal 生成随机 token，只存 `preview_grants`（`kind='ticket'`，`token_hash=sha256(ticket)`，**`issuer_id` = 当前登录用户（签发者）**、`user_id` = **主体（被授权访问的身份：普通 FDE 自签 = issuer = subject；admin 代签他人 private = subject 为 admin）**、`allocation_id`、`expires_at=now+60s`、`created_ip/created_ua`）。**不存 ticket 明文**（与 `login_sessions.token_hash` 同口径）。
@@ -1240,6 +1242,77 @@ COMMIT
 `details={fde_name, from_block_start, to_block_start, released_allocations, inserted_allocations, revoked_grants}`；
 `changed:false`（幂等空操作）按上表③ **不写审计**；`400/409` 不写。
 
+#### `POST /api/me/ports/batch-tickets` —— 一键放行整组（issue #247）
+
+> **为什么要它**：预览票是 **host 级**的（一张票只绑一条 allocation / 一个 host，§2.8），而一个 FDE 拿到的是
+> **一整段** `PREVIEW_PORT_COUNT`（默认 10）个 host ⇒ 前后端分离的应用（前端 22000 + 后端 22001）
+> 要逐个点「打开预览」，真机实测「跳 host 要点 2 次」。本端点把「一次点击 = 签 N 张票」变成**一次请求**，
+> 前端一次点击开 N 个标签页。**票的语义一个字没变**（仍然一次性、60 秒、host 级、逐张落 `preview_grants`）。
+
+请求体（可选字段）：
+
+```json
+{ "allocation_ids": ["7b0a1f2e-…", "8c1b2a3f-…"] }
+```
+
+- 不给 `allocation_ids`（或给 `null`）⇒ **本 FDE 全部活行**（`state <> 'released'`，含 P5 前的
+  `scope='project'` 遗留行），按 `port ASC` —— 这就是「一键放行整组」。
+- 给了 ⇒ 只签这些行，**响应顺序 = 请求顺序**（前端按序开标签页）；重复的 id 是 `400`（同一行签两张票只会浪费一张）。
+- 上限 = **`PREVIEW_PORT_COUNT`**（`portal/src/previewpool.js`，与号池块大小同源 = 10，**不写死数字**）。
+  隐含集合（不给 `allocation_ids`）同样受这个上限约束：活行超上限（历史遗留形态）⇒ `400`，请显式分批传 id。
+
+响应 `201`（信封照既有列表端点 `{items:[...]}`，§1.3）：
+
+```json
+{
+  "items": [
+    {
+      "id": "7b0a1f2e-9c3d-4e5f-8a6b-1c2d3e4f5a6b",
+      "port": 22000,
+      "url": "http://alice-p-22000.fde.erix.vip:8090/?preview_ticket=pt_…",
+      "ticket": "pt_…",
+      "expires_at": "2026-10-23T12:01:00.000Z"
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` / `port` | 这条票对应的 allocation 与端口（前端按 `id` 把票对回列表行；顺序已与请求一致） |
+| `url` | **已带 `?preview_ticket=` 的完整地址**（与单据端点 §2.8 同形同口径：scheme/端口按公开入口派生，前端不得自行拼接） |
+| `ticket` | 一次性短效 token（只存 `sha256`，§2.8） |
+| `expires_at` | ISO 时间戳；**整批共用一个**（同一个签发时刻 + 同一份 `PREVIEW_TICKET_TTL_SECONDS`）⇒ 前端不需要为每张票各算一次 TTL。单据端点给的是 `expires_in`（秒），本端点给绝对时刻，理由：一次开 N 个标签页时「各自剩多少秒」没有意义，**必须立刻开**才是判据 |
+
+校验顺序即判据（①② 在任何 SQL 之前）：
+
+| 序 | 条件 | HTTP / code |
+|---|---|---|
+| ① | `allocation_ids` 不是数组 / 空数组 / 含非 UUID 串 / 含重复 / 超过 `PREVIEW_PORT_COUNT` 项 | `400 validation_failed`，`details.field='allocation_ids'`（**零 SQL**、零签发） |
+| ② | 任一 id **不属于本人 FDE** / 不存在 / 对应行已 `released` | `404 not_found`（三种情况回**同一句**：否则就是存在性探针；与单据端点 §2.8 同码） |
+| ③ | 隐含集合的活行数 > `PREVIEW_PORT_COUNT` | `400 validation_failed`，`details.field='allocation_ids'` |
+| ④ | 限流（按「用户 + IP」，`PREVIEW_TICKET_RATE_LIMIT_*`）已满 | `429 rate_limited`（`retryable=true` + `Retry-After`，与单据端点同码） |
+
+- **零新错误码**：上表四个码全部是既有码（`validation_failed` / `not_found` / `rate_limited`），本端点不新增任何 `error.code`。
+- **`retryable` 语义**：只有 `429 rate_limited` 是 `retryable=true`（等 `Retry-After` 后重试同一请求是安全的——本端点
+  不落任何业务状态）。`400`（形状/上限）与 `404`（归属）重试同一请求必败，`retryable=false`，要先改请求。
+- **限流按张计数**：一次请求签 N 张就吃掉 N 个配额（`check` 一次 + 逐张 `recordFailure`）⇒ 批量**不会**把
+  `20/60s` 放大 10 倍；被限流的那次**一张都不签**。
+- **原子性（对外「要么全成、要么报错」）**：不开大事务（每张票是一次独立 INSERT，读者逐张独立消费，
+  包进一个事务不会更原子，只会白占连接）。实现是「**先全量预检 → 再逐张签发 → 失败补偿**」：
+  预检（①②③）在任何签发之前完成 ⇒ 越界/超限这类可预期失败**零写入**；签发途中的意外（并发下 allocation 被释放、
+  DB 抖动）会用一条 `UPDATE preview_grants SET state='revoked', revoked_at=COALESCE(revoked_at, now())` 把本批
+  **已签的票全部收回**再抛错（既有 `500` 口径）⇒ 既**不返回半截 `items`**，库里也不留 60 秒内还能换预览 cookie 的残票。
+- **审计：逐张各写一行**（`action='auth.preview_ticket_issued'`、`actor_id`=签发者、`target`=该行的预览 host、
+  `details={grant_kind:'ticket', allocation_id, port, token_hash_prefix, expires_at}`）。口径照 §2.8 B3：
+  **绝不入 ticket 明文、也绝不入带票的 `url`**（与 forward-auth 审计的 `pathOnly` 同一条纪律）；
+  `400/404/429` **不写**审计。
+  ⚠ 单据端点 `POST /api/ports/:id/preview-ticket` 目前**写零行审计**（实现现状，见 §2.8），本端点是**新增**这条审计，
+  不改单据端点（`preview.js` 的 `issuePreviewTicket` 一字未动，签发口径仍只有一份）。
+- **实现**：`portal/src/http.js#handleBatchPreviewTickets`（分派/校验/限流/审计）+ 复用
+  `portal/src/preview.js#issuePreviewTicket`（**不复制签发逻辑**：幂等/哈希/过期/TTL 只有一份）；
+  测试 `portal/test/preview-ports.test.js` 的 `#247①~⑧`。
+
 #### 自动选块的冲突重算（补交付① 的已知边界，无新契约但影响本端点的用法）
 
 `provisionFdePreviewPorts`：**未**显式指定 `blockStart` 时遇 `preview_port_block_taken` ⇒ 开**新事务**重算
@@ -1251,7 +1324,7 @@ COMMIT
 > 已有的 `withFdeLock` 锁键是 `fde:${fdeName}`，**串行化不了不同 FDE 抢同一个空闲块**，
 > 所以「迁移 0019 的全局部分唯一索引 + 新事务重算」才是正解，不要指望加锁（规格 §8.2）。
 
-> **前端已接入（#246 交付② 单 B）**。
+> **前端已接入（#246 交付② 单 B）**；#247 的批量端点也已接入：工作台左侧栏的预览端口面板有「打开全部预览 / Open all previews」，一次点击 = 签 + 开 N 个标签页（**不做二次确认**——票 60 秒过期）；弹窗被拦时面板给出带票的可点链接列表兜底。批量签票**同样只在点击时发生**（挂载/折叠/刷新都不签）。
 
 ### 4.8 工具审批（Approvals）
 

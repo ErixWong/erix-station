@@ -27,6 +27,16 @@ const props = withDefaults(defineProps<{
   ticketBusyId?: string | null;
   ticketError?: PreviewApiError | null;
   popupBlockedUrl?: string | null;
+  /** #247：整批签票进行中（「打开全部预览」按钮禁用 + 转圈）。 */
+  batchBusy?: boolean;
+  batchError?: PreviewApiError | null;
+  /** #247：批量签完但部分新标签被拦截 ⇒ 这些带票地址的兜底链接（不得静默）。 */
+  batchBlockedUrls?: string[];
+  /**
+   * #247：是否渲染「打开全部预览」。批量端点**只签本人 FDE**（越界一律 404），
+   * 所以管理台「代看别人端口」的形态不给这个动作（给了会是个点了没反应的按钮）。
+   */
+  showOpenAll?: boolean;
   /** 'me' = 本人端口（GET /api/me/ports）；'fde' = 管理员代看某个 FDE。 */
   scope?: 'me' | 'fde';
   fdeName?: string | null;
@@ -40,6 +50,10 @@ const props = withDefaults(defineProps<{
   ticketBusyId: null,
   ticketError: null,
   popupBlockedUrl: null,
+  batchBusy: false,
+  batchError: null,
+  batchBlockedUrls: () => [],
+  showOpenAll: true,
   scope: 'me',
   fdeName: null,
   variant: 'table',
@@ -48,6 +62,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (e: 'retry'): void;
   (e: 'open', item: PreviewPortItem): void;
+  /** #247 一键开整组：签票时机由调用方（usePreviewPorts.openAllPreviews）决定，面板自己不碰网络。 */
+  (e: 'open-all'): void;
 }>();
 
 const { t } = useI18n();
@@ -93,6 +109,16 @@ function ticketErrorText(error: PreviewApiError): string {
   return t('previewPorts.ticketFailed', { code: error.code, message: error.message });
 }
 
+function batchErrorText(error: PreviewApiError): string {
+  return t('previewPorts.batchFailed', { code: error.code, message: error.message });
+}
+
+/** 批量兜底链接的文字 = 该票地址的 host（人一眼能看出是哪个端口），解析不出就回原串。 */
+function blockedLinkLabel(url: string): string {
+  const matched = /^[a-z]+:\/\/([^/?#]+)/i.exec(url);
+  return matched ? matched[1]! : url;
+}
+
 // 卸载时收掉复制回显的定时器（复制提示是纯本地态，组件都没了就没必要再改 ref）
 onScopeDispose(() => clearTimeout(copiedTimer));
 </script>
@@ -109,7 +135,25 @@ onScopeDispose(() => clearTimeout(copiedTimer));
         :disabled="props.loading"
         @click="emit('retry')"
       >{{ t('common.retry') }}</button>
+      <!-- #247 一键开整组：只在点击时签（一次点击 = 签 + 开，无二次确认——票 60 秒过期）。
+           列表为空时不渲染（没东西可开）；签票中/批量中一律禁用（票是一次性的，并发签等于白签）。 -->
+      <button
+        v-if="props.showOpenAll && props.items.length > 0"
+        type="button"
+        data-test="preview-open-all"
+        class="ml-auto rounded-md border border-brand/40 bg-brand/5 px-2 py-0.5 text-xs text-brand hover:bg-brand/10 disabled:opacity-50"
+        :disabled="props.batchBusy || props.ticketBusyId !== null"
+        @click="emit('open-all')"
+      >{{ props.batchBusy ? t('previewPorts.batchSigning') : t('previewPorts.openAllAction') }}</button>
     </div>
+
+    <!-- #286：面向**人**的 Cookie 告知（平台边缘整体剥 Cookie 头，这是 by design，不是 bug）。
+         工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知；人类开发者在此告知。
+         放在面板顶部：空态/失败态也看得到（不只是有端口列表时才说）。 -->
+    <p
+      data-test="preview-cookie-notice"
+      class="mb-1.5 rounded-md border border-black/10 bg-black/[0.03] px-2 py-1 text-[11px] leading-[1.5] text-black/60"
+    >{{ t('previewPorts.cookieNotice') }}</p>
 
     <!-- 加载中（首屏骨架；已有列表时刷新不抽掉列表，只在按钮上体现） -->
     <div v-if="props.loading && !props.loaded" data-test="preview-ports-loading" role="status">
@@ -267,6 +311,14 @@ onScopeDispose(() => clearTimeout(copiedTimer));
       role="alert"
     >{{ ticketErrorText(props.ticketError) }}</p>
 
+    <!-- #247 批量签票失败（整批不返回半截）：错误码 + 服务端原文 -->
+    <p
+      v-if="props.batchError"
+      data-test="preview-batch-error"
+      class="syserr mt-1.5 text-sm"
+      role="alert"
+    >{{ batchErrorText(props.batchError) }}</p>
+
     <!-- 弹窗被拦截：给同一条带票地址的兜底链接（ticket 仍然只在这条链接里，不进当前页 URL） -->
     <p
       v-if="props.popupBlockedUrl"
@@ -282,6 +334,26 @@ onScopeDispose(() => clearTimeout(copiedTimer));
         rel="noopener"
         data-test="preview-popup-fallback-link"
       >{{ t('previewPorts.popupBlockedLink') }}</a>
+    </p>
+
+    <!-- #247 批量：浏览器拦了部分新标签 ⇒ 逐个给可点链接兜底（**不得静默**）。
+         样式复用上面那条告警（不新增 UI 结构），只是链接从 1 个变成 N 个。 -->
+    <p
+      v-if="props.batchBlockedUrls.length > 0"
+      data-test="preview-batch-blocked"
+      class="mt-1.5 rounded-md border border-amber-500/60 bg-amber-50 px-2 py-1 text-xs text-amber-900"
+      role="status"
+    >
+      {{ t('previewPorts.batchBlocked') }}
+      <template v-for="(url, index) in props.batchBlockedUrls" :key="url">
+        <a
+          class="underline"
+          :href="url"
+          target="_blank"
+          rel="noopener"
+          data-test="preview-batch-fallback-link"
+        >{{ blockedLinkLabel(url) }}</a><span v-if="index < props.batchBlockedUrls.length - 1"> · </span>
+      </template>
     </p>
   </div>
 </template>

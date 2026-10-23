@@ -100,6 +100,8 @@ class PortsStore {
     this.takenFailuresLeft = 0;     // 前 N **笔事务**的 INSERT 直接 23505（⑪ 用）
     this.txBlewUp = false;
     this.doNothingPorts = new Set();// 指定端口命中冲突目标 ⇒ DO NOTHING 吃掉（⑩ 用）
+    this.ticketFailAt = 0;          // #247：第 N 张票的 INSERT 直接炸（验证「失败补偿」不留残票）
+    this.ticketAttempts = 0;
   }
 
   clone() {
@@ -167,6 +169,40 @@ class PortsStore {
       return { rows, rowCount: rows.length };
     }
 
+    // #247 批量签票：目标行解析（归属 / 活行判定在 http 层，fake 只按 SQL 说的做）。
+    // 放在「释放旧行 / 撤 grant」之前：下面那两条 UPDATE 分支按前缀匹配，不会误吞本分支的 SELECT。
+    if (s.startsWith('SELECT id, fde_id, state, port, hostname FROM port_allocations')) {
+      const ids = (params[0] ?? []).map((x) => String(x).toLowerCase());
+      const rows = this.rows
+        .filter((r) => ids.includes(String(r.id).toLowerCase()))
+        .map(({ id, fde_id, state, port, hostname }) => ({ id, fde_id, state, port, hostname }));
+      return { rows, rowCount: rows.length };
+    }
+
+    // preview.issuePreviewTicket 的单行取数（签发本体复用产品实现，fake 只喂它要的那几列）
+    if (s.startsWith('SELECT id, fde_id, state, exposure, hostname, url FROM port_allocations')) {
+      const row = this.rows.find((r) => String(r.id).toLowerCase() === String(params[0]).toLowerCase());
+      return { rows: row ? [row] : [] };
+    }
+
+    // #247 批量签票的失败补偿：按 token_hash 集合收回本批已签的票。
+    // **必须排在下面那条「按 allocation_id 撤 grant」之前**——两者前缀相同（`UPDATE preview_grants SET state = `）。
+    if (s.startsWith('UPDATE preview_grants SET state = ') && s.includes('token_hash = ANY')) {
+      const hashes = new Set(params[0] ?? []);
+      const matched = this.grants.filter((g) => hashes.has(g.token_hash) && g.kind === 'ticket' && g.state === 'active');
+      const proposed = matched.map((g) => ({ ...g, state: 'revoked', revoked_at: g.revoked_at ?? new Date().toISOString() }));
+      for (const row of proposed) {
+        const violation = previewGrantCheckViolation(row);
+        if (violation) throw previewGrantCheckError(row, violation);
+      }
+      for (const [index, grant] of matched.entries()) {
+        grant.state = proposed[index].state;
+        grant.revoked_at = proposed[index].revoked_at;
+      }
+      this.writes.push(s);
+      return { rows: matched.map((g) => ({ id: g.id })), rowCount: matched.length };
+    }
+
     // 释放旧行（照 offboarding.js:217-224 的写法；fake 必须回 RETURNING id）
     if (s.startsWith('UPDATE port_allocations SET state = ') && s.includes('released_at = COALESCE')) {
       this.writes.push(s);
@@ -186,6 +222,31 @@ class PortsStore {
       const out = applyRevokeGrantsSql({ sql: s, grants: this.grants, allocationIds: params[0] });
       this.writes.push(s);
       return out;
+    }
+
+    if (s.startsWith('INSERT INTO preview_grants')) {
+      // preview.issuePreviewTicket 的 INSERT（逐列同真库形状；fake 必须真落行，否则「N 张票 = N 行」
+      // 与「失败不留残票」两句断言都只是在读测试自己的空气）。
+      assert.match(s, /kind, state, expires_at/, '签票 INSERT 的列形状变了？');
+      const [tokenHash, userId, issuerId, allocationId, expiresAt, ip, ua] = params;
+      if (this.ticketFailAt > 0 && ++this.ticketAttempts >= this.ticketFailAt) {
+        throw sqlError('57014', 'canceling statement due to statement timeout');
+      }
+      const grant = seedGrant({
+        id: `pg-${++this.grantSeq}`,
+        token_hash: tokenHash,
+        user_id: userId,
+        issuer_id: issuerId,
+        allocation_id: allocationId,
+        kind: 'ticket',
+        state: 'active',
+        expires_at: expiresAt,
+        created_ip: ip,
+        created_ua: ua,
+      });
+      this.grants.push(grant);
+      this.writes.push(s);
+      return { rows: [], rowCount: 1 };
     }
 
     if (s.startsWith('INSERT INTO port_allocations')) {
@@ -749,7 +810,7 @@ class PortsHttpPool extends FakePool {
   }
 }
 
-async function startPortsServer({ store, users = [ADMIN, ALICE, BOB, LONG_FDE] } = {}) {
+async function startPortsServer({ store, users = [ADMIN, ALICE, BOB, LONG_FDE], rateLimit = null } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-ports-static-'));
   const config = {
     cookie: cookieSettings('dev-http', 604800),
@@ -762,6 +823,10 @@ async function startPortsServer({ store, users = [ADMIN, ALICE, BOB, LONG_FDE] }
     staticDir,
     baseDomain: BASE,
     portalPublicBaseUrl: PUBLIC_BASE,
+    // #247 批量签票：TTL 与限流必须显式给（前者缺了 `expires_at` 会算成 Invalid Date，
+    // 后者是「一次点击 = N 张票，放大倍数计入配额」那条断言的旋钮）。
+    previewTicketTtlSeconds: 60,
+    ...(rateLimit ? { previewTicketRateLimit: rateLimit } : {}),
   };
   const pool = new PortsHttpPool({ users, store });
   const server = createServer({ pool, config, llmGateway: { async listModels() { return { data: [] }; } }, log: LOG });
@@ -973,6 +1038,263 @@ test('③(线上形态) 改块成功：200 + changed:true + 列表跟着搬 + �
       body: JSON.stringify({ block_start: 22020 }),
     });
     assert.equal(fdeSelf.status, 401, 'admin 面未登录仍走 401；普通 FDE 的 403 见上一条测试');
+  } finally {
+    await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #247（issue #247，工单 feat-261023-04）：一键放行整组 —— POST /api/me/ports/batch-tickets
+//
+// 八条判据（工单「必测」①~⑤ + 三条本单自加）：
+//   ① 批量 = N 张票：每张各落一行 preview_grants、响应顺序与请求一致、url 带票且与 ticket 对得上
+//   ② 越界（别人的 / 未知的 / 已 released）⇒ 404 not_found，且**一张都不签**（零残票、零审计）
+//   ③ 上限 = 号池块大小（10）：第 11 个 ⇒ 400 validation_failed + details.field='allocation_ids'
+//   ④ 不给 allocation_ids ⇒ 该 FDE 全部活行（含 scope='project' 遗留行）、port ASC
+//   ⑤ 审计逐张各一行、details 不含 ticket 明文（也不含带票的 url）
+//   ⑥ 限流按**张**计数（一次点击 = N 张票，不得把 20/60s 放大 10 倍）
+//   ⑦ 失败补偿：签发中途炸 ⇒ 本批已签的票全部收回（不留半截可用票），响应不返回半截 items
+//   ⑧ admin 无 FDE ⇒ 201 空列表（与 GET /api/me/ports 同口径）；未登录 401
+// ---------------------------------------------------------------------------
+const BATCH_PATH = '/api/me/ports/batch-tickets';
+
+function postBatch(base, cookie, body) {
+  return fetch(`${base}${BATCH_PATH}`, {
+    method: 'POST',
+    headers: cookie ? { cookie, 'content-type': 'application/json' } : { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+// #247 批量签票的种子：行 id 必须是**真 UUID 形状**（端点对请求体里的 id 先判形状再交给
+// `= ANY($1::uuid[])`，`pa-1` 这种 fake 内部 id 会被 400 挡在签发之前）。
+const batchUuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
+function batchSeed({ extraRows = [] } = {}) {
+  return new PortsStore({
+    users: [{ id: 'u-alice', fde_name: 'alice' }, { id: 'u-bob', fde_name: 'bob' }],
+    rows: [
+      ...FIRST_BLOCK.map((port, i) => ({ ...liveRow('alice', 'u-alice', port), id: batchUuid(i + 1) })),
+      ...extraRows,
+    ],
+  });
+}
+
+test('#247① 批量 = N 张票：每张各落一行 preview_grants、响应顺序与请求一致、url 带票且与 ticket 对得上', async () => {
+  const store = batchSeed();
+  const { base, aliceCookie, close } = await startPortsServer({ store });
+  try {
+    const ids = [batchUuid(1), batchUuid(3), batchUuid(2)];
+    const res = await postBatch(base, aliceCookie, { allocation_ids: ids });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(Object.keys(body), ['items'], '信封照既有列表端点 {items:[...]}');
+    assert.equal(body.items.length, 3);
+    assert.deepEqual(body.items.map((i) => i.id), ids, '顺序与请求一致（前端按序开标签页）');
+    assert.deepEqual(body.items.map((i) => i.port), [22000, 22002, 22001], 'port 跟着 id 走（不按 port 重排）');
+    for (const item of body.items) {
+      assert.deepEqual(Object.keys(item).sort(), ['expires_at', 'id', 'port', 'ticket', 'url']);
+      assert.match(item.ticket, /^pt_[A-Za-z0-9_-]+$/);
+      assert.ok(item.url.endsWith(`?preview_ticket=${item.ticket}`), '§2.8：url 已带票，前端不得自行拼接');
+      assert.match(item.url, new RegExp(`^http://alice-p-${item.port}\\.fde\\.erix\\.vip:8090\\?preview_ticket=`));
+    }
+    // 整批同一个 expires_at（同一个 now + 同一份 TTL 配置），且落在 60s 之后
+    assert.equal(new Set(body.items.map((i) => i.expires_at)).size, 1, '同一批票共用一个 expires_at');
+    const ttlMs = new Date(body.items[0].expires_at).getTime() - Date.now();
+    assert.ok(ttlMs > 50_000 && ttlMs <= 60_000, `expires_at 应为 now+60s（实际 ${ttlMs}ms）`);
+
+    const tickets = store.grants.filter((g) => g.kind === 'ticket');
+    assert.equal(tickets.length, 3, '每张票各落一行 preview_grants');
+    assert.equal(new Set(tickets.map((g) => g.token_hash)).size, 3, '三张票三个不同哈希（没有复用同一张）');
+    for (const item of body.items) {
+      const grant = tickets.find((g) => g.allocation_id === item.id);
+      assert.ok(grant, `${item.id} 必须有自己那行 grant`);
+      assert.equal(grant.token_hash, auth.hashToken(item.ticket), '只存 sha256，不存明文');
+      assert.equal(grant.user_id, ALICE.id, '主体 = 本人');
+      assert.equal(grant.issuer_id, ALICE.id, 'issuer = 主体（普通 FDE 自签）');
+      assert.equal(grant.state, 'active');
+      assert.ok(grant.expires_at, 'expires_at 必须落库（TTL 生效）');
+    }
+  } finally {
+    await close();
+  }
+});
+
+test('#247② 越界（别人的 / 未知的 / 已 released）⇒ 404 not_found 且一张都不签（零残票、零审计、同一句响应）', async () => {
+  const store = batchSeed({
+    extraRows: [
+      { ...liveRow('bob', 'u-bob', 22020), id: batchUuid(11) },
+      { ...liveRow('alice', 'u-alice', 22011, { state: 'released', released_at: new Date().toISOString() }), id: batchUuid(12) },
+    ],
+  });
+  const bobRow = store.rows.find((r) => r.fde_id === 'u-bob');
+  const releasedRow = store.rows.find((r) => r.state === 'released');
+  const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+  try {
+    const before = store.grants.length;
+    const foreign = await postBatch(base, aliceCookie, { allocation_ids: [batchUuid(1), bobRow.id] });
+    const unknown = await postBatch(base, aliceCookie, { allocation_ids: [batchUuid(1), '00000000-0000-4000-8000-0000000000ff'] });
+    const released = await postBatch(base, aliceCookie, { allocation_ids: [releasedRow.id] });
+
+    assert.equal(foreign.status, 404);
+    assert.equal(foreign.status, 404, '别人的 allocation ⇒ 404（与单据端点同码）');
+    assert.equal(unknown.status, 404);
+    assert.equal(released.status, 404, '已 released 视同不存在（单据端点同口径）');
+    const bodies = [await foreign.json(), await unknown.json(), await released.json()];
+    for (const body of bodies) assert.equal(body.error.code, 'not_found', '复用既有码，不新造');
+    assert.deepEqual(bodies[0], bodies[1], '「存在但不属于你」与「根本不存在」必须回同一句（否则是存在性探针）');
+    assert.deepEqual(bodies[0], bodies[2]);
+
+    assert.equal(store.grants.length, before, '预检在签发之前 ⇒ 一张都没签（不存在「先签 pa-1 再撞 404」的半截）');
+    assert.equal(pool.audit.length, 0, '失败的批量不写审计');
+    assert.deepEqual(store.portSql().filter((x) => x.startsWith('INSERT')), [], '零 INSERT');
+  } finally {
+    await close();
+  }
+});
+
+test('#247③ 上限 = 号池块大小：第 11 个 ⇒ 400 validation_failed + details.field；形状类错误同样 400 且零写', async () => {
+  const store = aliceSeed();
+  const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+  try {
+    const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const tooMany = Array.from({ length: PREVIEW_PORT_COUNT + 1 }, (_, i) => uuid(i + 1));
+    const cases = [
+      [{ allocation_ids: tooMany }, '超过上限（第 11 个）'],
+      [{ allocation_ids: [] }, '空数组'],
+      [{ allocation_ids: 'pa-1' }, '不是数组'],
+      [{ allocation_ids: ['not-a-uuid'] }, '不是 UUID'],
+      [{ allocation_ids: [uuid(1), uuid(1).toUpperCase()] }, '重复（大小写归一后同一条）'],
+    ];
+    for (const [body, label] of cases) {
+      const res = await postBatch(base, aliceCookie, body);
+      assert.equal(res.status, 400, `${label} 必须 400`);
+      const err = await res.json();
+      assert.equal(err.error.code, 'validation_failed', `${label}：复用 validation_failed（零新错误码）`);
+      assert.equal(err.error.details.field, 'allocation_ids', `${label}：details.field 供前端定位`);
+      assert.equal(store.grants.length, 0, `${label}：零签发`);
+      assert.equal(pool.audit.length, 0, `${label}：零审计`);
+    }
+    assert.match((await (await postBatch(base, aliceCookie, { allocation_ids: tooMany })).json()).error.message, /10/,
+      '文案要点明上限是 10（与号池块大小同源）');
+  } finally {
+    await close();
+  }
+});
+
+test('#247④ 不给 allocation_ids ⇒ 该 FDE 全部活行（含 scope=\'project\' 遗留行），port ASC', async () => {
+  const store = new PortsStore({
+    users: [{ id: 'u-alice', fde_name: 'alice' }, { id: 'u-bob', fde_name: 'bob' }],
+    rows: [
+      { ...liveRow('alice', 'u-alice', 22000), id: batchUuid(1) },
+      // 遗留形态（P5 前的 project 维度行）：一键放行整组必须也覆盖它
+      { ...liveRow('alice', 'u-alice', 22012, { scope: 'project', role: 'primary' }), id: batchUuid(2) },
+      { ...liveRow('alice', 'u-alice', 22001), id: batchUuid(3) },
+      { ...liveRow('bob', 'u-bob', 22002), id: batchUuid(4) },
+    ],
+  });
+  const { base, aliceCookie, close } = await startPortsServer({ store });
+  try {
+    const res = await postBatch(base, aliceCookie, {});
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(body.items.map((i) => i.port), [22000, 22001, 22012], 'port ASC；含遗留行、不含别人的行');
+    assert.deepEqual(body.items.map((i) => i.id), [batchUuid(1), batchUuid(3), batchUuid(2)]);
+    assert.equal(store.grants.filter((g) => g.kind === 'ticket').length, 3);
+    assert.deepEqual(
+      store.grants.filter((g) => g.kind === 'ticket').map((g) => g.allocation_id).sort(),
+      [batchUuid(1), batchUuid(2), batchUuid(3)].sort(),
+      '遗留 project 行也要覆盖（否则「一键放行整组」在存量 FDE 上永远少一个）',
+    );
+  } finally {
+    await close();
+  }
+});
+
+test('#247⑤ 审计逐张各一行、details 不含 ticket 明文（也不含带票的 url）', async () => {
+  const store = batchSeed();
+  const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+  try {
+    const ids = [batchUuid(1), batchUuid(2), batchUuid(3)];
+    const body = await (await postBatch(base, aliceCookie, { allocation_ids: ids })).json();
+    const rows = pool.audit.filter((e) => e.action === 'auth.preview_ticket_issued');
+    assert.equal(rows.length, 3, '逐张各写一行（「整批写一行」是变异靶子，必须具名红）');
+    assert.equal(pool.audit.length, 3, '整个请求只产生这三行（不多不少）');
+
+    const blob = JSON.stringify(pool.audit);
+    for (const item of body.items) {
+      assert.ok(!blob.includes(item.ticket), '审计里绝不入 ticket 明文（http.js:385 的既有纪律）');
+      assert.ok(!blob.includes(item.url), '带票的 url 同样不得入审计');
+    }
+    const seen = new Set();
+    for (const row of rows) {
+      const details = JSON.parse(row.details);
+      assert.deepEqual(Object.keys(details).sort(),
+        ['allocation_id', 'expires_at', 'grant_kind', 'port', 'token_hash_prefix']);
+      assert.equal(details.grant_kind, 'ticket', '§2.8 B3：审计只记 grant_kind + 标识，不记明文');
+      assert.match(details.token_hash_prefix, /^[0-9a-f]{12}$/, '可关联的只有哈希前缀');
+      assert.equal(row.actor_id, ALICE.id);
+      assert.match(row.target, /^alice-p-\d+\.fde\.erix\.vip$/, 'target = 预览 host（同 auth.forward_auth 口径）');
+      seen.add(details.allocation_id);
+    }
+    assert.deepEqual([...seen].sort(), ids, '每行对应不同的 allocation（不是同一行写三遍）');
+  } finally {
+    await close();
+  }
+});
+
+test('#247⑥ 限流按**张**计数：一次点击签 N 张就吃掉 N 个配额（不得把 20/60s 放大 10 倍）', async () => {
+  const store = batchSeed();
+  const { base, aliceCookie, close } = await startPortsServer({
+    store,
+    rateLimit: { maxFailures: 3, windowMs: 60_000, blockMs: 60_000, maxEntries: 100 },
+  });
+  try {
+    const first = await postBatch(base, aliceCookie, { allocation_ids: [batchUuid(1), batchUuid(2), batchUuid(3)] });
+    assert.equal(first.status, 201);
+    const second = await postBatch(base, aliceCookie, { allocation_ids: [batchUuid(4)] });
+    assert.equal(second.status, 429, '3 张票已经吃满 3 个配额 ⇒ 第 4 张被限流');
+    const err = await second.json();
+    assert.equal(err.error.code, 'rate_limited');
+    assert.equal(err.error.retryable, true);
+    assert.equal(store.grants.filter((g) => g.kind === 'ticket').length, 3, '被限流的那次一张都没签');
+  } finally {
+    await close();
+  }
+});
+
+test('#247⑦ 失败补偿：签发中途炸 ⇒ 本批已签的票全部收回（不留半截可用票），不返回半截 items', async () => {
+  const store = batchSeed();
+  store.ticketFailAt = 3; // 第 3 张票的 INSERT 炸（前两张已落库）
+  const { base, aliceCookie, pool, close } = await startPortsServer({ store });
+  try {
+    const res = await postBatch(base, aliceCookie, { allocation_ids: [batchUuid(1), batchUuid(2), batchUuid(3)] });
+    assert.equal(res.status, 500, '意外失败照既有 500 口径（不新造码）');
+    assert.ok(!('items' in (await res.json())), '不返回半截 items');
+    const tickets = store.grants.filter((g) => g.kind === 'ticket');
+    assert.equal(tickets.length, 2, '前两张确实签过（不是「一张都没签」的假绿）');
+    for (const grant of tickets) {
+      assert.equal(grant.state, 'revoked', '已签的票必须被收回——否则它们 60 秒内还能换预览 cookie，等于悄悄放行了半个面板');
+      assert.ok(grant.revoked_at, 'revoked ⇔ revoked_at（baseline CHECK）');
+    }
+    assert.equal(pool.audit.length, 0, '整批失败不写审计（没有成功签发的行）');
+  } finally {
+    await close();
+  }
+});
+
+test('#247⑧ admin 没有 FDE ⇒ 201 空列表（同 GET /api/me/ports 口径）；未登录 401', async () => {
+  const store = batchSeed();
+  const { base, adminCookie, close } = await startPortsServer({ store });
+  try {
+    const res = await postBatch(base, adminCookie, {});
+    assert.equal(res.status, 201);
+    assert.deepEqual(await res.json(), { items: [] });
+    assert.equal(store.grants.length, 0, '零签发');
+
+    const anon = await postBatch(base, null, {});
+    assert.equal(anon.status, 401);
+    assert.equal((await anon.json()).error.code, 'unauthorized', '未登录走既有 401 口径');
   } finally {
     await close();
   }

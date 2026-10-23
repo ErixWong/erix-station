@@ -138,6 +138,7 @@ function errorText(error: PreviewApiError): string {
       :ticket-busy-id="ports.ticketBusyId.value"
       :ticket-error="ports.ticketError.value"
       :popup-blocked-url="ports.popupBlockedUrl.value"
+      :show-open-all="false"
       @retry="reload"
       @open="(item) => ports.openPreview(item)"
     />
