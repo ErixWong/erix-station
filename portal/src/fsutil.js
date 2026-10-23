@@ -40,7 +40,18 @@ export function assertSafePath(root, target) {
   }
 }
 
-/** 确保目录存在（不 follow symlink），并尝试 chmod/chown（非 root 时 chown best-effort）。 */
+/** 确保目录存在（不 follow symlink），并尝试 chmod/chown（非 root 时 chown best-effort）。
+ *
+ * ⚠ mode 的 setgid 位（0o2770 里的 2000）是**历史遗留，不会落盘**——口径已定 **0770**（issue #273）：
+ *   · mkdir(2) 传 0o2770 本身从不交出 setgid（umask 022 → 0750、0002 → 0770）；
+ *   · 真正能落下 setgid 的只有 chmod，且仅在「目录属组 == 本进程 egid」时；portal 是 uid0/gid0 且
+ *     cap_drop ALL + cap_add 无 CAP_FSETID（容器内 CapEff=0xcb），chown(1000,1000) 之后的下一轮 chmod
+ *     会被内核**静默清掉 setgid**（770 原样保留、不抛错）⇒ reconcile 从第 2 轮起稳定 0770。
+ *   · 这**不是缺陷**：GID 继承由写入进程主组（1000）达成，组写位由 umask 与属组 1000 达成，setgid 不承载任何行为。
+ * 别为了「把 mode 兑现成 2770」去补 CAP_FSETID（只改一个看不见的数字，不改任何访问语义，违背最小权限）。
+ * 别把字面量改成 0o0770（行为等价，但会让 docs/user-space §6.2 与 wp2a §④ 断言面重新变得可疑）。
+ * 将来真要「组协作」要动的是 umask / 组成员关系，不是 setgid。详见 docs/design/user-space.md §6.2 / issue #273。
+ */
 export function ensureDirSafe(root, dir, { mode = 0o750, uid = null, gid = null, log = console } = {}) {
   assertSafePath(root, dir);
   fs.mkdirSync(dir, { recursive: true, mode });

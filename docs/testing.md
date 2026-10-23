@@ -306,7 +306,7 @@ SQL
 | M1 原子写（半截不可见） | 物化写入过程中（temp 阶段）并发读目标文件 | 读者读到**旧完整文件**或**新完整文件**，绝无半截/空文件（同目录 tmp+rename，user-space §5.1） | 多次并发读，sha256 恒等于旧或新，无中间态 |
 | M2 跨文件一致性（manifest 提交点） | 一批物化同时改 `ports.json`+`manifest.json`，读方在两次 rename 之间读 | 读方检测到 sha256 不匹配 → 重读收敛到同一 generation（user-space §5.3） | 最终读到的 `ports.json.generation == manifest.generation` |
 | M3 manifest generation 单调 + 内容不变不递增 | 重复物化同一 DB 快照 | generation 不变、文件字节级相同（user-space §5.5/§8.2） | 两次输出 sha256 相等 |
-| M4 权限/属主 | 物化后 `stat` | 平台文件 root:root `0644`/`0444`（manifest `0444`）；工作区目录 `erix`(1000) `2770`（user-space §6.2） | 逐项匹配 |
+| M4 权限/属主 | 物化后 `stat` | 平台文件 root:root `0644`/`0444`（manifest `0444`）；工作区目录 `erix`(1000) `0770`（user-space §6.2，**无 setgid**；代码传 `2770` 但落盘 `0770`，成因与「为什么不是缺陷」见该节「为什么是 `0770` 而不是 `2770`」，issue #273） | 逐项匹配 |
 | M5 容器重建后重物化幂等 | 触发全量重物化（user-space §8.1） | 内容无变化 → 不重写、generation 不变（§8.2） | 文件 mtime 不变 + sha256 不变 |
 | M6 磁盘满（ENOSPC） | 对 temp 写入注入 ENOSPC | 不写半截、保留上一版、标记 `failed` + code=`disk_full` + 告警状态落库（user-space §7.3） | 上一版文件完好 + 失败状态可查 |
 | M7 权限错误（EACCES/EPERM） | 目录属主改错 / mount 只读 | 立即告警 code=`permission_denied`，低频对账重试，不高频盲重试（user-space §7.3） | 告警状态可查 |

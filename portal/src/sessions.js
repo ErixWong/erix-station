@@ -210,7 +210,8 @@ export async function createSession(pool, { userId, projectId, title, model, con
   }
 
   // 「＋新建目录」语义：目录不存在则创建（权限口径同 provisioner/materializer 工作区目录：
-  // 2770 + erix 属主；root 创建即 chown，非 root 环境 best-effort 告警不阻断——fsutil 语义）。
+  // mode 传 2770、**落盘 0770**，口径定在 0770（setgid 不承载行为，issue #273）；+ erix 属主；root 创建即
+  // chown，非 root 环境 best-effort 告警不阻断——fsutil 语义）。
   const fde = await pool.query(
     `SELECT fde_name FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
