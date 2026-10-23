@@ -1310,3 +1310,16 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 ⚠ **本案最值钱的一条口径（我差点测出错）**：第一次「修复后」只测到 2 次增长，看着像「修复没效果」——真因是**浏览器在跑缓存里的旧 bundle**（加载 `index-BSvpdxB0.js`，而新镜像是 `index-CZEDYy1L.js`）。⇒ **前端 A/B 必须先断言浏览器实际加载的 bundle 文件名**（`performance.getEntriesByType('resource')` 里筛 `assets/index-*.js` 与容器内 `index.html` 对比），加 `?nocache=` 重载再测；否则就是把旧代码当新代码下结论。
 
 **状态**：已合 main（`06bbaa2`，PR 自动关 #342），**未发版** —— 试用栈仍 pin v0.1.5，那条路上「整段一次出现」依旧会复现，别当回归。台账：前端基线 653 → **655**（`docs/ops/ci-release.md` §1 步骤 ④）。
+
+### 8.43 v0.1.26 发版与部署（2026-10-23，载荷 = #308 预览端口搬左栏 + #342 打字机修复）
+
+**载荷**（自 v0.1.25，共 13 个提交）：`#340`（issue #308，预览端口段从工作台顶栏搬进左栏底部堆叠区，前端基线 640→653）、`#343`（issue #342，delta 气泡/toolCard 持响应式 proxy，653→**655**）、三批 test/docs（#339 哨兵与载体口径、#338 发版补记）。⚠ **本版 `runner/` 代码零改动**（`git diff --name-only v0.1.25..v0.1.26 -- runner/` 去掉 package 文件后为空）⇒ **故意不重建 FDE 容器**、`FDE_IMAGE` 仍 pin 在 v0.1.25 摘要 `de16b78b…`（§8.19 先例，别当漏做）。
+
+**流程**（这次严格按「先等 main CI 绿再打 tag」，§8.32 那条纠偏落地）：版本 bump `32a2801`（六文件：三份 `package.json` 各 1 行 + 三份 lockfile 各 2 行，diff 恰好 9 增 9 删）→ main CI run `39906003775` **两个 job 全绿**（质量门禁 + 三镜像构建校验）→ 才打 tag `v0.1.26` → release run `39906538060` success（`event=push`，§8.15 那条老口径仍然成立）→ 清单 artifact 名是 **`images-digest`**（不是 `images-digest.json`，那是里面的文件名；`gh run download -n images-digest.json` 会报 no artifact）。
+digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imageId `e29d20c2…`；proxy `04d98cc4…` / imageId `a43c4e3e…`。**三镜像直连一次拉齐**（§8.35 那个 fde 422MB 单层 0 B/s 没复现；本版只 pull 了要 pin 的两个，fde 用 `docker manifest inspect ghcr.io/erixwong/erix-station-fde:0.1.26` 探到即算在 GHCR 存在）。`deploy/.env` 形态① pin **只两行**（备份 `/tmp/deploy.env.bak-0126`）→ `up -d --no-build` ⇒ portal 实跑 `8b3dec6d…` = 清单 imageId、healthy、经 Traefik `healthz 200`；`station-docker-proxy` 实跑 `a43c4e3e…` 一并跟上（只影响以后新建的 FDE）；五台 `fde-*` 仍在 `de16b78b`。
+
+**发布物上的真机复验（主 agent 亲手，1280×768）**
+- **bundle 核对先行**（§8.42 那条口径反着用）：容器内 `index.html` 与浏览器 `performance` 里的入口都是 **`index-CZEDYy1L.js`**，且**不等于**修复前 v0.1.25 的 `index-BSvpdxB0.js` ⇒ 下面这组数据测的确实是新代码。
+- **#342**：同一条 120 行 prompt ⇒ 374 次采样里**画面增长 62 次**、平均每次 **120 字符**、从 t=1.0s 起每 ~200ms 一跳（60–80 字符）= 打字机在发布物上成立。对照修复前 v0.1.25 是「3 次增长、其中一跳 +4283 字符」。
+- **#308**：`data-test="sidebar-aside"` / `sidebar-bottom-stack` / `preview-ports-toggle` 三者关系正确（**预览切换在底部栈内**），`#preview-ports-disclosure` 的 `closest('[data-test="sidebar-aside"]')` 命中 ⇒ 顶部没有全宽预览条残留；`sidebar-session-list` 可视高 532px（会话列表仍独立可滚，滚动预算只有一层）。
+- 浏览器 cookie 会随页面上下文重置丢掉 ⇒ 处置：在页面里 `fetch('/api/auth/login')` 一次（同源自动带 `Origin`，#234 同源门不拦），比走表单稳。
