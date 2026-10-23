@@ -1430,3 +1430,40 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
   - ⚠ **一条比 worker 边界表更具体的新边界（判据①的必然结果，不修）**：**「起跑前被取消」的 run 重开会话时没有分隔条**。标本 `58ffb56a…`（#277 验收造的 `cancelled_before_start`）在 `run_events` 里**只有 1 行 `run_end`**（#277 合成的那条），而 `run_end` 不在历史白名单 ⇒ 该 run 在响应窗口里**零可见行** ⇒ 判据①「该 run 出现在本次窗口里」不满足。已用 SQL + 该会话 history 的 run 分布双向确认（history 里 30 行全属 `9bde380a`）。影响面：那条 run `rounds=0` 且无正文，界面上只留用户消息（与 #346 是同一族观感）。
 - **呈现改判需要决策者过目**（PR 正文已显式标注，这里再记一次）：`aborted` 的**实时**呈现从红色 `.syserr` 改成中性 `roundsep`（判据 = 「是否用户自己按了停止」，单一常量 `USER_STOP_TERMINATION_REASON`）。依据是 #236 正文那句「用户主动停止是常规操作，不该与真故障同色」，且 #236-1 让所有 reason 都上屏后，旧 #212「保持红色不变」那句已被本单作废。**其余红色成员一字未改**。
 - **未发版**：本单已进 main，但 v0.1.27 部署面**不含**它；下次发版才带上（试用栈那条路上「刷新后分隔条消失」仍会复现，别当回归）。
+### 8.48 v0.1.28 发版 + 夜班三车道（#273 / #295 / #256）与「派工 → 独立评审 → 返修」闭环（2026-10-24 夜班，无人值守）
+
+**决策者睡觉期间自主推进**：发版 v0.1.28 → 收 stale issue（#302/#303/#331 取证后处置）→ 三车道派工（worktree 隔离）→ 三名 fresh-context reviewer 独立评审 → 按评审返修（文档我自己改、代码/测试另派三车道）。
+
+#### 发版 v0.1.28（纯前端载荷 ⇒ 只 pin portal + proxy）
+
+载荷 = `#347`（issue #236 第 1、2 条，§8.47）+ `#345`（#284）。`git diff --name-only v0.1.27..HEAD -- runner/` 去掉 package 文件后**为空** ⇒ `FDE_IMAGE` 故意仍 pin v0.1.25 摘要、**五台 FDE 容器未重建**（§8.19 先例）。流程：版本 bump `8c7906d`（六文件、9 增 9 删）→ **先等 main CI 两个 job 全绿再打 tag**（§8.32 纠偏第二次遵守）→ release run `40000640087` → 清单 `imageId` 与部署机 `docker image inspect .Id` 逐个一致（portal `4ce2a7db…` / proxy `3b44b32f…`）→ `.env` 形态① pin（备份 `/tmp/deploy.env.bak-0128`）→ `up -d --no-build` → `healthz=200`、服务 bundle = **`index-Zms29SHi.js`**（与 PR #347 的构建逐字同名 = 内容一致性旁证）。
+
+**#236 在发布物上把两条支路都验完**（此前只验过本地构建镜像 + 中性支路）：会话 `ec8a77b3…` **恰好 5 条** run 结束分隔条（3 `judge_done` + 2 `aborted`），computed color 全为中性 `rgba(0, 0, 0, 0.55)`、祖先无 `.syserr`、**硬刷新后仍是 5 条**；红色支路用标本会话 `1ead0b1a…`（`failed` = `invalid_messages` 砖化账本）⇒ 10 条里 **3 条红** `rgb(220, 53, 69)` 且带 `code=invalid_messages`，另 7 条中性，整页无 `undefined`/`[object Object]`/`NaN`。中英双语标签都逐字读过。
+
+#### 三车道派工（`worktree: true`，各 30 分钟硬顶）与逐笔 cherry-pick
+
+| issue | 交付 | 落地 | 关键取证 |
+|---|---|---|---|
+| **#273** 工作区 setgid 假话（文档承诺 `2770`、真机 `0770`） | 决策 = **C：改口 `0770`，不加 `CAP_FSETID`**；新 `portal/test/userspace-dir-mode-doc.test.js` | `e274d49`（patch-id SAME）+ 我的返修 `87e4365` | worker **推翻我给的两条前提**（① 清 setgid 的不是 `chown` 是**缺 `CAP_FSETID` 时的 `chmod`**——内核 `chown(2)` 对目录不清；② `umask 0002` 早就设了，`644` 是 `docker exec` 临时 shell 的 `0022`），两条我都独立复现（`CapEff=0xcb`、`0xcb & 0x10 == 0`） |
+| **#295** markdown 裸 URL 被 `_` 截断 / 缺左边界 / 邮箱未记录 | 占位符保护 `U+E002`（**不是**把 `_` 处理挪到链接之后——那会吞掉链接文字里的 `**` 并把星号卷进 `href`）+ 左边界 lookbehind + 邮箱定为刻意范围 | `7d1ccce`（SAME） | 30 条既有 golden（含 `[点我](javascript:alert(1))` ⇒ `<p>点我)</p>`）**零改动**；主 agent 跑新旧差分确认「无 URL 输入逐字相同」 |
+| **#256** 号池占用总览端点 + 429 带秒数 | `GET /api/admin/preview-ports/usage`（`{pool, occupied_blocks:[{start_block, fde_names[]}], free_blocks:{items,limit,has_more}, summary}`）、审计 `admin.preview_ports_usage_listed` 只计数 | `83e3080`/`d12b714`/`b14bf54`/`41dd2cd`（范围 patch-id SAME） | 占用判据与迁移 `0019` 的部分唯一索引 `WHERE state <> 'released'` **逐字同口径**；**429 只改前端一条路**（`api.ts` 早已把 `Retry-After` 解析成 `ApiError.retryAfter` ⇒ 我工单里那句「可能没秒数」是假问题，worker 否证、评审复核为真） |
+
+⚠ **纪律更新（本轮踩实）**：worker **多笔 commit** 时必须 cherry-pick **整段范围**（`base..branch`），只挑 tip 会因新增文件产生 DU 冲突（#256 实测）。
+
+#### 评审闭环：三名 fresh-context reviewer 各抓到的东西（都值得再来一轮）
+
+- **#273 → 1 blocker**：worker 把**实测混着的 setgid 写成「一致 `0770`」**——正是这单要消灭的那类假话。真机 `/srv/erix/users`：`eric/projects/probe-343`、`blind/projects/r1-app` = **`2770`**，同树 `probe-261014` = `770`，遗留 `home/worktrees` = `2755`（**在 `2770` 父目录里新建会继承 setgid**）。正确口径 = 「portal 每轮 reconcile 的目录 `0770` + 只建一次的 `projects/<p>` 停在 `2770`，同一棵树混着」。另 4 条：§9.1 创建者写错（`projects/<p>` 由 `sessions.js createSession` 建，materializer 的 P5 项目级物化早已退役）、spool 行给既成事实数字（**尚未实现**，口径应随创建者）、`(b)` 缺「所有 FDE 属主写点必须同传 uid+gid」这条**前提**（`ensureDirSafe` 的 `gid` 缺省 `null` ⇒ 只传 uid 会留 `gid=0`，那时 setgid 才真承重）、compose 注释仍写 `2770` 无指路、`docs/env.md` 给一个**不存在的 env** 编了默认值。
+- **#295 → 1 major + 2 minor**：全量门红是既有脆弱项（≠ 本单，见 #349）；`URL_LEFT_BOUNDARY` 是**第三份手写字面量**且 `&` 成员**永不生效**（`esc()` 已把 `&` 变 `&amp;` ⇒ lookbehind 看到的是 `;`，注释与实测不符）；左边界带来的行为面**宽于**工单举的四种（`:`/`#`/`~`/`@` 前缀一并挡掉，零用例零注释）；「与 cmark-gfm / linkify-it 同口径」**无出处**。
+- **#256 → 0 blocker/major + 5**：`docs/api/portal.md` 示例**内部自相矛盾**（`items` 2 段却与 `free`/`has_more` 对不上）；注释行号错位（真实锚点 = `parseRetryAfter` 与 `new ApiError(...)` 的末位实参）；**fake 是子串前缀匹配 ⇒ 有假绿窗口**；零字面量断言被 `22_000` 逃逸且不覆盖 `http.js` handler；`?limit=` 空串语义未定。
+
+#### 返修（第二波三车道，全部已合并）
+
+- `3edd679`（#295b）：`URL_WORD_SYMBOLS` → `URL_WORD_CHARS` → `URL_LEFT_BOUNDARY` 三层派生（**两个集合不硬并成假单一来源**）；删不可达的 `&` 并把原因写进注释；`: # ~ @ % ? +` 逐前缀用例 + **逐成员遍历**；三处「同 cmark 口径」降级为「按工单口径」。46 个探针跑改前/改后 **diff 逐字节相同**（行为零变更自证）。
+- `e66ac16` + `03d5842`（#256b）：fake 从子串匹配改成 **`compileWhere()` 真解析**（原子子句 + 括号 + AND/OR 优先级 + `BETWEEN` 内的 `AND` 不切分，解析不了直接 `throw`）；零字面量改**按数值**判（`22_000` / `0x5618` 都拦）并覆盖 handler；`?limit=` 空串 = 用默认值、`%20` 仍 400（**零新错误码**）；示例按 `?limit=3` 重写做到逐字段可推（800 = 797+2+1）。⚠ worker **反过来纠正了我的工单**：我给的变异形态 `WHERE (A OR B) AND …` 在旧 fake 下也是红的（多个 `(` 让前缀正则失配），**证明不了假绿**；真假绿形态是 `… AND pa.port BETWEEN $1 AND $2 OR pa.state = 'released'`（旧绿 / 新红，双方各自实测）。
+- `bd2a32e`（**新登记的 #349**）：`terminationReasons.spec.ts` 在全局 `jsdom` 下裸 `import 'node:fs'` ⇒ 三个 agent 各见 `Error: No such built-in module: node:`（suite 载入失败、0 test 被计）而我主仓**连跑 3 次 + 冷缓存都复现不到**（vitest 版本四处都是 5.0.1，排除了版本差）。worker 走路 B：`import src from './terminationReasons.ts?raw'` 取代 `readFileSync`，**同一份源码文本、断言一字未改**；路 A（docblock 切 node env）**实测被挡**——`useEventStream.ts:18 → ../i18n` 会加载 `src/i18n/index.ts:74` 的顶层 `document` 副作用（我工单里以为该 spec 不经 index，错）。⇒ 修完后这条门第一次是**无条件绿**（不再依赖 vitest 的 transform 缓存状态）。
+
+**主 agent 亲跑的 4 条返修变异（与 worker 不重叠，全红在具名用例）**：删 `URL_WORD_SYMBOLS` 里的 `~` ⇒ 2 红（逐前缀 + 逐成员）；占用判据放宽成永真 `… OR pa.state = 'released'` ⇒ 恰 1 红（新 fake 有牙）；号池起点写死 `22_000` ⇒ 恰 1 红（`#256③`）；把 `?raw` 指向别的文件 ⇒ 恰 1 红（源码层派生锁读的是对的源码）。⚠ 第一次给 `22_000` 那条我的 python 锚点没匹配上 = **空操作**（§8.24 那条纪律第 N 次在自己手上发作——先 `git diff --numstat` 再谈红绿）。
+
+**基线（合并树亲手复跑，判绿 = 退出码）**：根 **1426 / 1422 通过 / 0 失败 / 4 跳过**、runner **323/323**、前端 `typecheck` rc=0 + **42 文件 / 755 通过**。台账三处已同步（`docs/ops/ci-release.md` §1：1414→1426 / 741→755）。
+
+**新登记的 follow-up**：**#349**（已随本批修完）、**#350**（管理台号池占用总览 UI —— #256 只交付端点，人还在试错）。**仍 open**：#341（上游 erix-agent #415 **未发版**，npm 最新就是 0.23.0）、#303（0.23.0 读侧仍有 7 条路径认顶层旧名 ⇒ `?? tr.duration` **不许删**，取证已贴 issue）、#331（`ERIX_SESSION_AUTO_TITLE` 死光纤，撤它要动 portal + 两处测试）、#346 / #348 / #321 残留（需产品决策）。
