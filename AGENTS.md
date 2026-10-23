@@ -1166,7 +1166,9 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
   账本仍是 0.23 形状（4 条 `:msg:` + 2 条空 `messages` 轮行）⇒ **热patch 撤掉后结论在发布物上重述一遍成立**。
 
 **验收中顺手发现、不属本片的一件事（另开 issue）**：同一轮同时存在 `…:engine:round:<n>` 与 `…:engine:round:<n>:resume` 时，
-逐行投影会给同一条 `tool_use` 出两张卡（一张有结果一张没有）——**0.22 上同样存在**，不是 0.23 引入的回归。
+逐行投影会给同一条 `tool_use` 出两张卡（一张有结果一张没有）——当时附了一句「**0.22 上同样存在**，不是 0.23 引入的回归」。
+⚠ **该句已被 #339 复核判为误判（2026-10-23，见 §8.40）：机制成立，但写侧在 0.22 与 0.23 都不可达**（0.22 有同轮互斥守卫、
+0.23 的 `:resume` 行只写引擎控制文本）⇒ 已改判为「已钉住的夹具哨兵」，口径见 `docs/design/conversation-state.md` §6。
 
 **环境侧副产品**：本机解析不出 `station.fde.erix.vip`（解析器负缓存）且没有免密 sudo 改 hosts ⇒ 临时起了一个
 `127.0.0.1:18099 → 127.0.0.1:8090` 的 `Host`/`Origin` 改写小代理（`/tmp/hostproxy337.mjs`，验完已 kill）供浏览器验收用；
@@ -1210,6 +1212,25 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 ⚠ **只有五台**：发版前经决策者同意 offboard 了两台验收残渣（`pw173jscw` / `ui17kbwg`，10-13 那次浏览器验收建的临时账号）。平台自己的下线流程顺手拿到一次真机记账：`released 10 + 10` 条 allocation、`撤预览 grant（仅 active）0` 条（本来就是 0，关键是 #252 那把「只撤 active」的闸没撞 `used` 行的双向 CHECK）、两台容器消失、`routes.yml` 里两台 host 计数归零、用户 `disabled` + 下线任务 `done`。
 
 **发布物上复验**（不是只信本地镜像）：会话 `4becb332…` 一条真消息 ⇒ run `f49dc486…` `finished / judge_done`（6 轮、↑11,017 ↓179、cacheRead 9,344），`tool_calls` 里 `shell dur=4015ms / exit_code: 0`（#283 的时长面在新镜像上仍正常），助手正文 `done`。dev 残渣：该会话多了两条探针消息（混版冒烟 + 发版冒烟），故意不清。
+
+### 8.40 #339 改判：从「待修缺陷」降为「已钉住的夹具哨兵」+ 载体口径落档（工单 feat-261023-01，2026-10-23，**零产品代码**）
+
+**背景**：§8.38 验收时我记下一条「同轮双载体 ⇒ 两张工具卡片」并附「0.22 上同样存在」。本片把它推到底：**机制成立、可达性不成立**。
+
+**四条证据（均现网/包真件）**：① dev 真库对两种载体行 `GROUP BY transcript_key, round HAVING count(*) > 1` ⇒ **0 行**；② 62 个会话的生产投影按 `(round, call_id)` 与 `(run_id, round, call_id)` 都是 **0 重复卡片**；③ 0.22 `resume-manager.js` 有同轮互斥守卫；④ 0.23 `orchestrator.js` 写 `:resume` 行用的是 `messages: cloneState(resumeEngineText)` —— `resumeEngineText` 只收方向提示 / 达成 advisory **两种引擎控制文本**，不含 `tool_use` ⇒ 结构上给不出第二张卡（工具结果另走 `journalResumedToolResults()` 逐条 `:msg:` 行）。因此**不修**：为零可达面加读侧丢弃逻辑，只引入「静默丢内容」风险。
+
+**载体口径（单一真相 `portal/src/transcript-fold.js#isRoundCarrier` + `planFold`，已写进 `docs/design/conversation-state.md` §6）**：候选 = key 以 `:round:<n>` 或 `:round:<n>:resume` 结尾的非消息行；**每轮取行序第一个**，其余候选行原样保留；**这是本站为「逐行投影」引入的选择，上游 `foldLedgerMessages` 根本不认载体**（只按 `seq` 拼回轮行）⇒ 不许当引擎既有语义引用。
+⚠ **对工单的一处收窄（worker 实测，主 agent 核可）**：「第一个」的二级键是 **`created_at` 不是 `append_seq`** —— `projectSessionMessages` 折叠前用 `compareTranscriptRows`（`round` → `created_at`）**稳定**重排；生产 SELECT 按 `(round, append_seq)` 给行，两者一致时等价，**时钟回拨时载体跟着 `created_at` 走**（已钉成用例）。另：`foldTranscriptRows` / `foldLedgerRecords` **自己不排序**（排序是调用方责任）⇒ 「第一个载体」只在调用方排完序之后成立。
+⚠ 还钉到一条：**`toolCalls[].key` 是位置型键（`round#recordIndex:entryIndex:t<i>`）会跨行撞** ⇒ 不能当去重判据。
+**底线（与上游同语义）**：载体不在场（分页切在轮中间 / 崩溃早于轮行）时消息行**原样留在数组里**，不丢不拼；代价是该页出不了该轮卡片，正文仍在库里。**「内容丢失」不可接受，「这页没卡片」可接受。**
+
+**随带文档更正**：`docs/api/portal.md` §9.8b 行序旧写 `round ASC, created_at ASC`——与 #338 的 S1 分页段自相矛盾且 `created_at` 有完全相同的行、不能确定性还原 ⇒ 改对为 `round ASC, append_seq ASC`。
+
+**测试**：新 `portal/test/session-view-resume-carrier.test.js` **10 条**（**故意不并入 `session-view-fold.test.js`** —— 后者红 = 折叠坏了，本文件红 = 上游写侧形状变了 / 载体口径漂了，混在一起就没法「按红点定位上游文件」）。正向钉「0.23 真实形状只 1 张卡」（注释点名第一站去看 `orchestrator.js` 写 `:resume` 那处）；退化面按实测钉形状 A（2 张卡、`call_id` 同、视图 key 也同）；载体选择两侧（折叠侧归属 + 投影侧 `key` entryIndex 变化）；只有 `:resume` 载体的崩溃常态；无载体不丢内容；**分组键是 `round` 不是 `run_id`**（夹具全 `run_id: null`）；行序二级键。基线：根 **1378 → 1388**（1384 通过 / 0 失败 / 4 跳过）、runner **323 不变**、前端零字节未跑。
+
+**变异（worker 5 条 + 主 agent 亲跑 3 条，不重叠）**：主 agent —— ① `compareTranscriptRows` 二级键反向 ⇒ 3 条具名红（含「行序二级键」）；② `planFold` 无载体分支改成「丢行」⇒ 2 红（本文件的底线用例 + #337 的与上游逐字段一致用例）；③ **夹具变异**（`shapeB` 删掉 `tool_result` 行）⇒ 3 红（红在「唯一那张卡必须带着工具结果」）。⚠ **本单我自己差点犯一次空操作**：第一次夹具变异因文本不匹配而**根本没改文件**（`git diff` 零行）⇒ 33/33 全绿不能当证据；按纪律先证 `0 1` 的删行再重跑才拿到 3 红（§8.24 / §8.36 同族：红了要证明不是文件没跑，没红要证明不是变异没改行为）。worker 另跑 5 条，其中一条是**判据自身**的变异（把重复判据改成 `(run_id, round, call_id)` ⇒ **不红 = 假绿** ⇒ 该判据是死的，硬判据必须用 `(round, call_id)`，已写进文档与用例注释）。
+
+**下一片（A：引擎读路径折叠，#353 的站内义务）的前置已就位**：载体口径只此一份，`foldTranscriptRows` 把 `recordOf` 注入化就是为第二个消费者准备 ⇒ **A 不许在新消费点重写载体规则**；接线时要同时改 `portal/test/transcript-fold-wiring.test.js` 对 `internal.js` 的**反向**锁（改成正向）并保留其余反向锁。
 
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
