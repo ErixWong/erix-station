@@ -226,21 +226,22 @@ header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适�
 | **#349**（新）前端测试环境脆弱 | ✅ **已修并关闭**（`bd2a32e`）：`?raw` 取代 `node:fs`，全量门第一次不依赖 vitest transform 缓存 |
 | **v0.1.28** | ✅ **已发布并部署**（`8c7906d`；portal imageId `4ce2a7db…`、proxy `3b44b32f…` 逐位核对；服务 bundle `index-Zms29SHi.js`） |
 | **v0.1.29** | ✅ **已发布并部署**（`5d967c6`；main CI `40004642827` 绿后打 tag → release `40005238179`；portal `imageId=2a32a0f4…`/`digest=ea45ec01…`、proxy `imageId=ba408140…`/`digest=56fc03b3…` 逐位核对；服务 bundle **`index-BrgEGHCI.js`**；经 Traefik `healthz=200`）。载荷 = 上面四单；`runner/` 零实质改动 ⇒ **五台 FDE 容器故意未重建** |
+| **#350** 管理台号池占用总览页 | ✅ **已交付 + 发布物真机验收**（`491cb9d` cherry-pick（patch-id SAME）+ 我补的 `50eff39`）：管理台第 4 个 tab，真数据逐字段对得上直采 API；改块提示三态「被占用（点名占用者 + 会被 409）/ 整段空闲 / **不知道**（空闲列表是截断的）」在真机上成立，开面板隐式请求 0 次、零自动提交。**worker 推翻了我工单两条契约字段**（`start_block` 不存在；自洽关系是 `= partial + occupied`） |
 | **#351**（新）会话砖化 | 🔴 **已登记，未动代码**：被停止的 run 留下未结清的 `tool_use` ⇒ 同会话再发消息**永久** `invalid_messages`。两个真标本（`ec8a77b3…` index 11 结果行被 `:input:` 插队 / `1ead0b1a…` index 50 结果行根本没落账本），真账本行喂进引擎 `foldLedgerMessages` + `validateMessages` **逐字复现**。**已排除 #341**（链式 `partOf` 全库 0 行 ⇒ 巡检手册测不到这一类） |
 
 ### 🔭 观察队列（不指派，等信号）
 
 - **#351**：等拍修法（A 终态即结清 / B 发消息前置幂等补 / C 上游按 round 归位）。**优先理由**：普通操作（停止 → 继续）即触发、会话永久废掉、现有巡检手册测不到，且 dev 已有两个现成标本可当回归夹具。
 - **#341**：上游 [erix-agent #415](https://github.com/ErixWong/erix-agent/issues/415) **仍未发版**（npm 最新就是 0.23.0）⇒ 站内临时闸 + `docs/ops/transcript-ledger-inspection.md` 继续留着。
-- **#350**：管理台号池占用总览 UI（#256 只交付端点，人还在试错选段）。
 - **#303**：0.23.0 读侧仍有 7 条路径认顶层旧名 ⇒ `?? tr.duration` **不许删**；触发条件已改成「旧 transcript 行归档时」。
 - **#331**：`ERIX_SESSION_AUTO_TITLE` 死光纤（#322 之后 `runner/` 零读取，但撤它要动 portal + 两处测试）。
 - **#346 / #348 / #321 残留**：需产品决策。
 
 ### 刷新过的过期指针
 
-- **版本**：本机现跑 **v0.1.29**（试用栈 `station.vc.cn-ai.vip` 仍 v0.1.5 且不可达）。伞域 `fde.erix.vip`，预览端口段 = 全局号池 `22000–29999`（§8.13）。
+- **版本**：本机现跑 **v0.1.30**（试用栈 `station.vc.cn-ai.vip` 仍 v0.1.5 且不可达）。伞域 `fde.erix.vip`，预览端口段 = 全局号池 `22000–29999`（§8.13）。
 - **#236 的「未发版」口径过期**：其载荷（PR #347 `135ddf6`）已随 **v0.1.28** 发布，红色/中性两支都在发布物上重验过（`1ead0b1a…` 10 条分隔条里 3 条红带 `code=invalid_messages`，`ec8a77b3…` 5 条全中性且硬刷新后不变）。
 - **#278 引用的 #236-1** 同样已发版（v0.1.28）。
-- **测试基线**：根 `npm test` **1426 / 1422 通过 / 0 失败 / 4 跳过**、runner **323/323**、前端 **42 文件 / 755**（台账 `docs/ops/ci-release.md` §1）。
+- **测试基线**：根 `npm test` **1426 / 1422 通过 / 0 失败 / 4 跳过**、runner **323/323**、前端 **43 文件 / 782**（台账 `docs/ops/ci-release.md` §1）。
+- **#350 已随 v0.1.30 发布**（`imageId=0602a027…`/`digest=e2103740…`；bundle `index-xHmHZy-g.js`；`runner/` 零实质改动 ⇒ 五台 FDE 故意未重建）。台账 `AGENTS.md` §8.50。
 - **台账**：本批全过程在 `AGENTS.md` §8.48 / §8.49。⚠ **一条新坑**：主工作区里未提交的文档改动会被 worktree 化的子代理机制回退（本次丢了 ISSUES.md 的整段夜班表，AGENTS.md 因先提交而幸存）⇒ **文档台账改完就提交，别留窗口**。

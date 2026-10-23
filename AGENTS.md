@@ -1483,3 +1483,25 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 标本 1 真库账本（`append_seq` 升序 = 引擎读取序）：`msg:6:0`（assistant + `tool_use` sleep 240）→ **`input:128b5d39…`（用户下一条）** → `msg:6:1`（迟到的 `tool_result`）→ `engine:round:6:resume`。把**真行**喂进引擎自己的 `foldLedgerMessages`（`0.23.0`，`src/store/message-rows.js:197`）+ `validateMessages`（`src/messages/rounds.js:43`）**逐字复现 index 11**。
 **不是 #341**：巡检 SQL（`partOf` 指向的行自身也带 `partOf`）在两个标本会话与**全库**都 **0 行**，标本 1 唯一分片行 `msg:1:2 → msg:1:1` 形状正确 ⇒ `docs/ops/transcript-ledger-inspection.md` **测不到这一类**（手册判「干净」的会话照样砖）。机理也非竞态：停止时结果行不写，等到**下一次 run resume** 才由 `journalResumedToolResults()` 逐条写 `:msg:`；而 `:input:` 是发消息当时写的（#162 顺序红线）⇒ 「停止 → 再发一条」**构造上必现**。issue 里给了三个候选修法（A 终态即结清 / B 发消息前置幂等补结清 / C 引擎按 round 归位）并明说**未拍**，同时要求**存量已砖会话要修数据**。本单**未动代码**。
 ⚠ 可复用的取证手法：**把真账本行喂进引擎自己的折叠/校验函数**比看错误文案硬得多（两行 `await import` 就能在本地逐字重现一个只在真库上出现的错误）。
+
+### 8.50 管理台「预览号池占用总览」页（issue #350，PR 由主 agent 直推，随 **v0.1.30** 发布）
+
+**为什么值这一张**：#256 只交付了端点（§8.48），管理员给 FDE 改预览端口段仍在试错——挑一段 → 409 → 换一段。本单把 `GET /api/admin/preview-ports/usage` 画成管理台第 4 个 tab。**纯前端**：`portal/src/**`、`runner/`、`docs/`、`deploy/`、两份 lockfile 零字节（worker 交付 9 文件 +1283/−0，我核过非前端文件数 = 0）。
+
+**worker 推翻了我工单里两条契约字段（都独立坐实，不是它一家的说法）**
+1. `occupied_blocks[].start_block` **不存在**，真形状 `{start, end, occupied_count, fde_names}`。证据：我今天在 v0.1.29 真机抓的响应键集 = `['end','fde_names','occupied_count','start']` + `docs/api/portal.md` §4.7a。照工单写，被占段那一栏会渲染成 `undefined`。
+2. 自洽关系不是 `len(occupied_blocks) ≤ occupied` 而是 **`= partial + occupied`**——`docs/api/portal.md:1289` 逐字写着这句（`occupied_blocks` 数的是**全部**被占段）。真机 `len=5`、`partial=0`、`occupied=5` 两边都成立，但只有等号那条在 `partial>0` 时不报假矛盾。
+
+**两条收窄（主 agent 核可）**：① 「前端零端口字面量」**不可能全域判**——`lib/previewPorts.ts:78-82`（#246 交付②）早就镜像过 `22000/29999/10`，所以判据只覆盖本单新增的两个文件；② 前端**不复制**服务端 `PREVIEW_USAGE_FREE_LIMIT_DEFAULT = 50`：请求不带 query，页面显示的 `limit` 一律取响应值（服务端改默认值时前端不会撒谎）。
+**worker 自己补的一条**：`free_blocks.items` 是**截断的** ⇒ 一段「不在占用列表里」**不等于**空闲。`classifyBlock` 因此有第三种取值 `unknown`（页面说「不知道，以服务端校验为准」），否则就是给管理员一个假保证、把人推去撞 409。
+
+**主 agent 亲跑变异 4 条（与 worker 的 6 条不重叠，每条先 `git diff` 自证非空操作）**：`classifyBlock` 把「不在空闲列表」当 free ⇒ 2 条具名红；自洽告警行永不显示 ⇒ 恰 1 条红；错误行丢掉服务端 `message` 原文 ⇒ 2 条红；**给 `FdePreviewPortsPane.onMounted` 加一句 `loadPreviewUsage()`（让它隐式发总览请求）⇒ 36 条全绿** ⇒ 先自证非空操作后定性 **真覆盖缺口**：「本面板不发占用总览请求」只活在注释里。补一条 `判据④：打开改块面板**不会**隐式发占用总览请求` 后重放同一变异 ⇒ **恰 1 条红在新用例上**（§8.24 / §8.41 那条纪律第 N 次发作，每次都抓到东西）。
+
+**基线**：根 **1426 / 1422 通过 / 0 失败 / 4 跳过**、runner **323/323** 不变，前端 `typecheck` rc=0 + **43 文件 / 782 通过**（worker 交付 781 + 主 agent 补的 1 条）。`docs/ops/ci-release.md` §1 步骤 ④ 已同步。
+
+**发版与部署（v0.1.30）**：`491cb9d`（cherry-pick，`patch-id --stable` 与 worker 的 `991ac2a` SAME）→ `50eff39`（补测）→ `e2646c7`（版本 0.1.30，六文件 9 增 9 删）→ main CI `40010571884` **两个 job 全绿**（含三镜像构建校验，这是打 tag 的前置）→ tag `v0.1.30` → release `40011042026` success → 清单 portal `imageId=0602a027…`/`digest=e2103740…`、proxy `imageId=60636b92…`/`digest=275d2494…`，两个都直连一次拉成、`docker image inspect .Id` 逐位一致 → `.env` 形态① pin（只两行；备份 `/tmp/deploy.env.bak-0130`）→ `up -d --no-build` ⇒ portal 实跑 `0602a027…`、经 Traefik `healthz=200`。⚠ **本版 `git diff --name-only v0.1.29..v0.1.30 -- runner/` 只有 `package.json` + lockfile** ⇒ 五台 FDE 容器故意未重建（§8.19）。
+
+**真机验收两轮（路线 A 预验 + 发布物复验；截图 `/docker/erix_station_playwright/station-pr350-pool-usage.png`）**
+- **预验**（`docker build -f portal/Dockerfile` 本地镜像临时顶掉 pin）：管理台 tab 出现（`用户管理 / LLM 管理 / 仓库管理 / 号池占用`）；落 `/admin/users` 时占用请求 **0 次**，点 tab 后**恰好 1 次**且 URL **不带 query**；真数据逐字段对得上我今天直采的 API（`800 = 795 空闲 + 0 部分 + 5 占满`，被占段 `22000–22009 … 10 个活行 · 占用者：eric`…共 5 段真名）；`partial=0` ⇒ 无警报块、无自洽告警、无错误行、整页无 `undefined`/`NaN`/`[object Object]`、console error 0。
+- **改块提示三态在真机上成立**（这是本单的最终目的）：输入 `22000` ⇒ 「被占用（占用者：eric；10 个活行）——改块会被服务端拒绝（409），请换一段」；`22100` ⇒ 「整段空闲（在最近一次总览的空闲列表里）」；`29990` ⇒ 「**不知道**这一段空不空：它不在最近一次总览的空闲列表里（那份列表是截断的），以服务端校验为准」。开面板 ⇒ 占用请求增量 **0**（隐式请求为零，真机版）；`/ports/block` POST 数 **0**、输入框值原样保留（不自动改值/不自动提交）。
+- **发布物复验**：浏览器实际加载 `index-xHmHZy-g.js`，**与本地构建同名**（内容逐字节一致旁证，同 §8.43 那次先例），汇总与占用段渲染同上、四类脏值全 0。
