@@ -1289,3 +1289,24 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 - [x] run-state 快照与 `markRunState` status 拆分；新状态列走 migration `0014`，旧快照内嵌 `state` 由 status reader 兼容，无数据回填。
 - [x] 删除 `onRunStart` 调用；completion 错误只记日志、不覆盖 run 主错误。
 - [ ] PR B：为 notes retention/purge 与 active orphan cleanup 实现宿主自调度（ADR-018 D7/session clock）；本 PR 不实现 tool replay 或 partial persistence。
+
+### 8.42 流式正文为什么「不是逐字出」：裸对象进了响应式数组（issue #342，PR #343，2026-10-23，merge `06bbaa2`）
+
+**症状与病根**（issue 里的根因分析我独立复现，不是照抄）：run 正常终态、SSE 健康、库里 delta 事件与终稿都在，但界面上正文**不是逐字出**——像 run 结束才一次刷出来。机制是 Vue 响应式的一条老坑：`addDeltaEntry()` 返回**裸对象**，裸对象 `push` 进 `entries.value` 之后，闭包里继续持有并修改那个**裸引用**——读走 proxy（`track`）、写打在裸对象上（碰不到 trigger 逻辑）⇒ 不通知 ⇒ 不重渲染。只有结构性变化（`run_end` 移除 delta、追加终稿锚点）才触发一次渲染，于是整段答案一次出现。`useEventStream.toolCard()` 同根同因（`Map` 存裸引用，首帧 `card.text` 不触发）。
+
+**载荷只有 3 个前端文件（+76/−1）**：`stores/workbench.ts` 流式那行改取 `entries.value[entries.value.length - 1]`（push 后立刻回读 proxy，`shallowRef` 的 `triggerRef` 兜底也走同一条更新路径）；`composables/useEventStream.ts` 的 `toolCard()` 改 `return toolCards.get(key)!`；`workbench.spec.ts` +2 条回归。
+
+**验证与变异（主 agent 亲跑，不采信 PR 自报）**：PR head 上 `typecheck` rc=0、前端 **36 文件 / 655 通过** rc=0（= main 基线 653 + 2）、根 **1388 / 1384 / 0 / 4** 与基线逐位相同（`portal/src/` 与 `runner/` 零字节）。变异：撤掉 proxy 取回那两行 ⇒ **恰好 1 条具名红**；`toolCard()` 退回 `return card` ⇒ **全绿 ⇒ 这处改动没有对应的红变异**。按纪律先自证不是空操作（核 `toolCard()` 全部 2 个调用点：`card` 只在 handler 局部、无跨事件缓存裸引用，丢触发那一帧发生在任何人能订阅之前，且创建本身是结构变更会触发同批渲染）⇒ **定性为加固而非第二个现象**，#342 正文那句「同类隐患」按此收口，别当「修了两处 bug」记账。
+
+**真机 A/B（决定性；同一会话、同一 prompt 形态「120 行编号要点、禁工具」，只换 portal 镜像）**
+
+| 环境 | 画面增长次数 | 平均每次 | 形态 |
+|---|---|---|---|
+| 部署中的 v0.1.25（修复前） | **3**（93s / 466 采样） | 1439 字符 | 整段答案 **一跳 +4283 字符** |
+| PR 构建 `index-CZEDYy1L.js` | **24** | 175 字符 | 每 ~200ms 一次 60–130 字符 = 打字机 |
+
+总字数 4317 vs 4206（内容量相同，只差画法）；残渣 `.msg.assistant.md` 空节点 **0**（那个 `stored?.kind === 'delta'` 防御分支没留孤儿空气泡）、整页无 `NaN`/`[object Object]`/`undefined`、console error 0。部署手法 = §8.34 路线 A（worktree 里 `docker build -f portal/Dockerfile` → `.env` 临时顶掉 digest pin，备份 `/tmp/deploy.env.bak-343` → 验完还原并 `up -d`，还原后实跑 `9fef3faf…` = v0.1.25 pin、`healthz 200`）。
+
+⚠ **本案最值钱的一条口径（我差点测出错）**：第一次「修复后」只测到 2 次增长，看着像「修复没效果」——真因是**浏览器在跑缓存里的旧 bundle**（加载 `index-BSvpdxB0.js`，而新镜像是 `index-CZEDYy1L.js`）。⇒ **前端 A/B 必须先断言浏览器实际加载的 bundle 文件名**（`performance.getEntriesByType('resource')` 里筛 `assets/index-*.js` 与容器内 `index.html` 对比），加 `?nocache=` 重载再测；否则就是把旧代码当新代码下结论。
+
+**状态**：已合 main（`06bbaa2`，PR 自动关 #342），**未发版** —— 试用栈仍 pin v0.1.5，那条路上「整段一次出现」依旧会复现，别当回归。台账：前端基线 653 → **655**（`docs/ops/ci-release.md` §1 步骤 ④）。
