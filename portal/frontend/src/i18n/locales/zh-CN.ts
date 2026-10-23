@@ -261,15 +261,32 @@ export const zhCN = {
       runEndNormal: '正常完成',
       missedRunEnd: '连接中断期间该 run 已结束（详情见运行记录）',
       runFailed: 'run 失败：{code} — {message}',
-      // issue #212：新增失败原因的用户可读标签（双语必须同时补，en.ts 的 `satisfies MessageSchema`
-      // 会在漏译时编译报错）。只给新值加标签：既有 failed / aborted / max_rounds_cap 保持原样
-      // 透传引擎枚举（不改既有中文基线与既有断言）。键名故意用引擎 reason 原文（不 camelCase），
-      // 以便与 lib/terminationReasons.ts 的 EXPLAINED_FAIL_REASONS 逐项对齐。
+      // issue #212：失败原因的用户可读标签（双语必须同时补，en.ts 的 `satisfies MessageSchema`
+      // 会在漏译时编译报错）。键名故意用引擎 reason 原文（不 camelCase），以便与
+      // lib/terminationReasons.ts 的 RUN_END_LABEL_REASONS 逐项对齐。
+      // issue #236：**除 `end_turn` 外的每个 reason 都有标签**（`end_turn` 走 runEndNormal）。#212 那条
+      // 「既有 failed / aborted / max_rounds_cap 保持原样透传」在 #236 验收面（「按停止后看到的是母语
+      // 文案」）下作废；且终态分隔条现在会从历史投影出来，任何 reason 都会上屏。引擎新增的未知值
+      // 不进本表 ⇒ 文案回落 reason 原文（§5.3 向后兼容）。
       runEndReason: {
         // 快照没落盘 → 崩溃恢复可能重复工具副作用，语义最重（裁决理由见 docs/data/model.md §1.7）
         persistence_failed: '快照未落盘（崩溃恢复可能重复副作用）',
         // 终稿未经 final guard 核验 → 用户必须自己复核
         final_guard_unverified: '终稿未经核验',
+        // issue #236：用户主动停止（最常看到的那一条，此前上屏是裸英文 `aborted`）
+        aborted: '已中止',
+        // 引擎判定失败（`termination.errorCode` 有值时另追加 `（code=…）`）
+        failed: '运行失败',
+        // 撞轮数上限（finished 收场，但属异常截断）
+        max_rounds_cap: '达到轮数上限',
+        // 模型不再调工具就收尾（引擎的正常终态之一）
+        no_tool: '模型未再调用工具',
+        // 评审判定「已完成」（意见，不是独立核验）
+        judge_done: '评审判定完成',
+        // 连续多轮没有新输出
+        stall: '进展停滞',
+        // 续跑（continuation）次数耗尽
+        continuation_exhausted: '续跑次数耗尽',
       },
       // issue #212：persistence_failed 的落盘细节（worker 透传引擎 termination 的
       // operation/phase/sideEffect；工作台必须能看见 phase）

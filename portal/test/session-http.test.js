@@ -283,3 +283,77 @@ test('issue #107：PATCH 改名成功后推 session_updated（live-only 帧，pa
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// issue #236 第 2 条：**空 body 的 POST 不再强制 `Content-Type`**
+// 缺陷：`curl -X POST .../stop`（无 body、无该头）⇒ 400 `validation_failed`
+// 「Content-Type 必须为 application/json」。前端总发 `body:'{}'` 所以 UI 无感，手工客户端就踩。
+// 口径（决策者倾向的 ①）：只校验「**有 body 时**必须是 json」；无 body + 未声明头 ⇒ 放行。
+// 判据不认「返回 200」而认「**过了这道闸**」：stop 在假库里没有活跃 run ⇒ 409 no_active_run
+// （若 CT 闸仍拦着，这里会是 400 validation_failed「Content-Type 必须为 application/json」）。
+// ---------------------------------------------------------------------------
+const CT_ERROR = 'Content-Type 必须为 application/json';
+
+const callStop = (s, { body, headers = {} } = {}) => fetch(`${s.base}/api/sessions/${SESSION_ID}/stop`, {
+  method: 'POST',
+  headers: { Cookie: s.cookieHeader, ...headers },
+  ...(body === undefined ? {} : { body }),
+});
+
+test('#236 空 body + 无 Content-Type 的 POST /stop ⇒ 不再是 400（过了 CT 闸，落到业务判据 409 no_active_run）', async () => {
+  const s = await startServer();
+  try {
+    const res = await callStop(s);
+    assert.equal(res.status, 409, '空 body 不再被 CT 闸拦成 400');
+    const body = await res.json();
+    assert.equal(body.error.code, 'no_active_run');
+    assert.notEqual(body.error.message, CT_ERROR);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#236 同一端点：声明 json（含 charset）/ 有 body 但没声明 / 声明了非 json 的行为逐条不变', async () => {
+  const s = await startServer();
+  try {
+    // ① 无 body + 声明 json ⇒ 照旧放行（前端 `body:'{}'` 那条路）
+    const withCt = await callStop(s, { headers: { 'content-type': 'application/json' } });
+    assert.equal(withCt.status, 409);
+    // ② 无 body + json;charset=utf-8 ⇒ 照旧放行（`;` 之后的参数不参与比较）
+    const withCharset = await callStop(s, { headers: { 'content-type': 'application/json; charset=utf-8' } });
+    assert.equal(withCharset.status, 409);
+    // ③ **有 body** 但没声明 CT ⇒ 仍 400（本次只放宽「确定无 body」那一格，不放宽带体请求）
+    const bodyNoCt = await callStop(s, { body: '{}' });
+    assert.equal(bodyNoCt.status, 400);
+    assert.equal((await bodyNoCt.json()).error.message, CT_ERROR);
+    // ④ 有 body + 声明非 json ⇒ 仍 400
+    const bodyWrongCt = await callStop(s, { body: '{}', headers: { 'content-type': 'text/plain' } });
+    assert.equal(bodyWrongCt.status, 400);
+    assert.equal((await bodyWrongCt.json()).error.message, CT_ERROR);
+    // ⑤ 无 body 但**显式声明**非 json ⇒ 仍 400（显式声明了别的类型就是有意的，不替用户猜）
+    const emptyWrongCt = await callStop(s, { headers: { 'content-type': 'text/plain' } });
+    assert.equal(emptyWrongCt.status, 400);
+    assert.equal((await emptyWrongCt.json()).error.message, CT_ERROR);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#236 统一闸：同一放宽对其它 JSON 端点（POST /ai-title）同样生效；读方法（GET）不受影响', async () => {
+  const s = await startServer();
+  try {
+    // 另一个走 requireJson 的 POST：空 body + 无 CT ⇒ 过了闸，落到业务判据（会话没有 user 消息 ⇒ 409）
+    const aiTitle = await fetch(`${s.base}/api/sessions/${SESSION_ID}/ai-title`, {
+      method: 'POST',
+      headers: { Cookie: s.cookieHeader },
+    });
+    assert.equal(aiTitle.status, 409, 'CT 闸已放行，业务判据 409 no_user_messages');
+    assert.notEqual((await aiTitle.json()).error.message, CT_ERROR);
+
+    // GET 从来不经过 requireJson（本次零改动）
+    const me = await fetch(`${s.base}/api/me`, { headers: { Cookie: s.cookieHeader } });
+    assert.equal(me.status, 200);
+  } finally {
+    await s.close();
+  }
+});

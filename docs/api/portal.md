@@ -56,7 +56,7 @@
 | 会话 | `DELETE /api/sessions/:id` | 归档会话 |
 | 对话 | `POST /api/sessions/:id/messages` | 发消息（创建 run） |
 | 对话 | `GET /api/sessions/:id/events` | **SSE 事件流**（§5） |
-| 对话 | `GET /api/sessions/:id/events/history` | run_events 展示类事件历史（§4.4a，刷新后重建卡片/面板） |
+| 对话 | `GET /api/sessions/:id/events/history` | run_events 展示类事件历史（§4.4a，刷新后重建卡片/面板；另含两类**响应期合成项** `partial_output` §4.4a-1 / `run_termination` §4.4a-2） |
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
 | 端口 | `GET /api/projects/:id/ports` | **已退役 `410`**：端口事实的读取面是 FDE 级 `~/.erix/ports.json`（§4.7 / 规格 §8.2） |
@@ -160,6 +160,24 @@
 - **并发同 key**：先到先得——占位期间的后续请求 → `409 idempotency_conflict`（`retryable: true`，**不执行** fn）；首执行完成后的重发 → 正常回放。占位持有者崩溃（`in_progress` ≥ 5 分钟）→ 视同可覆盖：后续请求抢回后执行（否则一次崩溃会把该 key 永久钉死）。
 - **请求体校验前置**：非法请求体先返回 `400 validation_failed`，**不占用**占位行（否则一次笔误会让同 key 的合法重试撞 409 reuse）。
 - **非法 key**：非字符串 / 长度 > 128 / 含控制字符（**含仅出现在两侧**的 CR/LF 等，trim 前判定）→ `400 validation_failed`；无该头或纯空白 = 无幂等语义（直通）。
+
+### 1.5 请求体与 `Content-Type`（issue #236 第 2 条）
+
+所有**读 JSON 体**的写方法端点（`POST` / `PUT` / `DELETE`，实现里统一走 `requireJson` + `readJsonBody`）遵守同一张表：
+
+| 请求 | `Content-Type` | 结果 |
+|---|---|---|
+| 无 body（`Content-Length: 0`，或既无 CL 也无 `Transfer-Encoding`） | **未带** | **放行**（体按 `{}` 处理） |
+| 无 body | `application/json`（可带 `; charset=…`） | 放行 |
+| 无 body | 其它类型（`text/plain` 等，含显式空串） | `400 validation_failed`（「`Content-Type` 必须为 `application/json`」） |
+| **有** body | `application/json`（可带参数） | 放行 |
+| **有** body | 未带 / 其它类型 | `400 validation_failed`（同上） |
+| 有 body（`Transfer-Encoding: chunked`） | 未带 | `400 validation_failed`（体在读完前不可知 ⇒ fail-closed） |
+
+- **为什么放宽第一行**：`curl -X POST .../stop` 这类**空 body 的 POST** 不带 `Content-Type`，此前一律 `400`（前端总发 `body:'{}'`，所以 UI 无感；手工客户端/脚本按 REST 常识发空 body 就踩）。口径与直觉一致：**只校验「有 body 时必须是 json」**（issue #236 决策者倾向的 ①）。
+- **不放宽的两格**：「显式声明了非 json」与「带体但没声明」仍 `400`——前者是调用方有意声明的类型，后者可能是表单提交，都不是本次要放行的形状。
+- **`GET` / `HEAD` 与 SSE 不经过本闸**；`/api/internal/*`（容器 → portal）与 `/api/forward-auth` 也是同一套判据（它们**总是**带 json 体，行为不变）。
+- ⚠ 本闸是**纯请求体形状**校验，与 §2.11 的跨站写防线（`cross_origin_forbidden`）是**两件独立的事**，后者在鉴权与 handler 之前执行，不受本节影响。
 
 ---
 
@@ -980,7 +998,51 @@ station-portal user enable  --login <login>
 }
 ```
 
-> `events` 里可能多出**一条合成项** `partial_output`（中止 / 失败 run 的部分正文，见 §4.4a-1）——它不是 `run_events` 的行。
+> `events` 里可能多出两类**响应期合成项**：`partial_output`（中止 / 失败 run 的部分正文，§4.4a-1）与
+> `run_termination`（run 的**终态分隔条**，§4.4a-2）。两者都不是 `run_events` 的行，也不占 `limit`。
+
+#### 4.4a-2 合成项 `run_termination`（issue #236：刷新后终态分隔条仍在）
+
+缺陷：`run_end` **不在**下发白名单（§4.4a 首段，红线：历史回放不得驱动前端运行态状态机）⇒ 终止
+分隔条只在**实时 SSE** 里出现过一次，刷新 / 重开会话后**完全消失**；#217 补的是「打开会话时对**活跃**
+run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在本**只读**端点里从 `runs` 的终态字段
+（`status` + `termination`）**投影**一条展示项。
+
+**存在性判据（三条同时成立，一条 run 至多一条）**：① 该 run 出现在**本次响应窗口**里；
+② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成——「还在跑就标已中止」
+是新造的误导）；③ `termination.reason` 是**非空字符串**（缺 `termination` / 脏载荷 ⇒ 不合成：**绝不拿
+`status` 编一个 reason**）。
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `seq` | number | = 该 run 在 `run_events` 里的**最大 `seq`**（`run_end` 行本来就在表里 ⇒ 分隔条天然排在本次 run 内容之后；`MAX(seq)` 是**整 run** 口径，不受 `before` 窗口限制；**不新分配**，不推进 `chat_sessions.last_seq`） |
+| `run_id` | string | 所属 run（前端幂等键 = `termination:<run_id>`） |
+| `type` | string | 固定 `run_termination`（**合成类型，名字故意不叫 `run_end`**：`run_end` 永不进白名单） |
+| `payload.status` | string | `runs.status`（`finished` / `failed`） |
+| `payload.termination` | object | `runs.termination` **原样透传**（`reason` / `detail` / `operation` / `phase` / `sideEffect` / `errorCode`，字符串叶值截 2000）。分级与标签全由前端从它取 |
+
+- **不落库 / 不进 SSE / 不进白名单**：`run_termination` **不进** `HISTORY_EVENT_TYPES`（后端下发白名单），
+  也**不进**前端 `EVENT_TYPES` / `HISTORY_REPLAY_TYPES`——它只在**本端点的响应**里存在（与 §4.4a-1 同一种
+  存在方式）。反方向也钉着：库里即使真有一行 `type='run_termination'` 也**不会**被下发。
+- **呈现分级（前端）**：`aborted`（用户主动停止）⇒ **中性分隔条** + 母语标签；`failed` /
+  `max_rounds_cap` / `persistence_failed` / `final_guard_unverified` ⇒ **红色 `.syserr`**（§5.3 同一张口径表）。
+  实时 `run_end` 与历史合成项**共用同一个取词/分级函数**（`useEventStream#runEndLine`）——否则刷新一次颜色就变。
+- **幂等**：前端用 `renderedIds` 的 `termination:<run_id>` 去重；实时 `run_end` 渲染后立即登记同一个
+  id ⇒ 同一视图里「实时一条 + 历史一条」不会发生；硬刷新后 `renderedIds` 重建 ⇒ 历史项正常渲染。
+- **成本**：与 §4.4a-1 **共用同一条** `runs` 查询（`r.id = ANY(...)` + 终态过滤 + `MAX(seq)` 相关子查询，
+  走既有 `run_events_run_idx`）⇒ 本次窗口没有 run 时**一条查询都不发**，有 run 时**也只有那一条**（不重查）。
+- **已接受边界**：① 只覆盖「该 run 真落在本次响应窗口里」的那一页（同 §4.4a-1 的窗口口径）；
+  ② 合成项**不带 `usage`**（实时 `run_end` 的 `· tokens a+b` 后缀在历史里不重建——与 #282「刷新后运行态数字
+  拿不回来」同一口径，不拿历史值假装实时）。
+
+```jsonc
+{
+  "seq": 168,                 // = 该 run 的最大 run_events.seq
+  "run_id": "9d3b2f1e-...",
+  "type": "run_termination", // 合成项：不落库、不进 SSE
+  "payload": { "status": "finished", "termination": { "reason": "aborted", "detail": "stopped by user" } }
+}
+```
 
 错误：`401 unauthorized`；`404 not_found`；`400 validation_failed`（`limit` / `before` 非正整数）。
 
@@ -993,7 +1055,9 @@ station-portal user enable  --login <login>
 | `queued`（从未被 worker 领起） | **直接进终态** `finished`，`termination = {"reason":"aborted","detail":"cancelled_before_start"}`，写 `ended_at`，并**同事务从 `run_queue` 摘掉**（queue → `cancelled` + 清 `claim_token/owner_container_id/lease_until/claimed_at`，口径同 §9.11 release / reaper A2） | 没有任何执行体会去报它的终态：`cancelling` 被认领 SQL 排除（§9.3/A2）、终态又只能由 worker 经 U2 写、也不在 reaper 候选集（`q.status='claimed'` 且租约过期）——旧实现在此也写 `cancelling`，导致该 run 永久卡住、会话 `active_run_id` 恒非空 ⇒ UI 恒「运行中」+ 新消息恒 409 `run_in_progress` |
 | `running` | → `cancelling`（**不等终态**） | 已执行过、正在等 worker 报终态：worker abort 后经 U2 收敛 `finished`（`termination.reason='aborted'`）或 `failed` |
 
-请求体：无（空 JSON `{}`）。
+请求体：无。**`Content-Type` 也不再强制**（issue #236 第 2 条）：无 body 且未带该头 ⇒ 直接按空体处理；
+带 body 时仍必须是 `application/json`（逐格口径见 §1.5）。⚠ 前端仍发 `body:'{}'`（带 json 头），
+这里放宽的是**手工客户端**那一侧：`curl -X POST .../stop` 不再 400。
 
 响应 `200`（`run.status` = 本次写入的真实状态，不再是写死的 `cancelling`）：
 
@@ -1635,7 +1699,7 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 > 说明与边界：
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
 > - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（**第 14 类 `attempt_killed` 是规格之外的宿主新增事件，规格 §10.1 没有它，字段以本表为准**——additive 新类型不破坏上游契约，§13.2-3）（`{text}` / `{termination, usage, compaction_stats}`；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。**注（#21 审计决策 ②）**：规格 §10.1 曾写作 `compaction_stats`（本决策已一并删除），该字段在宿主全链路（`runner/`、`portal/src/`）无透传实现、U2 终态载荷不携带——本表与 §9.6 统一按**实际字段集** `termination` / `usage` / `rounds` / `final_text`（+ `attempt`，失败时 `error`）描述，不再引用 `compaction_stats`。
-> - `termination` 是**对象** `{reason, detail?}`（`persistence_failed` 另带 `operation`/`phase`/`sideEffect`），`reason` 取值集合以 erix-agent 0.18.0 的 `runToolLoop` 返回值契约为准：<!-- DRIFT:termination-reason:begin -->`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed, persistence_failed}`<!-- DRIFT:termination-reason:end -->（依据：`src/loop/orchestrator.js:511` typedef 的 9 值 + `:973-990` 的 `persistence_failed`；单一真相常量在前端 `lib/terminationReasons.ts`，与 §4.1 及 `docs/data/model.md` §1.7 逐项对齐）。宿主映射（**issue #212 修正**：0.18.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上）：runner 一律**原样透传** `err.termination`，引擎没给才回退 `aborted`/`failed`（`runner/worker.js` catch + `runner/lib/termination.js`）——所以引擎失败可以是 `failed` **或** `persistence_failed`（快照没落盘，崩溃恢复可能重复副作用，语义最重），用户主动停止 → `aborted`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。前端红色告警集合（`RUN_FAIL_REASONS`）含 `failed` / `max_rounds_cap` / `aborted` / `persistence_failed` / `final_guard_unverified`，其余 reason 保持灰色中性分隔条。**erix-agent 0.18.0 起（上游 #176）**，`reason === "failed"` 的终局另带 additive 字段 `errorCode`：引擎把错误上已有的分类码原样透出（`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …），无分类码则为 `unknown`，**值域由引擎定义**；station 原样透传引擎 termination，因此运行时零改动即已下发（依据：`src/loop/termination.js:43-57`，在 `orchestrator.js:981-984` 调用），前端不解释其语义、也不新增枚举。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。
+> - `termination` 是**对象** `{reason, detail?}`（`persistence_failed` 另带 `operation`/`phase`/`sideEffect`），`reason` 取值集合以 erix-agent 0.18.0 的 `runToolLoop` 返回值契约为准：<!-- DRIFT:termination-reason:begin -->`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed, persistence_failed}`<!-- DRIFT:termination-reason:end -->（依据：`src/loop/orchestrator.js:511` typedef 的 9 值 + `:973-990` 的 `persistence_failed`；单一真相常量在前端 `lib/terminationReasons.ts`，与 §4.1 及 `docs/data/model.md` §1.7 逐项对齐）。宿主映射（**issue #212 修正**：0.18.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上）：runner 一律**原样透传** `err.termination`，引擎没给才回退 `aborted`/`failed`（`runner/worker.js` catch + `runner/lib/termination.js`）——所以引擎失败可以是 `failed` **或** `persistence_failed`（快照没落盘，崩溃恢复可能重复副作用，语义最重），用户主动停止 → `aborted`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。前端有**两个**集合，别再混用（issue #236）：① **功能面**的 `RUN_FAIL_REASONS` 含 `failed` / `max_rounds_cap` / `aborted` / `persistence_failed` / `final_guard_unverified`——它决定「重试上一条」（#261B）与「终态后补拉 history」（#306），**`aborted` 仍在其内**；② **界面分级**的 `RUN_TERMINATION_SYSERR_REASONS` = ① 减掉 `aborted`（由①**派生**，不手抄）——只有它决定终态行刷红：`failed` / `max_rounds_cap` / `persistence_failed` / `final_guard_unverified` 红，其余（含 `aborted`）中性。理由：用户按「停止」不是故障（#236 §1）。**实时 `run_end` 与历史合成项 `run_termination`（§4.4a-2）共用这一条分级规则与同一份母语标签表**（`RUN_END_LABEL_REASONS`，除 `end_turn` 外的每个 reason 都有 zh-CN/en 标签；未知 reason 回落原文）。**erix-agent 0.18.0 起（上游 #176）**，`reason === "failed"` 的终局另带 additive 字段 `errorCode`：引擎把错误上已有的分类码原样透出（`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …），无分类码则为 `unknown`，**值域由引擎定义**；station 原样透传引擎 termination，因此运行时零改动即已下发（依据：`src/loop/termination.js:43-57`，在 `orchestrator.js:981-984` 调用），前端不解释其语义、也不新增枚举。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。
 > - **assistant 完整消息不单独发事件**：前端拼接 `assistant_delta` 流渲染气泡；run 结束后的持久对话内容以 `GET /api/sessions/:id` 的 `messages` 为准（`run_events` 是流式日志，`messages` 是人看的对话，两层不混，规格 §9.2）。
 > - 审批请求的出现通过 `judge` 事件（`action` 指示需审批）+ `GET /api/approvals` 列表体现，不单独设事件类型。
 > - **第 14 类 `attempt_killed` 是宿主合成事件**（issue #288 缺陷 B + #292，实现 `portal/src/internal.js` 的 `releaseRun` 与 `reapExpiredRuns`）：「worker 被杀 → 重排」这件事此前对用户**零可见**（requeue 分支只改 `run_queue` + `audit_log`），用户只看到同一个工具卡片亮 3 次、最后拿一句没有原因的 `attempts exhausted`。口径：
