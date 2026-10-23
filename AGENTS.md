@@ -1323,3 +1323,22 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **#342**：同一条 120 行 prompt ⇒ 374 次采样里**画面增长 62 次**、平均每次 **120 字符**、从 t=1.0s 起每 ~200ms 一跳（60–80 字符）= 打字机在发布物上成立。对照修复前 v0.1.25 是「3 次增长、其中一跳 +4283 字符」。
 - **#308**：`data-test="sidebar-aside"` / `sidebar-bottom-stack` / `preview-ports-toggle` 三者关系正确（**预览切换在底部栈内**），`#preview-ports-disclosure` 的 `closest('[data-test="sidebar-aside"]')` 命中 ⇒ 顶部没有全宽预览条残留；`sidebar-session-list` 可视高 532px（会话列表仍独立可滚，滚动预算只有一层）。
 - 浏览器 cookie 会随页面上下文重置丢掉 ⇒ 处置：在页面里 `fetch('/api/auth/login')` 一次（同源自动带 `Origin`，#234 同源门不拦），比走表单稳。
+
+### 8.44 目录名允许下划线：修的是「前端比后端严」，不是「放宽 DNS 约束」（issue #284，PR #345，2026-10-23，merge `eb079c8`）
+
+**决策者选 (a)「只把 `_` 加进前端」**。派单前用两名只读 reviewer 独立分析（并行、各自出报告），**两份都推翻了我给的前提**，所以这一节先记被纠正的事实——否则下一个人会按我原来的错说法去改：
+
+1. **「目录名要当 DNS label」这个理由早已失效，而且不是我说的 #246 —— 是 P5 / 迁移 `deploy/migrations/0008-deprojectize.sql`**。预览 URL 全仓只有一个生成点：`projects.js#buildHostname({fdeName, port, baseDomain})` ⇒ `<工位名>-p-<端口零填充≥4位>.<伞域>`（现网实例 `http://eric-p-22000.fde.erix.vip:8090`）。**项目/目录名不进 hostname**，也不进容器名、网络名、任何下发文件。
+2. **我建议的「后端收紧到前端」被否**，理由硬到不能含糊：`sessions.js:42-44` 原话写着目录名允许下划线是**有意的**（「用户在容器内自建目录的自由命名权」）；后端收紧会让唯一带 `_` 的真实项目 `meeting_asr_app`（真库 **15 次 run**，含 `judge_done`）变成「看得见、选得中、建不了会话」，而目录名在用户磁盘上、**平台无权改名**。⇒ **方向只有「前端补完到后端」一条**。
+3. **不会重现 #202 那类「过应用校验、被 DB CHECK 炸成裸 23514」**：真库 `pg_constraint` 实查 `chat_sessions.cwd` 的 CHECK 数 = **0**；唯一那条 DNS CHECK 是 `port_allocations_hostname_dns_check`，作用在 `hostname` 列上，而该列**永远不含项目名**。
+4. **FDE 名一个字符都不能跟着放**，且比 #284 正文说的更硬：**`users_fde_name_check` 是真库 CHECK**（`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`）+ 域名预算 55（`63 − len("-p-" + 5 位端口)`）+ 进容器名/网络名/凭据路径/LLM key alias。**「挡的是没工位的人」那类判据混淆在这里的对应物是：项目名与工位名是两条独立正则、两条独立约束，放宽前者在物理上不可能影响后者——唯一要防的是有人「顺手统一」。**
+
+**DNS 事实口径（决策者问过「`_` 和 `-` 是不是都可以」）**：`_` 在 **DNS 记录名**（`_dmarc.` / `_acme-challenge.` / `_sip._tcp.`，RFC 2181 放宽成 8-bit clean）**可以**，在**主机名 / URL host**（RFC 952 LDH + RFC 1123 只放宽「可数字打头」）**不可以**；且有硬后果：**CA/Browser Forum 基线要求 2019-04-30 起证书 `dNSName` MUST NOT 含 `_`** ⇒ 预览域名将来要上公共通配证书，工位名带 `_` 就签不出来。**「DNS label 是刚需」这句没错，但它挂的是工位名，不是目录名。**
+
+**载荷**（前端 6 文件 + `projects.js` 注释 + 3 篇文档）：`DIR_NAME_RE` 只把字符类 `-` 扩成 `_-`（首尾/长度/其余字符集**一字不改** ⇒ `cmms_test` 通过、`_x`/`x_` 仍拒，与今天 `-x`/`x-` 对称）；中英文案重写（说全规则 + 「容器里已存在的目录哪怕含其它字符都可在下拉里选中」，并**禁止再出现「预览域名/DNS」**）；新 `src/lib/dirNameRule.spec.ts`；`docs/api/portal.md` 顺带把 `POST /api/sessions` 按代码真值更正（原表写请求体 `project_id`、响应裸 `ChatSession`，实现是 `201 { session }` = `http.js:1456`、`project_id` 只是 P5 别名 = `sessions.js:7`、目录不存在则 `mkdir` = `sessions.js:198`）。**零后端行为、零 DDL、零依赖、`docs/data/schema.sql` 与 `deploy/migrations/` 一字节未动。**
+
+**验收**：根 **1388 / 1384 / 0 / 4 rc=0**（与基点逐位相同）、前端 **37 文件 / 661 通过 rc=0**（基线 36/655 ⇒ +1 文件 +6 用例）、`typecheck` rc=0、PR #345 质量门禁 pass（镜像构建校验在 PR 上 skipping，只在 main 跑）。
+
+**主 agent 亲跑变异 3 条（不采信 worker 自报）**：① 删掉前端 `_` ⇒ **3 条具名红**；② **反向的牙**：给 `validateSessionCwd` 插一条字符集白名单（模拟「将来有人反过来收紧后端」）⇒ **防漂移锁红**，消息逐字「后端对目录名新增了字符集校验」；③ 把「会用作预览域名 DNS label」塞回中文 label ⇒ **文案断言红**。⚠ **第一次变异 ① 是空操作**（sed 模式写错 ⇒ 文件零改动、87 条全绿差点被当成证据），靠「先 `git diff` 自证真改了」抓回来（§8.24 同族，第 N 次发作）。
+
+**已知边界（刻意不做，别当 bug）**：前端仍比后端严——**后端宽得远不止 `_`**（实测还收大写 `Bad_Name`、空格 `My Project`、`中文目录`、前导/尾随 `-`、80 字符长度）。本单只对齐 `_`；「要不要让前端也照 `validateSessionCwd` 放开（代价：UI 能建出 `中文目录`）」是另一个决策，未拍。存量口径由文案兜住：**已有目录永远走目录下拉，不受表单规则约束**。
