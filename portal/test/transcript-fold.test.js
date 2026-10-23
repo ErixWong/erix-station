@@ -12,6 +12,8 @@
 // 「两份原样返回」的假绿。这里每条 fixture 都传显式 `keyOf`，缺省值另有单独用例钉住。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 
 import { foldLedgerRecords, isFoldableMessageRow, MESSAGE_ROW_KIND } from '../src/transcript-fold.js';
 
@@ -56,6 +58,11 @@ const toolResult = (id, content, isError = false) => ({
 /**
  * 对拍表。每条的 `expect` 说明这一条在测什么（`foldable` = 参与折叠的消息行数，
  * `kept` = 折叠后数组长度）。**`foldable > 0` 的条目必须真的减少行数**，否则对拍是空转。
+ *
+ * ⚠ **链式 `partOf` 的夹具故意不在本表里**（见下面 #341 那一组）：本表是「与上游逐字段一致」的对拍，
+ * 而上游 `foldMessageRows` 到今天**仍未解链**（erix-agent #415）⇒ 把链式夹具塞进来会让对拍变成
+ * 「要么把本站改回错的那一份、要么放宽对拍」。链式口径由 `#341 链式 partOf…` 那组用例独立钉住，
+ * 对拍表**保持上游可比的子集**。
  */
 const FIXTURES = [
   {
@@ -286,4 +293,116 @@ test('#337 `keyOf` 缺省口径 = `dedupKey ?? roundKey`（与上游 rowKey 同�
   const folded = foldLedgerRecords(clone(roundKeyOnly), { keyOf });
   assert.equal(folded.length, 1);
   assert.deepEqual(folded[0].messages, [asstText('宿主键')]);
+});
+
+// ============================================================================
+// #341（上游 erix-agent #415）：`partOf` 是**链**不是一跳 —— 分片行自己的 key 也必须登记
+// ============================================================================
+//
+// 0.23 写侧（`erix-agent/src/loop/orchestrator.js`）每落一片就 `toolResultRowKey = persistedRowKey`
+// （覆盖）⇒ 第 3 个并行工具调用起，`partOf` 指向的是**前一片分片行**，而不是聚合消息的首片。
+// 本站 `planFold` 因此也把分片行的 key 登记进 `parts`（映射到它被接进去的那个同一消息下标）⇒
+// 链自然解回链头。下面是这条口径的**行为门**；上游那份仍是错的，故这些用例**不与上游对拍**。
+
+/** 一轮 3 个并行 `tool_use` + 3 条 `tool_result` 分片行（第 3 片指第 2 片 = 链）。 */
+function chainRecords(ids) {
+  const blocks = ids.map((id) => ({ type: 'tool_use', id, name: 'readFile', input: {} }));
+  const rows = [carrier(1), msg(1, 0, [{ role: 'assistant', content: blocks }])];
+  let previous = '';
+  ids.forEach((id, offset) => {
+    const seq = offset + 1;
+    rows.push(msg(1, seq, [toolResult(id, id.toUpperCase())], previous === '' ? {} : { partOf: previous }));
+    previous = `${KEY}:msg:1:${seq}`;
+  });
+  return rows;
+}
+
+/** 同一条轮内的 0.22 聚合形状（折叠的**目标**：一条 assistant + 一条含 N 个 tool_result 的 user）。 */
+function aggregateMessages(ids) {
+  return [
+    { role: 'assistant', content: ids.map((id) => ({ type: 'tool_use', id, name: 'readFile', input: {} })) },
+    { role: 'user', content: ids.map((id) => toolResult(id, id.toUpperCase()).content[0]) },
+  ];
+}
+
+test('#341 链式 partOf（三分片）⇒ 折回恰好 1 条聚合消息（含 3 个 tool_result）', () => {
+  const records = chainRecords(['a', 'b', 'c']);
+  // 前置：夹具必须真的是链（第 3 片指第 2 片，而不是指首片）。
+  const shards = records.filter((record) => typeof record.partOf === 'string');
+  assert.deepEqual(shards.map((record) => record.partOf), [`${KEY}:msg:1:1`, `${KEY}:msg:1:2`],
+    '前置条件：第 3 片的 partOf 必须指向前一片（链），否则这条用例测不到解链');
+
+  const folded = foldLedgerRecords(clone(records), { keyOf });
+  assert.equal(folded.length, 1, '整轮必须折回**恰好 1 条**记录（载体行）');
+  const messages = folded[0].messages;
+  assert.equal(messages.length, 2, '折叠后必须是 2 条消息（1 assistant + 1 聚合 tool_result），'
+    + `实际 ${messages.length} 条：${JSON.stringify(messages.map((message) => message.role))}`);
+  const aggregate = messages[1];
+  assert.equal(aggregate.role, 'user');
+  assert.equal(aggregate.content.length, 3, '聚合消息必须含 3 个 tool_result block');
+  assert.deepEqual(aggregate.content.map((block) => block.tool_use_id), ['a', 'b', 'c'], '分片顺序按 seq');
+  // 与 0.22 那条聚合消息**逐字段相等**（引擎 `validateMessages` 要求的形状）。
+  assert.deepEqual(messages, aggregateMessages(['a', 'b', 'c']),
+    '折叠结果必须与 0.22 的聚合消息逐字段相等（否则 resume 会 invalid_messages）');
+});
+
+test('#341 链长 3（四分片）：链上任意一跳都能解回链头', () => {
+  const folded = foldLedgerRecords(clone(chainRecords(['a', 'b', 'c', 'd'])), { keyOf });
+  assert.equal(folded.length, 1);
+  assert.deepEqual(folded[0].messages, aggregateMessages(['a', 'b', 'c', 'd']));
+});
+
+test('#341 无链夹具输出与改前逐字节相同（sha256 快照）', () => {
+  // 快照取自**改动前**的实现（`2970391` 的 `portal/src/transcript-fold.js`），逐条 `JSON.stringify`
+  // 后 sha256。它是「解链这步只影响链」的**反向判据**：无链夹具里没有任何行的 key 被后来者
+  // `partOf` 引用 ⇒ 多登记一个 key 不可能改变输出。
+  // 红了怎么办：先确认是不是**故意的口径变更**（那就同步重算快照并在 PR 里说明），否则就是回归。
+  const GOLDEN = {
+    '单工具轮：一条 assistant 正文 + 一条 tool_result，折回轮行': '9512c48013c40dab77518dbf0d9497fdedd4660444b519b7d52487e4027401eb',
+    '一轮多工具：两个 tool_use 在同一 assistant 消息，两个结果各一条消息': '4231053b011ad9f094c32d5322a9ff98b784bb06d3435b376b693efc05db1ca2',
+    '一结果多片：第二条结果用 partOf 指认第一条，拼回**同一条**消息': '77482789d169e9b715b4e30962f06501c2aca67c1645060ff503c3880ed67759',
+    '`partOf` 指认了，但分片行带两条消息：不满足单消息条件 ⇒ 不当分片（上游同一支路）': 'accb1fbb091feeef7363b4c283994c4ad9cb3a0b2d38d3814debac125b785f3b',
+    '控制行（`:control:<slot>`）与 seed 行都在场：控制行不是载体、seed 不是载体': '698a3352254d38b8ed1056b0cd92b0500bc6105307e5d05b7d9763e20ce3d48a',
+    '`:resume` 载体：`<key>:engine:round:<n>:resume` 也算载体': '1cf6cb65aa02eb3d269a1bb374e81313e76ed2698d4fd5613eabfbc44c0e5843',
+    '宿主默认键载体：`<key>:round:<n>` 也是载体': 'a8808d214c0d823193ec9a9cff5d42c57a42c2a7de205783ed562ea784b3d377',
+    '无消息行旧账本（0.22 形状）：原样透传，连数组引用都不换': '8641ad9d7ace6d1c543624baf953909540180b45a823e53c80ebc39af8d3e6d0',
+    '只有分片无载体（分页切在轮中间）：分片原样留着，key 与 round 都不动、内容一字不丢': '26882a5a6e17c35eac506f45798a74a7c6fd95f0e6ec6a2170f10db64ed392f1',
+    'seq 缺号乱序：按 seq 升序拼，不按落盘序': 'fe98379a8a15ac0d6208409e52f5b7d9579180e35ee96266d8f5613f56ae7331',
+    '非整数 seq：`1.5` / 字符串 `"2"` 都不是可折叠行（谓词要求安全整数）': '2a8c5b5b0c51f53841decff2c19bc71bde44d5ceac128e0d0dc998352e2ac230',
+    '空 messages：`messages: []` 不是可折叠行（谓词要求非空）': 'c42f83bd5a59f7655cc1042280e5f30622d1c6dc1d46bca6e8ba934e8d578108',
+    '非消息行但带 seq 与 messages（宿主自有行）：`kind` 不是 message ⇒ 不折': 'd1f1755e38708987b8bbfa9f6fc854b1c159e45f0a7e23941609b981411545eb',
+    '重复 dedupKey：两行同 key 同 seq 都参与折叠（不静默丢一条）': '013d1623585b9d36e4c62878c54d16dd56a3850050d9d5722f4d41bcd77b02c2',
+    '跨轮多组：两轮各自折回自己的载体': '023c1ddaaad8ebe0ce9588c11dcf9a86756ca6a8deef2283d1c176b5e94fa52a',
+    '无 round 的消息行（无法分组）：不折，原样留着': '20a8380036986c55c42a74e1cb7a9868b05cbab690d994f11205f54c9680e002',
+  };
+  assert.equal(Object.keys(GOLDEN).length, FIXTURES.length, '快照必须覆盖对拍表每一条（否则本条空转）');
+  for (const fixture of FIXTURES) {
+    const actual = createHash('sha256')
+      .update(JSON.stringify(foldLedgerRecords(clone(fixture.records), { keyOf })))
+      .digest('hex');
+    assert.equal(actual, GOLDEN[fixture.name],
+      `「${fixture.name}」折叠输出字节变了（改前快照不符）。实际输出=${JSON.stringify(foldLedgerRecords(clone(fixture.records), { keyOf }))}`);
+  }
+});
+
+test('#341 源码级哨兵：上游 message-rows.js 仍未在分片分支登记 key（红了不是回归，是提示撤闸）', () => {
+  // ⚠ **红了不是回归，是提示撤闸**：上游 erix-agent #415 修好（把 `parts.set` 挪到 `continue` 之前）
+  // 并升 pin 之后，本站 `planFold` 里那行「分片行也登记 key」就是多余的一份 ⇒ 按 `transcript-fold.js`
+  // 文件头的撤闸说明整体撤掉，并把本条哨兵按当时的真件重写（先例：§8.28 撤 #283 计时闸）。
+  const source = fs.readFileSync(UPSTREAM_PATH, 'utf8');
+  assert.ok(source.includes('export function foldMessageRows'), '上游仍应有 foldMessageRows（否则折叠口径整体重核）');
+  const branchStart = source.indexOf('if (partTargetIndex >= 0 && row.messages.length === 1) {');
+  assert.ok(branchStart >= 0,
+    '上游分片分支的形状变了（找不到 `if (partTargetIndex >= 0 && row.messages.length === 1) {`）'
+    + ' ⇒ 请重新核对上游折叠口径，并据此决定本闸是否该撤');
+  const branchEnd = source.indexOf('continue;', branchStart);
+  assert.ok(branchEnd > branchStart, '上游分片分支应仍以 `continue;` 结束');
+  const branchBody = source.slice(branchStart, branchEnd);
+  assert.doesNotMatch(branchBody, /parts\.set\s*\(/,
+    '上游已在分片分支登记 key ⇒ #415 已落地：本站的解链闸该撤了（删 planFold 里那行 parts.set + 文件头注释）');
+  // 非空操作自证：上游整个折叠函数里 `parts.set` 仍**恰好一处**（在分片分支之外）。
+  const foldStart = source.indexOf('export function foldMessageRows');
+  const foldBody = source.slice(foldStart);
+  assert.equal(foldBody.match(/parts\.set\s*\(/g)?.length, 1,
+    '上游 `foldMessageRows` 里 `parts.set` 应恰好一处；数量变了说明口径已动，请重核本闸');
 });
