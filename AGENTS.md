@@ -1358,3 +1358,30 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 **亲跑变异 2 条**（每条先自证锚点唯一匹配，不做空操作）：① 撤掉解链那一行 ⇒ **3 条具名红**；② **反向验哨兵**：在 `node_modules` 的上游真件里模拟 #415 已修（分片分支加 `parts.set`）⇒ **只有哨兵那 1 条红**（跑完已还原 `node_modules`）⇒ 「上游修好就提示撤闸」真有牙。
 
 **剩余（`#341` 保持 open）**：引擎 resume 侧仍待 erix-agent 发版升 pin，或按手册修数据；本站**不做**「检测到链式就告警」的运行时探针（没有消费者，先靠巡检 SQL）。
+
+### 8.46 消息时间戳 + 会话页动量状态条（#282）与预览票据一键批量签发（#247 / #286）（2026-10-23，随 **v0.1.27** 发布）
+
+**三个 issue 一张单，全部零后端行为变更（除新增一个只读型端点）/ 零 DDL / 零依赖 / 不动 `runner/`** ⇒ 本版**故意不重建 FDE 容器**（§8.19 先例）。分支：`f65786a`（#282）+ `4d7aa40`（#247+#286），两者都在独立 worktree 里写、主 agent cherry-pick 进 main（`git status` 干净、两份 lockfile 零变动）。
+
+**#282 = 决策者选的方案 B（两块都做，不许只做一块）**
+- **A 消息级时刻**：数据源是对话流 DTO 已有的 `created_at`（`session-view.js` 早已下发，**零后端改动**）；新 `lib/messageTime.ts` **只认「非空字符串」**这一种形状，数字/对象/`Date`/脏串/脏 locale 一律回 `''` ⇒ **宁可不显示，不显示 `Invalid Date`/`NaN`/猜出来的时间**（`new Date(1700000000000)` 是**可解析**的，所以「空值守卫」这条是真判据，用例里明说是变异哨兵）。渲染 `<time class="msg-time">`，用户与助手消息都算。
+- **B 顶部常驻状态条**：新 `RunStatusBar.vue`（挂 `WorkbenchView` 的滚动容器**上方**、不在 `StreamPanel` 渲染循环内）+ 分层 `lib/runMomentum.ts`（**纯计算**，可单测）/ `composables/useRunMomentum.ts`（状态机 + 1s 时钟 + 自注册 `onUnmounted` 清定时器）/ 事件入口用 `useEventStream` 新增的**只读旁路** `onEvent(type, d, history)`（在 `switch` **之前**通知 ⇒ `usage`/`round_end` 这类「接收但不展示」的类型也能被看到；不参与既有分支、不改载荷）。
+- **三条「不许伪装」的口径（本单最值钱的部分，都有用例）**：① **`~` tok/s 是前端滑窗估算**（界面带 `~` + tooltip 双语说明是估算；样本跨度 < 1s 或字符无增量 ⇒ **不出数**）；② `usage` 事件载荷是**单次 provider 调用**用量（`orchestrator.js` 每轮 emit），**不当 run 累计 tokens 显示**，只用它推进「最后活动时刻」；终态**没带 usage 就不显示 token 数字**（`?? 0` 会把「不知道」渲染成「0 tokens」= #283 同一族）；③ **起跑时刻未知不出时长**——`applyServerRunState` 只给 run id 时 `beginRun(id, null)`，**不从「我看到它」那一刻假装 0:00**（页面中途打开/刷新都会命中这条）。
+- **硬刷新边界如实交代**：`run_end` / `usage` 不在 `HISTORY_REPLAY_TYPES` ⇒ 刷新后运行态数字拿不回来，状态条回落成「空闲」，边界写进 tooltip 与 composable 头注，**没有拿历史帧假装在跑**（`history=true` 的帧一律短路，有用例）。
+- **冻结判据**：最后一次流式/工具事件距今 > `RUN_FROZEN_THRESHOLD_MS`（5s，单一常量）⇒ 标黄 +「上游已 Xs 无输出」；**恰好 5s 不冻结**（边界有用例）。
+
+**#247 = `POST /api/me/ports/batch-tickets`（一次请求签 N 张票 + 前端一键开 N 个标签）**
+- **命名与理由**：`batch-tickets` 走 kebab-case，与本仓既有路径同风格（`:batch` 那种冒号风格本仓零先例）。
+- **上限 = `PREVIEW_PORT_COUNT`**（从 `previewpool.js` 取，与号池块大小同源，**不写死 10**）；越界（不存在 / 已 released / **别人的**）三种**回同一句 `404 not_found`**（否则就成了存在性探针）；`admin` 无工位 / 尚未分段 ⇒ **`201 {"items": []}`**（与 `GET /api/me/ports` 的「空列表不是 404」同口径）。
+- **原子性 = 对外「要么全成、要么报错」，但不是靠大事务**：每张票本就是独立 INSERT、读者逐张独立消费，包进一个事务不更原子只白占连接 ⇒ 实现是「**先全量预检（在任何签发之前）→ 逐张签发 → 失败补偿**」，补偿用一条 `UPDATE … state='revoked' WHERE token_hash = ANY(...)` 收回本批已签的票再抛错 ⇒ **既不返回半截 `items`，库里也不留 60 秒内还能换 cookie 的残票**。
+- **限流按放大倍数计**：`check` 一次 + **逐张** `recordFailure`（一次点击 = N 张票，必须计入 `20/60s`，否则批量端点成了配额的旁路）。
+- ⚠ **一处实证推翻工单**（worker 查出、主 agent 复核确认）：工单写「审计与单据端点同 action/details 形状，先读现写法照抄」——**单据端点 `POST /api/ports/:id/preview-ticket` 目前写零行审计**（`http.js` 全文 `INSERT INTO audit_log` 0 命中，签发路径 `auth.audit` 也只有批量这一处；全仓 5 个文件写审计，无签发）。⇒ **没有可照抄的现写法**，本单是**新增**这条审计（逐张各一行，`details` 只放 `token_hash_prefix`，**绝不入 ticket 明文、绝不入带票的 `url`**，同 forward-auth 的 `pathOnly` 纪律）；**单据端点故意不动**（`preview.js#issuePreviewTicket` 一字未改 ⇒ 签发口径仍只有一份，红线守住）。
+- **前端**：`usePreviewPorts` 加批量签发 + **弹窗拦截兜底**（浏览器拦了 ⇒ 收回已开标签并给 N 条可点兜底链接，`batchBlockedUrls`）；**挂载与展开都不预取票据**（#246 那条「折叠也拉列表、但 ticket 绝不预取」语义逐字保持，有「请求数 = 0」用例）。
+
+**#286 = 只做面向人的告知**（评审否掉了「改边缘剥 Cookie」的两条路，理由记进 `docs/design/principles.md` 的**被否决方案表**：只剥平台 cookie = 把信任边界从 fail-closed 翻成 fail-open；票据塞 header = 顶层导航/子资源设不了自定义头，而预览第一跳就是顶层导航）。落点：容器内 `~/AGENTS.md` 第 7 条**早已存在且已有防漂移锚点**（决策者在 #262 定的稿，本单复核未改措辞）+ **工作台预览端口面板说明区**（双语，面向人）。⇒ **#286 按 `not_planned` 关单**，不是「修了」。
+
+**基线（主 agent 在合并树亲手复跑，判绿 = 退出码）**：根 `npm test` **1401 / 1397 通过 / 0 失败 / 4 跳过 rc=0**（基点 1393/1389 ⇒ **#247 后端 +8**，全在既有 `portal/test/preview-ports.test.js`）；`node --test runner/test/*.test.js` **323/323 rc=0 不变**；前端 `npm run typecheck` rc=0 + `timeout 300 npm test` **42 文件 / 731 通过 rc=0**（基点 37/661 ⇒ **#282 +53 条 / +5 文件**、**#247 +17 条 / +0 文件**）。
+
+**主 agent 亲跑变异 6 条，全红在具名用例**（每条先 `git diff` 自证不是空操作，不复用 worker 的结论）：① 删掉批量端点的归属判据 `row.fde_id !== session.user.id` ⇒ **恰 1 条红**（跨 FDE 那条）；② 失败补偿的 `if (issued.length > 0)` 改永假 ⇒ **恰 1 条红**（残票那条）；③ `formatMessageTime` 的空值守卫退化成只判 `''`/`null`/`undefined` ⇒ **恰 1 条红**且用例名逐字是「非字符串形状不猜（DTO 契约是字符串）—— 空值分支的变异哨兵」；④ `tokensPerSec` 不再区分运行态 ⇒ **恰 1 条红**（「终态残留的滑窗值会误导成『还在跑』」）；⑤ 冻结判据 `frozen` 写死 `false` ⇒ **2 条红**（纯函数层 + 渲染层各一条，症状可区分）；⑥ `clearInterval` 注释掉 ⇒ **恰 1 条红**（「卸载清定时器：mount 后有 interval，unmount 后一个都不剩」）。
+
+**过程账（我这一手的两次操作失误，代价 = 一次 7 分钟空转）**：把「写工单/脚本文件」和「派工调用」放进**同一条消息**，工具并行执行 ⇒ 派工时脚本还不存在，`#282` 那一次实际重跑了 `#341` 的 worktree（无产出、无分支），`#247` 那次根本没起来。另一条：workflow 脚本里 `const a = await runs.run(...)` 的 `await` 会**等子跑完**，所以两条派工变成串行（并行要用 `runs.all([...])`）。**口径：派工脚本与工单必须先落盘、在下一条消息里再派；要并行就 `runs.all`，别靠「去掉中间 await」猜。**
