@@ -15,8 +15,12 @@ import { i18n, setLocale } from '../i18n';
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
 } as AuthUser;
-const ADMIN_USER = {
-  id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local',
+// issue #308（M3）：原夹具是「无工位管理员」（`admin` 且 `fde_name=null`）——#334 的准入闸
+// （lib/workbenchGate.ts：`role==='admin' && !fde_name` ⇒ 改写去 /admin）之后这个形状**进不到工作台**，
+// 拿它当夹具等于给不可达状态做覆盖。换成第 ② 类人（`admin` **且**有工位，闸放行）：
+// 他同样能走到「端口列表为空」这条路径（尚未分段），空态覆盖因此保住。
+const ADMIN_WITH_SEAT = {
+  id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
 } as AuthUser;
 const DIRS = [{ name: 'demo', cwd: '~/projects/demo', running_count: 0, queued_count: 0 }];
 
@@ -215,8 +219,8 @@ describe('工作台 · 预览端口区块', () => {
     }
   });
 
-  it('admin 自己没有 FDE ⇒ items 为空：折叠条不带条数，展开走空态而不是空白', async () => {
-    const { wrapper } = await mountWorkbench(ADMIN_USER, (url, init) =>
+  it('列表为空（有工位但平台尚未分段）⇒ 折叠条不带条数，展开走空态而不是空白', async () => {
+    const { wrapper } = await mountWorkbench(ADMIN_WITH_SEAT, (url, init) =>
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: [] }) : undefined);
     try {
       expect(toggle(wrapper).text()).toContain('预览端口');

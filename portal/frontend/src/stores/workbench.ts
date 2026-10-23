@@ -232,7 +232,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // `newDirDisabled`、「＋新建目录」的 disabled、「进管理台」引导文案与占位符）——入口拦截落地后
   // 这类人**根本进不到工作台**（router 守卫里的 workbenchGateDecision，判据 lib/workbenchGate.ts），
   // 本 store 的 isPlatformAdmin 永远为 false ⇒ 按仓内纪律（不留不可达分支当「以防万一」）整块拆除。
-  // 服务端另有同名写闸：POST /api/sessions 对无 fde_name 的账号返 403 forbidden（portal.md §4.2）。
+  // 服务端另有同名写闸（**2026-10-21 更正**：这里原先写的是「403 forbidden」，与代码不符）：
+  // POST /api/sessions 对无 fde_name 的账号返 **400 `validation_failed` + `details.field='fde_name'`**
+  // （portal/src/sessions.js:214-222 的 `if (!fdeName)`；判据由 portal/test/sessions-cwd.test.js:99
+  // 「createSession：用户无 fde_name → 400」钉着）。
 
   // issue #55 A1：per-session 输入草稿（内存 Map，key=sessionId）；切换会话/项目时保存与恢复。
   const drafts = new Map<string, string>();
