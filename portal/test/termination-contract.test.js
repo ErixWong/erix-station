@@ -20,12 +20,15 @@ import { fileURLToPath } from 'node:url';
 
 import {
   ENGINE_VERSION_FOR_TERMINATION_REASONS,
-  EXPLAINED_FAIL_REASONS,
   LEGACY_TERMINATION_REASONS,
   PERSISTENCE_TERMINATION_REASON,
+  RUN_END_LABEL_REASONS,
   RUN_FAIL_REASON_LIST,
+  RUN_FAIL_REASONS,
   RUN_RETRYABLE_ERROR_CODES,
+  RUN_TERMINATION_SYSERR_REASONS,
   TERMINATION_REASONS,
+  USER_STOP_TERMINATION_REASON,
 } from '../frontend/src/lib/terminationReasons.ts'; // node 22 类型剥离：直读前端 .ts（无运行时依赖）
 import { RETRYABLE_ERROR_CODES as RUNNER_RETRYABLE_CODES } from '../../runner/lib/termination.js';
 
@@ -77,8 +80,22 @@ test('常量自洽：reason 全集 10 值、红色子集是真子集、legacy �
     assert.ok(!RUN_FAIL_REASON_LIST.includes(r), `${r} 不该是红色告警`);
   }
   assert.equal(PERSISTENCE_TERMINATION_REASON, 'persistence_failed');
-  // 需要双语标签的 reason 必须是红色子集的成员
-  for (const r of EXPLAINED_FAIL_REASONS) assert.ok(RUN_FAIL_REASON_LIST.includes(r), r);
+  // issue #236：双语标签覆盖「除 end_turn 外的每个 reason」（end_turn 走 runEndNormal）
+  for (const r of RUN_END_LABEL_REASONS) assert.ok(TERMINATION_REASONS.includes(r), `标签表含未知值 ${r}`);
+  assert.deepEqual(
+    [...RUN_END_LABEL_REASONS].sort(),
+    TERMINATION_REASONS.filter((r) => r !== 'end_turn').sort(),
+    '标签表 = 全集减 end_turn（#236 的覆盖面：任何 reason 都不许裸英文上屏）',
+  );
+  // issue #236：界面刷红集合 = 红色集合减掉「用户主动停止」（派生，不手抄）
+  assert.equal(USER_STOP_TERMINATION_REASON, 'aborted');
+  assert.ok(RUN_FAIL_REASONS.has(USER_STOP_TERMINATION_REASON), 'aborted 仍属功能面集合（#261B 重试 / #306 补拉）');
+  assert.deepEqual(
+    [...RUN_TERMINATION_SYSERR_REASONS].sort(),
+    [...RUN_FAIL_REASONS].filter((r) => r !== USER_STOP_TERMINATION_REASON).sort(),
+    '界面刷红集合必须由红色集合派生（减 aborted）',
+  );
+  assert.ok(!RUN_TERMINATION_SYSERR_REASONS.has(USER_STOP_TERMINATION_REASON), 'aborted 不得再刷红');
 });
 
 test('常量落点可被 node --test 直读：前端 .ts 零 import、零非 erasable 语法', () => {

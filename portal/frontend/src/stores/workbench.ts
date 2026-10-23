@@ -28,6 +28,15 @@ import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
 // 错误行/通知正文属「事件发生时快照」，不回溯翻译（可接受）。
 const t = i18n.global.t;
 
+/**
+ * issue #236：历史端点响应期合成的**终态状态项**类型（`GET /api/sessions/:id/events/history`）。
+ * 名字**故意不叫 `run_end`**：`run_end` 是实时 SSE 的运行态语义事件，绝不进历史白名单（#217 / #236
+ * 红线）；本项是后端从 `runs.status` + `runs.termination` **投影**出来的展示项，与 #300 的
+ * `partial_output` 同一种存在方式（不落库、不进 SSE、不进 `EVENT_TYPES` / `HISTORY_REPLAY_TYPES`）。
+ * ⇒ 宿主在归并循环里**于 `replayEvent` 之前**分流（见 `openSession`）。
+ */
+export const RUN_TERMINATION_TYPE = 'run_termination';
+
 /** 目录项（GET /api/dirs）：~/projects/ 一级目录 + 跨目录运行态计数。 */
 export interface DirInfo {
   name: string;
@@ -274,8 +283,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       removeDeltaEntry(); // 旧版 run_end 移除流式增量 DOM（终稿由 refreshSession 回写，防双份）
       notifyRunEnd(d);
       applyRetryFaceOnRunEnd(d); // issue #261B：失败终局 → 点亮「重试上一条」
+      // issue #236：登记「这条 run 的终态行已渲染」幂等键——同一个 id（`termination:<run_id>`）
+      // 被下面的历史补拉/重开会话复用，否则一次停止会得到两张分隔条（实时一张 + 历史一张）。
+      markRunTerminationRendered(d.run_id);
       refreshSession(d.run_id);
-      repullPartialOutput(d); // issue #306：中止/失败终局 → 补一次 history，让合成项当场出现
+      repullHistorySynthItems(d); // issue #306（#236 起同时喂终态分隔条）：补一次 history
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
     onSessionUpdated: (d) => {
@@ -339,18 +351,27 @@ export const useWorkbenchStore = defineStore('workbench', () => {
    * `aborted` 本身就在那一个集合里（`lib/terminationReasons.ts` 的 RUN_FAIL_REASON_LIST），所以
    * 不另开一份枚举；`end_turn` / `no_tool` / `judge_done` / `stall` 等**零重拉**——那类 run 本来就有
    * 助手锚点（判据②不成立，后端也不会合成），白打一次 history 是纯成本（dev 一个会话 14.4 万条事件）。
+   *
+   * issue #236：这个集合（**不是**界面分级集合 `RUN_TERMINATION_SYSERR_REASONS`）**未动**——
+   * `aborted` 仍在这里 ⇒ 停止后仍然补拉一次（#306 的行为逐字不变）。
    */
-  function shouldRepullPartialOutput(d: RunEndPayload): boolean {
+  function shouldRepullHistorySynth(d: RunEndPayload): boolean {
     return RUN_FAIL_REASONS.has(d.termination?.reason ?? '');
   }
 
   /**
-   * issue #306：`partial_output` **只在 `GET /events/history` 的响应期合成**（docs/api/portal.md
-   * §4.4a-1：不落库、不进 SSE），而此前只有 `openSession` 拉过 history ⇒ 用户点「停止」的那一刻
-   * 只能看到 `run_end` 分隔行，部分正文要刷新一次才出现。这里在**失败/中止终态**后补拉一次。
+   * issue #306（#236 起扩展）：**补拉一次 history**，喂本次响应里的响应期合成项。
    *
-   * - **复用既有归并路径**：只把 `partial_output` 交给 `addPartialOutput`（与 openSession 同一个
-   *   函数、同一份 `renderedIds` 幂等集，id = `partial:<run_id>`）⇒ 已渲染过就**不会出第二条**。
+   * `partial_output`（#300）与 `run_termination`（#236）都**只在 `GET /events/history` 的响应期
+   * 合成**（docs/api/portal.md §4.4a-1 / §4.4a-2：不落库、不进 SSE），而此前只有 `openSession` 拉过
+   * history ⇒ 用户点「停止」的那一刻只能看到实时 `run_end` 分隔行，部分正文要刷新一次才出现（#306）；
+   * 历史终态分隔条则**本来就不存在**（#236 §1 第 2 条）。
+   *
+   * - **一条请求同时服务两件事**：#236 **没有新增任何请求**，就在 #306 这条补拉里把 `run_termination`
+   *   也交给 `addRunTermination`（同一个 `renderedIds` 幂等集，id = `termination:<run_id>`）。
+   *   本次终态的 run 已经在实时 `run_end` 里渲染过分隔行 ⇒ 它的 id 已被登记（见 `onCurrentRunEnd`）
+   *   ⇒ 这条历史项**当场被去重**，不会出现「实时一条 + 历史一条」。
+   * - **复用既有归并路径**：与 openSession 同一个函数、同一份幂等集 ⇒ 已渲染过就不会出第二条。
    * - **其余事件故意不重放**：工具卡片幂等，但 `judge`/`round_start`/`attempt` 这些分隔行**不幂等**
    *   （重放一遍就是刷屏），而它们本次也不是来取的东西。
    * - **窗口参数不变**：openSession 拉 history 不传 `limit`/`before`（后端默认窗口），这里用**同一个
@@ -359,10 +380,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
    * - **失败静默**：不能把终态处理弄失败（§8.33 「自动改名降级是硬的」同口径）；内部全包在 try 里、
    *   调用处 `void`，**不得漏出未捕获拒绝**。
    */
-  function repullPartialOutput(d: RunEndPayload): void {
+  function repullHistorySynthItems(d: RunEndPayload): void {
     const sid = sessionId.value;
     // renderedIds 为 null = 不在会话详情视图里（切目录/重置）⇒ 没有幂等集，宁可不补也不能重复渲染。
-    if (sid == null || renderedIds.value === null || !shouldRepullPartialOutput(d)) return;
+    if (sid == null || renderedIds.value === null || !shouldRepullHistorySynth(d)) return;
     const reqSeq = sessionReqSeq.value;
     const ctx = ctxSeq.value;
     void (async () => {
@@ -370,12 +391,50 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         const data = await api<{ events?: RunHistoryEvent[] }>(`/api/sessions/${encodeURIComponent(sid)}/events/history`);
         if (reqSeq !== sessionReqSeq.value || ctx !== ctxSeq.value || sessionId.value !== sid) return; // 迟到的响应：已换会话
         for (const ev of data?.events ?? []) {
-          if (ev && ev.type === 'partial_output') addPartialOutput(ev);
+          if (!ev) continue;
+          if (ev.type === 'partial_output') addPartialOutput(ev);
+          else if (ev.type === RUN_TERMINATION_TYPE) addRunTermination(ev);
         }
       } catch {
         /* 静默降级：界面维持现状（只多一个没成功的请求），终态 UI 与停止按钮不受影响 */
       }
     })();
+  }
+
+  // ---- issue #236：终态分隔条从 run 终态字段投影（刷新 / 重开会话后仍在）----
+  /**
+   * 历史合成项 `run_termination` → 一条终态分隔行（中性 `.sep` 或红色 `.syserr`：分级与取词全在
+   * `useEventStream#historyRunEndEntry`，与实时 `run_end` 共用同一个函数）。
+   *
+   * **幂等键 = `termination:<run_id>`**（与 #300 的 `partial:<run_id>` 同一个 `renderedIds` 去重集）：
+   *   * 一条 run **至多一条**：同一响应里重复出现 / 再次归并 / #306 补拉再拿到同一项，都被去重；
+   *   * **实时与历史不会给两张**：实时 `run_end` 渲染完后 `onCurrentRunEnd` 把同一个 id 登记进
+   *     `renderedIds`（见那里）⇒ 同一次视图里历史项当场被跳过；
+   *   * 硬刷新后 `renderedIds` 重建 ⇒ 历史项正常渲染（这正是本单要的那条）。
+   * 脏载荷（无 `run_id` / 无 `termination.reason`）⇒ 不渲染、不占 id。
+   */
+  function addRunTermination(ev: RunHistoryEvent) {
+    const runId = typeof ev.run_id === 'string' && ev.run_id !== '' ? ev.run_id : null;
+    if (runId === null) return;
+    const entry = es.historyRunEndEntry(ev);
+    if (entry === null) return;
+    const id = `termination:${runId}`;
+    if (renderedIds.value) {
+      if (renderedIds.value.has(id)) return;
+      renderedIds.value.add(id);
+    }
+    entries.value.push(entry.kind === 'syserr' ? { kind: 'syserr', text: entry.text } : { kind: 'sep', text: entry.text });
+  }
+
+  /** 实时 `run_end` 已渲染过这条 run 的终态行 ⇒ 登记幂等键（防 #306 补拉 / 重开会话的历史项再出一条）。 */
+  function markRunTerminationRendered(runId: unknown): void {
+    if (typeof runId !== 'string' || runId === '') return;
+    renderedIds.value?.add(`termination:${runId}`);
+  }
+
+  /** 该 run 的终态分隔行是否已在本次视图里渲染过（幂等集存在时才算）。 */
+  function hasRunTerminationRendered(runId: unknown): boolean {
+    return typeof runId === 'string' && runId !== '' && renderedIds.value?.has(`termination:${runId}`) === true;
   }
 
   // ---- addMessage（issue #40 渲染规则逐行平移）----
@@ -536,7 +595,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (previousRunId === null || serverRunId !== null) return null;
     es.deltaText.value = null;
     removeDeltaEntry();
-    entries.value.push({ kind: 'sep', text: t('stream.event.missedRunEnd') });
+    // issue #236：重开会话时 history 已经先归并过（合成项可能已经给出**带具体 reason** 的终态分隔行）
+    // ⇒ 不再叠一条通用「连接中断期间该 run 已结束」。没有那条时（窗口没盖到 / 旧后端）才退到通用提示。
+    if (!hasRunTerminationRendered(previousRunId)) {
+      entries.value.push({ kind: 'sep', text: t('stream.event.missedRunEnd') });
+      markRunTerminationRendered(previousRunId);
+    }
     return previousRunId;
   }
 
@@ -710,6 +774,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       // 不进 SSE），既不进 EVENT_TYPES 也不进 HISTORY_REPLAY_TYPES ⇒ 自己推 entry；
       // **不喂 replayEvent**（它拿不到这个 type，自然不产工具卡片/分隔行，也不会「实时一条 + 历史一条」）。
       else if (item.ev && item.ev.type === 'partial_output') addPartialOutput(item.ev);
+      // issue #236：终态分隔条的响应期合成项（同一种存在方式：不落库、不进 SSE、不进两个集合）。
+      else if (item.ev && item.ev.type === RUN_TERMINATION_TYPE) addRunTermination(item.ev);
       else if (item.ev) es.replayEvent(item.ev);
     }
     const serverRunId = data.session.active_run_id;
@@ -1045,10 +1111,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // actions
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
-    saveDraft, addMessage, addPartialOutput, send, stop, refreshSession,
+    saveDraft, addMessage, addPartialOutput, addRunTermination, send, stop, refreshSession,
     pushStreamError,
     // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。
-    repullPartialOutput,
+    // issue #236：同一个入口现在也喂终态分隔条（`run_termination`），故改名 `repullHistorySynthItems`。
+    repullHistorySynthItems,
     // issue #261B：一键「重试上一条」（lastSend/retryAvailable 仅内存；retryInFlight 驱动按钮禁用）
     lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数

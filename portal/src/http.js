@@ -419,12 +419,37 @@ function clearCookieHeader(cookie) {
   return parts.join('; ');
 }
 
-/** 校验 Content-Type（JSON 端点要求 application/json）。 */
+/**
+ * 校验 Content-Type（JSON 端点要求 application/json）。
+ *
+ * issue #236（第 2 条）：**无 body 的请求不再强制 `Content-Type`**。此前
+ * `curl -X POST .../stop`（不带 body、不带该头）会 400 `validation_failed`
+ * 「Content-Type 必须为 application/json」——前端总是发 `body: '{}'` 所以 UI 无感，但手工客户端 /
+ * curl / 脚本按 REST 常识发空 body 就踩。现口径（决策者倾向的 ①）：
+ *   ① 声明了 `application/json`（可带 `; charset=…`）⇒ 放行（唯一被接受的正向声明）；
+ *   ② **没有** `Content-Type` 头 **且** 请求确实无 body ⇒ 放行（`readJsonBody` 对空体返回 `{}`）；
+ *   ③ 其余（有 body 但没声明 json / 声明了别的类型 / 头显式为空串）⇒ 仍 400（校验面只放宽这一格）。
+ * ⚠ 「无 body」只认 `Content-Length: 0` 或**既无 CL 也无 `Transfer-Encoding`**；chunked 的体在读完
+ *   之前不可知 ⇒ 按「有 body」处理（fail-closed，绝不把带体请求放过去）。
+ * ⚠ 本函数是**所有** JSON 端点的统一闸（POST / PUT / DELETE 共 40+ 处调用点），#234 的 Origin
+ *   同源门在它**之前**（`routeApi` 开头），两者语义无关、互不影响。
+ */
 function requireJson(req) {
-  const ct = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-  if (ct !== 'application/json') {
-    throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json');
+  const raw = req.headers['content-type'];
+  const ct = (raw || '').split(';')[0].trim().toLowerCase();
+  if (ct === 'application/json') return;
+  if (raw === undefined && requestHasNoBody(req)) return;
+  throw new HttpError(400, 'validation_failed', 'Content-Type 必须为 application/json');
+}
+
+/** issue #236：请求是否**确定**没有 body（`Content-Length: 0`，或既无 CL 也无 chunked 编码）。 */
+function requestHasNoBody(req) {
+  const contentLength = req.headers['content-length'];
+  if (contentLength !== undefined) {
+    const n = Number(contentLength);
+    return Number.isFinite(n) && n === 0;
   }
+  return req.headers['transfer-encoding'] === undefined;
 }
 
 /** 读取 JSON 请求体：Content-Length 早期拒绝 413；流式超限也 413（不 destroy 连接，回错误信封）。 */
@@ -1732,6 +1757,10 @@ const PARTIAL_OUTPUT_TYPE = 'partial_output';
 // 上限沿用本端点既有 `HISTORY_PAYLOAD_STRING_CAP = 2000` 的先例；**差别是刻意的**：合成项不塞
 // `…（已截断）` 文本，只给 `truncated` 布尔，截断标记由前端出（前端要能判定，见 StreamPanel）。
 const PARTIAL_OUTPUT_TEXT_CAP = 2000;
+// issue #236：**终态分隔条**的合成类型。名字**故意不叫 `run_end`**：`run_end` 是实时 SSE 的运行态
+// 语义事件，绝不能进历史白名单（#217 / #236 的红线）——它是响应期投影出来的展示项，与
+// `partial_output` 同一类存在（不落库、不进 SSE、两个前端集合都不加）。
+const RUN_TERMINATION_TYPE = 'run_termination';
 
 // 展示 payload 截断：字符串叶值超cap → 截断 + 标记（JSON 形状保持合法，前端 String() 路径原样可用）。
 function truncateHistoryPayload(value, depth = 0) {
@@ -1770,24 +1799,29 @@ function distinctWindowRunIds(rows) {
 }
 
 /**
- * issue #300 候选判定（**只在窗口里真有 run 时才发这一条查询**）：终态 **且** 零助手锚点。
- * - 终态口径 `status IN ('finished','failed')`（枚举见 schema.sql:207）。`queued`/`running`/`cancelling`
- *   **不算终态**——「还在跑就标已中止」是新造的误导。
+ * issue #300 / #236：窗口内 run 的**终态信息**一条查询取齐（**只在窗口里真有 run 时才发**）。
+ * - 只返回终态行（`status IN ('finished','failed')`，枚举见 schema.sql:207）；`queued`/`running`/
+ *   `cancelling` **不算终态**——「还在跑就标已中止」是新造的误导（#300 判据②，本单沿用）。
  * - 锚点口径 = `messages` 里 `role='assistant'` 的**任意**行，**含 `synthetic = true`**：judge/wrapup
- *   注入的助手行同样是「这次 run 说过话」的证据。**有锚点就绝不能再合成一遍**（重复正文是本单头号坑）。
+ *   注入的助手行同样是「这次 run 说过话」的证据。**有锚点就绝不能再合成一遍**（重复正文是 #300 头号坑）。
+ * - `last_seq` = 该 run 在 `run_events` 里的**最大 seq**（`run_events_run_idx (run_id, seq)` 覆盖，零新索引）。
+ *   合成项用它当 `seq`（**不新分配**，也不推进 `chat_sessions.last_seq`）：`run_end` 行本身就在这张表里，
+ *   所以这个 seq 恰好就是「该 run 最后一条事件」的位置 ⇒ 终态分隔条天然排在本次 run 的内容之后。
+ * - **一条查询同时服务两件事**（#300 的 `partial_output` 候选判定 + #236 的终态投影）⇒ 同一次响应里
+ *   对同一批 `run_id` 只有**这一条** runs 查询（成本红线：不许为分隔条再打第二条同类查询）。
  */
-async function findPartialCandidateRunIds(pool, runIds) {
+async function loadWindowRuns(pool, runIds) {
   const r = await pool.query(
     `SELECT r.id AS run_id,
+            r.status AS status,
+            r.termination AS termination,
+            (SELECT MAX(e.seq) FROM run_events e WHERE e.run_id = r.id) AS last_seq,
             EXISTS (SELECT 1 FROM messages m WHERE m.run_id = r.id AND m.role = 'assistant') AS has_anchor
        FROM runs r
       WHERE r.id = ANY($1) AND r.status IN ('finished', 'failed')`,
     [runIds],
   );
-  return (r.rows ?? [])
-    .filter((row) => row.has_anchor !== true)
-    .map((row) => row.run_id ?? row.id)
-    .filter((id) => id != null);
+  return r.rows ?? [];
 }
 
 /**
@@ -1840,9 +1874,9 @@ async function aggregatePartialOutputs(pool, candidateRunIds) {
 }
 
 /** 合成项参与升序排序，但**不占 limit、不参与 next_cursor/hasOlder**（那两个仍只由真实事件决定）。 */
-function mergePartialOutputsBySeq(realEvents, partialItems) {
-  if (!partialItems.length) return realEvents;
-  const parts = partialItems.slice().sort((a, b) => a.seq - b.seq);
+function mergeSynthItemsBySeq(realEvents, synthItems) {
+  if (!synthItems.length) return realEvents;
+  const parts = synthItems.slice().sort((a, b) => a.seq - b.seq);
   const merged = [];
   let i = 0;
   let j = 0;
@@ -1904,27 +1938,71 @@ async function handleSessionEventsHistory(req, res, ctx, sessionId) {
     type: row.type,
     payload: truncateHistoryPayload(row.payload ?? {}),
   }));
-  // issue #300：零候选 ⇒ 零额外查询（无 run ⇒ 连候选判定都不发）。
+  // issue #300 / #236：零候选 ⇒ 零额外查询（无 run ⇒ 连终态查询都不发）。
   // `next_cursor` / `hasOlder` 在上面已由**真实事件**算完，合成项不参与。
-  const partials = await buildPartialOutputEvents(ctx.pool, rows);
+  const synth = await buildHistorySynthItems(ctx.pool, rows);
   return sendJson(res, 200, {
-    events: mergePartialOutputsBySeq(events, partials),
+    events: mergeSynthItemsBySeq(events, synth),
     next_cursor: hasOlder && rows.length > 0 ? Number(rows[0].seq) : null,
   });
 }
 
 /**
- * issue #300：合成 `partial_output` 响应项（**不落库、不进 SSE**）。
- * 判据三条（缺一不合成）：① 该 run 出现在本次响应窗口里；② `runs.status IN ('finished','failed')`
- * 且该 run 零助手锚点；③ 聚合出非空文本。聚合范围 = **整个 run**（不受 `before` 窗口影响：窗口外的
- * 碎片也是这次 run 说过的话）。一条候选 run 至多一条合成项。契约见 portal.md §4.4a。
+ * issue #236：**终态分隔条**的响应期合成项（从 `runs` 的终态字段投影，**不是**把 `run_end` 塞进白名单）。
+ *
+ * 缺陷（issue #236 §1 第 2 条）：`run_end` 不在历史下发白名单（`HISTORY_EVENT_TYPES`，红线），
+ * 所以终态分隔条只在**实时 SSE** 里出现过一次，刷新 / 重开会话后完全消失（#217 只补了「打开会话时
+ * 对活跃 run 对账」，不覆盖终态回放）。修法**不碰白名单**：在只读端点里从 `runs.status` +
+ * `runs.termination` 投影出一条合成项（`type = 'run_termination'`，**不落库、不进 SSE、不进
+ * `HISTORY_EVENT_TYPES`，也不进前端 `EVENT_TYPES` / `HISTORY_REPLAY_TYPES`**——它只在本次响应里存在，
+ * 与 #300 的 `partial_output` 同一种存在方式）。
+ *
+ * 判据（缺一不合成，**一条 run 至多一条**）：
+ *   ① 该 run 出现在本次响应窗口里（`distinctWindowRunIds`）；
+ *   ② `runs.status IN ('finished','failed')`（`queued`/`running`/`cancelling` 一律不合成）；
+ *   ③ `termination.reason` 是**非空字符串**（缺 termination / 脏载荷 ⇒ 不合成：不拿 status 编一个 reason）。
+ *
+ * `seq` = 该 run 在 `run_events` 里的**最大 seq**（不新分配）：`run_end` 行本来就在表里 ⇒ 分隔条天然落在
+ * 本次 run 内容之后，且分页窗口外的行也拿得到（`MAX(seq)` 不受 `before` 限制）。
  */
-async function buildPartialOutputEvents(pool, windowRows) {
+async function buildHistorySynthItems(pool, windowRows) {
   const runIds = distinctWindowRunIds(windowRows);
   if (runIds.length === 0) return []; // 成本红线：窗口无 run ⇒ 整段跳过，一条查询都不许多发
-  const candidates = await findPartialCandidateRunIds(pool, runIds);
-  const partials = await aggregatePartialOutputs(pool, candidates);
-  return [...partials.values()];
+  // 一条 runs 查询同时服务 partial_output 的候选判定与 run_termination 的终态投影（不许打第二条）。
+  const runRows = await loadWindowRuns(pool, runIds);
+  const partialCandidates = runRows
+    .filter((row) => row.has_anchor !== true)
+    .map((row) => row.run_id ?? row.id)
+    .filter((id) => id != null);
+  const partials = await aggregatePartialOutputs(pool, partialCandidates);
+  return [...partials.values(), ...buildRunTerminationItems(runRows)];
+}
+
+/**
+ * issue #236：`runs` 终态行 → 合成项（一条 run 至多一条）。`payload.termination` 原样透传（前端
+ * 的分级 / 标签 / `errorCode` 都从它取），只过一遍字符串截断（`detail` 等可能很长）。
+ */
+function buildRunTerminationItems(runRows) {
+  const out = [];
+  for (const row of runRows ?? []) {
+    const runId = row.run_id ?? row.id ?? null;
+    if (runId == null) continue;
+    const termination = row.termination !== null && typeof row.termination === 'object' ? row.termination : null;
+    const reason = typeof termination?.reason === 'string' ? termination.reason : '';
+    if (reason === '') continue; // 判据③：没有 reason 就没什么可说的（绝不拿 status 编一个）
+    const seq = Number(row.last_seq);
+    if (!Number.isFinite(seq)) continue; // 无任何事件行 ⇒ 无处安放（窗口行里来的 run 理论上不会）
+    out.push({
+      seq,
+      run_id: runId,
+      type: RUN_TERMINATION_TYPE,
+      payload: {
+        status: row.status ?? null,
+        termination: truncateHistoryPayload(termination),
+      },
+    });
+  }
+  return out;
 }
 
 /** GET /api/runs/:id（portal.md §4.6）：run 详情（属主经 session join 校验，不泄露存在性）。 */
