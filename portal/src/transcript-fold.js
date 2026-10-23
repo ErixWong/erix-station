@@ -15,7 +15,8 @@
 // 刷新/重开会话后每张工具卡片从 `✓`/`✗` 退化成 `…`（`resultPreview` / `isError` / `executionStatus`
 // 三件全丢）。正文没坏、也不重复（上一片 §4.2/§9 实测）。
 //
-// 折叠口径与上游 `foldMessageRows` **逐字同构**（三条，缺一不可）：
+// 折叠口径与上游 `foldMessageRows` **逐字同构**（三条，缺一不可；**唯一例外**是下面 `partOf` 条目里
+// 那条 #341 解链登记——上游同款缺陷未修，所以本站刻意先走一步）：
 //   1. **分组**：按顶层 `round` 分组；组内按 `seq` 升序（`seq` 相同按行序）拼接 `messages`；
 //   2. **载体**：拼回该轮的**轮行**——key 以 `:round:<n>` 或 `:round:<n>:resume` 结尾的非消息行
 //      （`<key>:engine:round:<n>`、`<key>:round:<n>`、`<key>:engine:round:<n>:resume`）；
@@ -31,6 +32,23 @@
 //   · **`partOf`**：一条逻辑消息的分片（一轮多个 `tool_result`）接回它指认的那条消息后面，拼成
 //     **同一条**消息 ⇒ 折叠后的 `messages` 与 0.22 那条聚合消息深比较相等（否则恢复上下文会
 //     `invalid_messages`：一条 assistant 的 `tool_use` 必须由紧随其后的**那一条** user 消息结清）。
+//
+// ⚙ **#341 临时闸：`partOf` 是「链」不是「一跳」（上游 erix-agent #415 未修，本站读侧先解链）**。
+// 0.23 写侧 `src/loop/orchestrator.js` 每落一片就 `toolResultRowKey = persistedRowKey`（覆盖）⇒
+// 第 3 个并行工具调用起，`partOf` 指向的是**前一片分片行**（`msg:1:3 → msg:1:2 → msg:1:1`），而不是
+// 聚合消息的首片。上游 `foldMessageRows` 的 `parts` 表**只登记非分片行的 key**（分片行在登记前就
+// `continue`）⇒ 链上第 2 片起查不到目标 ⇒ 被当成**独立消息**排出去，同一轮的聚合 `tool_result`
+// 被劈成多条 user 消息（引擎 `foldLedgerMessages` + `validateMessages` 于是 `invalid_messages`，
+// resume 永久卡死）。
+// 本站修法（与上游 #415 建议一致）：**分片行也把自己的 key 登记进 `parts`，映射到它被接进去的那个
+// 同一消息下标** ⇒ 链自然解回链头。判据谓词（`isFoldableMessageRow` / `isRoundCarrier` / 「每轮取
+// 行序第一个载体」/「`partOf` 只在单消息行上当分片」）**一字不动**，登记是纯附加。
+// 无链的账本（没有分片行的 key 被后来者引用）输出逐字节不变 —— 这是本闸的放行条件，别拿「全绿」当
+// 解链生效的证据（`portal/test/transcript-fold.test.js` 有专门的对拍 + 字节快照用例）。
+// ⚠ **这是闸，不是永久设计**：上游 #415 落地（`parts.set` 挪到 `continue` 之前）**并升 pin 后，
+// 本段整体可撤**——撤法 = 删掉 `planFold` 里那行 `parts.set(key, partTargetIndex)`（连同本注释），
+// 再把 `portal/test/transcript-fold.test.js` 的源码级哨兵用例按当时的真件重写。先例：§8.28 撤 #283
+// 计时闸、§8.9 撤 `tree` 根标签收口。**哨兵红了不是回归，是提示撤闸**。
 //
 // 为什么本站要自己实现一份而不是 import 上游：`foldMessageRows` **不在包 exports 面**（只有 `.` /
 // `./tools` / `./contract-tests`）。本站先例是 `./transcript-payload.js`（同为「与上游同源的单一条尺」），
@@ -139,6 +157,12 @@ function planFold(records, keyOf) {
       if (partTargetIndex >= 0 && row.messages.length === 1) {
         // 分片：接到它指认的那条消息后面（分片行自身不出现在正文里）
         messages[partTargetIndex] = mergePartIntoMessage(messages[partTargetIndex], row.messages[0]);
+        // #341 解链：分片行**自己也登记**进 parts，指向它被接进去的那个同一消息下标。
+        // 0.23 写侧把 `partOf` 写成**链**（`orchestrator.js` 里每落一片就 `toolResultRowKey =
+        // persistedRowKey`，后一片指前一片）⇒ 不登记的话第 3 片起 `parts.get(partOf)` 落空，
+        // 它会被当成一条**独立消息**排出去（同一轮的聚合 `tool_result` 被劈成多条）。
+        // 上游 `foldMessageRows` 尚未修（erix-agent #415）；上游落地并升 pin 后本段整体可撤。
+        if (key !== '') parts.set(key, partTargetIndex);
         continue;
       }
       if (key !== '') parts.set(key, messages.length);

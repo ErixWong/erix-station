@@ -21,7 +21,8 @@ import assert from 'node:assert/strict';
 
 import { runToolLoop } from 'erix-agent';
 
-import { projectSessionMessages } from '../src/session-view.js';
+import { compareTranscriptRows, projectSessionMessages, recordForProjection } from '../src/session-view.js';
+import { foldTranscriptRows } from '../src/transcript-fold.js';
 
 const SESSION_ID = '10000000-0000-4000-8000-000000000001';
 const RUN_ID = '20000000-0000-4000-8000-000000000001';
@@ -311,4 +312,93 @@ test('#337 旧 0.22 账本（无消息行）走折叠后输出逐字节不变', 
 
   // 折叠必须是**纯**的：入参行一个字节都不许被改写（旧账本「原样透传」的另一半）。
   assert.deepEqual(LEGACY_ROWS, snapshot, '折叠不得改写入参行（纯函数）');
+});
+
+// ============================================================================
+// #341（上游 erix-agent #415）：链式 `partOf` 的**投影面贯通**
+// ============================================================================
+//
+// 一轮 ≥3 个并行工具调用时，0.23 写侧把 `partOf` 写成**链**（第 3 片指第 2 片）。本站折叠必须
+// 解链，否则同一轮的聚合 `tool_result` 会被劈成多条 user 消息（形状 ≠ 0.22，引擎 resume 会
+// `invalid_messages`）。
+//
+// ⚠ 诚实标注（实测，别拿「全绿」当解链生效的证据）：本用例的**第一半**（DTO 里 `resultPreview`
+// 在不在）在解链前后**都是绿的** —— 上游 `projection.js#toolResultsOf(messages)` 扫整条 record 的
+// 全部 messages（按 `tool_use_id` 建 Map），所以被劈出去那条 user 消息里的 `tool_result` 仍然配得上
+// 对；纯 tool_result 消息 `textOf()` 为空串，也不会多出 user 气泡。**解链的行为判据是第二半**
+// （折叠后该轮载体行必须恰好 1 条聚合 `tool_result`），它才是撤掉解链会红的那条。
+
+/** 主模型：第 1 轮要三个 `readFile`（第三个抛错），第 2 轮给终稿。 */
+function stubThreeToolProvider() {
+  let call = 0;
+  return {
+    async chat() {
+      call += 1;
+      if (call === 1) {
+        return {
+          content: [
+            { type: 'text', text: '先读三个文件' },
+            { type: 'tool_use', id: 'ok1', name: 'readFile', input: { path: 'a.txt' } },
+            { type: 'tool_use', id: 'ok2', name: 'readFile', input: { path: 'b.txt' } },
+            { type: 'tool_use', id: 'bad1', name: 'readFile', input: { path: 'missing.txt' } },
+          ],
+          stopReason: 'tool_use',
+        };
+      }
+      return { content: text('收工'), stopReason: 'end_turn' };
+    },
+  };
+}
+
+/** 真跑一次 0.23 `runToolLoop`（3 个并行工具），返回引擎落下的原始行；顺带断言 `partOf` 真的是链。 */
+async function runRealChainLedger() {
+  const records = {};
+  await runToolLoop({
+    provider: stubThreeToolProvider(),
+    initialUserMessage: '读文件',
+    completion: false,
+    tools: TOOLS,
+    executeTool: async ({ input }) => {
+      if (input.path === 'missing.txt') throw new Error('ENOENT: no such file');
+      return `body of ${input.path}`;
+    },
+    maxRounds: 4,
+    store: makeStore(records),
+    runId: SESSION_ID,
+  });
+  const rows = records[SESSION_ID] ?? [];
+  const shards = rows.filter((row) => typeof row.partOf === 'string');
+  assert.equal(shards.length, 2, '前置条件：3 个工具结果里后两条必须带 partOf');
+  assert.equal(shards[1].partOf, shards[0].dedupKey,
+    '前置条件：第 3 个工具结果的 partOf 必须指向**前一片分片行**（链），否则本条测不到解链');
+  return rows;
+}
+
+test('#341 投影面贯通：真 0.23 链式三分片账本 ⇒ 工具卡片带 resultPreview，且折叠后是 1 条聚合 tool_result', async () => {
+  const rows = await runRealChainLedger();
+  const transcriptRows = [inputRow(), ...toTranscriptRows(rows)];
+
+  // ① 用户可见面：三张工具卡片都要带执行事实（刷新后不该退化成 `…`）。
+  const calls = callsById(project(transcriptRows));
+  assert.deepEqual([...calls.keys()], ['ok1', 'ok2', 'bad1'], '三条工具调用都必须透传到 DTO');
+  for (const id of ['ok1', 'ok2', 'bad1']) {
+    assert.equal(typeof calls.get(id).resultPreview, 'string', `${id} 必须带 resultPreview`);
+  }
+  assert.match(calls.get('ok1').resultPreview, /^body of a\.txt/);
+  assert.match(calls.get('ok2').resultPreview, /^body of b\.txt/);
+  assert.match(calls.get('bad1').resultPreview, /ENOENT: no such file/);
+  assert.equal(calls.get('bad1').isError, true, '失败那条必须 isError === true');
+
+  // ② 解链判据（投影的**输入**形状）：该轮载体行折叠后必须恰好 2 条消息，
+  //    第 2 条是含 3 个 tool_result 的**一条**聚合消息 —— 撤掉解链 ⇒ 这里是 3 条 ⇒ 红。
+  const foldedRows = foldTranscriptRows([...transcriptRows].sort(compareTranscriptRows), {
+    recordOf: (row) => recordForProjection(row).record,
+  });
+  const carrier = foldedRows.find((row) => row.dedup_key === `${SESSION_ID}:engine:round:1`);
+  assert.ok(carrier, '折叠后该轮载体行必须还在（引擎轮行是载体）');
+  assert.equal(carrier.record.messages.length, 2,
+    `折叠后必须 2 条消息（1 assistant + 1 聚合 tool_result），实际 ${carrier.record.messages.length} 条`
+    + ' —— 3 条 = 链没解开（第 3 片被当成独立消息）');
+  assert.deepEqual(carrier.record.messages[1].content.map((block) => block.tool_use_id), ['ok1', 'ok2', 'bad1'],
+    '聚合消息必须按 seq 含全部 3 个 tool_result');
 });
