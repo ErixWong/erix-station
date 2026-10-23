@@ -1,8 +1,19 @@
 // issue #212 防漂移（前端侧）：termination reason 单一常量的自洽性 + 新 reason 的双语文案齐全。
 // 与后端 portal/test/termination-contract.test.js 互补：那边锁「常量 ↔ 文档枚举表 ↔ 引擎源码」，
 // 本文件锁「常量 ↔ 前端运行时引用 ↔ i18n 双语键集」（i18n 用真实消息对象，不用 fs 读文本）。
+//
+// issue #349：本文件**不再裸 import `node:` 内建**。原先结构锁用 `readFileSync` 读被测常量的源码文本，
+// 而全局 environment 是 jsdom（vite.config.ts:24）——vite 会把 `node:fs` externalize 成浏览器桩，
+// suite 载入期直接 `Error: No such built-in module: node:`（0 test 被计；是否发作取决于 transform
+// 缓存/并发状态，三个 agent 各见过一次而主 agent 全绿）。改用 vite 的 `?raw` 导入：**同一份源码文本**，
+// 零 node 内建依赖，jsdom / node 两种环境下行为一致 ⇒ 那条结构断言的强度一字未降。
+// （另一条路「在文件头 docblock 里把环境改成 node」实测被 src/i18n/index.ts:74 的顶层
+//  `document.documentElement.lang = …` 挡住：本 spec 经 useEventStream.ts:18 → i18n/index 间接加载它。
+//  不去改那个产品代码的顶层副作用，改走「去掉 node:fs 依赖」这条路。
+//  ⚠ 本注释里**故意不写那个 docblock 的原文**：vitest 是全文扫指令注释，写全了（即使只是引用）
+//  会真被当成环境指令，本文件就跑去 node 环境跑并报 `document is not defined`（本单踩过一次）。)
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import terminationReasonsSource from './terminationReasons.ts?raw';
 import { RUN_FAIL_REASONS as RUN_FAIL_REASONS_FROM_STREAM } from '../composables/useEventStream';
 import { en } from '../i18n/locales/en';
 import { zhCN } from '../i18n/locales/zh-CN';
@@ -84,10 +95,11 @@ describe('termination reason 单一常量（issue #212）', () => {
   // 在测试面上没人守。内容等价测不出「是不是派生的」，所以这里读源码做结构断言
   // （与项目里 `append-seq-ordering.test.js` / `system-prompt.test.js` 同一手法）。
   it('界面刷红集合在**源码层面**必须是派生实现（手抄一份等价枚举不算派生）', () => {
-    // 不用 `new URL(…, import.meta.url)`：vitest 下它是 http: URL，readFileSync 直接报
-    // 「The URL must be of scheme file」。这里按仓库约定的运行目录（portal/frontend）取路径；
-    // 路径不对会 ENOENT 直接红，不会退化成假绿。
-    const src = readFileSync('src/lib/terminationReasons.ts', 'utf8');
+    // issue #349：源码文本走 vite `?raw` 导入（构建期读盘），不再用 `readFileSync`——
+    // 既避开 jsdom 下 `node:fs` 被 externalize 的 `No such built-in module: node:`，
+    // 也避开 `new URL(…, import.meta.url)` 在 vitest 下是 http: URL 的坑。
+    // 读到的仍是同一份 `src/lib/terminationReasons.ts` 全文：常量改名/换写法时下面的 match 落空即红。
+    const src = terminationReasonsSource;
     const def = src.match(/export const RUN_TERMINATION_SYSERR_REASONS[\s\S]*?\n\);/);
     // 用 throw 而不是 expect(...).not.toBeNull()：后者不是类型守卫，strict 下 `def[0]` 仍报
     // TS18047 possibly null（CI 步骤 ④ 实测拦下过）。throw 既收窄类型，也保留同样的失败文案。
