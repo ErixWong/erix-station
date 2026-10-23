@@ -131,7 +131,7 @@ export const en = {
     newDirOption: '＋ New directory',
     refreshTitle: 'Refresh directory list and tree',
     newDirTitle: 'New directory',
-    newDirLabel: 'Directory name (lowercase letters / digits / hyphens)',
+    newDirLabel: 'Directory name (lowercase letters, digits, underscores, hyphens; must not start or end with a hyphen or underscore; max 63 characters)',
     newDirPlaceholder: 'e.g. my-project',
     newSession: '＋ New session',
     browse: 'Browse sessions',
@@ -627,7 +627,7 @@ export const en = {
     createSessionFailed: 'Failed to create session: {message}',
     stopFailed: 'Failed to stop: {message}',
     dirNameInvalid:
-      'Directory name must be lowercase letters / digits / hyphens, and must not start or end with a hyphen (max 63 characters)',
+      'Directory names may only use lowercase letters, digits, underscores and hyphens; they must not start or end with a hyphen or underscore; max 63 characters. Directories that already exist in the container (even with other characters) can be selected directly from the directory dropdown.',
     sendFailed: 'Send failed: {message}',
     sendFailedLlmNotConfigured:
       'Send failed: this FDE has no LLM upstream configured. Set it up in the admin console at /admin (contact your administrator if you lack access)',

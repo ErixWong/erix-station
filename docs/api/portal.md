@@ -693,7 +693,7 @@ station-portal user enable  --login <login>
 
 | 字段 | 说明 |
 |---|---|
-| `name` | 用户内唯一；同时是容器内目录名，故只允许 `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`（同 schema.sql CHECK，不允许尾随 `-`） |
+| `name` | 用户内唯一；`PROJECT_NAME_RE` 限定 `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`（同 schema.sql CHECK，不允许尾随 `-`）。**该规则只服务这张已退役、只读的 `projects` 表**：P5 起 hostname 不含项目名（迁移 `0008-deprojectize.sql`），目录名也不再由它约束——目录名在服务端的唯一硬边界是「`~/projects/` 一级目录 + 无路径穿越」（见 §4.2 `POST /api/sessions` 的 cwd 校验真值） |
 | `repo_url` | 可选仓库地址，**仅作记录/展示元数据**；不填时为 `null`。平台不 clone、不物化该目录；Git 凭据可由 FDE 自行配置，或由 admin 通过凭据端点投放（规格 §7.2/§12.2，user-space.md §4.1.1） |
 | `slot` | 项目端口块序号（**P5 之前的旧机制**，当年决定 `4000 + slot*8` 起始端口；现在端口分配与它无关，见规格 §8.2） |
 | `template` | 项目模板（onboarding 第 5 步生成 AGENTS.md 等，规格 §7.2） |
@@ -824,10 +824,22 @@ station-portal user enable  --login <login>
 | 端点 | 请求 | 响应 |
 |---|---|---|
 | `GET /api/sessions?project_id=<id>` | 可选按项目过滤，分页 | `200 {items, next_cursor}` |
-| `POST /api/sessions` | `{ "project_id": "p_8h2k", "title": "可选", "model": "可选" }` | `201 ChatSession` |
+| `POST /api/sessions` | `{ "cwd": "~/projects/<目录名>", "title": "可选", "model": "可选" }`（`project_id` 为 P5 过渡别名，语义就是 cwd） | `201 { "session": ChatSession }` |
 | `GET /api/sessions/:id` | — | `200 { "session": ChatSession, "messages": [Message...]（按 seq 升序、分页参数同 §1.3）, "last_seq": 128 }` |
 | `PATCH /api/sessions/:id` | `{ "title": "新标题" }` | `200 ChatSession` |
 | `DELETE /api/sessions/:id` | — | `204`（归档，`status → archived`；有进行中 run 时 `409 run_in_progress`） |
+
+**`cwd` 校验真值（P5，issue #284 校正；实现 `portal/src/sessions.js` 的 `CWD_RE` + `validateSessionCwd`）**：
+
+- 形态必须是 `~/projects/<name>`，`<name>` 为**一级目录**（不得含 `/`）——路径穿越就靠这一条拦；
+- `<name>` 为 `.` / `..` / 含控制字符（`\x00-\x1f`、`\x7f`）⇒ `400 validation_failed`（`details.field='project_id'`）；
+- **字符集与长度不限**：下划线、点、中文、空格、超过 63 字符都照收（容器内用户自建目录的自由命名权；
+  真库存量如 `~/projects/meeting_asr_app`）。`chat_sessions.cwd` 列**没有任何 CHECK**，服务端不按
+  「DNS label」收紧——P5 起目录名不进 hostname（迁移 `0008`），没有那个约束来源；
+- 目录不存在时服务端 `mkdir`（权限口径同工作区目录；已存在则幂等复用，不重建）。
+- **前端「＋ 新建目录」表单另有一层更严的规则**：`DIR_NAME_RE`（`portal/frontend/src/lib/constants.ts`，
+  `^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$` = 小写字母/数字/下划线/连字符、首尾须为字母数字、≤63）。
+  它**只约束新建**，不影响在目录下拉里选中容器内已有目录（哪怕目录名含其它字符）。
 
 **对话流 DTO 的 `messages[]` 展示字段（`GET /api/sessions/:id`）**
 

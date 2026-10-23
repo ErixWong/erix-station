@@ -145,7 +145,7 @@ export const zhCN = {
     newDirOption: '＋ 新建目录',
     refreshTitle: '刷新目录列表与目录树',
     newDirTitle: '新建目录',
-    newDirLabel: '目录名（小写字母/数字/连字符）',
+    newDirLabel: '目录名（小写字母、数字、下划线、连字符；不能以连字符或下划线开头/结尾；最长 63 字符）',
     newDirPlaceholder: '例如 my-project',
     newSession: '＋ 新会话',
     browse: '浏览会话',
@@ -648,7 +648,7 @@ export const zhCN = {
     workspaceLoadFailed: '工作台初始化失败：{message}（可刷新重试；持续失败请联系管理员）',
     createSessionFailed: '建会话失败：{message}',
     stopFailed: '停止失败：{message}',
-    dirNameInvalid: '目录名必须符合：小写字母/数字/连字符，且不能以连字符开头或结尾（最多 63 个字符）',
+    dirNameInvalid: '目录名只能用小写字母、数字、下划线、连字符；不能以连字符或下划线开头/结尾；最长 63 字符。容器里已存在的目录（哪怕含其它字符）可直接在目录下拉里选中使用。',
     sendFailed: '发送失败：{message}',
     // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）
     sendFailedLlmNotConfigured: '发送失败：该 FDE 未配置 LLM 上游，请到管理台 /admin 配置（无权限请联系管理员）',
