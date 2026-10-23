@@ -362,9 +362,10 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 | 对象 | 属主 | 模式 | 说明 |
 |---|---|---|---|
 | `/srv/erix/users/`（宿主根） | root:root | `0755` | 仅 portal（root）可写；Traefik/db 不挂、无权限 |
-| `/srv/erix/users/<fde>/` 及其下工作区目录（`home`、`projects`、`projects/<p>`、`worktrees`、`worktrees/<...>`、`cache`） | `erix`(1000):`erix`(1000) | **`0770`**（组 rwx，**无 setgid**） | 组 rwx 使 agentd(1001)/worker(1002) 可读写（三者主组恒为 1000）；**不需要 setgid**——新建子项的 GID 由写入进程的**主组**决定（恒 1000），不由目录的 setgid 位决定。口径与成因见本节末「为什么不需要 setgid」 |
+| `/srv/erix/users/<fde>/` 及其下**每轮 reconcile 的**工作区目录（`home`、`projects`、`cache`） | `erix`(1000):`erix`(1000) | **`0770`**（组 rwx，**无 setgid**） | 组 rwx 使 agentd(1001)/worker(1002) 可读写（三者主组恒为 1000）；**不需要 setgid**——新建子项的 GID 由写入进程的**主组**决定（恒 1000），不由目录的 setgid 位决定。口径与成因见本节末「为什么不需要 setgid」 |
+| `projects/<p>/`（**只创建一次**的那类，由 `sessions.js` `createSession` 建） | `erix`(1000):`erix`(1000) | **实测 `2770`**（首轮 `chmod` 时属组仍 == 进程 egid 0 ⇒ setgid 落得下，见成因 (a) 第 2 步） | ⚠ **同一棵树里 setgid 位是混的，别当一致状态**（真机实测 `eric/projects/probe-343`、`blind/projects/r1-app` = `2770`，同树 `eric/projects/probe-261014` = `770`）：同一项目再建第二个 session 会被下一轮 `chmod` 清成 `0770`。遗留的 `home/worktrees` 还见过 `2755`（在 `2770` 父目录里新建会**继承** setgid + umask `0022`）⇒ 结论同上：setgid 在这里不承载访问权 |
 | `.erix/`（HOME 级与项目级） | `erix`(1000):`erix`(1000) | `0750` | FDE 可管理 `skills/todos`；平台文件在其中为 root 属只读（下一行）；agentd/worker 只读 |
-| `.cache/station/spool/`（事件 spool） | `erix`(1000):`erix`(1000) | `0770`（组可写，无 setgid） | agentd(1001) 与 worker(1002) **都写** spool（runner §7.5），故需组写；新建 `.jsonl` 的 GID 来自写入进程主组（恒 1000），不需要 setgid |
+| `.cache/station/spool/`（事件 spool，**尚未实现**） | `erix`(1000):`erix`(1000) | 口径随创建者，**先不给数字** | spool 目前不落盘（runner README §7.5 待定项），全仓无创建该目录的代码 ⇒ 无法指到实测。将来落盘时按成因 (a) 判：**portal 建 ⇒ `0770`**（属组交出后被清）；**agentd/worker 建 ⇒ `2770` 会真落下**（其主组 1000 == egid，`chmod` 清不掉）。需要组写的结论不变（agentd 与 worker 都写） |
 | **平台文件**（`config.json`/`mcp.json`/`ports.json`/`AGENTS.md`/`.gitignore`） | root:root | `0644` | 容器内 1000/1001/1002 可读、不可写（防误改；FDE 有 root 可绕过，§4.1 已声明） |
 | `manifest.json` | root:root | `0444` | 更强只读（内容无敏感，但改它即破坏一致性校验，故只读） |
 | `~/.git-credentials` | FDE UID:GID（默认 `1000:1000`） | `0640` | Git credential-store；owner 1000 与同组 agentd/worker（1001/1002）可读，其他用户不可读；不由 materializer 管理 |
@@ -374,7 +375,7 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 
 #### 为什么是 `0770` 而不是 `2770`（issue #273，2026-10-24 定稿）
 
-**现状（实测，不是推测）**：工作区目录落盘 `0770`，属主 `erix`(1000):`erix`(1000)。`portal/src/{fsutil,provisioner,materializer,sessions}.js` 传的一直是 `0o2770`，但 setgid 位落不下来，且**将来也不会**落下来。
+**现状（实测，不是推测）**：portal 每轮 reconcile 的工作区目录落盘 `0770`，属主 `erix`(1000):`erix`(1000)；**只创建一次的目录（`projects/<p>/`）实测停在 `2770`**（首轮遗留）。`portal/src/{fsutil,provisioner,materializer,sessions}.js` 传的一直是 `0o2770`，但 setgid 位在 reconcile 循环里**将来也不会**留下来（成因见 (a)）——注意这句只描述 **portal 侧反复 chmod 的目录**，不等于全树一致，见上表的「混的」那行。
 
 **(a) 根因：不是 `chown` 清掉的，是 `chmod` 在缺 `CAP_FSETID` 时被内核静默清掉的**
 
@@ -392,6 +393,9 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 2. **组写位对 agentd/worker 生效，靠的也不是 setgid**：`umask 0002` 下以 1001/1002 身份实测得 `f=664`、`d=775`、gid 1000；能写进 `0770` 目录靠的是「目录属组 1000 + 组写位」，而属组是 portal 显式 `chown` 出来的、子项属组是主组继承来的。**全程没有 setgid 参与。**
 3. **portal 侧不靠组**：portal 是 root + `CAP_DAC_OVERRIDE`（`CapEff=0xcb` 含 bit1/bit3），FDE 进程是**属主**身份读写自己的目录。组既不是 portal 的通道，也不是 FDE 的通道。
 4. **补 `CAP_FSETID` 只改一个看不见的数字**：多一项 capability（违背最小权限），换来界面上、`stat` 的 group 归属上、任何访问判定上都**完全一样**的结果；还会造出「有没有那个 cap 部署行为不同」的隐性差异。
+5. ⚠ **以上四条成立有一个前提，它是会被人不小心破坏的**：**所有 FDE 属主写点都必须同时传 `uid` 与 `gid`（=1000）**。`fsutil.ensureDirSafe` 的 `gid` 默认是 `null`、`chownSync(dir, uid ?? -1, gid ?? -1)` 会把它当「不改」，所以任何**只传 uid** 的新调用点都会在目录里留下 `gid=0`（root 组）的文件——那时 setgid 就**真的开始承重**，本节「别补 `CAP_FSETID`」的结论随之失效。逐调用点核对结果（2026-10-24）：`materializer.js:234`、`provisioner.js:236`、`sessions.js:232`、`git-credential.js:324/358`、`git-cli-config.js:75-78` 全部同时传 uid+gid；只有**平台文件**（`materializer.js:272/293`）不 chown，落 `root:root 0644/0444`（全员可读，无访问依赖）。
+
+> 部署面同源代码：`deploy/docker-compose.yml` 里 proxy 的 `DAC_OVERRIDE` 注释仍写「穿越 **2770** 用户空间目录」，是同一处历史口径（本单红线不动 compose），随下次 compose 变更一起同步成 `0770`。
 
 **(c) 将来真要「组协作」要动的是 umask / 组成员，不是 setgid**
 
@@ -494,7 +498,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 - **portal（materializer）创建空目录 + 平台文件**，**agent 代劳 clone 仓库内容**；FDE 先经 portal 投放 Git HTTPS 凭据（#110，§4.1.1），两者分工不重叠。
 - 时序（建项目，`POST /api/projects`）：
   1. DB 事务写 `projects` + `port_allocations` + route outbox（portal.md §3.3）。
-  2. materializer 在宿主创建 `projects/<project>/`（`chown 1000:1000`、`chmod 2770`——代码意图，落盘 `0770`，见 §6.2「为什么是 0770 而不是 2770」）→ 写 `.gitignore`（含 `.erix/`）→ 写 `.erix/ports.json`、`.erix/AGENTS.md` → 更新 `manifest.json`。
+  2. `sessions.js` `createSession` 在宿主创建 `projects/<project>/`（`chown 1000:1000`、`chmod 0o2770`；**单次调用 ⇒ 实测落 `2770`**，同项目再建一个 session 才会被清成 `0770`，见 §6.2 表「混的」那行）。⚠ 早先这里写的是「materializer 创建并写 `.gitignore` / `.erix/ports.json` / `.erix/AGENTS.md`」——**P5 已整体退役**（`materializer.js` `buildFilePlan` 注释明写），materializer 只产 `home/AGENTS.md` 与 `home/.erix/{config,mcp,ports}.json`，不建项目目录。
   3. FDE 经 portal 投放 Git HTTPS 凭据（#110，写入 `home/.git-credentials`），由 agent 在项目目录代劳 clone。平台不下发 SSH key（SSH 私钥强制 `0600` 与组可读 `0640` 冲突）。
 
 ### 9.2 用户 clone 覆盖平台文件怎么办

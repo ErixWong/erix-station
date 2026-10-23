@@ -77,3 +77,27 @@ test('#273 文档口径：全仓 docs 里残留的 2770 必须处在「说真话
   assert.deepEqual(offenders, [],
     `docs 里仍有把 2770 当承诺的地方（#273：口径是 0770，2770 只是历史遗留的代码意图值）：\n${offenders.join('\n')}`);
 });
+
+// 评审 #273（review273 finding 1，blocker）：改口时曾把「混的」写成「一致 0770」——那是一条新假话。
+// 真机实测（2026-10-24，dev 栈 /srv/erix/users）：`eric/projects/probe-343`、`blind/projects/r1-app`、
+// `tetris/projects/tetris-arena` = **2770**；同树 `eric/projects/probe-261014` = 770；遗留 `home/worktrees` = 2755。
+// 机制在成因 (a) 第 2 步：只创建一次的目录首轮属组仍 == 进程 egid 0 ⇒ setgid 落得下，且没人再来清它。
+// 所以口径不是「全树 0770」，而是「portal 反复 reconcile 的目录 0770 + 只建一次的目录 2770，混着」。
+test('#273 文档口径：§6.2 必须承认 setgid 状态在同一棵树里是混的（不许写回“一致 0770”）', () => {
+  const sec = section62(fs.readFileSync(USER_SPACE, 'utf8'));
+  const mixed = sec.split('\n').filter((l) => l.startsWith('|') && /projects\/<p>/.test(l));
+  assert.equal(mixed.length, 1,
+    `§6.2 必须单独一行描述「只创建一次的 projects/<p>/」（实测 2770），实得 ${mixed.length} 行`);
+  // 判据必须落在**模式列**上（第 3 格），不能整行扫：同一行的说明列本来就会引用真机值 2770，
+  // 整行扫会让「把模式抹平成 0770」这条变异假绿（主 agent 第一次写这条时就这么错，已用变异抓回）。
+  const cells = mixed[0].split('|').map((c) => c.trim());
+  const modeCell = cells[3] ?? '';
+  assert.match(modeCell, /2770/,
+    `projects/<p> 那行的**模式列**必须写实测值 2770，不许并入 0770 那行（review273 finding 1）：${modeCell}`);
+  assert.doesNotMatch(modeCell, /^\*\*?`?0770`?/,
+    `projects/<p> 的模式列不许写成 0770（那是反复 reconcile 的目录，不是一次性创建的）：${modeCell}`);
+  assert.match(mixed[0], /混的|混着/,
+    `projects/<p> 那行必须明说同一棵树里 setgid 位是混的，防止下一个人拿它当一致状态：${mixed[0]}`);
+  assert.match(sec, /继承[^\n]*setgid|setgid[^\n]*继承/,
+    '§6.2 必须解释 2755/2775 这类形态的来源（在 2770 父目录里新建会继承 setgid），否则运维看到 2755 会再开一张单');
+});
