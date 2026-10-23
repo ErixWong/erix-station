@@ -5,11 +5,17 @@
 //      🔍 浏览会话（issue #94 入口；Ctrl/⌘+K 同语义）——不随列表滚动
 //   ② 会话列表段：flex-1 min-h-0 overflow-y-auto，独立内部滚动（空态文案「先创建目录」/
 //      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树
-//   ③ 目录树面板（DirectoryTree，默认收起，懒展开）：固定底部，任意会话数下恒可达
+//   ③ 底部堆叠区（issue #308）：**一个**滚动容器（shrink-0 max-h-[50vh] overflow-y-auto）里装
+//      「预览端口段 + 目录树面板」，两段**各自一个折叠开关**（都默认折叠、不持久化、不共用总开关）。
+//      高度/滚动预算只留这一层：树与端口面板都不再自带 overflow/max-h，否则三层滚动会抢滚轮。
+//      底部栈恒在列表之下 ⇒ 任意会话数下端口段与目录树恒可达，而列表仍然独立可滚。
 // issue #94（评审裁决瘦身版）：SessionPickerModal（单次全量浏览）挂在本组件与 WorkbenchView。
 // 移动端抽屉（≤768px）由父级 WorkbenchView 以 Tailwind max-md: 变体实现（旧 offcanvas 桥接的等价），
 // 三段结构在抽屉内同样成立（aside 高度由 max-md:inset-y-0 撑满，h-full 生效）。
-import { nextTick, ref } from 'vue';
+//
+// issue #308 的几何测试钩子（名字照工单 §五.7，不得自创）：
+//   data-test="sidebar-aside"（根）/ "sidebar-session-list"（列表段）/ "sidebar-bottom-stack"（底部栈）。
+import { computed, nextTick, onMounted, ref } from 'vue';
 import type { ComponentPublicInstance } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useAuthStore } from '../stores/auth';
@@ -20,7 +26,9 @@ import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
 import FilePreviewModal from './FilePreviewModal.vue';
 import NewDirectoryModal from './NewDirectoryModal.vue';
+import PreviewPortsPanel from './PreviewPortsPanel.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
+import { usePreviewPorts } from '../composables/usePreviewPorts';
 
 // issue #101 P2：用户可见文案走 i18n（sidebar.* / common.*；代码注释保持中文原文）。
 const { t } = useI18n();
@@ -32,11 +40,30 @@ const emit = defineEmits<{
 }>();
 
 // ---- ↻ 单按钮双刷：/api/dirs（store.refreshDirs）+ 目录树（组件 reload → 全折叠重载根层）----
+// issue #308 §四：↻ 语义**不动**——它继续只刷「目录列表 + 目录树」，**不**扩到刷新预览端口
+// （端口段有自己的「重试」按钮；且 usePreviewPorts.load() 没有 in-flight 守卫，扩功能要先自己加并发闸门，本单不做）。
 const treeRef = ref<InstanceType<typeof DirectoryTree> | null>(null);
 function onRefresh() {
   void store.refreshDirs().catch(() => { /* loadDirs 失败静默：下拉保留旧数据，下次刷新重试 */ });
   treeRef.value?.reload();
 }
+
+// ---- issue #308：预览端口段（从工作台顶栏搬进侧栏底部，与目录树各自独立折叠）----
+// 语义逐字保持 #246：进视图就拉一次 GET /api/me/ports（折叠也拉，aside 在移动端是「类隐藏」不是 v-if）；
+// 但**预览 ticket 绝不预取**——60 秒过期且一次性，预取等于把它用废（点击当场才签，见 usePreviewPorts.openPreview）。
+// 折叠态是纯本地 ref，**不持久化**（不写 localStorage、不发后端），刷新后回到折叠。
+const ports = usePreviewPorts();
+const portsOpen = ref(false);
+const portCount = computed(() => ports.items.value.length);
+const portsToggleLabel = computed(() => {
+  if (ports.listError.value !== null) return t('previewPorts.toggleFailed');
+  return portCount.value > 0
+    ? t('previewPorts.toggleCount', { count: portCount.value })
+    : t('previewPorts.toggle');
+});
+
+// load() 自带 try/catch/finally（失败落 listError），不会产生未捕获拒绝（AGENTS §4 / #281）。
+onMounted(() => { void ports.load(); });
 
 // ---- issue #84 P6：目录树文件点击 → 文件预览 modal（cwd 上下文 = store.dirCwd）----
 const previewTarget = ref<{ cwd: string; path: string } | null>(null);
@@ -155,8 +182,8 @@ function messageCountSuffix(s: Session): string {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col">
-    <!-- issue #92：aside 内 flex-col 三段（固定头 / 列表独立滚 / 树固定底）；h-full 铺满 aside 高 -->
+  <div data-test="sidebar-aside" class="flex h-full min-h-0 flex-col">
+    <!-- issue #92：aside 内 flex-col 三段（固定头 / 列表独立滚 / 底部栈）；h-full 铺满 aside 高 -->
     <!-- ⚠️ 根级不放注释：注释+元素会被 Vue 3 编成多根 fragment（禁用属性透传，也破坏单根断言） -->
     <!-- ① 固定头：不随会话列表滚动 -->
     <div class="shrink-0">
@@ -192,7 +219,8 @@ function messageCountSuffix(s: Session): string {
     </div>
 
     <!-- ② 会话列表段（该目录）：flex-1 min-h-0 + 独立内部滚动；空态文案也放这里（issue #92） -->
-    <div class="mt-2 min-h-0 flex-1 overflow-y-auto">
+    <!-- issue #308：data-test="sidebar-session-list" 是几何判据的稳定钩子（列表可视高度/独立可滚） -->
+    <div data-test="sidebar-session-list" class="mt-2 min-h-0 flex-1 overflow-y-auto">
       <!-- issue #112：空态文案 11px / text-dim / padding 8px 10px（对齐 pi-web 空态规格） -->
       <!-- issue #332：这里原有 `v-if="store.isPlatformAdmin"` 分支（「平台管理员：请到管理台…」+「进入管理台」
            链接）已删——无工位的平台管理员被路由守卫挡在管理台，该分支在工作台上不可达。 -->
@@ -313,10 +341,47 @@ function messageCountSuffix(s: Session): string {
       </div>
     </div>
 
-    <!-- ③ 目录树面板（默认收起，懒展开；文件点击 → P6 预览 modal）：固定底部恒可达 -->
-    <!-- shrink-0 经属性透传合并到 DirectoryTree 根元素，树展开再多条目也不缩列表段为负；
-         max-h-[40vh] + overflow-y-auto：树面板自身限高内部滚动，不无限侵占侧栏高度（issue #92） -->
-    <DirectoryTree ref="treeRef" class="shrink-0 max-h-[40vh] overflow-y-auto" :cwd="store.dirCwd" @file-click="onFileClick" />
+    <!-- ③ 底部堆叠区（issue #308）：**唯一**的底部滚动容器——端口段 + 目录树都在里面，
+         两段各自折叠；max-h-[50vh] 是高度预算（1280×768 下：aside 内容高 ≈706px − 固定头 76/116px
+         − 列表 mt-2 8px − 栈上限 384px ⇒ 列表仍有 ≈238/198px ≥ 120px 判据），overflow-y-auto 只这一层。
+         子层（端口面板 / 目录树）一律不再自带 max-h/overflow ⇒ 不会出现嵌套滚动条抢滚轮。 -->
+    <div data-test="sidebar-bottom-stack" class="mt-2 shrink-0 max-h-[50vh] overflow-y-auto">
+      <!-- ③-a 预览端口段（issue #308：从工作台顶栏搬入；默认折叠，与目录树各自独立开关） -->
+      <div class="mt-1 border-t border-black/10 pt-2">
+        <button
+          type="button"
+          data-test="preview-ports-toggle"
+          class="flex w-full items-center gap-1.5 rounded px-1 py-[3px] text-left text-[11px] font-semibold tracking-[0.05em] hover:bg-black/5"
+          :aria-expanded="portsOpen"
+          aria-controls="preview-ports-disclosure"
+          @click="portsOpen = !portsOpen"
+        >
+          <span aria-hidden="true">{{ portsOpen ? '▾' : '▸' }}</span>
+          <span>{{ portsToggleLabel }}</span>
+        </button>
+        <!-- v-show（非 v-if）：面板常驻 DOM（#246 语义：折叠只是不占位）；票仍然只在点击时签 -->
+        <div v-show="portsOpen" id="preview-ports-disclosure" class="mt-1 min-w-0">
+          <p class="px-1 pb-1 text-[11px] leading-[1.5] text-black/50">{{ t('previewPorts.scopeHint') }}</p>
+          <PreviewPortsPanel
+            variant="list"
+            :items="ports.items.value"
+            :loading="ports.loading.value"
+            :loaded="ports.loaded.value"
+            :error="ports.listError.value"
+            :ticket-busy-id="ports.ticketBusyId.value"
+            :ticket-error="ports.ticketError.value"
+            :popup-blocked-url="ports.popupBlockedUrl.value"
+            @retry="ports.load()"
+            @open="(item) => void ports.openPreview(item)"
+          />
+        </div>
+      </div>
+
+      <!-- ③-b 目录树面板（默认收起，懒展开；文件点击 → P6 预览 modal）：与端口段同栈、恒在最后 -->
+      <!-- issue #308：树自己那层 max-h-[40vh] overflow-y-auto 已撤（滚动预算只留底部栈一层），
+           shrink-0 / mt-3 / border-t 的分隔与「不缩列表」语义保留。 -->
+      <DirectoryTree ref="treeRef" class="shrink-0" :cwd="store.dirCwd" @file-click="onFileClick" />
+    </div>
 
     <!-- issue #84 P6：文件预览 modal（v-if 挂载：打开才发 /api/file，关闭即卸载归还焦点） -->
     <FilePreviewModal

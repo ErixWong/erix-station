@@ -302,7 +302,8 @@ export const en = {
   previewPorts: {
     title: 'Preview ports',
     adminTitle: 'Preview ports of {fde}',
-    // workbench disclosure bar (collapsed state must still convey something useful)
+    // workbench disclosure bar (issue #308: now at the bottom of the left sidebar, an independent
+    // toggle next to the directory tree; the collapsed state must still convey something useful)
     toggle: 'Preview ports',
     toggleCount: 'Preview ports ({count})',
     toggleFailed: 'Preview ports (failed to load)',
@@ -321,6 +322,15 @@ export const en = {
       active: 'Admitted once (first admission only)',
     },
     stateUnknown: 'Unknown state ({state})',
+    // issue #308: short labels for the compact sidebar variant (variant='list', ~163px wide);
+    // the full wording stays in state.* and is reachable via the same element's title/aria-label.
+    stateShort: {
+      allocated: 'Not opened',
+      active: 'Admitted',
+    },
+    stateShortUnknown: 'Unknown',
+    // issue #308 §3.4: the sidebar sections are cwd-scoped, ports belong to the workstation
+    scopeHint: 'Preview ports of this workstation (independent of the selected directory).',
     stateHint: '“Admitted once” only means the first credential was admitted; it does not mean an app is listening in the container.',
     emptySelf: 'You have no preview ports yet (the platform has not assigned a block, or all of them were released).',
     emptyFde: 'This FDE has no live preview ports (not onboarded yet, or already offboarded).',

@@ -45,7 +45,10 @@ function onChange(e: Event) {
         {{ d.name }}<template v-if="badge(d) > 0"> ●{{ badge(d) }}</template>
       </option>
       <!-- issue #332：原 `:disabled="store.newDirDisabled"`（平台管理员专用）已随入口拦截拆除——
-           没有工位的平台管理员进不到工作台，这里对「有工位的人」恒可用（服务端仍有 403 写闸）。 -->
+           没有工位的平台管理员进不到工作台，这里对「有工位的人」恒可用。
+           服务端仍有写闸（**2026-10-21 更正**：原先这里写「403」，与代码不符）：无 fde_name 的账号
+           POST /api/sessions 返 400 `validation_failed` + `details.field='fde_name'`
+           （portal/src/sessions.js:214-222，portal/test/sessions-cwd.test.js:99 钉着）。 -->
       <option value="__new__">{{ t('sidebar.newDirOption') }}</option>
     </select>
     <!-- ↻ 单按钮双刷：store.refreshDirs()（/api/dirs）+ DirectoryTree.reload()（目录树），SidebarPanel 组装 -->
