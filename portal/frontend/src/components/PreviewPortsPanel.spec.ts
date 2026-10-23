@@ -291,3 +291,91 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
     expect(wrapper.get('[data-test="preview-port-copied"]').text()).toContain('预览地址已复制');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #247 / #286：「打开全部预览」动作 + 面向人的 Cookie 告知 + 批量拦截兜底。
+// 判据：① 动作按钮双语成对、只在有行且允许时渲染、点击只 emit（面板不碰网络）；
+// ② 批量拦截兜底是**可点链接列表**（N 个 href 都带票，不静默）；
+// ③ 批量错误显示错误码 + 服务端原文；④ Cookie 告知双语成对、说的是「by design」不是 bug。
+// ---------------------------------------------------------------------------
+describe('PreviewPortsPanel · 一键开整组（#247）与 Cookie 告知（#286）', () => {
+  it('「打开全部预览」渲染且只 emit open-all（面板自己不碰网络）', async () => {
+    const onOpenAll = vi.fn();
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    wrapper = mountPanel({ onOpenAll });
+    const button = wrapper.get('[data-test="preview-open-all"]');
+    expect(button.text()).toBe('打开全部预览');
+    await button.trigger('click');
+    expect(onOpenAll).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('列表为空或管理台代看形态（showOpenAll=false）⇒ 不渲染该动作', () => {
+    wrapper = mountPanel({ items: [] });
+    expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
+    wrapper.unmount();
+
+    wrapper = mountPanel({ showOpenAll: false });
+    expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
+  });
+
+  it('批量签发中：按钮换成「批量签发中…」并禁用（防连点签两批）', () => {
+    wrapper = mountPanel({ batchBusy: true });
+    const button = wrapper.get('[data-test="preview-open-all"]');
+    expect(button.text()).toBe('批量签发中…');
+    expect((button.element as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('弹窗拦截兜底：每个被拦的地址都给一个可点链接（href 带票，target=_blank/rel=noopener）', () => {
+    wrapper = mountPanel({
+      batchBlockedUrls: [
+        'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_B',
+        'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_C',
+      ],
+    });
+    const block = wrapper.get('[data-test="preview-batch-blocked"]');
+    expect(block.attributes('role')).toBe('status');
+    expect(block.text()).toContain('浏览器拦截了部分新标签');
+    const links = wrapper.findAll('[data-test="preview-batch-fallback-link"]');
+    expect(links).toHaveLength(2);
+    expect(links.map((link) => link.attributes('href'))).toEqual([
+      'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_B',
+      'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_C',
+    ]);
+    expect(links.map((link) => link.text())).toEqual([
+      'alice-p-22001.fde.erix.vip:8090',
+      'alice-p-22002.fde.erix.vip:8090',
+    ]);
+    for (const link of links) {
+      expect(link.attributes('target')).toBe('_blank');
+      expect(link.attributes('rel')).toBe('noopener');
+    }
+  });
+
+  it('批量失败：错误码 + 服务端原文（不吞成「操作失败」）', () => {
+    wrapper = mountPanel({
+      batchError: { status: 400, code: 'validation_failed', message: '一次最多签发 10 张预览票', field: 'allocation_ids' },
+    });
+    expect(wrapper.get('[data-test="preview-batch-error"]').text())
+      .toBe('批量签发预览通行票失败（validation_failed）：一次最多签发 10 张预览票');
+  });
+
+  it('#286 Cookie 告知：双语成对、说的是「边缘剥 Cookie / 用 Authorization / 不是故障」', async () => {
+    wrapper = mountPanel();
+    const notice = wrapper.get('[data-test="preview-cookie-notice"]').text();
+    expect(notice).toContain('Cookie');
+    expect(notice).toContain('Authorization');
+    expect(notice).toContain('不是故障');
+    expect(notice).not.toMatch(/bug|缺陷/i);
+
+    setLocale('en');
+    await wrapper.vm.$nextTick();
+    const english = wrapper.get('[data-test="preview-cookie-notice"]').text();
+    expect(english).toContain('Cookie');
+    expect(english).toContain('Authorization');
+    expect(english).toMatch(/by design, not a bug/);
+    expect(english).not.toMatch(/[\u4e00-\u9fff]/);
+    setLocale('zh-CN');
+  });
+});

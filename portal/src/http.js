@@ -621,6 +621,12 @@ function decodeUuid(raw) {
   return decodeURIComponent(raw).toLowerCase();
 }
 
+/**
+ * 标准 UUID 的字符形状（小写、带连字符）。用于**请求体里的** id 数组（路径参数另有各自的解码路径）：
+ * 必须先判形状再交给 `= ANY($1::uuid[])`——畸形串会让 PG 直接 22P02（500），而这是客户端输入。
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 function decodeAdminUserUuid(raw) {
   let id;
   try {
@@ -841,6 +847,11 @@ async function routeApi(req, res, ctx, url) {
   // 「没有任何列端口的 API」⇒ 签票端点要的 allocation UUID 人看不见。本端点就是那条路（单 B 面板用它）。
   if (pathname === '/api/me/ports' && req.method === 'GET') {
     return handleListMyPorts(req, res, ctx);
+  }
+  // #247 一键放行整组：一次请求签 N 张预览票（portal.md §4.7a）。命名取 kebab-case，
+  // 与同族的 `/api/me/ports`、`/api/ports/:id/preview-ticket`、`/api/admin/fdes/:fdeName/ports/block` 一致。
+  if (pathname === '/api/me/ports/batch-tickets' && req.method === 'POST') {
+    return handleBatchPreviewTickets(req, res, ctx);
   }
   // 预览 ticket 签发（portal.md §2.8）。
   const portTicketMatch = pathname.match(/^\/api\/ports\/([^/]+)\/preview-ticket$/);
@@ -2288,6 +2299,156 @@ async function handlePreviewTicket(req, res, ctx, portId) {
   // 记录本次成功签发（作为限流计数），防单用户短时刷 ticket。
   ctx.previewTicketLimiter.recordFailure(rlKey);
   return sendJson(res, 201, result);
+}
+
+/**
+ * `POST /api/me/ports/batch-tickets`（issue #247 一键放行整组；portal.md §4.7a）。
+ *
+ * 语义：给**当前用户自己**的 FDE 一次请求签 N 张预览票（#247 的真痛点：票是 host 级，
+ * 前后端分离应用要点两次「打开预览」）。请求体 `{ allocation_ids?: string[] }`；
+ * 不给 ⇒ 该 FDE **全部活行**（`state <> 'released'`，含 `scope='project'` 遗留行），按 `port ASC`。
+ *
+ * 三条实现纪律（评审口径）：
+ *  ① **复用** `preview.issuePreviewTicket`（幂等/哈希/过期/审计口径只有一份；本文件不复制签发逻辑，
+ *     `preview.js` 的 `issuePreviewTicket` 本体一字未改）；
+ *  ② **上限 = `PREVIEW_PORT_COUNT`**（与号池块大小同源，不写死数字）；超出 ⇒ `400 validation_failed`
+ *     + `details.field='allocation_ids'`（**零新错误码**）；
+ *  ③ 越界（别人的 / 不存在的 / 已 released 的 allocation）⇒ 复用 `404 not_found`（与单据端点同码，
+ *     **不泄露「存在但不属于你」**——三种情况回同一个响应）。
+ *
+ * **为什么不开一个大事务**：每张票是一次独立 INSERT，读者（forwardAuth）逐张独立消费，把 10 次独立
+ * 写包进一个事务并不能让它们对读者更原子，只会白占一条连接。取而代之的是「**先全量校验、再逐张签发**
+ * + 失败补偿」：预检（形状/归属/活行/上限）在任何签发之前完成，所以越界/超限这类可预期的失败
+ * **零写入**；只有签发途中的意外（并发下 allocation 被释放、DB 抖动）才可能留下已签的票，此时用一条
+ * `UPDATE preview_grants SET state='revoked'` 把本批已签的票全部收回再抛错 ⇒ 对外**要么全成、要么报错**
+ * （不返回半截 `items`），且已签的票不会在库里留下可用的残票。
+ *
+ * 审计：**逐张各写一行**（`auth.preview_ticket_issued`），形状照 §2.8 B3 的既有口径——
+ * `details` 只记 `grant_kind`/`allocation_id`/`port`/`token_hash_prefix`/`expires_at`，
+ * **绝不入 ticket 明文，也绝不入 `url`**（`url` 里就带着 `?preview_ticket=`；见 `pathOnly` 那条纪律）。
+ * ⚠ 单据端点 `POST /api/ports/:id/preview-ticket` 目前**零审计**（源码实证），所以「照抄单据端点的
+ * action」无处可抄；本端点按 §2.8 文档口径补上逐行审计，单据端点保持原样（不在本单范围内改它）。
+ */
+async function handleBatchPreviewTickets(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const rawIds = body?.allocation_ids;
+
+  // ① 形状校验（零 SQL）：可选字段；给了就必须是非空、无重复、合法的 UUID 字符串数组，且不超过上限。
+  //    `details.field` 恒为 `allocation_ids`（前端按 field 定位输入，不解析文案）。
+  const invalid = (message) => new HttpError(400, 'validation_failed', message, { details: { field: 'allocation_ids' } });
+  let requestedIds = null;
+  if (rawIds !== undefined && rawIds !== null) {
+    if (!Array.isArray(rawIds)) throw invalid('allocation_ids 必须是字符串数组');
+    if (rawIds.length === 0) throw invalid('allocation_ids 不能为空数组（不传该字段表示「本 FDE 全部活行」）');
+    if (rawIds.length > PREVIEW_PORT_COUNT) {
+      throw invalid(`一次最多签发 ${PREVIEW_PORT_COUNT} 张预览票（收到 ${rawIds.length} 个 allocation_ids）`);
+    }
+    requestedIds = rawIds.map((raw) => {
+      if (typeof raw !== 'string' || !UUID_RE.test(raw.toLowerCase())) throw invalid('allocation_ids 的每一项都必须是 allocation UUID');
+      return raw.toLowerCase();
+    });
+    if (new Set(requestedIds).size !== requestedIds.length) throw invalid('allocation_ids 不允许重复（同一行签两张票只会浪费一张）');
+  }
+
+  // ② 解析目标行（一次 SELECT，**零签发**）：显式 id 走归属校验；不给则取本 FDE 全部活行（port ASC）。
+  //    归属判据 = `fde_id === 本人`：admin 代签他人是单据端点的能力，批量端点只服务「一键放行我自己的整组」。
+  let targets;
+  if (requestedIds) {
+    const r = await ctx.pool.query(
+      `SELECT id, fde_id, state, port, hostname FROM port_allocations WHERE id = ANY($1::uuid[])`,
+      [requestedIds],
+    );
+    const byId = new Map((r.rows ?? []).map((row) => [String(row.id).toLowerCase(), row]));
+    const rejected = requestedIds.some((id) => {
+      const row = byId.get(id);
+      return !row || row.fde_id !== session.user.id || row.state === 'released';
+    });
+    if (rejected) {
+      // 不区分「不存在 / 已释放 / 别人的」：三种都回同一句（否则就成了存在性探针）。
+      throw new HttpError(404, 'not_found', 'not found');
+    }
+    targets = requestedIds.map((id) => byId.get(id));
+  } else {
+    targets = await portalloc.listFdePreviewPorts(ctx.pool, { fdeId: session.user.id });
+    if (targets.length > PREVIEW_PORT_COUNT) {
+      // 平台不变式是一块 = `PREVIEW_PORT_COUNT` 行；活行超上限（历史遗留）只能显式分批签。
+      throw invalid(`本 FDE 的活行有 ${targets.length} 条，超过一次上限 ${PREVIEW_PORT_COUNT}：请显式传 allocation_ids 分批签`);
+    }
+  }
+  // 没有可签的行（admin 无 FDE / 尚未分段）：201 + 空列表（与 GET /api/me/ports 的「空列表不是 404」同口径），
+  // 零签发、零审计、零限流计数。
+  if (targets.length === 0) return sendJson(res, 201, { items: [] });
+
+  // ③ 限流：先查一次，再**逐张各记一次**（一次点击 = N 张票，放大倍数必须计入配额，否则批量端点
+  //    会把 20/60s 的限额放大 10 倍）。
+  const ip = req.socket.remoteAddress || 'unknown';
+  const rlKey = `ticket:${session.user.id}:${ip}`;
+  const check = ctx.previewTicketLimiter.check(rlKey);
+  if (!check.allowed) {
+    throw new HttpError(429, 'rate_limited', '预览 ticket 签发过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(check.retryAfterSeconds) },
+    });
+  }
+
+  // ④ 逐张签发（同一 `now` ⇒ 整批同一个 expires_at，响应里不用为每张票各算一次 TTL）。
+  const now = new Date();
+  const ua = req.headers['user-agent'] ?? null;
+  const issued = [];
+  try {
+    for (const target of targets) {
+      const result = await preview.issuePreviewTicket(ctx.pool, ctx.config, {
+        allocationId: target.id, session, ip, ua, now,
+      });
+      if (result.error) {
+        const { status, code } = result.error;
+        throw new HttpError(status, code, code === 'not_found' ? 'not found' : code);
+      }
+      ctx.previewTicketLimiter.recordFailure(rlKey);
+      issued.push({ target, result });
+    }
+  } catch (err) {
+    // 失败补偿：本批已签的票一律收回（`state='active'` 才动；`revoked ⇔ revoked_at` 靠 COALESCE 满足）。
+    // 目的：不把「半截可用的票」留在库里——它们 60 秒内仍可换预览 cookie，等于悄悄放行了半个面板。
+    if (issued.length > 0) {
+      const hashes = issued.map(({ result }) => auth.hashToken(result.ticket));
+      await ctx.pool.query(
+        `UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+          WHERE token_hash = ANY($1::text[]) AND kind = 'ticket' AND state = 'active'`,
+        [hashes],
+      ).catch(() => {});
+    }
+    throw err;
+  }
+
+  // ⑤ 审计逐张各一行（不写 url —— 它带票）。
+  const expiresAt = new Date(now.getTime() + ctx.config.previewTicketTtlSeconds * 1000).toISOString();
+  for (const { target, result } of issued) {
+    await auth.audit(ctx.pool, {
+      actorId: session.user.id,
+      action: 'auth.preview_ticket_issued',
+      target: target.hostname ?? '',
+      details: {
+        grant_kind: 'ticket',
+        allocation_id: target.id,
+        port: Number(target.port),
+        token_hash_prefix: auth.hashToken(result.ticket).slice(0, 12),
+        expires_at: expiresAt,
+      },
+    }).catch(() => {});
+  }
+
+  return sendJson(res, 201, {
+    items: issued.map(({ target, result }) => ({
+      id: target.id,
+      port: Number(target.port),
+      url: result.url,
+      ticket: result.ticket,
+      expires_at: expiresAt,
+    })),
+  });
 }
 
 /**

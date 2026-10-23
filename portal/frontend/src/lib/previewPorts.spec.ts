@@ -9,6 +9,7 @@ import {
   adminFdePortsBlockPath,
   adminFdePortsPath,
   asPreviewPortState,
+  batchTicketsPath,
   currentBlockRange,
   formatBlockRange,
   isAlignedBlockStart,
@@ -47,6 +48,10 @@ describe('端点路径（portal.md §4.7a / §2.8）', () => {
     expect(adminFdePortsBlockPath('a b/c')).toBe('/api/admin/fdes/a%20b%2Fc/ports/block');
   });
 
+  it('#247 批量签票端点逐字对齐文档（路径里不带 allocation id）', () => {
+    expect(batchTicketsPath).toBe('/api/me/ports/batch-tickets');
+  });
+
   it('签票端点的路径参数是 allocation UUID，不是端口号', () => {
     const item = portItem();
     expect(previewTicketPath(item.id)).toBe(`/api/ports/${item.id}/preview-ticket`);
@@ -72,6 +77,18 @@ describe('previewTargetUrl：ticket 只出现一次', () => {
       expires_in: 60,
     });
     expect(url).toBe('http://alice-p-22000.fde.erix.vip:8090?preview_ticket=pt_abc');
+  });
+
+  it('#247 批量响应的单项（url/ticket/expires_at）与单据响应共用同一拼法', () => {
+    const url = previewTargetUrl({
+      id: '7b0a1f2e-9c3d-4e5f-8a6b-1c2d3e4f5a6b',
+      port: 22001,
+      url: 'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_batch',
+      ticket: 'pt_batch',
+      expires_at: '2026-10-23T12:01:00.000Z',
+    });
+    expect(url).toBe('http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_batch');
+    expect(url.match(/preview_ticket=/g)).toHaveLength(1);
   });
 
   it('已带别的查询参数时用 & 拼接；ticket 做 URL 编码', () => {

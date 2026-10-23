@@ -25,6 +25,26 @@ export interface PreviewTicketResponse {
   expires_in: number;
 }
 
+/**
+ * `POST /api/me/ports/batch-tickets` 的单项（§4.7a，#247 一键放行整组）。
+ * 字段形态与单据端点对齐（`url` 已带票），另加 `id`/`port`/`expires_at`：
+ * `id` 让前端能把票对回列表行（服务端保证顺序与请求一致，但按 id 对账更稳）。
+ */
+export interface PreviewBatchTicketItem {
+  id: string;
+  port: number;
+  /** 已带 `?preview_ticket=` 的完整地址（同 §2.8，前端不得自行拼接）。 */
+  url: string;
+  ticket: string;
+  /** 整批共用一个 ISO 时间戳（= 签发时刻 + 票 TTL）。 */
+  expires_at: string;
+}
+
+/** `POST /api/me/ports/batch-tickets` 的 201 响应（信封同列表端点 `{items:[...]}`）。 */
+export interface PreviewBatchTicketsResponse {
+  items: PreviewBatchTicketItem[];
+}
+
 /** POST /api/admin/fdes/:fdeName/ports/block 的 200 响应（§4.7a）。 */
 export interface PreviewBlockMoveResult {
   changed: boolean;
@@ -85,11 +105,18 @@ export function previewTicketPath(allocationId: string): string {
 }
 
 /**
+ * 批量签票端点（#247）：**路径里不带 allocation id**，要签的行由请求体的 `allocation_ids` 给
+ * （不给就是「本 FDE 全部活行」）。一次最多 `PREVIEW_PORT_BLOCK_SIZE` 行（服务端判据）。
+ */
+export const batchTicketsPath = '/api/me/ports/batch-tickets';
+
+/**
  * 拼「新标签要打开的预览 URL」——**同一张票只出现一次**。
  * §2.8 的 `url` 已含 `?preview_ticket=`（文档明写「前端不得自行拼接」）⇒ 原样用；
  * 桩/旧形给裸 url 时补挂一次（带别的查询参数则用 `&`）。
+ * 入参只要求 `{url, ticket}` ⇒ 单据响应与批量响应的单项共用本函数（两条路的拼法只能有一份）。
  */
-export function previewTargetUrl(response: PreviewTicketResponse): string {
+export function previewTargetUrl(response: PreviewTicketResponse | PreviewBatchTicketItem): string {
   const url = typeof response.url === 'string' ? response.url : '';
   const ticket = typeof response.ticket === 'string' ? response.ticket : '';
   if (!ticket) return url;

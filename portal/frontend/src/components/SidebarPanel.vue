@@ -51,6 +51,7 @@ function onRefresh() {
 // ---- issue #308：预览端口段（从工作台顶栏搬进侧栏底部，与目录树各自独立折叠）----
 // 语义逐字保持 #246：进视图就拉一次 GET /api/me/ports（折叠也拉，aside 在移动端是「类隐藏」不是 v-if）；
 // 但**预览 ticket 绝不预取**——60 秒过期且一次性，预取等于把它用废（点击当场才签，见 usePreviewPorts.openPreview）。
+// #247 的批量签票同一条纪律：只在点「打开全部预览」时调 `openAllPreviews`（挂载不签、折叠不签）。
 // 折叠态是纯本地 ref，**不持久化**（不写 localStorage、不发后端），刷新后回到折叠。
 const ports = usePreviewPorts();
 const portsOpen = ref(false);
@@ -371,8 +372,12 @@ function messageCountSuffix(s: Session): string {
             :ticket-busy-id="ports.ticketBusyId.value"
             :ticket-error="ports.ticketError.value"
             :popup-blocked-url="ports.popupBlockedUrl.value"
+            :batch-busy="ports.batchBusy.value"
+            :batch-error="ports.batchError.value"
+            :batch-blocked-urls="ports.batchBlockedUrls.value"
             @retry="ports.load()"
             @open="(item) => void ports.openPreview(item)"
+            @open-all="() => void ports.openAllPreviews()"
           />
         </div>
       </div>
