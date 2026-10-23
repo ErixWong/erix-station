@@ -212,5 +212,7 @@ header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适�
 
 **非本文条目但同批推进的**：**#277**（停止无送达 / 停在 `queued` 的 run 卡死会话）**已关闭** —— v0.1.7 就发布了代码，缺的只是「run 停在队列里」的真机窗口，2026-10-23 在 v0.1.27 上造出来并逐项复验（`termination={"reason":"aborted","detail":"cancelled_before_start"}`、会话立即解锁 `202`）；顺带更正该单原判据措辞：出队是 `run_queue.status='cancelled'`，**不是物理删行**。见 issue 评论 `#issuecomment-6370402000`。
 
+**#236**（首次部署验收里的低优先项，3 条）**已关闭**（2026-10-24，PR #347，merge `135ddf6`）：第 1 条「终止文案看不见」= 双语标签 + 刷新后终态分隔条改为**从 `runs.termination` 投影**（`run_termination` 合成项，**没把 `run_end` 塞进历史白名单** —— 那是该单定的红线）；第 2 条「空 body 的 POST 强制 `Content-Type`」= 按请求是否可能带主体判定，`Content-Type` 只在真有主体时强制。真机：`curl -X POST …/stop` 无 body 无 CT 由 **400 → 200**（反面：带 body 不声明 CT 仍 400），重开 `aborted` 会话可见中性中文 `run 结束：aborted — 已中止`，`failed` 仍红色且带 `code=`，**硬刷新后条数不变（4→5→刷新仃 5）**。呈现上有一处改判需决策者过目：`aborted` 实时也从红色改中性（与历史同色）。**第 3 条拆到 #348**（每 run token/成本护栏 —— 需产品决策）。台账 `AGENTS.md` §8.47；**未发版**（v0.1.27 不含它）。
+
 > 试用环境口径也已过期：本机现跑 **v0.1.27**（不是 v0.1.5），伞域换成 `fde.erix.vip`，
 > 预览端口段从 `40XX` 换成全局号池 `22000–29999`（§8.13）。试用栈 `station.vc.cn-ai.vip` 目前不可达。
