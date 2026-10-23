@@ -203,3 +203,91 @@ describe('PreviewPortsPanel · 复制与兜底反馈', () => {
     setLocale('zh-CN');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #308：variant='list'（左侧栏紧凑形态，内容宽约 163px）。
+// 形态分叉只发生在行/表格模板上：状态口径、错误文案、空态、复制/签票语义仍只有一份
+// ⇒ 这里钉「短标签 + 完整口径在 title/aria-label」「行内宽度可收缩」「图标按钮的语义与禁用态」。
+// ---------------------------------------------------------------------------
+describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）', () => {
+  const listPanel = (overrides: Partial<Record<string, unknown>> = {}) =>
+    mountPanel({ variant: 'list', ...overrides });
+
+  it('渲染紧凑行而不是 4 列表格：端口 + 短状态（完整口径在 title/aria-label）+ 可截断 hostname', () => {
+    wrapper = listPanel();
+    expect(wrapper.find('[data-test="preview-ports-table"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="preview-ports-list"]').element.tagName.toLowerCase()).toBe('ul');
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows).toHaveLength(3);
+    expect(rows.map((row) => row.get('[data-test="preview-port-value"]').text()))
+      .toEqual(['22000', '22001', '22002']);
+    const states = rows.map((row) => row.get('[data-test="preview-port-state"]'));
+    expect(states.map((node) => node.text())).toEqual(['待首次访问', '已放行过', '已放行过']);
+    expect(states.map((node) => node.attributes('title')))
+      .toEqual(['已分配 · 待首次访问', '已放行过（仅表示首次放行过）', '已放行过（仅表示首次放行过）']);
+    expect(states.map((node) => node.attributes('aria-label')))
+      .toEqual(states.map((node) => node.attributes('title')));
+    // 不得只靠颜色传达：文案里也不出现「健康/运行中」
+    for (const node of states) {
+      expect(node.text()).not.toMatch(/健康|运行中/);
+      expect(node.attributes('title')).not.toMatch(/健康|运行中/);
+    }
+    // hostname：可见 hostname、title 完整 url、可截断（truncate + min-w-0 + w-full）
+    const hostname = rows[0].get('[data-test="preview-port-hostname"]');
+    expect(hostname.text()).toBe('alice-p-22000.fde.erix.vip');
+    expect(hostname.attributes('title')).toBe('http://alice-p-22000.fde.erix.vip:8090（点击复制完整地址）');
+    expect(hostname.classes()).toEqual(expect.arrayContaining(['truncate', 'min-w-0', 'w-full']));
+    // 紧凑形态不重复区块标题（折叠条已经写了「预览端口」），但保留重试入口
+    expect(wrapper.text()).not.toContain('预览端口');
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(true);
+  });
+
+  it('紧凑形态的「打开预览」是图标按钮：默认 title/aria-label=打开预览，签票中该行换「签发通行票…」且全部禁用', async () => {
+    const onOpen = vi.fn();
+    wrapper = listPanel({ onOpen });
+    const buttons = wrapper.findAll('[data-test="preview-port-open"]');
+    expect(buttons.map((b) => b.attributes('title'))).toEqual(['打开预览', '打开预览', '打开预览']);
+    expect(buttons[0].text()).toBe(''); // 纯图标（宽度预算）
+    expect(buttons[0].find('svg').exists()).toBe(true);
+    await buttons[1].trigger('click');
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen.mock.calls[0]![0]).toMatchObject({ id: 'id-22001' });
+    wrapper.unmount();
+
+    wrapper = listPanel({ ticketBusyId: 'id-22001' });
+    const busy = wrapper.findAll('[data-test="preview-port-open"]');
+    expect(busy.map((b) => (b.element as HTMLButtonElement).disabled)).toEqual([true, true, true]);
+    expect(busy[1].attributes('title')).toBe('签发通行票…');
+    expect(busy[1].find('svg.animate-spin').exists()).toBe(true);
+    expect(busy[0].attributes('title')).toBe('打开预览');
+  });
+
+  it('紧凑形态：未知 state 走短标签兜底（原值仍在 title）；切 en 短标签对译且不出现 healthy/running', async () => {
+    wrapper = listPanel({ items: [portItem('x', 22003, { state: 'released' })] });
+    const state = wrapper.get('[data-test="preview-port-state"]');
+    expect(state.text()).toBe('未知状态');
+    expect(state.attributes('title')).toBe('未知状态（released）'); // 不猜语义、原值透传
+    wrapper.unmount();
+
+    wrapper = listPanel();
+    setLocale('en');
+    await wrapper.vm.$nextTick();
+    const labels = wrapper.findAll('[data-test="preview-port-state"]').map((node) => node.text());
+    expect(labels).toEqual(['Not opened', 'Admitted', 'Admitted']);
+    for (const node of wrapper.findAll('[data-test="preview-port-state"]')) {
+      expect(`${node.text()} ${node.attributes('title')}`).not.toMatch(/healthy|running/i);
+    }
+    // 空态/错误文案与 table 形态同源（同一组件、同一份 i18n 键）
+    expect(wrapper.get('[data-test="preview-ports-retry"]').text()).toBe('Retry');
+    setLocale('zh-CN');
+  });
+
+  it('紧凑形态复制：点 hostname 复制的是完整 url（含 scheme 与端口）', async () => {
+    const writeText = vi.fn(async () => undefined);
+    stubClipboard(writeText);
+    wrapper = listPanel();
+    await wrapper.findAll('[data-test="preview-port-hostname"]')[2].trigger('click');
+    expect(writeText).toHaveBeenCalledWith('http://alice-p-22002.fde.erix.vip:8090');
+    expect(wrapper.get('[data-test="preview-port-copied"]').text()).toContain('预览地址已复制');
+  });
+});
