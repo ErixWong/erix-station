@@ -132,16 +132,27 @@ describe('工作台 · 预览端口区块', () => {
         .toEqual(['22000', '22001', '22002']);
       expect(rows[0].get('[data-test="preview-port-hostname"]').text())
         .toBe('alice-p-22000.fde.erix.vip');
-      const states = rows.map((row) => row.get('[data-test="preview-port-state"]').text());
-      expect(states).toEqual([
+      const states = rows.map((row) => row.get('[data-test="preview-port-state"]'));
+      // issue #308：端口段搬进左侧栏（最窄档内容宽约 163px）后行内只放**短**标签
+      // ——长口径「已放行过（仅表示首次放行过）」单格就约 168px，装不下。
+      // 判据仍承重：短标签逐字 + **完整口径必须仍可达**（title/aria-label），两条缺一就退化成「只有短词/只有颜色」。
+      expect(states.map((node) => node.text())).toEqual(['待首次访问', '已放行过', '已放行过']);
+      const fullLabels = [
         '已分配 · 待首次访问',
         '已放行过（仅表示首次放行过）',
         '已放行过（仅表示首次放行过）',
-      ]);
-      for (const text of states) {
+      ];
+      expect(states.map((node) => node.attributes('title'))).toEqual(fullLabels);
+      expect(states.map((node) => node.attributes('aria-label'))).toEqual(fullLabels);
+      for (const node of states) {
+        // 可见文本与完整口径都不许写「健康/运行中」（§4.7a）
+        const text = `${node.text()} ${node.attributes('title')}`;
         expect(text).not.toMatch(/健康/);
         expect(text).not.toMatch(/运行中/);
       }
+      // 4 列表格形态在侧栏里装不下（§3.1）⇒ 工作台走 variant='list'
+      expect(wrapper.find('[data-test="preview-ports-table"]').exists()).toBe(false);
+      expect(wrapper.find('[data-test="preview-ports-list"]').exists()).toBe(true);
     } finally {
       wrapper.unmount();
     }
