@@ -359,6 +359,8 @@ export const en = {
     openAllAction: 'Open all previews',
     batchSigning: 'Issuing tickets…',
     batchFailed: 'Failed to issue the preview tickets in bulk ({code}): {message}',
+    // issue #256 delivery 2: when 429/503 carries Retry-After, say how many seconds to wait
+    batchFailedRetry: 'Failed to issue the preview tickets in bulk ({code}): {message} (retry in about {seconds}s)',
     batchBlocked: 'The browser blocked some new tabs; open them one by one:',
     // issue #286: human-facing cookie notice (the edge stripping Cookie is by design, not a bug;
     // agents inside the workspace are told by rule 7 in the container's ~/AGENTS.md, humans are told here)
@@ -390,6 +392,8 @@ export const en = {
     emptyFde: 'This FDE has no live preview ports (not onboarded yet, or already offboarded).',
     loadFailed: 'Failed to load preview ports ({code}): {message}',
     ticketFailed: 'Failed to issue the preview ticket ({code}): {message}',
+    // issue #256 delivery 2: same for the single-ticket 429
+    ticketFailedRetry: 'Failed to issue the preview ticket ({code}): {message} (retry in about {seconds}s)',
     popupBlocked: 'The browser blocked the new tab;',
     popupBlockedLink: 'open the preview here',
     noFdeName: 'This user has no fde_name, so there are no preview ports.',

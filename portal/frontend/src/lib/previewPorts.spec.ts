@@ -18,6 +18,7 @@ import {
   previewBlockEnd,
   previewTargetUrl,
   previewTicketPath,
+  retryAfterSeconds,
   toPreviewApiError,
   type PreviewPortItem,
 } from './previewPorts';
@@ -158,7 +159,26 @@ describe('toPreviewApiError：错误码 / message / details.field 三面都不�
       code: 'preview_port_block_taken',
       message: '预览端口块 22010–22019 已被占用（外来活行端口：22011,22012',
       field: null,
+      // #256 交付②：`ApiError.retryAfter` 原样带走（没有该字段 ⇒ null，不是 undefined）
+      retryAfter: null,
     });
+  });
+
+  it('#256② Retry-After 秒数透传：429 带 42 ⇒ retryAfter=42；脏值 ⇒ null（不把 NaN 带进文案）', () => {
+    const rate = Object.assign(new Error('预览 ticket 签发过于频繁'), {
+      status: 429, code: 'rate_limited', retryAfter: 42,
+    });
+    expect(toPreviewApiError(rate).retryAfter).toBe(42);
+    expect(retryAfterSeconds(toPreviewApiError(rate))).toBe(42);
+
+    const noHeader = Object.assign(new Error('x'), { status: 429, code: 'rate_limited', retryAfter: null });
+    expect(toPreviewApiError(noHeader).retryAfter).toBeNull();
+    expect(retryAfterSeconds(toPreviewApiError(noHeader))).toBeNull();
+
+    for (const dirty of [Number.NaN, Number.POSITIVE_INFINITY, '30', 0, -3]) {
+      const err = Object.assign(new Error('x'), { status: 429, code: 'rate_limited', retryAfter: dirty });
+      expect(retryAfterSeconds(toPreviewApiError(err)), String(dirty)).toBeNull();
+    }
   });
 
   it('400 validation_failed 的 details.field 透传（指到 block_start）', () => {
