@@ -4,7 +4,7 @@
 // 已由 workbench store / StreamPanel 侧的 SPA 测试承接，不在此重复。
 // issue #285 R-1 补：裸 URL 自动链接（「裸 URL 自动链接」describe）+ 它在 XSS 红线里的对应项。
 import { describe, expect, it } from 'vitest';
-import { renderMarkdown } from './markdown';
+import { renderMarkdown, URL_LEFT_BOUNDARY, URL_WORD_CHARS, URL_WORD_SYMBOLS } from './markdown';
 
 /** 危险信号：输出里存在「带 on* 事件的 HTML 标签」（XSS 判据）。 */
 const hasScriptableTag = (html: string): boolean => /<[a-zA-Z][^>]*\son[a-zA-Z]+\s*=/i.test(html);
@@ -158,7 +158,7 @@ describe('裸 URL 自动链接（issue #285 R-1：助手回复里的裸 URL 在 
     }
   });
 
-  it('中文 / 全角标点不进 href（URL 字符集限定 ASCII，与 cmark-gfm・linkify-it 同口径）', () => {
+  it('中文 / 全角标点不进 href（URL 字符集限定 ASCII，按 issue #285 R-1 工单口径）', () => {
     expect(renderMarkdown('地址 http://x.example/g，端口 8090。'))
       .toBe('<p>地址 ' + link('http://x.example/g') + '，端口 8090。</p>');
     expect(renderMarkdown('http://x.example/h、http://x.example/i）】》'))
@@ -324,7 +324,8 @@ describe('裸 URL 自动链接：补充形状与已知边界', () => {
   });
 
   it('已知边界（故意保留的行为，动它之前先读 markdown.ts 的头注）', () => {
-    // 非 ASCII 不进 URL ⇒ 未百分号编码的中文路径会截断（cmark-gfm / linkify-it 同口径）
+    // 非 ASCII 不进 URL ⇒ 未百分号编码的中文路径会截断（按 issue #285 R-1 工单口径；
+    // 未与 cmark-gfm / linkify-it 逐例比对，不声称同口径）
     expect(renderMarkdown('http://x.example/中文')).toBe('<p>' + link('http://x.example/') + '中文</p>');
     // 只有协议头 + 一个标点：剥完连 host 都不剩，仍然链出去（无害的畸形链接，不为此加规则）
     expect(renderMarkdown('见 http://.')).toBe('<p>见 ' + link('http://') + '.</p>');
@@ -403,8 +404,10 @@ describe('issue #295 ①：URL 内部的 `_` 不被 emphasis 吃掉', () => {
   });
 });
 
-describe('issue #295 ②：自动链接左边界（cmark-gfm / linkify-it 口径）', () => {
-  it('前一个字符属于 ASCII 词字符集 ⇒ 不成链', () => {
+describe('issue #295 ②：自动链接左边界（按 issue #295 工单口径）', () => {
+  // 口径出处只有工单（工单举了 `x` / `/` / `-` / `=`）；**不声称**与 cmark-gfm / linkify-it
+  // 同口径——本机没有 cmark 可跑、仓库里也没有可指的上游用例（issue #295 评审 ③）。
+  it('前一个字符属于词字符集 ⇒ 不成链（工单举的四种：x / / / - / =）', () => {
     expect(renderMarkdown('xhttp://a.example/x')).toBe('<p>xhttp://a.example/x</p>');
     expect(renderMarkdown('/http://a/x')).toBe('<p>/http://a/x</p>');
     expect(renderMarkdown('a-http://a/x')).toBe('<p>a-http://a/x</p>');
@@ -413,6 +416,59 @@ describe('issue #295 ②：自动链接左边界（cmark-gfm / linkify-it 口径
     for (const src of ['xhttp://a.example/x', '/http://a/x', 'a_http://a/x']) {
       expect(countAnchors(renderMarkdown(src)), src).toBe(0);
     }
+  });
+
+  it('行为面宽于工单举的四种：: / # / ~ / @（以及 % ? +）前缀也不再成链——刻意，实测钉住', () => {
+    // 这些前缀在 #295 之前**是**成链的；左边界判据上线后一并挡掉（issue #295 评审 ② 点名）。
+    // 每一条都是逐字期望（不是只数 <a>），避免「输出换了形状但仍然是 0 个 <a>」蒙混过关。
+    const blocked: Array<[string, string]> = [
+      [':http://a/x', ':http://a/x'],
+      ['#http://a/x', '#http://a/x'],
+      ['~http://a/x', '~http://a/x'],
+      ['@http://a/x', '@http://a/x'],
+      ['%http://a/x', '%http://a/x'],
+      ['?http://a/x', '?http://a/x'],
+      ['+http://a/x', '+http://a/x'],
+    ];
+    for (const [src, want] of blocked) {
+      expect(renderMarkdown(src), src).toBe('<p>' + want + '</p>');
+      expect(countAnchors(renderMarkdown(src)), src).toBe(0);
+    }
+  });
+
+  it('词字符集是单一来源：每个手写符号成员都逐一生效（`\\w` 另测）', () => {
+    // 逐成员遍历 `URL_WORD_SYMBOLS`（实现里唯一手写的那一份）：谁被从字符类里漏掉，
+    // 这里就红。用导出常量而不是在 spec 里再抄一份字面量，正是为了让「两份手写字面量」
+    // 没法悄悄发散（issue #295 评审 ①）。
+    expect(URL_WORD_SYMBOLS).toBe('/:%#?+=~@-');
+    for (const ch of URL_WORD_SYMBOLS) {
+      const src = ch + 'http://a.example/x';
+      expect(countAnchors(renderMarkdown(src)), JSON.stringify(src)).toBe(0);
+      expect(renderMarkdown(src), JSON.stringify(src)).toBe('<p>' + src + '</p>');
+    }
+    // `\\w` 的代表：字母 / 数字 / 下划线
+    for (const ch of ['a', 'Z', '0', '9', '_']) {
+      const src = ch + 'http://a.example/x';
+      expect(countAnchors(renderMarkdown(src)), JSON.stringify(src)).toBe(0);
+    }
+  });
+
+  it('左边界由 URL_WORD_CHARS 拼出（不是第二份手写字面量）', () => {
+    // 结构判据：把实现改回 `'(?<![\\w/:\\-%&#?+=~@])'` 这种手写副本（哪怕内容等价）就红。
+    // 纯行为判据抓不到这类发散——`&` 成员不可达（见下面那条用例）就是活例子。
+    expect(URL_WORD_CHARS).toBe('\\w' + URL_WORD_SYMBOLS);
+    expect(URL_LEFT_BOUNDARY).toBe('(?<![' + URL_WORD_CHARS + '])');
+  });
+
+  it('`&` 前缀：转义后 lookbehind 看到的是 `;` ⇒ 仍成链（与直觉不同，实测钉住）', () => {
+    // `&` 曾被列进词字符集，但 `esc()` 先把它换成 `&amp;`，lookbehind 前一字符永远是 `;`
+    // ⇒ 那个成员在转义后的文本上不可达。所以 `&http://…` 的实际行为是「`&` 留正文、URL 照链」，
+    // 已从字符集删除（issue #295 评审 ①）。复现命令见 markdown.ts 对应注释。
+    expect(renderMarkdown('&http://a.example/x')).toBe('<p>&amp;' + link('http://a.example/x') + '</p>');
+    expect(renderMarkdown('a&http://a.example/x')).toBe('<p>a&amp;' + link('http://a.example/x') + '</p>');
+    // 整只实体当前缀也一样（`&amp;` → `&amp;amp;`，前一字符仍是 `;`）
+    expect(renderMarkdown('&amp;http://a.example/x'))
+      .toBe('<p>&amp;amp;' + link('http://a.example/x') + '</p>');
   });
 
   it('左边界成立（行首 / 空白 / 括号 / 中文标点）⇒ 照常成链', () => {
