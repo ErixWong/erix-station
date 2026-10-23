@@ -48,6 +48,10 @@ export function assertSafePath(root, target) {
  *     cap_drop ALL + cap_add 无 CAP_FSETID（容器内 CapEff=0xcb），chown(1000,1000) 之后的下一轮 chmod
  *     会被内核**静默清掉 setgid**（770 原样保留、不抛错）⇒ reconcile 从第 2 轮起稳定 0770。
  *   · 这**不是缺陷**：GID 继承由写入进程主组（1000）达成，组写位由 umask 与属组 1000 达成，setgid 不承载任何行为。
+ * ⚠ 上面那句有一个**前提**：调用方必须**同时传 uid 与 gid**（=1000）。本函数 `gid` 缺省是 `null`，而下面
+ *   `chownSync(dir, uid ?? -1, gid ?? -1)` 把 `null` 当「不改组」——**只传 uid** 的调用点会留下 `gid=0`（root 组）
+ *   的对象，那时 setgid 就**真的开始承重**，“别补 CAP_FSETID”的结论随之失效。现有调用点已全部同传 uid+gid
+ *   （2026-10-24 逐个核：materializer/provisioner/sessions/git-credential/git-cli-config），新增调用点请跟着做。
  * 别为了「把 mode 兑现成 2770」去补 CAP_FSETID（只改一个看不见的数字，不改任何访问语义，违背最小权限）。
  * 别把字面量改成 0o0770（行为等价，但会让 docs/user-space §6.2 与 wp2a §④ 断言面重新变得可疑）。
  * 将来真要「组协作」要动的是 umask / 组成员关系，不是 setgid。详见 docs/design/user-space.md §6.2 / issue #273。
