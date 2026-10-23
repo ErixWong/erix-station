@@ -3,13 +3,15 @@
 // 工单第「新增测试必须覆盖」5 条：
 //   ① `released` 行**不占位**（一段内只有一条 released ⇒ 该段仍进 `free_blocks`）
 //   ② `partial` / `occupied` 分类正确，且一段里**两个 FDE** 时 `fde_names` 给出两个名字
-//   ③ 端点实现里**零端口字面量**（源码级断言：新函数体内不含 22000 / 29999 / 10）
+//   ③ 端点实现里**零端口字面量**（源码级断言：新函数体 + HTTP handler 里都不含端口/块几何字面量；
+//      断言按**数值**判定，`22_000` / `0x5618` 这类等价写法同样被拦，见 `numericLiterals()`）
 //   ④ 非 admin ⇒ 403 且**不写审计**；admin ⇒ **恰好一行**审计且 `details` 不含整份响应体
 //   ⑤ `has_more` 与 `limit` 语义（空闲段多于 limit ⇒ `has_more=true` 且 `items.length == limit`）
 //
 // 隔离约定（docs/testing.md §2.1）：内存 fake，不碰真库 / docker。fake 只按真 SQL 的**谓词**派发
 // （`state <> 'released'` + `port BETWEEN $1 AND $2` + LEFT JOIN users 取 fde_name），
 // 这样「released 不占位」这条断言测的是实现真的发出去的 SQL，而不是测试自己写的过滤条件。
+// ⚠ 谓词是**解析后按行求值**的（`compileWhere()`），不是子串前缀匹配——见那段注释（#256 评审 B1）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -47,6 +49,114 @@ function portIn(nth, i = 0) {
 // ---------------------------------------------------------------------------
 // fake：port_allocations（+ users 的 fde_name 用于 LEFT JOIN）
 // ---------------------------------------------------------------------------
+
+/** 把括号外层的多余括号剥掉（`(a OR b)` → `a OR b`；不剥 `(a) AND (b)` 里的内层）。 */
+function stripOuterParens(expr) {
+  let e = expr.trim();
+  for (;;) {
+    if (!e.startsWith('(') || !e.endsWith(')')) return e;
+    let depth = 0;
+    let wrapsAll = true;
+    for (let i = 0; i < e.length; i++) {
+      if (e[i] === '(') depth++;
+      else if (e[i] === ')') {
+        depth--;
+        if (depth === 0 && i !== e.length - 1) { wrapsAll = false; break; }
+      }
+    }
+    if (!wrapsAll) return e;
+    e = e.slice(1, -1).trim();
+  }
+}
+
+/** 在括号深度 0、引号外按 `op`（`AND` / `OR`）切分；`BETWEEN $n AND $m` 里的 `AND` 不算分隔符。 */
+function splitTopLevel(expr, op) {
+  const out = [];
+  let depth = 0;
+  let quoted = false;
+  let last = 0;
+  const upper = expr.toUpperCase();
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i];
+    if (ch === "'") quoted = !quoted;
+    if (quoted) continue;
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (depth !== 0 || upper.startsWith(op, i) === false) continue;
+    const before = i === 0 ? ' ' : expr[i - 1];
+    const after = expr[i + op.length] ?? ' ';
+    if (/\w/.test(before) || /\w/.test(after)) continue;   // 词边界：`BRAND` / `ORDER` 不算
+    const head = expr.slice(last, i);
+    if (op === 'AND' && /BETWEEN\s+\$\d+\s*$/i.test(head)) continue;   // `BETWEEN $1 AND $2` 是一个原子
+    out.push(head);
+    last = i + op.length;
+    i += op.length - 1;
+  }
+  out.push(expr.slice(last));
+  return out.map((part) => part.trim());
+}
+
+/**
+ * 把 `WHERE` 子句编译成「按行求值」的谓词函数 `(row, params) => boolean`（#256 评审 B1）。
+ *
+ * 为什么不能只做子串匹配：`/WHERE pa\.state <> 'released' AND/` 这种**前缀包含**判定下，把实现谓词放宽成
+ * `WHERE (pa.state <> 'released' OR pa.state = 'released') AND …`（语义永真）时，fake 仍会命中「已过滤」分支
+ * ⇒ 测试绿而实现错（假绿窗口）。这里按 SQL 的真实语义求值：**解析不了的形态直接抛错**，
+ * fake 不许替实现兜底（AGENTS §8.14 的先例：`preview-grant-checks.js` 从 SQL 文本解析谓词、
+ * `fake-internal-pool.js` 按 SQL 文本真筛）。
+ *
+ * 支持（本端点真实用到的形态）：`pa.state <>|= 'x'`、`pa.state IN (…)`、`pa.port BETWEEN $n AND $m`、
+ * `pa.port <|<=|>|>=|= $n`、括号、`AND` / `OR`（`OR` 优先级低于 `AND`，与 SQL 一致）。
+ */
+function compileWhere(expr) {
+  const e = stripOuterParens(expr);
+  let m;
+
+  // 原子子句（先于 AND 切分：`BETWEEN … AND …` 才不会被切坏）
+  if ((m = e.match(/^(?:pa\.)?state\s*(<>|!=|=)\s*'([^']*)'$/i))) {
+    const negated = m[1] !== '=';
+    const wanted = m[2];
+    return (row) => (row.state === wanted) !== negated;
+  }
+  if ((m = e.match(/^(?:pa\.)?state\s+IN\s*\(([^)]*)\)$/i))) {
+    const list = m[1].split(',').map((s) => s.trim().replace(/^'|'$/g, ''));
+    return (row) => list.includes(row.state);
+  }
+  if ((m = e.match(/^(?:pa\.)?port\s+BETWEEN\s+\$(\d+)\s+AND\s+\$(\d+)$/i))) {
+    const [, a, b] = m.map(Number);
+    return (row, params) => Number(row.port) >= Number(params[a - 1]) && Number(row.port) <= Number(params[b - 1]);
+  }
+  if ((m = e.match(/^(?:pa\.)?port\s*(<=|>=|<|>|=)\s*\$(\d+)$/i))) {
+    const opText = m[1];
+    const idx = Number(m[2]) - 1;
+    const cmp = {
+      '<=': (x, y) => x <= y, '>=': (x, y) => x >= y,
+      '<': (x, y) => x < y, '>': (x, y) => x > y, '=': (x, y) => x === y,
+    }[opText];
+    return (row, params) => cmp(Number(row.port), Number(params[idx]));
+  }
+
+  const ors = splitTopLevel(e, 'OR');
+  if (ors.length > 1) {
+    const fns = ors.map(compileWhere);
+    return (row, params) => fns.some((fn) => fn(row, params));
+  }
+  const ands = splitTopLevel(e, 'AND');
+  if (ands.length > 1) {
+    const fns = ands.map(compileWhere);
+    return (row, params) => fns.every((fn) => fn(row, params));
+  }
+
+  throw new Error(`fake 解析不了这个 WHERE 原子子句：「${e}」——请让 fake 跟上 SQL（或让实现回到已支持形态），`
+    + '不要为了让测试变绿去放宽 fake（AGENTS §8.14）');
+}
+
+/** 从 SQL 文本里取 `WHERE` 子句（到 `ORDER BY` / `GROUP BY` / 结尾为止）；没有 WHERE ⇒ `null`。 */
+function extractWhere(sql) {
+  const m = sql.match(/\bWHERE\b([\s\S]*?)(?:\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|$)/i);
+  return m ? m[1].trim() : null;
+}
+
 class UsageStore {
   /**
    * @param {{rows?: Array<{fde_id, port, state}>, users?: Array<{id, fde_name}>}} [seed]
@@ -56,6 +166,8 @@ class UsageStore {
     this.users = users;
     this.seq = [];
     this.writes = [];
+    /** 每次总览取数看到的 `WHERE` 原文（断言「实现真的发了谓词」用）。 */
+    this.whereSeen = [];
   }
 
   async query(sql, params = []) {
@@ -64,12 +176,13 @@ class UsageStore {
 
     // 总览取数：谓词由 SQL 决定（fake 不另写一套），LEFT JOIN users 取 fde_name。
     if (s.startsWith('SELECT pa.port AS port, u.fde_name AS fde_name')) {
-      const [start, end] = params;
-      // **谓词由 SQL 决定**（fake 不另写一套）：实现把 `state <> 'released'` 去掉/放宽时，
-      // 「released 不占位」那条断言就会真的红（这是本文件最重要一条判据的诚实性来源）。
-      const liveOnly = /WHERE pa\.state <> 'released' AND/.test(s);
+      // **谓词由 SQL 决定**（fake 不另写一套，也不是子串匹配）：实现把 `state <> 'released'` 去掉/放宽时，
+      // 编译出来的谓词就真的变了 ⇒「released 不占位」那条断言会红（本文件最重要一条判据的诚实性来源）。
+      const where = extractWhere(s);
+      this.whereSeen.push(where);
+      const predicate = where === null ? () => true : compileWhere(where);
       const rows = this.rows
-        .filter((row) => (!liveOnly || row.state !== 'released') && row.port >= start && row.port <= end)
+        .filter((row) => predicate(row, params))
         .sort((a, b) => a.port - b.port)
         .map((row) => ({
           port: row.port,
@@ -166,25 +279,105 @@ test('#256② partial 与 occupied 分类正确；一段里两个 FDE ⇒ fde_na
 });
 
 // ---------------------------------------------------------------------------
-// ③ 源码级断言：新函数体内零端口字面量
+// ③ 源码级断言：新函数体内零端口字面量（+ HTTP handler 不做池算术）
 // ---------------------------------------------------------------------------
-test('#256③ 端点实现里零端口字面量：previewPortPoolUsage 函数体内不含 22000 / 29999 / 10（数字只从 previewpool.js 推导）', () => {
-  const source = fs.readFileSync(path.join(SRC_DIR, 'portalloc.js'), 'utf8');
-  const start = source.indexOf('export async function previewPortPoolUsage');
-  assert.ok(start > 0, 'portalloc.js 里必须找得到 previewPortPoolUsage（名字变了就同步改本断言）');
-  const rest = source.slice(start + 1);
-  const end = rest.indexOf('\nexport ');
-  const body = end >= 0 ? rest.slice(0, end) : rest;
 
-  for (const literal of [String(PREVIEW_PORT_POOL_START), String(PREVIEW_PORT_POOL_END)]) {
-    assert.equal(body.includes(literal), false, `函数体内不得出现端口字面量 ${literal}（号池边界只能来自 previewpool.js）`);
+/**
+ * 取一个具名函数 / 方法的**函数体原文**（先配对参数表的圆括号，再按花括号配对；不靠「下一个 export」猜边界）。
+ * 注释与字符串/模板里的花括号不算；正则字面量不支持（本断言扫的两个函数里没有）。
+ */
+function functionBodyOf(source, signature) {
+  const at = source.indexOf(signature);
+  assert.ok(at >= 0, `源码里必须找得到 ${signature}（名字变了就同步改本断言）`);
+
+  /** 从 `from` 处的开括号开始配对，返回配对闭括号的下标。 */
+  const matchBracket = (from, openCh, closeCh) => {
+    let depth = 0;
+    let quote = null;
+    for (let i = from; i < source.length; i++) {
+      const ch = source[i];
+      if (quote) {
+        if (ch === '\\') { i += 1; continue; }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+      if (ch === '/' && source[i + 1] === '/') { i = source.indexOf('\n', i); if (i < 0) break; continue; }
+      if (ch === '/' && source[i + 1] === '*') { i = source.indexOf('*/', i + 2); if (i < 0) break; i += 1; continue; }
+      if (ch === openCh) depth += 1;
+      else if (ch === closeCh) {
+        depth -= 1;
+        if (depth === 0) return i;
+      }
+    }
+    throw new Error(`找不到 ${signature} 的配对 ${openCh}${closeCh}`);
+  };
+
+  const paramsOpen = source.indexOf('(', at);
+  assert.ok(paramsOpen > 0, `${signature} 后面找不到参数表的 (`);
+  const paramsClose = matchBracket(paramsOpen, '(', ')');
+  const bodyOpen = source.indexOf('{', paramsClose);
+  assert.ok(bodyOpen > 0, `${signature} 后面找不到函数体的 {`);
+  const bodyClose = matchBracket(bodyOpen, '{', '}');
+  return source.slice(bodyOpen + 1, bodyClose);
+}
+
+/**
+ * 函数体里的**全部数字字面量**（连同它们的数值）。
+ * ⚠ 按数值判定，不按字面文本：`22_000`（数字分隔符）= 22000、`0x5618` = 22040，
+ * 两种都能绕过 `body.includes('22000')`（#256 评审实测的逃逸形态）。
+ */
+function numericLiterals(body) {
+  const re = /(?<![\w$])(?:0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[bB][01][01_]*|0[oO][0-7][0-7_]*|\d[\d_]*(?:\.[\d_]*)?(?:[eE][+-]?\d+)?)/g;
+  return [...body.matchAll(re)].map((m) => ({ raw: m[0], value: Number(m[0].replace(/_/g, '')) }));
+}
+
+/** 禁止在源码里出现的**数值**：端口区间 + 块几何（块大小 / 段总数 / 块内偏移上界）。 */
+const FORBIDDEN_NUMBERS = [
+  { value: PREVIEW_PORT_POOL_START, label: `池起点 ${PREVIEW_PORT_POOL_START}` },
+  { value: PREVIEW_PORT_POOL_END, label: `池终点 ${PREVIEW_PORT_POOL_END}` },
+  { value: PREVIEW_PORT_COUNT, label: `块大小 ${PREVIEW_PORT_COUNT}` },
+  { value: PREVIEW_PORT_BLOCK_COUNT, label: `段总数 ${PREVIEW_PORT_BLOCK_COUNT}` },
+];
+
+/** 扫一段源码里的数字字面量：池区间内的任何数 / 块几何数都不许出现（含 `22_000`、`0x5618`）。 */
+function assertNoPortLiterals(body, where) {
+  for (const { raw, value } of numericLiterals(body)) {
+    assert.equal(Number.isFinite(value), true, `${where} 里的数字字面量 ${raw} 解析不出数值（断言自己不完整）`);
+    const hit = FORBIDDEN_NUMBERS.find((b) => b.value === value);
+    assert.equal(hit, undefined, `${where} 不得出现字面量 ${raw}（= ${value} = ${hit?.label}；口径唯一来源是 previewpool.js）`);
+    assert.equal(
+      value >= PREVIEW_PORT_POOL_START && value <= PREVIEW_PORT_POOL_END,
+      false,
+      `${where} 不得出现池区间内的字面量 ${raw}（= ${value}；号池边界只能来自 previewpool.js）`,
+    );
   }
-  assert.equal(/\b10\b/.test(body), false, '函数体内不得出现块大小字面量 10');
-  assert.equal(/\b800\b/.test(body), false, '函数体内不得出现段总数字面量 800');
+}
+
+test('#256③ 零端口字面量：previewPortPoolUsage 函数体 + HTTP handler 都不含端口/块几何字面量（`22_000`、`0x5618` 也算）', () => {
+  const portallocSource = fs.readFileSync(path.join(SRC_DIR, 'portalloc.js'), 'utf8');
+  const body = functionBodyOf(portallocSource, 'export async function previewPortPoolUsage');
+
+  assertNoPortLiterals(body, 'previewPortPoolUsage 函数体');
   // 反证：体里确实用到了常量（否则上面几条「不含字面量」可以靠空函数通过）。
   for (const name of ['PREVIEW_PORT_POOL_START', 'PREVIEW_PORT_POOL_END', 'PREVIEW_PORT_COUNT', 'PREVIEW_PORT_BLOCK_COUNT']) {
     assert.ok(body.includes(name), `函数体必须引用 ${name}（口径唯一来源）`);
   }
+});
+
+test('#256③b HTTP handler 也不许自己算池：零字面量 + 不碰块几何常量 + 必须委派给 portalloc.previewPortPoolUsage', () => {
+  const httpSource = fs.readFileSync(path.join(SRC_DIR, 'http.js'), 'utf8');
+  const handler = functionBodyOf(httpSource, 'async function handleAdminPreviewPortsUsage(');
+
+  // (a) handler 里也不许有端口 / 块几何字面量（它只该做参数校验 + 审计 + 序列化）。
+  assertNoPortLiterals(handler, 'handleAdminPreviewPortsUsage');
+  // (b) handler **不碰**块几何：段边界 / 块大小由 portalloc 算，handler 连常量名都不该出现。
+  for (const name of ['PREVIEW_PORT_POOL_START', 'PREVIEW_PORT_POOL_END', 'PREVIEW_PORT_COUNT']) {
+    assert.equal(handler.includes(name), false, `handler 不得直接使用 ${name}（池算术属于 portalloc.previewPortPoolUsage）`);
+  }
+  // (c) 正证：它确实把取数委派下去了（否则上面「不含字面量」可以靠空 handler 通过）。
+  assert.ok(handler.includes('portalloc.previewPortPoolUsage('), 'handler 必须调用 portalloc.previewPortPoolUsage（数字在那一层算）');
+  assert.ok(handler.includes('portalloc.PREVIEW_USAGE_FREE_LIMIT_DEFAULT'), '默认 limit 也必须取 portalloc 的常量（不在 handler 里写 50）');
 });
 
 // ---------------------------------------------------------------------------
@@ -365,16 +558,28 @@ test('#256④b ?limit= 合法时生效、非法时 400 validation_failed + detai
     assert.equal(body.free_blocks.has_more, true);
     assert.equal(pool.audit.length, 1);
 
-    for (const raw of ['0', '-1', '1.5', 'abc', String(PREVIEW_PORT_BLOCK_COUNT + 1)]) {
+    // #256 评审 B3：`?limit=`（**空串**）口径 = 「留空 = 不修改」⇒ 用默认值，**不是** 400 也不是 0。
+    // （钉这条的理由：`Number('') === 0`、`parseInt('') === NaN`，两种写法会得到不同结果；口径必须被测试锁住，
+    //  不能随实现随手挑一种。）
+    const blank = await fetch(`${base}/api/admin/preview-ports/usage?limit=`, { headers: { cookie: adminCookie } });
+    assert.equal(blank.status, 200, '空串不是非法值（留空 = 不修改）');
+    const blankBody = await blank.json();
+    assert.equal(blankBody.free_blocks.limit, PREVIEW_USAGE_FREE_LIMIT_DEFAULT, '空串 ⇒ 默认 limit');
+    assert.equal(blankBody.free_blocks.items.length, PREVIEW_USAGE_FREE_LIMIT_DEFAULT);
+    assert.equal(blankBody.free_blocks.has_more, true);
+    assert.equal(pool.audit.length, 2, '空串走默认值 ⇒ 正常写一行审计（不是 400）');
+
+    // 空白串（`?limit=%20`）**不是**空串 ⇒ 仍算非法值（口径边界不能模糊）。
+    for (const raw of ['0', '-1', '1.5', 'abc', ' ', String(PREVIEW_PORT_BLOCK_COUNT + 1)]) {
       const bad = await fetch(`${base}/api/admin/preview-ports/usage?limit=${encodeURIComponent(raw)}`, {
         headers: { cookie: adminCookie },
       });
-      assert.equal(bad.status, 400, `limit=${raw} 必须 400`);
+      assert.equal(bad.status, 400, `limit=${JSON.stringify(raw)} 必须 400`);
       const err = await bad.json();
       assert.equal(err.error.code, 'validation_failed');
       assert.equal(err.error.details.field, 'limit');
     }
-    assert.equal(pool.audit.length, 1, '400 不写审计');
+    assert.equal(pool.audit.length, 2, '400 不写审计');
     assert.equal(store.writes.length, 0);
   } finally {
     await close();
