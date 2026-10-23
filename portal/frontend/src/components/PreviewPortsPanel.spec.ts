@@ -191,6 +191,39 @@ describe('PreviewPortsPanel · 复制与兜底反馈', () => {
     expect(link.attributes('rel')).toBe('noopener');
   });
 
+  it('#256② 429 带 Retry-After：签票失败文案说出秒数；缺头 / 非有限数退到不带秒数的文案（不演 undefined/NaN）', () => {
+    wrapper = mountPanel({
+      ticketError: { status: 429, code: 'rate_limited', message: '预览 ticket 签发过于频繁', field: null, retryAfter: 37 },
+    });
+    expect(wrapper.get('[data-test="preview-ticket-error"]').text())
+      .toBe('签发预览通行票失败（rate_limited）：预览 ticket 签发过于频繁（约 37 秒后可重试）');
+
+    wrapper.unmount();
+    wrapper = mountPanel({
+      ticketError: { status: 429, code: 'rate_limited', message: '预览 ticket 签发过于频繁', field: null, retryAfter: null },
+    });
+    const noHeader = wrapper.get('[data-test="preview-ticket-error"]').text();
+    expect(noHeader).toBe('签发预览通行票失败（rate_limited）：预览 ticket 签发过于频繁');
+    expect(noHeader).not.toContain('秒后可重试');
+
+    wrapper.unmount();
+    wrapper = mountPanel({
+      // 头不可解 / 脏数据：仍不许把 NaN 演给用户
+      ticketError: { status: 429, code: 'rate_limited', message: 'x', field: null, retryAfter: Number.NaN },
+    });
+    const dirty = wrapper.get('[data-test="preview-ticket-error"]').text();
+    expect(dirty).not.toContain('NaN');
+    expect(dirty).not.toContain('undefined');
+  });
+
+  it('#256② 批量签票 429 同样带秒数（双语成对：en 也有对应键）', () => {
+    wrapper = mountPanel({
+      batchError: { status: 429, code: 'rate_limited', message: '预览 ticket 签发过于频繁', field: null, retryAfter: 5 },
+    });
+    expect(wrapper.get('[data-test="preview-batch-error"]').text())
+      .toBe('批量签发预览通行票失败（rate_limited）：预览 ticket 签发过于频繁（约 5 秒后可重试）');
+  });
+
   it('切到 English：表头与 state 文案同步换英文（仍不出现 healthy/running）', async () => {
     wrapper = mountPanel();
     setLocale('en');

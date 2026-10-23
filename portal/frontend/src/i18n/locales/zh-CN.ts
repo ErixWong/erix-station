@@ -375,6 +375,8 @@ export const zhCN = {
     openAllAction: '打开全部预览',
     batchSigning: '批量签发中…',
     batchFailed: '批量签发预览通行票失败（{code}）：{message}',
+    // issue #256 交付②：429/503 带 Retry-After 时把「多久后重试」说成秒数（缺头走上面不带秒数的键）
+    batchFailedRetry: '批量签发预览通行票失败（{code}）：{message}（约 {seconds} 秒后可重试）',
     batchBlocked: '浏览器拦截了部分新标签，逐个点开：',
     // issue #286：面向**人**的 Cookie 告知（边缘整体剥 Cookie 头是 by design，不是 bug；
     // 工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知）
@@ -404,6 +406,8 @@ export const zhCN = {
     emptyFde: '该 FDE 没有活着的预览端口（可能尚未开户或已下线）。',
     loadFailed: '预览端口加载失败（{code}）：{message}',
     ticketFailed: '签发预览通行票失败（{code}）：{message}',
+    // issue #256 交付②：同上，单张签票的 429 提示
+    ticketFailedRetry: '签发预览通行票失败（{code}）：{message}（约 {seconds} 秒后可重试）',
     popupBlocked: '浏览器拦截了新标签；',
     popupBlockedLink: '点此打开预览',
     noFdeName: '该用户没有 fde_name，因此没有预览端口。',

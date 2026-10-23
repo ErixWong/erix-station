@@ -57,13 +57,21 @@ export interface PreviewBlockMoveResult {
   inserted_allocations: number;
 }
 
-/** 后端错误的关键三面（展示与分支判定都要用；message 一律原文透传，不翻译、不截断）。 */
+/**
+ * 后端错误的关键三面（展示与分支判定都要用；message 一律原文透传，不翻译、不截断）。
+ *
+ * #256 交付②：另带 `retryAfter`——`ApiError` 上**已经有**这个字段（`api.ts:21` / `api.ts:97`，
+ * #255 从 `Retry-After` 头解析，解析不出为 `null`），所以「429 的多久后重试」只在前端补一句文案即可，
+ * 不需要后端把秒数写进 `error.message`（那会变成两个真相源）。
+ */
 export interface PreviewApiError {
   status: number;
   code: string;
   message: string;
   /** 400 validation_failed 时服务端给 details.field（§4.7a 的 block_start/fde_name）。 */
   field: string | null;
+  /** `Retry-After` 头里的秒数（429 `rate_limited` / 503 `kdf_busy`）；缺头或不可解 ⇒ `null`。 */
+  retryAfter?: number | null;
 }
 
 // 号池常量（镜像 portal/src/previewpool.js：池 22000–29999、每段 10 个、块起点对齐）。
@@ -178,5 +186,20 @@ export function toPreviewApiError(err: unknown): PreviewApiError {
   const message = err instanceof Error && err.message ? err.message : String(err);
   const details = (err as { details?: { field?: unknown } })?.details;
   const field = typeof details?.field === 'string' ? details.field : null;
-  return { status, code, message, field };
+  // #256 交付②：`Retry-After` 秒数（ApiError 已解析好）原样带走；非有限数一律 null，
+  // 让文案退到不带秒数的版本——宁可少说一个数字，不说 `NaN 秒`。
+  const rawRetry = (err as { retryAfter?: unknown })?.retryAfter;
+  const retryAfter = typeof rawRetry === 'number' && Number.isFinite(rawRetry) ? rawRetry : null;
+  return { status, code, message, field, retryAfter };
+}
+
+/**
+ * 429/503 的「多久后重试」秒数（#256 交付②）：只认 `> 0` 的有限数。
+ * 返回 `null` ⇒ 调用方用不带秒数的文案（**绝不**显示 `undefined 秒` / `NaN`）。
+ */
+export function retryAfterSeconds(error: PreviewApiError): number | null {
+  const value = error.retryAfter;
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const seconds = Math.max(0, Math.round(value));
+  return seconds > 0 ? seconds : null;
 }

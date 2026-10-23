@@ -15,6 +15,7 @@ import { onScopeDispose, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import {
   asPreviewPortState,
+  retryAfterSeconds,
   type PreviewApiError,
   type PreviewPortItem,
 } from '../lib/previewPorts';
@@ -105,12 +106,22 @@ function loadErrorText(error: PreviewApiError): string {
   return t('previewPorts.loadFailed', { code: error.code, message: error.message });
 }
 
+/**
+ * 签票错误文案（issue #256 交付②）：`Retry-After` 拿得到秒数就说「约 N 秒后可重试」，
+ * 拿不到（缺头 / 不可解 / 非 429）退到不带秒数的既有文案——**绝不**显示 `undefined 秒` / `NaN`。
+ */
 function ticketErrorText(error: PreviewApiError): string {
-  return t('previewPorts.ticketFailed', { code: error.code, message: error.message });
+  const seconds = retryAfterSeconds(error);
+  return seconds === null
+    ? t('previewPorts.ticketFailed', { code: error.code, message: error.message })
+    : t('previewPorts.ticketFailedRetry', { code: error.code, message: error.message, seconds });
 }
 
 function batchErrorText(error: PreviewApiError): string {
-  return t('previewPorts.batchFailed', { code: error.code, message: error.message });
+  const seconds = retryAfterSeconds(error);
+  return seconds === null
+    ? t('previewPorts.batchFailed', { code: error.code, message: error.message })
+    : t('previewPorts.batchFailedRetry', { code: error.code, message: error.message, seconds });
 }
 
 /** 批量兜底链接的文字 = 该票地址的 host（人一眼能看出是哪个端口），解析不出就回原串。 */
