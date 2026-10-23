@@ -33,23 +33,56 @@ const LINK_PLACEHOLDER = (n: number): string => '\uE001' + n + '\uE001';
 // ---- 裸 URL 自动链接（GFM 风格，issue #285 R-1）----
 // 协议白名单：只放行 http(s)（正则本身就是白名单，不匹配的一律保持纯文本）——
 // `javascript:alert(1)` / `data:text/html,…` / `file:///etc/passwd` 无 `http(s)://` 开头不链，
-// 裸的 `www.example.com`（无协议）也不链（GFM 同样不链）。email/`mailto:` **刻意不做**：
+// 裸的 `www.example.com`（无协议）也不链（按 issue #285 R-1 工单口径；GFM 是否同样不链未在本
+// 仓库验证过，不作断言）。email/`mailto:` **刻意不做**：
 // 邮箱不是本次标本的失败形态，且自动包 mailto 会新开一条 href 协议面，属另一条 scope。
 // URL 字符集：可打印 ASCII，再去掉裸 `<`、`>`、引号、反引号、空白与**一切非 ASCII**：
 // · 裸 `<` 是我们自己插的标签边界（`**http://x**` 已被粗斜体换成 `<strong>http://x</strong>`
 //   ⇒ 自动链接在 `</strong>` 前自然停下）；转义产物 `&lt;`/`&amp;` 里没有裸 `<`，不会误停。
 // · 非 ASCII 不入围 ⇒ 中文与全角标点永远不会跟着进 href（`http://x，端口 8090` 只链到 `x`），
 //   占位符字符（U+E000/E001/E002）也落在这个排除区间里——它们不可能出现在真 URL 里。
-//   cmark-gfm 与 linkify-it 同样把自动链接限定在 ASCII 内（未百分号编码的中文路径会截断）。
+//   URL 字符集限定在可打印 ASCII 内是本实现的取舍（未百分号编码的中文路径会截断）；cmark-gfm /
+//   linkify-it 是否同此，本机没有 cmark 可跑、仓库里也没有可指的上游源码或用例，不作断言。
 const URL_BODY = '[^\\s<>"\'`\\u0000-\\u001f\\u007f-\\uFFFF]+';
-// 左边界（issue #295 ②）：前一个字符属于 ASCII 词字符集时**不成链**，与 cmark-gfm / linkify-it
-// 同口径——`xhttp://a.example/x`、`/http://a/x` 是正文，不许从中间切开当链接。
-// 词字符集 = 字母 / 数字 / `_`（= `\w`）+ `/` `:` `-` `%` `&` `#` `?` `+` `=` `~` `@`。
+// 左边界（issue #295 ②）：前一个字符属于下面的「词字符集」时**不成链**——
+// `xhttp://a.example/x`、`/http://a/x` 是正文，不许从中间切开当链接。
+//
+// 口径出处：**issue #295 工单**（工单只举了 `x` / `/` / `-` / `=` 四种情形，本实现把同一思路
+// 推到「贴在 URL 前面就说明它是更大 token 的尾巴」的那批 ASCII 符号上）。**不声称**与 cmark-gfm /
+// linkify-it 同口径：本机没有 cmark 可跑、仓库里没有可指的上游用例，任何「上游也这样」的断言
+// 都无法复现（issue #295 评审 ③），故一律只写「按工单口径」。
+//
+// 行为面（issue #295 评审 ② 点名，**刻意**）：`:http://…`、`#http://…`、`~http://…`、`@http://…`
+// 这些前缀现在也**不再成链**（`#295` 之前会链）——同一个左边界判据的必然结果，不是顺手改方向。
+// 每个成员的实际行为由 spec 逐前缀钉住（`issue #295 ②` 那个 describe）。
+//
+// 词字符集是**单一来源**（`URL_WORD_SYMBOLS` 只此一处手写，`URL_WORD_CHARS` 由它拼出，
+// `URL_LEFT_BOUNDARY` 再由 `URL_WORD_CHARS` 拼出——没有第二份手写字面量）：
+//   = `\w`（字母 / 数字 / `_`）+ `/` `:` `%` `#` `?` `+` `=` `~` `@` `-`
+// 它与 `URL_BODY` 是**两个集合**，不要合并成假单一来源：
+// · `URL_BODY` 是「URL 里允许出现什么」（否定字符类，超集；含 `.` `,` `!` `(` 等）；
+// · `URL_WORD_SYMBOLS` 是「什么前缀让 URL 不是从这儿开始」（`URL_BODY` 的真子集——每个成员都是
+//   合法 URL 字符，但 `.` `,` `(` `!` 这类当前缀时只是正文标点，`(http://x)`、`见 http://x.`
+//   必须照常成链）。两者用途相反，唯一可共用的性质只是「成员都是 URL 合法字符」。
+//
+// `&` **不在**词字符集里（issue #295 评审 ①）：`esc()` 先把 `&` 换成 `&amp;`，lookbehind 看到的
+// 前一字符因此永远是 `;`——`&` 这个成员在转义后的文本上**不可达**，留着只会让人误以为
+// `&http://…` 不成链。实测（可复现）：
+//   cd portal/frontend && node --experimental-strip-types \
+//     -e "import('./src/lib/markdown.ts').then(m=>console.log(m.renderMarkdown('&http://a.example/x')))"
+//   ⇒ <p>&amp;<a href="http://a.example/x" …>http://a.example/x</a></p>   # `&` 留正文，URL 照链
+// spec 逐字钉住这个形状（`&` 前缀那条用例）。
+//
 // 该集合**不含**空白、括号与中文标点 ⇒ 行首、`见 http://x`、`(http://x)`、`（http://x）`、
 // 以及粗斜体产出的 `>http://x`（`</strong>` 前）都照常成链。
-const URL_LEFT_BOUNDARY = '(?<![\\w/:\\-%&#?+=~@])';
+// `-` 放在字符类末尾（否则会被读成区间，`:`-`%` 直接 SyntaxError）。
+// 这三个常量导出仅供 spec 钉「单一来源 + 逐成员行为」，不属渲染器对外契约。
+export const URL_WORD_SYMBOLS = '/:%#?+=~@-';
+export const URL_WORD_CHARS = '\\w' + URL_WORD_SYMBOLS;
+export const URL_LEFT_BOUNDARY = '(?<![' + URL_WORD_CHARS + '])';
 const BARE_URL_RE = new RegExp(URL_LEFT_BOUNDARY + 'https?://' + URL_BODY, 'gi');
-// 同一字符集但**不看左边界**：给 emphasis 之前的 `_` 保护用（见 inline() 步骤 1.5）——
+// 与 `BARE_URL_RE` 共用 `URL_BODY`、但**不看左边界**：给 emphasis 之前的 `_` 保护用
+// （见 inline() 步骤 1.5）——
 // `xhttp://a.example/a_b_c` 虽不成链，它里面的 `_` 同样不该被当成 emphasis 分隔符。
 const URL_SPAN_RE = new RegExp('https?://' + URL_BODY, 'gi');
 // URL 内下划线的临时占位符（U+E002）：sanitizePua 会把用户输入里的整个私用区区间转成数字
