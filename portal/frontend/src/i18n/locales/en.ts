@@ -276,6 +276,30 @@ export const en = {
       paren: ' ({value})',
     },
   },
+  // Session-page momentum bar + message timestamps (issue #282, blocks A/B). Same key set as zh-CN
+  // (localeParity.spec.ts pins it). `~` marks the rate as an estimate; tokens only ever show real
+  // run_end.usage values (no 0 fabrication), and unknown durations render nothing.
+  runStatus: {
+    aria: 'Run status',
+    running: 'running',
+    idle: 'idle',
+    round: 'round {round}',
+    output: '↑ {size}',
+    rate: '~{rate} tok/s',
+    rateHint: 'Rate is a front-end estimate derived from character counts, not an upstream measurement',
+    tokens: 'tokens ↑{input} ↓{output}',
+    tokensInput: 'tokens ↑{input}',
+    tokensOutput: 'tokens ↓{output}',
+    runElapsed: 'this run {dur}',
+    lastRunElapsed: 'last run {dur}',
+    tools: '{count} tool calls',
+    toolsAvg: ' (avg {dur})',
+    frozen: 'no upstream output for {sec}s',
+    refreshBoundary: 'Run metrics live only on this page: after a hard refresh only message timestamps remain (run_end / usage are not replayed from history)',
+    runningElapsed: 'running for {dur}',
+    runningHint: 'This run is still executing; numbers refresh every second',
+    messageTimeTitle: 'Message time',
+  },
   composer: {
     send: 'Send',
     stop: '■ Stop',

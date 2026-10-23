@@ -285,6 +285,36 @@ export const zhCN = {
       paren: '（{value}）',
     },
   },
+  // 会话页顶部常驻动量状态条 + 消息时刻（issue #282 A/B 两块）。
+  // 口径（「不伪装精确」）：`~` 是速率估算标记（rateHint 双语都写了）；tokens 段只出 run_end.usage
+  // 真值（拿不到就整段不出，绝不显示 0）；时长未知就不出（不写 00:00）。
+  runStatus: {
+    aria: '运行状态',
+    running: '运行中',
+    idle: '空闲',
+    // `round` 是引擎侧标识符（不翻译），只拼数字
+    round: 'round {round}',
+    // 输出量（前端按收到的流式增量累计的 UTF-8 字节数）
+    output: '↑ {size}',
+    // 速率：**必须**带 `~`（前端滑窗估算，不是上游真值）
+    rate: '~{rate} tok/s',
+    rateHint: '速率是前端按字符数近似的估算值（非上游真值）',
+    // 终态 tokens：只出 run_end.usage 真值；没给就整段不出（不显示 0 tokens）
+    tokens: 'tokens ↑{input} ↓{output}',
+    tokensInput: 'tokens ↑{input}',
+    tokensOutput: 'tokens ↓{output}',
+    runElapsed: '本 run {dur}',
+    lastRunElapsed: '上次 run {dur}',
+    tools: '工具 {count} 次',
+    toolsAvg: '（均 {dur}）',
+    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）⇒ 状态条标黄 + 这句
+    frozen: '上游已 {sec}s 无输出',
+    // 硬刷新边界（状态条 tooltip）：run_end / usage 不在历史回放白名单
+    refreshBoundary: '运行态数字只在本页有效：硬刷新后只保留消息时间戳（run_end / usage 不在历史回放白名单）',
+    runningElapsed: '已运行 {dur}',
+    runningHint: '该 run 仍在执行：数值每 1 秒刷新',
+    messageTimeTitle: '消息时刻',
+  },
   // 输入区（components/ComposerBar.vue）
   composer: {
     send: '发送',

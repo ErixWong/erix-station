@@ -2,7 +2,7 @@
 // 消息流（旧 #stream 的渲染语义平移）：addMessage 三分（user/assistant/synthetic）、
 // 助手终稿 markdown（v-html，渲染器本身先转义后格式化，XSS 安全）、工具卡片、
 // roundsep/syserr 分隔行、流式增量气泡。自动跟随/「↓ 最新」由父级持有（scroll 容器也在父级）。
-import { reactive, watch } from 'vue';
+import { computed, reactive, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type StreamEntry, type FoldedInfo, type FoldedOriginalState } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
@@ -11,9 +11,36 @@ import { getToolPreview, getToolResultSummary, formatDuration, isSpecialExecutio
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 // pi-web 风格：流式增量也走 markdown 渲染（渲染器先转义后格式化，半截 ``` 容错收尾）。
 import { renderMarkdown } from '../lib/markdown';
+// issue #282：消息级时刻（A 块）+ 流式气泡上的「已运行 Xs」心跳（B 块在 StreamPanel 的唯一落点；
+// 其余动量数字都在顶部常驻状态条 RunStatusBar 里，见工单「落点」）。
+import { formatMessageTime } from '../lib/messageTime';
+import { formatElapsed } from '../lib/runMomentum';
+import { useRunMomentum } from '../composables/useRunMomentum';
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const store = useWorkbenchStore();
+// 本组件只读派生视图；1s 时钟由 composable 自己起、自己 `onUnmounted` 清（与 RunStatusBar 各一份，
+// 两条 1s interval 的成本可忽略，换来「谁卸载谁清理」的局部性）。
+const { view: momentumView } = useRunMomentum(store.momentum);
+
+/**
+ * issue #282 A：消息时刻文本。`created_at` 缺失/脏值 ⇒ `''`（模板 `v-if` 整段不出），
+ * 绝不把 `undefined` / `Invalid Date` / `NaN` 渲染上屏（格式化规则见 `lib/messageTime.ts`）。
+ */
+function msgTime(en: Extract<StreamEntry, { kind: 'msg' }>): string {
+  return formatMessageTime(en.createdAt, locale.value);
+}
+
+/**
+ * issue #282 B：流式气泡上的实时计时。运行中且有起跑时刻 ⇒「已运行 03:42」；运行中但起跑时刻
+ * 未知（页面中途打开）⇒ 只出「运行中」（不出假时长）；非运行态 ⇒ `''`（气泡本身也在 run_end 时被移除）。
+ */
+const deltaElapsedText = computed(() => {
+  const view = momentumView.value;
+  if (!view.running) return '';
+  const dur = formatElapsed(view.elapsedMs);
+  return dur === '' ? t('runStatus.running') : t('runStatus.runningElapsed', { dur });
+});
 
 // 展开态：组件内 reactive Set 驱动重渲染，模块级 Set（toolCallExpansion）做跨重渲染记忆，
 // 二者双向镜像；entries 重建（SSE 补发/历史重放）后从模块 Set 回灌，展开状态不丢。
@@ -189,12 +216,30 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
   <template v-for="(en, i) in store.entries" :key="entryKey(en, i)">
     <!-- 消息气泡：终稿 markdown 走 v-html；其余纯文本（{{ }} 插值等价 textContent） -->
     <div v-if="en.kind === 'msg'" :class="msgClass(en)">
+      <!-- issue #282 A：每条消息（用户与助手都算）显示时刻；DTO 没给 created_at 就整段不出 -->
+      <time
+        v-if="msgTime(en)"
+        class="msg-time block text-right text-[11px] leading-none text-black/35"
+        :datetime="en.createdAt"
+        :title="t('runStatus.messageTimeTitle')"
+      >{{ msgTime(en) }}</time>
       <div v-if="en.html" v-html="en.html"></div>
       <template v-else>{{ en.text }}</template>
     </div>
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
          类名与助手终稿一致（.msg assistant .md），pi-web 风格下增量与终稿视觉无跳变 -->
-    <div v-else-if="en.kind === 'delta'" class="msg assistant md" v-html="renderMarkdown(en.text)"></div>
+    <!-- issue #282 B：进行中的 run 在流式气泡上带「已运行 Xs」+ 心跳脉冲（复用既有 animate-pulse）；
+         终态后气泡由 run_end 移除、终稿回写为普通消息（时刻定格在消息 `<time>` 上）。 -->
+    <div v-else-if="en.kind === 'delta'" class="msg assistant md">
+      <div
+        class="delta-meta mb-0.5 flex items-center gap-1.5 text-[11px] leading-none text-black/40"
+        :title="t('runStatus.runningHint')"
+      >
+        <span class="heartbeat inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-brand" aria-hidden="true"></span>
+        <span v-if="deltaElapsedText">{{ deltaElapsedText }}</span>
+      </div>
+      <div v-html="renderMarkdown(en.text)"></div>
+    </div>
     <!-- issue #300：中止/失败 run 的**部分正文**（历史端点合成的 partial_output entry）。
          **中性助手气泡**：复用 .msg assistant .md（与助手终稿同一渲染路径），只加一个 `partial`
          修饰类做视觉区分——**不新增颜色语义**，更不进红色 .syserr（半截正文不是错误）。 -->
