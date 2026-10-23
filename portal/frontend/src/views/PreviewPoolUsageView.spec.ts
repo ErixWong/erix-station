@@ -509,6 +509,23 @@ describe('issue #350 自洽关系（§4.7a 三条）：对不上就明说，不�
 describe('issue #350 判据④：与改块流程接上（引用式 + 只读提示，红线：绝不自动改值/自动提交）', () => {
   const BLOCK_PATH = '/api/admin/fdes/alpha-fde/ports/block';
 
+  // 面板的快照是**只读**的（`FdePreviewPortsPane.vue` 头注明写：本面板不发占用总览请求）。
+  // 没有这条断言，那句话只是注释：往 onMounted 里加一句 `loadPreviewUsage()` 全部用例照旧绿（主 agent 实测）。
+  // 隐式请求会把 #246 的「tab 点开才拉端口列表」多挂一个网络依赖，且让审计行数不可预期（每次进面板一行）。
+  it('判据④：打开改块面板**不会**隐式发占用总览请求（快照只读是契约面，不是注释）', async () => {
+    const { wrapper, fetchMock } = await mountAdmin();
+    try {
+      expect(usageCalls(fetchMock)).toHaveLength(0);
+      await openPortsTab(wrapper, 'alice');
+      expect(wrapper.find('[data-test="fde-ports-pane"]').exists()).toBe(true);
+      expect(usageCalls(fetchMock)).toHaveLength(0);
+      // 没看过总览 ⇒ 提示不出现（也不能靠发一次请求去“补全”它）
+      expect(wrapper.find('[data-test="block-occupancy-hint"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
   it('判据④：改块区给出「打开号池占用总览」入口（不新增 data-test 冲突、不动既有确认流程）', async () => {
     const { wrapper } = await mountAdmin();
     try {
