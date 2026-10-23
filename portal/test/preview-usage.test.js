@@ -67,7 +67,7 @@ class UsageStore {
       const [start, end] = params;
       // **谓词由 SQL 决定**（fake 不另写一套）：实现把 `state <> 'released'` 去掉/放宽时，
       // 「released 不占位」那条断言就会真的红（这是本文件最重要一条判据的诚实性来源）。
-      const liveOnly = s.includes("state <> 'released'");
+      const liveOnly = /WHERE pa\.state <> 'released' AND/.test(s);
       const rows = this.rows
         .filter((row) => (!liveOnly || row.state !== 'released') && row.port >= start && row.port <= end)
         .sort((a, b) => a.port - b.port)
