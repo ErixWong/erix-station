@@ -283,6 +283,14 @@ describe('工作台 · 预览端口段已搬进左栏（issue #308）', () => {
       expect(wrapper.find('[data-test="sidebar-bottom-stack"]').exists()).toBe(true);
       // ⑥ 默认折叠（搬进侧栏不改变默认态）
       expect(bar.attributes('aria-expanded')).toBe('false');
+      // ⑦（主 agent 补的覆盖缺口）`<aside>` 自己不再是滚动容器 —— 滚动预算只许两处（列表段 + 底部栈）。
+      //    变异取证：本条不存在时，把 aside 的 `overflow-hidden` 改回 `overflow-y-auto` ⇒ 66 条全绿（抓不住），
+      //    补上后 ⇒ 恰本条红 ⇒ 「三层滚动不打架」在 aside 这一层第一次有牙。
+      const aside = wrapper.get('aside').element;
+      expect(aside.classList.contains('overflow-hidden')).toBe(true);
+      for (const cls of ['overflow-y-auto', 'overflow-auto', 'overflow-scroll']) {
+        expect(aside.classList.contains(cls)).toBe(false);
+      }
     } finally {
       wrapper.unmount();
     }
