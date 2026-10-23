@@ -7,10 +7,18 @@
 //
 // 支持子集：ATX 标题（#~######，支持闭合 #）、围栏代码块（```/~~~ + 语言标注）、
 // 行内代码、粗体/斜体（** __ * _ 及 *** ___）、无序/有序列表（平铺）、表格（含 : 对齐）、
-// 链接（仅 http/https，target=_blank rel=noopener noreferrer，其余协议退化为纯文本）、
-// 裸 URL 自动链接（issue #285 R-1：GFM 风格，同样只放行 http/https；行内代码与围栏代码
-// 内不链、URL 尾部标点不并入 href；`www.` 无协议不链、email/mailto 刻意不做，见 inline()）、
+// 链接（target=_blank rel=noopener noreferrer）、裸 URL 自动链接（issue #285 R-1：GFM 风格；
+// 行内代码与围栏代码内不链、URL 尾部标点不并入 href；`www.` 无协议不链）、
 // 引用（>，递归支持嵌套）。
+//
+// `href` 只可能来自**两个分支**，两个分支的协议白名单都只有 `http(s)://`（issue #295 ③ 定稿）：
+// · markdown 链接分支（`[文本](target)`）：target 由 `/^https?:\/\//i` 白名单判定；
+// · 裸 URL 自动链接分支：正则本身就要求 `https?://` 开头。
+// 没有「相对路径 / 锚点」分支——`[t](/a/b)`、`[t](#a)` 与 `[t](javascript:…)` 一样**不产出
+// href**：target 整体丢弃、只留链接文本（`[点我](javascript:alert(1))` 连 target 里那个 `)`
+// 都留在正文里 ⇒ `<p>点我)</p>`，这是既有形状，spec 的 golden 逐字钉住）。
+// email / `mailto:` 保持纯文本是**刻意口径、不是遗漏**：自动包 mailto 会新开一条 href 协议面
+// （点一下即拉起邮件客户端），不在本渲染器白名单内；要放开得另开单并同步 XSS 判据。
 //
 // 流式容错：未闭合围栏按「吞到文本末尾」收尾——半截 ``` 不会产出未闭合标签 / 炸布局。
 
@@ -31,9 +39,23 @@ const LINK_PLACEHOLDER = (n: number): string => '\uE001' + n + '\uE001';
 // · 裸 `<` 是我们自己插的标签边界（`**http://x**` 已被粗斜体换成 `<strong>http://x</strong>`
 //   ⇒ 自动链接在 `</strong>` 前自然停下）；转义产物 `&lt;`/`&amp;` 里没有裸 `<`，不会误停。
 // · 非 ASCII 不入围 ⇒ 中文与全角标点永远不会跟着进 href（`http://x，端口 8090` 只链到 `x`），
-//   占位符字符（U+E000/E001）也落在这个排除区间里——它们不可能出现在真 URL 里。
+//   占位符字符（U+E000/E001/E002）也落在这个排除区间里——它们不可能出现在真 URL 里。
 //   cmark-gfm 与 linkify-it 同样把自动链接限定在 ASCII 内（未百分号编码的中文路径会截断）。
-const BARE_URL_RE = /https?:\/\/[^\s<>"'`\u0000-\u001f\u007f-\uFFFF]+/gi;
+const URL_BODY = '[^\\s<>"\'`\\u0000-\\u001f\\u007f-\\uFFFF]+';
+// 左边界（issue #295 ②）：前一个字符属于 ASCII 词字符集时**不成链**，与 cmark-gfm / linkify-it
+// 同口径——`xhttp://a.example/x`、`/http://a/x` 是正文，不许从中间切开当链接。
+// 词字符集 = 字母 / 数字 / `_`（= `\w`）+ `/` `:` `-` `%` `&` `#` `?` `+` `=` `~` `@`。
+// 该集合**不含**空白、括号与中文标点 ⇒ 行首、`见 http://x`、`(http://x)`、`（http://x）`、
+// 以及粗斜体产出的 `>http://x`（`</strong>` 前）都照常成链。
+const URL_LEFT_BOUNDARY = '(?<![\\w/:\\-%&#?+=~@])';
+const BARE_URL_RE = new RegExp(URL_LEFT_BOUNDARY + 'https?://' + URL_BODY, 'gi');
+// 同一字符集但**不看左边界**：给 emphasis 之前的 `_` 保护用（见 inline() 步骤 1.5）——
+// `xhttp://a.example/a_b_c` 虽不成链，它里面的 `_` 同样不该被当成 emphasis 分隔符。
+const URL_SPAN_RE = new RegExp('https?://' + URL_BODY, 'gi');
+// URL 内下划线的临时占位符（U+E002）：sanitizePua 会把用户输入里的整个私用区区间转成数字
+// 实体 ⇒ 这个字符不可能来自用户输入；与行内代码占位符 U+E000、链接占位符 U+E001 互不串号。
+const URL_USCORE = '\uE002';
+const URL_USCORE_RE = /\uE002/g;
 
 // 尾部标点不算进 href（`见 http://x.` 的句号、`(http://x)` 的右括号、`http://x,` 的逗号、
 // 以及 `;` `:` `!` `?` 与引号），剥下来留在正文。中文标点不会走到这里——它们在字符类
@@ -72,6 +94,16 @@ function inline(text: string): string {
     codes.push(c);
     return PLACEHOLDER(codes.length - 1);
   });
+  // 1.5) URL 里的 `_` 先保护成 U+E002（issue #295 ①）：粗斜体（步骤 2）跑在链接（步骤 3/4）
+  //      之前，不保护的话 `http://h.example/a_b_c` 会被 `_b_` 当 emphasis 吃掉——裸 URL 与
+  //      markdown 链接的 target 两处同病（`[t](http://h/a_b_c)` 的 href 里会插进 `<em>`）。
+  //      只保护 `_`，**不动** `*`：`**http://x**` 的收尾靠的是步骤 2 先把 `**` 换成 `<strong>`、
+  //      自动链接再在裸 `<` 前停住；动 `*` 会把 `*` 并进 href（见 URL_BODY 的注释）。
+  //      末尾那串 `_` 不保护（留给 emphasis 当闭合标记）：`__see http://x__` 的粗体照旧生效。
+  s = s.replace(URL_SPAN_RE, (m: string) => {
+    const core = m.replace(/_+$/, '');
+    return core.replace(/_/g, URL_USCORE) + m.slice(core.length);
+  });
   // 2) 粗斜体：先 *** 后 ** 再 *（下划线同理，星号与下划线互不越界替换）
   s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -79,8 +111,12 @@ function inline(text: string): string {
   s = s.replace(/___([^_]+)___/g, '<strong><em>$1</em></strong>');
   s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
   s = s.replace(/_([^_\s](?:[^_]*[^_\s])?)_/g, '<em>$1</em>');
+  // 2.5) 还原 URL 内的下划线（必须早于步骤 3/4：链接与自动链接都要拿到真的 `_` 进 href）
+  s = s.replace(URL_USCORE_RE, '_');
   // 3) markdown 链接：仅放行 http(s)；href 保持转义形态（&amp;），引号已转义 → 无属性逃逸面。
-  //    非 http(s) 协议（javascript: data: 等）退化为链接文本纯文本。
+  //    非 http(s) 的 target（javascript: / data: / mailto: / 相对路径 / 锚点）**整体丢弃**、
+  //    只留链接文本（target 里第一个 `)` 之后的部分会留在正文 ⇒ `[点我](javascript:alert(1))`
+  //    渲染成 `<p>点我)</p>`，既有形状，spec golden 钉住）。
   //    ⚠ 产出**先整体占位**、不在 s 里留下真 <a>：否则第 4 步会把已生成的
   //    `<a href="http://…">` 里那段裸 URL 再链一次，做出 <a> 套 <a>。
   s = s.replace(/\[([^\]]+)\]\(\s*([^)\s]+)\s*\)/g, (_m, t: string, u: string) => {

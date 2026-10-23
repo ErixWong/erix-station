@@ -177,6 +177,9 @@ describe('裸 URL 自动链接（issue #285 R-1：助手回复里的裸 URL 在 
   });
 
   it('协议白名单：javascript: / data: / file: / 裸 www. / mailto: 一律保持纯文本', () => {
+    // issue #295 ③：`mailto:` / 邮箱在这里是**刻意口径**、不是漏掉的边界——自动包 mailto 会
+    // 新开一条 href 协议面（点一下即拉起邮件客户端），要放开得另开单并同步 XSS 判据。
+    // 专用判据见下面「issue #295 ③」describe。
     for (const src of [
       'javascript:alert(1)', 'data:text/html,PHN2Zz4=', 'file:///etc/passwd',
       'www.example.com', 'mailto:a@b.example', 'ftp://h.example/f', '邮箱 a.b@c.example',
@@ -366,5 +369,75 @@ describe('回归护栏：HEAD（e61a035）语料逐字不变', () => {
       // 附带 <a> 数量比对：旧输出里出现几只 <a>，新输出就必须还是几只
       expect(countAnchors(renderMarkdown(src)), src).toBe(countAnchors(want));
     }
+  });
+});
+
+// ---- issue #295：链接语义三条后续缺陷（①URL 内的 `_`、②自动链接左边界、③email/mailto 口径）----
+describe('issue #295 ①：URL 内部的 `_` 不被 emphasis 吃掉', () => {
+  it('裸 URL：成对下划线原样进 href 与链文本（旧实现切成 <em>）', () => {
+    expect(renderMarkdown('http://h.example/a_b_c_d')).toBe('<p>' + link('http://h.example/a_b_c_d') + '</p>');
+    // 双下划线（旧实现当 <strong> 吃）同样原样
+    expect(renderMarkdown('http://x/a__b__c')).toBe('<p>' + link('http://x/a__b__c') + '</p>');
+    expect(renderMarkdown('见 http://h.example/a_b_c。')).toBe('<p>见 ' + link('http://h.example/a_b_c') + '。</p>');
+    // 不成链的 URL 形状（②挡掉的 `xhttp://…`）里面的 `_` 也不被当分隔符
+    expect(renderMarkdown('xhttp://a.example/a_b_c')).toBe('<p>xhttp://a.example/a_b_c</p>');
+  });
+
+  it('markdown 链接的 target：href 里不许插 <em>（旧实现 href="…a<em>b</em>c"）', () => {
+    expect(renderMarkdown('[t](http://h.example/a_b_c)')).toBe('<p>' + link('http://h.example/a_b_c', 't') + '</p>');
+    // 链文本侧的 emphasis 照旧（本单只保护 URL 片段，不动文本侧）
+    expect(renderMarkdown('[点_我_](http://h.example/a_b)'))
+      .toBe('<p>' + link('http://h.example/a_b', '点<em>我</em>') + '</p>');
+  });
+
+  it('正文 emphasis 行为逐字不变（保护只作用在 URL 片段内部）', () => {
+    expect(renderMarkdown('_with_ underscores_')).toBe('<p><em>with</em> underscores_</p>');
+    expect(renderMarkdown('_斜_ 与 __粗__')).toBe('<p><em>斜</em> 与 <strong>粗</strong></p>');
+    expect(renderMarkdown('_a_ http://x/b_c_d _e_'))
+      .toBe('<p><em>a</em> ' + link('http://x/b_c_d') + ' <em>e</em></p>');
+    // 包裹 URL 的粗 / 斜体照旧生效（URL 末尾那串 `_` 不保护，留给 emphasis 当闭合标记）
+    expect(renderMarkdown('__see http://x__')).toBe('<p><strong>see ' + link('http://x') + '</strong></p>');
+    expect(renderMarkdown('_see http://x/a_b_')).toBe('<p><em>see ' + link('http://x/a_b') + '</em></p>');
+    // 裸 URL 自身以 `_` 收尾：没有可配对的 emphasis 分隔符 ⇒ 整只留在 href 里
+    expect(renderMarkdown('http://x/a_b_')).toBe('<p>' + link('http://x/a_b_') + '</p>');
+  });
+});
+
+describe('issue #295 ②：自动链接左边界（cmark-gfm / linkify-it 口径）', () => {
+  it('前一个字符属于 ASCII 词字符集 ⇒ 不成链', () => {
+    expect(renderMarkdown('xhttp://a.example/x')).toBe('<p>xhttp://a.example/x</p>');
+    expect(renderMarkdown('/http://a/x')).toBe('<p>/http://a/x</p>');
+    expect(renderMarkdown('a-http://a/x')).toBe('<p>a-http://a/x</p>');
+    expect(renderMarkdown('=http://a/x')).toBe('<p>=http://a/x</p>');
+    expect(renderMarkdown('a_http://a/x')).toBe('<p>a_http://a/x</p>');
+    for (const src of ['xhttp://a.example/x', '/http://a/x', 'a_http://a/x']) {
+      expect(countAnchors(renderMarkdown(src)), src).toBe(0);
+    }
+  });
+
+  it('左边界成立（行首 / 空白 / 括号 / 中文标点）⇒ 照常成链', () => {
+    expect(renderMarkdown('http://a.example/x')).toBe('<p>' + link('http://a.example/x') + '</p>');
+    expect(renderMarkdown('见 http://a.example/x')).toBe('<p>见 ' + link('http://a.example/x') + '</p>');
+    expect(renderMarkdown('（http://a.example/x）')).toBe('<p>（' + link('http://a.example/x') + '）</p>');
+    expect(renderMarkdown('(http://a.example/x)')).toBe('<p>(' + link('http://a.example/x') + ')</p>');
+  });
+});
+
+describe('issue #295 ③：email / mailto 是刻意口径（不是遗漏）', () => {
+  it('邮箱与 mailto: 保持纯文本是**期望**', () => {
+    for (const src of ['a.b@example.com', 'mailto:a@b.example', '给 a.b@example.com 发信', '联系 mailto:a@b.example。']) {
+      const out = renderMarkdown(src);
+      expect(out, src).toBe('<p>' + src + '</p>');
+      expect(countAnchors(out), src).toBe(0);
+      expect(out, src).not.toContain('href');
+    }
+  });
+
+  it('href 只可能来自 http(s)：相对路径 / 锚点 / mailto target 一律不成链', () => {
+    expect(renderMarkdown('[t](/a/b)')).toBe('<p>t</p>');
+    expect(renderMarkdown('[t](#anchor)')).toBe('<p>t</p>');
+    expect(renderMarkdown('[t](mailto:a@b.example)')).toBe('<p>t</p>');
+    // 既有怪形状（target 里第一个 `)` 之后留在正文）：本单不改它，钉住
+    expect(renderMarkdown('[t](javascript:alert(1))')).toBe('<p>t)</p>');
   });
 });
