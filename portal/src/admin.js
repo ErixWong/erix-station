@@ -126,6 +126,23 @@ export async function recordFdePortsListedAudit(pool, { actorId = null, fdeName,
   });
 }
 
+/**
+ * 号池占用总览（issue #256 交付①）的读审计：`GET /api/admin/preview-ports/usage` 只读全池快照，
+ * 也算「读他人的资源」⇒ 照 `recordFdePortsListedAudit` 的先例显式留一行。
+ * `details` **只放计数**（`free_count` / `occupied_block_count` 等）：整份响应体是一张号池快照，
+ * 抄进审计表等于多一份会漂移的副本。
+ */
+export async function recordPreviewPortsUsageListedAudit(pool, {
+  actorId = null, totalBlocks = 0, freeCount = 0, occupiedBlockCount = 0, limit = 0,
+} = {}) {
+  await recordAdminAudit(pool, actorId, 'admin.preview_ports_usage_listed', 'preview_port_pool', {
+    total_blocks: totalBlocks,
+    free_count: freeCount,
+    occupied_block_count: occupiedBlockCount,
+    limit,
+  });
+}
+
 /** 预览端口改块（搬迁）的写审计；只在**真的搬了**时写（幂等空操作按契约零写库，portal.md §4.7a）。 */
 export async function recordFdePortsBlockMovedAudit(pool, {
   actorId = null, fdeName, fromBlockStart = null, toBlockStart, releasedAllocations = 0, inserted = 0, revokedGrants = 0,

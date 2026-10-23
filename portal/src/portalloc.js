@@ -402,6 +402,99 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
 }
 
 /**
+ * 号池占用总览（issue #256 交付①）里 `free_blocks.items` 的**默认**条数。
+ * 段总数是 800（`PREVIEW_PORT_BLOCK_COUNT`），一次全列出来对「选一段空闲号」没有帮助 ⇒ 默认只给前 50 段
+ * 起点 + `has_more`，调用方要更多就用 `?limit=` 显式说。
+ */
+export const PREVIEW_USAGE_FREE_LIMIT_DEFAULT = 50;
+
+/**
+ * 号池**占用总览**（issue #256 交付①，`GET /api/admin/preview-ports/usage`，portal.md §4.7a）。
+ *
+ * 存在的理由：管理员「改块」原本只能填一个数字试错，撞 `409 preview_port_block_taken` 才知道那段被占。
+ * 本函数把「哪几段被占、哪几段整段空闲」一次算清楚，改块因此可以**先选空闲段**。
+ *
+ * 硬性口径（工单 #256 + 与 `firstFreePreviewBlockStart` 同源）：
+ *   - 占用判据 = **全局活行**（`state <> 'released'`，不分 FDE / scope / role），与迁移 0019 的部分唯一索引同口径；
+ *     `released` 行**不占位**（号码可回收是 #246 的硬判据）；
+ *   - **整块**判定：段内有 1 个活行 ⇒ 整段不进 `free_blocks`（与 `firstFreePreviewBlockStart` 的整块跳过一致，
+ *     避免把外来行侵吞进自己的段里）；`partial` = 占 1..N-1 个，`occupied` = 占满整块；
+ *   - `fde_names` **是数组**：单端口覆盖可以造出「一段里多个 FDE」的 mixed 形状，只显示第一个会骗人；
+ *   - 所有数字都从 `previewpool.js` 推导（本函数体内**零端口字面量**，测试有源码级断言）；
+ *   - **只读**：一条 SELECT 取活行端口 + 所属 FDE 名，不写库、不入队 outbox/revision、不加事务。
+ *
+ * @param clientOrPool pg pool 或事务内 client（读端点用 pool 即可）
+ * @param {{ freeLimit?: number }} [opts] freeLimit：`free_blocks.items` 的条数上限（默认 50）
+ */
+export async function previewPortPoolUsage(clientOrPool, { freeLimit = PREVIEW_USAGE_FREE_LIMIT_DEFAULT } = {}) {
+  if (!Number.isInteger(freeLimit) || freeLimit < 1) {
+    throw portsError('preview_ports_invalid_args', 'previewPortPoolUsage: freeLimit 必须是正整数');
+  }
+  const r = await clientOrPool.query(
+    `SELECT pa.port AS port, u.fde_name AS fde_name
+       FROM port_allocations pa
+       LEFT JOIN users u ON u.id = pa.fde_id
+      WHERE pa.state <> 'released' AND pa.port BETWEEN $1 AND $2
+      ORDER BY pa.port ASC`,
+    [PREVIEW_PORT_POOL_START, PREVIEW_PORT_POOL_END],
+  );
+
+  // 块起点 → { 活行数, FDE 名集合 }。名字用 Set 去重（同一 FDE 在一段里的每行都同名）。
+  const byBlock = new Map();
+  for (const row of r.rows ?? []) {
+    const port = Number(row.port);
+    if (!isPreviewPortInPool(port)) continue;   // 池外活行不计入总览（0019 的 CHECK 本就不许，防御性跳过）
+    const start = alignedPreviewBlockStart(port);
+    let entry = byBlock.get(start);
+    if (!entry) {
+      entry = { count: 0, names: new Set() };
+      byBlock.set(start, entry);
+    }
+    entry.count += 1;
+    if (typeof row.fde_name === 'string' && row.fde_name !== '') entry.names.add(row.fde_name);
+  }
+
+  const occupiedBlocks = [];
+  const freeStarts = [];
+  let partial = 0;
+  let occupied = 0;
+  // 遍历池内**每一个对齐块**（不是只遍历被占的块）：空闲段要按号池顺序整段列出来。
+  for (let block = PREVIEW_PORT_POOL_START; block + PREVIEW_PORT_COUNT - 1 <= PREVIEW_PORT_POOL_END; block += PREVIEW_PORT_COUNT) {
+    const entry = byBlock.get(block);
+    if (!entry) {
+      freeStarts.push(block);
+      continue;
+    }
+    if (entry.count >= PREVIEW_PORT_COUNT) occupied += 1;
+    else partial += 1;
+    occupiedBlocks.push({
+      start: block,
+      end: previewBlockEnd(block),
+      occupied_count: entry.count,
+      fde_names: [...entry.names].sort(),
+    });
+  }
+
+  const items = freeStarts.slice(0, freeLimit);
+  return {
+    pool: {
+      start: PREVIEW_PORT_POOL_START,
+      end: PREVIEW_PORT_POOL_END,
+      block_size: PREVIEW_PORT_COUNT,
+      total_blocks: PREVIEW_PORT_BLOCK_COUNT,
+    },
+    occupied_blocks: occupiedBlocks,
+    free_blocks: { items, has_more: freeStarts.length > items.length, limit: freeLimit },
+    summary: {
+      total_blocks: PREVIEW_PORT_BLOCK_COUNT,
+      free: freeStarts.length,
+      partial,
+      occupied,
+    },
+  };
+}
+
+/**
  * 按 `users.fde_name` 取 `{id, fde_name}`；不存在返回 null（调用方 → 404 `not_found`）。
  * **不按 status 过滤**：offboarding 只停用不删号（fde-platform §7.3），`fde_name` 又带 UNIQUE，
  * 所以停用中的 FDE 仍是「已知 FDE」⇒ 列端点回空列表（它的行都已 released）而不是 404。
