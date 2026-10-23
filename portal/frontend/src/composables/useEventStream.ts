@@ -427,7 +427,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     // 索引只记录「这个 provider id 最新对应哪张卡」，供结果/投影关联用；它不参与身份计算。
     rememberCallAlias(callId, { key, runId: runSegment(runId), roundToken: roundTokenFor(runId) });
     hooks.onToolCardCreated(key);
-    return card;
+    // 返回 reactive Map 读回的 proxy 而非 raw card：raw 存进响应式 Map 后，直接 mutate raw
+    // 不触发渲染（与 workbench deltaEntry 同源同因）；后续既有卡片走 get（已是 proxy）本无此问题。
+    return toolCards.get(key)!;
   }
 
   /**

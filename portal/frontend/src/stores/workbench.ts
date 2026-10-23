@@ -494,6 +494,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (old === null) {
       deltaEntry = { kind: 'delta', text: '' };
       entries.value.push(deltaEntry);
+      // ⚠️ 必须改回读数组里的 reactive proxy：数组内部存的是 raw 对象，直接 mutate push 前的
+      // raw 引用不经过 proxy set 陷阱 → 不触发渲染（打字机效果丢失，文字要等下一次
+      // entries 结构变更才"顺带"出现）。indexOf 对 raw/proxy 双向解引用（Vue 数组
+      // instrumentation），removeDeltaEntry 持 proxy 照常命中。
+      const stored = entries.value[entries.value.length - 1];
+      if (stored?.kind === 'delta') deltaEntry = stored;
     }
     if (deltaEntry) deltaEntry.text = v;
   });

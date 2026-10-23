@@ -1857,3 +1857,70 @@ describe('issue #306：终态后补拉 history（partial_output 当场出现，�
     expect(partials(store)).toHaveLength(0); // 守卫生效：不把 s1 的部分正文推进 s2 的流
   });
 });
+
+describe('流式增量气泡响应性（打字机效果回归）', () => {
+  // bug 回归：deltaEntry 曾是 push 进响应式数组前的 raw 对象，watch 回调直接 mutate raw
+  // 不触发渲染 → StreamPanel 不逐段更新，打字机效果丢失（文字等下一次 entries 结构变更
+  // 才"顺带"出现）。修复 = push 后从数组取回 reactive proxy 再持有。
+  // 断言方式：用 vue effect 订阅 delta 条目的 text，每收到一帧 assistant_delta 必须重跑一次。
+  beforeEach(() => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+  });
+
+  it('每帧 assistant_delta 都触发依赖 text 的 effect 重跑（raw mutate 不触发 → 本用例会红）', async () => {
+    const { effect, nextTick } = await import('vue');
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+
+    es.emit('assistant_delta', { seq: 1, text: 'a' });
+    await nextTick(); // 首帧建气泡（watch 回调）
+    const bubble = store.entries.find((e) => e.kind === 'delta') as { kind: 'delta'; text: string } | undefined;
+    expect(bubble).toBeTruthy();
+
+    const texts: string[] = [];
+    let runs = 0;
+    const stop = effect(() => { texts.push(bubble!.text); runs++; });
+    const baseline = runs; // effect 首次自跑一次
+
+    es.emit('assistant_delta', { seq: 2, text: 'b' });
+    await nextTick();
+    es.emit('assistant_delta', { seq: 3, text: 'c' });
+    await nextTick();
+
+    expect(bubble!.text).toBe('abc');
+    // 两帧增量 = 两次响应式更新（raw mutate 下 runs 会停在 baseline）
+    expect(runs - baseline).toBeGreaterThanOrEqual(2);
+    expect(texts.slice(-2)).toEqual(['ab', 'abc']);
+    stop();
+  });
+
+  it('tool_call_delta 增量落到卡片并触发响应式更新（行为钉住；toolCards 同源 raw mutate 隐患修）', async () => {
+    const { effect, nextTick } = await import('vue');
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+
+    es.emit('tool_use', { seq: 1, tool_call_id: 'c1', name: 'shell', input: {} });
+    await nextTick();
+    const card = store.es.toolCards.get('c1')!;
+    let runs = 0;
+    const stop = effect(() => { void card.args; runs++; });
+    const baseline = runs;
+
+    es.emit('tool_call_delta', { seq: 2, tool_call_id: 'c1', arguments_delta: '{"com' });
+    await nextTick();
+    es.emit('tool_call_delta', { seq: 3, tool_call_id: 'c1', arguments_delta: 'mand' });
+    await nextTick();
+
+    expect(card.args).toContain('{"com');
+    expect(runs - baseline).toBeGreaterThanOrEqual(2);
+    stop();
+  });
+});
