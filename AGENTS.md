@@ -1232,6 +1232,31 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **下一片（A：引擎读路径折叠，#353 的站内义务）的前置已就位**：载体口径只此一份，`foldTranscriptRows` 把 `recordOf` 注入化就是为第二个消费者准备 ⇒ **A 不许在新消费点重写载体规则**；接线时要同时改 `portal/test/transcript-fold-wiring.test.js` 对 `internal.js` 的**反向**锁（改成正向）并保留其余反向锁。
 
+### 8.41 预览端口段从工作台顶栏搬进左栏底部堆叠区（issue #308，PR #340，2026-10-23，**纯前端**）
+
+**目的**：端口横条过去卡在顶栏与消息流之间，每次开工作台先吃一垂。搬进**左侧栏底部**与目录树同一堆叠区，各自独立折叠。**14 个文件全在 `portal/frontend/src/**`**；`portal/src/`、`runner/`、`docs/`、两份 lockfile、`docs/data/schema.sql` 零改动。
+
+**已定稿口径**（写进 #308 正文，实现不得再发明）：默认折叠 · **两个独立折叠区**（不共用总开关）· 折叠态**不持久化** · `↻` 语义**不动**（继续只刷目录列表 + 目录树；`usePreviewPorts.load()` **没有 in-flight 守卫**，扩它之前要先加并发闸门，否则手快一点就是并发 GET）· 不预留 #247 图标位 · 不做「无工位管理员」空态分支（#334 已把人挡在门外）。
+
+**三个容易改坏的地方**：
+- **数据所有权跟着搬**：`usePreviewPorts` + `onMounted(load)` 从 `WorkbenchView` 移到 `SidebarPanel`，否则默认折叠的侧栏面板永远不会拉（#246 「进视图就拉一次、折叠也拉、**ticket 绝不预取**」三条语义逐字保持）。
+- **滚动预算只留两层**：列表段（`flex-1 min-h-0 overflow-y-auto`）与底部栈（`max-h-[50vh] overflow-y-auto`）。`<aside>` 由 `overflow-y-auto` 改 **`overflow-hidden`**，目录树自己那层 `max-h-[40vh] overflow-y-auto` **撑掉**。三层嵌套滚动抢滚轮是 #308 审计量出来的真缺陷。
+- **`variant` 默认仍是 `table`**：新形态 `variant='list'`（每行 = 端口 + 短状态 + 打开按钮，第二行 hostname `block w-full min-w-0 truncate`，完整口径挂同元素 `title`/`aria-label`）。侧栏可用宽 ≈**163px**、hostname 继承 14px ⇒ 溢出是被断言的；管理台 `FdePreviewPortsPane` 不传 variant ⇒ 零改动（真机重验：表头 `Port | Preview host | State | Actions` 仍在、list 标记不存在）。
+
+**钩子与契约**：新 `data-test="sidebar-aside" / "sidebar-session-list" / "sidebar-bottom-stack"`（几何/归并判据用）；`preview-ports-toggle` **名字不改**（`ForcePasswordChangeView.spec.ts:115` 拿它当工作台挂载标记，现在在侧栏里、仍全页唯一）；`↻` 的 `title="刷新目录列表与目录树"` 一字未动（两处测试按精确 title 选它）；`GET /api/me/ports` DTO 不碰。
+
+**既有测试没靠放宽变绿**：`SidebarPanel.spec` 的 `paneEls()` 从「根下恰好 3 个子节点、树在最后」改成按钩子定位 + 「树在底部栈**末位**」（意图保留）；树限高断言从「树自己 40vh」改成「栈 50vh + 树不再自带滚动（负面断言）」。
+
+**基线**：根 **1388 / 1384 / 0 / 4 不变**（`portal/src/` 与 `runner/` 零字节）；前端 **36 文件 / 640 → 653**（+13）；typecheck 干净。执行体自跑变异 5 条（并开关 / 默认展开 / 删两个 `data-test` / 去 `truncate`），全红在具名用例。
+
+**主 agent 亲跑变异 3 条（不重叠）+ 一条真覆盖缺口**：① 把树那层 `max-h-[40vh] overflow-y-auto` 加回去 ⇒ **2 条具名红**；② 侧栏 `variant` 用成 `table` ⇒ **3 条具名红**；③ `<aside>` 的 `overflow-hidden` 改回 `overflow-y-auto` ⇒ ⚠ **66 条全绿**——原断言只查「栈内部没有第二个滚动元素」，`aside` 那一层没人钉 ⇒ **定性真覆盖缺口**，补断言后重放同一变异 ⇒ **恰 1 条红**在具名那条（§8.24 / §8.14 口径：「没红」先证明变异不是空操作）。
+
+**真机 5 条全过（路线 A：先验再合，同 §8.34 手法）**：本地构建 PR 镜像临时顶掉 digest pin（备份 `/tmp/deploy.env.bak-308`，验完已还原）⇒ `header.nextElementSibling === MAIN`（横条真的没了）、折叠条在 `aside` 的底部栈内且全页唯一、默认 `aria-expanded=false`、`aside` 无滚动类且**栈内 `overflow-*` 元素数 = 0**、四步开关序列证明两区互不影响（只关端口 ⇒ 树仍可见）、签票 `POST …/preview-ticket` **恰 1 次** + 新标签落预览 host + 当前页 URL 不留票、管理台 Ports tab 仍表格形态。截图 `/docker/erix_station_playwright/pr308-sidebar-ports-expanded.png`。
+
+**真机量到的一条 UX 后果（按设计，不是 bug）**：两区**都展开**时底部栈可视高 `360px` / 内容 `838px` ⇒ 目录树折叠条落在栈底之下 ≈391px，**要在栈里往下滚 ≈478px 才够到**（够得到）；会话列表段可视高 `205px`（≥120px 判据成立）。这是「一套底部滚动预算」的直接结果；要改得在产品上二选一（调大 `50vh` / 两栏都展开时优先保树），另开单拍。像素几何在 jsdom 里是**算术不是实测**，真机不达标时**先调 `50vh`，别再给目录树加回第二层滚动**。
+
+**随带清掉 #334 两笔尾巴**（同一 PR）：`SeatlessAdminGate.spec` / `workbenchGate.spec` 的「无工位管理员」直接挂载夹具（守卫上线后形状已不可达）换成**第②类人 / 畸形 `fde`**；`workbench.ts` / `DirSelect.vue` 注释里「服务端另有 403 写闸」按实际 **400 `validation_failed` + `details.field='fde_name'`** 更正（服务端面零改动）。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 
