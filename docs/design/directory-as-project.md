@@ -82,3 +82,13 @@
 文件面板点击预览：代码高亮 / Markdown 渲染 / 图片直显 + git 变更标记 +
 run 终态自动刷新（SSE 已有终态事件）。实现通道 = portal 读 bind mount，只读，
 边界 = 会话 cwd。
+
+## 9. 补记（issue #284）：目录名不再受「域名段」约束
+
+§3 的「URL 去项目名段」有个常被忘掉的推论：**目录名自此不进 hostname**（hostname =
+`<工位名>-p-<端口>.<伞域>`，迁移 `0008-deprojectize.sql`），于是「DNS label / 合法域名段」不再是
+目录名的约束来源——`projects` 表那条 `PROJECT_NAME_RE` 只服务已退役、只读的 `projects` 表。
+目录名在服务端的唯一硬边界是「`~/projects/` 一级目录 + 无路径穿越」（`sessions.js` 的
+`CWD_RE` / `validateSessionCwd`：只拒 `.` / `..` / 控制字符，字符集与长度不限，下划线天然合法）。
+前端「＋ 新建目录」表单的 `DIR_NAME_RE` 是**另一层更严的、只管新建**的便利校验（issue #284 已补上
+`_`，与后端对齐）；存量目录（哪怕含其它字符）始终可以在目录下拉里直接选中使用。

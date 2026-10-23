@@ -337,7 +337,9 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     await flushPromises();
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
     expect(wrapper.text()).toContain('新建目录'); // modal 标题
-    expect(wrapper.get('label[for="newDirName"]').text()).toBe('目录名（小写字母/数字/连字符）');
+    // issue #284：label 补上「下划线」并写全首尾/长度规则（旧文案只说连字符，与后端口径不符）
+    expect(wrapper.get('label[for="newDirName"]').text())
+      .toBe('目录名（小写字母、数字、下划线、连字符；不能以连字符或下划线开头/结尾；最长 63 字符）');
     expect(wrapper.get('#newDirName').attributes('placeholder')).toBe('例如 my-project');
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['创建', '取消']);
   });
@@ -367,7 +369,7 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
     expect(wrapper.text()).toContain('New directory'); // modal 标题
     expect(wrapper.get('label[for="newDirName"]').text())
-      .toBe('Directory name (lowercase letters / digits / hyphens)');
+      .toBe('Directory name (lowercase letters, digits, underscores, hyphens; must not start or end with a hyphen or underscore; max 63 characters)');
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['Create', 'Cancel']);
   });
 
