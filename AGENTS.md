@@ -1205,6 +1205,12 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **三件后续的顺序（已定，勿自行改方向）**：**B = 本单（已完成）→ C = #339 文档更正 + 夹具哨兵（零产品代码）→ A = 引擎读路径折叠（#353 的站内义务）**。A 必须在 B 之后（否则会把半轮折进一页），且必须等 C 定稿「载体怎么取」——因为 A 会成为 `portal/src/transcript-fold.js` 的**第二个**消费者。
 
+**发版与部署（v0.1.25，2026-10-23）**：main `8d241cd`（版本 0.1.25，两个 job 全绿：质量门禁 + **三镜像构建校验**）→ tag `v0.1.25` → release run `39884453753` success → 清单三镜像与部署机 `docker pull` 后 `docker image inspect .Id` **逐个一致**（portal `9fef3faf…`/`ccce1c7a…`、fde `1642d582…`/`de16b78b…`、proxy `78d68779…`/`f1dcf047…`）→ `deploy/.env` 形态① pin **三项**（本版动 `runner/agentd.js` ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0125`）→ `up -d --no-build` ⇒ portal 实跑 `9fef3faf…`、经 Traefik `healthz=200` → **`docker rm -f` 五台 `fde-*`，reconcile ≈45s 全部重建在 `1642d582…` 且容器内引擎 `0.23.0`**、agentd `sse connected` + `sse ping received`（§8.18 双向链路口径）。
+
+⚠ **只有五台**：发版前经决策者同意 offboard 了两台验收残渣（`pw173jscw` / `ui17kbwg`，10-13 那次浏览器验收建的临时账号）。平台自己的下线流程顺手拿到一次真机记账：`released 10 + 10` 条 allocation、`撤预览 grant（仅 active）0` 条（本来就是 0，关键是 #252 那把「只撤 active」的闸没撞 `used` 行的双向 CHECK）、两台容器消失、`routes.yml` 里两台 host 计数归零、用户 `disabled` + 下线任务 `done`。
+
+**发布物上复验**（不是只信本地镜像）：会话 `4becb332…` 一条真消息 ⇒ run `f49dc486…` `finished / judge_done`（6 轮、↑11,017 ↓179、cacheRead 9,344），`tool_calls` 里 `shell dur=4015ms / exit_code: 0`（#283 的时长面在新镜像上仍正常），助手正文 `done`。dev 残渣：该会话多了两条探针消息（混版冒烟 + 发版冒烟），故意不清。
+
 ### 8.1 实施状态（feat-260922-01-erix-agent-090，2026-09-22）
 
 
