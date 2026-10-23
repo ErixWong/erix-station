@@ -1258,17 +1258,25 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 存在的理由：改块（上一条端点）原本只能填一个数字试错，撞 `409 preview_port_block_taken` 才知道那段被占。
 本端点把「哪几段被占、哪几段整段空闲」一次算清楚 ⇒ 管理员**先选空闲段**再改块。
 
+下面是 `GET /api/admin/preview-ports/usage?limit=3` 的响应（示例里每个数字都互相能推出来，见紧随其后的算术）：
+
 ```json
 {
   "pool": { "start": 22000, "end": 29999, "block_size": 10, "total_blocks": 800 },
   "occupied_blocks": [
     { "start": 22000, "end": 22009, "occupied_count": 10, "fde_names": ["eric"] },
-    { "start": 22010, "end": 22019, "occupied_count": 3, "fde_names": ["bob", "eric"] }
+    { "start": 22010, "end": 22019, "occupied_count": 3, "fde_names": ["bob", "eric"] },
+    { "start": 22050, "end": 22059, "occupied_count": 1, "fde_names": ["dana"] }
   ],
-  "free_blocks": { "items": [22020, 22030], "has_more": true, "limit": 50 },
-  "summary": { "total_blocks": 800, "free": 797, "partial": 1, "occupied": 2 }
+  "free_blocks": { "items": [22020, 22030, 22040], "has_more": true, "limit": 3 },
+  "summary": { "total_blocks": 800, "free": 797, "partial": 2, "occupied": 1 }
 }
 ```
+
+示例自洽（逐字段可推）：`occupied_blocks.length` = 3 = `partial` 2（22010 占 3 个、22050 占 1 个）+ `occupied` 1（22000 占满 10 个）；
+`free` = `total_blocks` 800 − 3 = 797；三类之和 797 + 2 + 1 = 800 = `total_blocks`；
+`limit=3` ⇒ `items.length` = 3 且是**升序的前 3 个**空闲段（22000/22010 被占 ⇒ 从 22020 起；22050 被占 ⇒ 跳过它），
+`has_more=true` 因为还有 797 − 3 = 794 段没列出来。
 
 | 字段 | 口径 |
 |---|---|
@@ -1277,10 +1285,12 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 | `occupied_count` | 该段活行数（`released` 不计） |
 | `fde_names` | **数组**（按名字升序、去重）。单端口覆盖可以造出「一段里多个 FDE」的 mixed 形状 ⇒ 只显示第一个会骗人 |
 | `free_blocks.items` | **整段无人占用**的对齐块起点，升序，默认前 `50` 段（`?limit=` 可改）。段内有 1 个活行就整段不进这里（与 `firstFreePreviewBlockStart` 的整块跳过一致，避免把外来行侵吞进自己的段里） |
-| `free_blocks.has_more` / `limit` | `has_more=true` ⇒ 还有更多空闲段没列出来；`limit` = 本次 `items` 的条数上限 |
-| `summary` | `partial` = 该段被占 1–9 个；`occupied` = 占满整块。`free + partial + occupied == total_blocks`（数的是**全部**段，不是列出来的那几条） |
+| `free_blocks.has_more` / `limit` | `has_more=true` ⇒ 还有更多空闲段没列出来（等价于 `summary.free > items.length`）；`limit` = 本次 `items` 的条数上限 |
+| `summary` | `partial` = 该段被占 1–9 个；`occupied` = 占满整块。`free + partial + occupied == total_blocks`，且 `partial + occupied == occupied_blocks.length`（数的是**全部**段，不是列出来的那几条） |
 
-错误码：`?limit=` 不是 `1–800` 的整数 ⇒ `400 validation_failed` + `details.field='limit'`（复用既有码）。
+`?limit=` 口径：**缺省 / 空串（`?limit=`）= 不修改 ⇒ 用默认值 50**（与门户「留空 = 不修改」的既有语义一致）；
+给值则必须是 `1–800` 的整数，否则 `400 validation_failed` + `details.field='limit'`（复用既有码，**零新错误码**）。
+空白串（`?limit=%20`）**不是**空串 ⇒ 按非法值 400（口径边界不含糊）。
 **审计口径**：读他人资源**必须显式写一行**（照 `admin.fde_ports_listed` 的先例）——
 `action='admin.preview_ports_usage_listed'`、`target='preview_port_pool'`、
 `details={total_blocks, free_count, occupied_block_count, limit}`。**恰好一行**，且 `details` **不放整份响应体**

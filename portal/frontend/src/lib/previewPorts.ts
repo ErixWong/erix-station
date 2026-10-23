@@ -60,8 +60,9 @@ export interface PreviewBlockMoveResult {
 /**
  * 后端错误的关键三面（展示与分支判定都要用；message 一律原文透传，不翻译、不截断）。
  *
- * #256 交付②：另带 `retryAfter`——`ApiError` 上**已经有**这个字段（`api.ts:21` / `api.ts:97`，
- * #255 从 `Retry-After` 头解析，解析不出为 `null`），所以「429 的多久后重试」只在前端补一句文案即可，
+ * #256 交付②：另带 `retryAfter`——`ApiError` 上**已经有**这个字段（类体里的 `retryAfter: number | null` 声明；
+ * 取值来自 `api()` 里 `if (!r.ok)` 分支 `new ApiError(...)` 的最后一个实参
+ * `parseRetryAfter(r.headers.get('Retry-After'))`，解析不出为 `null`），所以「429 的多久后重试」只在前端补一句文案即可，
  * 不需要后端把秒数写进 `error.message`（那会变成两个真相源）。
  */
 export interface PreviewApiError {
