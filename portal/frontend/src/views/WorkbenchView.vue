@@ -15,8 +15,6 @@ import StreamPanel from '../components/StreamPanel.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
-import PreviewPortsPanel from '../components/PreviewPortsPanel.vue';
-import { usePreviewPorts } from '../composables/usePreviewPorts';
 import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
 
 // issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
@@ -94,21 +92,12 @@ function onPickerSelect(id: string) {
   void onSelectSession(id); // 复用现有深链逻辑（同会话刷新 / 跨目录 / 路由 push）
 }
 
-// ---- issue #246 交付② 单 B：预览端口区块（折叠在顶栏下方，默认收起）----
-// 进视图就拉 GET /api/me/ports（面板常驻 DOM，折叠只是不占位）；但**预览 ticket 绝不预取**
-// ——60 秒过期且一次性，预取等于把它用废（点击当场才签，见 usePreviewPorts.openPreview）。
-const ports = usePreviewPorts();
-const portsOpen = ref(false);
-const portCount = computed(() => ports.items.value.length);
-const portsToggleLabel = computed(() => {
-  if (ports.listError.value !== null) return t('previewPorts.toggleFailed');
-  return portCount.value > 0
-    ? t('previewPorts.toggleCount', { count: portCount.value })
-    : t('previewPorts.toggle');
-});
+// ---- issue #308：预览端口段已从本视图的顶栏横条搬进左侧栏底部（SidebarPanel 内，与目录树各自折叠）----
+// 数据所有权也跟着走：usePreviewPorts + onMounted(load) 现在在 SidebarPanel（侧栏在工作台挂载时恒在，
+// 折叠只是不占位）⇒ 「进视图就拉一次、折叠也拉、ticket 绝不预取」的语义逐字不变，
+// 只是不再占消息流上方的垂直空间。本视图不再碰 /api/me/ports。
 
 onMounted(async () => {
-  void ports.load(); // 与 auth 守卫无关：进视图就拉自己的端口列表（能走到这里的人已由 #332 守卫保证有工位）
   if (!auth.user) return; // 守卫保证已登录
   // issue #281：**Vue 不等 onMounted 返回的 Promise** ⇒ 里面每一个 `await` 都必须自己收尾，否则一次
   // /api/dirs 失败就是 Unhandled Rejection（代价真实发生过：v0.1.7 打 tag 时 CI 步骤④ 就红在这两个
@@ -214,38 +203,6 @@ function jumpToLatest() {
       >{{ t('common.logout') }}</button>
     </header>
 
-    <!-- issue #246 交付② 单 B：预览端口区块（折叠条 + 展开面板）；面板常驻 ⇒ 进视图即拉列表 -->
-    <div class="border-b border-black/10 bg-black/[0.02]">
-      <button
-        type="button"
-        data-test="preview-ports-toggle"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-black/5"
-        :aria-expanded="portsOpen"
-        aria-controls="preview-ports-disclosure"
-        @click="portsOpen = !portsOpen"
-      >
-        <span aria-hidden="true">{{ portsOpen ? '▾' : '▸' }}</span>
-        <span class="font-medium">{{ portsToggleLabel }}</span>
-      </button>
-      <div
-        v-show="portsOpen"
-        id="preview-ports-disclosure"
-        class="max-h-72 overflow-y-auto border-t border-black/10 px-3 py-2"
-      >
-        <PreviewPortsPanel
-          :items="ports.items.value"
-          :loading="ports.loading.value"
-          :loaded="ports.loaded.value"
-          :error="ports.listError.value"
-          :ticket-busy-id="ports.ticketBusyId.value"
-          :ticket-error="ports.ticketError.value"
-          :popup-blocked-url="ports.popupBlockedUrl.value"
-          @retry="ports.load()"
-          @open="(item) => void ports.openPreview(item)"
-        />
-      </div>
-    </div>
-
     <main class="flex flex-1 min-h-0">
       <!-- 移动端抽屉遮罩（旧 #backdrop） -->
       <div
@@ -255,10 +212,11 @@ function jumpToLatest() {
       ></div>
       <!-- 侧栏：≥md 静态；<md 抽屉（旧 offcanvas-md + body.drawer-open 的 Tailwind 等价） -->
       <!-- w-60 改 CSS 变量绑定（仅 ≥md 生效），shrink-0 保留 -->
-      <!-- issue #92：aside 改 flex-col 以承载 SidebarPanel 的三段布局（固定头/列表独立滚/树固定底）；
-           overflow-y-auto 保留作兜底——正常三段结构下列表段内部消化滚动，整栏不再滚 -->
+      <!-- issue #92：aside 改 flex-col 以承载 SidebarPanel 的三段布局（固定头/列表独立滚/底部栈）；
+           issue #308：aside 改 overflow-hidden——滚动预算只给两处：列表段（flex-1 min-h-0 overflow-y-auto）
+           与底部栈（max-h-[50vh] overflow-y-auto）。aside 自己不再当第三层滚动容器（否则整栏滚与内层抢滚轮）。 -->
       <aside
-        class="flex w-60 md:w-(--sidebar-w) flex-col shrink-0 overflow-y-auto border-r border-black/10 bg-white p-2"
+        class="flex w-60 md:w-(--sidebar-w) flex-col shrink-0 overflow-hidden border-r border-black/10 bg-white p-2"
         :style="sidebar.asideStyle.value"
         :class="drawerOpen
           ? 'max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:shadow-lg'

@@ -1,7 +1,9 @@
 // SidebarPanel 单测（issue #92）：aside 内 flex-col 三段布局结构断言——
 //   ① 固定头（shrink-0：DirSelect + ＋新会话按钮，不随列表滚动）
 //   ② 会话列表段（flex-1 min-h-0 overflow-y-auto，独立内部滚动；空态文案在此段内）
-//   ③ 目录树面板（DirectoryTree，固定底部、恒可达，shrink-0 透传到其根元素）
+//   ③ 底部堆叠区（issue #308：data-test="sidebar-bottom-stack"，max-h-[50vh] overflow-y-auto 是**唯一**
+//      的底部滚动层，内含「预览端口段（默认折叠）+ 目录树面板（默认折叠、恒在末位）」，两段各自折叠）
+// 定位一律走稳定钩子（sidebar-aside / sidebar-session-list / sidebar-bottom-stack），不靠「根下第 N 子」。
 // 另覆盖：空态文案（「先创建目录」/「暂无会话」）、会话点击 emit 语义保持。
 // issue #332：这里原有「平台管理员提示 + 进入管理台链接」的空态分支已随**入口拦截**拆除（`admin && !fde_name` 的人被路由守卫送去 /admin，走不到工作台）；本文件里的 admin 夹具因此换成第 ② 类人（admin **且**有 fde_name）——他才是能站上工作台的管理员。
 // store 状态直填、fetch 桩掉（不碰真实后端）；路由用 memory-history 的真实 router（router-link 渲染需要）。
@@ -56,24 +58,34 @@ async function mountPanel(
   return wrapper;
 }
 
-// 三段定位助手：根容器 → 固定头 div（第 1 子）/ 列表段 div（第 2 子）/ DirectoryTree 根（末子）
+// 三段定位助手（issue #308：按稳定 data-test 钩子定位，不再靠「根下第 N 个子节点」）：
+//   head = 根下第 1 子（固定头，它没有独立钩子——顺序断言已钉它是第一个）
+//   list = [data-test="sidebar-session-list"]；stack = [data-test="sidebar-bottom-stack"]（底部堆叠区）
+//   tree = 底部栈的末子（「树在最后」的意图保留：端口段在前，树在最后）
 function paneEls(wrapper: Awaited<ReturnType<typeof mountPanel>>) {
-  const root = wrapper.element as HTMLElement; // 组件根 div（单根节点）
+  const root = wrapper.element as HTMLElement; // 组件根 div（单根节点，data-test="sidebar-aside"）
   const kids = Array.from(root.children) as HTMLElement[];
-  return { root, kids, head: kids[0], list: kids[1], tree: kids[kids.length - 1] };
+  const list = root.querySelector<HTMLElement>('[data-test="sidebar-session-list"]')!;
+  const stack = root.querySelector<HTMLElement>('[data-test="sidebar-bottom-stack"]')!;
+  return { root, kids, head: kids[0], list, stack, tree: stack.lastElementChild as HTMLElement };
 }
 
 describe('SidebarPanel · 三段布局（issue #92）', () => {
-  it('根元素为 flex-col 容器：h-full + min-h-0，三段按 固定头→列表→树 顺序排列', async () => {
+  it('根元素为 flex-col 容器：h-full + min-h-0，三段按 固定头→列表→底部栈 顺序排列', async () => {
     const wrapper = await mountPanel({
       dirs: [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }],
     });
-    const { root, kids, tree } = paneEls(wrapper);
+    const { root, kids, list, stack, tree } = paneEls(wrapper);
     expect(root.classList).toContain('flex');
     expect(root.classList).toContain('flex-col');
     expect(root.classList).toContain('h-full');
     expect(root.classList).toContain('min-h-0');
-    expect(kids).toHaveLength(3); // 固定头 div + 列表段 div + DirectoryTree
+    // issue #308：三段仍是 3 个直接子节点（固定头 / 列表段 / 底部栈），但**底部栈是第三段**，
+    // 树与端口段都在栈内 ⇒ 用钩子定位，顺序断言保留（head 第一、stack 末一）。
+    expect(kids).toHaveLength(3);
+    expect(kids[0]).toBe(paneEls(wrapper).head);
+    expect(kids[1]).toBe(list);
+    expect(kids[2]).toBe(stack);
     expect(tree.classList).toContain('mt-3'); // DirectoryTree 根自带上分隔线边距（确认末子是树面板）
     expect(tree.textContent).toContain('目录树');
   });
@@ -124,28 +136,34 @@ describe('SidebarPanel · 三段布局（issue #92）', () => {
     expect(paneEls(w3).list.textContent).toContain('暂无会话');
   });
 
-  it('目录树面板固定底部：末子元素 + shrink-0（透传合并到 DirectoryTree 根元素）', async () => {
+  it('目录树面板在底部栈末位：末子元素 + shrink-0（透传合并到 DirectoryTree 根元素）', async () => {
     const wrapper = await mountPanel({
       dirs: [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }],
       sessions: Array.from({ length: 15 }, (_, i) => ({ id: String(i), title: `s${i}` })), // 15 条也不改变结构
     });
-    const { root, kids, tree } = paneEls(wrapper);
-    expect(root.lastElementChild).toBe(tree);
+    const { stack, tree } = paneEls(wrapper);
+    expect(stack.lastElementChild).toBe(tree); // 「树在最后」的意图保留（端口段在它之前）
     expect(tree.classList).toContain('shrink-0');
-    expect(tree.classList).toContain('border-t'); // 树面板与列表段之间的分隔线（原样式保持）
-    expect(kids[1].querySelectorAll('[data-session-row]').length).toBe(15); // 会话行全在列表段内（issue #112 扁平行）
+    expect(tree.classList).toContain('border-t'); // 树面板与端口段之间的分隔线（原样式保持）
+    expect(paneEls(wrapper).list.querySelectorAll('[data-session-row]').length).toBe(15); // 会话行全在列表段内（issue #112 扁平行）
   });
 
-  it('目录树面板限高 + 内部滚动：根元素含 max-h-[40vh] 与 overflow-y-auto（保留 shrink-0/mt-3/border-t）', async () => {
+  // issue #308：高度/滚动预算只留一层——底部栈是**唯一**的底部滚动容器，
+  // 树与端口面板都不再自带 max-h/overflow（否则三层嵌套滚动会抢滚轮）。
+  it('底部栈是唯一的底部滚动容器：max-h-[50vh] + overflow-y-auto；树自己那层 max-h-[40vh] 已撤', async () => {
     const wrapper = await mountPanel({
       dirs: [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }],
     });
-    const { tree } = paneEls(wrapper);
-    expect(tree.classList).toContain('max-h-[40vh]');
-    expect(tree.classList).toContain('overflow-y-auto');
+    const { stack, tree } = paneEls(wrapper);
+    expect(stack.classList).toContain('max-h-[50vh]'); // 高度预算（50vh）
+    expect(stack.classList).toContain('overflow-y-auto'); // 唯一滚动层
+    expect(stack.classList).toContain('shrink-0'); // 栈不缩列表段为负
     expect(tree.classList).toContain('shrink-0'); // 原透传类保留
     expect(tree.classList).toContain('mt-3'); // 自带分隔边距保留
     expect(tree.classList).toContain('border-t');
+    // 负面断言：树不再自带滚动/限高（否则与底部栈嵌套抢滚轮）
+    expect(tree.classList).not.toContain('overflow-y-auto');
+    expect(tree.classList).not.toContain('max-h-[40vh]');
   });
 
   it('会话点击语义保持：emit select-session（session id）', async () => {
