@@ -252,3 +252,35 @@ describe('工作台 · 预览端口区块', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #308：区块从「顶栏与 main 之间的全宽横条」搬进左侧栏底部（aside 内的底部堆叠区），
+// 与目录树各自折叠。本套件钉搬迁的**结构事实**（工单 §五.6 的可判形式）与那条不得破坏的标记契约。
+// ---------------------------------------------------------------------------
+describe('工作台 · 预览端口段已搬进左栏（issue #308）', () => {
+  it('折叠条在 aside 的底部栈里；header 之后直接是 main（横条确已消失）；标记仍唯一', async () => {
+    const { wrapper } = await mountWorkbench(FDE_USER, (url, init) =>
+      url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: THREE_PORTS }) : undefined);
+    try {
+      const bar = toggle(wrapper);
+      // ① 标记契约：`preview-ports-toggle` 在工作台挂载时必须存在（#255 拿它当挂载标记，不许改名/删除）
+      expect(wrapper.find('[data-test="preview-ports-toggle"]').exists()).toBe(true);
+      expect(document.querySelectorAll('[data-test="preview-ports-toggle"]')).toHaveLength(1); // 搬完不留旧的一份
+      // ② 位置：在 aside 内的底部堆叠区里（与目录树同栈）
+      expect(bar.element.closest('aside')).not.toBeNull();
+      expect(bar.element.closest('[data-test="sidebar-bottom-stack"]')).not.toBeNull();
+      // ③ 结构判据：header 的下一个兄弟就是 main ⇒ 顶栏与消息流之间不再有端口区块
+      expect(wrapper.get('header').element.nextElementSibling!.tagName.toLowerCase()).toBe('main');
+      // ④ 消息流那一栏（aside 的兄弟 section）里没有端口面板（面板只在侧栏里）
+      expect(wrapper.get('main > section').element.querySelector('[data-test="preview-ports-panel-body"]')).toBeNull();
+      // ⑤ 三个几何钩子在工作台 DOM 上都在
+      expect(wrapper.find('[data-test="sidebar-aside"]').exists()).toBe(true);
+      expect(wrapper.find('[data-test="sidebar-session-list"]').exists()).toBe(true);
+      expect(wrapper.find('[data-test="sidebar-bottom-stack"]').exists()).toBe(true);
+      // ⑥ 默认折叠（搬进侧栏不改变默认态）
+      expect(bar.attributes('aria-expanded')).toBe('false');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+});

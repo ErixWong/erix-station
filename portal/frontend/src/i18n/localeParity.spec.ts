@@ -71,14 +71,25 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
   it('state 文案不承诺「健康/运行中」（active 只代表首次凭证放行过）', () => {
     const zhValues = Object.values(zhCN.previewPorts.state as Record<string, string>);
     const enValues = Object.values(en.previewPorts.state as Record<string, string>);
-    for (const text of [...zhValues, zhCN.previewPorts.stateHint, zhCN.previewPorts.title]) {
+    // issue #308：侧栏紧凑形态的**短**标签与作用域说明行同样受这条红线约束（不能换个短词就写成「运行中」）
+    const zhShort = Object.values(zhCN.previewPorts.stateShort as Record<string, string>);
+    const enShort = Object.values(en.previewPorts.stateShort as Record<string, string>);
+    for (const text of [...zhValues, ...zhShort, zhCN.previewPorts.stateShortUnknown, zhCN.previewPorts.scopeHint, zhCN.previewPorts.stateHint, zhCN.previewPorts.title]) {
       expect(text).not.toMatch(/健康/);
       expect(text).not.toMatch(/运行中/);
     }
-    for (const text of [...enValues, en.previewPorts.stateHint, en.previewPorts.title]) {
+    for (const text of [...enValues, ...enShort, en.previewPorts.stateShortUnknown, en.previewPorts.scopeHint, en.previewPorts.stateHint, en.previewPorts.title]) {
       expect(text).not.toMatch(/healthy/i);
       expect(text).not.toMatch(/running/i);
     }
+  });
+
+  // issue #308：紧凑形态的短标签键集必须与 state.* 一一对应（新增 state 取值会立刻要求补短标签）
+  it('issue #308：previewPorts.stateShort 键集 = PREVIEW_PORT_STATES（与 state.* 同步）', () => {
+    const zhShort = zhCN.previewPorts.stateShort as Readonly<Record<string, string>>;
+    const enShort = en.previewPorts.stateShort as Readonly<Record<string, string>>;
+    expect(Object.keys(zhShort).sort()).toEqual([...PREVIEW_PORT_STATES].sort());
+    expect(Object.keys(enShort).sort()).toEqual([...PREVIEW_PORT_STATES].sort());
   });
 
   it('改块确认文案必须点名「立刻失效 / 404 / 链接会断」三要素（二次确认的判据）', () => {

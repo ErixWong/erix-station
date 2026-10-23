@@ -786,3 +786,202 @@ describe('SidebarPanel · 会话消息数（issue #197）', () => {
     expect(metaOf(wrapper).textContent).not.toContain('条消息');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #308：预览端口段搬进左栏底部 + 与目录树**各自独立**折叠（都默认折叠、不持久化）。
+// 本套件钉四件事（对应工单 M2 要求）：
+//   ① 三个几何钩子存在且位置正确（sidebar-aside / sidebar-session-list / sidebar-bottom-stack）；
+//   ② 默认折叠态（两段都收起、面板不占位、树不请求、但端口列表**照样拉一次**）；
+//   ③ 两个开关互不影响（不共用总开关）；
+//   ④ 几何/滚动预算：底部栈是唯一的底部滚动层，hostname 溢出不撑破 163px 宽（截断 + title 可达）。
+//   另钉作用域（§3.4）：切目录不重发 GET /api/me/ports、列表不空。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · 预览端口段与底部堆叠区（issue #308）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+  const DIR_B: DirInfo[] = [{ name: 'b', cwd: '~/projects/b', running_count: 0, queued_count: 0 }];
+  const UUID = (n: number) => `aaaaaaaa-0000-4000-8000-00000000220${n}`;
+
+  function portRow(n: number, state: string) {
+    return {
+      id: UUID(n),
+      port: 22000 + n,
+      hostname: `alice-p-${22000 + n}.fde.erix.vip`,
+      url: `http://alice-p-${22000 + n}.fde.erix.vip:8090`,
+      state,
+      scope: 'fde',
+      role: 'spare',
+      exposure: 'private',
+    };
+  }
+
+  const THREE_PORTS = [portRow(0, 'allocated'), portRow(1, 'active'), portRow(2, 'active')];
+
+  /** 按 URL 分派的 fetch 桩（记录 url/method）：/api/me/ports 给 items，其余给空列表。 */
+  function stubRoutes(items: unknown[] = THREE_PORTS) {
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, method: init?.method ?? 'GET' });
+      const body = url.startsWith('/api/me/ports') ? { items } : { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    return calls;
+  }
+
+  /** jsdom 的 Response.json 走 macrotask ⇒ 端口列表的落地要真推一次宏任务再冲微任务。 */
+  const tick = async (ms = 30) => {
+    await new Promise((r) => setTimeout(r, ms));
+    await flushPromises();
+  };
+
+  const portsCalls = (calls: Array<{ url: string }>) =>
+    calls.filter((c) => c.url.startsWith('/api/me/ports'));
+
+  const toggleOf = (wrapper: Awaited<ReturnType<typeof mountPanel>>) =>
+    wrapper.get('[data-test="preview-ports-toggle"]');
+
+  it('三个几何钩子存在且位置正确：根 = sidebar-aside，底部栈是根的末子，树在栈内末位', async () => {
+    stubRoutes();
+    const wrapper = await mountPanel({ dirs: DIR });
+    const { root, kids, list, stack, tree } = paneEls(wrapper);
+    expect(root.getAttribute('data-test')).toBe('sidebar-aside');
+    expect(list.getAttribute('data-test')).toBe('sidebar-session-list');
+    expect(stack.getAttribute('data-test')).toBe('sidebar-bottom-stack');
+    expect(kids[2]).toBe(stack); // 固定头 → 列表 → 底部栈
+    expect(stack.contains(tree)).toBe(true); // 树在栈内（端口段之后）
+    expect(stack.contains(toggleOf(wrapper).element)).toBe(true); // 端口折叠条也在栈内（已离开顶栏）
+    // 面板本体钩子保持（#246 既有契约，不许改名）
+    expect(wrapper.find('[data-test="preview-ports-panel-body"]').exists()).toBe(true);
+  });
+
+  it('默认折叠：端口段与目录树都收起；面板不占位；但端口列表照样拉一次（折叠也拉）', async () => {
+    const calls = stubRoutes();
+    const wrapper = await mountPanel({ dirs: DIR });
+    await tick();
+
+    // 端口段：aria-expanded=false + v-show 收起（display:none ⇒ 不占垂直空间）
+    expect(toggleOf(wrapper).attributes('aria-expanded')).toBe('false');
+    const disclosure = wrapper.get('#preview-ports-disclosure').element as HTMLElement;
+    expect(disclosure.style.display).toBe('none');
+
+    // 目录树：折叠标记 ▸ + 树根层不请求（折叠不等于已加载）
+    const { tree } = paneEls(wrapper);
+    expect(tree.textContent).toContain('▸');
+    expect(calls.filter((c) => c.url.startsWith('/api/files/tree'))).toHaveLength(0);
+
+    // 折叠也拉：进视图即一次 GET /api/me/ports（#246 语义逐字保持）
+    expect(portsCalls(calls)).toHaveLength(1);
+    // 折叠态零签票（票 60 秒过期且一次性，绝不预取）
+    expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0);
+    // 折叠条收起态也给可用信息：条数
+    expect(toggleOf(wrapper).text()).toContain('预览端口（3 个）');
+  });
+
+  it('两个开关互不影响（不共用总开关）：展开端口不动目录树，收起端口不影响已展开的树', async () => {
+    const calls = stubRoutes();
+    const wrapper = await mountPanel({ dirs: DIR });
+    await tick();
+    const { tree } = paneEls(wrapper);
+    const treeToggle = Array.from(tree.querySelectorAll('button'))
+      .find((b) => b.textContent?.includes('目录树'))!;
+
+    // 展开端口段：树仍然收起（▸），且没触发树的请求
+    await toggleOf(wrapper).trigger('click');
+    await tick();
+    expect(toggleOf(wrapper).attributes('aria-expanded')).toBe('true');
+    expect(treeToggle.textContent).toContain('▸');
+    expect(calls.filter((c) => c.url.startsWith('/api/files/tree'))).toHaveLength(0);
+
+    // 展开目录树：端口段仍展开（两个独立状态，不是二选一）
+    treeToggle.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await tick();
+    expect(treeToggle.textContent).toContain('▾');
+    expect(toggleOf(wrapper).attributes('aria-expanded')).toBe('true');
+    expect(calls.filter((c) => c.url.startsWith('/api/files/tree')).length).toBeGreaterThan(0);
+
+    // 收起端口段：树保持展开
+    await toggleOf(wrapper).trigger('click');
+    expect(toggleOf(wrapper).attributes('aria-expanded')).toBe('false');
+    expect(treeToggle.textContent).toContain('▾');
+  });
+
+  it('只有一个滚动容器负责滚：底部栈是栈内唯一 overflow-y-auto，面板/树/端口行都不带滚动', async () => {
+    stubRoutes();
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '1', title: 's1' }] });
+    await tick();
+    await toggleOf(wrapper).trigger('click');
+    await tick();
+
+    const { list, stack } = paneEls(wrapper);
+    // 底部栈：唯一的高度/滚动预算层
+    expect(stack.classList).toContain('max-h-[50vh]');
+    expect(stack.classList).toContain('overflow-y-auto');
+    // 栈内再没有第二个滚动容器（嵌套滚动会互相抢滚轮）
+    const scrollersInStack = Array.from(stack.querySelectorAll<HTMLElement>('*'))
+      .filter((el) => el.classList.contains('overflow-y-auto') || el.classList.contains('overflow-auto')
+        || el.classList.contains('overflow-scroll'));
+    expect(scrollersInStack.map((el) => el.getAttribute('data-test') ?? el.className)).toEqual([]);
+    // 面板本体（list 形态）与目录树都不自带滚动/限高
+    const body = wrapper.get('[data-test="preview-ports-panel-body"]').element as HTMLElement;
+    for (const el of [body, body.querySelector('[data-test="preview-ports-list"]') as HTMLElement, paneEls(wrapper).tree]) {
+      expect(el.classList.contains('overflow-y-auto')).toBe(false);
+      expect(el.classList.contains('overflow-auto')).toBe(false);
+      expect(el.classList.contains('max-h-72')).toBe(false);
+    }
+    // 列表段是另一处（互不嵌套的）独立滚动区
+    expect(list.classList).toContain('overflow-y-auto');
+    expect(stack.contains(list)).toBe(false);
+  });
+
+  it('hostname 溢出不撑破布局：紧凑行每层 min-w-0、hostname 是 block w-full truncate、title 是完整 url', async () => {
+    stubRoutes();
+    const wrapper = await mountPanel({ dirs: DIR });
+    await tick();
+    await toggleOf(wrapper).trigger('click');
+    await tick();
+
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows).toHaveLength(3);
+    const row = rows[0];
+    const hostname = row.get('[data-test="preview-port-hostname"]');
+    // 可见文本是 hostname，完整 url 在 title 里（截断后可恢复 + 复制的是完整 url）
+    expect(hostname.text()).toBe('alice-p-22000.fde.erix.vip');
+    expect(hostname.attributes('title')).toContain('http://alice-p-22000.fde.erix.vip:8090');
+    // 截断纪律：hostname 自己是 block w-full truncate，且它的祖先链都允许收缩（min-w-0）
+    expect(hostname.classes()).toContain('truncate');
+    expect(hostname.classes()).toContain('w-full');
+    expect(hostname.classes()).toContain('min-w-0');
+    expect(row.classes()).toContain('min-w-0');
+    expect(row.element.firstElementChild!.classList).toContain('min-w-0');
+    const body = wrapper.get('[data-test="preview-ports-panel-body"]');
+    expect(body.classes()).toContain('min-w-0');
+    // 4 列表格形态不进侧栏（163px 装不下，会把面板撑破）
+    expect(wrapper.find('[data-test="preview-ports-table"]').exists()).toBe(false);
+    // 短状态标签也允许收缩，完整口径在 title 上
+    const state = row.get('[data-test="preview-port-state"]');
+    expect(state.classes()).toContain('truncate');
+    expect(state.classes()).toContain('min-w-0');
+    expect(state.attributes('title')).toBe('已分配 · 待首次访问');
+    // 作用域说明行（§3.4：端口是工位级资源，与所选目录无关）
+    expect(wrapper.text()).toContain('本工位的预览端口，与所选目录无关');
+  });
+
+  it('作用域：切目录不重发 GET /api/me/ports、列表不清空（端口跟工位走，不跟 cwd 走）', async () => {
+    const calls = stubRoutes();
+    const wrapper = await mountPanel({ dirs: DIR });
+    await tick();
+    await toggleOf(wrapper).trigger('click');
+    await tick();
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(3);
+
+    const store = useWorkbenchStore();
+    store.dirs = [DIR[0], DIR_B[0]];
+    store.dirCwd = DIR_B[0].cwd; // 切到另一个目录（树会 reload，端口列表不该动）
+    await tick();
+
+    expect(portsCalls(calls)).toHaveLength(1); // 仍然是进视图那一次
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(3);
+    expect(wrapper.get('[data-test="preview-port-hostname"]').text()).toBe('alice-p-22000.fde.erix.vip');
+    expect(toggleOf(wrapper).text()).toContain('预览端口（3 个）');
+  });
+});
