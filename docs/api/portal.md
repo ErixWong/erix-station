@@ -63,6 +63,7 @@
 | 端口 | `GET /api/me/ports` | **本人预览端口列表**（#246 交付②，§4.7a：只列活行、含签票要的 `id`） |
 | 端口 | `GET /api/admin/fdes/:fdeName/ports` | **管理员列他人预览端口**（#246 交付②，§4.7a；读他人资源**必写审计**） |
 | 端口 | `POST /api/admin/fdes/:fdeName/ports/block` | **管理员改块 = 搬迁事务**（#246 交付②，§4.7a：同事务释放旧块 + 撤 grant + 插新块 + 入队两条派生链） |
+| 端口 | `GET /api/admin/preview-ports/usage` | **号池占用总览（只读）**（#256 交付①，§4.7a：哪几段被占 / 哪几段整段空闲 + `fde_names`，让改块先选空闲段；读他人资源必写审计） |
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 端口 | `POST /api/me/ports/batch-tickets` | **一键放行整组：一次请求签 N 张预览票**（#247，§4.7a：上限 = 号池块大小、越界 `404`、审计逐张、零新错误码） |
@@ -1248,6 +1249,42 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 **审计口径**：读他人资源**必须显式写一行** `audit_log`（不假定框架已自动写——评审已查实现有 admin GET 未一致落实审计）：
 `action='admin.fde_ports_listed'`、`actor_id=` 管理员用户 id、`target=` 被读的 FDE 名、
 `details={fde_name, item_count}`。**恰好一行**（多写也算噪声）；`400/403/404` **不写**审计。
+
+#### `GET /api/admin/preview-ports/usage` —— 号池占用总览（issue #256 交付①）
+
+`requireAdmin`（同其它 `/api/admin/*`，非 admin → `403 forbidden`，**零新错误码**）。**只读**：
+一条 `SELECT` 取全局活行端口 + 所属 `fde_name`（`LEFT JOIN users`），不写库、不入队 outbox/revision、不开事务。
+
+存在的理由：改块（上一条端点）原本只能填一个数字试错，撞 `409 preview_port_block_taken` 才知道那段被占。
+本端点把「哪几段被占、哪几段整段空闲」一次算清楚 ⇒ 管理员**先选空闲段**再改块。
+
+```json
+{
+  "pool": { "start": 22000, "end": 29999, "block_size": 10, "total_blocks": 800 },
+  "occupied_blocks": [
+    { "start": 22000, "end": 22009, "occupied_count": 10, "fde_names": ["eric"] },
+    { "start": 22010, "end": 22019, "occupied_count": 3, "fde_names": ["bob", "eric"] }
+  ],
+  "free_blocks": { "items": [22020, 22030], "has_more": true, "limit": 50 },
+  "summary": { "total_blocks": 800, "free": 797, "partial": 1, "occupied": 2 }
+}
+```
+
+| 字段 | 口径 |
+|---|---|
+| `pool` | 号池边界 / 块大小 / 段总数，**全部从 `previewpool.js` 推导**（端点实现里零端口字面量，单测有源码级断言） |
+| `occupied_blocks` | **只列有活行的段**，按 `start` 升序。占用判据 = **全局活行**（`state <> 'released'`，不分 FDE / scope / role），与迁移 0019 的 `port_allocations_live_global_port_key` **同口径**；`released` 行**不占位**（号码可回收是 #246 的硬判据） |
+| `occupied_count` | 该段活行数（`released` 不计） |
+| `fde_names` | **数组**（按名字升序、去重）。单端口覆盖可以造出「一段里多个 FDE」的 mixed 形状 ⇒ 只显示第一个会骗人 |
+| `free_blocks.items` | **整段无人占用**的对齐块起点，升序，默认前 `50` 段（`?limit=` 可改）。段内有 1 个活行就整段不进这里（与 `firstFreePreviewBlockStart` 的整块跳过一致，避免把外来行侵吞进自己的段里） |
+| `free_blocks.has_more` / `limit` | `has_more=true` ⇒ 还有更多空闲段没列出来；`limit` = 本次 `items` 的条数上限 |
+| `summary` | `partial` = 该段被占 1–9 个；`occupied` = 占满整块。`free + partial + occupied == total_blocks`（数的是**全部**段，不是列出来的那几条） |
+
+错误码：`?limit=` 不是 `1–800` 的整数 ⇒ `400 validation_failed` + `details.field='limit'`（复用既有码）。
+**审计口径**：读他人资源**必须显式写一行**（照 `admin.fde_ports_listed` 的先例）——
+`action='admin.preview_ports_usage_listed'`、`target='preview_port_pool'`、
+`details={total_blocks, free_count, occupied_block_count, limit}`。**恰好一行**，且 `details` **不放整份响应体**
+（那是一张号池快照，抄进审计表等于多一份会漂移的副本）；`400/403/405` **不写**审计。
 
 #### `POST /api/admin/fdes/:fdeName/ports/block` —— 改块 = **搬迁**
 
