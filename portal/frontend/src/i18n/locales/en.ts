@@ -253,15 +253,32 @@ export const en = {
       runEndNormal: 'completed normally',
       missedRunEnd: 'This run ended while the connection was interrupted (see run history)',
       runFailed: 'run failed: {code} — {message}',
-      // issue #212: user-readable labels for the newly surfaced fail reasons (keys are the raw
-      // engine reason strings, not camelCase, so they line up 1:1 with EXPLAINED_FAIL_REASONS in
-      // lib/terminationReasons.ts). Existing failed / aborted / max_rounds_cap keep passing the
-      // raw enum through — unchanged baseline.
+      // issue #212: user-readable labels for the surfaced fail reasons (keys are the raw
+      // engine reason strings, not camelCase, so they line up 1:1 with RUN_END_LABEL_REASONS in
+      // lib/terminationReasons.ts). issue #236: **every reason except `end_turn`** has a label
+      // (`end_turn` keeps `runEndNormal`); #212's "existing failed / aborted / max_rounds_cap keep
+      // passing the raw enum through" is superseded by #236 (a stopped run must read as native
+      // language, and the termination separator is now projected into history for every reason).
+      // Unknown/future engine reasons stay out of this table ⇒ the raw reason is shown (§5.3).
       runEndReason: {
         // the run snapshot never reached the store → crash recovery may replay tool side effects
         persistence_failed: 'run snapshot not persisted (side effects may repeat on resume)',
         // the final answer never passed the final guard → the user must review it
         final_guard_unverified: 'final answer not verified',
+        // issue #236: user pressed stop (previously rendered as the bare English `aborted`)
+        aborted: 'stopped by user',
+        // engine reported a failure (`termination.errorCode` appends `(code=…)` when present)
+        failed: 'run failed',
+        // hit the round cap (finishes, but it is an abnormal truncation)
+        max_rounds_cap: 'round cap reached',
+        // the model stopped calling tools (a normal terminal reason)
+        no_tool: 'model made no further tool calls',
+        // the round judge decided the goal was met (an opinion, not an independent check)
+        judge_done: 'judge decided done',
+        // several rounds produced no new output
+        stall: 'stalled (no new output)',
+        // the continuation budget ran out
+        continuation_exhausted: 'continuation budget exhausted',
       },
       // issue #212: persistence detail forwarded from the engine termination
       // (operation/phase/sideEffect) — the workbench must show the phase

@@ -67,11 +67,14 @@ export type TerminationReason = (typeof TERMINATION_REASONS)[number];
 export const TERMINATION_REASON_SET: ReadonlySet<string> = new Set<string>(TERMINATION_REASONS);
 
 /**
- * 前端红色告警子集（issue #42 的三值 + issue #212 补的两值）：
+ * issue #212 的红色告警子集（issue #42 的三值 + #212 补的两值）：
  *   * `persistence_failed` = **快照没落盘**——崩溃恢复可能重复副作用，语义最重，必须红色；
  *   * `final_guard_unverified` = **终稿未经核验**（finalGuard 修订重试耗尽 fail-closed），用户必须看见。
- * 其余（end_turn / no_tool / judge_done / stall / max_rounds_cap… 之外的正常原因）保持灰色中性分隔条。
- * 注：`stall` / `continuation_exhausted` 属「截断但非故障」，本次按现状保持灰色（不在 #212 范围）。
+ * 注：`stall` / `continuation_exhausted` 属「截断但非故障」，按现状保持灰色（不在 #212 范围）。
+ *
+ * ⚠ issue #236 起这个集合**不再直接等于「界面上刷红」的集合**：它是「非正常收尾」的功能面判据
+ * （#261B 重试面 / #306 终态补拉），界面分级看下面 `RUN_TERMINATION_SYSERR_REASONS`（两者差一个
+ * `aborted`——用户主动停止不是故障）。
  */
 export const RUN_FAIL_REASON_LIST = [
   'failed',
@@ -85,15 +88,55 @@ export const RUN_FAIL_REASON_LIST = [
 export const RUN_FAIL_REASONS: ReadonlySet<string> = new Set<string>(RUN_FAIL_REASON_LIST);
 
 /**
+ * 用户**主动停止**的终态 reason（issue #236）。
+ * 它是 `RUN_FAIL_REASONS` 里唯一**不是故障**的值：「用户按了停止」不是错误，所以界面呈现上
+ * 从红色 `.syserr` 改判为中性分隔条（`RUN_TERMINATION_SYSERR_REASONS` = 红色集合减去它）。
+ * ⚠ 它仍在 `RUN_FAIL_REASONS` 里——那个集合还决定「重试上一条」（#261B）与「终态后补拉 history」
+ * （#306）两个**功能**面，那两个面把停止当失败收场是对的（都算非正常收尾）。
+ */
+export const USER_STOP_TERMINATION_REASON: TerminationReason = 'aborted';
+
+/**
+ * 终态分隔条**刷红**（`.syserr`）的 reason 集合（issue #236 呈现分级，实时 `run_end` 与历史合成项
+ * `run_termination` **共用这一条规则**——两路同文案同分级，不然刷新一次颜色就变）：
+ *   * 红 = `failed`（真失败）/ `max_rounds_cap`（撞轮数上限，异常截断）/ `persistence_failed`
+ *     （快照没落盘，崩溃恢复可能重复副作用，语义最重）/ `final_guard_unverified`（终稿未核验）；
+ *   * 中性 = 其余（含 `end_turn` / `no_tool` / `judge_done` / `stall` / `continuation_exhausted`
+ *     这些正常或「截断但非故障」的收尾，以及 **`aborted`**：用户按了停止）。
+ * **由 `RUN_FAIL_REASONS` 派生**（减掉 `USER_STOP_TERMINATION_REASON`）而不是手抄第二份枚举：
+ * 将来往红色集合里加值，这里自动跟上（`terminationReasons.spec.ts` 钉住这条派生关系）。
+ */
+export const RUN_TERMINATION_SYSERR_REASONS: ReadonlySet<string> = new Set<string>(
+  [...RUN_FAIL_REASONS].filter((reason) => reason !== USER_STOP_TERMINATION_REASON),
+);
+
+/**
  * 有落盘细节可展示的 reason（issue #212：worker 透传引擎 termination 后，
  * `persistence_failed` 会额外携带 `operation` / `phase` / `sideEffect`，工作台要能看见 phase）。
  */
 export const PERSISTENCE_TERMINATION_REASON: TerminationReason = 'persistence_failed';
 
-/** 需要用户可读解释文案的 reason（i18n `stream.event.runEndReason.*` 的键集，双语）。 */
-export const EXPLAINED_FAIL_REASONS = [
-  'persistence_failed',
+/**
+ * 需要用户可读解释文案的 reason（i18n `stream.event.runEndReason.*` 的键集，双语）。
+ *
+ * issue #236（覆盖 #212 的「既有 failed / aborted / max_rounds_cap 保持原样」）：**除 `end_turn`
+ * 之外的每一个引擎 reason 都有双语标签**。理由：① #236 的验收面就是「用户按停止后看到的是母语
+ * 文案，不是裸 `aborted`」；② 本单把终态分隔条投影到历史里（`run_termination`）后，**任何一个**
+ * reason 都会在重开会话时出现在界面上（含最常见的 `judge_done`）——只补 `aborted` 会把「裸英文
+ * 枚举」从一处搬到另一处。`end_turn` 不在表里：它走既有 `stream.event.runEndNormal`
+ * （「正常完成」/`completed normally`），两条文案不得漂移。
+ * 引擎新增的未知 reason **不进表** ⇒ 文案回落 reason 原文（§5.3 向后兼容，不编造翻译）。
+ */
+export const RUN_END_LABEL_REASONS = [
+  'no_tool',
+  'stall',
+  'max_rounds_cap',
+  'judge_done',
+  'continuation_exhausted',
   'final_guard_unverified',
+  'aborted',
+  'failed',
+  'persistence_failed',
 ] as const satisfies readonly TerminationReason[];
 
 /**

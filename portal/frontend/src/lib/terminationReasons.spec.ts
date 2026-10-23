@@ -2,19 +2,22 @@
 // 与后端 portal/test/termination-contract.test.js 互补：那边锁「常量 ↔ 文档枚举表 ↔ 引擎源码」，
 // 本文件锁「常量 ↔ 前端运行时引用 ↔ i18n 双语键集」（i18n 用真实消息对象，不用 fs 读文本）。
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { RUN_FAIL_REASONS as RUN_FAIL_REASONS_FROM_STREAM } from '../composables/useEventStream';
 import { en } from '../i18n/locales/en';
 import { zhCN } from '../i18n/locales/zh-CN';
 import {
   ENGINE_VERSION_FOR_TERMINATION_REASONS,
-  EXPLAINED_FAIL_REASONS,
   LEGACY_TERMINATION_REASONS,
   PERSISTENCE_TERMINATION_REASON,
+  RUN_END_LABEL_REASONS,
   RUN_FAIL_REASON_LIST,
   RUN_FAIL_REASONS,
   RUN_RETRYABLE_ERROR_CODES,
+  RUN_TERMINATION_SYSERR_REASONS,
   TERMINATION_REASONS,
   TERMINATION_REASON_SET,
+  USER_STOP_TERMINATION_REASON,
 } from './terminationReasons';
 
 const CJK = /[\u4e00-\u9fff]/;
@@ -61,6 +64,42 @@ describe('termination reason 单一常量（issue #212）', () => {
     expect(RUN_FAIL_REASONS_FROM_STREAM).toBe(RUN_FAIL_REASONS);
   });
 
+  // issue #236：界面分级集合 = 红色集合减掉「用户主动停止」，且由后者**派生**（不手抄第二份）。
+  it('界面刷红集合 = RUN_FAIL_REASONS − aborted；aborted 改判中性但仍留在功能面集合里', () => {
+    expect([...RUN_TERMINATION_SYSERR_REASONS].sort()).toEqual([
+      'failed', 'final_guard_unverified', 'max_rounds_cap', 'persistence_failed',
+    ]);
+    expect(USER_STOP_TERMINATION_REASON).toBe('aborted');
+    // 派生关系（将来往 RUN_FAIL_REASONS 里加值，这里自动跟上）：逐项比对，不靠手写清单。
+    const derived = [...RUN_FAIL_REASONS].filter((r) => r !== USER_STOP_TERMINATION_REASON).sort();
+    expect([...RUN_TERMINATION_SYSERR_REASONS].sort()).toEqual(derived);
+    // #236 只改**呈现**：`aborted` 必须仍在 RUN_FAIL_REASONS 里（#261B 重试面 / #306 补拉靠它）。
+    expect(RUN_FAIL_REASONS.has(USER_STOP_TERMINATION_REASON)).toBe(true);
+    expect(RUN_TERMINATION_SYSERR_REASONS.has(USER_STOP_TERMINATION_REASON)).toBe(false);
+  });
+
+  // 主 agent 补的覆盖缺口（验收时亲跑变异发现的）：上面那条**只比内容**——把派生实现换成
+  // 手抄的四值枚举（`new Set(['failed','max_rounds_cap','persistence_failed','final_guard_unverified'])`）
+  // 行为逐字相同，上面那条**依旧全绿**（实测），于是注释里承诺的「将来往红色集合加值这里自动跟上」
+  // 在测试面上没人守。内容等价测不出「是不是派生的」，所以这里读源码做结构断言
+  // （与项目里 `append-seq-ordering.test.js` / `system-prompt.test.js` 同一手法）。
+  it('界面刷红集合在**源码层面**必须是派生实现（手抄一份等价枚举不算派生）', () => {
+    // 不用 `new URL(…, import.meta.url)`：vitest 下它是 http: URL，readFileSync 直接报
+    // 「The URL must be of scheme file」。这里按仓库约定的运行目录（portal/frontend）取路径；
+    // 路径不对会 ENOENT 直接红，不会退化成假绿。
+    const src = readFileSync('src/lib/terminationReasons.ts', 'utf8');
+    const def = src.match(/export const RUN_TERMINATION_SYSERR_REASONS[\s\S]*?\n\);/);
+    // 用 throw 而不是 expect(...).not.toBeNull()：后者不是类型守卫，strict 下 `def[0]` 仍报
+    // TS18047 possibly null（CI 步骤 ④ 实测拦下过）。throw 既收窄类型，也保留同样的失败文案。
+    if (!def) throw new Error('常量定义必须能在源码里定位到（改名/换写法时本用例先红，提醒重新评估这条锁）');
+    const definition = def[0];
+    // 必须引用红色集合并减去「用户主动停止」那个常量，而不是写死字面量。
+    expect(definition).toContain('RUN_FAIL_REASONS');
+    expect(definition).toContain('USER_STOP_TERMINATION_REASON');
+    // 反面：出现任何 reason 字面量就是手抄（包括那个将来会新增的值也不能预先写死）。
+    expect(definition).not.toMatch(/['"](failed|aborted|max_rounds_cap|persistence_failed|final_guard_unverified)['"]/);
+  });
+
   it('上游可重试码集含 timeout/rate_limited/server/disconnect/checkpoint_failed（runner 镜像同集）', () => {
     expect([...RUN_RETRYABLE_ERROR_CODES].sort()).toEqual([
       'checkpoint_failed', 'disconnect', 'rate_limited', 'server', 'timeout',
@@ -68,14 +107,19 @@ describe('termination reason 单一常量（issue #212）', () => {
   });
 });
 
-describe('新 reason 的双语文案（issue #212 第 5 条）', () => {
-  const keys = EXPLAINED_FAIL_REASONS as readonly string[];
+describe('reason 的双语文案（issue #212 → #236）', () => {
+  const keys = RUN_END_LABEL_REASONS as readonly string[];
 
-  it('zh-CN 与 en 的 runEndReason 键集 = EXPLAINED_FAIL_REASONS，且都有非空文案', () => {
+  it('zh-CN 与 en 的 runEndReason 键集 = RUN_END_LABEL_REASONS（除 end_turn 外每个 reason 都有标签），且都有非空文案', () => {
     const zh = zhCN.stream.event.runEndReason as Readonly<Record<string, string>>;
     const enMsg = en.stream.event.runEndReason as Readonly<Record<string, string>>;
     expect(Object.keys(zh).sort()).toEqual([...keys].sort());
     expect(Object.keys(enMsg).sort()).toEqual([...keys].sort());
+    // 除 end_turn（走 runEndNormal）外，引擎 reason 全集里每个值都必须有标签（#236 的覆盖面）。
+    for (const reason of TERMINATION_REASONS) {
+      if (reason === 'end_turn') continue;
+      expect(keys).toContain(reason);
+    }
     for (const key of keys) {
       expect(zh[key].length).toBeGreaterThan(0);
       expect(enMsg[key].length).toBeGreaterThan(0);
@@ -83,6 +127,9 @@ describe('新 reason 的双语文案（issue #212 第 5 条）', () => {
       expect(enMsg[key]).not.toMatch(CJK);
       expect(zh[key]).toMatch(CJK);
     }
+    // #236 的验收面：`aborted` 必须是母语文案，不是裸英文枚举。
+    expect(zh.aborted).toBe('已中止');
+    expect(enMsg.aborted).not.toBe('aborted');
   });
 
   it('落盘细节模板双语都带 operation/phase/sideEffect 三个占位符（红色告警要能看见 phase）', () => {

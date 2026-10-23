@@ -8,6 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from '../src/http.js';
@@ -279,6 +280,127 @@ test('issue #107：PATCH 改名成功后推 session_updated（live-only 帧，pa
     assert.ok(!text.includes('不该出现'), '校验失败（400）不得推 session_updated');
     assert.ok(text.includes('event: session_updated'), '帧名 = session_updated');
     assert.ok(!text.includes('id:'), 'live-only 帧不带 seq（不进消息流水位线）');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// issue #236 第 2 条：**空 body 的 POST 不再强制 `Content-Type`**
+// 缺陷：`curl -X POST .../stop`（无 body、无该头）⇒ 400 `validation_failed`
+// 「Content-Type 必须为 application/json」。前端总发 `body:'{}'` 所以 UI 无感，手工客户端就踩。
+// 口径（决策者倾向的 ①）：只校验「**有 body 时**必须是 json」；无 body + 未声明头 ⇒ 放行。
+// 判据不认「返回 200」而认「**过了这道闸**」：stop 在假库里没有活跃 run ⇒ 409 no_active_run
+// （若 CT 闸仍拦着，这里会是 400 validation_failed「Content-Type 必须为 application/json」）。
+// ---------------------------------------------------------------------------
+const CT_ERROR = 'Content-Type 必须为 application/json';
+
+const callStop = (s, { body, headers = {} } = {}) => fetch(`${s.base}/api/sessions/${SESSION_ID}/stop`, {
+  method: 'POST',
+  headers: { Cookie: s.cookieHeader, ...headers },
+  ...(body === undefined ? {} : { body }),
+});
+
+/**
+ * 手工 `node:http` POST：`fetch` 发不出可控的 `Transfer-Encoding`（forbidden header），
+ * 而「既无 `Content-Length` 又写了 chunk」正是 Node 自己启用 chunked 编码的条件。
+ * ⚠ 夹具退化不会假绿：如果 Node 意外没发出 chunked（也没 CL），`requestHasNoBody` 会返回 true
+ * ⇒ 闸放行 ⇒ 状态变成 409，本用例会直接红在断言上，不会把「没测到」读成「测过了」。
+ */
+function rawPost(s, p, { chunks = [], headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(s.base + p);
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname,
+        method: 'POST',
+        headers: { Cookie: s.cookieHeader, ...headers },
+      },
+      (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { text += c; });
+        res.on('end', () => resolve({ status: res.statusCode, text }));
+      },
+    );
+    req.on('error', reject);
+    for (const chunk of chunks) req.write(chunk);
+    req.end();
+  });
+}
+
+test('#236 空 body + 无 Content-Type 的 POST /stop ⇒ 不再是 400（过了 CT 闸，落到业务判据 409 no_active_run）', async () => {
+  const s = await startServer();
+  try {
+    const res = await callStop(s);
+    assert.equal(res.status, 409, '空 body 不再被 CT 闸拦成 400');
+    const body = await res.json();
+    assert.equal(body.error.code, 'no_active_run');
+    assert.notEqual(body.error.message, CT_ERROR);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#236 同一端点：声明 json（含 charset）/ 有 body 但没声明 / 声明了非 json 的行为逐条不变', async () => {
+  const s = await startServer();
+  try {
+    // ① 无 body + 声明 json ⇒ 照旧放行（前端 `body:'{}'` 那条路）
+    const withCt = await callStop(s, { headers: { 'content-type': 'application/json' } });
+    assert.equal(withCt.status, 409);
+    // ② 无 body + json;charset=utf-8 ⇒ 照旧放行（`;` 之后的参数不参与比较）
+    const withCharset = await callStop(s, { headers: { 'content-type': 'application/json; charset=utf-8' } });
+    assert.equal(withCharset.status, 409);
+    // ③ **有 body** 但没声明 CT ⇒ 仍 400（本次只放宽「确定无 body」那一格，不放宽带体请求）
+    const bodyNoCt = await callStop(s, { body: '{}' });
+    assert.equal(bodyNoCt.status, 400);
+    assert.equal((await bodyNoCt.json()).error.message, CT_ERROR);
+    // ④ 有 body + 声明非 json ⇒ 仍 400
+    const bodyWrongCt = await callStop(s, { body: '{}', headers: { 'content-type': 'text/plain' } });
+    assert.equal(bodyWrongCt.status, 400);
+    assert.equal((await bodyWrongCt.json()).error.message, CT_ERROR);
+    // ⑤ 无 body 但**显式声明**非 json ⇒ 仍 400（显式声明了别的类型就是有意的，不替用户猜）
+    const emptyWrongCt = await callStop(s, { headers: { 'content-type': 'text/plain' } });
+    assert.equal(emptyWrongCt.status, 400);
+    assert.equal((await emptyWrongCt.json()).error.message, CT_ERROR);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#236 统一闸 fail-closed：**chunked 带体** + 未声明 `Content-Type` ⇒ 仍 400（主 agent 补的覆盖缺口）', async () => {
+  // 为什么必须单独一条：上面那条组合用例的「有 body 没声明 CT」用的是 `fetch({ body: '{}' })`，
+  // 而 fetch 会自动带上 `Content-Length: 2` ⇒ 它**只走了 `requestHasNoBody` 的 CL 分支**。
+  // chunked 那一格（既无 CL、有 `Transfer-Encoding` ⇒ 体在读完前不可知 → 按有 body 处理）
+  // 在本文件里**从来没被任何请求命中过**：把 `requestHasNoBody` 改成 `return true` 全套仍绿。
+  // 所以这里用手工 `node:http` 请求（不写 CL、写一个 chunk ⇒ Node 自己发 `Transfer-Encoding: chunked`），
+  // 把「放宽只覆盖确定无 body 的请求」这条 fail-closed 口径钉住。
+  const s = await startServer();
+  try {
+    const res = await rawPost(s, `/api/sessions/${SESSION_ID}/stop`, { chunks: ['{}'] });
+    assert.equal(res.status, 400, `chunked 带体不得被放宽，实得 ${res.status}：${res.text}`);
+    assert.equal(JSON.parse(res.text).error.message, CT_ERROR);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#236 统一闸：同一放宽对其它 JSON 端点（POST /ai-title）同样生效；读方法（GET）不受影响', async () => {
+  const s = await startServer();
+  try {
+    // 另一个走 requireJson 的 POST：空 body + 无 CT ⇒ 过了闸，落到业务判据（会话没有 user 消息 ⇒ 409）
+    const aiTitle = await fetch(`${s.base}/api/sessions/${SESSION_ID}/ai-title`, {
+      method: 'POST',
+      headers: { Cookie: s.cookieHeader },
+    });
+    assert.equal(aiTitle.status, 409, 'CT 闸已放行，业务判据 409 no_user_messages');
+    assert.notEqual((await aiTitle.json()).error.message, CT_ERROR);
+
+    // GET 从来不经过 requireJson（本次零改动）
+    const me = await fetch(`${s.base}/api/me`, { headers: { Cookie: s.cookieHeader } });
+    assert.equal(me.status, 200);
   } finally {
     await s.close();
   }

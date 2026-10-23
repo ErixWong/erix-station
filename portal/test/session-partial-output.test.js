@@ -76,8 +76,10 @@ class PartialOutputPool extends FakePool {
       };
     }
 
-    // 候选判定（终态 + 锚点存在性一条查询搞定）：
-    //   SELECT r.id AS run_id, EXISTS(... FROM messages m WHERE m.run_id = r.id AND m.role='assistant') AS has_anchor
+    // 终态查询（#300 的候选判定 + #236 的终态投影共用**同一条** SQL）：
+    //   SELECT r.id AS run_id, r.status, r.termination,
+    //          (SELECT MAX(e.seq) FROM run_events e WHERE e.run_id = r.id) AS last_seq,
+    //          EXISTS(... FROM messages m WHERE m.run_id = r.id AND m.role='assistant') AS has_anchor
     //     FROM runs r WHERE r.id = ANY($1) AND r.status IN ('finished','failed')
     if (flat.includes('FROM runs r')) {
       const ids = params[0] ?? [];
@@ -91,6 +93,12 @@ class PartialOutputPool extends FakePool {
       return {
         rows: rows.map((r) => ({
           run_id: r.id,
+          // 新列照 SQL 真算（#236 的终态投影要用 status/termination/last_seq）
+          status: r.status,
+          termination: r.termination ?? null,
+          last_seq: this.runEvents
+            .filter((e) => e.run_id === r.id)
+            .reduce((max, e) => (e.seq > max ? e.seq : max), null),
           has_anchor: flat.includes('FROM messages m') ? this.assistantAnchors(r.id).length > 0 : null,
         })),
       };
@@ -182,7 +190,10 @@ function seedAbortedRun(pool, { runId = 'r-partial', status = 'failed', deltas =
 }
 
 const partialsOf = (body) => body.events.filter((e) => e.type === 'partial_output');
-const realsOf = (body) => body.events.filter((e) => e.type !== 'partial_output');
+// 「真实事件」= 白名单里的落库事件。两个响应期合成项（#300 `partial_output` / #236 `run_termination`）
+// 都不是 `run_events` 的行 ⇒ 一并排除（否则 #300 的既有断言会把合成项当真实事件数进去）。
+const SYNTH_TYPES = new Set(['partial_output', 'run_termination']);
+const realsOf = (body) => body.events.filter((e) => !SYNTH_TYPES.has(e.type));
 
 // ---------------------------------------------------------------------------
 // 1. 核心：终态 + 零锚点 + 有 delta ⇒ 恰一条合成项，字段逐项对
@@ -210,8 +221,8 @@ test('#300 终态+零锚点+有 delta ⇒ 恰一条 partial_output，seq=最后�
     });
     assert.deepEqual(
       body.events.map((e) => [e.seq, e.type]),
-      [[5, 'round_start'], [7, 'partial_output']],
-      '合成项参与升序排序（排在 round_start 之后）；run_end 仍不下发',
+      [[5, 'round_start'], [7, 'partial_output'], [9, 'run_termination']],
+      '合成项参与升序排序（排在 round_start 之后）；run_end 仍不下发，终态行改为从 runs 投影（#236）',
     );
     assert.equal(body.next_cursor, null);
     // **不落库**：run_events 里不得出现 partial_output 行
