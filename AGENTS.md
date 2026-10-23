@@ -1467,3 +1467,19 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 **基线（合并树亲手复跑，判绿 = 退出码）**：根 **1426 / 1422 通过 / 0 失败 / 4 跳过**、runner **323/323**、前端 `typecheck` rc=0 + **42 文件 / 755 通过**。台账三处已同步（`docs/ops/ci-release.md` §1：1414→1426 / 741→755）。
 
 **新登记的 follow-up**：**#349**（已随本批修完）、**#350**（管理台号池占用总览 UI —— #256 只交付端点，人还在试错）。**仍 open**：#341（上游 erix-agent #415 **未发版**，npm 最新就是 0.23.0）、#303（0.23.0 读侧仍有 7 条路径认顶层旧名 ⇒ `?? tr.duration` **不许删**，取证已贴 issue）、#331（`ERIX_SESSION_AUTO_TITLE` 死光纤，撤它要动 portal + 两处测试）、#346 / #348 / #321 残留（需产品决策）。
+
+### 8.49 v0.1.29 发版 + 发布物验收 + 验收过程中挖到的 **#351（会话砖化）**（2026-10-24 02:52 CST，夜班收尾）
+
+**v0.1.29** = `5d967c6`（载荷 = 本批全部：#256 + #295 + #273 + #349 + 台账）。本批 `runner/` 除版本文件外**零差异** ⇒ **只 pin portal + fde-proxy**，五台 FDE 容器故意未重建（§8.19）。流程：`d8d1ee5`（台账 + 基线）→ `5d967c6` bump → main CI `40004642827` 全绿后才打 tag → release `40005238179` → 清单 portal `imageId=2a32a0f4…`/`digest=ea45ec01…`、proxy `imageId=ba408140…`/`digest=56fc03b3…`，两个都**直连一次拉成**且 `docker image inspect .Id` 逐位一致 → `.env` pin（备份 `/tmp/deploy.env.bak-0129`）→ `up -d --no-build` → portal/proxy 实跑镜像 ID = 清单、经 Traefik `healthz=200`、**服务 bundle = `index-BrgEGHCI.js`**（先断言 bundle 再测，§8.42）。
+
+**在发布物上重跑两条用户可见面**（不只信本地测）：
+- **#256 占用总览**（admin cookie 会话经 Traefik）：`pool` 22000–29999 / 块 10 / 800 段；`summary` **逐字段自洽 800 = 795 free + 0 partial + 5 occupied**；`occupied_blocks` 5 段带 `fde_names` 数组；`free_blocks` `items=50 limit=50 has_more=true` 与实际一致；审计 `admin.preview_ports_usage_listed` **恰 1 行**；handler 经 `http.js:1405` 委派 `previewPortPoolUsage`；函数体数字字面量只剩注释里的 `0019` 与状态码 `404`。⚠ **我第一条探针把「源码零端口字面量」测到了响应上**（响应里本来就得有段号）⇒ 假阴性；探针对错面比探针本身重要。
+- **#295 裸 URL**（新建会话 `5b0292eb…` / `~/projects/probe-351`，让助手原样复述）：带两个 `_` 的裸 URL → **单一** `<a href="…/probe_351_x_2">`全文保留、内部**无 `<em>`**；`[**加粗链接**](…)` → `<strong>` 仍在锚内、`**` 未进 `href`。
+
+#### 🔴 新登记 **#351**：被停止的 run 留下未结清的 `tool_use` ⇒ 同会话再发消息**永久** `invalid_messages`（验收自己撞上的）
+
+验 #295 时先往旧会话 `ec8a77b3…` 发消息，run 直接 `failed`：`invalid message at index 11: assistant tool_use has no immediately following user tool_result`（`retryable:false`，「重试上一条」永远同错）。**两个真机标本同族、子形状不同**（都是今天「停止 → 再发一条」造出来的）：`ec8a77b3…` = index 11，结果行**在**但被下一条 `:input:` **插队**；`1ead0b1a…` = index 50，被停止那次的 `tool_result` **根本没落账本**。
+
+标本 1 真库账本（`append_seq` 升序 = 引擎读取序）：`msg:6:0`（assistant + `tool_use` sleep 240）→ **`input:128b5d39…`（用户下一条）** → `msg:6:1`（迟到的 `tool_result`）→ `engine:round:6:resume`。把**真行**喂进引擎自己的 `foldLedgerMessages`（`0.23.0`，`src/store/message-rows.js:197`）+ `validateMessages`（`src/messages/rounds.js:43`）**逐字复现 index 11**。
+**不是 #341**：巡检 SQL（`partOf` 指向的行自身也带 `partOf`）在两个标本会话与**全库**都 **0 行**，标本 1 唯一分片行 `msg:1:2 → msg:1:1` 形状正确 ⇒ `docs/ops/transcript-ledger-inspection.md` **测不到这一类**（手册判「干净」的会话照样砖）。机理也非竞态：停止时结果行不写，等到**下一次 run resume** 才由 `journalResumedToolResults()` 逐条写 `:msg:`；而 `:input:` 是发消息当时写的（#162 顺序红线）⇒ 「停止 → 再发一条」**构造上必现**。issue 里给了三个候选修法（A 终态即结清 / B 发消息前置幂等补结清 / C 引擎按 round 归位）并明说**未拍**，同时要求**存量已砖会话要修数据**。本单**未动代码**。
+⚠ 可复用的取证手法：**把真账本行喂进引擎自己的折叠/校验函数**比看错误文案硬得多（两行 `await import` 就能在本地逐字重现一个只在真库上出现的错误）。
