@@ -12,6 +12,8 @@ import { AUTO_FOLLOW_GAP } from '../lib/constants';
 import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
 import StreamPanel from '../components/StreamPanel.vue';
+// issue #282：会话页顶部常驻动量状态条（run 级量化信号；消息级时刻在 StreamPanel 里）。
+import RunStatusBar from '../components/RunStatusBar.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
@@ -241,6 +243,9 @@ function jumpToLatest() {
       ></div>
 
       <section class="relative flex flex-1 flex-col min-w-0">
+        <!-- issue #282：状态条挂在消息流**上方**、与 StreamPanel 同层（不塞进 StreamPanel 的渲染循环，
+             也不在滚动容器里——常驻可见）。无选中会话时不挂（没有 run 可报，也不白起一个 1s 时钟）。 -->
+        <RunStatusBar v-if="store.sessionId" />
         <div ref="streamEl" class="flex-1 overflow-auto p-3" @scroll="onStreamScroll">
           <StreamPanel />
         </div>

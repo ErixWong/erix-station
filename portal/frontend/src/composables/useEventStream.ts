@@ -288,6 +288,14 @@ export interface EventStreamHooks {
   onConnected?: (sessionId: string) => void;
   /** issue #88：自动标题刷新（portal run 终态后异步评估、经 session SSE 推送）——宿主原地更新列表项。 */
   onSessionUpdated?: (d: { session_id?: string; title?: string } & Record<string, unknown>) => void;
+  /**
+   * issue #282：**每一帧**事件的旁路通知（不改变任何既有分发语义，纯观察面）。
+   * 用途单一：会话页动量状态条（`composables/useRunMomentum.ts`）需要 `round_start` / `round_end` /
+   * `usage` / `tool_use` / `tool_result` / `assistant_delta` / `run_end` 这些**已经到达前端**的帧。
+   * `history=true` 表示这是历史回放帧（`replayEvent`）：状态机自己短路（run_end/usage 不在历史
+   * 白名单，刷新后运行态数字本就拿不回来，不许拿历史帧假装「现在在跑」）。
+   */
+  onEvent?: (type: string, payload: Record<string, any>, history: boolean) => void;
 }
 
 // dig 摘要：对象 → JSON 截 120 字；其余 → String 截 120（旧 toolCard 原样）。
@@ -530,6 +538,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     // 实现注记（§5.1）：事件流 seq 有合法空洞（messages 占号），故**不做**跳号重连判定；
     // 这里只推进本地水位线（resync 重连时作为 ?last_event_id 回放游标）；历史回放不推进。
     if (typeof d.seq === 'number' && !history) lastSeq.value = Math.max(lastSeq.value, d.seq);
+    // issue #282：动量观察面（在 switch 之前通知 ⇒ usage/round_end 这些「接收但不展示」的类型也能被看到）。
+    // 红线：它只观察、不驱动——不 return、不改 d、不参与任何既有分支判定。
+    hooks.onEvent?.(type, d, history);
     switch (type) {
       case 'ping': return;
       case 'session_updated':

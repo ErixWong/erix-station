@@ -15,6 +15,8 @@ import { api, ApiError, patchSessionTitle, postSessionAiTitle, toDisplayText } f
 import { projectionRoundToken, runSegment, toolCardKey as buildToolCardKey } from '../lib/toolCardKey';
 import { i18n } from '../i18n';
 import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
+// issue #282：会话页动量状态条的状态机（SSE 逐帧喂；组件只读派生视图，见 components/RunStatusBar.vue）。
+import { createRunMomentumFeed } from '../composables/useRunMomentum';
 import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
@@ -112,6 +114,9 @@ export interface ChatMessage {
   turnKeys?: string[]; // 0.16.0：聚合进本 run 的助手轮视图键（`turn.key`，逐字透传）
   // issue #189：折叠段（compaction）摘要（有折叠才出现）；渲染为独立横幅，绑定在该助手消息上。
   folded?: FoldedInfo;
+  // issue #282：锚点行的创建时刻（对话流 DTO 原样透传，`portal/src/session-view.js:473`）。
+  // 缺失/脏值一律不猜（`lib/messageTime.formatMessageTime` 只认非空字符串）。
+  created_at?: string;
 }
 
 /**
@@ -132,7 +137,8 @@ export type FoldedOriginalState =
 
 /** 消息流渲染单元（旧版 DOM 追加序的数组等价）。 */
 export type StreamEntry =
-  | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null; sessionId: string | null }
+  // issue #282：`createdAt` = DTO `created_at` 原值（缺失就是 undefined ⇒ 消息行不出时刻）。
+  | { kind: 'msg'; id: string; role: string; synthetic: boolean; text: string; html: string | null; sessionId: string | null; createdAt?: string }
   // issue #189：折叠横幅独立 entry（**方案说明**：独立 kind 而非在 msg entry 加 folded 字段——
   // msg 分支渲染 .msg 气泡，加字段会诱导把横幅画进气泡内；独立 kind 天然渲染成独立分隔条
   // （非 .msg 类），并与该助手消息绑定（id=消息 id，排在正文气泡前）。renderedIds 去重、
@@ -252,10 +258,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   // SSE 协议状态 + 事件语义（hooks 接回展示层）。
   let runStateCheckSeq = 0;
+  // issue #282：动量观测面（run 级量化信号）。**只由 SSE 事件与宿主登记驱动**，不含任何假数据；
+  // 硬刷新后 run_end/usage 不在历史回放白名单 ⇒ 这些数字拿不回来（见 composable 头注与
+  // RunStatusBar 的 refreshBoundary tooltip）。
+  const momentum = createRunMomentumFeed();
   const es = useEventStream({
     onSep: (text, variant) => entries.value.push({ kind: 'sep', text, variant }),
     onSysErr: (text) => entries.value.push({ kind: 'syserr', text }),
     onToolCardCreated: (callId) => entries.value.push({ kind: 'tool', callId }),
+    // issue #282：唯一的事件入口——动量状态机在 dispatch 的**每一帧**都被喂（含 usage/round_end 这些
+    // 「接收但不展示」的类型）；history=true 的帧由状态机自己短路（历史回放不驱动运行态）。
+    onEvent: (type, d, history) => momentum.ingest(type, d, history),
     onConnected: (id) => { void reconcileActiveRun(id); },
     onCurrentRunEnd: (d) => {
       removeDeltaEntry(); // 旧版 run_end 移除流式增量 DOM（终稿由 refreshSession 回写，防双份）
@@ -420,6 +433,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       text: (m.synthetic ? t('workbench.systemInjection', { content: m.content }) : m.content),
       html: isMd ? renderMarkdown(m.content) : null,
       sessionId: sessionId.value, // issue #189：横幅「查看原文」按 (会话, 轮) 调端点，绑定所属会话
+      // issue #282：消息时刻原样透传（字符串才收；缺失/脏值不写键 ⇒ StreamPanel 不出 `<time>`）。
+      ...(typeof m.created_at === 'string' && m.created_at !== '' ? { createdAt: m.created_at } : {}),
     });
   }
 
@@ -513,6 +528,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function applyServerRunState(serverRunId: string | null, previousRunId: string | null): string | null {
     es.activeRunId.value = serverRunId;
+    // issue #282：服务端说「这个会话有活跃 run」时登记动量，但**起跑时刻未知**（页面是中途打开的，
+    // 我们没看见它的开始）⇒ startedAt=null ⇒ 状态条不出「本 run 0:05」这种从我看到它才起算的假时长。
+    // 服务端说没有活跃 run ⇒ 复位（拿不到它的终态数字就不显示，不猜）。
+    if (typeof serverRunId === 'string' && serverRunId !== '') momentum.beginRun(serverRunId, null);
+    else momentum.reset();
     if (previousRunId === null || serverRunId !== null) return null;
     es.deltaText.value = null;
     removeDeltaEntry();
@@ -610,6 +630,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
     es.resetStreamState();
+    momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -638,6 +659,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     inputValue.value = drafts.get(id) ?? '';
     sessionId.value = id;
     es.resetStreamState();
+    momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -750,6 +772,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
     es.resetStreamState();
+    momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -864,6 +887,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：无选中会话 → 不得复用旧会话的计数
     es.resetStreamState();
+    momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
     // issue #85：离开会话/目录切换时清空工具卡片展开记忆（toolCallExpansion）。
     clearExpandedToolCalls();
@@ -916,6 +940,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (ctx !== ctxSeq.value || sessionId.value !== sid) return;
       addMessage({ ...message, role: 'user' });
       es.activeRunId.value = run.id;
+      // issue #282：POST 返回 run id = 我们知道的最早起跑时刻（用户刚发出），登记给动量状态条。
+      momentum.beginRun(run.id);
       loadSessions();
     } catch (e) {
       // 评审修复：草稿按 sid 键，守卫之前写回——发送失败后即使期间切走会话，切回仍可恢复。
@@ -1027,5 +1053,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数
     foldedOriginals, getFoldedOriginal, loadFoldedOriginal, sessionStats,
+    // issue #282：动量状态机（RunStatusBar / StreamPanel 的 1s 时钟各自 useRunMomentum 读它）
+    momentum,
   };
 });
