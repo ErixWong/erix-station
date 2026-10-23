@@ -12,6 +12,8 @@ import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import PreviewPortsPanel from './PreviewPortsPanel.vue';
 import { requestBlockMove, usePreviewPorts } from '../composables/usePreviewPorts';
+import { useAdminStore } from '../stores/admin';
+import { classifyBlock } from '../lib/previewPoolUsage';
 import {
   PREVIEW_BLOCK_START_MAX,
   PREVIEW_BLOCK_START_MIN,
@@ -43,6 +45,29 @@ const confirmButton = useTemplateRef<HTMLButtonElement>('confirmButton');
 const currentBlock = computed(() => formatBlockRange(ports.blockRange.value));
 const portCount = computed(() => ports.items.value.length);
 const isBlockTaken = computed(() => moveError.value?.code === 'preview_port_block_taken');
+
+// issue #350：接上「号池占用总览」（判据④）。**只读引用**：
+//   • 快照来自 admin store 的缓存（本面板**不发**占用总览请求——那会让「进面板」多一趟网络，
+//     也会让 #246 的「tab 点开才拉端口列表」多一个隐式依赖）；没看过总览时这段提示不出现。
+//   • **红线**：绝不因为看到空闲段就改写 `block_start_input` 的值或自动提交
+//     （#256 口径：管理员显式指定的段被占要报错，禁止偷偷换段）。所以这里只读 `blockStart`，从不写它。
+const admin = useAdminStore();
+const usageSnapshot = computed(() => admin.previewUsage);
+const typedStart = computed(() => parseBlockStart(blockStart.value));
+const typedOccupancy = computed(() => classifyBlock(usageSnapshot.value, typedStart.value));
+
+/** 「这一段现在空不空 / 被谁占」——快照里**不知道**就直说不知道（列表是截断的，不猜）。 */
+function occupancyText(): string {
+  const occupancy = typedOccupancy.value;
+  if (occupancy.kind === 'free') return t('previewPorts.admin.occupancyFree');
+  if (occupancy.kind === 'unknown') return t('previewPorts.admin.occupancyUnknown');
+  const names = occupancy.fdeNames.join(', ');
+  const count = occupancy.occupiedCount;
+  if (names && count !== null) return t('previewPorts.admin.occupancyOccupied', { names, count });
+  if (names) return t('previewPorts.admin.occupancyOccupiedNoCount', { names });
+  if (count !== null) return t('previewPorts.admin.occupancyOccupiedNoNames', { count });
+  return t('previewPorts.admin.occupancyOccupiedBare');
+}
 
 /** 新段标签（起点 + 块大小，不写死 +9）。 */
 function newBlockLabel(start: number): string {
@@ -151,6 +176,15 @@ function errorText(error: PreviewApiError): string {
           : t('previewPorts.admin.currentBlockNone') }}
       </p>
       <p class="mt-1 text-xs text-black/55">{{ t('previewPorts.admin.blockHint') }}</p>
+      <!-- issue #350（判据④）：引用式接上号池占用总览。只给入口，不预填、不自动提交。 -->
+      <p class="mt-1 text-xs text-black/55">
+        {{ t('previewPorts.admin.usageRefHint') }}
+        <router-link
+          :to="{ name: 'admin-preview-pool' }"
+          data-test="open-preview-pool-usage"
+          class="underline"
+        >{{ t('previewPorts.admin.usageRefLink') }}</router-link>
+      </p>
 
       <div class="mt-2 flex flex-wrap items-end gap-2">
         <label class="flex min-w-40 flex-col gap-1 text-xs text-black/60">
@@ -187,6 +221,14 @@ function errorText(error: PreviewApiError): string {
         class="syserr mt-1 text-xs"
         role="alert"
       >{{ fieldError }}</p>
+      <!-- issue #350：只读提示——这个段在**最近一次**总览里空不空 / 被谁占（没看过总览就不显示）。
+           它绝不改写上面的输入框，也绝不自动提交（红线）。 -->
+      <p
+        v-else-if="typedStart !== null && usageSnapshot"
+        data-test="block-occupancy-hint"
+        class="mt-1 text-xs text-black/70"
+        role="status"
+      >{{ t('previewPorts.admin.occupancyTitle') }} {{ occupancyText() }}</p>
       <p
         v-else-if="pendingStart !== null && !isAlignedBlockStart(pendingStart)"
         data-test="block-start-align-hint"

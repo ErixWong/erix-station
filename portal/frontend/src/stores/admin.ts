@@ -6,6 +6,13 @@ import { defineStore } from 'pinia';
 import QRCode from 'qrcode';
 import { api } from '../api';
 import { i18n } from '../i18n';
+// issue #350：号池占用总览（GET /api/admin/preview-ports/usage）的请求面与归一化都在 lib 里（纯函数可单测）。
+import {
+  PREVIEW_USAGE_PATH,
+  normalizeUsage,
+  usageErrorText,
+  type PreviewPoolUsage,
+} from '../lib/previewPoolUsage';
 
 // issue #101 P3：前端自产文案（「错误：」前缀）走 i18n 单例——options store 非组件上下文，
 // useI18n() 会抛 MUST_BE_CALL_SETUP_TOP，故统一走 i18n.global.t。
@@ -161,11 +168,45 @@ export const useAdminStore = defineStore('admin', {
     totpOnce: null as TotpOnce | null, // 旧 #totpOnce 内联盒
     lastReactivatedUserId: null as string | null,
     usersLoading: false,
+    // issue #350：号池占用总览。`previewUsageLoaded` 与 `previewUsage` 分开：
+    // 「还没请求」（loaded=false）与「服务端说一个被占段都没有」（loaded=true + 空数组）不是同一件事。
+    previewUsage: null as PreviewPoolUsage | null,
+    previewUsageLoaded: false,
+    previewUsageLoading: false,
+    previewUsageErr: null as string | null,
   }),
 
   actions: {
     errText(err: unknown): string {
       return err instanceof Error ? err.message : String(err);
+    },
+
+    /**
+     * issue #350：`GET /api/admin/preview-ports/usage`（号池占用总览，只读）。
+     *
+     * 懒加载的判据在**调用方**（`PreviewPoolUsageView` 的 `onMounted`）：进管理台不请求，
+     * 切到该 tab 才发恰好 1 次。这里只负责「一次调用 = 一次请求」，不做缓存短路
+     * （号池占用是会变的，重新进入该页应当看到新快照）。
+     *
+     * 失败面照本文件既有口径：`admin.errorPrefix` + 服务端 `error.message` **原文**（不翻译）。
+     * 返回错误串便于调用方直接展示，同时写进 `previewUsageErr`。
+     */
+    async loadPreviewUsage(): Promise<string | null> {
+      this.previewUsageLoading = true;
+      this.previewUsageErr = null;
+      try {
+        const data = await api<unknown>(PREVIEW_USAGE_PATH);
+        // 归一化在 lib：脏值/缺字段 ⇒ null 或空 + Present 旗标，页面据此显示「—」而不是 0。
+        this.previewUsage = normalizeUsage(data);
+        this.previewUsageLoaded = true;
+        return null;
+      } catch (e) {
+        const { message } = usageErrorText(e);
+        this.previewUsageErr = t('admin.errorPrefix') + message;
+        return this.previewUsageErr;
+      } finally {
+        this.previewUsageLoading = false;
+      }
     },
 
     dismissTotpOnce() {
