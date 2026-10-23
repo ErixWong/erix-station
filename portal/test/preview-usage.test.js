@@ -65,8 +65,11 @@ class UsageStore {
     // 总览取数：谓词由 SQL 决定（fake 不另写一套），LEFT JOIN users 取 fde_name。
     if (s.startsWith('SELECT pa.port AS port, u.fde_name AS fde_name')) {
       const [start, end] = params;
+      // **谓词由 SQL 决定**（fake 不另写一套）：实现把 `state <> 'released'` 去掉/放宽时，
+      // 「released 不占位」那条断言就会真的红（这是本文件最重要一条判据的诚实性来源）。
+      const liveOnly = s.includes("state <> 'released'");
       const rows = this.rows
-        .filter((row) => row.state !== 'released' && row.port >= start && row.port <= end)
+        .filter((row) => (!liveOnly || row.state !== 'released') && row.port >= start && row.port <= end)
         .sort((a, b) => a.port - b.port)
         .map((row) => ({
           port: row.port,
