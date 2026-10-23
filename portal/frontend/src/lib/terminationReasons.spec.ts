@@ -2,6 +2,7 @@
 // 与后端 portal/test/termination-contract.test.js 互补：那边锁「常量 ↔ 文档枚举表 ↔ 引擎源码」，
 // 本文件锁「常量 ↔ 前端运行时引用 ↔ i18n 双语键集」（i18n 用真实消息对象，不用 fs 读文本）。
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { RUN_FAIL_REASONS as RUN_FAIL_REASONS_FROM_STREAM } from '../composables/useEventStream';
 import { en } from '../i18n/locales/en';
 import { zhCN } from '../i18n/locales/zh-CN';
@@ -75,6 +76,25 @@ describe('termination reason 单一常量（issue #212）', () => {
     // #236 只改**呈现**：`aborted` 必须仍在 RUN_FAIL_REASONS 里（#261B 重试面 / #306 补拉靠它）。
     expect(RUN_FAIL_REASONS.has(USER_STOP_TERMINATION_REASON)).toBe(true);
     expect(RUN_TERMINATION_SYSERR_REASONS.has(USER_STOP_TERMINATION_REASON)).toBe(false);
+  });
+
+  // 主 agent 补的覆盖缺口（验收时亲跑变异发现的）：上面那条**只比内容**——把派生实现换成
+  // 手抄的四值枚举（`new Set(['failed','max_rounds_cap','persistence_failed','final_guard_unverified'])`）
+  // 行为逐字相同，上面那条**依旧全绿**（实测），于是注释里承诺的「将来往红色集合加值这里自动跟上」
+  // 在测试面上没人守。内容等价测不出「是不是派生的」，所以这里读源码做结构断言
+  // （与项目里 `append-seq-ordering.test.js` / `system-prompt.test.js` 同一手法）。
+  it('界面刷红集合在**源码层面**必须是派生实现（手抄一份等价枚举不算派生）', () => {
+    // 不用 `new URL(…, import.meta.url)`：vitest 下它是 http: URL，readFileSync 直接报
+    // 「The URL must be of scheme file」。这里按仓库约定的运行目录（portal/frontend）取路径；
+    // 路径不对会 ENOENT 直接红，不会退化成假绿。
+    const src = readFileSync('src/lib/terminationReasons.ts', 'utf8');
+    const def = src.match(/export const RUN_TERMINATION_SYSERR_REASONS[\s\S]*?\n\);/);
+    expect(def, '常量定义必须能在源码里定位到（改名/换写法时本用例先红，提醒重新评估这条锁）').not.toBeNull();
+    // 必须引用红色集合并减去「用户主动停止」那个常量，而不是写死字面量。
+    expect(def[0]).toContain('RUN_FAIL_REASONS');
+    expect(def[0]).toContain('USER_STOP_TERMINATION_REASON');
+    // 反面：出现任何 reason 字面量就是手抄（包括那个将来会新增的值也不能预先写死）。
+    expect(def[0]).not.toMatch(/['"](failed|aborted|max_rounds_cap|persistence_failed|final_guard_unverified)['"]/);
   });
 
   it('上游可重试码集含 timeout/rate_limited/server/disconnect/checkpoint_failed（runner 镜像同集）', () => {
