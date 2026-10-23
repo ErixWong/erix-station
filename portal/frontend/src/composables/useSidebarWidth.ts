@@ -51,7 +51,8 @@ export function useSidebarWidth() {
 
   // pointerdown → setPointerCapture → pointermove 实时改宽（仅内存）→ pointerup 落盘并结束。
   // 持久化节流：onMove 高频触发不写 localStorage，避免拖拽途中反复同步写；松手按最终宽度写一次。
-  // 把手是 aside 的兄弟元素（aside 内 overflow-y-auto，内部把手会与滚动条打架）。
+  // 把手是 aside 的兄弟元素（issue #308 起 aside 是 overflow-hidden，内部滚动只有列表段与底部栈两层；
+  // 把手放在内部会与那两层的滚动条打架）。
   function onHandlePointerDown(e: PointerEvent) {
     const el = e.currentTarget as HTMLElement;
     if (e.button !== 0) return; // 只响应主键，避免误占中/右键

@@ -15,8 +15,12 @@ import { i18n, setLocale } from '../i18n';
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
 } as AuthUser;
-const ADMIN_USER = {
-  id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local',
+// issue #308（M3）：原夹具是「无工位管理员」（`admin` 且 `fde_name=null`）——#334 的准入闸
+// （lib/workbenchGate.ts：`role==='admin' && !fde_name` ⇒ 改写去 /admin）之后这个形状**进不到工作台**，
+// 拿它当夹具等于给不可达状态做覆盖。换成第 ② 类人（`admin` **且**有工位，闸放行）：
+// 他同样能走到「端口列表为空」这条路径（尚未分段），空态覆盖因此保住。
+const ADMIN_WITH_SEAT = {
+  id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: 'root', auth_source: 'local',
 } as AuthUser;
 const DIRS = [{ name: 'demo', cwd: '~/projects/demo', running_count: 0, queued_count: 0 }];
 
@@ -132,16 +136,27 @@ describe('工作台 · 预览端口区块', () => {
         .toEqual(['22000', '22001', '22002']);
       expect(rows[0].get('[data-test="preview-port-hostname"]').text())
         .toBe('alice-p-22000.fde.erix.vip');
-      const states = rows.map((row) => row.get('[data-test="preview-port-state"]').text());
-      expect(states).toEqual([
+      const states = rows.map((row) => row.get('[data-test="preview-port-state"]'));
+      // issue #308：端口段搬进左侧栏（最窄档内容宽约 163px）后行内只放**短**标签
+      // ——长口径「已放行过（仅表示首次放行过）」单格就约 168px，装不下。
+      // 判据仍承重：短标签逐字 + **完整口径必须仍可达**（title/aria-label），两条缺一就退化成「只有短词/只有颜色」。
+      expect(states.map((node) => node.text())).toEqual(['待首次访问', '已放行过', '已放行过']);
+      const fullLabels = [
         '已分配 · 待首次访问',
         '已放行过（仅表示首次放行过）',
         '已放行过（仅表示首次放行过）',
-      ]);
-      for (const text of states) {
+      ];
+      expect(states.map((node) => node.attributes('title'))).toEqual(fullLabels);
+      expect(states.map((node) => node.attributes('aria-label'))).toEqual(fullLabels);
+      for (const node of states) {
+        // 可见文本与完整口径都不许写「健康/运行中」（§4.7a）
+        const text = `${node.text()} ${node.attributes('title')}`;
         expect(text).not.toMatch(/健康/);
         expect(text).not.toMatch(/运行中/);
       }
+      // 4 列表格形态在侧栏里装不下（§3.1）⇒ 工作台走 variant='list'
+      expect(wrapper.find('[data-test="preview-ports-table"]').exists()).toBe(false);
+      expect(wrapper.find('[data-test="preview-ports-list"]').exists()).toBe(true);
     } finally {
       wrapper.unmount();
     }
@@ -204,8 +219,8 @@ describe('工作台 · 预览端口区块', () => {
     }
   });
 
-  it('admin 自己没有 FDE ⇒ items 为空：折叠条不带条数，展开走空态而不是空白', async () => {
-    const { wrapper } = await mountWorkbench(ADMIN_USER, (url, init) =>
+  it('列表为空（有工位但平台尚未分段）⇒ 折叠条不带条数，展开走空态而不是空白', async () => {
+    const { wrapper } = await mountWorkbench(ADMIN_WITH_SEAT, (url, init) =>
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: [] }) : undefined);
     try {
       expect(toggle(wrapper).text()).toContain('预览端口');
@@ -236,6 +251,46 @@ describe('工作台 · 预览端口区块', () => {
       await wrapper.get('[data-test="preview-ports-retry"]').trigger('click');
       await flushPromises();
       expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/me/ports')).toHaveLength(2);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #308：区块从「顶栏与 main 之间的全宽横条」搬进左侧栏底部（aside 内的底部堆叠区），
+// 与目录树各自折叠。本套件钉搬迁的**结构事实**（工单 §五.6 的可判形式）与那条不得破坏的标记契约。
+// ---------------------------------------------------------------------------
+describe('工作台 · 预览端口段已搬进左栏（issue #308）', () => {
+  it('折叠条在 aside 的底部栈里；header 之后直接是 main（横条确已消失）；标记仍唯一', async () => {
+    const { wrapper } = await mountWorkbench(FDE_USER, (url, init) =>
+      url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: THREE_PORTS }) : undefined);
+    try {
+      const bar = toggle(wrapper);
+      // ① 标记契约：`preview-ports-toggle` 在工作台挂载时必须存在（#255 拿它当挂载标记，不许改名/删除）
+      expect(wrapper.find('[data-test="preview-ports-toggle"]').exists()).toBe(true);
+      expect(document.querySelectorAll('[data-test="preview-ports-toggle"]')).toHaveLength(1); // 搬完不留旧的一份
+      // ② 位置：在 aside 内的底部堆叠区里（与目录树同栈）
+      expect(bar.element.closest('aside')).not.toBeNull();
+      expect(bar.element.closest('[data-test="sidebar-bottom-stack"]')).not.toBeNull();
+      // ③ 结构判据：header 的下一个兄弟就是 main ⇒ 顶栏与消息流之间不再有端口区块
+      expect(wrapper.get('header').element.nextElementSibling!.tagName.toLowerCase()).toBe('main');
+      // ④ 消息流那一栏（aside 的兄弟 section）里没有端口面板（面板只在侧栏里）
+      expect(wrapper.get('main > section').element.querySelector('[data-test="preview-ports-panel-body"]')).toBeNull();
+      // ⑤ 三个几何钩子在工作台 DOM 上都在
+      expect(wrapper.find('[data-test="sidebar-aside"]').exists()).toBe(true);
+      expect(wrapper.find('[data-test="sidebar-session-list"]').exists()).toBe(true);
+      expect(wrapper.find('[data-test="sidebar-bottom-stack"]').exists()).toBe(true);
+      // ⑥ 默认折叠（搬进侧栏不改变默认态）
+      expect(bar.attributes('aria-expanded')).toBe('false');
+      // ⑦（主 agent 补的覆盖缺口）`<aside>` 自己不再是滚动容器 —— 滚动预算只许两处（列表段 + 底部栈）。
+      //    变异取证：本条不存在时，把 aside 的 `overflow-hidden` 改回 `overflow-y-auto` ⇒ 66 条全绿（抓不住），
+      //    补上后 ⇒ 恰本条红 ⇒ 「三层滚动不打架」在 aside 这一层第一次有牙。
+      const aside = wrapper.get('aside').element;
+      expect(aside.classList.contains('overflow-hidden')).toBe(true);
+      for (const cls of ['overflow-y-auto', 'overflow-auto', 'overflow-scroll']) {
+        expect(aside.classList.contains(cls)).toBe(false);
+      }
     } finally {
       wrapper.unmount();
     }
