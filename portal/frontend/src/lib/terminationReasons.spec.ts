@@ -89,12 +89,15 @@ describe('termination reason 单一常量（issue #212）', () => {
     // 路径不对会 ENOENT 直接红，不会退化成假绿。
     const src = readFileSync('src/lib/terminationReasons.ts', 'utf8');
     const def = src.match(/export const RUN_TERMINATION_SYSERR_REASONS[\s\S]*?\n\);/);
-    expect(def, '常量定义必须能在源码里定位到（改名/换写法时本用例先红，提醒重新评估这条锁）').not.toBeNull();
+    // 用 throw 而不是 expect(...).not.toBeNull()：后者不是类型守卫，strict 下 `def[0]` 仍报
+    // TS18047 possibly null（CI 步骤 ④ 实测拦下过）。throw 既收窄类型，也保留同样的失败文案。
+    if (!def) throw new Error('常量定义必须能在源码里定位到（改名/换写法时本用例先红，提醒重新评估这条锁）');
+    const definition = def[0];
     // 必须引用红色集合并减去「用户主动停止」那个常量，而不是写死字面量。
-    expect(def[0]).toContain('RUN_FAIL_REASONS');
-    expect(def[0]).toContain('USER_STOP_TERMINATION_REASON');
+    expect(definition).toContain('RUN_FAIL_REASONS');
+    expect(definition).toContain('USER_STOP_TERMINATION_REASON');
     // 反面：出现任何 reason 字面量就是手抄（包括那个将来会新增的值也不能预先写死）。
-    expect(def[0]).not.toMatch(/['"](failed|aborted|max_rounds_cap|persistence_failed|final_guard_unverified)['"]/);
+    expect(definition).not.toMatch(/['"](failed|aborted|max_rounds_cap|persistence_failed|final_guard_unverified)['"]/);
   });
 
   it('上游可重试码集含 timeout/rate_limited/server/disconnect/checkpoint_failed（runner 镜像同集）', () => {
