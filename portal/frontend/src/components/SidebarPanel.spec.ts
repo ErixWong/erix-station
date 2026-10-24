@@ -964,8 +964,8 @@ describe('SidebarPanel · 预览端口段与底部堆叠区（issue #308）', ()
     expect(state.classes()).toContain('truncate');
     expect(state.classes()).toContain('min-w-0');
     expect(state.attributes('title')).toBe('已分配 · 待首次访问');
-    // 作用域说明行（面向不懂技术的业务用户：只说「只显示当前目录正在运行的项目」）
-    expect(wrapper.text()).toContain('只显示当前目录里正在运行的项目');
+    // scopeHint 前言已删（用户裁定：列表只画在用端口，空态自己会说话，不需要解说行）
+    expect(wrapper.text()).not.toContain('跟着你的工位走');
   });
 
   it('作用域：切目录不重发 GET /api/me/ports、列表不清空（端口跟工位走，不跟 cwd 走）', async () => {

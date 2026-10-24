@@ -140,16 +140,15 @@ describe('PreviewPortsPanel · 加载中 / 空 / 失败三态', () => {
   });
 
   it('失败：显示错误码 + 服务端 message 原文 + 可重试（admin 没有 FDE 是空列表，不是失败）', async () => {
-    const onRetry = vi.fn();
     const error: PreviewApiError = {
       status: 401, code: 'unauthorized', message: '未登录或会话已过期', field: null,
     };
-    wrapper = mountPanel({ items: [], loaded: true, error, onRetry });
+    wrapper = mountPanel({ items: [], loaded: true, error });
     const alert = wrapper.get('[data-test="preview-ports-error"]');
     expect(alert.attributes('role')).toBe('alert');
     expect(alert.text()).toBe('预览端口加载失败（unauthorized）：未登录或会话已过期');
-    await wrapper.get('[data-test="preview-ports-retry"]').trigger('click');
-    expect(onRetry).toHaveBeenCalledTimes(1);
+    // 重试按钮已退场：列表自动轮询保鲜（usePreviewPorts 30s + 回前台即刷），错误无需人手点击
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
   });
 
   it('已有列表时失败：旧列表保留 + 错误条（不闪成空白）', () => {
@@ -216,14 +215,6 @@ describe('PreviewPortsPanel · 复制与兜底反馈', () => {
     expect(dirty).not.toContain('undefined');
   });
 
-  it('#256② 批量签票 429 同样带秒数（双语成对：en 也有对应键）', () => {
-    wrapper = mountPanel({
-      batchError: { status: 429, code: 'rate_limited', message: '预览 ticket 签发过于频繁', field: null, retryAfter: 5 },
-    });
-    expect(wrapper.get('[data-test="preview-batch-error"]').text())
-      .toBe('批量签发预览通行票失败（rate_limited）：预览 ticket 签发过于频繁（约 5 秒后可重试）');
-  });
-
   it('切到 English：表头与 state 文案同步换英文（仍不出现 healthy/running）', async () => {
     wrapper = mountPanel();
     setLocale('en');
@@ -270,9 +261,9 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
     expect(hostname.text()).toBe('alice-p-22000.fde.erix.vip');
     expect(hostname.attributes('title')).toBe('http://alice-p-22000.fde.erix.vip:8090（点击复制完整地址）');
     expect(hostname.classes()).toEqual(expect.arrayContaining(['truncate', 'min-w-0', 'w-full']));
-    // 紧凑形态不重复区块标题（折叠条已经写了「预览端口」），但保留重试入口
+    // 紧凑形态不重复区块标题（折叠条已经写了「预览端口」），也没有任何操作按钮
     expect(wrapper.text()).not.toContain('预览端口');
-    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
   });
 
   it('紧凑形态的「打开预览」是图标按钮：默认 title/aria-label=打开预览，签票中该行换「签发通行票…」且全部禁用', async () => {
@@ -310,8 +301,6 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
     for (const node of wrapper.findAll('[data-test="preview-port-state"]')) {
       expect(`${node.text()} ${node.attributes('title')}`).not.toMatch(/healthy|running/i);
     }
-    // 空态/错误文案与 table 形态同源（同一组件、同一份 i18n 键）
-    expect(wrapper.get('[data-test="preview-ports-retry"]').text()).toBe('Retry');
     setLocale('zh-CN');
   });
 
@@ -326,72 +315,14 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
 });
 
 // ---------------------------------------------------------------------------
-// issue #247 / #286：「打开全部预览」动作 + 面向人的 Cookie 告知 + 批量拦截兜底。
-// 判据：① 动作按钮双语成对、只在有行且允许时渲染、点击只 emit（面板不碰网络）；
-// ② 批量拦截兜底是**可点链接列表**（N 个 href 都带票，不静默）；
-// ③ 批量错误显示错误码 + 服务端原文；④ Cookie 告知双语成对、说的是「by design」不是 bug。
+// #247「打开全部预览」与 #286 Cookie 告知双双退出人侧界面：
+// 批量链是探测时代（分不清哪个口有服务 ⇒ 10 标签盲开）的遗产；Cookie 事实的读者是 agent。
 // ---------------------------------------------------------------------------
-describe('PreviewPortsPanel · 一键开整组（#247）与 Cookie 告知（#286）', () => {
-  it('「打开全部预览」渲染且只 emit open-all（面板自己不碰网络）', async () => {
-    const onOpenAll = vi.fn();
-    const fetchSpy = vi.fn();
-    vi.stubGlobal('fetch', fetchSpy);
-    wrapper = mountPanel({ onOpenAll });
-    const button = wrapper.get('[data-test="preview-open-all"]');
-    expect(button.text()).toBe('打开全部预览');
-    await button.trigger('click');
-    expect(onOpenAll).toHaveBeenCalledTimes(1);
-    expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('列表为空或管理台代看形态（showOpenAll=false）⇒ 不渲染该动作', () => {
-    wrapper = mountPanel({ items: [] });
+describe('PreviewPortsPanel · 历史动作退场（#247 批量 / #286 Cookie 告知）', () => {
+  it('不再渲染「打开全部预览」与重试按钮（列表自动保鲜，盲开无存在理由）', () => {
+    wrapper = mountPanel();
     expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
-    wrapper.unmount();
-
-    wrapper = mountPanel({ showOpenAll: false });
-    expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
-  });
-
-  it('批量签发中：按钮换成「批量签发中…」并禁用（防连点签两批）', () => {
-    wrapper = mountPanel({ batchBusy: true });
-    const button = wrapper.get('[data-test="preview-open-all"]');
-    expect(button.text()).toBe('批量签发中…');
-    expect((button.element as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it('弹窗拦截兜底：每个被拦的地址都给一个可点链接（href 带票，target=_blank/rel=noopener）', () => {
-    wrapper = mountPanel({
-      batchBlockedUrls: [
-        'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_B',
-        'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_C',
-      ],
-    });
-    const block = wrapper.get('[data-test="preview-batch-blocked"]');
-    expect(block.attributes('role')).toBe('status');
-    expect(block.text()).toContain('浏览器拦截了部分新标签');
-    const links = wrapper.findAll('[data-test="preview-batch-fallback-link"]');
-    expect(links).toHaveLength(2);
-    expect(links.map((link) => link.attributes('href'))).toEqual([
-      'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_B',
-      'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_C',
-    ]);
-    expect(links.map((link) => link.text())).toEqual([
-      'alice-p-22001.fde.erix.vip:8090',
-      'alice-p-22002.fde.erix.vip:8090',
-    ]);
-    for (const link of links) {
-      expect(link.attributes('target')).toBe('_blank');
-      expect(link.attributes('rel')).toBe('noopener');
-    }
-  });
-
-  it('批量失败：错误码 + 服务端原文（不吞成「操作失败」）', () => {
-    wrapper = mountPanel({
-      batchError: { status: 400, code: 'validation_failed', message: '一次最多签发 10 张预览票', field: 'allocation_ids' },
-    });
-    expect(wrapper.get('[data-test="preview-batch-error"]').text())
-      .toBe('批量签发预览通行票失败（validation_failed）：一次最多签发 10 张预览票');
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
   });
 
   it('#286 Cookie 告知已退出人侧界面（技术事实只留在 agent 侧 ~/AGENTS.md，不进 UI）', () => {

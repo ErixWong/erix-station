@@ -233,9 +233,9 @@ describe('工作台 · 预览端口区块', () => {
     }
   });
 
-  it('列表加载失败：折叠条标出「加载失败」，展开显示错误码 + 原文，重试再拉一次', async () => {
+  it('列表加载失败：折叠条标出「加载失败」，展开显示错误码 + 原文（重试按钮已退场）', async () => {
     let calls = 0;
-    const { wrapper, fetchMock } = await mountWorkbench(FDE_USER, (url, init) => {
+    const { wrapper } = await mountWorkbench(FDE_USER, (url, init) => {
       if (url === '/api/me/ports' && !init?.method) {
         calls += 1;
         return jsonResponse(503, { error: { code: 'db_unavailable', message: '数据库暂时不可用' } });
@@ -248,9 +248,8 @@ describe('工作台 · 预览端口区块', () => {
       await toggle(wrapper).trigger('click');
       expect(wrapper.get('[data-test="preview-ports-error"]').text())
         .toBe('预览端口加载失败（db_unavailable）：数据库暂时不可用');
-      await wrapper.get('[data-test="preview-ports-retry"]').trigger('click');
-      await flushPromises();
-      expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/me/ports')).toHaveLength(2);
+      // 重试按钮已退场（自动轮询接管）；30s 定时器不在测试里等，只钉「按钮不再渲染」
+      expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
     } finally {
       wrapper.unmount();
     }
@@ -297,126 +296,7 @@ describe('工作台 · 预览端口段已搬进左栏（issue #308）', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// issue #247：一键开整组（POST /api/me/ports/batch-tickets）。
-// 四条判据：① **挂载时不预取票**（批量端点请求数 = 0，展开也不签）；
-// ② 点击才签、body 是列表顺序的 allocation_ids、N 张票开 N 个新标签；
-// ③ 弹窗被拦 ⇒ 面板里出现可点链接列表兜底（不静默）；
-// ④ 批量失败 ⇒ 空白标签收回 + 错误码原文可见。
-// ---------------------------------------------------------------------------
-const BATCH_PATH = '/api/me/ports/batch-tickets';
-
-function batchBody(items: Array<{ id: string; port: number; ticket: string }>) {
-  return {
-    items: items.map((item) => ({
-      id: item.id,
-      port: item.port,
-      ticket: item.ticket,
-      url: `http://alice-p-${item.port}.fde.erix.vip:8090/?preview_ticket=${item.ticket}`,
-      expires_at: '2026-10-23T12:01:00.000Z',
-    })),
-  };
-}
-
-describe('工作台 · 一键开整组（#247）', () => {
-  it('挂载 + 展开都不调批量端点（票不预取）；点击才签，body = 列表顺序的 allocation_ids，N 张票开 N 个标签', async () => {
-    const { wrapper, fetchMock } = await mountWorkbench(FDE_USER, (url, init) => {
-      if (url === '/api/me/ports' && !init?.method) return jsonResponse(200, { items: THREE_PORTS });
-      if (url === BATCH_PATH && init?.method === 'POST') {
-        return jsonResponse(201, batchBody([
-          { id: UUID_22000, port: 22000, ticket: 'pt_0' },
-          { id: UUID_22001, port: 22001, ticket: 'pt_1' },
-          { id: UUID_22002, port: 22002, ticket: 'pt_2' },
-        ]));
-      }
-      return undefined;
-    });
-    const tabs = stubOpen();
-    try {
-      // ① 挂载后（折叠态）批量端点请求数 = 0
-      expect(fetchMock.mock.calls.filter(([url]) => String(url) === BATCH_PATH)).toHaveLength(0);
-      await toggle(wrapper).trigger('click');
-      // 展开也不签（只拉过列表）
-      expect(fetchMock.mock.calls.filter(([url]) => String(url) === BATCH_PATH)).toHaveLength(0);
-      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
-
-      // ② 点击「打开全部预览」= 一次 POST + 三个标签
-      await wrapper.get('[data-test="preview-open-all"]').trigger('click');
-      await flushPromises();
-      const posts = fetchMock.mock.calls.filter(([url, init]) => String(url) === BATCH_PATH && init?.method === 'POST');
-      expect(posts).toHaveLength(1);
-      expect(JSON.parse(String(posts[0]![1]?.body))).toEqual({
-        allocation_ids: [UUID_22000, UUID_22001, UUID_22002],
-      });
-      expect(tabs).toHaveLength(3);
-      expect(tabs.map((tab) => tab.location.href)).toEqual([
-        'http://alice-p-22000.fde.erix.vip:8090/?preview_ticket=pt_0',
-        'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_1',
-        'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_2',
-      ]);
-      // 票不进当前页 URL
-      expect(window.location.href).not.toContain('preview_ticket');
-      expect(wrapper.find('[data-test="preview-batch-blocked"]').exists()).toBe(false);
-    } finally {
-      wrapper.unmount();
-    }
-  });
-
-  it('弹窗被拦 ⇒ 面板给出可点链接列表兜底（每张票一条，href 带票），不静默', async () => {
-    const { wrapper } = await mountWorkbench(FDE_USER, (url, init) => {
-      if (url === '/api/me/ports' && !init?.method) return jsonResponse(200, { items: THREE_PORTS });
-      if (url === BATCH_PATH && init?.method === 'POST') {
-        return jsonResponse(201, batchBody([
-          { id: UUID_22000, port: 22000, ticket: 'pt_0' },
-          { id: UUID_22001, port: 22001, ticket: 'pt_1' },
-          { id: UUID_22002, port: 22002, ticket: 'pt_2' },
-        ]));
-      }
-      return undefined;
-    });
-    vi.stubGlobal('open', vi.fn(() => null)); // 浏览器把三个标签全拦了
-    try {
-      await toggle(wrapper).trigger('click');
-      await wrapper.get('[data-test="preview-open-all"]').trigger('click');
-      await flushPromises();
-      const links = wrapper.findAll('[data-test="preview-batch-fallback-link"]');
-      expect(links).toHaveLength(3);
-      expect(links.map((link) => link.attributes('href'))).toEqual([
-        'http://alice-p-22000.fde.erix.vip:8090/?preview_ticket=pt_0',
-        'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_1',
-        'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_2',
-      ]);
-      expect(wrapper.get('[data-test="preview-batch-blocked"]').text()).toContain('浏览器拦截了部分新标签');
-    } finally {
-      wrapper.unmount();
-    }
-  });
-
-  it('批量失败（429）：本轮开的空白标签全收回，面板显示错误码 + 服务端原文', async () => {
-    const { wrapper } = await mountWorkbench(FDE_USER, (url, init) => {
-      if (url === '/api/me/ports' && !init?.method) return jsonResponse(200, { items: THREE_PORTS });
-      if (url === BATCH_PATH && init?.method === 'POST') {
-        return jsonResponse(429, { error: { code: 'rate_limited', message: '预览 ticket 签发过于频繁，请稍后再试' } });
-      }
-      return undefined;
-    });
-    const tabs = stubOpen();
-    try {
-      await toggle(wrapper).trigger('click');
-      await wrapper.get('[data-test="preview-open-all"]').trigger('click');
-      await flushPromises();
-      expect(wrapper.get('[data-test="preview-batch-error"]').text())
-        .toContain('批量签发预览通行票失败（rate_limited）：预览 ticket 签发过于频繁');
-      expect(tabs).toHaveLength(3);
-      for (const tab of tabs) {
-        expect(tab.close).toHaveBeenCalledTimes(1);
-        expect(tab.location.href).toBe('');
-      }
-    } finally {
-      wrapper.unmount();
-    }
-  });
-
+describe('工作台 · #286 告知链（人侧界面不再出现技术告知）', () => {
   it('#286：Cookie 告知已不在人侧界面（告知链收敛到 agent 侧 AGENTS.md）', async () => {
     const { wrapper } = await mountWorkbench(FDE_USER, (url, init) =>
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: THREE_PORTS }) : undefined);
