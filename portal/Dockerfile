@@ -16,6 +16,20 @@ FROM node:22-slim
 
 ENV NODE_ENV=production
 
+# ---- 运行时依赖：git（issue #359 收工灯）----
+# 为什么 portal 自己也要 git：`GET /api/git-light`（`portal/src/gitlight.js`）要跑一条
+#   `git status --porcelain -uall` 判「未提交 + 未跟踪」。未推送 / 0 提交那两路是纯文本读 `.git`，
+#   不依赖 git 二进制；**但缺 git 时灯永远只能报 `grey / git_unavailable`** —— 一颗恒灰的灯比没有灯更槽
+#   （绿是承诺、灰是无信息，用户会直接把它当“坏了”而不再看）。
+# 只要 read-only 能力：不装 openssh-client / 不配凭据 —— portal 零 git 写（D9：init/commit/push/clone
+#   全走「让 AI 收尾」），也不跑 fetch，所以不碰网络也不碰凭据。
+# 层序照 runner/Dockerfile：重且稳定的 apt 层在前、易变代码在后（改 portal 代码不触发重装）；
+#   `--no-install-recommends` + 同层 `rm -rf /var/lib/apt/lists/*`（评审 F6 先例：异层清理等于没清）。
+# 本层内容被 `portal/test/portal-image-git.test.js` 以文本锁钉住。
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # 依赖清单先行，利于层缓存

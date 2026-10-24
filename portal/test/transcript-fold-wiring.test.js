@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(HERE, '../src');
+const REPO_ROOT = path.join(HERE, '../..'); // #351：跨面包边——折叠归位在 runner 侧，护栏要能看见对面
 const read = (rel) => fs.readFileSync(path.join(SRC, rel), 'utf8');
 
 /** 取出某个顶层声明的函数体（到下一个顶层 `export` 为止）；取不到就红，避免护栏空转。 */
@@ -73,12 +74,31 @@ test('#337 引擎取上下文与 run 作用域 legacy 端点**不折**（`intern
   }
   assert.doesNotMatch(src, /transcript-fold/, 'internal.js 不得引用折叠模块');
   assert.doesNotMatch(src, FOLD_CALL,
-    '引擎自己会 foldLedgerMessages（resume-manager），站内再折是多余一遍；run 作用域 legacy 端点无新数据');
+    '#351 后口径：引擎只调 foldLedgerMessages（只接 partOf），载体折叠归 store——那是 runner/lib/store.js 的活；'
+    + '端点再折一遍是页内折（跨页轮会漏），legacy run 作用域端点更不该动');
 });
 
 test('#337 折叠模块只有一个消费点（`session-view.js`），别处引用即红', () => {
   const files = fs.readdirSync(SRC).filter((name) => name.endsWith('.js'));
-  const importers = files.filter((name) => read(name).includes('transcript-fold.js'));
+  // #351：模块自己的文件头现在要点名镜像 `runner/lib/transcript-fold.js`（两份尺的漂移说明），
+  // 那是**注释**不是消费点 ⇒ 排除自身；否则「改一句注释」就把这条护栏咬红，护栏就变成了打字员。
+  const importers = files
+    .filter((name) => name !== 'transcript-fold.js')
+    .filter((name) => read(name).includes('transcript-fold.js'));
   assert.deepEqual(importers, ['session-view.js'],
     `只允许咽喉点引用 transcript-fold.js，实际：${importers.join(', ')}`);
+});
+
+test('#351 引擎面的折叠在 runner 侧（`runner/lib/store.js`），portal 端点面**不得**再折一遍', () => {
+  // 折叠口径归位后（#351）：引擎 `store.load()` 的输出由 `runner/lib/store.js` 折一次（在 agentd
+  // 把游标翻页**全量**拉齐之后）。portal 的分页端点若也折，就会在**页内**折 ⇒ 一轮跨两页时漏折，
+  // 正是 #338 的病根 ⇒ 这里钉住「端点仍返回原始行」。
+  const src = read('internal.js');
+  const body = /async function getSessionTranscript\(|export async function getSessionTranscript\(\([\s\S]*?\n\}/.exec(src)?.[0] ?? '';
+  assert.ok(body.length > 0, 'getSessionTranscript 找不到了 ⇒ 本条护栏空转，先修测试再谈改动');
+  assert.doesNotMatch(body, FOLD_CALL,
+    '引擎面向的分页端点不得折叠：折叠在 runner 的 store.load()（全量聚合之后）做，页内折会漏折跨页的轮');
+  const runnerStore = fs.readFileSync(path.join(REPO_ROOT, 'runner/lib/store.js'), 'utf8');
+  assert.match(runnerStore, /foldLedgerRecords\(records\)/,
+    '引擎面的折叠必须在 runner/lib/store.js#load（与上游「内置 store 在 load() 里折」同构）');
 });

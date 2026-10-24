@@ -30,7 +30,15 @@ if (persistedRowKey !== undefined) toolResultRowKey = persistedRowKey;
 | 面 | 现状 |
 |---|---|
 | 站内展示投影（`portal/src/session-view.js#projectSessionMessages`） | **自 #341 起已解链**（`portal/src/transcript-fold.js#planFold` 让分片行也登记自己的 key）⇒ 折叠回 1 条聚合 `tool_result`，与 0.22 形状一致 |
-| **引擎 resume**（`foldLedgerMessages` + `validateMessages`） | **仍会坏**：上游 `foldMessageRows` / `foldLedgerMessages` 只认「一跳」，链上第 2 片起查不到目标 ⇒ 一条聚合 `tool_result` 被劈成多条 user 消息 ⇒ `invalid_messages`，会话永久卡死。**本站修不了，只能修数据**（等上游 #415 落地） |
+| **引擎 resume**（`foldLedgerMessages` + `validateMessages`） | **仍会坏**：上游 `foldMessageRows` / `foldLedgerMessages` 只认「一跳」，链上第 2 片起查不到目标 ⇒ 一条聚合 `tool_result` 被劈成多条 user 消息 ⇒ `invalid_messages`，会话永久卡死。⚠ **「本站修不了，只能修数据」2026-10-24 作废**：本站 `transcript-fold.js` 是上游读侧的**超集**（链式也解），差的只是把它接到**引擎面向的** `store.load()` ⇒ **#351 已实现**（`runner/lib/store.js#load` + `runner/lib/transcript-fold.js`）：接上后两类在引擎侧一起免疫、存量读侧自愈 |
+
+> **⚠ 口径更正（2026-10-24，#351）**：旧版那句「引擎 resume 侧本站修不了，只能修数据（等上游 #415）」**作废**。
+> 同一份链式 `partOf` 夹具实测：上游 `foldMessageRows` **FAIL**（`tool_result ids do not match…`，user 消息被劈成 2 条）、
+> 本站 `transcript-fold` **OK**（1 条）⇒ 本站那份折叠是上游读侧的**超集**。引擎 resume 读的是 `store.load()`，
+> 而本站 `runner/lib/store.js` 直通 portal 原始行 ⇒ **引擎从来没经过任何折叠**。
+> 契约依据：`host-consumer-contract.md:2405-2409`（`foldMessageRows` 由内置 store 的 `load()` 调用）与 `:2442`（宿主读账本必须经 `load()`）；
+> `src/loop/resume-manager.js:239-241` 的 `seq` 播种本就为**折叠后的** `load()` 输出设计。
+> 修法已落在 #351（`runner/lib/store.js#load` 接折叠）；§2 的修数据自此降级为兜底、已砖会话读侧自愈。上游同题 [#458](https://github.com/ErixWong/erix-agent/issues/458)。
 
 > ⚠ 另一个已实测的边界（别拿它当「没坏」的证据）：站内投影对链式 `partOf` **不显症状** ——
 > 上游 `src/display/projection.js#toolResultsOf(messages)` 扫整条 record 的全部 messages 并按
@@ -118,6 +126,9 @@ SELECT a.round,
 ---
 
 ## 2. 修数据口径（递归解链到链头）
+
+> **2026-10-24 定位**：本节是**兜底手段**（只治链式 `partOf` 一类）。#351 的折叠接线已落地 ⇒ 新会话不再需要修数据、
+> 已砖会话读侧自愈；在那之前它仍是引擎侧唯一可用的修法。今天真机那次修数据见 §5。
 
 **要改的只有一件事**：把每个**分片行**的 `record.partOf` 改成**链头**的 `dedupKey`
 （= 该轮那条「自己不带 `partOf`」的首片行）。改完链就退化成「一跳」，上游 `foldMessageRows` /
@@ -264,4 +275,81 @@ UPDATE transcript_rounds t
 | 写侧把 `partOf` 写成链 | erix-agent（`orchestrator.js`） | 0.23.x 现状 |
 | 读侧折叠只认一跳 | erix-agent（`store/message-rows.js#foldMessageRows` / `#foldLedgerMessages`） | 上游 **#415** 未修 |
 | 站内展示投影解链 | erix-station（`portal/src/transcript-fold.js#planFold`，**临时闸**） | **#341 已交付**；上游落地并升 pin 后撤闸（源码级哨兵会变红提示） |
+| **引擎 resume 面解链** | erix-station（同一份折叠接在 `runner/lib/store.js#load`，agentd 游标聚合之后） | **#351 已交付**：两类砖化形状在引擎侧一起免疫，存量会话读侧自愈（无需修数据） |
 | 引擎 resume 的账本修数据 | 运维（本文 §2） | 每次升级/巡检后按 §1 判、按 §2 修 |
+
+---
+
+## 5. 第二种砖化形状：`:input:` 行插队（2026-10-24 真机记录，#351）
+
+**§1 的巡检 SQL 测不到这一类**（当天全库链式 `partOf` = **0 行**，手册判「干净」的会话照样砖了 4 个 run）。
+
+真因不是链：被**手动停止**那一轮的 `tool_result` 要到**下一次 run resume** 才补落盘，而宿主 `:input:` 行是发消息**当场**写的（#162 顺序红线）⇒ 同一轮内 `append_seq` 顺序反了，`tool_use` 与它的结果之间夹了一条 user text：
+
+```text
+1122  msg:28:0                assistant + tool_use#…964e9a6c
+1123  input:092e8586-…        user text（发消息时预写）       ← 插在中队
+1124  msg:28:1                user tool_result → …964e9a6c   ← resume 时才补落盘
+1125  engine:round:28:resume  崩溃轮载体行（messages: []）
+```
+
+上游 `host-consumer-contract.md:2432-2437` **逐字**描述的就是这个形状，并说它「由折叠消化」——前提是宿主 `load()` 做了折叠（§0 更正）。
+
+### 5.1 新增巡检项（与 §1.1 并列，两条都要跑）
+
+```sql
+-- 被同轮引擎消息行「超车」的 :input: 行 = 会砖化的插队；期望 0 行
+SELECT t.transcript_key, t.round, t.dedup_key, t.append_seq
+  FROM transcript_rounds t
+ WHERE t.dedup_key LIKE '%:input:%'
+   AND EXISTS (SELECT 1 FROM transcript_rounds y
+                WHERE y.transcript_key = t.transcript_key AND y.round = t.round
+                  AND y.record ? 'seq' AND y.append_seq > t.append_seq);
+```
+
+> **两条谓词是一套，必须一起跑**（§1.1 查链、§5.1 查插队）——它们是同一类后果的两种形状。
+> 清掉一种，另一种就会在下一次 resume 显形：2026-10-24 实测，`index 56`（插队）用 §5.2 清掉后同会话
+> **成功跑了一轮**（rounds 37–43；其间 3 个并行工具调用又被上游写成链），**8 分钟**后下一次 resume 报
+> `index 81`（链，只有 §2.2 能清）。⇒ **修一条 ≠ 这个会话干净**，修完必须两条谓词都归 0。
+> 想一次性免疫两类：把折叠接到引擎面向的 `store.load()`（#351）；根治在上游 #415（别再写链）。
+
+### 5.2 修数据（只动排序键；`record` 逐字节不变、零增删行、零 DDL、幂等）
+
+`append_seq` 走 `nextval` ⇒ 后续新行仍排在被改行之后（**不要**手填一个中间值，会撞既有行）。
+
+```sql
+BEGIN;
+CREATE TABLE IF NOT EXISTS transcript_rounds_input_seq_bak_20261024 (
+  id uuid PRIMARY KEY, transcript_key text, round int, dedup_key text, append_seq bigint);
+INSERT INTO transcript_rounds_input_seq_bak_20261024
+SELECT t.id, t.transcript_key, t.round, t.dedup_key, t.append_seq FROM transcript_rounds t
+ WHERE t.dedup_key LIKE '%:input:%'
+   AND EXISTS (SELECT 1 FROM transcript_rounds y
+                WHERE y.transcript_key = t.transcript_key AND y.round = t.round
+                  AND y.record ? 'seq' AND y.append_seq > t.append_seq)
+   AND NOT EXISTS (SELECT 1 FROM transcript_rounds_input_seq_bak_20261024 b WHERE b.id = t.id);
+
+WITH need AS (
+  SELECT t.id FROM transcript_rounds t
+   WHERE t.dedup_key LIKE '%:input:%'
+     AND EXISTS (SELECT 1 FROM transcript_rounds y
+                  WHERE y.transcript_key = t.transcript_key AND y.round = t.round
+                    AND y.record ? 'seq' AND y.append_seq > t.append_seq))
+UPDATE transcript_rounds t SET append_seq = nextval('transcript_rounds_append_seq_seq')
+  FROM need WHERE t.id = need.id;
+COMMIT;
+```
+
+### 5.3 当天取证与复验（手法值得复用：**把真账本行喂进引擎自己的折叠/校验**）
+
+| 步骤 | 结果 |
+|---|---|
+| 修前：真 124 行按生产读序（`round, append_seq`）喂 `foldLedgerMessages` + `validateMessages` | **FAIL `index 56`**，与界面文案逐字一致 |
+| 同一批行先过上游 `foldMessageRows` | **OK**（76 条逻辑消息，124 行 → 44 行）⇒ **同一账本装进上游内置 store 不砖** = 「宿主侧修、不等上游」的定案依据 |
+| 修后：dev 库 14 个账本会话逐个跑 | **0 失败** |
+| 谓词复验 | **0 行**（幂等自证）；被改的行恰 1 行（`1123 → 1159`） |
+
+- 回滚（比 §2.4 的整条 record 覆盖更窄，只回滚排序键）：
+  `UPDATE transcript_rounds t SET append_seq = b.append_seq FROM transcript_rounds_input_seq_bak_20261024 b WHERE t.id = b.id;`
+- ⚠ 修数据**不会**重跑已失败的 run（当天 4 次 `failed` 需用户重发一次消息）。
+- ⚠ 失败的每次发消息都在账本里留下一条**没被回答的 `:input:` 行**（当天 3 条），下一次 resume 会把它们一起喂给模型——既有口径，不是新缺陷。
