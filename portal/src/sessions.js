@@ -338,14 +338,24 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
 
 /**
  * issue #189：折叠原文只读端点（GET /api/sessions/:id/folded/:round）。
- * 属主/存在性/active 校验同 fetchSession 口径（非属主/不存在一律 404，不泄露存在性）；
- * 取该 session 该 round 的折叠原文：优先 `folded_payload` 派生列（#195 修复后由引擎 record.foldedPayload
- * 回退提取写入），存量行（列 NULL）回退 `record.foldedPayload`——与 #195 的读侧 collectRoundText（internal.js）、
- * 写侧 putSessionRound 同一规则。
- * 为空/无行 → 404 folded_payload_not_found。命中时原文一律走同一个上游投影
- * `projectTranscriptForDisplay`（不另造折叠渲染，#95 红线），返回 { round, turns }。
- * 同 round 多行（append_seq 保序）：取最早一条（原文内容同源，首条即可）。
+ * 属主/存在性/active 校验同 fetchSession 口径（非属主/不存在一律 404，不泄露存在性）。
+ *
+ * ⚠ **口径已由 #375 改了一遗**：旧行为是“取该 round 那一行的归档”（`folded_payload` 列优先、
+ * 存量行回退 `record.foldedPayload`，为空一律 404）。那在 erix-agent 0.25.0 之前“意外成立”——
+ * 当时每次折叠都把 `from:1` 的全量写进归档，所最新那一行就是全部原文。0.25.0（erix-agent#461）
+ * 把归档改成**本轮新增的有界差分**（会话级内容去重 + 默认 256 KiB 夹断，超限保尾丢头，丢弃量记在
+ * `record.foldedPayloadMeta`）⇒ 只读归档现在只能给出**残缺**，去重全吸收时甚至是**空**，而旧口径会回
+ * `404 folded_payload_not_found`、前端渲染成「原文已不可用（上游未保留折叠前载荷）」——假话。
+ *
+ * 新口径（契约 host-consumer-contract：原文在各自的轮行里，`foldedRoundRange`/`navigationRecord` 才是
+ * 有界指针，宿主不得把截断/缺失读成丢数据）：
+ *   ① 有 `foldedRoundRange` ⇒ **从同会话已有轮行重建**（`source:'rebuilt'`，可证无损：账本 append-only
+ *     且全站 `DELETE FROM transcript_rounds` 零命中）；行数超 `FOLDED_REBUILD_MAX_ROWS` 只置 `truncated`。
+ *   ② 无 range（或 range 内一行正文都没有）⇒ 退回归档（`source:'archive'`，#195 列优先/record 回退不变）。
+ *   ③ 两条都拿不出正文 ⇒ `404 folded_payload_not_found`（语义收窄为“这个范围真的一行都没有”）。
+ * 返回形状**向后兼容**：`{ round, turns }` 一字未动，新增 `source`/`truncated`/`dropped_messages` 三个可选键。
  */
+const FOLDED_REBUILD_MAX_ROWS = 2000; // 扫描上限与 U7 recall 同尺（internal.js `recallTranscript` 先例）
 export async function getFoldedPayload(pool, { userId, sessionId, round }) {
   await fetchSession(pool, sessionId, userId);
   const n = Number(round);
@@ -363,11 +373,58 @@ export async function getFoldedPayload(pool, { userId, sessionId, round }) {
   const payload = Array.isArray(row?.folded_payload)
     ? row.folded_payload
     : (Array.isArray(row?.record?.foldedPayload) ? row.record.foldedPayload : null);
-  if (!Array.isArray(payload) || payload.length === 0) {
-    throw new SessionError('folded_payload_not_found', 'folded payload not found', { httpStatus: 404 });
+  const range = normalizeFoldedRoundRange(row?.record?.foldedRoundRange);
+  const meta = row?.record?.foldedPayloadMeta;
+  const droppedMessages = Number.isSafeInteger(meta?.droppedMessages) && meta.droppedMessages > 0 ? meta.droppedMessages : 0;
+
+  // ① 有范围 ⇒ 以账本为准重建（#375 主路）。归档只能给差分，而横幅说的是整个范围。
+  if (range) {
+    const rebuilt = await rebuildFoldedRange(pool, { key: sessionId, range });
+    if (rebuilt.turns.length > 0) {
+      return {
+        round: n, turns: rebuilt.turns, source: 'rebuilt',
+        truncated: rebuilt.truncated || droppedMessages > 0, dropped_messages: droppedMessages,
+      };
+    }
+    // 重建空（range 内一行正文都没有：极端旧账本 / range 越界）→ 落回 ②，不误 404。
   }
-  const turns = projectTranscriptForDisplay([{ round: n, messages: payload }]);
-  return { round: n, turns };
+  // ② 无 range（或重建为空）：归档本身就是全部可用原文，它非空即完整（不存在“只给一段”的歧义）。
+  if (Array.isArray(payload) && payload.length > 0) {
+    return {
+      round: n, turns: projectTranscriptForDisplay([{ round: n, messages: payload }]), source: 'archive',
+      truncated: droppedMessages > 0, dropped_messages: droppedMessages,
+    };
+  }
+  // ③ 两条路都拿不出正文 ⇒ 这时候才真的叫“没有原文”。
+  throw new SessionError('folded_payload_not_found', 'folded payload not found', { httpStatus: 404 });
+}
+
+/** `foldedRoundRange` 形态校验：两个非负整数且 from ≤ to；其余-shape 一律当“无范围”。 */
+function normalizeFoldedRoundRange(raw) {
+  const from = raw?.from;
+  const to = raw?.to;
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) return null;
+  if (from < 0 || to < from) return null;
+  return { from, to };
+}
+
+/**
+ * 按 `foldedRoundRange` 从同会话已有轮行重建原文（#375）。
+ * 账本 append-only、全站 `DELETE FROM transcript_rounds` 零命中 ⇒ 可证无损；上限与截断口径同 U7 recall。
+ * 取行不取折叠行本身（它的 `messages` 是空数组）；`messages <> '[]'::jsonb` 把无正文的事实行筛掉。
+ */
+async function rebuildFoldedRange(pool, { key, range }) {
+  const res = await pool.query(
+    `SELECT round, messages FROM transcript_rounds
+      WHERE transcript_key = $1 AND round BETWEEN $2 AND $3 AND messages <> '[]'::jsonb
+      ORDER BY round ASC, append_seq ASC LIMIT $4`,
+    [key, range.from, range.to, FOLDED_REBUILD_MAX_ROWS + 1],
+  );
+  const rows = res.rows ?? [];
+  const truncated = rows.length > FOLDED_REBUILD_MAX_ROWS;
+  const kept = truncated ? rows.slice(0, FOLDED_REBUILD_MAX_ROWS) : rows;
+  const records = kept.map((r) => ({ round: Number(r.round), messages: r.messages }));
+  return { turns: projectTranscriptForDisplay(records), truncated };
 }
 
 /** PATCH /api/sessions/:id —— 改标题（CAS 限定 active，防归档后仍改成功）。 */
