@@ -124,7 +124,7 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 
 - D1 Traefik 作 ingress；D2 SSO + 本地 break-glass admin；D3 每 FDE 仅自己的 `/29` 独立网络（`control` 共享网络已取消，H-B 定稿 issue #5）
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
-- D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree
+- D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree（**已修订**，见下方 D8 修订段）；D9 目录 git 状态 = 一颗红/黄/绿灯（见下方 D9 段，issue #359）
 
 ## 7. D8 修订（2026-09-24，决策者拍板）：cwd 直达项目目录，拆除 worktree
 
@@ -140,6 +140,28 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - **代价与边界**：agent 弄脏项目由用户 git 自治（工位语义本就如此）；将来真要并行同项目，
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
+
+## 7. D9（2026-10-24，决策者拍板，issue #359）：目录 git 状态只以「红/黄/绿」一颗灯呈现
+
+- **语义**：灯 = **收工进度**，一句话给用户的判据是「**每天忙完之后要保证它是绿的**」。
+  🔴 未落地（未提交 / 未跟踪 / 0 提交但有内容）→ 🟡 未推送（有提交未推 / 无远端 / 从未 fetch）
+  → 🟢 已收工；⚪ 读不到或未查完——**⚪ 不得渲染成绿**（绿是承诺，没扫完就没资格承诺）。
+- **理由**：git 细节对专业人士是噪音（他自己会问 AI），对非专业人士是噪音加噪音。界面只承载
+  「这个目录的工作有没有被 git 兜住」这一件事。**未跟踪与未提交同罪**（都是零兜底），故同归于红；
+  红是进度不是警报（agent 一改就红，直到收工），所以措辞用状态词、不给 `⚠` 与告警底色。
+- **边界**：portal **零 git 写操作**（不 init / 不 commit / 不 push / 不 checkout / 不代 clone，
+  与 D-「平台不 clone」同口径），写一律走 run = 界面上的「让 AI 收尾」（只**预填**输入框不自动发：
+  发 run 占 capacity 且花 token）。搞不清就「问 AI」——**每个态都留这条兜底**，这是闭环的最后一环。
+  唯一保留的 git 细节是「**仓库名**」，因为预填给 AI 的话必须指名目标仓库（一个目录多个仓库是真实现状）。
+- **数据源**：宿主 portal 直读 `<userSpaceRoot>/<fde>/projects/<dir>/.git`（与 `/api/dirs`、`/api/files/tree`
+  同一条 bind mount 通道）；一个仓库 = 一条 `git status --porcelain -uall` + 三次纯文本读 sha。
+  ⚠ **不得用 `-uno`**（实测它让 0 提交的根仓库对三个脏子仓库报空输出、rc=0，自认干净 ⇒ 直接撒谎）。
+  成本上界靠 `.gitignore` 剪枝 + stdout 流式数到 50 即 kill + 2s 超时（超时落 ⚪）。
+- **不做什么**：分支列表/分支数、detached、worktree/子模块结构、最后提交时刻、↑N/↓N、diff 内容、
+  inotify 事件源——全不做（理由与实测记录在 issue #359 正文与附录）。
+- **告知面先行**：D9 的**产品闭环**要求容器里的 agent 真会「收工即提交」，而它看不见灯 ⇒
+  要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.51），灯（P0a/P0b）后上。顺序反了就是
+  「灯长期红/黄、而没人负责让它变绿」。
 
 ## 8. erix-agent 依赖与升级（当前 pin：**0.20.0**，2026-10-15 由 #299 从 0.18.0 两步升上；历史 0.14–0.18 记录见下）
 
@@ -1538,3 +1560,35 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **镜像未重建**：现网 `FDE_IMAGE=ghcr.nju.edu.cn/erixwong/erix-station-fde@sha256:de16b78b513c…`（portal env + `IMAGE_ALLOWLIST` 全串精确匹配）。生效需要 build → 新 image ID → 同步这两处 env → recreate `fde-eric` / `fde-jim`（**会打断正在跑的 run**）。在此之前线上靠上面那份热补撑着。
 - **未发版**（不进 v0.1.31 的任何承诺，等决策者定窗口）。
 - 展示层过滤**没**同步到目录树（`fileTree`）：树面板里点开头目录仍可见可展开，是刻意的——树是浏览器的用法，人可能就是要看 `.git` / `.github`；下拉才是被污染的那一面。
+
+### 8.51 收工纪律进 `~/AGENTS.md`：D9 的告知面先行（issue #359 P0c，2026-10-24，分支 `feat-261024-05-git-light-agents-md`）
+
+**交付的只有 D9（§7）的告知面，灯本身没做**：`renderHomeAgentsMd` 的 `## git` 段从 2 行扩到 5 行——
+①「平台不 clone、不下发凭据，**也不替你提交**：首次运行只对还不是仓库的目录执行一次 `git init -b main`」
+②「**收工即提交**：任务完成（含新建/修改的文件，未跟踪的与改过的同样算没兜底）就 `git commit`，有远端就 `git push`」
+③「**一个目录里有多个仓库就逐个仓库分别提交**：父目录的仓库**不包含**子目录里的仓库，在父目录提交是白干的」
+④「目录还没有远端 ⇒ 提醒用户自行配置」。`portal/test/materializer.test.js` 加 1 条用例钉这四条**语义**（改字可以，改口径不行）。
+
+**为什么告知面要先走**：容器里的 agent **看不见灯**，而平台零 git 写操作（`worker.js:270 ensureGitRepo` 只 init 不 commit）
+⇒ 不先把要求写进它读的 `~/AGENTS.md`，灯上线后就是「把问题摆给用户，却没人负责让它变绿」。顺序反了 D9 就不闭环。
+③ 那句还顺手堵住 #359 §4.0 那个「空壳根仓库」的坑——它是在 AI 侧阻止事故，比在 UI 侧提示便宜。
+
+**生效路径（与 §8.50 那条「镜像未重建」不同类，值得单独记）**：materializer 跑在 **portal 进程内**，
+`isPlatformManagedPath` 认 `home/AGENTS.md` 是平台文件（`materializer.test.js` 那条钉着）⇒ **portal 发布后
+下一次 reconcile 重写** `<userSpaceRoot>/<fde>/home/AGENTS.md`，经 bind mount 立即可见于容器
+⇒ **不需要重建 FDE 镜像、不需要 recreate 容器、不打断正在跑的 run**。
+
+**基线**：基点 `origin/main` `1655d7a` **1445 / 1441 / 0 / 4** → 本次 **1446 / 1442 / 0 / 4**，**净 +1**
+（本次 diff 里 `^+test(` 计数 = 1，可校），`npm test` **rc=0**（判绿看退出码，§4.1）；`runner/` 与 `portal/frontend/` **零字节**。
+
+**未做 / 待决**：
+- **P0a**（`portal/src/gitlight.js` 三判据 + `GET /api/git-light?cwd=`）、**P0b**（顶栏灯 + `让 AI 收尾` 预填 + `问 AI` 兜底 + zh/en）都在 #359 挂着，**灯现在界面上不存在**。
+- **未发版**（不进任何版本承诺，等决策者定窗口）。
+- ⚠ 给接手 P0a 的 session：**动手前先读 #359 附录那 6 条实测**——尤其「`-uno` 会让 0 提交根仓库对脏子仓库报空输出（撒谎）」、「本机 `-u` 与 `-uall` 逐字相同、`.gitignore` 会剪掉整棵 `node_modules`」、「linked worktree 的 refs 在 `commondir` 而不是 `.git` 文件指向的目录」。**`listeners.js:112-126` 没处理 `commondir`，照抄会错。**
+
+**顺带挖到的仓库级坑（与本单无关，未动，只登记）**：`origin/main` 的 `1655d7a` 把 **`node_modules` 当文件提交成了指向它自己的符号链接**
+（`git ls-files -s` 是 mode `120000`，内容 = `/home/adminwange/projects/fde_station/erix-station/node_modules`；`file` 报 *broken symbolic link*）。
+后果：**任何新 checkout / 切分支到该 tip 之后，`npm test` 直接 `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'`**
+（本次切分支就撞上了，看着像自己的改动把测试弄挂）。本机用 `npm ci` 恢复（它先 `Removing non-directory node_modules` 再装 16 个包，0.7s）。
+CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完全误导人。
+⇒ 本单**没动这个路径**（工作区里那份删除是 `npm ci` 的副作用，未入提交）；后续要么 `git rm --cached node_modules` + 进 `.gitignore`，要么把它改成真的相对符号链接——**别在不知道它存在的情况下再提交它一次**。
