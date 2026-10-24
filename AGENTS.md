@@ -1635,3 +1635,50 @@ CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完�
   「`refs/` 两处都找、**common 优先**」（与 git files backend 的重定向一致），并顺手模拟 CI 那种布局进夹具。
   变异自证：只读 per-worktree 目录 ⇒ 1 红；不读 `commondir` ⇒ 1 红。
 - 端点未接任何前端调用；`/api/dirs`、`/api/files/tree`、`/api/file` 此前**根本没进 API 端点清单**（本次一并补上，见 §0.1 的「此前漏记，现补」标注）。
+
+
+### 8.53 portal 运行镜像装 git（#359 收工灯的硬前置，2026-10-24，同分支接 §8.52）
+
+**为什么 portal 自己也要 git**：`GET /api/git-light` 的「未提交 + 未跟踪」两路要跑一条
+`git status --porcelain -uall`。未推送 / 0 提交那两路是纯文本读 `.git`，不需要 git 二进制；
+**但缺 git 时灯只能恒报 `grey / git_unavailable`**——一颗恒灰的灯比没有灯更糟（绿是承诺、灰是无信息，
+用户会当它坏了而不再看）。§8.52 把这条登记成 P0b 前置，本次直接做掉。
+
+**改动**（Dockerfile 一处 + 新测试一个）：运行阶段加
+`apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*`，
+层序照 `runner/Dockerfile`（重且稳定的 apt 层排在 `npm ci` 之前，改 portal 代码不触发重装）。
+**只装 read 侧**：不装 openssh-client、不配凭据、不碰网络——D9 定了 portal 零 git 写。
+体积代价：apt 计划 109 MB（git 拖 perl/perl-modules/libcurl3-gnutls 等），对 341 MB 的 portal 镜像是
+**+30% 量级**——这是本次唯一的成本，换来的是灯能真判。
+
+**新测试 `portal/test/portal-image-git.test.js`（+4，判据形状照 `runner-image-cache-dir.test.js`：读文本不跑部署）**。
+为什么必须钉：**这个失效在 CI 里看不见**——根单测跑在 CI runner 自己的 git 上，镜像里没 git 也全绿。
+四条 = 运行阶段装了 git / apt 层排在 `npm ci` 之前 / 不许顺手装进前端 builder /
+缺 git 时代码必须落 `grey / git_unavailable`（**另一半锁**：镜像装了 git 管「能不能判」，这条管「判不了怎么表现」）。
+变异 2 条（先自证非空操作）：apt 里把 git 换成 `ca-certificates` ⇒ 1 条具名红；apt 层挪到 `npm ci` 之后 ⇒ 1 条具名红。
+
+**真机 A/B（同一份判定代码 + 同一套四态夹具，只换运行环境；探针脚本用完即删、不入库）**：
+
+| 夹具 | 现网 `station-portal:latest`（无 git） | 有 git 的环境（FDE 镜像，**git 2.39.5** ＝ bookworm 版，也正是 portal 将拿到的版本） |
+|---|---|---|
+| 已提交已推送 | `grey / git_unavailable` | **`green / synced`** |
+| 已提交未推送（有 upstream、从未 fetch） | `grey / git_unavailable` | **`yellow / never_fetched`** |
+| 有改动 + 有未跟踪 | `grey / git_unavailable` | **`red / uncommitted`** |
+| 已提交、无 remote | `grey / git_unavailable` | **`yellow / no_remote`** |
+| 目录不存在 | 404 `not_found` | 同左 |
+
+右列顺带证了**判定模块在 bookworm 的 git 2.39.5 上口径不变**（开发机 2.43.0、CI ubuntu-latest 更新，三处对齐）。
+
+**⚠ 本机没能把带 git 的 portal 镜像 build 完**（不是 Dockerfile 的问题，记下来省后人时间）：
+`apt` 的**大文件传输**在本机反复被掐——第一次 `Packages`(8.8 MB) 卡 8 分钟；第二次过了 update、卡在
+`perl-modules`(2.8 MB)；第三次换 `--network=host` 仍卡在同一处。而**同一时刻容器内小请求 5 秒正常返回**
+（`deb.debian.org` 的 404 页 5.2s）⇒ 症状与「GitHub 边缘半死」同一族：长流量被掐，不是 DNS、也不是 bridge 网络。
+所以这层的**首次真构建发生在合入后的发布构建**（GitHub runner 上；PR 上 image job 是 `skipped`，
+CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一套 apt 写法，那层在 CI 天天构建成功。
+
+**自伤两次、值得写下来**：`pkill -f "portal/Dockerfile"` / `pkill -f "buildx build --load -t fde-portal-gittest"`
+都**匹配到了自己这条 bash**（命令串里含该字符串）⇒ SIGTERM 打死自己，后面所有语句全没跑（`nohup` 起的构建
+也被进程组带走）。口径：**先 `pgrep` 看清再按 PID 杀**，且模式要写成不匹配自身的形式（如 `[p]ortal/Dockerfile`）。
+
+**基线**：接 §8.52 的 **1474 / 1470 / 0 / 4** → **1478 / 1474 / 0 / 4**，`npm test` **rc=0**；
+`runner/`、`portal/frontend/`、`portal/src/` 零字节（本次只动 Dockerfile + 测试 + 文档）。
