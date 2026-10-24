@@ -466,6 +466,138 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(store.es.activeRunId).toBeNull();
   });
 
+  // 试用台账 #10：后端一直 keyset 分页（默认只给最新 20 条），前端必须消费 next_cursor，
+  // 否则长会话「开头从压缩横幅开始」、最早的对话永远看不见（消息并未被压缩删除）。
+  it('台账 #10：openSession 首屏带 limit=100 并记下 next_cursor；loadOlderMessages 带 cursor 取更早批并**前插**；到底后 no-op', async () => {
+    const urls: string[] = [];
+    mockFetch((url) => {
+      urls.push(url);
+      if (url.includes('/api/sessions/s1/events/history')) {
+        return { status: 200, body: { events: [], next_cursor: null } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        if (url.includes('cursor=')) {
+          return {
+            status: 200,
+            body: {
+              session: { id: 's1' },
+              messages: [
+                { id: 'm1', role: 'user', content: '最早提问', seq: 1 },
+                { id: 'm2', role: 'assistant', content: '最早回复', seq: 3 },
+              ],
+              last_seq: 11,
+              next_cursor: null, // 这批已翻到第一条
+            },
+          };
+        }
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1' },
+            messages: [
+              { id: 'm10', role: 'user', content: '新提问', seq: 10 },
+              { id: 'm11', role: 'assistant', content: '新回复', seq: 11 },
+            ],
+            last_seq: 11,
+            next_cursor: 9,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(urls.some((u) => u.includes('/api/sessions/s1?limit=100'))).toBe(true); // 首屏取满后端窗口上限
+    expect(store.olderMessagesCursor).toBe(9); // next_cursor 被消费，入口存在
+    expect(store.entries.map((e) => (e as { kind: string }).kind)).toEqual(['msg', 'msg']);
+
+    expect(await store.loadOlderMessages()).toBe(true);
+    expect(urls.some((u) => /\/api\/sessions\/s1\?limit=100&cursor=9$/.test(u))).toBe(true);
+    // 更早批整段**前插**：按 seq 在已加载内容之前，而不是追加到尾部
+    const texts = store.entries.filter((e) => e.kind === 'msg').map((e) => (e as { text: string }).text);
+    expect(texts).toEqual(['最早提问', '最早回复', '新提问', '新回复']);
+    expect(store.olderMessagesCursor).toBeNull(); // 到底 → 入口消失
+
+    const callsBefore = urls.length;
+    expect(await store.loadOlderMessages()).toBe(false); // 无游标 → no-op，不发请求
+    expect(urls.length).toBe(callsBefore);
+  });
+
+  it('台账 #10：更早批同时带 events/history?before=<事件游标> 回放（judge 分隔行前插到旧正文区）', async () => {
+    const urls: string[] = [];
+    mockFetch((url) => {
+      urls.push(url);
+      if (url.includes('/api/sessions/s1/events/history')) {
+        if (url.includes('before=')) {
+          return {
+            status: 200,
+            body: {
+              events: [{ seq: 2, run_id: 'r0', type: 'judge', payload: { decision: { extend: false, extendReason: '够了' } } }],
+              next_cursor: null,
+            },
+          };
+        }
+        return { status: 200, body: { events: [], next_cursor: 6 } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        if (url.includes('cursor=')) {
+          return {
+            status: 200,
+            body: {
+              session: { id: 's1' },
+              messages: [
+                { id: 'm1', role: 'user', content: '最早提问', seq: 1 },
+                { id: 'm2', role: 'assistant', content: '最早回复', seq: 3 },
+              ],
+              last_seq: 11,
+              next_cursor: null,
+            },
+          };
+        }
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1' },
+            messages: [{ id: 'm10', role: 'user', content: '新提问', seq: 10 }],
+            last_seq: 11,
+            next_cursor: 9,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.olderEventsCursor).toBe(6); // 事件端点的 next_cursor 也被消费
+
+    expect(await store.loadOlderMessages()).toBe(true);
+    expect(urls.some((u) => u.includes('/events/history?limit=2000&before=6'))).toBe(true);
+    // 前插段内部按 seq 穿插：msg(1) → judge sep(2) → msg(3)，都在旧内容之前
+    expect(store.entries.map((e) => e.kind)).toEqual(['msg', 'sep', 'msg', 'msg']);
+    expect(store.entries[2]).toMatchObject({ kind: 'msg', text: '最早回复' });
+  });
+
+  it('台账 #10：更早批加载失败 → 返回 false、游标原地不动（入口保留可重试）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/api/sessions/s1/events/history')) {
+        return { status: 200, body: { events: [], next_cursor: null } };
+      }
+      if (url.includes('/api/sessions/s1')) {
+        if (url.includes('cursor=')) return { status: 500, body: { error: { code: 'internal', message: 'boom' } } };
+        return {
+          status: 200,
+          body: { session: { id: 's1' }, messages: [{ id: 'm10', role: 'user', content: 'q', seq: 10 }], last_seq: 10, next_cursor: 9 },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(await store.loadOlderMessages()).toBe(false);
+    expect(store.olderMessagesCursor).toBe(9); // 失败不推进游标
+    expect(store.olderLoading).toBe(false);
+  });
+
   it('issue #89 红线：历史回放不驱动运行态状态机（run_end 误下发也不触发刷新/停按钮态）', async () => {
     mockFetch((url) => {
       if (url.includes('/api/sessions/s1/events/history')) {
@@ -532,7 +664,7 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
       if (url.endsWith('/messages') && init?.method === 'POST') {
         return { status: 200, body: { message: { id: 'm1', content: '任务' }, run: { id: 'r1' } } };
       }
-      if (url === '/api/sessions/s1') {
+      if (url.split('?')[0] === '/api/sessions/s1') {
         return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
       }
       return { status: 200, body: { items: [] } };
@@ -567,7 +699,7 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
       if (url.endsWith('/messages') && init?.method === 'POST') {
         return { status: 200, body: { message: { id: 'm1', content: '任务' }, run: { id: 'r1' } } };
       }
-      if (url === '/api/sessions/s1') {
+      if (url.split('?')[0] === '/api/sessions/s1') {
         return { status: 200, body: { session: { id: 's1', active_run_id: 'r1' }, messages: [], last_seq: 0 } };
       }
       return { status: 200, body: { items: [] } };
@@ -591,7 +723,7 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     let activeRunId: string | null = 'r1';
     mockFetch((url) => {
       if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
-      if (url === '/api/sessions/s1') {
+      if (url.split('?')[0] === '/api/sessions/s1') {
         return { status: 200, body: { session: { id: 's1', active_run_id: activeRunId }, messages: [], last_seq: 0 } };
       }
       return { status: 200, body: { items: [] } };
@@ -613,7 +745,7 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
   it('issue #217：在线收到当前 run_end 仍渲染原终态行，不显示断线提示', async () => {
     mockFetch((url) => {
       if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
-      if (url === '/api/sessions/s1') {
+      if (url.split('?')[0] === '/api/sessions/s1') {
         return { status: 200, body: { session: { id: 's1', active_run_id: 'r1' }, messages: [], last_seq: 0 } };
       }
       return { status: 200, body: { items: [] } };
@@ -1189,7 +1321,7 @@ describe('issue #261B：一键「重试上一条」（retryAvailable / retryLast
           body: { message: { id: `m${postBodies.length}`, content: body.content }, run: { id: `r${postBodies.length}` } },
         };
       }
-      const sess = url.match(/^\/api\/sessions\/(s\d)$/);
+      const sess = url.match(/^\/api\/sessions\/(s\d)(?:\?.*)?$/);
       if (sess) return { status: 200, body: { session: { id: sess[1], active_run_id: null }, messages: [], last_seq: 0 } };
       return { status: 200, body: { items: [] } };
     });
@@ -1995,7 +2127,7 @@ describe('流式增量气泡响应性（打字机效果回归）', () => {
   beforeEach(() => {
     mockFetch((url) => {
       if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
-      if (url === '/api/sessions/s1') {
+      if (url.split('?')[0] === '/api/sessions/s1') {
         return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
       }
       return { status: 200, body: { items: [] } };

@@ -168,6 +168,8 @@ interface SessionDetail {
   session: Session & { active_run_id?: string | null };
   messages: ChatMessage[];
   last_seq: number;
+  /** 试用台账 #10：keyset 分页游标——后端还有更早消息时为「本批最老一条的 seq」，null/缺失 = 已到底。 */
+  next_cursor?: number | null;
 }
 
 interface WorkbenchHooks {
@@ -226,6 +228,14 @@ function partialTruncated(payload: Record<string, unknown> | undefined): boolean
   return payload?.truncated === true;
 }
 
+/**
+ * 试用台账 #10：分页游标消毒——只认正安全整数，其余（缺失/null/脏值/非整数）一律 null
+ * （= 按「没有更早」处理，宁可少一个入口按钮，不拿脏值去发必然 400 的 cursor 请求）。
+ */
+function positiveIntOrNull(v: unknown): number | null {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : null;
+}
+
 export const useWorkbenchStore = defineStore('workbench', () => {
   // ---- S 状态平移 ----
   const dirs = ref<DirInfo[]>([]);
@@ -235,6 +245,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // issue #197：当前会话的消息总数（getSession DTO 的 session.message_count，后端全量口径）。
   // null=旧后端/非详情入口无此字段 → sessionStats 回退已加载条数（messages 是分页窗口，长会话会少报）。
   const sessionMessageCount = ref<number | null>(null);
+  // 试用台账 #10：更早消息历史分页。消息**从未丢**——后端 getSession 早就是 keyset 分页
+  // （默认只给最新 20 条），病根是前端从不消费 next_cursor ⇒ 长会话开头永远看不见，
+  // 用户误读成「压缩把消息吃了」。olderMessagesCursor = 后端 next_cursor（已加载窗口最老
+  // 一条的 seq），null = 已到底/未加载；olderEventsCursor = events/history 的 next_cursor
+  // （更早展示类事件的 before 游标），null = 到底或首拉失败（首拉失败则更早批次只回放消息，
+  // 工具卡片由 DTO 投影兜底）；olderPrependSeq = prepend 完成后自增，视图 watch 它锚定
+  // 滚动位置防跳动（batch 整段前插会把原内容往下顶）。
+  const olderMessagesCursor = ref<number | null>(null);
+  const olderEventsCursor = ref<number | null>(null);
+  const olderLoading = ref(false);
+  const olderPrependSeq = ref(0);
+  // 窗口尺寸取后端各端点上限（getSession ≤100、events/history ≤2000），减少翻页往返。
+  const MESSAGES_PAGE_LIMIT = 100;
+  const OLD_EVENTS_PAGE_LIMIT = 2000;
   const noDir = ref(false);
   const projectReqSeq = ref(0); // 迟到响应丢弃（快速 A→B 切换）
   const sessionReqSeq = ref(0);
@@ -497,6 +521,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     });
   }
 
+  /**
+   * 试用台账 #10：把一批「消息 + 展示类事件」按 seq 归并后逐项回放——openSession 首屏与
+   * loadOlderMessages 更早批次**共用同一条回放链路**（不另写第二份，语义逐字一致）。
+   * issue #300：**在调 replayEvent 之前**分流。partial_output 只存在于历史响应里（不落库、
+   * 不进 SSE），既不进 EVENT_TYPES 也不进 HISTORY_REPLAY_TYPES ⇒ 自己推 entry；
+   * **不喂 replayEvent**（它拿不到这个 type，自然不产工具卡片/分隔行，也不会「实时一条 + 历史一条」）。
+   */
+  function replayMergedBatch(merged: Array<{ seq: number; msg?: ChatMessage; ev?: RunHistoryEvent }>) {
+    for (const item of merged) {
+      if (item.msg) addMessage(item.msg);
+      else if (item.ev && item.ev.type === 'partial_output') addPartialOutput(item.ev);
+      // issue #236：终态分隔条的响应期合成项（同一种存在方式：不落库、不进 SSE、不进两个集合）。
+      else if (item.ev && item.ev.type === RUN_TERMINATION_TYPE) addRunTermination(item.ev);
+      else if (item.ev) es.replayEvent(item.ev);
+    }
+  }
+
   // ---- issue #189：折叠段原文懒加载（GET /api/sessions/:id/folded/:round，只读）----
   // 按 (sessionId, round) 缓存；404（folded_payload_not_found）视为「无原文」（missing 态，友好提示不抛红）；
   // 其他错误可重试。loading/loaded/missing/error 四态暴露给 StreamPanel。
@@ -730,14 +771,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     renderedIds.value = new Set();
     entries.value = [];
     sessionMessageCount.value = null; // #197：先清旧会话的计数，加载失败/竞态丢弃时不得串会话残留
+    olderMessagesCursor.value = null; // 试用台账 #10：旧会话的游标不得泄漏到新会话（加载成功后重赋）
+    olderEventsCursor.value = null;
     let data: SessionDetail;
-    let history: { events: RunHistoryEvent[] } | null = null;
+    let history: { events: RunHistoryEvent[]; next_cursor?: number | null } | null = null;
     try {
       // issue #89：详情与展示类事件历史**并行**拉取（转录即真相对齐）；历史端点失败降级为
       // 纯文本视图（旧行为），不影响详情加载。
       const [d, h] = await Promise.all([
-        api<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`),
-        api<{ events: RunHistoryEvent[] }>(`/api/sessions/${encodeURIComponent(id)}/events/history`).catch(() => null),
+        // 试用台账 #10：首屏显式取满后端窗口上限（默认只给 20 条，长会话开头「看起来消失」）。
+        api<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}?limit=${MESSAGES_PAGE_LIMIT}`),
+        api<{ events: RunHistoryEvent[]; next_cursor?: number | null }>(`/api/sessions/${encodeURIComponent(id)}/events/history`).catch(() => null),
       ]);
       data = d;
       history = h;
@@ -768,16 +812,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       ...(history?.events ?? []).map((ev) => ({ seq: ev.seq, ev })),
     ];
     merged.sort((a, b) => a.seq - b.seq);
-    for (const item of merged) {
-      if (item.msg) addMessage(item.msg);
-      // issue #300：**在调 replayEvent 之前**分流。partial_output 只存在于历史响应里（不落库、
-      // 不进 SSE），既不进 EVENT_TYPES 也不进 HISTORY_REPLAY_TYPES ⇒ 自己推 entry；
-      // **不喂 replayEvent**（它拿不到这个 type，自然不产工具卡片/分隔行，也不会「实时一条 + 历史一条」）。
-      else if (item.ev && item.ev.type === 'partial_output') addPartialOutput(item.ev);
-      // issue #236：终态分隔条的响应期合成项（同一种存在方式：不落库、不进 SSE、不进两个集合）。
-      else if (item.ev && item.ev.type === RUN_TERMINATION_TYPE) addRunTermination(item.ev);
-      else if (item.ev) es.replayEvent(item.ev);
-    }
+    replayMergedBatch(merged);
+    // 试用台账 #10：记住更早批次的游标（后端 next_cursor；null = 已翻到第一条消息）。
+    olderMessagesCursor.value = positiveIntOrNull(data.next_cursor);
+    olderEventsCursor.value = positiveIntOrNull(history?.next_cursor);
     const serverRunId = data.session.active_run_id;
     if (serverRunId === null || (typeof serverRunId === 'string' && serverRunId !== '')) {
       applyServerRunState(serverRunId, previouslyActiveRunId);
@@ -785,6 +823,55 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       es.activeRunId.value = previouslyActiveRunId;
     }
     es.connect(id);
+  }
+
+  /**
+   * 试用台账 #10（根目录 ISSUES.md）：加载更早一批消息。
+   * 后端 keyset 分页早已完备（getSession `?cursor&limit`、events/history `?before&limit`，
+   * 都返 next_cursor），但此前前端只取最新一窗且从不消费 next_cursor ⇒ 长会话「开头从
+   * 压缩横幅开始」，最早的对话永远看不见（DB 里都在，不是压缩删的，纯读面缺陷）。
+   * 更早批次走与 openSession **同一条回放链路**（按 seq 归并；renderedIds/callId/卡片键
+   * 幂等），再把本批新产出的连续 entry 块**整段移到 entries 头部**：整批都比已加载的旧、
+   * 批内顺序已按 seq 排好，整块搬移安全；await 期间实时路推入的 entry 留在原位（它们本来
+   * 就更新，相对序不变）。滚动锚定归视图（WorkbenchView watch olderPrependSeq 补 scrollTop）。
+   */
+  async function loadOlderMessages(): Promise<boolean> {
+    const sid = sessionId.value;
+    const cursor = olderMessagesCursor.value;
+    if (!sid || cursor == null || olderLoading.value) return false;
+    olderLoading.value = true;
+    try {
+      const eventsBefore = olderEventsCursor.value;
+      const [data, olderEvents] = await Promise.all([
+        api<SessionDetail>(`/api/sessions/${encodeURIComponent(sid)}?limit=${MESSAGES_PAGE_LIMIT}&cursor=${cursor}`),
+        // eventsBefore=null：首拉失败或事件已到底 ⇒ 更早批次只回放消息（工具卡片由 DTO 投影兜底）。
+        eventsBefore == null
+          ? Promise.resolve(null)
+          : api<{ events: RunHistoryEvent[]; next_cursor?: number | null }>(
+            `/api/sessions/${encodeURIComponent(sid)}/events/history?limit=${OLD_EVENTS_PAGE_LIMIT}&before=${eventsBefore}`,
+          ).catch(() => null),
+      ]);
+      if (sessionId.value !== sid) return false; // 往返期间已切会话：entries 已由 openSession 重建，本批丢弃
+      olderMessagesCursor.value = positiveIntOrNull(data.next_cursor);
+      if (olderEvents !== null) olderEventsCursor.value = positiveIntOrNull(olderEvents.next_cursor);
+      const merged: Array<{ seq: number; msg?: ChatMessage; ev?: RunHistoryEvent }> = [
+        ...data.messages.map((m) => ({ seq: m.seq ?? 0, msg: m })),
+        ...(olderEvents?.events ?? []).map((ev) => ({ seq: ev.seq, ev })),
+      ];
+      merged.sort((a, b) => a.seq - b.seq);
+      const anchor = entries.value.length;
+      replayMergedBatch(merged);
+      if (entries.value.length > anchor) {
+        // 只搬「本批回放新产出」的那一段（anchor→尾）到头部；实时路/旧批次位置相对不动。
+        entries.value.unshift(...entries.value.splice(anchor));
+        olderPrependSeq.value += 1; // 通知视图锚定滚动位置
+      }
+      return true;
+    } catch {
+      return false; // 加载失败：游标原地不动，入口按钮保留可重试
+    } finally {
+      olderLoading.value = false;
+    }
   }
 
   /** 旧 newSess.onclick：建会话 → 列表置顶 → 打开（路由 push 由视图做）。 */
@@ -952,6 +1039,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     saveDraft();
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：无选中会话 → 不得复用旧会话的计数
+    olderMessagesCursor.value = null; // 试用台账 #10：分页游标同属会话级状态，一并清
+    olderEventsCursor.value = null;
     es.resetStreamState();
     momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
@@ -1103,6 +1192,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // state
     dirs, dirCwd, sessions, sessionId, noDir,
     entries, renderedIds, inputValue, creatingSession,
+    olderMessagesCursor, olderEventsCursor, olderLoading, olderPrependSeq,
     drafts, es,
     // computed
     currentDir, running, sendDisabled, inputPlaceholder, newSessDisabled,
@@ -1112,6 +1202,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, addPartialOutput, addRunTermination, send, stop, refreshSession,
+    loadOlderMessages,
     pushStreamError,
     // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。
     // issue #236：同一个入口现在也喂终态分隔条（`run_termination`），故改名 `repullHistorySynthItems`。

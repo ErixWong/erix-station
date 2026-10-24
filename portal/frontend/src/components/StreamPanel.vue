@@ -201,6 +201,18 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
 </script>
 
 <template>
+  <!-- 试用台账 #10：「加载更早消息」入口。后端 keyset 分页一直在 work（默认只给最新一窗），
+       此前前端从不消费 next_cursor ⇒ 长会话滚到顶就从压缩横幅开始，最早的对话「看起来消失」
+       （其实都在库里，不是压缩删的）。游标 null（已到底/旧后端）则不渲染；失败不推进游标，可重试。 -->
+  <p v-if="store.olderMessagesCursor != null" class="load-older mb-2 text-center">
+    <button
+      type="button"
+      class="rounded-md border border-black/20 px-2.5 py-1 text-xs text-black/60 hover:bg-black/5 disabled:opacity-50"
+      :disabled="store.olderLoading"
+      data-test="load-older"
+      @click="store.loadOlderMessages()"
+    >{{ store.olderLoading ? t('stream.loadOlderLoading') : t('stream.loadOlder') }}</button>
+  </p>
   <!-- issue #189（追加）：当前会话头部状态行「N 条消息 · 已压缩 M 次」（M=0 降级只显示条数；无选中会话不渲染）
        + 仅 M≥1 时一句克制提示（无弹窗/动画） -->
   <p v-if="store.sessionStats && store.sessionStats.messages > 0" class="session-stats mb-2 text-xs text-black/40">
