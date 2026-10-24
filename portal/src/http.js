@@ -20,6 +20,7 @@ import * as llm from './llm.js';
 import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
 import * as admin from './admin.js';
 import * as dirs from './dirs.js';
+import { getGitLight } from './gitlight.js';
 import * as gitCredential from './git-credential.js';
 import * as gitHosts from './git-hosts.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
@@ -847,6 +848,10 @@ async function routeApi(req, res, ctx, url) {
   }
   if (pathname === '/api/file' && req.method === 'GET') {
     return handleFilePreview(req, res, ctx, url);
+  }
+  // issue #359 P0a：目录 git「收工灯」（决策见 AGENTS.md §7 D9）——同一作用域、同一条直读通道。
+  if (pathname === '/api/git-light' && req.method === 'GET') {
+    return handleGitLight(req, res, ctx, url);
   }
 
   // ---- 项目与端口（portal.md §3；P5：写路径退役，projects 表留档只读） ----
@@ -2681,6 +2686,24 @@ async function handleFilePreview(req, res, ctx, url) {
     fdeName: session.user.fde_name,
     cwd: url.searchParams.get('cwd'),
     relPath: url.searchParams.get('path') ?? '',
+  });
+  return sendJson(res, 200, result);
+}
+
+/**
+ * issue #359 P0a：`GET /api/git-light?cwd=~/projects/<name>` → 一颗「收工灯」的完整判定。
+ * 只读零写；作用域 = 当前会话用户的工位（不会扫全平台）；实现与口径见 `portal/src/gitlight.js`。
+ * 错误沿用 `dirs.DirError` 同一条映射（cwd 非法 ⇒ 400，目录不存在 ⇒ 404）。
+ */
+async function handleGitLight(req, res, ctx, url) {
+  const session = await requireSession(req, ctx);
+  if (!session.user.fde_name) {
+    throw new dirs.DirError('fde_name_required', '当前用户未分配工位', { httpStatus: 400 });
+  }
+  const result = await getGitLight({
+    userSpaceRoot: ctx.config.userSpaceRoot,
+    fdeName: session.user.fde_name,
+    cwd: url.searchParams.get('cwd'),
   });
   return sendJson(res, 200, result);
 }

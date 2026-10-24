@@ -1592,3 +1592,40 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 （本次切分支就撞上了，看着像自己的改动把测试弄挂）。本机用 `npm ci` 恢复（它先 `Removing non-directory node_modules` 再装 16 个包，0.7s）。
 CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完全误导人。
 ⇒ 本单**没动这个路径**（工作区里那份删除是 `npm ci` 的副作用，未入提交）；后续要么 `git rm --cached node_modules` + 进 `.gitignore`，要么把它改成真的相对符号链接——**别在不知道它存在的情况下再提交它一次**。
+
+### 8.52 收工灯的判定端点（issue #359 P0a，2026-10-24，分支 `feat-261024-05-git-light-agents-md`，接 §8.51）
+
+**交付**：`portal/src/gitlight.js`（新增）+ `GET /api/git-light?cwd=`（`http.js`，挂在 `/api/file` 之后）
++ `docs/api/portal.md` §0.1 补 4 行 + **28 条单测**（`portal/test/gitlight.test.js`）。**界面上还没有灯**（P0b 未做），
+现在只能 curl 这个端点看判定结果。
+
+**三条判据落到实现（口径与实测记录都在 #359）**：
+- 未提交 + 未跟踪 = **一条** `git status --porcelain -uall`（不用 `-uno`，它会撒谎）；stdout 流式读，**数到 50 条即 kill**。
+- 未推送 = 纯文本：`HEAD` → 分支 → **`refs/remotes/<remote>/<br>`** 与 HEAD sha 比对（松散 ref 与 `packed-refs` 都读）。
+- 0 提交 = 纯文本（HEAD 指向的 ref 解析不出来）；⚪ 灰（含 `index.lock` 正忙 / `.git` 读不动 / 判不完）**一律不显绿**。
+
+**⚠ 两条实测纠正（都进了单测，别再走一遍）**：
+1. **`--no-optional-locks` 是 git 级选项**，必须排在 `status` **之前**。写成 `git status --porcelain --no-optional-locks`
+   ⇒ `error: unknown option` 直接退出 ⇒ **所有仓库默默变灰**，不报错、不显眼（#359 正文原先就把它写在子命令后面，已同步改正）。
+2. **`branch.<n>.merge = refs/heads/main` 指的是远端那条分支**，要拿 `refs/remotes/<remote>/main` 比。
+   拿 `cfg.merge` 直接比 = **HEAD 跟自己比** ⇒ 未推送永远判绿。
+   另外 worktree 的 `refs/`/`packed-refs`/`config` 在 **`commondir`** 指向的目录（per-worktree 目录只有 HEAD/index）——
+   `runner/lib/listeners.js:112-126` 只解到 `gitdir` 这一层，**照抄它会把 worktree 判成「从未同步」**。
+
+**`partial` 的语义 = 「这不是完整结论」总开关**（扫描预算耗尽 ∪ 仓库数封顶 ∪ 任一仓库没判完），具体差在哪由 `reason` 说；
+前端拿它当「不得显绿 + 必须给 ↻」的依据。空壳根仓库（0 提交 + 无已跟踪改动 + 看得见的东西**全是别的仓库**）标 `shell: true`，
+**不参与拉高灯色**（它恒为红会把一切染红），只在展开态出那一行解释。成本上界：20 仓库 / 发现 300ms 或 1500 目录 /
+单条 status 2s / 流式 50 条 / **单请求总预算 6s**（仓库多时逐个 2s 会把请求拖到几十秒）。
+
+**基线**：接 §8.51 的 **1446 / 1442 / 0 / 4** → **1474 / 1470 / 0 / 4**（**净 +28**），`npm test` **rc=0**；`runner/`、`portal/frontend/` 零字节。
+
+**主 agent 亲跑变异 5 条（每条先自证 `git diff` 非空操作）**：① `-uall` 退化成 `-uno` ⇒ **4 条红**；
+② 撤掉 `--no-optional-locks` ⇒ **第一次是假绿**——哨兵只判了「排在 `status` 之前」，参数整个删掉时 `indexOf` 返回 `-1`
+反而更小 ⇒ 判定通过（§8.50 那条「先量变异是否非空操作」的纪律又抓到东西）；补上「参数必须存在 + 顺序」双断言后 ⇒ 1 条红；
+③ 不读 `commondir` ⇒ 1 条红；④ 不读 `packed-refs` ⇒ 1 条红；⑤ upstream 退回与本地分支自比 ⇒ 2 条红。
+
+**未做 / 待决（重要）**：
+- **portal 镜像还没装 git**（`portal/Dockerfile` 无 apt-get）⇒ 现网这个端点对所有仓库都会返回 `grey / git_unavailable`，
+  只有纯文本那半（未推送、0 提交）不受伤。**P0b 上线前必须先给 portal 装 git**，否则灯永远是灰，比没有灯更糟。
+- 后端 TTL 缓存与全局并发闸（#359 §7）未加：现在只有一个消费方（还没有），加了要先把 `partial`/`checked_at` 口径带进缓存。
+- 端点未接任何前端调用；`/api/dirs`、`/api/files/tree`、`/api/file` 此前**根本没进 API 端点清单**（本次一并补上，见 §0.1 的「此前漏记，现补」标注）。
