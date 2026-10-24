@@ -408,17 +408,8 @@ export const zhCN = {
       active: '已放行过',
     },
     stateShortUnknown: '未知状态',
-    // issue #308 §3.4：端口是工位级资源；但工作台视图已按当前目录过滤（观测 MVP）——文案说真实行为。
-    scopeHint: '预览端口跟着工位走；列表按当前目录的在用进程过滤，其余在折叠区。',
-    // 观测层 MVP（迁移 0022）：agentd /proc 采样随心跳上报的「此刻真有没有进程在听」注解。
-    // ⚠ 无观测的行不渲染任何文案（null ≠ 空闲：旧 agentd / 未跑迁移的部署也是 null），所以这里没有反向键。
-    observedHere: '本目录在用',
-    observedTitle: '容器内监听此端口的进程',
-    observedUptime: '起了 {ago}',
-    duplicateWarn: '⚠ {cwd} 同时在 {ports} 上有进程监听——可能是同一项目的新旧实例并存，先分清哪个地址是你要的（旧会话残留的进程不会自己退出）。',
-    noneHere: '当前目录没有正在监听的端口（地址仍然可用，展开下方列表可手动打开）。',
-    othersExpand: '本工位其余端口（{count}）',
-    othersCollapse: '收起其余端口',
+    // issue #308 §3.4：侧栏三段都是 cwd 作用域，而端口跟着工位走 ⇒ 区块内一行说清作用域
+    scopeHint: '本工位的预览端口，与所选目录无关。',
     stateHint: '「已放行过」只表示该端口首次凭证放行过，不代表容器里有应用在监听。',
     emptySelf: '你还没有预览端口（平台尚未为账号分段，或已全部释放）。',
     emptyFde: '该 FDE 没有活着的预览端口（可能尚未开户或已下线）。',
