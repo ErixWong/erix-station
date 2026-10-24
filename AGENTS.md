@@ -1508,7 +1508,9 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **改块提示三态在真机上成立**（这是本单的最终目的）：输入 `22000` ⇒ 「被占用（占用者：eric；10 个活行）——改块会被服务端拒绝（409），请换一段」；`22100` ⇒ 「整段空闲（在最近一次总览的空闲列表里）」；`29990` ⇒ 「**不知道**这一段空不空：它不在最近一次总览的空闲列表里（那份列表是截断的），以服务端校验为准」。开面板 ⇒ 占用请求增量 **0**（隐式请求为零，真机版）；`/ports/block` POST 数 **0**、输入框值原样保留（不自动改值/不自动提交）。
 - **发布物复验**：浏览器实际加载 `index-xHmHZy-g.js`，**与本地构建同名**（内容逐字节一致旁证，同 §8.43 那次先例），汇总与占用段渲染同上、四类脏值全 0。
 
-### 8.50 目录下拉第一项是 `.pnpm-store`：展示层过滤 + 镜像钉死依赖缓存落位（2026-10-24，决策者口述、无 issue，PR 直修）
+### 8.51 目录下拉第一项是 `.pnpm-store`：展示层过滤 + 镜像钉死依赖缓存落位（2026-10-24，决策者口述、无 issue，**PR #360**，merge `444d2ca`）
+
+> **编号为什么是 8.51 不是 8.50**：我在 `0ea54dc` 上开工，当时 `AGENTS.md` 末节是 §8.49；合并时 main 已被 **#350 占了 §8.50**（v0.1.30）。两条不是同一件事，本条顺延 —— 台账里出现两个同号小节比改号更坏（后续所有 `§8.50` 引用会歧义）。
 
 **现象**：决策者开 FDE 界面点开目录下拉，第一项是 `.pnpm-store`，真实项目被挤到后面。
 
@@ -1526,11 +1528,11 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 
 **告知面**：`~/AGENTS.md` 那条「`node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）」改成「**已由镜像默认指到 `~/cache`**——不要把 store/cache 改到 `~/projects` 下，也不要在项目里建 `.pnpm-store`」。不改这句，agent 要么以为要自己配，要么反向把它挪回去。
 
-**基线**：根 **1430 / 1426 / 0 / 4**（基点 §8.49 记的 **1426 / 1422 / 0 / 4**，净 **+4** = `dirs.test.js` +1、新 `portal/test/runner-image-cache-dir.test.js` +3）、runner **323/323** 不变、**前端零字节**。改动面：`portal/src/dirs.js`、`portal/src/materializer.js`、`runner/Dockerfile`、`docs/design/user-space.md` §4.2、`ISSUES.md` 条目→issue 对照表一行（无 issue，写明当日直修）、两个测试文件。
+**基线**：根 **1430 / 1426 / 0 / 4**（基点 §8.49 / §8.50 都记的 **1426 / 1422 / 0 / 4**，净 **+4** = `dirs.test.js` +1、新 `portal/test/runner-image-cache-dir.test.js` +3）、runner **323/323** 不变、**前端零字节**。改动面：`portal/src/dirs.js`、`portal/src/materializer.js`、`runner/Dockerfile`、`docs/design/user-space.md` §4.2、`ISSUES.md` 条目→issue 对照表一行（无 issue，写明当日直修）、两个测试文件。
 
 **主 agent 亲跑变异 3 条（每条先自证 `git diff` 非空操作）**：① 撤掉 `isListedDirName` 的非隐藏判定 ⇒ `dirs.test.js` **恰 1 条红**（新用例）；② 删掉告知句里的「别挪进 `~/projects`」⇒ **恰 1 条红**；③ 把 globalconfig 层挪到 `npm install` 之前 ⇒ **恰 1 条红在层序那条**，且附顺序自检（`npmrc@5148 < install@5479`）。⚠ **③ 的第一次尝试是假变异**：脚本按 `t.index('WORKDIR /opt/erix')` 取切点，而该锚点在文件里出现得**更早**（`j < i`）⇒ 切出一段重复文本、相对顺序根本没变 ⇒ 3 条全绿差点被当成判据。按 §8.24 先量「变异后两个锚点的实际偏移」重做才拿到红（这条纪律又一次自己抓到东西）。
 
-**未做 / 待决**：
+**未做 / 待决**（**PR #360 已 merge 进 main**，merge `444d2ca`；main CI 两个 job 全绿 = 质量门禁 + **三镜像构建校验**，后者顺带证明新加的 globalconfig 层能构建）：
 - **镜像未重建**：现网 `FDE_IMAGE=ghcr.nju.edu.cn/erixwong/erix-station-fde@sha256:de16b78b513c…`（portal env + `IMAGE_ALLOWLIST` 全串精确匹配）。生效需要 build → 新 image ID → 同步这两处 env → recreate `fde-eric` / `fde-jim`（**会打断正在跑的 run**）。在此之前线上靠上面那份热补撑着。
 - **未发版**（不进 v0.1.31 的任何承诺，等决策者定窗口）。
 - 展示层过滤**没**同步到目录树（`fileTree`）：树面板里点开头目录仍可见可展开，是刻意的——树是浏览器的用法，人可能就是要看 `.git` / `.github`；下拉才是被污染的那一面。
