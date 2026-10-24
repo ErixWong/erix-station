@@ -366,6 +366,7 @@ function messageCountSuffix(s: Session): string {
           <PreviewPortsPanel
             variant="list"
             :items="ports.items.value"
+            :current-cwd="store.dirCwd"
             :loading="ports.loading.value"
             :loaded="ports.loaded.value"
             :error="ports.listError.value"
