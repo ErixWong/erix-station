@@ -453,7 +453,10 @@ onScopeDispose(() => clearTimeout(copiedTimer));
           >
             <div class="flex min-w-0 items-center gap-1.5">
               <span data-test="preview-port-value" class="shrink-0 text-[11px] font-medium leading-[1.4]">{{ item.port }}</span>
+              <!-- 池外合成行（url=null）在折叠区同样不画状态/打开按钮：没地址可开，点了只会拿
+                   `observed:<port>` 去签一张必 404 的票。主区行已同口径处理，这里曾漏改（用户实证）。 -->
               <span
+                v-if="item.url"
                 data-test="preview-port-state"
                 class="min-w-0 shrink truncate rounded-full border px-1.5 py-[1px] text-[10px] leading-[1.4]"
                 :class="item.state === 'active'
@@ -463,6 +466,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
                 :aria-label="stateLabel(item.state)"
               >{{ stateShortLabel(item.state) }}</span>
               <button
+                v-if="item.url"
                 type="button"
                 data-test="preview-port-open"
                 class="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/60 hover:bg-black/10 disabled:opacity-50"
