@@ -23,6 +23,8 @@
 //   loadRunState         → GET /transcript/:key/runstate              （session；无 → undefined）
 //   loadRunStateStatus   → GET /transcript/:key/runstate/status       （session；返回 status?.status）
 //   （旧 run 作用域 U5–U9/runstate 端点保留不动，供旧 runner/旧 agentd 兼容——本 adapter 自 P2 起只走 session 端点。）
+import { foldLedgerRecords } from './transcript-fold.js';
+
 const RETRY_DELAYS = [1000, 2000, 5000];
 
 function sleep(ms) {
@@ -59,7 +61,18 @@ export function makeStore(key, { request, runId }) {
     },
     async load(r) {
       const res = await requestWithRetry('load', { runId: r });
-      return Array.isArray(res?.records) ? res.records : [];
+      const records = Array.isArray(res?.records) ? res.records : [];
+      // issue #351：上游 0.23.0 的读侧折叠属于 **store 的职责**，不是引擎的职责。
+      // `host-consumer-contract.md:2405-2409`：`foldMessageRows` 由 file/memory 两个内置 store 的
+      // `load()` 调用，折回轮行才是「host-visible shape of load()」；`:2442`：宿主读账本必须经
+      // `load()`。引擎 resume 只调 `foldLedgerMessages`（只把 `partOf` 分片接回原消息），**不做载体
+      // 折叠**；`resume-manager.js:239-241` 的 `seq` 播种注释也写明它面向的是「折叠过的输出」。
+      // 本站过去直通 portal 原始行 ⇒ 引擎拿到的序列里 `tool_use` 与它的 `tool_result` 之间可以夹一条
+      // `:input:` 文本（真标本 index 56），链式 `partOf` 也能把聚合结果劈成两条（index 81）
+      // ⇒ 会话永久 `invalid_messages`。
+      // 折在全量拉齐之后（agentd `case 'load'` 已把游标翻页聚合成一个数组）；无消息行的账本（≤ 0.22）
+      // 由 `foldLedgerRecords` 原样返回**入参本身**，一个字节不改。
+      return foldLedgerRecords(records);
     },
     async recall(r, fromRound, toRound, pattern) {
       const res = await requestWithRetry('recall', { runId: r, fromRound, toRound, pattern });
