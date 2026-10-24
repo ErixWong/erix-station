@@ -575,7 +575,7 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 | store 方法 | IPC `method` | internal 端点 | 落库 | 幂等语义 |
 |---|---|---|---|---|
 | `appendRound(runId, record)` | `appendRound` | U5 `PUT .../transcript/rounds/:round` | `transcript_rounds` | `UNIQUE(run_id, round)`；body 带 `dedupKey`，portal 命中冲突 → `200 {inserted:false}`（对齐上游 dedupKey 语义：`src/store/file.js:51-56`/`167`） |
-| `load(runId)` | `load` | U6 `GET .../transcript` | 读 `transcript_rounds` 按 round 升序 | 只读 |
+| `load(runId)` | `load` | U6 `GET .../transcript` | 读 `transcript_rounds` 按 `(round, append_seq)` 升序（#338 的真 keyset 游标 + agentd 翻页拉齐全量） | 只读；**返回前必须做读侧折叠**（`runner/lib/transcript-fold.js`，#351：上游 0.23 把消息行折回轮行是 **store 的 `load()` 职责**，引擎只 `foldLedgerMessages` 不做载体折叠） |
 | `recall(runId, from?, to?, pattern?)` | `recall` | U7 `GET .../transcript/recall` | 读 `transcript_rounds`（含 `folded_payload`，对齐上游「折叠原文同属档案」`src/store/file.js:252-261`） | 只读 |
 | `markRunState(runId, state)` | `markRunState` | `running` → U2 `PUT .../state`；其他状态 → `PUT .../runstate {state}` | 终态仍走既有写路径，portal 写入独立 `runs.run_state_status` / `chat_sessions.engine_run_state_status`；只读另走 `GET .../runstate/status` | 覆盖写；不合并进 run-state JSONB |
 | `saveRunSnapshot(runId, snapshot)` | `saveRunSnapshot` | U8 `PUT .../checkpoint` | `run_checkpoints` | **单行 latest-only 覆盖写 + revision CAS**；旧 revision 被拒（§9.5）；`seq` 仅调用方本地元数据、不落库 |
@@ -584,6 +584,7 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 | `loadRunState(runId)` | `loadRunState` | `GET .../runstate` | 读快照 JSONB；无 → `204` → adapter 返回 `undefined` | 只读；legacy 快照内的 `state` 保留可读 |
 | `loadRunStateStatus(runId)` | `loadRunStateStatus` | `GET .../runstate/status` | 读 `run_state_status` / `engine_run_state_status`；缺失时回退 legacy 快照 `state`，损坏记录抛错 | 只读；portal 响应含 `status.status`，adapter 返回状态字符串 |
 
+> **`load()` 的折叠语义（issue #351）**：上游 0.23.0「一条消息一落盘」之后，**读侧折叠属于 store**（`host-consumer-contract.md:2405-2409`：`foldMessageRows` 由 file/memory 两个内置 store 的 `load()` 调用；:2442：宿主读账本必须经 `load()`）。引擎 `resume-manager` 只调 `foldLedgerMessages`（把 `partOf` 分片接回原消息），**不做载体折叠**，且它的 `seq` 播种（`resume-manager.js:239-241`）面向的就是「折叠过的输出」。本站 adapter 过去直通原始行⇒ `:input:` 行可以插在 `tool_use` 与它迟到的 `tool_result` 之间（真标本 `index 56`）、链式 `partOf` 把聚合结果劈成两条（`index 81`）⇒ 会话**永久** `invalid_messages`。⇒ 折叠接在 `runner/lib/store.js#load`，**且必须接在全量拉齐之后**（agentd 已聚合游标翻页）：接在 portal 分页端点的页内会在「一轮跨两页」时漏折（#338 同根）。口径与展示面那份同源，两边 `SHARED-FOLD-CORE` 区间由 `runner/test/store-load-fold.test.js` 逐字节钉住。
 > **run-state 双通道**：`saveRunState` 只存快照数据；`markRunState` 写独立状态记录，不触碰宿主 `runs.status`（唯一权威仍由 U2 终态收敛，不变式 3）。旧 `state` 不回填，status reader 缺新记录时兼容读取。
 > **recall（0.8.0 退役）**：引擎不再调用 `store.recall`，worker 也不再注册 recall 工具（档案取回归 note 工作流：note_list → note_read）；U7 端点与 adapter 方法保留（既有断言面与只读兼容，非孤儿）。
 > **notes 落盘位置（issue #46，0.10.0 起）**：NotesStore 不再落 run 工作区（D8 修订前为 run worktree），迁 **run 数据目录** `<home>/runs/<runId>/notes/`（logical-run 作用域，跨 attempt 保留——resume 不丢 notes；agentd RUN_START 下行 `notes_dir`，终态后由 agentd 清理，attempt 间绝不删）。详见 AGENTS.md §8.2。
