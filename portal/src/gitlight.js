@@ -76,17 +76,27 @@ function resolveGitDirs(repoAbs) {
   return { gitDir: dir, commonDir };
 }
 
-/** 纯文本取 ref → sha：松散 ref 文件优先，回退 `packed-refs`（**只看 `refs/` 目录必误判**）。 */
-function readRefSha(commonDir, ref, depth = 0) {
+/**
+ * 纯文本取 ref → sha：松散 ref 文件优先，回退 `packed-refs`（**只看 `refs/` 目录必误判**）。
+ * `roots` = `[commonDir, gitDir]`（顺序有意义）：linked worktree 的分支 ref 住在 **common dir**
+ * （git 的 files backend 会把 `refs/` 重定向到 common dir），但新版 git 也会在 per-worktree 目录里
+ * 建一个 `refs/` 空壳——本机与 CI 实测形态不同（CI ubuntu-latest 有、本机 git 2.43.0 没有）。
+ * 所以两处都找，且 **common 优先**：万一 per-worktree 目录里出现过同名陈旧文件，也不会读错。
+ * 普通仓库两者是同一个目录，顺序无意义。
+ */
+function readRefSha(roots, ref, depth = 0) {
   if (!ref || !ref.startsWith('refs/') || depth > 3) return null;
-  const loose = readOrNull(path.join(commonDir, ...ref.split('/')));
-  if (loose !== null) {
-    const v = loose.trim();
-    if (SHA_RE.test(v)) return v;
-    const sym = /^ref:\s*(refs\/.+)$/m.exec(v); // symbolic ref（如 HEAD → refs/heads/main）
-    return sym ? readRefSha(commonDir, sym[1].trim(), depth + 1) : null;
+  const list = Array.isArray(roots) ? roots : [roots];
+  for (const root of list) {
+    const loose = readOrNull(path.join(root, ...ref.split('/')));
+    if (loose !== null) {
+      const v = loose.trim();
+      if (SHA_RE.test(v)) return v;
+      const sym = /^ref:\s*(refs\/.+)$/m.exec(v); // symbolic ref（如 HEAD → refs/heads/main）
+      return sym ? readRefSha(roots, sym[1].trim(), depth + 1) : null;
+    }
   }
-  const packed = readOrNull(path.join(commonDir, 'packed-refs'));
+  const packed = readOrNull(path.join(list[0], 'packed-refs'));
   if (packed === null) return null;
   for (const line of packed.split('\n')) {
     const t = line.trim();
@@ -216,7 +226,7 @@ async function inspectRepo({ rel, abs, remainingMs, gitBin, now }) {
   let headSha = null;
   if (refM) {
     repo.branch = refM[1].replace(/^refs\/heads\//, '');
-    headSha = readRefSha(dirs.commonDir, refM[1]);
+    headSha = readRefSha([dirs.commonDir, dirs.gitDir], refM[1]);
     if (headSha === null) repo.no_commits = true;
   } else if (SHA_RE.test(head)) {
     repo.detached = true;
@@ -270,7 +280,7 @@ async function inspectRepo({ rel, abs, remainingMs, gitBin, now }) {
   const upRef = headBranch ? `refs/remotes/${cfg.remote}/${headBranch[1]}` : cfg.merge;
   // 只比一个东西：本地 HEAD vs 远端跟踪 ref。**不能再回退到 cfg.merge**——它通常是 `refs/heads/main`
   // （本地分支）⇒ 拿 HEAD 跟自己比，永远“已同步”，未推送会误判绿（单测「有提交未推送」钉的就是这个）。
-  const upSha = readRefSha(dirs.commonDir, upRef);
+  const upSha = readRefSha([dirs.commonDir, dirs.gitDir], upRef);
   if (upSha === null) { repo.push_state = 'never_fetched'; repo.light = 'yellow'; repo.reason = 'never_fetched'; return repo; }
   const synced = upSha === headSha;
   repo.push_state = synced ? 'synced' : 'unpushed_or_diverged';
