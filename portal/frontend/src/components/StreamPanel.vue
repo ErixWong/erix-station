@@ -15,7 +15,7 @@ import { renderMarkdown } from '../lib/markdown';
 // 只挂**终稿/部分正文**容器；流式增量不挂（pi-web 同口径：流式中不预览，防逐 chunk 重渲）。
 import { vMermaid } from '../directives/mermaid';
 // issue #282：消息级时刻（A 块）+ 流式气泡上的「已运行 Xs」心跳（B 块在 StreamPanel 的唯一落点；
-// 其余动量数字都在顶部常驻状态条 RunStatusBar 里，见工单「落点」）。
+// 其余动量数字都在输入框上方常驻状态条 RunStatusBar 里，见工单「落点」）。
 import { formatMessageTime } from '../lib/messageTime';
 import { formatElapsed } from '../lib/runMomentum';
 import { useRunMomentum } from '../composables/useRunMomentum';
