@@ -232,6 +232,10 @@ export const zhCN = {
       toolReplaySkipped: '工具执行被中断，未重放，由模型决定是否重试{tool}',
       // 工具名后缀：名字来自 payload（引擎透传，属外来数据），脏值在调用方已被 typeof 守卫拦掉。
       toolReplayTool: '（{name}）',
+      // issue #371-A：引擎 `persistence_error{fatal:false}`（erix-agent#461 起）——落盘失败但**不终止
+      // 本次任务**（剥掉的是折叠归档，原文仍在各轮记录里，#375 负责取回）⇒ 中性分隔行，不用红色。
+      // 致命的那条（`fatal:true` 或旧版无字段）不在这里刷，由 `run_end` 的 `persistence_failed` 红面负责。
+      persistenceDegraded: '落盘降级：{operation} 记录未存入（本次任务不受影响）',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       // issue #321（erix-station）：judge 永远只是**意见**，不是验收——分轴展示（工具审计 / 目标判断 /
