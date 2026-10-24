@@ -1507,3 +1507,30 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **预验**（`docker build -f portal/Dockerfile` 本地镜像临时顶掉 pin）：管理台 tab 出现（`用户管理 / LLM 管理 / 仓库管理 / 号池占用`）；落 `/admin/users` 时占用请求 **0 次**，点 tab 后**恰好 1 次**且 URL **不带 query**；真数据逐字段对得上我今天直采的 API（`800 = 795 空闲 + 0 部分 + 5 占满`，被占段 `22000–22009 … 10 个活行 · 占用者：eric`…共 5 段真名）；`partial=0` ⇒ 无警报块、无自洽告警、无错误行、整页无 `undefined`/`NaN`/`[object Object]`、console error 0。
 - **改块提示三态在真机上成立**（这是本单的最终目的）：输入 `22000` ⇒ 「被占用（占用者：eric；10 个活行）——改块会被服务端拒绝（409），请换一段」；`22100` ⇒ 「整段空闲（在最近一次总览的空闲列表里）」；`29990` ⇒ 「**不知道**这一段空不空：它不在最近一次总览的空闲列表里（那份列表是截断的），以服务端校验为准」。开面板 ⇒ 占用请求增量 **0**（隐式请求为零，真机版）；`/ports/block` POST 数 **0**、输入框值原样保留（不自动改值/不自动提交）。
 - **发布物复验**：浏览器实际加载 `index-xHmHZy-g.js`，**与本地构建同名**（内容逐字节一致旁证，同 §8.43 那次先例），汇总与占用段渲染同上、四类脏值全 0。
+
+### 8.50 目录下拉第一项是 `.pnpm-store`：展示层过滤 + 镜像钉死依赖缓存落位（2026-10-24，决策者口述、无 issue，PR 直修）
+
+**现象**：决策者开 FDE 界面点开目录下拉，第一项是 `.pnpm-store`，真实项目被挤到后面。
+
+**取证推翻了「worker 的 HOME 不可写」这个直觉归因**（我先这么说，实测否掉）：`runner/agentd.js:984` 本来就写 `childEnv.HOME = CFG.home`（= `/home/erix`），且 `/home/erix/.local` 的属主确实是 `erix-worker`(1002)——HOME 一直可写。真因是 pnpm 自己的落位规则：**默认 store 与项目不在同一卷时，它在「项目所在卷」上另找地方建 `.pnpm-store`**，而 `~/projects` 正是 `projects` 这个 bind mount 的根（容器内 `stat -c %d`：`/home`=**52**、`/home/erix`=**64512**、`/home/erix/projects`=**64512**）。eric 空间现场：**388 MB / 22781 文件**的 `~/projects/.pnpm-store`，属主 `erix-worker`，触发者是 `lingolens`（唯一带 `pnpm-lock.yaml` 的项目）。
+⇒ **结论：只要缓存落位由工具自己选，换个工具（corepack / pip）就会再长一次。** 两层分开做，缺一层都只剩一半。
+
+**① 展示层（`portal/src/dirs.js`）**：新增 `isListedDirName` = `isSafeDirName` + 非 `.` 开头，只用在 `listDirs` 的枚举处。下拉是**项目选择器**不是文件管理器，这类目录不可能被选为 cwd，列出来只是噪音（且 `.` 码点排在所有字母之前 ⇒ 必然顶掉第一项）。**只影响列表可见性**：`validateSessionCwd` / `fileTree` 不筛点开头，已存在的 `~/projects/.xxx` 会话 cwd 仍可读写与展开——不是收紧旧口径，只是不加严。
+
+**② 落位层（`runner/Dockerfile`）**：写 npm 的 **globalconfig**（容器内 `npm config get globalconfig` 实测 = `/usr/local/etc/npmrc`），`cache=/home/erix/cache/npm` + `store-dir=/home/erix/cache/pnpm-store`；`corepack`/`pip` 不读 npmrc ⇒ 镜像 ENV `COREPACK_HOME` / `PIP_CACHE_DIR`。三条不能换的做法：
+- **选 globalconfig 而不是 `ENV npm_config_*`、也不是往家目录物化 `.npmrc`**：它是 npmrc 链**最低一层**，只给默认值。真机实测优先级——只给它时 `npm config get cache=/home/erix/cache/npm`，再放一个 `~/.npmrc` 写 `cache=/tmp/override` ⇒ 立刻变 `/tmp/override`。⇒ 不与 user-space §4.2「`~/cache` 内容 FDE 自管」冲突，也不会静默盖掉用户/项目 `.npmrc`。家目录那条走不通另有其因：`~/` 下的平台文件每轮 reconcile 覆盖（`materializer.js`），用户改一次就丢。
+- **落点用既有的 `~/cache`**（§4.2 已划定的依赖缓存区、独立 bind mount、不进目录下拉），不新增概念。不预建子目录：工具自建，agentd(1001)/worker(1002) 主组 1000 + umask 0002 ⇒ 跨 UID 可复用（已实测 worker 在 `~/cache/pnpm-store` 里 `touch` 成功）。
+- **层序**：必须排在镜像自身 `npm install --omit=dev` **之后**，否则构建期缓存也落 `~/cache/npm`、运行时被宿主 bind mount 盖住 ⇒ 镜像白占一层且不可回收。这条顺序进了判据。
+
+**线上热补（不等镜像重建，当日已执行）**：`fde-eric` / `fde-jim` 两容器写入同一份 `/usr/local/etc/npmrc`（写在容器可写层：`docker restart` 还在、**`docker rm` 后没了** ⇒ 固化必须靠新镜像）；eric 的 store 用 `cp -a` 搬进 `~/cache/pnpm-store`（`find -type f` 源=目标 **22781=22781** 才删源，不重下）并 `chown erix:erix` + `chmod 0770`（组 rwx 让 agentd/worker 复用）。eric 的 `~/projects` 现只剩 6 个真项目。
+
+**告知面**：`~/AGENTS.md` 那条「`node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）」改成「**已由镜像默认指到 `~/cache`**——不要把 store/cache 改到 `~/projects` 下，也不要在项目里建 `.pnpm-store`」。不改这句，agent 要么以为要自己配，要么反向把它挪回去。
+
+**基线**：根 **1430 / 1426 / 0 / 4**（基点 §8.49 记的 **1426 / 1422 / 0 / 4**，净 **+4** = `dirs.test.js` +1、新 `portal/test/runner-image-cache-dir.test.js` +3）、runner **323/323** 不变、**前端零字节**。改动面：`portal/src/dirs.js`、`portal/src/materializer.js`、`runner/Dockerfile`、`docs/design/user-space.md` §4.2、`ISSUES.md` 条目→issue 对照表一行（无 issue，写明当日直修）、两个测试文件。
+
+**主 agent 亲跑变异 3 条（每条先自证 `git diff` 非空操作）**：① 撤掉 `isListedDirName` 的非隐藏判定 ⇒ `dirs.test.js` **恰 1 条红**（新用例）；② 删掉告知句里的「别挪进 `~/projects`」⇒ **恰 1 条红**；③ 把 globalconfig 层挪到 `npm install` 之前 ⇒ **恰 1 条红在层序那条**，且附顺序自检（`npmrc@5148 < install@5479`）。⚠ **③ 的第一次尝试是假变异**：脚本按 `t.index('WORKDIR /opt/erix')` 取切点，而该锚点在文件里出现得**更早**（`j < i`）⇒ 切出一段重复文本、相对顺序根本没变 ⇒ 3 条全绿差点被当成判据。按 §8.24 先量「变异后两个锚点的实际偏移」重做才拿到红（这条纪律又一次自己抓到东西）。
+
+**未做 / 待决**：
+- **镜像未重建**：现网 `FDE_IMAGE=ghcr.nju.edu.cn/erixwong/erix-station-fde@sha256:de16b78b513c…`（portal env + `IMAGE_ALLOWLIST` 全串精确匹配）。生效需要 build → 新 image ID → 同步这两处 env → recreate `fde-eric` / `fde-jim`（**会打断正在跑的 run**）。在此之前线上靠上面那份热补撑着。
+- **未发版**（不进 v0.1.31 的任何承诺，等决策者定窗口）。
+- 展示层过滤**没**同步到目录树（`fileTree`）：树面板里点开头目录仍可见可展开，是刻意的——树是浏览器的用法，人可能就是要看 `.git` / `.github`；下拉才是被污染的那一面。
