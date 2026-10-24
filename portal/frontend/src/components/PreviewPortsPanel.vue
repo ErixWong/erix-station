@@ -17,6 +17,8 @@ import {
   asPreviewPortState,
   duplicateObservedGroups,
   formatStartedAgo,
+  groupByProject,
+  projectRootOf,
   retryAfterSeconds,
   type PreviewApiError,
   type PreviewObserved,
@@ -46,6 +48,14 @@ const props = withDefaults(defineProps<{
    * 传了 ⇒ 本目录在用的端口排最前；不传（管理台代看）⇒ 只做「有观测优先」，组内维持后端 port ASC。
    */
   currentCwd?: string | null;
+  /**
+   * 双面板拆分（用户裁定）：侧栏不再按当前目录过滤，而是**按项目根分组**展示——
+   * 面板①端口池（url 非空）、面板②进程监听（有观测）各自传子集；当前目录组排最前挂徒章，
+   * 池内未用端口收进「空闲」组（仅池面板）。旧后端无观测 ⇒ 分组自动失效，退回平铺。
+   */
+  groupByProject?: boolean;
+  /** 空态文案覆盖（进程面板需要自己的口径，不能拿「你还没有预览端口」凑数）。 */
+  emptyLabel?: string | null;
 }>(), {
   error: null,
   ticketBusyId: null,
@@ -55,6 +65,8 @@ const props = withDefaults(defineProps<{
   fdeName: null,
   variant: 'table',
   currentCwd: null,
+  groupByProject: false,
+  emptyLabel: null,
 });
 
 const emit = defineEmits<{
@@ -128,31 +140,58 @@ function observedHere(item: PreviewPortItem): boolean {
 
 /**
  * 旧后端（未跑 0022）的 DTO 里**没有** `observed` 键 ⇒ undefined；新后端恒有（可能为 null）。
- * 据此判定「观测可用」：不可用 ⇒ 不过滤（全量展示，与改动前逐字节同形）。
+ * 旧后端 ⇒ 分组自动失效（无观测可分），退回平铺全量。
  */
 const observationsAvailable = computed(() => props.items.some((i) => 'observed' in i));
 
-/**
- * 工作台（传了 currentCwd）且观测可用 ⇒ **过滤**：主区只画当前目录在用的端口；
- * 其余（别的目录在用 + 无观测）收进折叠区——用户不必关心别的目录开了什么口，但签票/复用入口不丢。
- * 管理台代看（不传）或旧后端无观测 ⇒ 不过滤，仅「有观测优先」排序（组内维持后端 port ASC）。
- */
-const filterToDir = computed(() => !!props.currentCwd && observationsAvailable.value);
-const primaryItems = computed<PreviewPortItem[]>(() => {
-  const rank = (item: PreviewPortItem) => (observedHere(item) ? 0 : item.observed ? 1 : 2);
-  const sorted = [...props.items].sort((a, b) => rank(a) - rank(b));
-  return filterToDir.value ? sorted.filter(observedHere) : sorted;
-});
+/** 当前目录的项目根（子目录/绝对形都归一到 `~/projects/<name>`；非项目目录为 null）。 */
+const currentRoot = computed(() => projectRootOf(props.currentCwd ?? undefined));
+
+interface DisplayGroup {
+  root: string | null;
+  showHeader: boolean;
+  isCurrent: boolean;
+  items: PreviewPortItem[];
+}
 
 /**
- * 同目录 ≥2 个监听 = 「两个分支各占一口」的现场；面板顶部显性警告，不让人靠猜。
- * 过滤态下只保留与当前目录相关的组——别的目录的冲突不该出现在我眼前的清单里。
+ * 展示分组：分组模式（侧栏双面板）⇒ 在用目录组按项目根分桶，当前目录排最前挂徒章；
+ * 池内未用（url 非空且无观测）收进尾部「空闲」组。非分组模式/旧后端 ⇒ 单平铺组（行为同前）。
  */
-const duplicateGroups = computed(() => {
-  const groups = duplicateObservedGroups(props.items);
-  if (!filterToDir.value) return groups;
-  return groups.filter((g) => g.cwd === props.currentCwd);
+const displayGroups = computed<DisplayGroup[]>(() => {
+  const rank = (item: PreviewPortItem) => (observedHere(item) ? 0 : item.observed ? 1 : 2);
+  const flat = [...props.items].sort((a, b) => rank(a) - rank(b) || a.port - b.port);
+  if (props.variant !== 'list' || !props.groupByProject || !observationsAvailable.value) {
+    return [{ root: null, showHeader: false, isCurrent: false, items: flat }];
+  }
+  const observed = props.items.filter((i) => i.observed);
+  const spare = props.items.filter((i) => !i.observed && i.url);
+  const groups = groupByProject(observed).map((g) => ({
+    root: g.root as string | null,
+    showHeader: true,
+    isCurrent: g.root === currentRoot.value,
+    items: g.items,
+  }));
+  groups.sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || a.root!.localeCompare(b.root!));
+  if (spare.length > 0) groups.push({ root: null, showHeader: true, isCurrent: false, items: spare.sort((a, b) => a.port - b.port) });
+  return groups;
 });
+
+/** 行内观测文案：紧凑形态分组头已给目录，行内不重复报 cwd，只报 cmd/分支/已运行。 */
+function rowObservedText(item: PreviewPortItem): string {
+  return observedText(item.observed!, props.variant === 'list' || observedHere(item));
+}
+
+/** 分组头显示名：取目录段（~/projects/shop → shop），完整根挂 title。 */
+function dirName(root: string): string {
+  return root.split('/').pop() ?? root;
+}
+
+/**
+ * 同项目根 ≥2 个监听 = 「两个分支各占一口 / 子目录又开一口」的现场；顶部显性警告不让人靠猜。
+ * duplicateObservedGroups 已按项目根归并（含池外合成口）。
+ */
+const duplicateGroups = computed(() => duplicateObservedGroups(props.items));
 
 function observedText(obs: PreviewObserved, hereContext = false): string {
   // 主区行（目录已定）：cmd 比 cwd 有信息量（vite 还是 uvicorn）；cwd 冗余就不重复报。
@@ -207,7 +246,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
       data-test="preview-ports-empty"
       class="muted py-2 text-sm"
       role="status"
-    >{{ props.scope === 'fde' ? t('previewPorts.emptyFde') : t('previewPorts.emptySelf') }}</p>
+    >{{ props.emptyLabel ?? (props.scope === 'fde' ? t('previewPorts.emptyFde') : t('previewPorts.emptySelf')) }}</p>
 
     <template v-if="props.items.length > 0">
       <!-- 观测层 MVP：同一目录/仓库 ≥2 个监听（真机实证：两个分支的 dev server 各占一口）。
@@ -238,7 +277,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
           </tr>
         </thead>
         <tbody>
-          <tr v-for="item in primaryItems" :key="item.id" data-test="preview-port-row" class="border-b border-black/10 last:border-b-0">
+          <tr v-for="item in displayGroups[0].items" :key="item.id" data-test="preview-port-row" class="border-b border-black/10 last:border-b-0">
             <td class="py-1.5 font-medium" data-test="preview-port-value">{{ item.port }}</td>
             <td class="truncate py-1.5">
               <button
@@ -255,7 +294,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
                 data-test="preview-port-observed"
                 class="truncate px-1 text-[11px] text-black/55"
                 :title="observedTitle(item.observed)"
-              >{{ observedText(item.observed, observedHere(item)) }}</p>
+              >{{ rowObservedText(item) }}</p>
             </td>
             <td class="py-1.5">
               <span
@@ -284,8 +323,21 @@ onScopeDispose(() => clearTimeout(copiedTimer));
            第二行 = 可截断 hostname（点击复制**完整 url**，title 里也是完整 url）。
            宽度纪律：每一层都带 min-w-0，hostname 是 block w-full truncate ⇒ 再长的域名也不会横向撑破面板。 -->
       <ul v-else data-test="preview-ports-list" class="min-w-0">
+        <template v-for="group in displayGroups" :key="group.root ?? (group.showHeader ? 'spare' : 'flat')">
         <li
-          v-for="item in primaryItems"
+          v-if="group.showHeader"
+          data-test="preview-port-group-header"
+          class="flex min-w-0 items-center gap-1 pb-0.5 pt-2 text-[10px] font-semibold tracking-[0.04em] text-black/55 first:pt-0"
+        >
+          <span class="min-w-0 truncate" :title="group.root ?? undefined">{{ group.root === null ? t('previewPorts.spareGroup', { count: group.items.length }) : dirName(group.root) }}</span>
+          <span
+            v-if="group.isCurrent"
+            data-test="preview-port-group-current"
+            class="shrink-0 rounded-full border border-emerald-600/40 bg-emerald-50 px-1 text-emerald-800"
+          >{{ t('previewPorts.currentBadge') }}</span>
+        </li>
+        <li
+          v-for="item in group.items"
           :key="item.id"
           data-test="preview-port-row"
           class="min-w-0 border-b border-black/10 py-1.5 last:border-b-0"
@@ -357,28 +409,17 @@ onScopeDispose(() => clearTimeout(copiedTimer));
             data-test="preview-port-unrouted"
             class="mt-0.5 text-[10px] leading-[1.4] text-black/50"
           >{{ t('previewPorts.unroutedNote') }}</p>
-          <!-- 观测注解（有则显，无观测不加任何反向文案——null ≠ 空闲）；本目录在用时挂徒章。 -->
+          <!-- 观测注解（有则显，无观测不加任何反向文案——null ≠ 空闲）；目录由分组头承担，行内不重复。 -->
           <p
             v-if="item.observed"
             data-test="preview-port-observed"
             class="mt-0.5 flex min-w-0 items-center gap-1 text-[10px] leading-[1.4] text-black/55"
             :title="observedTitle(item.observed)"
           >
-            <span
-              v-if="observedHere(item)"
-              data-test="preview-port-observed-here"
-              class="shrink-0 rounded-full border border-emerald-600/40 bg-emerald-50 px-1 text-emerald-800"
-            >{{ t('previewPorts.observedHere') }}</span>
-            <span class="min-w-0 truncate">{{ observedText(item.observed, observedHere(item)) }}</span>
+            <span class="min-w-0 truncate">{{ rowObservedText(item) }}</span>
           </p>
         </li>
-        <!-- 过滤态下当前目录无在用端口：不谎报空列表（分配仍在），给一行说明。 -->
-        <li
-          v-if="filterToDir && primaryItems.length === 0"
-          data-test="preview-port-none-here"
-          class="muted py-2 text-[11px] leading-[1.5]"
-          role="status"
-        >{{ t('previewPorts.noneHere') }}</li>
+        </template>
       </ul>
 
       <!-- 无折叠区（用户实证裁定）：工作台列表 = 当前目录在用的端口，其余（含原 10 端口全量）

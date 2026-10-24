@@ -876,8 +876,21 @@ describe('SidebarPanel · 预览端口段与底部堆叠区（issue #308）', ()
     // 折叠态零签票（票 60 秒过期且一次性，绝不预取）
     expect(calls.filter((c) => c.method === 'POST')).toHaveLength(0);
     // 折叠条收起态也给可用信息：条数
-    expect(toggleOf(wrapper).text()).toContain('预览端口（3 个）');
+    expect(toggleOf(wrapper).text()).toContain('端口池（3 个）');
   });
+  it('折叠条计数=池地址数：池外观测合成行（url=null）不计入「端口池（N）」，只进进程面板', async () => {
+    stubRoutes([
+      ...THREE_PORTS,
+      { id: 'observed:5173', port: 5173, hostname: null, url: null, state: 'observed',
+        scope: 'fde', role: 'unrouted', exposure: 'private',
+        observed: { pid: 41, cwd: '~/projects/a', cmd: 'node vite', branch: null, started_at: null, observed_at: new Date().toISOString() } },
+    ]);
+    const wrapper = await mountPanel({ dirs: DIR });
+    await tick();
+    expect(toggleOf(wrapper).text()).toContain('端口池（3 个）');
+    expect(wrapper.get('[data-test="process-watch-toggle"]').text()).toContain('进程监听（1 个）'); // 池内三行是旧形夹具（无 observed 键=旧后端语义），只有合成行带观测
+  });
+
 
   it('两个开关互不影响（不共用总开关）：展开端口不动目录树，收起端口不影响已展开的树', async () => {
     const calls = stubRoutes();
@@ -984,6 +997,6 @@ describe('SidebarPanel · 预览端口段与底部堆叠区（issue #308）', ()
     expect(portsCalls(calls)).toHaveLength(1); // 仍然是进视图那一次
     expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(3);
     expect(wrapper.get('[data-test="preview-port-hostname"]').text()).toBe('alice-p-22000.fde.erix.vip');
-    expect(toggleOf(wrapper).text()).toContain('预览端口（3 个）');
+    expect(toggleOf(wrapper).text()).toContain('端口池（3 个）');
   });
 });

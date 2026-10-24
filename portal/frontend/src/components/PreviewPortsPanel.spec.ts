@@ -374,7 +374,7 @@ describe('观测层注解（observed）', () => {
     expect(warn).not.toContain('~/projects/other'); // 单实例目录不进警告
   });
 
-  it('传 currentCwd + 观测可用 ⇒ **只显示**本目录在用的端口；其余整行不画也不给展开入口（用户裁定：10 端口全量是干扰项）', () => {
+  it('分组模式 ⇒ 按项目根分组：当前目录组排最前挂「当前目录」徽章，其余目录各成一组，池内未用收进「空闲」组', () => {
     wrapper = mountPanel({
       items: [
         portItem('a', 22000, { observed: null }),
@@ -383,26 +383,28 @@ describe('观测层注解（observed）', () => {
       ],
       currentCwd: '~/projects/shop',
       variant: 'list',
+      groupByProject: true,
     });
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
+    expect(headers).toEqual(['shop当前目录', 'other', '空闲（1）']);
+    expect(wrapper.find('[data-test="preview-port-group-current"]').exists()).toBe(true);
     const rows = wrapper.findAll('[data-test="preview-port-row"]');
-    expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22002']);
-    expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(1);
-    // 主区行文案：目录已定 ⇒ 不重复报 cwd，改报 cmd（能看出是 vite 还是后端）。
+    expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22002', '22001', '22000']);
+    // 行文案：目录由分组头承担 ⇒ 行内只报 cmd/分支（能看出是 vite 还是后端）
     expect(rows[0].get('[data-test="preview-port-observed"]').text()).toContain('node vite.js');
-    // 无折叠区：其余端口（22000/22001）整行不可见，也没有展开入口
-    expect(wrapper.text()).not.toContain('22000');
-    expect(wrapper.text()).not.toContain('22001');
-    expect(wrapper.find('[data-test="preview-ports-others-toggle"]').exists()).toBe(false);
+    expect(rows[0].get('[data-test="preview-port-observed"]').text()).not.toContain('~/projects/shop');
   });
 
-  it('传 currentCwd 但本目录无在用端口 ⇒ 主区给「无在用」说明，不谎报空列表', () => {
+  it('当前目录无在用端口 ⇒ 不挂「当前目录」徽章、不谎报；空闲组照旧（池内未用 ≠ 无地址）', () => {
     wrapper = mountPanel({
       items: [portItem('a', 22000, { observed: null }), portItem('b', 22001, { observed: OBS_OTHER })],
       currentCwd: '~/projects/shop',
       variant: 'list',
+      groupByProject: true,
     });
-    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(0);
-    expect(wrapper.find('[data-test="preview-port-none-here"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="preview-port-group-current"]').exists()).toBe(false);
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
+    expect(headers).toEqual(['other', '空闲（1）']);
   });
 
   it('旧后端（DTO 无 observed 键）⇒ **不过滤**，全量展示与改动前同形', () => {
@@ -426,14 +428,17 @@ describe('观测层注解（observed）', () => {
     expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(0);
   });
 
-  it('子目录命中：observed 在 ~/projects/shop/frontend 也算「当前目录（shop）在用」', () => {
+  it('子目录归并：observed 在 ~/projects/shop/frontend 的行归进 shop 组并挂「当前目录」徽章', () => {
     wrapper = mountPanel({
       items: [portItem('a', 22000, { observed: { ...OBS_SHOP, cwd: '~/projects/shop/frontend' } })],
       currentCwd: '~/projects/shop',
       variant: 'list',
+      groupByProject: true,
     });
-    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(1);
-    expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(1);
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]');
+    expect(headers).toHaveLength(1);
+    expect(headers[0].text()).toContain('shop');
+    expect(headers[0].find('[data-test="preview-port-group-current"]').exists()).toBe(true);
   });
 
   it('端口池外的观测合成行（url=null）：可识别在用，但无打开/复制按钮，只有说明句', () => {
@@ -443,26 +448,29 @@ describe('观测层注解（observed）', () => {
       })],
       currentCwd: '~/projects/shop',
       variant: 'list',
+      groupByProject: true,
     });
+    expect(wrapper.find("[data-test=\"preview-port-group-current\"]").exists()).toBe(true);
     const row = wrapper.get('[data-test="preview-port-row"]');
-    expect(row.find('[data-test="preview-port-observed-here"]').exists()).toBe(true);
     expect(row.find('[data-test="preview-port-open"]').exists()).toBe(false);
     expect(row.find('[data-test="preview-port-hostname"]').exists()).toBe(false);
     expect(row.get('[data-test="preview-port-unrouted"]').text()).toContain('端口');
   });
 
-  it('非当前目录的端口（含池外合成行）整行不画（用户实证「未知状态+↗」干扰项的根治：不再渲染）', () => {
-    wrapper = mountPanel({
-      items: [
-        portItem('a', 22000, { observed: OBS_OTHER }),
-        portItem('observed:5173', 5173, { hostname: null, url: null, state: 'observed', observed: OBS_SHOP }),
-      ],
-      currentCwd: '~/projects/nowhere', // 两行都不命中 ⇒ 都不画，只剩「无在用」说明
-      variant: 'list',
-    });
-    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(0);
+  it('双面板分工（用户裁定）：端口池面板只收 url 行；池外合成行归进程面板 ⇒ 池面板永不见「未知状态」', () => {
+    const all = [
+      portItem('a', 22000, { observed: OBS_OTHER }),
+      portItem('observed:5173', 5173, { hostname: null, url: null, state: 'observed', observed: OBS_SHOP }),
+    ];
+    // 池面板：SidebarPanel 传的是 poolItems（url 非空）——这里模拟其子集
+    wrapper = mountPanel({ items: all.filter((i) => i.url), currentCwd: '~/projects/shop', variant: 'list', groupByProject: true });
     expect(wrapper.text()).not.toContain('5173');
     expect(wrapper.text()).not.toContain('未知状态');
-    expect(wrapper.find('[data-test="preview-port-none-here"]').exists()).toBe(true);
+    // 进程面板：groupByProject 过滤后两行都在，各自归组；合成行仍无按钮只有说明句
+    wrapper = mountPanel({ items: all, currentCwd: '~/projects/shop', variant: 'list', groupByProject: true });
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
+    expect(headers).toEqual(['shop当前目录', 'other']);
+    const unrouted = wrapper.get('[data-test="preview-port-unrouted"]');
+    expect(unrouted.text()).toContain('端口');
   });
 });

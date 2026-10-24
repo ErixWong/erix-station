@@ -116,7 +116,7 @@ describe('工作台 · 预览端口区块', () => {
     try {
       expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/me/ports')).toHaveLength(1);
       const bar = toggle(wrapper);
-      expect(bar.text()).toContain('预览端口（3 个）');
+      expect(bar.text()).toContain('端口池（3 个）');
       expect(bar.attributes('aria-expanded')).toBe('false');
       // 防预取：整个面板只打过列表端点，一条 POST 都没有
       expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
@@ -223,7 +223,7 @@ describe('工作台 · 预览端口区块', () => {
     const { wrapper } = await mountWorkbench(ADMIN_WITH_SEAT, (url, init) =>
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: [] }) : undefined);
     try {
-      expect(toggle(wrapper).text()).toContain('预览端口');
+      expect(toggle(wrapper).text()).toContain('端口池使用情况');
       expect(toggle(wrapper).text()).not.toContain('（');
       await toggle(wrapper).trigger('click');
       expect(wrapper.find('[data-test="preview-ports-table"]').exists()).toBe(false);
@@ -244,7 +244,7 @@ describe('工作台 · 预览端口区块', () => {
     });
     try {
       expect(calls).toBe(1);
-      expect(toggle(wrapper).text()).toContain('预览端口（加载失败）');
+      expect(toggle(wrapper).text()).toContain('端口池（加载失败）');
       await toggle(wrapper).trigger('click');
       expect(wrapper.get('[data-test="preview-ports-error"]').text())
         .toBe('预览端口加载失败（db_unavailable）：数据库暂时不可用');
