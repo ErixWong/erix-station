@@ -136,15 +136,16 @@ function toggleFolded(id: string): void {
   else expandedFolded.add(id);
 }
 
-// 横幅标题分级降级：count+范围 → countOnly → bare（字段缺失时逐级退回，不拼半截文案）。
+// 横幅标题分级降级：范围 → 条数 → 裸文案（字段缺失时逐级退回，不拼半截文案）。
+// #375：有范围就**只报范围**。原先一并报出去的 `foldedPayloadMessages` 在 erix-agent 0.25.0 之后
+// 是「本条记录携带的归档条数」（会话级去重 + 256 KiB 夹断之后），拿它当「压掉了多少条」会说假话；
+// 没有 range 的存量行才退回条数口径（那类行当时归档就是全量，条数是真话）。
 function foldedTitle(folded: FoldedInfo): string {
   const count = folded.foldedPayloadMessages;
   const range = folded.foldedRoundRange;
   const from = range?.from;
   const to = range?.to;
-  if (typeof count === 'number' && typeof from === 'number' && typeof to === 'number') {
-    return t('stream.folded.range', { count, from, to });
-  }
+  if (typeof from === 'number' && typeof to === 'number') return t('stream.folded.range', { from, to });
   if (typeof count === 'number') return t('stream.folded.countOnly', { count });
   return t('stream.folded.bare');
 }
@@ -296,6 +297,11 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
         <div v-if="foldedOriginalState(en)!.status === 'loading'" class="text-xs text-black/40">{{ t('common.loading') }}</div>
         <div v-else-if="foldedOriginalState(en)!.status === 'missing'" class="folded-original-missing text-xs text-black/40">{{ t('stream.folded.originalMissing') }}</div>
         <template v-else-if="foldedOriginalState(en)!.status === 'loaded'">
+          <!-- #375：归档只是本轮差分且被上游夹断时，要说清「下面的正文是从账本按轮号补齐的」 -->
+          <div
+            v-if="(foldedOriginalState(en) as { truncated?: boolean }).truncated"
+            class="folded-original-truncated text-xs text-black/40"
+          >{{ t('stream.folded.originalTruncated', { count: (foldedOriginalState(en) as { droppedMessages?: number }).droppedMessages ?? '?' }) }}</div>
           <div
             v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns"
             :key="ti"

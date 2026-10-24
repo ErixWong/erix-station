@@ -176,15 +176,21 @@ export const zhCN = {
     reasoning: '推理过程',
     // issue #189：折叠段（compaction）横幅：独立分隔条样式 + 摘要默认收起 + 查看原文（只读懒加载）
     folded: {
-      // 完整态：已压缩 N 条消息（第 r1–r2 轮）；缺字段时逐级降级
-      range: '已压缩 {count} 条消息（第 {from}–{to} 轮）',
+      // #375：横幅只说轮范围。原先那个「N 条」取自投影 `meta.foldedPayloadMessages`，而 erix-agent
+      // 0.25.0（erix-agent#461）之后它的语义变成「本条记录携带的归档条数」（会话级去重 + 夹断之后），
+      // 长会话上会明显偏小 ⇒ 再说「已压缩 N 条」就是说假话。缺 range 的存量行才退回条数口径。
+      range: '已压缩第 {from}–{to} 轮',
       countOnly: '已压缩 {count} 条消息',
       bare: '已压缩',
       viewOriginal: '查看原文',
       // 原文只读展示
       originalEmpty: '（无文本内容）',
-      // 404 folded_payload_not_found：友好提示（不是错误）
-      originalMissing: '原文已不可用（上游未保留折叠前载荷）',
+      // #375：404 语义已收窄成「range 与归档两条路都拿不出正文」。旧文案那句「上游未保留折叠前载荷」
+      // 在 0.25.0 之后会在数据完好时说假话（差分被去重吸空也会走这条）。
+      originalMissing: '这一段没有可显示的原文（账本里也没有）',
+      // 归档只是差分/被夹断：用后端 `truncated` 布尔位判，条数取 `dropped_messages`
+      //（只给布尔、截断标记由前端出，同 §4.4a-1 口径）。
+      originalTruncated: '本次归档被截断（另有 {count} 条未单独存档），以下为按轮号从账本补齐的原文',
       originalError: '原文加载失败：{message}',
     },
     // issue #189（追加）：当前会话头部状态行「N 条消息 · 已压缩 M 次」+ 克制提示（仅 M≥1）
