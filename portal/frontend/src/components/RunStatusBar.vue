@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 会话页顶部常驻状态条（issue #282 B 块）。
+// 输入框上方常驻状态条（issue #282 B 块，落点后续调整：原来在窗口顶部，容易被忽略，现紧贴 composer 上沿）。
 //
 // 为什么是「一条常驻状态条」而不是每条消息内嵌动量数字：消息级只负责**时刻**（StreamPanel 的
 // `<time>`），动量是 run 级概念；塞进每条消息会让每次增量重渲染都带着它一起抖（工单「落点」明确）。
@@ -84,7 +84,7 @@ const frozenSeconds = computed(() =>
 
 <template>
   <div
-    class="run-status-bar flex flex-wrap items-center gap-x-1.5 gap-y-0.5 border-b px-3 py-1 text-xs"
+    class="run-status-bar flex flex-wrap items-center gap-x-1.5 gap-y-0.5 border-t px-3 py-1 text-xs"
     :class="view.frozen
       ? 'border-amber-300 bg-amber-50 text-amber-800'
       : 'border-black/10 bg-black/[0.02] text-black/60'"

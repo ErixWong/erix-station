@@ -311,7 +311,7 @@ export const zhCN = {
       paren: '（{value}）',
     },
   },
-  // 会话页顶部常驻动量状态条 + 消息时刻（issue #282 A/B 两块）。
+  // 输入框上方常驻动量状态条 + 消息时刻（issue #282 A/B 两块）。
   // 口径（「不伪装精确」）：`~` 是速率估算标记（rateHint 双语都写了）；tokens 段只出 run_end.usage
   // 真值（拿不到就整段不出，绝不显示 0）；时长未知就不出（不写 00:00）。
   runStatus: {

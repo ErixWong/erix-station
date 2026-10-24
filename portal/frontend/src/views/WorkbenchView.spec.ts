@@ -388,3 +388,42 @@ describe('顶栏收工灯接线（#359 P0b）', () => {
     expect(store.entries.length).toBe(0); // 没往消息流里塞任何东西 = 没发送
   });
 });
+
+// ---- issue #282 落点修正：状态条从窗口顶部移到输入框上沿（顶部那行没人看）----
+describe('状态条落点：紧贴输入框上方（#282 落点调整）', () => {
+  /** 取 <section>（会话区）直系子元素的 class 序列——落点是**结构**问题，只能按兄弟顺序钉。 */
+  async function sectionKids(sessionId: string | null) {
+    const wrapper = await mountWorkbench();
+    const store = useWorkbenchStore();
+    store.sessionId = sessionId; // 状态条只在有选中会话时挂载（没有 run 可报）
+    await flushPromises();
+    const section = wrapper.find('main section');
+    expect(section.exists(), '会话区 <section> 必须在').toBe(true);
+    return Array.from(section.element.children).map((el) => el.className.toString());
+  }
+
+  it('顺序 = 消息流 → 状态条 → composer（状态条夹在两者之间，不再在窗口顶部）', async () => {
+    const classes = await sectionKids('s1');
+    const stream = classes.findIndex((c) => c.includes('overflow-auto'));
+    const status = classes.findIndex((c) => c.includes('run-status-bar'));
+    const composer = classes.length - 1; // composer 是会话区最后一个兄弟（modal / 悬浮按钮都是绝对定位的 v-if）
+    expect(status, '状态条必须渲染在会话区里').toBeGreaterThan(-1);
+    expect(status, '状态条在消息流**下方**').toBe(stream + 1);
+    expect(status, '状态条紧贴 composer 上方').toBe(composer - 1);
+    // 分隔线方向跟着落点翻转：贴输入框后分隔线在上沿（border-t），不再是压着消息流的 border-b
+    const bar = classes[status].split(/\s+/);
+    expect(bar).toContain('border-t');
+    expect(bar).not.toContain('border-b'); // 整类名比对：`border-black/10` 里含子串 `border-b`，不能用 includes
+    expect(bar).toContain('border-black/10');
+    // 状态条与输入框读作**一块**：两者之间不得再叠第二条线
+    expect(classes[composer].split(/\s+/)).not.toContain('border-t');
+  });
+
+  it('无选中会话（状态条不挂）⇒ composer 自己补上沿分隔线，不与流区粘连', async () => {
+    const classes = await sectionKids(null);
+    expect(classes.some((c) => c.includes('run-status-bar')), '无会话时不挂状态条').toBe(false);
+    const composer = classes[classes.length - 1].split(/\s+/);
+    expect(composer).toContain('border-t');
+    expect(composer).toContain('border-black/10');
+  });
+});
