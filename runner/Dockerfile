@@ -112,6 +112,9 @@ ENV COREPACK_HOME=/home/erix/cache/corepack \
 # ---- runner 代码 ----
 COPY agentd.js worker.js ./
 COPY lib ./lib
+# #363：平台技能（bundled 通道，worker 默认 bundledDir=/opt/erix/skills）。用户同名技能放
+# ~/.erix/skills 可覆盖（loader 优先级），日得迭代不需重建镜像。
+COPY skills ./skills
 COPY entrypoint.sh /usr/local/bin/station-agentd-entrypoint
 COPY healthcheck.sh /usr/local/bin/station-agentd-healthcheck
 RUN chmod 0755 /usr/local/bin/station-agentd-entrypoint /usr/local/bin/station-agentd-healthcheck
