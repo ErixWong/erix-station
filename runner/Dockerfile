@@ -90,6 +90,25 @@ RUN npm install --omit=dev --no-audit --no-fund \
   && npm cache clean --force \
   && rm -rf /root/.npm
 
+# ---- 依赖缓存落位（平台默认，优先级最低的一层）----
+# 症状（eric 空间实测 2026-10-24）：`~/projects/.pnpm-store` 长到 388 MB，把目录下拉第一项
+#   掉了——真实项目被工具自建缓存目录淹没（现靠 dirs.js 过滤点开头目录兼容，但垃圾还在长）。
+#   根因不是权限：pnpm 默认 store 与项目不同卷（或不可用）时，会在「项目所在卷」往上找位置建
+#   `.pnpm-store`，而 `~/projects` 正是 projects bind mount 的根，缓存就写进了项目列表。
+#   只要缓存位置由工具自己选，同类事就会反复发生——以平台默认值铉死才是解。
+# 做法：写 npm 的 **globalconfig**（镜像内 `npm config get globalconfig` 实测 = /usr/local/etc/npmrc）。
+#   它是 npmrc 配置链最低一层，只给默认值：实测 `~/.npmrc` / 项目 `.npmrc` 仍能覆盖（userconfig 优先）；
+#   npm / pnpm / yarn 共读此文件，所以 `store-dir`（pnpm）+ `cache`（npm）一并铉住。
+#   `~/cache` 是 user-space.md §3 已划定的依赖缓存区（独立 bind mount、不在目录下拉、平台不代管内容）；
+#   不预建子目录，工具自建：agentd(1001)/worker(1002) 主组 1000 + umask 0002 ⇒ 写入跳 UID 可复用。
+# 层位：必须在上方 `npm install --omit=dev` 之后——否则构建期缓存也落 /home/erix/cache/npm，
+#   运行时被宿主 bind mount 盖住，镜像里白占一层且不可回收。
+# corepack / pip 不读 npmrc，用镜像 ENV（用户 shell export 可覆盖）。
+RUN printf 'cache=/home/erix/cache/npm\nstore-dir=/home/erix/cache/pnpm-store\n' > /usr/local/etc/npmrc \
+  && chmod 0644 /usr/local/etc/npmrc
+ENV COREPACK_HOME=/home/erix/cache/corepack \
+    PIP_CACHE_DIR=/home/erix/cache/pip
+
 # ---- runner 代码 ----
 COPY agentd.js worker.js ./
 COPY lib ./lib

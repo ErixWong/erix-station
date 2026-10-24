@@ -72,7 +72,7 @@ export function renderHomeAgentsMd({ fdeName }) {
     // （写死就会出现「文档说 4000–4009、盘上是 22000–22009」那类告知失败，#246）。
     '- 预览域名由平台在开户时**分配一整段**（默认 10 条，每条带真实 `url`）：**`~/.erix/ports.json` 的清单就是唯一真相**，不要凭记忆猜端口，也不要要求平台加号；不够用就在清单里复用',
     '- 回流走 fork/PR，不直接在主干改',
-    '- `node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）',
+    '- `node_modules` 每项目一份；依赖缓存（npm cache / pnpm store / corepack / pip）**已由镜像默认指到 `~/cache`**——不要把 store/cache 改到 `~/projects` 下（会在项目列表里长出 `.pnpm-store` 这类目录），也不要在项目里建 `.pnpm-store`',
     '',
     // issue #257 + #258（工单 feat-261012-01）：**平台侧应用要求链的单一真相就落在这一节**。
     // 为什么落在 `~/AGENTS.md` 而不是 runner 的 `SYSTEM_PROMPT`（决策者 2026-10-12 定稿，#258
