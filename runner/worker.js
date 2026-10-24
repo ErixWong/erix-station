@@ -25,7 +25,7 @@ import {
   // resolveModelMetadata——本文件不自己算预算，也不把它的返回值当数据用（只看它抛不抛）。
   computeBudget,
 } from 'erix-agent';
-import { createToolRegistry } from 'erix-agent/tools';
+import { createToolRegistry, buildSkillTools } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
 import { parseMaxRounds } from './lib/config.js';
 import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
@@ -420,7 +420,32 @@ async function startRun(msg) {
     executors: { ...fileTools.executors, ...shellTools.executors },
     schemas: [...fileTools.schemas, ...shellTools.schemas],
   });
-  const tools = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas];
+  // #363 draft：平台技能 bundled 通道——`/platform/skills`（宿主专目录 ro bind mount，portal 单一写者；
+  // 目录不存在 = 通道空，静默缺席，同 notes_dir 缺失的降级风格只 warn 不阻断）。
+  // 用户自建 `~/.erix/skills` 同名可覆盖平台版（loader 原生优先级：project > global > bundled）。
+  // 工具名冲突由 buildSkillTools 自行跳过并计入 errors（builtin 优先，#65 语义）。
+  let skillTools = { tools: [], executeTool: null, errors: [] };
+  try {
+    skillTools = await buildSkillTools({
+      home: process.env.HOME || '/home/erix',
+      cwd,
+      bundledDir: process.env.STATION_SKILLS_DIR || '/platform/skills',
+      builtinNames: [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas].map((s) => s.name),
+    });
+    for (const e of skillTools.errors) {
+      sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: `skill ${e.skillId ?? '?'} skipped: ${e.error}`,
+      });
+    }
+  } catch (err) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `skills unavailable, run continues without them: ${String(err?.message ?? err)}`,
+    });
+  }
+  const skillToolNames = new Set(skillTools.tools.map((t) => t.name));
+  const tools = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
   // erix-agent 0.20.0（#285）：引擎对**四种返回形态真执行过的调用都写 `erix.durationMs`**（string /
   // number / `{content,metadata}` / 招异常），所以下面**不再包一层计时**。
@@ -431,6 +456,11 @@ async function startRun(msg) {
   const executeTool = async (options) => {
     if (noteTools.executeTool && noteToolNames.has(options.name)) {
       return noteTools.executeTool(options);
+    }
+    // 技能工具：上游 executeTool(name, input) 位置参形态（契约见 loader 契约测试），与 notes 的
+    // options 对象形态不同，故单独一段路由。
+    if (skillTools.executeTool && skillToolNames.has(options.name)) {
+      return skillTools.executeTool(options.name, options.input);
     }
     // issue #211：abort signal 必须转交。引擎契约把 run 的 signal 放在 executeTool 的**顶层**
     // options.signal（erix-agent 0.17.0 orchestrator.js:324 声明 + run-snapshot-executor.js:237
