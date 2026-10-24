@@ -102,6 +102,9 @@ class PortsStore {
     this.doNothingPorts = new Set();// 指定端口命中冲突目标 ⇒ DO NOTHING 吃掉（⑩ 用）
     this.ticketFailAt = 0;          // #247：第 N 张票的 INSERT 直接炸（验证「失败补偿」不留残票）
     this.ticketAttempts = 0;
+    // 观测层 MVP（迁移 0022 port_observations）：读端点 DTO 的 `observed` 数据源。
+    // 新鲜度窗口（SQL 里的 now() - interval '45 seconds'）fake 无法求值，用 JS 近似同口径过滤。
+    this.observations = [];
   }
 
   clone() {
@@ -156,6 +159,15 @@ class PortsStore {
         .filter((r) => r.fde_id === params[0] && r.state !== 'released')
         .sort((a, b) => a.port - b.port)
         .map(({ id, port, hostname, url, state, scope, role, exposure }) => ({ id, port, hostname, url, state, scope, role, exposure }));
+      return { rows, rowCount: rows.length };
+    }
+
+    // 观测注解取数（portalloc.listFdePreviewPorts 的旁路查询，只读）：新鲜度窗口按 45s 近似。
+    if (s.startsWith('SELECT port, pid, cwd, cmd, branch, proc_started_at, observed_at FROM port_observations')) {
+      const freshMs = Date.now() - 45_000;
+      const rows = this.observations
+        .filter((o) => o.fde_id === params[0] && new Date(o.observed_at).getTime() > freshMs)
+        .map(({ port, pid, cwd, cmd, branch, proc_started_at, observed_at }) => ({ port, pid, cwd, cmd, branch, proc_started_at, observed_at }));
       return { rows, rowCount: rows.length };
     }
 
@@ -739,7 +751,8 @@ test('listFdePreviewPorts：只列活行、port ASC、DTO 含 id（签票端点�
     'port ASC',
   );
   for (const item of items) {
-    assert.deepEqual(Object.keys(item).sort(), ['exposure', 'hostname', 'id', 'port', 'role', 'scope', 'state', 'url']);
+    assert.deepEqual(Object.keys(item).sort(), ['exposure', 'hostname', 'id', 'observed', 'port', 'role', 'scope', 'state', 'url']);
+    assert.equal(item.observed, null, '无观测行时 observed 恒 null（无观测 ≠ 无进程，旧 agentd/未跑 0022 同样形状）');
     assert.ok(item.id, 'id 必给——没有它本单白做（POST /api/ports/:id/preview-ticket 要 UUID）');
     assert.match(item.hostname, /^alice-p-\d+\.fde\.erix\.vip$/);
     assert.equal(item.url, previewUrl(item.hostname, { publicBaseUrl: PUBLIC_BASE }));
@@ -749,6 +762,75 @@ test('listFdePreviewPorts：只列活行、port ASC、DTO 含 id（签票端点�
     assert.equal(item.exposure, 'private');
   }
   await assert.rejects(() => listFdePreviewPorts(store.pool(), { fdeId: null }), /fdeId required/);
+});
+
+// 观测层 MVP（迁移 0022）：列端点 DTO 附 `observed`（同端口新鲜观测行），陈旧观测不附。
+test('listFdePreviewPorts：observed 只附新鲜观测行；陈旧（>45s 窗口）/他人/池外端口的观测都不附', async () => {
+  const store = aliceSeed();
+  const fresh = new Date().toISOString();
+  const stale = new Date(Date.now() - 46_000).toISOString();
+  store.observations.push(
+    { fde_id: 'u-alice', port: 22001, pid: 412, cwd: '~/projects/shop', cmd: 'node vite', branch: 'feat-x', proc_started_at: fresh, observed_at: fresh },
+    { fde_id: 'u-alice', port: 22002, pid: 9, cwd: null, cmd: null, branch: null, proc_started_at: null, observed_at: stale },
+    { fde_id: 'u-bob', port: 22003, pid: 1, cwd: '~/projects/other', cmd: 'x', branch: null, proc_started_at: fresh, observed_at: fresh },
+  );
+  const items = await listFdePreviewPorts(store.pool(), { fdeId: 'u-alice' });
+  const byPort = new Map(items.map((i) => [i.port, i]));
+  assert.deepEqual(byPort.get(22001).observed, {
+    pid: 412, cwd: '~/projects/shop', cmd: 'node vite', branch: 'feat-x', started_at: fresh, observed_at: fresh,
+  }, '新鲜观测逐字段附到对应端口（started_at/observed_at 改名后的 DTO 形）');
+  assert.equal(byPort.get(22002).observed, null, '超出新鲜度窗口的观测不附（僵尸注解自动消失的读侧一半）');
+  assert.equal(byPort.get(22003).observed, null, '别人的观测不混进本 FDE');
+});
+
+// 端口池外的真实监听（vite 5173 这类）：LEFT JOIN 不盖住 ⇒ 合成无地址只读行，
+// 否则「当前目录起了服务但面板说没有」。非项目目录（agentd 自己的 4000 等）不合成。
+test('listFdePreviewPorts：池外观测合成无地址行（~/projects 下）；非项目 cwd 与空 cwd 不合成', async () => {
+  const fresh = new Date().toISOString();
+  let calls = 0;
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM port_allocations')) {
+        calls += 1;
+        return { rows: [{ id: 'alloc-1', port: 22001, hostname: 'alice-p-22001.x', url: 'http://alice-p-22001.x', state: 'active', scope: 'fde', role: 'spare', exposure: 'private' }] };
+      }
+      if (sql.includes('FROM port_observations')) {
+        return { rows: [
+          { port: 5173, pid: 41, cwd: '~/projects/shop', cmd: 'node vite', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 8000, pid: 42, cwd: '/home/erix/projects/api', cmd: 'uvicorn', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 4000, pid: 7, cwd: '/opt/erix', cmd: 'node agentd.js', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 34107, pid: 1, cwd: null, cmd: null, branch: null, proc_started_at: null, observed_at: fresh },
+        ] };
+      }
+      throw new Error(`unexpected sql: ${sql}`);
+    },
+  };
+  const items = await listFdePreviewPorts(pool, { fdeId: 'u-alice' });
+  const byPort = new Map(items.map((i) => [i.port, i]));
+  assert.equal(calls, 1, '观测取数复用同一条查询（池外合成不新增 SQL，fake pool 零改动）');
+  assert.equal(byPort.get(22001).observed, null, '池内无观测行仍恒 null（合成不污染既有行形状）');
+  assert.equal(byPort.get(5173).id, 'observed:5173');
+  assert.equal(byPort.get(5173).url, null);
+  assert.equal(byPort.get(5173).hostname, null);
+  assert.equal(byPort.get(5173).state, 'observed');
+  assert.equal(byPort.get(5173).observed.cmd, 'node vite');
+  assert.equal(byPort.get(8000).observed.cmd, 'uvicorn', '未 sanitize 的绝对路径形（/home/<u>/projects/）同样合成');
+  assert.equal(byPort.get(4000), undefined, 'agentd 自己的内部口（非 ~/projects）不进列表');
+  assert.equal(byPort.get(34107), undefined, 'cwd 未知的观测不合成（不是用户的项目）');
+  assert.deepEqual([...byPort.keys()].sort((a, b) => a - b), [5173, 8000, 22001], '合并按 port 全局排序');
+});
+
+test('listFdePreviewPorts：观测表读失败（旧部署无表）⇒ 降级为全 null，列表照常', async () => {
+  const store = aliceSeed();
+  const pool = store.pool();
+  const orig = pool.query.bind(pool);
+  pool.query = async (sql, params) => {
+    if (/port_observations/.test(sql)) { const err = new Error('no such table'); err.code = '42P01'; throw err; }
+    return orig(sql, params);
+  };
+  const items = await listFdePreviewPorts(pool, { fdeId: 'u-alice' });
+  assert.equal(items.length, PREVIEW_PORT_COUNT);
+  for (const item of items) assert.equal(item.observed, null);
 });
 
 test('resolveFdeByName：命中回 {id, fde_name}，未知回 null（HTTP 层据此给 404 not_found）', async () => {
@@ -851,7 +933,7 @@ test('① GET /api/me/ports：只返回自己的活行、含 id、port ASC；adm
     assert.equal(body.items.length, PREVIEW_PORT_COUNT);
     assert.deepEqual(body.items.map((i) => i.port), FIRST_BLOCK, 'port ASC，且不含别人的行');
     for (const item of body.items) {
-      assert.deepEqual(Object.keys(item).sort(), ['exposure', 'hostname', 'id', 'port', 'role', 'scope', 'state', 'url']);
+      assert.deepEqual(Object.keys(item).sort(), ['exposure', 'hostname', 'id', 'observed', 'port', 'role', 'scope', 'state', 'url']);
       assert.match(item.id, /.*/, 'id 必给（前端签票用）');
     }
     assert.equal(pool.audit.length, 0, '本人读自己的端口不写 admin 审计');

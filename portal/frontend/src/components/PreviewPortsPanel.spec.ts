@@ -93,6 +93,12 @@ describe('PreviewPortsPanel · 列表渲染', () => {
     expect(wrapper.text()).toContain('「已放行过」只表示该端口首次凭证放行过');
   });
 
+  it('工作台紧凑形态不渲染放行语义注释（用户裁定：监听事实由观测注解回答，向业务用户解释黑话是噪音）', () => {
+    wrapper = mountPanel({ variant: 'list' });
+    expect(wrapper.find('[data-test="preview-port-row"]').exists()).toBe(true);
+    expect(wrapper.text()).not.toContain('「已放行过」只表示');
+  });
+
   it('未知 state 取值原样透传（不猜语义，也不误标成已放行过）', () => {
     wrapper = mountPanel({ items: [portItem('x', 22003, { state: 'released' })] });
     expect(wrapper.get('[data-test="preview-port-state"]').text()).toBe('未知状态（released）');
@@ -140,16 +146,15 @@ describe('PreviewPortsPanel · 加载中 / 空 / 失败三态', () => {
   });
 
   it('失败：显示错误码 + 服务端 message 原文 + 可重试（admin 没有 FDE 是空列表，不是失败）', async () => {
-    const onRetry = vi.fn();
     const error: PreviewApiError = {
       status: 401, code: 'unauthorized', message: '未登录或会话已过期', field: null,
     };
-    wrapper = mountPanel({ items: [], loaded: true, error, onRetry });
+    wrapper = mountPanel({ items: [], loaded: true, error });
     const alert = wrapper.get('[data-test="preview-ports-error"]');
     expect(alert.attributes('role')).toBe('alert');
     expect(alert.text()).toBe('预览端口加载失败（unauthorized）：未登录或会话已过期');
-    await wrapper.get('[data-test="preview-ports-retry"]').trigger('click');
-    expect(onRetry).toHaveBeenCalledTimes(1);
+    // 重试按钮已退场：列表自动轮询保鲜（usePreviewPorts 30s + 回前台即刷），错误无需人手点击
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
   });
 
   it('已有列表时失败：旧列表保留 + 错误条（不闪成空白）', () => {
@@ -216,14 +221,6 @@ describe('PreviewPortsPanel · 复制与兜底反馈', () => {
     expect(dirty).not.toContain('undefined');
   });
 
-  it('#256② 批量签票 429 同样带秒数（双语成对：en 也有对应键）', () => {
-    wrapper = mountPanel({
-      batchError: { status: 429, code: 'rate_limited', message: '预览 ticket 签发过于频繁', field: null, retryAfter: 5 },
-    });
-    expect(wrapper.get('[data-test="preview-batch-error"]').text())
-      .toBe('批量签发预览通行票失败（rate_limited）：预览 ticket 签发过于频繁（约 5 秒后可重试）');
-  });
-
   it('切到 English：表头与 state 文案同步换英文（仍不出现 healthy/running）', async () => {
     wrapper = mountPanel();
     setLocale('en');
@@ -270,9 +267,9 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
     expect(hostname.text()).toBe('alice-p-22000.fde.erix.vip');
     expect(hostname.attributes('title')).toBe('http://alice-p-22000.fde.erix.vip:8090（点击复制完整地址）');
     expect(hostname.classes()).toEqual(expect.arrayContaining(['truncate', 'min-w-0', 'w-full']));
-    // 紧凑形态不重复区块标题（折叠条已经写了「预览端口」），但保留重试入口
+    // 紧凑形态不重复区块标题（折叠条已经写了「预览端口」），也没有任何操作按钮
     expect(wrapper.text()).not.toContain('预览端口');
-    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
   });
 
   it('紧凑形态的「打开预览」是图标按钮：默认 title/aria-label=打开预览，签票中该行换「签发通行票…」且全部禁用', async () => {
@@ -310,8 +307,6 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
     for (const node of wrapper.findAll('[data-test="preview-port-state"]')) {
       expect(`${node.text()} ${node.attributes('title')}`).not.toMatch(/healthy|running/i);
     }
-    // 空态/错误文案与 table 形态同源（同一组件、同一份 i18n 键）
-    expect(wrapper.get('[data-test="preview-ports-retry"]').text()).toBe('Retry');
     setLocale('zh-CN');
   });
 
@@ -326,89 +321,156 @@ describe('PreviewPortsPanel · 侧栏紧凑形态（variant=list，issue #308）
 });
 
 // ---------------------------------------------------------------------------
-// issue #247 / #286：「打开全部预览」动作 + 面向人的 Cookie 告知 + 批量拦截兜底。
-// 判据：① 动作按钮双语成对、只在有行且允许时渲染、点击只 emit（面板不碰网络）；
-// ② 批量拦截兜底是**可点链接列表**（N 个 href 都带票，不静默）；
-// ③ 批量错误显示错误码 + 服务端原文；④ Cookie 告知双语成对、说的是「by design」不是 bug。
+// #247「打开全部预览」与 #286 Cookie 告知双双退出人侧界面：
+// 批量链是探测时代（分不清哪个口有服务 ⇒ 10 标签盲开）的遗产；Cookie 事实的读者是 agent。
 // ---------------------------------------------------------------------------
-describe('PreviewPortsPanel · 一键开整组（#247）与 Cookie 告知（#286）', () => {
-  it('「打开全部预览」渲染且只 emit open-all（面板自己不碰网络）', async () => {
-    const onOpenAll = vi.fn();
-    const fetchSpy = vi.fn();
-    vi.stubGlobal('fetch', fetchSpy);
-    wrapper = mountPanel({ onOpenAll });
-    const button = wrapper.get('[data-test="preview-open-all"]');
-    expect(button.text()).toBe('打开全部预览');
-    await button.trigger('click');
-    expect(onOpenAll).toHaveBeenCalledTimes(1);
-    expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('列表为空或管理台代看形态（showOpenAll=false）⇒ 不渲染该动作', () => {
-    wrapper = mountPanel({ items: [] });
-    expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
-    wrapper.unmount();
-
-    wrapper = mountPanel({ showOpenAll: false });
-    expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
-  });
-
-  it('批量签发中：按钮换成「批量签发中…」并禁用（防连点签两批）', () => {
-    wrapper = mountPanel({ batchBusy: true });
-    const button = wrapper.get('[data-test="preview-open-all"]');
-    expect(button.text()).toBe('批量签发中…');
-    expect((button.element as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it('弹窗拦截兜底：每个被拦的地址都给一个可点链接（href 带票，target=_blank/rel=noopener）', () => {
-    wrapper = mountPanel({
-      batchBlockedUrls: [
-        'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_B',
-        'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_C',
-      ],
-    });
-    const block = wrapper.get('[data-test="preview-batch-blocked"]');
-    expect(block.attributes('role')).toBe('status');
-    expect(block.text()).toContain('浏览器拦截了部分新标签');
-    const links = wrapper.findAll('[data-test="preview-batch-fallback-link"]');
-    expect(links).toHaveLength(2);
-    expect(links.map((link) => link.attributes('href'))).toEqual([
-      'http://alice-p-22001.fde.erix.vip:8090/?preview_ticket=pt_B',
-      'http://alice-p-22002.fde.erix.vip:8090/?preview_ticket=pt_C',
-    ]);
-    expect(links.map((link) => link.text())).toEqual([
-      'alice-p-22001.fde.erix.vip:8090',
-      'alice-p-22002.fde.erix.vip:8090',
-    ]);
-    for (const link of links) {
-      expect(link.attributes('target')).toBe('_blank');
-      expect(link.attributes('rel')).toBe('noopener');
-    }
-  });
-
-  it('批量失败：错误码 + 服务端原文（不吞成「操作失败」）', () => {
-    wrapper = mountPanel({
-      batchError: { status: 400, code: 'validation_failed', message: '一次最多签发 10 张预览票', field: 'allocation_ids' },
-    });
-    expect(wrapper.get('[data-test="preview-batch-error"]').text())
-      .toBe('批量签发预览通行票失败（validation_failed）：一次最多签发 10 张预览票');
-  });
-
-  it('#286 Cookie 告知：双语成对、说的是「边缘剥 Cookie / 用 Authorization / 不是故障」', async () => {
+describe('PreviewPortsPanel · 历史动作退场（#247 批量 / #286 Cookie 告知）', () => {
+  it('不再渲染「打开全部预览」与重试按钮（列表自动保鲜，盲开无存在理由）', () => {
     wrapper = mountPanel();
-    const notice = wrapper.get('[data-test="preview-cookie-notice"]').text();
-    expect(notice).toContain('Cookie');
-    expect(notice).toContain('Authorization');
-    expect(notice).toContain('不是故障');
-    expect(notice).not.toMatch(/bug|缺陷/i);
+    expect(wrapper.find('[data-test="preview-open-all"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="preview-ports-retry"]').exists()).toBe(false);
+  });
 
-    setLocale('en');
-    await wrapper.vm.$nextTick();
-    const english = wrapper.get('[data-test="preview-cookie-notice"]').text();
-    expect(english).toContain('Cookie');
-    expect(english).toContain('Authorization');
-    expect(english).toMatch(/by design, not a bug/);
-    expect(english).not.toMatch(/[\u4e00-\u9fff]/);
-    setLocale('zh-CN');
+  it('#286 Cookie 告知已退出人侧界面（技术事实只留在 agent 侧 ~/AGENTS.md，不进 UI）', () => {
+    wrapper = mountPanel();
+    expect(wrapper.find('[data-test="preview-cookie-notice"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('Cookie');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 观测层 MVP（迁移 0022）：`observed` 注解 + 同目录多实例警告 + 本目录优先排序。
+// 红线：无观测的行**不渲染任何反向文案**（null ≠ 空闲——旧 agentd/未跑迁移的部署也是 null）。
+// ---------------------------------------------------------------------------
+describe('观测层注解（observed）', () => {
+  const OBS_SHOP = {
+    pid: 412, cwd: '~/projects/shop', cmd: 'node vite.js', branch: 'feat-x',
+    started_at: new Date(Date.now() - 3 * 3_600_000).toISOString(),
+    observed_at: new Date().toISOString(),
+  };
+  const OBS_SHOP_FEAT = { ...OBS_SHOP, pid: 877, cwd: '~/projects/shop', branch: 'main' };
+  const OBS_OTHER = { ...OBS_SHOP, cwd: '~/projects/other', branch: null };
+
+  it('有观测 ⇒ 行内渲染 cwd/分支/起了多久；无观测的行不出现观测节点', async () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: OBS_SHOP }), portItem('b', 22001)],
+    });
+    const lines = wrapper.findAll('[data-test="preview-port-observed"]');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].text()).toContain('~/projects/shop');
+    expect(lines[0].text()).toContain('@feat-x');
+    expect(lines[0].text()).toMatch(/已运行 3h/);
+    expect(lines[0].attributes('title')).toContain('node vite.js');
+  });
+
+  it('同目录 ≥2 个监听 ⇒ 顶部警告点名两个端口（两个分支各占一口的现场）', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: OBS_SHOP }), portItem('b', 22001, { observed: OBS_SHOP_FEAT }), portItem('c', 22002, { observed: OBS_OTHER })],
+    });
+    const warn = wrapper.get('[data-test="preview-observed-duplicates"]').text();
+    expect(warn).toContain('~/projects/shop');
+    expect(warn).toContain('22000');
+    expect(warn).toContain('22001');
+    expect(warn).not.toContain('~/projects/other'); // 单实例目录不进警告
+  });
+
+  it('分组模式 ⇒ 按项目根分组：当前目录组排最前挂「当前目录」徽章，其余目录各成一组，池内未用收进「空闲」组', () => {
+    wrapper = mountPanel({
+      items: [
+        portItem('a', 22000, { observed: null }),
+        portItem('b', 22001, { observed: OBS_OTHER }),
+        portItem('c', 22002, { observed: OBS_SHOP }),
+      ],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
+    expect(headers).toEqual(['shop当前目录', 'other', '空闲（1）']);
+    expect(wrapper.find('[data-test="preview-port-group-current"]').exists()).toBe(true);
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22002', '22001', '22000']);
+    // 行文案：目录由分组头承担 ⇒ 行内只报 cmd/分支（能看出是 vite 还是后端）
+    expect(rows[0].get('[data-test="preview-port-observed"]').text()).toContain('node vite.js');
+    expect(rows[0].get('[data-test="preview-port-observed"]').text()).not.toContain('~/projects/shop');
+  });
+
+  it('当前目录无在用端口 ⇒ 不挂「当前目录」徽章、不谎报；空闲组照旧（池内未用 ≠ 无地址）', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: null }), portItem('b', 22001, { observed: OBS_OTHER })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    expect(wrapper.find('[data-test="preview-port-group-current"]').exists()).toBe(false);
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
+    expect(headers).toEqual(['other', '空闲（1）']);
+  });
+
+  it('旧后端（DTO 无 observed 键）⇒ **不过滤**，全量展示与改动前同形', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000), portItem('b', 22001)], // 无 observed 键 = 未跑 0022
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+    });
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(2);
+    expect(wrapper.find('[data-test="preview-ports-others-toggle"]').exists()).toBe(false);
+  });
+
+  it('不传 currentCwd（管理台代看）⇒ 不过滤，只做「有观测优先」，组内维持 port ASC', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000), portItem('b', 22001, { observed: OBS_OTHER }), portItem('c', 22002)],
+      scope: 'fde',
+      fdeName: 'bob',
+    });
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22001', '22000', '22002']);
+    expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(0);
+  });
+
+  it('子目录归并：observed 在 ~/projects/shop/frontend 的行归进 shop 组并挂「当前目录」徽章', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: { ...OBS_SHOP, cwd: '~/projects/shop/frontend' } })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]');
+    expect(headers).toHaveLength(1);
+    expect(headers[0].text()).toContain('shop');
+    expect(headers[0].find('[data-test="preview-port-group-current"]').exists()).toBe(true);
+  });
+
+  it('端口池外的观测合成行（url=null）：可识别在用，但无打开/复制按钮，只有说明句', () => {
+    wrapper = mountPanel({
+      items: [portItem('observed:5173', 5173, {
+        hostname: null, url: null, state: 'observed', observed: { ...OBS_SHOP, cwd: '~/projects/shop' },
+      })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    expect(wrapper.find("[data-test=\"preview-port-group-current\"]").exists()).toBe(true);
+    const row = wrapper.get('[data-test="preview-port-row"]');
+    expect(row.find('[data-test="preview-port-open"]').exists()).toBe(false);
+    expect(row.find('[data-test="preview-port-hostname"]').exists()).toBe(false);
+    expect(row.get('[data-test="preview-port-unrouted"]').text()).toContain('端口');
+  });
+
+  it('双面板分工（用户裁定）：端口池面板只收 url 行；池外合成行归进程面板 ⇒ 池面板永不见「未知状态」', () => {
+    const all = [
+      portItem('a', 22000, { observed: OBS_OTHER }),
+      portItem('observed:5173', 5173, { hostname: null, url: null, state: 'observed', observed: OBS_SHOP }),
+    ];
+    // 池面板：SidebarPanel 传的是 poolItems（url 非空）——这里模拟其子集
+    wrapper = mountPanel({ items: all.filter((i) => i.url), currentCwd: '~/projects/shop', variant: 'list', groupByProject: true });
+    expect(wrapper.text()).not.toContain('5173');
+    expect(wrapper.text()).not.toContain('未知状态');
+    // 进程面板：groupByProject 过滤后两行都在，各自归组；合成行仍无按钮只有说明句
+    wrapper = mountPanel({ items: all, currentCwd: '~/projects/shop', variant: 'list', groupByProject: true });
+    const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
+    expect(headers).toEqual(['shop当前目录', 'other']);
+    const unrouted = wrapper.get('[data-test="preview-port-unrouted"]');
+    expect(unrouted.text()).toContain('端口');
   });
 });

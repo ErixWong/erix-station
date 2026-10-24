@@ -26,6 +26,7 @@ import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
 import FilePreviewModal from './FilePreviewModal.vue';
 import NewDirectoryModal from './NewDirectoryModal.vue';
+import { groupByProject } from '../lib/previewPorts';
 import PreviewPortsPanel from './PreviewPortsPanel.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
 import { usePreviewPorts } from '../composables/usePreviewPorts';
@@ -54,14 +55,29 @@ function onRefresh() {
 // #247 的批量签票同一条纪律：只在点「打开全部预览」时调 `openAllPreviews`（挂载不签、折叠不签）。
 // 折叠态是纯本地 ref，**不持久化**（不写 localStorage、不发后端），刷新后回到折叠。
 const ports = usePreviewPorts();
-const portsOpen = ref(false);
-const portCount = computed(() => ports.items.value.length);
-const portsToggleLabel = computed(() => {
-  if (ports.listError.value !== null) return t('previewPorts.toggleFailed');
-  return portCount.value > 0
-    ? t('previewPorts.toggleCount', { count: portCount.value })
-    : t('previewPorts.toggle');
+// ---- 双面板拆分（用户裁定）：端口池（地址维度）与进程监听（事实维度）各自分组展示 ----
+const poolOpen = ref(false);
+const procOpen = ref(false);
+
+/** 面板①端口池：有地址的行（合成行不属于池）。 */
+const poolItems = computed(() => ports.items.value.filter((item) => item.url));
+/** 观测可用判据：DTO 无 observed 键 = 旧后端 ⇒ 进程面板整段退场（null ≠ 空闲，不谎报）。 */
+const observationsAvailable = computed(() => ports.items.value.some((item) => 'observed' in item));
+/** 面板②进程监听：有观测且落在项目目录下的行（池内外都要）——分组逻辑复用 lib（组内 port ASC、组间字典序）。 */
+const procItems = computed(() => groupByProject(ports.items.value).flatMap((group) => group.items));
+
+const poolCount = computed(() => poolItems.value.length);
+const poolToggleLabel = computed(() => {
+  if (ports.listError.value !== null) return t('previewPorts.poolToggleFailed');
+  return poolCount.value > 0
+    ? t('previewPorts.poolToggleCount', { count: poolCount.value })
+    : t('previewPorts.poolToggle');
 });
+const procToggleLabel = computed(() =>
+  procItems.value.length > 0
+    ? t('previewPorts.procToggleCount', { count: procItems.value.length })
+    : t('previewPorts.procToggle'),
+);
 
 // load() 自带 try/catch/finally（失败落 listError），不会产生未捕获拒绝（AGENTS §4 / #281）。
 onMounted(() => { void ports.load(); });
@@ -347,37 +363,63 @@ function messageCountSuffix(s: Session): string {
          − 列表 mt-2 8px − 栈上限 384px ⇒ 列表仍有 ≈238/198px ≥ 120px 判据），overflow-y-auto 只这一层。
          子层（端口面板 / 目录树）一律不再自带 max-h/overflow ⇒ 不会出现嵌套滚动条抢滚轮。 -->
     <div data-test="sidebar-bottom-stack" class="mt-2 shrink-0 max-h-[50vh] overflow-y-auto">
-      <!-- ③-a 预览端口段（issue #308：从工作台顶栏搬入；默认折叠，与目录树各自独立开关） -->
+      <!-- ③-a 端口池段：地址维度——工位分到的预览地址按项目分组，谁在用一目了然；未用在收进「空闲」组 -->
       <div class="mt-1 border-t border-black/10 pt-2">
         <button
           type="button"
           data-test="preview-ports-toggle"
           class="flex w-full items-center gap-1.5 rounded px-1 py-[3px] text-left text-[11px] font-semibold tracking-[0.05em] hover:bg-black/5"
-          :aria-expanded="portsOpen"
+          :aria-expanded="poolOpen"
           aria-controls="preview-ports-disclosure"
-          @click="portsOpen = !portsOpen"
+          @click="poolOpen = !poolOpen"
         >
-          <span aria-hidden="true">{{ portsOpen ? '▾' : '▸' }}</span>
-          <span>{{ portsToggleLabel }}</span>
+          <span aria-hidden="true">{{ poolOpen ? '▾' : '▸' }}</span>
+          <span>{{ poolToggleLabel }}</span>
         </button>
         <!-- v-show（非 v-if）：面板常驻 DOM（#246 语义：折叠只是不占位）；票仍然只在点击时签 -->
-        <div v-show="portsOpen" id="preview-ports-disclosure" class="mt-1 min-w-0">
-          <p class="px-1 pb-1 text-[11px] leading-[1.5] text-black/50">{{ t('previewPorts.scopeHint') }}</p>
+        <div v-show="poolOpen" id="preview-ports-disclosure" class="mt-1 min-w-0">
           <PreviewPortsPanel
             variant="list"
-            :items="ports.items.value"
+            group-by-project
+            :items="poolItems"
+            :current-cwd="store.dirCwd"
             :loading="ports.loading.value"
             :loaded="ports.loaded.value"
             :error="ports.listError.value"
             :ticket-busy-id="ports.ticketBusyId.value"
             :ticket-error="ports.ticketError.value"
             :popup-blocked-url="ports.popupBlockedUrl.value"
-            :batch-busy="ports.batchBusy.value"
-            :batch-error="ports.batchError.value"
-            :batch-blocked-urls="ports.batchBlockedUrls.value"
-            @retry="ports.load()"
             @open="(item) => void ports.openPreview(item)"
-            @open-all="() => void ports.openAllPreviews()"
+          />
+        </div>
+      </div>
+
+      <!-- ③-a2 进程监听段：事实维度——容器里真有进程在听的端口（含池外口），按项目分组。
+           旧后端无观测（DTO 无 observed 键）⇒ 整段退场，不拿 null 谎报「没进程」。 -->
+      <div v-if="observationsAvailable" class="mt-1 border-t border-black/10 pt-2">
+        <button
+          type="button"
+          data-test="process-watch-toggle"
+          class="flex w-full items-center gap-1.5 rounded px-1 py-[3px] text-left text-[11px] font-semibold tracking-[0.05em] hover:bg-black/5"
+          :aria-expanded="procOpen"
+          aria-controls="process-watch-disclosure"
+          @click="procOpen = !procOpen"
+        >
+          <span aria-hidden="true">{{ procOpen ? '▾' : '▸' }}</span>
+          <span>{{ procToggleLabel }}</span>
+        </button>
+        <div v-show="procOpen" id="process-watch-disclosure" class="mt-1 min-w-0">
+          <PreviewPortsPanel
+            variant="list"
+            group-by-project
+            :items="procItems"
+            :current-cwd="store.dirCwd"
+            :loading="ports.loading.value"
+            :loaded="ports.loaded.value"
+            :error="ports.listError.value"
+            :ticket-busy-id="ports.ticketBusyId.value"
+            :empty-label="t('previewPorts.procEmpty')"
+            @open="(item) => void ports.openPreview(item)"
           />
         </div>
       </div>

@@ -74,11 +74,11 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
     // issue #308：侧栏紧凑形态的**短**标签与作用域说明行同样受这条红线约束（不能换个短词就写成「运行中」）
     const zhShort = Object.values(zhCN.previewPorts.stateShort as Record<string, string>);
     const enShort = Object.values(en.previewPorts.stateShort as Record<string, string>);
-    for (const text of [...zhValues, ...zhShort, zhCN.previewPorts.stateShortUnknown, zhCN.previewPorts.scopeHint, zhCN.previewPorts.stateHint, zhCN.previewPorts.title]) {
+    for (const text of [...zhValues, ...zhShort, zhCN.previewPorts.stateShortUnknown, zhCN.previewPorts.stateHint, zhCN.previewPorts.title]) {
       expect(text).not.toMatch(/健康/);
       expect(text).not.toMatch(/运行中/);
     }
-    for (const text of [...enValues, ...enShort, en.previewPorts.stateShortUnknown, en.previewPorts.scopeHint, en.previewPorts.stateHint, en.previewPorts.title]) {
+    for (const text of [...enValues, ...enShort, en.previewPorts.stateShortUnknown, en.previewPorts.stateHint, en.previewPorts.title]) {
       expect(text).not.toMatch(/healthy/i);
       expect(text).not.toMatch(/running/i);
     }
