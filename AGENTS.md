@@ -1528,7 +1528,9 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 
 **告知面**：`~/AGENTS.md` 那条「`node_modules` 每项目一份 → 用 pnpm store / npm cache 共享（`~/cache`）」改成「**已由镜像默认指到 `~/cache`**——不要把 store/cache 改到 `~/projects` 下，也不要在项目里建 `.pnpm-store`」。不改这句，agent 要么以为要自己配，要么反向把它挪回去。
 
-**基线**：根 **1430 / 1426 / 0 / 4**（基点 §8.49 / §8.50 都记的 **1426 / 1422 / 0 / 4**，净 **+4** = `dirs.test.js` +1、新 `portal/test/runner-image-cache-dir.test.js` +3）、runner **323/323** 不变、**前端零字节**。改动面：`portal/src/dirs.js`、`portal/src/materializer.js`、`runner/Dockerfile`、`docs/design/user-space.md` §4.2、`ISSUES.md` 条目→issue 对照表一行（无 issue，写明当日直修）、两个测试文件。
+**基线**：根 **1430 / 1426 / 0 / 4**（基点 §8.49 / §8.50 都记的 **1426 / 1422 / 0 / 4**，净 **+4** = `dirs.test.js` +1、新 `portal/test/runner-image-cache-dir.test.js` +3）、runner **323/323** 不变、**前端零字节**。
+
+**合并树复跑**（在 `origin/main` = `bf23258`〔含同期 merge 的 **#358 端口观测**〕上亲手跑，判绿 = 退出码）：根 **1441 / 1437 / 0 / 4**、runner **328 / 328**。⚠ 与本单声明基线的差额（根 +11、runner +5）**全部来自 #358，不是本单** —— 本单增量恒为根 +4 / runner 0 / 前端 0。改动面：`portal/src/dirs.js`、`portal/src/materializer.js`、`runner/Dockerfile`、`docs/design/user-space.md` §4.2、`ISSUES.md` 条目→issue 对照表一行（无 issue，写明当日直修）、两个测试文件。
 
 **主 agent 亲跑变异 3 条（每条先自证 `git diff` 非空操作）**：① 撤掉 `isListedDirName` 的非隐藏判定 ⇒ `dirs.test.js` **恰 1 条红**（新用例）；② 删掉告知句里的「别挪进 `~/projects`」⇒ **恰 1 条红**；③ 把 globalconfig 层挪到 `npm install` 之前 ⇒ **恰 1 条红在层序那条**，且附顺序自检（`npmrc@5148 < install@5479`）。⚠ **③ 的第一次尝试是假变异**：脚本按 `t.index('WORKDIR /opt/erix')` 取切点，而该锚点在文件里出现得**更早**（`j < i`）⇒ 切出一段重复文本、相对顺序根本没变 ⇒ 3 条全绿差点被当成判据。按 §8.24 先量「变异后两个锚点的实际偏移」重做才拿到红（这条纪律又一次自己抓到东西）。
 
