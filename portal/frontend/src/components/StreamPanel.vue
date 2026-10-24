@@ -11,6 +11,9 @@ import { getToolPreview, getToolResultSummary, formatDuration, isSpecialExecutio
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 // pi-web 风格：流式增量也走 markdown 渲染（渲染器先转义后格式化，半截 ``` 容错收尾）。
 import { renderMarkdown } from '../lib/markdown';
+// mermaid 图渲染（参考 pi-web MermaidBlock）：v-html 落定后对 ```mermaid 块做 DOM 后处理。
+// 只挂**终稿/部分正文**容器；流式增量不挂（pi-web 同口径：流式中不预览，防逐 chunk 重渲）。
+import { vMermaid } from '../directives/mermaid';
 // issue #282：消息级时刻（A 块）+ 流式气泡上的「已运行 Xs」心跳（B 块在 StreamPanel 的唯一落点；
 // 其余动量数字都在顶部常驻状态条 RunStatusBar 里，见工单「落点」）。
 import { formatMessageTime } from '../lib/messageTime';
@@ -235,7 +238,7 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
         :datetime="en.createdAt"
         :title="t('runStatus.messageTimeTitle')"
       >{{ msgTime(en) }}</time>
-      <div v-if="en.html" v-html="en.html"></div>
+      <div v-if="en.html" v-mermaid v-html="en.html"></div>
       <template v-else>{{ en.text }}</template>
     </div>
     <!-- 流式增量：markdown 容错渲染（v-html，渲染器先转义后格式化 XSS 安全），
@@ -257,7 +260,7 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
          修饰类做视觉区分——**不新增颜色语义**，更不进红色 .syserr（半截正文不是错误）。 -->
     <div v-else-if="en.kind === 'partial'" class="msg assistant md partial">
       <div class="partial-label mb-0.5 text-xs text-black/45">{{ t('stream.partialOutput.label') }}</div>
-      <div v-html="partialHtml(en.text)"></div>
+      <div v-mermaid v-html="partialHtml(en.text)"></div>
       <div v-if="en.truncated" class="partial-truncated mt-0.5 text-xs text-black/45">{{ t('stream.partialOutput.truncated') }}</div>
     </div>
     <!-- issue #189：折叠横幅（**独立视觉**：非 .msg 气泡，琥珀色左边框 + 虚线分隔条，绑定助手消息 id，
