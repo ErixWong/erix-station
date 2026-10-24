@@ -209,6 +209,7 @@ header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适�
 | — | 附带发现：预览要点 10 次票 | **#247** | **已修**（v0.1.27：`POST /api/me/ports/batch-tickets` 一次签 N 张 + 前端一键开 N 个标签；真机 0→1 请求开 10 标签。**票据仍是 host 级**，FDE 级单票要 DDL，未做） |
 | — | 崩溃恢复后账本 `partOf` 链式 | **#341** + 上游 **erix-agent #415** | 站内读侧已解（`c47a692`）；**引擎 resume 侧未修**，巡检/修数据见 `docs/ops/transcript-ledger-inspection.md` |
 | — | 附带发现（#277 验收中）：起跑前被取消的消息，下一个 run 会当待办重做 | **#346** | **open，待产品决策**（三个候选方向的代价已在 issue 里；不是缺陷：取消不撤销消息、也没留助手锚点 ⇒ 模型照上文做事是对的，但用户观感是「取消了又跑去睡 240 秒」） |
+| — | 附带发现（决策者 2026-10-24 口述）：目录下拉第一项是 `.pnpm-store`，真项目被顶掉 | 无 issue（当日直修） | **已修**（两层：`dirs.js` 下拉不列 `.` 开头目录 + `runner/Dockerfile` 把 npm/pnpm/corepack/pip 缓存默认钉到 `~/cache`；现网已热补，**镜像未重建**；台账 §8.50） |
 
 **非本文条目但同批推进的**：**#277**（停止无送达 / 停在 `queued` 的 run 卡死会话）**已关闭** —— v0.1.7 就发布了代码，缺的只是「run 停在队列里」的真机窗口，2026-10-23 在 v0.1.27 上造出来并逐项复验（`termination={"reason":"aborted","detail":"cancelled_before_start"}`、会话立即解锁 `202`）；顺带更正该单原判据措辞：出队是 `run_queue.status='cancelled'`，**不是物理删行**。见 issue 评论 `#issuecomment-6370402000`。
 
