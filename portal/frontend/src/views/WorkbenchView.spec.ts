@@ -30,6 +30,14 @@ const FDE_NO_SEAT = {
   id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null, auth_source: 'local',
 } as AuthUser;
 const DIRS = [{ name: 'demo', cwd: '~/projects/demo', running_count: 0, queued_count: 0 }];
+// issue #359 P0b：收工灯的默认夹具（已收工）。脏载荷由个别用例自己传进 mountWorkbench 第三参。
+const GIT_LIGHT_GREEN = {
+  light: 'green', reason: 'synced', primary: null, cwd: '~/projects/demo',
+  repos: [{ rel: '', repo: 'demo', light: 'green', reason: 'synced', shell: false, branch: 'main',
+    no_commits: false, tracked_count: 0, untracked_count: 0, truncated: false, push_state: 'synced' }],
+  counts: { red: 0, yellow: 0, grey: 0, green: 1 }, partial: false, git_available: true,
+  truncated_repos: 0, checked_at: '2026-10-24T08:00:00.000Z',
+};
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -47,7 +55,7 @@ beforeEach(() => {
 });
 
 /** 挂载工作台（目录列表经 fetch 桩注入；会话列表恒为空）。 */
-async function mountWorkbench(user: AuthUser = FDE_USER, dirs = DIRS) {
+async function mountWorkbench(user: AuthUser = FDE_USER, dirs = DIRS, gitLightBody: unknown = GIT_LIGHT_GREEN) {
   const pinia = createPinia();
   setActivePinia(pinia);
   // 按 URL 分派的 fetch 桩（先于 router.push：导航守卫会打 /api/me）。
@@ -56,6 +64,8 @@ async function mountWorkbench(user: AuthUser = FDE_USER, dirs = DIRS) {
     if (url.startsWith('/api/me')) return jsonResponse({ user });
     if (url.startsWith('/api/dirs')) return jsonResponse({ dirs });
     if (url.startsWith('/api/sessions')) return jsonResponse({ items: [] });
+    // issue #359 P0b：收工灯（默认给"已收工"，个别用例自己换成脏载荷）
+    if (url.startsWith('/api/git-light')) return jsonResponse(gitLightBody);
     return jsonResponse({});
   }));
   const auth = useAuthStore();
@@ -307,5 +317,74 @@ describe('issue #281：onMounted 的 await 失败 ⇒ 零未捕获拒绝 + 界�
     expect(line).toContain('HTTP 500');
     expect(line).not.toContain('[object Object]');
     expect(leaked.map(describeRejection), `泄漏 ${leaked.length} 条未捕获拒绝`).toEqual([]);
+  });
+});
+
+// ---- issue #359（决策 §7 D9）P0b：顶栏收工灯的**接线**（判色与文案在各自 spec，这里只钉"接没接上"）----
+describe('顶栏收工灯接线（#359 P0b）', () => {
+  const lightCalls = () =>
+    (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]))
+      .filter((u) => u.startsWith('/api/git-light'));
+
+  it('选了目录 ⇒ 顶栏出现灯，且打的是 /api/git-light?cwd=<当前目录>', async () => {
+    const wrapper = await mountWorkbench();
+    expect(wrapper.find('[data-test="git-light"]').exists()).toBe(true);
+    expect(lightCalls()).toEqual(['/api/git-light?cwd=' + encodeURIComponent('~/projects/demo')]);
+  });
+
+  it('没选目录 ⇒ 灯不出现，也一个 git-light 请求都不发', async () => {
+    const wrapper = await mountWorkbench(FDE_USER, []);
+    expect(wrapper.find('[data-test="git-light"]').exists()).toBe(false);
+    expect(lightCalls()).toEqual([]);
+  });
+
+  it('一个 run 结束（running 从 true 落 false）⇒ 立刻重判——用户刚让 AI 干完活，不能等 30s 轮询', async () => {
+    const wrapper = await mountWorkbench();
+    const store = useWorkbenchStore();
+    const before = lightCalls().length;
+    store.es.activeRunId = 'run-1';
+    await tick();
+    expect(lightCalls().length).toBe(before); // 起跑本身不重判（跑的过程中判了也是脏结果）
+    store.es.activeRunId = null;
+    await tick();
+    expect(lightCalls().length).toBeGreaterThan(before);
+    void wrapper;
+  });
+
+  it('切目录 ⇒ 先作废旧结论再按新目录发（旧目录的绿不得顶到新目录头上）', async () => {
+    const wrapper = await mountWorkbench();
+    const store = useWorkbenchStore();
+    expect(wrapper.get('[data-test="git-light-label"]').text()).toBe('已收工'); // 夹具是"已收工"
+    const before = lightCalls().length;
+    // 新目录的请求**故意挂住不回**：这时界面上该看见"没结论"，而不是旧目录的绿
+    // （变异取证：把接线里的 `gitLight.reset()` 删掉，这条会红——标签仍是"已收工"）。
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith('/api/git-light')) return new Promise<Response>(() => {});
+      return jsonResponse({});
+    }));
+    store.dirCwd = '~/projects/other';
+    await tick();
+    expect(wrapper.get('[data-test="git-light-label"]').text()).not.toContain('已收工');
+    const urls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+    expect(urls[urls.length - 1]).toBe('/api/git-light?cwd=' + encodeURIComponent('~/projects/other'));
+    void before;
+    void wrapper;
+  });
+
+  it('「让 AI 收尾」只把话填进输入框，**不发送**（发送 = 一次 run）', async () => {
+    const wrapper = await mountWorkbench(FDE_USER, DIRS, {
+      ...GIT_LIGHT_GREEN,
+      light: 'red', reason: 'untracked',
+      repos: [{ rel: 'svc', repo: 'svc', light: 'red', reason: 'untracked', shell: false, branch: 'main',
+        no_commits: false, tracked_count: 0, untracked_count: 2, truncated: false, push_state: 'unknown' }],
+    });
+    const store = useWorkbenchStore();
+    await wrapper.get('[data-test="git-light-badge"]').trigger('click');
+    await wrapper.get('[data-test="git-light-finish"]').trigger('click');
+    const text = store.inputValue;
+    expect(text).toContain('svc');
+    expect(text.length).toBeGreaterThan(10);
+    expect(store.entries.length).toBe(0); // 没往消息流里塞任何东西 = 没发送
   });
 });
