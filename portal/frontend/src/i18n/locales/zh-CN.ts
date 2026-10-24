@@ -375,12 +375,7 @@ export const zhCN = {
     openAction: '打开预览',
     signing: '签发通行票…',
     // issue #247：一键开整组（一次点击 = 签 + 开；不做二次确认——票 60 秒过期）
-    openAllAction: '打开全部预览',
-    batchSigning: '批量签发中…',
-    batchFailed: '批量签发预览通行票失败（{code}）：{message}',
     // issue #256 交付②：429/503 带 Retry-After 时把「多久后重试」说成秒数（缺头走上面不带秒数的键）
-    batchFailedRetry: '批量签发预览通行票失败（{code}）：{message}（约 {seconds} 秒后可重试）',
-    batchBlocked: '浏览器拦截了部分新标签，逐个点开：',
     // issue #286：面向**人**的 Cookie 告知（边缘整体剥 Cookie 头是 by design，不是 bug；
     // 工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知）
     hostnameCopyTitle: '{url}（点击复制完整地址）',
@@ -402,7 +397,6 @@ export const zhCN = {
     // issue #308 §3.4：端口是工位级资源；观测 MVP 后工作台视图按当前目录过滤——文案说真实行为。
     // 人侧文案面向不懂技术的业务用户：不出现端口/进程/监听这类词，只说动作层能执行的话；
     // 技术事实（Cookie 剥除、端口角色等）一律留在 agent 侧 ~/AGENTS.md，不进 UI。
-    scopeHint: '这些地址跟着你的工位走；列表只显示当前目录里正在运行的项目。',
     // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
     observedHere: '当前目录在用',
     observedTitle: '正在使用这个地址的程序',

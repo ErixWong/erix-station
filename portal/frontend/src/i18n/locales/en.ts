@@ -359,12 +359,7 @@ export const en = {
     signing: 'Issuing ticket…',
     // issue #247: open the whole group at once (one click = sign + open; no confirmation dialog,
     // because tickets expire in 60 seconds)
-    openAllAction: 'Open all previews',
-    batchSigning: 'Issuing tickets…',
-    batchFailed: 'Failed to issue the preview tickets in bulk ({code}): {message}',
     // issue #256 delivery 2: when 429/503 carries Retry-After, say how many seconds to wait
-    batchFailedRetry: 'Failed to issue the preview tickets in bulk ({code}): {message} (retry in about {seconds}s)',
-    batchBlocked: 'The browser blocked some new tabs; open them one by one:',
     // issue #286: human-facing cookie notice (the edge stripping Cookie is by design, not a bug;
     // agents inside the workspace are told by rule 7 in the container's ~/AGENTS.md, humans are told here)
     hostnameCopyTitle: '{url} (click to copy the full URL)',
@@ -384,7 +379,6 @@ export const en = {
     },
     stateShortUnknown: 'Unknown',
     // 人侧文案面向不懂技术的业务用户：不出现端口/进程/监听这类词（口径与 zh-CN 一致）。
-    scopeHint: 'These addresses belong to your workstation; the list shows only projects live in the current directory.',
     // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
     observedHere: 'Running here',
     observedTitle: 'Program using this address',

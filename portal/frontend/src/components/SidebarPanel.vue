@@ -362,7 +362,7 @@ function messageCountSuffix(s: Session): string {
         </button>
         <!-- v-show（非 v-if）：面板常驻 DOM（#246 语义：折叠只是不占位）；票仍然只在点击时签 -->
         <div v-show="portsOpen" id="preview-ports-disclosure" class="mt-1 min-w-0">
-          <p class="px-1 pb-1 text-[11px] leading-[1.5] text-black/50">{{ t('previewPorts.scopeHint') }}</p>
+          <!-- 无前言：列表只画当前目录在用的端口，空态自己会说话（scopeHint 作为废话被用户裁定退场） -->
           <PreviewPortsPanel
             variant="list"
             :items="ports.items.value"
@@ -373,12 +373,7 @@ function messageCountSuffix(s: Session): string {
             :ticket-busy-id="ports.ticketBusyId.value"
             :ticket-error="ports.ticketError.value"
             :popup-blocked-url="ports.popupBlockedUrl.value"
-            :batch-busy="ports.batchBusy.value"
-            :batch-error="ports.batchError.value"
-            :batch-blocked-urls="ports.batchBlockedUrls.value"
-            @retry="ports.load()"
             @open="(item) => void ports.openPreview(item)"
-            @open-all="() => void ports.openAllPreviews()"
           />
         </div>
       </div>
