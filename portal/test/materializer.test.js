@@ -221,6 +221,26 @@ test('buildFilePlan：下发 ~/bin/github-pinproxy.py 且归入平台管理路�
   }
 });
 
+// issue #359 P0c：`~/AGENTS.md` 的 git 段必须写「收工纪律」——工作台的 git 状态灯（D9）是给用户看的，
+// 容器里的 agent 看不见灯；不把要求写进它读的那份，就没人真正把改动落进 git（平台零 git 写操作，
+// `worker.js:270` 只 init 不 commit）⇒ 灯会长期红/黄而 AI 完全不主动收工。本测试钉三条要求的**语义**，
+// 改字可以、改口径不行。
+test('renderHomeAgentsMd：git 段必须有收工纪律（#359 P0c：平台不代提交，靠 agent 提交）', () => {
+  const md = renderHomeAgentsMd({ fdeName: 'alice' });
+  // ① 平台不代提交 + 只 init（对齐 worker.js ensureGitRepo 的真实行为，不得写成“平台会替你提交”）
+  assert.match(md, /不替你提交/, '必须声明平台不代提交');
+  // ② 收工即 commit / push，且**未跟踪与已修改同罪**（#359 §1 裁定的根口径）
+  assert.match(md, /收工即提交/);
+  assert.match(md, /git commit/);
+  assert.match(md, /git push/);
+  assert.match(md, /未跟踪/);
+  // ③ 多仓库逐个提交：不写这句，agent 会在父目录（#359 §4.0 的空壳仓库）提交而自认为已完事
+  assert.match(md, /逐个仓库/);
+  assert.match(md, /不包含/);
+  // ④ 无远端 ⇒ 提醒用户配（不写则黄态永远无法转为绿）
+  assert.match(md, /还没有远端/);
+});
+
 // ---------------------------------------------------------------------------
 // issue #257 + #258（工单 feat-261012-01）+ #262（工单 fix-261012-02）：`~/AGENTS.md` = 平台约束的**单一真相**。
 // 为什么钉这一节：真机演练（docs/ops/drill-2026-10-12.md §三）里，一个最普通的前后端分离应用要
