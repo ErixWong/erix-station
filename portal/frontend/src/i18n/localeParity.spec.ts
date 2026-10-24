@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { en } from './locales/en';
 import { zhCN } from './locales/zh-CN';
 import { PREVIEW_PORT_STATES } from '../lib/previewPorts';
+import { KNOWN_GIT_LIGHT_REASONS } from '../lib/gitLight';
 
 const CJK = /[\u4e00-\u9fff]/;
 
@@ -224,5 +225,62 @@ describe('预览端口 state 的双语键集（§4.7a：只列 allocated / activ
     expect(zh.judgeAxes).toContain('{axes}');
     expect(enEv.judgeAxes).toContain('{axes}');
     expect(zh.judgeAxes).not.toContain('{action}');
+  });
+});
+
+// issue #359（决策 §7 D9）P0b：收工灯文案的语义红线。**为什么不只钉键集**：这颗灯的全部价值在于
+// 一句话——"你的活儿被 git 保护住了吗"。文案一旦漂成"远端是最新的 / 自动提交 / ⚠ 错误"，
+// 承诺就假了（绿是承诺、红是日常态、平台零 git 写）。键集对齐由上面第一条统一兜住。
+describe('收工灯 gitLight.* 的语义红线（#359 / D9）', () => {
+  const zhLight = zhCN.gitLight as unknown as Record<string, Record<string, string>>;
+  const enLight = en.gitLight as unknown as Record<string, Record<string, string>>;
+
+  it('reason 键集合与 lib 的已知表**逐字一致**（加 reason 不补文案、或文案漏进 unknown，都会红）', () => {
+    expect(Object.keys(zhLight.reason).sort()).toEqual([...KNOWN_GIT_LIGHT_REASONS].sort());
+    expect(Object.keys(enLight.reason).sort()).toEqual([...KNOWN_GIT_LIGHT_REASONS].sort());
+  });
+
+  it('绿不许承诺"远端是最新的"：必须说"与你已知的远端一致"（同事推的你没 fetch 就看不见）', () => {
+    expect(zhLight.reason.synced).toContain('已知');
+    expect(enLight.reason.synced).toMatch(/as your machine knows it/);
+    expect(zhLight.reason.synced).not.toMatch(/远端是最新|远端最新|已是最新/);
+    expect(enLight.reason.synced).not.toMatch(/remote is up to date|latest/i);
+    expect(zhLight.tip.greenHonest).toContain('fetch');
+    expect(enLight.tip.greenHonest).toMatch(/not fetched/);
+  });
+
+  it('红是日常态不是警报：标签与原因里不出现 ⚠，也不说"错误/失败"', () => {
+    expect(zhLight.label.red).toBe('未落地');
+    expect(zhLight.label.red).not.toMatch(/错误|失败|警告/);
+    expect(enLight.label.red.toLowerCase()).not.toMatch(/error|fail|warn/);
+    for (const [locale, group] of [['zh-CN', zhLight], ['en', enLight]] as const) {
+      for (const [name, bag] of Object.entries(group)) {
+        for (const [key, value] of Object.entries(bag)) {
+          expect(`${name}.${key}`, `${locale} 键名`).toBeTruthy();
+          if (typeof value === 'string') {
+            expect(value, `${locale} gitLight.${name}.${key} 不得出现告警符`).not.toContain('⚠');
+          }
+        }
+      }
+    }
+  });
+
+  it('动作只预填不发送：口径必须写在界面上（发出去就是一次 run，不能让用户以为是自动提交）', () => {
+    expect(zhLight.action.finishHint).toMatch(/输入框/);
+    expect(zhLight.action.finishHint).toMatch(/不替你发送/);
+    expect(enLight.action.finishHint).toMatch(/fills the composer/i);
+    expect(enLight.action.finishHint).toMatch(/does not send/i);
+    // 预填文本必须给 AI 指名目标与"别漏未跟踪"（D9：未跟踪与未提交同样零保护）
+    expect(zhLight.prefill.finish).toContain('{repos}');
+    expect(zhLight.prefill.finish).toMatch(/未跟踪/);
+    expect(enLight.prefill.finish).toContain('{repos}');
+    expect(enLight.prefill.finish).toMatch(/untracked/i);
+  });
+
+  it('未检查完必须说出来（partial 的口径是"按未知处理"，不是"已收工"）', () => {
+    expect(zhLight.tip.partial).toMatch(/未知/);
+    expect(enLight.tip.partial).toMatch(/unknown/i);
+    expect(zhLight.label.grey).toBe('未检查');
+    expect(enLight.label.grey.toLowerCase()).toContain('unchecked');
   });
 });

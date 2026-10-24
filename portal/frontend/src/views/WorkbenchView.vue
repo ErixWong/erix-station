@@ -17,6 +17,9 @@ import RunStatusBar from '../components/RunStatusBar.vue';
 import ComposerBar from '../components/ComposerBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
+// issue #359（决策 §7 D9）P0b：顶栏「收工灯」——只回答“你的活儿被 git 保护住了吗”，平台零 git 写。
+import GitLightBadge from '../components/GitLightBadge.vue';
+import { useGitLight } from '../composables/useGitLight';
 import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
 
 // issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
@@ -145,6 +148,32 @@ async function copyCwd() {
   } catch { /* 剪贴板不可用（非安全上下文等）：静默降级，title 仍可看全路径 */ }
 }
 
+// ---- issue #359 P0b：收工灯（数据层 useGitLight，显示口径 lib/gitLight.ts）----
+// 刷新时机（**没有轮询以外的定时器**除外：composable 自带 30s 兵底 + 回前台即刷）：
+//   ① 切目录 ⇒ 先 reset 再拉（旧目录的绿不得顶到新目录头上）；
+//   ② **一个 run 结束的那一刻**（running 从 true 落 false）⇒ 重判——这是灯最需要新鲜的时刻，
+//      用户刚让 AI 干完活，30s 轮询的拖尾在这里不可接受；
+//   ③ onMounted 拉一次（initWorkspace 之后才有 dirCwd，所以给 watch 加 immediate）。
+const gitLight = useGitLight({ cwd: () => store.dirCwd });
+watch(
+  () => store.dirCwd,
+  (cwd) => {
+    gitLight.reset();
+    if (cwd) void gitLight.load();
+  },
+  { immediate: true },
+);
+watch(
+  () => store.running,
+  (now, prev) => {
+    if (prev && !now) void gitLight.load();
+  },
+);
+/** 「让 AI 收尾」/「问 AI」都只预填不发送（发送 = 一次 run，烧容量与 token，得用户自己按）。 */
+function onGitLightPrefill(text: string) {
+  store.inputValue = text;
+}
+
 // ---- issue #55 A2：自动跟随 + 「↓ 最新」悬浮按钮（AUTO_FOLLOW_GAP=80）----
 const streamEl = ref<HTMLElement | null>(null);
 const autoFollow = ref(true);
@@ -207,6 +236,16 @@ function jumpToLatest() {
         :title="t('workbench.cwdCopyTitle', { cwd: store.dirCwd })"
         @click="copyCwd"
       >📁 {{ dirShortName }}<span v-if="copied" class="text-black/40"> {{ t('common.copied') }}</span></button>
+      <!-- issue #359 P0b：收工灯（颜色不承重：旁边就有文字；完整口径在 title/aria-label） -->
+      <GitLightBadge
+        v-if="store.dirCwd"
+        :payload="gitLight.payload.value"
+        :loading="gitLight.loading.value"
+        :error="gitLight.error.value"
+        :cwd="store.dirCwd"
+        @refresh="gitLight.load()"
+        @prefill="onGitLightPrefill"
+      />
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
       <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">{{ t('common.adminConsole') }}</router-link>
       <LocaleSwitch />

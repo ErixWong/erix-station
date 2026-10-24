@@ -124,7 +124,7 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 
 - D1 Traefik 作 ingress；D2 SSO + 本地 break-glass admin；D3 每 FDE 仅自己的 `/29` 独立网络（`control` 共享网络已取消，H-B 定稿 issue #5）
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
-- D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree
+- D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree（**已修订**，见下方 D8 修订段）；D9 目录 git 状态 = 一颗红/黄/绿灯（见下方 D9 段，issue #359）
 
 ## 7. D8 修订（2026-09-24，决策者拍板）：cwd 直达项目目录，拆除 worktree
 
@@ -140,6 +140,28 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - **代价与边界**：agent 弄脏项目由用户 git 自治（工位语义本就如此）；将来真要并行同项目，
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
+
+## 7. D9（2026-10-24，决策者拍板，issue #359）：目录 git 状态只以「红/黄/绿」一颗灯呈现
+
+- **语义**：灯 = **收工进度**，一句话给用户的判据是「**每天忙完之后要保证它是绿的**」。
+  🔴 未落地（未提交 / 未跟踪 / 0 提交但有内容）→ 🟡 未推送（有提交未推 / 无远端 / 从未 fetch）
+  → 🟢 已收工；⚪ 读不到或未查完——**⚪ 不得渲染成绿**（绿是承诺，没扫完就没资格承诺）。
+- **理由**：git 细节对专业人士是噪音（他自己会问 AI），对非专业人士是噪音加噪音。界面只承载
+  「这个目录的工作有没有被 git 兜住」这一件事。**未跟踪与未提交同罪**（都是零兜底），故同归于红；
+  红是进度不是警报（agent 一改就红，直到收工），所以措辞用状态词、不给 `⚠` 与告警底色。
+- **边界**：portal **零 git 写操作**（不 init / 不 commit / 不 push / 不 checkout / 不代 clone，
+  与 D-「平台不 clone」同口径），写一律走 run = 界面上的「让 AI 收尾」（只**预填**输入框不自动发：
+  发 run 占 capacity 且花 token）。搞不清就「问 AI」——**每个态都留这条兜底**，这是闭环的最后一环。
+  唯一保留的 git 细节是「**仓库名**」，因为预填给 AI 的话必须指名目标仓库（一个目录多个仓库是真实现状）。
+- **数据源**：宿主 portal 直读 `<userSpaceRoot>/<fde>/projects/<dir>/.git`（与 `/api/dirs`、`/api/files/tree`
+  同一条 bind mount 通道）；一个仓库 = 一条 `git status --porcelain -uall` + 三次纯文本读 sha。
+  ⚠ **不得用 `-uno`**（实测它让 0 提交的根仓库对三个脏子仓库报空输出、rc=0，自认干净 ⇒ 直接撒谎）。
+  成本上界靠 `.gitignore` 剪枝 + stdout 流式数到 50 即 kill + 2s 超时（超时落 ⚪）。
+- **不做什么**：分支列表/分支数、detached、worktree/子模块结构、最后提交时刻、↑N/↓N、diff 内容、
+  inotify 事件源——全不做（理由与实测记录在 issue #359 正文与附录）。
+- **告知面先行**：D9 的**产品闭环**要求容器里的 agent 真会「收工即提交」，而它看不见灯 ⇒
+  要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
+  「灯长期红/黄、而没人负责让它变绿」。
 
 ## 8. erix-agent 依赖与升级（当前 pin：**0.20.0**，2026-10-15 由 #299 从 0.18.0 两步升上；历史 0.14–0.18 记录见下）
 
@@ -1593,3 +1615,167 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 **遗留**：上游 [erix-agent #458](https://github.com/ErixWong/erix-agent/issues/458)（把「宿主 `load()` 必须返回折叠后形状」
 从散文变成 exports + 契约判据）、[#415](https://github.com/ErixWong/erix-agent/issues/415)（写侧别再写链，落地并升 pin 后
 **两份镜像的解链闸要同时撤**——`runner/test/store-load-fold.test.js` 与 `portal/test/transcript-fold.test.js` 的源码级哨兵会红提示）。
+### 8.53 收工纪律进 `~/AGENTS.md`：D9 的告知面先行（issue #359 P0c，2026-10-24，分支 `feat-261024-05-git-light-agents-md`）
+
+**交付的只有 D9（§7）的告知面，灯本身没做**：`renderHomeAgentsMd` 的 `## git` 段从 2 行扩到 5 行——
+①「平台不 clone、不下发凭据，**也不替你提交**：首次运行只对还不是仓库的目录执行一次 `git init -b main`」
+②「**收工即提交**：任务完成（含新建/修改的文件，未跟踪的与改过的同样算没兜底）就 `git commit`，有远端就 `git push`」
+③「**一个目录里有多个仓库就逐个仓库分别提交**：父目录的仓库**不包含**子目录里的仓库，在父目录提交是白干的」
+④「目录还没有远端 ⇒ 提醒用户自行配置」。`portal/test/materializer.test.js` 加 1 条用例钉这四条**语义**（改字可以，改口径不行）。
+
+**为什么告知面要先走**：容器里的 agent **看不见灯**，而平台零 git 写操作（`worker.js:270 ensureGitRepo` 只 init 不 commit）
+⇒ 不先把要求写进它读的 `~/AGENTS.md`，灯上线后就是「把问题摆给用户，却没人负责让它变绿」。顺序反了 D9 就不闭环。
+③ 那句还顺手堵住 #359 §4.0 那个「空壳根仓库」的坑——它是在 AI 侧阻止事故，比在 UI 侧提示便宜。
+
+**生效路径（与 §8.50 那条「镜像未重建」不同类，值得单独记）**：materializer 跑在 **portal 进程内**，
+`isPlatformManagedPath` 认 `home/AGENTS.md` 是平台文件（`materializer.test.js` 那条钉着）⇒ **portal 发布后
+下一次 reconcile 重写** `<userSpaceRoot>/<fde>/home/AGENTS.md`，经 bind mount 立即可见于容器
+⇒ **不需要重建 FDE 镜像、不需要 recreate 容器、不打断正在跑的 run**。
+
+**基线**：基点 `origin/main` `1655d7a` **1445 / 1441 / 0 / 4** → 本次 **1446 / 1442 / 0 / 4**，**净 +1**
+（本次 diff 里 `^+test(` 计数 = 1，可校），`npm test` **rc=0**（判绿看退出码，§4.1）；`runner/` 与 `portal/frontend/` **零字节**。
+
+**未做 / 待决**：
+- **P0a**（`portal/src/gitlight.js` 三判据 + `GET /api/git-light?cwd=`）、**P0b**（顶栏灯 + `让 AI 收尾` 预填 + `问 AI` 兜底 + zh/en）都在 #359 挂着，**灯现在界面上不存在**。
+- **未发版**（不进任何版本承诺，等决策者定窗口）。
+- ⚠ 给接手 P0a 的 session：**动手前先读 #359 附录那 6 条实测**——尤其「`-uno` 会让 0 提交根仓库对脏子仓库报空输出（撒谎）」、「本机 `-u` 与 `-uall` 逐字相同、`.gitignore` 会剪掉整棵 `node_modules`」、「linked worktree 的 refs 在 `commondir` 而不是 `.git` 文件指向的目录」。**`listeners.js:112-126` 没处理 `commondir`，照抄会错。**
+
+**顺带挖到的仓库级坑（与本单无关，未动，只登记）**：`origin/main` 的 `1655d7a` 把 **`node_modules` 当文件提交成了指向它自己的符号链接**
+（`git ls-files -s` 是 mode `120000`，内容 = `/home/adminwange/projects/fde_station/erix-station/node_modules`；`file` 报 *broken symbolic link*）。
+后果：**任何新 checkout / 切分支到该 tip 之后，`npm test` 直接 `ERR_MODULE_NOT_FOUND: Cannot find package 'erix-agent'`**
+（本次切分支就撞上了，看着像自己的改动把测试弄挂）。本机用 `npm ci` 恢复（它先 `Removing non-directory node_modules` 再装 16 个包，0.7s）。
+CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完全误导人。
+⇒ 本单**没动这个路径**（工作区里那份删除是 `npm ci` 的副作用，未入提交）；后续要么 `git rm --cached node_modules` + 进 `.gitignore`，要么把它改成真的相对符号链接——**别在不知道它存在的情况下再提交它一次**。
+
+### 8.54 收工灯的判定端点（issue #359 P0a，2026-10-24，分支 `feat-261024-05-git-light-agents-md`，接 §8.53）
+
+**交付**：`portal/src/gitlight.js`（新增）+ `GET /api/git-light?cwd=`（`http.js`，挂在 `/api/file` 之后）
++ `docs/api/portal.md` §0.1 补 4 行 + **28 条单测**（`portal/test/gitlight.test.js`）。**界面上还没有灯**（P0b 未做），
+现在只能 curl 这个端点看判定结果。
+
+**三条判据落到实现（口径与实测记录都在 #359）**：
+- 未提交 + 未跟踪 = **一条** `git status --porcelain -uall`（不用 `-uno`，它会撒谎）；stdout 流式读，**数到 50 条即 kill**。
+- 未推送 = 纯文本：`HEAD` → 分支 → **`refs/remotes/<remote>/<br>`** 与 HEAD sha 比对（松散 ref 与 `packed-refs` 都读）。
+- 0 提交 = 纯文本（HEAD 指向的 ref 解析不出来）；⚪ 灰（含 `index.lock` 正忙 / `.git` 读不动 / 判不完）**一律不显绿**。
+
+**⚠ 两条实测纠正（都进了单测，别再走一遍）**：
+1. **`--no-optional-locks` 是 git 级选项**，必须排在 `status` **之前**。写成 `git status --porcelain --no-optional-locks`
+   ⇒ `error: unknown option` 直接退出 ⇒ **所有仓库默默变灰**，不报错、不显眼（#359 正文原先就把它写在子命令后面，已同步改正）。
+2. **`branch.<n>.merge = refs/heads/main` 指的是远端那条分支**，要拿 `refs/remotes/<remote>/main` 比。
+   拿 `cfg.merge` 直接比 = **HEAD 跟自己比** ⇒ 未推送永远判绿。
+   另外 worktree 的 `refs/`/`packed-refs`/`config` 在 **`commondir`** 指向的目录（per-worktree 目录只有 HEAD/index）——
+   `runner/lib/listeners.js:112-126` 只解到 `gitdir` 这一层，**照抄它会把 worktree 判成「从未同步」**。
+
+**`partial` 的语义 = 「这不是完整结论」总开关**（扫描预算耗尽 ∪ 仓库数封顶 ∪ 任一仓库没判完），具体差在哪由 `reason` 说；
+前端拿它当「不得显绿 + 必须给 ↻」的依据。空壳根仓库（0 提交 + 无已跟踪改动 + 看得见的东西**全是别的仓库**）标 `shell: true`，
+**不参与拉高灯色**（它恒为红会把一切染红），只在展开态出那一行解释。成本上界：20 仓库 / 发现 300ms 或 1500 目录 /
+单条 status 2s / 流式 50 条 / **单请求总预算 6s**（仓库多时逐个 2s 会把请求拖到几十秒）。
+
+**基线**：接 §8.53 的 **1446 / 1442 / 0 / 4** → **1474 / 1470 / 0 / 4**（**净 +28**），`npm test` **rc=0**；`runner/`、`portal/frontend/` 零字节。
+
+**主 agent 亲跑变异 5 条（每条先自证 `git diff` 非空操作）**：① `-uall` 退化成 `-uno` ⇒ **4 条红**；
+② 撤掉 `--no-optional-locks` ⇒ **第一次是假绿**——哨兵只判了「排在 `status` 之前」，参数整个删掉时 `indexOf` 返回 `-1`
+反而更小 ⇒ 判定通过（§8.50 那条「先量变异是否非空操作」的纪律又抓到东西）；补上「参数必须存在 + 顺序」双断言后 ⇒ 1 条红；
+③ 不读 `commondir` ⇒ 1 条红；④ 不读 `packed-refs` ⇒ 1 条红；⑤ upstream 退回与本地分支自比 ⇒ 2 条红。
+
+**未做 / 待决（重要）**：
+- **portal 镜像还没装 git**（`portal/Dockerfile` 无 apt-get）⇒ 现网这个端点对所有仓库都会返回 `grey / git_unavailable`，
+  只有纯文本那半（未推送、0 提交）不受伤。**P0b 上线前必须先给 portal 装 git**，否则灯永远是灰，比没有灯更糟。
+- 后端 TTL 缓存与全局并发闸（#359 §7）未加：现在只有一个消费方（还没有），加了要先把 `partial`/`checked_at` 口径带进缓存。
+- ⚠ **CI 红过一次，红在夹具而不是实现**：worktree 那条用例我钉了「per-worktree 的 gitdir 里不该有 `refs/`」——
+  本机 git 2.43.0 确实没有，**CI 的 ubuntu-latest 有**（`refs/` 空壳），断言当场炸。教训：**别把 git 的磁盘布局当断言**，
+  要钉性质（`.git` 是文件、`commondir` 指回主仓库 `.git`、分支 ref 在 common dir）。实现同步改成
+  「`refs/` 两处都找、**common 优先**」（与 git files backend 的重定向一致），并顺手模拟 CI 那种布局进夹具。
+  变异自证：只读 per-worktree 目录 ⇒ 1 红；不读 `commondir` ⇒ 1 红。
+- 端点未接任何前端调用；`/api/dirs`、`/api/files/tree`、`/api/file` 此前**根本没进 API 端点清单**（本次一并补上，见 §0.1 的「此前漏记，现补」标注）。
+
+
+### 8.55 portal 运行镜像装 git（#359 收工灯的硬前置，2026-10-24，同分支接 §8.54）
+
+**为什么 portal 自己也要 git**：`GET /api/git-light` 的「未提交 + 未跟踪」两路要跑一条
+`git status --porcelain -uall`。未推送 / 0 提交那两路是纯文本读 `.git`，不需要 git 二进制；
+**但缺 git 时灯只能恒报 `grey / git_unavailable`**——一颗恒灰的灯比没有灯更糟（绿是承诺、灰是无信息，
+用户会当它坏了而不再看）。§8.54 把这条登记成 P0b 前置，本次直接做掉。
+
+**改动**（Dockerfile 一处 + 新测试一个）：运行阶段加
+`apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*`，
+层序照 `runner/Dockerfile`（重且稳定的 apt 层排在 `npm ci` 之前，改 portal 代码不触发重装）。
+**只装 read 侧**：不装 openssh-client、不配凭据、不碰网络——D9 定了 portal 零 git 写。
+体积代价：apt 计划 109 MB（git 拖 perl/perl-modules/libcurl3-gnutls 等），对 341 MB 的 portal 镜像是
+**+30% 量级**——这是本次唯一的成本，换来的是灯能真判。
+
+**新测试 `portal/test/portal-image-git.test.js`（+4，判据形状照 `runner-image-cache-dir.test.js`：读文本不跑部署）**。
+为什么必须钉：**这个失效在 CI 里看不见**——根单测跑在 CI runner 自己的 git 上，镜像里没 git 也全绿。
+四条 = 运行阶段装了 git / apt 层排在 `npm ci` 之前 / 不许顺手装进前端 builder /
+缺 git 时代码必须落 `grey / git_unavailable`（**另一半锁**：镜像装了 git 管「能不能判」，这条管「判不了怎么表现」）。
+变异 2 条（先自证非空操作）：apt 里把 git 换成 `ca-certificates` ⇒ 1 条具名红；apt 层挪到 `npm ci` 之后 ⇒ 1 条具名红。
+
+**真机 A/B（同一份判定代码 + 同一套四态夹具，只换运行环境；探针脚本用完即删、不入库）**：
+
+| 夹具 | 现网 `station-portal:latest`（无 git） | 有 git 的环境（FDE 镜像，**git 2.39.5** ＝ bookworm 版，也正是 portal 将拿到的版本） |
+|---|---|---|
+| 已提交已推送 | `grey / git_unavailable` | **`green / synced`** |
+| 已提交未推送（有 upstream、从未 fetch） | `grey / git_unavailable` | **`yellow / never_fetched`** |
+| 有改动 + 有未跟踪 | `grey / git_unavailable` | **`red / uncommitted`** |
+| 已提交、无 remote | `grey / git_unavailable` | **`yellow / no_remote`** |
+| 目录不存在 | 404 `not_found` | 同左 |
+
+右列顺带证了**判定模块在 bookworm 的 git 2.39.5 上口径不变**（开发机 2.43.0、CI ubuntu-latest 更新，三处对齐）。
+
+**⚠ 本机没能把带 git 的 portal 镜像 build 完**（不是 Dockerfile 的问题，记下来省后人时间）：
+`apt` 的**大文件传输**在本机反复被掐——第一次 `Packages`(8.8 MB) 卡 8 分钟；第二次过了 update、卡在
+`perl-modules`(2.8 MB)；第三次换 `--network=host` 仍卡在同一处。而**同一时刻容器内小请求 5 秒正常返回**
+（`deb.debian.org` 的 404 页 5.2s）⇒ 症状与「GitHub 边缘半死」同一族：长流量被掐，不是 DNS、也不是 bridge 网络。
+所以这层的**首次真构建发生在合入后的发布构建**（GitHub runner 上；PR 上 image job 是 `skipped`，
+CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一套 apt 写法，那层在 CI 天天构建成功。
+
+**自伤两次、值得写下来**：`pkill -f "portal/Dockerfile"` / `pkill -f "buildx build --load -t fde-portal-gittest"`
+都**匹配到了自己这条 bash**（命令串里含该字符串）⇒ SIGTERM 打死自己，后面所有语句全没跑（`nohup` 起的构建
+也被进程组带走）。口径：**先 `pgrep` 看清再按 PID 杀**，且模式要写成不匹配自身的形式（如 `[p]ortal/Dockerfile`）。
+
+**基线**：接 §8.54 的 **1474 / 1470 / 0 / 4** → **1478 / 1474 / 0 / 4**，`npm test` **rc=0**；
+`runner/`、`portal/frontend/`、`portal/src/` 零字节（本次只动 Dockerfile + 测试 + 文档）。
+
+
+### 8.56 收工灯上线到界面（issue #359 P0b，2026-10-24，分支 `feat-261024-05-git-light-agents-md`，接 §8.54 / §8.55）
+
+**这是 D9 那颗灯真正被看见的一次**：顶栏 cwd 徽标旁多一颗灯 + 一个词，点开是逐仓库明细与两个动作。
+新增 4 个文件（`lib/gitLight.ts` / `composables/useGitLight.ts` / `components/GitLightBadge.vue` + 各自 spec），
+改动只有 `WorkbenchView.vue`（接线 20 行）与两份 locale。**后端零改动**（§8.54 的端点原样消费）。
+
+**分层**（防"两处判色"漂移）：`lib/gitLight.ts` 是**显示口径唯一入口**（纯函数、无 DOM）、
+`useGitLight.ts` 只管取数与作废（形状照 `usePreviewPorts.ts`：闭包 `reqSeq`、30s 轮询 + 回前台即刷、
+`onScopeDispose` 收摊）、组件**不判色**也不发请求（动作只 `emit('prefill')`）。
+
+**刷新时机三条**：切目录（先 `reset()` 再拉）、**一个 run 结束的那一刻**（`running` true→false）、
+挂载时；加上 composable 自带的 30s 兜底轮询（页面隐藏不轮询）。run 结束这条是重点：
+用户刚让 AI 干完活，30s 拖尾不可接受（§8.54 记过"灯必须立刻反映 run 后的状态"，这里落地）。
+
+**界面侧红线（都有单测）**：
+- **颜色不承重**：点旁边就是文字（`未落地 / 未推送 / 已收工 / 未检查`），完整口径同时进 `title` 与 `aria-label`
+  （两者逐字相同，读屏与鼠标拿到同一句话）；点本身 `aria-hidden`。
+- **⚪ 不得显绿**做**两层**：后端已把 `partial`/未判完压成灰，前端 `gitLightDisplay` 再压一次——
+  变异取证：撤掉前端这层 ⇒ 2 条具名红（钉的是"旧后端把 partial 的绿漏过来时界面也不许骗人"）。
+- **红是日常态**：无 `⚠`、无告警底色、文案不说"错误/失败"（`localeParity` 与组件各钉一条，源码级哨兵钉模板里不许出现 `⚠`）。
+- **绿的诚实**：文案必须写"与你**已知的**远端一致"+ 说明"同事推过而你没 fetch 的看不见"；
+  `localeParity` 反向钉不许出现"远端是最新的 / up to date"。
+- **平台零 git 写**：没有提交/推送按钮，动作只有「让 AI 收尾」（红/黄才出现）与「问 AI」（永远在），
+  两者**只写 `store.inputValue`**；界面上明写"只是填进输入框，不替你发送（发送就是一次运行）"。
+- 脏值面：`reason` 不在表上 ⇒ `gitLight.reason.unknown`；行内 `light` 也过枚举表；错误码缺失退 `unknown`
+  （三条都各有红变异）。`reason` 键集合与 lib 的已知表**跨文件逐字对齐**（加 reason 不补文案就红）。
+
+**基线**：前端 **44 文件 / 796 → 47 文件 / 857**（**+3 文件 / +61**：lib 27 / composable 10 / 组件 19 —— 组件里
+两条是双语与源码哨兵；另 `WorkbenchView.spec` +5 接线、`localeParity` +5 语义）；根 **1493 / 1489 / 0 / 4** 不变
+（`portal/src/` 零字节）；`npm run typecheck` 干净；两侧 `rc=0`。
+
+**主 agent 亲跑变异 7 条**（每条先自证非空操作）：撤"partial 压回灰" 2 红 / 没数据显绿 2 红 /
+撤文字标签（只剩颜色）6 红 / run 结束不重判 1 红 / 切目录不 `reset()` **第一次 0 红**
+（接线用例只看了"最后一次请求的 URL"，看不见"旧结论有没有被清掉"）⇒ 改成"新目录请求故意挂住 +
+断言标签不再是已收工"后 1 红 / 空壳也拿去点名 1 红 / 错误码允许 `undefined` 1 红。
+**另一条自伤**：非空操作探测用 `git diff --stat`，而**新建文件还没进索引** ⇒ 未跟踪文件的 diff 永远为空，
+五条新文件变异被误判成"空操作"；改成直接比字节（口径：**未跟踪文件不要拿 git diff 当非空操作判据**）。
+
+**未做 / 边界**：① 现网后端还没有 `/api/git-light`（P0a 未合入发布）⇒ 真机 A/B 只能到"组件对旧后端
+报 `grey + 本次检查失败"这一格，完整真机（真目录、真仓库、真 run 结束刷新）要等本 PR 进镜像；
+② 后端 TTL/并发闸仍未加（现在只有一个消费方）；③ 灯只在**有目录**时出现（`v-if="store.dirCwd"`），
+没选目录的用户看不到"这个平台不管 git"这件事——留观察，先不加噪声。

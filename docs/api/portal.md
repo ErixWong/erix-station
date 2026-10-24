@@ -37,6 +37,10 @@
 | 项目 | `GET /api/projects/:id` | 项目详情（留档只读；`ports` 恒空，§3.4） |
 | 项目 | `PATCH /api/projects/:id` | **已退役 `410 project_api_retired`**（§3.5） |
 | 项目 | `DELETE /api/projects/:id` | **已退役 `410 project_api_retired`**（§3.6） |
+| 目录 | `GET /api/dirs` | 目录下拉：`~/projects/` 一级目录 + 非终态 run 徽标（P5「目录即项目」；**本表此前漏记，现补**） |
+| 目录 | `GET /api/files/tree?cwd=&path=` | 目录树单层懒展开（只读、逐段拒 symlink；此前漏记，现补） |
+| 目录 | `GET /api/file?cwd=&path=` | 单文件只读预览（≤ 2MB，超限报错不截断；此前漏记，现补） |
+| 目录 | `GET /api/git-light?cwd=` | **收工灯**（issue #359，决策 D9）：`{light: red\|yellow\|green\|grey, reason, repos[], partial, …}`；只读零写，宿主直读 `.git`。**运行前提：镜像内需 `git`**（`portal/Dockerfile` apt 层），缺它时全报 `grey / git_unavailable` |
 | 管理 | `GET /api/admin/fdes/:fdeName/git-credential` | 查询 Git 凭据主机、用户名与掩码 |
 | 管理 | `PUT /api/admin/fdes/:fdeName/git-credential` | 配置一个 Git 主机凭据 |
 | 管理 | `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>` | 删除一个 Git 主机凭据 |
