@@ -1793,3 +1793,23 @@ CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一�
 **真机 E2E 四个坑（全部源码+实测双证，已写进注释/文档）**：① 5.0.3 `TrustHostFilter.isNotTrustHost` 对**空 host 一律 403**（检查在通配符之前）——`file:///abs` 三斜杠形态全挂，必须拼 `file://<KK_TRUST_HOST>/<abs>` 命名 authority（TrustDirFilter 只看 path 不受影响）；compose `KK_TRUST_HOST` 与 portal `previewproxy.KK_TRUST_HOST` 同值，改一侧 = 全量 403。② kk 把转换产物挂 web 根（`/testdocx.pdf`）且模板生成**绝对 URL**——正解是 `X-Base-Url`（BaseUrlFilter 优先级 1 的官方多域名钩子，portal 每请求注 `<origin>/pv/<码>/`），闸门内链接自闭环；另加产物尾缀白名单透传（1–2 段）。③ XFP 开关在 Boot 3 是 `SERVER_FORWARD_HEADERS_STRATEGY`（写成 `SPRING_*` 静默失效，属性改名于 Boot 2.4）。④ 容器里 `cp -a` 会保留本机 AD 大 gid（>2097151），maven-assembly 写 tar 报 `group id too big`——打包前源码必须 `cp -r` 成容器本地属主。真机验收：docx → LibreOffice 转 pdf → 产物经 `/pv/<码>/docdocx.pdf` **200 / %PDF 魔数**；未登录/穿越/未知尾缀均按闸门 401/404。
 
 **基线**：本单增量 = 根 **+21**（`file-stream-miss.test.js` 14 + `pv-proxy.test.js` 7；migrations.test 改断言不改数）、前端 **+1 文件 / +20**（`previewRoute.spec.ts` 12 + `FilePreviewModal.spec.ts` 8）、runner 零字节。**合并树复跑**（`origin/main` = `e662e3e`〔#351/#359 系已进〕，判绿 = 退出码）：根 **1516 / 1512 / 0 / 4**、前端 **48 文件 / 878**、typecheck rc=0。（分支期数字 1468/45-816 系基 `1ae464a`，勿与本行混引。）⚠ **node_modules 教训**：main 里入库的自指 symlink 会在 merge checkout 时静默顶掉工作区真实依赖目录（`git stash -u` 也会把它卷走），症状 = 测试 rc=216 且输出只有两行 banner；恢复 = `rm node_modules && npm ci`，判绿前先确认依赖目录真实存在。镜像产物：`erix-station/kkfileview-base:5.0.3` + `erix-station/kkfileview:5.0.3`（本机已建，生产按 digest 钉）。
+
+### 8.58 `v0.1.32` 是个没进 main 的孤儿 tag（**已发版、已在跑、不可删**）与 `v0.1.33` 的处置（2026-10-25，分支 `release-261025-0-1-33`）
+
+**取证（三条都实测，不是推断）**
+- `v0.1.32` 是附注 tag（对象 `ac53f05`）→ 提交 `cea06d5`，**已推到 origin**；`release.yml` run `40095479683` success ⇒ **GHCR 三镜像真的推出去了**。
+- **现网就在跑它**：`docker exec station-portal` 与 `fde-eric` 里 `package.json` 都是 `0.1.32`，`deploy/.env` 三行 digest pin + `FDE_AGENT_VERSION=0.1.32-088e41e`。⇒ **tag 删不掉**，它是有部署实体的发布物。
+- 但 `cea06d5` **不是 main 的祖先**：它从当时的 main `e662e3e` 切出后就直接打 tag，`release-261024-0-1-32` 分支至今 `ahead 1 / behind 10`。于是**版本号与内容两条线分叉**：main 写着 `0.1.31`，内容却已含 `0.1.32` 的全部代码（`#369` 是 squash 进 main 的，`e662e3e` 就是当时的 main tip）；反过来 `v0.1.32` 这个发布物比 main 落后 10 个提交（32 文件 / +1773 −69），**缺 `#366` 文件预览四通道（含迁移 `0023`、`/pv` 网关、kkFileView 部署面）与 `#282` 状态条位置**。
+
+**第二次漏账（同一个发布提交里）**：`cea06d5` 只动了 **3 个文件**（`package.json` + 根 `package-lock.json` + `runner/package.json`），漏了 `runner/package-lock.json`、`portal/frontend/package.json`、`portal/frontend/package-lock.json` —— 三处至今仍是 `0.1.31`。对照惯例：`872fd7f`（v0.1.31）与 `e2646c7`（v0.1.30）都是**六文件 / 9 行**。提交信息里那句「版本同步自查」只自查了 root 与 `runner/package.json` 两处，漏项就是这么来的。
+
+**处置（为什么不"把 0.1.32 合回 main"）**：合回去只会带回一个**内容落后 10 个提交的 0.1.32 号**，且六文件缺口还得再补一刀，版本号继续说谎。所以：
+1. `v0.1.32` tag **保留**，语义就此钉死为「只含 `#369` 的孤儿快照，勿当部署基线」；
+2. 从 `main@e219b43` 出 **`0.1.33`**（六文件 9 行，与 `872fd7f` 模板逐字同形），内容 = main 全量 ⊇ `v0.1.32`；
+3. 部署时 `0.1.33` 一次性把 `#366` + `#282` 带上线（`deploy/docker-compose.yml` 的 `station-kkfileview` profile + 两个 kk 镜像按 digest 钉、迁移 `0023` 启动自动应用）。本批 `runner/src|lib` **零字节**（只漂了 `runner/package.json` 的版本号）⇒ 按 §8.17 口径 **FDE 容器不必 `docker rm -f` 重建**，portal 前端与后端实质变。
+
+**基线复跑**（`release-261025-0-1-33` = `main@e219b43` + 版本号，判绿 = 退出码）：`node --check` 全量 js/mjs rc=0；根 `npm test` **1516 / 1512 / 0 fail / 4 skip**；`node --test runner/test/*.test.js` **342 / 342**；前端 `typecheck` rc=0、`vitest` **48 文件 / 879 通过**。⚠ §8.57 记的前端 **878 是 `#373` merge 之前的口径**，`+1` 出自 `#373` 在 `WorkbenchView.spec.ts` 补的状态条位置用例（`777cbbd` +39 行）；runner 342 同理高于 §8.51 时代的 323，别再引旧数。
+
+**两条纪律（下次发布当场可执行）**
+- **发布提交必须从 main 的最新提交切、并且先合回 main 再打 tag**。判据一条：`git merge-base --is-ancestor <release-commit> origin/main` 必须为真，否则 tag 就是孤儿。分支直接打 tag（`#369` 那次）等于造一条没人认领的版本线。
+- **发布自查按六文件表逐处 `grep '"version"'`**，判据是「六个文件里所有 `version` 字段等于新版本号，`git show --stat` = 6 files / 9 insertions」——不是"看一眼根 package.json"。
