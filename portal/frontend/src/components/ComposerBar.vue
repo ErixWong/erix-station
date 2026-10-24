@@ -17,7 +17,9 @@ function onKeydown(e: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="flex gap-2 border-t border-black/10 p-2">
+  <!-- 上沿分隔线：有选中会话时由上方 RunStatusBar 的 border-t 提供（两者读作一块，不叠两条线）；
+       无会话时状态条不挂 ⇒ composer 自己带线，免得与流区粘在一起 -->
+  <div class="flex gap-2 p-2" :class="store.sessionId ? '' : 'border-t border-black/10'">
     <textarea
       v-model="store.inputValue"
       class="flex-1 rounded-md border border-black/20 px-3 py-1.5 resize-none focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
