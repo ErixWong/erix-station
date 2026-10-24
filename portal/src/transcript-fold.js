@@ -55,7 +55,10 @@
 // 它的做法照抄过来：`portal/test/transcript-fold.test.js` 按**文件路径** import 上游真件做逐字段对拍，
 // 上游挪文件/改名/改口径 ⇒ 那边红，而不是两把尺各自漂移。
 //
-// 挂在哪：`session-view.js#projectSessionMessages`（咽喉点）。全站喂 `projectTranscriptForDisplay`
+// 挂在哪（**展示面**）：`session-view.js#projectSessionMessages`（咽喉点）。
+// **引擎面**另有一份镜像 `runner/lib/transcript-fold.js`（issue #351，FDE 镜像里没有 portal 源码，
+// 只能镜像）；两边的 `SHARED-FOLD-CORE` 区间由 `runner/test/store-load-fold.test.js` 逐字节钉住
+// ⇒ **改口径必须两边一起改**（单边改必红）。全站喂 `projectTranscriptForDisplay`
 // 的两个业务读点（`sessions.js#fetchSession` 的对话流、`session-text.js#projectAnchors`）都过它，
 // 一处接线覆盖两个调用方，结构上不会「改了一个漏一个」。
 // **故意不折的地方**（各有硬理由，别顺手也折上）：
@@ -67,6 +70,7 @@
 //     `getTranscript` / `collectRoundText` / `recallTranscript`（run 作用域 legacy，session 行 `run_id`
 //     为 NULL ⇒ 新数据不在命中集里）。
 
+// ===== SHARED-FOLD-CORE BEGIN =====
 /** 消息行的 `kind` 字面值（上游 `message-rows.js#MESSAGE_ROW_KIND` 同值）。 */
 export const MESSAGE_ROW_KIND = 'message';
 
@@ -200,7 +204,7 @@ export function foldLedgerRecords(records, { keyOf = defaultKeyOf } = {}) {
   }
   return folded;
 }
-
+// ===== SHARED-FOLD-CORE END =====
 /** 行级折叠的缺省写法：`transcript_rounds` 行形状（正文在 `row.record.messages` 上）。 */
 function defaultWithRecord(row, messages, record) {
   return { ...row, record: { ...record, messages: [...(record.messages ?? []), ...messages] } };
