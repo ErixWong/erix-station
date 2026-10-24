@@ -1104,7 +1104,8 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 **引擎侧结论对、依据要改**（别照我原来那句「裸 flatMap 等价」去论证）：0.23 的 resume 用
 `foldLedgerMessages(records)`（`resume-manager.js:96`，`:102` 注释自己写着「口径不是裸 `records.flatMap(record.messages)`」）。
 裸 flatMap 在**一轮 ≥2 个工具调用**时**不等价**（拆成两条 user 消息 ⇒ `validateMessages` 要求 `tool_use` 由紧随其后的那条 user 结清
-⇒ `invalid_messages`）。⇒ **runner 侧不需要补折叠**（站内 `runner/lib/store.js` 直通，引擎自己折）。
+⇒ `invalid_messages`）。⇒ ~~**runner 侧不需要补折叠**（站内 `runner/lib/store.js` 直通，引擎自己折）~~
+**⚠ 这句已被 [#351](https://github.com/ErixWong/erix-station/issues/351) 推翻（2026-10-24 复核）**：引擎只调 `foldLedgerMessages`（只把 `partOf` 分片接回原消息），**载体折叠 `foldMessageRows` 是 store 的职责**（`host-consumer-contract.md:2405-2409 / :2442`；`resume-manager.js:239-241` 的 `seq` 播种本就为折叠后的 `load()` 输出设计）。本站 `load()` 直通原始行 ⇒ 引擎侧从来没折过，这就是 #351 的根因；修法是把 `portal/src/transcript-fold.js` 接到引擎面向的 `load()`（同一份折叠同时覆盖本单的链式 `partOf`）。
 
 **为什么升级后三套全绿（绿灯不代表展示面没坏）** —— 主 agent 独立取证：`grep -rl "partOf|kind: *'message'" portal/test runner/test portal/integration`
 = **零命中**；把真引擎产出喂进 `projectSessionMessages` 的用例 = **零条**；随包契约套件里 `kind:"message"`/`partOf` 命中 **0**
