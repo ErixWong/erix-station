@@ -2780,7 +2780,7 @@ async function handleInternal(req, res, ctx, url) {
     const body = await readJsonBody(req, ctx.config.maxBodyBytes);
     // issue #289：把 serve 进程的 llmGateway 单例透传给心跳对账；必须传 ctx.llmGateway 本身，
     // 不可在此现造 client——llm.js 的映射 TTL 缓存按 client 对象身份分槽，现造 ⇒ 每次心跳多打一次 GET /model/info。
-    const result = await internal.heartbeat(ctx.pool, { container, user, body, llmGateway: ctx.llmGateway });
+    const result = await internal.heartbeat(ctx.pool, { container, user, body, llmGateway: ctx.llmGateway, log: ctx.log });
     return sendJson(res, 200, result);
   }
 

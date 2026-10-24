@@ -371,9 +371,15 @@ export const zhCN = {
     title: '预览端口',
     adminTitle: '{fde} 的预览端口',
     // 工作台折叠条（issue #308 起在左侧栏底部，与目录树各自独立折叠；收起态也要给出可用信息）
-    toggle: '预览端口',
-    toggleCount: '预览端口（{count} 个）',
-    toggleFailed: '预览端口（加载失败）',
+    // 双面板拆分（用户裁定）：端口池=地址维度、进程监听=事实维度，各自按项目分组。
+    poolToggle: '端口池使用情况',
+    poolToggleCount: '端口池（{count} 个）',
+    poolToggleFailed: '端口池（加载失败）',
+    procToggle: '进程监听情况',
+    procToggleCount: '进程监听（{count} 个）',
+    procEmpty: '项目里没有进程在监听。',
+    spareGroup: '空闲（{count}）',
+    currentBadge: '当前目录',
     colPort: '端口',
     colHostname: '预览域名',
     colState: '状态',
@@ -381,17 +387,9 @@ export const zhCN = {
     openAction: '打开预览',
     signing: '签发通行票…',
     // issue #247：一键开整组（一次点击 = 签 + 开；不做二次确认——票 60 秒过期）
-    openAllAction: '打开全部预览',
-    batchSigning: '批量签发中…',
-    batchFailed: '批量签发预览通行票失败（{code}）：{message}',
     // issue #256 交付②：429/503 带 Retry-After 时把「多久后重试」说成秒数（缺头走上面不带秒数的键）
-    batchFailedRetry: '批量签发预览通行票失败（{code}）：{message}（约 {seconds} 秒后可重试）',
-    batchBlocked: '浏览器拦截了部分新标签，逐个点开：',
     // issue #286：面向**人**的 Cookie 告知（边缘整体剥 Cookie 头是 by design，不是 bug；
     // 工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知）
-    cookieNotice:
-      '说明：平台边缘会剥掉请求的 Cookie 头，预览通道上请勿使用 Cookie 会话——登录态请走 Authorization 头。'
-      + '（工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知。）这是平台的既有设计，不是故障。',
     hostnameCopyTitle: '{url}（点击复制完整地址）',
     copiedUrl: '预览地址已复制到剪贴板。',
     copyFailed: '复制失败：',
@@ -408,8 +406,14 @@ export const zhCN = {
       active: '已放行过',
     },
     stateShortUnknown: '未知状态',
-    // issue #308 §3.4：侧栏三段都是 cwd 作用域，而端口跟着工位走 ⇒ 区块内一行说清作用域
-    scopeHint: '本工位的预览端口，与所选目录无关。',
+    // issue #308 §3.4：端口是工位级资源；观测 MVP 后工作台视图按当前目录过滤——文案说真实行为。
+    // 人侧文案面向不懂技术的业务用户：不出现端口/进程/监听这类词，只说动作层能执行的话；
+    // 技术事实（Cookie 剥除、端口角色等）一律留在 agent 侧 ~/AGENTS.md，不进 UI。
+    // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
+    observedTitle: '正在使用这个地址的程序',
+    observedUptime: '已运行 {ago}',
+    duplicateWarn: '⚠ {cwd} 同时在 {ports} 两个地址上开着——可能是新旧两个版本并存，先确认哪个才是你要看的（旧任务留下的程序不会自己关）。',
+    unroutedNote: '这个程序还不能用预览地址打开——可让助理把它改到分配好的端口上。',
     stateHint: '「已放行过」只表示该端口首次凭证放行过，不代表容器里有应用在监听。',
     emptySelf: '你还没有预览端口（平台尚未为账号分段，或已全部释放）。',
     emptyFde: '该 FDE 没有活着的预览端口（可能尚未开户或已下线）。',

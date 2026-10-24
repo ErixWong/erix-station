@@ -377,9 +377,20 @@ export async function provisionFdePreviewPorts(pool, config, { fdeId, fdeName, b
 const PREVIEW_PORT_LIST_COLUMNS = 'id, port, hostname, url, state, scope, role, exposure';
 
 /**
+ * 观测新鲜度窗口（秒）：心跳 15s ⚠（runner-integration §4.2）连丢 3 次判容器死，取同口径——
+ * 窗口内的 `port_observations` 行才算「此刻还在听」。读侧过滤，不是删除：行会随下一次心跳整批替换自然消失。
+ */
+export const OBSERVATION_FRESHNESS_SECONDS = 45;
+
+/**
  * 某个 FDE 的**活行**预览 allocation（`state <> 'released'`），按 `port ASC`。
  * 两个列端点（本人 / admin 面）共用同一个取数与 DTO，避免两个端点漂成两套字段。
  * 只读 ⇒ 不加事务、不取锁（列表容忍并发：读到的是「那一刻的活行」，前端每次签票前重取即可）。
+ *
+ * 端口呈现优化·观测层 MVP（迁移 0022）：每条附 `observed`——该端口此刻容器内是否真有进程在听、
+ * 在哪个目录/分支、起了多久（agentd /proc 采样随心跳落库，只读观测非管控，#246 不变式）。
+ * **best-effort**：表缺失（未跑 0022 的部署）/ 读失败 ⇒ 全部 `observed:null`，列表照常。
+ * ⚠ 无观测 ≠ 无进程（旧 agentd 不上报同样是 null），前端文案不得把 null 写成「没有应用」。
  */
 export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
   if (!fdeId) throw portsError('preview_ports_invalid_args', 'listFdePreviewPorts: fdeId required');
@@ -389,7 +400,29 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
       ORDER BY port ASC`,
     [fdeId],
   );
-  return r.rows.map((row) => ({
+  const observedByPort = new Map();
+  try {
+    const o = await clientOrPool.query(
+      `SELECT port, pid, cwd, cmd, branch, proc_started_at, observed_at
+         FROM port_observations
+        WHERE fde_id = $1 AND observed_at > now() - interval '${OBSERVATION_FRESHNESS_SECONDS} seconds'`,
+      [fdeId],
+    );
+    const iso = (v) => (v instanceof Date ? v.toISOString() : (v ?? null));
+    for (const row of o.rows ?? []) {
+      observedByPort.set(Number(row.port), {
+        pid: row.pid === null || row.pid === undefined ? null : Number(row.pid),
+        cwd: row.cwd ?? null,
+        cmd: row.cmd ?? null,
+        branch: row.branch ?? null,
+        started_at: iso(row.proc_started_at),
+        observed_at: iso(row.observed_at),
+      });
+    }
+  } catch {
+    // 观测层永远降级不致命：旧部署无表 ⇒ 列表与 #246 时代逐字节同形（只是没有注解）。
+  }
+  const items = r.rows.map((row) => ({
     id: row.id,
     port: Number(row.port),
     hostname: row.hostname,
@@ -398,7 +431,32 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
     scope: row.scope,
     role: row.role,
     exposure: row.exposure,
+    observed: observedByPort.get(Number(row.port)) ?? null,
   }));
+
+  // 端口池外的真实监听（agent 起在 5173/8000 这类默认口上的 dev server）：以前只在 LEFT JOIN 里
+  // 被丢弃 ⇒ 用户「当前目录明明起了服务，面板却说没有」。现在合成成**无地址的只读行**
+  // （hostname/url=null，state='observed'）：不能开、没有票，但「有进程在用这个口」这件事可见。
+  // 只要 ~/projects/ 下的（agentd 自己的 4000、root 的内部口不算“用户的项目”，不进列表）。
+  const poolPorts = new Set(items.map((i) => i.port));
+  const looksLikeProject = (cwd) => typeof cwd === 'string'
+    && (cwd.startsWith('~/projects/') || /^\/home\/[^/]+\/projects\//.test(cwd));
+  for (const [port, obs] of observedByPort) {
+    if (poolPorts.has(port) || !looksLikeProject(obs.cwd)) continue;
+    items.push({
+      id: `observed:${port}`,
+      port,
+      hostname: null,
+      url: null,
+      state: 'observed',
+      scope: 'fde',
+      role: 'unrouted',
+      exposure: 'private',
+      observed: obs,
+    });
+  }
+  items.sort((a, b) => a.port - b.port);
+  return items;
 }
 
 /**

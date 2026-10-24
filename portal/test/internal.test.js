@@ -1446,3 +1446,74 @@ test('issue #283 U3：duration_ms 缺失 ⇒ 库里是 NULL 而不是 0；无 to
   await post([{ client_event_id: 'run1:1:99', type: 'tool_result', ts: null, payload: { tool_call_id: null, duration_ms: 7 } }]);
   assert.equal(pool.toolCalls.length, before, '无 tool_call_id ⇒ 无键可依：不猜、不建行');
 });
+
+// ---------------------------------------------------------------------------
+// 观测层 MVP（迁移 0022 port_observations）：heartbeat `listeners` 整批替换落库。
+// ---------------------------------------------------------------------------
+test('观测 MVP：heartbeat 带 listeners ⇒ 对该容器整批替换 port_observations；缺字段不动；空数组清空', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const runs = [{ run_id: runId, status: 'running', worker_pid: 1, claim_token: ticket.claim_token }];
+
+  // ① 缺 listeners 字段（旧 agentd）⇒ 一个 port_observations 语句都不发。
+  await heartbeat(pool, { container, user, body: { agent_version: '0.1', runs }, log: { warn() {} } });
+  assert.equal(pool.sqlLog.filter((l) => /port_observations/.test(l.sql)).length, 0, '缺字段 = 未上报，不碰观测');
+
+  // ② 上报两条 ⇒ DELETE + 2×INSERT，fake 表里正好两条、字段消毒后落库。
+  await heartbeat(pool, { container, user, log: { warn() {} }, body: { agent_version: '0.1', runs, listeners: [
+    { port: 22000, pid: 412, cwd: '~/projects/shop', cmd: 'node vite.js', branch: 'feat-x', started_at: '2026-10-20T00:00:00.000Z' },
+    { port: 22001, pid: 877, cwd: '~/projects/shop-feat', cmd: 'node vite.js', branch: 'main', started_at: '2026-10-24T00:00:00.000Z' },
+  ] } });
+  assert.deepEqual((pool.portObservations ?? []).map((o) => o.port), [22000, 22001]);
+  assert.equal(pool.portObservations[0].fde_id, userId, 'fde_id 取心跳主体（读端点按 FDE 直查）');
+  assert.equal(pool.portObservations[0].container_id, containerId);
+  assert.equal(pool.portObservations[0].branch, 'feat-x');
+
+  // ③ 整批替换：第二次只报 22001 ⇒ 22000 的观测消失（僵尸端口无需显式释放）。
+  await heartbeat(pool, { container, user, log: { warn() {} }, body: { agent_version: '0.1', runs, listeners: [
+    { port: 22001, pid: 999, cwd: '~/projects/other', cmd: 'uvicorn', branch: null, started_at: null },
+  ] } });
+  assert.deepEqual((pool.portObservations ?? []).map((o) => o.port), [22001]);
+  assert.equal(pool.portObservations[0].pid, 999, '同端口重报 = 覆盖（upsert 语义）');
+
+  // ④ 空数组 = 「这次真的什么都没在听」⇒ 清空（与缺字段语义不同）。
+  await heartbeat(pool, { container, user, log: { warn() {} }, body: { agent_version: '0.1', runs, listeners: [] } });
+  assert.deepEqual(pool.portObservations ?? [], []);
+});
+
+test('观测 MVP：sanitizeListeners 消毒容器输入；观测写库失败只警告，心跳其余语义不受影响', async () => {
+  const { sanitizeListeners } = await import('../src/internal.js');
+  assert.equal(sanitizeListeners(undefined), null, '缺字段 ⇒ null（未上报）');
+  assert.deepEqual(sanitizeListeners('nonsense'), null);
+  const out = sanitizeListeners([
+    { port: 22000, pid: 1, cwd: ' x ', cmd: 'y', branch: null, started_at: 'not-a-date' },
+    { port: 0 },                                  // 端口非法 ⇒ 丢
+    { port: 70000 },                              // 超 65535 ⇒ 丢
+    { port: '22001', pid: 'abc', cwd: 42, cmd: null, started_at: 1762000000000 }, // 松类型 ⇒ 归化
+    null, 'str',
+  ]);
+  assert.deepEqual(out.map((r) => r.port), [22000, 22001]);
+  assert.equal(out[0].startedAt, null, '不可解时间戳 ⇒ null');
+  assert.equal(out[0].cwd, 'x', 'trim');
+  assert.equal(out[1].pid, null, 'pid 非正整数 ⇒ null');
+  assert.equal(out[1].cwd, null, '非字符串 cwd ⇒ null');
+  assert.ok(out[1].startedAt, 'epoch ms 可用');
+
+  // 观测写库全炸（模拟未跑 0022 的旧库）⇒ 心跳仍 200，runs/租约语义不变。
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const runs = [{ run_id: runId, status: 'running', worker_pid: 1, claim_token: ticket.claim_token }];
+  const orig = pool._query.bind(pool);
+  pool._query = async (sql, params) => {
+    if (/port_observations/.test(sql)) { const e = new Error('relation "port_observations" does not exist'); e.code = '42P01'; throw e; }
+    return orig(sql, params);
+  };
+  const warns = [];
+  const hb = await heartbeat(pool, { container, user, log: { warn: (m) => warns.push(m) }, body: { agent_version: '0.1', runs, listeners: [{ port: 22000 }] } });
+  assert.equal(hb.runs[0].lease, 'renewed', '观测失败不得牵连租约续期');
+  assert.equal(warns.length, 1, '失败要留一条警告');
+});

@@ -52,7 +52,7 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
   // 新迁移追加在序列末尾（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -84,7 +84,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -141,7 +141,7 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0011-git-hosts.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0011-git-hosts.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS git_hosts/);
@@ -162,7 +162,7 @@ test('迁移 0012-onboarding：开户队列状态、步骤和索引全在增量 
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0012-onboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0012-onboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS fde_onboarding/);
@@ -178,7 +178,7 @@ test('迁移 0013-offboarding：增量队列可保留已停用用户并吊销 ru
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0013-offboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '迁移编号连续');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '迁移编号连续');
 
   const sql = fs.readFileSync(path.join(dir, '0013-offboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE fde_offboarding/);
@@ -197,7 +197,7 @@ test('迁移 0014-run-state-status：终态 status 独立列，旧快照由读�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0014-run-state-status.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移');
 
   const sql = fs.readFileSync(path.join(dir, '0014-run-state-status.sql'), 'utf8');
   assert.match(sql, /runs ADD COLUMN IF NOT EXISTS run_state_status jsonb/);
@@ -212,7 +212,7 @@ test('迁移 0015-backfill-user-input-transcript：只增不改、文本判断�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0015-backfill-user-input-transcript.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移');
 
   const sql = fs.readFileSync(path.join(dir, '0015-backfill-user-input-transcript.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -237,7 +237,7 @@ test('迁移 0016-transcript-append-seq：append 序列、确定性回填、索�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0016-transcript-append-seq.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移');
 
   const sql = fs.readFileSync(path.join(dir, '0016-transcript-append-seq.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -266,7 +266,7 @@ test('迁移 0017-port-allocations-hostname-check：整域名 CHECK、NOT VALID�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0017-port-allocations-hostname-check.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0017-port-allocations-hostname-check.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -292,7 +292,7 @@ test('迁移 0018-port-allocations-scope-fde：scope CHECK 放开含 fde、保�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0018-port-allocations-scope-fde.sql'), '0018 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0018-port-allocations-scope-fde.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -334,7 +334,7 @@ test('迁移 0019-preview-port-pool：⓪→①→②→③ 顺序不可换、CH
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0019-preview-port-pool.sql'), '0019 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0019-preview-port-pool.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -421,7 +421,7 @@ test('迁移 0020-preview-grant-revoke-repair：只撤 active、不碰 used、�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0020-preview-grant-revoke-repair.sql'), '0020 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
 
   const sql = fs.readFileSync(path.join(dir, '0020-preview-grant-revoke-repair.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -474,7 +474,7 @@ test('迁移 0021-user-must-change-password：ADD COLUMN IF NOT EXISTS 可重放
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0021-user-must-change-password.sql'), '0021 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 21, '0021 为当前最后迁移（连续无空洞）');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 22, '0022 为当前最后迁移（连续无空洞）');
   // 编号连续无空洞（README 约定：顺序 = 文件名升序）。
   files.forEach((f, i) => assert.equal(Number(f.slice(0, 4)), i + 1, `迁移编号空洞：${files.join(', ')}`));
 
@@ -533,4 +533,35 @@ test('迁移 0021-user-must-change-password：ADD COLUMN IF NOT EXISTS 可重放
   const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
   assert.ok(!baseline.includes('must_change_password'), '冻结 baseline 不得回写 must_change_password');
   assert.ok(!/0021/.test(baseline), '冻结 baseline 不得回写本迁移的痕迹');
+});
+
+// 0022（端口呈现优化·观测层 MVP）：port_observations 表——agentd /proc 采样随 heartbeat 落库，
+// 读侧按 observed_at 新鲜度窗口过滤进 /api/me/ports DTO。整批替换语义 ⇒ 陈旧注解无需显式释放。
+test('迁移 0022-port-observations：编号连续、语句幂等、关键语义锚点齐全', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0022-port-observations.sql'), '0022 存在');
+
+  const sql = fs.readFileSync(path.join(dir, '0022-port-observations.sql'), 'utf8');
+  assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS port_observations'), '建表幂等');
+  assert.ok(sql.includes('fde_id          uuid NOT NULL REFERENCES users (id)') || /fde_id\s+uuid NOT NULL REFERENCES users \(id\)/.test(sql), 'fde_id 必带（读端点按 FDE 直查）');
+  assert.ok(sql.includes('observed_at'), 'observed_at 新鲜度列（陈旧性由读侧窗口判定）');
+  assert.ok(sql.includes('proc_started_at'), '进程启动时刻（比 HEAD 分支更诚实的时间证据）');
+  assert.ok(sql.includes('port_observations_container_port_key'), '每容器每端口唯一（整批替换的幂等落点）');
+  assert.ok(sql.includes('ON port_observations (container_id, port)'), '唯一索引键 = (container_id, port)');
+  assert.ok(sql.includes('port_observations_fde_idx'), 'FDE 读路径索引');
+
+  // 幂等（README 单文件约定）：全部 CREATE ... IF NOT EXISTS，零 UPDATE/DELETE。
+  const statements = sql.split(';').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('--'));
+  for (const stmt of statements) {
+    const head = stmt.replace(/^--[^\n]*\n/g, '').trim().toUpperCase();
+    assert.ok(
+      head.startsWith('SET LOCK_TIMEOUT') || head.startsWith('CREATE TABLE IF NOT EXISTS') || head.startsWith('CREATE UNIQUE INDEX IF NOT EXISTS') || head.startsWith('CREATE INDEX IF NOT EXISTS'),
+      `0022 只允许 SET lock_timeout / CREATE ... IF NOT EXISTS，发现：${head.slice(0, 60)}`,
+    );
+  }
+
+  // 冻结 baseline 不回写。
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('port_observations'), '冻结 baseline 不得回写 port_observations');
 });

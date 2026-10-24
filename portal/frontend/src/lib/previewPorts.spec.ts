@@ -197,3 +197,45 @@ describe('toPreviewApiError：错误码 / message / details.field 三面都不�
     expect(info.message).toContain('Failed to fetch');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 观测层 MVP 的纯判据（组件侧只留装配）。
+// ---------------------------------------------------------------------------
+import { duplicateObservedGroups, formatStartedAgo } from './previewPorts';
+
+function item(port: number, cwd: string | null): PreviewPortItem {
+  return {
+    id: `id-${port}`, port, hostname: `h-${port}`, url: `http://h-${port}`,
+    state: 'allocated', scope: 'fde', role: 'spare', exposure: 'private',
+    observed: cwd === null ? null : { pid: 1, cwd, cmd: null, branch: null, started_at: null, observed_at: null },
+  };
+}
+
+describe('duplicateObservedGroups（同目录多实例 = 「两个分支各占一口」的判据）', () => {
+  it('同 cwd ≥2 条 ⇒ 一组（端口升序）；单条/无观测/无 cwd 不入组', () => {
+    const groups = duplicateObservedGroups([
+      item(22005, '~/projects/shop'),
+      item(22000, '~/projects/shop'),
+      item(22001, '~/projects/other'),
+      item(22002, null),
+    ]);
+    expect(groups).toEqual([{ cwd: '~/projects/shop', ports: [22000, 22005] }]);
+  });
+});
+
+describe('formatStartedAgo（相对时刻：1m/h/d，坏输入宁缺毋滥）', () => {
+  const now = Date.parse('2026-10-24T12:00:00.000Z');
+  it.each([
+    [30_000, '1m'],           // 不足 1 分钟报 1m，不出 0m
+    [5 * 60_000, '5m'],
+    [59 * 60_000 + 999, '59m'],
+    [2 * 3_600_000, '2h'],
+    [25 * 3_600_000, '1d'],
+  ])('启动于 %sms 前 ⇒ %s', (agoMs, expected) => {
+    expect(formatStartedAgo(new Date(now - agoMs).toISOString(), now)).toBe(expected);
+  });
+  it('未来时刻（时钟漂移）与不可解时间戳 ⇒ null', () => {
+    expect(formatStartedAgo(new Date(now + 60_000).toISOString(), now)).toBeNull();
+    expect(formatStartedAgo('nonsense', now)).toBeNull();
+  });
+});

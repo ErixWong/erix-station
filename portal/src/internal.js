@@ -925,7 +925,7 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
 // U4 heartbeat（租约续期 + stop 兜底 + 容器级 revoked）
 // ---------------------------------------------------------------------------
 
-export async function heartbeat(pool, { container, user, body, llmGateway = null }) {
+export async function heartbeat(pool, { container, user, body, llmGateway = null, log = console }) {
   const runs = body?.runs ?? [];
   if (!Array.isArray(runs)) {
     throw new InternalError(400, 'validation_failed', 'runs 必须为数组', { details: { field: 'runs' } });
@@ -993,7 +993,60 @@ export async function heartbeat(pool, { container, user, body, llmGateway = null
   // llmGateway 为 null/缺省时完全跳过对账 ⇒ 调用方不接线时行为与 #289 之前逐字节相同（兼容面，勿删）。
   const models = await getFdeLlmHeartbeatModels(pool, user.id, { gateway: llmGateway });
 
+  // 端口呈现优化·观测层 MVP（迁移 0022）：agentd /proc 采样的 `listeners` 落 port_observations。
+  // 口径：缺字段（旧 agentd）⇒ 不碰观测；有字段 ⇒ 对该容器**整批替换**（未观测到的端口自然消失）。
+  // **best-effort**：表缺失（新 agentd + 未跑 0022 的库）/权限问题一律吐警告，绝不影响心跳其余语义。
+  await recordPortObservations(pool, { container, user, listeners: body?.listeners, log });
   return { now: now.toISOString(), stop_run_ids: stopRunIds, revoked: false, runs: results, models };
+}
+
+/** 心跳 `listeners` 的消毒（容器上报 = 半可信输入）：非法条目丢弃、字符串截断、封顶；非数组 ⇒ null（=「未上报」，与「上报了但都非法」的空数组区分）。 */
+export const PORT_OBSERVATION_MAX = 64;
+export function sanitizeListeners(raw) {
+  if (!Array.isArray(raw)) return null;
+  const str = (v, max) => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null);
+  const out = [];
+  for (const item of raw.slice(0, PORT_OBSERVATION_MAX)) {
+    if (!item || typeof item !== 'object') continue;
+    const port = Number(item.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+    const pid = Number.isInteger(item.pid) && item.pid > 0 ? item.pid : null;
+    let startedAt = null;
+    if (typeof item.started_at === 'string' || typeof item.started_at === 'number') {
+      const d = new Date(item.started_at);
+      if (!Number.isNaN(d.getTime())) startedAt = d.toISOString();
+    }
+    out.push({
+      port,
+      pid,
+      cwd: str(item.cwd, 512),
+      cmd: str(item.cmd, 200),
+      branch: str(item.branch, 128),
+      startedAt,
+    });
+  }
+  return out;
+}
+
+async function recordPortObservations(pool, { container, user, listeners, log = console }) {
+  const rows = sanitizeListeners(listeners);
+  if (rows === null) return;
+  try {
+    await pool.query(`DELETE FROM port_observations WHERE container_id = $1`, [container.id]);
+    for (const r of rows) {
+      await pool.query(
+        `INSERT INTO port_observations (fde_id, container_id, port, pid, cwd, cmd, branch, proc_started_at, observed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+         ON CONFLICT (container_id, port) DO UPDATE
+           SET fde_id = EXCLUDED.fde_id, pid = EXCLUDED.pid, cwd = EXCLUDED.cwd,
+               cmd = EXCLUDED.cmd, branch = EXCLUDED.branch,
+               proc_started_at = EXCLUDED.proc_started_at, observed_at = now()`,
+        [user.id, container.id, r.port, r.pid, r.cwd, r.cmd, r.branch, r.startedAt],
+      );
+    }
+  } catch (err) {
+    log.warn?.(`[internal] port_observations 写入失败（观测层，心跳继续）：${err?.code || err?.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -354,9 +354,15 @@ export const en = {
     adminTitle: 'Preview ports of {fde}',
     // workbench disclosure bar (issue #308: now at the bottom of the left sidebar, an independent
     // toggle next to the directory tree; the collapsed state must still convey something useful)
-    toggle: 'Preview ports',
-    toggleCount: 'Preview ports ({count})',
-    toggleFailed: 'Preview ports (failed to load)',
+    // 双面板拆分（用户裁定）：端口池=地址维度、进程监听=事实维度，各自按项目分组。
+    poolToggle: 'Port pool',
+    poolToggleCount: 'Port pool ({count})',
+    poolToggleFailed: 'Port pool (failed to load)',
+    procToggle: 'Process listeners',
+    procToggleCount: 'Listeners ({count})',
+    procEmpty: 'No project processes are listening.',
+    spareGroup: 'Spare ({count})',
+    currentBadge: 'Current',
     colPort: 'Port',
     colHostname: 'Preview host',
     colState: 'State',
@@ -365,19 +371,9 @@ export const en = {
     signing: 'Issuing ticket…',
     // issue #247: open the whole group at once (one click = sign + open; no confirmation dialog,
     // because tickets expire in 60 seconds)
-    openAllAction: 'Open all previews',
-    batchSigning: 'Issuing tickets…',
-    batchFailed: 'Failed to issue the preview tickets in bulk ({code}): {message}',
     // issue #256 delivery 2: when 429/503 carries Retry-After, say how many seconds to wait
-    batchFailedRetry: 'Failed to issue the preview tickets in bulk ({code}): {message} (retry in about {seconds}s)',
-    batchBlocked: 'The browser blocked some new tabs; open them one by one:',
     // issue #286: human-facing cookie notice (the edge stripping Cookie is by design, not a bug;
     // agents inside the workspace are told by rule 7 in the container's ~/AGENTS.md, humans are told here)
-    cookieNotice:
-      'Note: the platform edge strips the Cookie header from requests, so do not use cookie-based sessions '
-      + 'on preview channels — pass your session in the Authorization header. '
-      + '(Agents inside the workspace are already told by rule 7 in the container’s ~/AGENTS.md; '
-      + 'this note is for human developers.) This is by design, not a bug.',
     hostnameCopyTitle: '{url} (click to copy the full URL)',
     copiedUrl: 'Preview URL copied to clipboard.',
     copyFailed: 'Copy failed: ',
@@ -394,8 +390,12 @@ export const en = {
       active: 'Admitted',
     },
     stateShortUnknown: 'Unknown',
-    // issue #308 §3.4: the sidebar sections are cwd-scoped, ports belong to the workstation
-    scopeHint: 'Preview ports of this workstation (independent of the selected directory).',
+    // 人侧文案面向不懂技术的业务用户：不出现端口/进程/监听这类词（口径与 zh-CN 一致）。
+    // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
+    observedTitle: 'Program using this address',
+    observedUptime: 'up {ago}',
+    duplicateWarn: '⚠ {cwd} is open on both {ports} at the same time — likely two versions coexisting. Check which one you want (leftovers from ended tasks do not close themselves).',
+    unroutedNote: 'This app cannot be opened at a preview address yet — ask your assistant to move it to an assigned port.',
     stateHint: '“Admitted once” only means the first credential was admitted; it does not mean an app is listening in the container.',
     emptySelf: 'You have no preview ports yet (the platform has not assigned a block, or all of them were released).',
     emptyFde: 'This FDE has no live preview ports (not onboarded yet, or already offboarded).',
