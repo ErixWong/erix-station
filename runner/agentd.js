@@ -25,6 +25,9 @@ import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
 import { archiveRunData, prepareRunDataDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
+// 端口呈现优化·观测层 MVP（迁移 0022）：/proc 采样当前真实监听，随 U4 heartbeat 捐带 `listeners`。
+// 只读展示用途，不做管控（#246 不变式）；采样失败只报空数组，绝不拖死心跳。
+import { collectListeners } from './lib/listeners.js';
 // issue #288 启动不变式：只取 shell 超时上限的**解析口径**（与 worker 侧同源），不引入 shell 执行本身。
 import { resolveShellMaxTimeoutMs } from './lib/shell-tools.js';
 
@@ -46,6 +49,8 @@ const CFG = {
   capacity: Number(process.env.ERIX_AGENTD_CAPACITY || 2),
   hbOkPath: process.env.ERIX_HB_OK_PATH || '/run/station/hb-ok',
   heartbeatMs: Number(process.env.ERIX_HEARTBEAT_MS || 15000),
+  // /proc 采样根目录（测试可注入 fixture；非 Linux / /proc 不可读 ⇒ listeners 恒空，不影响其余心跳语义）。
+  procPath: process.env.ERIX_PROC_PATH || '/proc',
   // issue #79：冷启动 gate 的最长等待——最多 2 个心跳周期（默认 30s）。超时后放行 claim
   // 并 warn「llmModels 未就绪，run 将回退 config 占位模型」，防心跳故障时永久卡死。
   hbInitMaxWaitMs: Number(process.env.ERIX_AGENTD_HB_INIT_MAX_WAIT_MS || 2 * (Number(process.env.ERIX_HEARTBEAT_MS || 15000))),
@@ -409,8 +414,11 @@ async function heartbeatOnce() {
     if (!ctx.worker) continue;
     runs.push({ run_id: ctx.runId, status: 'running', worker_pid: ctx.workerPid, claim_token: ctx.claimToken });
   }
+  // 观测层 MVP：真实监听快照（绝不 throw，双保险再包一层；旧 portal 不认识该字段会直接忽略，additive）。
+  let listeners = [];
+  try { listeners = collectListeners({ procPath: CFG.procPath, home: CFG.home }); } catch { listeners = []; }
   const r = await internalRequest('POST', '/heartbeat', {
-    body: { agent_version: CFG.agentVersion, runs },
+    body: { agent_version: CFG.agentVersion, runs, listeners },
   });
   return r.data;
 }

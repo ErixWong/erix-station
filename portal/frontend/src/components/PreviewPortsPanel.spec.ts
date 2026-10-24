@@ -412,3 +412,94 @@ describe('PreviewPortsPanel · 一键开整组（#247）与 Cookie 告知（#286
     setLocale('zh-CN');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 观测层 MVP（迁移 0022）：`observed` 注解 + 同目录多实例警告 + 本目录优先排序。
+// 红线：无观测的行**不渲染任何反向文案**（null ≠ 空闲——旧 agentd/未跑迁移的部署也是 null）。
+// ---------------------------------------------------------------------------
+describe('观测层注解（observed）', () => {
+  const OBS_SHOP = {
+    pid: 412, cwd: '~/projects/shop', cmd: 'node vite.js', branch: 'feat-x',
+    started_at: new Date(Date.now() - 3 * 3_600_000).toISOString(),
+    observed_at: new Date().toISOString(),
+  };
+  const OBS_SHOP_FEAT = { ...OBS_SHOP, pid: 877, cwd: '~/projects/shop', branch: 'main' };
+  const OBS_OTHER = { ...OBS_SHOP, cwd: '~/projects/other', branch: null };
+
+  it('有观测 ⇒ 行内渲染 cwd/分支/起了多久；无观测的行不出现观测节点', async () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: OBS_SHOP }), portItem('b', 22001)],
+    });
+    const lines = wrapper.findAll('[data-test="preview-port-observed"]');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].text()).toContain('~/projects/shop');
+    expect(lines[0].text()).toContain('@feat-x');
+    expect(lines[0].text()).toMatch(/起了 3h/);
+    expect(lines[0].attributes('title')).toContain('node vite.js');
+  });
+
+  it('同目录 ≥2 个监听 ⇒ 顶部警告点名两个端口（两个分支各占一口的现场）', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: OBS_SHOP }), portItem('b', 22001, { observed: OBS_SHOP_FEAT }), portItem('c', 22002, { observed: OBS_OTHER })],
+    });
+    const warn = wrapper.get('[data-test="preview-observed-duplicates"]').text();
+    expect(warn).toContain('~/projects/shop');
+    expect(warn).toContain('22000');
+    expect(warn).toContain('22001');
+    expect(warn).not.toContain('~/projects/other'); // 单实例目录不进警告
+  });
+
+  it('传 currentCwd + 观测可用 ⇒ **只显示**本目录在用的端口；其余进折叠区，展开后可见', async () => {
+    wrapper = mountPanel({
+      items: [
+        portItem('a', 22000, { observed: null }),
+        portItem('b', 22001, { observed: OBS_OTHER }),
+        portItem('c', 22002, { observed: OBS_SHOP }),
+      ],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+    });
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22002']);
+    expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(1);
+    // 主区行文案：目录已定 ⇒ 不重复报 cwd，改报 cmd（能看出是 vite 还是后端）。
+    expect(rows[0].get('[data-test="preview-port-observed"]').text()).toContain('node vite.js');
+    expect(wrapper.find('[data-test="preview-ports-others"]').exists()).toBe(false);
+
+    await wrapper.get('[data-test="preview-ports-others-toggle"]').trigger('click');
+    const others = wrapper.findAll('[data-test="preview-port-other-row"]');
+    expect(others.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22000', '22001']);
+  });
+
+  it('传 currentCwd 但本目录无在用端口 ⇒ 主区给「无在用」说明，不谎报空列表', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: null }), portItem('b', 22001, { observed: OBS_OTHER })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+    });
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(0);
+    expect(wrapper.find('[data-test="preview-port-none-here"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="preview-ports-others-toggle"]').exists()).toBe(true);
+  });
+
+  it('旧后端（DTO 无 observed 键）⇒ **不过滤**，全量展示与改动前同形', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000), portItem('b', 22001)], // 无 observed 键 = 未跑 0022
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+    });
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(2);
+    expect(wrapper.find('[data-test="preview-ports-others-toggle"]').exists()).toBe(false);
+  });
+
+  it('不传 currentCwd（管理台代看）⇒ 不过滤，只做「有观测优先」，组内维持 port ASC', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000), portItem('b', 22001, { observed: OBS_OTHER }), portItem('c', 22002)],
+      scope: 'fde',
+      fdeName: 'bob',
+    });
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22001', '22000', '22002']);
+    expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(0);
+  });
+});

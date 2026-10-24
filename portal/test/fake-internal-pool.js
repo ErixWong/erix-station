@@ -320,6 +320,21 @@ export class FakeInternalPool {
       return { rows: [] };
     }
 
+    // ---- port_observations（观测层 MVP，迁移 0022）：heartbeat listeners 整批替换 ----
+    if (sql.includes('DELETE FROM port_observations')) {
+      this.portObservations = (this.portObservations ?? []).filter((o) => o.container_id !== params[0]);
+      return { rows: [] };
+    }
+    if (sql.includes('INSERT INTO port_observations')) {
+      const [fde_id, container_id, port, pid, cwd, cmd, branch, proc_started_at] = params;
+      const list = (this.portObservations ??= []);
+      const row = { fde_id, container_id, port, pid, cwd, cmd, branch, proc_started_at, observed_at: Date.now() };
+      const existing = list.find((o) => o.container_id === container_id && o.port === port);
+      if (existing) Object.assign(existing, row);
+      else list.push(row);
+      return { rows: [] };
+    }
+
     // ---- heartbeat：LLM serving names read alongside the text model_info.id slots ----
     if (sql.includes('FROM fde_llm_bindings') && sql.includes('main_model_id, main_model_name')) {
       const [userId] = params;

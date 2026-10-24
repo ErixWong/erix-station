@@ -4,6 +4,25 @@
 // **改块前必须二次确认**）里，前两条是纯函数可以钉的——放组件里就只能靠装配才能测。
 // 红线：后端零改动，这里只是把常量与规则镜像一份用于 UI 提示（判据仍在服务端）。
 
+/**
+ * 观测注解（端口呈现优化·观测层 MVP，迁移 0022）：容器内该端口此刻**真有进程在听**的旁证
+ * （agentd /proc 采样随 heartbeat 落库，portal 按新鲜度窗口附进 §4.7a 列表 DTO）。
+ * ⚠ `observed:null` ≠ 「没应用在监听」：旧 agentd 不上报 / 未跑 0022 的部署也是 null，
+ * 前端不得把 null 画成「空闲/停止」。
+ */
+export interface PreviewObserved {
+  pid: number | null;
+  /** ~/projects/<name> 形（家目录内归一）；家目录外进程是绝对路径；反查不到 ⇒ null。 */
+  cwd: string | null;
+  cmd: string | null;
+  /** cwd 处 .git/HEAD 的分支；detached/非仓库/反查不到 ⇒ null。 */
+  branch: string | null;
+  /** 进程启动时刻（ISO）——比分支更诚实：原地切分支后旧进程服务的已是新代码。 */
+  started_at: string | null;
+  /** 最后一次采样到它的时刻（ISO）。 */
+  observed_at: string | null;
+}
+
 /** 列端点的行（GET /api/me/ports 与 GET /api/admin/fdes/:fdeName/ports 同形同序，§4.7a）。 */
 export interface PreviewPortItem {
   id: string;
@@ -15,6 +34,8 @@ export interface PreviewPortItem {
   scope: string;
   role: string;
   exposure: string;
+  /** 可选：旧后端（未跑 0022）不返这个字段 ⇒ undefined 也要能画。 */
+  observed?: PreviewObserved | null;
 }
 
 /** POST /api/ports/:id/preview-ticket 的 201 响应（§2.8）。 */
@@ -203,4 +224,38 @@ export function retryAfterSeconds(error: PreviewApiError): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   const seconds = Math.max(0, Math.round(value));
   return seconds > 0 ? seconds : null;
+}
+
+// ---------------------------------------------------------------------------
+// 观测层呈现（端口呈现优化 MVP）的纯判据——组件里只留装配，判据在这里可单测。
+// ---------------------------------------------------------------------------
+
+/**
+ * 「同一目录/仓库多实例」分组：`observed.cwd` 相同的活观测 ≥2 条 ⇒ 这就是用户分不清的现场
+ * （真机：同一项目两个分支的 dev server 各占 22000/22001）。
+ * 只按 cwd 精确分组——repo 归组要 git commdir，观测数据里没有，宁缺毋滥。
+ */
+export function duplicateObservedGroups(items: PreviewPortItem[]): Array<{ cwd: string; ports: number[] }> {
+  const byCwd = new Map<string, number[]>();
+  for (const item of items) {
+    const cwd = item.observed?.cwd;
+    if (!cwd) continue;
+    const list = byCwd.get(cwd) ?? [];
+    list.push(item.port);
+    byCwd.set(cwd, list);
+  }
+  return [...byCwd.entries()]
+    .filter(([, ports]) => ports.length >= 2)
+    .map(([cwd, ports]) => ({ cwd, ports: ports.sort((a, b) => a - b) }));
+}
+
+/** 观测行的「起了多久」摘要（相对时刻——绝对时间戳在侧栏 163px 里既放不下也没人看）。 */
+export function formatStartedAgo(startedAtIso: string, nowMs: number = Date.now()): string | null {
+  const t = Date.parse(startedAtIso);
+  if (!Number.isFinite(t)) return null;
+  const minutes = Math.floor((nowMs - t) / 60_000);
+  if (minutes < 0) return null; // 时钟漂移（started_at 在未来）⇒ 宁可不显示
+  if (minutes < 60) return `${Math.max(minutes, 1)}m`; // 不足 1 分钟也报 1m，不显示 0m
+  if (minutes < 60 * 24) return `${Math.floor(minutes / 60)}h`;
+  return `${Math.floor(minutes / (60 * 24))}d`;
 }
