@@ -137,10 +137,15 @@ export interface FoldedOriginalTurn {
   [key: string]: unknown;
 }
 
-/** 原文懒加载状态：missing=后端 404（folded_payload_not_found，友好提示，不抛红）；error=其他错误（可重试）。 */
+/**
+ * 原文懒加载状态：missing=后端 404（#375 后语义收窄为「range 与归档两条路都没有正文」，
+ * 友好提示不抛红）；error=其他错误（可重试）。
+ * `source`/`truncated`/`droppedMessages` 是 #375 新增的**可选**键（旧后端不返 ⇒ undefined ⇒
+ * 组件不渲染截断说明，向后兼容）。`source='rebuilt'` = 原文是按 `foldedRoundRange` 从账本重建的。
+ */
 export type FoldedOriginalState =
   | { status: 'loading' }
-  | { status: 'loaded'; turns: FoldedOriginalTurn[] }
+  | { status: 'loaded'; turns: FoldedOriginalTurn[]; source?: 'rebuilt' | 'archive'; truncated?: boolean; droppedMessages?: number }
   | { status: 'missing' }
   | { status: 'error'; message: string };
 
@@ -566,10 +571,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (cur && !(opts.force && cur.status === 'error')) return cur;
     foldedOriginals.value[key] = { status: 'loading' };
     try {
-      const data = await api<{ round: number; turns: FoldedOriginalTurn[] }>(
+      const data = await api<{
+        round: number; turns: FoldedOriginalTurn[];
+        source?: 'rebuilt' | 'archive'; truncated?: boolean; dropped_messages?: number;
+      }>(
         `/api/sessions/${encodeURIComponent(sid)}/folded/${encodeURIComponent(String(round))}`,
       );
-      const next: FoldedOriginalState = { status: 'loaded', turns: Array.isArray(data.turns) ? data.turns : [] };
+      // #375：三个可选键只在后端给了时写（旧后端无此键 ⇒ 不渲染截断说明）。
+      const next: FoldedOriginalState = {
+        status: 'loaded',
+        turns: Array.isArray(data.turns) ? data.turns : [],
+        ...(data.source === 'rebuilt' || data.source === 'archive' ? { source: data.source } : {}),
+        ...(data.truncated === true ? { truncated: true } : {}),
+        ...(Number.isSafeInteger(data.dropped_messages) ? { droppedMessages: data.dropped_messages as number } : {}),
+      };
       foldedOriginals.value[key] = next;
       return next;
     } catch (e) {
