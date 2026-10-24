@@ -14,6 +14,7 @@ import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 import { samePayload, dedupConflictDetails } from './transcript-payload.js';
+import { enqueueMaterializeChange } from './outbox.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
 const REAPER_INTERVAL_MS = 15000; // run 租约 reaper 扫描间隔（lease 90s 的 1/6，schema.sql §8 注释）
@@ -1032,6 +1033,15 @@ async function recordPortObservations(pool, { container, user, listeners, log = 
   const rows = sanitizeListeners(listeners);
   if (rows === null) return;
   try {
+    // #361：先拿旧板面，写完比集合——只在占用**翻转**时触发重刷 ports.json（in_use 咨询位），
+    // 不跟 15s 心跳节拍全量物化。比较必须在 DELETE 前读，DELETE+INSERT 本身无条件幂等照写。
+    let prevPorts = null;
+    try {
+      const prev = await pool.query(`SELECT port FROM port_observations WHERE container_id = $1`, [container.id]);
+      prevPorts = new Set(prev.rows.map((r) => Number(r.port)));
+    } catch {
+      // 旧板面读不到 ⇒ 保守当作翻转，刷一次
+    }
     await pool.query(`DELETE FROM port_observations WHERE container_id = $1`, [container.id]);
     for (const r of rows) {
       await pool.query(
@@ -1043,6 +1053,18 @@ async function recordPortObservations(pool, { container, user, listeners, log = 
                proc_started_at = EXCLUDED.proc_started_at, observed_at = now()`,
         [user.id, container.id, r.port, r.pid, r.cwd, r.cmd, r.branch, r.startedAt],
       );
+    }
+    const nowPorts = new Set(rows.map((r) => r.port));
+    const flipped = prevPorts === null
+      || prevPorts.size !== nowPorts.size
+      || [...prevPorts].some((p) => !nowPorts.has(p));
+    if (flipped) {
+      // 单独兜底：刷文件是咨询位更新，失败不得把整块观测写入标成失败。
+      try {
+        await enqueueMaterializeChange(pool, { fdeId: user.id, op: 'upsert' });
+      } catch (err) {
+        log.warn?.(`[internal] in_use 翻转触发重刷入队失败（咨询位，忽略）：${err?.code || err?.message}`);
+      }
     }
   } catch (err) {
     log.warn?.(`[internal] port_observations 写入失败（观测层，心跳继续）：${err?.code || err?.message}`);

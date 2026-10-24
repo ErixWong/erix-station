@@ -1517,3 +1517,49 @@ test('观测 MVP：sanitizeListeners 消毒容器输入；观测写库失败只�
   assert.equal(hb.runs[0].lease, 'renewed', '观测失败不得牵连租约续期');
   assert.equal(warns.length, 1, '失败要留一条警告');
 });
+
+// ---------------------------------------------------------------------------
+// #361：in_use 翻转 ⇒ 入队重刷 ports.json（咨询位刷新只在集合变化时发生，不跟 15s 心跳节拍）。
+// ---------------------------------------------------------------------------
+test('#361：观测端口集合翻转才入队 materialize upsert；集合不变不刷；观测读失败保守刷一次', async () => {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const runs = [{ run_id: runId, status: 'running', worker_pid: 1, claim_token: ticket.claim_token }];
+  const hb = (listeners) => heartbeat(pool, { container, user, log: { warn() {} }, body: { agent_version: '0.1', runs, listeners } });
+
+  // 首报（旧板面空 → {22000}）⇒ 翻转 ⇒ 入队一条 upsert
+  await hb([{ port: 22000, pid: 1 }]);
+  assert.equal((pool.materializeOps ?? []).length, 1, '空→有 = 翻转，必须入队重刷');
+  assert.equal(pool.materializeOps[0].fde_id, userId);
+  assert.equal(pool.materializeOps[0].op, 'upsert');
+
+  // 同集合重报（pid 变了、集合没变）⇒ 不刷（咨询位语义只看占用与否）
+  await hb([{ port: 22000, pid: 2 }]);
+  assert.equal(pool.materializeOps.length, 1, '集合不变 = 不刷，15s 节拍不得变全量物化节拍');
+
+  // 占用面变化（+22001）⇒ 刷
+  await hb([{ port: 22000, pid: 2 }, { port: 22001, pid: 3 }]);
+  assert.equal(pool.materializeOps.length, 2, '有→更多 = 翻转');
+
+  // 清空（进程全退）⇒ 刷（in_use 要翻回 false）
+  await hb([]);
+  assert.equal(pool.materializeOps.length, 3, '有→无 = 翻转');
+
+  // 空→空 ⇒ 不再刷
+  await hb([]);
+  assert.equal(pool.materializeOps.length, 3, '空→空 = 无翻转');
+
+  // 入队失败拖不垮心跳：outbox 表炸了，心跳照常 200、观测照常落库
+  const orig = pool._query.bind(pool);
+  pool._query = async (sql, params) => {
+    if (/materialize_(revisions|outbox)/.test(sql)) throw new Error('outbox down');
+    return orig(sql, params);
+  };
+  const warns = [];
+  const res = await heartbeat(pool, { container, user, log: { warn: (m) => warns.push(m) }, body: { agent_version: '0.1', runs, listeners: [{ port: 22005 }] } });
+  assert.equal(res.runs[0].lease, 'renewed', '入队失败不得牵连租约');
+  assert.deepEqual(pool.portObservations.map((o) => o.port), [22005], '入队失败不得回滚观测写入');
+  assert.ok(warns.some((w) => /重刷入队失败/.test(w)));
+});

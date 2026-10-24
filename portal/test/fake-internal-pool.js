@@ -321,6 +321,22 @@ export class FakeInternalPool {
     }
 
     // ---- port_observations（观测层 MVP，迁移 0022）：heartbeat listeners 整批替换 ----
+    if (sql.includes('SELECT port FROM port_observations')) {
+      const list = this.portObservations ?? [];
+      return { rows: list.filter((o) => o.container_id === params[0]).map((o) => ({ port: o.port })) };
+    }
+    // ---- #361：in_use 翻转→重刷 ports.json 的 outbox 入队（bump revision + 插 outbox 行）----
+    if (sql.includes('INSERT INTO materialize_revisions')) {
+      const [fde_id] = params;
+      const revs = (this.materializeRevisions ??= {});
+      revs[fde_id] = (revs[fde_id] ?? 0) + 1;
+      return { rows: [{ revision: revs[fde_id] }] };
+    }
+    if (sql.includes('INSERT INTO materialize_outbox')) {
+      const [fde_id, op, revision] = params;
+      (this.materializeOps ??= []).push({ fde_id, op, revision });
+      return { rows: [] };
+    }
     if (sql.includes('DELETE FROM port_observations')) {
       this.portObservations = (this.portObservations ?? []).filter((o) => o.container_id !== params[0]);
       return { rows: [] };

@@ -58,22 +58,41 @@ test('renderConfigJson：占位 key + endpoint（erix-agent v0.3.5 slots 嵌套�
   assert.equal(obj.slots.default.model, 'deepseek-flash'); // 占位即兜底：须为 relay 真实支持的模型名（#79）
 });
 
-test('renderPortsJson：P5 FDE 级单一文件（schema/fde/generation/allocations 平铺，无 project 字段）', () => {
+test('renderPortsJson：#361 schema 2 —— 只载分配事实（block 范围 + 逐条 port/url/in_use），使用面幻觉字段全剃', () => {
   const obj = JSON.parse(
     renderPortsJson({
       fdeName: 'alice',
       generation: 42,
       allocations: [ALLOC],
+      observedPorts: [],
     }),
   );
-  assert.equal(obj.schema, 1);
+  assert.equal(obj.schema, 2);
   assert.equal(obj.fde, 'alice');
   assert.equal(obj.generation, 42);
   assert.equal(obj.project, undefined, 'FDE 级文件不再按项目分组');
+  assert.deepEqual(obj.block, { start: ALLOC.port, end: ALLOC.port });
   assert.equal(obj.allocations.length, 1);
   assert.equal(obj.allocations[0].port, 4016);
   // 任何一条 allocation 进 ports.json 都必须带 url（#240 起把这条口径钉死在渲染层）
   assert.deepEqual(obj.allocations.map((a) => a.url), [ALLOC.url]);
+  // schema 2 剃除项：这些字段是 P5 后的使用面幻觉，谁回来都算回归
+  for (const gone of ['scope', 'role', 'run_id', 'exposure', 'state']) {
+    assert.equal(obj.allocations[0][gone], undefined, `${gone} 已剃除，不得回归`);
+  }
+});
+
+test('renderPortsJson：in_use 咨询位三态 —— true（新鲜观测命中）/ false（未命中）/ null（无观测数据 ≠ 空闲）', () => {
+  const allocs = [
+    { port: 22000, url: 'u0' },
+    { port: 22001, url: 'u1' },
+  ];
+  const withObs = JSON.parse(renderPortsJson({ fdeName: 'a', generation: 1, allocations: allocs, observedPorts: [22000] }));
+  assert.deepEqual(withObs.allocations.map((a) => a.in_use), [true, false]);
+  const noObs = JSON.parse(renderPortsJson({ fdeName: 'a', generation: 1, allocations: allocs }));
+  assert.deepEqual(noObs.allocations.map((a) => a.in_use), [null, null], '缺 observedPorts ⇒ null：不能把「不知道」写成「空闲」');
+  const empty = JSON.parse(renderPortsJson({ fdeName: 'a', generation: 1, allocations: [], observedPorts: [] }));
+  assert.equal(empty.block, null, '无分配 ⇒ 无范围');
 });
 
 // issue #240：开户预分配 10 条 FDE 级预览域名后，ports.json 就是「告知」的第一落点
@@ -86,17 +105,16 @@ const PREVIEW_ALLOCS = previewAllocationPlan({
   scope: p.scope, port: p.port, role: p.role, run_id: null, url: p.url, exposure: p.exposure, state: p.state,
 }));
 
-test('renderPortsJson：#240 预分配的 10 条预览域名全部出现，且**每条都带 url**', () => {
-  const obj = JSON.parse(renderPortsJson({ fdeName: 'alice', generation: 7, allocations: PREVIEW_ALLOCS }));
+test('renderPortsJson：#240 预分配的 10 条预览域名全部出现，且**每条都带 url**；block = 整段范围', () => {
+  const obj = JSON.parse(renderPortsJson({ fdeName: 'alice', generation: 7, allocations: PREVIEW_ALLOCS, observedPorts: [] }));
   assert.deepEqual(obj.allocations.map((a) => a.port), PREVIEW_PORTS, '端口 4000–4009 一条不缺');
   assert.equal(obj.allocations.length, 10);
+  assert.deepEqual(obj.block, { start: Math.min(...PREVIEW_PORTS), end: Math.max(...PREVIEW_PORTS) });
   for (const a of obj.allocations) {
     assert.equal(typeof a.url, 'string');
     assert.ok(a.url && a.url.length > 0, `端口 ${a.port} 的条目必须带 url（agent 永不自行拼 URL）`);
     assert.equal(a.url, `http://alice-p-${a.port}.fde.erix.vip:8090`);
-    assert.equal(a.scope, 'fde');
-    assert.equal(a.role, 'spare');
-    assert.equal(a.state, 'allocated');
+    assert.equal(a.in_use, false, '无命中观测 ⇒ 明确 false（非 null）');
   }
 });
 
