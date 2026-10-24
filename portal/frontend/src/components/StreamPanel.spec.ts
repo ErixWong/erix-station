@@ -667,3 +667,29 @@ describe('issue #300：partial entry 渲染（中性助手气泡 + 双语标签�
     expect(wrapper.get('.partial-label').text()).not.toContain('第一行');
   });
 });
+
+// 试用台账 #10：「加载更早消息」入口——后端一直分页（默认只给最新一窗），前端消费
+// next_cursor 后由本按钮触发取更早批；游标 null（到底/旧后端）不渲染。
+describe('加载更早消息入口（台账 #10）', () => {
+  it('有游标 → 渲染按钮并可点击调用 store.loadOlderMessages；加载中禁用；无游标不渲染', async () => {
+    const store = useWorkbenchStore();
+    const spy = vi.spyOn(store, 'loadOlderMessages').mockResolvedValue(true);
+    store.olderMessagesCursor = 42;
+    const wrapper = mountPanel();
+    const btn = wrapper.get('[data-test="load-older"]');
+    expect(btn.text()).toBe('加载更早消息');
+    await btn.trigger('click');
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    store.olderLoading = true;
+    await flushPromises();
+    const loadingBtn = wrapper.get('[data-test="load-older"]');
+    expect((loadingBtn.element as HTMLButtonElement).disabled).toBe(true);
+    expect(loadingBtn.text()).toBe('正在加载…');
+
+    store.olderLoading = false;
+    store.olderMessagesCursor = null; // 已到底 / 旧后端无此字段
+    await flushPromises();
+    expect(wrapper.find('[data-test="load-older"]').exists()).toBe(false);
+  });
+});
