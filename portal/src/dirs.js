@@ -17,15 +17,30 @@ export class DirError extends Error {
   }
 }
 
-/** 目录名自身防护：readdir 不可能产出 /，但仍防御性拒绝 . / ..（路径穿越红线）。 */
+/**
+ * 目录名自身防护：readdir 不可能产出 /，但仍防御性拒绝 . / ..（路径穿越红线）。
+ */
 function isSafeDirName(name) {
   return typeof name === 'string' && name.length > 0 && name !== '.' && name !== '..'
     && !name.includes('/') && !/[\x00-\x1f\x7f]/.test(name);
 }
 
 /**
+ * 目录下拉是否列出该目录名：安全名 + 非隐藏（`.` 开头一律不列）。
+ * 理由（design/directory-as-project.md §2 列表口径）：下拉是「项目选择器」而非文件管理器，
+ * `~/projects/` 一级常出现工具自建目录——最典型是 pnpm 在无可写 HOME 时把内容寻址缓存
+ * `.pnpm-store` 建到挂载根（数百 MB，码点还排在所有真实项目之前，直接顶掉第一项）。
+ * 这类目录不可能被选为 cwd，列出来只是噪音。只影响**列表可见性**：已存在的
+ * `~/projects/.xxx` 会话 cwd 仍可正常读写（validateSessionCwd / fileTree 不筛点开头）。
+ */
+function isListedDirName(name) {
+  return isSafeDirName(name) && !name.startsWith('.');
+}
+
+/**
  * GET /api/dirs → { dirs: [{ name, cwd, running_count, queued_count }] }。
- * 枚举 ~/projects/ 一级目录（不存在则空列表，不 500——目录还没建过是正常态）；
+ * 枚举 ~/projects/ 一级目录（不存在则空列表，不 500——目录还没建过是正常态；
+ * 隐藏目录不列，见 isListedDirName）；
  * 运行态聚合：runs JOIN chat_sessions 按 cwd 分组（queued = status 'queued'；
  * running = 'running' + 'cancelling'，与 sessions ACTIVE_RUN_STATES 同口径）。
  */
@@ -36,7 +51,7 @@ export async function listDirs(pool, { userId, userSpaceRoot, fdeName, log = con
   let names = [];
   try {
     names = fs.readdirSync(projectsRoot, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && isSafeDirName(d.name))
+      .filter((d) => d.isDirectory() && isListedDirName(d.name))
       .map((d) => d.name)
       .sort();
   } catch (err) {
