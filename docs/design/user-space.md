@@ -186,8 +186,13 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 | `/home/<user>/projects/<project>/`（仓库内容） | agent 代劳 clone + FDE/agent 编辑 | 平台只创建空目录与平台文件；Git 凭据由 FDE 经 portal 投放（#110，§4.1.1） |
 | `/home/<user>/worktrees/<project>-<runId>/` | **agentd**（`git worktree add`，runner §6.2） | **worktree 元数据无文件**：run↔worktree 绑定在 DB（`runs.id` + 路径约定 `~/worktrees/<project>-<runId>`），不在用户空间物化任何元数据文件（避免与 git 自身元数据冲突、避免双真相） |
 | `/home/<user>/.cache/station/spool/<runId>.jsonl` | agentd / worker（事件缓冲，runner §7.5） | **JSONL**（append-only，每行一个事件信封）；run 结束后清排；平台不读不写 |
-| `/home/<user>/cache/` | FDE / agent（pnpm store / npm / pip） | 依赖缓存，平台不代管 |
+| `/home/<user>/cache/` | FDE / agent（pnpm store / npm / pip） | 依赖缓存，内容平台不代管；**位置由 FDE 镜像预配**（`/usr/local/etc/npmrc` 的 globalconfig + `COREPACK_HOME`/`PIP_CACHE_DIR` ENV，见 runner/Dockerfile） |
 | `/home/<user>/.erix/skills/`、`.erix/todos/` | FDE / agent 自管 | 平台只建目录（若模板需要），内容不物化 |
+
+> **为何预配缓存位置**（eric 空间实测 2026-10-24）：不指默认时 pnpm 会自己在「项目所在卷」上找地方建
+> `.pnpm-store`，而 `~/projects` 正是 projects bind mount 的根 → 实测长出 388 MB 的 `~/projects/.pnpm-store`，
+> 污染目录列表（`dirs.js` 现已过滤 `.` 开头目录作展示层兼容）。globalconfig 是 npmrc 链最低一层，
+> 只供默认值：`~/.npmrc` 与项目 `.npmrc` 仍可覆盖（已实测），所以这不与「内容 FDE 自管」冲突。
 
 > **spool 路径澄清**：事件 spool 在 `~/.cache/station/spool/`（runner §7.5 原文），依赖缓存在 `~/cache/`（规格 §12.1）——两者**不同目录**，不是同一路径的两处写法。本表按此区分，不改 runner-integration.md。
 
