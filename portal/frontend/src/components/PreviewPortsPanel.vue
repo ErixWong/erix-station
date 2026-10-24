@@ -384,7 +384,9 @@ onScopeDispose(() => clearTimeout(copiedTimer));
       <!-- 无折叠区（用户实证裁定）：工作台列表 = 当前目录在用的端口，其余（含原 10 端口全量）
            都是干扰项，不显示也不提供展开入口。旧后端无观测时不过滤（filterToDir=false），全量照常。 -->
 
-      <p class="muted mt-1" :class="props.variant === 'list' ? 'text-[11px] leading-[1.5]' : 'text-xs'">{{ t('previewPorts.stateHint') }}</p>
+      <!-- 放行语义注释只给管理台（table）：工作台列表只画「当前目录真有进程在听」的端口，
+           监听事实已由观测注解回答，向业务用户解释 allocated/active 是噪音（用户裁定）。 -->
+      <p v-if="props.variant === 'table'" class="muted mt-1 text-xs">{{ t('previewPorts.stateHint') }}</p>
       <p v-if="copyError" data-test="preview-port-copy-error" class="syserr mt-1 text-xs" role="alert">{{ copyError }}</p>
       <p v-else-if="copiedId" data-test="preview-port-copied" class="mt-1 text-xs text-green-700" role="status">
         {{ t('previewPorts.copiedUrl') }}
