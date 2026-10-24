@@ -60,6 +60,7 @@
 | 会话 | `DELETE /api/sessions/:id` | 归档会话 |
 | 对话 | `POST /api/sessions/:id/messages` | 发消息（创建 run） |
 | 对话 | `GET /api/sessions/:id/events` | **SSE 事件流**（§5） |
+| 对话 | `GET /api/sessions/:id/folded/:round` | 折叠段「查看原文」（§4.4b，#189；**#375 改口径**：有 `foldedRoundRange` 就从账本重建） |
 | 对话 | `GET /api/sessions/:id/events/history` | run_events 展示类事件历史（§4.4a，刷新后重建卡片/面板；另含两类**响应期合成项** `partial_output` §4.4a-1 / `run_termination` §4.4a-2） |
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
@@ -1054,6 +1055,28 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 ```
 
 错误：`401 unauthorized`；`404 not_found`；`400 validation_failed`（`limit` / `before` 非正整数）。
+
+### 4.4b `GET /api/sessions/:id/folded/:round`（issue #189；口径于 #375 改版）
+
+折叠横幅上「查看原文」的只读懒加载端点。鉴权同 `GET /api/sessions/:id`（非属主/不存在一律 `404 not_found`，不泄露存在性）；`:round` 是**折叠行自己的 round**（不是 `foldedRoundRange.to`）。
+
+**200 响应**（`turns` 一律走同一个上游投影 `projectTranscriptForDisplay`，不另造折叠渲染，#95 红线）：
+
+```json
+{ "round": 137, "turns": [ … ], "source": "rebuilt", "truncated": true, "dropped_messages": 317 }
+```
+
+| 字段 | 口径 |
+|---|---|
+| `round` | 请求里的折叠行 round，原样回显 |
+| `turns` | 原文投影结果，**形状与 #189 一版完全一致**（新字段只增不改，旧前端无需改） |
+| `source` | `rebuilt` = 按 `foldedRoundRange` 从同会话已有轮行重建；`archive` = 只拿得到那一行的归档（无 range 的存量行 / range 内无正文） |
+| `truncated` | 布尔位（**不塞省略号文本**，截断标记由前端出，先例同 §4.4a-1）。重建行数超 `FOLDED_REBUILD_MAX_ROWS = 2000`（与 U7 recall 同尺）**或**归档被上游夹断 ⇒ `true` |
+| `dropped_messages` | 上游夹断丢掉的条数（取 `record.foldedPayloadMeta.droppedMessages`）；无则 `0` |
+
+**口径为什么要改**（#375，背后可见上游 erix-agent#461）：erix-agent 0.25.0 之前 `record.foldedPayload` 是每次折叠从 `from:1` 重发的**全量副本**，所以“只读那一行归档”意外地等于“全部原文”；0.25.0 把它改成**本轮新增的有界差分**（会话级内容去重 + 默认 256 KiB 夹断）⇒ 只读归档只能给出残缺，去重全吸收时甚至是空，而旧口径一律 `404 folded_payload_not_found`、前端文案「原文已不可用（上游未保留折叠前载荷）」——那是假话，原文一直在各自的轮行里。上游契约也已写明：宿主不得把截断/缺失读成数据丢失，`foldedRoundRange` + `navigationRecord` 才是有界指针。
+
+**`404` 语义收窄**：`folded_payload_not_found` 现在只在「range 与归档**两条路**都拿不出任何正文」时才发（旧口径：那一行归档为空就发）。行顺序按 `round ASC, append_seq ASC`（与账本保序口径一致，#338 教训：不得只在页内取行）。
 
 ### 4.5 `POST /api/sessions/:id/stop`
 
