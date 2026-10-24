@@ -14,8 +14,9 @@ import path from 'node:path';
 // 历史实测候选（会过期，探活兜过期）：2026-10-24 本机 + touwakamate 双端实测可用。
 const CANDIDATES = {
   'github.com': [
+    '140.82.112.4', '140.82.113.4', '140.82.114.4', '20.205.243.166',
     '20.205.243.160', '20.205.243.161', '20.205.243.162', '20.205.243.163', '20.205.243.164',
-    '20.205.243.165', '20.205.243.166', '20.205.243.167', '140.82.112.4', '140.82.113.4', '140.82.114.4',
+    '20.205.243.165', '20.205.243.167',
   ],
   'codeload.github.com': ['140.82.112.4', '140.82.113.4', '140.82.114.4', '20.205.243.166'],
   'api.github.com': ['20.205.243.168', '140.82.112.6', '140.82.113.6'],
@@ -58,9 +59,29 @@ const pinnedGlobal = new Map();
 function startProxy() {
   return new Promise((resolve, reject) => {
     const server = net.createServer((socket) => {
-      socket.once('data', async (head) => {
-        const line = head.toString('latin1');
-        const m = line.match(/^CONNECT\s+(\S+):443\s/);
+      // 真 CONNECT 处序（2026-10-24 容器实测：curl 7.88 把 CONNECT 头分多包，once('data')
+      // 只吃第一段——残字节丢进隧道或丢失，表现为对端 400 / 本端挂死）：缓存至 \r\n\r\n，
+      // 残字节（含紧跟的 ClientHello）必须透传。
+      let buf = Buffer.alloc(0);
+      socket.on('data', async (chunk) => {
+        if (buf === null) return; // 已建隧道（pipe 后不应再进这里）
+        buf = Buffer.concat([buf, chunk]);
+        const end = buf.indexOf('\r\n\r\n');
+        if (end === -1) {
+          if (buf.length > 8192) socket.destroy();
+          return;
+        }
+        const head = buf.subarray(0, end).toString('latin1');
+        let rest = buf.subarray(end + 4);
+        buf = null;
+        socket.removeAllListeners('data');
+        // 隧道建立（含探活 await + connect RTT）期间到达的字节必须缓存重放：curl/git 会把
+        // ClientHello 与 CONNECT 同段发来、或在 200 后立刻发——旧版丢弃残段即对端 400/本端挂死
+        //（2026-10-24 容器真机与宿主行为不一致的根因）。
+        let up = null;
+        const pend = [];
+        socket.on('data', (c) => { if (!up) pend.push(c); });
+        const m = head.match(/^CONNECT\s+(\S+):443\s/);
         if (!m) { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); return; }
         const host = m[1].replace(/^\[|\]$/g, '');
         let ip = pinnedGlobal.get(host);
@@ -69,8 +90,13 @@ function startProxy() {
           if (!ip) { socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); return; }
           pinnedGlobal.set(host, ip);
         }
-        const up = net.connect(443, ip ?? host, () => {
+        up = net.connect(443, ip ?? host, () => {
           socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          if (rest.length) up.write(rest);
+          for (const c of pend) up.write(c);
+          rest = Buffer.alloc(0);
+          pend.length = 0;
+          socket.removeAllListeners('data');
           socket.pipe(up); up.pipe(socket);
         });
         up.on('error', () => {
