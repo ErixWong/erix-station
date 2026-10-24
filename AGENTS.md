@@ -1628,4 +1628,9 @@ CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完�
 - **portal 镜像还没装 git**（`portal/Dockerfile` 无 apt-get）⇒ 现网这个端点对所有仓库都会返回 `grey / git_unavailable`，
   只有纯文本那半（未推送、0 提交）不受伤。**P0b 上线前必须先给 portal 装 git**，否则灯永远是灰，比没有灯更糟。
 - 后端 TTL 缓存与全局并发闸（#359 §7）未加：现在只有一个消费方（还没有），加了要先把 `partial`/`checked_at` 口径带进缓存。
+- ⚠ **CI 红过一次，红在夹具而不是实现**：worktree 那条用例我钉了「per-worktree 的 gitdir 里不该有 `refs/`」——
+  本机 git 2.43.0 确实没有，**CI 的 ubuntu-latest 有**（`refs/` 空壳），断言当场炸。教训：**别把 git 的磁盘布局当断言**，
+  要钉性质（`.git` 是文件、`commondir` 指回主仓库 `.git`、分支 ref 在 common dir）。实现同步改成
+  「`refs/` 两处都找、**common 优先**」（与 git files backend 的重定向一致），并顺手模拟 CI 那种布局进夹具。
+  变异自证：只读 per-worktree 目录 ⇒ 1 红；不读 `commondir` ⇒ 1 红。
 - 端点未接任何前端调用；`/api/dirs`、`/api/files/tree`、`/api/file` 此前**根本没进 API 端点清单**（本次一并补上，见 §0.1 的「此前漏记，现补」标注）。

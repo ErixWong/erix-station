@@ -269,10 +269,15 @@ test('linked worktree：refs 在 commondir 而不是 .git 文件指向的目录�
   const { dir } = makeSyncedRepo(projects, 'p1');
   const wt = path.join(projects, 'p1-wt');
   git(['-C', dir, 'worktree', 'add', '-q', wt, '-b', 'wt-branch'], dir);
-  // 夹具自证：worktree 的 .git 是文件，其 gitdir 目录里没有 refs/，refs 在 common dir
+  // 夹具自证（**布局无关**，别钉"worktree 目录里有没有 refs/"——本机 git 2.43.0 没有，CI 的
+  // ubuntu-latest 有：那条断言在 CI 上红过一次）。真正要钉的是：`.git` 是文件、commondir 指回主仓库
+  // 的 .git、**分支 ref 在 common dir**。
   const gitdir = /^gitdir:\s*(.+)$/m.exec(fs.readFileSync(path.join(wt, '.git'), 'utf8'))[1].trim();
-  assert.equal(fs.existsSync(path.join(gitdir, 'refs')), false, 'worktree 目录不该有 refs/');
-  assert.equal(fs.readFileSync(path.join(gitdir, 'commondir'), 'utf8').trim(), '../..');
+  const common = path.resolve(gitdir, fs.readFileSync(path.join(gitdir, 'commondir'), 'utf8').trim());
+  assert.equal(common, fs.realpathSync(path.join(dir, '.git')), 'commondir 必须指回主仓库的 .git');
+  assert.ok(fs.existsSync(path.join(common, 'refs', 'remotes', 'origin', 'main')), '远端跟踪 ref 在 common dir');
+  // 再把 CI 那种布局模拟出来（per-worktree 目录里有 refs/ 空壳），保证本机也覆盖到那条形状
+  fs.mkdirSync(path.join(gitdir, 'refs', 'heads'), { recursive: true });
 
   fs.writeFileSync(path.join(wt, 'wt.txt'), '1\n');
   git(['-C', wt, 'add', '-A'], wt);
