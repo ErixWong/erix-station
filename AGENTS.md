@@ -1082,7 +1082,8 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 **引擎侧结论对、依据要改**（别照我原来那句「裸 flatMap 等价」去论证）：0.23 的 resume 用
 `foldLedgerMessages(records)`（`resume-manager.js:96`，`:102` 注释自己写着「口径不是裸 `records.flatMap(record.messages)`」）。
 裸 flatMap 在**一轮 ≥2 个工具调用**时**不等价**（拆成两条 user 消息 ⇒ `validateMessages` 要求 `tool_use` 由紧随其后的那条 user 结清
-⇒ `invalid_messages`）。⇒ **runner 侧不需要补折叠**（站内 `runner/lib/store.js` 直通，引擎自己折）。
+⇒ `invalid_messages`）。⇒ ~~**runner 侧不需要补折叠**（站内 `runner/lib/store.js` 直通，引擎自己折）~~
+**⚠ 这句已被 [#351](https://github.com/ErixWong/erix-station/issues/351) 推翻（2026-10-24 复核）**：引擎只调 `foldLedgerMessages`（只把 `partOf` 分片接回原消息），**载体折叠 `foldMessageRows` 是 store 的职责**（`host-consumer-contract.md:2405-2409 / :2442`；`resume-manager.js:239-241` 的 `seq` 播种本就为折叠后的 `load()` 输出设计）。本站 `load()` 直通原始行 ⇒ 引擎侧从来没折过，这就是 #351 的根因；修法是把 `portal/src/transcript-fold.js` 接到引擎面向的 `load()`（同一份折叠同时覆盖本单的链式 `partOf`）。
 
 **为什么升级后三套全绿（绿灯不代表展示面没坏）** —— 主 agent 独立取证：`grep -rl "partOf|kind: *'message'" portal/test runner/test portal/integration`
 = **零命中**；把真引擎产出喂进 `projectSessionMessages` 的用例 = **零条**；随包契约套件里 `kind:"message"`/`partOf` 命中 **0**
@@ -1538,3 +1539,57 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **镜像未重建**：现网 `FDE_IMAGE=ghcr.nju.edu.cn/erixwong/erix-station-fde@sha256:de16b78b513c…`（portal env + `IMAGE_ALLOWLIST` 全串精确匹配）。生效需要 build → 新 image ID → 同步这两处 env → recreate `fde-eric` / `fde-jim`（**会打断正在跑的 run**）。在此之前线上靠上面那份热补撑着。
 - **未发版**（不进 v0.1.31 的任何承诺，等决策者定窗口）。
 - 展示层过滤**没**同步到目录树（`fileTree`）：树面板里点开头目录仍可见可展开，是刻意的——树是浏览器的用法，人可能就是要看 `.git` / `.github`；下拉才是被污染的那一面。
+
+### 8.52 引擎面向的 `store.load()` 补上读侧折叠（issue #351，会话砖化的根治性止血）
+
+**触发**：决策者真机连撞两次 `invalid_messages`（同一会话 `9e0c8a17…`，8 分钟内两个不同的 index）。
+
+**取证手法（值得复用）**：把**真账本行**喂进引擎自己的 `foldLedgerMessages` + `validateMessages`，
+比读错误文案硬得多；再用两张备份表把账本**还原成修数据之前**的原始形状做 A/B：
+
+| 读法 | 原始 158 行真账本 |
+|---|---|
+| 本站 `store.load()` 过去那样直通原始行 | **FAIL `index 56`**（= 界面上第一次红） |
+| 先过上游 `foldMessageRows`（= file/memory store 的读法） | **FAIL `index 81`**（= 界面上第二次红；上游解不了链式 `partOf` = #415） |
+| 本单：`runner/lib/transcript-fold.js` | **OK（92 条逻辑消息）** |
+
+**归因推翻了两条在册口径**（都在册很久）：
+① `AGENTS.md:1107`「runner 侧不需要补折叠（引擎自己折）」——**错**：引擎只调 `foldLedgerMessages`
+（只把 `partOf` 分片接回原消息），**载体折叠 `foldMessageRows` 是 store 的职责**
+（上游 `host-consumer-contract.md:2405-2409` + `:2442`；`resume-manager.js:239-241` 的 `seq` 播种本就面向折叠后的输出）。
+② #341 与巡检手册「引擎 resume 侧本站修不了，只能修数据（等上游 #415）」——**错**：本站 `portal/src/transcript-fold.js`
+是上游读侧的**超集**（分片行也登记自己的 key ⇒ 解链），链式夹具实测上游 FAIL / 本站 OK。
+
+**修法**：折叠接在 `runner/lib/store.js#load`，**且必须在全量拉齐之后**（agentd `case 'load'` 已把游标翻页聚合成一个数组）——
+接在 portal 分页端点的页内会在「一轮跨两页」时漏折（#338 同根）。新建 `runner/lib/transcript-fold.js` 是
+`portal/src/transcript-fold.js` 的**镜像**（FDE 镜像 build context = `runner/`，运行期拿不到 portal 源码；先例：
+`runner/lib/llm-models.js` 的 `positiveIntOrNull`）。两份的 `SHARED-FOLD-CORE` 区间**逐字节**由测试钉住
+⇒ 口径漂移只能两边一起改。`portal/src/transcript-fold.js` 只加了标记注释，逻辑零改动。
+
+**主 agent 亲跑变异 4 条**（每条先自证只改 1 行、且**一条一还原**）：
+① 摘掉接线（`return records`）⇒ **恰 4 条红**（标本①② + 真 `runToolLoop` 贯通 + 源码级「load 必须折」）；
+② 撤 runner 那份的 #341 解链闸 ⇒ **恰 2 条红**（标本② + 两份镜像字节对拍）；
+③ 单边改 portal 口径（`isFoldableMessageRow(record) && seq >= 0`）⇒ 镜像字节锁红（同一轮还顺手证明了「单边改」正是字节锁要拦的）；
+④ 让载体不接正文（`attached.set` 注释掉）⇒ **5 条红**（标本①② + 真 `runToolLoop` 贯通 + 镜像字节锁 + 与上游逐字段对拍）。
+⚠ ②③ 第一次连跑时**忘了还原 ②** 就测 ③ ⇒ 多出一条假红（标本②）——变异取证必须一条一还原。
+
+**⚠ 一条自己差点放过的假绿（本单最值钱的一处）**：`runToolLoop` 贯通用例**第一版只跑到崩溃后那次 resume，
+变异① 摘接线时它照样绿**（当时另三条变异也没把它打红）。原因：崩溃现场那次 resume 引擎自己会把宿主的 `:input:` 行当尾巴延后拼
+（`resume-manager.js:196-215`），**不折也能过**；砖发生在**下一次** resume（快照干净、尾巴支路不走）——
+真机正是这个次序（`07237084…` 崩溃后 resume 成功跑 8 轮 → `4f857875…` 才报 `index 56/81`）。
+⇒ 用例补成「崩溃 → 追问 → resume → **再 resume**」并加**前提自证**（`:input:` 行必须排在迟到的
+`tool_result` 之前），补完后变异① 才红在它上面。**教训：resume 类判据必须跑到「快照干净后的第二次 resume」。**
+
+**基线**：根 `node --test` **1460 项 / 1456 通过 / 0 失败 / 4 跳过**（同树不含本单 **1448 / 1444 / 0 / 4**
+⇒ 本单 **+12**：新 `runner/test/store-load-fold.test.js` 11 + `portal/test/transcript-fold-wiring.test.js` +1）。
+前端与 `portal/src` 运行时零改动（`portal/src/transcript-fold.js` 只加注释与标记）。
+`portal/test/transcript-fold-wiring.test.js` 那条「折叠模块只有一个消费点」顺带修了自身空转：
+它用「文件里出现 `transcript-fold.js` 字符串」当消费点判据，而本单在模块自己的文件头注释里点名了镜像 ⇒ 自己咬自己
+⇒ 判据排除模块自身（注释不是消费点）。
+
+**存量**：接线后新会话不再需要修数据、**已砖会话读侧自愈**。今天两次修数据照旧执行过（打地鼠，见 #367 与手册 §2/§5），
+备份表 `transcript_rounds_input_seq_bak_20261024`（1 行 `append_seq`）与 `transcript_rounds_partof_bak_20261024`（92 行 `partOf`）。
+
+**遗留**：上游 [erix-agent #458](https://github.com/ErixWong/erix-agent/issues/458)（把「宿主 `load()` 必须返回折叠后形状」
+从散文变成 exports + 契约判据）、[#415](https://github.com/ErixWong/erix-agent/issues/415)（写侧别再写链，落地并升 pin 后
+**两份镜像的解链闸要同时撤**——`runner/test/store-load-fold.test.js` 与 `portal/test/transcript-fold.test.js` 的源码级哨兵会红提示）。
