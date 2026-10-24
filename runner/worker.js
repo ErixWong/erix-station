@@ -420,16 +420,17 @@ async function startRun(msg) {
     executors: { ...fileTools.executors, ...shellTools.executors },
     schemas: [...fileTools.schemas, ...shellTools.schemas],
   });
-  // #363 draft：平台技能 bundled 通道——`/platform/skills`（宿主专目录 ro bind mount，portal 单一写者；
-  // 目录不存在 = 通道空，静默缺席，同 notes_dir 缺失的降级风格只 warn 不阻断）。
-  // 用户自建 `~/.erix/skills` 同名可覆盖平台版（loader 原生优先级：project > global > bundled）。
-  // 工具名冲突由 buildSkillTools 自行跳过并计入 errors（builtin 优先，#65 语义）。
+  // #363：平台技能 bundled 通道 = FDE 镜像内 /opt/erix/skills（COPY 进镜像，不可变随 digest pin）。
+  // 不用 bind mount：fde-proxy 契约只放 rw + userSpace 内源，ro 平台目录要改安全面；而 loader
+  // 原生优先级 project > ~/.erix/skills > bundled 已把**迭代通道**白送给用户空间：把同名技能丢进
+  // ~/.erix/skills（宿主 users/<fde>/home/.erix/skills，rw bind 现成）即秒级覆盖镜像版。
+  // 目录缺席 = 通道空，静默降级（notes 同款 warn 不阻断）。工具名冲突 builtin 优先（#65 语义）。
   let skillTools = { tools: [], executeTool: null, errors: [] };
   try {
     skillTools = await buildSkillTools({
       home: process.env.HOME || '/home/erix',
       cwd,
-      bundledDir: process.env.STATION_SKILLS_DIR || '/platform/skills',
+      bundledDir: process.env.STATION_SKILLS_DIR || '/opt/erix/skills',
       builtinNames: [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas].map((s) => s.name),
     });
     for (const e of skillTools.errors) {
