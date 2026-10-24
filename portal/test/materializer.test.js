@@ -4,6 +4,7 @@
 // 隔离约定（docs/testing.md §2.1）：注入临时目录，不碰真实 /srv/erix/users。
 import test from 'node:test';
 import { mock } from 'node:test';
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -177,6 +178,47 @@ test('renderHomeAgentsMd：clone 指引并入 FDE 级（平台不 clone / 空目
   assert.match(md, /git clone <地址> \./);
   assert.match(md, /git init/);
   assert.doesNotMatch(md, /<repo_url>/);
+});
+
+// GitHub 连通性告知（2026-10-24）：工位 agent 因 DNS 把 github 指到不可达旧边缘而 clone 六连败，
+// 退化成 tarball 快照（丢历史）且把自建代理写进不持久的 /tmp——这一节钉的就是当时的四个认知缺口：
+// 先查解析、自己探可用 IP、代理放 ~/bin 保历史 fetch、tarball 只是无历史兑底。
+test('renderHomeAgentsMd：GitHub 拉取节存在且把「先查解析/探可用 IP/平台代理保历史/快照兑底」写清', () => {
+  const md = renderHomeAgentsMd({ fdeName: 'alice' });
+  assert.match(md, /## GitHub 拉取：clone 超时先查解析/, '必须有一节把「超时≠断网」的定性钉在标题里');
+  assert.match(md, /--resolve github\.com:443:<候选IP>/, '必须给可直接执行的探 IP 判据命令');
+  assert.match(md, /python3 ~\/bin\/github-pinproxy\.py/, '必须指向平台下发的代理脚本本体（不让每个 session 现发明）');
+  assert.match(md, /脚本放 `~\/bin` 不放 `\/tmp`/, '自己另写时也必须放持久层（/tmp 不持久）');
+  assert.match(md, /http\.proxy=http:\/\/127\.0\.0\.1:<端口>.*fetch/s, '必须给出保完整历史的 fetch 口径');
+  assert.match(md, /tar\.gz\/HEAD/, '必须写 codeload 快照兑底');
+  assert.match(md, /没有 ssh 客户端/, '必须堵住 SSH 备选路径的幻想');
+});
+
+// 代理脚本本体随 buildFilePlan 下发（同 AGENTS.md 同通道），并归入平台管理路径——
+// 否则要么没人有脚本可用，要么 stale 清理会把用户自己放 ~/bin 的其它文件当平台文件误删。
+test('buildFilePlan：下发 ~/bin/github-pinproxy.py 且归入平台管理路径；脚本可编译', () => {
+  const files = buildFilePlan({
+    fdeName: 'alice',
+    baseDomain: 'example.test',
+    llmBaseUrl: 'http://llm.example.test:4000',
+    allocations: [],
+    root: '/tmp/unused',
+    generation: 1,
+  });
+  const entry = files.find((f) => f.containerPath === '/home/erix/bin/github-pinproxy.py');
+  assert.ok(entry, 'file plan 必须包含钉位代理脚本');
+  assert.ok(isPlatformManagedPath('/home/erix/bin/github-pinproxy.py'), '脚本路径必须归平台管理（stale 清理误删保护面）');
+  assert.ok(!isPlatformManagedPath('/home/erix/bin/my-tool.py'), '用户自建 ~/bin 下其它文件不得被判成平台文件');
+  assert.match(entry.content, /127\.0\.0\.1/, '只监听回环');
+  assert.match(entry.content, /CONNECT/, 'CONNECT 隧道定位');
+  // 语法面：有 python3 就真编译一遍；没有就只钉形状（CI ubuntu-latest 有 python3）。
+  const py = spawnSync('python3', ['-c', 'import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)'], { input: undefined });
+  if (py.error === undefined) {
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pinproxy-')), 'p.py');
+    fs.writeFileSync(f, entry.content);
+    const r = spawnSync('python3', ['-m', 'py_compile', f]);
+    assert.equal(r.status, 0, `代理脚本必须能被 python3 编译：${r.stderr}`);
+  }
 });
 
 // ---------------------------------------------------------------------------

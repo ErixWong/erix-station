@@ -21,6 +21,100 @@ export const CONTAINER_HOME = `/home/${FDE_CONTAINER_USER}`;
 
 // 平台文件权限（user-space §6.2）：普通平台文件 0644，manifest 0444。
 const FILE_MODE = 0o644;
+
+// GitHub 钉位 CONNECT 代理（平台随开户下发到 ~/bin/github-pinproxy.py，AGENTS.md「GitHub 拉取」节引用）。
+// 为什么平台下发而不是让 agent 现写（2026-10-24 实证）：touwakamate 工位 clone 六连败后，agent 自己
+// 重新发明了同款代理（1.3KB、写进不持久的 /tmp）——能赌对，但每个 session 重发明一次就是 N 份会过期
+// 的平行真相；脚本本体收进单一真相通道（同 AGENTS.md 自己的理由）。纯 TCP 转发，TLS 端到端，不碰凭据。
+// 候选 IP 是历史实测值（含真机验证过的 .3/.4 与 20.205.243.16x）；全拨失败时 AGENTS.md 有自探判据。
+const GITHUB_PINPROXY_SCRIPT = String.raw`#!/usr/bin/env python3
+# GitHub 钉位 CONNECT 代理（平台物化下发，平台管理、勿改；用法见 ~/AGENTS.md「GitHub 拉取」节）。
+# 背景：公司 DNS 间歇性把 github 域名指向不可达的旧边缘地址（TCP 连得上、HTTP 不回话）。
+# 本脚本只监听 127.0.0.1，收到 CONNECT 后把 github 域名拨到候选可用 IP；纯 TCP 转发，
+# TLS 端到端，证书由 git/curl 自己校验，token/代码对本脚本透明。
+# 用法：python3 ~/bin/github-pinproxy.py [端口]    # 默认 18080
+#   git -c http.proxy=http://127.0.0.1:<端口> fetch origin
+import socket, sys, threading
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18080
+BY_HOST = {
+    'github.com': ['140.82.112.4', '140.82.113.4', '140.82.114.4', '140.82.112.3', '20.205.243.166'],
+    'api.github.com': ['20.205.243.168', '20.205.243.166', '140.82.113.4', '140.82.112.4'],
+    'codeload.github.com': ['140.82.114.4', '140.82.113.4', '140.82.112.4', '20.205.243.166'],
+    'objects.githubusercontent.com': ['140.82.112.4', '140.82.113.4', '140.82.114.4'],
+    'raw.githubusercontent.com': ['140.82.112.4', '140.82.113.4', '140.82.114.4'],
+}
+PREFERRED = {}
+
+def pump(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+def handle(c):
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        d = c.recv(4096)
+        if not d:
+            c.close()
+            return
+        buf += d
+    try:
+        method, hostport, _ = buf.split(b'\r\n', 1)[0].decode().split()
+    except ValueError:
+        c.close()
+        return
+    if method != 'CONNECT':
+        c.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+        c.close()
+        return
+    host, _, port = hostport.rpartition(':')
+    port = int(port or 443)
+    order = list(BY_HOST.get(host, []))
+    if PREFERRED.get(host) in order:
+        order.remove(PREFERRED[host])
+        order.insert(0, PREFERRED[host])
+    s = None
+    for ip in (order or [host]):
+        try:
+            s = socket.create_connection((ip, port), timeout=6)
+            if host in BY_HOST:
+                PREFERRED[host] = ip
+            break
+        except OSError:
+            pass
+    if s is None:
+        c.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+        c.close()
+        return
+    c.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
+    rest = buf.split(b'\r\n\r\n', 1)[1]
+    if rest:
+        s.sendall(rest)
+    threading.Thread(target=pump, args=(c, s), daemon=True).start()
+    pump(s, c)
+    c.close()
+    s.close()
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', PORT))
+srv.listen(64)
+print('github-pinproxy on 127.0.0.1:%d' % PORT, flush=True)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+`;
 const MANIFEST_MODE = 0o444;
 // 目录权限：工作区目录传 2770，.erix 0750（user-space §6.2）。
 // 2770 是历史遗留的意图值，**落盘恒为 0770**（mkdir 交不出 setgid；chown 交出属组后的下一轮 chmod
@@ -136,6 +230,16 @@ export function renderHomeAgentsMd({ fdeName }) {
     '- clone 与 git 凭据（SSH key / token）由你在容器内自行配置（等同你自己的开发机）',
     '- 平台不 clone、不下发 git 凭据',
     '',
+    // GitHub 连通性（2026-10-24 真机：某工位 clone 六连败后靠 tarball 快照才拿到代码）。
+    // 只写「症状 + 怎么自己找可用 IP + 兑底手段」，不把可用 IP 当清单拄进来（同上面不写端口号池的理由）。
+    '## GitHub 拉取：clone 超时先查解析，不是断网',
+    '',
+    '- 出口链路没封，但公司 DNS 常把 `github.com` / `api.github.com` 指向一两个**不可达的旧边缘地址**（现象：TCP 连得上、TLS 握得上、HTTP 不回话）。所以 `git clone` 反复超时/挂死时，先怀疑解析结果。',
+    '- 3 秒定性（通了就确认是解析问题）：`timeout 10 curl -s -o /dev/null -w "%{http_code}\n" --max-time 8 --resolve github.com:443:<候选IP> https://github.com`，多个候选试到一个返 2xx/3xx 的即拿它当可用 IP；`getent hosts github.com` 看到与可用地址不同即中招。',
+    '- 可用期间的正确做法：直接起平台已下发的钉位代理 `python3 ~/bin/github-pinproxy.py`（只监听回环、监听端口见脚本首行用法注释，平台管理别改；端口被占可传参换），再 `git -c http.proxy=http://127.0.0.1:<端口> fetch origin`——**保完整历史**（git 无 `https.proxy` 配置键，`http.proxy` 对 https 远端同样生效）。自己另写代理时脚本放 `~/bin` 不放 `/tmp`（`/tmp` 不持久）。',
+    '- 兑底（拿不到代理时）：`codeload.github.com/<owner>/<repo>/tar.gz/HEAD` 拉默认分支快照——**没有历史**，拿到后记得用上面的方法 `git fetch` 补回。',
+    '- 容器内**没有 ssh 客户端**，不要规划 SSH 备选路径；`codeload.github.com` 通常不受该解析问题影响。',
+    '',
     `（FDE 标识：${fdeName}）`,
     '',
   ].join('\n');
@@ -209,6 +313,7 @@ export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, ob
   };
 
   add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
+  add(`${CONTAINER_HOME}/bin/github-pinproxy.py`, GITHUB_PINPROXY_SCRIPT);
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
   add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, observedPorts, generation }));
@@ -336,6 +441,7 @@ export function isPlatformManagedPath(containerPath) {
   if (typeof containerPath !== 'string' || !containerPath.startsWith(`${CONTAINER_HOME}/`)) return false;
   const rel = containerPath.slice(CONTAINER_HOME.length + 1);
   if (rel === 'AGENTS.md') return true;
+  if (rel === 'bin/github-pinproxy.py') return true;
   if (rel.startsWith('.erix/')) return true;
   if (!rel.startsWith('projects/')) return false;
   const parts = rel.split('/');
