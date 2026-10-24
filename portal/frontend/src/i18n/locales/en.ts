@@ -180,6 +180,12 @@ export const en = {
       label: 'Aborted · partial output',
       truncated: 'Output was not finished before the run stopped (truncated)',
     },
+    // Mermaid diagram blocks (see pi-web MermaidBlock): preview/source toggle & render-failure note
+    mermaid: {
+      preview: 'Preview',
+      source: 'Source',
+      error: 'Diagram failed to render (syntax error); source shown above',
+    },
     event: {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',

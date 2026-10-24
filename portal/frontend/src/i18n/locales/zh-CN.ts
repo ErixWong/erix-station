@@ -201,6 +201,12 @@ export const zhCN = {
       label: '已中止 · 部分输出',
       truncated: '输出在停止前未生成完全（已截断）',
     },
+    // mermaid 图块（参考 pi-web MermaidBlock）：预览/源码切换按钮文案与渲染失败提示
+    mermaid: {
+      preview: '预览',
+      source: '源码',
+      error: '图表渲染失败（语法错误），以上展示源码',
+    },
     event: {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',
