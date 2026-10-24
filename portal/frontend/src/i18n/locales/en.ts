@@ -389,7 +389,15 @@ export const en = {
     },
     stateShortUnknown: 'Unknown',
     // issue #308 §3.4: the sidebar sections are cwd-scoped, ports belong to the workstation
-    scopeHint: 'Preview ports of this workstation (independent of the selected directory).',
+    scopeHint: 'Ports belong to the workstation; the list is filtered to processes in use in the current directory (the rest are collapsed below).',
+    // 观测层 MVP（迁移 0022）：真实监听注解；无观测的行不渲染任何反向文案（null ≠ 空闲）。
+    observedHere: 'In use here',
+    observedTitle: 'Container process listening on this port',
+    observedUptime: 'up {ago}',
+    duplicateWarn: '⚠ {cwd} is being served on {ports} at the same time — likely old and new instances of the same project (processes from ended sessions do not exit on their own). Check which address you actually want.',
+    noneHere: 'No process is listening for this directory right now (addresses still work — expand the list below to open them manually).',
+    othersExpand: 'Other ports of this workstation ({count})',
+    othersCollapse: 'Collapse other ports',
     stateHint: '“Admitted once” only means the first credential was admitted; it does not mean an app is listening in the container.',
     emptySelf: 'You have no preview ports yet (the platform has not assigned a block, or all of them were released).',
     emptyFde: 'This FDE has no live preview ports (not onboarded yet, or already offboarded).',
