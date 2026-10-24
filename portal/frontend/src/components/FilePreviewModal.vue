@@ -10,6 +10,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef } from 
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import { renderMarkdown } from '../lib/markdown';
+// 与 StreamPanel 同口径：.md 预览里的 ```mermaid 块也挂图（v-html 落定后 DOM 后处理）。
+import { vMermaid } from '../directives/mermaid';
 
 // issue #101 P2：用户可见文案走 i18n（preview.* / common.*）；错误 message 来自后端（原样展示）。
 const { t } = useI18n();
@@ -99,7 +101,7 @@ function onKeydown(e: KeyboardEvent) {
         <template v-else-if="preview">
           <img v-if="preview.kind === 'image'" :src="preview.data" :alt="preview.name" class="mx-auto max-h-full max-w-full">
           <!-- Markdown：渲染器输出走 v-html（先转义后格式化，无注入面），.md 类复用全局样式 -->
-          <div v-else-if="isMarkdown" class="md text-sm" v-html="html"></div>
+          <div v-else-if="isMarkdown" v-mermaid class="md text-sm" v-html="html"></div>
           <pre v-else class="overflow-auto whitespace-pre-wrap break-words font-mono text-xs">{{ preview.data }}</pre>
         </template>
       </div>
