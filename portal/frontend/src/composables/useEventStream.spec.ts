@@ -1361,3 +1361,51 @@ describe('issue #279：跨轮复用 provider call id ⇒ 卡片身份含轮号',
     expect(s.cardIdentityOfCall('c1')).toBe('r1:c1');
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #371-A：`persistence_error`（引擎落盘失败告警，经 runner `diagnostics.error` 上报）。
+// 缺陷本体：本站从没传 `diagnostics` ⇒ 真机 `run_events` 该类型 0 行，「剥掉折叠归档重试一次」
+// 这类**非致命降级**在界面上全隐形（run 绿、有正文、无提示）。所以这里钉的不是样式，而是
+// 「这条事件到底有没有被接住」——含实时监听面（漏加 EVENT_TYPES 就是一条都收不到）。
+// ---------------------------------------------------------------------------
+describe('#371-A persistence_error（落盘失败告警）', () => {
+  const P = { port: 'transcript', phase: 'write', operation: 'appendRound', engine_run_id: 'sess-1' };
+
+  it('fatal:false → 中性分隔行（onSep，不是 onSysErr 红行），文案带 operation', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('persistence_error', { seq: 3, ...P, fatal: false, error: { name: 'Error', message: 'too large' } });
+    expect(hooks.onSep).toHaveBeenCalledTimes(1);
+    expect(hooks.onSep).toHaveBeenCalledWith('落盘降级：appendRound 记录未存入（本次任务不受影响）');
+    expect(hooks.onSysErr).not.toHaveBeenCalled(); // 非致命刷红 = 谎报严重程度
+  });
+
+  it('fatal:true 与「字段缺失」（= erix-agent 0.23.0 及以前的旧事件）都**不刷**：红面归 run_end 的 persistence_failed', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('persistence_error', { seq: 1, ...P, fatal: true });
+    lastES().emit('persistence_error', { seq: 2, ...P }); // 旧引擎没有 fatal
+    expect(hooks.onSep).not.toHaveBeenCalled();
+    expect(hooks.onSysErr).not.toHaveBeenCalled();
+  });
+
+  it('operation 脏值/缺失 → 退回 round，绝不把 [object Object] 渗进用户可见文案', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('persistence_error', { seq: 1, ...P, fatal: false, operation: { x: 1 } });
+    lastES().emit('persistence_error', { seq: 2, ...P, fatal: false, operation: '' });
+    expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
+      '落盘降级：round 记录未存入（本次任务不受影响）',
+      '落盘降级：round 记录未存入（本次任务不受影响）',
+    ]);
+  });
+
+  it('EventSource 必须挂上这个具名监听（EVENT_TYPES 漏加 = 实时一条都收不到，且不报错不警告）', () => {
+    const s = useEventStream(makeHooks());
+    s.connect('sess-1');
+    expect([...lastES().listeners.keys()]).toContain('persistence_error');
+  });
+});

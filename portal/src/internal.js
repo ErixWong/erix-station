@@ -23,7 +23,25 @@ const HOLD_MS_MAX = 30000; // claim 长轮询 hold 上限
 
 const MAX_EVENTS_PER_BATCH = 200; // runner §7.2
 const MAX_EVENTS_BYTES = 256 * 1024; // runner §7.2
-const MAX_ROUND_BYTES = 1024 * 1024; // portal.md §9.7
+// portal.md §9.7：单轮 transcript 记录体积上限。**默认仍是契约值 1 MiB**，issue #371-B 起可由
+// env `MAX_ROUND_BYTES` 覆盖（真机复现「宿主拒 → 引擎剥归档重试一次」要把闸调小到几百 KB，
+// 不可能为此跑 160 轮）。⚠ 调之前先看下面那个算术——调小于它，正常折叠记录也会天天碰闸。
+// 算术（`test/internal-round-size-cap.test.js` 钉住）：上游 erix-agent#461 把折叠归档夹到 256 KiB
+// （`ERIX_FOLD_ARCHIVE_MAX_BYTES`）+ 非归档部分真机稳定≈ 20 KiB + `messages` 满预算
+// （203 161 估算 token × 2.78 B）≈ 565 KiB ⇒ 单条记录≈ 840 KiB < 1 MiB。
+const MAX_ROUND_BYTES_DEFAULT = 1024 * 1024;
+
+/**
+ * 单轮上限解析（#371-B）：显式 env > 默认 1 MiB。非法值（非整数 / ≤0 / 乱码）**退回默认**，
+ * 不拒启动——本值只是防护上限，配错时宁可回到契约值也不要让 portal 起不来。
+ */
+export function resolveMaxRoundBytes(raw = process.env.MAX_ROUND_BYTES) {
+  if (raw === undefined || raw === null || raw === '') return MAX_ROUND_BYTES_DEFAULT;
+  const parsed = Number(String(raw).trim());
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return MAX_ROUND_BYTES_DEFAULT;
+  return parsed;
+}
+const MAX_ROUND_BYTES = resolveMaxRoundBytes();
 
 /** internal 通道统一错误（http.js 映射为标准错误信封，portal.md §9.13）。 */
 export class InternalError extends Error {
@@ -1085,7 +1103,7 @@ export async function putRound(pool, { container, user, runId, round, claimToken
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_ROUND_BYTES) {
-    throw new InternalError(400, 'validation_failed', 'round 请求体超过 1MB 上限');
+    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B：闸可由 env 调，文案要说真值（旧文案写死「1MB」）
   }
 
   const run = await fetchRun(pool, runId, user.id);
@@ -1324,7 +1342,7 @@ export async function putSessionRound(pool, { container, user, key, round, claim
   }
   const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bytes > MAX_ROUND_BYTES) {
-    throw new InternalError(400, 'validation_failed', 'round 请求体超过 1MB 上限');
+    throw new InternalError(400, 'validation_failed', `round 请求体超过 ${MAX_ROUND_BYTES} 字节上限`); // #371-B：闸可由 env 调，文案要说真值（旧文案写死「1MB」）
   }
 
   await fetchSession(pool, key, user.id);

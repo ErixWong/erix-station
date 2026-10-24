@@ -1813,6 +1813,13 @@ const HISTORY_EVENT_TYPES = new Set([
   // 给前端（前端 `useEventStream.ts` 的 `default: return;` 中性忽略），若不进白名单则刷新页面
   // 后历史回放会把它过滤掉——同一事件两种可见性就是口径不一致，故列入可回放集合。
   'model_metadata_missing',
+  // issue #371-A：`persistence_error`（引擎 erix-agent#461 起的落盘失败告警，带 `fatal`）此前
+  // **库里存着、读不出来**：写入侧不过白名单（`internal.js` 直接 INSERT），展示侧不过 ⇒ 刷新后
+  // 一条都不提。而这条事件最重要的时刻，正是用户刷新来看「我这轮到底存下没」的那一刻。
+  // 前端只把 `fatal === false` 刷成**中性**分隔行（致命那条由 `run_end` 的 `persistence_failed`
+  // 红色面负责，不在这里重复报）。与前端 `useEventStream.ts` 的 `EVENT_TYPES` +
+  // `HISTORY_REPLAY_TYPES` 是**三处独立存亡的集合**（#288 教训），本单同改。
+  'persistence_error',
 ]);
 const HISTORY_EVENT_DEFAULT_LIMIT = 500;
 const HISTORY_EVENT_MAX_LIMIT = 2000;

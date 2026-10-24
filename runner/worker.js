@@ -253,6 +253,30 @@ export function loopEventPayload(event) {
         partial_output_available: event.partialOutputAvailable === true,
       };
     }
+    case 'persistence_error': {
+      // issue #371-A：引擎的**落盘失败事件**（`orchestrator.js` 的 `persistenceErrorEvent`）。
+      // ⚠ 它**不走 `onEvent`**，走 `diagnostics.error`（本站此前根本没传 `diagnostics` ⇒ 这个事件
+      // 从来没进过 `run_events`；真机全库 `type='persistence_error'` = **0 行**，2026-10-24 查得）。
+      // 字段以引擎 `persistenceErrorEvent` 的实际形状为准（钉在 0.23.0 `orchestrator.js:206-222`，
+      // 与 #461 后的 0.25 同形）：`{type, port, phase, operation, runId, fatal, sideEffect,
+      // error:{name,message,stack}, ts}`。两个故意取舍：
+      //   · **`stack` 不透**：那是宿主日志的东西，塞进 UI payload 只会淹没前端（单事件上限 256KB）。
+      //   · `fatal` **归一成布尔且缺字段算致命**（`!== false`）：前端靠它分「降级继续」与「run 已终止」，
+      //     脏值/缺字段时宁可报重不可报轻（把真失败刷成灰 = 谎报严重程度，#212 口径）。
+      // ⚠ `runId` 是引擎 store key = transcriptKey = sessionId（#81 P2 老坑），落名 `engine_run_id`。
+      const err = event.error && typeof event.error === 'object' ? event.error : {};
+      const str = (v) => (typeof v === 'string' && v !== '' ? v : null);
+      return {
+        port: str(event.port) ?? 'transcript',
+        phase: str(event.phase),
+        operation: str(event.operation) ?? 'unknown',
+        engine_run_id: str(event.runId),
+        fatal: event.fatal !== false,
+        sideEffect: event.sideEffect ?? null,
+        error: { name: str(err.name) ?? 'Error', message: str(err.message) ?? '' },
+        ts: str(event.ts),
+      };
+    }
     default:
       return event ?? {};
   }
@@ -548,6 +572,21 @@ async function startRun(msg) {
       onUsage: () => {}, // 记账以 runToolLoop 返回值 usage 为准（§7.3）
       onPersistenceError: (err) => {
         sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: `persistence error: ${String(err?.message ?? err)}` });
+      },
+      // issue #371-A：引擎落盘失败的**事件**通道。与上面的 `onPersistenceError` 是两条不同的嘴：
+      // 那条只拿得到 `Error` 对象（本站只落一条 warn 日志，界面上什么都看不见），而
+      // `diagnostics.error` 才是带 `fatal`/`operation`/`phase` 的完整事件。此前本站**从来没传
+      // `diagnostics`** ⇒ 事件整条丢弃（真机 `run_events` 里 `persistence_error` 恒 0 行）。
+      // 接上之后：致命那条仍由 `run_end`（`persistence_failed`）刷红，本事件只负责可审计的明细；
+      // 非致命那条（erix-agent#109 宿主端口桥 / #461 剥归档重试）以前是**真隐形**，现在会中性刷一行。
+      diagnostics: {
+        // 引擎现在只从 `persistenceErrorEvent` 报（type 恒为 `persistence_error`），但那是上游
+        // 可能改的自由面：type 缺失/不是非空字符串时守到 `persistence_error`，不让事件因为一个
+        // 名字而整条丢（丢了就是又隐形回去）。
+        error: (event) => {
+          const type = typeof event?.type === 'string' && event.type !== '' ? event.type : 'persistence_error';
+          emitEvent(type, loopEventPayload(event));
+        },
       },
       onObserverError: (err) => {
         sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: `observer error: ${String(err?.message ?? err)}` });

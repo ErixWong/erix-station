@@ -219,6 +219,10 @@ export const en = {
       // Tool-name suffix: the name comes from the payload (engine pass-through = foreign data); dirty
       // values are already blocked by a typeof guard at the call site.
       toolReplayTool: ' ({name})',
+      // issue #371-A: engine `persistence_error{fatal:false}` — a storage failure that does NOT end the
+      // run (the stripped part is the fold archive; originals stay readable in the ledger rows, #375).
+      // Neutral separator, never red; fatal ones are rendered by `run_end` / `persistence_failed`.
+      persistenceDegraded: 'persistence degraded: the {operation} record was not stored (this run is unaffected)',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       // issue #321 (erix-station): the judge is forever only an **opinion**, never an acceptance — shown on
