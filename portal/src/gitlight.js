@@ -157,7 +157,10 @@ function runGitStatus(repoAbs, { gitBin, timeoutMs, maxEntries }) {
     }
     let buf = '';
     let settled = false;
-    const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(state); } };
+    // resolve 的是**快照**而不是 `state` 本体：截断路径先 resolve，随后 `close` 会带着
+    // `code:null`（被自己 SIGKILL）再改一次 `state.reason`——拿引用就会在 resolve 之后脉脉污染调用方读到的值
+    //（同一个“resolve 后继续改引用”的坑，pi #342 在前端刚踩过一次）。
+    const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve({ ...state }); } };
     const timer = setTimeout(() => {
       state.reason = 'unchecked_partial';
       state.truncated = true;
@@ -173,6 +176,11 @@ function runGitStatus(repoAbs, { gitBin, timeoutMs, maxEntries }) {
         if (line) pushEntry(state, line);
         if (state.tracked.length + state.untracked.length + state.nested.length >= maxEntries) {
           state.truncated = true;
+          // ⚠ **截断不是「没判完」**：已经亲眼看见 ≥maxEntries 条脏条目，结论是确定的（红）。
+          // 这里曾长期留 `ok:false` ⇒ 调用方 `if (!st.ok) → unchecked_failed` 把「最脏的那一档」
+          // 判成灰灯。真机首例就撞上了：生产 `eric/cmms`（未跟踪 564 KB / 几百条）永远显灰。
+          // 回归测试见 `gitlight.test.js`「脏条目超过 50 条 ⇒ 仍是红」。
+          state.ok = true;
           try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
           finish();
           return;

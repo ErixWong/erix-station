@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getGitLight, SCAN_EXCLUDE_DIRS, GIT_LIGHT_MAX_REPOS } from '../src/gitlight.js';
+import { getGitLight, SCAN_EXCLUDE_DIRS, GIT_LIGHT_MAX_REPOS, GIT_STATUS_MAX_ENTRIES } from '../src/gitlight.js';
 import { DirError } from '../src/dirs.js';
 
 const GIT_ID = ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false'];
@@ -430,4 +430,51 @@ test('哨兵：排除名单必须与 runner 侧 artifacts.js 的 EXCLUDE_DIRS �
   assert.ok(m, 'runner 侧 EXCLUDE_DIRS 形态变了，请同步这里的哨兵');
   const runnerSet = new Set(m[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')));
   assert.deepEqual([...SCAN_EXCLUDE_DIRS].sort(), [...runnerSet].sort(), 'portal 侧与 runner 侧的排除名单漂移');
+});
+
+// ---------------------------------------------------------------------------
+// 真机回归：脏条目**超过截断上限**（生产首例撞的就是这个 —— `eric/cmms` 未跟踪 564 KB /
+// 几百条，`runGitStatus` 的截断路径没把 `ok` 置真 ⇒ 调用方 `if (!st.ok) → unchecked_failed`
+// ⇒ 最该亮红的仓库长期显灰「没判完」。单测此前只测了「仓库数封顶」的 truncated_repos，
+// 没测「单仓库条目封顶」的结果形状，所以放过了它。）
+// ---------------------------------------------------------------------------
+
+test('未跟踪条目超过 50 条 ⇒ 仍是红 + truncated=true（"看见 ≥50 条"是确定结论，不是"没判完"）', async () => {
+  const { root, projects } = tmpUserspace();
+  const { dir } = makeSyncedRepo(projects, 'p1');
+  for (let i = 0; i < GIT_STATUS_MAX_ENTRIES + 10; i++) fs.writeFileSync(path.join(dir, `u${i}.txt`), 'x\n');
+  const r = await light(root);
+  assert.equal(r.light, 'red');
+  assert.equal(r.reason, 'untracked');
+  assert.notEqual(r.reason, 'unchecked_failed', '截断被当成"没判完"就是这个 bug 的形状');
+  const row = r.repos[0];
+  assert.equal(row.truncated, true, '必须如实标"只数了前 50 条"，前端才不谎报数量');
+  assert.ok(row.untracked_count >= GIT_STATUS_MAX_ENTRIES, '计数至少到上限（不谎称只有这么多）');
+});
+
+test('已跟踪改动超过 50 条 ⇒ 红 uncommitted（同一条路径，已跟踪侧也要成立）', async () => {
+  const { root, projects } = tmpUserspace();
+  const { dir } = makeSyncedRepo(projects, 'p1');
+  // 先造 N 个已跟踪文件并提交，再全部改一遍 ⇒ status 只报已跟踪改动（非 ?? 行）
+  const n = GIT_STATUS_MAX_ENTRIES + 5;
+  for (let i = 0; i < n; i++) fs.writeFileSync(path.join(dir, `t${i}.txt`), 'base\n');
+  git(['add', '-A'], dir);
+  git(['commit', '-q', '-m', 'track many'], dir);
+  for (let i = 0; i < n; i++) fs.writeFileSync(path.join(dir, `t${i}.txt`), 'dirty\n');
+  const r = await light(root);
+  assert.equal(r.light, 'red');
+  assert.equal(r.reason, 'uncommitted');
+  assert.equal(r.repos[0].truncated, true);
+});
+
+test('截断与超时是两回事：预算耗尽（没看见条目）⇒ 灰 unchecked_partial，不许借截断洗成红', async () => {
+  const { root, projects } = tmpUserspace();
+  const { dir } = makeSyncedRepo(projects, 'p1');
+  for (let i = 0; i < GIT_STATUS_MAX_ENTRIES + 10; i++) fs.writeFileSync(path.join(dir, `u${i}.txt`), 'x\n');
+  // 第一次 now() 给起点、第二次直接越过总预算 ⇒ 进 inspectRepo 前就没预算（真"没判完"）
+  let calls = 0;
+  const now = () => (calls++ === 0 ? 1_000_000 : 1_000_000 + 10 ** 9);
+  const r = await light(root, '~/projects/p1', { now });
+  assert.equal(r.light, 'grey');
+  assert.equal(r.reason, 'unchecked_partial');
 });
