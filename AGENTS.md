@@ -1539,7 +1539,7 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **未发版**（不进 v0.1.31 的任何承诺，等决策者定窗口）。
 - 展示层过滤**没**同步到目录树（`fileTree`）：树面板里点开头目录仍可见可展开，是刻意的——树是浏览器的用法，人可能就是要看 `.git` / `.github`；下拉才是被污染的那一面。
 
-### 8.52 文件预览四通道 + kkFileView 自建 5.0.3 接入（issue #366，PR 待开，分支 `feat-261024-06-file-preview-p0p1`）
+### 8.52 文件预览四通道 + kkFileView 自建 5.0.3 接入（issue #366，**PR #372**，分支 `feat-261024-06-file-preview-p0p1`）
 
 > 规格 = issue **#366**（定稿），前史 #356（其中「签名票据下载」一节基于「文件在 FDE 容器内」的**事实错误**，已被 #366 作废：文件在宿主 bind mount `/docker/erix/users`，portal 与 kk 挂同一棵盘即可 ro 直读）。契约落在 `docs/api/portal.md` **§4.11**，env 面在 `docs/env.md`（`KK_*` 四行），部署面在 `deploy/README.md` + `deploy/docker-compose.yml`（`station-kkfileview`，profile `kkfileview`）。
 
