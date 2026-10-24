@@ -783,6 +783,43 @@ test('listFdePreviewPorts：observed 只附新鲜观测行；陈旧（>45s 窗�
   assert.equal(byPort.get(22003).observed, null, '别人的观测不混进本 FDE');
 });
 
+// 端口池外的真实监听（vite 5173 这类）：LEFT JOIN 不盖住 ⇒ 合成无地址只读行，
+// 否则「当前目录起了服务但面板说没有」。非项目目录（agentd 自己的 4000 等）不合成。
+test('listFdePreviewPorts：池外观测合成无地址行（~/projects 下）；非项目 cwd 与空 cwd 不合成', async () => {
+  const fresh = new Date().toISOString();
+  let calls = 0;
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM port_allocations')) {
+        calls += 1;
+        return { rows: [{ id: 'alloc-1', port: 22001, hostname: 'alice-p-22001.x', url: 'http://alice-p-22001.x', state: 'active', scope: 'fde', role: 'spare', exposure: 'private' }] };
+      }
+      if (sql.includes('FROM port_observations')) {
+        return { rows: [
+          { port: 5173, pid: 41, cwd: '~/projects/shop', cmd: 'node vite', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 8000, pid: 42, cwd: '/home/erix/projects/api', cmd: 'uvicorn', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 4000, pid: 7, cwd: '/opt/erix', cmd: 'node agentd.js', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 34107, pid: 1, cwd: null, cmd: null, branch: null, proc_started_at: null, observed_at: fresh },
+        ] };
+      }
+      throw new Error(`unexpected sql: ${sql}`);
+    },
+  };
+  const items = await listFdePreviewPorts(pool, { fdeId: 'u-alice' });
+  const byPort = new Map(items.map((i) => [i.port, i]));
+  assert.equal(calls, 1, '观测取数复用同一条查询（池外合成不新增 SQL，fake pool 零改动）');
+  assert.equal(byPort.get(22001).observed, null, '池内无观测行仍恒 null（合成不污染既有行形状）');
+  assert.equal(byPort.get(5173).id, 'observed:5173');
+  assert.equal(byPort.get(5173).url, null);
+  assert.equal(byPort.get(5173).hostname, null);
+  assert.equal(byPort.get(5173).state, 'observed');
+  assert.equal(byPort.get(5173).observed.cmd, 'node vite');
+  assert.equal(byPort.get(8000).observed.cmd, 'uvicorn', '未 sanitize 的绝对路径形（/home/<u>/projects/）同样合成');
+  assert.equal(byPort.get(4000), undefined, 'agentd 自己的内部口（非 ~/projects）不进列表');
+  assert.equal(byPort.get(34107), undefined, 'cwd 未知的观测不合成（不是用户的项目）');
+  assert.deepEqual([...byPort.keys()].sort((a, b) => a - b), [5173, 8000, 22001], '合并按 port 全局排序');
+});
+
 test('listFdePreviewPorts：观测表读失败（旧部署无表）⇒ 降级为全 null，列表照常', async () => {
   const store = aliceSeed();
   const pool = store.pool();

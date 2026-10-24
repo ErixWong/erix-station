@@ -367,11 +367,6 @@ export const en = {
     batchBlocked: 'The browser blocked some new tabs; open them one by one:',
     // issue #286: human-facing cookie notice (the edge stripping Cookie is by design, not a bug;
     // agents inside the workspace are told by rule 7 in the container's ~/AGENTS.md, humans are told here)
-    cookieNotice:
-      'Note: the platform edge strips the Cookie header from requests, so do not use cookie-based sessions '
-      + 'on preview channels — pass your session in the Authorization header. '
-      + '(Agents inside the workspace are already told by rule 7 in the container’s ~/AGENTS.md; '
-      + 'this note is for human developers.) This is by design, not a bug.',
     hostnameCopyTitle: '{url} (click to copy the full URL)',
     copiedUrl: 'Preview URL copied to clipboard.',
     copyFailed: 'Copy failed: ',
@@ -388,16 +383,17 @@ export const en = {
       active: 'Admitted',
     },
     stateShortUnknown: 'Unknown',
-    // issue #308 §3.4: the sidebar sections are cwd-scoped, ports belong to the workstation
-    scopeHint: 'Ports belong to the workstation; the list is filtered to processes in use in the current directory (the rest are collapsed below).',
-    // 观测层 MVP（迁移 0022）：真实监听注解；无观测的行不渲染任何反向文案（null ≠ 空闲）。
-    observedHere: 'In use here',
-    observedTitle: 'Container process listening on this port',
+    // 人侧文案面向不懂技术的业务用户：不出现端口/进程/监听这类词（口径与 zh-CN 一致）。
+    scopeHint: 'These addresses belong to your workstation; the list shows only projects live in the current directory.',
+    // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
+    observedHere: 'Running here',
+    observedTitle: 'Program using this address',
     observedUptime: 'up {ago}',
-    duplicateWarn: '⚠ {cwd} is being served on {ports} at the same time — likely old and new instances of the same project (processes from ended sessions do not exit on their own). Check which address you actually want.',
-    noneHere: 'No process is listening for this directory right now (addresses still work — expand the list below to open them manually).',
-    othersExpand: 'Other ports of this workstation ({count})',
-    othersCollapse: 'Collapse other ports',
+    duplicateWarn: '⚠ {cwd} is open on both {ports} at the same time — likely two versions coexisting. Check which one you want (leftovers from ended tasks do not close themselves).',
+    noneHere: 'Nothing to preview in this directory right now; other workstation addresses are collapsed below.',
+    othersExpand: 'Other preview addresses of this workstation ({count})',
+    othersCollapse: 'Collapse other addresses',
+    unroutedNote: 'This app cannot be opened at a preview address yet — ask your assistant to move it to an assigned port.',
     stateHint: '“Admitted once” only means the first credential was admitted; it does not mean an app is listening in the container.',
     emptySelf: 'You have no preview ports yet (the platform has not assigned a block, or all of them were released).',
     emptyFde: 'This FDE has no live preview ports (not onboarded yet, or already offboarded).',

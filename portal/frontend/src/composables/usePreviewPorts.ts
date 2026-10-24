@@ -122,14 +122,16 @@ export function usePreviewPorts(options: UsePreviewPortsOptions = {}) {
    */
   async function openAllPreviews(): Promise<'opened' | 'blocked' | 'failed'> {
     if (batchBusy.value || ticketBusyId.value) return 'failed'; // 并发闸门：一次只允许一批
-    if (items.value.length === 0) return 'failed';
+    if (items.value.filter((item) => item.url).length === 0) return 'failed';
     batchBusy.value = true;
     batchError.value = null;
     batchBlockedUrls.value = [];
     popupBlockedUrl.value = null; // 上一轮单张的兜底链接不再适用
     ticketError.value = null;
-    const requested = items.value.map((item) => item.id);
-    const tabs = items.value.map(() => openBlankTab());
+    // 端口池外的观测合成行（url=null）不签票：id 是 `observed:<port>`，服务端没有这条 allocation。
+    const routable = items.value.filter((item) => item.url);
+    const requested = routable.map((item) => item.id);
+    const tabs = routable.map(() => openBlankTab());
     try {
       const signed = await api<PreviewBatchTicketsResponse>(batchTicketsPath, {
         method: 'POST',
