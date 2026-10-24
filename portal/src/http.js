@@ -20,6 +20,8 @@ import * as llm from './llm.js';
 import { createLlmGatewayClient, LlmGatewayError } from './llm-gateway.js';
 import * as admin from './admin.js';
 import * as dirs from './dirs.js';
+import * as previewmiss from './previewmiss.js';
+import * as previewproxy from './previewproxy.js';
 import * as gitCredential from './git-credential.js';
 import * as gitHosts from './git-hosts.js';
 import { createDockerClient, onboardFde } from './provisioner.js';
@@ -695,6 +697,11 @@ async function route(req, res, ctx) {
   if (pathname.startsWith('/api/')) {
     return routeApi(req, res, ctx, url);
   }
+  // #366 P2：/pv/<code>/** 是带鉴权的反代路由，不是静态资源——必须在 serveStatic 分流之前进 routeApi。
+  // （routeApi 内部只匹配 /api/* 的处理器，/pv 的路由条目就在那里；其余非 /api 路径照旧进静态。）
+  if (pathname.startsWith('/pv/')) {
+    return routeApi(req, res, ctx, url);
+  }
 
   return serveStatic(req, res, ctx, url);
 }
@@ -847,6 +854,16 @@ async function routeApi(req, res, ctx, url) {
   }
   if (pathname === '/api/file' && req.method === 'GET') {
     return handleFilePreview(req, res, ctx, url);
+  }
+  // 预览短码签发（#366 P2 隔离链③）：签一枚绑 (用户, 文件, mtime, exp) 的 HMAC 能力码，
+  // 拼进 /pv/<code>/onlinePreview 当 iframe src。命名对齐同族 kebab-case 端点。
+  if (pathname === '/api/preview-tickets' && req.method === 'POST') {
+    return handleFilePreviewTicket(req, res, ctx);
+  }
+  // /pv/<code>/** 预览反代（#366 P2）：浏览器全程只见 portal 源，kk 主机名零暴露。
+  const pvMatch = pathname.match(/^\/pv\/([^/]+)(\/.*)?$/);
+  if (pvMatch && (req.method === 'GET' || req.method === 'HEAD')) {
+    return handlePvProxy(req, res, ctx, decodeURIComponent(pvMatch[1]), pvMatch[2] ?? '/', url.searchParams.toString());
   }
 
   // ---- 项目与端口（portal.md §3；P5：写路径退役，projects 表留档只读） ----
@@ -1332,6 +1349,13 @@ async function handleAdminApi(req, res, ctx, url) {
   // 预览端口号池**占用总览**（issue #256 交付①，portal.md §4.7a）：只读。
   // 存在的理由：改块原本只能填数字试错（撞 409 preview_port_block_taken 才知道哪段被占），
   // 有了总览就能**先选空闲段**。鉴权走 handleAdminApi 的 requireAdmin（非 admin ⇒ 403，零新错误码）。
+  // #366 P0：预览未命中聚合（Office 预览需求数据，previewmiss 模块）。管理员取数：
+  // GET /api/admin/preview-misses?days=14 → { days, items: [{kind, ext, hits, last_seen_at}] }。
+  if (pathname === '/api/admin/preview-misses' && req.method === 'GET') {
+    const days = Number(url.searchParams.get('days') ?? 14);
+    return sendJson(res, 200, await previewmiss.summarizePreviewMisses({ pool: ctx.pool, days }));
+  }
+
   if (pathname === '/api/admin/preview-ports/usage') {
     if (req.method === 'GET') return handleAdminPreviewPortsUsage(req, res, ctx, session, url);
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
@@ -2673,16 +2697,157 @@ async function handleFileTree(req, res, ctx, url) {
   return sendJson(res, 200, result);
 }
 
-/** 单文件只读预览（P6 issue #84）：?cwd=<相对cwd>&path=<相对路径>；牢笼校验见 dirs.readFilePreview。 */
+/**
+ * 单文件只读预览（P6 issue #84）：?cwd=<相对cwd>&path=<相对路径>；牢笼校验见 dirs.readFilePreview。
+ * #366 P0 加 mode 三形态：缺省/`json`=旧契约逐字节不变；`stream`=原字节内联（Range/MIME 白名单，
+ * PDF/音视频当场可看）；`download`=附件下载（415/413 死路页的出口）。JSON 通道的 415/413 同时
+ * 被埋点计数（previewmiss，fire-and-forget，不改响应语义）。
+ */
 async function handleFilePreview(req, res, ctx, url) {
   const session = await requireSession(req, ctx);
-  const result = await dirs.readFilePreview({
+  const mode = url.searchParams.get('mode') ?? '';
+  if (mode === 'stream' || mode === 'download') {
+    const opened = await dirs.openFileStream({
+      userSpaceRoot: ctx.config.userSpaceRoot,
+      fdeName: session.user.fde_name,
+      cwd: url.searchParams.get('cwd'),
+      relPath: url.searchParams.get('path') ?? '',
+      range: req.headers.range ?? null,
+      disposition: mode === 'download' ? 'download' : 'inline',
+    });
+    res.writeHead(opened.status, opened.headers);
+    if (opened.stream) {
+      opened.stream.on('error', () => res.destroy());
+      opened.stream.pipe(res);
+    } else {
+      res.end(); // 416：只有头没有体
+    }
+    return undefined;
+  }
+  if (mode !== '' && mode !== 'json') {
+    throw new HttpError(400, 'validation_failed', 'mode 只支持 json|stream|download', { details: { field: 'mode' } });
+  }
+  try {
+    const result = await dirs.readFilePreview({
+      userSpaceRoot: ctx.config.userSpaceRoot,
+      fdeName: session.user.fde_name,
+      cwd: url.searchParams.get('cwd'),
+      relPath: url.searchParams.get('path') ?? '',
+    });
+    return sendJson(res, 200, result);
+  } catch (err) {
+    // 埋点（#366 P0）：Office/大文件的「死掉的点击」变需求数据。不 await：埋点绝不能改变
+    // 响应的时间或语义；模块内部已吞写失败，.catch 只堆不冒泡。
+    const kind = previewmiss.missKindFor(err);
+    if (kind) {
+      previewmiss
+        .recordPreviewMiss({
+          pool: ctx.pool,
+          userId: session.user.id,
+          kind,
+          relPath: url.searchParams.get('path') ?? '',
+          log: ctx.log,
+        })
+        .catch(() => {});
+    }
+    throw err;
+  }
+}
+
+/**
+ * 本站公开 origin（给 kk X-Base-Url 拼产物链接用）：头口径与 forwardAuth 同源（XFH 优先，
+ * Traefik 权威覆写）；scheme 真机永远 https（edge TLS 终结 + XFP），直连/dev 按 cookie
+ * profile 判（dev-http = 本地纯 http）。写死 https 会在 dev 里生成混合内容链接。
+ */
+function publicOriginOf(req, ctx) {
+  const rawHost = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+  // dev-http（cookie 非 secure）直连无 Traefik 头时才是 http；真机 edge TLS 终结必发 XFP。
+  const proto = req.headers['x-forwarded-proto'] ?? (ctx.config.cookie.secure ? 'https' : 'http');
+  return `${proto}://${rawHost}`;
+}
+
+/**
+ * POST /api/preview-tickets（#366 P2）：{cwd, path} → { url, expires_in }。
+ * 牢笼解析复用 dirs.resolveJailedFile（与预览同一红线）；mtime 进载荷做 cache-buster：
+ * 文件被 agent 改写 → 旧码 403 → 前端重签 → kk 重转（陈旧性由机制自解决，不靠清缓存）。
+ */
+async function handleFilePreviewTicket(req, res, ctx) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const jailed = dirs.resolveJailedFile({
     userSpaceRoot: ctx.config.userSpaceRoot,
     fdeName: session.user.fde_name,
-    cwd: url.searchParams.get('cwd'),
-    relPath: url.searchParams.get('path') ?? '',
+    cwd: body?.cwd,
+    relPath: body?.path,
   });
-  return sendJson(res, 200, result);
+  const code = previewproxy.issuePreviewCode({
+    secret: ctx.config.previewSessionSigningKey,
+    userId: session.user.id,
+    fdeName: session.user.fde_name,
+    project: jailed.project,
+    relPath: jailed.rel,
+    mtimeMs: jailed.st.mtimeMs,
+  });
+  return sendJson(res, 200, {
+    url: `/pv/${encodeURIComponent(code)}/onlinePreview`,
+    expires_in: previewproxy.PREVIEW_CODE_TTL_SECONDS,
+  });
+}
+
+/**
+ * /pv/<code>/** 预览反代（#366 P2 定稿，previewproxy 模块注释是架构真相）：
+ * 每请求过 会话（隔离链②）+ 能力码归属/时效（③）+ 路径白名单，再把载荷重写成 kk 的
+ * 本地文件参数（路径泄露归零）；HTML 响应改写补前缀，子资源继续走同一闸门。
+ */
+async function handlePvProxy(req, res, ctx, code, subPath, query) {
+  const session = await requireSession(req, ctx);
+  const payload = previewproxy.verifyPreviewCode(ctx.config.previewSessionSigningKey, code);
+  // 码验不过统一 404（不告诉探探器「有这枚码但过期了」这种存在性信息）。
+  if (!payload) throw new HttpError(404, 'not_found', 'not found');
+  // 路径白名单先于归属/时效：非路由就是 404，不把码的状态（有效/过期/他人）泄露给探测者。
+  const kkPath = previewproxy.pvForwardPath(subPath);
+  if (!kkPath) throw new HttpError(404, 'not_found', 'not found');
+  if (payload.u !== session.user.id) throw new HttpError(403, 'forbidden', 'forbidden');
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!(Number(payload.e) > nowSec)) throw new HttpError(403, 'preview_code_expired', 'preview code expired', { retryable: true });
+  // onlinePreview 的 url 参数由载荷重写为 file:// URL（客户端碰不到真实路径，SSRF 根）；
+  // 其余子请求透传原 query。file URL 的根 = portal 自己的 userSpaceRoot（compose 保证 kk
+  // 容器同路径 ro 挂载，两边看到同一盘 —— 用 portal 的值而非写死，测试/异路径部署都对）。
+  const kkBase = ctx.config.kkInternalBaseUrl ?? previewproxy.KK_INTERNAL_BASE_URL;
+  const upstreamUrl = kkPath === '/onlinePreview'
+    ? `${kkBase}/onlinePreview?${previewproxy.kkOnlinePreviewQuery(payload, ctx.config.userSpaceRoot)}`
+    : `${kkBase}${kkPath}${query ? `?${query}` : ''}`;
+  let upstream;
+  try {
+    upstream = await fetch(upstreamUrl, {
+      method: req.method,
+      // 公开 origin：Traefik 权威覆写的 XFH/XFP（直连时回退 Host/scheme），给 kk 的 X-Base-Url
+      // 拼闸门内绝对链接用（previewproxy 注释是口径真相）。
+      headers: previewproxy.pvForwardHeaders(req, code, publicOriginOf(req, ctx)),
+      redirect: 'manual',
+    });
+  } catch {
+    throw new HttpError(502, 'preview_backend_unavailable', 'kkfileview unreachable', { retryable: true });
+  }
+  const headers = previewproxy.pvSanitizedHeaders(upstream);
+  let outBody = Buffer.from(await upstream.arrayBuffer());
+  const isHtml = String(upstream.headers.get('content-type') ?? '').includes('text/html');
+  if (isHtml && upstream.status === 200 && req.method === 'GET') {
+    const rewritten = previewproxy.rewriteKkHtml(outBody.toString('utf8'), code);
+    if (rewritten !== null) outBody = Buffer.from(rewritten, 'utf8');
+  }
+  if (req.method === 'HEAD') {
+    const cl = upstream.headers.get('content-length');
+    if (cl !== null) headers['content-length'] = cl;
+    res.writeHead(upstream.status, headers);
+    res.end();
+    return undefined;
+  }
+  headers['content-length'] = String(outBody.length);
+  res.writeHead(upstream.status, headers);
+  res.end(outBody);
+  return undefined;
 }
 
 async function handleListProjects(req, res, ctx) {

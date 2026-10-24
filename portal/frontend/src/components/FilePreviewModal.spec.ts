@@ -174,3 +174,125 @@ describe('FilePreviewModal（issue #84 P6 文件预览）', () => {
     wrapper.unmount();
   });
 });
+
+describe('FilePreviewModal 四通道分流（#366 P0/P1/P2）', () => {
+  /** 任意 path 的弹窗（通道由 previewRoute 纯函数定，表已在 previewRoute.spec 钉死）。 */
+  function mountAt(path: string, handlers: { onClose?: () => void } = {}) {
+    return mount(FilePreviewModal, {
+      props: { cwd: '~/projects/demo', path, ...handlers },
+      global: { plugins: [i18n] },
+      attachTo: document.body,
+    });
+  }
+
+  it('PDF → <object> 指 stream 通道，零 JSON 请求', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const wrapper = mountAt('specs/design.pdf');
+    await tick();
+    const obj = wrapper.find('object[type="application/pdf"]');
+    expect(obj.exists()).toBe(true);
+    expect(obj.attributes('data')).toContain('mode=stream');
+    expect(obj.attributes('data')).toContain('specs%2Fdesign.pdf');
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0); // 原生元素自加载，前端不发 JSON
+    wrapper.unmount();
+  });
+
+  it('mp4 → <video controls>；mp3 → <audio controls>；均指 stream', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const w1 = mountAt('media/clip.mp4');
+    await tick();
+    const video = w1.find('video');
+    expect(video.exists()).toBe(true);
+    expect(video.attributes('src')).toContain('mode=stream');
+    expect(video.attributes('controls')).toBeDefined();
+    w1.unmount();
+    const w2 = mountAt('media/song.mp3');
+    await tick();
+    expect(w2.find('audio[controls]').exists()).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0);
+    w2.unmount();
+  });
+
+  it('kkfile：签票 POST → iframe 指 /pv/<码>，sandbox 无 allow-same-origin', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      jsonResponse(200, { url: '/pv/CODE123.SIG/onlinePreview', expires_in: 600 })));
+    const wrapper = mountAt('docs/report.docx');
+    await tick();
+    expect(String(vi.mocked(fetch).mock.calls.at(-1)![0])).toBe('/api/preview-tickets');
+    const iframe = wrapper.find('iframe');
+    expect(iframe.exists()).toBe(true);
+    expect(iframe.attributes('src')).toBe('/pv/CODE123.SIG/onlinePreview');
+    // 红线：sandbox 给脚本执行权但不给同源权（预览内容 XSS 拿不到 portal 会话）。
+    expect(iframe.attributes('sandbox')).toBe('allow-scripts');
+    expect(iframe.attributes('sandbox')).not.toContain('allow-same-origin');
+    wrapper.unmount();
+  });
+
+  it('kkfile：签票遇 preview_code_expired 自动重签一次；第二次仍错才直显', async () => {
+    let n = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n += 1;
+      if (n === 1) return jsonResponse(403, { error: { code: 'preview_code_expired', message: 'preview code expired' } });
+      return jsonResponse(200, { url: '/pv/FRESH.SIG/onlinePreview', expires_in: 600 });
+    }));
+    const wrapper = mountAt('docs/deck.pptx');
+    await tick();
+    expect(n).toBe(2); // 一次静默重签（文件被 agent 改写后的自愈路径）
+    expect(wrapper.find('iframe').attributes('src')).toBe('/pv/FRESH.SIG/onlinePreview');
+    wrapper.unmount();
+
+    n = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n += 1;
+      return jsonResponse(403, { error: { code: 'preview_code_expired', message: 'expired again' } });
+    }));
+    const w2 = mountAt('docs/deck.pptx');
+    await tick();
+    expect(n).toBe(2); // 重签只重试一次，不无限循环
+    expect(w2.find('[role="alert"]').text()).toContain('expired again');
+    w2.unmount();
+  });
+
+  it('kkfile：kk 不可用（502）→ 错误直显 + 下载出口', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      jsonResponse(502, { error: { code: 'preview_backend_unavailable', message: 'kkfileview unreachable' } })));
+    const wrapper = mountAt('docs/a.xlsx');
+    await tick();
+    expect(wrapper.find('[role="alert"]').text()).toContain('kkfileview unreachable');
+    const link = wrapper.find('a[role], a[href*="mode=download"]');
+    expect(link.attributes('href')).toContain('mode=download');
+    wrapper.unmount();
+  });
+
+  it('other：清单外零请求，直接给「不支持预览 + 下载」', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'x')));
+    const wrapper = mountAt('data/blob.parquet');
+    await tick();
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0); // 不猜格式，探针都不发
+    expect(wrapper.text()).toContain('该格式不支持在线预览');
+    expect(wrapper.find('a[href*="mode=download"]').attributes('href')).toContain('mode=download');
+    wrapper.unmount();
+  });
+
+  it('native-json 失败态（415）：错误文案 + 下载链接同时在场（P0 死路页出口）', async () => {
+    // 415 只能来自 native-json 通道的后端嗅探：扩展名在文本桶但内容实为二进制（.tsv 命中 TEXT 清单）。
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      jsonResponse(415, { error: { code: 'unsupported_file_type', message: '二进制文件不支持预览' } })));
+    const wrapper = mountAt('data/table.tsv');
+    await tick();
+    const alert = wrapper.find('[role="alert"]');
+    expect(alert.text()).toContain('二进制文件不支持预览');
+    expect(alert.find('a[href*="mode=download"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('头部下载链接常驻：所有通道都能下载（含成功态）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => okFile('text', 'hello')));
+    const wrapper = mountAt('a/b/note.txt');
+    await tick();
+    const head = wrapper.find('.flex.items-center a[href*="mode=download"]');
+    expect(head.exists()).toBe(true);
+    expect(head.attributes('href')).toContain(`path=${encodeURIComponent('a/b/note.txt')}`);
+    wrapper.unmount();
+  });
+});
