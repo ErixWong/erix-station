@@ -158,6 +158,17 @@ function scrollDown() {
 // 旧 scrollDown() 挂点：消息/分隔行/工具卡片追加 + 流式增量追加（entries.length / deltaText 变化）。
 watch(() => store.entries.length, () => nextTick(scrollDown));
 watch(() => store.es.deltaText, () => nextTick(scrollDown));
+// 试用台账 #10：「加载更早消息」整段前插后锚定滚动位置——新批次把原内容往下顶，不锚定
+// 视口就会跳到顶。watch 在 pre-flush 跑：此刻 DOM 尚未重渲染，读到的是**旧**高度；
+// nextTick 后新高度已知，把高度差补进 scrollTop 即保持原视觉位置。本 watcher 注册在
+// scrollDown 之后 → 同一 flush 内它的 nextTick 回调后执行，锚定值最继覆盖自动贴底。
+watch(() => store.olderPrependSeq, () => {
+  const el = streamEl.value;
+  if (!el) return;
+  const prevHeight = el.scrollHeight;
+  const prevTop = el.scrollTop;
+  nextTick(() => { el.scrollTop = prevTop + (el.scrollHeight - prevHeight); });
+});
 
 function onStreamScroll() {
   const el = streamEl.value;

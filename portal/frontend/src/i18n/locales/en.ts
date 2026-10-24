@@ -169,6 +169,9 @@ export const en = {
     sessionStats: '{count} messages',
     sessionStatsCompacted: 'compacted {count}×',
     sessionCompactionHint: 'Context compaction has started; open a new session if you need to keep full details',
+    // Trial log #10: older-message pagination entry (backend always paginated; the frontend just never fetched older pages).
+    loadOlder: 'Load older messages',
+    loadOlderLoading: 'Loading…',
     // issue #300: an aborted/failed run has ZERO assistant anchors, so its body area used to render
     // blank; the history endpoint aggregates its assistant_delta into one synthetic item. NEUTRAL
     // wording on purpose: not "completed" (it never finished) and not an "error" (a half-written body
