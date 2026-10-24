@@ -71,6 +71,10 @@
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 端口 | `POST /api/me/ports/batch-tickets` | **一键放行整组：一次请求签 N 张预览票**（#247，§4.7a：上限 = 号池块大小、越界 `404`、审计逐张、零新错误码） |
+| 文件 | `GET /api/file?mode=json\|stream\|download` | 单文件预览（缺省 `json` 行为不变）；`stream` 带 Range/MIME/Disposition，`download` 附件（#366 P0，§4.11） |
+| 文件 | `POST /api/preview-tickets` | 签一枚 `/pv/<code>` 预览能力码（#366 P2，§4.11） |
+| 文件 | `GET /pv/<code>/**` | kkFileView 反代网关（非 JSON API，浏览器 iframe 入口；#366 P2，§4.11） |
+| 文件 | `GET /api/admin/preview-misses` | 415/413 预览未命中日聚合（#366 P1，§4.11；管理员） |
 | 审批 | `GET /api/approvals` | 待审批工具调用列表——⚠ **未交付**（无路由，实测 `404`；能力已裁决不交付，见 principles §3 / #249）|
 | 审批 | `POST /api/approvals/:id` | 审批决定——⚠ **未交付**（同上；internal 面 U10/U11 保留作协议留档）|
 | LLM 管理 | `GET /api/admin/llm/providers` | 供应商 + 模型列表（模型对象的两个名字见 §4.9） |
@@ -1687,6 +1691,46 @@ SELECT fde_id FROM fde_llm_bindings
   改名已在网关落定，把 PATCH 拖成 500 只会诱导管理员重试第二次改名；不自动回滚的理由同 §8.25。
 - 「门户内改名不是漂移源」这句话从此要打个补丁：**改名会把引用它的 FDE 变成漂移**（`*_model_name`
   暂时指向旧名），立即对账就是为了让这个窗口尽量短——就地注释见 `AGENTS.md` §8.25。
+
+### 4.11 文件预览四通道与 kkFileView 网关（issue #366）
+
+> 规格：issue #366（定稿）；实现：`portal/src/dirs.js`（`resolveJailedFile`/`openFileStream`）、
+> `portal/src/previewmiss.js`、`portal/src/previewproxy.js`、`portal/frontend/src/lib/previewRoute.ts`。
+
+前端按扩展名把每个文件路由到四个通道之一（`previewChannel()`，前后端扩展名单互相钉死）：
+
+| 通道 | 格式 | 链路 |
+|---|---|---|
+| `native-json` | 文本/md/小图片 | `GET /api/file`（缺省 json，§P6 老行为一字不变） |
+| `native-stream` | pdf/音视频/大图 | `GET /api/file?mode=stream`（Range/206，`<object>`/`<video>`/`<audio>`） |
+| `kkfile` | Office/压缩包/老格式 | `POST /api/preview-tickets` → iframe `/pv/<code>/onlinePreview` |
+| `other` | 未知 | 只给下载（`?mode=download`） |
+
+**`GET /api/file` 的 `mode` 参数**：`json`（缺省，旧行为）/ `stream` / `download`。stream 通道：
+单 Range → `206`（`Accept-Ranges: bytes`；不可满足 → `416`；多 Range/非法头当无 Range 降级整身 `200`）；
+MIME 白名单（图片/pdf/mp4/webm/mov/mp3/wav/ogg/m4a），**白名单外一律 `application/octet-stream`
+且强制 `attachment`**，`text/html` 永不直出（同源 XSS 红线）；上限 512MB（`413`），不读进内存。
+JSON 通道的 415/413 同时写 `preview_miss_stats` 埋点（见下）。
+
+**`POST /api/preview-tickets`** `{cwd, path}` → `{ url: "/pv/<code>/onlinePreview", expires_in: 600 }`。
+`<code>` = `base64url(JSON 载荷) + "." + HMAC-SHA256`（载荷 `{u: user_id, p: userspace 相对路径, m: mtime 秒, e: 过期秒}`），
+密钥 = `SESSION_SIGNING_KEY`（`previewSessionSigningKey`）。mtime 入码 = 文件被 agent 改写后旧码自然失效（`403 preview_code_expired`，`retryable` → 前端重签一次）。
+
+**`GET/HEAD /pv/<code>/**`（反代闸门，非 JSON API）**：浏览器永远看不到 kk 真实地址。每请求依序过：
+会话 cookie（401）→ 能力码验签（404）→ 子路径白名单（kk 已知路由 + `js/css/images` 静态目录，越界 404）
+→ 归属（`payload.u` ≠ 会话用户 403）→ 时效（过期 403 `preview_code_expired`）→ 把 `onlinePreview` 的
+`url` 参数**重写**为 portal 自产的 `file://<userSpaceRoot>/<p>`（base64，SSRF 根：用户的 URL 永远到不了 kk）。
+响应头消毒（剥 kk 的 XFO/CSP/Set-Cookie，注入 portal 的 `SAMEORIGIN` + CSP + `no-store`）；链接回闸门
+三条腿：① `X-Base-Url = <本站 origin>/pv/<码>/`（kk BaseUrlFilter 优先级 1 钩子，绝对产物链接如
+`/xx.pdf`、pdf 图块目录直接生成成闸门内 URL）；② `X-Forwarded-Prefix`（kk 侧
+`SERVER_FORWARD_HEADERS_STRATEGY=native`，Thymeleaf 根链接自产前缀）；③ portal 改写器接根相对链接。
+产物透传白名单：转换产物挂 web 根（`/xx.pdf`、`/xx/1.png`），放 1–2 段安全字符+产物尾缀（同租户
+登录态内可枚举，匿名探测被闸门排除）。**kk 侧两个硬前提**（真机实证）：镜像自建 5.0.3（官方 Hub 停在 4.1.0，无 `file://`）；`url` 必须带命名 authority `file://<KK_TRUST_HOST>/<abs>`（5.0.3 空 host 一律 403，`KK_TRUST_HOST` 与 portal `previewproxy.KK_TRUST_HOST` 同值），portal 与 kk 容器 userspace **同路径**挂载（`KK_LOCAL_PREVIEW_DIR` = portal `ERIX_USERSPACE_ROOT`）。kk 宕机 → `502 preview_backend_unavailable`（`retryable`）。
+
+**`GET /api/admin/preview-misses?days=14`**（管理员）→ `{ days, items: [{day, kind, ext, hits, last_seen_at}] }`。
+埋点表 `preview_miss_stats`（迁移 0023）按 日×`kind|ext` UPSERT 聚合，kind ∈ `unsupported`/`too_large`，
+ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写失败只 `warn` 不拖预览。
+用途：看真实需求面再决定要不要把某格式提进原生白名单。
 
 
 ---

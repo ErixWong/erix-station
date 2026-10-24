@@ -345,6 +345,10 @@ export const en = {
   },
   preview: {
     title: 'Preview {path}',
+    download: 'Download',
+    downloadInstead: 'Download this file',
+    notPreviewable: 'This format cannot be previewed online',
+    pdfUnsupported: 'This browser cannot display the embedded PDF; download it and open locally',
   },
   // Preview port panels (issue #246 delivery ②, ticket B: workbench section + admin FDE pane).
   // Contract red line (portal.md §4.7a): `active` only means “the first credential was admitted” ⇒

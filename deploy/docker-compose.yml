@@ -165,6 +165,9 @@ services:
       ERIX_WORKSPACE_RETENTION_DAYS: ${ERIX_WORKSPACE_RETENTION_DAYS:-0}
       TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic
       TRAEFIK_DYNAMIC_FILE: routes.yml
+      # issue #366：/pv/<code> 预览网关的后端（容器网内部，无宿主端口）。portal 是唯一入口，
+      # 浏览器永远看不到 kk 真实地址；测试里可注入 http://127.0.0.1:<port>。
+      KK_INTERNAL_BASE_URL: ${KK_INTERNAL_BASE_URL:-http://kkfileview:8012}
       PORTAL_HOST: ${PORTAL_HOST:-station.localhost}
       PORTAL_INTERNAL_HOSTS: ${PORTAL_INTERNAL_HOSTS:-}
       PORTAL_BACKEND_URL: http://127.0.0.1:${PORTAL_HOST_PORT:-18080}
@@ -283,6 +286,63 @@ services:
       timeout: 5s
       retries: 6
       start_period: 60s
+
+  # issue #366：kkFileView 文档预览引擎（Office/压缩包等浏览器原生不能渲染的格式）。
+  # 全局单实例（预览是无状态只读活，不按 FDE 分裂；容量不够加副本不改前端）。
+  # 安全面：不发布宿主端口（只能经 portal /pv/<code> 网关访问，能力码闸门在 portal 层）；
+  # userspace 同一子树 ro 挂载到与 portal 同路径 /srv/erix/users（portal 递过来的永远是
+  # portal 自己生成的 file:// URL，SSRF 面 = portal 自己）；cap_drop ALL + 非 root（uid/gid
+  # 对齐 userspace 属主 1000:1000，drwxrwx--- 直读）；转换产物写 tmpfs（重启即清，无盘上
+  # 残留），内存上限 2G（LibreOffice 子进程计入 cgroup）。
+  station-kkfileview:
+    container_name: "${KKFILEVIEW_NAME:-station-kkfileview}"
+    image: ${KKFILEVIEW_IMAGE:-erix-station/kkfileview:5.0.3}
+    # 镜像自建（见上），fresh 机器无现成 tag：先跑 deploy/kkfileview/build-image.sh 再
+    # `--profile kkfileview` 起（与 litellm 同模式，不阻断默认 up）；没起时 portal 对 kk
+    # 死亡已有 502 preview_backend_unavailable 降级，预览模态框可见提示 + 下载兑底。
+    profiles:
+      - kkfileview
+    restart: unless-stopped
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    user: "${KKFILEVIEW_UID:-1000}:${KKFILEVIEW_GID:-1000}"
+    mem_limit: ${KKFILEVIEW_MEM_LIMIT:-2g}
+    tmpfs:
+      # 转换产物/日志（kk 内 Tomcat work 也落此）：内存盘，重启即清；kk 需写权限。
+      - /tmp/kkfileview:mode=1777
+    volumes:
+      # 与 station-portal 同一宿主子树，ro + 同路径：portal 递的 file:// 绝对路径在两容器
+      # 里解出同一个文件（D-6 直写 bind mount 的同一棵盘，无拷贝）。
+      - ${ERIX_USERSPACE_ROOT_HOST:-/srv/erix/users}:/srv/erix/users:ro
+    environment:
+      KK_SERVER_PORT: "8012"
+      # 本地文件预览根（TrustDirFilter 对 file:// 路径做 canonical 前缀比对的白名单目录）。
+      KK_LOCAL_PREVIEW_DIR: /srv/erix/users
+      # 转换产物目录（kk 写入面，不碰 userspace——ro 挂载下写不进去也不需要）。
+      KK_FILE_DIR: /tmp/kkfileview/
+      # SSRF 双保险：portal 已把 url 永远重写成 file://，白名单再兑一层。⚠ 必须与 portal 侧
+      # previewproxy.KK_TRUST_HOST 同值：5.0.3 对空 host 的 file:// 一律 403（真机实证），能力
+      # URL 靠命名 authority `file://<此值>/<abs>` 过信任比对——改一侧不改另一侧 = 全量 403。
+      KK_TRUST_HOST: station-preview.internal
+      # Office → 原生 PDF 预览（体验优于逐页图；默认 image）。
+      KK_OFFICE_PREVIEW_TYPE: pdf
+      # 上传预览（/index 页）我们不用：默认本就是关的，显式写出防后续版本反转。
+      KK_FILE_UPLOAD_ENABLED: "false"
+      # X-Forwarded-Prefix 生效开关：Tomcat RemoteIpValve 消费 XFP → Thymeleaf 根链接自挂前缀。
+      # ⚠ Boot 3 属性是 server.forward-headers-strategy（env = SERVER_*）；写成 SPRING_* 会被
+      # 静默忽略（属性改名于 Boot 2.4，真机读过上游才改对）。rewriteKkHtml 仍是第二层。
+      SERVER_FORWARD_HEADERS_STRATEGY: native
+    healthcheck:
+      # 基座里装了 curl（自建镜像 Dockerfile.base）；/index 无 url 参数，不过 trust 过滤器，纯存活探针。
+      test: ["CMD-SHELL", "curl -fsS -m 5 http://127.0.0.1:8012/index > /dev/null"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 90s
 
   station-edge:
     container_name: "${STATION_EDGE_NAME:-station-edge}"

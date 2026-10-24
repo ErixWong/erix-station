@@ -265,6 +265,9 @@ export function loadConfig(env = process.env) {
     previewCookie: previewCookieSettings(cookieProfile, intEnv(env, 'PREVIEW_SESSION_TTL_SECONDS', 15 * 60)),
     // 预览 session 派生密钥（HMAC-SHA256，portal.md §2.7 第 6 步）；生产必须显式注入，开发期仅联调占位。
     previewSessionSigningKey: signingKeyRaw || 'erix-station-dev-signing-key-change-me',
+    // #366 P2：kkFileView 反代上游（docker 内网名；compose 不发宿主端口，只有 portal 能触达）。
+    // 置空串 = 未部署 kk：/api/preview-tickets 照常签码，但 /pv 转发时 connect refused → 502（可观测可降级）。
+    kkInternalBaseUrl: env.KK_INTERNAL_BASE_URL ?? 'http://kkfileview:8012',
     // 预览 ticket 签发限流（portal.md §6.1：按用户 + IP）。
     previewTicketRateLimit: {
       maxFailures: intEnv(env, 'PREVIEW_TICKET_RATE_LIMIT_MAX', 20),
