@@ -236,11 +236,38 @@ export function retryAfterSeconds(error: PreviewApiError): number | null {
  * （真机：同一项目两个分支的 dev server 各占 22000/22001）。
  * 只按 cwd 精确分组——repo 归组要 git commdir，观测数据里没有，宁缺毋滥。
  */
+/**
+ * 观测 cwd → 项目根（`~/projects/<name>`）：子目录里起的服务（frontend/、apps/web/）归到项目本身；
+ * 非项目目录（agentd 自己的 /opt 等）返回 null——两个分组面板都不收。
+ * 未 sanitize 的绝对形（/home/<u>/projects/…）同样命中（与 portalloc 合成行同口径）。
+ */
+export function projectRootOf(cwd: string | null | undefined): string | null {
+  if (typeof cwd !== 'string') return null;
+  const matched = /^(?:~|\/home\/[^/]+)\/projects\/([^/]+)/.exec(cwd);
+  return matched ? `~/projects/${matched[1]}` : null;
+}
+
+/** 按项目根分组（池内+池外一视同仁）；非项目观测丢弃，组内按 port ASC、组间按目录名字序。 */
+export function groupByProject(items: PreviewPortItem[]): Array<{ root: string; items: PreviewPortItem[] }> {
+  const byRoot = new Map<string, PreviewPortItem[]>();
+  for (const item of items) {
+    const root = projectRootOf(item.observed?.cwd);
+    if (root === null) continue;
+    const bucket = byRoot.get(root) ?? [];
+    bucket.push(item);
+    byRoot.set(root, bucket);
+  }
+  return [...byRoot.entries()]
+    .map(([root, bucket]) => ({ root, items: bucket.sort((a, b) => a.port - b.port) }))
+    .sort((a, b) => a.root.localeCompare(b.root));
+}
+
 export function duplicateObservedGroups(items: PreviewPortItem[]): Array<{ cwd: string; ports: number[] }> {
   const byCwd = new Map<string, number[]>();
   for (const item of items) {
-    const cwd = item.observed?.cwd;
-    if (!cwd) continue;
+    // 按项目根归并（用户实证：主目录一个口 + 子目录一个口也是「同一项目两实例」，精确比 cwd 会漏报）。
+    const cwd = projectRootOf(item.observed?.cwd);
+    if (cwd === null) continue;
     const list = byCwd.get(cwd) ?? [];
     list.push(item.port);
     byCwd.set(cwd, list);
