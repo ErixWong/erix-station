@@ -93,6 +93,12 @@ describe('PreviewPortsPanel · 列表渲染', () => {
     expect(wrapper.text()).toContain('「已放行过」只表示该端口首次凭证放行过');
   });
 
+  it('工作台紧凑形态不渲染放行语义注释（用户裁定：监听事实由观测注解回答，向业务用户解释黑话是噪音）', () => {
+    wrapper = mountPanel({ variant: 'list' });
+    expect(wrapper.find('[data-test="preview-port-row"]').exists()).toBe(true);
+    expect(wrapper.text()).not.toContain('「已放行过」只表示');
+  });
+
   it('未知 state 取值原样透传（不猜语义，也不误标成已放行过）', () => {
     wrapper = mountPanel({ items: [portItem('x', 22003, { state: 'released' })] });
     expect(wrapper.get('[data-test="preview-port-state"]').text()).toBe('未知状态（released）');
