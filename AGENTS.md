@@ -160,7 +160,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - **不做什么**：分支列表/分支数、detached、worktree/子模块结构、最后提交时刻、↑N/↓N、diff 内容、
   inotify 事件源——全不做（理由与实测记录在 issue #359 正文与附录）。
 - **告知面先行**：D9 的**产品闭环**要求容器里的 agent 真会「收工即提交」，而它看不见灯 ⇒
-  要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.51），灯（P0a/P0b）后上。顺序反了就是
+  要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
   「灯长期红/黄、而没人负责让它变绿」。
 
 ## 8. erix-agent 依赖与升级（当前 pin：**0.20.0**，2026-10-15 由 #299 从 0.18.0 两步升上；历史 0.14–0.18 记录见下）
@@ -1562,7 +1562,60 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 - **未发版**（不进 v0.1.31 的任何承诺，等决策者定窗口）。
 - 展示层过滤**没**同步到目录树（`fileTree`）：树面板里点开头目录仍可见可展开，是刻意的——树是浏览器的用法，人可能就是要看 `.git` / `.github`；下拉才是被污染的那一面。
 
-### 8.51 收工纪律进 `~/AGENTS.md`：D9 的告知面先行（issue #359 P0c，2026-10-24，分支 `feat-261024-05-git-light-agents-md`）
+### 8.52 引擎面向的 `store.load()` 补上读侧折叠（issue #351，会话砖化的根治性止血）
+
+**触发**：决策者真机连撞两次 `invalid_messages`（同一会话 `9e0c8a17…`，8 分钟内两个不同的 index）。
+
+**取证手法（值得复用）**：把**真账本行**喂进引擎自己的 `foldLedgerMessages` + `validateMessages`，
+比读错误文案硬得多；再用两张备份表把账本**还原成修数据之前**的原始形状做 A/B：
+
+| 读法 | 原始 158 行真账本 |
+|---|---|
+| 本站 `store.load()` 过去那样直通原始行 | **FAIL `index 56`**（= 界面上第一次红） |
+| 先过上游 `foldMessageRows`（= file/memory store 的读法） | **FAIL `index 81`**（= 界面上第二次红；上游解不了链式 `partOf` = #415） |
+| 本单：`runner/lib/transcript-fold.js` | **OK（92 条逻辑消息）** |
+
+**归因推翻了两条在册口径**（都在册很久）：
+① `AGENTS.md:1107`「runner 侧不需要补折叠（引擎自己折）」——**错**：引擎只调 `foldLedgerMessages`
+（只把 `partOf` 分片接回原消息），**载体折叠 `foldMessageRows` 是 store 的职责**
+（上游 `host-consumer-contract.md:2405-2409` + `:2442`；`resume-manager.js:239-241` 的 `seq` 播种本就面向折叠后的输出）。
+② #341 与巡检手册「引擎 resume 侧本站修不了，只能修数据（等上游 #415）」——**错**：本站 `portal/src/transcript-fold.js`
+是上游读侧的**超集**（分片行也登记自己的 key ⇒ 解链），链式夹具实测上游 FAIL / 本站 OK。
+
+**修法**：折叠接在 `runner/lib/store.js#load`，**且必须在全量拉齐之后**（agentd `case 'load'` 已把游标翻页聚合成一个数组）——
+接在 portal 分页端点的页内会在「一轮跨两页」时漏折（#338 同根）。新建 `runner/lib/transcript-fold.js` 是
+`portal/src/transcript-fold.js` 的**镜像**（FDE 镜像 build context = `runner/`，运行期拿不到 portal 源码；先例：
+`runner/lib/llm-models.js` 的 `positiveIntOrNull`）。两份的 `SHARED-FOLD-CORE` 区间**逐字节**由测试钉住
+⇒ 口径漂移只能两边一起改。`portal/src/transcript-fold.js` 只加了标记注释，逻辑零改动。
+
+**主 agent 亲跑变异 4 条**（每条先自证只改 1 行、且**一条一还原**）：
+① 摘掉接线（`return records`）⇒ **恰 4 条红**（标本①② + 真 `runToolLoop` 贯通 + 源码级「load 必须折」）；
+② 撤 runner 那份的 #341 解链闸 ⇒ **恰 2 条红**（标本② + 两份镜像字节对拍）；
+③ 单边改 portal 口径（`isFoldableMessageRow(record) && seq >= 0`）⇒ 镜像字节锁红（同一轮还顺手证明了「单边改」正是字节锁要拦的）；
+④ 让载体不接正文（`attached.set` 注释掉）⇒ **5 条红**（标本①② + 真 `runToolLoop` 贯通 + 镜像字节锁 + 与上游逐字段对拍）。
+⚠ ②③ 第一次连跑时**忘了还原 ②** 就测 ③ ⇒ 多出一条假红（标本②）——变异取证必须一条一还原。
+
+**⚠ 一条自己差点放过的假绿（本单最值钱的一处）**：`runToolLoop` 贯通用例**第一版只跑到崩溃后那次 resume，
+变异① 摘接线时它照样绿**（当时另三条变异也没把它打红）。原因：崩溃现场那次 resume 引擎自己会把宿主的 `:input:` 行当尾巴延后拼
+（`resume-manager.js:196-215`），**不折也能过**；砖发生在**下一次** resume（快照干净、尾巴支路不走）——
+真机正是这个次序（`07237084…` 崩溃后 resume 成功跑 8 轮 → `4f857875…` 才报 `index 56/81`）。
+⇒ 用例补成「崩溃 → 追问 → resume → **再 resume**」并加**前提自证**（`:input:` 行必须排在迟到的
+`tool_result` 之前），补完后变异① 才红在它上面。**教训：resume 类判据必须跑到「快照干净后的第二次 resume」。**
+
+**基线**：根 `node --test` **1460 项 / 1456 通过 / 0 失败 / 4 跳过**（同树不含本单 **1448 / 1444 / 0 / 4**
+⇒ 本单 **+12**：新 `runner/test/store-load-fold.test.js` 11 + `portal/test/transcript-fold-wiring.test.js` +1）。
+前端与 `portal/src` 运行时零改动（`portal/src/transcript-fold.js` 只加注释与标记）。
+`portal/test/transcript-fold-wiring.test.js` 那条「折叠模块只有一个消费点」顺带修了自身空转：
+它用「文件里出现 `transcript-fold.js` 字符串」当消费点判据，而本单在模块自己的文件头注释里点名了镜像 ⇒ 自己咬自己
+⇒ 判据排除模块自身（注释不是消费点）。
+
+**存量**：接线后新会话不再需要修数据、**已砖会话读侧自愈**。今天两次修数据照旧执行过（打地鼠，见 #367 与手册 §2/§5），
+备份表 `transcript_rounds_input_seq_bak_20261024`（1 行 `append_seq`）与 `transcript_rounds_partof_bak_20261024`（92 行 `partOf`）。
+
+**遗留**：上游 [erix-agent #458](https://github.com/ErixWong/erix-agent/issues/458)（把「宿主 `load()` 必须返回折叠后形状」
+从散文变成 exports + 契约判据）、[#415](https://github.com/ErixWong/erix-agent/issues/415)（写侧别再写链，落地并升 pin 后
+**两份镜像的解链闸要同时撤**——`runner/test/store-load-fold.test.js` 与 `portal/test/transcript-fold.test.js` 的源码级哨兵会红提示）。
+### 8.53 收工纪律进 `~/AGENTS.md`：D9 的告知面先行（issue #359 P0c，2026-10-24，分支 `feat-261024-05-git-light-agents-md`）
 
 **交付的只有 D9（§7）的告知面，灯本身没做**：`renderHomeAgentsMd` 的 `## git` 段从 2 行扩到 5 行——
 ①「平台不 clone、不下发凭据，**也不替你提交**：首次运行只对还不是仓库的目录执行一次 `git init -b main`」
@@ -1594,7 +1647,7 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完全误导人。
 ⇒ 本单**没动这个路径**（工作区里那份删除是 `npm ci` 的副作用，未入提交）；后续要么 `git rm --cached node_modules` + 进 `.gitignore`，要么把它改成真的相对符号链接——**别在不知道它存在的情况下再提交它一次**。
 
-### 8.52 收工灯的判定端点（issue #359 P0a，2026-10-24，分支 `feat-261024-05-git-light-agents-md`，接 §8.51）
+### 8.54 收工灯的判定端点（issue #359 P0a，2026-10-24，分支 `feat-261024-05-git-light-agents-md`，接 §8.53）
 
 **交付**：`portal/src/gitlight.js`（新增）+ `GET /api/git-light?cwd=`（`http.js`，挂在 `/api/file` 之后）
 + `docs/api/portal.md` §0.1 补 4 行 + **28 条单测**（`portal/test/gitlight.test.js`）。**界面上还没有灯**（P0b 未做），
@@ -1618,7 +1671,7 @@ CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完�
 **不参与拉高灯色**（它恒为红会把一切染红），只在展开态出那一行解释。成本上界：20 仓库 / 发现 300ms 或 1500 目录 /
 单条 status 2s / 流式 50 条 / **单请求总预算 6s**（仓库多时逐个 2s 会把请求拖到几十秒）。
 
-**基线**：接 §8.51 的 **1446 / 1442 / 0 / 4** → **1474 / 1470 / 0 / 4**（**净 +28**），`npm test` **rc=0**；`runner/`、`portal/frontend/` 零字节。
+**基线**：接 §8.53 的 **1446 / 1442 / 0 / 4** → **1474 / 1470 / 0 / 4**（**净 +28**），`npm test` **rc=0**；`runner/`、`portal/frontend/` 零字节。
 
 **主 agent 亲跑变异 5 条（每条先自证 `git diff` 非空操作）**：① `-uall` 退化成 `-uno` ⇒ **4 条红**；
 ② 撤掉 `--no-optional-locks` ⇒ **第一次是假绿**——哨兵只判了「排在 `status` 之前」，参数整个删掉时 `indexOf` 返回 `-1`
@@ -1637,12 +1690,12 @@ CI 不受伤（`npm ci` 路径），但**本地开发受伤**，而且症状完�
 - 端点未接任何前端调用；`/api/dirs`、`/api/files/tree`、`/api/file` 此前**根本没进 API 端点清单**（本次一并补上，见 §0.1 的「此前漏记，现补」标注）。
 
 
-### 8.53 portal 运行镜像装 git（#359 收工灯的硬前置，2026-10-24，同分支接 §8.52）
+### 8.55 portal 运行镜像装 git（#359 收工灯的硬前置，2026-10-24，同分支接 §8.54）
 
 **为什么 portal 自己也要 git**：`GET /api/git-light` 的「未提交 + 未跟踪」两路要跑一条
 `git status --porcelain -uall`。未推送 / 0 提交那两路是纯文本读 `.git`，不需要 git 二进制；
 **但缺 git 时灯只能恒报 `grey / git_unavailable`**——一颗恒灰的灯比没有灯更糟（绿是承诺、灰是无信息，
-用户会当它坏了而不再看）。§8.52 把这条登记成 P0b 前置，本次直接做掉。
+用户会当它坏了而不再看）。§8.54 把这条登记成 P0b 前置，本次直接做掉。
 
 **改动**（Dockerfile 一处 + 新测试一个）：运行阶段加
 `apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*`，
@@ -1680,5 +1733,5 @@ CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一�
 都**匹配到了自己这条 bash**（命令串里含该字符串）⇒ SIGTERM 打死自己，后面所有语句全没跑（`nohup` 起的构建
 也被进程组带走）。口径：**先 `pgrep` 看清再按 PID 杀**，且模式要写成不匹配自身的形式（如 `[p]ortal/Dockerfile`）。
 
-**基线**：接 §8.52 的 **1474 / 1470 / 0 / 4** → **1478 / 1474 / 0 / 4**，`npm test` **rc=0**；
+**基线**：接 §8.54 的 **1474 / 1470 / 0 / 4** → **1478 / 1474 / 0 / 4**，`npm test` **rc=0**；
 `runner/`、`portal/frontend/`、`portal/src/` 零字节（本次只动 Dockerfile + 测试 + 文档）。

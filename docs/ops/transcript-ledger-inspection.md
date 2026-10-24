@@ -30,7 +30,7 @@ if (persistedRowKey !== undefined) toolResultRowKey = persistedRowKey;
 | 面 | 现状 |
 |---|---|
 | 站内展示投影（`portal/src/session-view.js#projectSessionMessages`） | **自 #341 起已解链**（`portal/src/transcript-fold.js#planFold` 让分片行也登记自己的 key）⇒ 折叠回 1 条聚合 `tool_result`，与 0.22 形状一致 |
-| **引擎 resume**（`foldLedgerMessages` + `validateMessages`） | **仍会坏**：上游 `foldMessageRows` / `foldLedgerMessages` 只认「一跳」，链上第 2 片起查不到目标 ⇒ 一条聚合 `tool_result` 被劈成多条 user 消息 ⇒ `invalid_messages`，会话永久卡死。⚠ **「本站修不了，只能修数据」2026-10-24 作废**：本站 `transcript-fold.js` 是上游读侧的**超集**（链式也解），差的只是把它接到**引擎面向的** `store.load()`（§5 + [#351](https://github.com/ErixWong/erix-station/issues/351)，**尚未实现**） |
+| **引擎 resume**（`foldLedgerMessages` + `validateMessages`） | **仍会坏**：上游 `foldMessageRows` / `foldLedgerMessages` 只认「一跳」，链上第 2 片起查不到目标 ⇒ 一条聚合 `tool_result` 被劈成多条 user 消息 ⇒ `invalid_messages`，会话永久卡死。⚠ **「本站修不了，只能修数据」2026-10-24 作废**：本站 `transcript-fold.js` 是上游读侧的**超集**（链式也解），差的只是把它接到**引擎面向的** `store.load()` ⇒ **#351 已实现**（`runner/lib/store.js#load` + `runner/lib/transcript-fold.js`）：接上后两类在引擎侧一起免疫、存量读侧自愈 |
 
 > **⚠ 口径更正（2026-10-24，#351）**：旧版那句「引擎 resume 侧本站修不了，只能修数据（等上游 #415）」**作废**。
 > 同一份链式 `partOf` 夹具实测：上游 `foldMessageRows` **FAIL**（`tool_result ids do not match…`，user 消息被劈成 2 条）、
@@ -38,7 +38,7 @@ if (persistedRowKey !== undefined) toolResultRowKey = persistedRowKey;
 > 而本站 `runner/lib/store.js` 直通 portal 原始行 ⇒ **引擎从来没经过任何折叠**。
 > 契约依据：`host-consumer-contract.md:2405-2409`（`foldMessageRows` 由内置 store 的 `load()` 调用）与 `:2442`（宿主读账本必须经 `load()`）；
 > `src/loop/resume-manager.js:239-241` 的 `seq` 播种本就为**折叠后的** `load()` 输出设计。
-> 修法与要钉的回归锁在 #351；上线后 §2 的修数据降级为兜底、已砖会话读侧自愈。上游同题 [#458](https://github.com/ErixWong/erix-agent/issues/458)。
+> 修法已落在 #351（`runner/lib/store.js#load` 接折叠）；§2 的修数据自此降级为兜底、已砖会话读侧自愈。上游同题 [#458](https://github.com/ErixWong/erix-agent/issues/458)。
 
 > ⚠ 另一个已实测的边界（别拿它当「没坏」的证据）：站内投影对链式 `partOf` **不显症状** ——
 > 上游 `src/display/projection.js#toolResultsOf(messages)` 扫整条 record 的全部 messages 并按
@@ -127,7 +127,7 @@ SELECT a.round,
 
 ## 2. 修数据口径（递归解链到链头）
 
-> **2026-10-24 定位**：本节是**兜底手段**（只治链式 `partOf` 一类）。#351 的折叠接线上线后新会话不再需要修数据、
+> **2026-10-24 定位**：本节是**兜底手段**（只治链式 `partOf` 一类）。#351 的折叠接线已落地 ⇒ 新会话不再需要修数据、
 > 已砖会话读侧自愈；在那之前它仍是引擎侧唯一可用的修法。今天真机那次修数据见 §5。
 
 **要改的只有一件事**：把每个**分片行**的 `record.partOf` 改成**链头**的 `dedupKey`
@@ -275,7 +275,7 @@ UPDATE transcript_rounds t
 | 写侧把 `partOf` 写成链 | erix-agent（`orchestrator.js`） | 0.23.x 现状 |
 | 读侧折叠只认一跳 | erix-agent（`store/message-rows.js#foldMessageRows` / `#foldLedgerMessages`） | 上游 **#415** 未修 |
 | 站内展示投影解链 | erix-station（`portal/src/transcript-fold.js#planFold`，**临时闸**） | **#341 已交付**；上游落地并升 pin 后撤闸（源码级哨兵会变红提示） |
-| **引擎 resume 面解链** | erix-station（把同一份折叠接到 `runner/lib/store.js#load`，agentd 游标聚合之后） | **待做 = #351**（本单从「只能修数据」改判为「站内可修」） |
+| **引擎 resume 面解链** | erix-station（同一份折叠接在 `runner/lib/store.js#load`，agentd 游标聚合之后） | **#351 已交付**：两类砖化形状在引擎侧一起免疫，存量会话读侧自愈（无需修数据） |
 | 引擎 resume 的账本修数据 | 运维（本文 §2） | 每次升级/巡检后按 §1 判、按 §2 修 |
 
 ---
