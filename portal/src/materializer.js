@@ -13,6 +13,7 @@ import {
   writeTempFile,
   commitTempFile,
 } from './fsutil.js';
+import { OBSERVATION_FRESHNESS_SECONDS } from './portalloc.js';
 
 // 容器内用户名固定 erix（⚠️ 待决策者确认，user-space §2.4）。
 export const FDE_CONTAINER_USER = 'erix';
@@ -97,7 +98,7 @@ export function renderHomeAgentsMd({ fdeName }) {
     '',
     '> 平台负责把请求送到容器，但**容器内不做端口管控**：下面 8 条全在你这一侧，缺一条就有一种挂法（第 8 条缺了不会挂，但用户拿不到能点的地址）。',
     '',
-    '1. **端口从 `~/.erix/ports.json` 取**——前后端各占清单里的一条，不要发明端口，也不要凭记忆猜。',
+    '1. **端口从 `~/.erix/ports.json` 取**——前后端各占清单里的一条，不要发明端口，也不要凭记忆猜。条目里 `in_use: true` = 此刻有进程在听（平台观测，可能滞后），**优先避开**；真撞上了 `bind` 会报错，换清单里下一个号重试即可。`in_use: null` = 无观测数据，**不要当成空闲**。',
     '2. **服务监听 `0.0.0.0`**（容器内），绑 `127.0.0.1` 等于没人接。',
     '3. **把预览 host 加进 dev server 自己的主机白名单**：host 就取该条分配记录里的 `url`（**窄范围优先**，用到的逐条列全）。后缀匹配（一次放开整棵子域）可以接受，但要在注释里说明它放开了整棵子域；**不要 `allowedHosts: true` / `"all"` 一把梭**。配置项名字各框架不同——Vite 是 `server.allowedHosts`，webpack-dev-server 是 `devServer.allowedHosts`，其它框架按你实际用的版本核实，别一律叫 `allowedHosts`。',
     '4. **跨预览端口调用要带凭据**：前端 `fetch` 传 `credentials:\'include\'`（XHR 用 `withCredentials`）。平台的通行凭证是**每条 host 各自的 host-only `HttpOnly` cookie**，不带凭据会被边缘拒成 `403`，且响应体里的 `code` 是 `preview_ticket_required`。',
@@ -142,19 +143,23 @@ export function renderHomeAgentsMd({ fdeName }) {
 
 // P5 去项目化（directory-as-project §3/§5）：ports.json 升为 FDE 级单一文件 ~/.erix/ports.json——
 // allocations 不再按项目分组（port_allocations.project_id 已退役，迁移 0008）。
-export function renderPortsJson({ fdeName, allocations, generation }) {
+export function renderPortsJson({ fdeName, allocations, generation, observedPorts = null }) {
+  // schema 2（#361）：只载**分配事实**（哪些号归我 + 逐条现成 url），使用面事实不上文件。
+  // 旧字段 state/role/run_id/scope/exposure 剃除：P5 后 role 恒 spare、run_id 恒 NULL、
+  // state 只表示「放行过一次」——全是使用面幻觉，agent 消费不了还误导。
+  // in_use = 新鲜观测镜像（≤45s）的**咨询位**：起服务前避开被占的口；仲裁仍是 bind()
+  //（内核原子 test-and-set，EADDRINUSE 即拒绝）——平台不据观测做任何管控，#246 不变。
+  // observedPorts=null ⇒ 无观测数据（旧 agentd / 观测表不可用），in_use 整体降级为 null（=「不知道」，≠空闲）。
+  const ports = allocations.map((a) => Number(a.port)).sort((x, y) => x - y);
   return json({
-    schema: 1,
+    schema: 2,
     fde: fdeName,
     generation,
+    block: ports.length > 0 ? { start: ports[0], end: ports[ports.length - 1] } : null,
     allocations: allocations.map((a) => ({
-      scope: a.scope,
       port: Number(a.port),
-      role: a.role,
-      run_id: a.run_id,
       url: a.url,
-      exposure: a.exposure,
-      state: a.state,
+      in_use: observedPorts === null ? null : observedPorts.includes(Number(a.port)),
     })),
   });
 }
@@ -197,7 +202,7 @@ export function hostPathFor(root, fdeName, containerPath) {
  * 骨架 + FDE 级 ports.json；旧项目脚手架靠 stale 清理（manifest 机制）自然移除。
  * @returns { files: [{ containerPath, hostPath, content, mode }] }
  */
-export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, root, generation }) {
+export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root, generation }) {
   const files = [];
   const add = (containerPath, content, mode = FILE_MODE) => {
     files.push({ containerPath, hostPath: hostPathFor(root, fdeName, containerPath), content, mode });
@@ -206,7 +211,7 @@ export function buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, ro
   add(`${CONTAINER_HOME}/AGENTS.md`, renderHomeAgentsMd({ fdeName }));
   add(`${CONTAINER_HOME}/.erix/config.json`, renderConfigJson({ llmBaseUrl }));
   add(`${CONTAINER_HOME}/.erix/mcp.json`, renderMcpJson());
-  add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, generation }));
+  add(`${CONTAINER_HOME}/.erix/ports.json`, renderPortsJson({ fdeName, allocations, observedPorts, generation }));
   return files;
 }
 
@@ -244,11 +249,11 @@ export function createMaterializer({ root, uid = 1000, gid = 1000, log = console
    * 渲染 + 落盘该 FDE 全部平台文件 + manifest（提交点）。
    * 返回 manifest 内容与最终 generation（供测试断言）。
    */
-  async function materialize({ fdeName, baseDomain, llmBaseUrl, allocations, generation, prevManifest, materializedAt = new Date() }) {
+  async function materialize({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, generation, prevManifest, materializedAt = new Date() }) {
     const rootReal = path.resolve(root);
     const prevFiles = (prevManifest && prevManifest.files) || {};
 
-    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, root: rootReal, generation });
+    const files = buildFilePlan({ fdeName, baseDomain, llmBaseUrl, allocations, observedPorts, root: rootReal, generation });
 
     ensureWorkspaceDirs(files);
 
@@ -416,9 +421,23 @@ async function readFdeDesiredState(pool, fdeId, config) {
        FROM port_allocations WHERE fde_id = $1 AND state <> 'released' ORDER BY port`,
     [fdeId],
   );
+  // #361：in_use 咨询位的数据源 = 新鲜观测（与门户列端点同口径 45s）。观测表不可用 ⇒ null 降级，
+  // 分配告知照常——ports.json 的第一职责（告知分配）永不被观测面拖死。
+  let observedPorts = null;
+  try {
+    const obs = await pool.query(
+      `SELECT DISTINCT port FROM port_observations
+        WHERE fde_id = $1 AND observed_at > now() - interval '${OBSERVATION_FRESHNESS_SECONDS} seconds'`,
+      [fdeId],
+    );
+    observedPorts = obs.rows.map((r) => Number(r.port));
+  } catch {
+    // 观测表缺失/读失败：咨询位降级 null
+  }
   return {
     fdeName,
     allocations: allocs.rows,
+    observedPorts,
     llmBaseUrl: config.llmPublicBaseUrl,
     baseDomain: config.baseDomain,
   };
@@ -514,6 +533,7 @@ export async function runMaterializerOnce(pool, config, { log = console, workerI
         baseDomain: state.baseDomain,
         llmBaseUrl: state.llmBaseUrl,
         allocations: state.allocations,
+        observedPorts: state.observedPorts,
         generation: Number(row.revision),
         prevManifest,
       });

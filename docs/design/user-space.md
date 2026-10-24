@@ -198,46 +198,37 @@ Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<UR
 
 ### 4.3 JSON schema
 
-#### 4.3.1 `ports.json`（项目端口派生视图）
+#### 4.3.1 `ports.json`（FDE 级分配告知 + in_use 咨询位，schema 2）
 
-路径：`/home/<user>/projects/<project>/.erix/ports.json`。schema 与规格 §8.3 对齐并补全：
+路径：`/home/<user>/.erix/ports.json`（P5 去项目化后为 FDE 级单一文件）。schema 2（issue #361）只载**分配事实**：
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "fde": "alice",
-  "project": "proj1",
   "generation": 42,
+  "block": { "start": 22000, "end": 22009 },
   "allocations": [
-    {
-      "scope": "project",
-      "port": 4000,
-      "role": "frontend",
-      "run_id": null,
-      "url": "https://alice-p-4000.fde.erix.vip",
-      "exposure": "private",
-      "state": "allocated"
-    },
-    {
-      "scope": "run",
-      "port": 4001,
-      "role": "backend",
-      "run_id": "6f1c2a34-9b8e-4f2d-a1c5-7d8e0f1a2b3c",
-      "url": "https://alice-p-4001.fde.erix.vip",
-      "exposure": "private",
-      "state": "active"
-    }
+    { "port": 22000, "url": "http://alice-p-22000.fde.erix.vip:8090", "in_use": true },
+    { "port": 22001, "url": "http://alice-p-22001.fde.erix.vip:8090", "in_use": false }
   ]
 }
 ```
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `schema` | int | 固定 `1`（读方据此做向后兼容分支） |
-| `fde` / `project` | string | FDE 名 / 项目名（与 `port_allocations` 同源） |
+| `schema` | int | 固定 `2`（读方据此做向后兼容分支） |
+| `fde` | string | FDE 名（与 `port_allocations` 同源） |
 | `generation` | int | = 物化时 `manifest.json` 的 generation（跨文件一致性锚点，§5.3） |
-| `allocations[]` | array | 该项目（`project_id`）当前所有未释放分配（`state ∈ {allocated, active}`）的投影 |
-| `allocations[].scope/port/role/run_id/url/exposure/state` | — | 与 `port_allocations` 列一一对应（model §1.9）；`run_id` 项目级恒 `null`，run 级为 run UUID 字符串 |
+| `block` | obj \| null | 分配段范围（活跃分配的最小/最大端口；无分配 ⇒ null） |
+| `allocations[]` | array | 该 FDE 当前所有未释放分配（`state ∈ {allocated, active}`）的投影，按端口升序 |
+| `allocations[].port` | int | 与 `port_allocations.port` 同源 |
+| `allocations[].url` | string | 现成预览地址（**agent 报地址时取此原值**，永不自行拼接；#240 口径） |
+| `allocations[].in_use` | bool \| null | **咨询位**：新鲜观测（`port_observations`，≤45s，与门户读端点同口径）镜像「此刻有进程在听」；`null` = 无观测数据（**≠空闲**）。仲裁仍是内核 `bind()`（`EADDRINUSE` 即拒绝换口），平台不据观测做任何管控（#246 不变式） |
+
+**使用面事实永不进文件**（#361 决策）：「谁在占哪个口、干啥用」是心跳黑板（`port_observations`，允许丢失自动重建）；文件只回答「哪些号归我」。旧 schema 1 的 `scope/role/run_id/exposure/state` 已剃除（P5 后恒值/无消费者）。
+
+**刷新纪律**：`in_use` 翻转（观测端口集合变化）时由心跳写侧入队 materialize 重刷；不跟 15s 心跳节拍做全量物化。
 
 **序列化规则（幂等前提）**：对象键序固定（按渲染模板插入序，非字典序）、2 空格缩进、末尾换行。同一 DB 快照 → 字节级相同的文件（§5.5）。
 
