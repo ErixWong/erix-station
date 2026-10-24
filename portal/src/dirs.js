@@ -179,16 +179,12 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
 }
 
 /**
- * GET /api/file?cwd=<相对cwd>&path=<相对路径> → 单文件只读预览 { name, path, kind, data }。
- * P6（issue #84）文件面板点击预览第一版：文本/Markdown/图片；git 变更标记与 run 终态
- * 刷新不在本版范围。
- * 牢笼校验与 fileTree 同口径（安全红线）：cwd 形态 → root 真实目录且非 symlink →
- * 解析后 containment 检查（拒 .. / 绝对路径逃逸）→ 逐段 lstat 拒 symlink（防 bind mount 内
- * 用户自建 symlink 把文件内容泄漏到 jail 外）→ 目标必须是非 symlink 的普通文件。
- * 大小上限 FILE_PREVIEW_MAX_BYTES（超限 413 报错不截断）；非图片按「前 8KB 嗅探 NUL 字节」
- * 判二进制，二进制明确拒绝（不猜测解码乱码）。
+ * 牢笼解析（JSON 预览与流式通道共用，同一条安全红线只写一遍）：
+ * cwd 形态 → root 真实目录且非 symlink → 解析后 containment 检查（拒 .. / 绝对路径逃逸）
+ * → 逐段 lstat 拒 symlink（防 bind mount 内用户自建 symlink 把文件内容泄漏到 jail 外）
+ * → 目标必须是非 symlink 的普通文件。命中即抛 DirError，成功返回 { target, rel, st, project }。
  */
-export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } = {}) {
+export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFoundHint = 'file' } = {}) {
   if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
   let safeCwd;
   try {
@@ -222,8 +218,8 @@ export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } =
   }
   const target = path.resolve(root, relPath);
   if (target !== root) {
-    const rel = path.relative(root, target);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    const relToRoot = path.relative(root, target);
+    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
       throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
     }
   }
@@ -238,7 +234,7 @@ export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } =
       st = fs.lstatSync(cur);
     } catch (err) {
       if (err?.code === 'ENOENT') {
-        throw new DirError('not_found', 'file not found', { httpStatus: 404 });
+        throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
       }
       throw err;
     }
@@ -246,11 +242,23 @@ export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } =
       throw new DirError('validation_failed', 'path 含符号链接，拒绝读取', { details: { field: 'path' } });
     }
   }
-
   const st = fs.lstatSync(target);
   if (!st.isFile()) {
     throw new DirError('validation_failed', 'path 必须是文件', { details: { field: 'path' } });
   }
+  return { target, rel, st, project: name };
+}
+
+/**
+ * GET /api/file?cwd=<相对cwd>&path=<相对路径> → 单文件只读预览 { name, path, kind, data }。
+ * P6（issue #84）文件面板点击预览第一版：文本/Markdown/图片；git 变更标记与 run 终态
+ * 刷新不在本版范围。
+ * 牢笼校验见 resolveJailedFile（与 fileTree 同口径，安全红线）。
+ * 大小上限 FILE_PREVIEW_MAX_BYTES（超限 413 报错不截断）；非图片按「前 8KB 嗅探 NUL 字节」
+ * 判二进制，二进制明确拒绝（不猜测解码乱码）——415/413 同时被 #366 P0 埋点计数（http.js 接线）。
+ */
+export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } = {}) {
+  const { target, rel, st } = resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath });
   if (st.size > FILE_PREVIEW_MAX_BYTES) {
     throw new DirError('file_too_large', `文件超过预览上限（${Math.floor(FILE_PREVIEW_MAX_BYTES / 1024 / 1024)}MB）`, {
       httpStatus: 413,
@@ -275,8 +283,104 @@ export async function readFilePreview({ userSpaceRoot, fdeName, cwd, relPath } =
 /** 预览单文件大小上限（P6 issue #84）：超限报错而非截断，防误点大文件把 portal 内存打爆。 */
 export const FILE_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 
+/**
+ * 流式通道单文件上限（#366 P0）：不读进内存（createReadStream），上限只是护栏
+ * （防百 GB 级误点堵带宽）；比 JSON 预览的 2MB 宽两个量级——大 PDF/视频的合法体积。
+ */
+export const FILE_STREAM_MAX_BYTES = 512 * 1024 * 1024;
+
 /** 图片扩展名 → data URL MIME（图片走 base64 data URL，前端 <img> 直接渲染，零新端点）。 */
 const IMAGE_MIME = {
   '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
   '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
 };
+
+/**
+ * 流式通道响应 MIME（#366 P0，浏览器原生可渲集）。红线：没有 text/html——工作区里的
+ * .html 若以 text/html 同源直出，脚本在 portal 源里执行（预览即 XSS）；一律降级为下载。
+ * 未知扩展名 → application/octet-stream（浏览器存盘，不猜）。
+ */
+const STREAM_MIME = {
+  ...IMAGE_MIME,
+  '.pdf': 'application/pdf',
+  '.mp4': 'video/mp4', '.webm': 'video/webm', '.m4v': 'video/x-m4v', '.mov': 'video/quicktime',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4',
+};
+
+/** 流式通道取 MIME：图片/PDF/音视频命中白名单，其余 octet-stream（存盘不执行）。 */
+export function streamMimeFor(target) {
+  return STREAM_MIME[path.extname(String(target)).toLowerCase()] ?? 'application/octet-stream';
+}
+
+/**
+ * 单 Range 解析（#366 P0，视频 seek / pdf.js 分段加载的硬前置）。
+ * 支持 `bytes=a-b` / `bytes=a-` / `bytes=-N`（后缀长）；多 Range、非法格式一律当无 Range
+ * （整身 200，宽容降级）。不可满足（起点 ≥ 大小）是 Range 语义错误 → 416，与「没发 Range」
+ * 不同类，不可降级。
+ * @returns {{status:'ok',start:number,end:number}|{status:'unsatisfiable'}|{status:'none'}|null}
+ */
+export function parseSingleRange(header, size) {
+  if (typeof header !== 'string' || !header) return { status: 'none' };
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m || (m[1] === '' && m[2] === '')) return { status: 'none' };
+  if (size === 0) return { status: 'unsatisfiable' };
+  if (m[1] === '') {
+    const n = Number(m[2]);
+    if (!Number.isSafeInteger(n) || n <= 0) return { status: 'none' };
+    return { status: 'ok', start: Math.max(size - n, 0), end: size - 1 };
+  }
+  const start = Number(m[1]);
+  if (!Number.isSafeInteger(start) || start >= size) return { status: 'unsatisfiable' };
+  const end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+  return { status: 'ok', start, end };
+}
+
+/**
+ * 流式打开通道（#366 P0）：牢笼同 JSON 预览，但不嗅探类型、不读进内存，返回
+ * { name, path, rel, size, mime, status(200|206), headers, stream }（headers 给 http 层原样
+ * writeHead；stream 为 null 时是 416，headers 带 Content-Range）。download=true →
+ * attachment（「下载」按钮的出口）；否则媒体白名单内 inline、其余（octet-stream）强制
+ * attachment（红线：同源未知字节流不给 inline）。无 Range ⇒ 整身 200。
+ */
+export async function openFileStream({
+  userSpaceRoot, fdeName, cwd, relPath, range = null, disposition = 'inline',
+} = {}) {
+  const { target, rel, st } = resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath });
+  if (st.size > FILE_STREAM_MAX_BYTES) {
+    throw new DirError('file_too_large', `文件超过流式上限（${Math.floor(FILE_STREAM_MAX_BYTES / 1024 / 1024)}MB）`, {
+      httpStatus: 413,
+    });
+  }
+  const name = path.basename(target);
+  const mime = streamMimeFor(target);
+  // inline 资格：媒体白名单命中才 inline；octet-stream 未知型强制 attachment，
+  // 除非调用方明确要求 attachment（disposition='attachment'）。
+  const effective = disposition === 'download' || mime === 'application/octet-stream' ? 'attachment' : 'inline';
+  const headers = {
+    'Content-Type': mime,
+    'Accept-Ranges': 'bytes',
+    'Content-Disposition': `${effective}; filename="${sanitizeFilename(name)}"`,
+  };
+  const parsed = parseSingleRange(range, st.size);
+  if (parsed?.status === 'unsatisfiable') {
+    return {
+      name, path: rel, rel, size: st.size, mime, status: 416, stream: null,
+      headers: { ...headers, 'Content-Range': `bytes */${st.size}` },
+    };
+  }
+  const { start, end } = parsed?.status === 'ok' ? parsed : { start: 0, end: st.size - 1 };
+  const length = st.size === 0 ? 0 : end - start + 1;
+  if (parsed?.status === 'ok') {
+    headers['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
+  }
+  headers['Content-Length'] = String(length);
+  return {
+    name, path: rel, rel, size: st.size, mime, status: parsed?.status === 'ok' ? 206 : 200,
+    headers, stream: fs.createReadStream(target, length === 0 ? { start: 0, end: -1 } : { start, end }),
+  };
+}
+
+/** Content-Disposition filename 净化：去引号/反斜杠/控制符/分号，防头注入与断句。 */
+function sanitizeFilename(name) {
+  return String(name).replace(/["\\;\x00-\x1f\x7f]/g, '_').slice(0, 200);
+}

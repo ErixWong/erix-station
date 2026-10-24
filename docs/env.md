@@ -302,7 +302,11 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_AGENT_VERSION` | 平台规范固定（写 `containers.agent_version`；开发期占位） | `dev` |
 | `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；**已决 2026-09-18，issue #27**） | `4g`（B 档镜像下 dotnet build/chromium 峰值需要；`0` 表示不限） |
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
-| `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
+| `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；#366 兼任 `/pv/<code>` 能力码签名密钥 `previewSessionSigningKey`；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |
+| `KK_INTERNAL_BASE_URL` | portal 访问 kkFileView 预览引擎的容器网地址（#366，portal.md §4.11；浏览器永远不碰它） | `http://kkfileview:8012` |
+| `KKFILEVIEW_IMAGE` | kkFileView 镜像。**官方 Hub 镜像停在 4.1.0（无 `file://` 本地协议，不支持 ro 挂载预览设计），上游 5.x 未发布镜像 → 自建**（`deploy/kkfileview/build-image.sh`，生产按 digest 钉死） | `erix-station/kkfileview:5.0.3`（dev 本地 build） |
+| `KKFILEVIEW_UID` / `KKFILEVIEW_GID` | kk 容器运行身份（userspace 属主是 1000:1000 且 `drwxrwx---`，root 无特权容器里拿不到 GID 1000 补充组，直读只能同 uid/gid；#366） | `1000` / `1000` |
+| `KKFILEVIEW_MEM_LIMIT` | kk 容器内存上限（LibreOffice 子进程计入；转换峰值实测前保守值） | `2g` |
 | `PREVIEW_TICKET_TTL_SECONDS` / `PREVIEW_SESSION_TTL_SECONDS` | 平台规范固定（portal.md §2.8；**已决 2026-09-18，issue #27**） | `60` / `900`（ticket 单次短 TTL / 预览 cookie 15min 滚动续期） |
 | `LLM_GATEWAY_HOST` | Traefik host-network 使用的 LiteLLM 数据面回环地址 | `http://127.0.0.1:4100` |
 | `LITELLM_HOST_PORT` | LiteLLM 在宿主回环发布的端口；隔离栈必须指定与其它栈不同的端口 | `4100` |

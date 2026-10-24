@@ -1,0 +1,35 @@
+# kkFileView 5.x 运行基座（issue #366）
+#
+# 为什么自建：官方 Docker Hub 镜像 keking/kkfileview 停在 4.1.0（2022-08），而
+# file:// 本地文件协议（ro 挂载 userspace 预览的硬依赖，DownloadUtils.isFileUrl）
+# v5.x 才实现；上游 v5.0.x 的 Dockerfile 又从 keking/kkfileview-base:5.0.0 构建，
+# 该镜像 Hub 上不存在（404，只有 GHCR 私有源）。基座按上游
+# docker/kkfileview-base/Dockerfile（v5.0.3 tag）等价复刻：
+#   ubuntu 24.04 + openjdk-21-jre + libreoffice-nogui + 中文字体 + zh_CN locale。
+# 与上游的差异（有意）：
+# - 去掉 ttf-mscorefonts-installer：postinst 从 SourceForge 拉 cab，内网不可靠；
+#   中文渲染主力是 wqy 三个包（上游也装），ms 核心字体缺失只影响少数英文衬线字体排版。
+# - 不装 fonts/* 目录（上游 repo 里该目录只有 .gitkeep，等价空操作）。
+# 构建（在仓库根，构建缓存走 apt aliyun 镜像）：
+#   docker build -f deploy/kkfileview/Dockerfile.base -t erix-station/kkfileview-base:5.0.3 .
+FROM ubuntu:noble
+
+# apt 换 aliyun 镜像（与上游同款；noble 用 ubuntu.sources 新格式）
+RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.aliyun.com@g; s@//security.ubuntu.com@//mirrors.aliyun.com@g' /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      openjdk-21-jre-headless \
+      libreoffice-nogui \
+      tzdata locales xfonts-utils fontconfig curl \
+      ttf-wqy-microhei ttf-wqy-zenhei xfonts-wqy && \
+    echo 'Asia/Shanghai' > /etc/timezone && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    localedef -i zh_CN -c -f UTF-8 -A /usr/share/locale/locale.alias zh_CN.UTF-8 && \
+    locale-gen zh_CN.UTF-8 && \
+    fc-cache -fv && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 预览产物目录（KK_FILE_DIR 指到这里；运行时也可换 tmpfs）
+RUN mkdir -p /opt/kkfileview/file && chmod 1777 /opt/kkfileview/file
+
+ENV LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8 JAVA_OPTS=""
