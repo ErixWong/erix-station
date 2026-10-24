@@ -54,6 +54,22 @@ test('listDirs：枚举一级目录（字典序），cwd 相对形式 + 运行�
   }
 });
 
+test('listDirs：隐藏目录（. 开头）不列——下拉只给真项目，不列 .pnpm-store 类工具缓存', async () => {
+  const { root, projects } = tmpUserspace();
+  try {
+    fs.mkdirSync(path.join(projects, '.pnpm-store'), { recursive: true }); // 真实案例：pnpm 缓存落在挂载根
+    fs.mkdirSync(path.join(projects, '.config'), { recursive: true });
+    fs.mkdirSync(path.join(projects, 'lingolens'), { recursive: true });
+    fs.writeFileSync(path.join(projects, '.gitignore'), 'x'); // 隐藏文件同样不列
+
+    const pool = fakePool({ cwdCounts: { '~/projects/.pnpm-store': { running: 1, queued: 0 } } });
+    const r = await listDirs(pool, { userId: 'u1', userSpaceRoot: root, fdeName: 'alice' });
+    assert.deepEqual(r.dirs.map((d) => d.name), ['lingolens']);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('listDirs：projects 根不存在 → 空列表（不 500，尚无目录是正常态）', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'erix-dirs-empty-'));
   try {
