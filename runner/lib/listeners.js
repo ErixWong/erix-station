@@ -136,19 +136,21 @@ function normalizeCwd(cwdAbs, home) {
 /** 对「当前 euid 读得动」的这批 socket 做完整富化（owner 本人的视角）。 */
 function enrich(procPath, sockets, owners, btime, home) {
   const out = [];
-  // 同一端口多 inode（v4+v6）⇒ 按 port 归并。
+  // 同一端口多 inode（v4+v6）⇒ 按 port 归并；uid 取组内首个非空 owner。
   const byPort = new Map();
   for (const s of sockets) {
-    if (!byPort.has(s.port)) byPort.set(s.port, { port: s.port, inodes: [] });
-    byPort.get(s.port).inodes.push(s.inode);
+    if (!byPort.has(s.port)) byPort.set(s.port, { port: s.port, inodes: [], uid: null });
+    const g = byPort.get(s.port);
+    g.inodes.push(s.inode);
+    if (g.uid === null && s.uid !== null) g.uid = s.uid;
   }
-  for (const { port, inodes } of byPort.values()) {
+  for (const { port, inodes, uid } of byPort.values()) {
     let pid = null;
     for (const ino of inodes) {
       const found = owners.get(ino);
       if (found !== undefined) { pid = found; break; }
     }
-    const entry = { port, pid: null, uid: sockets[0]?.uid ?? null, cwd: null, cmd: null, branch: null, started_at: null };
+    const entry = { port, pid: null, uid, cwd: null, cmd: null, branch: null, started_at: null };
     if (pid !== null) {
       entry.pid = pid;
       const cwdAbs = readlinkOrNull(path.join(procPath, String(pid), 'cwd'));
@@ -169,6 +171,12 @@ function enrich(procPath, sockets, owners, btime, home) {
 
 /**
  * 采样一次。「绝不 throw」是契约：任何异常吞掉、返回已有部分（最差空数组）。
+ *
+ * ⚠ **setuid 窗口是同步的**：切 uid → 扫描 → 恢复全程无 await（Node 单线程 ⇒ 窗口内不会有其它 JS
+ * 以临时身份跑）；libuv 线程池里在途的异步 fs 可能落进窗口，采样毫秒级、代价可忽略。
+ * node 的 process.setuid(setresuid) 会把 saved uid 一并改掉——恢复自己靠的是 agentd 常驻的
+ * ambient CAP_SETUID（entrypoint 授 setuid/setgid/kill，runner §11.3），真机已验证来回切换 OK。
+ *
  * @param procPath   注入点（单测 fixture；生产 '/proc'）
  * @param home       容器用户家目录（~/projects/... 归一前缀；容器外进程保留绝对路径）
  * @param setuid     注入点：单测不降权（缺省 node:process.setuid，生产按 owner 切换）
@@ -179,39 +187,72 @@ export function collectListeners({ procPath = '/proc', home = null, maxEntries =
     const sockets = listenSockets(procPath);
     if (sockets.length === 0) return [];
     const btime = bootTimeSec(procPath);
-    const applyUid = setuid ?? ((uid) => process.setuid(uid));
     const selfUid = (() => { try { return process.getuid(); } catch { return null; } })();
+    // ⚠ **只能用原生 process.setuid，绝不能用返回 uid 的封装**：libuv 的 uv_setuid 在 setresuid 失败时
+    // 会退化成 setuid()——非 root 下 saved uid 被踩成目标 uid，**再也切不回来**（真机实证：
+    // 探针里 setuid(0) 成功降级成 root、随后 setuid(1000) EPERM）。原生 setuid(2) 是 setresuid(r,e,s)
+    // 三写，ambient CAP_SETUID 下可往返（runner §11.3 / entrypoint 的 setuid/setgid/kill 正是这条能力）。
+    const nativeSetuid = (() => {
+      try { return globalThis.process.setuid.bind(globalThis.process); } catch { return null; }
+    })();
+    const applyUid = setuid ?? ((uid) => {
+      if (!nativeSetuid) throw new Error('setuid unavailable');
+      nativeSetuid(uid);
+    });
     const restoreUid = () => { if (selfUid !== null) { try { applyUid(selfUid); } catch { /* 尽力恢复 */ } } };
 
     const merged = new Map(); // port → entry（先到先得；同端口跨 uid 罕见，v4/v6 已在 enrich 内归并）
-    const byOwner = new Map(); // 能读 fd 的候选 uid：socket owner（含 -1 = 老内核拿不到 uid，root 视角试一次）
+    const byOwner = new Map(); // 读 fd 需要的身份：socket owner uid；-1 = 拿不到 uid 的兜底组（当前身份试一次）
     for (const s of sockets) {
       const key = s.uid === null ? -1 : s.uid;
       if (!byOwner.has(key)) byOwner.set(key, []);
       byOwner.get(key).push(s);
     }
+    // 自己的 uid 排最后扫：扫完直接恢复，省一次无谓的切进/切出（且中途抛错也不会把自己留在别人身份上）。
+    // ⚠ uid 0 只在自身就是 root 时才切：root→非 root 的 setuid 会把 permitted/effective 能力**清空**
+    //   （无 KEEPCAPS），碰一次 root 就永久失去切回去的资本——真机实证：setuid(0) 后再切 1000 直接 EPERM。
+    //   非 root 的 agentd 对 uid-0 socket 只报「端口在听 + owner=0」（容器内 root 监听本就不是 agent 的 dev server）。
+    const canSwitch = selfUid !== null;
+    const ownerKeys = [...byOwner.keys()].filter((u) => u >= 0 && u !== selfUid && (u !== 0 || selfUid === 0));
+    ownerKeys.sort((a, b) => (a === selfUid ? 1 : 0) - (b === selfUid ? 1 : 0));
+    if (selfUid === null) ownerKeys.push(-1); // 拿不到自身 uid（非 POSIX）⇒ 用当前身份全扫一次
 
-    for (const [uidKey, group] of byOwner.entries()) {
+    const minimal = (group, uidKey) => group.map((s) => ({
+      port: s.port, pid: null, uid: uidKey < 0 ? null : uidKey, cwd: null, cmd: null, branch: null, started_at: null,
+    }));
+
+    // 切换链一旦断掉（恢复自身失败 ⇒ 后续 applyUid 全 EPERM）就不再切，余下组只报端口可见。
+    let broken = false;
+    for (const uidKey of ownerKeys) {
+      const group = byOwner.get(uidKey) ?? [];
       let entries = [];
       try {
-        if (uidKey >= 0) {
-          // 切到 owner 再扫（Yama/无 CAP_PTRACE 下唯一读得动其 fd 的身份）；扫完切回。
-          applyUid(uidKey);
-          const owners = inodeOwners(procPath, group);
-          entries = enrich(procPath, group, owners, btime, home);
-        } else {
-          const owners = inodeOwners(procPath, group);
-          entries = enrich(procPath, group, owners, btime, home);
-        }
+        if (broken) throw new Error('uid switch chain broken');
+        if (uidKey >= 0 && uidKey !== selfUid) applyUid(uidKey);
+        const owners = inodeOwners(procPath, group);
+        entries = enrich(procPath, group, owners, btime, home);
       } catch {
-        entries = group.map((s) => ({ port: s.port, pid: null, uid: uidKey < 0 ? null : uidKey, cwd: null, cmd: null, branch: null, started_at: null }));
+        entries = minimal(group, uidKey);
       } finally {
-        if (uidKey >= 0) restoreUid();
+        if (uidKey >= 0 && uidKey !== selfUid) {
+          try { applyUid(selfUid); } catch { broken = true; }
+        }
       }
-      // 兜底：这组里仍没拿到 pid 的（跨 uid 读不动）⇒ 至少报「端口在听 + owner uid」。
+      // 兜底：这组里仍没拿到 pid 的（身份不对/进程已退）⇒ 至少报「端口在听 + owner uid」。
       for (const e of entries) {
         if (!merged.has(e.port)) merged.set(e.port, e);
       }
+    }
+    // 未扫的组（uid-0 且自身非 root / 拿不到 uid 的 -1 组）：用当前身份扫一次不切 uid，
+    // 读得动多少算多少（同 uid 进程读自己的 fd 永远没问题）。
+    for (const [uidKey, group] of byOwner.entries()) {
+      const skipped = !ownerKeys.includes(uidKey) || (uidKey === 0 && selfUid !== 0 && canSwitch);
+      if (!skipped || group.every((s) => merged.has(s.port))) continue;
+      try {
+        for (const e of enrich(procPath, group, inodeOwners(procPath, group), btime, home)) {
+          if (!merged.has(e.port)) merged.set(e.port, e);
+        }
+      } catch { /* 维持端口可见 */ }
     }
 
     const out = [...merged.values()].sort((a, b) => a.port - b.port);
