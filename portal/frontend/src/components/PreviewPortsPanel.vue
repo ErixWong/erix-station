@@ -171,11 +171,6 @@ const primaryItems = computed<PreviewPortItem[]>(() => {
   const sorted = [...props.items].sort((a, b) => rank(a) - rank(b));
   return filterToDir.value ? sorted.filter(observedHere) : sorted;
 });
-const otherItems = computed<PreviewPortItem[]>(() => {
-  if (!filterToDir.value) return [];
-  return props.items.filter((i) => !observedHere(i));
-});
-const othersOpen = ref(false);
 
 /**
  * 同目录 ≥2 个监听 = 「两个分支各占一口」的现场；面板顶部显性警告，不让人靠猜。
@@ -432,59 +427,8 @@ onScopeDispose(() => clearTimeout(copiedTimer));
         >{{ t('previewPorts.noneHere') }}</li>
       </ul>
 
-      <!-- 过滤态的兑底折叠区：别的目录在用 + 无观测的冷余量。默认收起，签票/复用入口不丢。 -->
-      <div v-if="filterToDir && otherItems.length > 0" class="mt-1">
-        <button
-          type="button"
-          data-test="preview-ports-others-toggle"
-          class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[10px] font-medium text-black/55 hover:bg-black/5"
-          :aria-expanded="othersOpen"
-          @click="othersOpen = !othersOpen"
-        >
-          <span aria-hidden="true">{{ othersOpen ? '▾' : '▸' }}</span>
-          <span>{{ othersOpen ? t('previewPorts.othersCollapse') : t('previewPorts.othersExpand', { count: otherItems.length }) }}</span>
-        </button>
-        <ul v-if="othersOpen" data-test="preview-ports-others" class="min-w-0">
-          <li
-            v-for="item in otherItems"
-            :key="item.id"
-            data-test="preview-port-other-row"
-            class="min-w-0 border-b border-black/10 py-1.5 last:border-b-0"
-          >
-            <div class="flex min-w-0 items-center gap-1.5">
-              <span data-test="preview-port-value" class="shrink-0 text-[11px] font-medium leading-[1.4]">{{ item.port }}</span>
-              <!-- 池外合成行（url=null）在折叠区同样不画状态/打开按钮：没地址可开，点了只会拿
-                   `observed:<port>` 去签一张必 404 的票。主区行已同口径处理，这里曾漏改（用户实证）。 -->
-              <span
-                v-if="item.url"
-                data-test="preview-port-state"
-                class="min-w-0 shrink truncate rounded-full border px-1.5 py-[1px] text-[10px] leading-[1.4]"
-                :class="item.state === 'active'
-                  ? 'border-sky-500/40 bg-sky-50 text-sky-800'
-                  : 'border-black/20 bg-black/5 text-black/60'"
-                :title="stateLabel(item.state)"
-                :aria-label="stateLabel(item.state)"
-              >{{ stateShortLabel(item.state) }}</span>
-              <button
-                v-if="item.url"
-                type="button"
-                data-test="preview-port-open"
-                class="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/60 hover:bg-black/10 disabled:opacity-50"
-                :disabled="props.ticketBusyId !== null"
-                :title="props.ticketBusyId === item.id ? t('previewPorts.signing') : t('previewPorts.openAction')"
-                :aria-label="props.ticketBusyId === item.id ? t('previewPorts.signing') : t('previewPorts.openAction')"
-                @click="emit('open', item)"
-              >↗</button>
-            </div>
-            <p
-              v-if="item.observed"
-              data-test="preview-port-observed"
-              class="mt-0.5 min-w-0 truncate text-[10px] leading-[1.4] text-black/55"
-              :title="observedTitle(item.observed)"
-            >{{ observedText(item.observed) }}</p>
-          </li>
-        </ul>
-      </div>
+      <!-- 无折叠区（用户实证裁定）：工作台列表 = 当前目录在用的端口，其余（含原 10 端口全量）
+           都是干扰项，不显示也不提供展开入口。旧后端无观测时不过滤（filterToDir=false），全量照常。 -->
 
       <p class="muted mt-1" :class="props.variant === 'list' ? 'text-[11px] leading-[1.5]' : 'text-xs'">{{ t('previewPorts.stateHint') }}</p>
       <p v-if="copyError" data-test="preview-port-copy-error" class="syserr mt-1 text-xs" role="alert">{{ copyError }}</p>

@@ -437,7 +437,7 @@ describe('观测层注解（observed）', () => {
     expect(warn).not.toContain('~/projects/other'); // 单实例目录不进警告
   });
 
-  it('传 currentCwd + 观测可用 ⇒ **只显示**本目录在用的端口；其余进折叠区，展开后可见', async () => {
+  it('传 currentCwd + 观测可用 ⇒ **只显示**本目录在用的端口；其余整行不画也不给展开入口（用户裁定：10 端口全量是干扰项）', () => {
     wrapper = mountPanel({
       items: [
         portItem('a', 22000, { observed: null }),
@@ -452,11 +452,10 @@ describe('观测层注解（observed）', () => {
     expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(1);
     // 主区行文案：目录已定 ⇒ 不重复报 cwd，改报 cmd（能看出是 vite 还是后端）。
     expect(rows[0].get('[data-test="preview-port-observed"]').text()).toContain('node vite.js');
-    expect(wrapper.find('[data-test="preview-ports-others"]').exists()).toBe(false);
-
-    await wrapper.get('[data-test="preview-ports-others-toggle"]').trigger('click');
-    const others = wrapper.findAll('[data-test="preview-port-other-row"]');
-    expect(others.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22000', '22001']);
+    // 无折叠区：其余端口（22000/22001）整行不可见，也没有展开入口
+    expect(wrapper.text()).not.toContain('22000');
+    expect(wrapper.text()).not.toContain('22001');
+    expect(wrapper.find('[data-test="preview-ports-others-toggle"]').exists()).toBe(false);
   });
 
   it('传 currentCwd 但本目录无在用端口 ⇒ 主区给「无在用」说明，不谎报空列表', () => {
@@ -467,7 +466,6 @@ describe('观测层注解（observed）', () => {
     });
     expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(0);
     expect(wrapper.find('[data-test="preview-port-none-here"]').exists()).toBe(true);
-    expect(wrapper.find('[data-test="preview-ports-others-toggle"]').exists()).toBe(true);
   });
 
   it('旧后端（DTO 无 observed 键）⇒ **不过滤**，全量展示与改动前同形', () => {
@@ -516,24 +514,18 @@ describe('观测层注解（observed）', () => {
     expect(row.get('[data-test="preview-port-unrouted"]').text()).toContain('端口');
   });
 
-  it('折叠区（其他地址）里的池外行同样不画状态徽章/打开按钮（曾漏改：用户实证「未知状态+↗」）', async () => {
+  it('非当前目录的端口（含池外合成行）整行不画（用户实证「未知状态+↗」干扰项的根治：不再渲染）', () => {
     wrapper = mountPanel({
       items: [
         portItem('a', 22000, { observed: OBS_OTHER }),
         portItem('observed:5173', 5173, { hostname: null, url: null, state: 'observed', observed: OBS_SHOP }),
       ],
-      currentCwd: '~/projects/nowhere', // 两行都不命中 ⇒ 都落折叠区，同框对比池内/池外画法
+      currentCwd: '~/projects/nowhere', // 两行都不命中 ⇒ 都不画，只剩「无在用」说明
       variant: 'list',
     });
-    await wrapper.get('[data-test="preview-ports-others-toggle"]').trigger('click');
-    const others = wrapper.findAll('[data-test="preview-port-other-row"]');
-    const unroutedRow = others.find((r) => r.get('[data-test="preview-port-value"]').text() === '5173');
-    expect(unroutedRow).toBeTruthy();
-    expect(unroutedRow.find('[data-test="preview-port-state"]').exists()).toBe(false);
-    expect(unroutedRow.find('[data-test="preview-port-open"]').exists()).toBe(false);
-    // 池内行不受波及：徽章与按钮都在
-    const routedRow = others.find((r) => r.get('[data-test="preview-port-value"]').text() === '22000');
-    expect(routedRow.find('[data-test="preview-port-state"]').exists()).toBe(true);
-    expect(routedRow.find('[data-test="preview-port-open"]').exists()).toBe(true);
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(0);
+    expect(wrapper.text()).not.toContain('5173');
+    expect(wrapper.text()).not.toContain('未知状态');
+    expect(wrapper.find('[data-test="preview-port-none-here"]').exists()).toBe(true);
   });
 });
