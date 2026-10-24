@@ -515,4 +515,25 @@ describe('观测层注解（observed）', () => {
     expect(row.find('[data-test="preview-port-hostname"]').exists()).toBe(false);
     expect(row.get('[data-test="preview-port-unrouted"]').text()).toContain('端口');
   });
+
+  it('折叠区（其他地址）里的池外行同样不画状态徽章/打开按钮（曾漏改：用户实证「未知状态+↗」）', async () => {
+    wrapper = mountPanel({
+      items: [
+        portItem('a', 22000, { observed: OBS_OTHER }),
+        portItem('observed:5173', 5173, { hostname: null, url: null, state: 'observed', observed: OBS_SHOP }),
+      ],
+      currentCwd: '~/projects/nowhere', // 两行都不命中 ⇒ 都落折叠区，同框对比池内/池外画法
+      variant: 'list',
+    });
+    await wrapper.get('[data-test="preview-ports-others-toggle"]').trigger('click');
+    const others = wrapper.findAll('[data-test="preview-port-other-row"]');
+    const unroutedRow = others.find((r) => r.get('[data-test="preview-port-value"]').text() === '5173');
+    expect(unroutedRow).toBeTruthy();
+    expect(unroutedRow.find('[data-test="preview-port-state"]').exists()).toBe(false);
+    expect(unroutedRow.find('[data-test="preview-port-open"]').exists()).toBe(false);
+    // 池内行不受波及：徽章与按钮都在
+    const routedRow = others.find((r) => r.get('[data-test="preview-port-value"]').text() === '22000');
+    expect(routedRow.find('[data-test="preview-port-state"]').exists()).toBe(true);
+    expect(routedRow.find('[data-test="preview-port-open"]').exists()).toBe(true);
+  });
 });
