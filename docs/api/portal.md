@@ -1237,6 +1237,7 @@ run 终态产物 bundle 取回（runner §6.6）。鉴权：**admin 或 run 属�
 | `state` | `allocated` \| `active`（首次 forward-auth 放行才升 `active`，规格 §8.6）；**已 `released` 的行不列** |
 | `scope` / `role` / `exposure` | 恒 `fde` / `spare` / `private`（#250 裁决：`private` 是唯一交付档位） |
 | `observed` | 观测层 MVP（迁移 `0022 port_observations`）：容器内该端口**此刻真有进程在听**的旁证——agentd 采样 `/proc`（LISTEN 端口 + pid + cwd + cmdline + git 分支 + 启动时刻）随 U4 heartbeat 捐带，portal 按新鲜度窗口（45s = 心跳 15s ⚠ × 3，同「连丢判死」口径）附进 DTO。**只读观测用于展示，不是管控**（#246「不检查不限制不 reconcile」不变式不动）。⚠ **`null` ≠ 空闲**：旧 agentd 不上报 / 未跑 0022 的部署也是 `null`；前端不得把 `null` 渲染成「没有应用」。同目录 ≥2 个监听（两个分支各占一口）是前端冲突警告的判据。采样失败整块降级（全 `null`），列表照常 |
+| 池外合成行 | 观测到的监听**不在号池里**（如 vite 默认 5173）时，列表额外合成一条**只读行**：`id="observed:<port>"`、`hostname`/`url` = `null`、`state="observed"`、`role="unrouted"`。无地址可开、无票可签（批量签票跳过它），但「这个目录起了服务」对人可见——否则面板会谎报「当前目录没有」。只合成 `cwd` 落在 `~/projects/` 下的（未 sanitize 的 `/home/<u>/projects/` 同样命中）；agentd 自身端口与 cwd 未知的观测不合成 |
 
 **只列活行**（`state <> 'released'`）、**按 `port ASC`**；不游标分页（一块 = 10 行，上限可预期）。
 

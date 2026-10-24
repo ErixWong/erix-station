@@ -383,9 +383,6 @@ export const zhCN = {
     batchBlocked: '浏览器拦截了部分新标签，逐个点开：',
     // issue #286：面向**人**的 Cookie 告知（边缘整体剥 Cookie 头是 by design，不是 bug；
     // 工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知）
-    cookieNotice:
-      '说明：平台边缘会剥掉请求的 Cookie 头，预览通道上请勿使用 Cookie 会话——登录态请走 Authorization 头。'
-      + '（工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知，人类开发者在此告知。）这是平台的既有设计，不是故障。',
     hostnameCopyTitle: '{url}（点击复制完整地址）',
     copiedUrl: '预览地址已复制到剪贴板。',
     copyFailed: '复制失败：',
@@ -403,15 +400,18 @@ export const zhCN = {
     },
     stateShortUnknown: '未知状态',
     // issue #308 §3.4：端口是工位级资源；观测 MVP 后工作台视图按当前目录过滤——文案说真实行为。
-    scopeHint: '预览端口跟着工位走；列表按当前目录的在用进程过滤，其余在折叠区。',
-    // 观测层 MVP（迁移 0022）：真实监听注解；无观测的行不渲染任何反向文案（null ≠ 空闲）。
-    observedHere: '本目录在用',
-    observedTitle: '容器内监听此端口的进程',
-    observedUptime: '起了 {ago}',
-    duplicateWarn: '⚠ {cwd} 同时在 {ports} 上有进程监听——可能是同一项目的新旧实例并存，先分清哪个地址是你要的（旧会话残留的进程不会自己退出）。',
-    noneHere: '当前目录没有正在监听的端口（地址仍然可用，展开下方列表可手动打开）。',
-    othersExpand: '本工位其余端口（{count}）',
-    othersCollapse: '收起其余端口',
+    // 人侧文案面向不懂技术的业务用户：不出现端口/进程/监听这类词，只说动作层能执行的话；
+    // 技术事实（Cookie 剥除、端口角色等）一律留在 agent 侧 ~/AGENTS.md，不进 UI。
+    scopeHint: '这些地址跟着你的工位走；列表只显示当前目录里正在运行的项目。',
+    // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
+    observedHere: '当前目录在用',
+    observedTitle: '正在使用这个地址的程序',
+    observedUptime: '已运行 {ago}',
+    duplicateWarn: '⚠ {cwd} 同时在 {ports} 两个地址上开着——可能是新旧两个版本并存，先确认哪个才是你要看的（旧任务留下的程序不会自己关）。',
+    noneHere: '当前目录暂时没有可打开的预览；工位的其他地址在下方折叠区。',
+    othersExpand: '工位的其他预览地址（{count}）',
+    othersCollapse: '收起其他地址',
+    unroutedNote: '这个程序还不能用预览地址打开——可让助理把它改到分配好的端口上。',
     stateHint: '「已放行过」只表示该端口首次凭证放行过，不代表容器里有应用在监听。',
     emptySelf: '你还没有预览端口（平台尚未为账号分段，或已全部释放）。',
     emptyFde: '该 FDE 没有活着的预览端口（可能尚未开户或已下线）。',

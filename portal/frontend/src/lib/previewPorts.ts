@@ -27,8 +27,9 @@ export interface PreviewObserved {
 export interface PreviewPortItem {
   id: string;
   port: number;
-  hostname: string;
-  url: string;
+  /** 端口池外的观测合成行（state='observed'，id=`observed:<port>`）无地址：null ⇒ 不可开/不可复制。 */
+  hostname: string | null;
+  url: string | null;
   /** allocated | active（released 的行后端不列）。 */
   state: string;
   scope: string;

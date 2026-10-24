@@ -84,6 +84,7 @@ let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** 复制的是完整 `url`（含 scheme 与 dev 端口后缀），显示的是 hostname（§4.7a 两字段各自用途）。 */
 async function copyUrl(item: PreviewPortItem) {
+  if (!item.url) return; // 观测合成行无地址可复制（本不该渲染按钮，防御性兜底）
   try {
     await navigator.clipboard.writeText(item.url);
     copiedId.value = item.id;
@@ -145,7 +146,12 @@ function blockedLinkLabel(url: string): string {
 // ---------------------------------------------------------------------------
 
 function observedHere(item: PreviewPortItem): boolean {
-  return !!props.currentCwd && item.observed?.cwd === props.currentCwd;
+  const dir = props.currentCwd?.replace(/\/+$/, '');
+  const cwd = item.observed?.cwd;
+  if (!dir || !cwd) return false;
+  // 精确或子目录命中：agent 常在项目子目录里起服务（frontend/、apps/web/），
+  // 只比全串会把「这个项目起的」误判成「与本目录无关」。
+  return cwd === dir || cwd.startsWith(`${dir}/`);
 }
 
 /**
@@ -235,14 +241,6 @@ onScopeDispose(() => clearTimeout(copiedTimer));
       >{{ props.batchBusy ? t('previewPorts.batchSigning') : t('previewPorts.openAllAction') }}</button>
     </div>
 
-    <!-- #286：面向**人**的 Cookie 告知（平台边缘整体剥 Cookie 头，这是 by design，不是 bug）。
-         工位内的 agent 已由容器内 ~/AGENTS.md 第 7 条被告知；人类开发者在此告知。
-         放在面板顶部：空态/失败态也看得到（不只是有端口列表时才说）。 -->
-    <p
-      data-test="preview-cookie-notice"
-      class="mb-1.5 rounded-md border border-black/10 bg-black/[0.03] px-2 py-1 text-[11px] leading-[1.5] text-black/60"
-    >{{ t('previewPorts.cookieNotice') }}</p>
-
     <!-- 加载中（首屏骨架；已有列表时刷新不抽掉列表，只在按钮上体现） -->
     <div v-if="props.loading && !props.loaded" data-test="preview-ports-loading" role="status">
       <p class="muted text-sm">{{ t('common.loading') }}</p>
@@ -295,12 +293,14 @@ onScopeDispose(() => clearTimeout(copiedTimer));
             <td class="py-1.5 font-medium" data-test="preview-port-value">{{ item.port }}</td>
             <td class="truncate py-1.5">
               <button
+                v-if="item.url"
                 type="button"
                 data-test="preview-port-hostname"
                 class="w-full truncate rounded px-1 py-0.5 text-left hover:bg-black/5"
                 :title="t('previewPorts.hostnameCopyTitle', { url: item.url })"
                 @click="copyUrl(item)"
               >{{ item.hostname }}</button>
+              <span v-else data-test="preview-port-unrouted" class="text-black/45">—</span>
               <p
                 v-if="item.observed"
                 data-test="preview-port-observed"
@@ -319,6 +319,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
             </td>
             <td class="py-1.5 text-right">
               <button
+                v-if="item.url"
                 type="button"
                 data-test="preview-port-open"
                 class="rounded-md bg-brand px-2 py-0.5 text-xs text-white hover:bg-brand-hover disabled:opacity-50"
@@ -343,6 +344,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
           <div class="flex min-w-0 items-center gap-1.5">
             <span data-test="preview-port-value" class="shrink-0 text-[11px] font-medium leading-[1.4]">{{ item.port }}</span>
             <span
+              v-if="item.url"
               data-test="preview-port-state"
               class="min-w-0 shrink truncate rounded-full border px-1.5 py-[1px] text-[10px] leading-[1.4]"
               :class="item.state === 'active'
@@ -352,6 +354,7 @@ onScopeDispose(() => clearTimeout(copiedTimer));
               :aria-label="stateLabel(item.state)"
             >{{ stateShortLabel(item.state) }}</span>
             <button
+              v-if="item.url"
               type="button"
               data-test="preview-port-open"
               class="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/60 hover:bg-black/10 disabled:opacity-50"
@@ -393,12 +396,18 @@ onScopeDispose(() => clearTimeout(copiedTimer));
             </button>
           </div>
           <button
+            v-if="item.url"
             type="button"
             data-test="preview-port-hostname"
             class="mt-0.5 block w-full min-w-0 truncate rounded px-0.5 py-0.5 text-left text-[11px] leading-[1.4] text-black/70 hover:bg-black/5"
             :title="t('previewPorts.hostnameCopyTitle', { url: item.url })"
             @click="copyUrl(item)"
           >{{ item.hostname }}</button>
+          <p
+            v-else
+            data-test="preview-port-unrouted"
+            class="mt-0.5 text-[10px] leading-[1.4] text-black/50"
+          >{{ t('previewPorts.unroutedNote') }}</p>
           <!-- 观测注解（有则显，无观测不加任何反向文案——null ≠ 空闲）；本目录在用时挂徒章。 -->
           <p
             v-if="item.observed"

@@ -417,15 +417,13 @@ describe('工作台 · 一键开整组（#247）', () => {
     }
   });
 
-  it('#286：Cookie 告知在侧栏端口面板里可见（人类开发者的告知落点）', async () => {
+  it('#286：Cookie 告知已不在人侧界面（告知链收敛到 agent 侧 AGENTS.md）', async () => {
     const { wrapper } = await mountWorkbench(FDE_USER, (url, init) =>
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: THREE_PORTS }) : undefined);
     try {
       await toggle(wrapper).trigger('click');
-      const notice = wrapper.get('[data-test="preview-cookie-notice"]').text();
-      expect(notice).toContain('Cookie');
-      expect(notice).toContain('Authorization');
-      expect(notice).toContain('不是故障');
+      expect(wrapper.find('[data-test="preview-cookie-notice"]').exists()).toBe(false);
+      expect(wrapper.text()).not.toContain('Cookie');
     } finally {
       wrapper.unmount();
     }

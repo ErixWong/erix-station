@@ -422,7 +422,7 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
   } catch {
     // 观测层永远降级不致命：旧部署无表 ⇒ 列表与 #246 时代逐字节同形（只是没有注解）。
   }
-  return r.rows.map((row) => ({
+  const items = r.rows.map((row) => ({
     id: row.id,
     port: Number(row.port),
     hostname: row.hostname,
@@ -433,6 +433,30 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
     exposure: row.exposure,
     observed: observedByPort.get(Number(row.port)) ?? null,
   }));
+
+  // 端口池外的真实监听（agent 起在 5173/8000 这类默认口上的 dev server）：以前只在 LEFT JOIN 里
+  // 被丢弃 ⇒ 用户「当前目录明明起了服务，面板却说没有」。现在合成成**无地址的只读行**
+  // （hostname/url=null，state='observed'）：不能开、没有票，但「有进程在用这个口」这件事可见。
+  // 只要 ~/projects/ 下的（agentd 自己的 4000、root 的内部口不算“用户的项目”，不进列表）。
+  const poolPorts = new Set(items.map((i) => i.port));
+  const looksLikeProject = (cwd) => typeof cwd === 'string'
+    && (cwd.startsWith('~/projects/') || /^\/home\/[^/]+\/projects\//.test(cwd));
+  for (const [port, obs] of observedByPort) {
+    if (poolPorts.has(port) || !looksLikeProject(obs.cwd)) continue;
+    items.push({
+      id: `observed:${port}`,
+      port,
+      hostname: null,
+      url: null,
+      state: 'observed',
+      scope: 'fde',
+      role: 'unrouted',
+      exposure: 'private',
+      observed: obs,
+    });
+  }
+  items.sort((a, b) => a.port - b.port);
+  return items;
 }
 
 /**

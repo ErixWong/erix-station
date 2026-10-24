@@ -394,22 +394,10 @@ describe('PreviewPortsPanel · 一键开整组（#247）与 Cookie 告知（#286
       .toBe('批量签发预览通行票失败（validation_failed）：一次最多签发 10 张预览票');
   });
 
-  it('#286 Cookie 告知：双语成对、说的是「边缘剥 Cookie / 用 Authorization / 不是故障」', async () => {
+  it('#286 Cookie 告知已退出人侧界面（技术事实只留在 agent 侧 ~/AGENTS.md，不进 UI）', () => {
     wrapper = mountPanel();
-    const notice = wrapper.get('[data-test="preview-cookie-notice"]').text();
-    expect(notice).toContain('Cookie');
-    expect(notice).toContain('Authorization');
-    expect(notice).toContain('不是故障');
-    expect(notice).not.toMatch(/bug|缺陷/i);
-
-    setLocale('en');
-    await wrapper.vm.$nextTick();
-    const english = wrapper.get('[data-test="preview-cookie-notice"]').text();
-    expect(english).toContain('Cookie');
-    expect(english).toContain('Authorization');
-    expect(english).toMatch(/by design, not a bug/);
-    expect(english).not.toMatch(/[\u4e00-\u9fff]/);
-    setLocale('zh-CN');
+    expect(wrapper.find('[data-test="preview-cookie-notice"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('Cookie');
   });
 });
 
@@ -434,7 +422,7 @@ describe('观测层注解（observed）', () => {
     expect(lines).toHaveLength(1);
     expect(lines[0].text()).toContain('~/projects/shop');
     expect(lines[0].text()).toContain('@feat-x');
-    expect(lines[0].text()).toMatch(/起了 3h/);
+    expect(lines[0].text()).toMatch(/已运行 3h/);
     expect(lines[0].attributes('title')).toContain('node vite.js');
   });
 
@@ -501,5 +489,30 @@ describe('观测层注解（observed）', () => {
     const rows = wrapper.findAll('[data-test="preview-port-row"]');
     expect(rows.map((r) => r.get('[data-test="preview-port-value"]').text())).toEqual(['22001', '22000', '22002']);
     expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(0);
+  });
+
+  it('子目录命中：observed 在 ~/projects/shop/frontend 也算「当前目录（shop）在用」', () => {
+    wrapper = mountPanel({
+      items: [portItem('a', 22000, { observed: { ...OBS_SHOP, cwd: '~/projects/shop/frontend' } })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+    });
+    expect(wrapper.findAll('[data-test="preview-port-row"]')).toHaveLength(1);
+    expect(wrapper.findAll('[data-test="preview-port-observed-here"]')).toHaveLength(1);
+  });
+
+  it('端口池外的观测合成行（url=null）：可识别在用，但无打开/复制按钮，只有说明句', () => {
+    wrapper = mountPanel({
+      items: [portItem('observed:5173', 5173, {
+        hostname: null, url: null, state: 'observed', observed: { ...OBS_SHOP, cwd: '~/projects/shop' },
+      })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+    });
+    const row = wrapper.get('[data-test="preview-port-row"]');
+    expect(row.find('[data-test="preview-port-observed-here"]').exists()).toBe(true);
+    expect(row.find('[data-test="preview-port-open"]').exists()).toBe(false);
+    expect(row.find('[data-test="preview-port-hostname"]').exists()).toBe(false);
+    expect(row.get('[data-test="preview-port-unrouted"]').text()).toContain('端口');
   });
 });
