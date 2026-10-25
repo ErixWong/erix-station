@@ -136,6 +136,40 @@ function toggleFolded(id: string): void {
   else expandedFolded.add(id);
 }
 
+// issue #388：「收起原文」——**纯展示态**（按 entry id 记，与 expandedFolded 同一风格），绝不碰
+// workbench 的 foldedOriginals 缓存：收起后再展开必须仍命中缓存（fetch 总次数恒为 1），
+// 「收起 = 删缓存」是假修法（下次展开要重拉 836 KB，等于没修）。
+const collapsedOriginals = reactive(new Set<string>());
+
+function isOriginalCollapsed(id: string): boolean {
+  return collapsedOriginals.has(id);
+}
+
+function collapseOriginal(id: string): void {
+  collapsedOriginals.add(id);
+}
+
+/**
+ * issue #390（#390-A 前端半）：`folded.hasSummary === false` = 上游摘要其实是字面量 "missing"，
+ * 展开出来的只是跟标题换句话重复的兜底句 ⇒ 不画 ▾ 控件、不画摘要区（「查看原文」照旧——
+ * 原文与摘要是两回事）。**键缺失**（旧 DTO / 其他路径）≠「没有摘要」⇒ 保持现状画 ▾。
+ */
+function foldedHasSummary(en: FoldedEntry): boolean {
+  return en.folded.hasSummary !== false;
+}
+
+/**
+ * 原文块可见性（issue #388 收起联动）：
+ * - 有摘要（默认）⇒ 归横幅展开态管辖：点标题「收起」时摘要与原文**一起**收起（836 KB 的
+ *   原文不许孤儿地挂在页面上），且本地「收起原文」生效时不出；
+ * - hasSummary=false ⇒ 没有 ▾ 可操作 ⇒ 加载出来就直接显示（否则点「查看原文」永远看不见结果）。
+ */
+function foldedOriginalVisible(en: FoldedEntry): boolean {
+  if (foldedOriginalState(en) == null) return false;
+  if (!foldedHasSummary(en)) return true;
+  return isFoldedExpanded(en.id) && !isOriginalCollapsed(en.id);
+}
+
 // 横幅标题分级降级：范围 → 条数 → 裸文案（字段缺失时逐级退回，不拼半截文案）。
 // #375：有范围就**只报范围**。原先一并报出去的 `foldedPayloadMessages` 在 erix-agent 0.25.0 之后
 // 是「本条记录携带的归档条数」（会话级去重 + 256 KiB 夹断之后），拿它当「压掉了多少条」会说假话；
@@ -161,6 +195,10 @@ function foldedQueryRound(folded: FoldedInfo): number | null {
 function loadOriginal(en: FoldedEntry): void {
   const round = foldedQueryRound(en.folded);
   if (en.sessionId == null || round == null) return;
+  // issue #388：点「查看原文」=「我要看原文」⇒ 顺手展开横幅（否则原文归展开态管辖，
+  // 收起状态下点了等于没反应）、并解除本地「收起原文」；命中缓存与否由 loadFoldedOriginal 自己判。
+  collapsedOriginals.delete(en.id);
+  expandedFolded.add(en.id);
   void store.loadFoldedOriginal(en.sessionId, round);
 }
 
@@ -271,7 +309,9 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       v-else-if="en.kind === 'folded'"
       class="folded-banner my-1.5 max-w-[46rem] rounded-md border border-dashed border-black/20 border-l-4 border-l-amber-500 bg-amber-50/60 px-3 py-1.5 text-sm"
     >
+      <!-- issue #390：hasSummary=false ⇒ 无▾、无摘要区（标题降为普通行）；键缺席照旧画▾可展开。 -->
       <button
+        v-if="foldedHasSummary(en)"
         type="button"
         class="folded-toggle flex w-full min-w-0 items-center gap-2 text-left"
         :aria-expanded="isFoldedExpanded(en.id)"
@@ -283,8 +323,16 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
           :class="{ 'rotate-180': isFoldedExpanded(en.id) }"
         >▾</span>
       </button>
-      <!-- 摘要：默认收起，展开后纯文本全文 -->
-      <pre v-if="isFoldedExpanded(en.id)" class="folded-summary mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ en.folded.text }}</pre>
+      <div v-else class="folded-title flex w-full min-w-0 items-center gap-2">
+        <span class="shrink-0 font-semibold text-black/60">🗜 {{ foldedTitle(en.folded) }}</span>
+      </div>
+      <!-- 摘要：默认收起；展开后走 markdown（#389：与助手气泡同一渲染路径/样式——先转义后格式化，
+           XSS 安全；markdown 自己重排，所以不叠加 whitespace-pre-wrap，否则双倍行距）。 -->
+      <div
+        v-if="foldedHasSummary(en) && isFoldedExpanded(en.id)"
+        class="folded-summary md mt-1 overflow-auto text-black/70"
+        v-html="renderMarkdown(en.folded.text)"
+      ></div>
       <!-- 查看原文（轮号可推导才展示；只读懒加载，按 (会话,轮) 缓存） -->
       <div v-if="en.sessionId != null && foldedQueryRound(en.folded) != null" class="mt-1 flex items-center gap-2">
         <button
@@ -293,7 +341,16 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
           @click="loadOriginal(en)"
         >{{ t('stream.folded.viewOriginal') }}</button>
       </div>
-      <div v-if="foldedOriginalState(en)" class="folded-original mt-1">
+      <!-- 原文块（#388）：可见性归 foldedOriginalVisible 管——标题收起时跟着收起，本地「收起原文」时隐藏（不清缓存）。 -->
+      <div v-if="foldedOriginalVisible(en)" class="folded-original mt-1">
+        <!-- #388：原文块自己的收起入口——只隐藏，**不清缓存**（再展开命中缓存，不重发）。 -->
+        <div class="flex justify-end">
+          <button
+            type="button"
+            class="folded-original-collapse rounded-md border border-black/20 px-2 py-0.5 text-xs text-black/50 hover:bg-black/5"
+            @click="collapseOriginal(en.id)"
+          >{{ t('stream.folded.collapseOriginal') }}</button>
+        </div>
         <div v-if="foldedOriginalState(en)!.status === 'loading'" class="text-xs text-black/40">{{ t('common.loading') }}</div>
         <div v-else-if="foldedOriginalState(en)!.status === 'missing'" class="folded-original-missing text-xs text-black/40">{{ t('stream.folded.originalMissing') }}</div>
         <template v-else-if="foldedOriginalState(en)!.status === 'loaded'">
@@ -315,8 +372,10 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
             class="folded-original-turn"
           >
             <div v-if="turn.role === 'user'" class="folded-original-role text-xs text-black/35">{{ t('stream.folded.originalRoleUser') }}</div>
+            <!-- #389：正文走 markdown（与助手气泡同一路径/样式）；reasoning 与工具行**刻意保持纯文本**
+                 （模型独白/命令行里 `*` `_` 反引号遍地，格式化会出错），绝不 v-html。 -->
             <div v-if="turn.reasoning" class="folded-original-reasoning overflow-auto whitespace-pre-wrap break-all text-black/40 italic">{{ turn.reasoning }}</div>
-            <div v-if="turn.text" class="folded-original-text overflow-auto whitespace-pre-wrap break-all text-black/70">{{ turn.text }}</div>
+            <div v-if="turn.text" class="folded-original-text md overflow-auto text-black/70" v-html="renderMarkdown(turn.text)"></div>
             <div
               v-for="(tc, ci) in (turn.toolCalls ?? [])"
               :key="ci"

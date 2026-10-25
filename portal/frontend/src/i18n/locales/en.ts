@@ -161,6 +161,8 @@ export const en = {
       countOnly: 'Compressed {count} messages',
       bare: 'Compressed',
       viewOriginal: 'View original',
+      // #388: the original block's own collapse entry (hides only, never clears the cache; re-expanding does not refetch)
+      collapseOriginal: 'Collapse original',
       originalEmpty: '(no text content)',
       // #384: a ledger turn carries four kinds of content (`text` / `reasoning` / `toolCalls[]` / being the
       // user). The old renderer drew only `text`, so the turns that actually *did something* (reasoning plus

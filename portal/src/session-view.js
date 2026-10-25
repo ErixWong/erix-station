@@ -169,7 +169,27 @@ function foldedTurnText(turns) {
  * 是「查看原文」端点 `GET /api/sessions/:id/folded/:round` 的正确查询键——它与被折叠的轮范围
  * `foldedRoundRange`（如 1–5）语义不同，前端拿 range 去查会查错行 404。附加字段，不进「四项全缺 → null」判据。
  */
-function foldedTurnFields(turns) {
+/**
+ * issue #390-A：这次折叠**到底有没有真摘要**。
+ *
+ * 判据来自上游契约本身（erix-agent `src/store/file.js:25` / `src/store/memory.js:19` 逐字同款）：
+ *
+ *     summary?:{action:string,note:string}|"missing",
+ *
+ * ⇒ 摘要**可缺省**，缺省时上游写的是字符串字面量 `"missing"`（现网全站 17 条折叠行都是这个值）。
+ * 只有 `{action,note}` 形态、且至少一项是非空字符串，才算「有摘要」。刻意**不**用「`text` 是不是
+ * 那句兜底话」来判：那是上游投影生成物，字符串比对会把真摘要也误判掉（#390 里写明了这条红线）。
+ *
+ * 判据宽松度说明：`{action:'x', note:''}` 算有（上游只承诺形状、没承诺两项都填），
+ * `{}`、`{note:''}`、`"missing"`、`null`、数组都算没有。
+ */
+function hasRealSummary(record) {
+  const summary = record?.summary;
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return false;
+  return [summary.action, summary.note].some((value) => typeof value === 'string' && value !== '');
+}
+
+function foldedTurnFields(turns, roundsWithRealSummary = new Set()) {
   for (const turn of [...turns].reverse()) {
     if (turn?.folded !== true) continue;
     const pick = (key) => (turn[key] !== undefined && turn[key] !== null
@@ -189,6 +209,9 @@ function foldedTurnFields(turns) {
       ...(navigation === undefined ? {} : { navigationRecord: navigation }),
       ...(payloadMessages === undefined ? {} : { foldedPayloadMessages: payloadMessages }),
       ...(round === undefined ? {} : { round }),
+      // #390-A：轮号可定时才给得出「这次折叠有没有真摘要」。**轮号缺失就整个不带这个键**（不是 false）——
+      // 前端口径是「键缺席 = 不知道 = 保持现状」，把它写成 false 会让旧数据凭空丢掉展开控件。
+      ...(round === undefined ? {} : { hasSummary: roundsWithRealSummary.has(round) }),
     };
   }
   return null;
@@ -333,10 +356,19 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
   }
   let currentRunId = null;
 
+  // #390-A：折叠行的真摘要按**折叠行自己的 round** 记账（`recordForProjection` 恒把 round 列合成进
+  // record，所以 turn.round 与 row.round 必然同值，两边对得上）。只扫一遍入参行，无额外查询。
+  const roundsWithRealSummary = new Set((Array.isArray(transcriptRows) ? transcriptRows : [])
+    .filter((row) => {
+      const { record } = recordForProjection(row);
+      return record?.folded === true && hasRealSummary(record);
+    })
+    .map((row) => Number(row.round)));
+
   const setRunText = (runId, assistantText, foldText, turns) => {
     if (assistantText !== null) assistantContent.set(runId, assistantText);
     if (foldText !== null) foldContent.set(runId, foldText);
-    const foldedFields = foldedTurnFields(turns);
+    const foldedFields = foldedTurnFields(turns, roundsWithRealSummary);
     if (foldedFields !== null) runFolded.set(runId, foldedFields);
     const fields = assistantTurnFields(turns);
     if (fields === null) return;

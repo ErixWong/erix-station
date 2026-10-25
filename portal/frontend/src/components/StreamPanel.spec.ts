@@ -772,3 +772,213 @@ describe('加载更早消息入口（台账 #10）', () => {
     expect(wrapper.find('[data-test="load-older"]').exists()).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #388/#389/#390：折叠横幅——收起联动、「收起原文」不清缓存、摘要/原文正文走 markdown
+// （reasoning 与工具行除外）、XSS 哨兵、hasSummary=false 不画展开控件。
+// ---------------------------------------------------------------------------
+function foldedFetchCalls(): unknown[][] {
+  return vi.mocked(fetch).mock.calls.filter(([u]) => String(u).includes('/folded/'));
+}
+
+describe('issue #388：收起联动 + 「收起原文」不清缓存', () => {
+  it('点标题「收起」⇒ 摘要与原文**一起**消失（原文不许孤儿地挂在页面上）', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'assistant', text: '原文甲' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+
+    await wrapper.get('.folded-toggle').trigger('click'); // 展开摘要
+    await wrapper.get('.view-original').trigger('click'); // 拉原文
+    await flushPromises();
+    expect(wrapper.find('.folded-summary').exists()).toBe(true);
+    expect(wrapper.findAll('.folded-original-turn')).toHaveLength(1);
+
+    await wrapper.get('.folded-toggle').trigger('click'); // 点标题收起
+    expect(wrapper.find('.folded-summary').exists()).toBe(false);
+    expect(wrapper.find('.folded-original').exists()).toBe(false); // 旧缺陷：这里原文仍在
+
+    await wrapper.get('.folded-toggle').trigger('click'); // 再展开：两者都回来（缓存命中，不重发）
+    expect(wrapper.find('.folded-summary').exists()).toBe(true);
+    expect(wrapper.findAll('.folded-original-turn')).toHaveLength(1);
+    expect(foldedFetchCalls()).toHaveLength(1);
+  });
+
+  it('「收起原文」只隐藏原文（摘要不动）；再展开原文回来且 **fetch 总次数仍为 1**（收起≠删缓存）', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'assistant', text: '原文甲' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.findAll('.folded-original-turn')).toHaveLength(1);
+
+    await wrapper.get('.folded-original-collapse').trigger('click');
+    expect(wrapper.find('.folded-original').exists()).toBe(false); // 原文隐藏
+    expect(wrapper.find('.folded-summary').exists()).toBe(true); // 摘要不受波及
+    // 假修法拦截：若收起被实现成清缓存，这里要么重发（次数变 2）要么 turns 拿不回来。
+    expect(store.getFoldedOriginal('s1', 8)!.status).toBe('loaded');
+
+    await wrapper.get('.view-original').trigger('click'); // 再展开
+    await flushPromises();
+    expect(wrapper.findAll('.folded-original-turn')).toHaveLength(1);
+    expect(wrapper.get('.folded-original-turn').text()).toContain('原文甲');
+    expect(foldedFetchCalls()).toHaveLength(1); // 防「收起=删缓存」的硬断言
+  });
+
+  it('i18n：「收起原文」按钮文案 zh/en 成对', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'assistant', text: '原文甲' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.folded-original-collapse').text()).toBe('收起原文');
+    setLocale('en');
+    await flushPromises();
+    expect(wrapper.get('.folded-original-collapse').text()).toBe('Collapse original');
+    setLocale('zh-CN');
+  });
+});
+
+describe('issue #389：折叠区 markdown（摘要/原文 text 走渲染器；reasoning/工具行保持纯文本）', () => {
+  it('摘要走 markdown：## 标题 / 围栏代码 / **粗** ⇒ <h2> / <pre><code> / <strong>', async () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({
+      folded: { text: '## 折叠标题\n\n**粗体**\n\n```\ncode line\n```' },
+    }));
+    const wrapper = mountPanel();
+    await wrapper.get('.folded-toggle').trigger('click');
+    const html = wrapper.get('.folded-summary').html();
+    expect(html).toContain('<h2>折叠标题</h2>');
+    expect(html).toContain('<strong>粗体</strong>');
+    expect(html).toContain('<pre><code>code line</code></pre>');
+    // markdown 自己重排：不得再叠加 whitespace-pre-wrap（双倍行距）。
+    expect(wrapper.get('.folded-summary').classes()).not.toContain('whitespace-pre-wrap');
+  });
+
+  it('原文 turn 的 text 走 markdown（**粗** ⇒ <strong>）', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'assistant', text: '## 轮标题\n**粗**' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    const html = wrapper.get('.folded-original-text').html();
+    expect(html).toContain('<h2>轮标题</h2>');
+    expect(html).toContain('<strong>粗</strong>');
+  });
+
+  it('反向判据（钉死）：reasoning 与工具行里的 **x** **不得**被格式化', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? {
+        status: 200,
+        body: {
+          round: 8,
+          turns: [{
+            role: 'assistant',
+            text: '',
+            reasoning: '先跑 **x** 再 `ls -la`',
+            toolCalls: [{ name: 'shell', argsSummary: 'glob=**/*.ts' }],
+          }],
+        },
+      }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    const reasoning = wrapper.get('.folded-original-reasoning');
+    expect(reasoning.html()).not.toContain('<strong>');
+    expect(reasoning.text()).toContain('**x**'); // 星号原样在屏
+    const tool = wrapper.get('.folded-original-tool');
+    expect(tool.html()).not.toContain('<strong>');
+    expect(tool.text()).toContain('**/*.ts');
+  });
+
+  it('XSS 哨兵：摘要/原文里的 <img onerror> 与 javascript: 链接只能变成转义文本', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? {
+        status: 200,
+        body: {
+          round: 8,
+          turns: [{ role: 'assistant', text: '<img src=x onerror=alert(1)> [t](javascript:alert(1))' }],
+        },
+      }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({
+      folded: { text: '<img src=x onerror=alert(1)> [t](javascript:alert(1))' },
+    }));
+    const wrapper = mountPanel();
+    await wrapper.get('.folded-toggle').trigger('click');
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+
+    for (const sel of ['.folded-summary', '.folded-original-text'] as const) {
+      const html = wrapper.get(sel).html();
+      expect(html, sel).not.toContain('<img'); // 只可能以转义文本存在
+      expect(html, sel).not.toMatch(/href="[^"]*javascript:/i); // 不得产出 javascript: 的 href
+    }
+    // 内容本身仍在（转义文本，不是被吞）
+    expect(wrapper.get('.folded-summary').text()).toContain('<img src=x onerror=alert(1)>');
+    expect(wrapper.get('.folded-original-text').text()).toContain('<img src=x onerror=alert(1)>');
+    expect(wrapper.findAll('img')).toHaveLength(0);
+  });
+});
+
+describe('issue #390：folded.hasSummary 控制展开控件', () => {
+  it('hasSummary=false ⇒ 无 ▾ 展开控件、无摘要区；「查看原文」照旧可用', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'assistant', text: '原文甲' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: false } }));
+    const wrapper = mountPanel();
+    expect(wrapper.find('.folded-toggle').exists()).toBe(false); // 无 ▾
+    expect(wrapper.find('.folded-summary').exists()).toBe(false); // 无摘要区
+    expect(wrapper.get('.folded-banner').text()).toContain('已压缩第 2–5 轮'); // 标题仍在
+    // 原文与摘要是两回事：按钮照旧在，点了照旧看得到（没有 ▾ 时不受展开态管辖）。
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.findAll('.folded-original-turn')).toHaveLength(1);
+    expect(wrapper.get('.folded-original-turn').text()).toContain('原文甲');
+  });
+
+  it('hasSummary 键缺席（旧 DTO）⇒ 保持现状：▾与摘要区照旧画，收起联动也照旧', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'assistant', text: '原文甲' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: undefined } })); // 键不存在
+    const wrapper = mountPanel();
+    expect(wrapper.find('.folded-toggle').exists()).toBe(true);
+    expect(wrapper.get('.folded-toggle').attributes('aria-expanded')).toBe('false');
+    await wrapper.get('.folded-toggle').trigger('click');
+    expect(wrapper.find('.folded-summary').exists()).toBe(true);
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.folded-original').exists()).toBe(true);
+    // 「键缺失」不得被当成「没有摘要」（变异：!hasSummary 会在这一格翻红）。
+    await wrapper.get('.folded-toggle').trigger('click');
+    expect(wrapper.find('.folded-summary').exists()).toBe(false);
+  });
+
+  it('hasSummary=true ⇒ 与键缺席同形（▾与摘要区都画）', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: true } }));
+    const wrapper = mountPanel();
+    expect(wrapper.find('.folded-toggle').exists()).toBe(true);
+    expect(wrapper.find('.view-original').exists()).toBe(true);
+  });
+});
