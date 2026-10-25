@@ -244,8 +244,6 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [x] **未采纳**：**#181**（provider `defaultHeaders`/`extraBody`）——理由：station 不包装 fetch，`runner/` 内无自包 fetch / 自定义 header 代码，接了是空操作；0.18.0 的 `searchText` / `edit` 新文件工具、`createFileTools` 与 skills loader 导出——属 issue **#228** 迁移范围，另派单（本次 `runner/lib/file-tools.js` 一字未动；文件工具部分**已交付**，见 §8.9，skills loader 仍未动）。`judge` 的 `writeToolNames` 默认值 0.18.0 变为 `["writeFile","edit"]`，本站 `runner/worker.js` 只传 `reflection: {enabled: true, roundJudge: true}`、未显式传该字段，**不需动**。
 - [x] **测试口径（M6 全量复跑）**：根 `npm test` **807 项：806 通过 / 0 失败 / 1 跳过**（基点 `06b91c8` 基线 800 项：799 通过 / 1 跳过；净增 7 = 上游契约套件 +2、#180 用例 +4、#182 用例 +1）；`cd runner && node --test` **155 通过 / 0 失败**（基线 150；净增 5 = 上游契约 +1、本次 +4）；`node --test portal/test/termination-contract.test.js` **6/6**；唯一跳过项为基线既有。前端（`portal/frontend/node_modules` 本不存在，按工单以 `NODE_ENV=development npm ci` 装上后跑；**未向仓库引入任何前端 lockfile 变动**，装完 `git status` 仍干净）：`npm run typecheck`（`vue-tsc --noEmit`）**干净无报错**、`npm test`（vitest）**23 文件 / 321 测试全通过**（含 `terminationReasons.spec.ts` 里随 pin 同步为 `0.18.0` 的版本断言）。docker / compose / e2e 未跑（真机 e2e 归主 agent）。
 
-
-
 ### 8.9 文件工具迁上游（issue #228，2026-10-10）
 
 依据：station issue **#228** / 上游 erix-agent **#184**（`createFileTools` 规范实现 + `fileToolsContract` 契约套件）。
@@ -309,8 +307,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - [ ] **未做（已记录）**：FDE 级 grant（一次签票给整组 host 发 cookie，免「要点两次预览」）在 #241 正文另议；
   前端 host 自己的 dev server 不答 `OPTIONS`（返 200 + HTML 且无 ACAO）属**应用侧**，不在平台范围。
 
-
-
 ### 8.12 开户预分配 10 条 FDE 级预览域名（issue #240，2026-10-11）
 
 > ⚠ **更正（issue #246 交付①，2026-10-11；原记录不删，只标失效项）**：本节的**分配粒度 = FDE 级**、
@@ -353,8 +349,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   eric 重跑 `provision-fde` 得到 `8/10 新写（2 条已存在）` → 第二次 `0/10`，`ports.json` 自动 `generation=3` / 10 条（8 `fde` + 2 遗留）。全量 **877/876/0/1**、runner **200/200**。
 - [ ] **已知缺口（未在本单补）**：**签票入口缺失**（`GET /api/ports` 已随 P5 退役、SPA 内无任何端口列表/预览按钮 ⇒ 人只能靠 curl 调 API 拿票）；票据仍是 **host 级**（10 个端口要点 10 次）；
   `PORT_QUOTA` 已成死配置（文档已标注，摘除留后续 PR）；容器绑错端口（无人在听）时的可见性未量化。
-
-
 
 ### 8.13 预览端口全局号池 `22000–29999` 与块分配（issue #246 交付①，PR #248，2026-10-11）
 
@@ -581,8 +575,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   - **已接受的呈现（不是 bug）**：被中断的那次工具卡片本身是**红色 ✗**——引擎给的合成 `tool_result` 是 `is_error:true`，卡片按失败渲染，解释由下面那行中性文案承担（刻意不把卡片也刷成中性，否则真失败与中断会混色）。
 
 
-
-
 ### 8.23 reaper 收敛的重排也可见（issue #292，2026-10-14）
 
 **缺口性质**：#288 缺陷 B 把「attempt 被杀并重排」做成了用户可见，但只覆盖 **agentd 主动上报**（U12 release 带 `killed_by`）那一条路径。而**租约过期才是最常见的真崩溃形状**（agentd 自己被杀 / 容器被 `docker kill` / OOM / 网络断 ⇒ 根本没有上报）。`reapExpiredRuns` 的三条分支此前都不写 `attempt_killed` ⇒ 界面上仍是「同一个工具卡片亮几次，最后没有原因」。
@@ -792,8 +784,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **dev 残渣**：会话 `457fe11a…` 多了两条我发的探针消息（一篇 3000 字已完成长文 + 一篇停在 7418 字的长文），**故意不清**：它们同时是「有锚点不重复」与「截断」两块面的现成回放标本。
 
 **#300 已关闭。**
-
-
 
 ### 8.31 模型元数据打通：压缩开关不再是隐含的（issue #309，切片 0/1/1.5/2+2b，2026-10-19，随 **v0.1.16** 发布）
 
@@ -2227,3 +2217,34 @@ A/B/C/E 四片都在修「折叠丢了东西」，而轴三（**人得知道丢�
 前端 **925/925**、`vue-tsc` 干净。
 
 **部署口径**：前端在 portal 镜像里 ⇒ 生效只需 portal 换镜像 + 重启，**不需要**重建 `fde-*`（runner 侧零改动）。
+
+
+### 8.69 issue #404：`containers.image` 必须跟上现实，不是停在开户那一刻（2026-10-26，分支 `fix-261026-01-container-image-ledger`）
+
+现网实测的账实不一致：`fde-eric`/`fde-jim` 跑的是 v0.1.38 的 digest，库里 `image` 还写着 v0.1.37 的；
+`agent_version` 停在 `0.1.32-088e41e`。后果不是难看，是**问不出答案**——「这个 FDE 在跑哪个 runner」
+只能人肉 `docker inspect`，我这两天的部署核对全这么过来的。
+
+病根是写面的形状，不是某处漏了一行：`image` 只出现在 `onboardFde` 里**「DB 没有行」那条 INSERT** 上。
+其余三条路径——① 复用（容器在、env token 匹配）② 重建（有行、token 轮换那条 UPDATE）③ reconcile 的
+adopt 分支（`res.created === false`）——**一条都不写** ⇒ 一次开户定终身。所以修法是给三条路径都补写，
+而不是改 INSERT。
+
+**写"实际"而不是写"期望"**（这条是本片的判断核心）：adopt 场景里容器可能正是上个版本遗留的，把
+`config.fdeImage` 写进去只是把一种谎换成另一种。于是 `ensureFdeContainer` 现在把容器**实际**镜像带回
+调用方（adopt 取 `Config.Image`，新建取 create body 的 `Image`），调用方只有一条写法：`res.image` 写账。
+唯一写期望值的地方是「token 轮换 UPDATE 之后紧接着就是 create(config.fdeImage)」——那里期望值就是真话，
+且 `status='creating'` 已把"还没起来"标出来了。
+
+顺手修同一条路径上的 409：`ensureFdeContainer` 原先只认 204/304，而 **409 是 Docker 在说「它已经在跑了」**
+——正是本函数要的终态。并发（reconcile 与 provision-fde 同时动同一个名字）时赢的那一方拿 409 抛错，
+reconcile 因此抱怨 `start container … failed: HTTP 409`，把真故障淹在噪音里。现在 409 当幂等成功，且
+`started` 保持 `false`：它本来就在跑，不是我们启动的，不许谎报。
+
+判据 3 条：409 幂等（含"必须先查后起"与"不许谎报 started"）/ 新建路径回报实际镜像 / 三条写路径都在源码
+契约上钉住（`onboardFde` 全链 fake 成本高，沿用本文件既有做法；`ensureFdeContainer` 真跑）。
+provisioner 34/34、portal+root 全量绿。
+
+**留给后续的边界**（本片故意不做，不是遗漏）：`agent_version` 仍由心跳自报，不由 station 写 `config.fdeAgentVersion`
+——它是「容器里跑的 runner 自报的版本」，station 写死等于自报变推断。要真正闭环，得让 `provision-fde` /
+reconcile 在建容器后等一次心跳（见 issue #404 评论）。
