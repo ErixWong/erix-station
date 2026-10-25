@@ -373,7 +373,7 @@ function assertAuditPool(pool) {
   }
 }
 
-export async function setGitCredential({ pool, actorId = null, config, fdeName, host, username, token, protocol } = {}) {
+export async function setGitCredential({ pool, actorId = null, config, fdeName, host, username, token, protocol, auditAction = 'admin.git_credential_set', auditExtra } = {}) {
   const normalizedHost = validateHost(host);
   validateFde(fdeName);
   validateUsername(username);
@@ -408,9 +408,10 @@ export async function setGitCredential({ pool, actorId = null, config, fdeName, 
   // 而这两个状态各自都会被抓取/自愈逻辑当真。文件写在事务**之前**（不可回滚，沿用既有设计：
   // 投放成功是既成事实，DB 记账失败时最坏退化成 #395 修之前的样子——文件有、库无副本）。
   await withTransaction(pool, async (client) => {
-    await writeAudit(client, actorId, 'admin.git_credential_set', fdeName, {
+    await writeAudit(client, actorId, auditAction, fdeName, {
       fde_name: fdeName,
       host: normalizedHost,
+      ...auditExtra,
     });
     await persistTokenPlaintext(client, fdeName, normalizedHost, token);
     await updateAssignedAccountWith(client, fdeName, normalizedHost, username, true);
@@ -469,4 +470,77 @@ export async function listGitCredentials({ config, fdeName } = {}) {
     });
   }
   return { hosts };
+}
+
+/**
+ * issue #395：凭据自愈——库里持有明文、但文件里那一行没了，就重投一次。
+ *
+ * 治的是 #395 的后半段：`provisioner.js` 判「有没有凭据」用的一直是 `token_ref` 非空，而 `token_ref`
+ * 只是远端 token 的 **ID**，与文件的真实状态毫无关系。现网实例（`eric`，2026-10-25）：agent 整文件重写
+ * `~/.git-credentials` 把 gitea 那行冲掉，库里 `token_ref` 依然好端端挂着 ⇒ 平台以为一切正常，agent
+ * 却永远报「没有凭据」，而重跑 provision 也不会补投（判据认为已经有了）——自愈路径是断的。
+ *
+ * 判定与动作（**只补，不覆盖**）：
+ *   文件里有该 host 的行，且 username 与 `remote_login` 一致 → `present`，什么都不做；
+ *   文件里有该 host 的行、但 username 不是 `remote_login`   → `different_identity`，**不动**：
+ *     那是 FDE 自己在容器里换成的另一枚凭据（同 host 换账号），平台拿副本去盖就是擅自改人家的登录身份；
+ *   文件里没有该 host 的行 + 库里有明文 → 重投（审计单独一条 `admin.git_credential_redeployed`，
+ *     与人工投放区分开，运维才看得见"这是自愈补的，不是谁提交的"）；
+ *   文件里没有该 host 的行 + 库里无明文 → `no_platform_copy`：**只能重铸或人工再提交一次**，
+ *     这是 per_fde_pat 与 #395 之前存量行的固有形状（平台从未持有明文），报出来而不是装作修好了。
+ *
+ * @returns {Promise<{deployed: boolean, reason: string, host?: string}>}
+ */
+export async function ensureCredentialDeployed({ pool, actorId = null, config, fdeName, log = () => {} } = {}) {
+  validateFde(fdeName);
+  assertAuditPool(pool);
+  const { target } = getCredentialPath(config, fdeName);
+  const { rows } = await pool.query(
+    `SELECT a.remote_login, a.token, a.token_ref, h.base_url, h.provider, h.enabled
+       FROM fde_git_accounts a
+       JOIN git_hosts h ON h.id = a.git_host_id
+       JOIN users u ON u.id = a.fde_id
+      WHERE u.fde_name = $1`,
+    [fdeName],
+  );
+  const account = rows[0];
+  if (!account) return { deployed: false, reason: 'no_account' };
+
+  let host;
+  try {
+    host = new URL(account.base_url).host.toLowerCase();
+  } catch {
+    return { deployed: false, reason: 'host_unparsable' };
+  }
+  if (account.enabled === false) return { deployed: false, reason: 'host_disabled', host };
+
+  const sameHost = fileLines(readCredentialFile(target))
+    .map((line) => ({ line, cred: parseCredentialLine(line) }))
+    .filter((entry) => entry.cred?.host === host);
+  if (sameHost.length > 0) {
+    const mine = sameHost.some((entry) => entry.cred.username === account.remote_login);
+    if (mine) return { deployed: false, reason: 'present', host };
+    log(`[git-credential] ${fdeName}@${host}: 文件里是另一个登录名（平台侧是 ${account.remote_login ?? '<无>'}），不覆盖 FDE 自己的凭据`);
+    return { deployed: false, reason: 'different_identity', host };
+  }
+
+  if (!account.remote_login) return { deployed: false, reason: 'no_remote_login', host };
+  if (!account.token) {
+    log(`[git-credential] ${fdeName}@${host}: 文件里没有该 host 的凭据，而平台也没有明文副本（per_fde_pat 或 #395 之前的存量行）⇒ 需重铸或人工重新提交`);
+    return { deployed: false, reason: 'no_platform_copy', host };
+  }
+
+  await setGitCredential({
+    pool,
+    actorId,
+    config,
+    fdeName,
+    host,
+    username: account.remote_login,
+    token: account.token,
+    auditAction: 'admin.git_credential_redeployed',
+    auditExtra: { redeployed: true },
+  });
+  log(`[git-credential] ${fdeName}@${host}: 文件里缺该行，已按平台副本重投`);
+  return { deployed: true, reason: 'redeployed', host };
 }

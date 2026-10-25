@@ -21,7 +21,7 @@ import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
-import { removeGitCredentialFile, setGitCredential } from './git-credential.js';
+import { ensureCredentialDeployed, removeGitCredentialFile, setGitCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
 
 // ---------------------------------------------------------------------------
@@ -766,6 +766,18 @@ export async function onboardFde(pool, config, {
           await pool.query(`UPDATE users SET status = 'awaiting_credential' WHERE id = $1 AND status = 'active'`, [userId]);
           accountStatus = 'awaiting_credential';
         }
+      }
+      // issue #395：凭据自愈。上面两条分支（minted / per_fde_pat）判「有没有凭据」用的都是
+      // `token_ref` / `remote_login` 非空，而 `token_ref` 只是远端 token 的 **ID**，与用户空间里那行
+      // 文件的真实状态毫无关系（现网实例：agent 整文件重写 `~/.git-credentials` 把 gitea 那行冲掉，
+      // 库里一切正常、agent 却永远报「没凭据」，重跑 provision 也不补投）。这里以「文件里那行在不在」
+      // 做一次收敛：有明文副本就重投，没副本就把「只能重铸」明说，而不是一句“已就绪”糊过去。
+      // 放在两条分支**之后**：刚铸完的路径里 `setGitCredential` 已落盘，这里只会得到 `present` 空转。
+      const healed = await ensureCredentialDeployed({ pool, config, fdeName, log });
+      if (healed.deployed) {
+        log.warn?.(`[provisioner] ${fdeName}: ~/.git-credentials 里缺 ${healed.host} 那行，已按平台副本重投（issue #395）`);
+      } else if (healed.reason === 'no_platform_copy') {
+        log.warn?.(`[provisioner] ${fdeName}@${healed.host}: 文件里没有凭据且平台无明文副本，需重铸或人工重新提交（issue #395）`);
       }
       await pool.query(`UPDATE containers SET git_provider = $2, updated_at = now() WHERE id = $1`, [containerId, gitHost.provider]);
     }

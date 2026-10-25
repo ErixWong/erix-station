@@ -9,6 +9,7 @@ import * as auth from '../src/auth.js';
 import { createMaterializer } from '../src/materializer.js';
 import {
   deleteGitCredential,
+  ensureCredentialDeployed,
   GitCredentialError,
   listGitCredentials,
   setGitCredential,
@@ -816,4 +817,89 @@ test('#395 host 未在 git_hosts 注册 ⇒ 一条副本都不写，但审计不
   assert.equal(pool.state.token, null);
   assert.ok(pool.calls.some((call) => call.sql.includes('INSERT INTO audit_log')));
   assertNoTokenInDbCalls(pool, secret);
+});
+
+// ---------------------------------------------------------------------------
+// issue #395 后半段：自愈（库里有副本、文件里那行没了 → 重投）
+// 现网病灶：`provisioner.js` 判「有没有凭据」用的是 `token_ref` 非空，而那只是远端 token 的 ID。
+// ---------------------------------------------------------------------------
+
+/** 建模 `fde_git_accounts ⋈ git_hosts` 的读（自愈判定的唯一输入）。 */
+function healPool({ token = 'gitea-minted-9900', remoteLogin = 'eric', enabled = true, base_url = 'https://git.erix.vip' } = {}) {
+  const calls = [];
+  const row = { remote_login: remoteLogin, token, token_ref: '14', enabled, base_url, provider: 'gitea' };
+  const run = async (sql, params = []) => {
+    calls.push({ sql, params });
+    if (sql.includes('a.remote_login, a.token, a.token_ref')) return { rows: [{ ...row }] };
+    if (sql === 'SELECT base_url, provider FROM git_hosts') return { rows: [{ base_url, provider: 'gitea' }] };
+    if (sql.includes('a.fde_id, a.git_host_id')) return { rows: [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url }] };
+    if (sql.includes('SELECT u.id AS fde_id')) return { rows: [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url }] };
+    if (sql.includes('INSERT INTO materialize_revisions')) return { rows: [{ revision: 2 }] };
+    return { rows: [] };
+  };
+  return { calls, state: row, query: run, async connect() { return { query: run, release() {} }; } };
+}
+
+test('#395 自愈：文件里那行没了但库里有明文 ⇒ 重投，审计单独记一条 redeployed', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.target, 'https://x-access-token:github-only-secret@github.com\n', { mode: 0o640 });
+  const pool = healPool();
+  const out = await ensureCredentialDeployed({ pool, actorId: null, config: f.config, fdeName: 'alice' });
+
+  assert.deepEqual({ deployed: out.deployed, reason: out.reason, host: out.host }, {
+    deployed: true, reason: 'redeployed', host: 'git.erix.vip',
+  });
+  const lines = fs.readFileSync(f.target, 'utf8').trimEnd().split('\n');
+  assert.ok(lines.some((line) => line.startsWith('https://eric:') && line.endsWith('@git.erix.vip')), '缺失那行必须回来');
+  assert.ok(lines.some((line) => line.endsWith('@github.com')), '别的 host 的行不能被动（GitHub 凭据是 FDE 自己配的）');
+  const audits = pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log'));
+  assert.deepEqual(audits.map((call) => call.params[1]), ['admin.git_credential_redeployed'],
+    '自愈要与人工投放分账，否则运维看不出这条是谁写的');
+  assert.ok(!JSON.stringify(pool.calls).includes('gitea-minted-9900-x'), 'sanity');
+  assertNoTokenInDbCalls(pool, 'gitea-minted-9900');
+});
+
+test('#395 自愈幂等：那行本来就在 ⇒ 什么都不做（不写文件、不写审计）', async (t) => {
+  const f = fixture(t);
+  const before = 'https://eric:still-valid-secret@git.erix.vip\n';
+  fs.writeFileSync(f.target, before, { mode: 0o640 });
+  const pool = healPool();
+  const out = await ensureCredentialDeployed({ pool, actorId: null, config: f.config, fdeName: 'alice' });
+  assert.equal(out.reason, 'present');
+  assert.equal(out.deployed, false);
+  assert.equal(fs.readFileSync(f.target, 'utf8'), before, 'present 分支一个字都不能改（改了会让每次 provision 都刷 mtime）');
+  assert.equal(pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log')).length, 0);
+});
+
+test('#395 自愈不擅自动手：同 host 上是**另一个登录名** ⇒ 保持 FDE 自己的凭据', async (t) => {
+  const f = fixture(t);
+  const before = 'https:someone-else@placeholder\nhttps://someone-else:their-own-token@git.erix.vip\n';
+  fs.writeFileSync(f.target, before, { mode: 0o640 });
+  const pool = healPool({ remoteLogin: 'eric' });
+  const out = await ensureCredentialDeployed({ pool, actorId: null, config: f.config, fdeName: 'alice' });
+  assert.equal(out.reason, 'different_identity');
+  assert.equal(fs.readFileSync(f.target, 'utf8'), before,
+    '平台副本盖掉 FDE 自己换的登录身份 = 擅自改人家家目录');
+});
+
+test('#395 平台无明文副本 ⇒ 如实报 no_platform_copy，不假装修好了', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.target, 'https://x-access-token:github-only@github.com\n', { mode: 0o640 });
+  const pool = healPool({ token: null });
+  const lines = [];
+  const out = await ensureCredentialDeployed({
+    pool, actorId: null, config: f.config, fdeName: 'alice', log: (line) => lines.push(line),
+  });
+  assert.equal(out.reason, 'no_platform_copy');
+  assert.equal(fs.existsSync(f.target) ? fs.readFileSync(f.target, 'utf8').includes('@git.erix.vip') : false, false,
+    '没副本就什么都投不出来，别写出一个空行');
+  assert.match(lines.join('\n'), /重铸|人工重新提交/, 'per_fde_pat / 存量行的固有形状要说人话报出来，这是唯一能找到运维的线索');
+});
+
+// 接线不能被悄悄摘掉：自愈只在 provisioner 被调用时存在，纯模块测试看不见那条调用。
+test('#395 provisioner 确实接了自愈（静态锚点）', () => {
+  const src = fs.readFileSync(new URL('../src/provisioner.js', import.meta.url), 'utf8');
+  assert.match(src, /import \{[^}]*ensureCredentialDeployed[^}]*\} from '\.\/git-credential\.js'/, '必须 import');
+  assert.match(src, /await ensureCredentialDeployed\(\{ pool, config, fdeName, log \}\)/,
+    '必须在两条模式分支**之后**调用（刚铸完时文件已落盘，只会得到 present 空转）');
 });
