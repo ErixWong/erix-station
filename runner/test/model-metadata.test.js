@@ -382,7 +382,12 @@ test('#309 上游前提：引擎仍然用 modelMetadata/maxTokens 这两个入�
   const orchestrator = readUpstream('src', 'loop', 'orchestrator.js');
   assert.match(orchestrator, /notifyModelMetadataMissing/,
     'model_metadata_missing 诊断事件仍在 ⇒ 「不传 = 可观测」这条判据仍然成立');
-  assert.match(orchestrator, /if \(maxTokens !== undefined\) requestForJudge\.maxTokens = maxTokens;/,
+  // 0.23 这句写在 `orchestrator.js:3474`；**0.25.0 把 wrap-up 的 judge 请求搬进
+  // `src/reflection/wrapup.js`**，改写成 spread（`...(maxTokens === undefined ? {} : { maxTokens })`）。
+  // **副作用本身一个字没变**：宿主传的 maxTokens 仍继承给 wrap-up judge（工单 §3 明令「不要顺手修」）。
+  // 本条钉的是「还在继承」而不是「写在哪个文件」⇒ 上游搬家时要跟着换锚点，**不许删断言**。
+  const wrapup = readUpstream('src', 'reflection', 'wrapup.js');
+  assert.match(wrapup, /maxTokens === undefined \? \{\} : \{ maxTokens \}/,
     '已知副作用仍在：wrap-up judge 继承宿主 maxTokens（工单 §3，不要顺手修）');
 });
 

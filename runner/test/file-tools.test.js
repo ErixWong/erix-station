@@ -139,11 +139,17 @@ test('tree：真实子目录名不过度归一（sub / sub/ / 子路径均保留
     fs.writeFileSync(path.join(root, 'a.txt'), 'x');
     assert.equal(await tools.executors.tree({ path: 'sub' }), 'sub/\n  b.txt\n  deeper/\n    c.txt');
     assert.equal(await tools.executors.tree({ path: 'sub/' }), 'sub/\n  b.txt\n  deeper/\n    c.txt');
-    assert.equal(String(await tools.executors.tree({ path: 'sub/deeper' })).split('\n')[0], 'deeper/');
+    // ⚠ erix-agent 0.25.0（上游自己的 #358）把**非根目标**的首行也改成「相对根的完整路径」：
+    // 旧值 `deeper/` 是 basename，`a/sub` 与 `b/sub` 的标签长得一样、且抄回 path 换个父目录就回放不了。
+    // 随包契约套件（`test/contract/file-tools.js`）现在钉的就是这个新形状 ⇒ 这里跟着改，**不是放松**。
+    assert.equal(String(await tools.executors.tree({ path: 'sub/deeper' })).split('\n')[0], 'sub/deeper/');
     // 工作目录名作为**相对路径**依旧按普通子目录看待（本目录里并没有这个子目录 → ENOENT），
     // 不被当成根写法强行归一——过度归一会把「真的不存在」洗成「根目录」，那是另一条谎。
+    // 0.25.0 起不存在的路径抛的是**引擎自己的错误对象**（文案「错误：路径不存在：…」+ 下一步提示），
+    // 不再带 `code === 'ENOENT'`（旧断言读的是 fs 层的 code）⇒ 判据换成「确实失败且说清了原因」，
+    // 「真的不存在」这条语义没变，变的只是错误的形状。
     await assert.rejects(() => tools.executors.tree({ path: `${path.basename(root)}/` }),
-      (error) => error?.code === 'ENOENT');
+      (error) => String(error?.message ?? error).includes('路径不存在'));
     // 真存在的同名子目录：标签就是它自己，不是 ./
     fs.mkdirSync(path.join(root, path.basename(root)), { recursive: true });
     fs.writeFileSync(path.join(root, path.basename(root), 'inner.txt'), 'x');
@@ -166,10 +172,13 @@ test('回归（真机链路 #228 → #64）：第一次 tree 的首行拿去当�
     assert.equal(second.split('\n')[0], './');
     assert.equal(second, first, '同一个目录两次查询结果逐字一致（模型不会看到新标签）');
 
-    // 反证：这个收口确实在挡真实失败——拿 basename 当相对 path 就是真机那一次的结局
+    // 反证：这个收口确实在挡真实失败——拿 basename 当相对 path 就是真机那一次的结局。
+    // 0.25.0 起抛的是引擎自己的「路径不存在」错误（不再有 fs 的 `code: 'ENOENT'`，见上一处注释），
+    // 判据同向：失败 + 说清原因，**不许**被洗成「当成根目录了」。
     await assert.rejects(() => tools.executors.tree({ path: `${path.basename(root)}/` }),
-      (error) => error?.code === 'ENOENT',
-      'basename 当相对路径必须 ENOENT（这正是必须在根标签上收口的原因）');
+      (error) => String(error?.message ?? error).includes('路径不存在'),
+      'basename 当相对路径必须是真实失败（这正是必须在根标签上收口的原因）');
+    // 而**首行抄回 path** 在 0.25 之后是官方契约（根标签 `./` 可回放），上面已钉逐字一致。
   }));
 
 test('searchText（原 rg 用例）：正则命中——mode 显式 + 返回 {content, metadata}', () =>
