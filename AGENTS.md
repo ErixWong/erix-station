@@ -1932,3 +1932,27 @@ U7 `recallTranscript` 是范围扫（`LIMIT 2000`）不受影响。
 （`select append_seq, folded, octet_length(folded_payload::text) ... where round=100 order by append_seq`），
 而不是照着上游 CHANGELOG 讲故事。§8.59 里「病根 = 0.25.0 差分归档」那句要按本节理解：**差分归档是
 第二层病**（会让重建只剩差分），**取错行是第一层病**（让端点压根看不到折叠行）。
+
+### 8.62 「查看原文」满屏「（无文本内容）」是渲染层的谎（2026-10-25，#384）
+
+#375 两层病修完、真机验收时用户第一眼看到的是：正文确实出来了，但**夹着二十几行「（无文本内容）」**。
+先去账本量而不是先猜（§8.61 那条教训的直接应用）：容器内直调 `getFoldedPayload` 把 112 条 turn 的
+形状分布打出来 ⇒ `text` 为空的有 **40 条**，而它们**全部带着 `toolCalls`**，`reasoning` 更是 91/112 条非空。
+样例那条 turn 里有 `reasoning`（"The user wants to pull code…"）+ 两条 `shell` 的 `tool_use`——**活干了，
+只是没写正文**。
+
+病根是一行模板：`{{ turn.text || t('stream.folded.originalEmpty') }}`。DTO 的 turn 有**四类**内容
+（`text` / `reasoning` / `toolCalls[]` / 是不是 user 说的），模板只画第一类。修法就是四类都画
+（user 身份标记 → 灰斜体 reasoning → text → 每个工具一行 `🔧 名称｜argsSummary`，`isError` 标「失败」），
+占位符语义收窄成「四类真的都空」。数据侧一行没动：`toolCalls[].argsSummary` 与 `reasoning` 上游投影本来就在给
+（现网 98/98 工具调用带 `argsSummary`）。
+
+判据变异恰 1 格红（删掉工具行那个 `div`）。**已知不足另单跟**：重建路上 `resultPreview` 实测 **0/98**——
+工具**结果**在紧随其后的 `tool_result` 块里，`projectTranscriptForDisplay` 不做配对（主消息流那条预览是靠
+`tool_calls` 表 join 出来的，见 §8 里 #282 那段），所以原文里看得到"调了什么"看不到"返回了什么"；要补是
+后端 `rebuildFoldedRange` 那侧的一片，不是前端。
+
+**通用教训**：一个「数据没取到」的观感，先证明**它到底取到了什么**（把 DTO 的形状分布打出来：
+`role/text 有无/toolCalls 条数` 一张计数表就够），再决定改哪一层。这次如果直接去改后端配对，就会花一整片
+的预算在一个纯前端问题上。
+
