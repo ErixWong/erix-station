@@ -394,8 +394,10 @@ async function startRun(msg) {
   ensureGitRepo(cwd);
   const jail = createJail({ root: cwd, writable: [cwd] });
   const fileTools = createStationFileTools({ jail, cwd });
-  // issue #46（选项 A，logical-run 作用域）：notesDir 由 agentd 下行（run 数据目录
-  // <home>/runs/<runId>/notes，跨 attempt 保留，与 run 工作区生命周期解耦——resume 不再丢 notes）。
+  // issue #46（选项 A）+ #392（B 片）：notesDir 由 agentd 下行。作用域已从 **logical-run**
+  // 改为**会话**：下行的是 `<home>/sessions/<sessionId>/notes`，同一会话的每个 run 看到的是
+  // **同一个** notes 目录 + 同一个 scopeRef ⇒ `note_list` 与引擎 run-state 小抄目录跨 run 可见。
+  // （旧语义：笔记跟 run 同生同灭，而本站**一条用户消息就是一个 run** ⇒ 笔记天然无效。）
   // 旧 agentd 无 notes_dir 字段 → 回退 cwd 内 .notes（旧语义，resume 仍会丢，warn 明示）。
   let noteTools = { schemas: [], executeTool: null, lifecycle: null };
   try {
@@ -408,7 +410,19 @@ async function startRun(msg) {
         msg: 'notes_dir missing from RUN_START (old agentd?), fallback to cwd-local .notes; notes will NOT survive resume',
       });
     }
-    noteTools = await createNotesTools({ runId, notesDir });
+    // issue #392（B 片）：`scopeRef = sessionId` ⇒ 笔记作用域 = 会话。
+    // 真机依据（会话 `bdef6dd7`，195 轮 / 12 run）：`note_take` 共 3 次，而每次写的都是
+    // `scopeRef=runId` ⇒ **下一个 run 一行也读不到**（笔记与它想救的那个上下文同命）。
+    // 并发安全：`runs_one_active_per_session`（同会话同时最多一个活跃 run）⇒ 不会有两个 worker
+    // 同时写同一个会话的 notes 目录，引擎那条 single-writer 约定依旧成立。
+    // 无 session（旧下行 / 无本子的工单）⇒ `scopeRef` 为 undefined ⇒ **逐字退回旧的 run 作用域**。
+    /* #392:notes-session-scope:start */
+    noteTools = await createNotesTools({
+      runId,
+      notesDir,
+      scopeRef: sessionId ?? undefined,
+    });
+    /* #392:notes-session-scope:end */
   } catch (err) {
     sendIpc(process, {
       type: MSG.LOG, run_id: runId, level: 'warn',
@@ -722,7 +736,12 @@ async function startRun(msg) {
     });
   } finally {
     // issue #46：onRunComplete 仅完成 active notes；收尾错误只记日志，不覆盖 run 主错误。
-    if (noteTools.lifecycle) {
+    // issue #392（B 片）：会话作用域下**不能**调它——`completeRun` 按 scopeRef 批量把 active
+    // 改 done（erix-agent 0.25.0 `src/store/notes.js:94`），而 scopeRef 现在 = sessionId
+    // ⇒ 每个 run 收尾会把**整个会话**的笔记刷成 done，下个 run 又看不到 ⇒ 与本片目的相反。
+    // 标志位由 `lib/notes-tools.js` 给出（不在这里重新推 `msg.session_id`）：作用域与是否收尾
+    // 必须是同一个判断的两种说法，两处各自解析就会有不一致的可能。
+    if (noteTools.lifecycle && noteTools.completesRunNotes !== false) {
       try {
         const completion = await noteTools.lifecycle.onRunComplete();
         const completedCount = completion?.completed?.completed;
