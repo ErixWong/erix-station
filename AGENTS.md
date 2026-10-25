@@ -2096,3 +2096,57 @@ offboard 收敛）。它们不在一条调用链上，加第六处时没人会�
 **线上 run 不受影响**（模型与预算走 portal 心跳下行，网关 `LiteLLM_ProxyModelTable` 实查 `context_window=262144` / `max_output_tokens=32768`，runner 的 `resolveModelMetadata` 拿到的就是这两个数）；但 **e2e 与 CLI 读的是占位文件**（`resolveRunModel` 无下行时取占位 model，endpoint/key 永远取占位）⇒ `modelMetadata` 不成对 ⇒ `modelMetadataMissing` ⇒ `examples/pi-extension/erix-run-e2e.test.js` 的 **E6「装配自查」恒红**（上游 `ERIX_E2E_REAL=1 npm run check:release:real` 的 4/5 就是它）。
 2026-10-25 已给三个槽位补齐两键并把模型名改成 `qwen3.8-flash-next`（备份 `config.json.bak-20261025`；两个数字的来源：网关错误原文 *"maximum context length is 262144 tokens"* 与 `/v1/models` 的 `max_output_tokens: 32768`，与网关配置一致），补齐后真上游五步 **5/5 全绿**。
 **结论：占位文件里这两键不是可选项**——它决定 e2e 能不能跑、以及 CLI 手工验证时压缩是否真开；别当成冗余删掉。
+
+### 8.66 折叠摘要入注（issue #392 C 片）：折一次记一次，摘要不再是「产出来就扔」（2026-10-26，分支 `feat-261026-01-fold-notes`）
+
+A 片（§8.65 前后的 `context.strategy='fold-statistical'`）只解决「折叠**产出**替代物」；替代物产出之后
+没人投递，用户侧感知与「静默硬删」完全一致——摘要生出来就扔了。本片补上投递这一环，让
+**折一次记一次**成为可验证的不变量。
+
+引擎侧 0.26.0 已把出口给全（本站不往引擎加任何东西）：`context.onFoldSummary(payload)`，
+`payload = { ...record.foldedFacts, round }` = `{ text, source, chars, bytes, truncated, round }`；
+契约三条边界都写在引擎里——**无 text 不调用**、宿主回调抛错只落
+`persistence_error{operation:"onFoldSummary", phase:"fold_summary_delivery", fatal:false}` 不杀 run、
+不接这个回调则行为与 0.25.0 逐字相同。投递方向是**宿主的事**（erix-agent#470 定调：引擎里没有
+notesStore 句柄，也不该塞 fs/DB）。
+
+落地位置（三处，前两处是新增文件）：
+
+| 位置 | 职责 | 为什么切在这儿 |
+|---|---|---|
+| `runner/lib/fold-notes-key.js` | 纯函数：key 与正文 | 零依赖 ⇒ 单测能把 key 形态钉死，不必装引擎 |
+| `runner/lib/fold-notes.js` | 投递 + 失败纪律 + 序号 | 只有这里知道 `noteTools.executors`，也只有这里该知道 |
+| `runner/worker.js` `#392:C-fold-notes` / `#392:C-onFoldSummary` | 装配 + 条件接线 | 判据从源码抠值求值，删掉那行必红（技法同 A 片） |
+
+四条写在代码里的硬约束：
+
+1. **key 必须能排时间线，且永不重复**。同 scope 下 key 就是笔记 id：固定 key ⇒ 第二个 run 的第一次折叠
+   撞重复、注直接丢掉、台账从此只有一条。key 还必须过 store 的
+   `SAFE_KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/`（`erix-agent src/store/notes.js:47`），不过就被哈希成
+   `h<digest>`——人在 `note_list` 里既读不出顺序也认不出是哪次折叠 ⇒ 时刻用 **basic 形态**
+   `fold-20261026T021530Z-r57-s1`（带 `-` `:` `.` 的 ISO 过不了这条）。
+2. **投递处不传 `scopeRef` / `runId`**。作用域由 B 片的工厂绑定成 `sessionId`；这里再传一次就是伪造
+   `__erix`，会把注写回 run 目录，正好抵消 B 片的收益（判据 C7 / C13）。
+3. **写注失败绝不打死 run**：笔记是台账不是事实源，失败只上报 `fatal:false`（连上报通道自己抛错也不
+   传染，C8 / C9）。
+4. **无 text 不写空注**：引擎契约是本不该调用；真被调到算异常形态，只上报（`reason:'no_summary_text'`），
+   不写一条空笔记在 `note_list` 里冒充「已存档」（C6）。
+
+`pinned:false`——pinned 的唯一豁免是 memory，折叠摘要不算。
+
+**两条已知边界（别当成已解决）**：
+
+- **精确轮次范围 `a–b` 拿不到**：payload 只有 `round`，没有折叠水位线的前后值，也没有 `foldedRounds`。
+  所以正文只能写「round N 及之前的原文已退出可见上下文」。要写「折走第 12–57 轮」得让上游
+  在 payload 里补 `foldedRoundsBefore/After`（additive，一小格），本片不假装知道。
+- **序号是 run 内的**：折叠水位线本身仍是 run 作用域（#462 补的是读侧裁剪，没把它抬到 session），
+  所以「第 N 次折叠」在新 run 里从 1 重来。正文里同时写 run id 与绝对时刻，就是为了让读者能自己
+  判断这不是全局序号——不谎报。
+
+未做：**D 片**（banner 两态：显示 `compaction.strategyName` 与「已折走 N 轮原文对模型不再可见」）；
+`context.keepRounds`（0.25.0 里没人读，A 片已钉死）；env 旋钮（延续 A 片口径：策略与投递不是运维参数）。
+
+验证：`runner/test/fold-notes.test.js` 新增 **13 条**（C1–C13），runner 全量 **386/386**；语法门
+`node --check` 204 文件 0 失败。根套件 1634 条里唯一那格红是 `portal/test/termination-contract.test.js`
+的 tripwire 读**安装态**引擎版本（本地 `node_modules` 是借来的 0.25.0），CI `npm ci` 下即 0.26.0 ——
+它红得正好：那根线闸的作用就是「版本变了必须重开 issue 复核 reason 全集」（§8.65）。
