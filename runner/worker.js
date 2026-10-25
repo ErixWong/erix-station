@@ -33,6 +33,7 @@ import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
+import { createFoldNoteSink } from './lib/fold-notes.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope } from './lib/termination.js';
@@ -531,6 +532,26 @@ async function startRun(msg) {
     });
   };
 
+  /* #392:C-fold-notes:start */
+  // issue #392（C 片）：折叠摘要投递成笔记。**A 片让折叠产出替代物，本行让它落地**——没有这一步，
+  // 用户侧感知与「静默硬删」完全一致（摘要产出来了就扔了）。「折一次记一次」这条不变量在这里闭环。
+  // 投递是宿主的事：引擎里没有 notesStore 句柄（erix-agent#470 定调），所以 `onFoldSummary` 只是出口，
+  // 写注由 `noteTools.executors('note_take', …)` 完成（作用域 = B 片的 scopeRef=sessionId，此处不传
+  // scopeRef/runId——工厂绑定，传了就是伪造 __erix）。写注失败只 warn（`fatal:false`），绝不打死 run。
+  // notes 不可用时（lib/notes-tools.js 降级路径：executors 非函数）⇒ 整体不接线，行为退回 A 片。
+  const foldNoteSink = typeof noteTools.executors === 'function'
+    ? createFoldNoteSink({
+      noteTools,
+      runId,
+      onDeliveryError: (info) => sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: `fold summary note delivery failed (operation=onFoldSummary phase=${info?.phase ?? 'fold_summary_delivery'} fatal=false seq=${info?.seq ?? '-'} key=${info?.key ?? '-'})`
+          + `: ${info?.reason ?? info?.message ?? 'unknown'}`,
+      }),
+    })
+    : null;
+  /* #392:C-fold-notes:end */
+
   // P3 PR②a：portal 已在 POST 事务内预写 `:input:<messageId>`。
   // 空本子（旧 ticket）走引擎 round 0 seed；已有档案直接 resume；旧 ticket 沿用 ticket.resume。
   // resume=true 对齐 repl.js:656：不传 initialMessages/initialUserMessage（恢复记录即完整上文）。
@@ -613,6 +634,11 @@ async function startRun(msg) {
       /* #392:context-strategy:start */
       context: {
         strategy: 'fold-statistical',
+        /* #392:C-onFoldSummary:start */
+        // 折一次 → 写一条注（lib/fold-notes.js）。引擎保证「无 text 不调用」，本处只管投递与失败不上抛。
+        // 不接线的情形只有一个：notes 工具整体不可用（上面 foldNoteSink = null）。
+        ...(foldNoteSink ? { onFoldSummary: foldNoteSink.onFoldSummary } : {}),
+        /* #392:C-onFoldSummary:end */
       },
       /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。

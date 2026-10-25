@@ -36,7 +36,11 @@ function workerContextOption() {
   assert.ok(block,
     'worker.js 必须有一对配对的 `/* #392:context-strategy:start|end */` 标记：'
     + '没了就是本站又退回「不传 context ⇒ 引擎滑窗兜底 ⇒ 折叠是静默硬删」那条老路');
-  return new Function(`return {${block[1]}}`)().context;
+  // C 片（折叠摘要入注）在同一块里加了一个**条件键** `...(foldNoteSink ? { onFoldSummary } : {})`，
+  // 所以要给沙箱注入一个变量。本文件一律注入 `null`（= notes 不可用的降级形态）：
+  // 于是下面「键集恰好是 ['strategy']」那条断言测的是「没 sink 就不许多塞键」；
+  // 接上 sink 的那一半由 runner/test/fold-notes.test.js 钉。两个形态都得有判据。
+  return new Function('foldNoteSink', `return {${block[1]}}`)(null).context;
 }
 
 /** 造 n 轮真形态消息（user → assistant tool_use → user tool_result），文本够长以便真的折得动。 */
