@@ -225,8 +225,21 @@ async function withTransaction(pool, work) {
  * 重复入队无害（materialize revision 为 head/latest-wins，见 materializer.js 消费逻辑）。
  * configured=false（删除凭据）active→awaiting_credential 不触发物化——凭据移除不改平台文件。
  */
-async function updateAssignedAccount(pool, fdeName, host, username, configured) {
-  await withTransaction(pool, async (client) => {
+/**
+ * 写回 FDE 的 Git 账户/用户状态（issue #395：改名 `*With(client)`，事务边界上提到调用方，
+ * 让「明文落库」与「状态翻转」共享同一个事务——见 `setGitCredential`。
+ *
+ * configured=true（投放凭据）时 awaiting_credential→active，并在**同一事务**内入队一次物化
+ * revision（issue #183）：凭据到达前 FDE 处于 awaiting_credential，其平台文件可能尚未物化；
+ * 状态翻转后必须补一次，否则 ~/.erix 永远缺失 → agent run ENOENT config.json 崩溃。
+ * 重复入队无害（issue #183：materialize revision 为 head/latest-wins，见 materializer.js 消费逻辑）。
+ * configured=false（删除凭据）active→awaiting_credential 不触发物化——凭据移除不改平台文件。
+ *
+ * ⚠ 这里的 `AND token_ref IS NULL` 是**原有语义**（只认「平台不持有远端 token」的 per_fde_pat 行），
+ *   不要顺手放宽：minted 行的状态翻转由 `provisioner.js` 在 mint 之后显式 `UPDATE users SET status`，
+ *   两条路径各自负责自己的模式。
+ */
+async function updateAssignedAccountWith(client, fdeName, host, username, configured) {
     const result = await client.query(
       `SELECT u.id AS fde_id, a.git_host_id, h.base_url
          FROM users u
@@ -262,6 +275,61 @@ async function updateAssignedAccount(pool, fdeName, host, username, configured) 
         materializeEnqueued.add(row.fde_id);
       }
     }
+}
+
+/**
+ * 明文 token 落库 / 清库（issue #395）。
+ *
+ * 为什么需要它：`minted` 模式下平台铸出的 token 明文此**只**投放到 FDE 的 `~/.git-credentials`，
+ * 库里 `token_ref` 存的是远端 token ID（吊销用），不是 secret ⇒ 明文的唯一副本躺在用户态、agent 可写的
+ * 文件里。真机（现网 `eric`，2026-10-25）该文件被 agent 整文件重写，gitea 那行消失，平台既无副本也不会自愈。
+ *
+ * 语义（`0024-git-token-plaintext.sql` 的列注释是同一口径）：
+ *   `token = <明文>` ⇒ 平台持有副本，具备重投能力；
+ *   `token = null`  ⇒ 平台**没有**副本（`per_fde_pat` 下 FDE 自行在容器里配的密钥、以及 #395 之前的存量行）。
+ * 所以**删除凭据必须把这一列一起置 NULL**：库里留着明文，自愈逻辑就会把用户刚刚删掉的凭据又投回文件里。
+ *
+ * host 匹配沿用 `updateAssignedAccountWith` 的做法：URL 解析在 JS 侧（库里没有 URL 解析函数），
+ * 匹配不上就一行都不动——传进来的 host 没在 `git_hosts` 注册（例如 FDE 自己配的 github.com）时，
+ * **不该**凭空造出副本，也不该报错：那只意味着「平台不知道这枚 token」，与 `token IS NULL` 的语义一致。
+ *
+ * @param {object} client pg 客户端（必须已在事务内）
+ * @param {string|null} token 明文；`null` = 清除副本（删除路径）
+ * @returns {Promise<number>} 被更新的行数（0 是正常结果，不是错误）
+ */
+async function persistTokenPlaintext(client, fdeName, host, token) {
+  const rows = await client.query(
+    `SELECT a.fde_id, a.git_host_id, h.base_url
+       FROM fde_git_accounts a
+       JOIN git_hosts h ON h.id = a.git_host_id
+       JOIN users u ON u.id = a.fde_id
+      WHERE u.fde_name = $1`,
+    [fdeName],
+  );
+  let updated = 0;
+  for (const row of rows.rows) {
+    let assignedHost;
+    try {
+      assignedHost = new URL(row.base_url).host.toLowerCase();
+    } catch {
+      continue;
+    }
+    if (assignedHost !== host) continue;
+    const result = await client.query(
+      `UPDATE fde_git_accounts
+          SET token = $3, updated_at = now()
+        WHERE fde_id = $1 AND git_host_id = $2`,
+      [row.fde_id, row.git_host_id, token],
+    );
+    updated += result.rowCount ?? 0;
+  }
+  return updated;
+}
+
+/** 兼容旧调用点的自包事务版本（删除路径与既有测试沿用）。 */
+async function updateAssignedAccount(pool, fdeName, host, username, configured) {
+  await withTransaction(pool, async (client) => {
+    await updateAssignedAccountWith(client, fdeName, host, username, configured);
   });
 }
 
@@ -334,11 +402,19 @@ export async function setGitCredential({ pool, actorId = null, config, fdeName, 
     token,
     protocol: scheme,
   });
-  await writeAudit(pool, actorId, 'admin.git_credential_set', fdeName, {
-    fde_name: fdeName,
-    host: normalizedHost,
+  // issue #395：审计 + 明文落库 + 账号状态翻转，同一个事务。
+  // 为什么把状态翻转也拉进来（它此前自成一事务）：这三件事是同一个事实「该 FDE 现在有这枚凭据」的
+  // 三个侧面，分开提交会出现「库里说明文有了，用户还挂在 awaiting_credential」或反之的中间态，
+  // 而这两个状态各自都会被抓取/自愈逻辑当真。文件写在事务**之前**（不可回滚，沿用既有设计：
+  // 投放成功是既成事实，DB 记账失败时最坏退化成 #395 修之前的样子——文件有、库无副本）。
+  await withTransaction(pool, async (client) => {
+    await writeAudit(client, actorId, 'admin.git_credential_set', fdeName, {
+      fde_name: fdeName,
+      host: normalizedHost,
+    });
+    await persistTokenPlaintext(client, fdeName, normalizedHost, token);
+    await updateAssignedAccountWith(client, fdeName, normalizedHost, username, true);
   });
-  await updateAssignedAccount(pool, fdeName, normalizedHost, username, true);
   return { host: normalizedHost, username, configured: true };
 }
 
@@ -365,12 +441,17 @@ export async function deleteGitCredential({ pool, actorId = null, config, fdeNam
     provider: registeredHost.provider,
     host: normalizedHost,
   });
-  await writeAudit(pool, actorId, 'admin.git_credential_deleted', fdeName, {
-    fde_name: fdeName,
-    host: normalizedHost,
-    deleted,
+  // issue #395：审计 + 清除明文副本 + 账号状态回退，同一个事务。
+  // 未注册 host（deleted=false）也照跑：那时无行可更新，但审计不能丢。
+  await withTransaction(pool, async (client) => {
+    await writeAudit(client, actorId, 'admin.git_credential_deleted', fdeName, {
+      fde_name: fdeName,
+      host: normalizedHost,
+      deleted,
+    });
+    await persistTokenPlaintext(client, fdeName, normalizedHost, null);
+    if (deleted) await updateAssignedAccountWith(client, fdeName, normalizedHost, null, false);
   });
-  if (deleted) await updateAssignedAccount(pool, fdeName, normalizedHost, null, false);
   return { host: normalizedHost, deleted };
 }
 

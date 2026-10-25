@@ -72,12 +72,30 @@ function recordingPool(gitHostBaseUrls = []) {
   return pool;
 }
 
+/**
+ * issue #395 改了这条契约：明文 token 从「**永不进 DB**」变成「只进 `fde_git_accounts.token` 一列」。
+ * 所以这里断言的不再是「DB 调用里没有明文」，而是「**除了那一列，哪儿都不能有**」：
+ *   ① SQL 文本里永远不得内插明文（拼串 = 泄进 `pg_stat_activity` / 日志）；
+ *   ② 参数里只允许出现在 `UPDATE fde_git_accounts … SET token` 那一条；
+ *      `audit_log` 的 INSERT 参数（details JSON）里出现明文就是回归——`admin.git_credential_set`
+ *      历史上就只记 host/username，这个口径不能因为多了个副本列就被抹掉。
+ */
 function assertNoTokenInDbCalls(pool, ...tokens) {
   for (const call of pool.calls) {
     const serialized = JSON.stringify(call.params);
-    for (const token of tokens) assert.ok(!serialized.includes(token), 'token must not be written to DB');
+    const isTokenColumnWrite = /UPDATE fde_git_accounts/i.test(call.sql) && /\bSET token\b/i.test(call.sql);
+    for (const token of tokens) {
+      assert.ok(!call.sql.includes(token), 'token 不得出现在 SQL 文本（拼接 = 泄进 pg_stat_activity 与日志）');
+      if (isTokenColumnWrite) continue;
+      assert.ok(!serialized.includes(token), `token 不得写入 ${call.sql.slice(0, 60)} 的参数（明文副本只住 fde_git_accounts.token）`);
+    }
   }
 }
+
+/** 抽出一组调用里对 `fde_git_accounts.token` 列的写（#395 的断言靶子）。 */
+const tokenColumnWrites = (pool) => pool.calls.filter(
+  (call) => /UPDATE fde_git_accounts/i.test(call.sql) && /\bSET token\b/i.test(call.sql),
+);
 
 /**
  * issue #183：投放/删除 per-FDE PAT 的 fake pool——记录状态翻转与物化入队。
@@ -96,6 +114,10 @@ function assignedAccountPool({ baseUrl = 'https://github.com', flip = true } = {
       return {
         async query(sql, params = []) {
           calls.push({ sql, params });
+          // issue #395：明文副本的 host 匹配查询（与下方状态翻转共用同一事务）
+          if (sql.includes('a.fde_id, a.git_host_id')) {
+            return { rows: [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url: baseUrl }] };
+          }
           if (sql.includes('SELECT u.id AS fde_id')) {
             return { rows: [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url: baseUrl }] };
           }
@@ -654,8 +676,144 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   assert.deepEqual(await deleteResponse.json(), { host: 'github.com', deleted: true });
 
   for (const call of calls) {
+    // ⚠ 本例的假库把 `github.com` 建模成**未在 `git_hosts` 注册**（无分配账号行），所以 issue #395 的
+    //   明文副本写入不会发生，此处「明文不进 DB 参数」成立。它在生产里的完整契约是
+    //   「除 `fde_git_accounts.token` 一列外哪儿都不能有」（见本文件 `assertNoTokenInDbCalls` 与
+    //   下方 #395 用例）——不要把本例当成那条全局契约的证人。
     assert.ok(!JSON.stringify(call.params).includes(secret), 'plaintext token must not reach DB parameters');
     assert.ok(!JSON.stringify(call.params).includes('replacement-secret'), 'failed-write token must not reach DB parameters');
   }
   assert.ok(pool.audit.every((entry) => !entry.details.includes(secret)));
+});
+
+// ---------------------------------------------------------------------------
+// issue #395：明文 token 落库（`fde_git_accounts.token`）
+//
+// 起因（现网 2026-10-25）：minted 模式铸出的明文只投放到 `~/.git-credentials` 就丢弃，库里
+// `token_ref` 只是远端 token ID。FDE `eric` 的 agent 整文件重写该文件，gitea 那行消失——平台作为
+// 铸币方既无副本、也不会自愈（存在性判据是 `token_ref` 非空）。以下用例钉住修好的那半边：
+// ① 投放即留副本；② 删除必须清副本（否则自愈会把用户刚删的凭据投回去）；③ 副本只住那一列。
+// ---------------------------------------------------------------------------
+
+/**
+ * 建模 `fde_git_accounts` 的有状态假库（#395）。按 SQL 文本真筛，不做"来者不拒返回空"的
+ * 安慰剂 fake（AGENTS §8.14）。`registered=false` = host 不在 `git_hosts` 里（FDE 自己配的
+ * github.com 这类），此时一条副本都不该写。
+ */
+function tokenReplicaPool({ baseUrl = 'https://git.erix.vip', registered = true } = {}) {
+  const calls = [];
+  const state = { token: null, remoteLogin: null, userStatus: 'awaiting_credential' };
+  const accountRows = registered ? [{ fde_id: 'fde-1', git_host_id: 'host-1', base_url: baseUrl }] : [];
+  const run = async (sql, params = []) => {
+    calls.push({ sql, params });
+    if (sql === 'SELECT base_url, provider FROM git_hosts') {
+      return { rows: registered ? [{ base_url: baseUrl, provider: 'gitea' }] : [] };
+    }
+    if (sql.includes('a.fde_id, a.git_host_id')) return { rows: accountRows };
+    if (/UPDATE fde_git_accounts/i.test(sql) && /\bSET token\b/i.test(sql)) {
+      state.token = params[2];
+      return { rowCount: accountRows.length };
+    }
+    if (sql.includes('UPDATE fde_git_accounts')) {
+      state.remoteLogin = params[2];
+      return { rows: [] };
+    }
+    if (sql.includes('SELECT u.id AS fde_id')) return { rows: accountRows };
+    if (sql.includes('UPDATE users SET status')) {
+      state.userStatus = params[1];
+      return { rows: [{ id: params[0] }] };
+    }
+    if (sql.includes('INSERT INTO materialize_revisions')) return { rows: [{ revision: 2 }] };
+    return { rows: [] };
+  };
+  const pool = {
+    calls,
+    state,
+    query: run,
+    async connect() {
+      return { query: run, release() {} };
+    },
+  };
+  return pool;
+}
+
+test('#395 投放凭据把明文写进 fde_git_accounts.token，且与审计/状态翻转同事务', async (t) => {
+  const f = fixture(t);
+  const pool = tokenReplicaPool();
+  const secret = 'gitea-minted-secret-7788';
+  await setGitCredential({
+    pool, actorId: 'admin-id', config: f.config, fdeName: 'alice',
+    host: 'git.erix.vip', username: 'eric', token: secret,
+  });
+
+  assert.equal(pool.state.token, secret, '平台必须持有明文副本，否则文件一丢就无从重投');
+  assert.equal(pool.state.remoteLogin, 'eric');
+  assert.equal(pool.state.userStatus, 'active');
+
+  const writes = tokenColumnWrites(pool);
+  assert.equal(writes.length, 1, '一次投放只写一次副本列');
+  const begin = pool.calls.findIndex((call) => call.sql === 'BEGIN');
+  const commit = pool.calls.findIndex((call) => call.sql === 'COMMIT');
+  const tokenIdx = pool.calls.indexOf(writes[0]);
+  assert.ok(begin >= 0 && begin < tokenIdx && tokenIdx < commit, '副本写入必须与审计/状态翻转同事务（分开提交会出现"库里有副本但用户还挂在 awaiting_credential"）');
+
+  // 副本只住那一列：审计的 details 里只有 host/fde_name，没有明文。
+  const audits = pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log'));
+  assert.ok(audits.length >= 1);
+  for (const audit of audits) {
+    assert.ok(!JSON.stringify(audit.params).includes(secret), 'audit_log 不得记明文（历史上它只记 host/username）');
+  }
+  assertNoTokenInDbCalls(pool, secret);
+
+  // 出参面不变：列表端点仍是掩码。
+  const listed = await listGitCredentials({ config: f.config, fdeName: 'alice' });
+  assert.deepEqual(listed.hosts.map((h) => h.token), ['****7788']);
+  assert.ok(!JSON.stringify(listed).includes(secret));
+});
+
+test('#395 删除凭据必须把库里的副本一起置 NULL（否则自愈会把刚删掉的凭据投回去）', async (t) => {
+  const f = fixture(t);
+  const pool = tokenReplicaPool();
+  const secret = 'gitea-to-be-deleted-1122';
+  await setGitCredential({
+    pool, actorId: 'admin-id', config: f.config, fdeName: 'alice',
+    host: 'git.erix.vip', username: 'eric', token: secret,
+  });
+  assert.equal(pool.state.token, secret);
+
+  const result = await deleteGitCredential({
+    pool, actorId: 'admin-id', config: f.config, fdeName: 'alice', host: 'git.erix.vip',
+  });
+  assert.equal(result.deleted, true);
+  assert.equal(pool.state.token, null, '文件里的凭据删了，库里的副本必须同步消失');
+  assert.equal(pool.state.userStatus, 'awaiting_credential');
+});
+
+test('#395 轮换（同 host 再投一次）覆盖旧副本而不是留着旧的', async (t) => {
+  const f = fixture(t);
+  const pool = tokenReplicaPool();
+  const common = { pool, actorId: 'admin-id', config: f.config, fdeName: 'alice', host: 'git.erix.vip', username: 'eric' };
+  await setGitCredential({ ...common, token: 'old-minted-aaaa' });
+  await setGitCredential({ ...common, token: 'new-minted-bbbb' });
+  assert.equal(pool.state.token, 'new-minted-bbbb');
+  assert.equal(tokenColumnWrites(pool).length, 2, '两次投放各写一次');
+  // 文件侧同 host 只留一行（既有契约），副本侧 likewise 只有一个值。
+  const lines = fs.readFileSync(f.target, 'utf8').trimEnd().split('\n');
+  assert.equal(lines.filter((line) => line.includes('@git.erix.vip')).length, 1);
+  assertNoTokenInDbCalls(pool, 'old-minted-aaaa', 'new-minted-bbbb');
+});
+
+test('#395 host 未在 git_hosts 注册 ⇒ 一条副本都不写，但审计不丢、不报错', async (t) => {
+  const f = fixture(t);
+  const pool = tokenReplicaPool({ registered: false });
+  const secret = 'self-configured-github-pat';
+  const result = await setGitCredential({
+    pool, actorId: 'admin-id', config: f.config, fdeName: 'alice',
+    host: 'github.com', username: 'x-access-token', token: secret,
+  });
+  assert.equal(result.configured, true, '未注册 host 照常投放文件（FDE 自己配的 github 凭据也走这条端点）');
+  assert.equal(tokenColumnWrites(pool).length, 0, '平台不知道这枚 token 属于哪个受管账号 ⇒ 不凭空造副本');
+  assert.equal(pool.state.token, null);
+  assert.ok(pool.calls.some((call) => call.sql.includes('INSERT INTO audit_log')));
+  assertNoTokenInDbCalls(pool, secret);
 });

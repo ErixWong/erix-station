@@ -735,12 +735,17 @@ export async function onboardFde(pool, config, {
             token: minted.tokenPlaintext,
           });
           await pool.query(
-            `INSERT INTO fde_git_accounts (fde_id, git_host_id, remote_login, token_ref)
-             VALUES ($1, $2, $3, $4)
+            `INSERT INTO fde_git_accounts (fde_id, git_host_id, remote_login, token_ref, token)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (fde_id) DO UPDATE
                SET git_host_id = EXCLUDED.git_host_id, remote_login = EXCLUDED.remote_login,
-                   token_ref = EXCLUDED.token_ref, updated_at = now()`,
-            [userId, gitHost.id, minted.remoteLogin, minted.tokenRef],
+                   token_ref = EXCLUDED.token_ref, token = EXCLUDED.token, updated_at = now()`,
+            // issue #395：`token` 存**明文**。上游 `setGitCredential`（上一行）已把同一枚明文投到
+            // `~/.git-credentials`，它内部的 `persistTokenPlaintext` 在行已存在时（重新激活路径：admin.js
+            // 清空 `remote_login`/`token_ref` 但保留 `git_host_id`）就先把明文写进了库；本句的
+            // `token = EXCLUDED.token` 是**必需的**而不是冷余：少了它，下面那次 UPSERT 不会回退列值，
+            // 但全新开户（行不存在）就永远拿不到副本。mint 不重跑 ⇒ 丢了就真没了。
+            [userId, gitHost.id, minted.remoteLogin, minted.tokenRef, minted.tokenPlaintext],
           );
         }
         await pool.query(`UPDATE users SET status = 'active' WHERE id = $1 AND status = 'awaiting_credential'`, [userId]);
