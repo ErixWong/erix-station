@@ -1,6 +1,6 @@
 {
   "name": "erix-station-portal-frontend",
-  "version": "0.1.40",
+  "version": "0.1.41",
   "private": true,
   "type": "module",
   "description": "FDE Station portal Vue 3 SPA（issue #61 P1：骨架 + 登录页）",
