@@ -2245,6 +2245,14 @@ reconcile 因此抱怨 `start container … failed: HTTP 409`，把真故障淹�
 契约上钉住（`onboardFde` 全链 fake 成本高，沿用本文件既有做法；`ensureFdeContainer` 真跑）。
 provisioner 34/34、portal+root 全量绿。
 
-**留给后续的边界**（本片故意不做，不是遗漏）：`agent_version` 仍由心跳自报，不由 station 写 `config.fdeAgentVersion`
-——它是「容器里跑的 runner 自报的版本」，station 写死等于自报变推断。要真正闭环，得让 `provision-fde` /
-reconcile 在建容器后等一次心跳（见 issue #404 评论）。
+> **本节写完当场发现的一句话错误，保留在此而不是悄悄改**：原文说"`agent_version` 由心跳自报"，**不成立**。
+> 实际链条是 `deploy/.env` 里一个静态 `FDE_AGENT_VERSION=0.1.32-088e41e` →（compose）→ `config.fdeAgentVersion`
+> → 建容器时写库、并作为 env 注进容器 → `runner/agentd.js:44` 上报的就是**那个 env 标签**；而
+> `portal/src/internal.js` 的 heartbeat 收到 `agent_version`（`agentd.js:421` 确实报了）**从不写这一列**。
+> 所以该字段的真实语义是「建容器时我以为版本是多少」，且"以为"的出处是一个没人再动的 .env 值——
+> v0.1.40 的容器写着 `0.1.32` 即由此来。修它需要两处同时动：runner 报自己 `package.json` 的真实版本
+> （env 仅作 override）+ portal 在 heartbeat 里落账（同值不写，免得每心跳刷 `updated_at`）。详见 #404 结案评论。
+>
+> **`image` 那一半已实测修好**：v0.1.41 上线后第一个 reconcile tick 就把两行改写成容器实际引用，全长等值。
+> 核对时注意读数陷阱——用 `right(image,12)` 比 `docker inspect | cut -c8-20` 会把**同一个** digest 的
+> 后 12 位与前 12 位当成两个值，看着像"写平了但写错对象"。**digest 必须比全长。**
