@@ -12,6 +12,7 @@ import * as auth from './auth.js';
 import * as migrate from './migrate.js';
 import * as projects from './projects.js';
 import * as sessions from './sessions.js';
+import * as queuedInputs from './queued-inputs.js'; // #370：对话输入队列
 import * as idempotency from './idempotency.js';
 import * as preview from './preview.js';
 import * as internal from './internal.js';
@@ -923,6 +924,14 @@ async function routeApi(req, res, ctx, url) {
     // issue #114：「AI 改名」——用户主动触发的一次性 LLM 调用（属主鉴权同 PATCH）。
     return handleAiTitle(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/ai-title$/)[1]));
   }
+  // ---- #370：对话输入队列（portal.md §4.3a/§4.3b）。须在 /messages 之前注册（两条路径不同，
+  // 显式排序只为表达「队列入口」与「直发入口」是两条通路，且队列入口的 409 语义更多）。
+  const queuedInputsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/queued-inputs$/);
+  if (queuedInputsMatch) {
+    const sessionId = decodeUuid(queuedInputsMatch[1]);
+    if (req.method === 'POST') return handlePostQueuedInput(req, res, ctx, sessionId);
+    if (req.method === 'DELETE') return handleRecallQueuedInputs(req, res, ctx, sessionId);
+  }
   if (req.method === 'POST' && /^\/api\/sessions\/([^/]+)\/messages$/.test(pathname)) {
     return handlePostMessage(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)[1]));
   }
@@ -1571,6 +1580,13 @@ async function handleGetSession(req, res, ctx, sessionId) {
     limit: url.searchParams.get('limit') || undefined,
     messagesCursor: url.searchParams.get('cursor'),
   });
+  // #370：未投递输入队列快照（`queued_messages`，pi `get_state.queuedMessages` 的等价物）——
+  // 刷新 / 换设备 / 断线重连后队列条唯一的补齐来源（`queue_update` 是 live-only、不落库）。
+  // 只读不加锁；取不到就按空队列渲染：它是补齐面，不许把整个会话详情拖成 5xx。
+  // 挂在 DTO 出口而不是 sessions.getSession 内部的原因见 sessions.js 那条注释（依赖方向）。
+  try {
+    result.session.queued_messages = await queuedInputs.snapshotQueuedInputs(ctx.pool, sessionId);
+  } catch { result.session.queued_messages = { steering: [], follow_up: [] }; }
   return sendJson(res, 200, result);
 }
 
@@ -1615,6 +1631,105 @@ async function handleAiTitle(req, res, ctx, sessionId) {
     notify: internal.notifySessionEvents,
   });
   return sendJson(res, 200, { session: updated });
+}
+
+/**
+ * 队列推送依赖包（#370）。`queued-inputs.js` **不得** import `internal.js`（终态出队的接线方
+ * 就是 internal.js，反向 import 会成环），故 SSE/唤醒一律从这里注入。
+ * `notifyQueueUpdate(sessionId, blocked)`：读一次快照再推——**推送载荷恒为全量快照**（pi
+ * `queue_update` 同口径），增量会让断线重连的客户端永远缺一块。
+ */
+function queuedInputDeps(ctx) {
+  return {
+    notifyRunEnqueued: ({ runId, userId }) => internal.notifyRunEnqueued(userId, { run_id: runId }),
+    notifySteerRequest: (userId, data) => internal.broadcastSteerRequest(userId, data),
+    notifyQueueUpdate: async (sessionId, blocked = null) => {
+      const rows = await queuedInputs.snapshotQueuedInputs(ctx.pool, sessionId);
+      internal.notifyQueueUpdate(sessionId, rows, blocked);
+    },
+  };
+}
+
+/**
+ * POST /api/sessions/:id/queued-inputs（portal.md §4.3a，issue #370）：运行中说话。
+ * body `{content, attachments?, kind:'steer'|'follow_up'}`；可选 `Idempotency-Key`（§1.4）。
+ * **入队还是直发由服务端事务内裁决**（照 pi `agent-session.js:1633`：读完 isStreaming 就分岔）
+ * ⇒ 响应有两种形状：`{posted:{message,run}, queued:null}` 或 `{posted:null, queued:{...}}`。
+ * 错误码：400 `validation_failed`、409 `queue_full`（本站新增，§1.2 清单）。
+ */
+async function handlePostQueuedInput(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  // 校验前置到幂等包装之前（F3 口径，同 handlePostMessage）：非法体 400 且不占幂等占位行。
+  // `kind` 缺省 = `steer`（前端主键 Enter 的动作，也是旧客户端不传 kind 时唯一的合理默认）。
+  // ⚠ 缺省必须在**算 requestHash 之前**定形：否则「不传 kind」与「传 steer」的同 key 重试会被
+  //   判成不同载荷 ⇒ 409 idempotency_key_reuse（同一个坑在 /messages 上踩过）。
+  const kind = queuedInputs.validateQueuedKind(body?.kind ?? 'steer');
+  const { content, attachments } = sessions.validateMessageBody(body);
+  const key = idempotency.normalizeKey(req.headers['idempotency-key']);
+  const endpoint = `POST /api/sessions/${sessionId}/queued-inputs`;
+  const result = await idempotency.executeWithIdempotency(
+    ctx.pool,
+    {
+      userId: session.user.id, endpoint, key,
+      requestHash: idempotency.requestHash({ content, attachments, kind }),
+      log: ctx.log,
+    },
+    async (record) => {
+      // ⚠ 台账里存的必须是**响应体**而不是业务结果：回放路径直接吐台账里的 response，
+      // 不做映射就会给出裸 DB 行（多 session_id/status/attachments…），首次与回放形状不一致。
+      // 包一层让两条路共用同一个 `queuedInputResponse`，形状不可能漂。
+      const recordBody = record
+        ? (client, statusCode, payload) => record(client, statusCode, queuedInputResponse(payload))
+        : undefined;
+      const r = await queuedInputs.enqueueQueuedInput(ctx.pool, {
+        userId: session.user.id, sessionId,
+        kind, content, attachments,
+        record: recordBody,
+        deps: queuedInputDeps(ctx),
+      });
+      // ⚠ `executeWithIdempotency` 约定的 fn 返回形状是 `{statusCode, response}`（不是业务结果），
+      // 带 key 与不带 key 两条路都按这个形状收（不带 key 时它把 `{replayed:false, ...fresh}` 透传）。
+      // 直接返回业务结果是本次测试抓出来的 bug：无 key 时靠对象展开蒙对，带 key 时 `result.posted`
+      // 恒 undefined ⇒ 500。
+      return { statusCode: 202, response: queuedInputResponse(r) };
+    },
+  );
+  // 回放路径按台账里的首次 status_code / response 原样返回（§1.4），形状与首次共用同一映射函数。
+  return sendJson(res, result.statusCode, result.response);
+}
+
+/**
+ * #370：入队结果 → 响应体（唯一一处映射，首次与幂等回放共用）。
+ * 直发那一路与 §4.3 同形（前端复用同一段气泡渲染），入队那一路只回队列条目。
+ */
+function queuedInputResponse({ posted, queued }) {
+  if (posted) return { posted, queued: null };
+  return {
+    posted: null,
+    queued: {
+      id: queued.id,
+      kind: queued.kind,
+      content: queued.content,
+      position: Number(queued.position),
+      created_at: queued.created_at?.toISOString?.() ?? queued.created_at,
+    },
+  };
+}
+
+/**
+ * DELETE /api/sessions/:id/queued-inputs（portal.md §4.3b，= pi `clear_queue`）：整队取回。
+ * 返回 `{steering:[...], follow_up:[...]}` 文本数组（steering 在前，pi 同序），前端回填输入框
+ * （取回文本在前、已打草稿在后、中间空一行——agegr/pi-web `prependText` 的口径）。
+ * 只有整队，**没有单条删除**：pi 明说单条删会和 loop 的 pull 竞态（`clear_queue` 注释）。
+ */
+async function handleRecallQueuedInputs(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  const recalled = await queuedInputs.recallQueuedInputs(ctx.pool, {
+    userId: session.user.id, sessionId, deps: queuedInputDeps(ctx),
+  });
+  return sendJson(res, 200, { recalled });
 }
 
 /**
@@ -1705,6 +1820,12 @@ async function handleStopSession(req, res, ctx, sessionId) {
   try {
     internal.broadcastStopRequest(session.user.id, { run_id: result.run.id, session_id: sessionId });
   } catch { /* 尽力推送：无 worker 在线不影响停止已落库 */ }
+  // #370：停止也可能是**终态产出点**——「queued 且未被领走」那条路 portal 直接把 run 写成 finished
+  // （sessions.js stopSession，#277-A2）。那条 run 永远不会再有 U2 ⇒ 不在这里出队，它排的队就死了。
+  // `running → cancelling` 不在这里投：它的终态出队由 worker 上报后的 finishRun 负责（同 run_end 归属）。
+  if (result.run?.status === 'finished' || result.run?.status === 'failed') {
+    await internal.drainQueueAfterRun(ctx.pool, result.run.id);
+  }
   return sendJson(res, 200, result);
 }
 
