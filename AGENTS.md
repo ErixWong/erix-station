@@ -1615,6 +1615,14 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 **遗留**：上游 [erix-agent #458](https://github.com/ErixWong/erix-agent/issues/458)（把「宿主 `load()` 必须返回折叠后形状」
 从散文变成 exports + 契约判据）、[#415](https://github.com/ErixWong/erix-agent/issues/415)（写侧别再写链，落地并升 pin 后
 **两份镜像的解链闸要同时撤**——`runner/test/store-load-fold.test.js` 与 `portal/test/transcript-fold.test.js` 的源码级哨兵会红提示）。
+**口径范围（2026-10-24 补，别把本节读成「砖化都修完了」）**：本节止血的是**读侧形状**那一类
+（`invalid_messages`：账本装得下、引擎 `load()` 出来的序列过不了校验）。**写侧还有独立的一类**：
+单条折叠记录把 `from:1` 起的全部被折叠消息重发一遍，体积随会话长度线性增长，撞到 portal §9.7 的
+**1 MiB** 单轮上限 ⇒ `400 validation_failed` ⇒ run 以 `persistence_failed` 终局。它**根本不经过
+`load()`**，本节的读侧折叠一点也帮不上；判据也不同（要量 `octet_length` 字节，§1/§5 两条巡检都判不出）。
+上游修在 erix-agent **#461**（0.25.0 `src/compact/fold-archive.js`：sha256 去重 + 256 KiB 夹断），
+本站配套 **#371 / #375**（见 §8.59），巡检与算术余量见 `docs/ops/transcript-ledger-inspection.md` §6。
+
 ### 8.53 收工纪律进 `~/AGENTS.md`：D9 的告知面先行（issue #359 P0c，2026-10-24，分支 `feat-261024-05-git-light-agents-md`）
 
 **交付的只有 D9（§7）的告知面，灯本身没做**：`renderHomeAgentsMd` 的 `## git` 段从 2 行扩到 5 行——
@@ -1813,3 +1821,48 @@ CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一�
 **两条纪律（下次发布当场可执行）**
 - **发布提交必须从 main 的最新提交切、并且先合回 main 再打 tag**。判据一条：`git merge-base --is-ancestor <release-commit> origin/main` 必须为真，否则 tag 就是孤儿。分支直接打 tag（`#369` 那次）等于造一条没人认领的版本线。
 - **发布自查按六文件表逐处 `grep '"version"'`**，判据是「六个文件里所有 `version` 字段等于新版本号，`git show --stat` = 6 files / 9 insertions」——不是"看一眼根 package.json"。
+### 8.59 折叠归档写侧 1 MiB：「取不到原文」与「看不见失败」两面（issue #375 + #371，2026-10-24）
+
+**同一次故障、两处独立缺陷**（真机标本：会话 `9e0c8a17-13c6-41d2-b637-ddc28665ce52`，轮 162 的折叠记录
+≈1.13 MB 被 §9.7 的 1 MiB 闸拒掉，run 以 `persistence_failed` 终局；同一会话 3 行折叠记录占全账本字节
+**53%**）。上游把归档改成有界差分（erix-agent **#461** / 0.25.0）之后，**本站这两处才开始失真**：
+
+- **PR #376（#375，「查看原文」）**：`sessions.js#getFoldedPayload` 只读那一行的归档，而差分被会话级
+  去重吸空时归档是**空的** ⇒ 旧口径一律 `404 folded_payload_not_found` ⇒ 界面「原文已不可用（上游未
+  保留折叠前载荷）」——**假 404**，原文一行都没丢，全在各自的轮行里。改成三路：有 `foldedRoundRange`
+  ⇒ 从轮行重建（`source:'rebuilt'`）；否则退回归档（`source:'archive'`）；两条都空才 404。
+  `truncated` 只给布尔位（先例 §4.4a-1），行数上限 2000 与 U7 recall 同尺。**DTO 向后兼容**（`{round,
+  turns}` 未动，三个新键可选）⇒ 前端不改也不坏。前端半边同时改掉两处说假话的文案：横幅那个
+  `foldedPayloadMessages` 现在含义是「本条记录携带的归档条数」（去重+夹断后），长会话上偏小，
+  所以**有 range 就只报轮范围**；`originalMissing` 改写 + 新增 `originalTruncated`。
+- **PR #377（#371-A/B，「看不见失败」）**：⚠ **本单原先写「库里存着、只是界面不显示」是错的**——
+  `SELECT count(*) FROM run_events WHERE type='persistence_error'` = **0 行**。真因：引擎的落盘失败走
+  **`diagnostics.error`（`orchestrator.js:873`），不走 `onEvent`**，而本站 `runToolLoop` 参数里**从来没有
+  `diagnostics`**，只有 `onPersistenceError`（只拿得到 `Error`，且只落一条 IPC warn）⇒ 事件在源头就丢。
+  而且**不依赖升 pin**：通道与 `fatal:false` 在 pin 的 0.23.0 里就存在（`:895` 宿主端口桥）。
+  四处一起接：runner `diagnostics.error → emitEvent`（映射在 `loopEventPayload`：`fatal` 缺字段算致命、
+  `stack` 刻意不透传、引擎 `runId` 落名 `engine_run_id`）+ 三处集合（`http.js HISTORY_EVENT_TYPES` /
+  前端 `EVENT_TYPES` / `HISTORY_REPLAY_TYPES`，#288 那个「三处独立存亡」的坑第三次发作）+ 前端**只把
+  `fatal === false` 刷中性行**（红面仍归 `run_end` 的 `persistence_failed`，重复刷就是把一件事报两遍）
+  + `portal.md` §5.3 **第 16 行**。#371-B：`MAX_ROUND_BYTES` 改 env（默认仍契约值 1 MiB）并把与上游
+  256 KiB 归档上限的**算术余量**钉成用例（峰值 ≈840 KiB < 1 MiB）。
+
+**取证口径（值得复用）**：全程用 **`octet_length()` 而不是 `length()`**（CJK 一字 3 字节，`length`
+系统性低估约 20%，同一批记录会出现「`length` 判有余量、`octet_length` 已越界」）；并实测 B/估算 token
+≈**2.785** 稳定、非归档部分 ≈**20.4 KB** 稳定 ⇒ 才敢把「满预算 messages ≈565 KiB」写进算术。
+巡检 SQL、标本数字与「为什么不修数据」已落 `docs/ops/transcript-ledger-inspection.md` **§6**；
+`docs/api/portal.md` 补了 **§4.4b**（这个 #189 端点此前在 API 文档里**根本没有条目**）。
+
+**基线**（main = 根 **1516 / 1512 / 0 / 4**（含 `runner/test`）、`runner` 单独 **342**、前端 **48 文件 / 879**）：
+#375 片 ⇒ 根 **1521 / 1517 / 0 / 4**、前端 **885**；#377 片 ⇒ 根 **1529 / 1525 / 0 / 4**、`runner` **347**、
+前端 **883**。两片都 merge 后预期 根 **1534 / 1530**、`runner` **347**、前端 **890**。
+变异（每条先证只改 1 行、跑完立刻还原）：`range` 强制 `null` ⇒ **恰 3 红**（旧 4 格全绿）；`truncated`
+写死 `false` ⇒ **恰 1 红**；摘掉 `worker.js` 的 `diagnostics` 接线 ⇒ **恰 1 红**（源码级哨兵，行为格①
+**不红**——它自己传了 `diagnostics`，这正是「行为面测不到的接线必须单独钉」）；`http.js` 白名单去类型
+⇒ **恰 2 红**；前端 `EVENT_TYPES` 去类型 ⇒ 前端 **3 红** + 跨层哨兵 **1 红**。
+
+**遗留**：#371-C（`record` + `folded_payload` 双列存储去重）等升 pin 后按新归档尺寸重新量收益；
+#371-E（归档去重**命中性**）：erix-agent **0.25.0 已上 npm**（2026-10-25 02:14，上游 PR #463 merged；`latest` 已是 0.25.0），但本站 pin 仍 0.23.0 ⇒ 待升 pin 片后实测判据 `foldedPayloadMeta.dedupedMessages > 0`——本站
+`load()` 现在过 #351 的 `foldLedgerRecords`，消息形状被改写就可能**指纹命不中**，那是要改代码的；
+上游 erix-agent **#462**（resume 按 `foldedThrough` 裁剪）只做性能，不动。⚠ **#415 未修** ⇒
+`runner/lib/transcript-fold.js` 与 `portal/src/transcript-fold.js` 的**解链闸必须留着**。

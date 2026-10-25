@@ -1,6 +1,7 @@
 # 会话账本巡检与修数据口径（`transcript_rounds`）
 
 > 适用版本：erix-agent **0.23.x**（「一条消息一落盘」写侧）。归属：erix-station **#341** / 上游 **erix-agent #415**。
+> §6 是第三种形状（**写侧** 1 MiB 溢出，#371 / #375 / erix-agent #460），与前两类的判据完全不同：**量字节**，不是查形状。
 > 本文只讲**读**（巡检 SQL）与**修数据**（可重放的 UPDATE）口径；**本文不含任何在本次交付里执行过的 SQL**。
 
 ---
@@ -353,3 +354,75 @@ COMMIT;
   `UPDATE transcript_rounds t SET append_seq = b.append_seq FROM transcript_rounds_input_seq_bak_20261024 b WHERE t.id = b.id;`
 - ⚠ 修数据**不会**重跑已失败的 run（当天 4 次 `failed` 需用户重发一次消息）。
 - ⚠ 失败的每次发消息都在账本里留下一条**没被回答的 `:input:` 行**（当天 3 条），下一次 resume 会把它们一起喂给模型——既有口径，不是新缺陷。
+
+---
+
+## 6. 第三种砖化形状：**写侧**单轮记录超 1 MiB（2026-10-24 真机，#371 / #375 / erix-agent #460）
+
+前两类（§1 链式 `partOf`、§5 `:input:` 插队）都是**读侧**砖：账本装得下，但引擎 `load()` 出来的序列
+过不了 `validate_messages` ⇒ `invalid_messages`。这一类完全不同，发生在**写**上：
+
+- 症状：run 以 **`persistence_failed`** 终局（界面红色分隔条），`termination.detail` / 事件里是
+  portal 的那句 **`round 请求体超过 1MB 上限`**（#371-B 之后文案改成报真值 `… 超过 <N> 字节上限`）。
+- 机制：erix-agent 0.23.x 的滑动窗口每次折叠把 `from:1` 起的**全部被折叠消息**重新塞进那一条轮记录的
+  `record.foldedPayload`（`src/compact/sliding-window.js`），体积随会话长度**线性增长**，
+  而 `POST /internal/sessions/:id/transcript` 的单条记录有 **1 MiB** 闸（`portal.md` §9.7；HTTP 层放行
+  1.5 MB，是 §9.7 的校验先撞到）。**400 不在 runner 的重试集合里** ⇒ 一次都不重试，直接终止。
+- ⚠ **§1/§5 的两条巡检都判不出这一类**：链式 `partOf` 0 行、`:input:` 插队 0 行，会话照样砖。
+  必须量**字节**。
+
+### 6.1 巡检项（只读；判据是字节，不是字符）
+
+> ⚠ **必须用 `octet_length()`，不能用 `length()`**：`length()` 数的是**字符**，CJK 一字 3 字节，
+> 真机上系统性低估约 20%（同一批折叠记录：`length` 判「还有余量」，`octet_length` 已越界）。
+> 这是本手册第三条「量错单位就看不见」的坑，与前两条的「测错维度」同族。
+
+```sql
+-- 单个会话的折叠记录体积走势（阈值 1 MiB = 1048576 字节；只看 folded 行）
+SELECT round,
+       octet_length(record::text)        AS record_bytes,
+       octet_length(COALESCE(folded_payload::text, '')) AS folded_payload_bytes
+FROM transcript_rounds
+WHERE transcript_key = '<session-id>' AND folded
+ORDER BY round;
+```
+
+判据与真机标本（会话 `9e0c8a17-13c6-41d2-b637-ddc28665ce52`，2026-10-24）：
+
+| 折叠轮 | `record` 字节 | 说明 |
+|---|---|---|
+| 100 | 569 518 | 已过一半 |
+| 121 | 742 771 | |
+| 137 | 960 703 | 距 1 MiB 只剩 8 % |
+| 162 | ≈1 130 000 | **越界** ⇒ 该轮 `400` ⇒ run `persistence_failed` |
+
+同一会话汇总：`record` 列 6 105 745 B + `folded_payload` 列 2 214 280 B = **8 320 025 B**，其中
+**3 行折叠记录占 53 %**（单行最大 1 900 981 B —— 双列各存一份：`record` 存整条记录，`folded_payload`
+又单列存一遍，见 #371-C）。
+
+```sql
+-- 谁下一个撞闸（按最大折叠记录字节排序；>800 KB 就该盯）
+SELECT transcript_key, count(*) AS rounds,
+       max(octet_length(record::text)) AS max_record_bytes,
+       sum(octet_length(record::text) + octet_length(COALESCE(folded_payload::text,''))) AS total_bytes
+FROM transcript_rounds
+GROUP BY transcript_key ORDER BY max_record_bytes DESC LIMIT 10;
+```
+
+### 6.2 为什么不能「把闸调大」了事（算术要一起看）
+
+单条折叠记录的峰值 = 归档 + 非归档部分 + `messages`：
+`256 KiB`（erix-agent #461 的默认 `ERIX_FOLD_ARCHIVE_MAX_BYTES`）+ ≈`20 KiB`（真机稳定值，#460 标本）
++ ≈`565 KiB`（满预算 `messages`：203 161 估算 token × 实测 2.78 B/估算 token）≈ **840 KiB < 1 MiB**。
+⇒ 契约值 1 MiB **够用**，前提是上游那份归档上限也生效。两个数是**配套的**：把 `MAX_ROUND_BYTES`
+调到 256 KiB 以下就得同时把上游归档上限调小，否则正常折叠也会天天碰闸（这条算术钉在
+`portal/test/internal-round-size-cap.test.js`，`docs/api/portal.md` §9.7）。
+
+### 6.3 与修数据的关系：这一类**不修数据**
+
+- 上游 erix-agent **#461**（0.25.0，`src/compact/fold-archive.js`）已把归档改成「本轮新增的有界差分 +
+  会话级 sha256 去重 + 256 KiB 夹断」⇒ 写侧不再线性增长。升 pin 即根治，**不需要 UPDATE**。
+- 本站配套：#375（「查看原文」不再依赖那条归档，改按 `foldedRoundRange` 从轮行重建）、
+  #371-A（落盘失败要看得见）、#371-B（闸可调，便于真机复现）。
+- 存量已砖会话（如 `9e0c8a17…`）**在升 pin 之前依旧写不进新折叠**——不要试图用「删掉折叠行」救它：
+  折叠行是别处重建原文的指针来源（#375 靠它），删了才是真丢数据。
