@@ -2043,6 +2043,26 @@ offboard 收敛）。它们不在一条调用链上，加第六处时没人会�
 + `runs.trigger_kind` 先测量两周再决定是否合并投递；容器不在 ⇒ **不投不丢** + `blocked='container_not_running'`
 让界面说清「为什么还没发」；按钮叫**「转向」**不叫「打断并转向」（5 个字会在用户最需要按下它的那一刻吓到他）。
 
+**自评轮抓出的四条，全部先写红测再修**（不是合并前的礼貌扫一眼，是真去找「我的测试测不到的地方」）：
+1. **`CLAIM_STALE_MS` 是一根没人读的光纤**（#331 前例）：迁移注释与本模块注释都承诺「`claimed_at` 过期可被
+   重新认领」，但 pick 与 CAS 两条 SQL 都只认 `status='pending'` ⇒ 认领后崩在建 run 之前的那行**永久停
+   在 `delivering`**：不投递、取不回（recall 只动 pending）、还算在 20 条上限里。修法是 pick 与 CAS 共用
+   同一条 CLAIMABLE 判据（pending 或过期 delivering），两处必须同源否则「选得出来却永远抢不到」。
+   ⚠ **这条行为测试天然测不到**：判据在 SQL 里，而假池自己实现了一份同判据的 JS —— 变异「把 pick 改回
+   只认 pending」实测 **25/25 仍然全绿**。必须补源码级断言（`queued-inputs-wiring.test.js`），补完变异才红。
+2. **队列投递出去的 run 前端根本不认识**：本站前端只有两条路知道活跃 run（自己 POST 的响应、会话详情的
+   `active_run_id`），队列投递两条都不走 ⇒ 旧 run 的 run_end 到了就清空运行态，新 run 在跑而状态条显示
+   空闲；更糟的是新 run 自己那条 `run_end` 因 `d.run_id !== activeRunId` 被整条丢弃 ⇒ **终稿永不刷新**。
+   修法：`queue_update` 带 `delivered_run_id`，前端仅在 `activeRunId == null` 时接管（不抢用户正在看的那个）。
+3. **转向会把「重试上一条」点亮**：转向也是 `reason=aborted`，落在 `RUN_FAIL_REASONS` 里 ⇒ 用户刚说「用这句
+   继续」，界面却给一个「把上一条原话重发」。用 `termination.detail === 'steered'` 抑制，**不动 reason 集合
+   本体**（它还管 #306 的补拉 history）。
+4. **`send(override)` 会被队列委派静默吞掉**：`retryLast()` 传的是原文，而运行中那条委派走
+   `sendQueued` 读的是输入框 ⇒ 该重发的那句丢了、反倒把草稿排了队。改成带 override 不进队列，
+   把「不许串味」写进结构而不是依赖调用方永远记得守。
+自评还顺手发现自己写的一个**空操作断言**：`applyRetryFaceOnRunEnd` 没导出，`(store as any).fn?.()` 调的是
+`undefined?.()` ⇒ 改前改后都绿，等于没测。改成驱动真实 `run_end` 帧，并同时钉「普通 abort 仍要亮」。
+
 **判据**：根 **1604 / 1600 / 0 / 4**（基线 1564，本片新增 40 格：判定表 22 + HTTP 面 10 + 接线防漂移 6 +
 迁移 1 + runner termination 1）、前端 **50 文件 / 916**（基线 896，新增 20 格）、`vue-tsc` 全 0。
 被本工单**有意改掉**的旧断言四处，均已在注释写明（`sendDisabled` 运行中不再为 true ×2、ComposerBar 运行中

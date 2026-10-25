@@ -226,18 +226,28 @@ export async function recallQueuedInputs(pool, { userId, sessionId, deps = {} })
 export async function drainQueuedInputs(pool, {
   userId, sessionId, endedRunId, termination, deps = {}, log = console,
 }) {
+  // 「可认领」= pending，**或认领过期**（`delivering` 但 `claimed_at` 已超过 CLAIM_STALE_MS）。
+  // ⚠ 过期重认领必须写在这里，不是只写在注释里：认领与建 run 跨两次提交，中间崩一次，那行就
+  //   永远停在 delivering —— 既不投递（本查询不认它）、也取不回（recall 只动 pending）、还算在
+  //   上限里。那才是真正的「消息蒸发了」，而界面上毫无线索。判据同 run_queue 租约 / materializer
+  //   的 lease 回收（本站已有两处同型先例）。
+  const staleSeconds = Math.max(1, Math.round(CLAIM_STALE_MS / 1000));
+  const CLAIMABLE = `(q.status = 'pending' OR (q.status = 'delivering' AND q.claimed_at < now() - make_interval(secs => $2::int)))`;
   const claim = await pool.query(
     `SELECT q.id, q.kind, q.content, q.attachments
        FROM queued_inputs q
-      WHERE q.session_id = $1 AND q.status = 'pending'
+      WHERE q.session_id = $1
+        AND ${CLAIMABLE}
         -- steering 先、followUp 后（pi peekQueuedMessages 同序）；同组内 FIFO
         AND NOT EXISTS (SELECT 1 FROM queued_inputs q2
-                         WHERE q2.session_id = q.session_id AND q2.status = 'pending'
+                         WHERE q2.session_id = q.session_id
+                           AND (q2.status = 'pending' OR (q2.status = 'delivering'
+                                AND q2.claimed_at < now() - make_interval(secs => $2::int)))
                            AND (CASE q2.kind WHEN 'steer' THEN 0 ELSE 1 END)
                              < (CASE q.kind WHEN 'steer' THEN 0 ELSE 1 END))
       ORDER BY CASE q.kind WHEN 'steer' THEN 0 ELSE 1 END, q.position
       LIMIT 1`,
-    [sessionId],
+    [sessionId, staleSeconds],
   );
   const head = claim.rows?.[0];
   if (!head) return null;
@@ -266,11 +276,14 @@ export async function drainQueuedInputs(pool, {
   }
 
   // 认领（CAS）。0 行 = 有人抢先（另一处终态 / 重放的终态），放弃。
+  // CAS 的准入条件必须与上面的 pick 同一条谓词（含过期重认领），否则「选出来了但永远抢不到」。
   const got = await pool.query(
     `UPDATE queued_inputs SET status = 'delivering', claimed_at = now()
-      WHERE id = $1 AND status = 'pending'
+      WHERE id = $1
+        AND (status = 'pending' OR (status = 'delivering'
+             AND claimed_at < now() - make_interval(secs => $2::int)))
       RETURNING id, kind, content, attachments`,
-    [head.id],
+    [head.id, staleSeconds],
   );
   if (!got.rows?.length) return { blocked: 'claimed_by_other', head: head.kind };
   const row = got.rows[0];
@@ -306,7 +319,11 @@ export async function drainQueuedInputs(pool, {
   if (!done.rows?.length) {
     log.warn?.(`queued_inputs: 投递记账丢失（id=${row.id}），run=${posted?.run?.id}`);
   }
-  await safeNotify(() => deps.notifyQueueUpdate?.(sessionId));
+  // 帧里带 `delivered_run_id`：**这是前端知道「有一个它没亲手发出去的 run」的唯一推送路径**。
+  // 前端平时只能从 POST 响应或会话详情知道活跃 run；队列投递两个都不是 ⇒ 不带上，界面就会
+  // 在「旧 run 已终态、新 run 已在跑」的状态条上显示空闲，且新 run 那条 run_end 因 `isCurrent`
+  // 判假被整条丢掉（终稿不刷新）。
+  await safeNotify(() => deps.notifyQueueUpdate?.(sessionId, null, posted?.run?.id ?? null));
   return { delivered: row.id, kind: row.kind, runId: posted?.run?.id ?? null };
 }
 

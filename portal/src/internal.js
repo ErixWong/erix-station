@@ -401,9 +401,9 @@ export function broadcastSteerRequest(userId, data) {
 }
 
 /** 队列快照 + 推送一步到位（终态出队与各终态产出点用；`blocked` 见 portal.md §5.3）。 */
-export async function notifyQueueUpdateForSession(pool, sessionId, blocked = null) {
+export async function notifyQueueUpdateForSession(pool, sessionId, blocked = null, deliveredRunId = null) {
   const rows = await snapshotQueuedInputs(pool, sessionId);
-  notifyQueueUpdate(sessionId, rows, blocked);
+  notifyQueueUpdate(sessionId, rows, blocked, deliveredRunId);
 }
 
 /**
@@ -418,7 +418,8 @@ export async function drainQueueAfterRun(pool, runId, log = console) {
       log,
       deps: {
         notifyRunEnqueued: ({ runId: newRunId, userId }) => notifyRunEnqueued(userId, { run_id: newRunId }),
-        notifyQueueUpdate: (sessionId, blocked = null) => notifyQueueUpdateForSession(pool, sessionId, blocked),
+        notifyQueueUpdate: (sessionId, blocked = null, deliveredRunId = null) =>
+          notifyQueueUpdateForSession(pool, sessionId, blocked, deliveredRunId),
       },
     });
   } catch (err) {
@@ -434,12 +435,15 @@ export async function drainQueueAfterRun(pool, runId, log = console) {
  * `HISTORY_EVENT_TYPES` / `HISTORY_REPLAY_TYPES`，**刷新后靠会话详情补齐，不靠 SSE 回放**。
  * 载荷两个数组恒为**全量**队列（pi `json.md` 的 `queue_update` 同口径，不是增量）。
  */
-export function notifyQueueUpdate(sessionId, rows, blocked = null) {
+export function notifyQueueUpdate(sessionId, rows, blocked = null, deliveredRunId = null) {
   const steering = rows.steering ?? [];
   const followUp = rows.follow_up ?? [];
   notifySessionEvents(sessionId, [{
     seq: null, ts: new Date().toISOString(), run_id: null, type: 'queue_update',
-    payload: { steering, follow_up: followUp, blocked },
+    // `delivered_run_id`：这一帧存在的原因是「刚投出去一条 ⇒ 起了一个新 run」。前端只有经 POST
+    // 响应或会话详情才知道活跃 run，队列投递两个都不经过 ⇒ 不带这个字段，界面就会在「旧 run
+    // 已终态、新 run 在跑」时显示空闲（而新 run 那条 run_end 因 `isCurrent` 判假被整条丢掉）。
+    payload: { steering, follow_up: followUp, blocked, delivered_run_id: deliveredRunId },
   }]);
 }
 

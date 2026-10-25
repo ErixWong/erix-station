@@ -140,3 +140,33 @@ test('#370 trigger_kind 的取值必须与迁移 CHECK 一致（漂了就是写�
   assert.match(sessionsSrc, /triggerKind[^]{0,200}'user_send'/, "postMessage 缺 trigger_kind 时按 user_send 落库");
   assert.ok(allowed.includes('user_send'), '迁移 CHECK 必须容下默认值 user_send');
 });
+
+// #370：`CLAIM_STALE_MS` 不得是一根没人读的光纤（前例：#331 那根死光纤）。
+// 行为测试在这里**测不到**这条：认领过期的判据在 SQL 里，而假池自己实现了一份同判据的 JS——
+// 产品 SQL 怎么写、假池都照样绿（变异「把 pick 改回只认 pending」实测仍然 25/25 全绿，
+// 这就是证据）。所以判据必须同时在源码上钉一次：pick 与 CAS 两条语句都得带过期重认领，
+// 且那个时长必须由 CLAIM_STALE_MS 推导（不是硬编码第二个数）。
+test('#370 认领过期重认领在 SQL 里真实存在（不是只写在注释与假池里）', () => {
+  const q = read('queued-inputs.js');
+  // pick 走模板变量 CLAIMABLE，所以断言分两段：那个变量本身必须含过期判据 + pick 必须真的用它。
+  const claimable = /const CLAIMABLE = `([\s\S]*?)`;/.exec(q);
+  assert.ok(claimable, 'CLAIMABLE 谓词不见了：pick 与 CAS 的同一性就是靠这个变量维持的');
+  assert.match(claimable[1], /q\.status = 'pending'/, '可认领 = pending');
+  assert.match(claimable[1], /q\.status = 'delivering'/, '…或 delivering');
+  assert.match(claimable[1], /q\.claimed_at < now\(\) - make_interval\(secs => \$2::int\)/, '…且认领已过期');
+
+  const pick = /SELECT q\.id[\s\S]*?ORDER BY/.exec(q);
+  assert.ok(pick, '队头查询（pick）形状变了：重核本断言');
+  assert.match(pick[0], /\$\{CLAIMABLE\}/, 'pick 必须用 CLAIMABLE，不得自己写一条只认 pending 的');
+  assert.match(pick[0], /q2\.status = 'delivering'/, 'pick 的组内自连接也必须认过期 delivering（否则卡住的行会挡住同组后来的）');
+
+  const cas = /UPDATE queued_inputs SET status = 'delivering'[\s\S]*?\[head\.id/.exec(q);
+  assert.ok(cas, '认领 CAS 不见了');
+  assert.match(cas[0], /status = 'delivering'\s*AND claimed_at < now\(\) - make_interval\(secs => \$2::int\)/,
+    'CAS 的准入必须与 pick 同一条判据（选出来了却永远抢不到 = 白跑一轮）');
+  assert.match(q, /const staleSeconds = Math\.max\(1, Math\.round\(CLAIM_STALE_MS \/ 1000\)\)/,
+    '过期时长必须由 CLAIM_STALE_MS 推导（硬编码第二个数就是两处真相）');
+  // 上限计数必须含 delivering：否则「认领后崩掉」那行不计入上限，20 条的红线会被绕过
+  assert.match(q, /COUNT\(\*\)::int[\s\S]*?status IN \('pending', 'delivering'\)/,
+    '上限计数必须含 delivering');
+});

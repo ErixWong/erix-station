@@ -93,9 +93,11 @@ function world(overrides = {}) {
       return { rows: rows.map((q) => ({ id: q.id, kind: q.kind, content: q.content })) };
     }
     // --- 队头查询（含「组内第一条」的 NOT EXISTS 自连接）---
+    // 必须与产品 SQL 同步认「过期的 delivering」（`w.staleIds`），否则这条测试只能证明假池自己一致。
     if (/FROM queued_inputs q/.test(sql)) {
-      const pending = w.queued
-        .filter((q) => q.session_id === params[0] && q.status === 'pending')
+      const claimable = (q) => q.session_id === params[0]
+        && (q.status === 'pending' || (q.status === 'delivering' && w.staleIds?.has(q.id)));
+      const pending = w.queued.filter(claimable)
         .sort((a, b) => (a.kind === b.kind ? a.position - b.position : a.kind === 'steer' ? -1 : 1));
       return { rows: pending[0] ? [{ id: pending[0].id, kind: pending[0].kind, content: pending[0].content, attachments: pending[0].attachments }] : [] };
     }
@@ -105,7 +107,9 @@ function world(overrides = {}) {
     }
     // --- 认领 CAS ---
     if (/SET status = 'delivering'/.test(sql)) {
-      const row = w.queued.find((q) => q.id === params[0] && q.status === 'pending');
+      // CAS 的准入与 pick 同谓词：pending 或（delivering 且已过期）
+      const row = w.queued.find((q) => q.id === params[0]
+        && (q.status === 'pending' || (q.status === 'delivering' && w.staleIds?.has(q.id))));
       if (!row) return { rows: [] };
       row.status = 'delivering';
       return { rows: [{ id: row.id, kind: row.kind, content: row.content, attachments: row.attachments }] };
@@ -386,6 +390,38 @@ test('#370 出队：会话已归档 ⇒ 直接不投（用户已看不见它）'
   const out = await drainWith(w, { termination: { reason: 'end_turn' } });
   assert.equal(out, null);
   assert.equal(w.postCalls.length, 0);
+});
+
+test('#370 出队：认领过期的 delivering 行要被重新捞起（崩溃窗口不许让话永久蒸发）', async () => {
+  // 现场：上一次投递认领了这行（delivering）之后进程崩在建 run 之前 ⇒ claimed_at 停在那里。
+  // 旧实现只认 status='pending' ⇒ 这行既不投（pick 不认）、也取不回（recall 只动 pending）、
+  // 还算在 20 条上限里 —— 迁移注释里承诺的「过期即可被重新认领」是句空话。
+  const w = world();
+  seedQueued(w, [{ kind: 'follow_up', content: '认领后崩掉的那句', status: 'delivering' }]);
+  w.staleIds = new Set(['q0']);   // 假池按 SQL 谓词判过期
+  const out = await drainWith(w, { termination: { reason: 'end_turn' } });
+  assert.equal(out.delivered, 'q0', '过期认领必须能被重投');
+  assert.equal(w.postCalls.length, 1);
+});
+
+test('#370 出队：未过期的 delivering 不算可认领（正在投的那条不许被抢第二次）', async () => {
+  const w = world();
+  seedQueued(w, [{ kind: 'follow_up', content: '别人正在投', status: 'delivering' }]);
+  w.staleIds = new Set();
+  const out = await drainWith(w, { termination: { reason: 'end_turn' } });
+  assert.equal(out, null, '没有可认领的行 ⇒ 直接返回 null');
+  assert.equal(w.postCalls.length, 0);
+});
+
+test('#370 出队：投递成功那一帧必须带 delivered_run_id（否则前端不知道新 run 在跑）', async () => {
+  const w = world();
+  seedQueued(w, [{ kind: 'follow_up', content: '投出去的一句' }]);
+  const seen = [];
+  w.deps.notifyQueueUpdate = (_sid, blocked = null, deliveredRunId = null) => { seen.push({ blocked, deliveredRunId }); };
+  const out = await drainWith(w, { termination: { reason: 'end_turn' } });
+  assert.ok(out.runId, '投递要回传新 run id');
+  assert.deepEqual(seen.at(-1), { blocked: null, deliveredRunId: out.runId },
+    '前端只有 POST 响应与会话详情两条路知道活跃 run，队列投递两条都不走 ⇒ 只能靠这一帧');
 });
 
 test('#370 出队：推送失败不得污染终态响应（best-effort）', async () => {

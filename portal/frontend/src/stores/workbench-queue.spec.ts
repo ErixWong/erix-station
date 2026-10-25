@@ -8,6 +8,7 @@
 //   4. 整队取回回填口径：取回的文在前、已打草稿在后、空行分隔；
 //   5. 入队失败 ⇒ 话回到输入框 + 撤销乐观条目（不许「说了却丢」）。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { flushPromises } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { normalizeQueuedSnapshot, useWorkbenchStore } from './workbench';
 
@@ -204,6 +205,64 @@ describe('workbench store · 输入队列（#370）', () => {
     expect(store.queuedCount).toBe(0);
     // 文案由服务端 message 决定（#294：ApiError.message 是服务端文案的唯一出口），故断其内容而非话本身
     expect(store.entries.some((e) => e.kind === 'syserr' && String((e as { text: string }).text).includes('最多 5 条'))).toBe(true);
+  });
+
+  it('队列投递出去的 new run 被前端接管（评审抓到的 bug：不接管则状态条空闲 + 新 run 的 run_end 被丢）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail();
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.es.activeRunId).toBeNull();
+    // 经真实 SSE 帧驱动（不是直接调 action）：漏接 onQueueUpdate 的第二段就该红
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('queue_update', { steering: [], follow_up: [], blocked: null, delivered_run_id: 'r-new' });
+    expect(store.es.activeRunId).toBe('r-new');
+    expect(store.running).toBe(true);
+  });
+
+  it('本机已有活跃 run 时不抢（别把用户正在看的那个 run 换掉）', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail();
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.es.activeRunId = 'r-mine';
+    store.adoptDeliveredRun('r-other');
+    expect(store.es.activeRunId).toBe('r-mine');
+  });
+
+  // 「重试上一条」的面由**真实 run_end 帧**驱动（不是直接调内部函数——它没导出，直接调会得到
+  // 一个 undefined?.() 的空操作，测了等于没测）。两条一起放：普通 abort 必须亮，转向 abort 必须不亮。
+  async function faceAfterRunEnd(termination: Record<string, unknown>) {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') return detail();
+      if (url.endsWith('/messages')) {
+        return { status: 202, body: { message: { id: 'm1', seq: 1, role: 'user', content: '长任务' }, run: { id: 'r1' } } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.inputValue = '长任务';
+    await store.send();                       // 记 lastSend + activeRunId=r1
+    expect(store.es.activeRunId).toBe('r1');
+    FakeEventSource.instances.at(-1)!.emit('run_end', { run_id: 'r1', termination });
+    await flushPromises();
+    return store.retryAvailable;
+  }
+
+  it('#370 普通 abort 点亮「重试上一条」（既有 #261B 语义不被本片改坏）', async () => {
+    expect(await faceAfterRunEnd({ reason: 'aborted' })).toBe(true);
+  });
+
+  it('#370 转向导致的 abort 不点亮「重试上一条」（用户刚说「用这句继续」，重试是倒退）', async () => {
+    expect(await faceAfterRunEnd({ reason: 'aborted', detail: 'steered' })).toBe(false);
   });
 
   it('切换会话清空队列（会话级状态，不得把上个会话的队列带过去）', async () => {

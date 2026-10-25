@@ -361,11 +361,11 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 | 关键字段 | 语义 |
 |---|---|
 | `kind` | `steer`（**转向**：当前轮跑完就停下，用这句话继续）\| `follow_up`（**排队**：当前任务正常结束后按顺序发）。就这两个值，CHECK 钉死 |
-| `status` | `pending → delivering → delivered`；`pending → recalled`（用户整队取回）；`discarded`（预留位，当前实现不 discard）。**`delivering` 不是装饰**：认领与建 run 跨两次提交（`postMessage` 自开事务并锁 `chat_sessions`，同事务内调它会自锁），中间必须有一个「已被认领」的可见状态，否则并发终态出队会把同一条投两次 |
+| `status` | `pending → delivering → delivered`；`pending → recalled`（用户整队取回）；`discarded`（预留位，当前实现不 discard）。**`delivering` 不是装饰**：认领与建 run 跨两次提交（`postMessage` 自开事务并锁 `chat_sessions`，同事务内调它会自锁），中间必须有一个「已被认领」的可见状态，否则并发终态出队会把同一条投两次。`delivering → delivered` 那一次推 `queue_update` 额外带 `delivered_run_id`（portal.md §5.3 第 17 类）——那是前端知道「有一个它没亲手发出去的 run」的**唯一推送路径**（它平时只能从 POST 响应或会话详情得知活跃 run，队列投递两条都不经过）|
 | `position` | `bigserial`——FIFO 的真相。不用 `now()`：同毫秒入队也要有确定先后，且不依赖时钟 |
 | `interrupted_run_id` | 仅 `steer`：它入队时**打断**的那个 run。**「这次 abort 是转向还是用户按了停止」的唯一判据**——所以 run 状态机零改动（不新增 status、不新增 termination reason），判定完全落在队列侧 |
 | `run_id` | 投递成功后它触发的那个 run |
-| `claimed_at` | 进入 `delivering` 的时刻；过期（`CLAIM_STALE_MS`）可被重新认领，覆盖「认领了但崩在建 run 之前」的窗口 |
+| `claimed_at` | 进入 `delivering` 的时刻。**过期（`CLAIM_STALE_MS` = 60s，服务端 `make_interval` 换算）可被重新认领**——判据同时写在出队扫描的 pick 与认领 CAS 两条语句里（两处必须同判据，否则「选得出来却永远抢不到」）。这条判据的存在理由：认领与建 run 跨两次提交，中间崩一次那行就停在 `delivering`——既不投递、也取不回（`recall` 只动 `pending`）、还算在 20 条上限里，界面上毫无线索。**判据在 SQL 里，单测的假池自己实现了一份同判据的 JS ⇒ 行为测试测不到它**，故另有源码级断言（`queued-inputs-wiring.test.js`；变异「pick 改回只认 pending」实测必须红，前例见 #331 那根死光纤）|
 
 **为什么落 DB 而不是照抄 pi 的内存队列**（`pi-agent-core` `Agent.steeringQueue`）：pi 的队列随进程消失（其自身注释："dead wrapper (no state) means the queue is gone"），而本站不变式 3「DB 是状态真相」+ 容器是牲口 ⇒ 用户打进来的话不能随进程或页面消失。实测症状：关页面 = 那句话蒸发；容器重启 = 排好的队全没了。
 
@@ -466,7 +466,7 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
 | `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
 | `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制，attempts+1）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收（A1/A2 定稿）：`runs.status='cancelling'` → `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
-| `queued_inputs.status` | `pending / delivering / delivered / recalled / discarded` | `pending` 由 `POST …/queued-inputs` 产生（会话行锁内，同事务判活跃 run）；`delivering` 由终态出队的 CAS 认领产生（0 行 = 被别人抢先，放弃本轮）；`delivered` 由投递成功后回写（带 `run_id`）；`recalled` 由 `DELETE …/queued-inputs` 整队取回产生；投递失败**退回 `pending`**（下一次终态再来），只有会话已 404 才 `discarded`。消费方：会话详情 `queued_messages` 快照、`queue_update` SSE、上限校验计数 | 
+| `queued_inputs.status` | `pending / delivering / delivered / recalled / discarded` | `pending` 由 `POST …/queued-inputs` 产生（会话行锁内，同事务判活跃 run）；`delivering` 由终态出队的 CAS 认领产生（0 行 = 被别人抢先，放弃本轮）；`delivered` 由投递成功后回写（带 `run_id`）；`recalled` 由 `DELETE …/queued-inputs` 整队取回产生；投递失败**退回 `pending`**（下一次终态再来），只有会话已 404 才 `discarded`。消费方：会话详情 `queued_messages` 快照、`queue_update` SSE、上限校验计数。**过期 `delivering` 算可认领**（判据见 §1.29 `claimed_at` 行）且**算在上限里** | 
 | `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
 
 ### 2.5 `route_outbox.state`

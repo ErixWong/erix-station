@@ -351,6 +351,8 @@ export interface EventStreamHooks {
     steering?: Array<{ id: string; content: string }> | string[];
     follow_up?: Array<{ id: string; content: string }> | string[];
     blocked?: string | null;
+    /** 本帧存在的原因是一条队列输入被投出去了 ⇒ 这个 run 刚被建起来。 */
+    delivered_run_id?: string | null;
   } & Record<string, unknown>) => void;
   /**
    * issue #282：**每一帧**事件的旁路通知（不改变任何既有分发语义，纯观察面）。

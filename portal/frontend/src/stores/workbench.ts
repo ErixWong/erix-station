@@ -362,10 +362,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
     // issue #370：队列快照帧 ⇒ 整体覆盖本地队列（服务端是唯一真相）。
-    onQueueUpdate: (d) => applyQueueSnapshot(
-      { steering: d?.steering, follow_up: d?.follow_up },
-      typeof d?.blocked === 'string' ? d.blocked : null,
-    ),
+    onQueueUpdate: (d) => {
+      applyQueueSnapshot(
+        { steering: d?.steering, follow_up: d?.follow_up },
+        typeof d?.blocked === 'string' ? d.blocked : null,
+      );
+      adoptDeliveredRun(d?.delivered_run_id);
+    },
     onSessionUpdated: (d) => {
       const sid = d.session_id != null ? String(d.session_id) : sessionId.value;
       if (typeof d.title !== 'string' || sid == null) return;
@@ -419,6 +422,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
    */
   function applyRetryFaceOnRunEnd(d: RunEndPayload) {
     const last = lastSend.value;
+    // issue #370：转向导致的 abort 也落在 `RUN_FAIL_REASONS`（reason=aborted）里，但**不该**点亮
+    // 「重试上一条」——用户刚刚亲手说了「用这句话继续」，再给一个「把上一条原话再发一遍」的按钮
+    // 是倒退，而且会烧掉他刚排的那条转向。判据只用 `detail === 'steered'`（runner 补的那个字段），
+    // **不改 reason 集合本体**（它还要管「终态后补拉 history」，#306）。
+    if (d.termination?.detail === 'steered') {
+      retryAvailable.value = false;
+      return;
+    }
     retryAvailable.value = RUN_FAIL_REASONS.has(d.termination?.reason ?? '')
       && last != null && last.sessionId === sessionId.value;
   }
@@ -1140,7 +1151,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // issue #370：运行中的 Enter 不再是 no-op（旧行为：`es.activeRunId` 非空直接 return，用户以为
     // 发出去了、其实什么都没发生），而是**转向**。守卫顺序也因此变成「先判有没有内容，再判在不在跑」。
     // `retryLast()` 走的是 override 分支且只在无活跃 run 时可见，不会被这条改到行为。
-    if (es.activeRunId.value) return sendQueued('steer');
+    // 带 override 的调用（唯一调用方是 retryLast）**不进队列**：那条语义是「把这句原话重发一次」，
+    // 而队列的语义是「把输入框里刚打的话排起来」。让 override 落进队列会静默丢掉要重发的那句、
+    // 反而把输入框里的草稿排队——两件事都不是用户点的。retryLast 本来就守 `!activeRunId`，这里是
+    // 把「不许串味」写死在结构里，而不是依赖调用方永远记得守。
+    if (es.activeRunId.value && !override) return sendQueued('steer');
     // issue #84 P5 真机验收修正：选了目录但未打开会话时，首条发送自动建会话（原实现 !sid 静默返回，
     // 用户「选目录→打字→发送」没有任何反馈）。目录未选中（空 projects）才保持 no-op。
     if (!sessionId.value) {
@@ -1228,6 +1243,22 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function applyQueueSnapshot(snapshot: unknown, blocked: string | null = null) {
     queuedInputs.value = normalizeQueuedSnapshot(snapshot);
     queueBlocked.value = blocked;
+  }
+
+  /**
+   * #370 评审修的那个 bug：队列投出去的那句话起了一个**前端从没亲手发出去**的新 run，而本站
+   * 只有两条路知道活跃 run（POST 响应、会话详情）——队列投递两条都不走。不接管就会出现：
+   * 旧 run 的 run_end 到了（运行态清空）⇒ 新 run 在跑但状态条显示空闲；更糟的是新 run 自己那条
+   * `run_end` 因 `d.run_id !== activeRunId` 被判「不是当前 run」整条丢弃 ⇒ **终稿永不刷新**。
+   * 只在本机没有活跃 run 时接管：别把用户正在看的另一个 run 抢掉（同页会话切换/竞态）。
+   */
+  function adoptDeliveredRun(runId: unknown) {
+    if (typeof runId !== 'string' || runId === '') return;
+    if (es.activeRunId.value != null) return;
+    es.activeRunId.value = runId;
+    // 起跑时刻未知（是服务端起的）⇒ startedAt=null，动量状态条不出「从我看到它才起算」的假时长
+    // （口径与 applyServerRunState 的中途打开分支逐字一致）。
+    momentum.beginRun(runId, null);
   }
 
   /**
@@ -1382,7 +1413,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, addPartialOutput, addRunTermination, send, stop, refreshSession,
     // issue #370：运行中说话（steer / follow_up 入队）与整队取回
-    sendQueued, recallQueue, applyQueueSnapshot,
+    sendQueued, recallQueue, applyQueueSnapshot, adoptDeliveredRun,
     loadOlderMessages,
     pushStreamError,
     // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。
