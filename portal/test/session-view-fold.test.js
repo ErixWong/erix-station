@@ -350,8 +350,16 @@ function stubThreeToolProvider() {
   };
 }
 
-/** 真跑一次 0.23 `runToolLoop`（3 个并行工具），返回引擎落下的原始行；顺带断言 `partOf` 真的是链。 */
-async function runRealChainLedger() {
+/**
+ * 真跑一次 `runToolLoop`（3 个并行工具），返回引擎落下的原始行。
+ *
+ * ⚠ **erix-agent 0.25.0 起了结形状变了**：上游把**写侧**修好了（`orchestrator.js:3927`
+ * `if (toolResultRowKey === undefined && …)` —— 只在**第一个**分片上登记 key），所以三片的
+ * `partOf` 现在**都直指聚合首片**，不再串成链。本函数因此钉的是「新账本不再产链」。
+ * 而**读侧** `message-rows.js` 的 `parts.set` 仍恰好一处（分片分支不登记）⇒ **存量 0.23 账本里的链
+ * 上游依旧解不了** ⇒ 本站那份解链闸必须留着，判据见下面那条「存量链式形状」用例。
+ */
+async function runRealEngineLedger() {
   const records = {};
   await runToolLoop({
     provider: stubThreeToolProvider(),
@@ -369,13 +377,24 @@ async function runRealChainLedger() {
   const rows = records[SESSION_ID] ?? [];
   const shards = rows.filter((row) => typeof row.partOf === 'string');
   assert.equal(shards.length, 2, '前置条件：3 个工具结果里后两条必须带 partOf');
-  assert.equal(shards[1].partOf, shards[0].dedupKey,
-    '前置条件：第 3 个工具结果的 partOf 必须指向**前一片分片行**（链），否则本条测不到解链');
+  // 0.25.0 的真形状：两片都指向**同一条**（聚合首片 `msg:<round>:1`），不是前一片。
+  assert.equal(shards[1].partOf, shards[0].partOf,
+    'erix-agent 0.25.0 写侧已修 #415：后一片必须与前一片指向同一个链头。'
+    + '它若变回「指前一片」= 上游又写链了 ⇒ 本站解链正好兜住，但这条要先红给你看');
   return rows;
 }
 
-test('#341 投影面贯通：真 0.23 链式三分片账本 ⇒ 工具卡片带 resultPreview，且折叠后是 1 条聚合 tool_result', async () => {
-  const rows = await runRealChainLedger();
+/** 把真账本改回 **0.23 存量形状**（第 3 片的 `partOf` 指前一片分片行）= 现网老会话的样子。 */
+function chainify(rows) {
+  const shards = rows.filter((row) => typeof row.partOf === 'string');
+  const copy = rows.map((row) => ({ ...row }));
+  const target = copy.find((row) => row.dedupKey === shards[1].dedupKey);
+  target.partOf = shards[0].dedupKey;
+  return copy;
+}
+
+test('#341 投影面贯通（0.25 新账本：partOf 直指链头）⇒ 工具卡片带 resultPreview，折叠后是 1 条聚合 tool_result', async () => {
+  const rows = await runRealEngineLedger();
   const transcriptRows = [inputRow(), ...toTranscriptRows(rows)];
 
   // ① 用户可见面：三张工具卡片都要带执行事实（刷新后不该退化成 `…`）。
@@ -401,4 +420,31 @@ test('#341 投影面贯通：真 0.23 链式三分片账本 ⇒ 工具卡片带 
     + ' —— 3 条 = 链没解开（第 3 片被当成独立消息）');
   assert.deepEqual(carrier.record.messages[1].content.map((block) => block.tool_use_id), ['ok1', 'ok2', 'bad1'],
     '聚合消息必须按 seq 含全部 3 个 tool_result');
+});
+
+test('#341 存量 0.23 链式账本（手工还原的形状）⇒ 本站解链闸仍必须把它折回 1 条聚合消息', async () => {
+  // 为什么这条要单独存在：erix-agent 0.25.0 修的是**写侧**，**读侧 `parts.set` 仍恰好一处**
+  // ⇒ 现网 0.23 时代落下的链式行，上游读侧依旧解不了（`portal/test/transcript-fold.test.js` 的
+  // 「上游能否解链」哨兵钉着这件事）。撤掉本站的闸，这些老会话在下一次 resume 时就会
+  // `invalid_messages`（§8.52 那类砖化）。所以判据必须由**合成夹具**驱动，不能依赖引擎版本。
+  const rows = await runRealEngineLedger();
+  const chained = chainify(rows);
+  const shards = chained.filter((row) => typeof row.partOf === 'string');
+  assert.equal(shards[1].partOf, shards[0].dedupKey, '夹具自证：第 3 片必须指前一片（真 0.23 的形状）');
+
+  const foldedRows = foldTranscriptRows([inputRow(), ...toTranscriptRows(chained)].sort(compareTranscriptRows), {
+    recordOf: (row) => recordForProjection(row).record,
+  });
+  const carrier = foldedRows.find((row) => row.dedup_key === `${SESSION_ID}:engine:round:1`);
+  assert.ok(carrier, '载体行必须在');
+  assert.equal(carrier.record.messages.length, 2,
+    '解链后必须恰好 2 条消息（1 assistant + 1 条含三个 tool_result 的聚合 user）。'
+    + '撤掉 `planFold` 里那行 `parts.set(key, partTargetIndex)` ⇒ 这里变 3 条，本用例红');
+  const aggregate = carrier.record.messages[1];
+  assert.equal(aggregate.role, 'user');
+  assert.equal(aggregate.content.filter((block) => block.type === 'tool_result').length, 3,
+    '三个 tool_result 必须并成**同一条** user 消息（分开就是 invalid_messages 的形状）');
+  // 用户可见面同样不许退化
+  const calls = callsById(project([inputRow(), ...toTranscriptRows(chained)]));
+  assert.deepEqual([...calls.keys()].sort(), ['bad1', 'ok1', 'ok2']);
 });

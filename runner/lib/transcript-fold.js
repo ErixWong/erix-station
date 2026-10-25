@@ -25,9 +25,42 @@
 // **故意不折**：portal 侧 `transcript-store.js` 的 `load`/`loadByDedupKey`/`loadMaxRound`（发消息
 // 预写幂等面要看见自己那条 `:input:` 行）、`session-text.js` 的单行点查——与本模块无关。
 
+import { isDeepStrictEqual } from 'node:util';
+
 // ===== SHARED-FOLD-CORE BEGIN =====
 /** 消息行的 `kind` 字面值（上游 `message-rows.js#MESSAGE_ROW_KIND` 同值）。 */
 export const MESSAGE_ROW_KIND = 'message';
+
+// erix-agent **0.25.0**（上游 #439 A）给折叠加了两件事，本站**逐字跟着改**（对拍用例
+// `portal/test/transcript-fold.test.js` 与 `runner/test/store-load-fold.test.js` 会立刻抓到漂移）：
+//   · **`stampRowTs`**：折回载体行时，把**该行自己的行级 `ts`** 盖到它携带的消息上（消息已带 `ts`
+//     就不动，幂等）。病根：写侧每条消息落盘都带行级 `ts`，但折叠只把 `messages` 拼回载体行
+//     ⇒ 消息成型时刻丢失，而载体行的 `ts` 是**轮行**落盘时刻 ⇒ 被折过的消息在时间线上没有时刻。
+//     口径与 #430 同向：`ts` 取该逻辑消息**首片行**的 `ts`；行上没有 `ts` ⇒ **缺键**，不写
+//     `undefined`、不猜值。⚠ 只在**非分片**那一支盖（上游就是如此，分片支路原样不动）。
+//   · **已折过的幂等丢弃**：载体行本来就有正文、且与这次要折进去的**逐字段相等（忽略 `ts`）**
+//     ⇒ 这批消息行是**重复副本**，丢掉、不再往载体上二次追加（否则同一轮正文翻倍）。
+//     比较时两边都过 `withoutJournalTs` 剥掉 `ts`——行级时间戳本来就不属于消息身份，
+//     不剥的话「同一份内容两次落盘时间不同」会被判成不同正文 ⇒ 又翻一倍。
+/**
+ * 消息已有 `ts`（非空字符串）就不动；否则把行级 `ts` 盖上。行上没有 `ts` ⇒ 原样返回（缺键，不猜）。
+ * 与上游 `stampRowTs` 同式。
+ */
+function stampRowTs(message, row) {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return message;
+  if (typeof message.ts === 'string' && message.ts !== '') return message;
+  const ts = typeof row?.ts === 'string' ? row.ts : '';
+  return ts === '' ? message : { ...message, ts };
+}
+
+/** 剥掉 `ts` 的浅拷贝（只用于比较：行级时间戳不是消息身份的一部分）。与上游 `withoutJournalTs` 同式。 */
+function withoutJournalTs(message) {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return message;
+  if (typeof message.ts !== 'string') return message;
+  const rest = { ...message };
+  delete rest.ts;
+  return rest;
+}
 
 /**
  * 可折叠的消息行：`kind === "message"` 且带轮内序号 `seq` 且带非空 `messages`。
@@ -125,8 +158,13 @@ function planFold(records, keyOf) {
         continue;
       }
       if (key !== '') parts.set(key, messages.length);
-      messages.push(...row.messages);
+      messages.push(...row.messages.map((message) => stampRowTs(message, row))); // 0.25.0 #439 A：盖行级 ts
     }
+    // 0.25.0：载体行本来就有这批正文（比较时忽略行级 `ts`）⇒ 消息行是**重复副本**，丢掉不二次追加。
+    const carrier = records[group.carrier];
+    const existing = Array.isArray(carrier?.messages) ? carrier.messages : [];
+    if (existing.length > 0
+      && isDeepStrictEqual(existing.map(withoutJournalTs), messages.map(withoutJournalTs))) continue;
     attached.set(group.carrier, messages);
   }
   if (consumed.size === 0) return null;

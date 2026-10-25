@@ -47,16 +47,35 @@ test('#337 咽喉点：`projectSessionMessages` 在喂投影**之前**折叠账�
     '折叠必须发生在逐行投影之前（顺序反了等于没折）');
 });
 
-test('#337 预写幂等面**不折**：`transcript-store.js` 的 load / 两个点查探针（反方向）', () => {
+// 口径在 **erix-agent 0.25.0** 翻了一次向：上游 #458 把「宿主 `store.load()` 必须返回折叠后形状」
+// 从散文变成**随包契约断言**（`test/contract/transcript-store.js` 的 #401 / #458 那四格），
+// 不折 = 宿主违约（实测翻红四格）。所以本单从「load 也不许折」改成**「load 必须折、两个点查探针
+// 照旧不许折」**——两个方向都得钉，单边钉住就会有人改一半。
+// #337 当年的顾虑（`appendUserTurn` 要看得见自己那条 `:input:` 行）没有作废，是靠两条事实同时成立的：
+//   ① 幂等判据实际走 `loadByDedupKey` 点查（0.17.0 #157 起），那条路仍然读原始行；
+//   ② `:input:` 行不带 `kind:"message"` 也不带 `seq` ⇒ `isFoldableMessageRow` 判不通过，
+//      折完它仍在数组里（行为判据在 `portal/test/transcript-store.test.js`）。
+test('#337+#458 折叠方向：`transcript-store.js` 的 load **必须折**，两个点查探针**必须不折**', () => {
   const src = read('transcript-store.js');
-  // 三个承重方法仍在（改名/删掉时这条护栏不能变成空转）。
-  assert.match(src, /async load\(key\)/, 'transcript-store 的 load 必须还在');
-  assert.match(src, /async loadByDedupKey\(key, dedupKey\)/, '点查探针①必须还在');
-  assert.match(src, /async loadMaxRound\(key\)/, '点查探针②必须还在');
+  const at = (header) => {
+    const index = src.indexOf(header);
+    assert.ok(index >= 0, `transcript-store.js 应包含「${header}」（改名/删掉时这条护栏不能空转）`);
+    return index;
+  };
+  const loadAt = at('async load(key)');
+  const probe1At = at('async loadByDedupKey(key, dedupKey)');
+  const probe2At = at('async loadMaxRound(key)');
+  assert.ok(loadAt < probe1At && probe1At < probe2At, '三个方法的源码顺序与预期一致（否则下面的切片失效）');
 
-  assert.doesNotMatch(src, /transcript-fold/, 'transcript-store 不得引用折叠模块');
-  assert.doesNotMatch(src, FOLD_CALL,
-    '预写面不得折叠：引擎 `appendUserTurn` 的幂等判据是「load/点查能看见自己那条 :input: 行」');
+  const loadBody = src.slice(loadAt, probe1At);
+  const probe1Body = src.slice(probe1At, probe2At);
+  const probe2Body = src.slice(probe2At);
+
+  assert.match(loadBody, /\bfoldLedgerRecords\s*\(/,
+    '0.25.0 契约判据：load() 必须返回**折叠后**形状（撤掉它 ⇒ 随包契约 #401/#458 那四格红）');
+  assert.doesNotMatch(probe1Body, FOLD_CALL,
+    '点查探针①必须读原始行：`appendUserTurn` 的幂等判据靠它，且这是上游「两个点查探针不折叠」的同口径');
+  assert.doesNotMatch(probe2Body, FOLD_CALL, '点查探针②同理（成对探针只认原始行）');
 });
 
 test('#337 `fetchInputTextByMessageId` **不折**（点查单行 `:input:` 行，天生不需要折）', () => {
@@ -85,8 +104,11 @@ test('#337 折叠模块只有一个消费点（`session-view.js`），别处引�
   const importers = files
     .filter((name) => name !== 'transcript-fold.js')
     .filter((name) => read(name).includes('transcript-fold.js'));
-  assert.deepEqual(importers, ['session-view.js'],
-    `只允许咽喉点引用 transcript-fold.js，实际：${importers.join(', ')}`);
+  // 允许清单在 0.25.0 从 1 个变 2 个：`transcript-store.js` 的 `load()` 现在也必须折
+  //（上游 #458 的随包契约），口径必须与咽喉点**同一份** `planFold` —— 这正是「两处都用同一模块」
+  // 的理由，不是「多一个消费点就违规」。名单外的新引用仍然红：折叠口径只许有一份。
+  assert.deepEqual(importers, ['session-view.js', 'transcript-store.js'],
+    `只允许这两个消费点引用 transcript-fold.js（口径只此一份），实际：${importers.join(', ')}`);
 });
 
 test('#351 引擎面的折叠在 runner 侧（`runner/lib/store.js`），portal 端点面**不得**再折一遍', () => {

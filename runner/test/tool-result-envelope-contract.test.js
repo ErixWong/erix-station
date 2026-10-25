@@ -184,8 +184,10 @@ test('普通成功块上 erix.executionStatus 缺席（不是空串、不是 ok 
   assert.equal(Object.hasOwn(block.erix, 'executionStatus'), false,
     '常量说 writtenFor="special states only"，普通块上必须是**缺席**');
   assert.equal(block.erix.executionStatus, undefined);
+  // 与前端 `toolSummary.ts` 的 SPECIAL_EXECUTION_STATUSES 逐项一致：**上游加值这里先红**，
+  // 0.25.0 实测新增第三个 `rejected`（引数解析失败，工具从未执行，上游 #409）。
   assert.deepEqual(TOOL_RESULT_CONTRACT.engine.fields.executionStatus.presentValues,
-    ['intercepted', 'interrupted']);
+    ['intercepted', 'interrupted', 'rejected']);
 
   // 我们的 payload 映射不得因为「字段不在」就报错或造出异常值
   const payload = loopEventPayload({ type: 'tool_result', round: 1, toolResult: block });

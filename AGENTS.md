@@ -1614,7 +1614,8 @@ digest：portal `8a0b7b7c…` / imageId `8b3dec6d…`；fde `48c72116…` / imag
 
 **遗留**：上游 [erix-agent #458](https://github.com/ErixWong/erix-agent/issues/458)（把「宿主 `load()` 必须返回折叠后形状」
 从散文变成 exports + 契约判据）、[#415](https://github.com/ErixWong/erix-agent/issues/415)（写侧别再写链，落地并升 pin 后
-**两份镜像的解链闸要同时撤**——`runner/test/store-load-fold.test.js` 与 `portal/test/transcript-fold.test.js` 的源码级哨兵会红提示）。
+**两份镜像的解链闸要同时撤**——`runner/test/store-load-fold.test.js` 与 `portal/test/transcript-fold.test.js` 的源码级哨兵会红提示。
+**2026-10-25 更新：这条还没到撤的时候**——0.25.0 只修了**写侧**（新账本不再产链），读侧 `parts.set` 仍恰好一处 ⇒ 存量 0.23 链式行照旧需要本站的闸。真判据是「巡检 SQL 查出存量链式 `partOf` 清零」，不是「上游版本号涨了」。详见 §8.60 的判定表。）
 **口径范围（2026-10-24 补，别把本节读成「砖化都修完了」）**：本节止血的是**读侧形状**那一类
 （`invalid_messages`：账本装得下、引擎 `load()` 出来的序列过不了校验）。**写侧还有独立的一类**：
 单条折叠记录把 `from:1` 起的全部被折叠消息重发一遍，体积随会话长度线性增长，撞到 portal §9.7 的
@@ -1861,8 +1862,45 @@ CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一�
 **不红**——它自己传了 `diagnostics`，这正是「行为面测不到的接线必须单独钉」）；`http.js` 白名单去类型
 ⇒ **恰 2 红**；前端 `EVENT_TYPES` 去类型 ⇒ 前端 **3 红** + 跨层哨兵 **1 红**。
 
-**遗留**：#371-C（`record` + `folded_payload` 双列存储去重）等升 pin 后按新归档尺寸重新量收益；
+**遗留更新（2026-10-25，erix-agent 0.25.0 已升 pin，见 §8.60）**：**#371-E 已实测交付**——会话级归档去重
+在**本站折叠后的 `load()` 形状上命中**（三条老正文 3/3 命中；反向对照「剥掉 `foldedPayload`」⇒ 命中归零），
+判据落在 `portal/test/fold-archive-dedup-on-station-load.test.js`。机制：引擎 pre-seed 扫的是
+`record.foldedPayload`，而本站折叠从不改写它（③ 格钉住）。**遗留**：#371-C（`record` + `folded_payload` 双列存储去重）等按新归档尺寸重新量收益；
 #371-E（归档去重**命中性**）：erix-agent **0.25.0 已上 npm**（2026-10-25 02:14，上游 PR #463 merged；`latest` 已是 0.25.0），但本站 pin 仍 0.23.0 ⇒ 待升 pin 片后实测判据 `foldedPayloadMeta.dedupedMessages > 0`——本站
 `load()` 现在过 #351 的 `foldLedgerRecords`，消息形状被改写就可能**指纹命不中**，那是要改代码的；
 上游 erix-agent **#462**（resume 按 `foldedThrough` 裁剪）只做性能，不动。⚠ **#415 未修** ⇒
 `runner/lib/transcript-fold.js` 与 `portal/src/transcript-fold.js` 的**解链闸必须留着**。
+
+### 8.60 引擎升 pin 0.23.0 → **0.25.0**：契约把三处散文判据变成了红格（2026-10-25，分支 `feat-261025-01-erix-agent-0.25.0`）
+
+**这**不是**「只追版本号」的升级**（对比 §8.53 的 0.22→0.23 那一票：那次 `diff -r` 关键面逐字节相同）。
+0.24/0.25 改了 **52 个 src 文件**、新增 6 个模块（`fold-archive` / `pending-tool-result` / `deliverables` /
+`resume-notice` / `slot-provider` / `normalization` / `text/repair-json`），并把三条原先只写在散文里的
+宿主义务**变成随包契约断言** ⇒ 升级当场翻红 **14 格**，每一格都对应一处本站的真实欠账：
+
+| 红格 | 上游改了什么 | 本站怎么办（**不是**把断言改绿） |
+|---|---|---|
+| `station-portal-adapter` 折叠 ×4（`test/contract/transcript-store.js` #401/#458） | 上游 #458 把「**宿主 `store.load()` 必须返回折叠后形状**」变成契约判据 | `portal/src/transcript-store.js#load` 接 `foldLedgerRecords`。**#337 当年「故意不折」的顾虑没作废**：幂等判据实际走 `loadByDedupKey` 点查（照旧不折），且 `:input:` 行不带 `kind`/`seq` 根本折不走 ⇒ 两条同时成立，`transcript-fold-wiring.test.js` 把**两个方向**都钉住（load 必须折 / 两个探针必须不折） |
+| 折叠对拍 ×4（`transcript-fold.test.js` / `store-load-fold.test.js`） | `message-rows.js` 加 `stampRowTs`（#439 A：折叠时把**行级 `ts`** 盖到消息上，只盖非分片支路）+ 「载体已有同一批正文（忽略 `ts`）⇒ 消息行当**重复副本**丢弃」的幂等判据 | 两份镜像（`portal/src/transcript-fold.js` / `runner/lib/transcript-fold.js`）**同时**加 `stampRowTs` / `withoutJournalTs` / 幂等丢弃，SHARED 区仍逐字节一致 |
+| `#309 上游前提` | wrap-up 的 judge 请求从 `orchestrator.js:3474` 搬进 `reflection/wrapup.js`，改写成 spread | **副作用没变**（宿主 `maxTokens` 仍继承）⇒ 换锚点不换判据，注释写明「搬家要跟着换、不许删断言」 |
+| `executionStatus` 枚举 | `tool-fact.js` 加第三个值 **`rejected`**（引数解析失败，工具**从未执行**，上游 #409） | 前端 `SPECIAL_EXECUTION_STATUSES` 加值 + 两处注释「两种」改口径；这张表**必须跟着上游常量走**，手抄已经错过一次 |
+| `tree` 首行 ×3 | 上游自己实现 #358：**非根目标首行 = 相对根的完整路径**（`nested/sub/`），并且不存在的路径抛的是引擎自己的「路径不存在」而非 fs 的 `ENOENT` | ①本站入口判据 `isRootFormPath` 有个**潜伏真 bug**：`startsWith('./')` 把 `./nested/sub` 当成根 ⇒ 整棵树退化成根目录（模型看到**错目录的树**）。0.23 时代上游自己也不区分所以没炸，是上游的修正把它**揭出来**了 ⇒ 改成逐段判；②两条本站旧断言按新契约改写（`deeper/`→`sub/deeper/`、`code==='ENOENT'`→文案含「路径不存在」） |
+
+**#415 的判定（重要，别照字面撤闸）**：0.25.0 修的是**写侧**（`orchestrator.js:3927`
+`if (toolResultRowKey === undefined && …)` ⇒ 新账本的 `partOf` 全部直指链头），但**读侧
+`message-rows.js` 的 `parts.set` 仍恰好一处**（分片分支照旧不登记）⇒ **现网 0.23 时代的链式行上游依旧解不了**。
+结论：**两份镜像的解链闸必须留着**，服务对象从「所有链」缩成「存量链」。判据因此从「依赖引擎真产出链」
+改成**合成夹具驱动**：`portal/test/session-view-fold.test.js` 拆成两格——① 真 0.25 引擎 ⇒ `partOf` 直指链头
+（上游若改回写链，这条先红）② 手工还原 0.23 链式形状 ⇒ 本站仍折回 1 条聚合 `tool_result`
+（撤闸即红）。撤闸的真判据 = 巡检 SQL 确认存量链式 `partOf` 清零，不是「上游版本号涨了」。
+
+**#371-E 当场验掉**（判据见 §8.59 与本节末）：会话级归档去重在本站折叠后的 `load()` 形状上**命中**，
+新文件 `portal/test/fold-archive-dedup-on-station-load.test.js`（5 格：命中本体 / 剥归档⇒归零的反向对照 /
+折叠不许动 `foldedPayload` / 两份镜像一致 / 指纹语义）。变异：让折叠顺手丢 `foldedPayload` ⇒ **恰 3 格红**。
+
+**基线**（判绿 = 退出码）：根 `node --test` **1553 项 / 1549 通过 / 0 失败 / 4 跳过**；`runner` 单独
+**359 / 359 / 0**；前端 **48 文件 / 885**、`vue-tsc` 干净。根计数比 §8.59 记的「两片都合 1534/1530」涨得多，
+是**随包契约套件本身长大了**（0.25 的 #401/#458/#439/#358 新判据都算在根里）+ 本站新增 19 格。
+`erix-agent` 三处版本 tripwire（`terminationReasons.ts` + 其 spec + `runner/test/llm-timeouts.test.js`）
+同步到 `0.25.0`；`termination.js` 与 `providers/openai.js` 的 diff 逐条读过：`termination.reason` 取值集合
+未变，provider 侧改动不影响本站 LiteLLM 通路（三相超时与 `max_tokens` 口径的用例全绿）。

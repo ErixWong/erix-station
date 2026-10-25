@@ -18,6 +18,7 @@
 // 两探针缺任一才回退全量 load）；同 key 并发由 postMessage 的 session FOR UPDATE 串行化，
 // ON CONFLICT 是本事务之外的最后防线。
 import { appendUserTurn } from 'erix-agent';
+import { foldLedgerRecords } from './transcript-fold.js'; // 0.25.0 契约判据：load() 必须返回折叠后形状
 import {
   payloadFingerprint, samePayload, dedupPayloadConflict, transcriptRecordKey,
 } from './transcript-payload.js';
@@ -47,8 +48,16 @@ async function readStoredRecord(client, key, dedupKey) {
 export function createSessionTranscriptStore(client) {
   return {
     /** 读该 key 的全部轮记录（round/dedup_key 以权威列合成进 record，供引擎推导与幂等判据）。
-     *  issue #337：**故意不折**——这是发消息的**预写幂等**面，`appendUserTurn` 的判据是「能看见自己那条
-     *  `<key>:input:<messageId>` 行」；被折叠吸走就会重复追加同一轮追问。 */
+     *
+     *  **erix-agent 0.25.0 起本方法必须折叠**：上游 #458 把「宿主 `load()` 必须返回折叠后形状」
+     *  从散文变成**随包契约断言**（`test/contract/transcript-store.js` 的 #401 / #458 那四格），
+     *  不折就是宿主违约（实测翻红四格）。
+     *  issue #337 当年「故意不折」的理由（`appendUserTurn` 要能看见自己那条
+     *  `<key>:input:<messageId>` 行，被吸走就会重复追加同一轮追问）**依然成立，但与此不冲突**，两条都守住了：
+     *    · 真正的幂等判据走 **`loadByDedupKey` 点查**（0.17.0 #157 起，见本文件头），那条路**照旧不折**；
+     *    · `:input:` 行本身**折不走**——它不带 `kind: "message"` 也不带 `seq`，`isFoldableMessageRow`
+     *      判不通过，折叠之后仍作为独立记录留在数组里（`portal/test/transcript-store.test.js` 钉着）。
+     *  `loadMaxRound` 同样不折（成对探针只认原始行）。 */
     async load(key) {
       const res = await client.query(
         // 0.16.0 契约（host-upgrade-guide §1 same-round ordering）：同 round 多行必须按持久化
@@ -59,7 +68,7 @@ export function createSessionTranscriptStore(client) {
           ORDER BY round, append_seq`,
         [key],
       );
-      return (res.rows ?? []).map((row) => {
+      const records = (res.rows ?? []).map((row) => {
         const base = row.record && typeof row.record === 'object' ? row.record : {};
         return {
           ...base,
@@ -68,6 +77,8 @@ export function createSessionTranscriptStore(client) {
           dedupKey: row.dedup_key ?? base.dedupKey ?? base.roundKey ?? null,
         };
       });
+      // 单一真相源：与展示面 / runner 镜像同一份 `planFold`（口径漂移会同时被三处用例抓到）
+      return foldLedgerRecords(records);
     },
     /**
      * 追加一轮：会话预写行恒为 run_id=NULL / folded=false / folded_payload=NULL（同 PR②a 形态）。
