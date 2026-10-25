@@ -182,6 +182,15 @@ export const zhCN = {
       range: '已压缩第 {from}–{to} 轮',
       countOnly: '已压缩 {count} 条消息',
       bare: '已压缩',
+      // D 片（issue #392）：可见性说明。标题只回答「压缩了什么」，这一行回答「现在谁看不见它」——
+      // 折叠之后原文对模型不再逐字可见，只剩摘要；而「有没有摘要」直接决定这句话是安慰还是空头
+      // 支票，所以必须两态。`hasSummary` **键缺席**（旧 DTO）⇒ 整行不渲染，延续 #390-A「键缺席=不知道」
+      // 那一条纪律：宁可不说，也不拿旧数据凭空断言「这次没摘要」。轮数只在有 `foldedRoundRange` 时报；
+      // 拿 `foldedPayloadMessages` 报轮数是 #375 已经定过性的假话（那玩样儿是归档条数）。
+      visibility: '这 {n} 轮原文对模型已不再逐字可见；下面这份摘要就是它留下的全部。',
+      visibilityNoSummary: '这 {n} 轮原文对模型已不再逐字可见；本次没有生成摘要，要看原文请点「查看原文」。',
+      visibilityBare: '这部分原文对模型已不再逐字可见；下面这份摘要就是它留下的全部。',
+      visibilityNoSummaryBare: '这部分原文对模型已不再逐字可见；本次没有生成摘要，要看原文请点「查看原文」。',
       viewOriginal: '查看原文',
       // #388：原文块自己的收起入口（只隐藏、不清缓存，再展开不重发）
       collapseOriginal: '收起原文',
@@ -281,7 +290,10 @@ export const zhCN = {
       judgeDegraded: '评审降级（{error}），本轮未给出意见',
       judgeUnknownAction: '评审动作：{action}',
       judgeNoDetail: '评审事件（无可解读细节）',
-      compaction: '上下文折叠（round {round}）：{folded} 轮折叠，{before} → {after} tokens',
+      compaction: '上下文折叠（round {round}，策略 {strategy}）：{folded} 轮折叠，{before} → {after} tokens',
+      // #464 A：策略名是引擎写实例上的那个名字（含库层兜底 `sliding-window`），不是配置项原文；
+      // 旧事件没这个字段 ⇒ 拿它填一个显式的「未知」，而不是留空让人以为「策略叫不出名字」。
+      compactionStrategyUnknown: '未知',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',
       runEnd: 'run 结束：{reason}{usage}',

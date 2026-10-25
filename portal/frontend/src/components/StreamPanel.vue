@@ -188,6 +188,30 @@ function foldedTitle(folded: FoldedInfo): string {
 //（transcript 行的 round，DTO 由 folded.round 逐字透传）。不能用 foldedRoundRange（那是
 // 「被折叠的轮范围」如 1–5，拿 range.to ?? from 去查会查错行、必然 404，#189 收尾根因）。
 // 无 round（整数以外）→ null → 隐藏按钮（保持现状）。
+/**
+ * D 片（issue #392）：横幅上的「可见性说明」。
+ *
+ * 为什么需要单独一行：标题（#375）只说「已压缩第 a–b 轮」，但「压缩」这个词在用户那里并不自动
+ * 等于「模型从此看不见它」。折叠的全部意义就在那后半句，而它此前只存在于实现者脑子里。
+ *
+ * 两态的必要性：`hasSummary === false` 时下面那份“摘要”其实是重复标题的兜底句（#390-A 已经不画展开
+ * 控件），此时再说「摘要就是它留下的全部」就是空头支票 ⇒ 改成指路「查看原文」。
+ *
+ * `hasSummary` **键缺席**（旧 DTO / 其他路径）⇒ 返回 null，整行不渲染。不能当 false 处理：那会让
+ * 存量数据凭空多出一句「本次没有生成摘要」的断言（同 #390-A 那条「键缺席=不知道」纪律）。
+ * 轮数只在有 `foldedRoundRange` 时报——拿 `foldedPayloadMessages` 报轮数是 #375 定过性的假话。
+ */
+function foldedVisibilityNotice(en: FoldedEntry): string | null {
+  const has = (en.folded as { hasSummary?: unknown }).hasSummary;
+  if (has !== true && has !== false) return null;
+  const range = (en.folded as { foldedRoundRange?: { from?: unknown; to?: unknown } }).foldedRoundRange;
+  const from = range?.from;
+  const to = range?.to;
+  const n = typeof from === 'number' && typeof to === 'number' && to >= from ? to - from + 1 : null;
+  if (n === null) return has ? t('stream.folded.visibilityBare') : t('stream.folded.visibilityNoSummaryBare');
+  return has ? t('stream.folded.visibility', { n }) : t('stream.folded.visibilityNoSummary', { n });
+}
+
 function foldedQueryRound(folded: FoldedInfo): number | null {
   return Number.isInteger(folded.round) ? (folded.round as number) : null;
 }
@@ -326,6 +350,10 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       <div v-else class="folded-title flex w-full min-w-0 items-center gap-2">
         <span class="shrink-0 font-semibold text-black/60">🗜 {{ foldedTitle(en.folded) }}</span>
       </div>
+      <!-- D 片（#392）：可见性说明（两态；hasSummary 键缺席则整行不出）。 -->
+      <p v-if="foldedVisibilityNotice(en)" class="folded-visibility mt-0.5 text-xs text-black/45">
+        {{ foldedVisibilityNotice(en) }}
+      </p>
       <!-- 摘要：默认收起；展开后走 markdown（#389：与助手气泡同一渲染路径/样式——先转义后格式化，
            XSS 安全；markdown 自己重排，所以不叠加 whitespace-pre-wrap，否则双倍行距）。 -->
       <div
