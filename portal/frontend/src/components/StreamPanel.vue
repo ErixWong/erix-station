@@ -302,11 +302,28 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
             v-if="(foldedOriginalState(en) as { truncated?: boolean }).truncated"
             class="folded-original-truncated text-xs text-black/40"
           >{{ t('stream.folded.originalTruncated', { count: (foldedOriginalState(en) as { droppedMessages?: number }).droppedMessages ?? '?' }) }}</div>
+          <!--
+            原文渲染口径（#384，真机验出来的一条「假占位」）：
+            账本里的 turn 有四类内容——`text` / `reasoning` / `toolCalls[]`（+ user 身份）。旧实现只画 `text`，
+            于是**真的干了活的那几轮**（只有 reasoning + 工具调用、没有正文）整片渲染成「（无文本内容）」——
+            真机 round 100 的 112 条里有 40 条是这样，用户看到的是满屏空行，而原文其实全在。
+            现在：四类都画；只有四类**都空**才给占位（占位的语义收窄成「这一条真的什么都没有」）。
+          -->
           <div
-            v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns"
+            v-for="(turn, ti) in (foldedOriginalState(en) as { status: 'loaded'; turns: Array<{ role?: string; text?: string; reasoning?: string; toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean }> }> }).turns"
             :key="ti"
-            class="folded-original-turn whitespace-pre-wrap break-all text-black/70"
-          >{{ (turn as { text?: string }).text || t('stream.folded.originalEmpty') }}</div>
+            class="folded-original-turn"
+          >
+            <div v-if="turn.role === 'user'" class="folded-original-role text-xs text-black/35">{{ t('stream.folded.originalRoleUser') }}</div>
+            <div v-if="turn.reasoning" class="folded-original-reasoning overflow-auto whitespace-pre-wrap break-all text-black/40 italic">{{ turn.reasoning }}</div>
+            <div v-if="turn.text" class="folded-original-text overflow-auto whitespace-pre-wrap break-all text-black/70">{{ turn.text }}</div>
+            <div
+              v-for="(tc, ci) in (turn.toolCalls ?? [])"
+              :key="ci"
+              class="folded-original-tool overflow-auto whitespace-pre-wrap break-all text-xs text-black/45"
+            >{{ t('stream.folded.originalTool', { name: tc.name ?? '?', args: tc.argsSummary ?? '' }) }}{{ tc.isError ? t('stream.folded.originalToolFailed') : '' }}</div>
+            <div v-if="!turn.text && !turn.reasoning && !(turn.toolCalls && turn.toolCalls.length)" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>
+          </div>
           <div v-if="(foldedOriginalState(en) as { status: 'loaded'; turns: unknown[] }).turns.length === 0" class="text-xs text-black/40">{{ t('stream.folded.originalEmpty') }}</div>
         </template>
         <div v-else-if="foldedOriginalState(en)!.status === 'error'" class="folded-original-error flex items-center gap-2 text-xs text-red-600">
