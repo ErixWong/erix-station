@@ -312,12 +312,25 @@ export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
     let started = false;
     if (status !== 'running') {
       const r = await docker.startContainer(containerName);
-      if (r.status !== 204 && r.status !== 304) {
+      // issue #404：**409 是 Docker 在说「它已经在跑了」**——这正是本函数要的终态，不是故障。
+      // 原先只认 204/304，于是并发（reconcile 与 provision-fde 同时动同一个名字）时赢的那一方
+      // 会拿到 409 并抛错，reconcile 因此每轮抱怨一条 `start container … failed: HTTP 409`，
+      // 把真故障淹在噪音里。started 保持 false：我们确实没有把它"启动起来"，它本来就在跑。
+      if (r.status !== 204 && r.status !== 304 && r.status !== 409) {
         throw new Error(`start container ${containerName} failed: HTTP ${r.status}`);
       }
-      started = true;
+      started = r.status !== 409;
     }
-    return { created: false, started, id: existing.data?.Id ?? null, token: null, envToken: readContainerEnv(existing.data) };
+    // issue #404：adopt 路径必须把容器**实际**在跑的镜像引用带出去，供调用方把账写对
+    //（写"期望值"是另一种说谎：容器可能是上一个版本遗留的）。
+    return {
+      created: false,
+      started,
+      id: existing.data?.Id ?? null,
+      token: null,
+      envToken: readContainerEnv(existing.data),
+      image: existing.data?.Config?.Image ?? existing.data?.Image ?? null,
+    };
   }
   if (existing.status !== 404) {
     throw new Error(`inspect container ${containerName} failed: HTTP ${existing.status}`);
@@ -348,7 +361,9 @@ export async function ensureFdeContainer(docker, opts, { log = console } = {}) {
     throw new Error(`start container ${containerName} failed: HTTP ${started.status}`);
   }
   log.log?.(`[provisioner] container created: ${containerName} (${id})`);
-  return { created: true, started: true, id, token, envToken: token };
+  // issue #404：新建路径的"实际镜像"就是我们传进去的那个引用（body.Image），照样带出去——
+  // 让调用方只有一条写法：拿 res.image 写账，不必自己区分 created/adopt。
+  return { created: true, started: true, id, token, envToken: token, image: body?.Image ?? opts.image ?? null };
 }
 
 /** 停止并删除 FDE 容器（404 视为已删）。返回 { ok, stopped, removed }（F9：删除失败时 ok=false，供调用方保留 desired state）。 */
@@ -525,13 +540,21 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
             agentVersion: config.fdeAgentVersion ?? 'dev',
           });
           stats.rebuilt += 1;
-        } else if (res.started) {
+        } else {
+          // issue #404：adopt（容器已存在、本轮没创建）同样要让账跟上**实际**镜像。
           await pool.query(
-            `UPDATE containers SET status = 'running', updated_at = now()
+            `UPDATE containers SET image = COALESCE($2, image), updated_at = now()
               WHERE user_id = $1 AND status <> 'removed'`,
-            [row.user_id],
+            [row.user_id, res.image ?? null],
           );
-          stats.statusUpdates += 1;
+          if (res.started) {
+            await pool.query(
+              `UPDATE containers SET status = 'running', updated_at = now()
+                WHERE user_id = $1 AND status <> 'removed'`,
+              [row.user_id],
+            );
+            stats.statusUpdates += 1;
+          }
         }
         // 兑底：确保 status 收敛到 running。
         await pool.query(
@@ -683,14 +706,26 @@ export async function onboardFde(pool, config, {
       tokenHash = dbRow.runner_token_hash;
       containerId = dbRow.id;
       needRecreate = false;
+      // issue #404（病根本体）：`image` 此前**只在「DB 没有行」那条 INSERT 上写一次**，此后
+      // 无论换多少个镜像都不再更新 ⇒ `containers.image` 永远停在开户那一刻，运维问「这个 FDE
+      // 在跑哪个 runner」只能人肉 `docker inspect`（实测：容器已是 v0.1.38 的 digest，库里还写着
+      // v0.1.37 的）。复用路径就写**容器实际**的引用——期望值在这里可能是假话。
+      await pool.query(
+        `UPDATE containers SET image = COALESCE($2, image), updated_at = now()
+          WHERE id = $1 AND status <> 'removed'`,
+        [dbRow.id, existing.data?.Config?.Image ?? existing.data?.Image ?? null],
+      );
     } else {
       ({ token, tokenHash } = generateRunnerToken());
       needRecreate = true;
       if (dbRow) {
         await pool.query(
           `UPDATE containers SET runner_token_hash = $2, token_generation = token_generation + 1,
-              status = 'creating', revoked_at = NULL, rotated_at = now(), updated_at = now() WHERE id = $1`,
-          [dbRow.id, tokenHash],
+              status = 'creating', revoked_at = NULL, rotated_at = now(),
+              image = COALESCE($3, image), updated_at = now() WHERE id = $1`,
+          // issue #404：这条 UPDATE 马上会跟一次 create（用的就是 config.fdeImage），所以此刻写
+          // 期望值是真话；status='creating' 也已经把"还没起来"标了出来。
+          [dbRow.id, tokenHash, config.fdeImage ?? null],
         );
         containerId = dbRow.id;
       } else {
