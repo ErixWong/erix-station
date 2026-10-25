@@ -356,6 +356,30 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
  * 返回形状**向后兼容**：`{ round, turns }` 一字未动，新增 `source`/`truncated`/`dropped_messages` 三个可选键。
  */
 const FOLDED_REBUILD_MAX_ROWS = 2000; // 扫描上限与 U7 recall 同尺（internal.js `recallTranscript` 先例）
+// 一个 round 的行数极小（引擎轮行 + 若干消息行 + **折叠那一行**），取全再挑一次的代价就是一次索引扫。
+const FOLD_ROW_SCAN_LIMIT = 64;
+
+/**
+ * **同一个 round 有多行，折叠指针只长在折叠那一行上**（真机 `9e0c8a17` round 100 实测 4 行：
+ * `append_seq` 1818/1819/1820 是轮行与消息行、`folded_payload` 为 JSON `null`，折叠行是**最后**那条
+ * 1821：`folded = true`、带 `foldedRoundRange`、归档 550 KB）。
+ * ⇒ 旧口径 `ORDER BY append_seq ASC LIMIT 1` 挑中的是**没有归档的那一行**，于是「账本里明明有原文」
+ * 被读成 `404 folded_payload_not_found`，前端渲染成「原文已不可用（上游未保留折叠前载荷）」——
+ * 这就是 #375 那声「假 404」的真病根（跟 erix-agent 0.25.0 的差分归档**无关**，两个病叠在一起）。
+ * 挑选次序：① `folded === true` 且带 range 或正文 ② 任意带 range 的行 ③ 任意带正文的行 ④ 交回 null
+ * （调用方退到「第一行」，保持旧行为：一条归档都没有时仍然 404，不误判成有）。
+ */
+function pickFoldCarrierRow(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const hasRange = (row) => normalizeFoldedRoundRange(row?.record?.foldedRoundRange) !== null;
+  const hasPayload = (row) => (Array.isArray(row?.folded_payload) && row.folded_payload.length > 0)
+    || (Array.isArray(row?.record?.foldedPayload) && row.record.foldedPayload.length > 0);
+  return list.find((row) => row?.folded === true && (hasRange(row) || hasPayload(row)))
+    ?? list.find(hasRange)
+    ?? list.find(hasPayload)
+    ?? null;
+}
+
 export async function getFoldedPayload(pool, { userId, sessionId, round }) {
   await fetchSession(pool, sessionId, userId);
   const n = Number(round);
@@ -363,13 +387,14 @@ export async function getFoldedPayload(pool, { userId, sessionId, round }) {
     throw new SessionError('validation_failed', 'round 必须为非负整数', { details: { field: 'round' } });
   }
   const res = await pool.query(
-    `SELECT round, folded_payload, record FROM transcript_rounds
+    `SELECT round, folded, folded_payload, record FROM transcript_rounds
       WHERE transcript_key = $1 AND round = $2
-      ORDER BY append_seq ASC LIMIT 1`,
-    [sessionId, n],
+      ORDER BY append_seq ASC LIMIT $3`,
+    [sessionId, n, FOLD_ROW_SCAN_LIMIT],
   );
   // #195 一致性：列优先、record.foldedPayload 回退（存量行列值为 NULL、原文只在 record 里，不得误 404）。
-  const row = res.rows?.[0];
+  // ⚠ 必须**挑折叠那一行**而不是取该轮第一行，理由见 `pickFoldCarrierRow`（#375 真病根）。
+  const row = pickFoldCarrierRow(res.rows) ?? res.rows?.[0] ?? null;
   const payload = Array.isArray(row?.folded_payload)
     ? row.folded_payload
     : (Array.isArray(row?.record?.foldedPayload) ? row.record.foldedPayload : null);
