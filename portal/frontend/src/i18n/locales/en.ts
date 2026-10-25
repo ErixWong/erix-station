@@ -162,6 +162,13 @@ export const en = {
       bare: 'Compressed',
       viewOriginal: 'View original',
       originalEmpty: '(no text content)',
+      // #384: a ledger turn carries four kinds of content (`text` / `reasoning` / `toolCalls[]` / being the
+      // user). The old renderer drew only `text`, so the turns that actually *did something* (reasoning plus
+      // tool calls, no prose) all collapsed into the placeholder above — 40 of 112 turns on the real session.
+      // All four are rendered now; the placeholder means "this turn truly has nothing".
+      originalRoleUser: 'user',
+      originalTool: '🔧 {name} | {args}',
+      originalToolFailed: ' (failed)',
       originalMissing: 'No text to show for this span (the ledger has none either)',
       originalTruncated: 'This archive was clipped ({count} more messages were not archived separately); the text below is rebuilt from the ledger by round',
       originalError: 'Failed to load the original text: {message}',

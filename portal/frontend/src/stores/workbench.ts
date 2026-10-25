@@ -134,6 +134,10 @@ export interface ChatMessage {
  */
 export interface FoldedOriginalTurn {
   text?: string;
+  /** #384：渲染要用得上三类“不是正文”的内容（旧实现只看 `text`，把有工具调用的轮画成空行）。 */
+  role?: string;
+  reasoning?: string;
+  toolCalls?: Array<{ name?: string; argsSummary?: string; isError?: boolean }>;
   [key: string]: unknown;
 }
 

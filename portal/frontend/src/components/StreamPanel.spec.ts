@@ -499,12 +499,50 @@ describe('issue #189：折叠横幅渲染', () => {
     expect(fetchUrl).toBe('/api/sessions/s1/folded/8');
     const turns = wrapper.findAll('.folded-original-turn');
     expect(turns).toHaveLength(2);
-    expect(turns[0].text()).toBe('原文甲');
-    expect(turns[1].text()).toBe('（无文本内容）'); // 空 text 降级占位
+    // #384：user 轮现在带一个很轻的身份标记（原来满屏正文分不清是谁说的）⇒ 断言从 `toBe` 改 `toContain`。
+    expect(turns[0].text()).toContain('原文甲');
+    expect(turns[0].text()).toContain('用户');
+    expect(turns[1].text()).toBe('（无文本内容）'); // 四类（text/reasoning/工具/身份）都空才给占位
 
     await wrapper.get('.view-original').trigger('click'); // 缓存命中不重发
     await flushPromises();
     expect(vi.mocked(fetch).mock.calls.filter(([u]) => String(u).includes('/folded/'))).toHaveLength(1);
+  });
+
+  it('#384 原文里「只有思考 + 工具调用」的轮不再被渲染成空行（真机 round 100 的 112 条里 40 条是这形状）', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? {
+        status: 200,
+        body: {
+          round: 8,
+          turns: [{
+            role: 'assistant',
+            text: '',
+            reasoning: '先看工作目录再决定 clone 方式',
+            toolCalls: [
+              { name: 'shell', argsSummary: 'command=pwd && ls -la' },
+              { name: 'readFile', argsSummary: 'path=missing.txt', isError: true },
+            ],
+          }],
+        },
+      }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+
+    const turn = wrapper.get('.folded-original-turn');
+    // 旧行为：整块就一句「（无文本内容）」——活干了但没正文，占位符在说谎。
+    expect(turn.text()).not.toContain('（无文本内容）');
+    expect(turn.get('.folded-original-reasoning').text()).toContain('先看工作目录再决定 clone 方式');
+    const tools = wrapper.findAll('.folded-original-tool');
+    expect(tools).toHaveLength(2);
+    expect(tools[0].text()).toContain('shell');
+    expect(tools[0].text()).toContain('command=pwd && ls -la');
+    expect(tools[1].text(), 'isError 的工具行要标出失败').toContain('（失败）');
   });
 
   it('原文 404 → 友好提示（非红错）', async () => {
