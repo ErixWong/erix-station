@@ -2192,3 +2192,33 @@ E6 同一份替代物**同时**进轮记录 `foldedFacts`（投递与落账不�
 **顺带修正 §8.66 的一处措辞**：那里写「精确轮次范围 `a–b` 拿不到」——`onFoldSummary` 的 payload 确实
 还是没有范围，但引擎**自己的摘要文本里**带范围（`早期第 … 轮（共 … 轮）已折叠`，见 §8.65 A3 判据）。
 所以缺的是**结构化**的 `from/to`（给 DB 与 banner 用），不是"系统不知道范围"。erix-agent#479 的诉求据此收窄。
+
+### 8.69 issue #404：`containers.image` 必须跟上现实，不是停在开户那一刻（2026-10-26，分支 `fix-261026-01-container-image-ledger`）
+
+现网实测的账实不一致：`fde-eric`/`fde-jim` 跑的是 v0.1.38 的 digest，库里 `image` 还写着 v0.1.37 的；
+`agent_version` 停在 `0.1.32-088e41e`。后果不是难看，是**问不出答案**——「这个 FDE 在跑哪个 runner」
+只能人肉 `docker inspect`，我这两天的部署核对全这么过来的。
+
+病根是写面的形状，不是某处漏了一行：`image` 只出现在 `onboardFde` 里**「DB 没有行」那条 INSERT** 上。
+其余三条路径——① 复用（容器在、env token 匹配）② 重建（有行、token 轮换那条 UPDATE）③ reconcile 的
+adopt 分支（`res.created === false`）——**一条都不写** ⇒ 一次开户定终身。所以修法是给三条路径都补写，
+而不是改 INSERT。
+
+**写"实际"而不是写"期望"**（这条是本片的判断核心）：adopt 场景里容器可能正是上个版本遗留的，把
+`config.fdeImage` 写进去只是把一种谎换成另一种。于是 `ensureFdeContainer` 现在把容器**实际**镜像带回
+调用方（adopt 取 `Config.Image`，新建取 create body 的 `Image`），调用方只有一条写法：`res.image` 写账。
+唯一写期望值的地方是「token 轮换 UPDATE 之后紧接着就是 create(config.fdeImage)」——那里期望值就是真话，
+且 `status='creating'` 已把"还没起来"标出来了。
+
+顺手修同一条路径上的 409：`ensureFdeContainer` 原先只认 204/304，而 **409 是 Docker 在说「它已经在跑了」**
+——正是本函数要的终态。并发（reconcile 与 provision-fde 同时动同一个名字）时赢的那一方拿 409 抛错，
+reconcile 因此抱怨 `start container … failed: HTTP 409`，把真故障淹在噪音里。现在 409 当幂等成功，且
+`started` 保持 `false`：它本来就在跑，不是我们启动的，不许谎报。
+
+判据 3 条：409 幂等（含"必须先查后起"与"不许谎报 started"）/ 新建路径回报实际镜像 / 三条写路径都在源码
+契约上钉住（`onboardFde` 全链 fake 成本高，沿用本文件既有做法；`ensureFdeContainer` 真跑）。
+provisioner 34/34、portal+root 全量绿。
+
+**留给后续的边界**（本片故意不做，不是遗漏）：`agent_version` 仍由心跳自报，不由 station 写 `config.fdeAgentVersion`
+——它是「容器里跑的 runner 自报的版本」，station 写死等于自报变推断。要真正闭环，得让 `provision-fde` /
+reconcile 在建容器后等一次心跳（见 issue #404 评论）。
