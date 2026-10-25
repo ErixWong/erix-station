@@ -172,23 +172,38 @@ test('C11 多次折叠序号递增（seq 既进 key 也进正文，是「折一�
 
 // ── ④ 接线本体（删掉 worker 那一行必须变红） ──────────────────────────────────
 const CTX_MARKERS = /\/\* #392:context-strategy:start \*\/([\s\S]*?)\/\* #392:context-strategy:end \*\//;
+const OPT_MARKERS = /\/\* #392:C-onFoldSummary:start \*\/([\s\S]*?)\/\* #392:C-onFoldSummary:end \*\//;
 
-function contextWith(foldNoteSink) {
-  const block = read('worker.js').match(CTX_MARKERS);
-  assert.ok(block, 'worker.js 的 #392 context 装配标记没了');
-  return new Function('foldNoteSink', `return {${block[1]}}`)(foldNoteSink).context;
+/** 求值 worker 的**顶层** options 片段（引擎从 options 解构 onFoldSummary，不是从 context）。 */
+function topLevelOptionWith(foldNoteSink) {
+  const block = read('worker.js').match(OPT_MARKERS);
+  assert.ok(block, 'worker.js 里 `#392:C-onFoldSummary` 标记没了：C 片的接线被搬走或删除');
+  return new Function('foldNoteSink', `return {${block[1]}}`)(foldNoteSink);
 }
 
-test('C12 worker 真的把 onFoldSummary 接进 context（有 sink 时），且 sink=null 时不接', () => {
+test('C12 worker 真的把 onFoldSummary 接在**顶层 options**（有 sink 时），sink=null 时不接', () => {
   const sink = { onFoldSummary: async () => {} };
-  const wired = contextWith(sink);
-  assert.equal(wired.strategy, 'fold-statistical', 'A 片那行不能被顺手删');
-  assert.equal(wired.onFoldSummary, sink.onFoldSummary,
-    '没接上就是「摘要产出来就扔」——A 片的收益停在引擎内部，用户侧仍是静默硬删');
+  const opts = topLevelOptionWith(sink);
+  assert.equal(opts.onFoldSummary, sink.onFoldSummary,
+    '没接上就是「摘要产出来就扔」：A 片的收益停在引擎内部，用户侧仍是静默硬删');
+  assert.deepEqual(Object.keys(topLevelOptionWith(null)), [],
+    'notes 不可用时不该接一个必炸的回调');
+});
 
-  const unwired = contextWith(null);
-  assert.ok(!('onFoldSummary' in unwired), 'notes 不可用时不该接一个必炸的回调');
-  assert.deepEqual(Object.keys(unwired), ['strategy']);
+test('C14 【防回装】onFoldSummary 不得被塞回 context——引擎只从顶层 options 读它', () => {
+  // 真实现场（本单自己踩的）：把它放进 `context` 后，折叠照跑、`record.foldedFacts` 照落账、
+  // 注**一条也不写**，且不报错——#331 那根「没人读的光纤」原样重现。判据不抄进测试：
+  // 直接与**已安装引擎**的选项白名单比对（上游改名/搬走 ⇒ 本格红，与 termination-contract 同族）。
+  const engineOptSrc = fs.readFileSync(
+    path.join(RUNNER_DIR, 'node_modules/erix-agent/src/loop/option-normalization.js'), 'utf8');
+  assert.match(engineOptSrc, /"onFoldSummary",/,
+    '已安装引擎的 RUN_TOOL_LOOP_OPTION_NAMES 里找不到 onFoldSummary ⇒ 上游改了/移了它，'
+    + 'worker 的接线口径与本文件需同步重核');
+
+  const ctxBlock = read('worker.js').match(CTX_MARKERS);
+  assert.ok(ctxBlock, 'worker.js 的 #392 context 装配标记没了');
+  assert.ok(!/onFoldSummary/.test(ctxBlock[1]),
+    'onFoldSummary 又被塞回 context 了——那里没人读它，折叠会**静默**不投递（不报错、不红、只是没注）');
 });
 
 test('C13 接线的前置门是「executors 可用」，不是「runId 存在」之类会误伤会话作用域的条件', () => {
