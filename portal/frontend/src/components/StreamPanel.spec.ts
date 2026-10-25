@@ -432,13 +432,16 @@ function mockFoldedFetch(handler: (url: string) => { status: number; body: unkno
 }
 
 describe('issue #189：折叠横幅渲染', () => {
-  it('有折叠 → 独立横幅（非 .msg 气泡）：标题「已压缩 9 条消息（第 2–5 轮）」', () => {
+  it('有折叠 → 独立横幅（非 .msg 气泡）：#375 后标题只报轮范围「已压缩第 2–5 轮」', () => {
     const store = useWorkbenchStore();
     store.entries.push(foldedEntry());
     const wrapper = mountPanel();
     const banner = wrapper.get('.folded-banner');
     expect(banner.classes()).not.toContain('msg'); // 独立视觉：不是普通气泡
-    expect(banner.text()).toContain('已压缩 9 条消息（第 2–5 轮）');
+    expect(banner.text()).toContain('已压缩第 2–5 轮');
+    // #375：条数不得再上横幅——foldedPayloadMessages 自 erix-agent 0.25.0 起是「本条记录携带的
+    // 归档条数」（去重+夹断后），拿它说「压掉了多少条」会说假话。
+    expect(banner.text()).not.toContain('9 条');
     expect(wrapper.findAll('.msg')).toHaveLength(0);
   });
 
@@ -511,8 +514,46 @@ describe('issue #189：折叠横幅渲染', () => {
     const wrapper = mountPanel();
     await wrapper.get('.view-original').trigger('click');
     await flushPromises();
-    expect(wrapper.get('.folded-original-missing').text()).toBe('原文已不可用（上游未保留折叠前载荷）');
+    expect(wrapper.get('.folded-original-missing').text()).toBe('这一段没有可显示的原文（账本里也没有）');
     expect(wrapper.find('.folded-original-error').exists()).toBe(false);
+  });
+
+  // #375：后端改成「有 foldedRoundRange 就从账本重建」，多返三个可选键 source/truncated/dropped_messages。
+  it('#375 差分归档被夹断 → turns 照渲染（重建的完整原文）并给中性截断说明，不报红也不报「没原文」', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? {
+          status: 200,
+          body: {
+            round: 8,
+            turns: [{ role: 'user', text: '被夹断丢掉的头部原文' }, { role: 'assistant', text: '尾部原文' }],
+            source: 'rebuilt', truncated: true, dropped_messages: 317,
+          },
+        }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.findAll('.folded-original-turn')).toHaveLength(2);
+    const cap = wrapper.get('.folded-original-truncated');
+    expect(cap.text()).toContain('317');
+    expect(cap.text()).toContain('本次归档被截断');
+    expect(wrapper.find('.folded-original-missing').exists()).toBe(false);
+    expect(wrapper.find('.folded-original-error').exists()).toBe(false);
+  });
+
+  it('#375 旧后端（无三个可选键）→ 不渲染截断说明（向后兼容，不拼「undefined」）', async () => {
+    mockFoldedFetch((url) => url.includes('/folded/')
+      ? { status: 200, body: { round: 8, turns: [{ role: 'user', text: '存量全量归档' }] } }
+      : { status: 200, body: { items: [] } });
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());
+    const wrapper = mountPanel();
+    await wrapper.get('.view-original').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.folded-original-truncated').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('undefined');
   });
 
   it('无 folded.round → 隐藏「查看原文」按钮（有 range 也不能拿 range.to/from 去查：那是被折叠范围，会 404）', () => {
@@ -605,7 +646,7 @@ describe('issue #189（追加）：会话头部状态行「N 条消息 · 已压
     expect(wrapper.get('.session-stats').text()).toContain('compacted 1×');
     expect(wrapper.get('.session-compaction-hint').text())
       .toBe('Context compaction has started; open a new session if you need to keep full details');
-    expect(wrapper.get('.folded-banner').text()).toContain('Compressed 3 messages');
+    expect(wrapper.get('.folded-banner').text()).toContain('Compressed rounds 1–2'); // #375：有 range 只报范围
     expect(wrapper.get('.view-original').text()).toBe('View original');
     setLocale('zh-CN');
   });
