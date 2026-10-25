@@ -539,8 +539,9 @@ async function startRun(msg) {
       //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
       //     「provider 默认」变成我们那个数（**变严**，不是变松）；
       //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
-      //   - fold-llm 压缩 summarizer 也继承 maxTokens（:1175）——本站没显式选 context.strategy，
-      //     超预算时引擎用 createSlidingWindowStrategy() 兜底（:2503），本单**不**顺手选策略。
+      //   - fold-llm 压缩 summarizer 也继承 maxTokens（:1175）——但**只有真选了 `fold-llm` 才成立**：
+      //     本站自 #392 起显式选 `fold-statistical`（零 LLM，见下面 `#392:context-strategy` 标记段），
+      //     超预算时也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
       /* #309:engine-model-params:start */
       ...(engineModelMetadata ? {
         modelMetadata: {
@@ -552,6 +553,38 @@ async function startRun(msg) {
       /* #309:engine-model-params:end */
       // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
       system: SYSTEM_PROMPT,
+      // issue #392（A 片）：**显式选折叠策略，唯一目的是让折叠产出确定性替代物**。
+      // 此前本站连 `context` 都不传 ⇒ 超预算时引擎自己 `createSlidingWindowStrategy()` 兜底
+      // （0.25.0 `loop/orchestrator.js:3136` 那条 fallback）。真机标本（erix-station 现网会话
+      // `bdef6dd7`，erix-agent 0.25.0，195 轮 / 12 run / 666 条轮记录）：7 次整轮折叠**全部**是
+      // slidingWindow，账本里 `foldedSummary` 与 `navigationRecord` 各 **0 行**、`summary` 恒
+      // `"missing"`、`[已折叠]` 占位 0 条（`stubFor` 没人给 ⇒ `resolveFoldStubs` 直接返回 `[]`）
+      // ⇒ 一次折叠 = 从第 1 轮起到 `budget-6` 轮的**整块静默硬删**（单次最多折走 32.7 万 token），
+      // 模型事后既不知道自己少了什么、也无从判断该去哪找。**这条静默不是 bug 而是本站选的后果**。
+      // 换成 `fold-statistical`（同版本、零 LLM、零调用成本）之后：机械摘要被 **prepend 进 head**
+      // （`compact/fold-statistical.js:546` → `formatFoldSummary`：范围句 + 工具足迹 + 导航记录 +
+      // `[已折叠]` 占位 + 锚点节，本会话实测那一份 732 B）⇒ ① 模型当场看得见「早期第 1–107 轮已
+      // 折叠」这类事实；② 因为它是真进了请求的正文，`orchestrator.js:3257` 的
+      // `fedSummaryText !== ""` 成立 ⇒ 同一份摘要**同时进账本**（`record.foldedSummary`，#326 wo-C）
+      // ⇒ 宿主横幅与引擎喂给 judge 的轮次历史第一次有料（此前两者只能看见 `"missing"`）。
+      // ⚠ 三件**不要**把本行读成的事：
+      //   ① **不是为了少折**。0.25.0 的 `selectFoldedRounds` 对两种策略都是「折掉除最后
+      //      `keepRounds` 轮以外的全部」，没有按预算缺口比例裁剪的逻辑（真机每次折到预算的
+      //      1.4%–5.4% 就是这个）⇒ 那是 erix-agent#464 的 C 档，**仍未做**，本行不改变它。
+      //   ② **故意不传 `keepRounds`**：0.25.0 里 `context.keepRounds` 既不进工厂入参
+      //      （`orchestrator.js:1301-1305` 只转发 `recoveryHint` / `stubFor`），也不在调用期
+      //      白名单里（`:3090-3097` 那六个键）⇒ 传了没任何人读 = #331 那根「没人读的光纤」。
+      //      真要用它只能改对象形态 `createFoldStatisticalStrategy({ keepRounds })`（包根
+      //      `index.js:41` 有导出）。判据钉在 `runner/test/fold-strategy.test.js`，见该文件注释。
+      //   ③ **不选 `fold-llm`**：真机 39.9 s 同步阻塞在轮与轮之间、最大一次喂进 261345 token
+      //      撞 262144 窗口 → 400 后静默降级，而它无超时 / 无输入上限 / 从不看 finish_reason
+      //      （erix-agent#469 未修）⇒ 那张单落地之前不提。
+      // 不给 env 旋钮：策略名不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
+      /* #392:context-strategy:start */
+      context: {
+        strategy: 'fold-statistical',
+      },
+      /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
       onEvent: (event) => {
         if (event?.type === 'usage') return; // 双源去重：记账以返回值 usage 为准（§7.3/§6.3-6）
