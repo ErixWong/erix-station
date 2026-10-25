@@ -157,7 +157,18 @@
 
 **重新激活（issue #161）**：再次雇用同一 `fde_name` 时，管理台复用原 disabled `users` 行（不新建第二行），更新登录名、邮箱、显示名、口令与 TOTP 后设回 active；因此两次雇佣沿用同一用户 ID 与审计/历史记录。若新登录名被别的用户占用则返回 `409 login_conflict`。事务清空旧 `login_sessions`、`login_pending` 与 `api_tokens`，并将 `fde_git_accounts.remote_login` / `token_ref` 清空；历史 `fde_offboarding` 行保留。已有 onboarding 行按原队列契约重置为 pending，重新执行 provision、materialize、LLM binding；provision 重建容器、恢复/重铸 LLM key，并重新投放 Git 凭据。若旧 offboarding 仍处于 pending/running，则拒绝重激活以免与清理任务竞态。Gitea 复用分支在 mint 前吊销 Station 旧 token，避免 `prohibit_login=false` 后旧 token 复活。
 
-Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 的 HOME，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
+Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token。它们只落在 FDE 的 HOME，**不经环境变量传入容器**，也**不进日志与 `audit_log.details`**；API 只回显 host、username 与 token 掩码。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。
+
+**例外（issue #395，2026-10-25）：明文同时落库一份**。自迁移 `0024` 起，`fde_git_accounts.token`（裸 `text`）持有平台侧副本。本小节原本写的是「不进 DB」，那一条已被推翻，不是漏改：
+
+- **为什么需要副本**：`minted` 模式下明文由平台向 Gitea/GitLab 代铸，而它的**唯一副本**躺在用户态、agent 可写的 `~/.git-credentials` 里。现网实证（FDE `eric`，2026-10-25）：agent 配 GitHub 凭据时整文件重写，gitea 那行被冲掉 ⇒ 平台作为铸币方既无副本也无从自愈。而判「有没有凭据」用的是 `fde_git_accounts.token_ref`，那只是远端 token 的 **ID**（吊销寻址用），与文件真实状态毫无关系，于是「库里一切正常、agent 永远报没凭据」。
+- **为什么是明文而不是密文**：同库 `git_hosts.admin_key`（`0011`）本就是裸 `text`，而它的权限比任何单枚 per-FDE token 都大。再单独给 per-FDE token 套一层加密只会长出第二个会过期的真相源（key 放哪、谁轮换、存量怎么迁移），而两者威胁模型完全一致：能读 DB 的 == 能读用户空间根的。
+- **三态是契约**：`token IS NOT NULL` = 平台持有副本，可重投；`token IS NULL` = 平台**没有**副本（`per_fde_pat` 下 FDE 自行在容器里配的密钥、以及 #395 之前的存量行）⇒ 只能重铸或人工重新提交。所以列**可空且无默认值**，空串被 `0024` 的 CHECK 当场拒（`0021` 靠默认值钉契约，`0024` 靠**没有**默认值钉同一件事）。
+- **出参面不变**：`token` 永不进 API 响应、`audit_log.details`、日志与错误消息（沿用 `maskToken()`，与 `git_hosts.admin_key` 的「只回掩码」是同一条红线）。DB 侧的完整口径是「**除 `fde_git_accounts.token` 这一列外哪儿都不能有明文**」，不是「DB 里没有明文」。
+- **自愈（`ensureCredentialDeployed`）**：`provisioner` 在两条模式分支之后做一次收敛，判据是「文件里那一行**真在不在**」而不是 `token_ref`。缺行且有副本 ⇒ 重投（审计单独一条 `admin.git_credential_redeployed`）；缺行且无副本 ⇒ 如实报 `no_platform_copy`；文件里是**另一个登录名** ⇒ `different_identity`，**不覆盖**（那是 FDE 自己在容器里换的身份）。
+- ⚠ `0011-git-hosts.sql` 第 2 行的注释（「代铸 token 明文只投放到 FDE 凭据文件」）**不回改**：已应用的迁移按 `migrations/README` 记录 `sha256`，改一个字符就让既有部署拒启。该注释属**冻结的历史陈述**，现行口径以本节为准（`0024` 的头注释里也写了这条 supersession）。
+
+回填历史明文的入口是 `cli.js backfill-git-tokens`（只填 `token IS NULL` 的行、逐行各自提交、捞不到留 NULL；`userSpaceRoot` 未配与路径被篡改一律上抛，不当「留空」吞掉）。
 
 该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户下线时 portal 尝试删除此文件；失败只告警，不回滚停用。
 
@@ -553,7 +564,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 | 项 | 结论 |
 |---|---|
 | 文件权限是安全边界吗 | **不是**（principles §1 原理四）。只防误改；真正边界是网络（每 FDE 独立 `/29`、不 publish、ingress 唯一、LLM 唯一出口）。 |
-| 平台文件泄漏什么 | 物化平台文件无真实密钥：占位 key 无价值、endpoint 是内网 `llm.<base>`、`ports.json` 是 FDE 自己的端口。`.git-credentials` 是 FDE 单独授权的 Git 主机凭据文件；**真实 LLM key / DB 凭据 / runner token 永不进入用户空间文件**。宿主侧有权访问该用户空间的进程可读取 Git token 明文，这是接受的残余风险。 |
+| 平台文件泄漏什么 | 物化平台文件无真实密钥：占位 key 无价值、endpoint 是内网 `llm.<base>`、`ports.json` 是 FDE 自己的端口。`.git-credentials` 是 FDE 单独授权的 Git 主机凭据文件；**真实 LLM key / DB 凭据 / runner token 永不进入用户空间文件**。宿主侧有权访问该用户空间的进程可读取 Git token 明文，这是接受的残余风险。⚠ **#395 之后这份额度变成两处**：同一枚 Git token 的明文还存在 `fde_git_accounts.token`（裸 `text`，与 `git_hosts.admin_key` 同一口径）——判据不变：能读 DB 的进程与能读用户空间根的进程属同一信任域；不加密的理由见 §4.1.1。 |
 | FDE 能否破坏自己 | 能（有 root）——**接受**（runner §11.3 同口径）；只保证「他人/平台状态不被单个 FDE 破坏」。 |
 | 跨 FDE 隔离 | bind mount 每 FDE 只挂自己的 `/srv/erix/users/<fde>/`；materializer 只按 DB `fde_id` 写对应目录；名字白名单 + 无 `..`（§6.3）防越目录。 |
 | 单 FDE 写入路径 | materializer 不读回用户空间内容做决策（§6.3-4），杜绝「FDE 篡改文件反灌平台」。 |
