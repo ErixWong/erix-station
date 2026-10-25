@@ -54,6 +54,25 @@ pi（本地单用户，无远端宿主）的会话模型与 erix-agent store 机
 - **messages 表降级为 UI 投影**（从树投影），不再双写
 - **新用户消息先落树、再派工**：portal 收到消息 → 写 session transcript → 派执行
 
+### 3a 运行中说的话：先入队，投递时才落树（issue #370）
+
+目标态此前只规定了「消息怎么进树」，没规定「**任务正在跑时进来的话**什么时候进树」。补齐的口径：
+
+```
+运行中进来的话 ──► queued_inputs（DB，模型看不见，UI 显示为「待发送」）
+                        │  run 终态（五处产出点之一）
+                        ▼
+                  postMessage（唯一发送路）──► transcript + messages 锚点 + 新 run
+```
+
+三条不可让步的点：
+
+- **入队绝不写 `messages` / `transcript_rounds`**。§6 把 `messages` 定成纯锚点行、正文真相在树；而**还没说出口的话**一旦进树，就同时被模型看见并被界面渲染成「已发送」——那是把「排队」实现成了「插话且撒谎」。投递那一刻才走既有写入路径，**入队面零写入第①/②层**。
+- **队列是状态，不是历史**：真相在 `queued_inputs`，快照由会话详情全量给出，SSE 的 `queue_update` 只是通知（不落 `run_events`、不参与回放）。这条区分决定了它为什么能在刷新、换设备、断线重连之后仍然在那里——也正是 pi 内存队列（`Agent.steeringQueue`，其自身注释承认 "dead wrapper (no state) means the queue is gone"）在本架构下不能照抄的原因。
+- **投递由服务端在 run 终态驱动，不由浏览器驱动**。pi/pi-web 用 `agent_end` 回调出队，那是浏览器进程里的回调：关页面 = 那句话蒸发。本站是「容器是牲口、DB 是真相」，出队点必须在 portal 的**终态产出处**（五处，见 `docs/data/model.md` §1.29 与 `portal/test/queued-inputs-wiring.test.js` 的接线断言）——关掉页面，队照样在，也照样会发。
+
+转向（steer）在本模型下**不改变树的形状**：它只是让当前 run 在轮边界停下（runner §6.3-8b），随后那句话作为一条普通用户消息追加到同一棵 session 树上、起一个新 run 续接。会话真相仍然单源，run 仍然只是运维单元。
+
 ## 4. 引擎现状核对（源码证据，2026-09-24 晚修正）
 
 - transcript 累积：非 resume 时 initialMessages/initialUserMessage 作为 round 0 种子入档（`resume-manager.js:245`），每轮 appendRound 到同一 key——跨调用累积**已支持**

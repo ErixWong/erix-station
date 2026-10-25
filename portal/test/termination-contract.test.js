@@ -145,7 +145,10 @@ test('runner 运行时镜像与前端码集、文档 §6.4 锚点逐项一致；
   assert.deepEqual(canonical, ['checkpoint_failed', 'disconnect', 'rate_limited', 'server', 'timeout']);
 
   const worker = fs.readFileSync(path.join(ROOT, 'runner/worker.js'), 'utf8');
-  assert.match(worker, /buildFailureEnvelope\(\{ err, aborted \}\)/);
+  // 入参表被 issue #370 扩到三参数（新增 `steered`，只往 termination.detail 补 'steered'，不改 reason）。
+  // 本断言的原意不变：worker 的 catch 必须**只有这一处**信封构造、没有第二份手写实现——所以仍是精确
+  // 匹配调用形状而不是放宽成 /buildFailureEnvelope\(/（放宽就测不出「有人另写了一份」）。
+  assert.match(worker, /buildFailureEnvelope\(\{ err, aborted, steered \}\)/);
   assert.doesNotMatch(worker, /code === 'checkpoint_failed'/, 'worker 里的手写半截清单必须删掉');
   assert.doesNotMatch(worker, /termination: \{ reason: aborted \? 'aborted' : 'failed' \}/,
     'worker 不得再把引擎 termination 拍平成 {reason: failed}');
