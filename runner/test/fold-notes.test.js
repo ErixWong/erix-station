@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import {
   FOLD_NOTE_TAG,
   foldNoteKey,
@@ -194,8 +195,22 @@ test('C14 【防回装】onFoldSummary 不得被塞回 context——引擎只从
   // 真实现场（本单自己踩的）：把它放进 `context` 后，折叠照跑、`record.foldedFacts` 照落账、
   // 注**一条也不写**，且不报错——#331 那根「没人读的光纤」原样重现。判据不抄进测试：
   // 直接与**已安装引擎**的选项白名单比对（上游改名/搬走 ⇒ 本格红，与 termination-contract 同族）。
+  // 路径不拼！根 `npm test` 的 glob **也覆盖 `runner/test/`**（CI 里根套件那 1641 格就含本文件），而那时
+  // `runner/node_modules` 可能还没装（runner 安装在第③步）⇒ 拼路径会 ENOENT。用 `import.meta.url`
+  // 走**与本文件 `import { runToolLoop } from 'erix-agent'` 完全同源**的解析，拿到那份引擎再读文件。
+  // 用 `import.meta.url` 走**与本文件 `import { runToolLoop } from 'erix-agent'` 完全同源**的解析。
+  // ⚠ 不能用 `resolve('erix-agent/package.json')`：引擎的 `exports` 只列了 `.` / `./tools` /
+  // `./contract-tests`，没列 `./package.json` ⇒ `ERR_PACKAGE_PATH_NOT_EXPORTED`（实测）。所以下面
+  // 解析主入口，再向上找到 `name === 'erix-agent'` 的包根。
+  const engineEntry = createRequire(import.meta.url).resolve('erix-agent');
+  let engineRoot = path.dirname(engineEntry);
+  while (engineRoot !== path.dirname(engineRoot)) {
+    const pj = path.join(engineRoot, 'package.json');
+    if (fs.existsSync(pj) && JSON.parse(fs.readFileSync(pj, 'utf8')).name === 'erix-agent') break;
+    engineRoot = path.dirname(engineRoot);
+  }
   const engineOptSrc = fs.readFileSync(
-    path.join(RUNNER_DIR, 'node_modules/erix-agent/src/loop/option-normalization.js'), 'utf8');
+    path.join(engineRoot, 'src/loop/option-normalization.js'), 'utf8');
   assert.match(engineOptSrc, /"onFoldSummary",/,
     '已安装引擎的 RUN_TOOL_LOOP_OPTION_NAMES 里找不到 onFoldSummary ⇒ 上游改了/移了它，'
     + 'worker 的接线口径与本文件需同步重核');
