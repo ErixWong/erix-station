@@ -64,6 +64,8 @@ const HOST_CONFIG_FIELDS = new Set([
   'ExtraHosts',
 ]);
 const CAP_ADD_ALLOW = new Set(['SETUID', 'SETGID', 'CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL']);
+// #399：平台托管 git 凭据的固定容器内挂载点（唯一允许 :ro 的目标；源必须 <fde>/platform/git）。
+const PLATFORM_GIT_DEST = '/run/erix/git';
 const NETWORK_NAME_RE = /^fde-[a-z0-9-]+$/;
 const CONTAINER_NAME_RE = /^\/fde-[a-z0-9-]+$/;
 const FDE_NAME_RE = /^[a-z0-9-]+$/;
@@ -297,10 +299,13 @@ export function validateBindSource(src, { userSpaceRootHost, userSpaceRoot }) {
   return null;
 }
 
-/** 校验 bind destination 必须在容器 home 下（/home/erix 或 /home/erix/...）。 */
-export function validateContainerDest(dest) {
+/** 校验 bind destination 必须在容器 home 下（/home/erix 或 /home/erix/...），或恰为平台凭据挂载点 /run/erix/git（#399，仅 ro）。 */
+export function validateContainerDest(dest, { allowPlatformGit = false } = {}) {
   if (typeof dest !== 'string' || dest.length === 0) return 'bind destination is empty';
   if (!dest.startsWith('/')) return `bind destination must be absolute: ${dest}`;
+  if (dest === PLATFORM_GIT_DEST) {
+    return allowPlatformGit ? null : `bind destination ${PLATFORM_GIT_DEST} requires :ro and source <fde>/platform/git`;
+  }
   const home = '/home/erix';
   if (dest !== home && !dest.startsWith(home + '/')) return `bind destination not under container home: ${dest}`;
   const rest = dest === home ? '' : dest.slice(home.length + 1);
@@ -525,8 +530,21 @@ export function validateCreateBody(body, opts = {}) {
           continue;
         }
         const [src, dest, mode] = parts;
+        // #399 平台凭据挂载：目标固定 /run/erix/git，源必须落在本 FDE 用户空间的 platform/git，且必须 ro——
+        // 封死「拿 ro 往 home 里挂任意目录」与「把平台凭据挂成 rw」两条偏路；source 白名单照旧要过。
+        const isPlatformGitBind = dest === PLATFORM_GIT_DEST;
+        if (isPlatformGitBind && mode !== 'ro') {
+          reasons.push(`platform git bind must be "<fde>/platform/git:${PLATFORM_GIT_DEST}:ro": ${b}`);
+          continue;
+        }
         const srcReason = validateBindSource(src, { userSpaceRootHost: fdeRootHost, userSpaceRoot: fdeRootContainer });
         if (srcReason) reasons.push(srcReason);
+        if (isPlatformGitBind) {
+          if (!src.endsWith(`${path.sep}platform${path.sep}git`)) {
+            reasons.push(`platform git bind source must be <fde>/platform/git: ${b}`);
+          }
+          continue; // dest 就是 PLATFORM_GIT_DEST，home 规则不适用；mode 已按 ro 验过
+        }
         const destReason = validateContainerDest(dest);
         if (destReason) reasons.push(destReason);
         if (mode !== undefined && mode !== 'rw') reasons.push(`bind mode must be "rw" or empty: ${b}`);

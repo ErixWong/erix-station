@@ -21,7 +21,7 @@ import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
 import { broadcastRevoke, drainQueueAfterRun } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
-import { removeGitCredentialFile, setGitCredential } from './git-credential.js';
+import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
 
 // ---------------------------------------------------------------------------
@@ -141,6 +141,14 @@ function assertBindSourceInsideRoot(userSpaceRoot, bindSource) {
   }
 }
 
+/** #399：判断 inspect 返回的容器是否已带平台凭据的 ro bind（新代次运行时的标志）。 */
+export function containerHasPlatformGitBind(inspectData) {
+  const binds = inspectData?.HostConfig?.Binds ?? [];
+  if (binds.some((b) => typeof b === 'string' && b.includes(':/run/erix/git'))) return true;
+  const mounts = inspectData?.Mounts ?? [];
+  return mounts.some((m) => m?.Destination === '/run/erix/git');
+}
+
 /**
  * FDE 容器的 Docker API create body（契约 §6.2/§6.4）。
  * 不变式：不 publish 端口（无 PortBindings）、不挂 docker.sock、bind mount 只允许本 FDE 用户空间。
@@ -172,6 +180,10 @@ export function buildContainerConfig({
     `${hostRoot}/home:${home}`,
     `${hostRoot}/projects:${home}/projects`,
     `${hostRoot}/cache:${home}/cache`,
+    // #399：平台托管的 git 凭据——**挂目录不挂文件**（bind 不存在的文件 Docker 会造目录），
+    // 只读：容器内 agent 连 root 都写不动，git 的「认证被拒 ⇒ erase」再也删不掉那行。
+    // 镜像 /etc/gitconfig 的 fill-only helper 读 /run/erix/git/credentials（system 级、排 store 前）。
+    `${hostRoot}/platform/git:/run/erix/git:ro`,
   ];
   // P3 纵深防御：bind source realpath 后必须仍在 userSpaceRoot 内（防 symlink 逃逸）。
   for (const b of binds) assertBindSourceInsideRoot(userSpaceRoot, b.split(':')[0]);
@@ -235,6 +247,10 @@ export function ensureUserSpaceMountDirs({ userSpaceRoot, fdeName, uid, gid, log
   for (const sub of ['home', 'projects', 'cache']) {
     ensureDirSafe(root, path.join(fdeRoot, sub), { mode: 0o2770, uid, gid, log });
   }
+  // #399：平台托管凭据目录（portal 独占写；ro bind 进容器 /run/erix/git）。
+  // 属主跟 portal 进程（root），不给 FDE uid——FDE 在容器内本来就写不动（ro），宿主侧也不该可写。
+  // 0755：容器内 agentd(1001)/worker(1002) 需要穿越+读（ro bind 不改权限，只拦写）。
+  ensureDirSafe(root, path.join(fdeRoot, 'platform', 'git'), { mode: 0o755, uid: null, gid: null, log });
   return fdeRoot;
 }
 
@@ -717,14 +733,28 @@ export async function onboardFde(pool, config, {
     if (gitHost) {
       const hostName = new URL(gitHost.base_url).host;
       if (gitHost.mode === 'minted') {
-        if (!gitAccount?.token_ref) {
+        // #399 存在性判据：不再信 token_ref 非空（那只是远端 token 的 ID，与文件真实状态零耦合），
+        // 改问「平台那份文件里这一行在不在」。但判据只对**新代次运行时**成立：旧镜像容器只读
+        // legacy home/.git-credentials，拿平台文件判「缺」会误重铸。旧代次下沿用旧口径（token_ref 在即算在），
+        // 并顺手把存量搬进平台文件——搬了旧容器也照读 legacy，不会断（搬运幂等、token 不变）。
+        const newGenRuntime = needRecreate || containerHasPlatformGitBind(existing.status === 200 ? existing.data : null);
+        let credPresent = platformCredentialPresent({ config, fdeName, host: hostName });
+        if (!credPresent && gitAccount?.token_ref) {
+          credPresent = migrateLegacyCredential({ config, fdeName, host: hostName, log }) > 0;
+        }
+        let lostTokenRef = null;
+        if (newGenRuntime && gitAccount?.token_ref && !credPresent) {
+          lostTokenRef = gitAccount.token_ref;
+          log.warn?.(`[provisioner] ${fdeName}: platform git credential line missing for ${hostName}; re-minting (revoking old token_ref=${lostTokenRef})`);
+        }
+        if (!gitAccount?.token_ref || lostTokenRef) {
           const minted = await mintGitAccount({
             provider: gitHost.provider,
             mode: gitHost.mode,
             baseUrl: gitHost.base_url,
             adminKey: gitHost.admin_key,
             login: fdeName,
-            previousTokenRef,
+            previousTokenRef: previousTokenRef ?? lostTokenRef,
           });
           await setGitCredential({
             pool,

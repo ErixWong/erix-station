@@ -15,6 +15,8 @@ import {
   parseMemoryLimit,
   ensureFdeNetwork,
   ensureFdeContainer,
+  ensureUserSpaceMountDirs,
+  containerHasPlatformGitBind,
   fdeContainerIp,
   reconcileOnce,
   deprovisionFde,
@@ -120,11 +122,13 @@ test('buildContainerConfig：不 publish 端口 / bind mount 只允许本 FDE / 
   assert.equal(body.Labels['fde.name'], 'alice');
   // 不变式一：不 publish 端口（proxy P1 字段级 allowlist 拒绝任何 PortBindings 字段）
   assert.equal('PortBindings' in body.HostConfig, false);
-  // bind mount 只允许本 FDE 用户空间（user-space §2.4）；D8 修订：worktrees 挂载已拆除（#81 P2.5）
+  // bind mount 只允许本 FDE 用户空间（user-space §2.4）；D8 修订：worktrees 挂载已拆除（#81 P2.5）。
+  // #399：第四条是平台托管凭据的 ro bind——ro 必须硬锁在 create body 里，它是凭据不被 erase 的全部保障。
   assert.deepEqual(body.HostConfig.Binds, [
     '/srv/erix/users/alice/home:/home/erix',
     '/srv/erix/users/alice/projects:/home/erix/projects',
     '/srv/erix/users/alice/cache:/home/erix/cache',
+    '/srv/erix/users/alice/platform/git:/run/erix/git:ro',
   ]);
   // 只接自己的 /29
   assert.equal(body.HostConfig.NetworkMode, 'fde-alice');
@@ -1278,4 +1282,48 @@ test('issue #185 回归：disabled 的 FDE 仍在 desired 之外 → 容器/网�
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// issue #399：平台托管 git 凭据的 ro bind 与新代次判据。
+// 判据只在「容器确实挂了 /run/erix/git」时才允许拿平台文件说「缺」——旧代次容器只读
+// legacy home/.git-credentials，误判会白白吊销一枚好 token（重铸动静比搬运大一个量级）。
+// ---------------------------------------------------------------------------
+
+test('#399 containerHasPlatformGitBind：Mounts / Binds 两种 inspect 形状都认', () => {
+  assert.equal(containerHasPlatformGitBind(null), false);
+  assert.equal(containerHasPlatformGitBind({ HostConfig: { Binds: ['/x:/home/erix'] } }), false, '旧代次 = 假');
+  assert.equal(containerHasPlatformGitBind({ HostConfig: { Binds: ['/x:/home/erix', '/y/platform/git:/run/erix/git:ro'] } }), true);
+  assert.equal(containerHasPlatformGitBind({ Mounts: [{ Destination: '/run/erix/git', RO: true }] }), true, 'inspect 走 Mounts 形状也要认');
+  assert.equal(containerHasPlatformGitBind({ Mounts: [{ Destination: '/home/erix' }] }), false);
+});
+
+test('#399 ensureUserSpaceMountDirs 建出 platform/git（portal 属主 0755，不给 FDE 写权）', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-provisioner-399-'));
+  try {
+    ensureUserSpaceMountDirs({ userSpaceRoot: root, fdeName: 'bob', uid: SELF_UID, gid: SELF_GID, log: { warn() {} } });
+    const dir = path.join(root, 'bob', 'platform', 'git');
+    const stat = fs.statSync(dir);
+    assert.ok(stat.isDirectory());
+    assert.equal(stat.mode & 0o777, 0o755, 'ro bind 的宿主侧权限就是容器内读权限，必须 0755');
+    // home/projects/cache 三兄弟行为不回退
+    for (const sub of ['home', 'projects', 'cache']) {
+      assert.ok(fs.statSync(path.join(root, 'bob', sub)).isDirectory(), `${sub} 仍要创建`);
+    }
+    // 重跑幂等
+    ensureUserSpaceMountDirs({ userSpaceRoot: root, fdeName: 'bob', uid: SELF_UID, gid: SELF_GID, log: { warn() {} } });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('#399 buildContainerConfig：第四条 bind 必须硬锁 :ro（rw 会让 erase 复活）', () => {
+  const body = buildContainerConfig({
+    fdeName: 'bob', containerName: 'fde-bob', image: 'img', cmd: [],
+    networkName: 'fde-bob', ip: '10.200.1.2', gateway: '10.200.1.1',
+    baseDomain: 'example.test', llmHost: 'llm.example.test',
+    userSpaceRoot: '/srv/erix/users',
+  });
+  const credBind = body.HostConfig.Binds.find((b) => b.includes('/run/erix/git'));
+  assert.ok(credBind?.endsWith('/platform/git:/run/erix/git:ro'), `凭据 bind 必须挂目录且 :ro，实际 ${credBind}`);
 });

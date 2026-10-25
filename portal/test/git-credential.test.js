@@ -11,6 +11,9 @@ import {
   deleteGitCredential,
   GitCredentialError,
   listGitCredentials,
+  migrateLegacyCredential,
+  platformCredentialPresent,
+  removeGitCredentialFile,
   setGitCredential,
 } from '../src/git-credential.js';
 import { FakePool } from './fake-pool.js';
@@ -45,11 +48,16 @@ function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'station-git-credential-'));
   const home = path.join(root, 'alice', 'home');
   fs.mkdirSync(home, { recursive: true, mode: 0o2770 });
+  // #399：set/delete 现在写平台独占文件（portal 进程建目录，懒建）；home 里那份降为遗留只读存量。
+  // target = 平台文件（断言主面）；homeTarget = 遗留文件（验证「不碰」与 stale 清理语义）。
+  const platform = path.join(root, 'alice', 'platform', 'git');
+  fs.mkdirSync(platform, { recursive: true, mode: 0o755 });
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return {
     root,
     home,
-    target: path.join(home, '.git-credentials'),
+    target: path.join(platform, 'credentials'),
+    homeTarget: path.join(home, '.git-credentials'),
     config: { userSpaceRoot: root, fdeUid: SELF_UID, fdeGid: SELF_GID },
   };
 }
@@ -115,7 +123,7 @@ function assignedAccountPool({ baseUrl = 'https://github.com', flip = true } = {
 const materializeOutboxInserts = (pool) => pool.calls.filter((call) => call.sql.includes('INSERT INTO materialize_outbox'));
 const materializeRevisionInserts = (pool) => pool.calls.filter((call) => call.sql.includes('INSERT INTO materialize_revisions'));
 
-test('write merges hosts, replaces only the target host, and installs 0640 FDE-owned file', async (t) => {
+test('write merges hosts, replaces only the target host, and installs a 0644 platform-owned file', async (t) => {
   const f = fixture(t);
   const pool = recordingPool();
   const common = { pool, actorId: 'admin-id', config: f.config, fdeName: 'alice' };
@@ -135,9 +143,9 @@ test('write merges hosts, replaces only the target host, and installs 0640 FDE-o
   assert.ok(!fs.readFileSync(f.target, 'utf8').includes('ghp:secret@A'));
 
   const stat = fs.statSync(f.target);
-  assert.equal(stat.mode & 0o777, 0o640);
-  assert.equal(stat.uid, SELF_UID, '落盘属主必须等于 config.fdeUid');
-  assert.equal(stat.gid, SELF_GID, '落盘属组必须等于 config.fdeGid');
+  assert.equal(stat.mode & 0o777, 0o644, '平台文件必须 0644：容器内 ro 挂载只拦写，读要按 UID 给到 agentd/worker');
+  assert.equal(fs.statSync(path.dirname(f.target)).mode & 0o777, 0o755, '平台目录 0755：穿越+读');
+  assert.equal(fs.existsSync(f.homeTarget), false, '#399：set 不得再碰遗留 home 文件');
   assertNoTokenInDbCalls(pool, 'ghp:secret@A/?#%', 'glpat-gitlab-B-4567', 'ghp-new-token-9876');
   assert.deepEqual(pool.calls.filter((call) => call.sql.includes('INSERT INTO audit_log')).map((call) => call.params[1]), [
     'admin.git_credential_set',
@@ -146,7 +154,7 @@ test('write merges hosts, replaces only the target host, and installs 0640 FDE-o
   ]);
 });
 
-test('delete removes only the selected host and retains an empty 0640 file', async (t) => {
+test('delete removes only the selected host and retains an empty 0644 platform file', async (t) => {
   const f = fixture(t);
   const pool = recordingPool();
   const common = { pool, actorId: 'admin-id', config: f.config, fdeName: 'alice' };
@@ -160,9 +168,7 @@ test('delete removes only the selected host and retains an empty 0640 file', asy
   assert.ok(fs.existsSync(f.target));
   assert.equal(fs.readFileSync(f.target, 'utf8'), '');
   const stat = fs.statSync(f.target);
-  assert.equal(stat.mode & 0o777, 0o640);
-  assert.equal(stat.uid, SELF_UID, '空凭据文件仍由 config.fdeUid 持有');
-  assert.equal(stat.gid, SELF_GID);
+  assert.equal(stat.mode & 0o777, 0o644);
   assertNoTokenInDbCalls(pool, 'ghp-github-secret', 'glpat-gitlab-secret');
 });
 
@@ -192,7 +198,8 @@ test('atomic replacement leaves the old credential intact on rename failure', as
     auditCount,
     'failed writes are not audited as successful',
   );
-  assert.deepEqual(fs.readdirSync(f.home), ['.git-credentials'], 'temporary file is removed');
+  assert.deepEqual(fs.readdirSync(path.dirname(f.target)), ['credentials'], 'temporary file is removed');
+  assert.equal(fs.existsSync(f.homeTarget), false, '#399：平台写路径不再生成遗留 home 文件');
 });
 
 test('credential protocol follows matching git_hosts configuration and defaults to HTTPS without a match', async (t) => {
@@ -403,10 +410,11 @@ test('credential inputs reject whitespace-only values and tokens above the lengt
   assert.equal(pool.calls.length, 0);
 });
 
-test('materializer stale cleanup never removes the out-of-manifest credential file', async (t) => {
+test('materializer stale cleanup never removes credential files (neither legacy home nor platform)', async (t) => {
   const f = fixture(t);
   const contents = 'https://x-access-token:secret-token@github.com\n';
-  fs.writeFileSync(f.target, contents, { mode: 0o640 });
+  fs.writeFileSync(f.homeTarget, contents, { mode: 0o640 }); // #399 后遗留文件仍在 home，对账语义要跟住
+  fs.writeFileSync(f.target, contents, { mode: 0o644 });
   const materializer = createMaterializer({
     root: f.root, uid: SELF_UID, gid: SELF_GID, log: { warn() {} },
   });
@@ -422,7 +430,8 @@ test('materializer stale cleanup never removes the out-of-manifest credential fi
       },
     },
   });
-  assert.equal(fs.readFileSync(f.target, 'utf8'), contents);
+  assert.equal(fs.readFileSync(f.homeTarget, 'utf8'), contents);
+  assert.equal(fs.readFileSync(f.target, 'utf8'), contents, '#399：平台文件根本不在物化树里，也不得被 stale 清理误删');
 });
 
 test('admin HTTP endpoints require admin auth and never echo the submitted token', async (t) => {
@@ -586,14 +595,14 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
   const setBody = await set.json();
   assert.deepEqual(setBody, { host: 'github.com', username: 'alice-token', configured: true });
   assert.ok(!JSON.stringify(setBody).includes(secret));
-  assert.equal(fs.statSync(f.target).mode & 0o777, 0o640);
-  // 测试名声称「use login ownership」，此处真的锤一下属主（跟 config.fdeUid，非特权环境下即登录身份）。
-  assert.equal(fs.statSync(f.target).uid, SELF_UID, 'FDE 自助写入的凭据文件必须属于该 FDE 的属主');
-  assert.equal(fs.statSync(f.target).gid, SELF_GID, 'FDE 自助写入的凭据文件必须属于该 FDE 的属组');
+  assert.equal(fs.statSync(f.target).mode & 0o777, 0o644, '#399：自助端点也写平台独占文件（0644，容器内 ro）');
+  // 属主跟 portal 进程（生产 root / 测试环境登录身份）：平台文件不再按 config.fdeUid 投放。
+  assert.equal(fs.statSync(f.target).uid, SELF_UID, '平台凭据文件属主 = portal 进程身份');
+  assert.equal(fs.existsSync(f.homeTarget), false, '#399：set 不再写遗留 home 文件');
   let initialContents = fs.readFileSync(f.target, 'utf8');
   assert.ok(initialContents.startsWith('http://alice-token:'));
   assert.ok(initialContents.includes(secret));
-  assert.deepEqual(fs.readdirSync(f.home), ['.config', '.git-credentials'], 'atomic rename leaves no temporary file');
+  assert.deepEqual(fs.readdirSync(f.home), ['.config'], 'home 只剩 CLI 配置；凭据行在平台文件，rename 不留 temp');
 
   const get = await fetch(endpoint, { headers: { cookie: cookie(fdeToken) } });
   assert.equal(get.status, 200);
@@ -643,7 +652,7 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
     fs.renameSync = originalRename;
   }
   assert.equal(fs.readFileSync(f.target, 'utf8'), initialContents, 'failed rename preserves old credential');
-  assert.deepEqual(fs.readdirSync(f.home), ['.config', '.git-credentials']);
+  assert.deepEqual(fs.readdirSync(path.dirname(f.target)), ['credentials'], 'failed rename 不留 temp');
 
   const deleteResponse = await fetch(endpoint, {
     method: 'DELETE',
@@ -658,4 +667,64 @@ test('FDE self-service credentials use login ownership, write atomically, and ne
     assert.ok(!JSON.stringify(call.params).includes('replacement-secret'), 'failed-write token must not reach DB parameters');
   }
   assert.ok(pool.audit.every((entry) => !entry.details.includes(secret)));
+});
+
+// ---------------------------------------------------------------------------
+// issue #399：平台独占凭据文件（platform/git/credentials，容器内 /run/erix/git ro）
+// ---------------------------------------------------------------------------
+
+test('#399 setGitCredential 写平台文件：0644、懒建目录、不落 legacy', async (t) => {
+  const f = fixture(t);
+  const pool = recordingPool();
+  await setGitCredential({ pool, config: f.config, fdeName: 'alice', host: 'git.example.test', username: 'alice', token: 'tok-399-a' });
+  assert.equal(fs.readFileSync(f.target, 'utf8'), 'https://alice:tok-399-a@git.example.test\n');
+  assert.equal(fs.statSync(f.target).mode & 0o777, 0o644);
+  assert.equal(fs.existsSync(f.homeTarget), false, 'legacy home 文件不得被创建');
+});
+
+test('#399 platformCredentialPresent 是文件级判据：有行/无行/无文件三种形状', async (t) => {
+  const f = fixture(t);
+  assert.equal(platformCredentialPresent({ config: f.config, fdeName: 'alice', host: 'git.example.test' }), false, '文件不存在 = 不在');
+  const pool = recordingPool();
+  await setGitCredential({ pool, config: f.config, fdeName: 'alice', host: 'git.example.test', username: 'alice', token: 'tok-399-b' });
+  assert.equal(platformCredentialPresent({ config: f.config, fdeName: 'alice', host: 'git.example.test' }), true);
+  assert.equal(platformCredentialPresent({ config: f.config, fdeName: 'alice', host: 'other.example.test' }), false, '逐 host 判，不做存在即真');
+  await deleteGitCredential({ pool, config: f.config, fdeName: 'alice', host: 'git.example.test' });
+  assert.equal(platformCredentialPresent({ config: f.config, fdeName: 'alice', host: 'git.example.test' }), false, '删除后判据必须翻回假');
+});
+
+test('#399 migrateLegacyCredential 整行原样搬运、token 不变、幂等、只动目标 host', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.homeTarget, [
+    'https://alice:legacy-gitea-token@git.example.test',
+    'https://x-access-token:ghp-self-config@github.com',
+  ].join('\n') + '\n', { mode: 0o640 });
+
+  assert.equal(migrateLegacyCredential({ config: f.config, fdeName: 'alice', host: 'git.example.test', log: { log() {}, warn() {} } }), 1);
+  assert.equal(fs.readFileSync(f.target, 'utf8'), 'https://alice:legacy-gitea-token@git.example.test\n', 'token 必须原样（不重编码、不换发）');
+  assert.equal(fs.readFileSync(f.homeTarget, 'utf8'), 'https://x-access-token:ghp-self-config@github.com\n', 'FDE 自配行不碰（要点 4）');
+  assert.equal(migrateLegacyCredential({ config: f.config, fdeName: 'alice', host: 'git.example.test', log: { log() {}, warn() {} } }), 0, '重跑 = 0，幂等');
+  assert.equal(platformCredentialPresent({ config: f.config, fdeName: 'alice', host: 'git.example.test' }), true);
+});
+
+test('#399 listGitCredentials 合并两份文件：平台份优先、同 host 不双列', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.homeTarget, 'https://alice:stale-old-token@git.example.test\nhttps://x-access-token:ghp-self@github.com\n', { mode: 0o640 });
+  const pool = recordingPool();
+  await setGitCredential({ pool, config: f.config, fdeName: 'alice', host: 'git.example.test', username: 'alice', token: 'fresh-platform-token' });
+  const { hosts } = await listGitCredentials({ config: f.config, fdeName: 'alice' });
+  assert.deepEqual(hosts.map((h) => h.host).sort(), ['git.example.test', 'github.com']);
+  const gitea = hosts.find((h) => h.host === 'git.example.test');
+  assert.equal(gitea.token, '****oken', '列出的必须是平台那份（先答先赢的实际生效方）');
+  assert.ok(!gitea.token.includes('stale'));
+});
+
+test('#399 removeGitCredentialFile（offboarding）把平台那份一并清掉', async (t) => {
+  const f = fixture(t);
+  const pool = recordingPool();
+  await setGitCredential({ pool, config: f.config, fdeName: 'alice', host: 'git.example.test', username: 'alice', token: 'tok-399-c' });
+  fs.writeFileSync(f.homeTarget, 'https://x-access-token:ghp-self@github.com\n', { mode: 0o640 });
+  assert.equal(removeGitCredentialFile({ config: f.config, fdeName: 'alice' }), true);
+  assert.equal(fs.existsSync(f.target), false, 'offboarding 不留托管凭据残留');
+  assert.equal(fs.existsSync(f.homeTarget), false);
 });
