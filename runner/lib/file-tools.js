@@ -156,8 +156,12 @@ function isRootFormPath(value) {
   if (typeof value !== 'string') return false;
   const trimmed = value.trim();
   if (trimmed === '') return true;
-  if (!trimmed.startsWith('.')) return false;   // 真实子目录名（`sub` / `sub/`）与绝对路径一律不算
-  return trimmed.startsWith('./') || trimmed === '.';
+  // ⚠ erix-agent 0.25.0 起这条必须**逐段判**，不能写 `startsWith('./')`：`./nested/sub` 是**子目录**
+  // 写法，上游 0.25 的契约（`test/contract/file-tools.js` 的 #358 那组）要求它的首行是
+  // `nested/sub/`；旧写法把它当根 ⇒ 整棵树退化成根目录、首行 `./`（模型看到的是**错目录的树**，
+  // 0.23 时代上游自己把子目录标签也归一掉了，所以这条一直没炸——它是被上游的修正**揭出来**的）。
+  // 判据：剥掉空段与 `.` 段之后什么都不剩，才是根写法（`''` / `'.'` / `'./'` / `.//` / `././`）。
+  return trimmed.split('/').filter((segment) => segment !== '' && segment !== '.').length === 0;
 }
 
 /** 解析后就是根的其他写法（绝对根路径、`sub/..`）：也归一根标签，但不改上游入参。 */

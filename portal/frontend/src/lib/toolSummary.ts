@@ -102,20 +102,23 @@ export function formatDuration(ms: number): string {
 
 // ---------------------------------------------------------------------------
 // issue #299（erix-agent 0.20.0 / host-upgrade-guide-0.20.0 §7，上游 #286 追加项）：
-// `executionStatus` 的存在条件——**只在两种特殊状态下存在**
+// `executionStatus` 的存在条件——**只在特殊状态下存在**（0.25.0 起是三种，上游 #409 加了 `rejected`）
 //   * `intercepted` = 审计拦截（调用从未执行）
 //   * `interrupted` = resume 改写 / 续跑时被中止
+//   * `rejected`    = **引数解析失败**（工具从未执行；判词见引擎 `src/messages/tool-arguments.js`）
 // 普通成功或失败的结果块上这个字段是**缺席**的（`undefined`）——不是空串、也不是 `ok` 占位。
 // 机器可读条件在引擎常量里：`TOOL_RESULT_CONTRACT.engine.fields.executionStatus`
-//   = `{ writtenFor: "special states only", presentValues: ["intercepted","interrupted"] }`。
+//   = `{ writtenFor: "special states only", presentValues: ["intercepted","interrupted","rejected"] }`
+//   （`tool-fact.js:77`，0.25.0 实测）。⚠ **这张表由上游驱动**：0.23→0.25 就加了一个值，上面那句
+//   「两种」的旧注释已经错过一次 ⇒ 升级引擎时必须与随包契约套件同时核，不要手改口径。
 //
 // ⚠ 因此**禁止**把「字段存在」当成「这个块值得关注」的判据（那是 0.19 之前的误读）：
-//    判特殊状态请拿值与这两个字符串比，用下面的 `isSpecialExecutionStatus`，不要写 `!== undefined`。
+//    判特殊状态请拿值与**这张表**比，用下面的 `isSpecialExecutionStatus`，不要写 `!== undefined`。
 //    随包 `toolResultEnvelopeContract` 现在会在普通块上**无条件断言其缺席**。
 // ---------------------------------------------------------------------------
 
-/** 引擎 `erix.executionStatus` 的两个合法取值（与上游常量的 presentValues 逐项一致）。 */
-export const SPECIAL_EXECUTION_STATUSES = ['intercepted', 'interrupted'] as const;
+/** 引擎 `erix.executionStatus` 的合法取值（与上游常量 `TOOL_RESULT_CONTRACT…presentValues` 逐项一致）。 */
+export const SPECIAL_EXECUTION_STATUSES = ['intercepted', 'interrupted', 'rejected'] as const;
 
 /** 值比对（不是存在性比对）：这个 executionStatus 是不是「值得关注」的特殊状态。 */
 export function isSpecialExecutionStatus(status: unknown): boolean {
