@@ -445,6 +445,46 @@ describe('issue #189：折叠横幅渲染', () => {
     expect(wrapper.findAll('.msg')).toHaveLength(0);
   });
 
+  // D 片（issue #392）：横幅上的「可见性说明」——折叠的全部意义是「模型从此看不见原文」，
+  // 而这半句此前只存在于实现者脑子里。判据分三态，第三态（键缺席）尤其重要：它挡的是
+  // 「拿旧数据凭空断言本次没有摘要」这种新造谎言。
+  it('D 片：hasSummary=true → 说明行报轮数并声明「摘要就是全部」', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: true } }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('4 轮');            // range 2–5 ⇒ 4 轮，必须由 range 算出
+    expect(notice.text()).toContain('不再逐字可见');
+    expect(notice.text()).toContain('摘要就是它留下的全部');
+  });
+
+  it('D 片：hasSummary=false → 不许许诺摘要，改成指路「查看原文」', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: false } }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('不再逐字可见');
+    expect(notice.text()).toContain('本次没有生成摘要');
+    expect(notice.text()).not.toContain('摘要就是它留下的全部'); // 无摘要时说这句就是空头支票
+  });
+
+  it('D 片：hasSummary 键缺席（旧 DTO）⇒ 整行不渲染，不凭空断言', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry());                   // helper 默认不带 hasSummary
+    const wrapper = mountPanel();
+    expect(wrapper.findAll('.folded-visibility')).toHaveLength(0);
+    expect(wrapper.get('.folded-banner').text()).toContain('已压缩第 2–5 轮'); // 标题照旧
+  });
+
+  it('D 片：无 range 时不报轮数（#375：拿归档条数报轮数是假话）', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: true, foldedRoundRange: undefined } }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('这部分原文');
+    expect(notice.text()).not.toMatch(/\d+ 轮/);
+  });
+
   it('无折叠消息 → 不渲染横幅', () => {
     const store = useWorkbenchStore();
     store.sessionId = 's1';

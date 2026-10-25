@@ -160,6 +160,13 @@ export const en = {
       range: 'Compressed rounds {from}–{to}',
       countOnly: 'Compressed {count} messages',
       bare: 'Compressed',
+      // D 片（issue #392）：visibility line. The title answers "what was compressed"; this line answers
+      // "who can no longer see it". `hasSummary` key absent (old DTO) ⇒ the whole line is not rendered
+      // (same "absent key = unknown" discipline as #390-A). Round count only from `foldedRoundRange`.
+      visibility: '{n} rounds of original text are no longer visible to the model; the summary below is all that remains.',
+      visibilityNoSummary: '{n} rounds of original text are no longer visible to the model, and this fold produced no summary — use “View original” to read them.',
+      visibilityBare: 'This original text is no longer visible to the model; the summary below is all that remains.',
+      visibilityNoSummaryBare: 'This original text is no longer visible to the model, and this fold produced no summary — use “View original” to read them.',
       viewOriginal: 'View original',
       // #388: the original block's own collapse entry (hides only, never clears the cache; re-expanding does not refetch)
       collapseOriginal: 'Collapse original',
@@ -269,7 +276,8 @@ export const en = {
       judgeDegraded: 'judge degraded ({error}); no verdict this round',
       judgeUnknownAction: 'judge action: {action}',
       judgeNoDetail: 'judge event (no interpretable details)',
-      compaction: 'Context compaction (round {round}): {folded} rounds folded, {before} → {after} tokens',
+      compaction: 'Context compaction (round {round}, strategy {strategy}): {folded} rounds folded, {before} → {after} tokens',
+      compactionStrategyUnknown: 'unknown',
       finalGuard: 'final guard: {action}{dash}',
       forcedFinal: 'forced final (round {round}): {reason}',
       runEnd: 'run ended: {reason}{usage}',

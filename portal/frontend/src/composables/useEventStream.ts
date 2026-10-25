@@ -741,6 +741,11 @@ export function useEventStream(hooks: EventStreamHooks) {
           folded: c.foldedRounds ?? 0,
           before: c.tokensBefore ?? '?',
           after: c.tokensAfter ?? '?',
+          // #464 A：引擎在事件里带的是**实例上的策略名**（含库层兜底 "sliding-window"），不是配置项原文。
+          // 旧事件没这个字段 ⇒ 显式填「未知」，别留空让人以为策略名字就叫空串。
+          strategy: typeof c.strategyName === 'string' && c.strategyName !== ''
+            ? c.strategyName
+            : t('stream.event.compactionStrategyUnknown'),
         }));
         return;
       }
