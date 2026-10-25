@@ -25,6 +25,15 @@ export const MSG = {
   STORE_RESPONSE: 'store_response',
   APPROVAL_DECISION: 'approval_decision',
   ABORT: 'abort',
+  /**
+   * #370：转向标记（agentd → worker）。**与 `ABORT` 的区别就是 issue #370 的全部要点**：
+   * `ABORT` = 「现在就砍」——agentd 同时起 5s SIGKILL 宽限，正在跑的 shell 进进程组被杀；
+   * `STEER_ARM` = 「**本轮跑完再停**」——只装一个标记，worker 在 erix-agent 的 `onRound`
+   * （本轮已落库、下一次 provider 调用之前）里自己 abort。于是转向的投递点与 pi 的 steer 定义
+   * 重合（*after the current assistant turn finishes executing its tool calls, before the next
+   * LLM call*）。⇒ 收到它**不得**发 SIGKILL、不得起宽限、不得置 `ctx.dropped`。
+   */
+  STEER_ARM: 'steer_arm',
 };
 
 /**

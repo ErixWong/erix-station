@@ -120,6 +120,10 @@ process.on('message', (msg) => {
     case MSG.ABORT:
       if (abortController) abortController.abort();
       break;
+    case MSG.STEER_ARM:
+      // 只装标记（见上面 steerArmed 的注释）。重复投递幂等；run 已结束时无 abortController 也无妨。
+      steerArmed = true;
+      break;
     case MSG.APPROVAL_DECISION: {
       const p = pendingApproval.get(msg.req_id);
       if (p) {
@@ -152,6 +156,14 @@ let eventCounter = 0;
 let runId = null;
 let attempt = 1;
 let abortController = null;
+/**
+ * #370：转向标记。`STEER_ARM` 只置位、不 abort；真正 abort 的位置是引擎的 `onRound`
+ * （本轮 transcript 已落库、下一次 provider 调用之前）。⇒ 「本轮跑完再停」，正在执行的工具
+ * 会跑完（与「停止」的立即 SIGKILL 相对），投递点与 pi 的 steer 定义重合。
+ */
+let steerArmed = false;
+/** 本次 run 是否曾经装填过转向（`steerArmed` 会被消费清零，终态信封需要的是「曾经装过」这个事实）。 */
+let steeredThisRun = false;
 const pendingApproval = new Map();
 
 function makeEvent(type, payload) {
@@ -309,6 +321,10 @@ async function startRun(msg) {
   runId = msg.run_id;
   attempt = Number(msg.attempt ?? 1);
   abortController = new AbortController();
+  steeredThisRun = false;
+  // #370：每个 run 自己一份标记。⚠ 必须在 `startRun` 里复位——同一个 worker 进程会被 agentd
+  // 复用给下一个 run（`RUN_START` 再次进来），漏复位就等于「上个 run 的转向把下个 run 也停了」。
+  steerArmed = false;
 
   const { task, cwd } = msg;
   const modelConfigPath = msg.config?.model_config_path || '/home/erix/.erix/config.json';
@@ -649,6 +665,23 @@ async function startRun(msg) {
       wrapup: false,
       // 7) signal
       signal: abortController.signal,
+      // 8) #370：转向的唯一落点。**为什么是 onRound**（erix-agent 0.25.0 实证，行号请按当天实际
+      //    安装版本重核）：`onRound` 是**被 await 的**且**在本轮 transcript 落库之后、`round_end`
+      //    之前**才响（`src/loop/orchestrator.js:4342`），而轮循环**圈顶先查一次中止**（`:3722`，
+      //    PR #291 必修 1：「本轮已跑完的记录照旧落库，只是不再为它发起下一轮请求」）。一「轮」在本
+      //    引擎里 = 一次 provider 调用 + 它的工具调用执行 ⇒ 在这里 abort 得到的正是
+      //    「当前 assistant 轮的工具调用全部跑完、下一次 LLM 调用之前」，与 pi 对 steer 的定义重合。
+      // 红线：① 抛错**不是**控制流（#173：观察者抛错只记一笔、run 继续），要停只认 `signal.abort()`；
+      //      ② **不得**在这里 park 等下一条队列输入冒充 input port——那会静默卡住 run，拿 90s 租约
+      //         与 F6 静默看门狗（#288 `watchdog_silent`）冒险。所以本回调同步返回、零 await。
+      onRound: () => {
+        if (steerArmed && abortController && !abortController.signal.aborted) {
+          steeredThisRun = true; // 一次性快照：`steerArmed` 下面就被清零
+          steerArmed = false; // 一次性：装配完就摘，免得同一 run 后续每轮都判一次
+          sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'info', msg: 'steer: aborting at round boundary' });
+          abortController.abort();
+        }
+      },
     });
 
     // issue #322：标题归 portal 生成（`portal/src/title-llm.js` → `portal/src/llm-chat.js`），
@@ -675,7 +708,11 @@ async function startRun(msg) {
     // erix-agent #180（0.18.0）：usage/rounds 也从信封取引擎挂在错误上的真值，
     // 「停止」/失败的 run 不再是账面上的 0 token（引擎没挂时回退零值）。
     const aborted = abortController?.signal?.aborted === true;
-    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted });
+    // #370：`steered` 只往 `termination.detail` 补一个 'steered'（不改 reason、不覆盖引擎给的 detail），
+    // 前端据此把终态行刷中性并抑制「重试上一条」。注意用的是**快照**：上面的 abort 会把标记清零，
+    // 而「这次是不是转向」这件事必须一路带到终态信封。
+    const steered = steerArmed || steeredThisRun;
+    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted, steered });
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
