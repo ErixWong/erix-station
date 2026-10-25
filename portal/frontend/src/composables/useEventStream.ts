@@ -36,6 +36,10 @@ const EVENT_TYPES = [
   'tool_replay_decision_required',
   'tool_call_delta', 'judge', 'compaction', 'final_guard', 'forced_final',
   'run_end', 'session_updated', 'ping', 'resync', // issue #88：session_updated = 自动标题刷新（live-only，不落 run_events）
+  // issue #371-A：引擎落盘失败告警（erix-agent#461 起带 `fatal`）。本数组是 EventSource 逐类型
+  // `addEventListener` 的唯一来源，漏加就是**实时一条都收不到**（不报错不警告）；与下面
+  // HISTORY_REPLAY_TYPES 与 `http.js` 的 HISTORY_EVENT_TYPES 是三处独立存亡的集合（#288）。
+  'persistence_error',
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
@@ -58,6 +62,10 @@ const HISTORY_REPLAY_TYPES = new Set([
   // 与上方 EVENT_TYPES 是**三处独立存亡的集合**（只加一边分别会「实时收不到」或「刷新后消失」，
   // 本分支已用变异逐条证明过），口径见 docs/api/portal.md §5.3 第 15 行与 AGENTS §8.22。
   'tool_replay_decision_required',
+  // issue #371-A：与上面 `EVENT_TYPES` 与 `http.js` 的 `HISTORY_EVENT_TYPES` **同步**加（三处只加
+  // 一边就分别得到「实时收不到」或「刷新后消失」）。它是展示类、不驱动运行态状态机：
+  // 致命失败的红面仍然只由 `run_end`（`persistence_failed`）负责。
+  'persistence_error',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
@@ -628,6 +636,22 @@ export function useEventStream(hooks: EventStreamHooks) {
         const toolName = typeof d.name === 'string' && d.name !== '' ? d.name : null;
         hooks.onSep(t('stream.event.toolReplaySkipped', {
           tool: toolName ? t('stream.event.toolReplayTool', { name: toolName }) : '',
+        }));
+        return;
+      }
+      case 'persistence_error': {
+        // issue #371-A：落盘失败告警（引擎 `orchestrator.js` 的 `persistenceErrorEvent`，
+        // erix-agent#461 起附 `fatal`）。**只有 `fatal === false` 在这里刷中性分隔行**：
+        //   · `fatal === true` / 字段缺失（= erix-agent 0.23.0 及以前的旧事件）⇒ 本次 run 正在或
+        //     已经终止，红色面归 `run_end` 的 `persistence_failed` 管；这里再刷一条就是把一件事
+        //     报两遍，也不能刷成中性——那会把真失败降成灰（谎报严重程度，同 #212 口径）。
+        //   · 非致命这条**不影响本次任务**（剥掉的是折叠归档，原文仍在各轮记录里，#375 负责取回），
+        //     所以走 hooks.onSep 的中性分隔行，不走红色错误行那一支。
+        // `operation` 是引擎透传的外来数据：非字符串/空串一律退到 `round`（不 `String(对象)`
+        // 把 `[object Object]` 渗进用户可见文案，同 #261/#288C 口径）。
+        if (d.fatal !== false) return;
+        hooks.onSep(t('stream.event.persistenceDegraded', {
+          operation: typeof d.operation === 'string' && d.operation !== '' ? d.operation : 'round',
         }));
         return;
       }
