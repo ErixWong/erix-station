@@ -67,6 +67,32 @@ test('竞态兜底：signal 已 abort 但引擎给了兜底值 failed → 以 ab
   // agentd 据此把 run 收敛为 finished（runner/agentd.js:929），与改动前一致：「停止」不会变红成失败
 });
 
+// issue #370：转向（轮边界 abort）与「用户按停止」在 reason 上**本来就同值**（都是 aborted），
+// 区分它们只靠 detail='steered'。两条红线：① **不得改 reason**（reason 值域由引擎定义，portal.md §5.3
+// 的向后兼容红线，新增一个 reason 会让所有旧前端落到未知分支）；② **不得覆盖引擎已给的 detail**。
+test('#370 steered 只补 detail、不改 reason、也不覆盖引擎给的 detail', () => {
+  // 引擎给了 aborted、没给 detail → 补一个
+  assert.deepEqual(
+    buildFailureEnvelope({ err: { termination: { reason: 'aborted' } }, aborted: true, steered: true }).termination,
+    { reason: 'aborted', detail: 'steered' },
+  );
+  // 引擎已给 detail → 一个字不动（引擎的 detail 是一手信息，宿主不许覆盖）
+  assert.deepEqual(
+    buildFailureEnvelope({ err: { termination: { reason: 'aborted', detail: 'user_abort' } }, aborted: true, steered: true }).termination,
+    { reason: 'aborted', detail: 'user_abort' },
+  );
+  // reason 永远不因 steered 而变：引擎判成 persistence_failed 时不允许出现 reason:'steered'
+  assert.deepEqual(
+    buildFailureEnvelope({ err: { termination: { reason: 'persistence_failed', phase: 'snapshot' } }, aborted: false, steered: true }).termination,
+    { reason: 'persistence_failed', phase: 'snapshot' },
+  );
+  // 未 steered（普通停止）→ 不得冒出 detail（前端据它判「是不是转向」，冒错就会把停止画成中性转向）
+  assert.deepEqual(
+    buildFailureEnvelope({ err: new Error('boom'), aborted: true }).termination,
+    { reason: 'aborted' },
+  );
+});
+
 test('竞态兜底只覆盖兜底值 failed：引擎给出 persistence_failed 时仍以引擎为准', () => {
   const { termination } = buildFailureEnvelope({
     err: { message: 'm', termination: PERSISTENCE_TERMINATION },
@@ -109,7 +135,9 @@ test('message 兜底：无 message 时用 String(err)，绝不产出 undefined',
 test('worker.js 确实用了本模块（catch 里没有第二份实现）', () => {
   const worker = fs.readFileSync(path.join(HERE, '../worker.js'), 'utf8');
   assert.match(worker, /import \{ buildFailureEnvelope \} from '\.\/lib\/termination\.js';/);
-  assert.match(worker, /const \{ termination, error, usage, rounds \} = buildFailureEnvelope\(\{ err, aborted \}\);/);
+  // issue #370 加了第三个入参 `steered`（只往 termination.detail 补 'steered'），故这里的形状断言随之更新：
+  // 断言仍锁死「catch 里只有这一处调用、没有第二份手写实现」这一原意，只是把入参表写成三参数版。
+  assert.match(worker, /const \{ termination, error, usage, rounds \} = buildFailureEnvelope\(\{ err, aborted, steered \}\);/);
 });
 
 // ---------- erix-agent #180（0.18.0）：失败/中止终态不再谎报零用量 ----------

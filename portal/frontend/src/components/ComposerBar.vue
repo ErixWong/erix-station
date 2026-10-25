@@ -7,12 +7,24 @@ import { useWorkbenchStore } from '../stores/workbench';
 // issue #101 P2：用户可见文案走 i18n（composer.*；占位符来自 store.inputPlaceholder）。
 const { t } = useI18n();
 const store = useWorkbenchStore();
+// issue #370：运行中说话（转向 / 排队）与队列条。空值提交由 store 兜底，按钮 disable 只是体验层。
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key !== 'Enter') return;
+  if (e.altKey) {
+    // issue #370：Alt+Enter = 排队（照 pi ChatInput 的 alt+Enter → followUp）。必须先于 Shift 判：
+    // 三键组合里 Alt 的语义要唯一，否则 macOS 上 Option+Enter 会落进「换行」那一支。
     e.preventDefault();
-    store.send();
+    void store.sendQueued('follow_up');
+    return;
   }
+  if (e.shiftKey) return; // 原生换行
+  e.preventDefault();
+  // issue #370：运行中 Enter = 转向，空闲 Enter = 发送。⚠ 这里选的只是**动作**（调哪个 action），
+  // 「入队还是直发」的最终裁决永远在后端那个事务里（见 store.sendQueued 的注释）——前端判错
+  // 最坏结果是多一次网络往返，绝不会把消息判丢。
+  if (store.running) void store.sendQueued('steer');
+  else void store.send();
 }
 </script>
 
@@ -38,7 +50,29 @@ function onKeydown(e: KeyboardEvent) {
       :disabled="store.retryInFlight"
       @click="store.retryLast()"
     >{{ t('composer.retry') }}</button>
+    <!-- issue #370：运行中发送键分裂成两个动作（对齐 agegr/pi-web ChatInput.tsx:802-825 的
+         steer / follow_up 双按钮与 pi 的 Enter=steer、Alt+Enter=follow_up）。
+         文案叫「转向」而不是「打断并转向」：轮边界语义与 pi 的 steer 一致，但 5 个字会在用户
+         最需要按下它的那一刻把人吓住（理由全文见 portal.md §4.3a）。 -->
+    <template v-if="store.running">
+      <button
+        data-queued-kind="steer"
+        class="rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white px-4 disabled:opacity-50"
+        :disabled="!store.inputValue.trim() || store.sendDisabled"
+        :title="t('composer.steerHint')"
+        @click="store.sendQueued('steer')"
+      >{{ t('composer.steer') }}</button>
+      <button
+        data-queued-kind="follow_up"
+        class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5 disabled:opacity-50"
+        :disabled="!store.inputValue.trim() || store.sendDisabled"
+        :title="t('composer.followUpHint')"
+        @click="store.sendQueued('follow_up')"
+      >{{ t('composer.followUp') }}</button>
+    </template>
     <button
+      v-else
+      data-queued-kind="send"
       class="rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white px-4 disabled:opacity-50"
       :disabled="store.sendDisabled"
       @click="store.send()"

@@ -674,7 +674,9 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     store.inputValue = '任务';
     await store.send(); // 用户消息成功入队后本地进入 run 状态
     expect(store.es.activeRunId).toBe('r1');
-    expect(store.sendDisabled).toBe(true);
+    // 断言被 issue #370 有意改掉：运行中**不再禁用发送**（那句话改走输入队列，而不是「等一会儿
+    // 再说」）。这里从 `true` 改成 `false`，语义由「跑着就别说话」变成「随时能说，服务端决定入队」。
+    expect(store.sendDisabled).toBe(false);
 
     const connection = FakeEventSource.instances.at(-1)!;
     connection.onerror?.(); // EventSource 断线，期间 run_end 丢失
@@ -714,7 +716,8 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     connection.onopen?.();
     await vi.waitFor(() => expect(store.es.activeRunId).toBe('r1'));
     expect(store.running).toBe(true);
-    expect(store.sendDisabled).toBe(true);
+    // 同上：issue #370 之后运行中仍可发送（走队列），故此断言由 true 改为 false。
+    expect(store.sendDisabled).toBe(false);
     expect(store.entries.some((e) => e.kind === 'sep' && e.text.includes('连接中断期间'))).toBe(false);
   });
 

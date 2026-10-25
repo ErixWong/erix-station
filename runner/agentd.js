@@ -332,6 +332,20 @@ function handleSseChunk(raw) {
     if (ctx) abortRun(ctx, 'stop_request');
     return;
   }
+  // #370：转向下行。**不走 abortRun**——那会起 5s SIGKILL 宽限并砍掉正在跑的工具，正是本轮边界
+  // 停止要避免的事（口径见 lib/ipc.js MSG.STEER_ARM 的注释）。找不到 ctx = 该 run 不在本容器跑
+  // （已结束/别的容器），忽略即可：portal 侧的队列不因此丢失，终态出队会把它投成新 run。
+  if (event === 'steer_request') {
+    const runId = payload?.run_id;
+    const ctx = runId ? state.runs.get(runId) : null;
+    if (ctx?.worker?.connected) {
+      sendIpc(ctx.worker, { type: MSG.STEER_ARM, run_id: runId });
+      log('info', 'steer armed', { run_id: runId });
+    } else {
+      log('debug', 'steer_request ignored (no live worker)', { run_id: runId });
+    }
+    return;
+  }
   if (event === 'revoke') {
     log('warn', 'revoke received', { reason: payload?.reason ?? 'revoked' });
     beginRevoke(payload?.reason ?? 'revoked');
