@@ -634,11 +634,6 @@ async function startRun(msg) {
       /* #392:context-strategy:start */
       context: {
         strategy: 'fold-statistical',
-        /* #392:C-onFoldSummary:start */
-        // 折一次 → 写一条注（lib/fold-notes.js）。引擎保证「无 text 不调用」，本处只管投递与失败不上抛。
-        // 不接线的情形只有一个：notes 工具整体不可用（上面 foldNoteSink = null）。
-        ...(foldNoteSink ? { onFoldSummary: foldNoteSink.onFoldSummary } : {}),
-        /* #392:C-onFoldSummary:end */
       },
       /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
@@ -693,6 +688,16 @@ async function startRun(msg) {
       // 注入 run-state 的 semantic 段；undefined/非函数时引擎按「未提供」跳过（工厂加载失败的
       // 降级路径同样安全：noteTools 回退对象无此字段）。
       semanticStateProvider: noteTools.semanticStateProvider,
+      /* #392:C-onFoldSummary:start */
+      // 折一次 → 写一条注（`lib/fold-notes.js`）。⚠ **这是顶层选项，不是 `context` 键**：引擎从
+      // options 里解构它（`orchestrator.js` 的 `onFoldSummary` 形参 + `option-normalization.js` 的
+      // `RUN_TOOL_LOOP_OPTION_NAMES` 白名单），而 `context` 里自前只认 `strategy`。
+      // 塞错一层不会报错，只会**静默不投递**（真机现场：折叠照跑、注一条不写）——#331 那根
+      // 「没人读的光纤」的原样重现。判据：`runner/test/fold-notes.test.js` C12/C14 与
+      // `runner/test/fold-notes-e2e.test.js` E2（真 `runToolLoop` 里折出来的才算）。
+      // 引擎契约：“无 text 不调用”；本处只管投递与失败不上抛。
+      ...(foldNoteSink ? { onFoldSummary: foldNoteSink.onFoldSummary } : {}),
+      /* #392:C-onFoldSummary:end */
       store,
       // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
       runId: transcriptKey,

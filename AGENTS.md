@@ -2150,3 +2150,45 @@ notesStore 句柄，也不该塞 fs/DB）。
 `node --check` 204 文件 0 失败。根套件 1634 条里唯一那格红是 `portal/test/termination-contract.test.js`
 的 tripwire 读**安装态**引擎版本（本地 `node_modules` 是借来的 0.25.0），CI `npm ci` 下即 0.26.0 ——
 它红得正好：那根线闸的作用就是「版本变了必须重开 issue 复核 reason 全集」（§8.65）。
+
+### 8.67 E 片：端到端验「折叠 → 写注 → 注回到模型输入」，当场抓到 C 片是死光纤（2026-10-26，分支 `feat-261026-02-fold-notes-e2e`）
+
+§8.66 的 C 片有 13 条判据全绿。它们证明的是「给定一个 `foldedFacts` 形态的 payload，投递器会把注写对」。
+它们**没有**证明：引擎在真折叠时会调用那个回调、以及写出的注会不会回到模型可见输入。补一片端到端
+（`runner/test/fold-notes-e2e.test.js`，真 `runToolLoop` + 桩 provider 录下每一份请求 + 真 notes 工厂与
+真投递器落真目录）当天就抓到两件事：
+
+**① C 片的接线是错的，而且是本站最经典的那种错。** `onFoldSummary` 我塞进了 `context`，而引擎从
+**顶层 options** 解构它（`src/loop/option-normalization.js` 的 `RUN_TOOL_LOOP_OPTION_NAMES` 里有它；
+`context` 里目前只认 `strategy`）。后果：折叠照跑、`record.foldedFacts` 照落账、注**一条也不写**、
+**且不报错**——#331 那根「没人读的光纤」原样重现，而这次是我自己造的。E2 那一格（`sink.seq() >= 1`）
+就是它的探测器：真跑一次折叠，`seq=0` 立刻现形。
+
+教训不是"下次仔细点"，而是：**手工喂 payload 的单测证明不了接线**。凡跨包/跨层的回调接线，判据里必须
+有一格是「让对面真的调我一次」。已把它固化成防回装：C14 直接读**已安装引擎**的白名单源码比对，
+并断言 `context` 段里再出现 `onFoldSummary` 就红。
+
+**② 注确实回到了模型输入，但形态是小抄，不是全文。** 引擎的 semantic 段渲染成：
+
+```
+[notes 小抄目录]（note_read key=... 取全文）
+- fold-20261025T184024Z-r1-s1 (@agent): 折走存档：第 1 次折叠（run …）
+```
+
+于是 E4 的探针只能取**小抄行里有的东西**（注首行）。第一版我拿正文第二句当探针，得到"注没回去"的
+**假红**——这类"探针选错"的假红比真红更危险，因为它会把正确实现判死、把错误结论写进 issue。
+所以 E4 之外必须配 E5 对照组（不接 `semanticStateProvider` ⇒ 注仍在盘上、但请求里查不到）：
+E4 绿 + E5 绿 才叫「注是经 semantic 段回去的」，只有 E4 绿说明不了归因。
+
+**约束（下次调 harnes 别再猜）**：引擎预算
+`budget = cw - maxOutput - max(2000, ⌈cw×比例⌉)`（`src/compact/budget.js:23-25`），预留**硬底 2000**
+⇒ `context_window: 900` 直接 `Computed context budget must be positive (got -1300)`，四格空转。
+本文件用 `6000 / maxOutput 200`：够小所以两三必然折一次（真机要上百轮，那是成本不是机制），又不至于被硬底打死。
+
+六条判据的分工：E1 折叠真发生（否则全是空断言）· E2 真折叠真写注（抓死光纤）· E3 无投递失败且 run 跑完 ·
+E4 闭环（小抄进请求 + `note_read` 指引 + provider 真被调）· E5 对照组（E4 的归因兜底）·
+E6 同一份替代物**同时**进轮记录 `foldedFacts`（投递与落账不是二选一，#470-B/#470-D 两路都要在）。
+
+**顺带修正 §8.66 的一处措辞**：那里写「精确轮次范围 `a–b` 拿不到」——`onFoldSummary` 的 payload 确实
+还是没有范围，但引擎**自己的摘要文本里**带范围（`早期第 … 轮（共 … 轮）已折叠`，见 §8.65 A3 判据）。
+所以缺的是**结构化**的 `from/to`（给 DB 与 banner 用），不是"系统不知道范围"。erix-agent#479 的诉求据此收窄。
