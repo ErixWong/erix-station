@@ -163,7 +163,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
   「灯长期红/黄、而没人负责让它变绿」。
 
-## 8. erix-agent 依赖与升级（当前 pin：**0.20.0**，2026-10-15 由 #299 从 0.18.0 两步升上；历史 0.14–0.18 记录见下）
+## 8. erix-agent 依赖与升级（当前 pin：**0.26.0**，2026-10-25 由 `feat-261025-09-erix-agent-0.26.0` 从 0.25.0 升上；历史 0.14–0.25 记录见下。⚠ 本标题曾长期停在 0.20.0，与实际 pin 不符，本次一并修正）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
 - runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
@@ -2071,3 +2071,28 @@ offboard 收敛）。它们不在一条调用链上，加第六处时没人会�
 **⚠ 运维坑**（§8.17 同型）：`steer_arm` 与 `onRound` 全在 **worker 进程**里 ⇒ 必须重建 FDE 镜像并
 `docker rm -f` 掉全部 `fde-*` 容器；旧容器收到 `steer_arm` 当未知 IPC 类型忽略，症状是「按了转向、run 照跑到
 自然结束、转向的话在终态后才发出」——功能退化不报错，极易误判成「已经生效」。
+
+### 8.65 引擎升 pin 0.25.0 → **0.26.0**：折叠替代物有了投递出口，`judge_done` 不再终局零正文（2026-10-25，分支 `feat-261025-09-erix-agent-0.26.0`）
+
+上游这五单（erix-agent #468 / #472 / #474 / #471 / #477）已 squash 进 `main` `aef25b0d`，并随 **0.26.0** 上 npm（2026-10-25，`npm view erix-agent version = 0.26.0`，发布走的是 AGENTS §4 那套 npm12 device-flow）。
+与 §8.60（0.23→0.25 当场翻红 14 格）不同，**这次只翻红 9 格，而且全是同一种形状**：两处把引擎版本钉成常量的**版本线闸**——`runner/test/llm-timeouts.test.js:48` 的 `ENGINE_VERSION_PINNED`（一个常量拖住 4 格，根测与 runner 测各跑一遍所以看起来像 8 格）与
+`portal/frontend/src/lib/terminationReasons.ts:45` 的 `ENGINE_VERSION_FOR_TERMINATION_REASONS`（连带 `portal/test/termination-contract.test.js` 与前端 spec 共 1 格 + 1 格）。闸门原话是「版本变了必须**先人工复核**再改常量与文档」，所以复核做在改常量之前：
+
+| 线闸要求复核的东西 | 复核方法（实做，不是读上游 CHANGELOG） | 结论 |
+|---|---|---|
+| `termination.reason` 全集 | 两个**已安装**版本的 `src/loop/termination.js` 字面量集合逐一对照 | **两侧完全相同**：`aborted / end_turn / failed / judge_done / max_rounds_cap / no_tool` ⇒ 常量与前端码集**不动** |
+| 超时相语义（四相 vs legacy 120s 总闸） | `diff -rq <0.25.0>/src/providers <0.26.0>/src/providers` | **整目录 0 差异**，超时相关模块一个没碰 ⇒ `llm-timeouts` 断言前提不变 |
+
+真正变了的是**强制收尾白名单**：`["max_rounds_cap","stall","continuation_exhausted"]` → **追加 `judge_done`**（#467）。⇒ 本站新增一条验收口径：**终局可不可信要看 `termination.forcedFinal`，不能只看「有没有正文」**；引擎代写的正文带 `forced-final` 标记（#323 的 marker 规矩），呈现时不允兆冒充模型自答。
+⚠ 同一个洞在 `end_turn` / `no_tool` 上**仍在**（上游 #475 / #476 未动，评审判据侧是 #473），所以**别写成「任何终局都有正文」**。
+
+新增的宿主可用面（本站下一片接）：`record.foldedFacts`（每次折叠的有界机械索引，默认 `FOLDED_FACTS_MAX_BYTES = 2048`）与 `context.onFoldSummary`（折叠定稿那一刻投递 `{ ...foldedFacts, round }`；钩子抛错只落 `persistence_error{operation:"onFoldSummary", phase:"fold_summary_delivery", fatal:false}`，永远不改 run 结果；不传则逐字节不变）。
+**C 片**用它做折叠入注（不再轮询账本），**D 片**用它把横幅从「272530→5004 压缩比」改成「N 轮原文对模型不再可见」并如实标 `src` 两态（`strategy` / `llm`）。另 `compaction.strategyName` + 一次性 `compaction_strategy_fallback`（#464 A）已可用 ⇒ PR #400 A 片选的 `fold-statistical` 从此**能被证明真的在跑**，不用再靠猜。
+
+门禁（本机 worktree 实测，判据 = 退出码）：根 `npm test` **1608 / 1604 通过 / 0 失败 / 4 跳过**；`cd runner && node --test` **360 / 360 / 0**；前端 `vue-tsc --noEmit` 干净 + `npm test` **50 文件 / 920 全过**。
+本次动的文件：pin 两处（`package.json`、`runner/package.json`）+ 两份 lock；版本线闸三处（`runner/test/llm-timeouts.test.js:48`、`portal/frontend/src/lib/terminationReasons.ts:45`、`.../terminationReasons.spec.ts:61`）；本节 + §8 标题的 pin 口径。
+
+⚠ **顺带修正一条本站旧结论**：容器 `/home/erix/.erix/config.json` 三个槽位此前**都没有** `contextWindowTokens` / `maxOutputTokens`，模型名还是上游已撤的 `deepseek-flash`。
+**线上 run 不受影响**（模型与预算走 portal 心跳下行，网关 `LiteLLM_ProxyModelTable` 实查 `context_window=262144` / `max_output_tokens=32768`，runner 的 `resolveModelMetadata` 拿到的就是这两个数）；但 **e2e 与 CLI 读的是占位文件**（`resolveRunModel` 无下行时取占位 model，endpoint/key 永远取占位）⇒ `modelMetadata` 不成对 ⇒ `modelMetadataMissing` ⇒ `examples/pi-extension/erix-run-e2e.test.js` 的 **E6「装配自查」恒红**（上游 `ERIX_E2E_REAL=1 npm run check:release:real` 的 4/5 就是它）。
+2026-10-25 已给三个槽位补齐两键并把模型名改成 `qwen3.8-flash-next`（备份 `config.json.bak-20261025`；两个数字的来源：网关错误原文 *"maximum context length is 262144 tokens"* 与 `/v1/models` 的 `max_output_tokens: 32768`，与网关配置一致），补齐后真上游五步 **5/5 全绿**。
+**结论：占位文件里这两键不是可选项**——它决定 e2e 能不能跑、以及 CLI 手工验证时压缩是否真开；别当成冗余删掉。

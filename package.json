@@ -22,7 +22,7 @@
     "healthcheck": "node portal/src/cli.js healthcheck"
   },
   "dependencies": {
-    "erix-agent": "0.25.0",
+    "erix-agent": "0.26.0",
     "pg": "^8.23.0",
     "yaml": "2.9.1"
   }
