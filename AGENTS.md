@@ -1904,3 +1904,31 @@ CI 也不会替这层背书）。风险面低：与 `runner/Dockerfile` 同一�
 `erix-agent` 三处版本 tripwire（`terminationReasons.ts` + 其 spec + `runner/test/llm-timeouts.test.js`）
 同步到 `0.25.0`；`termination.js` 与 `providers/openai.js` 的 diff 逐条读过：`termination.reason` 取值集合
 未变，provider 侧改动不影响本站 LiteLLM 通路（三相超时与 `max_tokens` 口径的用例全绿）。
+
+### 8.61 部署后复查推翻了自己：#375 的「假 404」有**更早的真病根**，与 erix-agent 0.25.0 无关（2026-10-25，v0.1.34 部署当场验出）
+
+v0.1.34 起来第一件事就是拿真机那条砖会话（`9e0c8a17`）验 #375 的重建路，结果**三轮折叠全部照旧 404**
+（`folded_payload_not_found`）。而 `rebuildFoldedRange` 单拎出来跑得好好的（range 1–94 扫到 210 行、投影出
+112 条 turn）⇒ 病不在重建，在**取哪一行**。
+
+**真病根**：`getFoldedPayload` 取折叠行用的是 `WHERE round=$2 ORDER BY append_seq ASC LIMIT 1`。
+一个 round 在账本里有**多行**（引擎轮行 + 逐条消息行 + 折叠发生时**追加**的那一行），而折叠指针
+（`folded` 位、`foldedRoundRange`、`folded_payload`）**只长在最后那一行**。真机 round 100 实测：
+`append_seq` 1818（轮行，`folded_payload` 是 JSON `null`）/ 1819 / 1820 / **1821 = 折叠行**
+（`folded=true`、range `{1,94}`、归档 550 KB）。`LIMIT 1` 挑中的是 1818 ⇒ 两条路都拿不出正文 ⇒ 404
+⇒ 前端「原文已不可用（上游未保留折叠前载荷）」。**这条从 #189 起就错着**，跟 0.25.0 的差分归档只是
+叠在一起，我之前把它整个记在 0.25.0 账上，是**只读了代码没跑真账本**的代价。
+
+修法：该轮**取多行**（`LIMIT $3`，上限 64——一轮的行数极小）再显式挑：`folded===true` 且带指针/正文
+⇒ 任意带 range ⇒ 任意带正文 ⇒ 都没有才退回第一行并照旧 404。fake pool 原来 `.slice(0, 1)` 模拟 SQL，
+**等于把「挑错行」这个病从测试里抹掉**（AGENTS §8.42「fake 必须模拟真库形状」的反例），现改成返回
+该轮全部行；新增两格行为判据（真机形状：折叠行在最后 ⇒ 200 且 range 上界那轮必须在；反向：该轮真的
+什么都没有 ⇒ 仍 404）+ 一格源码级哨兵（SQL 里不许再出现 `LIMIT 1`、必须取 `folded` 列、必须显式调
+`pickFoldCarrierRow`）。**变异**：把挑选改回取第一行 ⇒ **恰这 2 格红**（老 10 格全绿，说明旧测试对这个
+病是瞎的）。同型病灶排查：`grep -rn "transcript_rounds" portal/src/*.js | grep -i "limit 1"` 零命中，
+U7 `recallTranscript` 是范围扫（`LIMIT 2000`）不受影响。
+
+**教训（写给自己）**：一个 404 文案说「上游没保留」的 bug，正确动作是**先去账本里把那一行捞出来**
+（`select append_seq, folded, octet_length(folded_payload::text) ... where round=100 order by append_seq`），
+而不是照着上游 CHANGELOG 讲故事。§8.59 里「病根 = 0.25.0 差分归档」那句要按本节理解：**差分归档是
+第二层病**（会让重建只剩差分），**取错行是第一层病**（让端点压根看不到折叠行）。

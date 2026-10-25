@@ -48,12 +48,15 @@ class FoldedPayloadPool extends FakePool {
   }
 
   seedFold(transcriptKey, round, foldedPayload, record) {
-    this.transcriptRows.push({ transcript_key: transcriptKey, round, folded_payload: foldedPayload, record });
+    // `folded: true` 与真库一致（`transcript_rounds.folded` 列由写入方按 `record.folded` 落）。
+    this.transcriptRows.push({ transcript_key: transcriptKey, round, folded: true, folded_payload: foldedPayload, record });
   }
 
   /** #375：重建路要吃的「各自轮行」——`messages` 有正文的普通轮行。 */
-  seedRound(transcriptKey, round, messages) {
-    this.transcriptRows.push({ transcript_key: transcriptKey, round, folded_payload: null, record: null, messages });
+  seedRound(transcriptKey, round, messages, { folded = false } = {}) {
+    this.transcriptRows.push({
+      transcript_key: transcriptKey, round, folded, folded_payload: null, record: null, messages,
+    });
   }
 
   async query(sql, params = []) {
@@ -74,10 +77,17 @@ class FoldedPayloadPool extends FakePool {
         return { rows };
       }
       // 对齐 #195 回退后的 SQL：无 IS NOT NULL 过滤，行面含 folded_payload 与 record（列 NULL 时靠 record 回退）。
-      const [key, round] = params;
+      // ⚠ **不能 `slice(0, 1)`**：真库同一 round 有多行，而折叠指针只长在**最后**那一行上
+      //（真机 round 100 共 4 行、折叠行 append_seq 1821）。fake 只回第一行就等于把「挑错行」这个
+      // 病从测试里抹掉 ⇒ 这里是 AGENTS §8.42「fake 必须模拟真库形状」的正例。
+      const [key, round, limit = 64] = params;
       const rows = this.transcriptRows
         .filter((x) => x.transcript_key === key && x.round === round)
-        .slice(0, 1);
+        .slice(0, limit)
+        .map((x) => ({
+          round: x.round, folded: x.folded ?? false,
+          folded_payload: x.folded_payload ?? null, record: x.record ?? null,
+        }));
       return { rows };
     }
     return super.query(sql, params);
@@ -248,6 +258,38 @@ test('#375 重建跨多轮多行不得只取一页（#338/#351 同根教训：�
   } finally { await s.close(); }
 });
 
+test('#375 真病根：同一 round 有多行、折叠行是**最后**一行 ⇒ 必须挑到它，不能取该轮第一行', async () => {
+  // 真机形状（`9e0c8a17` round 100，实测 4 行）：先落轮行/消息行（`folded_payload` 是 JSON null、
+  // `folded` false），折叠发生时才追加那一行（`folded=true` + `foldedRoundRange` + 归档）。
+  // 旧 SQL `ORDER BY append_seq ASC LIMIT 1` 挑中的是第一行 ⇒ 404「原文已不可用」——**假话**。
+  const s = await startServer();
+  try {
+    s.pool.seedRound(SESSION_ID, 12, []);                                  // 该轮第一行：无正文、无归档
+    s.pool.seedRound(SESSION_ID, 12, [msg('R12 工具结果行')]);              // 消息行
+    s.pool.seedFold(SESSION_ID, 12, [], { foldedRoundRange: { from: 1, to: 11 } }); // 折叠行（最后）
+    s.pool.seedRound(SESSION_ID, 3, [msg('R3 原文')]);
+    s.pool.seedRound(SESSION_ID, 11, [msg('R11 原文')]);
+    const res = await fetch(`${s.base}/api/sessions/${SESSION_ID}/folded/12`, { headers: { Cookie: s.cookieHeader } });
+    assert.equal(res.status, 200, '有 range 就该重建出来，不能因为第一行没归档而 404');
+    const body = await res.json();
+    assert.equal(body.source, 'rebuilt');
+    const all = JSON.stringify(body.turns);
+    assert.match(all, /R3 原文/);
+    assert.match(all, /R11 原文/, 'range 上界那一轮必须在（挑错行时会整段丢）');
+  } finally { await s.close(); }
+});
+
+test('#375 反向对照：该轮确实一行归档/指针都没有 ⇒ 仍然 404（挑行不许把「没有」读成「有」）', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seedRound(SESSION_ID, 13, [msg('R13 正文')]);
+    s.pool.seedRound(SESSION_ID, 13, []);
+    const res = await fetch(`${s.base}/api/sessions/${SESSION_ID}/folded/13`, { headers: { Cookie: s.cookieHeader } });
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error.code, 'folded_payload_not_found');
+  } finally { await s.close(); }
+});
+
 test('#375 源码级哨兵：重建 SQL 必须筛掉无正文行并带上限（fake 自己模拟了这个筛除，不钉就是假绿面）', () => {
   const src = fs.readFileSync(new URL('../src/sessions.js', import.meta.url), 'utf8');
   const start = src.indexOf('async function rebuildFoldedRange');
@@ -257,4 +299,16 @@ test('#375 源码级哨兵：重建 SQL 必须筛掉无正文行并带上限（f
   assert.match(body, /LIMIT \$4/, '必须有行上限（range 可能跨上百轮）');
   assert.ok(body.includes('FOLDED_REBUILD_MAX_ROWS + 1'), '上限要"多取一条"才判得出截断');
   assert.ok(body.includes('ORDER BY round ASC, append_seq ASC'), '取行顺序必须与账本保序口径一致（#338 教训）');
+});
+
+test('#375 源码级哨兵：取折叠行的 SQL **不得**再 `LIMIT 1`（真机折叠行是该轮最后一行，取第一行必假 404）', () => {
+  const src = fs.readFileSync(new URL('../src/sessions.js', import.meta.url), 'utf8');
+  const start = src.indexOf('export async function getFoldedPayload');
+  assert.ok(start > 0, '端点入口必须在（改名要同步本哨兵）');
+  const body = src.slice(start, src.indexOf('/** `foldedRoundRange` 形态校验', start));
+  assert.ok(body.includes('ORDER BY append_seq ASC LIMIT $3'),
+    '该轮取行必须带上限地取多行（`LIMIT 1` 就是 #375 的真病根）');
+  assert.ok(body.includes('pickFoldCarrierRow(res.rows)'), '必须显式挑折叠行，不许 reliance 于行序');
+  assert.ok(body.includes('SELECT round, folded, folded_payload, record'),
+    '必须把 `folded` 列取出来——它是「这一行就是折叠那一行」最直接的判别位');
 });
