@@ -55,6 +55,9 @@ export interface Session {
   /** issue #197：会话消息数（后端 listSessions COUNT 全量 messages 行、含 synthetic，
    * 与头部状态行 sessionStats 同源口径）；旧后端/其列表外来源（createSession 响应）可能缺失 → 不显示。 */
   message_count?: number;
+  /** issue #370：未投递的输入队列 `{steering, follow_up}`（**仅会话详情**带；列表响应不带）。
+   *  旧后端无此字段 ⇒ normalizeQueuedSnapshot 退化成空队列，additive 兼容。 */
+  queued_messages?: unknown;
 }
 
 /**
@@ -113,6 +116,26 @@ export interface FoldedInfo {
    * **键缺失**（旧 DTO / 其他路径）≠「没有摘要」，前端按「有摘要」处理保持现状。
    */
   hasSummary?: boolean;
+}
+
+/** #370：一条待发送输入（`queued_inputs` 的一行投影）。 */
+export interface QueuedInputItem { id: string; content: string }
+export interface QueuedSnapshot { steering: QueuedInputItem[]; follow_up: QueuedInputItem[] }
+
+/**
+ * 队列快照归一化（纯函数）：后端与 SSE 都给 `{steering, follow_up}`，元素可能是
+ * `{id, content}`（详情快照 / 入队后）或裸字符串（`clear_queue` 的返回，pi 同形状）。
+ * 旧后端没有这个字段 ⇒ 一律退化成空队列（additive 兼容，前端不得因此报错）。
+ */
+export function normalizeQueuedSnapshot(raw: unknown): QueuedSnapshot {
+  const pick = (v: unknown): QueuedInputItem[] => Array.isArray(v)
+    ? v.map((it, i) => typeof it === 'string'
+      ? { id: `text-${i}`, content: it }
+      : { id: String(it?.id ?? `text-${i}`), content: String(it?.content ?? '') })
+      .filter((it) => it.content !== '')
+    : [];
+  const o = (raw ?? {}) as Record<string, unknown>;
+  return { steering: pick(o.steering), follow_up: pick(o.follow_up) };
 }
 
 export interface ChatMessage {
@@ -281,6 +304,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const entries = ref<StreamEntry[]>([]); // 消息流（含分隔行/工具卡片占位）
   const renderedIds = ref<Set<string> | null>(null); // 去重（refresh 与流式缓冲竞态）
   const inputValue = ref(''); // composer 输入（旧 $('input').value）
+  // issue #370：输入队列（运行中说话）。**服务端是唯一真相**（`queued_inputs` 表），本 ref 只是投影：
+  //   * 入队成功 → 本地先乐观插一条（消除「点了没反应」的空窗）；
+  //   * 任意一帧 `queue_update`（全量快照）到达 → **整体覆盖**，乐观条目自然被权威值取代；
+  //   * 刷新/切会话 → 由 `GET /api/sessions/:id` 的 `session.queued_messages` 补齐。
+  // `queueBlocked`：暂停投递的原因（当前只有 `container_not_running` / `deliver_failed`），
+  // 界面必须说出来——「周五排的队周一才发」这种事不写清楚就是「消息丢了」。
+  const queuedInputs = ref<QueuedSnapshot>({ steering: [], follow_up: [] });
+  const queueBlocked = ref<string | null>(null);
+  const queueSubmitting = ref(false); // 入队 POST 在途（防双击双发，同 retryInFlight 的口径）
   const creatingSession = ref(false); // 旧 newSess 按钮禁用语义
   // issue #332：这里原有 `isPlatformAdmin = user.role === 'admin' && !user.fde_name`（+ 派生的
   // `newDirDisabled`、「＋新建目录」的 disabled、「进管理台」引导文案与占位符）——入口拦截落地后
@@ -329,6 +361,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       repullHistorySynthItems(d); // issue #306（#236 起同时喂终态分隔条）：补一次 history
     },
     // issue #88：自动标题刷新 → 原地更新会话列表项（比整表 loadSessions 轻；后续列表刷新仍是兜底）。
+    // issue #370：队列快照帧 ⇒ 整体覆盖本地队列（服务端是唯一真相）。
+    onQueueUpdate: (d) => applyQueueSnapshot(
+      { steering: d?.steering, follow_up: d?.follow_up },
+      typeof d?.blocked === 'string' ? d.blocked : null,
+    ),
     onSessionUpdated: (d) => {
       const sid = d.session_id != null ? String(d.session_id) : sessionId.value;
       if (typeof d.title !== 'string' || sid == null) return;
@@ -341,12 +378,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   /** 当前选中目录（顶栏 cwd 徽标 / 下拉高亮用）。 */
   const currentDir = computed(() => dirs.value.find((d) => d.cwd === dirCwd.value) ?? null);
   const running = computed(() => es.activeRunId.value != null);
-  const sendDisabled = computed(() => running.value || noDir.value);
+  // issue #370：**运行中不再禁用发送**——那句话改走队列，而不是「等一等再说」。
+  // 唯一保留的禁用条件是「没有目录」（无从建会话）与「会话/入队 POST 在途」（防双击双发）。
+  const sendDisabled = computed(() => noDir.value || queueSubmitting.value);
   const inputPlaceholder = computed(() =>
-    // #332：原先第三态「平台管理员：请到管理台…」已随入口拦截拆掉（不可达），两态照旧：
-    // 无目录 → 引导建目录；有目录 → 正常输入提示。
-    noDir.value ? t('common.createFirstDir') : t('workbench.inputPlaceholder'),
+    // #332：原先第三态「平台管理员：请到管理台…」已随入口拦截拆掉（不可达）。
+    // #370 加运行中一态：文案直接告诉用户 Enter 是转向、Alt+Enter 是排队（agegr/pi-web 的
+    // `chat.steerPlaceholder` 同思路：把行为写进 placeholder，而不是让人猜按钮）。
+    noDir.value ? t('common.createFirstDir')
+      : running.value ? t('composer.placeholderRunning')
+        : t('workbench.inputPlaceholder'),
   );
+  /** 队列总条数（队列条的「N 条待发送」与徽标用）。 */
+  const queuedCount = computed(() => queuedInputs.value.steering.length + queuedInputs.value.follow_up.length);
   const newSessDisabled = computed(() => noDir.value || creatingSession.value);
   // 会话列表项 meta 行（● 运行中 / 本地化时间）
   // issue #105 ③：时间戳按当前 locale 格式化（原硬编码 'zh-CN'，英文界面下仍是中文格式）。
@@ -826,6 +870,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       && Number.isFinite(data.session.message_count)
       ? data.session.message_count
       : null;
+    // issue #370：刷新 / 切会话 / 断线重连后的队列补齐（`queue_update` 是 live-only、不落库，
+    // 没有这一行，刷新后队列条就会凭空消失）。blocked 不在详情里——它只在有队列时才有意义，
+    // 由下一帧 queue_update 带上；这里先清，免得留着上个会话的原因。
+    applyQueueSnapshot(data.session?.queued_messages);
     es.lastSeq.value = data.last_seq;
     renderedIds.value = new Set();
     // issue #89：messages（addMessage）与历史 run_events（es.replayEvent）按 seq 归并回放——
@@ -1064,6 +1112,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     saveDraft();
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：无选中会话 → 不得复用旧会话的计数
+    applyQueueSnapshot({ steering: [], follow_up: [] }); // #370：队列同样是会话级状态
     olderMessagesCursor.value = null; // 试用台账 #10：分页游标同属会话级状态，一并清
     olderEventsCursor.value = null;
     es.resetStreamState();
@@ -1087,7 +1136,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   async function send(contentOverride?: string) {
     const override = typeof contentOverride === 'string';
     const content = (override ? contentOverride! : inputValue.value).trim();
-    if (!content || es.activeRunId.value) return;
+    if (!content) return;
+    // issue #370：运行中的 Enter 不再是 no-op（旧行为：`es.activeRunId` 非空直接 return，用户以为
+    // 发出去了、其实什么都没发生），而是**转向**。守卫顺序也因此变成「先判有没有内容，再判在不在跑」。
+    // `retryLast()` 走的是 override 分支且只在无活跃 run 时可见，不会被这条改到行为。
+    if (es.activeRunId.value) return sendQueued('steer');
     // issue #84 P5 真机验收修正：选了目录但未打开会话时，首条发送自动建会话（原实现 !sid 静默返回，
     // 用户「选目录→打字→发送」没有任何反馈）。目录未选中（空 projects）才保持 no-op。
     if (!sessionId.value) {
@@ -1168,6 +1221,105 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
 
+  /**
+   * #370：覆盖本地队列（唯一写 `queuedInputs` 的入口，SSE 快照 / 详情快照 / 乐观入队都走它）。
+   * `blocked=null` 时也清空上一帧的暂停原因——快照是全量语义，「不再有原因」同样是变化。
+   */
+  function applyQueueSnapshot(snapshot: unknown, blocked: string | null = null) {
+    queuedInputs.value = normalizeQueuedSnapshot(snapshot);
+    queueBlocked.value = blocked;
+  }
+
+  /**
+   * #370：**运行中说话**。`kind='steer'`（转向，默认，`Enter`）= 当前轮跑完就停下用这句继续；
+   * `kind='follow_up'`（排队，`Alt+Enter`）= 当前任务正常结束后依次发。
+   *
+   * 为什么前端可以直接选 kind：**「入队还是直接发」不靠前端判**——后端在同一事务里读活跃 run
+   * 原子分岔（`queued-inputs.js enqueueQueuedInput`，照 pi `agent-session.js` 的 isStreaming 分岔）。
+   * 所以本函数在 run 刚好结束的那一刻按下去也安全：响应体是 `{posted}` 还是 `{queued}` 由服务端定，
+   * 前端两种形状都认。⚠ 不得改成「先 `if (running)` 再决定调 `/messages` 还是本端点」——
+   * 那等于把同一个竞态重新请回来（pi 源码注释称之为 *strand a message in an idle queue*）。
+   */
+  async function sendQueued(kind: 'steer' | 'follow_up' = 'steer') {
+    const content = inputValue.value.trim();
+    if (!content) return;
+    // 目录守卫与 send() 逐字同口径：**只有「还没有会话」时才要求先选目录**（已有会话就带着它发）。
+    // 写成 `!dirCwd` 一律拦，会让「刷新后 dirCwd 还没恢复但会话已知」这种正常状态下的队列按键变哑。
+    if (!sessionId.value && (!dirCwd.value || noDir.value)) return;
+    const ctx = ctxSeq.value;
+    // 没有会话时先建再发（与 send() 同一条前置语义，不能只在新会话首条上支持队列）
+    let targetSid = sessionId.value;
+    if (!targetSid) {
+      const created = await createSession();
+      if (!created) return;
+      await openSession(created.id);
+      targetSid = sessionId.value;
+      if (!targetSid) return;
+    }
+    queueSubmitting.value = true;
+    inputValue.value = ''; // 先清输入框：入队是「已交接」，不是「待发送的草稿」
+    const optimistic: QueuedInputItem = { id: `local-${Date.now()}`, content };
+    const before = queuedInputs.value;
+    const bucket = kind === 'steer' ? 'steering' : 'follow_up';
+    queuedInputs.value = { ...before, [bucket]: [...before[bucket], optimistic] };
+    try {
+      const res = await api<{ posted: unknown; queued: { id: string; content: string } | null }>(
+        `/api/sessions/${encodeURIComponent(targetSid)}/queued-inputs`,
+        { method: 'POST', body: JSON.stringify({ content, attachments: [], kind }) },
+      );
+      if (ctx !== ctxSeq.value || sessionId.value !== targetSid) return; // 切走了：草稿与队列都不再是它的
+      drafts.delete(targetSid);
+      if (res.posted) {
+        // 服务端裁决成「直接发」（点下去的那一刻没有活跃 run）：走与 send() 相同的渲染面。
+        const posted = res.posted as { message?: ChatMessage; run?: { id: string } };
+        if (posted.message) addMessage({ ...posted.message, role: posted.message.role ?? 'user' });
+        if (posted.run?.id) { es.activeRunId.value = posted.run.id; momentum.beginRun(posted.run.id); }
+        // ⚠ 必须**手动**摘掉乐观条目：这条路服务端**没有入队**，因此永远不会来一帧 `queue_update`
+        // 覆盖它。漏这一行 = 消息已经变成正常 user 气泡了，队列条上还挂着同一条「待发送」。
+        queuedInputs.value = {
+          ...queuedInputs.value,
+          [bucket]: queuedInputs.value[bucket].filter((it) => it.id !== optimistic.id),
+        };
+        loadSessions();
+      }
+      // 真入队那一路不用做任何渲染：`queue_update` 全量快照马上会覆盖本地乐观值。
+    } catch (e) {
+      drafts.set(targetSid, content); // 失败回填草稿（口径同 send()）
+      if (ctx !== ctxSeq.value || sessionId.value !== targetSid) return;
+      inputValue.value = content;     // 话没交出去 ⇒ 回到输入框
+      queuedInputs.value = before;    // 撤销乐观条目
+      // 错误面复用 `errors.sendFailed`（#294 设计：入队失败 = 发送失败，一个出口一种说法）。
+      // `queue_full` 不另开文案：它是 4xx、服务端消息本身已说明「同时最多 5 条」，而
+      // ApiError.message 是服务端 message 的**唯一出口**——另开文案只会让同一件事有两种说法
+      //（#276 拆 errorMap 时立的规矩）。
+      entries.value.push({ kind: 'syserr', text: t('errors.sendFailed', { message: e instanceof Error ? e.message : String(e) }) });
+    } finally {
+      queueSubmitting.value = false;
+    }
+  }
+
+  /**
+   * #370：**整队取回**（= pi `clear_queue` + agegr/pi-web 的「取回」）。只有整队，没有单条删除
+   * （pi 的 `clear_queue` 注释：单条删要和引擎的 pull 竞态）。回填口径照 pi `prependText`：
+   * **取回的文本在前、用户已打的草稿在后，中间空一行**。
+   */
+  async function recallQueue() {
+    const sid = sessionId.value;
+    if (!sid) return;
+    try {
+      const res = await api<{ recalled: { steering: string[]; follow_up: string[] } }>(
+        `/api/sessions/${encodeURIComponent(sid)}/queued-inputs`, { method: 'DELETE' },
+      );
+      const texts = [...(res.recalled?.steering ?? []), ...(res.recalled?.follow_up ?? [])]
+        .filter((x) => x && x.trim());
+      const current = inputValue.value.trim();
+      inputValue.value = [...texts, current].filter((x) => x).join('\n\n');
+      applyQueueSnapshot({ steering: [], follow_up: [] }); // 服务端已清空，本地立刻跟上（SSE 也会再来一帧）
+    } catch (e) {
+      alert(t('errors.sendFailed', { message: e instanceof Error ? e.message : String(e) }));
+    }
+  }
+
   async function stop() {
     if (!sessionId.value || !es.activeRunId.value) return;
     try {
@@ -1221,12 +1373,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     drafts, es,
     // computed
     currentDir, running, sendDisabled, inputPlaceholder, newSessDisabled,
+    // issue #370：输入队列（状态 + 计数 + 暂停原因）
+    queuedInputs, queuedCount, queueBlocked, queueSubmitting,
     // helpers
     sessMeta,
     // actions
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
     saveDraft, addMessage, addPartialOutput, addRunTermination, send, stop, refreshSession,
+    // issue #370：运行中说话（steer / follow_up 入队）与整队取回
+    sendQueued, recallQueue, applyQueueSnapshot,
     loadOlderMessages,
     pushStreamError,
     // issue #306：导出让单测能直接驱动「终态后补拉 history」的窄条件（不靠拼 SSE 帧也能钉零重拉）。

@@ -345,6 +345,34 @@ export const en = {
     stop: '■ Stop',
     // issue #261B：上一条发送以失败终局收场时的一键重发（中英双语同口径）。
     retry: 'Retry last',
+    // issue #370: two ways to speak while a run is in flight.
+    placeholderRunning: 'Type while it runs — Enter steers, Option/Alt+Enter queues',
+    steer: 'Steer',
+    steerHint: 'Finish the current round, then continue with this message (in-flight tool calls complete first) · Enter',
+    followUp: 'Queue',
+    followUpHint: 'Send this after the current task finishes normally, in order · Alt+Enter',
+    hintEnterSend: 'send',
+    hintEnterSteer: 'steer',
+    hintAltFollowUp: 'queue',
+    hintShiftNewline: 'newline',
+    hintSlash: 'commands',
+    hintAt: 'mention file',
+  },
+  // issue #370: pending-input queue bar (components/QueuedInputsBar.vue)
+  queued: {
+    count: '{n} pending',
+    steerCount: '{n} steer',
+    followUpCount: '{n} queued',
+    expand: 'Expand',
+    collapse: 'Collapse',
+    recall: 'Recall all',
+    recallHint: 'Put every queued message back into the input box (recalled text first, existing draft after)',
+    // Keys are the server's machine codes, referenced as `queued.blocked.<code>`:
+    // the server sends codes, the client owns the wording (#294).
+    blocked: {
+      container_not_running: 'Container not running — queue paused (resumes automatically)',
+      deliver_failed: 'Last delivery failed — queue paused, recall and resend',
+    },
   },
   picker: {
     title: 'Browse sessions',
