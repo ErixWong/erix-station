@@ -294,7 +294,10 @@ services:
   # portal 自己生成的 file:// URL，SSRF 面 = portal 自己）；cap_drop ALL + 非 root（uid/gid
   # 对齐 userspace 属主 1000:1000，drwxrwx--- 直读）；转换产物写 tmpfs（重启即清，无盘上
   # 残留），内存上限 2G（LibreOffice 子进程计入 cgroup）。
-  station-kkfileview:
+  # ⚠ 服务键名 = 容器网 DNS 名，**必须是 `kkfileview`**：portal 代码/compose 默认都是
+  # `http://kkfileview:8012`（双口径一致纪律 #114）；container_name 仍守 station-* 命名。
+  # （写成 station-kkfileview 作键 → DNS 无 kkfileview 记录 → /pv 全量 502，真机踩过。）
+  kkfileview:
     container_name: "${KKFILEVIEW_NAME:-station-kkfileview}"
     image: ${KKFILEVIEW_IMAGE:-erix-station/kkfileview:5.0.3}
     # 镜像自建（见上），fresh 机器无现成 tag：先跑 deploy/kkfileview/build-image.sh 再
