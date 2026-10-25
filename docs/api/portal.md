@@ -881,6 +881,7 @@ station-portal user enable  --login <login>
 |---|---|---|
 | `messages[].toolCalls[]` | 引擎投影 | `{key, name, id?, argsSummary?, resultPreview?, isError?, executionStatus?}`（预览长度由上游定） |
 | `messages[].toolCalls[].durationMs` | **宿主 join**（issue #283） | 毫秒。⚠ **引擎投影不带这个字段**（`DisplayTurn.toolCalls[]` 的形状里没有时长），它由 `portal/src/session-view.js` 在投影**之后**按 `(run_id, call_id)` 从本站 `tool_calls.duration_ms` 补上（数据源 = §9.4 的 U3 `tool_result` UPDATE）。`call_id` 即事件里的 `tool_call_id` = `toolCalls[].id`。 |
+| `messages[].folded.hasSummary` | **宿主判定**（issue #390-A） | boolean。**这个键不是上游字段**，是 `portal/src/session-view.js` 按折叠行自己的 `record.summary` 形态算出来的：上游契约（erix-agent `src/store/file.js:25`）是 `summary?:{action:string,note:string}|"missing"` ⇒ 只有 `{action,note}` 且至少一项非空才算“有真摘要”，字面量 `"missing"`（现网 17/17 条折叠行都是这个值）、缺键、空壳都算没有。存否口径与 `round` 绑定：**轮号取不到就整个不带这个键**（缺席 = 前端“不知道”，不得当成 `false` 把旧数据的展开控件抹掉）。存要的作用是：没有真摘要时，摘要区只是把横幅标题换个说法重说一遍（“已压缩第 1–94 轮” vs “早期第 1–94 轮已折叠。”），前端据此不画展开控件。 |
 
 - **旧数据口径**：库里 `duration_ms` 为 `NULL`（引擎当年就没给时长的那批历史调用，见 §5.3 第 7 行与
   erix-agent #285）⇒ **DTO 不出现 `durationMs` 键**，不写 `0`、不塞 `null`、也不拿时间差造一个假时长；

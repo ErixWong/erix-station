@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { getSession } from '../src/sessions.js';
 import { projectSessionMessages, recordForProjection } from '../src/session-view.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
@@ -1303,6 +1304,9 @@ test('#189 折叠轮正文走折叠摘要兜底时，DTO 带 folded（foldedRoun
     navigationRecord: navigation,
     foldedPayloadMessages: 2,
     round: 9, // #189 收尾：该折叠行自己的 round（上游 turn.round 原名透传）
+    // #390-A 新增键：本夹具的 `record.summary` 是 `{action,note}` 形态 ⇒ 有真摘要。这是**向后兼容的
+    // 加键**（旧前端不读它照跑），但 deepEqual 要跟着走。
+    hasSummary: true,
   }, 'text + 三元组 + round 逐字透传（上游原名、不改名、不重推导）');
   // 「查看原文」端点的 :round 是折叠行自己的 round，不是被折叠的轮范围：两者必须不同（本单存在的理由）。
   assert.equal(projection[0].folded.round, 9);
@@ -1563,4 +1567,61 @@ test('issue #283：includeMessages=false（SSE 只校验 last_seq）不多打 to
   await getSession(pool, { userId: USER_ID, sessionId: SESSION_ID, includeMessages: false });
   assert.equal(pool.queries.some((query) => query.sql.includes('FROM tool_calls')), false,
     '没有消息就没有可 join 的对象 ⇒ 不发这次查询');
+});
+
+// ============================================================================
+// issue #390-A：`folded.hasSummary`——「这次折叠到底有没有真摘要」的机器判据
+//
+// 为什么必须有：现网全站 17 条折叠行的 `record.summary` 都是字符串字面量 `"missing"`（上游契约
+// `src/store/file.js:25`：`summary?:{action:string,note:string}|"missing"`），而上游投影在摘要缺失时
+// 把 `text` 兜底成「早期第 1–94 轮已折叠。」——与横幅标题换句话重复。前端因此需要一位判据，
+// 且**不许**用字符串比对去猜（那条红线写在 #390 里）。
+// ============================================================================
+
+const foldProjectionWithSummary = (summary) => {
+  const record = {
+    dedupKey: `${RUN_1}:engine:round:9`,
+    folded: true,
+    foldedRoundRange: { from: 1, to: 5 },
+    foldedPayload: [{ role: 'user', content: text('RAW') }],
+  };
+  if (summary !== undefined) record.summary = summary;
+  return projectSessionMessages({
+    sessionId: SESSION_ID,
+    anchors: [message('folded-has-summary', 1, 'assistant', 'stale anchor text', RUN_1)],
+    userAnchors: [],
+    transcriptRows: [transcript(9, `${RUN_1}:engine:round:9`, record, at(1))],
+  })[0]?.folded;
+};
+
+test('#390-A `hasSummary`：只有 `{action,note}` 形态算有摘要；`"missing"` / 缺键 / 空壳都算没有', () => {
+  // 现网真实形状（17/17 条折叠行都是这个值）⇒ false，前端据此不该画展开控件
+  assert.equal(foldProjectionWithSummary('missing').hasSummary, false,
+    '字面量 "missing" 是上游契约里的「没有摘要」标记，不是摘要文本');
+  assert.equal(foldProjectionWithSummary(undefined).hasSummary, false, '缺 `summary` 键 = 没有摘要');
+  assert.equal(foldProjectionWithSummary({}).hasSummary, false, '空对象不算');
+  assert.equal(foldProjectionWithSummary({ action: '', note: '' }).hasSummary, false, '两项都空不算');
+  assert.equal(foldProjectionWithSummary({ note: null }).hasSummary, false, '非字符串不算');
+  assert.equal(foldProjectionWithSummary(['a', 'b']).hasSummary, false, '数组不算');
+  // 真有摘要的三种形态
+  assert.equal(foldProjectionWithSummary({ action: '调研代码', note: '定位到 store 层' }).hasSummary, true);
+  assert.equal(foldProjectionWithSummary({ action: '调研代码', note: '' }).hasSummary, true,
+    '上游只承诺形状、没承诺两项都填 ⇒ 任一项非空就算有（宁可多画展开，别把真摘要判没）');
+  assert.equal(foldProjectionWithSummary({ action: '', note: '只有 note' }).hasSummary, true);
+});
+
+test('#390-A `hasSummary` 与 `round` 同生同灭：轮号取不到就不带这个键（缺席 ≠ false）', () => {
+  const withRound = foldProjectionWithSummary('missing');
+  assert.ok('hasSummary' in withRound, '轮号可定时必须带这个键（前端把「缺席」当「不知道」）');
+  // 判据的另一半在源码里：`recordForProjection` 恒把 round 列合成进 record ⇒ 现实数据永远带得上。
+  const src = fs.readFileSync(new URL('../src/session-view.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('...(round === undefined ? {} : { hasSummary:'),
+    '加键必须挂在 round 的同一个守卫上；改成无条件写 `false` 会让旧数据凭空丢掉展开控件');
+});
+
+test('#390-A 上游契约哨兵：`summary` 的缺失标记仍是字面量 "missing"（变了就该重核判据）', () => {
+  const upstream = fs.readFileSync(
+    new URL('../../node_modules/erix-agent/src/store/file.js', import.meta.url), 'utf8');
+  assert.ok(/summary\?:\{action:string,note:string\}\|"missing"/.test(upstream),
+    'erix-agent 的 `summary` 契约形态变了 ⇒ `hasRealSummary()` 的判据要跟着重核（别只改这里不查上游）');
 });
