@@ -1994,3 +1994,80 @@ turn 全量渲染 **text 7 ms / reasoning 13 ms** ⇒ 性能根本不是理由�
    我单独跑该文件 **18/18 绿**、连跑两次全量 **896/896 绿** ⇒ 那 3+2 是**我并行跑根测试把它压出来的**，
    不是预存失败。子代理的基线数字必须自己复算一遍，不能照抄。
 
+
+### 8.64 对话输入队列：运行中可说话（转向 / 排队），pi 的两条队列落到 DB（issue #370，2026-10-25，分支 `feat-261025-01-chat-input-queue`）
+
+现象是一句很日常的话：**任务在跑时输入框是灰的**。前端 `send()` 见 `activeRunId` 静默 return（连报错都没有），
+后端 `postMessage` 撞 `ACTIVE_RUN_STATES` 409。参照系是 pi / pi-web（本机 `~/.npm/_npx/…/pi-agent-core` 与
+`/tmp/pi-web-agegr`），它有两条队列：`steer`（转向：当前轮跑完就停下用这句继续）与 `follow_up`（排队：任务
+正常结束后依次发）。**照抄三条口径，改造三处本站化**。
+
+**照抄的三条**（证据在 #370「参照系」节，动 `portal/src/queued-inputs.js` 前先读那条）：① **入队还是直发必须在
+服务端事务内判**（pi `agent-session.js:1633` 读完 `isStreaming` 就分岔，中间不 await）——反过来「前端先看 running
+再决定调哪个端点」在「点发送那一刻 run 刚好结束」时会退化成 409，pi 注释管这叫 *strand a message in an idle
+queue*；② **只有整队取回，没有单条删除**（pi `clear_queue`：单条删要和 loop 的 pull 竞态）；③ **停止不清队列**
+（pi `agent.js:218` `abort()` 不碰队列），aborted 轮留下的 follow_up 在下一次终态自动带出。
+
+**本站化的三处**：① 队列落 **DB**（`queued_inputs`，迁移 `0024`）而不是 pi 的内存队列——pi 自己的注释承认
+"dead wrapper (no state) means the queue is gone"，而不变式 3 是「DB 是状态真相」，实测症状就是**关页面 = 那句话
+蒸发**；② 投递由 portal 在 **run 终态**驱动，不是浏览器的 `agent_end` 回调 ⇒ 关页面也照发；③ `queue_update`
+是**状态帧不是历史事件**：信封要求 `run_id NOT NULL` 而入队时压根没有 run，所以它不落 `run_events`、不进历史
+白名单，刷新后靠 `GET /api/sessions/:id` 的 `session.queued_messages` 全量补齐（前端三处集合各漏一处的症状
+不同，#288 已证，这次一格 `es.emits('queue_update').length === 1` 钉住监听面）。
+
+**转向的实现路径没有动引擎**（这是本片最省钱的地方）：erix-agent 0.25.0 的 `onRound` 是**被 await 的**、且
+**在本轮 transcript 落库之后、`round_end` 之前**才响（`src/loop/orchestrator.js:4342`），而轮循环**圈顶先查一次
+中止**（`:3722`）。一「轮」= 一次 provider 调用 + 它的工具执行 ⇒ 在 `onRound` 里 `abort()` 得到的正是
+「当前轮工具调用全部跑完、下一次 LLM 调用之前」，**与 pi 对 steer 投递点的定义逐字重合**。
+两条引擎红线写进代码注释：**抛错不是控制流**（#173：观察者抛错只记一笔、run 继续，要停只认 `signal.abort()`）、
+**不得在 `onRound` 里 park 等输入**（它被 await，park = 静默卡 run，拿 90s 租约与 #288 静默看门狗冒险）。
+配套：**转向只写 `cancel_requested_at`、绝不写 `status='cancelling'`**——`cancelling` 是「worker 立刻按进程组
+SIGKILL 正在跑的工具」的开关（#211），而转向要「本轮跑完再停」；「这次 abort 是转向还是用户按了停止」的判据
+落 `queued_inputs.interrupted_run_id`，**run 状态机与 termination reason 零改动**（runner 只在 `detail` 补
+`steered`，用例钉住「不改 reason / 不覆盖引擎给的 detail」）。
+
+**五条终态产出点必须全部接线**（`finishRun` / `releaseRun` / `reapExpiredRuns` / 停止端点的直接终态分支 /
+offboard 收敛）。它们不在一条调用链上，加第六处时没人会回头改前四处，漏一处的症状是「队列偶尔静默卡死」
+而界面毫无线索 ⇒ 把「谁调了它」写成断言（`portal/test/queued-inputs-wiring.test.js`，含「`queued-inputs`
+不得 import `internal.js`」与「`sessions.js` 不得反向 import 它」两条依赖方向红线——后者是我自己先写出环来，
+被断言逼着把快照挂载移到 DTO 出口才拆掉的）。
+
+**过程中被测试抓出来的两个真 bug**（都不是测试迁就代码）：① `executeWithIdempotency` 约定的 fn 返回形状是
+`{statusCode, response}`，我按业务结果写 ⇒ 无 key 时靠对象展开蒙对、**带 `Idempotency-Key` 恒 500**；
+② 幂等台账里存的必须是**响应体**而非业务结果，否则回放给出裸 DB 行（多 `session_id`/`status`/
+`interrupted_run_id`），首次与回放形状不同 ⇒ 改成两条路共用同一个 `queuedInputResponse()` 映射。
+前端也抓到一处：服务端裁决成直发（`{posted}`）时**永远不会有 `queue_update` 到达**，乐观条目必须手动摘掉，
+否则那句话同时以「已发送气泡」和「待发送」两种身份挂在界面上。
+
+**拍板点三条已全部落定**（原文与理由在 #370）：每条 follow-up = 一个新 run（各带一份 `maxRounds=16` 预算）
++ `runs.trigger_kind` 先测量两周再决定是否合并投递；容器不在 ⇒ **不投不丢** + `blocked='container_not_running'`
+让界面说清「为什么还没发」；按钮叫**「转向」**不叫「打断并转向」（5 个字会在用户最需要按下它的那一刻吓到他）。
+
+**自评轮抓出的四条，全部先写红测再修**（不是合并前的礼貌扫一眼，是真去找「我的测试测不到的地方」）：
+1. **`CLAIM_STALE_MS` 是一根没人读的光纤**（#331 前例）：迁移注释与本模块注释都承诺「`claimed_at` 过期可被
+   重新认领」，但 pick 与 CAS 两条 SQL 都只认 `status='pending'` ⇒ 认领后崩在建 run 之前的那行**永久停
+   在 `delivering`**：不投递、取不回（recall 只动 pending）、还算在 20 条上限里。修法是 pick 与 CAS 共用
+   同一条 CLAIMABLE 判据（pending 或过期 delivering），两处必须同源否则「选得出来却永远抢不到」。
+   ⚠ **这条行为测试天然测不到**：判据在 SQL 里，而假池自己实现了一份同判据的 JS —— 变异「把 pick 改回
+   只认 pending」实测 **25/25 仍然全绿**。必须补源码级断言（`queued-inputs-wiring.test.js`），补完变异才红。
+2. **队列投递出去的 run 前端根本不认识**：本站前端只有两条路知道活跃 run（自己 POST 的响应、会话详情的
+   `active_run_id`），队列投递两条都不走 ⇒ 旧 run 的 run_end 到了就清空运行态，新 run 在跑而状态条显示
+   空闲；更糟的是新 run 自己那条 `run_end` 因 `d.run_id !== activeRunId` 被整条丢弃 ⇒ **终稿永不刷新**。
+   修法：`queue_update` 带 `delivered_run_id`，前端仅在 `activeRunId == null` 时接管（不抢用户正在看的那个）。
+3. **转向会把「重试上一条」点亮**：转向也是 `reason=aborted`，落在 `RUN_FAIL_REASONS` 里 ⇒ 用户刚说「用这句
+   继续」，界面却给一个「把上一条原话重发」。用 `termination.detail === 'steered'` 抑制，**不动 reason 集合
+   本体**（它还管 #306 的补拉 history）。
+4. **`send(override)` 会被队列委派静默吞掉**：`retryLast()` 传的是原文，而运行中那条委派走
+   `sendQueued` 读的是输入框 ⇒ 该重发的那句丢了、反倒把草稿排了队。改成带 override 不进队列，
+   把「不许串味」写进结构而不是依赖调用方永远记得守。
+自评还顺手发现自己写的一个**空操作断言**：`applyRetryFaceOnRunEnd` 没导出，`(store as any).fn?.()` 调的是
+`undefined?.()` ⇒ 改前改后都绿，等于没测。改成驱动真实 `run_end` 帧，并同时钉「普通 abort 仍要亮」。
+
+**判据**：根 **1604 / 1600 / 0 / 4**（基线 1564，本片新增 40 格：判定表 22 + HTTP 面 10 + 接线防漂移 6 +
+迁移 1 + runner termination 1）、前端 **50 文件 / 916**（基线 896，新增 20 格）、`vue-tsc` 全 0。
+被本工单**有意改掉**的旧断言四处，均已在注释写明（`sendDisabled` 运行中不再为 true ×2、ComposerBar 运行中
+键位 ×2、`buildFailureEnvelope` 入参表 ×2 处跨两文件）。
+
+**⚠ 运维坑**（§8.17 同型）：`steer_arm` 与 `onRound` 全在 **worker 进程**里 ⇒ 必须重建 FDE 镜像并
+`docker rm -f` 掉全部 `fde-*` 容器；旧容器收到 `steer_arm` 当未知 IPC 类型忽略，症状是「按了转向、run 照跑到
+自然结束、转向的话在终态后才发出」——功能退化不报错，极易误判成「已经生效」。

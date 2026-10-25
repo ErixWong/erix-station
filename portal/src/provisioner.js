@@ -19,7 +19,7 @@ import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
 import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
-import { broadcastRevoke } from './internal.js';
+import { broadcastRevoke, drainQueueAfterRun } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
@@ -995,6 +995,12 @@ export async function deprovisionFde(pool, config, { fdeName, docker, log = cons
     // ①b 收敛该用户全部 active run（issue #33）——offboard = 系统发起的 stop；口径对齐 reaper A2。
     //     放在吊销事务提交之后：业务收敛失败不回滚安全吊销（best-effort，失败仅告警）。
     const runEnds = await terminateActiveRuns(pool, { userId: u.id, log });
+    // #370：offboard 也是终态产出点之一（五条出队接线里的第五条）。这里**几乎总是**被容器闸门挡下
+    // ——步骤 ① 刚把 token 吊销（`revoked_at` 非空），闸门正是要认这个事实。接线的价值恰恰是
+    // 「五处同一个判定」这条纪律：漏掉这一处，将来某条不吊销容器的收敛路径就会让队列静默卡死。
+    for (const e of runEnds) {
+      await drainQueueAfterRun(pool, e.run_id, log).catch(() => {});
+    }
     if (runEnds.length > 0) {
       if (typeof notify === 'function') {
         for (const e of runEnds) {

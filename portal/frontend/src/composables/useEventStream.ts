@@ -40,6 +40,10 @@ const EVENT_TYPES = [
   // `addEventListener` 的唯一来源，漏加就是**实时一条都收不到**（不报错不警告）；与下面
   // HISTORY_REPLAY_TYPES 与 `http.js` 的 HISTORY_EVENT_TYPES 是三处独立存亡的集合（#288）。
   'persistence_error',
+  // issue #370：输入队列快照（steer / follow_up 待发送）。**live-only、不落 run_events**
+  // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
+  // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
+  'queue_update',
 ] as const;
 
 // issue #42：run_end 分级文案的异常终止集合（end_turn 之外的正常/未知原因保持灰色中性）。
@@ -340,6 +344,17 @@ export interface EventStreamHooks {
   /** issue #88：自动标题刷新（portal run 终态后异步评估、经 session SSE 推送）——宿主原地更新列表项。 */
   onSessionUpdated?: (d: { session_id?: string; title?: string } & Record<string, unknown>) => void;
   /**
+   * issue #370：输入队列快照（`queue_update`，全量非增量）。宿主直接整体覆盖本地队列——
+   * 服务端是唯一真相，前端只做乐观显示，所以「覆盖」而不是「合并」，天然消双发。
+   */
+  onQueueUpdate?: (d: {
+    steering?: Array<{ id: string; content: string }> | string[];
+    follow_up?: Array<{ id: string; content: string }> | string[];
+    blocked?: string | null;
+    /** 本帧存在的原因是一条队列输入被投出去了 ⇒ 这个 run 刚被建起来。 */
+    delivered_run_id?: string | null;
+  } & Record<string, unknown>) => void;
+  /**
    * issue #282：**每一帧**事件的旁路通知（不改变任何既有分发语义，纯观察面）。
    * 用途单一：会话页动量状态条（`composables/useRunMomentum.ts`）需要 `round_start` / `round_end` /
    * `usage` / `tool_use` / `tool_result` / `assistant_delta` / `run_end` 这些**已经到达前端**的帧。
@@ -597,6 +612,11 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'session_updated':
         // issue #88：标题是会话元数据而非时间线事件（live-only 帧，无 seq）；只更新列表项，不进消息流。
         hooks.onSessionUpdated?.(d);
+        return;
+      case 'queue_update':
+        // issue #370：同样是一帧无 seq 的 live-only 状态帧；**不进消息流**（它是 composer 上方的条，
+        // 不是对话内容——投递成功后那句话才会以正常 user 消息出现）。
+        hooks.onQueueUpdate?.(d);
         return;
       case 'round_start':
         if (deltaText.value) { deltaText.value = null; }

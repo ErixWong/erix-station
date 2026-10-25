@@ -365,6 +365,36 @@ export const zhCN = {
     stop: '■ 停止',
     // issue #261B：上一条发送以失败终局收场时的一键重发（仅输入框为空 + 无活跃 run 时可见）。
     retry: '重试上一条',
+    // issue #370：运行中说话的两个动作。命名纪律：叫「转向」不叫「打断并转向」——语义与 pi 的
+    // steer 完全一致（当前轮工具调用跑完、下一次 LLM 调用之前停下），但 5 个字会在用户最需要
+    // 按下它的那一刻把人吓住（理由全文见 docs/portal.md §4.3a）。
+    placeholderRunning: '运行中也能说话：Enter 转向，Alt+Enter 排队',
+    steer: '转向',
+    steerHint: '当前这一轮跑完就停下来，用这句话继续（正在执行的工具会先跑完）· Enter',
+    followUp: '排队',
+    followUpHint: '等当前任务正常结束后，按顺序把这句话发出去 · Alt+Enter',
+    hintEnterSend: '发送',
+    hintEnterSteer: '转向',
+    hintAltFollowUp: '排队',
+    hintShiftNewline: '换行',
+    hintSlash: '查看命令',
+    hintAt: '引用文件',
+  },
+  // issue #370：待发送输入队列条（components/QueuedInputsBar.vue）
+  queued: {
+    count: '{n} 条待发送',
+    steerCount: '{n} 条转向',
+    followUpCount: '{n} 条排队',
+    expand: '展开',
+    collapse: '收起',
+    recall: '全部取回',
+    recallHint: '把队列里的话全部取回输入框（取回的文在前、已打的草稿在后）',
+    // 暂停投递的原因（`queue_update.blocked`）。键名即服务端的机器码，拼成 `queued.blocked.<code>`
+    // ——**服务端发码、前端出话**（#294：不在 SSE 里塞成人话）。
+    blocked: {
+      container_not_running: '容器未运行，队列暂停投递（容器起来后自动继续）',
+      deliver_failed: '上次投递没成功，队列已暂停，可取回后重发',
+    },
   },
   // 会话浏览 modal（components/SessionPickerModal.vue）
   picker: {
