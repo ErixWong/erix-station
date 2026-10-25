@@ -157,12 +157,13 @@ export const en = {
     reasoning: 'Reasoning',
     // issue #189：compaction banner (standalone separator look, summary collapsed by default, read-only lazy load)
     folded: {
-      range: 'Compressed {count} messages (rounds {from}–{to})',
+      range: 'Compressed rounds {from}–{to}',
       countOnly: 'Compressed {count} messages',
       bare: 'Compressed',
       viewOriginal: 'View original',
       originalEmpty: '(no text content)',
-      originalMissing: 'Original text unavailable (upstream did not retain the folded payload)',
+      originalMissing: 'No text to show for this span (the ledger has none either)',
+      originalTruncated: 'This archive was clipped ({count} more messages were not archived separately); the text below is rebuilt from the ledger by round',
       originalError: 'Failed to load the original text: {message}',
     },
     // issue #189 (addendum): session header stats line "N messages · compacted M times" + restrained hint (M≥1 only)
