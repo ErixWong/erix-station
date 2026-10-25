@@ -325,6 +325,35 @@ test('白名单含 tool_replay_decision_required（#288 缺陷 C）：历史回�
   }
 });
 
+test('#371-A 白名单含 persistence_error：落盘失败事件刷新后必须还在（致命与非致命一视同仁）', async () => {
+  const s = await startServer();
+  try {
+    // payload 一律是 runner `loopEventPayload` 的产物（形状与字段口径见 portal.md §5.3 第 16 行）：
+    // `fatal` 已归一成布尔、`stack` 不在、`engine_run_id` 而非 `run_id`。
+    s.pool.seed(ev(11, 'persistence_error', {
+      port: 'transcript', phase: 'write', operation: 'appendRound', engine_run_id: SESSION_ID,
+      fatal: false, sideEffect: 'strip-fold-archive-retry',
+      error: { name: 'Error', message: 'round 请求体超过 1048576 字节上限' }, ts: '2026-10-24T10:00:00.000Z',
+    }));
+    s.pool.seed(ev(12, 'persistence_error', {
+      port: 'transcript', phase: 'write', operation: 'appendRound', fatal: true,
+      error: { name: 'Error', message: 'boom' },
+    }));
+    s.pool.seed(ev(13, 'checkpoint', { round: 4 })); // 运行态语义事件：仍在白名单外
+
+    const body = await (await fetch(`${s.base}/api/sessions/${SESSION_ID}/events/history`, {
+      headers: { Cookie: s.cookieHeader },
+    })).json();
+    assert.deepEqual(body.events.map((e) => [e.seq, e.type]), [[11, 'persistence_error'], [12, 'persistence_error']],
+      '两类都要可回放：非致命那条是「降级但继续」的唯一线索，刷新后消失就等于从未发生（#371-A 缺陷本体）。'
+      + '致命那条也留库是为了可审计——界面刷不刷由前端决定，不在这里丢数据');
+    assert.equal(body.events[0].payload.fatal, false, 'fatal 必须原样下发（前端靠它分中性/红面，丢了就把降级刷成失败）');
+    assert.equal(body.events[0].payload.error.message, 'round 请求体超过 1048576 字节上限');
+  } finally {
+    await s.close();
+  }
+});
+
 test('payload 大小防护：字符串叶值截 2000 字符 + 标记（JSON 形状保持合法）', async () => {
   const s = await startServer();
   try {

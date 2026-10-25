@@ -945,7 +945,7 @@ station-portal user enable  --login <login>
 刷新后前端重建工具卡片 / judge 面板的**只读历史通路**（对齐 pi-web「转录即真相」：历史与实时走同一渲染入口）。
 
 - **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
-- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。
+- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
@@ -1823,6 +1823,7 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；`persistence_failed` 另带 `operation`/`phase`/`sideEffect`——runner 自 0.17.0 起原样透传引擎挂在错误上的 termination，见 §5.3 注与 issue #212；**0.18.0 起** `reason === "failed"` 的终局另带引擎 additive 字段 `errorCode`（上游 #176，值域由引擎定义，宿主不解释）），`usage: { input_tokens, output_tokens }`（整 run 汇总），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6）；**attempts 耗尽那条**（`error.code = max_attempts_exceeded`，§9.11）**issue #288 起 additive 另带** `last_reason: string` / `last_silent_ms: number`（release 上报过 kill 信息时出现，没上报就**没有这两个键**） |
 | 14 | `attempt_killed` | **portal 合成，两条产出路径**（不是引擎事件、不经 U3、不进 `run_queue`）：① **U12 release 的 requeue 分支**（`releaseRun`，issue #288 缺陷 B：agentd 还活着并 additive 上报 `killed_by`，§9.11）② **run 租约 reaper 的 requeue 分支**（`reapExpiredRuns`，issue #292：上报者自己已死、根本没有 release，由 portal 自己合成，§9.11 注记） | `attempt: number`（死掉的那次尝试，1-based = `run_queue.attempts`），`max_attempts: number`，`reason: string`（**开放值、无枚举白名单**：release 路径 = agentd 上报的 reason 原文，如 `watchdog_silent` / `worker_crashed`；**reaper 路径固定 `lease_expired`**），`killed_by: "watchdog" | "crash"`（`watchdog` = F6 执行期静默被判死；`crash` = worker 非预期退出；**reaper 路径固定 `crash`**——它无从区分看门狗与真崩，保守取值），可选 `silent_ms: number`（判死前的静默时长 = **最后一次 IPC 上报之后**算了多久，只有活着的 agentd 报得出来；**只在可信时出现，绝不写 0/null 冒充「有」⇒ reaper 形态固定不带**），可选 `next_retry_in_ms: number`（预留：portal 侧支持，当前 agentd 不发；reaper 也不发） |
 | 15 | `tool_replay_decision_required` | `onEvent`（LoopEvent 透传，erix-agent 0.18.0 additive 类型；**仅在 `replayPolicy: "per-tool-declaration"` 下才会发**，本站自 issue #288 缺陷 C 起传该值） | `tool_call_id: string \| null`，`round: number`，`name: string \| null`（被中断的工具），`replay: string \| null`（引擎解析出的声明，当前只可能是 `"unsafe"`），`requires_host_decision: boolean`（引擎恒给 `true`），`partial_output_available: boolean`（快照里有没有已归档的部分输出）。语义：**该工具的上次执行被崩溃打断，引擎没有重放它**，模型同时收到一条 `is_error: true` + `executionStatus: "interrupted"` 的 `tool_result`（第 7 类），**是否重试由模型决定，引擎不自己重试**。⚠ 信封里的 `run_id` 是 station run id，而引擎事件自带的 `runId` 是 store key = `transcriptKey` = `session_id`（issue #81 P2）——runner 映射时落名 `engine_run_id` 以免同义不同（`runner/worker.js loopEventPayload`） |
+| 16 | `persistence_error` | **引擎 `diagnostics.error` 通道**（**不是 `onEvent`**；本站接线在 `runner/worker.js` 的 `diagnostics: { error: … }`，映射在 `loopEventPayload` 的 `persistence_error` 分支）。erix-agent 0.23.0 起就有这条通道（`orchestrator.js:873`），`fatal: false` 一类也已存在（`:895` 宿主端口桥）；erix-agent#461 / 0.25.0 再加一类「剥掉折叠归档后重试一次」 | `port: string`（缺省 `"transcript"`），`phase: string \| null`，`operation: string`（缺省 `"unknown"`；实测致命那条 = 失败的 store 方法名，如 `appendRound`），`engine_run_id: string \| null`（**引擎 store key = transcriptKey = sessionId**，不是 station run id，#81 P2 老坑），`fatal: boolean`（**runner 归一：缺字段/脏值算 `true`**——宁可报重，不可把真失败刷成灰），`sideEffect`（引擎原样透传），`error: {name, message}`（**`stack` 刻意不透传**：那是宿主日志的东西，塞进 UI payload 只会淹没前端），`ts: string \| null`。**可见性口径**：`fatal === false` → 中性分隔行（不影响本次任务）；`fatal === true` → 界面交给 `run_end` 的 `persistence_failed` 红面，本事件只作可审计明细、不重复刷 |
 
 > 说明与边界：
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
@@ -1842,6 +1843,15 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 >   - **中性文案**（不是错误行）：引擎不重放不等于失败——模型拿到「没重放」的说明后可以自己决定重跑。所以前端不写 `.syserr`。
 >   - **可回放**：已进 §4.4a 历史回放白名单与前端 `HISTORY_REPLAY_TYPES`；与前端实时具名监听 `EVENT_TYPES` 三处必须同时存在（**只加一边就是「实时收不到」或「刷新后消失」**，本分支已用变异证明过）。
 
+> - **第 16 类 `persistence_error` 是「宿主没接线」型缺陷**（issue #371-A，2026-10-24）：引擎一直从
+>   `diagnostics.error` 报落盘失败，而本站 `runToolLoop` 参数里**从来没有 `diagnostics`**，只有
+>   `onPersistenceError`（只拿得到 `Error` 对象，且只落一条 IPC warn 日志）⇒ 真机 `run_events` 里该类型
+>   **0 行**（2026-10-24 `SELECT count(*) … WHERE type='persistence_error'` 实测），非致命降级全隐形：
+>   run 绿、有正文、界面上没有任何提示。**别把这条当成「引擎 0.25.0 才有」**——通道与 `fatal:false`
+>   在 pin 的 0.23.0 里就存在（`orchestrator.js:873` / `:895`），只是本站没接。
+>   回归锁分两个文件：`runner/test/persistence-error-channel.test.js`（① 真引擎跑一遍钉「通道与字段名
+>   是真的」② `loopEventPayload` 映射 ③ 源码级「接线还在」哨兵——**① 自己传 diagnostics，所以摘掉本站
+>   接线只有 ③ 会红**）与 `portal/test/persistence-error-visibility.test.js`（三处集合同步 + 本文档同源）。
 ---
 
 ## 6. 错误语义专题
