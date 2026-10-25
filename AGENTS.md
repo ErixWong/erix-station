@@ -1956,3 +1956,41 @@ U7 `recallTranscript` 是范围扫（`LIMIT 2000`）不受影响。
 `role/text 有无/toolCalls 条数` 一张计数表就够），再决定改哪一层。这次如果直接去改后端配对，就会花一整片
 的预算在一个纯前端问题上。
 
+### 8.63 折叠横幅三件套：收起入口（#388）+ markdown（#389）+ 「没有真摘要就别画展开控件」（#390-A）（2026-10-25）
+
+一片做完三张单，全在 `StreamPanel.vue` 那一块。**后端一位判据 + 前端两处渲染**。
+
+**#390-A 判据落在后端**：`portal/src/session-view.js` 新增 `hasRealSummary(record)`，DTO 的
+`folded.hasSummary`（boolean，**宿主判定、不是上游字段**）。判据直接抄上游契约
+（`erix-agent/src/store/file.js:25` / `store/memory.js:19` 逐字同款：`summary?:{action:string,note:string}|"missing"`）：
+只有 `{action,note}` 且至少一项非空才算有；**字面量 `"missing"` 是上游的「没有摘要」标记**（现网 17/17 条
+折叠行都是这个值），缺键 / `{}` / 两项全空 / 数组都算没有。**存否与 `round` 绑同一个守卫**：轮号取不到
+就整个不带这个键，前端把「缺席」当「不知道」，不许当 `false`（否则旧数据凭空丢掉展开控件——变异 ④
+把 `!== false` 写成 truthy 判定，**恰有 6 格红**，其中 5 格是旧用例，说明这条红线本来就有护栏）。
+另钉一格**上游契约哨兵**（读随包 `store/file.js` 的形态串），上游哪天改标记就得重核判据。
+
+**#388 收起**：原文块原来挂在 `v-if="foldedOriginalState(en)"`，**不在 `isFoldedExpanded` 管辖内**
+⇒ 标题「收起」只收起摘要，836 KB / 157 条 turn 的原文孤儿地挂在页面上，而 `.view-original` 再点只是命中
+缓存 ⇒ 展开后根本没有收起入口。现在可见性收进 `foldedOriginalVisible()`（横幅收起 ⇒ 摘要与原文一起收起；
+原文块自带 `.folded-original-collapse`，**只隐藏不清缓存**——判据是「收起再展开后 `fetch('/folded/')`
+总次数仍为 1」，专门防「收起 = 删缓存」那种假修法）。`loadOriginal` 顺手展开横幅并解除本地收起
+（否则收起态点「查看原文」等于没反应）。
+
+**#389 markdown**：摘要与原文 turn 的 `text` 改走站内既有的 `renderMarkdown()`（先转义后格式化、标签白名单、
+href 只放 https，助手气泡本来就是这条路），`<pre>` + `whitespace-pre-wrap` 换成 `div.md` + `v-html`
+（markdown 自己重排，叠加 `pre-wrap` 会双倍行距）。**`reasoning` 与工具行刻意保持纯文本插值**并有反向判据
+钉住（模型独白和 `ls -la *_all*` 这种一格式化就出鬼）。成本实测过再决定做不做：真机 round 137 的 157 条
+turn 全量渲染 **text 7 ms / reasoning 13 ms** ⇒ 性能根本不是理由，也不需要虚拟滚动。
+
+**判据**：根 **1564 / 1560 / 0 / 4**、runner **359 / 359 / 0**、前端 **48 文件 / 896**、`vue-tsc` 全 0
+（前端新增 10 格、后端新增 3 格；变异四次：①去 `isFoldedExpanded` 前置 ⇒ 恰 1 红；②「收起原文」改成清缓存
+⇒ 恰 1 红；③原文 `v-html` 改回插值 ⇒ 恰 1 红；④`!== false` 写成 truthy ⇒ 6 红）。
+
+**并行作业的两条环境教训**（这次真踩到）：
+1. **主检出正被另一个 session 编辑时不要在里面干活**——我用 `git worktree add ../wt390 origin/main` 开独立
+   检出（三处 `npm ci` 各 <1 分钟），主检出的他人未提交改动一行没动。**别在别人的工作树上 `git checkout`**：
+   我建分支建在主检出，害得要先 `git checkout main` 把分支删掉才能建 worktree。
+2. **别在这台机器上同时跑两套重活**。子代理报「基线就有 3 条 `GitLightBadge` 失败 + 2 条偶发红」，
+   我单独跑该文件 **18/18 绿**、连跑两次全量 **896/896 绿** ⇒ 那 3+2 是**我并行跑根测试把它压出来的**，
+   不是预存失败。子代理的基线数字必须自己复算一遍，不能照抄。
+

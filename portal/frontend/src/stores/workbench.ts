@@ -107,6 +107,12 @@ export interface FoldedInfo {
   navigationRecord?: unknown;
   foldedPayloadMessages?: number;
   round?: number;
+  /**
+   * issue #390（#390-A，与后端并行）：上游是否真的给了 {action, note} 摘要。
+   * `false` = 上游写的是字面量 "missing"，摘要区只是重复标题 ⇒ 前端不画 ▾/摘要区（「查看原文」照旧）。
+   * **键缺失**（旧 DTO / 其他路径）≠「没有摘要」，前端按「有摘要」处理保持现状。
+   */
+  hasSummary?: boolean;
 }
 
 export interface ChatMessage {

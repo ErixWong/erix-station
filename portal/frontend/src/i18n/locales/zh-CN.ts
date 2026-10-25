@@ -183,6 +183,8 @@ export const zhCN = {
       countOnly: '已压缩 {count} 条消息',
       bare: '已压缩',
       viewOriginal: '查看原文',
+      // #388：原文块自己的收起入口（只隐藏、不清缓存，再展开不重发）
+      collapseOriginal: '收起原文',
       // 原文只读展示
       originalEmpty: '（无文本内容）',
       // #384：一个 turn 在账本里有四类内容（`text` / `reasoning` / `toolCalls[]` / user 身份），旧实现只画
