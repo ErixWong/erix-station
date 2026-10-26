@@ -150,6 +150,7 @@ export function buildContainerConfig({
   fdeName,
   containerName,
   image,
+  agentVersion = null,
   cmd,
   networkName,
   ip,
@@ -213,6 +214,12 @@ export function buildContainerConfig({
     // 单容器/单网络下默认 IPAM 顺序分配即固定位 .2（topology §3）。
   };
   if (runUser) body.User = runUser;
+  // issue #404 结案：`FDE_AGENT_VERSION` 从"版本的来源"降级成"显式 override"。
+  // 默认不设 ⇒ 容器里的版本真相来自镜像内 build-info.json（runner/lib/build-info.js 读）。
+  // 'dev' 是 docs/env.md 写明的开发期占位，**不算钉值**：把它注进容器等于让占位冒充上报值——
+  // 账上那个 0.1.32-088e41e 正是"占位没人撤"的形状。
+  if (agentVersion && agentVersion !== 'dev') body.Env.push(`ERIX_AGENT_VERSION=${agentVersion}`);
+
   return body;
 }
 
@@ -507,6 +514,8 @@ export async function reconcileOnce(pool, config, { docker, log = console } = {}
           fdeName,
           containerName,
           image: config.fdeImage,
+          // #404 结案：版本的真相在镜像里，这里只把"显式钉值"当 override 传下去（默认 null）。
+          agentVersion: config.fdeAgentVersion ?? null,
           cmd: config.fdeCmd,
           networkName,
           ip,
@@ -813,6 +822,8 @@ export async function onboardFde(pool, config, {
         fdeName,
         containerName,
         image: config.fdeImage,
+        // #404 结案：版本的真相在镜像里，这里只把"显式钉值"当 override 传下去（默认 null）。
+        agentVersion: config.fdeAgentVersion ?? null,
         cmd: config.fdeCmd,
         networkName: net.network_name,
         ip,
