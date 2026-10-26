@@ -1388,3 +1388,27 @@ test('#404 FDE_AGENT_VERSION 只是 override：默认不注入、dev 占位不�
   const pinned = buildContainerConfig({ ...base, agentVersion: '0.27.0-rc1' });
   assert.ok(pinned.Env.includes('ERIX_AGENT_VERSION=0.27.0-rc1'), '显式钉值必须真的落到容器 env');
 });
+
+// ---------------------------------------------------------------------------
+// 交叉核对（issue #404 结案的补漏）：**注入方（provisioner）与放行方（fde-proxy 白名单）是两个模块**。
+// #416 加了 `ERIX_AGENT_VERSION` 注入却没同步白名单，现网 `provision-fde` 直接
+// `create_policy_denied: Env key not allowed: ERIX_AGENT_VERSION`，而两个 FDE 容器当时已被 provision
+// 流程删掉 ⇒ 短暂全停。单侧的测试（"我确实注了这个键"）永远不会发现这件事，因为它两边都"对"。
+// ---------------------------------------------------------------------------
+test('交叉核对：buildContainerConfig 能注入的每个 Env 键，都必须在 fde-proxy 白名单里', async () => {
+  const fs = await import('node:fs');
+  const src = await fs.promises.readFile(new URL('../src/provisioner.js', import.meta.url), 'utf8');
+  const start = src.indexOf('export function buildContainerConfig');
+  const end = src.indexOf('\n}\n', start);
+  assert.ok(start > 0 && end > start, 'buildContainerConfig 源码边界没定位到（判据不能空转）');
+  const injected = [...new Set([...src.slice(start, end).matchAll(/`([A-Z][A-Z0-9_]{2,})=/g)].map((m) => m[1]))].sort();
+  assert.ok(injected.length >= 5, `只解析到 ${injected.length} 个注入键，多半是解析失效而非真的少`);
+
+  const proxy = await fs.promises.readFile(new URL('../../deploy/fde-proxy/server.js', import.meta.url), 'utf8');
+  const m = /const ENV_KEY_ALLOW = new Set\(\[(.*?)\]\)/s.exec(proxy);
+  assert.ok(m, 'fde-proxy 的 ENV_KEY_ALLOW 定义没找到（改名了？那这条判据得同步改）');
+  const allowed = new Set([...m[1].matchAll(/'([A-Z][A-Z0-9_]*)'/g)].map((x) => x[1]));
+
+  const missing = injected.filter((k) => !allowed.has(k));
+  assert.deepEqual(missing, [], `provisioner 会注入但 proxy 不放行的键：${missing.join(', ')} ⇒ 现网 create_policy_denied，容器建不出来`);
+});
