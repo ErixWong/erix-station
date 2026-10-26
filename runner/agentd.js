@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
+import { readBuildInfo } from './lib/build-info.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
 import { archiveRunData, prepareRunDataDir, prepareSessionNotesDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
@@ -41,7 +42,11 @@ const CFG = {
   token: process.env.ERIX_STATION_TOKEN || '',
   baseUrl: (process.env.ERIX_STATION_BASE_URL || 'https://station.localhost/api/internal').replace(/\/+$/, ''),
   fdeName: process.env.ERIX_FDE_NAME || 'unknown',
-  agentVersion: process.env.ERIX_AGENT_VERSION || '0.1.0',
+  // issue #404 结案：版本是**构建产物**，不是 env 兜底。原先这里是
+  // `process.env.ERIX_AGENT_VERSION || '0.1.0'`，而那个 env **从来没被任何地方设过**
+  // （provisioner / Dockerfile / compose 全无）⇒ 每次心跳都在报 `'0.1.0'` 这个假值。
+  // 现在读镜像里烘的 build-info.json（见 Dockerfile），拿不到就是 `unknown`，不再猜一个像样的版本。
+  ...(() => { const b = readBuildInfo(); return { agentVersion: b.agentVersion, runnerVersion: b.runnerVersion, buildRevision: b.revision, buildInfoSource: b.source }; })(),
   homeUser: process.env.FDE_CONTAINER_USER || 'erix',
   home: process.env.FDE_HOME || `/home/${process.env.FDE_CONTAINER_USER || 'erix'}`,
   workerUid: Number(process.env.FDE_WORKER_UID || process.env.ERIX_WORKER_UID || 1002),
@@ -432,7 +437,15 @@ async function heartbeatOnce() {
   let listeners = [];
   try { listeners = collectListeners({ procPath: CFG.procPath, home: CFG.home }); } catch { listeners = []; }
   const r = await internalRequest('POST', '/heartbeat', {
-    body: { agent_version: CFG.agentVersion, runs, listeners },
+    // agent_version = 引擎（erix-agent）版本，口径见 docs/api/portal.md U4；runner 自身版本与构建
+    // revision 各占一个字段（旧 portal 不认识会忽略，见上一行注释的同一约定）。
+    body: {
+      agent_version: CFG.agentVersion,
+      runner_version: CFG.runnerVersion,
+      build_revision: CFG.buildRevision,
+      runs,
+      listeners,
+    },
   });
   return r.data;
 }

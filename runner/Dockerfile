@@ -119,6 +119,20 @@ COPY entrypoint.sh /usr/local/bin/station-agentd-entrypoint
 COPY healthcheck.sh /usr/local/bin/station-agentd-healthcheck
 RUN chmod 0755 /usr/local/bin/station-agentd-entrypoint /usr/local/bin/station-agentd-healthcheck
 
+# ---- 版本作为构建产物（issue #404 结案）-------------------------------------------
+# `build-info.json` 是运行时唯一版本真相（agentd 经 lib/build-info.js 读它）。
+# station/engine 两个版本**从镜像内的文件取**（`package.json` 与 `node_modules/erix-agent/package.json`），
+# 不从 ARG 传——少一条"必须与构建同步的手工输入"就少一次漂移；只有 git revision / 构建时间这类
+# 镜像内部拿不到的才走 ARG。engine_version 用文件读而不是 `require('erix-agent/package.json')`：
+# 该包的 exports 只开了 `.`/`./tools`/`./contract-tests`，裸 spec 会 ERR_PACKAGE_PATH_NOT_EXPORTED。
+# 故意放在靠后位置：ARG 每次变更都会让它之后的层缓存失效，放末尾把影响压到最小。
+ARG STATION_VERSION=unknown
+ARG STATION_REVISION=unknown
+ARG STATION_BUILD_DATE=unknown
+RUN node -e 'const fs=require("fs");const v=p=>{try{const j=JSON.parse(fs.readFileSync(p,"utf8"));return (typeof j.version==="string"&&j.version)||"unknown"}catch{return "unknown"}};const sv=v("/opt/erix/package.json");if(sv==="unknown"){console.error("[build-info] /opt/erix/package.json 缺 version，版本没能烘进镜像");process.exit(1)}fs.writeFileSync("/opt/erix/build-info.json",JSON.stringify({station_version:sv,engine_version:v("/opt/erix/node_modules/erix-agent/package.json"),revision:process.env.STATION_REVISION||"unknown",built_at:process.env.STATION_BUILD_DATE||"unknown"})+"\n");console.log("[build-info] "+fs.readFileSync("/opt/erix/build-info.json","utf8").trim())'
+# label 给人看（docker inspect 一眼可读版本），不参与运行时真相；版本真值以 build-info.json 为准。
+LABEL org.opencontainers.image.version="${STATION_VERSION}"       org.opencontainers.image.revision="${STATION_REVISION}"
+
 # ---- 非 root 运行路径（deploy-contract §1）：root 启动 → drop 1001（setpriv ambient caps）----
 # 说明：compose/provisioner 已 --init（tini 作 PID 1）；entrypoint 直接 exec agentd，不重复 init（runner §2.3 方案 (a)）。
 # setpriv 以 ambient caps 保留 SETUID/SETGID/KILL，供 agentd(1001) fork worker(1002) 与跨 UID kill（deploy-contract §6.2 B7）。

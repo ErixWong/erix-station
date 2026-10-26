@@ -76,7 +76,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `fde_name` / `container_name` | 均唯一；`container_name = fde-<name>`（docker 容器名）。该容器名只在其自己的 `/29` 网络内按 docker DNS 解析（供其自有服务）；portal **不**按容器名/容器 IP 访问它——平台通道全出站经 Traefik（H-B，topology.md §2/§4；`control` 已取消） |
 | `runner_token_hash` / `token_generation` / `revoked_at` / `rotated_at` | per-container token（规格 §10.3 / issue #12）：**仅存哈希**。建容器时生成原文、注入容器 env `ERIX_STATION_TOKEN`；**容器 → portal 单向出示原文**（internal API Bearer），portal 只校验哈希、不再向容器出示。`token_generation` 是代次（轮换/重建 +1），`revoked_at` / `rotated_at` 记录吊销/轮换时刻——旧代次哈希失配 → `401 token_revoked`（原子吊销，topology.md §6 第 9 条）。Offboarding 吊销时将 `runner_token_hash` 置 `NULL` 并增加代次（nullable 由 migration 0013 提供）。严禁明文入 DB/日志/镜像/仓库（原理 §5 清单）。**容器除此之外无任何平台凭据，尤其没有 DB 凭据**（D1'） |
 | `status` | `creating / running / stopped / exited / removed`（状态机见 §2.4） |
-| `agent_version` | erix-agent 版本 pin / canary 的记录点（规格 §14 容器升级流程） |
+| `agent_version` | **实际在跑的 erix-agent 版本**（构建产物，随心跳落账，issue #404 结案）。旧语义是「版本 pin / canary 记录点」，实测那样只会存着一个没人再动的 `.env` 静态值、且**重建也不修正**，已弃用；canary 若真要做，需另开「期望版本」列，与「实际」并排才看得出漂移 |
 | `git_provider` | onboarding 选定的 Git host provider（`gitea` / `github` / `gitlab`）；host 详细绑定见 `fde_git_accounts` |
 | `last_heartbeat` | agentd 心跳（15s ⚠️，经 internal API 上报、portal 落库，runner-integration §4.2 U4）；3 次丢失（45s ⚠️）判容器死（视 `exited`），run 级处置走租约到期 re-claim（runner-integration §6.4） |
 

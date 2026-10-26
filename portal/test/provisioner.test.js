@@ -1360,3 +1360,31 @@ test('#404 写面：三条容器写路径都必须更新 image（复用写实际
   assert.ok(adopt.length >= 1, 'reconcile 的 adopt 分支必须写实际镜像（res.image）');
   assert.ok(src.includes('res.image ?? null'), 'reconcile 必须用 ensureFdeContainer 带回的 res.image，而不是自己猜期望值');
 });
+
+// ---------------------------------------------------------------------------
+// issue #404 结案：`FDE_AGENT_VERSION` 从"版本的来源"降级成"显式 override"。
+// 版本的真相在镜像里（build-info.json，见 runner/lib/build-info.js 与 runner/Dockerfile）。
+// 判据钉三种情形：不设 ⇒ 不注入（容器自己读构建产物）；设成 'dev'（docs/env.md 的开发期占位）
+// ⇒ **仍不注入**（占位冒充上报值正是本次要清除的形状）；显式钉一个真值 ⇒ 注入覆盖。
+// ---------------------------------------------------------------------------
+test('#404 FDE_AGENT_VERSION 只是 override：默认不注入、dev 占位不注入、钉值才注入', async () => {
+  const base = {
+    fdeName: 'alice',
+    containerName: 'fde-alice',
+    image: 'traefik/whoami',
+    cmd: ['-port', '4000'],
+    networkName: 'fde-alice',
+    ip: '10.200.1.2',
+    gateway: '10.200.1.1',
+    baseDomain: 'localhost',
+    llmHost: 'llm.localhost',
+    userSpaceRoot: '/srv/erix/users',
+  };
+  const hasOverride = (body) => body.Env.some((e) => e.startsWith('ERIX_AGENT_VERSION='));
+  assert.equal(hasOverride(buildContainerConfig(base)), false, '不设 ⇒ 让容器读构建产物');
+  assert.equal(hasOverride(buildContainerConfig({ ...base, agentVersion: null })), false);
+  assert.equal(hasOverride(buildContainerConfig({ ...base, agentVersion: 'dev' })), false,
+    'dev 是占位，注进容器就等于让占位冒充上报值（账上那个 0.1.32-088e41e 就是这么来的）');
+  const pinned = buildContainerConfig({ ...base, agentVersion: '0.27.0-rc1' });
+  assert.ok(pinned.Env.includes('ERIX_AGENT_VERSION=0.27.0-rc1'), '显式钉值必须真的落到容器 env');
+});

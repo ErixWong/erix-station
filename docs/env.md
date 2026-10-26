@@ -299,7 +299,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `STATION_DOCKER_PROXY_IMAGE` | 平台规范固定（deploy-contract §5.1）；自构建（build context `deploy/fde-proxy/`） | `erix-station/fde-proxy:<git-sha>`（自研 admission proxy；tecnativa/docker-socket-proxy 方案已废弃）；dev 默认 `:local`，compose 插值可 env 覆盖（issue #27） |
 | `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）**；生产 pin 双轨见下方「镜像 pin 策略」+ issue #27（B 档语言矩阵：Node/Python/.NET/Playwright，实测 2.29GB） |
 | `FDE_CMD` | 平台规范固定（FDE 容器命令；开发期 whoami 站台用，生产为 `station-agentd` 入口） | JSON 数组；开发期 `["-port","4000"]`（首个项目块首端口，fde-platform §8.2） |
-| `FDE_AGENT_VERSION` | 平台规范固定（写 `containers.agent_version`；开发期占位） | `dev` |
+| `FDE_AGENT_VERSION` | **仅作显式 override**（issue #404 结案）：不设 ⇒ 版本真相来自镜像内 `build-info.json`；设成真值 ⇒ 同时注进容器 env `ERIX_AGENT_VERSION` 覆盖构建产物，并写进新建容器的 `containers.agent_version`（后续由心跳校正为实际值）。`dev` 是占位，**不算钉值、不注入容器** | 不设（占位 `dev`） |
 | `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；**已决 2026-09-18，issue #27**） | `4g`（B 档镜像下 dotnet build/chromium 峰值需要；`0` 表示不限） |
 | `FDE_AGENTD_UID` / `FDE_WORKER_UID` | 平台规范固定（runner-integration §11.3 / user-space §6.1 双 UID） | `1001` / `1002`（GID 同 `1000`；开发期 whoami 镜像不具备双 UID 用户，用 `--user 1001:1000` 兜底） |
 | `SESSION_SIGNING_KEY` | 决策者/运维提供（预览 session 确定性派生 HMAC 密钥，portal.md §2.7；#366 兼任 `/pv/<code>` 能力码签名密钥 `previewSessionSigningKey`；⚠️ 生产必须改为强随机值） | `erix-station-dev-signing-key-change-me`（仅联调占位） |

@@ -150,7 +150,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | U1 | `POST /api/internal/claim` | **领任务（长轮询）** | `{capacity, hold_ms}`（hold 上限 30s ⚠️） | `200 {ticket}` 或 `204`（hold 超时无任务） | lease + `claim_token`（见下） |
 | U2 | `PUT /api/internal/runs/:id/state` | `markRunState("running")` 的 run 生命周期信号；worker 结束后的宿主终态收敛 | `{state: "running"}` 或宿主终态 `{state: "finished"\|"failed", termination, usage, rounds, final_text, error?}` | `200` | 终态写入幂等（终态不可变，重复提交返回首次结果） |
 | U3 | `POST /api/internal/runs/:id/events` | **事件批量上报** | `{batch_id, events: [{client_event_id, type, ts, payload}]}` | `200 {stored, seq_first, seq_last}` | `client_event_id` 唯一（§7.3） |
-| U4 | `POST /api/internal/heartbeat` | 心跳 + 租约续期 + stop 兜底轮询 | `{agent_version, runs: [{run_id, status, worker_pid, claim_token}], listeners?: [{port, pid, cwd, cmd, branch, started_at}]}`（`listeners` = 观测层 MVP 的 additive 字段，缺省 = 旧 agentd、不碰 `port_observations`，语义见 §4.2） | `200 {now, stop_run_ids: [], revoked: false, runs: [{run_id, lease}]}`（部分失败；`revoked` 字段保留但恒 false——吊销走鉴权阶段 `401 token_revoked`，见 §4.2） | 天然幂等（覆盖写 `last_heartbeat`、续 lease；逐 run 按 claim_token fencing；listeners 整批替换） |
+| U4 | `POST /api/internal/heartbeat` | 心跳 + 租约续期 + stop 兜底轮询 | `{agent_version, runner_version?, build_revision?, runs: [{run_id, status, worker_pid, claim_token}], listeners?: [{port, pid, cwd, cmd, branch, started_at}]}`（`listeners` = 观测层 MVP 的 additive 字段，缺省 = 旧 agentd、不碰 `port_observations`，语义见 §4.2） | `200 {now, stop_run_ids: [], revoked: false, runs: [{run_id, lease}]}`（部分失败；`revoked` 字段保留但恒 false——吊销走鉴权阶段 `401 token_revoked`，见 §4.2） | 天然幂等（覆盖写 `last_heartbeat`、续 lease；逐 run 按 claim_token fencing；listeners 整批替换） |
 | U5 | `PUT /api/internal/runs/:id/transcript/rounds/:round` | store：`appendRound` | RoundRecord（含 `dedupKey`、`folded`、`messages`、`foldedPayload`） | `200 {inserted: bool}` | `UNIQUE(run_id, round)` + dedupKey（§9.3） |
 | U6 | `GET /api/internal/runs/:id/transcript` | store：`load` | — | `200 {records: [...]}` | 只读 |
 | U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall` | query：`from_round` / `to_round` / `pattern` | `200 {text}` | 只读 |
@@ -190,7 +190,9 @@ agentd                          portal
 
   ```json
   {
-    "agent_version": "0.1.0",
+    "agent_version": "0.26.0",
+    "runner_version": "0.1.41",
+    "build_revision": "<git sha | unknown>",
     "runs": [
       { "run_id": "9d3b2f1e-...", "status": "running", "worker_pid": 1234, "claim_token": "ct_3f8a..." }
     ],

@@ -2193,16 +2193,25 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 ```json
 {
-  "agent_version": "0.1.0",
+  "agent_version": "0.26.0",
+  "runner_version": "0.1.41",
+  "build_revision": "8e28cc1c2b0e4b0e1a2f3c4d5e6f7a8b9c0d1e2f",
   "runs": [
     { "run_id": "9d3b2f1e-...", "status": "running", "worker_pid": 1234, "claim_token": "ct_3f8a..." }
   ]
 }
 ```
 
+> **版本是构建产物，不是运维旋钮**（issue #404 结案）。三个版本字段一律来自 FDE 镜像构建期烘进去的
+> `/opt/erix/build-info.json`（`runner/Dockerfile` 写、`runner/lib/build-info.js` 读）；读不到就报
+> `unknown`，**不再有 `'0.1.0'` 这类兜底常量**——一个看起来合法的假值比空值更难发现。
+> `ERIX_AGENT_VERSION` 只剩 override 身份（默认不设，portal 仅在显式钉值时注入）。
+
 | 字段 | 说明 |
 |---|---|
-| `agent_version` | agentd 版本号字符串（供审计/排障） |
+| `agent_version` | **erix-agent（引擎）版本**，构建产物；portal 会落账到 `containers.agent_version`（仅当与现值不同，见下）。空/缺 ⇒ 不写，**不会拿 `unknown` 去覆盖上一次的真值**（兼容旧 agentd） |
+| `runner_version` | station runner 自身版本（`additive`，旧 portal 忽略） |
+| `build_revision` | 构建所用 git commit（`additive`；本地/dev 构建为 `unknown`） |
 | `runs[].run_id` | 当前活跃 run 的 id |
 | `runs[].status` | `running`（agentd 只上报在跑的 run；终态 run 在 U2 后即从列表移除）。其余值保留、portal 忽略 |
 | `runs[].worker_pid` | 该 run 的 worker 进程 pid（观测用） |

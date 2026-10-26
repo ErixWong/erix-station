@@ -2256,3 +2256,46 @@ provisioner 34/34、portal+root 全量绿。
 > **`image` 那一半已实测修好**：v0.1.41 上线后第一个 reconcile tick 就把两行改写成容器实际引用，全长等值。
 > 核对时注意读数陷阱——用 `right(image,12)` 比 `docker inspect | cut -c8-20` 会把**同一个** digest 的
 > 后 12 位与前 12 位当成两个值，看着像"写平了但写错对象"。**digest 必须比全长。**
+### 8.70 版本改成构建产物：`build-info.json` 是运行时唯一真相，env 只剩 override（2026-10-26，分支 `feat-261026-06-version-as-artifact`）
+
+#404 结案评论里定的修法。为什么不是"把那个 .env 值改对"：**它还有第二个来源，就一定会再漂**。
+当时的三方各说各话是这样的——
+
+| 位置 | 当时写的 | 真相 |
+|---|---|---|
+| `containers.agent_version` | `0.1.32-088e41e` | 容器已换过两版 |
+| 出处 | `deploy/.env` 一行没人再动的 `FDE_AGENT_VERSION` | 且**重建也不会修正**（重建路径写的还是同一个 env） |
+| agentd 心跳上报 | `0.1.0` | `ERIX_AGENT_VERSION` **从来没被任何地方设过** ⇒ 落到兜底常量 |
+| 全仓读者 | 无 | API 不返回、前端不显示、reconcile 不判 |
+
+**规则**：未知就写 `unknown`，不要写兜底版本号。`0.1.0` 和 `0.1.32-088e41e` 这两个"看起来合法的假值"
+骗过了所有看的人，比空值毒。
+
+| 改动 | 为什么在这儿 |
+|---|---|
+| `runner/Dockerfile` 构建期写 `/opt/erix/build-info.json` | `station_version` / `engine_version` **从镜像内的 `package.json` 与 `node_modules/erix-agent/package.json` 读**，不从 ARG 传——少一条"必须与构建同步的手工输入"就少一次漂移；只有 `.git` 拿不到的 `revision` / `built_at` 走 ARG。ARG 与 RUN 放 Dockerfile 末尾，把缓存失效压到最小 |
+| `runner/lib/build-info.js`（新） | 三级来源 + **绝不抛错**（心跳热路径上读版本不能把心跳打死）：env override > `build-info.json` > 本地 `package.json`（dev）> `unknown` |
+| `runner/agentd.js` | 删掉 `\|\| '0.1.0'`；心跳新增 `runner_version` / `build_revision`（additive，旧 portal 忽略） |
+| `portal/src/internal.js` 心跳 | 落账 `agent_version`：空/缺 ⇒ **不写**（不许拿 unknown 覆盖上一次真值）；`IS DISTINCT FROM` ⇒ 同值不写，否则 15s 一次的心跳把 `updated_at` 刷成噪音；截断 64 防一个怪 tag 把心跳打成 500 |
+| `portal/src/provisioner.js` | `FDE_AGENT_VERSION` 降级成 override：**默认不注入**容器 env；`dev` 是占位、不算钉值（注入它等于让占位冒充上报值） |
+| `.github/workflows/release.yml` | 传 `STATION_VERSION` / `STATION_REVISION` / `STATION_BUILD_DATE` |
+| `.github/workflows/ci.yml` | 构建校验里加 tripwire：`build-info.json` 必须存在、`station_version` 必须等于仓库 pin、`revision` 必须等于本次 commit、`engine_version` 不许 unknown |
+
+口径与坑：
+
+- **`agent_version` 的契约语义是 erix-agent（引擎）版本**（`docs/api/portal.md` U4 早就这么定义），
+  runner 自身版本另放 `runner_version`。以前三方混用一个字段，正是它腐烂的原因。
+- 读引擎版本**不能** `require('erix-agent/package.json')`：那个包的 `exports` 只开 `.` / `./tools` /
+  `./contract-tests`，裸 spec 会 `ERR_PACKAGE_PATH_NOT_EXPORTED`；这里按文件路径直接读。
+- CI 那段是 YAML 块标量里的 shell + `node -e`：单引号内的行尾 `\` **会**进字符串（JS 里是语法错误），
+  所以脚本行一律不带续行符；`EXPECTED` 要靠 `docker run -e EXPECTED` 才进得了容器，只在 shell 里赋值没用。
+  两处都用 `bash -n` + `node --check` 真验过，不是"看着像对"。
+- 判据里"不许出现 `|| '0.1.0'`"要**先剥注释再查**：本条文档自己就原样引用了被禁的写法，不剥会判据过敏。
+- 消费面（谁读这列）**本片故意不做**：现网只有两个容器，人一眼看得过来；先把真相做对，读者等有需求再加。
+  判据是 `#404` 结案评论里那三条触发条件，不是"以后再说"。
+- ⚠ **两个 workflow 文件不在本 PR 里**，不是忘了：本机 `gh` 用的是 OAuth App token，scopes 只有
+  `gist, read:org, repo`，GitHub 直接拒绝无 `workflow` scope 的推送（`refusing to allow an OAuth App to
+  create or update workflow`）。release 的 build-args 与 CI 的 tripwire 以补丁形式挂在 PR 评论里，
+  等有 `workflow` scope 的凭据（或本人）再推。**在它落地之前**：`revision` / OCI label 会是 `unknown`
+  （`station_version` / `engine_version` 仍是真值，因为它们从镜像内文件读，不依赖 ARG），
+  而"版本没烘进去"这件事暂时**没有自动检查**——就是上面反复强调的"第三问：谁在检查"仍然空着。
