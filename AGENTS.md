@@ -2299,3 +2299,35 @@ provisioner 34/34、portal+root 全量绿。
   等有 `workflow` scope 的凭据（或本人）再推。**在它落地之前**：`revision` / OCI label 会是 `unknown`
   （`station_version` / `engine_version` 仍是真值，因为它们从镜像内文件读，不依赖 ARG），
   而"版本没烘进去"这件事暂时**没有自动检查**——就是上面反复强调的"第三问：谁在检查"仍然空着。
+
+### 8.71 #412④：隔离跑的宿主写路径必须**逐条证明与共享栈不相等**，"有没有设"不是判据（2026-10-26，分支 `fix-261026-07-host-write-paths`）
+
+先纠正我自己写进 #412 的一句话：原以为病根是"compose 里 `${TRAEFIK_DYNAMIC_DIR_HOST:-默认}` 这个不安全默认值"。
+**不对**：那个默认值是相对路径 `./traefik/dynamic`，而我今晚覆掉生产配置时它**有值**——值是
+`--env-file deploy/.env` 从生产 `.env` 里带进来的（`/docker/station-edge/dynamic`）。所以改成必填挡不住：
+`--env-file` 永远会填上。缺的不是"设没设"，是**"这个值是不是我这套栈的"**。
+
+判据因此做成"**与共享 `.env` 的值逐条不相等**"：`assertHostWritePathsIsolated({env, envFile})` 读
+`deploy/.env`（缺文件则只判绝对路径），对四条宿主写路径逐一比对——
+
+| env | 写错会怎样 | 现网生产值 |
+|---|---|---|
+| `TRAEFIK_DYNAMIC_DIR_HOST` | **直接改写生产边缘的路由文件**（今晚 502 就是这个） | `/docker/station-edge/dynamic` |
+| `ERIX_USERSPACE_ROOT_HOST` | 隔离用户目录落进生产 userspace | `/docker/erix/users` |
+| `ERIX_ARTIFACTS_ROOT_HOST` | run 产物混进生产 | `/docker/erix/artifacts` |
+| `STATION_DB_DIR` | 两个实例开同一份数据文件 | `/docker/station-db` |
+
+未设置也算命中（未设置 ⇒ compose 用默认值或 env-file 的值，两种都不是"我这套栈的目录"）。
+拿真实生产 `.env` 实测：原样使用四个值 ⇒ 直接拒；换 `/tmp/*` ⇒ 放行。
+
+两个刻意的形状，别改回去：
+
+- **这条判据不挂在 `assertIsolatedEnvironment` 里**。各脚本只在 `compose('up', extraEnv)` 传这三个
+  `ERIX_*` 路径，`process.env` 里常常没有 ⇒ 挂总断言会误伤所有老脚本，而"判错方向"比不判更糟。
+  规则是**谁 `up` 栈谁调**，传 `{...process.env, ...extraEnv}`。本 PR 先接 `wp3b`（我手工起栈踩过的那条路）。
+- 没动 compose 的默认值。改成 `:?` 只是把"静默用共享目录"换成"另一种静默"，还会让
+  `docker compose config` 这类无 env 的解析场景一起炸——收益低、面大。**先修判据，默认值的事另议**。
+
+另外记一条排障口径：**"容器全 healthy" 不能证明系统没事**。今晚 502 的时候 `docker ps` 六个容器
+全 `Up (healthy)`、portal 直连正常，坏的是配置**内容**。判入口要打到真入口：
+`curl -o /dev/null -w '%{http_code}' http://station.vc.cn-ai.vip:8090/`，以及 `/api/sessions` 期望 401。
