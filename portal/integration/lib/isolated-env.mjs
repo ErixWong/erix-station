@@ -179,6 +179,80 @@ export function createDbDirCleaner({ docker, env = process.env, allowSharedReset
  * @param {string[]} [options.extraRequiredEnv] 脚本专属必需 env
  * @param {[string, string][]} [options.extraForbiddenEnv] 脚本专属「不得等于共享栈值」对
  */
+// ---------------------------------------------------------------------------
+// issue #412 ④：宿主**写路径**必须逐条证明是隔离的，"没报错"不等于隔离。
+//
+// 事故现场（2026-10-26，部署机）：手工 `docker compose -p e2e40 --env-file deploy/.env up -d` 起了
+// 一套隔离栈，四个隔离变量都设了，唯独没设 `TRAEFIK_DYNAMIC_DIR_HOST`。它**不是没值**——
+// `--env-file` 把生产 `.env` 里的 `/docker/station-edge/dynamic` 带了进来，于是隔离 portal 把路由
+// 写进了**生产边缘正在读的那份文件**，上游被改成 `http://127.0.0.1:28080`（隔离栈自己的 portal 端口，
+// 宿主上没人监听）⇒ `http://station.vc.cn-ai.vip:8090/` 全线 502，而 `docker ps` 里全部 healthy。
+//
+// 所以这条判据的形状很重要：compose 里写 `${VAR:-默认}` **挡不住**这件事，因为默认值根本不缺,
+// 缺的是"这个值是不是我这套栈的"。判据必须是"与共享 `.env` 里的值不相等"，而不是"有没有设"。
+// ---------------------------------------------------------------------------
+export const HOST_WRITE_PATH_ENVS = Object.freeze([
+  'TRAEFIK_DYNAMIC_DIR_HOST', // 边缘网关动态配置目录：写错 = 直接改写生产路由（本次事故就是它）
+  'ERIX_USERSPACE_ROOT_HOST', // FDE 用户空间：写错 = 隔离用户目录落进生产 userspace
+  'ERIX_ARTIFACTS_ROOT_HOST', // run 产物卷：写错 = 产物混进生产
+  'STATION_DB_DIR', // 库文件目录：写错 = 两个实例开同一份数据文件
+]);
+
+/** 读 `deploy/.env`（只取 `KEY=VALUE`，忽略注释/空行）。缺文件返回 {}（CI 的 worktree 里就没有它）。 */
+export function readEnvFile(envFile) {
+  try {
+    const out = {};
+    for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
+      if (!line.trim() || line.trim().startsWith('#')) continue;
+      const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+      if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 断言"我这套栈要写的宿主目录，一个都不是共享栈的那一份"。
+ * @param {{env?: Record<string,string|undefined>, envFile?: string|null, label?: string}} [options]
+ */
+export function assertHostWritePathsIsolated({
+  env = process.env,
+  envFile = 'deploy/.env',
+  label = '隔离实例',
+} = {}) {
+  if (!envFile) return { checked: [], shared: {} };
+  const shared = readEnvFile(envFile);
+  const collisions = [];
+  for (const key of HOST_WRITE_PATH_ENVS) {
+    const mine = env[key];
+    const theirs = shared[key];
+    if (!mine) {
+      // 没设 ⇒ compose 会用默认值或 env-file 的值，两种都不是"我这套栈的目录"。
+      collisions.push(`${key} 未设置（会落到 compose 默认值或 ${envFile} 里的 ${theirs ?? '默认值'}）`);
+      continue;
+    }
+    if (!path.isAbsolute(mine)) collisions.push(`${key}=${mine} 不是绝对路径`);
+    if (theirs && theirs.replace(/\/+$/, '') === String(mine).replace(/\/+$/, '')) {
+      collisions.push(`${key}=${mine} 与共享栈共用同一份（${envFile}）`);
+    }
+  }
+  if (collisions.length > 0) {
+    throw new Error(
+      `${label} 的宿主写路径未被证明隔离：\n  - ${collisions.join('\n  - ')}\n`
+      + '⇒ 这套栈会往**生产的目录**里写。现网实测过一次：隔离 portal 覆写边缘路由文件，8090 全线 502，而容器全绿。',
+    );
+  }
+  return { checked: [...HOST_WRITE_PATH_ENVS], shared };
+}
+
+/**
+ * ⚠ `assertHostWritePathsIsolated` **不在这里调**：它是"起栈那一刻"的判据，要判的是
+ * **compose 真正拿到的那份 env**。各脚本只在 `compose('up', extraEnv)` 里传这三个 `ERIX_*` 路径，
+ * `process.env` 里往往没有 ⇒ 放进总断言会误伤所有老脚本（判错方向比不判更糟）。
+ * 谁 `up` 栈谁调，传 `{...process.env, ...extraEnv}`。
+ */
 export function assertIsolatedEnvironment(options = {}) {
   const {
     env = process.env,
