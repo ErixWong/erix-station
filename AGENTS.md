@@ -2291,6 +2291,11 @@ provisioner 34/34、portal+root 全量绿。
   所以脚本行一律不带续行符；`EXPECTED` 要靠 `docker run -e EXPECTED` 才进得了容器，只在 shell 里赋值没用。
   两处都用 `bash -n` + `node --check` 真验过，不是"看着像对"。
 - 判据里"不许出现 `|| '0.1.0'`"要**先剥注释再查**：本条文档自己就原样引用了被禁的写法，不剥会判据过敏。
+- ⚠ **本片上线即炸过一次现网**：`buildContainerConfig` 新增注入 `ERIX_AGENT_VERSION`，但
+  `deploy/fde-proxy/server.js` 的 `ENV_KEY_ALLOW` 是**另一个模块**、没同步 ⇒ `provision-fde` 报
+  `create_policy_denied: Env key not allowed`，而那时两个 FDE 容器已经被流程删掉，短暂全停。
+  单侧测试查不出来（注入方与放行方各自都"对"）。已补白名单 + 一条**交叉核对**判据：
+  provisioner 可能注入的键集合必须 ⊆ proxy 白名单。**"我加了个 env"从来不是一句无害的话。**
 - 消费面（谁读这列）**本片故意不做**：现网只有两个容器，人一眼看得过来；先把真相做对，读者等有需求再加。
   判据是 `#404` 结案评论里那三条触发条件，不是"以后再说"。
 - ⚠ **两个 workflow 文件不在本 PR 里**，不是忘了：本机 `gh` 用的是 OAuth App token，scopes 只有
