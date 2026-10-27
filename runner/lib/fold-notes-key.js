@@ -36,7 +36,7 @@ export function foldNoteKey({ nowIso, round, seq } = {}) {
 // `truncated:true` / `bytesBefore`；策略给出区间时再多 `from` / `to` / `rounds`。
 // ⚠ **`chars` 这个键引擎从来没有过**：旧代码读 `payload.chars` 恒定 `undefined` ⇒ 生产上那条注
 // 永远写「摘掉正文 ? 字」，而单测手工喂了 `chars: 184320` 所以一直是绿的（#331 同形状：
-// 手工喂的形状全绿、真链路是死光纤）。口径改成引擎真给的 `bytes`，`chars` 只作前向兼容。
+// 手工喂的形状全绿、真链路是死光纤）。口径改成引擎真给的 `bytes`；`chars` **一律不读**（见下方「规模」段的理由）。
 //
 // erix-agent #485（已合 main，未发版）会**再加**三键：`foldedRoundRange{from,to}` /
 // `foldedThrough` / `foldedRoundCount`。下面全部按「有就写、没有就不写」处理，所以现在合进去
@@ -76,9 +76,11 @@ export function deriveFoldNote({ payload, seq, nowIso, runId } = {}) {
     Number.isSafeInteger(payload?.foldedRoundCount) ? `本 run 累计折 ${payload.foldedRoundCount} 轮` : undefined,
   ].filter((line) => line !== undefined);
 
-  // 规模：引擎给的是**字节**（`bytes`，夹断前另有 `bytesBefore`）。`chars` 留作前向兼容。
+  // 规模：引擎给的是**字节**（`bytes`，夹断前另有 `bytesBefore`）。**不读 `chars`**：引擎从不发这个
+  // 键（`fold-summary-journal.js` 全文无 `chars`，C18 钉着），读它就是第二个 `unshrinkable`——同一个
+  // 形状的推测键（见 §8.72：那个在本单里刚被换成契约真有的四个键）。推测键的代价不是报错而是
+  // **永不触发**，外加下一个人会以为那个维度有数据。
   const sizeParts = [];
-  if (Number.isSafeInteger(payload?.chars)) sizeParts.push(`${payload.chars} 字`);
   if (Number.isSafeInteger(payload?.bytes)) {
     sizeParts.push(`${payload.bytes} B`);
     if (payload.truncated === true && Number.isSafeInteger(payload?.bytesBefore)

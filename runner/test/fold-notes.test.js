@@ -254,14 +254,17 @@ test('C13 接线的前置门是「executors 可用」，不是「runId 存在」
 });
 
 // ── ④ 规模与范围口径：只写引擎真给的东西（erix-agent #485 / #469 宿主侧后续）────────
-test('C15 规模走引擎真给的 `bytes`；`chars` 只在引擎哪天真给了才写（旧代码读一个不存在的键，生产永远写「?」）', () => {
-  // 真形状（0.26.0）：无 chars ⇒ 必须写清字节数，不能退化成「?」或「规模未知」
+test('C15 规模只走引擎真给的 `bytes`；`chars` 一律不读（读了就是第二个 unshrinkable）', () => {
+  // 真形状（实测键面里没有 chars）⇒ 必须写清字节数，不能退化成「?」或「规模未知」
   const real = deriveFoldNote({ payload: payload({ truncated: false, bytes: 20_000 }), seq: 1, nowIso: T0, runId: 'r' });
   assert.match(real.content, /摘掉正文 20000 B/);
   assert.doesNotMatch(real.content, /规模未知|\?/);
-  // 前向兼容：哪天真给了 chars，就一并写上
-  const withChars = deriveFoldNote({ payload: payload({ truncated: false, chars: 65_000, bytes: 20_000 }), seq: 1, nowIso: T0, runId: 'r' });
-  assert.match(withChars.content, /65000 字 \/ 20000 B/);
+  // **不写 `chars`，也不搞「前向兼容」**：引擎从不发这个键（C18 钉），读了它只会多一条永不触发的
+  // 分支 + 让下一个人以为这个维度有数据——那个形状本站刚在 `foldSummary.unshrinkable` 上犯过一次。
+  const withSpeculative = deriveFoldNote({ payload: payload({ truncated: false, chars: 65_000, bytes: 20_000 }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.equal(withSpeculative.content, real.content,
+    'payload 里多一个引擎不发的 chars，注里一个字也不该变（变了就说明本站又在按推测键渲染）');
+  assert.doesNotMatch(withSpeculative.content, /65000|字/);
   // 两个都没有（引擎改了形状）⇒ 老实说「规模未知」，不许编一个 0
   const noSize = deriveFoldNote({ payload: { text: 'x', source: 'llm', round: 3 }, seq: 1, nowIso: T0, runId: 'r' });
   assert.match(noSize.content, /摘掉正文 规模未知/);
