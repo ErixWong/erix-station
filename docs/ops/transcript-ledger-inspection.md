@@ -426,3 +426,131 @@ GROUP BY transcript_key ORDER BY max_record_bytes DESC LIMIT 10;
   #371-A（落盘失败要看得见）、#371-B（闸可调，便于真机复现）。
 - 存量已砖会话（如 `9e0c8a17…`）**在升 pin 之前依旧写不进新折叠**——不要试图用「删掉折叠行」救它：
   折叠行是别处重建原文的指针来源（#375 靠它），删了才是真丢数据。
+
+---
+
+## 7. 第四种砖化形状：**`:resume` 载体裸重放「已在别的轮结清的 `tool_use`」**（2026-10-27 真机，v0.1.43 上发现并修数据）
+
+前三类里，§1/§5 是读侧形状问题（#351 之后由折叠在 `store.load()` 兜住），§6 是写侧体积问题（升 pin 根治）。
+这一类**折叠救不了**：账本里有一条 assistant 消息带着一个 `tool_use`，而它的 `tool_result` **在同轮的任何行里都不存在**
+——结果在**早先的另一轮**里就结清过了。引擎 `validate_messages` 要求 `assistant.tool_use` 后面**紧跟** user `tool_result`，
+所以这条裸发的 turn 直接把序列卡死。
+
+```text
+1ead0b1a… 的 round 25 `:engine:round:25:resume`（修前，3 条消息）
+  msg#0 assistant  reasoning,text,reasoning, use:Bz7323(shell)   ← 结果在 round 10 的 :resume 里，早就结清了
+  msg#1 assistant  reasoning,               use:ur9809(shell)
+  msg#2 user       res:ur9809
+⇒ 折叠后 msg#0 与 msg#1 相邻（两条 assistant），msg#0 的 tool_use 没有紧随的结果
+⇒ Invalid message at index 36: assistant tool_use has no immediately following user tool_result
+```
+
+- ⚠ **按 id 查孤儿查不出来**：`tool_use` 17 个 / `tool_result` 16 个，但「有 use 无 result」= **0**——
+  因为那个 id 在**别的轮**有结果。⇒ 判据必须**带轮**，只看 id 集合会得出「账本干净」的假结论（我第一次就跑成这样）。
+- ⚠ **0.23+ 的正常形状本身就是「use 与 result 分行」**（`:msg:N:0` 装 assistant、`:msg:N:1..k` 装结果），
+  所以「同一条记录里没有对应结果」在 0.23+ 上**是常态**：按记录判会得到 9 个会话 / 几十行误报。
+  **必须按 `(transcript_key, round)` 判**。
+
+### 7.1 巡检项（只读）
+
+```sql
+-- 结果不在同轮任何行里、却在别的轮结清过的 tool_use = 这一类；期望 0 行
+WITH blocks AS (
+  SELECT t.transcript_key, t.round, t.dedup_key, b
+    FROM transcript_rounds t
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(t.record->'messages')='array' THEN t.record->'messages' ELSE '[]'::jsonb END) m
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(m->'content')='array' THEN m->'content' ELSE '[]'::jsonb END) b),
+uses AS (SELECT transcript_key, round, dedup_key, b->>'id' AS id FROM blocks WHERE b->>'type'='tool_use'),
+res  AS (SELECT DISTINCT transcript_key, round, b->>'tool_use_id' AS id FROM blocks WHERE b->>'type'='tool_result')
+SELECT u.transcript_key, u.round, u.dedup_key, left(u.id, 20) AS stale_tool_use
+  FROM uses u
+ WHERE NOT EXISTS (SELECT 1 FROM res r WHERE r.transcript_key=u.transcript_key AND r.round=u.round AND r.id=u.id)
+   AND EXISTS     (SELECT 1 FROM res r WHERE r.transcript_key=u.transcript_key AND r.id=u.id AND r.round <> u.round)
+ ORDER BY u.transcript_key, u.round;
+```
+
+两个 `EXISTS` 缺一个就废：去掉第一个 ⇒ 0.23+ 的正常分行形状全进来了；去掉第二个 ⇒ 变成「结果从未落账本」（那是另一类，见 §7.4）。
+
+### 7.2 现状与定性（这台部署 2026-10-27 实测）
+
+| 会话 | 位置 | 载体写入时间 | 当时在跑的引擎 | 修前状态 |
+|---|---|---|---|---|
+| `1ead0b1a…` | `:engine:round:25:resume` | 2026-10-15 07:59 | 0.18.x 时代 | `failed / invalid_messages`（10-23 起连吃 4 次，**10-27 在 v0.1.43 上仍红**） |
+| `3dcab38b…` | `:engine:round:56:resume` | 2026-10-08 12:17 | 0.14/0.16 时代 | 未引爆（10-08 之后没人再发消息） |
+
+⇒ **是历史化石，不是现行写侧还在产的形状**：同一天在 v0.1.43（引擎 0.26.0）上现跑「起长命令 → 点停止 → 再发一条」，
+新会话 `3fe993c7…` 的 `:engine:round:1:resume` **不带 `messages`**（只有 `:msg:1:*` 分片行），
+且第二条消息 `finished / judge_done`——写侧这个形状在新引擎上产不出来。
+⚠ 但**别拿 0.23/0.26 的源码去推断老数据**：`:resume` 载体的内容口径跨版本变过（§8.40 那条「0.22/0.23 只写引擎控制文本」的判断，对 10-08/10-15 那两条老行就不成立）。**判据以本手册这条 SQL 为准。**
+
+### 7.3 修数据（删陈旧 assistant turn；`append_seq` 不动、零增删行、零 DDL、幂等）
+
+规则（保守，混合情况不动手）：**只删**「`role=assistant` 且它的 `tool_use` **全部**已在别的轮结清」的整条消息。
+一条 assistant 消息若同时含陈旧与未陈旧的 `tool_use`，本规则**不删它**，留人工看（本机两例都不含混合）。
+
+先算后写（本地跑，用引擎自己的校验器做前后判据；`<repo>` = 仓库根，需已 `npm ci`）：
+
+```js
+// node ./repair.mjs  —— 读导出的行，按上面的规则重算 messages，并用引擎 validateMessages 判前后
+// 前置：psql 导出（record 用 ::text，-A -t 不转义；COPY 会转义，别用）
+//   psql -At -F $'\x1f' -c "SELECT transcript_key, round::text, dedup_key, append_seq::text, record::text
+//                            FROM transcript_rounds WHERE transcript_key='<sid>' ORDER BY round, append_seq"
+const { validateMessages } = await import('erix-agent/src/messages/rounds.js');   // 深路径不在 exports 面里 ⇒ 用绝对路径 import
+const { foldLedgerRecords } = await import('<repo>/runner/lib/transcript-fold.js');
+const usesOf    = (m) => (Array.isArray(m?.content) ? m.content : []).filter((b) => b?.type === 'tool_use').map((b) => b.id);
+const resultsOf = (m) => (Array.isArray(m?.content) ? m.content : []).filter((b) => b?.type === 'tool_result').map((b) => b.tool_use_id);
+// settledByRound: Map<round, Set<id>>；settledAnywhere: 全部结果 id 的并集
+// 逐行：if (!/:resume$/.test(dedup_key)) 跳过；
+//   keep = messages.filter(m => !(m.role === 'assistant' && usesOf(m).length
+//            && usesOf(m).every((id) => settledAnywhere.has(id) && !settledByRound.get(round).has(id))))
+// 前判：validateMessages(foldLedgerRecords(原 records).flatMap(r => r.messages ?? []))  ⇒ 应 FAIL（文案与界面逐字同）
+// 后判：同一条调用换成交改后的 records                                        ⇒ 必须 PASS，否则别写库
+```
+
+写库（备份 + 幂等；`record <> 新值` 是幂等守卫，第二遍 `UPDATE 0`）：
+
+```sql
+BEGIN;
+CREATE TABLE IF NOT EXISTS transcript_rounds_shape4_bak_YYYYMMDD (
+  id uuid PRIMARY KEY, transcript_key text, round int, dedup_key text, append_seq bigint,
+  record_before jsonb, record_after jsonb);
+INSERT INTO transcript_rounds_shape4_bak_YYYYMMDD
+  SELECT id, transcript_key, round, dedup_key, append_seq, record, '<新 record>::jsonb'
+    FROM transcript_rounds WHERE transcript_key='<sid>' AND dedup_key='<那条 :resume 行>'
+     AND NOT EXISTS (SELECT 1 FROM transcript_rounds_shape4_bak_YYYYMMDD b WHERE b.dedup_key = transcript_rounds.dedup_key);
+UPDATE transcript_rounds SET record = '<新 record>::jsonb'
+  WHERE transcript_key='<sid>' AND dedup_key='<那条 :resume 行>' AND record <> '<新 record>::jsonb';
+COMMIT;
+```
+
+⚠ **`UPDATE 0` 有两种成因**：真幂等，或者 **WHERE 根本没匹配上**（本站第一次落库就是这个——脚本里字段名打错，
+`dedup_key = 'undefined'` 两遍都 `UPDATE 0`，看着像幂等证明其实是空操作）。⇒ **首跑必须看到 `UPDATE 1`**，
+并用 `INSERT` 行数与备份表的 `jsonb_array_length(record_before/after)` 双向对一次。
+
+### 7.4 当天取证与复验（每一步都是亲手跑的）
+
+| 步骤 | 结果 |
+|---|---|
+| §1 链式 `partOf` 巡检 | **0 行**（这台机器没有那一类） |
+| §5.1 `:input:` 插队巡检 | 2 行（`ec8a77b3…` round 6/7）——但两条 run 都正常，见下方「代码已兜住」 |
+| §6.1 单条记录 > 1 MiB | **0 行** |
+| §7.1 本类巡检（改判据前） | 按**记录**判 = 9 会话 / 几十行（误报，见 §7 顶部） |
+| §7.1 本类巡检（按**轮**判） | 6 行 / 2 会话（`1ead0b1a…` r25、`3dcab38b…` r56）——全在 `:resume` 载体里 |
+| 引擎校验器前后判 | `1ead0b1a`：FAIL `index 36` → 删 1 条 → **PASS**；`3dcab38b`：FAIL `index 73` → 删 5 条 → **PASS** |
+| 落库 | `INSERT 0 1 / UPDATE 1` ×2；备份表 3→2 与 7→2 条消息；重放第二遍 `UPDATE 0` ×2 |
+| §7.1 复跑 | **0 行** |
+| 真机复活 | 两个会话各发一条消息 ⇒ `finished / judge_done`（`1ead0b1a…` 是 10-23 起连砖 4 次的那个标本） |
+| 回滚 | `UPDATE transcript_rounds SET record = b.record_before FROM transcript_rounds_shape4_bak_20261027 b WHERE b.dedup_key = transcript_rounds.dedup_key`（本次未用） |
+
+### 7.5 「代码已兜住」与「必须修数据」的边界（别修多，也别修少）
+
+- **§5 的 `:input:` 插队：现在有代码兜底，巡检计数 > 0 不等于会话坏**。2026-10-27 在 v0.1.43 上现跑
+  「起 `sleep 120` → 点停止 → 再发一条」，新会话留下 1 条插队行（全库计数 2→3），而第二条消息
+  `finished / judge_done`（修复前这个动作会把会话永久砖掉，#351）。⇒ §5.2 的修数据在 #351 之后是**兜底/清账**，
+  不是「计数不为 0 就得动手」的硬前置。
+- **本类（§7）代码兜不住**：折叠只能把分行拼回，**造不出**缺失的那条 `tool_result`。要么按 §7.3 删陈旧 turn，
+  要么（不推荐）给它补一条合成 `tool_result`——后者是把「不知道」写成「有结果」，与 #283/#282 那条
+  「不许把未知伪装成已知」的口径相反。
+- **另一种「结果从未落账本」**：本类判据的第二个 `EXISTS` 为假（哪个轮都没有结果）时，是「停止时结果行没写、
+  而 resume 也没补记」——先确认它不是 §7（跑一次判据即可分辨），再谈怎么修（删该 turn 同样成立，但要意识到
+  删的是**唯一一次**工具调用的记录）。

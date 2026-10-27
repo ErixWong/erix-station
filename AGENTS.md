@@ -2336,3 +2336,38 @@ provisioner 34/34、portal+root 全量绿。
 另外记一条排障口径：**"容器全 healthy" 不能证明系统没事**。今晚 502 的时候 `docker ps` 六个容器
 全 `Up (healthy)`、portal 直连正常，坏的是配置**内容**。判入口要打到真入口：
 `curl -o /dev/null -w '%{http_code}' http://station.vc.cn-ai.vip:8090/`，以及 `/api/sessions` 期望 401。
+
+### 8.72 接班部署 v0.1.43 + #351/#352 发布物验收 + 账本**第四种砖化形状**（`:resume` 载体裸重放）（2026-10-27 夜班，本机 = 部署机）
+
+背景：本机 main 停在 `6cffeb9`（#350 时代），另一台主机三天里推到 `v0.1.42`（94 个提交）。接班第一动作是分清**三层**（仓库同步 / 部署面 / 存量数据），别把「issue 还 open」一律当「还要写代码」：仓库已快进到 `0c47329`（干净），但本机仍跑 **v0.1.30**、`FDE_IMAGE` 仍 pin 在 v0.1.25 摘要、DB 缺迁移 `0022/0023/0024` ⇒ `#351`/`#352` 的修复**在本机根本还没生效**。
+
+**为什么发 v0.1.43 而不是直接部署已发布的 v0.1.42**：`v0.1.42` 含 #416（`ERIX_AGENT_VERSION` 下发）但**不含** main 上的 #419 补漏（`fde-proxy` env 白名单没带这个键 ⇒ `provision-fde` 上线即炸 `create_policy_denied: Env key not allowed: ERIX_AGENT_VERSION`）。⇒ 从 HEAD 发新版，别把「有 tag」当「能部署」。
+
+**部署面四件套（本机 uid=1000 才会暴露的那条）**
+
+- ⚠ **`runner/test/listeners.test.js` 的跨 UID 用例在 uid=1000 的开发机上必然红**（fixture 写死 socket owner uid=1000，而实现故意「owner == 自身 uid 就不切换」`ownerKeys.filter(u => u !== selfUid)`；CI 是 1001 所以一直绿）。修法 = `OTHER_UID = (process.getuid?.() ?? 0) === 1000 ? 1001 : 1000`（`53191cd`）。**取证**：改回写死 ⇒ 该用例红；摘掉 `u !== selfUid` ⇒ 1 红；去掉 uid 还原 ⇒ 1 红（`runner/lib/listeners.js` 验完无 diff）。⇒ 这条**不是放宽断言**，是把「主机 uid」从测试的隐含前提里拿掉。
+- **四件套基线（本机实测，判绿=退出码）**：根 `npm test` **1656 / 1652 通过 / 0 失败 / 4 跳过**、`node --test runner/test/*.test.js` **399/399**、前端 `typecheck` rc=0 + **50 文件 / 925 通过**（台账原值 1493 / 221→323 / 47 文件 857 均已过期，本次按合并树真值刷新）。
+- **发版与部署**：main CI（`53191cd` 与 bump `fafe4a7`）两个 job 全绿后才打 tag（#419 那条 `质量门禁` 显示 `cancelled` 是「我随后又推了一个提交」把在跑的 run 取消了，不是失败）→ tag `v0.1.43` → release `40527305596` success → 清单 portal `imageId=sha256:827ec194…` / `digest=sha256:aa036666…`、fde `imageId=sha256:78ec7b00…` / `digest=sha256:6882cb5a…`、proxy `imageId=sha256:aa91d2fa…` / `digest=sha256:d5453b04…`，三个都 `docker image inspect .Id` **逐位一致**。
+- ⚠ **GHCR 直连拉 `fde` 又卡层**（§8.35 那条老坑复发，两次重试都在同一层 `eddb72140443` 0 B/s 耗尽重试）：解法仍是镜像站——`docker pull ghcr.nju.edu.cn/erixwong/erix-station-fde:0.1.43` 一次成功（回来的 Digest 与清单一致），**再按 digest `docker pull ghcr.io/…`** 一次 ⇒ 层已在本地、秒回，于是有 `repo@sha256:` 引用、pin 保持形态①。比手工拼 tar 更省事。
+- `deploy/.env` 三项一起 pin（本版 `runner/` 非版本文件有变动 ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0143`）→ `up -d --no-build` → portal 实跑 `827ec194…`、`healthz=200`、日志 `[migrate] applying 0022-port-observations / 0023-preview-miss-stats / 0024-queued-inputs`（**三条迁移是 portal 启动自动应用的**，无需手工跑）→ `docker rm -f` 五台 `fde-*` → reconcile ≈10s 全部落在 `78ec7b00…`，容器内 `erix-agent` = **0.26.0**，agentd `sse connected` + `sse ping received`（§8.18 双向口径）。
+
+**#351 在发布物上的验收（两个方向都跑）**
+
+- **正面对象复活**：标本 `ec8a77b3…`（当年 `index 11`，结果行在、被 `:input:` 插队）发一条消息 ⇒ `finished / judge_done` + 助手正文落库。
+- **现跑对照**（不是只信老标本）：新会话 `3fe993c7…` 起 `sleep 120` → 跑到一半点停止（run1 `aborted`）→ **再发一条** ⇒ run2 `judge_done`。**修复前这个动作会把会话永久砖掉**。⚠ 账本里那条插队 `:input:` 行**照样留下**（全库 §5.1 计数 2→3）⇒ **折叠在 `store.load()` 兜住了它，巡检计数 > 0 不再等于会话坏**（这条口径已写进巡检手册 §7.5，别再去「修数据修到 0」）。
+- **但另一标本 `1ead0b1a…` 仍红**（`invalid_messages index 50`，v0.1.43 上）⇒ 顺着查出**第四种形状**，见下。
+
+**账本第四种砖化形状（新）：`:resume` 载体裸重放「已在别的轮结清的 `tool_use`」**——折叠救不了（造不出缺失的那条 `tool_result`），只能修数据。判据与手术已整节落 `docs/ops/transcript-ledger-inspection.md` **§7**，这里只留最值钱的三条：
+
+1. **判据必须带轮**。按 id 集合查孤儿会得出「账本干净」的**假结论**（`tool_use` 17 / `tool_result` 16，但「有 use 无 result」= 0——那个 id 的结果在**别的轮**）；而按**记录**判在 0.23+ 上又是**常态误报**（`use` 与 `result` 本就分 `:msg:` 行，实测 9 会话 / 几十行）。只有「同轮任何行都没有结果 **且** 别的轮结清过」精确（本机 = 6 行 / 2 会话，全在 `:engine:round:N:resume`）。
+2. **定性是历史化石，不是现行写侧**：两条陈旧载体的 `ts` 是 10-08 与 10-15（旧引擎）；同一天 0.26.0 现跑的 `:engine:round:1:resume` **不带 `messages`**。⇒ 别拿 0.23/0.26 源码去推断老数据（`:resume` 载体的内容口径跨版本变过，§8.40 那条「只写引擎控制文本」对这两行不成立）。
+3. **修数据前后都用引擎自己的校验器判**：`1ead0b1a` FAIL `index 36` → 删 1 条陈旧 assistant turn → **PASS**；`3dcab38b` FAIL `index 73` → 删 5 条 → **PASS**；落库 `INSERT 0 1 / UPDATE 1` ×2、备份表 3→2 与 7→2、重放第二遍 `UPDATE 0` ×2、判据复跑 **0 行**、真机两个会话都 `judge_done`（`1ead0b1a` 是 10-23 起连砖 4 次那个标本）。⚠ **我自己的空操作**：第一版生成器把字段名写错 ⇒ `dedup_key = 'undefined'`，两遍都是 `UPDATE 0`，看着像幂等证明其实啥也没写 ⇒ **口径：修数据首跑必须看到 `UPDATE 1`**，并用 `INSERT` 行数 + 备份表的 `jsonb_array_length(before/after)` 双向对一次（§8.24 那条纪律在 SQL 落库上的版本）。
+4. `#367`（存量链式 `partOf`）在**本机无事可做**：§1.1 巡检 **0 行**、§6.1 超 1 MiB **0 行**，且它点名的会话 `9e0c8a17…` 在本机 DB 里**不存在**（那是另一台部署的标本）⇒ 这类 issue 的「还 open」是**别台机器的存量**，不是本机的待办。
+
+**#352 在发布物上的验收（观测层，端到端）**
+
+- **跨 UID 真采样**（我修的正是这条路径的单测，所以真机特意造了这个形状）：agentd 跑在 **uid 1001**、两个 `python3 -m http.server` 在 **uid 1000**，`port_observations` 里 22000（池内）与 3000（池外）都拿到了 `pid + cwd=~/projects/probe-351 + branch=main + cmd` ⇒ setuid 重扫在真机上成立（这条在 uid=1000 的机器上单测结构上测不到）。
+- **DTO 只做加法**：`GET /api/me/ports` = 原 8 列 + `observed`，11 行 = 池 10 + 池外观测行（`state='observed'`、`hostname/url=null`），`observed=null` 有 9 行 = 「不知道」而不是「空闲」。
+- **池外只报「用户的项目」**：`/proc` 里还有 Docker 内嵌 DNS（`127.0.0.11:34957`，uid 0）落了 `port_observations`，但门户按 `cwd` 是否 `~/projects/` 过滤掉（`portalloc.js` 那句注释写明「agentd 自己的 4000、root 的内部口不算用户的项目」）⇒ **表里有、面板里没有**，别当丢数据。
+- **界面面**（bundle 先断言 = `index-1_vis29R.js`）：`Port pool (10)` 分组头 `probe-351  Current` 排最前 + `Spare (9)` 折叠；`Listeners (2)` 面板给出「同一目录同时开在 3000 与 22000，多半是两个版本并存」告警，池外那条给「还不能在预览地址打开——让助手挪到分配的口」。截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`。
+- 探针残渣：fde-eric 里那两个 `http.server` 已 kill（新鲜度窗 45s，之后面板自动掉）；两个会话各多一条探针消息（`复活`）。

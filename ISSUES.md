@@ -228,12 +228,24 @@ header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适�
 | **v0.1.28** | ✅ **已发布并部署**（`8c7906d`；portal imageId `4ce2a7db…`、proxy `3b44b32f…` 逐位核对；服务 bundle `index-Zms29SHi.js`） |
 | **v0.1.29** | ✅ **已发布并部署**（`5d967c6`；main CI `40004642827` 绿后打 tag → release `40005238179`；portal `imageId=2a32a0f4…`/`digest=ea45ec01…`、proxy `imageId=ba408140…`/`digest=56fc03b3…` 逐位核对；服务 bundle **`index-BrgEGHCI.js`**；经 Traefik `healthz=200`）。载荷 = 上面四单；`runner/` 零实质改动 ⇒ **五台 FDE 容器故意未重建** |
 | **#350** 管理台号池占用总览页 | ✅ **已交付 + 发布物真机验收**（`491cb9d` cherry-pick（patch-id SAME）+ 我补的 `50eff39`）：管理台第 4 个 tab，真数据逐字段对得上直采 API；改块提示三态「被占用（点名占用者 + 会被 409）/ 整段空闲 / **不知道**（空闲列表是截断的）」在真机上成立，开面板隐式请求 0 次、零自动提交。**worker 推翻了我工单两条契约字段**（`start_block` 不存在；自洽关系是 `= partial + occupied`） |
-| **#351**（新）会话砖化 | 🔴 **已登记，未动代码**：被停止的 run 留下未结清的 `tool_use` ⇒ 同会话再发消息**永久** `invalid_messages`。两个真标本（`ec8a77b3…` index 11 结果行被 `:input:` 插队 / `1ead0b1a…` index 50 结果行根本没落账本），真账本行喂进引擎 `foldLedgerMessages` + `validateMessages` **逐字复现**。**已排除 #341**（链式 `partOf` 全库 0 行 ⇒ 巡检手册测不到这一类） |
+| **#351**（新）会话砖化 | ✅ **已关闭**（当时登记 → 另一台主机以 `4ae2634`「引擎面向的 `store.load()` 做读侧折叠」根治，**本机的发布面验收在 10-27 的 v0.1.43 上才做到**，见下方新批次）：正面对象 `ec8a77b3…`（结果行在、被 `:input:` 插队）发一条消息 ⇒ `judge_done`；新会话现跑「起长命令 → 点停止 → 再发一条」⇒ `judge_done`（修复前该动作会永久砖化）。另一标本 `1ead0b1a…` 仍红 ⇒ **顺带查出第四种砖化形状**（见下） |
+
+### 🌙 夜班批次（2026-10-27 接班：仓库快进 94 个提交 → **v0.1.43** 部署到本机）
+
+> 接班先分清**三层**：仓库同步（已快进到 `0c47329`）≠ 部署面（本机还跑 **v0.1.30**、缺迁移 `0022/0023/0024`）≠ 存量数据。`#351`/`#352` 的「还 open」在这一天全部是**后两层**，不是代码待办。
+
+| 条目 | 状态 |
+|---|---|
+| **v0.1.43** | ✅ **已发布并部署**（`fafe4a7`；main CI 两个 job 绿后打 tag → release `40527305596`；portal `imageId=827ec194…`/`digest=aa036666…`、fde `78ec7b00…`/`6882cb5a…`、proxy `aa91d2fa…`/`d5453b04…` 逐位核对 → 五台 `fde-*` 重建后容器内 `erix-agent` = **0.26.0**、agentd 双向链路通；迁移 0022–0024 由 portal 启动自动应用）。⚠ **不发已发布的 v0.1.42**：它含 #416 但**不含** #419 补漏（`fde-proxy` env 白名单缺 `ERIX_AGENT_VERSION` ⇒ `provision-fde` 上线即炸），「有 tag」≠「能部署」 |
+| **测试可移植性（新）** | ✅ `53191cd`：`runner/test/listeners.test.js` 的跳 UID 用例写死 fixture owner uid=1000，而实现故意「owner == 自身 uid 就切而不切」⇒ **在 uid=1000 的开发机上必然红**（CI 是 1001 所以看不见的）。改 `OTHER_UID` 后本机 **399/399**；三条变异各恰 1 条红 ⇒ 不是放宽断言 |
+| **#352** 按项目看端口占用 | ✅ **已关闭（观测层 B+）+ 发布物真机验收**：agentd 采样 `/proc` → U4 心跳 → `port_observations`（迁移 0022）→ `GET /api/me/ports` 每行加 `observed`（只做加法，原 8 列不动）。真机特意造了 **agentd=uid 1001 / 监听进程=uid 1000** 的跳 UID 形状 ⇒ `pid/cwd/branch/cmd` 全拿到（这条单测在 uid=1000 机上结构上测不到）；池外 3000 合成 `state='observed'` 只读行，而 Docker 内嵌 DNS（uid 0、无项目 cwd）**入库但不进面板**（按 `~/projects/` 过滤，设想的）；界面 `probe-351  Current` 分组排最前 + `Spare (9)` 折叠 + 「同目录同时候在 3000 与 22000」告警（截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`） |
+| **账本第四种砖化形状（新）** | ✅ **已定位 + 已修数据 + 两个会话真机复活**：`:resume` 载体裸重放「已在**别的轮**结清的 `tool_use`」⇒ 折叠救不了（造不出缺失的那条 `tool_result`）。判据与手术整节落 `docs/ops/transcript-ledger-inspection.md` **§7**（⚠ 判据必须**带轮**：按 id 查孤儿得「干净」假结论，按记录判在 0.23+ 上是 9 会话误报）。定性 = **历史化石**（两条载体 ts 是 10-08 / 10-15 旧引擎；0.26.0 现跑的 `:resume` 行不带 `messages`）。修前/修后都拿**引擎自己的校验器**判（`index 36` / `index 73` → PASS），真机两会话 `judge_done` |
+| 基线刷新 | 根 **1656 / 1652 / 0 失败 / 4 跳过**、runner **399/399**、前端 **50 文件 / 925** + `typecheck` rc=0（台账原值 1493 / 221→323 / 47 文件 857 均过期）；台账 `AGENTS.md` §8.72 |
 
 ### 🔭 观察队列（不指派，等信号）
 
-- **#351**：等拍修法（A 终态即结清 / B 发消息前置幂等补 / C 上游按 round 归位）。**优先理由**：普通操作（停止 → 继续）即触发、会话永久废掉、现有巡检手册测不到，且 dev 已有两个现成标本可当回归夹具。
-- **#341**：上游 [erix-agent #415](https://github.com/ErixWong/erix-agent/issues/415) **仍未发版**（npm 最新就是 0.23.0）⇒ 站内临时闸 + `docs/ops/transcript-ledger-inspection.md` 继续留着。
+- **#367**（存量链式 `partOf` 修数据）：**本机无事可做** —— §1.1 巡检 **0 行**、§6.1 超 1 MiB **0 行**，且该单点名的会话 `9e0c8a17…` 在本机 DB 里**不存在**（那是另一台部署的标本）。⇒ 这类 issue 的「还 open」是**别台机器的存量**，不是本机待办；巡检手册 §7.1 已新增第四类判据。
+- **#341**：上游已把**写侧**链式 `partOf` 修掉（erix-agent 0.26.0 `orchestrator.js` 锤定首片，注释点名 issue #430），但**读侧仍解不了存量链** ⇒ 站内临时闸（`portal/src/transcript-fold.js` / `runner/lib/transcript-fold.js` + 哨兵用例）继续留着，**不要拆**。
 - **#303**：0.23.0 读侧仍有 7 条路径认顶层旧名 ⇒ `?? tr.duration` **不许删**；触发条件已改成「旧 transcript 行归档时」。
 - **#331**：`ERIX_SESSION_AUTO_TITLE` 死光纤（#322 之后 `runner/` 零读取，但撤它要动 portal + 两处测试）。
 - **#346 / #348 / #321 残留**：需产品决策。
