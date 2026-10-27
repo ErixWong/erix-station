@@ -240,6 +240,14 @@ export const en = {
       // run (the stripped part is the fold archive; originals stay readable in the ledger rows, #375).
       // Neutral separator, never red; fatal ones are rendered by `run_end` / `persistence_failed`.
       persistenceDegraded: 'persistence degraded: the {operation} record was not stored (this run is unaffected)',
+      // issue #421: four diagnostic event types the engine promises but this host used not to subscribe
+      // to. All four render as neutral separator lines — they report "config didn't take effect /
+      // capability missing / this batch was never ledgered", not "this round failed".
+      strategyFallback: 'compaction is not using the configured strategy: the engine fallback "sliding-window" drops whole head rounds without summarising (from round {round})',
+      metadataMissing: 'model context metadata missing: compaction and the aggregate output budget are disabled for this run',
+      capabilityDegraded: 'store lacks the {method} capability: that persistence is skipped for this run (no mid-run crash resume)',
+      resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the snapshot',
+      resumeJournalSome: 'some',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       // issue #321 (erix-station): the judge is forever only an **opinion**, never an acceptance — shown on

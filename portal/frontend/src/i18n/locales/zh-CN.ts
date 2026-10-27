@@ -259,6 +259,13 @@ export const zhCN = {
       // 本次任务**（剥掉的是折叠归档，原文仍在各轮记录里，#375 负责取回）⇒ 中性分隔行，不用红色。
       // 致命的那条（`fatal:true` 或旧版无字段）不在这里刷，由 `run_end` 的 `persistence_failed` 红面负责。
       persistenceDegraded: '落盘降级：{operation} 记录未存入（本次任务不受影响）',
+      // issue #421：引擎承诺、本站以前订不到的 4 类诊断事件（均为**中性分隔行**，不刷红——
+      // 它们说的是“配置没生效 / 能力缺失 / 这批没入账”，不是“本轮失败”）。
+      strategyFallback: '压缩未使用配置的策略：引擎兜底 sliding-window（整轮丢弃、不摘要，第 {round} 轮起）',
+      metadataMissing: '模型上下文元数据缺失：本次 run 的压缩与聚合输出预算已关闭',
+      capabilityDegraded: '存储端缺少 {method} 能力：本次 run 对应的持久化被跳过（中途崩溃不可恢复）',
+      resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖快照',
+      resumeJournalSome: '若干',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       // issue #321（erix-station）：judge 永远只是**意见**，不是验收——分轴展示（工具审计 / 目标判断 /

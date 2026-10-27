@@ -34,6 +34,7 @@ import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
+import { engineDiagnosticNotice } from './lib/engine-notices.js';
 import { assertCompactContext } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
@@ -704,6 +705,14 @@ async function startRun(msg) {
         const degrade = event?.type === 'compaction' ? foldDegradeNotice(event.compaction) : null;
         if (degrade) {
           sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: degrade });
+        }
+        // issue #421：引擎承诺的 16 类事件里有 5 类本站以前**根本订不到**（前端 `EVENT_TYPES` 没列）。
+        // 界面那一半（中性分隔行）在同一次提交里补了；这里是**运维那一半**：只读 LOG 的人也得看得见。
+        // ⚠ 只记日志、**不改事件也不改终态**（这些都是诊断不是失败，升成错误会让人对着正常完成的 run 看到红字）。
+        // `run_outcome` 每轮都有，它是账不是告警 ⇒ `info`（口径见 `lib/engine-notices.js`）。
+        const notice = engineDiagnosticNotice(event);
+        if (notice) {
+          sendIpc(process, { type: MSG.LOG, run_id: runId, level: notice.level, msg: notice.msg });
         }
         emitEvent(event.type, loopEventPayload(event));
       },
