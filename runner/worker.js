@@ -33,6 +33,7 @@ import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
+import { createFoldNoteSink } from './lib/fold-notes.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope } from './lib/termination.js';
@@ -120,6 +121,10 @@ process.on('message', (msg) => {
     case MSG.ABORT:
       if (abortController) abortController.abort();
       break;
+    case MSG.STEER_ARM:
+      // 只装标记（见上面 steerArmed 的注释）。重复投递幂等；run 已结束时无 abortController 也无妨。
+      steerArmed = true;
+      break;
     case MSG.APPROVAL_DECISION: {
       const p = pendingApproval.get(msg.req_id);
       if (p) {
@@ -152,6 +157,14 @@ let eventCounter = 0;
 let runId = null;
 let attempt = 1;
 let abortController = null;
+/**
+ * #370：转向标记。`STEER_ARM` 只置位、不 abort；真正 abort 的位置是引擎的 `onRound`
+ * （本轮 transcript 已落库、下一次 provider 调用之前）。⇒ 「本轮跑完再停」，正在执行的工具
+ * 会跑完（与「停止」的立即 SIGKILL 相对），投递点与 pi 的 steer 定义重合。
+ */
+let steerArmed = false;
+/** 本次 run 是否曾经装填过转向（`steerArmed` 会被消费清零，终态信封需要的是「曾经装过」这个事实）。 */
+let steeredThisRun = false;
 const pendingApproval = new Map();
 
 function makeEvent(type, payload) {
@@ -309,6 +322,10 @@ async function startRun(msg) {
   runId = msg.run_id;
   attempt = Number(msg.attempt ?? 1);
   abortController = new AbortController();
+  steeredThisRun = false;
+  // #370：每个 run 自己一份标记。⚠ 必须在 `startRun` 里复位——同一个 worker 进程会被 agentd
+  // 复用给下一个 run（`RUN_START` 再次进来），漏复位就等于「上个 run 的转向把下个 run 也停了」。
+  steerArmed = false;
 
   const { task, cwd } = msg;
   const modelConfigPath = msg.config?.model_config_path || '/home/erix/.erix/config.json';
@@ -394,8 +411,10 @@ async function startRun(msg) {
   ensureGitRepo(cwd);
   const jail = createJail({ root: cwd, writable: [cwd] });
   const fileTools = createStationFileTools({ jail, cwd });
-  // issue #46（选项 A，logical-run 作用域）：notesDir 由 agentd 下行（run 数据目录
-  // <home>/runs/<runId>/notes，跨 attempt 保留，与 run 工作区生命周期解耦——resume 不再丢 notes）。
+  // issue #46（选项 A）+ #392（B 片）：notesDir 由 agentd 下行。作用域已从 **logical-run**
+  // 改为**会话**：下行的是 `<home>/sessions/<sessionId>/notes`，同一会话的每个 run 看到的是
+  // **同一个** notes 目录 + 同一个 scopeRef ⇒ `note_list` 与引擎 run-state 小抄目录跨 run 可见。
+  // （旧语义：笔记跟 run 同生同灭，而本站**一条用户消息就是一个 run** ⇒ 笔记天然无效。）
   // 旧 agentd 无 notes_dir 字段 → 回退 cwd 内 .notes（旧语义，resume 仍会丢，warn 明示）。
   let noteTools = { schemas: [], executeTool: null, lifecycle: null };
   try {
@@ -408,7 +427,19 @@ async function startRun(msg) {
         msg: 'notes_dir missing from RUN_START (old agentd?), fallback to cwd-local .notes; notes will NOT survive resume',
       });
     }
-    noteTools = await createNotesTools({ runId, notesDir });
+    // issue #392（B 片）：`scopeRef = sessionId` ⇒ 笔记作用域 = 会话。
+    // 真机依据（会话 `bdef6dd7`，195 轮 / 12 run）：`note_take` 共 3 次，而每次写的都是
+    // `scopeRef=runId` ⇒ **下一个 run 一行也读不到**（笔记与它想救的那个上下文同命）。
+    // 并发安全：`runs_one_active_per_session`（同会话同时最多一个活跃 run）⇒ 不会有两个 worker
+    // 同时写同一个会话的 notes 目录，引擎那条 single-writer 约定依旧成立。
+    // 无 session（旧下行 / 无本子的工单）⇒ `scopeRef` 为 undefined ⇒ **逐字退回旧的 run 作用域**。
+    /* #392:notes-session-scope:start */
+    noteTools = await createNotesTools({
+      runId,
+      notesDir,
+      scopeRef: sessionId ?? undefined,
+    });
+    /* #392:notes-session-scope:end */
   } catch (err) {
     sendIpc(process, {
       type: MSG.LOG, run_id: runId, level: 'warn',
@@ -501,6 +532,26 @@ async function startRun(msg) {
     });
   };
 
+  /* #392:C-fold-notes:start */
+  // issue #392（C 片）：折叠摘要投递成笔记。**A 片让折叠产出替代物，本行让它落地**——没有这一步，
+  // 用户侧感知与「静默硬删」完全一致（摘要产出来了就扔了）。「折一次记一次」这条不变量在这里闭环。
+  // 投递是宿主的事：引擎里没有 notesStore 句柄（erix-agent#470 定调），所以 `onFoldSummary` 只是出口，
+  // 写注由 `noteTools.executors('note_take', …)` 完成（作用域 = B 片的 scopeRef=sessionId，此处不传
+  // scopeRef/runId——工厂绑定，传了就是伪造 __erix）。写注失败只 warn（`fatal:false`），绝不打死 run。
+  // notes 不可用时（lib/notes-tools.js 降级路径：executors 非函数）⇒ 整体不接线，行为退回 A 片。
+  const foldNoteSink = typeof noteTools.executors === 'function'
+    ? createFoldNoteSink({
+      noteTools,
+      runId,
+      onDeliveryError: (info) => sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: `fold summary note delivery failed (operation=onFoldSummary phase=${info?.phase ?? 'fold_summary_delivery'} fatal=false seq=${info?.seq ?? '-'} key=${info?.key ?? '-'})`
+          + `: ${info?.reason ?? info?.message ?? 'unknown'}`,
+      }),
+    })
+    : null;
+  /* #392:C-fold-notes:end */
+
   // P3 PR②a：portal 已在 POST 事务内预写 `:input:<messageId>`。
   // 空本子（旧 ticket）走引擎 round 0 seed；已有档案直接 resume；旧 ticket 沿用 ticket.resume。
   // resume=true 对齐 repl.js:656：不传 initialMessages/initialUserMessage（恢复记录即完整上文）。
@@ -539,8 +590,9 @@ async function startRun(msg) {
       //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
       //     「provider 默认」变成我们那个数（**变严**，不是变松）；
       //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
-      //   - fold-llm 压缩 summarizer 也继承 maxTokens（:1175）——本站没显式选 context.strategy，
-      //     超预算时引擎用 createSlidingWindowStrategy() 兜底（:2503），本单**不**顺手选策略。
+      //   - fold-llm 压缩 summarizer 也继承 maxTokens（:1175）——但**只有真选了 `fold-llm` 才成立**：
+      //     本站自 #392 起显式选 `fold-statistical`（零 LLM，见下面 `#392:context-strategy` 标记段），
+      //     超预算时也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
       /* #309:engine-model-params:start */
       ...(engineModelMetadata ? {
         modelMetadata: {
@@ -552,6 +604,38 @@ async function startRun(msg) {
       /* #309:engine-model-params:end */
       // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
       system: SYSTEM_PROMPT,
+      // issue #392（A 片）：**显式选折叠策略，唯一目的是让折叠产出确定性替代物**。
+      // 此前本站连 `context` 都不传 ⇒ 超预算时引擎自己 `createSlidingWindowStrategy()` 兜底
+      // （0.25.0 `loop/orchestrator.js:3136` 那条 fallback）。真机标本（erix-station 现网会话
+      // `bdef6dd7`，erix-agent 0.25.0，195 轮 / 12 run / 666 条轮记录）：7 次整轮折叠**全部**是
+      // slidingWindow，账本里 `foldedSummary` 与 `navigationRecord` 各 **0 行**、`summary` 恒
+      // `"missing"`、`[已折叠]` 占位 0 条（`stubFor` 没人给 ⇒ `resolveFoldStubs` 直接返回 `[]`）
+      // ⇒ 一次折叠 = 从第 1 轮起到 `budget-6` 轮的**整块静默硬删**（单次最多折走 32.7 万 token），
+      // 模型事后既不知道自己少了什么、也无从判断该去哪找。**这条静默不是 bug 而是本站选的后果**。
+      // 换成 `fold-statistical`（同版本、零 LLM、零调用成本）之后：机械摘要被 **prepend 进 head**
+      // （`compact/fold-statistical.js:546` → `formatFoldSummary`：范围句 + 工具足迹 + 导航记录 +
+      // `[已折叠]` 占位 + 锚点节，本会话实测那一份 732 B）⇒ ① 模型当场看得见「早期第 1–107 轮已
+      // 折叠」这类事实；② 因为它是真进了请求的正文，`orchestrator.js:3257` 的
+      // `fedSummaryText !== ""` 成立 ⇒ 同一份摘要**同时进账本**（`record.foldedSummary`，#326 wo-C）
+      // ⇒ 宿主横幅与引擎喂给 judge 的轮次历史第一次有料（此前两者只能看见 `"missing"`）。
+      // ⚠ 三件**不要**把本行读成的事：
+      //   ① **不是为了少折**。0.25.0 的 `selectFoldedRounds` 对两种策略都是「折掉除最后
+      //      `keepRounds` 轮以外的全部」，没有按预算缺口比例裁剪的逻辑（真机每次折到预算的
+      //      1.4%–5.4% 就是这个）⇒ 那是 erix-agent#464 的 C 档，**仍未做**，本行不改变它。
+      //   ② **故意不传 `keepRounds`**：0.25.0 里 `context.keepRounds` 既不进工厂入参
+      //      （`orchestrator.js:1301-1305` 只转发 `recoveryHint` / `stubFor`），也不在调用期
+      //      白名单里（`:3090-3097` 那六个键）⇒ 传了没任何人读 = #331 那根「没人读的光纤」。
+      //      真要用它只能改对象形态 `createFoldStatisticalStrategy({ keepRounds })`（包根
+      //      `index.js:41` 有导出）。判据钉在 `runner/test/fold-strategy.test.js`，见该文件注释。
+      //   ③ **不选 `fold-llm`**：真机 39.9 s 同步阻塞在轮与轮之间、最大一次喂进 261345 token
+      //      撞 262144 窗口 → 400 后静默降级，而它无超时 / 无输入上限 / 从不看 finish_reason
+      //      （erix-agent#469 未修）⇒ 那张单落地之前不提。
+      // 不给 env 旋钮：策略名不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
+      /* #392:context-strategy:start */
+      context: {
+        strategy: 'fold-statistical',
+      },
+      /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
       onEvent: (event) => {
         if (event?.type === 'usage') return; // 双源去重：记账以返回值 usage 为准（§7.3/§6.3-6）
@@ -604,6 +688,16 @@ async function startRun(msg) {
       // 注入 run-state 的 semantic 段；undefined/非函数时引擎按「未提供」跳过（工厂加载失败的
       // 降级路径同样安全：noteTools 回退对象无此字段）。
       semanticStateProvider: noteTools.semanticStateProvider,
+      /* #392:C-onFoldSummary:start */
+      // 折一次 → 写一条注（`lib/fold-notes.js`）。⚠ **这是顶层选项，不是 `context` 键**：引擎从
+      // options 里解构它（`orchestrator.js` 的 `onFoldSummary` 形参 + `option-normalization.js` 的
+      // `RUN_TOOL_LOOP_OPTION_NAMES` 白名单），而 `context` 里自前只认 `strategy`。
+      // 塞错一层不会报错，只会**静默不投递**（真机现场：折叠照跑、注一条不写）——#331 那根
+      // 「没人读的光纤」的原样重现。判据：`runner/test/fold-notes.test.js` C12/C14 与
+      // `runner/test/fold-notes-e2e.test.js` E2（真 `runToolLoop` 里折出来的才算）。
+      // 引擎契约：“无 text 不调用”；本处只管投递与失败不上抛。
+      ...(foldNoteSink ? { onFoldSummary: foldNoteSink.onFoldSummary } : {}),
+      /* #392:C-onFoldSummary:end */
       store,
       // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
       runId: transcriptKey,
@@ -649,6 +743,23 @@ async function startRun(msg) {
       wrapup: false,
       // 7) signal
       signal: abortController.signal,
+      // 8) #370：转向的唯一落点。**为什么是 onRound**（erix-agent 0.25.0 实证，行号请按当天实际
+      //    安装版本重核）：`onRound` 是**被 await 的**且**在本轮 transcript 落库之后、`round_end`
+      //    之前**才响（`src/loop/orchestrator.js:4342`），而轮循环**圈顶先查一次中止**（`:3722`，
+      //    PR #291 必修 1：「本轮已跑完的记录照旧落库，只是不再为它发起下一轮请求」）。一「轮」在本
+      //    引擎里 = 一次 provider 调用 + 它的工具调用执行 ⇒ 在这里 abort 得到的正是
+      //    「当前 assistant 轮的工具调用全部跑完、下一次 LLM 调用之前」，与 pi 对 steer 的定义重合。
+      // 红线：① 抛错**不是**控制流（#173：观察者抛错只记一笔、run 继续），要停只认 `signal.abort()`；
+      //      ② **不得**在这里 park 等下一条队列输入冒充 input port——那会静默卡住 run，拿 90s 租约
+      //         与 F6 静默看门狗（#288 `watchdog_silent`）冒险。所以本回调同步返回、零 await。
+      onRound: () => {
+        if (steerArmed && abortController && !abortController.signal.aborted) {
+          steeredThisRun = true; // 一次性快照：`steerArmed` 下面就被清零
+          steerArmed = false; // 一次性：装配完就摘，免得同一 run 后续每轮都判一次
+          sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'info', msg: 'steer: aborting at round boundary' });
+          abortController.abort();
+        }
+      },
     });
 
     // issue #322：标题归 portal 生成（`portal/src/title-llm.js` → `portal/src/llm-chat.js`），
@@ -675,7 +786,11 @@ async function startRun(msg) {
     // erix-agent #180（0.18.0）：usage/rounds 也从信封取引擎挂在错误上的真值，
     // 「停止」/失败的 run 不再是账面上的 0 token（引擎没挂时回退零值）。
     const aborted = abortController?.signal?.aborted === true;
-    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted });
+    // #370：`steered` 只往 `termination.detail` 补一个 'steered'（不改 reason、不覆盖引擎给的 detail），
+    // 前端据此把终态行刷中性并抑制「重试上一条」。注意用的是**快照**：上面的 abort 会把标记清零，
+    // 而「这次是不是转向」这件事必须一路带到终态信封。
+    const steered = steerArmed || steeredThisRun;
+    const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted, steered });
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
@@ -689,7 +804,12 @@ async function startRun(msg) {
     });
   } finally {
     // issue #46：onRunComplete 仅完成 active notes；收尾错误只记日志，不覆盖 run 主错误。
-    if (noteTools.lifecycle) {
+    // issue #392（B 片）：会话作用域下**不能**调它——`completeRun` 按 scopeRef 批量把 active
+    // 改 done（erix-agent 0.25.0 `src/store/notes.js:94`），而 scopeRef 现在 = sessionId
+    // ⇒ 每个 run 收尾会把**整个会话**的笔记刷成 done，下个 run 又看不到 ⇒ 与本片目的相反。
+    // 标志位由 `lib/notes-tools.js` 给出（不在这里重新推 `msg.session_id`）：作用域与是否收尾
+    // 必须是同一个判断的两种说法，两处各自解析就会有不一致的可能。
+    if (noteTools.lifecycle && noteTools.completesRunNotes !== false) {
       try {
         const completion = await noteTools.lifecycle.onRunComplete();
         const completedCount = completion?.completed?.completed;

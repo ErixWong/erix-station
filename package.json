@@ -1,6 +1,6 @@
 {
   "name": "erix-station",
-  "version": "0.1.37",
+  "version": "0.1.42",
   "private": true,
   "type": "module",
   "description": "FDE Station — 给 FDE 用的开发工位平台（宿主平台）",
@@ -22,7 +22,7 @@
     "healthcheck": "node portal/src/cli.js healthcheck"
   },
   "dependencies": {
-    "erix-agent": "0.25.0",
+    "erix-agent": "0.26.0",
     "pg": "^8.23.0",
     "yaml": "2.9.1"
   }

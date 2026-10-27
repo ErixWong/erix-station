@@ -509,11 +509,26 @@ describe('useEventStream（mock EventSource）', () => {
       'judge：不建议扩轮 — 够用了',
       'judge：工具审计：已放行（on_track，非任务完成）',
       'judge：工具审计：已放行（非任务完成） · 评审理由：ok',
-      '上下文折叠（round 2）：3 轮折叠，100 → 40 tokens',
+      '上下文折叠（round 2，策略 未知）：3 轮折叠，100 → 40 tokens',
       'final guard：accept — fine',
       'forced final（round 5）：cap',
     ]);
     expect(hooks.onSysErr).not.toHaveBeenCalled();
+  });
+
+  // #464 A（本站 D 片）：事件里带实例策略名时必须原样显示——它是「这次折叠到底是谁做的」的唯一实时答案，
+  // 而空串/缺字段一律显式成「未知」，不能让人以为策略名字是空的。
+  it('compaction 分隔行显示实例策略名（缺失时显式「未知」）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('compaction', {
+      round: 9,
+      compaction: { foldedRounds: 46, tokensBefore: 261345, tokensAfter: 8000, strategyName: 'fold-statistical' },
+    });
+    expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
+      '上下文折叠（round 9，策略 fold-statistical）：46 轮折叠，261345 → 8000 tokens',
+    ]);
   });
 
   it('judge 分隔行带 variant=judge，其余状态行（round/compaction 等）不带', () => {
@@ -588,7 +603,7 @@ describe('useEventStream（mock EventSource）', () => {
       expect(hooks.onSep.mock.calls).toEqual([
         ['judge：不建议扩轮 — 够用了', 'judge'],
         ['round 1'],
-        ['上下文折叠（round 2）：1 轮折叠，9 → 3 tokens'],
+        ['上下文折叠（round 2，策略 未知）：1 轮折叠，9 → 3 tokens'],
         ['final guard：accept — fine'],
       ]);
     });
@@ -670,7 +685,7 @@ describe('useEventStream · i18n（issue #101 P2）', () => {
     lastES().emit('resync', { reason: 'buffer_overflow' });
     expect(hooks.onSep.mock.calls.map((c) => c[0])).toEqual([
       '重试中（2/3）',
-      '上下文折叠（round 1）：2 轮折叠，9 → 4 tokens',
+      '上下文折叠（round 1，策略 未知）：2 轮折叠，9 → 4 tokens',
       'judge：建议扩轮 — P（R）',
       '事件流需重同步（服务端缓冲溢出），正在重连补发…',
     ]);
@@ -697,7 +712,7 @@ describe('useEventStream · i18n（issue #101 P2）', () => {
       'judge: suggests extending rounds — P (R)',
       'judge: suggests no extension — enough',
       'judge: tool audit: released (on_track; not task completion)',
-      'Context compaction (round 1): 2 rounds folded, 9 → 4 tokens',
+      'Context compaction (round 1, strategy unknown): 2 rounds folded, 9 → 4 tokens',
       'forced final (round 5): cap',
     ]);
     expect(s.toolCards.get('c1')!.out).toBe('✓ ok (5ms)');

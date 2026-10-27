@@ -33,7 +33,8 @@ export class SessionError extends Error {
   }
 }
 
-const ACTIVE_RUN_STATES = `('queued', 'running', 'cancelling')`;
+/** 活跃 run 状态集合（#370 起被 `queued-inputs.js` 复用——入队判定与它必须同源）。 */
+export const ACTIVE_RUN_STATES = `('queued', 'running', 'cancelling')`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** 会话 cwd 形态：~/projects/<name>（name 为一级目录名，不得含 /，不得为 . / ..；P5 边界）。 */
 export const CWD_RE = /^~\/projects\/([^/]+)$/;
@@ -97,7 +98,7 @@ export function validateMessageBody(body) {
  *  会话消息总数（口径与 listSessions 的 message_count 同源：该会话 messages 表全量行数、含 synthetic、
  *  不按 role/synthetic/分页过滤）。写在这里而非另发 COUNT：零额外往返；其余调用方（postMessage/
  *  stop/archive/SSE 校验等）不带该列，热路径 SQL 逐字不变。 */
-async function fetchSession(pool, sessionId, userId, { forUpdate = false, withMessageCount = false } = {}) {
+export async function fetchSession(pool, sessionId, userId, { forUpdate = false, withMessageCount = false } = {}) {
   if (typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) {
     throw new SessionError('not_found', 'session not found', { httpStatus: 404 });
   }
@@ -320,6 +321,13 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
     transcriptRows: transcript.rows,
     toolCallRows: toolCallDurations.rows,
   });
+  // #370：未投递的输入队列快照（`queued_messages`）**不在这里取**，由 `http.js handleGetSession`
+  // 在 DTO 出口挂上。两个理由，都不是洁癖：
+  //   ① 依赖方向——`queued-inputs.js` 必须能 import 本文件（它要复用 `postMessage` 这条唯一发送路），
+  //      本文件再 import 它就是循环；ESM 靠函数声明提升能跑，但那是**运气不是设计**，
+  //      将来谁把某个依赖改成模块级常量求值就会炸成 undefined。
+  //   ② 只有 `GET /api/sessions/:id` 这一个入口需要它（SSE 首连那条 `includeMessages:false` 不需要），
+  //      放在 DTO 出口比在数据层无条件多打一条查询更诚实。
   return {
     session: {
       ...rowToSession(s),
@@ -512,7 +520,10 @@ export async function archiveSession(pool, { userId, sessionId }) {
  * 回调一次（入参为新标题），由调用方推 SSE session_updated——让侧栏标题立即到位；不入事务，
  * 失败不影响 202。
  */
-export async function postMessage(pool, { userId, sessionId, content, attachments, notify, record, onSessionTitle }) {
+export async function postMessage(pool, {
+  userId, sessionId, content, attachments, notify, record, onSessionTitle,
+  triggerKind = 'user_send',
+}) {
   // 体校验（与 handlePostMessage 的前置校验同一函数；此处兜底，保证直接调用者也拿不到非法数据）
   const valid = validateMessageBody({ content, attachments });
   const safeContent = valid.content;
@@ -619,9 +630,12 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
 
     // run + 入队（§4.3：显式把用户输入作为 task 传引擎；id 由 portal 生成，禁止 cwd 派生 §9.3-3）
     const runId = crypto.randomUUID();
+    // #370：lineage。`queued_steer` / `queued_follow_up` 的 run 各带一份 maxRounds 预算，
+    // 没有这个字段就没法把「队列投递产生的成本」从普通发送里分出来（拍板点 ①：先测量再调参）。
     const run = await client.query(
-      `INSERT INTO runs (id, session_id, status) VALUES ($1, $2, 'queued') RETURNING id, status`,
-      [runId, s.id],
+      `INSERT INTO runs (id, session_id, status, trigger_kind)
+       VALUES ($1, $2, 'queued', $3) RETURNING id, status, trigger_kind`,
+      [runId, s.id, triggerKind],
     );
     await client.query(
       `INSERT INTO run_queue (run_id, container_id, status) VALUES ($1, $2, 'pending')`,
@@ -645,7 +659,7 @@ export async function postMessage(pool, { userId, sessionId, content, attachment
         attachments: safeAttachments,
         created_at: msg.rows[0].created_at?.toISOString?.() ?? msg.rows[0].created_at,
       },
-      run: { id: run.rows[0].id, status: run.rows[0].status },
+      run: { id: run.rows[0].id, status: run.rows[0].status, trigger_kind: run.rows[0].trigger_kind },
     };
 
     // G2：幂等记账并入业务事务（同 client 同事务）——状态码取本端点的契约值 202（portal.md §4.3）。

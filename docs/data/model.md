@@ -29,7 +29,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 |---|---|---|
 | 账号与认证 | `users` / `login_sessions` / `login_pending` / `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.2/§2.7 |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
-| 会话与对话 | `chat_sessions` / `runs` / `messages` | 规格 §9.1 |
+| 会话与对话 | `chat_sessions` / `runs` / `messages` / `queued_inputs`（migration 0024） | 规格 §9.1 / issue #370 |
 | 写操作幂等 | `idempotency_keys` | portal.md §1.4（本轮实现；**仅**由增量迁移 0001 提供，baseline 不含本表） |
 | 端口分配与路由 | `port_allocations` / `route_outbox` / `route_revisions` | 规格 §8 / topology.md §5/§8 |
 | 引擎持久化 | `transcript_rounds` / `run_checkpoints` / `run_events` | 规格 §9.2/§9.3 |
@@ -76,7 +76,7 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `fde_name` / `container_name` | 均唯一；`container_name = fde-<name>`（docker 容器名）。该容器名只在其自己的 `/29` 网络内按 docker DNS 解析（供其自有服务）；portal **不**按容器名/容器 IP 访问它——平台通道全出站经 Traefik（H-B，topology.md §2/§4；`control` 已取消） |
 | `runner_token_hash` / `token_generation` / `revoked_at` / `rotated_at` | per-container token（规格 §10.3 / issue #12）：**仅存哈希**。建容器时生成原文、注入容器 env `ERIX_STATION_TOKEN`；**容器 → portal 单向出示原文**（internal API Bearer），portal 只校验哈希、不再向容器出示。`token_generation` 是代次（轮换/重建 +1），`revoked_at` / `rotated_at` 记录吊销/轮换时刻——旧代次哈希失配 → `401 token_revoked`（原子吊销，topology.md §6 第 9 条）。Offboarding 吊销时将 `runner_token_hash` 置 `NULL` 并增加代次（nullable 由 migration 0013 提供）。严禁明文入 DB/日志/镜像/仓库（原理 §5 清单）。**容器除此之外无任何平台凭据，尤其没有 DB 凭据**（D1'） |
 | `status` | `creating / running / stopped / exited / removed`（状态机见 §2.4） |
-| `agent_version` | erix-agent 版本 pin / canary 的记录点（规格 §14 容器升级流程） |
+| `agent_version` | **实际在跑的 erix-agent 版本**（构建产物，随心跳落账，issue #404 结案）。旧语义是「版本 pin / canary 记录点」，实测那样只会存着一个没人再动的 `.env` 静态值、且**重建也不修正**，已弃用；canary 若真要做，需另开「期望版本」列，与「实际」并排才看得出漂移 |
 | `git_provider` | onboarding 选定的 Git host provider（`gitea` / `github` / `gitlab`）；host 详细绑定见 `fde_git_accounts` |
 | `last_heartbeat` | agentd 心跳（15s ⚠️，经 internal API 上报、portal 落库，runner-integration §4.2 U4）；3 次丢失（45s ⚠️）判容器死（视 `exited`），run 级处置走租约到期 re-claim（runner-integration §6.4） |
 
@@ -109,7 +109,8 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `usage` / `cost` | `usage` 为 `{input_tokens, output_tokens}` jsonb（run_end 汇总）；`cost` ⚠️ 待决策者确认（Q1/Q4，P1 可空，见 §5） |
 | `run_state` | 引擎 run-state 快照（0.14.0 `saveRunState` / `loadRunState` 可选能力；DDL：`deploy/migrations/0003-run-state.sql`，**baseline 已冻结故不写入 schema.sql**）；合并写时剔除顶层 `state`。终态由 `markRunState` 写入独立 `run_state_status`（migration `0014-run-state-status.sql`），而非快照；`loadRunStateStatus` 先读新状态列，若缺失则兼容读取 legacy 快照 `state`（不回填），损坏状态抛错。`runs.status` 终态仍由 U2 收敛，本列是引擎侧断点/恢复事实（不变式 3）。会话作用域对应列为 `chat_sessions.engine_run_state` 与 `engine_run_state_status` |
 | `error` | 失败时为 `{code, message, retryable}`；run 级错误码见 portal.md §6.4（`rate_limited` / `checkpoint_failed` / `container_exited` / …） |
-| `cancel_requested_at` | 停止标记：portal 写、runner 轮询（`AbortController` 跨不了进程，规格 §10.3） |
+| `cancel_requested_at` | 停止标记：portal 写、runner 轮询（`AbortController` 跨不了进程，规格 §10.3）。**issue #370 起转向也写它**（`POST …/queued-inputs` 的 `kind='steer'` 分支），但**只写时间戳、不动 `status`**——`status='cancelling'` 是「worker 立刻 SIGKILL 正在跑的工具」的开关，而转向要「本轮跑完再停」。「这次 abort 是转向还是用户按了停止」不看这里，看 `queued_inputs.interrupted_run_id` | 
+| `trigger_kind` | **这个 run 是谁叫起来的**（migration 0024，issue #370）：`user_send`（默认，用户手发）\| `queued_steer` \| `queued_follow_up` \| `synthetic`。存在的理由很具体：每条 follow-up 都是**一个新 run**，各带一份 `maxRounds`（默认 16，≥16 自动开 reflection）+ judge/wrapup/finalGuard 固定开销——不分出来就永远不知道「一次对话为什么烧了 4 份预算」，也就无法决定是否要合并投递。存量行 DEFAULT `user_send`（不回填，它们确实都是手发的）。默认值是契约，迁移尾部有守卫（漂了拒启动）|
 
 **termination 口径注（issue #212，2026-10-09）**
 
@@ -353,6 +354,25 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 | `attempt` / `last_error` | 每次 claim 增加尝试次数；最近失败原因用于管理台排障 |
 | `workspace_purge_after` | `ERIX_WORKSPACE_RETENTION_DAYS=0`（默认）时保持 `NULL`；显式正数才设置到期时间。到期 sweep 只删 workspace 目录，用户、Git 绑定、此任务及其他 DB 行均永久保留 |
 
+### 1.29 `queued_inputs` — 运行中说的话（issue #370，migration 0024）
+
+任务在跑时用户照常说话，话先进这里，**不进 `messages`、不进 `transcript_rounds`**。
+
+| 关键字段 | 语义 |
+|---|---|
+| `kind` | `steer`（**转向**：当前轮跑完就停下，用这句话继续）\| `follow_up`（**排队**：当前任务正常结束后按顺序发）。就这两个值，CHECK 钉死 |
+| `status` | `pending → delivering → delivered`；`pending → recalled`（用户整队取回）；`discarded`（预留位，当前实现不 discard）。**`delivering` 不是装饰**：认领与建 run 跨两次提交（`postMessage` 自开事务并锁 `chat_sessions`，同事务内调它会自锁），中间必须有一个「已被认领」的可见状态，否则并发终态出队会把同一条投两次。`delivering → delivered` 那一次推 `queue_update` 额外带 `delivered_run_id`（portal.md §5.3 第 17 类）——那是前端知道「有一个它没亲手发出去的 run」的**唯一推送路径**（它平时只能从 POST 响应或会话详情得知活跃 run，队列投递两条都不经过）|
+| `position` | `bigserial`——FIFO 的真相。不用 `now()`：同毫秒入队也要有确定先后，且不依赖时钟 |
+| `interrupted_run_id` | 仅 `steer`：它入队时**打断**的那个 run。**「这次 abort 是转向还是用户按了停止」的唯一判据**——所以 run 状态机零改动（不新增 status、不新增 termination reason），判定完全落在队列侧 |
+| `run_id` | 投递成功后它触发的那个 run |
+| `claimed_at` | 进入 `delivering` 的时刻。**过期（`CLAIM_STALE_MS` = 60s，服务端 `make_interval` 换算）可被重新认领**——判据同时写在出队扫描的 pick 与认领 CAS 两条语句里（两处必须同判据，否则「选得出来却永远抢不到」）。这条判据的存在理由：认领与建 run 跨两次提交，中间崩一次那行就停在 `delivering`——既不投递、也取不回（`recall` 只动 `pending`）、还算在 20 条上限里，界面上毫无线索。**判据在 SQL 里，单测的假池自己实现了一份同判据的 JS ⇒ 行为测试测不到它**，故另有源码级断言（`queued-inputs-wiring.test.js`；变异「pick 改回只认 pending」实测必须红，前例见 #331 那根死光纤）|
+
+**为什么落 DB 而不是照抄 pi 的内存队列**（`pi-agent-core` `Agent.steeringQueue`）：pi 的队列随进程消失（其自身注释："dead wrapper (no state) means the queue is gone"），而本站不变式 3「DB 是状态真相」+ 容器是牲口 ⇒ 用户打进来的话不能随进程或页面消失。实测症状：关页面 = 那句话蒸发；容器重启 = 排好的队全没了。
+
+**红线**：入队**只写本表**。提前写 `messages` 会破坏 #77 P3 PR②b B2 的「`messages` = 纯锚点行」；提前 `appendUserInputTurn` 更糟——**还没说出口的话**就进了模型上下文，并被读侧渲染成已发送。投递时才走 `postMessage` 那条唯一发送路（#261B）。
+
+**投递判定**（`drainQueuedInputs`，由 run 终态的**五处**产出点驱动，漏一处即队列卡死）：队头是 `steer` ⇒ 无条件投；队头是 `follow_up` 且正常终态（`end_turn` / `no_tool` / `judge_done`）⇒ 投；`follow_up` + `aborted` 且**存在 `kind='steer' AND interrupted_run_id = 本 run`** ⇒ 投（用户意图就是接着说）；其余（用户按停止 / `failed` / `persistence_failed` / `max_rounds_cap`…）⇒ **不投，留在队列**——别把排队的话烧在一个坏 run 上。另加容器存活闸门：容器不在 ⇒ 不投、**不丢**，快照带 `blocked='container_not_running'` 让界面说清「为什么还没发」。
+
 ---
 
 ## 2. 状态机
@@ -446,6 +466,7 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 | `chat_sessions.status` | `active / archived` | FDE 归档操作产生；消费：列表过滤、SSE 首连策略 |
 | `users.status` | `active / disabled` | onboarding / offboarding / IdP 对账（规格 §7.3）产生；消费：登录与 forward-auth 拒绝、容器停止 |
 | `run_queue.status` | `pending / claimed / done / cancelled` | portal 入队产生 `pending`；agentd claim（→ `claimed`，`claimed_at`/`lease_until`/`owner_container_id`/`claim_token` 必填由 CHECK 强制，attempts+1）→ 完成 `done` / 取消 `cancelled`；租约过期由 reaper 回收（A1/A2 定稿）：`runs.status='cancelling'` → `cancelled` + runs `finished`（aborted）；否则 `attempts < max_attempts` → 回 `pending`（**attempts 不变**），`attempts >= max_attempts` → `done` + runs `failed`（`max_attempts_exceeded`，§2.8） |
+| `queued_inputs.status` | `pending / delivering / delivered / recalled / discarded` | `pending` 由 `POST …/queued-inputs` 产生（会话行锁内，同事务判活跃 run）；`delivering` 由终态出队的 CAS 认领产生（0 行 = 被别人抢先，放弃本轮）；`delivered` 由投递成功后回写（带 `run_id`）；`recalled` 由 `DELETE …/queued-inputs` 整队取回产生；投递失败**退回 `pending`**（下一次终态再来），只有会话已 404 才 `discarded`。消费方：会话详情 `queued_messages` 快照、`queue_update` SSE、上限校验计数。**过期 `delivering` 算可认领**（判据见 §1.29 `claimed_at` 行）且**算在上限里** | 
 | `preview_grants.state` | `active / used / revoked / expired` | `active` 由 portal 签发（ticket）/ forwardAuth 换取（session）产生；`used` 由 forwardAuth 首次校验 ticket 同事务置位；`revoked` 由显式吊销 / allocation released / 用户 disabled 置位；`expired` 由 reaper 按 `expires_at` 懒打标 |
 
 ### 2.5 `route_outbox.state`

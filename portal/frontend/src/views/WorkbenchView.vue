@@ -15,6 +15,7 @@ import StreamPanel from '../components/StreamPanel.vue';
 // issue #282：输入框上方常驻动量状态条（run 级量化信号；消息级时刻在 StreamPanel 里）。
 import RunStatusBar from '../components/RunStatusBar.vue';
 import ComposerBar from '../components/ComposerBar.vue';
+import QueuedInputsBar from '../components/QueuedInputsBar.vue';
 import SessionPickerModal from '../components/SessionPickerModal.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 // issue #359（决策 §7 D9）P0b：顶栏「收工灯」——只回答“你的活儿被 git 保护住了吗”，平台零 git 写。
@@ -300,6 +301,9 @@ function jumpToLatest() {
              滚动容器里——常驻可见）。原来在流上方，顶部一行容易被忽略；贴到 composer 上沿后视线自然落到它。
              无选中会话时不挂（没有 run 可报，也不白起一个 1s 时钟）。 -->
         <RunStatusBar v-if="store.sessionId" />
+        <!-- issue #370：队列条夹在状态条与 composer 之间——它是「还没发出去的话」，
+             读序必须是「现在在跑什么 → 还排队说什么 → 输入框」。 -->
+        <QueuedInputsBar v-if="store.sessionId" />
         <ComposerBar />
         <!-- issue #94：会话选择 modal（Ctrl/⌘+K，scope='all'） -->
         <SessionPickerModal

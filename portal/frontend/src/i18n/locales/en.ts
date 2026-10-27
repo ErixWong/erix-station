@@ -160,6 +160,13 @@ export const en = {
       range: 'Compressed rounds {from}–{to}',
       countOnly: 'Compressed {count} messages',
       bare: 'Compressed',
+      // D 片（issue #392）：visibility line. The title answers "what was compressed"; this line answers
+      // "who can no longer see it". `hasSummary` key absent (old DTO) ⇒ the whole line is not rendered
+      // (same "absent key = unknown" discipline as #390-A). Round count only from `foldedRoundRange`.
+      visibility: '{n} rounds of original text are no longer visible to the model; the summary below is all that remains.',
+      visibilityNoSummary: '{n} rounds of original text are no longer visible to the model, and this fold produced no summary — use “View original” to read them.',
+      visibilityBare: 'This original text is no longer visible to the model; the summary below is all that remains.',
+      visibilityNoSummaryBare: 'This original text is no longer visible to the model, and this fold produced no summary — use “View original” to read them.',
       viewOriginal: 'View original',
       // #388: the original block's own collapse entry (hides only, never clears the cache; re-expanding does not refetch)
       collapseOriginal: 'Collapse original',
@@ -269,7 +276,8 @@ export const en = {
       judgeDegraded: 'judge degraded ({error}); no verdict this round',
       judgeUnknownAction: 'judge action: {action}',
       judgeNoDetail: 'judge event (no interpretable details)',
-      compaction: 'Context compaction (round {round}): {folded} rounds folded, {before} → {after} tokens',
+      compaction: 'Context compaction (round {round}, strategy {strategy}): {folded} rounds folded, {before} → {after} tokens',
+      compactionStrategyUnknown: 'unknown',
       finalGuard: 'final guard: {action}{dash}',
       forcedFinal: 'forced final (round {round}): {reason}',
       runEnd: 'run ended: {reason}{usage}',
@@ -345,6 +353,34 @@ export const en = {
     stop: '■ Stop',
     // issue #261B：上一条发送以失败终局收场时的一键重发（中英双语同口径）。
     retry: 'Retry last',
+    // issue #370: two ways to speak while a run is in flight.
+    placeholderRunning: 'Type while it runs — Enter steers, Option/Alt+Enter queues',
+    steer: 'Steer',
+    steerHint: 'Finish the current round, then continue with this message (in-flight tool calls complete first) · Enter',
+    followUp: 'Queue',
+    followUpHint: 'Send this after the current task finishes normally, in order · Alt+Enter',
+    hintEnterSend: 'send',
+    hintEnterSteer: 'steer',
+    hintAltFollowUp: 'queue',
+    hintShiftNewline: 'newline',
+    hintSlash: 'commands',
+    hintAt: 'mention file',
+  },
+  // issue #370: pending-input queue bar (components/QueuedInputsBar.vue)
+  queued: {
+    count: '{n} pending',
+    steerCount: '{n} steer',
+    followUpCount: '{n} queued',
+    expand: 'Expand',
+    collapse: 'Collapse',
+    recall: 'Recall all',
+    recallHint: 'Put every queued message back into the input box (recalled text first, existing draft after)',
+    // Keys are the server's machine codes, referenced as `queued.blocked.<code>`:
+    // the server sends codes, the client owns the wording (#294).
+    blocked: {
+      container_not_running: 'Container not running — queue paused (resumes automatically)',
+      deliver_failed: 'Last delivery failed — queue paused, recall and resend',
+    },
   },
   picker: {
     title: 'Browse sessions',

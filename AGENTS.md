@@ -163,7 +163,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
   「灯长期红/黄、而没人负责让它变绿」。
 
-## 8. erix-agent 依赖与升级（当前 pin：**0.20.0**，2026-10-15 由 #299 从 0.18.0 两步升上；历史 0.14–0.18 记录见下）
+## 8. erix-agent 依赖与升级（当前 pin：**0.26.0**，2026-10-25 由 `feat-261025-09-erix-agent-0.26.0` 从 0.25.0 升上；历史 0.14–0.25 记录见下。⚠ 本标题曾长期停在 0.20.0，与实际 pin 不符，本次一并修正）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
 - runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
@@ -244,8 +244,6 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [x] **未采纳**：**#181**（provider `defaultHeaders`/`extraBody`）——理由：station 不包装 fetch，`runner/` 内无自包 fetch / 自定义 header 代码，接了是空操作；0.18.0 的 `searchText` / `edit` 新文件工具、`createFileTools` 与 skills loader 导出——属 issue **#228** 迁移范围，另派单（本次 `runner/lib/file-tools.js` 一字未动；文件工具部分**已交付**，见 §8.9，skills loader 仍未动）。`judge` 的 `writeToolNames` 默认值 0.18.0 变为 `["writeFile","edit"]`，本站 `runner/worker.js` 只传 `reflection: {enabled: true, roundJudge: true}`、未显式传该字段，**不需动**。
 - [x] **测试口径（M6 全量复跑）**：根 `npm test` **807 项：806 通过 / 0 失败 / 1 跳过**（基点 `06b91c8` 基线 800 项：799 通过 / 1 跳过；净增 7 = 上游契约套件 +2、#180 用例 +4、#182 用例 +1）；`cd runner && node --test` **155 通过 / 0 失败**（基线 150；净增 5 = 上游契约 +1、本次 +4）；`node --test portal/test/termination-contract.test.js` **6/6**；唯一跳过项为基线既有。前端（`portal/frontend/node_modules` 本不存在，按工单以 `NODE_ENV=development npm ci` 装上后跑；**未向仓库引入任何前端 lockfile 变动**，装完 `git status` 仍干净）：`npm run typecheck`（`vue-tsc --noEmit`）**干净无报错**、`npm test`（vitest）**23 文件 / 321 测试全通过**（含 `terminationReasons.spec.ts` 里随 pin 同步为 `0.18.0` 的版本断言）。docker / compose / e2e 未跑（真机 e2e 归主 agent）。
 
-
-
 ### 8.9 文件工具迁上游（issue #228，2026-10-10）
 
 依据：station issue **#228** / 上游 erix-agent **#184**（`createFileTools` 规范实现 + `fileToolsContract` 契约套件）。
@@ -309,8 +307,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - [ ] **未做（已记录）**：FDE 级 grant（一次签票给整组 host 发 cookie，免「要点两次预览」）在 #241 正文另议；
   前端 host 自己的 dev server 不答 `OPTIONS`（返 200 + HTML 且无 ACAO）属**应用侧**，不在平台范围。
 
-
-
 ### 8.12 开户预分配 10 条 FDE 级预览域名（issue #240，2026-10-11）
 
 > ⚠ **更正（issue #246 交付①，2026-10-11；原记录不删，只标失效项）**：本节的**分配粒度 = FDE 级**、
@@ -353,8 +349,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   eric 重跑 `provision-fde` 得到 `8/10 新写（2 条已存在）` → 第二次 `0/10`，`ports.json` 自动 `generation=3` / 10 条（8 `fde` + 2 遗留）。全量 **877/876/0/1**、runner **200/200**。
 - [ ] **已知缺口（未在本单补）**：**签票入口缺失**（`GET /api/ports` 已随 P5 退役、SPA 内无任何端口列表/预览按钮 ⇒ 人只能靠 curl 调 API 拿票）；票据仍是 **host 级**（10 个端口要点 10 次）；
   `PORT_QUOTA` 已成死配置（文档已标注，摘除留后续 PR）；容器绑错端口（无人在听）时的可见性未量化。
-
-
 
 ### 8.13 预览端口全局号池 `22000–29999` 与块分配（issue #246 交付①，PR #248，2026-10-11）
 
@@ -581,8 +575,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   - **已接受的呈现（不是 bug）**：被中断的那次工具卡片本身是**红色 ✗**——引擎给的合成 `tool_result` 是 `is_error:true`，卡片按失败渲染，解释由下面那行中性文案承担（刻意不把卡片也刷成中性，否则真失败与中断会混色）。
 
 
-
-
 ### 8.23 reaper 收敛的重排也可见（issue #292，2026-10-14）
 
 **缺口性质**：#288 缺陷 B 把「attempt 被杀并重排」做成了用户可见，但只覆盖 **agentd 主动上报**（U12 release 带 `killed_by`）那一条路径。而**租约过期才是最常见的真崩溃形状**（agentd 自己被杀 / 容器被 `docker kill` / OOM / 网络断 ⇒ 根本没有上报）。`reapExpiredRuns` 的三条分支此前都不写 `attempt_killed` ⇒ 界面上仍是「同一个工具卡片亮几次，最后没有原因」。
@@ -792,8 +784,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **dev 残渣**：会话 `457fe11a…` 多了两条我发的探针消息（一篇 3000 字已完成长文 + 一篇停在 7418 字的长文），**故意不清**：它们同时是「有锚点不重复」与「截断」两块面的现成回放标本。
 
 **#300 已关闭。**
-
-
 
 ### 8.31 模型元数据打通：压缩开关不再是隐含的（issue #309，切片 0/1/1.5/2+2b，2026-10-19，随 **v0.1.16** 发布）
 
@@ -1994,3 +1984,355 @@ turn 全量渲染 **text 7 ms / reasoning 13 ms** ⇒ 性能根本不是理由�
    我单独跑该文件 **18/18 绿**、连跑两次全量 **896/896 绿** ⇒ 那 3+2 是**我并行跑根测试把它压出来的**，
    不是预存失败。子代理的基线数字必须自己复算一遍，不能照抄。
 
+
+### 8.64 对话输入队列：运行中可说话（转向 / 排队），pi 的两条队列落到 DB（issue #370，2026-10-25，分支 `feat-261025-01-chat-input-queue`）
+
+现象是一句很日常的话：**任务在跑时输入框是灰的**。前端 `send()` 见 `activeRunId` 静默 return（连报错都没有），
+后端 `postMessage` 撞 `ACTIVE_RUN_STATES` 409。参照系是 pi / pi-web（本机 `~/.npm/_npx/…/pi-agent-core` 与
+`/tmp/pi-web-agegr`），它有两条队列：`steer`（转向：当前轮跑完就停下用这句继续）与 `follow_up`（排队：任务
+正常结束后依次发）。**照抄三条口径，改造三处本站化**。
+
+**照抄的三条**（证据在 #370「参照系」节，动 `portal/src/queued-inputs.js` 前先读那条）：① **入队还是直发必须在
+服务端事务内判**（pi `agent-session.js:1633` 读完 `isStreaming` 就分岔，中间不 await）——反过来「前端先看 running
+再决定调哪个端点」在「点发送那一刻 run 刚好结束」时会退化成 409，pi 注释管这叫 *strand a message in an idle
+queue*；② **只有整队取回，没有单条删除**（pi `clear_queue`：单条删要和 loop 的 pull 竞态）；③ **停止不清队列**
+（pi `agent.js:218` `abort()` 不碰队列），aborted 轮留下的 follow_up 在下一次终态自动带出。
+
+**本站化的三处**：① 队列落 **DB**（`queued_inputs`，迁移 `0024`）而不是 pi 的内存队列——pi 自己的注释承认
+"dead wrapper (no state) means the queue is gone"，而不变式 3 是「DB 是状态真相」，实测症状就是**关页面 = 那句话
+蒸发**；② 投递由 portal 在 **run 终态**驱动，不是浏览器的 `agent_end` 回调 ⇒ 关页面也照发；③ `queue_update`
+是**状态帧不是历史事件**：信封要求 `run_id NOT NULL` 而入队时压根没有 run，所以它不落 `run_events`、不进历史
+白名单，刷新后靠 `GET /api/sessions/:id` 的 `session.queued_messages` 全量补齐（前端三处集合各漏一处的症状
+不同，#288 已证，这次一格 `es.emits('queue_update').length === 1` 钉住监听面）。
+
+**转向的实现路径没有动引擎**（这是本片最省钱的地方）：erix-agent 0.25.0 的 `onRound` 是**被 await 的**、且
+**在本轮 transcript 落库之后、`round_end` 之前**才响（`src/loop/orchestrator.js:4342`），而轮循环**圈顶先查一次
+中止**（`:3722`）。一「轮」= 一次 provider 调用 + 它的工具执行 ⇒ 在 `onRound` 里 `abort()` 得到的正是
+「当前轮工具调用全部跑完、下一次 LLM 调用之前」，**与 pi 对 steer 投递点的定义逐字重合**。
+两条引擎红线写进代码注释：**抛错不是控制流**（#173：观察者抛错只记一笔、run 继续，要停只认 `signal.abort()`）、
+**不得在 `onRound` 里 park 等输入**（它被 await，park = 静默卡 run，拿 90s 租约与 #288 静默看门狗冒险）。
+配套：**转向只写 `cancel_requested_at`、绝不写 `status='cancelling'`**——`cancelling` 是「worker 立刻按进程组
+SIGKILL 正在跑的工具」的开关（#211），而转向要「本轮跑完再停」；「这次 abort 是转向还是用户按了停止」的判据
+落 `queued_inputs.interrupted_run_id`，**run 状态机与 termination reason 零改动**（runner 只在 `detail` 补
+`steered`，用例钉住「不改 reason / 不覆盖引擎给的 detail」）。
+
+**五条终态产出点必须全部接线**（`finishRun` / `releaseRun` / `reapExpiredRuns` / 停止端点的直接终态分支 /
+offboard 收敛）。它们不在一条调用链上，加第六处时没人会回头改前四处，漏一处的症状是「队列偶尔静默卡死」
+而界面毫无线索 ⇒ 把「谁调了它」写成断言（`portal/test/queued-inputs-wiring.test.js`，含「`queued-inputs`
+不得 import `internal.js`」与「`sessions.js` 不得反向 import 它」两条依赖方向红线——后者是我自己先写出环来，
+被断言逼着把快照挂载移到 DTO 出口才拆掉的）。
+
+**过程中被测试抓出来的两个真 bug**（都不是测试迁就代码）：① `executeWithIdempotency` 约定的 fn 返回形状是
+`{statusCode, response}`，我按业务结果写 ⇒ 无 key 时靠对象展开蒙对、**带 `Idempotency-Key` 恒 500**；
+② 幂等台账里存的必须是**响应体**而非业务结果，否则回放给出裸 DB 行（多 `session_id`/`status`/
+`interrupted_run_id`），首次与回放形状不同 ⇒ 改成两条路共用同一个 `queuedInputResponse()` 映射。
+前端也抓到一处：服务端裁决成直发（`{posted}`）时**永远不会有 `queue_update` 到达**，乐观条目必须手动摘掉，
+否则那句话同时以「已发送气泡」和「待发送」两种身份挂在界面上。
+
+**拍板点三条已全部落定**（原文与理由在 #370）：每条 follow-up = 一个新 run（各带一份 `maxRounds=16` 预算）
++ `runs.trigger_kind` 先测量两周再决定是否合并投递；容器不在 ⇒ **不投不丢** + `blocked='container_not_running'`
+让界面说清「为什么还没发」；按钮叫**「转向」**不叫「打断并转向」（5 个字会在用户最需要按下它的那一刻吓到他）。
+
+**自评轮抓出的四条，全部先写红测再修**（不是合并前的礼貌扫一眼，是真去找「我的测试测不到的地方」）：
+1. **`CLAIM_STALE_MS` 是一根没人读的光纤**（#331 前例）：迁移注释与本模块注释都承诺「`claimed_at` 过期可被
+   重新认领」，但 pick 与 CAS 两条 SQL 都只认 `status='pending'` ⇒ 认领后崩在建 run 之前的那行**永久停
+   在 `delivering`**：不投递、取不回（recall 只动 pending）、还算在 20 条上限里。修法是 pick 与 CAS 共用
+   同一条 CLAIMABLE 判据（pending 或过期 delivering），两处必须同源否则「选得出来却永远抢不到」。
+   ⚠ **这条行为测试天然测不到**：判据在 SQL 里，而假池自己实现了一份同判据的 JS —— 变异「把 pick 改回
+   只认 pending」实测 **25/25 仍然全绿**。必须补源码级断言（`queued-inputs-wiring.test.js`），补完变异才红。
+2. **队列投递出去的 run 前端根本不认识**：本站前端只有两条路知道活跃 run（自己 POST 的响应、会话详情的
+   `active_run_id`），队列投递两条都不走 ⇒ 旧 run 的 run_end 到了就清空运行态，新 run 在跑而状态条显示
+   空闲；更糟的是新 run 自己那条 `run_end` 因 `d.run_id !== activeRunId` 被整条丢弃 ⇒ **终稿永不刷新**。
+   修法：`queue_update` 带 `delivered_run_id`，前端仅在 `activeRunId == null` 时接管（不抢用户正在看的那个）。
+3. **转向会把「重试上一条」点亮**：转向也是 `reason=aborted`，落在 `RUN_FAIL_REASONS` 里 ⇒ 用户刚说「用这句
+   继续」，界面却给一个「把上一条原话重发」。用 `termination.detail === 'steered'` 抑制，**不动 reason 集合
+   本体**（它还管 #306 的补拉 history）。
+4. **`send(override)` 会被队列委派静默吞掉**：`retryLast()` 传的是原文，而运行中那条委派走
+   `sendQueued` 读的是输入框 ⇒ 该重发的那句丢了、反倒把草稿排了队。改成带 override 不进队列，
+   把「不许串味」写进结构而不是依赖调用方永远记得守。
+自评还顺手发现自己写的一个**空操作断言**：`applyRetryFaceOnRunEnd` 没导出，`(store as any).fn?.()` 调的是
+`undefined?.()` ⇒ 改前改后都绿，等于没测。改成驱动真实 `run_end` 帧，并同时钉「普通 abort 仍要亮」。
+
+**判据**：根 **1604 / 1600 / 0 / 4**（基线 1564，本片新增 40 格：判定表 22 + HTTP 面 10 + 接线防漂移 6 +
+迁移 1 + runner termination 1）、前端 **50 文件 / 916**（基线 896，新增 20 格）、`vue-tsc` 全 0。
+被本工单**有意改掉**的旧断言四处，均已在注释写明（`sendDisabled` 运行中不再为 true ×2、ComposerBar 运行中
+键位 ×2、`buildFailureEnvelope` 入参表 ×2 处跨两文件）。
+
+**⚠ 运维坑**（§8.17 同型）：`steer_arm` 与 `onRound` 全在 **worker 进程**里 ⇒ 必须重建 FDE 镜像并
+`docker rm -f` 掉全部 `fde-*` 容器；旧容器收到 `steer_arm` 当未知 IPC 类型忽略，症状是「按了转向、run 照跑到
+自然结束、转向的话在终态后才发出」——功能退化不报错，极易误判成「已经生效」。
+
+### 8.65 引擎升 pin 0.25.0 → **0.26.0**：折叠替代物有了投递出口，`judge_done` 不再终局零正文（2026-10-25，分支 `feat-261025-09-erix-agent-0.26.0`）
+
+上游这五单（erix-agent #468 / #472 / #474 / #471 / #477）已 squash 进 `main` `aef25b0d`，并随 **0.26.0** 上 npm（2026-10-25，`npm view erix-agent version = 0.26.0`，发布走的是 AGENTS §4 那套 npm12 device-flow）。
+与 §8.60（0.23→0.25 当场翻红 14 格）不同，**这次只翻红 9 格，而且全是同一种形状**：两处把引擎版本钉成常量的**版本线闸**——`runner/test/llm-timeouts.test.js:48` 的 `ENGINE_VERSION_PINNED`（一个常量拖住 4 格，根测与 runner 测各跑一遍所以看起来像 8 格）与
+`portal/frontend/src/lib/terminationReasons.ts:45` 的 `ENGINE_VERSION_FOR_TERMINATION_REASONS`（连带 `portal/test/termination-contract.test.js` 与前端 spec 共 1 格 + 1 格）。闸门原话是「版本变了必须**先人工复核**再改常量与文档」，所以复核做在改常量之前：
+
+| 线闸要求复核的东西 | 复核方法（实做，不是读上游 CHANGELOG） | 结论 |
+|---|---|---|
+| `termination.reason` 全集 | 两个**已安装**版本的 `src/loop/termination.js` 字面量集合逐一对照 | **两侧完全相同**：`aborted / end_turn / failed / judge_done / max_rounds_cap / no_tool` ⇒ 常量与前端码集**不动** |
+| 超时相语义（四相 vs legacy 120s 总闸） | `diff -rq <0.25.0>/src/providers <0.26.0>/src/providers` | **整目录 0 差异**，超时相关模块一个没碰 ⇒ `llm-timeouts` 断言前提不变 |
+
+真正变了的是**强制收尾白名单**：`["max_rounds_cap","stall","continuation_exhausted"]` → **追加 `judge_done`**（#467）。⇒ 本站新增一条验收口径：**终局可不可信要看 `termination.forcedFinal`，不能只看「有没有正文」**；引擎代写的正文带 `forced-final` 标记（#323 的 marker 规矩），呈现时不允兆冒充模型自答。
+⚠ 同一个洞在 `end_turn` / `no_tool` 上**仍在**（上游 #475 / #476 未动，评审判据侧是 #473），所以**别写成「任何终局都有正文」**。
+
+新增的宿主可用面（本站下一片接）：`record.foldedFacts`（每次折叠的有界机械索引，默认 `FOLDED_FACTS_MAX_BYTES = 2048`）与 `context.onFoldSummary`（折叠定稿那一刻投递 `{ ...foldedFacts, round }`；钩子抛错只落 `persistence_error{operation:"onFoldSummary", phase:"fold_summary_delivery", fatal:false}`，永远不改 run 结果；不传则逐字节不变）。
+**C 片**用它做折叠入注（不再轮询账本），**D 片**用它把横幅从「272530→5004 压缩比」改成「N 轮原文对模型不再可见」并如实标 `src` 两态（`strategy` / `llm`）。另 `compaction.strategyName` + 一次性 `compaction_strategy_fallback`（#464 A）已可用 ⇒ PR #400 A 片选的 `fold-statistical` 从此**能被证明真的在跑**，不用再靠猜。
+
+门禁（本机 worktree 实测，判据 = 退出码）：根 `npm test` **1608 / 1604 通过 / 0 失败 / 4 跳过**；`cd runner && node --test` **360 / 360 / 0**；前端 `vue-tsc --noEmit` 干净 + `npm test` **50 文件 / 920 全过**。
+本次动的文件：pin 两处（`package.json`、`runner/package.json`）+ 两份 lock；版本线闸三处（`runner/test/llm-timeouts.test.js:48`、`portal/frontend/src/lib/terminationReasons.ts:45`、`.../terminationReasons.spec.ts:61`）；本节 + §8 标题的 pin 口径。
+
+⚠ **顺带修正一条本站旧结论**：容器 `/home/erix/.erix/config.json` 三个槽位此前**都没有** `contextWindowTokens` / `maxOutputTokens`，模型名还是上游已撤的 `deepseek-flash`。
+**线上 run 不受影响**（模型与预算走 portal 心跳下行，网关 `LiteLLM_ProxyModelTable` 实查 `context_window=262144` / `max_output_tokens=32768`，runner 的 `resolveModelMetadata` 拿到的就是这两个数）；但 **e2e 与 CLI 读的是占位文件**（`resolveRunModel` 无下行时取占位 model，endpoint/key 永远取占位）⇒ `modelMetadata` 不成对 ⇒ `modelMetadataMissing` ⇒ `examples/pi-extension/erix-run-e2e.test.js` 的 **E6「装配自查」恒红**（上游 `ERIX_E2E_REAL=1 npm run check:release:real` 的 4/5 就是它）。
+2026-10-25 已给三个槽位补齐两键并把模型名改成 `qwen3.8-flash-next`（备份 `config.json.bak-20261025`；两个数字的来源：网关错误原文 *"maximum context length is 262144 tokens"* 与 `/v1/models` 的 `max_output_tokens: 32768`，与网关配置一致），补齐后真上游五步 **5/5 全绿**。
+**结论：占位文件里这两键不是可选项**——它决定 e2e 能不能跑、以及 CLI 手工验证时压缩是否真开；别当成冗余删掉。
+
+### 8.66 折叠摘要入注（issue #392 C 片）：折一次记一次，摘要不再是「产出来就扔」（2026-10-26，分支 `feat-261026-01-fold-notes`）
+
+A 片（§8.65 前后的 `context.strategy='fold-statistical'`）只解决「折叠**产出**替代物」；替代物产出之后
+没人投递，用户侧感知与「静默硬删」完全一致——摘要生出来就扔了。本片补上投递这一环，让
+**折一次记一次**成为可验证的不变量。
+
+引擎侧 0.26.0 已把出口给全（本站不往引擎加任何东西）：`context.onFoldSummary(payload)`，
+`payload = { ...record.foldedFacts, round }` = `{ text, source, chars, bytes, truncated, round }`；
+契约三条边界都写在引擎里——**无 text 不调用**、宿主回调抛错只落
+`persistence_error{operation:"onFoldSummary", phase:"fold_summary_delivery", fatal:false}` 不杀 run、
+不接这个回调则行为与 0.25.0 逐字相同。投递方向是**宿主的事**（erix-agent#470 定调：引擎里没有
+notesStore 句柄，也不该塞 fs/DB）。
+
+落地位置（三处，前两处是新增文件）：
+
+| 位置 | 职责 | 为什么切在这儿 |
+|---|---|---|
+| `runner/lib/fold-notes-key.js` | 纯函数：key 与正文 | 零依赖 ⇒ 单测能把 key 形态钉死，不必装引擎 |
+| `runner/lib/fold-notes.js` | 投递 + 失败纪律 + 序号 | 只有这里知道 `noteTools.executors`，也只有这里该知道 |
+| `runner/worker.js` `#392:C-fold-notes` / `#392:C-onFoldSummary` | 装配 + 条件接线 | 判据从源码抠值求值，删掉那行必红（技法同 A 片） |
+
+四条写在代码里的硬约束：
+
+1. **key 必须能排时间线，且永不重复**。同 scope 下 key 就是笔记 id：固定 key ⇒ 第二个 run 的第一次折叠
+   撞重复、注直接丢掉、台账从此只有一条。key 还必须过 store 的
+   `SAFE_KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/`（`erix-agent src/store/notes.js:47`），不过就被哈希成
+   `h<digest>`——人在 `note_list` 里既读不出顺序也认不出是哪次折叠 ⇒ 时刻用 **basic 形态**
+   `fold-20261026T021530Z-r57-s1`（带 `-` `:` `.` 的 ISO 过不了这条）。
+2. **投递处不传 `scopeRef` / `runId`**。作用域由 B 片的工厂绑定成 `sessionId`；这里再传一次就是伪造
+   `__erix`，会把注写回 run 目录，正好抵消 B 片的收益（判据 C7 / C13）。
+3. **写注失败绝不打死 run**：笔记是台账不是事实源，失败只上报 `fatal:false`（连上报通道自己抛错也不
+   传染，C8 / C9）。
+4. **无 text 不写空注**：引擎契约是本不该调用；真被调到算异常形态，只上报（`reason:'no_summary_text'`），
+   不写一条空笔记在 `note_list` 里冒充「已存档」（C6）。
+
+`pinned:false`——pinned 的唯一豁免是 memory，折叠摘要不算。
+
+**两条已知边界（别当成已解决）**：
+
+- **精确轮次范围 `a–b` 拿不到**：payload 只有 `round`，没有折叠水位线的前后值，也没有 `foldedRounds`。
+  所以正文只能写「round N 及之前的原文已退出可见上下文」。要写「折走第 12–57 轮」得让上游
+  在 payload 里补 `foldedRoundsBefore/After`（additive，一小格），本片不假装知道。
+- **序号是 run 内的**：折叠水位线本身仍是 run 作用域（#462 补的是读侧裁剪，没把它抬到 session），
+  所以「第 N 次折叠」在新 run 里从 1 重来。正文里同时写 run id 与绝对时刻，就是为了让读者能自己
+  判断这不是全局序号——不谎报。
+
+未做：**D 片**（banner 两态：显示 `compaction.strategyName` 与「已折走 N 轮原文对模型不再可见」）；
+`context.keepRounds`（0.25.0 里没人读，A 片已钉死）；env 旋钮（延续 A 片口径：策略与投递不是运维参数）。
+
+验证：`runner/test/fold-notes.test.js` 新增 **13 条**（C1–C13），runner 全量 **386/386**；语法门
+`node --check` 204 文件 0 失败。根套件 1634 条里唯一那格红是 `portal/test/termination-contract.test.js`
+的 tripwire 读**安装态**引擎版本（本地 `node_modules` 是借来的 0.25.0），CI `npm ci` 下即 0.26.0 ——
+它红得正好：那根线闸的作用就是「版本变了必须重开 issue 复核 reason 全集」（§8.65）。
+
+### 8.67 E 片：端到端验「折叠 → 写注 → 注回到模型输入」，当场抓到 C 片是死光纤（2026-10-26，分支 `feat-261026-02-fold-notes-e2e`）
+
+§8.66 的 C 片有 13 条判据全绿。它们证明的是「给定一个 `foldedFacts` 形态的 payload，投递器会把注写对」。
+它们**没有**证明：引擎在真折叠时会调用那个回调、以及写出的注会不会回到模型可见输入。补一片端到端
+（`runner/test/fold-notes-e2e.test.js`，真 `runToolLoop` + 桩 provider 录下每一份请求 + 真 notes 工厂与
+真投递器落真目录）当天就抓到两件事：
+
+**① C 片的接线是错的，而且是本站最经典的那种错。** `onFoldSummary` 我塞进了 `context`，而引擎从
+**顶层 options** 解构它（`src/loop/option-normalization.js` 的 `RUN_TOOL_LOOP_OPTION_NAMES` 里有它；
+`context` 里目前只认 `strategy`）。后果：折叠照跑、`record.foldedFacts` 照落账、注**一条也不写**、
+**且不报错**——#331 那根「没人读的光纤」原样重现，而这次是我自己造的。E2 那一格（`sink.seq() >= 1`）
+就是它的探测器：真跑一次折叠，`seq=0` 立刻现形。
+
+教训不是"下次仔细点"，而是：**手工喂 payload 的单测证明不了接线**。凡跨包/跨层的回调接线，判据里必须
+有一格是「让对面真的调我一次」。已把它固化成防回装：C14 直接读**已安装引擎**的白名单源码比对，
+并断言 `context` 段里再出现 `onFoldSummary` 就红。
+
+**② 注确实回到了模型输入，但形态是小抄，不是全文。** 引擎的 semantic 段渲染成：
+
+```
+[notes 小抄目录]（note_read key=... 取全文）
+- fold-20261025T184024Z-r1-s1 (@agent): 折走存档：第 1 次折叠（run …）
+```
+
+于是 E4 的探针只能取**小抄行里有的东西**（注首行）。第一版我拿正文第二句当探针，得到"注没回去"的
+**假红**——这类"探针选错"的假红比真红更危险，因为它会把正确实现判死、把错误结论写进 issue。
+所以 E4 之外必须配 E5 对照组（不接 `semanticStateProvider` ⇒ 注仍在盘上、但请求里查不到）：
+E4 绿 + E5 绿 才叫「注是经 semantic 段回去的」，只有 E4 绿说明不了归因。
+
+**约束（下次调 harnes 别再猜）**：引擎预算
+`budget = cw - maxOutput - max(2000, ⌈cw×比例⌉)`（`src/compact/budget.js:23-25`），预留**硬底 2000**
+⇒ `context_window: 900` 直接 `Computed context budget must be positive (got -1300)`，四格空转。
+本文件用 `6000 / maxOutput 200`：够小所以两三必然折一次（真机要上百轮，那是成本不是机制），又不至于被硬底打死。
+
+六条判据的分工：E1 折叠真发生（否则全是空断言）· E2 真折叠真写注（抓死光纤）· E3 无投递失败且 run 跑完 ·
+E4 闭环（小抄进请求 + `note_read` 指引 + provider 真被调）· E5 对照组（E4 的归因兜底）·
+E6 同一份替代物**同时**进轮记录 `foldedFacts`（投递与落账不是二选一，#470-B/#470-D 两路都要在）。
+
+**顺带修正 §8.66 的一处措辞**：那里写「精确轮次范围 `a–b` 拿不到」——`onFoldSummary` 的 payload 确实
+还是没有范围，但引擎**自己的摘要文本里**带范围（`早期第 … 轮（共 … 轮）已折叠`，见 §8.65 A3 判据）。
+所以缺的是**结构化**的 `from/to`（给 DB 与 banner 用），不是"系统不知道范围"。erix-agent#479 的诉求据此收窄。
+
+### 8.68 D 片：折叠横幅补上「谁现在看不见它」——横幅两态 + 事件行显示实例策略名（2026-10-26，分支 `feat-261026-03-fold-banner-d`）
+
+A/B/C/E 四片都在修「折叠丢了东西」，而轴三（**人得知道丢了**）一直只有 #388/#389/#390-A 那半套：
+横幅标题说「已压缩第 2–5 轮」，但**「压缩」这个词在用户那里并不自动等于「模型从此看不见它」**。
+折叠的全部意义恰在那后半句，而它此前只存在于实现者脑子里。这片就补这半句，顺带把「谁折的」显示出来。
+
+| 位置 | 改动 | 为什么在这儿 |
+|---|---|---|
+| `StreamPanel.vue` `foldedVisibilityNotice()` | 横幅标题下新增一行，**两态** | 数据全在现有 DTO 里（`foldedRoundRange` + `hasSummary`），**零后端改动** |
+| `zh-CN.ts` / `en.ts` `stream.folded.visibility*` | 四个键：有/无摘要 × 有/无轮数 | 措辞必须跟着事实分叉，见下 |
+| `useEventStream.ts` + `stream.event.compaction` | 事件行加「策略 {strategy}」 | `compaction` 事件本就带 `strategyName`（erix-agent #464 A），此前没人显示 |
+
+三条口径（都不是措辞偏好，是防说谎）：
+
+1. **两态是必需，不是润色**。`hasSummary === false` 时下面那份「摘要」其实是复述标题的兜底句
+   （#390-A 因此已经不画展开控件）。此时若还说「摘要就是它留下的全部」就是**空头支票** ⇒ 无摘要态改成
+   指路「查看原文」。
+2. **`hasSummary` 键缺席 ⇒ 整行不渲染**，不能当 `false`。存量行没有这个键，当 false 处理等于让旧数据
+   凭空多出一句「本次没有生成摘要」的断言——与 #390-A「键缺席 = 不知道，宁可保持现状」同一条纪律。
+3. **轮数只从 `foldedRoundRange` 算**（`to − from + 1`）。拿 `foldedPayloadMessages` 报轮数是 #375 已经
+   定过性的假话（那字段是「本条记录携带的归档条数」，去重 + 夹断后明显偏小）。无 range 就退成不带数字的
+   措辞，**不猜**。
+
+`strategyName` 缺失时显式渲染成「未知」而不是留空：留空会让人以为策略名字是空串，而真相是「这条事件
+比该字段古老」。**注意**：引擎只把策略名放进 `compaction` 事件，**不落轮记录**（`roundRecord` 上只有
+`folded` / `foldedPayload` / `foldedRoundRange` / `navigationRecord` / `foldedFacts`），所以历史行里
+显示不出「谁折的」——这不是本站漏做，是 erix-agent#479 那半格（宿主侧目前只能用 `foldedFacts.source`
+近似，两者在降级路径下会不一致）。
+
+判据 5 条：横幅 4 条（有摘要报轮数 / 无摘要不许许诺并指路 / **键缺席整行不出** / 无 range 不报数字）+
+事件行 1 条（有 `strategyName` 原样显示；旧的三处文案期望同步成「策略 未知」）。
+前端 **925/925**、`vue-tsc` 干净。
+
+**部署口径**：前端在 portal 镜像里 ⇒ 生效只需 portal 换镜像 + 重启，**不需要**重建 `fde-*`（runner 侧零改动）。
+
+
+### 8.69 issue #404：`containers.image` 必须跟上现实，不是停在开户那一刻（2026-10-26，分支 `fix-261026-01-container-image-ledger`）
+
+现网实测的账实不一致：`fde-eric`/`fde-jim` 跑的是 v0.1.38 的 digest，库里 `image` 还写着 v0.1.37 的；
+`agent_version` 停在 `0.1.32-088e41e`。后果不是难看，是**问不出答案**——「这个 FDE 在跑哪个 runner」
+只能人肉 `docker inspect`，我这两天的部署核对全这么过来的。
+
+病根是写面的形状，不是某处漏了一行：`image` 只出现在 `onboardFde` 里**「DB 没有行」那条 INSERT** 上。
+其余三条路径——① 复用（容器在、env token 匹配）② 重建（有行、token 轮换那条 UPDATE）③ reconcile 的
+adopt 分支（`res.created === false`）——**一条都不写** ⇒ 一次开户定终身。所以修法是给三条路径都补写，
+而不是改 INSERT。
+
+**写"实际"而不是写"期望"**（这条是本片的判断核心）：adopt 场景里容器可能正是上个版本遗留的，把
+`config.fdeImage` 写进去只是把一种谎换成另一种。于是 `ensureFdeContainer` 现在把容器**实际**镜像带回
+调用方（adopt 取 `Config.Image`，新建取 create body 的 `Image`），调用方只有一条写法：`res.image` 写账。
+唯一写期望值的地方是「token 轮换 UPDATE 之后紧接着就是 create(config.fdeImage)」——那里期望值就是真话，
+且 `status='creating'` 已把"还没起来"标出来了。
+
+顺手修同一条路径上的 409：`ensureFdeContainer` 原先只认 204/304，而 **409 是 Docker 在说「它已经在跑了」**
+——正是本函数要的终态。并发（reconcile 与 provision-fde 同时动同一个名字）时赢的那一方拿 409 抛错，
+reconcile 因此抱怨 `start container … failed: HTTP 409`，把真故障淹在噪音里。现在 409 当幂等成功，且
+`started` 保持 `false`：它本来就在跑，不是我们启动的，不许谎报。
+
+判据 3 条：409 幂等（含"必须先查后起"与"不许谎报 started"）/ 新建路径回报实际镜像 / 三条写路径都在源码
+契约上钉住（`onboardFde` 全链 fake 成本高，沿用本文件既有做法；`ensureFdeContainer` 真跑）。
+provisioner 34/34、portal+root 全量绿。
+
+> **本节写完当场发现的一句话错误，保留在此而不是悄悄改**：原文说"`agent_version` 由心跳自报"，**不成立**。
+> 实际链条是 `deploy/.env` 里一个静态 `FDE_AGENT_VERSION=0.1.32-088e41e` →（compose）→ `config.fdeAgentVersion`
+> → 建容器时写库、并作为 env 注进容器 → `runner/agentd.js:44` 上报的就是**那个 env 标签**；而
+> `portal/src/internal.js` 的 heartbeat 收到 `agent_version`（`agentd.js:421` 确实报了）**从不写这一列**。
+> 所以该字段的真实语义是「建容器时我以为版本是多少」，且"以为"的出处是一个没人再动的 .env 值——
+> v0.1.40 的容器写着 `0.1.32` 即由此来。修它需要两处同时动：runner 报自己 `package.json` 的真实版本
+> （env 仅作 override）+ portal 在 heartbeat 里落账（同值不写，免得每心跳刷 `updated_at`）。详见 #404 结案评论。
+>
+> **`image` 那一半已实测修好**：v0.1.41 上线后第一个 reconcile tick 就把两行改写成容器实际引用，全长等值。
+> 核对时注意读数陷阱——用 `right(image,12)` 比 `docker inspect | cut -c8-20` 会把**同一个** digest 的
+> 后 12 位与前 12 位当成两个值，看着像"写平了但写错对象"。**digest 必须比全长。**
+### 8.70 版本改成构建产物：`build-info.json` 是运行时唯一真相，env 只剩 override（2026-10-26，分支 `feat-261026-06-version-as-artifact`）
+
+#404 结案评论里定的修法。为什么不是"把那个 .env 值改对"：**它还有第二个来源，就一定会再漂**。
+当时的三方各说各话是这样的——
+
+| 位置 | 当时写的 | 真相 |
+|---|---|---|
+| `containers.agent_version` | `0.1.32-088e41e` | 容器已换过两版 |
+| 出处 | `deploy/.env` 一行没人再动的 `FDE_AGENT_VERSION` | 且**重建也不会修正**（重建路径写的还是同一个 env） |
+| agentd 心跳上报 | `0.1.0` | `ERIX_AGENT_VERSION` **从来没被任何地方设过** ⇒ 落到兜底常量 |
+| 全仓读者 | 无 | API 不返回、前端不显示、reconcile 不判 |
+
+**规则**：未知就写 `unknown`，不要写兜底版本号。`0.1.0` 和 `0.1.32-088e41e` 这两个"看起来合法的假值"
+骗过了所有看的人，比空值毒。
+
+| 改动 | 为什么在这儿 |
+|---|---|
+| `runner/Dockerfile` 构建期写 `/opt/erix/build-info.json` | `station_version` / `engine_version` **从镜像内的 `package.json` 与 `node_modules/erix-agent/package.json` 读**，不从 ARG 传——少一条"必须与构建同步的手工输入"就少一次漂移；只有 `.git` 拿不到的 `revision` / `built_at` 走 ARG。ARG 与 RUN 放 Dockerfile 末尾，把缓存失效压到最小 |
+| `runner/lib/build-info.js`（新） | 三级来源 + **绝不抛错**（心跳热路径上读版本不能把心跳打死）：env override > `build-info.json` > 本地 `package.json`（dev）> `unknown` |
+| `runner/agentd.js` | 删掉 `\|\| '0.1.0'`；心跳新增 `runner_version` / `build_revision`（additive，旧 portal 忽略） |
+| `portal/src/internal.js` 心跳 | 落账 `agent_version`：空/缺 ⇒ **不写**（不许拿 unknown 覆盖上一次真值）；`IS DISTINCT FROM` ⇒ 同值不写，否则 15s 一次的心跳把 `updated_at` 刷成噪音；截断 64 防一个怪 tag 把心跳打成 500 |
+| `portal/src/provisioner.js` | `FDE_AGENT_VERSION` 降级成 override：**默认不注入**容器 env；`dev` 是占位、不算钉值（注入它等于让占位冒充上报值） |
+| `.github/workflows/release.yml` | 传 `STATION_VERSION` / `STATION_REVISION` / `STATION_BUILD_DATE` |
+| `.github/workflows/ci.yml` | 构建校验里加 tripwire：`build-info.json` 必须存在、`station_version` 必须等于仓库 pin、`revision` 必须等于本次 commit、`engine_version` 不许 unknown |
+
+口径与坑：
+
+- **`agent_version` 的契约语义是 erix-agent（引擎）版本**（`docs/api/portal.md` U4 早就这么定义），
+  runner 自身版本另放 `runner_version`。以前三方混用一个字段，正是它腐烂的原因。
+- 读引擎版本**不能** `require('erix-agent/package.json')`：那个包的 `exports` 只开 `.` / `./tools` /
+  `./contract-tests`，裸 spec 会 `ERR_PACKAGE_PATH_NOT_EXPORTED`；这里按文件路径直接读。
+- CI 那段是 YAML 块标量里的 shell + `node -e`：单引号内的行尾 `\` **会**进字符串（JS 里是语法错误），
+  所以脚本行一律不带续行符；`EXPECTED` 要靠 `docker run -e EXPECTED` 才进得了容器，只在 shell 里赋值没用。
+  两处都用 `bash -n` + `node --check` 真验过，不是"看着像对"。
+- 判据里"不许出现 `|| '0.1.0'`"要**先剥注释再查**：本条文档自己就原样引用了被禁的写法，不剥会判据过敏。
+- ⚠ **本片上线即炸过一次现网**：`buildContainerConfig` 新增注入 `ERIX_AGENT_VERSION`，但
+  `deploy/fde-proxy/server.js` 的 `ENV_KEY_ALLOW` 是**另一个模块**、没同步 ⇒ `provision-fde` 报
+  `create_policy_denied: Env key not allowed`，而那时两个 FDE 容器已经被流程删掉，短暂全停。
+  单侧测试查不出来（注入方与放行方各自都"对"）。已补白名单 + 一条**交叉核对**判据：
+  provisioner 可能注入的键集合必须 ⊆ proxy 白名单。**"我加了个 env"从来不是一句无害的话。**
+- 消费面（谁读这列）**本片故意不做**：现网只有两个容器，人一眼看得过来；先把真相做对，读者等有需求再加。
+  判据是 `#404` 结案评论里那三条触发条件，不是"以后再说"。
+- ⚠ **两个 workflow 文件不在本 PR 里**，不是忘了：本机 `gh` 用的是 OAuth App token，scopes 只有
+  `gist, read:org, repo`，GitHub 直接拒绝无 `workflow` scope 的推送（`refusing to allow an OAuth App to
+  create or update workflow`）。release 的 build-args 与 CI 的 tripwire 以补丁形式挂在 PR 评论里，
+  等有 `workflow` scope 的凭据（或本人）再推。**在它落地之前**：`revision` / OCI label 会是 `unknown`
+  （`station_version` / `engine_version` 仍是真值，因为它们从镜像内文件读，不依赖 ARG），
+  而"版本没烘进去"这件事暂时**没有自动检查**——就是上面反复强调的"第三问：谁在检查"仍然空着。
+
+### 8.71 #412④：隔离跑的宿主写路径必须**逐条证明与共享栈不相等**，"有没有设"不是判据（2026-10-26，分支 `fix-261026-07-host-write-paths`）
+
+先纠正我自己写进 #412 的一句话：原以为病根是"compose 里 `${TRAEFIK_DYNAMIC_DIR_HOST:-默认}` 这个不安全默认值"。
+**不对**：那个默认值是相对路径 `./traefik/dynamic`，而我今晚覆掉生产配置时它**有值**——值是
+`--env-file deploy/.env` 从生产 `.env` 里带进来的（`/docker/station-edge/dynamic`）。所以改成必填挡不住：
+`--env-file` 永远会填上。缺的不是"设没设"，是**"这个值是不是我这套栈的"**。
+
+判据因此做成"**与共享 `.env` 的值逐条不相等**"：`assertHostWritePathsIsolated({env, envFile})` 读
+`deploy/.env`（缺文件则只判绝对路径），对四条宿主写路径逐一比对——
+
+| env | 写错会怎样 | 现网生产值 |
+|---|---|---|
+| `TRAEFIK_DYNAMIC_DIR_HOST` | **直接改写生产边缘的路由文件**（今晚 502 就是这个） | `/docker/station-edge/dynamic` |
+| `ERIX_USERSPACE_ROOT_HOST` | 隔离用户目录落进生产 userspace | `/docker/erix/users` |
+| `ERIX_ARTIFACTS_ROOT_HOST` | run 产物混进生产 | `/docker/erix/artifacts` |
+| `STATION_DB_DIR` | 两个实例开同一份数据文件 | `/docker/station-db` |
+
+未设置也算命中（未设置 ⇒ compose 用默认值或 env-file 的值，两种都不是"我这套栈的目录"）。
+拿真实生产 `.env` 实测：原样使用四个值 ⇒ 直接拒；换 `/tmp/*` ⇒ 放行。
+
+两个刻意的形状，别改回去：
+
+- **这条判据不挂在 `assertIsolatedEnvironment` 里**。各脚本只在 `compose('up', extraEnv)` 传这三个
+  `ERIX_*` 路径，`process.env` 里常常没有 ⇒ 挂总断言会误伤所有老脚本，而"判错方向"比不判更糟。
+  规则是**谁 `up` 栈谁调**，传 `{...process.env, ...extraEnv}`。本 PR 先接 `wp3b`（我手工起栈踩过的那条路）。
+- 没动 compose 的默认值。改成 `:?` 只是把"静默用共享目录"换成"另一种静默"，还会让
+  `docker compose config` 这类无 env 的解析场景一起炸——收益低、面大。**先修判据，默认值的事另议**。
+
+另外记一条排障口径：**"容器全 healthy" 不能证明系统没事**。今晚 502 的时候 `docker ps` 六个容器
+全 `Up (healthy)`、portal 直连正常，坏的是配置**内容**。判入口要打到真入口：
+`curl -o /dev/null -w '%{http_code}' http://station.vc.cn-ai.vip:8090/`，以及 `/api/sessions` 期望 401。

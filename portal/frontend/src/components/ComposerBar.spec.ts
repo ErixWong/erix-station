@@ -29,11 +29,15 @@ describe('ComposerBar · i18n（issue #101 P2）', () => {
     expect(wrapper.text()).not.toContain('停止');
   });
 
-  it('运行中：显示「■ 停止」按钮', async () => {
+  // issue #370 改了本例断言（原为 `['发送', '■ 停止']`）：运行中发送键分裂成「转向 / 排队」两个
+  // 动作，停止键照旧。判据用 `data-queued-kind` 而不是只比文案——文案会随翻译变，而「运行中有且
+  // 只有这两个发送动作、且 idle 态那个键不存在」是本工单的行为契约。
+  it('运行中：发送键分裂为「转向 / 排队」，并显示「■ 停止」', async () => {
     const { store, wrapper } = setup();
     store.es.activeRunId = 'r1';
     await flushPromises();
-    expect(wrapper.findAll('button').map((b) => b.text())).toEqual(['发送', '■ 停止']);
+    expect(wrapper.findAll('button').map((b) => b.text())).toEqual(['转向', '排队', '■ 停止']);
+    expect(wrapper.find('[data-queued-kind="send"]').exists()).toBe(false);
   });
 
   it('无目录：占位符引导建目录 + 输入框禁用', async () => {
@@ -54,9 +58,58 @@ describe('ComposerBar · i18n（issue #101 P2）', () => {
     await flushPromises();
     setLocale('en');
     await flushPromises();
+    // 断言被 issue #370 改掉：运行中的占位符与发送键都是新三态之一（见 ComposerBar.vue 的双按钮）。
     expect(wrapper.get('textarea').attributes('placeholder'))
-      .toBe('Type a task, Enter to send (Shift+Enter for a newline)');
-    expect(wrapper.findAll('button').map((b) => b.text())).toEqual(['Send', '■ Stop']);
+      .toBe('Type while it runs — Enter steers, Option/Alt+Enter queues');
+    expect(wrapper.findAll('button').map((b) => b.text())).toEqual(['Steer', 'Queue', '■ Stop']);
+  });
+
+  // issue #370：三个发送动作的分派。判据是「点了之后 store 收到哪个 action」——
+  // 界面文案会变，而「运行中 Enter=转向 / Alt+Enter=排队 / 空闲 Enter=直发」是本工单的行为契约。
+  describe('issue #370：运行中说话的动作分派', () => {
+    it('运行中点「转向」→ sendQueued("steer")，点「排队」→ sendQueued("follow_up")', async () => {
+      const { store, wrapper } = setup();
+      const spy = vi.spyOn(store, 'sendQueued').mockImplementation(async () => {});
+      const sendSpy = vi.spyOn(store, 'send').mockImplementation(async () => {});
+      store.es.activeRunId = 'r1';
+      store.inputValue = '慢一点';
+      await flushPromises();
+      await wrapper.get('[data-queued-kind="steer"]').trigger('click');
+      await wrapper.get('[data-queued-kind="follow_up"]').trigger('click');
+      expect(spy.mock.calls.map((c) => c[0])).toEqual(['steer', 'follow_up']);
+      expect(sendSpy).not.toHaveBeenCalled(); // 运行中绝不再走直发路
+    });
+
+    it('运行中 Enter=转向、Alt+Enter=排队、Shift+Enter 交回原生换行', async () => {
+      const { store, wrapper } = setup();
+      const spy = vi.spyOn(store, 'sendQueued').mockImplementation(async () => {});
+      store.es.activeRunId = 'r1';
+      await flushPromises();
+      const ta = wrapper.get('textarea');
+      await ta.trigger('keydown', { key: 'Enter' });
+      await ta.trigger('keydown', { key: 'Enter', altKey: true });
+      await ta.trigger('keydown', { key: 'Enter', shiftKey: true });
+      expect(spy.mock.calls.map((c) => c[0])).toEqual(['steer', 'follow_up']);
+    });
+
+    it('空闲时仍是单发送键，Enter 走 send()（队列不许改变无 run 时的行为）', async () => {
+      const { store, wrapper } = setup();
+      const spy = vi.spyOn(store, 'sendQueued').mockImplementation(async () => {});
+      const sendSpy = vi.spyOn(store, 'send').mockImplementation(async () => {});
+      await wrapper.get('textarea').trigger('keydown', { key: 'Enter' });
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(spy).not.toHaveBeenCalled();
+      expect(wrapper.find('[data-queued-kind="steer"]').exists()).toBe(false);
+    });
+
+    it('空输入时两个键都禁用（队列不许让空白提交溜过去）', async () => {
+      const { store, wrapper } = setup();
+      store.es.activeRunId = 'r1';
+      store.inputValue = '   ';
+      await flushPromises();
+      expect((wrapper.get('[data-queued-kind="steer"]').element as HTMLButtonElement).disabled).toBe(true);
+      expect((wrapper.get('[data-queued-kind="follow_up"]').element as HTMLButtonElement).disabled).toBe(true);
+    });
   });
 
   it('切 English 后无目录占位符同样变英文（store 计算属性响应式）', async () => {

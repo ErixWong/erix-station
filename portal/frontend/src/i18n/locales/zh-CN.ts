@@ -182,6 +182,15 @@ export const zhCN = {
       range: '已压缩第 {from}–{to} 轮',
       countOnly: '已压缩 {count} 条消息',
       bare: '已压缩',
+      // D 片（issue #392）：可见性说明。标题只回答「压缩了什么」，这一行回答「现在谁看不见它」——
+      // 折叠之后原文对模型不再逐字可见，只剩摘要；而「有没有摘要」直接决定这句话是安慰还是空头
+      // 支票，所以必须两态。`hasSummary` **键缺席**（旧 DTO）⇒ 整行不渲染，延续 #390-A「键缺席=不知道」
+      // 那一条纪律：宁可不说，也不拿旧数据凭空断言「这次没摘要」。轮数只在有 `foldedRoundRange` 时报；
+      // 拿 `foldedPayloadMessages` 报轮数是 #375 已经定过性的假话（那玩样儿是归档条数）。
+      visibility: '这 {n} 轮原文对模型已不再逐字可见；下面这份摘要就是它留下的全部。',
+      visibilityNoSummary: '这 {n} 轮原文对模型已不再逐字可见；本次没有生成摘要，要看原文请点「查看原文」。',
+      visibilityBare: '这部分原文对模型已不再逐字可见；下面这份摘要就是它留下的全部。',
+      visibilityNoSummaryBare: '这部分原文对模型已不再逐字可见；本次没有生成摘要，要看原文请点「查看原文」。',
       viewOriginal: '查看原文',
       // #388：原文块自己的收起入口（只隐藏、不清缓存，再展开不重发）
       collapseOriginal: '收起原文',
@@ -281,7 +290,10 @@ export const zhCN = {
       judgeDegraded: '评审降级（{error}），本轮未给出意见',
       judgeUnknownAction: '评审动作：{action}',
       judgeNoDetail: '评审事件（无可解读细节）',
-      compaction: '上下文折叠（round {round}）：{folded} 轮折叠，{before} → {after} tokens',
+      compaction: '上下文折叠（round {round}，策略 {strategy}）：{folded} 轮折叠，{before} → {after} tokens',
+      // #464 A：策略名是引擎写实例上的那个名字（含库层兜底 `sliding-window`），不是配置项原文；
+      // 旧事件没这个字段 ⇒ 拿它填一个显式的「未知」，而不是留空让人以为「策略叫不出名字」。
+      compactionStrategyUnknown: '未知',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',
       runEnd: 'run 结束：{reason}{usage}',
@@ -365,6 +377,36 @@ export const zhCN = {
     stop: '■ 停止',
     // issue #261B：上一条发送以失败终局收场时的一键重发（仅输入框为空 + 无活跃 run 时可见）。
     retry: '重试上一条',
+    // issue #370：运行中说话的两个动作。命名纪律：叫「转向」不叫「打断并转向」——语义与 pi 的
+    // steer 完全一致（当前轮工具调用跑完、下一次 LLM 调用之前停下），但 5 个字会在用户最需要
+    // 按下它的那一刻把人吓住（理由全文见 docs/portal.md §4.3a）。
+    placeholderRunning: '运行中也能说话：Enter 转向，Alt+Enter 排队',
+    steer: '转向',
+    steerHint: '当前这一轮跑完就停下来，用这句话继续（正在执行的工具会先跑完）· Enter',
+    followUp: '排队',
+    followUpHint: '等当前任务正常结束后，按顺序把这句话发出去 · Alt+Enter',
+    hintEnterSend: '发送',
+    hintEnterSteer: '转向',
+    hintAltFollowUp: '排队',
+    hintShiftNewline: '换行',
+    hintSlash: '查看命令',
+    hintAt: '引用文件',
+  },
+  // issue #370：待发送输入队列条（components/QueuedInputsBar.vue）
+  queued: {
+    count: '{n} 条待发送',
+    steerCount: '{n} 条转向',
+    followUpCount: '{n} 条排队',
+    expand: '展开',
+    collapse: '收起',
+    recall: '全部取回',
+    recallHint: '把队列里的话全部取回输入框（取回的文在前、已打的草稿在后）',
+    // 暂停投递的原因（`queue_update.blocked`）。键名即服务端的机器码，拼成 `queued.blocked.<code>`
+    // ——**服务端发码、前端出话**（#294：不在 SSE 里塞成人话）。
+    blocked: {
+      container_not_running: '容器未运行，队列暂停投递（容器起来后自动继续）',
+      deliver_failed: '上次投递没成功，队列已暂停，可取回后重发',
+    },
   },
   // 会话浏览 modal（components/SessionPickerModal.vue）
   picker: {

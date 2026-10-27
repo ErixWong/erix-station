@@ -14,6 +14,7 @@
 // worktree 生命周期不变（D8 执行隔离物，照旧随 run 回收）；终态产物（issue #64 R1）由 agentd 在
 // archiveRunData 之前捕获上传（runner/lib/artifacts.js），归档不拦截产物回收。
 // 抽成独立模块：agentd.js 导入即用的同时可被单测直接驱动（agentd.js 顶层有 main() 副作用）。
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -37,6 +38,45 @@ export function prepareRunDataDir(home, runId, { workerUid, workerGid }) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o775 });
   runAsWorker(NOTES_DIR_HELPER, [path.join(dir, 'notes')], { workerUid, workerGid });
   return dir;
+}
+
+// ---------------------------------------------------------------------------
+// 会话级 notes 目录（issue #392 B 片：notes 作用域从 logical-run 抬到**会话**）
+// ---------------------------------------------------------------------------
+//
+//   <home>/sessions/<sessionId>/notes/    会话真相层：与会话同命，跨该会话的**每一个** run 可见。
+//
+// 三条刻意的形状：
+//  ① **不放进 `runs/<runId>/`**：那条目录在 run 终态被 `archiveRunData` 整体 rename 进
+//     `runs-archive/`（本文件 :158 起）。notes 若挂在里面，就会跟着 run 一起搬走 —— 而"下个 run
+//     看不见上一个 run 的笔记"正是本片要治的病，换个位置复演一次而已。
+//  ② 目录所有权照旧归 worker：`NOTES_DIR_HELPER` 全套复用（file store 每次写都 chmod 0700，
+//     属主不是 worker UID 就 EPERM；真机踩过，见下面 helper 上方的注释）。
+//  ③ `sessionId` 落盘前收敛：这一层直接进文件路径，而 sessionId 是从 portal 下行拿的
+//     （本站自己生成 UUID，但**下行面不当可信输入**）。非法形态退化成 `sess-h-<sha256 前 24>`，
+//     与引擎 `store/notes-port.js` 把非法 scopeRef 收敛成 `run-h-<sha…>` 同一口径 —— 两边都不是
+//     "校验失败就抛"，因为丢了笔记比换个目录名糟得多。
+//
+// ⚠ 已知代价（不藏）：`sessions/` 不在现成两条 sweep（`runs/` 24h、`runs-archive/` 168h）覆盖里
+//   ⇒ 会话笔记目前**不会**被物理清扫（单会话几条 JSON，量级 KB；引擎侧 `purge({before})` 是现成
+//   出口）。将来接 TTL 要接在会话生命周期那一侧（portal 删会话时连带删目录），不要接在 run sweep 上。
+export function safeSessionScope(sessionId) {
+  const raw = String(sessionId ?? '');
+  // 白名单 + 长度上界：`..`、`/`、空串、超长全部走哈希支（哈希支自己保证安全且稳定）。
+  if (/^[A-Za-z0-9._-]{1,128}$/.test(raw) && !raw.includes('..')) return raw;
+  return `sess-h-${createHash('sha256').update(raw).digest('hex').slice(0, 24)}`;
+}
+
+export function sessionNotesDir(home, sessionId) {
+  return path.join(home, 'sessions', safeSessionScope(sessionId), 'notes');
+}
+
+/** 备好会话 notes 目录（父目录 agentd 所有、叶子 worker 所有），返回可直接下行的 notes_dir。 */
+export function prepareSessionNotesDir(home, sessionId, { workerUid, workerGid }) {
+  const notes = sessionNotesDir(home, sessionId);
+  fs.mkdirSync(path.dirname(notes), { recursive: true, mode: 0o775 });
+  runAsWorker(NOTES_DIR_HELPER, [notes], { workerUid, workerGid });
+  return notes;
 }
 
 // ---------------------------------------------------------------------------

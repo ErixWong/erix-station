@@ -21,9 +21,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
+import { readBuildInfo } from './lib/build-info.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
-import { archiveRunData, prepareRunDataDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
+import { archiveRunData, prepareRunDataDir, prepareSessionNotesDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
 // 端口呈现优化·观测层 MVP（迁移 0022）：/proc 采样当前真实监听，随 U4 heartbeat 捐带 `listeners`。
 // 只读展示用途，不做管控（#246 不变式）；采样失败只报空数组，绝不拖死心跳。
@@ -41,7 +42,11 @@ const CFG = {
   token: process.env.ERIX_STATION_TOKEN || '',
   baseUrl: (process.env.ERIX_STATION_BASE_URL || 'https://station.localhost/api/internal').replace(/\/+$/, ''),
   fdeName: process.env.ERIX_FDE_NAME || 'unknown',
-  agentVersion: process.env.ERIX_AGENT_VERSION || '0.1.0',
+  // issue #404 结案：版本是**构建产物**，不是 env 兜底。原先这里是
+  // `process.env.ERIX_AGENT_VERSION || '0.1.0'`，而那个 env **从来没被任何地方设过**
+  // （provisioner / Dockerfile / compose 全无）⇒ 每次心跳都在报 `'0.1.0'` 这个假值。
+  // 现在读镜像里烘的 build-info.json（见 Dockerfile），拿不到就是 `unknown`，不再猜一个像样的版本。
+  ...(() => { const b = readBuildInfo(); return { agentVersion: b.agentVersion, runnerVersion: b.runnerVersion, buildRevision: b.revision, buildInfoSource: b.source }; })(),
   homeUser: process.env.FDE_CONTAINER_USER || 'erix',
   home: process.env.FDE_HOME || `/home/${process.env.FDE_CONTAINER_USER || 'erix'}`,
   workerUid: Number(process.env.FDE_WORKER_UID || process.env.ERIX_WORKER_UID || 1002),
@@ -332,6 +337,20 @@ function handleSseChunk(raw) {
     if (ctx) abortRun(ctx, 'stop_request');
     return;
   }
+  // #370：转向下行。**不走 abortRun**——那会起 5s SIGKILL 宽限并砍掉正在跑的工具，正是本轮边界
+  // 停止要避免的事（口径见 lib/ipc.js MSG.STEER_ARM 的注释）。找不到 ctx = 该 run 不在本容器跑
+  // （已结束/别的容器），忽略即可：portal 侧的队列不因此丢失，终态出队会把它投成新 run。
+  if (event === 'steer_request') {
+    const runId = payload?.run_id;
+    const ctx = runId ? state.runs.get(runId) : null;
+    if (ctx?.worker?.connected) {
+      sendIpc(ctx.worker, { type: MSG.STEER_ARM, run_id: runId });
+      log('info', 'steer armed', { run_id: runId });
+    } else {
+      log('debug', 'steer_request ignored (no live worker)', { run_id: runId });
+    }
+    return;
+  }
   if (event === 'revoke') {
     log('warn', 'revoke received', { reason: payload?.reason ?? 'revoked' });
     beginRevoke(payload?.reason ?? 'revoked');
@@ -418,7 +437,15 @@ async function heartbeatOnce() {
   let listeners = [];
   try { listeners = collectListeners({ procPath: CFG.procPath, home: CFG.home }); } catch { listeners = []; }
   const r = await internalRequest('POST', '/heartbeat', {
-    body: { agent_version: CFG.agentVersion, runs, listeners },
+    // agent_version = 引擎（erix-agent）版本，口径见 docs/api/portal.md U4；runner 自身版本与构建
+    // revision 各占一个字段（旧 portal 不认识会忽略，见上一行注释的同一约定）。
+    body: {
+      agent_version: CFG.agentVersion,
+      runner_version: CFG.runnerVersion,
+      build_revision: CFG.buildRevision,
+      runs,
+      listeners,
+    },
   });
   return r.data;
 }
@@ -1268,6 +1295,20 @@ async function handleTicket(ticket) {
     return;
   }
 
+  // issue #392（B 片）：会话 notes 目录（与 run 数据目录并列的**第二条**准备路径，两种语义：
+  // run 级目录随终态归档、会话级目录与会话同命）。失败只降级不 requeue，理由见下面下行处注释。
+  ctx.notesDir = null;
+  if (typeof run.session_id === 'string' && run.session_id.length > 0) {
+    try {
+      ctx.notesDir = prepareSessionNotesDir(CFG.home, run.session_id, {
+        workerUid: CFG.workerUid, workerGid: CFG.workerGid,
+      });
+    } catch (err) {
+      log('warn', 'session notes dir prep failed, fall back to run-scoped notes',
+        { run_id: runId, err: String(err?.message ?? err) });
+    }
+  }
+
   // 先 PUT running（§6.1：准备就绪后）。worker 内部 runToolLoop 也会 markRunState('running')，幂等。
   try {
     await internalRequest('PUT', `/runs/${runId}/state`, { body: { state: 'running' }, claimToken: ctx.claimToken });
@@ -1293,8 +1334,12 @@ async function handleTicket(ticket) {
     attachments: Array.isArray(run.attachments) ? run.attachments : [],
     // P3 PR③（issue #69 下行退役）：ticket 无 `history`、RUN_START 也不再透传——会话上下文
     // 唯一来源 = transcript resume（conversation-state.md §6 契约③）。
-    // issue #46：notesDir 下行（run 数据目录内，logical-run 作用域；worker 不再自推工作区路径）。
-    notes_dir: path.join(ctx.runDataPath, 'notes'),
+    // issue #46 → #392（B 片）：notesDir 下行。**作用域 = 会话**（`<home>/sessions/<sessionId>/notes`），
+    // 不再随 run 终态归档搬走 ⇒ 同一会话的下一个 run 看得见上一个 run 写的笔记（旧语义下
+    // `scopeRef=runId`，而本站一条用户消息就是一个 run ⇒ 笔记天然无效）。
+    // 无 session_id（无本子的工单/旧下行）⇒ 逐字退回旧的 run 级目录。会话目录备不出来时
+    // **降级到 run 级 + warn**，不因此把 run 打死（笔记是加分项，`run_data_failed` 那种崩法不适用于它）。
+    notes_dir: ctx.notesDir ?? path.join(ctx.runDataPath, 'notes'),
     config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
     // issue #38 Phase B2：模型快照，run 边界生效——此处取的是 **run 启动瞬间**的 state.llmModels，
     // 之后心跳刷新 state.llmModels 不影响本 run（进行中 run 的模型名在其生命周期内锁定）。

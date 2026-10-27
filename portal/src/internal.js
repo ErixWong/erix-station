@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
+import { snapshotQueuedInputs, drainAfterRunTerminal } from './queued-inputs.js'; // #370
 import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
@@ -385,6 +386,67 @@ export function broadcastStopRequest(userId, data) {
   }
 }
 
+/**
+ * #370：转向下行快通道 `steer_request`（portal.md §9.12）。
+ * 与 `stop_request` 的**语义差别是本题的核心**：stop = 「现在就砍」（worker 走 abort 路径、
+ * 正在跑的工具进进程组 SIGKILL）；steer = 「**本轮跑完再停**」——agentd 只给 worker 装一个标记，
+ * worker 在 erix-agent 的 `onRound`（本轮已落库、下一次 provider 调用之前）里自己 abort。
+ * 于是投递点与 pi 的 steer 定义重合（*after the current assistant turn finishes executing its
+ * tool calls, before the next LLM call*）。⇒ agentd 收到它**绝不得**直接 abort。
+ */
+export function broadcastSteerRequest(userId, data) {
+  for (const client of sseClients.values()) {
+    if (client.userId === userId) writeSseEvent(client.res, 'steer_request', data);
+  }
+}
+
+/** 队列快照 + 推送一步到位（终态出队与各终态产出点用；`blocked` 见 portal.md §5.3）。 */
+export async function notifyQueueUpdateForSession(pool, sessionId, blocked = null, deliveredRunId = null) {
+  const rows = await snapshotQueuedInputs(pool, sessionId);
+  notifyQueueUpdate(sessionId, rows, blocked, deliveredRunId);
+}
+
+/**
+ * #370：**终态出队的统一调用点**。run 进终态后试着投一条队列输入。
+ * best-effort 是硬要求：投递失败（LLM 没绑、容器没了、会话被归档）绝不得把 U2/U12/reaper 的
+ * 终态响应弄成 5xx —— 那会让 worker 以为「终态没记上」而重试上报，把一次投递失败放大成 run 卡死。
+ */
+export async function drainQueueAfterRun(pool, runId, log = console) {
+  try {
+    return await drainAfterRunTerminal(pool, {
+      runId,
+      log,
+      deps: {
+        notifyRunEnqueued: ({ runId: newRunId, userId }) => notifyRunEnqueued(userId, { run_id: newRunId }),
+        notifyQueueUpdate: (sessionId, blocked = null, deliveredRunId = null) =>
+          notifyQueueUpdateForSession(pool, sessionId, blocked, deliveredRunId),
+      },
+    });
+  } catch (err) {
+    log.warn?.(`queued_inputs: 终态出队失败 run=${runId}：${err?.message ?? err}`);
+    return null;
+  }
+}
+
+/**
+ * #370：队列快照推送（`queue_update`，portal.md §5.3 第 16 类）。
+ * **不落 run_events**：入队时根本没有 run（信封 `run_id NOT NULL`），且队列是**状态**不是**历史**
+ * ——真相在 `queued_inputs`，快照可由 `GET /api/sessions/:id` 全量重建（不变式 3）。⇒ 它不进
+ * `HISTORY_EVENT_TYPES` / `HISTORY_REPLAY_TYPES`，**刷新后靠会话详情补齐，不靠 SSE 回放**。
+ * 载荷两个数组恒为**全量**队列（pi `json.md` 的 `queue_update` 同口径，不是增量）。
+ */
+export function notifyQueueUpdate(sessionId, rows, blocked = null, deliveredRunId = null) {
+  const steering = rows.steering ?? [];
+  const followUp = rows.follow_up ?? [];
+  notifySessionEvents(sessionId, [{
+    seq: null, ts: new Date().toISOString(), run_id: null, type: 'queue_update',
+    // `delivered_run_id`：这一帧存在的原因是「刚投出去一条 ⇒ 起了一个新 run」。前端只有经 POST
+    // 响应或会话详情才知道活跃 run，队列投递两个都不经过 ⇒ 不带这个字段，界面就会在「旧 run
+    // 已终态、新 run 在跑」时显示空闲（而新 run 那条 run_end 因 `isCurrent` 判假被整条丢掉）。
+    payload: { steering, follow_up: followUp, blocked, delivered_run_id: deliveredRunId },
+  }]);
+}
+
 export function broadcastApprovalDecision(userId, data) {
   for (const client of sseClients.values()) {
     if (client.userId === userId) writeSseEvent(client.res, 'approval_decision', data);
@@ -677,7 +739,7 @@ async function terminalPayloadMatches(pool, run, body) {
 }
 
 /** 终态收敛事务（runner §7.6 加锁顺序：锁 run → 校验租约 → 写终态 → queue 收敛 → messages/usage/run_end）。 */
-async function finishRun(pool, { user, runId, claimToken, state, body, config }) {
+async function finishRun(pool, { user, runId, claimToken, state, body, config, log = console }) {
   const termination = body.termination;
   const usage = body.usage;
   const rounds = body.rounds;
@@ -793,6 +855,9 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config })
     try {
       scheduleAutoTitle(pool, { sessionId: r.session_id, runId, notify: notifySessionEvents, config });
     } catch { /* 评估调度失败不影响终态响应 */ }
+    // #370：run 终态 ⇒ 试着投一条输入队列。放在 COMMIT 之后（`drainQueuedInputs` 会另开事务并
+    // 锁 chat_sessions，同事务内调它就是自锁）；判定表在 queued-inputs.js 一处，五处终态共用。
+    await drainQueueAfterRun(pool, runId, log);
     await audit(pool, { actorId: user.id, action: 'run.finish', target: runId, details: { state, queue_status: queueStatus } }).catch(() => {});
     return { state, queue_status: queueStatus, run_end_seq: runEndSeq };
   } catch (err) {
@@ -966,6 +1031,26 @@ export async function heartbeat(pool, { container, user, body, llmGateway = null
       WHERE id = $1`,
     [container.id],
   );
+
+  // issue #404 结案：`agent_version` 从此是**构建产物**的落账点。body.agent_version 由 agentd 从
+  // 镜像里烘的 build-info.json 读（runner/lib/build-info.js），不再是运维在 .env 里手写的静态值——
+  // 那个值曾是 `0.1.32-088e41e`，而容器早就换过两版，且**重建也不会修正它**（重建路径写的还是同一个 env）。
+  // 三条口径：
+  //   - 空/缺/非字符串 ⇒ 不写（旧 agentd 或读不到版本时，保持上一次的真值，不拿 unknown 去覆盖）；
+  //   - `IS DISTINCT FROM` ⇒ 同值不写，否则 15s 一次的心跳会把 `updated_at` 刷成噪音
+  //     （"这行什么时候真变过"就是这个字段的全部价值）；
+  //   - 截断到 64 ⇒ 与列宽一致，别让一个超长 tag 把心跳打成 500。
+  const reported = typeof body?.agent_version === 'string' && body.agent_version.trim() !== ''
+    ? body.agent_version.trim().slice(0, 64)
+    : null;
+  if (reported !== null) {
+    await pool.query(
+      `UPDATE containers
+          SET agent_version = $2, updated_at = now()
+        WHERE id = $1 AND agent_version IS DISTINCT FROM $2`,
+      [container.id, reported],
+    );
+  }
 
   const now = new Date();
   const results = [];
@@ -1878,6 +1963,12 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
     await client.query('COMMIT');
     try {
       if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
+      // #370：这一支写了终态（cancelled / attempts 耗尽）⇒ 试着投一条输入队列。
+      // 只在真的写了 run_end 时投：requeue 那一支 run 还活着，投了会撞「同会话同时两个活跃 run」。
+      // ⚠ 不传 log：`releaseRun` / `reapExpiredRuns` 的作用域里没有 `log` 这个绑定
+      // （只有 `finishRun` 新加了），传了就是 ReferenceError——而它被 best-effort 的 try 包着，
+      // 表现会是「出队静默不发生」，比崩更难查。用默认 console。
+      if (committedRunEnd) await drainQueueAfterRun(pool, runId);
       // issue #288：`attempt_killed` 与合成 `run_end` 同级：落库后实时推一把，与刷新后的历史回放同形状。
       if (committedAttemptKilled) notifySessionEvents(committedAttemptKilled.session_id, [{ seq: committedAttemptKilled.seq, ts: new Date().toISOString(), run_id: runId, type: 'attempt_killed', payload: committedAttemptKilled.payload }]);
     } catch { /* 尽力推送 */ }
@@ -2044,6 +2135,12 @@ export async function reapExpiredRuns(pool) {
       await client.query('COMMIT');
       try {
         if (committedRunEnd) notifySessionEvents(committedRunEnd.session_id, [{ seq: committedRunEnd.seq, ts: new Date().toISOString(), run_id: runId, type: 'run_end', payload: committedRunEnd.payload }]);
+      // #370：这一支写了终态（cancelled / attempts 耗尽）⇒ 试着投一条输入队列。
+      // 只在真的写了 run_end 时投：requeue 那一支 run 还活着，投了会撞「同会话同时两个活跃 run」。
+      // ⚠ 不传 log：`releaseRun` / `reapExpiredRuns` 的作用域里没有 `log` 这个绑定
+      // （只有 `finishRun` 新加了），传了就是 ReferenceError——而它被 best-effort 的 try 包着，
+      // 表现会是「出队静默不发生」，比崩更难查。用默认 console。
+      if (committedRunEnd) await drainQueueAfterRun(pool, runId);
         // issue #292：`attempt_killed` 与合成 `run_end` 同级——落库后实时推一把，与刷新后的历史回放同形状
         // （该类型已在 §4.4a 回放白名单与前端 HISTORY_REPLAY_TYPES 里，两面可见性必须一致）。
         if (committedAttemptKilled) notifySessionEvents(committedAttemptKilled.session_id, [{ seq: committedAttemptKilled.seq, ts: new Date().toISOString(), run_id: runId, type: 'attempt_killed', payload: committedAttemptKilled.payload }]);

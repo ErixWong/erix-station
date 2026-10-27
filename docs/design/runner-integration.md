@@ -150,7 +150,7 @@ FDE 容器（不 publish 任何端口；仅接自己的 `fde-<name>` `/29` 网�
 | U1 | `POST /api/internal/claim` | **领任务（长轮询）** | `{capacity, hold_ms}`（hold 上限 30s ⚠️） | `200 {ticket}` 或 `204`（hold 超时无任务） | lease + `claim_token`（见下） |
 | U2 | `PUT /api/internal/runs/:id/state` | `markRunState("running")` 的 run 生命周期信号；worker 结束后的宿主终态收敛 | `{state: "running"}` 或宿主终态 `{state: "finished"\|"failed", termination, usage, rounds, final_text, error?}` | `200` | 终态写入幂等（终态不可变，重复提交返回首次结果） |
 | U3 | `POST /api/internal/runs/:id/events` | **事件批量上报** | `{batch_id, events: [{client_event_id, type, ts, payload}]}` | `200 {stored, seq_first, seq_last}` | `client_event_id` 唯一（§7.3） |
-| U4 | `POST /api/internal/heartbeat` | 心跳 + 租约续期 + stop 兜底轮询 | `{agent_version, runs: [{run_id, status, worker_pid, claim_token}], listeners?: [{port, pid, cwd, cmd, branch, started_at}]}`（`listeners` = 观测层 MVP 的 additive 字段，缺省 = 旧 agentd、不碰 `port_observations`，语义见 §4.2） | `200 {now, stop_run_ids: [], revoked: false, runs: [{run_id, lease}]}`（部分失败；`revoked` 字段保留但恒 false——吊销走鉴权阶段 `401 token_revoked`，见 §4.2） | 天然幂等（覆盖写 `last_heartbeat`、续 lease；逐 run 按 claim_token fencing；listeners 整批替换） |
+| U4 | `POST /api/internal/heartbeat` | 心跳 + 租约续期 + stop 兜底轮询 | `{agent_version, runner_version?, build_revision?, runs: [{run_id, status, worker_pid, claim_token}], listeners?: [{port, pid, cwd, cmd, branch, started_at}]}`（`listeners` = 观测层 MVP 的 additive 字段，缺省 = 旧 agentd、不碰 `port_observations`，语义见 §4.2） | `200 {now, stop_run_ids: [], revoked: false, runs: [{run_id, lease}]}`（部分失败；`revoked` 字段保留但恒 false——吊销走鉴权阶段 `401 token_revoked`，见 §4.2） | 天然幂等（覆盖写 `last_heartbeat`、续 lease；逐 run 按 claim_token fencing；listeners 整批替换） |
 | U5 | `PUT /api/internal/runs/:id/transcript/rounds/:round` | store：`appendRound` | RoundRecord（含 `dedupKey`、`folded`、`messages`、`foldedPayload`） | `200 {inserted: bool}` | `UNIQUE(run_id, round)` + dedupKey（§9.3） |
 | U6 | `GET /api/internal/runs/:id/transcript` | store：`load` | — | `200 {records: [...]}` | 只读 |
 | U7 | `GET /api/internal/runs/:id/transcript/recall` | store：`recall` | query：`from_round` / `to_round` / `pattern` | `200 {text}` | 只读 |
@@ -190,7 +190,9 @@ agentd                          portal
 
   ```json
   {
-    "agent_version": "0.1.0",
+    "agent_version": "0.26.0",
+    "runner_version": "0.1.41",
+    "build_revision": "<git sha | unknown>",
     "runs": [
       { "run_id": "9d3b2f1e-...", "status": "running", "worker_pid": 1234, "claim_token": "ct_3f8a..." }
     ],
@@ -237,6 +239,7 @@ agentd                          portal
 | `run_assigned` | `{run_id, queue_id}` | **唤醒 hint**：有新任务可领。**不携带权威载荷**（载荷以 claim 响应为准）——hint 到达时任务可能已被其他 capacity 领走，agentd 必须容忍 | 若当前 claim 处于 hold 间隙则立即发起 claim |
 | `approval_decision` | `{approval_id, run_id, decision, note, decided_at}` | 审批结果**快通道** | resolve 对应 worker 的 await（§10） |
 | `stop_request` | `{run_id, reason}` | portal 已写 `cancel_requested_at`（portal.md §4.5），要求终止 | IPC `abort` → worker；若无此 run（已结束）忽略 |
+| `steer_request` | `{run_id}` | **转向请求**（issue #370，portal.md §4.3a）：那句话已进 `queued_inputs`，portal 已给该 run 打 `cancel_requested_at` 但 **`runs.status` 仍是 `running`** | IPC `steer_arm` → worker **装标记**（**不发 `abort`、不起 SIGKILL 宽限**，见 §5 与 §6.3-9）；无此 run 或 worker 已退 ⇒ 忽略（队列仍在 DB，终态出队会把它投成新 run） |
 | `revoke` | `{reason}` | token 吊销 / 容器停用 | 停领新任务；**abort 全部在跑 run**（worker 收敛）后退出——三个信号源（SSE revoke / claim 401 / heartbeat 401 token_revoked）同径（issue #22 beginRevoke） |
 | `ping` | `{ts}` | 15s 保活（也可作 SSE 注释行） | 更新「下行健康」标记；连续丢失触发重连 |
 
@@ -283,6 +286,7 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 | `approval_request` | worker→agentd | `{req_id, run_id, tool_call_id, round, name, input_digest}` | `executeTool` 包装层发起；worker 挂起等待 |
 | `approval_decision` | agentd→worker | `{req_id, approval_id, decision: "approved"\|"denied", note?}` | resolve worker 的 await；超时/拒绝语义见 §10 |
 | `abort` | agentd→worker | `{run_id, reason}` | 停止指令（SSE `stop_request` 或心跳兜底触发）；worker 调 `AbortController.abort()` |
+| `steer_arm` | agentd→worker | `{run_id}` | **（issue #370）「本轮跑完再停」的标记，不是停止指令**。worker 只置一个布尔，真正 `abort()` 的位置是引擎的 `onRound`（§6.3-9）。**与 `abort` 的区别就是本条存在的全部理由**：`abort` 那条路径 agentd 同时起 5s SIGKILL 宽限并按进程组杀（§2.4），会把正在执行的工具调用砍成残缺；`steer_arm` 不动 `ctx.dropped`、不起宽限、不杀进程组，于是本轮的轮次与 usage 完整。终态信封的 `termination.detail` 补 `'steered'`（**不改 `reason`**，仍 `aborted`）供前端区分展示 |
 | `run_finished` | worker→agentd | `{run_id, ok, termination?, usage?, rounds?, final_text?, error?: {code, message, retryable}}` | `runToolLoop` resolve/reject 后发送；worker 随后自行 `process.exit` |
 | `log` | worker→agentd | `{run_id, level, msg}` | stdout/stderr 转发（agentd 加 run 前缀统一输出，§14） |
 | `shell_liveness` | worker→agentd | `{run_id, phase: "spawn"\|"heartbeat"\|"exit", pgid, command?, elapsed_ms?}` | **（issue #288）宿主内部信号，不是事件**：`spawn`/`exit` 报子命令的进程组 id（shell 工具 `spawn(..., {detached:true})` ⇒ 子命令自成一组，**不在 worker 组里**），agentd 记入本次 attempt 的登记集，在每一条 worker 终止路径（watchdog kill / abort / 退出清理）SIGKILL worker 组**之后**逐个 `-pgid` 补杀（否则常驻命令会跨 attempt 无限累加）；`heartbeat`（默认 30s，`ERIX_SHELL_LIVENESS_MS`）是 shell 执行期零引擎 IPC 期间的保活冒泡，依赖「任意 IPC 刷 `lastIpcAt`」这条既有口径防止 F6 watchdog 误杀真在跑的长命令。**两者都不得进事件通道**（不落 `run_events`、不推 SSE），agentd 侧只 `log('debug', …)` 记账 |
@@ -375,6 +379,12 @@ internal 端点错误信封沿用 portal.md §1.1；下表为本通道特有 cod
 6. **回调**：`onEvent / onDelta / onReasoningDelta / onToolCall / onJudge` 全部桥接到 IPC `event`；**`onUsage` 不产 IPC `event`**——其值随 U2 终态载荷上报（含 usage，§7.6）；`onPersistenceError` 记日志（store 内部已重试，最终失败会以 `checkpoint_failed` 抛出）。**usage 双源去重**：`onEvent` 里的 `usage` 类事件与 `onUsage` 都可能出现 usage——**记账以 `onUsage` 为准**（随 U2 终态载荷 `usage` 上报 → `usage_ledger`，§4.2）；`onEvent` 的 `usage` 类事件仅实时展示、不产生第二条记账。
 7. **signal**：worker 持有 `AbortController`，IPC `abort` 时触发。
 8. **reflection**：显式传（不依赖 `maxRounds>=16` 的默认开启，§1.3 硬注意-3）；`wrapup` 显式传（对话型宿主参照 host-upgrade-guide §1 touwaka 的先例评估 `wrapup: false` ⚠️）。
+8b. **转向（steer）：`onRound` 里 abort，不在别处**（issue #370）。IPC `steer_arm` 只置 `steerArmed = true`；`runToolLoop` 多传一个 `onRound: () => { if (steerArmed && !signal.aborted) abortController.abort(); }`。
+    - **为什么偏偏是 `onRound`**（erix-agent 0.25.0 源码实证；行号请按当天实际安装版本重核）：`onRound` 是**被 `await` 的**，且**在本轮 transcript 落库之后、`round_end` 之前**才响（`src/loop/orchestrator.js:4342`）；而轮循环**圈顶先查一次中止**（`:3722`，PR #291 必修 1 的原文：「本轮已跑完的记录照旧落库，只是不再为它发起下一轮请求」）。一「轮」在本引擎里 = 一次 provider 调用 + 它的工具调用执行 ⇒ 在这里 abort 拿到的正是「当前 assistant 轮的工具调用全部跑完、下一次 LLM 调用之前」，**与 pi 对 steer 投递点的定义逐字重合**（`pi-agent-core` `agent-loop.js` 在每轮工具执行完后 poll `steeringQueue`）。**上游零改动**：不需要 erix-agent 加 input port。
+    - **两条引擎红线**（都踩过坑，别再踩）：① **抛错不是控制流**——#173 起观察者回调抛错只记一笔诊断、run 继续（`onRound` 尤其如此），要停只认 `signal.abort()`；② **不得在 `onRound` 里 park 等下一条输入**冒充 input port——`onRound` 被 await，park 住就静默卡住 run，拿 90s 租约（§6.1）与 F6 静默看门狗（#288 `watchdog_silent`）冒险。所以本回调**同步返回、零 await**（有源码级用例钉住，`portal/test/queued-inputs-wiring.test.js`）。
+    - **每个 run 必须复位标记**：worker 进程被 agentd 复用给下一个 run（再次 `run_start`），`steerArmed` / `steeredThisRun` 漏复位 = 上个 run 的转向把下个 run 也停了。
+    - **终态呈现**：abort 之后引擎上抛 → §6.3-9 的 `buildFailureEnvelope({err, aborted, steered})` 给 `termination` 补 `detail: 'steered'`（**`reason` 仍是 `aborted`，绝不新增 reason**——值域由引擎定义，portal.md §5.3 的向后兼容红线）。前端据此把终态行保持中性并抑制「重试上一条」（用户已经转向了，重试是倒退）。
+    - **⚠ 运维坑**（与 5b / 1b 同型）：本逻辑全在 **worker 进程**里 ⇒ **必须重建 FDE 镜像并 `docker rm -f` 掉全部 `fde-*` 容器**才生效；旧容器收到 `steer_arm` 会当成未知 IPC 类型忽略 ⇒ 症状是「按了转向，run 照跑到自然结束，转向的话在终态后才发出」（功能退化，不报错）。
 9. **结束**：resolve → `run_finished {ok:true, termination, usage, rounds, final_text}`；reject → `run_finished {ok:false, termination, error, usage, rounds}`，**`termination` 原样透传引擎挂在错误上的对象**（issue #212：引擎的失败/中止走 `fail()` 抛异常，`annotateTermination` 把完整 termination 塞进 `error.termination`——`erix-agent/src/loop/termination.js:74-91`），引擎没给才回退 `{reason: aborted ? "aborted" : "failed"}`。**erix-agent 0.18.0 起（上游 #180）**：同一个错误对象上还挂与正常返回值同形的 `usage`/`rounds`，因此失败/中止分支也不再写死零值——`buildFailureEnvelope` 原样透传 `err.usage ?? {input_tokens:0, output_tokens:0}` / `err.rounds ?? 0`（引擎没挂时回退，不抛错）；`reason === "failed"` 的终局另带 additive 字段 `errorCode`（上游 #176，值域由引擎定义）。因此 `reason` 可以是 `failed` **或** `persistence_failed`（后者额外带 `operation`/`phase`/`sideEffect`：run snapshot / `markRunState` 没落盘，崩溃恢复可能重复副作用）。`error.code` = signal 已 abort → `aborted`，否则 `err.code ?? "failed"`；`error.retryable` = `err.retryable === true` 或码属上游可重试码集（`timeout` / `rate_limited` / `server` / `disconnect` / `checkpoint_failed`，见 portal.md §6.4；旧代码是只认两值的半截清单）。实现与单测：`runner/lib/termination.js` + `runner/test/termination.test.js`；竞态兜底（signal 已 abort 但引擎给兜底值 `failed` → 仍以 `aborted` 呈现，保住「停止」= finished 的既有口径）见 §5 终态与 `runner/agentd.js` 的 `state` 判定。
 
 ### 6.4 异常路径（每步谁负责）

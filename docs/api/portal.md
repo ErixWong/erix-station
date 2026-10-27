@@ -132,7 +132,7 @@
 | 403 | `cross_origin_forbidden`（#234，工单 `feat-261013-01`）| **跨站写请求被同源防线拒**（`Sec-Fetch-Site: cross-site` / `Origin` 的 authority 与请求自身不同，**含同注册域的 `same-site`**）。**与 `forbidden` 的关键差别：这是「没资格发这个请求」而不是「没权限做这件事」**，且**未认证也可能拿到**（防线先于 cookie 校验）。`details` = `{origin, sec_fetch_site, method}`（**不含 cookie**）；响应带 #241 那套 CORS deny 头（ACAO/ACAC/Vary）。判据、豁免端点、语义变化见 §2.11 | 否 |
 | 403 | `password_change_required`（#255，工单 `feat-261013-03`）| **受限会话被拦**：已认证，但 `users.must_change_password=true` 且尚未改密 ⇒ 除 §2.11a 放行清单外的 `/api/*` 全部拒。**与 `forbidden` 的关键差别：不是「这件事你没权限」而是「这枚口令还没经过你的手」**；解法只有一个（`POST /api/me/password`），所以 `details` 直接给 `{action, endpoint}`。登录（新旧两条）、登出（新旧两条）、`GET /api/me`、`/api/me/password`、`/api/forward-auth`、`/api/internal/*` 不受限（逐条理由见 §2.11a）；**未认证的 401 语义不变**（门只管已认证的人）。**不写审计**（SPA 轮询会把它刷成噪声，理由见 §2.11a）| 否 |
 | 404 | `not_found` | 资源不存在（**他人资源也返回 404**，不泄露存在性） | 否 |
-| 409 | `name_conflict` / `run_in_progress` / `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2。**#246 交付② 同一码也用在新端点 `POST /api/admin/fdes/:fdeName/ports/block`**：管理员显式指定的块被外来活行占住、或搬迁中途插入数 ≠ 10（并发抢号 ⇒ 整笔回滚）——**那里 `retryable` 是 `false`**（盲试同一段必败，要先换一个起点），口径见 §4.7a） | 是（仅此码；**例外**：§4.7a 的改块 409 为 `false`） |
+| 409 | `name_conflict` / `run_in_progress` / `queue_full`（#370，§4.3a 待发送队列满）/ `no_active_run` / `active_runs` / `already_decided` / `approval_expired` / `idempotency_key_reuse` | 状态冲突，各端点分别列出。**`port_quota_exceeded` 已删除**（#240：预览域名一次性预分配 ⇒ 没有「配额超限」这回事，规格 §8.2；不新造替代码）。**#246 新增 `preview_port_block_taken`**（开户/补建预览段时全局唯一索引 `port_allocations_live_global_port_key` 报 `23505` ⇒ 候选块被并发占用，**可重试**，与上面「状态冲突不重试」的口径不同，见规格 §8.2。**#246 交付② 同一码也用在新端点 `POST /api/admin/fdes/:fdeName/ports/block`**：管理员显式指定的块被外来活行占住、或搬迁中途插入数 ≠ 10（并发抢号 ⇒ 整笔回滚）——**那里 `retryable` 是 `false`**（盲试同一段必败，要先换一个起点），口径见 §4.7a） | 是（仅此码；**例外**：§4.7a 的改块 409 为 `false`） |
 | 409 | `model_name_conflict`（#296，工单 `feat-261015-03`）| **管理员改「调用名」时撞了另一个模型正在用的数据面名字**：`PATCH /api/admin/llm/models/:id` 带 `call_name`，而网关目录里**别的** deployment 的顶层 `model_name` 已经是它。`details` = `{field: 'call_name', call_name, conflicting_model_id}`。**为什么门户要拦**：真机实测 LiteLLM **不拦重名**（两条 deployment 都 200 建成），而 `GET /v1/models` 只列一个、按名字路由时请求在两个 deployment 之间**轮询** ⇒ 同名 = 静默的二义性，比报错更难查（§4.9）。同码也用于**调用名没变、但顺手把上游模型 `litellm_params.model` 改成另一个模型正在用的调用名**（网关路由表按顶层名选 deployment，那个新值落进去就是同一件事）。与 `name_conflict` 的差别：那是会话/仓库标题冲突，本码是**数据面路由名**冲突 | 否（换个名字才行）|
 | 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
@@ -936,6 +936,59 @@ station-portal user enable  --login <login>
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）：FDE 容器不在线/不可达且**不产生** message/run 记录；拉模型（终态）落库即 202、不返回此码（§6.3） |
 
 > 支持 `Idempotency-Key`（§1.4）：断网重发同 key 返回首次的 `message`/`run`，不产生重复消息。实现口径：TTL 24h；**先占位后执行 + 记账并入业务事务**（`in_progress` 占位 → 业务事务内 `record()` 转 `done`，同一次 COMMIT，故「同 key 至多一次副作用（记账与业务写入同事务）」）；`claim_token` owner fencing 使被抢回的旧持有者的迟到记账/释放失效（§1.4）；同 key 不同载荷 → `409 idempotency_key_reuse`；并发同 key 未收敛（占位 < 5 分钟）→ `409 idempotency_conflict`（`retryable: true`，稍后重试拿首次结果）；重放路径不重复副作用（不重复唤醒 runner）。
+
+### 4.3a `POST /api/sessions/:id/queued-inputs`（issue #370：运行中说话）
+
+任务正在跑时把话交进来。**一个端点、服务端裁决**：同一事务里读「本会话有没有活跃 run」，有 ⇒ 入队，无 ⇒ 直接发送（复用 §4.3 的全部语义）。前端**不许**自己先看 `running` 再决定调哪个端点——那会在「点发送那一刻 run 刚好结束」时退化成 409，把消息丢在地上（pi 源码注释称之为 *strand a message in an idle queue*；本端点的原子分岔就是为堵它）。
+
+请求：
+
+```json
+{ "content": "慢一点，先说方案再动手", "attachments": [], "kind": "steer" }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `content` / `attachments` | 与 §4.3 逐字同规则（同一个 `validateMessageBody`） |
+| `kind` | `"steer"`（**转向**：当前轮跑完就停下，用这句话继续）\| `"follow_up"`（**排队**：当前任务正常结束后按顺序发）。缺省 `steer`。其它值 → 400 |
+
+响应 `202`（与 §4.3 同码：两条路都是「已受理，后续异步发生」——直发那路是等 runner 领，入队那路是等终态投），两种形状（**前端两种都必须认**）：
+
+```json
+{ "posted": { "message": { "…": "…" }, "run": { "id": "…", "status": "queued" } }, "queued": null }
+{ "posted": null, "queued": { "id": "…", "kind": "steer", "content": "…", "position": 7 } }
+```
+
+错误：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 400 | `validation_failed` | content 空 / `kind` 非白名单 |
+| 404 | `not_found` | session 不存在、不属本人、或已归档 |
+| 409 | `queue_full` | 未投递条数已达上限（`MAX_QUEUED_INPUTS_PER_SESSION` = 20）。`details.limit` 给具体数 |
+| 409/429/… | 同 §4.3 | **直发分支**原样透传 §4.3 的错误面（LLM 未绑定、模型漂移、配额…），不重新包装 |
+
+行为口径（改实现前必读）：
+
+- **入队只写 `queued_inputs`**，绝不写 `messages` 锚点行、绝不提前 `appendUserInputTurn`。正文真相在 `transcript_rounds`（§4.7 / #77 P3 PR②b B2），提前落 transcript 等于让**还没说出口的话**进模型上下文并被渲染成已发送。投递时才走 §4.3 那条唯一发送路。
+- `kind='steer'` 额外做两件事：记下 `interrupted_run_id` = 当时那个活跃 run，并给该 run 打 `cancel_requested_at`，**但 `runs.status` 保持 `running`（不进 `cancelling`）**。原因：`cancelling` 是「worker 立刻 SIGKILL 正在跑的工具」的开关（进程组杀，§4.5），而转向要的是「本轮跑完再停」。谁停、什么时候停，见 §9.12 的 `steer_request` 与 runner §「轮边界」。
+- 上限只在真的要入队这条路上算，直发分支不吃这个数。
+- 支持 `Idempotency-Key`（§1.4，同 §4.3 的台账），记账并入入队事务。
+
+### 4.3b `DELETE /api/sessions/:id/queued-inputs`（整队取回）
+
+把该会话**未投递**的话全部拿回给用户（= pi 的 `clear_queue`）。返回 `200`：
+
+```json
+{ "recalled": { "steering": ["慢一点"], "follow_up": ["跑完再改标题"] } }
+```
+
+- **只有整队，没有单条删除**：单条删要和投递方的领取竞态（pi 同样只给 `clear_queue` 一个动作）。
+- 状态迁移是 `pending → recalled`，**不硬删**（留一行给人查「他说过什么没发出去」）。
+- 已在 `delivering` 的**不动**——它已经变成一条正在建的 run，此时清它等于把已说出口的话再吐回输入框。
+- 前端回填口径照 pi：取回的文在前、用户已打的草稿在后，中间空一行。
+
+> 会话详情 `GET /api/sessions/:id` 的 `session.queued_messages` = `{steering:[{id,content}], follow_up:[{id,content}]}`，是刷新 / 多端 / 断线重连后队列的**唯一补齐来源**（在 DTO 出口挂载，不在 `sessions.getSession` 内部取——依赖方向与「只有详情需要它」两条理由见该处注释；快照取失败退化成空队列，不把详情拖成 5xx）（§5.3 第 17 类 `queue_update` 是 live-only、不落库）。additive：旧客户端不读它即可，旧后端不带它 ⇒ 前端退化成空队列。
 
 ### 4.4 `GET /api/sessions/:id/events`（SSE）
 
@@ -1825,11 +1878,12 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 14 | `attempt_killed` | **portal 合成，两条产出路径**（不是引擎事件、不经 U3、不进 `run_queue`）：① **U12 release 的 requeue 分支**（`releaseRun`，issue #288 缺陷 B：agentd 还活着并 additive 上报 `killed_by`，§9.11）② **run 租约 reaper 的 requeue 分支**（`reapExpiredRuns`，issue #292：上报者自己已死、根本没有 release，由 portal 自己合成，§9.11 注记） | `attempt: number`（死掉的那次尝试，1-based = `run_queue.attempts`），`max_attempts: number`，`reason: string`（**开放值、无枚举白名单**：release 路径 = agentd 上报的 reason 原文，如 `watchdog_silent` / `worker_crashed`；**reaper 路径固定 `lease_expired`**），`killed_by: "watchdog" | "crash"`（`watchdog` = F6 执行期静默被判死；`crash` = worker 非预期退出；**reaper 路径固定 `crash`**——它无从区分看门狗与真崩，保守取值），可选 `silent_ms: number`（判死前的静默时长 = **最后一次 IPC 上报之后**算了多久，只有活着的 agentd 报得出来；**只在可信时出现，绝不写 0/null 冒充「有」⇒ reaper 形态固定不带**），可选 `next_retry_in_ms: number`（预留：portal 侧支持，当前 agentd 不发；reaper 也不发） |
 | 15 | `tool_replay_decision_required` | `onEvent`（LoopEvent 透传，erix-agent 0.18.0 additive 类型；**仅在 `replayPolicy: "per-tool-declaration"` 下才会发**，本站自 issue #288 缺陷 C 起传该值） | `tool_call_id: string \| null`，`round: number`，`name: string \| null`（被中断的工具），`replay: string \| null`（引擎解析出的声明，当前只可能是 `"unsafe"`），`requires_host_decision: boolean`（引擎恒给 `true`），`partial_output_available: boolean`（快照里有没有已归档的部分输出）。语义：**该工具的上次执行被崩溃打断，引擎没有重放它**，模型同时收到一条 `is_error: true` + `executionStatus: "interrupted"` 的 `tool_result`（第 7 类），**是否重试由模型决定，引擎不自己重试**。⚠ 信封里的 `run_id` 是 station run id，而引擎事件自带的 `runId` 是 store key = `transcriptKey` = `session_id`（issue #81 P2）——runner 映射时落名 `engine_run_id` 以免同义不同（`runner/worker.js loopEventPayload`） |
 | 16 | `persistence_error` | **引擎 `diagnostics.error` 通道**（**不是 `onEvent`**；本站接线在 `runner/worker.js` 的 `diagnostics: { error: … }`，映射在 `loopEventPayload` 的 `persistence_error` 分支）。erix-agent 0.23.0 起就有这条通道（`orchestrator.js:873`），`fatal: false` 一类也已存在（`:895` 宿主端口桥）；erix-agent#461 / 0.25.0 再加一类「剥掉折叠归档后重试一次」 | `port: string`（缺省 `"transcript"`），`phase: string \| null`，`operation: string`（缺省 `"unknown"`；实测致命那条 = 失败的 store 方法名，如 `appendRound`），`engine_run_id: string \| null`（**引擎 store key = transcriptKey = sessionId**，不是 station run id，#81 P2 老坑），`fatal: boolean`（**runner 归一：缺字段/脏值算 `true`**——宁可报重，不可把真失败刷成灰），`sideEffect`（引擎原样透传），`error: {name, message}`（**`stack` 刻意不透传**：那是宿主日志的东西，塞进 UI payload 只会淹没前端），`ts: string \| null`。**可见性口径**：`fatal === false` → 中性分隔行（不影响本次任务）；`fatal === true` → 界面交给 `run_end` 的 `persistence_failed` 红面，本事件只作可审计明细、不重复刷 |
+| 17 | `queue_update` | **portal 合成（issue #370）**：入队 / 整队取回 / 终态出队（含被闸门挡下）三处推 | `steering: [{id, content}]`、`follow_up: [{id, content}]`（**恒为全量快照，不是增量**）、`blocked: string \| null`（暂停投递原因，当前值域 `container_not_running` / `deliver_failed` / `not_deliverable_at_terminal`；界面按它出本地化文案，**服务端只发码不发话**，#294）、`delivered_run_id: string \| null`（**本帧存在的原因是一条队列输入被投出去了** ⇒ 这个 run 刚被建起来；前端只有在「本机没有活跃 run」时接管它，见下）。**信封 `seq` 与 `run_id` 均为 `null`**：它不是历史事件而是**状态**，真相在 `queued_inputs`，可由会话详情全量重建 ⇒ **不落 `run_events`、不进历史白名单、不参与回放**（同第 16 类之外的 `session_updated` 那一支）。 |
 
 > 说明与边界：
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
 > - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（**第 14 类 `attempt_killed` 是规格之外的宿主新增事件，规格 §10.1 没有它，字段以本表为准**——additive 新类型不破坏上游契约，§13.2-3）（`{text}` / `{termination, usage, compaction_stats}`；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。**注（#21 审计决策 ②）**：规格 §10.1 曾写作 `compaction_stats`（本决策已一并删除），该字段在宿主全链路（`runner/`、`portal/src/`）无透传实现、U2 终态载荷不携带——本表与 §9.6 统一按**实际字段集** `termination` / `usage` / `rounds` / `final_text`（+ `attempt`，失败时 `error`）描述，不再引用 `compaction_stats`。
-> - `termination` 是**对象** `{reason, detail?}`（`persistence_failed` 另带 `operation`/`phase`/`sideEffect`），`reason` 取值集合以 erix-agent 0.18.0 的 `runToolLoop` 返回值契约为准：<!-- DRIFT:termination-reason:begin -->`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed, persistence_failed}`<!-- DRIFT:termination-reason:end -->（依据：`src/loop/orchestrator.js:511` typedef 的 9 值 + `:973-990` 的 `persistence_failed`；单一真相常量在前端 `lib/terminationReasons.ts`，与 §4.1 及 `docs/data/model.md` §1.7 逐项对齐）。宿主映射（**issue #212 修正**：0.18.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上）：runner 一律**原样透传** `err.termination`，引擎没给才回退 `aborted`/`failed`（`runner/worker.js` catch + `runner/lib/termination.js`）——所以引擎失败可以是 `failed` **或** `persistence_failed`（快照没落盘，崩溃恢复可能重复副作用，语义最重），用户主动停止 → `aborted`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。前端有**两个**集合，别再混用（issue #236）：① **功能面**的 `RUN_FAIL_REASONS` 含 `failed` / `max_rounds_cap` / `aborted` / `persistence_failed` / `final_guard_unverified`——它决定「重试上一条」（#261B）与「终态后补拉 history」（#306），**`aborted` 仍在其内**；② **界面分级**的 `RUN_TERMINATION_SYSERR_REASONS` = ① 减掉 `aborted`（由①**派生**，不手抄）——只有它决定终态行刷红：`failed` / `max_rounds_cap` / `persistence_failed` / `final_guard_unverified` 红，其余（含 `aborted`）中性。理由：用户按「停止」不是故障（#236 §1）。**实时 `run_end` 与历史合成项 `run_termination`（§4.4a-2）共用这一条分级规则与同一份母语标签表**（`RUN_END_LABEL_REASONS`，除 `end_turn` 外的每个 reason 都有 zh-CN/en 标签；未知 reason 回落原文）。**erix-agent 0.18.0 起（上游 #176）**，`reason === "failed"` 的终局另带 additive 字段 `errorCode`：引擎把错误上已有的分类码原样透出（`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …），无分类码则为 `unknown`，**值域由引擎定义**；station 原样透传引擎 termination，因此运行时零改动即已下发（依据：`src/loop/termination.js:43-57`，在 `orchestrator.js:981-984` 调用），前端不解释其语义、也不新增枚举。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。
+> - `termination` 是**对象** `{reason, detail?}`（`persistence_failed` 另带 `operation`/`phase`/`sideEffect`），`reason` 取值集合以 erix-agent 0.18.0 的 `runToolLoop` 返回值契约为准：<!-- DRIFT:termination-reason:begin -->`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed, persistence_failed}`<!-- DRIFT:termination-reason:end -->（依据：`src/loop/orchestrator.js:511` typedef 的 9 值 + `:973-990` 的 `persistence_failed`；单一真相常量在前端 `lib/terminationReasons.ts`，与 §4.1 及 `docs/data/model.md` §1.7 逐项对齐）。宿主映射（**issue #212 修正**：0.18.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上）：runner 一律**原样透传** `err.termination`，引擎没给才回退 `aborted`/`failed`（`runner/worker.js` catch + `runner/lib/termination.js`）——所以引擎失败可以是 `failed` **或** `persistence_failed`（快照没落盘，崩溃恢复可能重复副作用，语义最重），用户主动停止 → `aborted`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。前端有**两个**集合，别再混用（issue #236）：① **功能面**的 `RUN_FAIL_REASONS` 含 `failed` / `max_rounds_cap` / `aborted` / `persistence_failed` / `final_guard_unverified`——它决定「重试上一条」（#261B）与「终态后补拉 history」（#306），**`aborted` 仍在其内**；② **界面分级**的 `RUN_TERMINATION_SYSERR_REASONS` = ① 减掉 `aborted`（由①**派生**，不手抄）——只有它决定终态行刷红：`failed` / `max_rounds_cap` / `persistence_failed` / `final_guard_unverified` 红，其余（含 `aborted`）中性。理由：用户按「停止」不是故障（#236 §1）。**实时 `run_end` 与历史合成项 `run_termination`（§4.4a-2）共用这一条分级规则与同一份母语标签表**（`RUN_END_LABEL_REASONS`，除 `end_turn` 外的每个 reason 都有 zh-CN/en 标签；未知 reason 回落原文）。**erix-agent 0.18.0 起（上游 #176）**，`reason === "failed"` 的终局另带 additive 字段 `errorCode`：引擎把错误上已有的分类码原样透出（`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …），无分类码则为 `unknown`，**值域由引擎定义**；station 原样透传引擎 termination，因此运行时零改动即已下发（依据：`src/loop/termination.js:43-57`，在 `orchestrator.js:981-984` 调用），前端不解释其语义、也不新增枚举。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。**issue #370 新增一个宿主 additive 字段**：`detail === 'steered'`（轮边界转向导致的 abort，`reason` 仍是 `aborted`、值域零改动；runner 只补 detail，且**不覆盖引擎已给的 detail**）。它的唯一用途是**功能面**：转向导致的 abort 不点亮「重试上一条」（用户刚说「用这句继续」，再给一个「把上一条原话重发」是倒退，还会挤掉他刚排的那条转向）。⚠ **不进红色集合、不改 `RUN_FAIL_REASONS`**（那个集合还管「终态后补拉 history」，#306）。
 > - **assistant 完整消息不单独发事件**：前端拼接 `assistant_delta` 流渲染气泡；run 结束后的持久对话内容以 `GET /api/sessions/:id` 的 `messages` 为准（`run_events` 是流式日志，`messages` 是人看的对话，两层不混，规格 §9.2）。
 > - 审批请求的出现通过 `judge` 事件（`action` 指示需审批）+ `GET /api/approvals` 列表体现，不单独设事件类型。
 > - **第 14 类 `attempt_killed` 是宿主合成事件**（issue #288 缺陷 B + #292，实现 `portal/src/internal.js` 的 `releaseRun` 与 `reapExpiredRuns`）：「worker 被杀 → 重排」这件事此前对用户**零可见**（requeue 分支只改 `run_queue` + `audit_log`），用户只看到同一个工具卡片亮 3 次、最后拿一句没有原因的 `attempts exhausted`。口径：
@@ -1854,6 +1908,13 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 >   是真的」② `loopEventPayload` 映射 ③ 源码级「接线还在」哨兵——**① 自己传 diagnostics，所以摘掉本站
 >   接线只有 ③ 会红**）与 `portal/test/persistence-error-visibility.test.js`（三处集合同步 + 本文档同源）。
 ---
+> - **第 17 类 `queue_update` 是状态帧，不是历史事件**（issue #370，实现 `portal/src/internal.js` 的 `notifyQueueUpdate` / `notifyQueueUpdateForSession`）：
+>   - **为什么不落 `run_events`**：信封要求 `run_id NOT NULL`，而**入队那一刻根本没有 run**（转向打断的那个 run 是另一个）。硬塞要造一个假 run id；把「队列」塞进「历史」也判错了性态——队列是**状态**（此刻还有什么没发出去），历史是**发生过什么**。状态要能重建，于是真相放 `queued_inputs` 表，快照由 §4.3a 尾注的 `session.queued_messages` 全量提供。
+>   - **因此它不进 §4.4a 历史白名单，也不进前端 `HISTORY_REPLAY_TYPES`**，只进 `EVENT_TYPES`（实时具名监听）。刷新后队列条不消失靠详情快照补齐，不靠 SSE 回放。三处集合各漏一处的症状不同（#288 已证）：漏 `EVENT_TYPES` = 实时一条都收不到；误进回放 = 无 seq 帧污染水位线。
+>   - **载荷恒为全量快照**（不是增量）⇒ 前端**整体覆盖**本地队列，天然消双发、天然多标签页一致。乐观入队只是消除「点了没反应」的空窗，权威值到达即被取代。
+>   - **为什么必须带 `delivered_run_id`**（评审抓到的缺陷）：本站前端只有两条路知道「这个会话有活跃 run」——自己 POST 的响应，和会话详情里的 `active_run_id`。**队列投递两条都不走**（portal 自己调 `postMessage`）。不带这个字段就会得到：旧 run 的 `run_end` 到达 ⇒ 运行态清空 ⇒ 新 run 在跑但状态条显示空闲；更糟的是新 run 自己那条 `run_end` 因 `d.run_id !== activeRunId` 被判「不是当前 run」而**整条丢弃**（终稿不刷新、历史不补拉）。前端接管的判据是 `activeRunId == null`——**别把用户正在看的另一个 run 抢掉**（起跑时刻未知 ⇒ 动量 `startedAt=null`，口径与「中途打开会话」逐字一致，不出「从我看到它才起算」的假时长）。
+>   - `blocked` 是**机器码**，前端 `queued.blocked.<code>` 出话（#294：服务端只发码不发话）。当前值：`container_not_running`（容器没起来，agentd 不在，没人 claim ⇒ 留在队列并说明原因）、`deliver_failed`（认领后 `postMessage` 失败，已退回 `pending`）、`not_deliverable_at_terminal`（队头是 follow_up 而这次终态不该投——用户按了停止 / run 是 failed）。**一个都不丢弃**。
+
 
 ## 6. 错误语义专题
 
@@ -2132,16 +2193,25 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 
 ```json
 {
-  "agent_version": "0.1.0",
+  "agent_version": "0.26.0",
+  "runner_version": "0.1.41",
+  "build_revision": "8e28cc1c2b0e4b0e1a2f3c4d5e6f7a8b9c0d1e2f",
   "runs": [
     { "run_id": "9d3b2f1e-...", "status": "running", "worker_pid": 1234, "claim_token": "ct_3f8a..." }
   ]
 }
 ```
 
+> **版本是构建产物，不是运维旋钮**（issue #404 结案）。三个版本字段一律来自 FDE 镜像构建期烘进去的
+> `/opt/erix/build-info.json`（`runner/Dockerfile` 写、`runner/lib/build-info.js` 读）；读不到就报
+> `unknown`，**不再有 `'0.1.0'` 这类兜底常量**——一个看起来合法的假值比空值更难发现。
+> `ERIX_AGENT_VERSION` 只剩 override 身份（默认不设，portal 仅在显式钉值时注入）。
+
 | 字段 | 说明 |
 |---|---|
-| `agent_version` | agentd 版本号字符串（供审计/排障） |
+| `agent_version` | **erix-agent（引擎）版本**，构建产物；portal 会落账到 `containers.agent_version`（仅当与现值不同，见下）。空/缺 ⇒ 不写，**不会拿 `unknown` 去覆盖上一次的真值**（兼容旧 agentd） |
+| `runner_version` | station runner 自身版本（`additive`，旧 portal 忽略） |
+| `build_revision` | 构建所用 git commit（`additive`；本地/dev 构建为 `unknown`） |
 | `runs[].run_id` | 当前活跃 run 的 id |
 | `runs[].status` | `running`（agentd 只上报在跑的 run；终态 run 在 U2 后即从列表移除）。其余值保留、portal 忽略 |
 | `runs[].worker_pid` | 该 run 的 worker 进程 pid（观测用） |
@@ -2689,6 +2759,7 @@ worker 被杀后重排的上报形态（**issue #288 additive**；没有 kill �
 | `run_assigned` | `{run_id, queue_id}` | **唤醒 hint**：有新任务可领；**不携带权威载荷**（载荷以 claim 响应为准） | 若当前 claim 处于 hold 间隙则立即发起 claim |
 | `approval_decision` | `{approval_id, run_id, decision, note, decided_at}` | 审批结果**快通道** | resolve 对应 worker 的 await（§9.10） |
 | `stop_request` | `{run_id, reason}` | portal 已写 `cancel_requested_at`（§4.5），要求终止 | IPC `abort` → worker；若无此 run（已结束）忽略 |
+| `steer_request` | `{run_id}` | **用户要求转向**（issue #370，§4.3a）：portal 已把那句话写进 `queued_inputs` 并给该 run 打了 `cancel_requested_at`（**`status` 仍是 `running`**） | IPC `steer_arm` → worker **装标记**（**不是 abort！**）。worker 在 erix-agent 的 `onRound`（本轮 transcript 已落库、下一次 provider 调用之前）里自己 `abort()` ⇒ 正在执行的工具调用**会跑完**。找不到该 run（已结束/不在本容器）就忽略：队列不因此丢失，终态出队会把它投成新 run |
 | `revoke` | `{reason}` | token 吊销 / 容器停用 | 停领新任务；在跑 run 继续到终态后退出 |
 | `ping` | `{ts}` | 15s 保活 | 更新「下行健康」标记；连续丢失触发重连 |
 

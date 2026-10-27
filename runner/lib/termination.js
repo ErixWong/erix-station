@@ -48,7 +48,13 @@ export function isRetryableErrorCode(code) {
  * @param {{ termination?: unknown, aborted?: boolean }} input
  * @returns {Record<string, unknown>}
  */
-export function buildRunTermination({ termination, aborted = false } = {}) {
+/**
+ * #370：`steered` = 本次 abort 是**转向**（用户在轮边界装填了「用这句话继续」），不是按了停止。
+ * 只补 `detail`、**绝不改 reason**（reason 值域由引擎定义，§5.3 红线），也**不覆盖**引擎已给的 detail。
+ * 前端据此把终态行刷成中性并抑制「重试上一条」（用户已经转向了，重试是倒退）；portal 的出队判定
+ * 则不看这里——它看 `queued_inputs.interrupted_run_id`（DB 是真相）。
+ */
+export function buildRunTermination({ termination, aborted = false, steered = false } = {}) {
   const reason = typeof termination?.reason === 'string' && termination.reason.length > 0
     ? termination.reason
     : null;
@@ -59,7 +65,9 @@ export function buildRunTermination({ termination, aborted = false } = {}) {
   // run 收敛为 finished（runner/agentd.js:929），与本次改动前的行为一致（「停止」不会变红成失败）。
   // 只覆盖兜底值 `failed`：引擎给出的其它 reason（含 persistence_failed）一律以引擎为准。
   if (aborted && reason === 'failed') return { ...termination, reason: 'aborted' };
-  return /** @type {Record<string, unknown>} */ (termination);
+  const out = /** @type {Record<string, unknown>} */ (termination);
+  if (steered && out.reason === 'aborted' && out.detail == null) return { ...out, detail: 'steered' };
+  return out;
 }
 
 /**
@@ -67,10 +75,10 @@ export function buildRunTermination({ termination, aborted = false } = {}) {
  * @param {{ err: any, aborted?: boolean }} input
  * @returns {{ termination: Record<string, unknown>, error: { code: string, message: string, retryable: boolean }, usage: Record<string, unknown>, rounds: number }}
  */
-export function buildFailureEnvelope({ err, aborted = false } = {}) {
+export function buildFailureEnvelope({ err, aborted = false, steered = false } = {}) {
   const code = aborted ? 'aborted' : (err?.code ?? 'failed');
   return {
-    termination: buildRunTermination({ termination: err?.termination, aborted }),
+    termination: buildRunTermination({ termination: err?.termination, aborted, steered }),
     error: {
       code,
       message: String(err?.message ?? err),
