@@ -248,7 +248,14 @@ export function compactionDegradeText(stat: unknown): string {
       ? s.degradeReason
       : null);
   if (kind !== null) parts.push(t('stream.event.compactionDegraded', { kind }));
-  if (s.unshrinkable === true) parts.push(t('stream.event.compactionUnshrinkable'));
+  // 下面两个键名同样必须在上游契约的 `foldSummary` 字段面里存在（`runner/test/compact-knobs.test.js`
+  // 的 K12 对账）。这里不写引擎不发的键：前例是 `unshrinkable`，一个本站凭记忆造的字段。
+  if (s.budgetExhausted === true) parts.push(t('stream.event.compactionBudgetExhausted'));
+  const droppedRounds = typeof s.droppedRounds === 'number' && Number.isSafeInteger(s.droppedRounds) ? s.droppedRounds : 0;
+  const droppedMessages = typeof s.droppedMessages === 'number' && Number.isSafeInteger(s.droppedMessages) ? s.droppedMessages : 0;
+  if (s.inputTruncated === true || droppedRounds > 0 || droppedMessages > 0) {
+    parts.push(t('stream.event.compactionInputClipped', { rounds: droppedRounds, messages: droppedMessages }));
+  }
   if (s.finishReason === 'max_tokens') parts.push(t('stream.event.compactionTruncated'));
   return parts.length === 0 ? '' : t('stream.event.compactionDegradeNote', { body: parts.join('，') });
 }

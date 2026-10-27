@@ -299,7 +299,8 @@ export const zhCN = {
       // `degradeNote` 由本文件拼好（括号整块交给文案，代码不拼标点）。
       compactionDegradeNote: '（⚠ {body}）',
       compactionDegraded: '摘要已降级：{kind}',
-      compactionUnshrinkable: '摘要压不下去（回写比输入还大）',
+      compactionBudgetExhausted: '摘要预算耗尽（没来得及自愈重试）',
+      compactionInputClipped: '摘要输入被裁（丢 {rounds} 轮 / {messages} 条，据不完整材料写成）',
       compactionTruncated: '摘要被输出预算截断',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',

@@ -552,12 +552,16 @@ describe('useEventStream（mock EventSource）', () => {
       .toContain('摘要已降级：摘要器没在预算内回来');
     expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeKind: 'error', degradeReason: '整句' } }))
       .toContain('摘要已降级：error');
-    // 两类超预算事实（#490）一条拼全
-    const both = sepTexts({ ...base, foldSummary: { unshrinkable: true, finishReason: 'max_tokens' } });
-    expect(both).toContain('摘要压不下去');
+    // 另外两类非致命事实一条拼全：整条步骤预算耗尽（没自愈重试）+ 摘要被输出预算截断
+    const both = sepTexts({ ...base, foldSummary: { budgetExhausted: true, finishReason: 'max_tokens' } });
+    expect(both).toContain('摘要预算耗尽');
     expect(both).toContain('摘要被输出预算截断');
+    // 输入面被裁（48 KB 整轮裁 / token 守卫逐条裁）必须带上数字，只说"被裁"等于没量化
+    expect(sepTexts({ ...base, foldSummary: { droppedRounds: 7, droppedMessages: 3 } }))
+      .toContain('摘要输入被裁（丢 7 轮 / 3 条');
+    expect(sepTexts({ ...base, foldSummary: { inputTruncated: true } })).toContain('摘要输入被裁（丢 0 轮 / 0 条');
     // 正常收尾不是事实
-    expect(sepTexts({ ...base, foldSummary: { finishReason: 'end_turn', unshrinkable: false, degraded: false } }))
+    expect(sepTexts({ ...base, foldSummary: { finishReason: 'end_turn', budgetExhausted: false, inputTruncated: false, droppedRounds: 0, droppedMessages: 0, degraded: false } }))
       .toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
   });
 

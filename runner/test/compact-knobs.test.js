@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { runToolLoop } from 'erix-agent';
 import {
   COMPACT_CONTEXT_KEYS,
@@ -113,7 +114,9 @@ test('K8 fold-statistical（本站现状）下五键全缺席 ⇒ 不出告警�
   assert.equal(foldDegradeNotice({ strategyName: 'fold-statistical', foldedRounds: 12 }), null);
   assert.equal(foldDegradeNotice({ foldSummary: {} }), null, '产出了合格摘要 ⇒ 不该有 warn');
   assert.equal(foldDegradeNotice(undefined), null);
-  assert.equal(foldDegradeNotice({ foldSummary: { degraded: false, unshrinkable: false, finishReason: 'end_turn' } }), null);
+  assert.equal(foldDegradeNotice({
+    foldSummary: { degraded: false, budgetExhausted: false, inputTruncated: false, droppedRounds: 0, droppedMessages: 0, finishReason: 'end_turn' },
+  }), null);
 });
 
 test('K9 degradeKind 优先（#487 的封闭枚举，短）；只有 degradeReason 时退回它（#482/#491 的整句）', () => {
@@ -132,13 +135,24 @@ test('K9 degradeKind 优先（#487 的封闭枚举，短）；只有 degradeReas
   assert.ok(foldDegradeNotice({ foldSummary: { degraded: true, degradeReason: 'x'.repeat(500) } }).length < 300);
 });
 
-test('K10 另两类非致命事实也要出声：截了等于没截（#490）、摘要被输出预算截断（#490 finishReason）', () => {
-  assert.match(foldDegradeNotice({ foldSummary: { unshrinkable: true } }), /unshrinkable/);
+test('K10 另外两类非致命事实也要出声：整条步骤预算耗尽（没自愈重试）、输入面被裁；摘要被输出预算截断', () => {
+  // 契约 #469①②③：剩余预算不足 2 秒 ⇒ 连「换更短输入自愈重试」都没发生，记 budgetExhausted
+  assert.match(foldDegradeNotice({ foldSummary: { budgetExhausted: true } }), /budget_exhausted/);
+  // 输入面被裁是两层守卫：48 KB 按整轮裁（inputTruncated / droppedRounds）与 token 守卫逐条裁
+  //（droppedMessages）。任一发生 ⇒ 这份摘要是「基于不完整材料写成的」，必须说。
+  assert.match(foldDegradeNotice({ foldSummary: { inputTruncated: true } }), /input clipped/);
+  assert.match(foldDegradeNotice({ foldSummary: { droppedRounds: 7 } }), /input clipped \(rounds=7 messages=0\)/);
+  assert.match(foldDegradeNotice({ foldSummary: { droppedMessages: 3 } }), /messages=3/);
   assert.match(foldDegradeNotice({ foldSummary: { finishReason: 'max_tokens' } }), /truncated at max output tokens/);
   assert.equal(foldDegradeNotice({ foldSummary: { finishReason: 'end_turn' } }), null,
     '正常收尾不是事实，不该刷 warn');
-  const all = foldDegradeNotice({ foldSummary: { degraded: true, degradeKind: 'too_large', unshrinkable: true, finishReason: 'max_tokens' } });
-  assert.equal(all.match(/degraded=|unshrinkable|truncated/g).length, 3, '三类同时发生要一条说全，不要分三条');
+  assert.equal(foldDegradeNotice({ foldSummary: { droppedRounds: 0, droppedMessages: 0, inputTruncated: false } }), null,
+    '0 与 false 都是「没裁」，不许据此报事（那会把每个正常折叠都刷一条）');
+  const all = foldDegradeNotice({
+    foldSummary: { degraded: true, degradeKind: 'context_window_exceeded', budgetExhausted: true, droppedRounds: 7, finishReason: 'max_tokens' },
+  });
+  assert.equal(all.match(/degraded=|budget_exhausted|input clipped|truncated/g).length, 4,
+    '四类同时发生要一条说全，不要分四条');
 });
 
 test('K11 worker 的 onEvent 里那条 warn 真接着（且**不改事件**：降级不是 run 失败）', () => {
@@ -151,4 +165,69 @@ test('K11 worker 的 onEvent 里那条 warn 真接着（且**不改事件**：�
     '告警之后仍要原样下发 compaction 事件：#392-D 横幅与历史回放都靠它');
   assert.doesNotMatch(onEvent[0], /RUN_FINISHED|buildFailureEnvelope/,
     '摘要降级不得改终态：模型拿到的仍是机械摘要，把正常完成的 run 刷红是误报');
+});
+
+// ── ③ 字段面对账：本站读的每个 foldSummary 键都必须真的存在 ─────────────────────
+// 前例（本单自己犯的）：本站曾读 `foldSummary.unshrinkable`——**引擎从不发这个键**（0.26.0 与
+// 上游 main 的契约、`src/` 全文 grep 均零命中），它靠"看起来像 #490 会发的东西"写进了代码、
+// 判据和两份 i18n。后果不是报错而是**永不触发**：一条永不响的告警比没有告警更坏。
+// 键名清单**从两处生产代码里抠**（不手抄），所以改了代码不改进契约面就会红。
+const FOLD_SUMMARY_KEYS_PINNED = [
+  'degradeKind', 'degradeReason', 'degraded',
+  'budgetExhausted', 'inputTruncated', 'droppedRounds', 'droppedMessages', 'finishReason',
+];
+
+function enginePackageRoot() {
+  const engineEntry = createRequire(import.meta.url).resolve('erix-agent');
+  let root = path.dirname(engineEntry);
+  while (root !== path.dirname(root)) {
+    const pj = path.join(root, 'package.json');
+    if (fs.existsSync(pj) && JSON.parse(fs.readFileSync(pj, 'utf8')).name === 'erix-agent') return root;
+    root = path.dirname(root);
+  }
+  throw new Error('找不到已安装 erix-agent 的包根');
+}
+
+function keysReadFromStat() {
+  const workerBody = read('worker.js');
+  const w = workerBody.slice(workerBody.indexOf('export function foldDegradeNotice'));
+  const fePath = path.join(RUNNER_DIR, '..', 'portal', 'frontend', 'src', 'composables', 'useEventStream.ts');
+  const fe = fs.readFileSync(fePath, 'utf8');
+  const f = fe.slice(fe.indexOf('export function compactionDegradeText'));
+  const grab = (text, re) => [...text.slice(0, text.indexOf('\n}\n') > 0 ? text.indexOf('\n}\n') : 4000)]
+    .join('').match(re) || [];
+  const found = new Set([
+    ...grab(w, /\bstat\.([A-Za-z][A-Za-z0-9]*)/g).map((m) => m.split('.')[1]),
+    ...grab(f, /\bs\.([A-Za-z][A-Za-z0-9]*)/g).map((m) => m.split('.')[1]),
+  ]);
+  return [...found].sort();
+}
+
+test('K12 本站从 foldSummary 读的每个键都在上游契约的字段面里（引擎不发的键 = 一条永不响的告警）', (t) => {
+  const keys = keysReadFromStat();
+  assert.ok(keys.length >= 6, `从生产代码里只抠到 ${keys.length} 个键，正则或函数形状变了：${keys.join(', ')}`);
+  for (const key of keys) {
+    assert.ok(FOLD_SUMMARY_KEYS_PINNED.includes(key),
+      `${key} 不在手抄自上游契约（erix-agent main 的 host-consumer-contract.md「compaction stat」那一行）的清单里`
+      + ' ⇒ 要么上游改名了，要么本站又在读一个引擎不发的键（unshrinkable 前例）');
+  }
+  // ↑ 这一半**永远跑**，是今天真正的防线。↓ 另一半是「装上 0.27.0 之后自动接管」的对账：
+  const engineRoot = enginePackageRoot();
+  const engineVersion = JSON.parse(fs.readFileSync(path.join(engineRoot, 'package.json'), 'utf8')).version;
+  const contractPath = path.join(engineRoot, 'docs', 'host-consumer-contract.md');
+  const contract = fs.existsSync(contractPath) ? fs.readFileSync(contractPath, 'utf8') : '';
+  const hasSurface = contract.includes('foldSummary');
+  const [maj, min] = String(engineVersion).split('.').map((n) => Number(n));
+  const surfaceShouldExist = maj > 0 || min >= 27;
+  // 跳过必须**有机判据**，不许用「引擎版本旧」这句话自证：这里按版本号判，并反过来钉住
+  // 「低于 0.27.0 时契约确实还没有这一面」——上游若把字段面回移到老版本，这里就红。
+  assert.notEqual(hasSurface, surfaceShouldExist ? false : true,
+    `契约 foldSummary 字段面的存在性与引擎版本（${engineVersion}）对不上：shouldExist=${surfaceShouldExist}`);
+  if (!hasSurface) {
+    t.skip(`已安装引擎 ${engineVersion} 的契约还没有 foldSummary 字段面（<0.27.0 正常如此）；pin 到 0.27.0 后下面的逐键对账自动接管`);
+    return;
+  }
+  for (const key of keys) {
+    assert.ok(contract.includes('\`' + key + '\`'), `上游契约里没有 foldSummary.${key} ⇒ 本站在读一个不存在的键`);
+  }
 });

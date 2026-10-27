@@ -298,7 +298,7 @@ export function loopEventPayload(event) {
 
 // issue #469 宿主侧后续（A2）：从 `CompactionStat.foldSummary` 里推出「这次摘要是不是次品」。
 // 字段本体是 erix-agent #482/#487/#490/#491 加的（**仅 fold-llm 会产生**：`fold-statistical` 下
-// 五个键全缺席，这是契约不是 bug），所以本函数在 0.26.0 + 本站现策略下永远返回 `null`，
+// 这些键全缺席，这是契约不是 bug），所以本函数在 0.26.0 + 本站现策略下永远返回 `null`，
 // 它是为切到 `fold-llm` 那天预先接好的嘴。`degradeKind`（#487）比 `degradeReason`（#482）新且短，
 // 所以优先读 kind，只读 kind 拿不到时才退回 reason（老版本引擎）。
 /**
@@ -316,9 +316,19 @@ export function foldDegradeNotice(compaction) {
         stat.degradeReason.slice(0, 200)
       : null);
   if (kind) parts.push(`degraded=${kind}`);
-  // #490 的第三类非致命事实：截了等于没截（模型给的回写比输入还大）——不记就会「摘要隔一轮
-  // 变大回去」而没人知道原因。两个值都是引擎直接给的，本站不自己量。
-  if (stat.unshrinkable === true) parts.push('summary unshrinkable (rewrite came back larger than input)');
+  // 以下每一个键名都必须能在上游契约的 `foldSummary` 字段面里找到（K12 钉这条对账）。
+  // 前例：本函数曾读过一个 `foldSummary.unshrinkable`——**引擎从不发这个键**（契约与 `src/`
+  // 全文 grep 零命中），它是本站按记忆造的形状，后果不是报错而是永不触发：一条永不响的告警。
+  //
+  // `budgetExhausted`（契约 #469①②③）：整条摘要步骤的剩余预算不足 2 秒 ⇒ 连「换更短输入
+  // 自愈重试」都没发生。不记就会「只折了一半就继续」而没人知道原因。
+  if (stat.budgetExhausted === true) parts.push('budget_exhausted (no self-heal retry: <2s left)');
+  // 输入面被裁：48 KB 按整轮裁（`inputTruncated` / `droppedRounds`）与 token 守卫逐条裁
+  // （`droppedMessages`）是两层不同的守卫，两个都是「摘要是基于不完整材料写成的」这个事实。
+  const clipped = stat.inputTruncated === true
+    || (Number.isSafeInteger(stat.droppedRounds) && stat.droppedRounds > 0)
+    || (Number.isSafeInteger(stat.droppedMessages) && stat.droppedMessages > 0);
+  if (clipped) parts.push(`input clipped (rounds=${stat.droppedRounds ?? 0} messages=${stat.droppedMessages ?? 0})`);
   if (stat.finishReason === 'max_tokens') parts.push('summary truncated at max output tokens');
   if (parts.length === 0) return null;
   const strategy = typeof compaction?.strategyName === 'string' && compaction.strategyName !== ''

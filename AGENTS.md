@@ -2403,3 +2403,20 @@ N 轮」——契约（host-consumer-contract #479）明写它是 **run 作用�
 ③ `fold-strategy.test.js` 注入的是**真**校验器不是桩（换成桩，worker 里加错键就又看不见了）；
 ④ A2 两处「只加不改」（改了事件本体或终态，就是把一次正常完成的 run 刷成错误，还会让历史回放里
 的旧事件多出一段括号）。
+
+**收口补丁：A2 读过一个引擎从不发的键（`foldSummary.unshrinkable`），现在是 K12 这条对账在守。**
+上游 #494 合进 0.27.0 的发布收尾期间顺手核了一遍契约，发现本单 A2 里那个「截了等于没截」的判据
+读的是 `foldSummary.unshrinkable`——**这个键在中英契约与 `src/` 全文 grep 零命中**，是本站按
+「#490 应该会发这个」的记忆造的。后果不是报错而是**永不触发**：一条永不响的告警比没有告警更坏，
+而且它已经长进了判据（K10）、前端文案和两份 i18n。改回契约真有的那批（erix-agent 契约
+「compaction stat」那一行）：`degradeKind` / `degradeReason` / `budgetExhausted`（整条摘要步骤剩余
+预算不足 2 秒 ⇒ 连自愈重试都没发生）/ `inputTruncated` + `droppedRounds`（48 KB 按整轮裁）/
+`droppedMessages`（token 守卫逐条裁）/ `finishReason`。`droppedRounds: 0` 与 `false` 是「没裁」，
+不许据此报事，否则每个正常折叠都刷一条。
+
+**K12 的写法是重点，不只是补一条断言**：待检键名**从两处生产代码里正则抠**（`worker.js` 的
+`foldDegradeNotice` 里的 `stat.*` 与前端 `compactionDegradeText` 里的 `s.*`），不手抄清单；然后
+两半检查——**永远跑的那半**比一份手抄自上游 main 的键清单（今天真正的防线），**随 pin 自动接管的
+那半**与已安装引擎随包的 `docs/host-consumer-contract.md` 逐键对账。跳过必须有机判据：按已安装引擎
+**版本号**判（`<0.26.0 无此面` 是 0.26.0 的正常事实），并反向钉住「版本低 ⇒ 契约确实没有这一面」——
+上游若把字段面回移到老版本，这条会红，而不是让跳过状态一直用「引擎版本旧」这句话自证。
