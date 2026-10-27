@@ -4,7 +4,7 @@
 //   ① 嘴漏（引擎发了、本站没接）⇒ E1/E2 逐条要求出文案；
 //   ② **推测键**（本站按记忆造形状）⇒ E5 拿已安装引擎源码做对账，口径同 `compact-knobs.test.js`
 //      的 K12 与 `fold-notes.test.js` 的 C18。前例两条：`payload.chars`、`foldSummary.unshrinkable`
-//      ——推测键的后果不是报错，是**永不触发**（AGENTS §8.72）。
+//      ——推测键的后果不是报错，是**永不触发**（AGENTS §8.73）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

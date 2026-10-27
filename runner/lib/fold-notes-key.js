@@ -78,7 +78,7 @@ export function deriveFoldNote({ payload, seq, nowIso, runId } = {}) {
 
   // 规模：引擎给的是**字节**（`bytes`，夹断前另有 `bytesBefore`）。**不读 `chars`**：引擎从不发这个
   // 键（`fold-summary-journal.js` 全文无 `chars`，C18 钉着），读它就是第二个 `unshrinkable`——同一个
-  // 形状的推测键（见 §8.72：那个在本单里刚被换成契约真有的四个键）。推测键的代价不是报错而是
+  // 形状的推测键（见 §8.73：那个在本单里刚被换成契约真有的四个键）。推测键的代价不是报错而是
   // **永不触发**，外加下一个人会以为那个维度有数据。
   const sizeParts = [];
   if (Number.isSafeInteger(payload?.bytes)) {

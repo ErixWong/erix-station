@@ -11,7 +11,7 @@
 //   · **只描述事实，不改终态、不改事件**（这些都是诊断，不是 run 失败）；
 //   · **只读契约里真存在的键**，每个键名旁边注明发射点行号；判据 `test/engine-notices.test.js`
 //     逐条对账。前例本站栽过两次：`payload.chars` 与 `foldSummary.unshrinkable` 都是本站按记忆
-//     造的键——推测键的后果不是报错，是**永不触发**（见 AGENTS §8.72）；
+//     造的键——推测键的后果不是报错，是**永不触发**（见 AGENTS §8.73）；
 //   · 数字没给就写 `?`，绝不拿 0 冒充（#283）；
 //   · 外来标识符（`method` / `reason` / `termination.reason`）要过形状闸，绝不 `String(对象)`
 //     把 `[object Object]` 渗进日志（#261）。
