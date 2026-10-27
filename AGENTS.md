@@ -2336,3 +2336,70 @@ provisioner 34/34、portal+root 全量绿。
 另外记一条排障口径：**"容器全 healthy" 不能证明系统没事**。今晚 502 的时候 `docker ps` 六个容器
 全 `Up (healthy)`、portal 直连正常，坏的是配置**内容**。判入口要打到真入口：
 `curl -o /dev/null -w '%{http_code}' http://station.vc.cn-ai.vip:8090/`，以及 `/api/sessions` 期望 401。
+
+### 8.72 erix-agent #469 的宿主侧后续：摘要口径、降级出口、起跑前校验（2026-10-27，分支 `feat-261027-01-392-host-followup`）
+
+上游 #469（折叠摘要器无超时/无上限/从不看 `finish_reason`）已关单，六张 PR：#482 超时不吞、
+#487 死线与不泄 `ProviderError`、#488 四个上限、#489 跨 run 不重复烧钱、#490 默认摘要预算 1400、
+#493 装配口白名单。**本站仍留在 `fold-statistical`**，闸门三条（缺一不可，见 §8.65 与本节末）：
+① 上述 PR 随 **0.27.0 真发版**（npm 最新仍是 0.26.0，本站只认版本号不认 git SHA）；② pin 完在
+**隔离实例**跑真长会话，看 `foldSummary.degradeKind` / `finishReason` / 摘要字节数 / 横幅四件都是活的；
+③ 量住「每轮多花多少时间」「每次多喂多少字节」，量完才能说"可接受"。这一节写的是**不等发版**
+就该做完的四件事。
+
+**A1 是一处真 bug，不是美化。** `runner/lib/fold-notes-key.js` 的 `deriveFoldNote` 一直在读
+`payload.chars`——而引擎**从来没有这个键**。真链路键面（`runToolLoop` + `fold-statistical`，
+0.26.0 实测）是 `{text, source, strategy, bytes, fingerprint, round}`，被夹断时多
+`truncated`/`bytesBefore`，策略给出区间时多 `from`/`to`/`rounds`。⇒ 生产上那条折走存档**永远**写
+「摘掉正文 ? 字」，规模这一维自 #392 C 片上线起就没通过。而 §8.66 那 13 条判据一直全绿，因为
+夹具手写了 `chars: 184_320`：**#331「没人读的光纤」这次复发的位置是测试夹具本身**——喂进去的
+形状是手搓的，不是从引擎取的。现在：规模以 `bytes` 为主口径（截断过就一并写「夹断前 N B」），
+`chars` 只在引擎真给了时才写，两个都没有就老实写「规模未知」；`K`/`C15` 钉值，`C18` 直接读
+**已安装引擎的源码**钉住「给 `bytes` 不给 `chars`」（与 `C14` 同一手法：不信注释不信夹具）。
+
+**A1b：erix-agent #485（已合 main、未发版）追加的三键按「有就写、没有就不写」处理。**
+`foldedRoundRange{from,to}` → 「折走第 a–b 轮」，退回引擎自己的平铺 `from`/`to`，两者都缺才退回
+旧的「第 N 轮及之前」；`foldedThrough` → 「水位线到第 X 轮」；`foldedRoundCount` → 「本 run 累计折
+N 轮」——契约（host-consumer-contract #479）明写它是 **run 作用域**、resume 后归零，所以文案里
+那个「本 run」是**口径不是措辞**，写成「会话累计」就是把一个会归零的数说成不会归零的数。
+不发 `0` 也不发 `?`：那会把「引擎没给」读成「水位线是 0」。后果是现在合进 0.26.0 表现逐字不变
+（少写两行），pin 到 ≥0.27.0 之后自动亮。
+
+**A2：降级在引擎侧是故意静默的，出口必须宿主自己接。** 上游裁定一是「降级不新增事件类型，只记进
+`CompactionStat.foldSummary`」，而 `fold-statistical` 下那五个键**全缺席**（契约不是 bug）——于是
+「折了 46 轮」和「折了 46 轮、但摘要是超时降级的次品」在界面上逐字一样。两条嘴：
+`worker.js` 导出的 `foldDegradeNotice`（→ agentd 一条 `level:'warn'`，优先 `degradeKind` 短枚举，
+只拿到 #482/#491 的整句 `degradeReason` 时退回它并截 200 字）与前端 `compactionDegradeText`
+（→ #392-D 横幅后缀 `（⚠ …）`）。两处都**只加不改**：不改 `compaction` 事件本体、不改终态——
+摘要降级不是 run 失败，模型拿到的仍是机械摘要，把正常完成的 run 刷红是误报；无降级时文案逐字
+不变（历史回放里的旧事件不得多出一段括号）。
+
+**A4：本站走直连 `runToolLoop`，上游的装配期校验一次也不会触发。** #488/#493 的校验（未知子键抛
+`TypeError`、旋钮值必须安全正整数）只挂在 `createAssemblyPort` 上，而本站从不用它。真链路实测
+（`K6`）：`context: { strategy:'fold-statistical', summarizerTimeout:5000, maxSummaryTokens:'abc' }`
+——键名少了 `Ms`、值是个字符串——在引擎里一路 `end_turn`，不抛错、不发事件、不红。所以
+`runner/lib/compact-knobs.js` 是本站唯一的拦截点：键名白名单 + 安全正整数，`worker.js` 里
+`context:` 包一层 `assertCompactContext(…)`（抛错走 §8 里的 #212 失败信封，有 `RUN_FINISHED failed`
++ 人能读的 reason，比静默跑默认值和比 exit 1 无终态都好看）。`fold-strategy.test.js` 的抠块求值
+现在**注入真校验器**而不是桩，于是往 worker 的 `context` 里加一个拼错的键，那条老判据当场红。
+`keepRounds: 0` 是合法值（含义是「折掉除最后一轮以外的全部」），所以那一支单独按「非负整数」判，
+不能套「>0 才算给」。
+
+**四个上限仍然不写、也不给 env 旋钮**（§8.65 同一条理由：策略与上限不是运维参数，改它要改的是
+判据不是配置）。上游的默认值就是本站的裁定值（30 000 ms / 30 000 ms / 49 152 B / 24 576 B /
+1 400 tok），省略与写死等价，`K5` 钉住"写死也不会被自己的白名单拦下"。`worker.js` 里两处口径注释
+同步改了：`fold-llm` 那条从「#469 未修」改成「已修 + 本站三条闸门」，`maxTokens` 继承那条加了
+「pin 0.27.0 后变成 `min(宿主 maxTokens, maxSummaryTokens ?? 1400)`，方向是变严，届时重跑口径」。
+
+**基线**（主 agent 亲跑，`wt-392f` 干净依赖 `npm ci --prefer-offline`）：根 `npm test`
+**1656 → 1671**（0 失败 / 4 跳过不变；净 +15 = `runner/test/compact-knobs.test.js` 新建 11 条 +
+`fold-notes.test.js` 的 C15–C18 四条）、`runner` `node --test` **399 → 414**（0 失败）、前端
+**50 文件 / 925 → 926**（`useEventStream.spec.ts` +1 条，`vue-tsc --noEmit` 干净）。⚠ `.github/workflows/ci.yml`
+里那句「1401 项基线」自 #282 起就没再跟（现值 1671），本单**不动它**——那是 §8 反复警告过的
+「顺手修陈旧物」，要修得单开一单把整串台账一次理直。
+
+**别改回去的四件事**：① `deriveFoldNote` 里那个 `bytes` 主口径（读 `chars` 的那版本在 0.26.0 上
+**永远**输出「?」，而单测照样全绿）；② `C18` 那条读引擎源码的 tripwire（它就是为了①而存在的）；
+③ `fold-strategy.test.js` 注入的是**真**校验器不是桩（换成桩，worker 里加错键就又看不见了）；
+④ A2 两处「只加不改」（改了事件本体或终态，就是把一次正常完成的 run 刷成错误，还会让历史回放里
+的旧事件多出一段括号）。

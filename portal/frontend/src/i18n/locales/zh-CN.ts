@@ -290,10 +290,17 @@ export const zhCN = {
       judgeDegraded: '评审降级（{error}），本轮未给出意见',
       judgeUnknownAction: '评审动作：{action}',
       judgeNoDetail: '评审事件（无可解读细节）',
-      compaction: '上下文折叠（round {round}，策略 {strategy}）：{folded} 轮折叠，{before} → {after} tokens',
+      compaction: '上下文折叠（round {round}，策略 {strategy}）：{folded} 轮折叠，{before} → {after} tokens{degrade}',
       // #464 A：策略名是引擎写实例上的那个名字（含库层兜底 `sliding-window`），不是配置项原文；
       // 旧事件没这个字段 ⇒ 拿它填一个显式的「未知」，而不是留空让人以为「策略叫不出名字」。
       compactionStrategyUnknown: '未知',
+      // erix-agent #469 后续（A2）：摘要降级在引擎侧是**故意静默**的（只进
+      // `CompactionStat.foldSummary`，不新增事件类型），不拼这里就只有去看日志的人才知道。
+      // `degradeNote` 由本文件拼好（括号整块交给文案，代码不拼标点）。
+      compactionDegradeNote: '（⚠ {body}）',
+      compactionDegraded: '摘要已降级：{kind}',
+      compactionUnshrinkable: '摘要压不下去（回写比输入还大）',
+      compactionTruncated: '摘要被输出预算截断',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',
       runEnd: 'run 结束：{reason}{usage}',

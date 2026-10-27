@@ -531,6 +531,36 @@ describe('useEventStream（mock EventSource）', () => {
     ]);
   });
 
+  // erix-agent #469 宿主侧后续（A2）：降级只进 `CompactionStat.foldSummary`、**不新增事件类型**（上游
+  // 裁定一），不拼这一段就只能让人看出「折了 46 轮」而看不出「那 46 轮的摘要是超时降级的次品」。
+  // 同时钉住「没降级时逐字不变」：历史回放里的旧事件不得多出一段括号。
+  it('compaction 分隔行把 foldSummary 里的降级事实拼出来（无降级时逐字不变）', () => {
+    const sepTexts = (payload: Record<string, unknown>) => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.connect('sess-1');
+      lastES().emit('compaction', { round: 9, compaction: payload });
+      return hooks.onSep.mock.calls.map((c) => c[0])[0];
+    };
+    const base = { foldedRounds: 46, tokensBefore: 261345, tokensAfter: 8000, strategyName: 'fold-llm' };
+    expect(sepTexts(base)).toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
+    expect(sepTexts({ ...base, foldSummary: {} })).toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
+    expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeKind: 'timeout' } }))
+      .toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens（⚠ 摘要已降级：timeout）');
+    // `degradeReason` 是 #482/#491 的整句，kind 缺席时退回它；两者都在时以 kind 为准（日志要能 grep）
+    expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeReason: '摘要器没在预算内回来' } }))
+      .toContain('摘要已降级：摘要器没在预算内回来');
+    expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeKind: 'error', degradeReason: '整句' } }))
+      .toContain('摘要已降级：error');
+    // 两类超预算事实（#490）一条拼全
+    const both = sepTexts({ ...base, foldSummary: { unshrinkable: true, finishReason: 'max_tokens' } });
+    expect(both).toContain('摘要压不下去');
+    expect(both).toContain('摘要被输出预算截断');
+    // 正常收尾不是事实
+    expect(sepTexts({ ...base, foldSummary: { finishReason: 'end_turn', unshrinkable: false, degraded: false } }))
+      .toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
+  });
+
   it('judge 分隔行带 variant=judge，其余状态行（round/compaction 等）不带', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);

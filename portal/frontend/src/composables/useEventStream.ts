@@ -231,6 +231,28 @@ function judgeOptionalDash(value: unknown, max: number): string {
     : '';
 }
 
+// erix-agent #469 宿主侧后续（A2）：折叠摘要「产出了但是次品」的界面出口。
+//
+// 为什么非宿主不可：上游裁定一是「降级**不新增事件类型**，只记进 `CompactionStat.foldSummary`」，
+// 而且这些字段**只有 `fold-llm` 会写**（`fold-statistical` 下五个键全缺席，这是契约不是 bug）——
+// 所以不拼这一段，「折了 46 轮」与「折了 46 轮、但摘要是超时降级的次品」在横幅上逐字一样。
+// 口径与 `runner/worker.js` 的 `foldDegradeNotice`（日志那条）刻意一致：`degradeKind`（#487，短、
+// 封闭枚举）优先，只拿到 `degradeReason`（#482/#491，整句）时退回它，两类超预算事实另计。
+export function compactionDegradeText(stat: unknown): string {
+  if (!stat || typeof stat !== 'object') return '';
+  const s = stat as Record<string, unknown>;
+  const parts: string[] = [];
+  const kind = typeof s.degradeKind === 'string' && s.degradeKind !== ''
+    ? s.degradeKind
+    : (s.degraded === true && typeof s.degradeReason === 'string' && s.degradeReason !== ''
+      ? s.degradeReason
+      : null);
+  if (kind !== null) parts.push(t('stream.event.compactionDegraded', { kind }));
+  if (s.unshrinkable === true) parts.push(t('stream.event.compactionUnshrinkable'));
+  if (s.finishReason === 'max_tokens') parts.push(t('stream.event.compactionTruncated'));
+  return parts.length === 0 ? '' : t('stream.event.compactionDegradeNote', { body: parts.join('，') });
+}
+
 // 引擎已知 action 全集（orchestrator 轮末 judge + run-snapshot-executor 中途审计，已对 0.20.0 源码核实）；
 // 集合外的新增值（引擎演进 additive）一律中性透传，不反推任何语义。
 const JUDGE_KNOWN_ACTIONS = new Set([
@@ -746,6 +768,10 @@ export function useEventStream(hooks: EventStreamHooks) {
           strategy: typeof c.strategyName === 'string' && c.strategyName !== ''
             ? c.strategyName
             : t('stream.event.compactionStrategyUnknown'),
+          // erix-agent #469 裁定一：摘要降级**不新增事件类型**，只进 `CompactionStat.foldSummary`
+          // ⇒ 界面上「折了 46 轮」与「折了 46 轮但摘要其实是次品」长得一模一样。本行是把那个
+          // 差别拼回来；无降级时 `degrade` 是空串，旧文案逐字不变（历史回放里的旧事件也不得多出一段）。
+          degrade: compactionDegradeText(c.foldSummary),
         }));
         return;
       }
