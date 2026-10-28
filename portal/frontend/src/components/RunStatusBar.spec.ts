@@ -1,7 +1,7 @@
-// 会话页动量状态条单测（issue #282 B 块 + #387 改版）。
+// 会话页动量状态条单测（issue #282 B 块 + #425 改版）。
 // #282 验收：② 运行态计时递增（mock 定时器）、③ 速率估算与 `~` 标注、⑤ `run_end` 带 usage 显示真值 /
 // 不带时**不显示 token 数字**、⑥ 卸载清定时器。
-// #387 验收：运行中**常驻相位段**（等 LLM / 工具中 / 生成中）；标黄阈值从 5s 抬到 `RUN_STALL_THRESHOLD_MS`
+// #425 验收：运行中**常驻相位段**（等 LLM / 工具中 / 生成中）；标黄阈值从 5s 抬到 `RUN_STALL_THRESHOLD_MS`
 // （旧口径几乎常亮，把「大上下文 prefill」报成故障）；本轮 token / 累计 token / 上下文占用运行中就显示。
 // 另加双语（zh-CN / en 都不许把中文写死在模板里）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -62,9 +62,9 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
     expect(rateSeg).toBeDefined();
     expect(rateSeg!.text()).toContain('~');
     expect(rateSeg!.attributes('title')).toBe('速率是前端按字符数近似的估算值（非上游真值）');
-    // #387：运行中必须**一直有相位段**（最后一个事件是 tool_result ⇒ 回到「等模型回话」）。
+    // #425：运行中必须**一直有相位段**（最后一个事件是 tool_result ⇒ 回到「等模型回话」）。
     expect(text).toContain('等待模型回复中');
-    // 整条的 tooltip = 硬刷新边界说明（#387 后边界缩小：token 与窗口不再丢）
+    // 整条的 tooltip = 硬刷新边界说明（#425 后边界缩小：token 与窗口不再丢）
     expect(wrapper.get('.run-status-bar').attributes('title')).toContain('不在历史回放白名单');
   });
 
@@ -80,11 +80,11 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
     expect(wrapper.text()).toContain('本 run 03:42');
   });
 
-  // #387 重写原来那条「>5s 就标黄 + 上游已 Xs 无输出」的用例：
+  // #425 重写原来那条「>5s 就标黄 + 上游已 Xs 无输出」的用例：
   //   * `RUN_FROZEN_THRESHOLD_MS`（5s）现在是「该提一句」的阈值（相位秒数上屏），**不再驱动颜色**；
   //   * 颜色改由 `RUN_STALL_THRESHOLD_MS`（60s）驱动——旧口径在真机 run 里几乎常亮（大上下文 prefill /
   //     长构建都是几十秒），把正常等待报成故障，对非专业用户是误导。
-  it('#387 相位计时：跨 5s 就报秒但不标黄；到 stall 阈值才标黄、心跳才停', async () => {
+  it('#425 相位计时：跨 5s 就报秒但不标黄；到 stall 阈值才标黄、心跳才停', async () => {
     // 阈值钉死（防呆）：若两个常量被改成 0 / Infinity，先在这里快速具名红。
     expect(RUN_FROZEN_THRESHOLD_MS).toBe(5000);
     expect(RUN_STALL_THRESHOLD_MS).toBe(60_000);
@@ -95,7 +95,7 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
 
     vi.advanceTimersByTime(RUN_FROZEN_THRESHOLD_MS);
     await nextTick();
-    // #387：相位段**常驻**（不再是「超过 5s 才冒出来」）——界面安静时也要说清自己在等什么。
+    // #425：相位段**常驻**（不再是「超过 5s 才冒出来」）——界面安静时也要说清自己在等什么。
     expect(wrapper.text()).toContain('等待模型回复中 5s');
 
     vi.advanceTimersByTime(1000); // 6s：报秒，但**不黄**
@@ -108,10 +108,10 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
     await nextTick();
     expect(wrapper.get('.run-status-bar').classes()).toContain('bg-amber-50');
     expect(wrapper.get('.run-status-dot').classes()).not.toContain('animate-pulse');
-    expect(wrapper.text()).toContain('等待模型回复中'); // #387：不再说「上游无输出」，而是说在等什么
+    expect(wrapper.text()).toContain('等待模型回复中'); // #425：不再说「上游无输出」，而是说在等什么
   });
 
-  it('#387 工具执行中：相位段带工具名，不再让用户面对「安静 = 挂了」', async () => {
+  it('#425 工具执行中：相位段带工具名，不再让用户面对「安静 = 挂了」', async () => {
     const store = useWorkbenchStore();
     store.momentum.beginRun('r1', Date.now());
     store.momentum.ingest('round_start', { run_id: 'r1', round: 4 });
@@ -124,7 +124,7 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
     expect(wrapper.get('.run-status-bar').classes()).not.toContain('bg-amber-50');
   });
 
-  it('#387 本轮 token / 累计 token / 上下文占用：运行中就显示（全是上游真值，不带 ~）', async () => {
+  it('#425 本轮 token / 累计 token / 上下文占用：运行中就显示（全是上游真值，不带 ~）', async () => {
     const store = useWorkbenchStore();
     store.momentum.beginRun('r1', Date.now());
     store.momentum.ingest('round_start', { run_id: 'r1', round: 5 });
@@ -154,7 +154,7 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
     expect(tokenSeg?.attributes('title')).toContain('不是花费');
   });
 
-  it('#387 没有 context_window（模型未配元数据）：上下文段整段不出，不拿 0% 冒充', async () => {
+  it('#425 没有 context_window（模型未配元数据）：上下文段整段不出，不拿 0% 冒充', async () => {
     const store = useWorkbenchStore();
     store.momentum.beginRun('r1', Date.now());
     store.momentum.ingest('usage', { run_id: 'r1', round: 1, usage: { input_tokens: 1000 } });
@@ -164,7 +164,7 @@ describe('运行态状态条（● running · round · ↑ 输出量 · ~速率 
     expect(wrapper.text()).not.toMatch(/0%|NaN%/);
   });
 
-  it('#387 硬刷新后：历史 round_end 的累计 token 仍显示（不谎报在跑，也不假装有时刻）', async () => {
+  it('#425 硬刷新后：历史 round_end 的累计 token 仍显示（不谎报在跑，也不假装有时刻）', async () => {
     const store = useWorkbenchStore();
     store.sessionId = 's1';
     store.momentum.ingest('round_end', {

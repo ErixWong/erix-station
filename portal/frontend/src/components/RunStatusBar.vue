@@ -8,11 +8,11 @@
 // 本组件**只渲染**：所有「拿不到」在派生视图里就是 null，这里一律整段不出——不显示 0、不显示
 // `NaN`/`undefined`/`0.0 KB`。
 //
-// 硬刷新边界：`run_end` 不在历史回放白名单 ⇒ 运行中的速率/时长拿不回来；#387 开的那唯一的口子
+// 硬刷新边界：`run_end` 不在历史回放白名单 ⇒ 运行中的速率/时长拿不回来；#425 开的那唯一的口子
 // 是历史 `round_end` 的累计用量（见 `useRunMomentum.ts` 的 `historyUsageOnly`），所以刷新后
 // 「上次 run 用了多少 token / 窗口多大」还在。整条 tooltip 说清剩余边界。
 //
-// issue #387（用户体验）：本条从「只有出事才说话」改成「**一直在说话**」：
+// issue #425（用户体验）：本条从「只有出事才说话」改成「**一直在说话**」：
 //   * 运行中始终有一段**相位**（等待 LLM 中 12s / 工具 shell 执行中 8s / 正在生成），
 //     让「界面安静」不再等于「可能挂了」——非专业用户判不了这两件事，也不该由界面误导他们；
 //   * 颜色只在真到了 `RUN_STALL_THRESHOLD_MS` 才变黄（旧的 5s 标黄把「大上下文 prefill」报成故障）；
@@ -83,7 +83,7 @@ function wholeSeconds(ms: number | null): number | null {
 }
 
 /**
- * 相位段（#387 的核心）：运行中**一直在**——`round_start` ⇒ 等待 LLM；`assistant_delta` ⇒ 正在生成；
+ * 相位段（#425 的核心）：运行中**一直在**——`round_start` ⇒ 等待 LLM；`assistant_delta` ⇒ 正在生成；
  * `tool_use` ⇒ 工具执行中（带工具名，工具名不是中文文案所以不 i18n：它是上游给的数据）。
  * 相位未知（旧后端 / 首帧前）退回旧的静默时长文案，并且仍只在阈值后出现（不改变既有可见性）。
  */
@@ -92,7 +92,7 @@ const phaseSegment = computed<{ text: string; title?: string } | null>(() => {
   if (!v.running) return null;
   const sec = wholeSeconds(v.phaseMs ?? v.frozenMs);
   if (sec === null) return null;
-  // 相位已知 ⇒ 立刻可见（0s 起就写「等待 LLM 中」，这正是 #387 要的「一直在说话」）。
+  // 相位已知 ⇒ 立刻可见（0s 起就写「等待 LLM 中」，这正是 #425 要的「一直在说话」）。
   if (v.phase === 'awaiting_llm') {
     return { text: t('runStatus.phaseAwaiting', { sec }), title: t('runStatus.phaseAwaitingHint') };
   }
@@ -173,7 +173,7 @@ const segments = computed<Array<{ text: string; title?: string }>>(() => {
     if (elapsed !== '') parts.push({ text: t('runStatus.runElapsed', { dur: elapsed }) });
     if (tools !== '') parts.push({ text: tools });
   } else if (v.hasLastRun) {
-    // 空闲态：上次 run 概况，能拿到什么显示什么。#387 之后「tokens」这一段即使硬刷新也还在
+    // 空闲态：上次 run 概况，能拿到什么显示什么。#425 之后「tokens」这一段即使硬刷新也还在
     // （来源 = 历史 `round_end` 的累计真值）；真的没数据（旧 run / 没配元数据）时仍然一段都不出。
     if (elapsed !== '') parts.push({ text: t('runStatus.lastRunElapsed', { dur: elapsed }) });
     if (size !== '') parts.push({ text: t('runStatus.output', { size }) });
@@ -196,7 +196,7 @@ const segments = computed<Array<{ text: string; title?: string }>>(() => {
     :aria-label="t('runStatus.aria')"
     :title="t('runStatus.refreshBoundary')"
   >
-    <!-- 心跳：运行中脉冲（复用既有 Tailwind animate-pulse，不新造动画）。#387：只要还在收流/还在等
+    <!-- 心跳：运行中脉冲（复用既有 Tailwind animate-pulse，不新造动画）。#425：只要还在收流/还在等
          工具就继续脉冲——它表达的是「进程活着」，不再是「5 秒内有输出」；只有整体 stall 才停。 -->
     <span
       class="run-status-dot shrink-0"

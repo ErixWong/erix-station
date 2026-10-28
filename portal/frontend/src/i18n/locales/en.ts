@@ -360,7 +360,7 @@ export const en = {
     runningElapsed: 'running for {dur}',
     runningHint: 'This run is still executing; numbers refresh every second',
     messageTimeTitle: 'Message time',
-    // ---- issue #387: phase + tokens (the bar must always be able to say what it is waiting on) ----
+    // ---- issue #425: phase + tokens (the bar must always be able to say what it is waiting on) ----
     // `{tool}` is the upstream tool identifier (an English token by nature, not translated here).
     phaseAwaiting: 'waiting for the model {sec}s',
     phaseAwaitingHint: 'The request is out and the model has not started answering yet. With a large context this silence can legitimately last tens of seconds; it is not a failure',

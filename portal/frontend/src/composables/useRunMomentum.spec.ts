@@ -198,8 +198,8 @@ describe('store 接线（useEventStream 的 onEvent 旁路）', () => {
   });
 });
 
-// ---- issue #387：相位跟踪 / usage 面 / 历史用量口子 ----
-describe('#387 相位跟踪（让状态条一直说得出自己在等什么）', () => {
+// ---- issue #425：相位跟踪 / usage 面 / 历史用量口子 ----
+describe('#425 相位跟踪（让状态条一直说得出自己在等什么）', () => {
   it('round_start ⇒ 等 LLM；delta ⇒ 收流；tool_use ⇒ 工具中（带名字）；tool_result 全部交差 ⇒ 回到等 LLM', () => {
     const feed = createRunMomentumFeed();
     feed.beginRun('r1', 0);
@@ -240,7 +240,7 @@ describe('#387 相位跟踪（让状态条一直说得出自己在等什么）',
   });
 });
 
-describe('#387 usage 面（单次调用 vs 本 run 累计两个数，都不估算）', () => {
+describe('#425 usage 面（单次调用 vs 本 run 累计两个数，都不估算）', () => {
   it('usage 落到 roundUsage（不是 run_end 的 usage）；同轮多次调用累加', () => {
     const feed = createRunMomentumFeed();
     feed.beginRun('r1', 0);
@@ -287,7 +287,7 @@ describe('#387 usage 面（单次调用 vs 本 run 累计两个数，都不估�
   });
 });
 
-describe('#387 历史回放的唯一口子：round_end 的累计用量（其余历史帧仍一律短路）', () => {
+describe('#425 历史回放的唯一口子：round_end 的累计用量（其余历史帧仍一律短路）', () => {
   it('硬刷新后：历史 round_end 填出「上次 run」的 token 与窗口，但状态仍是空闲', () => {
     const feed = createRunMomentumFeed();
     feed.ingest('round_end', {

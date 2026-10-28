@@ -215,7 +215,7 @@ export function loopEventPayload(event, meta = {}) {
     case 'recovered':
       return { round: event.round, attempt: event.attempt };
     case 'usage': {
-      // issue #387：`usage` 是**单次 provider 调用**的用量，此前被 `onEvent` 整条丢掉（见下方注释），
+      // issue #425：`usage` 是**单次 provider 调用**的用量，此前被 `onEvent` 整条丢掉（见下方注释），
       // 界面上「上下文占了多少 / 这一轮烧了多少」因此永远拿不到真值。现在放行展示，
       // **记账仍然只认 U2 终态载荷**（§7.3/§6.3-6 的口径没动，只是不再拿「不记账」当「不显示」）。
       // `context_window` 是**宿主侧 additive 字段**（引擎事件里没有，来自 RUN_START 下行的模型元数据，
@@ -716,7 +716,7 @@ async function startRun(msg) {
       }),
       /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
-      // issue #387：**不再丢弃 `usage`**（旧代码在这里 `return`，理由是「双源去重」——但去重针对的是
+      // issue #425：**不再丢弃 `usage`**（旧代码在这里 `return`，理由是「双源去重」——但去重针对的是
       // **记账**，而记账本就只走 U2 织态载荷（§7.3-6：「onEvent 的 usage 类事件仅实时展示、不产生第二条
       // 记账」）。旧写法把「不记账」做成了「不显示」，于是用户界面上除了织态那一行永远看不到任何
       // token 数字，「上下文到底吃了多少」只能猜。现在按 §7.3-6 的原意放行：只展示，不记账。

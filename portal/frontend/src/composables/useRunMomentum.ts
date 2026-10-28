@@ -11,7 +11,7 @@
 // 处理是 `ingest(..., history=true)` **直接短路**——历史帧（含 round_start/tool_use）一律不驱动运行态，
 // 于是刷新后回落成「只有消息时间戳 + 会话级信息」。**不许用假数据把空白填满**。
 //
-// issue #387 只开了**一个口子，且只开在用量上**：`round_end` 在白名单里，而它的 `usage` 是本 run 的
+// issue #425 只开了**一个口子，且只开在用量上**：`round_end` 在白名单里，而它的 `usage` 是本 run 的
 // 累计真值 ⇒ 刷新后「上次 run 吃了多少 token / 窗口多大」能拿回来。相位 / 轮号 / 时长 / 速率
 // 依旧一律不吃历史帧（那会把历史帧说成「现在在跑」）。
 import { computed, onMounted, onUnmounted, reactive, ref, type ComputedRef } from 'vue';
@@ -161,7 +161,7 @@ export function createRunMomentumFeed(): RunMomentumFeed {
       const termination = (d.termination as { reason?: unknown } | null | undefined)?.reason;
       state.termination = typeof termination === 'string' && termination !== '' ? termination : null;
       // 真值优先：`run_end.usage` 有就显示真值，没有就保持 null（界面不出 token 数字）。
-      // 来源标成实时：此后任何历史 `round_end` 都不得回退它（#387）。
+      // 来源标成实时：此后任何历史 `round_end` 都不得回退它（#425）。
       state.usage = readUsage(d.usage);
       state.usageFromHistory = false;
       return;
@@ -207,14 +207,14 @@ export function createRunMomentumFeed(): RunMomentumFeed {
       case 'recovering':
       case 'recovered':
         // 脏轮号不覆盖已知值（不拿「旧轮号冒充当前轮」，也不写 NaN）。
-        if (typeof d.round === 'number' && Number.isFinite(d.round)) state.round = d.round;        // #387：这四个事件都发生在「刚把请求发出去」的时刻 ⇒ 相位 = 等 LLM。
+        if (typeof d.round === 'number' && Number.isFinite(d.round)) state.round = d.round;        // #425：这四个事件都发生在「刚把请求发出去」的时刻 ⇒ 相位 = 等 LLM。
         // 新一轮开始 ⇒ 上轮的用量不再是「本轮」（宁可不显，也不拿 N-1 轮的数冒充 N 轮）。
         state.roundUsage = null;
         state.roundUsageRound = null;
         enterPhase('awaiting_llm', nowMs);
         return;
       case 'usage': {
-        // #387：单次 provider 调用的真值。同轮多次调用（续写/重试）累加到本轮；换轮则重置。
+        // #425：单次 provider 调用的真值。同轮多次调用（续写/重试）累加到本轮；换轮则重置。
         const usage = readUsage(d.usage);
         const round = finiteOrNull(d.round);
         if (usage !== null) {
@@ -235,7 +235,7 @@ export function createRunMomentumFeed(): RunMomentumFeed {
       }
       case 'round_end':
         if (typeof d.round === 'number' && Number.isFinite(d.round)) state.round = d.round;
-        // #387：引擎给的是**本 run 累计**真值（口径见 lib 层注释）；没有就不覆盖旧值。
+        // #425：引擎给的是**本 run 累计**真值（口径见 lib 层注释）；没有就不覆盖旧值。
         {
           const usage = readUsage(d.usage);
           if (usage !== null) state.runUsage = usage;

@@ -259,7 +259,7 @@ test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端�
 });
 
 // ---------------------------------------------------------------------------
-// issue #387（用户体验）：**过程播报**。现场痛点是「agent 干活途中一个字都不说」：
+// issue #425（用户体验）：**过程播报**。现场痛点是「agent 干活途中一个字都不说」：
 // 界面上能看见的只有工具卡片和偶发的正文，而 transcript 里 `stop_reason=tool_use` 的轮次只有
 // 164/973 带正文 ⇒ 一条十几分钟的 run 里用户可能只看到卡片在动。这不是引擎问题（流式通道本来就在），
 // 是提示词里从来没要求过「把进展说出来」。本段只钉行为要点，不钉措辞。
@@ -269,7 +269,7 @@ test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端�
 function narrationSection(prompt) {
   const lines = prompt.split('\n');
   const start = lines.findIndex((l) => l.startsWith('过程播报'));
-  assert.notEqual(start, -1, 'SYSTEM_PROMPT 必须有「过程播报」这一段（#387 的落点）');
+  assert.notEqual(start, -1, 'SYSTEM_PROMPT 必须有「过程播报」这一段（#425 的落点）');
   const rest = lines.slice(start);
   const end = rest.findIndex((l) => l.trim() === '');
   const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
@@ -277,7 +277,7 @@ function narrationSection(prompt) {
   return section;
 }
 
-test('#387：SYSTEM_PROMPT 有「过程播报」段，并写清开工先回一句 / 阶段报结果 / 失败也要报', () => {
+test('#425：SYSTEM_PROMPT 有「过程播报」段，并写清开工先回一句 / 阶段报结果 / 失败也要报', () => {
   const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
   const section = narrationSection(prompt);
   // ① 开工先回一句（否则从发送到第一个工具卡片之前用户看到的是完全空白）
@@ -294,7 +294,7 @@ test('#387：SYSTEM_PROMPT 有「过程播报」段，并写清开工先回一�
   assert.match(section, /一句话|不是报告/, '必须钉住播报的长度约束');
 });
 
-test('#387：播报段不得把「多久没说话」这类展示层阈值拄进提示词（单一真相在前端常量）', () => {
+test('#425：播报段不得把「多久没说话」这类展示层阈值拄进提示词（单一真相在前端常量）', () => {
   const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
   const section = narrationSection(prompt);
   // 状态条的等待阈值住在 portal/frontend/src/lib/runMomentum.ts；提示词里写「超过 60 秒没说话」
@@ -302,7 +302,7 @@ test('#387：播报段不得把「多久没说话」这类展示层阈值拄进�
   assert.doesNotMatch(section, /\d+\s*(秒|s)\b/, '播报段不得写具体秒数/阈值（展示层常量是唯一真相）');
 });
 
-test('#387：usage 事件不再被丢弃（旧代码把「不记账」做成了「不显示」）', () => {
+test('#425：usage 事件不再被丢弃（旧代码把「不记账」做成了「不显示」）', () => {
   const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
   const loop = extractOnEventBlock(src);
   assert.doesNotMatch(loop, /type === 'usage'\)\s*return/, 'onEvent 里不得再 `return` 掉 usage 帧');

@@ -1,4 +1,4 @@
-// issue #387：`usage` 事件的**展示面**（此前被 onEvent 整条丢弃 ⇒ 界面上永远看不到 token 数）。
+// issue #425：`usage` 事件的**展示面**（此前被 onEvent 整条丢弃 ⇒ 界面上永远看不到 token 数）。
 //
 // 口径钉子（三条，逐条对应一种会静默发生的回归）：
 //   ① 引擎给的 `round` + `usage` 原样透出，**不拍平**（docs/api/portal.md §5.3 第 5 行：宿主若拍平成
@@ -12,7 +12,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loopEventPayload } from '../worker.js';
 
-test('#387 ①：引擎的 usage 形状原样透出（round + 嵌套 usage，不拍平、不补键）', () => {
+test('#425 ①：引擎的 usage 形状原样透出（round + 嵌套 usage，不拍平、不补键）', () => {
   const payload = loopEventPayload({
     type: 'usage', round: 12, usage: { input_tokens: 116_204, output_tokens: 5_560 },
   });
@@ -20,7 +20,7 @@ test('#387 ①：引擎的 usage 形状原样透出（round + 嵌套 usage，不
   assert.equal(payload.input_tokens, undefined, '不得把 usage 拍平到顶层');
 });
 
-test('#387 ②：context_window 只在**正整数**时出现；缺字段 / 脏值 / ≤0 一律不写键', () => {
+test('#425 ②：context_window 只在**正整数**时出现；缺字段 / 脏值 / ≤0 一律不写键', () => {
   const event = { type: 'usage', round: 1, usage: { input_tokens: 10, output_tokens: 2 } };
 
   assert.equal(loopEventPayload(event, { contextWindow: 262_144 }).context_window, 262_144);
@@ -34,7 +34,7 @@ test('#387 ②：context_window 只在**正整数**时出现；缺字段 / 脏�
   assert.equal(Object.hasOwn(loopEventPayload(event), 'context_window'), false);
 });
 
-test('#387 ③：非 usage 事件的 payload 形状不受影响（本单只动 usage 一个 case）', () => {
+test('#425 ③：非 usage 事件的 payload 形状不受影响（本单只动 usage 一个 case）', () => {
   assert.deepEqual(loopEventPayload({ type: 'round_start', round: 3 }, { contextWindow: 128_000 }), { round: 3 });
   assert.deepEqual(loopEventPayload({ type: 'tool_result', toolResult: { tool_use_id: 'c1', erix: { durationMs: 25 } } }),
     { tool_call_id: 'c1', round: undefined, name: null, result_digest: '', duration_ms: 25, ok: true });

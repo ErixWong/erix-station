@@ -158,8 +158,8 @@ describe('deriveMomentumView（派生视图：拿不到就是 null，不是 0）
   });
 });
 
-// ---- issue #387：相位 / 标黄阈值 / 上下文占用 ----
-describe('#387 相位与标黄（颜色不再由 5s 驱动）', () => {
+// ---- issue #425：相位 / 标黄阈值 / 上下文占用 ----
+describe('#425 相位与标黄（颜色不再由 5s 驱动）', () => {
   it('相位时长随时钟走；终态后不再出相位（那时该看「上次 run」，不是「还在等谁」）', () => {
     const state = runningState({ startedAt: 0, phase: 'awaiting_llm', phaseAt: 1_000 });
     expect(deriveMomentumView(state, 6_000).phaseMs).toBe(5_000);
@@ -191,7 +191,7 @@ describe('#387 相位与标黄（颜色不再由 5s 驱动）', () => {
   });
 });
 
-describe('#387 上下文占用（分子分母都得是真值，缺一不出）', () => {
+describe('#425 上下文占用（分子分母都得是真值，缺一不出）', () => {
   it('本轮输入 / 窗口 ⇒ 百分比（取整）', () => {
     const state = runningState({
       roundUsage: { input_tokens: 116_204 },

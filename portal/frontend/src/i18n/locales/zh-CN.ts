@@ -378,15 +378,15 @@ export const zhCN = {
     lastRunElapsed: '上次 run {dur}',
     tools: '工具 {count} 次',
     toolsAvg: '（均 {dur}）',
-    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）。#387 后这句只在
+    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）。#425 后这句只在
     // **相位未知**（旧后端/首帧前）时才用；颜色改由 RUN_STALL_THRESHOLD_MS 负责（见下面 phase*）。
     frozen: '已 {sec}s 没有新内容',
-    // 硬刷新边界（状态条 tooltip）：`run_end` 不在历史回放白名单；#387 只把历史 `round_end` 的累计用量放进来了。
+    // 硬刷新边界（状态条 tooltip）：`run_end` 不在历史回放白名单；#425 只把历史 `round_end` 的累计用量放进来了。
     refreshBoundary: '刷新后运行中的速率与时长会丢失（run_end 不在历史回放白名单）；上次 run 的 token 与上下文窗口仍会显示（来自历史 round_end 的累计用量）',
     runningElapsed: '已运行 {dur}',
     runningHint: '该 run 仍在执行：数值每 1 秒刷新',
     messageTimeTitle: '消息时刻',
-    // ---- issue #387：相位与 token（目标：界面一直说得出自己在等什么，不让用户猜）----
+    // ---- issue #425：相位与 token（目标：界面一直说得出自己在等什么，不让用户猜）----
     // 相位三选一（运行中常驻）。名字里的 {tool} 是上游给的工具名（英文标识符，不翻译）。
     phaseAwaiting: '等待模型回复中 {sec}s',
     phaseAwaitingHint: '请求已发出，模型还没开始回话。上下文越大，“首字节前的静默”可以正常地长达几十秒，这不是故障',
