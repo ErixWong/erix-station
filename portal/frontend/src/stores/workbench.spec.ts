@@ -2188,3 +2188,114 @@ describe('流式增量气泡响应性（打字机效果回归）', () => {
     stop();
   });
 });
+
+// ---- issue #428：换账号的全量复位 ----
+// 病根：登出只清 auth store + router.replace('/login')（SPA 不重载页面），本 store 是全局单例 ⇒
+// 上一个账号的消息流 / 目录 / 会话 / 草稿 / SSE 原样活到下一个账号，「切换用户后首页对话窗口里
+// 还是上一个账户的对话」。`resetSessionView()` 救不了：它唯一的自动触发点没有 immediate，重新登录
+// 挂载时 route.params.id 恒为 undefined ⇒ 回调不跑。
+describe('#428 换账号复位（claimOwnership / resetForUserSwitch）', () => {
+  /** 目录 + 会话详情 + 历史的最小完整桩（openSession 需要三端点齐）。 */
+  function userHandler(dirName: string) {
+    return (url: string) => {
+      if (url.startsWith('/api/dirs')) {
+        return { status: 200, body: { dirs: [{ name: dirName, cwd: `~/projects/${dirName}`, running_count: 0, queued_count: 0 }] } };
+      }
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return {
+          status: 200,
+          body: {
+            session: { id: 's1', active_run_id: null, message_count: 1 },
+            messages: [{ id: 'm1', role: 'user', content: '上一个账号的对话', seq: 1 }],
+            last_seq: 1,
+          },
+        };
+      }
+      return { status: 200, body: { items: [] } };
+    };
+  }
+
+  /** 把 store 灌成「A 正在用」的样子（含挂载时的认领）：目录 + 会话 + 消息流 + SSE + 草稿 + 队列。 */
+  async function seedAsUserA(store: ReturnType<typeof useWorkbenchStore>) {
+    mockFetch(userHandler('alpha'));
+    store.claimOwnership('u1'); // WorkbenchView.onMounted 的第一步（真实流程里恒发生在灌数据之前）
+    await store.initWorkspace();
+    await store.openSession('s1');
+    store.inputValue = '打了一半的话';
+    store.saveDraft();
+    store.applyQueueSnapshot({ steering: [{ id: 'q1', content: '排队里的话' } as never], follow_up: [] });
+  }
+
+  it('身份变化：消息流/会话/目录/草稿/队列全清，SSE 关闭', async () => {
+    const store = useWorkbenchStore();
+    await seedAsUserA(store);
+    // 前置自检：A 的状态确实建起来了（否则下面的断言是空对空）
+    expect(store.entries.length).toBeGreaterThan(0);
+    expect(store.sessionId).toBe('s1');
+    expect(store.dirCwd).toBe('~/projects/alpha');
+    expect(store.queuedCount).toBe(1);
+    const connection = FakeEventSource.instances.at(-1)!;
+    expect(connection.closed).toBe(false);
+
+    expect(store.claimOwnership('u2')).toBe(true); // A → B：复位发生
+
+    expect(store.entries).toEqual([]); // 对话窗口的内容不再属于下一个账号
+    expect(store.sessionId).toBeNull();
+    expect(store.sessionMessageCount).toBeNull();
+    expect(store.dirs).toEqual([]);
+    expect(store.dirCwd).toBeNull(); // 目录 cwd 是上一个账号家目录下的路径 ⇒ 同样跨账号
+    expect(store.sessions).toEqual([]);
+    expect(store.noDir).toBe(true);
+    expect(store.inputValue).toBe('');
+    expect(store.queuedCount).toBe(0);
+    expect(store.lastSend).toBeNull();
+    expect(store.retryAvailable).toBe(false);
+    expect(store.olderMessagesCursor).toBeNull();
+    expect(store.es.toolCards.size).toBe(0);
+    expect(connection.closed).toBe(true); // 连接本身必须断：否则带着 A 的会话继续收帧
+  });
+
+  it('同一身份重复认领不清（同一个人重挂载不是换账号）', async () => {
+    const store = useWorkbenchStore();
+    await seedAsUserA(store);
+    expect(store.claimOwnership('u1')).toBe(false); // seed 里已认领过 u1 ⇒ 同身份不再复位
+    expect(store.entries.length).toBeGreaterThan(0);
+    expect(store.sessionId).toBe('s1');
+    expect(store.claimOwnership('u1')).toBe(false);
+    expect(store.entries.length).toBeGreaterThan(0);
+  });
+
+  it('登出（claimOwnership(null)）后**同一账号**再登录也复位——草稿不得按会话 id 复活', async () => {
+    const store = useWorkbenchStore();
+    await seedAsUserA(store);
+    expect(store.claimOwnership(null)).toBe(true); // onLogout
+    // 同一个人重新登录：认领同 id 之前先经过 null，故这里必须是一次全新复位后的状态
+    expect(store.claimOwnership('u1')).toBe(true);
+    expect(store.entries).toEqual([]);
+    mockFetch(userHandler('alpha'));
+    // 关键用例：草稿按 sessionId 键 ⇒ 只有 `drafts.clear()` 能挡住「重开后恢复出上一个账号的半句话」
+    await store.openSession('s1');
+    expect(store.inputValue).toBe('');
+  });
+
+  it('复位后上一账号那次在途 /api/dirs 的迟到响应不得覆盖界面', async () => {
+    const DIR_B = { name: 'beta', cwd: '~/projects/beta', running_count: 0, queued_count: 0 };
+    let resolveLate: (r: Response) => void = () => {};
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      calls += 1;
+      // 第一次（A 的在途请求）挂住，第二次（B 的）立刻返回
+      if (calls === 1) return new Promise<Response>((res) => { resolveLate = res; });
+      return Promise.resolve(jsonResponse(200, { dirs: [DIR_B] }));
+    }));
+    const store = useWorkbenchStore();
+    const late = store.loadDirs(); // A 的请求在途
+    store.resetForUserSwitch(); // 撞开 dirsReqSeq
+    await store.loadDirs(); // B 的目录回来并落地
+    expect(store.dirs.map((d) => d.name)).toEqual(['beta']);
+    resolveLate(jsonResponse(200, { dirs: [{ name: 'alpha', cwd: '~/projects/alpha', running_count: 0, queued_count: 0 }] }));
+    await late;
+    expect(store.dirs.map((d) => d.name)).toEqual(['beta']); // A 的迟到响应被守卫丢弃
+  });
+});
