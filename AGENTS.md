@@ -2614,7 +2614,12 @@ kkFileView 提案）**在仓库里根本不存在**。两份台账长成了两�
   同步接线没有竞态，且**覆盖不经过 `logout()` 的换账号路径**（会话过期后 `forgetExpiredSession()` 回登录页、
   直接粘 `/login` 重登）。登出那次 `claimOwnership(null)` 的作用是**当场**断 SSE 并清空，不给登录页留旧内容。
 
-**顺带查清的一件事（原样记在 issue #428 里，未改代码）**：`send()` 用 `sessionId.value` 定位会话，
-复位之前它是**上一个账号的会话 id** ⇒ 界面看着是「新账号首页」，POST 却打到别人的会话。本修法把
-`sessionId` 归 null，症状随之消失；后端归属判定是否会把这种跨账号写挡成 403/404 **仍未核实**，
-没挡住就是数据串号而不是体验问题。
+**顺带查清的一件事（源码对账，未改代码）**：`send()` 用 `sessionId.value` 定位会话，复位之前它是
+**上一个账号的会话 id** ⇒ 界面看着是「新账号首页」，POST 却打到别人的会话。本修法把 `sessionId` 归
+null，症状随之消失。而**后端本来就挡着**（2026-10-28 对账 `portal/src/sessions.js` / `http.js`）：
+`fetchSession()` 一条 SQL 里同时做存在性与属主校验，`!row || row.user_id !== userId` 与「不存在」
+**同一个 `404 not_found`**（不泄露存在性）；`POST /messages` 在幂等 fn 内先 `assertSessionOwner()`
+（就是 `fetchSession` 的别名）再动笔，`postMessage()` 自己还带 `FOR UPDATE` 二次校，SSE
+`handleSessionStream` 走 `getSession()` 同一口径 ⇒ **跨账号写不会串号，只是把用户看到的一行错误文案
+变得莫名其妙**（"会话不存在"出现在一个看起来刚建好的首页上）。这类「前端状态穿越账号」的 bug 因此
+定级为体验 + 信息泄漏，**不是数据完整性**。
