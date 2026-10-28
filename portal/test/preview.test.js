@@ -258,12 +258,13 @@ class PreviewPool {
       const kind = sql.includes("'session'") ? 'session' : 'ticket';
       let g;
       if (kind === 'ticket') {
-        const [token_hash, user_id, issuer_id, allocation_id, expires_at] = params;
-        g = { id: `g${this.grantSeq++}`, token_hash, user_id, issuer_id, allocation_id, parent_ticket_id: null, kind, state: 'active', expires_at, used_at: null, revoked_at: null, last_seen_at: null };
+        // #429：实现多了一列 login_session_id（$8）——fake 按参数位解析，漂移即红（参数不够时取 undefined→null）。
+        const [token_hash, user_id, issuer_id, allocation_id, expires_at, , , login_session_id] = params;
+        g = { id: `g${this.grantSeq++}`, token_hash, user_id, issuer_id, allocation_id, parent_ticket_id: null, kind, state: 'active', expires_at, used_at: null, revoked_at: null, last_seen_at: null, login_session_id: login_session_id ?? null };
       } else {
-        // preview.js session 插入：VALUES ($1 token_hash, $2 user_id, NULL issuer, $3 allocation_id, $4 parent_ticket_id, 'session', 'active', $5 expires_at, $5)
-        const [token_hash, user_id, allocation_id, parent_ticket_id, expires_at] = params;
-        g = { id: `g${this.grantSeq++}`, token_hash, user_id, issuer_id: null, allocation_id, parent_ticket_id, kind, state: 'active', expires_at, used_at: null, revoked_at: null, last_seen_at: null };
+        // preview.js session 插入：VALUES ($1 token_hash, $2 user_id, NULL issuer, $3 allocation_id, $4 parent_ticket_id, 'session', 'active', $5 expires_at, $5, $6 login_session_id)
+        const [token_hash, user_id, allocation_id, parent_ticket_id, expires_at, login_session_id] = params;
+        g = { id: `g${this.grantSeq++}`, token_hash, user_id, issuer_id: null, allocation_id, parent_ticket_id, kind, state: 'active', expires_at, used_at: null, revoked_at: null, last_seen_at: null, login_session_id: login_session_id ?? null };
       }
       this.grants.push(g);
       return { rows: [] };
@@ -771,4 +772,52 @@ test('#275 读侧护栏（源码级）：hostname 查表必须自带「活行优
   assert.match(lookup, /\bLIMIT 1\b/, '取单行');
   const whereClause = lookup.slice(lookup.indexOf('WHERE'), lookup.indexOf('ORDER BY'));
   assert.doesNotMatch(whereClause, /a\.state\s*<>\s*'released'/, 'WHERE 里不得过滤 released：那会让 allocation_released 变死代码、把 403 改写成 404');
+});
+
+// ---- #429：凭证血缘（登出回收预览平面的前提）----
+test('#429 issuePreviewTicket：把签发时刻的登录会话血缘写进 grant；无会话上下文 ⇒ NULL', async () => {
+  const { pool, grants } = makePool();
+  const out = await issuePreviewTicket(pool, config, {
+    allocationId: 'pa1',
+    session: { user: { id: 'u1', role: 'fde' }, session: { id: 'ls-1' } },
+    now: NOW,
+  });
+  assert.ok(out.ticket);
+  assert.equal(grants[0].login_session_id, 'ls-1', 'ticket 行必须带签发会话血缘（登出撤销按此命中）');
+
+  const out2 = await issuePreviewTicket(pool, config, {
+    allocationId: 'pa1',
+    session: { user: { id: 'u1', role: 'fde' } }, // 无 session.id（测试桩/内部路径）
+    now: NOW,
+  });
+  assert.ok(out2.ticket);
+  assert.equal(grants[1].login_session_id, null, '血缘缺失 ⇒ NULL（登出救不了，靠 TTL 自然到期），不得抛错');
+});
+
+test('#429 ticket 兑换出的 session grant 继承 ticket 的登录会话血缘', async () => {
+  const { pool, grants } = makePool();
+  const ticket = 'pt_lineage_ticket';
+  grants.push({
+    id: 'g1', token_hash: hashToken(ticket), user_id: 'u1', issuer_id: 'u1', allocation_id: 'pa1',
+    parent_ticket_id: null, kind: 'ticket', state: 'active', expires_at: later(60), used_at: null, revoked_at: null,
+    login_session_id: 'ls-42',
+  });
+  const res = await authorizeForwardAuth(pool, config, { hostname: ALLOC.hostname, uri: `/?preview_ticket=${ticket}`, now: NOW });
+  assert.equal(res.outcome, 'redirect');
+  const sess = grants.find((x) => x.kind === 'session');
+  assert.ok(sess);
+  assert.equal(sess.login_session_id, 'ls-42',
+    '派生 session 必须继承血缘——否则登出只撤了没用的 ticket 行，正握着 cookie 的 session 反而活下来（本单主症状）');
+});
+
+test('#429 血缘缺失（迁移前存量/NULL）时兑换不炸，session 行血缘为 NULL', async () => {
+  const { pool, grants } = makePool();
+  const ticket = 'pt_legacy_ticket';
+  grants.push({
+    id: 'g1', token_hash: hashToken(ticket), user_id: 'u1', issuer_id: 'u1', allocation_id: 'pa1',
+    parent_ticket_id: null, kind: 'ticket', state: 'active', expires_at: later(60), used_at: null, revoked_at: null,
+  });
+  const res = await authorizeForwardAuth(pool, config, { hostname: ALLOC.hostname, uri: `/?preview_ticket=${ticket}`, now: NOW });
+  assert.equal(res.outcome, 'redirect');
+  assert.equal(grants.find((x) => x.kind === 'session').login_session_id, null);
 });
