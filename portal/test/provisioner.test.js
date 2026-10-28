@@ -1327,3 +1327,135 @@ test('#399 buildContainerConfig：第四条 bind 必须硬锁 :ro（rw 会让 er
   const credBind = body.HostConfig.Binds.find((b) => b.includes('/run/erix/git'));
   assert.ok(credBind?.endsWith('/platform/git:/run/erix/git:ro'), `凭据 bind 必须挂目录且 :ro，实际 ${credBind}`);
 });
+
+// issue #404：`containers.image` 必须跟上现实，而不是停在开户那一刻。
+// 现网实测：容器已是 v0.1.38 的 digest，库里 `image` 还写着 v0.1.37 的；`agent_version` 停在
+// `0.1.32-088e41e`。后果是「这个 FDE 到底在跑哪个 runner」这个问题在 DB 里问不出答案——
+// 我这两天的部署核对全是人肉 `docker inspect` 对出来的。
+// 病根是写面的形状：`image` 只出现在「DB 没有行」那条 INSERT 上，其余路径（复用 / 重建 / reconcile
+// adopt）一律不写 ⇒ 一次开户定终身。下面三条分别钉住三条写路径 + 一个 409 幂等。
+// onboardFde 全链 fake 成本高的口径沿用本文件既有做法（源码契约锚点）；`ensureFdeContainer`
+// 是纯 docker 交互，直接真跑。
+// ---------------------------------------------------------------------------
+test('#404 ensureFdeContainer：adopt 时 start 撞 409 当幂等成功（Docker 说"它已经在跑了"）', async () => {
+  const calls = [];
+  const docker = {
+    async inspectContainer() {
+      calls.push('inspect');
+      return {
+        status: 200,
+        data: {
+          Id: 'ctr-actual',
+          State: { Status: 'created' }, // inspect 说不在线 → 会去 start，而并发的另一方已经把它起来了
+          Config: { Env: ['ERIX_STATION_TOKEN=tok-x'], Image: 'ghcr.io/x/fde@sha256:newdigest' },
+        },
+      };
+    },
+    async startContainer() { calls.push('start'); return { status: 409, data: { message: 'container already started' } }; },
+  };
+  const res = await ensureFdeContainer(docker, { containerName: 'fde-a', fdeName: 'a', image: 'img:desired' }, { log: { log() {}, warn() {} } });
+  assert.deepEqual(calls, ['inspect', 'start'], '必须先查后起（409 是并发窗口的产物，不是可跳过的步骤）');
+  assert.equal(res.created, false);
+  assert.equal(res.started, false, '409 = 它本来就在跑，不是我们启动的 ⇒ 不许谎报 started=true');
+  assert.equal(res.image, 'ghcr.io/x/fde@sha256:newdigest', 'adopt 必须把**实际**镜像带回调用方，账才写得对');
+});
+
+test('#404 ensureFdeContainer：新建路径也回报实际镜像（created/adopt 同一条写账写法）', async () => {
+  let last;
+  const docker = {
+    async inspectContainer() { return { status: 404, data: null }; },
+    async createContainer(body) { last = body; return { status: 201, data: { Id: 'ctr-new' } }; },
+    async startContainer() { return { status: 204 }; },
+  };
+  const res = await ensureFdeContainer(docker, {
+    fdeName: 'b',
+    containerName: 'fde-b',
+    image: 'img:desired',
+    cmd: ['-port', '4000'],
+    networkName: 'fde-b',
+    ip: '10.200.1.2',
+    gateway: '10.200.1.1',
+    baseDomain: 'localhost',
+    llmHost: 'llm.localhost',
+    userSpaceRoot: '/srv/erix/users',
+  }, { log: { log() {}, warn() {} } });
+  assert.equal(res.created, true);
+  assert.equal(res.image, last.Image, '新建路径的实际镜像 = 传进 create body 的那个引用');
+  assert.equal(res.image, 'img:desired');
+});
+
+test('#404 写面：三条容器写路径都必须更新 image（复用写实际、重建/reconcile 跟随实际）', async () => {
+  const src = await import('node:fs').then((fs) => fs.promises.readFile(
+    new URL('../src/provisioner.js', import.meta.url), 'utf8'));
+  const blocks = src.split('`').map((b) => b.replace(/\s+/g, ' ').trim());
+
+  // ① onboardFde 复用路径：写 `Config.Image`（实际值）。这一条是病根本体——此前这里一个 image 都不写。
+  const reuse = blocks.filter((b) => b.includes('UPDATE containers SET image = COALESCE($2, image)'));
+  assert.ok(reuse.length >= 1, 'onboardFde 复用路径必须写 image（否则换镜像后库里永远是开户那一刻的值）');
+  const reuseWithActual = src.includes('existing.data?.Config?.Image');
+  assert.ok(reuseWithActual, '复用路径必须写**容器实际**镜像（写期望值在 adopt 场景里可能是假话）');
+
+  // ② onboardFde 重建路径：token 轮换那条 UPDATE 必须同时带 image（它紧接着就是 create(config.fdeImage)）。
+  const rotate = blocks.filter((b) => b.includes('UPDATE containers SET runner_token_hash') && b.includes('token_generation'));
+  assert.ok(rotate.length >= 1);
+  assert.ok(rotate.some((b) => b.includes('image = COALESCE($3, image)')),
+    '重建路径的 token 轮换 UPDATE 必须同时更新 image：#404 的账实不一致就是从"这条只动 token"来的');
+  assert.ok(rotate.every((b) => b.includes('revoked_at = NULL')), '不得回退 #22 F1（复用时必须清吊销）');
+
+  // ③ reconcile adopt 分支：不能只在 created / started 时写，未创建的 adopt 也要跟实际对齐。
+  const adopt = blocks.filter((b) => b.includes('UPDATE containers SET image = COALESCE($2, image)') && b.includes('user_id = $1'));
+  assert.ok(adopt.length >= 1, 'reconcile 的 adopt 分支必须写实际镜像（res.image）');
+  assert.ok(src.includes('res.image ?? null'), 'reconcile 必须用 ensureFdeContainer 带回的 res.image，而不是自己猜期望值');
+});
+
+// ---------------------------------------------------------------------------
+// issue #404 结案：`FDE_AGENT_VERSION` 从"版本的来源"降级成"显式 override"。
+// 版本的真相在镜像里（build-info.json，见 runner/lib/build-info.js 与 runner/Dockerfile）。
+// 判据钉三种情形：不设 ⇒ 不注入（容器自己读构建产物）；设成 'dev'（docs/env.md 的开发期占位）
+// ⇒ **仍不注入**（占位冒充上报值正是本次要清除的形状）；显式钉一个真值 ⇒ 注入覆盖。
+// ---------------------------------------------------------------------------
+test('#404 FDE_AGENT_VERSION 只是 override：默认不注入、dev 占位不注入、钉值才注入', async () => {
+  const base = {
+    fdeName: 'alice',
+    containerName: 'fde-alice',
+    image: 'traefik/whoami',
+    cmd: ['-port', '4000'],
+    networkName: 'fde-alice',
+    ip: '10.200.1.2',
+    gateway: '10.200.1.1',
+    baseDomain: 'localhost',
+    llmHost: 'llm.localhost',
+    userSpaceRoot: '/srv/erix/users',
+  };
+  const hasOverride = (body) => body.Env.some((e) => e.startsWith('ERIX_AGENT_VERSION='));
+  assert.equal(hasOverride(buildContainerConfig(base)), false, '不设 ⇒ 让容器读构建产物');
+  assert.equal(hasOverride(buildContainerConfig({ ...base, agentVersion: null })), false);
+  assert.equal(hasOverride(buildContainerConfig({ ...base, agentVersion: 'dev' })), false,
+    'dev 是占位，注进容器就等于让占位冒充上报值（账上那个 0.1.32-088e41e 就是这么来的）');
+  const pinned = buildContainerConfig({ ...base, agentVersion: '0.27.0-rc1' });
+  assert.ok(pinned.Env.includes('ERIX_AGENT_VERSION=0.27.0-rc1'), '显式钉值必须真的落到容器 env');
+});
+
+// ---------------------------------------------------------------------------
+// 交叉核对（issue #404 结案的补漏）：**注入方（provisioner）与放行方（fde-proxy 白名单）是两个模块**。
+// #416 加了 `ERIX_AGENT_VERSION` 注入却没同步白名单，现网 `provision-fde` 直接
+// `create_policy_denied: Env key not allowed: ERIX_AGENT_VERSION`，而两个 FDE 容器当时已被 provision
+// 流程删掉 ⇒ 短暂全停。单侧的测试（"我确实注了这个键"）永远不会发现这件事，因为它两边都"对"。
+// ---------------------------------------------------------------------------
+test('交叉核对：buildContainerConfig 能注入的每个 Env 键，都必须在 fde-proxy 白名单里', async () => {
+  const fs = await import('node:fs');
+  const src = await fs.promises.readFile(new URL('../src/provisioner.js', import.meta.url), 'utf8');
+  const start = src.indexOf('export function buildContainerConfig');
+  const end = src.indexOf('\n}\n', start);
+  assert.ok(start > 0 && end > start, 'buildContainerConfig 源码边界没定位到（判据不能空转）');
+  const injected = [...new Set([...src.slice(start, end).matchAll(/`([A-Z][A-Z0-9_]{2,})=/g)].map((m) => m[1]))].sort();
+  assert.ok(injected.length >= 5, `只解析到 ${injected.length} 个注入键，多半是解析失效而非真的少`);
+
+  const proxy = await fs.promises.readFile(new URL('../../deploy/fde-proxy/server.js', import.meta.url), 'utf8');
+  const m = /const ENV_KEY_ALLOW = new Set\(\[(.*?)\]\)/s.exec(proxy);
+  assert.ok(m, 'fde-proxy 的 ENV_KEY_ALLOW 定义没找到（改名了？那这条判据得同步改）');
+  const allowed = new Set([...m[1].matchAll(/'([A-Z][A-Z0-9_]*)'/g)].map((x) => x[1]));
+
+  const missing = injected.filter((k) => !allowed.has(k));
+  assert.deepEqual(missing, [], `provisioner 会注入但 proxy 不放行的键：${missing.join(', ')} ⇒ 现网 create_policy_denied，容器建不出来`);
+});

@@ -67,6 +67,7 @@ import { fileURLToPath } from 'node:url';
 import * as totp from '../src/totp.js';
 import * as auth from '../src/auth.js';
 import { ensureLlmBinding } from './lib/llm-binding.mjs';
+import { assertHostWritePathsIsolated } from './lib/isolated-env.mjs';
 import { DEFAULT_FDE_IMAGE, DEFAULT_PORTAL_IMAGE, buildFdeImage } from './lib/fde-image.mjs';
 import { BASE_DOMAIN, LLM_HOST, composeDomainEnv } from './lib/compose-domain.mjs';
 // issue #226：`writeTraefikStatic` 与隔离护栏本体一样收归公共模块（wp2a/wp3a/wp3b/wp5/wp6 共用一份）。
@@ -429,6 +430,21 @@ test('WP3b 端到端：真实 runner 镜像 + agentd/worker + mock LLM + 崩溃�
 
     // 2) 起栈（含 LiteLLM；FDE 用真实 runner 镜像：tag + dev-mode + 无 --user）。
     // MIGRATE_ON_START=1：启动迁移完成后，管理台 API 才能创建 credential/model/binding。
+    // issue #412 ④：起栈前证明"我要写的宿主目录都不是共享栈那一份"。判的是 compose 真正拿到的
+    // env（process.env + 这里显式传的），因为事故正是 `--env-file` 把生产的
+    // TRAEFIK_DYNAMIC_DIR_HOST 带了进来 ⇒ 隔离 portal 覆写生产边缘路由，8090 全线 502。
+    assertHostWritePathsIsolated({
+      env: {
+        ...process.env,
+        TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,
+        ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
+        ERIX_ARTIFACTS_ROOT_HOST: S.artifactsRoot,
+        STATION_DB_DIR: S.dbDir,
+      },
+      envFile: process.env.STATION_SHARED_ENV ?? 'deploy/.env',
+      label: `wp3b 隔离实例（stack=${S.stackId ?? process.env.STATION_STACK_ID ?? '?'}）`,
+    });
+
     compose('up -d --build', {
       ERIX_USERSPACE_ROOT_HOST: S.userspaceRoot,
       TRAEFIK_DYNAMIC_DIR_HOST: S.dynamicRoot,

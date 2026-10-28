@@ -54,6 +54,8 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 ⚠ **主工作区 `node_modules` 会被别的 worktree 掏空（同一晚第三次复发）**：症状是 `npm test` 从 1022 项掉到 **510 项 + 34 失败**，且 `node_modules/erix-agent` 不存在——**不是代码回归**，先 `ls -d node_modules/erix-agent` 再下结论，`npm ci --prefer-offline` 重装即回基线。推论：**发版/验收前必须先重装一次并复跑拿到基线数**，别拿一个依赖不完整的树当验收基点。
 
+> **这一族症状的根因已于 #396（`679519a`）消除，但上面那条重装仪式继续有效。** 根因不是「worktree 不拷依赖」，是 `node_modules` 曾被**当文件提交过**（mode 120000 的符号链接，内容是一个**绝对路径**；`.gitignore` 只有 `node_modules/`，**带斜杠只匹配目录**，所以 `git add -A` 把链接扫了进来）。后果是行为而不是观感：一棵依赖树被十几个 worktree 共享，任何一处 `npm install` 都顺链接剪别处的依赖（2026-10-27 实测：一次 `npm install --omit=dev` 把共享树清成空目录，另一个 worktree 的折叠那一族测整片红）；而各分支钉的 `erix-agent` 版本不同（今天就是 main 侧要求 0.26.0、共享树里是 0.25.0），共享树根本无法同时服务。**现在的口径：每个 worktree 自备 `node_modules`**（`npm ci --offline` 热缓存约 0.5s）；旧 worktree 里遗留的链接现在是**未跟踪**文件，`ls -ld node_modules` 看出形态后 `rm` 掉再装即可。判据：`test/repo-hygiene.test.js`（H1 跟踪必须为空；H2 真造一个符号链接复现旧症状，并带「把规则删掉必须看得见」的反向自证）。
+
 ⚠ **前端判绿只能看退出码，不能 grep 摘要行（2026-10-14 主 agent 自己犯的错，代价是一次返工重打 tag）**：vitest 在存在**未捕获拒绝**时照样打印 `Test Files 33 passed (33) / Tests 488 passed (488)`，**但进程以 rc=1 退出**。我当晚用 `npm test 2>&1 | grep -E "Test Files|Tests "` 连跑 3 次都读到「全绿」，实际每一次都是 rc=1、4 条 `Unhandled Rejection` —— 于是把红灯当绿灯合进了 main，直到 CI 步骤 ④ 红才发现。口径：**判绿 = 退出码 0**；要么直接 `npm test; echo rc=$?`，要么 `npm test && echo GREEN`。附带两条：① 这类泄漏的常见成因是 `onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的 Promise），产品侧实例见 issue #281；② 有 worker 把它归因成「本机 `NODE_ENV=production` ⇒ Vue 生产构建吞掉拒绝」，**该说法在本机已被主 agent 实测否证**（`production` 与 `NODE_ENV=test` 两种模式跑原始文件都是 rc=1）——别拿未在自己机器上复现的成因当结论。
 
 ⚠ **GitHub 连不上先怀疑本机 DNS，别反复重试 git（2026-10-24 实证）**：内网 DNS（`10.56.16.16`）把 `github.com` 钉到 `140.82.121.4`、`api.github.com` 钉到 `140.82.121.6`，这两个地址半死不活（TCP 连得上、TLS 握得手、HTTP 不回话）。**间歇性**，同一条命令可能连挂十几分钟再突然通。本机配置：`git` 已按域名注入 `git config --global http.https://github.com/.proxy = http://10.41.24.146:18099`（本机用户在 `10.41.24.146` 自建的代理，另有 SOCKS5 `:18098`），**仅作用于 github.com**；**`gh` 不读 git 配置**，得自己带：`HTTPS_PROXY=http://10.41.24.146:18099 gh …`。⚠ **不要在全局 env 里设 `HTTP(S)_PROXY`**：曾为此跑过一个本地 `127.0.0.1:18443` CONNECT 代理（含 cron 看门狗），结果把 pi 的中转请求（`api.ai.erix.vip`，直连 1s 即通）也代理掉并造成卡死，2026-10-24 已彻底删除——**代理加在本来就通的链上是负收益**。容器内的 `127.0.0.1` 不是宿主，也不继承本机代理（实测 erix agent 容器 DNS 拿到的是好 IP，200/0.6s）。判据：`timeout 8 curl -s -o /dev/null -w "%{http_code}\n" -x http://10.41.24.146:18099 https://api.github.com` 通了就只是本机 DNS 问题；要临时绕开代理用 `git -c http.https://github.com/.proxy= …`。别改 `/etc/hosts`（无 sudo）。最新口径见 `~/projects/AGENTS.md`。
@@ -244,8 +246,6 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 - [x] **未采纳**：**#181**（provider `defaultHeaders`/`extraBody`）——理由：station 不包装 fetch，`runner/` 内无自包 fetch / 自定义 header 代码，接了是空操作；0.18.0 的 `searchText` / `edit` 新文件工具、`createFileTools` 与 skills loader 导出——属 issue **#228** 迁移范围，另派单（本次 `runner/lib/file-tools.js` 一字未动；文件工具部分**已交付**，见 §8.9，skills loader 仍未动）。`judge` 的 `writeToolNames` 默认值 0.18.0 变为 `["writeFile","edit"]`，本站 `runner/worker.js` 只传 `reflection: {enabled: true, roundJudge: true}`、未显式传该字段，**不需动**。
 - [x] **测试口径（M6 全量复跑）**：根 `npm test` **807 项：806 通过 / 0 失败 / 1 跳过**（基点 `06b91c8` 基线 800 项：799 通过 / 1 跳过；净增 7 = 上游契约套件 +2、#180 用例 +4、#182 用例 +1）；`cd runner && node --test` **155 通过 / 0 失败**（基线 150；净增 5 = 上游契约 +1、本次 +4）；`node --test portal/test/termination-contract.test.js` **6/6**；唯一跳过项为基线既有。前端（`portal/frontend/node_modules` 本不存在，按工单以 `NODE_ENV=development npm ci` 装上后跑；**未向仓库引入任何前端 lockfile 变动**，装完 `git status` 仍干净）：`npm run typecheck`（`vue-tsc --noEmit`）**干净无报错**、`npm test`（vitest）**23 文件 / 321 测试全通过**（含 `terminationReasons.spec.ts` 里随 pin 同步为 `0.18.0` 的版本断言）。docker / compose / e2e 未跑（真机 e2e 归主 agent）。
 
-
-
 ### 8.9 文件工具迁上游（issue #228，2026-10-10）
 
 依据：station issue **#228** / 上游 erix-agent **#184**（`createFileTools` 规范实现 + `fileToolsContract` 契约套件）。
@@ -309,8 +309,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - [ ] **未做（已记录）**：FDE 级 grant（一次签票给整组 host 发 cookie，免「要点两次预览」）在 #241 正文另议；
   前端 host 自己的 dev server 不答 `OPTIONS`（返 200 + HTML 且无 ACAO）属**应用侧**，不在平台范围。
 
-
-
 ### 8.12 开户预分配 10 条 FDE 级预览域名（issue #240，2026-10-11）
 
 > ⚠ **更正（issue #246 交付①，2026-10-11；原记录不删，只标失效项）**：本节的**分配粒度 = FDE 级**、
@@ -353,8 +351,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   eric 重跑 `provision-fde` 得到 `8/10 新写（2 条已存在）` → 第二次 `0/10`，`ports.json` 自动 `generation=3` / 10 条（8 `fde` + 2 遗留）。全量 **877/876/0/1**、runner **200/200**。
 - [ ] **已知缺口（未在本单补）**：**签票入口缺失**（`GET /api/ports` 已随 P5 退役、SPA 内无任何端口列表/预览按钮 ⇒ 人只能靠 curl 调 API 拿票）；票据仍是 **host 级**（10 个端口要点 10 次）；
   `PORT_QUOTA` 已成死配置（文档已标注，摘除留后续 PR）；容器绑错端口（无人在听）时的可见性未量化。
-
-
 
 ### 8.13 预览端口全局号池 `22000–29999` 与块分配（issue #246 交付①，PR #248，2026-10-11）
 
@@ -581,8 +577,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
   - **已接受的呈现（不是 bug）**：被中断的那次工具卡片本身是**红色 ✗**——引擎给的合成 `tool_result` 是 `is_error:true`，卡片按失败渲染，解释由下面那行中性文案承担（刻意不把卡片也刷成中性，否则真失败与中断会混色）。
 
 
-
-
 ### 8.23 reaper 收敛的重排也可见（issue #292，2026-10-14）
 
 **缺口性质**：#288 缺陷 B 把「attempt 被杀并重排」做成了用户可见，但只覆盖 **agentd 主动上报**（U12 release 带 `killed_by`）那一条路径。而**租约过期才是最常见的真崩溃形状**（agentd 自己被杀 / 容器被 `docker kill` / OOM / 网络断 ⇒ 根本没有上报）。`reapExpiredRuns` 的三条分支此前都不写 `attempt_killed` ⇒ 界面上仍是「同一个工具卡片亮几次，最后没有原因」。
@@ -792,8 +786,6 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 - **dev 残渣**：会话 `457fe11a…` 多了两条我发的探针消息（一篇 3000 字已完成长文 + 一篇停在 7418 字的长文），**故意不清**：它们同时是「有锚点不重复」与「截断」两块面的现成回放标本。
 
 **#300 已关闭。**
-
-
 
 ### 8.31 模型元数据打通：压缩开关不再是隐含的（issue #309，切片 0/1/1.5/2+2b，2026-10-19，随 **v0.1.16** 发布）
 
@@ -2192,3 +2184,192 @@ E6 同一份替代物**同时**进轮记录 `foldedFacts`（投递与落账不�
 **顺带修正 §8.66 的一处措辞**：那里写「精确轮次范围 `a–b` 拿不到」——`onFoldSummary` 的 payload 确实
 还是没有范围，但引擎**自己的摘要文本里**带范围（`早期第 … 轮（共 … 轮）已折叠`，见 §8.65 A3 判据）。
 所以缺的是**结构化**的 `from/to`（给 DB 与 banner 用），不是"系统不知道范围"。erix-agent#479 的诉求据此收窄。
+
+### 8.68 D 片：折叠横幅补上「谁现在看不见它」——横幅两态 + 事件行显示实例策略名（2026-10-26，分支 `feat-261026-03-fold-banner-d`）
+
+A/B/C/E 四片都在修「折叠丢了东西」，而轴三（**人得知道丢了**）一直只有 #388/#389/#390-A 那半套：
+横幅标题说「已压缩第 2–5 轮」，但**「压缩」这个词在用户那里并不自动等于「模型从此看不见它」**。
+折叠的全部意义恰在那后半句，而它此前只存在于实现者脑子里。这片就补这半句，顺带把「谁折的」显示出来。
+
+| 位置 | 改动 | 为什么在这儿 |
+|---|---|---|
+| `StreamPanel.vue` `foldedVisibilityNotice()` | 横幅标题下新增一行，**两态** | 数据全在现有 DTO 里（`foldedRoundRange` + `hasSummary`），**零后端改动** |
+| `zh-CN.ts` / `en.ts` `stream.folded.visibility*` | 四个键：有/无摘要 × 有/无轮数 | 措辞必须跟着事实分叉，见下 |
+| `useEventStream.ts` + `stream.event.compaction` | 事件行加「策略 {strategy}」 | `compaction` 事件本就带 `strategyName`（erix-agent #464 A），此前没人显示 |
+
+三条口径（都不是措辞偏好，是防说谎）：
+
+1. **两态是必需，不是润色**。`hasSummary === false` 时下面那份「摘要」其实是复述标题的兜底句
+   （#390-A 因此已经不画展开控件）。此时若还说「摘要就是它留下的全部」就是**空头支票** ⇒ 无摘要态改成
+   指路「查看原文」。
+2. **`hasSummary` 键缺席 ⇒ 整行不渲染**，不能当 `false`。存量行没有这个键，当 false 处理等于让旧数据
+   凭空多出一句「本次没有生成摘要」的断言——与 #390-A「键缺席 = 不知道，宁可保持现状」同一条纪律。
+3. **轮数只从 `foldedRoundRange` 算**（`to − from + 1`）。拿 `foldedPayloadMessages` 报轮数是 #375 已经
+   定过性的假话（那字段是「本条记录携带的归档条数」，去重 + 夹断后明显偏小）。无 range 就退成不带数字的
+   措辞，**不猜**。
+
+`strategyName` 缺失时显式渲染成「未知」而不是留空：留空会让人以为策略名字是空串，而真相是「这条事件
+比该字段古老」。**注意**：引擎只把策略名放进 `compaction` 事件，**不落轮记录**（`roundRecord` 上只有
+`folded` / `foldedPayload` / `foldedRoundRange` / `navigationRecord` / `foldedFacts`），所以历史行里
+显示不出「谁折的」——这不是本站漏做，是 erix-agent#479 那半格（宿主侧目前只能用 `foldedFacts.source`
+近似，两者在降级路径下会不一致）。
+
+判据 5 条：横幅 4 条（有摘要报轮数 / 无摘要不许许诺并指路 / **键缺席整行不出** / 无 range 不报数字）+
+事件行 1 条（有 `strategyName` 原样显示；旧的三处文案期望同步成「策略 未知」）。
+前端 **925/925**、`vue-tsc` 干净。
+
+**部署口径**：前端在 portal 镜像里 ⇒ 生效只需 portal 换镜像 + 重启，**不需要**重建 `fde-*`（runner 侧零改动）。
+
+
+### 8.69 issue #404：`containers.image` 必须跟上现实，不是停在开户那一刻（2026-10-26，分支 `fix-261026-01-container-image-ledger`）
+
+现网实测的账实不一致：`fde-eric`/`fde-jim` 跑的是 v0.1.38 的 digest，库里 `image` 还写着 v0.1.37 的；
+`agent_version` 停在 `0.1.32-088e41e`。后果不是难看，是**问不出答案**——「这个 FDE 在跑哪个 runner」
+只能人肉 `docker inspect`，我这两天的部署核对全这么过来的。
+
+病根是写面的形状，不是某处漏了一行：`image` 只出现在 `onboardFde` 里**「DB 没有行」那条 INSERT** 上。
+其余三条路径——① 复用（容器在、env token 匹配）② 重建（有行、token 轮换那条 UPDATE）③ reconcile 的
+adopt 分支（`res.created === false`）——**一条都不写** ⇒ 一次开户定终身。所以修法是给三条路径都补写，
+而不是改 INSERT。
+
+**写"实际"而不是写"期望"**（这条是本片的判断核心）：adopt 场景里容器可能正是上个版本遗留的，把
+`config.fdeImage` 写进去只是把一种谎换成另一种。于是 `ensureFdeContainer` 现在把容器**实际**镜像带回
+调用方（adopt 取 `Config.Image`，新建取 create body 的 `Image`），调用方只有一条写法：`res.image` 写账。
+唯一写期望值的地方是「token 轮换 UPDATE 之后紧接着就是 create(config.fdeImage)」——那里期望值就是真话，
+且 `status='creating'` 已把"还没起来"标出来了。
+
+顺手修同一条路径上的 409：`ensureFdeContainer` 原先只认 204/304，而 **409 是 Docker 在说「它已经在跑了」**
+——正是本函数要的终态。并发（reconcile 与 provision-fde 同时动同一个名字）时赢的那一方拿 409 抛错，
+reconcile 因此抱怨 `start container … failed: HTTP 409`，把真故障淹在噪音里。现在 409 当幂等成功，且
+`started` 保持 `false`：它本来就在跑，不是我们启动的，不许谎报。
+
+判据 3 条：409 幂等（含"必须先查后起"与"不许谎报 started"）/ 新建路径回报实际镜像 / 三条写路径都在源码
+契约上钉住（`onboardFde` 全链 fake 成本高，沿用本文件既有做法；`ensureFdeContainer` 真跑）。
+provisioner 34/34、portal+root 全量绿。
+
+> **本节写完当场发现的一句话错误，保留在此而不是悄悄改**：原文说"`agent_version` 由心跳自报"，**不成立**。
+> 实际链条是 `deploy/.env` 里一个静态 `FDE_AGENT_VERSION=0.1.32-088e41e` →（compose）→ `config.fdeAgentVersion`
+> → 建容器时写库、并作为 env 注进容器 → `runner/agentd.js:44` 上报的就是**那个 env 标签**；而
+> `portal/src/internal.js` 的 heartbeat 收到 `agent_version`（`agentd.js:421` 确实报了）**从不写这一列**。
+> 所以该字段的真实语义是「建容器时我以为版本是多少」，且"以为"的出处是一个没人再动的 .env 值——
+> v0.1.40 的容器写着 `0.1.32` 即由此来。修它需要两处同时动：runner 报自己 `package.json` 的真实版本
+> （env 仅作 override）+ portal 在 heartbeat 里落账（同值不写，免得每心跳刷 `updated_at`）。详见 #404 结案评论。
+>
+> **`image` 那一半已实测修好**：v0.1.41 上线后第一个 reconcile tick 就把两行改写成容器实际引用，全长等值。
+> 核对时注意读数陷阱——用 `right(image,12)` 比 `docker inspect | cut -c8-20` 会把**同一个** digest 的
+> 后 12 位与前 12 位当成两个值，看着像"写平了但写错对象"。**digest 必须比全长。**
+### 8.70 版本改成构建产物：`build-info.json` 是运行时唯一真相，env 只剩 override（2026-10-26，分支 `feat-261026-06-version-as-artifact`）
+
+#404 结案评论里定的修法。为什么不是"把那个 .env 值改对"：**它还有第二个来源，就一定会再漂**。
+当时的三方各说各话是这样的——
+
+| 位置 | 当时写的 | 真相 |
+|---|---|---|
+| `containers.agent_version` | `0.1.32-088e41e` | 容器已换过两版 |
+| 出处 | `deploy/.env` 一行没人再动的 `FDE_AGENT_VERSION` | 且**重建也不会修正**（重建路径写的还是同一个 env） |
+| agentd 心跳上报 | `0.1.0` | `ERIX_AGENT_VERSION` **从来没被任何地方设过** ⇒ 落到兜底常量 |
+| 全仓读者 | 无 | API 不返回、前端不显示、reconcile 不判 |
+
+**规则**：未知就写 `unknown`，不要写兜底版本号。`0.1.0` 和 `0.1.32-088e41e` 这两个"看起来合法的假值"
+骗过了所有看的人，比空值毒。
+
+| 改动 | 为什么在这儿 |
+|---|---|
+| `runner/Dockerfile` 构建期写 `/opt/erix/build-info.json` | `station_version` / `engine_version` **从镜像内的 `package.json` 与 `node_modules/erix-agent/package.json` 读**，不从 ARG 传——少一条"必须与构建同步的手工输入"就少一次漂移；只有 `.git` 拿不到的 `revision` / `built_at` 走 ARG。ARG 与 RUN 放 Dockerfile 末尾，把缓存失效压到最小 |
+| `runner/lib/build-info.js`（新） | 三级来源 + **绝不抛错**（心跳热路径上读版本不能把心跳打死）：env override > `build-info.json` > 本地 `package.json`（dev）> `unknown` |
+| `runner/agentd.js` | 删掉 `\|\| '0.1.0'`；心跳新增 `runner_version` / `build_revision`（additive，旧 portal 忽略） |
+| `portal/src/internal.js` 心跳 | 落账 `agent_version`：空/缺 ⇒ **不写**（不许拿 unknown 覆盖上一次真值）；`IS DISTINCT FROM` ⇒ 同值不写，否则 15s 一次的心跳把 `updated_at` 刷成噪音；截断 64 防一个怪 tag 把心跳打成 500 |
+| `portal/src/provisioner.js` | `FDE_AGENT_VERSION` 降级成 override：**默认不注入**容器 env；`dev` 是占位、不算钉值（注入它等于让占位冒充上报值） |
+| `.github/workflows/release.yml` | 传 `STATION_VERSION` / `STATION_REVISION` / `STATION_BUILD_DATE` |
+| `.github/workflows/ci.yml` | 构建校验里加 tripwire：`build-info.json` 必须存在、`station_version` 必须等于仓库 pin、`revision` 必须等于本次 commit、`engine_version` 不许 unknown |
+
+口径与坑：
+
+- **`agent_version` 的契约语义是 erix-agent（引擎）版本**（`docs/api/portal.md` U4 早就这么定义），
+  runner 自身版本另放 `runner_version`。以前三方混用一个字段，正是它腐烂的原因。
+- 读引擎版本**不能** `require('erix-agent/package.json')`：那个包的 `exports` 只开 `.` / `./tools` /
+  `./contract-tests`，裸 spec 会 `ERR_PACKAGE_PATH_NOT_EXPORTED`；这里按文件路径直接读。
+- CI 那段是 YAML 块标量里的 shell + `node -e`：单引号内的行尾 `\` **会**进字符串（JS 里是语法错误），
+  所以脚本行一律不带续行符；`EXPECTED` 要靠 `docker run -e EXPECTED` 才进得了容器，只在 shell 里赋值没用。
+  两处都用 `bash -n` + `node --check` 真验过，不是"看着像对"。
+- 判据里"不许出现 `|| '0.1.0'`"要**先剥注释再查**：本条文档自己就原样引用了被禁的写法，不剥会判据过敏。
+- ⚠ **本片上线即炸过一次现网**：`buildContainerConfig` 新增注入 `ERIX_AGENT_VERSION`，但
+  `deploy/fde-proxy/server.js` 的 `ENV_KEY_ALLOW` 是**另一个模块**、没同步 ⇒ `provision-fde` 报
+  `create_policy_denied: Env key not allowed`，而那时两个 FDE 容器已经被流程删掉，短暂全停。
+  单侧测试查不出来（注入方与放行方各自都"对"）。已补白名单 + 一条**交叉核对**判据：
+  provisioner 可能注入的键集合必须 ⊆ proxy 白名单。**"我加了个 env"从来不是一句无害的话。**
+- 消费面（谁读这列）**本片故意不做**：现网只有两个容器，人一眼看得过来；先把真相做对，读者等有需求再加。
+  判据是 `#404` 结案评论里那三条触发条件，不是"以后再说"。
+- ⚠ **两个 workflow 文件不在本 PR 里**，不是忘了：本机 `gh` 用的是 OAuth App token，scopes 只有
+  `gist, read:org, repo`，GitHub 直接拒绝无 `workflow` scope 的推送（`refusing to allow an OAuth App to
+  create or update workflow`）。release 的 build-args 与 CI 的 tripwire 以补丁形式挂在 PR 评论里，
+  等有 `workflow` scope 的凭据（或本人）再推。**在它落地之前**：`revision` / OCI label 会是 `unknown`
+  （`station_version` / `engine_version` 仍是真值，因为它们从镜像内文件读，不依赖 ARG），
+  而"版本没烘进去"这件事暂时**没有自动检查**——就是上面反复强调的"第三问：谁在检查"仍然空着。
+
+### 8.71 #412④：隔离跑的宿主写路径必须**逐条证明与共享栈不相等**，"有没有设"不是判据（2026-10-26，分支 `fix-261026-07-host-write-paths`）
+
+先纠正我自己写进 #412 的一句话：原以为病根是"compose 里 `${TRAEFIK_DYNAMIC_DIR_HOST:-默认}` 这个不安全默认值"。
+**不对**：那个默认值是相对路径 `./traefik/dynamic`，而我今晚覆掉生产配置时它**有值**——值是
+`--env-file deploy/.env` 从生产 `.env` 里带进来的（`/docker/station-edge/dynamic`）。所以改成必填挡不住：
+`--env-file` 永远会填上。缺的不是"设没设"，是**"这个值是不是我这套栈的"**。
+
+判据因此做成"**与共享 `.env` 的值逐条不相等**"：`assertHostWritePathsIsolated({env, envFile})` 读
+`deploy/.env`（缺文件则只判绝对路径），对四条宿主写路径逐一比对——
+
+| env | 写错会怎样 | 现网生产值 |
+|---|---|---|
+| `TRAEFIK_DYNAMIC_DIR_HOST` | **直接改写生产边缘的路由文件**（今晚 502 就是这个） | `/docker/station-edge/dynamic` |
+| `ERIX_USERSPACE_ROOT_HOST` | 隔离用户目录落进生产 userspace | `/docker/erix/users` |
+| `ERIX_ARTIFACTS_ROOT_HOST` | run 产物混进生产 | `/docker/erix/artifacts` |
+| `STATION_DB_DIR` | 两个实例开同一份数据文件 | `/docker/station-db` |
+
+未设置也算命中（未设置 ⇒ compose 用默认值或 env-file 的值，两种都不是"我这套栈的目录"）。
+拿真实生产 `.env` 实测：原样使用四个值 ⇒ 直接拒；换 `/tmp/*` ⇒ 放行。
+
+两个刻意的形状，别改回去：
+
+- **这条判据不挂在 `assertIsolatedEnvironment` 里**。各脚本只在 `compose('up', extraEnv)` 传这三个
+  `ERIX_*` 路径，`process.env` 里常常没有 ⇒ 挂总断言会误伤所有老脚本，而"判错方向"比不判更糟。
+  规则是**谁 `up` 栈谁调**，传 `{...process.env, ...extraEnv}`。本 PR 先接 `wp3b`（我手工起栈踩过的那条路）。
+- 没动 compose 的默认值。改成 `:?` 只是把"静默用共享目录"换成"另一种静默"，还会让
+  `docker compose config` 这类无 env 的解析场景一起炸——收益低、面大。**先修判据，默认值的事另议**。
+
+另外记一条排障口径：**"容器全 healthy" 不能证明系统没事**。今晚 502 的时候 `docker ps` 六个容器
+全 `Up (healthy)`、portal 直连正常，坏的是配置**内容**。判入口要打到真入口：
+`curl -o /dev/null -w '%{http_code}' http://station.vc.cn-ai.vip:8090/`，以及 `/api/sessions` 期望 401。
+
+### 8.72 接班部署 v0.1.43 + #351/#352 发布物验收 + 账本**第四种砖化形状**（`:resume` 载体裸重放）（2026-10-27 夜班，本机 = 部署机）
+
+背景：本机 main 停在 `6cffeb9`（#350 时代），另一台主机三天里推到 `v0.1.42`（94 个提交）。接班第一动作是分清**三层**（仓库同步 / 部署面 / 存量数据），别把「issue 还 open」一律当「还要写代码」：仓库已快进到 `0c47329`（干净），但本机仍跑 **v0.1.30**、`FDE_IMAGE` 仍 pin 在 v0.1.25 摘要、DB 缺迁移 `0022/0023/0024` ⇒ `#351`/`#352` 的修复**在本机根本还没生效**。
+
+**为什么发 v0.1.43 而不是直接部署已发布的 v0.1.42**：`v0.1.42` 含 #416（`ERIX_AGENT_VERSION` 下发）但**不含** main 上的 #419 补漏（`fde-proxy` env 白名单没带这个键 ⇒ `provision-fde` 上线即炸 `create_policy_denied: Env key not allowed: ERIX_AGENT_VERSION`）。⇒ 从 HEAD 发新版，别把「有 tag」当「能部署」。
+
+**部署面四件套（本机 uid=1000 才会暴露的那条）**
+
+- ⚠ **`runner/test/listeners.test.js` 的跨 UID 用例在 uid=1000 的开发机上必然红**（fixture 写死 socket owner uid=1000，而实现故意「owner == 自身 uid 就不切换」`ownerKeys.filter(u => u !== selfUid)`；CI 是 1001 所以一直绿）。修法 = `OTHER_UID = (process.getuid?.() ?? 0) === 1000 ? 1001 : 1000`（`53191cd`）。**取证**：改回写死 ⇒ 该用例红；摘掉 `u !== selfUid` ⇒ 1 红；去掉 uid 还原 ⇒ 1 红（`runner/lib/listeners.js` 验完无 diff）。⇒ 这条**不是放宽断言**，是把「主机 uid」从测试的隐含前提里拿掉。
+- **四件套基线（本机实测，判绿=退出码）**：根 `npm test` **1656 / 1652 通过 / 0 失败 / 4 跳过**、`node --test runner/test/*.test.js` **399/399**、前端 `typecheck` rc=0 + **50 文件 / 925 通过**（台账原值 1493 / 221→323 / 47 文件 857 均已过期，本次按合并树真值刷新）。
+- **发版与部署**：main CI（`53191cd` 与 bump `fafe4a7`）两个 job 全绿后才打 tag（#419 那条 `质量门禁` 显示 `cancelled` 是「我随后又推了一个提交」把在跑的 run 取消了，不是失败）→ tag `v0.1.43` → release `40527305596` success → 清单 portal `imageId=sha256:827ec194…` / `digest=sha256:aa036666…`、fde `imageId=sha256:78ec7b00…` / `digest=sha256:6882cb5a…`、proxy `imageId=sha256:aa91d2fa…` / `digest=sha256:d5453b04…`，三个都 `docker image inspect .Id` **逐位一致**。
+- ⚠ **GHCR 直连拉 `fde` 又卡层**（§8.35 那条老坑复发，两次重试都在同一层 `eddb72140443` 0 B/s 耗尽重试）：解法仍是镜像站——`docker pull ghcr.nju.edu.cn/erixwong/erix-station-fde:0.1.43` 一次成功（回来的 Digest 与清单一致），**再按 digest `docker pull ghcr.io/…`** 一次 ⇒ 层已在本地、秒回，于是有 `repo@sha256:` 引用、pin 保持形态①。比手工拼 tar 更省事。
+- `deploy/.env` 三项一起 pin（本版 `runner/` 非版本文件有变动 ⇒ 含 `FDE_IMAGE`；备份 `/tmp/deploy.env.bak-0143`）→ `up -d --no-build` → portal 实跑 `827ec194…`、`healthz=200`、日志 `[migrate] applying 0022-port-observations / 0023-preview-miss-stats / 0024-queued-inputs`（**三条迁移是 portal 启动自动应用的**，无需手工跑）→ `docker rm -f` 五台 `fde-*` → reconcile ≈10s 全部落在 `78ec7b00…`，容器内 `erix-agent` = **0.26.0**，agentd `sse connected` + `sse ping received`（§8.18 双向口径）。
+
+**#351 在发布物上的验收（两个方向都跑）**
+
+- **正面对象复活**：标本 `ec8a77b3…`（当年 `index 11`，结果行在、被 `:input:` 插队）发一条消息 ⇒ `finished / judge_done` + 助手正文落库。
+- **现跑对照**（不是只信老标本）：新会话 `3fe993c7…` 起 `sleep 120` → 跑到一半点停止（run1 `aborted`）→ **再发一条** ⇒ run2 `judge_done`。**修复前这个动作会把会话永久砖掉**。⚠ 账本里那条插队 `:input:` 行**照样留下**（全库 §5.1 计数 2→3）⇒ **折叠在 `store.load()` 兜住了它，巡检计数 > 0 不再等于会话坏**（这条口径已写进巡检手册 §7.5，别再去「修数据修到 0」）。
+- **但另一标本 `1ead0b1a…` 仍红**（`invalid_messages index 50`，v0.1.43 上）⇒ 顺着查出**第四种形状**，见下。
+
+**账本第四种砖化形状（新）：`:resume` 载体裸重放「已在别的轮结清的 `tool_use`」**——折叠救不了（造不出缺失的那条 `tool_result`），只能修数据。判据与手术已整节落 `docs/ops/transcript-ledger-inspection.md` **§7**，这里只留最值钱的三条：
+
+1. **判据必须带轮**。按 id 集合查孤儿会得出「账本干净」的**假结论**（`tool_use` 17 / `tool_result` 16，但「有 use 无 result」= 0——那个 id 的结果在**别的轮**）；而按**记录**判在 0.23+ 上又是**常态误报**（`use` 与 `result` 本就分 `:msg:` 行，实测 9 会话 / 几十行）。只有「同轮任何行都没有结果 **且** 别的轮结清过」精确（本机 = 6 行 / 2 会话，全在 `:engine:round:N:resume`）。
+2. **定性是历史化石，不是现行写侧**：两条陈旧载体的 `ts` 是 10-08 与 10-15（旧引擎）；同一天 0.26.0 现跑的 `:engine:round:1:resume` **不带 `messages`**。⇒ 别拿 0.23/0.26 源码去推断老数据（`:resume` 载体的内容口径跨版本变过，§8.40 那条「只写引擎控制文本」对这两行不成立）。
+3. **修数据前后都用引擎自己的校验器判**：`1ead0b1a` FAIL `index 36` → 删 1 条陈旧 assistant turn → **PASS**；`3dcab38b` FAIL `index 73` → 删 5 条 → **PASS**；落库 `INSERT 0 1 / UPDATE 1` ×2、备份表 3→2 与 7→2、重放第二遍 `UPDATE 0` ×2、判据复跑 **0 行**、真机两个会话都 `judge_done`（`1ead0b1a` 是 10-23 起连砖 4 次那个标本）。⚠ **我自己的空操作**：第一版生成器把字段名写错 ⇒ `dedup_key = 'undefined'`，两遍都是 `UPDATE 0`，看着像幂等证明其实啥也没写 ⇒ **口径：修数据首跑必须看到 `UPDATE 1`**，并用 `INSERT` 行数 + 备份表的 `jsonb_array_length(before/after)` 双向对一次（§8.24 那条纪律在 SQL 落库上的版本）。
+4. `#367`（存量链式 `partOf`）在**本机无事可做**：§1.1 巡检 **0 行**、§6.1 超 1 MiB **0 行**，且它点名的会话 `9e0c8a17…` 在本机 DB 里**不存在**（那是另一台部署的标本）⇒ 这类 issue 的「还 open」是**别台机器的存量**，不是本机的待办。
+
+**#352 在发布物上的验收（观测层，端到端）**
+
+- **跨 UID 真采样**（我修的正是这条路径的单测，所以真机特意造了这个形状）：agentd 跑在 **uid 1001**、两个 `python3 -m http.server` 在 **uid 1000**，`port_observations` 里 22000（池内）与 3000（池外）都拿到了 `pid + cwd=~/projects/probe-351 + branch=main + cmd` ⇒ setuid 重扫在真机上成立（这条在 uid=1000 的机器上单测结构上测不到）。
+- **DTO 只做加法**：`GET /api/me/ports` = 原 8 列 + `observed`，11 行 = 池 10 + 池外观测行（`state='observed'`、`hostname/url=null`），`observed=null` 有 9 行 = 「不知道」而不是「空闲」。
+- **池外只报「用户的项目」**：`/proc` 里还有 Docker 内嵌 DNS（`127.0.0.11:34957`，uid 0）落了 `port_observations`，但门户按 `cwd` 是否 `~/projects/` 过滤掉（`portalloc.js` 那句注释写明「agentd 自己的 4000、root 的内部口不算用户的项目」）⇒ **表里有、面板里没有**，别当丢数据。
+- **界面面**（bundle 先断言 = `index-1_vis29R.js`）：`Port pool (10)` 分组头 `probe-351  Current` 排最前 + `Spare (9)` 折叠；`Listeners (2)` 面板给出「同一目录同时开在 3000 与 22000，多半是两个版本并存」告警，池外那条给「还不能在预览地址打开——让助手挪到分配的口」。截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`。
+- 探针残渣：fde-eric 里那两个 `http.server` 已 kill（新鲜度窗 45s，之后面板自动掉）；两个会话各多一条探针消息（`复活`）。

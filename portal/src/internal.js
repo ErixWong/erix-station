@@ -1032,6 +1032,26 @@ export async function heartbeat(pool, { container, user, body, llmGateway = null
     [container.id],
   );
 
+  // issue #404 结案：`agent_version` 从此是**构建产物**的落账点。body.agent_version 由 agentd 从
+  // 镜像里烘的 build-info.json 读（runner/lib/build-info.js），不再是运维在 .env 里手写的静态值——
+  // 那个值曾是 `0.1.32-088e41e`，而容器早就换过两版，且**重建也不会修正它**（重建路径写的还是同一个 env）。
+  // 三条口径：
+  //   - 空/缺/非字符串 ⇒ 不写（旧 agentd 或读不到版本时，保持上一次的真值，不拿 unknown 去覆盖）；
+  //   - `IS DISTINCT FROM` ⇒ 同值不写，否则 15s 一次的心跳会把 `updated_at` 刷成噪音
+  //     （"这行什么时候真变过"就是这个字段的全部价值）；
+  //   - 截断到 64 ⇒ 与列宽一致，别让一个超长 tag 把心跳打成 500。
+  const reported = typeof body?.agent_version === 'string' && body.agent_version.trim() !== ''
+    ? body.agent_version.trim().slice(0, 64)
+    : null;
+  if (reported !== null) {
+    await pool.query(
+      `UPDATE containers
+          SET agent_version = $2, updated_at = now()
+        WHERE id = $1 AND agent_version IS DISTINCT FROM $2`,
+      [container.id, reported],
+    );
+  }
+
   const now = new Date();
   const results = [];
   for (const r of runs) {

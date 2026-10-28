@@ -1563,3 +1563,56 @@ test('#361：观测端口集合翻转才入队 materialize upsert；集合不变
   assert.deepEqual(pool.portObservations.map((o) => o.port), [22005], '入队失败不得回滚观测写入');
   assert.ok(warns.some((w) => /重刷入队失败/.test(w)));
 });
+
+// ---------------------------------------------------------------------------
+// issue #404 结案：`containers.agent_version` 从此是**构建产物**的落账点。
+// 背景：这个字段曾写着一个 10-25 后没人再动的 `.env` 静态值（0.1.32-088e41e），而容器实际换过两版，
+// 且**重建也不会修正它**（重建路径写的还是同一个 env）；同时 agentd 上报的 ERIX_AGENT_VERSION
+// 从来没被任何地方设过 ⇒ 每次心跳都在报兜底的 '0.1.0'。现在：agentd 从镜像内 build-info.json 取真值
+// （runner/lib/build-info.js），portal 在心跳里落账。下面钉三条落账口径。
+// ---------------------------------------------------------------------------
+test('#404 心跳落账 agent_version：报上来的构建产物覆盖旧的静态 pin', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  pool.containers[0].agent_version = '0.1.32-088e41e'; // 库里那个没人撤的旧值
+  await heartbeat(pool, {
+    container: { id: containerId, user_id: userId },
+    user: { id: userId, login: 'alice' },
+    body: { agent_version: '0.26.0', runner_version: '0.1.41', runs: [] },
+  });
+  assert.equal(pool.containers[0].agent_version, '0.26.0', '真值必须覆盖占位值，否则修了上报也白修');
+  assert.equal(pool.agentVersionWrites, 1);
+});
+
+test('#404 心跳落账：同值不写（15s 一次的心跳不许把 updated_at 刷成噪音）', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  pool.containers[0].agent_version = '0.26.0';
+  for (let i = 0; i < 3; i += 1) {
+    await heartbeat(pool, {
+      container: { id: containerId, user_id: userId },
+      user: { id: userId, login: 'alice' },
+      body: { agent_version: '0.26.0', runs: [] },
+    });
+  }
+  assert.equal(pool.agentVersionWrites, 0, '值没变就不许写这一行：这列的全部价值是"什么时候真变过"');
+  const stmt = pool.sqlLog.filter((x) => x.sql.includes('agent_version IS DISTINCT FROM'));
+  assert.equal(stmt.length, 3, '三条心跳各发一条条件 UPDATE（"不写"是 SQL 语义，不是不发语句）');
+});
+
+test('#404 心跳落账：字段缺失/空白一律不写——不许拿 unknown 去覆盖上一次的真值', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  pool.containers[0].agent_version = '0.26.0';
+  await heartbeat(pool, { container: { id: containerId, user_id: userId }, user: { id: userId, login: 'a' }, body: { runs: [] } });
+  await heartbeat(pool, { container: { id: containerId, user_id: userId }, user: { id: userId, login: 'a' }, body: { agent_version: '   ', runs: [] } });
+  assert.equal(pool.containers[0].agent_version, '0.26.0');
+  assert.equal(pool.agentVersionWrites, 0, '旧版 agentd 或读不到版本时，保持真值而不是清空');
+});
+
+test('#404 心跳落账：超长值截断到列宽 64，不让一个怪 tag 把心跳打成 500', async () => {
+  const { pool, userId, containerId } = seedClaimable();
+  await heartbeat(pool, {
+    container: { id: containerId, user_id: userId },
+    user: { id: userId, login: 'a' },
+    body: { agent_version: `v${'9'.repeat(80)}`, runs: [] },
+  });
+  assert.equal(pool.containers[0].agent_version.length, 64);
+});

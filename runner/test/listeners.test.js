@@ -15,7 +15,7 @@ const BTIME = 1_700_000_000;            // /proc/stat btime（epoch 秒）
 const START_TICKS = 100_000;            // stat 第 22 列（USER_HZ=100 ⇒ +1000s）
 const EXPECTED_START_MS = (BTIME + 1000) * 1000;
 
-/** 造一棵最小 /proc fixture。ports: [{port, inode, pid?, owner=true}] */
+/** 造一棵最小 /proc fixture。ports: [{port, inode, pid?, owner=true, uid?=1000}] */
 function makeProc(t, { entries, home = null }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'proc-fix-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -26,7 +26,8 @@ function makeProc(t, { entries, home = null }) {
   for (const e of entries) {
     const hex = e.port.toString(16).toUpperCase().padStart(4, '0');
     // 其余列全填占位，字段位次与真 /proc/net/tcp 一致（inode 是第 10 列）。
-    lines.push(`   0: 00000000:${hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0   ${e.inode} 1 0000 100 0 0 10 0`);
+    const uid = e.uid ?? 1000;
+    lines.push(`   0: 00000000:${hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  ${String(uid).padStart(5)}        0   ${e.inode} 1 0000 100 0 0 10 0`);
   }
   fs.writeFileSync(path.join(root, 'net', 'tcp'), lines.join('\n') + '\n');
   fs.writeFileSync(path.join(root, 'net', 'tcp6'), '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n');
@@ -80,15 +81,20 @@ test('collectListeners：LISTEN 端口 + inode 反查 pid + cwd 归一 ~/ + 分�
 });
 
 test('collectListeners：跨 UID 采样 = 按 socket owner 分组 setuid 重扫（无 CAP_PTRACE + Yama 下的唯一可行路）', (t) => {
+  // ⚠ fixture 的 socket owner uid **必须 ≠ 跑测试者自己的 uid**：`lib/listeners.js` 的 `ownerKeys` 故意把
+  // `u !== selfUid` 那一组过滤掉（扫自己的身份不必切，且省一次切进/切出）。写死 1000 的后果：在 uid=1000
+  // 的开发机上「切过去」这一步根本不会发生 ⇒ 本用例必然红，而 uid≠1000 的主机与 CI runner 绿——即「只有
+  // 部分机器能跑」的形状（红了不是产品回归，绿了也不代表在 uid=1000 的生产容器里验过切换）。
+  const OTHER_UID = (process.getuid?.() ?? 0) === 1000 ? 1001 : 1000;
   const { root, homeDir } = makeProc(t, {
-    entries: [{ port: 22000, inode: 111, pid: 412, cwd: 'projects/x', cmd: 'node a' }],
+    entries: [{ port: 22000, inode: 111, pid: 412, uid: OTHER_UID, cwd: 'projects/x', cmd: 'node a' }],
   });
   const seen = [];
   collectListeners({
     procPath: root, home: homeDir,
     setuid: (uid) => { seen.push(uid); },
   });
-  assert.ok(seen.includes(1000), '以 owner uid 扫过');
+  assert.ok(seen.includes(OTHER_UID), '以 owner uid（≠ 自身 uid）扫过');
   assert.ok(seen.length >= 2, '扫完要恢复自身 uid（setuid 被调 ≥2 次：切过去 + 恢复）');
   assert.equal(seen[seen.length - 1], process.getuid(), '最后一次必须恢复到自身 uid（绝不能把守护进程留在别人的身份上）');
 });

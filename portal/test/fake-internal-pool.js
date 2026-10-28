@@ -31,6 +31,8 @@ export class FakeInternalPool {
       bindings: seed.llm?.bindings ?? [],     // [{fde_id, state, gateway, api_key, main_model_id, ...}]
     };
     this.auditLog = [];
+    // 计数器一开始就存在：只在建构造后第一次写入时才出现的计数器，会让"没写过"和"没查过"看起来一样。
+    this.agentVersionWrites = 0;
     this._claim = 0;
     // 事务模拟（对 `run_events` 的写入 + `allocSeq` + release/reaper 的 runs/run_queue 状态改写建撤销
     // 日志，#292 扩到后两项）：`failCommitOnce = true` 让下一次 COMMIT 抛错。
@@ -313,6 +315,18 @@ export class FakeInternalPool {
     }
 
     // ---- heartbeat：更新容器心跳 ----
+    // #404 结案：心跳落账 agent_version（同值不写 ⇒ 这里也照 SQL 的 IS DISTINCT FROM 语义判）
+    if (sql.includes('UPDATE containers') && sql.includes('agent_version IS DISTINCT FROM')) {
+      const [containerId, version] = params;
+      const c = this._container(containerId);
+      const changed = Boolean(c) && c.agent_version !== version;
+      if (c && changed) c.agent_version = version;
+      // "同值不写"必须可观测：真库靠 `IS DISTINCT FROM` 让 UPDATE 命中 0 行（也就不动 updated_at），
+      // 这里把它记成计数，判据才能钉住"15s 一次的心跳不许把这一行刷成噪音"。
+      this.agentVersionWrites = (this.agentVersionWrites ?? 0) + (changed ? 1 : 0);
+      return { rows: [], rowCount: changed ? 1 : 0 };
+    }
+
     if (sql.includes('UPDATE containers') && sql.includes('last_heartbeat')) {
       const [containerId] = params;
       const c = this._container(containerId);
