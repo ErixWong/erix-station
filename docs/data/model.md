@@ -270,8 +270,9 @@ forwardAuth 按「预览 token 的哈希」查本表解析 `user_id` 后做 expo
 | `state` | `active / used / revoked / expired`（状态机见 §2.4）；`used` 仅 ticket 有（`CHECK (kind='session') = (used_at IS NULL)`） |
 | `expires_at` | TTL 截止时刻：ticket **60s** ⚠️、session **15min** ⚠️ 滚动（portal.md §2.8） |
 | `used_at` | ticket 首次校验同事务原子置位（单次有效，重放 → `403 preview_ticket_used`） |
-| `revoked_at` | 显式吊销 / allocation `released` / 用户 `disabled`（portal.md §2.8/§2.9.3） |
+| `revoked_at` | 显式吊销 / allocation `released` / 用户 `disabled`（portal.md §2.8/§2.9.3）/ **签发会话登出（#429，按 `login_session_id` 血缘回收，§2.4）** |
 | `last_seen_at` | session 最近一次校验通过（滚动续期刷新） |
+| `login_session_id` | **凭证血缘（#429，migration 0025）**：签发该凭证的登录会话（`→ login_sessions.id`，`ON DELETE SET NULL`，可空不回填）；ticket 行签发时写入，session 行兑换时继承 ticket 的值。登出撤销沿此列命中（portal.md §2.4）；列缺失（存量行）= 登出救不了，靠 TTL 自然到期 |
 
 **与 allocation 释放的联动**：allocation 为软删除（`state → released`），释放事务由 portal 应用层**同事务**把该 allocation 的 `active` 凭证置 `revoked`；forwardAuth 每请求重查 allocation `state` 双保险（portal.md §2.8）。外键为普通引用（无级联）：物理删除 allocation（reaper 硬删 released 过期行，§4）前须先清空引用它的本表行（grant reaper 先删过期/已吊销/已消耗行，或显式按 `allocation_id` 删）。`expired` 由 reaper 周期性懒打标；forwardAuth 有效性判定同时查 `state` 与 `expires_at > now()`（打标前窗口仍拒绝，双保险）。
 

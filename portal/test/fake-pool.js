@@ -6,6 +6,7 @@ export class FakePool {
     this.users = users; // [{id, login, display_name, role, fde_name, auth_source, status, password_hash, totp_secret, last_totp_step}]
     this.pending = [];
     this.sessions = [];
+    this.grants = [];   // #429：revokeSession 的 CTE 会按 login_session_id 血缘撤这里的 active 行
     this.audit = [];
   }
 
@@ -136,11 +137,25 @@ export class FakePool {
       return { rows: [{ expires_at: expiresAt }] };
     }
 
-    // revokeSession
+    // revokeSession（#429 后是实现里的同语句 CTE：吊销会话 + 按 login_session_id 血缘撤 active 预览 grant）。
+    // fake 按 SQL 说的做：血缘谓词从 SQL 文本里认（只撤 active，撤 used 就是篡改历史 #252）。
     if (sql.includes('UPDATE login_sessions SET revoked_at')) {
       const [tokenHash] = params;
       const s = this.sessions.find((x) => x.token_hash === tokenHash && x.revoked_at === null);
-      if (s) s.revoked_at = new Date();
+      if (s) {
+        s.revoked_at = new Date();
+        if (sql.includes('UPDATE preview_grants')) {
+          if (!sql.includes("state = 'active'")) {
+            throw new Error('fake：revokeSession 的预览回收必须只撤 state = active（#252 口径）');
+          }
+          for (const g of this.grants ?? []) {
+            if (g.state === 'active' && g.login_session_id === s.id) {
+              g.state = 'revoked';
+              g.revoked_at = g.revoked_at ?? new Date();
+            }
+          }
+        }
+      }
       return { rows: [] };
     }
 
