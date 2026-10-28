@@ -287,6 +287,21 @@
 
 - 响应 `204`，删除服务端 `login_sessions` 记录，并下发过期 cookie 清除客户端副本。
 - 未登录调用返回 `401 unauthorized`。
+- **#429（方案 B「凭证血缘」）：登出同时回收本次登录会话签发的预览凭证。**同一事务形状的
+  单语句 CTE：吊销 `login_sessions` 行 + 按 `preview_grants.login_session_id` 血缘把**仍
+  `state='active'`** 的 ticket 与派生 session 一并置 `revoked`（只撤 `active`、`revoked_at` 用
+  `COALESCE`——与 #252 撤 grant 口径同形；`used` 是历史事实不动）。登出后旧预览 cookie 打
+  forwardAuth 得 `401 preview_session_invalid`，重新从 portal 签票即恢复。
+  - **为什么回收落在登出时刻而不是 forwardAuth**：登录 cookie 是 host-only 于 `station.<base>` 的
+    （§2.5 / issue #6），物理上到不了预览 host，forwardAuth 请求里没有可判的登录主体
+    （§2.11a 原话「门在它身上没有可判的主体」）；回收只能发生在 portal 同时握着两套凭证语境的入口。
+    forwardAuth 保持每请求零新增查表。
+  - **多设备语义**：血缘按 `login_session_id` 命中，不按 `user_id` 连坐——A 在设备 1 登出，
+    设备 2 的登录会话所签预览票不受影响。
+  - **发布窗口**：`login_session_id` 可空（迁移 `0025`，不回填）。血缘缺失的存量活跃凭证登出救不了，
+    最迟 `expires_at`（session ≤15min 滚动）自然到期，一次性窗口、无数据修复。
+  - 其它回收路径不变：用户 `disabled` 撤销该用户**全部** active grant（§2.9.3，含代签），
+    allocation `released` 撤销该 allocation 上全部 active（§2.8）；登出这条是**按血缘**的窄口径。
 
 ### 2.5 session cookie 属性
 
@@ -508,8 +523,9 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 签名 / 存储 | **不透明随机 token + 服务端哈希查找**（`sha256`）；选**有状态**而非「无状态 HMAC 签名」——一次性（single-use）与撤销必须有服务端状态支撑，纯签名 ticket 无法可靠地「用一次即失效」或「显式撤销」 |
 | TTL | **60s ⚠️ 待决策者确认**（覆盖人工点击/iframe 首帧的间隙，又不至于可被长期重放） |
 | 一次性（crash-safe） | 首次校验在**同一 DB 事务**内消费 ticket + 派生 session + 记 `ticket→session` 关联（§2.7 第 6 步）；响应丢失后**同一 ticket 安全重放**（返回同一 bootstrap 结果、不产生第二个 session token）；仅当已消费且派生的 session 已 `revoked`/`expired` 才 `403 preview_ticket_used` |
-| 撤销 | `state='active' → 'revoked'`（同事务置 `revoked_at`）即失效；portal 关闭预览页 / 用户登出 / admin 吊销时可选显式撤销未使用的 ticket |
+| 撤销 | `state='active' → 'revoked'`（同事务置 `revoked_at`）即失效；**用户登出时按 `login_session_id` 血缘撤销本次会话签发的未用 ticket（#429，必选非可选，见 §2.4）**；admin 吊销 / allocation 释放另走各自路径（下表与 §2.9.3） |
 | 与 allocation 释放联动 | allocation `state → released`（项目删除 / run 结束 / reaper / offboarding / 管理员改块）时，**同一事务**把该 allocation 上**仍 `state='active'`** 的凭证全部置 `state='revoked'`（同事务写 `revoked_at`）；`used`/`expired`/`revoked` **一律不动**（口径见下方「撤 grant 的口径」）；且 forwardAuth 第 2 步始终重查 allocation `state`，双保险 |
+| 血缘列 `login_session_id`（#429，迁移 `0025`） | 签发该凭证的**登录会话**（`→ login_sessions.id`，`ON DELETE SET NULL`，**可空不回填**）：ticket 行在签发时写入，session 行在 forwardAuth 兑换时**继承** ticket 的值。登出撤销按此列命中（§2.4）；血缘缺失（存量/无会话上下文签发）= 登出救不了，靠自身 TTL 到期 |
 
 #### 预览 cookie 语义（`preview_grants.kind='session'`）
 
@@ -518,13 +534,15 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 生成 | ticket 首次校验通过后，forwardAuth 在**同一事务**内消费 ticket 并**确定性派生** session token（`HMAC-SHA256(session_signing_key, "preview-session:" + ticket)`，不存明文），存 `preview_grants`（`kind='session'`，记 `parent_ticket_id`），并 `302` 下发 `Set-Cookie`（§2.7 第 6 步） |
 | 名称 / 属性 | `__Host-fde_preview`；`Secure`/`HttpOnly`/`SameSite=Lax`/`Path=/`、**不设 `Domain`（host-only 于当前预览 host）**；开发期纯 HTTP 按 §2.5 同法去 `__Host-` 前缀并关 `Secure` |
 | TTL | `Max-Age` 与 `expires_at` 一致：**15 分钟 ⚠️ 待决策者确认**，滚动续期（每次 forwardAuth 成功刷新） |
-| 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` 均失效（forwardAuth 每请求重查） |
+| 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` / **签发会话登出（#429，按 `login_session_id` 血缘，见 §2.4）** 均失效（前三项 forwardAuth 每请求重查；登出撤销是写侧回收，forwardAuth 只看到 `state='revoked'`） |
 | 上游可见性 | **预览 cookie 与 portal session cookie 都绝不到达预览上游**：二者 host-only、只在各自 host 发送；Traefik `strip-cookie` 中间件在放行后删除 `Cookie`（fde-platform §6.4）——上游 dev server 收到的请求头里**没有 `Cookie`** |
 
 #### 撤 grant 的口径（`state → revoked`，issue #252）
 
 三个写入口共用同一条 UPDATE 形状（`portal/src/offboarding.js` 的 `release-network-routes`、
-`portal/src/portalloc.js` 的 `moveFdePreviewBlock`、`portal/src/admin.js` 的停用用户）：
+`portal/src/portalloc.js` 的 `moveFdePreviewBlock`、`portal/src/admin.js` 的停用用户）；
+登出撤销（#429，`auth.js revokeSession` 的 CTE）是第四个写入口——**命中列换成 `login_session_id` 血缘**，
+但 SET 形状与谓词口径（只撤 `active`、`COALESCE` 写 `revoked_at`）与下面逐字同形：
 
 ```sql
 UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
