@@ -2369,6 +2369,22 @@ describe('#431 迟到写回的三条守卫（createDir / recallQueue / stop）',
     expect(store.dirs.map((d) => d.name)).toEqual(['beta']);
   });
 
+  it('同一个人切目录（selectDir 会撞 ctxSeq）**不得**把新建成功的目录吞掉（评审实测的回归）', async () => {
+    // 守卫比的是**用户代次**（scopeSeq），不是 ctxSeq：否则「点新建目录 → 在途中 ↻ / 切目录 →
+    // 回包落地」会变成「服务端目录建了、modal 既不报错也不跳转、界面无声消失」。
+    const { release } = deferOnce((url, init) => init?.method === 'POST' && url.startsWith('/api/sessions'));
+    const store = useWorkbenchStore();
+    store.claimOwnership('u1');
+    const inflight = store.createDir('my-new');
+    store.selectDir(DIR_B.cwd); // 同一个人切目录：撞 ctxSeq，不撞 scopeSeq
+    release({ session: { id: 's-new', cwd: '~/projects/my-new' } });
+    const out = await inflight;
+
+    expect(out.session?.id, '同一个人的并发操作不得把新建结果判成作废').toBe('s-new');
+    expect(store.dirCwd, '建目录的语义就是切进那个目录').toBe('~/projects/my-new');
+    expect(store.dirs.map((d) => d.name)).toContain('my-new');
+  });
+
   it('recallQueue 在途时换账号：文本存回**原会话草稿**，不写进新账号的输入框', async () => {
     const { release } = deferOnce((url, init) => init?.method === 'DELETE');
     const store = useWorkbenchStore();

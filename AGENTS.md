@@ -2650,7 +2650,7 @@ null，症状随之消失。而**后端本来就挡着**（2026-10-28 对账 `po
 
 | 路径 | 迟到后写什么 | 处置 |
 |---|---|---|
-| `createDir` | **整块**目录上下文（`dirCwd` / `sessionId=null` / `sessions` / `dirs.push` / `updateAvailability`） | **加 `ctxSeq` 守卫**（与 `createSession` 同口径）。目录与会话服务端已建，不算失败 ⇒ 返回 `{error:null}` 且**不带 `session`** ⇒ `NewDirectoryModal` 不 `emit('created')` ⇒ 不会路由到一个已不属于当前登录者的会话 |
+| `createDir` | **整块**目录上下文（`dirCwd` / `sessionId=null` / `sessions` / `dirs.push` / `updateAvailability`） | **加守卫，但比的是新增的「用户代次 `scopeSeq`」而不是 `ctxSeq`**（评审实测指出：`selectDir` 与 `refreshDirs` 的回退在**同一个人**身上也撞 `ctxSeq`，拿它当判据会把「新建成功」误判成作废 ⇒ 目录建了、modal 既不报错也不跳转、界面**无声**消失）。目录与会话服务端已建，不算失败 ⇒ 换人时返回 `{error:null}` 且**不带 `session`** ⇒ `NewDirectoryModal` 不 `emit('created')` ⇒ 不会路由到一个已不属于当前登录者的会话 |
 | `recallQueue` | `inputValue` + 队列快照 | 加守卫，但**守卫之前先按原会话存回 `drafts`**：DELETE 已在服务端把整队掏走，直接丢弃 = 文本两头没（先例 = `sendQueued` 的 catch 分支「守卫之前先 `drafts.set`」） |
 | `stop` | `entries.push(sep)` | 加守卫：「已请求停止」是上一条流的事，不许插进新账号的消息流末尾 |
 | `loadFoldedOriginal` | `foldedOriginals[<sid>:<round>]` | **故意不加**（键含 `sessionId` ⇒ 只是内存残留，新账号撞不上；同账号回头再开这个会话，这条缓存本来就该命中。加守卫反而丢掉已拿到的原文） |
@@ -2660,9 +2660,17 @@ null，症状随之消失。而**后端本来就挡着**（2026-10-28 对账 `po
 `stores/auth.spec.ts`（含**顺序断言**：`['reset', 'fetch']`）+ `WorkbenchView.spec.ts`
 「工作台挂载过之后在别处登出」钉住；后者删掉 `setUserScopeResetListener` 注册即红（实测）。
 
-**⚠ 可复用的两条核对法**：① 说"某类状态/请求已作废"之前，先 `grep` 出**所有 await 之后的写点**逐条打勾，
-不要凭"我改过哪几个函数"；② 说"登出时会 X"之前，先 `grep` 出**全站有几颗登出按钮**，接在按钮上
-就等于接在三个地方。
+**⚠ 可复用的三条核对法**：① 说"某类状态/请求已作废"之前，先 `grep` 出**所有 await 之后的写点**逐条打勾，
+不要凭"我改过哪几个函数"；② 说"登出时会 X"之前，先 `grep` 出**全站有几颗登出按钮**，接在按钮上就等于
+接在三个地方；③ **守卫要比对的代次必须匹配"作废的原因"**——`ctxSeq` 的语义是「上下文变了」（同一个人
+切目录也撞），而 #431 要防的是「人变了」，所以 `createDir` 认 `scopeSeq`。拿一个"碰巧也会变"的计数器当
+判据，代价是**把成功误判成失败**，比原 bug 更难查（界面一句话都不说）。判据：
+`stores/workbench.spec.ts` 里「同一个人切目录不得把新建成功的目录吞掉」那条用例，把守卫换回 `ctxSeq`
+就红（实测）。
+
+顺带补齐的证据链：新增 `views/AdminLayout.spec.ts`（此前**该组件零 spec**）钉「AdminLayout 那颗登出按钮
+= `auth.logout()`」这段胶水。`stores/auth.spec.ts` 钉的是 `logout()` ⇒ `notify`，
+`WorkbenchView.spec.ts` 钉的是 `notify` ⇒ 断流清空，缺了中间这段，「三颗按钮都收口」就只是说法。
 
 ### 8.79 登出只属于 portal 平面：预览凭证是独立能力，回收必须显式做（issue #429，2026-10-29，分支 `fix-261029-01-429-preview-logout-lineage`）
 

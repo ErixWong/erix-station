@@ -305,6 +305,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const dirsReqSeq = ref(0);
   const ctxSeq = ref(0); // 项目上下文代次
   /**
+   * issue #431：**用户代次**——只在 `resetForUserSwitch()` 里撞开（不同于 `ctxSeq`：后者同一个人
+   * 切目录 / ↻ 回退也会撞）。`createDir` 这类「服务端已经干了活」的写只该在**换人**时作废，
+   * 不该被同一个人的并发操作误判（误判的代价是「目录建成功了却静无声息」）。
+   */
+  const scopeSeq = ref(0);
+  /**
    * issue #428：这份 store 当前归谁（`auth.user.id`，登出置 null）。
    * 存在的唯一理由：给 `resetForUserSwitch()` 找一个**不依赖组件时序**的触发点。
    */
@@ -1004,10 +1010,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return { error: t('errors.dirNameInvalid') };
     }
     const cwd = `~/projects/${name}`;
-    // issue #431：与 createSession 同口径的代次守卫——本函数是当时**唯一一处在 await 之后直接整块写
-    // 目录上下文而无守卫的**（`dirCwd` / `sessions` / `dirs.push` / `updateAvailability`），于是
-    // 「A 点新建目录 → 在途中登出 → B 秒登录 → A 的回包最后落地」会把 B 刚加载好的目录上下文整块盖掉。
-    const ctx = ctxSeq.value;
+    // issue #431：与 createSession 同族的守卫，但**比的是用户代次而不是 `ctxSeq`**：
+    // 本函数是当时唯一一处在 `await` 之后直接整块写目录上下文而无守卫的（`dirCwd` / `sessions` /
+    // `dirs.push` / `updateAvailability`），「A 建目录在途 → 登出 → B 秒登录 → A 的回包最后落地」
+    // 会把 B 刚加载好的上下文整块盖掉。⚠ **不能用 `ctxSeq` 做判据**：`selectDir` 与 `refreshDirs`
+    // 的回退在**同一个人**身上也撞它，那样会把「新建成功」误判成作废 ⇒ 目录建了、modal 既不报错
+    // 也不跳转、界面无声消失（评审实测指出）。
+    const scope = scopeSeq.value;
     let session: Session;
     try {
       ({ session } = await api<{ session: Session }>('/api/sessions', {
@@ -1017,8 +1026,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     } catch (e) {
       return { error: e instanceof Error ? e.message : String(e) };
     }
-    if (ctx !== ctxSeq.value) {
-      // 在途期间已换目录/换账号（`claimOwnership` 会撞 ctxSeq）⇒ **不把上下文抢回来**。
+    if (scope !== scopeSeq.value) {
+      // 在途期间**换了人**（`resetForUserSwitch` 撞 scopeSeq）⇒ **不把上下文抢回来**。
       // 目录与服务端会话确实建出来了（不撤），也不报错（不是失败）；且不把 session 递回调用方
       // ⇒ NewDirectoryModal 不会 `emit('created')` ⇒ 视图不会跳到一个已经不属于当前登录者的会话。
       return { error: null };
@@ -1181,6 +1190,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     projectReqSeq.value++;
     sessionReqSeq.value++;
     dirsReqSeq.value++;
+    scopeSeq.value++; // issue #431：换人的信号（createDir 的迟到守卫只认这一个）
     runStateCheckSeq++;
     // ② SSE 与协议态（`resetStreamState` 内含 `closeEs()`：连接本身必须断，否则带着上一账号的
     //    会话继续收帧、继续往已清空的消息流里推条目）。
