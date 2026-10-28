@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { validateFdeName } from './projects.js';
-import { assertSafePath, atomicWriteFile } from './fsutil.js';
+import { assertSafePath, atomicWriteFile, ensureDirSafe } from './fsutil.js';
 import {
   deleteGitCliConfig,
   removeAllGitCliConfigFiles,
@@ -9,8 +9,14 @@ import {
 } from './git-cli-config.js';
 import { enqueueMaterializeChange } from './outbox.js';
 
-const CREDENTIAL_FILE = '.git-credentials';
-const FILE_MODE = 0o640;
+// #399：平台托管凭据从 FDE 可写的 `home/.git-credentials` 搬进平台独占目录：
+//   宿主 <userSpaceRoot>/<fde>/platform/git/credentials → 容器 /run/erix/git/credentials（ro bind）。
+//   写者只剩 portal：git 自己的「认证被拒 ⇒ erase」与 agent 的整文件重写都再也碰不到它。
+//   镜像 /etc/gitconfig 里平台 helper（fill-only，读 /run/erix/git/credentials）排在 store 前，先答先赢。
+const CREDENTIAL_FILE = '.git-credentials'; // 遗留位置（FDE 自配凭据文件；迁移后平台不再往它写）
+const PLATFORM_SUBPATH = path.join('platform', 'git', 'credentials');
+const FILE_MODE = 0o640; // 遗留 home 文件的模式（存量搬运/删除时重写用）
+const PLATFORM_FILE_MODE = 0o644; // 容器内 agentd(1001)/worker(1002) 需可读；ro 挂载防写，目录不是安全边界
 const MAX_TOKEN_LENGTH = 4096;
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -77,6 +83,44 @@ function getCredentialPath(config, fdeName) {
   return { root, target, homeDir };
 }
 
+/**
+ * 平台独占凭据文件路径（#399）：<userSpaceRoot>/<fde>/platform/git/credentials。
+ * 防逃逸同 getCredentialPath；目录不存在时由 ensurePlatformCredentialDir 创建。
+ */
+export function getPlatformCredentialPath(config, fdeName) {
+  validateFde(fdeName);
+  if (typeof config?.userSpaceRoot !== 'string' || config.userSpaceRoot === '') {
+    throw new GitCredentialError('credential_storage_unavailable', 'git credential storage unavailable', { httpStatus: 500 });
+  }
+  const root = path.resolve(config.userSpaceRoot);
+  const fdeDir = path.join(root, fdeName);
+  const target = path.join(fdeDir, PLATFORM_SUBPATH);
+  try {
+    assertSafePath(root, target);
+    const rootReal = fs.realpathSync(root);
+    const fdeReal = fs.realpathSync(fdeDir);
+    const relative = path.relative(rootReal, fdeReal);
+    if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new GitCredentialError('credential_path_unsafe', 'git credential path is unsafe', { httpStatus: 500 });
+    }
+  } catch (err) {
+    if (err instanceof GitCredentialError) throw err;
+    if (err?.code === 'materialize_path_tampered' || err?.code === 'ELOOP') {
+      throw new GitCredentialError('credential_path_unsafe', 'git credential path is unsafe', { httpStatus: 500 });
+    }
+    throw err;
+  }
+  return { root, target };
+}
+
+/** 确保平台凭据目录存在（portal 属主，0755：容器内只读挂载仍需按 UID 可读）。 */
+export function ensurePlatformCredentialDir({ config, fdeName, log = console } = {}) {
+  const { root, target } = getPlatformCredentialPath(config, fdeName);
+  const dir = path.dirname(target);
+  ensureDirSafe(root, dir, { mode: 0o755, uid: null, gid: null, log });
+  return { root, target };
+}
+
 export function removeGitCredentialFile({ config, fdeName } = {}) {
   validateFde(fdeName);
   if (typeof config?.userSpaceRoot !== 'string' || config.userSpaceRoot === '') {
@@ -119,8 +163,30 @@ export function removeGitCredentialFile({ config, fdeName } = {}) {
     throw new GitCredentialError('credential_file_invalid', 'git credential file must be a regular file', { httpStatus: 500 });
   }
   if (stat) fs.unlinkSync(target);
+  let removedPlatform = false;
+  // #399：平台那份（platform/git/credentials）也归本函数收尾——offboarding 不留残留托管凭据。
+  try {
+    const platformTarget = getPlatformCredentialPath(config, fdeName).target;
+    let platformStat;
+    try {
+      platformStat = fs.lstatSync(platformTarget);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
+    if (platformStat && !platformStat.isFile()) {
+      throw new GitCredentialError('credential_file_invalid', 'git credential file must be a regular file', { httpStatus: 500 });
+    }
+    if (platformStat) {
+      fs.unlinkSync(platformTarget);
+      removedPlatform = true;
+    }
+  } catch (err) {
+    if (err instanceof GitCredentialError) throw err;
+    if (err?.code !== 'ENOENT') throw err;
+  }
   removeAllGitCliConfigFiles({ root: safeRoot, homeDir });
-  return Boolean(stat);
+  // 返回值语义 = 「本次有没有清掉凭据」：#399 后主面在平台文件，两份任一命中都算 true。
+  return Boolean(stat) || removedPlatform;
 }
 
 function readCredentialFile(target) {
@@ -305,6 +371,58 @@ function assertAuditPool(pool) {
   }
 }
 
+/** 某 host 的行是否在文件内容里（只判存在，不回 token）。 */
+function credentialHostInLines(contents, host) {
+  return fileLines(contents).some((line) => credentialHost(line) === host);
+}
+
+/**
+ * 存在性判据（#399 替代 token_ref）：平台那份文件里这一行在不在。
+ * 用户空间尚未落盘（ENOENT）= 不在；路径篡改（path_unsafe）照抛——判据不能吞安全错误。
+ */
+export function platformCredentialPresent({ config, fdeName, host } = {}) {
+  const normalizedHost = String(host ?? '').toLowerCase();
+  let target;
+  try {
+    target = getPlatformCredentialPath(config, fdeName).target;
+  } catch (err) {
+    if (err?.code === 'ENOENT') return false;
+    throw err;
+  }
+  return credentialHostInLines(readCredentialFile(target), normalizedHost);
+}
+
+/**
+ * 存量一次性搬运（#399 要点 5）：把遗留 home/.git-credentials 里指定 host 的行
+ * **整行原样**搬进平台文件（token 不变、agent 无感），不新造副本。
+ * 返回搬动的行数。只动目标 host，FDE 自配的其它行（如 github）一律不碰。
+ */
+export function migrateLegacyCredential({ config, fdeName, host, log = console } = {}) {
+  const normalizedHost = String(host ?? '').toLowerCase();
+  let legacy;
+  try {
+    legacy = getCredentialPath(config, fdeName);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return 0; // 用户空间未落盘 = 无存量可搬
+    throw err;
+  }
+  const legacyContents = readCredentialFile(legacy.target);
+  const moved = fileLines(legacyContents).filter((line) => credentialHost(line) === normalizedHost);
+  if (moved.length === 0) return 0;
+  const { root: platformRoot, target: platformTarget } = ensurePlatformCredentialDir({ config, fdeName, log });
+  let next = readCredentialFile(platformTarget);
+  for (const line of moved) next = replaceHostLine(next, normalizedHost, line);
+  atomicWriteFile(platformTarget, next, { mode: PLATFORM_FILE_MODE, root: platformRoot });
+  atomicWriteFile(legacy.target, replaceHostLine(legacyContents, normalizedHost, null), {
+    mode: FILE_MODE,
+    uid: config.fdeUid ?? 1000,
+    gid: config.fdeGid ?? 1000,
+    root: legacy.root,
+  });
+  log.log?.(`[git-credential] migrated legacy credential line for host=${normalizedHost} fde=${fdeName} (token unchanged)`);
+  return moved.length;
+}
+
 export async function setGitCredential({ pool, actorId = null, config, fdeName, host, username, token, protocol } = {}) {
   const normalizedHost = validateHost(host);
   validateFde(fdeName);
@@ -312,28 +430,33 @@ export async function setGitCredential({ pool, actorId = null, config, fdeName, 
   validateToken(token);
   const requestedProtocol = validateProtocol(protocol);
   assertAuditPool(pool);
-  const { root, target, homeDir } = getCredentialPath(config, fdeName);
-  const contents = readCredentialFile(target);
+  // 校验顺序：遗留 home 路径（含 symlink 逃逸检查）先行，再建平台目录——两者任一不安全都零写入零审计。
+  const legacy = getCredentialPath(config, fdeName);
+  const legacyHome = fs.existsSync(legacy.homeDir) ? legacy : null;
+  // #399：写目标从 FDE 可写的 home/.git-credentials 改为平台独占 platform/git/credentials（容器内 ro）。
+  const { root: platformRoot, target: platformTarget } = ensurePlatformCredentialDir({ config, fdeName });
+  const platformContents = readCredentialFile(platformTarget);
   const registeredHost = await resolveGitHost(pool, normalizedHost);
   const scheme = requestedProtocol ?? registeredHost.protocol ?? 'https';
   const credentialLine = `${scheme}://${encodeUserInfo(username)}:${encodeUserInfo(token)}@${normalizedHost}`;
-  const nextContents = replaceHostLine(contents, normalizedHost, credentialLine);
-  atomicWriteFile(target, nextContents, {
-    mode: FILE_MODE,
-    uid: config.fdeUid ?? 1000,
-    gid: config.fdeGid ?? 1000,
-    root,
+  atomicWriteFile(platformTarget, replaceHostLine(platformContents, normalizedHost, credentialLine), {
+    mode: PLATFORM_FILE_MODE,
+    root: platformRoot,
   });
-  upsertGitCliConfig({
-    root,
-    homeDir,
-    config,
-    provider: registeredHost.provider,
-    host: normalizedHost,
-    username,
-    token,
-    protocol: scheme,
-  });
+  // 遗留 home 文件不碰：旧代次容器（单条 store helper）只认它，清了会当场断认；
+  // 新代次里即使残留旧行也无害——helper 逐序询问、平台那份先答，store 只在平台未命中时才兼答。
+  if (legacyHome) {
+    upsertGitCliConfig({
+      root: legacy.root,
+      homeDir: legacy.homeDir,
+      config,
+      provider: registeredHost.provider,
+      host: normalizedHost,
+      username,
+      token,
+      protocol: scheme,
+    });
+  }
   await writeAudit(pool, actorId, 'admin.git_credential_set', fdeName, {
     fde_name: fdeName,
     host: normalizedHost,
@@ -346,25 +469,33 @@ export async function deleteGitCredential({ pool, actorId = null, config, fdeNam
   const normalizedHost = validateHost(host);
   validateFde(fdeName);
   assertAuditPool(pool);
-  const { root, target, homeDir } = getCredentialPath(config, fdeName);
+  const { root: platformRoot, target: platformTarget } = ensurePlatformCredentialDir({ config, fdeName });
   const registeredHost = await resolveGitHost(pool, normalizedHost);
-  const contents = readCredentialFile(target);
-  const lines = fileLines(contents);
-  const nextLines = lines.filter((line) => credentialHost(line) !== normalizedHost);
-  const deleted = nextLines.length !== lines.length;
-  atomicWriteFile(target, serializeLines(nextLines), {
-    mode: FILE_MODE,
-    uid: config.fdeUid ?? 1000,
-    gid: config.fdeGid ?? 1000,
-    root,
-  });
-  deleteGitCliConfig({
-    root,
-    homeDir,
-    config,
-    provider: registeredHost.provider,
-    host: normalizedHost,
-  });
+  const platformContents = readCredentialFile(platformTarget);
+  const platformLines = fileLines(platformContents);
+  const nextPlatformLines = platformLines.filter((line) => credentialHost(line) !== normalizedHost);
+  const deleted = nextPlatformLines.length !== platformLines.length;
+  atomicWriteFile(platformTarget, serializeLines(nextPlatformLines), { mode: PLATFORM_FILE_MODE, root: platformRoot });
+  // 遗留文件里的同 host 行一并清（历史上两处都可能写过）。
+  const legacy = getCredentialPath(config, fdeName);
+  if (fs.existsSync(legacy.homeDir)) {
+    const legacyContents = readCredentialFile(legacy.target);
+    if (credentialHostInLines(legacyContents, normalizedHost)) {
+      atomicWriteFile(legacy.target, replaceHostLine(legacyContents, normalizedHost, null), {
+        mode: FILE_MODE,
+        uid: config.fdeUid ?? 1000,
+        gid: config.fdeGid ?? 1000,
+        root: legacy.root,
+      });
+    }
+    deleteGitCliConfig({
+      root: legacy.root,
+      homeDir: legacy.homeDir,
+      config,
+      provider: registeredHost.provider,
+      host: normalizedHost,
+    });
+  }
   await writeAudit(pool, actorId, 'admin.git_credential_deleted', fdeName, {
     fde_name: fdeName,
     host: normalizedHost,
@@ -375,17 +506,30 @@ export async function deleteGitCredential({ pool, actorId = null, config, fdeNam
 }
 
 export async function listGitCredentials({ config, fdeName } = {}) {
-  const { target } = getCredentialPath(config, fdeName);
+  // #399：平台文件优先列出；遗留 home 文件里 FDE 自配的行（如 github）仍展示（只读，不归平台管）。
+  // 同 host 两处都有时取平台那份（实际生效的就是它：helper 排序先答先赢）。
+  const sources = [];
+  try {
+    sources.push(getPlatformCredentialPath(config, fdeName).target);
+  } catch {
+    /* userSpaceRoot 不可用交给遗留路径的同一错误 */
+  }
+  sources.push(getCredentialPath(config, fdeName).target);
   const hosts = [];
-  for (const line of fileLines(readCredentialFile(target))) {
-    const credential = parseCredentialLine(line);
-    if (!credential?.username || !credential.token) continue;
-    hosts.push({
-      host: credential.host,
-      protocol: credential.protocol,
-      username: credential.username,
-      token: maskToken(credential.token),
-    });
+  const seen = new Set();
+  for (const target of sources) {
+    for (const line of fileLines(readCredentialFile(target))) {
+      const credential = parseCredentialLine(line);
+      if (!credential?.username || !credential.token) continue;
+      if (seen.has(credential.host)) continue;
+      seen.add(credential.host);
+      hosts.push({
+        host: credential.host,
+        protocol: credential.protocol,
+        username: credential.username,
+        token: maskToken(credential.token),
+      });
+    }
   }
   return { hosts };
 }

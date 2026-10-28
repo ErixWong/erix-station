@@ -79,7 +79,18 @@ RUN set -eu; \
 # sharedRepository=group：git 原生机制，init/clone 自动把 .git 调成 2775 组写——免约定，
 #   对任意入口（docker exec shell umask 022 / agent bash）都生效；agentd(1001) 才能 worktree add。
 # 配合 agentd/worker 的 umask 0002（user-space §6.2）：agentd checkout 的 worktree 文件 664，worker(1002) 可写。
-RUN printf '[safe]\n\tdirectory = *\n\n[core]\n\tsharedRepository = group\n\n[credential]\n\thelper = store\n' > /etc/gitconfig
+#
+# credential.helper 两条（issue #399）：
+#   1) 平台托管凭据：fill-only helper 读 /run/erix/git/credentials（ro bind，portal 独占写，
+#      宿主源 <userSpaceRoot>/<fde>/platform/git/）。store/erase 对它是 no-op——git 的
+#      「认证被拒 ⇒ erase」再也删不动平台托管的那一行（#399 真因：一次 401 静默删行）。
+#   2) FDE 自己的 ~/.git-credentials 照旧由 FDE 读写（github 等自配凭据），平台不碰。
+#   ⚠ 排序必须落在 system 级且平台条在前：git 逐 helper 询问、先答先赢；而 local/-c 的
+#      helper 是**追加在 system 之后**的，写 ~/.gitconfig 会被后加的条目插队（容器实测）。
+RUN install -d -o root -g root -m 0755 /usr/local/libexec && \
+  printf '#!/bin/sh\n# erix-gitcred：平台托管凭据文件的只读视图（issue #399）。\n# git 把操作名追加在参数末尾：get ⇒ 代答（无该 host 时输出为空，git 继续问下一个 helper）；\n# store/erase ⇒ 静默 no-op（exit 0）：平台文件只归 portal 写，erase 永不落在这里。\ncase " $* " in\n  *" get "*) exec git credential-store "$@" ;;\n  *) exit 0 ;;\nesac\n' > /usr/local/libexec/erix-gitcred && \
+  chmod 0755 /usr/local/libexec/erix-gitcred && \
+  printf '[safe]\n\tdirectory = *\n\n[core]\n\tsharedRepository = group\n\n[credential]\n\thelper = !/usr/local/libexec/erix-gitcred --file=/run/erix/git/credentials\n\thelper = store\n' > /etc/gitconfig
 
 WORKDIR /opt/erix
 
