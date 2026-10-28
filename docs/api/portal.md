@@ -2801,7 +2801,7 @@ Request:
 { "host": "github.com", "username": "x-access-token", "token": "<secret>" }
 ```
 
-`host`, `username`, and non-empty `token` are required. The token is URL-encoded and written through to `<userSpaceRoot>/<fdeName>/home/.git-credentials`; it is not stored in the database or passed in container environment variables. The file is atomically replaced with mode `0640` and the configured FDE UID/GID. The audit entry records the FDE and host only.
+`host`, `username`, and non-empty `token` are required. The token is URL-encoded and written through to the **platform-owned** credential file `<userSpaceRoot>/<fdeName>/platform/git/credentials` (bind-mounted read-only into the container at `/run/erix/git/credentials`, issue #399); it is not stored in the database or passed in container environment variables. The file is atomically replaced with mode `0644` owned by the portal process (the read-only bind, not the mode, is what prevents container-side writes; the image's `/etc/gitconfig` lists a fill-only helper for this file before the FDE's own `store`). The legacy `<fdeName>/home/.git-credentials` is left untouched for FDE-managed hosts (e.g. self-configured `github.com`). The audit entry records the FDE and host only.
 
 Response `200` (the token is never returned):
 
@@ -2821,7 +2821,7 @@ Response `200`:
 
 ### `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>`
 
-Removes all stored credential lines for the exact host, leaving other hosts intact; the credential file remains present even when empty. Response `200` is `{ "host": "github.com", "deleted": true }`. Audit details contain the host and deletion result, never token text.
+Removes all stored credential lines for the exact host from the platform credential file (and the legacy home file if the host still has a line there), leaving other hosts intact; the platform file remains present even when empty. Response `200` is `{ "host": "github.com", "deleted": true }`. Audit details contain the host and deletion result, never token text.
 
 ## 11. Admin Git host registry (issue #118)
 
