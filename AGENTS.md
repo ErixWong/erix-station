@@ -2373,3 +2373,128 @@ provisioner 34/34、portal+root 全量绿。
 - **池外只报「用户的项目」**：`/proc` 里还有 Docker 内嵌 DNS（`127.0.0.11:34957`，uid 0）落了 `port_observations`，但门户按 `cwd` 是否 `~/projects/` 过滤掉（`portalloc.js` 那句注释写明「agentd 自己的 4000、root 的内部口不算用户的项目」）⇒ **表里有、面板里没有**，别当丢数据。
 - **界面面**（bundle 先断言 = `index-1_vis29R.js`）：`Port pool (10)` 分组头 `probe-351  Current` 排最前 + `Spare (9)` 折叠；`Listeners (2)` 面板给出「同一目录同时开在 3000 与 22000，多半是两个版本并存」告警，池外那条给「还不能在预览地址打开——让助手挪到分配的口」。截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`。
 - 探针残渣：fde-eric 里那两个 `http.server` 已 kill（新鲜度窗 45s，之后面板自动掉）；两个会话各多一条探针消息（`复活`）。
+
+### 8.73 erix-agent #469 的宿主侧后续：摘要口径、降级出口、起跑前校验（2026-10-27，分支 `feat-261027-01-392-host-followup`）
+
+上游 #469（折叠摘要器无超时/无上限/从不看 `finish_reason`）已关单，六张 PR：#482 超时不吞、
+#487 死线与不泄 `ProviderError`、#488 四个上限、#489 跨 run 不重复烧钱、#490 默认摘要预算 1400、
+#493 装配口白名单。**本站仍留在 `fold-statistical`**，闸门三条（缺一不可，见 §8.65 与本节末）：
+① 上述 PR 随 **0.27.0 真发版**（npm 最新仍是 0.26.0，本站只认版本号不认 git SHA）；② pin 完在
+**隔离实例**跑真长会话，看 `foldSummary.degradeKind` / `finishReason` / 摘要字节数 / 横幅四件都是活的；
+③ 量住「每轮多花多少时间」「每次多喂多少字节」，量完才能说"可接受"。这一节写的是**不等发版**
+就该做完的四件事。
+
+**A1 是一处真 bug，不是美化。** `runner/lib/fold-notes-key.js` 的 `deriveFoldNote` 一直在读
+`payload.chars`——而引擎**从来没有这个键**。真链路键面（`runToolLoop` + `fold-statistical`，
+0.26.0 实测）是 `{text, source, strategy, bytes, fingerprint, round}`，被夹断时多
+`truncated`/`bytesBefore`，策略给出区间时多 `from`/`to`/`rounds`。⇒ 生产上那条折走存档**永远**写
+「摘掉正文 ? 字」，规模这一维自 #392 C 片上线起就没通过。而 §8.66 那 13 条判据一直全绿，因为
+夹具手写了 `chars: 184_320`：**#331「没人读的光纤」这次复发的位置是测试夹具本身**——喂进去的
+形状是手搓的，不是从引擎取的。现在：规模以 `bytes` 为主口径（截断过就一并写「夹断前 N B」），
+`chars` 只在引擎真给了时才写，两个都没有就老实写「规模未知」；`K`/`C15` 钉值，`C18` 直接读
+**已安装引擎的源码**钉住「给 `bytes` 不给 `chars`」（与 `C14` 同一手法：不信注释不信夹具）。
+
+**A1b：erix-agent #485（已合 main、未发版）追加的三键按「有就写、没有就不写」处理。**
+`foldedRoundRange{from,to}` → 「折走第 a–b 轮」，退回引擎自己的平铺 `from`/`to`，两者都缺才退回
+旧的「第 N 轮及之前」；`foldedThrough` → 「水位线到第 X 轮」；`foldedRoundCount` → 「本 run 累计折
+N 轮」——契约（host-consumer-contract #479）明写它是 **run 作用域**、resume 后归零，所以文案里
+那个「本 run」是**口径不是措辞**，写成「会话累计」就是把一个会归零的数说成不会归零的数。
+不发 `0` 也不发 `?`：那会把「引擎没给」读成「水位线是 0」。后果是现在合进 0.26.0 表现逐字不变
+（少写两行），pin 到 ≥0.27.0 之后自动亮。
+
+**A2：降级在引擎侧是故意静默的，出口必须宿主自己接。** 上游裁定一是「降级不新增事件类型，只记进
+`CompactionStat.foldSummary`」，而 `fold-statistical` 下那五个键**全缺席**（契约不是 bug）——于是
+「折了 46 轮」和「折了 46 轮、但摘要是超时降级的次品」在界面上逐字一样。两条嘴：
+`worker.js` 导出的 `foldDegradeNotice`（→ agentd 一条 `level:'warn'`，优先 `degradeKind` 短枚举，
+只拿到 #482/#491 的整句 `degradeReason` 时退回它并截 200 字）与前端 `compactionDegradeText`
+（→ #392-D 横幅后缀 `（⚠ …）`）。两处都**只加不改**：不改 `compaction` 事件本体、不改终态——
+摘要降级不是 run 失败，模型拿到的仍是机械摘要，把正常完成的 run 刷红是误报；无降级时文案逐字
+不变（历史回放里的旧事件不得多出一段括号）。
+
+**A4：本站走直连 `runToolLoop`，上游的装配期校验一次也不会触发。** #488/#493 的校验（未知子键抛
+`TypeError`、旋钮值必须安全正整数）只挂在 `createAssemblyPort` 上，而本站从不用它。真链路实测
+（`K6`）：`context: { strategy:'fold-statistical', summarizerTimeout:5000, maxSummaryTokens:'abc' }`
+——键名少了 `Ms`、值是个字符串——在引擎里一路 `end_turn`，不抛错、不发事件、不红。所以
+`runner/lib/compact-knobs.js` 是本站唯一的拦截点：键名白名单 + 安全正整数，`worker.js` 里
+`context:` 包一层 `assertCompactContext(…)`（抛错走 §8 里的 #212 失败信封，有 `RUN_FINISHED failed`
++ 人能读的 reason，比静默跑默认值和比 exit 1 无终态都好看）。`fold-strategy.test.js` 的抠块求值
+现在**注入真校验器**而不是桩，于是往 worker 的 `context` 里加一个拼错的键，那条老判据当场红。
+`keepRounds: 0` 是合法值（含义是「折掉除最后一轮以外的全部」），所以那一支单独按「非负整数」判，
+不能套「>0 才算给」。
+
+**四个上限仍然不写、也不给 env 旋钮**（§8.65 同一条理由：策略与上限不是运维参数，改它要改的是
+判据不是配置）。上游的默认值就是本站的裁定值（30 000 ms / 30 000 ms / 49 152 B / 24 576 B /
+1 400 tok），省略与写死等价，`K5` 钉住"写死也不会被自己的白名单拦下"。`worker.js` 里两处口径注释
+同步改了：`fold-llm` 那条从「#469 未修」改成「已修 + 本站三条闸门」，`maxTokens` 继承那条加了
+「pin 0.27.0 后变成 `min(宿主 maxTokens, maxSummaryTokens ?? 1400)`，方向是变严，届时重跑口径」。
+
+**基线**（主 agent 亲跑，`wt-392f` 干净依赖 `npm ci --prefer-offline`）：根 `npm test`
+**1656 → 1671**（0 失败 / 4 跳过不变；净 +15 = `runner/test/compact-knobs.test.js` 新建 11 条 +
+`fold-notes.test.js` 的 C15–C18 四条）、`runner` `node --test` **399 → 414**（0 失败）、前端
+**50 文件 / 925 → 926**（`useEventStream.spec.ts` +1 条，`vue-tsc --noEmit` 干净）。⚠ `.github/workflows/ci.yml`
+里那句「1401 项基线」自 #282 起就没再跟（现值 1671），本单**不动它**——那是 §8 反复警告过的
+「顺手修陈旧物」，要修得单开一单把整串台账一次理直。
+
+**别改回去的四件事**：① `deriveFoldNote` 里那个 `bytes` 主口径（读 `chars` 的那版本在 0.26.0 上
+**永远**输出「?」，而单测照样全绿）；② `C18` 那条读引擎源码的 tripwire（它就是为了①而存在的）；
+③ `fold-strategy.test.js` 注入的是**真**校验器不是桩（换成桩，worker 里加错键就又看不见了）；
+④ A2 两处「只加不改」（改了事件本体或终态，就是把一次正常完成的 run 刷成错误，还会让历史回放里
+的旧事件多出一段括号）。
+
+**收口补丁：A2 读过一个引擎从不发的键（`foldSummary.unshrinkable`），现在是 K12 这条对账在守。**
+上游 #494 合进 0.27.0 的发布收尾期间顺手核了一遍契约，发现本单 A2 里那个「截了等于没截」的判据
+读的是 `foldSummary.unshrinkable`——**这个键在中英契约与 `src/` 全文 grep 零命中**，是本站按
+「#490 应该会发这个」的记忆造的。后果不是报错而是**永不触发**：一条永不响的告警比没有告警更坏，
+而且它已经长进了判据（K10）、前端文案和两份 i18n。改回契约真有的那批（erix-agent 契约
+「compaction stat」那一行）：`degradeKind` / `degradeReason` / `budgetExhausted`（整条摘要步骤剩余
+预算不足 2 秒 ⇒ 连自愈重试都没发生）/ `inputTruncated` + `droppedRounds`（48 KB 按整轮裁）/
+`droppedMessages`（token 守卫逐条裁）/ `finishReason`。`droppedRounds: 0` 与 `false` 是「没裁」，
+不许据此报事，否则每个正常折叠都刷一条。
+
+**K12 的写法是重点，不只是补一条断言**：待检键名**从两处生产代码里正则抠**（`worker.js` 的
+`foldDegradeNotice` 里的 `stat.*` 与前端 `compactionDegradeText` 里的 `s.*`），不手抄清单；然后
+两半检查——**永远跑的那半**比一份手抄自上游 main 的键清单（今天真正的防线），**随 pin 自动接管的
+那半**与已安装引擎随包的 `docs/host-consumer-contract.md` 逐键对账。跳过必须有机判据：按已安装引擎
+**版本号**判（`<0.26.0 无此面` 是 0.26.0 的正常事实），并反向钉住「版本低 ⇒ 契约确实没有这一面」——
+上游若把字段面回移到老版本，这条会红，而不是让跳过状态一直用「引擎版本旧」这句话自证。
+
+### 8.74 #421：事件承接面要按**引擎承诺的清单**对账，不是按"界面上想展示什么"（2026-10-27，分支 `feat-261027-01-392-host-followup`）
+
+清点方式先说清楚，因为它比结论有用：**把上游对宿主承诺的事件面取出来，与本站三处白名单逐条对**。
+承诺面不是我自己挑样本，而是上游源码里的类型声明 —— `erix-agent` `src/loop/orchestrator.js` 中
+`LoopEvent` 的 `@property` 联合类型，**16 类**。对出来的结果：
+
+| | 数量 | 后果 |
+|---|---|---|
+| 上游承诺 | 16 | — |
+| 本站前端订得到（`useEventStream.ts` 的 `EVENT_TYPES`） | 11 | 另外 **5 类浏览器一条都收不到** |
+| 前端 `HISTORY_REPLAY_TYPES` / 后端 `http.js` 的 `HISTORY_EVENT_TYPES` | 各 20（彼此严格相等） | 5 类里 **4 类两处都没有 ⇒ 实时没有、刷新后也没有**；`model_metadata_missing` 只有后端下发、前端不处理 |
+
+写入侧不过白名单（`internal.js` 直接 `INSERT INTO run_events`）⇒ **这 5 类每轮都在往库里写**，是读侧
+把它们丢了。这就是 #371-A 的形状（库里存着、读不出来），也正是 #288 立"三处同步"纪律要防的那件事。
+最讽刺的一条：`compaction_strategy_fallback` 是上游 #464-A 专门为"你配的策略不是真跑的那条"造的
+信号，而 #392 正是本站在这上面栽过的一跤 —— 信号一直发，我们接不到。
+
+**三条口径**：
+
+1. **三处集合各自独立存亡**，只加一边就得到两种可见性不一致（"实时有刷新没" / "刷新有实时没"）。
+   对账测把 **16 类清单钉死在测里**（`portal/test/event-surface-contract.test.js`）：上游改联合类型、
+   本站删监听、豁免不写理由，都会红。跨端读后端源码这件事住在 `portal/test` —— 前端 vitest 是 jsdom，
+   读源码只能 `?raw`，而 vite 的 fs 边界不许越出 `portal/frontend`（#349 踩过）。
+   另有一条**等式**判据：前端回放集合必须与后端下发白名单**逐项相等**（不是子集，今天 20 = 20）。
+2. **"订得到"不可豁免，"展示"可以豁免但必须写理由**。`run_outcome` 每 run 一条、与 `run_end` 语义
+   重叠且今天无读者 ⇒ 显式不进时间线/历史白名单，理由写在测里的豁免表（`EXEMPT_FROM_TIMELINE`）；
+   等 §12 台账或结算面板真用它时再接。**豁免表空着不算做过决定。**
+3. **界面之外还要有运维的嘴**：`runner/lib/engine-notices.js` 把这 5 类翻成 LOG（四类 `warn`、
+   `run_outcome` 是 `info` —— 每轮都有的东西刷成 warn 会把 warn 面淹掉）。只修界面，等于"只读
+   LOG 的人仍然不知道"。文案口径照旧：数字没给就 `?`/「若干」，绝不拿 0 冒充（#283）；外来标识符
+   过形状闸，绝不 `[object Object]`（#261）。
+
+变异逐条证过这四条锁会红：删 `EVENT_TYPES` 里的 `run_outcome`（后端 2 红 + 前端 4 红）；删后端白名单
+里的 `compaction_strategy_fallback`（2 红）；删前端回放集合里的 `resume_journal_skipped`（后端 2 红 +
+前端 2 红）；删 `en` 一条 key（2 红）。复原后全绿。
+
+顺带清掉一个**文档假前提**：`http.js` 里 `model_metadata_missing` 那条注释写着"SSE 实时路径会原样推给
+前端（前端 `default: return;` 中性忽略）"—— 前端从没订过这个类型，EventSource 不订就不是"收到但不
+展示"，而是**根本没收到**。注释与实际不符本身就是缺陷面的一部分，改代码时必须一起改，不然下一个人
+会照着它再推一遍错的结论。
