@@ -427,3 +427,93 @@ describe('状态条落点：紧贴输入框上方（#282 落点调整）', () =>
     expect(composer).toContain('border-black/10');
   });
 });
+
+// ---- issue #428：换账号后首页对话窗口还挂着上一个账号的对话 ----
+// 登出是 `auth.logout()` + `router.replace('/login')`：SPA 不重载页面 ⇒ workbench store 这个全局
+// 单例跨账号存活。本组用例钉的是**视图接线**（store 侧复位本身在 stores/workbench.spec.ts）：
+// ① 挂载第一步按当前登录者认领，身份变了必须先复位；② 登出当场收回归属，不等下一个账号来擦。
+describe('#428 换账号时的视图接线', () => {
+  const USER_B = {
+    id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: 'bob', auth_source: 'local',
+  } as AuthUser;
+
+  /** jsdom 的 EventSource 是「一 new 就抛」的桩，openSession 会 connect ⇒ 自己给一个可断言的假类。 */
+  class FakeES {
+    static instances: FakeES[] = [];
+    closed = false;
+    listeners = new Map<string, ((e: MessageEvent) => void)[]>();
+    constructor(public url: string) { FakeES.instances.push(this); }
+    addEventListener(type: string, fn: (e: MessageEvent) => void) {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+    }
+    close() { this.closed = true; }
+  }
+
+  /**
+   * 挂载一次工作台。**pinia 由调用方建一次、两次挂载共用**——「store 跨账号存活」正是本单的前提，
+   * 每次新建 pinia 的装配等于把 bug 一起重建掉，用例会变成空对空。
+   */
+  async function mountWorkbenchWith(pinia: ReturnType<typeof createPinia>, user: AuthUser) {
+    setActivePinia(pinia);
+    vi.stubGlobal('EventSource', FakeES);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith('/api/me')) return jsonResponse({ user });
+      if (url.startsWith('/api/dirs')) return jsonResponse({ dirs: DIRS });
+      if (url.includes('/events/history')) return jsonResponse({ events: [], next_cursor: null });
+      if (url.includes('/api/sessions/s1')) {
+        return jsonResponse({
+          session: { id: 's1', active_run_id: null, message_count: 1 },
+          messages: [{ id: 'm1', role: 'user', content: '上一个账号的对话', seq: 1 }],
+          last_seq: 1,
+        });
+      }
+      if (url.startsWith('/api/sessions')) return jsonResponse({ items: [] });
+      if (url.startsWith('/api/git-light')) return jsonResponse(GIT_LIGHT_GREEN);
+      return jsonResponse({});
+    }));
+    const auth = useAuthStore();
+    auth.user = user;
+    auth.ready = true;
+    const router = createAppRouter(createMemoryHistory());
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(WorkbenchView, { global: { plugins: [pinia, router, i18n] } });
+    await tick();
+    return { wrapper, auth, store: useWorkbenchStore(), router };
+  }
+
+  it('A 开着会话登出 ⇒ 消息流当场清空、SSE 当场断开（不等下一个账号）', async () => {
+    FakeES.instances = [];
+    const pinia = createPinia();
+    const { wrapper, store } = await mountWorkbenchWith(pinia, FDE_USER);
+    await store.openSession('s1');
+    expect(store.entries.length, '前置自检：A 的对话已渲染进消息流').toBeGreaterThan(0);
+    expect(store.sessionId).toBe('s1');
+    const conn = FakeES.instances.at(-1)!;
+    expect(conn.closed).toBe(false);
+
+    await wrapper.findAll('header > button').at(-1)!.trigger('click'); // 登出
+    await tick();
+
+    expect(store.entries).toEqual([]);
+    expect(store.sessionId).toBeNull();
+    expect(conn.closed, 'SSE 必须跟着登出断开').toBe(true);
+    wrapper.unmount();
+  });
+
+  it('换 B 登录重挂载（同一个 pinia）⇒ 看到的是空窗口，不是 A 的对话', async () => {
+    const pinia = createPinia();
+    const first = await mountWorkbenchWith(pinia, FDE_USER);
+    await first.store.openSession('s1');
+    first.store.inputValue = 'A 打了一半的话';
+    first.wrapper.unmount(); // 直接卸载（不经登出按钮）＝会话过期 / 直接粘 /login 这类**不经过 logout()** 的路径
+
+    const { wrapper, store } = await mountWorkbenchWith(pinia, USER_B);
+    expect(store.entries, 'B 不得看见 A 的消息流').toEqual([]);
+    expect(store.sessionId).toBeNull();
+    expect(store.inputValue, 'A 的草稿不得出现在 B 的输入框').toBe('');
+    expect(store.dirCwd, 'B 自己的目录照常加载（复位不是把工作台弄坏）').toBe(DIRS[0].cwd);
+    wrapper.unmount();
+  });
+});

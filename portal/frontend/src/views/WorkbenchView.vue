@@ -78,6 +78,9 @@ async function onNewSession() {
 }
 
 async function onLogout() {
+  // issue #428：先把工作台从当前登录者名下收回（当场关 SSE + 清消息流/草稿/目录/会话），再跳登录页。
+  // 不靠 `auth.logout()` 顺手做：工作台状态的归属只有这里知道，且登出失败（会话已死）也得收摊。
+  store.claimOwnership(null);
   await auth.logout();
   router.replace('/login');
 }
@@ -105,6 +108,9 @@ function onPickerSelect(id: string) {
 
 onMounted(async () => {
   if (!auth.user) return; // 守卫保证已登录
+  // issue #428：SPA 登出**不重载页面** ⇒ 本视图重挂载时 workbench store 还是上一个账号的。
+  // 第一步就按当前登录者认领（身份变了则先全量复位），且必须在 `initWorkspace` 之前同步跑完。
+  store.claimOwnership(String(auth.user.id));
   // issue #281：**Vue 不等 onMounted 返回的 Promise** ⇒ 里面每一个 `await` 都必须自己收尾，否则一次
   // /api/dirs 失败就是 Unhandled Rejection（代价真实发生过：v0.1.7 打 tag 时 CI 步骤④ 就红在这两个
   // 无 catch 的 await 上，AGENTS §4 与 §8.20）。本地 catch ≠ 加一层重试：**不重试**，只把失败变成
