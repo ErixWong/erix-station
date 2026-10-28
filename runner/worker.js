@@ -90,7 +90,14 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 3. 收尾回复只写简短摘要：做了什么、写入/修改了哪些文件、如何运行与验证；不要在回复里粘贴代码全文或大段文件内容。
 4. 若任务只是问答或解释、不产生交付物，直接回答即可，无需写文件。
 5. 交付前尽量用 shell 工具运行验证命令（构建/测试/lint），跑通再交付；命令在容器内执行，不要改动项目目录之外的状态。
-6. 始终使用用户消息所用的语言进行回复与会话摘要；用户消息是英文就用英文，中文就用中文。`;
+6. 始终使用用户消息所用的语言进行回复与会话摘要；用户消息是英文就用英文，中文就用中文。
+
+过程播报（用户看不见你的内部动作，只看得见你写的字）：
+1. 收到任务后**先回一句**再动手：用一两句说清你理解到的目标与第一步要查什么。这句话之后的工具调用不会有人知道你在干什么——只有正文会显示给用户。
+2. 每完成一个阶段（定位到问题 / 改完一个文件 / 跑完一次测试 / 服务起来了）就用一两句说结果与下一步。连续多次工具调用之间不让用户看到任何字，他就不知道你是在干活还是已经死了。
+3. 只在**真的需要他参与**时提问：需求有歧义、要他在几个方案里拍板、缺了他才有的信息（密码、外部地址、预期行为）。工具报错、目录不存在、依赖没装——这些是你自己的活，不要拿它们打断用户。
+4. 预计要跑比较久的命令（安装依赖、构建、跑测试、起 dev server）先把要做什么说出来，跑完再报结果；失败也要说清楚失败在哪一步、你接下来怎么绕过，不要把失败咽下去只给一个成功收尾。
+5. 播报是**进度**不是报告：一句话就够，不要为了播报而反复读同一个文件、也不要把它写成第二段交付摘要。`;
 
 const nextReqId = createReqIdGenerator();
 let runStart = null;
@@ -197,7 +204,7 @@ function emitEvent(type, payload) {
  * 要钉 `duration_ms` 的取值口径：新记录读 `erix.durationMs`、老记录回退顶层 `duration`、
  * 两者都缺⇒ `null`，**绝不伪装成 0**）；worker 自身调用方式不变。
  */
-export function loopEventPayload(event) {
+export function loopEventPayload(event, meta = {}) {
   switch (event?.type) {
     case 'round_start':
       return { round: event.round };
@@ -207,8 +214,22 @@ export function loopEventPayload(event) {
       return { round: event.round, attempt: event.attempt, maxAttempts: event.maxAttempts };
     case 'recovered':
       return { round: event.round, attempt: event.attempt };
-    case 'usage':
-      return { round: event.round, usage: event.usage };
+    case 'usage': {
+      // issue #425：`usage` 是**单次 provider 调用**的用量，此前被 `onEvent` 整条丢掉（见下方注释），
+      // 界面上「上下文占了多少 / 这一轮烧了多少」因此永远拿不到真值。现在放行展示，
+      // **记账仍然只认 U2 终态载荷**（§7.3/§6.3-6 的口径没动，只是不再拿「不记账」当「不显示」）。
+      // `context_window` 是**宿主侧 additive 字段**（引擎事件里没有，来自 RUN_START 下行的模型元数据，
+      // 与喂给引擎 `modelMetadata.contextWindowTokens` 的是同一个数，§6.3-2/#309）——没配就是没有，
+      // **不补 0**：前端据此整段不出，而不是画一个「0% / 0 上限」的假进度条。
+      const payload = { round: event.round, usage: event.usage };
+      // ⚠ 形状判据用 `isSafeInteger` 而不是 `isFinite`：与 #316 入口（`parseHeartbeatModels`）以及
+      // `lib/llm-models.js` 规则 3 同一口径。小数（1.5）与字符串（"262144"）在那个入口已被丢掉，
+      // 但本函数是导出的公共面（单测/未来调用方），不得靠「上游刚好洗过」来保证形状。
+      if (Number.isSafeInteger(meta.contextWindow) && meta.contextWindow > 0) {
+        payload.context_window = meta.contextWindow;
+      }
+      return payload;
+    }
     case 'tool_use':
       return {
         tool_call_id: event.toolUse?.id ?? null,
@@ -695,8 +716,11 @@ async function startRun(msg) {
       }),
       /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
+      // issue #425：**不再丢弃 `usage`**（旧代码在这里 `return`，理由是「双源去重」——但去重针对的是
+      // **记账**，而记账本就只走 U2 织态载荷（§7.3-6：「onEvent 的 usage 类事件仅实时展示、不产生第二条
+      // 记账」）。旧写法把「不记账」做成了「不显示」，于是用户界面上除了织态那一行永远看不到任何
+      // token 数字，「上下文到底吃了多少」只能猜。现在按 §7.3-6 的原意放行：只展示，不记账。
       onEvent: (event) => {
-        if (event?.type === 'usage') return; // 双源去重：记账以返回值 usage 为准（§7.3/§6.3-6）
         // issue #469 宿主侧后续（A2）：折叠摘要「产出了，但是次品」在引擎侧是**故意静默**的
         // （erix-agent#469 裁定一：降级只进 `CompactionStat.foldSummary`，不新增事件类型）。
         // 本站必须接出一条人看得见的嘴，否则「降级了」与「没降级」在日志里长得一模一样。
@@ -714,7 +738,7 @@ async function startRun(msg) {
         if (notice) {
           sendIpc(process, { type: MSG.LOG, run_id: runId, level: notice.level, msg: notice.msg });
         }
-        emitEvent(event.type, loopEventPayload(event));
+        emitEvent(event.type, loopEventPayload(event, { contextWindow: engineModelMetadata?.context_window }));
       },
       onDelta: (chunk) => {
         if (typeof chunk === 'string' && chunk.length > 0) emitEvent('assistant_delta', { text: chunk });
