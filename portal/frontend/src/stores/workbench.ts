@@ -300,7 +300,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const noDir = ref(false);
   const projectReqSeq = ref(0); // 迟到响应丢弃（快速 A→B 切换）
   const sessionReqSeq = ref(0);
+  // issue #428：/api/dirs 同族序号——复位之后上一账号那次在途 loadDirs 的迟到响应必须被丢弃，
+  // 否则它会在 B 已经把目录拉回来之后覆盖界面（网络完成顺序不保证）。
+  const dirsReqSeq = ref(0);
   const ctxSeq = ref(0); // 项目上下文代次
+  /**
+   * issue #428：这份 store 当前归谁（`auth.user.id`，登出置 null）。
+   * 存在的唯一理由：给 `resetForUserSwitch()` 找一个**不依赖组件时序**的触发点。
+   */
+  const ownedBy = ref<string | null>(null);
   const entries = ref<StreamEntry[]>([]); // 消息流（含分隔行/工具卡片占位）
   const renderedIds = ref<Set<string> | null>(null); // 去重（refresh 与流式缓冲竞态）
   const inputValue = ref(''); // composer 输入（旧 $('input').value）
@@ -765,7 +773,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   /** issue #84 P5：拉取目录下拉数据源（GET /api/dirs）。↻ 刷新与 initWorkspace 共用。 */
   async function loadDirs() {
+    // issue #428：与 loadSessions 同口径的迟到响应守卫（复位会撞这个序号）。
+    const reqSeq = ++dirsReqSeq.value;
     const data = await api<{ dirs?: DirInfo[] }>('/api/dirs');
+    if (reqSeq !== dirsReqSeq.value) return; // 过期响应：这轮目录列表已被更新的请求（或换账号复位）接管
     dirs.value = data.dirs ?? [];
   }
 
@@ -1138,6 +1149,78 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   /**
+   * issue #428：**换账号**时的全量复位。登出只清 `auth` store + `router.replace('/login')`（SPA
+   * 不重载页面），而本 store 是 pinia 全局单例 ⇒ 上一个账号的消息流、会话/目录列表、输入草稿、
+   * 队列、折叠原文缓存、乃至**那条 SSE 连接**原样活到下一个账号，于是「切了账号，首页对话窗口里
+   * 还是别人的对话」。
+   *
+   * ⚠ 为什么不是 `resetSessionView()`：那条只清「一个会话的详情区」，目录 / 会话列表 / 草稿 / SSE
+   * 都留着；而它唯一的自动触发点（WorkbenchView 的 `watch(() => route.params.id)`）**没有
+   * `immediate`**——重新登录挂载时 `params.id` 恒为 `undefined` 且未发生变化 ⇒ 回调根本不跑。
+   *
+   * 清的是**整个用户的可见面**，一项不留：目录的 cwd 是上一个账号家目录下的路径，本身就是跨账号信息。
+   */
+  function resetForUserSwitch(): void {
+    // ① 在途响应全部作废：撞开全部代次/序号，让迟到的 /api/dirs、/api/sessions、getSession、
+    //    reconcile 响应被各自既有的守卫丢弃（不撞就会出现「B 的界面被 A 的迟到响应覆盖」）。
+    ctxSeq.value++;
+    projectReqSeq.value++;
+    sessionReqSeq.value++;
+    dirsReqSeq.value++;
+    runStateCheckSeq++;
+    // ② SSE 与协议态（`resetStreamState` 内含 `closeEs()`：连接本身必须断，否则带着上一账号的
+    //    会话继续收帧、继续往已清空的消息流里推条目）。
+    es.resetStreamState();
+    // ③ 消息流与详情区（含分页游标、#189 折叠原文缓存、#236/#306 幂等集）
+    entries.value = [];
+    renderedIds.value = null;
+    olderMessagesCursor.value = null;
+    olderEventsCursor.value = null;
+    olderLoading.value = false;
+    foldedOriginals.value = {};
+    // ④ 目录与会话列表
+    dirs.value = [];
+    dirCwd.value = null;
+    sessions.value = [];
+    sessionId.value = null;
+    sessionMessageCount.value = null;
+    updateAvailability(); // 目录已清 ⇒ noDir=true；新账号挂载后由 initWorkspace 重算
+    // ⑤ 输入面：草稿是「上一个账号打了一半的话」，绝不能出现在新账号的输入框里
+    //    （`drafts` 按 sessionId 键，同 id 理论上不会撞，但整个 Map 必须跟着人走）。
+    drafts.clear();
+    inputValue.value = '';
+    // ⑥ 队列（#370）与一键重试（#261B）以及各种在途闸门
+    applyQueueSnapshot({ steering: [], follow_up: [] });
+    queueSubmitting.value = false;
+    creatingSession.value = false;
+    retryInFlight.value = false;
+    lastSend.value = null;
+    clearRetryFace();
+    // ⑦ 旁路观测面：动量数字（#282）与工具卡片展开记忆（#85，模块级 Set，跨 store 实例都共享）
+    momentum.reset();
+    clearExpandedToolCalls();
+  }
+
+  /**
+   * issue #428：把工作台**认领**给当前登录者；身份与上一次不同 ⇒ 先 `resetForUserSwitch()`。
+   *
+   * 调用点只有 WorkbenchView：挂载时 `claimOwnership(auth.user.id)`（覆盖「会话过期后重登」「直接
+   * 粘 /login 重登」这些**不经过 `logout()`** 的换账号路径），登出时 `claimOwnership(null)`
+   * （当场关 SSE 并清空，不给登录页留旧内容）。
+   *
+   * ⚠ 复位必须在 `initWorkspace()` **之前同步执行**：放在 `watch(auth.user)` 里就要赌「回调先于
+   * 子组件 onMounted」这个时序，赌输了一次 `initWorkspace` 的成果会被洗成空目录。
+   *
+   * @returns 本次是否发生了复位（供调用方与单测断言）
+   */
+  function claimOwnership(userId: string | null): boolean {
+    if (ownedBy.value === userId) return false;
+    ownedBy.value = userId;
+    resetForUserSwitch();
+    return true;
+  }
+
+  /**
    * 发送链路（唯一一条）：自动建会话、草稿守卫、ctx/session 代次守卫、失败回填都在此。
    *
    * issue #261B：`contentOverride` = 重试链路传入的「上一条内容」。传了就用它作为发送体，
@@ -1399,9 +1482,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   return {
     // state
     dirs, dirCwd, sessions, sessionId, noDir,
+    // issue #428：`sessionMessageCount` 原本只内部用（#197 消息数口径），导出只为给换账号复位钉用例
+    sessionMessageCount,
     entries, renderedIds, inputValue, creatingSession,
     olderMessagesCursor, olderEventsCursor, olderLoading, olderPrependSeq,
     drafts, es,
+    // issue #428：换账号复位的两个入口（`ownedBy` 不外露：它是实现细节，不是界面状态）
+    claimOwnership, resetForUserSwitch,
     // computed
     currentDir, running, sendDisabled, inputPlaceholder, newSessDisabled,
     // issue #370：输入队列（状态 + 计数 + 暂停原因）

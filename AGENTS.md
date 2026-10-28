@@ -2578,3 +2578,48 @@ kkFileView 提案）**在仓库里根本不存在**。两份台账长成了两�
 **这条为什么没有机器判据**：`test/repo-hygiene.test.js` 只能看见仓库内部；「仓库父目录不得有散件」在 CI 里
 父目录是 `<runner>/work/<repo>/`，形状与本机不同，硬加就是一条会因环境假红的判据。**兜底方式是台账**：
 `ISSUES.md` 条目数从 7 → 13、对照表 8~13 行都在，任何人可以核对本机顶层是否还剩散件。
+
+### 8.77 SPA 化把登出 `location.reload()` 顺带承担的「清场」职责弄丢了：换账号必须显式认领（issue #428，2026-10-28，分支 `fix-261028-01-428-user-switch-reset`）
+
+**现象**：同一个浏览器标签里换账号（登出 → 换号登录）落到工作台首页（`/`，没选任何会话），
+**中间对话窗口还是上一个账号的那段对话**；侧栏列表是新账号的（被 `/api/sessions` 覆盖了），于是看起来
+像「列表是新的、聊天区是旧的」。刷新一次就好了 ⇒ 典型的内存态没跟人走。
+
+**根因是两层，缺一层都不会发生**：
+
+1. 登出只做两件事——`auth.logout()` 清 auth store + `router.replace('/login')`。**SPA 不重载页面**，
+   而 `stores/workbench.ts` 是 pinia 全局单例（setup store，无 `$reset`）⇒ 消息流 `entries`、目录 /
+   会话列表、`drafts`（模块内 `Map`）、#370 队列、#189 折叠原文缓存、乃至**那条 `EventSource` 连接**
+   全部原样活到下一个账号。
+2. 现成的 `resetSessionView()` 本来会清这些，但它**唯一的自动触发点**是
+   `WorkbenchView` 里 `watch(() => route.params.id, …)` 的 `else` 分支，且**没有 `immediate`**：
+   重新登录挂载时 `params.id` 恒为 `undefined` 且**没有发生变化** ⇒ 回调根本不跑。`onMounted` 里的
+   `initWorkspace()` 只重拉 `/api/dirs` + `loadSessions()`，从不碰 `entries`。
+
+**⚠ 这条的通用教训**：SPA 化之前旧版 `static/index.html` 的登出是 `location.reload()`——它**顺带**
+承担了「全局内存态清零」。改成 `router.replace` 时没人写下「reload 本来在承担什么」，职责就凭空消失了。
+**凡是靠整页重载白拿的干净状态，改 SPA / 改路由时都必须显式接回来**，并在注释里写明它原来在干什么。
+
+**修法（两处接线 + 一个 store 动作）**：
+
+- `resetForUserSwitch()`：清的是**整个用户的可见面**，不是「一个会话的详情区」——目录也一起清，
+  因为目录的 `cwd` 是上一个账号家目录下的路径，本身就算跨账号信息。顺序：先撞开全部代次/序号
+  （`ctxSeq` / `projectReqSeq` / `sessionReqSeq` / `runStateCheckSeq`，**新加 `dirsReqSeq`**——
+  `/api/dirs` 此前是唯一没有迟到守卫的那条），再断 SSE（`es.resetStreamState()` 内含 `closeEs()`），
+  然后清消息流 / 目录 / 会话 / 草稿 / 队列 / 重试面 / 动量 / 卡片展开记忆。
+- `claimOwnership(userId)`：store 记一个 `ownedBy`，身份不同才复位。**调用点在视图层两处**——
+  `WorkbenchView.onMounted` 第一步 `claimOwnership(auth.user.id)`、`onLogout()` 里 `claimOwnership(null)`。
+- ⚠ **为什么必须在 `initWorkspace()` 之前同步执行**，而不是写进 `watch(() => auth.user?.id)`：后者要赌
+  「父组件 watcher 先于子组件 `onMounted`」这个时序，赌输一次 `initWorkspace` 的成果就被洗成空目录。
+  同步接线没有竞态，且**覆盖不经过 `logout()` 的换账号路径**（会话过期后 `forgetExpiredSession()` 回登录页、
+  直接粘 `/login` 重登）。登出那次 `claimOwnership(null)` 的作用是**当场**断 SSE 并清空，不给登录页留旧内容。
+
+**顺带查清的一件事（源码对账，未改代码）**：`send()` 用 `sessionId.value` 定位会话，复位之前它是
+**上一个账号的会话 id** ⇒ 界面看着是「新账号首页」，POST 却打到别人的会话。本修法把 `sessionId` 归
+null，症状随之消失。而**后端本来就挡着**（2026-10-28 对账 `portal/src/sessions.js` / `http.js`）：
+`fetchSession()` 一条 SQL 里同时做存在性与属主校验，`!row || row.user_id !== userId` 与「不存在」
+**同一个 `404 not_found`**（不泄露存在性）；`POST /messages` 在幂等 fn 内先 `assertSessionOwner()`
+（就是 `fetchSession` 的别名）再动笔，`postMessage()` 自己还带 `FOR UPDATE` 二次校，SSE
+`handleSessionStream` 走 `getSession()` 同一口径 ⇒ **跨账号写不会串号，只是把用户看到的一行错误文案
+变得莫名其妙**（"会话不存在"出现在一个看起来刚建好的首页上）。这类「前端状态穿越账号」的 bug 因此
+定级为体验 + 信息泄漏，**不是数据完整性**。
