@@ -197,3 +197,140 @@ describe('store 接线（useEventStream 的 onEvent 旁路）', () => {
     expect(msg && msg.kind === 'msg' ? msg.createdAt : undefined).toBe('2026-10-23T13:42:07.000Z');
   });
 });
+
+// ---- issue #425：相位跟踪 / usage 面 / 历史用量口子 ----
+describe('#425 相位跟踪（让状态条一直说得出自己在等什么）', () => {
+  it('round_start ⇒ 等 LLM；delta ⇒ 收流；tool_use ⇒ 工具中（带名字）；tool_result 全部交差 ⇒ 回到等 LLM', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('round_start', { run_id: 'r1', round: 1 }, false, 1_000);
+    expect(feed.state).toMatchObject({ phase: 'awaiting_llm', phaseAt: 1_000, pendingTools: 0 });
+
+    feed.ingest('assistant_delta', { run_id: 'r1', text: 'hi' }, false, 2_000);
+    expect(feed.state).toMatchObject({ phase: 'streaming', phaseAt: 2_000 });
+
+    feed.ingest('reasoning_delta', { run_id: 'r1', text: 'hm' }, false, 2_500);
+    expect(feed.state.phase).toBe('streaming');       // 推理增量同样算「上游在回话」
+    expect(feed.state.phaseAt).toBe(2_000);           // 同相位内不重置计时（否则秒数永远停在 0）
+
+    feed.ingest('tool_use', { run_id: 'r1', tool_call_id: 'c1', name: 'shell' }, false, 3_000);
+    expect(feed.state).toMatchObject({ phase: 'tool_running', phaseAt: 3_000, activeToolName: 'shell', pendingTools: 1 });
+
+    feed.ingest('tool_result', { run_id: 'r1', tool_call_id: 'c1', duration_ms: 5 }, false, 4_000);
+    expect(feed.state).toMatchObject({ phase: 'awaiting_llm', phaseAt: 4_000, activeToolName: null, pendingTools: 0 });
+  });
+
+  it('并发工具：还有未交差的工具时相位留在 tool_running（不提前说「在等模型」）', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('tool_use', { run_id: 'r1', tool_call_id: 'a', name: 'readFile' }, false, 10);
+    feed.ingest('tool_use', { run_id: 'r1', tool_call_id: 'b', name: 'readFile' }, false, 11);
+    feed.ingest('tool_result', { run_id: 'r1', tool_call_id: 'a', duration_ms: 1 }, false, 20);
+    expect(feed.state.phase).toBe('tool_running');
+    feed.ingest('tool_result', { run_id: 'r1', tool_call_id: 'b', duration_ms: 1 }, false, 30);
+    expect(feed.state.phase).toBe('awaiting_llm');
+  });
+
+  it('tool_use 没带名字 ⇒ activeToolName 保持未知（文案整段不写工具名，不写 undefined）', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('tool_use', { run_id: 'r1', tool_call_id: 'c1' }, false, 10);
+    expect(feed.state.activeToolName).toBeNull();
+    expect(feed.state.phase).toBe('tool_running');
+  });
+});
+
+describe('#425 usage 面（单次调用 vs 本 run 累计两个数，都不估算）', () => {
+  it('usage 落到 roundUsage（不是 run_end 的 usage）；同轮多次调用累加', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('usage', { run_id: 'r1', round: 3, usage: { input_tokens: 100, output_tokens: 10 } }, false, 10);
+    feed.ingest('usage', { run_id: 'r1', round: 3, usage: { input_tokens: 0, output_tokens: 5 } }, false, 11);
+    expect(feed.state.roundUsage).toEqual({ input_tokens: 100, output_tokens: 15 });
+    expect(feed.state.usage).toBeNull();  // 绝不拿单次调用冒充整 run
+    expect(feed.state.runUsage).toBeNull();
+  });
+
+  it('换轮 ⇒ 本轮用量重置；round_end 填累计值且**不清**本轮（轮间空档不闪没）', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('usage', { run_id: 'r1', round: 1, usage: { input_tokens: 100, output_tokens: 10 } }, false, 10);
+    feed.ingest('round_end', { run_id: 'r1', round: 1, usage: { input_tokens: 100, output_tokens: 10 } }, false, 20);
+    expect(feed.state.runUsage).toEqual({ input_tokens: 100, output_tokens: 10 });
+    expect(feed.state.roundUsage).toEqual({ input_tokens: 100, output_tokens: 10 }); // 仍在（此刻界面说的就是这一轮）
+
+    feed.ingest('round_start', { run_id: 'r1', round: 2 }, false, 30);
+    expect(feed.state.roundUsage).toBeNull();          // 新一轮开始才清（不拿上一轮的数冒充本轮）
+    expect(feed.state.runUsage).toEqual({ input_tokens: 100, output_tokens: 10 }); // 累计不清
+
+    feed.ingest('round_end', { run_id: 'r1', round: 2, usage: { input_tokens: 260, output_tokens: 25 } }, false, 40);
+    expect(feed.state.runUsage).toEqual({ input_tokens: 260, output_tokens: 25 }); // 引擎给的是累计 ⇒ 覆盖不是相加
+  });
+
+  it('context_window：正数才收；0 / 负 / 脏值不覆盖已知值', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('usage', { run_id: 'r1', usage: { input_tokens: 1 }, context_window: 262_144 }, false, 10);
+    expect(feed.state.contextWindow).toBe(262_144);
+    feed.ingest('usage', { run_id: 'r1', usage: { input_tokens: 1 }, context_window: 0 }, false, 11);
+    expect(feed.state.contextWindow).toBe(262_144);   // 不拿「没有」盖掉已知值
+    feed.ingest('usage', { run_id: 'r1', usage: { input_tokens: 1 } }, false, 12);
+    expect(feed.state.contextWindow).toBe(262_144);   // 没带也保持
+  });
+
+  it('round_end 不带 usage ⇒ 不覆盖已有累计（缺键 = 没拿到，不是 0）', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r1', 0);
+    feed.ingest('round_end', { run_id: 'r1', round: 1, usage: { input_tokens: 10, output_tokens: 1 } }, false, 10);
+    feed.ingest('round_end', { run_id: 'r1', round: 2, usage: null }, false, 20);
+    expect(feed.state.runUsage).toEqual({ input_tokens: 10, output_tokens: 1 });
+  });
+});
+
+describe('#425 历史回放的唯一口子：round_end 的累计用量（其余历史帧仍一律短路）', () => {
+  it('硬刷新后：历史 round_end 填出「上次 run」的 token 与窗口，但状态仍是空闲', () => {
+    const feed = createRunMomentumFeed();
+    feed.ingest('round_end', {
+      run_id: 'r-old', round: 2,
+      usage: { input_tokens: 2_048, output_tokens: 64 },
+      context_window: 262_144,
+    }, true, 5_000);
+    expect(feed.state.runId).toBe('r-old');
+    expect(feed.state.endedAt).toBe(5_000);              // 已结束 ⇒ 空闲态那一栏
+    expect(feed.state.startedAt).toBeNull();             // 起跑时刻未知 ⇒ 不假一个时长
+    expect(feed.state.usage).toEqual({ input_tokens: 2_048, output_tokens: 64 });
+    expect(feed.state.contextWindow).toBe(262_144);
+    expect(feed.state.phase).toBeNull();                 // 相位/轮号/速率一律不吃历史帧
+    expect(feed.state.round).toBeNull();
+  });
+
+  it('按 seq 升序回放：后面的轮盖住前面的，累计量不回退', () => {
+    const feed = createRunMomentumFeed();
+    feed.ingest('round_end', { run_id: 'r1', round: 1, usage: { input_tokens: 100, output_tokens: 5 } }, true, 10);
+    feed.ingest('round_end', { run_id: 'r1', round: 2, usage: { input_tokens: 260, output_tokens: 12 } }, true, 11);
+    expect(feed.state.usage).toEqual({ input_tokens: 260, output_tokens: 12 });
+  });
+
+  it('正在跟踪活跃 run 时，别的 run 的历史 round_end 不得插进来', () => {
+    const feed = createRunMomentumFeed();
+    feed.beginRun('r-live', 0);
+    feed.ingest('round_end', { run_id: 'r-old', round: 1, usage: { input_tokens: 9, output_tokens: 9 } }, true, 10);
+    expect(feed.state.runId).toBe('r-live');
+    expect(feed.state.usage).toBeNull();
+    expect(feed.state.endedAt).toBeNull();
+  });
+
+  it('除 round_end 之外的历史帧照旧一律短路（不许借这个口子复活运行态）', () => {
+    const feed = createRunMomentumFeed();
+    feed.ingest('tool_use', { run_id: 'r1', tool_call_id: 'c1', name: 'shell' }, true, 10);
+    feed.ingest('usage', { run_id: 'r1', usage: { input_tokens: 9, output_tokens: 9 } }, true, 11);
+    expect(feed.state).toMatchObject({ runId: null, toolCount: 0, roundUsage: null, contextWindow: null });
+  });
+
+  it('reset 后不留上一个会话的用量与窗口', () => {
+    const feed = createRunMomentumFeed();
+    feed.ingest('round_end', { run_id: 'r1', usage: { input_tokens: 1, output_tokens: 1 }, context_window: 100 }, true, 10);
+    feed.reset();
+    expect(feed.state).toMatchObject({ runId: null, usage: null, runUsage: null, contextWindow: null, phase: null });
+  });
+});
