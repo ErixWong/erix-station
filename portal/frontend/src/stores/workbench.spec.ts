@@ -6,6 +6,8 @@ import { createPinia, setActivePinia } from 'pinia';
 import { setWorkbenchHooks, useWorkbenchStore, type StreamEntry } from './workbench';
 import type { RunHistoryEvent } from '../composables/useEventStream';
 import { setLocale } from '../i18n';
+// issue #431：断言复位连模块级展开记忆一起清（它不属于 store，只能从外部函数看）
+import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 
 /** EventSource 桩（openSession 会 connect；本套件只验证 URL 与状态，不驱动事件帧）。 */
 class FakeEventSource {
@@ -2256,6 +2258,20 @@ describe('#428 换账号复位（claimOwnership / resetForUserSwitch）', () => 
     expect(connection.closed).toBe(true); // 连接本身必须断：否则带着 A 的会话继续收帧
   });
 
+  it('旁路面（#431 对账补钉）：动量状态机与工具卡片展开记忆（**模块级 Set**，最容易漏的一类）', async () => {
+    const store = useWorkbenchStore();
+    await seedAsUserA(store);
+    store.momentum.beginRun('r-mom');
+    setToolCallExpanded('c1', true);
+    expect(store.momentum.state.runId).toBe('r-mom'); // 前置自检：真的灌进去了
+    expect(isToolCallExpanded('c1')).toBe(true);
+
+    store.resetForUserSwitch();
+
+    expect(store.momentum.state.runId, '#282 的动量数字不得活到下一个账号').toBeNull();
+    expect(isToolCallExpanded('c1'), '#85 的展开记忆是模块级 Set，跨 store 实例共享').toBe(false);
+  });
+
   it('同一身份重复认领不清（同一个人重挂载不是换账号）', async () => {
     const store = useWorkbenchStore();
     await seedAsUserA(store);
@@ -2297,5 +2313,106 @@ describe('#428 换账号复位（claimOwnership / resetForUserSwitch）', () => 
     resolveLate(jsonResponse(200, { dirs: [{ name: 'alpha', cwd: '~/projects/alpha', running_count: 0, queued_count: 0 }] }));
     await late;
     expect(store.dirs.map((d) => d.name)).toEqual(['beta']); // A 的迟到响应被守卫丢弃
+  });
+});
+
+// ---- issue #431：#428 声称「在途响应全部作废」，本片把漏掉的三条路径补上守卫 ----
+// 病根形状都一样：`await` 之后不看代次就写界面。窗口 = 「A 的操作在途 → 登出 → B 秒登录 →
+// A 的回包最后落地」。第四条（`loadFoldedOriginal`）**故意不加守卫**，理由写在源码注释里。
+describe('#431 迟到写回的三条守卫（createDir / recallQueue / stop）', () => {
+  const DIR_B = { name: 'beta', cwd: '~/projects/beta', running_count: 0, queued_count: 0 };
+
+  /** 会话详情 + 历史（openSession 用）+ 目录（B 的）；POST/DELETE 由各用例自己接管。 */
+  function sessionHandler(url: string, init?: RequestInit) {
+    if (url.startsWith('/api/dirs')) return jsonResponse(200, { dirs: [DIR_B] });
+    if (url.includes('/events/history')) return jsonResponse(200, { events: [], next_cursor: null });
+    if (url.includes('/api/sessions/s1') && init?.method !== 'DELETE') {
+      return jsonResponse(200, {
+        session: { id: 's1', active_run_id: null, message_count: 1 },
+        messages: [{ id: 'm1', role: 'user', content: '话', seq: 1 }],
+        last_seq: 1,
+      });
+    }
+    return jsonResponse(200, { items: [] });
+  }
+
+  /** 把某类请求挂起来的 fetch 桩：返回 resolve 句柄，其余 URL 走 `base`。 */
+  function deferOnce(match: (url: string, init?: RequestInit) => boolean, base = sessionHandler) {
+    let release: (r: Response) => void = () => {};
+    let deferred = false;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!deferred && match(url, init)) {
+        deferred = true;
+        return new Promise<Response>((res) => { release = res; });
+      }
+      return Promise.resolve(base(url, init));
+    }));
+    return { release: (body: unknown) => release(jsonResponse(200, body)) };
+  }
+
+  it('createDir 在途时换账号：不把目录上下文抢回来，也不把上一账号的 session 递回视图', async () => {
+    const { release } = deferOnce((url, init) => init?.method === 'POST' && url.startsWith('/api/sessions'));
+    const store = useWorkbenchStore();
+    store.claimOwnership('u1');
+    const inflight = store.createDir('late-dir'); // POST 挂起
+    store.claimOwnership('u2'); // 换账号（复位会撞 ctxSeq）
+    await store.loadDirs(); // B 的目录已就位
+    store.dirCwd = DIR_B.cwd;
+    release({ session: { id: 's-a', cwd: '~/projects/late-dir' } });
+    const out = await inflight;
+
+    expect(out.error, '服务端确实建出来了 ⇒ 不算失败').toBeNull();
+    expect(out.session, '不得把上一账号的会话递回视图（否则会被路由到一个不属于当前登录者的会话）').toBeUndefined();
+    expect(store.dirCwd, 'B 刚加载好的目录上下文不得被盖掉').toBe(DIR_B.cwd);
+    expect(store.sessions).toEqual([]);
+    expect(store.dirs.map((d) => d.name)).toEqual(['beta']);
+  });
+
+  it('同一个人切目录（selectDir 会撞 ctxSeq）**不得**把新建成功的目录吞掉（评审实测的回归）', async () => {
+    // 守卫比的是**用户代次**（scopeSeq），不是 ctxSeq：否则「点新建目录 → 在途中 ↻ / 切目录 →
+    // 回包落地」会变成「服务端目录建了、modal 既不报错也不跳转、界面无声消失」。
+    const { release } = deferOnce((url, init) => init?.method === 'POST' && url.startsWith('/api/sessions'));
+    const store = useWorkbenchStore();
+    store.claimOwnership('u1');
+    const inflight = store.createDir('my-new');
+    store.selectDir(DIR_B.cwd); // 同一个人切目录：撞 ctxSeq，不撞 scopeSeq
+    release({ session: { id: 's-new', cwd: '~/projects/my-new' } });
+    const out = await inflight;
+
+    expect(out.session?.id, '同一个人的并发操作不得把新建结果判成作废').toBe('s-new');
+    expect(store.dirCwd, '建目录的语义就是切进那个目录').toBe('~/projects/my-new');
+    expect(store.dirs.map((d) => d.name)).toContain('my-new');
+  });
+
+  it('recallQueue 在途时换账号：文本存回**原会话草稿**，不写进新账号的输入框', async () => {
+    const { release } = deferOnce((url, init) => init?.method === 'DELETE');
+    const store = useWorkbenchStore();
+    store.claimOwnership('u1');
+    await store.openSession('s1');
+    const inflight = store.recallQueue(); // DELETE 挂起
+    store.claimOwnership('u2'); // 换账号：输入框、队列、会话全部归零
+    release({ recalled: { steering: ['A 排的队'], follow_up: [] } });
+    await inflight;
+
+    expect(store.inputValue, 'A 排队的文本不得灌进 B 的输入框').toBe('');
+    // 队列在服务端已被整队取走 ⇒ 直接丢弃 = 文本两头没。切回原会话必须还能拿回来。
+    await store.openSession('s1');
+    expect(store.inputValue, '取回的文本按原会话存进 drafts，切回去还在').toBe('A 排的队');
+  });
+
+  it('stop 在途时换账号：提示行不追进新账号的消息流', async () => {
+    const { release } = deferOnce((url, init) => init?.method === 'POST' && url.endsWith('/stop'));
+    const store = useWorkbenchStore();
+    store.claimOwnership('u1');
+    await store.openSession('s1');
+    store.es.activeRunId = 'r1'; // stop 的前提
+    const inflight = store.stop();
+    store.claimOwnership('u2'); // 复位（entries 清空、会话归零）
+    expect(store.entries).toEqual([]);
+    release({ ok: true });
+    await inflight;
+
+    expect(store.entries, '「已请求停止」是上一账号那条流的事，不得插进新账号的消息流').toEqual([]);
   });
 });
