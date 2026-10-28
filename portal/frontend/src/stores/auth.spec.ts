@@ -3,6 +3,8 @@
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 import { useAuthStore, afterLoginRoute } from './auth';
+// issue #431：登出/会话过期必须触发「本轮用户结束」信号（收口三颗登出按钮）
+import { setUserScopeResetListener } from '../lib/userScope';
 
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
@@ -182,5 +184,54 @@ describe('afterLoginRoute（旧版语义）', () => {
   });
   it('带 fde_name 的 admin（FDE 兼管理员）→ /', () => {
     expect(afterLoginRoute({ ...ADMIN_USER, fde_name: 'root' })).toBe('/');
+  });
+});
+
+// ---- issue #431：登出收口——「本轮用户结束」只有 auth 知道，由它统一通知 ----
+// 为什么不在三颗登出按钮里各自认领：`WorkbenchView` 只是其中一颗（另外两颗是管理台顶栏与强制改密
+// 屏），漏一颗的代价是上一个账号的 EventSource 带着死会话无限重连（`useEventStream.ts:467` 的
+// 「自动重连」在这里不是特性而是漏点）。
+describe('#431 auth 触发用户 scope 复位', () => {
+  afterEach(() => setUserScopeResetListener(null));
+
+  it('logout：**在发请求之前**就通知（SSE 不能等服务端回包）', async () => {
+    const order: string[] = [];
+    setUserScopeResetListener(() => order.push('reset'));
+    vi.stubGlobal('fetch', fetchMock(() => {
+      order.push('fetch');
+      return new Response(null, { status: 204 });
+    }));
+    const auth = useAuthStore();
+    auth.user = FDE_USER;
+    await auth.logout();
+    expect(order).toEqual(['reset', 'fetch']);
+  });
+
+  it('logout 失败（会话已死）同样通知——收摊不依赖服务端是否撤销成功', async () => {
+    let notified = 0;
+    setUserScopeResetListener(() => { notified += 1; });
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(401, { error: { code: 'unauthorized', message: 'unauthorized' } })));
+    const auth = useAuthStore();
+    auth.user = FDE_USER;
+    await auth.logout();
+    expect(notified).toBe(1);
+  });
+
+  it('forgetExpiredSession（改密时撞 401 ⇒ 回登录页重登）也通知', () => {
+    let notified = 0;
+    setUserScopeResetListener(() => { notified += 1; });
+    const auth = useAuthStore();
+    auth.user = FDE_USER;
+    auth.forgetExpiredSession();
+    expect(notified).toBe(1);
+    expect(auth.user).toBeNull();
+  });
+
+  it('没有接线时静默（没进过工作台就没有要收的摊）', async () => {
+    setUserScopeResetListener(null);
+    vi.stubGlobal('fetch', fetchMock(() => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = FDE_USER;
+    await expect(auth.logout()).resolves.toBeUndefined();
   });
 });

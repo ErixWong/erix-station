@@ -2624,6 +2624,54 @@ null，症状随之消失。而**后端本来就挡着**（2026-10-28 对账 `po
 变得莫名其妙**（"会话不存在"出现在一个看起来刚建好的首页上）。这类「前端状态穿越账号」的 bug 因此
 定级为体验 + 信息泄漏，**不是数据完整性**。
 
+### 8.78 「在途响应全部作废」要按**写点清单**核对，不是按请求清单；登出收口要按**按钮清单**核对（issue #431 = #428 未尽部分，2026-10-28，分支 `fix-261028-01-431-logout-scope-and-late-writes`）
+
+#428（§8.77）合并后做独立评审，抓出两处**它自己的注释已经承诺、但代码没做完**的事。两处的形状值得记，
+因为它们都不是"想不到"，而是**按错误的清单核对**：
+
+**① 登出有三颗按钮，认领只接了一颗。** `claimOwnership(null)` 原本写在
+`WorkbenchView.onLogout` 里；而全站有**三颗**登出按钮——工作台顶栏、`AdminLayout.vue:29`、
+`ForcePasswordChangeView.vue:70`，后两颗是裸 `auth.logout()`。`WorkbenchView` **没有 `onUnmounted`
+关流的钩子**（它的 `onUnmounted` 只清 keydown），SSE 归 `useEventStream.ts` 自己管，而那里
+`:467` 的注释写着「EventSource 自动重连，带 Last-Event-ID」⇒ **从管理台或改密屏登出时，上一个账号
+那条 `/api/sessions/<id>/events` 不会关**，服务端会话一死它不当终态、按规范无限重连，浏览器后台
+一直替别人的会话要事件流，挂到标签页关掉为止。界面看不见（进工作台的任何路径第一步都认领 ⇒ 数据
+会被复位），代价是纯资源/背景请求。
+
+**修法：收口到唯一的汇合点** `stores/auth.ts` 的 `logout()`（**在 `await` 之前**——会话本来就可能
+已经死了，下面还 catch 着失败，SSE 不该等服务端回包）与 `forgetExpiredSession()`。为不把整个工作台
+面（`useEventStream` / `useRunMomentum` / `lib/markdown`）拖进登录页首屏 chunk（路由是懒加载的），
+新增 `lib/userScope.ts`：形状**照本仓已有的 `lib/restrictedSession.ts`**（`set*Listener` + `notify*`，
+最后一次注册生效、传 null 注销）。⚠ **注册只装不卸**：只有工作台挂载过一次才有东西要清，`onUnmounted`
+里注销就等于把「从管理台登出」这条路径重新漏掉。
+
+**② 「在途响应全部作废」当时是按"我加过守卫的请求"核对的，正确的清单是"await 之后的写点"。**
+逐函数核 `stores/workbench.ts` 里 `await` 之后直接写界面而无代次守卫的位置，四条：
+
+| 路径 | 迟到后写什么 | 处置 |
+|---|---|---|
+| `createDir` | **整块**目录上下文（`dirCwd` / `sessionId=null` / `sessions` / `dirs.push` / `updateAvailability`） | **加守卫，但比的是新增的「用户代次 `scopeSeq`」而不是 `ctxSeq`**（评审实测指出：`selectDir` 与 `refreshDirs` 的回退在**同一个人**身上也撞 `ctxSeq`，拿它当判据会把「新建成功」误判成作废 ⇒ 目录建了、modal 既不报错也不跳转、界面**无声**消失）。目录与会话服务端已建，不算失败 ⇒ 换人时返回 `{error:null}` 且**不带 `session`** ⇒ `NewDirectoryModal` 不 `emit('created')` ⇒ 不会路由到一个已不属于当前登录者的会话 |
+| `recallQueue` | `inputValue` + 队列快照 | 加守卫，但**守卫之前先按原会话存回 `drafts`**：DELETE 已在服务端把整队掏走，直接丢弃 = 文本两头没（先例 = `sendQueued` 的 catch 分支「守卫之前先 `drafts.set`」） |
+| `stop` | `entries.push(sep)` | 加守卫：「已请求停止」是上一条流的事，不许插进新账号的消息流末尾 |
+| `loadFoldedOriginal` | `foldedOriginals[<sid>:<round>]` | **故意不加**（键含 `sessionId` ⇒ 只是内存残留，新账号撞不上；同账号回头再开这个会话，这条缓存本来就该命中。加守卫反而丢掉已拿到的原文） |
+
+**兜底方式**：`stores/workbench.spec.ts` 的 `#431` describe 用挂起的 Promise 真实造出「A 在途 →
+换账号 → A 的回包最后落地」，三条各一条；把三个守卫改成 `if (false)` ⇒ 恰好三条红。登出收口由
+`stores/auth.spec.ts`（含**顺序断言**：`['reset', 'fetch']`）+ `WorkbenchView.spec.ts`
+「工作台挂载过之后在别处登出」钉住；后者删掉 `setUserScopeResetListener` 注册即红（实测）。
+
+**⚠ 可复用的三条核对法**：① 说"某类状态/请求已作废"之前，先 `grep` 出**所有 await 之后的写点**逐条打勾，
+不要凭"我改过哪几个函数"；② 说"登出时会 X"之前，先 `grep` 出**全站有几颗登出按钮**，接在按钮上就等于
+接在三个地方；③ **守卫要比对的代次必须匹配"作废的原因"**——`ctxSeq` 的语义是「上下文变了」（同一个人
+切目录也撞），而 #431 要防的是「人变了」，所以 `createDir` 认 `scopeSeq`。拿一个"碰巧也会变"的计数器当
+判据，代价是**把成功误判成失败**，比原 bug 更难查（界面一句话都不说）。判据：
+`stores/workbench.spec.ts` 里「同一个人切目录不得把新建成功的目录吞掉」那条用例，把守卫换回 `ctxSeq`
+就红（实测）。
+
+顺带补齐的证据链：新增 `views/AdminLayout.spec.ts`（此前**该组件零 spec**）钉「AdminLayout 那颗登出按钮
+= `auth.logout()`」这段胶水。`stores/auth.spec.ts` 钉的是 `logout()` ⇒ `notify`，
+`WorkbenchView.spec.ts` 钉的是 `notify` ⇒ 断流清空，缺了中间这段，「三颗按钮都收口」就只是说法。
+
 ### 8.79 登出只属于 portal 平面：预览凭证是独立能力，回收必须显式做（issue #429，2026-10-29，分支 `fix-261029-01-429-preview-logout-lineage`）
 
 **现象**：同一浏览器登出 → 换号登录，**上一个账号开着的预览 URL 照常打开、能操作**，

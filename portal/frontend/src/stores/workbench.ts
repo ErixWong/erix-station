@@ -305,6 +305,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const dirsReqSeq = ref(0);
   const ctxSeq = ref(0); // 项目上下文代次
   /**
+   * issue #431：**用户代次**——只在 `resetForUserSwitch()` 里撞开（不同于 `ctxSeq`：后者同一个人
+   * 切目录 / ↻ 回退也会撞）。`createDir` 这类「服务端已经干了活」的写只该在**换人**时作废，
+   * 不该被同一个人的并发操作误判（误判的代价是「目录建成功了却静无声息」）。
+   */
+  const scopeSeq = ref(0);
+  /**
    * issue #428：这份 store 当前归谁（`auth.user.id`，登出置 null）。
    * 存在的唯一理由：给 `resetForUserSwitch()` 找一个**不依赖组件时序**的触发点。
    */
@@ -633,6 +639,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   /**
    * 懒加载某轮折叠前原文。已加载/加载中直接返回（缓存命中不重发）；error 态由组件传
    * force=true 重试。返回加载后的状态，便于调用方/测试断言。
+   *
+   * issue #431：**故意不加迟到/换账号守卫**。缓存键 = `sid:round` ⇒ 复位后迟到的响应只会把
+   * 上一账号的原文放回一个已清空的 `Record`（内存残留，不串界面：新账号的键不可能相同），
+   * 而**同一账号**回头再开那个会话时这条缓存本来就该命中。加守卫反而会把「已拿到的原文」丢掉。
    */
   async function loadFoldedOriginal(
     sid: string,
@@ -1000,6 +1010,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return { error: t('errors.dirNameInvalid') };
     }
     const cwd = `~/projects/${name}`;
+    // issue #431：与 createSession 同族的守卫，但**比的是用户代次而不是 `ctxSeq`**：
+    // 本函数是当时唯一一处在 `await` 之后直接整块写目录上下文而无守卫的（`dirCwd` / `sessions` /
+    // `dirs.push` / `updateAvailability`），「A 建目录在途 → 登出 → B 秒登录 → A 的回包最后落地」
+    // 会把 B 刚加载好的上下文整块盖掉。⚠ **不能用 `ctxSeq` 做判据**：`selectDir` 与 `refreshDirs`
+    // 的回退在**同一个人**身上也撞它，那样会把「新建成功」误判成作废 ⇒ 目录建了、modal 既不报错
+    // 也不跳转、界面无声消失（评审实测指出）。
+    const scope = scopeSeq.value;
     let session: Session;
     try {
       ({ session } = await api<{ session: Session }>('/api/sessions', {
@@ -1008,6 +1025,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }));
     } catch (e) {
       return { error: e instanceof Error ? e.message : String(e) };
+    }
+    if (scope !== scopeSeq.value) {
+      // 在途期间**换了人**（`resetForUserSwitch` 撞 scopeSeq）⇒ **不把上下文抢回来**。
+      // 目录与服务端会话确实建出来了（不撤），也不报错（不是失败）；且不把 session 递回调用方
+      // ⇒ NewDirectoryModal 不会 `emit('created')` ⇒ 视图不会跳到一个已经不属于当前登录者的会话。
+      return { error: null };
     }
     // 目录上下文切换（等价 selectDir 的复位语义）：关流/存草稿/清深链/复位协议状态。
     es.closeEs();
@@ -1167,6 +1190,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     projectReqSeq.value++;
     sessionReqSeq.value++;
     dirsReqSeq.value++;
+    scopeSeq.value++; // issue #431：换人的信号（createDir 的迟到守卫只认这一个）
     runStateCheckSeq++;
     // ② SSE 与协议态（`resetStreamState` 内含 `closeEs()`：连接本身必须断，否则带着上一账号的
     //    会话继续收帧、继续往已清空的消息流里推条目）。
@@ -1420,12 +1444,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   async function recallQueue() {
     const sid = sessionId.value;
     if (!sid) return;
+    // issue #431：取回是 DELETE，服务端**已经**把整队掏走了 ⇒ 迟到时不能简单丢弃（丢 = 文本两头没），
+    // 也不能直接写输入框（那是下一个账号/会话的输入框）。口径照 `sendQueued` 失败分支的先例：
+    // **守卫之前先按原会话存回 `drafts`**（切回那个会话还在），守卫之后才跳过界面写入。
+    const ctx = ctxSeq.value;
     try {
       const res = await api<{ recalled: { steering: string[]; follow_up: string[] } }>(
         `/api/sessions/${encodeURIComponent(sid)}/queued-inputs`, { method: 'DELETE' },
       );
       const texts = [...(res.recalled?.steering ?? []), ...(res.recalled?.follow_up ?? [])]
         .filter((x) => x && x.trim());
+      if (ctx !== ctxSeq.value || sessionId.value !== sid) {
+        if (texts.length > 0) {
+          const kept = [...texts, drafts.get(sid) ?? ''].filter((x) => x).join('\n\n');
+          drafts.set(sid, kept);
+        }
+        return;
+      }
       const current = inputValue.value.trim();
       inputValue.value = [...texts, current].filter((x) => x).join('\n\n');
       applyQueueSnapshot({ steering: [], follow_up: [] }); // 服务端已清空，本地立刻跟上（SSE 也会再来一帧）
@@ -1436,8 +1471,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   async function stop() {
     if (!sessionId.value || !es.activeRunId.value) return;
+    // issue #431：stop 在服务端是一定会生效的，但提示行属于**当时那条流**——在途期间换账号/换会话
+    // （`resetSessionView` 与 `resetForUserSwitch` 都会把 `entries` 清空）⇒ 追不回来，也不能往新账号
+    // 的消息流末尾插一条「已请求停止」（那件事与新账号无关）。
+    const sid = sessionId.value;
+    const ctx = ctxSeq.value;
     try {
-      await api(`/api/sessions/${encodeURIComponent(sessionId.value)}/stop`, { method: 'POST', body: '{}' });
+      await api(`/api/sessions/${encodeURIComponent(sid)}/stop`, { method: 'POST', body: '{}' });
+      if (ctx !== ctxSeq.value || sessionId.value !== sid) return;
       entries.value.push({ kind: 'sep', text: t('workbench.stopRequested') });
     } catch (e) {
       alert(t('errors.stopFailed', { message: e instanceof Error ? e.message : String(e) }));
