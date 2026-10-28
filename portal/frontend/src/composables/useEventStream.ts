@@ -40,6 +40,13 @@ const EVENT_TYPES = [
   // `addEventListener` 的唯一来源，漏加就是**实时一条都收不到**（不报错不警告）；与下面
   // HISTORY_REPLAY_TYPES 与 `http.js` 的 HISTORY_EVENT_TYPES 是三处独立存亡的集合（#288）。
   'persistence_error',
+  // issue #421：引擎对宿主承诺的 16 类事件（`erix-agent` `src/loop/orchestrator.js:297` 的 `LoopEvent`
+  // 结合类型）里，下面 5 类本站**以前一类都订不到**——写入侧不过白名单 ⇒ 它们每轮都在往
+  // `run_events` 里写，而读侧三个集合里没它们 ⇒ 实时没有、刷新后也没有（#371-A 同形状）。
+  // 本数组是 EventSource 逐类型 `addEventListener` 的唯一来源，漏加就是实时一条都收不到。
+  // 哪一类进回放、哪一类显式豁免，判据在 `engineEventSurface.spec.ts`（它把 16 类清单钉在测里）。
+  'compaction_strategy_fallback', 'model_metadata_missing', 'persistence_capability_degraded',
+  'resume_journal_skipped', 'run_outcome',
   // issue #370：输入队列快照（steer / follow_up 待发送）。**live-only、不落 run_events**
   // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
   // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
@@ -70,6 +77,13 @@ const HISTORY_REPLAY_TYPES = new Set([
   // 一边就分别得到「实时收不到」或「刷新后消失」）。它是展示类、不驱动运行态状态机：
   // 致命失败的红面仍然只由 `run_end`（`persistence_failed`）负责。
   'persistence_error',
+  // issue #421：与上面 `EVENT_TYPES` 与下面 `http.js` 的 `HISTORY_EVENT_TYPES` **同步**加（三处只加
+  // 一边就分别得到「实时收不到」或「刷新后消失」）。四个都是**中性分隔行**（展示类），不驱动运行态
+  // 状态机：红色的面仍只由 `run_end` 负责。
+  // `run_outcome` **故意不在这里**：它与 `run_end` 语义重叠（rounds / 终局），今天没有读者，
+  // 把它放进回放只会让刷新时多送一堆没人看的行（豁免理由在 `engineEventSurface.spec.ts`）。
+  'compaction_strategy_fallback', 'model_metadata_missing', 'persistence_capability_degraded',
+  'resume_journal_skipped',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
@@ -225,10 +239,51 @@ function attemptKilledCauseText(killedBy: unknown, reason: unknown): string {
   return typeof reason === 'string' && reason !== '' ? reason : t('stream.event.attemptKilledUnknown');
 }
 
+/** issue #421：诊断行的数字片段——没给就 `?`，绝不拿 0 冒充（#283 口径）。 */
+function noticeNum(v: unknown): string {
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : '?';
+}
+
+// issue #421：引擎侧标识符（`saveRunSnapshot` / `crash_round_assistant_not_in_ledger`）的形状闸。
+// 外来字符串不合格就退 `?`，绝不 `String(对象)` 把 `[object Object]` 渗进用户可见文案（#261 口径）。
+const NOTICE_TOKEN_RE = /^[A-Za-z][A-Za-z0-9_.]{0,63}$/;
+function noticeToken(v: unknown): string {
+  return typeof v === 'string' && NOTICE_TOKEN_RE.test(v) ? v : '?';
+}
+
 function judgeOptionalDash(value: unknown, max: number): string {
   return typeof value === 'string' && value !== ''
     ? t('stream.event.dash', { value: value.slice(0, max) })
     : '';
+}
+
+// erix-agent #469 宿主侧后续（A2）：折叠摘要「产出了但是次品」的界面出口。
+//
+// 为什么非宿主不可：上游裁定一是「降级**不新增事件类型**，只记进 `CompactionStat.foldSummary`」，
+// 而且这些字段**只有 `fold-llm` 会写**（`fold-statistical` 下五个键全缺席，这是契约不是 bug）——
+// 所以不拼这一段，「折了 46 轮」与「折了 46 轮、但摘要是超时降级的次品」在横幅上逐字一样。
+// 口径与 `runner/worker.js` 的 `foldDegradeNotice`（日志那条）刻意一致：`degradeKind`（#487，短、
+// 封闭枚举）优先，只拿到 `degradeReason`（#482/#491，整句）时退回它，两类超预算事实另计。
+export function compactionDegradeText(stat: unknown): string {
+  if (!stat || typeof stat !== 'object') return '';
+  const s = stat as Record<string, unknown>;
+  const parts: string[] = [];
+  const kind = typeof s.degradeKind === 'string' && s.degradeKind !== ''
+    ? s.degradeKind
+    : (s.degraded === true && typeof s.degradeReason === 'string' && s.degradeReason !== ''
+      ? s.degradeReason
+      : null);
+  if (kind !== null) parts.push(t('stream.event.compactionDegraded', { kind }));
+  // 下面两个键名同样必须在上游契约的 `foldSummary` 字段面里存在（`runner/test/compact-knobs.test.js`
+  // 的 K12 对账）。这里不写引擎不发的键：前例是 `unshrinkable`，一个本站凭记忆造的字段。
+  if (s.budgetExhausted === true) parts.push(t('stream.event.compactionBudgetExhausted'));
+  const droppedRounds = typeof s.droppedRounds === 'number' && Number.isSafeInteger(s.droppedRounds) ? s.droppedRounds : 0;
+  const droppedMessages = typeof s.droppedMessages === 'number' && Number.isSafeInteger(s.droppedMessages) ? s.droppedMessages : 0;
+  if (s.inputTruncated === true || droppedRounds > 0 || droppedMessages > 0) {
+    parts.push(t('stream.event.compactionInputClipped', { rounds: droppedRounds, messages: droppedMessages }));
+  }
+  if (s.finishReason === 'max_tokens') parts.push(t('stream.event.compactionTruncated'));
+  return parts.length === 0 ? '' : t('stream.event.compactionDegradeNote', { body: parts.join('，') });
 }
 
 // 引擎已知 action 全集（orchestrator 轮末 judge + run-snapshot-executor 中途审计，已对 0.20.0 源码核实）；
@@ -675,6 +730,34 @@ export function useEventStream(hooks: EventStreamHooks) {
         }));
         return;
       }
+      // ---- issue #421：引擎承诺、本站以前订不到的 4 类诊断事件（均为中性分隔行）----
+      // 载荷形状逐条对着引擎发射点写的（不凭记忆造键——本站在 `payload.chars` 与
+      // `foldSummary.unshrinkable` 上各栽过一次，推测键的后果是**永不触发**，不是报错）：
+      //   compaction_strategy_fallback   {runId?, round, detail}      orchestrator.js:3193
+      //   model_metadata_missing         {runId, detail}（**无 round**）orchestrator.js:1040
+      //   persistence_capability_degraded {runId, method, detail}      orchestrator.js:1011
+      //   resume_journal_skipped         {runId, round, reason, count} orchestrator.js:2525
+      // 都不刷红：它们说的事实是“配置没生效 / 能力缺失 / 这批没入账”，不是“本轮失败”。
+      case 'compaction_strategy_fallback':
+        hooks.onSep(t('stream.event.strategyFallback', { round: noticeNum(d.round) }));
+        return;
+      case 'model_metadata_missing':
+        hooks.onSep(t('stream.event.metadataMissing'));
+        return;
+      case 'persistence_capability_degraded':
+        hooks.onSep(t('stream.event.capabilityDegraded', { method: noticeToken(d.method) }));
+        return;
+      case 'resume_journal_skipped':
+        hooks.onSep(t('stream.event.resumeJournalSkipped', {
+          count: typeof d.count === 'number' && Number.isFinite(d.count) ? String(d.count) : t('stream.event.resumeJournalSome'),
+          round: noticeNum(d.round),
+        }));
+        return;
+      case 'run_outcome':
+        // 订得到（推水位线 + `hooks.onEvent` 观察面拿得到），但**不刷时间线**：它与 `run_end` 重叠
+        // （rounds / 终局），多一行只会把同一件事说两遍（谎报严重度之外的“谎报信息量”，同 #371-A
+        // 不刷 fatal 红行的理由）。等多一个真读者（§12 台账 / 结算面板）再一次性接。
+        return;
       case 'recovering':
         observeRound(d.run_id, d.round); // 同 attempt：轮内重试，轮号仍是当前轮（#279）
         hooks.onSep(t('stream.event.recovering', { attempt: d.attempt, max: d.maxAttempts }));
@@ -746,6 +829,10 @@ export function useEventStream(hooks: EventStreamHooks) {
           strategy: typeof c.strategyName === 'string' && c.strategyName !== ''
             ? c.strategyName
             : t('stream.event.compactionStrategyUnknown'),
+          // erix-agent #469 裁定一：摘要降级**不新增事件类型**，只进 `CompactionStat.foldSummary`
+          // ⇒ 界面上「折了 46 轮」与「折了 46 轮但摘要其实是次品」长得一模一样。本行是把那个
+          // 差别拼回来；无降级时 `degrade` 是空串，旧文案逐字不变（历史回放里的旧事件也不得多出一段）。
+          degrade: compactionDegradeText(c.foldSummary),
         }));
         return;
       }

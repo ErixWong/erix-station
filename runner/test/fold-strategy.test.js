@@ -24,6 +24,7 @@ import {
   BUILTIN_COMPACTION_STRATEGY_NAMES,
   createSlidingWindowStrategy,
 } from 'erix-agent';
+import { assertCompactContext } from '../lib/compact-knobs.js';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
@@ -38,7 +39,10 @@ function workerContextOption() {
     + '没了就是本站又退回「不传 context ⇒ 引擎滑窗兜底 ⇒ 折叠是静默硬删」那条老路');
   // 本块里**只**该有 `strategy`。C 片（`onFoldSummary`）一度被塞在这里，而引擎从**顶层 options**
   // 解构它 ⇒ 折照折、注一条不写且不报错 ⇒ 又一根 #331 式死光纤。现由 C12/C14 钉住（两层各管各的）。
-  return new Function(`return {${block[1]}}`)().context;
+  // ⚠ #469 后续 A4 之后这一块包了一层 `assertCompactContext(…)`（本站走直连 `runToolLoop`，
+  // 上游 #488/#493 的装配期校验一次也不会触发）。这里**注入真校验器**而不是桩 ⇒ 本用例顺带多钉
+  // 一件事：worker 里那段真配置必须真能过本站自己的白名单（将来往里加个拼错的键，这里就红）。
+  return new Function('assertCompactContext', `return {${block[1]}}`)(assertCompactContext).context;
 }
 
 /** 造 n 轮真形态消息（user → assistant tool_use → user tool_result），文本够长以便真的折得动。 */

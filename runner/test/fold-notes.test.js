@@ -33,14 +33,33 @@ const SAFE_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 const T0 = '2026-10-25T18:15:30.123Z';
 const T1 = '2026-10-25T18:16:05.999Z';
 
-/** 引擎 `context.onFoldSummary` 的真实入参形态：`{ ...record.foldedFacts, round }`。 */
+/**
+ * 引擎 `onFoldSummary` 的**真**入参形态——逐字取自真链路（`runToolLoop` + `fold-statistical`，
+ * 0.26.0 上实测键面）：`{ text, source, strategy, bytes, fingerprint, round }`，被引擎夹断时多
+ * `truncated:true` / `bytesBefore`，策略给出区间时多 `from`/`to`/`rounds`。
+ * ⚠ **没有 `chars`**：旧夹具手写了 `chars: 184_320`，于是 `deriveFoldNote` 读它恒 `undefined`、
+ * 生产上永远写「摘掉正文 ? 字」而单测一直绿（#331「没人读的光纤」的同形状）。夹具从此只喂真形状。
+ */
 const payload = (over = {}) => ({
   text: '【已折叠】第 12–57 轮：改完 runner 的折叠策略；测试 360 通过；遗留问题是 jim 容器未重建。',
   source: 'statistical',
-  chars: 184320,
+  strategy: 'fold-statistical',
   bytes: 2048,
   truncated: true,
+  bytesBefore: 41_000,
+  fingerprint: 'sha256:9cc1a97d8742b8b506a6599c',
   round: 57,
+  ...over,
+});
+
+/** erix-agent #485（已合 main、未发版）追加的三键。本站按「有就写、没有就不写」处理。 */
+const payload485 = (over = {}) => payload({
+  foldedRoundRange: { from: 12, to: 57 },
+  foldedThrough: 57,
+  foldedRoundCount: 46,
+  from: 12,
+  to: 57,
+  rounds: 46,
   ...over,
 });
 
@@ -92,9 +111,13 @@ test('C5 正文带摘要本体 + 来源/规模/截断/轮次，tags 带 fold 与
   assert.ok(note);
   assert.ok(note.content.includes('改完 runner 的折叠策略'), '摘要本体必须在正文里——原文已退出可见上下文');
   assert.match(note.content, /statistical/);
-  assert.match(note.content, /184320/);
+  assert.match(note.content, /2048 B/, '规模必须用引擎真给的 `bytes`（0.26.0 没有 `chars` 这个键）');
+  assert.match(note.content, /夹断前 41000 B/, '被引擎夹断过就要说「夹断前多大」，否则丢了规模');
+  assert.doesNotMatch(note.content, /正文 \?/, '不许出现「摘掉正文 ?」——那正是旧代码读不存在的 `chars` 的症状');
+  assert.match(note.content, /策略 fold-statistical/, '来源轴之外还要写引擎策略名（前端 #392-D 同一个口径）');
   assert.match(note.content, /引擎截断 是/);
-  assert.match(note.content, /round 57/);
+  assert.match(note.content, /第 57 轮及之前/, '没有区间信息时退回旧口径（不发「折走第 undefined–undefined 轮」）');
+  assert.doesNotMatch(note.content, /水位线|本 run 累计/, '#485 的三键不存在时**整段不写**，不发 0 也不发 ?');
   assert.match(note.content, /run-abc/);
   assert.deepEqual(note.tags, [FOLD_NOTE_TAG, 'src:statistical']);
   assert.match(note.key, SAFE_KEY);
@@ -105,7 +128,7 @@ test('C6 无 text（引擎契约里本不该调用回调）⇒ 不写空注，�
     const tools = stubNoteTools();
     const events = [];
     const sink = createFoldNoteSink({ noteTools: tools, runId: 'r', onDeliveryError: (e) => events.push(e) });
-    await sink.onFoldSummary({ source: 'statistical', chars: 10, truncated: false, round: 9, text: bad });
+    await sink.onFoldSummary({ source: 'statistical', bytes: 10, truncated: false, round: 9, text: bad });
     assert.equal(tools.calls.length, 0, `text=${String(bad)} 时不该写注（空注会在 note_list 里冒充已存档）`);
     assert.equal(events.length, 1);
     assert.equal(events[0].reason, 'no_summary_text');
@@ -228,4 +251,61 @@ test('C13 接线的前置门是「executors 可用」，不是「runId 存在」
   assert.match(block[1], /typeof noteTools\.executors === 'function'/);
   assert.doesNotMatch(block[1], /scopeRef\s*:/,
     '投递处不得再传作用域：B 片已把 scopeRef 绑成 sessionId，这里传第二次就是伪造 __erix');
+});
+
+// ── ④ 规模与范围口径：只写引擎真给的东西（erix-agent #485 / #469 宿主侧后续）────────
+test('C15 规模只走引擎真给的 `bytes`；`chars` 一律不读（读了就是第二个 unshrinkable）', () => {
+  // 真形状（实测键面里没有 chars）⇒ 必须写清字节数，不能退化成「?」或「规模未知」
+  const real = deriveFoldNote({ payload: payload({ truncated: false, bytes: 20_000 }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.match(real.content, /摘掉正文 20000 B/);
+  assert.doesNotMatch(real.content, /规模未知|\?/);
+  // **不写 `chars`，也不搞「前向兼容」**：引擎从不发这个键（C18 钉），读了它只会多一条永不触发的
+  // 分支 + 让下一个人以为这个维度有数据——那个形状本站刚在 `foldSummary.unshrinkable` 上犯过一次。
+  const withSpeculative = deriveFoldNote({ payload: payload({ truncated: false, chars: 65_000, bytes: 20_000 }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.equal(withSpeculative.content, real.content,
+    'payload 里多一个引擎不发的 chars，注里一个字也不该变（变了就说明本站又在按推测键渲染）');
+  assert.doesNotMatch(withSpeculative.content, /65000|字/);
+  // 两个都没有（引擎改了形状）⇒ 老实说「规模未知」，不许编一个 0
+  const noSize = deriveFoldNote({ payload: { text: 'x', source: 'llm', round: 3 }, seq: 1, nowIso: T0, runId: 'r' });
+  assert.match(noSize.content, /摘掉正文 规模未知/);
+});
+
+test('C16 #485 三键到位时写全「第 a–b 轮 · 水位线 · 本 run 累计」，且累计必须标 run 作用域', () => {
+  const note = deriveFoldNote({ payload: payload485(), seq: 3, nowIso: T0, runId: 'run-9' });
+  assert.match(note.content, /折走第 12–57 轮（46 轮）/);
+  assert.match(note.content, /水位线到第 57 轮/);
+  assert.match(note.content, /本 run 累计折 46 轮/);
+  assert.doesNotMatch(note.content, /第 57 轮及之前/, '有区间信息时不该退回「及之前」这种含糊口径');
+  // 契约（host-consumer-contract #479）：foldedRoundCount 是 **run 作用域**，resume 后归零 ⇒
+  // 写成「会话累计」就是把一个会归零的数说成不会归零的数。
+  assert.doesNotMatch(note.content, /会话累计|累计折 46 轮（会话/);
+});
+
+test('C17 只有平铺 `from`/`to`（引擎 buildFoldedFacts 自己的形状）时也写范围；两者都缺才退回旧口径', () => {
+  const flat = deriveFoldNote({ payload: payload({ from: 4, to: 9 }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.match(flat.content, /折走第 4–9 轮/);
+  const nestedWins = deriveFoldNote({ payload: payload({ from: 4, to: 9, foldedRoundRange: { from: 1, to: 3 } }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.match(nestedWins.content, /折走第 1–3 轮/, '两种形状同时在场时以 #485 的嵌套键为准（它与轮记录同源）');
+  const neither = deriveFoldNote({ payload: payload({ from: undefined, to: undefined }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.match(neither.content, /第 57 轮及之前/);
+  // 半截区间（引擎只给了 from）不许拼出「第 12–undefined 轮」
+  const half = deriveFoldNote({ payload: payload({ from: 12, to: undefined }), seq: 1, nowIso: T0, runId: 'r' });
+  assert.doesNotMatch(half.content, /undefined/);
+});
+
+test('C18 【防再犯】已安装引擎的 buildFoldedFacts 确实给 `bytes` 而不给 `chars`（口径漂移就红）', () => {
+  // 与 C14 同一手法：不信注释、不信夹具，直接读**装在这个 worktree 里的引擎源码**。
+  // 上游哪天真的加了 `chars` 或改了规模键，这里会红 ⇒ 逼着我们重看一遍上面的口径。
+  const engineEntry = createRequire(import.meta.url).resolve('erix-agent');
+  let engineRoot = path.dirname(engineEntry);
+  while (engineRoot !== path.dirname(engineRoot)) {
+    const pj = path.join(engineRoot, 'package.json');
+    if (fs.existsSync(pj) && JSON.parse(fs.readFileSync(pj, 'utf8')).name === 'erix-agent') break;
+    engineRoot = path.dirname(engineRoot);
+  }
+  const journal = fs.readFileSync(path.join(engineRoot, 'src/compact/fold-summary-journal.js'), 'utf8');
+  const body = journal.slice(journal.indexOf('export function buildFoldedFacts'));
+  const returned = body.slice(0, body.indexOf('\n}\n') > 0 ? body.indexOf('\n}\n') : 4000);
+  assert.match(returned, /bytes:\s*bytesOf\(text\)/, '引擎的规模键已不是 bytes ⇒ 本站注文案的规模口径要重定');
+  assert.doesNotMatch(returned, /^\s*chars:/m, '引擎开始给 chars 了 ⇒ 本站该改回以字数为主口径');
 });
