@@ -8,6 +8,8 @@ import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
+// issue #431：用户 scope 结束的接线（注册方，触发方在 stores/auth.ts）。
+import { setUserScopeResetListener } from '../lib/userScope';
 import { AUTO_FOLLOW_GAP } from '../lib/constants';
 import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
@@ -49,6 +51,11 @@ setWorkbenchHooks({
   onDeepLinkRestored: (sid) => router.replace(`/session/${encodeURIComponent(sid)}`),
 });
 
+// issue #431：把「本轮用户结束 → 工作台不再归属任何人」注册到应用级信号上（`auth.logout()` / 会话
+// 过期都会 notify）。**只注册不注销**：`onUnmounted` 里清掉就等于重新漏掉「从管理台登出」那条路径——
+// 卸载后 listener 仍指向同一个 pinia 单例，正是需要的语义。口径详见 lib/userScope.ts。
+setUserScopeResetListener(() => { store.claimOwnership(null); });
+
 // ---- 深链解析（resolveHashSession 语义平移；popstate = 路由参数变化）----
 watch(
   () => route.params.id,
@@ -78,9 +85,9 @@ async function onNewSession() {
 }
 
 async function onLogout() {
-  // issue #428：先把工作台从当前登录者名下收回（当场关 SSE + 清消息流/草稿/目录/会话），再跳登录页。
-  // 不靠 `auth.logout()` 顺手做：工作台状态的归属只有这里知道，且登出失败（会话已死）也得收摊。
-  store.claimOwnership(null);
+  // issue #428/#431：本地收摊（关 SSE + 清上一个账号的可见面）由 `auth.logout()` 开头的
+  // `notifyUserScopeReset()` 统一触发（三颗登出按钮共用那一个汇合点），本视图只需注册
+  // `setUserScopeResetListener`（见上方），不在这里再抄一份。
   await auth.logout();
   router.replace('/login');
 }

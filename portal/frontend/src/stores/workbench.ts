@@ -633,6 +633,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   /**
    * 懒加载某轮折叠前原文。已加载/加载中直接返回（缓存命中不重发）；error 态由组件传
    * force=true 重试。返回加载后的状态，便于调用方/测试断言。
+   *
+   * issue #431：**故意不加迟到/换账号守卫**。缓存键 = `sid:round` ⇒ 复位后迟到的响应只会把
+   * 上一账号的原文放回一个已清空的 `Record`（内存残留，不串界面：新账号的键不可能相同），
+   * 而**同一账号**回头再开那个会话时这条缓存本来就该命中。加守卫反而会把「已拿到的原文」丢掉。
    */
   async function loadFoldedOriginal(
     sid: string,
@@ -1000,6 +1004,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return { error: t('errors.dirNameInvalid') };
     }
     const cwd = `~/projects/${name}`;
+    // issue #431：与 createSession 同口径的代次守卫——本函数是当时**唯一一处在 await 之后直接整块写
+    // 目录上下文而无守卫的**（`dirCwd` / `sessions` / `dirs.push` / `updateAvailability`），于是
+    // 「A 点新建目录 → 在途中登出 → B 秒登录 → A 的回包最后落地」会把 B 刚加载好的目录上下文整块盖掉。
+    const ctx = ctxSeq.value;
     let session: Session;
     try {
       ({ session } = await api<{ session: Session }>('/api/sessions', {
@@ -1008,6 +1016,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }));
     } catch (e) {
       return { error: e instanceof Error ? e.message : String(e) };
+    }
+    if (ctx !== ctxSeq.value) {
+      // 在途期间已换目录/换账号（`claimOwnership` 会撞 ctxSeq）⇒ **不把上下文抢回来**。
+      // 目录与服务端会话确实建出来了（不撤），也不报错（不是失败）；且不把 session 递回调用方
+      // ⇒ NewDirectoryModal 不会 `emit('created')` ⇒ 视图不会跳到一个已经不属于当前登录者的会话。
+      return { error: null };
     }
     // 目录上下文切换（等价 selectDir 的复位语义）：关流/存草稿/清深链/复位协议状态。
     es.closeEs();
@@ -1420,12 +1434,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   async function recallQueue() {
     const sid = sessionId.value;
     if (!sid) return;
+    // issue #431：取回是 DELETE，服务端**已经**把整队掏走了 ⇒ 迟到时不能简单丢弃（丢 = 文本两头没），
+    // 也不能直接写输入框（那是下一个账号/会话的输入框）。口径照 `sendQueued` 失败分支的先例：
+    // **守卫之前先按原会话存回 `drafts`**（切回那个会话还在），守卫之后才跳过界面写入。
+    const ctx = ctxSeq.value;
     try {
       const res = await api<{ recalled: { steering: string[]; follow_up: string[] } }>(
         `/api/sessions/${encodeURIComponent(sid)}/queued-inputs`, { method: 'DELETE' },
       );
       const texts = [...(res.recalled?.steering ?? []), ...(res.recalled?.follow_up ?? [])]
         .filter((x) => x && x.trim());
+      if (ctx !== ctxSeq.value || sessionId.value !== sid) {
+        if (texts.length > 0) {
+          const kept = [...texts, drafts.get(sid) ?? ''].filter((x) => x).join('\n\n');
+          drafts.set(sid, kept);
+        }
+        return;
+      }
       const current = inputValue.value.trim();
       inputValue.value = [...texts, current].filter((x) => x).join('\n\n');
       applyQueueSnapshot({ steering: [], follow_up: [] }); // 服务端已清空，本地立刻跟上（SSE 也会再来一帧）
@@ -1436,8 +1461,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   async function stop() {
     if (!sessionId.value || !es.activeRunId.value) return;
+    // issue #431：stop 在服务端是一定会生效的，但提示行属于**当时那条流**——在途期间换账号/换会话
+    // （`resetSessionView` 与 `resetForUserSwitch` 都会把 `entries` 清空）⇒ 追不回来，也不能往新账号
+    // 的消息流末尾插一条「已请求停止」（那件事与新账号无关）。
+    const sid = sessionId.value;
+    const ctx = ctxSeq.value;
     try {
-      await api(`/api/sessions/${encodeURIComponent(sessionId.value)}/stop`, { method: 'POST', body: '{}' });
+      await api(`/api/sessions/${encodeURIComponent(sid)}/stop`, { method: 'POST', body: '{}' });
+      if (ctx !== ctxSeq.value || sessionId.value !== sid) return;
       entries.value.push({ kind: 'sep', text: t('workbench.stopRequested') });
     } catch (e) {
       alert(t('errors.stopFailed', { message: e instanceof Error ? e.message : String(e) }));

@@ -516,4 +516,20 @@ describe('#428 换账号时的视图接线', () => {
     expect(store.dirCwd, 'B 自己的目录照常加载（复位不是把工作台弄坏）').toBe(DIRS[0].cwd);
     wrapper.unmount();
   });
+  it('#431 工作台挂载过之后在**别处**登出（管理台顶栏 / 强制改密屏）同样断流并清空', async () => {
+    const pinia = createPinia();
+    const first = await mountWorkbenchWith(pinia, FDE_USER);
+    await first.store.openSession('s1');
+    const conn = FakeES.instances.at(-1)!;
+    expect(conn.closed).toBe(false);
+    first.wrapper.unmount(); // 去 /admin：工作台卸载，但 SSE 不归它管（没有 onUnmounted 关流）
+
+    // 这就是 AdminLayout.vue 那颗登出按钮做的事——它只调 auth.logout()，不知道 workbench 的存在。
+    await first.auth.logout();
+
+    expect(conn.closed, 'SSE 必须跟着登出断掉：会话已死而 EventSource 会自动重连，'
+      + '不关就是浏览器后台一直替别人的会话要事件流，挂到标签页关掉为止').toBe(true);
+    expect(first.store.entries).toEqual([]);
+    expect(first.store.sessionId).toBeNull();
+  });
 });
