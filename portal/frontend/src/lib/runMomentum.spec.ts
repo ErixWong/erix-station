@@ -8,7 +8,9 @@ import {
   estimateTokensPerSec,
   formatByteSize,
   formatElapsed,
+  formatTokenCount,
   RUN_FROZEN_THRESHOLD_MS,
+  RUN_STALL_THRESHOLD_MS,
   TPS_WINDOW_MS,
   utf8ByteLength,
   type RunMomentumState,
@@ -153,5 +155,82 @@ describe('deriveMomentumView（派生视图：拿不到就是 null，不是 0）
     expect(deriveMomentumView(running, 2000).tokensPerSec).toBe(10);
     const ended = runningState({ startedAt: 0, endedAt: 2000, samples });
     expect(deriveMomentumView(ended, 2000).tokensPerSec).toBeNull();
+  });
+});
+
+// ---- issue #387：相位 / 标黄阈值 / 上下文占用 ----
+describe('#387 相位与标黄（颜色不再由 5s 驱动）', () => {
+  it('相位时长随时钟走；终态后不再出相位（那时该看「上次 run」，不是「还在等谁」）', () => {
+    const state = runningState({ startedAt: 0, phase: 'awaiting_llm', phaseAt: 1_000 });
+    expect(deriveMomentumView(state, 6_000).phaseMs).toBe(5_000);
+    expect(deriveMomentumView(state, 6_000).phase).toBe('awaiting_llm');
+    const ended = { ...state, endedAt: 7_000 };
+    expect(deriveMomentumView(ended, 99_000).phase).toBeNull();
+    expect(deriveMomentumView(ended, 99_000).phaseMs).toBeNull();
+  });
+
+  it('标黄只看 stall 阈值（相位已知时拿相位算）：5s 不黄、60s 不黄、跨过才黄', () => {
+    const state = runningState({ startedAt: 0, phase: 'awaiting_llm', phaseAt: 0, lastEventAt: 0 });
+    expect(deriveMomentumView(state, RUN_FROZEN_THRESHOLD_MS + 1_000).stalled).toBe(false);
+    expect(deriveMomentumView(state, RUN_STALL_THRESHOLD_MS).stalled).toBe(false); // 「>」而不是「>=」
+    expect(deriveMomentumView(state, RUN_STALL_THRESHOLD_MS + 1).stalled).toBe(true);
+  });
+
+  it('相位未知（旧后端）时退回事件静默时长算黄——黄必须仍会亮，只是不再乱亮', () => {
+    const state = runningState({ startedAt: 0, lastEventAt: 0 });
+    expect(deriveMomentumView(state, RUN_STALL_THRESHOLD_MS - 1).stalled).toBe(false);
+    expect(deriveMomentumView(state, RUN_STALL_THRESHOLD_MS + 1).stalled).toBe(true);
+  });
+
+  it('刚进相位（0ms）也算：相位段从 0s 就说话，不等阈值', () => {
+    const state = runningState({ startedAt: 0, phase: 'tool_running', phaseAt: 0, activeToolName: 'shell' });
+    const view = deriveMomentumView(state, 0);
+    expect(view.phaseMs).toBe(0);
+    expect(view.activeToolName).toBe('shell');
+    expect(view.stalled).toBe(false);
+  });
+});
+
+describe('#387 上下文占用（分子分母都得是真值，缺一不出）', () => {
+  it('本轮输入 / 窗口 ⇒ 百分比（取整）', () => {
+    const state = runningState({
+      roundUsage: { input_tokens: 116_204 },
+      contextWindow: 262_144,
+    });
+    expect(deriveMomentumView(state, 0).contextPct).toBe(44);
+  });
+
+  it('窗口未知 / 本轮输入未知 ⇒ null（整段不出，不画一个「0%」假进条）', () => {
+    expect(deriveMomentumView(runningState({ roundUsage: { input_tokens: 1000 } }), 0).contextPct).toBeNull();
+    expect(deriveMomentumView(runningState({ contextWindow: 262_144 }), 0).contextPct).toBeNull();
+    expect(deriveMomentumView(runningState({ roundUsage: null, contextWindow: null }), 0).contextPct).toBeNull();
+  });
+
+  it('上游报得比标称窗口还大 ⇒ 钳到 100（不画 118% 的进度条）', () => {
+    const state = runningState({ roundUsage: { input_tokens: 300_000 }, contextWindow: 262_144 });
+    expect(deriveMomentumView(state, 0).contextPct).toBe(100);
+  });
+
+  it('脏窗口（0 / 负数 / NaN）一律当「没拿到」，而不是「0%」', () => {
+    for (const window of [0, -1, Number.NaN]) {
+      const state = runningState({ roundUsage: { input_tokens: 100 }, contextWindow: window });
+      expect(deriveMomentumView(state, 0).contextWindow).toBeNull();
+      expect(deriveMomentumView(state, 0).contextPct).toBeNull();
+    }
+  });
+});
+
+describe('formatTokenCount（状态条窄位置的紧凑写法）', () => {
+  it('k / M 两档（阈值 1000，token 不是字节）', () => {
+    expect(formatTokenCount(512)).toBe('512');
+    expect(formatTokenCount(1_000)).toBe('1k');
+    expect(formatTokenCount(116_204)).toBe('116.2k');
+    expect(formatTokenCount(1_383_397)).toBe('1.4M');
+  });
+
+  it('拿不到 / 负数 ⇒ 空串（调用方整段不出）', () => {
+    for (const value of [null, undefined, Number.NaN, -1] as const) {
+      expect(formatTokenCount(value)).toBe('');
+    }
   });
 });

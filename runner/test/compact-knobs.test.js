@@ -161,7 +161,10 @@ test('K11 worker 的 onEvent 里那条 warn 真接着（且**不改事件**：�
   assert.ok(onEvent, 'worker.js 的 onEvent 结构变了，本判据的正则需要重看');
   assert.match(onEvent[0], /foldDegradeNotice\(event\.compaction\)/);
   assert.match(onEvent[0], /level:\s*'warn'/);
-  assert.match(onEvent[0], /emitEvent\(event\.type,\s*loopEventPayload\(event\)\)/,
+  // #387 起 `loopEventPayload` 多了一个 meta 参数（`{ contextWindow }`，只往 payload 里加宿主侧
+  // additive 展示量，**不改 event 本身**）⇒ 锚点必须容得下它，否则这条判据会因为一个纯加法而假红。
+  // 「不改事件」这层仍由下面的 doesNotMatch 与「第一参数就是 event」共同兜住。
+  assert.match(onEvent[0], /emitEvent\(event\.type,\s*loopEventPayload\(event(?:,\s*\{[^}]*\})?\)\)/,
     '告警之后仍要原样下发 compaction 事件：#392-D 横幅与历史回放都靠它');
   assert.doesNotMatch(onEvent[0], /RUN_FINISHED|buildFailureEnvelope/,
     '摘要降级不得改终态：模型拿到的仍是机械摘要，把正常完成的 run 刷红是误报');

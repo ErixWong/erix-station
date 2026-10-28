@@ -378,13 +378,32 @@ export const zhCN = {
     lastRunElapsed: '上次 run {dur}',
     tools: '工具 {count} 次',
     toolsAvg: '（均 {dur}）',
-    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）⇒ 状态条标黄 + 这句
-    frozen: '上游已 {sec}s 无输出',
-    // 硬刷新边界（状态条 tooltip）：run_end / usage 不在历史回放白名单
-    refreshBoundary: '运行态数字只在本页有效：硬刷新后只保留消息时间戳（run_end / usage 不在历史回放白名单）',
+    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）。#387 后这句只在
+    // **相位未知**（旧后端/首帧前）时才用；颜色改由 RUN_STALL_THRESHOLD_MS 负责（见下面 phase*）。
+    frozen: '已 {sec}s 没有新内容',
+    // 硬刷新边界（状态条 tooltip）：`run_end` 不在历史回放白名单；#387 只把历史 `round_end` 的累计用量放进来了。
+    refreshBoundary: '刷新后运行中的速率与时长会丢失（run_end 不在历史回放白名单）；上次 run 的 token 与上下文窗口仍会显示（来自历史 round_end 的累计用量）',
     runningElapsed: '已运行 {dur}',
     runningHint: '该 run 仍在执行：数值每 1 秒刷新',
     messageTimeTitle: '消息时刻',
+    // ---- issue #387：相位与 token（目标：界面一直说得出自己在等什么，不让用户猜）----
+    // 相位三选一（运行中常驻）。名字里的 {tool} 是上游给的工具名（英文标识符，不翻译）。
+    phaseAwaiting: '等待模型回复中 {sec}s',
+    phaseAwaitingHint: '请求已发出，模型还没开始回话。上下文越大，“首字节前的静默”可以正常地长达几十秒，这不是故障',
+    phaseTool: '正在执行工具 {tool}（{sec}s）',
+    phaseToolNoName: '正在执行工具（{sec}s）',
+    phaseToolHint: '工具在容器内真实执行（构建/测试/dev server 等），这一步的时长不取决于模型',
+    phaseStreaming: '正在生成',
+    phaseSilent: '已 {sec}s 没有新内容',
+    // 上下文占用：分子 = 本轮输入 token（上游真值），分母 = 模型窗口（管理员给该模型配的值）。
+    context: '上下文 {pct}%（{used}/{window}）',
+    contextHint: '本轮发给模型的上下文：{used} tokens，模型窗口 {window} tokens（接近满时平台会自动折叠旧轮内容）',
+    // 本轮 / 本 run token：全部是上游真值（`usage` / `round_end`），不带 `~`。
+    roundTokens: '本轮 tokens ↑{input} ↓{output}',
+    roundTokensInput: '本轮 tokens ↑{input}',
+    roundTokensOutput: '本轮 tokens ↓{output}',
+    roundTokensHint: '本轮真实用量（上游返回的 usage）；↑ 是发给模型的上下文，不是花费',
+    runTokens: '累计 {tokens}',
   },
   // 输入区（components/ComposerBar.vue）
   composer: {

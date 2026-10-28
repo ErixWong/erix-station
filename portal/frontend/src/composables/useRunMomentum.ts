@@ -10,6 +10,10 @@
 // （`useEventStream.ts` 的 `HISTORY_REPLAY_TYPES`），所以刷新后这些运行态数字**拿不回来**。本文件的
 // 处理是 `ingest(..., history=true)` **直接短路**——历史帧（含 round_start/tool_use）一律不驱动运行态，
 // 于是刷新后回落成「只有消息时间戳 + 会话级信息」。**不许用假数据把空白填满**。
+//
+// issue #387 只开了**一个口子，且只开在用量上**：`round_end` 在白名单里，而它的 `usage` 是本 run 的
+// 累计真值 ⇒ 刷新后「上次 run 吃了多少 token / 窗口多大」能拿回来。相位 / 轮号 / 时长 / 速率
+// 依旧一律不吃历史帧（那会把历史帧说成「现在在跑」）。
 import { computed, onMounted, onUnmounted, reactive, ref, type ComputedRef } from 'vue';
 import {
   createEmptyMomentumState,
@@ -18,6 +22,7 @@ import {
   utf8ByteLength,
   type RunMomentumState,
   type RunMomentumView,
+  type RunPhase,
   type RunUsage,
 } from '../lib/runMomentum';
 
@@ -61,6 +66,28 @@ function readUsage(raw: unknown): RunUsage | null {
   return Object.keys(usage).length > 0 ? usage : null;
 }
 
+/** 有限数才认（`NaN` / 字符串 / `undefined` = 「没拿到」，不是 0）。 */
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** 本轮用量累加（同轮多次 provider 调用：续写 / 重试）。两边都缺的键保持缺席，不补 0。 */
+function addUsage(base: RunUsage | null, delta: RunUsage): RunUsage {
+  const out: RunUsage = { ...base };
+  for (const key of ['input_tokens', 'output_tokens'] as const) {
+    const a = out[key];
+    const b = delta[key];
+    if (typeof b === 'number') out[key] = (typeof a === 'number' ? a : 0) + b;
+  }
+  return out;
+}
+
+/** 历史帧里的上下文窗口（runner 宿主侧 additive 字段）；只收正有限整数之外的脏值一律当没拿到。 */
+function readContextWindow(raw: unknown): number | null {
+  const value = finiteOrNull(raw);
+  return value !== null && value > 0 ? value : null;
+}
+
 /**
  * 状态机工厂：返回响应式原始观测面 + ingest/beginRun/reset。
  * 每个 store 实例一份（pinia setup store 里创建），组件通过 `useRunMomentum` 只读派生。
@@ -88,6 +115,15 @@ export function createRunMomentumFeed(): RunMomentumFeed {
     state.outputChars = 0;
     state.outputBytes = 0;
     state.usage = null;
+    state.usageFromHistory = false;
+    state.roundUsage = null;
+    state.roundUsageRound = null;
+    state.runUsage = null;
+    state.contextWindow = null;
+    state.phase = null;
+    state.phaseAt = null;
+    state.activeToolName = null;
+    state.pendingTools = 0;
     state.toolCount = 0;
     state.toolDurTotalMs = 0;
     state.toolDurCount = 0;
@@ -109,7 +145,10 @@ export function createRunMomentumFeed(): RunMomentumFeed {
     nowMs: number = Date.now(),
   ): void {
     // 历史回放帧不驱动运行态（硬刷新边界的落点，见文件头注）。
-    if (history) return;
+    // 唯一例外 `historyUsageOnly`：历史 `round_end` 的累计用量与窗口——只喂【用量】与【窗口】两个数，
+    // 并且把登记出来的 run 直接标成已结束（否则历史帧会被当成「现在在跑」）。
+    const historyUsageOnly = history && type === 'round_end';
+    if (history && !historyUsageOnly) return;
     const d = payload ?? {};
     const rid = runIdOf(d);
 
@@ -122,15 +161,41 @@ export function createRunMomentumFeed(): RunMomentumFeed {
       const termination = (d.termination as { reason?: unknown } | null | undefined)?.reason;
       state.termination = typeof termination === 'string' && termination !== '' ? termination : null;
       // 真值优先：`run_end.usage` 有就显示真值，没有就保持 null（界面不出 token 数字）。
+      // 来源标成实时：此后任何历史 `round_end` 都不得回退它（#387）。
       state.usage = readUsage(d.usage);
+      state.usageFromHistory = false;
       return;
     }
 
-    // 别的 run 的迟到帧：正在跟踪一个活跃 run 时一律忽略（不串 run、不误判起跑）。
+    // 历史 `round_end`：本页没见过这个 run（硬刷新后的典型形状）⇒ 登记一个**已结束的** run，
+    // 只为了把「上次 run」那一栏的用量与窗口填上。**必顶在通用 run 登记之前**：那个入口会拿
+    // `nowMs` 当起跑时刻，而历史帧根本不知道什么时候起跑（假出一个「上次 run 00:00」）。
+    // `startedAt = null` ⇒ 界面不出时长；`endedAt = nowMs` ⇒ 它进空闲态那一栏，不是「运行中」。
+    // 回放按 seq 升序，所以最后一条就是累计量最大的那一条（后面的轮盖住前面的，不会回退）。
+    if (historyUsageOnly) {
+      // 本页正在跟踪一个**还活着**的 run 时，别的 run 的历史帧不得抢登记（刷新后历史补拉与实时帧同屏）。
+      if (state.runId !== null && state.endedAt === null && rid !== null && rid !== state.runId) return;
+      if (rid !== null && rid !== state.runId) beginRun(rid, null);
+      if (state.runId === null) return;
+      state.endedAt = nowMs;
+      // 实时 `run_end` 已经给过终态用量的，**不拿历史 `round_end` 盖掉**（前者是权威口径）；
+      // 但历史帧之间要允许覆盖（回放按 seq 升序，后一条的累计量更大，不盖就是少报）。
+      const historyUsage = readUsage(d.usage);
+      if (historyUsage !== null && (state.usage === null || state.usageFromHistory)) {
+        state.usage = historyUsage;
+        state.usageFromHistory = true;
+      }
+      const historyWindow = readContextWindow(d.context_window);
+      if (historyWindow !== null) state.contextWindow = historyWindow;
+      return;
+    }
+
+    // 别的 run 的帧：正在跟踪一个活跃 run 时，迟到帧一律忽略（不串 run、不误判起跑）。
     if (rid !== null && rid !== state.runId) {
       if (state.runId !== null && state.endedAt === null) return;
       beginRun(rid, nowMs);
     }
+
     // 不知道 run 的帧（旧后端/无 run_id）不造 run：没有 run 就没有动量。
     if (state.runId === null) return;
 
@@ -138,12 +203,47 @@ export function createRunMomentumFeed(): RunMomentumFeed {
 
     switch (type) {
       case 'round_start':
-      case 'round_end':
       case 'attempt':
       case 'recovering':
       case 'recovered':
         // 脏轮号不覆盖已知值（不拿「旧轮号冒充当前轮」，也不写 NaN）。
+        if (typeof d.round === 'number' && Number.isFinite(d.round)) state.round = d.round;        // #387：这四个事件都发生在「刚把请求发出去」的时刻 ⇒ 相位 = 等 LLM。
+        // 新一轮开始 ⇒ 上轮的用量不再是「本轮」（宁可不显，也不拿 N-1 轮的数冒充 N 轮）。
+        state.roundUsage = null;
+        state.roundUsageRound = null;
+        enterPhase('awaiting_llm', nowMs);
+        return;
+      case 'usage': {
+        // #387：单次 provider 调用的真值。同轮多次调用（续写/重试）累加到本轮；换轮则重置。
+        const usage = readUsage(d.usage);
+        const round = finiteOrNull(d.round);
+        if (usage !== null) {
+          if (state.roundUsageRound === null || round === null || state.roundUsageRound === round) {
+            state.roundUsage = addUsage(state.roundUsage, usage);
+          } else {
+            state.roundUsage = usage;
+          }
+          if (round !== null) state.roundUsageRound = round;
+        }
+        // 上下文窗口：runner 的宿主侧 additive 字段。没带就保持已知值（同一 run 的窗口不会变），
+        // 从不拿 0 盖掉已知值。
+        const window = readContextWindow(d.context_window);
+        if (window !== null) state.contextWindow = window;
+        // 能拿到 usage = 上游已经回话了 ⇒ 不再是「等回音」。后面的 tool_use 会把相位接过去；
+        // 没有工具调用时保持 awaiting_llm 也不并错（下一轮即将开始）——不自己造「收尾中」这种新相位。
+        return;
+      }
+      case 'round_end':
         if (typeof d.round === 'number' && Number.isFinite(d.round)) state.round = d.round;
+        // #387：引擎给的是**本 run 累计**真值（口径见 lib 层注释）；没有就不覆盖旧值。
+        {
+          const usage = readUsage(d.usage);
+          if (usage !== null) state.runUsage = usage;
+        }
+        // `round_end` **不清**本轮用量：轮与轮之间有个空档，清了会让刚显示的「本轮 tokens」闪一下就没。
+        // 重置放在下一个 `round_start`（那时才真的换了轮）。
+        // 工具结果已全部返回、下一轮还没 `round_start`：这段空隙也是在等 LLM，不回到「未知」。
+        enterPhase('awaiting_llm', nowMs);
         return;
       case 'assistant_delta': {
         const text = typeof d.text === 'string' ? d.text : '';
@@ -152,10 +252,21 @@ export function createRunMomentumFeed(): RunMomentumFeed {
         state.outputBytes += utf8ByteLength(text);
         state.samples.push({ t: nowMs, chars: state.outputChars });
         pruneSamples(nowMs);
+        // 流在动 ⇒ 相位是「在收流」。进相位只在从别的相位切过来时重置计时（否则每秒重置，
+        // 「已运行」永远停在 0s）。
+        enterPhase('streaming', nowMs);
         return;
       }
+      case 'reasoning_delta':
+        // 推理增量同样证明「上游在回话」（不展示，但相位必须算 streaming）。
+        enterPhase('streaming', nowMs);
+        return;
       case 'tool_use':
         state.toolCount += 1;
+        state.pendingTools += 1;
+        // 工具在跑：把相位从「等 LLM」换成「等工具」，并记下工具名（文案用得上）。
+        state.activeToolName = typeof d.name === 'string' && d.name !== '' ? d.name : state.activeToolName;
+        enterPhase('tool_running', nowMs);
         return;
       case 'tool_result': {
         // 只有**真带了**有限时长才计入均值（缺失不伪装成 0ms，与 #283 同口径）。
@@ -164,10 +275,24 @@ export function createRunMomentumFeed(): RunMomentumFeed {
           state.toolDurTotalMs += dur;
           state.toolDurCount += 1;
         }
+        state.pendingTools = Math.max(0, state.pendingTools - 1);
+        if (state.pendingTools === 0) {
+          // 全部工具已交差 ⇒ 下一个动作一定是「把结果发回模型并等回音」。
+          state.activeToolName = null;
+          enterPhase('awaiting_llm', nowMs);
+        }
         return;
       }
       default:
         return;
+    }
+  }
+
+  /** 进相位：只有**从别的相位切过来**才重置计时（同相位内重复事件不得把秒数抹回 0）。 */
+  function enterPhase(phase: RunPhase, nowMs: number): void {
+    if (state.phase !== phase) {
+      state.phase = phase;
+      state.phaseAt = nowMs;
     }
   }
 

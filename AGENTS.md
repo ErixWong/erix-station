@@ -2498,3 +2498,51 @@ N 轮」——契约（host-consumer-contract #479）明写它是 **run 作用�
 前端（前端 `default: return;` 中性忽略）"—— 前端从没订过这个类型，EventSource 不订就不是"收到但不
 展示"，而是**根本没收到**。注释与实际不符本身就是缺陷面的一部分，改代码时必须一起改，不然下一个人
 会照着它再推一遍错的结论。
+
+### 8.75 状态条从「出事才说话」改成「一直在说话」（issue #387，2026-10-26）
+
+用户口述的三件不适：① 看不到**上下文吃了多少 / 这一轮烧了多少 token**；② `上游已 6s 无输出` 读起来像
+故障，而它当时**几乎常亮**；③ agent 中间大段静默时，非专业用户分不清「在干活」与「已经死了」。
+对应三处改动，全在展示层 + runner 提示词，**零 DDL、零后端行为变更、零新事件类型**。
+
+**① `usage` 事件从「整条丢掉」改成「放行展示」**（`runner/worker.js`）：`onEvent` 里原本有一句
+`if (event?.type === 'usage') return;`——那是 **#282 为了「不拿单次调用冒充整 run 汇总」**加的，但它同时
+把数字从界面上抹掉了。现在事件照发、照落 `run_events`，记账面一字未动（`onUsage` 仍是空实现，计费仍只吃
+U2 终态载荷，§7.3/§6.3-6 口径不变）。同一处加宿主侧 additive 字段 `context_window`（值 = 喂给引擎
+`modelMetadata.contextWindowTokens` 的那个数，#309），**判据用 `Number.isSafeInteger` 而不是 `isFinite`**
+——与 #316 入口 `parseHeartbeatModels` 同一形状口径；小数/字符串/≤0 ⇒ **整键不写**，前端整段不出，
+绝不画一个「0% / 上限 0」的假进度条。
+
+**② token 三个面**（`lib/runMomentum.ts` / `RunStatusBar.vue`）：`roundUsage`（最近一次 `usage`，
+同轮多次调用累加，换 `round_start` 才清）、`runUsage`（最近一次 `round_end.usage`）、上下文占用
+= 本轮输入 / 窗口。**累计量运行中就有**：真机 `run_events` 里 `round_end.usage` 单调递增、最后一轮 =
+`run_end.usage` ⇒ 引擎给的是**本 run 累计**（口径来自引擎实现而非契约文档，所以注释写死「截至上一轮」）。
+`round_end` **不清**本轮用量（清了会在轮间空档闪没），重置点放在下一个 `round_start`。
+
+**③ 相位**：`round_start`/`attempt`/`recovering` ⇒ `awaiting_llm`；`assistant_delta`/`reasoning_delta` ⇒
+`streaming`；`tool_use` ⇒ `tool_running`（带工具名）；最后一个 `tool_result` 交差 ⇒ 回 `awaiting_llm`。
+`enterPhase` **只在换相位时重置计时**（同相位内重复 delta 会把「已等 42s」每秒抹回 0）。
+颜色与文案解耦：`RUN_FROZEN_THRESHOLD_MS`（5s）降级成「该提一句」的阈值（相位秒数上屏），标黄另用
+`RUN_STALL_THRESHOLD_MS = 60_000`——取数依据是本站自己下发的 `firstByteTimeoutMs=240s` /
+`streamIdleTimeoutMs=180s` 与 300s 看门狗（量级参考，**不抄那两个数的字面量**：它们住在容器 env，改它不必改这里）。
+
+**④ 提示词「过程播报」段**（`SYSTEM_PROMPT`）：开工先回一句再动手 / 每阶段报结果 / 只在真的需要用户参与时
+提问（工具报错不许拿去打断用户）/ 长命令先说要做什么、失败也要报 / 播报是进度不是第二段摘要。
+静默多久算久由界面负责，提示词里**不写阈值数字**（单一真相在前端常量）。
+
+**硬刷新口子的形状**（这条最容易写错，已按它单测）：历史回放白名单没动，但状态机对 `history=true` 开了
+**一个**例外——历史 `round_end` 的 `usage` 与 `context_window`。它必须①在通用 run 登记**之前**处理
+（否则 `beginRun(rid, nowMs)` 会假出一个「上次 run 00:00」）、②把登记的 run 直接标 `endedAt`（否则历史帧
+被当成「现在在跑」）、③`startedAt=null`（时长不出）、④允许**历史帧之间**后者盖前者（seq 升序，不盖就是少报）
+却**不许回退实时 `run_end` 的值**（靠 `state.usageFromHistory` 一个布尔区分来源，不进视图）。
+
+**基线（主 agent 亲跑，判绿 = 退出码）**：根 `npm test` **1567 / 1563 通过 / 0 失败 / 4 跳过 rc=0**
+（基点 1561 ⇒ **+6**）；`node --test runner/test/*.test.js` **365/365 rc=0**（基点 359 ⇒ `usage-event` +3 /
+`system-prompt` 的 #387 段 +3）；前端 `npm run typecheck` rc=0 + `npm test` **48 文件 / 912 通过 rc=0**
+（基点 886 ⇒ **+26**：lib 层 10 条、状态机组 12 条、组件层 4 条）。
+过程中被自己的钉子抓到并修掉三次：`SYSTEM_PROMPT` 收尾漏分号（抠取器断言先红）、`context_window`
+用 `isFinite` 放过 1.5、历史 `round_end` 抢走正在跑的活 run 登记。
+
+**已知不足（另单跟）**：相位在 `usage` 之后不主动改（没有工具调用时它停在 `awaiting_llm`，语义上「下一轮
+即将开始」，不算错，但界面上会出现「刚收到 usage 却说在等回音」的一瞬）；`roundUsage` 是**本轮**口径而
+`runUsage` 是**截至上一轮**口径，两个数并排时用户可能以为它们同源；提示词的播报效果只能真机看 transcript 验收。
