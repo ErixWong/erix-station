@@ -495,7 +495,7 @@ preview-ports 观测附取/降级 2 例、migrations 0022 锚点 1 例、前端 
 | 11 | 预览端口呈现盲区（只显示在用端口 + 显性暴露多实例占多口） | **#246 / #251 / #253 → #308** | **已修**（全局号池与列端点 AGENTS §8.13/§8.14；端口段搬进左栏 §8.41，PR #340） |
 | 12 | 自托管 kkFileView：文件树点击 → 右侧预览面板 + 全屏 modal | **#356 / #366** | **已交付**（PR #372 merge `aaf8294`；四通道 + kkFileView 5.0.3，AGENTS §8.57） |
 | 13 | 上游网关 `tool_calls` 参数流被提前截断（嵌套 schema + ≳4KB） | **#426** | **观察中**（本站改不了上游；报告与复现脚本已入 `docs/design/`，三条规避已采用） |
-| 14 | 切换用户后首页对话窗口里还是上一个账户的对话记录（决策者 2026-10-28 口述） | **#428** | **已修**（登出只清 auth store + SPA 不重载页面 ⇒ workbench 全局单例跨账号存活；新增 `resetForUserSwitch()` + `claimOwnership()` 两处视图接线，AGENTS §8.77；**未发版**）。跨账号写已**源码对账确认挡住**（`fetchSession()` 非属主一律 `404 not_found`、不泄露存在性；`POST /messages` 幂等 fn 内先 `assertSessionOwner`，`postMessage` 再带 `FOR UPDATE` 二次校，SSE 同口径）⇒ 定级 = 体验 + 信息泄漏，不是数据串号 |
+| 14 | 切换用户后首页对话窗口里还是上一个账户的对话记录（决策者 2026-10-28 口述） | **#428** | **已修**（登出只清 auth store + SPA 不重载页面 ⇒ workbench 全局单例跨账号存活；新增 `resetForUserSwitch()` + `claimOwnership()` 两处视图接线，AGENTS §8.77；**未发版**）。跨账号写已**源码对账确认挡住**（`fetchSession()` 非属主一律 `404 not_found`、不泄露存在性；`POST /messages` 幂等 fn 内先 `assertSessionOwner`，`postMessage` 再带 `FOR UPDATE` 二次校，SSE 同口径）⇒ 定级 = 体验 + 信息泄漏，不是数据串号。**未尽部分另立 #431 并已修**（登出三颗按钮只有一颗收摊 ⇒ SSE 带死会话无限重连；`createDir`/`recallQueue`/`stop` 三条迟到写回无守卫），AGENTS §8.78 |
 
 ### 🔭 观察队列（不指派，等信号）
 
