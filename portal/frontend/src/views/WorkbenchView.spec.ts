@@ -4,13 +4,14 @@
 //   ② 顶栏语言切换菜单（LocaleSwitch）挂载在管理台/登出旁；切 English 后顶栏（含嵌套的侧栏
 //      子组件）文案即时变英文，who 拼接改半角括号。
 // 约定（照 LoginView.spec 先例）：装配真实 i18n 单例，不 mock t()；每例 localStorage.clear() + setLocale('zh-CN')。
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import WorkbenchView from './WorkbenchView.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 import { createAppRouter } from '../router';
+import { setUserScopeResetListener } from '../lib/userScope';
 import { useAuthStore, type AuthUser } from '../stores/auth';
 import { useWorkbenchStore } from '../stores/workbench'; // issue #281：断言消息流里的可见错误行要用 store
 import { i18n, setLocale } from '../i18n';
@@ -433,6 +434,11 @@ describe('状态条落点：紧贴输入框上方（#282 落点调整）', () =>
 // 单例跨账号存活。本组用例钉的是**视图接线**（store 侧复位本身在 stores/workbench.spec.ts）：
 // ① 挂载第一步按当前登录者认领，身份变了必须先复位；② 登出当场收回归属，不等下一个账号来擦。
 describe('#428 换账号时的视图接线', () => {
+  // 卫生（#431 评审建议）：本文件在用例里注册 setUserScopeResetListener 且**故意不在组件卸载时注销**
+  // （产品语义如此）。单测侧仍要在收尾注销，否则将来同文件新增「不挂载却调 auth.logout()」的用例会被
+  // 上一个 pinia 的旧 store listener 干扰（口径同 stores/auth.spec.ts）。
+  afterEach(() => setUserScopeResetListener(null));
+
   const USER_B = {
     id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: 'bob', auth_source: 'local',
   } as AuthUser;
