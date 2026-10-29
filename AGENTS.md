@@ -2704,3 +2704,32 @@ A 在另一台设备的预览连坐掉。forwardAuth 保持零改动（回收只
 ③ fake 建模新列时**按 SQL 说的做**（`preview.test.js` 的 INSERT 按参数位解析、`fake-pool` 的血缘撤权
   从 SQL 文本认 `state = 'active'` 谓词）：实现漂移（多一列 / 改谓词）fake 当场红，
   不重演 #252「单测结构上测不到」。
+
+### 8.80 给人看的地方不许出现主键：模型下拉把 LiteLLM 的 UUID 摊了出来（issue #434，2026-10-29，分支 `fix-261029-02-434-model-label-uuid`）
+
+**现象**：管理台「编辑用户 → LLM 配置」选模型，下拉每一项是 `920aa0c6-f336-4085-b6b1-607660883b35 — deepseek-flash`。
+同一屏的模型表格（#296 那轮改的「调用名 / 显示名」两列）是对的——**下拉与两条错误文案是漏网之鱼**。
+
+**根因**：`toModel()` 发给前端的 `model_id = model_info.id`，而建模型时我们**从不写** `model_info.id`
+⇒ LiteLLM 自己生成 UUID（现网两个模型实测全是 UUID，`display_name` 与调用名相同）。
+凡 `${model.model_id} — ${model.name}` 都在打这个 UUID。**单测没抓到是因为 mock 把 `model_id` 写成
+`'gpt-4o'`**——形状与真机不符，这种 mock 只能测逻辑不能测语义。
+
+**同类 6 处一次收口**（不是一个下拉的事）：`UserLlmPane` 三个下拉 + 选中项 `title`、`AdminUsersView`
+新建 FDE 的三个下拉、保存成功 toast（取 `config.main.model_id`）、`AdminView` **新增**模型表单第一个
+字段的裸 label（编辑表单 #296 已改，新增表单漏——同文件下方就有 `not.toContain('model_id')` 这条既有判据，
+照着抄一遍就行）、后端调用名撞车 409 的 `已被模型 <UUID> 占用`、以及**给 FDE 终端用户看的**
+`llm_model_not_found` 预检文案与它的前端 i18n 版。
+
+**修法**：`lib/modelLabel.ts::modelOptionLabel()` = `展示名 (调用名)`，两者相同（现网绝大多数）只显示一次，
+**绝不打主键**；与表格两列同源，不引入第三套叫法。错误文案优先报**绑定里存的调用名**（用户认得的那个），
+UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字优先、老服务端没带才退 `model_id`。
+**提交/回填一律仍走主键 `id`** ——本收口只动显示面，不碰任何契约字段。
+
+**⚠ 可复用的三条**：
+① 「主键能不能给人看」判据：**只有 UUID/自增 id 是主键，就不许出现在下拉、toast、聊天 syserr 里**；
+  要给人看就用 `#296` 那两个名字（展示名 / 调用名），要排障就放 `details` 或括号；
+② **同一类"给人看的标签"必须收到一个函数里**（本轮之前它散在 2 个文件 6 处）——散落形状下，
+  修一处 = 漏五处，#296 那一轮正是这么漏的；
+③ mock 的字面值要**长得像真机的形状**（`pk-m1` / UUID 形态），`model_id: 'gpt-4o'` 这种"看着像人名"的
+  mock 会让 UUID 泄漏在结构上测不出来。

@@ -1310,12 +1310,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         text: err?.code === 'llm_not_configured'
           ? t('errors.sendFailedLlmNotConfigured')
           // issue #261014 切片 B2：`llm_model_not_found`（绑定的模型 id 在网关里已不存在）给专用指引；
-          // 槽位与模型 id 取自服务端 `error.details`，一律经 `toDisplayText` 收口
+          // 槽位与模型名取自服务端 `error.details`，一律经 `toDisplayText` 收口
           // ⇒ 脏值（嵌套对象 / 非字符串）退化成 JSON 文本，绝不演成 `[object Object]`。
+          // 模型名优先取调用名（`model_name`，用户认得的那个），旧服务端没带才退到 `model_id`（UUID，
+          // 没得选）。
           : err?.code === 'llm_model_not_found'
             ? t('errors.sendFailedLlmModelNotFound', {
               slot: toDisplayText(err.details?.slot).trim() || '-',
-              model_id: toDisplayText(err.details?.model_id).trim() || '-',
+              model: toDisplayText(err.details?.model_name).trim()
+                || toDisplayText(err.details?.model_id).trim() || '-',
             })
             : t('errors.sendFailed', { message: err?.message ?? e })
               + (err?.code === 'run_in_progress' ? t('errors.runInProgress') : ''),
