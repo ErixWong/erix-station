@@ -387,6 +387,31 @@ describe('workbench store（P5 前既有语义，回归保留）', () => {
     expect(text).toContain('7');
   });
 
+  // 服务端现在随 details 带绑定里的**调用名**（model_name）：用户只认得这个名字，
+  // 而 model_id 是 LiteLLM 主键 UUID，摊在聊天框里读不得。旧服务端没带时才退回 id。
+  it('llm_model_not_found：details 带 model_name ⇒ 文案用调用名，不再摊 UUID', async () => {
+    mockFetch((url, init) => (url.endsWith('/messages') && init?.method === 'POST'
+      ? {
+        status: 409,
+        body: {
+          error: {
+            code: 'llm_model_not_found', message: 'nope',
+            details: { slot: 'main', model_id: '920aa0c6-f336-4085-b6b1-607660883b35', model_name: 'deepseek-flash' },
+          },
+        },
+      }
+      : { status: 200, body: { items: [] } }));
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.inputValue = 'x';
+    await store.send();
+    const text = store.entries.filter((e) => e.kind === 'syserr').pop() as { text: string };
+    expect(text.text).toContain('deepseek-flash');
+    expect(text.text).not.toContain('920aa0c6');
+    expect(text.text).toContain('main');
+  });
+
   it('切 English：llm_model_not_found 的发送失败文案是英文（双语成对，不拿中文交差）', async () => {
     mockFetch((url, init) => (url.endsWith('/messages') && init?.method === 'POST'
       ? { status: 409, body: { error: { code: 'llm_model_not_found', message: 'nope', details: { slot: 'vision', model_id: 'mid-9' } } } }

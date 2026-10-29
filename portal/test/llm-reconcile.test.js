@@ -555,6 +555,9 @@ test('#296: 占用中的调用名 ⇒ 409 model_name_conflict（真网关不拦�
       assert.equal(error.details.field, 'call_name');
       assert.equal(error.details.call_name, 'text-embedding-3');
       assert.equal(error.details.conflicting_model_id, 'm-emb', '把撞车的模型 id 给出去，运维才知道要去动谁');
+      // 但给人看的文案不得是主键 id（真实网关那是 UUID）：用撞车模型的名字。
+      assert.match(error.message, /已被模型「/, error.message);
+      assert.ok(!error.message.includes('m-emb'), `文案里不该出现主键：${error.message}`);
       return true;
     },
   );

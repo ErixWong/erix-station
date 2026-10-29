@@ -215,10 +215,11 @@ test('issue #261014 B2：绑定的 main 模型 id 在网关里不存在 → 409 
     assert.equal(r.status, 409);
     const body = await r.json();
     assert.equal(body.error.code, 'llm_model_not_found');
-    assert.deepEqual(body.error.details, { slot: 'main', model_id: 'mid-main' });
+    assert.deepEqual(body.error.details, { slot: 'main', model_id: 'mid-main', model_name: 'gpt-main' });
     assert.equal(body.error.retryable, true, '管理员改配后可原样重试（本预检零副作用、不占幂等位）');
-    // 说人话：槽位与模型 id 都要出现在 message 里（前端另有一层码→文案，但服务端原文本身也得可读）
+    // 说人话：**绑定里的调用名**才是用户认得的词，必须是文案主语；槽位与 id（UUID）做辅助定位。
     assert.match(body.error.message, /主模型/);
+    assert.match(body.error.message, /「gpt-main」/, '给人看的是名字，不是 UUID');
     assert.match(body.error.message, /mid-main/);
     assert.match(body.error.message, /管理台/);
   } finally {
@@ -267,7 +268,7 @@ test('issue #261014 B2：embedding 槽位的 id 不存在也拦（details.slot=e
     assert.equal(r.status, 409);
     const body = await r.json();
     assert.equal(body.error.code, 'llm_model_not_found');
-    assert.deepEqual(body.error.details, { slot: 'embedding', model_id: 'mid-emb' });
+    assert.deepEqual(body.error.details, { slot: 'embedding', model_id: 'mid-emb', model_name: 'gpt-emb' });
     assert.match(body.error.message, /嵌入模型/);
   } finally {
     await s.close();
@@ -375,7 +376,7 @@ test('issue #261014 B2：预检只读——单元面零写库、零 updateKey（
       }),
       (err) => err.code === 'llm_model_not_found' && err.httpStatus === 409
         && err.retryable === true
-        && JSON.stringify(err.details) === JSON.stringify({ slot: 'main', model_id: 'mid-main' }),
+        && JSON.stringify(err.details) === JSON.stringify({ slot: 'main', model_id: 'mid-main', model_name: 'gpt-main' }),
     );
     // 网关不可达路径
     const unreachable = fakeGateway({ fail: true });
