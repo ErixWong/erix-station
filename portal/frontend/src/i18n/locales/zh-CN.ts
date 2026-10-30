@@ -874,7 +874,7 @@ export const zhCN = {
     // issue #41：LLM 未绑定预检 409 → 友好指引（fde 角色可能无 /admin 权限 → 措辞兜底「联系管理员」）
     sendFailedLlmNotConfigured: '发送失败：该 FDE 未配置 LLM 上游，请到管理台 /admin 配置（无权限请联系管理员）',
     // 拼在 sendFailed 之后的可选后缀（zh 全角括号、en 前置空格 + 半角括号）
-    sendFailedLlmModelNotFound: '发送失败：本 FDE 绑定的模型在 LLM 网关里已不存在（槽位 {slot}，模型 id {model_id}）：请到管理台 /admin 重新选择模型后再发一次（无权限请联系管理员）',
+    sendFailedLlmModelNotFound: '发送失败：本 FDE 绑定的模型在 LLM 网关里已不存在（槽位 {slot}，模型 {model}）：请到管理台 /admin 重新选择模型后再发一次（无权限请联系管理员）',
     runInProgress: '（已有进行中任务）',
     treeLoadFailed: '目录树加载失败：{message}',
     // issue #107：侧栏内联重命名——空串本地拦截 / 提交失败回退旧标题时的轻提示

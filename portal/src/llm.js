@@ -756,7 +756,11 @@ export async function updateModel(gateway, id, {
       .filter((model) => String(modelId(model) ?? '') !== String(modelId(current) ?? ''))
       .find((model) => model?.model_name === callName);
     if (conflicting) {
-      throw new LlmError('model_name_conflict', `调用名「${callName}」已被模型 ${modelId(conflicting)} 占用`, {
+      // 给人看的文案用【撞车模型的名字】（展示名优光，退到调用名），不要把 LiteLLM 主键
+      // UUID 直接摊到管理员界面上（id 仍在 details 里，机器/运维要用它）。
+      const clash = toModel(conflicting);
+      const clashLabel = clash.name || clash.model_name || String(modelId(conflicting));
+      throw new LlmError('model_name_conflict', `调用名「${callName}」已被模型「${clashLabel}」占用`, {
         httpStatus: 409,
         details: { field: 'call_name', call_name: callName, conflicting_model_id: String(modelId(conflicting)) },
       });
@@ -1204,15 +1208,18 @@ export async function assertBindingModelsResolvable(pool, userId, opts = {}) {
     return observed;
   }
 
-  for (const { slot, idColumn } of slots) {
+  for (const { slot, idColumn, nameColumn } of slots) {
     const modelId = String(row[idColumn]);
     if (index.names.has(modelId)) continue;
+    // 给人看的名词优先用绑定里存的调用名（用户就认得这个名字），**模型 id 是 UUID**（LiteLLM
+    // 主键）只当排障引用放在括号里；details 两个都给（前端文案要名字，日志/运维要 id）。
+    const boundName = typeof row[nameColumn] === 'string' ? row[nameColumn].trim() : '';
     throw new LlmError(
       'llm_model_not_found',
-      `绑定的${SLOT_LABELS[slot] ?? slot}在 LLM 网关里已不存在（模型 id ${modelId}）：请到管理台 /admin 重新选模型后再发送（无权限请联系管理员）`,
+      `绑定的${SLOT_LABELS[slot] ?? slot}${boundName ? `「${boundName}」` : ''}在 LLM 网关里已不存在（模型 id ${modelId}）：请到管理台 /admin 重新选模型后再发送（无权限请联系管理员）`,
       {
         httpStatus: 409,
-        details: { slot, model_id: modelId },
+        details: { slot, model_id: modelId, ...(boundName ? { model_name: boundName } : {}) },
         // 「管理员改配后可重试」：本预检零副作用且不写幂等台账，同 key 原样重试能重新占位（§1.4）；
         // 但盲目立即重试仍是同一码——解法只有一个（改配）。
         retryable: true,

@@ -832,7 +832,7 @@ export const en = {
     sendFailedLlmNotConfigured:
       'Send failed: this FDE has no LLM upstream configured. Set it up in the admin console at /admin (contact your administrator if you lack access)',
     sendFailedLlmModelNotFound:
-      'Send failed: the model this FDE is bound to no longer exists in the LLM gateway (slot {slot}, model id {model_id}). Re-select the model in the admin console at /admin and send again (contact your administrator if you lack access)',
+      'Send failed: the model this FDE is bound to no longer exists in the LLM gateway (slot {slot}, model {model}). Re-select the model in the admin console at /admin and send again (contact your administrator if you lack access)',
     runInProgress: ' (a run is already in progress)',
     treeLoadFailed: 'Failed to load the directory tree: {message}',
     // issue #107：inline rename — blank title blocked locally / hint when the PATCH fails (old title restored)

@@ -508,8 +508,14 @@ onMounted(() => {
     </div>
     <form data-test="add-model-form" class="grid gap-3 px-3 py-3 sm:grid-cols-2" @submit.prevent="onAddModel">
       <label class="flex flex-col gap-1 text-xs text-black/55">
-        model_id
-        <input v-model="modelForm.model_id" required placeholder="gpt-4o" class="rounded-md border border-black/20 px-2 py-1 text-sm">
+        {{ t('admin.llm.colCallName') }}
+        <input
+          v-model="modelForm.model_id"
+          data-test="add-model-call-name"
+          required
+          placeholder="gpt-4o"
+          class="rounded-md border border-black/20 px-2 py-1 text-sm"
+        >
       </label>
       <label class="flex flex-col gap-1 text-xs text-black/55">
         {{ t('admin.llm.upstreamModelId') }}

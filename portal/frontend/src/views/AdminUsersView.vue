@@ -4,7 +4,8 @@ import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
 import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
-import { useAdminStore, type AdminUser, type LlmModel, type LlmProvider } from '../stores/admin';
+import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider } from '../stores/admin';
+import { modelOptionLabel } from '../lib/modelLabel';
 import { useAuthStore } from '../stores/auth';
 
 const { t, locale } = useI18n();
@@ -789,7 +790,7 @@ onBeforeUnmount(() => {
           >
             <option disabled value="">{{ t('admin.fde.selectLlmMainModel') }}</option>
             <option v-for="model in newMainModelOptions" :key="model.id" :value="model.id">
-              {{ model.model_id }} — {{ model.name }}
+              {{ modelOptionLabel(model) }}
             </option>
           </select>
         </label>
@@ -803,7 +804,7 @@ onBeforeUnmount(() => {
           >
             <option value="">{{ t('admin.fde.llmModelNotConfigured') }}</option>
             <option v-for="model in newEmbeddingModelOptions" :key="model.id" :value="model.id">
-              {{ model.model_id }} — {{ model.name }}
+              {{ modelOptionLabel(model) }}
             </option>
           </select>
         </label>
@@ -817,7 +818,7 @@ onBeforeUnmount(() => {
           >
             <option value="">{{ t('admin.fde.llmModelNotConfigured') }}</option>
             <option v-for="model in newVisionModelOptions" :key="model.id" :value="model.id">
-              {{ model.model_id }} — {{ model.name }}
+              {{ modelOptionLabel(model) }}
             </option>
           </select>
         </label>
