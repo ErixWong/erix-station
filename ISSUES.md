@@ -506,54 +506,59 @@ preview-ports 观测附取/降级 2 例、migrations 0022 锚点 1 例、前端 
 - **#346 / #348 / #321 残留**：需产品决策。
 - **上游 [erix-agent #467](https://github.com/ErixWong/erix-agent/issues/467)**（本站 2026-10-25 登记，决策 = **暂不改代码**）：`judge_done` 停机不走强制收尾（`termination.js:529` reason 白名单缺它）⇒ 模型末轮只出 reasoning、零正文时**终局静默**，时间线最后一条是评审卡。真机 **6/90**（全站 `judge_done`）/ **1/6**（登记现场那个会话）。修法是白名单加一项，`hasFinalDraft()` 自带豁免 ⇒ 只在该掏的 6 次掏一次 `tools: []` 的文本请求（同路 `max_rounds_cap` 6/6 实测产出 1.1–2.3K 字正文）；**等下一次 runner 镜像批次顺路带走**，不为它单独重建五台容器。复算锚点：会话 `14dd6202-1471-44f9-b492-ce88c7e35f30` / run `040b2f7e…` / `run_events.seq` 28722→28725。**同单另一问需产品决策**：评审理由原文写着「仅剩提交动作」仍交 `done=true / conf=0.85` 过硬停门——比静默更伤（没干完还被判干完）。
 
-### 📋 未关闭 issue 分层（2026-10-27，27 个 open 全量过一遍）
+### 📋 未关闭 issue 分层（2026-10-30 刷新，27 个 open 全量过一遍）
 
-> 判据不是「issue 还 open」而是**代码/部署/数据三层分别在哪**。取证方式：`git log v0.1.30..HEAD` 里的 issue 引用 +
-> `AGENTS.md` 各小节覆盖 + 关键实现 grep（本节每条都点到了具体文件/提交/小节）。**结论先说：真正需要写代码的只有 6 条**，
-> 其余是「已交付待关」「产品决策」「上游阻塞」「陈旧」。
+> 判据不是「issue 还 open」，而是**代码 / 部署 / 数据三层分别在哪**。取证 = `git log` 里的 issue 引用 +
+> `AGENTS.md` 小节覆盖 + 关键实现 grep（每条都点到文件或提交）。
+> ⚠ **别用「open 数」当进度**：10-27 到 10-30 之间 open 数一直是 27，但组成换了——**#421、#399 已关**，
+> 同时新开 **#434、#426**。
+> ⚠ **也别用提交标题认领交付**：`4c8408a` 的 subject 写着 `feat(#387)`，正文自己说「issue 错号」——
+> 它实际是 #425 的**状态条**单，#387（查看原文的 resultPreview）**没做**。判据看文件，不看标题。
 
 #### A. 代码已落 ⇒ 只需一次收尾动作（可关）
 
 | issue | 依据 | 关它需要什么 |
 |---|---|---|
-| **#404** containers.image / agent_version 不回写 | §8.69（三条写路径 + 409 幂等）+ §8.70（`runner/lib/build-info.js`、心跳回写 `portal/src/internal.js` 的 `agent_version` 均已在 main）；结案评论已实测现网自动改写 | 只剩「谁读这一列」的**消费面**（§8.70 明说本片不做）⇒ 关它并把消费面另开一单，或标 not planned |
-| **#366** 文件预览定稿（kkFileView） | PR #372 merged（`aaf8294`）、§8.57；`deploy/docker-compose.yml` 的 `kkfileview` 服务在册 | 遗留 ① kk 镜像 push GHCR + digest 钉 ② 发版窗口；本机 v0.1.43 **未启用该 profile** ⇒ 部署面未验。建议：关 #366（方案已落），部署验收另开 ops 单 |
-| **#356** 自托管 kkFileView | 被 #366 取代并已实现 | 直接关（注明 superseded by #366） |
-| **#359** 目录 git 一颗灯 | §8.53（告知面）/ §8.54（`GET /api/git-light` 已在 `portal/src/http.js`）/ §8.55（portal 镜像装 git）/ §8.56（灯上界面） | P0a/P0b/P0c 全交付；剩下的是「每天绿」的产品习惯与 P1 项 ⇒ 关它，P1 另开 |
-| **#392** 长会话压缩退化成静默硬删 | §8.65（`context.strategy` 已配，`runner/worker.js` 有 `strategy:`）/ §8.66 C 片 / §8.67 E 片（含当场抓到的死光纤）/ §8.68 D 片 | A/C/D/E 四片都在 ⇒ 关它 |
-| **#412** wp3b 在部署机跑不起来 | ④ 已交付（§8.71）；其余子项（worktree 缺 `deploy/.env`、物化目录 EACCES、proxy bind source realpath）**未见对应提交** | 部分交付：关④子项，把剩下三项拆成独立单（否则这张单永远「半开」） |
-| **#371** 接住 0.25.0 落盘面 | A（`persistence_error{fatal:false}`）/ B（`MAX_ROUND_BYTES` env）/ E（归档去重命中性）已交付（§8.59/§8.60）；0.25.0 已升 pin（§8.60） | 剩 **C**（`record` + `folded_payload` 双列存储去重）与巡检改写 ⇒ 部分，建议拆单 |
-| **#367** 存量链式 `partOf` 修数据 | **本机 0 行**（§1.1 巡检）、点名的会话 `9e0c8a17…` 本机 DB 不存在 ⇒ 是别台部署的存量；本机侧另加了第四种形状判据（手册 §7，2026-10-27 评论） | 只有**持有那份数据的那台部署**能关它；本机无事可做 |
+| **#404** containers.image / agent_version 不回写 | §8.69（三条写路径 + 409 幂等）+ §8.70（`runner/lib/build-info.js`、心跳回写 `agent_version`）+ 结案评论已实测现网自动改写 | 只剩「谁读这一列」的**消费面**（§8.70 明说不做）⇒ 关它，消费面另开或 not planned |
+| **#366** 文件预览定稿（kkFileView） | PR #372 merged（`aaf8294`）、§8.57；`deploy/docker-compose.yml` 的 `kkfileview` 服务在册 | 遗留：kk 镜像 push GHCR + digest 钉、发版窗口；本机 v0.1.43 **未启用该 profile** ⇒ 部署面未验。建议关 #366（方案已落），部署验收另开 ops 单 |
+| **#356** 自托管 kkFileView | 被 #366 取代并已实现 | 直接关（superseded by #366） |
+| **#359** 目录 git 一颗灯 | §8.53/§8.54（`GET /api/git-light` 在 `portal/src/http.js`）/§8.55/§8.56 | P0a/P0b/P0c 全交付 ⇒ 关它，P1 另开 |
+| **#392** 长会话压缩退化成静默硬删 | §8.65（`runner/worker.js` 已配 `strategy:`）/§8.66 C 片/§8.67 E 片/§8.68 D 片 | A/C/D/E 四片都在 ⇒ 关它 |
+| **#378** `node_modules` 被当符号链接提交 | `679519a`「解除对 node_modules 符号链接的跟踪（#396 仓库卫生）」+ 新增 `test/repo-hygiene.test.js` 常驻判据 | 代码已落、跟踪已解除（我今天 `npm ci` 后 `git status` 干净，不再出现 ` D node_modules`）⇒ 验一次新 clone 即可关 |
+| **#395** Git token 被静默删行（原处方已改判） | 由 **#399 → #411**（`988c896` 平台托管 git 凭据搬进 ro bind）覆盖 | 关它并注明 superseded by #399/#411 |
+| **#412** wp3b 在部署机跑不起来 | ④ 已交付（§8.71）；其余子项（worktree 缺 `deploy/.env`、物化目录 EACCES、proxy bind source realpath）**未见对应提交** | 部分交付 ⇒ 关④，剩三项拆独立单（否则永远「半开」） |
+| **#371** 接住 0.25.0 落盘面 | A/B/E 已交付（§8.59/§8.60），0.25.0 已升 pin | 剩 **C**（双列存储去重）+ 巡检改写 ⇒ 拆单 |
+| **#367** 存量链式 `partOf` 修数据 | **本机 0 行**（§1.1 巡检）、点名的会话本机 DB 不存在 ⇒ 别台存量；本机侧另加第四种形状判据（手册 §7） | 只有持有那份数据的部署能关 |
 
 #### B. 真待做（要写代码，按建议顺序）
 
 | issue | 为什么是真待做（取证） | 面 |
 |---|---|---|
-| **#421** 引擎 16 类事件里 5 类前端收不到 | 实测：`tool_input_delta` 在 `useEventStream.ts` 与 `http.js` 历史白名单里**都是 0 命中**；`model_metadata_missing` 历史有、实时没订（EVENT_TYPES 0 命中）；`round_start`/`persistence_error`/`attempt_killed` 已通 | 中（三处同步判据 + 历史回放） |
-| **#387** 「查看原文」工具只有「调了什么」没有「返回了什么」 | §8.62 记录实测 `resultPreview` **0/98**；主消息流靠 `tool_calls` join，重建路没配对 ⇒ 要动 `rebuildFoldedRange` | 中 |
-| **#399 / #395** Git 凭据文件一次 401 就被静默删行 | 无任何提交/小节覆盖；#395 已改判为 #399 的口径 | 中（安全） |
-| **#378** `node_modules` 被当符号链接提交（指向自己） | 无提交；**今晚我又踩了一次**（`npm ci` 后 `git status` 显示 ` D node_modules`，必须手动不提交） | 小（一次 `git rm --cached` + `.gitignore` + 判据） |
-| **#259** jail 只有项目根一个读边界 | 无提交；现状仍靠 shell 读 `~/AGENTS.md` / `~/.erix/ports.json`（#258 的告知面就是为此绕的） | 中（写边界不动，只加只读例外） |
-| **#233** 防火墙 P1 零实现（FDE→宿主端口未收紧） | 无提交；deploy-contract §4.4/§7.1 已选定方案 | 大（安全，需设计确认） |
+| **#434** 模型下拉把网关主键 UUID 摊到人看的界面 | 新开（10-28 后）；#296 双名定稿的延续，6 处（三下拉 + 两错误文案） | 小（纯前端 + 判据） |
+| **#387** 「查看原文」只有「调了什么」没有「返回了什么」 | §8.62 实测 `resultPreview` **0/98**；`portal/src/session-view.js` 里 `resultPreview` **只出现在注释**（未实现）⇒ 需在 `rebuildFoldedRange` 侧配对 `tool_result` | 中 |
+| **#259** jail 只有项目根一个读边界 | 无提交；现状仍靠 shell 读 `~/AGENTS.md` / `~/.erix/ports.json` | 中（写边界不动，只加只读例外） |
+| **#243** 终局可能是文本化工具调用（DSML） | 无提交；§8.15 曾「本轮未复现」⇒ 需先造复现再谈修 | 中（先取证） |
+| **#231** 文件工具迁上游遗留 | `SYSTEM_PROMPT` 已写 `edit`/`searchText`（§8.10）、`maskedPaths` 已注入（§8.9）⇒ 只剩三项确认项 | 小（逐项核后关） |
+| **#233** 防火墙 P1 零实现（FDE→宿主端口未收紧） | 无提交；deploy-contract §4.4/§7.1 已选方案 | 大（安全，需设计确认） |
 
 #### C. 产品决策阻塞（等拍，不是缺代码）
 
 - **#348** 单次 run 无 token/成本上限（#236 第 3 条拆出）。
 - **#346** 起跑前取消的消息留在会话里、下一个 run 当待办重做（取消语义）。
-- **#331** `ERIX_SESSION_AUTO_TITLE` 死光纤：撤掉下发表 vs 接回 portal（#322 之后 `runner/` 零读取）。
+- **#331** `ERIX_SESSION_AUTO_TITLE` 死光纤：撤下发表 vs 接回 portal（#322 之后 `runner/` 零读取）。
 
-#### D. 上游 / 版本阻塞（站内只能挂账）
+#### D. 上游 / 版本 / 外部阻塞
 
 - **#341** 引擎 0.26.0 只修**写侧**（`orchestrator.js` 锚定首片，点名 erix-agent #430）；**读侧 `parts.set` 仍恰好一处** ⇒ 存量链式行解不了 ⇒ 站内解链闸（`portal/src/transcript-fold.js` / `runner/lib/transcript-fold.js` + 哨兵）**必须留**。
-- **#303** 两处「一代回退」挂账：触发条件已改成「旧 transcript 行归档时」，**不是**「下次升 minor」；`?? tr.duration` 不许提前删。
+- **#303** 两处「一代回退」挂账：触发条件是「旧 transcript 行归档时」，**不是**「下次升 minor」；`?? tr.duration` 不许提前删。
+- **#426** 上游网关 `qwen3.8-flash-next` 的 `tool_calls` 参数流在嵌套 schema + args ≳ 某长度时截断（10-24 现场，散件已归档进仓）⇒ **不是本站代码**，属网关/上游；本站只能复现与绕行。
 
 #### E. 陈旧 / 载体已转移
 
-- **#274** SESSION HANDOFF 2026-10-13：已被后续 handoff 与 `AGENTS.md` 台账取代 ⇒ 可关（或改成一个「当前交接在哪」的指针）。
-- **#163** GitLab 上游能力：已裁决搁置（待实例）⇒ 关或标 not planned。
-- **#135** SSO/OIDC P2：阻塞于 IdP 事实（issuer/client 注册/group claim）⇒ 保持 open 但别当待办。
-- **#227 / #270**：e2e 隔离第二阶段（1–3 项已做，剩「单 test 粒度」；#270 的 `POOLS.large` 参数化是并行隔离的前提）⇒ 合并成一张「e2e 并行化」单更清晰。
-- **#231** 文件工具迁上游遗留：`SYSTEM_PROMPT` 已写 `edit`/`searchText`（§8.10）、`maskedPaths` 已注入（§8.9）⇒ 只剩三项确认项，需逐项核后再关。
+- **#274** SESSION HANDOFF 2026-10-13：已被后续 handoff 与 `AGENTS.md` 台账取代 ⇒ 关或改成「当前交接在哪」的指针。
+- **#163** GitLab 上游能力：已裁决搁置（待实例）⇒ 关或 not planned。
+- **#135** SSO/OIDC P2：阻塞于 IdP 事实 ⇒ 保持 open，但别当待办。
+- **#227 / #270**：e2e 隔离第二阶段（1–3 已做，剩「单 test 粒度」；#270 的 `POOLS.large` 参数化是并行隔离前提）⇒ 合并成一张「e2e 并行化」单更清晰。
 
 ### 刷新过的过期指针
 
