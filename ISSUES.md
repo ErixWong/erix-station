@@ -488,6 +488,9 @@ preview-ports 观测附取/降级 2 例、migrations 0022 锚点 1 例、前端 
 | **测试可移植性（新）** | ✅ `53191cd`：`runner/test/listeners.test.js` 的跳 UID 用例写死 fixture owner uid=1000，而实现故意「owner == 自身 uid 就切而不切」⇒ **在 uid=1000 的开发机上必然红**（CI 是 1001 所以看不见的）。改 `OTHER_UID` 后本机 **399/399**；三条变异各恰 1 条红 ⇒ 不是放宽断言 |
 | **#352** 按项目看端口占用 | ✅ **已关闭（观测层 B+）+ 发布物真机验收**：agentd 采样 `/proc` → U4 心跳 → `port_observations`（迁移 0022）→ `GET /api/me/ports` 每行加 `observed`（只做加法，原 8 列不动）。真机特意造了 **agentd=uid 1001 / 监听进程=uid 1000** 的跳 UID 形状 ⇒ `pid/cwd/branch/cmd` 全拿到（这条单测在 uid=1000 机上结构上测不到）；池外 3000 合成 `state='observed'` 只读行，而 Docker 内嵌 DNS（uid 0、无项目 cwd）**入库但不进面板**（按 `~/projects/` 过滤，设想的）；界面 `probe-351  Current` 分组排最前 + `Spare (9)` 折叠 + 「同目录同时候在 3000 与 22000」告警（截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`） |
 | **账本第四种砖化形状（新）** | ✅ **已定位 + 已修数据 + 两个会话真机复活**：`:resume` 载体裸重放「已在**别的轮**结清的 `tool_use`」⇒ 折叠救不了（造不出缺失的那条 `tool_result`）。判据与手术整节落 `docs/ops/transcript-ledger-inspection.md` **§7**（⚠ 判据必须**带轮**：按 id 查孤儿得「干净」假结论，按记录判在 0.23+ 上是 9 会话误报）。定性 = **历史化石**（两条载体 ts 是 10-08 / 10-15 旧引擎；0.26.0 现跑的 `:resume` 行不带 `messages`）。修前/修后都拿**引擎自己的校验器**判（`index 36` / `index 73` → PASS），真机两会话 `judge_done` |
+| **v0.1.44** | ✅ **已发布并部署**（`eaea3d8`；release `41018144161`；portal `646a1c65…`、fde `cd43ed63…`、proxy `df93027e…` 逐位核对；迁移 **0025** 自动应用；五台 `fde-*` 重建后 `station 0.1.44 / engine 0.26.0`）。载荷 = 积压的 21 个未发版提交 + #434 |
+| **#434** 模型下拉摊 UUID | ✅ **已交付 + 真机验收 + 关闭**（PR #435 合并 `f860302`；新增 `modelLabel.ts` 单一函数，6 处收口）。真机：三个下拉只剩 `deepseek-v4-pro` / `deepseek-flash`，**整页 UUID 命中 0**；409 文案变异 ⇒ `not ok 19` 红 |
+| **#429** 登出回收预览凭证 | ✅ **真机验收**：签票后 grant 带 `login_session_id` 血缘 → `logout 204` → 该 grant `revoked`。⚠ 已知边界：0025 之前签的存量 grant 无血缘 ⇒ 撤不掉 |
 | 基线刷新 | 根 **1656 / 1652 / 0 失败 / 4 跳过**、runner **399/399**、前端 **50 文件 / 925** + `typecheck` rc=0（台账原值 1493 / 221→323 / 47 文件 857 均过期）；台账 `AGENTS.md` §8.72 |
 | 8 | resume 必炸：写侧 `partOf` 写成链式，读侧只认首片行 | **#341** | **仍未修**（引擎侧 0.23；存量砖的 ops 修数据见 **#367**；复核记录 AGENTS ~§8.36/#351） |
 | 9 | 流式回复无打字机效果（前端 mutate raw 丢 Vue 响应性） | **#342** | **已修**（v0.1.26 真机验收：374 次采样画面增长 62 次、每 ~200ms 一跳；AGENTS §8.43） |
@@ -534,7 +537,6 @@ preview-ports 观测附取/降级 2 例、migrations 0022 锚点 1 例、前端 
 
 | issue | 为什么是真待做（取证） | 面 |
 |---|---|---|
-| **#434** 模型下拉把网关主键 UUID 摊到人看的界面 | 新开（10-28 后）；#296 双名定稿的延续，6 处（三下拉 + 两错误文案） | 小（纯前端 + 判据） |
 | **#387** 「查看原文」只有「调了什么」没有「返回了什么」 | §8.62 实测 `resultPreview` **0/98**；`portal/src/session-view.js` 里 `resultPreview` **只出现在注释**（未实现）⇒ 需在 `rebuildFoldedRange` 侧配对 `tool_result` | 中 |
 | **#259** jail 只有项目根一个读边界 | 无提交；现状仍靠 shell 读 `~/AGENTS.md` / `~/.erix/ports.json` | 中（写边界不动，只加只读例外） |
 | **#243** 终局可能是文本化工具调用（DSML） | 无提交；§8.15 曾「本轮未复现」⇒ 需先造复现再谈修 | 中（先取证） |
