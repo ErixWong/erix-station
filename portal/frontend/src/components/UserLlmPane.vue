@@ -8,6 +8,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api, ApiError } from '../api';
+import { modelOptionLabel } from '../lib/modelLabel';
 import { useAdminStore, type AdminUser, type GitHost, type LlmModel, type LlmProvider } from '../stores/admin';
 
 // issue #101 P3：pane 文案走 i18n（admin.llm.*）；服务端透传的 error.message 不译，
@@ -25,6 +26,8 @@ const props = defineProps<{
 // config.main/embedding/vision 各含 { model_id, ... }，api_key 为掩码）。
 interface SlotEcho {
   model_id?: string | null;
+  /** 数据面调用名（= fde_llm_bindings.*_model_name），后端 slot() 必给；不是展示名。 */
+  name?: string | null;
 }
 interface FdeLlmConfig {
   provider_id: string | null;
@@ -70,8 +73,11 @@ const mainOptions = computed(() => enabledModels.value.filter((m) => m.type === 
 const embeddingOptions = computed(() => enabledModels.value.filter((m) => m.type === 'embedding'));
 const visionOptions = computed(() => enabledModels.value.filter((m) => m.type === 'vision'));
 
+// 下拉标签一律走 modelOptionLabel（展示名 [+ 调用名]）：**不要**再拼 model_id——那是 LiteLLM
+// 主键 UUID，摊到界面上就是「920aa0c6-f336-… — deepseek-flash」这种读不得的东西。只管显示，
+// 提交/回填仍用主键 id。
 function modelOptionTitle(model: LlmModel) {
-  return `${model.model_id} — ${model.name}`;
+  return modelOptionLabel(model);
 }
 
 function selectedModelTitle(options: LlmModel[], id: string) {
@@ -143,7 +149,9 @@ async function submitLlm(force: boolean) {
       body: JSON.stringify(body),
     });
     cfg.value = r.config;
-    okMsg.value = t('admin.llm.saved', { model: r.config.main.model_id });
+    // 回显的 config.main.model_id 是 UUID，不能直接进文案：用刚选中的那个模型的标签。
+    const saved = mainOptions.value.find((m) => m.id === mainModelId.value);
+    okMsg.value = t('admin.llm.saved', { model: saved ? modelOptionLabel(saved) : (r.config.main.name ?? '') });
     errMsg.value = '';
     conflictMsg.value = ''; // 旧版成功即清空消息区（含 409 拒绝与强制按钮）
     showForce.value = false;

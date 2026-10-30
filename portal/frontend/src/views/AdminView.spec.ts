@@ -443,6 +443,10 @@ describe('AdminView · LLM 管理', () => {
     await wrapper.get('[data-test="open-add-model"]').trigger('click');
     const addForm = wrapper.get('[data-test="add-model-form"]');
     expect(addForm.findAll('input')[0].attributes('required')).toBeDefined();
+    // #296 口径：新增表单第一个字段是**调用名**，不得把内部字段名 `model_id` 直接标给人看
+    //（编辑表单已如此，见下方 `editForm.text()).not.toContain('model_id')`）。
+    expect(addForm.text()).not.toContain('model_id');
+    expect(addForm.find('[data-test="add-model-call-name"]').exists()).toBe(true);
     await addForm.findAll('input')[0].setValue('gpt-4o-mini');
     const addUpstreamModel = addForm.get('[data-test="add-model-upstream-id"]');
     expect(addUpstreamModel.attributes('required')).toBeDefined();
@@ -1045,6 +1049,9 @@ describe('AdminView · FDE 用户', () => {
     await form.get('[data-test="user-fde-name"]').setValue('carol');
     await form.get('[data-test="new-user-git-host"]').setValue('gh1');
     await form.get('[data-test="new-user-llm-provider"]').setValue('p1');
+    // 模型选项给人看的是「展示名 (调用名)」，不是主键 model_id（真实环境那是 LiteLLM 的 UUID）。
+    expect(form.get('[data-test="new-user-main-model"]').findAll('option').map((o) => o.text()))
+      .toEqual(['选择主模型', 'GPT-4o (gpt-4o)']);
     await form.get('[data-test="new-user-main-model"]').setValue('m1');
     await form.get('[data-test="user-totp-enabled"]').setValue(true);
     await form.trigger('submit.prevent');

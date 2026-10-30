@@ -18,15 +18,15 @@ const PROVIDERS = [
   {
     id: 'p1', name: 'openai', base_url: 'https://api.openai.com/v1',
     models: [
-      { id: 'm1', provider_id: 'p1', model_id: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true },
-      { id: 'm2', provider_id: 'p1', model_id: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: true },
-      { id: 'm3', provider_id: 'p1', model_id: 'claude-x', name: 'Claude X', type: 'text', tool_calling: false, context_window: null, enabled: true },
+      { id: 'm1', provider_id: 'p1', model_id: 'pk-m1', model_name: 'gpt-4o', name: 'GPT-4o', type: 'text', tool_calling: true, context_window: 128000, enabled: true },
+      { id: 'm2', provider_id: 'p1', model_id: 'pk-m2', model_name: 'text-embedding-3', name: 'Embedding 3', type: 'embedding', tool_calling: false, context_window: null, enabled: true },
+      { id: 'm3', provider_id: 'p1', model_id: 'pk-m3', model_name: 'claude-x', name: 'Claude X', type: 'text', tool_calling: false, context_window: null, enabled: true },
     ],
   },
   {
     id: 'p2', name: 'anthropic', base_url: 'https://api.anthropic.com',
     models: [
-      { id: 'm4', provider_id: 'p2', model_id: 'claude-sonnet', name: 'Sonnet', type: 'text', tool_calling: true, context_window: 200000, enabled: false },
+      { id: 'm4', provider_id: 'p2', model_id: 'pk-m4', model_name: 'claude-sonnet', name: 'Sonnet', type: 'text', tool_calling: true, context_window: 200000, enabled: false },
     ],
   },
 ] as LlmProvider[];
@@ -48,8 +48,8 @@ const GET_CONFIG = {
   config: {
     provider_id: 'p1',
     api_key: 'sk•••',
-    main: { model_id: 'gpt-4o' },
-    embedding: { model_id: 'text-embedding-3' },
+    main: { model_id: 'pk-m1', name: 'gpt-4o', type: 'text' },
+    embedding: { model_id: 'pk-m2', name: 'text-embedding-3', type: 'embedding' },
     vision: null,
   },
   active_run: true,
@@ -115,9 +115,12 @@ describe('UserLlmPane · LLM 配置表单', () => {
 
     // 主模型下拉：仅 text 且 tool_calling 的启用模型（m1 gpt-4o；m3 无 tool_calling 被过滤）
     const mainOpts = wrapper.find('[data-test="main-model"]').findAll('option');
-    expect(mainOpts.map((o) => o.text())).toEqual(['（不配置）', 'gpt-4o — GPT-4o']);
+    expect(mainOpts.map((o) => o.text())).toEqual(['（不配置）', 'GPT-4o (gpt-4o)']);
     expect((wrapper.find('[data-test="main-model"]').element as HTMLSelectElement).value).toBe('m1');
-    expect(wrapper.find('[data-test="main-model"]').attributes('title')).toBe('gpt-4o — GPT-4o');
+    expect(wrapper.find('[data-test="main-model"]').attributes('title')).toBe('GPT-4o (gpt-4o)');
+    // 回归：主键（model_id = LiteLLM model_info.id，真实环境是 UUID）不得出现在下拉文本/标题里。
+    expect(wrapper.find('[data-test="main-model"]').text()).not.toContain('pk-m1');
+    expect(wrapper.find('[data-test="embedding-model"]').text()).not.toContain('pk-m2');
     expect(wrapper.find('[data-test="main-model"]').classes()).toContain('truncate');
 
     // embedding 下拉回填 m2；vision 无可选项 → 不配置
@@ -136,13 +139,13 @@ describe('UserLlmPane · LLM 配置表单', () => {
   it('保存成功：不提交上游 key，展示保存状态和只读的虚拟 key 掩码', async () => {
     const { wrapper, fetchFn } = await mountPane((url, init) => {
       if (String(url).includes('/llm') && init?.method === 'PUT') {
-        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'gpt-4o' } } });
+        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'pk-m1', name: 'gpt-4o', type: 'text' } } });
       }
       return undefined;
     });
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    expect(wrapper.text()).toContain('已保存：主模型 gpt-4o');
+    expect(wrapper.text()).toContain('已保存：主模型 GPT-4o (gpt-4o)');
     expect(wrapper.find('[data-test="virtual-key"]').text()).toBe('当前虚拟 key：sk•••');
     expect(wrapper.find('input[type="password"]').exists()).toBe(false);
     const puts = putCalls(fetchFn);
@@ -163,7 +166,7 @@ describe('UserLlmPane · LLM 配置表单', () => {
             },
           });
         }
-        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'gpt-4o' } } });
+        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'pk-m1', name: 'gpt-4o', type: 'text' } } });
       }
       return undefined;
     });
@@ -185,7 +188,7 @@ describe('UserLlmPane · LLM 配置表单', () => {
     await flushPromises();
     const secondPut = putCalls(fetchFn)[1];
     expect(JSON.parse(String(secondPut[1]?.body)).force).toBe(true);
-    expect(wrapper.text()).toContain('已保存：主模型 gpt-4o');
+    expect(wrapper.text()).toContain('已保存：主模型 GPT-4o (gpt-4o)');
     expect(wrapper.find('[data-test="force-save"]').exists()).toBe(false);
   });
 
@@ -280,14 +283,14 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
       expect(wrapper.find(`[data-test="${sel}"]`).findAll('option')[0].text()).toBe('(not configured)');
     }
     expect(wrapper.find('[data-test="main-model"]').findAll('option').map((o) => o.text()))
-      .toEqual(['(not configured)', 'gpt-4o — GPT-4o']);
+      .toEqual(['(not configured)', 'GPT-4o (gpt-4o)']);
   });
 
   it('切 English：保存成功 / 409 拒绝 / provision 完成 / 错误前缀文案英文', async () => {
     // ① 保存成功；虚拟 key 在独立只读区域展示，不拼入保存状态文案。
     const { wrapper, fetchFn } = await mountPane((url, init) => {
       if (String(url).includes('/llm') && init?.method === 'PUT') {
-        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'gpt-4o' } } });
+        return jsonResponse(200, { config: { provider_id: 'p1', api_key: 'sk•••', main: { model_id: 'pk-m1', name: 'gpt-4o', type: 'text' } } });
       }
       if (String(url).includes('/provision') && init?.method === 'POST') {
         return jsonResponse(200, { fde: 'alice', network: 'fde-alice', subnet: '10.0.0.0/29', container: 'fde-alice' });
@@ -299,7 +302,7 @@ describe('UserLlmPane · 语言切换（issue #101 P3）', () => {
 
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    expect(wrapper.text()).toContain('Saved: main model gpt-4o');
+    expect(wrapper.text()).toContain('Saved: main model GPT-4o (gpt-4o)');
     expect(wrapper.find('[data-test="virtual-key"]').text()).toContain('Current virtual key:');
     expect(wrapper.find('[data-test="virtual-key"]').text()).toContain('sk•••');
 
