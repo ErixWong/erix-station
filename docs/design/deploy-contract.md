@@ -237,7 +237,7 @@
 
 - `CONTAINERS`：FDE 容器生命周期（create/start/stop/rm/inspect/ps）——portal 核心职责。
 - `NETWORKS`：FDE 网络生命周期（`network create --subnet` / inspect / ls / rm），onboarding/offboarding。
-- **删除 `VOLUMES`**：portal 用 **bind mount** 而非 docker volume（user-space §2.2 的四条宿主路径），不需要 `VOLUMES` API（`inspect/ls` 卷观察无必要、且多一个被攻破后可枚举宿主卷的面）。
+- **删除 `VOLUMES`**：portal 用 **bind mount** 而非 docker volume（user-space §2.2 的四条 rw 宿主路径 + #399 的一条 ro 凭据源），不需要 `VOLUMES` API（`inspect/ls` 卷观察无必要、且多一个被攻破后可枚举宿主卷的面）。
 - **不授 `IMAGES`**：FDE 镜像由宿主部署时预拉取（§1），portal 不需要、也不应能拉任意镜像（防被攻破后拉恶意镜像）。
 - **不授 `EXEC`**：portal 被攻破后 `docker exec` 进任意容器 = 跨信任边界提权（违反不变式一）。
 - **不授 `SYSTEM`/`AUTH`/`SECRETS`**：防读宿主 docker 配置/凭据/secret。
@@ -247,7 +247,7 @@
 >
 > - **镜像**：只允许**预拉取/本地 build 的 `FDE_IMAGE` 不可变引用**（issue #27 双轨两形态：① `image@sha256:…`；② `sha256:<imageId>`，env §10）；拒绝任何 tag-only / 其它镜像 / `image` 为空。
 > - **网络**：只允许 `fde-<name>`（本 FDE 的网络名，与 `fde_networks.network_name` 一致）；拒绝 `backend` / `host` / `bridge` / 其它网络名。
-> - **bind mount**：白名单 = `USER_SPACE_ROOT/<fde>/{home,projects,worktrees,cache}` 四条宿主源（user-space §2.4 / §6.4）；拒绝其它宿主路径（尤其 `/var/run/docker.sock`、`/docker/**`、`/`）。
+> - **bind mount**：白名单 = `USER_SPACE_ROOT/<fde>/{home,projects,worktrees,cache}` 四条 rw 宿主源 + **一条只读源** `USER_SPACE_ROOT/<fde>/platform/git → /run/erix/git:ro`（#399 平台托管凭据；dest 固定、mode 必须 `ro`、源必须以 `platform/git` 结尾，三条任一不满足即 403）（user-space §2.4 / §6.4）；拒绝其它宿主路径（尤其 `/var/run/docker.sock`、`/docker/**`、`/`）。
 > - **禁止项（硬拒绝）**：`--privileged`、`--pid=host`、`--network=host`、`--device`、`--cap-add` 超出 §6.2 白名单、`--security-opt` 以外的任意 security 选项、`--publish`（`-p`）。
 > - **`--ip`**：只允许该 FDE `/29`（或 `/28`）内的固定位（`.2`）；其它 IP 拒绝。
 >
@@ -312,6 +312,7 @@
 | `/srv/erix/users/<fde>/projects` | `/home/<user>/projects` | `erix`(1000) |
 | `/srv/erix/users/<fde>/worktrees` | `/home/<user>/worktrees` | `erix`(1000) |
 | `/srv/erix/users/<fde>/cache` | `/home/<user>/cache` | `erix`(1000) |
+| `/srv/erix/users/<fde>/platform/git`（**`:ro`**，#399） | `/run/erix/git` | portal(root)，目录 `0755`/文件 `0644` |
 
 > 平台文件（`config.json`/`ports.json`/`AGENTS.md`/`manifest.json`）由 portal（materializer）以 root 直写宿主 bind mount（tmp+fsync+rename 原子替换），属主 root:root、模式 `0644`/`0444`，容器只读（防误改，非安全边界）——完整契约见 user-space §4/§5/§6。
 

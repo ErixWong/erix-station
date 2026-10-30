@@ -457,3 +457,48 @@ test('env 白名单：ERIX_SESSION_AUTO_TITLE 放行（issue #88 修订，worker
   const denied = okBody({ Env: ['ERIX_STATION_TOKEN=t', 'ERIX_FDE_NAME=alice', 'ERIX_SESSION_AUTO_TITLE_NOT_A_KEY=1'] });
   assert.ok(validateCreateBody(denied, CFG).some((r) => r.includes('Env key not allowed')), '未知键仍 deny-by-default');
 });
+
+// ---------------------------------------------------------------------------
+// issue #399：平台凭据 ro bind（<fde>/platform/git → /run/erix/git:ro）的形状锁
+// ---------------------------------------------------------------------------
+
+test('#399 平台凭据 ro bind：正确形状放行', () => {
+  const body = okBody({
+    HostConfig: {
+      ...okBody().HostConfig,
+      Binds: [
+        '/srv/erix/users/alice/home:/home/erix',
+        '/srv/erix/users/alice/projects:/home/erix/projects',
+        '/srv/erix/users/alice/cache:/home/erix/cache',
+        '/srv/erix/users/alice/platform/git:/run/erix/git:ro',
+      ],
+    },
+  });
+  assert.deepEqual(validateCreateBody(body, CFG), []);
+});
+
+test('#399 平台凭据 bind 偏路全拒：rw / 越界源 / home 里的 ro / 别的 dest', () => {
+  const withBinds = (binds) => okBody({ HostConfig: { ...okBody().HostConfig, Binds: binds } });
+  const cases = [
+    // 平台凭据挂成 rw（erase 又活了）
+    ['/srv/erix/users/alice/platform/git:/run/erix/git:rw', /platform git bind/],
+    ['/srv/erix/users/alice/platform/git:/run/erix/git', /platform git bind/],
+    // 源不对：借 ro 往 home 外挂任意 userspace 子目录 / 假 platform 路径
+    ['/srv/erix/users/alice/home:/run/erix/git:ro', /platform git bind source/],
+    ['/srv/erix/users/alice/platform/git/credentials:/run/erix/git:ro', /platform git bind source/],
+    // 别的容器内 ro（dest 不在 home）
+    ['/srv/erix/users/alice/platform/git:/mnt/creds:ro', /bind mode must be/],
+  ];
+  for (const [bind, re] of cases) {
+    const reasons = validateCreateBody(withBinds([bind]), CFG);
+    assert.ok(reasons.some((r) => re.test(r)), `${bind} 应被拒（期望 ${re}，实际 ${JSON.stringify(reasons)}）`);
+  }
+});
+
+test('#399 平台凭据 bind 的 source 仍过 USERSPACE_ROOT 白名单（借形状越狱也不行）', () => {
+  const body = okBody({
+    HostConfig: { ...okBody().HostConfig, Binds: ['/etc/erix/platform/git:/run/erix/git:ro'] },
+  });
+  const reasons = validateCreateBody(body, CFG);
+  assert.ok(reasons.some((r) => r.includes('not under USERSPACE_ROOT')), JSON.stringify(reasons));
+});

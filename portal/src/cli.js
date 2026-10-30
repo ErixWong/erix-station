@@ -20,6 +20,7 @@ import {
   reconcileOnce,
   startProvisionerLoop,
 } from './provisioner.js';
+import { migrateLegacyCredential } from './git-credential.js';
 
 function usage() {
   // eslint-disable-next-line no-console
@@ -30,6 +31,7 @@ function usage() {
       '  cli.js bootstrap-admin --login <name> [--password <pw>] [--display-name <name>] [--allow-extra] [--print-secret]\n' +
       '  cli.js provision-fde --fde-name <name>\n' +
       '  cli.js deprovision-fde --fde-name <name>\n' +
+      '  cli.js migrate-git-credentials [--fde-name <name>]\n' +
       '  cli.js healthcheck',
   );
 }
@@ -224,6 +226,51 @@ async function runProvisionFde(values) {
   }
 }
 
+/**
+ * issue #399：存量搬运——把 minted FDE 留在 legacy home/.git-credentials 里的平台托管行
+ * 搬进平台独占文件（token 不变、agent 无感）。缺省扫全部 minted FDE；--fde-name 限定单台。
+ * 幂等：legacy 没有该行则迁 0；重跑安全。
+ */
+async function runMigrateGitCredentials(values) {
+  const config = loadConfig();
+  const pool = createPool(config.databaseUrl);
+  let failed = false;
+  try {
+    const rows = (await pool.query(
+      `SELECT u.fde_name, h.base_url
+         FROM fde_git_accounts a
+         JOIN users u ON u.id = a.fde_id
+         JOIN git_hosts h ON h.id = a.git_host_id
+        WHERE h.mode = 'minted' AND ($1::text IS NULL OR u.fde_name = $1) AND u.fde_name IS NOT NULL`,
+      [values['fde-name'] ?? null],
+    )).rows;
+    let migrated = 0;
+    for (const row of rows) {
+      let host;
+      try {
+        host = new URL(row.base_url).host.toLowerCase();
+      } catch {
+        continue;
+      }
+      try {
+        const n = migrateLegacyCredential({ config, fdeName: row.fde_name, host });
+        migrated += n;
+        // eslint-disable-next-line no-console
+        console.log(`[migrate-git-credentials] ${row.fde_name} ${host}: ${n > 0 ? `moved ${n} line(s)` : 'nothing to move'}`);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[migrate-git-credentials] ${row.fde_name} ${host}: FAILED ${err.message}`);
+        failed = true;
+      }
+    }
+    // eslint-disable-next-line no-console
+    console.log(`[migrate-git-credentials] done: scanned=${rows.length} migrated_lines=${migrated}`);
+    if (failed) process.exitCode = 1;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+
 async function runDeprovisionFde(values) {
   const fdeName = values['fde-name'];
   if (!fdeName) {
@@ -303,6 +350,8 @@ async function main() {
       return runProvisionFde(values);
     case 'deprovision-fde':
       return runDeprovisionFde(values);
+    case 'migrate-git-credentials':
+      return runMigrateGitCredentials(values);
     case 'healthcheck':
       return healthcheck();
     default:

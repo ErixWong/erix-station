@@ -34,6 +34,8 @@ import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
+import { engineDiagnosticNotice } from './lib/engine-notices.js';
+import { assertCompactContext } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope } from './lib/termination.js';
@@ -88,7 +90,14 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 3. 收尾回复只写简短摘要：做了什么、写入/修改了哪些文件、如何运行与验证；不要在回复里粘贴代码全文或大段文件内容。
 4. 若任务只是问答或解释、不产生交付物，直接回答即可，无需写文件。
 5. 交付前尽量用 shell 工具运行验证命令（构建/测试/lint），跑通再交付；命令在容器内执行，不要改动项目目录之外的状态。
-6. 始终使用用户消息所用的语言进行回复与会话摘要；用户消息是英文就用英文，中文就用中文。`;
+6. 始终使用用户消息所用的语言进行回复与会话摘要；用户消息是英文就用英文，中文就用中文。
+
+过程播报（用户看不见你的内部动作，只看得见你写的字）：
+1. 收到任务后**先回一句**再动手：用一两句说清你理解到的目标与第一步要查什么。这句话之后的工具调用不会有人知道你在干什么——只有正文会显示给用户。
+2. 每完成一个阶段（定位到问题 / 改完一个文件 / 跑完一次测试 / 服务起来了）就用一两句说结果与下一步。连续多次工具调用之间不让用户看到任何字，他就不知道你是在干活还是已经死了。
+3. 只在**真的需要他参与**时提问：需求有歧义、要他在几个方案里拍板、缺了他才有的信息（密码、外部地址、预期行为）。工具报错、目录不存在、依赖没装——这些是你自己的活，不要拿它们打断用户。
+4. 预计要跑比较久的命令（安装依赖、构建、跑测试、起 dev server）先把要做什么说出来，跑完再报结果；失败也要说清楚失败在哪一步、你接下来怎么绕过，不要把失败咽下去只给一个成功收尾。
+5. 播报是**进度**不是报告：一句话就够，不要为了播报而反复读同一个文件、也不要把它写成第二段交付摘要。`;
 
 const nextReqId = createReqIdGenerator();
 let runStart = null;
@@ -195,7 +204,7 @@ function emitEvent(type, payload) {
  * 要钉 `duration_ms` 的取值口径：新记录读 `erix.durationMs`、老记录回退顶层 `duration`、
  * 两者都缺⇒ `null`，**绝不伪装成 0**）；worker 自身调用方式不变。
  */
-export function loopEventPayload(event) {
+export function loopEventPayload(event, meta = {}) {
   switch (event?.type) {
     case 'round_start':
       return { round: event.round };
@@ -205,8 +214,22 @@ export function loopEventPayload(event) {
       return { round: event.round, attempt: event.attempt, maxAttempts: event.maxAttempts };
     case 'recovered':
       return { round: event.round, attempt: event.attempt };
-    case 'usage':
-      return { round: event.round, usage: event.usage };
+    case 'usage': {
+      // issue #425：`usage` 是**单次 provider 调用**的用量，此前被 `onEvent` 整条丢掉（见下方注释），
+      // 界面上「上下文占了多少 / 这一轮烧了多少」因此永远拿不到真值。现在放行展示，
+      // **记账仍然只认 U2 终态载荷**（§7.3/§6.3-6 的口径没动，只是不再拿「不记账」当「不显示」）。
+      // `context_window` 是**宿主侧 additive 字段**（引擎事件里没有，来自 RUN_START 下行的模型元数据，
+      // 与喂给引擎 `modelMetadata.contextWindowTokens` 的是同一个数，§6.3-2/#309）——没配就是没有，
+      // **不补 0**：前端据此整段不出，而不是画一个「0% / 0 上限」的假进度条。
+      const payload = { round: event.round, usage: event.usage };
+      // ⚠ 形状判据用 `isSafeInteger` 而不是 `isFinite`：与 #316 入口（`parseHeartbeatModels`）以及
+      // `lib/llm-models.js` 规则 3 同一口径。小数（1.5）与字符串（"262144"）在那个入口已被丢掉，
+      // 但本函数是导出的公共面（单测/未来调用方），不得靠「上游刚好洗过」来保证形状。
+      if (Number.isSafeInteger(meta.contextWindow) && meta.contextWindow > 0) {
+        payload.context_window = meta.contextWindow;
+      }
+      return payload;
+    }
     case 'tool_use':
       return {
         tool_call_id: event.toolUse?.id ?? null,
@@ -293,6 +316,46 @@ export function loopEventPayload(event) {
     default:
       return event ?? {};
   }
+}
+
+// issue #469 宿主侧后续（A2）：从 `CompactionStat.foldSummary` 里推出「这次摘要是不是次品」。
+// 字段本体是 erix-agent #482/#487/#490/#491 加的（**仅 fold-llm 会产生**：`fold-statistical` 下
+// 这些键全缺席，这是契约不是 bug），所以本函数在 0.26.0 + 本站现策略下永远返回 `null`，
+// 它是为切到 `fold-llm` 那天预先接好的嘴。`degradeKind`（#487）比 `degradeReason`（#482）新且短，
+// 所以优先读 kind，只读 kind 拿不到时才退回 reason（老版本引擎）。
+/**
+ * @param {object|undefined} compaction `LoopEvent.compaction`（即 `CompactionStat`）
+ * @returns {string|null} 人可读的一行告警；没降级/没超预算时 `null`
+ */
+export function foldDegradeNotice(compaction) {
+  const stat = compaction?.foldSummary;
+  if (!stat || typeof stat !== 'object') return null;
+  const parts = [];
+  const kind = typeof stat.degradeKind === 'string' && stat.degradeKind !== ''
+    ? stat.degradeKind
+    : (stat.degraded === true && typeof stat.degradeReason === 'string' && stat.degradeReason !== ''
+      ? // #491 之后 `degradeReason` 是**整句**（给人读的），进日志可以但不能无限长
+        stat.degradeReason.slice(0, 200)
+      : null);
+  if (kind) parts.push(`degraded=${kind}`);
+  // 以下每一个键名都必须能在上游契约的 `foldSummary` 字段面里找到（K12 钉这条对账）。
+  // 前例：本函数曾读过一个 `foldSummary.unshrinkable`——**引擎从不发这个键**（契约与 `src/`
+  // 全文 grep 零命中），它是本站按记忆造的形状，后果不是报错而是永不触发：一条永不响的告警。
+  //
+  // `budgetExhausted`（契约 #469①②③）：整条摘要步骤的剩余预算不足 2 秒 ⇒ 连「换更短输入
+  // 自愈重试」都没发生。不记就会「只折了一半就继续」而没人知道原因。
+  if (stat.budgetExhausted === true) parts.push('budget_exhausted (no self-heal retry: <2s left)');
+  // 输入面被裁：48 KB 按整轮裁（`inputTruncated` / `droppedRounds`）与 token 守卫逐条裁
+  // （`droppedMessages`）是两层不同的守卫，两个都是「摘要是基于不完整材料写成的」这个事实。
+  const clipped = stat.inputTruncated === true
+    || (Number.isSafeInteger(stat.droppedRounds) && stat.droppedRounds > 0)
+    || (Number.isSafeInteger(stat.droppedMessages) && stat.droppedMessages > 0);
+  if (clipped) parts.push(`input clipped (rounds=${stat.droppedRounds ?? 0} messages=${stat.droppedMessages ?? 0})`);
+  if (stat.finishReason === 'max_tokens') parts.push('summary truncated at max output tokens');
+  if (parts.length === 0) return null;
+  const strategy = typeof compaction?.strategyName === 'string' && compaction.strategyName !== ''
+    ? compaction.strategyName : '?';
+  return `fold summary weak: strategy=${strategy} foldedRounds=${compaction?.foldedRounds ?? '?'} ${parts.join(' ')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -590,9 +653,13 @@ async function startRun(msg) {
       //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
       //     「provider 默认」变成我们那个数（**变严**，不是变松）；
       //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
-      //   - fold-llm 压缩 summarizer 也继承 maxTokens（:1175）——但**只有真选了 `fold-llm` 才成立**：
-      //     本站自 #392 起显式选 `fold-statistical`（零 LLM，见下面 `#392:context-strategy` 标记段），
-      //     超预算时也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
+      //   - fold-llm 压缩 summarizer 也继承 maxTokens（0.26.0 `orchestrator.js:1175`）——但**只有
+      //     真选了 `fold-llm` 才成立**：本站自 #392 起显式选 `fold-statistical`（零 LLM），超预算时
+      //     也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
+      //     ⚠ **pin 到 0.27.0 之后这条会变**：erix-agent #493 把摘要的 maxTokens 改成
+      //     `min(宿主 maxTokens, context.maxSummaryTokens ?? 1400)` ⇒ 本站那个按窗口算出来的
+      //     `max_output_tokens` 在摘要这条路上不再说了算（上限 32 768 → 1 400，方向是**变严**）。
+      //     届时重跑一遍本项口径再下结论（本站已真机验过 `maxSummaryTokens` 直连路径生效）。
       /* #309:engine-model-params:start */
       ...(engineModelMetadata ? {
         modelMetadata: {
@@ -627,19 +694,51 @@ async function startRun(msg) {
       //      白名单里（`:3090-3097` 那六个键）⇒ 传了没任何人读 = #331 那根「没人读的光纤」。
       //      真要用它只能改对象形态 `createFoldStatisticalStrategy({ keepRounds })`（包根
       //      `index.js:41` 有导出）。判据钉在 `runner/test/fold-strategy.test.js`，见该文件注释。
-      //   ③ **不选 `fold-llm`**：真机 39.9 s 同步阻塞在轮与轮之间、最大一次喂进 261345 token
-      //      撞 262144 窗口 → 400 后静默降级，而它无超时 / 无输入上限 / 从不看 finish_reason
-      //      （erix-agent#469 未修）⇒ 那张单落地之前不提。
+      //      ⚠ 上面那句在 0.26.0 成立；erix-agent #485 之后 `context.keepRounds` 会被读（作为
+      //      `foldedRoundRange.from` 的退回口径），但本站仍不传——要真用它得改成对象形态。
+      //   ③ **不选 `fold-llm`**——本站的闸门，不是一句「未修」。**erix-agent #469 已关单**（六张
+      //      PR：#482 超时不吞 / #487 死线与不泄 ProviderError / #488 四个上限 / #489 跨 run 不
+      //      重复烧钱 / #490 默认摘要预算 1400 / #493 白名单），真机逐项验过。本站**仍留在
+      //      `fold-statistical`**，前置三件缺一不可：① 上述 PR 随 **0.27.0** 真发版（npm 最新
+      //      仍是 0.26.0，只认版本号不认 git SHA）；② pin 完在**隔离实例**跑真长会话，看
+      //      `foldSummary.degradeKind` / `finishReason` / 摘要字节数 / 横幅三件都是活的；
+      //      ③ 量住「每轮多花多少时间」与「每次多嗂多少字节」两项，量完才能说「可接受」。
+      //      本行不是「开关」，改它同时得改 `runner/test/fold-strategy.test.js` 的判据。
       // 不给 env 旋钮：策略名不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
+      // ⚠ `assertCompactContext` 不是装饰：本站走**直连** `runToolLoop`，上游 #488/#493 的装配期
+      //   校验（未知子键抛错、旋钮值必须正整数）**一次也不会触发**。真链路实测：
+      //   `{ strategy:'fold-llm', summarizerTimeout:5000, maxSummaryTokens:'abc' }` 在引擎里一路
+      //   `end_turn`，不报错不事件 ⇒ 键名拼错就是静默用默认值。抛在这里 = 走 #212 失败信封
+      //   （有 `RUN_FINISHED failed` + 人能读的 reason），比静默跑默认或 exit 1 无终态都好看。
       /* #392:context-strategy:start */
-      context: {
+      context: assertCompactContext({
         strategy: 'fold-statistical',
-      },
+      }),
       /* #392:context-strategy:end */
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
+      // issue #425：**不再丢弃 `usage`**（旧代码在这里 `return`，理由是「双源去重」——但去重针对的是
+      // **记账**，而记账本就只走 U2 织态载荷（§7.3-6：「onEvent 的 usage 类事件仅实时展示、不产生第二条
+      // 记账」）。旧写法把「不记账」做成了「不显示」，于是用户界面上除了织态那一行永远看不到任何
+      // token 数字，「上下文到底吃了多少」只能猜。现在按 §7.3-6 的原意放行：只展示，不记账。
       onEvent: (event) => {
-        if (event?.type === 'usage') return; // 双源去重：记账以返回值 usage 为准（§7.3/§6.3-6）
-        emitEvent(event.type, loopEventPayload(event));
+        // issue #469 宿主侧后续（A2）：折叠摘要「产出了，但是次品」在引擎侧是**故意静默**的
+        // （erix-agent#469 裁定一：降级只进 `CompactionStat.foldSummary`，不新增事件类型）。
+        // 本站必须接出一条人看得见的嘴，否则「降级了」与「没降级」在日志里长得一模一样。
+        // ⚠ 只记日志、**不改事件也不改终态**：摘要降级不是 run 失败（模型拿到的仍是机械摘要），
+        //   把它升成错误会让人对着一条正常完成的 run 看到红字。前端口径同 #392-D 横幅。
+        const degrade = event?.type === 'compaction' ? foldDegradeNotice(event.compaction) : null;
+        if (degrade) {
+          sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: degrade });
+        }
+        // issue #421：引擎承诺的 16 类事件里有 5 类本站以前**根本订不到**（前端 `EVENT_TYPES` 没列）。
+        // 界面那一半（中性分隔行）在同一次提交里补了；这里是**运维那一半**：只读 LOG 的人也得看得见。
+        // ⚠ 只记日志、**不改事件也不改终态**（这些都是诊断不是失败，升成错误会让人对着正常完成的 run 看到红字）。
+        // `run_outcome` 每轮都有，它是账不是告警 ⇒ `info`（口径见 `lib/engine-notices.js`）。
+        const notice = engineDiagnosticNotice(event);
+        if (notice) {
+          sendIpc(process, { type: MSG.LOG, run_id: runId, level: notice.level, msg: notice.msg });
+        }
+        emitEvent(event.type, loopEventPayload(event, { contextWindow: engineModelMetadata?.context_window }));
       },
       onDelta: (chunk) => {
         if (typeof chunk === 'string' && chunk.length > 0) emitEvent('assistant_delta', { text: chunk });

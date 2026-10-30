@@ -127,7 +127,7 @@ export function normalizeHostHeader(rawHost) {
 async function handleTicket(pool, config, { ticket, allocation, uri, scheme, hostHeader = null, now }) {
   const h = hashToken(ticket);
   const r = await pool.query(
-    `SELECT id, user_id, issuer_id, allocation_id, state, expires_at, used_at, revoked_at
+    `SELECT id, user_id, issuer_id, allocation_id, state, expires_at, used_at, revoked_at, login_session_id
        FROM preview_grants WHERE token_hash = $1 AND kind = 'ticket'`,
     [h],
   );
@@ -188,10 +188,11 @@ async function handleTicket(pool, config, { ticket, allocation, uri, scheme, hos
     }
     await client.query(
       `INSERT INTO preview_grants
-          (token_hash, user_id, issuer_id, allocation_id, parent_ticket_id, kind, state, expires_at, last_seen_at)
-        VALUES ($1, $2, NULL, $3, $4, 'session', 'active', $5, $5)
+          (token_hash, user_id, issuer_id, allocation_id, parent_ticket_id, kind, state, expires_at, last_seen_at, login_session_id)
+        VALUES ($1, $2, NULL, $3, $4, 'session', 'active', $5, $5, $6)
         ON CONFLICT (token_hash) DO NOTHING`,
-      [sessionHash, g.user_id, allocation.id, g.id, expiresAt],
+      // #429：派生 session **继承** ticket 的登录会话血缘（登出时沿血缘一并回收，portal.md §2.4）。
+      [sessionHash, g.user_id, allocation.id, g.id, expiresAt, g.login_session_id ?? null],
     );
     await client.query('COMMIT');
   } catch (err) {
@@ -362,9 +363,11 @@ export async function issuePreviewTicket(pool, config, { allocationId, session, 
   const expiresAt = new Date(now.getTime() + config.previewTicketTtlSeconds * 1000);
   await pool.query(
     `INSERT INTO preview_grants
-        (token_hash, user_id, issuer_id, allocation_id, kind, state, expires_at, created_ip, created_ua)
-      VALUES ($1, $2, $3, $4, 'ticket', 'active', $5, $6, $7)`,
-    [tokenHash, user.id, user.id, allocation.id, expiresAt, ip, ua],
+        (token_hash, user_id, issuer_id, allocation_id, kind, state, expires_at, created_ip, created_ua, login_session_id)
+      VALUES ($1, $2, $3, $4, 'ticket', 'active', $5, $6, $7, $8)`,
+    // #429：写入签发时刻的登录会话血缘（登出时沿血缘回收预览平面，portal.md §2.4）。
+    // 无会话上下文的调用（如测试桩）传 null：血缘缺失 = 登出救不了它，最迟 TTL 自然到期。
+    [tokenHash, user.id, user.id, allocation.id, expiresAt, ip, ua, session.session?.id ?? null],
   );
 
   // 预览 URL 的 scheme/端口按**公开入口**派生（#57 阶段2，dev http:8090 / 生产 https 同一代码路径）：

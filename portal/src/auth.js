@@ -354,11 +354,30 @@ export async function renewSession(
   return res.rows?.[0]?.expires_at ?? null;
 }
 
-/** 吊销单条会话（portal.md §2.4/§2.5）。 */
+/**
+ * 吊销单条会话（portal.md §2.4/§2.5），并**同语句回收该会话签发的预览凭证**（#429，方案 B「凭证血缘」）。
+ *
+ * 为什么撤权要落在这里而不是 forwardAuth：登录 cookie 是 host-only 于 `station.<base>` 的（issue #6），
+ * 物理上到不了预览 host —— forwardAuth 请求里没有可判的登录主体（§2.11a 的原则「门在它身上没有
+ * 可判的主体」）。所以回收只发生在登出时刻（portal 同时握着两套凭证语境的唯一入口），
+ * forwardAuth 保持每请求零新增查表。
+ *
+ * 撤权谓词与 #252 口径同形：**只撤 `state='active'`**、`revoked_at = COALESCE(...)`、绝不碰 `used`；
+ * 命中范围 = `login_session_id` 血缘（该会话签发的未用 ticket + 其派生 session），
+ * ⇒ 同一用户其它设备/会话签的票不受连坐。单语句 CTE ⇒ 吊销与回收原子生效，无中间态。
+ */
 export async function revokeSession(pool, token) {
   if (!token || typeof token !== 'string') return;
   await pool.query(
-    `UPDATE login_sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL`,
+    `WITH revoked AS (
+       UPDATE login_sessions SET revoked_at = now()
+        WHERE token_hash = $1 AND revoked_at IS NULL
+        RETURNING id
+     )
+     UPDATE preview_grants
+        SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
+      WHERE state = 'active'
+        AND login_session_id IN (SELECT id FROM revoked)`,
     [hashToken(token)],
   );
 }

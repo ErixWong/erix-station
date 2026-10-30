@@ -1933,7 +1933,17 @@ const HISTORY_EVENT_TYPES = new Set([
   // erix-agent #182（0.18.0）新增的**诊断类**事件：模型元信息缺失时上抛。SSE 实时路径会原样推
   // 给前端（前端 `useEventStream.ts` 的 `default: return;` 中性忽略），若不进白名单则刷新页面
   // 后历史回放会把它过滤掉——同一事件两种可见性就是口径不一致，故列入可回放集合。
+  // ⚠ 上面那句「SSE 实时路径会原样推给前端（前端 `default: return;` 中性忽略）」**前提是错的**：
+  // 前端 `EVENT_TYPES` 里从来没有这个类型，EventSource 不订 ⇒ **实时也收不到**（不是“收到但不展示”）。
+  // issue #421 已把它接进 `EVENT_TYPES` 并刷一行中性分隔行，同时 runner 侧补了 warn 日志
+  // （`runner/lib/engine-notices.js`）——现在实时 / 刷新 / 只读 LOG 三条路都看得见。
   'model_metadata_missing',
+  // issue #421：引擎对宿主承诺的 16 类事件（`erix-agent` `src/loop/orchestrator.js:297`）里剩下的
+  // 3 类。同一个形状：写入侧不过白名单 ⇒ `run_events` 里始织有行，读侧不进白名单就是「实时没有、
+  // 刷新后也没有」（#371-A）。三处集合（前端 `EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` / 本表）
+  // 仍独立存亡，只加一边就得到两种可见性不一致（#288），16 类的对账测在 `engineEventSurface.spec.ts`。
+  // 只剩 `run_outcome` **显式不进**（与 `run_end` 语义重叠且今天无读者，豁免理由同在下测里写出）。
+  'compaction_strategy_fallback', 'persistence_capability_degraded', 'resume_journal_skipped',
   // issue #371-A：`persistence_error`（引擎 erix-agent#461 起的落盘失败告警，带 `fatal`）此前
   // **库里存着、读不出来**：写入侧不过白名单（`internal.js` 直接 INSERT），展示侧不过 ⇒ 刷新后
   // 一条都不提。而这条事件最重要的时刻，正是用户刷新来看「我这轮到底存下没」的那一刻。

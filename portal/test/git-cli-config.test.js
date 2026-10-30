@@ -154,7 +154,8 @@ test('set writes escaped provider-specific YAML with FDE ownership and permissio
     assertFdeDirectory(path.dirname(file));
   }
 
-  assert.ok(fs.readFileSync(path.join(f.homeDir, '.git-credentials'), 'utf8').includes(encodeURIComponent(token)));
+  // #399：凭据行现在落平台独占文件（home 里只有 CLI 配置）。
+  assert.ok(fs.readFileSync(path.join(f.root, 'alice', 'platform', 'git', 'credentials'), 'utf8').includes(encodeURIComponent(token)));
   for (const call of pool.calls) assert.ok(!JSON.stringify(call.params).includes(token));
 });
 
@@ -222,7 +223,9 @@ test('unregistered hosts and providers without a supported CLI only write git cr
     host: 'azure.example.test', username: 'alice', token: 'fake-azure-token',
   });
 
-  assert.ok(fs.existsSync(path.join(f.homeDir, '.git-credentials')));
+  // #399：凭据落平台文件；home 里不再出现 .git-credentials，也不得出现 CLI 配置。
+  assert.ok(fs.existsSync(path.join(f.root, 'alice', 'platform', 'git', 'credentials')));
+  assert.equal(fs.existsSync(path.join(f.homeDir, '.git-credentials')), false);
   assert.equal(fs.existsSync(path.join(f.homeDir, '.config')), false);
 });
 

@@ -1352,3 +1352,127 @@ test('GET / 与 /assets/* → 服务 Vue SPA（P2 翻转；/app 挂载点已删�
     await s.close();
   }
 });
+
+// #429：登出回收预览平面（凭证血缘）。端到端走「登录 → 签票 → 兑换 cookie → 登出 → 旧 cookie 401」，
+// 并钉住多设备语义：同一用户另一台设备（另一个 login_session）签发的预览 cookie 不受连坐。
+test('#429 登出撤销本登录会话签发的预览凭证；旧 cookie 打 forward-auth 401；另一会话不受连坐', async () => {
+  const HOST = 'alice-p-4000.fde.erix.vip';
+  const grants = [];
+  let grantSeq = 1;
+  const sessions = [];
+  let sessionSeq = 1;
+  const user = {
+    id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice',
+    auth_source: 'local', status: 'active', password_hash: null, totp_secret: null, last_totp_step: null,
+  };
+  const hashOf = (t) => hashToken(t);
+  const pool = {
+    async query(sql, params = []) {
+      if (sql.includes('schema_migrations')) return { rows: [{ version: '0000_baseline' }] };
+      if (sql.includes('FROM users WHERE login')) return { rows: [{ ...user, password_hash: 'x' }] };
+      if (sql.includes('INSERT INTO login_sessions')) {
+        sessions.push({ id: `ls${sessionSeq++}`, user_id: user.id, token_hash: params[1], revoked_at: null, expires_at: new Date(Date.now() + 3.6e6), last_seen_at: new Date() });
+        return { rows: [] };
+      }
+      if (sql.includes('FROM login_sessions s') && sql.includes('JOIN users')) {
+        const h = params[0];
+        const s = sessions.find((x) => x.token_hash === h && x.revoked_at === null);
+        if (!s) return { rows: [] };
+        return { rows: [{ id: user.id, login: user.login, display_name: user.display_name, role: user.role, fde_name: user.fde_name, auth_source: user.auth_source, status: user.status, must_change_password: false, session_id: s.id, expires_at: s.expires_at, last_seen_at: s.last_seen_at }] };
+      }
+      // 登出 CTE（auth.revokeSession）：吊销会话 + 按血缘撤 active grant。
+      if (sql.includes('UPDATE login_sessions SET revoked_at = now()')) {
+        const h = params[0];
+        const s = sessions.find((x) => x.token_hash === h && x.revoked_at === null);
+        if (s) {
+          s.revoked_at = new Date();
+          for (const g of grants) if (g.state === 'active' && g.login_session_id === s.id) { g.state = 'revoked'; g.revoked_at = new Date(); }
+        }
+        return { rows: [] };
+      }
+      if (sql.includes('FROM port_allocations WHERE id = $1')) {
+        return { rows: [{ id: 'pa1', fde_id: user.id, state: 'allocated', exposure: 'private', hostname: HOST, url: `https://${HOST}` }] };
+      }
+      if (sql.includes('INSERT INTO preview_grants')) {
+        grants.push({ id: `g${grantSeq++}`, token_hash: params[0], user_id: params[1], issuer_id: params[2] ?? null, allocation_id: sql.includes("'session'") ? params[2] : params[3], kind: sql.includes("'session'") ? 'session' : 'ticket', state: 'active', expires_at: new Date(Date.now() + 900_000), used_at: null, revoked_at: null, parent_ticket_id: sql.includes("'session'") ? params[3] : null, login_session_id: sql.includes("'session'") ? params[5] : params[7] });
+        return { rows: [] };
+      }
+      if (sql.includes('FROM port_allocations a')) {
+        return { rows: [{ id: 'pa1', fde_id: user.id, state: 'active', exposure: 'private', hostname: HOST, fde_name: 'alice', user_status: 'active' }] };
+      }
+      if (sql.includes("FROM preview_grants WHERE token_hash = $1 AND kind = 'ticket'")) {
+        const g = grants.find((x) => x.token_hash === params[0] && x.kind === 'ticket');
+        return { rows: g ? [{ ...g }] : [] };
+      }
+      if (sql.includes("FROM preview_grants WHERE token_hash = $1 AND kind = 'session'")) {
+        const g = grants.find((x) => x.token_hash === params[0] && x.kind === 'session');
+        return { rows: g ? [{ ...g }] : [] };
+      }
+      if (sql.includes("SET state = 'used', used_at = now()")) {
+        const g = grants.find((x) => x.id === params[0]);
+        if (g && g.state === 'active' && g.used_at == null) { g.state = 'used'; g.used_at = new Date(); return { rows: [{ id: g.id }] }; }
+        return { rows: [] };
+      }
+      if (sql.includes('parent_ticket_id = $1')) {
+        const g = grants.find((x) => x.parent_ticket_id === params[0] && x.kind === 'session');
+        return { rows: g ? [{ ...g }] : [] };
+      }
+      if (sql.includes('SELECT id, role, status FROM users WHERE id = $1')) return { rows: [{ id: user.id, role: user.role, status: user.status }] };
+      if (sql.includes('UPDATE preview_grants SET expires_at')) return { rows: [] };
+      if (sql.includes('SET state = \'active\' WHERE id = $1')) return { rows: [] };
+      return { rows: [] };
+    },
+    async connect() { return { query: (s, p) => this.query(s, p), release() {} }; },
+    async end() {},
+  };
+  const s = await startServer({ pool, overrides: {
+    previewTicketTtlSeconds: 60,
+    previewSessionTtlSeconds: 900,
+    previewSessionSigningKey: 'test-key-429',
+    previewCookie: { name: 'fde_preview_dev', secure: false, httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 900 },
+    cookie: { name: 'fde_session_dev', secure: false, httpOnly: true, sameSite: 'Lax', path: '/', maxAge: 3600 },
+  } });
+  try {
+    // 两枚「设备」= 两枚登录会话（直接注入 sessions，跳过口令路径：本单测的是登出回收，不是登录）。
+    sessions.push({ id: 'ls-dev1', user_id: user.id, token_hash: hashOf('loginTok1'), revoked_at: null, expires_at: new Date(Date.now() + 3.6e6), last_seen_at: new Date() });
+    sessions.push({ id: 'ls-dev2', user_id: user.id, token_hash: hashOf('loginTok2'), revoked_at: null, expires_at: new Date(Date.now() + 3.6e6), last_seen_at: new Date() });
+
+    // 设备 1 签票（血缘 = ls-dev1）并兑换预览 cookie。
+    const t1 = await fetch(`${s.base}/api/ports/pa1/preview-ticket`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: 'fde_session_dev=loginTok1' }, body: '{}' });
+    assert.equal(t1.status, 201);
+    const { ticket: ticket1 } = await t1.json();
+    assert.equal(grants.at(-1).login_session_id, 'ls-dev1', '签票必须把签发会话血缘写进 grant');
+    // redirect: 'manual'——302 的 Location 指向预览域名（真库里由 Traefik 接住），fetch 不许自动跟。
+    const ex1 = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': HOST, 'x-forwarded-uri': `/?preview_ticket=${ticket1}` }, redirect: 'manual' });
+    assert.equal(ex1.status, 302);
+    const cookie1 = ex1.headers.get('set-cookie').split(';')[0]; // fde_preview_dev=<s_...>
+
+    // 设备 2 同样签票 + 兑换（血缘 = ls-dev2）。
+    const t2 = await fetch(`${s.base}/api/ports/pa1/preview-ticket`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: 'fde_session_dev=loginTok2' }, body: '{}' });
+    const { ticket: ticket2 } = await t2.json();
+    const ex2 = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': HOST, 'x-forwarded-uri': `/?preview_ticket=${ticket2}` }, redirect: 'manual' });
+    assert.equal(ex2.status, 302);
+    const cookie2 = ex2.headers.get('set-cookie').split(';')[0];
+
+    // 兑换后两枚预览 cookie 都放行。
+    assert.equal((await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': HOST, Cookie: cookie1 } })).status, 200);
+    assert.equal((await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': HOST, Cookie: cookie2 } })).status, 200);
+
+    // 设备 1 登出 ⇒ 它的登录会话与预览凭证一起失效。
+    const out = await fetch(`${s.base}/api/auth/logout`, { method: 'POST', headers: { Cookie: 'fde_session_dev=loginTok1' } });
+    assert.equal(out.status, 204);
+
+    const after1 = await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': HOST, Cookie: cookie1 } });
+    assert.equal(after1.status, 401, '登出后旧预览 cookie 必须 401（回收前这里是 200 —— 本单主症状）');
+    const body1 = await after1.json();
+    assert.equal(body1.error.code, 'preview_session_invalid');
+
+    // 设备 2 不受连坐（血缘按 login_session 命中，不是按 user）。
+    assert.equal((await fetch(`${s.base}/api/forward-auth`, { headers: { 'x-forwarded-host': HOST, Cookie: cookie2 } })).status, 200,
+      '另一登录会话的预览 cookie 不得被连坐（方案 B 的多设备语义）');
+    // 设备 1 自己的登录态也确实没了（登出本身语义不回归）。
+    assert.equal((await fetch(`${s.base}/api/me`, { headers: { Cookie: 'fde_session_dev=loginTok1' } })).status, 401);
+  } finally {
+    await s.close();
+  }
+});
