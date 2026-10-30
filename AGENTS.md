@@ -2733,3 +2733,25 @@ UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字�
   修一处 = 漏五处，#296 那一轮正是这么漏的；
 ③ mock 的字面值要**长得像真机的形状**（`pk-m1` / UUID 形态），`model_id: 'gpt-4o'` 这种"看着像人名"的
   mock 会让 UUID 泄漏在结构上测不出来。
+
+### 8.73 v0.1.44 发版与部署（含 #434 模型标签收口 + #429 登出回收预览凭证真机验收）（2026-10-30）
+
+**为什么这次一次发**：main 上积了 **21 个未发版提交**（#396 `node_modules` 解除跟踪 / #399 Git 凭据搬 ro bind / #420 事件承接面 / #425 状态条 / #428 换账号串号 / #429 登出回收预览凭证 / #431 登出收口 + #434 模型标签），而最新 tag 还是 `v0.1.43` ⇒ 现网落后两天。⇒ 合完 #434 直接发 **v0.1.44**。
+
+**#434（PR #435，另一台主机做的，我按 §6.1 亲审 + 复跑 + 变异后合并）**
+
+- diff 形状：新增 `portal/frontend/src/lib/modelLabel.ts`（`modelOptionLabel()` = `展示名 (调用名)`，同名只显示一次，**绝不打主键**；提交/回填仍走 `model_id`）+ 6 处调用点收口（三个下拉 + `AdminUsersView` 三个新建下拉 + 保存 toast + `AdminView` 新增模型表单 label + `llm.js` 的 409 文案与消息预检文案）。`llm.js` 的两处把「模型 id」换成「撞车/绑定模型的名字」，**id 仍留在 `details` 里**给运维与日志。
+- **四件套（在独立 worktree `5cf8801` 上亲跑，判绿=退出码）**：根 **1710 / 1705 / 0 失败 / 5 跳过**、runner **430 / 429 / 0**、前端 **53 文件 / 982 通过**、`typecheck` rc=0。
+- **我自己的两条变异（每条先 `git diff --numstat` 自证非空操作）**：① `modelOptionLabel` 改回 `${model_id} — ${display}` ⇒ `modelLabel.spec` **2 条具名红**；② `llm.js` 的 `clashLabel` 改回裸 `modelId(conflicting)` ⇒ `llm-reconcile.test.js` **`not ok 19`（409 文案那条）**。各自还原后 `git status` 干净。
+- 合并：`gh api -X PUT .../pulls/435/merge` → `f860302`（PR 质量门禁 SUCCESS、镜像构建校验 SKIPPED 属 PR 常态）。
+- **真机验收（v0.1.44 发布物，bundle 先断言 = `index-XmXg4_i6.js`，与 v0.1.43 的 `index-1_vis29R.js` 不同名）**：管理台 → eric 的 Edit → **LLM & Repository** 标签，三个下拉选项实测 = `(not configured)` / `deepseek-v4-pro` / `deepseek-flash`，**整页 UUID 正则命中 0 次**（修复前是 `920aa0c6-… — deepseek-flash`）；新增模型表单里 `model_id` 字面量不再作为字段 label 出现。截图 `/docker/erix_station_playwright/v0144-434-model-dropdowns.png`。
+  ⚠ 探针坑：抽屉内容要等 ~2s 才渲染完（第一次读只看到 1 个 select 就以为「下拉不存在」）；且 admin 自己没有 FDE ⇒ LLM 面板不出模型下拉，**必须挑 FDE 用户（eric）那一行**。
+
+**#429（登出回收预览平面）真机验收**（这次一起发的安全面，顺手验掉）：以 eric 登录 → 列端口拿 allocation → 签票 `201` → 库里该 grant `kind=ticket / state=active / login_session_id IS NOT NULL`（**血缘写上了**）→ `POST /api/auth/logout` `204` → 该 grant **`state=revoked` 且 `revoked_at` 非空**。⚠ **已知边界**：迁移 0025 之前签的 grant **没有血缘** ⇒ 登出撤不掉（真机同屏就有一条 `kind=session / state=active` 的老凭证），这是「历史行不可追认」的必然代价，不是漏做。
+
+**发版与部署（v0.1.44）**：`git diff v0.1.43..HEAD -- runner/` 有 **13 个非版本文件** ⇒ **必须重建 FDE 镜像**；新增迁移 `0025-preview-grant-login-session.sql`。
+版本 bump `eaea3d8`（六文件 +9/−9，`npm version 0.1.44 --no-git-tag-version` ×3 目录）→ main CI（质量门禁 + **三镜像构建校验**）两个 job 全绿后才打 tag → release `41018144161` success → 清单 portal `imageId=646a1c65…`/`digest=9daa73ba…`、fde `imageId=cd43ed63…`/`digest=df324165…`、proxy `imageId=df93027e…`/`digest=a52ecc96…`，三个都 `docker image inspect .Id` **逐位一致**。
+⚠ **fde 又一次直连拉不动**（这次 `rc=124` 直接超时）⇒ 老办法：`docker pull ghcr.nju.edu.cn/erixwong/erix-station-fde:0.1.44` 成功后**再按 digest 拉 ghcr 一次**（层已在本地、秒回），于是有 `repo@sha256:` 引用、pin 保持形态①。
+`deploy/.env` 三项 pin（备份 `/tmp/deploy.env.bak-0144`）→ `up -d --no-build` ⇒ portal 实跑 `646a1c65…`、迁移 **0025 自动应用**、`healthz=200` → `docker rm -f` 五台 `fde-*` → reconcile 16 秒内全部落在 `cd43ed63…`、容器内 `station 0.1.44 / engine 0.26.0`、agentd `sse connected` + `sse ping received`。
+
+⚠ **一条操作坑（与 §8.24 同族）**：`while read … docker pull … done < file` 里 **docker 会吃掉 stdin** ⇒ 循环只跑了一条就静默结束（我这次就是 portal/fde 跑完、proxy 根本没执行）。⇒ 逐个显式调用，或 `docker pull < /dev/null`。
