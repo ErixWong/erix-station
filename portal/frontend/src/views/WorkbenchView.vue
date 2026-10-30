@@ -8,6 +8,8 @@ import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
+// issue #431：用户 scope 结束的接线（注册方，触发方在 stores/auth.ts）。
+import { setUserScopeResetListener } from '../lib/userScope';
 import { AUTO_FOLLOW_GAP } from '../lib/constants';
 import { useSidebarWidth, SIDEBAR_MAX, SIDEBAR_MIN } from '../composables/useSidebarWidth';
 import SidebarPanel from '../components/SidebarPanel.vue';
@@ -49,6 +51,11 @@ setWorkbenchHooks({
   onDeepLinkRestored: (sid) => router.replace(`/session/${encodeURIComponent(sid)}`),
 });
 
+// issue #431：把「本轮用户结束 → 工作台不再归属任何人」注册到应用级信号上（`auth.logout()` / 会话
+// 过期都会 notify）。**只注册不注销**：`onUnmounted` 里清掉就等于重新漏掉「从管理台登出」那条路径——
+// 卸载后 listener 仍指向同一个 pinia 单例，正是需要的语义。口径详见 lib/userScope.ts。
+setUserScopeResetListener(() => { store.claimOwnership(null); });
+
 // ---- 深链解析（resolveHashSession 语义平移；popstate = 路由参数变化）----
 watch(
   () => route.params.id,
@@ -78,6 +85,9 @@ async function onNewSession() {
 }
 
 async function onLogout() {
+  // issue #428/#431：本地收摊（关 SSE + 清上一个账号的可见面）由 `auth.logout()` 开头的
+  // `notifyUserScopeReset()` 统一触发（三颗登出按钮共用那一个汇合点），本视图只需注册
+  // `setUserScopeResetListener`（见上方），不在这里再抄一份。
   await auth.logout();
   router.replace('/login');
 }
@@ -105,6 +115,9 @@ function onPickerSelect(id: string) {
 
 onMounted(async () => {
   if (!auth.user) return; // 守卫保证已登录
+  // issue #428：SPA 登出**不重载页面** ⇒ 本视图重挂载时 workbench store 还是上一个账号的。
+  // 第一步就按当前登录者认领（身份变了则先全量复位），且必须在 `initWorkspace` 之前同步跑完。
+  store.claimOwnership(String(auth.user.id));
   // issue #281：**Vue 不等 onMounted 返回的 Promise** ⇒ 里面每一个 `await` 都必须自己收尾，否则一次
   // /api/dirs 失败就是 Unhandled Rejection（代价真实发生过：v0.1.7 打 tag 时 CI 步骤④ 就红在这两个
   // 无 catch 的 await 上，AGENTS §4 与 §8.20）。本地 catch ≠ 加一层重试：**不重试**，只把失败变成

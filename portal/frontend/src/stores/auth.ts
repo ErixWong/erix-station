@@ -5,6 +5,8 @@
 import { defineStore } from 'pinia';
 import { api, ApiError, toDisplayText } from '../api';
 import { seatAwareLanding } from '../lib/workbenchGate';
+// issue #431：「本轮用户结束」的应用级信号（接回工作台认领，详见 lib/userScope.ts）。
+import { notifyUserScopeReset } from '../lib/userScope';
 
 export interface AuthUser {
   id: string;
@@ -224,6 +226,8 @@ export const useAuthStore = defineStore('auth', {
      * 无会话 ⇒ 受限态一并清掉（否则 App 闸门会把登录页也挡死，与 `logout()` 同口径）。
      */
     forgetExpiredSession() {
+      // issue #431：会话已死 ⇒ 同样先收摊（断 SSE + 清工作台的上一个账号可见面），再清 auth 态。
+      notifyUserScopeReset();
       this.user = null;
       this.pendingToken = null;
       this.ready = true;
@@ -240,6 +244,10 @@ export const useAuthStore = defineStore('auth', {
 
     /** 登出：撤销服务端会话 + 清本地态（旧版 reload 走渲染未登录，SPA 改为跳 /login）。 */
     async logout() {
+      // issue #431：**在 `await` 之前**先收摊——三颗登出按钮（工作台 / 管理台顶栏 / 强制改密屏）
+      // 都只调本函数 ⇒ 它是唯一的汇合点；而工作台那条 SSE 不能等服务端回包（会话本来就可能已经死了，
+      // 下面也 catch 了失败），晚一步就是一个带死会话的无限重连。具体后果见 lib/userScope.ts。
+      notifyUserScopeReset();
       try {
         await api('/api/auth/logout', { method: 'POST' });
       } catch {

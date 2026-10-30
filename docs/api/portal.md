@@ -287,6 +287,21 @@
 
 - 响应 `204`，删除服务端 `login_sessions` 记录，并下发过期 cookie 清除客户端副本。
 - 未登录调用返回 `401 unauthorized`。
+- **#429（方案 B「凭证血缘」）：登出同时回收本次登录会话签发的预览凭证。**同一事务形状的
+  单语句 CTE：吊销 `login_sessions` 行 + 按 `preview_grants.login_session_id` 血缘把**仍
+  `state='active'`** 的 ticket 与派生 session 一并置 `revoked`（只撤 `active`、`revoked_at` 用
+  `COALESCE`——与 #252 撤 grant 口径同形；`used` 是历史事实不动）。登出后旧预览 cookie 打
+  forwardAuth 得 `401 preview_session_invalid`，重新从 portal 签票即恢复。
+  - **为什么回收落在登出时刻而不是 forwardAuth**：登录 cookie 是 host-only 于 `station.<base>` 的
+    （§2.5 / issue #6），物理上到不了预览 host，forwardAuth 请求里没有可判的登录主体
+    （§2.11a 原话「门在它身上没有可判的主体」）；回收只能发生在 portal 同时握着两套凭证语境的入口。
+    forwardAuth 保持每请求零新增查表。
+  - **多设备语义**：血缘按 `login_session_id` 命中，不按 `user_id` 连坐——A 在设备 1 登出，
+    设备 2 的登录会话所签预览票不受影响。
+  - **发布窗口**：`login_session_id` 可空（迁移 `0025`，不回填）。血缘缺失的存量活跃凭证登出救不了，
+    最迟 `expires_at`（session ≤15min 滚动）自然到期，一次性窗口、无数据修复。
+  - 其它回收路径不变：用户 `disabled` 撤销该用户**全部** active grant（§2.9.3，含代签），
+    allocation `released` 撤销该 allocation 上全部 active（§2.8）；登出这条是**按血缘**的窄口径。
 
 ### 2.5 session cookie 属性
 
@@ -508,8 +523,9 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 签名 / 存储 | **不透明随机 token + 服务端哈希查找**（`sha256`）；选**有状态**而非「无状态 HMAC 签名」——一次性（single-use）与撤销必须有服务端状态支撑，纯签名 ticket 无法可靠地「用一次即失效」或「显式撤销」 |
 | TTL | **60s ⚠️ 待决策者确认**（覆盖人工点击/iframe 首帧的间隙，又不至于可被长期重放） |
 | 一次性（crash-safe） | 首次校验在**同一 DB 事务**内消费 ticket + 派生 session + 记 `ticket→session` 关联（§2.7 第 6 步）；响应丢失后**同一 ticket 安全重放**（返回同一 bootstrap 结果、不产生第二个 session token）；仅当已消费且派生的 session 已 `revoked`/`expired` 才 `403 preview_ticket_used` |
-| 撤销 | `state='active' → 'revoked'`（同事务置 `revoked_at`）即失效；portal 关闭预览页 / 用户登出 / admin 吊销时可选显式撤销未使用的 ticket |
+| 撤销 | `state='active' → 'revoked'`（同事务置 `revoked_at`）即失效；**用户登出时按 `login_session_id` 血缘撤销本次会话签发的未用 ticket（#429，必选非可选，见 §2.4）**；admin 吊销 / allocation 释放另走各自路径（下表与 §2.9.3） |
 | 与 allocation 释放联动 | allocation `state → released`（项目删除 / run 结束 / reaper / offboarding / 管理员改块）时，**同一事务**把该 allocation 上**仍 `state='active'`** 的凭证全部置 `state='revoked'`（同事务写 `revoked_at`）；`used`/`expired`/`revoked` **一律不动**（口径见下方「撤 grant 的口径」）；且 forwardAuth 第 2 步始终重查 allocation `state`，双保险 |
+| 血缘列 `login_session_id`（#429，迁移 `0025`） | 签发该凭证的**登录会话**（`→ login_sessions.id`，`ON DELETE SET NULL`，**可空不回填**）：ticket 行在签发时写入，session 行在 forwardAuth 兑换时**继承** ticket 的值。登出撤销按此列命中（§2.4）；血缘缺失（存量/无会话上下文签发）= 登出救不了，靠自身 TTL 到期 |
 
 #### 预览 cookie 语义（`preview_grants.kind='session'`）
 
@@ -518,13 +534,15 @@ Traefik 对 `<FDE_WILDCARD_HOST>`（`*.fde.<BASE_DOMAIN>`）的每个请求先�
 | 生成 | ticket 首次校验通过后，forwardAuth 在**同一事务**内消费 ticket 并**确定性派生** session token（`HMAC-SHA256(session_signing_key, "preview-session:" + ticket)`，不存明文），存 `preview_grants`（`kind='session'`，记 `parent_ticket_id`），并 `302` 下发 `Set-Cookie`（§2.7 第 6 步） |
 | 名称 / 属性 | `__Host-fde_preview`；`Secure`/`HttpOnly`/`SameSite=Lax`/`Path=/`、**不设 `Domain`（host-only 于当前预览 host）**；开发期纯 HTTP 按 §2.5 同法去 `__Host-` 前缀并关 `Secure` |
 | TTL | `Max-Age` 与 `expires_at` 一致：**15 分钟 ⚠️ 待决策者确认**，滚动续期（每次 forwardAuth 成功刷新） |
-| 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` 均失效（forwardAuth 每请求重查） |
+| 撤销 | `revoked_at` 置位 / TTL 过期 / allocation `released` / 用户 `disabled` / **签发会话登出（#429，按 `login_session_id` 血缘，见 §2.4）** 均失效（前三项 forwardAuth 每请求重查；登出撤销是写侧回收，forwardAuth 只看到 `state='revoked'`） |
 | 上游可见性 | **预览 cookie 与 portal session cookie 都绝不到达预览上游**：二者 host-only、只在各自 host 发送；Traefik `strip-cookie` 中间件在放行后删除 `Cookie`（fde-platform §6.4）——上游 dev server 收到的请求头里**没有 `Cookie`** |
 
 #### 撤 grant 的口径（`state → revoked`，issue #252）
 
 三个写入口共用同一条 UPDATE 形状（`portal/src/offboarding.js` 的 `release-network-routes`、
-`portal/src/portalloc.js` 的 `moveFdePreviewBlock`、`portal/src/admin.js` 的停用用户）：
+`portal/src/portalloc.js` 的 `moveFdePreviewBlock`、`portal/src/admin.js` 的停用用户）；
+登出撤销（#429，`auth.js revokeSession` 的 CTE）是第四个写入口——**命中列换成 `login_session_id` 血缘**，
+但 SET 形状与谓词口径（只撤 `active`、`COALESCE` 写 `revoked_at`）与下面逐字同形：
 
 ```sql
 UPDATE preview_grants SET state = 'revoked', revoked_at = COALESCE(revoked_at, now())
@@ -999,7 +1017,7 @@ station-portal user enable  --login <login>
 刷新后前端重建工具卡片 / judge 面板的**只读历史通路**（对齐 pi-web「转录即真相」：历史与实时走同一渲染入口）。
 
 - **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
-- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。
+- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
@@ -1866,7 +1884,7 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 2 | `attempt` | 同上 | `round: number`，`attempt: number`（1-based），`maxAttempts: number`（依据：`src/loop.js:1346-1351`） |
 | 3 | `recovering` | 同上 | `round: number`，`attempt: number`，`maxAttempts: number`（provider 重试前发出，依据：`src/loop.js:1447-1452`） |
 | 4 | `recovered` | 同上 | `round: number`，`attempt: number`（重试成功，依据：`src/loop.js:1413`/`1424`） |
-| 5 | `usage` | 同上 | `round: number`，`usage: object`（嵌套 usage 对象，形如 `{input_tokens, output_tokens}`；依据：`src/loop.js:1355`/`1928`/`1960`。宿主若拍平为顶层 `input_tokens`/`output_tokens`，属宿主侧改写，须显式注明） |
+| 5 | `usage` | 同上 | `round: number`，`usage: object`（嵌套 usage 对象，形如 `{input_tokens, output_tokens}`；依据：`src/loop.js:1355`/`1928`/`1960`。宿主若拍平为顶层 `input_tokens`/`output_tokens`，属宿主侧改写，须显式注明）。**#425 起宿主侧 additive 字段 `context_window: number`**：值 = 本 run 下行的模型上下文窗口（与喂给引擎 `modelMetadata.contextWindowTokens` 同一个数，#309），**只在正整数时写键**，未配/脏值 ⇒ **整键缺席**（不写 0）；前端据此出「上下文占用 %」，没有就整段不出。引擎事件本身不带这个字段 ⇒ 不记为上游契约变更 |
 | 6 | `tool_use` | 同上 | `tool_call_id: string`，`name: string`，`input: object` |
 | 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283 → #299**：`duration_ms` 可为 `null`。erix-agent **0.20.0** 起引擎把时长写进 `tool_result.erix.durationMs`，**真执行过的四种返回形态（string / number / `{content,metadata}` / 抛异常）都会给值** ⇒ 本站 #283 那层装配期临时计时闸（`runner/lib/tool-duration.js`）已撤。仍没有值的只剩三种状态：judge 拦截、unsafe 重放被中止、executor 未 settle 就被中止（上游 `TOOL_RESULT_CONTRACT.engine.fields.durationMs`）。runner 映射读 `erix.durationMs`，**旧记录**（一代内）回退顶层 `duration`；两者都缺一律 `null`，**不伪装成 0**，前端据此不渲染时长） |
 | 8 | `round_end` | 同上 | `round: number` |
@@ -1878,9 +1896,15 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 14 | `attempt_killed` | **portal 合成，两条产出路径**（不是引擎事件、不经 U3、不进 `run_queue`）：① **U12 release 的 requeue 分支**（`releaseRun`，issue #288 缺陷 B：agentd 还活着并 additive 上报 `killed_by`，§9.11）② **run 租约 reaper 的 requeue 分支**（`reapExpiredRuns`，issue #292：上报者自己已死、根本没有 release，由 portal 自己合成，§9.11 注记） | `attempt: number`（死掉的那次尝试，1-based = `run_queue.attempts`），`max_attempts: number`，`reason: string`（**开放值、无枚举白名单**：release 路径 = agentd 上报的 reason 原文，如 `watchdog_silent` / `worker_crashed`；**reaper 路径固定 `lease_expired`**），`killed_by: "watchdog" | "crash"`（`watchdog` = F6 执行期静默被判死；`crash` = worker 非预期退出；**reaper 路径固定 `crash`**——它无从区分看门狗与真崩，保守取值），可选 `silent_ms: number`（判死前的静默时长 = **最后一次 IPC 上报之后**算了多久，只有活着的 agentd 报得出来；**只在可信时出现，绝不写 0/null 冒充「有」⇒ reaper 形态固定不带**），可选 `next_retry_in_ms: number`（预留：portal 侧支持，当前 agentd 不发；reaper 也不发） |
 | 15 | `tool_replay_decision_required` | `onEvent`（LoopEvent 透传，erix-agent 0.18.0 additive 类型；**仅在 `replayPolicy: "per-tool-declaration"` 下才会发**，本站自 issue #288 缺陷 C 起传该值） | `tool_call_id: string \| null`，`round: number`，`name: string \| null`（被中断的工具），`replay: string \| null`（引擎解析出的声明，当前只可能是 `"unsafe"`），`requires_host_decision: boolean`（引擎恒给 `true`），`partial_output_available: boolean`（快照里有没有已归档的部分输出）。语义：**该工具的上次执行被崩溃打断，引擎没有重放它**，模型同时收到一条 `is_error: true` + `executionStatus: "interrupted"` 的 `tool_result`（第 7 类），**是否重试由模型决定，引擎不自己重试**。⚠ 信封里的 `run_id` 是 station run id，而引擎事件自带的 `runId` 是 store key = `transcriptKey` = `session_id`（issue #81 P2）——runner 映射时落名 `engine_run_id` 以免同义不同（`runner/worker.js loopEventPayload`） |
 | 16 | `persistence_error` | **引擎 `diagnostics.error` 通道**（**不是 `onEvent`**；本站接线在 `runner/worker.js` 的 `diagnostics: { error: … }`，映射在 `loopEventPayload` 的 `persistence_error` 分支）。erix-agent 0.23.0 起就有这条通道（`orchestrator.js:873`），`fatal: false` 一类也已存在（`:895` 宿主端口桥）；erix-agent#461 / 0.25.0 再加一类「剥掉折叠归档后重试一次」 | `port: string`（缺省 `"transcript"`），`phase: string \| null`，`operation: string`（缺省 `"unknown"`；实测致命那条 = 失败的 store 方法名，如 `appendRound`），`engine_run_id: string \| null`（**引擎 store key = transcriptKey = sessionId**，不是 station run id，#81 P2 老坑），`fatal: boolean`（**runner 归一：缺字段/脏值算 `true`**——宁可报重，不可把真失败刷成灰），`sideEffect`（引擎原样透传），`error: {name, message}`（**`stack` 刻意不透传**：那是宿主日志的东西，塞进 UI payload 只会淹没前端），`ts: string \| null`。**可见性口径**：`fatal === false` → 中性分隔行（不影响本次任务）；`fatal === true` → 界面交给 `run_end` 的 `persistence_failed` 红面，本事件只作可审计明细、不重复刷 |
-| 17 | `queue_update` | **portal 合成（issue #370）**：入队 / 整队取回 / 终态出队（含被闸门挡下）三处推 | `steering: [{id, content}]`、`follow_up: [{id, content}]`（**恒为全量快照，不是增量**）、`blocked: string \| null`（暂停投递原因，当前值域 `container_not_running` / `deliver_failed` / `not_deliverable_at_terminal`；界面按它出本地化文案，**服务端只发码不发话**，#294）、`delivered_run_id: string \| null`（**本帧存在的原因是一条队列输入被投出去了** ⇒ 这个 run 刚被建起来；前端只有在「本机没有活跃 run」时接管它，见下）。**信封 `seq` 与 `run_id` 均为 `null`**：它不是历史事件而是**状态**，真相在 `queued_inputs`，可由会话详情全量重建 ⇒ **不落 `run_events`、不进历史白名单、不参与回放**（同第 16 类之外的 `session_updated` 那一支）。 |
+| 17 | `queue_update` | **portal 合成（issue #370）**：入队 / 整队取回 / 终态出队（含被闸门挡下）三处推 |`steering: [{id, content}]`、`follow_up: [{id, content}]`（**恒为全量快照，不是增量**）、`blocked: string \| null`（暂停投递原因，当前值域 `container_not_running` / `deliver_failed` / `not_deliverable_at_terminal`；界面按它出本地化文案，**服务端只发码不发话**，#294）、`delivered_run_id: string \| null`（**本帧存在的原因是一条队列输入被投出去了** ⇒ 这个 run 刚被建起来；前端只有在「本机没有活跃 run」时接管它，见下）。**信封 `seq` 与 `run_id` 均为 `null`**：它不是历史事件而是**状态**，真相在 `queued_inputs`，可由会话详情全量重建 ⇒ **不落 `run_events`、不进历史白名单、不参与回放**（同第 16 类之外的 `session_updated` 那一支）。 |
+| 18 | `compaction_strategy_fallback` | **引擎 `onEvent`**（additive `LoopEvent`，erix-agent 0.25.0 上游 #464-A；发射点 `orchestrator.js:3193`） | `round: number`、`detail: string`（首句是**固定原文**，宿主可直接断言）、`runId`（= 引擎 store key = transcriptKey = sessionId，**不是** station run id，#81 老坑）。语义：**你配在 `context.strategy` 上的折叠策略没生效，实跑的是引擎库层默认的 `sliding-window`**（整轮丢头、不摘要）。条件：仅当 `context.strategy` **未配置**时发，每 run 恰好一条 ⇒ 本站恒配 `fold-statistical`，**这条一响就意味着本站的配置没送到引擎**（#392 那个回归的机读信号）。界面：中性分隔行（`stream.event.strategyFallback`）；runner 另落一条 `warn` LOG（`runner/lib/engine-notices.js`）。 |
+| 19 | `model_metadata_missing` | **引擎 `onEvent`**（erix-agent 0.18.0 上游 #182；发射点 `orchestrator.js:1040`） | `runId`（同上口径）、`detail: string`。**注意：本事件没有 `round`**（引擎不给，文案也不许编）。语义：模型上下文元数据取不到 ⇒ **本 run 的压缩闸门与聚合输出预算整条关闭**。本站 #309/#316 的行为级测早拿它当判据（「压缩关掉必须是可观测的」），但今天只有测试看得见——#421 之后实时 / 刷新 / LOG 三条路都看得到。界面：中性分隔行（`stream.event.metadataMissing`）。 |
+| 20 | `persistence_capability_degraded` | **引擎 `onEvent`**（erix-agent 0.20.0 上游 #173 PR-B；发射点 `orchestrator.js:1011`） | `runId`、`method: string`（缺的那个 store 能力名）、`detail: string`。语义：宿主 store 没实现某个持久化能力 ⇒ **那一步整个 run 跳过（中途崩溃不可恢复）**，每 run 每个方法最多一条。本站实现了 `saveRunSnapshot`（旧名 `saveCheckpoint`/`appendCheckpoint` 只是引擎兼容别名）⇒ 今天不响，一响就是 portal 侧 store 面回退了。界面：中性分隔行（`stream.event.capabilityDegraded`）。 |
+| 21 | `resume_journal_skipped` | **引擎 `onEvent`**（erix-agent 0.24.0 上游 #420/#421；发射点 `orchestrator.js:2525`） | `runId`、`round: number`、`reason: string`（当前实测值 `crash_round_assistant_not_in_ledger`）、`count: number`。语义：**崩溃那一轮的助手消息不在账上 ⇒ 那批工具结果本次没入账**，下一次恢复仍靠快照兜住。本站天天在恢复会话 ⇒ 可达。界面：中性分隔行（`stream.event.resumeJournalSkipped`，`count` 缺 ⇒ 「若干」，`round` 缺 ⇒ `?`，绝不拿 0 冒充，#283）。 |
+| 22 | `run_outcome` | **引擎 `onEvent`**（erix-agent 0.21.0 上游 #165；记录体 `judge-record.js:105`，正常终局走 `termination.js:700`、抛错终局走 `orchestrator.js:1197`） | `runId?`、`model?`、`judgeModel?`、`rounds?`、`judgeRecordCount?`、`termination?`、`verification?`（全是条件写入，没给就**没这个键**）。语义：**每 run 恰好一条**的 run 级终局汇总（`runOutcomeEmitted` 去重）。**本站今天不展示它**：它与第 10 类 `run_end` 语义重叠（rounds / 终局）且无读者，故**不进 §4.4a 历史白名单也不进 `HISTORY_REPLAY_TYPES`**（订得到：水位线与 `hooks.onEvent` 观察面拿得到；runner 落一条 `info` LOG）。豁免理由钉在 `portal/test/event-surface-contract.test.js`——等 §12 台账 / 结算面板真用它时再接。 |
 
 > 说明与边界：
+> - **第 18~22 类是 issue #421 补接的「引擎承诺、宿主订不到」那一族**（2026-10-27）：erix-agent 对宿主承诺 **16 类事件**（`src/loop/orchestrator.js` 里 `LoopEvent` 的 `@property` 联合类型），而本站三处白名单（前端 `EVENT_TYPES` / 前端 `HISTORY_REPLAY_TYPES` / 本文件 §4.4a 与 `http.js` 的 `HISTORY_EVENT_TYPES`）此前只认 11 类。写入侧不过白名单（`internal.js` 直接 `INSERT`）⇒ 这 5 类**每轮都在往 `run_events` 里写，而浏览器一条都收不到**（#371-A 同形状：库里存着、读不出来）。对账测：`portal/test/event-surface-contract.test.js`（把 16 类清单钉死在测里，上游改联合类型、本站删监听、豁免没写理由都会红）+ `portal/frontend/src/composables/engineEventSurface.spec.ts`（行为面：订得到 / 能回放 / 文案不编数据）+ `runner/test/engine-notices.test.js`（LOG 那一半）。**新增一类时三处必须同步，且 `run_outcome` 那种「订到但不展示」的决定必须写进豁免表。**
 > - 第 1~8 类是 **erix `LoopEvent` 的原样透传**（规格 §10.1：「`type: 同 LoopEvent`」），与 erix-agent v0.3.5 `src/loop.js:533` 的 LoopEvent union 一一对应（8 类，契约锚点见 principles §6）。**上游 additive 新增 LoopEvent 子类型时宿主原样透传**，前端按「未知类型忽略」规则处理即兼容（规格 §13.2-3 additive 原则）。
 > - 第 9/10/11/13 类的字段形状在规格 §10.1 已锚定（**第 14 类 `attempt_killed` 是规格之外的宿主新增事件，规格 §10.1 没有它，字段以本表为准**——additive 新类型不破坏上游契约，§13.2-3）（`{text}` / `{termination, usage, compaction_stats}`；第 11 类规格写作 `{type:"tool_call_delta", ...}`，上表字段为宿主侧补全）。**注（#21 审计决策 ②）**：规格 §10.1 曾写作 `compaction_stats`（本决策已一并删除），该字段在宿主全链路（`runner/`、`portal/src/`）无透传实现、U2 终态载荷不携带——本表与 §9.6 统一按**实际字段集** `termination` / `usage` / `rounds` / `final_text`（+ `attempt`，失败时 `error`）描述，不再引用 `compaction_stats`。
 > - `termination` 是**对象** `{reason, detail?}`（`persistence_failed` 另带 `operation`/`phase`/`sideEffect`），`reason` 取值集合以 erix-agent 0.18.0 的 `runToolLoop` 返回值契约为准：<!-- DRIFT:termination-reason:begin -->`reason ∈ {end_turn, no_tool, stall, max_rounds_cap, judge_done, continuation_exhausted, final_guard_unverified, aborted, failed, persistence_failed}`<!-- DRIFT:termination-reason:end -->（依据：`src/loop/orchestrator.js:511` typedef 的 9 值 + `:973-990` 的 `persistence_failed`；单一真相常量在前端 `lib/terminationReasons.ts`，与 §4.1 及 `docs/data/model.md` §1.7 逐项对齐）。宿主映射（**issue #212 修正**：0.18.0 的失败/中止走 `fail()` **抛异常**，完整 termination 挂在错误上）：runner 一律**原样透传** `err.termination`，引擎没给才回退 `aborted`/`failed`（`runner/worker.js` catch + `runner/lib/termination.js`）——所以引擎失败可以是 `failed` **或** `persistence_failed`（快照没落盘，崩溃恢复可能重复副作用，语义最重），用户主动停止 → `aborted`；正常结束 → `end_turn`（或 `no_tool` / `judge_done` 等）。前端有**两个**集合，别再混用（issue #236）：① **功能面**的 `RUN_FAIL_REASONS` 含 `failed` / `max_rounds_cap` / `aborted` / `persistence_failed` / `final_guard_unverified`——它决定「重试上一条」（#261B）与「终态后补拉 history」（#306），**`aborted` 仍在其内**；② **界面分级**的 `RUN_TERMINATION_SYSERR_REASONS` = ① 减掉 `aborted`（由①**派生**，不手抄）——只有它决定终态行刷红：`failed` / `max_rounds_cap` / `persistence_failed` / `final_guard_unverified` 红，其余（含 `aborted`）中性。理由：用户按「停止」不是故障（#236 §1）。**实时 `run_end` 与历史合成项 `run_termination`（§4.4a-2）共用这一条分级规则与同一份母语标签表**（`RUN_END_LABEL_REASONS`，除 `end_turn` 外的每个 reason 都有 zh-CN/en 标签；未知 reason 回落原文）。**erix-agent 0.18.0 起（上游 #176）**，`reason === "failed"` 的终局另带 additive 字段 `errorCode`：引擎把错误上已有的分类码原样透出（`timeout` / `rate_limited` / `auth` / `server` / `checkpoint_failed` / …），无分类码则为 `unknown`，**值域由引擎定义**；station 原样透传引擎 termination，因此运行时零改动即已下发（依据：`src/loop/termination.js:43-57`，在 `orchestrator.js:981-984` 调用），前端不解释其语义、也不新增枚举。**若宿主需额外区分「cancelled」这类 UI 语义，那是宿主从 `cancel_requested_at` + `termination.reason` 推导的展示态，不得冒充引擎取值**。**issue #370 新增一个宿主 additive 字段**：`detail === 'steered'`（轮边界转向导致的 abort，`reason` 仍是 `aborted`、值域零改动；runner 只补 detail，且**不覆盖引擎已给的 detail**）。它的唯一用途是**功能面**：转向导致的 abort 不点亮「重试上一条」（用户刚说「用这句继续」，再给一个「把上一条原话重发」是倒退，还会挤掉他刚排的那条转向）。⚠ **不进红色集合、不改 `RUN_FAIL_REASONS`**（那个集合还管「终态后补拉 history」，#306）。
@@ -2795,7 +2819,7 @@ Request:
 { "host": "github.com", "username": "x-access-token", "token": "<secret>" }
 ```
 
-`host`, `username`, and non-empty `token` are required. The token is URL-encoded and written through to `<userSpaceRoot>/<fdeName>/home/.git-credentials`; it is not stored in the database or passed in container environment variables. The file is atomically replaced with mode `0640` and the configured FDE UID/GID. The audit entry records the FDE and host only.
+`host`, `username`, and non-empty `token` are required. The token is URL-encoded and written through to the **platform-owned** credential file `<userSpaceRoot>/<fdeName>/platform/git/credentials` (bind-mounted read-only into the container at `/run/erix/git/credentials`, issue #399); it is not stored in the database or passed in container environment variables. The file is atomically replaced with mode `0644` owned by the portal process (the read-only bind, not the mode, is what prevents container-side writes; the image's `/etc/gitconfig` lists a fill-only helper for this file before the FDE's own `store`). The legacy `<fdeName>/home/.git-credentials` is left untouched for FDE-managed hosts (e.g. self-configured `github.com`). The audit entry records the FDE and host only.
 
 Response `200` (the token is never returned):
 
@@ -2815,7 +2839,7 @@ Response `200`:
 
 ### `DELETE /api/admin/fdes/:fdeName/git-credential?host=<host>`
 
-Removes all stored credential lines for the exact host, leaving other hosts intact; the credential file remains present even when empty. Response `200` is `{ "host": "github.com", "deleted": true }`. Audit details contain the host and deletion result, never token text.
+Removes all stored credential lines for the exact host from the platform credential file (and the legacy home file if the host still has a line there), leaving other hosts intact; the platform file remains present even when empty. Response `200` is `{ "host": "github.com", "deleted": true }`. Audit details contain the host and deletion result, never token text.
 
 ## 11. Admin Git host registry (issue #118)
 

@@ -2,8 +2,11 @@
 //
 // 为什么必须有：`fold-statistical`（A 片）只是让折叠**产出**替代物；产出之后若没人投递，用户侧
 // 感知仍与「静默硬删」一致——「折一次记一次」这条不变量要在这里闭环。引擎侧 0.26.0 已给出口：
-//   `context.onFoldSummary(payload)`，`payload = { ...record.foldedFacts, round }`
-//   = `{ text, source, chars, bytes, truncated, round }`。
+//   `onFoldSummary(payload)`，`payload = { ...buildFoldedFacts(), round }`
+//   = `{ text, source, strategy, bytes, fingerprint, round }`（夹断时多 `truncated`/`bytesBefore`，
+//   策略给出区间时多 `from`/`to`/`rounds`；erix-agent #485 之后多 `foldedRoundRange`/
+//   `foldedThrough`/`foldedRoundCount`）。**没有 `chars` 这个键**——旧注释写的 `{…, chars, …}`
+//   是手写出来而非测出来的，于是 `deriveFoldNote` 读它永远 `undefined`（详见该文件头）。
 // 投递方向是**宿主的事**（erix-agent#470 的定调：引擎里没有 notesStore 句柄，也不该塞 fs/DB）。
 //
 // 三条硬约束（写在代码里，不靠注释自觉）：

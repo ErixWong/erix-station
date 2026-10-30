@@ -15,3 +15,6 @@ coverage/
 
 # 分析/方案文档（本地过程产物，不入库）
 tasks/
+
+# 无斜杠版本：`node_modules/` 只匹配目录，符号链接曾经因此溜进仓库（见本 PR）
+node_modules

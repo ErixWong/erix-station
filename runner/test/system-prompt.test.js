@@ -257,3 +257,66 @@ test('SYSTEM_PROMPT 挡掉三种跑偏：自造域名/端口、找平台加端�
   assert.match(section, /shell/, '必须给出读得到 ports.json 的实际手段（文件工具够不到家目录）');
   assert.match(prompt, /0\.0\.0\.0/, 'dev server 绑 0.0.0.0 的硬约定不能丢（fde-platform §8.4）');
 });
+
+// ---------------------------------------------------------------------------
+// issue #425（用户体验）：**过程播报**。现场痛点是「agent 干活途中一个字都不说」：
+// 界面上能看见的只有工具卡片和偶发的正文，而 transcript 里 `stop_reason=tool_use` 的轮次只有
+// 164/973 带正文 ⇒ 一条十几分钟的 run 里用户可能只看到卡片在动。这不是引擎问题（流式通道本来就在），
+// 是提示词里从来没要求过「把进展说出来」。本段只钉行为要点，不钉措辞。
+// ---------------------------------------------------------------------------
+
+/** 抠出「过程播报」整段（从标题行到下一个空行）。 */
+function narrationSection(prompt) {
+  const lines = prompt.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('过程播报'));
+  assert.notEqual(start, -1, 'SYSTEM_PROMPT 必须有「过程播报」这一段（#425 的落点）');
+  const rest = lines.slice(start);
+  const end = rest.findIndex((l) => l.trim() === '');
+  const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
+  assert.ok(section.length > 100, '过程播报段不该是空壳');
+  return section;
+}
+
+test('#425：SYSTEM_PROMPT 有「过程播报」段，并写清开工先回一句 / 阶段报结果 / 失败也要报', () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  const section = narrationSection(prompt);
+  // ① 开工先回一句（否则从发送到第一个工具卡片之前用户看到的是完全空白）
+  assert.match(section, /先回一句/, '必须要求收到任务先回一句再动手');
+  assert.match(section, /工具调用|工具/, '必须把「用户看不见工具调用」这个因果写出来（否则这句会被当成客套）');
+  // ② 阶段报结果：判据是「按阶段/里程碑」而不是「每轮」——每轮都播会烧 token 也遮信息
+  assert.match(section, /每完成一个阶段|阶段/, '必须把播报节奏钉在阶段上，不是每轮刷屏');
+  assert.match(section, /下一步/, '报结果同时要报下一步（用户要的是“到哪了”，不是流水账）');
+  // ③ 不要拿工具报错去打断用户（否则播报会变成新的打扰源）
+  assert.match(section, /自己的活|不许打断|不要拿它们打断/, '必须区分「需要用户参与」与「自己的活」，不要把播报变成插话');
+  // ④ 失败不许咽下去（长时间静默后只给一句成功摘要 = 用户永远不知道绕过了什么）
+  assert.match(section, /失败/, '必须要求失败也播报');
+  // ⑤ 反向约束：播报不是第二段摘要（不钉这句，播报会膨胀成每次一段小作文）
+  assert.match(section, /一句话|不是报告/, '必须钉住播报的长度约束');
+});
+
+test('#425：播报段不得把「多久没说话」这类展示层阈值拄进提示词（单一真相在前端常量）', () => {
+  const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
+  const section = narrationSection(prompt);
+  // 状态条的等待阈值住在 portal/frontend/src/lib/runMomentum.ts；提示词里写「超过 60 秒没说话」
+  // 就是埋下第二份必然漂移的阀值（改一个数要同时改两个包）。
+  assert.doesNotMatch(section, /\d+\s*(秒|s)\b/, '播报段不得写具体秒数/阈值（展示层常量是唯一真相）');
+});
+
+test('#425：usage 事件不再被丢弃（旧代码把「不记账」做成了「不显示」）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const loop = extractOnEventBlock(src);
+  assert.doesNotMatch(loop, /type === 'usage'\)\s*return/, 'onEvent 里不得再 `return` 掉 usage 帧');
+  assert.match(loop, /loopEventPayload\(/, '接线处不得手拄第二份 payload');
+  assert.match(src, /case 'usage': \{[\s\S]*?context_window/, 'usage payload 必须带宿主侧 context_window（没配则不写键）');
+  // 记账那一侧的口径不得因为「要显示」而漂：onUsage 依旧不产事件，终态仍只吃 U2 载荷。
+  assert.match(src, /onUsage: \(\) => \{\}/, 'onUsage 必须仍是空实现（记账单一来源 = runToolLoop 返回值）');
+});
+
+/** 抠出 `onEvent: (event) => ...` 那一小段源码（防「去重」在重构里静默回来）。 */
+function extractOnEventBlock(src) {
+  const start = src.indexOf('onEvent: (event)');
+  assert.notEqual(start, -1, 'worker.js 必须仍有 `onEvent: (event) => …` 接线');
+  const end = src.indexOf('onDelta:', start);
+  assert.notEqual(end, -1, 'onEvent 与 onDelta 之间必须能划出一段（抠取器假设的形状变了要同步本文件）');
+  return src.slice(start, end);
+}

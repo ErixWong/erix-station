@@ -1,7 +1,11 @@
 # FDE Station 试用问题记录
 
 > **台账（2026-10-23 更新）**：本文是 2026-10-13 的原始反馈记录（保留历史原文，不改写）。
-> 7 条已全部登记到 GitHub issue，**追踪以 issue 为准**，见文末「条目 → issue 对照」。
+> 13 条已全部登记到 GitHub issue，**追踪以 issue 为准**，见文末「条目 → issue 对照」。
+>
+> 其中 **8~12 条**原本是**仓库外**散件（`fde_station/ISSUES.md`，412 行）里的内容——仓库内这份只有 7 条，
+> 也就是说这五条在仓库里**根本不存在**；2026-10-28 随 AGENTS §8.76 的散件清理一并归档进来。**第 13 条**是同
+> 一批散件里的 `toolcall-truncation-report.md`（追踪单 #426）。
 
 部署：本机 `station.vc.cn-ai.vip:8090`，portal/fde 镜像 = 上游 GHCR v0.1.5（digest 见 deploy/.env）。
 发现日期：2026-10-13。反馈渠道：内部记录，择机整理成上游 issue。
@@ -193,6 +197,250 @@ SSE 事件本身已到前端（逐字渲染存在即证明），纯前端可先�
 header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适配大得多。
 
 ---
+## 8. resume 必炸：erix-agent 0.23.0 写侧 `partOf` 写成链式，读侧只认首片行（引擎 bug，已实修）
+
+**现象**（2026-10-23 实跑，会话 c5f6cd78，todo 项目）：run 正常跑到 round 67 终态后，
+新消息「用户名密码是啥？」resume 起跑即失败，三次重试全同错、tokens 0+0（零请求出网）：
+
+```
+run failed: invalid_messages — Invalid message at index 108:
+tool_result ids do not match assistant tool_use ids
+```
+
+**根因**（已用容器内引擎自身代码复现，`/opt/erix/node_modules/erix-agent@0.23.0`）：
+工单 261021 把工具结果改成「一结果一成型一落盘」的分片行，靠 `partOf` 接回同一条逻辑
+user 消息。设计口径（`src/store/message-rows.js` 注释）：**`partOf` 恒指首片行 key**。
+但写侧 `src/loop/orchestrator.js`（~:3394 `toolResultRowKey = persistedRowKey` 每落一片
+就覆盖）把它写成了**链式**：第 3 片指第 2 片、第 4 片指第 3 片。读侧
+`foldLedgerMessages` 的 `keyToIndex[分片行] = entries.length`（合并后不推进），链式的
+第 3 片起接不回去、各自独立成条 ⇒ 一条 assistant（N 个 tool_use）后面跟多条单结果
+user 消息 ⇒ `src/messages/rounds.js#validateMessages` 判「tool_result ids 不匹配」
+⇒ `invalid_messages`（`retryable:false`）终局。**触发条件**：一轮并行 ≥3 个工具调用
+且此后发生 resume（跨 run 追问/崩溃续跑）——同轮 ≤2 个结果时链式=首片式，不触发。
+
+**影响**：0.23.0 起该会话永久不可续跑（每次 resume 重放同一坏账本，确定性炸）；
+非确定性竞态，是账本形状坏。
+
+**本机止血（已做，2026-10-23）**：SQL 递归解链，把该会话全部 10 条分片行的
+`record.partOf` 改写为指向各自链头（首片行），共 5 个 round（52/53/54/55/57）修复；
+用容器内引擎 `foldLedgerMessages` + `validateMessages` 对修复后全量账本验证通过。
+
+**上游修复建议**（写侧一行）：`orchestrator.js` 的 `toolResultRowKey` 只在
+`=== undefined` 时赋值（`??=`），不要每片覆盖。或读侧 `keyToIndex` 对分片行也登记
+（链式解引用）以兼容已坏账本——两者最好都做，后者能救历史坏数据。
+
+---
+
+## 9. 流式回复无打字机效果：前端 raw 对象 mutate 丢失 Vue 响应性（已修）
+
+**现象**（2026-10-23）：SSE 链路本身正常（run_events 里 `assistant_delta` 逐秒连续入库、
+portal 实时推流），但浏览器上回复文字一段段跳出来，不是逐字流。
+
+**根因**（`portal/frontend/src/stores/workbench.ts` 增量气泡 watch）：
+`deltaEntry = {kind:'delta', text:''}; entries.value.push(deltaEntry)` —— 数组内部存的
+是这个 **raw 对象**，随后 `deltaEntry.text = v` 直接改 raw，不经过 reactive proxy 的 set
+陷阱 → **不触发渲染**。只有下一次 entries 结构变更（push sep / 新卡片 / splice）整表重渲时
+才把新文字"顺带"带出来。用最小复现验证：raw mutate 下渲染 effect 全程只跑 1 次，
+改经 proxy 后每帧都跑。
+
+**同类隐患**（一并修）：`useEventStream.ts#toolCard()` 返回 set 进 reactive Map 前的 raw
+card，调用方首次 mutate（args/结果回填首帧）同样丢触发；改为返回 `toolCards.get(callId)`
+的 proxy。
+
+**修复**：push 后从 `entries.value[...]` 取回 proxy 再持有（indexOf 对 raw/proxy 双向
+解引用，`removeDeltaEntry` 不受影响）。回归测试两条（第一条在旧代码下确实红）。
+
+---
+
+## 10. 长会话历史消息「消失」：后端分页已实现，前端从不消费 `next_cursor`（前端缺陷，数据无损）
+
+**现象**（2026-10-23 实查）：会话头部显示「31 条消息 · 已压缩 2 次」，向上翻到最顶部
+只有这条状态行 + 压缩提示「上下文已开始压缩；如需保留完整细节，建议新开会话」，
+再往上没有任何消息——最早的约 1/3 对话在界面上不可见，也没有「加载更早」入口。
+
+**结论：消息没有被压缩删除，也不是后端丢数据；是前端未实现历史分页，只渲染了最新一窗。**
+「已压缩」文案出现在截断处附近，纯属背锅（但它确实诱导用户得出"压缩吃掉消息"的错误结论）。
+
+**证据链**：
+
+1. **头部条数是全库计数**：`portal/src/sessions.js:107/180` `message_count =
+   SELECT COUNT(*) FROM messages`（全量，含 synthetic，不受分页窗口影响，#197 口径）；
+   前端 `stores/workbench.ts` `sessionStats`（:472-487）优先消费它 ⇒ 显示 31。
+2. **消息窗口默认 20 条**：`getSession`（`sessions.js:250` 起）keyset 分页默认
+   `limit=20`（上限 100），`cursor=<更早批最小 seq>` 取下一批，响应带 `next_cursor`
+   （`sessions.js:334`）。`http.js:1462-1466` 正常透传 `?limit`/`?cursor`——**后端侧完备**。
+3. **前端不翻页**：`openSession`（`workbench.ts:653`）请求 `/api/sessions/{id}` 不带任何
+   分页参数；`SessionDetail` 接口（`workbench.ts:152`）没声明 `next_cursor`；全前端
+   `next_cursor` / 触顶加载 / 「加载更多」零命中；`WorkbenchView.vue` 滚动逻辑只有
+   自动贴底（`scrollDown`），无触顶加载。⇒ 31−20=11 条更早消息在库里，界面永远拿不到。
+4. **压缩（compaction）不删消息**：设计见 `docs/design/conversation-state.md`（参照 pi：
+   真相 append-only，compaction 是视图层）；`foldedPayload` 原文留在
+   `transcript_rounds.folded_payload`/`record`，#189 有只读端点
+   `GET /api/sessions/:id/folded/:round` + 前端「查看原文」懒加载（`StreamPanel.vue:206`）；
+   全站 `DELETE FROM messages` / `DELETE FROM transcript_rounds` 零命中，无清场删除。
+
+**修复建议**（前端为主，后端零改动）：
+
+1. `openSession` 消费 `next_cursor`：滚动触顶（或显式「加载更早消息」按钮）时
+   带 `cursor=<当前最早 entry 的 seq>` 再取一批，按 seq 归并进 entries，并保持
+   滚动位置锚定（防跳动）；`SessionDetail` 类型补 `next_cursor` 字段。
+2. 首屏建议显式传 `limit=100`（后端上限），减少常见会话的翻页次数。
+3. 文案解耦（次要）：头部「已压缩 M 次」提示的是**模型上下文**压缩，与「历史消息
+   分页」无关；截断处宜给一条独立分隔行（如「↑ 更早消息点击加载」），避免用户
+   把分页截断误读成压缩删消息。
+4. 同类隐患一并查：`GET /api/sessions/:id/events/history` 默认 limit=500（上限 2000）
+   同样不翻页（`docs/api/portal.md` §4.4a），超长 run 的历史工具卡片也会截头。
+
+**验证口径**：修好后同一会话应能逐批翻到第一条用户消息；DB 侧
+`SELECT seq, role FROM messages WHERE session_id=… ORDER BY seq` 行数与头部
+「N 条消息」一致（本来就一致，这是纯读面缺陷）。
+
+**修复记录（2026-10-23，erix-station 分支 `fix-261023-01-older-messages-pagination`；rebase 到 v0.1.30 后 commit `dc85647`，PR gh#353 已合并，merge commit `3bdde74`）**：
+按建议 1+2 实施，后端零改动。① `workbench.ts`：`SessionDetail` 补 `next_cursor`；`openSession`
+首屏 `?limit=100` 并记下消息/事件两个更早游标；新增 `loadOlderMessages()`——更早批走与首屏
+同一条按 seq 归并回放链路（renderedIds/callId/卡片键幂等），本批新产出整段前插到 entries 头部；
+加载失败不推进游标（入口保留可重试）。② `StreamPanel.vue`：顶部「加载更早消息」按钮，
+游标 null（到底/旧后端）不渲染、加载中禁用。③ `WorkbenchView.vue`：watch `olderPrependSeq`
+做 scrollTop 高度差补偿，前插不跳视野。④ events/history 更早批按 `?before=<事件游标>&limit=2000`
+同步回放（judge/分隔行按 seq 穿插进旧正文区）。测试 +4（游标消费、前插顺序、before 事件回放、
+失败保游标）；vitest 36 文件 659/659、`vue-tsc` 干净。建议 3（文案解耦）未动——压缩横幅语义
+本身没错，只是此前被当成了截断元凶；建议 4 的 history 截头已顺带解决（before 翻页）。
+
+---
+
+## 11. 预览端口呈现盲区：应只显示当前目录在用的端口，并显性暴露「一个项目多实例占多口」（体验 + 观测缺失）
+
+**现象**（2026-10 实机）：
+
+1. 预览端口面板列的是该 FDE **整块预分配**的 10 条地址（22000–22009），与「当前目录/项目实际用了哪几口」无关，用户面对 10 行只知道都"可能"能用；
+2. 实测 **22000 与 22001 上跑的是同一个项目两个分支的 dev server**——旧会话留下的进程没死，新会话另起一局另占一口。面板上两行长得一模一样（同 FDE 名 + 不同端口），没有任何信息告诉用户"这两口背后是两个进程、两个分支"。FDE 缺经验时必然搞不清该点哪个、哪个是旧的。
+
+**现状盘点（代码事实）：平台对容器内真实监听完全失明，上报和检测两条路都不存在**
+
+| 通道 | 方向 | 内容 | 局限 |
+|---|---|---|---|
+| `ports.json` 物化（`portal/src/materializer.js:141 renderPortsJson`） | 平台→容器 | FDE 级 10 条预分配清单 | 与真实使用无关；#246 起 scope 恒为 `fde`，**不按项目分**（P5 去项目化，同文件 :139 注释） |
+| LLM 口播 URL（系统提示词第 8 条，`materializer.js:107`） | agent→聊天文本 | 「服务起好了，URL 是…」 | 只是行为约定，**不是结构化上报**；平台不解析、不落库 |
+| agentd heartbeat（`runner/agentd.js:406 heartbeatOnce`，15s） | 容器→平台 | `{agent_version, runs[]}` | 只有 run 租约，**无监听/进程信息** |
+| 技术探测 | — | 无 | `portalloc.js` 头注释明文「平台不做容器侧端口管控：不检查、不限制、不 reconcile 容器实际监听什么」 |
+
+⇒ 呈现层无论怎么做，缺的都是同一个事实：**端口 ↔ 进程 ↔ 目录/分支 的映射**，目前任何一层都没有。
+
+**交付①：端口列表按当前目录过滤 + 用途标注**
+
+工作台已有「当前目录」上下文（`frontend/src/stores/workbench.ts` `dirCwd`），会话也绑定 cwd（`sessions.js`，directory-as-project）。把 `GET /api/ports` 的返回从「FDE 全量 10 条」改为两段式：
+
+- **当前目录在用**：URL 可点 + 用途标注（"前端 dev server"/"API 后端"，可能多条）+ 放行状态 + 打开按钮；
+- 折叠区「本账号其余可用地址」：保留现有全量列表（复用/签票入口不丢）。
+
+**交付②：技术检测机制（观测层，本 issue 的核心增项）**
+
+自报（LLM 或 agent 主动上报）不足以作为真相，三种失效模式本次实机全踩到了：僵尸进程不再自报、新会话不知道旧实例存在会另领新号、原地切分支后注解描述的代码已失效。**事实必须由平台观测**：
+
+1. **agentd 采样 `/proc`**：解析 `/proc/net/tcp[6]` 拿 LISTEN 端口与 inode → 扫 `/proc/<pid>/fd` 反查属主进程 → 读 `/proc/<pid>/{cwd,cmdline,stat}` 拿目录/命令/启动时刻。erix 用户读自己的进程，无需 root，成本可忽略；
+2. **随现有 heartbeat 捎带**（U4 载荷 additive 加 `listeners: [{port, pid, cwd, cmd, started_at}]`），不需要新通道；portal 落 `port_observations`（带 `observed_at`），**连续几个心跳没观测到 ⇒ 自动消失**——陈旧性由采样机制自身解决，无需显式释放；
+3. **归属增强**：cwd 已知后直接读 `.git/HEAD` 文件（不 spawn git）补分支；同 repo（git `commondir` 或 remote URL）出现 ≥2 个监听 ⇒ 判定「同一项目多实例」；
+4. **口径界线**：这是「只读观测用于展示」，不是「管控/reconcile」，不破 #246「不做容器侧端口管控」的不变式，但需在文档中明说这条界线。
+
+**交付③：多实例显性呈现（不能阻止就先做到这条）**
+
+冲突卡片：同一 repo/目录 ≥2 个活跃监听时，面板分组渲染并标注每实例的 `分支 / 启动时刻 / 所属会话是否已停`。孤儿实例（所属会话已终态而进程还在听）打 ⚠ 标记。注意诚实口径：**分支是目录此刻的 HEAD，不是进程启动时加载的代码**，所以同时展示 `started_at`，让人能推断「这进程比切分支还老」。
+
+**防止（可选后续，按成本递增）**：
+
+1. 规范层：`.erix/AGENTS.md` 是 materializer 物化下去的，加一条硬规则「起服务前先查该端口是否已被自己的旧进程占用；同项目旧实例先 kill 再起、复用原端口」——存量 FDE 下次物化自动生效，零迁移；
+2. 行动层：冲突卡片给「停掉旧实例」按钮 → agentd 命令通道（U4 已有 stop 兜底先例，kill 进程是同通道新 op；erix 杀自己的进程权限天然对），用户点击、平台不擅自动手；
+3. 根治层：会话-进程同生命周期——agentd 把 dev server 收进会话进程组，会话 stop 时 `killpg`。僵尸机制性消失，但需处理 `nohup`/`setsid` 逃逸，建议先用观测数据评估僵尸普遍度再决定。
+
+**落地顺序**：② 观测 MVP（这一步就解决痛点，且不依赖 agent 自觉）→ ①③ 呈现 → 防止 1/2 → 防止 3 视数据另议。自报（先前讨论的 `port_usages` label）降级为可选增强：观测已能回答「哪个目录、什么框架、几号进程」，自报只是把它说成人话。
+
+**代码触点预估**：`runner/agentd.js`（采样 + heartbeat 载荷）、`portal/src/internal.js`（heartbeat 落 observations）、新迁移（`port_observations` 表）、`portal/src/portalloc.js`（列端点 LEFT JOIN + `?cwd=` 过滤）、`frontend/src/components/PreviewPortsPanel.vue`（两段式 + 冲突卡片）、`portal/src/materializer.js`（AGENTS.md 规则条目 + 容器侧 prompt）。
+
+**实施记录（2026-10-24，方案 A 观测层 MVP）**：已提交 erix-station 分支 `feat-261024-02-port-observations`：
+① 迁移 `deploy/migrations/0022-port-observations.sql`（`port_observations` 表，每容器每端口唯一）；
+② `runner/lib/listeners.js`：/proc 采样（LISTEN 端口 + inode→pid 反查 + cwd 归一 `~/` + cmdline 摘要 +
+`.git/HEAD` 分支含 gitdir 链接 + `stat` 第 22 列换算启动时刻），绝不 throw，procPath 可注入；
+`runner/agentd.js` heartbeat 捎带 `listeners`（additive，旧 portal 忽略）；
+③ `portal/src/internal.js`：heartbeat 消毒（`sanitizeListeners`）后对该容器**整批替换**落库，
+写失败只警告不炸心跳（新 agentd + 未跑 0022 的旧库兼容）；**缺 `listeners` 字段 = 不碰观测**；
+④ 读端点 `portalloc.listFdePreviewPorts` 每条附 `observed`（新鲜度窗口 45s = 心跳 15s ⚠ ×3，同「连丢判死」口径；
+表缺失整块降级全 null），DTO 与两列端点文档已更新（portal.md §4.7a / runner-integration.md §4.2 U4）；
+⑤ 前端 `PreviewPortsPanel`：观测行（cwd@分支·起了多久，title 全量）+ **同目录 ≥2 监听 = 顶部冲突警告**
++ 传 `currentCwd`（工作台 store.dirCwd）时本目录在用排最前挂徽章；**无观测的行不渲染任何反向文案**
+（null ≠ 空闲）。测试：runner listeners 4 例（/proc fixture）、internal 观测落库/消毒/降级 2 例、
+preview-ports 观测附取/降级 2 例、migrations 0022 锚点 1 例、前端 panel 4 例 + lib 纯函数 8 例。
+三面退出码全 0（portal 1431 / runner 327 / 前端 802 + typecheck）。
+⑥ 规范层：`materializer.js` 的 AGENTS.md「目录约定」加「复用端口前先看旧进程（同项目旧实例先停、原号重起）」。
+未做（后续）：一键 kill 旧实例（agentd 命令通道）、会话-进程组同生命周期、按 repo（git commdir）归组。
+
+---
+
+## 12. 自托管 kkFileView：左侧文件列表点击 → 右侧预览面板 + 全屏 modal（功能提案）
+
+> **已提线上 issue**：[erix-station#356](https://github.com/ErixWong/erix-station/issues/356)（2026-10-24，labels: enhancement/design）
+>
+> **方案定稿单**：[erix-station#366](https://github.com/ErixWong/erix-station/issues/366)（2026-10-24）——评审后架构收编：
+> 事实修正（文件在宿主 bind mount 非 FDE 容器内，kk 改 ro 挂 userspace 本地模式，签票拉取降为分布式 B 方案）；
+> /pv/<code> 预览反代闸门（短码 capability URL，隐藏 kk + A/B 隔离同层解决，隔离链⑤层）；
+> 分阶段 P0（415 埋点+下载按钮+stream 端点）→ P1（PDF/音视频原生）→ P2（kk+反代+全屏 modal）→ P3（右侧 panel）；
+> #356 的 #246 关联为范畴错误已在其评论区声明，本单 §五 为其技术要点终稿。
+>
+> **已合并（2026-10-24，PR [#372](https://github.com/ErixWong/erix-station/pull/372) merge `aaf8294`，main CI 门禁绿；台账 erix-station `AGENTS.md` §8.57）**：P0/P1/P2 全量 + kk 本层落地。**镜像改自建 5.0.3**（官方 Hub 停 4.1.0 无 `file://` 本地协议，上游 5.x 未发镜像；`deploy/kkfileview/build-image.sh`）；真机 E2E 通（docx→pdf 产物经 /pv 闸门 200）；基线根 1468/1464/0、前端 816、typecheck 0。台账 erix-station `AGENTS.md` §8.52。待：镜像 push GHCR + digest 钉（另一批变更推完再动）、发版窗口（归决策者）。
+
+**提案**（2026-10）：本机 docker-compose 栈部署 [kkFileView](https://github.com/kekingcn/kkFileView)
+（镜像 `keking/kkfileview`，默认端口 8012），让工作台文件树点击文件时按扩展名路由到两套预览通道。
+
+**现状基线（代码事实）**：`portal/frontend/src/components/FilePreviewModal.vue`（issue #84 P6 第一版）
+走 `GET /api/file`（base64 data URL），只渲染三种：Markdown / 纯文本 `<pre>` / 图片 `<img>`；
+413 超限、415 二进制直接报错。**Office、PDF、CAD、压缩包、音视频等二进制格式目前无解**。
+
+**交互设计**：
+
+1. **扩展名白名单先行**：前后端共享一份「允许预览扩展名清单」，分两桶——
+   - `native`（md/text/img，走现有 modal，零改动）；
+   - `kkfile`（doc/docx/xls/xlsx/ppt/pptx/pdf/画类/cad/压缩包…，走 kkFileView）；
+   - 清单外扩展名：点击不预览（或仅下载）。清单落配置而非硬编码，随版本演进。
+2. **右侧预览 panel**：命中 `kkfile` 桶的文件 → 工作台右侧新 panel 内嵌
+   `<iframe src="http(s)://<kkfile-host>/onlinePreview?url=<base64(带签票的文件下载地址)>`；
+3. **全屏 modal**：panel 可点击 → 弹出约网页尺寸的全屏 modal（复用 `ModalShell.vue` 交互模式：
+   Esc 关闭/焦点归还/锁背景滚动），iframe 原样搬进 modal，panel 侧保留占位。
+
+**技术要点与坑**：
+
+- **文件怎么给到 kkFileView**：kkFileView 是**服务端拉取**模式（`url=` 参数由 kk 的 JVM 去下载），
+  而文件在 FDE 容器内。方案：portal 新增（或扩展 `/api/file` 为 `?mode=stream`）一个**带短时效签票的
+  文件下载端点**，拼进 `url=` 让 kk 代取——不挂共享卷、不违反 #246「不做容器侧端口管控」。
+- **安全（必须）**：kkFileView 历史多起 SSRF/RCE（如 GHSA HTML 预览脚本执行，新版已 iframe 沙箱化）；
+  部署时 ① 出网限制（kk 容器只允许回源 portal 下载端点，默认拒任意 URL）② 下载端点用
+  一次性/短时效 token 限定 (fde, cwd, path, 用户)，防 SSRF 打内网 ③ pin 官方版本，别追 latest。
+- **i18n / 测试**：新文案走 `preview.*`（对齐 #101 P2 口径）；iframe 存在性、扩展名路由纯函数、
+  token 端点各补测试，对齐现有测试基线口径。
+
+**代码触点预估**：`deploy/docker-compose.yml`（kkfileview 服务 + 出网限制）、
+`portal/src/files.js`（stream + 签票端点）、新配置（扩展名两桶清单）、
+`frontend/src/components/`（右侧 panel 组件 + `FilePreviewModal.vue` 扩展 kkfile iframe 分支 +
+扩展名路由纯函数）、`docs/api/portal.md`。
+
+**落地顺序建议**：MVP = 部署 kk + 签票下载端点 + 全屏 modal 一个通道打通 → 再加右侧 panel →
+扩展名清单配置化。
+
+
+## 13. 上游网关 `qwen3.8-flash-next`：`tool_calls` 参数流被提前截断（嵌套 schema + args ≳4KB，2026-10-24）
+
+**现象**：同一条 SSE 流里 reasoning 分片正常吐完，`tool_calls` 参数只吐出前 10–31 个字符就断——没有
+`finish_reason`、没有 `[DONE]`、没有 usage 分片，而 **HTTP 仍是 200**。触发条件是入参 schema 为「数组套对象」
+且参数字符串 ≳4 KB；同样长度换成扁平 schema 完全正常（20 KB 也过）。同一会话里 `bash`/`read`/`write` 全好，
+只有 `edit`（`{edits:[{oldText,newText}]}`）死：**本地 1.2 万+ 次调用里 edit 失败 41 次，其余工具合计 4 次**。
+
+**为什么不能靠重试**：同一 payload 是**确定性**失败，重试 3 次全死在同一处，只是重复烧 token。
+
+**已采用的规避**：单次 `edit` args ≤ ~2 KB（拆小）；整文件重写走扁平的 `write`；应急临时切
+`kimi-for-coding`（3/3 通过，延迟约 2 倍）。
+
+**追踪**：**#426**（上游网关侧，本站改不了 ⇒ 本单是观察 + 承接）。完整报告与复现脚本已入仓：
+`docs/design/toolcall-args-truncation-2026-10-24.md` / `-repro.py`（纯 stdlib，两条命令即可判定上游修没修）。
+
+---
 
 ## 条目 → issue 对照（2026-10-23）
 
@@ -241,6 +489,13 @@ header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适�
 | **#352** 按项目看端口占用 | ✅ **已关闭（观测层 B+）+ 发布物真机验收**：agentd 采样 `/proc` → U4 心跳 → `port_observations`（迁移 0022）→ `GET /api/me/ports` 每行加 `observed`（只做加法，原 8 列不动）。真机特意造了 **agentd=uid 1001 / 监听进程=uid 1000** 的跳 UID 形状 ⇒ `pid/cwd/branch/cmd` 全拿到（这条单测在 uid=1000 机上结构上测不到）；池外 3000 合成 `state='observed'` 只读行，而 Docker 内嵌 DNS（uid 0、无项目 cwd）**入库但不进面板**（按 `~/projects/` 过滤，设想的）；界面 `probe-351  Current` 分组排最前 + `Spare (9)` 折叠 + 「同目录同时候在 3000 与 22000」告警（截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`） |
 | **账本第四种砖化形状（新）** | ✅ **已定位 + 已修数据 + 两个会话真机复活**：`:resume` 载体裸重放「已在**别的轮**结清的 `tool_use`」⇒ 折叠救不了（造不出缺失的那条 `tool_result`）。判据与手术整节落 `docs/ops/transcript-ledger-inspection.md` **§7**（⚠ 判据必须**带轮**：按 id 查孤儿得「干净」假结论，按记录判在 0.23+ 上是 9 会话误报）。定性 = **历史化石**（两条载体 ts 是 10-08 / 10-15 旧引擎；0.26.0 现跑的 `:resume` 行不带 `messages`）。修前/修后都拿**引擎自己的校验器**判（`index 36` / `index 73` → PASS），真机两会话 `judge_done` |
 | 基线刷新 | 根 **1656 / 1652 / 0 失败 / 4 跳过**、runner **399/399**、前端 **50 文件 / 925** + `typecheck` rc=0（台账原值 1493 / 221→323 / 47 文件 857 均过期）；台账 `AGENTS.md` §8.72 |
+| 8 | resume 必炸：写侧 `partOf` 写成链式，读侧只认首片行 | **#341** | **仍未修**（引擎侧 0.23；存量砖的 ops 修数据见 **#367**；复核记录 AGENTS ~§8.36/#351） |
+| 9 | 流式回复无打字机效果（前端 mutate raw 丢 Vue 响应性） | **#342** | **已修**（v0.1.26 真机验收：374 次采样画面增长 62 次、每 ~200ms 一跳；AGENTS §8.43） |
+| 10 | 长会话历史消息「消失」：前端从不消费 `next_cursor` | **#338**（后端 keyset） | **已修**（前端现消费游标：`stores/workbench.ts` / `StreamPanel.vue`；后端 `(round, append_seq)` keyset AGENTS §8.39） |
+| 11 | 预览端口呈现盲区（只显示在用端口 + 显性暴露多实例占多口） | **#246 / #251 / #253 → #308** | **已修**（全局号池与列端点 AGENTS §8.13/§8.14；端口段搬进左栏 §8.41，PR #340） |
+| 12 | 自托管 kkFileView：文件树点击 → 右侧预览面板 + 全屏 modal | **#356 / #366** | **已交付**（PR #372 merge `aaf8294`；四通道 + kkFileView 5.0.3，AGENTS §8.57） |
+| 13 | 上游网关 `tool_calls` 参数流被提前截断（嵌套 schema + ≳4KB） | **#426** | **观察中**（本站改不了上游；报告与复现脚本已入 `docs/design/`，三条规避已采用） |
+| 14 | 切换用户后首页对话窗口里还是上一个账户的对话记录（决策者 2026-10-28 口述） | **#428** | **已修**（登出只清 auth store + SPA 不重载页面 ⇒ workbench 全局单例跨账号存活；新增 `resetForUserSwitch()` + `claimOwnership()` 两处视图接线，AGENTS §8.77；**未发版**）。跨账号写已**源码对账确认挡住**（`fetchSession()` 非属主一律 `404 not_found`、不泄露存在性；`POST /messages` 幂等 fn 内先 `assertSessionOwner`，`postMessage` 再带 `FOR UPDATE` 二次校，SSE 同口径）⇒ 定级 = 体验 + 信息泄漏，不是数据串号。**未尽部分另立 #431 并已修**（登出三颗按钮只有一颗收摊 ⇒ SSE 带死会话无限重连；`createDir`/`recallQueue`/`stop` 三条迟到写回无守卫），AGENTS §8.78 |
 
 ### 🔭 观察队列（不指派，等信号）
 
@@ -249,6 +504,7 @@ header（需 dev server 不依赖）。收益面比方案 C 这类应用侧适�
 - **#303**：0.23.0 读侧仍有 7 条路径认顶层旧名 ⇒ `?? tr.duration` **不许删**；触发条件已改成「旧 transcript 行归档时」。
 - **#331**：`ERIX_SESSION_AUTO_TITLE` 死光纤（#322 之后 `runner/` 零读取，但撤它要动 portal + 两处测试）。
 - **#346 / #348 / #321 残留**：需产品决策。
+- **上游 [erix-agent #467](https://github.com/ErixWong/erix-agent/issues/467)**（本站 2026-10-25 登记，决策 = **暂不改代码**）：`judge_done` 停机不走强制收尾（`termination.js:529` reason 白名单缺它）⇒ 模型末轮只出 reasoning、零正文时**终局静默**，时间线最后一条是评审卡。真机 **6/90**（全站 `judge_done`）/ **1/6**（登记现场那个会话）。修法是白名单加一项，`hasFinalDraft()` 自带豁免 ⇒ 只在该掏的 6 次掏一次 `tools: []` 的文本请求（同路 `max_rounds_cap` 6/6 实测产出 1.1–2.3K 字正文）；**等下一次 runner 镜像批次顺路带走**，不为它单独重建五台容器。复算锚点：会话 `14dd6202-1471-44f9-b492-ce88c7e35f30` / run `040b2f7e…` / `run_events.seq` 28722→28725。**同单另一问需产品决策**：评审理由原文写着「仅剩提交动作」仍交 `done=true / conf=0.85` 过硬停门——比静默更伤（没干完还被判干完）。
 
 ### 📋 未关闭 issue 分层（2026-10-27，27 个 open 全量过一遍）
 

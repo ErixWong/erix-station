@@ -323,7 +323,7 @@ portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确�
 4. **物化用户空间文件（bind mount）**：portal 直写宿主 `/srv/erix/users/<fde>/`（H-B 定稿 D-6，issue #7，无需任何入站网络；原「落容器内文件需容器网络可达」类表述随之作废）——含 `AGENTS.md`、`~/.erix/config.json`、项目 `.erix/ports.json`、模板与 `manifest.json`。**文件清单、路径映射、原子写、UID/权限、失败重试、重建幂等、项目目录归属的完整契约见 [`user-space.md`](user-space.md)**（本条由原「写模板/AGENTS.md」单点描述扩充为该契约）
 5. **创建 LLM 绑定**：按建号表单必选的 LiteLLM provider 与主模型（可选 embedding / vision）创建模型白名单受限的 per-FDE 虚拟 key 并发布 LLM 注入路由；key 只写进宿主 Traefik 动态配置（600），**不进容器**（容器内零 LLM 凭据，§11）
 
-> **边界**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。平台不绑定单一 git host 产品；管理台可新建 Gitea/GitLab（可选平台代铸）与 GitHub host。GitHub 以 `per_fde_pat` 支持：平台无法为其代铸 per-FDE 凭据（凭据由管理员/FDE 提供，host 的 mode 恒为「需凭据」，配置 admin key 会被拒绝），azure 仍空悬。agent 代劳 clone，Git 凭据由 FDE 经 portal 投放（#110）到 `home/.git-credentials`；GitHub 另写 `~/.config/gh/hosts.yml` 供 gh CLI 读取。此 write-through 凭据文件不进 DB/日志/audit payload，细节见 [`user-space.md`](user-space.md) §4.1.1。平台不下发 SSH key（SSH 强制私钥 `0600` 与组可读 `0640` 冲突）。
+> **边界**：平台交付到「**容器内一个仓库目录** + 端口分配 + 模板」为止。平台不绑定单一 git host 产品；管理台可新建 Gitea/GitLab（可选平台代铸）与 GitHub host。GitHub 以 `per_fde_pat` 支持：平台无法为其代铸 per-FDE 凭据（凭据由管理员/FDE 提供，host 的 mode 恒为「需凭据」，配置 admin key 会被拒绝），azure 仍空悬。agent 代劳 clone，Git 凭据由 FDE 经 portal 投放（#110）到平台独占的 `platform/git/credentials`（#399：ro bind 进容器 `/run/erix/git`，git 的 401-erase 删不动；FDE 自配凭据仍写自己的 `home/.git-credentials`）；GitHub 另写 `~/.config/gh/hosts.yml` 供 gh CLI 读取。此 write-through 凭据文件不进 DB/日志/audit payload，细节见 [`user-space.md`](user-space.md) §4.1.1。平台不下发 SSH key（SSH 强制私钥 `0600` 与组可读 `0640` 冲突）。
 
 **开户执行（issue #111 A；LLM 绑定按 issue #146 更新）**：管理台新建 FDE 时 email、`fde_name`、启用中的 Git host，以及 LiteLLM 目录中的 provider 和至少一个启用且支持 tool-calling 的主模型必填。目录不可达（LiteLLM profile 未启用或故障）时 fail-closed，拒绝创建用户。用户、模型选择（保存在 `fde_onboarding.steps` JSONB）、Git host 绑定与队列记录在同一 DB 事务内写入。portal 后台依次执行 provision、用户空间 materialize、`llm-binding` 并持久化步骤状态；LLM key 创建失败只将该步骤记为 `failed`，不阻断账户主体，整体终态仍按 Git 凭据状态取 `done` / `awaiting_credential`。**`per_fde_pat` 模式下开户时凭据尚未投放、用户处于 `awaiting_credential`，但物化照常生效（见 [`user-space.md`](user-space.md) §8.1）——平台文件不因凭据待补而缺失**；管理员/FDE 投放凭据把状态翻回 `active` 时 portal 会在同一事务内补入队一次物化 revision（issue #183）。**同一「活」状态口径也适用于容器对账（issue #185）**：`awaiting_credential` 的 FDE 仍在 reconciler 的「应有容器」期望集内——删/换 Git 凭据把状态翻成 `awaiting_credential` 时，既有容器**不得**被判孤儿删除重建（正在跑的 run 不被杀）；`disabled` 仍排除（offboarding 后容器照常被清）。管理员可用 onboarding retry 重试该独立步骤；若已有 binding（例如管理员先手配），开户步骤跳过且不覆盖。其他步骤失败仍由管理员显式重试，已完成步骤跳过。
 
@@ -718,7 +718,8 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 
 ```
 /srv/erix/users/<fde>/            # 宿主机（user-space.md §2）
-├── home/                          # 挂到容器 /home/<user>（HOME：.git-credentials + .erix/{config.json,mcp.json,skills,todos} + .cache/station/spool）
+├── home/                          # 挂到容器 /home/<user>（HOME：.git-credentials[FDE 自配] + .erix/{config.json,mcp.json,skills,todos} + .cache/station/spool）
+├── platform/git/                  # 平台托管 Git 凭据（#399：portal 独占写，ro bind → 容器 /run/erix/git）
 ├── projects/<project>/            # 仓库；含 .erix/{ports.json,AGENTS.md} + .gitignore
 ├── worktrees/<project>-<runId>/   # 每个 run 独占的 git worktree（agentd 创建）
 └── cache/                         # 依赖缓存（npm/pnpm/pip）

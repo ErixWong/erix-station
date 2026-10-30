@@ -240,6 +240,14 @@ export const en = {
       // run (the stripped part is the fold archive; originals stay readable in the ledger rows, #375).
       // Neutral separator, never red; fatal ones are rendered by `run_end` / `persistence_failed`.
       persistenceDegraded: 'persistence degraded: the {operation} record was not stored (this run is unaffected)',
+      // issue #421: four diagnostic event types the engine promises but this host used not to subscribe
+      // to. All four render as neutral separator lines — they report "config didn't take effect /
+      // capability missing / this batch was never ledgered", not "this round failed".
+      strategyFallback: 'compaction is not using the configured strategy: the engine fallback "sliding-window" drops whole head rounds without summarising (from round {round})',
+      metadataMissing: 'model context metadata missing: compaction and the aggregate output budget are disabled for this run',
+      capabilityDegraded: 'store lacks the {method} capability: that persistence is skipped for this run (no mid-run crash resume)',
+      resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the snapshot',
+      resumeJournalSome: 'some',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       // issue #321 (erix-station): the judge is forever only an **opinion**, never an acceptance — shown on
@@ -276,8 +284,13 @@ export const en = {
       judgeDegraded: 'judge degraded ({error}); no verdict this round',
       judgeUnknownAction: 'judge action: {action}',
       judgeNoDetail: 'judge event (no interpretable details)',
-      compaction: 'Context compaction (round {round}, strategy {strategy}): {folded} rounds folded, {before} → {after} tokens',
+      compaction: 'Context compaction (round {round}, strategy {strategy}): {folded} rounds folded, {before} → {after} tokens{degrade}',
       compactionStrategyUnknown: 'unknown',
+      compactionDegradeNote: ' (⚠ {body})',
+      compactionDegraded: 'summary degraded: {kind}',
+      compactionBudgetExhausted: 'summary budget exhausted (no self-heal retry)',
+      compactionInputClipped: 'summary input clipped ({rounds} rounds / {messages} messages dropped; written from incomplete material)',
+      compactionTruncated: 'summary truncated at the output budget',
       finalGuard: 'final guard: {action}{dash}',
       forcedFinal: 'forced final (round {round}): {reason}',
       runEnd: 'run ended: {reason}{usage}',
@@ -342,11 +355,27 @@ export const en = {
     lastRunElapsed: 'last run {dur}',
     tools: '{count} tool calls',
     toolsAvg: ' (avg {dur})',
-    frozen: 'no upstream output for {sec}s',
-    refreshBoundary: 'Run metrics live only on this page: after a hard refresh only message timestamps remain (run_end / usage are not replayed from history)',
+    frozen: 'nothing new for {sec}s',
+    refreshBoundary: 'After a hard refresh the live rate and elapsed time are lost (run_end is not replayed from history); last run\u2019s tokens and the context window stay visible (they come from replayed round_end usage)',
     runningElapsed: 'running for {dur}',
     runningHint: 'This run is still executing; numbers refresh every second',
     messageTimeTitle: 'Message time',
+    // ---- issue #425: phase + tokens (the bar must always be able to say what it is waiting on) ----
+    // `{tool}` is the upstream tool identifier (an English token by nature, not translated here).
+    phaseAwaiting: 'waiting for the model {sec}s',
+    phaseAwaitingHint: 'The request is out and the model has not started answering yet. With a large context this silence can legitimately last tens of seconds; it is not a failure',
+    phaseTool: 'running {tool} ({sec}s)',
+    phaseToolNoName: 'running a tool ({sec}s)',
+    phaseToolHint: 'The tool is really executing inside your container (build / tests / dev server); this duration does not depend on the model',
+    phaseStreaming: 'generating',
+    phaseSilent: 'nothing new for {sec}s',
+    context: 'context {pct}% ({used}/{window})',
+    contextHint: 'Context sent to the model on the current round: {used} tokens of a {window}-token window (older rounds get compacted automatically as it fills up)',
+    roundTokens: 'this round \u2191{input} \u2193{output}',
+    roundTokensInput: 'this round \u2191{input}',
+    roundTokensOutput: 'this round \u2193{output}',
+    roundTokensHint: 'Real usage for this round (upstream usage payload); \u2191 is the context sent to the model, not the cost',
+    runTokens: 'total {tokens}',
   },
   composer: {
     send: 'Send',

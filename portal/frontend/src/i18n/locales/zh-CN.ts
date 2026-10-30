@@ -259,6 +259,13 @@ export const zhCN = {
       // 本次任务**（剥掉的是折叠归档，原文仍在各轮记录里，#375 负责取回）⇒ 中性分隔行，不用红色。
       // 致命的那条（`fatal:true` 或旧版无字段）不在这里刷，由 `run_end` 的 `persistence_failed` 红面负责。
       persistenceDegraded: '落盘降级：{operation} 记录未存入（本次任务不受影响）',
+      // issue #421：引擎承诺、本站以前订不到的 4 类诊断事件（均为**中性分隔行**，不刷红——
+      // 它们说的是“配置没生效 / 能力缺失 / 这批没入账”，不是“本轮失败”）。
+      strategyFallback: '压缩未使用配置的策略：引擎兜底 sliding-window（整轮丢弃、不摘要，第 {round} 轮起）',
+      metadataMissing: '模型上下文元数据缺失：本次 run 的压缩与聚合输出预算已关闭',
+      capabilityDegraded: '存储端缺少 {method} 能力：本次 run 对应的持久化被跳过（中途崩溃不可恢复）',
+      resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖快照',
+      resumeJournalSome: '若干',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       // issue #321（erix-station）：judge 永远只是**意见**，不是验收——分轴展示（工具审计 / 目标判断 /
@@ -290,10 +297,18 @@ export const zhCN = {
       judgeDegraded: '评审降级（{error}），本轮未给出意见',
       judgeUnknownAction: '评审动作：{action}',
       judgeNoDetail: '评审事件（无可解读细节）',
-      compaction: '上下文折叠（round {round}，策略 {strategy}）：{folded} 轮折叠，{before} → {after} tokens',
+      compaction: '上下文折叠（round {round}，策略 {strategy}）：{folded} 轮折叠，{before} → {after} tokens{degrade}',
       // #464 A：策略名是引擎写实例上的那个名字（含库层兜底 `sliding-window`），不是配置项原文；
       // 旧事件没这个字段 ⇒ 拿它填一个显式的「未知」，而不是留空让人以为「策略叫不出名字」。
       compactionStrategyUnknown: '未知',
+      // erix-agent #469 后续（A2）：摘要降级在引擎侧是**故意静默**的（只进
+      // `CompactionStat.foldSummary`，不新增事件类型），不拼这里就只有去看日志的人才知道。
+      // `degradeNote` 由本文件拼好（括号整块交给文案，代码不拼标点）。
+      compactionDegradeNote: '（⚠ {body}）',
+      compactionDegraded: '摘要已降级：{kind}',
+      compactionBudgetExhausted: '摘要预算耗尽（没来得及自愈重试）',
+      compactionInputClipped: '摘要输入被裁（丢 {rounds} 轮 / {messages} 条，据不完整材料写成）',
+      compactionTruncated: '摘要被输出预算截断',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',
       runEnd: 'run 结束：{reason}{usage}',
@@ -363,13 +378,32 @@ export const zhCN = {
     lastRunElapsed: '上次 run {dur}',
     tools: '工具 {count} 次',
     toolsAvg: '（均 {dur}）',
-    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）⇒ 状态条标黄 + 这句
-    frozen: '上游已 {sec}s 无输出',
-    // 硬刷新边界（状态条 tooltip）：run_end / usage 不在历史回放白名单
-    refreshBoundary: '运行态数字只在本页有效：硬刷新后只保留消息时间戳（run_end / usage 不在历史回放白名单）',
+    // 冻结判据：最后一次流式/工具事件距今 > RUN_FROZEN_THRESHOLD_MS（5s）。#425 后这句只在
+    // **相位未知**（旧后端/首帧前）时才用；颜色改由 RUN_STALL_THRESHOLD_MS 负责（见下面 phase*）。
+    frozen: '已 {sec}s 没有新内容',
+    // 硬刷新边界（状态条 tooltip）：`run_end` 不在历史回放白名单；#425 只把历史 `round_end` 的累计用量放进来了。
+    refreshBoundary: '刷新后运行中的速率与时长会丢失（run_end 不在历史回放白名单）；上次 run 的 token 与上下文窗口仍会显示（来自历史 round_end 的累计用量）',
     runningElapsed: '已运行 {dur}',
     runningHint: '该 run 仍在执行：数值每 1 秒刷新',
     messageTimeTitle: '消息时刻',
+    // ---- issue #425：相位与 token（目标：界面一直说得出自己在等什么，不让用户猜）----
+    // 相位三选一（运行中常驻）。名字里的 {tool} 是上游给的工具名（英文标识符，不翻译）。
+    phaseAwaiting: '等待模型回复中 {sec}s',
+    phaseAwaitingHint: '请求已发出，模型还没开始回话。上下文越大，“首字节前的静默”可以正常地长达几十秒，这不是故障',
+    phaseTool: '正在执行工具 {tool}（{sec}s）',
+    phaseToolNoName: '正在执行工具（{sec}s）',
+    phaseToolHint: '工具在容器内真实执行（构建/测试/dev server 等），这一步的时长不取决于模型',
+    phaseStreaming: '正在生成',
+    phaseSilent: '已 {sec}s 没有新内容',
+    // 上下文占用：分子 = 本轮输入 token（上游真值），分母 = 模型窗口（管理员给该模型配的值）。
+    context: '上下文 {pct}%（{used}/{window}）',
+    contextHint: '本轮发给模型的上下文：{used} tokens，模型窗口 {window} tokens（接近满时平台会自动折叠旧轮内容）',
+    // 本轮 / 本 run token：全部是上游真值（`usage` / `round_end`），不带 `~`。
+    roundTokens: '本轮 tokens ↑{input} ↓{output}',
+    roundTokensInput: '本轮 tokens ↑{input}',
+    roundTokensOutput: '本轮 tokens ↓{output}',
+    roundTokensHint: '本轮真实用量（上游返回的 usage）；↑ 是发给模型的上下文，不是花费',
+    runTokens: '累计 {tokens}',
   },
   // 输入区（components/ComposerBar.vue）
   composer: {

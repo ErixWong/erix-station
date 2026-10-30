@@ -54,6 +54,8 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 ⚠ **主工作区 `node_modules` 会被别的 worktree 掏空（同一晚第三次复发）**：症状是 `npm test` 从 1022 项掉到 **510 项 + 34 失败**，且 `node_modules/erix-agent` 不存在——**不是代码回归**，先 `ls -d node_modules/erix-agent` 再下结论，`npm ci --prefer-offline` 重装即回基线。推论：**发版/验收前必须先重装一次并复跑拿到基线数**，别拿一个依赖不完整的树当验收基点。
 
+> **这一族症状的根因已于 #396（`679519a`）消除，但上面那条重装仪式继续有效。** 根因不是「worktree 不拷依赖」，是 `node_modules` 曾被**当文件提交过**（mode 120000 的符号链接，内容是一个**绝对路径**；`.gitignore` 只有 `node_modules/`，**带斜杠只匹配目录**，所以 `git add -A` 把链接扫了进来）。后果是行为而不是观感：一棵依赖树被十几个 worktree 共享，任何一处 `npm install` 都顺链接剪别处的依赖（2026-10-27 实测：一次 `npm install --omit=dev` 把共享树清成空目录，另一个 worktree 的折叠那一族测整片红）；而各分支钉的 `erix-agent` 版本不同（今天就是 main 侧要求 0.26.0、共享树里是 0.25.0），共享树根本无法同时服务。**现在的口径：每个 worktree 自备 `node_modules`**（`npm ci --offline` 热缓存约 0.5s）；旧 worktree 里遗留的链接现在是**未跟踪**文件，`ls -ld node_modules` 看出形态后 `rm` 掉再装即可。判据：`test/repo-hygiene.test.js`（H1 跟踪必须为空；H2 真造一个符号链接复现旧症状，并带「把规则删掉必须看得见」的反向自证）。
+
 ⚠ **前端判绿只能看退出码，不能 grep 摘要行（2026-10-14 主 agent 自己犯的错，代价是一次返工重打 tag）**：vitest 在存在**未捕获拒绝**时照样打印 `Test Files 33 passed (33) / Tests 488 passed (488)`，**但进程以 rc=1 退出**。我当晚用 `npm test 2>&1 | grep -E "Test Files|Tests "` 连跑 3 次都读到「全绿」，实际每一次都是 rc=1、4 条 `Unhandled Rejection` —— 于是把红灯当绿灯合进了 main，直到 CI 步骤 ④ 红才发现。口径：**判绿 = 退出码 0**；要么直接 `npm test; echo rc=$?`，要么 `npm test && echo GREEN`。附带两条：① 这类泄漏的常见成因是 `onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的 Promise），产品侧实例见 issue #281；② 有 worker 把它归因成「本机 `NODE_ENV=production` ⇒ Vue 生产构建吞掉拒绝」，**该说法在本机已被主 agent 实测否证**（`production` 与 `NODE_ENV=test` 两种模式跑原始文件都是 rc=1）——别拿未在自己机器上复现的成因当结论。
 
 ⚠ **GitHub 连不上先怀疑本机 DNS，别反复重试 git（2026-10-24 实证）**：内网 DNS（`10.56.16.16`）把 `github.com` 钉到 `140.82.121.4`、`api.github.com` 钉到 `140.82.121.6`，这两个地址半死不活（TCP 连得上、TLS 握得手、HTTP 不回话）。**间歇性**，同一条命令可能连挂十几分钟再突然通。本机配置：`git` 已按域名注入 `git config --global http.https://github.com/.proxy = http://10.41.24.146:18099`（本机用户在 `10.41.24.146` 自建的代理，另有 SOCKS5 `:18098`），**仅作用于 github.com**；**`gh` 不读 git 配置**，得自己带：`HTTPS_PROXY=http://10.41.24.146:18099 gh …`。⚠ **不要在全局 env 里设 `HTTP(S)_PROXY`**：曾为此跑过一个本地 `127.0.0.1:18443` CONNECT 代理（含 cron 看门狗），结果把 pi 的中转请求（`api.ai.erix.vip`，直连 1s 即通）也代理掉并造成卡死，2026-10-24 已彻底删除——**代理加在本来就通的链上是负收益**。容器内的 `127.0.0.1` 不是宿主，也不继承本机代理（实测 erix agent 容器 DNS 拿到的是好 IP，200/0.6s）。判据：`timeout 8 curl -s -o /dev/null -w "%{http_code}\n" -x http://10.41.24.146:18099 https://api.github.com` 通了就只是本机 DNS 问题；要临时绕开代理用 `git -c http.https://github.com/.proxy= …`。别改 `/etc/hosts`（无 sudo）。最新口径见 `~/projects/AGENTS.md`。
@@ -2371,3 +2373,334 @@ provisioner 34/34、portal+root 全量绿。
 - **池外只报「用户的项目」**：`/proc` 里还有 Docker 内嵌 DNS（`127.0.0.11:34957`，uid 0）落了 `port_observations`，但门户按 `cwd` 是否 `~/projects/` 过滤掉（`portalloc.js` 那句注释写明「agentd 自己的 4000、root 的内部口不算用户的项目」）⇒ **表里有、面板里没有**，别当丢数据。
 - **界面面**（bundle 先断言 = `index-1_vis29R.js`）：`Port pool (10)` 分组头 `probe-351  Current` 排最前 + `Spare (9)` 折叠；`Listeners (2)` 面板给出「同一目录同时开在 3000 与 22000，多半是两个版本并存」告警，池外那条给「还不能在预览地址打开——让助手挪到分配的口」。截图 `/docker/erix_station_playwright/v0143-352-two-panels.png`。
 - 探针残渣：fde-eric 里那两个 `http.server` 已 kill（新鲜度窗 45s，之后面板自动掉）；两个会话各多一条探针消息（`复活`）。
+
+### 8.73 erix-agent #469 的宿主侧后续：摘要口径、降级出口、起跑前校验（2026-10-27，分支 `feat-261027-01-392-host-followup`）
+
+上游 #469（折叠摘要器无超时/无上限/从不看 `finish_reason`）已关单，六张 PR：#482 超时不吞、
+#487 死线与不泄 `ProviderError`、#488 四个上限、#489 跨 run 不重复烧钱、#490 默认摘要预算 1400、
+#493 装配口白名单。**本站仍留在 `fold-statistical`**，闸门三条（缺一不可，见 §8.65 与本节末）：
+① 上述 PR 随 **0.27.0 真发版**（npm 最新仍是 0.26.0，本站只认版本号不认 git SHA）；② pin 完在
+**隔离实例**跑真长会话，看 `foldSummary.degradeKind` / `finishReason` / 摘要字节数 / 横幅四件都是活的；
+③ 量住「每轮多花多少时间」「每次多喂多少字节」，量完才能说"可接受"。这一节写的是**不等发版**
+就该做完的四件事。
+
+**A1 是一处真 bug，不是美化。** `runner/lib/fold-notes-key.js` 的 `deriveFoldNote` 一直在读
+`payload.chars`——而引擎**从来没有这个键**。真链路键面（`runToolLoop` + `fold-statistical`，
+0.26.0 实测）是 `{text, source, strategy, bytes, fingerprint, round}`，被夹断时多
+`truncated`/`bytesBefore`，策略给出区间时多 `from`/`to`/`rounds`。⇒ 生产上那条折走存档**永远**写
+「摘掉正文 ? 字」，规模这一维自 #392 C 片上线起就没通过。而 §8.66 那 13 条判据一直全绿，因为
+夹具手写了 `chars: 184_320`：**#331「没人读的光纤」这次复发的位置是测试夹具本身**——喂进去的
+形状是手搓的，不是从引擎取的。现在：规模以 `bytes` 为主口径（截断过就一并写「夹断前 N B」），
+`chars` 只在引擎真给了时才写，两个都没有就老实写「规模未知」；`K`/`C15` 钉值，`C18` 直接读
+**已安装引擎的源码**钉住「给 `bytes` 不给 `chars`」（与 `C14` 同一手法：不信注释不信夹具）。
+
+**A1b：erix-agent #485（已合 main、未发版）追加的三键按「有就写、没有就不写」处理。**
+`foldedRoundRange{from,to}` → 「折走第 a–b 轮」，退回引擎自己的平铺 `from`/`to`，两者都缺才退回
+旧的「第 N 轮及之前」；`foldedThrough` → 「水位线到第 X 轮」；`foldedRoundCount` → 「本 run 累计折
+N 轮」——契约（host-consumer-contract #479）明写它是 **run 作用域**、resume 后归零，所以文案里
+那个「本 run」是**口径不是措辞**，写成「会话累计」就是把一个会归零的数说成不会归零的数。
+不发 `0` 也不发 `?`：那会把「引擎没给」读成「水位线是 0」。后果是现在合进 0.26.0 表现逐字不变
+（少写两行），pin 到 ≥0.27.0 之后自动亮。
+
+**A2：降级在引擎侧是故意静默的，出口必须宿主自己接。** 上游裁定一是「降级不新增事件类型，只记进
+`CompactionStat.foldSummary`」，而 `fold-statistical` 下那五个键**全缺席**（契约不是 bug）——于是
+「折了 46 轮」和「折了 46 轮、但摘要是超时降级的次品」在界面上逐字一样。两条嘴：
+`worker.js` 导出的 `foldDegradeNotice`（→ agentd 一条 `level:'warn'`，优先 `degradeKind` 短枚举，
+只拿到 #482/#491 的整句 `degradeReason` 时退回它并截 200 字）与前端 `compactionDegradeText`
+（→ #392-D 横幅后缀 `（⚠ …）`）。两处都**只加不改**：不改 `compaction` 事件本体、不改终态——
+摘要降级不是 run 失败，模型拿到的仍是机械摘要，把正常完成的 run 刷红是误报；无降级时文案逐字
+不变（历史回放里的旧事件不得多出一段括号）。
+
+**A4：本站走直连 `runToolLoop`，上游的装配期校验一次也不会触发。** #488/#493 的校验（未知子键抛
+`TypeError`、旋钮值必须安全正整数）只挂在 `createAssemblyPort` 上，而本站从不用它。真链路实测
+（`K6`）：`context: { strategy:'fold-statistical', summarizerTimeout:5000, maxSummaryTokens:'abc' }`
+——键名少了 `Ms`、值是个字符串——在引擎里一路 `end_turn`，不抛错、不发事件、不红。所以
+`runner/lib/compact-knobs.js` 是本站唯一的拦截点：键名白名单 + 安全正整数，`worker.js` 里
+`context:` 包一层 `assertCompactContext(…)`（抛错走 §8 里的 #212 失败信封，有 `RUN_FINISHED failed`
++ 人能读的 reason，比静默跑默认值和比 exit 1 无终态都好看）。`fold-strategy.test.js` 的抠块求值
+现在**注入真校验器**而不是桩，于是往 worker 的 `context` 里加一个拼错的键，那条老判据当场红。
+`keepRounds: 0` 是合法值（含义是「折掉除最后一轮以外的全部」），所以那一支单独按「非负整数」判，
+不能套「>0 才算给」。
+
+**四个上限仍然不写、也不给 env 旋钮**（§8.65 同一条理由：策略与上限不是运维参数，改它要改的是
+判据不是配置）。上游的默认值就是本站的裁定值（30 000 ms / 30 000 ms / 49 152 B / 24 576 B /
+1 400 tok），省略与写死等价，`K5` 钉住"写死也不会被自己的白名单拦下"。`worker.js` 里两处口径注释
+同步改了：`fold-llm` 那条从「#469 未修」改成「已修 + 本站三条闸门」，`maxTokens` 继承那条加了
+「pin 0.27.0 后变成 `min(宿主 maxTokens, maxSummaryTokens ?? 1400)`，方向是变严，届时重跑口径」。
+
+**基线**（主 agent 亲跑，`wt-392f` 干净依赖 `npm ci --prefer-offline`）：根 `npm test`
+**1656 → 1671**（0 失败 / 4 跳过不变；净 +15 = `runner/test/compact-knobs.test.js` 新建 11 条 +
+`fold-notes.test.js` 的 C15–C18 四条）、`runner` `node --test` **399 → 414**（0 失败）、前端
+**50 文件 / 925 → 926**（`useEventStream.spec.ts` +1 条，`vue-tsc --noEmit` 干净）。⚠ `.github/workflows/ci.yml`
+里那句「1401 项基线」自 #282 起就没再跟（现值 1671），本单**不动它**——那是 §8 反复警告过的
+「顺手修陈旧物」，要修得单开一单把整串台账一次理直。
+
+**别改回去的四件事**：① `deriveFoldNote` 里那个 `bytes` 主口径（读 `chars` 的那版本在 0.26.0 上
+**永远**输出「?」，而单测照样全绿）；② `C18` 那条读引擎源码的 tripwire（它就是为了①而存在的）；
+③ `fold-strategy.test.js` 注入的是**真**校验器不是桩（换成桩，worker 里加错键就又看不见了）；
+④ A2 两处「只加不改」（改了事件本体或终态，就是把一次正常完成的 run 刷成错误，还会让历史回放里
+的旧事件多出一段括号）。
+
+**收口补丁：A2 读过一个引擎从不发的键（`foldSummary.unshrinkable`），现在是 K12 这条对账在守。**
+上游 #494 合进 0.27.0 的发布收尾期间顺手核了一遍契约，发现本单 A2 里那个「截了等于没截」的判据
+读的是 `foldSummary.unshrinkable`——**这个键在中英契约与 `src/` 全文 grep 零命中**，是本站按
+「#490 应该会发这个」的记忆造的。后果不是报错而是**永不触发**：一条永不响的告警比没有告警更坏，
+而且它已经长进了判据（K10）、前端文案和两份 i18n。改回契约真有的那批（erix-agent 契约
+「compaction stat」那一行）：`degradeKind` / `degradeReason` / `budgetExhausted`（整条摘要步骤剩余
+预算不足 2 秒 ⇒ 连自愈重试都没发生）/ `inputTruncated` + `droppedRounds`（48 KB 按整轮裁）/
+`droppedMessages`（token 守卫逐条裁）/ `finishReason`。`droppedRounds: 0` 与 `false` 是「没裁」，
+不许据此报事，否则每个正常折叠都刷一条。
+
+**K12 的写法是重点，不只是补一条断言**：待检键名**从两处生产代码里正则抠**（`worker.js` 的
+`foldDegradeNotice` 里的 `stat.*` 与前端 `compactionDegradeText` 里的 `s.*`），不手抄清单；然后
+两半检查——**永远跑的那半**比一份手抄自上游 main 的键清单（今天真正的防线），**随 pin 自动接管的
+那半**与已安装引擎随包的 `docs/host-consumer-contract.md` 逐键对账。跳过必须有机判据：按已安装引擎
+**版本号**判（`<0.26.0 无此面` 是 0.26.0 的正常事实），并反向钉住「版本低 ⇒ 契约确实没有这一面」——
+上游若把字段面回移到老版本，这条会红，而不是让跳过状态一直用「引擎版本旧」这句话自证。
+
+### 8.74 #421：事件承接面要按**引擎承诺的清单**对账，不是按"界面上想展示什么"（2026-10-27，分支 `feat-261027-01-392-host-followup`）
+
+清点方式先说清楚，因为它比结论有用：**把上游对宿主承诺的事件面取出来，与本站三处白名单逐条对**。
+承诺面不是我自己挑样本，而是上游源码里的类型声明 —— `erix-agent` `src/loop/orchestrator.js` 中
+`LoopEvent` 的 `@property` 联合类型，**16 类**。对出来的结果：
+
+| | 数量 | 后果 |
+|---|---|---|
+| 上游承诺 | 16 | — |
+| 本站前端订得到（`useEventStream.ts` 的 `EVENT_TYPES`） | 11 | 另外 **5 类浏览器一条都收不到** |
+| 前端 `HISTORY_REPLAY_TYPES` / 后端 `http.js` 的 `HISTORY_EVENT_TYPES` | 各 20（彼此严格相等） | 5 类里 **4 类两处都没有 ⇒ 实时没有、刷新后也没有**；`model_metadata_missing` 只有后端下发、前端不处理 |
+
+写入侧不过白名单（`internal.js` 直接 `INSERT INTO run_events`）⇒ **这 5 类每轮都在往库里写**，是读侧
+把它们丢了。这就是 #371-A 的形状（库里存着、读不出来），也正是 #288 立"三处同步"纪律要防的那件事。
+最讽刺的一条：`compaction_strategy_fallback` 是上游 #464-A 专门为"你配的策略不是真跑的那条"造的
+信号，而 #392 正是本站在这上面栽过的一跤 —— 信号一直发，我们接不到。
+
+**三条口径**：
+
+1. **三处集合各自独立存亡**，只加一边就得到两种可见性不一致（"实时有刷新没" / "刷新有实时没"）。
+   对账测把 **16 类清单钉死在测里**（`portal/test/event-surface-contract.test.js`）：上游改联合类型、
+   本站删监听、豁免不写理由，都会红。跨端读后端源码这件事住在 `portal/test` —— 前端 vitest 是 jsdom，
+   读源码只能 `?raw`，而 vite 的 fs 边界不许越出 `portal/frontend`（#349 踩过）。
+   另有一条**等式**判据：前端回放集合必须与后端下发白名单**逐项相等**（不是子集，今天 20 = 20）。
+2. **"订得到"不可豁免，"展示"可以豁免但必须写理由**。`run_outcome` 每 run 一条、与 `run_end` 语义
+   重叠且今天无读者 ⇒ 显式不进时间线/历史白名单，理由写在测里的豁免表（`EXEMPT_FROM_TIMELINE`）；
+   等 §12 台账或结算面板真用它时再接。**豁免表空着不算做过决定。**
+3. **界面之外还要有运维的嘴**：`runner/lib/engine-notices.js` 把这 5 类翻成 LOG（四类 `warn`、
+   `run_outcome` 是 `info` —— 每轮都有的东西刷成 warn 会把 warn 面淹掉）。只修界面，等于"只读
+   LOG 的人仍然不知道"。文案口径照旧：数字没给就 `?`/「若干」，绝不拿 0 冒充（#283）；外来标识符
+   过形状闸，绝不 `[object Object]`（#261）。
+
+变异逐条证过这四条锁会红：删 `EVENT_TYPES` 里的 `run_outcome`（后端 2 红 + 前端 4 红）；删后端白名单
+里的 `compaction_strategy_fallback`（2 红）；删前端回放集合里的 `resume_journal_skipped`（后端 2 红 +
+前端 2 红）；删 `en` 一条 key（2 红）。复原后全绿。
+
+顺带清掉一个**文档假前提**：`http.js` 里 `model_metadata_missing` 那条注释写着"SSE 实时路径会原样推给
+前端（前端 `default: return;` 中性忽略）"—— 前端从没订过这个类型，EventSource 不订就不是"收到但不
+展示"，而是**根本没收到**。注释与实际不符本身就是缺陷面的一部分，改代码时必须一起改，不然下一个人
+会照着它再推一遍错的结论。
+
+### 8.75 状态条从「出事才说话」改成「一直在说话」（#425；#282 的后续，2026-10-26）
+
+> **编号更正记录**：这片活起草时（在主工作区未提交状态里躺了两天）把代码注释、测试名、本台账一律写成
+> `#387`，而真实的 #387 是另一条**仍未修**的后端问题（「查看原文」里 `resultPreview` 实测 0/98）。本片的血脉是
+> **#282**（顶部常驻状态栏）的后续 ⇒ 立项为 **#425** 并把全部引用改指本号。**教训**：写台账引用前先
+> `gh issue view <号>` 核一遍标题——凭记忆填号，错号会跟着代码永久留在仓库里，比没写更难查。
+
+用户口述的三件不适：① 看不到**上下文吃了多少 / 这一轮烧了多少 token**；② `上游已 6s 无输出` 读起来像
+故障，而它当时**几乎常亮**；③ agent 中间大段静默时，非专业用户分不清「在干活」与「已经死了」。
+对应三处改动，全在展示层 + runner 提示词，**零 DDL、零后端行为变更、零新事件类型**。
+
+**① `usage` 事件从「整条丢掉」改成「放行展示」**（`runner/worker.js`）：`onEvent` 里原本有一句
+`if (event?.type === 'usage') return;`——那是 **#282 为了「不拿单次调用冒充整 run 汇总」**加的，但它同时
+把数字从界面上抹掉了。现在事件照发、照落 `run_events`，记账面一字未动（`onUsage` 仍是空实现，计费仍只吃
+U2 终态载荷，§7.3/§6.3-6 口径不变）。同一处加宿主侧 additive 字段 `context_window`（值 = 喂给引擎
+`modelMetadata.contextWindowTokens` 的那个数，#309），**判据用 `Number.isSafeInteger` 而不是 `isFinite`**
+——与 #316 入口 `parseHeartbeatModels` 同一形状口径；小数/字符串/≤0 ⇒ **整键不写**，前端整段不出，
+绝不画一个「0% / 上限 0」的假进度条。
+
+**② token 三个面**（`lib/runMomentum.ts` / `RunStatusBar.vue`）：`roundUsage`（最近一次 `usage`，
+同轮多次调用累加，换 `round_start` 才清）、`runUsage`（最近一次 `round_end.usage`）、上下文占用
+= 本轮输入 / 窗口。**累计量运行中就有**：真机 `run_events` 里 `round_end.usage` 单调递增、最后一轮 =
+`run_end.usage` ⇒ 引擎给的是**本 run 累计**（口径来自引擎实现而非契约文档，所以注释写死「截至上一轮」）。
+`round_end` **不清**本轮用量（清了会在轮间空档闪没），重置点放在下一个 `round_start`。
+
+**③ 相位**：`round_start`/`attempt`/`recovering` ⇒ `awaiting_llm`；`assistant_delta`/`reasoning_delta` ⇒
+`streaming`；`tool_use` ⇒ `tool_running`（带工具名）；最后一个 `tool_result` 交差 ⇒ 回 `awaiting_llm`。
+`enterPhase` **只在换相位时重置计时**（同相位内重复 delta 会把「已等 42s」每秒抹回 0）。
+颜色与文案解耦：`RUN_FROZEN_THRESHOLD_MS`（5s）降级成「该提一句」的阈值（相位秒数上屏），标黄另用
+`RUN_STALL_THRESHOLD_MS = 60_000`——取数依据是本站自己下发的 `firstByteTimeoutMs=240s` /
+`streamIdleTimeoutMs=180s` 与 300s 看门狗（量级参考，**不抄那两个数的字面量**：它们住在容器 env，改它不必改这里）。
+
+**④ 提示词「过程播报」段**（`SYSTEM_PROMPT`）：开工先回一句再动手 / 每阶段报结果 / 只在真的需要用户参与时
+提问（工具报错不许拿去打断用户）/ 长命令先说要做什么、失败也要报 / 播报是进度不是第二段摘要。
+静默多久算久由界面负责，提示词里**不写阈值数字**（单一真相在前端常量）。
+
+**硬刷新口子的形状**（这条最容易写错，已按它单测）：历史回放白名单没动，但状态机对 `history=true` 开了
+**一个**例外——历史 `round_end` 的 `usage` 与 `context_window`。它必须①在通用 run 登记**之前**处理
+（否则 `beginRun(rid, nowMs)` 会假出一个「上次 run 00:00」）、②把登记的 run 直接标 `endedAt`（否则历史帧
+被当成「现在在跑」）、③`startedAt=null`（时长不出）、④允许**历史帧之间**后者盖前者（seq 升序，不盖就是少报）
+却**不许回退实时 `run_end` 的值**（靠 `state.usageFromHistory` 一个布尔区分来源，不进视图）。
+
+**基线（主 agent 亲跑，判绿 = 退出码）**：根 `npm test` **1567 / 1563 通过 / 0 失败 / 4 跳过 rc=0**
+（基点 1561 ⇒ **+6**）；`node --test runner/test/*.test.js` **365/365 rc=0**（基点 359 ⇒ `usage-event` +3 /
+`system-prompt` 的 #425 段 +3）；前端 `npm run typecheck` rc=0 + `npm test` **48 文件 / 912 通过 rc=0**
+（基点 886 ⇒ **+26**：lib 层 10 条、状态机组 12 条、组件层 4 条）。
+过程中被自己的钉子抓到并修掉三次：`SYSTEM_PROMPT` 收尾漏分号（抠取器断言先红）、`context_window`
+用 `isFinite` 放过 1.5、历史 `round_end` 抢走正在跑的活 run 登记。
+
+**已知不足（另单跟）**：相位在 `usage` 之后不主动改（没有工具调用时它停在 `awaiting_llm`，语义上「下一轮
+即将开始」，不算错，但界面上会出现「刚收到 usage 却说在等回音」的一瞬）；`roundUsage` 是**本轮**口径而
+`runUsage` 是**截至上一轮**口径，两个数并排时用户可能以为它们同源；提示词的播报效果只能真机看 transcript 验收。
+
+### 8.76 调查现场必须进仓库，仓库外（workspace 顶层）不留散件（2026-10-28，分支 `chore-261027-01-loose-artifacts`）
+
+**现象**：`fde_station/` 顶层（**仓库外**）躺着四件 10-24 的产物，两周没人碰：`ISSUES.md`（412 行）、
+`relay-bug/`（**空目录**）、`toolcall-truncation-report.md`（10 KB）、`toolcall-truncation-repro.py`（6.6 KB）。
+
+**代价不是「乱」，是「台账残缺」**：那份顶层 `ISSUES.md` 有 **12 条**，而仓库里被跟踪的那份只有 **7 条**——
+第 8~12 条（`partOf` 链式 resume 必炸、打字机丢失 Vue 响应性、前端从不消费 `next_cursor`、预览端口呈现盲区、
+kkFileView 提案）**在仓库里根本不存在**。两份台账长成了两份，且**被跟踪的那份才是残缺的那份**。
+这是我们反复讲的「绿灯不代表没坏」的镜像命题：**没入仓不代表没发生**。
+
+**`relay-bug/` 是空目录**这件事单独值得记：现场被清过、壳留着，两周后没人知道它曾经装过什么、bug 是不是
+还在。现场要么留下证据（进仓），要么写进台账（带结论），**不要只留一个名字**。本次直接删。
+
+**规矩（三条）**：
+
+1. **调查产物一律进仓库**：报告 `docs/design/<主题>-<YYYY-MM-DD>.md`、脚本同目录（`-repro.py` 后缀，
+   已有先例 `docs/design/audit-2026-09-16.md`）；并在 `ISSUES.md` 留一条正文 + 文末对照表加一行，指向追踪
+   issue 与 AGENTS 章节。本次的落点：`docs/design/toolcall-args-truncation-2026-10-24.md` / `-repro.py`
+   → 台账第 13 条 → 追踪单 **#426**。
+2. **workspace 顶层只放仓库与 worktree**，不放散件。散件的判断标准：`git -C <仓库> status` 看不见它 = 散件。
+3. **落笔引用 issue 号之前先 `gh issue view <号>` 核标题**（与 §8.75 同源教训：错号会跟着代码永久留在仓库里，
+   比没写更难查）。
+
+**这条为什么没有机器判据**：`test/repo-hygiene.test.js` 只能看见仓库内部；「仓库父目录不得有散件」在 CI 里
+父目录是 `<runner>/work/<repo>/`，形状与本机不同，硬加就是一条会因环境假红的判据。**兜底方式是台账**：
+`ISSUES.md` 条目数从 7 → 13、对照表 8~13 行都在，任何人可以核对本机顶层是否还剩散件。
+
+### 8.77 SPA 化把登出 `location.reload()` 顺带承担的「清场」职责弄丢了：换账号必须显式认领（issue #428，2026-10-28，分支 `fix-261028-01-428-user-switch-reset`）
+
+**现象**：同一个浏览器标签里换账号（登出 → 换号登录）落到工作台首页（`/`，没选任何会话），
+**中间对话窗口还是上一个账号的那段对话**；侧栏列表是新账号的（被 `/api/sessions` 覆盖了），于是看起来
+像「列表是新的、聊天区是旧的」。刷新一次就好了 ⇒ 典型的内存态没跟人走。
+
+**根因是两层，缺一层都不会发生**：
+
+1. 登出只做两件事——`auth.logout()` 清 auth store + `router.replace('/login')`。**SPA 不重载页面**，
+   而 `stores/workbench.ts` 是 pinia 全局单例（setup store，无 `$reset`）⇒ 消息流 `entries`、目录 /
+   会话列表、`drafts`（模块内 `Map`）、#370 队列、#189 折叠原文缓存、乃至**那条 `EventSource` 连接**
+   全部原样活到下一个账号。
+2. 现成的 `resetSessionView()` 本来会清这些，但它**唯一的自动触发点**是
+   `WorkbenchView` 里 `watch(() => route.params.id, …)` 的 `else` 分支，且**没有 `immediate`**：
+   重新登录挂载时 `params.id` 恒为 `undefined` 且**没有发生变化** ⇒ 回调根本不跑。`onMounted` 里的
+   `initWorkspace()` 只重拉 `/api/dirs` + `loadSessions()`，从不碰 `entries`。
+
+**⚠ 这条的通用教训**：SPA 化之前旧版 `static/index.html` 的登出是 `location.reload()`——它**顺带**
+承担了「全局内存态清零」。改成 `router.replace` 时没人写下「reload 本来在承担什么」，职责就凭空消失了。
+**凡是靠整页重载白拿的干净状态，改 SPA / 改路由时都必须显式接回来**，并在注释里写明它原来在干什么。
+
+**修法（两处接线 + 一个 store 动作）**：
+
+- `resetForUserSwitch()`：清的是**整个用户的可见面**，不是「一个会话的详情区」——目录也一起清，
+  因为目录的 `cwd` 是上一个账号家目录下的路径，本身就算跨账号信息。顺序：先撞开全部代次/序号
+  （`ctxSeq` / `projectReqSeq` / `sessionReqSeq` / `runStateCheckSeq`，**新加 `dirsReqSeq`**——
+  `/api/dirs` 此前是唯一没有迟到守卫的那条），再断 SSE（`es.resetStreamState()` 内含 `closeEs()`），
+  然后清消息流 / 目录 / 会话 / 草稿 / 队列 / 重试面 / 动量 / 卡片展开记忆。
+- `claimOwnership(userId)`：store 记一个 `ownedBy`，身份不同才复位。**调用点在视图层两处**——
+  `WorkbenchView.onMounted` 第一步 `claimOwnership(auth.user.id)`、`onLogout()` 里 `claimOwnership(null)`。
+- ⚠ **为什么必须在 `initWorkspace()` 之前同步执行**，而不是写进 `watch(() => auth.user?.id)`：后者要赌
+  「父组件 watcher 先于子组件 `onMounted`」这个时序，赌输一次 `initWorkspace` 的成果就被洗成空目录。
+  同步接线没有竞态，且**覆盖不经过 `logout()` 的换账号路径**（会话过期后 `forgetExpiredSession()` 回登录页、
+  直接粘 `/login` 重登）。登出那次 `claimOwnership(null)` 的作用是**当场**断 SSE 并清空，不给登录页留旧内容。
+
+**顺带查清的一件事（源码对账，未改代码）**：`send()` 用 `sessionId.value` 定位会话，复位之前它是
+**上一个账号的会话 id** ⇒ 界面看着是「新账号首页」，POST 却打到别人的会话。本修法把 `sessionId` 归
+null，症状随之消失。而**后端本来就挡着**（2026-10-28 对账 `portal/src/sessions.js` / `http.js`）：
+`fetchSession()` 一条 SQL 里同时做存在性与属主校验，`!row || row.user_id !== userId` 与「不存在」
+**同一个 `404 not_found`**（不泄露存在性）；`POST /messages` 在幂等 fn 内先 `assertSessionOwner()`
+（就是 `fetchSession` 的别名）再动笔，`postMessage()` 自己还带 `FOR UPDATE` 二次校，SSE
+`handleSessionStream` 走 `getSession()` 同一口径 ⇒ **跨账号写不会串号，只是把用户看到的一行错误文案
+变得莫名其妙**（"会话不存在"出现在一个看起来刚建好的首页上）。这类「前端状态穿越账号」的 bug 因此
+定级为体验 + 信息泄漏，**不是数据完整性**。
+
+### 8.78 「在途响应全部作废」要按**写点清单**核对，不是按请求清单；登出收口要按**按钮清单**核对（issue #431 = #428 未尽部分，2026-10-28，分支 `fix-261028-01-431-logout-scope-and-late-writes`）
+
+#428（§8.77）合并后做独立评审，抓出两处**它自己的注释已经承诺、但代码没做完**的事。两处的形状值得记，
+因为它们都不是"想不到"，而是**按错误的清单核对**：
+
+**① 登出有三颗按钮，认领只接了一颗。** `claimOwnership(null)` 原本写在
+`WorkbenchView.onLogout` 里；而全站有**三颗**登出按钮——工作台顶栏、`AdminLayout.vue:29`、
+`ForcePasswordChangeView.vue:70`，后两颗是裸 `auth.logout()`。`WorkbenchView` **没有 `onUnmounted`
+关流的钩子**（它的 `onUnmounted` 只清 keydown），SSE 归 `useEventStream.ts` 自己管，而那里
+`:467` 的注释写着「EventSource 自动重连，带 Last-Event-ID」⇒ **从管理台或改密屏登出时，上一个账号
+那条 `/api/sessions/<id>/events` 不会关**，服务端会话一死它不当终态、按规范无限重连，浏览器后台
+一直替别人的会话要事件流，挂到标签页关掉为止。界面看不见（进工作台的任何路径第一步都认领 ⇒ 数据
+会被复位），代价是纯资源/背景请求。
+
+**修法：收口到唯一的汇合点** `stores/auth.ts` 的 `logout()`（**在 `await` 之前**——会话本来就可能
+已经死了，下面还 catch 着失败，SSE 不该等服务端回包）与 `forgetExpiredSession()`。为不把整个工作台
+面（`useEventStream` / `useRunMomentum` / `lib/markdown`）拖进登录页首屏 chunk（路由是懒加载的），
+新增 `lib/userScope.ts`：形状**照本仓已有的 `lib/restrictedSession.ts`**（`set*Listener` + `notify*`，
+最后一次注册生效、传 null 注销）。⚠ **注册只装不卸**：只有工作台挂载过一次才有东西要清，`onUnmounted`
+里注销就等于把「从管理台登出」这条路径重新漏掉。
+
+**② 「在途响应全部作废」当时是按"我加过守卫的请求"核对的，正确的清单是"await 之后的写点"。**
+逐函数核 `stores/workbench.ts` 里 `await` 之后直接写界面而无代次守卫的位置，四条：
+
+| 路径 | 迟到后写什么 | 处置 |
+|---|---|---|
+| `createDir` | **整块**目录上下文（`dirCwd` / `sessionId=null` / `sessions` / `dirs.push` / `updateAvailability`） | **加守卫，但比的是新增的「用户代次 `scopeSeq`」而不是 `ctxSeq`**（评审实测指出：`selectDir` 与 `refreshDirs` 的回退在**同一个人**身上也撞 `ctxSeq`，拿它当判据会把「新建成功」误判成作废 ⇒ 目录建了、modal 既不报错也不跳转、界面**无声**消失）。目录与会话服务端已建，不算失败 ⇒ 换人时返回 `{error:null}` 且**不带 `session`** ⇒ `NewDirectoryModal` 不 `emit('created')` ⇒ 不会路由到一个已不属于当前登录者的会话 |
+| `recallQueue` | `inputValue` + 队列快照 | 加守卫，但**守卫之前先按原会话存回 `drafts`**：DELETE 已在服务端把整队掏走，直接丢弃 = 文本两头没（先例 = `sendQueued` 的 catch 分支「守卫之前先 `drafts.set`」） |
+| `stop` | `entries.push(sep)` | 加守卫：「已请求停止」是上一条流的事，不许插进新账号的消息流末尾 |
+| `loadFoldedOriginal` | `foldedOriginals[<sid>:<round>]` | **故意不加**（键含 `sessionId` ⇒ 只是内存残留，新账号撞不上；同账号回头再开这个会话，这条缓存本来就该命中。加守卫反而丢掉已拿到的原文） |
+
+**兜底方式**：`stores/workbench.spec.ts` 的 `#431` describe 用挂起的 Promise 真实造出「A 在途 →
+换账号 → A 的回包最后落地」，三条各一条；把三个守卫改成 `if (false)` ⇒ 恰好三条红。登出收口由
+`stores/auth.spec.ts`（含**顺序断言**：`['reset', 'fetch']`）+ `WorkbenchView.spec.ts`
+「工作台挂载过之后在别处登出」钉住；后者删掉 `setUserScopeResetListener` 注册即红（实测）。
+
+**⚠ 可复用的三条核对法**：① 说"某类状态/请求已作废"之前，先 `grep` 出**所有 await 之后的写点**逐条打勾，
+不要凭"我改过哪几个函数"；② 说"登出时会 X"之前，先 `grep` 出**全站有几颗登出按钮**，接在按钮上就等于
+接在三个地方；③ **守卫要比对的代次必须匹配"作废的原因"**——`ctxSeq` 的语义是「上下文变了」（同一个人
+切目录也撞），而 #431 要防的是「人变了」，所以 `createDir` 认 `scopeSeq`。拿一个"碰巧也会变"的计数器当
+判据，代价是**把成功误判成失败**，比原 bug 更难查（界面一句话都不说）。判据：
+`stores/workbench.spec.ts` 里「同一个人切目录不得把新建成功的目录吞掉」那条用例，把守卫换回 `ctxSeq`
+就红（实测）。
+
+顺带补齐的证据链：新增 `views/AdminLayout.spec.ts`（此前**该组件零 spec**）钉「AdminLayout 那颗登出按钮
+= `auth.logout()`」这段胶水。`stores/auth.spec.ts` 钉的是 `logout()` ⇒ `notify`，
+`WorkbenchView.spec.ts` 钉的是 `notify` ⇒ 断流清空，缺了中间这段，「三颗按钮都收口」就只是说法。
+
+### 8.79 登出只属于 portal 平面：预览凭证是独立能力，回收必须显式做（issue #429，2026-10-29，分支 `fix-261029-01-429-preview-logout-lineage`）
+
+**现象**：同一浏览器登出 → 换号登录，**上一个账号开着的预览 URL 照常打开、能操作**，
+`audit_log` 把新账号的点击全记在旧账号名下；只要页面持续有请求，滚动续期让这个状态无限持续。
+用户拿它对照设计意图（「不同用户之间/直接访问打不开 webapp」）来问——那两条路径实测都还成立
+（无 cookie 无 ticket ⇒ `403 preview_ticket_required`；`public` 免票是 §2.7 的设计豁免），
+**破功的只有「共享浏览器换账号」这一条**。
+
+**根因不是实现偏差，是 spec 缺口**（这条最容易被"照 spec 实现"的人漏）：
+- §2.4 登出语义历史上就只写「删 `login_sessions`」；§2.8 登出对预览的撤销写的是
+  「**可选**显式撤销**未使用的 ticket**」——这个可选项没实现，且 `kind='session'`（正握着 cookie 的那种）
+  根本不在任何登出路径的清单里。
+- forwardAuth **故意**不查 `login_sessions`：登录 cookie host-only 于 `station.<base>`（#6），
+  物理上到不了预览 host——「门在它身上没有可判的主体」（§2.11a 原话）。exposure 判定用 grant 上
+  **冻结的 `user_id`**，浏览器当前登录着谁，边缘既不知道也不需要知道。
+- 于是登出对预览平面**什么都不是**：cookie 在浏览器 jar 里、grant 在库里 `active`、滚动续期无绝对上限。
+
+**修法 = 凭证血缘（issue #429 方案 B）**：`preview_grants.login_session_id`（迁移 `0025`，可空、
+FK `ON DELETE SET NULL`——offboarding/停用会 DELETE `login_sessions` 行，RESTRICT 会当场撞 FK），
+ticket 签发时写、forwardAuth 兑换时**继承**；`auth.revokeSession` 改成**同语句 CTE**：吊销会话 + 按血缘
+撤 `active` grant（SET 形状与谓词口径与 #252 撤 grant 逐字同形，是「撤 grant」的第四个写入口，只是命中列换成血缘）。
+多设备语义靠血缘天然成立：撤的是**这次登录会话**签的票，不是这个 user 的所有票——按 `user_id` 撤会把
+A 在另一台设备的预览连坐掉。forwardAuth 保持零改动（回收只发生在登出时刻）。
+
+**⚠ 可复用的三条**：
+① 「登出/禁用/释放会不会回收 X」要**按撤销写入口清单**核对（本仓共四个：offboarding、改块、停用用户、登出），
+  少接一处就是 #252（撤权漏重试路径）与 #429（登出压根不在清单）的复发形状；
+② 两套独立凭证的平面（登录面 / 预览面），**任何一面的「退出」语义都必须显式跨面广播**——
+  「凭证独立」是隔离性的来源，也是回收遗漏的来源；
+③ fake 建模新列时**按 SQL 说的做**（`preview.test.js` 的 INSERT 按参数位解析、`fake-pool` 的血缘撤权
+  从 SQL 文本认 `state = 'active'` 谓词）：实现漂移（多一列 / 改谓词）fake 当场红，
+  不重演 #252「单测结构上测不到」。

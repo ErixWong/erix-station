@@ -50,7 +50,7 @@
 |---|---|---|
 | **宿主** | `/srv/erix/users/<fde>/` | materializer 写盘的真实根；子目录见 §2.3 |
 | **portal 容器** | `/srv/erix/users/`（**同路径**，RW bind mount） | portal 需要创建/删除 `<fde>` 目录、直写任意 FDE 的文件，故挂**整根**，且容器内路径与宿主一致，materializer 无需做路径翻译 |
-| **FDE 容器** | `/home/<user>/`（HOME）+ 三条子挂载（见 §2.4） | 容器内进程看到的路径；**与宿主路径不一致**（见 §2.4 理由） |
+| **FDE 容器** | `/home/<user>/`（HOME）+ 三条子挂载，另有一条**只读**凭据挂载 `/run/erix/git`（#399，不在 HOME 下；见 §2.4） | 容器内进程看到的路径；**与宿主路径不一致**（见 §2.4 理由） |
 
 > **是否挂到 portal 容器：是**。portal 是唯一需要写用户空间的服务（D-6），故只有 portal 挂 `/srv/erix/users`（RW）。`station-edge`（Traefik）与 `station-db` **不挂**用户空间——Traefik 只读自己 `/docker/station-edge/` 的动态配置（600），station-db 只挂自己的 pg data。这条「只有 portal 能写用户空间」的单一写方性质与「Postgres 业务写方只有 portal」同构（D1'）。
 
@@ -60,7 +60,7 @@
 /srv/erix/users/<fde>/
 ├── home/                       # 容器 HOME 的内容（挂到 /home/<user>）
 │   ├── AGENTS.md               # 平台文件（**工位约定 + 平台约束的单一真相**：含预览访问要求链，§4.1.2）
-│   ├── .git-credentials        # 凭据类文件（admin 按需投放，不进 manifest，§4.1.1）
+│   ├── .git-credentials        # 遗留/FDE 自配凭据（github 等自配 host 归它；平台托管行已迁 platform/，§4.1.1）
 │   ├── .config/
 │   │   ├── tea/config.yml      # Gitea CLI 凭据（按 git_hosts provider 投放，§4.1.1）
 │   │   ├── gh/hosts.yml        # GitHub CLI 凭据（同上）
@@ -72,6 +72,8 @@
 │   │   ├── skills/             # FDE/agent 自管（平台不物化内容）
 │   │   └── todos/              # FDE/agent 自管（平台不物化内容）
 │   └── .cache/station/spool/   # 事件 spool（agentd/worker 写，平台不碰）
+├── platform/git/               # 平台托管 Git 凭据（#399；portal 独占写，ro bind 进容器 /run/erix/git）
+│   └── credentials             # credential-store 行格式；镜像 /etc/gitconfig 的 fill-only helper 读它
 ├── projects/<project>/         # 仓库目录（agent clone 目标）
 │   ├── .gitignore              # 平台文件（忽略 .erix/ 等，§11）
 │   └── .erix/
@@ -89,6 +91,7 @@
 | `/srv/erix/users/<fde>/projects` | `/home/<user>/projects` | 项目目录 | `erix`(1000) |
 | `/srv/erix/users/<fde>/worktrees` | `/home/<user>/worktrees` | run 工作区 | `erix`(1000) |
 | `/srv/erix/users/<fde>/cache` | `/home/<user>/cache` | 依赖缓存 | `erix`(1000) |
+| `/srv/erix/users/<fde>/platform/git`（**ro**） | `/run/erix/git` | 平台托管 Git 凭据（#399）：portal 独占写，容器内连 root 都写不动；镜像 `/etc/gitconfig` 的 fill-only helper 读 `/run/erix/git/credentials`（排在 `store` 前，先答先赢） | portal(root)，`0755`/文件 `0644`（ro bind 不改权限、只拦写；容器内按 UID 可读） |
 
 > **为什么容器内路径是 `/home/<user>` 而不是「宿主路径与容器内一致」**：原规格 §12.1 写「bind mount 到容器内同路径（路径一致性约定）」，那是**未定稿的临时表述**（issue #7 指出的缺口之一）。把容器内 HOME 定为 `/home/<user>`（标准 Linux 家目录）有三个好处：
 > 1. **避免把宿主路径泄漏进容器**：容器内进程、`$HOME`、shell 提示符、`~` 展开、各类工具写 `~/.config` / `~/.cache` 都落到 `/home/<user>`，而不是 `/srv/erix/...`——镜像与工具对「家目录」的假设全部成立。
@@ -142,7 +145,8 @@
 
 | 文件（容器路径） | 写方 / 读方 | 属主与权限 | 物化 / 生命周期 |
 |---|---|---|---|
-| `/home/<user>/.git-credentials` | FDE 经 portal 自助凭据端点 write-through 写入宿主 bind mount；Git 的 `credential.helper=store` 供 agent/worker 读取 | FDE UID:GID（默认 `1000:1000`），`0640`（owner 与同组 worker 可读） | **不写入 manifest，不进入 materializer 对账覆盖集**；stale 清理不得删除。offboarding 删除该文件。 |
+| `/run/erix/git/credentials`（宿主 `<userSpaceRoot>/<fde>/platform/git/credentials`，**ro bind**） | **平台托管凭据唯一落点（issue #399）**：portal（凭据端点 / provision 重铸）独占写；镜像 `/etc/gitconfig` 的 fill-only helper（`/usr/local/libexec/erix-gitcred`）代答 `get`，`store`/`erase` 对它是 no-op ⇒ git 的「认证被拒 ⇒ erase」与 agent 的整文件重写都删不动它 | portal 进程（生产 root），目录 `0755`、文件 `0644`（容器内 agentd/worker 按 UID 可读；ro 挂载拦写，权限不承担防写职责） | **不写入 manifest，不进对账覆盖集**（根本不在 home 树里）。存量（#399 前投进 `.git-credentials` 的行）由 `migrateLegacyCredential`/`cli.js migrate-git-credentials` 整行原样搬入（token 不变）。offboarding 删除。 |
+| `/home/<user>/.git-credentials` | **遗留位，降级为 FDE 自配凭据文件（#399）**：FDE 在容器内自配的非托管 host（如 `github.com`）照旧由 FDE 读写；portal 新写不再落这里，只在 offboarding 时删除。镜像 `/etc/gitconfig` 第二条 `helper = store` 读它（平台 helper 未命中才兼答） | FDE UID:GID（默认 `1000:1000`），`0640`（owner 与同组 worker 可读） | **不写入 manifest，不进入 materializer 对账覆盖集**；stale 清理不得删除。offboarding 删除该文件。 |
 | `/home/<user>/.config/tea/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitea` upsert；tea CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
 | `/home/<user>/.config/gh/hosts.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=github` upsert；gh CLI 读取 | FDE UID:GID（默认 `1000:1000`），`0640`；父目录 `0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
 | `/home/<user>/.config/glab-cli/config.yml` | portal 在 Git 凭据写入时按 `git_hosts.provider=gitlab` upsert；glab CLI 读取 | worker UID（默认 `1002`），`0600`；父目录保持 FDE UID:GID（默认 `1000:1000`）、`0750` | **不写入 manifest，不进入 materializer 对账覆盖集**；凭据删除移除 host 条目；offboarding 无条件删除该文件。 |
@@ -157,7 +161,9 @@
 
 **重新激活（issue #161）**：再次雇用同一 `fde_name` 时，管理台复用原 disabled `users` 行（不新建第二行），更新登录名、邮箱、显示名、口令与 TOTP 后设回 active；因此两次雇佣沿用同一用户 ID 与审计/历史记录。若新登录名被别的用户占用则返回 `409 login_conflict`。事务清空旧 `login_sessions`、`login_pending` 与 `api_tokens`，并将 `fde_git_accounts.remote_login` / `token_ref` 清空；历史 `fde_offboarding` 行保留。已有 onboarding 行按原队列契约重置为 pending，重新执行 provision、materialize、LLM binding；provision 重建容器、恢复/重铸 LLM key，并重新投放 Git 凭据。若旧 offboarding 仍处于 pending/running，则拒绝重激活以免与清理任务竞态。Gitea 复用分支在 mint 前吊销 Station 旧 token，避免 `prohibit_login=false` 后旧 token 复活。
 
-Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 的 HOME，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
+Git 凭据按 Git credential-store URL 行格式保存（`https://<username>:<URL-encoded-token>@<host>`）；对应 CLI 配置也含该 host 的明文 token，二者只落在 FDE 用户空间，不进 DB、日志或 `audit_log.details`，也不经环境变量传入容器。portal 以同目录临时文件 + `fsync` + `rename` 原子替换，写前复用 `assertSafePath` 并校验 `realpath` 位于用户空间根内；禁止非法 FDE 名、路径穿越与 symlink 路径。配置按 provider 选择，未注册 host 或不支持的 provider 不写 CLI 配置；轮换原位 upsert。API 只回显 host、username 与 token 掩码。
+
+> **#399（2026-10-26）：为什么平台托管凭据必须离开 `.git-credentials`。**该文件同时有三个写者（portal、FDE/agent、**git 自己**），而 git 的语义是「认证被拒 ⇒ `erase` 掉那枚凭据」——一次 401 就静默删行、rc=0、不留痕迹（现网 eric 两天内被删两次，现场复现实验：可写文件 1 行→401→0 行；ro 文件同一动作凭据存活）。`chmod` 挡不住：store helper 是「同目录建锁文件→写→rename 覆盖」，rename 只看目录可写不看目标 mode。所以平台那份搬进 portal 独占的 `platform/git/credentials` 并 **ro bind** 进容器（挂载级只读才是只读）；存在性判据同步从「DB 里 `token_ref` 非空」换成「平台文件里这一行在不在」，缺了走既有重铸路。`~/.git-credentials` 保留给 FDE 自配凭据，两边不再互侵犯。
 
 该文件是 FDE 经 portal 显式授权投放的 Git 凭据，不是平台控制面密钥；FDE 容器仍不持有 DB、runner 或 LLM 平台凭据。它独立于 manifest 的纯 DB 派生平台文件，凭据更新不触发 generation，也不参与旧 manifest stale 清理。用户下线时 portal 尝试删除此文件；失败只告警，不回滚停用。
 
@@ -364,7 +370,8 @@ materializer 对所有 JSON 统一「**固定键序**（按渲染模板插入序
 | `.cache/station/spool/`（事件 spool，**尚未实现**） | `erix`(1000):`erix`(1000) | 口径随创建者，**先不给数字** | spool 目前不落盘（runner README §7.5 待定项），全仓无创建该目录的代码 ⇒ 无法指到实测。将来落盘时按成因 (a) 判：**portal 建 ⇒ `0770`**（属组交出后被清）；**agentd/worker 建 ⇒ `2770` 会真落下**（其主组 1000 == egid，`chmod` 清不掉）。需要组写的结论不变（agentd 与 worker 都写） |
 | **平台文件**（`config.json`/`mcp.json`/`ports.json`/`AGENTS.md`/`.gitignore`） | root:root | `0644` | 容器内 1000/1001/1002 可读、不可写（防误改；FDE 有 root 可绕过，§4.1 已声明） |
 | `manifest.json` | root:root | `0444` | 更强只读（内容无敏感，但改它即破坏一致性校验，故只读） |
-| `~/.git-credentials` | FDE UID:GID（默认 `1000:1000`） | `0640` | Git credential-store；owner 1000 与同组 agentd/worker（1001/1002）可读，其他用户不可读；不由 materializer 管理 |
+| `~/.git-credentials`（遗留/FDE 自配） | FDE UID:GID（默认 `1000:1000`） | `0640` | Git credential-store；owner 1000 与同组 agentd/worker（1001/1002）可读，其他用户不可读；不由 materializer 管理；#399 后 portal 不再往这里写平台托管行 |
+| `platform/git/credentials`（宿主侧，ro bind 到容器 `/run/erix/git/`，#399） | portal 进程（生产 root:root） | 目录 `0755`、文件 `0644` | 只读靠**挂载级 ro**，不靠 mode；容器内全员可读（helper 代答需要）、连 root 不可写；portal 独占写（tmp+rename 在宿主目录里完成，不受 ro 影响——ro 只存在于 FDE 容器的挂载视图） |
 | 容器内进程 `umask` | — | **`0002`** | 新建文件 664、新建目录 775（`runner/entrypoint.sh` 设一次，`agentd.js`/`worker.js` 各自防御性重设）。组写位**确实生效**——靠的是三者主组同为 1000 + 目录属组 1000，**与 setgid 无关**。注：`docker exec` 起的临时 shell 不在该进程树下，仍是镜像默认 `0022`（实测），别拿它当容器 umask 的证据 |
 
 **portal 写入身份**：portal 容器以 root 运行，materializer 以 root 写平台文件（root:root），并在创建/重建工作区目录时 `chown 1000:1000` + `chmod 2770`（代码意图；**落盘是 `0770`**，成因见下）。这是「portal 直写」能同时满足「工作区属主=FDE」「平台文件=root 只读」的机制。
@@ -495,7 +502,7 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 - 时序（建项目，`POST /api/projects`）：
   1. DB 事务写 `projects` + `port_allocations` + route outbox（portal.md §3.3）。
   2. `sessions.js` `createSession` 在宿主创建 `projects/<project>/`（`chown 1000:1000`、`chmod 0o2770`；**单次调用 ⇒ 实测落 `2770`**，同项目再建一个 session 才会被清成 `0770`，见 §6.2 表「混的」那行）。⚠ 早先这里写的是「materializer 创建并写 `.gitignore` / `.erix/ports.json` / `.erix/AGENTS.md`」——**P5 已整体退役**（`materializer.js` `buildFilePlan` 注释明写），materializer 只产 `home/AGENTS.md` 与 `home/.erix/{config,mcp,ports}.json`，不建项目目录。
-  3. FDE 经 portal 投放 Git HTTPS 凭据（#110，写入 `home/.git-credentials`），由 agent 在项目目录代劳 clone。平台不下发 SSH key（SSH 私钥强制 `0600` 与组可读 `0640` 冲突）。
+  3. FDE 经 portal 投放 Git HTTPS 凭据（#110；#399 后写入平台独占的 `platform/git/credentials`，ro bind 进容器 `/run/erix/git`；FDE 自配凭据仍写 `home/.git-credentials`），由 agent 在项目目录代劳 clone。平台不下发 SSH key（SSH 私钥强制 `0600` 与组可读 `0640` 冲突）。
 
 ### 9.2 用户 clone 覆盖平台文件怎么办
 
