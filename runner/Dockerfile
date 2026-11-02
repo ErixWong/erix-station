@@ -1,6 +1,7 @@
 # FDE 容器镜像：station-agentd + station-runner + erix-agent（deploy-contract §1/§6）。
 # B 档语言矩阵（issue #27，决策 2026-09-18）：Node 22 + Python3/venv/pip + gcc/g++/make
-#   + .NET SDK 8.0（COPY 自官方 sdk 镜像）+ Playwright/chromium（§12.4，装容器内不做 sidecar）。
+#   + .NET SDK 8.0 + 10.0 side-by-side（叠加 COPY 自官方 sdk 镜像，issue #436）
+#   + Playwright/chromium（§12.4，装容器内不做 sidecar）。
 #   code-server 不装（用户 2026-09-18 裁定，P3 再议）。
 # 依据：docs/design/deploy-contract.md §6（三用户/root-drop/--init/healthcheck）、
 #       docs/design/runner-integration.md §2/§11（进程模型/凭据边界）。
@@ -34,11 +35,31 @@ RUN groupmod -n erix node \
   && useradd -u 1001 -g 1000 -M -d /nonexistent -s /usr/sbin/nologin erix-agentd \
   && useradd -u 1002 -g 1000 -M -d /nonexistent -s /usr/sbin/nologin erix-worker
 
-# ---- .NET SDK 8.0（issue #27 决策 1）：COPY 自官方 sdk 镜像（bookworm 同底座），软链进 PATH ----
+# ---- .NET SDK 8.0 + 10.0 side-by-side（issue #27 决策 1；SDK 10 由 issue #436 追加）----
+# 两条 COPY 打同一个目标目录 = **目录合并**，不是覆盖：官方 sdk 镜像的 /usr/share/dotnet 内部全是
+#   版本化子目录（sdk/<ver>、shared/<fw>/<ver>、packs/<name>/<ver>），8 与 10 互不重叠；
+#   唯一被 10 覆盖的是顶层 muxer `dotnet`——它是向后兼容的宿主程序（按 global.json / 最高版挑 SDK），
+#   所以 8.0.x 与 10.0.x 真并存（`dotnet --list-sdks` 两行都在），旧项目照跑。
+# 默认选**最高版**（现为 10）：要钉 8 的项目在项目里放 global.json（{"sdk":{"version":"8.0.x"}}）。
+# 矩阵外风险（issue #436）：sdk:10.0 官方底座是 Ubuntu 24.04 / glibc 2.39，微软**没有 bookworm 变体**，
+#   我们把它跑在 node:22-slim 的 Debian 12 / glibc 2.36 上。当前实测可用，但某个 10.0.x 补丁抬高
+#   glibc 要求时，`dotnet --list-sdks` 只跑 muxer 看不出来（不加载运行时）——所以下面那条
+#   **离线 CoreCLR 烟测**是这条风险的兜底：真加载一次 10 的运行时，构建期就红，而不是等用户跑起来才炸。
 COPY --from=mcr.microsoft.com/dotnet/sdk:8.0 /usr/share/dotnet /usr/share/dotnet
+COPY --from=mcr.microsoft.com/dotnet/sdk:10.0 /usr/share/dotnet /usr/share/dotnet
 ENV DOTNET_ROOT=/usr/share/dotnet
+# 构建期断言（**不写死补丁号**：官方 tag 是浮动的，写成某个具体 8.0.x/10.0.x 补丁号会随官方 tag 漂移）：
+#   ① 两个 major 的 SDK 都在；② NETCore.App 与 AspNetCore.App 两个框架的 8. 与 10. 都在；
+#   ③ 离线 CoreCLR 烟测：跑 10 的 Roslyn csc.dll -version（真加载 CoreCLR，不联网、几秒）。
 RUN ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
-  && dotnet --list-sdks
+  && dotnet --list-sdks \
+  && dotnet --list-sdks | grep -q '^8\.' \
+  && dotnet --list-sdks | grep -q '^10\.' \
+  && for fw in Microsoft.NETCore.App Microsoft.AspNetCore.App; do \
+       dotnet --list-runtimes | grep -q "^$fw 8\." || exit 1; \
+       dotnet --list-runtimes | grep -q "^$fw 10\." || exit 1; \
+     done \
+  && dotnet "$(ls -d /usr/share/dotnet/sdk/10.*/ | head -1)Roslyn/bincore/csc.dll" -version
 
 # ---- Playwright + chromium（规格 §12.4：装进 FDE 容器，不做 sidecar；版本 pin 便于重建复现）----
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
