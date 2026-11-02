@@ -378,6 +378,26 @@ test('renderHomeAgentsMd：预览访问节不出现端口数字与区间，全�
   assert.match(section, /该条分配记录里的 `url`/, 'host 来源必须是分配记录里的 url');
 });
 
+test('renderHomeAgentsMd：环境事实写明 .NET SDK 8 与 10 并存 + 钉 8 的 global.json 口径（#436）', () => {
+  const md = renderHomeAgentsMd({ fdeName: 'alice' });
+  // 按节取（同 previewAccessSection 口径：从 `## 环境事实` 到下一个 `## ` 标题），不靠全文 grep 凑。
+  const lines = md.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('## 环境事实'));
+  assert.notEqual(start, -1, 'AGENTS.md 必须有「## 环境事实」这一节');
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((l) => l.startsWith('## '));
+  const section = (end === -1 ? rest : rest.slice(0, end)).join('\n');
+  // 只说「SDK 8」会让 agent 以为 net10.0 跑不了（从而自己装 SDK，撞上容器内无 sudo/无网络时的死路）。
+  assert.match(section, /\.NET SDK 8 与 10/, '必须同时提到 SDK 8 与 SDK 10');
+  assert.match(section, /side-by-side/, '必须点明是 side-by-side 并存，而不是 10 把 8 替换了');
+  assert.match(section, /默认选\*\*最高版\*\*|默认选最高版/, '必须写明 dotnet 默认选最高版（现为 10），否则 agent 会以为默认还是 8');
+  assert.match(section, /global\.json/, '必须给出钉 8 的手段：项目里放 global.json');
+  assert.match(section, /"sdk"\s*:\s*\{\s*"version"/, 'global.json 必须给出可照抄的字段形状');
+  // 红线（#257）继续适用：这段仍不得出现端口数字 / 伞域字面量（全文那条断言不放宽，这里按节再钉一次）。
+  assert.doesNotMatch(section, /\b\d{4,5}\b/, '环境事实段不得出现端口数字');
+  assert.doesNotMatch(section, /erix\.vip/i, '环境事实段不得出现伞域字面量');
+});
+
 test('isPlatformManagedPath：认 home/AGENTS.md 是平台文件（单一真相必须被对账覆盖）', () => {
   // 精确分支（materializer.js 里 `rel === 'AGENTS.md'`）：预览访问 8 条就住在这个文件里，
   // 一旦它不再被认作平台文件，stale 清理不再管它、手改也不再被对账重物化覆盖（user-space §9.3）。
