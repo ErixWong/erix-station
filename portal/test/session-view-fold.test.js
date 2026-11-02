@@ -560,3 +560,159 @@ test('#438-B4 DTO：fold-llm 真折叠 ⇒ folded.foldedRoundRange 是整数区�
   assert.equal(stat?.strategyName, 'fold-llm',
     '事件里的 strategyName 必须是 fold-llm（`useEventStream.ts` 的 compaction 分支原样显示它）');
 });
+
+// ── issue #440（M1）：`foldedFacts` 进 DTO ────────────────────────────────────────────────
+//
+// 真机病症（会话 `e02d96cb…` 第 25 轮，`seq 8989`）：轮记录里明明躺着
+// `foldedFacts = {source:'llm', origin:'semantic', strategy:'fold-llm', text:'## 阶段…（2048 B）',
+// truncated:true, bytesBefore:3076}`，而 `GET /api/sessions/:id` 的 `folded.hasSummary === false`
+// （fold-llm 写的是字面量 `"missing"`）⇒ 横幅显示「this fold produced no summary」，
+// `foldedFacts.text` **压根没进 DTO** ⇒ 用户为语义折叠付的那份 token 一个字节也看不见。
+//
+// 三条判据的分工（每条都有「删掉/改坏就红」的方向）：
+//   · D1 真 `fold-llm` 账本 ⇒ `summarySource:'llm'` + `summaryText` 非空 + `truncated` 反映真实值，
+//     且 **`hasSummary` 仍是 false**（#390-A 的语义一字未改，这正是 #440 的两层病根之一）；
+//   · D2 只有机械替代物（`fold-statistical`）⇒ `summarySource:'statistical'`，且**不冒充** `truncated`；
+//   · D3 `foldedFacts` 缺席（旧账本）⇒ 三个新键**都不在**（不是 `null` / `false`）。
+//
+// 与 #438-B4 同一套取证：真跑 `runToolLoop`，把真账本行按生产列形状装成 `transcript_rounds` 再投影。
+// 手工喂 DTO 的单测证明不了接线（§8.67 的教训）。
+
+/** 真跑一次指定策略的折叠（`fold-statistical` 不需要摘要器那一发）。`summary` 可给长文本以便真夹断。 */
+async function runRealFoldLedger(strategyName, summary = '【LLM 摘要】已折走早期轮次，细节去 transcript 查。') {
+  const records = {};
+  const main = [];
+  const provider = {
+    async chat(request) {
+      if (typeof request?.system === 'string' && request.system.includes('对话历史压缩器')) {
+        return { content: text(summary), stopReason: 'end_turn' };
+      }
+      main.push(request);
+      return main.length <= 2
+        ? { content: [{ type: 'tool_use', id: `c${main.length}`, name: 'noop', input: {} }], stopReason: 'tool_use' }
+        : { content: text('收尾'), stopReason: 'end_turn' };
+    },
+  };
+  await runToolLoop({
+    provider,
+    store: makeStore(records),
+    executeTool: async () => 'ok',
+    config: {
+      input: { messages: foldHistory(14), initialUserMessage: '继续收尾' },
+      run: { runId: SESSION_ID, maxRounds: 6, completion: false },
+      folding: { context: assertCompactContext({ strategy: strategyName, keepRounds: 6 }) },
+      metadata: { task: 't', modelMetadata: { contextWindowTokens: 6000, maxOutputTokens: 200 } },
+      tuning: { maxTokens: 200 },
+    },
+  });
+  const rows = records[SESSION_ID] ?? [];
+  const foldRow = rows.find((row) => row.folded === true);
+  assert.ok(foldRow, `${strategyName} 前置：这一跑必须真的折过一次（否则下面的 DTO 断言全是空断言）`);
+  return { rows, foldRow };
+}
+
+test('#440-D1 真 fold-llm 账本 ⇒ DTO 透传 summarySource/summaryText/truncated，而 hasSummary 仍是 false', async () => {
+  const { rows, foldRow } = await runRealFoldLlmLedger();
+  // 前置：账本侧的形状（引擎写侧 `orchestrator.js:5417` + `buildFoldedFacts`）
+  assert.equal(foldRow.foldedFacts?.source, 'llm', '前置：真 fold-llm 的 foldedFacts.source 必须是 llm');
+  assert.equal(typeof foldRow.foldedFacts?.text, 'string');
+  assert.ok(foldRow.foldedFacts.text.length > 0);
+
+  const dto = project([inputRow(), ...toTranscriptRows(rows)]);
+  const folded = dto.find((message) => message.role === 'assistant')?.folded;
+  assert.ok(folded, 'DTO 必须带 folded（横幅的载体）');
+
+  assert.equal(folded.summarySource, 'llm',
+    '`summarySource` 必须逐字等于账本 `foldedFacts.source`（#440 的 M1 主判据：删掉这个键就红）');
+  assert.equal(folded.summaryText, foldRow.foldedFacts.text,
+    '`summaryText` 必须与账本 `foldedFacts.text` **逐字同源**（#95 红线：不裁剪、不重推导）');
+  assert.ok(folded.summaryText.length > 0, 'summaryText 不许是空串');
+  // 本现场的摘要短于 `FOLDED_FACTS_MAX_BYTES` ⇒ 引擎不写 `truncated` ⇒ DTO 也不许造一个。
+  // 真夹断那一格由 D1b 单独钉（两个方向都要有：不夹断 ⇒ 键缺席；夹断 ⇒ true）。
+  assert.ok(!Object.hasOwn(folded, 'truncated'), '没有夹断时 DTO 不许出现 truncated（更不许写 false）');
+
+  // #390-A 的语义**一字未动**：`hasSummary` 只读 `record.summary`（本现场是字面量 "missing"）。
+  // 这一格就是 #440 的原文病症：`hasSummary === false` 与 `summarySource === 'llm'` **同时成立**，
+  // 横幅必须靠后者说话，不许再说「没有生成摘要」。
+  assert.equal(foldRow.summary, 'missing', '前置：fold-llm 仍把 record.summary 写成字面量 "missing"');
+  assert.equal(folded.hasSummary, false,
+    '`hasSummary` 不许被 #440 改成读 `foldedFacts.text`（#390-A 钉着；D1 与 D3 各从一个方向拦它）');
+});
+
+test('#440-D1b 语义摘要被 2048 B 上界真夹断 ⇒ DTO 的 truncated === true（横幅据此说「被夹断」）', async () => {
+  // 真机标本（#440）就是这一格：`text` 2048 B、`truncated:true`、`bytesBefore:3076`。
+  // ⚠ 用长 ASCII 正文而不是重复中文：`maxSummaryTokens` 会先把超预算的中文摘要「修剪」成恢复提示
+  //   （`[已修剪]`），那样测到的是修剪层、不是 `buildFoldedFacts` 的字节夹断。ASCII 长文不会触发修剪。
+  const { rows, foldRow } = await runRealFoldLedger('fold-llm', `【LLM 摘要】${'x'.repeat(3000)}`);
+  assert.equal(foldRow.foldedFacts?.truncated, true,
+    `前置：超长语义摘要必须被 FOLDED_FACTS_MAX_BYTES 夹断（实得 ${JSON.stringify(foldRow.foldedFacts?.truncated)}）`);
+  assert.ok(Number.isSafeInteger(foldRow.foldedFacts.bytesBefore) && foldRow.foldedFacts.bytesBefore > foldRow.foldedFacts.bytes,
+    '前置：夹断事实必须带 bytesBefore > bytes（引擎口径）');
+
+  const dto = project([inputRow(), ...toTranscriptRows(rows)]);
+  const folded = dto.find((message) => message.role === 'assistant')?.folded;
+  assert.equal(folded.truncated, true, '账本 `truncated:true` ⇒ DTO 必须透传 true（删掉这一键 ⇒ 横幅不再提示被夹断）');
+  assert.equal(folded.summarySource, 'llm');
+  assert.equal(folded.summaryText, foldRow.foldedFacts.text, 'summaryText 仍是账本那份（夹断后的 2048 B 正文）');
+});
+
+test('#440-D2 只有机械替代物（fold-statistical）⇒ summarySource=statistical，且不冒充 truncated', async () => {
+  const { rows, foldRow } = await runRealFoldLedger('fold-statistical');
+  assert.equal(foldRow.foldedFacts?.source, 'statistical',
+    '前置：真 fold-statistical 的 foldedFacts.source 必须是 statistical');
+
+  const dto = project([inputRow(), ...toTranscriptRows(rows)]);
+  const folded = dto.find((message) => message.role === 'assistant')?.folded;
+  assert.ok(folded, 'DTO 必须带 folded');
+  assert.equal(folded.summarySource, 'statistical',
+    '机械替代物必须自报 statistical（横幅第二态：不许说它是 LLM 语义摘要）');
+  assert.equal(typeof folded.summaryText, 'string');
+  assert.ok(!Object.hasOwn(folded, 'truncated'),
+    '账本没有 `truncated` 键时 DTO 也**不许**造一个（写 false 就是替引擎断言「我看过且没夹断」）');
+});
+
+test('#440-D4 两个折叠行（round 3 / 7）⇒ 各自取自己那一轮的 foldedFacts，不串号也不吃数组下标', async () => {
+  // 主 agent 补的覆盖缺口：`foldedFactsByRound` 若用「第几条」当键（而不是 `row.round`），
+  // 单折叠行夹具（round=1）恰好命中，D1/D2/D3 全绿也发现不了 —— 这条用 round 3 / 7 把它钉住。
+  const { rows, foldRow } = await runRealFoldLlmLedger();
+  const base = foldRow;
+  // `runRealFoldLlmLedger` 返回的是**引擎 record** 数组（不是 `transcript_rounds` 行），行由 `toTranscriptRows` 造。
+  const mk = (round, text) => ({
+    ...base,
+    round,
+    dedupKey: `${SESSION_ID}:engine:round:${round}`,
+    roundKey: `${SESSION_ID}:engine:round:${round}`,
+    foldedFacts: { ...base.foldedFacts, text },
+  });
+  const rowsWithTwoFolds = rows
+    .map((row) => (row === base ? mk(3, 'EARLIER-FOLD-TEXT') : row))
+    .concat([mk(7, 'LATEST-FOLD-TEXT')]);
+
+  const dto = project([inputRow(), ...toTranscriptRows(rowsWithTwoFolds)]);
+  const folded = dto.find((message) => message.role === 'assistant')?.folded;
+  assert.ok(folded, 'DTO 必须带 folded');
+  assert.equal(folded.summaryText, 'LATEST-FOLD-TEXT',
+    '必须取第 7 轮**自己**那份 foldedFacts：用数组下标/序号当键会在这里错位（round 7 取不到 ⇒ 键缺席）');
+});
+
+test('#440-D3 foldedFacts 缺席（旧账本）⇒ summaryText/summarySource/truncated 三个键**都不在**', async () => {
+  const { rows, foldRow } = await runRealFoldLlmLedger();
+  // 有意的单点变异：把真行上的 `foldedFacts` 摘掉（= 0.29 之前落盘的折叠行）。
+  const withoutFacts = rows.map((row) => {
+    if (row !== foldRow) return row;
+    const { foldedFacts, ...rest } = row;
+    return rest;
+  });
+  assert.equal(withoutFacts.find((row) => row.folded === true)?.foldedFacts, undefined, '夹具自证：键已摘掉');
+
+  const dto = project([inputRow(), ...toTranscriptRows(withoutFacts)]);
+  const folded = dto.find((message) => message.role === 'assistant')?.folded;
+  assert.ok(folded, '折叠行本身还在 ⇒ folded 照旧出现（#189 的四项判据没被 #440 动过）');
+  for (const key of ['summaryText', 'summarySource', 'truncated']) {
+    assert.ok(!Object.hasOwn(folded, key),
+      `\`foldedFacts\` 缺席时 DTO 不许出现 \`${key}\`（不是 null、不是 false、不是空串——`
+      + '键缺席 = 不知道 = 前端保持现状，#390-A 那条纪律同样适用）');
+  }
+  // 反向对照：`hasSummary` 仍然由 `record.summary` 决定，与 `foldedFacts` 在不在无关。
+  assert.equal(folded.hasSummary, false, 'hasSummary 与 foldedFacts 无关（它只读 record.summary）');
+});

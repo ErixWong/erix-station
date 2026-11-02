@@ -191,6 +191,16 @@ export const zhCN = {
       visibilityNoSummary: '这 {n} 轮原文对模型已不再逐字可见；本次没有生成摘要，要看原文请点「查看原文」。',
       visibilityBare: '这部分原文对模型已不再逐字可见；下面这份摘要就是它留下的全部。',
       visibilityNoSummaryBare: '这部分原文对模型已不再逐字可见；本次没有生成摘要，要看原文请点「查看原文」。',
+      // issue #440：**三态**的前两态（数据来自账本 `foldedFacts`，不是 `hasSummary`）。
+      // 第一态必须把「LLM 语义摘要」说出口：fold-llm 把 `record.summary` 写成字面量 "missing"，
+      // 旧实现据此说「本次没有生成摘要」——而账本里明明躺着 2048 B 语义摘要，那是 #440 的原文病症。
+      visibilityLlm: '这 {n} 轮原文对模型已不再逐字可见；留下的是 LLM 语义摘要（fold-llm），完整细节请看原文。',
+      visibilityLlmBare: '这部分原文对模型已不再逐字可见；留下的是 LLM 语义摘要（fold-llm），完整细节请看原文。',
+      // 第二态：只有机械替代物（fold-statistical）。如实说「没有 LLM 语义摘要」，不把它包装成语义摘要。
+      visibilityMechanical: '这 {n} 轮原文对模型已不再逐字可见；本次只留下机械替代物（fold-statistical），没有 LLM 语义摘要，细节请看原文。',
+      visibilityMechanicalBare: '这部分原文对模型已不再逐字可见；本次只留下机械替代物（fold-statistical），没有 LLM 语义摘要，细节请看原文。',
+      // 「摘要被夹断」标记（账本 `truncated:true`）——挂在同一行末尾，零新增 UI 结构。
+      summaryTruncated: '（摘要过长，已被夹断；完整内容请点「查看原文」。）',
       viewOriginal: '查看原文',
       // #388：原文块自己的收起入口（只隐藏、不清缓存，再展开不重发）
       collapseOriginal: '收起原文',

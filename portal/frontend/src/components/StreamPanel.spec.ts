@@ -1022,3 +1022,108 @@ describe('issue #390：folded.hasSummary 控制展开控件', () => {
     expect(wrapper.find('.view-original').exists()).toBe(true);
   });
 });
+
+// issue #440：账本 `foldedFacts` 进 DTO 之后，横幅是**三态**（不是两态）。
+// 真机病症（会话 e02d96cb… 第 25 轮）：`folded.hasSummary === false`（fold-llm 把 `record.summary`
+// 写成字面量 "missing"）+ `foldedFacts.text` 有 2048 B 语义摘要却进不了 DTO ⇒ 横幅说
+// 「本次没有生成摘要」，用户为语义折叠付的 token 一个字节也看不见。
+describe('issue #440：foldedFacts（summarySource/summaryText/truncated）驱动横幅三态', () => {
+  const LLM_TEXT = '## 阶段\n语义摘要正文（fold-llm 写进 foldedFacts.text 的那一份）';
+
+  it('第一态 summarySource=llm ⇒ 说「LLM 语义摘要」，绝不说「本次没有生成摘要」', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: false, summarySource: 'llm', summaryText: LLM_TEXT } }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('4 轮');
+    expect(notice.text()).toContain('LLM 语义摘要');
+    // #440 的原文病症：这一格只要出现「没有生成摘要」就是撒谎（hasSummary 是 false，但账本有摘要）。
+    expect(notice.text()).not.toContain('本次没有生成摘要');
+  });
+
+  it('第一态：hasSummary=false 但 summaryText 在场 ⇒ 仍能展开摘要区，且画的是账本那份正文', async () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: false, summarySource: 'llm', summaryText: LLM_TEXT } }));
+    const wrapper = mountPanel();
+    // #390-A 的 hasSummary=false 关掉的是「没有替代物时的空摘要区」；有 summaryText 时必须有 ▾，
+    // 否则语义摘要依然一个字节也看不见（#440 的两层病根之一）。
+    expect(wrapper.find('.folded-toggle').exists()).toBe(true);
+    await wrapper.get('.folded-toggle').trigger('click');
+    const summary = wrapper.get('.folded-summary');
+    expect(summary.text()).toContain('语义摘要正文');
+    // 画的是 `summaryText`，不是投影生成的 `folded.text`（后者是机械替代物/兜底句）。
+    expect(summary.text()).not.toContain('折叠摘要全文');
+  });
+
+  it('第一态 + truncated=true ⇒ 同一行给出「摘要被夹断」标记（零新增 UI 结构）', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({
+      folded: { hasSummary: false, summarySource: 'llm', summaryText: LLM_TEXT, truncated: true },
+    }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('LLM 语义摘要');
+    expect(notice.text()).toContain('已被夹断');
+    // 标记必须挂在既有的 .folded-visibility 那一行上，不许新开面板。
+    expect(wrapper.findAll('.folded-visibility')).toHaveLength(1);
+  });
+
+  it('truncated 键缺席（没夹断/不知道）⇒ 不出现夹断标记', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: false, summarySource: 'llm', summaryText: LLM_TEXT } }));
+    const wrapper = mountPanel();
+    expect(wrapper.get('.folded-visibility').text()).not.toContain('已被夹断');
+  });
+
+  it('第二态：机械替代物**不许**把账本里那份带引擎 marker 的正文画到界面上', async () => {
+    const store = useWorkbenchStore();
+    // 真形状（实测）：`foldedFacts.text` 开头带 `FOLD_SUMMARY_MARKER`（`fold-statistical.js:26`），
+    // 而投影生成的 `folded.text` 是洗过的。渲染前者 = 把引擎内部版本号撒到用户界面上。
+    store.entries.push(foldedEntry({
+      folded: {
+        hasSummary: false,
+        summarySource: 'statistical',
+        summaryText: '【上下文折叠·v1·erix-9f6e2c】早期第 1–21 轮（共 21 轮）已折叠。工具足迹：noop×11。',
+      },
+    }));
+    const wrapper = mountPanel();
+    await wrapper.get('.folded-toggle').trigger('click');
+    const summary = wrapper.get('.folded-summary');
+    expect(summary.text()).toContain('折叠摘要全文');            // = folded.text（既有口径）
+    expect(summary.text()).not.toContain('erix-9f6e2c');        // 引擎内部 marker 不许泄漏
+  });
+
+  it('第二态 summarySource=statistical ⇒ 只有机械替代物，如实说「没有 LLM 语义摘要」', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({
+      folded: { hasSummary: false, summarySource: 'statistical', summaryText: '## 已折叠第 1–5 轮（机械）' },
+    }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('机械替代物');
+    expect(notice.text()).toContain('没有 LLM 语义摘要');
+    expect(notice.text()).not.toContain('LLM 语义摘要（fold-llm）');
+  });
+
+  it('第三态 三键全缺席（旧账本）⇒ 与 #440 之前逐字一致（退回 hasSummary 两态）', () => {
+    const store = useWorkbenchStore();
+    store.entries.push(foldedEntry({ folded: { hasSummary: false } }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('本次没有生成摘要');
+    expect(notice.text()).not.toContain('LLM 语义摘要');
+    expect(notice.text()).not.toContain('机械替代物');
+  });
+
+  it('第三态：summarySource 是后端不认识的形态 ⇒ 整个键缺席（不是 null），横幅不许猜', () => {
+    const store = useWorkbenchStore();
+    // 后端只放行 'llm' | 'statistical'；这里模拟一个「万一漏进来」的第三种形态（类型层挡住，运行期兜底）。
+    store.entries.push(foldedEntry({
+      folded: { hasSummary: false, summarySource: 'strategy' as unknown as 'llm', summaryText: LLM_TEXT },
+    }));
+    const wrapper = mountPanel();
+    const notice = wrapper.get('.folded-visibility');
+    expect(notice.text()).toContain('本次没有生成摘要');
+    expect(notice.text()).not.toContain('LLM 语义摘要');
+  });
+});

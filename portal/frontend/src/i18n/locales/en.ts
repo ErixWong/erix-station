@@ -167,6 +167,18 @@ export const en = {
       visibilityNoSummary: '{n} rounds of original text are no longer visible to the model, and this fold produced no summary — use “View original” to read them.',
       visibilityBare: 'This original text is no longer visible to the model; the summary below is all that remains.',
       visibilityNoSummaryBare: 'This original text is no longer visible to the model, and this fold produced no summary — use “View original” to read them.',
+      // issue #440: the first two of the **three states** (data comes from the ledger's `foldedFacts`, not
+      // from `hasSummary`). The first state must say "LLM semantic summary" out loud: `fold-llm` writes the
+      // literal `"missing"` into `record.summary`, so the old copy claimed "this fold produced no summary"
+      // while the ledger held a 2048 B semantic summary — that is exactly the #440 symptom.
+      visibilityLlm: '{n} rounds of original text are no longer visible to the model; what remains is an LLM semantic summary (fold-llm) — use “View original” for the full detail.',
+      visibilityLlmBare: 'This original text is no longer visible to the model; what remains is an LLM semantic summary (fold-llm) — use “View original” for the full detail.',
+      // Second state: mechanical substitute only (fold-statistical). Say plainly that there is no LLM
+      // semantic summary; do not dress the mechanical substitute up as one.
+      visibilityMechanical: '{n} rounds of original text are no longer visible to the model; only a mechanical substitute (fold-statistical) remains — no LLM semantic summary. Use “View original” for the detail.',
+      visibilityMechanicalBare: 'This original text is no longer visible to the model; only a mechanical substitute (fold-statistical) remains — no LLM semantic summary. Use “View original” for the detail.',
+      // The "summary was clamped" marker (ledger `truncated:true`) rides on the same line: no new UI.
+      summaryTruncated: ' (the summary was too long and has been clamped; use “View original” for the full text.)',
       viewOriginal: 'View original',
       // #388: the original block's own collapse entry (hides only, never clears the cache; re-expanding does not refetch)
       collapseOriginal: 'Collapse original',
