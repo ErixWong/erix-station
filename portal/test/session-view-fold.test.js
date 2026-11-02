@@ -21,8 +21,16 @@ import assert from 'node:assert/strict';
 
 import { runToolLoop } from 'erix-agent';
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { compareTranscriptRows, projectSessionMessages, recordForProjection } from '../src/session-view.js';
 import { foldTranscriptRows } from '../src/transcript-fold.js';
+import { assertCompactContext } from '../../runner/lib/compact-knobs.js';
+
+const PORTAL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const RUNNER_DIR = path.join(PORTAL_DIR, '..', 'runner');
 
 const SESSION_ID = '10000000-0000-4000-8000-000000000001';
 const RUN_ID = '20000000-0000-4000-8000-000000000001';
@@ -449,4 +457,106 @@ test('#341 存量 0.23 链式账本（手工还原的形状）⇒ 本站解链�
   // 用户可见面同样不许退化
   const calls = callsById(project([inputRow(), ...toTranscriptRows(chained)]));
   assert.deepEqual([...calls.keys()].sort(), ['bad1', 'ok1', 'ok2']);
+});
+
+// ── issue #438 切片 B（M3.2）：DTO 侧 `folded` 在 **fold-llm 真折叠**下的形状 ───────────────
+//
+// 为什么这条必须在 portal 侧：横幅两态（`folded.hasSummary` / `foldedRoundRange`）是**读侧投影**
+// 的事——引擎只负责把 `folded: true` / `foldedRoundRange` / `foldedPayload` 写进轮记录
+// （`orchestrator.js:5401-5408`），"这两态长什么样"由 `session-view.js` 的 `foldedTurnFields` 决定。
+// 手工喂 DTO 的单测证明不了接线（§8.67 的教训）⇒ 这里**真跑 `runToolLoop` + `fold-llm`**，把真账本行
+// 按生产列形状装成 `transcript_rounds` 行，再喂 `projectSessionMessages`。
+//
+// 策略与尾窗**从 `runner/worker.js` 的真配置里抠**（不另抄）：切片 B 把生产策略翻成 `fold-llm` 之后，
+// 这里如果还写 `fold-statistical`，证的就是一个已经不存在的配置。
+const CTX_MARKERS = /\/\* #392:context-strategy:start \*\/([\s\S]*?)\/\* #392:context-strategy:end \*\//;
+
+function workerFoldingContext() {
+  const src = readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const block = src.match(CTX_MARKERS);
+  assert.ok(block, 'worker.js 的 #392:context-strategy 标记没了');
+  // 注入真校验器（不换桩，§8.73）：本格顺带证明 worker 里那份真配置能过本站自己的白名单。
+  return new Function('assertCompactContext', `return {${block[1]}}`)(assertCompactContext).context;
+}
+
+/** 造 n 轮真形态历史（user → tool_use → tool_result），文本足够长以便真折得动。 */
+function foldHistory(n) {
+  const messages = [];
+  for (let i = 1; i <= n; i += 1) {
+    messages.push({ role: 'user', content: text(`第 ${i} 轮任务 ${'u'.repeat(500)}`) });
+    messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: `h-t${i}`, name: 'noop', input: { round: i } }] });
+    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `h-t${i}`, content: `第 ${i} 轮结果 ${'r'.repeat(700)}` }] });
+  }
+  return messages;
+}
+
+/** 真跑一次 `fold-llm`（摘要那一发走同一个 provider，按 system prompt 认出来单独回）。 */
+async function runRealFoldLlmLedger() {
+  const records = {};
+  const main = [];
+  const events = [];
+  const provider = {
+    async chat(request) {
+      if (typeof request?.system === 'string' && request.system.includes('对话历史压缩器')) {
+        return { content: text('【LLM 摘要】已折走早期轮次，细节去 transcript 查。'), stopReason: 'end_turn' };
+      }
+      main.push(request);
+      return main.length <= 2
+        ? { content: [{ type: 'tool_use', id: `c${main.length}`, name: 'noop', input: {} }], stopReason: 'tool_use' }
+        : { content: text('收尾'), stopReason: 'end_turn' };
+    },
+  };
+  await runToolLoop({
+    provider,
+    store: makeStore(records),
+    executeTool: async () => 'ok',
+    onEvent: (event) => events.push(event),
+    config: {
+      input: { messages: foldHistory(14), initialUserMessage: '继续收尾' },
+      run: { runId: SESSION_ID, maxRounds: 6, completion: false },
+      folding: { context: workerFoldingContext() },
+      metadata: { task: 't', modelMetadata: { contextWindowTokens: 6000, maxOutputTokens: 200 } },
+      tuning: { maxTokens: 200 },
+    },
+  });
+  const rows = records[SESSION_ID] ?? [];
+  const foldRow = rows.find((row) => row.folded === true);
+  assert.ok(foldRow, '前置：这一跑必须真的折过一次（否则下面的 DTO 断言全是空断言）');
+  return { rows, foldRow, events };
+}
+
+test('#438-B4 DTO：fold-llm 真折叠 ⇒ folded.foldedRoundRange 是整数区间、hasSummary 两态可翻', async () => {
+  const { rows, foldRow, events } = await runRealFoldLlmLedger();
+  // 前置：真折叠的账本形状（引擎写侧，`orchestrator.js:5401`）
+  assert.ok(Number.isSafeInteger(foldRow.foldedRoundRange?.from) && Number.isSafeInteger(foldRow.foldedRoundRange?.to),
+    `折叠轮的 foldedRoundRange 必须是两个整数（实得 ${JSON.stringify(foldRow.foldedRoundRange)}）`);
+  assert.ok(Array.isArray(foldRow.foldedPayload) && foldRow.foldedPayload.length > 0);
+
+  const transcriptRows = [inputRow(), ...toTranscriptRows(rows)];
+  const dto = project(transcriptRows);
+  const assistant = dto.find((message) => message.role === 'assistant');
+  assert.ok(assistant?.folded, 'DTO 必须带 folded（横幅两态的载体）；没有就说明投影没把折叠轮认出来');
+  assert.deepEqual(assistant.folded.foldedRoundRange, foldRow.foldedRoundRange,
+    'DTO 的 foldedRoundRange 必须与账本同源同值（#95 红线：逐字透传，不重推导）');
+  assert.equal(assistant.folded.round, foldRow.round,
+    'folded.round 必须是**该折叠行自己的轮号**（「查看原文」端点的查询键），不是被折区间');
+  assert.equal(typeof assistant.folded.hasSummary, 'boolean',
+    'hasSummary 必须是布尔（#390-A：轮号可定时才给得出「这次折叠有没有真摘要」）');
+  // 本现场没有 wrapup 摘要 ⇒ 两态里的 false 那一态（真值，不是「不知道」）
+  assert.equal(assistant.folded.hasSummary, false,
+    '没有 wrapup 摘要的折叠轮必须报 false（报 true 就是许诺一份不存在的摘要）');
+
+  // 另一态：给同一条真行补上引擎的 wrapup 摘要形状（`summary: {action, note}`）⇒ hasSummary 必须翻成 true。
+  // ⚠ 这是**有意的单点变异**（真行 + 一处 documented 改动），用来证明两态**真的由数据驱动**，
+  //   而不是恒 false 的死键。
+  const withSummary = rows.map((row) => (row === foldRow ? { ...row, summary: { action: 'wrapup', note: '已收尾' } } : row));
+  const dto2 = project([inputRow(), ...toTranscriptRows(withSummary)]);
+  const assistant2 = dto2.find((message) => message.role === 'assistant');
+  assert.equal(assistant2.folded.hasSummary, true,
+    '同一条折叠行补上 {action,note} 摘要后 hasSummary 必须变 true ⇒ 否则这个键是恒 false 的死键');
+
+  // 事件行那一半（M3.2 的另一条腿）：真 compaction 事件的实例策略名就是界面显示的字符串。
+  const stat = events.find((event) => event?.type === 'compaction')?.compaction;
+  assert.equal(stat?.strategyName, 'fold-llm',
+    '事件里的 strategyName 必须是 fold-llm（`useEventStream.ts` 的 compaction 分支原样显示它）');
 });

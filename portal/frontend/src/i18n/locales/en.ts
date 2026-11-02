@@ -248,6 +248,11 @@ export const en = {
       capabilityDegraded: 'store lacks the {method} capability: that persistence is skipped for this run (no mid-run crash resume)',
       resumeJournalSkipped: '{count} tool result(s) from the crash round (round {round}) were not written to the ledger; the next resume relies on the snapshot',
       resumeJournalSome: 'some',
+      // issue #438 slice B (erix-agent 0.29.0): the two display-class diagnostics the LoopEvent union
+      // grew. Missing numbers are already normalised to "?" by the caller (#283); foreign identifiers
+      // go through the shape gate (#261). This text must not invent a number.
+      compactionDeferred: 'compaction deferred this round: the request tail is an assistant tool_use without its tool_result (round {round}, {reason}); the next round folds it',
+      budgetBelowWorkingSet: 'still over budget after folding: working set {workingSet} tokens > budget {budget} tokens ({attempts} consecutive attempts), so this run ends early; the engine suggests budget >= {suggested}',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       // issue #321 (erix-station): the judge is forever only an **opinion**, never an acceptance — shown on

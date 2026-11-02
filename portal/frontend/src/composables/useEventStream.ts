@@ -26,7 +26,11 @@ import { eventRoundToken, runSegment, toolCardKey, UNKNOWN_ROUND_TOKEN } from '.
 const t = i18n.global.t;
 
 // 具名事件全集（旧 connectEvents 的数组原样，顺序不变）。
-const EVENT_TYPES = [
+// ⚠ 本数组是 EventSource 逐类型 `addEventListener` 的**唯一来源**，三处集合（本数组 /
+// HISTORY_REPLAY_TYPES / 后端 `http.js` 的 HISTORY_EVENT_TYPES）各自独立存亡（#288）。
+// 引擎承诺面（`LoopEvent` 联合类型）与本数组的对账**不再靠手抄清单**：`portal/test/event-surface-contract.test.js`
+// 从**已安装引擎源码**里解析那个联合类型（19 类，0.29.0），逐类要求「订得到」，并要求「进回放 / 显式豁免（写理由）」二选一。
+export const EVENT_TYPES = [
   'round_start', 'round_end', 'attempt', 'attempt_killed', 'recovering', 'recovered', 'usage',
   'tool_use', 'tool_result', 'assistant_delta', 'reasoning_delta',
   // issue #288（缺陷 C）：崩溃恢复时挂起工具**没被重放**（引擎 additive LoopEvent，仅
@@ -47,6 +51,25 @@ const EVENT_TYPES = [
   // 哪一类进回放、哪一类显式豁免，判据在 `engineEventSurface.spec.ts`（它把 16 类清单钉在测里）。
   'compaction_strategy_fallback', 'model_metadata_missing', 'persistence_capability_degraded',
   'resume_journal_skipped', 'run_outcome',
+  // issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 联合类型从 16 类长到 **19 类**，多出来的
+  // 三类在这里逐类决定（对账口径见 `portal/test/event-surface-contract.test.js`，那份清单是从
+  // 已安装引擎源码解析出来的，不再手抄）：
+  //   · `compaction_deferred` —— 进时间线（中性分隔行）：引擎因「请求尾部是没结清的 tool_use」
+  //     推迟本轮折叠。这是**每轮可能发生一次**的展示类事实，且用户看得懂（「这轮没折」）；
+  //   · `budget_below_working_set` —— 进时间线（中性分隔行）：连续几次折叠后工作集本身仍超预算
+  //     ⇒ 引擎判定「预算装不下模型手上的东西」并**提前终局**。它是终局原因的解释，必须留痕；
+  //   · `config_override_conflict` —— **豁免**（只订不刷行）：启动期一次性的配置冲突（`config.*`
+  //     与同名扁平键同时给且值不同）。本站只写 `config.<组>.<叶>`，结构上不可能出现；真响了就是
+  //     宿主代码 bug，账在 runner 的 warn LOG 里（`runner/lib/engine-notices.js`），时间线上没有
+  //     任何用户可行动信息 ⇒ 不进回放、不刷行（理由同 `run_outcome` 的豁免表）。
+  'compaction_deferred', 'budget_below_working_set', 'config_override_conflict',
+  // issue #438 切片 B：`continuity_injection_skipped` **经 `onEvent` 真发、但不在 `LoopEvent` 联合类型里**
+  // （引擎漏登记，0.29.0 实测）。本站的显式决定 = **订得到、不刷行、不回放**：本站在 `config.continuity`
+  // 与 `capabilities.hooks.continuityProvider` 上**都不传**（`continuity.handoff` 默认 `off`）⇒ 引擎连
+  // 注入分支都进不去，本事件在本站结构上不可能出现；订它是为了让「将来开 continuity」那天不必重新
+  // 发现一次（同 `run_outcome`：订得到但今天没有读者）。理由钉在 `portal/test/event-surface-contract.test.js`
+  // 的豁免表里，**不靠巧合漏掉**。
+  'continuity_injection_skipped',
   // issue #370：输入队列快照（steer / follow_up 待发送）。**live-only、不落 run_events**
   // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
   // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
@@ -81,9 +104,14 @@ const HISTORY_REPLAY_TYPES = new Set([
   // 一边就分别得到「实时收不到」或「刷新后消失」）。四个都是**中性分隔行**（展示类），不驱动运行态
   // 状态机：红色的面仍只由 `run_end` 负责。
   // `run_outcome` **故意不在这里**：它与 `run_end` 语义重叠（rounds / 终局），今天没有读者，
-  // 把它放进回放只会让刷新时多送一堆没人看的行（豁免理由在 `engineEventSurface.spec.ts`）。
+  // 把它放进回放只会让刷新时多送一堆没人看的行（豁免理由在 `portal/test/event-surface-contract.test.js`）。
   'compaction_strategy_fallback', 'model_metadata_missing', 'persistence_capability_degraded',
   'resume_journal_skipped',
+  // issue #438 切片 B（erix-agent 0.29.0）：这两类**进回放**（与 `http.js` 的 HISTORY_EVENT_TYPES 同步）。
+  // 只加一边 = 「实时收不到」或「刷新后消失」（#288 的老坑）。两者都是展示类，不驱动运行态状态机。
+  // `config_override_conflict` 与 `continuity_injection_skipped` **故意不在这里**：前者是启动期配置 bug
+  // （账在 LOG），后者本站结构上不可能出现（不传 continuity）——两条豁免理由都写在上面 EVENT_TYPES 段。
+  'compaction_deferred', 'budget_below_working_set',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
@@ -757,6 +785,40 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 订得到（推水位线 + `hooks.onEvent` 观察面拿得到），但**不刷时间线**：它与 `run_end` 重叠
         // （rounds / 终局），多一行只会把同一件事说两遍（谎报严重度之外的“谎报信息量”，同 #371-A
         // 不刷 fatal 红行的理由）。等多一个真读者（§12 台账 / 结算面板）再一次性接。
+        return;
+      // ---- issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 联合类型新增的三类 + 联合外的一类 ----
+      // 载荷形状逐条对着引擎发射点写（不凭记忆造键；推测键的后果是**永不触发**，不是报错）：
+      //   compaction_deferred        {runId?, round, reason, detail}                 orchestrator.js:4884
+      //   budget_below_working_set   {runId?, round, budgetTokens, workingSetTokens,
+      //                               suggestedBudgetTokens, repeatStreak,
+      //                               foldLayersOverBudget, attempts, detail}        orchestrator.js:4056
+      //   config_override_conflict   {runId?, conflicts:[{path,key}], detail}        orchestrator.js:1271
+      // 前两类刷中性行（它们说的是“这轮没折 / 预算装不下工作集”，不是“本轮失败”）；第三类不刷行（豁免）。
+      case 'compaction_deferred':
+        hooks.onSep(t('stream.event.compactionDeferred', {
+          round: noticeNum(d.round),
+          reason: noticeToken(d.reason),
+        }));
+        return;
+      case 'budget_below_working_set':
+        // 数字全走 `noticeNum`：引擎没给就 `?`，绝不拿 0 冒充（#283）。`suggestedBudgetTokens`
+        // 是引擎给的「该配多少」，缺了就只报事实、不给建议（不自己算一个数出来）。
+        hooks.onSep(t('stream.event.budgetBelowWorkingSet', {
+          workingSet: noticeNum(d.workingSetTokens),
+          budget: noticeNum(d.budgetTokens),
+          attempts: noticeNum(d.attempts),
+          suggested: noticeNum(d.suggestedBudgetTokens),
+        }));
+        return;
+      case 'config_override_conflict':
+        // **豁免**（理由在 `EVENT_TYPES` 那段与 `portal/test/event-surface-contract.test.js` 的豁免表）：
+        // 启动期一次性的配置冲突，本站只写 `config.<组>.<叶>` ⇒ 结构上不可能出现；真响了就是宿主
+        // 代码 bug，账在 runner 的 warn LOG 里，时间线上没有用户可行动的信息。
+        return;
+      case 'continuity_injection_skipped':
+        // **豁免**：经 `onEvent` 真发、但**不在 `LoopEvent` 联合类型里**（引擎漏登记）。本站不传
+        // `continuity`（`config.continuity.handoff` 默认 `off`、也不传 `continuityProvider`）⇒
+        // 引擎连注入分支都进不去。订它只为将来开 continuity 时不必重新发现一次。
         return;
       case 'recovering':
         observeRound(d.run_id, d.round); // 同 attempt：轮内重试，轮号仍是当前轮（#279）

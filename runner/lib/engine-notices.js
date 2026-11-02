@@ -1,11 +1,14 @@
 // issue #421：引擎「诊断类」事件的宿主侧嘴（runner 这一半）。
 //
-// 为什么要有这个文件：erix-agent 对宿主承诺 **16 类事件**（`LoopEvent` 联合类型，
-// `src/loop/orchestrator.js:297`），本站此前只有 11 类订得到——`compaction_strategy_fallback`、
+// 为什么要有这个文件：erix-agent 对宿主承诺 **19 类事件**（`LoopEvent` 联合类型，0.29.0 的
+// `src/loop/orchestrator.js` —— #438 切片 B 起由 `portal/test/event-surface-contract.test.js`
+// 从已安装引擎源码解析，不再手抄），本站此前只有 11 类订得到——`compaction_strategy_fallback`、
 // `model_metadata_missing`、`persistence_capability_degraded`、`resume_journal_skipped`、
 // `run_outcome` 这 5 类**每一轮都在往 `run_events` 里写，但前端一条都收不到**（写入侧不过白名单，
 // 读侧白名单里没有它们）。#421 把界面那一半补齐；本文件补的是**运维那一半**：只读 LOG 的人
 // 也必须能看见这五件事，否则「界面没接」就变成「世界上没人知道」。
+// #438 切片 B 又把 0.29 新增的三类接进本文件（`compaction_deferred` / `budget_below_working_set` /
+// `config_override_conflict`），口径同上：级别按「每轮都有就 info，异常才 warn」判。
 //
 // 口径与 `worker.js` 的 `foldDegradeNotice` 完全一致：
 //   · **只描述事实，不改终态、不改事件**（这些都是诊断，不是 run 失败）；
@@ -78,6 +81,47 @@ export function engineDiagnosticNotice(event) {
         level: 'info',
         msg: `run outcome: reason=${token(termination?.reason)} rounds=${num(event.rounds)}`
           + ` judgeRecords=${num(event.judgeRecordCount)}`,
+      };
+    }
+    // ---- issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 联合类型新增的三类 ----
+    // 发射点 `orchestrator.js:4884`，载荷 `{ runId?, round, reason, detail }`。
+    // 语义：本轮**没折**（请求尾部是没结清的 tool_use，折了就会把半截工具调用写成摘要）。
+    // 正常形态、每轮最多一条 ⇒ `info`；一响就说明这轮请求可能按本地估算超预算。
+    case 'compaction_deferred':
+      return {
+        level: 'info',
+        msg: `compaction deferred: round ${num(event.round)} was not folded (reason=${token(event.reason)});`
+          + ' the next round folds the completed round',
+      };
+    // 发射点 `orchestrator.js:4056`，载荷 `{ runId?, round, budgetTokens, workingSetTokens,
+    // suggestedBudgetTokens, repeatStreak, foldLayersOverBudget, attempts, detail }`。
+    // 语义：连续几次折叠后工作集本身仍超预算 ⇒ 引擎判定「预算装不下模型手上的东西」并提前收尾。
+    // 这是**配置配小了**（异常）⇒ `warn`，并带上引擎自己给的「该配多少」，别让运维去反推。
+    case 'budget_below_working_set':
+      return {
+        level: 'warn',
+        msg: `budget below working set: working set ${num(event.workingSetTokens)} tokens > budget`
+          + ` ${num(event.budgetTokens)} tokens for ${num(event.attempts)} consecutive attempt(s)`
+          + ` (round ${num(event.round)}); suggested budget >= ${num(event.suggestedBudgetTokens)}`
+          + ' — the run ends early instead of re-reading until max_rounds_cap',
+      };
+    // 发射点 `orchestrator.js:1271`，载荷 `{ runId?, conflicts: [{path, key}], detail }`。
+    // 语义：`config.*` 与同名扁平键（或调用级 config 与装配口 policy.config）同时给了**不同的值**。
+    // 本站只写 `config.<组>.<叶>` ⇒ 结构上不可能出现；一响就是宿主代码 bug ⇒ `warn`。
+    // `path` 是外来字符串（形如 `run.maxRounds` / `hooks.onEvent`）⇒ 逐条过形状闸，不合格写 `?`。
+    case 'config_override_conflict': {
+      // 数组缺席 ≠ 零条冲突：引擎只在 `conflicts.length > 0` 时才发这条事件，所以「键不在」
+      // 只能是形状漂移 ⇒ 写 `?`，绝不拿 0 冒充（#283）。
+      const conflicts = Array.isArray(event.conflicts) ? event.conflicts : null;
+      const paths = (conflicts ?? [])
+        .slice(0, 8)
+        .map((entry) => token(entry && typeof entry === 'object' ? entry.path : entry))
+        .join(', ');
+      return {
+        level: 'warn',
+        msg: `config override conflict: ${conflicts === null ? '?' : num(conflicts.length)}`
+          + ' leaf/leaves set by two sources with different values'
+          + ` (${paths === '' ? '?' : paths}); config.* wins, the flat spelling is still accepted`,
       };
     }
     default:
