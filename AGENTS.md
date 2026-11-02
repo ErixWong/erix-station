@@ -3073,3 +3073,65 @@ unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRou
 `http://station.fde.erix.vip:8090/` **就能通**（Traefik 收到正确 Host、浏览器自动带同源 `Origin`）。
 ⚠ 别绕远路：`http://127.0.0.1:8090/` 会 404（Traefik 只认那个 Host）、自己写 Host 改写代理还要处理
 `Origin` 与 `Set-Cookie Domain`，白花时间（本次先绕了一圈）。
+
+### 8.85 v0.1.47：#440 折叠替代物进 DTO（横幅三态）+ `folding.toolResultTtl` 旋钮（2026-11-03 凌晨）
+
+§8.84 收尾时用户问「上游升级的红利都用上了吗，特别是折叠面」。审计结论里最扎眼的一条是：
+**`fold-llm` 每次折叠真花 8983+741 token 生成的语义摘要，界面上一个字节都看不到**——本片修它，
+顺带把两个从未传过的折叠旋钮显式传上（但**没能证明收益**，见下）。
+
+**M1 = #440 本体。** 病根两层都在读侧：`hasRealSummary(record)` 只读 `record.summary`（`fold-llm`
+写的是字面量 `"missing"`）⇒ `folded.hasSummary` 恒 false；而 `foldedTurnFields()` 的 `text` 取的是
+**上游投影生成的折叠 turn 文本**，账本 `foldedFacts.text` **压根没进 DTO**。修法：新增三个**可选**键
+`summaryText` / `summarySource` / `truncated`（键缺席语义照 #390-A：不写 `false`/`null` 冒充），
+`hasSummary` 语义**一字未动**，横幅从两态扩成**三态**，零新增 UI 结构。
+⚠ **机械路径刻意不换正文**：`fold-statistical` 的 `foldedFacts.text` 带引擎内部 marker
+（`【上下文折叠·v1·erix-9f6e2c】`），只有 `source === 'llm'` 才用 `summaryText` —— 否则就是把引擎内部
+版本号撒到用户界面上（这正是上游 #565 造 `foldedFacts.title` 要消灭的东西）。
+⚠ `summarySource` 用**白名单** `llm|statistical` 而不是原样透传：引擎缺省是 `'strategy'`、另有 `'host'`，
+这两个值在本站横幅上**没有第三态可落**（说是语义摘要是假话、说是机械替代物也不准）⇒ 整个键不给。
+
+**真机验收用「旧账本、零重跑」**：会话 `e02d96cb…` 第 25 轮是 v0.1.46 时代折的，部署 v0.1.47 后
+DTO 立刻给出 `round=25 hasSummary=False src=llm trunc=True text=1278B range={22,22}`，界面横幅变成
+「what remains is an LLM semantic summary (fold-llm)」+ 夹断标记，展开画的是**账本里的语义摘要正文**
+（`## 阶段 / ## 已改文件 / ## 已验证项 …`），不再是投影兜底句。截图 `v0147-440-fold-llm-summary.png`。
+⇒ 读侧改动可以**只换 portal 镜像、不重跑 run、不动账本**验证，这条比「再造一个长会话」便宜一个数量级。
+
+**M2 = `folding.toolResultTtl=6` / `toolResultFoldMinTokens=8000`（引擎默认 `2 / 4000`）。**
+⚠ **本片没能用 A/B 证明收益，注释与台账都如实写「待验证的裁定」**：v0.1.46 真机基线（12 个 4971 token
+文件、8 轮、budget≈460K）观测到 **0 条 `compaction` 事件**、`input_tokens` **单调递增**
+`4891→10639→18403→26962→43266→55463→68010→90263`（TTL 若折过必然回落）。引擎侧 `shouldSchedule`
+要求 `effectiveMaxRounds - budgetRounds > 2` **且** `lowBudgetPrompted !== true`
+（`src/compact/pipeline.js:21-26`）⇒ **多轮任务一旦开始催收尾，TTL 层就关了**，而这正是多轮任务的常态。
+⇒ 教训：**「引擎有这个旋钮」不等于「本站的场景会走到它」**；调参前先量「这一层到底触发没有」，
+否则调的是一个死旋钮（#331 死光纤的同族）。两行集中在 `#440:ttl-knobs` 标记里，回退 = 删两行。
+另核实：引擎**不校验**这两个叶子的类型（`CONFIG_LEAF_VALUE_RULE_PATHS` 只有 `run.stream` /
+`continuity.handoff`；真链路实测 `'6'` / `-1` / `null` / `1.5` 全部正常收尾、不抛不告警，
+静默退化成「TTL 折叠失效」）⇒ 本站补 `assertFoldingToolResultKnobs`（`0` 合法 = 关掉）。
+
+**基线**：根 **1727/1723/0/4 → 1736/1732/0/4**（+9）、runner **439 → 443**、前端 **53 文件 / 985 → 993**、
+`typecheck` rc=0。**主 agent 亲跑 6 条变异**全红在具名用例，其中 **M6（`foldedFactsByRound` 用数组下标
+当键）原 10 条全绿 ⇒ 定性真覆盖缺口**，补 `#440-D4`（两个折叠行 round 3/7）后重放**恰 1 条红在新用例上**。
+⚠ 单折叠行夹具（round=1）恰好让下标键命中，这类「夹具太单薄导致变异测不出」的形状值得记住。
+
+**发版与部署（v0.1.47）**：`e5513a7`（PR #441）→ `cca8d3f`（版本 0.1.47，六文件 9 增 9 删）→
+main CI `41478854611` 两个 job 全绿（含三镜像构建校验）→ tag `v0.1.47` → release `41479818422` success →
+清单三镜像 `docker image inspect .Id` **逐个一致**（portal `8400dceb…` / fde `eac553a6…` / proxy `e5d8d1a7…`）。
+⚠ **fde 与 proxy 直连 GHCR 又拉不动**（`docker pull` rc=1）⇒ 老办法：先拉
+`ghcr.nju.edu.cn/...:0.1.47`（成功），**再按 digest 拉 ghcr 一次**（层已在本地、秒回）⇒ 拿到 `repo@sha256:`
+引用、pin 保持形态①。`deploy/.env` 三项 pin（备份 `/tmp/deploy.env.bak-0147`）→ `up -d --no-build` ⇒
+portal healthy、`healthz=200` → **重建 5 台 FDE**，全部 `0.1.47 / engine 0.29.0`。
+
+**两条过程账（都值一次记录）**：
+1. **`git push -q -c http.proxy=…` 是错的写法**——`-c` 是**全局**选项，写在子命令后面会被当成 push 的参数，
+   报出来的是 curl 的 `-6, --ipv6` 帮助文本（完全误导）。正解 `git -c http.proxy=… push`。
+2. **重建 FDE 容器不能用 `--filter name=fde-`**：本站 5 台带 `label=station.stack=default`，而
+   `fde-workshop-db`（另一个 session 的 postgres）**没有**这个标签 ⇒ 用
+   `--filter label=station.stack=default --filter name=fde-` 精确圈定（§8.84 那次误删的正是它）。
+3. **playwright 里「用 fetch 调 `/api/auth/login`」进不去 SPA 工作台**：cookie 种上了（`/api/me` 200），
+   但 SPA 的 auth store 没被填充，路由守卫照样踢回 `/login`。正解 = **走登录表单**（或登录后
+   `location.reload()` 让 store 从 `/api/me` 初始化）。本次用的是后者，且要等 ~2.5 s 再断言 DOM。
+
+**未做 / 待验证**：① TTL 旋钮的 A/B（见上，需要「轮数充足 + 未进入催收尾」的长 run 才能触发 TTL 层）；
+② `foldedFacts` 的 `origin` / `strategy` / `bytesBefore` 未进 DTO（只有 `source`/`text`/`truncated` 三个够用）；
+③ 中文界面真机面未单独走（靠 `localeParity` + 组件用例兜底，英文面已真机验）。
