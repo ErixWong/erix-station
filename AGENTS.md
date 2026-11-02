@@ -2755,3 +2755,29 @@ UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字�
 `deploy/.env` 三项 pin（备份 `/tmp/deploy.env.bak-0144`）→ `up -d --no-build` ⇒ portal 实跑 `646a1c65…`、迁移 **0025 自动应用**、`healthz=200` → `docker rm -f` 五台 `fde-*` → reconcile 16 秒内全部落在 `cd43ed63…`、容器内 `station 0.1.44 / engine 0.26.0`、agentd `sse connected` + `sse ping received`。
 
 ⚠ **一条操作坑（与 §8.24 同族）**：`while read … docker pull … done < file` 里 **docker 会吃掉 stdin** ⇒ 循环只跑了一条就静默结束（我这次就是 portal/fde 跑完、proxy 根本没执行）。⇒ 逐个显式调用，或 `docker pull < /dev/null`。
+
+### 8.81 FDE 镜像补 .NET SDK 10（与 SDK 8 side-by-side，issue #436，2026-11-02）
+
+**需求**：一个项目同时需要 SDK 8 与 SDK 10（既有 net8.0 解决方案 + 新 net10.0 项目）。镜像原本只有 SDK 8（`runner/Dockerfile` 从 `mcr.microsoft.com/dotnet/sdk:8.0` COPY `/usr/share/dotnet`）。
+
+**决策路径**：主 agent 先实测「两个官方镜像的 `/usr/share/dotnet` 叠加 COPY = 目录合并 = side-by-side」可行，再把四条路（继续胖镜像 / 按档位分镜像 / 用户态装 / sidecar）摆给决策者 ⇒ **选 A（继续胖镜像）**，成本 +620 MB。sidecar 那条**本来就已被否决**（`fde-platform.md:754`：跨容器 `localhost` 语义坑），按档位分镜像要动 `FDE_IMAGE` 单值 + provisioner + 管理台 + 多套 pin，未选。
+
+**实测（合并后镜像，uid 1000）**：`dotnet --list-sdks` = 8.0.424 + 10.0.403；`--list-runtimes` = NETCore.App / AspNetCore.App 各 8.0.30 与 10.0.14；net8.0 与 net10.0 两个 ASP.NET Core 应用 publish 后起在 22000/22001，`curl` 分别 `ok-8.0.30` / `ok-10.0.14`；`global.json` 钉 `8.0.424` ⇒ `dotnet --version`=8.0.424，不钉 ⇒ **10.0.403**。
+
+**两条必须记住的事实**：
+1. **默认 SDK 会从 8 变成 10**（两版并存时选最高版）⇒ 老 .NET 8 项目会静默用 10 构建。要钉 8 必须放 `global.json`。这条已写进下发的 `~/AGENTS.md`（`materializer.js` 环境事实段），agent 与人都能读到。
+2. **属于官方矩阵之外**：`sdk:10.0` 底座是 Ubuntu 24.04 / glibc 2.39，微软**没有发布 bookworm 变体**（`10.0-bookworm` / `-bookworm-slim` / `-trixie-slim` 全不存在，只有 `10.0` 与 `10.0-noble`），我们在 Debian 12 / glibc 2.36 上跑。兜底 = Dockerfile 里的**离线 CoreCLR 烟测**（`dotnet <sdk/10.*>/Roslyn/bincore/csc.dll -version`，真加载运行时；`--list-sdks` 只跑 muxer 看不出来）。哪天 10.0.x 抬高 glibc 要求，**镜像构建期就红**，不会等用户跑起来才炸。真失效时唯一出路是把 FDE 底座升 trixie/noble（apt 包 + playwright 依赖全量重测），本单不做。
+
+**改动**（6 文件 / +128 −6）：`runner/Dockerfile`（加 `COPY --from=dotnet/sdk:10.0` + 断言收紧成「两个 major 都在」+ 离线烟测 + 三条注释）、`portal/src/materializer.js`（告知面：SDK 8 与 10 并存 + 默认选最高版 + `global.json` 形状）、`portal/test/runner-image-dotnet.test.js`（新，4 条静态判据）、`portal/test/materializer.test.js`（+1，按节取「环境事实」并再钉零端口数字）、`docs/design/deploy-contract.md` §6 + `docs/env.md` `FDE_IMAGE` 行（矩阵与体积同步）。零依赖变动、零 lockfile、零 DDL、零版本号改动。
+
+**体积**：`/usr/share/dotnet` 578 MB → 1.2 GB；镜像 2.43 GB → **3.08 GB**（`docker image inspect .Size` = 3082044237 字节）。**整机一份**（所有 FDE 共用同一 image 层），不是每台 FDE 各 620 MB。
+
+**验收（主 agent 亲跑，不采信 worker 自报）**：根 `npm test` **1715 / 1710 通过 / 0 失败 / 5 跳过 rc=0**、`node --test runner/test/*.test.js` **430 / 429 / 0 / 1 跳过 rc=0**（净 +5 = 新文件 4 + materializer 1）；**我自己的构建 rc=0，imageId 与 worker 的逐位相同 `sha256:131de5e5…`**（可复现）；镜像内 uid 1000 实测见上；顺带核对 node 22.23.3 / python 3.11.2 / gh·tea·glab / `station-agentd-entrypoint`·`healthcheck` / `build-info.json`（0.1.44 + engine 0.26.0）**全部完好**（防中段改动误伤）。
+
+**我自己的三条变异（每条先 `git diff --numstat` 自证非空操作，复原后 `git status` 干净）**：① 删掉 `grep -q '^10\.'` ⇒ `not ok 2`（断言那条）；② 把两条 COPY 顺序反转 ⇒ `not ok 1`（顺序那条，正是「10 被 8 的 muxer 盖掉」的静态哨兵）；③ `materializer` 告知面退回旧文案 ⇒ `not ok 14`（SDK 8+10 那条）。
+
+**环境坑（本机，值得记）**：本机 `github.com` **直连已挂**（`--noproxy '*'` 20s 无响应），`docker build` 会卡在 CLI 下载层（#16）二十多分钟直到超时。必须走代理：`docker build --network=host --build-arg HTTP_PROXY=http://172.20.0.35:19001 --build-arg HTTPS_PROXY=… --build-arg NO_PROXY=127.0.0.1,localhost`（与 `portal/integration/lib/fde-image.mjs` 的既有写法一致；实测 `curl -x` 到 github 200）。另：这次两条 dotnet COPY 与断言层**在直连构建里全部 CACHED** ⇒ 可以直接判定 recipe 未变、失败纯属网络。
+
+**已知 nit（故意保留）**：新测试对 **Dockerfile 全文**禁 `8.0.<数字>` / `10.0.<数字>`（含注释），所以将来谁想在某条注释里写「实测 8.0.427 通过」会红。这是刻意的——官方 tag 浮动，把补丁号写进镜像会随官方推补丁漂移；要记实测版本请记在本台账或 issue 里，别记进 Dockerfile。
+
+**未做 / 待办**：① 发版 + **`docker rm -f` 全部 `fde-*` 让 reconcile 重建**（§8.17：不动镜像就还是只有 SDK 8）；② 本单**不碰** per-FDE / per-language 镜像（`FDE_IMAGE` 仍是全局单值，要改是另一个决策）；③ 不装 .NET 9、不改底座、不动 `FDE_MEMORY_LIMIT=4g`。
