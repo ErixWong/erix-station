@@ -18,8 +18,8 @@
 //      `portal/test/termination-contract.test.js` 的「零 import」断言钉住。
 //
 // 真值来源（引擎 0.22.0，逐值定位；0.18.0 → 0.19.0 → 0.20.0 → 0.22.0 四次复核：reason 全集**一字未变**）：
-//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:447-448`（runToolLoop 返回值 typedef。
-//     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块 ⇒ 防漂移测试的取值正则已同步）；
+//   * JSDoc 9 值：`erix-agent/src/loop/orchestrator.js:655-656`（runToolLoop 返回值 typedef；**按 0.29.0 现查**。
+//     0.18.0 时这块写在一行、位于 :511，0.19.0 起改成多行块，0.26.0 在 :490-491 ⇒ 防漂移测试的取值正则已同步）；
 //   * 未写进 JSDoc 但会实际产出：`persistence_failed`（`orchestrator.js:1077-1081`，fail() 里
 //     「快照/markRunState 没落盘」时定值，并把 operation/phase/sideEffect 挂在 termination 上，
 //     `orchestrator.js:1091` + `src/loop/termination.js:74` annotateTermination）；
@@ -39,10 +39,21 @@
 //     所在行号因上方新增注释下移一行），且 `? "failed" : "persistence_failed"`、`const reason = signal?.aborted`、
 //     `operation: persistenceFailure.operation` 三处形状断言仍然命中；0.23.0 的 `src/` 变更面（投影 / orchestrator /
 //     resume-manager / store 三个文件 / file-tools）**完全不碰 termination 语义** ⇒ **只追版本号，不放宽任何断言**。
+//   * 0.26.0 → 0.29.0（#438 升级片；**0.27.0 从未发布**，本站 0.26.0 一跳上 0.29.0）五度核，按 0.29.0 现查：
+//     ① `src/loop/termination.js` 里 reason 字面值集合用
+//        `grep -oE '"(aborted|end_turn|failed|judge_done|max_rounds_cap|no_tool|stall|timeout|continuation_exhausted|final_guard_unverified)"' | sort -u`
+//        对 0.26.0 与 0.29.0 **两侧结果逐字相同**（十值全在、无新增无改名）；该文件的 diff 只含注释 + 强制收尾判据
+//        下沉（erix-agent #475：白名单 `["max_rounds_cap","stall","continuation_exhausted","judge_done"]` 改成
+//        `FORCED_FINAL_TRUNCATED_REASONS` + 「终稿正文是否为空」）与续接 finalize 钩子（#598）——**都不改值域**。
+//     ② `src/loop/orchestrator.js` 的 typedef 现在在 `:655-656`（0.29.0 现查；0.26.0 是 `:490-491`），仍是同一组九值、
+//        同一声明顺序；`? "failed" : "persistence_failed"` / `const reason = signal?.aborted` /
+//        `operation: persistenceFailure.operation` 三处形状断言仍然命中。
+//     ③ `diff -rq <0.26.0>/src/providers <0.29.0>/src/providers` **无输出** ⇒ provider 层可重试码面零差异。
+//     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.26.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.29.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。

@@ -45,7 +45,12 @@ const REPO_ROOT = path.join(RUNNER_DIR, '..');
 // `display/projection.js` / `loop/orchestrator.js` / `loop/resume-manager.js` / `store/file.js` /
 // `store/memory.js` / `store/message-rows.js`(新增) / `tools/file-tools.js`，**providers 一个文件没动**。
 // ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
-const ENGINE_VERSION_PINNED = '0.26.0';
+// 0.26.0 → **0.29.0** 复核结果（#438 升级片；0.27.0 **从未发布**，npm 版本线是 0.26.0 → 0.28.0 → 0.29.0）：
+// `diff -rq <0.26.0>/src/providers <0.29.0>/src/providers` **无任何输出** ⇒ 整个 providers 目录
+// 逐字节相同（0.28.0 动的是 `loop/option-normalization.js` / `loop/config-namespace.js` / `assembly*.js`
+// 那一片**入参面**，0.29.0 动的是派生面与压缩续接面，两版都没碰 provider 的超时/载荷实现）。
+// ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
+const ENGINE_VERSION_PINNED = '0.29.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。

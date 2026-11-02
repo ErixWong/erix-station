@@ -77,16 +77,18 @@ async function runRealLedger() {
   const records = {};
   await runToolLoop({
     provider: stubProvider(),
-    initialUserMessage: '读文件',
-    completion: false,
     tools: TOOLS,
     executeTool: async ({ input }) => {
       if (input.path === 'missing.txt') throw new Error('ENOENT: no such file');
       return 'file body line1\nline2';
     },
-    maxRounds: 4,
     store: makeStore(records),
-    runId: SESSION_ID,
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `initialUserMessage` /
+    // `completion` / `maxRounds` / `runId` 现在启动期就抛）；观察者/端口仍是顶层。
+    config: {
+      input: { initialUserMessage: '读文件' },
+      run: { runId: SESSION_ID, maxRounds: 4, completion: false },
+    },
   });
   const rows = records[SESSION_ID] ?? [];
   assert.ok(rows.some((row) => row.kind === 'message'), '前置条件：0.23 必须真的落出 kind:"message" 行');
@@ -363,16 +365,16 @@ async function runRealEngineLedger() {
   const records = {};
   await runToolLoop({
     provider: stubThreeToolProvider(),
-    initialUserMessage: '读文件',
-    completion: false,
     tools: TOOLS,
     executeTool: async ({ input }) => {
       if (input.path === 'missing.txt') throw new Error('ENOENT: no such file');
       return `body of ${input.path}`;
     },
-    maxRounds: 4,
     store: makeStore(records),
-    runId: SESSION_ID,
+    config: {
+      input: { initialUserMessage: '读文件' },
+      run: { runId: SESSION_ID, maxRounds: 4, completion: false },
+    },
   });
   const rows = records[SESSION_ID] ?? [];
   const shards = rows.filter((row) => typeof row.partOf === 'string');

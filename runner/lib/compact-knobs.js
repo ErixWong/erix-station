@@ -3,7 +3,8 @@
 // 为什么必须宿主自己校（这是本站走**直连** `runToolLoop` 的代价）：
 //   erix-agent #488/#493 加的装配期校验（未知子键抛错、旋钮值必须正整数）**只挂在
 //   `createAssemblyPort` 上**。本站从不走装配口——真链路实测（引擎 0.26.0 + pr493 同款探针）：
-//       runToolLoop({ context: { strategy:'fold-llm', summarizerTimeout:5000, maxSummaryTokens:'abc' } })
+//       runToolLoop({ config: { folding: { context: {
+//         strategy:'fold-llm', summarizerTimeout:5000, maxSummaryTokens:'abc' } } } })
 //   ⇒ 一路 `end_turn`，**不抛错、不发事件、不红**：`summarizerTimeout` 是拼错的键名（引擎读的是
 //   `summarizerTimeoutMs`），`maxSummaryTokens:"abc"` 是非法值。这就是 erix-station #331 那根
 //   「没人读的光纤」的形状：配置写了、看起来配上了、跑的其实是默认值。
@@ -45,7 +46,8 @@ const KEY_SET = new Set(COMPACT_CONTEXT_KEYS);
 const POSITIVE_INT_SET = new Set(COMPACT_POSITIVE_INT_KEYS);
 
 /**
- * @param {Record<string, unknown>|undefined} context 要交给 `runToolLoop({ context })` 的那个对象
+ * @param {Record<string, unknown>|undefined} context 要交给 `runToolLoop({ config: { folding: { context } } })` 的那个对象
+ *   （erix-agent 0.28.0 起扁平顶层 `context` 会被启动期拒；**值本身**与本校验器一字未变）
  * @returns {string[]} 问题列表（空 = 通过）
  */
 export function collectCompactContextProblems(context) {

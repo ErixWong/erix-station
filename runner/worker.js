@@ -642,79 +642,158 @@ async function startRun(msg) {
   try {
     const result = await runToolLoop({
       provider,
-      // issue #309 切片 2：模型元数据 + 显式 max_tokens（值已在 resolveModelMetadata 里钳过）。
-      // 命名纪律（决策者定稿）：camelCase 三键（contextWindowTokens / maxOutputTokens / maxTokens）
-      // **在本文件里只允许出现在下面这一对 #309 标记之间**（引擎入参的唯一映射点）。措辞刻意
-      // 不说「全站」：锁只数 worker.js（见 model-metadata.test.js 那条用例）；runner 侧过去另有一处
-      // `maxTokens: 512`（`lib/session-title.js` 给 provider.chat 用），#322 已随该文件一并删除。
-      // 防漂移锁：runner/test/model-metadata.test.js（从 worker.js 源码正则数次数，不 import worker）。
-      // 已知副作用（都核过行号，**不要顺手修**）：
-      //   - wrap-up 归一化 judge 的请求**继承**宿主 maxTokens（orchestrator.js:3115
-      //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
-      //     「provider 默认」变成我们那个数（**变严**，不是变松）；
-      //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
-      //   - fold-llm 压缩 summarizer 也继承 maxTokens（0.26.0 `orchestrator.js:1175`）——但**只有
-      //     真选了 `fold-llm` 才成立**：本站自 #392 起显式选 `fold-statistical`（零 LLM），超预算时
-      //     也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
-      //     ⚠ **pin 到 0.27.0 之后这条会变**：erix-agent #493 把摘要的 maxTokens 改成
-      //     `min(宿主 maxTokens, context.maxSummaryTokens ?? 1400)` ⇒ 本站那个按窗口算出来的
-      //     `max_output_tokens` 在摘要这条路上不再说了算（上限 32 768 → 1 400，方向是**变严**）。
-      //     届时重跑一遍本项口径再下结论（本站已真机验过 `maxSummaryTokens` 直连路径生效）。
-      /* #309:engine-model-params:start */
-      ...(engineModelMetadata ? {
-        modelMetadata: {
-          contextWindowTokens: engineModelMetadata.context_window,
-          maxOutputTokens: engineModelMetadata.max_output_tokens,
+      // erix-agent 0.28.0（上游 issue #498 S3）起「一个值只有一个住址」：**数据**只能写进
+      // `config.<组>.<叶>`，写成扁平顶层键**在启动期就抛**（逐字：
+      // `unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRounds;
+      // the flat spelling is rejected)`）。本站走**直连** runToolLoop ⇒ 这棵树是唯一的写侧住址。
+      // ⚠ 观察者与端口**仍是顶层选项**，一个都不许搬进来：`provider` / `tools` / `executeTool` /
+      //   `store` / `signal` / `semanticStateProvider` / 12 个 `on*` / `diagnostics`
+      //   （0.29 的顶层白名单 = 引擎 `src/loop/option-normalization.js#RUN_TOOL_LOOP_OPTION_NAMES`）。
+      // ⚠ 0.28 只搬**写侧**：引擎读侧仍是 `effectiveOptions.<扁平名>`（展开相写回），所以本次迁移
+      //   对 run 的语义是零变化。判据：runner/test/worker-options-address.test.js（顶层键 ⊆ 引擎白名单）
+      //   与 runner/test/model-metadata.test.js / fold-strategy.test.js / replay-policy.test.js（值仍真到引擎）。
+      config: {
+        // issue #309 切片 2：模型元数据 + 显式 max_tokens（值已在 resolveModelMetadata 里钳过）。
+        // 命名纪律（决策者定稿）：camelCase 三键（contextWindowTokens / maxOutputTokens / maxTokens）
+        // **在本文件里只允许出现在下面这一对 #309 标记之间**（引擎入参的唯一映射点）。措辞刻意
+        // 不说「全站」：锁只数 worker.js（见 model-metadata.test.js 那条用例）；runner 侧过去另有一处
+        // `maxTokens: 512`（`lib/session-title.js` 给 provider.chat 用），#322 已随该文件一并删除。
+        // 防漂移锁：runner/test/model-metadata.test.js（从 worker.js 源码正则数次数，不 import worker）。
+        // 0.28 之后它们的住址是 `config.metadata.modelMetadata` 与 `config.tuning.maxTokens`，而
+        // `task`（§1.3 硬注意-1 要求显式传）住在同组的 `config.metadata.task` ⇒ **整组**在这里一次
+        // 给出。别在别处再写第二个 `metadata:` / `tuning:`（同名字面量后写者胜 = 静默丢掉元数据）。
+        // 已知副作用（都核过行号，**不要顺手修**）：
+        //   - wrap-up 归一化 judge 的请求**继承**宿主 maxTokens（orchestrator.js:3115
+        //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
+        //     「provider 默认」变成我们那个数（**变严**，不是变松）；
+        //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
+        //   - fold-llm 压缩 summarizer 也继承 maxTokens（0.26.0 `orchestrator.js:1175`）——但**只有
+        //     真选了 `fold-llm` 才成立**：本站自 #392 起显式选 `fold-statistical`（零 LLM），超预算时
+        //     也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
+        //     ⚠ 0.29.0 起这条口径的**一半**已经落地：erix-agent #493 把摘要的 maxTokens 改成
+        //     `min(宿主 maxTokens, context.maxSummaryTokens ?? 1400)` ⇒ 本站那个按窗口算出来的
+        //     `max_output_tokens` 在摘要这条路上不再说了算（上限 32 768 → 1 400，方向仍是**变严**）。
+        //     本站仍未切 `fold-llm`（见下面 folding 段的裁定），所以真机上这条路依旧不被走到。
+        /* #309:engine-model-params:start */
+        metadata: {
+          task,
+          ...(engineModelMetadata ? {
+            modelMetadata: {
+              contextWindowTokens: engineModelMetadata.context_window,
+              maxOutputTokens: engineModelMetadata.max_output_tokens,
+            },
+          } : {}),
         },
-        maxTokens: engineModelMetadata.max_output_tokens,
-      } : {}),
-      /* #309:engine-model-params:end */
-      // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
-      system: SYSTEM_PROMPT,
-      // issue #392（A 片）：**显式选折叠策略，唯一目的是让折叠产出确定性替代物**。
-      // 此前本站连 `context` 都不传 ⇒ 超预算时引擎自己 `createSlidingWindowStrategy()` 兜底
-      // （0.25.0 `loop/orchestrator.js:3136` 那条 fallback）。真机标本（erix-station 现网会话
-      // `bdef6dd7`，erix-agent 0.25.0，195 轮 / 12 run / 666 条轮记录）：7 次整轮折叠**全部**是
-      // slidingWindow，账本里 `foldedSummary` 与 `navigationRecord` 各 **0 行**、`summary` 恒
-      // `"missing"`、`[已折叠]` 占位 0 条（`stubFor` 没人给 ⇒ `resolveFoldStubs` 直接返回 `[]`）
-      // ⇒ 一次折叠 = 从第 1 轮起到 `budget-6` 轮的**整块静默硬删**（单次最多折走 32.7 万 token），
-      // 模型事后既不知道自己少了什么、也无从判断该去哪找。**这条静默不是 bug 而是本站选的后果**。
-      // 换成 `fold-statistical`（同版本、零 LLM、零调用成本）之后：机械摘要被 **prepend 进 head**
-      // （`compact/fold-statistical.js:546` → `formatFoldSummary`：范围句 + 工具足迹 + 导航记录 +
-      // `[已折叠]` 占位 + 锚点节，本会话实测那一份 732 B）⇒ ① 模型当场看得见「早期第 1–107 轮已
-      // 折叠」这类事实；② 因为它是真进了请求的正文，`orchestrator.js:3257` 的
-      // `fedSummaryText !== ""` 成立 ⇒ 同一份摘要**同时进账本**（`record.foldedSummary`，#326 wo-C）
-      // ⇒ 宿主横幅与引擎喂给 judge 的轮次历史第一次有料（此前两者只能看见 `"missing"`）。
-      // ⚠ 三件**不要**把本行读成的事：
-      //   ① **不是为了少折**。0.25.0 的 `selectFoldedRounds` 对两种策略都是「折掉除最后
-      //      `keepRounds` 轮以外的全部」，没有按预算缺口比例裁剪的逻辑（真机每次折到预算的
-      //      1.4%–5.4% 就是这个）⇒ 那是 erix-agent#464 的 C 档，**仍未做**，本行不改变它。
-      //   ② **故意不传 `keepRounds`**：0.25.0 里 `context.keepRounds` 既不进工厂入参
-      //      （`orchestrator.js:1301-1305` 只转发 `recoveryHint` / `stubFor`），也不在调用期
-      //      白名单里（`:3090-3097` 那六个键）⇒ 传了没任何人读 = #331 那根「没人读的光纤」。
-      //      真要用它只能改对象形态 `createFoldStatisticalStrategy({ keepRounds })`（包根
-      //      `index.js:41` 有导出）。判据钉在 `runner/test/fold-strategy.test.js`，见该文件注释。
-      //      ⚠ 上面那句在 0.26.0 成立；erix-agent #485 之后 `context.keepRounds` 会被读（作为
-      //      `foldedRoundRange.from` 的退回口径），但本站仍不传——要真用它得改成对象形态。
-      //   ③ **不选 `fold-llm`**——本站的闸门，不是一句「未修」。**erix-agent #469 已关单**（六张
-      //      PR：#482 超时不吞 / #487 死线与不泄 ProviderError / #488 四个上限 / #489 跨 run 不
-      //      重复烧钱 / #490 默认摘要预算 1400 / #493 白名单），真机逐项验过。本站**仍留在
-      //      `fold-statistical`**，前置三件缺一不可：① 上述 PR 随 **0.27.0** 真发版（npm 最新
-      //      仍是 0.26.0，只认版本号不认 git SHA）；② pin 完在**隔离实例**跑真长会话，看
-      //      `foldSummary.degradeKind` / `finishReason` / 摘要字节数 / 横幅三件都是活的；
-      //      ③ 量住「每轮多花多少时间」与「每次多嗂多少字节」两项，量完才能说「可接受」。
-      //      本行不是「开关」，改它同时得改 `runner/test/fold-strategy.test.js` 的判据。
-      // 不给 env 旋钮：策略名不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
-      // ⚠ `assertCompactContext` 不是装饰：本站走**直连** `runToolLoop`，上游 #488/#493 的装配期
-      //   校验（未知子键抛错、旋钮值必须正整数）**一次也不会触发**。真链路实测：
-      //   `{ strategy:'fold-llm', summarizerTimeout:5000, maxSummaryTokens:'abc' }` 在引擎里一路
-      //   `end_turn`，不报错不事件 ⇒ 键名拼错就是静默用默认值。抛在这里 = 走 #212 失败信封
-      //   （有 `RUN_FINISHED failed` + 人能读的 reason），比静默跑默认或 exit 1 无终态都好看。
-      /* #392:context-strategy:start */
-      context: assertCompactContext({
-        strategy: 'fold-statistical',
-      }),
-      /* #392:context-strategy:end */
+        tuning: {
+          ...(engineModelMetadata ? { maxTokens: engineModelMetadata.max_output_tokens } : {}),
+        },
+        /* #309:engine-model-params:end */
+        // 0) system prompt（issue #64 R2）：交付物落盘、收尾回复只写摘要不贴代码全文。
+        // 8) wrapup 显式关（§6.3-8，对话型宿主）；种子片段对齐上游 CLI 的
+        // `...(resume ? {} : { initialUserMessage })`：resume 不传任何种子选项（恢复记录即完整上文），
+        // 空本子只种 `initialUserMessage`。
+        // P3 PR③：会话历史文本注入（issue #69）已退役 —— 两个分支都永不传 `initialMessages`，
+        // 上下文唯一来源 = transcript（conversation-state.md §6 契约③）。
+        input: {
+          system: SYSTEM_PROMPT,
+          wrapup: false,
+          ...buildEngineSeedOptions({ resume: transcriptPlan.resume === true, task }),
+        },
+        folding: {
+          // issue #392（A 片）：**显式选折叠策略，唯一目的是让折叠产出确定性替代物**。
+          // 此前本站连 `context` 都不传 ⇒ 超预算时引擎自己 `createSlidingWindowStrategy()` 兜底
+          // （0.25.0 `loop/orchestrator.js:3136` 那条 fallback）。真机标本（erix-station 现网会话
+          // `bdef6dd7`，erix-agent 0.25.0，195 轮 / 12 run / 666 条轮记录）：7 次整轮折叠**全部**是
+          // slidingWindow，账本里 `foldedSummary` 与 `navigationRecord` 各 **0 行**、`summary` 恒
+          // `"missing"`、`[已折叠]` 占位 0 条（`stubFor` 没人给 ⇒ `resolveFoldStubs` 直接返回 `[]`）
+          // ⇒ 一次折叠 = 从第 1 轮起到 `budget-6` 轮的**整块静默硬删**（单次最多折走 32.7 万 token），
+          // 模型事后既不知道自己少了什么、也无从判断该去哪找。**这条静默不是 bug 而是本站选的后果**。
+          // 换成 `fold-statistical`（同版本、零 LLM、零调用成本）之后：机械摘要被 **prepend 进 head**
+          // （`compact/fold-statistical.js:546` → `formatFoldSummary`：范围句 + 工具足迹 + 导航记录 +
+          // `[已折叠]` 占位 + 锚点节，本会话实测那一份 732 B）⇒ ① 模型当场看得见「早期第 1–107 轮已
+          // 折叠」这类事实；② 因为它是真进了请求的正文，`orchestrator.js:3257` 的
+          // `fedSummaryText !== ""` 成立 ⇒ 同一份摘要**同时进账本**（`record.foldedSummary`，#326 wo-C）
+          // ⇒ 宿主横幅与引擎喂给 judge 的轮次历史第一次有料（此前两者只能看见 `"missing"`）。
+          // ⚠ 三件**不要**把本行读成的事：
+          //   ① **不是为了少折**。0.25.0 的 `selectFoldedRounds` 对两种策略都是「折掉除最后
+          //      `keepRounds` 轮以外的全部」，没有按预算缺口比例裁剪的逻辑（真机每次折到预算的
+          //      1.4%–5.4% 就是这个）⇒ 那是 erix-agent#464 的 C 档，**仍未做**，本行不改变它。
+          //   ② **故意不传 `keepRounds`**：0.25.0 里 `context.keepRounds` 既不进工厂入参
+          //      （`orchestrator.js:1301-1305` 只转发 `recoveryHint` / `stubFor`），也不在调用期
+          //      白名单里（`:3090-3097` 那六个键）⇒ 传了没任何人读 = #331 那根「没人读的光纤」。
+          //      真要用它只能改对象形态 `createFoldStatisticalStrategy({ keepRounds })`（包根
+          //      `index.js:41` 有导出）。判据钉在 `runner/test/fold-strategy.test.js`，见该文件注释。
+          //      ⚠ 上面那句在 0.26.0 成立；erix-agent #485 之后 `context.keepRounds` 会被读（作为
+          //      `foldedRoundRange.from` 的退回口径），但本站仍不传——要真用它得改成对象形态。
+          //   ③ **不选 `fold-llm`**——本站的闸门，不是一句「未修」。**erix-agent #469 已关单**（六张
+          //      PR：#482 超时不吞 / #487 死线与不泄 ProviderError / #488 四个上限 / #489 跨 run 不
+          //      重复烧钱 / #490 默认摘要预算 1400 / #493 白名单），真机逐项验过。本站**仍留在
+          //      `fold-statistical`**，前置三件缺一不可：① 上述 PR 随正式版本真发版（**0.29.0 已发，
+          //      条件① 满足**）；② pin 完在**隔离实例**跑真长会话，看 `foldSummary.degradeKind` /
+          //      `finishReason` / 摘要字节数 / 横幅三件都是活的；③ 量住「每轮多花多少时间」与
+          //      「每次多嗂多少字节」两项，量完才能说「可接受」。②③ 未做 ⇒ 策略不动（§8.73 三条闸门）。
+          //      本行不是「开关」，改它同时得改 `runner/test/fold-strategy.test.js` 的判据。
+          // 不给 env 旋钮：策略名不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
+          // ⚠ `assertCompactContext` 不是装饰：本站走**直连** `runToolLoop`，上游 #488/#493 的装配期
+          //   校验（未知子键抛错、旋钮值必须正整数）**一次也不会触发**。真链路实测：
+          //   `{ strategy:'fold-llm', summarizerTimeout:5000, maxSummaryTokens:'abc' }` 在引擎里一路
+          //   `end_turn`，不报错不事件 ⇒ 键名拼错就是静默用默认值。抛在这里 = 走 #212 失败信封
+          //   （有 `RUN_FINISHED failed` + 人能读的 reason），比静默跑默认或 exit 1 无终态都好看。
+          // 0.28 起它的住址是 `config.folding.context`（值本身逐字节不变）。
+          /* #392:context-strategy:start */
+          context: assertCompactContext({
+            strategy: 'fold-statistical',
+          }),
+          /* #392:context-strategy:end */
+        },
+        run: {
+          // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
+          runId: transcriptKey,
+          resume: transcriptPlan.resume === true,
+          // maxRounds：env ERIX_MAX_ROUNDS 可调（默认 16；2026-09-24 用户拍板自 8 上调，与上游
+          // judge 常规搭配 DEFAULT_REFLECTION_MIN_ROUNDS=16 对齐）。改值 = 改容器 env + 重建容器，
+          // 不需重建镜像（provisioner 注入，docs/env.md 登记）。
+          maxRounds: parseMaxRounds(process.env.ERIX_MAX_ROUNDS),
+          // 0.28 新增的值规则（issue #538）：`config.run.stream` 必须是**布尔**，非布尔在两条路
+          // 的入口都抛（`1` / `0` / `"yes"` / `null` 全拒）。本站传 true，保持原样。
+          stream: true,
+          // issue #288（缺陷 C）：崩溃恢复时**不再盲目重放**挂起工具 —— 交给引擎 0.18.0 已有的能力，
+          // 本站只是接线。真机标本：一条 `sleep 360` 的 shell 被 watchdog 杀掉后，resume 把**同一个
+          // `tool_use` 从头再执行一遍**（`run_events` 里同 `call_id` 出现 3 条 `tool_use`）——非幂等命令
+          // （kill 旧进程、重启 backend/vite、重跑测试）每轮真的再掀一次桌。
+          // 引擎读点（erix-agent **0.18.0**，已逐个核过行号；0.29.0 只搬写侧住址，读侧与取值校验未变）：
+          //   - `loop/orchestrator.js:425` 选项文档；`:558` **默认 `"always-replay"`**（= 本站原来的行为）；
+          //     `:634-635` 取值校验（只认两个字面量，写错就 TypeError，不会静默退化）。
+          //   - `:2565-2620` resume 分支：`:2571` 门 `replayPolicy === "per-tool-declaration" && resumePendingTool.replay !== "safe"`
+          //     ⇒ **不调 executor**，合成一条 `is_error: true` + `executionStatus: "interrupted"` 的 tool_result
+          //     （:2586-2597，正文带已捕获的部分输出），并发 `tool_replay_decision_required`
+          //     （:2605-2614，`requiresHostDecision: true`）；**引擎自己不重试**，是否重跑交给模型。
+          //   - `replay` 的值从哪来：`resume-manager.js:256-264` 把 `run snapshot.pendingToolUses` 灌进
+          //     `resumePendingTools`，而条目上的 `replay` 是崩溃**当时**由 `:1783-1786` `withReplayDeclaration`
+          //     按 `:1770-1782` 解析后盖上去的（源头 = 工具定义顶层 `replay` 键，见 lib/shell-tools.js）。
+          // ⚠ 「撤销一条已记录的旧决定」只能改这里，改工具定义不够：`:1775-1777` 规定**快照里已记的
+          //   `replay` 值优先于当前工具定义**（「恢复用当初的意图」是上游故意设计）。所以将来若把某个
+          //   工具改成 `replay: "safe"`，**存量挂起快照仍按旧值不重放**；要翻案就得同时换本选项或清空快照。
+          // 代价（刻意的保守）：上游 0.18.0 `createFileTools` **未给任何工具标 replay**（`src/tools/*.js`
+          // grep `replay:` 零命中），而 `:1781` 的判据是 `=== "safe"` ⇒ **未标注也算非 safe**，
+          // 5 个文件工具挂起时同样不重放（写文件是幂等的，少跑一次比多跑一次安全，模型可自行重试）。
+          // 口径钉在 runner/test/replay-policy.test.js；详细边界见 AGENTS §8.22。
+          replayPolicy: 'per-tool-declaration',
+          // 8) reflection 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
+          // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
+          // nearLimit 时可 extend 扩轮；judgeIntercept 默认开（工具透明审计）。judge 输出非法
+          // JSON 时 fail-closed 不扩轮（roundJudgeFailures 限 3 后本轮禁用）。
+          // erix-agent 0.22 新增（**上游缺省 false = 不开**，`orchestrator.js:1304-1308`）：
+          // 评审判「目标已达成」且置信度够（`>= JUDGE_DONE_CONFIDENCE_THRESHOLD`）时，把那句评审意见
+          // **作为一条普通文本消息注入下文**（软提示，不硬断 run、不改 termination）。
+          // 决策：2026-10-21 决策者要求默认开。**故意不给 env 旋钮**（#331 那根死光纤的前例：
+          // 下发一根没人读的光纤 = 多一个假旋钮）。注入行的 marker = `meta.source === 'judge-control'`，
+          // 取数面已在 `portal/src/session-view.js` 里排掉（界面上不显示，也不当用户原话去起标题）。
+          // 0.28 起三个**数据**成员住在这里（`config.run.reflection.*`）；两个被引擎**调用**的成员
+          // （`onReflection` / `judge.provider`）才属 `capabilities`——本站两个都不传。
+          reflection: { enabled: true, roundJudge: true, judgeDoneAdvisory: true },
+        },
+      },
       // 6) 回调：全桥接到 IPC event（§6.3-6）。
       // issue #425：**不再丢弃 `usage`**（旧代码在这里 `return`，理由是「双源去重」——但去重针对的是
       // **记账**，而记账本就只走 U2 织态载荷（§7.3-6：「onEvent 的 usage 类事件仅实时展示、不产生第二条
@@ -774,12 +853,6 @@ async function startRun(msg) {
       onObserverError: (err) => {
         sendIpc(process, { type: MSG.LOG, run_id: runId, level: 'warn', msg: `observer error: ${String(err?.message ?? err)}` });
       },
-      // task 显式传（§1.3 硬注意-1）；种子片段对齐上游 CLI 的 `...(resume ? {} : { initialUserMessage })`：
-      // resume 不传任何种子选项（恢复记录即完整上文），空本子只种 `task`。
-      // P3 PR③：会话历史文本注入（issue #69）已退役 —— 两个分支都永不传 `initialMessages`，
-      // 上下文唯一来源 = transcript（conversation-state.md §6 契约③）。
-      task,
-      ...buildEngineSeedOptions({ resume: transcriptPlan.resume === true, task }),
       tools,
       executeTool,
       // ADR-015：notes 工厂 semanticStateProvider 透传——引擎在
@@ -788,9 +861,9 @@ async function startRun(msg) {
       // 降级路径同样安全：noteTools 回退对象无此字段）。
       semanticStateProvider: noteTools.semanticStateProvider,
       /* #392:C-onFoldSummary:start */
-      // 折一次 → 写一条注（`lib/fold-notes.js`）。⚠ **这是顶层选项，不是 `context` 键**：引擎从
-      // options 里解构它（`orchestrator.js` 的 `onFoldSummary` 形参 + `option-normalization.js` 的
-      // `RUN_TOOL_LOOP_OPTION_NAMES` 白名单），而 `context` 里自前只认 `strategy`。
+      // 折一次 → 写一条注（`lib/fold-notes.js`）。⚠ **这是顶层选项，不是 `config.folding.context` 的
+      // 子键**：引擎从 options 里解构它（`orchestrator.js` 的 `onFoldSummary` 形参 +
+      // `option-normalization.js` 的 `RUN_TOOL_LOOP_OPTION_NAMES` 白名单），而折叠壳里只认数据键。
       // 塞错一层不会报错，只会**静默不投递**（真机现场：折叠照跑、注一条不写）——#331 那根
       // 「没人读的光纤」的原样重现。判据：`runner/test/fold-notes.test.js` C12/C14 与
       // `runner/test/fold-notes-e2e.test.js` E2（真 `runToolLoop` 里折出来的才算）。
@@ -798,48 +871,6 @@ async function startRun(msg) {
       ...(foldNoteSink ? { onFoldSummary: foldNoteSink.onFoldSummary } : {}),
       /* #392:C-onFoldSummary:end */
       store,
-      // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。
-      runId: transcriptKey,
-      resume: transcriptPlan.resume === true,
-      // maxRounds：env ERIX_MAX_ROUNDS 可调（默认 16；2026-09-24 用户拍板自 8 上调，与上游
-      // judge 常规搭配 DEFAULT_REFLECTION_MIN_ROUNDS=16 对齐）。改值 = 改容器 env + 重建容器，
-      // 不需重建镜像（provisioner 注入，docs/env.md 登记）。
-      maxRounds: parseMaxRounds(process.env.ERIX_MAX_ROUNDS),
-      stream: true,
-      // issue #288（缺陷 C）：崩溃恢复时**不再盲目重放**挂起工具 —— 交给引擎 0.18.0 已有的能力，
-      // 本站只是接线。真机标本：一条 `sleep 360` 的 shell 被 watchdog 杀掉后，resume 把**同一个
-      // `tool_use` 从头再执行一遍**（`run_events` 里同 `call_id` 出现 3 条 `tool_use`）——非幂等命令
-      // （kill 旧进程、重启 backend/vite、重跑测试）每轮真的再掀一次桌。
-      // 引擎读点（erix-agent **0.18.0**，已逐个核过行号）：
-      //   - `loop/orchestrator.js:425` 选项文档；`:558` **默认 `"always-replay"`**（= 本站原来的行为）；
-      //     `:634-635` 取值校验（只认两个字面量，写错就 TypeError，不会静默退化）。
-      //   - `:2565-2620` resume 分支：`:2571` 门 `replayPolicy === "per-tool-declaration" && resumePendingTool.replay !== "safe"`
-      //     ⇒ **不调 executor**，合成一条 `is_error: true` + `executionStatus: "interrupted"` 的 tool_result
-      //     （:2586-2597，正文带已捕获的部分输出），并发 `tool_replay_decision_required`
-      //     （:2605-2614，`requiresHostDecision: true`）；**引擎自己不重试**，是否重跑交给模型。
-      //   - `replay` 的值从哪来：`resume-manager.js:256-264` 把 `run snapshot.pendingToolUses` 灌进
-      //     `resumePendingTools`，而条目上的 `replay` 是崩溃**当时**由 `:1783-1786` `withReplayDeclaration`
-      //     按 `:1770-1782` 解析后盖上去的（源头 = 工具定义顶层 `replay` 键，见 lib/shell-tools.js）。
-      // ⚠ 「撤销一条已记录的旧决定」只能改这里，改工具定义不够：`:1775-1777` 规定**快照里已记的
-      //   `replay` 值优先于当前工具定义**（「恢复用当初的意图」是上游故意设计）。所以将来若把某个
-      //   工具改成 `replay: "safe"`，**存量挂起快照仍按旧值不重放**；要翻案就得同时换本选项或清空快照。
-      // 代价（刻意的保守）：上游 0.18.0 `createFileTools` **未给任何工具标 replay**（`src/tools/*.js`
-      // grep `replay:` 零命中），而 `:1781` 的判据是 `=== "safe"` ⇒ **未标注也算非 safe**，
-      // 5 个文件工具挂起时同样不重放（写文件是幂等的，少跑一次比多跑一次安全，模型可自行重试）。
-      // 口径钉在 runner/test/replay-policy.test.js；详细边界见 AGENTS §8.22。
-      replayPolicy: 'per-tool-declaration',
-      // 8) reflection / wrapup 显式传（§6.3-8）。judge（扩轮）已开：用户 2026-09-22 拍板，
-      // 推翻「P1 mock 关 judge」决策（issue #43）——每轮 end_turn 走 round judge 评估，
-      // nearLimit 时可 extend 扩轮；judgeIntercept 默认开（工具透明审计）。judge 输出非法
-      // JSON 时 fail-closed 不扩轮（roundJudgeFailures 限 3 后本轮禁用）。wrapup 保持关（对话型宿主）。
-      // erix-agent 0.22 新增（**上游缺省 false = 不开**，`orchestrator.js:1304-1308`）：
-      // 评审判「目标已达成」且置信度够（`>= JUDGE_DONE_CONFIDENCE_THRESHOLD`）时，把那句评审意见
-      // **作为一条普通文本消息注入下文**（软提示，不硬断 run、不改 termination）。
-      // 决策：2026-10-21 决策者要求默认开。**故意不给 env 旋钮**（#331 那根死光纤的前例：
-      // 下发一根没人读的光纤 = 多一个假旋钮）。注入行的 marker = `meta.source === 'judge-control'`，
-      // 取数面已在 `portal/src/session-view.js` 里排掉（界面上不显示，也不当用户原话去起标题）。
-      reflection: { enabled: true, roundJudge: true, judgeDoneAdvisory: true },
-      wrapup: false,
       // 7) signal
       signal: abortController.signal,
       // 8) #370：转向的唯一落点。**为什么是 onRound**（erix-agent 0.25.0 实证，行号请按当天实际
