@@ -116,6 +116,23 @@ export interface FoldedInfo {
    * **键缺失**（旧 DTO / 其他路径）≠「没有摘要」，前端按「有摘要」处理保持现状。
    */
   hasSummary?: boolean;
+  /**
+   * issue #440：账本 `record.foldedFacts.text` 逐字透传（`fold-llm` 下就是那份语义摘要正文）。
+   * **键缺失** = 旧账本 / 这次折叠没产出替代物（不是空串）⇒ 横幅退回 #390-A 的两态。
+   * ⚠ 它与 `hasSummary` 回答的是两个问题：`hasSummary` 读 `record.summary`（fold-llm 恒 `"missing"`
+   * ⇒ false），本键读 `foldedFacts` ⇒ #440 的病症就是「`hasSummary:false` 而本键非空」。
+   */
+  summaryText?: string;
+  /**
+   * issue #440：`record.foldedFacts.source`（后端只放行 `'llm' | 'statistical'`；不认识的形态整个键
+   * 缺席）。三态横幅的判据：`'llm'` = LLM 语义摘要，`'statistical'` = 只有机械替代物。
+   */
+  summarySource?: 'llm' | 'statistical';
+  /**
+   * issue #440：账本的 `foldedFacts.truncated === true`（语义摘要被 2048 B 上界削过尾）。
+   * **只在真夹断时出现**（不写 `false`）⇒ 键缺席 = 没夹断或不知道。
+   */
+  truncated?: boolean;
 }
 
 /** #370：一条待发送输入（`queued_inputs` 的一行投影）。 */

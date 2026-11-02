@@ -189,7 +189,56 @@ function hasRealSummary(record) {
   return [summary.action, summary.note].some((value) => typeof value === 'string' && value !== '');
 }
 
-function foldedTurnFields(turns, roundsWithRealSummary = new Set()) {
+/**
+ * issue #440：`foldedFacts.source` 里本站**认得**的那两个值（实测值域，见 erix-agent
+ * `compact/fold-summary-journal.js#ORIGIN_BY_SOURCE`：`llm` ⇒ semantic，`statistical` ⇒ mechanical）。
+ *
+ * 为什么要白名单而不是「原样透传」：`source` 的引擎缺省是字面量 `'strategy'`（同一函数里
+ * `input.source ?? 'strategy'`），另有一个 `'host'`。这两个值在本站横幅上**没有第三态可落**——
+ * 说它们是「LLM 语义摘要」是假话、说「机械替代物」也不准。所以不认识的形态**整个键不给**
+ * （与 #390-A 同一条「键缺席 = 不知道」纪律），前端自然退回第三态。
+ */
+const FOLDED_FACTS_SOURCES = Object.freeze(['llm', 'statistical']);
+
+/**
+ * issue #440：`foldedFacts` 的**读侧**投影（一折一条，落在发生折叠的那一轮的轮记录上）。
+ *
+ * 为什么必须进 DTO：`foldedFacts.text` 是宿主横幅**唯一**能拿到「这次折叠到底留下了什么」的地方
+ * （引擎 `orchestrator.js:5417` 把 `compaction.foldedFacts` clone 到轮记录）。真机标本（会话
+ * `e02d96cb…` 第 25 轮，`seq 8989`）：`record.foldedFacts` = `{source:'llm', origin:'semantic',
+ * strategy:'fold-llm', text:'## 阶段…（2048 B 语义摘要）', truncated:true, bytesBefore:3076}`，
+ * 而 `folded.hasSummary === false`（fold-llm 写的是字面量 `"missing"`）+ `folded.text` 取的是
+ * 上游投影生成的折叠 turn 文本 ⇒ 界面上一句「this fold produced no summary」，用户为语义折叠付的
+ * 那份 token 一个字节也看不见（#440 的原文病症）。
+ *
+ * 三个键的缺席语义（与 #390-A 同规矩，**不许写 false/null 冒充**）：
+ *   · `summaryText` —— `foldedFacts.text` 非空字符串才给；
+ *   · `summarySource` —— 只在白名单里才给（见 `FOLDED_FACTS_SOURCES`）；
+ *   · `truncated` —— 只在 `foldedFacts.truncated === true` 时给（前端据此说「摘要被夹断」）；
+ *     `false` 不给：`buildFoldedFacts` 只在真夹断时写这个键，回一个 `false` 等于替引擎断言
+ *     「我看过且没夹断」，而旧账本上我们根本不知道。
+ *
+ * ⚠ `hasSummary` 的语义**一字未动**（#390-A 钉着：它只读 `record.summary`，与 `foldedFacts` 无关）。
+ * 「有没有可读摘要」这件事由 `summaryText` 自己表达，不复用 `hasSummary`。
+ *
+ * @param {unknown} facts 轮记录上的 `record.foldedFacts`
+ * @returns {{ summaryText?: string, summarySource?: string, truncated?: true }}
+ */
+function foldedFactsFields(facts) {
+  if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return {};
+  const value = /** @type {{ text?: unknown, source?: unknown, truncated?: unknown }} */ (facts);
+  const summaryText = typeof value.text === 'string' && value.text !== '' ? value.text : undefined;
+  const summarySource = typeof value.source === 'string' && FOLDED_FACTS_SOURCES.includes(value.source)
+    ? value.source
+    : undefined;
+  return {
+    ...(summaryText === undefined ? {} : { summaryText }),
+    ...(summarySource === undefined ? {} : { summarySource }),
+    ...(value.truncated === true ? { truncated: true } : {}),
+  };
+}
+
+function foldedTurnFields(turns, roundsWithRealSummary = new Set(), foldedFactsByRound = new Map()) {
   for (const turn of [...turns].reverse()) {
     if (turn?.folded !== true) continue;
     const pick = (key) => (turn[key] !== undefined && turn[key] !== null
@@ -203,14 +252,20 @@ function foldedTurnFields(turns, roundsWithRealSummary = new Set()) {
     // 该折叠行自己的轮号（上游 turn.round，原名；仅整数时带上。非四项判据成员，缺了不影响出现与否）。
     const round = Number.isInteger(turn.round) ? turn.round : undefined;
     if (range === undefined && navigation === undefined && payloadMessages === undefined && text === undefined) continue;
+    // #440：`foldedFacts` 按**该折叠行自己的轮号**取（与 `roundsWithRealSummary` 同一把键，见调用方）。
+    // 轮号缺失 / 账本没有这个键（旧账本）⇒ 三个键全部缺席，不是 false/null。
+    const factsFields = round === undefined ? {} : foldedFactsFields(foldedFactsByRound.get(round));
     return {
       ...(text === undefined ? {} : { text }),
       ...(range === undefined ? {} : { foldedRoundRange: range }),
       ...(navigation === undefined ? {} : { navigationRecord: navigation }),
       ...(payloadMessages === undefined ? {} : { foldedPayloadMessages: payloadMessages }),
       ...(round === undefined ? {} : { round }),
+      ...factsFields,
       // #390-A：轮号可定时才给得出「这次折叠有没有真摘要」。**轮号缺失就整个不带这个键**（不是 false）——
       // 前端口径是「键缺席 = 不知道 = 保持现状」，把它写成 false 会让旧数据凭空丢掉展开控件。
+      // ⚠ #440 不许把它改成读 `foldedFacts.text`：它回答的是「引擎 `record.summary` 有没有料」，
+      // 与「折叠替代物有没有料」是两件事（后者由上面的 `summaryText` 回答）。
       ...(round === undefined ? {} : { hasSummary: roundsWithRealSummary.has(round) }),
     };
   }
@@ -365,10 +420,22 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
     })
     .map((row) => Number(row.round)));
 
+  // #440：折叠替代物（`record.foldedFacts`）同样按**折叠行自己的 round** 记账——与上面那个 Set 同一把
+  // 键、同一次扫描口径（都过 `recordForProjection`，不读原始行）。旧账本没有这个键 ⇒ 表里没这一项
+  // ⇒ DTO 里 `summaryText`/`summarySource`/`truncated` 三个键全部缺席（不是 null / false）。
+  const foldedFactsByRound = new Map();
+  for (const row of Array.isArray(transcriptRows) ? transcriptRows : []) {
+    const { record } = recordForProjection(row);
+    if (record?.folded !== true) continue;
+    const facts = record?.foldedFacts;
+    if (facts === undefined || facts === null) continue;
+    foldedFactsByRound.set(Number(row.round), facts);
+  }
+
   const setRunText = (runId, assistantText, foldText, turns) => {
     if (assistantText !== null) assistantContent.set(runId, assistantText);
     if (foldText !== null) foldContent.set(runId, foldText);
-    const foldedFields = foldedTurnFields(turns, roundsWithRealSummary);
+    const foldedFields = foldedTurnFields(turns, roundsWithRealSummary, foldedFactsByRound);
     if (foldedFields !== null) runFolded.set(runId, foldedFields);
     const fields = assistantTurnFields(turns);
     if (fields === null) return;

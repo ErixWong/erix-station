@@ -35,7 +35,7 @@ import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
 import { engineDiagnosticNotice } from './lib/engine-notices.js';
-import { assertCompactContext } from './lib/compact-knobs.js';
+import { assertCompactContext, assertFoldingToolResultKnobs } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope } from './lib/termination.js';
@@ -762,6 +762,46 @@ async function startRun(msg) {
             keepRounds: 6,
           }),
           /* #392:context-strategy:end */
+          // ── issue #440：工具结果折叠的两个旋钮（A/B 的开关）─────────────────────────────────
+          // 为什么单独立一对标记：这两个值是**待验证的裁定**，回退 = 删掉标记区间里那两行（一行回退，
+          // 别翻代码）。⚠ 集中在这**一处**，且**不许**加 env 旋钮（§8.73 口径：策略与折叠参数不是
+          // 运维参数，A/B 由主 agent 改这一处 + 重新部署来做）。
+          //
+          // 三条事实（判据会查，`runner/test/fold-strategy.test.js` B4/B5）：
+          //   ① 引擎默认：`toolResultTtl = 2` / `toolResultFoldMinTokens = 4000`
+          //      （`src/loop/tool-result-ttl.js:16-17`；读侧 `orchestrator.js:794` / `:703` 都是裸 `??` 缺省
+          //      ⇒ **不传就等于用 2 / 4000**，而本站此前从没传过）。
+          //   ② 为什么本站想调大：**机制上的理由，不是实测结论**。多轮任务里 `ttl = 2` 意味着工具结果
+          //      **两轮后**就变成占位符 ⇒ 模型要回头引用同一份内容时**可能重读**（重复 token）；
+          //      而 `minTokens = 4000` 让大结果先被 TTL 层折掉、策略层（fold-llm）可能因此**从不触发**
+          //      （工单里那条「13 KB ⇒ TTL 折 9 次、上下文压到 ~22 K、策略层一次没跑」是**另一场景的
+          //      早期观测**，本片未复现；v0.1.46 基线上 TTL 层 0 次触发，见③）。
+          //      小文件 2.6 KB < 4000 反过来 ⇒ TTL 不折，全靠策略层/兜底层在折。
+          //      ⇒「谁在折」此前完全由这两个默认值决定，本站从没碰过 —— 这是本片存在的理由。
+          //   ③ **本片无法用 A/B 证明收益，这一点必须写在台账上**（v0.1.46 真机基线，主 agent 量）：
+          //      12 个文件 × 15 128 B = **4971 token**（已过 `minTokens = 4000` 门槛）、8 轮、
+          //      `budget ≈ 460K` ⇒ 观测到 **0 条 `compaction` 事件**，且 `round_end.usage.input_tokens`
+          //      **单调递增** 4891 → 10639 → 18403 → 26962 → 43266 → 55463 → 68010 → 90263
+          //      （TTL 若真折过，input 必然回落）。原因是引擎侧条件叠加（`src/compact/pipeline.js:21-26`）：
+          //      TTL 的 `shouldSchedule` 要求 `effectiveMaxRounds - budgetRounds > 2` **且**
+          //      `lowBudgetPrompted !== true`，再叠加 `tool-result-ttl.js` 的 `age >= ttl` 与
+          //      `estimateTokens(text) >= minTokens`（`age` 读 `block.erix.round`，
+          //      `tool-result-ttl.js:203`；引擎确实写它，`run-snapshot-executor.js:472`）。
+          //      ⇒ 当前预算下 TTL 层**一次都没触发**，所以「调大 ttl / minTokens 更省」**没有被验证**，
+          //      也不许拿任何一次测量去声称它被验证了。真正的 A/B 要在大预算压力场景下做（主 agent）。
+          //      **这是待验证的裁定，不是定论**：如果量出来更贵，回退 = 删掉标记区间里那两行
+          //      （不要改成注释掉的死代码——注释掉的配置会被下一个人当成「曾经有用」）。
+          //
+          // 校验归属（先核实过）：这两个叶子在 `config.folding` **组层**、不在 `folding.context` 里
+          // ⇒ `assertCompactContext` 管不到；引擎也**不校**它们的值（`CONFIG_LEAF_VALUE_RULE_PATHS`
+          // 只登记了 `run.stream` / `continuity.handoff`，见 `config-namespace.js:569-587`）⇒ 本站自己
+          // 加一道 `assertFoldingToolResultKnobs`（与 #469 A4 同一个理由：值是代码写死的，配错 = 编程错误）。
+          /* #440:ttl-knobs:start */
+          ...assertFoldingToolResultKnobs({
+            toolResultTtl: 6,
+            toolResultFoldMinTokens: 8000,
+          }),
+          /* #440:ttl-knobs:end */
         },
         run: {
           // issue #81 P2：引擎 store key = transcript key（sessionId），非真 runId。

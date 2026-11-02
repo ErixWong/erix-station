@@ -35,12 +35,14 @@ import {
   BUILTIN_COMPACTION_STRATEGY_NAMES,
   createSlidingWindowStrategy,
 } from 'erix-agent';
-import { assertCompactContext } from '../lib/compact-knobs.js';
+import { assertCompactContext, assertFoldingToolResultKnobs } from '../lib/compact-knobs.js';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
 
 const STRATEGY_MARKERS = /\/\* #392:context-strategy:start \*\/([\s\S]*?)\/\* #392:context-strategy:end \*\//;
+// issue #440：`config.folding` **组层**的两个工具结果旋钮（不在 `context` 里 ⇒ 上面那对标记管不到它们）。
+const TTL_MARKERS = /\/\* #440:ttl-knobs:start \*\/([\s\S]*?)\/\* #440:ttl-knobs:end \*\//;
 
 /** 求值 worker 的 `context` 装配段（标记没了 = 装配点被搬走/删掉，判据先在这里红，不许静默失去对象）。 */
 function workerContextOption() {
@@ -201,4 +203,77 @@ test('#438-B3 `config.continuity` / `capabilities.hooks.continuityProvider` 一�
   // `~/.erix/continuity/`）⇒ 属未量行为变化，本片不接（`continuity_injection_skipped` 的豁免理由也建在这条上）。
   assert.doesNotMatch(src, /^\s*continuity:\s*\{/m, 'worker 开始传 `config.continuity` 了 ⇒ continuity 那族事件的豁免理由失效，需重看');
   assert.doesNotMatch(src, /\bcontinuityProvider\b/, 'worker 开始传 `continuityProvider` 了 ⇒ 同上');
+});
+
+// ── issue #440（M2）：`folding.toolResultTtl` / `toolResultFoldMinTokens` 显式传 ──────────────────
+//
+// 为什么钉死这两个值：「谁在折」此前**完全**由引擎默认值（2 / 4000）决定，本站从没碰过。
+// ⚠ 调大的理由是**机制**、不是实测结论：多轮任务里 `ttl = 2` ⇒ 工具结果两轮后变占位符 ⇒ 模型回头
+//   引用同一份内容时**可能重读**（重复 token）；`minTokens = 4000` ⇒ 大结果先被 TTL 层折掉 ⇒ 策略层
+//   （fold-llm）可能从不触发。
+// ⚠ 本片**无法**用 A/B 证明收益（v0.1.46 真机基线，主 agent 量）：12 文件 × 15 128 B = 4971 token
+//   （已过 minTokens=4000）、8 轮、budget ≈ 460K ⇒ **0 条 `compaction` 事件**，且
+//   `round_end.usage.input_tokens` 单调递增 4891 → 10639 → 18403 → 26962 → 43266 → 55463 → 68010 → 90263
+//   （TTL 若折过，input 必然回落）。引擎侧条件是叠加的（`src/compact/pipeline.js:21-26`：
+//   `effectiveMaxRounds - budgetRounds > 2` 且 `lowBudgetPrompted !== true`；再加
+//   `tool-result-ttl.js` 的 `age >= ttl` / `estimateTokens >= minTokens`）⇒ 当前预算下 TTL 层一次都没
+//   触发。**所以「调大更省」没有被验证**，也不许拿任何一次测量声称它被验证了。
+// 这两个值是**待 A/B 验证的裁定**（不是定论）：量出来更贵就删掉 `#440:ttl-knobs` 区间里那两行。
+
+/** 求值 worker 的 `#440:ttl-knobs` 段（注入真校验器，顺带证明那份真配置过得了本站校验）。 */
+function workerTtlKnobs() {
+  const block = read('worker.js').match(TTL_MARKERS);
+  assert.ok(block,
+    'worker.js 必须有一对配对的 `/* #440:ttl-knobs:start|end */` 标记：'
+    + '没了就是 A/B 回退点丢了（工单要求这两个值集中在一处、一行可删）');
+  return new Function('assertFoldingToolResultKnobs', `return {${block[1]}}`)(assertFoldingToolResultKnobs);
+}
+
+test('#440-B4 worker 显式传 toolResultTtl=6 / toolResultFoldMinTokens=8000（删掉任一就红）', () => {
+  const knobs = workerTtlKnobs();
+  // 「显式在场」优先于值：引擎默认是 2 / 4000，删掉这两行行为会**静默**变回默认值
+  // （读侧是裸 `??`，见 `orchestrator.js:794` / `:703`）⇒ 只有「键必须在场 + 值必须等于 N」能钉住。
+  assert.ok(Object.hasOwn(knobs, 'toolResultTtl'),
+    'worker 里 `toolResultTtl: 6` 这一行被删了：引擎默认是 2（`tool-result-ttl.js:16`），'
+    + '那是**引擎的**决定，不是本站的（A/B 的开关必须显式在场）');
+  assert.equal(knobs.toolResultTtl, 6,
+    `toolResultTtl 必须是 6（实得 ${JSON.stringify(knobs.toolResultTtl)}）——机制上 TTL=2 让工具结果`
+    + '两轮后就变占位符 ⇒ 模型回头引用时可能重读（**未验证**，见文件头那段基线）');
+  assert.ok(Object.hasOwn(knobs, 'toolResultFoldMinTokens'),
+    'worker 里 `toolResultFoldMinTokens: 8000` 这一行被删了：引擎默认是 4000（`tool-result-ttl.js:17`）');
+  assert.equal(knobs.toolResultFoldMinTokens, 8000,
+    `toolResultFoldMinTokens 必须是 8000（实得 ${JSON.stringify(knobs.toolResultFoldMinTokens)}）——`
+    + '机制上 4000 让大结果先被 TTL 层压住 ⇒ 策略层可能永不触发（**未验证**，同上）');
+  // 这一组只许有这两个键：多一个键就要先证明引擎真读它（#331 那根「没人读的光纤」）
+  assert.deepEqual(Object.keys(knobs).sort(), ['toolResultFoldMinTokens', 'toolResultTtl'],
+    'folding 层出现了本片没有裁定的旋钮：每加一个都要先证明引擎真读它，并在本文件补一条判据');
+  // 反向：它们**不在** `context` 里（那是另一层，`assertCompactContext` 的白名单管不到也不该管）
+  const context = workerContextOption();
+  for (const key of ['toolResultTtl', 'toolResultFoldMinTokens']) {
+    assert.ok(!Object.hasOwn(context, key),
+      `${key} 跑到 context 里了：它是 \`config.folding\` 的叶子，不是 \`folding.context\` 的子键`);
+  }
+});
+
+test('#440-B5 源码级：这两个键只出现在 `#440:ttl-knobs` 标记区间内（A/B 回退 = 删一处）', () => {
+  const src = read('worker.js');
+  const block = src.match(TTL_MARKERS);
+  assert.ok(block, 'worker.js 的 `#440:ttl-knobs` 标记没了');
+  const regionStart = src.indexOf('/* #440:ttl-knobs:start */');
+  const regionEnd = src.indexOf('/* #440:ttl-knobs:end */');
+  assert.ok(regionStart > 0 && regionEnd > regionStart, '标记必须成对且顺序正确');
+  for (const key of ['toolResultTtl', 'toolResultFoldMinTokens']) {
+    // 只数**赋值形态**（`key:`），不数注释里的散文提及：判据要钉的是「值写在哪」，不是「名字被提过几次」。
+    const hits = [...src.matchAll(new RegExp(`\\b${key}\\s*:`, 'g'))].map((m) => m.index);
+    assert.equal(hits.length, 1,
+      `\`${key}:\` 在 worker.js 里出现 ${hits.length} 次（应恰好 1 次）：`
+      + '重复出现 = A/B 回退点不止一处，回退时会漏');
+    assert.ok(hits[0] > regionStart && hits[0] < regionEnd,
+      `\`${key}\` 出现在 #440 标记区间之外（index ${hits[0]}）⇒ A/B 回退点被搬走了`);
+  }
+  // 值也必须写在区间里（不是从别处 import / 拼出来的）
+  assert.match(block[1], /toolResultTtl:\s*6\b/, '标记区间里必须逐字写着 `toolResultTtl: 6`');
+  assert.match(block[1], /toolResultFoldMinTokens:\s*8000\b/, '标记区间里必须逐字写着 `toolResultFoldMinTokens: 8000`');
+  // 区间里**只**有这两个叶子（`...assertFoldingToolResultKnobs({...})` 这一层包装除外）
+  assert.doesNotMatch(block[1], /context\s*:/, '`folding.context` 不许搬进这个区间（两套标记各管各的）');
 });
