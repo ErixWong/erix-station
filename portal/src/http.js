@@ -1944,6 +1944,12 @@ const HISTORY_EVENT_TYPES = new Set([
   // 仍独立存亡，只加一边就得到两种可见性不一致（#288），16 类的对账测在 `engineEventSurface.spec.ts`。
   // 只剩 `run_outcome` **显式不进**（与 `run_end` 语义重叠且今天无读者，豁免理由同在下测里写出）。
   'compaction_strategy_fallback', 'persistence_capability_degraded', 'resume_journal_skipped',
+  // issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 联合类型从 16 类长到 **19 类**，这两类是
+  // 本站裁定「进时间线」的那部分（第三类 `config_override_conflict` 与联合外的
+  // `continuity_injection_skipped` **显式豁免**，理由在 `portal/test/event-surface-contract.test.js`
+  // 的豁免表与 `useEventStream.ts` 的 EVENT_TYPES 段）。三处集合仍各自独立存亡（#288）：
+  // 只加一边就是「实时收不到」或「刷新后消失」。
+  'compaction_deferred', 'budget_below_working_set',
   // issue #371-A：`persistence_error`（引擎 erix-agent#461 起的落盘失败告警，带 `fatal`）此前
   // **库里存着、读不出来**：写入侧不过白名单（`internal.js` 直接 INSERT），展示侧不过 ⇒ 刷新后
   // 一条都不提。而这条事件最重要的时刻，正是用户刷新来看「我这轮到底存下没」的那一刻。

@@ -320,9 +320,10 @@ export function loopEventPayload(event, meta = {}) {
 
 // issue #469 宿主侧后续（A2）：从 `CompactionStat.foldSummary` 里推出「这次摘要是不是次品」。
 // 字段本体是 erix-agent #482/#487/#490/#491 加的（**仅 fold-llm 会产生**：`fold-statistical` 下
-// 这些键全缺席，这是契约不是 bug），所以本函数在 0.26.0 + 本站现策略下永远返回 `null`，
-// 它是为切到 `fold-llm` 那天预先接好的嘴。`degradeKind`（#487）比 `degradeReason`（#482）新且短，
-// 所以优先读 kind，只读 kind 拿不到时才退回 reason（老版本引擎）。
+// 这些键全缺席，这是契约不是 bug）。⚠ #438 切片 B 起本站**真选了 `fold-llm`** ⇒ 本函数从「预先
+// 接好但永不触发」变成了活路径（`compaction` 事件里的 `foldSummary` 现在真的会带这些键）。
+// `degradeKind`（#487）比 `degradeReason`（#482）新且短，所以优先读 kind，只读 kind 拿不到时才退回
+// reason（老版本引擎）。
 /**
  * @param {object|undefined} compaction `LoopEvent.compaction`（即 `CompactionStat`）
  * @returns {string|null} 人可读的一行告警；没降级/没超预算时 `null`
@@ -667,13 +668,13 @@ async function startRun(msg) {
         //     `if (maxTokens !== undefined) requestForJudge.maxTokens = maxTokens`）⇒ 它的输出上限从
         //     「provider 默认」变成我们那个数（**变严**，不是变松）；
         //   - round judge / 扩轮 judge **不受影响**（:2319 固定 `maxTokens: 1024`，另一条路径）；
-        //   - fold-llm 压缩 summarizer 也继承 maxTokens（0.26.0 `orchestrator.js:1175`）——但**只有
-        //     真选了 `fold-llm` 才成立**：本站自 #392 起显式选 `fold-statistical`（零 LLM），超预算时
-        //     也不再退到 `createSlidingWindowStrategy()` 兜底 ⇒ 这条继承对本站至今不适用。
+        //     - fold-llm 压缩 summarizer 也继承 maxTokens（0.29.0 `orchestrator.js` 的摘要那一发）
+        //       ——**自 #438 切片 B 起本站真选了 `fold-llm` ⇒ 这条路现在是活的**。
         //     ⚠ 0.29.0 起这条口径的**一半**已经落地：erix-agent #493 把摘要的 maxTokens 改成
         //     `min(宿主 maxTokens, context.maxSummaryTokens ?? 1400)` ⇒ 本站那个按窗口算出来的
         //     `max_output_tokens` 在摘要这条路上不再说了算（上限 32 768 → 1 400，方向仍是**变严**）。
-        //     本站仍未切 `fold-llm`（见下面 folding 段的裁定），所以真机上这条路依旧不被走到。
+        //     判据：`runner/test/compact-knobs.test.js` K5（上游默认值 = 本站裁定值）与
+        //     `runner/test/fold-strategy.test.js` A5（四个上限**故意不在场**）。
         /* #309:engine-model-params:start */
         metadata: {
           task,
@@ -718,31 +719,47 @@ async function startRun(msg) {
           //   ① **不是为了少折**。0.25.0 的 `selectFoldedRounds` 对两种策略都是「折掉除最后
           //      `keepRounds` 轮以外的全部」，没有按预算缺口比例裁剪的逻辑（真机每次折到预算的
           //      1.4%–5.4% 就是这个）⇒ 那是 erix-agent#464 的 C 档，**仍未做**，本行不改变它。
-          //   ② **故意不传 `keepRounds`**：0.25.0 里 `context.keepRounds` 既不进工厂入参
-          //      （`orchestrator.js:1301-1305` 只转发 `recoveryHint` / `stubFor`），也不在调用期
-          //      白名单里（`:3090-3097` 那六个键）⇒ 传了没任何人读 = #331 那根「没人读的光纤」。
-          //      真要用它只能改对象形态 `createFoldStatisticalStrategy({ keepRounds })`（包根
-          //      `index.js:41` 有导出）。判据钉在 `runner/test/fold-strategy.test.js`，见该文件注释。
-          //      ⚠ 上面那句在 0.26.0 成立；erix-agent #485 之后 `context.keepRounds` 会被读（作为
-          //      `foldedRoundRange.from` 的退回口径），但本站仍不传——要真用它得改成对象形态。
-          //   ③ **不选 `fold-llm`**——本站的闸门，不是一句「未修」。**erix-agent #469 已关单**（六张
-          //      PR：#482 超时不吞 / #487 死线与不泄 ProviderError / #488 四个上限 / #489 跨 run 不
-          //      重复烧钱 / #490 默认摘要预算 1400 / #493 白名单），真机逐项验过。本站**仍留在
-          //      `fold-statistical`**，前置三件缺一不可：① 上述 PR 随正式版本真发版（**0.29.0 已发，
-          //      条件① 满足**）；② pin 完在**隔离实例**跑真长会话，看 `foldSummary.degradeKind` /
-          //      `finishReason` / 摘要字节数 / 横幅三件都是活的；③ 量住「每轮多花多少时间」与
-          //      「每次多嗂多少字节」两项，量完才能说「可接受」。②③ 未做 ⇒ 策略不动（§8.73 三条闸门）。
-          //      本行不是「开关」，改它同时得改 `runner/test/fold-strategy.test.js` 的判据。
-          // 不给 env 旋钮：策略名不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
-          // ⚠ `assertCompactContext` 不是装饰：本站走**直连** `runToolLoop`，上游 #488/#493 的装配期
-          //   校验（未知子键抛错、旋钮值必须正整数）**一次也不会触发**。真链路实测：
-          //   `{ strategy:'fold-llm', summarizerTimeout:5000, maxSummaryTokens:'abc' }` 在引擎里一路
-          //   `end_turn`，不报错不事件 ⇒ 键名拼错就是静默用默认值。抛在这里 = 走 #212 失败信封
-          //   （有 `RUN_FINISHED failed` + 人能读的 reason），比静默跑默认或 exit 1 无终态都好看。
+          //   ② **`keepRounds` 现在显式传 6**（#438 切片 B）。历史：0.25.0 里 `context.keepRounds`
+          //      既不进工厂入参也不在调用期白名单里 ⇒ 当时传了没人读（#331 那根「没人读的光纤」）；
+          //      0.26.0 起引擎真读它（`orchestrator.js:3856` 的 `?? 6`），0.29.0 仍读 ⇒ 现在写它才
+          //      有意义。判据钉在 `runner/test/fold-strategy.test.js` A2（**删掉这一行必须红**）。
+          //   ③ **策略自 #438 切片 B 起 = `fold-llm`**（决策者 2026-11-02 定，推翻此前「留在
+          //      `fold-statistical`」的裁定）。理由：上游在语义折叠上投的大功夫，以及本站为它建好的
+          //      三处面——#392-C 折叠写注、#392-D 横幅两态、A2 降级告警——在 `fold-statistical` 下
+          //      **结构上不可达**（那些键只有 `fold-llm` 会写，契约不是 bug），等于三处死代码。
+          //      §8.73 三条闸门的状态：① 上游六张 PR（#482/#487/#488/#489/#490/#493）随 0.29.0
+          //      **已发版 ⇒ 满足**；②③（隔离实例真长会话看 `degradeKind` / `finishReason` / 摘要
+          //      字节数 / 横幅，并量住每轮多花的时间与字节）**由主 agent 真机量**，量不过就一行退回
+          //      `fold-statistical`（本行 + `runner/test/fold-strategy.test.js` 的判据同改）。
+          //   ④ **`keepRounds: 6` 必须显式传**（决策者定；不靠引擎缺省）。两条事实不许写错：
+          //      · 引擎缺省是 `compactionContext.keepRounds ?? 6`（`orchestrator.js:3856`）
+          //        ⇒ **不传不等于 0**，也正因为「不传也等于 6」，只有显式写出来才能被
+          //        `fold-strategy.test.js` A2 的「删掉这一行必须红」钉住；
+          //      · `estimatedTokens / budgetTokens > 2` 时引擎把它收紧成 `Math.min(配置值, 2)`
+          //        （`orchestrator.js:3858-3859`）⇒ **小窗口高负载下实际会掉到 2，这是设计**，
+          //        不是本站配错。
+          // 仍然**不传**（各自一条负例判据钉住「不在场」，`fold-strategy.test.js` A5/A6）：
+          //   · 四个上限（`summarizerTimeoutMs` / `firstByteTimeoutMs` / `maxSummaryBytes` /
+          //     `maxSummaryTokens`）——上游缺省即本站裁定值（§8.73 口径）；
+          //   · `workingSetRecentRounds`（上游默认关；#612 实测打开更贵，只在主 agent 的测量里当对照臂）；
+          //   · `foldAtRatio`、`config.continuity.handoff`。
+          // 不给 env 旋钮：策略与尾窗不是运维参数（改它要改的是判据不是配置），且 #331 的前例摆在那儿。
+          // ⚠ `assertCompactContext` 不是装饰，但它**不再**是唯一那道闸。⚠ 口径更正（#438 切片 A
+          //   复核，此前这里写的是「上游校验一次也不会触发」——**那句在 0.28.0 起已不成立**）：
+          //   erix-agent #496 S1 把 `assertSemanticOptionValues` 放进了**两条路的公共前置**
+          //   ⇒ 直连路径现在也校（实测：`summarizerTimeout` 拼错 ⇒ `unknown assembly policy context
+          //   option`；`maxSummaryTokens:'abc'` ⇒ `must be a positive integer`）。
+          //   本层仍然保留，理由变成两条，都是引擎**给不了**的：
+          //     ① **引擎漏校 `keepRounds`**（0.29.0 实测 `keepRounds: -1` 直连跑通不报错，而
+          //        `selectFoldedRounds` 的 `target = max(0, rounds.length - keepRounds)` 会把**尾部轮
+          //        也折掉**）⇒ 本层是「0 合法 / 负数拒」这条口径的唯一执行点；
+          //     ② 本站口径的 fail-fast：抛在这里走 #212 失败信封（`RUN_FINISHED failed` + 人能读的
+          //        reason），比引擎的裸 TypeError 或 exit 1 无终态都好定位。
           // 0.28 起它的住址是 `config.folding.context`（值本身逐字节不变）。
           /* #392:context-strategy:start */
           context: assertCompactContext({
-            strategy: 'fold-statistical',
+            strategy: 'fold-llm',
+            keepRounds: 6,
           }),
           /* #392:context-strategy:end */
         },

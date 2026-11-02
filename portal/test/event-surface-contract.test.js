@@ -1,4 +1,4 @@
-// issue #421 判据（跨端面）：erix-agent 承诺给宿主的事件全集 vs 本站三处白名单。
+// issue #421 / #438（切片 B）判据（跨端面）：erix-agent 承诺给宿主的事件全集 vs 本站三处白名单。
 //
 // 为什么放在 `portal/test`（而不是前端 spec）：这条要同时读**后端源码**与**前端源码**。前端
 // vitest 的全局 environment 是 jsdom，读源码只能走 vite `?raw`，而 vite 的 fs 边界不许越出
@@ -12,40 +12,124 @@
 //   ③ 后端 `http.js` 的 `HISTORY_EVENT_TYPES` —— 漏 = **刷新后后端根本不下发**。
 // 写入侧不过白名单（`internal.js` 直接 `INSERT INTO run_events`），所以「库里没这条」永远不是借口：
 // 漏接的事件只是躺在表里没人读。
+//
+// ⚠ #438 切片 B 改的是**这份清单的来源**：`ENGINE_PROMISED_EVENTS` 不再手抄（手抄清单就是本片
+// 要治的病灶 —— 0.29.0 把联合类型从 16 类长到 19 类，手抄那份**不会自己红**），而是从**已安装引擎
+// 源码**里解析 `LoopEvent` 的 `@property` 联合类型。解析不到 ⇒ `t.skip` 并写明原因（不许退化成
+// 硬抄清单：那就是把「库里存着、没人读」换成「测里抄着、没人管」）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const PORTAL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FE_EVENTS = path.join(PORTAL_DIR, 'frontend', 'src', 'composables', 'useEventStream.ts');
 const HTTP = path.join(PORTAL_DIR, 'src', 'http.js');
 
+// ---------------------------------------------------------------------------
+// 引擎承诺面：**从已安装引擎源码解析**，不手抄
+// ---------------------------------------------------------------------------
+
+/** 定位**装在本 worktree 里的**引擎根目录（与 `runner/test/fold-notes.test.js` C18 同一手法）。 */
+function engineRoot() {
+  // 不用 `resolve('erix-agent/package.json')`：引擎 `exports` 没列 `./package.json`
+  // ⇒ `ERR_PACKAGE_PATH_NOT_EXPORTED`（实测）。解析主入口再向上找包根。
+  let dir = path.dirname(createRequire(import.meta.url).resolve('erix-agent'));
+  while (dir !== path.dirname(dir)) {
+    const pj = path.join(dir, 'package.json');
+    if (fs.existsSync(pj) && JSON.parse(fs.readFileSync(pj, 'utf8')).name === 'erix-agent') return dir;
+    dir = path.dirname(dir);
+  }
+  throw new Error('找不到已安装 erix-agent 的包根');
+}
+
 /**
- * 引擎承诺给宿主的事件全集。来源（**不凭记忆**）：`erix-agent` `src/loop/orchestrator.js` 里
+ * 解析 `LoopEvent` typedef 上的 `@property {"a"|"b"|…} type` 联合类型。
+ *
+ * 返回 `{ version, types, source }`；任何一步不成立都**抛错**（调用方据此 skip 并写明原因），
+ * 绝不悄悄退回一份手抄清单。
+ */
+function parseEngineLoopEventTypes() {
+  const root = engineRoot();
+  const version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+  const loopPath = path.join(root, 'src', 'loop', 'orchestrator.js');
+  if (!fs.existsSync(loopPath)) throw new Error(`引擎源码里没有 ${loopPath}（随包裁剪或改版）`);
+  const src = fs.readFileSync(loopPath, 'utf8');
+  // 锚点 = typedef 头 + 紧跟的那条 `@property {...} type`。两处都钉，任一处被搬走就抛。
+  const typedefAt = src.indexOf('@typedef {object} LoopEvent');
+  if (typedefAt < 0) throw new Error('orchestrator.js 里找不到 `@typedef {object} LoopEvent`');
+  const tail = src.slice(typedefAt, typedefAt + 4000);
+  const union = tail.match(/@property \{([^}]*)\} type/);
+  if (!union) throw new Error('LoopEvent typedef 里找不到 `@property {...} type` 联合类型行');
+  const types = [...union[1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+  if (types.length < 8) throw new Error(`解析到的联合类型只有 ${types.length} 项，抽取姿势可疑：${types.join(', ')}`);
+  // 发射点扫描面 = 引擎 `src/` 下的全部 `.js`（`attempt`/`recovering`/`recovered` 住在
+  // `loop/provider-runner.js`、`run_outcome` 的记录体住在 `loop/judge-record.js` ⇒ 只看
+  // orchestrator.js 会把它们误判成「没人发」）。
+  const srcFiles = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.js')) srcFiles.push(full);
+    }
+  };
+  walk(path.join(root, 'src'));
+  const emissions = srcFiles.map((file) => fs.readFileSync(file, 'utf8')).join('\n');
+  return { version, types, source: src, emissions, fileCount: srcFiles.length };
+}
+
+const engine = parseEngineLoopEventTypes();
+
+/**
+ * 引擎承诺给宿主的事件全集。来源（**不凭记忆、不手抄**）：`erix-agent` `src/loop/orchestrator.js` 里
  * `LoopEvent` 的 `@property` 联合类型。上游改这个联合类型 ⇒ 本测红 ⇒ 逼本站重看承接面
- * （#421 那 5 类漏接就是这么找出来的）。
+ * （#421 那 5 类漏接就是这么找出来的；0.29.0 又从 16 类长到 19 类）。
  */
-const ENGINE_PROMISED_EVENTS = [
-  'round_start', 'attempt', 'recovering', 'recovered', 'usage', 'tool_use', 'tool_result',
-  'tool_replay_decision_required', 'round_end', 'compaction', 'final_guard',
-  'persistence_capability_degraded', 'model_metadata_missing', 'resume_journal_skipped',
-  'compaction_strategy_fallback', 'run_outcome',
-];
+const ENGINE_PROMISED_EVENTS = engine.types;
 
-/** #421 新接的四类诊断事件：三处都必须有它们。 */
-const DIAGNOSTIC_EVENTS = [
-  'compaction_strategy_fallback', 'model_metadata_missing',
-  'persistence_capability_degraded', 'resume_journal_skipped',
+/**
+ * 引擎**经 `onEvent` 真发、却没进上面那个联合类型**的事件（0.29.0 实测：联合类型漏登记）。
+ *
+ * 这条清单同样是**读源码得出的**（下面 S6 逐条 grep 发射点），不是凭记忆。
+ * `continuity_injection_skipped`：每轮可能一条，说「续接块本轮没注入」。
+ * `continuity_written` / `continuity_write_failed`：续接块的**写者**那一半（`config.continuity.handoff`
+ * 打开时才走）。
+ */
+const ENGINE_UNPROMISED_EVENTS = [
+  'continuity_injection_skipped',
+  'continuity_written',
+  'continuity_write_failed',
 ];
 
 /**
- * **显式豁免表**：订得到、但故意不进时间线也不进回放的类型，必须写理由。
- * `run_outcome`：每 run 一条的 run 级汇总，与 `run_end`（rounds / 终局）语义重叠，今天没有读者；
- * 放进回放只会让刷新时多一堆没人看的行。等 §12 台账 / 结算面板真用它时再接。
+ * **显式豁免表**：订得到、但故意不进时间线也不进回放的类型，必须写理由（#438 口径：
+ * 逐类决定「进时间线 / 只订不回放下发 / 显式豁免」，豁免必须写理由）。
+ *
+ * 三条各自的裁定（每条都能被下面的 S2/S3/S5 反向检查）：
+ * · `run_outcome`：每 run 一条的 run 级汇总，与 `run_end`（rounds / 终局）语义重叠，今天没有读者；
+ *   放进回放只会让刷新时多一堆没人看的行。0.29.0 复核：载荷多了 `verification` / `termination`
+ *   两个键，**重叠关系没变**（`run_end` 仍是终局的唯一展示面），理由仍成立。
+ * · `config_override_conflict`：启动期一次性的配置冲突（`config.*` 与同名扁平键值不同）。本站只写
+ *   `config.<组>.<叶>`（切片 A 迁移后的唯一拼写）⇒ **结构上不可能出现**；真响了就是宿主代码 bug，
+ *   账在 runner 的 warn LOG（`runner/lib/engine-notices.js`），时间线上没有用户可行动的信息。
+ * · `continuity_injection_skipped`：**不在承诺联合类型里**（引擎漏登记，S6 钉这条事实）。本站
+ *   `config.continuity` 与 `capabilities.hooks.continuityProvider` 都不传（`handoff` 默认 `off`）
+ *   ⇒ 引擎连注入分支都进不去。订它只为将来开 continuity 时不必重新发现一次。
  */
-const EXEMPT_FROM_TIMELINE = { run_outcome: '与 run_end 语义重叠且今天无读者（见上）' };
+const EXEMPT_FROM_TIMELINE = {
+  run_outcome: '与 run_end 语义重叠且今天无读者；0.29 下重叠关系未变（见上）',
+  config_override_conflict: '启动期一次性配置冲突，本站只写 config.* 故结构上不可能；账在 runner warn LOG',
+  continuity_injection_skipped: '本站不传 continuity（handoff=off 且无 provider）⇒ 注入分支进不去；且不在承诺联合里',
+};
+
+/** 引擎真发、本站**故意不订**的事件（不进 `EVENT_TYPES`），每条也要有理由。 */
+const NOT_SUBSCRIBED = {
+  continuity_written: '续接块的写者那一半：config.continuity.handoff=off ⇒ 引擎不会写，也不会发',
+  continuity_write_failed: '同上：只有 handoff 打开后才会走到落盘失败这条',
+};
 
 function literalsIn(source, marker) {
   const start = source.indexOf(marker);
@@ -59,37 +143,78 @@ function literalsIn(source, marker) {
 }
 
 function feSource() { return fs.readFileSync(FE_EVENTS, 'utf8'); }
-function liveSet() { return literalsIn(feSource(), 'const EVENT_TYPES = ['); }
+function liveSet() { return literalsIn(feSource(), 'export const EVENT_TYPES = ['); }
 function replaySet() { return literalsIn(feSource(), 'const HISTORY_REPLAY_TYPES = new Set(['); }
 function backendSet() { return literalsIn(fs.readFileSync(HTTP, 'utf8'), 'const HISTORY_EVENT_TYPES = new Set(['); }
 
-test('S1 引擎承诺的 16 类全部在前端实时监听集合里（“订得到”不可豁免）', () => {
+/** 引擎源码里是否存在 `type: "<name>"` 的发射点（= 引擎真会发它）。 */
+function engineEmits(name) {
+  return new RegExp(`type: "${name}"`).test(engine.emissions);
+}
+
+/**
+ * **只订不回放下发**的运行态语义事件（#89 红线：历史回放绝不驱动运行态状态机）。
+ * 它们不需要「豁免理由」——它们**有读者**（展示 / 水位线），只是那个读者不在回放路径上。
+ */
+const LIVE_ONLY = {
+  usage: '单次 provider 调用的用量：只用于实时展示与水位线，不进历史回放（#89 / #425 口径）',
+};
+
+test('S0 承诺清单是从**已安装引擎源码**解析出来的（不是手抄），并报出版本', () => {
+  // 解析失败时本文件在模块顶层就抛了；能走到这里说明拿到了一份非空联合类型。
+  // 这条同时钉住「不许退化成硬抄」：联合类型被搬走/改名 ⇒ parseEngineLoopEventTypes 抛 ⇒ 本文件红，
+  // 而不是像手抄清单那样**静默过期**。
+  assert.ok(ENGINE_PROMISED_EVENTS.length >= 8,
+    `解析到的联合类型只有 ${ENGINE_PROMISED_EVENTS.length} 项：${ENGINE_PROMISED_EVENTS.join(', ')}`);
+  assert.equal(new Set(ENGINE_PROMISED_EVENTS).size, ENGINE_PROMISED_EVENTS.length, '联合类型里有重复项');
+  assert.match(engine.version, /^\d+\.\d+\.\d+$/, `引擎版本读不出来：${engine.version}`);
+});
+
+test('S1 引擎承诺的每一类都订得到（“订得到”不可豁免）', () => {
   const live = liveSet();
   assert.ok(live.size >= 20, `抽到的 EVENT_TYPES 只有 ${live.size} 项，抽取姿势可疑`);
-  for (const type of ENGINE_PROMISED_EVENTS) {
-    assert.ok(live.has(type), `实时监听里没有 ${type} ⇒ 浏览器一条都收不到（#421 的原病灶）`);
-  }
-  for (const [type, reason] of Object.entries(EXEMPT_FROM_TIMELINE)) {
-    assert.ok(ENGINE_PROMISED_EVENTS.includes(type), `豁免表里的 ${type} 已不在承诺清单里：上游不发了，该删豁免`);
-    assert.ok(reason.length > 6, `${type} 的豁免必须写理由——写了才算决定，没写就是漏`);
+  const missing = ENGINE_PROMISED_EVENTS.filter((type) => !live.has(type));
+  assert.deepEqual(missing, [],
+    `实时监听里没有 ${missing.join(', ')} ⇒ 浏览器一条都收不到（#421 的原病灶）`);
+  // 豁免表里的每一条都必须要么在承诺清单里、要么在「联合外真发」清单里
+  //（上游不发了 ⇒ 该删豁免，而不是让豁免表烂着）
+  for (const type of Object.keys(EXEMPT_FROM_TIMELINE)) {
+    if (NOT_SUBSCRIBED[type] !== undefined) continue;
+    assert.ok(ENGINE_PROMISED_EVENTS.includes(type) || ENGINE_UNPROMISED_EVENTS.includes(type),
+      `豁免表里的 ${type} 既不在承诺清单也不在「联合外真发」清单里：上游不发了，该删豁免`);
   }
 });
 
-test('S2 四类诊断事件三处齐全（漏任一处都是一种可见性不一致）', () => {
+test('S2 承诺清单里**逐类**都有决定：进时间线 / 只订不回放 / 写明理由的豁免', () => {
+  const replay = replaySet();
+  const back = backendSet();
+  const undecided = [];
+  for (const type of ENGINE_PROMISED_EVENTS) {
+    const inTimeline = replay.has(type) && back.has(type);
+    const decided = Object.hasOwn(EXEMPT_FROM_TIMELINE, type) || Object.hasOwn(LIVE_ONLY, type);
+    if (!inTimeline && !decided) undecided.push(type);
+    if (inTimeline && decided) undecided.push(`${type}(既进时间线又在豁免/只订表)`);
+    // 「只订不回放」不许半进：只进回放不进后端（或反之）会让 S4 红，这里只钉两表不重叠
+  }
+  assert.deepEqual(undecided, [],
+    `这些类型既没进时间线也没写决定：${undecided.join(', ')}（#438：逐类决定，写了才算决定）`);
+  for (const table of [EXEMPT_FROM_TIMELINE, LIVE_ONLY]) {
+    for (const [type, reason] of Object.entries(table)) {
+      assert.ok(reason.length > 6, `${type} 的决定必须写理由——写了才算决定，没写就是漏`);
+    }
+  }
+});
+
+test('S3 豁免的类型：订得到，但不进前端回放、也不进后端下发白名单', () => {
   const live = liveSet();
   const replay = replaySet();
   const back = backendSet();
-  for (const type of DIAGNOSTIC_EVENTS) {
-    assert.ok(live.has(type), `${type} 漏在前端 EVENT_TYPES ⇒ 实时收不到`);
-    assert.ok(replay.has(type), `${type} 漏在前端 HISTORY_REPLAY_TYPES ⇒ 刷新后消失`);
-    assert.ok(back.has(type), `${type} 漏在后端 HISTORY_EVENT_TYPES ⇒ 刷新后后端不下发`);
+  for (const type of Object.keys(EXEMPT_FROM_TIMELINE)) {
+    if (NOT_SUBSCRIBED[type] !== undefined) continue;
+    assert.ok(live.has(type), `${type} 订都订不到就不叫豁免，叫漏`);
+    assert.equal(replay.has(type), false, `${type} 已进前端回放 ⇒ 要么真接了，要么在刷没人看的行，请重读豁免理由`);
+    assert.equal(back.has(type), false, `${type} 已进后端历史白名单 ⇒ 同上`);
   }
-});
-
-test('S3 run_outcome 是写明了理由的豁免（订得到，但不进回放、不进后端历史）', () => {
-  assert.ok(liveSet().has('run_outcome'), '订都订不到就不叫豁免，叫漏');
-  assert.equal(replaySet().has('run_outcome'), false, 'run_outcome 已进前端回放 ⇒ 要么真接了，要么在刷没人看的行，请重读豁免理由');
-  assert.equal(backendSet().has('run_outcome'), false, 'run_outcome 已进后端历史白名单 ⇒ 同上');
 });
 
 test('S4 前端回放集合与后端下发白名单**逐项相等**（不是子集：多一边少一边都是 bug）', () => {
@@ -101,20 +226,33 @@ test('S4 前端回放集合与后端下发白名单**逐项相等**（不是子�
   assert.deepEqual(onlyBe, [], `后端下发、前端却不处理（白送的数据没人读）：${onlyBe.join(', ')}`);
 });
 
-test('S5 反向防推测键：前端接的诊断事件必须引擎真发（读已安装引擎源码）', (t) => {
-  let entry;
-  try { entry = fileURLToPath(import.meta.resolve('erix-agent')); } catch { return t.skip('未安装 erix-agent，无从对账'); }
-  let root = path.dirname(entry);
-  while (root !== path.dirname(root)) {
-    const pj = path.join(root, 'package.json');
-    if (fs.existsSync(pj) && JSON.parse(fs.readFileSync(pj, 'utf8')).name === 'erix-agent') break;
-    root = path.dirname(root);
+test('S5 反向防推测键：承诺清单里的每一类引擎都真发（读已安装引擎源码）', () => {
+  assert.ok(engine.fileCount >= 20, `只扫到 ${engine.fileCount} 个引擎源码文件，扫描面可疑`);
+  const dead = ENGINE_PROMISED_EVENTS.filter((type) => !engineEmits(type));
+  assert.deepEqual(dead, [],
+    `引擎源码里找不到这些类型的发射点 ⇒ 本站的监听/展示是永不触发的死支（推测键），该删：${dead.join(', ')}`);
+});
+
+test('S6 联合类型之外还有引擎真发的事件：逐条有决定，`continuity_injection_skipped` 单独钉住', () => {
+  // 0.29.0 实测：`continuity_injection_skipped` 经 `onEvent` 真发、**不在** `LoopEvent` 联合类型里。
+  // 这条判据把「事实」和「决定」分开钉：事实（引擎真发 / 不在联合里）读源码得出，决定（豁免理由）在表里。
+  for (const type of ENGINE_UNPROMISED_EVENTS) {
+    assert.equal(engineEmits(type), true,
+      `引擎源码里找不到 type: "${type}" ⇒ 本清单过期了（引擎不发它了，本站的订/豁免都该删）`);
+    assert.equal(ENGINE_PROMISED_EVENTS.includes(type), false,
+      `${type} 已经进了 LoopEvent 联合类型 ⇒ 请把它从 ENGINE_UNPROMISED_EVENTS 移到承诺清单（并重看它的决定）`);
   }
-  const loop = path.join(root, 'src', 'loop', 'orchestrator.js');
-  if (!fs.existsSync(loop)) return t.skip('引擎源码里没有 src/loop/orchestrator.js（随包裁剪或改版）');
-  const src = fs.readFileSync(loop, 'utf8');
-  for (const type of DIAGNOSTIC_EVENTS) {
-    assert.match(src, new RegExp(`type: "${type}"`),
-      `引擎不再发 ${type} ⇒ 本站的前端分支是永不触发的死支（推测键），该删`);
+  assert.ok(ENGINE_UNPROMISED_EVENTS.includes('continuity_injection_skipped'),
+    '`continuity_injection_skipped` 必须留在「联合外真发」清单里：它经 onEvent 真发但没进 typedef');
+  // 每一条都要么订了（并写豁免理由），要么在 NOT_SUBSCRIBED 里写明为什么不订
+  const live = liveSet();
+  for (const type of ENGINE_UNPROMISED_EVENTS) {
+    if (NOT_SUBSCRIBED[type] !== undefined) {
+      assert.equal(live.has(type), false, `${type} 已在 NOT_SUBSCRIBED 里说明不订，却又出现在 EVENT_TYPES`);
+      assert.ok(NOT_SUBSCRIBED[type].length > 6, `${type} 的「不订」也必须写理由`);
+      continue;
+    }
+    assert.ok(live.has(type), `${type} 既没订也没写「不订」的理由 ⇒ 这就是漏`);
+    assert.ok(Object.hasOwn(EXEMPT_FROM_TIMELINE, type), `${type} 订了就必须有决定（进时间线或豁免+理由）`);
   }
 });
