@@ -89,14 +89,20 @@ async function runOnce({ advisory }) {
   };
   const result = await runToolLoop({
     provider,
-    initialUserMessage: '干活',
-    completion: false,
     tools: createShellTools({ worktreeRoot: RUNNER_DIR }).schemas,
     executeTool: async () => 'ok',
-    maxRounds: 16, // judge 需要 maxRounds >= DEFAULT_REFLECTION_MIN_ROUNDS(16) 才启用
-    reflection,
     store: makeStore(records),
-    runId: KEY,
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `initialUserMessage` /
+    // `completion` / `maxRounds` / `reflection` / `runId` 现在启动期就抛）。
+    config: {
+      input: { initialUserMessage: '干活' },
+      run: {
+        runId: KEY,
+        maxRounds: 16, // judge 需要 maxRounds >= DEFAULT_REFLECTION_MIN_ROUNDS(16) 才启用
+        completion: false,
+        reflection,
+      },
+    },
   });
   const injected = [];
   for (const record of Object.values(records).flat()) {
@@ -143,14 +149,18 @@ test('#333 传非布尔会被引擎拒（所以我们只能写字面量，不能
   await assert.rejects(
     runToolLoop({
       provider: stubProvider({ toolRounds: 2 }),
-      initialUserMessage: 'x',
-      completion: false,
       tools: createShellTools({ worktreeRoot: RUNNER_DIR }).schemas,
       executeTool: async () => 'ok',
-      maxRounds: 16,
-      reflection: { enabled: true, roundJudge: true, judgeDoneAdvisory: 'true' },
       store: makeStore({}),
-      runId: KEY,
+      config: {
+        input: { initialUserMessage: 'x' },
+        run: {
+          runId: KEY,
+          maxRounds: 16,
+          completion: false,
+          reflection: { enabled: true, roundJudge: true, judgeDoneAdvisory: 'true' },
+        },
+      },
     }),
     (err) => err instanceof TypeError && /judgeDoneAdvisory must be a boolean/.test(err.message),
   );
