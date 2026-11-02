@@ -153,9 +153,36 @@ function collapseOriginal(id: string): void {
  * issue #390（#390-A 前端半）：`folded.hasSummary === false` = 上游摘要其实是字面量 "missing"，
  * 展开出来的只是跟标题换句话重复的兜底句 ⇒ 不画 ▾ 控件、不画摘要区（「查看原文」照旧——
  * 原文与摘要是两回事）。**键缺失**（旧 DTO / 其他路径）≠「没有摘要」⇒ 保持现状画 ▾。
+ *
+ * issue #440：但 `hasSummary === false` **不再等于**「没东西可看」——`fold-llm` 把 `record.summary`
+ * 写成字面量 `"missing"`（所以 `hasSummary` 恒 false），而真正的语义摘要躺在账本的
+ * `foldedFacts.text` 里（DTO 的 `summaryText`）。此时如果还按 #390-A 那条关掉 ▾，用户为语义折叠
+ * 付的那份 token 在界面上仍然**一个字节也看不到**（#440 的原文病症）⇒ 有 `summaryText` 就一定有
+ * 东西可展开。`hasSummary` 本身的语义一字未动（它仍只回答「`record.summary` 有没有料」）。
  */
-function foldedHasSummary(en: FoldedEntry): boolean {
+function foldedHasReadableSummary(en: FoldedEntry): boolean {
+  if (en.folded.summaryText !== undefined) return true;
   return en.folded.hasSummary !== false;
+}
+
+/**
+ * issue #440：摘要区画哪一份正文。
+ *
+ * `folded.text` 是**上游投影生成的折叠 turn 文本**（机械替代物/兜底句），`summaryText` 是账本
+ * `foldedFacts.text`。**只在 `summarySource === 'llm'` 时才改用 `summaryText`**，理由两条（实测）：
+ *
+ *   ① 这才是 #440 要修的那一格：`fold-llm` 下 `folded.text` 只是「早期第 a–b 轮已折叠。」这类
+ *      投影兜底句，而 2048 B 语义摘要只在 `foldedFacts.text` 里 ⇒ 不换就永远看不到；
+ *   ② **机械那一份不能换**：`fold-statistical` 的 `foldedFacts.text` 开头带着引擎的内部 marker
+ *      （`【上下文折叠·v1·erix-9f6e2c】`，`fold-statistical.js:26` 的 `FOLD_SUMMARY_MARKER`），
+ *      而 `folded.text` 是**洗过的**（实测：`早期第 1–21 轮已折叠。`）。渲染前者就是把引擎的内部
+ *      版本号撒到用户界面上——那正是上游 #565 造 `foldedFacts.title`（剥 marker）要消灭的东西。
+ *      ⇒ 机械路径保持现状（`folded.text`），不自己写正则剥 marker（剥 = 把「解析引擎内部字面量」
+ *      这件事又塞回宿主）。
+ */
+function foldedSummaryBody(en: FoldedEntry): string {
+  if (en.folded.summarySource === 'llm' && en.folded.summaryText !== undefined) return en.folded.summaryText;
+  return en.folded.text;
 }
 
 /**
@@ -166,7 +193,7 @@ function foldedHasSummary(en: FoldedEntry): boolean {
  */
 function foldedOriginalVisible(en: FoldedEntry): boolean {
   if (foldedOriginalState(en) == null) return false;
-  if (!foldedHasSummary(en)) return true;
+  if (!foldedHasReadableSummary(en)) return true;
   return isFoldedExpanded(en.id) && !isOriginalCollapsed(en.id);
 }
 
@@ -197,17 +224,38 @@ function foldedTitle(folded: FoldedInfo): string {
  * 两态的必要性：`hasSummary === false` 时下面那份“摘要”其实是重复标题的兜底句（#390-A 已经不画展开
  * 控件），此时再说「摘要就是它留下的全部」就是空头支票 ⇒ 改成指路「查看原文」。
  *
+ * #440 把它从两态扩成**三态**（前两态的数据来自账本 `foldedFacts`，不是 `hasSummary`）：
+ *   ① `summarySource === 'llm'` ⇒ 这次折叠留的是 **LLM 语义摘要**（`fold-llm`）。**绝对不许**在这
+ *      一格再说「本次没有生成摘要」——那是 #440 的原文病症（fold-llm 把 `record.summary` 写成
+ *      字面量 `"missing"`，旧实现据此说「没摘要」，而账本里躺着 2048 B 的语义摘要）；
+ *   ② `summarySource === 'statistical'` ⇒ 只有**机械替代物**（`fold-statistical`），如实说「没有
+ *      LLM 语义摘要」，别把机械替代物包装成语义摘要；
+ *   ③ `summarySource` 缺席（旧账本 / 不认识的形态）⇒ 退回 #390-A 那两态，逐字不变。
+ *
  * `hasSummary` **键缺席**（旧 DTO / 其他路径）⇒ 返回 null，整行不渲染。不能当 false 处理：那会让
  * 存量数据凭空多出一句「本次没有生成摘要」的断言（同 #390-A 那条「键缺席=不知道」纪律）。
  * 轮数只在有 `foldedRoundRange` 时报——拿 `foldedPayloadMessages` 报轮数是 #375 定过性的假话。
  */
 function foldedVisibilityNotice(en: FoldedEntry): string | null {
-  const has = (en.folded as { hasSummary?: unknown }).hasSummary;
-  if (has !== true && has !== false) return null;
   const range = (en.folded as { foldedRoundRange?: { from?: unknown; to?: unknown } }).foldedRoundRange;
   const from = range?.from;
   const to = range?.to;
   const n = typeof from === 'number' && typeof to === 'number' && to >= from ? to - from + 1 : null;
+  // #440：**三态**里的前两态——账本 `foldedFacts` 说了这次折叠留下了什么。
+  // `summarySource` 只由后端白名单给出（`'llm' | 'statistical'`），不认识的形态整个键缺席。
+  const source = en.folded.summarySource;
+  if (source === 'llm' || source === 'statistical') {
+    const key = source === 'llm'
+      ? (n === null ? 'stream.folded.visibilityLlmBare' : 'stream.folded.visibilityLlm')
+      : (n === null ? 'stream.folded.visibilityMechanicalBare' : 'stream.folded.visibilityMechanical');
+    const line = n === null ? t(key) : t(key, { n });
+    // 「摘要被夹断」标记（账本 `truncated:true` = 语义摘要被 2048 B 上界削过尾）——
+    // 不新开面板，就挂在同一行末尾（工单：零新增 UI 结构）。
+    return en.folded.truncated === true ? `${line}${t('stream.folded.summaryTruncated')}` : line;
+  }
+  // 第三态（#390-A 原样）：账本没有可读替代物（旧账本 / 机械路径缺席）⇒ 与 #440 之前逐字一致。
+  const has = (en.folded as { hasSummary?: unknown }).hasSummary;
+  if (has !== true && has !== false) return null;
   if (n === null) return has ? t('stream.folded.visibilityBare') : t('stream.folded.visibilityNoSummaryBare');
   return has ? t('stream.folded.visibility', { n }) : t('stream.folded.visibilityNoSummary', { n });
 }
@@ -335,7 +383,7 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
     >
       <!-- issue #390：hasSummary=false ⇒ 无▾、无摘要区（标题降为普通行）；键缺席照旧画▾可展开。 -->
       <button
-        v-if="foldedHasSummary(en)"
+        v-if="foldedHasReadableSummary(en)"
         type="button"
         class="folded-toggle flex w-full min-w-0 items-center gap-2 text-left"
         :aria-expanded="isFoldedExpanded(en.id)"
@@ -357,9 +405,9 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       <!-- 摘要：默认收起；展开后走 markdown（#389：与助手气泡同一渲染路径/样式——先转义后格式化，
            XSS 安全；markdown 自己重排，所以不叠加 whitespace-pre-wrap，否则双倍行距）。 -->
       <div
-        v-if="foldedHasSummary(en) && isFoldedExpanded(en.id)"
+        v-if="foldedHasReadableSummary(en) && isFoldedExpanded(en.id)"
         class="folded-summary md mt-1 overflow-auto text-black/70"
-        v-html="renderMarkdown(en.folded.text)"
+        v-html="renderMarkdown(foldedSummaryBody(en))"
       ></div>
       <!-- 查看原文（轮号可推导才展示；只读懒加载，按 (会话,轮) 缓存） -->
       <div v-if="en.sessionId != null && foldedQueryRound(en.folded) != null" class="mt-1 flex items-center gap-2">

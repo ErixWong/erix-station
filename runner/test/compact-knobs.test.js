@@ -12,13 +12,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { runToolLoop } from 'erix-agent';
 import {
   COMPACT_CONTEXT_KEYS,
   collectCompactContextProblems,
   assertCompactContext,
+  collectFoldingToolResultProblems,
+  assertFoldingToolResultKnobs,
 } from '../lib/compact-knobs.js';
 import { foldDegradeNotice } from '../worker.js';
 
@@ -277,4 +279,67 @@ test('K12 本站从 foldSummary 读的每个键都在上游契约的字段面里
   for (const key of keys) {
     assert.ok(contract.includes('\`' + key + '\`'), `上游契约里没有 foldSummary.${key} ⇒ 本站在读一个不存在的键`);
   }
+});
+
+// ── ③ issue #440：`config.folding` 组层的两个工具结果旋钮 ──────────────────────────────────────
+//
+// 先核实过引擎**不校**这两个叶子（0.29.0）：它们是 `CONFIG_NAMESPACE_SCHEMA.folding` 的合法叶子
+// （`config-namespace.js:222-223`），所以不撞 unknown-leaf；但 `CONFIG_LEAF_VALUE_RULE_PATHS`
+// （`:569-587`）只登记了 `run.stream` / `continuity.handoff` ⇒ **没有值规则**，读侧是裸 `??` 缺省
+// （`orchestrator.js:794` / `:703`）⇒ `'6'` / `-1` / `null` 一路静默（`tool-result-ttl.js:241-245`
+// 的 `Number.isFinite` 守卫 + `ttl <= 0 || minTokens <= 0` no-op 会让它**看起来配上了、其实是关的**）。
+// 所以本站自己加一道（与 #469 A4 同一个理由）。
+test('#440-K13 引擎确实不校这两个叶子（判据的依据不过期：上游哪天加了值规则，本文件要重看）', async () => {
+  const root = enginePackageRoot();
+  const ns = fs.readFileSync(path.join(root, 'src', 'loop', 'config-namespace.js'), 'utf8');
+  // ① 两个叶子是合法叶子（否则「unknown config.folding option」那一层已经拦住了，本站这道就多余）
+  assert.match(ns, /folding:\s*Object\.freeze\(\[/, 'folding 组不见了');
+  for (const leaf of ['toolResultTtl', 'toolResultFoldMinTokens']) {
+    assert.ok(ns.includes(`"${leaf}"`), `${leaf} 不再是 folding 组的合法叶子 ⇒ 引擎层变了，重看本判据`);
+  }
+  // ② 但它们**没有**值规则 —— 读引擎**导出的那张表**（不 grep 源码：同一份文件里还有一张
+  //    `CONFIG_LEAF_BINDING`（`"folding.toolResultTtl": "init"`），按字符串搜会把绑定表误判成值规则）
+  const nsModule = await import(pathToFileURL(path.join(root, 'src', 'loop', 'config-namespace.js')).href);
+  const rulePaths = Object.keys(nsModule.CONFIG_LEAF_VALUE_RULE_PATHS);
+  assert.deepEqual(rulePaths.sort(), ['continuity.handoff', 'run.stream'],
+    `引擎的值规则表变了（${rulePaths.join(', ')}）：若 folding.* 进了这张表，本站那道 `
+    + '`assertFoldingToolResultKnobs` 就该退成注释（别重复造）');
+  for (const leaf of ['toolResultTtl', 'toolResultFoldMinTokens']) {
+    assert.ok(!rulePaths.includes(`folding.${leaf}`),
+      `引擎开始给 folding.${leaf} 登记值规则了 ⇒ 本站这道校验可以退成注释（别重复造）`);
+  }
+  // ③ 读侧仍是裸 `??` 缺省（真引擎行为：非法值不抛）
+  const orch = fs.readFileSync(path.join(root, 'src', 'loop', 'orchestrator.js'), 'utf8');
+  assert.match(orch, /toolResultTtl \?\? TOOL_RESULT_TTL_DEFAULT/,
+    '引擎读侧不再是 `??` 缺省 ⇒ 值校验可能已经搬到别处，重看');
+});
+
+test('#440-K14 值域按引擎语义：0 = 关掉（合法），负数/小数/字符串/null 全拒', () => {
+  // 合法：正整数与 0（`tool-result-ttl.js:244-245`：`ttl <= 0 || minTokens <= 0` = 关闭、no-op）
+  for (const ok of [0, 1, 6, 8000, 100000]) {
+    for (const key of ['toolResultTtl', 'toolResultFoldMinTokens']) {
+      assert.deepEqual(collectFoldingToolResultProblems({ [key]: ok }), [],
+        `${key}=${ok} 应当合法（0 在引擎语义里是「关掉」，不是非法值）`);
+    }
+  }
+  assert.deepEqual(collectFoldingToolResultProblems(undefined), [], '省略 = 用引擎默认（2 / 4000）');
+  assert.deepEqual(collectFoldingToolResultProblems({}), []);
+  // 非法：字符串（`Number.isFinite('6')` false ⇒ 引擎会静默 no-op）、负数、小数、null、NaN、溢出
+  for (const bad of ['6', -1, 1.5, null, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const key of ['toolResultTtl', 'toolResultFoldMinTokens']) {
+      const problems = collectFoldingToolResultProblems({ [key]: bad });
+      assert.equal(problems.length, 1, `${key}=${String(bad)} 应红，实际 ${JSON.stringify(problems)}`);
+      assert.match(problems[0], new RegExp(`^${key} must be a non-negative integer`));
+    }
+  }
+  // 拼错键名同样当场红（这两个叶子的错法最像的是单复数与大小写）
+  for (const typo of ['toolResultTll', 'toolResultTTL', 'toolResultFoldMinToken']) {
+    const problems = collectFoldingToolResultProblems({ [typo]: 6 });
+    assert.equal(problems.length, 1, `${typo} 应当被拦，实际 ${JSON.stringify(problems)}`);
+    assert.match(problems[0], /unknown folding tool-result knob/);
+  }
+  // 抛错形态（worker 起跑即崩，不是 warn）
+  assert.throws(() => assertFoldingToolResultKnobs({ toolResultTtl: '6' }), TypeError);
+  const good = { toolResultTtl: 6, toolResultFoldMinTokens: 8000 };
+  assert.equal(assertFoldingToolResultKnobs(good), good, '通过时原样返回入参（worker 用 `...` 展开它）');
 });
