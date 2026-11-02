@@ -266,6 +266,10 @@ export const zhCN = {
       capabilityDegraded: '存储端缺少 {method} 能力：本次 run 对应的持久化被跳过（中途崩溃不可恢复）',
       resumeJournalSkipped: '崩溃轮的 {count} 条工具结果未入账（第 {round} 轮），下次恢复将依赖快照',
       resumeJournalSome: '若干',
+      // issue #438 切片 B（erix-agent 0.29.0）：`LoopEvent` 新增的两类**展示类**诊断事件。
+      // 数字没给就 `?`（#283）、外来标识符过形状闸（#261）——调用方已归一，文案不得再编数。
+      compactionDeferred: '本轮未折叠：请求尾部是未结清的工具调用（第 {round} 轮，{reason}），下一轮再折',
+      budgetBelowWorkingSet: '折叠后仍超预算：工作集 {workingSet} tokens > 预算 {budget} tokens（连续 {attempts} 次），本次 run 提前收尾；引擎建议预算 ≥ {suggested}',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       // issue #321（erix-station）：judge 永远只是**意见**，不是验收——分轴展示（工具审计 / 目标判断 /
