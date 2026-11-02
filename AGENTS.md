@@ -165,7 +165,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
   「灯长期红/黄、而没人负责让它变绿」。
 
-## 8. erix-agent 依赖与升级（当前 pin：**0.26.0**，2026-10-25 由 `feat-261025-09-erix-agent-0.26.0` 从 0.25.0 升上；历史 0.14–0.25 记录见下。⚠ 本标题曾长期停在 0.20.0，与实际 pin 不符，本次一并修正）
+## 8. erix-agent 依赖与升级（当前 pin：**0.29.0**，2026-11-02 由 `feat-261102-01-erix-agent-0.29.0` 从 0.26.0 升上（0.27.0 从未发布）；历史 0.14–0.26 记录见下。⚠ 本标题曾长期停在 0.20.0，与实际 pin 不符，§8.65 那次一并修正）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
 - runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
@@ -2781,3 +2781,139 @@ UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字�
 **已知 nit（故意保留）**：新测试对 **Dockerfile 全文**禁 `8.0.<数字>` / `10.0.<数字>`（含注释），所以将来谁想在某条注释里写「实测 8.0.427 通过」会红。这是刻意的——官方 tag 浮动，把补丁号写进镜像会随官方推补丁漂移；要记实测版本请记在本台账或 issue 里，别记进 Dockerfile。
 
 **未做 / 待办**：① 发版 + **`docker rm -f` 全部 `fde-*` 让 reconcile 重建**（§8.17：不动镜像就还是只有 SDK 8）；② 本单**不碰** per-FDE / per-language 镜像（`FDE_IMAGE` 仍是全局单值，要改是另一个决策）；③ 不装 .NET 9、不改底座、不动 `FDE_MEMORY_LIMIT=4g`。
+
+### 8.82 引擎升 pin 0.26.0 → **0.29.0**：扁平入参面被删，pin 与迁移必须同一次落地（2026-11-02，分支 `feat-261102-01-erix-agent-0.29.0`）
+
+**载荷**：`erix-agent` 0.26.0 → **0.29.0**（两份 `package.json` + 两份 lockfile，`npm install --save-exact`）。
+0.27.0 **从未发布**（npm 版本线 `0.26.0 → 0.28.0 → 0.29.0`；`npm view erix-agent version` = `0.29.0`、
+`dist-tags.latest` = `0.29.0`，2026-11-02 现查），所以本站是**一跳**上去，没有 0.27 的中间形态要迁。
+
+**为什么这一片不能 pin-first（与 §8.37 / §8.65 的差异，务必记住）**：0.28.0 是 **BREAKING**——上游
+#498 S3 + #545 把 44 个扁平配置键从 `RUN_TOOL_LOOP_OPTION_NAMES` 里删了，写成扁平**在启动期就抛**：
+
+```
+unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRounds; the flat spelling is rejected)
+```
+
+本站 `runner/worker.js` 走**直连** `runToolLoop`，此前传的 13 个扁平键
+（`system` / `task` / `wrapup` / `context` / `modelMetadata` / `maxTokens` / `runId` / `resume` /
+`maxRounds` / `stream` / `replayPolicy` / `reflection` / `initialUserMessage`）**全部被拒**。⇒
+「先升 pin 让它变红、再按红格修」这条 0.22→0.23（§8.37）、0.25→0.26（§8.65）用过的节奏在这里**不成立**：
+只升 pin 的后果是**每一个 run 在第 1 轮之前就抛**（不是「跑起来但某条判据红」）。0.29.0 本身则**不动入参面**
+（§8 的 0.29 指南：没有选项被退役/改名/搬家），所以本片的迁移量全部来自 0.28。
+
+**落点**（写侧住址只有一处：`runner/worker.js` 的 `await runToolLoop({`）：
+- `system` / `wrapup` / `initialUserMessage` → `config.input.*`；`task` / `modelMetadata` → `config.metadata.*`；
+  `maxTokens` → `config.tuning.maxTokens`；`context` → `config.folding.context`；
+  `runId` / `resume` / `maxRounds` / `stream` / `replayPolicy` / `reflection`（三个数据成员）→ `config.run.*`。
+- **观察者与端口保持顶层**（0.29 白名单 26 个名字里除 `config` / `capabilities` / `session` 外全是行为载体）：
+  `provider` / `tools` / `executeTool` / `store` / `signal` / `semanticStateProvider` / 12 个 `on*` /
+  `diagnostics`。`onFoldSummary` 也在顶层（#331 那根死光纤的老坑，C12/C14 钉着）。
+- 三处标记注释**跟到新住址**（`#309:engine-model-params` → `config.metadata`/`config.tuning` 两组整组在标记内装配；
+  `#392:context-strategy` → `config.folding.context`；`#392:C-onFoldSummary` 原地不动）。`#309` 的
+  「camelCase 三键（`contextWindowTokens` / `maxOutputTokens` / `maxTokens`）各只出现一次、且只在那一对标记里」
+  这把锁**一格没放宽**：`model-metadata.test.js` 的求值器改成「把标记段放回 `config` 里再求值」，
+  断言换成 `modelParamsOf(params)`（判据仍是「两个叶子都不在 = 什么都不传」）。
+- `assertCompactContext` **继续包住** `config.folding.context`（值一字未改：`{ strategy: 'fold-statistical' }`）。
+- `config.run.stream` 传**布尔** `true`（0.28 新增值规则，非布尔两条路都抛）。
+- 折叠策略**仍是 `fold-statistical`**（§8.73 的三条闸门：0.29.0 已发版 ⇒ 条件① 满足，②③ 未做 ⇒ 不动）。
+
+**被更正 / 作废的旧口径**（都是这次实测推翻的，别再照旧引用）：
+1. **「直连路径不校验 `context` 子键」已作废**。0.26.0 时成立（`option-normalization.js` 里没有语义相），
+   0.28.0 把 `assertSemanticOptionValues` 放进了**两条路的公共前置**（上游 #496 S1）⇒ 现在**直连也拒**
+   （`unknown assembly policy context option: "summarizerTimeout"; maxSummaryTokens must be a positive integer`）。
+   `compact-knobs.test.js` K6 的标题与判据随之改写（从「引擎不校验」改成「引擎现在也校验」，**强度是升的**）；
+   `assertCompactContext` 仍然保留，理由变成「本站口径的 fail-fast + 值必须同时过两道闸」，K7 继续钉着。
+2. **`#309` 装配段不再在顶层**；`context` 也不再是顶层选项。任何按老住址抠源码的判据都要跟位
+   （`fold-strategy.test.js` / `fold-notes.test.js` C14 / `compact-knobs.test.js` K7 / `fold-notes-e2e.test.js` 的求值器）。
+3. **上游 `src/tools/` 不再平铺**：0.29.0 新增 `src/tools/delegation/` 子目录，`replay-policy.test.js` 里
+   「上游工具源码零 `replay:` 标注」那条的读点从 `readdirSync` 平铺改成**递归收 `.js`**（判据强度不变、覆盖面更大）。
+4. `worker.js` 里那句「pin 到 0.27.0 之后摘要 maxTokens 口径会变」的注释：**0.29.0 已含 #493**
+   （摘要 `maxTokens = min(宿主 maxTokens, context.maxSummaryTokens ?? 1400)`），但本站仍不选 `fold-llm` ⇒ 真机不走到那条路。
+
+**测试口径**（判绿 = 退出码 0）：
+- 根 `npm test` **1718 格 / 1714 通过 / 0 失败 / 4 跳过，rc=0**（净 +3 = 新增 `runner/test/worker-options-address.test.js` 的 3 条；
+  原本 `compact-knobs.test.js` K12 里那条「装上 0.27.0 后自动接管」的跳过格现在**真跑**了，与 4 个既有跳过格无关）。
+- `node --test runner/test/*.test.js` **433 格 / 433 通过 / 0 失败 / 0 跳过，rc=0**（基线 430 = 429 通过 + 1 跳过，即 K12 那条「装上 0.27.0 后自动接管」的格；本片 +3 新格、且那 1 格现在**真跑**。⚠ 别用目录形式，本机是坏的）。
+- `cd portal/frontend && npm run typecheck` **rc=0**。
+- `cd portal/frontend && timeout 240 npm test`：**主 agent 在合并树上复跑两次，两次都是 53 文件 / 982 格全绿，rc=0**。
+  worker 交回的是 **rc=1 / 3 格红**（`src/components/GitLightBadge.spec.ts` 的 `git-light-finish` / `git-light-ask` /
+  `git-light-refresh`，报 `Target cannot be null or undefined`），并把它记成「既有基线红，在未改动的 main 上单跑同样 3 红」——
+  **那句被现验推翻**：我在**未改动的 main 检出**（`/home/eric/projects/erix-station`，HEAD `201dd09`）单跑同一个 spec
+  = **18/18 绿 rc=0**；又在合并树上做过**并发负载复现**（后台跑全量、同时单跑该 spec ×2）也**全绿**。
+  ⇒ 定性：**worker 那 3 格红是它那一侧的环境性红灯，本机不可复现**（同 spec 同症状在 §8.48 有过先例：那次是主 agent
+  并行跑重活压出来的）。**不是本片引入，也不是基线红** —— 两个说法都不成立，别再引用「基线 3 红」这句。
+  ⚠ 本机 `NODE_ENV=production` ⇒ `npm ci` 默认**不装 devDependencies**，跑前端四件套前必须 `npm ci --include=dev`
+  （否则 `vue-tsc: not found`）——这条是 worker 说对的一条运维口径。
+- 四套随包契约（`transcriptStoreContract` / `toolResultEnvelopeContract` / `fileToolsContract` +
+  `portal/test/transcript-store.test.js`）**零放宽**：0.29.0 没有新增翻红格；上面第 3 条那处只是**读点**更新。
+
+**变异（每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原、`git status` 干净）**：
+① `config.run.maxRounds` 搬回顶层扁平 `maxRounds`（`1 1 runner/worker.js`）⇒ `worker-options-address` **①、②③ 两格红**
+（① = 顶层键不在引擎白名单；②③ = `config.run.maxRounds` 不在装配里）；
+② 摘掉 `assertCompactContext` 那层包装（`2 2 runner/worker.js`）⇒ `compact-knobs` **K7 恰 1 格红**；
+③ 版本线闸改回 `0.26.0`（`1 1 runner/test/llm-timeouts.test.js`）⇒ `llm-timeouts` **② 组 4 格红**（回归门那 4 条）；
+同一变异改前端常量（`1 1 portal/frontend/src/lib/terminationReasons.ts`）⇒ `portal/test/termination-contract.test.js`
+第 6 条 + `terminationReasons.spec.ts` 的「引擎取值面逐项在册」各 1 格红；
+④ 折叠策略改 `fold-llm`（`1 1 runner/worker.js`）⇒ `fold-strategy` **A3 1 格红** + `compact-knobs` **K7 1 格红**（策略值那条）。
+
+**主 agent 验收（2026-11-02，合并树 `review-029A`，依赖由 lockfile `npm ci` 装上后 `node_modules/erix-agent` 两处均 0.29.0）**：
+- 四件套复跑与 worker 逐位相同：根 **1718 / 1714 / 0 失败 / 4 跳过 rc=0**、runner **433 / 433 rc=0**、
+  `typecheck` **rc=0**、前端 **53 文件 / 982 rc=0**（前端那 3 格红见上一条的更正）。
+- **亲跑 6 条变异**（不复用 worker 的结论；每条先自证**非空操作**、跑完复原并**用 md5 对一次**）：
+  ① `replayPolicy` 值改 `always-replay` ⇒ `replay-policy` **2 格具名红**（主口径 + 刻意保守那条）；
+  ② 折叠策略改 `fold-llm` ⇒ `compact-knobs` **K7** + `fold-strategy` **A3** 各 1 格红；
+  ③ runner 版本线闸退回 `0.26.0` ⇒ `llm-timeouts` **4 格红**（② 组回归门）；
+  ④ 前端版本线闸退回 `0.26.0` ⇒ `termination-contract` **第 6 格红**（引擎源码交叉核对）；
+  ⑤ `maxRounds` 搬回顶层扁平 ⇒ `worker-options-address` **①②③ 两格红**；
+  ⑥ **叶子放错组**（`metadata.modelMetadata` 改名挪位）⇒ `model-metadata` **5 格行为级红**
+  —— 顺带量到一条覆盖面事实：`worker-options-address` 的 ②③ **看不见条件 spread 里面的键**
+  （`...(engineModelMetadata ? { modelMetadata: … } : {})`），所以那一层的牙在 `model-metadata` 的行为级判据上。
+  ⚠ 我自己有一次**空操作变异**（锚点缩进写错 ⇒ md5 前后相同），靠「先证变异真的改变文件」抓回（§8.24 同族，又一次）。
+- **一条新的引擎事实（给切片 B 用，别按被作废的旧理由推理）**：0.29.0 的直连路径**会**校 `context` 的
+  拼错键与旋钮非法值（`unknown assembly policy context option` / `maxSummaryTokens must be a positive integer`，
+  我亲手探针复现），但**不校 `keepRounds`**：`{ strategy:'fold-statistical', keepRounds:-1 }` **跑通不报错**，
+  而 `selectFoldedRounds` 的 `target = max(0, rounds.length - keepRounds)`（`src/compact/helpers.js`）会把
+  **尾部轮也折掉**。⇒ `assertCompactContext` 的现役理由从「引擎不校」改成「**引擎漏校 `keepRounds`，且本站要
+  的是 0 合法 / 负数拒**」；切片 B 传 `keepRounds: 6` 时这条闸必须已在。
+
+**过程账（主 agent 的操作失误，代价 = worker 的 5 个 commit 只剩 patch）**：我按 §2.7 的收尾动作清理 worker worktree 时，
+**在它自己 commit 之后立刻 `git worktree remove --force` + `git branch -D`**，而那 5 个 commit 既没 push 也没进 main
+⇒ 提交对象随分支删除而不可达，**唯一载体是 subagent 自动导出的 `worktree-diffs/…worker.patch`（含 untracked 新文件）**。
+落回方式：`git apply` 那份 patch（21 文件 / +902 −230，一次成功）。⚠ 连带一条更狠的同类坑：**补丁没 `git add` 时，
+做变异用的 `git checkout -- <file>` 会把补丁一起抹掉**（它从 index 复原，而 index 还是 HEAD）——我一轮变异后就中了，
+表现是「变异结果仍然对得上」但测的其实是未迁移的旧 worker。⇒ **口径：把外部交回的补丁 review 之前先 `git add -A`**，
+此后 `git checkout --` 才只撤销变异；清理别人的 worktree 之前先确认它的 commit 已进 main 或已 push。
+
+**已知边界 / 本片未做**：
+- **不接派生面**：`createDelegateTool` / `config.run.parentRunId` / 五个端口（`runChild` / `notifyParent` /
+  `transcriptPathFor` / `cwdFor` / `isProcessAlive`）**一律不接**。理由：本站 runner 没有「启动子 run」的原语
+  （一个 run = 一个 worker 子进程，由 agentd fork），而且名册目录 `~/.erix/delegation/` 是**共享**的
+  （0.29 指南 §3 明写：不接 `isProcessAlive` 就没有陈旧清理，别的进程能改写你那条记录）。要接是另一片活。
+- **三个新叶子故意不传**：`config.folding.context.foldAtRatio`（默认 1.0 = 与今天逐字等价）、
+  `workingSetRecentRounds`（默认 0 = 关；上游量的结论是**打开反而更贵**：11,467 → 46,476 token、重读 3 → 9）、
+  `config.continuity.handoff`（默认 `off`；开了就由引擎当默认写者，请求里多一条 ~80 token 指令并落
+  `~/.erix/continuity/`）。传了就是引入未量的行为变化 ⇒ 一律不传，只在这里登记它们存在。
+- **事件承接面三处集合不动**：`compaction_deferred` / `config_override_conflict` / `budget_below_working_set`
+  属**切片 B**（前端 `EVENT_TYPES` + `docs/api/portal.md` + `docs/data/model.md`），本片一个字节都不碰，
+  避免两切片在同一片代码上打架。
+- 不发版、不打 tag、不部署、不 `docker rm`；不动 `docs/data/schema.sql` 与 `deploy/migrations/`（本片零 DDL）；
+  不动 `package.json` 的 `version`；不新增依赖。
+
+**待办（主 agent）**：
+- **切片 B（已立项，工单 `.work-orders/erix-agent-0.29-sliceB.md`）**：① 事件承接面按**已安装引擎的 `LoopEvent`
+  联合类型**重新对账（`compaction_deferred` / `config_override_conflict` / `budget_below_working_set`，以及只在
+  `onEvent` 里出现、不在 typedef 联合里的 `continuity_injection_skipped` —— 要接就三处都接，要豁免就写理由，
+  不允许「豁免表空着」）；② 折叠策略 `fold-statistical` → **`fold-llm`** 并**显式**传 `keepRounds: 6`（决策者
+  2026-11-02 定）。理由：上游为语义折叠下的那些投资（`degradeKind` / `foldedFacts.origin:'llm'` / 横幅两态 /
+  A2 降级告警）在本站**结构性不可达**，而 #469 那六张 PR 已随 0.29.0 发版（§8.73 闸门条件① 已满足）。
+  配套：`assertCompactContext` 白名单加 `keepRounds`（**非负**安全整数，0 合法）；降级出口已核：`foldSummary`
+  在 0.29.0 仍**只在 `compaction` 事件里**（不落轮记录），故 D 片横幅不声称降级，降级面归事件行 + runner LOG。
+  ⚠ 两条不许写错的事实：**不传 `keepRounds` ≠ `0`**（引擎缺省 `?? 6`），且 `estimatedTokens / budget > 2` 时会
+  自动收到 **2**（设计，不是 bug）；摘要调用**计入整 run 用量与 LiteLLM 账单**，但不污染 `latestApiInputTokens`、
+  不计轮次/停滞。成本闸（②③）未量完之前不得发版。
+- 发版号与真机结论：`TODO(主 agent)`（本片只 commit，不 push / 不打 tag / 不部署）。
+- 真机（`TODO(主 agent)`）：五个 `fde-*` 重建后容器内 `erix-agent` 必须是 **0.29.0**，并跑一次真会话确认
+  ① `fold-statistical` 的替代物照旧进请求与账本；② `usage.context_window` 与 `max_tokens` 仍按元数据走；
+  ③ judge 的 `judgeDoneAdvisory` 仍注入。⚠ 本片**动 `runner/`** ⇒ 必须重建 FDE 镜像 + `docker rm -f` 让
+  reconcile 重建（§8.17：`ensureFdeContainer` 不检镜像漂移）。

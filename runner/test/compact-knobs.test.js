@@ -78,22 +78,39 @@ test('K5 上游给本站定的那批默认值都能过（将来写死时不会�
   }
 });
 
-test('K6 【真链路】同样的错交给**引擎**不报错——这正是 A4 必须存在的理由', async () => {
+test('K6 【真链路】同样的错在 0.29.0 的**直连路径**上也会被拒（上游 #496 S1 起两条路共用一个语义相）', async () => {
   const run = await runToolLoop({
     provider: {
       protocol: 'openai', model: 'm',
       async chat() { return { content: [{ type: 'text', text: '收尾' }], stopReason: 'end_turn', usage: { input_tokens: 10, output_tokens: 5 } }; },
       async chatStream() { return this.chat(); },
     },
-    model: 'm',
-    initialUserMessage: 'hi',
     tools: [{ name: 'f', description: 'd', inputSchema: { type: 'object' } }],
     executeTool: async () => 'ok',
-    maxRounds: 2, reflection: false, completion: false, stallDetection: false,
-    // 一个拼错的键 + 一个非法值：装配口会抛 TypeError，直连路径什么都不会发生
-    context: { strategy: 'fold-statistical', summarizerTimeout: 5000, maxSummaryTokens: 'abc' },
-  });
-  assert.equal(run.termination?.reason, 'end_turn', '引擎不校验 ⇒ 错配置照样"成功"跑完');
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `model` / `initialUserMessage` /
+    // `maxRounds` / `reflection` / `completion` / `stallDetection` / `context` 现在启动期就抛）。
+    config: {
+      metadata: { model: 'm' },
+      input: { initialUserMessage: 'hi' },
+      run: {
+        maxRounds: 2, reflection: false, completion: false, stallDetection: false,
+      },
+      // 一个拼错的键 + 一个非法值
+      folding: { context: { strategy: 'fold-statistical', summarizerTimeout: 5000, maxSummaryTokens: 'abc' } },
+    },
+  }).then((r) => ({ ok: r }), (err) => ({ err }));
+  // ⚠ 口径在 0.29.0 上**变了，而且是变严**：0.26.0 时直连路径对这个错**一声不响**
+  // （`normalizeRunToolLoopOptions` 里没有语义相），0.28.0 把 `assertSemanticOptionValues`
+  // 放进了两条路的公共前置（上游 issue #496 S1，`option-normalization.js` 头注释第 5 条）⇒
+  // 现在**直连也抛**。所以本格从「引擎不校验」改成「引擎现在也校验」，判据强度是**升**的：
+  // 上游若哪天把这道闸从直连路径上摘掉，本格会红（那正是 A4 重新变成唯一防线的那一天）。
+  assert.equal(run.ok, undefined, '0.29.0 的直连路径必须拒掉这份错配置（0.26.0 时代它是一声不响的）');
+  assert.match(String(run.err?.message ?? ''),
+    /unknown assembly policy context option: "summarizerTimeout"/,
+    '拒绝理由必须点名那个拼错的键（上游文案口径，本站只钉「真的拒了 + 拒得有名有姓」）');
+  assert.match(String(run.err?.message ?? ''), /maxSummaryTokens must be a positive integer/,
+    '非法值那一半同样要被点名');
+  assert.ok(run.err instanceof TypeError, '语义相的抛错类型仍是 TypeError（两条路一致）');
   // 反向确认：本站校验器对同一份入参是**红**的
   assert.equal(collectCompactContextProblems({ strategy: 'fold-statistical', summarizerTimeout: 5000, maxSummaryTokens: 'abc' }).length, 2);
   assert.throws(() => assertCompactContext({ strategy: 'fold-statistical', summarizerTimeout: 5000 }), TypeError);
