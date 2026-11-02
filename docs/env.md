@@ -297,7 +297,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `POSTGRES_IMAGE` | 平台规范固定（规格 §14）；官方镜像（compose 变量名 `POSTGRES_IMAGE`） | `postgres:16.15`；生产必须 pin 到 `postgres:16.<patch>` **再 pin digest**（⚠️ 具体值部署时由 §9 产出后填） |
 | `TRAEFIK_IMAGE` | 平台规范固定（规格 §14）；官方镜像 | `traefik:v3`；生产必须 pin 到 `traefik:v3.<minor>.<patch>` **再 pin digest**（⚠️ 同上；P1 开发可临时 `traefik:v3` 并记录 resolved digest） |
 | `STATION_DOCKER_PROXY_IMAGE` | 平台规范固定（deploy-contract §5.1）；自构建（build context `deploy/fde-proxy/`） | `erix-station/fde-proxy:<git-sha>`（自研 admission proxy；tecnativa/docker-socket-proxy 方案已废弃）；dev 默认 `:local`，compose 插值可 env 覆盖（issue #27） |
-| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）**；生产 pin 双轨见下方「镜像 pin 策略」+ issue #27（B 档语言矩阵：Node/Python/.NET/Playwright，实测 2.29GB） |
+| `FDE_IMAGE` | 平台规范固定（规格 §12/§14）；自构建（build context `runner/`） | `erix-station/fde:<erix-agent 版本>-<git-sha>`（不可变 tag；版本记录点 `containers.agent_version`）；**WP2b 开发期默认 `traefik/whoami`（轻量站台，可配置）**；生产 pin 双轨见下方「镜像 pin 策略」+ issue #27（B 档语言矩阵：Node/Python/.NET SDK 8 + 10 side-by-side（默认选最高版，钉 8 用 global.json）/Playwright，实测 ≈3.08GB（加 SDK 10 后）） |
 | `FDE_CMD` | 平台规范固定（FDE 容器命令；开发期 whoami 站台用，生产为 `station-agentd` 入口） | JSON 数组；开发期 `["-port","4000"]`（首个项目块首端口，fde-platform §8.2） |
 | `FDE_AGENT_VERSION` | **仅作显式 override**（issue #404 结案）：不设 ⇒ 版本真相来自镜像内 `build-info.json`；设成真值 ⇒ 同时注进容器 env `ERIX_AGENT_VERSION` 覆盖构建产物，并写进新建容器的 `containers.agent_version`（后续由心跳校正为实际值）。`dev` 是占位，**不算钉值、不注入容器** | 不设（占位 `dev`） |
 | `FDE_MEMORY_LIMIT` | 平台规范固定（deploy-contract §6.2 资源限额；**已决 2026-09-18，issue #27**） | `4g`（B 档镜像下 dotnet build/chromium 峰值需要；`0` 表示不限） |

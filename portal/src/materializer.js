@@ -221,7 +221,10 @@ export function renderHomeAgentsMd({ fdeName }) {
     '',
     '## 环境事实（先查再用，不要重复安装）',
     '',
-    '- Node 22 / npm / pnpm（corepack）、python3 + venv/pip、gcc/g++/make、.NET SDK 8 已预装',
+    '- Node 22 / npm / pnpm（corepack）、python3 + venv/pip、gcc/g++/make、.NET SDK 8 与 10（side-by-side）已预装',
+    // .NET 两版并存的口径（issue #436）：不说清楚「默认选最高版」+「怎么钉 8」，agent 会以为只有 8、
+    // 或者反过来以为装坏了。红线同上：不写端口号、不写伞域。
+    '- .NET 两版并存时 `dotnet` 默认选**最高版**（现为 10）：要钉 8 的项目在项目根放 `global.json`（`{"sdk":{"version":"8.0.<patch>"}}`）；不钉也能跑，只是 `net8.0` 项目编译时用的是 10 的 SDK',
     '- **Playwright 浏览器已烘焙在 `/ms-playwright`（chromium + headless shell），无需 `playwright install`**；浏览器不在 PATH 上（`which chromium` 为空是正常的），用 `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` 或 `chromium.executablePath()` 定位',
     '- `which` 探测不到 ≠ 未安装；先查 `/ms-playwright`、`/usr/local/lib/node_modules` 再动手',
     '',
