@@ -48,6 +48,38 @@ test('E1 四类诊断事件各出一条 warn，且关键字段进文案（不许
   }
 });
 
+test('E2b issue #438 切片 B：0.29 新增的三类各有一条嘴，级别按「每轮都有 ⇒ info / 异常才 warn」判', () => {
+  // 载荷逐条对着引擎发射点写：orchestrator.js:4884 / :4056 / :1271
+  const deferred = engineDiagnosticNotice({ type: 'compaction_deferred', round: 3, reason: 'pending_tool_use' });
+  assert.ok(deferred, 'compaction_deferred 必须接出一条');
+  assert.equal(deferred.level, 'info', '推迟折叠是正常形态（每轮最多一条）⇒ info，不许占 warn 面');
+  assert.match(deferred.msg, /round 3/);
+  assert.match(deferred.msg, /pending_tool_use/);
+
+  const budget = engineDiagnosticNotice({
+    type: 'budget_below_working_set', round: 5, budgetTokens: 9000, workingSetTokens: 15000,
+    suggestedBudgetTokens: 24000, attempts: 3, repeatStreak: 2, foldLayersOverBudget: 1,
+  });
+  assert.ok(budget);
+  assert.equal(budget.level, 'warn', '预算装不下工作集 ⇒ run 提前收尾，是异常，必须 warn');
+  for (const needle of ['15000', '9000', '3', '24000']) {
+    assert.ok(budget.msg.includes(needle), `文案里必须有「${needle}」，实得：${budget.msg}`);
+  }
+
+  const conflict = engineDiagnosticNotice({
+    type: 'config_override_conflict', conflicts: [{ path: 'run.maxRounds', key: 'maxRounds' }],
+  });
+  assert.ok(conflict);
+  assert.equal(conflict.level, 'warn', '配置冲突 = 宿主代码 bug ⇒ warn');
+  assert.match(conflict.msg, /run\.maxRounds/);
+  // 数组缺席 ≠ 零条冲突（引擎只在 >0 时才发）⇒ 写 ?，不拿 0 冒充（#283）
+  assert.match(engineDiagnosticNotice({ type: 'config_override_conflict' }).msg, /conflict: \?/);
+  // 脏 path 过形状闸（#261）
+  const dirtyPath = engineDiagnosticNotice({ type: 'config_override_conflict', conflicts: [{ path: { x: 1 } }] });
+  assert.doesNotMatch(dirtyPath.msg, /\[object Object\]/);
+  assert.match(dirtyPath.msg, /\(\?\)/);
+});
+
 test('E2 run_outcome 每轮都有 ⇒ 走 info，不许刷成 warn（否则 warn 面被淹）', () => {
   const n = engineDiagnosticNotice({
     type: 'run_outcome', rounds: 12, judgeRecordCount: 3,
@@ -94,7 +126,7 @@ test('E5 非诊断类型返回 null（本模块不许什么都接，否则每轮
   }
 });
 
-test('E6 【防推测键】本模块接的 5 类，已安装引擎必须真发（源码对账）', (t) => {
+test('E6 【防推测键】本模块接的 8 类，已安装引擎必须真发（源码对账）', (t) => {
   const root = engineRootOrNull();
   if (!root) return t.skip('未安装 erix-agent，无从对账');
   const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
@@ -102,7 +134,9 @@ test('E6 【防推测键】本模块接的 5 类，已安装引擎必须真发�
   const records = read('src/loop/judge-record.js');
   // 发射点逐条对：上游哪天不发这类事件，本站这条嘴就该跟着删（留着 = 永不触发的死支）。
   for (const kind of ['compaction_strategy_fallback', 'model_metadata_missing',
-    'persistence_capability_degraded', 'resume_journal_skipped']) {
+    'persistence_capability_degraded', 'resume_journal_skipped',
+    // issue #438 切片 B（0.29.0 的 LoopEvent 新增三类）
+    'compaction_deferred', 'budget_below_working_set', 'config_override_conflict']) {
     assert.match(loop, new RegExp(`type: "${kind}"`),
       `引擎源码里已找不到 type: "${kind}" 的发射点：本站这条嘴该删`);
   }

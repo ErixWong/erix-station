@@ -28,8 +28,13 @@ const CTX_MARKERS = /\/\* #392:context-strategy:start \*\/([\s\S]*?)\/\* #392:co
 
 // ── ① A4：校验器本体的口径 ────────────────────────────────────────────────────
 test('K1 本站现在真传的那份 context 必须过校验（否则 worker 起跑即崩）', () => {
-  assert.deepEqual(collectCompactContextProblems({ strategy: 'fold-statistical' }), []);
-  assert.equal(assertCompactContext({ strategy: 'fold-statistical' }).strategy, 'fold-statistical');
+  // #438 切片 B：真传的是 `{ strategy: 'fold-llm', keepRounds: 6 }`（从 worker 抠，不另抄）。
+  const block = read('worker.js').match(CTX_MARKERS);
+  assert.ok(block, 'worker.js 的 #392:context-strategy 标记没了');
+  const real = new Function('assertCompactContext', `return {${block[1]}}`)(assertCompactContext).context;
+  assert.deepEqual(collectCompactContextProblems(real), [],
+    `worker 真传的那份 context 过不了本站校验：${JSON.stringify(real)}`);
+  assert.equal(assertCompactContext(real).strategy, 'fold-llm');
   assert.deepEqual(collectCompactContextProblems(undefined), [], '不传 context 是合法形态（引擎自己兜底）');
 });
 
@@ -58,8 +63,29 @@ test('K4 省略 = 用引擎默认（本站当前的裁定）；`keepRounds: 0` �
   }), []);
   assert.deepEqual(collectCompactContextProblems({ strategy: 'fold-llm', keepRounds: 0 }), [],
     'keepRounds=0 的含义是「折掉除最后一轮以外的全部」，不是没给');
-  assert.equal(collectCompactContextProblems({ strategy: 'fold-llm', keepRounds: -1 }).length, 1);
-  assert.equal(collectCompactContextProblems({ strategy: 'fold-llm', keepRounds: 'x' }).length, 1);
+  // #438 切片 B（M2.2）：判据是**非负整数**，且必须是**安全整数**。
+  // 四个具名负例（工单 §2 M2.2 点名）：-1 / 1.5 / '3'（字符串）/ NaN，再加安全整数上界。
+  const negatives = [
+    ['-1', -1],
+    ['1.5', 1.5],
+    ["'3'", '3'],
+    ['NaN', NaN],
+    ['MAX_SAFE_INTEGER+1', Number.MAX_SAFE_INTEGER + 1],
+    ['Infinity', Infinity],
+    ['null', null],
+  ];
+  for (const [label, bad] of negatives) {
+    const problems = collectCompactContextProblems({ strategy: 'fold-llm', keepRounds: bad });
+    assert.equal(problems.length, 1, `keepRounds=${label} 应红，实际 ${JSON.stringify(problems)}`);
+    assert.match(problems[0], /^keepRounds must be a non-negative integer/,
+      `keepRounds=${label} 的报错文案要能看出「非负整数」这条口径`);
+    assert.throws(() => assertCompactContext({ strategy: 'fold-llm', keepRounds: bad }), TypeError);
+  }
+  // 正向：0 与 6 都合法（0 是「全折」，不是「没给」）
+  for (const good of [0, 1, 6, Number.MAX_SAFE_INTEGER]) {
+    assert.deepEqual(collectCompactContextProblems({ strategy: 'fold-llm', keepRounds: good }), [],
+      `keepRounds=${good} 应合法`);
+  }
 });
 
 test('K5 上游给本站定的那批默认值都能过（将来写死时不会被自己拦下）', () => {
@@ -123,12 +149,13 @@ test('K7 worker 真的把 context 包在 assertCompactContext 里（删掉那层
     'worker 里的 context 又变成裸对象了 ⇒ 本站侧校验失效，拼错键名重新变成静默');
   // 注入真校验器求值 worker 那段真代码，而不是抄一份字面量
   const context = new Function('assertCompactContext', `return {${block[1]}}`)(assertCompactContext).context;
-  assert.equal(context.strategy, 'fold-statistical');
+  assert.equal(context.strategy, 'fold-llm');
+  assert.equal(context.keepRounds, 6);
 });
 
 // ── ② A2：降级事实的出口 ─────────────────────────────────────────────────────
-test('K8 fold-statistical（本站现状）下五键全缺席 ⇒ 不出告警，不许凭空造一条', () => {
-  assert.equal(foldDegradeNotice({ strategyName: 'fold-statistical', foldedRounds: 12 }), null);
+test('K8 `fold-llm` 产出合格摘要时五键全缺席 ⇒ 不出告警，不许凭空造一条', () => {
+  assert.equal(foldDegradeNotice({ strategyName: 'fold-llm', foldedRounds: 12 }), null);
   assert.equal(foldDegradeNotice({ foldSummary: {} }), null, '产出了合格摘要 ⇒ 不该有 warn');
   assert.equal(foldDegradeNotice(undefined), null);
   assert.equal(foldDegradeNotice({

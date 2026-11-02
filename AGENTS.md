@@ -2901,7 +2901,8 @@ unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRou
   不动 `package.json` 的 `version`；不新增依赖。
 
 **待办（主 agent）**：
-- **切片 B（已立项，工单 `.work-orders/erix-agent-0.29-sliceB.md`）**：① 事件承接面按**已安装引擎的 `LoopEvent`
+- ~~**切片 B（工单 `.work-orders/erix-agent-0.29-sliceB.md`）**~~ ✅ **已落地，见 §8.83**（2026-11-02）：
+  ① 事件承接面按**已安装引擎的 `LoopEvent`
   联合类型**重新对账（`compaction_deferred` / `config_override_conflict` / `budget_below_working_set`，以及只在
   `onEvent` 里出现、不在 typedef 联合里的 `continuity_injection_skipped` —— 要接就三处都接，要豁免就写理由，
   不允许「豁免表空着」）；② 折叠策略 `fold-statistical` → **`fold-llm`** 并**显式**传 `keepRounds: 6`（决策者
@@ -2917,3 +2918,80 @@ unknown runToolLoop option: "maxRounds" (its canonical home is config.run.maxRou
   ① `fold-statistical` 的替代物照旧进请求与账本；② `usage.context_window` 与 `max_tokens` 仍按元数据走；
   ③ judge 的 `judgeDoneAdvisory` 仍注入。⚠ 本片**动 `runner/`** ⇒ 必须重建 FDE 镜像 + `docker rm -f` 让
   reconcile 重建（§8.17：`ensureFdeContainer` 不检镜像漂移）。
+
+### 8.83 切片 B：事件承接面对齐 0.29 的 19 类 + 折叠策略切 **`fold-llm`**（显式 `keepRounds: 6`）（issue #438，2026-11-02，分支 `feat-261102-02-erix-agent-0.29-sliceB`）
+
+**本节收口 §8.82 末尾那条「待办：切片 B」**：① 事件承接面已按**已安装引擎的 `LoopEvent` 联合类型**重新对账；
+② 折叠策略已切 `fold-llm` 并显式传 `keepRounds: 6`。发版号与真机结论仍留主 agent（见本节末）。
+
+**载荷与落点**
+
+- **承接面清单不再手抄**：`portal/test/event-surface-contract.test.js` 的 `ENGINE_PROMISED_EVENTS` 从
+  `runner/node_modules/erix-agent/src/loop/orchestrator.js` 的 `LoopEvent` `@property` 联合类型**解析**得到
+  （0.29.0 = **19 类**），解析不到就**抛**（整文件红），不许退化成硬抄清单——手抄清单正是这次的病灶
+  （16 类那份不会自己红）。发射点扫描面 = 引擎 `src/` 下**全部 `.js`**（`attempt`/`recovering`/`recovered`
+  在 `loop/provider-runner.js`、`run_outcome` 的记录体在 `loop/judge-record.js`）。
+- **逐类三桶决定**（测里是三张表，每条都要么进时间线、要么写理由）：
+  - **进时间线**（三处集合 + 中英双语标签）：新增 `compaction_deferred`、`budget_below_working_set`；
+  - **只订不回放**：`usage`（运行态语义事件，#89 红线）；
+  - **显式豁免**：`run_outcome`（0.29 下与 `run_end` 的重叠关系复核仍成立）、`config_override_conflict`
+    （本站只写 `config.<组>.<叶>` ⇒ 结构上不可能；账在 runner warn LOG）、`continuity_injection_skipped`
+    （**经 `onEvent` 真发但不在联合类型里**；本站不传 continuity ⇒ 注入分支进不去）。
+- **联合类型之外真发的还有两个**：`continuity_written` / `continuity_write_failed`（续接块的写者那一半，
+  `config.continuity.handoff=off` ⇒ 不发）——**故意不订**，理由写在测里的 `NOT_SUBSCRIBED` 表。
+- **运维的嘴**（`runner/lib/engine-notices.js`）：`compaction_deferred` = **info**（每轮可能一条的正常推迟）、
+  `budget_below_working_set` = **warn**（预算装不下工作集、run 提前收尾）、`config_override_conflict` = **warn**
+  （宿主代码 bug）。数字缺 ⇒ `?`（#283），外来标识符过形状闸（#261），`conflicts` 缺席写 `?` 不写 `0`。
+- **折叠策略**：`runner/worker.js` 的 `#392:context-strategy` 块现在是
+  `assertCompactContext({ strategy: 'fold-llm', keepRounds: 6 })`（两个值都在标记区间内，`fold-strategy.test.js`
+  按锚点抠块求值并**注入真 `assertCompactContext`**，§8.73 口径）。
+- **判据翻向、强度只增**：`fold-strategy.test.js` B1 钉「策略名 = `fold-llm`」+「`keepRounds` **必须在场且 = 6**」
+  （删掉那一行必须红——它测的是**显式写**，不是「引擎缺省也是 6」）+「除这两项外一个键都不许有」；
+  B2 逐个钉四个上限（`summarizerTimeoutMs` / `firstByteTimeoutMs` / `maxSummaryBytes` / `maxSummaryTokens`）、
+  `workingSetRecentRounds`、`foldAtRatio` **仍然不在场**；B3 钉 `config.continuity` / `continuityProvider` 不传。
+  `compact-knobs.test.js` K4 把 `keepRounds` 的负例补齐（`-1` / `1.5` / `'3'` / `NaN` / 超安全整数 / `null`），
+  正向钉 `0` 合法（= 全折，不能按 `>0` 判）。
+
+**成本口径**（写清楚，别让下一个人以为折叠是免费的）
+
+- 摘要器 = **本 run 的主力 provider / 同一模型**，摘要那一发**并入 run 总账**并转发宿主 `onUsage`
+  ⇒ 界面上的 token 数**与 LiteLLM 的 spend 都会涨**（涨的是「折叠一次 = 一次额外 LLM 调用」这份钱）。
+- 摘要那一发的 `maxTokens = min(宿主 maxTokens, context.maxSummaryTokens ?? 1400)`（erix-agent #493）
+  ⇒ 本站按窗口算出来的 `max_output_tokens` 在摘要这条路上**不再说了算**（方向是变严）。
+- 摘要在**轮循环之外** ⇒ **不计轮次、不参与 stall 判定**（erix-agent #167 那段注释的口径）。
+- 本站**仍不传**那四个上限（上游缺省即本站裁定值，§8.73），也不给 env 旋钮：策略与尾窗不是运维参数。
+
+**§8.73 三条闸门的状态**
+
+1. 上游六张 PR（#482/#487/#488/#489/#490/#493）随 **0.29.0 已发版** ⇒ **① 满足**；
+2. ② 隔离实例跑真长会话看 `foldSummary.degradeKind` / `finishReason` / 摘要字节数 / 横幅三件是活的
+   —— **`TODO(主 agent)`**（本片只做仓库内判据，不碰真机）；
+3. ③ 量住「每轮多花多少时间」与「每次多嗂多少字节」 —— **`TODO(主 agent)`**。
+
+②③ 量不过 ⇒ **一行退回** `fold-statistical`（`worker.js` 那个块 + `fold-strategy.test.js` B1 + 本节；
+`fold-notes-e2e.test.js` 的 E1/E2/E6 与 `session-view-fold.test.js` 的 B4 会跟着红，正好提醒你它们也要改）。
+
+**已知边界**（事实，不是排期）
+
+- **摘要器失败在 0.29 是 degrade 不是终态**：`foldSummary.degradeKind ∈ {timeout, context_window_exceeded,
+  error, empty_summary}`，run 照旧跑完、模型拿到机械摘要；上游 main 已把这条改成终态错误 ⇒ **0.30 未发布**，
+  届时升级要重核 `runner/lib/engine-notices.js` 的 A2 出口与 `fold-notes-e2e.test.js` 的 E8。
+- 实测一条口径：走**引擎默认 provider 摘要器**时「摘要器回空文本」先被它自己拦成
+  `default fold-llm summarizer returned no text`（不带 `summarizer_empty_summary` 码）⇒ 分类是 **`error`**；
+  `empty_summary` 只在宿主注入的 summarizer 直接返回空串时可达（`fold-llm.js#assertUsableSummary`）。
+- `compaction` 事件里的 `foldSummary` **不含 `source`**（`compact/pipeline.js:228-232` 明确只收诊断信号；
+  `source` 在轮记录 `foldedFacts.source` 上）⇒ 谁在事件上读 `foldSummary.source`，谁就是在造第二个
+  `unshrinkable`（永不触发的推测键）。判据：`fold-notes-e2e.test.js` E7 的 `hasOwn` 反向断言。
+- `foldedFacts.origin` 的值域是 `mechanical|semantic|host`（**不是**字面量 `llm`）：`source: 'llm'` ⇒ `semantic`。
+- 跨端边界（同 #349）：前端 jsdom 里跑不了引擎，也不许给 `portal/frontend` 加 `erix-agent` 依赖
+  ⇒ A2 的**前端**文案只能用「runner 侧真跑实测出来的键面」钉，形状本身由 runner 侧真跑用例守着。
+
+**待办（主 agent）**
+
+- 发版号：`TODO(主 agent)`；真机结论：`TODO(主 agent)`。
+- 真机（五个 `fde-*` 重建后容器内 `erix-agent` 必须是 0.29.0）：跑一次真会话确认 ① 折叠**真走 `fold-llm`**
+  （`run_events` 里 `compaction.compaction.strategyName = "fold-llm"`、`layers.foldLlm.triggered = 1`）；
+  ② 会话笔记目录里 `fold-*.json` 的 tags 是 `['fold','src:llm']`；③ `usage` 与 LiteLLM spend 的增量对得上
+  （摘要那一发也算钱）；④ 事件行显示「策略 fold-llm」。
+- ⚠ 本片**动 `runner/`** ⇒ 必须重建 FDE 镜像 + `docker rm -f` 让 reconcile 重建（§8.17：`ensureFdeContainer`
+  不检镜像漂移）。

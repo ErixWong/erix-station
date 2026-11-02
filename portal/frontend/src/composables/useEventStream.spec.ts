@@ -565,6 +565,43 @@ describe('useEventStream（mock EventSource）', () => {
       .toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
   });
 
+  // #438 切片 B（M3.3）：上面那条用的是**手写**形状；这一条用**真链路实测到的键面**。
+  // 真形状（`runner/test/fold-notes-e2e.test.js` 的 E7/E8 用真 `runToolLoop` + `fold-llm` 跑出来的）：
+  //   · 成功那次：`foldSummary` 里**没有 `source`**（引擎 `compact/pipeline.js:228-232` 明确不进事件），
+  //     只可能有 `inputTruncated` / `droppedMessages` / `finishReason` / `inputTokens` / `outputTokens`；
+  //   · 降级那次：`degradeKind` + `degradeReason`，**没有** `degraded: true`（旧夹具里的 `degraded`
+  //     是 #482 时代的形状，0.29 的真事件不带它）。
+  // 跨端不能直连（jsdom 里跑不了引擎、也不许给前端加 erix-agent 依赖，`engine-upgrade-299` 判据①），
+  // 所以这里用「真键面 + 真值」钉文案，形状本身由 runner 侧那两条真跑用例守着。
+  it('A2 真链路键面（无 degraded 键、只有 degradeKind/degradeReason）也能拼出降级后缀', () => {
+    const sepTexts = (payload: Record<string, unknown>) => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.connect('sess-1');
+      lastES().emit('compaction', { round: 1, compaction: payload });
+      return hooks.onSep.mock.calls.map((c) => c[0])[0] as string;
+    };
+    const realSuccess = {
+      foldedRounds: 21, tokensBefore: 5857, tokensAfter: 1692, strategyName: 'fold-llm',
+      // 真成功形态：摘要输入被 token 守卫裁过（6k 窗口下的真实情形）
+      foldSummary: { inputTruncated: true, droppedMessages: 21, finishReason: 'end_turn' },
+    };
+    expect(sepTexts(realSuccess)).toBe(
+      '上下文折叠（round 1，策略 fold-llm）：21 轮折叠，5857 → 1692 tokens（⚠ 摘要输入被裁（丢 0 轮 / 21 条，据不完整材料写成））',
+    );
+    const realDegraded = {
+      foldedRounds: 21, tokensBefore: 5857, tokensAfter: 1692, strategyName: 'fold-llm',
+      // 真降级形态：只有 degradeKind（没有 degraded 键）
+      foldSummary: { degradeKind: 'timeout', degradeReason: 'summarizer timed out' },
+    };
+    const line = sepTexts(realDegraded);
+    expect(line).toContain('摘要已降级：timeout');
+    expect(line).not.toContain('summarizer timed out'); // kind 优先，整句不进横幅
+    // 无降级且无任何裁剪 ⇒ 逐字回到旧文案（历史回放里的旧事件不得多出一段括号）
+    expect(sepTexts({ foldedRounds: 21, tokensBefore: 5857, tokensAfter: 1692, strategyName: 'fold-llm' }))
+      .toBe('上下文折叠（round 1，策略 fold-llm）：21 轮折叠，5857 → 1692 tokens');
+  });
+
   it('judge 分隔行带 variant=judge，其余状态行（round/compaction 等）不带', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
