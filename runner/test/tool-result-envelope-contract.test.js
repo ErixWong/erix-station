@@ -55,12 +55,15 @@ async function runOneToolCall(executeTool) {
   const events = [];
   await runToolLoop({
     provider,
-    initialUserMessage: 'noop please',
-    completion: false,
     executeTool,
     store,
-    runId: 'envelope-run',
     onEvent: (event) => { if (event?.type === 'tool_result') events.push(event); },
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `initialUserMessage` /
+    // `completion` / `runId` 现在启动期就抛）；观察者/端口仍是顶层。
+    config: {
+      input: { initialUserMessage: 'noop please' },
+      run: { runId: 'envelope-run', completion: false },
+    },
   });
   assert.equal(events.length, 1, '桩 run 必须恰好产生一次 tool_result 事件');
   const rounds = await store.load('envelope-run');

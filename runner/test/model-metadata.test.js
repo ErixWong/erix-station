@@ -36,17 +36,41 @@ const PARAMS_MARKERS = /\/\* #309:engine-model-params:start \*\/([\s\S]*?)\/\* #
 
 /**
  * 求值 worker 的装配段：`engineModelMetadata`（resolveModelMetadata 的返回值，snake_case）
- * → 真传给引擎的 `{ modelMetadata?, maxTokens? }`。
- * 元数据缺失时 worker 走 `: {}` ⇒ 这里得到空对象 = 「什么都不传」= 现状行为；
- * 若 worker 改成「硬塞 0」，这里就会带出 0（正是变异 c 要红的地方）。
+ * → 真传给引擎的 `config` 片段（erix-agent 0.28.0 起扁平写法启动期抛，数据只能住在
+ * `config.<组>.<叶>`：这两个值现在的住址是 `config.metadata.modelMetadata` 与
+ * `config.tuning.maxTokens`；`config.metadata.task` 与前者同组，所以求值时要喂 `task`）。
+ * 元数据缺失时 worker 走 `: {}` ⇒ `metadata` 里没有 `modelMetadata` 键、`tuning` 里没有
+ * `maxTokens` 键 = 「什么都不传」= 现状行为；若 worker 改成「硬塞 0」，这里就会带出 0
+ * （正是变异 c 要红的地方）。
+ * ⚠ 判据强度不变：本函数仍求值 worker.js 里的**真代码**（不另抄字面量），只是把它放回它
+ *   真正的住址（`config` 对象内）再返回。
  */
+const TASK_TEXT = 'go';
 function workerEngineModelParams(engineModelMetadata) {
   const src = read('worker.js');
   const block = src.match(PARAMS_MARKERS);
   assert.ok(block,
     'worker.js 必须有一对配对的 `/* #309:engine-model-params:start|end */` 标记：'
     + '标记没了 = 装配点被搬走或删了，本文件的判据会静默失去对象（宁可先红在这里）');
-  return new Function('engineModelMetadata', `return {${block[1]}}`)(engineModelMetadata);
+  return new Function('engineModelMetadata', 'task', `return { config: {${block[1]}} };`)(
+    engineModelMetadata, TASK_TEXT,
+  );
+}
+
+/**
+ * 从 worker 装配出来的 `config` 片段里取出**模型元数据面**（`metadata.modelMetadata` +
+ * `tuning.maxTokens` 这两个叶子）——「什么都不传」= 两个键都不在。
+ * 判据口径与 0.26.0 时代逐字等价（那时是 `assert.deepEqual(params, {})`：整个装配段为空），
+ * 只是 0.28 之后 `task` 与 modelMetadata 同住 `metadata` 组，所以不能再拿「整个对象为空」当判据。
+ */
+function modelParamsOf(params) {
+  const config = params?.config ?? {};
+  const metadata = config.metadata ?? {};
+  const tuning = config.tuning ?? {};
+  return {
+    ...(Object.hasOwn(metadata, 'modelMetadata') ? { modelMetadata: metadata.modelMetadata } : {}),
+    ...(Object.hasOwn(tuning, 'maxTokens') ? { maxTokens: tuning.maxTokens } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -120,16 +144,20 @@ async function runOnce({ models, extraParams = {}, withComputeBudget = false }) 
     result = await runToolLoop({
       provider,
       store: makeStore(),
-      runId: TRANSCRIPT_KEY,
-      maxRounds: 4,
-      stream: true,
-      completion: false,
-      initialUserMessage: 'go',
       // 本桩一轮就 end_turn，不会真调工具；但 0.20.0 的装配口**强制要求** executeTool
       // （orchestrator.js:546 `assembly port is missing methods: executeTool`），缺了就测不到下游。
       executeTool: async () => { throw new Error('harness: no tool call expected'); },
       onEvent: (event) => events.push(event),
-      ...params,
+      // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `runId` / `maxRounds` /
+      // `stream` / `completion` / `initialUserMessage` 现在**启动期就抛**）。观察者/端口仍是顶层。
+      config: {
+        input: { initialUserMessage: 'go' },
+        run: {
+          runId: TRANSCRIPT_KEY, maxRounds: 4, stream: true, completion: false,
+        },
+        // worker 源码抠出来的那一段（`metadata` / `tuning`）；`extraParams` 覆盖它时同样按组覆盖。
+        ...(params.config ?? {}),
+      },
     });
   } catch (err) {
     error = err;
@@ -197,8 +225,10 @@ test('#309 行为级：会压负预算的元数据（ctx=100000, maxOut=95000）
     models,
     // 反证：把「原样透传」显式装回去（等价变异 b 的效果），必须死在引擎启动期的预算推导上。
     extraParams: {
-      modelMetadata: { contextWindowTokens: 100000, maxOutputTokens: 95000 },
-      maxTokens: 95000,
+      config: {
+        metadata: { modelMetadata: { contextWindowTokens: 100000, maxOutputTokens: 95000 } },
+        tuning: { maxTokens: 95000 },
+      },
     },
   });
   assert.equal(raw.error?.code, 'invalid_budget',
@@ -212,7 +242,7 @@ test('#309 行为级：ctx 缺失支路 ⇒ 请求体里**没有** max_tokens �
     models: { main: { model: 'glm-4.6', type: 'text', max_output_tokens: 4096 } },
   });
   assert.equal(error, undefined);
-  assert.deepEqual(params, {},
+  assert.deepEqual(modelParamsOf(params), {},
     'ctx 读不到时 worker 必须**什么都不传**（改成硬塞 0 就红在这里；见下一条为什么不能塞 0）');
   assert.equal(maxTokensOf(bodies[0]).present, false,
     '没钳到值时请求体里必须整键不在（保持现状：输出上限退回 provider 默认/引擎 4096 口径）');
@@ -225,8 +255,10 @@ test('#309 行为级反证：ctx 缺失时若硬塞 0 ⇒ 引擎 invalid_budget�
   const forced = await runOnce({
     models: { main: { model: 'glm-4.6', type: 'text' } },
     extraParams: {
-      modelMetadata: { contextWindowTokens: 0, maxOutputTokens: 0 },
-      maxTokens: 0,
+      config: {
+        metadata: { modelMetadata: { contextWindowTokens: 0, maxOutputTokens: 0 } },
+        tuning: { maxTokens: 0 },
+      },
     },
   });
   assert.equal(forced.error?.code, 'invalid_budget',
@@ -270,7 +302,7 @@ test('#316 行为级【#316 判据本体】：context_window 存成数字串 ⇒
     { context_window: 262144, max_output_tokens: 32768, clamped: false, clamped_from: 32768 },
     '前置诊断：数字串窗口经入口归一后必须过纯函数（这里拿到 null = #316 复发）');
   assert.equal(typeof engineModelMetadata.context_window, 'number', '递给引擎的必须是 number，不是原字符串');
-  assert.deepEqual(params, {
+  assert.deepEqual(modelParamsOf(params), {
     modelMetadata: { contextWindowTokens: 262144, maxOutputTokens: 32768 },
     maxTokens: 32768,
   }, 'worker 装配段必须传出这对值（空对象 = 压缩又静默关了）');
@@ -289,7 +321,7 @@ test('#316 行为级：真小数窗口（配错）依旧走「什么都不传」
     withComputeBudget: true,
   });
   assert.equal(error, undefined, '配错元数据最多让压缩关掉，绝不能把 run 弄死');
-  assert.deepEqual(params, {}, '真小数 ⇒ 入口就丢掉 context_window ⇒ 整对不传（不 floor、不兜 0）');
+  assert.deepEqual(modelParamsOf(params), {}, '真小数 ⇒ 入口就丢掉 context_window ⇒ 整对不传（不 floor、不兜 0）');
   assert.equal(maxTokensOf(bodies[0]).present, false, '请求体里整键不在（= 现状）');
   assert.equal(missingEvents(events).length, 1, '压缩关掉仍可观测：恰好一条一次性诊断事件');
 });
@@ -414,7 +446,7 @@ test('#309-2b 行为级【判据本体】：ctx=1001/2000/2666 走真闸 ⇒ 不
       + `而引擎的答复是真实的 invalid_budget）；实际 code=${String(error?.code)} message=${String(error?.message)}`);
     assert.equal(engineModelMetadata, null,
       `前置诊断：ctx=${meta.context_window} 经真闸必须是 null（闸没接到 = 本单白做）`);
-    assert.deepEqual(params, {}, 'worker 的装配段必须真的**什么都不传**（改成硬塞钳后值就红在这里）');
+    assert.deepEqual(modelParamsOf(params), {}, 'worker 的装配段必须真的**什么都不传**（改成硬塞钳后值就红在这里）');
     assert.ok(bodies.length > 0, 'run 至少走了一轮（桩收到了请求）');
     assert.equal(maxTokensOf(bodies[0]).present, false,
       `ctx=${meta.context_window}：请求体里必须**没有** max_tokens 键（= 现状：输出上限退回 provider 默认）`);
@@ -431,8 +463,10 @@ test('#309-2b 行为级反证：同一组小窗口若硬把钳后值塞进 model
     models: { main: { model: 'glm-4.6', type: 'text', context_window: 1001, max_output_tokens: 1000 } },
     withComputeBudget: false, // 纯函数仍会钳到 250（无闸），但这里直接覆盖装配段，模拟「把钳后值交出去」
     extraParams: {
-      modelMetadata: { contextWindowTokens: 1001, maxOutputTokens: 250 },
-      maxTokens: 250,
+      config: {
+        metadata: { modelMetadata: { contextWindowTokens: 1001, maxOutputTokens: 250 } },
+        tuning: { maxTokens: 250 },
+      },
     },
   });
   assert.equal(forced.error?.code, 'invalid_budget',

@@ -113,13 +113,17 @@ async function crashWithPendingTool({ tools, replayPolicy, toolName, callId = PE
   const executedDuringCrash = [];
   await runToolLoop({
     provider: toolThenDoneProvider(toolName, callId),
-    initialUserMessage: 'go',
-    completion: false,
     tools,
-    maxRounds: 8,
-    replayPolicy,
     store,
-    runId: TRANSCRIPT_KEY,
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `initialUserMessage` /
+    // `completion` / `maxRounds` / `replayPolicy` / `runId` 现在**启动期就抛**）。
+    // `replayPolicy` 的值仍是 `workerReplayPolicy()` 从 worker.js 源码里抠出来的真值。
+    config: {
+      input: { initialUserMessage: 'go' },
+      run: {
+        runId: TRANSCRIPT_KEY, resume: false, maxRounds: 8, completion: false, replayPolicy,
+      },
+    },
     executeTool: async (options) => {
       executedDuringCrash.push(options.id);
       abort.abort(); // 命令还在跑就被宿主叫停（watchdog 误杀 / 进程被 SIGKILL 的等价形态）
@@ -137,13 +141,13 @@ async function resumeFromPending({ store, tools, replayPolicy }) {
   const events = [];
   const result = await runToolLoop({
     provider,
-    completion: false,
     tools,
-    maxRounds: 8,
-    replayPolicy,
     store,
-    runId: TRANSCRIPT_KEY,
-    resume: true,
+    config: {
+      run: {
+        runId: TRANSCRIPT_KEY, resume: true, maxRounds: 8, completion: false, replayPolicy,
+      },
+    },
     executeTool: async (options) => {
       resumeExecuted.push(options.id);
       return 'REPLAYED BY ENGINE';
@@ -310,9 +314,17 @@ test('#288：shell 的工具定义必须**显式**声明 replay:"unsafe"（顶�
 test('#288 刻意保守：上游 createFileTools 未标注 replay ⇒ 5 个文件工具挂起时同样不重放（不是漏配）', async () => {
   const upstreamRequire = createRequire(import.meta.url);
   const pkgRoot = path.dirname(path.dirname(upstreamRequire.resolve('erix-agent')));
-  const upstreamSrc = fs.readdirSync(path.join(pkgRoot, 'src', 'tools'))
-    .map((f) => fs.readFileSync(path.join(pkgRoot, 'src', 'tools', f), 'utf8'))
-    .join('\n');
+  // erix-agent 0.29.0 在 `src/tools/` 下新增了**子目录** `delegation/`（派生工具面，本站不接）：
+  // 旧的 `readdirSync` 平铺读法会对目录调 `readFileSync` ⇒ EISDIR。改成**递归**收集 `.js`，
+  // 判据强度不变（仍是「上游工具源码里一个 `replay:` 标注都没有」），且覆盖面比原来更大
+  // （子目录里的工具定义也一起被扫到）。
+  const collectToolSources = (dir) => fs.readdirSync(dir, { withFileTypes: true })
+    .flatMap((entry) => {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) return collectToolSources(full);
+      return entry.name.endsWith('.js') ? [fs.readFileSync(full, 'utf8')] : [];
+    });
+  const upstreamSrc = collectToolSources(path.join(pkgRoot, 'src', 'tools')).join('\n');
   assert.match(upstreamSrc, /createFileTools|file-tools/i, '上游文件工具源码要读得到（包结构变了就更新本读点）');
   assert.doesNotMatch(upstreamSrc, /\breplay\s*:/,
     'erix-agent 0.18.0 的上游工具源码里没有任何 replay 标注。若将来上游标了 safe，'
@@ -344,11 +356,13 @@ test('#288：replay 是引擎元数据，不得渗进送给模型的工具定义
   const provider = endTurnProvider();
   await runToolLoop({
     provider,
-    initialUserMessage: 'go',
-    completion: false,
     tools: [...fileSchemas(), shellSchema()],
-    maxRounds: 4,
-    replayPolicy: workerReplayPolicy(),
+    config: {
+      input: { initialUserMessage: 'go' },
+      run: {
+        maxRounds: 4, completion: false, replayPolicy: workerReplayPolicy(),
+      },
+    },
     executeTool: async () => 'x',
   });
   assert.ok(provider.requests.length >= 1, '桩 provider 必须收到过请求');

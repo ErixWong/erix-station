@@ -233,10 +233,16 @@ test('#351 真 runToolLoop 贯通：崩溃→追问→resume→**再 resume**，
   const toolCallId = 'call-crash-1';
   await runToolLoop({
     provider: { async chat() { return { content: [{ type: 'tool_use', id: toolCallId, name: 'shell', input: { command: 'sleep 240' } }], stopReason: 'tool_use' }; } },
-    initialUserMessage: 'go', completion: false, tools: [shellSchema()], maxRounds: 6,
-    replayPolicy: 'per-tool-declaration', store, runId: KEY,
+    tools: [shellSchema()], store,
     executeTool: async () => { abort.abort(); return 'outcome never recorded'; },
     signal: abort.signal,
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平写法现在启动期就抛）。
+    config: {
+      input: { initialUserMessage: 'go' },
+      run: {
+        runId: KEY, maxRounds: 6, completion: false, replayPolicy: 'per-tool-declaration',
+      },
+    },
   }).catch(() => {});
 
   const crashRound = Math.max(...rows.map((r) => r.round ?? 0));
@@ -251,9 +257,13 @@ test('#351 真 runToolLoop 贯通：崩溃→追问→resume→**再 resume**，
   // 第 2 趟：resume（不再要工具 ⇒ 直接收尾）
   const resumed = await runToolLoop({
     provider: { async chat() { return { content: [{ type: 'text', text: 'done' }], stopReason: 'end_turn' }; } },
-    completion: false, tools: [shellSchema()], maxRounds: 6,
-    replayPolicy: 'per-tool-declaration', store, runId: KEY, resume: true,
+    tools: [shellSchema()], store,
     executeTool: async () => 'not used',
+    config: {
+      run: {
+        runId: KEY, resume: true, maxRounds: 6, completion: false, replayPolicy: 'per-tool-declaration',
+      },
+    },
   }).catch((error) => ({ error }));
 
   assert.equal(resumed?.error?.code ?? resumed?.error, undefined,
@@ -273,9 +283,13 @@ test('#351 真 runToolLoop 贯通：崩溃→追问→resume→**再 resume**，
 
   const third = await runToolLoop({
     provider: { async chat() { return { content: [{ type: 'text', text: 'again' }], stopReason: 'end_turn' }; } },
-    completion: false, tools: [shellSchema()], maxRounds: 6,
-    replayPolicy: 'per-tool-declaration', store, runId: KEY, resume: true,
+    tools: [shellSchema()], store,
     executeTool: async () => 'not used',
+    config: {
+      run: {
+        runId: KEY, resume: true, maxRounds: 6, completion: false, replayPolicy: 'per-tool-declaration',
+      },
+    },
   }).catch((error) => ({ error }));
   assert.equal(third?.error?.code ?? third?.error, undefined,
     '第 3 趟 resume 必须成功——这一步才真正区分「折了」与「没折」：不折时引擎看到的序列里'

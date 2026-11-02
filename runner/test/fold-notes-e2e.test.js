@@ -34,11 +34,18 @@ const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
 const PARAMS_MARKERS = /\/\* #309:engine-model-params:start \*\/([\s\S]*?)\/\* #309:engine-model-params:end \*\//;
 
-/** 生产同一条元数据装配式（与 model-metadata.test.js 同款技法，不另抄字面量）。 */
+/**
+ * 生产同一条元数据装配式（与 model-metadata.test.js 同款技法，不另抄字面量）。
+ * erix-agent 0.28.0 起这一段住在 `config` 里（`config.metadata.modelMetadata` /
+ * `config.tuning.maxTokens`，`task` 与前者同组）⇒ 求值时把它放回 `config` 对象内再返回。
+ */
+const TASK_TEXT = '继续收尾';
 function workerEngineModelParams(engineModelMetadata) {
   const block = read('worker.js').match(PARAMS_MARKERS);
   assert.ok(block, 'worker.js 的 #309:engine-model-params 标记没了，本片失去被测对象');
-  return new Function('engineModelMetadata', `return {${block[1]}}`)(engineModelMetadata);
+  return new Function('engineModelMetadata', 'task', `return { config: {${block[1]}} };`)(
+    engineModelMetadata, TASK_TEXT,
+  );
 }
 
 /** 造 n 轮真形态历史（user → tool_use → tool_result），文本足够长以便真折得动。 */
@@ -89,18 +96,24 @@ async function runFoldingScene({ semanticEnabled = true } = {}) {
   const result = await runToolLoop({
     provider,
     store,
-    runId: sessionId,
-    maxRounds: 8,
-    completion: false,
-    initialMessages: historyRounds(14),
-    initialUserMessage: '继续收尾',
     executeTool: async () => 'noop 结果',
     ...(semanticEnabled ? { semanticStateProvider } : {}),
-    // ⚠ **顶层**选项：引擎从 options 解构 `onFoldSummary`，`context` 里只认 `strategy`。
-    // 塞错一层就是本文件头注释里那条死光纤。
+    // ⚠ **顶层**选项：引擎从 options 解构 `onFoldSummary`，折叠壳（`config.folding.context`）
+    // 里只认数据键。塞错一层就是本文件头注释里那条死光纤。
     onFoldSummary: sink.onFoldSummary,
-    ...workerEngineModelParams({ context_window: 6000, max_output_tokens: 200 }),
-    context: { strategy: 'fold-statistical' },
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `runId` / `maxRounds` /
+    // `completion` / `initialMessages` / `initialUserMessage` / `context` 现在启动期就抛；
+    // `initialMessages` 的叶子名是 `config.input.messages`，唯一登记过的别名）。
+    config: {
+      input: {
+        messages: historyRounds(14),
+        initialUserMessage: '继续收尾',
+      },
+      run: { runId: sessionId, maxRounds: 8, completion: false },
+      folding: { context: { strategy: 'fold-statistical' } },
+      // 生产同一条元数据装配式（metadata / tuning 两组）
+      ...workerEngineModelParams({ context_window: 6000, max_output_tokens: 200 }).config,
+    },
   });
 
   const requestsText = provider.requests.map((r) => JSON.stringify(r ?? {}));

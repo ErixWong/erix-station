@@ -47,18 +47,21 @@ test('① 真引擎在 store 写失败时经 diagnostics.error 上抛 persistenc
   const seen = [];
   await runToolLoop({
     provider: textProvider(),
-    initialUserMessage: 'go',
-    completion: false,
     tools: [],
-    maxRounds: 2,
     store: brokenStore(),
-    runId: TRANSCRIPT_KEY,
     // 引擎的装配口缺一格就整条 run 起不来（实测 `assembly port is missing methods: executeTool`
     // ——那样 diagnostics 一次都不会被调，①会变成「通道不存在」的假红，所以必须给全）
     executeTool: async () => 'ok',
-    // 重试与退避压到最小：本用例要的是「失败之后上报了什么」，不是重试次数
-    retry: { attempts: 1, backoffBaseMs: 0, backoffMaxMs: 0 },
     diagnostics: { error: (event) => seen.push(event) },
+    // erix-agent 0.28.0：数据只能写进 `config.<组>.<叶>`（扁平 `initialUserMessage` /
+    // `completion` / `maxRounds` / `runId` / `retry` 现在启动期就抛；`retry` 的家是
+    // `config.timing.retry`）；`diagnostics` 是回调出口，仍是顶层。
+    config: {
+      input: { initialUserMessage: 'go' },
+      run: { runId: TRANSCRIPT_KEY, maxRounds: 2, completion: false },
+      // 重试与退避压到最小：本用例要的是「失败之后上报了什么」，不是重试次数
+      timing: { retry: { attempts: 1, backoffBaseMs: 0, backoffMaxMs: 0 } },
+    },
   }).catch(() => {}); // 落盘失败会让 run 以 persistence 失败收场，终态本身不是本格的断言对象
 
   assert.ok(seen.length >= 1,
