@@ -3239,3 +3239,41 @@ foldToolResultsForRequest(...) → ttlStats.foldedCount > 0
 **修法**：观测面单开一片（工单 `.work-orders/compaction-stats-observability.md`）——读侧从
 `transcript_rounds.record.compactionStats` 聚合出 `session.compaction`（零 DDL、覆盖存量），前端在既有位置给一行
 「压缩：TTL 折 N 条（省 X token）· 窗口折 M 次」。这样「压缩有没有在工作」一眼可见，不必每次翻 SQL。
+
+### 8.88 v0.1.49：`compactionStats` 观测面（#451）—— 压缩有没有在工作，界面上看得见（2026-11-03）
+
+§8.87 那次纠错的落地。**零 DDL、零 runner 改动、纯读侧聚合**。
+
+**载荷**：① 后端 `session-view.js#collectTranscriptFacts` 把「折叠真摘要 / 折叠替代物 / 压缩层聚合」收进
+**同一次** `transcriptRows` 扫描（成本红线：`sessions.js` 只有一处 `FROM transcript_rounds`），
+`getSession` 一次算好既喂投影又挂 DTO `session.compaction = {rounds, layers:{<id>:{triggered,tokensSaved}}, tokensSaved, lastRound}`；
+② 前端 `lib/compactionSummary.ts`（纯函数 + `formatTokenCount` 复用）+ `StreamPanel.vue` 在**既有** `.session-stats`
+行下追加一行，零新增容器、不进 `.syserr`、双语成对。
+
+**三条硬口径**（都有判据）：**并入既有扫描**（不另发 SQL）/ **键缺席而非零**（一条 stats 都没有 ⇒ 整个键不给，
+不是「0 次压缩」）/ **脏数据逐条跳过不炸**（`compactionStats: "oops"` / `layers: null` / `triggered: "abc"` /
+`tokensSaved: -5` 四种形态 ⇒ 跳过该轮、其余照常、HTTP 200）。
+
+**基线**：根 **1755/1751/0/4 → 1767/1763/0/4**（+12）、runner **451 不变**（不动 `runner/`）、
+前端 **53/998 → 54/1012**、`typecheck` rc=0。
+
+**变异**（主 agent 亲跑 3 条 + 源码审查 1 条）：C1 键缺席改成全零对象 ⇒ 判据 2 + HTTP 那条；
+C2 去掉 `triggered > 0` 过滤 ⇒ 4 条 + 一趟扫描那条；**C3 只读 `stats[0]` ⇒ 判据 1 不红（真覆盖缺口，worker 如实报并补
+「同轮多条」用例）**，红在补的判据 4 + 脏数据那条；C4（另起扫描）由源码审查确认（`sessions.js` 只有一处查询）。
+
+**真机验收（v0.1.49，主 agent 亲手）**：会话 `ce0260ca-…`（todo-multi，60 轮量级）的 DTO
+`compaction = {rounds:53, layers:{ttl:{triggered:53, tokensSaved:210481}}, tokensSaved:210481, lastRound:57}`，
+界面 `.session-stats` 那行显示 **`Session compaction: TTL ×53 (saved 210.5k tokens)`**；对照一个没有折叠的会话
+⇒ **整键缺席**（前端一个字节都不渲染）。截图 `/docker/erix_station_playwright/v0149-451-compaction-stats.png`。
+⚠ 这个数**只覆盖最后加载的那一页**（`rounds=53` 是分页窗口内有 stats 的轮数，不是全会话 259 轮的全部）——
+`lastRound=57` 与真库对得上，但「会话累计」这个词在超长会话上是**近似**（读侧只扫当前页的 transcript 行）。
+若将来要精确全会话累计，得单独一条聚合查询（成本红线要重新评估），本片不做。
+
+**发版与部署（v0.1.49）**：`bb0352d`（PR #444）→ `8943156`（版本 0.1.49）→ main CI 绿 → tag `v0.1.49` →
+release `41741485753` success → **只 pin portal + proxy 两个**（`git diff v0.1.48..v0.1.49 -- 'runner/**/*.js'` **为空** ⇒
+`FDE_IMAGE` 故意留在 v0.1.48 摘要 `fe46c38a…`、**不重建 5 台 FDE**）。portal 实跑 `86fd009a…`、`healthz=200`。
+
+**⚠ 前端 3 条 `GitLightBadge.spec.ts` 红第三次出现（worker 环境）**：worker 报「主树同样 3 红」，
+我在**无其他负载**下跑同一 worktree = **54 文件 / 1012 全绿 rc=0**。⇒ 与 §8.63/§8.82 同一形状：
+**worker 跑前端测试时主 agent 并行跑重活**（根测试 / 大 SQL）会把它们压红。口径：派工跑前端期间，
+主 agent 不要并行起重活；看到这类红先自己空载复跑，别改代码。
