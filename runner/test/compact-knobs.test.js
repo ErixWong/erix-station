@@ -165,22 +165,54 @@ test('K8 `fold-llm` 产出合格摘要时五键全缺席 ⇒ 不出告警，不�
   }), null);
 });
 
-test('K9 degradeKind 优先（#487 的封闭枚举，短）；只有 degradeReason 时退回它（#482/#491 的整句）', () => {
-  const both = foldDegradeNotice({
-    strategyName: 'fold-llm', foldedRounds: 46,
-    foldSummary: { degraded: true, degradeKind: 'timeout', degradeReason: '摘要器在 30000ms 内没有回来' },
-  });
-  assert.match(both, /degraded=timeout/);
-  assert.doesNotMatch(both, /摘要器在/, '两个都在时读 kind：整句留给 #392-D 的 tooltip，日志要能 grep');
-  assert.match(both, /strategy=fold-llm/);
-  assert.match(both, /foldedRounds=46/);
-
-  const onlyReason = foldDegradeNotice({ foldSummary: { degraded: true, degradeReason: 'provider 拒绝了请求' } });
-  assert.match(onlyReason, /degraded=provider 拒绝了请求/);
-  // 整句可能很长：留边界，别让一条 warn 变成半页
-  assert.ok(foldDegradeNotice({ foldSummary: { degraded: true, degradeReason: 'x'.repeat(500) } }).length < 300);
+// ── K9 issue #442（erix-agent 0.30.0 / 上游 #661）：**已退役的键不许复活** ─────────────────────
+//
+// 0.29 时代这里钉的是「degradeKind 优先、degradeReason 退回」。#661 把「降级为统计摘要」整条路径
+// 删了：摘要器失败 ⇒ 抛 `KitError("summarizer_failed")` ⇒ run 以 `failed` 收场（一个 compaction
+// 事件都不发）。于是 `foldSummary.degradeKind` / `degradeReason` / `degraded` **再也不会出现**，
+// 读它们的那一支是死分支（本站 0.30.0 起已删）。
+//
+// 本格是那条删除的**判据**，方向反过来了：不是「读得对」，而是「**一个字节都不许再读**」。
+// 变异：把那一支加回 `worker.js#foldDegradeNotice` ⇒ 本格红（证明删除不是靠注释自觉）。
+test('K9 【已退役的键不许复活】degradeKind / degradeReason / degraded 不再被读（0.30 起引擎不生产）', () => {
+  // ① 行为面：喂进去也不出声（这三个键今天只可能是旧数据/旧事件里的残留）
+  for (const retired of [
+    { degraded: true, degradeKind: 'timeout' },
+    { degraded: true, degradeReason: 'provider 拒绝了请求' },
+    { degradeKind: 'error', degradeReason: '整句' },
+  ]) {
+    assert.equal(foldDegradeNotice({ strategyName: 'fold-llm', foldedRounds: 46, foldSummary: retired }), null,
+      `foldSummary 里只有退役键 ${JSON.stringify(retired)} 时不许出告警（那条降级路径已删）`);
+  }
+  // ② 代码面：生产代码（剥掉注释）里这三个键名一个都不许出现。
+  //    `runner/worker.js` 与前端 `compactionDegradeText` 各盯一半（同一口径，两个出口）。
+  const stripComments = (text) => text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n');
+  const sources = [
+    ['runner/worker.js', read('worker.js')],
+    ['portal/frontend/src/composables/useEventStream.ts',
+      fs.readFileSync(path.join(RUNNER_DIR, '..', 'portal', 'frontend', 'src', 'composables', 'useEventStream.ts'), 'utf8')],
+  ];
+  // 只认**属性访问**（`.degradeKind` / `.degraded`）：`persistence_capability_degraded` 与 judge 的
+  // `action === 'degraded'` 都是别的语义，按裸字符串搜会把它们误判成复活。
+  for (const [name, source] of sources) {
+    const code = stripComments(source);
+    for (const retired of ['degradeKind', 'degradeReason', 'degraded']) {
+      const hit = new RegExp(`\\.${retired}\\b`).test(code);
+      assert.equal(hit, false,
+        `${name} 的代码面又读了已退役的 \`.${retired}\`（0.30.0 起引擎不生产它）⇒ `
+        + '那是死分支：要么删掉，要么先证明上游把它加回来了（K12 会先红）');
+    }
+  }
+  // ③ 抽取面同口径：K12 的「本站从 foldSummary 读的键」里也不许有退役键（两格互相兜）
+  assert.deepEqual(keysReadFromStat().filter((key) => FOLD_SUMMARY_KEYS_RETIRED.includes(key)), [],
+    '生产代码仍在读退役键 ⇒ 死分支复活');
 });
 
+// ⚠ issue #442 复核（0.30.0 实测）：`foldSummary.budgetExhausted` 现在**只剩失败路径**那一个写入点
+// （`fold-llm.js:805` 的 `fail(..., { budgetExhausted: true })`，而失败路径不再返回 stat）⇒ 成功路径上
+// 已不可达。工单 §M3 明确要求**保留**这一支（「删了就是丢信号」），故本格继续钉它；处置见报告 §M3。
 test('K10 另外两类非致命事实也要出声：整条步骤预算耗尽（没自愈重试）、输入面被裁；摘要被输出预算截断', () => {
   // 契约 #469①②③：剩余预算不足 2 秒 ⇒ 连「换更短输入自愈重试」都没发生，记 budgetExhausted
   assert.match(foldDegradeNotice({ foldSummary: { budgetExhausted: true } }), /budget_exhausted/);
@@ -195,10 +227,10 @@ test('K10 另外两类非致命事实也要出声：整条步骤预算耗尽（�
   assert.equal(foldDegradeNotice({ foldSummary: { droppedRounds: 0, droppedMessages: 0, inputTruncated: false } }), null,
     '0 与 false 都是「没裁」，不许据此报事（那会把每个正常折叠都刷一条）');
   const all = foldDegradeNotice({
-    foldSummary: { degraded: true, degradeKind: 'context_window_exceeded', budgetExhausted: true, droppedRounds: 7, finishReason: 'max_tokens' },
+    foldSummary: { budgetExhausted: true, droppedRounds: 7, finishReason: 'max_tokens' },
   });
-  assert.equal(all.match(/degraded=|budget_exhausted|input clipped|truncated/g).length, 4,
-    '四类同时发生要一条说全，不要分四条');
+  assert.equal(all.match(/budget_exhausted|input clipped|truncated/g).length, 3,
+    '三类同时发生要一条说全，不要分三条（退役的 degraded 那一支已不在计数里）');
 });
 
 test('K11 worker 的 onEvent 里那条 warn 真接着（且**不改事件**：降级不是 run 失败）', () => {
@@ -221,10 +253,14 @@ test('K11 worker 的 onEvent 里那条 warn 真接着（且**不改事件**：�
 // 上游 main 的契约、`src/` 全文 grep 均零命中），它靠"看起来像 #490 会发的东西"写进了代码、
 // 判据和两份 i18n。后果不是报错而是**永不触发**：一条永不响的告警比没有告警更坏。
 // 键名清单**从两处生产代码里抠**（不手抄），所以改了代码不改进契约面就会红。
+// 0.30.0 起 `degradeKind` / `degradeReason` / `degraded` **退役**（见 K9）：它们从「可读键」清单里
+// 移走，不是因为上游契约删了字段（`pipeline.js` 的投影面还写着），而是因为**没有任何代码路径生产它们**。
+// 留在清单里等于给「复活」发许可。
 const FOLD_SUMMARY_KEYS_PINNED = [
-  'degradeKind', 'degradeReason', 'degraded',
   'budgetExhausted', 'inputTruncated', 'droppedRounds', 'droppedMessages', 'finishReason',
 ];
+/** 已退役（0.30.0）：读它们 = 死分支。K9 盯这一半。 */
+const FOLD_SUMMARY_KEYS_RETIRED = ['degradeKind', 'degradeReason', 'degraded'];
 
 function enginePackageRoot() {
   const engineEntry = createRequire(import.meta.url).resolve('erix-agent');
@@ -254,8 +290,11 @@ function keysReadFromStat() {
 
 test('K12 本站从 foldSummary 读的每个键都在上游契约的字段面里（引擎不发的键 = 一条永不响的告警）', (t) => {
   const keys = keysReadFromStat();
-  assert.ok(keys.length >= 6, `从生产代码里只抠到 ${keys.length} 个键，正则或函数形状变了：${keys.join(', ')}`);
+  // 0.30.0 起剩 5 个（退役的三个不在其中）；下限跟着收，但**不再往下**——再少就是抽取姿势坏了。
+  assert.ok(keys.length >= 5, `从生产代码里只抠到 ${keys.length} 个键，正则或函数形状变了：${keys.join(', ')}`);
   for (const key of keys) {
+    assert.equal(FOLD_SUMMARY_KEYS_RETIRED.includes(key), false,
+      `${key} 是 0.30.0 已退役的键（引擎不再生产）⇒ 读它=死分支（K9 的反向面）`);
     assert.ok(FOLD_SUMMARY_KEYS_PINNED.includes(key),
       `${key} 不在手抄自上游契约（erix-agent main 的 host-consumer-contract.md「compaction stat」那一行）的清单里`
       + ' ⇒ 要么上游改名了，要么本站又在读一个引擎不发的键（unshrinkable 前例）');
@@ -283,9 +322,10 @@ test('K12 本站从 foldSummary 读的每个键都在上游契约的字段面里
 
 // ── ③ issue #440：`config.folding` 组层的两个工具结果旋钮 ──────────────────────────────────────
 //
-// 先核实过引擎**不校**这两个叶子（0.29.0）：它们是 `CONFIG_NAMESPACE_SCHEMA.folding` 的合法叶子
-// （`config-namespace.js:222-223`），所以不撞 unknown-leaf；但 `CONFIG_LEAF_VALUE_RULE_PATHS`
-// （`:569-587`）只登记了 `run.stream` / `continuity.handoff` ⇒ **没有值规则**，读侧是裸 `??` 缺省
+// 先核实过引擎**不校**这两个叶子（0.29.0，0.30.0 复核仍成立）：它们是 `CONFIG_NAMESPACE_SCHEMA.folding`
+// 的合法叶子（`config-namespace.js:222-223`），所以不撞 unknown-leaf；但 `CONFIG_LEAF_VALUE_RULE_PATHS`
+// （`:569-587`）只登记了 `run.stream` / `continuity.handoff`（**0.30.0 起多了一条 `metadata.modelMetadata`**，
+// 那是新增的显式压缩预算叶子 issue #682，与 folding.* 无关）⇒ **没有值规则**，读侧是裸 `??` 缺省
 // （`orchestrator.js:794` / `:703`）⇒ `'6'` / `-1` / `null` 一路静默（`tool-result-ttl.js:241-245`
 // 的 `Number.isFinite` 守卫 + `ttl <= 0 || minTokens <= 0` no-op 会让它**看起来配上了、其实是关的**）。
 // 所以本站自己加一道（与 #469 A4 同一个理由）。
@@ -301,7 +341,10 @@ test('#440-K13 引擎确实不校这两个叶子（判据的依据不过期：�
   //    `CONFIG_LEAF_BINDING`（`"folding.toolResultTtl": "init"`），按字符串搜会把绑定表误判成值规则）
   const nsModule = await import(pathToFileURL(path.join(root, 'src', 'loop', 'config-namespace.js')).href);
   const rulePaths = Object.keys(nsModule.CONFIG_LEAF_VALUE_RULE_PATHS);
-  assert.deepEqual(rulePaths.sort(), ['continuity.handoff', 'run.stream'],
+  // 0.30.0 实测：`metadata.modelMetadata`（issue #682 的显式压缩预算叶子）进了这张表。
+  // 本站不接 `config.metadata.modelMetadata.budgetTokens`（工单 §明确不做），所以它只是**列在这里的事实**，
+  // 不是本站的校验对象——`folding.*` 仍然一个都不在表里（下面那条反向断言继续盯）。
+  assert.deepEqual(rulePaths.sort(), ['continuity.handoff', 'metadata.modelMetadata', 'run.stream'],
     `引擎的值规则表变了（${rulePaths.join(', ')}）：若 folding.* 进了这张表，本站那道 `
     + '`assertFoldingToolResultKnobs` 就该退成注释（别重复造）');
   for (const leaf of ['toolResultTtl', 'toolResultFoldMinTokens']) {

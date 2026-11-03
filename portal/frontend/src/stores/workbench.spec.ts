@@ -2124,6 +2124,25 @@ describe('issue #236：历史投影的终态分隔条（run_termination）', () 
     expect(sepTexts(store)).toEqual(['run 结束：aborted — 已中止']); // 实时那一条，历史项被去重
   });
 
+  // issue #442（erix-agent 0.30.0 / 上游 #476）：兜底标记穿过历史投影 ⇒ 界面多一条**中性**标记行。
+  it('#442 兜底标记：termination.finalTextFallback=true ⇒ 终态条之后再跟一条中性标记（不进红色面）', async () => {
+    stage([termEv('end_turn', 'r1', 9, { forcedFinal: true, finalTextFallback: true })]);
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(sepTexts(store)).toHaveLength(2);
+    expect(sepTexts(store)[1]).toContain('引擎兜底文案');
+    expect(sepTexts(store)[1]).toContain('非模型输出');
+    expect(sysErrTexts(store)).toEqual([]); // 兜底不是故障：不许进红色面
+  });
+
+  it('#442 没有兜底标记 ⇒ 一条都不多（缺席 = 不是兜底，不是 false）', async () => {
+    stage([termEv('end_turn', 'r1', 9, { forcedFinal: true })]);
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(sepTexts(store)).toHaveLength(1);
+    expect(sepTexts(store).some((line) => line.includes('引擎兜底文案'))).toBe(false);
+  });
+
   it('脏载荷：无 run_id / 无 termination.reason / 非对象 ⇒ 一条都不出（不编 reason）', async () => {
     stage([
       { seq: 1, run_id: null, type: 'run_termination', payload: { termination: { reason: 'aborted' } } },

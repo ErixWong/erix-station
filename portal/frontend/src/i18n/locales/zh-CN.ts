@@ -280,6 +280,9 @@ export const zhCN = {
       // 数字没给就 `?`（#283）、外来标识符过形状闸（#261）——调用方已归一，文案不得再编数。
       compactionDeferred: '本轮未折叠：请求尾部是未结清的工具调用（第 {round} 轮，{reason}），下一轮再折',
       budgetBelowWorkingSet: '折叠后仍超预算：工作集 {workingSet} tokens > 预算 {budget} tokens（连续 {attempts} 次），本次 run 提前收尾；引擎建议预算 ≥ {suggested}',
+      // issue #442（erix-agent 0.30.0）：`LoopEvent` 27 类里唯一「进时间线」的新类型。它是随后那次上游 400
+      // 的**唯一归因信号**，所以用中性分隔行（不是红面：「请求已原样发出」不是「本轮已失败」）。
+      userTurnGuardUnrecoverable: '请求视图仍缺 user 轮（回补全失败，第 {round} 轮，{channel}/{reason}）：请求已原样发出，上游可能拒绝它',
       recovering: '重试中（{attempt}/{max}）',
       recovered: '重试成功',
       // issue #321（erix-station）：judge 永远只是**意见**，不是验收——分轴展示（工具审计 / 目标判断 /
@@ -315,20 +318,34 @@ export const zhCN = {
       // #464 A：策略名是引擎写实例上的那个名字（含库层兜底 `sliding-window`），不是配置项原文；
       // 旧事件没这个字段 ⇒ 拿它填一个显式的「未知」，而不是留空让人以为「策略叫不出名字」。
       compactionStrategyUnknown: '未知',
-      // erix-agent #469 后续（A2）：摘要降级在引擎侧是**故意静默**的（只进
+      // erix-agent #469 后续（A2）：折叠事实在引擎侧是**故意静默**的（只进
       // `CompactionStat.foldSummary`，不新增事件类型），不拼这里就只有去看日志的人才知道。
       // `degradeNote` 由本文件拼好（括号整块交给文案，代码不拼标点）。
+      // ⚠ issue #442（erix-agent 0.30.0）：`compactionDegraded`（「摘要已降级：{kind}」）**已删除**
+      // —— 引擎不再生产 `foldSummary.degradeKind`（摘要器失败现在是终局错误，见下面
+      // `runErrorCode.summarizerFailed`）。删掉而不是留着，是为了让「已退役的键不许复活」在 i18n
+      // 这一层也有据可查：想加回来就必须同时改这一行注释与那两条判据。
       compactionDegradeNote: '（⚠ {body}）',
-      compactionDegraded: '摘要已降级：{kind}',
       compactionBudgetExhausted: '摘要预算耗尽（没来得及自愈重试）',
       compactionInputClipped: '摘要输入被裁（丢 {rounds} 轮 / {messages} 条，据不完整材料写成）',
       compactionTruncated: '摘要被输出预算截断',
       finalGuard: 'final guard：{action}{dash}',
       forcedFinal: 'forced final（round {round}）：{reason}',
+      // issue #442（erix-agent 0.30.0 / 上游 #476）：终稿正文是**引擎兜底文案**时的中性标记
+      // （`termination.finalTextFallback === true`）。**中性、不进红色面**：它不是故障，
+      // 是引擎在如实交代「这次收尾没产出正文」。缺这条的用户体验：正文区那段话看起来像模型写的。
+      finalTextFallback: '（本次收尾未产出正文：以上为引擎兜底文案，非模型输出）',
       runEnd: 'run 结束：{reason}{usage}',
       runEndNormal: '正常完成',
       missedRunEnd: '连接中断期间该 run 已结束（详情见运行记录）',
       runFailed: 'run 失败：{code} — {message}',
+      // issue #442（erix-agent 0.30.0 / 上游 #661）：run 级错误码 → 人话。码表在
+      // `lib/terminationReasons.ts#RUN_ERROR_CODE_LABELS`（与 `RUN_RETRYABLE_ERROR_CODES` 同一处，
+      // 单一真相），这里只放文案。缺这条的用户体验：`failed — No summary was produced...`
+      // （引擎原文，英文技术句），用户读不出「这是摘要器的问题，可以重试」。
+      runErrorCode: {
+        summarizerFailed: '压缩摘要器调用失败 ⇒ 本次运行失败（不是降级：上下文没能压缩，重试即可）',
+      },
       // issue #212：失败原因的用户可读标签（双语必须同时补，en.ts 的 `satisfies MessageSchema`
       // 会在漏译时编译报错）。键名故意用引擎 reason 原文（不 camelCase），以便与
       // lib/terminationReasons.ts 的 RUN_END_LABEL_REASONS 逐项对齐。
