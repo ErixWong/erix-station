@@ -16,7 +16,7 @@
 // 协议状态（es/lastSeq/esSessionId/activeRunId/deltaText/toolCards）与事件语义。
 import { reactive, ref } from 'vue';
 import { i18n } from '../i18n';
-import { PERSISTENCE_TERMINATION_REASON, RUN_END_LABEL_REASONS, RUN_FAIL_REASONS, RUN_TERMINATION_SYSERR_REASONS } from '../lib/terminationReasons';
+import { PERSISTENCE_TERMINATION_REASON, RUN_END_LABEL_REASONS, RUN_ERROR_CODE_LABELS, RUN_FAIL_REASONS, RUN_TERMINATION_SYSERR_REASONS } from '../lib/terminationReasons';
 import { getToolResultSummary, formatDuration, isSpecialExecutionStatus } from '../lib/toolSummary';
 import { eventRoundToken, runSegment, toolCardKey, UNKNOWN_ROUND_TOKEN } from '../lib/toolCardKey';
 
@@ -29,7 +29,7 @@ const t = i18n.global.t;
 // ⚠ 本数组是 EventSource 逐类型 `addEventListener` 的**唯一来源**，三处集合（本数组 /
 // HISTORY_REPLAY_TYPES / 后端 `http.js` 的 HISTORY_EVENT_TYPES）各自独立存亡（#288）。
 // 引擎承诺面（`LoopEvent` 联合类型）与本数组的对账**不再靠手抄清单**：`portal/test/event-surface-contract.test.js`
-// 从**已安装引擎源码**里解析那个联合类型（19 类，0.29.0），逐类要求「订得到」，并要求「进回放 / 显式豁免（写理由）」二选一。
+// 从**已安装引擎源码**里解析那个联合类型（27 类，0.30.0），逐类要求「订得到」，并要求「进回放 / 显式豁免（写理由）」二选一。
 export const EVENT_TYPES = [
   'round_start', 'round_end', 'attempt', 'attempt_killed', 'recovering', 'recovered', 'usage',
   'tool_use', 'tool_result', 'assistant_delta', 'reasoning_delta',
@@ -70,6 +70,17 @@ export const EVENT_TYPES = [
   // 发现一次（同 `run_outcome`：订得到但今天没有读者）。理由钉在 `portal/test/event-surface-contract.test.js`
   // 的豁免表里，**不靠巧合漏掉**。
   'continuity_injection_skipped',
+  // issue #442（erix-agent 0.29.0 → 0.30.0）：`LoopEvent` 联合类型从 **19 类涨到 27 类**（+8，无一移除）。
+  // 下面 6 类本站以前一类都订不到（写入侧不过白名单 ⇒ `run_events` 里有行，读侧三个集合里没它）。
+  // 逐类决定见 `portal/test/event-surface-contract.test.js` 的三张表（它从**已安装引擎源码**现算 27 类）：
+  //   · `user_turn_guard_unrecoverable` —— **进时间线**（中性分隔行）：请求视图违反「必须有 user 轮」
+  //     且所有回补都失败 ⇒ 请求**原样发出**，上游多半 400。它是那次 400 的唯一归因信号，必须留痕。
+  //   · `tool_output_aggregate` / `continuity_written` / `continuity_write_failed` /
+  //     `final_guard_extend` / `context_unknown_option` —— **豁免**（订得到、不刷行、不回放），
+  //     理由逐条写在豁免表里（stub 正文已在工具卡片可见 / handoff=off 结构上不产生 /
+  //     本站不传 finalGuard / 本站从不走装配口）。账在 runner 的 LOG（`runner/lib/engine-notices.js`）。
+  'tool_output_aggregate', 'continuity_written', 'continuity_write_failed',
+  'final_guard_extend', 'context_unknown_option', 'user_turn_guard_unrecoverable',
   // issue #370：输入队列快照（steer / follow_up 待发送）。**live-only、不落 run_events**
   // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
   // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
@@ -112,6 +123,12 @@ const HISTORY_REPLAY_TYPES = new Set([
   // `config_override_conflict` 与 `continuity_injection_skipped` **故意不在这里**：前者是启动期配置 bug
   // （账在 LOG），后者本站结构上不可能出现（不传 continuity）——两条豁免理由都写在上面 EVENT_TYPES 段。
   'compaction_deferred', 'budget_below_working_set',
+  // issue #442（erix-agent 0.30.0）：27 类里本站裁定「进时间线」的那一类（其余 5 个新增全部豁免，
+  // 理由在 `portal/test/event-surface-contract.test.js` 的豁免表）。与 `http.js` 的
+  // HISTORY_EVENT_TYPES 同步加——只加一边就是「实时收不到」或「刷新后消失」（#288 老坑）。
+  // 它是展示类、不驱动运行态状态机：红色面仍只由 `run_end` 负责（这条事件本身说的是「请求已原样发出」，
+  // 不是「本轮失败」）。
+  'user_turn_guard_unrecoverable',
 ]);
 
 /** issue #89：run_events 历史端点的事件项（REST 形状，与 SSE data 展开后同构）。 */
@@ -164,6 +181,10 @@ export interface RunTermination {
   // docs/data/model.md §1.7）。**值域由引擎定义**：前端不解释语义、不维护第二份枚举、不参与
   // RUN_FAIL_REASONS 判定，只做失败横幅的原样透出（failReasonText）。
   errorCode?: string;
+  // issue #442（erix-agent 0.30.0 / 上游 #476）：`true` ⇒ 终稿正文是**引擎兜底文案**（不是模型输出）。
+  // 引擎在 `result` 上给这个键；宿主把它落进 `runs.termination`（`finalTextFallback: true`）后，
+  // 实时 `run_end` 与历史 `run_termination` 两路都读得到。**缺席 = 不是兜底**（引擎从不写 false）。
+  finalTextFallback?: boolean;
 }
 
 export interface RunEndPayload {
@@ -228,6 +249,24 @@ function runEndLine(reason: string, termination?: RunTermination | null, usage =
 }
 
 /**
+ * issue #442（erix-agent 0.30.0 / 上游 #476）：**引擎兜底文案**的中性标记。
+ *
+ * 什么时候有：`termination.finalTextFallback === true`（引擎 `makeResult` 在
+ * `forcedFinal === true` **且**终稿正文为空时置的）。含义：这次 run 的终稿正文**不是模型写的**，
+ * 是引擎落的那句固定文案（`FORCED_FINAL_FALLBACK_TEXT`）——它如实交代「本次收尾未产出正文」。
+ *
+ * 三条口径（工单 §M4.2）：
+ *   ① **中性、不进 `.syserr`**：它不是故障，是引擎在如实交代。所以它是**独立一行** `sep`，
+ *      而不是往终态行上贴后缀（终态行在 `reason=failed` 时是红的，混在一起就变成「兜底=报错」）。
+ *   ② **只在 `=== true` 时出现**：缺席 = 不是兜底 ⇒ 一个字节都不多（判据钉了这条）。
+ *   ③ 数据来源：`termination`（实时 `run_end` 载荷 / 历史 `run_termination` 合成项的
+ *      `payload.termination`）——两条路同一个键，宿主不用分叉。
+ */
+function finalTextFallbackMarker(termination?: RunTermination | null): string {
+  return termination?.finalTextFallback === true ? t('stream.event.finalTextFallback') : '';
+}
+
+/**
  * issue #236：历史合成项 `run_termination`（`GET /events/history` 的响应期投影，不落库、不进 SSE）
  * → 展示条目。取词/分级与实时 `run_end` **共用 `runEndLine`**（两路同文案同分级）。
  *
@@ -288,20 +327,20 @@ function judgeOptionalDash(value: unknown, max: number): string {
 // erix-agent #469 宿主侧后续（A2）：折叠摘要「产出了但是次品」的界面出口。
 //
 // 为什么非宿主不可：上游裁定一是「降级**不新增事件类型**，只记进 `CompactionStat.foldSummary`」，
-// 而且这些字段**只有 `fold-llm` 会写**（`fold-statistical` 下五个键全缺席，这是契约不是 bug）——
-// 所以不拼这一段，「折了 46 轮」与「折了 46 轮、但摘要是超时降级的次品」在横幅上逐字一样。
-// 口径与 `runner/worker.js` 的 `foldDegradeNotice`（日志那条）刻意一致：`degradeKind`（#487，短、
-// 封闭枚举）优先，只拿到 `degradeReason`（#482/#491，整句）时退回它，两类超预算事实另计。
+// 而且这些字段**只有 `fold-llm` 会写**（`fold-statistical` 下这些键全缺席，这是契约不是 bug）——
+// 所以不拼这一段，「折了 46 轮」与「折了 46 轮、但摘要输入被裁过」在横幅上逐字一样。
+//
+// ⚠⚠ issue #442（erix-agent **0.30.0** / 上游 #661）：「降级为统计摘要」这条路径**已被删除**
+// ⇒ `foldSummary.degradeKind` / `degradeReason` / `degraded` 再也不会出现，读它们的那一支是**死分支**，
+// 已删。**已退役的键不许复活**（判据 `engineEventSurface.spec.ts` 的「degraded 后缀」一格与
+// `runner/test/compact-knobs.test.js` 的 K9 各盯一半）。摘要器失败现在走**终态红面**
+//（`run_end` 的 `reason=failed` + `errorCode=summarizer_failed`，人话在
+// `RUN_ERROR_CODE_LABELS`），不再是横幅上的一句后缀。
+// 仍然生产、必须留着的是下面这几个键（与 `runner/worker.js#foldDegradeNotice` 逐字同口径）。
 export function compactionDegradeText(stat: unknown): string {
   if (!stat || typeof stat !== 'object') return '';
   const s = stat as Record<string, unknown>;
   const parts: string[] = [];
-  const kind = typeof s.degradeKind === 'string' && s.degradeKind !== ''
-    ? s.degradeKind
-    : (s.degraded === true && typeof s.degradeReason === 'string' && s.degradeReason !== ''
-      ? s.degradeReason
-      : null);
-  if (kind !== null) parts.push(t('stream.event.compactionDegraded', { kind }));
   // 下面两个键名同样必须在上游契约的 `foldSummary` 字段面里存在（`runner/test/compact-knobs.test.js`
   // 的 K12 对账）。这里不写引擎不发的键：前例是 `unshrinkable`，一个本站凭记忆造的字段。
   if (s.budgetExhausted === true) parts.push(t('stream.event.compactionBudgetExhausted'));
@@ -816,9 +855,37 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 代码 bug，账在 runner 的 warn LOG 里，时间线上没有用户可行动的信息。
         return;
       case 'continuity_injection_skipped':
-        // **豁免**：经 `onEvent` 真发、但**不在 `LoopEvent` 联合类型里**（引擎漏登记）。本站不传
-        // `continuity`（`config.continuity.handoff` 默认 `off`、也不传 `continuityProvider`）⇒
-        // 引擎连注入分支都进不去。订它只为将来开 continuity 时不必重新发现一次。
+        // **豁免**：本站不传 `continuity`（`config.continuity.handoff` 默认 `off`、也不传
+        // `continuityProvider`）⇒ 引擎连注入分支都进不去。
+        // issue #442（0.30.0）：它**已进 `LoopEvent` 联合类型**（0.29 时是「联合外真发」，
+        // 理由里的那一半已失效），故豁免理由只剩「本站结构上不产生」这一半。
+        return;
+      // ---- issue #442（erix-agent 0.30.0）：`LoopEvent` 27 类里的 6 个新类型 ----
+      // 载荷形状逐条对着引擎发射点写（不凭记忆造键；推测键的后果是**永不触发**，不是报错）：
+      //   user_turn_guard_unrecoverable {runId?, parentRunId?, round, channel, reason, detail}  orchestrator.js:2716
+      //   tool_output_aggregate        {round, toolUseId, name, action, reason, budgetTokens, …}  run-snapshot-executor.js:218
+      //   final_guard_extend           {round, from_max_rounds, to_max_rounds, guard_extension, …} orchestrator.js:4744 / :4849
+      //   context_unknown_option       {keys:[…], note}                                  assembly.js:999
+      //   continuity_written           {round, …}（handoff 打开才有）                      orchestrator.js:3390
+      //   continuity_write_failed      {round, …}（同上）                                  orchestrator.js:3277/3355/3401
+      case 'user_turn_guard_unrecoverable':
+        // **进时间线**（中性分隔行，不是红面）：它是随后那次上游 400 的**唯一归因信号**——
+        // 引擎在请求发出**之前**就发它，说明「请求视图违反 user 轮不变式、所有回补都失败、请求照原样发出」。
+        hooks.onSep(t('stream.event.userTurnGuardUnrecoverable', {
+          round: noticeNum(d.round),
+          channel: noticeToken(d.channel),
+          reason: noticeToken(d.reason),
+        }));
+        return;
+      case 'tool_output_aggregate':
+      case 'final_guard_extend':
+      case 'context_unknown_option':
+      case 'continuity_written':
+      case 'continuity_write_failed':
+        // **豁免**（理由逐条在 `portal/test/event-surface-contract.test.js` 的豁免表里）：
+        // 前三个在本站结构上不产生（聚合层的 stub 正文本身就在工具卡片里可见 / 本站不传 finalGuard /
+        // 本站从不走 `createAssemblyPort`），后两个要 `config.continuity.handoff` 打开才会走到。
+        // 账在 runner 的 LOG（`runner/lib/engine-notices.js`）——只读日志的人也看得见。
         return;
       case 'recovering':
         observeRound(d.run_id, d.round); // 同 attempt：轮内重试，轮号仍是当前轮（#279）
@@ -926,7 +993,19 @@ export function useEventStream(hooks: EventStreamHooks) {
           const line = runEndLine(reason, d.termination, usage);
           if (line.sysErr) hooks.onSysErr(line.text);
           else hooks.onSep(line.text);
-          if (d.error) hooks.onSysErr(t('stream.event.runFailed', { code: d.error.code, message: d.error.message }));
+          // issue #442：兜底文案标记**单独一行、中性**（不进 `.syserr`：它不是故障）。
+          const fallbackNote = finalTextFallbackMarker(d.termination);
+          if (fallbackNote !== '') hooks.onSep(fallbackNote);
+          if (d.error) {
+            // issue #442（erix-agent 0.30.0）：错误码命中人话表就用它，否则照旧透传引擎原话。
+            // ⚠ **不新增 UI 结构**：仍然是既有的红色 `.syserr` 面 + `code=` 后缀（工单 §M3.3），
+            // 只是把 `{message}` 那一格从引擎英文技术句换成用户读得懂的一句（`summarizer_failed`）。
+            const codeText = typeof d.error.code === 'string' && d.error.code !== ''
+              && Object.hasOwn(RUN_ERROR_CODE_LABELS, d.error.code)
+              ? t(`stream.event.runErrorCode.${RUN_ERROR_CODE_LABELS[d.error.code]}`)
+              : d.error.message;
+            hooks.onSysErr(t('stream.event.runFailed', { code: d.error.code, message: codeText }));
+          }
           activeRunId.value = null;
           hooks.onCurrentRunEnd(d);
         }
@@ -959,5 +1038,8 @@ export function useEventStream(hooks: EventStreamHooks) {
     // historyRunEndEntry（issue #236）：历史合成项 `run_termination` 的取词/分级入口（宿主在
     // **调 replayEvent 之前**分流，与 #300 的 `partial_output` 同一种接法）。
     handleEvent, toolCard, replayEvent, projectToolCard, cardIdentityOfCall, historyRunEndEntry,
+    // issue #442：兜底标记的**唯一取词口**（历史 `run_termination` 合成项那条路由宿主在 workbench 里
+    // 推一条中性 sep；与实时那条共用同一句文案，不许抄第二份）。
+    finalTextFallbackMarker,
   };
 }

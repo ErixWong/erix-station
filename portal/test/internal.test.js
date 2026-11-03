@@ -1616,3 +1616,90 @@ test('#404 心跳落账：超长值截断到列宽 64，不让一个怪 tag 把�
   });
   assert.equal(pool.containers[0].agent_version.length, 64);
 });
+
+// ---------------------------------------------------------------------------
+// issue #442（erix-agent 0.30.0 / 上游 #476）：`final_text_fallback` 的 U2 承接。
+// 判据三件：① 只认 `true`（`false`/脏值 400 —— 缺席才是「不是兜底」）；② 落了库（`runs.termination`
+// 上的宿主 additive 键，零 DDL）；③ 幂等重放对称（同一次终态重放仍判「载荷相同」，不假 409）。
+// ---------------------------------------------------------------------------
+async function finishWith(body) {
+  const { pool, userId, containerId, runId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  const base = {
+    state: 'finished',
+    termination: { reason: 'end_turn', forcedFinal: true },
+    usage: { input_tokens: 3, output_tokens: 1 },
+    rounds: 2,
+    final_text: 'No final text was produced: …',
+  };
+  return { pool, container, user, runId, claimToken, base };
+}
+
+test('#442 final_text_fallback=true ⇒ 落进 runs.termination.finalTextFallback（零 DDL 的宿主 additive 键）', async () => {
+  const { pool, container, user, runId, claimToken, base } = await finishWith();
+  const res = await setRunState(pool, { container, user, runId, claimToken, body: { ...base, final_text_fallback: true } });
+  assert.equal(res.state, 'finished');
+  const stored = pool.runs[0].termination;
+  assert.equal(stored.finalTextFallback, true, '兜底标记没落库 ⇒ 刷新后界面又把它当模型正文');
+  // 引擎自己的键一个都不许被这条落库改掉（只加键，不改值）
+  assert.equal(stored.reason, 'end_turn');
+  assert.equal(stored.forcedFinal, true);
+  // run_end 事件的 payload 也带同一份 termination（实时那条路的数据源）。
+  // ⚠ fake pool 存的是**原始参数**（`internal.js` 传的是 JSON 字符串）⇒ 这里自己 parse。
+  const runEnd = pool.events.find((e) => e.type === 'run_end');
+  const runEndPayload = typeof runEnd?.payload === 'string' ? JSON.parse(runEnd.payload) : runEnd?.payload;
+  assert.equal(runEndPayload?.termination?.finalTextFallback, true,
+    'run_end 载荷里没有兜底标记 ⇒ 实时那条路拿不到（只有刷新后才看得见）');
+});
+
+test('#442 不带 final_text_fallback ⇒ runs.termination 与引擎给的那份**逐字相同**（不多一个键）', async () => {
+  const { pool, container, user, runId, claimToken, base } = await finishWith();
+  await setRunState(pool, { container, user, runId, claimToken, body: base });
+  assert.deepEqual(pool.runs[0].termination, base.termination,
+    '不是兜底时多写了一个键 ⇒ 旧行为被改写（缺席 = 不是兜底）');
+});
+
+test('#442 final_text_fallback 只认 true：false / 脏值 ⇒ 400 validation_failed（缺席才是「不是兜底」）', async () => {
+  for (const bad of [false, 'true', 1, {}, []]) {
+    const { pool, container, user, runId, claimToken, base } = await finishWith();
+    await assert.rejects(
+      () => setRunState(pool, { container, user, runId, claimToken, body: { ...base, final_text_fallback: bad } }),
+      (e) => e instanceof InternalError && e.status === 400 && e.code === 'validation_failed',
+      `final_text_fallback=${JSON.stringify(bad)} 必须被拒（契约只有 true 与缺席两态）`,
+    );
+    assert.equal(pool.runs[0].status, 'running', '被拒的载荷不得推进状态机');
+  }
+});
+
+test('#442 幂等重放对称：带兜底标记的终态重放仍判「载荷相同」（不因为落库多了一个键就假 409）', async () => {
+  const { pool, userId, containerId, runId, sessionId } = seedClaimable();
+  const container = { id: containerId, user_id: userId };
+  const user = { id: userId, login: 'alice' };
+  const ticket = await claimRun(pool, { container, user, capacity: 1, holdMs: 10 });
+  const claimToken = ticket.claim_token;
+  await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
+  // 兜底终态：引擎把 `result.finalText` 换成了那句固定文案，所以 `final_text` 非空（锚点行照旧产生）。
+  const FALLBACK_TEXT = 'No final text was produced: the forced wrap-up request returned no body…';
+  const payload = {
+    state: 'finished',
+    termination: { reason: 'end_turn', forcedFinal: true },
+    usage: { input_tokens: 4, output_tokens: 2 },
+    rounds: 3,
+    final_text: FALLBACK_TEXT,
+    final_text_fallback: true,
+  };
+  const r1 = await setRunState(pool, { container, user, runId, claimToken, body: payload });
+  assert.equal(r1.state, 'finished');
+  // 与 F4 同一条取数路径：终态正文的真相在 transcript 投影（`messages.content` 恒空）⇒ 补上该行。
+  pool.rounds.push(engineRow(sessionId, runId, 4, FALLBACK_TEXT));
+
+  // 同载荷重放 ⇒ 幂等成功。若 `finalTextFallback` 落库后没在比对侧做同一个变换，这里会假 409。
+  const r2 = await setRunState(pool, { container, user, runId, claimToken, body: { ...payload } });
+  assert.equal(r2.state, 'finished');
+  assert.equal(r2.idempotent, true,
+    '同一次终态重放被判成「载荷不同」⇒ 409 run_terminal：agentd 会把重试当失败（假 409）');
+});
