@@ -1237,6 +1237,55 @@ describe('issue #189：折叠段 folded 字段与原文懒加载', () => {
     expect(store.sessionStats).toEqual({ messages: 20, folded: 0 }); // 缺失 → 回退 messages 长度口径
   });
 
+  it('#451 sessionCompaction：详情 DTO 的 compaction 收窄后进 store；键缺席 ⇒ null；切会话/无会话一律清空', async () => {
+    const window = [{ id: 'm0', role: 'user', content: 'x', seq: 1 }];
+    let dto: Record<string, unknown> = {
+      rounds: 2,
+      tokensSaved: 4885,
+      lastRound: 2,
+      layers: {
+        ttl: { triggered: 1, tokensSaved: 3985 },
+        slidingWindow: { triggered: 1, tokensSaved: 900 },
+        foldLlm: { triggered: 0, tokensSaved: 0 },
+      },
+    };
+    mockFetch((url) => {
+      if (url.includes('/events/history')) return { status: 200, body: { events: [], next_cursor: null } };
+      if (url.includes('/api/sessions/s1')) {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null, compaction: dto }, messages: window, last_seq: 1 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    expect(store.sessionCompaction).toEqual({
+      rounds: 2,
+      tokensSaved: 4885,
+      lastRound: 2,
+      layers: {
+        ttl: { triggered: 1, tokensSaved: 3985 },
+        slidingWindow: { triggered: 1, tokensSaved: 900 },
+      },
+    });
+
+    // 旧后端 / 一条 compactionStats 都没有 ⇒ 键缺席 ⇒ null（不是全零对象）
+    dto = undefined as unknown as Record<string, unknown>;
+    await store.openSession('s1');
+    expect(store.sessionCompaction).toBeNull();
+
+    // 脏值（负 tokensSaved）⇒ 归一化成 null，不渲染半截汇总
+    dto = { rounds: 1, tokensSaved: -5, layers: { ttl: { triggered: 1, tokensSaved: 1 } } };
+    await store.openSession('s1');
+    expect(store.sessionCompaction).toBeNull();
+
+    // 离开会话 ⇒ 清空（不得把上一个会话的累计带到下一个会话）
+    dto = { rounds: 1, tokensSaved: 10, lastRound: 1, layers: { ttl: { triggered: 1, tokensSaved: 10 } } };
+    await store.openSession('s1');
+    expect(store.sessionCompaction).not.toBeNull();
+    store.resetSessionView();
+    expect(store.sessionCompaction).toBeNull();
+  });
+
   it('loadFoldedOriginal：200 → loaded(turns)；按 (sessionId, round) 缓存不重发；不同轮各自加载', async () => {
     let calls = 0;
     mockFetch((url) => {

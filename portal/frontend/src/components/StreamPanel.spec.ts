@@ -7,6 +7,8 @@ import { createPinia, setActivePinia } from 'pinia';
 import StreamPanel from './StreamPanel.vue';
 import { useWorkbenchStore } from '../stores/workbench';
 import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
+// #451：会话头部压缩累计行（DTO 归一化走真实纯函数，不在测试里手搓窄类型）
+import { normalizeSessionCompaction } from '../lib/compactionSummary';
 import { i18n, setLocale } from '../i18n';
 
 // issue #101 P2：装配真实 i18n 单例（组件内 useI18n() 需要），本文件多处 mount 统一经此助手。
@@ -726,6 +728,78 @@ describe('issue #189（追加）：会话头部状态行「N 条消息 · 已压
       .toBe('Context compaction has started; open a new session if you need to keep full details');
     expect(wrapper.get('.folded-banner').text()).toContain('Compressed rounds 1–2'); // #375：有 range 只报范围
     expect(wrapper.get('.view-original').text()).toBe('View original');
+    setLocale('zh-CN');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #451：会话头部的「本会话压缩」累计行（引擎 compactionStats 的读侧聚合）。
+// 三条口径：① 键缺席（store.sessionCompaction === null）⇒ 一个字节都不渲染；
+// ② 是本会话累计、双语成对；③ 不进 .syserr（压缩是正常工作，不是故障）。
+// ---------------------------------------------------------------------------
+describe('#451 会话头部「本会话压缩」累计行', () => {
+  function seedCompaction(value: unknown) {
+    const store = useWorkbenchStore();
+    store.sessionId = 's1';
+    store.renderedIds = new Set();
+    store.addMessage({ id: 'm1', role: 'user', content: 'x' });
+    // 走 store 的正式入口（DTO 归一化也在那里，不在测试里手搓窄类型）
+    store.sessionCompaction = normalizeSessionCompaction(value);
+    return store;
+  }
+
+  it('真有折叠 → 一行汇总（层名 + 次数 + 可读 token 单位），且不是 .syserr', () => {
+    seedCompaction({
+      rounds: 82,
+      tokensSaved: 326863,
+      lastRound: 57,
+      layers: {
+        ttl: { triggered: 75, tokensSaved: 314518 },
+        slidingWindow: { triggered: 8, tokensSaved: 12345 },
+        foldLlm: { triggered: 0, tokensSaved: 0 },
+      },
+    });
+    const wrapper = mountPanel();
+    const line = wrapper.get('.session-compaction-stats');
+    expect(line.text()).toBe('本会话压缩：TTL 折叠 75 次（省 314.5k token） · 窗口折叠 8 次（省 12.3k token）');
+    expect(line.classes()).not.toContain('syserr');
+    expect(wrapper.find('.syserr').exists()).toBe(false);
+    // tooltip 说清「累计自几轮 + 最近一次第几轮」（本会话累计，不是本次 run）
+    expect(line.attributes('title')).toBe('累计自 82 轮统计，最近一次在第 57 轮');
+  });
+
+  it('键缺席（null）⇒ 整段不渲染（不是「压缩 0 次」）', () => {
+    seedCompaction(undefined); // 旧后端 / 一条 compactionStats 都没有
+    const wrapper = mountPanel();
+    expect(wrapper.find('.session-compaction-stats').exists()).toBe(false);
+    expect(wrapper.get('.session-stats').text()).toBe('1 条消息');
+  });
+
+  it('全零层不列 + 零省 token 的层不写「省 0 token」', () => {
+    seedCompaction({
+      rounds: 1,
+      tokensSaved: 0,
+      lastRound: 3,
+      layers: {
+        enforceSize: { triggered: 2, tokensSaved: 0 },
+        anchors: { triggered: 0, tokensSaved: 0 },
+      },
+    });
+    const line = mountPanel().get('.session-compaction-stats');
+    expect(line.text()).toBe('本会话压缩：裁剪折叠 2 次');
+  });
+
+  it('切 English：整行即时变英文（无硬编码中文、无中文残留）', () => {
+    seedCompaction({
+      rounds: 2,
+      tokensSaved: 3985,
+      lastRound: 2,
+      layers: { ttl: { triggered: 1, tokensSaved: 3985 } },
+    });
+    setLocale('en');
+    const line = mountPanel().get('.session-compaction-stats');
+    expect(line.text()).toBe('Session compaction: TTL ×1 (saved 4k tokens)');
+    expect(line.attributes('title')).toBe('Aggregated over 2 rounds; last one at round 2');
     setLocale('zh-CN');
   });
 });
