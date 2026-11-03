@@ -722,8 +722,13 @@ async function terminalPayloadMatches(pool, run, body) {
     rounds: run.rounds ?? 0,
     usage: run.usage ?? { input_tokens: 0, output_tokens: 0 },
   };
+  // issue #442：`final_text_fallback` 会以 `finalTextFallback: true` 的形式**落进** stored termination
+  // ⇒ 比较时 incoming 必须做同一个变换，否则同一次终态的重放会被判成「载荷不同」（假 409）。
+  const incomingTermination = body?.termination ?? null;
   const incoming = {
-    termination: body?.termination ?? null,
+    termination: body?.final_text_fallback === true && incomingTermination && typeof incomingTermination === 'object'
+      ? { ...incomingTermination, finalTextFallback: true }
+      : incomingTermination,
     error: body?.error ?? null,
     rounds: body?.rounds ?? 0,
     usage: body?.usage ?? { input_tokens: 0, output_tokens: 0 },
@@ -753,6 +758,15 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
   if (body.title !== undefined && body.title !== null && typeof body.title !== 'string') {
     throw new InternalError(400, 'validation_failed', 'title 必须为字符串', { details: { field: 'title' } });
   }
+  // issue #442（erix-agent 0.30.0 / 上游 #476）：`final_text_fallback` = 「这次终稿是**引擎兜底文案**，
+  // 不是模型输出」。**只在 `true` 时合法**：runner 按契约只在真兜底时才给这个键，缺席 = 不是兜底
+  // （`false` 与缺席在语义上重复，收到 `false` 就是有人把契约读成了三态）。
+  if (body.final_text_fallback !== undefined && body.final_text_fallback !== true) {
+    throw new InternalError(400, 'validation_failed', 'final_text_fallback 只能为 true（缺席 = 不是兜底）', {
+      details: { field: 'final_text_fallback' },
+    });
+  }
+  const finalTextFallback = body.final_text_fallback === true;
 
   if (!termination || typeof termination !== 'object' || !termination.reason) {
     throw new InternalError(400, 'validation_failed', '终态载荷缺 termination.reason');
@@ -781,8 +795,16 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
       throw new InternalError(409, 'lease_lost', 'claim token mismatch or lease expired (run reclaimed)');
     }
 
+    // issue #442：兜底标记**挂在 `runs.termination` 上**（`finalTextFallback: true`），这是零 DDL 的落点：
+    //   * `runs.termination` 是 run 级终态 JSONB，`GET /api/runs/:id` 与历史合成项 `run_termination`
+    //     （`http.js#buildRunTerminationItems`）都**原样透传**它 ⇒ 刷新后界面仍看得见（不是只在实时帧里）；
+    //   * 键名沿用引擎在 result 上的同名键（`finalTextFallback`），一眼能看出它就是
+    //     `result.finalTextFallback` 的宿主落点（与 #370 往 `termination.detail` 补 `steered` 同一族做法：
+    //     宿主 additive 键，**不改 reason、不改引擎语义**）；
+    //   * **只在 true 时写**：不是兜底 ⇒ 落库的 termination 与引擎给的那份逐字相同（旧行为零变化）。
+    const storedTermination = finalTextFallback ? { ...termination, finalTextFallback: true } : termination;
     const payload = {
-      termination,
+      termination: storedTermination,
       usage: usage ?? { input_tokens: 0, output_tokens: 0 },
       rounds: rounds ?? 0,
       attempt: Number(q.rows[0].attempts),
@@ -794,7 +816,7 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
     await client.query(
       `UPDATE runs SET status = $2, termination = $3, usage = $4, rounds = $5, error = $6, ended_at = now()
         WHERE id = $1`,
-      [runId, state, JSON.stringify(termination), JSON.stringify(usage ?? { input_tokens: 0, output_tokens: 0 }), rounds ?? 0, error ? JSON.stringify(error) : null],
+      [runId, state, JSON.stringify(storedTermination), JSON.stringify(usage ?? { input_tokens: 0, output_tokens: 0 }), rounds ?? 0, error ? JSON.stringify(error) : null],
     );
     await client.query(
       `UPDATE run_queue SET status = $2, claim_token = NULL, owner_container_id = NULL, lease_until = NULL, claimed_at = NULL

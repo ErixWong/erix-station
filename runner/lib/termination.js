@@ -97,3 +97,24 @@ export function buildFailureEnvelope({ err, aborted = false, steered = false } =
     rounds: err?.rounds ?? 0,
   };
 }
+
+/**
+ * issue #442（erix-agent **0.30.0** / 上游 #476）：`result.finalTextFallback === true` ⇒ 终稿正文是
+ * **引擎兜底文案**（`FORCED_FINAL_FALLBACK_TEXT`，`src/loop/termination.js:832`），不是模型输出。
+ *
+ * 判据（引擎侧只有一处）：`termination.js` 的 `forcedFinalFallbackApplies()` —— `termination.forcedFinal
+ * === true` **且** 终稿正文 trim 后为空。满足时引擎把 `result.finalText` 换成那句固定文案，并在
+ * **result 上**（不是 termination 上）置 `finalTextFallback: true`。
+ *
+ * 三条口径（工单 §M4.1）：
+ *   ① **只在 `=== true` 时给这个键**（缺席 = 不是兜底）。绝不写 `false`：那会让「旧 runner / 旧引擎
+ *      没有这个字段」与「明确不是兜底」两件事在 DTO 上分不开。
+ *   ② 命名跟既有 `final_text` 走 snake_case（IPC / U2 载荷都是这个风格）。
+ *   ③ 它**不改终态**：兜底是引擎在 `makeResult` 里做的，`verification` 不会因此变好，`reason` 也不变。
+ *
+ * @param {{ finalTextFallback?: unknown }|null|undefined} result `runToolLoop` 的返回值
+ * @returns {{ final_text_fallback: true }|{}} 直接展开进 IPC 信封的对象
+ */
+export function finalTextFallbackField(result) {
+  return result?.finalTextFallback === true ? { final_text_fallback: true } : {};
+}

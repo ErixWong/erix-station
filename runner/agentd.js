@@ -1148,6 +1148,11 @@ async function onWorkerFinished(ctx, msg) {
     usage: msg.usage ?? { input_tokens: 0, output_tokens: 0 },
     rounds: msg.rounds ?? 0,
     final_text: msg.final_text ?? '',
+    // issue #442（erix-agent 0.30.0 / 上游 #476）：worker 只在**真的兜底**时才带这个键（`=== true`）。
+    // 本行**逐字透传**、绝不补 `false`：U2 那边「缺席」与「false」是两件事（缺席 = 不是兜底 /
+    // 旧 worker 不知道这个键）。落点见 `portal/src/internal.js` 的 `finishRun`（写进
+    // `runs.termination.finalTextFallback`，由 `run_termination` 合成项投影给界面）。
+    ...(msg.final_text_fallback === true ? { final_text_fallback: true } : {}),
     // issue #322：标题**归 portal 生成**（`session-title.js` → `title-llm.js` → `llm-chat.js`），worker
     // 侧不再起标题 ⇒ 这个字段现在恒是空串。本行只保留**透传**（契约形状一字未改：旧 portal + 新 agentd
     // 的组合下拿到空串即走降级链），`title` 在 U2 上的口径见 `docs/api/portal.md` §9.6。

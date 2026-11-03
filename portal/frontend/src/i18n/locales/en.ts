@@ -265,6 +265,10 @@ export const en = {
       // go through the shape gate (#261). This text must not invent a number.
       compactionDeferred: 'compaction deferred this round: the request tail is an assistant tool_use without its tool_result (round {round}, {reason}); the next round folds it',
       budgetBelowWorkingSet: 'still over budget after folding: working set {workingSet} tokens > budget {budget} tokens ({attempts} consecutive attempts), so this run ends early; the engine suggests budget >= {suggested}',
+      // issue #442 (erix-agent 0.30.0): the only new LoopEvent type this host puts on the timeline. It is
+      // the sole attribution signal for the upstream 400 that may follow, so it renders as a neutral
+      // separator (not an error line: "the request was sent unchanged" is not "this round failed").
+      userTurnGuardUnrecoverable: 'the request view still has no user turn (every fallback failed, round {round}, {channel}/{reason}): the request was sent unchanged and the upstream may reject it',
       recovering: 'Retrying ({attempt}/{max})',
       recovered: 'Retry succeeded',
       // issue #321 (erix-station): the judge is forever only an **opinion**, never an acceptance — shown on
@@ -304,16 +308,28 @@ export const en = {
       compaction: 'Context compaction (round {round}, strategy {strategy}): {folded} rounds folded, {before} → {after} tokens{degrade}',
       compactionStrategyUnknown: 'unknown',
       compactionDegradeNote: ' (⚠ {body})',
-      compactionDegraded: 'summary degraded: {kind}',
+      // issue #442 (erix-agent 0.30.0): `compactionDegraded` ("summary degraded: {kind}") is **gone** —
+      // the engine no longer produces `foldSummary.degradeKind` (a failing summarizer is now a terminal
+      // error, see `runErrorCode.summarizerFailed` below).
       compactionBudgetExhausted: 'summary budget exhausted (no self-heal retry)',
       compactionInputClipped: 'summary input clipped ({rounds} rounds / {messages} messages dropped; written from incomplete material)',
       compactionTruncated: 'summary truncated at the output budget',
       finalGuard: 'final guard: {action}{dash}',
       forcedFinal: 'forced final (round {round}): {reason}',
+      // issue #442 (erix-agent 0.30.0 / upstream #476): neutral marker for "the final text is the
+      // engine's own fallback, not model output" (`termination.finalTextFallback === true`).
+      // Deliberately neutral (never the red `.syserr` face): it is not a failure.
+      finalTextFallback: '(no final text was produced: the text above is the engine fallback, not model output)',
       runEnd: 'run ended: {reason}{usage}',
       runEndNormal: 'completed normally',
       missedRunEnd: 'This run ended while the connection was interrupted (see run history)',
       runFailed: 'run failed: {code} — {message}',
+      // issue #442 (erix-agent 0.30.0 / upstream #661): run-level error code → plain language. The code
+      // table lives in `lib/terminationReasons.ts#RUN_ERROR_CODE_LABELS` (same file as
+      // `RUN_RETRYABLE_ERROR_CODES`, single source); this block only holds the copy.
+      runErrorCode: {
+        summarizerFailed: 'the compaction summarizer failed, so this run failed (this is not a degraded summary: the context was not compacted; retry)',
+      },
       // issue #212: user-readable labels for the surfaced fail reasons (keys are the raw
       // engine reason strings, not camelCase, so they line up 1:1 with RUN_END_LABEL_REASONS in
       // lib/terminationReasons.ts). issue #236: **every reason except `end_turn`** has a label
