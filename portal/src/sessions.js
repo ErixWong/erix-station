@@ -15,7 +15,7 @@ import {
   buildAiTitlePrompt, generateTitle, resolveTitleLlmProvider,
   TITLE_CONTEXT_MESSAGES, TITLE_CONTEXT_MAX_LEN, TITLE_LLM_MAX_TOKENS, TITLE_LLM_TIMEOUT_MS, TITLE_SYSTEM_PROMPT,
 } from './title-llm.js';
-import { projectSessionMessages } from './session-view.js';
+import { collectTranscriptFacts, projectSessionMessages } from './session-view.js';
 import { projectTranscriptForDisplay } from 'erix-agent';
 import { fetchUserTextTurns } from './session-text.js';
 import { appendUserInputTurn } from './transcript-store.js';
@@ -314,12 +314,17 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
       [durationRunIds],
     )
     : { rows: [] };
+  // #451：`transcript.rows` 只扫这一次——折叠事实与压缩层聚合同源（不另发 SQL）。
+  const facts = collectTranscriptFacts(transcript.rows);
   const projection = projectSessionMessages({
     sessionId,
     anchors: msgs.rows,
     userAnchors: userAnchors.rows,
     transcriptRows: transcript.rows,
     toolCallRows: toolCallDurations.rows,
+    // #451：**同一趟扫描**的产物既喂投影（折叠摘要/折叠替代物），又喂下面的
+    // `session.compaction` 聚合——成本红线：对 `transcript_rounds` 的查询次数不变。
+    facts,
   });
   // #370：未投递的输入队列快照（`queued_messages`）**不在这里取**，由 `http.js handleGetSession`
   // 在 DTO 出口挂上。两个理由，都不是洁癖：
@@ -336,6 +341,10 @@ export async function getSession(pool, { userId, sessionId, limit = 20, messages
       // （fetchSession 内嵌相关子查询：messages 全量行数、含 synthetic、不受下方 limit 分页窗口影响）。
       // fake pool 缺列时置 null（前端按「缺失」回退已加载条数），真库恒为数字。
       message_count: s.message_count == null ? null : Number(s.message_count),
+      // #451：压缩层累计观测（**键缺席而非零**）——一条 `compactionStats` 都没有（或全部层
+      // `triggered === 0`）⇒ 整个键不给：前端据此一个字节都不渲染（不是「0 次压缩」）。
+      // 零 DDL：数据源是引擎已经写进轮记录的 `record.compactionStats`，读侧聚合，存量与新 run 同时覆盖。
+      ...(facts.compaction === null ? {} : { compaction: facts.compaction }),
     },
     messages: projection,
     last_seq: Number(s.last_seq),
