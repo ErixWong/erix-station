@@ -3135,3 +3135,57 @@ portal healthy、`healthz=200` → **重建 5 台 FDE**，全部 `0.1.47 / engin
 **未做 / 待验证**：① TTL 旋钮的 A/B（见上，需要「轮数充足 + 未进入催收尾」的长 run 才能触发 TTL 层）；
 ② `foldedFacts` 的 `origin` / `strategy` / `bytesBefore` 未进 DTO（只有 `source`/`text`/`truncated` 三个够用）；
 ③ 中文界面真机面未单独走（靠 `localeParity` + 组件用例兜底，英文面已真机验）。
+
+### 8.86 v0.1.48：erix-agent 0.29.0 → **0.30.0**（LoopEvent 19→27 / `summarizer_failed` 终局 / `finalTextFallback`）（issue #442，2026-11-03）
+
+⚠ **开工复核推翻了上游文档与我自己工单的前提，这条先记**：上游 `docs/host-upgrade-guide-0.30.0_cn.md` 写
+「0.30.0 就是那个破坏包：16 个导出名被删除」，而 **npm 上发布的 0.30.0 一个都没删**——`exports` 仍指向
+`src/index.js`，16 个名字全在导出面（只挂了 `@deprecated … removed in 0.30` 标记），上游 `origin/main` 的
+`src/index.js` 也还在。包内 `CHANGELOG.md` 自述「`## [0.30.0] - 2026-11-03（未发布 / unpublished）`…the
+published line is 0.29.0」，**与 npm 事实矛盾**（`dist-tags.latest = 0.30.0`，2026-11-03T01:38Z 发布，
+`dist.shasum` 与本地 `npm pack` 的 tgz 同值 ⇒ 不是拉错了包）。⇒ **「安排」与「事实」的又一次分家**：
+指南描述的是「0.30 这个破坏包会删」，而实际发出去的是「只带了摘要器终局那一条 Breaking 的 0.30」。
+本片因此把 M1 的导出面那一半从「仍在导出面就红」改成「**版本章 + 导出面快照对账**」（照字面写会一落地就红），
+**零消费者闸门仍是硬判据**。
+
+**实际载荷**（比指南多，都是我在 `/tmp/ea30/package` 里量出来的）：
+
+| # | 事实 | 本站处置 |
+|---|---|---|
+| 1 | 16 个导出名**仍在**（没删） | 零命中（逐个 grep 7 个目录）+ 新 `portal/test/engine-removed-exports.test.js`（Z0 扫描面 / Z1 零消费者 / Z2 版本章 / Z3 导出面快照 / Z4 名单自洽） |
+| 2 | **`LoopEvent` 19 → 27 类**（+8，零移除） | 逐类三选一：`EVENT_TYPES` +6、`HISTORY_REPLAY_TYPES` +1、`http.js` +1、`engine-notices.js` 5 个 LOG、双语标签；`event-surface-contract.test.js` 三张表 + S6 反向 |
+| 3 | **`summarizer_failed` = 终局错误**（#661） | `reason='failed'` + `errorCode='summarizer_failed'`；**「降级为统计摘要」路径已删** ⇒ 本站 §8.73 的 A2 降级出口读的 `foldSummary.degradeKind` **从此无值 = 死分支**（删；但 `inputTruncated`/`droppedRounds`/`budgetExhausted`/`finishReason` **仍生产，保留**） |
+| 4 | **`finalTextFallback` 是新红利**（#476） | 全链透传：`termination.js` → `worker.js` → `agentd.js` → `internal.js`（只认 `=== true`，落 `runs.termination.finalTextFallback`，**零 DDL**）→ 前端**中性**分隔行（不进 `.syserr`：引擎如实交代不是故障） |
+| 5 | `termination.reason` 字面量 | **零变化**（diff 确认；新增的是 `guardVerdict`/`finalTextFallback`/`deliverablesFailures` 这些附加字段） |
+| 6 | `src/providers/**` | 只有 `anthropic.js` 变（工厂删除）；本站走 OpenAI 兼容 ⇒ 四相超时语义未动 |
+
+**基线**：根 **1736/1732/0/4 → 1755/1751/0/4**（+19）、runner **443 → 451**、前端 **53 文件 / 993 → 998**、
+`typecheck` rc=0。**主 agent 亲跑 6 条变异**全红在具名用例；其中 **V3（把读 `degradeKind` 的函数加回
+`engine-notices.js`）原 10 条全绿 ⇒ 真覆盖缺口**（0.30 起引擎不再生产该键，行为级用例永远喂不出它），
+补一条**源码级判据**（剥注释后不许出现 `degradeKind`）后重放恰 1 条红。
+⚠ **V3 第一次做成了语法错误**（bash 把模板字符串里的 `${...}` 展开了）⇒ `# pass 0` 的红**不算数**，
+重做后才定性（§8.33 那条「红了也要证明红来自你以为的那处改动」）。
+⚠ 前端侧**不需要**额外源码级判据：V5（前端加回读 `degradeKind`）已被既有行为用例拦住（2 条红）。
+
+**发版与部署（v0.1.48）**：`263e643`（PR #443）→ `e3d3485`（版本 0.1.48，六文件 9 增 9 删）→
+main CI `41577347490` 两个 job 全绿 → tag `v0.1.48` → release `41577923228` success →
+清单三镜像 `docker image inspect .Id` **逐个一致**（portal `0ffdc198…` / fde `909ca778…` / proxy `e46e1cff…`）。
+⚠ fde 又是**先拉 `ghcr.nju.edu.cn/...:0.1.48`、再按 digest 拉 ghcr 一次**（第三次同一手法，已成标准动作）。
+`deploy/.env` 三项 pin（备份 `/tmp/deploy.env.bak-0148`）→ `up -d --no-build` ⇒ portal healthy、`healthz=200`
+→ **重建 5 台 FDE**（`--filter label=station.stack=default`，不是 `name=fde-`），全部 `0.1.48 / engine 0.30.0`。
+
+**真机验收（v0.1.48）**：普通多轮 run（12 个 4971 token 文件）⇒ `finished/judge_done`、11 轮、12 个 readFile
+**全唯一、0 重复读**、21 条 toolCall 全带 `resultPreview`、`messages` 2 条正文正常、agentd
+`sse connected` + `sse ping received`、portal 日志无 error/warn ⇒ **零回归**。
+
+**⚠ `folding.toolResultTtl=6` / `toolResultFoldMinTokens=8000` 在 0.30 下**依然一次没触发**（0 条 `compaction` 事件）** ——
+这是**第二次**同结论（§8.85 首次）。不是版本问题：引擎 `shouldSchedule` 要求
+`effectiveMaxRounds - budgetRounds > 2` **且** `lowBudgetPrompted !== true`（`src/compact/pipeline.js:21-26`），
+而多轮任务一旦开始催收尾就关掉 TTL 层。⇒ **这两个旋钮至今没有收益证据**，仍属「待验证的裁定」；
+真要验证必须造「轮数充足 + 全程未催收尾」的 run（另一片）。
+
+**未做（如实记）**：① `summarizer_failed` 终局路径**没做真机注入**（要人为破坏摘要器/网关，风险高于收益）
+——证据在单测（`runner/test/engine-notices.test.js` 的 `summarizerFailureNotice` + 前端 `RUN_ERROR_CODE_LABELS`）；
+② `finalTextFallback` 的**真机造场**（需要 forcedFinal + 终稿空正文）同样未做，证据在
+`runner/test/final-text-fallback.test.js` 与 `internal.test.js` 的落库/幂等用例；③ `budgetTokens` 显式预算未接
+（窗口派生够用，要接得先量差）；④ `verification.guardVerdict` / `deliverables` 结构上不产生，不接。
