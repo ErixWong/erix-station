@@ -91,18 +91,14 @@ const engine = parseEngineLoopEventTypes();
 const ENGINE_PROMISED_EVENTS = engine.types;
 
 /**
- * 引擎**经 `onEvent` 真发、却没进上面那个联合类型**的事件（0.29.0 实测：联合类型漏登记）。
+ * 引擎**经 `onEvent` 真发、却没进上面那个联合类型**的事件。
  *
- * 这条清单同样是**读源码得出的**（下面 S6 逐条 grep 发射点），不是凭记忆。
- * `continuity_injection_skipped`：每轮可能一条，说「续接块本轮没注入」。
- * `continuity_written` / `continuity_write_failed`：续接块的**写者**那一半（`config.continuity.handoff`
- * 打开时才走）。
+ * **0.30.0 起为空集**：0.29 时代这三条（`continuity_injection_skipped` / `continuity_written` /
+ * `continuity_write_failed`）经 `onEvent` 真发但漏登记，0.30.0 把三条全补进了 `LoopEvent` 联合类型
+ * ⇒ 「联合外真发」这个逃生口今天**没有任何成员**。它作为机制保留（S6 逐条验）：将来上游再漏登记一条，
+ * 把名字加进来即可，不必重写判据。
  */
-const ENGINE_UNPROMISED_EVENTS = [
-  'continuity_injection_skipped',
-  'continuity_written',
-  'continuity_write_failed',
-];
+const ENGINE_UNPROMISED_EVENTS = [];
 
 /**
  * **显式豁免表**：订得到、但故意不进时间线也不进回放的类型，必须写理由（#438 口径：
@@ -115,21 +111,35 @@ const ENGINE_UNPROMISED_EVENTS = [
  * · `config_override_conflict`：启动期一次性的配置冲突（`config.*` 与同名扁平键值不同）。本站只写
  *   `config.<组>.<叶>`（切片 A 迁移后的唯一拼写）⇒ **结构上不可能出现**；真响了就是宿主代码 bug，
  *   账在 runner 的 warn LOG（`runner/lib/engine-notices.js`），时间线上没有用户可行动的信息。
- * · `continuity_injection_skipped`：**不在承诺联合类型里**（引擎漏登记，S6 钉这条事实）。本站
- *   `config.continuity` 与 `capabilities.hooks.continuityProvider` 都不传（`handoff` 默认 `off`）
- *   ⇒ 引擎连注入分支都进不去。订它只为将来开 continuity 时不必重新发现一次。
+ * · `continuity_injection_skipped`：本站 `config.continuity` 与 `capabilities.hooks.continuityProvider`
+ *   都不传（`handoff` 默认 `off`）⇒ 引擎连注入分支都进不去。
+ *   ⚠ **0.30.0 复核**：它已进 `LoopEvent` 联合类型（0.29 时「不在 typedef 里」那半句理由**已失效**），
+ *   剩下的一半仍然成立（本站结构上不产生）。
+ * · `continuity_written` / `continuity_write_failed`（0.30.0 新增进联合类型）：续接块的**写者**那一半。
+ *   本站 `config.continuity.handoff=off` ⇒ 引擎不写、不发；`write_failed` 即使真响也有 runner 的 warn LOG。
+ * · `final_guard_extend`（0.30.0 新增）：**guard 专属**。两个发射点（`orchestrator.js:4744` / `:4849`）
+ *   都在 guard 裁决后的扩轮路径上（revise 补跑 / 交付物补齐），本站**不传 `finalGuard`** ⇒ 结构上不产生。
+ * · `context_unknown_option`（0.30.0 新增）：唯一发射点在 `createAssemblyPort`（`assembly.js:999`，
+ *   走 `port.emit`），而**本站从不走装配口**（真链路直连 `runToolLoop`，口径见 `runner/lib/compact-knobs.js`）
+ *   ⇒ 结构上不可能出现。真响了就说明本站开始用装配口且写错了 `context` 子键——那正是 runner warn LOG 的活。
+ * · `tool_output_aggregate`（0.30.0 新增）：单轮工具输出超聚合预算时逐条发（`run-snapshot-executor.js:218`，
+ *   载荷带 `action` / `reason` / `budgetTokens` / `inlineTokens` / `projectedTokens`）。**不刷行**的理由：
+ *   被归档/stub 化的结果**正文本身就在工具卡片里可见**（模型看到的就是那段 stub 文字），时间线再加一行
+ *   是同一件事说两遍；而它每轮可以多条 ⇒ 重型 run 会刷屏。账在 runner 的 info LOG。
  */
 const EXEMPT_FROM_TIMELINE = {
-  run_outcome: '与 run_end 语义重叠且今天无读者；0.29 下重叠关系未变（见上）',
+  run_outcome: '与 run_end 语义重叠且今天无读者；0.29/0.30 下重叠关系未变（见上）',
   config_override_conflict: '启动期一次性配置冲突，本站只写 config.* 故结构上不可能；账在 runner warn LOG',
-  continuity_injection_skipped: '本站不传 continuity（handoff=off 且无 provider）⇒ 注入分支进不去；且不在承诺联合里',
+  continuity_injection_skipped: '本站不传 continuity（handoff=off 且无 provider）⇒ 注入分支进不去（0.30 起它已在联合类型里）',
+  continuity_written: 'handoff=off ⇒ 引擎不会写续接块，也不会发这条；开了 continuity 才需要重看',
+  continuity_write_failed: '同上：只有 handoff 打开后才会走到落盘失败这条；真响也有 runner warn LOG',
+  final_guard_extend: 'guard 专属（两个发射点都在 guard 裁决后的扩轮路径）；本站不传 finalGuard ⇒ 结构上不产生',
+  context_unknown_option: '唯一发射点在 createAssemblyPort，本站从不走装配口 ⇒ 结构上不产生；账在 runner warn LOG',
+  tool_output_aggregate: 'stub 正文已在工具卡片里可见（重复），且每轮可多条 ⇒ 不刷行；账在 runner info LOG',
 };
 
-/** 引擎真发、本站**故意不订**的事件（不进 `EVENT_TYPES`），每条也要有理由。 */
-const NOT_SUBSCRIBED = {
-  continuity_written: '续接块的写者那一半：config.continuity.handoff=off ⇒ 引擎不会写，也不会发',
-  continuity_write_failed: '同上：只有 handoff 打开后才会走到落盘失败这条',
-};
+/** 引擎真发、本站**故意不订**的事件（不进 `EVENT_TYPES`）。0.30.0 起**为空**。 */
+const NOT_SUBSCRIBED = {};
 
 function literalsIn(source, marker) {
   const start = source.indexOf(marker);
@@ -233,17 +243,23 @@ test('S5 反向防推测键：承诺清单里的每一类引擎都真发（读�
     `引擎源码里找不到这些类型的发射点 ⇒ 本站的监听/展示是永不触发的死支（推测键），该删：${dead.join(', ')}`);
 });
 
-test('S6 联合类型之外还有引擎真发的事件：逐条有决定，`continuity_injection_skipped` 单独钉住', () => {
+test('S6 联合类型之外还有引擎真发的事件：逐条有决定（0.30.0 起该清单为空，三条 continuity 已进联合）', () => {
   // 0.29.0 实测：`continuity_injection_skipped` 经 `onEvent` 真发、**不在** `LoopEvent` 联合类型里。
-  // 这条判据把「事实」和「决定」分开钉：事实（引擎真发 / 不在联合里）读源码得出，决定（豁免理由）在表里。
+  // **0.30.0 复核（#442）**：上游把三条 continuity 事件全补进了联合类型 ⇒ 「联合外真发」清单**空集**。
+  // 这条判据把「事实」和「决定」分开钉：事实（引擎真发 / 在不在联合里）读源码得出，决定（豁免理由）在表里。
   for (const type of ENGINE_UNPROMISED_EVENTS) {
     assert.equal(engineEmits(type), true,
       `引擎源码里找不到 type: "${type}" ⇒ 本清单过期了（引擎不发它了，本站的订/豁免都该删）`);
     assert.equal(ENGINE_PROMISED_EVENTS.includes(type), false,
       `${type} 已经进了 LoopEvent 联合类型 ⇒ 请把它从 ENGINE_UNPROMISED_EVENTS 移到承诺清单（并重看它的决定）`);
   }
-  assert.ok(ENGINE_UNPROMISED_EVENTS.includes('continuity_injection_skipped'),
-    '`continuity_injection_skipped` 必须留在「联合外真发」清单里：它经 onEvent 真发但没进 typedef');
+  // 0.30.0 的事实：三条 continuity 事件**都在**联合类型里（0.29 时它们在外面）。
+  // 这条钉住「逃生口是空的」这个前提：将来若真有人往 `ENGINE_UNPROMISED_EVENTS` 里加东西，下面会提醒他重看。
+  for (const type of ['continuity_injection_skipped', 'continuity_written', 'continuity_write_failed']) {
+    assert.ok(ENGINE_PROMISED_EVENTS.includes(type),
+      `${type} 在 0.30.0 的 LoopEvent 联合类型里（实测）⇒ 它不能走「联合外真发」那条豁免路`);
+    assert.equal(engineEmits(type), true, `引擎源码里找不到 type: "${type}" 的发射点 ⇒ 它成了推测键`);
+  }
   // 每一条都要么订了（并写豁免理由），要么在 NOT_SUBSCRIBED 里写明为什么不订
   const live = liveSet();
   for (const type of ENGINE_UNPROMISED_EVENTS) {

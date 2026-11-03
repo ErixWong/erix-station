@@ -20,7 +20,8 @@
 //     摘要正文）⇒ 注的正文/来源必须是 `llm` 形态，`foldedFacts.origin` 从 `mechanical` 变 `semantic`；
 //   · `compaction` 事件里的 `strategyName` / `foldSummary.source` / `foldedRoundRange` 是**真折叠**的
 //     形状（界面横幅与事件行读的就是这几个键）；
-//   · 摘要器失败时引擎走**真降级**形态（`degradeKind`）⇒ 宿主的 A2 告警出口被真事件驱动一次。
+//   · 摘要器失败时引擎**不再降级**（0.30.0 / #661）：run 以 `failed` / `summarizer_failed` 收场，
+//     宿主的 warn 出口（`summarizerFailureNotice`）被真终态驱动一次（E8）。
 //
 // 现场构成：真 `runToolLoop` + 桩 provider（录下每一份请求）+ 内存 store + **真** notes 工厂与
 // **真**投递器（落真临时目录）+ 引擎元数据从 `worker.js` 的 `#309:engine-model-params` 标记里抠出来
@@ -40,6 +41,7 @@ import { createNotesTools } from '../lib/notes-tools.js';
 import { createFoldNoteSink } from '../lib/fold-notes.js';
 import { assertCompactContext } from '../lib/compact-knobs.js';
 import { foldDegradeNotice } from '../worker.js';
+import { summarizerFailureNotice } from '../lib/engine-notices.js';
 
 const RUNNER_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => fs.readFileSync(path.join(RUNNER_DIR, rel), 'utf8');
@@ -314,35 +316,63 @@ test('E7 真折叠发出的 compaction 事件：strategyName=fold-llm，且 fold
     '本现场（cw 6000 / keepRounds 6）摘要输入必被裁；若上游改成不裁，这里的口径要重核');
 });
 
-// ── E8（M3.3）：真 degrade 形态驱动 A2 的两个出口（runner LOG + 前端横幅后缀） ─────────
-test('E8 摘要器真失败 ⇒ 引擎发出 degradeKind 形态，A2 出口被真事件驱动（不是喂字面量）', async () => {
-  // 两形态各跑一次，都是**真 provider 行为**逼出来的：
-  //   · `timeout`：摘要那一发抛 `summarizer_timeout`（`classifyFoldDegradeKind` 的封闭枚举值）；
-  //   · `error`：摘要器回空文本 —— ⚠ 实测口径：走**引擎默认 provider 摘要器**时它先抛自己的
-  //     `default fold-llm summarizer returned no text`（不带 `summarizer_empty_summary` 码），
-  //     所以分类是 `error` 而**不是** `empty_summary`；后者只在宿主注入的 summarizer 直接返回空串时
-  //     才可达（`assertUsableSummary`）。本片按真链路的形状钉。
-  for (const [summarizer, expected] of [['throw', 'timeout'], ['empty', 'error']]) {
-    const { compactionEvents, records } = await runFoldingScene({ summarizer });
-    assert.ok(compactionEvents.length >= 1, `${expected}: 折叠没发生，本格失去对象`);
-    const stat = compactionEvents[0].compaction;
-    assert.equal(stat.foldSummary?.degradeKind, expected,
-      `${expected}: 引擎给的原因分类应与桩 provider 造的一致（实得 ${JSON.stringify(stat.foldSummary?.degradeKind)}）`);
-    // 降级事实的另一半在轮记录上：`foldedFacts.source` 退回 statistical（⇒ origin = mechanical）
-    const facts = records.map((r) => r?.foldedFacts).find((f) => f?.text);
-    assert.ok(facts, `${expected}: 降级时仍应有 foldedFacts（机械替代物）`);
-    assert.equal(facts.source, 'statistical',
-      `${expected}: 降级时 source 必须退回 statistical（否则「有 LLM 摘要」是假的）`);
-    assert.equal(facts.origin, 'mechanical',
-      `${expected}: 降级时 origin 应退回 mechanical（E6 是它的正向对照）`);
-    // A2 的 runner 出口：真事件 → 真告警
-    const notice = foldDegradeNotice(stat);
-    assert.ok(notice, `${expected}: 真降级形态必须让 foldDegradeNotice 出声（否则「降级了」与「没降级」在日志里一样）`);
-    assert.match(notice, new RegExp(`degraded=${expected}`));
-    assert.match(notice, /strategy=fold-llm/);
-    // 降级是**事实**不是终局：run 照旧跑完、注照旧写出（模型拿到的仍是机械摘要）
-    assert.ok(records.length >= 1, `${expected}: 降级不该让 run 没有轮记录`);
+// ── E8（M3.2）：真摘要器失败 ⇒ **run 失败**（0.30.0 / 上游 #661 的终局口径） ────────────────
+//
+// 0.29 时代这一格钉的是「引擎发出 degradeKind 形态、A2 出口被真事件驱动」。**0.30.0 起那条路径没了**：
+// 摘要器失败 ⇒ 引擎抛 `KitError("summarizer_failed")` ⇒ `termination.reason === 'failed'` /
+// `termination.errorCode === 'summarizer_failed'`，**一个 compaction 事件都不发**，那一折一个键都不留。
+// 于是本格改成钉新口径，且仍然**跑真引擎**（不是喂字面量）：
+//   ① 抛错形状：`code === 'summarizer_failed'`、`termination.reason === 'failed'`、
+//      `termination.errorCode === 'summarizer_failed'`、`retryable === false`；
+//   ② 什么都没留下：没有 compaction 事件、轮记录里没有这一折的 `foldedFacts`（不是「降级成机械摘要」）；
+//   ③ 宿主出口：`summarizerFailureNotice` 对这个终态出声（warn），且**别类失败不出声**。
+test('E8 摘要器真失败 ⇒ run 以 failed / summarizer_failed 收场（不再降级），宿主 warn 出口被真终态驱动', async () => {
+  // 两形态各跑一次，都是**真 provider 行为**逼出来的（0.30.0 实测的分类值）：
+  //   · `throw`：摘要那一发抛 `summarizer_timeout` ⇒ `details.kind === 'timeout'`；
+  //   · `empty`：摘要器回空白文本 ⇒ `details.kind === 'empty_summary'`。
+  //     ⚠ 0.29 时代这一格是 `error`（引擎默认摘要器抛自己的 "returned no text"，不带
+  //     `summarizer_empty_summary` 码）；0.30.0 起空摘要**单独归类**成 `empty_summary`
+  //     （`classifyFoldDegradeKind` 的封闭枚举之一）⇒ 本格跟着改，不是放宽。
+  for (const [summarizer, expectedKind] of [['throw', 'timeout'], ['empty', 'empty_summary']]) {
+    let err = null;
+    let scene = null;
+    try {
+      scene = await runFoldingScene({ summarizer });
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, `${expectedKind}: 摘要器失败必须让 run 抛错（0.30 起这是终局错误，不再静默降级）`);
+    // ① 抛错形状（码与终态都由引擎定义，本站只透传）
+    assert.equal(err.code, 'summarizer_failed',
+      `${expectedKind}: 抛错码应为 summarizer_failed（实得 ${JSON.stringify(err.code)}）`);
+    assert.equal(err.retryable, false, `${expectedKind}: 摘要器失败不可重试（引擎给的 retryable: false）`);
+    assert.equal(err.termination?.reason, 'failed',
+      `${expectedKind}: 终态 reason 应为 failed（实得 ${JSON.stringify(err.termination?.reason)}）`);
+    assert.equal(err.termination?.errorCode, 'summarizer_failed',
+      `${expectedKind}: termination.errorCode 应为 summarizer_failed`);
+    // 归因分类住在异常的 details 上（CHANGELOG：degradeKind 那套键搬到 details）
+    assert.equal(err.details?.kind, expectedKind,
+      `${expectedKind}: details.kind 应与桩 provider 造的一致（实得 ${JSON.stringify(err.details?.kind)}）`);
+    // ② 什么都没留下：没有 compaction 事件（失败那一折一个键都不留 ⇒ 界面横幅没有数据源）
+    const scene2 = scene;
+    if (scene2) {
+      assert.equal(scene2.compactionEvents.length, 0,
+        `${expectedKind}: 失败的那一折不许留下 compaction 事件（留下就是把没发生的事报了）`);
+    }
+    // ③ 宿主出口：真终态 ⇒ 一条 warn，且文案说清「这是失败、不是降级」
+    const notice = summarizerFailureNotice({
+      termination: err.termination, error: { code: err.code, details: err.details },
+    });
+    assert.ok(notice, `${expectedKind}: 真终态必须让 summarizerFailureNotice 出声（否则运维只看到裸 failed）`);
+    assert.equal(notice.level, 'warn');
+    assert.match(notice.msg, /THIS RUN FAILED/);
+    assert.match(notice.msg, /not a degraded statistical summary/);
+    assert.match(notice.msg, new RegExp(`kind=${expectedKind}`));
   }
+  // 反向：别的失败（普通 provider 错、用户停止）不许被这条嘴吞成「摘要器失败」
+  assert.equal(summarizerFailureNotice({ termination: { reason: 'failed' }, error: { code: 'llm_error' } }), null);
+  assert.equal(summarizerFailureNotice({ termination: { reason: 'aborted' }, error: { code: 'aborted' } }), null);
+  assert.equal(summarizerFailureNotice({}), null);
 });
 
 // ── E9：本文件的桩 provider 靠**引擎摘要 system 文案**认出「摘要那一发」 ─────────────

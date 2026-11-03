@@ -549,6 +549,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       renderedIds.value.add(id);
     }
     entries.value.push(entry.kind === 'syserr' ? { kind: 'syserr', text: entry.text } : { kind: 'sep', text: entry.text });
+    // issue #442（erix-agent 0.30.0 / 上游 #476）：这次 run 的终稿是**引擎兜底文案** ⇒ 再推一条**中性**
+    // 分隔行（不进 `.syserr`：兜底不是故障，是引擎在如实交代「本次收尾未产出正文」）。
+    // 取词与实时 `run_end` 共用 `useEventStream#finalTextFallbackMarker`（同一句，不抄第二份）；
+    // 幂等跟着上面那条 `termination:<run_id>` 走（同一条 run 只会到这里一次）。
+    const payload = (ev.payload !== null && typeof ev.payload === 'object') ? ev.payload as Record<string, unknown> : {};
+    const termination = payload.termination;
+    const fallbackNote = es.finalTextFallbackMarker(
+      termination !== null && typeof termination === 'object' ? termination as { finalTextFallback?: boolean } : null,
+    );
+    if (fallbackNote !== '') entries.value.push({ kind: 'sep', text: fallbackNote });
   }
 
   /** 实时 `run_end` 已渲染过这条 run 的终态行 ⇒ 登记幂等键（防 #306 补拉 / 重开会话的历史项再出一条）。 */

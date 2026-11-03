@@ -232,6 +232,78 @@ describe('useEventStream（mock EventSource）', () => {
     expect(allLines.every((line) => !line.includes('code='))).toBe(true);
   });
 
+  // issue #442（erix-agent 0.30.0 / 上游 #661）：`summarizer_failed` 是**新增的终局错误码**
+  // —— 摘要器失败不再静默降级成统计摘要，而是让 run 以 `failed` 收场。用户看到的不能只是引擎那句
+  // 英文技术文本，必须有一句人话（「压缩摘要器调用失败 ⇒ 本次运行失败（可重试）」）。
+  // ⚠ 口径：**不新增 UI 结构**（仍是既有红色 `.syserr` + `code=` 后缀），只换 `{message}` 那一格。
+  it('run_end 失败横幅（#442）：summarizer_failed 走人话（码仍原样带出）；未知码照旧透传引擎原话', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.activeRunId.value = 'run-1';
+    lastES().emit('run_end', {
+      seq: 1, run_id: 'run-1',
+      termination: { reason: 'failed', errorCode: 'summarizer_failed' },
+      error: { code: 'summarizer_failed', message: 'No summary was produced: the summarizer returned no text.' },
+    });
+    const lines = hooks.onSysErr.mock.calls.map((c) => String(c[0]));
+    // ① 终态行仍然带 code=（既有 #261 后缀面，一字未改）
+    expect(lines.some((l) => l.includes('code=summarizer_failed'))).toBe(true);
+    // ② 错误信封那一行是人话，不是引擎英文原句
+    const detail = lines.find((l) => l.startsWith('run 失败：summarizer_failed'));
+    expect(detail).toBeDefined();
+    expect(detail).toContain('压缩摘要器调用失败');
+    expect(detail).toContain('重试');
+    expect(detail).not.toContain('No summary was produced');
+    // ③ 未知码不许被这张表吞掉：照旧把引擎原话透传出来（不编翻译）
+    hooks.onSysErr.mockClear();
+    s.activeRunId.value = 'run-2';
+    lastES().emit('run_end', {
+      seq: 2, run_id: 'run-2',
+      termination: { reason: 'failed' },
+      error: { code: 'llm_error', message: 'boom' },
+    });
+    expect(hooks.onSysErr).toHaveBeenLastCalledWith('run 失败：llm_error — boom');
+  });
+
+  // issue #442（erix-agent 0.30.0 / 上游 #476）：`finalTextFallback === true` ⇒ 终稿是**引擎兜底文案**。
+  // 判据（工单 §M4.2/M4.3）：
+  //   ① 有标记 ⇒ 多**一行中性 sep**（不进 `.syserr`：兜底不是故障）；
+  //   ② 无标记 ⇒ 一个字节都不多（缺席 = 不是兜底）；
+  //   ③ `false` / 脏值也不算兜底（引擎从不写 false，但 DTO 可能被旧数据/手工注入污染）。
+  it('run_end 兜底标记（#442）：finalTextFallback=true ⇒ 一行中性标记；缺席/false/脏值 ⇒ 一个字节都不多', () => {
+    const runOnce = (termination: Record<string, unknown>) => {
+      const hooks = makeHooks();
+      const s = useEventStream(hooks);
+      s.connect('sess-1');
+      s.activeRunId.value = 'run-1';
+      lastES().emit('run_end', { seq: 1, run_id: 'run-1', termination });
+      return {
+        sep: hooks.onSep.mock.calls.map((c) => String(c[0])),
+        sysErr: hooks.onSysErr.mock.calls.map((c) => String(c[0])),
+      };
+    };
+    const withFallback = runOnce({ reason: 'end_turn', forcedFinal: true, finalTextFallback: true });
+    const marker = withFallback.sep.filter((line) => line.includes('引擎兜底文案'));
+    expect(marker).toHaveLength(1);
+    expect(marker[0]).toContain('非模型输出');
+    // 中性：它绝不能出现在红色面里（兜底不是故障）
+    expect(withFallback.sysErr.some((line) => line.includes('引擎兜底文案'))).toBe(false);
+    // 反向：没有这个键 ⇒ 不多一行
+    const plain = runOnce({ reason: 'end_turn', forcedFinal: true });
+    expect(plain.sep.filter((line) => line.includes('引擎兜底文案'))).toHaveLength(0);
+    // `false` 与脏值同样不算兜底
+    for (const dirty of [false, 'true', 1, {}]) {
+      const line = runOnce({ reason: 'end_turn', finalTextFallback: dirty });
+      expect(line.sep.filter((l) => l.includes('引擎兜底文案')), JSON.stringify(dirty)).toHaveLength(0);
+    }
+    // 与 failed 红面共存时：红面照旧红，标记照旧中性（两行各在各的面里）
+    const failed = runOnce({ reason: 'failed', errorCode: 'summarizer_failed', finalTextFallback: true });
+    expect(failed.sysErr.some((l) => l.includes('run 结束：failed'))).toBe(true);
+    expect(failed.sep.some((l) => l.includes('引擎兜底文案'))).toBe(true);
+    expect(failed.sysErr.some((l) => l.includes('引擎兜底文案'))).toBe(false);
+  });
+
   // 技术细节不进 i18n（工单 #261B）：英文界面下同样原样透出，不新增词条、不回落中文。
   it('run_end 失败横幅（#261）：en 界面下 code 片段同形（不进 i18n）', () => {
     setLocale('en');
@@ -531,10 +603,14 @@ describe('useEventStream（mock EventSource）', () => {
     ]);
   });
 
-  // erix-agent #469 宿主侧后续（A2）：降级只进 `CompactionStat.foldSummary`、**不新增事件类型**（上游
-  // 裁定一），不拼这一段就只能让人看出「折了 46 轮」而看不出「那 46 轮的摘要是超时降级的次品」。
-  // 同时钉住「没降级时逐字不变」：历史回放里的旧事件不得多出一段括号。
-  it('compaction 分隔行把 foldSummary 里的降级事实拼出来（无降级时逐字不变）', () => {
+  // erix-agent #469 宿主侧后续（A2）：折叠事实只进 `CompactionStat.foldSummary`、**不新增事件类型**
+  // （上游裁定一），不拼这一段就只能让人看出「折了 46 轮」而看不出「那份摘要是基于被裁过的材料写的」。
+  // 同时钉住「无事实时逐字不变」：历史回放里的旧事件不得多出一段括号。
+  //
+  // ⚠ issue #442（erix-agent 0.30.0 / 上游 #661）：「降级」那一支**已删**（引擎不再生产
+  // `degradeKind` / `degradeReason` / `degraded`）⇒ 下面**没有**降级后缀那几格，取而代之的是
+  // 下面第 3 格的反向断言：喂一个退役键进横幅，**一个字节都不许多**（已退役的键不许复活）。
+  it('compaction 分隔行把 foldSummary 里的折叠事实拼出来（无事实时逐字不变；退役的 degraded 键不许复活）', () => {
     const sepTexts = (payload: Record<string, unknown>) => {
       const hooks = makeHooks();
       const s = useEventStream(hooks);
@@ -545,13 +621,17 @@ describe('useEventStream（mock EventSource）', () => {
     const base = { foldedRounds: 46, tokensBefore: 261345, tokensAfter: 8000, strategyName: 'fold-llm' };
     expect(sepTexts(base)).toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
     expect(sepTexts({ ...base, foldSummary: {} })).toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens');
-    expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeKind: 'timeout' } }))
-      .toBe('上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens（⚠ 摘要已降级：timeout）');
-    // `degradeReason` 是 #482/#491 的整句，kind 缺席时退回它；两者都在时以 kind 为准（日志要能 grep）
-    expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeReason: '摘要器没在预算内回来' } }))
-      .toContain('摘要已降级：摘要器没在预算内回来');
-    expect(sepTexts({ ...base, foldSummary: { degraded: true, degradeKind: 'error', degradeReason: '整句' } }))
-      .toContain('摘要已降级：error');
+    // ⚠ 退役键的反向断言（0.30.0 起引擎不生产它们）：喂进来也**一个字节都不许多**。
+    // 这就是「已退役的键不许复活」的界面那一半（runner 那一半是 compact-knobs 的 K9）。
+    for (const retired of [
+      { degraded: true, degradeKind: 'timeout' },
+      { degraded: true, degradeReason: '摘要器没在预算内回来' },
+      { degradeKind: 'error', degradeReason: '整句' },
+    ]) {
+      expect(sepTexts({ ...base, foldSummary: retired })).toBe(
+        '上下文折叠（round 9，策略 fold-llm）：46 轮折叠，261345 → 8000 tokens',
+      );
+    }
     // 另外两类非致命事实一条拼全：整条步骤预算耗尽（没自愈重试）+ 摘要被输出预算截断
     const both = sepTexts({ ...base, foldSummary: { budgetExhausted: true, finishReason: 'max_tokens' } });
     expect(both).toContain('摘要预算耗尽');
@@ -566,14 +646,14 @@ describe('useEventStream（mock EventSource）', () => {
   });
 
   // #438 切片 B（M3.3）：上面那条用的是**手写**形状；这一条用**真链路实测到的键面**。
-  // 真形状（`runner/test/fold-notes-e2e.test.js` 的 E7/E8 用真 `runToolLoop` + `fold-llm` 跑出来的）：
+  // 真形状（`runner/test/fold-notes-e2e.test.js` 的 E7 用真 `runToolLoop` + `fold-llm` 跑出来的）：
   //   · 成功那次：`foldSummary` 里**没有 `source`**（引擎 `compact/pipeline.js:228-232` 明确不进事件），
   //     只可能有 `inputTruncated` / `droppedMessages` / `finishReason` / `inputTokens` / `outputTokens`；
-  //   · 降级那次：`degradeKind` + `degradeReason`，**没有** `degraded: true`（旧夹具里的 `degraded`
-  //     是 #482 时代的形状，0.29 的真事件不带它）。
+  //   · 失败那次（0.30.0 起）：**没有 compaction 事件**（那一折一个键都不留）——run 直接以
+  //     `failed` / `summarizer_failed` 收场 ⇒ 横幅没有数据源，红面归 `run_end`（见本文件末尾那格）。
   // 跨端不能直连（jsdom 里跑不了引擎、也不许给前端加 erix-agent 依赖，`engine-upgrade-299` 判据①），
-  // 所以这里用「真键面 + 真值」钉文案，形状本身由 runner 侧那两条真跑用例守着。
-  it('A2 真链路键面（无 degraded 键、只有 degradeKind/degradeReason）也能拼出降级后缀', () => {
+  // 所以这里用「真键面 + 真值」钉文案，形状本身由 runner 侧那条真跑用例守着。
+  it('A2 真链路键面（成功折叠：只有裁剪/截断事实，没有降级后缀）', () => {
     const sepTexts = (payload: Record<string, unknown>) => {
       const hooks = makeHooks();
       const s = useEventStream(hooks);
@@ -589,15 +669,15 @@ describe('useEventStream（mock EventSource）', () => {
     expect(sepTexts(realSuccess)).toBe(
       '上下文折叠（round 1，策略 fold-llm）：21 轮折叠，5857 → 1692 tokens（⚠ 摘要输入被裁（丢 0 轮 / 21 条，据不完整材料写成））',
     );
-    const realDegraded = {
+    // 退役键（0.30.0 的引擎不会写它）出现在旧事件里时，横幅也不许多一个字节。
+    const retiredShape = {
       foldedRounds: 21, tokensBefore: 5857, tokensAfter: 1692, strategyName: 'fold-llm',
-      // 真降级形态：只有 degradeKind（没有 degraded 键）
       foldSummary: { degradeKind: 'timeout', degradeReason: 'summarizer timed out' },
     };
-    const line = sepTexts(realDegraded);
-    expect(line).toContain('摘要已降级：timeout');
-    expect(line).not.toContain('summarizer timed out'); // kind 优先，整句不进横幅
-    // 无降级且无任何裁剪 ⇒ 逐字回到旧文案（历史回放里的旧事件不得多出一段括号）
+    expect(sepTexts(retiredShape)).toBe(
+      '上下文折叠（round 1，策略 fold-llm）：21 轮折叠，5857 → 1692 tokens',
+    );
+    // 无任何裁剪事实 ⇒ 逐字回到旧文案（历史回放里的旧事件不得多出一段括号）
     expect(sepTexts({ foldedRounds: 21, tokensBefore: 5857, tokensAfter: 1692, strategyName: 'fold-llm' }))
       .toBe('上下文折叠（round 1，策略 fold-llm）：21 轮折叠，5857 → 1692 tokens');
   });

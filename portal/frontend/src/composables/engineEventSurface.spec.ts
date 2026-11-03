@@ -19,13 +19,22 @@ const DIAGNOSTIC_EVENTS = [
   'persistence_capability_degraded', 'resume_journal_skipped',
   // issue #438 切片 B：`LoopEvent` 联合类型新增、本站裁定「进时间线」的两类。
   'compaction_deferred', 'budget_below_working_set',
+  // issue #442（erix-agent 0.30.0，19 类 → 27 类）：8 个新类型里本站只把这一类裁定为「进时间线」
+  // ——它是随后那次上游 400 的唯一归因信号。
+  'user_turn_guard_unrecoverable',
 ];
 
 /**
- * #438 切片 B：**豁免**（订得到、但不刷行、不回放）。理由在 `portal/test/event-surface-contract.test.js`
- * 的豁免表里；这里只钉「决定真的被执行了」（订了 + 不刷行）。
+ * #438 切片 B / #442：**豁免**（订得到、但不刷行、不回放）。理由在
+ * `portal/test/event-surface-contract.test.js` 的豁免表里；这里只钉「决定真的被执行了」（订了 + 不刷行）。
+ * #442 把 0.30.0 新增的 5 类（`tool_output_aggregate` / `continuity_written` /
+ * `continuity_write_failed` / `final_guard_extend` / `context_unknown_option`）也钉进这张表。
  */
-const EXEMPT_EVENTS = ['run_outcome', 'config_override_conflict', 'continuity_injection_skipped'];
+const EXEMPT_EVENTS = [
+  'run_outcome', 'config_override_conflict', 'continuity_injection_skipped',
+  'tool_output_aggregate', 'continuity_written', 'continuity_write_failed',
+  'final_guard_extend', 'context_unknown_option',
+];
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -77,7 +86,7 @@ describe('#421/#438 承接面（行为面）', () => {
     }
   });
 
-  it('六类诊断事件：实时帧与历史回放帧都刷同一行中性分隔行', () => {
+  it('七类诊断事件：实时帧与历史回放帧都刷同一行中性分隔行', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
     s.connect('sess-1');
@@ -184,7 +193,7 @@ describe('#421 四类诊断事件的文案', () => {
     expect(bare).not.toMatch(/(^|[^0-9])0([^0-9]|$)/);
   });
 
-  it('en 语言下六类都有文案（i18n 两份语言同步；缺 key 会回落中文 ⇒ 这条会红）', async () => {
+  it('en 语言下七类都有文案（i18n 两份语言同步；缺 key 会回落中文 ⇒ 这条会红）', async () => {
     setLocale('en');
     const hooks = makeHooks();
     useEventStream(hooks).connect('sess-1');
@@ -194,11 +203,29 @@ describe('#421 四类诊断事件的文案', () => {
     lastES().emit('resume_journal_skipped', { count: 2, round: 1 });
     lastES().emit('compaction_deferred', { round: 3, reason: 'pending_tool_use' });
     lastES().emit('budget_below_working_set', { budgetTokens: 9000, workingSetTokens: 15000, attempts: 3, suggestedBudgetTokens: 24000 });
+    lastES().emit('user_turn_guard_unrecoverable', { round: 2, channel: 'request', reason: 'no_user_turn' });
     const lines = hooks.onSep.mock.calls.map((c) => c[0] as string);
-    expect(lines).toHaveLength(6);
+    expect(lines).toHaveLength(7);
     for (const line of lines) {
       expect(line).not.toMatch(/[\u4e00-\u9fff]/); // 一条中文都不该有
       expect(line.length).toBeGreaterThan(10);
     }
+  });
+
+  // issue #442：0.30.0 唯一「进时间线」的新类型——载荷形状对着发射点写（orchestrator.js:2716），
+  // 数字缺就 ?（#283）、外来标识符过形状闸（#261）。
+  it('user_turn_guard_unrecoverable：说清「请求已原样发出、上游可能拒绝」，缺数字写 ?', () => {
+    const hooks = makeHooks();
+    useEventStream(hooks).connect('sess-1');
+    lastES().emit('user_turn_guard_unrecoverable', { round: 4, channel: 'request', reason: 'no_user_turn' });
+    const line = hooks.onSep.mock.calls[0][0] as string;
+    for (const needle of ['4', 'request', 'no_user_turn', '原样发出']) {
+      expect(line, needle).toContain(needle);
+    }
+    hooks.onSep.mockClear();
+    lastES().emit('user_turn_guard_unrecoverable', { channel: { nope: 1 }, reason: 'a b;rm -rf' });
+    const dirty = hooks.onSep.mock.calls[0][0] as string;
+    expect(dirty).toContain('?');
+    expect(dirty).not.toContain('[object Object]');
   });
 });

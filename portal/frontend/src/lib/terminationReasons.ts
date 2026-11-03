@@ -50,10 +50,23 @@
 //        `operation: persistenceFailure.operation` 三处形状断言仍然命中。
 //     ③ `diff -rq <0.26.0>/src/providers <0.29.0>/src/providers` **无输出** ⇒ provider 层可重试码面零差异。
 //     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
+//   * 0.29.0 → 0.30.0（#442 升级片）六度核，按 0.30.0 现查：
+//     ① `src/loop/termination.js` 的 reason 字面值集合用
+//        `grep -oE '"(aborted|end_turn|failed|judge_done|max_rounds_cap|no_tool|stall|timeout|continuation_exhausted|final_guard_unverified)"' | sort -u`
+//        对 0.29.0 与 0.30.0 **两侧结果逐字相同**（十值全在、无新增无改名）；该文件的 diff 只含
+//        #435 交付物失败条目的注释 + `guardVerdict` / `finalTextFallback` / `deliverablesFailures`
+//        这些**附加字段**（都不是新 reason，见升级指南 §4「终止、验证与退出码语义」一节）。
+//     ② `src/loop/orchestrator.js` 的 typedef 仍是同一组九值、同一声明顺序；
+//        `? "failed" : "persistence_failed"` / `const reason = signal?.aborted` /
+//        `operation: persistenceFailure.operation` 三处形状断言仍然命中。
+//     ③ `diff -rq <0.29.0>/src/providers <0.30.0>/src/providers` 只有 `anthropic.js` + `anthropic.d.ts`
+//        不同，且两处**都只是 `@deprecated` 注释**（工厂本体没删）；`payload.js` / `timeout.js` /
+//        `errors.js` / `openai.js` 逐字节相同 ⇒ provider 层可重试码面零差异。
+//     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.29.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.30.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。
@@ -168,3 +181,22 @@ export const RUN_RETRYABLE_ERROR_CODES = [
 
 /** 历史遗留、已不再是引擎取值的 reason（只可能在旧数据行里；文档不得再当枚举值列它）。 */
 export const LEGACY_TERMINATION_REASONS = ['reflection_stop'] as const;
+
+/**
+ * issue #442（erix-agent 0.30.0 / 上游 #661）：**run 级错误码 → 人话**的映射表（码 → i18n 键后缀）。
+ *
+ * 为何在这里：本文件已经是「引擎码表在宿主的单一真相」（`RUN_RETRYABLE_ERROR_CODES` 就在上面），
+ * 再开一张表就是第三份枚举。**纯数据、不引 i18n**：本文件被 `portal/test/termination-contract.test.js`
+ * 用 node 直读（类型剥离），不能把 vue-i18n 拖进来；取词在 `useEventStream.ts` 的 `run_end` 分支里做。
+ *
+ * 口径：**只在码命中时用**，命中不了的码照旧把引擎原话展示出来（不编翻译、不吞信息）。
+ * 键后缀对应 `stream.event.runErrorCode.<后缀>`（双语必须成对，`localeParity` 会红）。
+ *
+ * 为什么 `summarizer_failed` 需要一条人话：0.30.0 之前摘要器失败是**静默降级**（横幅上一句后缀，
+ * run 照常成功）；现在它是**终局错误**（`reason='failed'` + `errorCode='summarizer_failed'`），
+ * 用户看到的是红面加引擎那句英文技术文本（"No final text was produced..." / summarizer 自己的报错），
+ * 读不出「这不是未知错误、是摘要器调用失败、重试即可」。
+ */
+export const RUN_ERROR_CODE_LABELS: Readonly<Record<string, string>> = {
+  summarizer_failed: 'summarizerFailed',
+};

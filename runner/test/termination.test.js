@@ -134,7 +134,10 @@ test('message 兜底：无 message 时用 String(err)，绝不产出 undefined',
 
 test('worker.js 确实用了本模块（catch 里没有第二份实现）', () => {
   const worker = fs.readFileSync(path.join(HERE, '../worker.js'), 'utf8');
-  assert.match(worker, /import \{ buildFailureEnvelope \} from '\.\/lib\/termination\.js';/);
+  // issue #442：import 表多了 `finalTextFallbackField`（同一模块的纯函数，M4 的兜底标记）⇒ 断言改成
+  // 「这个模块被 import、且名字表里含 buildFailureEnvelope」，原意（用本模块、不写第二份）不变。
+  assert.match(worker, /import \{[^}]*\bbuildFailureEnvelope\b[^}]*\} from '\.\/lib\/termination\.js';/,
+    'worker.js 必须从 lib/termination.js import buildFailureEnvelope（catch 里不许有第二份实现）');
   // issue #370 加了第三个入参 `steered`（只往 termination.detail 补 'steered'），故这里的形状断言随之更新：
   // 断言仍锁死「catch 里只有这一处调用、没有第二份手写实现」这一原意，只是把入参表写成三参数版。
   assert.match(worker, /const \{ termination, error, usage, rounds \} = buildFailureEnvelope\(\{ err, aborted, steered \}\);/);

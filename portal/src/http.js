@@ -1957,6 +1957,12 @@ const HISTORY_EVENT_TYPES = new Set([
   // 红色面负责，不在这里重复报）。与前端 `useEventStream.ts` 的 `EVENT_TYPES` +
   // `HISTORY_REPLAY_TYPES` 是**三处独立存亡的集合**（#288 教训），本单同改。
   'persistence_error',
+  // issue #442（erix-agent 0.30.0）：`LoopEvent` 联合类型 19 类 → **27 类**。8 个新类型里本站只把
+  // `user_turn_guard_unrecoverable` 裁定为**进时间线**（其余 5 个新类型 + `continuity_injection_skipped`
+  // 是豁免，`forced_final` 早已在册）：它是随后那次上游 400 的**唯一归因信号**（引擎在请求发出之前就发它），
+  // 用户刷新来看「这次怎么失败了」时必须看得到。与前端 `EVENT_TYPES` + `HISTORY_REPLAY_TYPES` 是
+  // **三处独立存亡的集合**（#288 教训），本单同改。
+  'user_turn_guard_unrecoverable',
 ]);
 const HISTORY_EVENT_DEFAULT_LIMIT = 500;
 const HISTORY_EVENT_MAX_LIMIT = 2000;

@@ -418,6 +418,43 @@ test('#236 终态 run ⇒ 恰一条 run_termination：seq = 该 run 最后一条
   }
 });
 
+// issue #442（erix-agent 0.30.0 / 上游 #476）：兜底标记（`termination.finalTextFallback`）必须**穿过**
+// 这条响应期投影——它是界面那条中性标记的唯一数据源（刷新后仍在，靠的就是本端点原样透传 termination）。
+test('#442 终态 termination 里的 finalTextFallback 原样进 run_termination 合成项（界面标记的数据源）', async () => {
+  const s = await startServer();
+  try {
+    // ⚠ 窗口里必须有**白名单内**的事件：合成项只对「本次响应窗口里出现过的 run」投影
+    //（`distinctWindowRunIds`），只种一条 run_end（白名单外）会连一条合成项都没有。
+    s.pool.seed(ev(1, 'round_start', { round: 1 }));
+    s.pool.seed(ev(2, 'run_end', { termination: { reason: 'end_turn' } }));
+    s.pool.seedRun('r1', 'finished', { reason: 'end_turn', forcedFinal: true, finalTextFallback: true });
+    const terms = terminationsOf(await historyOf(s));
+    assert.equal(terms.length, 1);
+    assert.equal(terms[0].payload.termination.finalTextFallback, true,
+      '宿主 additive 键被投影吞了 ⇒ 刷新后界面把引擎兜底文案当成模型正文');
+    // 引擎自己的键一个不少（投影是「原样透传」，不是白名单）
+    assert.equal(terms[0].payload.termination.forcedFinal, true);
+    assert.equal(terms[0].payload.termination.reason, 'end_turn');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#442 没有兜底标记 ⇒ 合成项里一个字节都不多（不是 false，是根本没有这个键）', async () => {
+  const s = await startServer();
+  try {
+    s.pool.seed(ev(1, 'round_start', { round: 1 }));
+    s.pool.seed(ev(2, 'run_end', { termination: { reason: 'end_turn' } }));
+    s.pool.seedRun('r1', 'finished', { reason: 'end_turn' });
+    const terms = terminationsOf(await historyOf(s));
+    assert.equal(terms.length, 1);
+    assert.equal(Object.hasOwn(terms[0].payload.termination, 'finalTextFallback'), false,
+      '不是兜底时多出了 finalTextFallback 键 ⇒ 界面会误报「这是兜底文案」');
+  } finally {
+    await s.close();
+  }
+});
+
 for (const status of ['queued', 'running', 'cancelling']) {
   test(`#236 非终态 ${status} ⇒ 不合成（「还在跑就标已中止」是新造的误导，三态各钉一条）`, async () => {
     const s = await startServer();

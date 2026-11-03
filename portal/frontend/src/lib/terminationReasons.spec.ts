@@ -63,7 +63,11 @@ describe('termination reason 单一常量（issue #212）', () => {
     // （该文件的 diff 只有注释 + #475 强制收尾判据下沉 + #598 续接 finalize 钩子，不改值域）；
     // `orchestrator.js` 的 typedef 现在在 `:655-656`（0.26.0 是 `:490-491`），仍是同一组九值、同一顺序；
     // `src/providers/` 整目录 `diff -rq` **无输出** ⇒ 下面九值断言一字未改。
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.29.0');
+    // 0.29.0 → 0.30.0（#442 升级片）六度核，按 0.30.0 现查：`src/loop/termination.js` 的 reason 字面值
+    // 集合两侧 `grep -oE … | sort -u` **逐字相同**（该文件新增的是 `guardVerdict` / `finalTextFallback` /
+    // `deliverablesFailures` 这些附加字段，不是新 reason）；`orchestrator.js` 的 typedef 仍是同一组九值；
+    // `src/providers/` 只有 `anthropic.js`(+`.d.ts`) 不同且只是 `@deprecated` 注释 ⇒ 下面九值断言一字未改。
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.30.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 

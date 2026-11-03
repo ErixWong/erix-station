@@ -34,11 +34,11 @@ import { createJail, createStationFileTools } from './lib/file-tools.js';
 import { createShellTools } from './lib/shell-tools.js';
 import { createNotesTools } from './lib/notes-tools.js';
 import { createFoldNoteSink } from './lib/fold-notes.js';
-import { engineDiagnosticNotice } from './lib/engine-notices.js';
+import { engineDiagnosticNotice, summarizerFailureNotice } from './lib/engine-notices.js';
 import { assertCompactContext, assertFoldingToolResultKnobs } from './lib/compact-knobs.js';
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
-import { buildFailureEnvelope } from './lib/termination.js';
+import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -322,8 +322,18 @@ export function loopEventPayload(event, meta = {}) {
 // 字段本体是 erix-agent #482/#487/#490/#491 加的（**仅 fold-llm 会产生**：`fold-statistical` 下
 // 这些键全缺席，这是契约不是 bug）。⚠ #438 切片 B 起本站**真选了 `fold-llm`** ⇒ 本函数从「预先
 // 接好但永不触发」变成了活路径（`compaction` 事件里的 `foldSummary` 现在真的会带这些键）。
-// `degradeKind`（#487）比 `degradeReason`（#482）新且短，所以优先读 kind，只读 kind 拿不到时才退回
-// reason（老版本引擎）。
+//
+// ⚠⚠ issue #442（erix-agent **0.30.0** / 上游 #661）：「降级为统计摘要」这条路径**已被删除**。
+// 摘要器失败现在直接抛 `KitError("summarizer_failed")` ⇒ run 以 `termination.reason === 'failed'` /
+// `errorCode === 'summarizer_failed'` 收场（告警在 `lib/engine-notices.js#summarizerFailureNotice`），
+// **不再**产出一条 `foldSummary.degradeKind` / `degradeReason` / `degraded`。
+// 于是本函数里读那三个键的那一支是**死分支**，0.30 起已删——**已退役的键不许复活**（判据
+// `compact-knobs.test.js` 的 K9 直接盯本函数体）。仍然生产、必须留着的是下面这几个：
+//   `inputTruncated` / `droppedRounds` / `droppedMessages` / `finishReason`（`pipeline.js:234-250`
+//   的投影面在成功路径上照旧写它们）。
+//   `budgetExhausted` 按工单 §M3 的口径**保留**，但 0.30 实测它只剩失败路径那一个写入点
+//   （`fold-llm.js:805` 的 `fail(..., { budgetExhausted: true })`，而失败路径不再返回 stat）
+//   ⇒ 成功路径上今天已不可达；留着是为了「上游把它挪回来时不丢信号」，处置留给主 agent（报告 §M3）。
 /**
  * @param {object|undefined} compaction `LoopEvent.compaction`（即 `CompactionStat`）
  * @returns {string|null} 人可读的一行告警；没降级/没超预算时 `null`
@@ -332,13 +342,7 @@ export function foldDegradeNotice(compaction) {
   const stat = compaction?.foldSummary;
   if (!stat || typeof stat !== 'object') return null;
   const parts = [];
-  const kind = typeof stat.degradeKind === 'string' && stat.degradeKind !== ''
-    ? stat.degradeKind
-    : (stat.degraded === true && typeof stat.degradeReason === 'string' && stat.degradeReason !== ''
-      ? // #491 之后 `degradeReason` 是**整句**（给人读的），进日志可以但不能无限长
-        stat.degradeReason.slice(0, 200)
-      : null);
-  if (kind) parts.push(`degraded=${kind}`);
+  // （0.30.0 起这里**不再读** `degradeKind` / `degradeReason` / `degraded`：见上面的段落。）
   // 以下每一个键名都必须能在上游契约的 `foldSummary` 字段面里找到（K12 钉这条对账）。
   // 前例：本函数曾读过一个 `foldSummary.unshrinkable`——**引擎从不发这个键**（契约与 `src/`
   // 全文 grep 零命中），它是本站按记忆造的形状，后果不是报错而是永不触发：一条永不响的告警。
@@ -963,6 +967,10 @@ async function startRun(msg) {
       usage: result.usage ?? { input_tokens: 0, output_tokens: 0 },
       rounds: result.rounds ?? 0,
       final_text: result.finalText ?? '',
+      // issue #442（erix-agent 0.30.0 / 上游 #476）：`result.finalTextFallback === true` ⇒ 上面那句终稿
+      // 是**引擎兜底文案**（「本次收尾未产出正文」），不是模型输出。**只在 true 时给这个键**
+      // （缺席 = 不是兜底，绝不写 false）。`finalTextFallbackField` 是纯函数，判据在 termination.test.js。
+      ...finalTextFallbackField(result),
       title: '',   // 标题归 portal 生成，worker 恒发空串（#322）
     });
   } catch (err) {
@@ -978,6 +986,13 @@ async function startRun(msg) {
     // 而「这次是不是转向」这件事必须一路带到终态信封。
     const steered = steerArmed || steeredThisRun;
     const { termination, error, usage, rounds } = buildFailureEnvelope({ err, aborted, steered });
+    // issue #442（erix-agent 0.30.0 / 上游 #661）：折叠摘要器失败**现在是终局错误**（不再静默降级成
+    // 统计摘要）⇒ 这次失败必须在运维账上说得清是哪一类。只读 LOG 的人不能只看到 `run failed: failed`。
+    // ⚠ 只记日志、**不改终态也不改事件**（终态是引擎判的；界面那一半是 `run_end` 的红色面）。
+    const summarizerFailure = summarizerFailureNotice({ termination, error });
+    if (summarizerFailure) {
+      sendIpc(process, { type: MSG.LOG, run_id: runId, level: summarizerFailure.level, msg: summarizerFailure.msg });
+    }
     sendIpc(process, {
       type: MSG.RUN_FINISHED,
       run_id: runId,
