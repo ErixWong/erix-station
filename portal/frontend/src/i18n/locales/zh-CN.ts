@@ -224,6 +224,26 @@ export const zhCN = {
     sessionStats: '{count} 条消息',
     sessionStatsCompacted: '已压缩 {count} 次',
     sessionCompactionHint: '上下文已开始压缩；如需保留完整细节，建议新开会话',
+    // #451（compactionStats 观测面）：会话头部的**本会话累计**压缩行。
+    // 为什么单独一行而不并进上面那句：上面那个 folded 是「本页 DTO 里带 folded 字段的消息数」，
+    // 口径不同（那是投影里看得见的折叠横幅条数，这是引擎逐轮写的层统计）；两个数并列会互相矛盾。
+    // 措辞钉住两件事：① 是本会话累计（不是本次 run）；② 压缩是正常工作，不是故障（不红、不警告）。
+    sessionCompactionSummary: '本会话压缩：{parts}',
+    sessionCompactionLayer: '{layer} {count} 次',
+    sessionCompactionLayerSaved: '{segment}（省 {saved} token）',
+    sessionCompactionHintTitle: '累计自 {rounds} 轮统计，最近一次在第 {last} 轮',
+    sessionCompactionHintTitleNoRound: '累计自 {rounds} 轮统计',
+    // 层名（键 = 引擎 `COMPACTION_PIPELINE` 的 id；顺序由前端 lib 定，不靠对象键序）
+    // 层名自带「折叠」二字：计数单位是「次」（TTL 折的是工具结果、窗口折的是整轮，都不是「条消息」，
+    // 说「次」才两边都真）。模板因此只留 `{layer} {count} 次`，中文不必在标签后硬塞一个空格。
+    sessionCompactionLayers: {
+      ttl: 'TTL 折叠',
+      slidingWindow: '窗口折叠',
+      foldStatistical: '统计折叠',
+      foldLlm: '策略折叠',
+      anchors: '锚点折叠',
+      enforceSize: '裁剪折叠',
+    },
     // 试用台账 #10：更早消息分页入口（后端一直分页，前端此前从不取更早批次）。
     loadOlder: '加载更早消息',
     loadOlderLoading: '正在加载…',

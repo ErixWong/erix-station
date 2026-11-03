@@ -198,6 +198,24 @@ export const en = {
     sessionStats: '{count} messages',
     sessionStatsCompacted: 'compacted {count}×',
     sessionCompactionHint: 'Context compaction has started; open a new session if you need to keep full details',
+    // #451 (compactionStats observability): the session-header CUMULATIVE compaction line.
+    // Separate from the line above on purpose: that `folded` counts DTO messages carrying a `folded`
+    // field, this counts the engine's per-round layer stats — different denominators, so they must
+    // not be glued into one number. Wording pins two things: it is cumulative for THIS SESSION (not
+    // this run), and compaction is normal work, not a failure (no red, no warning).
+    sessionCompactionSummary: 'Session compaction: {parts}',
+    sessionCompactionLayer: '{layer} ×{count}',
+    sessionCompactionLayerSaved: '{segment} (saved {saved} tokens)',
+    sessionCompactionHintTitle: 'Aggregated over {rounds} rounds; last one at round {last}',
+    sessionCompactionHintTitleNoRound: 'Aggregated over {rounds} rounds',
+    sessionCompactionLayers: {
+      ttl: 'TTL',
+      slidingWindow: 'window',
+      foldStatistical: 'statistical',
+      foldLlm: 'strategy',
+      anchors: 'anchors',
+      enforceSize: 'size cap',
+    },
     // Trial log #10: older-message pagination entry (backend always paginated; the frontend just never fetched older pages).
     loadOlder: 'Load older messages',
     loadOlderLoading: 'Loading…',

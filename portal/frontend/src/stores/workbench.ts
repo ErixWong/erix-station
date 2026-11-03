@@ -21,6 +21,8 @@ import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
 import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
+// #451：`compactionStats` 观测面（会话头部的压缩累计行）——DTO 归一化走纯函数，模板不碰脏值。
+import { normalizeSessionCompaction, type SessionCompaction } from '../lib/compactionSummary';
 
 // 用户可见文案取词（issue #101 P2）：Pinia setup store 不是组件 setup 上下文（useI18n 会抛
 // MUST_BE_CALL_SETUP_TOP，且组件作用域 composer 语义不符），故统一走 i18n.global.t。
@@ -58,6 +60,10 @@ export interface Session {
   /** issue #370：未投递的输入队列 `{steering, follow_up}`（**仅会话详情**带；列表响应不带）。
    *  旧后端无此字段 ⇒ normalizeQueuedSnapshot 退化成空队列，additive 兼容。 */
   queued_messages?: unknown;
+  /** #451：压缩层累计观测（**仅会话详情**带；一条 compactionStats 都没有 ⇒ 键整个缺席）。
+   *  形状 `{rounds, layers:{<layer>:{triggered,tokensSaved}}, tokensSaved, lastRound}`；
+   *  声明成 `unknown` 是故意的——网络来的 DTO 一律过 `normalizeSessionCompaction` 收窄，不信类型。 */
+  compaction?: unknown;
 }
 
 /**
@@ -300,6 +306,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // issue #197：当前会话的消息总数（getSession DTO 的 session.message_count，后端全量口径）。
   // null=旧后端/非详情入口无此字段 → sessionStats 回退已加载条数（messages 是分页窗口，长会话会少报）。
   const sessionMessageCount = ref<number | null>(null);
+  // #451：本会话的压缩累计（`GET /api/sessions/:id` 的 `session.compaction`，后端读侧聚合）。
+  // null = 一条 compactionStats 都没有（**键缺席**，不是 0 次）⇒ 头部那一行一个字节都不渲染。
+  const sessionCompaction = ref<SessionCompaction | null>(null);
   // 试用台账 #10：更早消息历史分页。消息**从未丢**——后端 getSession 早就是 keyset 分页
   // （默认只给最新 20 条），病根是前端从不消费 next_cursor ⇒ 长会话开头永远看不见，
   // 用户误读成「压缩把消息吃了」。olderMessagesCursor = 后端 next_cursor（已加载窗口最老
@@ -724,6 +733,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       else if (en.kind === 'folded') folded++;
     }
     const total = sessionMessageCount.value;
+    // #451：压缩累计**不进**这个对象——它是独立的一行（口径不同，见 StreamPanel 的注释），
+    // 由 store 自己的 `sessionCompaction` ref 承载，免得给既有形状加键。
     return { messages: total != null ? Math.max(total, messages) : messages, folded };
   });
 
@@ -862,6 +873,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     dirCwd.value = cwd;
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
+    sessionCompaction.value = null; // #451：压缩累计同属会话级状态
     es.resetStreamState();
     momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
@@ -899,6 +911,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     renderedIds.value = new Set();
     entries.value = [];
     sessionMessageCount.value = null; // #197：先清旧会话的计数，加载失败/竞态丢弃时不得串会话残留
+    sessionCompaction.value = null; // #451：压缩累计同属会话级状态，不得串会话残留
     olderMessagesCursor.value = null; // 试用台账 #10：旧会话的游标不得泄漏到新会话（加载成功后重赋）
     olderEventsCursor.value = null;
     let data: SessionDetail;
@@ -929,6 +942,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       && Number.isFinite(data.session.message_count)
       ? data.session.message_count
       : null;
+    // #451：压缩累计（键缺席 ⇒ null ⇒ 不渲染；脏值 ⇒ 归一化成 null，绝不渲染半截汇总）。
+    sessionCompaction.value = normalizeSessionCompaction(data.session?.compaction);
     // issue #370：刷新 / 切会话 / 断线重连后的队列补齐（`queue_update` 是 live-only、不落库，
     // 没有这一行，刷新后队列条就会凭空消失）。blocked 不在详情里——它只在有队列时才有意义，
     // 由下一帧 queue_update 带上；这里先清，免得留着上个会话的原因。
@@ -1069,6 +1084,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     dirCwd.value = cwd;
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：同 resetSessionView——离开会话不得残留旧计数
+    sessionCompaction.value = null; // #451：压缩累计同属会话级状态
     es.resetStreamState();
     momentum.reset(); // issue #282：离开/切换会话不复用上一个会话的动量数字
     clearRetryFace(); // issue #261B：离开/换开会话（selectDir / openSession / createDir / resetSessionView）⇒ 重试面重置
@@ -1184,6 +1200,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     saveDraft();
     sessionId.value = null;
     sessionMessageCount.value = null; // #197：无选中会话 → 不得复用旧会话的计数
+    sessionCompaction.value = null; // #451：无选中会话 → 压缩累计一并清（否则切走再切回会看到上一个会话的数）
     applyQueueSnapshot({ steering: [], follow_up: [] }); // #370：队列同样是会话级状态
     olderMessagesCursor.value = null; // 试用台账 #10：分页游标同属会话级状态，一并清
     olderEventsCursor.value = null;
@@ -1235,6 +1252,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     sessions.value = [];
     sessionId.value = null;
     sessionMessageCount.value = null;
+    sessionCompaction.value = null; // #451：换账号复位——上一个账号的压缩累计不得留到新账号
     updateAvailability(); // 目录已清 ⇒ noDir=true；新账号挂载后由 initWorkspace 重算
     // ⑤ 输入面：草稿是「上一个账号打了一半的话」，绝不能出现在新账号的输入框里
     //    （`drafts` 按 sessionId 键，同 id 理论上不会撞，但整个 Map 必须跟着人走）。
@@ -1527,6 +1545,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         && Number.isFinite(data.session.message_count)
         ? data.session.message_count
         : null;
+      // #451：run 终态后重取详情——压缩累计同样刷新（本 run 新折的轮数要立刻可见）。
+      sessionCompaction.value = normalizeSessionCompaction(data.session?.compaction);
       const msgs = data.messages.filter((m) => m.run_id === runId && m.role === 'assistant' && !m.synthetic);
       for (const m of msgs) addMessage(m);
       await loadSessions();
@@ -1581,6 +1601,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     lastSend, retryAvailable, retryInFlight, retryLast,
     // issue #189：折叠段原文懒加载 + 会话头部状态行计数
     foldedOriginals, getFoldedOriginal, loadFoldedOriginal, sessionStats,
+    // #451：压缩累计（sessionStats.compaction 是渲染入口；这个 ref 导出只为给换会话/换账号复位钉用例）
+    sessionCompaction,
     // issue #282：动量状态机（RunStatusBar / StreamPanel 的 1s 时钟各自 useRunMomentum 读它）
     momentum,
   };
