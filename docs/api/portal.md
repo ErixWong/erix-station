@@ -889,6 +889,39 @@ station-portal user enable  --login <login>
   `^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$` = 小写字母/数字/下划线/连字符、首尾须为字母数字、≤63）。
   它**只约束新建**，不影响在目录下拉里选中容器内已有目录（哪怕目录名含其它字符）。
 
+**`session.compaction`（#451：引擎 `compactionStats` 的读侧观测面，**键缺席而非零**）**
+
+引擎 `runToolLoop` 的返回值带 `compactionStats`（typedef 在 erix-agent `src/loop/orchestrator.js`），
+**每轮一条**并原样写进 `transcript_rounds.record.compactionStats`；本站此前从未消费它（`runner/worker.js`
+只透传 `termination`/`usage`/`rounds`/`finalText`），于是「压缩到底有没有在工作」只能靠 SQL 猜——真库
+2026-11 实测 82 条带 stats 的轮记录里 TTL 层 `triggered=75` / `tokensSaved=314518`，而两版台账都写着
+「TTL 未触发」（判据用错了：TTL 层**不发** `compaction` 事件，只写 `compactionStats`）。
+
+`GET /api/sessions/:id` 的 `session.compaction`（**零 DDL、读侧聚合**，与 `projectSessionMessages`
+的折叠事实**共用那一次** `transcript_rounds` 扫描 ⇒ 查询次数不变）：
+
+```json
+{ "rounds": 82, "layers": { "ttl": { "triggered": 75, "tokensSaved": 314518 } },
+  "tokensSaved": 326863, "lastRound": 57 }
+```
+
+| 键 | 口径 |
+|---|---|
+| `compaction`（整个键） | **缺席 = 本会话一次折叠都没有**（不是 0 次）：一条有效 `compactionStats` 都没有，或所有层 `triggered === 0` ⇒ 不给这个键 |
+| `rounds` | 至少有一层 `triggered > 0` 的轮数（按轮号去重） |
+| `layers.<id>` | **只列 `triggered > 0` 的层**（`foldLlm.triggered === 0` ⇒ 没有 `foldLlm` 键）；`id ∈ {ttl, slidingWindow, foldStatistical, foldLlm, anchors, enforceSize}`（= 引擎 `COMPACTION_PIPELINE` 顺序，白名单：新层要等宿主补 id + 文案才出现） |
+| `tokensSaved` | 各**已列**层 `tokensSaved` 之和 |
+| `lastRound` | 最后一次有折叠的轮号（无则键缺席） |
+
+脏数据处置（**绝不让一个坏轮记录把整个会话 DTO 打成 500**）：`compactionStats` 不是数组 / `layers`
+不是对象 / `triggered` 非「非负安全整数」/ `tokensSaved` 非有限非负数 ⇒ **该条跳过并计数**（跳过数
+只在返回值里给调用方，**不进 DTO**），其余轮照常汇总。按**数组遍历**（不假设长度恒 1；今天是每轮 1 条，
+那是实测事实不是契约）。
+
+前端落点：会话头部既有那行状态（`StreamPanel.vue` 的 `.session-stats`）下追加一行
+`本会话压缩：TTL 折叠 75 次（省 314.5k token）· …`——**不新造面板**、不进 `.syserr`（压缩是正常工作，
+不是故障）、token 走既有 `formatTokenCount`（`lib/compactionSummary.ts` 收窄 DTO，模板不碰脏值）。
+
 **对话流 DTO 的 `messages[]` 展示字段（`GET /api/sessions/:id`）**
 
 助手锚点上除宿主元数据（`id`/`run_id`/`seq`/`role`/`content`/`synthetic`/`attachments`/`created_at`）外，

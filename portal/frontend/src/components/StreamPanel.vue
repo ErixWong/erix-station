@@ -19,12 +19,49 @@ import { vMermaid } from '../directives/mermaid';
 import { formatMessageTime } from '../lib/messageTime';
 import { formatElapsed } from '../lib/runMomentum';
 import { useRunMomentum } from '../composables/useRunMomentum';
+// #451：会话头部「本会话压缩」累计行——层序/脏值归一化/可读单位都在 lib 里（纯函数），模板只做插值。
+import { compactionLayerSegments, formatSavedTokens, type SessionCompaction } from '../lib/compactionSummary';
 
 const { t, locale } = useI18n();
 const store = useWorkbenchStore();
 // 本组件只读派生视图；1s 时钟由 composable 自己起、自己 `onUnmounted` 清（与 RunStatusBar 各一份，
 // 两条 1s interval 的成本可忽略，换来「谁卸载谁清理」的局部性）。
 const { view: momentumView } = useRunMomentum(store.momentum);
+
+/**
+ * #451：本会话压缩累计（`GET /api/sessions/:id` 的 `session.compaction`，后端读侧聚合）。
+ *
+ * 三条口径都写在这里，模板不再判断：
+ *   ① **只在该会话真有折叠时出现**：`sessionStats.compaction` 为 null（后端键缺席）⇒ 返回 `''`
+ *      ⇒ 模板 `v-if` 整段不出，一个字节都不渲染（不是「压缩 0 次」）；
+ *   ② **本会话累计**（不是本次 run）：文案里写死「本会话」，tooltip 再说清累计自几轮；
+ *   ③ 压缩是**正常工作**：这一行与消息数同色（`text-black/40`），不进 `.syserr` 红色。
+ * token 走站内既有 `formatTokenCount`（`314.5k` / `1.2M`），不在模板里算。
+ */
+const compactionText = computed(() => {
+  const compaction: SessionCompaction | null = store.sessionCompaction ?? null;
+  if (compaction === null) return '';
+  const parts = compactionLayerSegments(compaction).map((seg) => {
+    const segment = t('stream.sessionCompactionLayer', {
+      layer: t(`stream.sessionCompactionLayers.${seg.id}`),
+      count: seg.triggered,
+    });
+    const saved = formatSavedTokens(seg.saved);
+    return saved === '' ? segment : t('stream.sessionCompactionLayerSaved', { segment, saved });
+  });
+  if (parts.length === 0) return '';
+  return t('stream.sessionCompactionSummary', { parts: parts.join(' · ') });
+});
+
+/** #451：累计行的 tooltip（轮数与最近一轮）。轮号缺席就只说轮数——不编一个 0。 */
+const compactionTitle = computed(() => {
+  const compaction: SessionCompaction | null = store.sessionCompaction ?? null;
+  if (compaction === null) return '';
+  const last = compaction.lastRound;
+  return typeof last === 'number' && Number.isFinite(last)
+    ? t('stream.sessionCompactionHintTitle', { rounds: compaction.rounds, last })
+    : t('stream.sessionCompactionHintTitleNoRound', { rounds: compaction.rounds });
+});
 
 /**
  * issue #282 A：消息时刻文本。`created_at` 缺失/脏值 ⇒ `''`（模板 `v-if` 整段不出），
@@ -329,9 +366,12 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
   </p>
   <!-- issue #189（追加）：当前会话头部状态行「N 条消息 · 已压缩 M 次」（M=0 降级只显示条数；无选中会话不渲染）
        + 仅 M≥1 时一句克制提示（无弹窗/动画） -->
-  <p v-if="store.sessionStats && store.sessionStats.messages > 0" class="session-stats mb-2 text-xs text-black/40">
+  <p v-if="store.sessionStats && (store.sessionStats.messages > 0 || compactionText !== '')" class="session-stats mb-2 text-xs text-black/40">
     {{ t('stream.sessionStats', { count: store.sessionStats.messages }) }}<template v-if="store.sessionStats.folded > 0"> · {{ t('stream.sessionStatsCompacted', { count: store.sessionStats.folded }) }}</template>
     <span v-if="store.sessionStats.folded >= 1" class="session-compaction-hint block">{{ t('stream.sessionCompactionHint') }}</span>
+    <!-- #451：本会话压缩累计（引擎 compactionStats 的读侧聚合）。**不是**错误/警告：与上面同一灰色，
+         不进 .syserr；后端没有这个键时整段不渲染（v-if 已在 computed 里收口）。 -->
+    <span v-if="compactionText !== ''" class="session-compaction-stats block" :title="compactionTitle">{{ compactionText }}</span>
   </p>
   <!-- 空态：旧版「选择或新建会话」默认文案（issue #332：曾按 `noDir && isPlatformAdmin` 分叉去
        引导「进管理台」，入口拦截后该形状不可达 ⇒ 分支已删，只剩这一条） -->

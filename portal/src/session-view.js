@@ -347,6 +347,163 @@ function attachToolCallDurations(toolCalls, runId, durations) {
 }
 
 /**
+ * #451：引擎压缩层的 id，**规范顺序**逐字取自 erix-agent `src/compact/pipeline.js` 的
+ * `COMPACTION_PIPELINE`（ttl → slidingWindow → foldStatistical → foldLlm → anchors → enforceSize）。
+ *
+ * 为什么是白名单而不是「`layers` 里有什么就透什么」：这是宿主 DTO 的契约面，前端每个 id 都有一句
+ * 中英文案；引擎将来加第七层时，宿主**不该**静默把一个没有文案的键塞给界面（键缺席 = 不渲染）。
+ * 代价写在这里：新层要等宿主补 id + 文案才会出现在界面上（工单 §残留）。
+ */
+export const COMPACTION_LAYER_IDS = Object.freeze([
+  'ttl', 'slidingWindow', 'foldStatistical', 'foldLlm', 'anchors', 'enforceSize',
+]);
+
+/**
+ * #451：解析**一条** `compactionStats` 条目（引擎每轮往轮记录里 append 一条）。
+ *
+ * 真形状（真库核过，2026-11 全库 82 条带 stats 的轮记录，`jsonb_array_length` 恒 1）：
+ * `{compacted, foldedRounds, tokensBefore, tokensAfter, layers:{ttl|slidingWindow|foldStatistical|
+ * foldLlm|anchors|enforceSize:{triggered,tokensSaved}}, userTurnGuard?, strategyName?, foldSummary?}`。
+ * ⚠ 真数据里 `layers` 的**六个键全在**（没触发的层是 `{triggered:0,tokensSaved:0}`，不是缺席）。
+ *
+ * 脏数据的处置是**整条丢弃**（不是修修补补）：一个坏轮记录不许把整个会话 DTO 打成 500。
+ * 判据形状与 #390-A 同源——「不知道」就什么都不说，**绝不写 0 冒充**：
+ *   · 条目不是对象 / `layers` 不是对象 ⇒ 脏（返回 null）；
+ *   · 某层 `triggered` 非「非负安全整数」（如 `"abc"`）或 `tokensSaved` 非有限非负数（如 `-5`）⇒ 脏；
+ *   · 某层缺席 ⇒ **不是脏**，只是该层没参与这次折叠（照实跳过该层）；
+ *   · `tokensSaved` 缺席 ⇒ 不是脏，按 0 计（`triggered` 才是「有没有折」的判据）。
+ *
+ * @param {unknown} entry `compactionStats[i]`
+ * @returns {Record<string, {triggered: number, tokensSaved: number}> | null} 脏 ⇒ null
+ */
+function parseCompactionEntry(entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const layers = /** @type {{layers?: unknown}} */ (entry).layers;
+  if (layers === null || typeof layers !== 'object' || Array.isArray(layers)) return null;
+  const parsed = {};
+  for (const id of COMPACTION_LAYER_IDS) {
+    const stat = layers[id];
+    if (stat === undefined) continue; // 层缺席 = 这一层没参与，不是脏数据
+    if (stat === null || typeof stat !== 'object' || Array.isArray(stat)) return null;
+    const { triggered, tokensSaved } = /** @type {{triggered?: unknown, tokensSaved?: unknown}} */ (stat);
+    if (!Number.isSafeInteger(triggered) || triggered < 0) return null;
+    if (tokensSaved === undefined) {
+      parsed[id] = { triggered, tokensSaved: 0 };
+      continue;
+    }
+    if (typeof tokensSaved !== 'number' || !Number.isFinite(tokensSaved) || tokensSaved < 0) return null;
+    parsed[id] = { triggered, tokensSaved: Math.floor(tokensSaved) };
+  }
+  return parsed;
+}
+
+/**
+ * #451：`session.compaction` 聚合器（**纯函数、零查询**）——读侧覆盖存量与新 run。
+ *
+ * 语义（三条硬口径都在这里）：
+ *   ① **键缺席而非零**：全库一条有效 `compactionStats` 都没有（或所有层的 `triggered` 都是 0）
+ *      ⇒ 返回 `null`，调用方**整个 `compaction` 键都不给**——「键缺席 = 本会话没有任何折叠」，
+ *      不是 `{}` / 不是全零对象（#390-A 同一形状）。
+ *   ② **全零层不列**：只输出 `triggered > 0` 的层（`layers.foldLlm.triggered === 0` ⇒ 没有 `foldLlm` 键）。
+ *   ③ **脏数据不炸**：脏条目逐条跳过并计入 `skipped`（进 LOG / 进测试断言，**不进 DTO**），
+ *      其余轮照常汇总。
+ *
+ * `rounds` 按**轮号去重**计数（同一轮若出现多条 stats 只算一轮）；`lastRound` 是贡献过统计的最大轮号。
+ * ⚠ 「贡献过」的准确含义是「这一轮至少有一层 `triggered > 0`」——全零轮（六层全 0）不进 `rounds`、
+ * 也不推 `lastRound`。工单里写的是「有 compactionStats 的轮数」，而真库 82 条 stats 里全零轮是 **0 条**
+ * （引擎不会为「什么都没折」的轮写统计），所以两种读法在今天的真数据上逐字相等；选后者是因为它让
+ * 「键在 ⇒ `rounds ≥ 1`、`lastRound` 必定指向一轮真有折叠」自洽（否则会出现 `layers` 全空却 `rounds > 0`）。
+ *
+ * 实现上它只是 `collectTranscriptFacts` 的一个薄壳（同一个累加器，不另扫一遍）：
+ * 单独导出是为了让「聚合语义」能被单测直接钉住，不必每次都造整个 DTO。
+ *
+ * @param {Array<{round?: unknown, record?: unknown}>} transcriptRows
+ * @returns {{compaction: {rounds: number, layers: Record<string, {triggered: number, tokensSaved: number}>, tokensSaved: number, lastRound: number | null} | null, skipped: number}}
+ */
+export function aggregateCompactionStats(transcriptRows) {
+  const { compaction, skippedCompactionEntries } = collectTranscriptFacts(transcriptRows);
+  return { compaction, skipped: skippedCompactionEntries };
+}
+
+/**
+ * #451：`transcriptRows` 的**那一次**扫描——三份事实一起产出，谁都别再扫第二遍。
+ *
+ * 为什么合成一个函数而不是三个 `filter`/`for`：`GET /api/sessions/:id` 要同时拿到
+ * ① 折叠行真摘要（#390-A）、② 折叠替代物（#440）、③ 压缩层聚合（#451）；分三趟就是三倍
+ * `recordForProjection` 调用。成本红线的**判据**是 SQL 次数不变，但同一个数组扫三遍同样没必要。
+ *
+ * @param {Array<{round?: unknown, record?: unknown}>} transcriptRows
+ * @returns {{roundsWithRealSummary: Set<number>, foldedFactsByRound: Map<number, unknown>, compaction: object | null, skippedCompactionEntries: number}}
+ */
+export function collectTranscriptFacts(transcriptRows) {
+  const rows = Array.isArray(transcriptRows) ? transcriptRows : [];
+  const roundsWithRealSummary = new Set();
+  const foldedFactsByRound = new Map();
+  const totals = new Map(); // layerId → {triggered, tokensSaved}
+  const roundsSeen = new Set();
+  let lastRound = null;
+  let skipped = 0;
+  for (const row of rows) {
+    // 一行只过一次 `recordForProjection`：折叠那半边与压缩那半边读的是同一个合成后的 record。
+    const { record } = recordForProjection(row);
+    const round = Number(row.round);
+    if (record?.folded === true) {
+      if (hasRealSummary(record)) roundsWithRealSummary.add(round);
+      const foldedFacts = record?.foldedFacts;
+      if (foldedFacts !== undefined && foldedFacts !== null) foldedFactsByRound.set(round, foldedFacts);
+    }
+    // ---- #451：压缩层统计（同一趟扫描的第三个消费者）----
+    const stats = record?.compactionStats;
+    if (stats === undefined || stats === null) continue;
+    // `compactionStats` 不是数组 ⇒ 这一行脏（跳过并计数），不是「没有统计」。
+    if (!Array.isArray(stats)) {
+      skipped += 1;
+      continue;
+    }
+    // 按数组遍历（**不假设**长度恒 1）：引擎每轮 append 一条是今天的实测事实，不是契约。
+    for (const entry of stats) {
+      const parsed = parseCompactionEntry(entry);
+      if (parsed === null) {
+        skipped += 1;
+        continue;
+      }
+      const layerIds = Object.keys(parsed);
+      if (layerIds.length === 0) continue; // 空 layers ⇒ 这一条什么也没说
+      // 全零轮不算「有折叠的轮」（见上方注释：真库 0 条全零 stats，两种读法在真数据上等价）。
+      if (!layerIds.some((id) => parsed[id].triggered > 0)) continue;
+      if (Number.isFinite(round)) {
+        roundsSeen.add(round);
+        if (lastRound === null || round > lastRound) lastRound = round;
+      }
+      for (const id of layerIds) {
+        const target = totals.get(id) ?? { triggered: 0, tokensSaved: 0 };
+        target.triggered += parsed[id].triggered;
+        target.tokensSaved += parsed[id].tokensSaved;
+        totals.set(id, target);
+      }
+    }
+  }
+  const layers = {};
+  let tokensSaved = 0;
+  for (const id of COMPACTION_LAYER_IDS) {
+    const total = totals.get(id);
+    if (!total || total.triggered <= 0) continue; // ② 全零层不列（不是列个 0）
+    layers[id] = { triggered: total.triggered, tokensSaved: total.tokensSaved };
+    tokensSaved += total.tokensSaved;
+  }
+  // ① 键缺席而非零：一条都没折（或全零）⇒ null，调用方不给这个键。
+  const compaction = Object.keys(layers).length === 0
+    ? null
+    : { rounds: roundsSeen.size, layers, tokensSaved, lastRound };
+  return {
+    roundsWithRealSummary,
+    foldedFactsByRound,
+    compaction,
+    skippedCompactionEntries: skipped,
+  };
+}
+
+/**
  * Build the existing message DTO from the official display projection plus message anchor metadata.
  * Synthetic rows (for example judge/wrapup injections) have no required transcript
  * text match yet, so their content intentionally remains sourced from the anchor.
@@ -354,8 +511,14 @@ function attachToolCallDurations(toolCalls, runId, durations) {
  * issue #283 可选入参 `toolCallRows`：宿主自有 `tool_calls` 里取出的
  * `{run_id, call_id, duration_ms}` 行（只带有时长的行）。不传/空数组 ⇒ DTO 的 `toolCalls[]`
  * 与以前逐字相同（向后兼容，文本取数面 `session-text.js` 就不传）。
+ *
+ * 可选入参 `facts`：调用方已经跑过 `collectTranscriptFacts(transcriptRows)` 时把它传进来，
+ * 本函数就不再自己扫一遍（`GET /api/sessions/:id` 正是这样：同一次扫描既喂投影、又喂
+ * `session.compaction` 聚合——成本红线的落点）。不传 ⇒ 行为与以前逐字相同。
  */
-export function projectSessionMessages({ sessionId, anchors, userAnchors, transcriptRows, toolCallRows }) {
+export function projectSessionMessages({
+  sessionId, anchors, userAnchors, transcriptRows, toolCallRows, facts = null,
+}) {
   const users = [...userAnchors].sort((a, b) => Number(a.seq) - Number(b.seq));
   const userById = new Map(users.map((anchor) => [String(anchor.id), anchor]));
   const userAnchorsByText = new Map();
@@ -413,24 +576,13 @@ export function projectSessionMessages({ sessionId, anchors, userAnchors, transc
 
   // #390-A：折叠行的真摘要按**折叠行自己的 round** 记账（`recordForProjection` 恒把 round 列合成进
   // record，所以 turn.round 与 row.round 必然同值，两边对得上）。只扫一遍入参行，无额外查询。
-  const roundsWithRealSummary = new Set((Array.isArray(transcriptRows) ? transcriptRows : [])
-    .filter((row) => {
-      const { record } = recordForProjection(row);
-      return record?.folded === true && hasRealSummary(record);
-    })
-    .map((row) => Number(row.round)));
-
-  // #440：折叠替代物（`record.foldedFacts`）同样按**折叠行自己的 round** 记账——与上面那个 Set 同一把
-  // 键、同一次扫描口径（都过 `recordForProjection`，不读原始行）。旧账本没有这个键 ⇒ 表里没这一项
-  // ⇒ DTO 里 `summaryText`/`summarySource`/`truncated` 三个键全部缺席（不是 null / false）。
-  const foldedFactsByRound = new Map();
-  for (const row of Array.isArray(transcriptRows) ? transcriptRows : []) {
-    const { record } = recordForProjection(row);
-    if (record?.folded !== true) continue;
-    const facts = record?.foldedFacts;
-    if (facts === undefined || facts === null) continue;
-    foldedFactsByRound.set(Number(row.round), facts);
-  }
+  //
+  // #451（compactionStats 观测面）：这一趟扫描同时产出三份事实——`roundsWithRealSummary` /
+  // `foldedFactsByRound` / `compaction`（压缩层聚合）。**一趟扫描供三处消费**，聚合不另起一轮
+  // 遍历、更不另发 SQL（成本红线：`GET /api/sessions/:id` 对 `transcript_rounds` 的查询次数不变）。
+  const resolvedFacts = facts ?? collectTranscriptFacts(transcriptRows);
+  const roundsWithRealSummary = resolvedFacts.roundsWithRealSummary;
+  const foldedFactsByRound = resolvedFacts.foldedFactsByRound;
 
   const setRunText = (runId, assistantText, foldText, turns) => {
     if (assistantText !== null) assistantContent.set(runId, assistantText);
