@@ -3098,7 +3098,7 @@ DTO 立刻给出 `round=25 hasSummary=False src=llm trunc=True text=1278B range=
 ⇒ 读侧改动可以**只换 portal 镜像、不重跑 run、不动账本**验证，这条比「再造一个长会话」便宜一个数量级。
 
 **M2 = `folding.toolResultTtl=6` / `toolResultFoldMinTokens=8000`（引擎默认 `2 / 4000`）。**
-⚠ **本片没能用 A/B 证明收益，注释与台账都如实写「待验证的裁定」**：v0.1.46 真机基线（12 个 4971 token
+⚠ **本片没能用 A/B 证明收益，注释与台账都如实写「待验证的裁定」**（⚠ **下面这段的判据后来被证伪，见 §8.87**——「0 条 `compaction` 事件」不等于「TTL 层没触发」，TTL 层根本不发那个事件）：v0.1.46 真机基线（12 个 4971 token
 文件、8 轮、budget≈460K）观测到 **0 条 `compaction` 事件**、`input_tokens` **单调递增**
 `4891→10639→18403→26962→43266→55463→68010→90263`（TTL 若折过必然回落）。引擎侧 `shouldSchedule`
 要求 `effectiveMaxRounds - budgetRounds > 2` **且** `lowBudgetPrompted !== true`
@@ -3178,7 +3178,7 @@ main CI `41577347490` 两个 job 全绿 → tag `v0.1.48` → release `415779232
 **全唯一、0 重复读**、21 条 toolCall 全带 `resultPreview`、`messages` 2 条正文正常、agentd
 `sse connected` + `sse ping received`、portal 日志无 error/warn ⇒ **零回归**。
 
-**⚠ `folding.toolResultTtl=6` / `toolResultFoldMinTokens=8000` 在 0.30 下**依然一次没触发**（0 条 `compaction` 事件）** ——
+**⚠ `folding.toolResultTtl=6` / `toolResultFoldMinTokens=8000` 在 0.30 下**依然一次没触发**（0 条 `compaction` 事件）**（⚠ **此判据已被证伪，见 §8.87**）——
 这是**第二次**同结论（§8.85 首次）。不是版本问题：引擎 `shouldSchedule` 要求
 `effectiveMaxRounds - budgetRounds > 2` **且** `lowBudgetPrompted !== true`（`src/compact/pipeline.js:21-26`），
 而多轮任务一旦开始催收尾就关掉 TTL 层。⇒ **这两个旋钮至今没有收益证据**，仍属「待验证的裁定」；
@@ -3189,3 +3189,53 @@ main CI `41577347490` 两个 job 全绿 → tag `v0.1.48` → release `415779232
 ② `finalTextFallback` 的**真机造场**（需要 forcedFinal + 终稿空正文）同样未做，证据在
 `runner/test/final-text-fallback.test.js` 与 `internal.test.js` 的落库/幂等用例；③ `budgetTokens` 显式预算未接
 （窗口派生够用，要接得先量差）；④ `verification.guardVerdict` / `deliverables` 结构上不产生，不接。
+
+### 8.87 更正 §8.85/§8.86 的「TTL 层未触发」：判据用错了落点，TTL 一直在工作（省 31.4 万 token）（2026-11-03）
+
+**这不是新功能，是一次判据纠错。** 用户追问「TTL 是几轮后挪走对吧？为什么这是问题」时我回去查数据，
+发现**两版台账的核心结论是错的**。
+
+**错在哪**：我把「`run_events` 里 `type='compaction'` 事件数 = 0」当成「TTL 层没触发」。而
+**TTL 层根本不发 `compaction` 事件**——那条事件是**预算层**（策略层 / `slidingWindow`）折叠时才发的。
+TTL 层走的是另一条路（`provider-runner.js:228-238`）：
+
+```
+foldToolResultsForRequest(...) → ttlStats.foldedCount > 0
+  → ctx.recordCompactionLayer({layerId:'ttl', ...})
+  → orchestrator.js:2728 recordCompactionLayer → recordCompactionStat
+  → runToolLoop 返回值的 result.compactionStats[]（每轮一条）
+  → 引擎写进轮记录 transcript_rounds.record.compactionStats
+```
+
+而 `runner/worker.js` **从来没消费过 `result.compactionStats`**（只读 `termination`/`usage`/`rounds`/`finalText`/
+`finalTextFallback`）⇒ 这个事实**一直在轮记录里躺着，没人看**，所以我两次都读到了「0」。
+
+**真相（现查全库 82 条带 `compactionStats` 的轮记录）**：
+
+| 层 | triggered | tokensSaved |
+|---|---|---|
+| **ttl** | **75** | **314 518** |
+| slidingWindow | 8 | （同批） |
+| foldLlm | 1 | （同批） |
+| enforceSize | 1 | |
+| foldStatistical / anchors | 0 | 0 |
+
+75 次**全部来自 todo-multi 那三轮多轮对话**（`ce0260ca-…`，29 / 44 / 60 轮，输入 1.12M / 1.31M / 1.95M token），
+集中在第 50–57 轮。⇒ **TTL 层在长会话里每轮折 1 条、累计省 31.4 万 token**（占三轮总输入 4.37M 的 7%）；
+在短 run（8–11 轮）里确实不触发（上下文还没堆到那个程度）。
+
+**所以 `toolResultTtl` 2 vs 6 的区别是真实的**：`ttl=2` 时第 N 轮的工具结果第 N+2 轮变占位符，`ttl=6` 时第 N+6 轮才变
+⇒ 多保留 4 轮原文（好处是不用重读，代价是上下文更大、可能更早触发策略折叠）。**但 `ttl=6` 至今没有长会话数据**
+（v0.1.47 凌晨才部署，之后只跑过两个短 run）⇒ 6 是好是坏**仍未验证**，需要一次 60 轮量级的 A/B
+（基线就是 todo-multi 第 3 轮：60 轮 / 1.95M token / 75 次 TTL 折叠）。
+
+**教训（比结论值钱）**：**「引擎有这个层」≠「它在事件面可见」。** 判据必须落在**事实的落点**上：
+问「某层触发了没有」，就去读那一层自己写的地方（这里是 `compactionStats`），而不是读一个**看起来相关但只覆盖部分层**
+的观测面（`compaction` 事件只覆盖预算层）。同类形状：`foldSummary` 只在 `compaction` 事件里（§8.73）、
+`finalTextFallback` 只在 `runToolLoop` 返回值上（§8.86）——**每个事实都有自己的出口，猜出口就会得出反向结论**。
+⚠ 这条错误的代价不是返工，是**我差点建议用户撤掉一个正在省 31 万 token 的配置**（撤的依据是「它没作用」，
+而它其实在长会话里一直工作）。⇒ **撤一个东西之前，先证明它在自己的落点上确实没工作。**
+
+**修法**：观测面单开一片（工单 `.work-orders/compaction-stats-observability.md`）——读侧从
+`transcript_rounds.record.compactionStats` 聚合出 `session.compaction`（零 DDL、覆盖存量），前端在既有位置给一行
+「压缩：TTL 折 N 条（省 X token）· 窗口折 M 次」。这样「压缩有没有在工作」一眼可见，不必每次翻 SQL。
