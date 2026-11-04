@@ -3277,3 +3277,43 @@ release `41741485753` success → **只 pin portal + proxy 两个**（`git diff 
 我在**无其他负载**下跑同一 worktree = **54 文件 / 1012 全绿 rc=0**。⇒ 与 §8.63/§8.82 同一形状：
 **worker 跑前端测试时主 agent 并行跑重活**（根测试 / 大 SQL）会把它们压红。口径：派工跑前端期间，
 主 agent 不要并行起重活；看到这类红先自己空载复跑，别改代码。
+
+### 8.89 #451 真机演练（`summarizer_failed`）抓到两件事：注入路径不可行 + 历史回放缺人话（v0.1.50，2026-11-03）
+
+**先说结论**：这次演练**没能在真机上让引擎真的抛 `summarizer_failed`**，但**抓到并修掉了一个真缺口**——
+「同一个错误码，实时面有人话、刷新后只剩 `code=xxx`」。
+
+**① 注入路径为什么不可行（结构性，不是成本问题）**。要让 `fold-llm` 的摘要器失败，唯一可造的形状是
+「摘要器输入超窗 ⇒ 网关 400 ⇒ `context_window_exceeded`」。但引擎有两道结构约束把这条路堵死：
+
+- 摘要器输入受 `keepRounds` 与窗口共同约束：被折轮 ≈ `总轮数 - keepRounds(6)`，而**主模型请求**是保留的那 6 轮
+  + 系统提示（≈3300 token）⇒ 要让「被折轮 > 窗口」同时「保留轮 < 窗口」，必须精确控制单轮体积
+  （`ctx=9000` 时 `per_round < 950` 且总轮数 > 15.5；`ctx=65536` 时 `per_round < 10373` 且 > 12.3 轮）。
+- 更致命的是**超窗会自动重试一次，且重试是「砍一半」**（`fold-llm.js:573 retryBoundFor` → `Math.floor(current/2)`）
+  ⇒ 要让重试也超窗，首次输入必须 > **2×窗口**，于是 `总轮数 > 2×ctx/per + 6`（`ctx=9000` 时 ≈ **25 轮**，
+  且 `per_round` 要卡在 900 上下——主模型请求只剩 300 token 余量）。**这不是「跑一次就能造出来」的形状。**
+
+⇒ 口径：**`summarizer_failed` 的引擎侧（`throw new KitError(...)`）由上游代码与本站单测覆盖，不做真机注入**；
+真机只验**我们自己那一段**（终态落库 → DTO → 前端文案）。这条写下来是为了下次别再花 20 分钟算一遍。
+
+**② 演练抓到的真缺口（已修，v0.1.50）**：`RUN_ERROR_CODE_LABELS`（`summarizer_failed → summarizerFailed`
+的人话表）原先**只在实时 `run_end` 的 `d.error` 信封那一支被查**（`useEventStream.ts:1004`），而
+**历史合成项 `run_termination` 只有 `termination`、没有 `error` 信封** ⇒ 同一个 `summarizer_failed`：
+实时显示「压缩摘要器调用失败 ⇒ …」，**刷新后只剩 `run ended: failed — run failed（code=summarizer_failed）`**。
+这违反 §8.47 立的口径「实时 `run_end` 与历史合成项**共用 `runEndLine`**（同文案同分级，否则刷新一次颜色就变）」。
+修法 = 把查表挪进 `runEndReasonText`（两条路的唯一汇合点），未命中的码逐字保持 `（code=xxx）`。
+
+**判据**：新用例 `historyRunEndEntry` 那条（真机形状：`run_termination` + `termination.errorCode='summarizer_failed'`
+⇒ 文案含「压缩摘要器调用失败」+「重试」+ `code=`）+ 反向对照（未登记的码逐字不变）。
+**变异**：把查表挪回只有实时面 ⇒ 恰 1 条红。基线 根 **1767/1763/0/4 不变**、前端 **54 文件 / 1012 → 1013**、
+runner 451 不变、`typecheck` rc=0。
+
+**真机验证（v0.1.50，DB 注入终态 + 浏览器）**：注入 `{reason:'failed', errorCode:'summarizer_failed'}` 到探针 run
+⇒ 历史回放渲染 `run ended: failed — run failed（the compaction summarizer failed, so this run failed (this is not
+a degraded summary: the context was not compacted; retry) · code=summarizer_failed）`（修复前只有 `code=…`）；
+验完已复原（`judge_done` / `finished`），模型元数据 6 条全在基线（`ctx 512000|262144`、`maxout 32768`、
+`litellm_max 32768`）。截图 `v0150-451-summarizer-failed-human-text.png`。
+
+**⚠ 过程账（同一条坑第二次）**：我做变异时 `git checkout -- <file>` 把**尚未 commit 的修复**一起抹掉了
+（§8.82 记过一模一样的教训）。⇒ **口径：做变异前先 `git commit`**，否则「复原变异」会把修复也复原掉；
+发现后重新应用修复并**先提交再变异**，变异才红得可信。
