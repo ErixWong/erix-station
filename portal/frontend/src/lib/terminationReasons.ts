@@ -63,10 +63,24 @@
 //        不同，且两处**都只是 `@deprecated` 注释**（工厂本体没删）；`payload.js` / `timeout.js` /
 //        `errors.js` / `openai.js` 逐字节相同 ⇒ provider 层可重试码面零差异。
 //     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
+//   * 0.30.0 → 0.31.0（#447 升级片）七度核，按 0.31.0 现查（0.30.0 / 0.31.0 两份 `npm pack` 解包逐字对比）：
+//     ① `src/loop/termination.js` 用 `diff -u` 对 0.30.0 与 0.31.0 **无任何输出**（逐字节相同）；
+//        另用 `grep -oE '…|sort -u'` 取 reason 字面值，两侧都是同十个值
+//        （`aborted` / `continuation_exhausted` / `end_turn` / `failed` / `final_guard_unverified` /
+//        `judge_done` / `max_rounds_cap` / `no_tool` / `stall` / `timeout`）⇒ 值域零变化。
+//     ② `src/loop/orchestrator.js` 的 typedef 两侧都是同一组九值、同一声明顺序
+//        （`end_turn,no_tool,stall,max_rounds_cap,judge_done,continuation_exhausted,final_guard_unverified,aborted,failed`）；
+//        `? "failed" : "persistence_failed"` / `const reason = signal?.aborted` /
+//        `operation: persistenceFailure.operation` 三处形状断言仍然命中。
+//     ③ `diff -rq <0.30.0>/src/providers <0.31.0>/src/providers` 只有 `anthropic.js` 不同 +
+//        `anthropic.d.ts` 消失；`anthropic.js` 的 diff 只有一行 `@deprecated … removed in 0.30 → in 0.31`
+//        的注释（工厂实现仍在，只是不再导出）；`errors.js` 的 `RETRYABLE_CODES` 两侧仍是
+//        `timeout` / `rate_limited` / `server` / `disconnect` ⇒ provider 层可重试码面零差异。
+//     ⇒ **只追版本号，不放宽任何断言**（§8.27 / §8.65 先例）。
 //   * `reflection_stop` 已不是引擎取值（旧文档残留），只可能出现在历史数据行里，故**不在**本集合。
 
 /** 常量对齐的引擎版本（升级 erix-agent 时必须重跑防漂移测试并按需重开 issue）。 */
-export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.30.0';
+export const ENGINE_VERSION_FOR_TERMINATION_REASONS = '0.31.0';
 
 /**
  * 引擎 `termination.reason` 全集（顺序 = 引擎 typedef 声明顺序，`persistence_failed` 追加在末尾）。
