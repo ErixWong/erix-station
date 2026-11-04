@@ -228,8 +228,19 @@ function runEndReasonText(reason: string, termination?: RunTermination | null): 
   }
   // issue #261：typeof + 非空双重判定——后端 additive 字段，旧 run / 旧引擎 / 显式 null 都要
   // 落回「文案零变化」，不能让 `（code=undefined）` 这种字样渗进用户可见文案。
+  // issue #451 真机演练补的缺口：人话表（`RUN_ERROR_CODE_LABELS`）原先**只在实时 `run_end` 的
+  // `d.error` 信封**那一支被查（见本文件 `run_end` 分支），而**历史合成项 `run_termination` 只有
+  // `termination`、没有 `error` 信封** ⇒ 同一个 `summarizer_failed`，实时有人话、**刷新后只剩
+  // `code=summarizer_failed`**。这违反 §8.47 立的口径「实时 `run_end` 与历史合成项共用 `runEndLine`
+  // （同文案同分级，否则刷新一次颜色就变）」。
+  // ⇒ 查表挪到这一格（两条路的唯一汇合点）：命中的码带人话，未命中的码逐字保持 `（code=xxx）`。
   const code = termination?.errorCode;
-  if (typeof code === 'string' && code !== '') text += `（code=${code}）`;
+  if (typeof code === 'string' && code !== '') {
+    const labelSuffix = Object.hasOwn(RUN_ERROR_CODE_LABELS, code) ? RUN_ERROR_CODE_LABELS[code] : '';
+    text += labelSuffix === ''
+      ? `（code=${code}）`
+      : `（${t(`stream.event.runErrorCode.${labelSuffix}`)} · code=${code}）`;
+  }
   return text;
 }
 

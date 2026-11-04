@@ -236,6 +236,34 @@ describe('useEventStream（mock EventSource）', () => {
   // —— 摘要器失败不再静默降级成统计摘要，而是让 run 以 `failed` 收场。用户看到的不能只是引擎那句
   // 英文技术文本，必须有一句人话（「压缩摘要器调用失败 ⇒ 本次运行失败（可重试）」）。
   // ⚠ 口径：**不新增 UI 结构**（仍是既有红色 `.syserr` + `code=` 后缀），只换 `{message}` 那一格。
+  it('历史回放（#451 真机演练补的缺口）：run_termination 合成项也必须带人话 —— 实时与历史同文案', () => {
+    // 真机现场：同一个 `summarizer_failed`，实时 `run_end` 有 `d.error` 信封 ⇒ 人话；
+    // 刷新后走 `run_termination` 合成项（只有 `termination`、没有 `error`）⇒ 只剩 `code=summarizer_failed`。
+    // 这条钉住「两条路共用 `runEndReasonText`」，谁把查表挪回 `d.error` 那一支就红。
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    // 历史入口是 `historyRunEndEntry`（openSession 归并循环里调它），不是 `run_termination` 的 SSE 分支。
+    const entry = s.historyRunEndEntry({
+      seq: 9,
+      run_id: 'run-hist',
+      type: 'run_termination',
+      payload: { status: 'failed', termination: { reason: 'failed', errorCode: 'summarizer_failed' } },
+    });
+    expect(entry, '历史回放必须给出终态行').not.toBeNull();
+    expect(entry!.kind).toBe('syserr');
+    expect(entry!.text).toContain('code=summarizer_failed');
+    expect(entry!.text).toContain('压缩摘要器调用失败');
+    expect(entry!.text).toContain('重试');
+    // 反向对照：未登记的码逐字保持 `（code=xxx）`，不许被这张表吞掉或改写。
+    const unknown = s.historyRunEndEntry({
+      seq: 10,
+      run_id: 'run-x',
+      type: 'run_termination',
+      payload: { termination: { reason: 'failed', errorCode: 'timeout' } },
+    });
+    expect(unknown!.text).toBe('run 结束：failed — 运行失败（code=timeout）');
+  });
+
   it('run_end 失败横幅（#442）：summarizer_failed 走人话（码仍原样带出）；未知码照旧透传引擎原话', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
