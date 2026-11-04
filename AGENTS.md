@@ -3317,3 +3317,48 @@ a degraded summary: the context was not compacted; retry) · code=summarizer_fai
 **⚠ 过程账（同一条坑第二次）**：我做变异时 `git checkout -- <file>` 把**尚未 commit 的修复**一起抹掉了
 （§8.82 记过一模一样的教训）。⇒ **口径：做变异前先 `git commit`**，否则「复原变异」会把修复也复原掉；
 发现后重新应用修复并**先提交再变异**，变异才红得可信。
+
+### 8.90 v0.1.51：erix-agent 0.30.0 → **0.31.0**（16 个导出真删 / 六格全不变 / Z3 翻向成硬判据）（issue #447，2026-11-04）
+
+**上游把 0.30 那句谎话修掉了。** 0.31.0 指南开篇就写：「这一版才是真正落地那 16 个删除的破坏包——0.30.0 指南宣布了
+它们，而 0.30.0 的包里一个都没删」，并在 `CHANGELOG` 里给 0.30 那一页做了**勘误**（上游 issue #686）——
+正是我在 §8.86 量到的矛盾。
+
+**这一版对我们几乎是零改动**（指南 §4 六格逐格「不变」），我把三处复核做成了实测而不是引用：
+
+| 复核项 | 实测结果 |
+|---|---|
+| `termination.js` 两份解包 `diff -u` | **逐字节相同**；reason 字面量两侧同十个值、typedef 两侧同九值同顺序 |
+| `src/providers/**` | 只有 `anthropic.js` 变，且**只有一行注释**（`removed in 0.30` → `in 0.31`，工厂实现仍在）；`payload.js`/`timeout.js`/`errors.js`/`openai.js` 逐字节相同、`RETRYABLE_CODES` 同四码 |
+| `budget.js` + `tool-result-ttl.js` | `diff -u` **无输出**；`TOOL_RESULT_TTL_DEFAULT=2` / `FOLD_MIN_TOKENS=4000` / `computeBudget` 全在原位 |
+| `LoopEvent` | 仍 **27 类**逐名相同 |
+| 16 个被删导出 | 0.31.0 两个入口**一个都不在**（0.30.0 时全在） |
+
+**载荷**：pin 0.31.0（两处 + 两份 lockfile，`--save-exact` 未破）+ 三处版本线闸追号（`llm-timeouts` /
+`terminationReasons.ts` / 其 spec）+ **Z3 翻向**。
+
+**Z3 翻向是本单唯一的值**：`portal/test/engine-removed-exports.test.js` 的 ② 在 0.30 时代是「与实测快照逐名对账」
+（因为那 16 个名字**还在**导出面，照字面写「必须不在」会一落地就红）；现在改成**硬判据**
+`SURFACE_SNAPSHOT_0_31_0 = {'.': [], './tools': []}` + 断言「必须一个都不在」。**Z1（零消费者）一字未动**，
+并在注释里补了一句「**上游删了也不许撤这一条**：将来上游把名字加回来时，Z1 是第一道（也是唯一一道）防线」。
+Z4 的 `NOTE_VALUE_MAX_CHARS` 改成两入口**双向钉**（名单侧 + 快照结构侧），比原先更强。
+
+**基线**：根 **1767/1763/0/4 → 1767/1763/0/4**（**逐数相同**，本片只改版本号常量与 Z3 快照）、runner **451 不变**、
+前端 **54 文件 / 1013 不变**、`typecheck` rc=0。
+**主 agent 亲跑 3 条变异**：W1 快照塞回一个名字 ⇒ `Z3` + `Z4` 红；W2 真 import `estimateMessagesTokens` ⇒ `Z1` 红；
+W3 runner 版本闸回退 `0.30.0` ⇒ `llm-timeouts` 的 ② 组 4 条红（含「legacy 120s 绝对总闸」那条）。
+
+**发版与部署（v0.1.51）**：`c71c3f8`（PR #448）→ `25752a3`（版本 0.1.51）→ main CI 绿 → tag `v0.1.51` →
+release `41772471962` success → 清单三镜像 `image inspect .Id` **逐个一致**（portal `574ec081…` / fde `08621b3a…` /
+proxy `c3ab6488…`）→ `deploy/.env` 形态① pin **三项**（本版 `runner/package-lock.json` 变 = **引擎 pin 变了** ⇒
+**含 `FDE_IMAGE`**；备份 `/tmp/deploy.env.bak-0151`）→ `up -d --no-build` ⇒ portal healthy、`healthz=200` →
+**`docker rm -f` 5 台 FDE，reconcile 全部重建在 `0.1.51 / engine 0.31.0`**。
+
+⚠ **「引擎 pin 变」必须重建 FDE 容器**（§8.38 那条跨镜像类推的坑）：引擎装在 FDE 镜像里，
+`git diff -- runner/**/*.js` 为空**不代表**镜像没变——`runner/package-lock.json` 变了镜像就变了。
+这与 §8.19「runner 只有版本号变动就不重建」不是同一类（那次是站内 runner 代码没变且引擎 pin 没动）。
+
+**真机验收（v0.1.51）**：端到端 run ⇒ `finished/judge_done` + 助手回 `pong`；agentd `sse connected` +
+`sse ping received`；portal 日志无 error/warn；**容器内实测 0.31 的导出面**：`createAnthropicProvider` /
+`estimateMessagesTokens` / `serializeFoldedMessages` / `parseSummary` 四个抽样名字**全部「已删 ✓」**
+（这是 Z3 断言在真机上的镜像验证，不只是单测）。
