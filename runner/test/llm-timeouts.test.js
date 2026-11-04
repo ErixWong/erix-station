@@ -57,7 +57,13 @@ const REPO_ROOT = path.join(RUNNER_DIR, '..');
 // `portal/test/engine-removed-exports.test.js` 的实测快照），`anthropic.d.ts` 同步注释；
 // `payload.js` / `timeout.js` / `errors.js` / `openai.js` **逐字节相同** ⇒ 四相超时语义、legacy 120s
 // 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
-const ENGINE_VERSION_PINNED = '0.30.0';
+// 0.30.0 → **0.31.0** 复核结果（#447 升级片）：
+// `diff -rq <0.30.0>/src/providers <0.31.0>/src/providers` 只有两行：`anthropic.js` 不同、
+// `anthropic.d.ts` 在 0.31.0 里**消失**（工厂的 `.d.ts` 随删除登记表一起撤走，实现仍在）；
+// `anthropic.js` 的 diff **只有一行注释**（`@deprecated issue #429: removed in 0.30` → `in 0.31`），
+// 工厂本体没删。`payload.js` / `timeout.js` / `errors.js` / `openai.js` **逐字节相同**
+// ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
+const ENGINE_VERSION_PINNED = '0.31.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。

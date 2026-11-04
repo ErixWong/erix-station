@@ -1,4 +1,5 @@
-// issue #442（erix-agent 0.29.0 → 0.30.0）：**零消费者导出**的机器判据。
+// issue #442（erix-agent 0.29.0 → 0.30.0）建起、issue #447（0.30.0 → 0.31.0）**翻向**的：
+// **零消费者导出**的机器判据。
 //
 // 病灶（工单 §M1.1）：升级指南 `docs/host-upgrade-guide-0.30.0_cn.md` §2/§3 列了 16 个「零消费者导出」，
 // 说它们在 0.30.0 被删除。0.29 → 0.30 的升级动作本身因此退化成「抬版本号」——**而这件事当时只有
@@ -6,27 +7,32 @@
 // 16 个名字中的一个从本站的某个文件里「顺手用起来」，没有任何东西会响。
 //
 // 本文件把那份人工结论换成两条机器判据：
-//   ① **零消费者**（真闸门）：本站源码里一个名字都不许引用。它必须**现在就是绿的**，且能被变异打红
-//      （把一个名字真的 import 进任意一个源码/测试文件 ⇒ 红）。注释不算引用（见 `stripComments`）：
+//   ① **零消费者**（真闸门，**永久**）：本站源码里一个名字都不许引用。它必须**现在就是绿的**，且能被变异
+//      打红（把一个名字真的 import 进任意一个源码/测试文件 ⇒ 红）。注释不算引用（见 `stripComments`）：
 //      「写进注释里提醒自己」是文档，不是依赖——本文件自己的注释里就写着 `createAnthropicProvider`。
-//   ② **导出面重评估 tripwire**：把「0.30.0 上实测到的导出面」钉成快照，与**现算**的导出面逐名对账，
-//      并用 `ENGINE_VERSION_MEASURED` 给快照盖版本章。上游真删 / 真加 / 本站升 pin 三者任一发生 ⇒ 红，
-//      红的那句话直接说「该重新评估哪一半」。
+//      ⚠ **上游删了也不许撤这一条**：将来上游把某个名字加回来时，Z1 是第一道（也是唯一一道）防线。
+//   ② **导出面硬判据**（0.31.0 起）：这 16 个名字在 `.` 与 `./tools` 两个入口上**必须一个都不在**。
+//      快照常量 `SURFACE_SNAPSHOT_0_31_0` 两个入口都是 `[]`（0.31.0 实测），现算结果与它逐名相等；
+//      `ENGINE_VERSION_MEASURED` 给快照盖版本章，升 pin 时强制重新量一遍。
 //
-// ⚠ 为什么 ② 不是「断言这 16 个名字**不在**导出面上」：**已发布的 0.30.0 一个都没删**。
+// ⚠ **② 在 0.30.0 上是「快照对账」而不是「必须不在」**，因为**已发布的 0.30.0 一个都没删**：
 //   实测证据（2026-11-03，`/tmp/ea30/package` = `npm pack erix-agent@0.30.0` 解包，其 tarball 的
 //   `sha1sum` 与 `npm view erix-agent@0.30.0 dist.shasum` = `9cb153da6216cecaf84ba3f2d1e51e31736a08a8`
 //   逐字节一致 ⇒ 就是 registry 上那一份）：
 //     · `src/index.js` 仍 `export { createAnthropicProvider } from "./providers/anthropic.js"`；
 //     · `src/tools/index.js` 仍导出 4 个 provider 工厂 + `removeRecord` / `resolveFileReadMaxBytes` /
 //       `setNotesClock` / `NOTE_VALUE_MAX_CHARS`；
-//     · 运行时 `await import('erix-agent')` / `await import('erix-agent/tools')` 里 16 个名字**全在**；
-//     · 那些定义上挂着 `@deprecated issue #429: removed in 0.30 …` 标记，而包内 `CHANGELOG.md` 的
-//       0.30.0 段自己写着「0.30.0（未发布 / unpublished）——已发布线是 0.29.0」。
-//   ⇒ 上游「删除登记表落地」这件事**没有随 0.30.0 发出来**；指南 §2/§3 描述的是一个尚未发布的状态。
-//   照工单原文「若那 16 个名字仍出现在导出面就红」字面实现，本文件会**一落地就红**（因为一个都没删），
-//   那样它就不是判据而是噪音。所以 ② 改成「快照对账」：它保住了同一个目的（上游导出面一变就必须
-//   重新评估本站的消费者面），但不在「上游还没发」这件事上撒谎。
+//     · 运行时 `await import('erix-agent')` / `await import('erix-agent/tools')` 里 16 个名字**全在**。
+//   上游已勘误那一页（issue #686）：0.30.0 只登记、没删；**删除落在 0.31.0**。
+//   ⇒ #447 把 ② 翻成它一开始就该是的形状：**「这 16 个名字不许出现在导出面」是一条可执行断言**，
+//   不是一句文档。
+//
+// 0.31.0 实测（2026-11-04，本 worktree 装好的包 + `/tmp/ea31/package` 解包两份互证）：
+//   · 运行时 `import('erix-agent')` / `import('erix-agent/tools')` 里 16 个名字**一个都不在**
+//     （两个入口的导出名总数分别是 85 / 46）；
+//   · `src/index.js` 与 `src/tools/index.js` 的 diff 只有**删行**（再导出表里那 17 行）；
+//   · 另外 9 个定义文件的 diff 只有 `@deprecated issue #429: removed in 0.30 → in 0.31` 这一行注释
+//     ⇒ 删的是**导出**，不是实现（指南 §2 的承诺在 0.31.0 才成立）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -76,34 +82,18 @@ const ZERO_CONSUMER_EXPORTS = [
 ];
 
 /** 快照盖的版本章：这一份「导出面上有谁」是在哪个引擎版本上量的。 */
-const ENGINE_VERSION_MEASURED = '0.30.0';
+const ENGINE_VERSION_MEASURED = '0.31.0';
 
 /**
- * **0.30.0 实测快照**：这些名字里，哪些真的出现在导出面上（按入口分组）。
- * 现算结果与它不等 ⇒ 红（见文件头 ② 的理由）。改这一格 = 重新评估，不是「修测试」。
+ * **0.31.0 实测快照**：这 16 个名字里，哪些真的出现在导出面上（按入口分组）。
+ * 0.31.0 起**两个入口都是空数组**——删除真的落地了（见文件头「0.31.0 实测」）。
+ * 现算结果与它不等 ⇒ 红：少了不可能（已经空了），所以红的只有一种情况——**上游把名字加回来了**，
+ * 那时本站在这些名字上的「零消费者」结论要重新评估（Z1 是闸门）。
+ * 改这一格 = 重新评估，不是「修测试」。
  */
-const SURFACE_SNAPSHOT_0_30_0 = {
-  '.': [
-    'MESSAGE_OVERHEAD_TOKENS',
-    'NOTE_VALUE_MAX_CHARS',
-    'createAnthropicProvider',
-    'createEnvModelConfigProvider',
-    'estimateMessagesTokens',
-    'extractL0',
-    'extractL0Fact',
-    'parseReflectionSummary',
-    'parseSummary',
-    'serializeFoldedMessages',
-  ],
-  './tools': [
-    'NOTE_VALUE_MAX_CHARS',
-    'createCompositeToolProvider',
-    'createJsonFileToolProvider',
-    'createStaticToolProvider',
-    'removeRecord',
-    'resolveFileReadMaxBytes',
-    'setNotesClock',
-  ],
+const SURFACE_SNAPSHOT_0_31_0 = {
+  '.': [],
+  './tools': [],
 };
 
 // ---------------------------------------------------------------------------
@@ -256,17 +246,17 @@ test('Z1 这 16 个零消费者导出：本站源码里一个都不 import / 不
 });
 
 // ---------------------------------------------------------------------------
-// 判据 ②：导出面重评估 tripwire（版本章 + 快照对账）
+// 判据 ②：导出面硬判据（版本章 + 「一个都不在」）
 // ---------------------------------------------------------------------------
 
 test('Z2 导出面快照盖的是**当前装着的**引擎版本（升 pin 后必须重新量一遍）', () => {
   assert.equal(engineVersion, ENGINE_VERSION_MEASURED,
     `引擎已从 ${ENGINE_VERSION_MEASURED} 升到 ${engineVersion}：`
-    + '`SURFACE_SNAPSHOT_0_30_0` 与 `ENGINE_VERSION_MEASURED` 必须在新版本上**重新量**，'
-    + '并重新决定这 16 个名字是「已删（本 tripwire 退役）」还是「仍在（继续盯消费者面）」。');
+    + '`SURFACE_SNAPSHOT_0_31_0` 与 `ENGINE_VERSION_MEASURED` 必须在新版本上**重新量**，'
+    + '并重新决定这 16 个名字是「仍然已删（继续钉不在场）」还是「被加回来了（重评 Z1）」。');
 });
 
-test('Z3 现算导出面与 0.30.0 实测快照逐名相等（上游删了/加回来都要重看这一页）', () => {
+test('Z3 这 16 个名字必须**一个都不在**导出面上（0.31.0 起是硬判据，不是快照对账）', () => {
   for (const entry of ['.', './tools']) {
     assert.ok(surface[entry].size >= 20,
       `从 ${entry} 入口只解析到 ${surface[entry].size} 个导出名，解析姿势可疑（入口文件形态变了？）`);
@@ -274,13 +264,13 @@ test('Z3 现算导出面与 0.30.0 实测快照逐名相等（上游删了/加�
       .filter((item) => item.entries.includes(entry))
       .map((item) => item.name);
     const measured = names.filter((name) => surface[entry].has(name)).sort();
-    assert.deepEqual(measured, SURFACE_SNAPSHOT_0_30_0[entry],
-      `${entry} 入口上这 16 个名字的**在场情况**与 0.30.0 实测快照不一致：\n`
+    assert.deepEqual(measured, SURFACE_SNAPSHOT_0_31_0[entry],
+      `${entry} 入口上这 16 个名字的**在场情况**与 0.31.0 实测快照（应为空）不一致：\n`
       + `  现算 = ${JSON.stringify(measured)}\n`
-      + `  快照 = ${JSON.stringify(SURFACE_SNAPSHOT_0_30_0[entry])}\n`
-      + '少了 ⇒ 上游真的删了：删掉 ZERO_CONSUMER_EXPORTS 里对应条目（这条 tripwire 可以退役一半），'
-      + '并在 AGENTS.md 记一笔「0.3x 起这些名字真的没了」。\n'
-      + '多了 ⇒ 上游把名字加回来了：本站在这些名字上的「零消费者」结论要重新评估（Z1 是闸门）。');
+      + `  快照 = ${JSON.stringify(SURFACE_SNAPSHOT_0_31_0[entry])}\n`
+      + '上游把名字加回来了 ⇒ 本站在这些名字上的「零消费者」结论要重新评估（Z1 是闸门）：\n'
+      + '要么把新用途登记进 AGENTS.md 并重开一张工单，要么把调用点改掉；\n'
+      + '⚠ 不许为了让它变绿把 Z3 改回去/删掉——它是「这 16 个名字不许出现在导出面」的唯一可执行断言。');
   }
 });
 
@@ -294,7 +284,15 @@ test('Z4 名单自身自洽：16 个名字、无重复、入口只有 `.` / `./t
       assert.ok(entry === '.' || entry === './tools', `${item.name} 的入口写成 ${entry}`);
     }
   }
-  // `NOTE_VALUE_MAX_CHARS` 在指南里是**两个入口都有**的唯一一个（`.` + `./tools`）⇒ 快照两侧都该有它。
-  assert.ok(SURFACE_SNAPSHOT_0_30_0['.'].includes('NOTE_VALUE_MAX_CHARS'));
-  assert.ok(SURFACE_SNAPSHOT_0_30_0['./tools'].includes('NOTE_VALUE_MAX_CHARS'));
+  // `NOTE_VALUE_MAX_CHARS` 在指南里是**两个入口都有**的唯一一个（`.` + `./tools`）。
+  // ⚠ 0.31.0 翻向时这两条从「快照里两边都有它」改成「**名单**里两边都挂着它 + 快照两边都有这一格
+  //   （值均为空）」：同一个事实（它是唯一的两入口名字）从名单侧 + 快照结构侧**双向**钉，比原先只查
+  //   快照内容更强（原先那两条在 `[]` 快照上恒假，不是「放宽」而是「换到不会随方向失效的那一侧」）。
+  const twoEntry = ZERO_CONSUMER_EXPORTS.filter((item) => item.entries.length === 2);
+  assert.deepEqual(twoEntry.map((item) => item.name), ['NOTE_VALUE_MAX_CHARS'],
+    '两入口名字有且只有 NOTE_VALUE_MAX_CHARS 一个');
+  assert.deepEqual(twoEntry[0].entries, ['.', './tools']);
+  assert.deepEqual(Object.keys(SURFACE_SNAPSHOT_0_31_0).sort(), ['.', './tools']);
+  assert.deepEqual(SURFACE_SNAPSHOT_0_31_0['.'], []);
+  assert.deepEqual(SURFACE_SNAPSHOT_0_31_0['./tools'], []);
 });
