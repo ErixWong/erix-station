@@ -718,3 +718,47 @@ test('#462 verifyLiveCertificate：指纹一致但链深 1 且非自签 ⇒ mism
     route.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// ⑧ #462 / 安全文档 S4：回滚用 `copyFile`（不把私钥读进进程内存）
+// ---------------------------------------------------------------------------
+
+test('#462/S4 rollback：copyFile 语义——prev 与恢复出的两文件逐字节相同、模式仍是 644/600、零次读 prev 私钥', async () => {
+  const dir = tmpDynamicDir('s4rollback');
+  try {
+    await writeCertificateAssets({ dynamicDir: dir, certPem: WILDCARD.certPem, keyPem: WILDCARD.keyPem, log: quietLog() });
+    await writeCertificateAssets({ dynamicDir: dir, certPem: OTHER.certPem, keyPem: OTHER.keyPem, log: quietLog() });
+    const prevCertPath = path.join(dir, 'certs', 'prev', 'tls.crt');
+    const prevKeyPath = path.join(dir, 'certs', 'prev', 'tls.key');
+    const prevKeyBytes = fs.readFileSync(prevKeyPath);
+
+    // 包一层 fsImpl：记录每一次 readFile，用来证明回滚路径没读过 prev 的私钥
+    const readPaths = [];
+    const fsImpl = {
+      async stat(p, ...rest) { return fs.promises.stat(p, ...rest); },
+      async readFile(p, ...rest) { readPaths.push(p); return fs.promises.readFile(p, ...rest); },
+      async copyFile(a, b, ...rest) { return fs.promises.copyFile(a, b, ...rest); },
+      async chmod(p, m) { return fs.promises.chmod(p, m); },
+      async mkdir(p, o) { return fs.promises.mkdir(p, o); },
+      async unlink(p) { return fs.promises.unlink(p); },
+    };
+
+    const out = await rollbackCertificateAssets({ dynamicDir: dir, log: quietLog(), fsImpl });
+    assert.equal(out.tlsOut.published, true);
+    assert.equal(out.cert.subjectCN, '*.fde.erix.vip', '回滚后返回的是 prev 那一代');
+
+    const certPath = path.join(dir, 'certs', 'tls.crt');
+    const keyPath = path.join(dir, 'certs', 'tls.key');
+    assert.deepEqual(fs.readFileSync(keyPath), prevKeyBytes, '恢复出的私钥与 prev 里的**逐字节相同**');
+    assert.equal(fs.readFileSync(certPath, 'utf8'), fs.readFileSync(prevCertPath, 'utf8'));
+    assert.equal(fs.statSync(keyPath).mode & 0o777, TLS_KEY_MODE, '回滚后私钥必须仍是 0600');
+    assert.equal(fs.statSync(certPath).mode & 0o777, 0o644);
+    assert.ok(!readPaths.includes(prevKeyPath), '回滚**不许**把 prev 的私钥读进内存（copyFile 就够了）');
+    assert.ok(!readPaths.includes(keyPath), '恢复出的私钥同样不该被读过');
+    // 幂等：再回滚一次结论不变
+    assert.equal((await rollbackCertificateAssets({ dynamicDir: dir, log: quietLog(), fsImpl })).tlsOut.published, true);
+    assert.deepEqual(fs.readFileSync(keyPath), prevKeyBytes);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
