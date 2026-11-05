@@ -2,7 +2,7 @@
 
 > 状态：**已落地**（issue #451；分支 `feat-261105-01-agents-md-layering`，PR 由主 agent 统一收尾）。
 > 代码落点：`runner/lib/agents-md.js`（采集 + 渲染）、`runner/worker.js` 的 `startRun`（接线）；
-> 判据：`runner/test/agents-md.test.js`（16 格）+ `runner/test/system-prompt.test.js`（指针用例改写 + 2 条接线锁）。
+> 判据：`runner/test/agents-md.test.js`（28 格）+ `runner/test/system-prompt.test.js`（指针用例改写 + 2 条接线锁）。
 > §7 表里标了各片完成情况；**§1.2 / §4.4 的实测数字一个都没改**（那是开工前的真机取证，改了就失去对照价值）。
 > 作者：主 agent；日期 2026-11-05（UTC+8）。裁决项见 §5。
 > 需求原话：「作为宿主需要实现一个功能，让 agent 读取 AGENTS.md 以及上级目录的 AGENTS.md，做个评估。」
@@ -182,6 +182,8 @@ export function renderAgentsMdSection({ blocks, notes = [], subdirHints = [] } =
 2. **scope 标注**：`home` ⇒ `platform`；`home/projects` ⇒ `workspace`；其它 ⇒ `project`。
    平台节由 materializer 生成（root:root），用户改不动 ⇒ 这是"不可覆盖"的**事实依据**，不是约定。
 3. **跳过**：不存在 / 非普通文件（`stat.isFile()===false`）/ 空或全空白 / 与前面某份 **sha256 相同**（去重，防用户抄一份）。
+   去重键是**规范化后**的 sha256（去前导 BOM + `\r\n` → `\n` + 首尾空白裁剪，#451 评审 m4）——拿原始字节算
+   会让「同内容只差 BOM / 行尾」的两份注两遍且 `notes=0`；**展示仍用原文**（归一只进键，不改 `blocks[].text`）。
 4. **越界**：`realpath(file)` 必须仍在 `realpath(home)` 内（挡 symlink 逃逸）；不满足 ⇒ 跳过 + note。
    实现以「链的最外层目录」为基准：home 是祖先时它就等于 `realpath(home)`；`cwd` 不在 home 之下时退回 `cwd`
    （否则那份项目文件按定义「越界」，永远读不到）。
@@ -210,8 +212,15 @@ export function renderAgentsMdSection({ blocks, notes = [], subdirHints = [] } =
 ### 4.2 渲染与拼接位置
 
 ```
-config.input.system = SYSTEM_PROMPT + '\n\n' + renderAgentsMdSection(blocks)
+// worker.js 的 startRun 内（与实现逐字对齐，#451 评审 m5）
+agentsMd = collectAgentsMd({ cwd, home: process.env.HOME || '/home/erix' });
+agentsMdSection = renderAgentsMdSection(agentsMd);   // 入参是 { blocks, notes, subdirHints } 整个对象，不是 blocks
+// …
+system: SYSTEM_PROMPT + agentsMdSection,
 ```
+
+前导 `\n\n` **由渲染自带**（`renderAgentsMdSection` 的返回值以 `\n\n` 开头），所以拼装点不再写 `+ '\n\n' +`；
+无 blocks 时 `agentsMdSection === ''` ⇒ `system` 逐字节等于原值。
 
 `renderAgentsMdSection` 输出形状（示意）：
 
@@ -355,7 +364,7 @@ dev 现查 `runs.usage.cacheRead` 有值（最近 5 条：3 328 / 3 328 / 3 328 
 | S1 | `runner/lib/agents-md.js` + `runner/test/agents-md.test.js` | 1 新文件（~150 行）+ 1 测试（~15 格） | ✅ 完成：采集器 326 行（含注释）+ 16 格单测（`8b945ab`）。实际导出与 §4.1 的草案差一处：`collectAgentsMd` 多返回 `subdirHints`（子目录索引是**索引不是正文**，不该混进 `blocks` 的账，也不该被截断逻辑当成一份内容）；`renderAgentsMdSection({ blocks, notes, subdirHints })` 因此多接受一个可选键 |
 | S2 | `runner/worker.js` 接线（3 行）+ 指针段改写 + `system-prompt.test.js` 重写指针用例 | ~20 行 + 1 测试改写 | ✅ 完成（`46f9465`）：`startRun` 内采集 + `MSG.LOG`（info，不新增事件类型）+ `system: SYSTEM_PROMPT + agentsMdSection`；指针段改为「已随本次 run 注入」；新增 2 条接线源码级锁。8 规则词禁词用例与 `0.0.0.0` 断言一字未动 |
 | S3 | 文档：`docs/design/user-space.md` §4.1.2 增行（层级与注入口径）、`docs/design/runner-integration.md` 记一句、本节转正 | 3 处 | ✅ 完成（本提交）：§4.1.2 增「注入 = 主路径」一行 + 「读取边界」行改口径 + §4.1 文件表同一句；`runner-integration.md` §6.3 新增 2b 条 |
-| S4 | 真机验收（§6.2 D1–D5） | 主 agent | ⬜ 未做（需要重建 FDE 镜像 + 真 run，本单不 push 也不起容器） |
+| S4 | 真机验收（§6.2 D1–D5） | 主 agent | D1–D4 ✅（数据见 `AGENTS.md` §8.91）/ D5 ⬜ |
 
 **必须重建 FDE 镜像**（动 `runner/`），并按 §8.17 `docker rm -f` 让 reconcile 重建。
 **不需要** portal 改动 ⇒ 平台 AGENTS.md 内容不变、物化不变。
