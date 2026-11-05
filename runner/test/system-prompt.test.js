@@ -233,15 +233,39 @@ test('SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」，并�
   assert.match(section, /cat ~\/AGENTS\.md/, '复核手段不得丢：模型要确认注入的约定文件是否被改过，只能 shell cat');
 });
 
-test('#451 接线锁①：worker.js 里 collectAgentsMd( 恰好 1 次，且在 async function startRun( 之后', () => {
+/**
+ * #451 评审 M3：取 `startRun` 的**函数体边界**。旧锁只比文本位置（`indexOf('collectAgentsMd(') > indexOf('async function startRun(')`）
+ * ⇒ 把采集整段搬到文件末尾（模块顶层）时旧锁全绿（主 agent 实测：agents-md 20/20 绿、system-prompt 与对照逐字相同）。
+ * 定界口径：`startRun` 是 2 空格缩进的 `async function startRun(`，函数体以**行首** `}` 收尾
+ * ⇒ 从 `startRunAt` 起找第一个 `\n}`。⚠ **不要用括号计数**：worker.js 里有模板字符串与正则字面量，`(` `)` 数不干净。
+ * （与 `agents-md.test.js` 的同名 helper 故意各留一份：两边都是源码级锁，互相 import 会把测试绑住。）
+ */
+function startRunBodyRange(src) {
+  const startRunAt = src.indexOf('async function startRun(');
+  assert.notEqual(startRunAt, -1, 'worker.js 必须仍有 `async function startRun(`');
+  const rel = src.slice(startRunAt).search(/\n\}/);
+  assert.notEqual(rel, -1, 'startRun 必须以行首 `}` 收尾（找不到 = 缩进形态变了，这条锁要跟着改而不是放宽）');
+  return { startRunAt, endAt: startRunAt + rel };
+}
+
+test('#451 接线锁①：collectAgentsMd( 恰好 1 次，且采集/渲染/拼接三点全部落在 startRun **函数体内**', () => {
   const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
   const hits = src.match(/collectAgentsMd\(/g) ?? [];
   assert.equal(hits.length, 1, `采集点必须唯一（实际 ${hits.length} 处）：两处采集 = 两份真相，后写者静默胜`);
-  const startRunAt = src.indexOf('async function startRun(');
-  assert.notEqual(startRunAt, -1, 'worker.js 必须仍有 `async function startRun(`');
-  assert.ok(src.indexOf('collectAgentsMd(') > startRunAt,
-    '采集必须写在 startRun **内部**：worker 进程会被 agentd 复用给下一个 run，提到模块顶层 = '
-    + '第二个 run 沿用第一个 run 的内容（§8.64 steerArmed 同型老账）');
+  const { startRunAt, endAt } = startRunBodyRange(src);
+  for (const needle of ['collectAgentsMd(', 'renderAgentsMdSection(', 'system: SYSTEM_PROMPT + agentsMdSection']) {
+    const at = src.indexOf(needle);
+    assert.notEqual(at, -1, `worker.js 必须仍有「${needle}」`);
+    assert.ok(at > startRunAt && at < endAt,
+      `「${needle}」必须在 startRun **函数体内**（实际 index=${at}，体内区间=[${startRunAt}, ${endAt}]）：` +
+      'worker 进程会被 agentd 复用给下一个 run，提到模块顶层 = 第二个 run 沿用第一个 run 的内容或启动时的空快照'
+      + '（§8.64 steerArmed 同型老账，也正是本段注释里最强调的那条）');
+  }
+  // 语义锁（M3）：采集必须用的是**本 run** 的 cwd——用了 `msg.cwd` 才可能是 per-run 的。
+  const msgAt = src.indexOf('const { task, cwd } = msg;');
+  assert.notEqual(msgAt, -1, 'startRun 必须仍从 msg 解构 `{ task, cwd }`：采集的 cwd 就来自这里');
+  assert.ok(src.indexOf('collectAgentsMd(') > msgAt,
+    '采集必须在 `const { task, cwd } = msg;` **之后**：抢在解构之前就不可能拿到本 run 的 cwd');
 });
 
 test('#451 接线锁②：config.input.system 是 SYSTEM_PROMPT + agentsMdSection（不是裸 SYSTEM_PROMPT）', () => {
@@ -251,6 +275,11 @@ test('#451 接线锁②：config.input.system 是 SYSTEM_PROMPT + agentsMdSectio
   assert.equal((src.match(/system: SYSTEM_PROMPT(?! \+ agentsMdSection)/g) ?? []).length, 0,
     '不得有任何「裸 SYSTEM_PROMPT」的 system 拼装点（设计稿 §6.2 W1）：第二处会让人以为注入生效了');
   assert.equal((src.match(/renderAgentsMdSection\(/g) ?? []).length, 1, '渲染调用点必须唯一（W1）');
+  // M3：拼接口不得漂到函数外（`agentsMdSection` 是 startRun 的局部变量，搬出去直接 ReferenceError）。
+  const { startRunAt, endAt } = startRunBodyRange(src);
+  const systemAt = src.indexOf('system: SYSTEM_PROMPT + agentsMdSection');
+  assert.ok(systemAt > startRunAt && systemAt < endAt,
+    `拼装点必须在 startRun 函数体内（实际 index=${systemAt}，体内区间=[${startRunAt}, ${endAt}]）`);
 });
 
 test('单一来源防漂移：提示词里不得出现那八个具体规则词（allowedHosts / credentials / CORS / Set-Cookie / localStorage / Bearer / 打开预览 / markdown 链接）', async () => {
