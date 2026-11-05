@@ -3457,3 +3457,55 @@ reconcile 40 秒内全部重建在 `983cc2bb…` 且 healthy、容器内 `statio
 `agents-md injected: files=1 bytes=9018 truncated=0 subdir_hints=0 notes=0`；**9 次 tool_use 里含 `AGENTS.md` 的 0 次**；
 回复给了完整预览 URL（`eric-p-22000`）+ `--bind 0.0.0.0` + 403/502 两种失败形态对照 + `git commit 4f75781` 收工。
 dev 残渣（故意留作标本）：`~/projects/probe-451`（含那条「端口固定 3000」的冲突夹具 `AGENTS.md`）、`probe-451b`（对照组）、`probe-451c`。
+
+### 8.92 #450 管理台独立入口（9443 + TLS 装载面 + 边缘双向隔离）——A1 切片（2026-11-05，分支 `feat-261105-01-450-admin-entry-A1`）
+
+**规格来源是 #450 的「决策记录」评论**（用户裁决 + 我按原理补的四条），不是我的转述。一句话：
+**能力边界由「host × entrypoint 的交集」决定**，与页面在哪个 origin 渲染无关。
+
+| # | 决策 | 落点 |
+|---|---|---|
+| D0 | 端口 **9443**，配置住部署面 `TRAEFIK_ADMIN_PORT`；**管理台不提供端口写入口** | `deploy/traefik/traefik.yml` 的 `adminsecure` + `deploy/.env` + `portal/src/config.js` |
+| D1 | 独立 host `admin.<伞域>`（`ADMIN_PUBLIC_HOST` 可覆盖，非法形态回退默认 + warn） | `config.js#resolveAdminHost`（复用 `validateHostnameGrammar`，零新错误码） |
+| D2 | 边缘双向隔离：管理台入口只挂 ①SPA ②`/api/admin` ③`/api/auth`+`/api/me`；用户入口 deny `/api/admin/*`；管理台 host 上其它 `/api/*` 也 deny；**预览路由不挂管理台入口** | `portal/src/routes.js`（`admin-api`/`admin-auth`/`admin-spa`/`admin-deny-user`/`admin-deny-api`） |
+| D4 | `ADMIN_IP_ALLOWLIST`（逗号分隔 CIDR，**空 = 不挂中间件 = 放行全部** = 今天的现状） | `config.js#resolveAdminIpAllowlist` + `admin-allow` 中间件 |
+| D5 | 证书走**动态**配置：`<dynamic>/tls.yml`，**两文件齐才生成**，带随证书变化的 fingerprint 注释当 reload 把手 | `portal/src/tlsassets.js` |
+
+**四条实测换来的事实（都不许按文档/直觉重推）**
+
+1. **`${VAR}` 在 Traefik 静态配置文件里不插值**（`traefik:v3.7.13` + `--configFile` 三种写法逐一实测）：
+   `"${TRAEFIK_ADMIN_PORT:19443}"` ⇒ `listen tcp: lookup tcp/19443}: unknown port`；`"${TRAEFIK_ADMIN_PORT}"` ⇒
+   `missing port in address`；`TRAEFIK_ENTRYPOINTS_ADMINSECURE_ADDRESS` 这类 env 静态覆盖**同样被忽略**。
+   ⇒ 端口只能**写死**在 `deploy/traefik/traefik.yml`。**于是它有两处真值**（静态文件 + `deploy/.env` 的
+   `TRAEFIK_ADMIN_PORT`），由 `portal/test/deploy-env-defaults.test.js` 把「静态字面量 / compose 插值默认 /
+   代码默认」三条读出来对比钉住——人记不住，让机器记。
+2. **`station-edge` 是 `network_mode: host` ⇒ 写 `ports:` 会被 Docker 静默丢弃**（`Published ports are discarded`，
+   compose 连警告都不给）。所以工单里那句「publish 9443」在本仓不成立，改成注释 + 单点真值（宿主端口 = 容器端口）。
+3. **`ipAllowList` 的 `sourceRange` 不能是空数组**：Traefik 会 `ERR sourceRange is empty, IPAllowLister not created`
+   —— 中间件**根本不存在** ⇒ 路由回落 catch-all ⇒ **静默放行**。所以 ① `ADMIN_IP_ALLOWLIST` 为空时**不生成**
+   `admin-allow` 也不挂它（不是挂一个空 sourceRange）；② deny 中间件用 **RFC 5737 的 `192.0.2.0/24`**（文档网段、
+   永不匹配真实客户端）+ `rejectStatusCode: 404` + `service: noop@internal` = 「恒拒 + 不碰任何后端」。
+   v3.7 没有「直接返状态码」的中间件（`headers` 只有 `customResponseHeaders`），这是唯一稳定产 404 的路子。
+4. **deny 的优先级取 300**（> internal 200 > portal 100）。取 150 也够用（`/api/admin` 与 `/api/internal` 不交），
+   但那样「deny 生效」就依赖「路径永不重叠」这条隐式前提；300 把不变量写成「deny 永远压过一切本地路由」。
+
+**真机验证（一次性 `traefik:v3.7.13` + 本仓真实静态文件 + 真实生成物 + 逐请求打 access log 的 nginx 后端；
+现网容器零动作）**：隔离矩阵 13 条（用户入口 `/api/admin*` ⇒ 404、管理台入口 `/api/sessions`+`/api/internal/x` ⇒ 404、
+两个「别人的 host」⇒ 404、允许面全 200）；**deny 的后端命中 0 行**（不是从状态码猜，是数 nginx access log）；
+免重启换证往返（`CN=admin.fde.erix.vip` ↔ `TRAEFIK DEFAULT CERT`，全程路由不丢）；`ADMIN_IP_ALLOWLIST` 两态（名单外 403/0 命中、
+名单内 200，且 deny 不受白名单影响）。⚠ 探针坑：`traefik/whoami` **不逐请求打日志** ⇒ `grep -c` 数出 0 是**假信号**；
+nginx 默认站对未知路径回 404 又会让「允许但没这个文件」和「被 deny」看起来一样 ⇒ 换成「恒 200 + access log」才消歧。
+
+**基线（主 agent 亲跑，判绿 = 退出码）**：基点 `41e76b0` **1833 / 1829 / 0 / 4** ⇒ 本单 **1859 / 1855 / 0 / 4**
+（净 **+26** = `tls-assets` 8 + `routes` 9 + `config` 7 + `deploy-env-defaults` 2）；`runner` **473/473 不变**；
+前端 **1072 不变**（本单前端零字节）。**主 agent 亲跑 6 条变异全红在具名用例**（每条先 `git diff --numstat` 自证
+非空操作、跑完还原）：`admin-api` 摘 `tls:{}` ⇒ 2 红；deny 优先级 300→150 ⇒ 2 红；空 allowlist 也生成并挂
+`admin-allow` ⇒ 2 红；fingerprint 写死 ⇒ 3 红；证书缺失时不摘旧 `tls.yml` ⇒ 2 红；adminHost 非法不回退 ⇒ 1 红。
+worker 另跑 3 条（预览路由挂管理台入口 / deny 不挡 `/api/admin` / 一文件也生成 `tls.yml`）。
+
+**上线口径（本单没碰现网，所以 9443 现在不通）**：`deploy/.env` 加 `TRAEFIK_ADMIN_PORT=9443`（可选
+`ADMIN_PUBLIC_HOST` / `ADMIN_IP_ALLOWLIST`）→ `docker compose up -d --force-recreate station-edge`（**静态配置只在启动时读**）
+→ `up -d station-portal`（拿新 env）。**首张证书人工落盘** `<dynamic>/certs/tls.{crt,key}`（鸡生蛋：没 TLS 进不去管理台，
+进不去就传不了证书），必须覆盖 `admin.<伞域>`；不放则管理台用 Traefik 内建自签证书应答（`__Host-` cookie 仍成立）。
+⚠ **A2 未做前不要部署**：用户入口已经 deny `/api/admin/*`，而管理台 SPA 仍随用户面下发、不会自动跳管理台
+⇒ 现网在用户 host 上打开 `#/admin…` 会「页面在、API 全 404」。A2 = host-aware 跳转（#450 D3）。
