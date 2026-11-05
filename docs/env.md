@@ -88,6 +88,20 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 | P1 认证方案 | portal 本地表 + `crypto.scrypt` 口令哈希（P1 骨架；argon2id 待决策者确认后按自描述哈希平滑迁移，portal §2.9.4）+ 强制 TOTP（规格 §7.1 本地 admin 通道的同一套机制）；第一个 admin 只能本地建（bootstrap） | 平台规范固定（倾向，依据 principles §4 Q3 倾向 (a)：本地账号仅破窗 + bootstrap） | 先用本地账号：在没有 IdP 事实前，P1 不阻塞于 SSO |
 | OIDC 接入 | 拿到 issuer / client 注册方式 / group claim 名称后接入（建议 P2）：JIT provisioning，角色来自 group claim（`fde` / `admin`），不在 UI 手点 | 平台规范固定（规格 §7.1 / D2 已定方向），接入时点取决于决策者提供事实 | 延后到 P2 |
 
+### 4.1 邮件通道（issue #449：登录第二因素「邮箱验证码」）
+
+> **SMTP 参数不在这里**：主机 / 端口 / secure / 用户名 / 口令 / 发件人 / 三档超时都存在 DB 的
+> `mail_settings` 单行表（管理台维护，见 `docs/data/model.md` §1.31 与 `docs/api/portal.md` §2.3a）。
+> 本机/部署环境**只需要下面这一个开关**。
+
+| 参数 | 语义 | 取值来源 | 示例值 |
+|---|---|---|---|
+| `MAIL_TRANSPORT` | **急停开关**：`disabled` ⇒ 无论 `mail_settings` 怎么配都**不发信**（不读库、不看缓存），未注册 TOTP 的账号退回纯口令登录，portal 启动时打一条 `level:'warn'`（`[auth] email verification code disabled …`）；不设或其它值 ⇒ 由 DB 配置决定（无 `mail_settings` 行 = 未配置 = 同样不生效） | 运维/决策者按需（急停用），默认不设 | `disabled`（只在要强制关掉发信时设） |
+
+- **未配置（无 `mail_settings` 行或 `transport='disabled'`）时第二因素不生效**：未注册 TOTP 的账号走纯口令，审计 `method='password_direct_no_second_factor'`——「这一层没做第二因素」在日志与审计里都查得到。
+- **读取失败不锁站**：`mail_settings` 读不到（迁移没跑 / DB 抖动）⇒ 邮件通道按未启用处理 + 一条 warn，登录照常（fail-open，决策 D3b）。
+- SMTP 口令是**明文列**（内网 email relay，与 `git_hosts.admin_key` 同一口径）；API / 审计 / 日志**永不返回口令明文**。
+
 ## 5. 端口参数与 ingress 入口
 
 | 参数 | 语义 | 取值来源 | 示例值 |

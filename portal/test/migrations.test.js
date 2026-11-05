@@ -52,7 +52,7 @@ test('迁移 0008-deprojectize：编号连续、语句幂等（可重放）、�
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0008-deprojectize.sql'), '0008 存在');
   // 新迁移追加在序列末尾（README：编号连续无空洞）。
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0008-deprojectize.sql'), 'utf8');
   // 语句全部幂等（IF NOT EXISTS / 条件 UPDATE / IF EXISTS）。
@@ -84,7 +84,7 @@ test('迁移 0009-session-auto-title：编号连续、语句幂等、关键语�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0009-session-auto-title.sql'), '0009 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0009-session-auto-title.sql'), 'utf8');
   assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS title_source'), 'chat_sessions 加 title_source 列（幂等）');
@@ -141,7 +141,7 @@ test('迁移 0011-git-hosts：Git host registry、token ref 与 awaiting_credent
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0011-git-hosts.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "迁移编号连续");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "迁移编号连续");
 
   const sql = fs.readFileSync(path.join(dir, '0011-git-hosts.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS git_hosts/);
@@ -162,7 +162,7 @@ test('迁移 0012-onboarding：开户队列状态、步骤和索引全在增量 
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0012-onboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "迁移编号连续");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "迁移编号连续");
 
   const sql = fs.readFileSync(path.join(dir, '0012-onboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS fde_onboarding/);
@@ -178,7 +178,7 @@ test('迁移 0013-offboarding：增量队列可保留已停用用户并吊销 ru
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0013-offboarding.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "迁移编号连续");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "迁移编号连续");
 
   const sql = fs.readFileSync(path.join(dir, '0013-offboarding.sql'), 'utf8');
   assert.match(sql, /CREATE TABLE fde_offboarding/);
@@ -197,7 +197,7 @@ test('迁移 0014-run-state-status：终态 status 独立列，旧快照由读�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0014-run-state-status.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移");
 
   const sql = fs.readFileSync(path.join(dir, '0014-run-state-status.sql'), 'utf8');
   assert.match(sql, /runs ADD COLUMN IF NOT EXISTS run_state_status jsonb/);
@@ -212,7 +212,7 @@ test('迁移 0015-backfill-user-input-transcript：只增不改、文本判断�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0015-backfill-user-input-transcript.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移");
 
   const sql = fs.readFileSync(path.join(dir, '0015-backfill-user-input-transcript.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -237,7 +237,7 @@ test('迁移 0016-transcript-append-seq：append 序列、确定性回填、索�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0016-transcript-append-seq.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移");
 
   const sql = fs.readFileSync(path.join(dir, '0016-transcript-append-seq.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -266,7 +266,7 @@ test('迁移 0017-port-allocations-hostname-check：整域名 CHECK、NOT VALID�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0017-port-allocations-hostname-check.sql'));
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0017-port-allocations-hostname-check.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -292,7 +292,7 @@ test('迁移 0018-port-allocations-scope-fde：scope CHECK 放开含 fde、保�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0018-port-allocations-scope-fde.sql'), '0018 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0018-port-allocations-scope-fde.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -334,7 +334,7 @@ test('迁移 0019-preview-port-pool：⓪→①→②→③ 顺序不可换、CH
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0019-preview-port-pool.sql'), '0019 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0019-preview-port-pool.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -421,7 +421,7 @@ test('迁移 0020-preview-grant-revoke-repair：只撤 active、不碰 used、�
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0020-preview-grant-revoke-repair.sql'), '0020 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
 
   const sql = fs.readFileSync(path.join(dir, '0020-preview-grant-revoke-repair.sql'), 'utf8');
   const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
@@ -474,7 +474,7 @@ test('迁移 0021-user-must-change-password：ADD COLUMN IF NOT EXISTS 可重放
   const dir = path.join(HERE, '../../deploy/migrations');
   const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
   assert.ok(files.includes('0021-user-must-change-password.sql'), '0021 存在');
-  assert.equal(Number(files[files.length - 1].slice(0, 4)), 25, "0025 为当前最后迁移（连续无空洞）");
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, "0026 为当前最后迁移（连续无空洞）");
   // 编号连续无空洞（README 约定：顺序 = 文件名升序）。
   files.forEach((f, i) => assert.equal(Number(f.slice(0, 4)), i + 1, `迁移编号空洞：${files.join(', ')}`));
 
@@ -671,4 +671,74 @@ test('迁移 0025-preview-grant-login-session：血缘列可空、FK SET NULL、
   assert.match(previewSrc, /VALUES \(\$1, \$2, NULL, \$3, \$4, 'session', 'active', \$5, \$5, \$6\)/,
     '派生 session 必须继承血缘（登出才能连派生的 cookie 一起回收）');
   assert.match(previewSrc, /g\.login_session_id \?\? null/, '派生继承读的是 ticket 行的血缘（不是重新猜一个）');
+});
+
+// 0026（issue #449）：登录第二因素「邮箱验证码」——`login_email_codes`（一行一枚码）+ `mail_settings`
+// （邮件通道单行配置，决策者 2026-11-04/05：SMTP 参数存 DB、口令明文，与 git_hosts.admin_key 同口径）。
+// 静态断言口径：
+//   ① 幂等（CREATE TABLE/INDEX IF NOT EXISTS，第二遍零 DDL）；
+//   ② 敏感面：码只存 hash 列（没有明文列）、口令列叫 smtp_password（不是 *_enc，也不许假装加密）；
+//   ③ 单行表靠 CHECK (id = 1) 把「只能有一行」写成 DB 事实；
+//   ④ 半套 SMTP 配置不许落库（transport='smtp' ⇒ host/from 必填）；
+//   ⑤ 冻结 baseline 不回写；
+//   ⑥ 与实现同源：产品 SQL 必须真的读/写这些列（列名漂移即红）。
+test('迁移 0026-login-email-codes：两表幂等、码只存 hash、单行配置靠 CHECK、零 baseline 回写', () => {
+  const dir = path.join(HERE, '../../deploy/migrations');
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort();
+  assert.ok(files.includes('0026-login-email-codes.sql'), '0026 存在');
+  assert.equal(Number(files[files.length - 1].slice(0, 4)), 26, '0026 为当前最后迁移（连续无空洞）');
+
+  const sql = fs.readFileSync(path.join(dir, '0026-login-email-codes.sql'), 'utf8');
+  const executable = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n');
+
+  assert.match(sql, /#449/, '头注释要引用 issue #449');
+  assert.match(executable, /CREATE TABLE IF NOT EXISTS login_email_codes/);
+  assert.match(executable, /CREATE INDEX IF NOT EXISTS login_email_codes_pending_idx\s+ON login_email_codes \(pending_token_hash, created_at DESC\)/);
+  assert.match(executable, /code_hash\s+text NOT NULL/, '码只存 sha256 列');
+  assert.doesNotMatch(executable, /\bcode\s+text/, '绝不许有明文码列');
+  assert.match(executable, /attempts\s+int NOT NULL DEFAULT 0/);
+  assert.match(executable, /max_attempts\s+int NOT NULL/);
+  assert.match(executable, /resend_count\s+int NOT NULL DEFAULT 0/);
+  assert.match(executable, /consumed_at\s+timestamptz/, '单次消费列可空');
+
+  assert.match(executable, /CREATE TABLE IF NOT EXISTS mail_settings/);
+  assert.match(executable, /id\s+int PRIMARY KEY DEFAULT 1 CHECK \(id = 1\)/, '单行表：约束写成 DB 事实');
+  assert.match(executable, /CHECK \(transport IN \('disabled', 'smtp'\)\)/);
+  assert.match(executable, /smtp_password\s+text/, '口令列是明文（内网 relay 口径）');
+  assert.doesNotMatch(executable, /smtp_password_enc|MAIL_SECRET_KEY/, '不做本地加密：不许留假加密列/密钥');
+  assert.match(executable, /CHECK \(transport <> 'smtp' OR \(smtp_host IS NOT NULL AND smtp_from IS NOT NULL\)\)/,
+    '半套 SMTP 配置不许落库');
+  assert.match(executable, /updated_by\s+uuid/, 'updated_by 只记 id，不建 FK（删用户不该被配置行拦住）');
+  assert.doesNotMatch(executable, /updated_by uuid REFERENCES/, 'updated_by 不得建 FK');
+
+  // 幂等：全部语句只允许幂等 DDL（DO 块是纯读证据，允许）。
+  const withoutDo = executable.replace(/DO \$\$[\s\S]*?END \$\$;/g, '');
+  const statements = withoutDo.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
+  assert.ok(statements.length >= 3, `语句数异常：${statements.length}`);
+  for (const stmt of statements) {
+    const head = stmt.replace(/\s+/g, ' ').trim().toUpperCase();
+    assert.ok(
+      head.startsWith('CREATE TABLE IF NOT EXISTS') || head.startsWith('CREATE INDEX IF NOT EXISTS'),
+      `0026 只允许幂等 DDL，发现：${head.slice(0, 60)}`,
+    );
+  }
+
+  const baseline = fs.readFileSync(path.join(HERE, '../../docs/data/schema.sql'), 'utf8');
+  assert.ok(!baseline.includes('login_email_codes'), '冻结 baseline 不得回写 login_email_codes');
+  assert.ok(!baseline.includes('mail_settings'), '冻结 baseline 不得回写 mail_settings');
+
+  // —— 与实现同源（列名/表名漂移即红）——
+  const codeSrc = fs.readFileSync(path.join(HERE, '../src/login-email-code.js'), 'utf8');
+  for (const col of ['pending_token_hash', 'code_hash', 'expires_at', 'attempts', 'max_attempts', 'resend_count', 'consumed_at']) {
+    assert.ok(codeSrc.includes(col), `login-email-code.js 必须真的读写 ${col}`);
+  }
+  const providerSrc = fs.readFileSync(path.join(HERE, '../src/mail-provider.js'), 'utf8');
+  assert.match(providerSrc, /FROM mail_settings WHERE id = 1/, 'provider 读的是单行表（id = 1）');
+  for (const col of ['smtp_host', 'smtp_port', 'smtp_secure', 'smtp_user', 'smtp_password', 'smtp_from']) {
+    assert.ok(providerSrc.includes(col), `mail-provider.js 必须读 ${col}`);
+  }
+  const configSrc = fs.readFileSync(path.join(HERE, '../src/config.js'), 'utf8');
+  assert.ok(!configSrc.includes('MAIL_SMTP_'), 'SMTP 参数不进 env（决策者 2026-11-04）');
+  assert.ok(!configSrc.includes('MAIL_SECRET_KEY'), '不做本地加密（决策者 2026-11-05）');
+  assert.match(configSrc, /MAIL_TRANSPORT/, 'env 只剩急停开关');
 });

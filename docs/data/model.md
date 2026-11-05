@@ -27,7 +27,8 @@ DDL 全局约定（schema.sql 头部亦有注）：
 
 | 组 | 表 | 来源 |
 |---|---|---|
-| 账号与认证 | `users` / `login_sessions` / `login_pending` / `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.2/§2.7 |
+| 账号与认证 | `users` / `login_sessions` / `login_pending` / `login_email_codes`（migration 0026，邮箱验证码）/ `api_tokens` / `preview_grants`（预览凭证） | 规格 §7 / portal.md §2.2/§2.3a/§2.7 / issue #449 |
+| 邮件通道配置 | `mail_settings`（migration 0026，单行） | issue #449（SMTP 参数存 DB，管理台维护） |
 | 容器与项目 | `containers` / `projects` | 规格 §4 / §7.2 |
 | 会话与对话 | `chat_sessions` / `runs` / `messages` / `queued_inputs`（migration 0024） | 规格 §9.1 / issue #370 |
 | 写操作幂等 | `idempotency_keys` | portal.md §1.4（本轮实现；**仅**由增量迁移 0001 提供，baseline 不含本表） |
@@ -373,6 +374,45 @@ POST 写端点的可选 `Idempotency-Key` 去重：同 `(user_id, endpoint, key)
 **红线**：入队**只写本表**。提前写 `messages` 会破坏 #77 P3 PR②b B2 的「`messages` = 纯锚点行」；提前 `appendUserInputTurn` 更糟——**还没说出口的话**就进了模型上下文，并被读侧渲染成已发送。投递时才走 `postMessage` 那条唯一发送路（#261B）。
 
 **投递判定**（`drainQueuedInputs`，由 run 终态的**五处**产出点驱动，漏一处即队列卡死）：队头是 `steer` ⇒ 无条件投；队头是 `follow_up` 且正常终态（`end_turn` / `no_tool` / `judge_done`）⇒ 投；`follow_up` + `aborted` 且**存在 `kind='steer' AND interrupted_run_id = 本 run`** ⇒ 投（用户意图就是接着说）；其余（用户按停止 / `failed` / `persistence_failed` / `max_rounds_cap`…）⇒ **不投，留在队列**——别把排队的话烧在一个坏 run 上。另加容器存活闸门：容器不在 ⇒ 不投、**不丢**，快照带 `blocked='container_not_running'` 让界面说清「为什么还没发」。
+
+### 1.30 `login_email_codes` — 登录第二因素「邮箱验证码」（issue #449，migration 0026）
+
+> **来源：增量迁移 [`deploy/migrations/0026-login-email-codes.sql`](../../deploy/migrations/0026-login-email-codes.sql)（唯一来源）**。
+> baseline `docs/data/schema.sql` 冻结、**不含本表**（改 baseline 会破坏 `0000_baseline` 的 checksum，见 deploy-contract §3.3）。
+
+TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网账号都没注册 TOTP ⇒ 登录实际只有口令一层。本表给「未注册 TOTP」的账号补第二层：口令通过后发一枚 6 位邮箱验证码（portal.md §2.3a），校验通过才建 `login_sessions`。**一行一枚码**；同一 `pending_token` 下「最新一条未消费」才是当前有效码。
+
+| 关键字段 | 语义 |
+|---|---|
+| `pending_token_hash` | `sha256(pending_token)`，与 `login_pending.token_hash` 同值（**不建 FK**：`login_pending` 行会随会话建立被消费/过期，验证码行要留作审计证据） |
+| `code_hash` | `sha256(6 位数字码)` hex——**只存哈希，绝不存明文**；审计只记前 12 位（`code_hash_prefix`） |
+| `created_at` / `expires_at` | 发码时刻与 TTL（默认 600s，`EMAIL_CODE_TTL_SECONDS`）。校验与成功消费都带 `expires_at > now` 谓词。**行只在「发信成功之后」才插入**（发信失败 ⇒ 零行，失败重试不受重发冷却约束） |
+| `attempts` / `max_attempts` | 单码校验失败计数与上限（默认 5，`EMAIL_CODE_MAX_ATTEMPTS`）。**码错只累加 attempts、不烧 `pending_token`**；`attempts + 1 >= max_attempts` 时同一条语句写 `consumed_at` 作废 |
+| `resend_count` | 同一 `pending_token` 的累计重发次数（上限默认 3，`EMAIL_CODE_MAX_RESENDS`）；冷却默认 60s（`EMAIL_CODE_RESEND_COOLDOWN_SECONDS`）按「最近一条的 `created_at`」算 |
+| `consumed_at` | 单次消费标记：**成功校验**（原子 `UPDATE … RETURNING id`）、**重发时作废旧码**、**尝试次数用尽**三处写它。`NULL` = 仍可能有效 |
+| `created_ip` / `created_ua` | 签发来源（审计/排障），与 `login_pending` 同口径 |
+
+索引：`login_email_codes_pending_idx (pending_token_hash, created_at DESC)` —— 读路径只有两条（取最新未消费 / 取最新一条算冷却），都按 pending 定位。
+
+写入方 = portal（登录第一步发码、§2.3b 重发）；读取/消费方 = portal（登录第二步）。**没有第二个消费者**（不参与 SSE、不影响任何状态机）。
+
+### 1.31 `mail_settings` — 邮件通道配置（issue #449，migration 0026，单行表）
+
+> 同上：来自增量迁移 `0026-login-email-codes.sql`；baseline 冻结、不回写 `schema.sql`。
+
+**为什么落 DB 而不是 env**：SMTP 主机/凭据/发件人是运维日常要改的东西（改 env 要重建容器），且口令进 env 会跟着 compose 文件与进程环境扩散。读取侧 `portal/src/mail-provider.js`：读一行 + 60s 缓存；**读取失败降级为「未启用」+ warn**（登录 fail-open 到纯口令，绝不把整站锁死）。
+
+| 关键字段 | 语义 |
+|---|---|
+| `id` | 恒 `1`（`CHECK (id = 1)`）：用约束把「只能有一行」写成 DB 事实，不靠应用自觉 |
+| `transport` | `'disabled'`（默认）\| `'smtp'`；非 `smtp` 一律不发信 |
+| `smtp_host` / `smtp_port` / `smtp_secure` | relay 地址与端口；`secure=true` = implicit TLS（465 形态），否则 STARTTLS |
+| `smtp_user` / `smtp_password` | **都可空**（内网 relay 常按来源 IP 放行、不需要认证）。口令是**明文列**：目标是内网 email relay，口令非高价值，与 `git_hosts.admin_key`（migration 0011）同一口径；**API / 审计 / 日志永不返回口令明文**。将来换成公网 SMTP 再上加密列（另开迁移） |
+| `smtp_from` | 发件人。`transport='smtp'` 时与 `smtp_host` 一起被 CHECK 强制非空（半套配置不许落库） |
+| `connection_timeout_ms` / `greeting_timeout_ms` / `socket_timeout_ms` | 三档超时（默认 10000 / 10000 / 20000），直接映射到 nodemailer 同名选项 |
+| `updated_at` / `updated_by` | 最后修改时刻与管理员 id（**不建 FK**：删用户不该被配置行拦住；审计靠 `updated_at` + 日志） |
+
+写入方 = 管理台 API（**下一片**：`GET/PUT` + 缓存 `invalidate()`）；读取方 = portal 登录发信路径（`mail-provider.js`，60s TTL）。运维急停：`MAIL_TRANSPORT=disabled`（env），为真时**不读本表**、一律不发信。
 
 ---
 
