@@ -7,6 +7,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
 import { setWorkbenchHooks, useWorkbenchStore } from '../stores/workbench';
 // issue #431：用户 scope 结束的接线（注册方，触发方在 stores/auth.ts）。
 import { setUserScopeResetListener } from '../lib/userScope';
@@ -24,13 +25,22 @@ import LocaleSwitch from '../components/LocaleSwitch.vue';
 import GitLightBadge from '../components/GitLightBadge.vue';
 import { useGitLight } from '../composables/useGitLight';
 import { toDisplayText } from '../api'; // issue #281：失败详情进文案前过一道收口（不渗 [object Object]/undefined）
+// #450 A2：管理台入口是**跨 host** 链接（用户面 → 管理台），落点由 `site` store 的两个 base 决定。
+import { hashUrl } from '../lib/hostGate';
+import { ADMIN_CONSOLE_PATH } from '../lib/workbenchGate';
 
 // issue #101 P2：顶栏文案走 i18n（workbench.* / common.*）；LocaleSwitch 挂管理台/登出旁。
 const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
+const site = useSiteStore();
 const store = useWorkbenchStore();
+
+// #450 A2：顶栏「管理台」入口改成**绝对地址**（`adminBaseUrl#/admin`）——理由见 SidebarPanel.vue 同一处注释：
+// 用户 host 上的 `/api/admin/*` 已被 A1 的边缘 deny 挡成 404，相对跳转只会渲染出一个全 404 的页面。
+// 拿不到 site 信息时退回相对 hash（fail-open，与改动前一致）。
+const adminConsoleHref = computed(() => hashUrl(site.info?.adminBaseUrl, ADMIN_CONSOLE_PATH) ?? `#${ADMIN_CONSOLE_PATH}`);
 
 // ---- issue #90：侧栏宽度拖拽调整（钳制/持久化/键盘微调在 composable 内）----
 const sidebar = useSidebarWidth();
@@ -261,7 +271,12 @@ function jumpToLatest() {
         @prefill="onGitLightPrefill"
       />
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
-      <router-link v-if="auth.user?.role === 'admin'" to="/admin" class="text-sm underline">{{ t('common.adminConsole') }}</router-link>
+      <a
+        v-if="auth.user?.role === 'admin'"
+        data-test="admin-console-link"
+        :href="adminConsoleHref"
+        class="text-sm underline"
+      >{{ t('common.adminConsole') }}</a>
       <LocaleSwitch />
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"

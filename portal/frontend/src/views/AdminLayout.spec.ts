@@ -11,6 +11,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import AdminLayout from './AdminLayout.vue';
 import { useAuthStore } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
 import { i18n, setLocale } from '../i18n';
 import { routes } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
@@ -110,5 +111,33 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
     expect(mailRoute.path).toBe('mail');
     expect(mailRoute.meta).toEqual({ requiresRole: 'admin' });
     expect(typeof mailRoute.component).toBe('function');
+  });
+});
+
+// #450 A2：「← 返回工作台」是**跨 host** 链接（管理台 `admin.<伞域>:9443` → 用户面 `station.<伞域>`）。
+// A1 之后同一份 SPA 也从用户 host 下发，若这颗按钮还是 `router-link to="/"`，它会把人送到
+// 「管理台 host 上的工作台」——页面渲染得出来、所有用户 API 全 404。判据：href 来自 site store 的 userBaseUrl。
+describe('AdminLayout「← 返回工作台」（#450 A2：跨 host 绝对地址）', () => {
+  it('site 有值 ⇒ userBaseUrl#/；拿不到 ⇒ 退回相对 hash `#/`（fail-open）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+    const link = () => wrapper.get('[data-test="back-to-workbench"]');
+
+    expect(link().attributes('href')).toBe('#/');
+
+    useSiteStore().info = {
+      userBaseUrl: 'http://station.fde.erix.vip:8090',
+      adminBaseUrl: 'https://admin.fde.erix.vip:9443',
+    };
+    await flushPromises();
+    expect(link().attributes('href')).toBe('http://station.fde.erix.vip:8090#/');
+    // 文案不变（issue #101 的 i18n 键仍是唯一真相）
+    expect(link().text()).toBe('← 返回工作台');
   });
 });
