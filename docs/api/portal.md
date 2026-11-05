@@ -28,6 +28,8 @@
 |---|---|---|
 | 认证 | `POST /api/auth/login` | 第一步：口令校验 |
 | 认证 | `POST /api/auth/login/totp` | 第二步：TOTP 校验，发 cookie |
+| 认证 | `POST /api/auth/login/email-code` | 第二步：**邮箱验证码**校验，发 cookie（#449，§2.3a）|
+| 认证 | `POST /api/auth/login/email-code/resend` | 重发邮箱验证码（#449，§2.3b）|
 | 认证 | `POST /api/auth/logout` | 登出 |
 | 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password`，§2.6）|
 | 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
@@ -128,6 +130,7 @@
 |---|---|---|---|
 | 400 | `validation_failed` | 请求体/参数不合法 | 否 |
 | 401 | `unauthorized` | 无 cookie / 会话失效 / 登录凭据错误 | 否 |
+| 401 | `email_code_invalid`（#449）| **登录第二步（邮箱验证码）校验失败**：码错、码不存在、码已过期、尝试次数用尽——四者**同一个码**（不区分，防探测「这枚 pending 到底走到哪一步」）。`retryable` 为否：解法是重发（§2.3b）或重走第一步（§2.2）。`too_many_attempts` 的 `message` 会额外说明「请重新登录获取新验证码」。详见 §2.3a | 否 |
 | 403 | `forbidden` | 已认证但无权访问该资源（含他人资源、越级操作） | 否 |
 | 403 | `cross_origin_forbidden`（#234，工单 `feat-261013-01`）| **跨站写请求被同源防线拒**（`Sec-Fetch-Site: cross-site` / `Origin` 的 authority 与请求自身不同，**含同注册域的 `same-site`**）。**与 `forbidden` 的关键差别：这是「没资格发这个请求」而不是「没权限做这件事」**，且**未认证也可能拿到**（防线先于 cookie 校验）。`details` = `{origin, sec_fetch_site, method}`（**不含 cookie**）；响应带 #241 那套 CORS deny 头（ACAO/ACAC/Vary）。判据、豁免端点、语义变化见 §2.11 | 否 |
 | 403 | `password_change_required`（#255，工单 `feat-261013-03`）| **受限会话被拦**：已认证，但 `users.must_change_password=true` 且尚未改密 ⇒ 除 §2.11a 放行清单外的 `/api/*` 全部拒。**与 `forbidden` 的关键差别：不是「这件事你没权限」而是「这枚口令还没经过你的手」**；解法只有一个（`POST /api/me/password`），所以 `details` 直接给 `{action, endpoint}`。登录（新旧两条）、登出（新旧两条）、`GET /api/me`、`/api/me/password`、`/api/forward-auth`、`/api/internal/*` 不受限（逐条理由见 §2.11a）；**未认证的 401 语义不变**（门只管已认证的人）。**不写审计**（SPA 轮询会把它刷成噪声，理由见 §2.11a）| 否 |
@@ -137,10 +140,12 @@
 | 400 | `preview_hostname_invalid`（#246 交付① 引入、交付② 沿用）：FDE 名拼不出合法的预览域名（首标签超 DNS 上限 63 ⇒ **预算 55**，`details.field='fde_name'`）。落点：开户（`admin.js createUser`）与预分配前复检（`portalloc.js`）、以及**交付② 的管理员改块**（§4.7a）——**不降级为 warn**，否则到 INSERT 才被 0017 的 CHECK 以裸 23514 炸掉（#202 的病根） | 否 |
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
+| 409 | `email_not_registered`（#449）| **邮件通道已启用，但这个账号没有邮箱** ⇒ 第二因素做不成（`users.email` 为空）。`retryable: false`：重试一万次也不会长出邮箱，`message` 直接给出路「请联系管理员补录邮箱」。**关键语义：绝不静默退回纯口令**（否则「开了第二因素」只是控制台的错觉）。落点：§2.2 第一步与 §2.3b 重发 | 否 |
 | 409 | `llm_model_not_found`（#261014 切片 B2，工单 `fix-261014-05b2`）| **发消息预检 fail-fast**：`POST /api/sessions/:id/messages` 在建 run 之前发现「会话属主 active LiteLLM binding 里某个**已配置槽位**的 `model_info.id` 在网关 `/model/info` 里查不到」（模型被删除/重建 ⇒ **id 变**）。**与 `llm_not_configured` 的关键差别：后者是「压根没配」，本码是「配过，但那个模型已经不存在了」**。`details` = `{slot, model_id}`（`slot` 取值 `main` / `embedding` / `vision`）。**选 409 而不是 424**：请求本身合法且已认证，失败原因是「绑定配置与网关目录的状态互相矛盾」，与同端点既有的 `409 llm_not_configured` / `409 run_in_progress` 同族（424 Failed Dependency 语义是「依赖的前置请求失败」，这里没有任何前置请求，且 §4.3 全表无 424 先例）。**只在发消息路径拦**：心跳路径同判据仍只 `warn`（§9.5，`reason: 'unknown_model_id'`）；**网关不可达一律放行**（fail-open，不让网关抖动演成用户发不出消息）| 是（管理员改配后原样重试可成功；本预检零副作用、不写幂等台账，同 `Idempotency-Key` 重试会重新占位，§1.4。**盲目立即重试仍是同一码**——解法只有一个：改配） |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
+| 503 | `email_send_failed`（#449）| **验证码邮件没发出去**（SMTP 超时/拒绝/未配置口令解不开等，`details` 不带正文）。`retryable: true`：**`pending_token` 不作废**，用户点「重发」（§2.3b）即可，不必重输口令 | 是 |
 | 500 | `internal` | 未分类服务端错误 | 否 |
 
 > 资源归属一律以「当前登录用户」过滤：**越权访问与他人资源一律表现为 404**（`not_found`），只有「本人资源上的越级操作」（如普通 FDE 开 `public` 端口）才返回 403。
@@ -197,13 +202,27 @@
 
 **P1 用本地账号**：口令哈希 + TOTP 第二因素（规格 §7.1 本地通道的同一套机制；P1 骨架暂用 Node 内置 `crypto.scrypt`，目标 argon2id 按 §2.9.4 平滑迁移；env §4 ⚠️ 待决策者确认：OIDC provider 事实缺失，OIDC 接入延后到 P2，届时按规格 §7.1 走 JIT provisioning，角色来自 group claim）。
 
-- **两步登录的适用范围（现状）**：**已注册 TOTP**（`users.totp_secret` 非 NULL/空串）的本地账号走两步（§2.2 → §2.3）；**未注册 TOTP**（`totp_secret` 为 NULL 或空串）的本地账号**口令直通建会话**（§2.2 直接返回 `authenticated`，没有第二步）——用户决策 2026-09-22，实现 d605015。规格 §7.1「强制 TOTP」是**设计目标**，此处为已落地的偏离：CLI 建号（§2.9.1/§2.9.2）与 `reset-totp` 一律下发种子，故经 CLI 创建的账号仍是强制两步；偏离只对「种子为空」的账号生效（原语义下第二步必然失败 = 账号永久锁死）。
+- **两步登录的适用范围（现状）**：**已注册 TOTP**（`users.totp_secret` 非 NULL/空串）的本地账号走两步（§2.2 → §2.3）；**未注册 TOTP**（`totp_secret` 为 NULL 或空串）的本地账号——**邮件通道启用时走邮箱验证码**（§2.2 → §2.3a/§2.3b，issue #449），**邮件通道未启用时口令直通建会话**（§2.2 直接返回 `authenticated`，没有第二步）——用户决策 2026-09-22，实现 d605015。**TOTP 是 opt-in**：现网账号都没注册 TOTP，所以第二因素实际由邮箱码这一层承担（前提是管理台把 `mail_settings` 配成 `transport='smtp'`，§2.3a）。规格 §7.1「强制 TOTP」是**设计目标**，此处为已落地的偏离：CLI 建号（§2.9.1/§2.9.2）与 `reset-totp` 一律下发种子，故经 CLI 创建的账号仍是强制两步；偏离只对「种子为空」的账号生效（原语义下第二步必然失败 = 账号永久锁死）。
 - 第一个 admin 由部署 bootstrap 在本地建（规格 §7.1）；**TOTP 种子由 bootstrap 流程生成下发，不走公开 API**（P1 契约不含注册/自助找回端点）。
 - OIDC 接入后登录入口变化（跳转 SSO），但 **cookie、session 语义、本文其余端点全部不变**——前端无需感知。
 
 ### 2.2 `POST /api/auth/login`
 
-第一步：校验口令。响应按该账号是否已注册 TOTP 分两种（§2.1）：已注册 → `totp_required`（进入第二步）；未注册 → `authenticated`（口令直通，直接建会话发 cookie）。
+第一步：校验口令。响应按「第二因素选择规则」（下表）分四种：`totp_required`（进入 §2.3）、`email_code_required`（进入 §2.3a）、`authenticated`（口令直通，直接建会话发 cookie）、或直接 `409 email_not_registered`。
+
+#### 第二因素选择规则（issue #449，实现为纯函数 `login-email-code.js#chooseSecondFactor`）
+
+按顺序取第一条命中的分支（**顺序就是优先级**，TOTP 永远优先——已注册 TOTP 的账号行为一字不改）：
+
+| 已注册 TOTP | 邮件通道启用 | `users.email` 非空 | 结果 | 说明 |
+|---|---|---|---|---|
+| 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3 |
+| 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
+| 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
+| 否 | 否 | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末） |
+
+- 「邮件通道启用」= `mail_settings.transport='smtp'` **且** `MAIL_TRANSPORT !== 'disabled'`（运维急停）**且** 配置能读出来（读取失败降级为未启用，见 §2.3a 的「fail-open」）。
+- 未启用时的口令直通**不是无声的**：启动日志会打一条 `level:'warn'`（`[auth] email verification code disabled (mail settings unavailable or MAIL_TRANSPORT=disabled); accounts without TOTP log in with password only`），且成功登录审计的 `method` 写的是 `password_direct_no_second_factor`（不是笼统的 `password_direct`）——「这一层没做第二因素」在日志与审计里都能被查到。
 
 请求：
 
@@ -235,6 +254,20 @@
 
 同时下发 session cookie（属性见 §2.5）；**无 `pending_token`**，无需（也无法）再调 `/api/auth/login/totp`。
 
+响应 `200`（**口令正确、未注册 TOTP、邮件通道已启用、账号有邮箱**：进入邮箱验证码第二步；**此时尚未登录**）：
+
+```json
+{ "status": "email_code_required", "pending_token": "pt_9f2c...", "expires_in": 600, "email_hint": "a***@e***.com" }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `pending_token` | 一次性待决令牌，仅可用于 §2.3a/§2.3b；服务端只存其 `sha256`（`login_pending.token_hash`） |
+| `expires_in` | 该令牌的实际有效期（秒）= `max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`，默认 `600`。**为什么不直接用 120**：码的有效期是 600s，令牌 120s 就会让「码还没过期、令牌先死」成为常态，这个字段也就成了谎 |
+| `email_hint` | 脱敏收件人：本地部分保留首字符 + `***`；域名首段保留首字符 + `***`，TLD 及后续标签原样 ⇒ `alice@example.com` → `a***@e***.com`。**只用于「发到哪个邮箱了」的确认**，不含完整地址 |
+
+> 本响应同样**不带** `password_change_required`（#255）：还没发 cookie，谈不上受限会话；这一位在 §2.3a 的成功响应里给。
+
 | 字段 | 说明 |
 |---|---|
 | `password_change_required`（#255，工单 `feat-261013-03`，纯 additive）| `true` ⇒ 本次下发的会话是**受限会话**（`users.must_change_password=true`：口令由管理员开户/重置时代设，还没经过本人之手），除 §2.11a 放行清单外的 `/api/*` 一律 `403 password_change_required`（§1.2）。**前端应在拿到 cookie 的那一刻就把用户弹到改密屏**，而不是先碰一个 403 再猜。`false` 也必须**出现**（恒为布尔，不靠缺省省掉）。两个**发会话**的分支都有（本分支与 §2.3 第二步）；`totp_required` 中间响应与所有失败响应（401）**都不带**——还没会话的人谈不上受限，发了反而泄露「这个账号欠一次改密」 |
@@ -246,7 +279,9 @@
 | HTTP | code | 场景 |
 |---|---|---|
 | 401 | `invalid_credentials` | 用户名或口令错误（**不区分是哪种**，防用户枚举） |
+| 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第③分支）。**不会退回纯口令** |
 | 429 | `rate_limited` | 同一 login / IP 连续失败触发限流；响应带 `Retry-After` 头（秒） |
+| 503 | `email_send_failed` | 第②分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废 |
 
 ### 2.3 `POST /api/auth/login/totp`
 
@@ -282,6 +317,100 @@
 | 401 | `totp_invalid` | TOTP 码错误 |
 | 401 | `pending_expired` | `pending_token` 过期/不存在/已使用 → 重新走第一步 |
 | 429 | `rate_limited` | TOTP 连续失败限流（带 `Retry-After`） |
+
+### 2.3a `POST /api/auth/login/email-code`（issue #449：邮箱验证码第二步）
+
+第二步的另一条路：**未注册 TOTP 且邮件通道启用**的账号（§2.2 第二因素选择规则第②分支）在这里交验证码，成功后建立会话。
+
+请求：
+
+```json
+{ "pending_token": "pt_9f2c...", "code": "123456" }
+```
+
+响应 `200`（**与 §2.3 逐字同口径**）：
+
+```json
+{
+  "password_change_required": true,
+  "user": { "id": "u_alice", "login": "alice", "display_name": "Alice", "role": "fde", "fde_name": "alice" }
+}
+```
+
+同时下发 session cookie（属性见 §2.5）。`password_change_required`（#255）**必须出现且恒为布尔**——与 §2.3 同一理由（第二步才是真正发会话的地方）；`user` 的键集与 §2.3 完全相同。
+
+验证码与尝试上限（决策 6，全部可配）：
+
+| 项 | 默认 | env |
+|---|---|---|
+| 码形态 | 6 位数字（`crypto.randomInt(0, 1_000_000)` 左补零） | — |
+| 码有效期 | 600s | `EMAIL_CODE_TTL_SECONDS` |
+| 单 `pending_token` 最多校验尝试 | 5 次 | `EMAIL_CODE_MAX_ATTEMPTS` |
+| 重发冷却 | 60s | `EMAIL_CODE_RESEND_COOLDOWN_SECONDS` |
+| 单 `pending_token` 最多重发 | 3 次 | `EMAIL_CODE_MAX_RESENDS` |
+
+- **只存 `sha256(码)`**（`login_email_codes.code_hash`），绝不存明文；成功校验是一条原子 `UPDATE … WHERE consumed_at IS NULL AND expires_at > now AND code_hash = $h AND attempts < max_attempts … RETURNING id` ⇒ 并发/重放至多一次成功。
+- **码错不烧 `pending_token`**：只把该码的 `attempts + 1`（达到上限时同时作废该码），用户还能接着试/重发；`pending_token` 本身只在成功时被消费。
+- **限流**：按「账户 + IP」计**校验失败**（`emailcode:<userId>:<ip>`，默认 10 次 / 15 分钟窗口，超限 `429 rate_limited` + `Retry-After`）。换新 `pending_token` 不重置计数，防 6 位码爆破。
+
+错误：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 400 | `validation_failed` | `pending_token` / `code` 缺失 |
+| 401 | `email_code_invalid` | 码错 / 码不存在 / 码已过期 / 尝试次数用尽——**同一个码**（不区分，防探测）。`too_many_attempts` 的 `message` 会说明「请重新登录获取新验证码」 |
+| 401 | `pending_expired` | `pending_token` 过期/不存在/**已消费**（含「同一枚码重放」：成功那次已经把 pending 消费掉了）→ 重新走第一步 |
+| 429 | `rate_limited` | 上述账户级失败限流（带 `Retry-After`） |
+
+**SMTP 配置从哪来（决策者 2026-11-04/05 定稿）**：`mail_settings` 单行表（管理台维护，`GET/PUT` 留给下一片），运行时由 `portal/src/mail-provider.js` 读取并 60s 缓存。口令是**明文列** `smtp_password`——目标是内网 email relay，口令非高价值，与既有 `git_hosts.admin_key`（迁移 0011）同一口径；若将来换成公网 SMTP 再上加密列。**API / 审计 / 日志永不返回口令明文**（管理台只给 `hasPassword` 布尔，下一片）。
+
+**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整 ⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第④分支（纯口令 + 审计 `password_direct_no_second_factor`）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
+
+审计（`audit_log`）：
+
+| action | 时机 | `details` |
+|---|---|---|
+| `auth.email_code_sent` | 码发出去了 | `{login, email_hint, code_hash_prefix, expires_at, resend_count?, at}`——`code_hash_prefix` 是 `sha256(码)` 的**前 12 位**；**绝无明文码** |
+| `auth.email_code_failed` | 发信失败（`503`） | `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令） |
+| `auth.email_code_verified` | 校验通过并发了会话 | `{login, method:'email_code', at}`；另有一条 `auth.login_success`（`method='email_code'`） |
+| `auth.email_code_invalid` | ——**不写** | 码错不落审计：这是可重试的日常动作，写了只会被爆破尝试刷成噪声；失败次数由限流器持有 |
+
+### 2.3b `POST /api/auth/login/email-code/resend`（issue #449：重发验证码）
+
+请求：
+
+```json
+{ "pending_token": "pt_9f2c..." }
+```
+
+响应 `200`：
+
+```json
+{ "expires_in": 600, "resend_after": 60 }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `expires_in` | 新码的有效期（秒，`EMAIL_CODE_TTL_SECONDS`） |
+| `resend_after` | 下一次允许重发的冷却秒数（`EMAIL_CODE_RESEND_COOLDOWN_SECONDS`） |
+
+- **重发必须换新码并作废旧码**：先插新行（`resend_count = 上一条 + 1`），再把同一 `pending_token` 下其余未消费行 `consumed_at = now`。校验只认「最新一条未消费」，所以旧码从这一刻起必然被拒。
+- **按 IP 计发信频率**（`email:<ip>`，默认 10 次 / 15 分钟窗口）：被当成邮件放大器时最先撞这条。
+- 发信失败与 §2.3a 同口径：`503 email_send_failed`（`retryable: true`），`pending_token` 不作废。
+
+错误：
+
+| HTTP | code | 场景 |
+|---|---|---|
+| 400 | `validation_failed` | `pending_token` 缺失 |
+| 401 | `pending_expired` | `pending_token` 过期/不存在/已消费 |
+| 409 | `email_not_registered` | 该账号没有邮箱（第二因素做不成，找管理员补录） |
+| 429 | `rate_limited` | ① 冷却中（`Retry-After` = 剩余冷却秒数）；② 重发次数用尽（`Retry-After` 仍给出，但解法是重走第一步）；③ 按 IP 的发信频率超限 |
+| 503 | `email_send_failed` | SMTP 发不出去（`retryable: true`，可原样再试） |
+
+> §2.2 的 `503 email_send_failed` 是**第一次发信**就失败（此时客户端还没拿到过 `pending_token`），所以它的
+> `error.details` 里带上 `{pending_token, expires_in, email_hint}`——否则「pending 不作废、点重试即可」在协议上
+> 不成立（用户只能回去重输口令）。§2.3b 的 503 不带（客户端本来就有 token）。
 
 ### 2.4 `POST /api/auth/logout`
 
@@ -695,7 +824,7 @@ station-portal user enable  --login <login>
 | `GET /api/me` | 受限会话的唯一数据源：前端靠它拿「我是谁 + 为什么被弹去改密」（§2.6 的 `must_change_password`）。挡掉它 = SPA 只看见一片 403，不知道该把用户送去哪儿 |
 | `POST /api/me/password`（**不限方法**）| 受限状态的**唯一出口**（§2.6a），挡掉就是死锁。整条路径放行而不挑方法：非 `POST` 该由路由自己回 `405`，不能被门改写成 403——403 会让前端以为「连改密这条路也被锁了」 |
 | `POST /api/auth/logout` | 登出永远可达：不想改密的人至少能换账号/退出；挡住它会把人钉在一个自己进不去的会话里 |
-| `POST /api/auth/login`、`POST /api/auth/login/totp` | 登录两端点不得被挡（§2.2/§2.3）：第一步此刻还没有会话，本门对无会话请求本就无效；列进来是防「受限用户重新登录」被自己的旧会话形状误伤，也让清单与 §0.1 端点表对齐 |
+| `POST /api/auth/login`、`POST /api/auth/login/totp`、`POST /api/auth/login/email-code`、`POST /api/auth/login/email-code/resend` | 登录的三个第二步与重发不得被挡（§2.2/§2.3/§2.3a/§2.3b）：第一步此刻还没有会话，本门对无会话请求本就无效；列进来是防「受限用户重新登录」被自己的旧会话形状误伤（受限账号的旧 cookie 会跟着新登录请求一起发出），也让清单与 §0.1 端点表对齐 |
 | `POST /api/login`、`POST /api/logout`（**旧路径**）| ⚠ **新旧两条都覆盖**：`POST /api/login → 307 → /api/auth/login`（§0.1）这对重写在本门**之后**，所以旧路径**确实会走到本门**（不是「到不了所以不用列」）。不列，一个还带着旧会话 cookie 的受限用户连「重新登录」「退出」这两个动作本身都会被 403 锁死 |
 | `* /api/forward-auth` | ⚠ **本单最大的雷**：Traefik forwardAuth 回调（§2.7）。`routes.js` 的 `authRequestHeaders` 白名单带 `Cookie` ⇒ 浏览器 cookie 会原样进这条回调；而它的语义是「这片预览该不该放行」，被门挡成 403 `password_change_required` 时 **Traefik 只把它当成认证失败** ⇒ 该用户 `*.fde.<base>` 名下**全部**预览端口一起挂，而他要改的只是口令 |
 | `* /api/internal/*`（前缀）| 容器 → portal（§9）：per-container Bearer token 鉴权、**不带登录 cookie**，改密状态与它无关（与 #234 的豁免同一批理由）|
