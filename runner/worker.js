@@ -39,6 +39,8 @@ import { assertCompactContext, assertFoldingToolResultKnobs } from './lib/compac
 import { makeStore } from './lib/store.js';
 import { planTranscriptSeed, buildEngineSeedOptions } from './lib/transcript-seed.js';
 import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.js';
+// issue #451：AGENTS.md 链注入（采集器纯函数 + 可注入 fs，判据在 runner/test/agents-md.test.js）。
+import { collectAgentsMd, renderAgentsMdSection } from './lib/agents-md.js';
 
 // issue #64（R2）：system prompt 为 runToolLoop 合法顶层选项（erix-llm-kit
 // docs/host-consumer-contract.md §runToolLoop options 白名单含 system）——
@@ -56,12 +58,18 @@ import { buildFailureEnvelope, finalTextFallbackField } from './lib/termination.
 // **平台约束的单一真相 = materializer 下发的 `~/AGENTS.md`**（预览访问 8 条要求链 + 错误形态对照；
 // 第 7 条「应用自己的登录态不要用 Cookie」来自 #262，边缘全方法剥 `Cookie` 头，#263 复测定口径；
 // 第 8 条「报『服务已起』必须给出清单里那条完整预览 URL 并提醒逐 host 放行」来自 #285，告知义务）
-// 本段只留一句「开工前先读 `~/AGENTS.md`」的**强制指针**，不抄规则——同 §8.10「工具名从注册面取、
+// 本段只留一句「平台约定已随本次 run 注入」的**强制指针**，不抄规则——同 §8.10「工具名从注册面取、
 // 不手抄清单」：提示词与 portal 文案是两个包里的两份字，抄一遍就是埋下一份必然过期的第二真相。
+// **#451（2026-11-05）把「告知面」从「让模型自己去读」改成「宿主在 run 启动时注入」**：真机 14 天实测
+// 35 个 run 只有 5 个读过 `~/AGENTS.md`（14%，其中 4 个还是验收探针），读过的 5 个里 4 个自带
+// `head -50/60/80` 截断（「收工即提交」在 53–54 行，`head -50` 正好切掉）⇒ 指针再硬也挡不住
+// 「下发了 ≠ 读了」。注入在 `startRun` 里做（`lib/agents-md.js`），本常量只负责**告知**这段内容从哪来
+// （不告知，模型会以为那是它自己读到的、也可能再 `cat` 一遍白烧轮次）。
 // ⚠ 前提单 **#259** 未落地前 `createJail({ root: cwd })` 的读边界只有项目根（无只读例外），
-//   所以指针必须同时带「家目录用 shell 读」的口径（真机里模型用 `readFile` 读 `~/AGENTS.md` 会撞
-//   「被宿主边界拒绝」白烧一轮）。R-1 复测新增 **P0：下发了 ≠ 读了**，transcript 里读 `~/AGENTS.md`
-//   的调用数为 0 直接判失败。防漂移断言：同文件里的「强制指针存在 / 八个具体规则词不得出现（allowedHosts
+//   所以指针必须保留「家目录用 shell 读」的口径（`~/.erix/ports.json` 仍要 `cat`；`~/AGENTS.md` 降级为
+//   「复核」手段——真机里模型用 `readFile` 读它会撞「被宿主边界拒绝」白烧一轮）。R-1 复测的 P0 判据
+//   （transcript 里读 `~/AGENTS.md` 的调用数为 0 判失败）自 #451 起**反转**为「规则被遵守」
+//   （设计稿 §6.2 D1/D2）。防漂移断言：同文件里的「强制指针存在 / 八个具体规则词不得出现（allowedHosts
 //   · credentials · CORS · Set-Cookie · localStorage · Bearer，后三个是 #262 第 7 条带进来的；
 //   最后两个 · 打开预览 · markdown 链接 是 #285 第 8 条带进来的）/ 不出现
 //   伞域字面量」三条。
@@ -78,11 +86,11 @@ const SYSTEM_PROMPT = `你是运行在 FDE 工作台容器中的编码 agent，�
 - 读文件回「错误：…被宿主边界拒绝：…」时，不要在原路径上反复重试：那是路径越出了项目目录，或是要读的文件被平台刻意遮蔽（密钥类）。真需要内容时用 shell 定点看那一个文件，别把整文件灌进回复。
 
 预览域名与端口（段由平台分配，**清单是唯一真相**，不需要你自己发明）：
-- **开工前先读 \`~/AGENTS.md\`**（尤其是要让外部浏览器访问你起的服务时）：工位约定与平台约束都在那份文件里，本提示词**有意不复述**它的应用侧规则（抄一遍就是第二个会过期的真相源）。
+- **平台约定已随本次 run 注入到本提示词末尾**（\`~/AGENTS.md\` 平台节 + 上级目录与项目根的 \`AGENTS.md\`，由宿主在 run 启动时读取）：工位约定与平台约束就在那里，本提示词**有意不复述**它的应用侧规则（抄一遍就是第二个会过期的真相源）。不必再 \`cat\` 它们；本 run 里改动这些文件**不会立刻生效**，下一次 run 启动时才重新读取。
 - 预览端口段由平台在本 FDE 开户时**分配**：从全局号池里发一整段连续端口（默认 10 个，管理员可改段）。这一段到底是哪几个号，**唯一真相是 \`~/.erix/ports.json\` 里的清单**（每条带对应的真实访问 \`url\`）——不要凭记忆、也不要假设是固定的某几个端口。
 - dev server 的端口**必须从清单里选**，并绑 \`0.0.0.0\`（绑 127.0.0.1 入口进不来）；对外访问直接用清单里那一条的 \`url\`。
 - 域名由平台按 \`<fde>-p-<端口>\` 生成（与入口路由同源）：**不要自造域名或端口**，也不要要求平台再加——清单里那段就是全部，不够用就在它们里复用。
-- \`~/.erix/ports.json\` 与 \`~/AGENTS.md\` 都在家目录（项目目录之外），文件工具读不到它们（会回「被宿主边界拒绝」），用 shell 读：\`cat ~/.erix/ports.json\`、\`cat ~/AGENTS.md\`。
+- \`~/.erix/ports.json\` 在家目录（项目目录之外），文件工具读不到它（会回「被宿主边界拒绝」），用 shell 读：\`cat ~/.erix/ports.json\`；要确认注入的约定文件是否被改过，也用 shell 复核：\`cat ~/AGENTS.md\`。
 
 交付规则：
 1. 交付物（代码/配置/文档）必须用 writeFile 写入工作目录的文件系统——磁盘上的文件才是交付物。
@@ -398,6 +406,45 @@ async function startRun(msg) {
   const { task, cwd } = msg;
   const modelConfigPath = msg.config?.model_config_path || '/home/erix/.erix/config.json';
 
+  // issue #451：**AGENTS.md 链注入**（设计稿 docs/design/agents-md-layering-2026-11-05.md）。
+  // 让模型不必自己 `cat`（真机 86% 的 run 压根没读，读了的 4/5 还自带 head -N 截断）。
+  // ⚠ **必须在 startRun 里采集**：同一个 worker 进程会被 agentd 复用给下一个 run（`RUN_START` 再次进来，
+  //   同上面 `steerArmed` 那条老账）⇒ 提到模块顶层 = 第二个 run 沿用第一个 run 的内容（或启动时的空快照）。
+  // ⚠ 渲染禁时间戳 / run id / generation：system 是引擎标记的 prompt 缓存稳定前缀（`markStablePrefix`
+  //   给 system 打 `cacheBoundary`），任何每次变化的内容都会让整条前缀缓存失效 ⇒ 文件不变则逐字节不变。
+  // ⚠ 失败一律降级（lib/agents-md.js 内部兜住：跳过 + note），**绝不让 run 因为读不到约定文件而失败**。
+  //   返修 F1b：采集/渲染整段再包一层 try/catch —— 采集器自己的 bug、注入的 fs 门面抛、
+  //   未来重构引入的意外，都只降级成「不注入 + 一条 warn」，**不允许从 catch 里再抛**。
+  //   为什么必需：本段在 `startRun` 里、`runToolLoop` 之前，抛出去 = worker 进程死 ⇒ agentd 当崩溃处理
+  //   → requeue → 3 次 attempt 耗尽，用户只看到「attempts exhausted」（工单 §4.5 红线的反例）。
+  // 记账走现成 IPC `MSG.LOG`（不新增事件类型）：文件数 / 总字节 / 是否截断，供 §6.2 D4 量成本。
+  let agentsMd = { blocks: [], totalBytes: 0, notes: [], subdirHints: [] };
+  let agentsMdSection = '';
+  let agentsMdOk = true;
+  try {
+    agentsMd = collectAgentsMd({ cwd, home: process.env.HOME || '/home/erix' });
+    agentsMdSection = renderAgentsMdSection(agentsMd);
+  } catch (err) {
+    agentsMdOk = false;
+    agentsMdSection = '';
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `agents-md collection failed, run continues without injection: ${String(err?.message ?? err)}`,
+    });
+  }
+  // 记账**无论注入几份都发**（files=0 也是有效信息：证明这条路径真跑过，供 §6.2 D4 量成本）；
+  // 只有采集失败那一支不发（免得一条 warn 后面跟一条看起来正常的 injected）。
+  if (agentsMdOk) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'info',
+      msg: `agents-md injected: files=${agentsMd.blocks.length}`
+        + ` bytes=${agentsMd.totalBytes}`
+        + ` truncated=${agentsMd.blocks.some((b) => b.truncated) ? 1 : 0}`
+        + ` subdir_hints=${agentsMd.subdirHints.length}`
+        + ` notes=${agentsMd.notes.length}`,
+    });
+  }
+
   // issue #81 P2（conversation-state.md §4.1）：transcript key = sessionId（引擎 runToolLoop 的
   // store key），runId 退回纯运维身份（事件流/IPC）。store adapter 双身份：engine 面 key=sessionId，
   // U2 'running' 面真 runId（makeStore 第二参，见 store.js 头注释）。旧 ticket 无 session_id →
@@ -700,7 +747,9 @@ async function startRun(msg) {
         // P3 PR③：会话历史文本注入（issue #69）已退役 —— 两个分支都永不传 `initialMessages`，
         // 上下文唯一来源 = transcript（conversation-state.md §6 契约③）。
         input: {
-          system: SYSTEM_PROMPT,
+          // issue #451：AGENTS.md 链已由宿主注入（`agentsMdSection` 为空时**逐字节等于**原 SYSTEM_PROMPT）。
+          // 防漂移锁：runner/test/system-prompt.test.js 数本行的拼装形状（裸常量 = 注入整条死掉且不报错）。
+          system: SYSTEM_PROMPT + agentsMdSection,
           wrapup: false,
           ...buildEngineSeedOptions({ resume: transcriptPlan.resume === true, task }),
         },
