@@ -279,3 +279,95 @@ test('常量与名字是接口的一部分（下游 worker 与文档都按这些
   assert.equal(AGENTS_MD_MAX_TOTAL_BYTES, 48 * 1024);
   assert.equal(AGENTS_MD_MAX_SUBDIR_HINTS, 5);
 });
+
+// ---------------------------------------------------------------------------
+// 返修 F1：**采集器绝不抛**。主 agent 亲审实测：`collectAgentsMd({})` / `{cwd}` / `{home}` 全抛
+// `The "paths[0]" argument must be of type string`（`path.resolve(undefined)` 在 `realpathOr` 的 try 外）。
+// 为什么这是真缺口而不是洁癖：这次采集在 `worker.js` 的 `startRun` 里、`runToolLoop` **之前**，
+// 抛出去 = worker 进程死 ⇒ agentd 当崩溃处理 → requeue → 3 次 attempt 耗尽，用户只看到
+// 「attempts exhausted」，而根因只是一个参数形态不对（工单 §4.5「失败一律降级」）。
+// ---------------------------------------------------------------------------
+
+/** 返回值的形状必须永远合法（下游 renderAgentsMdSection 直接拆这些字段）。 */
+function assertCollectedShape(result, label) {
+  assert.equal(typeof result, 'object', `${label}：必须返回对象`);
+  assert.ok(Array.isArray(result.blocks), `${label}：blocks 必须是数组`);
+  assert.equal(typeof result.totalBytes, 'number', `${label}：totalBytes 必须是数字`);
+  assert.ok(Array.isArray(result.notes), `${label}：notes 必须是数组`);
+  assert.ok(Array.isArray(result.subdirHints), `${label}：subdirHints 必须是数组`);
+  assert.ok(result.notes.length > 0, `${label}：降级必须记账（否则宿主日志里什么都看不见）`);
+}
+
+test('F1：参数缺失 / 非字符串 / 空串时 collectAgentsMd 绝不抛，降级为空结果 + note', () => {
+  // 主 agent 实测过的三格 + 三个额外形态（null 整体、空串、非字符串）
+  const cases = [
+    ['{}', {}],
+    ['{ cwd }', { cwd: '/tmp' }],
+    ['{ home }', { home: '/tmp' }],
+    ['null', null],
+    ['{ cwd: "" }', { cwd: '' }],
+    ['{ cwd: 42 }', { cwd: 42 }],
+  ];
+  for (const [label, args] of cases) {
+    let result;
+    assert.doesNotThrow(() => { result = collectAgentsMd(args); },
+      `collectAgentsMd(${label}) 必须降级不得抛：抛出去就是 worker 进程死 → requeue → attempts exhausted`);
+    assertCollectedShape(result, label);
+  }
+  // 口径：cwd 不可用 ⇒ 不采集（不能凭空造一个工作目录）
+  assert.deepEqual(collectAgentsMd({}).blocks, [], 'cwd 不可用时不得注入任何文件');
+  assert.equal(collectAgentsMd({}).totalBytes, 0);
+  assert.deepEqual(collectAgentsMd({}).subdirHints, []);
+});
+
+test('F1：home 不可用时只按 cwd 采集（平台节/跨项目节不注入）+ 一条 note', async () => {
+  await withTree({ 'home/AGENTS.md': PLATFORM }, ({ home, cwd }) => {
+    // 控制组：home 正常 ⇒ 平台节在
+    assert.deepEqual(collectAgentsMd({ cwd, home }).blocks.map((b) => b.scope), ['platform']);
+    // home 不可用 ⇒ 仍然能跑，只是少一节（boundary 退回 cwd，不得把所有文件都判成「越界」）
+    const degraded = collectAgentsMd({ cwd, home: '' });
+    assertCollectedShape(degraded, 'home 不可用');
+    assert.ok(degraded.notes.some((n) => n.includes('home 不可用')), `要记账，实际 notes=${JSON.stringify(degraded.notes)}`);
+    assert.equal(degraded.blocks.every((b) => b.scope === 'project'), true,
+      'home 不可用 ⇒ 没有平台/跨项目节可言，任何节的 scope 都不得冒充 platform');
+  });
+});
+
+test('F1：resolveAgentsMdChain 对不可用输入返回空数组（口径：没有 cwd 就没有候选链）', () => {
+  for (const args of [{}, null, { home: '/tmp' }, { cwd: '' }, { cwd: 42 }]) {
+    let chain;
+    assert.doesNotThrow(() => { chain = resolveAgentsMdChain(args); },
+      `resolveAgentsMdChain(${JSON.stringify(args)}) 必须不抛`);
+    assert.deepEqual(chain, [], `${JSON.stringify(args)}：cwd 不可用 ⇒ 空链（不凭空造 process.cwd()）`);
+  }
+  // home 不可用但 cwd 可用 ⇒ 只给 cwd 一项，scope = project
+  const onlyCwd = resolveAgentsMdChain({ cwd: '/tmp' });
+  assert.deepEqual(onlyCwd.map((e) => e.dir), ['/tmp']);
+  assert.equal(onlyCwd[0].scope, 'project');
+});
+
+// ---------------------------------------------------------------------------
+// 接线源码级锁（与 system-prompt.test.js 里那两条并列的第三条）：**采集必须在 try/catch 里**。
+// 变异（主 agent 验收会做）：把 try/catch 摘掉 ⇒ 这条必须红。
+// ---------------------------------------------------------------------------
+
+test('接线锁③：worker.js 里 collectAgentsMd( 被 try { … } catch 包住，catch 里置空注入段 + 发 warn', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const startRunAt = src.indexOf('async function startRun(');
+  assert.notEqual(startRunAt, -1, 'worker.js 必须仍有 `async function startRun(`');
+  const body = src.slice(startRunAt);
+  const collectAt = body.indexOf('collectAgentsMd(');
+  assert.notEqual(collectAt, -1, 'startRun 里必须仍有采集调用');
+  const tryAt = body.lastIndexOf('try {', collectAt);
+  assert.notEqual(tryAt, -1,
+    '采集前必须有 `try {`：本段在 runToolLoop 之前，抛出去就是 worker 进程死 → requeue → attempts exhausted');
+  const catchAt = body.indexOf('catch', collectAt);
+  assert.notEqual(catchAt, -1, '采集之后必须有 catch（只有 try 没有 catch 等于没兜）');
+  assert.ok(catchAt - collectAt < 800, 'catch 必须紧跟着这段采集，不是文件后面某个无关的 catch');
+  const catchBlock = body.slice(catchAt, catchAt + 600);
+  assert.match(catchBlock, /agentsMdSection = ''/,
+    'catch 里必须把注入段置空（否则可能带着半成品拼进 system）');
+  assert.match(catchBlock, /MSG\.LOG[\s\S]{0,160}level: 'warn'/, 'catch 里必须发一条 MSG.LOG warn（不新增事件类型）');
+  // catch 里不得再抛：出现 throw 就是「降级」变成「换一种死法」
+  assert.doesNotMatch(catchBlock, /\bthrow\b/, 'catch 里再抛是禁止的：那只是把同一个死法往后挪几行');
+});

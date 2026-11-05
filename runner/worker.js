@@ -413,17 +413,37 @@ async function startRun(msg) {
   // ⚠ 渲染禁时间戳 / run id / generation：system 是引擎标记的 prompt 缓存稳定前缀（`markStablePrefix`
   //   给 system 打 `cacheBoundary`），任何每次变化的内容都会让整条前缀缓存失效 ⇒ 文件不变则逐字节不变。
   // ⚠ 失败一律降级（lib/agents-md.js 内部兜住：跳过 + note），**绝不让 run 因为读不到约定文件而失败**。
+  //   返修 F1b：采集/渲染整段再包一层 try/catch —— 采集器自己的 bug、注入的 fs 门面抛、
+  //   未来重构引入的意外，都只降级成「不注入 + 一条 warn」，**不允许从 catch 里再抛**。
+  //   为什么必需：本段在 `startRun` 里、`runToolLoop` 之前，抛出去 = worker 进程死 ⇒ agentd 当崩溃处理
+  //   → requeue → 3 次 attempt 耗尽，用户只看到「attempts exhausted」（工单 §4.5 红线的反例）。
   // 记账走现成 IPC `MSG.LOG`（不新增事件类型）：文件数 / 总字节 / 是否截断，供 §6.2 D4 量成本。
-  const agentsMd = collectAgentsMd({ cwd, home: process.env.HOME || '/home/erix' });
-  const agentsMdSection = renderAgentsMdSection(agentsMd);
-  sendIpc(process, {
-    type: MSG.LOG, run_id: runId, level: 'info',
-    msg: `agents-md injected: files=${agentsMd.blocks.length}`
-      + ` bytes=${agentsMd.totalBytes}`
-      + ` truncated=${agentsMd.blocks.some((b) => b.truncated) ? 1 : 0}`
-      + ` subdir_hints=${agentsMd.subdirHints.length}`
-      + ` notes=${agentsMd.notes.length}`,
-  });
+  let agentsMd = { blocks: [], totalBytes: 0, notes: [], subdirHints: [] };
+  let agentsMdSection = '';
+  let agentsMdOk = true;
+  try {
+    agentsMd = collectAgentsMd({ cwd, home: process.env.HOME || '/home/erix' });
+    agentsMdSection = renderAgentsMdSection(agentsMd);
+  } catch (err) {
+    agentsMdOk = false;
+    agentsMdSection = '';
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'warn',
+      msg: `agents-md collection failed, run continues without injection: ${String(err?.message ?? err)}`,
+    });
+  }
+  // 记账**无论注入几份都发**（files=0 也是有效信息：证明这条路径真跑过，供 §6.2 D4 量成本）；
+  // 只有采集失败那一支不发（免得一条 warn 后面跟一条看起来正常的 injected）。
+  if (agentsMdOk) {
+    sendIpc(process, {
+      type: MSG.LOG, run_id: runId, level: 'info',
+      msg: `agents-md injected: files=${agentsMd.blocks.length}`
+        + ` bytes=${agentsMd.totalBytes}`
+        + ` truncated=${agentsMd.blocks.some((b) => b.truncated) ? 1 : 0}`
+        + ` subdir_hints=${agentsMd.subdirHints.length}`
+        + ` notes=${agentsMd.notes.length}`,
+    });
+  }
 
   // issue #81 P2（conversation-state.md §4.1）：transcript key = sessionId（引擎 runToolLoop 的
   // store key），runId 退回纯运维身份（事件流/IPC）。store adapter 双身份：engine 面 key=sessionId，
