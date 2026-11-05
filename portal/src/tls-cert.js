@@ -86,21 +86,12 @@ function dnsNamesOf(subjectAltName) {
 }
 
 /**
- * 解析证书 PEM ⇒ 元数据。fullchain 也可以（`X509Certificate` 只看第一份 = 叶子证书，正是 Traefik 会端出来的那张）。
+ * 一张 `X509Certificate` ⇒ 元数据（**内部原语**：`parseCertificatePem` 与链解析共用，别各写一份）。
  *
  * @returns {{subjectCN: string|null, sans: string[], issuerCN: string|null, notBefore: string,
  *            notAfter: string, fingerprintSha256: string, publicKeyPem: string}}
  */
-export function parseCertificatePem(pem) {
-  if (typeof pem !== 'string' || pem.trim() === '') {
-    throw fail('tls_cert_invalid', '证书 PEM 为空');
-  }
-  let cert;
-  try {
-    cert = new crypto.X509Certificate(pem);
-  } catch (err) {
-    throw fail('tls_cert_invalid', `证书 PEM 无法解析：${err?.message ?? err}`);
-  }
+function certificateInfo(cert) {
   let publicKeyPem;
   try {
     publicKeyPem = cert.publicKey.export({ type: 'spki', format: 'pem' });
@@ -118,6 +109,104 @@ export function parseCertificatePem(pem) {
     fingerprintSha256: cert.fingerprint256,
     publicKeyPem,
   };
+}
+
+/**
+ * 解析证书 PEM ⇒ 元数据。
+ *
+ * ⚠ 这是「**解析单张**」的原语：`new X509Certificate(多段PEM)` 只取**第一段**。所以它对
+ * 「顺序反了」的 bundle 会把**中间证书**当成叶子（#462 实测：于是私钥配对判定报错的对象不对）。
+ * 要按整条链判断（选叶子 / 顺序 / 断链）请用 `parseCertificateChain` + `selectLeaf` + `describeChain`，
+ * **不要**把链判据塞进这里（`describeTls` / `readActiveCertificate` 共用它，语义必须保持「第一张」）。
+ *
+ * @returns {{subjectCN: string|null, sans: string[], issuerCN: string|null, notBefore: string,
+ *            notAfter: string, fingerprintSha256: string, publicKeyPem: string}}
+ */
+export function parseCertificatePem(pem) {
+  if (typeof pem !== 'string' || pem.trim() === '') {
+    throw fail('tls_cert_invalid', '证书 PEM 为空');
+  }
+  let cert;
+  try {
+    cert = new crypto.X509Certificate(pem);
+  } catch (err) {
+    throw fail('tls_cert_invalid', `证书 PEM 无法解析：${err?.message ?? err}`);
+  }
+  return certificateInfo(cert);
+}
+
+/** 切 PEM 段用的正则（`g` + `matchAll`：`matchAll` 会克隆正则，不会污染 `lastIndex`）。 */
+const CERT_PEM_BLOCK_RE = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+
+/**
+ * 把一份（可能是 fullchain 的）证书 PEM 切成**逐段**的 `X509Certificate`（issue #462 M1）。
+ *
+ * 只做切段与逐段解析，**不做**任何顺序 / 链完整性判断（那是 `selectLeaf` / `describeChain` 的事）：
+ * 这里抛 `tls_cert_invalid` 的唯一含义是「这份字节里没有可解析的证书段」。
+ *
+ * @returns {{blocks: crypto.X509Certificate[], pem: string[]}} `pem[i]` 是第 i 段**原始文本**
+ *          （原样切片，不重新序列化——落盘字节永远是用户提交的那份，本函数不参与写盘）。
+ */
+export function parseCertificateChain(pem) {
+  if (typeof pem !== 'string' || pem.trim() === '') {
+    throw fail('tls_cert_invalid', '证书 PEM 为空');
+  }
+  const blocks = [];
+  const pems = [];
+  for (const match of pem.matchAll(CERT_PEM_BLOCK_RE)) {
+    const text = match[0];
+    let cert;
+    try {
+      cert = new crypto.X509Certificate(text);
+    } catch (err) {
+      throw fail('tls_cert_invalid', `第 ${blocks.length + 1} 段证书无法解析：${err?.message ?? err}`);
+    }
+    blocks.push(cert);
+    pems.push(text);
+  }
+  if (blocks.length === 0) {
+    throw fail('tls_cert_invalid', '证书 PEM 里没有任何 BEGIN CERTIFICATE 段');
+  }
+  return { blocks, pem: pems };
+}
+
+/**
+ * 从链里选出**叶子**证书（= 与私钥配对的那张；没给私钥时按约定取第一段）。
+ *
+ * 配对判定**复用** `keyMatchesCert`（DER 逐字节比），不重写。
+ *
+ * @returns {{leaf: crypto.X509Certificate, index: number}} `index = -1` ⇒ 给了私钥但**没有一段**与它配对
+ *          （此时 `leaf` 退回 `blocks[0]`，调用方自己决定报什么：PUT 报 `tls_key_mismatch`，inspect 报
+ *          `keyMatches:false`）。
+ */
+export function selectLeaf(blocks, keyObj) {
+  const list = Array.isArray(blocks) ? blocks : [];
+  if (list.length === 0) throw fail('tls_cert_invalid', '证书 PEM 里没有任何证书段');
+  if (!keyObj) return { leaf: list[0], index: 0 };
+  const index = list.findIndex((block) => keyMatchesCert(certificateInfo(block), keyObj));
+  return index >= 0 ? { leaf: list[index], index } : { leaf: list[0], index: -1 };
+}
+
+/**
+ * 链形态：`depth` = 段数，`links[i] = blocks[i].checkIssued(blocks[i+1])`（「第 i 段是不是由第 i+1 段签的」）。
+ *
+ * 为什么用 `checkIssued` 而不是比 `subjectCN === issuerCN` 字符串：`X509_check_issued` 一起验
+ * **签发者名 + 签名 + CA 位（keyUsage keyCertSign）**——实测 `leaf.checkIssued(root)=false`（隔代不成立）、
+ * `root.checkIssued(root)=true`（自签成立）。字符串比会把「同名不同钥」的伪造链放过去。
+ */
+export function describeChain(blocks) {
+  const list = Array.isArray(blocks) ? blocks : [];
+  const links = [];
+  for (let i = 0; i + 1 < list.length; i += 1) {
+    let issued = false;
+    try {
+      issued = list[i].checkIssued(list[i + 1]) === true;
+    } catch {
+      issued = false; // 拿不到结论就按「接不上」处理（宁可提示，不可放过一条一定校验失败的链）
+    }
+    links.push(issued);
+  }
+  return { depth: list.length, links };
 }
 
 /** 解析私钥 PEM（PKCS#8 / PKCS#1 / SEC1 都行，交给 OpenSSL）。非法 ⇒ `tls_key_invalid`。 */
@@ -199,10 +288,24 @@ export function certificateDomains({ sans, subjectCN }) {
 /**
  * 上传前的全套校验。**纯函数**（不碰盘、不碰 DB），`now` 可注入 ⇒ 过期判据可单测。
  *
- * 顺序（每条都能被单测打红）：PEM 可解析 → 私钥可解析 → 公钥配对 → 未过期 → 覆盖 `adminHost`
- * → `confirmDomains` 每个名字都在证书里（用户声明不能超出证书能力）。
+ * 顺序（每条都能被单测打红）：
+ *   ① PEM 可解析（**整条链**，不是只看第一段）
+ *   ② 私钥可解析
+ *   ③ 选叶子（逐段找与私钥配对的那张）—— 一段都对不上 ⇒ `tls_key_mismatch`
+ *   ④ **顺序**（配对段不是第一段）⇒ `tls_cert_order_invalid`。⚠ 必须排在配对之前报，
+ *      否则「顺序反了」又会被报成 `tls_key_mismatch`（用户的私钥是对的，这个提示是误导——#462）
+ *   ⑤ 链完整（`checkIssued` 逐对成立）⇒ 否则 `tls_cert_chain_broken`
+ *   ⑥ 未过期 → ⑦ 覆盖 `adminHost` → ⑧ `confirmDomains` 每个名字都在证书里（用户声明不能超出证书能力）
  *
- * @returns {{ok: true, cert: object} | {ok: false, code: string, message: string, details?: object}}
+ * ④/⑤ 的界线（为什么顺序是 400、只有叶子只是 warning）：
+ *   · C3「只有叶子」= 用户**知道自己只有叶子**（可接受的自担风险，确有只发 leaf 也够用的内部部署）；
+ *   · C5「顺序反了」= Traefik **直接拒加载这张证书**，整条 `tls.certificates` 项失效、退回内置自签
+ *     ⇒ 管理台变成浏览器硬告警（实测，见 AGENTS §8.100）；
+ *   · C7「接不上」= 用户**以为自己给了完整链**，发出去客户端一定链校验失败，而他没有任何别的信号。
+ *   所以后两者是 400，前者只是 `chainWarnings`。
+ *
+ * @returns {{ok: true, cert: object, chainWarnings: string[]}
+ *          | {ok: false, code: string, message: string, details?: object}}
  */
 export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now = new Date() } = {}) {
   const asFailure = (err) => ({
@@ -227,13 +330,15 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
     }
   }
 
-  let cert;
+  // ① 整条链（`parseCertificatePem` 只看第一段，那正是「顺序反了 ⇒ 拿中间证书当叶子」的病根）。
+  let chain;
   try {
-    cert = parseCertificatePem(certPem);
+    chain = parseCertificateChain(certPem);
   } catch (err) {
     return asFailure(err);
   }
 
+  // ② 私钥
   let keyObj;
   try {
     keyObj = parsePrivateKeyPem(keyPem);
@@ -241,12 +346,47 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
     return asFailure(err);
   }
 
-  if (!keyMatchesCert(cert, keyObj)) {
+  // ③ 选叶子（配对逻辑复用 `keyMatchesCert`）
+  const picked = selectLeaf(chain.blocks, keyObj);
+  if (picked.index < 0) {
     return {
       ok: false,
       code: 'tls_key_mismatch',
       message: '私钥与证书不配对（公钥不一致）',
       details: { field: 'keyPem' },
+    };
+  }
+
+  // ④ 顺序（C5）：配对段不是第一段 ⇒ 上传上来 Traefik 会整条拒加载，必须在上传时拒。
+  if (picked.index > 0) {
+    const firstInfo = certificateInfo(chain.blocks[0]);
+    const leafInfo = certificateInfo(picked.leaf);
+    return {
+      ok: false,
+      code: 'tls_cert_order_invalid',
+      message: `第一个 BEGIN CERTIFICATE 必须是你的域名证书；现在第一个是「${firstInfo.subjectCN ?? '（无 CN）'}」（中间证书），请把叶子证书放在最前面`,
+      details: { firstSubjectCN: firstInfo.subjectCN, leafSubjectCN: leafInfo.subjectCN },
+    };
+  }
+
+  const cert = certificateInfo(picked.leaf);
+
+  // ⑤ 链完整（C7）：段间接不上 ⇒ 发出去客户端一定链校验失败，而用户以为自己给了完整链。
+  const described = describeChain(chain.blocks);
+  const brokenAt = described.links.findIndex((ok) => ok !== true);
+  if (brokenAt >= 0) {
+    const info = certificateInfo(chain.blocks[brokenAt]);
+    const nextInfo = certificateInfo(chain.blocks[brokenAt + 1]);
+    return {
+      ok: false,
+      code: 'tls_cert_chain_broken',
+      message: `第 ${brokenAt + 1} 段接不上：「${info.subjectCN ?? '（无 CN）'}」的签发者是「${info.issuerCN ?? '（无 CN）'}」，但下一段是「${nextInfo.subjectCN ?? '（无 CN）'}」`,
+      details: {
+        index: brokenAt + 1, // 段号从 1 起（与文案里的「第 N 段」同数）
+        subjectCN: info.subjectCN,
+        issuerCN: info.issuerCN,
+        nextSubjectCN: nextInfo.subjectCN,
+      },
     };
   }
 
@@ -296,7 +436,14 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
     }
   }
 
-  return { ok: true, cert };
+  // 只作提示、**不阻断**（C3）：只有一张非自签证书 ⇒ Traefik 能加载，但客户端严格校验会
+  // `unable to verify the first certificate`。不拒的理由见函数头注释。
+  const chainWarnings = [];
+  if (described.depth === 1 && cert.subjectCN !== cert.issuerCN) {
+    chainWarnings.push(TLS_INSPECT_WARNINGS.CHAIN_LOOKS_LEAF_ONLY);
+  }
+
+  return { ok: true, cert, chainWarnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +463,22 @@ export const TLS_INSPECT_WARNINGS = Object.freeze({
   NO_SANS: 'no_sans',
   /** 覆盖不到 `adminHost`：与 `coverage.covered:false` 同义，给「只读 warnings」的消费者一个自足信号。 */
   ADMIN_HOST_NOT_COVERED: 'admin_host_not_covered',
+  /**
+   * **只有一张证书且非自签**（#462 C3）：Traefik 能加载，但客户端严格校验会
+   * `unable to verify the first certificate`（实测）。**警告不拒**：确有只发 leaf 也够用的内部部署。
+   */
+  CHAIN_LOOKS_LEAF_ONLY: 'chain_looks_leaf_only',
+  /**
+   * **顺序可能反了**（#462 C6，只在「没给私钥」时能出现）：`blocks[0]` 的 subject 是 `blocks[1]` 的 issuer，
+   * 而 `blocks[0]` 的 issuer 不是 `blocks[1]` 的 subject ⇒ 典型「中间在前、叶子在后」。
+   * 没私钥就无法用配对定论，所以只警告；`PUT` 一定带私钥 ⇒ 一定走 C5 的 400。
+   */
+  CHAIN_ORDER_SUSPECT: 'chain_order_suspect',
+  /**
+   * **段间接不上**（#462 C7）：`checkIssued` 在某一对上是 false（例如混了别人的中间证书）。
+   * inspect 只警告；`PUT` 是 400 `tls_cert_chain_broken`（用户以为自己给了完整链）。
+   */
+  CHAIN_BROKEN: 'chain_broken',
 });
 
 /**
@@ -325,7 +488,11 @@ export const TLS_INSPECT_WARNINGS = Object.freeze({
  * 其余一律降级成 `warnings` + `coverage`：
  *   · `keyPem` 省略（`undefined` / `null` / 空白串）⇒ `keyMatches: null`；
  *   · 给了但**不配对** ⇒ `keyMatches: false`，**不报错**（UI 自己说）；
- *   · 覆盖不到 `adminHost` / 已过期 ⇒ 各自进 `warnings`，**不报错**（用户可能就是在传一张还没生效的证书）。
+ *   · 覆盖不到 `adminHost` / 已过期 ⇒ 各自进 `warnings`，**不报错**（用户可能就是在传一张还没生效的证书）；
+ *   · 链形态（#462）⇒ `chain_looks_leaf_only` / `chain_order_suspect` / `chain_broken` 三条 warning，
+ *     **只有一个例外**：给了私钥且配对段不是第一段（C5）⇒ `400 tls_cert_order_invalid`。
+ *     为什么这一条不降级：顺序反了 Traefik **直接拒加载这张证书**（退回内置自签 = 浏览器硬告警），
+ *     而「第一段不是你的域名证书」是**可以当场确定**的事实（有私钥做配对证据），不是猜测。
  *
  * **零副作用**：不写盘、不写 DB、不写审计、不动 `tlsLive`、不烧上传配额（限流在 HTTP 层，宽松档）。
  *
@@ -365,13 +532,29 @@ export function inspectCertificate({ certPem, keyPem, adminHost, now = new Date(
     }
   }
 
-  const cert = parseCertificatePem(certPem); // 抛 `tls_cert_invalid`
+  const chain = parseCertificateChain(certPem); // 抛 `tls_cert_invalid`
+  const described = describeChain(chain.blocks);
+
   let keyMatches = null;
+  let leaf = chain.blocks[0];
   if (keyGiven) {
     const keyObj = parsePrivateKeyPem(keyPem); // 抛 `tls_key_invalid`
-    // **不配对不是错误**（契约 4.13-3a）：把事实交给 UI，由它禁用「确认安装」并说清为什么。
-    keyMatches = keyMatchesCert(cert, keyObj);
+    const picked = selectLeaf(chain.blocks, keyObj);
+    // 不配对不是错误（契约 4.13-3a）：把事实交给 UI，由它禁用「确认安装」并说清为什么。
+    keyMatches = picked.index >= 0;
+    leaf = picked.leaf;
+    if (picked.index > 0) {
+      // C5：有配对证据 ⇒ 能当场确定「第一段不是叶子」，这是会让 Traefik 拒加载的形态。
+      const firstInfo = certificateInfo(chain.blocks[0]);
+      const leafInfo = certificateInfo(leaf);
+      throw fail(
+        'tls_cert_order_invalid',
+        `第一个 BEGIN CERTIFICATE 必须是你的域名证书；现在第一个是「${firstInfo.subjectCN ?? '（无 CN）'}」（中间证书），请把叶子证书放在最前面`,
+        { httpStatus: 400, details: { firstSubjectCN: firstInfo.subjectCN, leafSubjectCN: leafInfo.subjectCN } },
+      );
+    }
   }
+  const cert = certificateInfo(leaf);
 
   const host = normalizeHost(adminHost);
   const covered = certCoversHost(host, cert.sans, cert.subjectCN);
@@ -385,8 +568,24 @@ export function inspectCertificate({ certPem, keyPem, adminHost, now = new Date(
   if (cert.sans.length === 0) warnings.push(TLS_INSPECT_WARNINGS.NO_SANS);
   if (!covered) warnings.push(TLS_INSPECT_WARNINGS.ADMIN_HOST_NOT_COVERED);
 
+  // 链形态（#462）：C3 叶子单张 / C6 顺序可疑（仅无钥时）/ C7 断链。
+  if (described.depth === 1 && cert.subjectCN !== cert.issuerCN) {
+    warnings.push(TLS_INSPECT_WARNINGS.CHAIN_LOOKS_LEAF_ONLY);
+  }
+  // 顺序可疑优先于断链：顺序反了的链在 `checkIssued` 下也“接不上”，但真正的病是顺序
+  // （修法完全不同：把叶子挑到前面 vs 换成对的那张中间证书）——两条一起发只会让人猜。
+  const orderSuspect = !keyGiven && described.depth >= 2
+    && commonNameOf(chain.blocks[0].subject) === commonNameOf(chain.blocks[1].issuer)
+    && commonNameOf(chain.blocks[0].issuer) !== commonNameOf(chain.blocks[1].subject);
+  if (orderSuspect) {
+    warnings.push(TLS_INSPECT_WARNINGS.CHAIN_ORDER_SUSPECT);
+  } else if (described.links.some((ok) => ok !== true)) {
+    warnings.push(TLS_INSPECT_WARNINGS.CHAIN_BROKEN);
+  }
+
   return {
     // 逐键白名单（与 `describeTls` 的 `active` 同一套字段）：**`publicKeyPem` 不在里面**。
+    // #462：`cert` 一律是**叶子**（不是 `blocks[0]`）——顺序反了时报错/展示的对象才是对的。
     cert: {
       subjectCN: cert.subjectCN,
       sans: cert.sans,
@@ -621,6 +820,11 @@ export async function writeCertificateAssets({ dynamicDir, certPem, keyPem, fsIm
  * 回滚到 `certs/prev/` 那一代：两文件写回原位 + 物化 `tls.yml`。
  * prev 不存在（或 prev 缺私钥）⇒ `404 tls_no_previous`（本单**允许**新增的码，见 §1.2）。
  *
+ * **`copyFile` 而不是 `readFile` + `write`**（#462 / 安全文档 S4）：回滚也不需要把私钥正文读进
+ * 进程内存（它只需要从 A 搬到 B）。两个副作用都补上：① 显式 `chmod` 把模式固定成
+ * 644/600（`copyFile` 只在**新建**目标时继承源模式，目标已存在时保留旧模式）；② 返回的 `cert`
+ * 从**落盘后的证书文件**重新解析（公开文件，不是私钥）。
+ *
  * 回滚**不改写 prev 本身**（它仍是那一代）⇒ 重复回滚幂等。
  */
 export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promises, log = console } = {}) {
@@ -631,17 +835,16 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
     });
   }
   const paths = tlsPaths(dynamicDir);
-  let certBuf;
-  let keyBuf;
   try {
-    certBuf = await fsImpl.readFile(prev.certPath);
-    keyBuf = await fsImpl.readFile(prev.keyPath);
+    await fsImpl.copyFile(prev.certPath, paths.certPath);
+    await fsImpl.copyFile(prev.keyPath, paths.keyPath);
   } catch (err) {
     throw stepError('restore', err);
   }
   try {
-    atomicWriteFile(paths.certPath, certBuf, { mode: TLS_CERT_MODE, root: dynamicDir });
-    atomicWriteFile(paths.keyPath, keyBuf, { mode: TLS_KEY_MODE, root: dynamicDir });
+    // 模式必须**显式**固定：`copyFile` 到已存在的目标时保留目标旧模式，不能指望它给 0600。
+    await fsImpl.chmod(paths.certPath, TLS_CERT_MODE);
+    await fsImpl.chmod(paths.keyPath, TLS_KEY_MODE);
   } catch (err) {
     throw stepError('restore', err);
   }
@@ -660,7 +863,8 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
   }
   let cert = null;
   try {
-    cert = parseCertificatePem(certBuf.toString('utf8'));
+    // 读的是**证书**（公开文件）：回滚的返回值要告诉调用方「现在生效的是哪张」。
+    cert = parseCertificatePem((await fsImpl.readFile(paths.certPath)).toString('utf8'));
   } catch {
     cert = null;
   }
@@ -701,16 +905,52 @@ export async function readDefaultGateway({ routePath = '/proc/net/route', fsImpl
 }
 
 /**
+ * 从 `getPeerCertificate(true)` 的对端证书对象里数**链深**（#462 M2）。
+ *
+ * 口径（Node 实测）：`rejectUnauthorized:false` 下 `issuerCertificate` **仍然会给**——
+ * leaf-only ⇒ 没有 `issuerCertificate`（链深 1）；fullchain ⇒ 有一层（链深 2）。
+ * 终止条件三个：没有 `issuerCertificate` / 指纹重复（自签时 Node 会把自己当 issuer）/ 最多 6 层防环。
+ *
+ * 指纹拿不到（测试桩/异常形态）⇒ 返回 1（“不知道”就按最保守的 1 层算，由调用方结合自签判定决定要不要报）。
+ */
+export function peerChainDepth(peer) {
+  const fingerprintOfPeer = (cert) => (typeof cert?.fingerprint256 === 'string' && cert.fingerprint256 !== ''
+    ? cert.fingerprint256.toUpperCase()
+    : null);
+  const seen = new Set();
+  let depth = 1;
+  let current = peer;
+  const first = fingerprintOfPeer(current);
+  if (first === null) return depth;
+  seen.add(first);
+  while (depth < 6) {
+    const next = current?.issuerCertificate;
+    if (next === null || typeof next !== 'object') break;
+    const fp = fingerprintOfPeer(next);
+    if (fp === null || seen.has(fp)) break;
+    seen.add(fp);
+    depth += 1;
+    current = next;
+  }
+  return depth;
+}
+
+/**
  * 对管理台入口做一次真 TLS 握手，比对 `fingerprint256`。
  *
  * 为什么连**默认网关**而不是 `adminPublicBaseUrl` 的 hostname：portal 容器解析不了 `admin.<伞域>`
  * （实测 `dns.lookup` ⇒ ENOTFOUND）。`servername` 传 adminHost 是为了让 Traefik 选中正确的证书
  * （SNI），不是为了做 hostname 校验——事实④：`rejectUnauthorized:false`，只比指纹。
  *
- * 三种结果（`status`）：`live`（指纹一致）/ `mismatch`（握手成功但端出来的是另一张）/ `unreachable`
- * （连不上 / 超时 / 拿不到对端证书 / 解析不出网关）。**永不抛**——这是探针，不是断言。
+ * 结果（`status` + #462 新增的可选 `reason` / `chainDepth`）：
+ *   · `live`：指纹一致，**且**链看着能过（链深 ≥ 2 或服务端那张是自签）
+ *   · `mismatch`：
+ *       - `reason:'fingerprint_mismatch'`：端出来的是**另一张**（上传了但没生效）
+ *       - `reason:'chain_incomplete'`：指纹一致但服务端**只发了 1 张**且非自签 ⇒ 客户端可能链校验失败
+ *         （实测 leaf-only ⇒ `21 unable to verify the first certificate`）
+ *   · `unreachable`：连不上 / 超时 / 拿不到对端证书 / 解析不出网关
  *
- * `connect` 可注入（单测用假 `tls.connect`）。
+ * **永不抛**——这是探针，不是断言。`connect` 可注入（单测用假 `tls.connect`）。
  */
 export async function verifyLiveCertificate({
   expectedFingerprint,
@@ -756,7 +996,8 @@ export async function verifyLiveCertificate({
     socket.once('secureConnect', () => {
       let peer;
       try {
-        peer = socket.getPeerCertificate();
+        // #462：`true` ⇒ 带上 `issuerCertificate`，否则数不了链深。
+        peer = socket.getPeerCertificate(true);
       } catch (err) {
         finish({ status: 'unreachable', error: String(err?.message ?? err) });
         return;
@@ -767,15 +1008,26 @@ export async function verifyLiveCertificate({
       }
       const fingerprintSha256 = String(peer.fingerprint256).toUpperCase();
       let subjectCN = null;
+      let issuerCN = null;
       try {
-        subjectCN = commonNameOf(new crypto.X509Certificate(peer.raw).subject);
+        const info = certificateInfo(new crypto.X509Certificate(peer.raw));
+        subjectCN = info.subjectCN;
+        issuerCN = info.issuerCN;
       } catch {
         subjectCN = null;
+        issuerCN = null;
       }
-      if (expectedFingerprint && fingerprintSha256 === String(expectedFingerprint).toUpperCase()) {
-        finish({ status: 'live', fingerprintSha256, subjectCN });
+      // 链深与服务端那张的自签判定（#462）：非自签 + 链深 1 ⇒ 客户端严格校验会失败。
+      const chainDepth = peerChainDepth(peer);
+      const nonSelfSigned = subjectCN !== null && issuerCN !== null && subjectCN !== issuerCN;
+      const base = { fingerprintSha256, subjectCN, chainDepth };
+      if (!expectedFingerprint || fingerprintSha256 !== String(expectedFingerprint).toUpperCase()) {
+        finish({ status: 'mismatch', ...base, reason: 'fingerprint_mismatch' });
+      } else if (chainDepth < 2 && nonSelfSigned) {
+        // 指纹对、但服务端只发了 1 张且不是自签：Traefik 能加载、浏览器却链校验失败（实测 21）。
+        finish({ status: 'mismatch', ...base, reason: 'chain_incomplete' });
       } else {
-        finish({ status: 'mismatch', fingerprintSha256, subjectCN });
+        finish({ status: 'live', ...base });
       }
     });
     socket.once('error', (err) => finish({ status: 'unreachable', error: String(err?.code ?? err?.message ?? err) }));
@@ -819,6 +1071,7 @@ export async function recordCertificateRow(pool, { cert, kind, uploadedBy = null
  *   · `active`：`{subjectCN, sans, issuerCN, notBefore, notAfter, fingerprintSha256}`（**没有** publicKeyPem）
  *   · `coverage`：`{adminHost, covered}`
  *   · `live`：`{status, checkedAt}` + 可选 `{fingerprintSha256, subjectCN, error}`
+ *     + #462 可选 `{reason, chainDepth}`（缺席 = 不知道，**不写 0 / 不写空串**）
  *   · `previous`：`{fingerprintSha256, subjectCN, notAfter, savedAt}` 或 `null`
  * 私钥正文、`certPem`/`keyPem` 原文、任何密钥派生值**一律不出现**。
  */
@@ -847,6 +1100,9 @@ export async function describeTls({ dynamicDir, adminHost, live = null, fsImpl =
         ...(live.fingerprintSha256 !== undefined ? { fingerprintSha256: live.fingerprintSha256 } : {}),
         ...(live.subjectCN !== undefined ? { subjectCN: live.subjectCN } : {}),
         ...(live.error !== undefined ? { error: live.error } : {}),
+        // #462：只有真的知道时才写（缺省语义照旧：不知道就不写，不写 0、不写空串）。
+        ...(live.reason !== undefined ? { reason: live.reason } : {}),
+        ...(live.chainDepth !== undefined ? { chainDepth: live.chainDepth } : {}),
       }
       : { status: 'unknown', checkedAt: null },
     previous: previous.present

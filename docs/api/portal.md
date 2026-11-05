@@ -164,6 +164,8 @@
 | 400 | `tls_cert_invalid`（#456，§4.13）| **上传的证书 PEM 解析不出来**（`new X509Certificate()` 抛；空串/非 PEM/被截断都算）。`retryable:false`：同一份字节重试一万次也一样。`details` 不带任何 PEM 片段 | 否 |
 | 400 | `tls_key_invalid`（#456，§4.13）| **上传的私钥 PEM 解析不出来**（`createPrivateKey()` 抛）。与 `tls_key_mismatch` 的区别：这是「这根本不是一把钥匙」，那是「是钥匙但不是这张证书的」| 否 |
 | 400 | `tls_key_mismatch`（#456，§4.13）| **私钥与证书不配对**（两边导出的 SPKI DER 不一致）。装错私钥的后果是管理台入口握手直接失败（Traefik `Error while creating certificate store`），所以必须在写盘前拒 | 否 |
+| 400 | `tls_cert_order_invalid`（#462，§4.13）| **证书顺序反了**：给了私钥、配对成功的那张（叶子）**不是第一个 `BEGIN CERTIFICATE` 段**。`details = {firstSubjectCN, leafSubjectCN}`。为什么是 400 而不是警告：这种形态 Traefik **直接拒加载这张证书**（`Unable to parse certificate … tls: private key does not match public key`），整条 `tls.certificates` 项失效、退回内置自签 ⇒ 管理台变成浏览器硬告警（2026-11-05 真机实测）。**注意**：本码必须排在 `tls_key_mismatch` **之前**报，否则用户的私钥是对的却被报成「不配对」 | 否 |
+| 400 | `tls_cert_chain_broken`（#462，§4.13）| **链在段间接不上**：`checkIssued` 在某一对上是 false（典型：拼进来的中间证书不是签发这张叶子的那张）。`details = {index, subjectCN, issuerCN, nextSubjectCN}`，`index` 是**段号（从 1 起，与文案同数）**。与「只有叶子」的分界：后者是「我知道我只有叶子」（可接受的自担风险，`200` + `chain_looks_leaf_only`），前者是「我以为我给了链，其实接不上」——发出去客户端一定链校验失败，而用户没有任何别的信号 | 否 |
 | 400 | `tls_cert_expired`（#456，§4.13）| **证书已过期**（`notAfter <= now`）。`retryable` 也是 `false`：重试还是同一张过期证书，出路只有换一张 | 否 |
 | 400 | `tls_cert_domain_mismatch`（#456，§4.13）| **证书覆盖不到管理台域名**（`details = {adminHost, missing:[…], certDomains:[…]}`），或 `confirmDomains` 里有证书覆盖不到的名字（此时 `details.field='confirmDomains'`，`missing` 只列超出的那些）。**无 override**：不覆盖 `admin.<伞域>` 的证书装上去 = 刷新后进不了管理台，只能登服务器救 | 否 |
 | 404 | `tls_no_previous`（#456，§4.13）| **没有可回滚的上一代证书**（`<dynamic>/certs/prev/` 不存在或不完整——首次上传后立刻点回滚就是这一格）。`retryable:false` | 否 |
@@ -2208,6 +2210,9 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 > `portal/src/http.js`（分派 / 限流 / 审计）、`portal/src/tlsassets.js`（装载面，**只由它物化 `tls.yml`**）。
 > 表结构见 `docs/data/model.md` §1.32（迁移 `0027`）。部署面见 `docs/deploy/edge-routing.md` §5。
 > 四个端点全部过 `requireAdmin`：非 admin ⇒ `403 forbidden`，未登录 ⇒ `401 unauthorized`。
+> **#462（2026-11-05）**：判定从「只看第一段证书」升级为「按**整条链**判」（叶子选取 / 顺序 / 链完整性），
+> 新增 `tls_cert_order_invalid` / `tls_cert_chain_broken` 两个 400 码与三个 `warnings` 机器码；
+> `verify` 增加可选 `reason` / `chainDepth`。真机实测四形态表见 `AGENTS.md` §8.100。
 > **#456 M2 追加第五个：`POST /api/admin/tls/inspect`**（解析但不落盘，见 4.13-2a）——同样过 `requireAdmin`，
 > 但它**不参与** 4.13-1 的响应 DTO（它回的是「这份 PEM 里有什么」，不是「盘上现在是什么」）。
 
@@ -2248,6 +2253,8 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 | `coverage.covered` | 证书是否覆盖 `adminHost`（`ADMIN_PUBLIC_HOST`，默认 `admin.<伞域>`）。口径见 4.13-3 |
 | `live.status` | `unknown`（还没验过 / 上传后已失效）/ `live` / `mismatch` / `unreachable`。**GET 只回缓存，绝不主动连** |
 | `live.error` | 仅 `unreachable` 出现：`timeout` / `no_default_gateway` / `no_certificate` / socket 错误码（`ECONNREFUSED` 等） |
+| `live.reason` | 仅 `mismatch` 出现（#462）：`fingerprint_mismatch`（端出来的是**另一张**）/ `chain_incomplete`（指纹一致但服务端**只发了 1 张**且非自签 ⇒ 客户端可能链校验失败）。**缺席 = 老服务端**，按指纹不一致说 |
+| `live.chainDepth` | 可选（#462）：服务端实际发出的链层数（`getPeerCertificate(true)` 数 `issuerCertificate`，最多 6 层防环；自签算 1）。**缺席 = 不知道，不写 0** |
 | `previous` | 可回滚的上一代（`certs/prev/`）。`null` = 没有备份 |
 
 **响应里绝不含**：私钥正文、`certPem`/`keyPem` 原文、任何密钥派生值（连 `publicKeyPem` 都不在白名单里）。
@@ -2284,15 +2291,34 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 | `cert` | **键集恰好六个**（与 §4.13-1 的 `active` 同一套字段，`portal/test/tls-api.test.js` ⑪ 逐键钉住）。`publicKeyPem` 不在里面 |
 | `keyMatches` | `true` / `false` / `null`（未给 `keyPem`）。**不配对不是错误**：只回事实，UI 据此禁用「确认安装」 |
 | `coverage` | 与 §4.13-1 同一口径。`covered:false` **不报错**（用户可能就是在传一张还没生效的证书） |
-| `warnings` | 机器码数组（服务端只发码不发话）：`cert_expired`（`notAfter <= now`）/ `not_yet_valid`（`notBefore > now`）/ `no_sans`（一个 DNS SAN 都没有，覆盖判定退 CN）/ `admin_host_not_covered`（与 `coverage.covered:false` 同义）。**这些不是错误码**，不登记 §1.2、不改任何 HTTP 状态 |
+| `warnings` | 机器码数组（服务端只发码不发话）：`cert_expired`（`notAfter <= now`）/ `not_yet_valid`（`notBefore > now`）/ `no_sans`（一个 DNS SAN 都没有，覆盖判定退 CN）/ `admin_host_not_covered`（与 `coverage.covered:false` 同义）/ **#462 三条链形态**：`chain_looks_leaf_only`（只有一张且非自签）/ `chain_order_suspect`（顺序可能反了，**只在没给私钥时**出现）/ `chain_broken`（段间接不上）。**这些不是错误码**，不登记 §1.2、不改任何 HTTP 状态 |
 
-**错误只有两种形态**（沿用 M1 的码，**不新增**）：
+**`cert` 一律是「叶子」**（#462）：给了 `keyPem` 时是**与私钥配对**的那一段，没给时按约定取第一段。
+（旧实现取 `blocks[0]`，在「中间在前」的 bundle 上会把中间证书当叶子 ⇒ 报错/展示的对象都不对。）
+
+**链形态判定表（#462，`inspect` 与 `PUT` 共用同一套判据，`portal/test/tls-cert.test.js` C1–C7 逐条钉住）**：
+
+| # | 输入 | `inspect`（只读） | `PUT`（安装） |
+|---|---|---|---|
+| C1 | 叶子 + 中间（bundle，正确顺序） | 200，**无 warning**，`cert` = 叶子 | 200 落盘（**原样字节**，不重排、不裁剪） |
+| C2 | 叶子 + 中间 + 根 | 200，**无 warning**（实测多发一张根无害） | 200 |
+| C3 | 只有叶子且**非自签** | 200 + `chain_looks_leaf_only` | **200**（警告不拒）+ 审计 `details.chainWarnings` |
+| C4 | 只有叶子且**自签** | 200，无 warning（自签的链就是 1 层） | 200 |
+| C5 | **顺序反了**（配对段不是第一段） | **400 `tls_cert_order_invalid`** | **400 同码** |
+| C6 | 顺序反了但**没给私钥**（拿不到配对证据） | 200 + `chain_order_suspect` | 400 `tls_cert_order_invalid`（`PUT` 一定带私钥 ⇒ 走 C5） |
+| C7 | 段间接不上（`checkIssued` false） | 200 + `chain_broken` | **400 `tls_cert_chain_broken`** |
+
+> C6 的判据（`inspect` 专用）：`blocks[0].subjectCN === blocks[1].issuerCN` **且** `blocks[0].issuerCN !== blocks[1].subjectCN`。
+> 顺序可疑时**不再叠**一条 `chain_broken`：两条同时发只会让人猜（修法完全不同——把叶子挑到前面 vs 换成对的中间证书）。
+
+**错误形态**（沿用 M1 的码 + #462 两个新码）：
 
 | 判据 | 码 |
 |---|---|
 | `certPem`/`keyPem` 非字符串、或单份 > 64 KiB（体级闸同 `PUT`：256 KiB） | `400 validation_failed` + `details.field` |
-| 证书 PEM 解析不出 | `400 tls_cert_invalid` |
+| 证书 PEM 解析不出（含「一段都没有」） | `400 tls_cert_invalid` |
 | 私钥 PEM 解析不出（**仅当给了非空 `keyPem`**） | `400 tls_key_invalid` |
+| 顺序反了（给了私钥且配对段不是第一段，C5） | `400 tls_cert_order_invalid` + `details={firstSubjectCN, leafSubjectCN}` |
 
 **零副作用（判据可红）**：不写盘、不写 `tls_certificates`、不写审计、不动 `tlsLive` 缓存、**不烧上传配额**。
 限流单独一档 **120 次/小时**（key `tlsinspect:<adminId>`，每次请求计一次；`PUT`/`rollback` 的 10 次/小时不受影响）。
@@ -2308,8 +2334,9 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
   "confirmDomains": ["admin.fde.erix.vip", "fde.erix.vip"] }
 ```
 
-`certPem` = **整份 fullchain**（叶子在前；`X509Certificate` 只解析第一份 = Traefik 会端出来的那张），
+`certPem` = **整份 fullchain**（**叶子必须在前**；顺序反了会被 400 拒，见下表 4a/4b），
 `keyPem` = 对应私钥。两份各 **≤ 64 KiB**（超 ⇒ `400 validation_failed` + `details.field`）。
+**落盘字节 = 你提交的原样字节**（不重排、不裁剪、不重新序列化；`certs/tls.crt` 逐字节等于请求里的 `certPem`）。
 > 体级闸：本端点的请求体整体上限 **256 KiB**（不是默认的 `MAX_BODY_BYTES` 64 KiB——两份 64 KiB 的 PEM
 > 加上 JSON 转义放不进 64 KiB，那样会先撞 `413 payload_too_large` 而拿不到字段级错误）。超过 256 KiB 仍是
 > `413 payload_too_large`（§1.2，全局语义不变）。
@@ -2320,12 +2347,18 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 | # | 判据 | 失败码 |
 |---|---|---|
 | 1 | `certPem`/`keyPem` 是字符串且 ≤ 64 KiB | `400 validation_failed`（`details.field`）|
-| 2 | 证书 PEM 可解析（`new X509Certificate()`）| `400 tls_cert_invalid` |
+| 2 | 证书 PEM 可解析（**逐段**；一段都没有也算失败）| `400 tls_cert_invalid` |
 | 3 | 私钥 PEM 可解析（`createPrivateKey()`）| `400 tls_key_invalid` |
-| 4 | 公钥配对（两边 SPKI **DER** 逐字节比）| `400 tls_key_mismatch` |
+| 4 | 公钥配对（两边 SPKI **DER** 逐字节比；**逐段**找配对的那张 = 选叶子）| `400 tls_key_mismatch`（一段都对不上）|
+| 4a | **顺序**：配对段必须是**第一段**（#462 C5）| `400 tls_cert_order_invalid`（`details={firstSubjectCN, leafSubjectCN}`）|
+| 4b | **链完整**：`blocks[i].checkIssued(blocks[i+1])` 逐对成立（#462 C7）| `400 tls_cert_chain_broken`（`details={index, subjectCN, issuerCN, nextSubjectCN}`）|
 | 5 | 未过期（`notAfter > now`）| `400 tls_cert_expired` |
 | 6 | **覆盖 `adminHost`** | `400 tls_cert_domain_mismatch`（`details={adminHost, missing:[adminHost], certDomains}`）|
 | 7 | `confirmDomains` 每项都被覆盖（可选）| `400 tls_cert_domain_mismatch`（`details.missing` 只列超出的、`details.field='confirmDomains'`）|
+
+> ⚠ **4a 必须排在 4 之前报**（实现顺序：解析 → 选叶子 → **顺序** → 配对失败/链完整 → …）。旧实现把
+> 「顺序反了」报成 `tls_key_mismatch`——用户的私钥是对的，这个提示是误导（#462 的病根）。
+> 只有叶子（C3）**不是**错误：`200` + 审计 `details.chainWarnings: ['chain_looks_leaf_only']`（可接受的自担风险）。
 
 **域名覆盖口径（与浏览器一致，三条都是判据）**：
 
@@ -2358,13 +2391,24 @@ DB 写失败**不回滚已生效的证书**（盘是真相，回滚才是更坏�
 - `rejectUnauthorized: false`，**判据只看指纹**。⚠ **不要**顺手加 hostname 校验：证书 SAN 只覆盖
   `*.fde.erix.vip`，连 `127.0.0.1` 必然 `subjectAltName does not match`——那不是配置问题；
 - 超时 **5s**；三种结果 `live` / `mismatch` / `unreachable`（`error` 给原因）；
+- **#462：看链，不只比指纹**。用 `getPeerCertificate(true)` 数链深（`issuerCertificate` 存在、非空、
+  指纹不重复才继续，最多 6 层防环）：
+  | 情况 | 结果 |
+  |---|---|
+  | 指纹不一致 | `mismatch` + `reason:'fingerprint_mismatch'`（**现状语义不变**，只多一个 reason 字段） |
+  | 指纹一致、链深 ≥ 2 | `live` |
+  | 指纹一致、链深 < 2、**自签**（`subjectCN === issuerCN`） | `live`（自签的链就是 1 层） |
+  | 指纹一致、链深 < 2、**非自签** | `mismatch` + `reason:'chain_incomplete'` + `chainDepth`（服务端只发了 1 张 ⇒ 客户端可能 `unable to verify the first certificate`，实测） |
+  两个可选键**缺席 = 不知道**（不写 0、不写空串）。**绝不抛**：探针失败一律 `unreachable`；
 - 盘上无证书 ⇒ `live.status='unreachable'` + `error='no_certificate'`（没有可比的基准）；
 - 每管理员 **30 次/小时**（key `tlsverify:<adminId>`）；**不写审计**（探针不是变更）；
 - 结果缓存在进程内存（单实例），随后的 `GET` 直接回放；**上传/回滚成功会把它重置为 `unknown`**。
 
 #### 4.13-5 `POST /api/admin/tls/rollback`
 
-从 `certs/prev/` 读回两文件写回原位（0644 / **0600**）+ `materializeTlsAssets()` + 台账（`kind='rollback'`）+ 审计。
+把 `certs/prev/` 的两文件**拷回原位**（`fs.copyFile`，0644 / **0600**）+ `materializeTlsAssets()` + 台账（`kind='rollback'`）+ 审计。
+> **#462 / 安全文档 S4**：回滚走 `copyFile` 而不是 `readFile` + `write` —— 私钥不需要进进程内存；
+> 拷完显式 `chmod` 固定 644/600（`copyFile` 对**已存在**的目标不继承源模式）。
 `certs/prev/` 不存在或不完整 ⇒ **`404 tls_no_previous`**。回滚**不改写 `prev` 本身**（重复回滚幂等）。
 限流与上传共用同一个计数器（10 次/小时）。
 
@@ -2372,7 +2416,7 @@ DB 写失败**不回滚已生效的证书**（盘是真相，回滚才是更坏�
 
 | action | 触发 | `details` |
 |---|---|---|
-| `admin.tls_updated` | PUT 成功 | `{subjectCN, sans, fingerprintSha256, notAfter, backupCreated}` |
+| `admin.tls_updated` | PUT 成功 | `{subjectCN, sans, fingerprintSha256, notAfter, backupCreated}` + 可选 `chainWarnings`（#462，**只有非空时才写**，例如只有叶子时的 `['chain_looks_leaf_only']`） |
 | `admin.tls_rolled_back` | rollback 成功 | 同上（`backupCreated` 恒 `false`——回滚不产生新备份）|
 
 两条都带 `actor_id = 当前 admin`、`target = 'tls_certificate'`。**`details` 里没有 PEM、没有私钥、没有密钥派生值**。
@@ -2383,6 +2427,8 @@ DB 写失败**不回滚已生效的证书**（盘是真相，回滚才是更坏�
 - **审计**：只有元数据（4.13-6）。
 - **日志**：只记「哪一步失败」（错误码 + 步骤名），不记 PEM 正文。
 - **DB**：`tls_certificates` 里没有任何 PEM 列（迁移 0027 的列清单被单测钉住）。
+- **读路径**（#462 / 安全文档 S4）：`readTlsAssets` 对 `certs/tls.key` **只 `stat`**（`size > 0` + `mtimeMs`），
+  **不 `readFile`**；回滚用 `copyFile`。⇒ portal 的读路径**永不接触私钥字节**，只有上传那一刻必须接收管理员递来的。
 - **盘上**：`certs/tls.key` **0600 且属主必须是 Traefik 进程的 uid**（`station-edge` 里 root 没有
   `CAP_DAC_OVERRIDE`，属主/模式不对 ⇒ 9443 握手直接失败）。portal 容器内也是 root ⇒
   `atomicWriteFile(path, pem, {mode: 0o600, root: dynamicDir})` 天然满足。**绝不**用 `chmod 644` 绕。

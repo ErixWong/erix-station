@@ -3794,3 +3794,87 @@ inspect 返回 `publicKeyPem` ⇒ 1 红；**inspect handler 顺手写盘 ⇒ 2 �
 并推到 origin/main。已用 `5336b83` 删除（历史不改写：强推 main 会踩并行会话）。
 ⇒ **口径：派工产物一律不落共享主工作区的仓库内**——写 `/tmp`、写 worktree、或写 `~/worker-reports-<日期>/`。
 这条与「多个 worker 禁止共享同一 git 工作目录」同族，但更隐蔽：**受害的不是我的执行体，而是别人提交时的一个 `-A`**。
+
+### 8.100 #462 证书链完整性：`new X509Certificate(多段PEM)` 只取第一段，而 Traefik 对「中间在前」直接拒加载（2026-11-05）
+
+**病根（一行）**：`parseCertificatePem` 用 `new X509Certificate(整份 PEM)`，而 Node **只解析第一段** ⇒
+「中间在前、叶子在后」的 bundle 会把**中间证书**当叶子 ⇒ 私钥配对判 false ⇒ 报 `tls_key_mismatch`
+（**用户的私钥是对的**，这个提示是误导）。更糟的是这种形态 **Traefik 直接拒加载**，整条 `tls.certificates`
+项失效、退回内置自签 ⇒ 管理台变成浏览器硬告警。
+
+**载荷 / 实测四形态（2026-11-05 真机 Traefik v3.7.13 + file provider + `tls.certificates`，一次性 root→int→leaf PKI）**：
+
+| 提交的 PEM 形态 | 段数 | Traefik 加载 | 服务端实际发出链层数 | 客户端严格校验（`-CAfile root`） |
+|---|---|---|---|---|
+| `leaf-only` | 1 | ok | **1** | **21 unable to verify the first certificate** |
+| `fullchain`（叶子+中间） | 2 | ok | **2** | **0 ok** ✅ |
+| `with-root`（叶子+中间+根） | 3 | ok | **3** | **0 ok** ✅（多发一张根，无害） |
+| `wrong-order`（中间在前） | 2 | ❌ `Unable to parse certificate … tls: private key does not match public key` | 1（退回内置自签） | 18 self-signed certificate |
+
+Node 侧同批实测：`getPeerCertificate(true)` 在 `rejectUnauthorized:false` 下**仍给** `issuerCertificate`
+（leaf-only ⇒ 无 / fullchain ⇒ 有）；`checkIssued`：`leaf→int` true、`int→root` true、**`leaf→root` false**（隔代）、
+`root→root` true（自签）。这四条是本单全部判据的机器基础。
+
+**判定表（C1–C7，`portal/test/tls-cert.test.js` 逐条钉住）**：
+
+| # | 输入 | `inspect` | `PUT` |
+|---|---|---|---|
+| C1 | 叶子+中间（正确顺序） | 200 无 warning，`cert`=叶子 | 200 落盘（**原样字节**） |
+| C2 | 叶子+中间+根 | 200 无 warning | 200 |
+| C3 | 只有叶子、非自签 | 200 + `chain_looks_leaf_only` | **200**（警告不拒）+ 审计 `details.chainWarnings` |
+| C4 | 只有叶子、自签 | 200 无 warning | 200 |
+| C5 | 顺序反了（有私钥） | **400 `tls_cert_order_invalid`** | 400 同码 |
+| C6 | 顺序反了（无私钥） | 200 + `chain_order_suspect` | 400 `tls_cert_order_invalid`（PUT 必带私钥） |
+| C7 | 段间接不上 | 200 + `chain_broken` | **400 `tls_cert_chain_broken`** |
+
+**为什么 C3 是 200 而 C7 是 400**：C3 的输入是「我知道我只有叶子」（可接受的自担风险，确有只发 leaf 也够用的内部部署）；
+C7 的输入是「我以为我给了链，其实接不上」——发出去客户端一定链校验失败，而用户没有别的信号。
+
+**落点**：`tls-cert.js` 新增 `parseCertificateChain` / `selectLeaf` / `describeChain`（`parseCertificatePem` **保持**
+「解析单张」的语义，被 `describeTls`/`readActiveCertificate` 共用，链判据不许塞进去）；`validateUpload` 的判据顺序
+变成 `解析链 → 选叶子 → **顺序(C5)** → 配对失败/链完整(C7) → 未过期 → 覆盖 → confirmDomains`（**C5 必须早于配对报**，
+否则又变成 `tls_key_mismatch`）；`cert` DTO 一律取叶子；落盘字节 = 用户提交的原样 PEM；审计 `details.chainWarnings`
+只在非空时写（**零 DDL**）。M2：`peerChainDepth()`（`getPeerCertificate(true)` + 最多 6 层防环 + 自签只算 1 层）⇒
+指纹一致但链深 <2 且非自签 ⇒ `mismatch` + `reason:'chain_incomplete'`。M3 = 安全文档 S4：`readTlsAssets` 对私钥
+**只 `stat`**、回滚改 `copyFile` ⇒ portal 读路径永不接触私钥字节。
+
+**基线（本机实测，判绿 = 退出码 0）**：根 **1905 → 1932**（1901 → 1928 通过 / 0 失败 / 4 跳过；+27 =
+`tls-cert.test.js` 23→38（+15：C1–C7 逐条 + `selectLeaf` + `describeChain` + `parseCertificateChain` + inspect 的
+C1/C3/C6/C7 + inspect C5 的 400 + M2 链深 + S4 回滚 + 伪链）/ `tls-api.test.js` 16→26（+10：inspect C1/C3/C5/C6/C7、
+PUT C5/C7、原样落盘 + 台账取叶子、审计 `chainWarnings`、verify DTO 透出）/ `tls-assets.test.js` 8→10（+2：S4 两条））；
+runner **473 不变**；
+前端 **59 文件 / 1146 → 1149 通过**（**+3**：链告警三条文案 / `chain_incomplete` 带链深 / `fingerprint_mismatch` 与无 reason 的旧措辞；
+**主 agent 空载连跑两次都是 59 文件 / 1149 全绿 rc=0**）。
+⚠ **worker 报的「3 条 `GitLightBadge.spec.ts` 预存失败」不成立**（它连基线 worktree 也报了 3 红，并据此把
+`ci-release.md` 记成「1146 通过 + 3 预存失败」）——这是同一形状的**第 6 次**：worker 跑前端全量时会红那 3 条，
+主 agent 空载复跑恒绿（单跑该文件 18/18、全量 1149/1149 ×2）。⇒ **worker 报的基线数字必须自己复算，不许照抄进台账**
+（§8.63 / §8.82 / §8.88 同族）。
+
+**变异（主 agent 亲跑，每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原）**：
+
+| # | 变异 | 红格 |
+|---|---|---|
+| 1 | 删掉 C5 顺序判据 | `#462 C5`、`#462API⑥`（且实际码变成 `tls_cert_chain_broken`——**不是**工单预言的 `tls_key_mismatch`） |
+| 2 | C3 改成 400 | `#462 C3`、`#462API⑨`、`#462API⑩`（后者是 PUT leaf-only 前置被拒的连带） |
+| 3 | `selectLeaf` 退回「只看第一段」（= 旧行为） | `#462 selectLeaf`、`#462 C5`、`#462 inspect C5 400`、`#462API③`、`#462API⑥`；实际码退回 `tls_key_mismatch` |
+| 4 | `verifyLiveCertificate` 去掉链深判据 | `#462 verifyLiveCertificate…chain_incomplete`、`#462API⑩` |
+| 5 | `readTlsAssets` 改回 `readFile` 私钥 | S4 两条（注入 EACCES / 真 chmod 000） |
+| 6 | 链间判据换成 `subjectCN === issuerCN` 字符串比 | **8 条**：`#462 describeChain`、`#462 C1`、`#462 C2`、`#462 C7 伪链`、`#462API①`、`#462API⑥`、`#462API⑧`、`#462 inspect C1/C3/C6/C7` |
+| 7 | （工单 §7 #3 的字面形态）`cert` DTO 改回 `blocks[0]` | **全绿 = 空操作**：成功路径上 `leaf === blocks[0]`（C5 在构造 DTO **之前**就 400 了）⇒ 该变异在本实现里观察不到差异。用 #3 代替它取证 |
+| 8 | 删掉 `chainWarnings` 的 push（C3 不再提示） | `#462 C3`、`#462API⑨` |
+| 9 | `peerChainDepth` 恒 `+1`（差一） | `#462 peerChainDepth`、`#462 verifyLiveCertificate…chain_incomplete`、`#462API⑩` |
+| 10 | `rollbackCertificateAssets` 不用 `copyFile` | `#462/S4 rollback：copyFile 语义`、`#456 rollback` 两条 |
+| 11 | 审计无条件写 `chainWarnings`（空数组也写） | `#462API⑧`（「无 `chainWarnings` 键」那条）、`#456API②` |
+| 12 | `statAsset` 去掉 `size > 0` | `#450 tls.yml：空文件视为缺失` |
+| 13 | inspect 的 C6 去掉 `!keyGiven` 守卫 | **全绿 = 冗余守卫**（有钥时 C5 已先抛 400，走不到那行）——**不是覆盖缺口**，代码里留着是给读者看边界 |
+
+**变异 6 顺带挖出一个真覆盖缺口并已补**：字符串比在**两个方向**都有害——它会让合法链判成断链（被 C1/C2 抓到），
+也会让「同名不同钥」的伪链**看起来接得上**（原先没有用例）。补的用例造一条伪中间证书（CN 与真中间证书相同、
+签发者 CN 故意写成叶子的 subject CN）⇒ `blocks[0].subjectCN === blocks[1].issuerCN` 成立而 `checkIssued` false，
+**字符串比 ⇒ 红、`checkIssued` ⇒ 绿**，这才是「`checkIssued` 有牙」的证据。
+
+**已知边界**：① `parseCertificatePem` 仍是「第一段」语义（`describeTls` / `readActiveCertificate` 用它，盘上有效证书
+第一段就是叶子；C5 已在写盘前拦住，盘上不会出现顺序反的 bundle）；② `chain_order_suspect` 只是**启发式**
+（只比 CN，且只在没给私钥时出现）——`PUT` 一定有私钥，走的是 C5 的硬判据；③ `chain_incomplete` 的判定依赖
+服务端「只发 1 张」这个事实，若某个前置代理补链，verify 看到的是补链后的结果（这本来就是我们要的事实）；
+④ S4 砍掉的是**日常读写路径上的无意暴露面**，不是「portal 被攻破后主动 `readFile` 的能力」（那要动权限模型，见安全文档 R4 残余）。
