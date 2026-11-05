@@ -12,6 +12,7 @@ import { createMemoryHistory, createRouter } from 'vue-router';
 import AdminLayout from './AdminLayout.vue';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
+import { routes } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
 
 const ADMIN_WITH_SEAT = {
@@ -27,7 +28,7 @@ function makeRouter() {
       { path: '/login', component: { template: '<div>login</div>' } },
       // 顶栏四个 tab 用的是 `{ name: ... }` 形式的 :to ⇒ 路由表里没有这些名字，挂载当场就
       // "No match for {name:'admin-users'}" 抛错（不是断言失败）。给桩即可，本单不测 tab。
-      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-preview-pool']
+      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-preview-pool']
         .map((name) => ({ path: `/${name}`, name, component: { template: '<div />' } })),
     ],
   });
@@ -71,5 +72,43 @@ describe('AdminLayout 顶栏登出（#431 收口链路的那颗按钮）', () =>
     expect(calls.filter((u) => u.startsWith('/api/auth/logout'))).toHaveLength(1);
     expect(router.currentRoute.value.path).toBe('/login');
     expect(notified, '这颗按钮必须汇到 auth.logout()——否则从管理台登出时上一账号的 SSE 没人关').toBe(1);
+  });
+});
+
+// issue #449：新 tab 「邮件通道」必须真在导航里，且指向 `admin-mail`（只加路由不加 tab ⇒ 这页没入口）。
+describe('AdminLayout tab 导航（#449 邮件通道）', () => {
+  it('导航里有「邮件通道」，指向 admin-mail，且排在仓库管理之后、号池之前', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+
+    // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
+    // 路由表那条由本用例末尾的 `routes` 断言钉住）。
+    const links = wrapper.findAll('nav a').slice(0, 5);
+    const hrefs = links.map((link) => link.attributes('href'));
+    expect(hrefs).toContain('/admin-mail');
+
+    const mailLink = links.find((link) => link.attributes('href') === '/admin-mail')!;
+    expect(mailLink.text()).toBe('邮件通道');
+
+    // 顺序：仓库管理 → 邮件通道 → 号池占用（报告里要说明的取舍）
+    const repos = hrefs.indexOf('/admin-repos');
+    const mail = hrefs.indexOf('/admin-mail');
+    const pool = hrefs.indexOf('/admin-preview-pool');
+    expect(repos).toBeGreaterThanOrEqual(0);
+    expect(mail).toBe(repos + 1);
+    expect(pool).toBe(mail + 1);
+
+    // 路由表本身：`/admin` 的 children 里有 `mail` → `admin-mail`，且要求 admin 角色（照 admin-repos 的写法）
+    const adminRoute = routes.find((route) => route.path === '/admin')!;
+    const mailRoute = (adminRoute.children ?? []).find((child) => child.name === 'admin-mail')!;
+    expect(mailRoute.path).toBe('mail');
+    expect(mailRoute.meta).toEqual({ requiresRole: 'admin' });
+    expect(typeof mailRoute.component).toBe('function');
   });
 });
