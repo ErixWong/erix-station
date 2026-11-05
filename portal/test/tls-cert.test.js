@@ -29,6 +29,7 @@ import {
   parseCertificatePem,
   parseDefaultGateway,
   parsePrivateKeyPem,
+  peerChainDepth,
   readPreviousCertificate,
   selectLeaf,
   validateUpload,
@@ -611,4 +612,109 @@ test('#462 inspect：顺序反了**且有私钥** ⇒ 400 tls_cert_order_invalid
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// ⑦ #462 真机校验（M2）：数链深，不只比指纹
+// ---------------------------------------------------------------------------
+
+test('#462 peerChainDepth：leaf-only ⇒ 1；带 issuer ⇒ 2；自签（Node 把自己当 issuer）⇒ 1；防环', () => {
+  const leafRaw = new crypto.X509Certificate(CHAIN.leafPem).raw;
+  const intRaw = new crypto.X509Certificate(CHAIN.intermediatePem).raw;
+  const leafFp = new crypto.X509Certificate(CHAIN.leafPem).fingerprint256;
+  const intFp = new crypto.X509Certificate(CHAIN.intermediatePem).fingerprint256;
+
+  assert.equal(peerChainDepth({ fingerprint256: leafFp, raw: leafRaw }), 1, 'leaf-only ⇒ 1 层');
+  assert.equal(
+    peerChainDepth({ fingerprint256: leafFp, raw: leafRaw, issuerCertificate: { fingerprint256: intFp, raw: intRaw } }),
+    2,
+    'fullchain ⇒ 2 层',
+  );
+  const self = new crypto.X509Certificate(WILDCARD.certPem);
+  assert.equal(
+    peerChainDepth({ fingerprint256: self.fingerprint256, raw: self.raw, issuerCertificate: { fingerprint256: self.fingerprint256, raw: self.raw } }),
+    1,
+    '自签时 Node 会把自己当 issuer ⇒ 不能数成 2 层',
+  );
+  // 防环：两个对象互相指向对方 ⇒ 停在重复指纹上（不会无限递归）
+  const a = { fingerprint256: 'AA', issuerCertificate: null };
+  const b = { fingerprint256: 'BB', issuerCertificate: a };
+  a.issuerCertificate = b;
+  assert.equal(peerChainDepth(a), 2);
+});
+
+test('#462 verifyLiveCertificate：指纹一致但链深 1 且非自签 ⇒ mismatch/chain_incomplete（带 chainDepth）', async () => {
+  const { EventEmitter } = await import('node:events');
+  const route = fakeRouteFile();
+  const expected = new crypto.X509Certificate(CHAIN.leafPem).fingerprint256;
+  const leafRaw = new crypto.X509Certificate(CHAIN.leafPem).raw;
+  const intRaw = new crypto.X509Certificate(CHAIN.intermediatePem).raw;
+  const intFp = new crypto.X509Certificate(CHAIN.intermediatePem).fingerprint256;
+  const makeConnect = (peer) => () => {
+    const sock = new EventEmitter();
+    sock.destroy = () => {};
+    sock.getPeerCertificate = (detailed) => {
+      assert.equal(detailed, true, '#462：必须传 true 才拿得到 issuerCertificate');
+      return peer;
+    };
+    setImmediate(() => sock.emit('secureConnect'));
+    return sock;
+  };
+
+  try {
+    // 链深 1（服务端只发了叶子）⇒ 指纹对也不算 live：客户端会 unable to verify the first certificate
+    const incomplete = await verifyLiveCertificate({
+      expectedFingerprint: expected,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({ fingerprint256: expected, raw: leafRaw }),
+    });
+    assert.equal(incomplete.status, 'mismatch', '指纹一致但链不完整 ⇒ 不能报 live');
+    assert.equal(incomplete.reason, 'chain_incomplete');
+    assert.equal(incomplete.chainDepth, 1);
+    assert.equal(incomplete.subjectCN, 'admin.fde.erix.vip');
+
+    // 链深 2 ⇒ live
+    const full = await verifyLiveCertificate({
+      expectedFingerprint: expected,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({
+        fingerprint256: expected,
+        raw: leafRaw,
+        issuerCertificate: { fingerprint256: intFp, raw: intRaw },
+      }),
+    });
+    assert.equal(full.status, 'live');
+    assert.equal(full.chainDepth, 2);
+    assert.equal(full.reason, undefined, 'live 不带 reason');
+
+    // 自签 + 链深 1 ⇒ live（自签的链就是 1 层）
+    const self = new crypto.X509Certificate(WILDCARD.certPem);
+    const selfSigned = await verifyLiveCertificate({
+      expectedFingerprint: self.fingerprint256,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({ fingerprint256: self.fingerprint256, raw: self.raw }),
+    });
+    assert.equal(selfSigned.status, 'live');
+    assert.equal(selfSigned.chainDepth, 1);
+
+    // 指纹不一致 ⇒ mismatch + reason:'fingerprint_mismatch'（现状语义不变，只多一个 reason）
+    const otherFp = new crypto.X509Certificate(OTHER.certPem).fingerprint256;
+    const mismatch = await verifyLiveCertificate({
+      expectedFingerprint: expected,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({ fingerprint256: otherFp, raw: new crypto.X509Certificate(OTHER.certPem).raw }),
+    });
+    assert.equal(mismatch.status, 'mismatch');
+    assert.equal(mismatch.reason, 'fingerprint_mismatch');
+  } finally {
+    route.cleanup();
+  }
 });

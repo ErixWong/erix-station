@@ -790,3 +790,40 @@ test('#462API⑨ PUT C3：leaf-only ⇒ 200 落盘 + 审计 details.chainWarning
     await srv.close();
   }
 });
+
+test('#462API⑩ verify DTO：chain_incomplete 的 reason/chainDepth 出现在响应里（缺席不写）', async () => {
+  // 桩：端出**盘上那张的指纹**，但只发 1 张证书（链深 1）且非自签 ⇒ chain_incomplete
+  const connect = () => {
+    const sock = new EventEmitter();
+    sock.destroy = () => {};
+    sock.getPeerCertificate = () => ({
+      fingerprint256: new crypto.X509Certificate(CHAIN.leafPem).fingerprint256,
+      raw: new crypto.X509Certificate(CHAIN.leafPem).raw,
+    });
+    setImmediate(() => sock.emit('secureConnect'));
+    return sock;
+  };
+  const srv = await startServer({ connect });
+  try {
+    assert.equal((await putTls(srv, { certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem })).status, 200);
+    const res = await verifyTls(srv);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.live.status, 'mismatch');
+    assert.equal(res.body.live.reason, 'chain_incomplete');
+    assert.equal(res.body.live.chainDepth, 1);
+    assert.equal(res.body.live.fingerprintSha256, new crypto.X509Certificate(CHAIN.leafPem).fingerprint256);
+    // GET 回放缓存时两个可选键跟着走（白名单放行）
+    const cached = await getTls(srv);
+    assert.equal(cached.body.live.reason, 'chain_incomplete');
+    assert.equal(cached.body.live.chainDepth, 1);
+    // unknown 的 live 不带这两个键（缺席语义：不知道就不写）
+    const fresh = await startServer();
+    try {
+      assert.deepEqual((await getTls(fresh)).body.live, { status: 'unknown', checkedAt: null });
+    } finally {
+      await fresh.close();
+    }
+  } finally {
+    await srv.close();
+  }
+});

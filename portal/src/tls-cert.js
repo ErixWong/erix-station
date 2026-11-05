@@ -900,16 +900,52 @@ export async function readDefaultGateway({ routePath = '/proc/net/route', fsImpl
 }
 
 /**
+ * 从 `getPeerCertificate(true)` 的对端证书对象里数**链深**（#462 M2）。
+ *
+ * 口径（Node 实测）：`rejectUnauthorized:false` 下 `issuerCertificate` **仍然会给**——
+ * leaf-only ⇒ 没有 `issuerCertificate`（链深 1）；fullchain ⇒ 有一层（链深 2）。
+ * 终止条件三个：没有 `issuerCertificate` / 指纹重复（自签时 Node 会把自己当 issuer）/ 最多 6 层防环。
+ *
+ * 指纹拿不到（测试桩/异常形态）⇒ 返回 1（“不知道”就按最保守的 1 层算，由调用方结合自签判定决定要不要报）。
+ */
+export function peerChainDepth(peer) {
+  const fingerprintOfPeer = (cert) => (typeof cert?.fingerprint256 === 'string' && cert.fingerprint256 !== ''
+    ? cert.fingerprint256.toUpperCase()
+    : null);
+  const seen = new Set();
+  let depth = 1;
+  let current = peer;
+  const first = fingerprintOfPeer(current);
+  if (first === null) return depth;
+  seen.add(first);
+  while (depth < 6) {
+    const next = current?.issuerCertificate;
+    if (next === null || typeof next !== 'object') break;
+    const fp = fingerprintOfPeer(next);
+    if (fp === null || seen.has(fp)) break;
+    seen.add(fp);
+    depth += 1;
+    current = next;
+  }
+  return depth;
+}
+
+/**
  * 对管理台入口做一次真 TLS 握手，比对 `fingerprint256`。
  *
  * 为什么连**默认网关**而不是 `adminPublicBaseUrl` 的 hostname：portal 容器解析不了 `admin.<伞域>`
  * （实测 `dns.lookup` ⇒ ENOTFOUND）。`servername` 传 adminHost 是为了让 Traefik 选中正确的证书
  * （SNI），不是为了做 hostname 校验——事实④：`rejectUnauthorized:false`，只比指纹。
  *
- * 三种结果（`status`）：`live`（指纹一致）/ `mismatch`（握手成功但端出来的是另一张）/ `unreachable`
- * （连不上 / 超时 / 拿不到对端证书 / 解析不出网关）。**永不抛**——这是探针，不是断言。
+ * 结果（`status` + #462 新增的可选 `reason` / `chainDepth`）：
+ *   · `live`：指纹一致，**且**链看着能过（链深 ≥ 2 或服务端那张是自签）
+ *   · `mismatch`：
+ *       - `reason:'fingerprint_mismatch'`：端出来的是**另一张**（上传了但没生效）
+ *       - `reason:'chain_incomplete'`：指纹一致但服务端**只发了 1 张**且非自签 ⇒ 客户端可能链校验失败
+ *         （实测 leaf-only ⇒ `21 unable to verify the first certificate`）
+ *   · `unreachable`：连不上 / 超时 / 拿不到对端证书 / 解析不出网关
  *
- * `connect` 可注入（单测用假 `tls.connect`）。
+ * **永不抛**——这是探针，不是断言。`connect` 可注入（单测用假 `tls.connect`）。
  */
 export async function verifyLiveCertificate({
   expectedFingerprint,
@@ -955,7 +991,8 @@ export async function verifyLiveCertificate({
     socket.once('secureConnect', () => {
       let peer;
       try {
-        peer = socket.getPeerCertificate();
+        // #462：`true` ⇒ 带上 `issuerCertificate`，否则数不了链深。
+        peer = socket.getPeerCertificate(true);
       } catch (err) {
         finish({ status: 'unreachable', error: String(err?.message ?? err) });
         return;
@@ -966,15 +1003,26 @@ export async function verifyLiveCertificate({
       }
       const fingerprintSha256 = String(peer.fingerprint256).toUpperCase();
       let subjectCN = null;
+      let issuerCN = null;
       try {
-        subjectCN = commonNameOf(new crypto.X509Certificate(peer.raw).subject);
+        const info = certificateInfo(new crypto.X509Certificate(peer.raw));
+        subjectCN = info.subjectCN;
+        issuerCN = info.issuerCN;
       } catch {
         subjectCN = null;
+        issuerCN = null;
       }
-      if (expectedFingerprint && fingerprintSha256 === String(expectedFingerprint).toUpperCase()) {
-        finish({ status: 'live', fingerprintSha256, subjectCN });
+      // 链深与服务端那张的自签判定（#462）：非自签 + 链深 1 ⇒ 客户端严格校验会失败。
+      const chainDepth = peerChainDepth(peer);
+      const nonSelfSigned = subjectCN !== null && issuerCN !== null && subjectCN !== issuerCN;
+      const base = { fingerprintSha256, subjectCN, chainDepth };
+      if (!expectedFingerprint || fingerprintSha256 !== String(expectedFingerprint).toUpperCase()) {
+        finish({ status: 'mismatch', ...base, reason: 'fingerprint_mismatch' });
+      } else if (chainDepth < 2 && nonSelfSigned) {
+        // 指纹对、但服务端只发了 1 张且不是自签：Traefik 能加载、浏览器却链校验失败（实测 21）。
+        finish({ status: 'mismatch', ...base, reason: 'chain_incomplete' });
       } else {
-        finish({ status: 'mismatch', fingerprintSha256, subjectCN });
+        finish({ status: 'live', ...base });
       }
     });
     socket.once('error', (err) => finish({ status: 'unreachable', error: String(err?.code ?? err?.message ?? err) }));
@@ -1018,6 +1066,7 @@ export async function recordCertificateRow(pool, { cert, kind, uploadedBy = null
  *   · `active`：`{subjectCN, sans, issuerCN, notBefore, notAfter, fingerprintSha256}`（**没有** publicKeyPem）
  *   · `coverage`：`{adminHost, covered}`
  *   · `live`：`{status, checkedAt}` + 可选 `{fingerprintSha256, subjectCN, error}`
+ *     + #462 可选 `{reason, chainDepth}`（缺席 = 不知道，**不写 0 / 不写空串**）
  *   · `previous`：`{fingerprintSha256, subjectCN, notAfter, savedAt}` 或 `null`
  * 私钥正文、`certPem`/`keyPem` 原文、任何密钥派生值**一律不出现**。
  */
@@ -1046,6 +1095,9 @@ export async function describeTls({ dynamicDir, adminHost, live = null, fsImpl =
         ...(live.fingerprintSha256 !== undefined ? { fingerprintSha256: live.fingerprintSha256 } : {}),
         ...(live.subjectCN !== undefined ? { subjectCN: live.subjectCN } : {}),
         ...(live.error !== undefined ? { error: live.error } : {}),
+        // #462：只有真的知道时才写（缺省语义照旧：不知道就不写，不写 0、不写空串）。
+        ...(live.reason !== undefined ? { reason: live.reason } : {}),
+        ...(live.chainDepth !== undefined ? { chainDepth: live.chainDepth } : {}),
       }
       : { status: 'unknown', checkedAt: null },
     previous: previous.present
