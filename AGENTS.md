@@ -3724,3 +3724,40 @@ inspect 返回 `publicKeyPem` ⇒ 1 红；**inspect handler 顺手写盘 ⇒ 2 �
 ⚠ **我自己两次把变异做成空操作**（往 `inspectCertificate` 里加「仅当 `arguments[0].dynamicDir` 存在才写盘」——
 而 handler 根本不传 `dynamicDir`；另一次写 `/tmp`，快照判据看不到）。⇒ 又一次印证 §8.24：**红了要证明红来自你以为的那处改动，
 没红要先证明变异真的改变了行为**。真变异要落在**调用链上真实存在的那一层**（这里 = `handleAdminTlsInspect`）。
+
+### 8.98 v0.1.54 发版与部署：#456 M2 上线 + 真机把「装证书 → 回滚」跑通（顺带挖出 #462）
+
+**载荷**：`#461`（`#456` M2 证书页 + `POST /api/admin/tls/inspect`）。**本版 `runner/` 非版本文件零改动**
+⇒ 按 §8.19 只 pin **portal + proxy** 两个镜像，五台 FDE 容器**故意不重建**（仍在 v0.1.53 摘要）。
+
+**发版与部署**：`880a35f`（PR #461 merge）→ `7eeeabe`（版本 0.1.54，六文件 9 增 9 删）→ main CI `42043703529`
+**两个 job 全绿**（先等绿再打 tag）→ tag `v0.1.54` → release `42044827640` success → 清单 `imageId` 与部署机
+`docker image inspect .Id` **逐个一致**（portal `ae54f4cd…` / proxy `feb166e6…`；fde `918c1bfc…` 只探到存在、未拉）→
+`deploy/.env` 形态① pin 两行（备份 `/tmp/deploy.env.bak-0154`）→ `up -d --no-build station-portal station-docker-proxy`
+⇒ portal healthy、经 Traefik `healthz=200`。
+⚠ **`up -d station-portal` 会连带重建 `station-docker-proxy`**（compose 依赖），所以 proxy 的 `IMAGE_ALLOWLIST`
+必须同步 pin 新 digest（§8.70 那个「只改一边 ⇒ `create_policy_denied`」的同型坑）。
+
+**真机验收（v0.1.54，dev 栈，主 agent 亲手；`erix_station_playwright` 直连 `https://admin.fde.erix.vip:9443/`，
+正式证书已装 ⇒ **无证书告警**）**
+
+| 面 | 结果 |
+|---|---|
+| 导航 | `User management / LLM management / Repository management / Mail channel / **Certificates** / Pool usage`（证书页在 mail 与 pool 之间，符合设计） |
+| 状态卡 | `configured` + 「Covers the admin host admin.fde.erix.vip」+ Subject `fde.erix.vip` / Issuer `YE1` / 有效期到 `2/3/2027` / SAN 两条 / 指纹 `63:AA:DC:8E…`（**无脏值**） |
+| 真机校验 | 点按钮 ⇒ **绿**「The live handshake serves exactly this certificate (fingerprints match)」+ 时刻戳 |
+| 两步上传 | 只给证书 ⇒ 解析出 `*.fde.erix.vip`、`fde.erix.vip` 两行可编辑域名 + 「No private key provided…」+ 安装按钮**禁用** + 提示「A private key is required to install」；补上私钥再解析 ⇒ 「The private key matches the certificate」+ 按钮**启用** |
+| 安装 | 200 ⇒ 「Installed…」；**两个 textarea 与域名草稿当场清空**（`certLen=0 / keyLen=0 / domainRows=0`，inspect 结果块也收起）；`certs/prev/{tls.crt,tls.key,meta.json}` 生成（meta 只有指纹/主题/到期/时刻，**无 PEM**）；`tls_certificates` 落一行 `upload`；审计 `admin.tls_updated` 的 `details` **只有指纹与 SAN，无 PEM** |
+| 回滚 | 先点「Rollback」⇒ 出确认框（**确认前 `admin.tls_rolled_back` 计数 = 0**）；确认后 200 ⇒ 「Rolled back」、`certs/tls.crt` 恢复成 **4832 B 全链、`sha256 9686693a…` 与上传前逐字节相同**、`openssl` **`Verify return code: 0`**（4 层链齐全）、台账 +1 `rollback` 行、审计 `admin.tls_rolled_back` |
+
+**顺手挖出一个真缺口 → [#462](https://github.com/ErixWong/erix-station/issues/462)（已开单，本版不修）**：
+我这次故意只粘了 **leaf** 去做上传验收，装完发现 `certs/tls.crt` 从 4832 B 变成 1306 B ⇒
+`openssl s_client` 直接 **`Verify return code: 21 (unable to verify the first certificate)`**（客户端链校验失败），
+而页面上的「真机校验」**照样报 live ✓** —— 因为它只比 `fingerprint256`（leaf 指纹，装 leaf-only 前后完全相同）。
+⇒ 对「唯一入口」来说这是**一次上传就把自己锁在门外**的形状。两条修法（`validateUpload` 加 `chain_looks_leaf_only`
+警告 / `verifyLiveCertificate` 比 `issuerCertificate` 是否存在）已写进 issue，**警告不拒**（确有只发 leaf 也够用的部署）。
+现网已**回滚复原**（`sha256` 与上传前逐字节相同、`Verify return code: 0`），台账里那两行是回滚功能的正常产物、不是残渣。
+
+**过程账**：这次验收是**真上传真回滚**（不是只点按钮看提示），代价是 `certs/` 被改写了两次——所以每一步都先取
+`sha256` / 计数基线，回滚后**逐字节比对**确认复原。**「验收后能复原」本身就该是验收的一部分**（先例 §8.94 那条
+「验完还原 `.env` 并 `up -d`」）。
