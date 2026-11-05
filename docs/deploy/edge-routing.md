@@ -138,8 +138,19 @@ compose 的插值默认值、`loadConfig({}).adminPort` 三者逐字比对，任
 ├── tls.yml             # ← 本单新增：只声明证书装载面（portal tlsassets 物化，禁手改）
 └── certs/
     ├── tls.crt         # 运维手工放置（fullchain，644）
-    └── tls.key         # 运维手工放置（私钥，600）
+    └── tls.key         # 运维手工放置（私钥，600，**属主必须是 Traefik 进程的 uid**）
 ```
+
+> ⚠ **私钥属主是硬要求，不是洁癖**（2026-11-05 上线当场踩到）：`station-edge` 容器里 root **没有
+> `CAP_DAC_OVERRIDE`**（compose 收紧了 capabilities），所以「root 属主 + 0600」才读得动；`eric`(1000)
+> 属主的 `0600` 私钥会让 Traefik 报 `open …/tls.key: permission denied` + `Error while creating
+> certificate store`，而 **9443 上 TLS 握手直接失败**（`SSL_ERROR_SYSCALL`，连自签兜底都没有）。
+> 手工放证书时：`chown 0:0 tls.key && chmod 600 tls.key`（cert 644 即可）。#456 的上传面由 portal
+> 写盘（portal 容器内也是 root）⇒ 天然满足；**不要把这条做成「chmod 644 私钥」的偷懒修法**。
+>
+> ⚠ **换完证书必须动 `tls.yml`**：只替换 `certs/*` 的**内容/属主**不会触发 file provider 重读证书
+> （实测：chown 修好后握手仍失败，直到 `tls.yml` 被重写一次才生效）。这正是下面那行 fingerprint 注释
+> 存在的理由——它不是文档装饰，是**唯一的 reload 把手**。
 
 - **三个文件互不重叠、各自独立物化**：`tls.yml` 里没有 `http:` 段，`routes.yml` 里没有任何
   `certFile`。任一份坏掉都不该连坐另外两份（这正是「两文件齐才生成 tls.yml」的理由：一份指向不存在

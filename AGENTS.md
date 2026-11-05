@@ -3552,3 +3552,53 @@ deny 排除列表去掉 `/api/site` ⇒ 4 红。worker 另跑 3 条（工单要�
 
 **仍未做（部署前必须知道）**：真机验收归主 agent（`admin.<伞域>:9443` 尚未在现网 publish，A1 的 edge 重建 + 首张证书
 还没做）；`#456` 的证书上传/校验面仍未开工。
+
+### 8.94 v0.1.53 发版与部署：#450 A1+A2 上线（管理台搬到 `admin.<伞域>:9443`）+ 三条只有真机才给得出的事实（2026-11-05）
+
+**载荷**：`#458`（A1 边缘/路由/证书装载面）+ `#459`（A2 host 闸 + `/api/site`）+ `deploy/traefik/dynamic/.gitignore`
+（私钥红线，放证书**之前**先上闸）。**本版 `runner/` 只有版本号变动** ⇒ 五台 FDE 容器**故意没重建**（仍在 v0.1.52，
+`build-info.json` 实测 `0.1.52 / engine 0.31.0`），`FDE_IMAGE` 仍 pin 到 v0.1.53 摘要（下次新建/重建自然升级）。
+
+**流程**：`e9d2055` → 版本 bump `6226842`（六文件 9 增 9 删）→ main CI `41998175157` 两个 job 全绿 →
+tag `v0.1.53` → release `41999559918` success → 三镜像 `docker pull` 后 `image inspect .Id` 与清单 `imageId`
+**逐个一致**（portal `0314e233…` / fde `561887ff…` / proxy `2731d8a7…`）→ `deploy/.env` 形态① pin **三项**
+（备份 `/tmp/deploy.env.bak-0153`）+ 新增 `TRAEFIK_ADMIN_PORT=9443` / `ADMIN_PUBLIC_HOST=` / `ADMIN_IP_ALLOWLIST=`。
+
+**三条只有真机才给得出的事实（都写进了 `docs/deploy/edge-routing.md` §5，别再自己推一遍）**
+
+1. **`docker compose up -d station-edge` 不会因为静态配置文件内容变了就重建容器**（那份 `traefik.yml` 是 bind mount，
+   compose 眼里「配置没变」）⇒ 改静态配置后必须 `docker restart station-edge`（或 `--force-recreate`）。
+   本次就是先 `up -d` 看到 9443 根本没 listen 才发现。
+2. **私钥属主是硬要求**：`station-edge` 里 root **没有 `CAP_DAC_OVERRIDE`**（compose 收紧了 caps），
+   所以 `eric`(1000) 属主的 `0600` 私钥 ⇒ `open …/tls.key: permission denied` + `Error while creating
+   certificate store` ⇒ **9443 上 TLS 握手直接失败**（`SSL_ERROR_SYSCALL`，连自签兜底都没有，不是「浏览器告警」那么轻）。
+   正解 `chown 0:0 tls.key && chmod 600`（**不是**把私钥 chmod 644）。
+3. **只换 `certs/*` 不会触发重载**：chown 修好后握手**仍然**失败，直到 `tls.yml` 被重写一次
+   （`cat > tls.yml` 同内容即可）才生效 ⇒ A1 那行 `# fingerprint=… keymtime=…` 注释是**唯一 reload 把手**，
+   不是文档装饰。这条同时是「#456 上传面必须主动重写 `tls.yml`」的真机证据。
+
+**真机验收（v0.1.53，dev 栈，主 agent 亲手；请求带 `Host` 直打边缘）**
+
+| 请求 | 用户入口 `station.fde.erix.vip:8090` | 管理台入口 `admin.fde.erix.vip:9443` |
+|---|---|---|
+| `/` | 200 | 200 |
+| `/api/site` | 200（`userBaseUrl=http://station.fde.erix.vip:8090` / `adminBaseUrl=https://admin.fde.erix.vip:9443`） | 200（同值） |
+| `/api/admin/users` | **404**（边缘 deny） | 401（到 portal，未登录） |
+| `/api/sessions` | 401（到 portal） | **404**（边缘 deny） |
+| `/api/internal/x` | — | **404** |
+| `/api/health` | 200 | — |
+
+预览 host `eric-p-22004` 未签票 **403**（#241 行为无回归）；`websecure`(8443) 仍全 404（用户面 TLS 是另一单）；
+`routes.yml` 里五条管理台 router + 两条 deny + `admin-deny` 中间件都在，`tls.yml` 由 portal 自动生成（带 fingerprint 行）；
+portal 日志 8 分钟内零 error/warn。**A2 的 host 闸在真浏览器上成立**：访问 `http://station.fde.erix.vip:8090/#/admin/users`
+⇒ 页面**当场换到** `https://admin.fde.erix.vip:9443/…`（落到 Chrome 的 Privacy error，即证书不受信，见下）。
+
+**⚠ 尚未做：管理台的浏览器级验收（被证书卡住，不是代码问题）**。当前 `certs/` 里是**自签证书**（`CN=admin.fde.erix.vip`，
+有效期 1 年，私钥 root:600），Chrome 给 Privacy error；而 `erix_station_playwright` 容器**没有系统 CA 目录**
+（`/etc/ssl/certs` 不存在、无 `update-ca-certificates`、进程 uid 1000），装不进信任锚 ⇒ MCP 浏览器无法越过告警页。
+两条出路（**待决策者选**）：① 给一张**覆盖 `admin.fde.erix.vip`（或 `*.fde.erix.vip`）的正式证书**（手工放或 #456 上传）；
+② 把管理台 host 换成现成 `*.erix.vip` 通配证书覆盖的名字（`/docker/cert/erix.vip/` 有 `*.erix.vip`，到 2027-01-09），
+但那是**改 D1 的命名**（且 `admin.erix.vip` 的解析未核实）。
+
+**已知遗留**：`ADMIN_IP_ALLOWLIST` 仍为空 = 管理台入口**对 FDE 容器可达**（#233 防火墙未落地，D4 的「默认不破坏现网」）；
+`#456`（证书上传/校验/回滚）未开工——它才是「证书生命周期搬进管理台」那张单。
