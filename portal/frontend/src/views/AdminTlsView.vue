@@ -83,6 +83,24 @@ const canInstall = computed(() => inspect.value !== null
 const live = computed(() => status.value?.live ?? null);
 const liveCheckedAt = computed(() => formatLocalTime(live.value?.checkedAt ?? null));
 
+/**
+ * `mismatch` 的一句话（#462：按 `reason` 分两句）。
+ *
+ * `chain_incomplete` = 指纹**一致**但服务端只发了 1 张证书 ⇒ 客户端可能链校验失败
+ * （实测 `21 unable to verify the first certificate`）。它和「端出来的是另一张」是**两种病**，
+ * 修法也不同（补中间证书 vs 让 Traefik 真加载上），所以不能共用一句话。
+ * 老服务端没有 `reason` ⇒ 退回原来的措辞（缺席语义照旧）。
+ */
+const liveMismatchText = computed(() => {
+  const current = live.value;
+  if (current && current.reason === 'chain_incomplete') {
+    return t('admin.tls.liveMismatchChainIncomplete', {
+      depth: current.chainDepth ?? t('admin.tls.unknownValue'),
+    });
+  }
+  return t('admin.tls.liveMismatch');
+});
+
 async function onInspect() {
   if (admin.tlsInspecting) return;
   // 私钥没填就**不带这个键**（后端据此回 `keyMatches:null`；空串也是「没给」）。
@@ -152,12 +170,22 @@ async function copyFingerprint() {
   }
 }
 
-/** 解析结果里的告警码 → 人话（服务端只发码不发话）。 */
+/**
+ * 解析结果里的告警码 → 人话（服务端只发码不发话）。
+ *
+ * #462 追加三条**链形态**告警：`chain_looks_leaf_only`（只有叶子，警告不拒）、
+ * `chain_order_suspect`（顺序可能反了，只在没给私钥时出现）、`chain_broken`（段间接不上）。
+ * ⚠ 现状是「未知 code **被过滤掉**」（下面 `warnings` 的 filter），不是「走未知警告兜底」——
+ * 所以后端每新增一个码都必须在这里登记一行，否则页面上完全看不见（工单 §5 的说法与代码不符，已如实上报）。
+ */
 const WARNING_KEYS: Readonly<Record<string, string>> = {
   cert_expired: 'admin.tls.warnExpired',
   not_yet_valid: 'admin.tls.warnNotYetValid',
   no_sans: 'admin.tls.warnNoSans',
   admin_host_not_covered: 'admin.tls.warnNotCovered',
+  chain_looks_leaf_only: 'admin.tls.warnLeafOnly',
+  chain_order_suspect: 'admin.tls.warnChainOrderSuspect',
+  chain_broken: 'admin.tls.warnChainBroken',
 };
 const warnings = computed(() => (inspect.value?.warnings ?? [])
   .filter((code) => WARNING_KEYS[code] !== undefined));
@@ -308,7 +336,7 @@ onUnmounted(() => {
         {{ t('admin.tls.liveLive') }}
       </p>
       <div v-else-if="live.status === 'mismatch'" data-test="tls-live-mismatch" class="grid gap-1">
-        <p class="syserr text-sm" role="alert">{{ t('admin.tls.liveMismatch') }}</p>
+        <p class="syserr text-sm" role="alert">{{ liveMismatchText }}</p>
         <p class="text-xs text-black/60">{{ t('admin.tls.liveExpected') }}：<span data-test="tls-live-expected" class="font-mono">{{ active?.fingerprintSha256 ?? t('admin.tls.unknownValue') }}</span></p>
         <p class="text-xs text-black/60">{{ t('admin.tls.liveActual') }}：<span data-test="tls-live-actual" class="font-mono">{{ live.fingerprintSha256 ?? t('admin.tls.unknownValue') }}</span></p>
       </div>
