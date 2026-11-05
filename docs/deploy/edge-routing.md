@@ -24,7 +24,7 @@
 | router | rule | priority | 说明 |
 |---|---|---|---|
 | `admin-api` | `Host(admin) && PathPrefix(/api/admin)` | 200 | 管理 API |
-| `admin-auth` | `Host(admin) && (PathPrefix(/api/auth) \|\| PathPrefix(/api/me))` | 200 | 登录 / 登出 / 当前用户 / 改密 |
+| `admin-auth` | `Host(admin) && (PathPrefix(/api/auth) \|\| PathPrefix(/api/me) \|\| PathPrefix(/api/site))` | 200 | 登录 / 登出 / 当前用户 / 改密 / **host 信息（#450 A2）** |
 | `admin-spa` | `Host(admin)` | 100 | SPA 静态与前端路由（catch-all） |
 
 用户入口（`web`）上除原有 `portal`（100）/ `internal`（200）/ 预览（200）之外，多一条 deny：
@@ -37,12 +37,20 @@
 
 | router | rule | priority | 指向 |
 |---|---|---|---|
-| `admin-deny-api` | `Host(admin) && PathPrefix(/api) && !PathPrefix(/api/admin) && !PathPrefix(/api/auth) && !PathPrefix(/api/me)` | 300 | `noop@internal` + `admin-deny` |
+| `admin-deny-api` | `Host(admin) && PathPrefix(/api) && !PathPrefix(/api/admin) && !PathPrefix(/api/auth) && !PathPrefix(/api/me) && !PathPrefix(/api/site)` | 300 | `noop@internal` + `admin-deny` |
 
 **优先级口径**：`300 (deny) > 200 (internal / 预览 / 管理 API) > 100 (portal / 管理台 SPA)`。
 `internal` 的规则只匹配 `/api/internal`、与 `/api/admin` 路径不交，本可以取 150；但那样「deny 生效」
 就依赖「路径永不重叠」这条隐式前提（改天给 internal 扩前缀就会静默失效）。300 把不变量写成
 「deny 永远压过一切本地路由」，不依赖路径互斥推理。
+
+**⚠ 允许面与 deny 的排除列表必须逐条互补**（#450 A2 加的规矩）：管理台入口的「允许面」由两条路由构成
+（`admin-api` 的 `/api/admin` + `admin-auth` 的 `/api/auth`、`/api/me`、`/api/site`），而 `admin-deny-api`
+用**显式 `!PathPrefix` 排除列表**把它们排除掉。deny 的优先级（300）高于允许面（200），所以**两边漏一处**
+就是「deny 把允许的那条吃掉」——症状是「该 200 的端点变 404」，而 A1 真机矩阵里 `/api/sessions` 在管理台
+入口 404 正是这个机制。因此增删任何一个管理台允许端点都要**同时**改两处；`portal/test/routes.test.js`
+用一个**规则求值器**（不是字符串匹配）断言「某条路径命中的赢家是哪条 router」，并另有一条把两份前缀集合
+逐条比对的结构断言。
 
 **预览路由只挂用户入口**（`entryPoints: [<TRAEFIK_ENTRYPOINT>]`）：管理台 host 够不到任何人的预览。
 单测钉住这一点（`portal/test/routes.test.js` 的「预览路由只挂原入口」）。
@@ -58,6 +66,7 @@
 | `GET /api/admin/*`（管理 host） | — | 200（到 portal） |
 | `GET /api/auth/*`、`/api/me`（管理 host） | — | 200（到 portal） |
 | `GET /api/sessions`、`/api/internal/*`（管理 host） | — | **404 deny**（不到 portal） |
+| `GET /api/site`（两个 host） | 200（到 portal，`portal` catch-all） | 200（到 portal，`admin-auth`） |
 | `GET /`（预览 host） | 200/403（预览链） | **404**（预览不挂管理台入口） |
 
 > `PathPrefix` 是**字符串前缀**语义（实测：`/api/adminx` 也落在 `/api/admin` 的判定里）。真实 API 面
