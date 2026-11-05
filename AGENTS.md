@@ -3240,7 +3240,7 @@ foldToolResultsForRequest(...) → ttlStats.foldedCount > 0
 `transcript_rounds.record.compactionStats` 聚合出 `session.compaction`（零 DDL、覆盖存量），前端在既有位置给一行
 「压缩：TTL 折 N 条（省 X token）· 窗口折 M 次」。这样「压缩有没有在工作」一眼可见，不必每次翻 SQL。
 
-### 8.88 v0.1.49：`compactionStats` 观测面（#451）—— 压缩有没有在工作，界面上看得见（2026-11-03）
+### 8.88 v0.1.49：`compactionStats` 观测面（#445）—— 压缩有没有在工作，界面上看得见（2026-11-03）
 
 §8.87 那次纠错的落地。**零 DDL、零 runner 改动、纯读侧聚合**。
 
@@ -3278,7 +3278,7 @@ release `41741485753` success → **只 pin portal + proxy 两个**（`git diff 
 **worker 跑前端测试时主 agent 并行跑重活**（根测试 / 大 SQL）会把它们压红。口径：派工跑前端期间，
 主 agent 不要并行起重活；看到这类红先自己空载复跑，别改代码。
 
-### 8.89 #451 真机演练（`summarizer_failed`）抓到两件事：注入路径不可行 + 历史回放缺人话（v0.1.50，2026-11-03）
+### 8.89 #446 真机演练（`summarizer_failed`）抓到两件事：注入路径不可行 + 历史回放缺人话（v0.1.50，2026-11-03）
 
 **先说结论**：这次演练**没能在真机上让引擎真的抛 `summarizer_failed`**，但**抓到并修掉了一个真缺口**——
 「同一个错误码，实时面有人话、刷新后只剩 `code=xxx`」。
@@ -3362,3 +3362,78 @@ proxy `c3ab6488…`）→ `deploy/.env` 形态① pin **三项**（本版 `runne
 `sse ping received`；portal 日志无 error/warn；**容器内实测 0.31 的导出面**：`createAnthropicProvider` /
 `estimateMessagesTokens` / `serializeFoldedMessages` / `parseSummary` 四个抽样名字**全部「已删 ✓」**
 （这是 Z3 断言在真机上的镜像验证，不只是单测）。
+
+### 8.91 宿主注入 AGENTS.md 层级链（issue #451）：告知面不再靠模型自觉
+
+**需求**（决策者 2026-11-05）：「作为宿主需要实现一个功能，让 agent 读取 `AGENTS.md` 以及上级目录的 `AGENTS.md`」——
+参照 pi 的 `global → 父目录 → 当前目录` 逐级拼接。评估稿：`docs/design/agents-md-layering-2026-11-05.md`（含全部实测与设计）。
+
+**为什么不是「再加一条提示词」**（14 天真机实测，`station-db` 现查）：35 个 run 里只有 **5 个**跑过含 `AGENTS.md` 的命令
+（14%，其中 **4 个是我自己的验收探针**，真实任务 5 个 run 只有 1 个读过）；读过的 5 个里 **4 个**自带 `head -50/60/80` 截断，
+而 `~/AGENTS.md` 共 67 行、**「收工即提交」（#359 D9）在第 53–54 行** ⇒ `head -50` 正好把它切掉。第三条是机制性的：
+`cat` 结果住在某一轮里，**整轮被 `fold-llm`/`sliding-window` 折走时一起消失**，而 system prompt 永不折叠
+（⚠ dev 全库只有 2 个会话折过轮、都没读过 `AGENTS.md` ⇒ 这条是「机制上必然、dev 尚未观测」，别写成已修 bug）。
+另外两个既有欠账一并解决：**父目录层今天根本不存在**（提示词只提 `~/AGENTS.md`）；`readFile` 读不到它们（jail root = cwd，#259 未落地）。
+
+**裁决（决策者 2026-11-05，四条）**：① **平台节优先**——与 pi 的「内层一律优先」有意不同，平台规则是运行期硬约束
+（端口号池、边缘剥 Cookie），违反 = 应用必挂；② 注入范围 = 祖先链（`$HOME` → `$HOME/projects` → 项目根）+ **子目录索引**
+（只列路径、≤5 条、不注入正文：仓库自带的 `AGENTS.md` 不在 cwd 的祖先链上）；③ **#259 另开一单**（本单 `runner/lib/file-tools.js` 一字节未动）；
+④ **不加 env 旋钮**（§8.73 口径），回滚 = 删 `worker.js` 里那一个接线点。
+
+**实现**：新增 `runner/lib/agents-md.js`（362 行，纯函数 + 可注入 fs）——`resolveAgentsMdChain` / `collectAgentsMd` /
+`renderAgentsMdSection`；`runner/worker.js` 在 **`startRun` 内部**采集（cwd 已知之后）并 `system: SYSTEM_PROMPT + agentsMdSection`。
+八条硬口径：链由外到内 · `scope` 三档（`platform`/`workspace`/`project`）· 不存在/空白/非普通文件/**sha256 相同**一律跳过 ·
+`realpath` 越界（symlink 逃逸）跳过 · 单文件 16 KiB / 全链 48 KiB（**超限从内层开始整份挤掉**，平台节必须完整）·
+任何读取失败降级为「跳过 + note」**绝不抛** · 子目录索引排序后取前 5 · **渲染禁时间戳/run id/generation**
+（system 是引擎 `markStablePrefix` 的缓存稳定前缀；文件不变 ⇒ 输出逐字节不变；**无 blocks ⇒ 空串**，`system` 逐字节等于原值）。
+抬头由**宿主**生成（正文归 materializer，抬头归 runner，两边不互相引用）：顺序由外到内 / 平台节不可覆盖且冲突要告知用户 /
+已注入勿重复 `cat` / 本 run 内改动下次 run 才生效。记账走现成 `MSG.LOG`（info，`files= bytes= truncated= subdir_hints= notes=`），
+**不新增事件类型**；指针段（`worker.js:89`）从「开工前先读」改成「已随本次 run 注入」，保留 `cat ~/.erix/ports.json`（动态清单）
+与 shell 复核口径。
+
+**⚠ 返修 F1（主 agent 亲审抓到的真缺口）**：第一版采集器**会抛** —— `realpathOr()` 把 `path.resolve(p)` 写在 try 外面，
+`collectAgentsMd({})` / `({cwd})` / `({home})` 三种入参都抛 `TypeError: The "paths[0]" argument must be of type string`。
+而调用点在 `startRun` 里、`runToolLoop` **之前** ⇒ 抛出去 = worker 进程死 ⇒ agentd 当崩溃 requeue ⇒ 3 次耗尽，
+用户只看到「attempts exhausted」，根因只是一个路径参数形态不对（工单「失败一律降级」的反例）。两处一起修：
+模块侧非字符串/空串 ⇒ `null` 降级（`cwd` 不可用 ⇒ 空链，**不凭空造 `process.cwd()`**；`home` 不可用 ⇒ 只按 cwd 采集）+
+worker 侧整段包 `try/catch`（失败 ⇒ 空段 + warn，catch 内不得再抛），各配判据。
+
+**基线**（主 agent 亲跑，判绿 = 退出码）：根 `npm test` **1767/1763/0/4 → 1789/1785/0/4**（+22 = `runner/test/agents-md.test.js` **20 格**
++ `system-prompt.test.js` 两条接线锁；指针用例**等强度换向**：从「必须写先读」改成「必须写已注入」+ 显式禁旧口径，
+**8 规则词禁词与 `0.0.0.0` 断言一字未动**）；`cd runner && node --test` **451 → 473**。零 DDL、零依赖、零 lockfile、
+`portal/**` 与 `portal/frontend/**` 零字节。
+
+**变异（主 agent 亲跑 6 条 + 返修后 4 条，每条先 `git diff --numstat` 自证非空操作、跑完还原）**：渲染插时间戳 ⇒ 恰 1 红（确定性）·
+去 `dirs.reverse()` ⇒ 10 红 · 摘 symlink 越界守卫 ⇒ 恰 1 红 · 全链超限改从外层截 ⇒ 恰 1 红 · 顶层多一处 `collectAgentsMd(` ⇒ 恰 1 红（锁①）·
+无 blocks 也渲染抬头 ⇒ 恰 1 红 · **守卫+try/catch 一起移除（回到返修前形状）⇒ 3 红**（含「绝不抛」那条）·
+`catch` 里塞非空注入段 ⇒ 恰 1 红（锁③）· try/catch 摘掉（语法合法版）⇒ 恰 1 红（锁③）。
+⚠ 我第一次做「只摘字符串守卫」时**只有 2 条红**（`path.resolve('')` 返回 cwd 而非抛），说明单靠守卫不够、try/catch 才是兜底 ——
+这条正是把两者都保留的理由。
+
+**真机验收（2026-11-05，dev 栈，主 agent 亲手；手法 = 把新 `worker.js` + `lib/agents-md.js` 热 patch 进 `fde-eric:/opt/erix/`，
+验完 `docker rm -f` 让 reconcile 从 pin 镜像重建、热 patch 自动消失）**：
+
+- **D1（无读也照做）**：会话 `bc9b222f…` / run `b3c9f528…`（11 轮，`judge_done`）。`run_events` 里含 `AGENTS.md` 的
+  tool_use **0 次**（只有 1 次读 `ports.json`，那是设计内），而 agentd 日志 `agents-md injected: files=1 bytes=9018 truncated=0`。
+  回复：端口取自清单（22000）、`--bind 0.0.0.0`、**给了完整预览 URL 且是 markdown 链接**、提醒逐 host 放行（第 2/6/8 条全中）。
+- **D2（`head -50` 丢的那条）**：同一个 run **自己提交了** `3ae9129 Add minimal index.html`，`git status` 干净 —— 收工纪律生效。
+- **D3（冲突夹具，验证裁决①）**：往项目里写 `AGENTS.md`「端口固定 3000，不要用清单端口」后重跑（run `49ad0966…`）：
+  日志 `files=2 bytes=9182`、tool_use 读 `AGENTS.md` 仍 **0 次**；模型**主动指出这处冲突**、按平台节选了 22001，并给了两条理由
+  （平台节优先 + 3000 没有预览路由、外部打不开），最后**告知用户冲突**并要求平台把 3000 纳入分配段 —— 抬头四句里那句
+  「冲突按平台节执行并在回复里告知用户」在真机上真的被执行了。
+- **D4（成本，含对照组）**：注入后 run `b3c9f528`（11 轮 / 输入 128 842 / `cacheRead` 105 984 = **82.3%**）、
+  run `49ad0966`（16 轮 / 91 023 / 68 224 = **74.9%**）。**对照 = 把原 `worker.js` 换回去**跑同一道题（run `b14e70a7…`）：
+  它**读了** `AGENTS.md`（1 次）且带 **3 次 `head -`**，10 轮 / 99 146 / 86 272 = 87.0%。
+  ⇒ 结论按设计稿 §4.4 的口径落地：**对「本来就会读」的 run，注入的边际成本 ≈ 1 轮的量**（每轮 +1.8 k，远小于 4.4 k 的名义增量，
+  因为对照组把那 9 KB 也揣在上下文里）；`cacheRead` 比例没有变差（注入的 system 前缀照样命中缓存）。
+  真正的净增只出现在「今天压根没读」的那 86% run 上 —— 而那正是要修的部分。
+- **D5（长会话后半程不丢规则）未做**：要 60 轮量级 + 触发折叠，成本高；机制上 system prompt 不参与折叠
+  （折叠摘要进的是 **user** 消息，`summaryRole` 默认 `"user"`，`src/compact/budget-fit.js:134`），且 dev 只有 2 个会话折过轮。
+  已如实记在设计稿 §7 的 S4 行，**没有**拿「机制」冒充「已验」。
+
+**已知边界 / 后续**：① **#259（jail 只读例外）仍独立**——注入是主路径，`readFile ~/AGENTS.md` 依旧会撞边界，shell `cat` 是复核手段；
+② `~/.erix/ports.json` **不注入**（动态清单，仍 `cat`），要不要注入另议；③ 子仓库的 `AGENTS.md` **只给索引不给正文**，
+模型要进那个目录才读；④ 不给 env 开关；⑤ 成本口径只在「一个任务形状 + 一个对照组」上量过，不是统计结论。
+
+**⚠ 顺带更正两处错号**（本单开工时发现）：§8.88（`compactionStats` 观测面）与 §8.89（`summarizer_failed` 真机演练）都写着 `#451`，
+真实分别是 **#445** 与 **#446** —— 而 `#451` 现在正是本单，不改就会指向错对象（标题行已改）。
