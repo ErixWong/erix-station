@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { useAdminStore, testMailErrorText } from './admin';
+import { normalizeTlsStatus } from '../lib/tlsSettings';
 import { setLocale } from '../i18n';
 
 const SETTINGS = {
@@ -232,5 +233,173 @@ describe('testMailErrorText（按 code 分支，不匹配 message）', () => {
   it('非 Error 的抛出值也不出现 [object Object]', () => {
     expect(testMailErrorText({ message: { nested: true } })).toContain('nested');
     expect(testMailErrorText({ message: { nested: true } })).not.toContain('[object Object]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #456 M2：证书页的五个 action（§4.13 / §4.13-2a）。
+// 只钉 store 的那一层（渲染面在 `views/AdminTlsView.spec.ts`）：
+//   • `loadTls`：DTO 白名单（状态里没有任何 PEM 字段）／失败透传；
+//   • `inspectTls`：请求体原样透传、结果归一化、**不动** tlsStatus（零副作用端点）；
+//   • `saveTls`：成功刷新状态 + 清掉解析草稿／400 `details.field` 原文落到 `tlsSaveField`；
+//   • `verifyTls` / `rollbackTls`：状态刷新与 404 `tls_no_previous` 文案。
+// ---------------------------------------------------------------------------
+
+const TLS_STATUS = {
+  configured: true,
+  active: {
+    subjectCN: '*.fde.erix.vip',
+    sans: ['*.fde.erix.vip', 'fde.erix.vip'],
+    issuerCN: '*.fde.erix.vip',
+    notBefore: '2026-11-05T00:00:00.000Z',
+    notAfter: '2027-02-03T00:00:00.000Z',
+    fingerprintSha256: 'AB:CD:EF',
+  },
+  coverage: { adminHost: 'admin.fde.erix.vip', covered: true },
+  live: { status: 'unknown', checkedAt: null },
+  previous: null,
+};
+
+describe('loadTls（GET /api/admin/tls §4.13-2）', () => {
+  it('成功：归一化 DTO、SAN 是数组、状态里没有任何 PEM 字段', async () => {
+    const calls = stubFetch(() => jsonResponse(200, TLS_STATUS));
+    const admin = useAdminStore();
+
+    const err = await admin.loadTls();
+
+    expect(err).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ url: '/api/admin/tls', method: 'GET' });
+    expect(admin.tlsStatus).toMatchObject({
+      configured: true,
+      active: { subjectCN: '*.fde.erix.vip', sans: ['*.fde.erix.vip', 'fde.erix.vip'] },
+      coverage: { adminHost: 'admin.fde.erix.vip', covered: true },
+      live: { status: 'unknown', checkedAt: null },
+      previous: null,
+    });
+    expect(admin.tlsLoading).toBe(false);
+    expect(admin.tlsError).toBeNull();
+    // 红线：状态里的键没有一个像 PEM
+    expect(Object.keys(admin.$state).filter((key) => /pem|privatekey/i.test(key))).toEqual([]);
+  });
+
+  it('失败：本地化前缀 + 服务端 message 原文（不吞、不翻译）', async () => {
+    stubFetch(() => errorResponse(403, 'forbidden', '需要管理员权限'));
+    const admin = useAdminStore();
+
+    const err = await admin.loadTls();
+
+    expect(err).toBe('错误：需要管理员权限');
+    expect(admin.tlsError).toBe('错误：需要管理员权限');
+    expect(admin.tlsStatus).toBeNull();
+    expect(admin.tlsLoading).toBe(false);
+  });
+});
+
+describe('inspectTls（POST /api/admin/tls/inspect §4.13-2a）', () => {
+  it('成功：请求体原样透传、结果归一化，且**不动** tlsStatus（零副作用端点）', async () => {
+    const calls = stubFetch(() => jsonResponse(200, {
+      cert: TLS_STATUS.active,
+      keyMatches: true,
+      coverage: { adminHost: 'admin.fde.erix.vip', covered: true },
+      warnings: [],
+    }));
+    const admin = useAdminStore();
+    admin.tlsStatus = normalizeTlsStatus(TLS_STATUS);
+
+    const err = await admin.inspectTls({ certPem: 'CERT', keyPem: 'KEY' });
+
+    expect(err).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      url: '/api/admin/tls/inspect',
+      method: 'POST',
+      body: { certPem: 'CERT', keyPem: 'KEY' },
+    });
+    expect(admin.tlsInspect).toMatchObject({ keyMatches: true, warnings: [] });
+    expect(admin.tlsInspect?.cert.sans).toEqual(['*.fde.erix.vip', 'fde.erix.vip']);
+    expect(admin.tlsInspecting).toBe(false);
+    // 盘上什么都没变 ⇒ 状态卡不该被 inspect 改写
+    expect(admin.tlsStatus?.active?.fingerprintSha256).toBe('AB:CD:EF');
+  });
+
+  it('400 tls_cert_invalid ⇒ 文案带码 + 服务端 message；tlsInspect 保持 null', async () => {
+    stubFetch(() => errorResponse(400, 'tls_cert_invalid', '证书 PEM 无法解析'));
+    const admin = useAdminStore();
+
+    const err = await admin.inspectTls({ certPem: 'garbage' });
+
+    expect(err).toContain('tls_cert_invalid');
+    expect(err).toContain('证书 PEM 无法解析');
+    expect(admin.tlsInspect).toBeNull();
+    expect(admin.tlsInspecting).toBe(false);
+  });
+});
+
+describe('saveTls（PUT /api/admin/tls §4.13-3）', () => {
+  it('成功：状态用响应 DTO 刷新、置 tlsSaveOk，并丢掉解析草稿', async () => {
+    stubFetch(() => jsonResponse(200, { ...TLS_STATUS, live: { status: 'unknown', checkedAt: null } }));
+    const admin = useAdminStore();
+    admin.tlsInspect = {
+      cert: normalizeTlsStatus(TLS_STATUS).active!,
+      keyMatches: true,
+      coverage: { adminHost: 'admin.fde.erix.vip', covered: true },
+      warnings: [],
+    };
+
+    const err = await admin.saveTls({ certPem: 'CERT', keyPem: 'KEY', confirmDomains: ['admin.fde.erix.vip'] });
+
+    expect(err).toBeNull();
+    expect(admin.tlsSaveOk).toBe(true);
+    expect(admin.tlsSaving).toBe(false);
+    expect(admin.tlsStatus?.configured).toBe(true);
+    expect(admin.tlsInspect, '装上了就不该留着那份草稿').toBeNull();
+  });
+
+  it('400 + details.field=confirmDomains ⇒ `tlsSaveField` 收原文（视图负责映射到输入框）', async () => {
+    stubFetch(() => errorResponse(400, 'tls_cert_domain_mismatch', 'confirmDomains 里有证书覆盖不到的名字', {
+      missing: ['nope.example'],
+      field: 'confirmDomains',
+    }));
+    const admin = useAdminStore();
+
+    const err = await admin.saveTls({ certPem: 'CERT', keyPem: 'KEY', confirmDomains: ['nope.example'] });
+
+    expect(err).toContain('tls_cert_domain_mismatch');
+    expect(err).toContain('nope.example');
+    expect(admin.tlsSaveField).toBe('confirmDomains');
+    expect(admin.tlsSaveOk).toBe(false);
+    expect(admin.tlsSaving).toBe(false);
+  });
+});
+
+describe('verifyTls / rollbackTls（§4.13-4 / §4.13-5）', () => {
+  it('verify 成功：live 三态之一刷新进状态（unreachable 也是成功路径，不是错误）', async () => {
+    stubFetch(() => jsonResponse(200, {
+      ...TLS_STATUS,
+      live: { status: 'unreachable', checkedAt: '2026-11-05T09:12:31.004Z', error: 'ECONNREFUSED' },
+    }));
+    const admin = useAdminStore();
+
+    const err = await admin.verifyTls();
+
+    expect(err).toBeNull();
+    expect(admin.tlsStatus?.live).toMatchObject({ status: 'unreachable', error: 'ECONNREFUSED' });
+    expect(admin.tlsVerifying).toBe(false);
+    expect(admin.tlsVerifyErr).toBeNull();
+  });
+
+  it('rollback 成功 ⇒ 状态刷新 + tlsRollbackOk；404 tls_no_previous ⇒ 专属文案', async () => {
+    stubFetch(() => jsonResponse(200, { ...TLS_STATUS, previous: null }));
+    const admin = useAdminStore();
+    expect(await admin.rollbackTls()).toBeNull();
+    expect(admin.tlsRollbackOk).toBe(true);
+    expect(admin.tlsRollingBack).toBe(false);
+
+    stubFetch(() => errorResponse(404, 'tls_no_previous', '没有可回滚的上一代证书'));
+    const err = await admin.rollbackTls();
+    expect(err).toContain('tls_no_previous');
+    expect(err).toContain('没有可回滚的上一代');
+    expect(admin.tlsRollbackOk).toBe(false);
   });
 });

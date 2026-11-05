@@ -69,6 +69,14 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('./views/AdminMailView.vue'),
         meta: { requiresRole: 'admin' },
       },
+      // issue #456 M2：证书页（§4.13）。导航顺序：users → llm → repos → mail → **certs** → pool。
+      // 请求只在本视图挂载时发（`AdminTlsView` 的 onMounted 是唯一触发点）。
+      {
+        path: 'tls',
+        name: 'admin-tls',
+        component: () => import('./views/AdminTlsView.vue'),
+        meta: { requiresRole: 'admin' },
+      },
       // issue #350：预览号池占用总览（只读）。懒加载组件 + 照邻居写 requiresRole；
       // 请求只在本视图挂载时发（判据①：进管理台不请求，切到这一 tab 才恰好 1 次）。
       {

@@ -24,6 +24,22 @@ import {
   type MailSettings,
   type MailSettingsPayload,
 } from '../lib/mailSettings';
+// issue #456 M2 管理台证书页（§4.13）。DTO 白名单 / 到期判定 / 错误文案全在 lib（纯函数可单测），
+// 这里只负责「一次调用 = 一次请求」+ 错误透传。**请求体是不透明的 `TlsRequestBody`**：两个 PEM 的
+// 字段名只活在视图里，本文件（与 lib）连字面量都不出现——私钥不进 store 的红线由此**结构上**成立。
+import {
+  TLS_INSPECT_PATH,
+  TLS_ROLLBACK_PATH,
+  TLS_STATUS_PATH,
+  TLS_VERIFY_PATH,
+  normalizeTlsInspect,
+  normalizeTlsStatus,
+  tlsErrorText,
+  validationFieldOf as tlsValidationFieldOf,
+  type TlsInspectResult,
+  type TlsRequestBody,
+  type TlsStatus,
+} from '../lib/tlsSettings';
 
 // issue #101 P3：前端自产文案（「错误：」前缀）走 i18n 单例——options store 非组件上下文，
 // useI18n() 会抛 MUST_BE_CALL_SETUP_TOP，故统一走 i18n.global.t。
@@ -224,6 +240,25 @@ export const useAdminStore = defineStore('admin', {
     // 502 的 `details.reason`（§4.12-4：只有摘要，不含口令/正文）；单独放，便于页面加一行「原因：」。
     mailTestReason: null as string | null,
     mailTestOk: null as { to: string; at: string | null } | null,
+    // issue #456 M2：管理台证书页（§4.13）。**私钥永不进这里**：状态只有 DTO 白名单
+    // （`lib/tlsSettings.normalizeTlsStatus` / `normalizeTlsInspect`），连字段名字面量都不在本文件里。
+    tlsStatus: null as TlsStatus | null,
+    tlsLoading: false,
+    tlsError: null as string | null,
+    tlsInspecting: false,
+    tlsInspect: null as TlsInspectResult | null,
+    tlsInspectErr: null as string | null,
+    tlsSaving: false,
+    tlsSaveErr: null as string | null,
+    // 400 `validation_failed` 的 `details.field` **原文**（服务端的字段名，本文件不认识它们）；
+    // 视图把它映射到具体的输入框（映射表在视图里——所以 PEM 字段名不进本文件）。
+    tlsSaveField: null as string | null,
+    tlsSaveOk: false,
+    tlsVerifying: false,
+    tlsVerifyErr: null as string | null,
+    tlsRollingBack: false,
+    tlsRollbackErr: null as string | null,
+    tlsRollbackOk: false,
   }),
 
   actions: {
@@ -713,6 +748,127 @@ export const useAdminStore = defineStore('admin', {
         return this.mailTestErr;
       } finally {
         this.mailTesting = false;
+      }
+    },
+
+    /**
+     * issue #456 M2：`GET /api/admin/tls`（§4.13-2）——盘上证书现状 + 覆盖判定 + 真机校验缓存 + 备份。
+     *
+     * 无证书也是 `200` + `configured:false`（未配置是正常态，不是 404）⇒ 「未配置」走成功路径。
+     * 一次调用 = 一次请求（不做缓存短路：证书会被另一个管理员换掉，重进本页应当看到新快照）。
+     */
+    async loadTls(): Promise<string | null> {
+      this.tlsLoading = true;
+      this.tlsError = null;
+      try {
+        const data = await api<unknown>(TLS_STATUS_PATH);
+        this.tlsStatus = normalizeTlsStatus(data);
+        return null;
+      } catch (e) {
+        this.tlsError = t('admin.errorPrefix') + this.errText(e);
+        return this.tlsError;
+      } finally {
+        this.tlsLoading = false;
+      }
+    },
+
+    /**
+     * issue #456 M2：`POST /api/admin/tls/inspect`（§4.13-2a）——**解析但不落盘**。
+     *
+     * 请求体由视图构造（里面有 PEM，本文件不碰它的字段名）。零副作用端点 ⇒ 成功只更新 `tlsInspect`，
+     * **不动** `tlsStatus`（盘上什么都没变，状态卡不该刷新）。
+     */
+    async inspectTls(body: TlsRequestBody): Promise<string | null> {
+      this.tlsInspecting = true;
+      this.tlsInspectErr = null;
+      this.tlsInspect = null;
+      // 新的一份草稿进场 ⇒ 上一次「已安装」的提示过期（否则它会一直挂在新一轮上传的表单旁边）。
+      this.tlsSaveOk = false;
+      try {
+        const data = await api<unknown>(TLS_INSPECT_PATH, { method: 'POST', body: JSON.stringify(body) });
+        const parsed = normalizeTlsInspect(data);
+        if (parsed === null) {
+          this.tlsInspectErr = t('admin.tls.inspectEmpty');
+          return this.tlsInspectErr;
+        }
+        this.tlsInspect = parsed;
+        return null;
+      } catch (e) {
+        this.tlsInspectErr = tlsErrorText(e);
+        return this.tlsInspectErr;
+      } finally {
+        this.tlsInspecting = false;
+      }
+    },
+
+    /**
+     * issue #456 M2：`PUT /api/admin/tls`（§4.13-3）——确认安装。
+     *
+     * 成功 ⇒ 用响应 DTO 刷新状态卡、置 `tlsSaveOk`，并**丢掉解析结果**（那一份草稿已经装上了，
+     * 留着只会让人以为还能再点一次）。失败 ⇒ `tlsSaveField` 收 `details.field` 原文（视图映射到输入框），
+     * 文案走 `tlsErrorText`（按 code 分支 + 服务端 message 原文，**不翻译**）。
+     */
+    async saveTls(body: TlsRequestBody): Promise<string | null> {
+      this.tlsSaving = true;
+      this.tlsSaveErr = null;
+      this.tlsSaveField = null;
+      this.tlsSaveOk = false;
+      try {
+        const data = await api<unknown>(TLS_STATUS_PATH, { method: 'PUT', body: JSON.stringify(body) });
+        this.tlsStatus = normalizeTlsStatus(data);
+        this.tlsSaveOk = true;
+        this.tlsInspect = null;
+        return null;
+      } catch (e) {
+        this.tlsSaveField = tlsValidationFieldOf(e);
+        this.tlsSaveErr = tlsErrorText(e);
+        return this.tlsSaveErr;
+      } finally {
+        this.tlsSaving = false;
+      }
+    },
+
+    /**
+     * issue #456 M2：`POST /api/admin/tls/verify`（§4.13-4）——对管理台入口做一次真握手。
+     *
+     * 三种结果都在响应的 `live` 里（`live` / `mismatch` / `unreachable`）⇒ 成功路径刷新状态卡；
+     * `unreachable` **不是** HTTP 错误，页面按灰态呈现（连不上不该锁住上传，工单 §2②）。
+     */
+    async verifyTls(): Promise<string | null> {
+      this.tlsVerifying = true;
+      this.tlsVerifyErr = null;
+      try {
+        const data = await api<unknown>(TLS_VERIFY_PATH, { method: 'POST', body: JSON.stringify({}) });
+        this.tlsStatus = normalizeTlsStatus(data);
+        return null;
+      } catch (e) {
+        this.tlsVerifyErr = tlsErrorText(e);
+        return this.tlsVerifyErr;
+      } finally {
+        this.tlsVerifying = false;
+      }
+    },
+
+    /**
+     * issue #456 M2：`POST /api/admin/tls/rollback`（§4.13-5）——回滚到上一代。
+     *
+     * **调用方负责确认**（工单 §2④：确认前一个请求都不发）。无 prev ⇒ `404 tls_no_previous`，
+     * 文案由 `tlsErrorText` 给「没有可回滚的上一代」。
+     */
+    async rollbackTls(): Promise<string | null> {
+      this.tlsRollingBack = true;
+      this.tlsRollbackErr = null;
+      this.tlsRollbackOk = false;
+      try {
+        const data = await api<unknown>(TLS_ROLLBACK_PATH, { method: 'POST', body: JSON.stringify({}) });
+        this.tlsStatus = normalizeTlsStatus(data);
+        this.tlsRollbackOk = true;
+        return null;
+      } catch (e) {
+        this.tlsRollbackErr = tlsErrorText(e);
+        return this.tlsRollbackErr;
+      } finally {
+        this.tlsRollingBack = false;
       }
     },
   },
