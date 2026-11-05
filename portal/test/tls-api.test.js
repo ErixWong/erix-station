@@ -29,7 +29,7 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import { hashToken } from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
-import { makeCert, makeExpiredCert } from './tls-fixtures.js';
+import { makeCert, makeChain, makeExpiredCert } from './tls-fixtures.js';
 
 const ADMIN_ID = '00000000-0000-4000-8000-000000000001';
 const FDE_ID = '00000000-0000-4000-8000-000000000002';
@@ -43,6 +43,8 @@ const OTHER = makeCert({ cn: 'other.example', sans: ['other.example'] });
 // 第二张**能覆盖 adminHost** 的证书（覆盖上传 / 回滚要用它：换一张同样合法但不同的证书）
 const SECOND = makeCert({ cn: ADMIN_HOST, sans: [ADMIN_HOST] });
 const EXPIRED = makeExpiredCert();
+// #462：真三级链 root → intermediate → leaf（叶子 CN/SAN 覆盖 adminHost）。
+const CHAIN = makeChain();
 
 /** 假路由表（默认网关 172.32.0.1 = 现网实测值），避免依赖本机路由。 */
 function fakeRoutePath() {
@@ -625,6 +627,165 @@ test('#456API⑭ inspect **零副作用**：盘上/DB/审计/tlsLive 全不变�
     // 但鉴权发生在路由之前——所以这里按语句类型判，而不是按条数）
     const writes = srv.pool.statements.filter(({ sql }) => /^\s*(INSERT|UPDATE|DELETE|WITH)\b/i.test(sql));
     assert.deepEqual(writes, [], `inspect 不许发写语句：${JSON.stringify(writes)}`);
+  } finally {
+    await srv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #462 链完整性（M1 的 HTTP 面）：inspect 的 C1/C3/C5/C6/C7、PUT 的 C5/C7、
+// 审计 chainWarnings、**落盘字节 == 提交字节**。
+// ---------------------------------------------------------------------------
+
+test('#462API① inspect C1：叶子+中间（正确顺序）⇒ 200 + 无 chain warning，cert 取**叶子**', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.body.cert.subjectCN, 'admin.fde.erix.vip', 'cert 必须是叶子（不是第 1 段以外的任何东西）');
+    assert.equal(res.body.cert.issuerCN, 'Test Intermediate CA');
+    assert.deepEqual(res.body.cert.sans, ['admin.fde.erix.vip', '*.fde.erix.vip']);
+    assert.equal(res.body.keyMatches, true);
+    assert.deepEqual(res.body.warnings, [], 'bundle 是期望形态：不警告');
+    assert.deepEqual(res.body.coverage, { adminHost: ADMIN_HOST, covered: true });
+
+    // 带根（C2）同样无警告
+    const withRoot = await inspectTls(srv, { certPem: CHAIN.withRootPem, keyPem: CHAIN.keyPem });
+    assert.equal(withRoot.status, 200, withRoot.text);
+    assert.deepEqual(withRoot.body.warnings, [], '多发一张根无害 ⇒ 不警告');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API② inspect C3：只有叶子（非自签）⇒ 200 + warnings 含 chain_looks_leaf_only（警告不拒）', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 200, 'leaf-only 不是错误（确有只发 leaf 也够用的内部部署）');
+    assert.deepEqual(res.body.warnings, ['chain_looks_leaf_only']);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API③ inspect C5：顺序反了**且有私钥** ⇒ 400 tls_cert_order_invalid + details 两键', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: CHAIN.wrongOrderPem, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.error.code, 'tls_cert_order_invalid');
+    assert.equal(res.body.error.retryable, false, '要改输入才能过 ⇒ 不可重试');
+    assert.deepEqual(res.body.error.details, {
+      firstSubjectCN: 'Test Intermediate CA',
+      leafSubjectCN: 'admin.fde.erix.vip',
+    });
+    assert.ok(!res.text.includes('-----BEGIN CERTIFICATE-----'), '400 的 details 里不许带 PEM 正文');
+    assert.ok(!res.text.includes('PRIVATE KEY'));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API④ inspect C6：顺序反了**但没私钥** ⇒ 200 + chain_order_suspect（拿不到配对信息，只能警告）', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: CHAIN.wrongOrderPem });
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.body.keyMatches, null);
+    assert.ok(res.body.warnings.includes('chain_order_suspect'), JSON.stringify(res.body.warnings));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API⑤ inspect C7：接不上 ⇒ 200 + chain_broken（PUT 才拒）', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: `${CHAIN.leafPem}${OTHER.certPem}`, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 200, 'inspect 只做形态与配对判据：断链是 PUT 的拒因');
+    assert.deepEqual(res.body.warnings, ['chain_broken']);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API⑥ PUT C5：顺序反了 ⇒ 400 tls_cert_order_invalid，**盘上零变化**（且不是 tls_key_mismatch）', async () => {
+  const srv = await startServer();
+  try {
+    assert.equal((await putTls(srv, { certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem })).status, 200);
+    const before = snapshot(srv.dynamicDir);
+    const res = await putTls(srv, { certPem: CHAIN.wrongOrderPem, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.error.code, 'tls_cert_order_invalid');
+    assert.notEqual(res.body.error.code, 'tls_key_mismatch', '私钥是对的，报配对错是误导');
+    assert.deepEqual(snapshot(srv.dynamicDir), before, '校验失败必须零副作用');
+    assert.equal(srv.pool.tlsCerts.length, 1, '失败不许落台账');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API⑦ PUT C7：链接不上 ⇒ 400 tls_cert_chain_broken + details 点名第几段，盘上不变', async () => {
+  const srv = await startServer();
+  try {
+    const before = snapshot(srv.dynamicDir);
+    const res = await putTls(srv, { certPem: `${CHAIN.leafPem}${OTHER.certPem}`, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.error.code, 'tls_cert_chain_broken');
+    assert.equal(res.body.error.retryable, false);
+    assert.deepEqual(res.body.error.details, {
+      index: 1,
+      subjectCN: 'admin.fde.erix.vip',
+      issuerCN: 'Test Intermediate CA',
+      nextSubjectCN: 'other.example',
+    });
+    assert.deepEqual(snapshot(srv.dynamicDir), before, '断链不许写盘');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API⑧ PUT C1：fullchain **原样落盘**（不重排、不裁剪）+ 台账取叶子 + 无 chainWarnings 键', async () => {
+  const srv = await startServer();
+  try {
+    const res = await putTls(srv, { certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 200, res.text);
+    // 落盘字节 == 提交字节（红线：不许重排/裁剪/重新序列化）
+    assert.equal(fs.readFileSync(certPath(srv.dynamicDir), 'utf8'), CHAIN.fullchainPem);
+    assert.equal(fs.readFileSync(keyPath(srv.dynamicDir), 'utf8'), CHAIN.keyPem);
+    assert.equal(fs.statSync(keyPath(srv.dynamicDir)).mode & 0o777, 0o600);
+
+    // 台账 / 响应取的都是**叶子**
+    assert.equal(srv.pool.tlsCerts.length, 1);
+    assert.equal(srv.pool.tlsCerts[0].subject_cn, 'admin.fde.erix.vip');
+    assert.deepEqual(srv.pool.tlsCerts[0].sans, ['admin.fde.erix.vip', '*.fde.erix.vip']);
+    assert.equal(srv.pool.tlsCerts[0].fingerprint_sha256, new crypto.X509Certificate(CHAIN.leafPem).fingerprint256);
+    assert.equal(res.body.active.subjectCN, 'admin.fde.erix.vip');
+    assert.equal(res.body.active.issuerCN, 'Test Intermediate CA');
+    assert.equal(res.body.coverage.covered, true);
+
+    // 无警告 ⇒ 审计 details 里**不写** chainWarnings（老行形状不变）
+    const audit = auditRows(srv.pool, 'admin.tls_updated').at(-1);
+    assert.deepEqual(Object.keys(auditDetails(audit)).sort(), [
+      'backupCreated', 'fingerprintSha256', 'notAfter', 'sans', 'subjectCN',
+    ]);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#462API⑨ PUT C3：leaf-only ⇒ 200 落盘 + 审计 details.chainWarnings 记下提示', async () => {
+  const srv = await startServer();
+  try {
+    const res = await putTls(srv, { certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem });
+    assert.equal(res.status, 200, res.text);
+    assert.equal(fs.readFileSync(certPath(srv.dynamicDir), 'utf8'), CHAIN.leafPem);
+    const audit = auditRows(srv.pool, 'admin.tls_updated').at(-1);
+    const details = auditDetails(audit);
+    assert.deepEqual(details.chainWarnings, ['chain_looks_leaf_only'], '审计要留下「这张只有叶子」的证据');
+    assert.ok(!audit.details.includes('BEGIN'), '审计里不许有 PEM');
+    assert.ok(!audit.details.includes('PRIVATE KEY'));
   } finally {
     await srv.close();
   }
