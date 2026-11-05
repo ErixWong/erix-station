@@ -569,6 +569,27 @@ test('#462 C7：段间接不上（混了别人的证书）⇒ 400 tls_cert_chain
   assert.match(out.message, /第 1 段接不上/);
 });
 
+test('#462 C7：**同名不同钥的伪链** ⇒ checkIssued 仍判断链（字符串比 `subjectCN===issuerCN` 会放过）', () => {
+  // 伪中间证书：CN 与真中间证书**一样**，但它的签发者 CN 被写成叶子证书的 subject CN
+  // ⇒ `blocks[0].subjectCN === blocks[1].issuerCN` 成立（字符串比会说「接得上」），
+  // 而签名对不上（`checkIssued` 验签发者名 + 签名 + keyCertSign）⇒ 真的断链。
+  const lookalike = makeChain({ rootCN: 'admin.fde.erix.vip', intermediateCN: 'Test Intermediate CA' });
+  const forged = new crypto.X509Certificate(lookalike.intermediatePem);
+  const leaf = new crypto.X509Certificate(CHAIN.leafPem);
+  assert.equal(
+    parseCertificatePem(lookalike.intermediatePem).issuerCN,
+    parseCertificatePem(CHAIN.leafPem).subjectCN,
+    '前置：这条伪链在**字符串口径**下看起来是接得上的（否则这条用例证明不了 checkIssued 有牙）',
+  );
+  assert.equal(leaf.checkIssued(forged), false, '签名/密钥对不上 ⇒ 真断链');
+
+  const out = validateUpload({
+    certPem: `${CHAIN.leafPem}${lookalike.intermediatePem}`, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST,
+  });
+  assert.equal(out.ok, false, '同名不同钥的链发出去客户端一定验不过，必须拒');
+  assert.equal(out.code, 'tls_cert_chain_broken');
+});
+
 test('#462 inspect：C1/C3/C6/C7 的 warnings 与「cert 一律取叶子」', () => {
   // C1：正确 bundle（有/无私钥都无警告）
   const c1 = inspectCertificate({ certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
