@@ -39,6 +39,16 @@ export const en = {
     totpLabel: 'TOTP',
     totpSubmit: 'Verify & sign in',
     backToLogin: '← Back to login',
+    // issue #449: the other second-factor channel — email verification code (portal.md §2.2/§2.3a/§2.3b).
+    // Wording: only “second factor (email code)”; never claim “strong two-factor” or “phishing-resistant”.
+    emailStepTitle: 'Enter your email code',
+    emailStepHint: 'A code was sent to {email} (second factor). If it does not arrive, you can resend it.',
+    emailCodeLabel: 'Verification code',
+    emailCodeSubmit: 'Verify & sign in',
+    emailResend: 'Resend code',
+    emailResendIn: 'Resend in {seconds}s',
+    emailResendFailed: 'Send again',
+    emailBackToPassword: '← Back to the previous step',
   },
   // #255 forced first-login password change (views/ForcePasswordChangeView.vue). Restricted session
   // escape hatch (portal.md §2.11a). No hard-coded port/host; no promise about a minimum length
@@ -891,6 +901,15 @@ export const en = {
     renameFailed: 'Rename failed: {message}',
     // issue #114：AI rename failure (message comes from the server: 409 no LLM configured / 502 upstream)
     aiRenameFailed: 'AI rename failed: {message}',
+    // issue #449: email-code login error codes (code → actionable text; mapping in stores/auth.ts
+    // EMAIL_LOGIN_ERROR_KEYS). Only “what to do next” — no promise that a retry will succeed.
+    emailCodeInvalid:
+      'That code is wrong or has expired: resend a new one, or go back and sign in again.',
+    emailNotRegistered:
+      'This account has no email address on file, so no sign-in code can be sent: ask your administrator to add one and try again.',
+    emailSendFailed:
+      'The code email could not be sent this time: click “Send again” — you do not need to retype your password.',
+    pendingExpired: 'This sign-in attempt has expired: please enter your login name and password again.',
   },
   gitLight: {
     loading: 'Checking…',

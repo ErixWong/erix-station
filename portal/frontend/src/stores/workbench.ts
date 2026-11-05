@@ -21,6 +21,10 @@ import { renderMarkdown } from '../lib/markdown';
 import { DIR_NAME_RE, SESSION_TITLE_MAX_LEN } from '../lib/constants';
 // issue #85：工具卡片折叠记忆的会话级复位（挂在各 resetStreamState 宿主调用点）。
 import { clearExpandedToolCalls } from '../lib/toolCallExpansion';
+// #449：换账号复位要把登录第二步的待决凭证（pending_token/factor）一起清掉——它住在 auth store。
+// 方向只有这一个（workbench → auth）：反向 import 会把整个工作台面拖进登录页首屏 chunk，
+// 理由与 lib/userScope.ts 头注同源。
+import { useAuthStore } from './auth';
 // #451：`compactionStats` 观测面（会话头部的压缩累计行）——DTO 归一化走纯函数，模板不碰脏值。
 import { normalizeSessionCompaction, type SessionCompaction } from '../lib/compactionSummary';
 
@@ -1268,6 +1272,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // ⑦ 旁路观测面：动量数字（#282）与工具卡片展开记忆（#85，模块级 Set，跨 store 实例都共享）
     momentum.reset();
     clearExpandedToolCalls();
+    // ⑧ #449：登录**第二步的待决凭证**（`pending_token` / `factor` / `sendFailed` / 冷却）属于「上一个人」。
+    //    它是签发时那台服务端认可的待决令牌：留着就会被下一个人拿去撞 `/api/auth/login/email-code`
+    //    （与 #428/#431 同一纪律：跨账号可见面一项不留）。唯一的持有者是 auth store ⇒ 由它自己清。
+    //    这里用 `useAuthStore()`（action 内部：pinia 已在 action 入口设好 active pinia），
+    //    而不是在 setup 阶段就建 auth store —— 避免本 store 一创建就把 auth 拽进来。
+    useAuthStore().resetPendingLogin();
   }
 
   /**
