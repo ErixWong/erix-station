@@ -160,6 +160,10 @@ compose 的插值默认值、`loadConfig({}).adminPort` 三者逐字比对，任
 - **生成物内容**：`tls.stores.default.defaultCertificate` + `tls.certificates`（两条都写：前者是
   SNI 不匹配时的兜底证书，只有后者时访问未覆盖的名字会拿到 Traefik 内建自签证书）。
   私钥**只以路径形式**出现（正文/日志/DB 里都没有它）。
+- **上传面（#456）**：`PUT /api/admin/tls` 写 `certs/tls.{crt,key}` 后**主动**调 `materializeTlsAssets()`
+  重写 `tls.yml` ⇒ 换证**不需要重启边缘**（也不需要 `docker compose up`）。私钥由 portal 写盘
+  （容器内 root ⇒ 属主天然是 Traefik 的 uid，mode 600）。`POST /api/admin/tls/verify` 用
+  「默认网关 + `servername=adminHost` + 只比 `fingerprint256`」证明真的生效了（§5 末尾的探针口径）。
 - **reload 把手**：生成物带一行随证书变化的注释
   `# fingerprint=sha256:<证书字节哈希> keymtime=<私钥 mtimeMs>`。Traefik 的 file provider 是**文件驱动**
   的：只替换 `certs/*` 而不动 `tls.yml` 不一定触发 reload，改这一行必然触发。#456（证书上传/校验/回滚）
