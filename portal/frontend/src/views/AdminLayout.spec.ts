@@ -29,7 +29,7 @@ function makeRouter() {
       { path: '/login', component: { template: '<div>login</div>' } },
       // 顶栏四个 tab 用的是 `{ name: ... }` 形式的 :to ⇒ 路由表里没有这些名字，挂载当场就
       // "No match for {name:'admin-users'}" 抛错（不是断言失败）。给桩即可，本单不测 tab。
-      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-preview-pool']
+      ...['admin-users', 'admin-llm', 'admin-repos', 'admin-mail', 'admin-tls', 'admin-preview-pool']
         .map((name) => ({ path: `/${name}`, name, component: { template: '<div />' } })),
     ],
   });
@@ -90,20 +90,21 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
 
     // 裸路由把 tab 桩成 `/<name>`，所以 href 是 `/admin-mail`（真实应用里是 `/admin/mail`，
     // 路由表那条由本用例末尾的 `routes` 断言钉住）。
-    const links = wrapper.findAll('nav a').slice(0, 5);
+    const links = wrapper.findAll('nav a').slice(0, 6);
     const hrefs = links.map((link) => link.attributes('href'));
     expect(hrefs).toContain('/admin-mail');
 
     const mailLink = links.find((link) => link.attributes('href') === '/admin-mail')!;
     expect(mailLink.text()).toBe('邮件通道');
 
-    // 顺序：仓库管理 → 邮件通道 → 号池占用（报告里要说明的取舍）
+    // 顺序：仓库管理 → 邮件通道 → …（#456 的证书页插在邮件之后）→ 号池占用。
+    // 精确位置由下面那条「#456 证书页」用例钉住，这里只钉本 tab 的相邻关系。
     const repos = hrefs.indexOf('/admin-repos');
     const mail = hrefs.indexOf('/admin-mail');
     const pool = hrefs.indexOf('/admin-preview-pool');
     expect(repos).toBeGreaterThanOrEqual(0);
     expect(mail).toBe(repos + 1);
-    expect(pool).toBe(mail + 1);
+    expect(pool).toBeGreaterThan(mail);
 
     // 路由表本身：`/admin` 的 children 里有 `mail` → `admin-mail`，且要求 admin 角色（照 admin-repos 的写法）
     const adminRoute = routes.find((route) => route.path === '/admin')!;
@@ -111,6 +112,38 @@ describe('AdminLayout tab 导航（#449 邮件通道）', () => {
     expect(mailRoute.path).toBe('mail');
     expect(mailRoute.meta).toEqual({ requiresRole: 'admin' });
     expect(typeof mailRoute.component).toBe('function');
+  });
+});
+
+// issue #456 M2：新 tab「证书」必须真在导航里，且指向 `admin-tls`（只加路由不加 tab ⇒ 这页没入口）。
+describe('AdminLayout tab 导航（#456 证书页）', () => {
+  it('导航里有「证书」，指向 admin-tls，且排在邮件通道之后、号池占用之前', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = ADMIN_WITH_SEAT as never;
+    auth.ready = true;
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    const wrapper = mount(AdminLayout, { global: { plugins: [router, i18n] } });
+
+    const links = wrapper.findAll('nav a').slice(0, 6);
+    const hrefs = links.map((link) => link.attributes('href'));
+    expect(hrefs).toContain('/admin-tls');
+
+    const tlsLink = links.find((link) => link.attributes('href') === '/admin-tls')!;
+    expect(tlsLink.text()).toBe('证书');
+
+    // 顺序：users → llm → repos → mail → **certs** → pool
+    expect(hrefs.indexOf('/admin-tls')).toBe(hrefs.indexOf('/admin-mail') + 1);
+    expect(hrefs.indexOf('/admin-preview-pool')).toBe(hrefs.indexOf('/admin-tls') + 1);
+
+    // 路由表本身：`/admin` 的 children 里有 `tls` → `admin-tls`，懒加载且要求 admin 角色
+    const adminRoute = routes.find((route) => route.path === '/admin')!;
+    const tlsRoute = (adminRoute.children ?? []).find((child) => child.name === 'admin-tls')!;
+    expect(tlsRoute.path).toBe('tls');
+    expect(tlsRoute.meta).toEqual({ requiresRole: 'admin' });
+    expect(typeof tlsRoute.component).toBe('function');
   });
 });
 

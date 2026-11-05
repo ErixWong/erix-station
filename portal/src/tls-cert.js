@@ -299,6 +299,108 @@ export function validateUpload({ certPem, keyPem, adminHost, confirmDomains, now
   return { ok: true, cert };
 }
 
+// ---------------------------------------------------------------------------
+// inspect：解析但**不落盘**（issue #456 M2 唯一允许的后端追加，契约 portal.md §4.13-3a）
+// ---------------------------------------------------------------------------
+
+/**
+ * inspect 的**告警码**（机器码；文案在前端 i18n，服务端只发码不发话，照 #294 的口径）。
+ * ⚠ 这不是错误码：它们**不进** `docs/api/portal.md` §1.2 的登记表，也不改任何 HTTP 状态。
+ */
+export const TLS_INSPECT_WARNINGS = Object.freeze({
+  /** `notAfter <= now`（或解析不出）：装上去浏览器直接拒。inspect 不拒，只提醒。 */
+  EXPIRED: 'cert_expired',
+  /** `notBefore > now`：还没生效（预签发的新证书常见）。 */
+  NOT_YET_VALID: 'not_yet_valid',
+  /** 一个 DNS SAN 都没有：覆盖判定会退回 CN（浏览器现代口径已不看 CN）。 */
+  NO_SANS: 'no_sans',
+  /** 覆盖不到 `adminHost`：与 `coverage.covered:false` 同义，给「只读 warnings」的消费者一个自足信号。 */
+  ADMIN_HOST_NOT_COVERED: 'admin_host_not_covered',
+});
+
+/**
+ * **解析但不落盘**：给管理台「粘贴 → 自动抽出域名 → 用户确认后才装」的两步交互用。
+ *
+ * 只做**形态与配对**判据（`tls_cert_invalid` / `tls_key_invalid` / `validation_failed`），
+ * 其余一律降级成 `warnings` + `coverage`：
+ *   · `keyPem` 省略（`undefined` / `null` / 空白串）⇒ `keyMatches: null`；
+ *   · 给了但**不配对** ⇒ `keyMatches: false`，**不报错**（UI 自己说）；
+ *   · 覆盖不到 `adminHost` / 已过期 ⇒ 各自进 `warnings`，**不报错**（用户可能就是在传一张还没生效的证书）。
+ *
+ * **零副作用**：不写盘、不写 DB、不写审计、不动 `tlsLive`、不烧上传配额（限流在 HTTP 层，宽松档）。
+ *
+ * @returns {{cert: {subjectCN: string|null, sans: string[], issuerCN: string|null,
+ *            notBefore: string, notAfter: string, fingerprintSha256: string},
+ *            keyMatches: boolean|null, coverage: {adminHost: string, covered: boolean},
+ *            warnings: string[]}}
+ */
+export function inspectCertificate({ certPem, keyPem, adminHost, now = new Date() } = {}) {
+  // 字段级闸（与 `validateUpload` 的前两条同口径：必须是字符串 + 各 ≤ 64 KiB）。
+  if (typeof certPem !== 'string') {
+    throw fail('validation_failed', 'certPem 必须是 PEM 字符串', {
+      httpStatus: 400,
+      details: { field: 'certPem' },
+    });
+  }
+  if (Buffer.byteLength(certPem, 'utf8') > TLS_MAX_PEM_BYTES) {
+    throw fail('validation_failed', `certPem 超过 ${TLS_MAX_PEM_BYTES} 字节上限`, {
+      httpStatus: 400,
+      details: { field: 'certPem', max_bytes: TLS_MAX_PEM_BYTES },
+    });
+  }
+  // 「没给私钥」的三种写法都算省略（UI 的 textarea 留空就是空串；别把空串当「给了一把坏钥匙」）。
+  const keyGiven = typeof keyPem === 'string' ? keyPem.trim() !== '' : keyPem !== undefined && keyPem !== null;
+  if (keyGiven) {
+    if (typeof keyPem !== 'string') {
+      throw fail('validation_failed', 'keyPem 必须是 PEM 字符串', {
+        httpStatus: 400,
+        details: { field: 'keyPem' },
+      });
+    }
+    if (Buffer.byteLength(keyPem, 'utf8') > TLS_MAX_PEM_BYTES) {
+      throw fail('validation_failed', `keyPem 超过 ${TLS_MAX_PEM_BYTES} 字节上限`, {
+        httpStatus: 400,
+        details: { field: 'keyPem', max_bytes: TLS_MAX_PEM_BYTES },
+      });
+    }
+  }
+
+  const cert = parseCertificatePem(certPem); // 抛 `tls_cert_invalid`
+  let keyMatches = null;
+  if (keyGiven) {
+    const keyObj = parsePrivateKeyPem(keyPem); // 抛 `tls_key_invalid`
+    // **不配对不是错误**（契约 4.13-3a）：把事实交给 UI，由它禁用「确认安装」并说清为什么。
+    keyMatches = keyMatchesCert(cert, keyObj);
+  }
+
+  const host = normalizeHost(adminHost);
+  const covered = certCoversHost(host, cert.sans, cert.subjectCN);
+  const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  const notAfterMs = Date.parse(cert.notAfter);
+  const notBeforeMs = Date.parse(cert.notBefore);
+
+  const warnings = [];
+  if (!Number.isFinite(notAfterMs) || notAfterMs <= nowMs) warnings.push(TLS_INSPECT_WARNINGS.EXPIRED);
+  if (Number.isFinite(notBeforeMs) && notBeforeMs > nowMs) warnings.push(TLS_INSPECT_WARNINGS.NOT_YET_VALID);
+  if (cert.sans.length === 0) warnings.push(TLS_INSPECT_WARNINGS.NO_SANS);
+  if (!covered) warnings.push(TLS_INSPECT_WARNINGS.ADMIN_HOST_NOT_COVERED);
+
+  return {
+    // 逐键白名单（与 `describeTls` 的 `active` 同一套字段）：**`publicKeyPem` 不在里面**。
+    cert: {
+      subjectCN: cert.subjectCN,
+      sans: cert.sans,
+      issuerCN: cert.issuerCN,
+      notBefore: cert.notBefore,
+      notAfter: cert.notAfter,
+      fingerprintSha256: cert.fingerprintSha256,
+    },
+    keyMatches,
+    coverage: { adminHost: host, covered },
+    warnings,
+  };
+}
+
 /** 证书 PEM 的 sha256 指纹（冒号分隔大写，与 `getPeerCertificate().fingerprint256` 同形）。 */
 export function fingerprintOfPem(pem) {
   let cert;
