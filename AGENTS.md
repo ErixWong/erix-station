@@ -3923,3 +3923,68 @@ A1/A2/A2b 三条 `upload`/`rollback` 行（正常产物，非残渣）。
 **⚠ worker 环境性红第 6 次**：worker 报「3 条 `GitLightBadge.spec.ts` 预存失败（基线 83447df 上同样 3 红）」并据此改了
 `ci-release.md` 与 AGENTS —— **不成立**：主 agent 空载连跑两次都是 **59 文件 / 1149 全绿 rc=0**（单跑该文件 18/18），
 CI 也绿。两处已更正，并把「worker 报的基线数字必须自己复算」写进 §8.100。
+
+### 8.102 v0.1.56：#451 评审返修上线（blocker 上限前置 / 解码死光纤 / 接线锁函数体定界）（2026-11-06 凌晨）
+
+**载荷**：PR #464（`c71c8bd`）= §8.99 那 9 条 finding 的修复。本版**动 `runner/` 实质代码** ⇒ 五台 FDE 必须重建（§8.17）。
+
+**修法要点（每条都有主 agent 亲跑的变异）**
+
+- **B1 blocker**：新增 `readPrefix()`（定长 `maxFileBytes+4` 的 `Buffer.alloc` + `openSync`/`readSync`/`closeSync` 放 finally）
+  与 `canPrefixRead()`；**先按 `stat.size` 判**（`stat.size` 为 0 或不可信时仍走 `readFileSync`，防御不丢），超限只读前缀；
+  Buffer 归一与解码**挪进同一层 try**。
+- **M1**：`decodeUtf8Strict()` = `TextDecoder('utf-8',{fatal:true, ignoreBOM:true})`，失败 ⇒ 跳过 + note（带前 16 字节 hex）。
+  配套 `trimIncompleteUtf8Tail()`：前缀读切在字符中间是**读法**造成的不完整，先剔再解码——否则 M1 会把合法中文误判。
+  ⚠ **`ignoreBOM: true` 是 worker 自己发现的回归**：`TextDecoder` 默认**吞前导 BOM**，与「展示 = 原文」冲突。
+- **M2**：产品行为**不变**（无文件时注入段仍是空串）；三处文档补口径 + `worker.js` info 记账带**前 2 条 note 摘要**（`MSG.LOG`，零新事件类型）。
+- **M3**：两条接线锁改成**先取 `startRun` 函数体边界**（`\n}` 定界，不用括号计数——有模板字符串）再断言三点落在体内，
+  加语义锁「采集必须在 `const { task, cwd } = msg;` 之后」。
+- **m1/m2/m3/m4/m5**：锁③ 补 `try < render < catch`；TOCTOU 口径写准；16 KiB 与 marker 的量纲写进注释；
+  去重键改 `dedupeKey()`（去 BOM + CRLF→LF + trim，**展示仍用原文**）；三处文档对齐（S4 状态 / 28 格 / §4.2 拼接式）。
+
+**基线**：根 **1905/1901/0/4 → 1936/1932/0/4**（含 main 前进的 #462 测试）、runner **473 → 481**、`node --check` 全过。
+`git diff` 只碰 7 个文件（`agents-md.js` +145 / `agents-md.test.js` +206 / `system-prompt.test.js` +41 / `worker.js` +9 / 3 篇文档），
+**零依赖、零 lockfile、零 DDL**。
+
+**主 agent 亲跑 4 条变异（不复用 worker 的 8 条，每条先 `git diff --numstat` 自证非空操作）**：
+采集整段移到模块顶层 ⇒ **锁③ 恰 1 红 + 锁① 恰 1 红**（**修复前是 34 条零红**，这就是这条 finding 的全部意义）；
+B1 去掉 `stat.size` 预判 ⇒ 恰 1 红（「`readFileSync` 对该路径一次都没调」）；M1 改回 `toString('utf8')` ⇒ 恰 1 红；
+m1 渲染移出 try ⇒ 恰 1 红（`system-prompt` 仍 14/14）。
+
+**blocker 实质修复实测（600 MiB 稀疏文件）**：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 耗时 | 563 ms | **3 ms** |
+| RSS | 647 MB | **46 MB** |
+| 结果 | 抛 `ERR_STRING_TOO_LONG`，**平台节一起丢** | 不抛，`blocks=2`，平台节在，`truncated=true`，`bytes=16483` |
+
+**发版与部署（v0.1.56）**：`1070342`（六文件 9 增 9 删）→ main CI 绿（中间另一个 session 又推了 2 个纯文档提交，
+`f5b3cce` 那条还主动记了「并行会话把版本推到 0.1.56，下次发版会同时带上 #463 与 #464」——**它没抢版本号**）→
+tag `v0.1.56`（打在 `f5b3cce`，version 匹配）→ release `42067503370` success → 三镜像 `docker image inspect .Id`
+与清单**逐个一致**（portal `9158c3a2…` / fde `99bea2d2…` / proxy `86a0e30a…`）→ `deploy/.env` 三项 pin
+（备份 `/tmp/deploy.env.bak-0156`）→ `up -d --no-build station-portal`（连带重建 `station-docker-proxy`，
+`IMAGE_ALLOWLIST` 同步含新 fde digest）→ portal 实跑 `9158c3a2…`、经 Traefik `healthz=200` →
+**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认排除了 `fde-workshop-db`）
+→ reconcile 20 秒内全部重建在 `99bea2d2…`**，容器内 `station 0.1.56 / engine 0.31.0`、`lib/agents-md.js` 含新代码（9 处命中）、
+agentd `sse connected` + `sse ping received`。
+
+**真机验收（发布物，非热 patch）**
+
+1. 端到端 run `db6f0f88…` ⇒ `finished / judge_done`，日志 `agents-md injected: files=1 bytes=9018 truncated=0 subdir_hints=0 notes=0`。
+2. **M2 的可观测性修复真机验到**：在 `probe-451fix` 里造 `AGENTS.md -> /etc/passwd` 的 symlink ⇒ 下一个 run
+   `run 935c4947…` 的日志变成
+   `notes=1(跳过 ~/projects/probe-451fix/AGENTS.md：真实路径 /etc/passwd 越出 /home/erix)`，且 `files=1`（内容**没被注入**）。
+   **修复前这里只有一个 `notes=1`**，看不出为什么。验完 symlink 已删。
+3. dev 残渣（故意留）：会话 `1d13ff13…`（两条探针消息，标题「用一句话回答：pong」）。
+
+**⚠ 本轮两条自己的操作教训**
+
+1. **`docker pull` 被 `timeout 60` 截断时 rc 仍是 0**（管道掩盖了 SIGTERM）⇒ 我据此以为 fde 拉完了，实际镜像不在本地，
+   `docker image inspect` 才露馅。**口径：pull 之后必须 `docker image inspect <ref> --format '{{.Id}}'` 对一次 imageId，
+   别信 pull 的退出码与「Download complete」。**
+2. **派工前没查「这个 issue 是不是已经有人在做」**：我在 23:56 给 #462 派了一张工单，而另一个 session 那时已经修完并发了
+   v0.1.55（它的 `#463` 比我的工单更完整：按整条链判 + 两个新错误码 + 私钥只 stat）。我的 run 跑了 121 轮 / ↑10.4M tokens
+   **全部白烧**（分支已丢弃，报告归档 `~/worker-reports-261105/462-duplicate-report.md`）。
+   ⇒ **口径：派工前 `gh issue view <n> --comments` 看有没有人正在做 + `git fetch` 看 main 最近提交；
+   issue 是我自己开的也不等于它还空着。** 这条与 §8.99 的「派工产物落点」同族：并行的不只是工作树，还有 issue 本身。
