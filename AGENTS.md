@@ -3618,3 +3618,49 @@ portal 日志 8 分钟内零 error/warn。**A2 的 host 闸在真浏览器上成
 ⚠ 现状取证（供将来判断是否要改主意）：在 `fde-eric` 容器里 `curl -H 'Host: admin.fde.erix.vip:9443'
 https://100.100.0.3:9443/api/site` ⇒ **200**、`/api/admin/users` ⇒ **401**（= 容器够得到管理台，只剩登录这一层）。
 `#456`（证书上传/校验/回滚）**后端切片已开工**（工单 `.work-orders/feat-261105-03-456-tls-api.md`）。
+
+### 8.95 #456 M1：管理台证书生命周期（后端四端点 + 迁移 0027）（2026-11-05）
+
+**要治什么**：管理台入口（#450）的证书今天只能登服务器手工放文件，换证/回滚/「到底装了什么」全靠人记。
+本片把**上传 / 覆盖校验 / 真机校验 / 回滚**搬进管理台。**盘上的证书文件是唯一真相**，DB（`tls_certificates`）
+只是台账——Traefik 只认文件，DB 再准也换不了线上握手。
+
+| 端点 | 语义 |
+|---|---|
+| `GET /api/admin/tls` | 盘上证书元数据 + 覆盖判定 + **最近一次真机校验结果（只读缓存，不主动连）** + 有无可回滚备份 |
+| `PUT /api/admin/tls` | `{certPem, keyPem, confirmDomains?}` → 校验 → 限流 → 备份 → 写 crt → 写 key → **物化 `tls.yml`** → 台账 → 审计 |
+| `POST /api/admin/tls/verify` | 真 TLS 握手比对 `fingerprint256` ⇒ `live` / `mismatch` / `unreachable` |
+| `POST /api/admin/tls/rollback` | 从 `certs/prev/` 还原上一代 + 物化 + 台账（`kind='rollback'`） |
+
+**四条落地口径（都能被变异打红）**
+
+1. **校验失败零副作用**：所有判据（PEM 可解析 / 私钥可解析 / 公钥配对 / 未过期 / **覆盖 `adminHost`** /
+   `confirmDomains` 不得超出证书能力）都在写盘之前，且**不烧限流配额**（改一张 PEM 常常要试几次）。
+2. **`confirmDomains` 的方向是「用户声明 ⊆ 证书能力」**：前端把 SAN 抽出来给可编辑输入，但用户改不出证书里没有的名字；
+   缺 `station.<伞域>` 只是提示不阻断（#456 决策第 3 条）。
+3. **写盘顺序固定**：备份 → crt → key → `materializeTlsAssets()`。写 key 失败会 **best-effort 把 crt 还原成备份那一版**
+   ——否则盘上留下「新 crt + 旧 key」，Traefik 会端出一张浏览器直接拒的证书，比维持旧证书更糟。
+4. **verify 连默认网关，不连域名**：portal 容器解析不了 `admin.<伞域>`（实测 `ENOTFOUND`），而证书 SAN 也不含 IP
+   ⇒ 连 `/proc/net/route` 里的默认网关 + `servername=adminHost` + `rejectUnauthorized:false`，**只比指纹**。
+   网关解析失败 ⇒ `unreachable`（不瞎猜地址）。
+
+**红线复核（机器可查）**：私钥/PEM **不进 DB、不进日志、不进审计、不进响应、不进 `tls.yml` 正文**；
+`describeTls()` 逐键白名单（`configured/active/coverage/live/previous`，`active` 六个字段），有专门用例钉「键集恰好是白名单」；
+`git ls-files | grep -E '\.(pem|key|crt)$'` 空；`docs/data/schema.sql` 一字节未改（迁移 0027 增量，baseline sha256 冻结）。
+
+**基线（主 agent 亲跑）**：根 **1864 → 1901**（1897 通过 / 0 失败 / 4 跳过，净 **+37** = `tls-cert` 23 + `tls-api` 12 + migrations 1）、
+runner 473 与前端 1106 不变、`node --check` 全过。**主 agent 亲跑 6 条变异全红在具名用例**：去覆盖判据 ⇒ 3 红；
+key 写 0644 ⇒ 1 红；上传后不物化 `tls.yml` ⇒ 1 红；通配符放宽成多级 ⇒ 2 红；DTO 塞回 `keyPem` ⇒ 1 红；审计塞 PEM ⇒ 1 红。
+worker 另跑 4 条（工单要求的那四条）。
+
+**真证书 + 真网络预验（部署前就做了，不等上线）**：把模块挂进 portal 镜像跑在 `station_backend` 网络上 ——
+`readActiveCertificate` 解析现网 4 层 fullchain 正常（`subjectCN=fde.erix.vip`、SAN 两项、`notAfter 2027-02-03`）；
+`certCoversHost('admin.fde.erix.vip')=true` / `('a.b.fde.erix.vip')=false`（通配符单层）；
+`verifyLiveCertificate` 对真边缘 ⇒ **`live`** 且指纹与盘上逐字符相同，错指纹 ⇒ `mismatch`，死端口 ⇒ `unreachable`。
+
+**⚠ 一条只有 root 才看得到的坑**：`certs/tls.key` 是 `0600 root:root`（Traefik 的要求，见 §8.94），所以
+**以 `eric` 身份在本机跑 `readActiveCertificate` 会得到 `configured:false, reason:'unreadable'`** ——
+这不是 bug（portal 容器内是 root）。做本地验证要用 portal 镜像起容器，别在宿主上直接 node 跑。
+
+**未做（M2 = 前端切片）**：管理台「Certificates」tab（状态卡 / SAN 自动提取成可编辑输入 / 确认后提交 /
+verify 按钮 / 回滚按钮 / 过期提醒）。**本片前端零字节**。

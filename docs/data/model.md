@@ -414,6 +414,25 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 写入方 = 管理台 API（`GET/PUT /api/admin/mail/settings` + `POST /api/admin/mail/test`，已交付：`portal/src/mail-settings.js`，契约 `docs/api/portal.md` §4.12；落库后调 `mailerProvider.invalidate()` 让 60s 缓存立刻失效）；读取方 = portal 登录发信路径（`mail-provider.js`，60s TTL）。运维急停：`MAIL_TRANSPORT=disabled`（env），为真时**不读本表**、一律不发信。
 
+### 1.32 `tls_certificates` — 管理台证书的审计/历史（issue #456，migration 0027）
+
+> 同上：来自增量迁移 `0027-tls-certificates.sql`；baseline 冻结、不回写 `schema.sql`。
+
+⚠ **本表不是真相源**：当前生效的证书是**盘上的文件**（`<TRAEFIK_DYNAMIC_DIR_HOST>/certs/tls.{crt,key}`），Traefik 只认文件。本表只回答「谁在什么时候装了什么」，用于历史与排查；与盘不一致时**以盘为准**（`GET /api/admin/tls` 就是读盘拼的 DTO）。
+
+**为什么私钥不在这里**：私钥只落盘（mode 600、属主 = Traefik 进程 uid），不进 DB / 日志 / 审计 / 响应（#456 红线）。所以本表**没有任何 PEM 列**（单测 `portal/test/migrations.test.js` 的 0027 用例逐列钉住）。
+
+| 关键字段 | 语义 |
+|---|---|
+| `subject_cn` / `sans` / `issuer_cn` | 叶子证书的主体 CN、SAN 里的 DNS 名（`text[]`）、签发者 CN。CN 可空（现代证书允许只有 SAN） |
+| `not_before` / `not_after` | 有效期（从证书里读，不是上传时刻） |
+| `fingerprint_sha256` | **冒号分隔大写**，与 Node `X509Certificate.fingerprint256` / `getPeerCertificate().fingerprint256` 同形 ⇒ 「盘上证书 == 真机握手 == 台账」三者可直接逐字符比对 |
+| `kind` | `'upload'`（上传/更新）\| `'rollback'`（回滚到 `certs/prev/`）。CHECK 钉住两态，别让第三种来源悄悄进来 |
+| `uploaded_by` | 操作的管理员（`ON DELETE SET NULL`：删用户要留历史行，也不能撞 FK） |
+| `uploaded_at` | 落台账时刻；索引 `tls_certificates_uploaded_at_idx (uploaded_at DESC)` 对「最近装了什么」 |
+
+写入方 = 管理台 API（`PUT /api/admin/tls` → `kind='upload'`；`POST /api/admin/tls/rollback` → `kind='rollback'`，`portal/src/tls-cert.js#recordCertificateRow`）；读取方 = 目前**只有运维/历史查询**（产品侧 GET 读盘，不读本表）。
+
 ---
 
 ## 2. 状态机
