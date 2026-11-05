@@ -96,7 +96,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 
 | 参数 | 语义 | 取值来源 | 示例值 |
 |---|---|---|---|
-| `MAIL_TRANSPORT` | **急停开关**：`disabled` ⇒ 无论 `mail_settings` 怎么配都**不发信**（不读库、不看缓存），未注册 TOTP 的账号退回纯口令登录，portal 启动时打一条 `level:'warn'`（`[auth] email verification code disabled …`）；不设或其它值 ⇒ 由 DB 配置决定（无 `mail_settings` 行 = 未配置 = 同样不生效） | 运维/决策者按需（急停用），默认不设 | `disabled`（只在要强制关掉发信时设） |
+| `MAIL_TRANSPORT` | **急停开关**：`disabled` ⇒ 无论 `mail_settings` 怎么配都**不发信**（不读库、不看缓存），未注册 TOTP 的账号退回纯口令登录，portal 启动时打一条 `level:'warn'`（`[auth] email verification code disabled …`）；不设或其它值 ⇒ 由 DB 配置决定（无 `mail_settings` 行 = 未配置 = 同样不生效）。**管理台（§4.12）把 SMTP 配好之后，这个开关仍是唯一的急停手段**：管理台只能“配”与“关”（`transport='disabled'`），而“无论 DB 怎么配都不发信”只有它能做——改 DB 要连库、要等缓存、还会被下一个管理员改回来，急停不能依赖那些。 | 运维/决策者按需（急停用），默认不设 | `disabled`（只在要强制关掉发信时设） |
 
 - **未配置（无 `mail_settings` 行或 `transport='disabled'`）时第二因素不生效**：未注册 TOTP 的账号走纯口令，审计 `method='password_direct_no_second_factor'`——「这一层没做第二因素」在日志与审计里都查得到。
 - **读取失败不锁站**：`mail_settings` 读不到（迁移没跑 / DB 抖动）⇒ 邮件通道按未启用处理 + 一条 warn，登录照常（fail-open，决策 D3b）。
