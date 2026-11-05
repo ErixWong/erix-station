@@ -3437,3 +3437,22 @@ worker 侧整段包 `try/catch`（失败 ⇒ 空段 + warn，catch 内不得再�
 
 **⚠ 顺带更正两处错号**（本单开工时发现）：§8.88（`compactionStats` 观测面）与 §8.89（`summarizer_failed` 真机演练）都写着 `#451`，
 真实分别是 **#445** 与 **#446** —— 而 `#451` 现在正是本单，不改就会指向错对象（标题行已改）。
+
+**发版与部署（v0.1.52，2026-11-05，主 agent 亲手）**：main `55edff4`（版本 bump 六文件 9 增 9 删）→ main CI
+**两个 job 全绿**（质量门禁 + 三镜像构建校验，先等绿再打 tag）→ tag `v0.1.52` → release run `41977575433` success →
+清单 `images-digest`：portal `imageId=1bda4ff3…`/`digest=8b3cb82c…`、fde `imageId=983cc2bb…`/`digest=4e2fa6fd…`、
+proxy `imageId=7bae3eca…`/`digest=538ecc32…`。
+⚠ **本版只 pin `FDE_IMAGE`**（`deploy/.env`，备份 `/tmp/deploy.env.bak-0152`），portal/proxy **仍留 v0.1.51**：
+本单改动全在 runner（注入生效只需新 FDE 镜像），而 main 上同期还有**另一个 session** 在推 #449（登录第二因素邮箱码）
+的后端/管理台切片 —— 它的 portal 侧代码不必随本单上线（三片都 default-off，但没必要替别人做部署决定）。
+`docker pull` 只拉了 fde：`docker image inspect .Id` = `sha256:983cc2bb…` **与清单 imageId 逐位一致**、`RepoDigests` 含清单 digest。
+`docker compose -p station up -d --no-build station-portal` 重建 portal（拿到新 `FDE_IMAGE`）时 **`station-docker-proxy` 被作为依赖连带重建**
+⇒ 它的 `IMAGE_ALLOWLIST` 同步换成新 digest（**这是必须的**：白名单是**另一个容器**的 env，只改 portal 的 `FDE_IMAGE`
+会在 `docker create` 时被 proxy 拒成 `create_policy_denied`，§8.70 那个事故的同型坑）→
+`docker rm -f` 五台 `fde-*`（**按 `label=station.stack=default` + `name=fde-` 双过滤**，§8.84 误删 `fde-workshop-db` 的教训）→
+reconcile 40 秒内全部重建在 `983cc2bb…` 且 healthy、容器内 `station 0.1.52 / engine 0.31.0`、agentd `sse connected` + `sse ping received`。
+
+**发布物验收**（不是只信热 patch）：会话 `83b57016…` / run `3440e8a8…`（9 轮）——agentd 日志
+`agents-md injected: files=1 bytes=9018 truncated=0 subdir_hints=0 notes=0`；**9 次 tool_use 里含 `AGENTS.md` 的 0 次**；
+回复给了完整预览 URL（`eric-p-22000`）+ `--bind 0.0.0.0` + 403/502 两种失败形态对照 + `git commit 4f75781` 收工。
+dev 残渣（故意留作标本）：`~/projects/probe-451`（含那条「端口固定 3000」的冲突夹具 `AGENTS.md`）、`probe-451b`（对照组）、`probe-451c`。
