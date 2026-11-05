@@ -3387,6 +3387,7 @@ proxy `c3ab6488…`）→ `deploy/.env` 形态① pin **三项**（本版 `runne
 `realpath` 越界（symlink 逃逸）跳过 · 单文件 16 KiB / 全链 48 KiB（**超限从内层开始整份挤掉**，平台节必须完整）·
 任何读取失败降级为「跳过 + note」**绝不抛** · 子目录索引排序后取前 5 · **渲染禁时间戳/run id/generation**
 （system 是引擎 `markStablePrefix` 的缓存稳定前缀；文件不变 ⇒ 输出逐字节不变；**无 blocks ⇒ 空串**，`system` 逐字节等于原值）。
+**口径补齐（#451 评审 M2）**：子目录索引**只在至少注入了一份文件时才渲染**（`blocks` 为空 ⇒ 整段为空串、索引不单独出现：口径 7「子目录索引」与口径 8「无 blocks ⇒ 空串」的真取舍，实现按 8 裁）；补偿是 `worker.js` 那条 info 记账里拼上**前 2 条 note 摘要**（超过 2 条加 `…`，仍是 `MSG.LOG`、不新增事件类型）。
 抬头由**宿主**生成（正文归 materializer，抬头归 runner，两边不互相引用）：顺序由外到内 / 平台节不可覆盖且冲突要告知用户 /
 已注入勿重复 `cat` / 本 run 内改动下次 run 才生效。记账走现成 `MSG.LOG`（info，`files= bytes= truncated= subdir_hints= notes=`），
 **不新增事件类型**；指针段（`worker.js:89`）从「开工前先读」改成「已随本次 run 注入」，保留 `cat ~/.erix/ports.json`（动态清单）
