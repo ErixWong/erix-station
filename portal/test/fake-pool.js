@@ -13,6 +13,8 @@ export class FakePool {
     this.emailCodes = [];
     // #449：邮件通道配置（单行表 `mail_settings`）。默认无行 = 未配置 = 第二因素不生效。
     this.mailSettings = null;
+    // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
+    this.tlsCerts = [];
   }
 
   async query(sql, params = []) {
@@ -338,6 +340,40 @@ export class FakePool {
     if (sql.includes('login_email_codes')) {
       // 严格 fake：没认出来的 SQL 直接炸，不静默返回空行（AGENTS §8.14 同族）。
       throw new Error(`fake: 未识别的 login_email_codes SQL：${sql.replace(/\s+/g, ' ').slice(0, 160)}`);
+    }
+
+    // ---- #456：证书台账（tls_certificates） ----
+    // 写侧：按 SQL 文本真模拟，并把迁移 0027 的约束当 DB 事实执行——
+    //   ① `fingerprint_sha256` 必须是**冒号分隔大写**（与 Node fingerprint256 同形，verify 端点直接逐字符比）；
+    //   ② `kind` 只有 upload/rollback（CHECK）；
+    //   ③ `sans` 是 `text[]` ⇒ 必须传数组。
+    // 产品侧把指纹小写化、或把 PEM 当指纹写进去，这里会炸（而不是静默绿）。
+    if (sql.includes('INSERT INTO tls_certificates')) {
+      const [subjectCn, sans, issuerCn, notBefore, notAfter, fingerprint, kind, uploadedBy] = params;
+      if (!/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(String(fingerprint))) {
+        throw new Error(`fake: fingerprint_sha256 必须是冒号分隔大写（与 fingerprint256 同形），实际 ${String(fingerprint).slice(0, 24)}…`);
+      }
+      if (!Array.isArray(sans)) throw new Error('fake: sans 是 text[]，必须传数组');
+      if (kind !== 'upload' && kind !== 'rollback') throw new Error(`fake: kind 违反 CHECK (${kind})`);
+      const row = {
+        id: `tls${this.tlsCerts.length + 1}`,
+        subject_cn: subjectCn,
+        sans,
+        issuer_cn: issuerCn,
+        not_before: notBefore,
+        not_after: notAfter,
+        fingerprint_sha256: fingerprint,
+        kind,
+        uploaded_by: uploadedBy,
+        uploaded_at: new Date(),
+      };
+      this.tlsCerts.push(row);
+      return { rows: [{ id: row.id, uploaded_at: row.uploaded_at }], rowCount: 1 };
+    }
+
+    if (sql.includes('FROM tls_certificates')) {
+      const rows = [...this.tlsCerts].sort((a, b) => b.uploaded_at - a.uploaded_at);
+      return { rows, rowCount: rows.length };
     }
 
     return { rows: [] };
