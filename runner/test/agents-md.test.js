@@ -113,6 +113,38 @@ test('内容相同的两份只注入靠外那份（sha256 去重）+ 一条 note
   });
 });
 
+// #451 评审 m4（minor）：旧写法拿**原始字节**做 sha256 ⇒ BOM / CRLF 差异让去重失效：
+// 同一段规则注两遍且 notes=0（看上去一切正常）。去重键已改成规范化字节，**展示仍是原文**。
+test('m4：同内容只差 BOM / CRLF / 尾部空白 ⇒ 仍只注入 1 份 + 1 条去重 note，且注入的是原文', async () => {
+  const lf = '# 平台约定\n- 规则 A：端口从清单取\n';
+  await withTree({
+    // 靠外那份：UTF-8 BOM + LF；靠内那份：同内容 CRLF + 多一个尾部空行
+    'home/AGENTS.md': Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(lf, 'utf8')]),
+    'home/projects/AGENTS.md': Buffer.from(lf.replace(/\n/g, '\r\n') + '\r\n', 'utf8'),
+  }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.equal(blocks.length, 1, `只差 BOM/行尾就是同一份约定，不得注两遍（实际 ${blocks.length} 份）`);
+    assert.equal(blocks[0].scope, 'platform', '保留的必须是靠外那份（平台节优先）');
+    assert.ok(notes.some((n) => n.includes('去重')), `去重必须记账，实际 notes=${JSON.stringify(notes)}`);
+    assert.equal(blocks[0].text, '\uFEFF' + lf,
+      '去重键归一不得改展示：注入的仍是它自己文件的原文（BOM 一个字节都不动）');
+  });
+});
+
+test('m4 反向：内容真的不同（多一行）⇒ 仍注入 2 份，不得过度去重', async () => {
+  await withTree({
+    'home/AGENTS.md': '# 平台约定\n- 规则 A\n',
+    'home/projects/AGENTS.md': '# 平台约定\n- 规则 A\n- 规则 B\n',
+  }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform', 'workspace'],
+      '只差一行就是两份不同的约定：归一只能消除编码差异，不能吞掉真内容');
+    assert.equal(notes.filter((n) => n.includes('去重')).length, 0,
+      `不该有去重记账，实际 notes=${JSON.stringify(notes)}`);
+    assert.ok(blocks[1].text.includes('规则 B'), '两份各自必须是自己的原文');
+  });
+});
+
 test('单文件超上限：截断并留 marker（含原字节数 + 可直接照抄的 cat <path>）', async () => {
   const big = `# 大文件\n${'x'.repeat(AGENTS_MD_MAX_FILE_BYTES + 2048)}`;
   await withTree({ 'home/AGENTS.md': big }, ({ home, cwd }) => {
@@ -126,6 +158,101 @@ test('单文件超上限：截断并留 marker（含原字节数 + 可直接照�
     assert.match(block.text, /看全文：cat ~\/AGENTS\.md/,
       'marker 必须给可直接照抄的命令（不给命令，模型只会自己猜 head -N，那正是今天的病）');
     assert.ok(block.text.startsWith('# 大文件'), '截断只砍尾部，开头必须保留');
+  });
+});
+
+// #451 评审 B1（blocker）判据：上限必须在**读之前**生效。旧形状（先整文件 readFileSync 再比长度）
+// 在这两格上全红：它读满了整个文件，`stat.size` 从没用过。
+test('B1：单文件 maxFileBytes×40（≈640 KiB）⇒ 只读定长前缀，readFileSync 对该路径一次都没调', async () => {
+  const maxFileBytes = AGENTS_MD_MAX_FILE_BYTES;
+  const bigBytes = maxFileBytes * 40; // 655360 B：足够证明「不是靠 readFileSync 拿全文」
+  await withTree({ 'home/AGENTS.md': 'x'.repeat(bigBytes) }, ({ home, cwd }) => {
+    const readFileSyncCalls = [];
+    const readSyncLengths = [];
+    const facade = {
+      ...fs,
+      readFileSync: (target, ...rest) => {
+        readFileSyncCalls.push(String(target));
+        return fs.readFileSync(target, ...rest);
+      },
+      readSync: (fd, buffer, offset, length, position) => {
+        readSyncLengths.push(length);
+        return fs.readSync(fd, buffer, offset, length, position);
+      },
+    };
+    const { blocks } = collectAgentsMd({ cwd, home, fs: facade });
+    assert.equal(blocks.length, 1);
+    const block = blocks[0];
+    assert.equal(block.truncated, true, 'maxFileBytes×40 必须标 truncated');
+    assert.ok(readSyncLengths.length > 0, '超限文件必须走定长前缀读（openSync + readSync + closeSync）');
+    assert.ok(readSyncLengths.every((n) => n <= maxFileBytes + 4),
+      `readSync 每次读的字节数必须 ≤ maxFileBytes+4（实际 ${JSON.stringify(readSyncLengths)}）`);
+    assert.equal(readFileSyncCalls.filter((p) => p.endsWith('/AGENTS.md')).length, 0,
+      `超限的文件不许整文件 readFileSync（实际调了 ${JSON.stringify(readFileSyncCalls)}）：` +
+      '这是本条 finding 的核心——旧写法在这里会把 600 MiB 拉进内存再抛 ERR_STRING_TOO_LONG');
+    assert.ok(block.bytes > maxFileBytes && block.bytes < bigBytes / 4,
+      `注入字节数必须合理（实际 ${block.bytes}，文件 ${bigBytes}）`);
+    assert.match(block.text, new RegExp(`\\[已截断：原 ${bigBytes} 字节，仅注入前 ${maxFileBytes} 字节`),
+      'marker 必须报**原文件**字节数（前缀读之后 buf.length 只是前缀长度，报它会骗模型）');
+  });
+});
+
+test('B1：16 KiB 边界不变形——16384 不截断 / 16385 截断（上限口径仍是「正文」）', async () => {
+  const maxFileBytes = AGENTS_MD_MAX_FILE_BYTES;
+  assert.equal(maxFileBytes, 16384, '本用例的 16384/16385 字面量跟常量绑死');
+  await withTree({
+    'home/AGENTS.md': 'x'.repeat(maxFileBytes), // 正好卡在上限：一个字节都不许多读
+    'home/projects/proj/AGENTS.md': 'y'.repeat(maxFileBytes + 1), // 多 1 字节就该截
+  }, ({ home, cwd }) => {
+    const { blocks } = collectAgentsMd({ cwd, home });
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform', 'project']);
+    const [exact, over] = blocks;
+    assert.equal(exact.truncated, false, '正好 16384 字节不得截断（边界上多切一个字节就是改写约定）');
+    assert.equal(exact.bytes, maxFileBytes, '不截断时注入字节数必须逐字节等于文件字节数');
+    assert.equal(over.truncated, true, '16385 字节必须截断（上限是硬口径，没有“差一个字节就放过”）');
+    assert.match(over.text, new RegExp(`\\[已截断：原 ${maxFileBytes + 1} 字节`),
+      'marker 必须报真实原字节数（16385，不是前缀长度）');
+  });
+});
+
+// #451 评审 M1（major）：设计稿 §4.1 规则 6 承诺「解码失败 ⇒ 跳过 + note」，但旧实现的
+// `buf.toString('utf8')` 是 lossy 解码、永不失败 ⇒ 那条降级是死光纤。
+test('M1：非 UTF-8（FF FE 00 41）⇒ 不注入 + note 点名「UTF-8」并给出前 16 字节 hex', async () => {
+  await withTree({
+    'home/AGENTS.md': PLATFORM,
+    'home/projects/AGENTS.md': Buffer.from([0xff, 0xfe, 0x00, 0x41]), // 看着像 UTF-16LE BOM + 'A'
+  }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform'],
+      '非 UTF-8 的一份一个字节都不许注入（旧 lossy 解码会把 U+FFFD 与 \\u0000 当正文塞进 prompt 缓存前缀）');
+    assert.ok(notes.some((n) => n.includes('UTF-8')), `必须记账「不是 UTF-8」（旧实现 notes 恒为空）：${JSON.stringify(notes)}`);
+    assert.ok(notes.some((n) => n.includes('fffe0041')),
+      `note 必须带前 16 字节 hex（运维拿着就能定编码）：${JSON.stringify(notes)}`);
+    const rendered = renderAgentsMdSection({ blocks, notes });
+    assert.doesNotMatch(rendered, /\uFFFD/, '渲染结果里不得出现 U+FFFD');
+  });
+});
+
+test('M1：合法中文 UTF-8 仍逐字节注入（fatal 解码不得误伤）', async () => {
+  const cjk = '# 中文约定\n- 规则：提交前跑测试，口径见 §6.1\n';
+  await withTree({ 'home/AGENTS.md': cjk }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.equal(blocks.length, 1, '合法 UTF-8 不得被 fatal 解码误删');
+    assert.equal(blocks[0].text, cjk, '中文原文必须逐字节不变（展示用原文，不做任何规范化）');
+    assert.deepEqual(notes, [], `合法文件不得产生任何记账：${JSON.stringify(notes)}`);
+  });
+});
+
+test('M1+B1：超大中文文件被前缀切在字符中间 ⇒ 仍正常截断注入（不误判成非 UTF-8）', async () => {
+  // 6000 × '中' = 18000 字节 > 16384 ⇒ 走前缀读；16388 字节 = 5462 个完整字符 + 2 个残留字节
+  // ⇒ 尾部正好是个没读完的字符：那是**读法**造成的不完整，不是文件不是 UTF-8。
+  await withTree({ 'home/AGENTS.md': '中'.repeat(6000) }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.equal(blocks.length, 1, `前缀切断不得误伤合法 UTF-8（notes=${JSON.stringify(notes)}）`);
+    assert.equal(blocks[0].truncated, true);
+    assert.doesNotMatch(blocks[0].text, /\uFFFD/, '截断点必须落在字符边界（出现 U+FFFD 就是改写了原文）');
+    assert.ok(blocks[0].text.startsWith('中'), '截断只砍尾部');
+    assert.deepEqual(notes, []);
   });
 });
 
@@ -153,7 +280,8 @@ test('symlink 越界（~/projects/AGENTS.md -> home 之外）⇒ 跳过 + note',
   }, ({ root, home, cwd }) => {
     fs.symlinkSync(path.join(root, 'outside', 'secret.md'), path.join(home, 'projects', 'AGENTS.md'));
     const { blocks, notes } = collectAgentsMd({ cwd, home });
-    assert.deepEqual(blocks.map((b) => b.scope), ['platform'], 'symlink 逃出 home 的内容一个字节都不许注入');
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform'],
+      'symlink 逃出 home 的内容不注入（口径：以 realpath **检查时刻**的形态为准——检查与读取之间换 symlink 指向不在防护范围）');
     assert.ok(notes.some((n) => n.includes('越出')), `越界要记账，实际 notes=${JSON.stringify(notes)}`);
   });
 });
@@ -271,6 +399,25 @@ test('无 blocks ⇒ renderAgentsMdSection 返回空串（system 必须逐字节
   assert.equal(renderAgentsMdSection({}), '', '缺参也必须是空串，不许抛');
   // notes 非空但 blocks 为空 ⇒ 仍然是空串（记账不能把空节变成有内容）
   assert.equal(renderAgentsMdSection({ blocks: [], notes: ['跳过 ~/projects/AGENTS.md：EACCES'] }), '');
+  // #451 评审 M2 的取舍（口径 8「无注入 ⇒ system 逐字节不变」压过口径 7「子目录索引」）：
+  // 产品行为维持现状，但口径必须写死在这里（设计稿 §4.1 规则 7 / user-space.md / AGENTS.md §8.91 同一口径）。
+  assert.equal(renderAgentsMdSection({ blocks: [], subdirHints: ['~/repo-a/AGENTS.md'] }), '',
+    'blocks 为空时子目录索引也不单独出现（索引不能把空段变成有内容）');
+});
+
+// M2 的可观测性补偿：`blocks=[]` 时 notes / subdirHints 都进不了 prompt ⇒ 日志是唯一通道。
+test('#451 M2：worker 的 info 记账必须拼上前 2 条 note 摘要（仍是 MSG.LOG，不新增事件类型）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const at = src.indexOf('agents-md injected:');
+  assert.notEqual(at, -1, 'info 记账必须在：§6.2 D4 靠它量注入成本');
+  const block = src.slice(Math.max(0, at - 1600), at + 500);
+  assert.match(block, /type: MSG\.LOG,[^\n]*level: 'info'/, '必须复用现成 MSG.LOG（不新增事件类型）');
+  assert.match(block, /notes=\$\{agentsMd\.notes\.length\}\$\{[A-Za-z_$][\w$]*\}/,
+    'notes=N 后面必须紧跟 note 摘要：blocks=[] 时 notes 根本不会出现在 prompt 里，没这条就只能猜');
+  assert.match(block, /agentsMd\.notes\.slice\(0, *2\)/, '摘要只取前 2 条（日志长度不能没上限地长）');
+  assert.match(block, /\.join\('; '\)/, '多条 note 用 "; " 分隔');
+  assert.match(block, /notes\.length > 2 \? '…'/, '超过 2 条必须以 … 收尾（让人知道还有）');
+  assert.doesNotMatch(src, /MSG\.AGENTS/i, '不得为此新增事件类型（模块抬头：不新增事件类型 / 错误码）');
 });
 
 test('常量与名字是接口的一部分（下游 worker 与文档都按这些名字说话）', () => {
@@ -347,24 +494,61 @@ test('F1：resolveAgentsMdChain 对不可用输入返回空数组（口径：没
 });
 
 // ---------------------------------------------------------------------------
-// 接线源码级锁（与 system-prompt.test.js 里那两条并列的第三条）：**采集必须在 try/catch 里**。
-// 变异（主 agent 验收会做）：把 try/catch 摘掉 ⇒ 这条必须红。
+// 接线源码级锁（与 system-prompt.test.js 里那两条并列的第三条）：**采集与渲染都在 startRun 函数体内，
+// 且被同一个 try/catch 包住**。
+// 变异（评审 M3 / m1 的判据，主 agent 验收会做）：
+//   ① 把采集整段（含 try/catch）移到模块顶层 ⇒ 这条与 system-prompt 锁① 必须红（旧锁看不见：它 `slice` 到**文件末尾**）；
+//   ② 只把 `renderAgentsMdSection(...)` 移出 try ⇒ 这条必须红（m1：旧锁 20/20 全绿，而注释承诺的是「采集与渲染各包一层」）。
 // ---------------------------------------------------------------------------
 
-test('接线锁③：worker.js 里 collectAgentsMd( 被 try { … } catch 包住，catch 里置空注入段 + 发 warn', () => {
-  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+/**
+ * #451 评审 M3：`startRun` 的**函数体边界**。定界口径：`startRun` 是 2 空格缩进的 `async function startRun(`，
+ * 函数体以**行首** `}` 收尾 ⇒ 从 `startRunAt` 找第一个 `\n}`。⚠ **不要用括号计数**：worker.js 里有模板字符串
+ * 与正则字面量，`(` `)` 数不干净。（与 system-prompt.test.js 的同名 helper 故意各留一份。）
+ */
+function startRunBodyRange(src) {
   const startRunAt = src.indexOf('async function startRun(');
   assert.notEqual(startRunAt, -1, 'worker.js 必须仍有 `async function startRun(`');
-  const body = src.slice(startRunAt);
-  const collectAt = body.indexOf('collectAgentsMd(');
-  assert.notEqual(collectAt, -1, 'startRun 里必须仍有采集调用');
-  const tryAt = body.lastIndexOf('try {', collectAt);
+  const rel = src.slice(startRunAt).search(/\n\}/);
+  assert.notEqual(rel, -1, 'startRun 必须以行首 `}` 收尾（找不到 = 缩进形态变了，这条锁要跟着改而不是放宽）');
+  return { startRunAt, endAt: startRunAt + rel };
+}
+
+function inStartRunBody(name, at, { startRunAt, endAt }) {
+  assert.ok(at > startRunAt && at < endAt,
+    `「${name}」必须落在 startRun **函数体内**（实际 index=${at}，体内区间=[${startRunAt}, ${endAt}]）：` +
+    'worker 进程会被 agentd 复用给下一个 run，搬到模块顶层 = 第二个 run 沿用第一个 run 的内容（或启动时的空快照）');
+}
+
+test('接线锁③：采集与渲染都在 startRun **函数体内**、且落在同一个 try 块里（catch 置空注入段 + 发 warn）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const range = startRunBodyRange(src);
+  const collectAt = src.indexOf('collectAgentsMd(');
+  const renderAt = src.indexOf('renderAgentsMdSection(');
+  const systemAt = src.indexOf('system: SYSTEM_PROMPT + agentsMdSection');
+  assert.notEqual(collectAt, -1, '必须仍有采集调用');
+  assert.notEqual(renderAt, -1, '必须仍有渲染调用');
+  inStartRunBody('collectAgentsMd(', collectAt, range);
+  inStartRunBody('renderAgentsMdSection(', renderAt, range);
+  inStartRunBody('system: SYSTEM_PROMPT + agentsMdSection', systemAt, range);
+  // 语义锁（M3）：采集用的是本 run 的 cwd ⇒ 必须在解构 msg 之后
+  const msgAt = src.indexOf('const { task, cwd } = msg;');
+  assert.notEqual(msgAt, -1, 'startRun 必须仍从 msg 解构 `{ task, cwd }`：采集的 cwd 就来自这里');
+  assert.ok(collectAt > msgAt,
+    '采集必须在 `const { task, cwd } = msg;` **之后**：抢在解构之前就不可能拿到本 run 的 cwd（= 不是 per-run 的）');
+  // 采集与渲染必须在同一个 try 里（m1）
+  const tryAt = src.lastIndexOf('try {', collectAt);
   assert.notEqual(tryAt, -1,
     '采集前必须有 `try {`：本段在 runToolLoop 之前，抛出去就是 worker 进程死 → requeue → attempts exhausted');
-  const catchAt = body.indexOf('catch', collectAt);
+  assert.ok(tryAt > range.startRunAt, 'try 本身也必须在 startRun 体内（函数外的 try 兜不到函数内的局部变量）');
+  const catchAt = src.indexOf('catch', collectAt);
   assert.notEqual(catchAt, -1, '采集之后必须有 catch（只有 try 没有 catch 等于没兜）');
+  assert.ok(catchAt < range.endAt, 'catch 必须在 startRun 体内');
   assert.ok(catchAt - collectAt < 800, 'catch 必须紧跟着这段采集，不是文件后面某个无关的 catch');
-  const catchBlock = body.slice(catchAt, catchAt + 600);
+  assert.ok(tryAt < renderAt && renderAt < catchAt,
+    '渲染必须落在**同一个 try 块内**（try < render < catch）：renderAgentsMdSection 抛出去没人兜就是 worker 进程死，' +
+    '而 worker.js 那段注释承诺的是「采集/渲染整段再包一层 try/catch」');
+  const catchBlock = src.slice(catchAt, Math.min(catchAt + 600, range.endAt));
   assert.match(catchBlock, /agentsMdSection = ''/,
     'catch 里必须把注入段置空（否则可能带着半成品拼进 system）');
   assert.match(catchBlock, /MSG\.LOG[\s\S]{0,160}level: 'warn'/, 'catch 里必须发一条 MSG.LOG warn（不新增事件类型）');

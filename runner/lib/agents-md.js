@@ -36,7 +36,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 export const AGENTS_MD_BASENAME = 'AGENTS.md';
-/** 单文件注入上限。平台节今天 9 KB，留一倍余量；再大就说明有人在约定文件里塞别的东西。 */
+/**
+ * 单文件**正文**注入上限。平台节今天 9 KB，留一倍余量；再大就说明有人在约定文件里塞别的东西。
+ * ⚠ 口径（#451 评审 m3）：这是**正文**上限，**截断 marker 另计**（约 100 B：评审实测 16385 B 的源
+ * ⇒ `blocks[].bytes = 16479`）；而全链 48 KiB 是按**含 marker** 的 `b.bytes` 累加 ⇒ 两个上限不同量纲，
+ * 差的就是 marker。**不改判定逻辑**（改了会动「16384 不截断 / 16385 截断」那条用例，收益为零）。
+ */
 export const AGENTS_MD_MAX_FILE_BYTES = 16 * 1024;
 /** 全链上限（= 3 份满载单文件）。超了**从内层开始截**：平台节必须完整（它装的是运行期硬约束）。 */
 export const AGENTS_MD_MAX_TOTAL_BYTES = 48 * 1024;
@@ -92,6 +97,102 @@ function utf8Prefix(buf, maxBytes) {
   let end = Math.min(maxBytes, buf.length);
   while (end > 0 && end < buf.length && (buf[end] & 0xc0) === 0x80) end -= 1;
   return buf.subarray(0, end).toString('utf8');
+}
+
+/**
+ * #451 评审 B1（blocker）：**只读文件前 `maxBytes + 4` 字节**，定长缓冲 ⇒ 超大文件不会整文件进内存。
+ *
+ * 为什么是 +4：一个 UTF-8 字符最长 4 字节，多读 4 个字节就必然能判定第 `maxBytes` 字节是不是字符边界
+ * （`utf8Prefix` 要往回退到前导字节），也必然能在尾部判断末段字符是否完整（`trimIncompleteUtf8Tail`）。
+ *
+ * 逐次补读（`readSync` 对普通文件通常一次读满，但短读在语义上是合法的）；`closeSync` 放 finally，
+ * 关不掉不影响已经读到的前缀。**不整文件 `readFileSync`** 就是这条的存在理由：600 MiB 的 `AGENTS.md`
+ * 旧写法要 647 MB RSS + 抛 `ERR_STRING_TOO_LONG`（⇒ worker 兜住后整段注入置空，连平台节都没了）。
+ */
+function readPrefix(fsImpl, file, maxBytes) {
+  const length = maxBytes + 4;
+  const buf = Buffer.alloc(length); // 定长：内存占用与文件大小无关
+  const fd = fsImpl.openSync(file, 'r');
+  try {
+    let got = 0;
+    while (got < length) {
+      const n = fsImpl.readSync(fd, buf, got, length - got, got) ?? 0;
+      if (n <= 0) break; // EOF
+      got += n;
+    }
+    return buf.subarray(0, got);
+  } finally {
+    try {
+      fsImpl.closeSync(fd);
+    } catch {
+      // 关闭失败（EBADF 之类）不影响已经读进缓冲的前缀：降级口径，不记账也不抛。
+    }
+  }
+}
+
+function canPrefixRead(fsImpl) {
+  return typeof fsImpl.openSync === 'function' && typeof fsImpl.readSync === 'function'
+    && typeof fsImpl.closeSync === 'function';
+}
+
+/**
+ * #451 评审 M1：「解码失败 ⇒ 跳过 + note」在旧实现里是**死光纤**——`buf.toString('utf8')` 是 lossy
+ * 解码，**永不失败**，所以二进制 / GBK 的 `AGENTS.md` 会被当正文注入（带 U+FFFD 与 `\u0000`），而
+ * `notes=[]` 看起来完全正常。改 `TextDecoder(..., { fatal: true })` 后失败才会真发生（设计稿 §4.1 规则 6）。
+ * 统一定制成 `NotUtf8Error`：worker 侧的 catch 要能区分「读不动」与「不是 UTF-8」两种记账文案。
+ */
+class NotUtf8Error extends Error {}
+
+function decodeUtf8Strict(buf) {
+  try {
+    // `ignoreBOM: true` 是必须的：TextDecoder 默认**会吞掉前导 BOM**，而口径是「展示用原文、一个字节都
+    // 不改」（BOM 归展示，只在去重键里被剔掉，见 `dedupeKey`）。
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buf);
+  } catch (err) {
+    throw new NotUtf8Error(err?.message ?? String(err));
+  }
+}
+
+/** note 里给前 16 字节的 hex：运维拿着就能 `file`/`xxd` 定是什么编码，不用去猜。 */
+function hexHead(buf, max = 16) {
+  if (!buf) return '';
+  return Buffer.from(buf.subarray(0, max)).toString('hex');
+}
+
+/**
+ * 剔掉尾部一段**还没读完的**多字节序列（只在定长前缀读之后用）。
+ *
+ * 为什么必需：前缀切在字符中间是**读法**造成的不完整，不是文件本身不是 UTF-8；M1 之后 fatal 解码会
+ * 把它当非法编码 ⇒ 合法的中文约定文件会被误删。`readPrefix` 多读 4 字节就是为了让这里能判定
+ * （一个 UTF-8 字符最长 4 字节 ⇒ 尾部最多 3 个字节可能属于一个未完成的字符）。
+ */
+function trimIncompleteUtf8Tail(buf) {
+  for (let back = 1; back <= Math.min(4, buf.length); back += 1) {
+    const byte = buf[buf.length - back];
+    if ((byte & 0x80) === 0) return buf; // ASCII：尾部完整
+    if ((byte & 0xc0) === 0xc0) { // 前导字节：算它需要多少后续字节
+      const need = byte >= 0xf0 ? 3 : byte >= 0xe0 ? 2 : 1;
+      return back - 1 < need ? buf.subarray(0, buf.length - back) : buf;
+    }
+    // 10xxxxxx（continuation）：继续往回看找前导字节
+  }
+  return buf; // 回看 4 字节都是 continuation：本就是非法编码，交给 fatal 解码报错
+}
+
+/**
+ * 去重键（#451 评审 m4）：用**规范化后的字节**，不拿原始字节做 `sha256`。
+ *
+ * 旧写法让去重在真实形态下失效：`~/AGENTS.md` 带 BOM、`~/projects/AGENTS.md` 是同内容的 CRLF
+ * ⇒ 两份 sha 不同 ⇒ 同一段规则注两遍且 `notes=0`（看上去一切正常，就是多烧一份 token）。
+ * 规范化只做三件事：去前导 BOM（`EF BB BF` 解码后就是 U+FEFF）+ `\r\n` → `\n` + 首尾空白裁剪。
+ * ⚠ **只影响去重键，不影响展示**：`blocks[].text` 仍是文件原文，一个字节都不改（口径①）。
+ * 不做的规范化：单独的 `\r` 行尾、内部空白折叠——过度归一会把「真的只差空白」的两份当成一份。
+ * 超大文件走前缀读时键只能覆盖读到的前缀（尾部本来也不注入，同前缀 = 注入内容逐字节相同）。
+ */
+function dedupeKey(text) {
+  let normalized = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  normalized = normalized.replace(/\r\n/g, '\n').trim();
+  return crypto.createHash('sha256').update(Buffer.from(normalized, 'utf8')).digest('hex');
 }
 
 function scopeOf(dir, realHome) {
@@ -215,21 +316,50 @@ export function collectAgentsMd(options = {}) {
     }
     if (!isInside(realFile, boundary)) {
       // symlink 逃逸：文件真实路径跑出了 home（`~/projects/AGENTS.md -> /etc/passwd`）。
+      // ⚠ 口径（#451 评审 m2）：以 **realpath 时刻**的形态为准。本行判定与后面的读取之间没有
+      //   `O_NOFOLLOW` / `fstat` 比对 / 二次 `realpath` ⇒ **检查与读取之间的 symlink 变化不在防护范围**
+      //   （同容器、用户自己的文件：要挡的是「就是指向 home 之外」这种稳定形态，不是抢在两次
+      //   系统调用之间改指向的那个写入者）。选「把口径写准」而不是加系统调用：代价是 TOCTOU 窗口，
+      //   收益是少两次 syscall 与一套需要真 fs 才能测的机制。
       notes.push(`跳过 ${display}：真实路径 ${realFile} 越出 ${boundary}`);
       continue;
     }
-    let raw;
+    // #451 评审 B1（blocker）：**上限必须在读之前生效**。旧形状是「整文件 `readFileSync` ⇒ 全量解码
+    // ⇒ 才比 `buf.length > maxFileBytes`」：`stat.size` 拿到了却从没用过，实测 600 MiB 的 `AGENTS.md`
+    // ⇒ 抛 `ERR_STRING_TOO_LONG`、RSS 647 MB、563 ms，抛出去被 worker 的 catch 接住 ⇒ **整段置空**
+    // （连平台节都不注入）。现在 size 说超限就只定长读前缀，未超限才走原来的 `readFileSync`。
+    // ⚠ `stat.size` 对某些特殊文件（/proc、部分 FUSE）可能是 0 ⇒ 只当**提示**用：不可信时仍走
+    //   `readFileSync`，最终由下面的 `buf.length > maxFileBytes` 兜住截断（防御性，判定口径不变）。
+    let buf;
+    let text;
+    const sourceBytes = Number.isSafeInteger(stat.size) && stat.size > 0 ? stat.size : 0;
     try {
-      raw = fsImpl.readFileSync(realFile);
+      if (sourceBytes > maxFileBytes && canPrefixRead(fsImpl)) {
+        const prefix = readPrefix(fsImpl, realFile, maxFileBytes);
+        // 读满定长缓冲 ⇒ 文件在后面还有内容 ⇒ 尾部那段可能是个没读完的字符（剔掉，否则 M1 的
+        // fatal 解码会把一份合法 UTF-8 误判成「不是 UTF-8」）。没读满 = 真 EOF，不剔。
+        buf = prefix.length >= maxFileBytes + 4 ? trimIncompleteUtf8Tail(prefix) : prefix;
+      } else {
+        const raw = fsImpl.readFileSync(realFile);
+        buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
+      }
+      // 归一与解码**必须在这一层 try 内**（#451 评审 B1 第 4 点）：解码失败也要走下面同一条降级路径，
+      // 不许从 `collectAgentsMd` 里抛出去（抛 = worker 进程死 = run 被当崩溃 requeue）。
+      // M1：旧写法 `buf.toString('utf8')` 是 lossy 解码、永不失败 ⇒ 那条承诺过的降级是死光纤。
+      text = decodeUtf8Strict(buf);
     } catch (err) {
+      if (err instanceof NotUtf8Error) {
+        // 二进制 / GBK / UTF-16：注入进去就是往 prompt 缓存前缀里塞 U+FFFD，不如不注入。展示仍用**原文**（合法 UTF-8 一个字节不改）。
+        notes.push(`跳过 ${display}：不是 UTF-8 文本（前 16 字节：${hexHead(buf)}）`);
+        continue;
+      }
       // EACCES 等：**绝不抛**。用户把某份写成 0600 且属主不是 worker 就会走到这里。
       notes.push(`跳过 ${display}：读取失败（${errLabel(err)}）`);
       continue;
     }
-    const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
-    const text = buf.toString('utf8');
     if (text.trim() === '') continue; // 空 / 全空白：跳过（不产生空节）
-    const sha = crypto.createHash('sha256').update(buf).digest('hex');
+    // 去重键已改成规范化字节（去 BOM / CRLF / 首尾空白），**展示用的 text 仍是原文**：口径见 `dedupeKey`。
+    const sha = dedupeKey(text);
     if (seen.has(sha)) {
       notes.push(`跳过 ${display}：内容与 ${seen.get(sha)} 相同（去重，保留靠外那份）`);
       continue;
@@ -245,7 +375,8 @@ export function collectAgentsMd(options = {}) {
     const bodyBytes = Buffer.byteLength(body);
     if (truncated) {
       // marker 里的数字是**原文件字节数**与**实际注入的字节数**，命令可直接照抄（模型据此才读得到全文）。
-      body += `\n\n[已截断：原 ${buf.length} 字节，仅注入前 ${bodyBytes} 字节；看全文：cat ${display}]`;
+      // 原字节数取 `max(stat.size, buf.length)`：走前缀读时 `buf.length` 只是前缀长度，报它会骗模型（旧 L116 用例钉的就是真实大小）。
+      body += `\n\n[已截断：原 ${Math.max(sourceBytes, buf.length)} 字节，仅注入前 ${bodyBytes} 字节；看全文：cat ${display}]`;
     }
     blocks.push({
       dir: entry.dir,
