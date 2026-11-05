@@ -753,3 +753,70 @@ describe('附：加载时机', () => {
     expect(textOf(wrapper, 'tls-load-error')).toContain('需要管理员权限');
   });
 });
+
+// ---------------------------------------------------------------------------
+// ⑮ #462 链形态：inspect 的三条新告警码 + verify 的 reason 分句
+// ---------------------------------------------------------------------------
+
+describe('⑮ #462 链形态文案', () => {
+  it('inspect 的链告警码各自翻成人话（leaf-only / 顺序可疑 / 断链），且不丢条数', async () => {
+    stubDefault(statusDto(), {
+      inspect: () => jsonResponse(200, inspectDto({
+        warnings: ['chain_looks_leaf_only', 'chain_order_suspect', 'chain_broken'],
+      })),
+    });
+    const wrapper = await mountView();
+
+    await pasteAndInspect(wrapper);
+
+    const warnings = wrapper.findAll('[data-test="tls-warning"]').map((node) => node.text());
+    expect(warnings).toHaveLength(3);
+    expect(warnings[0]).toContain('只有叶子');
+    expect(warnings[0]).toContain('unable to verify the first certificate');
+    expect(warnings[1]).toContain('顺序可能是反的');
+    expect(warnings[2]).toContain('接不上');
+    // 未知码仍然被过滤掉（现状口径：不加登记 = 页面上看不见，所以后端每个新码都必须登记）
+    expect(wrapper.text()).not.toContain('chain_looks_leaf_only');
+  });
+
+  it('mismatch/chain_incomplete ⇒ 说清「指纹一致但只发了 1 张」并带上链深', async () => {
+    stubDefault(statusDto(), {
+      verify: () => jsonResponse(200, statusDto({
+        live: {
+          status: 'mismatch', checkedAt: iso(0), fingerprintSha256: FP_A, subjectCN: 'admin.fde.erix.vip',
+          reason: 'chain_incomplete', chainDepth: 1,
+        },
+      })),
+    });
+    const wrapper = await mountView();
+
+    await wrapper.get('[data-test="tls-live-check"]').trigger('click');
+    await flushPromises();
+
+    const text = textOf(wrapper, 'tls-live-mismatch');
+    expect(text).toContain('只发了 1 张证书');
+    expect(text).toContain('链深 1');
+    expect(text).toContain('unable to verify the first certificate');
+    expect(text).not.toContain('另一张');
+    // 指纹两侧照旧列出来（chain_incomplete 时它们**相等**，这正是要让人看见的事实）
+    expect(textOf(wrapper, 'tls-live-expected')).toBe(FP_A);
+    expect(textOf(wrapper, 'tls-live-actual')).toBe(FP_A);
+  });
+
+  it('mismatch/fingerprint_mismatch（以及老服务端没有 reason）⇒ 仍是「另一张证书」那句', async () => {
+    for (const live of [
+      { status: 'mismatch', checkedAt: iso(0), fingerprintSha256: FP_B, reason: 'fingerprint_mismatch' },
+      { status: 'mismatch', checkedAt: iso(0), fingerprintSha256: FP_B }, // 老服务端：没有 reason
+    ]) {
+      vi.unstubAllGlobals();
+      setActivePinia(createPinia());
+      stubDefault(statusDto(), { verify: () => jsonResponse(200, statusDto({ live })) });
+      const wrapper = await mountView();
+      await wrapper.get('[data-test="tls-live-check"]').trigger('click');
+      await flushPromises();
+      expect(textOf(wrapper, 'tls-live-mismatch')).toContain('另一张');
+      expect(textOf(wrapper, 'tls-live-mismatch')).not.toContain('链深');
+      wrapper.unmount();
+    }
+  });
+});

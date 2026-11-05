@@ -20,20 +20,25 @@ import {
   TlsCertError,
   certCoversHost,
   certificateDomains,
+  describeChain,
   describeTls,
   fingerprintOfPem,
+  inspectCertificate,
   keyMatchesCert,
+  parseCertificateChain,
   parseCertificatePem,
   parseDefaultGateway,
   parsePrivateKeyPem,
+  peerChainDepth,
   readPreviousCertificate,
+  selectLeaf,
   validateUpload,
   verifyLiveCertificate,
   writeCertificateAssets,
   rollbackCertificateAssets,
   readActiveCertificate,
 } from '../src/tls-cert.js';
-import { makeCert, makeExpiredCert } from './tls-fixtures.js';
+import { makeCert, makeChain, makeExpiredCert } from './tls-fixtures.js';
 
 const ADMIN_HOST = 'admin.fde.erix.vip';
 const WILDCARD = makeCert(); // CN=*.fde.erix.vip, SAN=*.fde.erix.vip,fde.erix.vip
@@ -41,6 +46,8 @@ const OTHER = makeCert({ cn: 'other.example', sans: ['other.example'] });
 const NO_SAN_CN = makeCert({ cn: ADMIN_HOST, sans: [] });
 const SAN_WITHOUT_ADMIN = makeCert({ cn: ADMIN_HOST, sans: ['other.example'] });
 const EXPIRED = makeExpiredCert();
+// #462：真三级链 root → intermediate → leaf（叶子 CN/SAN 覆盖 adminHost）。
+const CHAIN = makeChain();
 
 // ---------------------------------------------------------------------------
 // ① 通配符只匹配一层 / 大小写 / SAN 与 CN 的优先级
@@ -450,3 +457,329 @@ test('#456 verifyLiveCertificate：指纹一致 ⇒ live；不一致 ⇒ mismatc
 function OTHER_FP() {
   return parseCertificatePem(OTHER.certPem).fingerprintSha256;
 }
+
+// ---------------------------------------------------------------------------
+// ⑥ #462 链完整性（M1）：parseCertificateChain / selectLeaf / describeChain + C1–C7
+//
+// 判据来源：工单 `.work-orders/fix-261105-05-462-tls-chain.md` §1.2 的 C1–C7 判定表。
+// 每条都能被打红（变异取证见 `AGENTS.md` §8.100）。
+// ---------------------------------------------------------------------------
+
+test('#462 parseCertificateChain：逐段切分（fullchain=2 / with-root=3），空串与无段抛 tls_cert_invalid', () => {
+  const full = parseCertificateChain(CHAIN.fullchainPem);
+  assert.equal(full.blocks.length, 2, '叶子 + 中间 = 2 段');
+  assert.equal(full.pem.length, 2);
+  assert.equal(parseCertificatePem(full.pem[0]).subjectCN, 'admin.fde.erix.vip', '第 1 段是叶子');
+  assert.equal(parseCertificatePem(full.pem[1]).subjectCN, 'Test Intermediate CA');
+  assert.equal(parseCertificateChain(CHAIN.withRootPem).blocks.length, 3);
+  // 每段都是原样切片（不重新序列化）⇒ 与输入里的那一段逐字相同（落盘字节由调用方负责，这里只证不篡改）
+  assert.equal(full.pem[0], CHAIN.leafPem.trimEnd(), '第 1 段必须与用户提交的叶子 PEM 逐字相同');
+  assert.equal(full.pem[1], CHAIN.intermediatePem.trimEnd(), '第 2 段同理（不重排、不重新序列化）');
+  assert.throws(() => parseCertificateChain(''), (err) => err.code === 'tls_cert_invalid');
+  assert.throws(() => parseCertificateChain('no pem here'), (err) => err.code === 'tls_cert_invalid');
+});
+
+test('#462 selectLeaf：有私钥时找**配对的那段**（第二段也能找到）；无私钥取第一段；对不上 ⇒ index:-1', () => {
+  const blocks = parseCertificateChain(CHAIN.wrongOrderPem).blocks; // [中间, 叶子]
+  const keyObj = parsePrivateKeyPem(CHAIN.keyPem);
+  const picked = selectLeaf(blocks, keyObj);
+  assert.equal(picked.index, 1, '叶子在第二段 ⇒ index=1（`blocks[0]` 那种写法会把中间证书当叶子）');
+  assert.equal(parseCertificatePem(picked.leaf.toString()).subjectCN, 'admin.fde.erix.vip');
+
+  const noKey = selectLeaf(blocks);
+  assert.equal(noKey.index, 0, '没私钥就无法从密钥判断，按约定取第一段');
+  assert.equal(noKey.leaf, blocks[0]);
+
+  const wrongKey = selectLeaf(blocks, parsePrivateKeyPem(OTHER.keyPem));
+  assert.equal(wrongKey.index, -1, '一把对不上的私钥 ⇒ 没有任何一段配对');
+  assert.equal(wrongKey.leaf, blocks[0], '退回第一段，由调用方决定报什么');
+});
+
+test('#462 describeChain：三级链 links=[true,true]；自签单张 depth=1；**隔代不算**（leaf.checkIssued(root)=false）', () => {
+  const chain = describeChain(parseCertificateChain(CHAIN.withRootPem).blocks);
+  assert.deepEqual(chain, { depth: 3, links: [true, true] });
+  const leafAndRoot = describeChain([
+    new crypto.X509Certificate(CHAIN.leafPem),
+    new crypto.X509Certificate(CHAIN.rootPem),
+  ]);
+  assert.deepEqual(leafAndRoot.links, [false], '叶子不是根签的（隔了一代）⇒ 链断');
+  const selfSigned = describeChain([new crypto.X509Certificate(WILDCARD.certPem)]);
+  assert.deepEqual(selfSigned, { depth: 1, links: [] }, '单张自签的链就是 1 层，没有「接不上」这回事');
+  // 自签的自我签发关系成立（这就是「自签」的机器定义，也是 C4 不警告的根据）
+  const self = new crypto.X509Certificate(WILDCARD.certPem);
+  assert.equal(self.checkIssued(self), true);
+});
+
+test('#462 C1：叶子 + 中间（正确顺序）⇒ 200 语义，**无 chainWarnings**，cert 取叶子', () => {
+  const out = validateUpload({ certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.chainWarnings, [], 'bundle = 叶子 + 中间 是**期望形态**，不许警告');
+  assert.equal(out.cert.subjectCN, 'admin.fde.erix.vip', 'cert DTO 必须是叶子');
+  assert.deepEqual(out.cert.sans, ['admin.fde.erix.vip', '*.fde.erix.vip']);
+  assert.equal(out.cert.issuerCN, 'Test Intermediate CA');
+  assert.notEqual(
+    out.cert.fingerprintSha256,
+    parseCertificatePem(CHAIN.intermediatePem).fingerprintSha256,
+    '指纹必须是叶子的（不是第 1 段 = 中间证书）',
+  );
+});
+
+test('#462 C2：叶子 + 中间 + 根 ⇒ 通过且**不警告**（实测多发一张根无害）', () => {
+  const out = validateUpload({ certPem: CHAIN.withRootPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.chainWarnings, [], '带根证书不许警告（实测 3 层 + 严格校验 0 ok）');
+  assert.equal(out.cert.subjectCN, 'admin.fde.erix.vip');
+});
+
+test('#462 C3：只有叶子且非自签 ⇒ **通过**（警告不拒）+ chainWarnings=[chain_looks_leaf_only]', () => {
+  const out = validateUpload({ certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true, 'C3 的输入是「我知道我只有叶子」——可接受的自担风险，不许改成 400');
+  assert.deepEqual(out.chainWarnings, ['chain_looks_leaf_only']);
+});
+
+test('#462 C4：只有叶子且**自签** ⇒ 通过且无警告（自签的链就是 1 层）', () => {
+  const out = validateUpload({ certPem: WILDCARD.certPem, keyPem: WILDCARD.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.chainWarnings, []);
+});
+
+test('#462 C5：顺序反了（中间在前）⇒ 400 tls_cert_order_invalid，**不是** tls_key_mismatch', () => {
+  const out = validateUpload({ certPem: CHAIN.wrongOrderPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'tls_cert_order_invalid', '私钥是对的；报 tls_key_mismatch 是误导（#462 的病根）');
+  assert.notEqual(out.code, 'tls_key_mismatch');
+  assert.deepEqual(Object.keys(out.details).sort(), ['firstSubjectCN', 'leafSubjectCN']);
+  assert.equal(out.details.firstSubjectCN, 'Test Intermediate CA', 'details 必须点名「现在第一个是谁」');
+  assert.equal(out.details.leafSubjectCN, 'admin.fde.erix.vip', '以及「你的域名证书是哪张」');
+  assert.match(out.message, /第一个 BEGIN CERTIFICATE 必须是你的域名证书/);
+});
+
+test('#462 C7：段间接不上（混了别人的证书）⇒ 400 tls_cert_chain_broken + details 点名第几段', () => {
+  const out = validateUpload({
+    certPem: `${CHAIN.leafPem}${OTHER.certPem}`, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST,
+  });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'tls_cert_chain_broken');
+  assert.deepEqual(out.details, {
+    index: 1, // 段号从 1 起（与文案里的「第 N 段」同数）
+    subjectCN: 'admin.fde.erix.vip',
+    issuerCN: 'Test Intermediate CA',
+    nextSubjectCN: 'other.example',
+  });
+  assert.match(out.message, /第 1 段接不上/);
+});
+
+test('#462 C7：**同名不同钥的伪链** ⇒ checkIssued 仍判断链（字符串比 `subjectCN===issuerCN` 会放过）', () => {
+  // 伪中间证书：CN 与真中间证书**一样**，但它的签发者 CN 被写成叶子证书的 subject CN
+  // ⇒ `blocks[0].subjectCN === blocks[1].issuerCN` 成立（字符串比会说「接得上」），
+  // 而签名对不上（`checkIssued` 验签发者名 + 签名 + keyCertSign）⇒ 真的断链。
+  const lookalike = makeChain({ rootCN: 'admin.fde.erix.vip', intermediateCN: 'Test Intermediate CA' });
+  const forged = new crypto.X509Certificate(lookalike.intermediatePem);
+  const leaf = new crypto.X509Certificate(CHAIN.leafPem);
+  assert.equal(
+    parseCertificatePem(lookalike.intermediatePem).issuerCN,
+    parseCertificatePem(CHAIN.leafPem).subjectCN,
+    '前置：这条伪链在**字符串口径**下看起来是接得上的（否则这条用例证明不了 checkIssued 有牙）',
+  );
+  assert.equal(leaf.checkIssued(forged), false, '签名/密钥对不上 ⇒ 真断链');
+
+  const out = validateUpload({
+    certPem: `${CHAIN.leafPem}${lookalike.intermediatePem}`, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST,
+  });
+  assert.equal(out.ok, false, '同名不同钥的链发出去客户端一定验不过，必须拒');
+  assert.equal(out.code, 'tls_cert_chain_broken');
+});
+
+test('#462 inspect：C1/C3/C6/C7 的 warnings 与「cert 一律取叶子」', () => {
+  // C1：正确 bundle（有/无私钥都无警告）
+  const c1 = inspectCertificate({ certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.deepEqual(c1.warnings, []);
+  assert.equal(c1.cert.subjectCN, 'admin.fde.erix.vip');
+  assert.equal(c1.keyMatches, true);
+  assert.deepEqual(inspectCertificate({ certPem: CHAIN.fullchainPem, adminHost: ADMIN_HOST }).warnings, []);
+
+  // C2：带根同样无警告
+  assert.deepEqual(
+    inspectCertificate({ certPem: CHAIN.withRootPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST }).warnings,
+    [],
+  );
+
+  // C3：只有叶子（非自签）⇒ 警告
+  assert.deepEqual(
+    inspectCertificate({ certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST }).warnings,
+    ['chain_looks_leaf_only'],
+  );
+
+  // C6：顺序反了但**没私钥** ⇒ 只能警告（拿不到配对信息）
+  const c6 = inspectCertificate({ certPem: CHAIN.wrongOrderPem, adminHost: ADMIN_HOST });
+  assert.ok(c6.warnings.includes('chain_order_suspect'), `实际 warnings=${JSON.stringify(c6.warnings)}`);
+  assert.ok(!c6.warnings.includes('chain_broken'), '顺序可疑时不再叠一条「断链」（修法不同，会让人猜）');
+
+  // C7：接不上 ⇒ chain_broken
+  const c7 = inspectCertificate({
+    certPem: `${CHAIN.leafPem}${OTHER.certPem}`, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST,
+  });
+  assert.deepEqual(c7.warnings, ['chain_broken']);
+});
+
+test('#462 inspect：顺序反了**且有私钥** ⇒ 400 tls_cert_order_invalid（与 PUT 同码）', () => {
+  assert.throws(
+    () => inspectCertificate({ certPem: CHAIN.wrongOrderPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST }),
+    (err) => {
+      assert.equal(err.code, 'tls_cert_order_invalid');
+      assert.equal(err.httpStatus, 400);
+      assert.equal(err.details.firstSubjectCN, 'Test Intermediate CA');
+      assert.equal(err.details.leafSubjectCN, 'admin.fde.erix.vip');
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// ⑦ #462 真机校验（M2）：数链深，不只比指纹
+// ---------------------------------------------------------------------------
+
+test('#462 peerChainDepth：leaf-only ⇒ 1；带 issuer ⇒ 2；自签（Node 把自己当 issuer）⇒ 1；防环', () => {
+  const leafRaw = new crypto.X509Certificate(CHAIN.leafPem).raw;
+  const intRaw = new crypto.X509Certificate(CHAIN.intermediatePem).raw;
+  const leafFp = new crypto.X509Certificate(CHAIN.leafPem).fingerprint256;
+  const intFp = new crypto.X509Certificate(CHAIN.intermediatePem).fingerprint256;
+
+  assert.equal(peerChainDepth({ fingerprint256: leafFp, raw: leafRaw }), 1, 'leaf-only ⇒ 1 层');
+  assert.equal(
+    peerChainDepth({ fingerprint256: leafFp, raw: leafRaw, issuerCertificate: { fingerprint256: intFp, raw: intRaw } }),
+    2,
+    'fullchain ⇒ 2 层',
+  );
+  const self = new crypto.X509Certificate(WILDCARD.certPem);
+  assert.equal(
+    peerChainDepth({ fingerprint256: self.fingerprint256, raw: self.raw, issuerCertificate: { fingerprint256: self.fingerprint256, raw: self.raw } }),
+    1,
+    '自签时 Node 会把自己当 issuer ⇒ 不能数成 2 层',
+  );
+  // 防环：两个对象互相指向对方 ⇒ 停在重复指纹上（不会无限递归）
+  const a = { fingerprint256: 'AA', issuerCertificate: null };
+  const b = { fingerprint256: 'BB', issuerCertificate: a };
+  a.issuerCertificate = b;
+  assert.equal(peerChainDepth(a), 2);
+});
+
+test('#462 verifyLiveCertificate：指纹一致但链深 1 且非自签 ⇒ mismatch/chain_incomplete（带 chainDepth）', async () => {
+  const { EventEmitter } = await import('node:events');
+  const route = fakeRouteFile();
+  const expected = new crypto.X509Certificate(CHAIN.leafPem).fingerprint256;
+  const leafRaw = new crypto.X509Certificate(CHAIN.leafPem).raw;
+  const intRaw = new crypto.X509Certificate(CHAIN.intermediatePem).raw;
+  const intFp = new crypto.X509Certificate(CHAIN.intermediatePem).fingerprint256;
+  const makeConnect = (peer) => () => {
+    const sock = new EventEmitter();
+    sock.destroy = () => {};
+    sock.getPeerCertificate = (detailed) => {
+      assert.equal(detailed, true, '#462：必须传 true 才拿得到 issuerCertificate');
+      return peer;
+    };
+    setImmediate(() => sock.emit('secureConnect'));
+    return sock;
+  };
+
+  try {
+    // 链深 1（服务端只发了叶子）⇒ 指纹对也不算 live：客户端会 unable to verify the first certificate
+    const incomplete = await verifyLiveCertificate({
+      expectedFingerprint: expected,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({ fingerprint256: expected, raw: leafRaw }),
+    });
+    assert.equal(incomplete.status, 'mismatch', '指纹一致但链不完整 ⇒ 不能报 live');
+    assert.equal(incomplete.reason, 'chain_incomplete');
+    assert.equal(incomplete.chainDepth, 1);
+    assert.equal(incomplete.subjectCN, 'admin.fde.erix.vip');
+
+    // 链深 2 ⇒ live
+    const full = await verifyLiveCertificate({
+      expectedFingerprint: expected,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({
+        fingerprint256: expected,
+        raw: leafRaw,
+        issuerCertificate: { fingerprint256: intFp, raw: intRaw },
+      }),
+    });
+    assert.equal(full.status, 'live');
+    assert.equal(full.chainDepth, 2);
+    assert.equal(full.reason, undefined, 'live 不带 reason');
+
+    // 自签 + 链深 1 ⇒ live（自签的链就是 1 层）
+    const self = new crypto.X509Certificate(WILDCARD.certPem);
+    const selfSigned = await verifyLiveCertificate({
+      expectedFingerprint: self.fingerprint256,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({ fingerprint256: self.fingerprint256, raw: self.raw }),
+    });
+    assert.equal(selfSigned.status, 'live');
+    assert.equal(selfSigned.chainDepth, 1);
+
+    // 指纹不一致 ⇒ mismatch + reason:'fingerprint_mismatch'（现状语义不变，只多一个 reason）
+    const otherFp = new crypto.X509Certificate(OTHER.certPem).fingerprint256;
+    const mismatch = await verifyLiveCertificate({
+      expectedFingerprint: expected,
+      adminHost: ADMIN_HOST,
+      adminPort: 9443,
+      routePath: route.path,
+      connect: makeConnect({ fingerprint256: otherFp, raw: new crypto.X509Certificate(OTHER.certPem).raw }),
+    });
+    assert.equal(mismatch.status, 'mismatch');
+    assert.equal(mismatch.reason, 'fingerprint_mismatch');
+  } finally {
+    route.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑧ #462 / 安全文档 S4：回滚用 `copyFile`（不把私钥读进进程内存）
+// ---------------------------------------------------------------------------
+
+test('#462/S4 rollback：copyFile 语义——prev 与恢复出的两文件逐字节相同、模式仍是 644/600、零次读 prev 私钥', async () => {
+  const dir = tmpDynamicDir('s4rollback');
+  try {
+    await writeCertificateAssets({ dynamicDir: dir, certPem: WILDCARD.certPem, keyPem: WILDCARD.keyPem, log: quietLog() });
+    await writeCertificateAssets({ dynamicDir: dir, certPem: OTHER.certPem, keyPem: OTHER.keyPem, log: quietLog() });
+    const prevCertPath = path.join(dir, 'certs', 'prev', 'tls.crt');
+    const prevKeyPath = path.join(dir, 'certs', 'prev', 'tls.key');
+    const prevKeyBytes = fs.readFileSync(prevKeyPath);
+
+    // 包一层 fsImpl：记录每一次 readFile，用来证明回滚路径没读过 prev 的私钥
+    const readPaths = [];
+    const fsImpl = {
+      async stat(p, ...rest) { return fs.promises.stat(p, ...rest); },
+      async readFile(p, ...rest) { readPaths.push(p); return fs.promises.readFile(p, ...rest); },
+      async copyFile(a, b, ...rest) { return fs.promises.copyFile(a, b, ...rest); },
+      async chmod(p, m) { return fs.promises.chmod(p, m); },
+      async mkdir(p, o) { return fs.promises.mkdir(p, o); },
+      async unlink(p) { return fs.promises.unlink(p); },
+    };
+
+    const out = await rollbackCertificateAssets({ dynamicDir: dir, log: quietLog(), fsImpl });
+    assert.equal(out.tlsOut.published, true);
+    assert.equal(out.cert.subjectCN, '*.fde.erix.vip', '回滚后返回的是 prev 那一代');
+
+    const certPath = path.join(dir, 'certs', 'tls.crt');
+    const keyPath = path.join(dir, 'certs', 'tls.key');
+    assert.deepEqual(fs.readFileSync(keyPath), prevKeyBytes, '恢复出的私钥与 prev 里的**逐字节相同**');
+    assert.equal(fs.readFileSync(certPath, 'utf8'), fs.readFileSync(prevCertPath, 'utf8'));
+    assert.equal(fs.statSync(keyPath).mode & 0o777, TLS_KEY_MODE, '回滚后私钥必须仍是 0600');
+    assert.equal(fs.statSync(certPath).mode & 0o777, 0o644);
+    assert.ok(!readPaths.includes(prevKeyPath), '回滚**不许**把 prev 的私钥读进内存（copyFile 就够了）');
+    assert.ok(!readPaths.includes(keyPath), '恢复出的私钥同样不该被读过');
+    // 幂等：再回滚一次结论不变
+    assert.equal((await rollbackCertificateAssets({ dynamicDir: dir, log: quietLog(), fsImpl })).tlsOut.published, true);
+    assert.deepEqual(fs.readFileSync(keyPath), prevKeyBytes);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -88,17 +88,42 @@ async function readAsset(p, fsImpl) {
 }
 
 /**
+ * 只探测一份物料的**存在性与大小**，**绝不读字节**（#462 / 安全文档 S4：私钥读路径不碰正文）。
+ *
+ * 判据与 `readAsset` 逐条对齐（不是普通文件 / 空文件 / 缺失 / 读不了），**只是不 `readFile`**：
+ *   · `stat.size > 0` 就是「非空」——内容是不是一把合法的钥匙不归装载面管（那是上传时的事）；
+ *   · `mtimeMs` 是 fingerprint 里的 reload 把手（只换私钥不动证书时靠它变化）；
+ *   · 失败仍然不抛，语义与 `readAsset` 完全一致（调用方无需分支）。
+ */
+async function statAsset(p, fsImpl) {
+  try {
+    const st = await fsImpl.stat(p);
+    if (!st.isFile()) return { ok: false, code: 'not-file', reason: `${p} 不是普通文件` };
+    if (!(st.size > 0)) return { ok: false, code: 'empty', reason: `${p} 是空文件` };
+    return { ok: true, mtimeMs: st.mtimeMs, size: st.size };
+  } catch (err) {
+    const code = err?.code ?? 'unknown';
+    return { ok: false, code: code === 'ENOENT' ? 'missing' : 'unreadable', reason: `${p} 读取失败（${code}）` };
+  }
+}
+
+/**
  * 探测证书物料是否齐备。
  * fingerprint = `sha256:<证书字节哈希> keymtime=<私钥 mtimeMs>`：
  *   · 证书换新 ⇒ 哈希变；只换私钥（证书不变）⇒ mtime 变。两者都覆盖，且**不含私钥内容的任何派生值**。
  *   · 这一行是给 #456 的 reload 把手：Traefik 的 file provider 是文件驱动的，只替换 certs/* 而不动
  *     tls.yml 可能不触发 reload（证书文件本身不是被 watch 的配置文件），改这一行必然触发。
+ *
+ * **私钥只 `stat`，不 `readFile`**（#462 / 安全文档 S4）：portal 的读路径永不接触私钥字节，
+ * 只有上传那一刻必须接收管理员递来的。副作用（好的那种）：以非 root 身份跑时
+ * `GET /api/admin/tls` 不再因为「私钥读不动」而报 `unreadable`。
  */
 export async function readTlsAssets({ dynamicDir, fsImpl = fs.promises } = {}) {
   const { certPath, keyPath, target } = tlsPaths(dynamicDir);
   const cert = await readAsset(certPath, fsImpl);
   if (!cert.ok) return { ok: false, target, code: cert.code, reason: cert.reason, certPath, keyPath };
-  const key = await readAsset(keyPath, fsImpl);
+  // ⚠ 这里是 S4 的全部：私钥走 `statAsset`（只看 size / mtimeMs），**没有 readFile(keyPath)**。
+  const key = await statAsset(keyPath, fsImpl);
   if (!key.ok) return { ok: false, target, code: key.code, reason: key.reason, certPath, keyPath };
   const digest = crypto.createHash('sha256').update(cert.buf).digest('hex');
   return {

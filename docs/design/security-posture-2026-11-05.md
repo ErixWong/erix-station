@@ -22,7 +22,7 @@
 | FDE 容器能改 Traefik 规则吗？ | **不能**（无 dynamic 目录挂载、无 docker socket、无写 API） |
 | 那「规则被篡改」的真实入口是什么？ | **portal 被攻破**（它 root + RW 挂载 dynamic）或**宿主 shell** |
 | 被篡改后最坏能怎样？ | 把宿主 2222/9000/4100 暴露到公网域名；劫持别人的预览流量；**读走 TLS 私钥**（见 R4） |
-| 已经做对的部分 | `internal` API 用 **per-container bearer token**；`deploy/fde-proxy` 对建容器是**字段级 allowlist**；Traefik 对 dynamic 目录只读 |
+| 已经做对的部分 | `internal` API 用 **per-container bearer token**；`deploy/fde-proxy` 对建容器是**字段级 allowlist**；Traefik 对 dynamic 目录只读；**portal 的读路径不接触 TLS 私钥字节**（#462 / S4 已落地，见 §2.5） |
 
 ---
 
@@ -112,11 +112,18 @@ user/pids/memory 受限、env 键白名单。**所以「portal 被攻破后起�
 
 | 路径 | 是否接触私钥**字节** |
 |---|---|
-| `tlsassets.js#readTlsAssets`（每次路由物化 + `GET /api/admin/tls`） | **是**（为了算 `keymtime` 指纹把整份私钥读进内存）→ R4 |
-| `PUT /api/admin/tls` | 是（管理员递过来的新私钥，必须写盘） |
-| `rollbackCertificateAssets` | 是（`readFile` 再 `write`）→ 可改 `copyFile` |
-| `verifyLiveCertificate` | **否**（只比对证书指纹） |
+| `tlsassets.js#readTlsAssets`（每次路由物化 + `GET /api/admin/tls`） | **否 —— 只 `stat`**（`size > 0` + `mtimeMs` 算 `keymtime`，不 `readFile`）✅ **#462 / S4 已落地** |
+| `PUT /api/admin/tls` | 是（管理员递过来的新私钥，必须写盘——这是唯一必须的接触点） |
+| `rollbackCertificateAssets` | **否**（`fs.copyFile`，私钥不进进程内存）✅ **#462 / S4 已落地** |
+| `verifyLiveCertificate` | **否**（只比对证书指纹 + 数链深） |
 | Traefik 读 `certs/tls.key` | 是（必须，属主 root + 0600，见 `edge-routing.md` §5） |
+
+> **S4 落地记录（#462，2026-11-05）**：`readTlsAssets` 对 `certs/tls.key` 改为 `statAsset()`（只 `stat`，
+> 判据仍是「普通文件 + `size > 0`」），回滚改 `fs.copyFile`（+ 显式 `chmod` 644/600）。
+> 判据在 `portal/test/tls-assets.test.js`（注入 EACCES 的 `readFile` 仍判「有证书」、真 `chmod 000` 非 root 下同样）
+> 与 `portal/test/tls-cert.test.js`（回滚后两文件逐字节相同 + 零次读 `prev/tls.key`）。
+> **残余**：`PUT` 那一刻必须把私钥读进内存（管理员递交的字节），这条不可消除；`readPreviousCertificate`
+> 只 `stat` 备份私钥（`keyPresent`），也不读字节。
 
 ---
 
@@ -160,10 +167,13 @@ user/pids/memory 受限、env 键白名单。**所以「portal 被攻破后起�
 
 ### R4（高）portal 被攻破 ⇒ **TLS 私钥可被读出**
 
-- **现状**：`readTlsAssets()` 为了算 `keymtime` 把 `certs/tls.key` **整份读进内存**（每次路由物化、每次 `GET /api/admin/tls`）。
+- **现状（2026-11-05 记录）**：`readTlsAssets()` 为了算 `keymtime` 把 `certs/tls.key` **整份读进内存**（每次路由物化、每次 `GET /api/admin/tls`）。
 - **影响**：私钥是 `*.fde.erix.vip` 的 LE 证书（到 2027-02-03）⇒ 泄露后可冒充平台全部子域（含管理台、全部预览）。
 - **现有缓解**：私钥 0600 root、只在 portal 容器内可读；响应/审计/日志里从不出现。
-- **建议**：S4（读路径改 `stat`，回滚改 `copyFile`）——**便宜且直接砍掉这一格**。
+- **✅ 已处置（#462 / S4，2026-11-05）**：读路径改 `stat`、回滚改 `copyFile` ⇒ **portal 的读路径永不接触私钥字节**
+  （只剩 `PUT` 那一刻必须接收管理员递来的私钥）。**残余风险**：portal 进程一旦被攻破，仍可**主动**去
+  `readFile(certs/tls.key)`（它是 root 且文件就在它的可写目录里）——S4 砍掉的是「日常读写路径上的无意暴露面」，
+  不是「被攻破后的能力」。要真正砍掉后者得动权限模型（S6 那类结构性收敛）。
 
 ### R5（中）Traefik 规则文件被手改不会被发现
 
@@ -205,11 +215,11 @@ user/pids/memory 受限、env 键白名单。**所以「portal 被攻破后起�
 | **S1** | **`#233` 宿主 INPUT 收紧**：只放行 FDE 网段 → `8090/8443/9443`，其余（9000/2222/3306/4100…）DROP；幂等 + fail-closed | R1、R2、R7 | 中（要写 iptables 脚本 + 演练 + 回滚） | **最高**：一次消灭"容器直连宿主控制面" | 独立 issue `#233`，未开工 |
 | **S2** | **路由后端白名单不变量**：`generateTraefikConfig` 只允许 `portalBackendUrl` 与「DB 里活着的 `port_allocations` 算出的 `10.x.x.2:<port>`」，其它一律抛错 | R3 | 低（一个校验函数 + 几条用例） | 让"指向 `127.0.0.1:22` 的路由"在生成器层就生不出来 | 未开工 |
 | **S3** | **路由文件漂移对账**：portal 定时（如 60s）重算 `routes.yml` 与盘上比对，不一致 ⇒ 覆盖 + 审计 `admin.routes_drift_corrected` + 告警 | R3、R5 | 低 | 手改/误改被自愈并留痕 | 未开工 |
-| **S4** | **私钥读取收窄**：`readTlsAssets` 用 `stat` 取 `mtimeMs`/大小（不读字节）；回滚用 `fs.copyFile` | R4 | 很低 | portal 读路径永不接触私钥字节（只有上传那一刻必须接收） | 未开工 |
+| **S4** | **私钥读取收窄**：`readTlsAssets` 用 `stat` 取 `mtimeMs`/大小（不读字节）；回滚用 `fs.copyFile` | R4 | 很低 | portal 读路径永不接触私钥字节（只有上传那一刻必须接收） | **✅ 已实现**（#462，2026-11-05；判据见 §2.5 落地记录） |
 | **S5** | 用户面上 HTTPS（复用现成 `*.fde.erix.vip` 证书） | R6 | 中 | 消灭明文口令/会话 | 未开工 |
 | S6 | 把"发布路由"拆成独立最小进程（只读 DB、只写一个文件，无 docker/DB 写权限） | R3/R4 的深层 | 高（重排启动与权限模型） | 结构性收敛 | 暂不建议 |
 
-**优先级建议**：S4（半天，砍掉私钥泄露那一格）→ S2 + S3（一天，把"规则可被任意改写"关掉）→ S1（单独设计 + 演练）→ S5。
+**优先级建议**：~~S4（半天，砍掉私钥泄露那一格）~~ **已完成** → S2 + S3（一天，把"规则可被任意改写"关掉）→ S1（单独设计 + 演练）→ S5。
 
 ---
 

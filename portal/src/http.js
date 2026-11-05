@@ -1795,6 +1795,10 @@ async function handleAdminTlsPut(req, res, ctx, session) {
       fingerprintSha256: result.cert.fingerprintSha256,
       notAfter: result.cert.notAfter,
       backupCreated: written.backup !== null,
+      // #462：链形态的**非阻断**告警（只有非空时才写，老行形状不变）。零 DDL：只进 audit.details（jsonb）。
+      ...(Array.isArray(result.chainWarnings) && result.chainWarnings.length > 0
+        ? { chainWarnings: result.chainWarnings }
+        : {}),
     },
   }).catch(() => {});
 
