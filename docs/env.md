@@ -70,6 +70,13 @@ P1 本地开发（写代码、起栈联调）只需：
 
 Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据经环境变量注入，不写进配置文件。
 
+> **⚠️ 2026-11-05 修订（issue #450 决策记录）：ACME / DNS-01 那条**今天**没有实现，本仓也没有
+> `certificatesResolvers` 段。已落地的只有「**证书由运维手工放置、到期人工更换**」这一条：
+> 证书文件放 `<TRAEFIK_DYNAMIC_DIR_HOST>/certs/tls.crt` + `tls.key`（644 / 600），portal 的
+> `tlsassets` 会把它们物化成 `dynamic/tls.yml`（两文件齐才生成，缺任一就删掉该文件）。
+> 管理台入口 `adminsecure` 用它；上传/校验/回滚是 #456 的范围。细节见
+> [`deploy/edge-routing.md`](deploy/edge-routing.md) §5。上面三行保留为**未实现的既定方向**，不是现状。
+
 ## 3. 网络可达性与出口参数
 
 > 🕓 「平台可达性」（VPN-only / 公网可达性）为**部署期事项（P1 开发不需要）**，开发期 127.0.0.1 即可，见 §0（决策者 2026-09，issue #3 评论）。出口管控行仍为部署前置条件，与本节标注互不冲突。
@@ -108,6 +115,7 @@ Traefik 侧对应配置：`certificatesResolvers.le.acme.dnsChallenge`，凭据�
 |---|---|---|---|
 | `TRAEFIK_WEB_PORT` | Traefik `web` entrypoint 的监听端口（Traefik 跑 **host 网络**，独占；对外唯一入口之一。H-B 定稿，issue #5） | 平台规范固定（规格 §5：只有 ingress 占 80/443）+ 目标环境探测（可用性，见 §9） | `80` |
 | `TRAEFIK_WEBSECURE_PORT` | Traefik `websecure` entrypoint 的监听端口（同上，host 网络） | 同上 | `443`（目标环境冲突未解时过渡用 `8443`，见 §5.1 与 §8.3） |
+| `TRAEFIK_ADMIN_PORT` | **管理台入口** `adminsecure` 的端口（#450 D0 定为 `9443`；避开 80/443/8090/8443 与号池 22000–29999）。⚠️ **两处耦合**：Traefik 真正 listen 的端口写在 `deploy/traefik/traefik.yml` 的 `adminsecure.address` 里**字面量**（静态文件不做 `${VAR}` 插值，实测见 `deploy/edge-routing.md` §4），而 `station-edge` 是 `network_mode: host`（宿主端口 = 容器端口，没有 `ports:` 可跟着 env 走）⇒ **改端口要同时改这两处，并且重启边缘**（静态配置只在启动时读）。两处一致性由 `portal/test/deploy-env-defaults.test.js` 机器判据钉住。管理台**不提供**端口写入口（写错静态配置 = 整个边缘起不来） | 部署面 `deploy/.env`（决策者 2026-11-05 定 9443） | `9443` |
 | portal 8080 | portal 服务端口，**publish 仅 `127.0.0.1:8080`（回环）**：portal 在 `backend` 网络，回环 publish 供 Traefik（host 网络）反代与 forwardAuth；不暴露 LAN（H-B 定稿 D-3，issue #5，规格 §5） | 平台规范固定 + 目标环境探测（回环 8080 可用性，§9 第 7 项） | `127.0.0.1:8080`（⚠️ 参考实例 A 上宿主 8080 已被 `gitea_act_runner` 占用，见 §8.2——该机部署需迁移占用者或改 publish 端口） |
 | LiteLLM 数据面/管理面 | `station-litellm` 仅在 `litellm` profile 启动；宿主只发布到 `127.0.0.1`，默认端口由 `LITELLM_HOST_PORT` 控制。Traefik 通过 `LLM_GATEWAY_HOST` 访问；portal 容器内 AI-title 使用 `LLM_GATEWAY_ADMIN_URL`（backend 地址） | 平台规范固定 + 目标环境探测 | `127.0.0.1:4100`（默认） |
 | station-db 5432 | 数据库端口，**仅 `backend` 网络内**（H-B：`control` 已取消），不 publish 宿主机；station-db 是独立 postgres 容器，与宿主既有实例互不可见 | 平台规范固定 | —（同上） |
@@ -297,6 +305,9 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `LLM_HOST` | 平台规范固定 = `llm.` + `BASE_DOMAIN`（§1；容器内 hosts 注入解析为主、不依赖 DNS；伞域下顺带被泛解析覆盖） | `llm.fde.erix.vip` |
 | `TRAEFIK_WEB_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `80` |
 | `TRAEFIK_WEBSECURE_PORT` | 平台规范固定 + 目标环境探测可用性（§5/§9） | `443`（冲突未解时 `8443`，见 §5.1/§8.3） |
+| `TRAEFIK_ADMIN_PORT` | 管理台入口端口（#450 D0 定 `9443`）；**必须与 `deploy/traefik/traefik.yml` 的 `adminsecure.address` 字面量一致**，改了两处都要改并重启边缘（§5，`deploy/edge-routing.md` §4） | `9443` |
+| `ADMIN_PUBLIC_HOST` | 管理台对外 host。留空 ⇒ `admin.<BASE_DOMAIN>`（现网 `admin.fde.erix.vip`，泛解析已覆盖，零 DNS 动作）；非法形态（大写/下划线/空标签/超长/含换行）**回退默认并 warn**，不拦启动（#450 D1） | 空（= `admin.fde.erix.vip`） |
+| `ADMIN_IP_ALLOWLIST` | 管理台入口的来源白名单（逗号分隔 CIDR）。**空 = 不挂 `ipAllowList` = 放行全部**（= 现状，不破坏现网）；非空 ⇒ 三条管理台 router 都挂。单个非法条目丢弃并 warn、全部非法则额外 warn「入口不再受限」。⚠️ 引擎侧实测：`sourceRange` **不能为空数组**（Traefik 打 `ERR sourceRange is empty, IPAllowLister not created` 且中间件不生效 ⇒ 路由回落 catch-all 静默放行）⇒ 生成器在空清单时**根本不输出**该中间件 | 空 |
 | `BACKEND_SUBNET` | 平台规范固定（deploy-contract.md §2.1）；须避开宿主既有网段 | `172.30.0.0/24`（开发期本机为 `172.32.0.0/24`，见 §0） |
 | `PORTAL_HOST_PORT` | 平台规范固定（portal publish 仅回环 `127.0.0.1`，容器内固定 8080） | `8080`（开发期本机为 `18080`，见 §0） |
 | `ACME_EMAIL` | 决策者提供（§2 ⚠️） | 待填 |

@@ -33,6 +33,7 @@
 | [`data/model.md`](data/model.md) | **数据模型说明**：表用途、字段语义、状态机、三份数据边界、归档与记账口径 | ✅ |
 | [`testing.md`](testing.md) | **测试与验收契约（D5）**：测试分层与命令表、隔离约定（路径注入/临时栈/伪造 FDE 容器）、必测清单（网络隔离/认证/文件物化/崩溃恢复/路由发布/API 契约/浏览器验证）、验收判定与门禁、已知不可测项 | ✅ |
 | [`ops/deployment-2026-10-10.md`](ops/deployment-2026-10-10.md) | **实际部署成了什么样**（与 `design/deploy-contract.md` 的「应该是什么样」对照）：服务/镜像/端口/凭据与已接受偏差 | ✅ |
+| [`deploy/edge-routing.md`](deploy/edge-routing.md) | **边缘入口与路由（#450）**：两个 host（用户面 `station.<伞域>` / 管理台 `admin.<伞域>`）× 两个入口（`web` / `adminsecure:9443`）的能力矩阵、双向 deny 的语义与实现（`ipAllowList` 恒拒 + 404 + `noop@internal`）、`ADMIN_IP_ALLOWLIST` 的来源收紧、`dynamic/tls.yml` 证书装载面（两文件齐才生成、fingerprint 注释当 reload 把手）与「首次证书人工落盘」的鸡生蛋、`${VAR}` 在静态配置里不插值的实测 | ✅ |
 | [`ops/ci-release.md`](ops/ci-release.md) | **CI 与 GHCR 发布 runbook（#235）**：质量门禁口径、分钟预算语义、发布→部署的 digest pin、测试基线数字的同步义务 | ✅ |
 | [`ops/transcript-ledger-inspection.md`](ops/transcript-ledger-inspection.md) | **会话账本巡检与修数据口径（#341 / 上游 #415）**：链式 `partOf` 的只读巡检 SQL（期望 0）+ 会话/轮定位、递归解链到链头的可重放幂等 UPDATE、备份/演练/回滚与复验口径；同时标注「站内投影已解链、引擎 resume 仍需修数据」 | ✅ |
 | [`ops/drill-2026-10-12.md`](ops/drill-2026-10-12.md) | **平台演练记录 ②（2026-10-12 夜班）**：v0.1.3 发布与按 digest 部署（imageId/repoDigest 双校）、新工位 `todo` 开户全链、平台 agent 交付前后端分离 to-do 的浏览器真机结论，**预览域名下跑通一个普通前后端分离应用的 6 条要求链（3 条未告知 → #257/#258）**，单 B 预览端口 UI 真机验收，新一批操作坑 （含 **§八 复测 R-1 通过**：一条消息 0 返修） | ✅ |

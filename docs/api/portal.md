@@ -101,6 +101,15 @@
 >
 > 容器 → portal 的内部端点（`/api/internal/*`）见 §9（经 Traefik：`https://station.<base>/api/internal/*` + 来源 ipAllowList，H-B 定稿 D-5），不属上表。
 
+> ⚠ **`/api/admin/*` 在边缘就不可达（#450，工单 `feat-261105-01`）**：上表里所有 `管理` 端点**只能从管理台入口**
+> （`https://admin.<伞域>:9443`，`ADMIN_PUBLIC_HOST` / `TRAEFIK_ADMIN_PORT`）访问。从用户入口
+> （`station.<伞域>`，80/8090）打 `/api/admin/*` 得到的是**边缘返回的 `404`**（Traefik 的隔离 deny 路由，
+> 优先级高于 portal 路由）——**不是 portal 的 `403 forbidden` / `404 not_found`**，也不会产生任何到 portal 的请求。
+> 因此：① 看到 `403 forbidden` 说明请求已经到了 portal（即走的是管理台入口）；② 看到 `404` 且响应体是
+> `Not Found`（无 JSON 错误信封）说明被边缘挡了。管理台 host 上除 `/api/admin/*`、`/api/auth/*`、`/api/me`
+> 之外的 `/api/*`（如 `/api/sessions`）同样在边缘返回 `404`。矩阵与实现见
+> [`../deploy/edge-routing.md`](../deploy/edge-routing.md) §2/§3。
+
 ---
 
 ## 1. 通用约定

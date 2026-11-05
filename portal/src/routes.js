@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './fsutil.js';
+import { materializeTlsAssets } from './tlsassets.js';
 import { parseCidr } from './ipam.js';
 import { enqueueRouteChange } from './outbox.js';
 
@@ -143,6 +144,12 @@ export function generateTraefikConfig({
   entryPoint,
   allocations,
   sourceRanges,
+  // issue #450（feat-261105-01）：管理台独立入口。三者缺省（adminHost == null）时**不生成管理台段**——
+  // 单入口老部署的 routes.yml 字节不变（既有字节快照继续成立）；生产路径由 config.js 恒提供（adminHost
+  // 永远有值：显式 env 或 admin.<baseDomain>），所以「没生成」只可能是调用方显式不带。
+  adminHost = null,
+  adminEntryPoint = null,
+  adminIpAllowlist = [],
 }) {
   // F9：渲染边界严格校验，拒绝换行/控制字符/非法字符（DB 无 CHECK，代码层挡）。
   if (!isValidHostname(portalHost)) throw new Error(`invalid portal hostname: ${JSON.stringify(portalHost)}`);
@@ -158,6 +165,13 @@ export function generateTraefikConfig({
   // entryPoint 裸拼进 entryPoints flow list（不加引号），须命中安全 token 白名单（F5 注入面收口）。
   assertSafeToken(entryPoint, 'entryPoint');
   assertHttpUrl(portalBackendUrl, 'portalBackendUrl');
+  // #450：管理台入口/白名单同一口径校验（fail-closed：非法 host/entrypoint/CIDR 直接拒渲染，不落半截配置）。
+  const adminEnabled = adminHost != null && adminHost !== '';
+  if (adminEnabled) {
+    if (!isValidHostname(adminHost)) throw new Error(`invalid admin hostname: ${JSON.stringify(adminHost)}`);
+    assertSafeToken(adminEntryPoint, 'adminEntryPoint');
+    for (const r of adminIpAllowlist) parseCidr(r);
+  }
 
   const forwardAuthAddress = `${portalBackendUrl.replace(/\/$/, '')}/api/forward-auth`;
   const lines = ['http:'];
@@ -176,6 +190,66 @@ export function generateTraefikConfig({
   lines.push('      priority: 200');
   lines.push('      middlewares: [internal-allow]');
   lines.push('      service: portal');
+
+  // ---- issue #450 D2：管理台独立入口（adminsecure）与双向 deny ----
+  // 边界口径：「能力由 host + entrypoint 的交集决定」——管理台入口只挂 ① SPA 静态 ② /api/admin/*
+  // ③ /api/auth/* + /api/me；用户入口则把 /api/admin/* 用更高优先级的 deny 路由抬走。
+  // 优先级取 300（> internal 200 > portal 100）：internal 的规则只匹配 /api/internal、与 /api/admin
+  // 路径不交，本可以取 150；但那样「deny 是否生效」就取决于「路径永不重叠」这条隐式前提，改天有人给
+  // internal 扩前缀就会静默失效。300 把不变量写成「deny 永远压过一切本地路由」，不依赖路径互斥推理。
+  //
+  // deny 实现 = ipAllowList(空集) + rejectStatusCode: 404，service 指 noop@internal：
+  //   · Traefik v3.7 没有「直接返状态码」的中间件（headers 只有 customResponseHeaders，实测 binary
+  //     里无 customResponseCode）；能稳定产出 404 且**不碰任何后端**的就这一条。
+  //   · sourceRange 用 RFC 5737 TEST-NET-1（192.0.2.0/24，文档专用、永不可路由）⇒ 永不匹配真实客户端；
+  //     ⚠ 不能用空数组：实测 Traefik 会 `ERR sourceRange is empty, IPAllowLister not created`（中间件
+  //     根本不存在，路由回落 catch-all → 静默放行）。
+  //   · service noop@internal 是 Traefik 内建服务（永远不会被真正请求到；万一 deny 中间件没生效，
+  //     得到的是 Traefik 自己的 418，而不是把请求代理给 portal——fail-closed）。
+  if (adminEnabled) {
+    // allowlist 为空 ⇒ 三条管理台路由**不带任何 middlewares 行**（不是 `[]`、也不是空 sourceRange：
+    // 后者实测会被 Traefik 拒建中间件并打 ERR，前者只是无意义的噪音）。
+    const adminMw = adminIpAllowlist.length > 0 ? ['      middlewares: [admin-allow]'] : [];
+    lines.push('    admin-api:');
+    lines.push(`      entryPoints: [${adminEntryPoint}]`);
+    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && PathPrefix(\`/api/admin\`)`)}`);
+    lines.push('      priority: 200');
+    lines.push(...adminMw);
+    lines.push('      service: portal');
+    lines.push('      tls: {}');
+    lines.push('    admin-auth:');
+    lines.push(`      entryPoints: [${adminEntryPoint}]`);
+    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && (PathPrefix(\`/api/auth\`) || PathPrefix(\`/api/me\`))`)}`);
+    lines.push('      priority: 200');
+    lines.push(...adminMw);
+    lines.push('      service: portal');
+    lines.push('      tls: {}');
+    lines.push('    admin-spa:');
+    lines.push(`      entryPoints: [${adminEntryPoint}]`);
+    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`)`)}`);
+    lines.push('      priority: 100');
+    lines.push(...adminMw);
+    lines.push('      service: portal');
+    lines.push('      tls: {}');
+    // 用户入口：挡掉 /api/admin/*（#450 D2/D6）。挂与 portal 同一 entrypoint（而不是硬写 web+websecure）：
+    // 用户面全部路由都由 config.traefikEntryPoint 决定，deny 跟着它走才不会在「把用户面切到另一个入口」
+    // 时留下一个洞。websecure 今天一条路由都不挂（8443 本来就是全 404），在那里加 deny 没有保护价值。
+    lines.push('    admin-deny-user:');
+    lines.push(`      entryPoints: [${entryPoint}]`);
+    lines.push(`      rule: ${yq(`Host(\`${portalHost}\`) && PathPrefix(\`/api/admin\`)`)}`);
+    lines.push('      priority: 300');
+    lines.push('      middlewares: [admin-deny]');
+    lines.push('      service: noop@internal');
+    // 管理台入口：除三条白名单外的所有 /api/* 也走同一个 deny（「每个入口只够得到自己那套 API」）。
+    // 用**显式排除规则**而不是「先匹配 catch-all 再靠顺序」：规则本身可读、可断言。
+    lines.push('    admin-deny-api:');
+    lines.push(`      entryPoints: [${adminEntryPoint}]`);
+    lines.push(`      rule: ${yq(`Host(\`${adminHost}\`) && PathPrefix(\`/api\`) && !PathPrefix(\`/api/admin\`) && !PathPrefix(\`/api/auth\`) && !PathPrefix(\`/api/me\`)`)}`);
+    lines.push('      priority: 300');
+    lines.push('      middlewares: [admin-deny]');
+    lines.push('      service: noop@internal');
+    lines.push('      tls: {}');
+  }
 
   const routerNames = [];
   for (const a of allocations) {
@@ -208,6 +282,25 @@ export function generateTraefikConfig({
   lines.push('    internal-allow:');
   lines.push('      ipAllowList:');
   lines.push(`        sourceRange: ${ylist(sourceRanges)}`);
+  if (adminEnabled) {
+    // #450 D2：隔离 deny——恒拒 + 返 404 + **不代理到任何后端**。
+    // 为何是 ipAllowList 而不是别的：v3.7 没有「直接返状态码」的中间件；ipAllowList 的
+    // rejectStatusCode 是唯一能指定 404 的旋钮，而 sourceRange 取 RFC 5737 文档网段（192.0.2.0/24，
+    // 不可路由、永不出现真实客户端）即「恒拒」。空 sourceRange 实测被 Traefik 拒建（见上方注释）。
+    lines.push('    admin-deny:');
+    lines.push('      # #450 隔离 deny：恒拒并返 404（不代理到 portal，也不落任何服务）');
+    lines.push('      ipAllowList:');
+    lines.push('        sourceRange: ["192.0.2.0/24"]');
+    lines.push('        rejectStatusCode: 404');
+    if (adminIpAllowlist.length > 0) {
+      // #450 D4：来源白名单（空清单时**根本不输出本中间件**——空 sourceRange 会被 Traefik 拒建，
+      // 且「挂了一个不存在的中间件」比不挂更危险：路由会被禁用）。
+      lines.push('    admin-allow:');
+      lines.push('      # #450 D4：管理台入口来源白名单（ADMIN_IP_ALLOWLIST）；空清单时不生成本中间件');
+      lines.push('      ipAllowList:');
+      lines.push(`        sourceRange: ${ylist(adminIpAllowlist)}`);
+    }
+  }
 
   lines.push('  services:');
   lines.push('    portal:');
@@ -508,6 +601,10 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
     entryPoint: config.traefikEntryPoint,
     allocations: state.allocations,
     sourceRanges: state.sourceRanges,
+    // #450：管理台入口（config.js 恒提供；直接调用本函数且不带 adminHost 的老测试保持单入口快照）。
+    adminHost: config.adminHost,
+    adminEntryPoint: config.traefikAdminEntryPoint,
+    adminIpAllowlist: config.adminIpAllowlist ?? [],
   });
   validateTraefikConfig(text, state.allocations);
   const llmText = generateLlmTraefikConfig({
@@ -572,10 +669,24 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
     }
     throw err;
   }
+
+  // 第 3 步：#450 D5 证书装载面。与上面两份路由文件同一轮物化，但**失败隔离**：
+  // 证书面坏了只降级成「管理台入口用 Traefik 内建自签证书」，不许拖垮用户面与全部预览。
+  let tlsOut;
+  try {
+    tlsOut = await materializeTlsAssets({ dynamicDir: config.traefikDynamicDir, log });
+  } catch (err) {
+    log.warn?.(`[routes] tls.yml 物化异常（不影响路由）：${err.message}`);
+    tlsOut = { target: '', published: false, reason: err.message };
+  }
+
   return {
     target,
     llmTarget,
     llmPublished: llmText !== null,
+    // #450 D5：tls.yml 与两份路由文件**互不重叠、各自独立物化**（证书换新不需重启边缘）。
+    tlsTarget: tlsOut.target,
+    tlsPublished: tlsOut.published,
     allocations: state.allocations.length,
     sourceRanges: state.sourceRanges,
     llmBindings: state.llmBindings.length,
