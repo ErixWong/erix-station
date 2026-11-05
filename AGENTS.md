@@ -3509,3 +3509,46 @@ worker 另跑 3 条（预览路由挂管理台入口 / deny 不挡 `/api/admin` 
 进不去就传不了证书），必须覆盖 `admin.<伞域>`；不放则管理台用 Traefik 内建自签证书应答（`__Host-` cookie 仍成立）。
 ⚠ **A2 未做前不要部署**：用户入口已经 deny `/api/admin/*`，而管理台 SPA 仍随用户面下发、不会自动跳管理台
 ⇒ 现网在用户 host 上打开 `#/admin…` 会「页面在、API 全 404」。A2 = host-aware 跳转（#450 D3）。
+
+### 8.93 #450 A2：host 闸（用户面 ↔ 管理台跨 host 跳转）——不跳就是「页面在、API 全 404」（2026-11-05）
+
+A1（§8.92）把**边缘**隔离做实了，但 SPA 还是同一份、两个 host 都下发。于是「在用户 host 上打开
+`#/admin/users`」= 页面渲染得出来、**所有管理 API 404**（用户入口 deny `/api/admin/*`）；反方向
+「管理台 host 上打开 `#/session/<id>`」= `/api/sessions` 被 deny。⇒ A2 只做一件事：**发现自己在错的 host 上就换地址**。
+**D3 未变**：不改成 path 路由、不拆两份产物、hash 路由形态一字不动。
+
+**载荷（19 文件，前后端各一半）**
+
+| 面 | 落点 |
+|---|---|
+| 后端 | `GET /api/site`（**公开、零秘密**）：`{userBaseUrl, adminBaseUrl}`，两个值都取既有配置（`resolvePublicBaseUrl()` 与 A1 的 `adminPublicBaseUrl`），**handler 里不另拼 URL**；非 GET ⇒ 405 |
+| 路由生成 | `admin-auth` 允许面加 `/api/site`，`admin-deny-api` 排除列表**同步**加 `!PathPrefix(/api/site)` |
+| 判据 | `portal/frontend/src/lib/hostGate.ts`（纯函数、零 vue-router 依赖）：六行矩阵 + **防环** + **fail-open** + 深链保真 |
+| 状态 | `stores/site.ts`：**单飞**（并发导航只发一次）、失败 **30s 冷却**（不永久放弃也不每次重打）、**缺字段 ⇒ 不可用** |
+| 接线 | `router.ts` 的 `beforeEach` **最前面**（在 `auth.ensureMe()` 之前——「我在哪个 host」与「我是谁」是两件事）；命中 redirect ⇒ `window.location.replace` + **`return false`** |
+| 硬链接 | 用户面顶栏/侧栏「管理台」、`AdminLayout` 的「← 返回工作台」改成**跨 host 绝对地址**（`hashUrl(base, path)` 是唯一拼法） |
+
+**四条口径（都能被变异打红，不是措辞）**
+
+1. **fail-open 优先于「跳对」**：`/api/site` 拿不到 ⇒ **不跳**。跳错方向的代价是把用户踢到一个死地址，
+   而他连「改回来」都得手打 URL。所以 `parseOrigin` 解析失败/空串一律 `allow`。
+2. **防环由判据自己算**：只有 `new URL(target).origin !== new URL(here).origin` 才跳。
+   ⚠ **必须用 `new URL().origin` 而不是字符串前缀**：`https://admin.x:443` 与 `https://admin.x` 是同一 origin，
+   前缀比较会在「443 与显式端口」这两种合法形态之间判错——那正是重定向环的入口。
+3. **`return false` 而不是 `return { path }`**：后者是「在**当前** origin 上继续导航」，而我们刚判定这个 origin 是错的。
+4. **允许面与排除列表逐条互补**：deny 优先级 300 > 允许 200 ⇒ 漏一条就是「deny 把允许的吃掉」。
+   `routes.test.js` 用**规则求值器**把「管理台入口上 `/api/site` 命中 `admin-auth` 而非 `admin-deny-api`」写成断言，
+   不是靠人比对两个字符串。
+
+**一处规格外的自定（worker 提出、我核可）**：`/api/site` 进 `RESTRICTED_SESSION_ALLOWLIST`（#255 受限会话门）。
+公开端点拿「欠不欠改密」去挡不自洽，且被挡的后果不是 403 而是**静默降级**（前端把「site 不可用」当 fail-open ⇒
+受限会话在错的 host 上照样渲染一片 404）。
+
+**基线（主 agent 亲跑）**：根 **1859 → 1864**（+5：`http.test.js` 4 + `routes.test.js` 1）、runner **473 不变**、
+前端 **56 文件 / 1072 → 1106**（+34：`hostGate.spec` 16 + `site.spec` 9 + `router.spec` 3 + 三处硬链接/侧栏 +6）、
+`typecheck` rc=0。**主 agent 亲跑 5 条变异全红在具名用例**：去掉防环 ⇒ 6 红；fail-open 改成照跳 ⇒ 1 红；
+`isAdminPath` 边界放宽（`/adminx` 也算管理台）⇒ 1 红；`parseSiteInfo` 允许缺 `adminBaseUrl` ⇒ 1 红；
+deny 排除列表去掉 `/api/site` ⇒ 4 红。worker 另跑 3 条（工单要求的那三条）。
+
+**仍未做（部署前必须知道）**：真机验收归主 agent（`admin.<伞域>:9443` 尚未在现网 publish，A1 的 edge 重建 + 首张证书
+还没做）；`#456` 的证书上传/校验面仍未开工。

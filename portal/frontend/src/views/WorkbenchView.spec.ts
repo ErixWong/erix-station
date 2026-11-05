@@ -13,6 +13,7 @@ import LocaleSwitch from '../components/LocaleSwitch.vue';
 import { createAppRouter } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
 import { useAuthStore, type AuthUser } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench'; // issue #281：断言消息流里的可见错误行要用 store
 import { i18n, setLocale } from '../i18n';
 
@@ -110,7 +111,7 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     // who 拼接：login（role / fde_name）
     expect(wrapper.find('header span.flex-1').text()).toBe('alice（fde / alice）');
     // 普通 FDE 无「管理台」入口；登出按钮 + 语言切换菜单在位
-    expect(wrapper.find('header a[href="/admin"]').exists()).toBe(false);
+    expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
     // header 直系 button：☰ 导航 / cwd 徽标 / 登出（LocaleSwitch 自身按钮在子 div 内，不计入）
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('登出');
     expect(wrapper.findComponent(LocaleSwitch).exists()).toBe(true);
@@ -121,13 +122,29 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
   it('平台管理员（第 ② 类人：admin 且有工位）：顶栏「管理台」入口；who 带 fde_name（全角括号）', async () => {
     const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
     expect(wrapper.find('header span.flex-1').text()).toBe('root（admin / root）');
-    expect(wrapper.find('header a[href="/admin"]').text()).toBe('管理台');
+    expect(wrapper.find('header [data-test="admin-console-link"]').text()).toBe('管理台');
+  });
+
+  it('#450 A2：管理台入口是**跨 host 的绝对地址**（site 有值 ⇒ adminBaseUrl#/admin；无值 ⇒ 退回相对 hash）', async () => {
+    // A1 之后用户入口的 /api/admin/* 是边缘 404 ⇒ 这颗按钮必须指向管理台 host 的绝对地址，
+    // 否则用户看到的是「页面在、API 全 404」。拿不到 site 信息时（fail-open）退回同 origin 的 hash 链接。
+    const wrapper = await mountWorkbench(ADMIN_WITH_SEAT);
+    const link = () => wrapper.get('header [data-test="admin-console-link"]');
+    // 本例的 fetch 桩对 /api/site 回 `{}` ⇒ 形状不对 ⇒ site 不可用 ⇒ 退回相对 hash。
+    expect(link().attributes('href')).toBe('#/admin');
+
+    useSiteStore().info = {
+      userBaseUrl: 'http://station.fde.erix.vip:8090',
+      adminBaseUrl: 'https://admin.fde.erix.vip:9443',
+    };
+    await flushPromises();
+    expect(link().attributes('href')).toBe('https://admin.fde.erix.vip:9443#/admin');
   });
 
   it('who 的无 fde_name 分支（fde 账号缺 fde_name）：只显示 role（全角括号）', async () => {
     const wrapper = await mountWorkbench(FDE_NO_SEAT);
     expect(wrapper.find('header span.flex-1').text()).toBe('bob（fde）');
-    expect(wrapper.find('header a[href="/admin"]').exists()).toBe(false);
+    expect(wrapper.find('header [data-test="admin-console-link"]').exists()).toBe(false);
   });
 
   it('「↓ 最新」悬浮按钮文案走 i18n（离开底部时出现）', async () => {
@@ -147,7 +164,7 @@ describe('WorkbenchView 顶栏 · i18n（issue #101 P2）', () => {
     expect(wrapper.find('header button').attributes('aria-label')).toBe('Open navigation');
     expect(wrapper.find('header button[title]').attributes('title')).toBe('~/projects/demo (click to copy)');
     expect(wrapper.find('header span.flex-1').text()).toBe('root (admin / root)');
-    expect(wrapper.find('header a[href="/admin"]').text()).toBe('Admin console');
+    expect(wrapper.find('header [data-test="admin-console-link"]').text()).toBe('Admin console');
     expect(wrapper.findAll('header > button').at(-1)!.text()).toBe('Sign out');
     expect(wrapper.find('[role="separator"]').attributes('aria-label')).toBe('Resize sidebar');
     // 嵌套子组件（SidebarPanel/DirSelect）同样响应（全局 locale 向子树传播）

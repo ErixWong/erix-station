@@ -19,6 +19,7 @@ import { computed, nextTick, onMounted, ref } from 'vue';
 import type { ComponentPublicInstance } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useAuthStore } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench';
 import type { Session } from '../stores/workbench';
 import { SESSION_TITLE_MAX_LEN } from '../lib/constants';
@@ -27,6 +28,8 @@ import DirectoryTree from './DirectoryTree.vue';
 import FilePreviewModal from './FilePreviewModal.vue';
 import NewDirectoryModal from './NewDirectoryModal.vue';
 import { groupByProject } from '../lib/previewPorts';
+import { hashUrl } from '../lib/hostGate';
+import { ADMIN_CONSOLE_PATH } from '../lib/workbenchGate';
 import PreviewPortsPanel from './PreviewPortsPanel.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
 import { usePreviewPorts } from '../composables/usePreviewPorts';
@@ -35,10 +38,17 @@ import { usePreviewPorts } from '../composables/usePreviewPorts';
 const { t } = useI18n();
 const store = useWorkbenchStore();
 const auth = useAuthStore();
+const site = useSiteStore();
 const emit = defineEmits<{
   (e: 'select-session', id: string): void;
   (e: 'new-session'): void;
 }>();
+
+// #450 A2：「管理台」入口是**跨 host** 链接（用户面 `station.<伞域>` → 管理台 `admin.<伞域>:9443`）。
+// A1 之后 `/api/admin/*` 在用户入口上就是 404 ⇒ 这颗按钮若还走 router-link（相对 `/admin`），
+// 结果是「在用户 host 上渲染出管理台页面、所有管理 API 全 404」。改成用 `site` store 的 `adminBaseUrl`
+// 拼绝对地址；拿不到 site 信息时退回相对 hash `#/admin`（同 origin，行为与改动前一致，由 host 闸兜底）。
+const adminConsoleHref = computed(() => hashUrl(site.info?.adminBaseUrl, ADMIN_CONSOLE_PATH) ?? `#${ADMIN_CONSOLE_PATH}`);
 
 // ---- ↻ 单按钮双刷：/api/dirs（store.refreshDirs）+ 目录树（组件 reload → 全折叠重载根层）----
 // issue #308 §四：↻ 语义**不动**——它继续只刷「目录列表 + 目录树」，**不**扩到刷新预览端口
@@ -206,11 +216,12 @@ function messageCountSuffix(s: Session): string {
     <div class="shrink-0">
       <!-- 常驻「管理台」入口（旧 index.html header adminLink 的 SPA 等价；admin 角色才显示） -->
       <!-- issue #112：侧栏头控件统一 32px 高 / 7px 圆角 / 12px 字号（对齐 pi-web 控件规格） -->
-      <router-link
+      <a
         v-if="auth.user?.role === 'admin'"
-        to="/admin"
+        data-test="admin-console-link"
+        :href="adminConsoleHref"
         class="mb-2 block h-8 rounded-[7px] border border-black/20 bg-black/[.03] px-2.5 text-center text-[12px] leading-8 hover:bg-black/10"
-      >{{ t('common.adminConsole') }}</router-link>
+      >{{ t('common.adminConsole') }}</a>
 
       <!-- 目录下拉 + ↻ 双刷（issue #84 P5：替换原项目 select + 新项目表单） -->
       <DirSelect @refresh="onRefresh" @new-dir="newDirOpen = true" />

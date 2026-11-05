@@ -375,6 +375,13 @@ export const RESTRICTED_SESSION_ALLOWLIST = Object.freeze([
     path: '/api/logout',
     reason: '旧登出路径（307 → /api/auth/logout）：同上，两条路径的语义是同一个「退出」，必须一起可达。',
   }),
+  Object.freeze({
+    method: 'GET',
+    path: '/api/site',
+    reason: '#450 A2 的 host 信息端点（§2.12）：**本身就是公开端点**（无会话也 200、只回两个对外 base URL），'
+      + '拿「欠不欠改密」去挡它是不自洽的；而它被挡的后果不是 403 而是**静默降级**——前端路由守卫会把'
+      + '「site 不可用」当成 fail-open（不跨 host 跳），于是受限会话在错的 host 上照样渲染出一片 404 的页面。',
+  }),
 ]);
 
 /**
@@ -844,6 +851,23 @@ async function routeApi(req, res, ctx, url) {
 
   if (req.method === 'POST' && pathname === '/api/auth/login/email-code/resend') {
     return handleLoginEmailCodeResend(req, res, ctx);
+  }
+
+  // ---- #450 A2：GET /api/site（公开、零秘密）----
+  // 前端要知道「用户面与管理台各自的对外 URL」（跨 host 跳转的落点），而**登录页也要用**它 ⇒ 不能要求会话。
+  // 只回这两个 URL：不含版本号 / 镜像 / host 清单 / ADMIN_IP_ALLOWLIST 等运维面信息（零秘密）。
+  // 两个值都来自既有配置（`resolvePublicBaseUrl` 的产物与 A1 的 `adminPublicBaseUrl`），handler 里**不另拼 URL**
+  // ——拼第二套就一定会与 agentd 拿到的 base URL / 预览 URL 漂移。
+  // 两个入口都可达：管理台入口侧靠 routes.js 的 `admin-auth` 允许面 + `admin-deny-api` 的排除列表
+  //（两份列表严格互补，`portal/test/routes.test.js` 用规则求值器钉住「/api/site 命中 admin-auth 而非 deny」）。
+  if (pathname === '/api/site') {
+    if (req.method !== 'GET') {
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+    }
+    return sendJson(res, 200, {
+      userBaseUrl: config.portalPublicBaseUrl,
+      adminBaseUrl: config.adminPublicBaseUrl,
+    });
   }
 
   if (req.method === 'POST' && pathname === '/api/auth/logout') {

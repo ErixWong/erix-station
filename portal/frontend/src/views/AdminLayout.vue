@@ -3,11 +3,21 @@ import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
+import { hashUrl } from '../lib/hostGate';
 
 const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
+const site = useSiteStore();
+
+// #450 A2：「← 返回工作台」是**跨 host** 链接（管理台 `admin.<伞域>:9443` → 用户面 `station.<伞域>`）。
+// A1 之后同一份 SPA 仍会从两个 host 下发，而 `/` 在当前 origin 上就是「管理台 host 上的工作台」=
+// 页面渲染得出来、API 全 404。所以这里必须用 `site` store 的 `userBaseUrl` 拼**绝对地址**。
+// 拿不到 site 信息（fail-open）时退回相对 hash `#/`：同 origin 的 hash 链接，行为与改动前完全一致
+// （host 闸自己会在下一次导航里决定要不要换 host）。
+const backToWorkbenchHref = computed(() => hashUrl(site.info?.userBaseUrl, '/') ?? '#/');
 
 const who = computed(() => {
   const user = auth.user;
@@ -39,7 +49,7 @@ async function onLogout() {
     <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
       <h1 class="text-xl font-medium mb-0">{{ t('admin.title') }}</h1>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
-      <router-link to="/" class="text-sm underline">{{ t('admin.backToWorkbench') }}</router-link>
+      <a data-test="back-to-workbench" :href="backToWorkbenchHref" class="text-sm underline">{{ t('admin.backToWorkbench') }}</a>
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
         @click="onLogout"

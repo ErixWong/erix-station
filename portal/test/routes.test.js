@@ -64,7 +64,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '      tls: {}',
     '    admin-auth:',
     '      entryPoints: [adminsecure]',
-    '      rule: "Host(`admin.localhost`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`))"',
+    '      rule: "Host(`admin.localhost`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`) || PathPrefix(`/api/site`))"',
     '      priority: 200',
     '      service: portal',
     '      tls: {}',
@@ -82,7 +82,7 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '      service: noop@internal',
     '    admin-deny-api:',
     '      entryPoints: [adminsecure]',
-    '      rule: "Host(`admin.localhost`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`)"',
+    '      rule: "Host(`admin.localhost`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`) && !PathPrefix(`/api/site`)"',
     '      priority: 300',
     '      middlewares: [admin-deny]',
     '      service: noop@internal',
@@ -916,7 +916,7 @@ test('#450 管理台三条路由：adminsecure 入口 + admin host + tls:{} + �
 
   const auth = http.routers['admin-auth'];
   assert.deepEqual(auth.entryPoints, ['adminsecure']);
-  assert.equal(auth.rule, 'Host(`admin.fde.erix.vip`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`))');
+  assert.equal(auth.rule, 'Host(`admin.fde.erix.vip`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`) || PathPrefix(`/api/site`))');
   assert.equal(auth.priority, 200);
   assert.deepEqual(auth.tls, {});
 
@@ -945,7 +945,7 @@ test('#450 两条 deny 路由：规则 / 优先级 / 指向 noop@internal（不�
   assert.deepEqual(denyApi.entryPoints, ['adminsecure']);
   assert.equal(
     denyApi.rule,
-    'Host(`admin.fde.erix.vip`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`)',
+    'Host(`admin.fde.erix.vip`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`) && !PathPrefix(`/api/site`)',
   );
   assert.equal(denyApi.priority, 300);
   assert.deepEqual(denyApi.middlewares, ['admin-deny']);
@@ -1064,4 +1064,143 @@ test('#450 rebuildRoutes：证书面坏掉（certs/tls.crt 是目录）⇒ 路�
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// issue #450 A2：`/api/site` 在两个入口上都要可达。
+//
+// 「允许面被 deny 吃掉」这件事**不能用字符串匹配来验**：`admin-deny-api` 的规则是一条带 `!PathPrefix`
+// 的排除式表达式，只有**真的把规则求值**才知道某个路径最终命中哪条 router（deny 优先级 300 > 允许 200）。
+// 于是这里带一个最小规则求值器（只支持本文件生成器实际产出的语法：`Host(...)`、`PathPrefix(...)`、
+// `!`、`&&`、`||`、括号），按优先级取赢家。变异靶子：把 `!PathPrefix(`/api/site`)` 从 deny 规则里删掉
+// ⇒ 下面「/api/site 命中 admin-auth」必红。
+// ---------------------------------------------------------------------------
+
+/** 把 Traefik 规则串切成 token（`Host` / `PathPrefix` / 反引号字符串 / `&&` `||` `!` `(` `)`）。 */
+function tokenizeRule(rule) {
+  const tokens = [];
+  let i = 0;
+  while (i < rule.length) {
+    const ch = rule[i];
+    if (ch === ' ' || ch === '\t') { i += 1; continue; }
+    const two = rule.slice(i, i + 2);
+    if (two === '&&' || two === '||') { tokens.push(two); i += 2; continue; }
+    if (ch === '!' || ch === '(' || ch === ')') { tokens.push(ch); i += 1; continue; }
+    if (ch === '`') {
+      const end = rule.indexOf('`', i + 1);
+      assert.ok(end > i, `规则里的反引号没有闭合：${rule}`);
+      tokens.push({ str: rule.slice(i + 1, end) });
+      i = end + 1;
+      continue;
+    }
+    const m = /^[A-Za-z]+/.exec(rule.slice(i));
+    assert.ok(m, `规则里有无法识别的字符 ${JSON.stringify(ch)}：${rule}`);
+    tokens.push(m[0]);
+    i += m[0].length;
+  }
+  return tokens;
+}
+
+/** 规则求值：{ host, path } → 布尔（未知 matcher 直接抛错，不静默当 false）。 */
+function evalRule(rule, req) {
+  const tokens = tokenizeRule(rule);
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const eat = (expected) => {
+    const t = tokens[pos];
+    assert.deepEqual(t, expected, `规则解析错位（期望 ${String(expected)}，实际 ${String(t)}）：${rule}`);
+    pos += 1;
+    return t;
+  };
+  const matcher = (name, arg) => {
+    if (name === 'Host') return req.host === arg;
+    if (name === 'PathPrefix') return req.path.startsWith(arg);
+    throw new Error(`规则求值器不支持 matcher ${name}`);
+  };
+  const parsePrimary = () => {
+    const t = peek();
+    if (t === '(') {
+      eat('(');
+      const v = parseOr();
+      eat(')');
+      return v;
+    }
+    assert.equal(typeof t, 'string', `规则语法错位：${rule}`);
+    pos += 1;
+    // Traefik 的 matcher 形状是 `Name(`arg`)`：名字后面先是一个括号，再是反引号字符串。
+    eat('(');
+    const arg = peek();
+    assert.equal(typeof arg, 'object', `matcher ${t} 的参数必须是反引号字符串：${rule}`);
+    pos += 1;
+    eat(')');
+    return matcher(t, arg.str);
+  };
+  const parseUnary = () => {
+    if (peek() === '!') { eat('!'); return !parseUnary(); }
+    return parsePrimary();
+  };
+  const parseAnd = () => {
+    let v = parseUnary();
+    while (peek() === '&&') { eat('&&'); const r = parseUnary(); v = v && r; }
+    return v;
+  };
+  const parseOr = () => {
+    let v = parseAnd();
+    while (peek() === '||') { eat('||'); const r = parseAnd(); v = v || r; }
+    return v;
+  };
+  const value = parseOr();
+  assert.equal(pos, tokens.length, `规则没有被完整解析（剩 ${tokens.length - pos} 个 token）：${rule}`);
+  return value;
+}
+
+/** 某个入口上命中 {host, path} 的 router 名，按优先级从高到低（同优先级保持文件顺序）。 */
+function winningRouters(http, { host, path, entryPoint }) {
+  return Object.entries(http.routers)
+    .filter(([, r]) => (r.entryPoints ?? []).includes(entryPoint))
+    .filter(([, r]) => evalRule(r.rule, { host, path }))
+    .sort((a, b) => (b[1].priority ?? 0) - (a[1].priority ?? 0))
+    .map(([name]) => name);
+}
+
+test('#450 A2：管理台入口上 /api/site 命中 admin-auth（不是 admin-deny-api）——允许面与排除列表互补', () => {
+  const http = adminRoutesDoc();
+  const adminHost = 'admin.fde.erix.vip';
+  const onAdmin = (path) => winningRouters(http, { host: adminHost, path, entryPoint: 'adminsecure' });
+
+  // 逐条：白名单里的每条路径，赢家必须是它对应的**允许面**路由（deny 优先级更高，漏一条就被吃掉）。
+  for (const [path, expected] of [
+    ['/api/site', 'admin-auth'],
+    ['/api/auth/login', 'admin-auth'],
+    ['/api/me', 'admin-auth'],
+    ['/api/admin/users', 'admin-api'],
+    ['/', 'admin-spa'],
+  ]) {
+    assert.equal(onAdmin(path)[0], expected, `${path} 在管理台入口必须命中 ${expected}，实际 ${onAdmin(path)[0]}`);
+  }
+  // 反方向：白名单之外的 /api/* 仍然被 deny 挡住（不能为了 /api/site 把整条 deny 放宽）。
+  for (const path of ['/api/sessions', '/api/internal/claim', '/api/dirs']) {
+    assert.equal(onAdmin(path)[0], 'admin-deny-api', `${path} 必须仍被管理台入口的 deny 挡住`);
+  }
+  // 用户入口不变：/api/site 落到 portal catch-all，/api/admin/* 落到 deny。
+  assert.equal(winningRouters(http, { host: 'station.fde.erix.vip', path: '/api/site', entryPoint: 'web' })[0], 'portal');
+  assert.equal(winningRouters(http, { host: 'station.fde.erix.vip', path: '/api/admin/users', entryPoint: 'web' })[0], 'admin-deny-user');
+});
+
+test('#450 A2：允许面与 deny 排除列表**逐条互补**（结构不变量，不依赖某条路径的具体断言）', () => {
+  const http = adminRoutesDoc();
+  const adminHost = 'admin.fde.erix.vip';
+  // 从两条规则里各抽出前缀集合：允许面 = admin-auth 的 PathPrefix 并集；排除面 = deny 的 !PathPrefix 并集。
+  const prefixesOf = (rule, negated) => {
+    const out = [];
+    const re = negated ? /!PathPrefix\(`([^`]+)`\)/g : /(?<!!)PathPrefix\(`([^`]+)`\)/g;
+    for (const m of rule.matchAll(re)) out.push(m[1]);
+    return out.sort();
+  };
+  const authRule = http.routers['admin-auth'].rule;
+  const denyRule = http.routers['admin-deny-api'].rule;
+  const allowed = [...prefixesOf(authRule, false), ...prefixesOf(http.routers['admin-api'].rule, false)].sort();
+  const excluded = prefixesOf(denyRule, true);
+  assert.deepEqual(excluded, allowed,
+    '管理台入口的「允许面」与 deny 的排除列表必须逐条相等：少一条 = deny（300）把允许（200）吃掉');
 });
