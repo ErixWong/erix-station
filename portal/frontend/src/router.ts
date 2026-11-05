@@ -8,9 +8,12 @@ import {
   type RouteRecordRaw,
 } from 'vue-router';
 import { useAuthStore } from './stores/auth';
+import { useSiteStore } from './stores/site';
 import { FORCE_PASSWORD_PATH, createRedirectBudget, restrictedNavigationDecision } from './lib/forcePasswordGuard';
 // #332：工作台准入闸（admin 且无 fde_name ⇒ 送管理台）。判据本体在 lib/workbenchGate.ts，这里只接线。
 import { workbenchGateDecision } from './lib/workbenchGate';
+// #450 A2：host 闸（在错的 host 上就跳到对的 host）。判据本体在 lib/hostGate.ts，这里只接线。
+import { hostGateDecision } from './lib/hostGate';
 import { setRestrictedSessionListener } from './lib/restrictedSession';
 
 // #255 强制改密屏的路径：唯一真相在 lib/forcePasswordGuard.ts（守卫判据与它同处）。
@@ -79,13 +82,29 @@ export const routes: RouteRecordRaw[] = [
 ];
 
 // history 可注入（单测用 createMemoryHistory）；默认 hash 模式。
-export function createAppRouter(history: RouterHistory = createWebHashHistory()): Router {
+// #450 A2：`deps` 只为一件事存在——**跨 origin 跳转的两个副作用**（换地址、读当前 origin）必须可在单测里
+// 打桩：`window.location.replace()` 在 jsdom 里是「未实现」的导航（静默无效），而真跳会让用例跑出进程。
+// 生产路径两个缺省值就是 `window.location.replace` / `window.location.origin`，没有别的分支。
+export interface RouterDeps {
+  /** 跳转落点（缺省 `window.location.replace`）。**跨 origin**：vue-router 管不到。 */
+  navigate?: (url: string) => void;
+  /** 当前页面 origin（缺省 `window.location.origin`）。 */
+  currentOrigin?: () => string;
+}
+
+export function createAppRouter(
+  history: RouterHistory = createWebHashHistory(),
+  deps: RouterDeps = {},
+): Router {
+  const navigate = deps.navigate ?? ((url: string) => { window.location.replace(url); });
+  const currentOrigin = deps.currentOrigin ?? (() => window.location.origin);
   const router = createRouter({
     history,
     routes,
   });
 
   // 全局守卫（auth = session cookie；/api/me 401/403 → /login）：
+  //   ⓪ #450 A2 host 闸：发现自己在错的 host 上 ⇒ 换 origin（跳完 `return false`，本次导航终止）；
   //   ① 首次导航先探测 /api/me；② 已登录访问 /login → 回工作台；
   //   ③ 未登录访问受保护路由 → /login；④ requiresRole 不满足 → 工作台（旧版 /admin 403 的 SPA 等价）。
   //   ⑤ #255 受限会话：一切导航先被改写到 /change-password（「绕不过」的第二道机制，第一道在 App.vue）：
@@ -98,6 +117,24 @@ export function createAppRouter(history: RouterHistory = createWebHashHistory())
     if (!budget.notePass()) {
       budget.reset();
       console.warn(`[router] 守卫重定向链条超过预算，已终止本次导航（目标 ${to.fullPath}）`);
+      return false;
+    }
+    // #450 A2：**host 闸排在最前面**（在 `auth.ensureMe()` 之前）——「我在哪个 host 上」与「我是谁」
+    // 是两件事，前者不该先花一次 `/api/me` 的往返（错的 host 上那个请求也会白跑一趟）。
+    // 判据本体在 lib/hostGate.ts（六行矩阵 + 防环 + fail-open 都有单测），这里只负责接线：
+    //  · `ensureSite()` **永不抛**：拿不到 `/api/site` ⇒ null ⇒ 判据 fail-open（不跳）。
+    //  · 命中 redirect 时用 `navigate`（= `window.location.replace`）换地址，并 **`return false` 终止本次导航**。
+    //    ⚠ 绝不能 `return { path }`：那是「在**当前** origin 上继续导航」，而我们刚刚决定这个 origin 是错的。
+    const siteInfo = await useSiteStore().ensureSite();
+    const hostGate = hostGateDecision({
+      currentOrigin: currentOrigin(),
+      userBaseUrl: siteInfo?.userBaseUrl,
+      adminBaseUrl: siteInfo?.adminBaseUrl,
+      // `fullPath`（路径 + query）原样进 hash：`#/session/<id>?tab=x` 的深链不能被吃掉。
+      toPath: to.fullPath,
+    });
+    if (hostGate.action === 'redirect') {
+      navigate(hostGate.url);
       return false;
     }
     const auth = useAuthStore();
