@@ -113,6 +113,38 @@ test('内容相同的两份只注入靠外那份（sha256 去重）+ 一条 note
   });
 });
 
+// #451 评审 m4（minor）：旧写法拿**原始字节**做 sha256 ⇒ BOM / CRLF 差异让去重失效：
+// 同一段规则注两遍且 notes=0（看上去一切正常）。去重键已改成规范化字节，**展示仍是原文**。
+test('m4：同内容只差 BOM / CRLF / 尾部空白 ⇒ 仍只注入 1 份 + 1 条去重 note，且注入的是原文', async () => {
+  const lf = '# 平台约定\n- 规则 A：端口从清单取\n';
+  await withTree({
+    // 靠外那份：UTF-8 BOM + LF；靠内那份：同内容 CRLF + 多一个尾部空行
+    'home/AGENTS.md': Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(lf, 'utf8')]),
+    'home/projects/AGENTS.md': Buffer.from(lf.replace(/\n/g, '\r\n') + '\r\n', 'utf8'),
+  }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.equal(blocks.length, 1, `只差 BOM/行尾就是同一份约定，不得注两遍（实际 ${blocks.length} 份）`);
+    assert.equal(blocks[0].scope, 'platform', '保留的必须是靠外那份（平台节优先）');
+    assert.ok(notes.some((n) => n.includes('去重')), `去重必须记账，实际 notes=${JSON.stringify(notes)}`);
+    assert.equal(blocks[0].text, '\uFEFF' + lf,
+      '去重键归一不得改展示：注入的仍是它自己文件的原文（BOM 一个字节都不动）');
+  });
+});
+
+test('m4 反向：内容真的不同（多一行）⇒ 仍注入 2 份，不得过度去重', async () => {
+  await withTree({
+    'home/AGENTS.md': '# 平台约定\n- 规则 A\n',
+    'home/projects/AGENTS.md': '# 平台约定\n- 规则 A\n- 规则 B\n',
+  }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform', 'workspace'],
+      '只差一行就是两份不同的约定：归一只能消除编码差异，不能吞掉真内容');
+    assert.equal(notes.filter((n) => n.includes('去重')).length, 0,
+      `不该有去重记账，实际 notes=${JSON.stringify(notes)}`);
+    assert.ok(blocks[1].text.includes('规则 B'), '两份各自必须是自己的原文');
+  });
+});
+
 test('单文件超上限：截断并留 marker（含原字节数 + 可直接照抄的 cat <path>）', async () => {
   const big = `# 大文件\n${'x'.repeat(AGENTS_MD_MAX_FILE_BYTES + 2048)}`;
   await withTree({ 'home/AGENTS.md': big }, ({ home, cwd }) => {
@@ -248,7 +280,8 @@ test('symlink 越界（~/projects/AGENTS.md -> home 之外）⇒ 跳过 + note',
   }, ({ root, home, cwd }) => {
     fs.symlinkSync(path.join(root, 'outside', 'secret.md'), path.join(home, 'projects', 'AGENTS.md'));
     const { blocks, notes } = collectAgentsMd({ cwd, home });
-    assert.deepEqual(blocks.map((b) => b.scope), ['platform'], 'symlink 逃出 home 的内容一个字节都不许注入');
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform'],
+      'symlink 逃出 home 的内容不注入（口径：以 realpath **检查时刻**的形态为准——检查与读取之间换 symlink 指向不在防护范围）');
     assert.ok(notes.some((n) => n.includes('越出')), `越界要记账，实际 notes=${JSON.stringify(notes)}`);
   });
 });
