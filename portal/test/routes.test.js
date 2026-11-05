@@ -3,6 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { parse as parseYaml } from 'yaml';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -35,8 +36,12 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     entryPoint: 'web',
     allocations: [],
     sourceRanges: ['10.200.1.0/29', '10.201.7.0/28'],
+    // #450：管理台入口（allowlist 留空 ⇒ 三条管理台路由**不带 middlewares 行**，快照同步）
+    adminHost: 'admin.localhost',
+    adminEntryPoint: 'adminsecure',
+    adminIpAllowlist: [],
   });
-  // 不设额外 Host 时，完整 routes.yml 保持改动前字节快照。
+  // 不设额外 Host 时，完整 routes.yml 保持字节快照（#450 之后：含管理台三路由 + 两条 deny）。
   assert.equal(text, [
     'http:',
     '  routers:',
@@ -51,6 +56,37 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '      priority: 200',
     '      middlewares: [internal-allow]',
     '      service: portal',
+    '    admin-api:',
+    '      entryPoints: [adminsecure]',
+    '      rule: "Host(`admin.localhost`) && PathPrefix(`/api/admin`)"',
+    '      priority: 200',
+    '      service: portal',
+    '      tls: {}',
+    '    admin-auth:',
+    '      entryPoints: [adminsecure]',
+    '      rule: "Host(`admin.localhost`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`))"',
+    '      priority: 200',
+    '      service: portal',
+    '      tls: {}',
+    '    admin-spa:',
+    '      entryPoints: [adminsecure]',
+    '      rule: "Host(`admin.localhost`)"',
+    '      priority: 100',
+    '      service: portal',
+    '      tls: {}',
+    '    admin-deny-user:',
+    '      entryPoints: [web]',
+    '      rule: "Host(`station.localhost`) && PathPrefix(`/api/admin`)"',
+    '      priority: 300',
+    '      middlewares: [admin-deny]',
+    '      service: noop@internal',
+    '    admin-deny-api:',
+    '      entryPoints: [adminsecure]',
+    '      rule: "Host(`admin.localhost`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`)"',
+    '      priority: 300',
+    '      middlewares: [admin-deny]',
+    '      service: noop@internal',
+    '      tls: {}',
     '  middlewares:',
     '    fde-auth:',
     '      forwardAuth:',
@@ -65,6 +101,11 @@ test('internal router：priority > portal（200 > 100）+ PathPrefix + ipAllowLi
     '    internal-allow:',
     '      ipAllowList:',
     '        sourceRange: ["10.200.1.0/29", "10.201.7.0/28"]',
+    '    admin-deny:',
+    '      # #450 隔离 deny：恒拒并返 404（不代理到 portal，也不落任何服务）',
+    '      ipAllowList:',
+    '        sourceRange: ["192.0.2.0/24"]',
+    '        rejectStatusCode: 404',
     '  services:',
     '    portal:',
     '      loadBalancer:',
@@ -843,4 +884,139 @@ test('N5（Round C 评审）：启动重建失败 + 入队也失败 → needsFul
   );
   fs.chmodSync(dir, 0o700);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// issue #450 / feat-261105-01：管理台独立入口（adminsecure）+ 双向 deny 的生成器判据。
+// 结构断言走 yaml 解析（不是字符串匹配）：改一条规则/优先级/entryPoint 都会红。
+// ---------------------------------------------------------------------------
+
+const ADMIN_ARGS = {
+  portalHost: 'station.fde.erix.vip',
+  portalBackendUrl: 'http://127.0.0.1:18080',
+  entryPoint: 'web',
+  allocations: [{ id: 'pa1', hostname: 'eric-p-22000.fde.erix.vip', port: 22000, backendUrl: 'http://10.200.1.2:22000' }],
+  sourceRanges: ['10.200.1.0/29'],
+  adminHost: 'admin.fde.erix.vip',
+  adminEntryPoint: 'adminsecure',
+};
+
+function adminRoutesDoc(extra = {}) {
+  return parseYaml(generateTraefikConfig({ ...ADMIN_ARGS, ...extra })).http;
+}
+
+test('#450 管理台三条路由：adminsecure 入口 + admin host + tls:{} + 优先级（admin API 200 / SPA 100）', () => {
+  const http = adminRoutesDoc();
+  const api = http.routers['admin-api'];
+  assert.deepEqual(api.entryPoints, ['adminsecure'], '管理 API 只能从管理台入口进（D2）');
+  assert.equal(api.rule, 'Host(`admin.fde.erix.vip`) && PathPrefix(`/api/admin`)');
+  assert.equal(api.priority, 200);
+  assert.equal(api.service, 'portal');
+  assert.deepEqual(api.tls, {}, '管理台路由必须带 tls:{}（走 dynamic/tls.yml 装的那张证书）');
+
+  const auth = http.routers['admin-auth'];
+  assert.deepEqual(auth.entryPoints, ['adminsecure']);
+  assert.equal(auth.rule, 'Host(`admin.fde.erix.vip`) && (PathPrefix(`/api/auth`) || PathPrefix(`/api/me`))');
+  assert.equal(auth.priority, 200);
+  assert.deepEqual(auth.tls, {});
+
+  const spa = http.routers['admin-spa'];
+  assert.deepEqual(spa.entryPoints, ['adminsecure']);
+  assert.equal(spa.rule, 'Host(`admin.fde.erix.vip`)', 'SPA 静态是管理台 host 的 catch-all');
+  assert.equal(spa.priority, 100);
+  assert.ok(spa.priority < api.priority, 'SPA catch-all 必须低于 API 路由，否则 /api/* 会被它吃掉');
+  assert.deepEqual(spa.tls, {});
+});
+
+test('#450 两条 deny 路由：规则 / 优先级 / 指向 noop@internal（不代理到 portal）', () => {
+  const http = adminRoutesDoc();
+  // 用户入口：挡 /api/admin/*
+  const denyUser = http.routers['admin-deny-user'];
+  assert.deepEqual(denyUser.entryPoints, ['web'], 'deny 挂在用户入口（跟着 config.traefikEntryPoint 走）');
+  assert.equal(denyUser.rule, 'Host(`station.fde.erix.vip`) && PathPrefix(`/api/admin`)');
+  assert.equal(denyUser.priority, 300);
+  assert.ok(denyUser.priority > http.routers.portal.priority, 'deny 必须压过 portal catch-all（100）');
+  assert.ok(denyUser.priority > http.routers.internal.priority, 'deny 必须压过 internal（200）——不依赖「路径永不重叠」');
+  assert.deepEqual(denyUser.middlewares, ['admin-deny']);
+  assert.equal(denyUser.service, 'noop@internal', 'deny 不许指向 portal（否则就是「代理过去再让应用层挡」= 今天的现状）');
+
+  // 管理台入口：除三条白名单外的 /api/* 也走同一个 deny
+  const denyApi = http.routers['admin-deny-api'];
+  assert.deepEqual(denyApi.entryPoints, ['adminsecure']);
+  assert.equal(
+    denyApi.rule,
+    'Host(`admin.fde.erix.vip`) && PathPrefix(`/api`) && !PathPrefix(`/api/admin`) && !PathPrefix(`/api/auth`) && !PathPrefix(`/api/me`)',
+  );
+  assert.equal(denyApi.priority, 300);
+  assert.deepEqual(denyApi.middlewares, ['admin-deny']);
+  assert.equal(denyApi.service, 'noop@internal');
+  assert.deepEqual(denyApi.tls, {}, '管理台入口只接受 TLS 连接 ⇒ deny 路由也必须带 tls:{} 才匹配得上');
+});
+
+test('#450 deny 中间件：404 + 恒拒（不用空 sourceRange —— 实测 Traefik 会拒建该中间件）', () => {
+  const http = adminRoutesDoc();
+  const deny = http.middlewares['admin-deny'];
+  assert.equal(deny.ipAllowList.rejectStatusCode, 404, '隔离语义是 404（不是 403/401：不告诉探测者「这里有东西」）');
+  const ranges = deny.ipAllowList.sourceRange;
+  assert.ok(Array.isArray(ranges) && ranges.length > 0, 'sourceRange 不得为空数组（实测会被 Traefik 拒建 → 路由静默回落 catch-all）');
+  assert.deepEqual(ranges, ['192.0.2.0/24'], 'RFC 5737 文档网段：不可路由、永不匹配真实客户端 ⇒ 恒拒');
+});
+
+test('#450 ipAllowList：allowlist 为空 ⇒ 三条管理台路由**不出现** middlewares / 不生成 admin-allow', () => {
+  const http = adminRoutesDoc({ adminIpAllowlist: [] });
+  assert.equal(http.middlewares['admin-allow'], undefined, '空清单不生成中间件');
+  for (const name of ['admin-api', 'admin-auth', 'admin-spa']) {
+    assert.equal(http.routers[name].middlewares, undefined, `${name} 不得引用不存在的中间件（空 sourceRange 会被 Traefik 拒建）`);
+  }
+  assert.ok(!generateTraefikConfig({ ...ADMIN_ARGS, adminIpAllowlist: [] }).includes('admin-allow'));
+});
+
+test('#450 ipAllowList：allowlist 非空 ⇒ 出现且值逐项相等（三条管理台路由都挂）', () => {
+  const allow = ['100.64.0.0/10', '10.8.0.0/16'];
+  const http = adminRoutesDoc({ adminIpAllowlist: allow });
+  assert.deepEqual(http.middlewares['admin-allow'].ipAllowList.sourceRange, allow);
+  for (const name of ['admin-api', 'admin-auth', 'admin-spa']) {
+    assert.deepEqual(http.routers[name].middlewares, ['admin-allow'], `${name} 必须挂来源白名单`);
+  }
+  // deny 路由不受 allowlist 影响（它永远是 admin-deny，不是 admin-allow）
+  assert.deepEqual(http.routers['admin-deny-api'].middlewares, ['admin-deny']);
+});
+
+test('#450 预览路由只挂原入口：管理台入口上没有 preview router', () => {
+  const http = adminRoutesDoc({ adminIpAllowlist: ['100.64.0.0/10'] });
+  const previewRouters = Object.entries(http.routers).filter(([name]) => name.startsWith('fde-'));
+  assert.ok(previewRouters.length > 0, '样本里必须有预览路由，否则这条断言是空转');
+  for (const [name, router] of previewRouters) {
+    assert.deepEqual(router.entryPoints, ['web'], `预览路由 ${name} 只能挂用户入口`);
+    assert.ok(!router.entryPoints.includes('adminsecure'), `预览路由 ${name} 不得挂到管理台入口（admin host 够不到别人的预览）`);
+  }
+  // 反方向：管理台入口上只有三条管理台路由 + 一条 deny-api，没有别的
+  const onAdminEntry = Object.entries(http.routers)
+    .filter(([, r]) => (r.entryPoints ?? []).includes('adminsecure'))
+    .map(([name]) => name)
+    .sort();
+  assert.deepEqual(onAdminEntry, ['admin-api', 'admin-auth', 'admin-deny-api', 'admin-spa']);
+});
+
+test('#450 管理台段可缺省：不带 adminHost 时不生成（单入口老部署字节不变），带了则非法值 fail-closed', () => {
+  const legacy = generateTraefikConfig({
+    portalHost: 'station.localhost',
+    portalBackendUrl: 'http://127.0.0.1:18080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: [],
+  });
+  assert.ok(!legacy.includes('adminsecure'), '没有管理台 host 就不生成管理台段');
+  assert.ok(!legacy.includes('admin-deny'), '没有管理台段也就不需要 deny');
+
+  const bad = [
+    { adminHost: 'ADMIN.fde.erix.vip' },
+    { adminHost: 'admin..fde.erix.vip' },
+    { adminHost: 'admin.fde.erix.vip\nX: 1' },
+    { adminEntryPoint: 'admin secure' },
+    { adminIpAllowlist: ['not-a-cidr'] },
+  ];
+  for (const extra of bad) {
+    assert.throws(() => generateTraefikConfig({ ...ADMIN_ARGS, ...extra }), `必须拒绝：${JSON.stringify(extra)}`);
+  }
 });
