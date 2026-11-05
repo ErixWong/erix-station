@@ -129,6 +129,60 @@ test('单文件超上限：截断并留 marker（含原字节数 + 可直接照�
   });
 });
 
+// #451 评审 B1（blocker）判据：上限必须在**读之前**生效。旧形状（先整文件 readFileSync 再比长度）
+// 在这两格上全红：它读满了整个文件，`stat.size` 从没用过。
+test('B1：单文件 maxFileBytes×40（≈640 KiB）⇒ 只读定长前缀，readFileSync 对该路径一次都没调', async () => {
+  const maxFileBytes = AGENTS_MD_MAX_FILE_BYTES;
+  const bigBytes = maxFileBytes * 40; // 655360 B：足够证明「不是靠 readFileSync 拿全文」
+  await withTree({ 'home/AGENTS.md': 'x'.repeat(bigBytes) }, ({ home, cwd }) => {
+    const readFileSyncCalls = [];
+    const readSyncLengths = [];
+    const facade = {
+      ...fs,
+      readFileSync: (target, ...rest) => {
+        readFileSyncCalls.push(String(target));
+        return fs.readFileSync(target, ...rest);
+      },
+      readSync: (fd, buffer, offset, length, position) => {
+        readSyncLengths.push(length);
+        return fs.readSync(fd, buffer, offset, length, position);
+      },
+    };
+    const { blocks } = collectAgentsMd({ cwd, home, fs: facade });
+    assert.equal(blocks.length, 1);
+    const block = blocks[0];
+    assert.equal(block.truncated, true, 'maxFileBytes×40 必须标 truncated');
+    assert.ok(readSyncLengths.length > 0, '超限文件必须走定长前缀读（openSync + readSync + closeSync）');
+    assert.ok(readSyncLengths.every((n) => n <= maxFileBytes + 4),
+      `readSync 每次读的字节数必须 ≤ maxFileBytes+4（实际 ${JSON.stringify(readSyncLengths)}）`);
+    assert.equal(readFileSyncCalls.filter((p) => p.endsWith('/AGENTS.md')).length, 0,
+      `超限的文件不许整文件 readFileSync（实际调了 ${JSON.stringify(readFileSyncCalls)}）：` +
+      '这是本条 finding 的核心——旧写法在这里会把 600 MiB 拉进内存再抛 ERR_STRING_TOO_LONG');
+    assert.ok(block.bytes > maxFileBytes && block.bytes < bigBytes / 4,
+      `注入字节数必须合理（实际 ${block.bytes}，文件 ${bigBytes}）`);
+    assert.match(block.text, new RegExp(`\\[已截断：原 ${bigBytes} 字节，仅注入前 ${maxFileBytes} 字节`),
+      'marker 必须报**原文件**字节数（前缀读之后 buf.length 只是前缀长度，报它会骗模型）');
+  });
+});
+
+test('B1：16 KiB 边界不变形——16384 不截断 / 16385 截断（上限口径仍是「正文」）', async () => {
+  const maxFileBytes = AGENTS_MD_MAX_FILE_BYTES;
+  assert.equal(maxFileBytes, 16384, '本用例的 16384/16385 字面量跟常量绑死');
+  await withTree({
+    'home/AGENTS.md': 'x'.repeat(maxFileBytes), // 正好卡在上限：一个字节都不许多读
+    'home/projects/proj/AGENTS.md': 'y'.repeat(maxFileBytes + 1), // 多 1 字节就该截
+  }, ({ home, cwd }) => {
+    const { blocks } = collectAgentsMd({ cwd, home });
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform', 'project']);
+    const [exact, over] = blocks;
+    assert.equal(exact.truncated, false, '正好 16384 字节不得截断（边界上多切一个字节就是改写约定）');
+    assert.equal(exact.bytes, maxFileBytes, '不截断时注入字节数必须逐字节等于文件字节数');
+    assert.equal(over.truncated, true, '16385 字节必须截断（上限是硬口径，没有“差一个字节就放过”）');
+    assert.match(over.text, new RegExp(`\\[已截断：原 ${maxFileBytes + 1} 字节`),
+      'marker 必须报真实原字节数（16385，不是前缀长度）');
+  });
+});
+
 test('全链超上限：从内层开始截，平台节保持完整', async () => {
   const body = (tag) => `# ${tag}\n${'y'.repeat(80)}`;
   await withTree({

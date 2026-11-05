@@ -94,6 +94,42 @@ function utf8Prefix(buf, maxBytes) {
   return buf.subarray(0, end).toString('utf8');
 }
 
+/**
+ * #451 评审 B1（blocker）：**只读文件前 `maxBytes + 4` 字节**，定长缓冲 ⇒ 超大文件不会整文件进内存。
+ *
+ * 为什么是 +4：一个 UTF-8 字符最长 4 字节，多读 4 个字节就必然能判定第 `maxBytes` 字节是不是字符边界
+ * （`utf8Prefix` 要往回退到前导字节），也必然能在尾部判断末段字符是否完整（`trimIncompleteUtf8Tail`）。
+ *
+ * 逐次补读（`readSync` 对普通文件通常一次读满，但短读在语义上是合法的）；`closeSync` 放 finally，
+ * 关不掉不影响已经读到的前缀。**不整文件 `readFileSync`** 就是这条的存在理由：600 MiB 的 `AGENTS.md`
+ * 旧写法要 647 MB RSS + 抛 `ERR_STRING_TOO_LONG`（⇒ worker 兜住后整段注入置空，连平台节都没了）。
+ */
+function readPrefix(fsImpl, file, maxBytes) {
+  const length = maxBytes + 4;
+  const buf = Buffer.alloc(length); // 定长：内存占用与文件大小无关
+  const fd = fsImpl.openSync(file, 'r');
+  try {
+    let got = 0;
+    while (got < length) {
+      const n = fsImpl.readSync(fd, buf, got, length - got, got) ?? 0;
+      if (n <= 0) break; // EOF
+      got += n;
+    }
+    return buf.subarray(0, got);
+  } finally {
+    try {
+      fsImpl.closeSync(fd);
+    } catch {
+      // 关闭失败（EBADF 之类）不影响已经读进缓冲的前缀：降级口径，不记账也不抛。
+    }
+  }
+}
+
+function canPrefixRead(fsImpl) {
+  return typeof fsImpl.openSync === 'function' && typeof fsImpl.readSync === 'function'
+    && typeof fsImpl.closeSync === 'function';
+}
+
 function scopeOf(dir, realHome) {
   if (!realHome) return 'project'; // home 不可用 ⇒ 没有平台/跨项目节可言，全部按项目节标
   if (dir === realHome) return 'platform';
@@ -218,16 +254,30 @@ export function collectAgentsMd(options = {}) {
       notes.push(`跳过 ${display}：真实路径 ${realFile} 越出 ${boundary}`);
       continue;
     }
-    let raw;
+    // #451 评审 B1（blocker）：**上限必须在读之前生效**。旧形状是「整文件 `readFileSync` ⇒ 全量解码
+    // ⇒ 才比 `buf.length > maxFileBytes`」：`stat.size` 拿到了却从没用过，实测 600 MiB 的 `AGENTS.md`
+    // ⇒ 抛 `ERR_STRING_TOO_LONG`、RSS 647 MB、563 ms，抛出去被 worker 的 catch 接住 ⇒ **整段置空**
+    // （连平台节都不注入）。现在 size 说超限就只定长读前缀，未超限才走原来的 `readFileSync`。
+    // ⚠ `stat.size` 对某些特殊文件（/proc、部分 FUSE）可能是 0 ⇒ 只当**提示**用：不可信时仍走
+    //   `readFileSync`，最终由下面的 `buf.length > maxFileBytes` 兜住截断（防御性，判定口径不变）。
+    let buf;
+    let text;
+    const sourceBytes = Number.isSafeInteger(stat.size) && stat.size > 0 ? stat.size : 0;
     try {
-      raw = fsImpl.readFileSync(realFile);
+      if (sourceBytes > maxFileBytes && canPrefixRead(fsImpl)) {
+        buf = readPrefix(fsImpl, realFile, maxFileBytes);
+      } else {
+        const raw = fsImpl.readFileSync(realFile);
+        buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
+      }
+      // 归一与解码**必须在这一层 try 内**（#451 评审 B1 第 4 点）：解码失败也要走下面同一条降级路径，
+      // 不许从 `collectAgentsMd` 里抛出去（抛 = worker 进程死 = run 被当崩溃 requeue）。
+      text = buf.toString('utf8');
     } catch (err) {
       // EACCES 等：**绝不抛**。用户把某份写成 0600 且属主不是 worker 就会走到这里。
       notes.push(`跳过 ${display}：读取失败（${errLabel(err)}）`);
       continue;
     }
-    const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
-    const text = buf.toString('utf8');
     if (text.trim() === '') continue; // 空 / 全空白：跳过（不产生空节）
     const sha = crypto.createHash('sha256').update(buf).digest('hex');
     if (seen.has(sha)) {
@@ -245,7 +295,8 @@ export function collectAgentsMd(options = {}) {
     const bodyBytes = Buffer.byteLength(body);
     if (truncated) {
       // marker 里的数字是**原文件字节数**与**实际注入的字节数**，命令可直接照抄（模型据此才读得到全文）。
-      body += `\n\n[已截断：原 ${buf.length} 字节，仅注入前 ${bodyBytes} 字节；看全文：cat ${display}]`;
+      // 原字节数取 `max(stat.size, buf.length)`：走前缀读时 `buf.length` 只是前缀长度，报它会骗模型（旧 L116 用例钉的就是真实大小）。
+      body += `\n\n[已截断：原 ${Math.max(sourceBytes, buf.length)} 字节，仅注入前 ${bodyBytes} 字节；看全文：cat ${display}]`;
     }
     blocks.push({
       dir: entry.dir,
