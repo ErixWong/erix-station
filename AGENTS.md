@@ -3879,3 +3879,41 @@ runner **473 不变**；
 （只比 CN，且只在没给私钥时出现）——`PUT` 一定有私钥，走的是 C5 的硬判据；③ `chain_incomplete` 的判定依赖
 服务端「只发 1 张」这个事实，若某个前置代理补链，verify 看到的是补链后的结果（这本来就是我们要的事实）；
 ④ S4 砍掉的是**日常读写路径上的无意暴露面**，不是「portal 被攻破后主动 `readFile` 的能力」（那要动权限模型，见安全文档 R4 残余）。
+
+### 8.101 v0.1.55 发版与部署：#462 证书链 + S4 上线，真机六条全过（2026-11-05 深夜）
+
+**载荷**：`#463`（#462 链完整性 + 安全文档 S4）。**`runner/` 非版本文件零改动** ⇒ 只 pin portal + proxy，五台 FDE 不重建。
+
+**发版与部署**：`30d24e2`（PR #463 merge）→ `dd7c6b9`（版本 0.1.55）→ main CI `42063254168` 两个 job 全绿（先等绿再打 tag）
+→ tag `v0.1.55` → release `42064531259` success → portal/proxy `docker pull` 后 `image inspect .Id` **逐个一致**
+（portal `83d0973a…` / proxy `ee908a10…`；fde `a26f9f09…` 未拉）→ `.env` pin 两行（备份 `/tmp/deploy.env.bak-0155`）
+→ `up -d --no-build station-portal station-docker-proxy` ⇒ portal healthy、`healthz=200`、`openssl Verify return code: 0`。
+
+**真机验收（v0.1.55，dev 栈，主 agent 亲手；API 面用 admin 会话 + `Host`/`Origin` 都带 `:9443`，UI 面用 playwright）**
+
+| # | 动作 | 结果 |
+|---|---|---|
+| A1 | PUT **真 4 段 fullchain（bundle）** | **200**、审计**无 `chainWarnings` 键**、落盘 `sha256 9686693a…` **与提交逐字节相同**、服务端 4 层、`Verify return code: 0` |
+| A2 | inspect **leaf-only** | 200、`keyMatches:true`、`coverage.covered:true`、`warnings:['chain_looks_leaf_only']`（UI 上文案可见） |
+| A2 | PUT leaf-only | **200（警告不拒）**、审计 `details.chainWarnings=["chain_looks_leaf_only"]`、服务端变 **1 层**、严格校验 **21** |
+| A2 | **verify（#462 的核心）** | **`mismatch` + `reason:'chain_incomplete'` + `chainDepth:1`**（修复前这里报 `live ✓`）；UI 文案逐字：「live fingerprint matches this certificate, but the server sent only 1 certificate (chain depth 1)…」 |
+| A2b | rollback | 200、`sha256` 回到 `9686693a…` **逐字节相同**、4 层、`Verify return code: 0`、verify 回 `live`（`chainDepth 5`） |
+| A3 | PUT **wrong-order（中间证书在前）** | **400 `tls_cert_order_invalid`**、`retryable:false`、`details={firstSubjectCN:'YE1', leafSubjectCN:'fde.erix.vip'}`、文案点名「现在第一个是「YE1」（中间证书）」；**盘上一个字节没动** |
+| A4 | inspect wrong-order **带钥** | **400 同码**（有配对证据 ⇒ 直接拒，不给可疑警告） |
+| A5 | inspect wrong-order **不带钥** | 200 + `chain_order_suspect`（另带 `no_sans`/`admin_host_not_covered`，因为此时 `cert` 只能取第一段=中间证书，是**如实**的） |
+| A6 | PUT **断链**（叶子 + 跳过中间证书的 Root YE） | **400 `tls_cert_chain_broken`**、`details={index:1, subjectCN:'fde.erix.vip', issuerCN:'YE1', nextSubjectCN:'Root YE'}` |
+| A7 | inspect 断链 | 200 + `chain_broken`（`keyMatches:true`） |
+
+**「bundle 带根」的真机数据（回答决策者 2026-11-05 的提问）**：现网那张就是 **4 段**（leaf + YE1 + Root YE + ISRG Root X2）
+⇒ 加载正常、4 层、严格校验 0；一次性测试 PKI 上另测了 leaf+int（2 层，严格校验 0）与 leaf+int+root（3 层，0）⇒
+**bundle 无论带不带根都不警告**。⚠ 但真机上 **leaf+YE1（2 层）在本机系统 CA 下验不过（error 20）** ——
+因为这张证书的链要经 Root YE 才接到受信根，所以「链长够不够」不能靠段数判，判据只能是 `checkIssued` 逐对成立
+（我们的实现正是如此），**再加真机校验的链深**兜底。
+
+**收尾**：探针用的临时私钥 `/tmp/key-real.pem`、cookie jar、各 body/响应文件**全部删除**；`certs/tls.crt` 终态
+`sha256 9686693a…`（与部署前逐字节相同）、4 层、`Verify return code: 0`、verify `live`。台账里新增的是
+A1/A2/A2b 三条 `upload`/`rollback` 行（正常产物，非残渣）。
+
+**⚠ worker 环境性红第 6 次**：worker 报「3 条 `GitLightBadge.spec.ts` 预存失败（基线 83447df 上同样 3 红）」并据此改了
+`ci-release.md` 与 AGENTS —— **不成立**：主 agent 空载连跑两次都是 **59 文件 / 1149 全绿 rc=0**（单跑该文件 18/18），
+CI 也绿。两处已更正，并把「worker 报的基线数字必须自己复算」写进 §8.100。
