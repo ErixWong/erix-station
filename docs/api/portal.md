@@ -54,6 +54,9 @@
 | 管理 | `POST /api/admin/users/:id/reset-password` | 重置口令并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-reset` | 清除 TOTP 绑定并强制重新登录 |
 | 管理 | `POST /api/admin/users/:id/totp-enroll` | 补绑/重绑 TOTP；新种子只在本次响应下发并强制重新登录 |
+| 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
+| 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
+| 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
 | 会话 | `GET /api/sessions` | 会话列表 |
 | 会话 | `POST /api/sessions` | 创建会话 |
 | 会话 | `GET /api/sessions/:id` | 会话详情（含消息历史 + `last_seq`） |
@@ -141,11 +144,12 @@
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 409 | `email_not_registered`（#449）| **邮件通道已启用，但这个账号没有邮箱** ⇒ 第二因素做不成（`users.email` 为空）。`retryable: false`：重试一万次也不会长出邮箱，`message` 直接给出路「请联系管理员补录邮箱」。**关键语义：绝不静默退回纯口令**（否则「开了第二因素」只是控制台的错觉）。落点：§2.2 第一步与 §2.3b 重发 | 否 |
+| 409 | `mail_not_configured`（#449，管理台切片）| **测试发信时邮件通道未启用**（`mail_settings` 无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半 ⇒ 读取侧一律 `enabled:false`）。`retryable: false`：重试一万次也发不出去，`message` 直接给出路「先去管理台配 SMTP」。落点只有 `POST /api/admin/mail/test`（§4.12）——登录路径同一种状态**不是错误**（它按「没有第二因素」正常退回纯口令，§2.2 第④分支）| 否 |
 | 409 | `llm_model_not_found`（#261014 切片 B2，工单 `fix-261014-05b2`）| **发消息预检 fail-fast**：`POST /api/sessions/:id/messages` 在建 run 之前发现「会话属主 active LiteLLM binding 里某个**已配置槽位**的 `model_info.id` 在网关 `/model/info` 里查不到」（模型被删除/重建 ⇒ **id 变**）。**与 `llm_not_configured` 的关键差别：后者是「压根没配」，本码是「配过，但那个模型已经不存在了」**。`details` = `{slot, model_id}`（`slot` 取值 `main` / `embedding` / `vision`）。**选 409 而不是 424**：请求本身合法且已认证，失败原因是「绑定配置与网关目录的状态互相矛盾」，与同端点既有的 `409 llm_not_configured` / `409 run_in_progress` 同族（424 Failed Dependency 语义是「依赖的前置请求失败」，这里没有任何前置请求，且 §4.3 全表无 424 先例）。**只在发消息路径拦**：心跳路径同判据仍只 `warn`（§9.5，`reason: 'unknown_model_id'`）；**网关不可达一律放行**（fail-open，不让网关抖动演成用户发不出消息）| 是（管理员改配后原样重试可成功；本预检零副作用、不写幂等台账，同 `Idempotency-Key` 重试会重新占位，§1.4。**盲目立即重试仍是同一码**——解法只有一个：改配） |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
-| 503 | `email_send_failed`（#449）| **验证码邮件没发出去**（SMTP 超时/拒绝/未配置口令解不开等，`details` 不带正文）。`retryable: true`：**`pending_token` 不作废**，用户点「重发」（§2.3b）即可，不必重输口令 | 是 |
+| 503 | `email_send_failed`（#449）| **验证码邮件没发出去**（SMTP 超时/拒绝/未配置口令解不开等，`details` 不带正文）。`retryable: true`：**`pending_token` 不作废**，用户点「重发」（§2.3b）即可，不必重输口令。**管理台测试发信（§4.12）用同一个码但回 `502`**：那是管理员手点的一次探活请求，没有「待决登录」可保留，`details` 只有 `{reason}` 摘要 | 是 |
 | 500 | `internal` | 未分类服务端错误 | 否 |
 
 > 资源归属一律以「当前登录用户」过滤：**越权访问与他人资源一律表现为 404**（`not_found`），只有「本人资源上的越级操作」（如普通 FDE 开 `public` 端口）才返回 403。
@@ -1993,6 +1997,153 @@ JSON 通道的 415/413 同时写 `preview_miss_stats` 埋点（见下）。
 ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写失败只 `warn` 不拖预览。
 用途：看真实需求面再决定要不要把某格式提进原生白名单。
 
+### 4.12 管理台邮件通道配置（`/api/admin/mail/*`，#449）
+
+> 规格：issue #449（管理台切片；决策者 2026-11-04/05：**SMTP 参数存 DB**，不进 env）。
+> 实现：`portal/src/mail-settings.js`（校验 + 单条 upsert）、`portal/src/mail-provider.js`（读侧：60s 缓存 + 急停硬闸）、
+> `portal/src/http.js`（分派 / 缓存失效 / 审计）。表结构见 `docs/data/model.md` §1.31（迁移 0026）。
+> 三个端点全部过 `requireAdmin`：非 admin ⇒ `403 forbidden`，未登录 ⇒ `401 unauthorized`。
+> **这张表是登录第二因素「邮箱验证码」（§2.3a/§2.3b）的唯一真相**：管理台配好 `transport='smtp'` 且 `MAIL_TRANSPORT` 未设成 `disabled`，邮件通道才生效。
+
+#### 4.12-1 配置 DTO（GET 与 PUT 同一个形状）
+
+```json
+{
+  "transport": "smtp",
+  "smtp": {
+    "host": "relay.internal",
+    "port": 25,
+    "secure": false,
+    "user": "svc",
+    "from": "noreply@example.com",
+    "timeouts": { "connectionMs": 10000, "greetingMs": 10000, "socketMs": 20000 }
+  },
+  "hasPassword": true,
+  "updatedAt": "2026-11-05T08:12:31.004Z",
+  "updatedBy": "3f2c…（admin 的 users.id，uuid）"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `transport` | `'disabled'` \| `'smtp'` | 唯一决定「发不发信」的应用层开关（`disabled` = 不发） |
+| `smtp.host` / `smtp.from` | string | relay 地址与发件人；`transport='smtp'` 时两者都必填 |
+| `smtp.port` | int 1–65535 | 缺省 `587` |
+| `smtp.secure` | boolean | `true` = implicit TLS（465 形态），`false` = STARTTLS；缺省 `true` |
+| `smtp.user` | string | **可空**（内网 relay 常按来源 IP 放行、不需要认证） |
+| `smtp.timeouts.*` | 正整数（ms，≤ 600000） | 缺省 `10000 / 10000 / 20000`，直接映射 nodemailer 三档超时 |
+| `hasPassword` | boolean | **只有布尔**：`smtp_password` 是非空字符串时为 `true`。**任何响应都不返回口令明文** |
+| `updatedAt` | string\|null | 最后修改时刻（无行时 `null`） |
+| `updatedBy` | string\|null | 最后修改的 admin `users.id`（无行时 `null`；不建 FK，删用户不拦配置行） |
+
+#### 4.12-2 `GET /api/admin/mail/settings`
+
+无请求参数。**无 `mail_settings` 行时回 `200` + 默认 DTO，不是 404**——「未配置」是正常态（本单上线时的默认形态）：
+
+```json
+{
+  "transport": "disabled",
+  "smtp": { "host": "", "port": 587, "secure": true, "user": "", "from": "",
+            "timeouts": { "connectionMs": 10000, "greetingMs": 10000, "socketMs": 20000 } },
+  "hasPassword": false,
+  "updatedAt": null,
+  "updatedBy": null
+}
+```
+
+本端点**不写审计**（纯读、每次进管理页都会调）。
+
+#### 4.12-3 `PUT /api/admin/mail/settings`
+
+请求体 = DTO 的 `transport` + `smtp`（`hasPassword`/`updatedAt`/`updatedBy` 是**响应侧只读**字段，传了也忽略），
+外加**只写**字段 `password`：
+
+```json
+{ "transport": "smtp",
+  "smtp": { "host": "relay.internal", "port": 25, "secure": false, "user": "svc",
+            "from": "noreply@example.com",
+            "timeouts": { "connectionMs": 10000, "greetingMs": 10000, "socketMs": 20000 } },
+  "password": "<明文口令，只在请求里出现>" }
+```
+
+**口令三态（`password` 只写不读）**：
+
+| 请求里的 `password` | 语义 |
+|---|---|
+| **键缺席** | **保持原值**（编辑表单留空 = 不修改，项目既有口径，同 #314 一族）|
+| `null` 或 `""` | **清除**（`smtp_password → NULL`，`hasPassword` 变 `false`）|
+| 非空字符串 | **覆盖**（原样存，不 trim：口令里的空格是内容；上限 8192 字符）|
+
+**校验矩阵**（失败一律 `400 validation_failed` + `details.field`；`retryable:false`）：
+
+| `details.field` | 何时 |
+|---|---|
+| `body` | 请求体不是 JSON 对象 |
+| `transport` | 不是 `'disabled'` / `'smtp'`（含缺席） |
+| `smtp` | 不是对象 |
+| `smtp.host` | `transport='smtp'` 时为空/全空白；或给了非字符串（**类型错一律拦**：否则会在 DB 层变成 500）|
+| `smtp.from` | `transport='smtp'` 时为空；或不匹配邮箱正则 `^[^\s@]+@[^\s@]+\.[^\s@]+$`（**与 `admin.js` 建号同一个正则口径**，单测有源码级判据把两处钉在一起）|
+| `smtp.port` | 非 `1–65535` 的整数（字符串 `"25"` 也拒：JSON 里它就该是数字）|
+| `smtp.secure` | 非布尔 |
+| `smtp.timeouts.connectionMs` / `greetingMs` / `socketMs` | 非 `1–600000` 的正整数 |
+| `password` | 既不是字符串也不是 `null`/`""`；或超过 8192 字符 |
+
+**`transport='disabled'` 时 `host`/`from` 一律不校验**（允许「先关掉再慢慢配」，也允许关掉时保留半套配置）——
+**这是刻意的宽松**：只有真要发信（`smtp`）时才要求配全。迁移 0026 的
+`CHECK (transport <> 'smtp' OR (smtp_host IS NOT NULL AND smtp_from IS NOT NULL))` 是最后一道兜底。
+
+**落库**：单条 `INSERT … ON CONFLICT (id) DO UPDATE`（`id=1`、`updated_at=now()`、`updated_by=当前 admin`）。
+不用「先查再决定 INSERT/UPDATE」：两个管理员同时保存不会撞主键。
+
+**成功后的三步（顺序固定）**：
+
+1. `ctx.mailerProvider.invalidate()` —— 改配置**立刻**生效，不等 60s TTL（否则「配好了却要等一分钟」会被当成配置没生效）；
+2. 审计 `admin.mail_settings_updated`，`details` = `{ changed: [键名…], password_changed: bool, transport }`；
+3. 回 `200` + 与 GET 相同的 DTO。
+
+`changed` 的键名取值：`transport`、`smtp.host`、`smtp.port`、`smtp.secure`、`smtp.user`、`smtp.from`、
+`smtp.timeouts.connectionMs`、`smtp.timeouts.greetingMs`、`smtp.timeouts.socketMs`、`password`（口令真的变了才出现）。
+它是「相对上一次状态**真落库的变化**」（以 `RETURNING` 回读的行为准，不信输入；无行时基线 = GET 的默认 DTO）。
+什么都没变 ⇒ `changed: []`（仍然是 `200` + 一条审计：幂等保存不是错误）。
+
+#### 4.12-4 `POST /api/admin/mail/test`
+
+用**已保存的配置**真发一封测试信（不是用请求体里的配置）。
+
+```json
+{ "to": "ops@example.com" }
+```
+
+成功：`200 { "ok": true, "to": "ops@example.com", "at": "2026-11-05T08:20:11.220Z" }`。
+
+正文是「这是测试信 + 发送时间戳 + 无需操作」，**不含验证码**（运维手点的探活信不该带任何凭据）。
+
+| 情形 | 响应 |
+|---|---|
+| `to` 缺席/空/不是邮箱（同一正则） | `400 validation_failed`，`details.field='to'`（**不发信、不烧配额**）|
+| 超过限流（每管理员 **5 次/小时**，key `mailtest:<adminId>`）| `429 rate_limited` + `Retry-After`（秒）|
+| 通道未启用（无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半）| **`409 mail_not_configured`**（`retryable:false`，message 指出「先去配置 SMTP」；**此时不烧配额**——还没配好就先把额度用光不合理）|
+| 发信失败（超时/拒绝/认证失败） | `502 email_send_failed`（`retryable:true`，`details` **只有** `{reason}` 摘要，**不含口令/正文**）|
+
+限流器是内存态（单实例，重启清空）：与登录限流同一套 `createRateLimiter`，**每次真会发信的尝试都计一次**
+（含失败的那次——探活失败也是打了一次 relay）；`config.mailTestRateLimit` 可覆盖默认 `5 次 / 1 小时 / 封 1 小时`。
+
+#### 4.12-5 审计口径
+
+| action | 触发 | `details` |
+|---|---|---|
+| `admin.mail_settings_updated` | PUT 成功 | `{ changed: [键名…], password_changed: bool, transport }` |
+| `admin.mail_test_sent` | 测试发信成功 | `{ to, at }` |
+| `admin.mail_test_failed` | 测试发信失败（502）| `{ to, at, reason }`（`reason` 是底层错误的单行摘要，截断 120 字符）|
+
+三条都带 `actor_id = 当前 admin`、`target = 'mail_settings'`。
+
+#### 4.12-6 红线：口令只写不读
+
+- **响应**：只有 `hasPassword` 布尔。DTO 里没有 `password` / `smtp_password` 键。
+- **审计**：只有 `password_changed` 布尔与键名 `'password'`，**没有口令值**。
+- **日志**：本切片不打日志（发信失败由 `mailer.js` 记一条脱敏收件人 + reason，与登录路径同口径）。
+- 单测 `portal/test/admin-mail-settings.test.js` 有两条专门搜口令明文的判据（响应体 + 整条审计 `details` 序列化）。
 
 ---
 
