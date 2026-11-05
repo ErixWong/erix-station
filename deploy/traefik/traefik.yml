@@ -16,6 +16,19 @@ entryPoints:
     address: ":8443"
     http:
       aliasHeadersStrategy: delete
+  # issue #450 / feat-261105-01：管理台独立入口（与用户面 web/websecure 端口隔离，配合独立 host admin.<伞域>）。
+  # ⚠ 端口写死 9443 —— 本文件里的 `${VAR:default}` **不会被插值**（实测 traefik:v3.7.13 + `--configFile`，
+  #   见 .work-orders/450-admin-entry-A1-report.md 的实测输出）：地址原样变成字面量，Traefik 起不来
+  #   （`listen tcp: lookup tcp/9443}: unknown port`）。带 `--configFile` 时 `TRAEFIK_ENTRYPOINTS_*_ADDRESS`
+  #   这类 env 静态覆盖同样被忽略（实测只看到文件里的 web/websecure）。
+  # ⇒ **两处耦合**：改端口要同时改 ① 本行 ② `deploy/.env` 的 `TRAEFIK_ADMIN_PORT`（宿主=容器端口，
+  #   station-edge 是 `network_mode: host`，没有端口映射可跟着 env 走）。两处一致性由
+  #   `portal/test/deploy-env-defaults.test.js` 机器判据钉住（不是靠人记）。改完必须重启边缘（静态配置只在启动时读）。
+  # 绑定 0.0.0.0 的理由同 web（FDE 容器经宿主可达）；来源限制靠路由层的 `ADMIN_IP_ALLOWLIST`（#450 D4）。
+  adminsecure:
+    address: ":9443"
+    http:
+      aliasHeadersStrategy: delete
 
 providers:
   file:
