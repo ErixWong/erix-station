@@ -15,6 +15,7 @@ import SidebarPanel from './SidebarPanel.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench';
 import type { DirInfo, Session } from '../stores/workbench';
 import { i18n, setLocale } from '../i18n';
@@ -282,7 +283,7 @@ describe('SidebarPanel · 左栏视觉收敛（issue #112）', () => {
     expect(ctrl('select').classList).toContain('h-8');
     expect(ctrl('select').classList).toContain('text-[12px]');
     expect(ctrl('button[title="刷新目录列表与目录树"]').classList).toContain('h-8');
-    expect(ctrl('a[href="/admin"]').classList).toContain('h-8');
+    expect(ctrl('[data-test="admin-console-link"]').classList).toContain('h-8');
     expect(ctrl('label[for="dirSel"]').classList).toContain('text-[11px]');
   });
 });
@@ -350,7 +351,7 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     const wrapper = await mountPanel({ noDir: true, adminUser: true });
     const { list } = paneEls(wrapper);
     expect(list.textContent).not.toContain('请到管理台');
-    expect(wrapper.get('a[href="/admin"]').text()).toBe('管理台');
+    expect(wrapper.get('[data-test="admin-console-link"]').text()).toBe('管理台');
   });
 
   it('切 English：侧栏（含 DirSelect 子组件）文案即时变英文', async () => {
@@ -373,6 +374,19 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.findAll('form button').map((b) => b.text())).toEqual(['Create', 'Cancel']);
   });
 
+  it('#450 A2：管理台入口是**跨 host 的绝对地址**（site 有值 ⇒ adminBaseUrl#/admin；无值 ⇒ 退回相对 hash）', async () => {
+    const wrapper = await mountPanel({ noDir: true, adminUser: true });
+    const link = () => wrapper.get('[data-test="admin-console-link"]');
+    // fetch 桩对 /api/site 回 `{"items":[]}` ⇒ 形状不对 ⇒ site 不可用 ⇒ fail-open 退回相对 hash。
+    expect(link().attributes('href')).toBe('#/admin');
+    useSiteStore().info = {
+      userBaseUrl: 'http://station.fde.erix.vip:8090',
+      adminBaseUrl: 'https://admin.fde.erix.vip:9443',
+    };
+    await flushPromises();
+    expect(link().attributes('href')).toBe('https://admin.fde.erix.vip:9443#/admin');
+  });
+
   it('切 English：管理台入口变英文，且被删掉的两句指路文案不会以任何形态回潮', async () => {
     // issue #332：zh / en 两侧的 `common.platformAdminHint`、`common.goToAdmin` 必须**成对消失**
     // （键集对齐另有 localeParity.spec 兜底，这里钉渲染结果）。
@@ -382,7 +396,7 @@ describe('SidebarPanel · i18n（issue #101 P2）', () => {
     expect(wrapper.text()).toContain('Create a directory first');
     expect(wrapper.text()).not.toContain('Platform admin');
     expect(wrapper.text()).not.toContain('Go to admin console');
-    expect(wrapper.get('a[href="/admin"]').text()).toBe('Admin console');
+    expect(wrapper.get('[data-test="admin-console-link"]').text()).toBe('Admin console');
   });
 });
 

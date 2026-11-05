@@ -791,6 +791,50 @@ test('旧路径 /api/login、/api/logout → 307 到新路径', async () => {
   }
 });
 
+// #450 A2：`GET /api/site`——公开、零秘密、值全部来自既有配置（不在这里另拼 URL）。
+test('#450 A2：GET /api/site 公开（无 cookie 也 200）+ 零秘密（键集合恰好两个）+ 值原样来自配置', async () => {
+  const s = await startServer({
+    overrides: {
+      portalPublicBaseUrl: 'http://station.fde.erix.vip:8090',
+      adminPublicBaseUrl: 'https://admin.fde.erix.vip:9443',
+    },
+  });
+  try {
+    const r = await fetch(`${s.base}/api/site`); // ⚠ 不带 cookie
+    assert.equal(r.status, 200, '登录页也要用它 ⇒ 不能要求会话');
+    assert.match(r.headers.get('content-type') ?? '', /application\/json/);
+    const body = await r.json();
+    assert.deepEqual(Object.keys(body).sort(), ['adminBaseUrl', 'userBaseUrl'],
+      '零秘密：响应键集合恰好两个（多一个字段就是多一条运维面信息）');
+    assert.equal(body.userBaseUrl, 'http://station.fde.erix.vip:8090', 'userBaseUrl 取自 resolvePublicBaseUrl 的产物');
+    assert.equal(body.adminBaseUrl, 'https://admin.fde.erix.vip:9443', 'adminBaseUrl 取自 A1 的 adminPublicBaseUrl');
+
+    // 非 GET：405（与 /healthz 同口径，不新增错误码）
+    const post = await fetch(`${s.base}/api/site`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(post.status, 405);
+  } finally {
+    await s.close();
+  }
+});
+
+test('#450 A2：GET /api/site 原样回 443 形态（不带端口）——handler 不自己拼端口', async () => {
+  const s = await startServer({
+    overrides: {
+      portalPublicBaseUrl: 'https://station.fde.erix.vip',
+      adminPublicBaseUrl: 'https://admin.fde.erix.vip',
+    },
+  });
+  try {
+    const body = await (await fetch(`${s.base}/api/site`)).json();
+    assert.equal(body.userBaseUrl, 'https://station.fde.erix.vip');
+    assert.equal(body.adminBaseUrl, 'https://admin.fde.erix.vip', '443 时不带端口（与 resolveAdminPublicBaseUrl 同口径）');
+  } finally {
+    await s.close();
+  }
+});
+
 test('TOTP 限流按账户+IP 计数：换新 pending token 仍被限流（不被绕过）', async () => {
   const password = 'pw';
   const user = {

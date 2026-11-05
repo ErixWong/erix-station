@@ -705,6 +705,24 @@ test('#255③ 纯判据：清单外一律挡，清单内一律放（HEAD 按 GET
   assert.equal(restrictedSessionAllows('GET', '/api/me/password'), true, '不限方法：非 POST 该拿 405，不是 403');
   // `/api/me` 的前缀不能顺手写成 startsWith，否则 `/api/me/ports` 会被误放。
   assert.equal(restrictedSessionAllows('GET', '/api/meeee'), false);
+  // #450 A2：`/api/site` 本身是公开端点（无会话也 200），拿「欠不欠改密」挡它不自洽；
+  // 被挡的后果还是**静默降级**（前端 host 闸 fail-open ⇒ 受限会话在错的 host 上照样渲染出一片 404）。
+  assert.equal(restrictedSessionAllows('GET', '/api/site'), true, '/api/site 必须在放行清单里（#450 A2）');
+});
+
+test('#255③ 清单内不被挡：GET /api/site 200（#450 A2 的 host 信息端点，公开零秘密）', async () => {
+  const t = await setupGate();
+  try {
+    const res = await get(t.base, '/api/site', t.cookie);
+    assert.equal(res.status, 200, `应 200（实际 ${res.status}：${await res.clone().text()}）`);
+    const body = await res.json();
+    assert.notEqual(body?.error?.code, 'password_change_required', '受限会话不该被 host 信息端点挡在门外');
+    // 键集合（零秘密）与两个值的来源在 portal/test/http.test.js 里逐条钉住（那里给了完整 config）；
+    // 本例只关心「门有没有把它挡掉」。
+    assert.equal(body.error, undefined, `不是错误信封（实际 ${JSON.stringify(body)}）`);
+  } finally {
+    await t.close();
+  }
 });
 
 test('#255③ 旗标为真 ⇒ 清单外的 GET /api/sessions 一律 403 password_change_required（且不写审计）', async () => {

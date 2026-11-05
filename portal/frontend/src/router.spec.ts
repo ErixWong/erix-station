@@ -316,3 +316,123 @@ describe('#255 守卫重定向链条的熔断接线', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// #450 A2：host 闸的**守卫接线**用例。
+//
+// 与 `lib/hostGate.spec.ts` 的分工：那里测「判据算得对」（纯函数、六行矩阵、防环、fail-open），
+// 这里测「守卫真的调了它、排在 `ensureMe()` 之前、跳完终止导航」——四条接线各自对应一条变异：
+//  · 删掉 `router.ts` 里那段 host 闸 ⇒ 第一、二条必红；
+//  · 把 `return false` 换成 `return { path: to.path }`（在错的 origin 上继续导航）⇒ 第一、二条的
+//    「导航被终止」断言红；
+//  · 把 host 闸挪到 `auth.ensureMe()` 之后 ⇒ 「跳转前只打了 /api/site」那条红；
+//  · 让 `ensureSite()` 失败时抛（fail-closed）⇒ 第三条红。
+// ---------------------------------------------------------------------------
+
+/** 现网形态（docs/deploy/edge-routing.md §1/§4）。 */
+const USER_ORIGIN = 'http://station.fde.erix.vip:8090';
+const ADMIN_ORIGIN = 'https://admin.fde.erix.vip:9443';
+const SITE_BODY = { userBaseUrl: USER_ORIGIN, adminBaseUrl: ADMIN_ORIGIN };
+
+/**
+ * 按路径分流的 fetch 桩：`/api/site` 与 `/api/me` 各自回各自的东西。
+ * ⚠ 不能用本文件既有的 `fetchMe`（它对**所有** URL 回同一个 body）：那样 `/api/site` 会拿到 `{user}`，
+ * 于是 site store 永远是 unavailable，host 闸永远 fail-open —— 用例就测不到跳转了。
+ */
+function stubApiByPath({ site, me }: {
+  site: { status: number; body: unknown };
+  me: { status: number; body: unknown };
+}): string[] {
+  const calls: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    calls.push(url);
+    if (url.startsWith('/api/site')) return jsonResponse(site.status, site.body);
+    if (url.startsWith('/api/me')) return jsonResponse(me.status, me.body);
+    return jsonResponse(404, { error: { code: 'not_found', message: 'not found' } });
+  }));
+  return calls;
+}
+
+/** 带上 host 闸的两个副作用桩（`navigate` 收集落点、`currentOrigin` 假装地址栏）。 */
+async function freshHostRouter(currentOrigin: string) {
+  setActivePinia(createPinia());
+  const navigations: string[] = [];
+  const router = createAppRouter(createMemoryHistory(), {
+    navigate: (url) => navigations.push(url),
+    currentOrigin: () => currentOrigin,
+  });
+  return { router, navigations };
+}
+
+describe('#450 A2 host 闸的守卫接线', () => {
+  it('用户 host 上打开 #/admin/users ⇒ 跨 host 跳管理台，且本次导航被终止（不在错的 origin 上落地）', async () => {
+    const calls = stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: ADMIN_USER } } });
+    const { router, navigations } = await freshHostRouter(USER_ORIGIN);
+
+    const failure = await router.push('/admin/users');
+
+    expect(navigations).toEqual([`${ADMIN_ORIGIN}#/admin/users`]);
+    expect(
+      isNavigationFailure(failure, NavigationFailureType.aborted),
+      `期望 NAVIGATION_ABORTED（跳完就停），实际：${String(failure)}`,
+    ).toBe(true);
+    expect(router.currentRoute.value.path).not.toBe('/admin/users');
+    // host 闸排在 ensureMe 之前：跳转发生前只该打 /api/site，一趟 /api/me 都不该发。
+    expect(calls).toEqual(['/api/site']);
+  });
+
+  it('管理台 host 上打开 #/session/x?tab=diff ⇒ 跳回用户面，深链与 query 原样保住', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
+    const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
+
+    const failure = await router.push('/session/abc?tab=diff');
+
+    expect(navigations).toEqual([`${USER_ORIGIN}#/session/abc?tab=diff`]);
+    expect(isNavigationFailure(failure, NavigationFailureType.aborted)).toBe(true);
+  });
+
+  it('site 不可用（5xx）⇒ 不跳，原导航继续（fail-open）', async () => {
+    stubApiByPath({
+      site: { status: 503, body: { error: { code: 'unavailable', message: 'down' } } },
+      me: { status: 200, body: { user: FDE_USER } },
+    });
+    const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
+
+    // 管理台 host 上本来「该跳」的那一格（/session/*）：site 拿不到就必须留在原地照常渲染。
+    expect(await router.push('/session/abc')).toBeUndefined();
+    expect(navigations).toEqual([]);
+    expect(router.currentRoute.value.path).toBe('/session/abc');
+  });
+
+  it('管理台 host 上已经在对的 host ⇒ 不跳（防重定向环）', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: ADMIN_USER } } });
+    const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
+
+    expect(await router.push('/admin/users')).toBeUndefined();
+    expect(navigations).toEqual([]);
+    expect(router.currentRoute.value.name).toBe('admin-users');
+  });
+
+  it('#332 × #450：无工位管理员在**用户 host** 上最终落到 adminBaseUrl#/admin/users（不是 #/，也不是裸 /admin）', async () => {
+    const SEATLESS = {
+      id: 'u0', login: 'root', display_name: 'Root', role: 'admin', fde_name: null, auth_source: 'local',
+    } as AuthUser;
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: SEATLESS } } });
+    const { router, navigations } = await freshHostRouter(USER_ORIGIN);
+
+    await router.push('/');
+    // workbenchGate 先把它改写去管理台（#332），路由表把 `/admin` 解析成 `/admin/users`，
+    // 然后 host 闸把「用户 host 上的 /admin/users」换成管理台的绝对地址。
+    expect(navigations).toEqual([`${ADMIN_ORIGIN}#/admin/users`]);
+  });
+
+  it('管理台 host 上 FDE 用户登录成功（落地 /）⇒ 跳回用户面（管理台不给 FDE 用，判据仍是 afterLoginRoute + host 闸）', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
+    const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
+
+    // LoginView 的 `router.replace(loginRedirect())`：FDE 的 afterLoginRoute 是 `/`。
+    await router.push('/');
+    expect(navigations).toEqual([`${USER_ORIGIN}#/`]);
+  });
+});
