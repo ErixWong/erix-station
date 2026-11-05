@@ -36,7 +36,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 export const AGENTS_MD_BASENAME = 'AGENTS.md';
-/** 单文件注入上限。平台节今天 9 KB，留一倍余量；再大就说明有人在约定文件里塞别的东西。 */
+/**
+ * 单文件**正文**注入上限。平台节今天 9 KB，留一倍余量；再大就说明有人在约定文件里塞别的东西。
+ * ⚠ 口径（#451 评审 m3）：这是**正文**上限，**截断 marker 另计**（约 100 B：评审实测 16385 B 的源
+ * ⇒ `blocks[].bytes = 16479`）；而全链 48 KiB 是按**含 marker** 的 `b.bytes` 累加 ⇒ 两个上限不同量纲，
+ * 差的就是 marker。**不改判定逻辑**（改了会动「16384 不截断 / 16385 截断」那条用例，收益为零）。
+ */
 export const AGENTS_MD_MAX_FILE_BYTES = 16 * 1024;
 /** 全链上限（= 3 份满载单文件）。超了**从内层开始截**：平台节必须完整（它装的是运行期硬约束）。 */
 export const AGENTS_MD_MAX_TOTAL_BYTES = 48 * 1024;
@@ -140,7 +145,9 @@ class NotUtf8Error extends Error {}
 
 function decodeUtf8Strict(buf) {
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    // `ignoreBOM: true` 是必须的：TextDecoder 默认**会吞掉前导 BOM**，而口径是「展示用原文、一个字节都
+    // 不改」（BOM 归展示，只在去重键里被剔掉，见 `dedupeKey`）。
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buf);
   } catch (err) {
     throw new NotUtf8Error(err?.message ?? String(err));
   }
@@ -170,6 +177,22 @@ function trimIncompleteUtf8Tail(buf) {
     // 10xxxxxx（continuation）：继续往回看找前导字节
   }
   return buf; // 回看 4 字节都是 continuation：本就是非法编码，交给 fatal 解码报错
+}
+
+/**
+ * 去重键（#451 评审 m4）：用**规范化后的字节**，不拿原始字节做 `sha256`。
+ *
+ * 旧写法让去重在真实形态下失效：`~/AGENTS.md` 带 BOM、`~/projects/AGENTS.md` 是同内容的 CRLF
+ * ⇒ 两份 sha 不同 ⇒ 同一段规则注两遍且 `notes=0`（看上去一切正常，就是多烧一份 token）。
+ * 规范化只做三件事：去前导 BOM（`EF BB BF` 解码后就是 U+FEFF）+ `\r\n` → `\n` + 首尾空白裁剪。
+ * ⚠ **只影响去重键，不影响展示**：`blocks[].text` 仍是文件原文，一个字节都不改（口径①）。
+ * 不做的规范化：单独的 `\r` 行尾、内部空白折叠——过度归一会把「真的只差空白」的两份当成一份。
+ * 超大文件走前缀读时键只能覆盖读到的前缀（尾部本来也不注入，同前缀 = 注入内容逐字节相同）。
+ */
+function dedupeKey(text) {
+  let normalized = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  normalized = normalized.replace(/\r\n/g, '\n').trim();
+  return crypto.createHash('sha256').update(Buffer.from(normalized, 'utf8')).digest('hex');
 }
 
 function scopeOf(dir, realHome) {
@@ -293,6 +316,11 @@ export function collectAgentsMd(options = {}) {
     }
     if (!isInside(realFile, boundary)) {
       // symlink 逃逸：文件真实路径跑出了 home（`~/projects/AGENTS.md -> /etc/passwd`）。
+      // ⚠ 口径（#451 评审 m2）：以 **realpath 时刻**的形态为准。本行判定与后面的读取之间没有
+      //   `O_NOFOLLOW` / `fstat` 比对 / 二次 `realpath` ⇒ **检查与读取之间的 symlink 变化不在防护范围**
+      //   （同容器、用户自己的文件：要挡的是「就是指向 home 之外」这种稳定形态，不是抢在两次
+      //   系统调用之间改指向的那个写入者）。选「把口径写准」而不是加系统调用：代价是 TOCTOU 窗口，
+      //   收益是少两次 syscall 与一套需要真 fs 才能测的机制。
       notes.push(`跳过 ${display}：真实路径 ${realFile} 越出 ${boundary}`);
       continue;
     }
@@ -330,8 +358,8 @@ export function collectAgentsMd(options = {}) {
       continue;
     }
     if (text.trim() === '') continue; // 空 / 全空白：跳过（不产生空节）
-    // 去重键：超大文件走前缀读时只能覆盖读到的前缀（尾部本来也不注入，同前缀 = 注入内容逐字节相同 ⇒ 去重仍成立）。
-    const sha = crypto.createHash('sha256').update(buf).digest('hex');
+    // 去重键已改成规范化字节（去 BOM / CRLF / 首尾空白），**展示用的 text 仍是原文**：口径见 `dedupeKey`。
+    const sha = dedupeKey(text);
     if (seen.has(sha)) {
       notes.push(`跳过 ${display}：内容与 ${seen.get(sha)} 相同（去重，保留靠外那份）`);
       continue;
