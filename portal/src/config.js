@@ -4,6 +4,8 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validateHostnameGrammar } from './projects.js';
+import { parseCidr } from './ipam.js';
 
 const DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 天，portal.md §2.5
 
@@ -15,6 +17,70 @@ function intEnv(env, key, fallback) {
 function nonNegativeIntEnv(env, key, fallback) {
   const v = Number(env[key] ?? fallback);
   return Number.isSafeInteger(v) && v >= 0 ? v : fallback;
+}
+
+/** TCP 端口 env：正整且 ≤65535，否则回退 fallback 并 warn（一个错拼的端口不许把 portal 拦在启动外）。 */
+function portEnv(env, key, fallback) {
+  const raw = env[key];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const v = Number(raw);
+  if (Number.isInteger(v) && v > 0 && v <= 65535) return v;
+  // eslint-disable-next-line no-console
+  console.warn(`[config] ⚠️ ${key}=${JSON.stringify(raw)} 不是合法 TCP 端口，回退默认 ${fallback}`);
+  return fallback;
+}
+
+/**
+ * 管理台 host（issue #450 D1）：显式 `ADMIN_PUBLIC_HOST` 优先，否则 `admin.<baseDomain>`（伞域泛解析已覆盖）。
+ * 形状判据复用 hostname 族里已有的 `validateHostnameGrammar`（逐标签 ≤63 + DNS 字符集 + 总长 ≤253），
+ * **不新写正则、不新增错误码**；非法形态退回默认值并 warn——一个错拼的 host 只应该降级，不应该把
+ * portal 拦在启动之外（与 FDE_IMAGE/SESSION_SIGNING_KEY 那种 fail-closed 项不同：那两项错的是安全面，
+ * 这一项错的是「管理台打不开」，而退回默认恰好是安全的那一侧）。
+ */
+function resolveAdminHost(env, baseDomain) {
+  const fallback = `admin.${baseDomain}`;
+  const raw = String(env.ADMIN_PUBLIC_HOST ?? '').trim();
+  if (!raw) return fallback;
+  const grammar = validateHostnameGrammar(raw);
+  if (grammar.ok) return raw;
+  // eslint-disable-next-line no-console
+  console.warn(`[config] ⚠️ ADMIN_PUBLIC_HOST=${JSON.stringify(raw)} 非法（${grammar.reason}），回退默认 ${fallback}`);
+  return fallback;
+}
+
+/**
+ * 管理台入口来源白名单（issue #450 D4）：`ADMIN_IP_ALLOWLIST` 逗号分隔 CIDR → 数组。
+ * **空数组 = 不挂 ipAllowList = 放行全部**（= 今天的现状，默认不破坏现网）。
+ * 单个条目非法就丢掉该条并 warn（不是整串作废）；若因此变成空数组，则额外 warn 一次
+ * 「入口将不受来源限制」——这一条必须响，因为它的安全含义是「谁能进管理台」。
+ */
+function resolveAdminIpAllowlist(env) {
+  const raw = String(env.ADMIN_IP_ALLOWLIST ?? '').trim();
+  if (!raw) return [];
+  const entries = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  const valid = [];
+  for (const entry of entries) {
+    try {
+      parseCidr(entry);
+      valid.push(entry);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[config] ⚠️ ADMIN_IP_ALLOWLIST 条目 ${JSON.stringify(entry)} 非法（${err.message}），已丢弃`);
+    }
+  }
+  if (valid.length === 0) {
+    // eslint-disable-next-line no-console
+    console.warn('[config] ⚠️ ADMIN_IP_ALLOWLIST 全部条目非法 ⇒ 管理台入口**不挂 ipAllowList**（对任何来源放行）');
+  }
+  return valid;
+}
+
+/**
+ * 管理台对外 URL（issue #450）：`https://<adminHost>[:<port>]`，**443 时不带端口**——
+ * 与 `resolvePublicBaseUrl` 的 websecure 分支同口径（默认端口不进 URL），不另造一套拼法。
+ */
+function resolveAdminPublicBaseUrl(adminHost, adminPort) {
+  return `https://${adminHost}${adminPort === 443 ? '' : `:${adminPort}`}`;
 }
 
 /**
@@ -144,6 +210,13 @@ export function loadConfig(env = process.env) {
     console.warn('[config] ⚠️ SESSION_SIGNING_KEY 使用 dev 占位值，生产必须改为强随机值');
   }
 
+  // ---- issue #450 / feat-261105-01：管理台独立入口（独立 host admin.<伞域> + 端口 + TLS）----
+  // 端口唯一真值 = 部署面 env（compose 从 deploy/.env 注入）；Traefik 侧 listen 端口写在静态文件里
+  //（`${VAR}` 在 `--configFile` 下不插值，实测），两处一致性由 deploy-env-defaults 测试钉住。
+  const baseDomain = env.BASE_DOMAIN || 'localhost';
+  const adminHost = resolveAdminHost(env, baseDomain);
+  const adminPort = portEnv(env, 'TRAEFIK_ADMIN_PORT', 9443);
+
   return {
     host: env.HOST || '0.0.0.0',
     port: Number(env.PORT || 8080),
@@ -217,7 +290,7 @@ export function loadConfig(env = process.env) {
     sessionAutoTitleMinNew: intEnv(env, 'ERIX_SESSION_AUTO_TITLE_MIN_NEW', 3),
     maxLoginLength: intEnv(env, 'MAX_LOGIN_LENGTH', 128),
     maxPasswordLength: intEnv(env, 'MAX_PASSWORD_LENGTH', 256),
-    baseDomain: env.BASE_DOMAIN || 'localhost',
+    baseDomain,
     migrateOnStart: env.MIGRATE_ON_START !== '0',
     staticDir: env.STATIC_DIR || defaultStaticDir(),
     // ---- WP2a：用户空间物化 + 路由 reconciler 配置 ----
@@ -243,6 +316,15 @@ export function loadConfig(env = process.env) {
       .filter(Boolean),
     portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
     traefikEntryPoint: env.TRAEFIK_ENTRYPOINT || 'web',
+    // issue #450 D2：管理台入口（静态配置里的 entrypoint 名）。管理台路由挂它，用户入口挂 deny。
+    traefikAdminEntryPoint: env.TRAEFIK_ADMIN_ENTRYPOINT || 'adminsecure',
+    // issue #450 D1/D4：管理台 host / 端口 / 来源白名单 / 对外 URL。
+    // adminIpAllowlist 为空数组 ⇒ 路由生成器**根本不输出** ipAllowList 中间件（不是输出一个空 sourceRange：
+    // 实测 Traefik 对空 sourceRange 直接拒建中间件并打 ERR `sourceRange is empty, IPAllowLister not created`）。
+    adminHost,
+    adminPort,
+    adminIpAllowlist: resolveAdminIpAllowlist(env),
+    adminPublicBaseUrl: resolveAdminPublicBaseUrl(adminHost, adminPort),
     llmHost: env.LLM_HOST || `llm.${env.BASE_DOMAIN || 'localhost'}`,
     // ---- 容器经 Traefik 访问 portal/LLM 的公共入口 base URL（scheme://host[:port]）----
     // dev：web entrypoint http + 高端口；prod：websecure entrypoint https + 443（隐式）。

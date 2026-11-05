@@ -49,3 +49,51 @@ test('#114 双向一致性：compose 默认喂进 loadConfig ⇒ 必须等于代
   assert.equal(loadConfig({ ERIX_SESSION_AUTO_TITLE: '1' }).sessionAutoTitle, true, '运维显式设 1 仍应开回来');
   assert.equal(loadConfig({ ERIX_SESSION_AUTO_TITLE: 'yes' }).sessionAutoTitle, false, '非 1 值不算开（避免「写了就算开」）');
 });
+
+// ---------------------------------------------------------------------------
+// issue #450 / feat-261105-01：管理台入口端口是**三处一份真值**，而这单没法把它收成一处：
+//   · Traefik 的 listen 端口只能在静态配置里（`deploy/traefik/traefik.yml`），且该文件**不做 `${VAR}` 插值**
+//     （实测 traefik:v3.7.13 + `--configFile`：地址原样成字面量 → `listen tcp: lookup tcp/9443}: unknown port`）；
+//   · station-edge 是 `network_mode: host` ⇒ 宿主端口 = 容器端口，没有 ports 映射可跟着 env 走；
+//   · 部署面 env（compose 的 `TRAEFIK_ADMIN_PORT`）才是 portal 推导管理台 URL 的那一份。
+// ⇒ 三处必须逐字一致。人记不住，所以让机器记：把「静态文件里的字面量」「compose 的插值默认值」
+//   「代码默认值」三条都读出来对比，任一处单独改动都会红。
+const TRAEFIK_YML = new URL('../../deploy/traefik/traefik.yml', import.meta.url);
+
+function adminEntryPointAddress() {
+  const text = fs.readFileSync(TRAEFIK_YML, 'utf8');
+  const m = /^  adminsecure:\n(?:.*\n)*?    address: "([^"]+)"/m.exec(text);
+  assert.ok(m, 'deploy/traefik/traefik.yml 里必须有 adminsecure entrypoint 的 address（#450 D0）');
+  return m[1];
+}
+
+test('#450 管理台端口三处一致：静态文件 adminsecure.address / compose 插值默认 / 代码默认', () => {
+  const address = adminEntryPointAddress();
+  const m = /^:(\d+)$/.exec(address);
+  assert.ok(m, `adminsecure.address 必须是写死的 ":<port>"（静态文件不插值，不能写 \${VAR}）：实际 ${address}`);
+  const staticPort = Number(m[1]);
+
+  const doc = parse(fs.readFileSync(COMPOSE, 'utf8'));
+  const env = doc.services['station-portal'].environment;
+  assert.ok('TRAEFIK_ADMIN_PORT' in env, 'compose 必须把 TRAEFIK_ADMIN_PORT 注入 portal（管理台 URL 要它）');
+  const composePort = Number(interpolationDefault(env.TRAEFIK_ADMIN_PORT));
+
+  assert.equal(composePort, staticPort,
+    `compose 默认 ${composePort} ≠ 静态配置 listen ${staticPort}：Traefik 绑在 ${staticPort}，`
+    + 'portal 却按另一个端口拼管理台 URL（症状：链接打不开）');
+  assert.equal(loadConfig({}).adminPort, staticPort,
+    `代码默认 ${loadConfig({}).adminPort} ≠ 静态配置 listen ${staticPort}`);
+  // 端口不能撞既有入口/号池（#450 D0：9443，避开 80/443/8090/8443 与 22000–29999）
+  assert.ok(![80, 443, 8090, 8443].includes(staticPort), `管理台端口 ${staticPort} 与既有入口撞车`);
+  assert.ok(staticPort < 22000 || staticPort > 29999, `管理台端口 ${staticPort} 落在预览号池 22000–29999 内`);
+});
+
+test('#450 管理台 host 默认 = admin.<BASE_DOMAIN>，且 compose 把 ADMIN_PUBLIC_HOST / ADMIN_IP_ALLOWLIST 透传', () => {
+  const doc = parse(fs.readFileSync(COMPOSE, 'utf8'));
+  const env = doc.services['station-portal'].environment;
+  assert.ok('ADMIN_PUBLIC_HOST' in env, 'compose 必须透传 ADMIN_PUBLIC_HOST（否则 deploy/.env 里设了也不生效）');
+  assert.ok('ADMIN_IP_ALLOWLIST' in env, 'compose 必须透传 ADMIN_IP_ALLOWLIST（#450 D4 的唯一开关）');
+  assert.equal(interpolationDefault(env.ADMIN_IP_ALLOWLIST), '', '默认必须是空 = 不挂 ipAllowList（不破坏现网）');
+  assert.equal(interpolationDefault(env.ADMIN_PUBLIC_HOST), '', '默认必须是空 = 由 BASE_DOMAIN 推导');
+  assert.equal(loadConfig({}).adminHost, 'admin.localhost');
+});

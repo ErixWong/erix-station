@@ -279,6 +279,15 @@ http:
 
 portal 的 `/api/forward-auth` 逻辑：**解析 `X-Forwarded-Host` → 精确查 `port_allocations.hostname` → 按 token 哈希查 `preview_grants`（一次性 ticket / host-only 预览 cookie；portal 自身会话才查 `login_sessions`）→ 按 `exposure` 授权**（**不解析 session cookie 的 `sub`**）。端口/槽位白名单、审计日志都在这里做；执行顺序与失败语义见 [portal.md](../api/portal.md) §2.7 与 [topology.md](topology.md) §5.2，此处不重复定义。
 
+**管理台入口已落实（#450 / feat-261105-01，2026-11-05）**：管理面不再只是「同一个 host 上多几个
+`/api/admin/*` 端点」，而是**独立入口 + 独立 host**——entrypoint `adminsecure`（端口 9443，静态配置里写死）
++ host `admin.<伞域>`（`ADMIN_PUBLIC_HOST` 可覆盖）。该入口只挂三条 router（管理 API `/api/admin/*`、
+登录相关 `/api/auth/*` + `/api/me`、SPA catch-all），全部带 `tls: {}`（证书来自 `dynamic/tls.yml` 装载面）；
+用户入口用更高优先级（300）的 deny 路由把 `/api/admin/*` 挡成 `404`，管理台入口则用显式排除规则把
+白名单以外的 `/api/*` 同样挡成 `404`。**预览路由仍只挂用户入口**（管理台 host 够不到别人的预览）。
+能力边界因此由「host × entrypoint 的交集」决定，与页面在哪个 origin 渲染无关（hash 路由不改）。
+细节与真机验证矩阵见 [`../deploy/edge-routing.md`](../deploy/edge-routing.md)。
+
 **路由由 portal 生成、经 reconciler 幂等发布到 Traefik file provider，与 DB 的端口分配表同源**（DB 事务写 `port_allocations` + route outbox/revision，§8.1）——不允许手工改，也不允许 FDE 容器打 label 自注册（「路由表里没有 = 不可达」「FDE 不能自注册路由」这两条性质必须成立）。动态配置文件含全部虚拟 key，宿主文件权限 **600**，仅 portal 可写、Traefik 只读（topology.md §6 第 8 条）。
 
 > **LLM 网关凭据入口收紧（H-B）**：LLM 网关数据面只接受 Traefik 经 `fde-<name>-llm` router 注入的 `Authorization` 头；网关须显式**拒绝**其它凭据输入通道（`X-API-Key`、HTTP Basic、cookie、query token）——否则容器可绕过「来源子网 → 身份」判定直接出示凭据（topology.md §4-L7）。
