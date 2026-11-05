@@ -3843,8 +3843,12 @@ C7 的输入是「我以为我给了链，其实接不上」——发出去客�
 C1/C3/C6/C7 + inspect C5 的 400 + M2 链深 + S4 回滚 + 伪链）/ `tls-api.test.js` 16→26（+10：inspect C1/C3/C5/C6/C7、
 PUT C5/C7、原样落盘 + 台账取叶子、审计 `chainWarnings`、verify DTO 透出）/ `tls-assets.test.js` 8→10（+2：S4 两条））；
 runner **473 不变**；
-前端 **59 文件 / 1146 → 1149 项**（**+3**：链告警三条文案 / `chain_incomplete` 带链深 / `fingerprint_mismatch` 与无 reason 的旧措辞）。
-⚠ 前端那 3 条 `GitLightBadge.spec.ts` 失败是**预存**的（基线 `83447df` 上同样是 3 失败 / 1143 通过），与 #462 无关。
+前端 **59 文件 / 1146 → 1149 通过**（**+3**：链告警三条文案 / `chain_incomplete` 带链深 / `fingerprint_mismatch` 与无 reason 的旧措辞；
+**主 agent 空载连跑两次都是 59 文件 / 1149 全绿 rc=0**）。
+⚠ **worker 报的「3 条 `GitLightBadge.spec.ts` 预存失败」不成立**（它连基线 worktree 也报了 3 红，并据此把
+`ci-release.md` 记成「1146 通过 + 3 预存失败」）——这是同一形状的**第 6 次**：worker 跑前端全量时会红那 3 条，
+主 agent 空载复跑恒绿（单跑该文件 18/18、全量 1149/1149 ×2）。⇒ **worker 报的基线数字必须自己复算，不许照抄进台账**
+（§8.63 / §8.82 / §8.88 同族）。
 
 **变异（主 agent 亲跑，每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原）**：
 
@@ -3857,6 +3861,12 @@ runner **473 不变**；
 | 5 | `readTlsAssets` 改回 `readFile` 私钥 | S4 两条（注入 EACCES / 真 chmod 000） |
 | 6 | 链间判据换成 `subjectCN === issuerCN` 字符串比 | **8 条**：`#462 describeChain`、`#462 C1`、`#462 C2`、`#462 C7 伪链`、`#462API①`、`#462API⑥`、`#462API⑧`、`#462 inspect C1/C3/C6/C7` |
 | 7 | （工单 §7 #3 的字面形态）`cert` DTO 改回 `blocks[0]` | **全绿 = 空操作**：成功路径上 `leaf === blocks[0]`（C5 在构造 DTO **之前**就 400 了）⇒ 该变异在本实现里观察不到差异。用 #3 代替它取证 |
+| 8 | 删掉 `chainWarnings` 的 push（C3 不再提示） | `#462 C3`、`#462API⑨` |
+| 9 | `peerChainDepth` 恒 `+1`（差一） | `#462 peerChainDepth`、`#462 verifyLiveCertificate…chain_incomplete`、`#462API⑩` |
+| 10 | `rollbackCertificateAssets` 不用 `copyFile` | `#462/S4 rollback：copyFile 语义`、`#456 rollback` 两条 |
+| 11 | 审计无条件写 `chainWarnings`（空数组也写） | `#462API⑧`（「无 `chainWarnings` 键」那条）、`#456API②` |
+| 12 | `statAsset` 去掉 `size > 0` | `#450 tls.yml：空文件视为缺失` |
+| 13 | inspect 的 C6 去掉 `!keyGiven` 守卫 | **全绿 = 冗余守卫**（有钥时 C5 已先抛 400，走不到那行）——**不是覆盖缺口**，代码里留着是给读者看边界 |
 
 **变异 6 顺带挖出一个真覆盖缺口并已补**：字符串比在**两个方向**都有害——它会让合法链判成断链（被 C1/C2 抓到），
 也会让「同名不同钥」的伪链**看起来接得上**（原先没有用例）。补的用例造一条伪中间证书（CN 与真中间证书相同、
