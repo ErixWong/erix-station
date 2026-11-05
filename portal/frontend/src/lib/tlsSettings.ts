@@ -52,6 +52,13 @@ export interface TlsLive {
   subjectCN?: string;
   /** 仅 `unreachable`：`timeout` / `no_default_gateway` / `no_certificate` / socket 错误码。 */
   error?: string;
+  /**
+   * 仅 `mismatch`（#462）：`fingerprint_mismatch`（端出来的是另一张）/ `chain_incomplete`
+   * （指纹一致但服务端只发了 1 张、非自签 ⇒ 客户端可能链校验失败）。缺席 = 老服务端，按指纹不一致说。
+   */
+  reason?: string;
+  /** 服务端实际发出的链层数（#462）。缺席 = 不知道，**不显示 0**。 */
+  chainDepth?: number;
 }
 
 export interface TlsPrevious {
@@ -137,6 +144,11 @@ function normalizeLive(data: unknown): TlsLive {
   }
   if (typeof live.subjectCN === 'string' && live.subjectCN !== '') normalized.subjectCN = live.subjectCN;
   if (typeof live.error === 'string' && live.error !== '') normalized.error = live.error;
+  // #462：两个可选键同样「只在服务端真的给了时才写」（缺键 ≠ 空串 / 0）。
+  if (typeof live.reason === 'string' && live.reason !== '') normalized.reason = live.reason;
+  if (typeof live.chainDepth === 'number' && Number.isFinite(live.chainDepth) && live.chainDepth > 0) {
+    normalized.chainDepth = live.chainDepth;
+  }
   return normalized;
 }
 
