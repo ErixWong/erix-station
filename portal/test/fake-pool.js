@@ -15,9 +15,16 @@ export class FakePool {
     this.mailSettings = null;
     // #456：证书台账（`tls_certificates`）。**不是真相源**（真相是盘上证书文件），只记「谁什么时候装了什么」。
     this.tlsCerts = [];
+    // #456 M2：**语句流水**（`{sql, params}`，每条进来的语句）。只给「零副作用」这类判据用：
+    // `POST /api/admin/tls/inspect` 必须一条写语句都不发（`SELECT` 可以，鉴权本身要查会话）。
+    // ⚠ 刻意**不叫** `sqlLog`：子类（admin/must-change-password/…）自带同名字段并在自己的 `query` 里
+    // 记一份，而它们未处理的语句会落到 `super.query` ⇒ 共用一个数组会多出重复条目，把「每请求恰查一次」
+    // 那类计数判据误打红（实测 7 条）。
+    this.statements = [];
   }
 
   async query(sql, params = []) {
+    this.statements.push({ sql, params });
     if (sql.includes('schema_migrations')) {
       return { rows: [{ version: '0000_baseline' }] };
     }
