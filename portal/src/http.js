@@ -636,6 +636,15 @@ export function createServer({
     blockMs: config.tlsVerifyRateLimit?.blockMs ?? 60 * 60 * 1000,
     maxEntries: config.tlsVerifyRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
   });
+  // #456 M2：`POST /api/admin/tls/inspect` 是**只解析不落盘**的端点（工单唯一允许的后端追加）。
+  // 它**不烧上传配额**（那一档 10 次/小时是留给「真会改线上握手」的操作），单独一档 **120 次/小时**：
+  // 解析一张 PEM 是纯 CPU（OpenSSL），限流只为防脚本刷；正常人手点几十次够用，改错了也不会被锁住。
+  const tlsInspectLimiter = createRateLimiter({
+    maxFailures: config.tlsInspectRateLimit?.maxFailures ?? 120,
+    windowMs: config.tlsInspectRateLimit?.windowMs ?? 60 * 60 * 1000,
+    blockMs: config.tlsInspectRateLimit?.blockMs ?? 60 * 60 * 1000,
+    maxEntries: config.tlsInspectRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
   // #449：邮件通道读取侧（SMTP 参数存 DB，见 `mail-provider.js`）。`mailerProvider` 参数仅供测试注入 fake。
   // 为什么不在启动时同步读一次：登录是热路径但启动不是；真正的「现在到底能不能发信」每次登录时由
   // `ctx.mailerProvider.get()` 回答（60s 缓存 + 急停硬闸）。这里只在 `config.mail` 存在（= `loadConfig`
@@ -656,7 +665,7 @@ export function createServer({
   const ctx = {
     pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter,
     mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, mailTestLimiter, docker,
-    tlsUploadLimiter, tlsVerifyLimiter,
+    tlsUploadLimiter, tlsVerifyLimiter, tlsInspectLimiter,
     // #456：真机校验的注入点（生产 = `tls.connect` + `/proc/net/route`；单测换成假 socket / 假路由表）。
     tlsConnect, tlsRoutePath,
     // #456：最近一次**真机校验**结果（内存态，单实例）。GET 只回缓存，绝不主动连（那是 verify 端点的事）。
@@ -1437,6 +1446,11 @@ async function handleAdminApi(req, res, ctx, url) {
     if (req.method === 'POST') return handleAdminTlsVerify(req, res, ctx, session);
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
+  // #456 M2：**解析但不落盘**（唯一允许的后端追加）。给「粘贴 → 抽出域名 → 确认后才装」的两步交互用。
+  if (pathname === '/api/admin/tls/inspect') {
+    if (req.method === 'POST') return handleAdminTlsInspect(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
   if (pathname === '/api/admin/tls/rollback') {
     if (req.method === 'POST') return handleAdminTlsRollback(req, res, ctx, session);
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
@@ -1785,6 +1799,30 @@ async function handleAdminTlsPut(req, res, ctx, session) {
   }).catch(() => {});
 
   return sendJson(res, 200, await tlsStatusPayload(ctx));
+}
+
+/**
+ * POST /api/admin/tls/inspect：**解析但不落盘**（契约 portal.md §4.13-3a）。
+ *
+ * 零副作用：不写盘、不写 DB、不写审计、不动 `tlsLive`、**不烧上传配额**（单独一档宽松限流）。
+ * 判据只有「形态与配对」：`keyPem` 省略 ⇒ `keyMatches:null`；不配对 / 不覆盖 adminHost / 已过期
+ * 都**不报错**（各回 `keyMatches:false` / `coverage.covered:false` / `warnings`），让 UI 自己说。
+ */
+async function handleAdminTlsInspect(req, res, ctx, session) {
+  requireJson(req);
+  // 体级闸与上传同档（两份 PEM 各 64 KiB + JSON 转义放不进默认的 64 KiB）。
+  const body = await readJsonBody(req, TLS_UPLOAD_BODY_LIMIT);
+
+  const limiterKey = `tlsinspect:${session.user.id}`;
+  const gate = ctx.tlsInspectLimiter.check(limiterKey);
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书解析过于频繁，请稍后再试');
+  ctx.tlsInspectLimiter.recordFailure(limiterKey);
+
+  return sendJson(res, 200, tlsCert.inspectCertificate({
+    certPem: body?.certPem,
+    keyPem: body?.keyPem,
+    adminHost: ctx.config.adminHost,
+  }));
 }
 
 /**

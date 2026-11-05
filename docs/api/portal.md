@@ -60,6 +60,7 @@
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
 | 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
 | 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
+| 管理 | `POST /api/admin/tls/inspect` | **解析但不落盘**（#456 M2，§4.13-3a）：`{certPem,keyPem?}` → 证书元数据 + `keyMatches` 三态 + 覆盖判定 + `warnings`。**零副作用**（不写盘/DB/审计、不动 `tlsLive`、不烧上传配额）；每管理员 120 次/小时 |
 | 管理 | `POST /api/admin/tls/verify` | **真机校验**（#456，§4.13）：连默认网关的 `TRAEFIK_ADMIN_PORT` + `servername=adminHost`，比 `fingerprint256` ⇒ `live`/`mismatch`/`unreachable`。每管理员 30 次/小时 |
 | 管理 | `POST /api/admin/tls/rollback` | **回滚到上一代**（#456，§4.13）。从 `certs/prev/` 还原 + 重写 `tls.yml` + 台账（`kind='rollback'`）+ 审计；无 prev ⇒ `404 tls_no_previous` |
 | 会话 | `GET /api/sessions` | 会话列表 |
@@ -2207,6 +2208,8 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 > `portal/src/http.js`（分派 / 限流 / 审计）、`portal/src/tlsassets.js`（装载面，**只由它物化 `tls.yml`**）。
 > 表结构见 `docs/data/model.md` §1.32（迁移 `0027`）。部署面见 `docs/deploy/edge-routing.md` §5。
 > 四个端点全部过 `requireAdmin`：非 admin ⇒ `403 forbidden`，未登录 ⇒ `401 unauthorized`。
+> **#456 M2 追加第五个：`POST /api/admin/tls/inspect`**（解析但不落盘，见 4.13-2a）——同样过 `requireAdmin`，
+> 但它**不参与** 4.13-1 的响应 DTO（它回的是「这份 PEM 里有什么」，不是「盘上现在是什么」）。
 
 #### 4.13-0 分工：盘是真相，DB 只是台账
 
@@ -2248,6 +2251,51 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 | `previous` | 可回滚的上一代（`certs/prev/`）。`null` = 没有备份 |
 
 **响应里绝不含**：私钥正文、`certPem`/`keyPem` 原文、任何密钥派生值（连 `publicKeyPem` 都不在白名单里）。
+
+#### 4.13-2a `POST /api/admin/tls/inspect`（#456 M2：解析但不落盘）
+
+> 为「粘贴 → 自动抽出证书里的域名 → 用户确认后才装」的两步交互而存在：`PUT` 会直接落盘，
+> `GET` 只读盘上那张，都不回答「这份 PEM 里有什么」。这是 M2 唯一允许的后端追加。
+
+```json
+{ "certPem": "-----BEGIN CERTIFICATE-----\n…", "keyPem": "-----BEGIN PRIVATE KEY-----\n…" }
+```
+
+`keyPem` **可省略**（`undefined` / `null` / 空白串三种写法等价）⇒ `keyMatches: null`。
+
+**`200` 响应**：
+
+```json
+{
+  "cert": {"subjectCN": "*.fde.erix.vip", "sans": ["*.fde.erix.vip"], "issuerCN": "*.fde.erix.vip",
+           "notBefore": "…", "notAfter": "…", "fingerprintSha256": "AB:…"},
+  "keyMatches": true,
+  "coverage": {"adminHost": "admin.fde.erix.vip", "covered": true},
+  "warnings": []
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `cert` | **键集恰好六个**（与 §4.13-1 的 `active` 同一套字段，`portal/test/tls-api.test.js` ⑪ 逐键钉住）。`publicKeyPem` 不在里面 |
+| `keyMatches` | `true` / `false` / `null`（未给 `keyPem`）。**不配对不是错误**：只回事实，UI 据此禁用「确认安装」 |
+| `coverage` | 与 §4.13-1 同一口径。`covered:false` **不报错**（用户可能就是在传一张还没生效的证书） |
+| `warnings` | 机器码数组（服务端只发码不发话）：`cert_expired`（`notAfter <= now`）/ `not_yet_valid`（`notBefore > now`）/ `no_sans`（一个 DNS SAN 都没有，覆盖判定退 CN）/ `admin_host_not_covered`（与 `coverage.covered:false` 同义）。**这些不是错误码**，不登记 §1.2、不改任何 HTTP 状态 |
+
+**错误只有两种形态**（沿用 M1 的码，**不新增**）：
+
+| 判据 | 码 |
+|---|---|
+| `certPem`/`keyPem` 非字符串、或单份 > 64 KiB（体级闸同 `PUT`：256 KiB） | `400 validation_failed` + `details.field` |
+| 证书 PEM 解析不出 | `400 tls_cert_invalid` |
+| 私钥 PEM 解析不出（**仅当给了非空 `keyPem`**） | `400 tls_key_invalid` |
+
+**零副作用（判据可红）**：不写盘、不写 `tls_certificates`、不写审计、不动 `tlsLive` 缓存、**不烧上传配额**。
+限流单独一档 **120 次/小时**（key `tlsinspect:<adminId>`，每次请求计一次；`PUT`/`rollback` 的 10 次/小时不受影响）。
+> 为什么单独一档：上传配额是留给「真会改线上握手」的操作；解析只是 CPU。120 次/小时够人手点几十次，
+> 也拦得住脚本刷。超限 ⇒ `429 rate_limited` + `Retry-After`。
+
+**审计**：不写（探针式读取，与 verify 同口径）。
 
 #### 4.13-2 `GET /api/admin/tls`
 

@@ -138,6 +138,9 @@ const verifyTls = async (srv, cookie = srv.adminCookie) =>
   json(await call(srv.base, 'POST', '/api/admin/tls/verify', { body: {}, cookie }));
 const rollbackTls = async (srv, cookie = srv.adminCookie) =>
   json(await call(srv.base, 'POST', '/api/admin/tls/rollback', { body: {}, cookie }));
+// #456 M2：**解析但不落盘**（唯一允许的后端追加）。
+const inspectTls = async (srv, body, cookie = srv.adminCookie) =>
+  json(await call(srv.base, 'POST', '/api/admin/tls/inspect', { body, cookie }));
 
 /** 盘上快照：`certs/**` + `tls.yml` 的 路径→内容 映射（用来证明「失败零副作用」）。 */
 function snapshot(dynamicDir) {
@@ -498,6 +501,130 @@ test('#456API+ 上传限流：第 11 次 429 + Retry-After（按管理员计，1
     assert.equal(blocked.status, 429);
     assert.equal(blocked.body.error.code, 'rate_limited');
     assert.ok(Number(blocked.headers.get('retry-after')) > 0, '429 必须带 Retry-After');
+  } finally {
+    await srv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑪~⑭ inspect（issue #456 M2）：**解析但不落盘**。四条判据逐条对应工单 §4。
+// ---------------------------------------------------------------------------
+
+test('#456API⑪ inspect 合法 ⇒ 200 + cert 六键白名单（SAN/覆盖判定齐全），且响应不含 PEM', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: WILDCARD.certPem, keyPem: WILDCARD.keyPem });
+    assert.equal(res.status, 200, res.text);
+    // cert 的键集**恰好**是白名单（`publicKeyPem` 不许混进来）
+    assert.deepEqual(Object.keys(res.body.cert).sort(), [
+      'fingerprintSha256', 'issuerCN', 'notAfter', 'notBefore', 'sans', 'subjectCN',
+    ]);
+    assert.deepEqual(res.body.cert.sans, ['*.fde.erix.vip', 'fde.erix.vip']);
+    assert.equal(res.body.cert.subjectCN, '*.fde.erix.vip');
+    assert.match(res.body.cert.fingerprintSha256, /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
+    // 覆盖判定：`*.fde.erix.vip` 覆盖 admin.fde.erix.vip（通配符只匹配一层，口径与后端同一函数）
+    assert.deepEqual(res.body.coverage, { adminHost: ADMIN_HOST, covered: true });
+    assert.equal(res.body.keyMatches, true);
+    assert.deepEqual(res.body.warnings, []);
+    assert.deepEqual(Object.keys(res.body).sort(), ['cert', 'coverage', 'keyMatches', 'warnings']);
+
+    // 不覆盖 adminHost 的证书：**不报错**，只把事实说清（coverage.covered:false + 具名告警）
+    const other = await inspectTls(srv, { certPem: OTHER.certPem, keyPem: OTHER.keyPem });
+    assert.equal(other.status, 200, '不覆盖 adminHost 不是错误（用户可能就是在传一张还没生效的证书）');
+    assert.equal(other.body.coverage.covered, false);
+    assert.deepEqual(other.body.warnings, ['admin_host_not_covered']);
+
+    for (const r of [res, other]) {
+      assert.ok(!r.text.includes('BEGIN CERTIFICATE'), 'inspect 响应不许带 PEM');
+      assert.ok(!r.text.includes('PRIVATE KEY'), 'inspect 响应不许带私钥');
+      assert.ok(!r.text.includes(WILDCARD.keyPem.slice(40, 80)));
+    }
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#456API⑫ inspect 省略 keyPem ⇒ keyMatches:null（空串/不传两种写法都算省略）', async () => {
+  const srv = await startServer();
+  try {
+    const omitted = await inspectTls(srv, { certPem: WILDCARD.certPem });
+    assert.equal(omitted.status, 200, omitted.text);
+    assert.equal(omitted.body.keyMatches, null);
+
+    const empty = await inspectTls(srv, { certPem: WILDCARD.certPem, keyPem: '' });
+    assert.equal(empty.status, 200, empty.text);
+    assert.equal(empty.body.keyMatches, null, '空串 = 没给（不是「给了一把坏钥匙」）');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#456API⑬ inspect 私钥不配对 ⇒ 200 + keyMatches:false（**不是 400**）', async () => {
+  const srv = await startServer();
+  try {
+    const res = await inspectTls(srv, { certPem: WILDCARD.certPem, keyPem: OTHER.keyPem });
+    assert.equal(res.status, 200, '不配对只回事实，让 UI 自己禁用「确认安装」');
+    assert.equal(res.body.keyMatches, false);
+    // 形态坏掉才是 400：证书解析不出 / 私钥解析不出（沿用 M1 的码，不新增）
+    const badCert = await inspectTls(srv, { certPem: 'not a pem', keyPem: WILDCARD.keyPem });
+    assert.equal(badCert.status, 400);
+    assert.equal(badCert.body.error.code, 'tls_cert_invalid');
+    const badKey = await inspectTls(srv, { certPem: WILDCARD.certPem, keyPem: 'not a key' });
+    assert.equal(badKey.status, 400);
+    assert.equal(badKey.body.error.code, 'tls_key_invalid');
+    // 过期证书也**不拒**（只进 warnings）：inspect 只做形态与配对判据
+    const expired = await inspectTls(srv, { certPem: EXPIRED.certPem, keyPem: EXPIRED.keyPem });
+    assert.equal(expired.status, 200, '过期是 PUT 的拒因，不是 inspect 的');
+    assert.ok(expired.body.warnings.includes('cert_expired'));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('#456API⑭ inspect **零副作用**：盘上/DB/审计/tlsLive 全不变，且不发任何写语句', async () => {
+  // 假 `tls.connect`：verify 要拿到「盘上那张」的指纹才算 live（本用例**不碰真网络**）。
+  const connect = () => {
+    const sock = new EventEmitter();
+    sock.destroy = () => {};
+    sock.getPeerCertificate = () => ({
+      fingerprint256: new crypto.X509Certificate(WILDCARD.certPem).fingerprint256,
+      raw: new crypto.X509Certificate(WILDCARD.certPem).raw,
+    });
+    setImmediate(() => sock.emit('secureConnect'));
+    return sock;
+  };
+  const srv = await startServer({ connect });
+  try {
+    // 先装一张 + 真机校验一次，好让「缓存」与「台账」都有非零基线（否则「没变」毫无意义）
+    assert.equal((await putTls(srv, { certPem: WILDCARD.certPem, keyPem: WILDCARD.keyPem })).status, 200);
+    const liveRes = await verifyTls(srv);
+    assert.equal(liveRes.body.live.status, 'live');
+
+    const diskBefore = snapshot(srv.dynamicDir);
+    const certsBefore = srv.pool.tlsCerts.length;
+    const auditBefore = srv.pool.audit.length;
+    srv.pool.statements.length = 0; // 只看 inspect 自己发了什么语句
+
+    const res = await inspectTls(srv, { certPem: SECOND.certPem, keyPem: SECOND.keyPem });
+    assert.equal(res.status, 200, res.text);
+
+    assert.deepEqual(snapshot(srv.dynamicDir), diskBefore, '盘上一个字节都不许变（不落盘是这条的全部意义）');
+    assert.equal(srv.pool.tlsCerts.length, certsBefore, '不许写台账');
+    assert.equal(srv.pool.audit.length, auditBefore, '不许写审计');
+    // `tlsLive` 缓存也不许动：上一次 verify 的结论仍然成立（inspect 的是**别的一张**）
+    const after = await getTls(srv);
+    assert.equal(after.body.live.status, 'live', 'inspect 不许重置/覆盖 tlsLive');
+    assert.equal(
+      after.body.active.fingerprintSha256,
+      new crypto.X509Certificate(WILDCARD.certPem).fingerprint256,
+      '盘上仍是上一张（inspect 的是别的一张，不许换上去）',
+    );
+    assert.notEqual(after.body.active.fingerprintSha256, res.body.cert.fingerprintSha256);
+
+    // 连一条写语句都不许发（鉴权那几条 SELECT 不在本次窗口里：sqlLog 在 inspect 之前已清空，
+    // 但鉴权发生在路由之前——所以这里按语句类型判，而不是按条数）
+    const writes = srv.pool.statements.filter(({ sql }) => /^\s*(INSERT|UPDATE|DELETE|WITH)\b/i.test(sql));
+    assert.deepEqual(writes, [], `inspect 不许发写语句：${JSON.stringify(writes)}`);
   } finally {
     await srv.close();
   }
