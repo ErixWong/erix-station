@@ -3593,12 +3593,25 @@ tag `v0.1.53` → release `41999559918` success → 三镜像 `docker pull` 后 
 portal 日志 8 分钟内零 error/warn。**A2 的 host 闸在真浏览器上成立**：访问 `http://station.fde.erix.vip:8090/#/admin/users`
 ⇒ 页面**当场换到** `https://admin.fde.erix.vip:9443/…`（落到 Chrome 的 Privacy error，即证书不受信，见下）。
 
-**⚠ 尚未做：管理台的浏览器级验收（被证书卡住，不是代码问题）**。当前 `certs/` 里是**自签证书**（`CN=admin.fde.erix.vip`，
-有效期 1 年，私钥 root:600），Chrome 给 Privacy error；而 `erix_station_playwright` 容器**没有系统 CA 目录**
-（`/etc/ssl/certs` 不存在、无 `update-ca-certificates`、进程 uid 1000），装不进信任锚 ⇒ MCP 浏览器无法越过告警页。
-两条出路（**待决策者选**）：① 给一张**覆盖 `admin.fde.erix.vip`（或 `*.fde.erix.vip`）的正式证书**（手工放或 #456 上传）；
-② 把管理台 host 换成现成 `*.erix.vip` 通配证书覆盖的名字（`/docker/cert/erix.vip/` 有 `*.erix.vip`，到 2027-01-09），
-但那是**改 D1 的命名**（且 `admin.erix.vip` 的解析未核实）。
+**正式证书已装（2026-11-05，决策者提供 `/docker/cert/fde.erix.vip/`）**：Let's Encrypt `*.fde.erix.vip` + `fde.erix.vip`
+（`notAfter 2027-02-03`，`fullchain.pem` 4 层链，`privkey.pem` 与证书公钥配对）。装入 `certs/tls.{crt,key}`
+（**fullchain 整份当 crt**，`chown 0:0` + key `600`）+ 重写 `tls.yml` ⇒ `openssl s_client -servername admin.fde.erix.vip`
+`Verify return code: 0 (ok)`。⚠ 该证书**同时覆盖 `station.fde.erix.vip`**（`*.fde.erix.vip` 单层），
+所以用户面将来上 HTTPS（`websecure`/443）不需要另签一张，但那是**另一单**（今天 `websecure` 仍一条路由都没挂）。
+
+**浏览器级验收（正式证书到位后补做，v0.1.53，`erix_station_playwright` 真机）**：
+① 管理台入口 `https://admin.fde.erix.vip:9443/#/login` 正常渲染（**不再有证书告警**），admin 登录 ⇒ 落 `#/admin/users`，
+`/api/admin/users`、`/api/admin/llm/providers`、`/api/admin/git-hosts` 全 **200**；
+② 「Mail channel」tab（#457 那一片）在新入口上渲染正常（transport=disabled / password=not set / 测试发信按钮禁用并解释原因）；
+③ 「← Back to workbench」是**绝对地址** `http://station.fde.erix.vip:8090#/`（`hashUrl()` 的唯一拼法生效）；
+④ **A2 两个方向都实测**：管理台 `#/session/<id>` ⇒ 换到用户面（无会话 ⇒ `/login?redirect=/session/<id>`）；
+用户面 `#/admin/users` ⇒ 换到管理台并直接落在管理页（管理台会话 cookie 在）；
+⑤ **#332 × A2 组合**：无工位管理员在用户面打开 `#/` ⇒ 守卫先改写 `/admin/users` ⇒ host 闸换到管理台 ⇒ 落管理页。
+
+**⚠ 一条探针方法坑**：`curl https://127.0.0.1:9443` 在正式证书下**必然报 `subjectAltName does not match 127.0.0.1`**
+（证书只覆盖 `*.fde.erix.vip`）。要打本机端口又走真实证书校验，用
+`curl --resolve admin.fde.erix.vip:9443:127.0.0.1 https://admin.fde.erix.vip:9443/…`；`-k` 能绕过但那样就
+验不到「证书与 host 匹配」这件事（而它正是本单要保证的）。
 
 **已知遗留**：`ADMIN_IP_ALLOWLIST` 仍为空 = 管理台入口**对 FDE 容器可达**（#233 防火墙未落地，D4 的「默认不破坏现网」）；
 `#456`（证书上传/校验/回滚）未开工——它才是「证书生命周期搬进管理台」那张单。

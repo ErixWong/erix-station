@@ -174,6 +174,10 @@ compose 的插值默认值、`loadConfig({}).adminPort` 三者逐字比对，任
   上传面主动重写；最省事的做法是放好证书后重建一次 portal（`docker compose up -d station-portal`）。
 - **证书必须覆盖 `admin.<伞域>`**（#456 的硬校验口径）：不覆盖时浏览器报证书名不匹配，
   与「管理台有自己的 SSL 证书」这条需求直接冲突。
+- **现网已装**（2026-11-05）：`/docker/cert/fde.erix.vip/` 的 Let's Encrypt `*.fde.erix.vip`（`notAfter 2027-02-03`，
+  4 层链）⇒ `certs/tls.crt` = 整份 `fullchain.pem`、`certs/tls.key` = `privkey.pem`。该证书**同时覆盖**
+  `station.fde.erix.vip`，用户面上 HTTPS 时不必另签。⚠ 探针用 `curl --resolve admin.fde.erix.vip:9443:127.0.0.1`，
+  直接打 `https://127.0.0.1:9443` 会因 SAN 不含该 IP 而失败（这不是配置问题）。
 
 ## 6. 来源白名单（`ADMIN_IP_ALLOWLIST`，D4）
 
