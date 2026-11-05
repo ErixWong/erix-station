@@ -435,13 +435,20 @@ async function startRun(msg) {
   // 记账**无论注入几份都发**（files=0 也是有效信息：证明这条路径真跑过，供 §6.2 D4 量成本）；
   // 只有采集失败那一支不发（免得一条 warn 后面跟一条看起来正常的 injected）。
   if (agentsMdOk) {
+    // #451 评审 M2：`blocks` 为空时整个注入段是空串（口径 8「无 blocks ⇒ 逐字节不变」压过口径 7
+    // 「子目录索引」，取舍已写进设计稿 §4.1 规则 7 / user-space.md / §8.91）⇒ `notes` 与 `subdirHints`
+    // 都进不了 prompt。只看 prompt 分不清「采集跑过但一份都没注」和「整段根本没跑」
+    // ⇒ 把前 2 条 note 摘要拼进这条 info（**仍是现成 IPC `MSG.LOG`，不新增事件类型**）。
+    const noteSummary = agentsMd.notes.length > 0
+      ? `(${agentsMd.notes.slice(0, 2).join('; ')}${agentsMd.notes.length > 2 ? '…' : ''})`
+      : '';
     sendIpc(process, {
       type: MSG.LOG, run_id: runId, level: 'info',
       msg: `agents-md injected: files=${agentsMd.blocks.length}`
         + ` bytes=${agentsMd.totalBytes}`
         + ` truncated=${agentsMd.blocks.some((b) => b.truncated) ? 1 : 0}`
         + ` subdir_hints=${agentsMd.subdirHints.length}`
-        + ` notes=${agentsMd.notes.length}`,
+        + ` notes=${agentsMd.notes.length}${noteSummary}`,
     });
   }
 

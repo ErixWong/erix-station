@@ -366,6 +366,25 @@ test('无 blocks ⇒ renderAgentsMdSection 返回空串（system 必须逐字节
   assert.equal(renderAgentsMdSection({}), '', '缺参也必须是空串，不许抛');
   // notes 非空但 blocks 为空 ⇒ 仍然是空串（记账不能把空节变成有内容）
   assert.equal(renderAgentsMdSection({ blocks: [], notes: ['跳过 ~/projects/AGENTS.md：EACCES'] }), '');
+  // #451 评审 M2 的取舍（口径 8「无注入 ⇒ system 逐字节不变」压过口径 7「子目录索引」）：
+  // 产品行为维持现状，但口径必须写死在这里（设计稿 §4.1 规则 7 / user-space.md / AGENTS.md §8.91 同一口径）。
+  assert.equal(renderAgentsMdSection({ blocks: [], subdirHints: ['~/repo-a/AGENTS.md'] }), '',
+    'blocks 为空时子目录索引也不单独出现（索引不能把空段变成有内容）');
+});
+
+// M2 的可观测性补偿：`blocks=[]` 时 notes / subdirHints 都进不了 prompt ⇒ 日志是唯一通道。
+test('#451 M2：worker 的 info 记账必须拼上前 2 条 note 摘要（仍是 MSG.LOG，不新增事件类型）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const at = src.indexOf('agents-md injected:');
+  assert.notEqual(at, -1, 'info 记账必须在：§6.2 D4 靠它量注入成本');
+  const block = src.slice(Math.max(0, at - 1600), at + 500);
+  assert.match(block, /type: MSG\.LOG,[^\n]*level: 'info'/, '必须复用现成 MSG.LOG（不新增事件类型）');
+  assert.match(block, /notes=\$\{agentsMd\.notes\.length\}\$\{[A-Za-z_$][\w$]*\}/,
+    'notes=N 后面必须紧跟 note 摘要：blocks=[] 时 notes 根本不会出现在 prompt 里，没这条就只能猜');
+  assert.match(block, /agentsMd\.notes\.slice\(0, *2\)/, '摘要只取前 2 条（日志长度不能没上限地长）');
+  assert.match(block, /\.join\('; '\)/, '多条 note 用 "; " 分隔');
+  assert.match(block, /notes\.length > 2 \? '…'/, '超过 2 条必须以 … 收尾（让人知道还有）');
+  assert.doesNotMatch(src, /MSG\.AGENTS/i, '不得为此新增事件类型（模块抬头：不新增事件类型 / 错误码）');
 });
 
 test('常量与名字是接口的一部分（下游 worker 与文档都按这些名字说话）', () => {
