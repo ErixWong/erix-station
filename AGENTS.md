@@ -3761,3 +3761,36 @@ inspect 返回 `publicKeyPem` ⇒ 1 红；**inspect handler 顺手写盘 ⇒ 2 �
 **过程账**：这次验收是**真上传真回滚**（不是只点按钮看提示），代价是 `certs/` 被改写了两次——所以每一步都先取
 `sha256` / 计数基线，回滚后**逐字节比对**确认复原。**「验收后能复原」本身就该是验收的一部分**（先例 §8.94 那条
 「验完还原 `.env` 并 `up -d`」）。
+
+### 8.99 #451 的独立评审（erix_run）：1 blocker + 3 major —— 其中一条是「本单最强调的不变量无锁」（2026-11-05）
+
+派工方式：`erix_run`（`cwd` = 主工作区，只读、禁改仓库、报告写固定路径），`maxRounds=100` / `timeoutMs=3600000` /
+`sessionDir` 必给。终局 `judge_done`、54 轮、↑2.96M / ↓54k。报告 264 行（已归档 `~/worker-reports-261105/review-451-erix-run.md`）。
+
+**结论：1 blocker + 3 major + 6 minor。核心逻辑与八条硬口径在常见路径上确实做到了（两套测试 20/20、14/14 全绿、
+`node --check` 全 0），但下列四条是真的。**
+
+- **blocker：16 KiB 上限在「整文件读进内存并转成 JS 字符串」之后才生效**（`runner/lib/agents-md.js:223` `readFileSync`
+  无长度限制 → `:230` `buf.toString('utf8')` 在 read 的 try **之外** → `:241` 才判 `buf.length > maxFileBytes`）。
+  主 agent 独立复现（`/tmp` 稀疏文件）：600 MiB ⇒ **抛 `ERR_STRING_TOO_LONG`**、RSS 647 MB、563 ms，
+  而 `:198` 的 `stat.size` 从头到尾没用过。破「绝不抛」（硬口径 6）的后果被放大：`worker.js:424-434` 的兜底把
+  **整段置空** ⇒ 连 9 KB 平台节都不注入。修法：先按 `stat.size` 判，超限只 `readSync` 前 16 KiB；顺带把解码挪进 try。
+- **major：设计稿 §4.1 规则 6 承诺「解码失败 ⇒ 跳过 + note」是死光纤**——`buf.toString('utf8')` 是 lossy 解码、
+  **永不失败**（`grep -n 'TextDecoder\|fatal'` 零命中）⇒ 二进制/GBK 的 `AGENTS.md` 被当正文注入（含 U+FFFD 与 `\u0000`），
+  且 `notes=[]` 让日志看起来完全正常。修法：`new TextDecoder('utf-8',{fatal:true})` 包 try。
+- **major：`blocks=[]` 时 `subdirHints` 与 `notes` 一起被丢**（`agents-md.js:332` 提前返回不看它们）。实测：
+  项目根无 `AGENTS.md` + 5 个子仓库各有一份（**正是规则 7 的动机形态**）⇒ 渲染 0 字节、索引一条不出现。
+  口径 7 与口径 8 是**真冲突**，实现按 8 裁了，但 `§8.91` 与 `user-space.md:184` 都写成「7 条全部落地」，没有任何地方记这个取舍。
+- **major：接线锁①/③ 只比文本位置，钉不住「采集必须在 `startRun` 内」**。主 agent 独立复现（`/tmp` 副本，先跑未变异
+  对照）：把采集整段（含 try/catch）移到**模块顶层**、`startRun` 里只留 `if (agentsMdOk) { sendIpc … }`
+  ⇒ `agents-md.test.js` **20/20 全绿**、`system-prompt.test.js` 与对照**逐字相同**（12/14，红的 2 条是副本环境读
+  `portal/**` 的相对路径噪声，真仓库 14/14）。这正是 §8.64 `steerArmed` 的同型老账，而它是本单注释里最强调的那条。
+
+6 条 minor 里两条值得单独记：**`realpath` → `readFileSync` 的 TOCTOU**（检查后换 symlink 指向，实测越界内容可注入，
+用例文案「一个字节都不许注入」比实现强）；**去重 sha 用的是原始字节** ⇒ BOM/CRLF 差异让去重失效、同一段规则注入两遍且 `notes=0`。
+
+**⚠ 派工产物落点的教训（本次真实踩到，零例外）**：报告让 `erix_run` 写进 `<仓库>/.review-451/report.md`（未跟踪），
+而**同一个主工作区还有另一个会话在干活** ⇒ 它提交文档时 `git add -A` 把这份 27 KB 报告一起扫进了 `6078e30`
+并推到 origin/main。已用 `5336b83` 删除（历史不改写：强推 main 会踩并行会话）。
+⇒ **口径：派工产物一律不落共享主工作区的仓库内**——写 `/tmp`、写 worktree、或写 `~/worker-reports-<日期>/`。
+这条与「多个 worker 禁止共享同一 git 工作目录」同族，但更隐蔽：**受害的不是我的执行体，而是别人提交时的一个 `-A`**。
