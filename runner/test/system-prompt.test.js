@@ -202,23 +202,55 @@ test('SYSTEM_PROMPT 讲清「端口段由平台分配 + ports.json 是唯一真�
 //      因为旧提示词压根没提它）；
 //   ② 破了 ⇒ 有人开始把具体规则抄进提示词 = 第二个会过期的真相源（同 §8.10「工具名从注册面取、
 //      不手抄清单」）。抄规则在短期内看起来更“详细”，但它把 portal 文案与容器提示词绑成两份要同步的真相。
+//
+// **#451（2026-11-05）改口径**：告知面从「让模型自己 `cat`」改成「宿主在 run 启动时注入」。
+// 真机 14 天实测 35 个 run 只有 5 个读过 `~/AGENTS.md`（14%，其中 4 个是验收探针），读过的 4/5 自带
+// `head -50/60/80` 截断（「收工即提交」在 53–54 行，`head -50` 正好切掉）⇒ 指针再硬也挡不住。
+// 所以下面这条用例的判据**反转**：不再要求「必须写先读」，而要求「必须明确告知已注入」——不告知，
+// 模型会以为提示词末尾那段是它自己读到的，也可能再 `cat` 一遍白烧轮次。
+// 保留的两条口径不变：`~/.erix/ports.json` 的 `cat`（它是动态清单，不注入）、家目录用 shell 读。
 // ---------------------------------------------------------------------------
 
-test('SYSTEM_PROMPT 有「开工先读 ~/AGENTS.md」的强制指针，且自带读得到它的实际手段（#259 前提）', () => {
+test('SYSTEM_PROMPT 明确告知「平台约定已随本次 run 注入」，并保留 ports.json 的 shell 读法与复核手段（#451）', () => {
   const prompt = extractSystemPrompt(fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8'));
   const pointer = linesMentioning(prompt, '~/AGENTS.md');
   assert.ok(pointer.length > 0, 'SYSTEM_PROMPT 必须指向 ~/AGENTS.md（#258 定稿的强制指针）——缺了模型根本不知道有这份文件');
-  // 措辞必须是「先读」：R-1 P0 的判据是 transcript 里出现读 ~/AGENTS.md 的调用，「可以参考」挡不住。
-  assert.ok(pointer.some((l) => /先读/.test(l)), `强制指针必须写「先读」，实际是：${pointer.join(' / ')}`);
+  // #451：判据从「先读」改成「已注入」。这是**等强度换向**，不是放宽：旧判据要求模型自己去读，
+  // 新判据要求宿主已经把内容放进来且提示词说清这件事（真机证据见设计稿 §1.2）。
+  assert.ok(pointer.some((l) => /已随本次 run 注入|注入到本提示词/.test(l)),
+    `强制指针必须写明平台约定已注入本次 run，实际是：${pointer.join(' / ')}`);
+  assert.doesNotMatch(pointer.join('\n'), /开工前先读/,
+    '旧口径（让模型自己先读）必须退场：留着它会与「已注入」互相矛盾，模型会照旧 head -N 一遍');
   // 指针必须落在预览段里（agent 起服务给人访问时才会去翻这一段）。
   const section = previewSection(prompt);
   assert.match(section, /~\/AGENTS\.md/, '强制指针必须落在「预览域名与端口」段内（与它的消费时机同段）');
   assert.match(section, /不复述|不重抄/, '指针必须说明本节有意不复述那些规则（否则下一句就会被人当成可以拄规则）');
+  assert.match(section, /不会立刻生效/, '必须写明本 run 内改约定文件不立刻生效（否则模型会以为改完就生效）');
   // ⚠ #259 未落地前 createJail({ root: cwd }) 的读边界只有项目根（无只读例外）⇒
   //   指针必须自带 shell 手段，否则模型按自然习惯 readFile 会撞「被宿主边界拒绝」白烧一轮。
   assert.match(section, /文件工具读不到[\s\S]{0,60}用 shell 读/, '家目录读不到的口径与 shell 手段必须同段给出');
-  assert.match(section, /cat ~\/AGENTS\.md/, '必须给出可直接照抄的 `cat ~/AGENTS.md`');
-  assert.match(section, /cat ~\/\.erix\/ports\.json/, 'ports.json 的读取手段不得在改版时丢掉');
+  assert.match(section, /cat ~\/\.erix\/ports\.json/, 'ports.json 的读取手段不得在改版时丢掉（它是动态清单，不注入）');
+  assert.match(section, /cat ~\/AGENTS\.md/, '复核手段不得丢：模型要确认注入的约定文件是否被改过，只能 shell cat');
+});
+
+test('#451 接线锁①：worker.js 里 collectAgentsMd( 恰好 1 次，且在 async function startRun( 之后', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const hits = src.match(/collectAgentsMd\(/g) ?? [];
+  assert.equal(hits.length, 1, `采集点必须唯一（实际 ${hits.length} 处）：两处采集 = 两份真相，后写者静默胜`);
+  const startRunAt = src.indexOf('async function startRun(');
+  assert.notEqual(startRunAt, -1, 'worker.js 必须仍有 `async function startRun(`');
+  assert.ok(src.indexOf('collectAgentsMd(') > startRunAt,
+    '采集必须写在 startRun **内部**：worker 进程会被 agentd 复用给下一个 run，提到模块顶层 = '
+    + '第二个 run 沿用第一个 run 的内容（§8.64 steerArmed 同型老账）');
+});
+
+test('#451 接线锁②：config.input.system 是 SYSTEM_PROMPT + agentsMdSection（不是裸 SYSTEM_PROMPT）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  assert.match(src, /system: SYSTEM_PROMPT \+ agentsMdSection,/,
+    '注入点必须拼上采集结果；写成裸 SYSTEM_PROMPT 等于本功能整条死掉，而且不会有任何报错');
+  assert.equal((src.match(/system: SYSTEM_PROMPT(?! \+ agentsMdSection)/g) ?? []).length, 0,
+    '不得有任何「裸 SYSTEM_PROMPT」的 system 拼装点（设计稿 §6.2 W1）：第二处会让人以为注入生效了');
+  assert.equal((src.match(/renderAgentsMdSection\(/g) ?? []).length, 1, '渲染调用点必须唯一（W1）');
 });
 
 test('单一来源防漂移：提示词里不得出现那八个具体规则词（allowedHosts / credentials / CORS / Set-Cookie / localStorage / Bearer / 打开预览 / markdown 链接）', async () => {
