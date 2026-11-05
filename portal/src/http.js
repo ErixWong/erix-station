@@ -41,6 +41,7 @@ import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录�
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
+import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -560,7 +561,16 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
   }
 }
 
-export function createServer({ pool, config, log = console, docker = null, llmGateway = null, mailerProvider = null }) {
+/**
+ * @param {{pool: object, config: object, log?: Console, docker?: object, llmGateway?: object,
+ *          mailerProvider?: object, tlsConnect?: Function, tlsRoutePath?: string}} opts
+ *   `tlsConnect` / `tlsRoutePath` 仅供测试注入（#456 的真机校验探针）：前者换掉 `tls.connect`，
+ *   后者换掉 `/proc/net/route`。生产形态两者都不传（走真 socket + 真路由表）。
+ */
+export function createServer({
+  pool, config, log = console, docker = null, llmGateway = null, mailerProvider = null,
+  tlsConnect = null, tlsRoutePath = '/proc/net/route',
+}) {
   const loginLimiter = createRateLimiter(config.loginRateLimit);
   // TOTP 失败限流按「账户 + IP」计数（防换新 pending_token 绕过）；单 token 尝试上限单独计。
   const totpLimiter = createRateLimiter({
@@ -610,6 +620,22 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
     blockMs: config.mailTestRateLimit?.blockMs ?? 60 * 60 * 1000,
     maxEntries: config.mailTestRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
   });
+  // #456 管理台证书：上传/回滚 10 次/小时、真机校验 30 次/小时，都按管理员计（key `tlsupload:<adminId>` /
+  // `tlsverify:<adminId>`）。同 mailTestLimiter 的形状（createRateLimiter 只有 recordFailure 一个计数入口）。
+  // **只在真会落盘 / 真会握手时才记**：证书校验失败（PEM 错、不配对、不覆盖域名）不烧配额——
+  // 用户改一张 PEM 常常要试几次，先把额度用光只会让他连「改对了」都提交不进去。
+  const tlsUploadLimiter = createRateLimiter({
+    maxFailures: config.tlsUploadRateLimit?.maxFailures ?? 10,
+    windowMs: config.tlsUploadRateLimit?.windowMs ?? 60 * 60 * 1000,
+    blockMs: config.tlsUploadRateLimit?.blockMs ?? 60 * 60 * 1000,
+    maxEntries: config.tlsUploadRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
+  const tlsVerifyLimiter = createRateLimiter({
+    maxFailures: config.tlsVerifyRateLimit?.maxFailures ?? 30,
+    windowMs: config.tlsVerifyRateLimit?.windowMs ?? 60 * 60 * 1000,
+    blockMs: config.tlsVerifyRateLimit?.blockMs ?? 60 * 60 * 1000,
+    maxEntries: config.tlsVerifyRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
   // #449：邮件通道读取侧（SMTP 参数存 DB，见 `mail-provider.js`）。`mailerProvider` 参数仅供测试注入 fake。
   // 为什么不在启动时同步读一次：登录是热路径但启动不是；真正的「现在到底能不能发信」每次登录时由
   // `ctx.mailerProvider.get()` 回答（60s 缓存 + 急停硬闸）。这里只在 `config.mail` 存在（= `loadConfig`
@@ -630,6 +656,12 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
   const ctx = {
     pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter,
     mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, mailTestLimiter, docker,
+    tlsUploadLimiter, tlsVerifyLimiter,
+    // #456：真机校验的注入点（生产 = `tls.connect` + `/proc/net/route`；单测换成假 socket / 假路由表）。
+    tlsConnect, tlsRoutePath,
+    // #456：最近一次**真机校验**结果（内存态，单实例）。GET 只回缓存，绝不主动连（那是 verify 端点的事）。
+    // 上传/回滚成功后会被重置成 `unknown`——旧结果对应的是上一张证书，留着就是撒谎。
+    tlsLive: { status: 'unknown', checkedAt: null },
     llmGateway: llmGateway ?? createLlmGatewayClient({
       adminUrl: config.llmGatewayAdminUrl ?? 'http://station-litellm:4000',
       masterKey: config.llmGatewayMasterKey ?? '',
@@ -693,6 +725,12 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
         return;
       }
       if (err instanceof mailSettings.MailSettingsError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof tlsCert.TlsCertError) {
+        // #456：证书面的错误一律 `retryable:false`（`tls_cert_expired` 也是——换一张证书才是出路，
+        // 重试一万次还是同一张）。`details` 里只有字段名/域名/指纹，**没有 PEM、没有私钥**。
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
@@ -1387,6 +1425,23 @@ async function handleAdminApi(req, res, ctx, url) {
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
+  // ---- 管理台证书生命周期（issue #456 M1，契约 portal.md §4.13） ----
+  // 四个端点全部已在 handleAdminApi 入口过 `requireAdmin`；盘上证书是真相，DB 只是台账。
+  // 响应一律由 `tls-cert.js#describeTls` **逐键白名单**拼装（私钥/PEM 原文永不出现）。
+  if (pathname === '/api/admin/tls') {
+    if (req.method === 'GET') return handleAdminTlsGet(req, res, ctx);
+    if (req.method === 'PUT') return handleAdminTlsPut(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  if (pathname === '/api/admin/tls/verify') {
+    if (req.method === 'POST') return handleAdminTlsVerify(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  if (pathname === '/api/admin/tls/rollback') {
+    if (req.method === 'POST') return handleAdminTlsRollback(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
   // 管理台「邮件通道」配置（issue #449 写侧切片，契约 portal.md §4.12）：GET 读 / PUT 写 / POST 测试发信。
   // 口令**只写不读**：响应只有 `hasPassword` 布尔（模块层就不把 `smtp_password` 放进 DTO）。
   if (pathname === '/api/admin/mail/settings') {
@@ -1617,6 +1672,199 @@ async function handleAdminMailTest(req, res, ctx, session) {
     details: { to, at },
   });
   return sendJson(res, 200, { ok: true, to, at });
+}
+
+// ---------------------------------------------------------------------------
+// 管理台证书生命周期（issue #456 M1，契约 portal.md §4.13）
+// ---------------------------------------------------------------------------
+
+/**
+ * 证书上传请求体的**整体**上限。
+ *
+ * 为什么不是 `config.maxBodyBytes`（默认 64 KiB）：两份 PEM **各**允许 64 KiB（工单 §4），
+ * 合起来再加 JSON 转义就超过 64 KiB —— 用默认闸会在 `readJsonBody` 里先变成 413，
+ * 而工单要求的是「超 64 KiB ⇒ 400 `validation_failed` + `details.field`」。所以：
+ * 体级闸放到 256 KiB（宽松，只防离谱体积），**字段级 64 KiB 判据在 `tls-cert.js#validateUpload`**。
+ */
+const TLS_UPLOAD_BODY_LIMIT = 256 * 1024;
+
+/** 证书目录（`<dynamic>/certs` 的父目录）：与 routes.yml / llm-routes.yml 同一个动态目录。 */
+function tlsDynamicDir(ctx) {
+  return ctx.config.traefikDynamicDir;
+}
+
+/** GET / PUT / verify / rollback 共用的响应形状（逐键白名单，见 `tls-cert.js#describeTls`）。 */
+async function tlsStatusPayload(ctx) {
+  return tlsCert.describeTls({
+    dynamicDir: tlsDynamicDir(ctx),
+    adminHost: ctx.config.adminHost,
+    live: ctx.tlsLive,
+  });
+}
+
+/** 429 信封（与 `handleAdminMailTest` 同一个形状）。 */
+function tlsRateLimited(gate, message) {
+  return new HttpError(429, 'rate_limited', message, {
+    retryable: true,
+    headers: { 'Retry-After': String(gate.retryAfterSeconds) },
+  });
+}
+
+/**
+ * GET /api/admin/tls：盘上证书元数据 + 覆盖判定 + **最近一次真机校验结果**（只读缓存，不主动连）+ 有无可回滚备份。
+ *
+ * 不写审计（纯读，每次进管理页都会调）。无证书也是 `200` + `configured:false`（未配置是正常态，不是 404）。
+ */
+async function handleAdminTlsGet(req, res, ctx) {
+  return sendJson(res, 200, await tlsStatusPayload(ctx));
+}
+
+/**
+ * PUT /api/admin/tls：上传/更新证书。顺序固定：
+ *   校验（PEM / 配对 / 未过期 / 覆盖 adminHost / confirmDomains）→ 限流 → 备份 → 写 crt → 写 key
+ *   → `materializeTlsAssets()`（重写 tls.yml = 唯一 reload 把手）→ 台账 → 审计。
+ *
+ * **校验失败零副作用**：所有校验都在写盘之前（盘上一个字节都不动，单测有判据）。
+ * 限流**只在真会落盘时才计次**（同 mailTest 的口径：校验失败不烧配额）。
+ */
+async function handleAdminTlsPut(req, res, ctx, session) {
+  requireJson(req);
+  const body = await readJsonBody(req, TLS_UPLOAD_BODY_LIMIT);
+
+  const result = tlsCert.validateUpload({
+    certPem: body?.certPem,
+    keyPem: body?.keyPem,
+    adminHost: ctx.config.adminHost,
+    confirmDomains: body?.confirmDomains,
+  });
+  if (!result.ok) {
+    throw new tlsCert.TlsCertError(result.code, result.message, {
+      httpStatus: 400,
+      details: result.details,
+    });
+  }
+
+  const limiterKey = `tlsupload:${session.user.id}`;
+  const gate = ctx.tlsUploadLimiter.check(limiterKey);
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书上传过于频繁，请稍后再试');
+  ctx.tlsUploadLimiter.recordFailure(limiterKey);
+
+  const written = await tlsCert.writeCertificateAssets({
+    dynamicDir: tlsDynamicDir(ctx),
+    certPem: body.certPem,
+    keyPem: body.keyPem,
+    log: ctx.log,
+  });
+
+  // 台账：**盘是真相**，所以 DB 写失败不回滚已生效的证书（回滚才是更坏的后果），只记 error。
+  try {
+    await tlsCert.recordCertificateRow(ctx.pool, {
+      cert: result.cert,
+      kind: 'upload',
+      uploadedBy: session.user.id,
+    });
+  } catch (err) {
+    ctx.log?.error?.(`[tls] 证书已写盘但台账写入失败：${err?.message ?? err}`);
+  }
+
+  // 上一张证书的校验结果对这张不成立 —— 重置成 unknown（留着就是撒谎）。
+  ctx.tlsLive = { status: 'unknown', checkedAt: null };
+
+  await auth.audit(ctx.pool, {
+    actorId: session.user.id,
+    action: 'admin.tls_updated',
+    target: 'tls_certificate',
+    // 只有元数据：**不放 PEM、不放私钥**（红线）。
+    details: {
+      subjectCN: result.cert.subjectCN,
+      sans: result.cert.sans,
+      fingerprintSha256: result.cert.fingerprintSha256,
+      notAfter: result.cert.notAfter,
+      backupCreated: written.backup !== null,
+    },
+  }).catch(() => {});
+
+  return sendJson(res, 200, await tlsStatusPayload(ctx));
+}
+
+/**
+ * POST /api/admin/tls/verify：对管理台入口做一次**真 TLS 握手**，比对指纹。
+ *
+ * 连**默认网关**（从 `/proc/net/route` 读）+ `servername=adminHost`：portal 容器解析不了
+ * `admin.<伞域>`（实测 ENOTFOUND），而证书 SAN 也不含 IP（事实③④）。`rejectUnauthorized:false`，
+ * 判据只看 `fingerprint256`。
+ *
+ * 盘上无证书 ⇒ `live.status='unreachable'` + `error='no_certificate'`（没有可比的基准，不是「连不上」）。
+ * 不写审计（探针不是变更）。
+ */
+async function handleAdminTlsVerify(req, res, ctx, session) {
+  requireJson(req);
+  const limiterKey = `tlsverify:${session.user.id}`;
+  const gate = ctx.tlsVerifyLimiter.check(limiterKey);
+  if (!gate.allowed) throw tlsRateLimited(gate, '证书校验过于频繁，请稍后再试');
+  ctx.tlsVerifyLimiter.recordFailure(limiterKey);
+
+  const active = await tlsCert.readActiveCertificate({ dynamicDir: tlsDynamicDir(ctx) });
+  let live;
+  if (!active.configured) {
+    live = { status: 'unreachable', checkedAt: new Date().toISOString(), error: 'no_certificate' };
+  } else {
+    live = await tlsCert.verifyLiveCertificate({
+      expectedFingerprint: active.cert.fingerprintSha256,
+      adminHost: ctx.config.adminHost,
+      adminPort: ctx.config.adminPort,
+      // 测试可注入假 `tls.connect` / 假路由表（单测不碰真网络、不依赖本机路由）。
+      ...(ctx.tlsConnect ? { connect: ctx.tlsConnect } : {}),
+      routePath: ctx.tlsRoutePath,
+    });
+  }
+  ctx.tlsLive = live;
+  return sendJson(res, 200, await tlsStatusPayload(ctx));
+}
+
+/**
+ * POST /api/admin/tls/rollback：从 `certs/prev/` 还原上一代 + 重写 `tls.yml` + 台账（`kind='rollback'`）+ 审计。
+ * prev 不存在 ⇒ `404 tls_no_previous`（本单允许新增的码）。
+ */
+async function handleAdminTlsRollback(req, res, ctx, session) {
+  requireJson(req);
+  const limiterKey = `tlsupload:${session.user.id}`;
+  const gate = ctx.tlsUploadLimiter.check(limiterKey);
+  if (!gate.allowed) throw tlsRateLimited(gate, '回滚过于频繁，请稍后再试');
+  ctx.tlsUploadLimiter.recordFailure(limiterKey);
+
+  const out = await tlsCert.rollbackCertificateAssets({
+    dynamicDir: tlsDynamicDir(ctx),
+    log: ctx.log,
+  });
+
+  try {
+    await tlsCert.recordCertificateRow(ctx.pool, {
+      cert: out.cert,
+      kind: 'rollback',
+      uploadedBy: session.user.id,
+    });
+  } catch (err) {
+    ctx.log?.error?.(`[tls] 回滚已生效但台账写入失败：${err?.message ?? err}`);
+  }
+
+  ctx.tlsLive = { status: 'unknown', checkedAt: null };
+
+  await auth.audit(ctx.pool, {
+    actorId: session.user.id,
+    action: 'admin.tls_rolled_back',
+    target: 'tls_certificate',
+    details: {
+      subjectCN: out.cert?.subjectCN ?? null,
+      sans: out.cert?.sans ?? [],
+      fingerprintSha256: out.cert?.fingerprintSha256 ?? null,
+      notAfter: out.cert?.notAfter ?? null,
+      // 回滚**不产生**新备份（prev 仍是那一代）⇒ 恒 false。
+      backupCreated: false,
+    },
+  }).catch(() => {});
+
+  return sendJson(res, 200, await tlsStatusPayload(ctx));
 }
 
 /**

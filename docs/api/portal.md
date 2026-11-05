@@ -58,6 +58,10 @@
 | 管理 | `GET /api/admin/mail/settings` | **邮件通道配置：读**（#449，§4.12）。**永不返回口令**：只给 `hasPassword` 布尔；无行（未配置）也回 `200` + 默认 DTO |
 | 管理 | `PUT /api/admin/mail/settings` | **邮件通道配置：写**（#449，§4.12）。口令**只写**：键缺席 = 不修改、`null`/`""` = 清除；落库后缓存**立刻**失效（不等 60s TTL） |
 | 管理 | `POST /api/admin/mail/test` | **用已保存的配置发一封测试信**（#449，§4.12）。未启用 ⇒ `409 mail_not_configured`；每管理员 5 次/小时 |
+| 管理 | `GET /api/admin/tls` | **证书现状：读**（#456，§4.13）。盘上证书元数据 + 覆盖判定 + 最近一次真机校验结果（**只读缓存，不主动连接**）+ 有无可回滚备份。无证书 ⇒ `200` + `configured:false` |
+| 管理 | `PUT /api/admin/tls` | **证书上传/更新**（#456，§4.13）。校验（PEM/配对/未过期/覆盖 adminHost/confirmDomains）→ 备份上一代 → 写盘（key 0600）→ 重写 `tls.yml`（触发 reload）→ 台账 → 审计。每管理员 10 次/小时 |
+| 管理 | `POST /api/admin/tls/verify` | **真机校验**（#456，§4.13）：连默认网关的 `TRAEFIK_ADMIN_PORT` + `servername=adminHost`，比 `fingerprint256` ⇒ `live`/`mismatch`/`unreachable`。每管理员 30 次/小时 |
+| 管理 | `POST /api/admin/tls/rollback` | **回滚到上一代**（#456，§4.13）。从 `certs/prev/` 还原 + 重写 `tls.yml` + 台账（`kind='rollback'`）+ 审计；无 prev ⇒ `404 tls_no_previous` |
 | 会话 | `GET /api/sessions` | 会话列表 |
 | 会话 | `POST /api/sessions` | 创建会话 |
 | 会话 | `GET /api/sessions/:id` | 会话详情（含消息历史 + `last_seq`） |
@@ -156,6 +160,12 @@
 | 409 | `email_not_registered`（#449）| **邮件通道已启用，但这个账号没有邮箱** ⇒ 第二因素做不成（`users.email` 为空）。`retryable: false`：重试一万次也不会长出邮箱，`message` 直接给出路「请联系管理员补录邮箱」。**关键语义：绝不静默退回纯口令**（否则「开了第二因素」只是控制台的错觉）。落点：§2.2 第一步与 §2.3b 重发 | 否 |
 | 409 | `mail_not_configured`（#449，管理台切片）| **测试发信时邮件通道未启用**（`mail_settings` 无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半 ⇒ 读取侧一律 `enabled:false`）。`retryable: false`：重试一万次也发不出去，`message` 直接给出路「先去管理台配 SMTP」。落点只有 `POST /api/admin/mail/test`（§4.12）——登录路径同一种状态**不是错误**（它按「没有第二因素」正常退回纯口令，§2.2 第④分支）| 否 |
 | 409 | `llm_model_not_found`（#261014 切片 B2，工单 `fix-261014-05b2`）| **发消息预检 fail-fast**：`POST /api/sessions/:id/messages` 在建 run 之前发现「会话属主 active LiteLLM binding 里某个**已配置槽位**的 `model_info.id` 在网关 `/model/info` 里查不到」（模型被删除/重建 ⇒ **id 变**）。**与 `llm_not_configured` 的关键差别：后者是「压根没配」，本码是「配过，但那个模型已经不存在了」**。`details` = `{slot, model_id}`（`slot` 取值 `main` / `embedding` / `vision`）。**选 409 而不是 424**：请求本身合法且已认证，失败原因是「绑定配置与网关目录的状态互相矛盾」，与同端点既有的 `409 llm_not_configured` / `409 run_in_progress` 同族（424 Failed Dependency 语义是「依赖的前置请求失败」，这里没有任何前置请求，且 §4.3 全表无 424 先例）。**只在发消息路径拦**：心跳路径同判据仍只 `warn`（§9.5，`reason: 'unknown_model_id'`）；**网关不可达一律放行**（fail-open，不让网关抖动演成用户发不出消息）| 是（管理员改配后原样重试可成功；本预检零副作用、不写幂等台账，同 `Idempotency-Key` 重试会重新占位，§1.4。**盲目立即重试仍是同一码**——解法只有一个：改配） |
+| 400 | `tls_cert_invalid`（#456，§4.13）| **上传的证书 PEM 解析不出来**（`new X509Certificate()` 抛；空串/非 PEM/被截断都算）。`retryable:false`：同一份字节重试一万次也一样。`details` 不带任何 PEM 片段 | 否 |
+| 400 | `tls_key_invalid`（#456，§4.13）| **上传的私钥 PEM 解析不出来**（`createPrivateKey()` 抛）。与 `tls_key_mismatch` 的区别：这是「这根本不是一把钥匙」，那是「是钥匙但不是这张证书的」| 否 |
+| 400 | `tls_key_mismatch`（#456，§4.13）| **私钥与证书不配对**（两边导出的 SPKI DER 不一致）。装错私钥的后果是管理台入口握手直接失败（Traefik `Error while creating certificate store`），所以必须在写盘前拒 | 否 |
+| 400 | `tls_cert_expired`（#456，§4.13）| **证书已过期**（`notAfter <= now`）。`retryable` 也是 `false`：重试还是同一张过期证书，出路只有换一张 | 否 |
+| 400 | `tls_cert_domain_mismatch`（#456，§4.13）| **证书覆盖不到管理台域名**（`details = {adminHost, missing:[…], certDomains:[…]}`），或 `confirmDomains` 里有证书覆盖不到的名字（此时 `details.field='confirmDomains'`，`missing` 只列超出的那些）。**无 override**：不覆盖 `admin.<伞域>` 的证书装上去 = 刷新后进不了管理台，只能登服务器救 | 否 |
+| 404 | `tls_no_previous`（#456，§4.13）| **没有可回滚的上一代证书**（`<dynamic>/certs/prev/` 不存在或不完整——首次上传后立刻点回滚就是这一格）。`retryable:false` | 否 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
@@ -2187,6 +2197,149 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 - **审计**：只有 `password_changed` 布尔与键名 `'password'`，**没有口令值**。
 - **日志**：本切片不打日志（发信失败由 `mailer.js` 记一条脱敏收件人 + reason，与登录路径同口径）。
 - 单测 `portal/test/admin-mail-settings.test.js` 有两条专门搜口令明文的判据（响应体 + 整条审计 `details` 序列化）。
+
+---
+
+### 4.13 管理台证书生命周期（`/api/admin/tls*`，#456 M1）
+
+> 规格：issue #456（决策者 2026-11-05：**证书上传/更新/覆盖域名检查搬进管理台**，不手工登服务器放文件）。
+> 实现：`portal/src/tls-cert.js`（解析 / 校验 / 写盘 / 备份 / 回滚 / 真机握手比对）、
+> `portal/src/http.js`（分派 / 限流 / 审计）、`portal/src/tlsassets.js`（装载面，**只由它物化 `tls.yml`**）。
+> 表结构见 `docs/data/model.md` §1.32（迁移 `0027`）。部署面见 `docs/deploy/edge-routing.md` §5。
+> 四个端点全部过 `requireAdmin`：非 admin ⇒ `403 forbidden`，未登录 ⇒ `401 unauthorized`。
+
+#### 4.13-0 分工：盘是真相，DB 只是台账
+
+| 面 | 谁是真相 | 说明 |
+|---|---|---|
+| 当前生效的证书 | **`<dynamic>/certs/tls.crt` + `tls.key`** | GET 一律**读盘**（不信 DB）：`configured` 的判据是「两文件都在且证书能解析」 |
+| Traefik 用哪张证书 | **`<dynamic>/tls.yml`** | 由 `materializeTlsAssets()` 物化；**上传/回滚后必须重写它**才触发 reload（只换 `certs/*` 不会） |
+| 「谁什么时候装了什么」 | `tls_certificates`（DB） | 审计/历史，**不是**真相源；与盘不一致时以盘为准 |
+
+#### 4.13-1 响应 DTO（GET / PUT / verify / rollback **同一个形状**）
+
+```json
+{
+  "configured": true,
+  "active": {
+    "subjectCN": "*.fde.erix.vip",
+    "sans": ["*.fde.erix.vip", "fde.erix.vip"],
+    "issuerCN": "*.fde.erix.vip",
+    "notBefore": "2026-11-05T00:00:00.000Z",
+    "notAfter": "2027-02-03T00:00:00.000Z",
+    "fingerprintSha256": "AB:CD:…:EF"
+  },
+  "coverage": { "adminHost": "admin.fde.erix.vip", "covered": true },
+  "live": { "status": "live", "checkedAt": "2026-11-05T09:12:31.004Z", "fingerprintSha256": "AB:CD:…:EF", "subjectCN": "*.fde.erix.vip" },
+  "previous": { "fingerprintSha256": "12:34:…:99", "subjectCN": "*.fde.erix.vip", "notAfter": "2027-02-03T00:00:00.000Z", "savedAt": "2026-11-05T09:00:00.000Z" }
+}
+```
+
+**键集是白名单，`portal/test/tls-api.test.js` ⑨ 逐键钉住**（顶层恰好五个键、`active` 恰好六个、`coverage` 两个、
+`previous` 四个）。无证书时 `active` / `previous` 为 `null`、`coverage.covered` 为 `false`。
+
+| 字段 | 说明 |
+|---|---|
+| `configured` | 盘上**两文件齐**且证书可解析。`false` 时管理台入口回落到 Traefik 内建自签证书 |
+| `active.*` | 叶子证书的元数据。`fingerprintSha256` = `X509Certificate.fingerprint256`（**冒号分隔大写**，与 `getPeerCertificate().fingerprint256` 逐字符可比） |
+| `coverage.covered` | 证书是否覆盖 `adminHost`（`ADMIN_PUBLIC_HOST`，默认 `admin.<伞域>`）。口径见 4.13-3 |
+| `live.status` | `unknown`（还没验过 / 上传后已失效）/ `live` / `mismatch` / `unreachable`。**GET 只回缓存，绝不主动连** |
+| `live.error` | 仅 `unreachable` 出现：`timeout` / `no_default_gateway` / `no_certificate` / socket 错误码（`ECONNREFUSED` 等） |
+| `previous` | 可回滚的上一代（`certs/prev/`）。`null` = 没有备份 |
+
+**响应里绝不含**：私钥正文、`certPem`/`keyPem` 原文、任何密钥派生值（连 `publicKeyPem` 都不在白名单里）。
+
+#### 4.13-2 `GET /api/admin/tls`
+
+无请求参数。纯读、**不写审计**（每次进管理页都会调）。无证书 ⇒ `200` + `configured:false`（**不是 404**）。
+
+#### 4.13-3 `PUT /api/admin/tls`
+
+```json
+{ "certPem": "-----BEGIN CERTIFICATE-----\n…", "keyPem": "-----BEGIN PRIVATE KEY-----\n…",
+  "confirmDomains": ["admin.fde.erix.vip", "fde.erix.vip"] }
+```
+
+`certPem` = **整份 fullchain**（叶子在前；`X509Certificate` 只解析第一份 = Traefik 会端出来的那张），
+`keyPem` = 对应私钥。两份各 **≤ 64 KiB**（超 ⇒ `400 validation_failed` + `details.field`）。
+> 体级闸：本端点的请求体整体上限 **256 KiB**（不是默认的 `MAX_BODY_BYTES` 64 KiB——两份 64 KiB 的 PEM
+> 加上 JSON 转义放不进 64 KiB，那样会先撞 `413 payload_too_large` 而拿不到字段级错误）。超过 256 KiB 仍是
+> `413 payload_too_large`（§1.2，全局语义不变）。
+`confirmDomains` 可选：前端把证书里提取到的名字预填成可编辑 input，用户删/补后回传；**它不能超出证书能力**。
+
+**校验顺序（每条都能被单测打红；全部在写盘之前 ⇒ 失败零副作用）**：
+
+| # | 判据 | 失败码 |
+|---|---|---|
+| 1 | `certPem`/`keyPem` 是字符串且 ≤ 64 KiB | `400 validation_failed`（`details.field`）|
+| 2 | 证书 PEM 可解析（`new X509Certificate()`）| `400 tls_cert_invalid` |
+| 3 | 私钥 PEM 可解析（`createPrivateKey()`）| `400 tls_key_invalid` |
+| 4 | 公钥配对（两边 SPKI **DER** 逐字节比）| `400 tls_key_mismatch` |
+| 5 | 未过期（`notAfter > now`）| `400 tls_cert_expired` |
+| 6 | **覆盖 `adminHost`** | `400 tls_cert_domain_mismatch`（`details={adminHost, missing:[adminHost], certDomains}`）|
+| 7 | `confirmDomains` 每项都被覆盖（可选）| `400 tls_cert_domain_mismatch`（`details.missing` 只列超出的、`details.field='confirmDomains'`）|
+
+**域名覆盖口径（与浏览器一致，三条都是判据）**：
+
+- **通配符只匹配一层**：`*.fde.erix.vip` 覆盖 `admin.fde.erix.vip`，**不**覆盖 `a.b.fde.erix.vip`；
+- **大小写不敏感**、结尾点归一；
+- **有 SAN 时忽略 CN**（SAN 是唯一权威）；**无 SAN 时** CN 兜底。只认 `DNS:` 项（IP/email SAN 与「覆盖哪个 host」无关）。
+
+**成功后的顺序（固定）**：
+
+1. **限流**（每管理员 **10 次/小时**，key `tlsupload:<adminId>`；**只在真会落盘时计次**——校验失败不烧配额）；
+2. **备份上一代**到 `certs/prev/`（`tls.crt` 0644 / `tls.key` 0600 / `meta.json` = `{fingerprintSha256, subjectCN, notAfter, savedAt}`，**不含 PEM**；只保一代，覆盖式）；
+3. 写 `certs/tls.crt`（0644）；
+4. 写 `certs/tls.key`（**0600**，属主 = 进程 uid = root ⇒ 满足 Traefik 的读取前提）；
+5. `materializeTlsAssets()` 重写 `tls.yml`（**唯一 reload 把手**；`fingerprint` 行含 `keymtime`，只换私钥也会变）；
+6. 落 `tls_certificates` 一行（`kind='upload'`）；
+7. 审计 `admin.tls_updated`；
+8. 回 `200` + 4.13-1 的 DTO（`live` 重置为 `unknown`——上一张证书的校验结果对这张不成立）。
+
+任一步失败 ⇒ `500 internal` + `details.step`（`mkdir`/`backup`/`cert`/`key`/`materialize`），**说清是哪一步**；
+写 `key` 失败时会 best-effort 把 `crt` 还原成备份那一版（避免盘上留下「新 crt + 旧 key」的不配对组合）。
+DB 写失败**不回滚已生效的证书**（盘是真相，回滚才是更坏的后果），只记一条 `error` 日志。
+
+#### 4.13-4 `POST /api/admin/tls/verify`
+
+无请求体（`{}` 也行）。对管理台入口做**一次真 TLS 握手**，比 `fingerprint256`：
+
+- 连 **默认网关**（从 `/proc/net/route` 读 `Destination=00000000` 那行；`Gateway` 是小端 hex，
+  现网 `010020AC` ⇒ `172.32.0.1`）+ **`port = config.adminPort`**（`TRAEFIK_ADMIN_PORT`，默认 9443）
+  + **`servername = adminHost`**（SNI，让 Traefik 选中正确的证书）；
+- `rejectUnauthorized: false`，**判据只看指纹**。⚠ **不要**顺手加 hostname 校验：证书 SAN 只覆盖
+  `*.fde.erix.vip`，连 `127.0.0.1` 必然 `subjectAltName does not match`——那不是配置问题；
+- 超时 **5s**；三种结果 `live` / `mismatch` / `unreachable`（`error` 给原因）；
+- 盘上无证书 ⇒ `live.status='unreachable'` + `error='no_certificate'`（没有可比的基准）；
+- 每管理员 **30 次/小时**（key `tlsverify:<adminId>`）；**不写审计**（探针不是变更）；
+- 结果缓存在进程内存（单实例），随后的 `GET` 直接回放；**上传/回滚成功会把它重置为 `unknown`**。
+
+#### 4.13-5 `POST /api/admin/tls/rollback`
+
+从 `certs/prev/` 读回两文件写回原位（0644 / **0600**）+ `materializeTlsAssets()` + 台账（`kind='rollback'`）+ 审计。
+`certs/prev/` 不存在或不完整 ⇒ **`404 tls_no_previous`**。回滚**不改写 `prev` 本身**（重复回滚幂等）。
+限流与上传共用同一个计数器（10 次/小时）。
+
+#### 4.13-6 审计口径
+
+| action | 触发 | `details` |
+|---|---|---|
+| `admin.tls_updated` | PUT 成功 | `{subjectCN, sans, fingerprintSha256, notAfter, backupCreated}` |
+| `admin.tls_rolled_back` | rollback 成功 | 同上（`backupCreated` 恒 `false`——回滚不产生新备份）|
+
+两条都带 `actor_id = 当前 admin`、`target = 'tls_certificate'`。**`details` 里没有 PEM、没有私钥、没有密钥派生值**。
+
+#### 4.13-7 红线：私钥只落盘
+
+- **响应**：白名单键集（4.13-1），连 `publicKeyPem` 都不在里面。
+- **审计**：只有元数据（4.13-6）。
+- **日志**：只记「哪一步失败」（错误码 + 步骤名），不记 PEM 正文。
+- **DB**：`tls_certificates` 里没有任何 PEM 列（迁移 0027 的列清单被单测钉住）。
+- **盘上**：`certs/tls.key` **0600 且属主必须是 Traefik 进程的 uid**（`station-edge` 里 root 没有
+  `CAP_DAC_OVERRIDE`，属主/模式不对 ⇒ 9443 握手直接失败）。portal 容器内也是 root ⇒
+  `atomicWriteFile(path, pem, {mode: 0o600, root: dynamicDir})` 天然满足。**绝不**用 `chmod 644` 绕。
+- **`tls.yml`**：私钥只以**路径**出现。
+- 单测 `portal/test/tls-api.test.js` 的 ②⑧ 在响应体与审计 `details` 里搜 PEM/私钥片段；⑨ 钉住键集白名单。
 
 ---
 
