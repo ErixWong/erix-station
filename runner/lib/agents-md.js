@@ -130,6 +130,48 @@ function canPrefixRead(fsImpl) {
     && typeof fsImpl.closeSync === 'function';
 }
 
+/**
+ * #451 评审 M1：「解码失败 ⇒ 跳过 + note」在旧实现里是**死光纤**——`buf.toString('utf8')` 是 lossy
+ * 解码，**永不失败**，所以二进制 / GBK 的 `AGENTS.md` 会被当正文注入（带 U+FFFD 与 `\u0000`），而
+ * `notes=[]` 看起来完全正常。改 `TextDecoder(..., { fatal: true })` 后失败才会真发生（设计稿 §4.1 规则 6）。
+ * 统一定制成 `NotUtf8Error`：worker 侧的 catch 要能区分「读不动」与「不是 UTF-8」两种记账文案。
+ */
+class NotUtf8Error extends Error {}
+
+function decodeUtf8Strict(buf) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch (err) {
+    throw new NotUtf8Error(err?.message ?? String(err));
+  }
+}
+
+/** note 里给前 16 字节的 hex：运维拿着就能 `file`/`xxd` 定是什么编码，不用去猜。 */
+function hexHead(buf, max = 16) {
+  if (!buf) return '';
+  return Buffer.from(buf.subarray(0, max)).toString('hex');
+}
+
+/**
+ * 剔掉尾部一段**还没读完的**多字节序列（只在定长前缀读之后用）。
+ *
+ * 为什么必需：前缀切在字符中间是**读法**造成的不完整，不是文件本身不是 UTF-8；M1 之后 fatal 解码会
+ * 把它当非法编码 ⇒ 合法的中文约定文件会被误删。`readPrefix` 多读 4 字节就是为了让这里能判定
+ * （一个 UTF-8 字符最长 4 字节 ⇒ 尾部最多 3 个字节可能属于一个未完成的字符）。
+ */
+function trimIncompleteUtf8Tail(buf) {
+  for (let back = 1; back <= Math.min(4, buf.length); back += 1) {
+    const byte = buf[buf.length - back];
+    if ((byte & 0x80) === 0) return buf; // ASCII：尾部完整
+    if ((byte & 0xc0) === 0xc0) { // 前导字节：算它需要多少后续字节
+      const need = byte >= 0xf0 ? 3 : byte >= 0xe0 ? 2 : 1;
+      return back - 1 < need ? buf.subarray(0, buf.length - back) : buf;
+    }
+    // 10xxxxxx（continuation）：继续往回看找前导字节
+  }
+  return buf; // 回看 4 字节都是 continuation：本就是非法编码，交给 fatal 解码报错
+}
+
 function scopeOf(dir, realHome) {
   if (!realHome) return 'project'; // home 不可用 ⇒ 没有平台/跨项目节可言，全部按项目节标
   if (dir === realHome) return 'platform';
@@ -265,20 +307,30 @@ export function collectAgentsMd(options = {}) {
     const sourceBytes = Number.isSafeInteger(stat.size) && stat.size > 0 ? stat.size : 0;
     try {
       if (sourceBytes > maxFileBytes && canPrefixRead(fsImpl)) {
-        buf = readPrefix(fsImpl, realFile, maxFileBytes);
+        const prefix = readPrefix(fsImpl, realFile, maxFileBytes);
+        // 读满定长缓冲 ⇒ 文件在后面还有内容 ⇒ 尾部那段可能是个没读完的字符（剔掉，否则 M1 的
+        // fatal 解码会把一份合法 UTF-8 误判成「不是 UTF-8」）。没读满 = 真 EOF，不剔。
+        buf = prefix.length >= maxFileBytes + 4 ? trimIncompleteUtf8Tail(prefix) : prefix;
       } else {
         const raw = fsImpl.readFileSync(realFile);
         buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
       }
       // 归一与解码**必须在这一层 try 内**（#451 评审 B1 第 4 点）：解码失败也要走下面同一条降级路径，
       // 不许从 `collectAgentsMd` 里抛出去（抛 = worker 进程死 = run 被当崩溃 requeue）。
-      text = buf.toString('utf8');
+      // M1：旧写法 `buf.toString('utf8')` 是 lossy 解码、永不失败 ⇒ 那条承诺过的降级是死光纤。
+      text = decodeUtf8Strict(buf);
     } catch (err) {
+      if (err instanceof NotUtf8Error) {
+        // 二进制 / GBK / UTF-16：注入进去就是往 prompt 缓存前缀里塞 U+FFFD，不如不注入。展示仍用**原文**（合法 UTF-8 一个字节不改）。
+        notes.push(`跳过 ${display}：不是 UTF-8 文本（前 16 字节：${hexHead(buf)}）`);
+        continue;
+      }
       // EACCES 等：**绝不抛**。用户把某份写成 0600 且属主不是 worker 就会走到这里。
       notes.push(`跳过 ${display}：读取失败（${errLabel(err)}）`);
       continue;
     }
     if (text.trim() === '') continue; // 空 / 全空白：跳过（不产生空节）
+    // 去重键：超大文件走前缀读时只能覆盖读到的前缀（尾部本来也不注入，同前缀 = 注入内容逐字节相同 ⇒ 去重仍成立）。
     const sha = crypto.createHash('sha256').update(buf).digest('hex');
     if (seen.has(sha)) {
       notes.push(`跳过 ${display}：内容与 ${seen.get(sha)} 相同（去重，保留靠外那份）`);

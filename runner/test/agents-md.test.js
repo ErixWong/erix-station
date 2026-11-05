@@ -183,6 +183,47 @@ test('B1：16 KiB 边界不变形——16384 不截断 / 16385 截断（上限�
   });
 });
 
+// #451 评审 M1（major）：设计稿 §4.1 规则 6 承诺「解码失败 ⇒ 跳过 + note」，但旧实现的
+// `buf.toString('utf8')` 是 lossy 解码、永不失败 ⇒ 那条降级是死光纤。
+test('M1：非 UTF-8（FF FE 00 41）⇒ 不注入 + note 点名「UTF-8」并给出前 16 字节 hex', async () => {
+  await withTree({
+    'home/AGENTS.md': PLATFORM,
+    'home/projects/AGENTS.md': Buffer.from([0xff, 0xfe, 0x00, 0x41]), // 看着像 UTF-16LE BOM + 'A'
+  }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.deepEqual(blocks.map((b) => b.scope), ['platform'],
+      '非 UTF-8 的一份一个字节都不许注入（旧 lossy 解码会把 U+FFFD 与 \\u0000 当正文塞进 prompt 缓存前缀）');
+    assert.ok(notes.some((n) => n.includes('UTF-8')), `必须记账「不是 UTF-8」（旧实现 notes 恒为空）：${JSON.stringify(notes)}`);
+    assert.ok(notes.some((n) => n.includes('fffe0041')),
+      `note 必须带前 16 字节 hex（运维拿着就能定编码）：${JSON.stringify(notes)}`);
+    const rendered = renderAgentsMdSection({ blocks, notes });
+    assert.doesNotMatch(rendered, /\uFFFD/, '渲染结果里不得出现 U+FFFD');
+  });
+});
+
+test('M1：合法中文 UTF-8 仍逐字节注入（fatal 解码不得误伤）', async () => {
+  const cjk = '# 中文约定\n- 规则：提交前跑测试，口径见 §6.1\n';
+  await withTree({ 'home/AGENTS.md': cjk }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.equal(blocks.length, 1, '合法 UTF-8 不得被 fatal 解码误删');
+    assert.equal(blocks[0].text, cjk, '中文原文必须逐字节不变（展示用原文，不做任何规范化）');
+    assert.deepEqual(notes, [], `合法文件不得产生任何记账：${JSON.stringify(notes)}`);
+  });
+});
+
+test('M1+B1：超大中文文件被前缀切在字符中间 ⇒ 仍正常截断注入（不误判成非 UTF-8）', async () => {
+  // 6000 × '中' = 18000 字节 > 16384 ⇒ 走前缀读；16388 字节 = 5462 个完整字符 + 2 个残留字节
+  // ⇒ 尾部正好是个没读完的字符：那是**读法**造成的不完整，不是文件不是 UTF-8。
+  await withTree({ 'home/AGENTS.md': '中'.repeat(6000) }, ({ home, cwd }) => {
+    const { blocks, notes } = collectAgentsMd({ cwd, home });
+    assert.equal(blocks.length, 1, `前缀切断不得误伤合法 UTF-8（notes=${JSON.stringify(notes)}）`);
+    assert.equal(blocks[0].truncated, true);
+    assert.doesNotMatch(blocks[0].text, /\uFFFD/, '截断点必须落在字符边界（出现 U+FFFD 就是改写了原文）');
+    assert.ok(blocks[0].text.startsWith('中'), '截断只砍尾部');
+    assert.deepEqual(notes, []);
+  });
+});
+
 test('全链超上限：从内层开始截，平台节保持完整', async () => {
   const body = (tag) => `# ${tag}\n${'y'.repeat(80)}`;
   await withTree({
