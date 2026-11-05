@@ -412,7 +412,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 | `connection_timeout_ms` / `greeting_timeout_ms` / `socket_timeout_ms` | 三档超时（默认 10000 / 10000 / 20000），直接映射到 nodemailer 同名选项 |
 | `updated_at` / `updated_by` | 最后修改时刻与管理员 id（**不建 FK**：删用户不该被配置行拦住；审计靠 `updated_at` + 日志） |
 
-写入方 = 管理台 API（**下一片**：`GET/PUT` + 缓存 `invalidate()`）；读取方 = portal 登录发信路径（`mail-provider.js`，60s TTL）。运维急停：`MAIL_TRANSPORT=disabled`（env），为真时**不读本表**、一律不发信。
+写入方 = 管理台 API（`GET/PUT /api/admin/mail/settings` + `POST /api/admin/mail/test`，已交付：`portal/src/mail-settings.js`，契约 `docs/api/portal.md` §4.12；落库后调 `mailerProvider.invalidate()` 让 60s 缓存立刻失效）；读取方 = portal 登录发信路径（`mail-provider.js`，60s TTL）。运维急停：`MAIL_TRANSPORT=disabled`（env），为真时**不读本表**、一律不发信。
 
 ---
 

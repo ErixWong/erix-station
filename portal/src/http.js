@@ -39,6 +39,7 @@ import {
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
 import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
 import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
+import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 
 const MIME = {
@@ -593,6 +594,15 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
     blockMs: config.emailSendRateLimit?.blockMs ?? 15 * 60 * 1000,
     maxEntries: config.emailSendRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
   });
+  // #449 管理台：**测试发信**按管理员限流（5 次/小时，key `mailtest:<adminId>`）。
+  // 语义与 emailSendLimiter 同族（限流器只有 recordFailure 一个计数入口 ⇒ 每次尝试记一次），
+  // 但**只在通道确实启用时**才记（未启用的 409 不烧配额，否则「还没配好就先把额度用光」）。
+  const mailTestLimiter = createRateLimiter({
+    maxFailures: config.mailTestRateLimit?.maxFailures ?? 5,
+    windowMs: config.mailTestRateLimit?.windowMs ?? 60 * 60 * 1000,
+    blockMs: config.mailTestRateLimit?.blockMs ?? 60 * 60 * 1000,
+    maxEntries: config.mailTestRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
   // #449：邮件通道读取侧（SMTP 参数存 DB，见 `mail-provider.js`）。`mailerProvider` 参数仅供测试注入 fake。
   // 为什么不在启动时同步读一次：登录是热路径但启动不是；真正的「现在到底能不能发信」每次登录时由
   // `ctx.mailerProvider.get()` 回答（60s 缓存 + 急停硬闸）。这里只在 `config.mail` 存在（= `loadConfig`
@@ -612,7 +622,7 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
   }
   const ctx = {
     pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter,
-    mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, docker,
+    mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, mailTestLimiter, docker,
     llmGateway: llmGateway ?? createLlmGatewayClient({
       adminUrl: config.llmGatewayAdminUrl ?? 'http://station-litellm:4000',
       masterKey: config.llmGatewayMasterKey ?? '',
@@ -672,6 +682,10 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
         return;
       }
       if (err instanceof gitHosts.GitHostError) {
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
+      if (err instanceof mailSettings.MailSettingsError) {
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
@@ -1349,6 +1363,43 @@ async function handleAdminApi(req, res, ctx, url) {
     throw new HttpError(405, 'method_not_allowed', 'method not allowed');
   }
 
+  // 管理台「邮件通道」配置（issue #449 写侧切片，契约 portal.md §4.12）：GET 读 / PUT 写 / POST 测试发信。
+  // 口令**只写不读**：响应只有 `hasPassword` 布尔（模块层就不把 `smtp_password` 放进 DTO）。
+  if (pathname === '/api/admin/mail/settings') {
+    if (req.method === 'GET') {
+      // 无行（未配置）也是 200 + 默认 DTO：未配置是正常态，不是 404。
+      return sendJson(res, 200, await mailSettings.getMailSettings(ctx.pool));
+    }
+    if (req.method === 'PUT') {
+      requireJson(req);
+      const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      const result = await mailSettings.updateMailSettings({
+        pool: ctx.pool,
+        actorId: session.user.id,
+        fields: body,
+      });
+      // 改配置**立刻**生效：不等 60s TTL（否则「配好了却要等一分钟」会被当成配置没生效）。
+      ctx.mailerProvider.invalidate();
+      // 审计只记「改了哪些键」+ 口令是否变化：**绝不含口令明文**（`details` 里没有 password 值）。
+      await auth.audit(ctx.pool, {
+        actorId: session.user.id,
+        action: 'admin.mail_settings_updated',
+        target: 'mail_settings',
+        details: {
+          changed: result.changed,
+          password_changed: result.passwordChanged,
+          transport: result.transport,
+        },
+      });
+      return sendJson(res, 200, result.settings);
+    }
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+  if (pathname === '/api/admin/mail/test') {
+    if (req.method === 'POST') return handleAdminMailTest(req, res, ctx, session);
+    throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  }
+
   // FDE 容器 provision（调查结论：portal serve 进程有 config.dockerHost，client 懒建，端点可实现）
   const adminProvisionMatch = pathname.match(/^\/api\/admin\/fdes\/([^/]+)\/provision$/);
   if (adminProvisionMatch && req.method === 'POST') {
@@ -1472,6 +1523,76 @@ async function resolveAdminFde(ctx, fdeName) {
     });
   }
   return fde;
+}
+
+/**
+ * POST /api/admin/mail/test（issue #449 管理台切片，契约 portal.md §4.12）：用**已保存的配置**真发一封测试信。
+ *
+ * 顺序（每一步都能被单测打红）：
+ *   ① `to` 必填 + 过邮箱正则（与建号同一口径）⇒ 否则 400 `validation_failed`；
+ *   ② 限流：每管理员 5 次/小时（`mailtest:<adminId>`）⇒ 超限 429 `rate_limited` + `Retry-After`；
+ *   ③ 通道未启用（无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停）⇒ 409 `mail_not_configured`，
+ *      **此时不烧配额**（还没配好就先把额度用光不合理）；
+ *   ④ 发信失败 ⇒ 502 `email_send_failed`（`retryable:true`，`details` 只放 reason 摘要，**不含口令/正文**）。
+ *
+ * 正文是「这是测试信 + 时间戳」，**不含验证码**——运维手点的探活信不该带任何凭据。
+ */
+async function handleAdminMailTest(req, res, ctx, session) {
+  requireJson(req);
+  const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+  const raw = body?.to;
+  if (!mailSettings.isEmail(raw)) {
+    throw new HttpError(400, 'validation_failed', 'to 必须是有效邮箱地址', { details: { field: 'to' } });
+  }
+  const to = raw.trim();
+
+  const limiterKey = `mailtest:${session.user.id}`;
+  const gate = ctx.mailTestLimiter.check(limiterKey);
+  if (!gate.allowed) {
+    throw new HttpError(429, 'rate_limited', '测试发信过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(gate.retryAfterSeconds) },
+    });
+  }
+
+  // 发信端口：SMTP 配置存 DB，`get()` 是 60s 缓存后的结果（急停/未配置/配了一半 ⇒ disabled）。
+  const mailer = await ctx.mailerProvider.get();
+  if (!mailer.enabled) {
+    throw new HttpError(
+      409,
+      'mail_not_configured',
+      '邮件通道未启用：请先在管理台配置 SMTP（transport=smtp 且填好主机与发件人）后再测试',
+      { retryable: false },
+    );
+  }
+
+  // 只有真会发信才计次（见 ③）：这一条同时防「同一管理员并发点测试」把额度当并发数用。
+  ctx.mailTestLimiter.recordFailure(limiterKey);
+
+  const at = new Date().toISOString();
+  const sent = await mailer.send(mailSettings.buildTestMessage({ to, at }));
+  if (!sent.ok) {
+    const reason = typeof sent.reason === 'string' && sent.reason !== '' ? sent.reason : 'send_failed';
+    await auth.audit(ctx.pool, {
+      actorId: session.user.id,
+      action: 'admin.mail_test_failed',
+      target: 'mail_settings',
+      // 只记 reason 摘要：**不含口令、不含正文**（正文里有时间戳与收件人，没有价值且会扩散）。
+      details: { to, at, reason },
+    }).catch(() => {});
+    throw new HttpError(502, 'email_send_failed', '测试邮件发送失败，请检查 SMTP 配置与网络', {
+      retryable: true,
+      details: { reason },
+    });
+  }
+
+  await auth.audit(ctx.pool, {
+    actorId: session.user.id,
+    action: 'admin.mail_test_sent',
+    target: 'mail_settings',
+    details: { to, at },
+  });
+  return sendJson(res, 200, { ok: true, to, at });
 }
 
 /**

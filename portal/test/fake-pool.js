@@ -191,8 +191,43 @@ export class FakePool {
     }
 
     // ---- #449：邮件通道配置（mail_settings 单行表） ----
+    // 写侧（管理台 PUT）：**单条 upsert**，按 SQL 文本真模拟——不把新 SQL 当未知放行（AGENTS §8.14 同族）。
+    // 同时把迁移 0026 的两条约束当 DB 事实执行：① 只能有一行（id = 1）；② `transport='smtp'` 时
+    // host/from 必须非空（半套配置不许落库）。产品侧校验漏了这两条时这里会炸 ⇒ 用例变红而不是静默绿。
+    if (sql.includes('INSERT INTO mail_settings')) {
+      if (!/ON CONFLICT \(id\) DO UPDATE/.test(sql)) {
+        throw new Error('fake：mail_settings 写入必须是单条 upsert（INSERT … ON CONFLICT (id) DO UPDATE）');
+      }
+      if (!/VALUES \(1,/.test(sql)) throw new Error('fake：mail_settings 是单行表，插入必须写死 id = 1');
+      const [transport, host, port, secure, user, password, from, connMs, greetMs, sockMs, updatedBy] = params;
+      if (params.length !== 11) throw new Error(`fake：mail_settings upsert 应带 11 个参数，实际 ${params.length}`);
+      if (password !== null && typeof password !== 'string') {
+        throw new Error('fake：smtp_password 必须是字符串或 null（键缺席时应回落到原值）');
+      }
+      if (transport !== 'smtp' && transport !== 'disabled') throw new Error('fake：transport 违反 CHECK 约束');
+      if (transport === 'smtp' && (host == null || from == null)) {
+        throw new Error('fake：CHECK (transport <> \'smtp\' OR (smtp_host IS NOT NULL AND smtp_from IS NOT NULL)) 被违反');
+      }
+      this.mailSettings = {
+        transport,
+        smtp_host: host,
+        smtp_port: port,
+        smtp_secure: secure,
+        smtp_user: user,
+        smtp_password: password,
+        smtp_from: from,
+        connection_timeout_ms: connMs,
+        greeting_timeout_ms: greetMs,
+        socket_timeout_ms: sockMs,
+        updated_at: new Date(),
+        updated_by: updatedBy,
+      };
+      return { rows: [{ ...this.mailSettings }], rowCount: 1 };
+    }
+
     if (sql.includes('FROM mail_settings')) {
-      return { rows: this.mailSettings ? [this.mailSettings] : [], rowCount: this.mailSettings ? 1 : 0 };
+      // 回副本：避免产品代码拿到 fake 的内部对象引用后就地改（那会让「没落库」的 bug 测不出来）。
+      return { rows: this.mailSettings ? [{ ...this.mailSettings }] : [], rowCount: this.mailSettings ? 1 : 0 };
     }
 
     // ---- #449：登录邮箱验证码（login_email_codes） ----
