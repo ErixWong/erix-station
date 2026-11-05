@@ -820,6 +820,11 @@ export async function writeCertificateAssets({ dynamicDir, certPem, keyPem, fsIm
  * 回滚到 `certs/prev/` 那一代：两文件写回原位 + 物化 `tls.yml`。
  * prev 不存在（或 prev 缺私钥）⇒ `404 tls_no_previous`（本单**允许**新增的码，见 §1.2）。
  *
+ * **`copyFile` 而不是 `readFile` + `write`**（#462 / 安全文档 S4）：回滚也不需要把私钥正文读进
+ * 进程内存（它只需要从 A 搬到 B）。两个副作用都补上：① 显式 `chmod` 把模式固定成
+ * 644/600（`copyFile` 只在**新建**目标时继承源模式，目标已存在时保留旧模式）；② 返回的 `cert`
+ * 从**落盘后的证书文件**重新解析（公开文件，不是私钥）。
+ *
  * 回滚**不改写 prev 本身**（它仍是那一代）⇒ 重复回滚幂等。
  */
 export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promises, log = console } = {}) {
@@ -830,17 +835,16 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
     });
   }
   const paths = tlsPaths(dynamicDir);
-  let certBuf;
-  let keyBuf;
   try {
-    certBuf = await fsImpl.readFile(prev.certPath);
-    keyBuf = await fsImpl.readFile(prev.keyPath);
+    await fsImpl.copyFile(prev.certPath, paths.certPath);
+    await fsImpl.copyFile(prev.keyPath, paths.keyPath);
   } catch (err) {
     throw stepError('restore', err);
   }
   try {
-    atomicWriteFile(paths.certPath, certBuf, { mode: TLS_CERT_MODE, root: dynamicDir });
-    atomicWriteFile(paths.keyPath, keyBuf, { mode: TLS_KEY_MODE, root: dynamicDir });
+    // 模式必须**显式**固定：`copyFile` 到已存在的目标时保留目标旧模式，不能指望它给 0600。
+    await fsImpl.chmod(paths.certPath, TLS_CERT_MODE);
+    await fsImpl.chmod(paths.keyPath, TLS_KEY_MODE);
   } catch (err) {
     throw stepError('restore', err);
   }
@@ -859,7 +863,8 @@ export async function rollbackCertificateAssets({ dynamicDir, fsImpl = fs.promis
   }
   let cert = null;
   try {
-    cert = parseCertificatePem(certBuf.toString('utf8'));
+    // 读的是**证书**（公开文件）：回滚的返回值要告诉调用方「现在生效的是哪张」。
+    cert = parseCertificatePem((await fsImpl.readFile(paths.certPath)).toString('utf8'));
   } catch {
     cert = null;
   }

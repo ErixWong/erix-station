@@ -254,3 +254,64 @@ test('#450 renderTlsConfig：路径里的引号/反斜杠被转义（YAML 注入
   assert.ok(text.includes('certFile: "/a\\"b/tls.crt"'));
   assert.ok(text.includes('keyFile: "/c\\\\d/tls.key"'));
 });
+
+// ---------------------------------------------------------------------------
+// #462 / 安全文档 S4：**私钥读路径不碰字节**（`readTlsAssets` 只 stat）
+// ---------------------------------------------------------------------------
+
+test('#462/S4 readTlsAssets：私钥**只 stat 不 readFile**（注入 EACCES 仍判「有证书」）', async () => {
+  const dir = tmpDynamicDir('s4stat');
+  try {
+    const { certPath, keyPath } = writeCerts(dir);
+    const readPaths = [];
+    const fsImpl = {
+      async stat(p, ...rest) {
+        return fs.promises.stat(p, ...rest);
+      },
+      async readFile(p, ...rest) {
+        readPaths.push(p);
+        if (p === keyPath) {
+          // 真实的「私钥读不动」形态（非 root 下 chmod 000 就是这个码）
+          throw Object.assign(new Error(`EACCES: permission denied, open '${p}'`), { code: 'EACCES' });
+        }
+        return fs.promises.readFile(p, ...rest);
+      },
+      async unlink(p) {
+        return fs.promises.unlink(p);
+      },
+    };
+
+    const state = await readTlsAssets({ dynamicDir: dir, fsImpl });
+    assert.equal(state.ok, true, '私钥读不动也必须判「有证书」：读路径根本不碰私钥字节');
+    assert.match(state.fingerprint, /^sha256:[0-9a-f]{64} keymtime=\d+$/);
+    assert.deepEqual(readPaths, [certPath], 'readFile 只被证书调用过一次：私钥一次都没读');
+
+    // 物化同样不受影响（tls.yml 只需要路径 + 证书哈希 + 私钥 mtime）
+    const out = await materializeTlsAssets({ dynamicDir: dir, fsImpl, log: quietLog() });
+    assert.equal(out.published, true);
+    assert.equal(readPaths.filter((p) => p === keyPath).length, 0, '整条物化链路零次读私钥');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test(
+  '#462/S4 readTlsAssets：真 chmod 000 的私钥文件仍判「有证书」（非 root 才有效，root 会跳过）',
+  { skip: typeof process.getuid === 'function' && process.getuid() === 0 ? 'root 下 chmod 000 不生效' : false },
+  async () => {
+    const dir = tmpDynamicDir('s4chmod');
+    try {
+      const { keyPath } = writeCerts(dir);
+      fs.chmodSync(keyPath, 0o000);
+      // 前置：这个 uid 确实读不动它（否则这条用例什么也没证明）
+      await assert.rejects(() => fs.promises.readFile(keyPath), (err) => err.code === 'EACCES');
+      const state = await readTlsAssets({ dynamicDir: dir });
+      assert.equal(state.ok, true, '只看 stat.size ⇒ 私钥不可读不影响「有证书」判定');
+      const out = await materializeTlsAssets({ dynamicDir: dir, log: quietLog() });
+      assert.equal(out.published, true);
+    } finally {
+      fs.chmodSync(path.join(dir, 'certs', 'tls.key'), 0o600);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
