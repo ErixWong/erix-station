@@ -54,6 +54,16 @@ export const zhCN = {
     totpLabel: 'TOTP',
     totpSubmit: '验证并登录',
     backToLogin: '← 返回重新登录',
+    // issue #449：第二步的另一条通道——邮箱验证码（portal.md §2.2/§2.3a/§2.3b）。
+    // 措辞口径：只说「第二因素（邮箱验证码）」，**不写**「双因素强认证 / 防钓鱼」（前端不替后端承诺强度）。
+    emailStepTitle: '输入邮箱验证码',
+    emailStepHint: '验证码已发送到 {email}（第二因素）。没收到可以重发。',
+    emailCodeLabel: '验证码',
+    emailCodeSubmit: '验证并登录',
+    emailResend: '重发验证码',
+    emailResendIn: '{seconds} 秒后可重发',
+    emailResendFailed: '重新发送',
+    emailBackToPassword: '← 返回上一步',
   },
   // #255 首登强制改密（views/ForcePasswordChangeView.vue）：受限会话（portal.md §2.11a）的唯一出口界面文案。
   // 约束：不硬编码端口/域名（部署形态可变、docs/api/portal.md §2.5 cookie 口径与 host 无关），
@@ -933,6 +943,12 @@ export const zhCN = {
     renameFailed: '重命名失败：{message}',
     // issue #114：AI 改名失败（message 为服务端文案：409 未配置 LLM / 502 上游失败）
     aiRenameFailed: 'AI 改名失败：{message}',
+    // issue #449：邮箱验证码这条链路的错误码文案（码 → 可行动文案，映射见 stores/auth.ts 的
+    // EMAIL_LOGIN_ERROR_KEYS）。只写「下一步做什么」；不承诺「重试必成功」，也不写强度口径。
+    emailCodeInvalid: '验证码不对或已失效：可以点「重发验证码」换一枚，或返回上一步重新登录。',
+    emailNotRegistered: '当前账号未登记邮箱，收不到登录验证码：请联系管理员补录邮箱后再登录。',
+    emailSendFailed: '验证码邮件这次没发出去：点「重新发送」再试一次，不用重新输入口令。',
+    pendingExpired: '这次登录等待已过期：请重新输入登录名与口令。',
   },
   gitLight: {
     loading: '检查中…',
