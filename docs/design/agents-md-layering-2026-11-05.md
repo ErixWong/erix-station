@@ -156,24 +156,48 @@ select count(distinct e.run_id) from run_events e join runs r on r.id=e.run_id
 export const AGENTS_MD_BASENAME = 'AGENTS.md';
 export const AGENTS_MD_MAX_FILE_BYTES = 16 * 1024;   // 单文件上限
 export const AGENTS_MD_MAX_TOTAL_BYTES = 48 * 1024;  // 全链上限
+export const AGENTS_MD_MAX_SUBDIR_HINTS = 5;         // 子目录索引条数上限
 
-// 返回 { blocks: [{ dir, path, scope, text, bytes, truncated, skipped }], totalBytes, notes }
-export function collectAgentsMd({ cwd, home, fs: fsImpl = fs, limits = {} }) {}
+// 由外到内的候选链（home → … → cwd），每项 { dir, path, scope }
+// cwd 不可用 ⇒ 返回 []（空链）；home 不可用 ⇒ 只返回 [cwd] 一项（scope = project）
+export function resolveAgentsMdChain({ cwd, home, fs: fsImpl = fs } = {}) {}
+
+// 返回 { blocks: [{ dir, path, display, scope, text, bytes, truncated }],
+//        totalBytes, notes, subdirHints }
+// `limits`（{ maxFileBytes, maxTotalBytes, maxSubdirHints }）只给单测用，生产没有 env 旋钮
+export function collectAgentsMd({ cwd, home, fs: fsImpl = fs, limits = {} } = {}) {}
+
+// 无 blocks ⇒ 返回 ''（system 逐字节等于原值）；有内容时自带前导 '\n\n'
+export function renderAgentsMdSection({ blocks, notes = [], subdirHints = [] } = {}) {}
 ```
+
+> **与初稿的差异（实现后回填，2026-11-05）**：`subdirHints` 是独立的一个键，**不塞进 `blocks`**——
+> 子目录索引是「索引不是正文」，混进 `blocks` 会污染「注入了几份文件」的账，也会被全链截断逻辑当成一份内容。
+> 三处签名对 `null` / 缺参 / 非字符串路径**一律降级不抛**（详见下面规则 6 的补充）。
 
 规则（每条都要单测）：
 
 1. **链的构成**：`realpath(cwd)` 向上直到 `realpath(home)`（含 home 自身）。若 `cwd` 不在 home 之下
-   （理论上不该发生）⇒ 只读 `cwd/AGENTS.md` 并 warn。
+   （理论上不该发生）⇒ 只读 `cwd/AGENTS.md`，并记一条 note（随注入段的「采集记账」小节上浮，不额外发日志）。
 2. **scope 标注**：`home` ⇒ `platform`；`home/projects` ⇒ `workspace`；其它 ⇒ `project`。
    平台节由 materializer 生成（root:root），用户改不动 ⇒ 这是"不可覆盖"的**事实依据**，不是约定。
 3. **跳过**：不存在 / 非普通文件（`stat.isFile()===false`）/ 空或全空白 / 与前面某份 **sha256 相同**（去重，防用户抄一份）。
 4. **越界**：`realpath(file)` 必须仍在 `realpath(home)` 内（挡 symlink 逃逸）；不满足 ⇒ 跳过 + note。
-5. **截断**：单文件 > 16 KiB 或全链 > 48 KiB ⇒ 截断并留 marker：
-   `[已截断：原 N 字节，仅注入前 M 字节；看全文：cat <path>]`（给的是可直接照抄的命令）。
+   实现以「链的最外层目录」为基准：home 是祖先时它就等于 `realpath(home)`；`cwd` 不在 home 之下时退回 `cwd`
+   （否则那份项目文件按定义「越界」，永远读不到）。
+5. **截断 / 挤出**：**单文件** > 16 KiB ⇒ 截断并留 marker：
+   `[已截断：原 N 字节，仅注入前 M 字节；看全文：cat <path>]`（给的是可直接照抄的命令；按 UTF-8 字符边界切，
+   不产生半个字符）。**全链** > 48 KiB ⇒ **从内层开始整份不注入**并逐份记账（实现是 `blocks.pop()` + note），
+   不是把内层截一半——**平台节必须完整**（它装的是运行期硬约束）。只有「单份就超全链上限」这种极限情形
+   （默认常量下不可达：单文件 16 KiB < 全链 48 KiB）才会把那一份截断，并另记一条 note。
 6. **失败隔离**：任何 `EACCES` / `EISDIR` / 解码失败 ⇒ 该份跳过 + note，**绝不让 run 失败**。
    注意 worker 是 uid 1002、home 目录 0770 erix:erix（实测可读 `~/AGENTS.md` 与 `~/projects`），
    但若用户把某份写成 `0600` 且属主不是 worker，就会走到这条分支。
+   **「绝不抛」也包括调用方传错参数**（返修 F1，主 agent 亲审实测出来的真缺口）：`cwd` / `home` 非字符串或空串
+   ⇒ 降级（`cwd` 不可用 ⇒ 空结果 + note；`home` 不可用 ⇒ 只按 `cwd` 采集 + note），**不是异常**。
+   为什么这条是硬的：这次采集在 `worker.js` 的 `startRun` 里、`runToolLoop` **之前**，抛出去 = worker 进程死
+   ⇒ agentd 当崩溃处理 → requeue → 3 次 attempt 耗尽，用户只看到「attempts exhausted」。
+   采集与渲染在 worker 侧还各包一层 `try/catch`（catch ⇒ 注入段置空 + 一条 `MSG.LOG` warn，run 照跑）。
 7. **子目录索引**（C 的部分）：`cwd` 的直接子目录里带 `AGENTS.md` 的，最多列 5 条路径（只列路径，不注入正文）。
    动机：真实形态是"目录即项目，仓库在其下一层"（D9 记过"一个目录里有多个仓库"），
    而仓库自带的 `AGENTS.md` **不在 cwd 的祖先链上**。

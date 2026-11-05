@@ -53,9 +53,20 @@ function isInside(target, root) {
 /**
  * realpath 失败时的降级：退回 `path.resolve` 的形态（不存在 / 无权限时仍要能算出候选链，
  * 至于那一份文件读不读得到是后面逐文件的判断）。
+ *
+ * ⚠ **不可用（非字符串 / 空串）返回 `null`，绝不抛**（issue #451 返修 F1）：`path.resolve(undefined)`
+ * 会抛 `The "paths[0]" argument must be of type string`，而这次采集在 worker 的 `startRun` 里、
+ * `runToolLoop` 之前 ⇒ 抛出去就是 worker 进程死 ⇒ agentd 当崩溃处理 → requeue → attempts exhausted，
+ * 用户只看到「3 次耗尽」，根因只是一个路径参数形态不对。工单 §4.5「失败一律降级」包括**调用方传错**。
  */
 function realpathOr(fsImpl, p) {
-  const abs = path.resolve(p);
+  if (typeof p !== 'string' || p.trim() === '') return null;
+  let abs;
+  try {
+    abs = path.resolve(p);
+  } catch {
+    return null; // 理论上不可达（已保证是字符串），防御性兜底：降级不抛
+  }
   try {
     return fsImpl.realpathSync(abs);
   } catch {
@@ -84,6 +95,7 @@ function utf8Prefix(buf, maxBytes) {
 }
 
 function scopeOf(dir, realHome) {
+  if (!realHome) return 'project'; // home 不可用 ⇒ 没有平台/跨项目节可言，全部按项目节标
   if (dir === realHome) return 'platform';
   if (dir === path.join(realHome, 'projects')) return 'workspace';
   return 'project';
@@ -96,12 +108,22 @@ function scopeOf(dir, realHome) {
  * - `cwd` 不在 `home` 之下（理论上不该发生）⇒ 只取 `cwd/AGENTS.md`（note 由 `collectAgentsMd` 补）。
  *
  * 只做路径算术：不 stat、不读文件。真实路径（realpath）在这里定死，后面所有越界判断都以它为基准。
+ *
+ * **不可用输入的降级口径**（返修 F1，**不抛**）：
+ * - `cwd` 不可用（非字符串 / 空串 / 解析失败）⇒ 返回**空数组**（没有 cwd 就没有候选链；
+ *   取「空数组」而不是「抛」或「造一个 `process.cwd()`」：后者会让宿主的工作目录变成默认值，
+ *   在没有 cwd 的上下文里静默注入一份不该注入的文件）；note 由 `collectAgentsMd` 补。
+ * - `home` 不可用 ⇒ 只返回 `[cwd]` 一项（scope = `project`）：仍按 cwd 采集，只是没有平台/跨项目节。
  */
-export function resolveAgentsMdChain({ cwd, home, fs: fsImpl = fsDefault } = {}) {
+export function resolveAgentsMdChain(options = {}) {
+  const { cwd, home, fs: fsImpl = fsDefault } = options ?? {};
   const realCwd = realpathOr(fsImpl, cwd);
   const realHome = realpathOr(fsImpl, home);
   const dirs = [];
-  if (isInside(realCwd, realHome)) {
+  if (realCwd === null) return [];
+  if (realHome === null || !isInside(realCwd, realHome)) {
+    dirs.push(realCwd);
+  } else {
     let dir = realCwd;
     for (;;) {
       dirs.push(dir);
@@ -110,8 +132,6 @@ export function resolveAgentsMdChain({ cwd, home, fs: fsImpl = fsDefault } = {})
       if (parent === dir) break; // 不可达（isInside 保证先撞到 home），防御性兜底
       dir = parent;
     }
-  } else {
-    dirs.push(realCwd);
   }
   dirs.reverse(); // 由外到内
   return dirs.map((dir) => ({
@@ -134,8 +154,12 @@ export function resolveAgentsMdChain({ cwd, home, fs: fsImpl = fsDefault } = {})
  *
  * `limits` 只给单测用（`{ maxFileBytes, maxTotalBytes, maxSubdirHints }`）；生产走上面的常量，
  * **没有 env 旋钮**（裁决 ④）。
+ *
+ * **绝不抛**（返修 F1）：`options` 为 `null` / `{}` / 只给一半、`cwd` 或 `home` 非字符串或空串，
+ * 一律降级为「少注入 + note」，不是异常。
  */
-export function collectAgentsMd({ cwd, home, fs: fsImpl = fsDefault, limits = {} } = {}) {
+export function collectAgentsMd(options = {}) {
+  const { cwd, home, fs: fsImpl = fsDefault, limits = {} } = options ?? {};
   const maxFileBytes = positiveIntOr(limits?.maxFileBytes, AGENTS_MD_MAX_FILE_BYTES);
   const maxTotalBytes = positiveIntOr(limits?.maxTotalBytes, AGENTS_MD_MAX_TOTAL_BYTES);
   const maxSubdirHints = Number.isSafeInteger(limits?.maxSubdirHints) && limits.maxSubdirHints >= 0
@@ -145,11 +169,23 @@ export function collectAgentsMd({ cwd, home, fs: fsImpl = fsDefault, limits = {}
   const realCwd = realpathOr(fsImpl, cwd);
   const realHome = realpathOr(fsImpl, home);
   const notes = [];
+  // 返修 F1：cwd 不可用 ⇒ **空结果 + 一条 note**，绝不抛（调用方在 startRun 里、runToolLoop 之前，
+  // 抛出去就是 worker 进程死 → requeue → attempts exhausted，而根因只是一个参数形态不对）。
+  if (realCwd === null) {
+    return {
+      blocks: [],
+      totalBytes: 0,
+      notes: [`cwd 不可用（非字符串 / 空串）：本次 run 不注入任何 ${AGENTS_MD_BASENAME}`],
+      subdirHints: [],
+    };
+  }
   const chain = resolveAgentsMdChain({ cwd, home, fs: fsImpl });
   // 越界基准 = 链的最外层目录：home 是祖先时它就是 home（= 裁决里的 `realpath(HOME)`），
   // cwd 不在 home 之下时它是 cwd（否则那份项目文件按定义「越界」，会永远读不到）。
-  const boundary = chain.length > 0 ? chain[0].dir : realHome;
-  if (chain.length > 0 && chain[0].scope !== 'platform') {
+  const boundary = chain.length > 0 ? chain[0].dir : realCwd;
+  if (realHome === null) {
+    notes.push(`home 不可用（非字符串 / 空串）：只按 cwd 采集，平台节与跨项目节不会注入`);
+  } else if (chain.length > 0 && chain[0].scope !== 'platform') {
     notes.push(`cwd（${realCwd}）不在 home（${realHome}）之下：只注入该目录的 ${AGENTS_MD_BASENAME}`);
   }
 
