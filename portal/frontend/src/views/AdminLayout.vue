@@ -21,6 +21,9 @@ const tabs = [
   { name: 'admin-users', label: 'admin.tabs.users' },
   { name: 'admin-llm', label: 'admin.tabs.llm' },
   { name: 'admin-repos', label: 'admin.tabs.repos' },
+  // issue #449：邮件通道配置（登录第二因素「邮箱验证码」的开关）。放在仓库管理之后、号池之前：
+  // 前四个 tab 都是「人 / 模型 / 仓库 / 发信」这类平台配置，号池占用是只读的运维快照，留在最后。
+  { name: 'admin-mail', label: 'admin.tabs.mail' },
   // issue #350：号池占用总览（只读）。放在最后：先看用户/配置，选段时才来这里。
   { name: 'admin-preview-pool', label: 'admin.tabs.previewPool' },
 ] as const;
