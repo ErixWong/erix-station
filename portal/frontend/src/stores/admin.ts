@@ -4,7 +4,7 @@
 // 已兼容（空体 → {}，调用方本就丢弃返回值），故 api.ts 无需改动（结论已核对 http.js）。
 import { defineStore } from 'pinia';
 import QRCode from 'qrcode';
-import { api } from '../api';
+import { api, toDisplayText } from '../api';
 import { i18n } from '../i18n';
 // issue #350：号池占用总览（GET /api/admin/preview-ports/usage）的请求面与归一化都在 lib 里（纯函数可单测）。
 import {
@@ -13,6 +13,17 @@ import {
   usageErrorText,
   type PreviewPoolUsage,
 } from '../lib/previewPoolUsage';
+// issue #449 管理台切片：邮件通道配置（§4.12）。DTO 归一化 / 请求体构造 / 字段名映射都在 lib 里（纯函数可单测），
+// 这里只负责「一次调用 = 一次请求」+ 错误透传（照本文件既有 action 的写法）。
+import {
+  MAIL_SETTINGS_PATH,
+  MAIL_TEST_PATH,
+  normalizeMailSettings,
+  validationFieldOf,
+  type MailFieldKey,
+  type MailSettings,
+  type MailSettingsPayload,
+} from '../lib/mailSettings';
 
 // issue #101 P3：前端自产文案（「错误：」前缀）走 i18n 单例——options store 非组件上下文，
 // useI18n() 会抛 MUST_BE_CALL_SETUP_TOP，故统一走 i18n.global.t。
@@ -148,6 +159,29 @@ function hasTotpProvision(response: TotpProvisionResponse): response is TotpEnro
   return typeof response.totp_secret === 'string' && typeof response.totp_uri === 'string';
 }
 
+/**
+ * issue #449：测试发信的四种失败面 → 人话（§4.12-4）。
+ *
+ * 按 `code` 分支，**不匹配 message**（§1.1：前端分支只能用 code）。
+ * `mail_not_configured` / `email_send_failed` 用本地化前缀 + 服务端 message 原文（不翻译）；
+ * `rate_limited` 用 `Retry-After` 秒数（`retryAfter` 不可解 ⇒ 退到不带秒数的版本，不显示 “undefined 秒”）。
+ */
+export function testMailErrorText(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  // 消息优先取 `message`（ApiError 是 Error；测试/桩里可能是同形状的普通对象），拿不到再退到整个抛出值。
+  const rawMessage = err instanceof Error ? err.message : (err as { message?: unknown } | null)?.message;
+  const message = toDisplayText(rawMessage === undefined ? err : rawMessage);
+  const retryAfter = (err as { retryAfter?: unknown } | null)?.retryAfter;
+  if (code === 'mail_not_configured') return t('admin.mail.testNotConfiguredPrefix') + message;
+  if (code === 'email_send_failed') return t('admin.mail.testFailedPrefix') + message;
+  if (code === 'rate_limited') {
+    return typeof retryAfter === 'number' && Number.isFinite(retryAfter)
+      ? t('admin.mail.testRateLimited', { seconds: retryAfter })
+      : t('admin.mail.testRateLimitedNoRetry');
+  }
+  return t('admin.errorPrefix') + message;
+}
+
 export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'role' | 'fde_name'>> & {
   status?: 'active' | 'disabled';
 };
@@ -174,11 +208,30 @@ export const useAdminStore = defineStore('admin', {
     previewUsageLoaded: false,
     previewUsageLoading: false,
     previewUsageErr: null as string | null,
+    // issue #449：邮件通道配置（§4.12）。**口令永不进这里**：DTO 只有 `hasPassword`，
+    // 归一化（lib/mailSettings.normalizeMailSettings）是显式白名单，连服务端误发的明文也会被丢掉。
+    mailSettings: null as MailSettings | null,
+    mailSettingsLoaded: false, // 「还没请求」与「服务端说默认 DTO」是两件事
+    mailSettingsLoading: false,
+    mailSettingsErr: null as string | null,
+    mailSaving: false,
+    mailSaveErr: null as string | null,
+    // 400 `validation_failed` 的 `details.field`（§4.12-3）→ 页面字段；null = 整表错误（认不出字段名就不猜）。
+    mailSaveField: null as MailFieldKey | null,
+    mailSaveOk: false,
+    mailTesting: false,
+    mailTestErr: null as string | null,
+    // 502 的 `details.reason`（§4.12-4：只有摘要，不含口令/正文）；单独放，便于页面加一行「原因：」。
+    mailTestReason: null as string | null,
+    mailTestOk: null as { to: string; at: string | null } | null,
   }),
 
   actions: {
     errText(err: unknown): string {
-      return err instanceof Error ? err.message : String(err);
+      // 非 Error 的抛出值（服务端信封被换成对象、fetch 桩抛字面量…）此前走 `String()` ⇒
+      // `[object Object]`。改用 api.ts 的 toDisplayText（#255 的同一把尺子）：对象退化成 JSON 文本，
+      // 宁可难看也不丢信息。字符串/Error.message 的行为一字不改。
+      return toDisplayText(err instanceof Error ? err.message : err);
     },
 
     /**
@@ -571,6 +624,95 @@ export const useAdminStore = defineStore('admin', {
       } catch (e) {
         this.fdeErr = t('admin.errorPrefix') + this.errText(e);
         return this.fdeErr;
+      }
+    },
+
+    /**
+     * issue #449：`GET /api/admin/mail/settings`（§4.12-2）。无行时服务端回 `200` + 默认 DTO（不是 404），
+     * 所以「未配置」也走成功路径——页面据此显示默认形态而不是报错。
+     *
+     * 一次调用 = 一次请求（不做缓存短路：配置会被另一个管理员改，重进本页应当看到新快照）。
+     * 失败面照本文件既有口径：`admin.errorPrefix` + 服务端 `error.message` **原文**（不翻译）。
+     */
+    async loadMailSettings(): Promise<string | null> {
+      this.mailSettingsLoading = true;
+      this.mailSettingsErr = null;
+      try {
+        const data = await api<unknown>(MAIL_SETTINGS_PATH);
+        // 显式白名单归一化：DTO 里没有口令键，这里也不会带进来（§4.12-6 红线）。
+        this.mailSettings = normalizeMailSettings(data);
+        this.mailSettingsLoaded = true;
+        return null;
+      } catch (e) {
+        this.mailSettingsErr = t('admin.errorPrefix') + this.errText(e);
+        return this.mailSettingsErr;
+      } finally {
+        this.mailSettingsLoading = false;
+      }
+    },
+
+    /**
+     * issue #449：`PUT /api/admin/mail/settings`（§4.12-3）。成功 ⇒ 用响应 DTO 刷新状态（服务端已
+     * `invalidate()`，改完立刻生效）。
+     *
+     * 400 时把 `details.field` 落到 `mailSaveField`（页面据此标红**那个**输入框并在其下显示 message），
+     * 认不出字段名就不猜（`null` ⇒ 整表错误）。
+     */
+    async saveMailSettings(payload: MailSettingsPayload): Promise<string | null> {
+      this.mailSaving = true;
+      this.mailSaveErr = null;
+      this.mailSaveField = null;
+      this.mailSaveOk = false;
+      try {
+        const data = await api<unknown>(MAIL_SETTINGS_PATH, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        this.mailSettings = normalizeMailSettings(data);
+        this.mailSettingsLoaded = true;
+        this.mailSaveOk = true;
+        return null;
+      } catch (e) {
+        this.mailSaveField = validationFieldOf(e);
+        this.mailSaveErr = t('admin.errorPrefix') + this.errText(e);
+        return this.mailSaveErr;
+      } finally {
+        this.mailSaving = false;
+      }
+    },
+
+    /**
+     * issue #449：`POST /api/admin/mail/test`（§4.12-4）——用**已保存的**配置真发一封探活信。
+     *
+     * 四种失败面各自给人话（§4.12-4 的表）：`409 mail_not_configured` / `502 email_send_failed` /
+     * `429 rate_limited`（带 `Retry-After` 秒数）各一个本地化前缀，其余走 `admin.errorPrefix`。
+     * 服务端 `error.message` 一律**不翻译**（与本文件既有口径一致）；`details.reason` 走 `toDisplayText`，
+     * 所以任何形状都不会渲染成 `[object Object]`。
+     */
+    async sendTestMail(to: string): Promise<string | null> {
+      this.mailTesting = true;
+      this.mailTestErr = null;
+      this.mailTestReason = null;
+      this.mailTestOk = null;
+      try {
+        const data = await api<{ ok?: unknown; to?: unknown; at?: unknown }>(MAIL_TEST_PATH, {
+          method: 'POST',
+          body: JSON.stringify({ to }),
+        });
+        this.mailTestOk = {
+          to: typeof data?.to === 'string' ? data.to : to,
+          at: typeof data?.at === 'string' ? data.at : null,
+        };
+        return null;
+      } catch (e) {
+        const reason = e instanceof Error
+          ? toDisplayText((e as { details?: Record<string, unknown> }).details?.reason)
+          : '';
+        this.mailTestReason = reason === '' ? null : reason;
+        this.mailTestErr = testMailErrorText(e);
+        return this.mailTestErr;
+      } finally {
+        this.mailTesting = false;
       }
     },
   },
