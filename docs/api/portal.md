@@ -2262,6 +2262,9 @@ ext 来自 `path` 末段（无扩展名记 `(none)`，路径不入库）；写�
 
 `certPem` = **整份 fullchain**（叶子在前；`X509Certificate` 只解析第一份 = Traefik 会端出来的那张），
 `keyPem` = 对应私钥。两份各 **≤ 64 KiB**（超 ⇒ `400 validation_failed` + `details.field`）。
+> 体级闸：本端点的请求体整体上限 **256 KiB**（不是默认的 `MAX_BODY_BYTES` 64 KiB——两份 64 KiB 的 PEM
+> 加上 JSON 转义放不进 64 KiB，那样会先撞 `413 payload_too_large` 而拿不到字段级错误）。超过 256 KiB 仍是
+> `413 payload_too_large`（§1.2，全局语义不变）。
 `confirmDomains` 可选：前端把证书里提取到的名字预填成可编辑 input，用户删/补后回传；**它不能超出证书能力**。
 
 **校验顺序（每条都能被单测打红；全部在写盘之前 ⇒ 失败零副作用）**：
