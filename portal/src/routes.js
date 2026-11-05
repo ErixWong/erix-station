@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './fsutil.js';
+import { materializeTlsAssets } from './tlsassets.js';
 import { parseCidr } from './ipam.js';
 import { enqueueRouteChange } from './outbox.js';
 
@@ -668,10 +669,24 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
     }
     throw err;
   }
+
+  // 第 3 步：#450 D5 证书装载面。与上面两份路由文件同一轮物化，但**失败隔离**：
+  // 证书面坏了只降级成「管理台入口用 Traefik 内建自签证书」，不许拖垮用户面与全部预览。
+  let tlsOut;
+  try {
+    tlsOut = await materializeTlsAssets({ dynamicDir: config.traefikDynamicDir, log });
+  } catch (err) {
+    log.warn?.(`[routes] tls.yml 物化异常（不影响路由）：${err.message}`);
+    tlsOut = { target: '', published: false, reason: err.message };
+  }
+
   return {
     target,
     llmTarget,
     llmPublished: llmText !== null,
+    // #450 D5：tls.yml 与两份路由文件**互不重叠、各自独立物化**（证书换新不需重启边缘）。
+    tlsTarget: tlsOut.target,
+    tlsPublished: tlsOut.published,
     allocations: state.allocations.length,
     sourceRanges: state.sourceRanges,
     llmBindings: state.llmBindings.length,

@@ -1020,3 +1020,48 @@ test('#450 管理台段可缺省：不带 adminHost 时不生成（单入口老�
     assert.throws(() => generateTraefikConfig({ ...ADMIN_ARGS, ...extra }), `必须拒绝：${JSON.stringify(extra)}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// #450 D5：tls.yml 与 routes.yml/llm-routes.yml **互不重叠、各自独立物化**（失败隔离）。
+// ---------------------------------------------------------------------------
+test('#450 rebuildRoutes：两证书齐 ⇒ 同轮物化 tls.yml，且不改动两份路由文件的内容', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-tls-'));
+  try {
+    const certDir = path.join(dir, 'certs');
+    fs.mkdirSync(certDir);
+    fs.writeFileSync(path.join(certDir, 'tls.crt'), '-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n');
+    fs.writeFileSync(path.join(certDir, 'tls.key'), '-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n');
+    const config = { ...PUBLISH_CONFIG_BASE, adminHost: 'admin.localhost', traefikAdminEntryPoint: 'adminsecure', traefikDynamicDir: dir };
+    const out = await rebuildRoutes(makePublishPool({ bindings: [] }), config);
+    assert.equal(out.tlsPublished, true, '两文件齐必须生成 tls.yml');
+    assert.equal(out.tlsTarget, path.join(dir, 'tls.yml'));
+    const tlsText = fs.readFileSync(out.tlsTarget, 'utf8');
+    assert.ok(tlsText.includes(`certFile: "${path.join(certDir, 'tls.crt')}"`));
+    assert.ok(!tlsText.includes('BEGIN PRIVATE KEY'), '私钥正文不得进 tls.yml');
+    // 三份文件各管一段：tls.yml 里没有任何 http 路由内容
+    assert.ok(!tlsText.includes('routers:'), 'tls.yml 不得掺路由（#456 将来只重写这一个文件）');
+    const routesText = fs.readFileSync(out.target, 'utf8');
+    assert.ok(!routesText.includes('certFile'), 'routes.yml 不得掺证书装载面');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#450 rebuildRoutes：证书面坏掉（certs/tls.crt 是目录）⇒ 路由照常发布，只降级 tls（失败隔离）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-tls-bad-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'certs', 'tls.crt'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'certs', 'tls.key'), 'KEY');
+    // 预置一份上一轮的 tls.yml：证书面坏掉时必须被摘除，不能留在盘上指向坏路径
+    fs.writeFileSync(path.join(dir, 'tls.yml'), 'tls: {}\n');
+    const config = { ...PUBLISH_CONFIG_BASE, adminHost: 'admin.localhost', traefikAdminEntryPoint: 'adminsecure', traefikDynamicDir: dir };
+    const out = await rebuildRoutes(makePublishPool({ bindings: [] }), config);
+    assert.equal(out.tlsPublished, false);
+    assert.equal(fs.existsSync(path.join(dir, 'tls.yml')), false, '坏证书面必须摘除旧 tls.yml');
+    const routesText = fs.readFileSync(out.target, 'utf8');
+    assert.ok(routesText.includes('Host(`station.localhost`)'), '证书面失败不得影响路由发布');
+    assert.ok(routesText.includes('adminsecure'), '管理台路由照常生成');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
