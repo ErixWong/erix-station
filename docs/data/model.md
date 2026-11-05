@@ -386,7 +386,7 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 |---|---|
 | `pending_token_hash` | `sha256(pending_token)`，与 `login_pending.token_hash` 同值（**不建 FK**：`login_pending` 行会随会话建立被消费/过期，验证码行要留作审计证据） |
 | `code_hash` | `sha256(6 位数字码)` hex——**只存哈希，绝不存明文**；审计只记前 12 位（`code_hash_prefix`） |
-| `created_at` / `expires_at` | 发码时刻与 TTL（默认 600s，`EMAIL_CODE_TTL_SECONDS`）。校验与成功消费都带 `expires_at > now` 谓词 |
+| `created_at` / `expires_at` | 发码时刻与 TTL（默认 600s，`EMAIL_CODE_TTL_SECONDS`）。校验与成功消费都带 `expires_at > now` 谓词。**行只在「发信成功之后」才插入**（发信失败 ⇒ 零行，失败重试不受重发冷却约束） |
 | `attempts` / `max_attempts` | 单码校验失败计数与上限（默认 5，`EMAIL_CODE_MAX_ATTEMPTS`）。**码错只累加 attempts、不烧 `pending_token`**；`attempts + 1 >= max_attempts` 时同一条语句写 `consumed_at` 作废 |
 | `resend_count` | 同一 `pending_token` 的累计重发次数（上限默认 3，`EMAIL_CODE_MAX_RESENDS`）；冷却默认 60s（`EMAIL_CODE_RESEND_COOLDOWN_SECONDS`）按「最近一条的 `created_at`」算 |
 | `consumed_at` | 单次消费标记：**成功校验**（原子 `UPDATE … RETURNING id`）、**重发时作废旧码**、**尝试次数用尽**三处写它。`NULL` = 仍可能有效 |

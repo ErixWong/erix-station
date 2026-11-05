@@ -260,14 +260,19 @@ export class FakePool {
       return { rows: [], rowCount: 1 };
     }
 
-    // 成功消费：单条原子 UPDATE（谓词与产品 SQL 逐条同形）。
+    // 成功消费：单条原子 UPDATE。谓词**按 SQL 文本真解析**（AGENTS §8.14）：产品侧少写
+    // `AND consumed_at IS NULL` / 少写过期或次数谓词时，fake 必须跟着放宽 ⇒ 「重放保护」这条防线
+    // 才在单测里有牙（评审返修 ③ 的变异就落在这里：删掉 consumed_at 谓词必须让重放用例变红）。
     if (sql.includes('UPDATE login_email_codes') && sql.includes('code_hash = $3')) {
       const [pendingTokenHash, now, codeHash] = params;
+      const requireUnconsumed = sql.includes('consumed_at IS NULL');
+      const requireUnexpired = /expires_at\s*>\s*\$2/.test(sql);
+      const requireAttemptsLeft = /attempts\s*<\s*max_attempts/.test(sql);
       const row = this.emailCodes.find((x) => x.pending_token_hash === pendingTokenHash
-        && x.consumed_at === null
-        && new Date(x.expires_at) > new Date(now)
         && x.code_hash === codeHash
-        && x.attempts < x.max_attempts);
+        && (!requireUnconsumed || x.consumed_at === null)
+        && (!requireUnexpired || new Date(x.expires_at) > new Date(now))
+        && (!requireAttemptsLeft || x.attempts < x.max_attempts));
       if (!row) return { rows: [], rowCount: 0 };
       row.consumed_at = now;
       return { rows: [{ id: row.id }], rowCount: 1 };

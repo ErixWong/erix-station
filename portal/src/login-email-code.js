@@ -146,8 +146,11 @@ export async function verifyEmailCode(pool, { pendingTokenHash, code, now = new 
  * 「一枚可用码都没有」的死状态；而校验只认最新未消费一条，所以这段窗口里旧码本来也不会被接受）。
  *
  * 返回：`{ok:true, resendCount, nextAllowedAt}` |
- *       `{ok:false, reason:'cooldown'|'max_resends', retryAfterSeconds}` |
- *       `{ok:false, reason:'not_found'}`（该 pending 下没有任何码 ⇒ HTTP 层按 `401 pending_expired`）。
+ *       `{ok:false, reason:'cooldown'|'max_resends', retryAfterSeconds}`。
+ *
+ * **该 pending 下一条码行都没有 ⇒ `{ok:true, resendCount:0}`**（评审返修 ①）：这不是 401，而是
+ * 「首次发信失败后的重试」——`handleEmailCodeRequired` 现在是「发信成功后才插码行」，发信失败时
+ * 库里就是零行；把这里当 401 会把「点重试」直接堵死。pending 的有效性由 `findPendingUser` 判过。
  */
 export async function recordResend(
   pool,
@@ -162,7 +165,8 @@ export async function recordResend(
     [pendingTokenHash],
   );
   const row = rows?.[0];
-  if (!row) return { ok: false, reason: 'not_found', retryAfterSeconds: 0 };
+  // 零行 = 首次发信失败后的重试（见上方返回口径）：没有冷却起点、也没有历史重发次数。
+  if (!row) return { ok: true, resendCount: 0, nextAllowedAt: new Date(now.getTime() + cooldownSeconds * 1000) };
 
   const createdAt = row.created_at instanceof Date ? row.created_at : new Date(row.created_at);
   const elapsedSeconds = (now.getTime() - createdAt.getTime()) / 1000;

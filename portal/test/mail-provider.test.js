@@ -111,13 +111,23 @@ test('#449 邮件通道：relay 不认证（user/password 为空）也能启用'
   assert.equal(calls[0].smtp.password, '');
 });
 
-test('#449 邮件通道：transport=disabled 行 ⇒ disabled（不读就不发）', async () => {
+test('#449 邮件通道：transport=disabled 行 ⇒ disabled，且**不告警**（正常关闭态，评审返修 ④）', async () => {
   const pool = new MailSettingsPool({ ...SMTP_ROW, transport: 'disabled' });
   const { log, logs } = captureLog();
-  const provider = createMailProvider({ pool, config: { mail: { killSwitch: false } }, log });
-  const mailer = await provider.get();
-  assert.equal(mailer.enabled, false);
-  assert.match(logs.warn.join('\n'), /transport_disabled/);
+  let clock = 1_000_000;
+  const provider = createMailProvider({
+    pool,
+    config: { mail: { killSwitch: false } },
+    log,
+    now: () => clock,
+    createMailerImpl: captureMailerFactory().factory,
+  });
+  assert.equal((await provider.get()).enabled, false);
+  // 缓存过期后重读也不许再 warn：默认就没配，每 60s 刷一行只会把日志变成噪声。
+  clock += 61_000;
+  assert.equal((await provider.get()).enabled, false);
+  assert.equal(pool.queries, 2);
+  assert.deepEqual(logs.warn, [], '正常关闭态必须静默');
 });
 
 test('#449 邮件通道：半套 SMTP 配置（有 host 无 from）⇒ disabled + warn，而不是拿半套去连', async () => {
@@ -130,11 +140,12 @@ test('#449 邮件通道：半套 SMTP 配置（有 host 无 from）⇒ disabled 
 
 test('#449 邮件通道：MAIL_TRANSPORT=disabled 急停 ⇒ 一律 disabled，且**不查库**', async () => {
   const pool = new MailSettingsPool(SMTP_ROW);
-  const { log } = captureLog();
+  const { log, logs } = captureLog();
   const provider = createMailProvider({ pool, config: { mail: { killSwitch: true } }, log });
   assert.equal((await provider.get()).enabled, false);
   assert.equal((await provider.get()).enabled, false);
   assert.equal(pool.queries, 0, '急停必须能在不碰数据库的情况下生效');
+  assert.deepEqual(logs.warn, [], '急停是正常运维动作，不该刷告警');
 });
 
 test('#449 邮件通道：读取失败（表不存在/DB 抖动）⇒ disabled + warn，绝不抛给登录路径', async () => {

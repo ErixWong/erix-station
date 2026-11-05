@@ -588,7 +588,7 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
     maxEntries: config.emailCodeRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
   });
   const emailSendLimiter = createRateLimiter({
-    maxFailures: config.emailSendRateLimit?.maxFailures ?? 10,
+    maxFailures: config.emailSendRateLimit?.maxFailures ?? 20,
     windowMs: config.emailSendRateLimit?.windowMs ?? 15 * 60 * 1000,
     blockMs: config.emailSendRateLimit?.blockMs ?? 15 * 60 * 1000,
     maxEntries: config.emailSendRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
@@ -2478,12 +2478,30 @@ function emailCodeMessage(code, ttlSeconds) {
 /**
  * 决策 2 的第②分支：发一枚邮箱验证码（`status='email_code_required'`）。
  * 发信失败 ⇒ `503 email_send_failed`（retryable），但 **pending_token 不作废**：用户点重发即可，不必重输口令。
+ *
+ * 顺序契约（评审返修 ①，issue #449）：**先发信、成功后才插码行**。
+ * 反过来（先插码再发信）会让失败重试被自己插的那行的 `created_at` 卡在 60s 冷却里——
+ * 用户看到的是「503 让我重试」紧接着「429 请稍后再试」，而 pending 只有 600s 寿命。
+ * 发信失败时库里**一条码行都没有**，所以 `recordResend` 的重试路径（无码行 ⇒ 当首次发信）成立。
+ *
+ * 发信限流（评审返修 ②）：与重发同一把闸（`email:<ip>`），否则持有效口令的人可以反复调第一步刷邮箱。
  */
 async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
   const { pool, config } = ctx;
   // 这里再取一次（拿到的还是同一份 60s 缓存对象）；不用登录选择时那份是为了让本函数的依赖自己写清楚。
   const mailer = await ctx.mailerProvider.get();
   const policy = emailCodePolicy(config);
+
+  // 发信频率闸先于建 pending：被限流时连 pending 行都不该留下（客户端稍后重走第一步即可）。
+  const sendKey = `email:${ip}`;
+  const sendCheck = ctx.emailSendLimiter.check(sendKey);
+  if (!sendCheck.allowed) {
+    throw new HttpError(429, 'rate_limited', '发信过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(sendCheck.retryAfterSeconds) },
+    });
+  }
+
   // 待决令牌的 TTL 取 max(口令步 TTL, 码 TTL)：否则码还没过期、令牌先过期，`expires_in` 就是一句谎。
   const pendingTtlSeconds = Math.max(config.pendingTokenTtlSeconds ?? 120, policy.ttlSeconds);
   const pending = await auth.createPendingToken(pool, user.id, {
@@ -2492,14 +2510,6 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
     ttlSeconds: pendingTtlSeconds,
   });
   const code = loginEmailCode.generateEmailCode();
-  const created = await loginEmailCode.createEmailCode(pool, {
-    pendingTokenHash: pending.tokenHash,
-    code,
-    ttlSeconds: policy.ttlSeconds,
-    maxAttempts: policy.maxAttempts,
-    ip,
-    userAgent: req.headers['user-agent'] ?? null,
-  });
 
   const sent = await mailer.send({ to: email, ...emailCodeMessage(code, policy.ttlSeconds) });
   if (!sent.ok) {
@@ -2521,6 +2531,17 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
       },
     });
   }
+  ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
+
+  // 发信成功后才落库：这样「重发冷却」的起算点就是用户真的收到信的时刻。
+  const created = await loginEmailCode.createEmailCode(pool, {
+    pendingTokenHash: pending.tokenHash,
+    code,
+    ttlSeconds: policy.ttlSeconds,
+    maxAttempts: policy.maxAttempts,
+    ip,
+    userAgent: req.headers['user-agent'] ?? null,
+  });
 
   // 审计只记脱敏收件人 + 码哈希前缀（12 位）+ 过期时刻；**绝不出现明文码**（portal.md §2.3a）。
   await auth.audit(pool, {
@@ -2677,9 +2698,8 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
     now,
   });
   if (!gate.ok) {
-    if (gate.reason === 'not_found') {
-      throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
-    }
+    // `recordResend` 不再有 `not_found`（该 pending 下一条码行都没有 = 首次发信失败后的重试，
+    // 语义上是「首次发信」而不是 401；pending 有效性上面已经由 `findPendingUser` 判过）。
     ctx.emailSendLimiter.recordFailure(sendKey);
     const retryAfter = Math.max(1, Number(gate.retryAfterSeconds ?? 0));
     throw new HttpError(
@@ -2691,6 +2711,25 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
   }
 
   const code = loginEmailCode.generateEmailCode();
+  // 与首次发信同一顺序契约：**先发信、成功后才落库**。发信失败时既不插新码也不作废旧码
+  // ⇒ 用户手上的旧码仍然有效，且「立刻重试」不会被自己没收到的那封信的 created_at 卡 60s。
+  // （代价：若发信成功而 INSERT 失败——纯 DB 故障——用户拿到的码不在库里。那是 500 级故障，
+  //   与「发信失败被冷却卡 60s」这条**必然发生**的日常路径相比，取舍明确。）
+  const sent = await mailer.send({ to: loaded.email, ...emailCodeMessage(code, policy.ttlSeconds) });
+  if (!sent.ok) {
+    await auth.audit(pool, {
+      actorId: loaded.user.id,
+      action: 'auth.email_code_failed',
+      target: loaded.user.login,
+      details: { login: loaded.user.login, reason: sent.reason ?? 'send_failed', at: new Date().toISOString() },
+    }).catch(() => {});
+    throw new HttpError(503, 'email_send_failed', '验证码邮件发送失败，请稍后重试', {
+      retryable: true,
+      headers: { 'Retry-After': '5' },
+    });
+  }
+  ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
+
   const created = await loginEmailCode.createEmailCode(pool, {
     pendingTokenHash,
     code,
@@ -2708,21 +2747,6 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
     keepCodeHash: created.codeHash,
     now,
   });
-
-  const sent = await mailer.send({ to: loaded.email, ...emailCodeMessage(code, policy.ttlSeconds) });
-  if (!sent.ok) {
-    await auth.audit(pool, {
-      actorId: loaded.user.id,
-      action: 'auth.email_code_failed',
-      target: loaded.user.login,
-      details: { login: loaded.user.login, reason: sent.reason ?? 'send_failed', at: new Date().toISOString() },
-    }).catch(() => {});
-    throw new HttpError(503, 'email_send_failed', '验证码邮件发送失败，请稍后重试', {
-      retryable: true,
-      headers: { 'Retry-After': '5' },
-    });
-  }
-  ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
 
   await auth.audit(pool, {
     actorId: loaded.user.id,
