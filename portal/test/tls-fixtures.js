@@ -133,3 +133,88 @@ export function makeExpiredCert({
   cache.set(cacheKey, out);
   return out;
 }
+
+/**
+ * 生成一条**真三级链** `root → intermediate → leaf`（issue #462 的链完整性判据要用）。
+ *
+ * 为什么必须是真链而不是「两张自签拼一起」：C7 的判据是 `X509Certificate#checkIssued()`，它对
+ * **签发者名 + 签名 + CA 位（keyUsage keyCertSign）** 一起验——自签证书之间 `checkIssued` 恒 false，
+ * 拼出来的「假链」会让 C1/C2 也判成断链，等于整片判据没有牙。所以这里老老实实签三级。
+ *
+ * `leaf` 的 CN/SAN 默认覆盖管理台域名（`admin.fde.erix.vip`），私钥与叶子配对；root/int 的私钥
+ * 生成完就留在 tmpdir 里（**不入库、不进任何响应**，只用来签发）。
+ *
+ * @returns {{rootPem: string, intermediatePem: string, leafPem: string, keyPem: string,
+ *            fullchainPem: string, withRootPem: string, wrongOrderPem: string, dir: string}}
+ *   · `fullchainPem` = 叶子 + 中间（C1 的正确形态）
+ *   · `withRootPem`  = 叶子 + 中间 + 根（C2）
+ *   · `wrongOrderPem`= 中间 + 叶子（C5/C6 的故障形态）
+ */
+export function makeChain({
+  leafCN = 'admin.fde.erix.vip',
+  sans = ['admin.fde.erix.vip', '*.fde.erix.vip'],
+  rootCN = 'Test Root CA',
+  intermediateCN = 'Test Intermediate CA',
+} = {}) {
+  const cacheKey = JSON.stringify({ chain: true, leafCN, sans, rootCN, intermediateCN });
+  const hit = cache.get(cacheKey);
+  if (hit) return hit;
+
+  const dir = tmpdir('chain');
+  const p = (name) => path.join(dir, name);
+  const ecKey = ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1'];
+
+  // ① 根（自签，CA:TRUE + keyCertSign）
+  openssl([
+    'req', '-x509', '-nodes', ...ecKey,
+    '-keyout', p('root.key'), '-out', p('root.pem'),
+    '-days', '3650', '-subj', `/CN=${rootCN}`,
+    '-addext', 'basicConstraints=critical,CA:TRUE',
+    '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+  ], dir);
+
+  // ② 中间（由根签，CA:TRUE）
+  fs.writeFileSync(p('int.ext'), 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n');
+  openssl([
+    'req', '-new', '-nodes', ...ecKey,
+    '-keyout', p('int.key'), '-out', p('int.csr'), '-subj', `/CN=${intermediateCN}`,
+  ], dir);
+  openssl([
+    'x509', '-req', '-in', p('int.csr'), '-CA', p('root.pem'), '-CAkey', p('root.key'),
+    '-CAcreateserial', '-out', p('int.pem'), '-days', '3650', '-sha256', '-extfile', p('int.ext'),
+  ], dir);
+
+  // ③ 叶子（由中间签，CA:FALSE + serverAuth + SAN）—— 有效期相对现在算，别让 2027 之后自己变红
+  const leafExt = [
+    'basicConstraints=critical,CA:FALSE',
+    'keyUsage=critical,digitalSignature,keyEncipherment',
+    'extendedKeyUsage=serverAuth',
+    ...(sans.length > 0 ? [`subjectAltName=${sansExt(sans)}`] : []),
+    '',
+  ].join('\n');
+  fs.writeFileSync(p('leaf.ext'), leafExt);
+  openssl([
+    'req', '-new', '-nodes', ...ecKey,
+    '-keyout', p('leaf.key'), '-out', p('leaf.csr'), '-subj', `/CN=${leafCN}`,
+  ], dir);
+  openssl([
+    'x509', '-req', '-in', p('leaf.csr'), '-CA', p('int.pem'), '-CAkey', p('int.key'),
+    '-CAcreateserial', '-out', p('leaf.pem'), '-days', '365', '-sha256', '-extfile', p('leaf.ext'),
+  ], dir);
+
+  const rootPem = fs.readFileSync(p('root.pem'), 'utf8');
+  const intermediatePem = fs.readFileSync(p('int.pem'), 'utf8');
+  const leafPem = fs.readFileSync(p('leaf.pem'), 'utf8');
+  const out = {
+    rootPem,
+    intermediatePem,
+    leafPem,
+    keyPem: fs.readFileSync(p('leaf.key'), 'utf8'),
+    fullchainPem: `${leafPem}${intermediatePem}`,
+    withRootPem: `${leafPem}${intermediatePem}${rootPem}`,
+    wrongOrderPem: `${intermediatePem}${leafPem}`,
+    dir,
+  };
+  cache.set(cacheKey, out);
+  return out;
+}

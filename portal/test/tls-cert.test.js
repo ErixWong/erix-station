@@ -20,20 +20,24 @@ import {
   TlsCertError,
   certCoversHost,
   certificateDomains,
+  describeChain,
   describeTls,
   fingerprintOfPem,
+  inspectCertificate,
   keyMatchesCert,
+  parseCertificateChain,
   parseCertificatePem,
   parseDefaultGateway,
   parsePrivateKeyPem,
   readPreviousCertificate,
+  selectLeaf,
   validateUpload,
   verifyLiveCertificate,
   writeCertificateAssets,
   rollbackCertificateAssets,
   readActiveCertificate,
 } from '../src/tls-cert.js';
-import { makeCert, makeExpiredCert } from './tls-fixtures.js';
+import { makeCert, makeChain, makeExpiredCert } from './tls-fixtures.js';
 
 const ADMIN_HOST = 'admin.fde.erix.vip';
 const WILDCARD = makeCert(); // CN=*.fde.erix.vip, SAN=*.fde.erix.vip,fde.erix.vip
@@ -41,6 +45,8 @@ const OTHER = makeCert({ cn: 'other.example', sans: ['other.example'] });
 const NO_SAN_CN = makeCert({ cn: ADMIN_HOST, sans: [] });
 const SAN_WITHOUT_ADMIN = makeCert({ cn: ADMIN_HOST, sans: ['other.example'] });
 const EXPIRED = makeExpiredCert();
+// #462：真三级链 root → intermediate → leaf（叶子 CN/SAN 覆盖 adminHost）。
+const CHAIN = makeChain();
 
 // ---------------------------------------------------------------------------
 // ① 通配符只匹配一层 / 大小写 / SAN 与 CN 的优先级
@@ -450,3 +456,159 @@ test('#456 verifyLiveCertificate：指纹一致 ⇒ live；不一致 ⇒ mismatc
 function OTHER_FP() {
   return parseCertificatePem(OTHER.certPem).fingerprintSha256;
 }
+
+// ---------------------------------------------------------------------------
+// ⑥ #462 链完整性（M1）：parseCertificateChain / selectLeaf / describeChain + C1–C7
+//
+// 判据来源：工单 `.work-orders/fix-261105-05-462-tls-chain.md` §1.2 的 C1–C7 判定表。
+// 每条都能被打红（变异取证见 `AGENTS.md` §8.100）。
+// ---------------------------------------------------------------------------
+
+test('#462 parseCertificateChain：逐段切分（fullchain=2 / with-root=3），空串与无段抛 tls_cert_invalid', () => {
+  const full = parseCertificateChain(CHAIN.fullchainPem);
+  assert.equal(full.blocks.length, 2, '叶子 + 中间 = 2 段');
+  assert.equal(full.pem.length, 2);
+  assert.equal(parseCertificatePem(full.pem[0]).subjectCN, 'admin.fde.erix.vip', '第 1 段是叶子');
+  assert.equal(parseCertificatePem(full.pem[1]).subjectCN, 'Test Intermediate CA');
+  assert.equal(parseCertificateChain(CHAIN.withRootPem).blocks.length, 3);
+  // 每段都是原样切片（不重新序列化）⇒ 与输入里的那一段逐字相同（落盘字节由调用方负责，这里只证不篡改）
+  assert.equal(full.pem[0], CHAIN.leafPem.trimEnd(), '第 1 段必须与用户提交的叶子 PEM 逐字相同');
+  assert.equal(full.pem[1], CHAIN.intermediatePem.trimEnd(), '第 2 段同理（不重排、不重新序列化）');
+  assert.throws(() => parseCertificateChain(''), (err) => err.code === 'tls_cert_invalid');
+  assert.throws(() => parseCertificateChain('no pem here'), (err) => err.code === 'tls_cert_invalid');
+});
+
+test('#462 selectLeaf：有私钥时找**配对的那段**（第二段也能找到）；无私钥取第一段；对不上 ⇒ index:-1', () => {
+  const blocks = parseCertificateChain(CHAIN.wrongOrderPem).blocks; // [中间, 叶子]
+  const keyObj = parsePrivateKeyPem(CHAIN.keyPem);
+  const picked = selectLeaf(blocks, keyObj);
+  assert.equal(picked.index, 1, '叶子在第二段 ⇒ index=1（`blocks[0]` 那种写法会把中间证书当叶子）');
+  assert.equal(parseCertificatePem(picked.leaf.toString()).subjectCN, 'admin.fde.erix.vip');
+
+  const noKey = selectLeaf(blocks);
+  assert.equal(noKey.index, 0, '没私钥就无法从密钥判断，按约定取第一段');
+  assert.equal(noKey.leaf, blocks[0]);
+
+  const wrongKey = selectLeaf(blocks, parsePrivateKeyPem(OTHER.keyPem));
+  assert.equal(wrongKey.index, -1, '一把对不上的私钥 ⇒ 没有任何一段配对');
+  assert.equal(wrongKey.leaf, blocks[0], '退回第一段，由调用方决定报什么');
+});
+
+test('#462 describeChain：三级链 links=[true,true]；自签单张 depth=1；**隔代不算**（leaf.checkIssued(root)=false）', () => {
+  const chain = describeChain(parseCertificateChain(CHAIN.withRootPem).blocks);
+  assert.deepEqual(chain, { depth: 3, links: [true, true] });
+  const leafAndRoot = describeChain([
+    new crypto.X509Certificate(CHAIN.leafPem),
+    new crypto.X509Certificate(CHAIN.rootPem),
+  ]);
+  assert.deepEqual(leafAndRoot.links, [false], '叶子不是根签的（隔了一代）⇒ 链断');
+  const selfSigned = describeChain([new crypto.X509Certificate(WILDCARD.certPem)]);
+  assert.deepEqual(selfSigned, { depth: 1, links: [] }, '单张自签的链就是 1 层，没有「接不上」这回事');
+  // 自签的自我签发关系成立（这就是「自签」的机器定义，也是 C4 不警告的根据）
+  const self = new crypto.X509Certificate(WILDCARD.certPem);
+  assert.equal(self.checkIssued(self), true);
+});
+
+test('#462 C1：叶子 + 中间（正确顺序）⇒ 200 语义，**无 chainWarnings**，cert 取叶子', () => {
+  const out = validateUpload({ certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.chainWarnings, [], 'bundle = 叶子 + 中间 是**期望形态**，不许警告');
+  assert.equal(out.cert.subjectCN, 'admin.fde.erix.vip', 'cert DTO 必须是叶子');
+  assert.deepEqual(out.cert.sans, ['admin.fde.erix.vip', '*.fde.erix.vip']);
+  assert.equal(out.cert.issuerCN, 'Test Intermediate CA');
+  assert.notEqual(
+    out.cert.fingerprintSha256,
+    parseCertificatePem(CHAIN.intermediatePem).fingerprintSha256,
+    '指纹必须是叶子的（不是第 1 段 = 中间证书）',
+  );
+});
+
+test('#462 C2：叶子 + 中间 + 根 ⇒ 通过且**不警告**（实测多发一张根无害）', () => {
+  const out = validateUpload({ certPem: CHAIN.withRootPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.chainWarnings, [], '带根证书不许警告（实测 3 层 + 严格校验 0 ok）');
+  assert.equal(out.cert.subjectCN, 'admin.fde.erix.vip');
+});
+
+test('#462 C3：只有叶子且非自签 ⇒ **通过**（警告不拒）+ chainWarnings=[chain_looks_leaf_only]', () => {
+  const out = validateUpload({ certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true, 'C3 的输入是「我知道我只有叶子」——可接受的自担风险，不许改成 400');
+  assert.deepEqual(out.chainWarnings, ['chain_looks_leaf_only']);
+});
+
+test('#462 C4：只有叶子且**自签** ⇒ 通过且无警告（自签的链就是 1 层）', () => {
+  const out = validateUpload({ certPem: WILDCARD.certPem, keyPem: WILDCARD.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.chainWarnings, []);
+});
+
+test('#462 C5：顺序反了（中间在前）⇒ 400 tls_cert_order_invalid，**不是** tls_key_mismatch', () => {
+  const out = validateUpload({ certPem: CHAIN.wrongOrderPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'tls_cert_order_invalid', '私钥是对的；报 tls_key_mismatch 是误导（#462 的病根）');
+  assert.notEqual(out.code, 'tls_key_mismatch');
+  assert.deepEqual(Object.keys(out.details).sort(), ['firstSubjectCN', 'leafSubjectCN']);
+  assert.equal(out.details.firstSubjectCN, 'Test Intermediate CA', 'details 必须点名「现在第一个是谁」');
+  assert.equal(out.details.leafSubjectCN, 'admin.fde.erix.vip', '以及「你的域名证书是哪张」');
+  assert.match(out.message, /第一个 BEGIN CERTIFICATE 必须是你的域名证书/);
+});
+
+test('#462 C7：段间接不上（混了别人的证书）⇒ 400 tls_cert_chain_broken + details 点名第几段', () => {
+  const out = validateUpload({
+    certPem: `${CHAIN.leafPem}${OTHER.certPem}`, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST,
+  });
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 'tls_cert_chain_broken');
+  assert.deepEqual(out.details, {
+    index: 1, // 段号从 1 起（与文案里的「第 N 段」同数）
+    subjectCN: 'admin.fde.erix.vip',
+    issuerCN: 'Test Intermediate CA',
+    nextSubjectCN: 'other.example',
+  });
+  assert.match(out.message, /第 1 段接不上/);
+});
+
+test('#462 inspect：C1/C3/C6/C7 的 warnings 与「cert 一律取叶子」', () => {
+  // C1：正确 bundle（有/无私钥都无警告）
+  const c1 = inspectCertificate({ certPem: CHAIN.fullchainPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST });
+  assert.deepEqual(c1.warnings, []);
+  assert.equal(c1.cert.subjectCN, 'admin.fde.erix.vip');
+  assert.equal(c1.keyMatches, true);
+  assert.deepEqual(inspectCertificate({ certPem: CHAIN.fullchainPem, adminHost: ADMIN_HOST }).warnings, []);
+
+  // C2：带根同样无警告
+  assert.deepEqual(
+    inspectCertificate({ certPem: CHAIN.withRootPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST }).warnings,
+    [],
+  );
+
+  // C3：只有叶子（非自签）⇒ 警告
+  assert.deepEqual(
+    inspectCertificate({ certPem: CHAIN.leafPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST }).warnings,
+    ['chain_looks_leaf_only'],
+  );
+
+  // C6：顺序反了但**没私钥** ⇒ 只能警告（拿不到配对信息）
+  const c6 = inspectCertificate({ certPem: CHAIN.wrongOrderPem, adminHost: ADMIN_HOST });
+  assert.ok(c6.warnings.includes('chain_order_suspect'), `实际 warnings=${JSON.stringify(c6.warnings)}`);
+  assert.ok(!c6.warnings.includes('chain_broken'), '顺序可疑时不再叠一条「断链」（修法不同，会让人猜）');
+
+  // C7：接不上 ⇒ chain_broken
+  const c7 = inspectCertificate({
+    certPem: `${CHAIN.leafPem}${OTHER.certPem}`, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST,
+  });
+  assert.deepEqual(c7.warnings, ['chain_broken']);
+});
+
+test('#462 inspect：顺序反了**且有私钥** ⇒ 400 tls_cert_order_invalid（与 PUT 同码）', () => {
+  assert.throws(
+    () => inspectCertificate({ certPem: CHAIN.wrongOrderPem, keyPem: CHAIN.keyPem, adminHost: ADMIN_HOST }),
+    (err) => {
+      assert.equal(err.code, 'tls_cert_order_invalid');
+      assert.equal(err.httpStatus, 400);
+      assert.equal(err.details.firstSubjectCN, 'Test Intermediate CA');
+      assert.equal(err.details.leafSubjectCN, 'admin.fde.erix.vip');
+      return true;
+    },
+  );
+});
