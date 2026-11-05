@@ -117,8 +117,9 @@ function getDummyHash() {
 export async function authenticate(pool, login, password, { log } = {}) {
   // #255：多读一列 `must_change_password`，但**不塞进 `user`**（§2.2 的 user DTO 形状不动）：
   // 登录响应用的是顶层的 `password_change_required`（见 http.js），两条各自自己的口径。
+  // #449：同理多读 `email`（只用于第二因素选择与发信，**不进 user DTO**）。
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email
        FROM users WHERE login = $1 AND status = 'active'`,
     [login],
   );
@@ -150,6 +151,8 @@ export async function authenticate(pool, login, password, { log } = {}) {
     },
     // #255：登录响应里的 `password_change_required` 就取这一位（收成显式布尔，理由同 findSessionUser）。
     mustChangePassword: row.must_change_password === true,
+    // #449：第二因素选择规则（http.js `chooseSecondFactor`）要的邮箱；空串/NULL 一律按「未登记」。
+    email: typeof row.email === 'string' && row.email.trim() !== '' ? row.email : null,
   };
 }
 
@@ -273,6 +276,33 @@ export async function hasTotpEnrollment(pool, userId) {
     [userId],
   );
   return rows.length > 0;
+}
+
+/**
+ * 按 id 读活跃用户（issue #449：邮箱码第二步要发会话，`verifyEmailCode` 只判码、不碰 users）。
+ * 返回 `{ user, mustChangePassword, email }` 或 `null`（停用/不存在）。
+ * 与 `findSessionUser` 同口径：`must_change_password` 收成显式布尔（门的判据是 `=== true`）。
+ */
+export async function loadActiveUser(pool, userId) {
+  const res = await pool.query(
+    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password
+       FROM users WHERE id = $1 AND status = 'active'`,
+    [userId],
+  );
+  const row = res.rows?.[0];
+  if (!row) return null;
+  return {
+    user: {
+      id: row.id,
+      login: row.login,
+      display_name: row.display_name,
+      role: row.role,
+      fde_name: row.fde_name,
+      auth_source: row.auth_source,
+    },
+    mustChangePassword: row.must_change_password === true,
+    email: typeof row.email === 'string' && row.email.trim() !== '' ? row.email : null,
+  };
 }
 
 export async function createSession(

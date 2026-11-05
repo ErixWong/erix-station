@@ -8,6 +8,11 @@ export class FakePool {
     this.sessions = [];
     this.grants = [];   // #429：revokeSession 的 CTE 会按 login_session_id 血缘撤这里的 active 行
     this.audit = [];
+    // #449：登录邮箱验证码（`login_email_codes`）。按 SQL 文本真模拟：取「最新未消费」、attempts 累加、
+    // 成功消费、重发作废旧码——不把新 SQL 当未知放行（否则「码错也放行」这类变异在单测里是绿的）。
+    this.emailCodes = [];
+    // #449：邮件通道配置（单行表 `mail_settings`）。默认无行 = 未配置 = 第二因素不生效。
+    this.mailSettings = null;
   }
 
   async query(sql, params = []) {
@@ -29,6 +34,25 @@ export class FakePool {
         (x) => x.id === userId && x.status === 'active' && x.totp_secret != null && x.totp_secret !== '',
       );
       return { rows: u ? [{ '?column?': 1 }] : [] };
+    }
+
+    // loadActiveUser（#449 邮箱码第二步发会话）：按 id 查活跃用户，按 SQL 的列清单回列。
+    if (sql.includes('FROM users WHERE id') && sql.includes('must_change_password') && !sql.includes('totp_secret')) {
+      const userId = params[0];
+      const u = this.users.find((x) => x.id === userId && x.status === 'active');
+      if (!u) return { rows: [] };
+      return {
+        rows: [{
+          id: u.id,
+          login: u.login,
+          display_name: u.display_name,
+          role: u.role,
+          fde_name: u.fde_name,
+          auth_source: u.auth_source,
+          email: u.email ?? null,
+          must_change_password: u.must_change_password === true,
+        }],
+      };
     }
 
     // verifyTotpForUser：按 id 查活跃用户（含 totp_secret/last_totp_step）
@@ -164,6 +188,116 @@ export class FakePool {
       const [actorId, action, target, details] = params;
       this.audit.push({ actor_id: actorId, action, target, details });
       return { rows: [] };
+    }
+
+    // ---- #449：邮件通道配置（mail_settings 单行表） ----
+    if (sql.includes('FROM mail_settings')) {
+      return { rows: this.mailSettings ? [this.mailSettings] : [], rowCount: this.mailSettings ? 1 : 0 };
+    }
+
+    // ---- #449：登录邮箱验证码（login_email_codes） ----
+    // 写侧：只接受 sha256 hex（产品代码的契约是「绝不存明文码」，fake 按契约拒明文）。
+    if (sql.includes('INSERT INTO login_email_codes')) {
+      const [pendingTokenHash, codeHash, createdAt, expiresAt, maxAttempts, resendCount, ip, ua] = params;
+      if (!/^[0-9a-f]{64}$/.test(String(pendingTokenHash))) throw new Error('fake: pending_token_hash 必须是 sha256 hex');
+      if (!/^[0-9a-f]{64}$/.test(String(codeHash))) throw new Error('fake: code_hash 必须是 sha256 hex（绝不存明文码）');
+      if (!Number.isInteger(Number(maxAttempts))) throw new Error('fake: max_attempts NOT NULL');
+      const row = {
+        id: `ec${this.emailCodes.length + 1}`,
+        pending_token_hash: pendingTokenHash,
+        code_hash: codeHash,
+        created_at: createdAt,
+        expires_at: expiresAt,
+        attempts: 0,
+        max_attempts: Number(maxAttempts),
+        resend_count: Number(resendCount ?? 0),
+        consumed_at: null,
+        created_ip: ip ?? null,
+        created_ua: ua ?? null,
+      };
+      this.emailCodes.push(row);
+      return { rows: [{ id: row.id }], rowCount: 1 };
+    }
+
+    // 校验读：该 pending 下「最新一条未消费」。
+    if (sql.includes('FROM login_email_codes') && sql.includes('pending_token_hash = $1 AND consumed_at IS NULL')) {
+      const [pendingTokenHash] = params;
+      const rows = this.emailCodes
+        .filter((x) => x.pending_token_hash === pendingTokenHash && x.consumed_at === null)
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at) || String(b.id).localeCompare(String(a.id)));
+      const row = rows[0];
+      return {
+        rows: row
+          ? [{
+            id: row.id, code_hash: row.code_hash, expires_at: row.expires_at,
+            attempts: row.attempts, max_attempts: row.max_attempts,
+          }]
+          : [],
+        rowCount: row ? 1 : 0,
+      };
+    }
+
+    // 重发闸门读：该 pending 下「最新一条」（含已消费——冷却按最近一次发信算）。
+    if (sql.includes('FROM login_email_codes') && sql.includes('resend_count')) {
+      const [pendingTokenHash] = params;
+      const rows = this.emailCodes
+        .filter((x) => x.pending_token_hash === pendingTokenHash)
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at) || String(b.id).localeCompare(String(a.id)));
+      const row = rows[0];
+      return {
+        rows: row ? [{ id: row.id, resend_count: row.resend_count, created_at: row.created_at }] : [],
+        rowCount: row ? 1 : 0,
+      };
+    }
+
+    // 码错：attempts + 1；达到上限同时作废（与产品 SQL 的 CASE 同语义）。
+    if (sql.includes('UPDATE login_email_codes') && sql.includes('attempts = attempts + 1')) {
+      const [id, now] = params;
+      const row = this.emailCodes.find((x) => x.id === id && x.consumed_at === null);
+      if (!row) return { rows: [], rowCount: 0 };
+      row.attempts += 1;
+      if (row.attempts >= row.max_attempts) row.consumed_at = now;
+      return { rows: [], rowCount: 1 };
+    }
+
+    // 成功消费：单条原子 UPDATE（谓词与产品 SQL 逐条同形）。
+    if (sql.includes('UPDATE login_email_codes') && sql.includes('code_hash = $3')) {
+      const [pendingTokenHash, now, codeHash] = params;
+      const row = this.emailCodes.find((x) => x.pending_token_hash === pendingTokenHash
+        && x.consumed_at === null
+        && new Date(x.expires_at) > new Date(now)
+        && x.code_hash === codeHash
+        && x.attempts < x.max_attempts);
+      if (!row) return { rows: [], rowCount: 0 };
+      row.consumed_at = now;
+      return { rows: [{ id: row.id }], rowCount: 1 };
+    }
+
+    // 重发作废旧码（保留新码）。
+    if (sql.includes('UPDATE login_email_codes') && sql.includes('code_hash <> $3')) {
+      const [pendingTokenHash, now, keepCodeHash] = params;
+      let n = 0;
+      for (const row of this.emailCodes) {
+        if (row.pending_token_hash === pendingTokenHash && row.consumed_at === null && row.code_hash !== keepCodeHash) {
+          row.consumed_at = now;
+          n += 1;
+        }
+      }
+      return { rows: [], rowCount: n };
+    }
+
+    // 按 id 作废（尝试次数用尽时的幂等标记）。
+    if (sql.includes('UPDATE login_email_codes') && sql.includes('WHERE id = $1 AND consumed_at IS NULL')) {
+      const [id, now] = params;
+      const row = this.emailCodes.find((x) => x.id === id && x.consumed_at === null);
+      if (!row) return { rows: [], rowCount: 0 };
+      row.consumed_at = now;
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.includes('login_email_codes')) {
+      // 严格 fake：没认出来的 SQL 直接炸，不静默返回空行（AGENTS §8.14 同族）。
+      throw new Error(`fake: 未识别的 login_email_codes SQL：${sql.replace(/\s+/g, ' ').slice(0, 160)}`);
     }
 
     return { rows: [] };

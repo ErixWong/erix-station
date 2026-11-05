@@ -80,6 +80,12 @@ export function loadConfig(env = process.env) {
   if (llmGatewayMode !== 'self' && llmGatewayMode !== 'external') {
     throw new Error('LLM_GATEWAY_MODE 必须为 self 或 external');
   }
+  // 邮件通道（issue #449，决策者 2026-11-04 改口径）：**SMTP 参数存 DB**（`mail_settings` 单行，
+  // 管理台维护，读取侧 `portal/src/mail-provider.js`），env 只留一个旋钮：
+  //   `MAIL_TRANSPORT=disabled` —— 运维急停：为真时无论 DB 怎么配都不发信（决策 D3b 的硬闸）。
+  // 口令以**明文**落库（`smtp_password`）：目标是内网 email relay，口令非高价值，与既有
+  // `git_hosts.admin_key`（迁移 0011）同一口径；将来换成公网 SMTP 再上加密列。
+  const mailKillSwitch = String(env.MAIL_TRANSPORT ?? '').trim().toLowerCase() === 'disabled';
   // 生产判定：FDE_DEV_MODE=1 显式开发（即使镜像内 NODE_ENV=production 也按开发）；
   // FDE_DEV_MODE=0 显式生产；未设时按 NODE_ENV=production 判生产，否则开发。
   const fdeDevMode =
@@ -154,6 +160,20 @@ export function loadConfig(env = process.env) {
     sessionTtlSeconds,
     // 两步登录（portal.md §2.2）：待决令牌短期、单次消费
     pendingTokenTtlSeconds: intEnv(env, 'PENDING_TOKEN_TTL_SECONDS', 120),
+    // 邮件通道（issue #449，portal.md §2.3a/§2.3b + env.md「邮件通道（MAIL_*）」）。
+    // 未配置（默认 `disabled`）时第二因素不生效：未注册 TOTP 的账号退回纯口令，并在启动时打一条 warn。
+    // 邮件通道（issue #449）：**SMTP 主机/端口/凭据/发件人都在 DB**（`mail_settings`，管理台维护，
+    // 见 `portal/src/mail-provider.js`）。env 只剩一个旋钮——急停开关。
+    mail: {
+      killSwitch: mailKillSwitch,
+    },
+    // 登录邮箱验证码（issue #449 决策 6）：6 位 / TTL 600s / 单 pending 5 次尝试 / 重发冷却 60s / 最多 3 次重发。
+    loginEmailCode: {
+      ttlSeconds: intEnv(env, 'EMAIL_CODE_TTL_SECONDS', 600),
+      maxAttempts: intEnv(env, 'EMAIL_CODE_MAX_ATTEMPTS', 5),
+      resendCooldownSeconds: nonNegativeIntEnv(env, 'EMAIL_CODE_RESEND_COOLDOWN_SECONDS', 60),
+      maxResends: nonNegativeIntEnv(env, 'EMAIL_CODE_MAX_RESENDS', 3),
+    },
     // 滚动续期：距上次续期超过该间隔才写库并重发 cookie（portal.md §2.5）
     sessionRenewIntervalSeconds: intEnv(env, 'SESSION_RENEW_INTERVAL_SECONDS', 60 * 60),
     // TOTP（RFC 6238）：6 位 / 30s / ±1 窗口 / SHA-1

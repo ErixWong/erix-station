@@ -554,7 +554,8 @@ test('未注册 TOTP（totp_secret 为 NULL）→ step1 口令直通建会话', 
     const auditDetails = JSON.parse(loginAudits[0].details);
     assert.deepEqual(Object.keys(auditDetails).sort(), ['at', 'login', 'method'], 'details 只含 login/method/at');
     assert.equal(auditDetails.login, 'alice');
-    assert.equal(auditDetails.method, 'password_direct');
+    // #449：邮件通道未启用 ⇒ 口令直通，但 method 明确标出「这一层没做第二因素」。
+    assert.equal(auditDetails.method, 'password_direct_no_second_factor');
     assert.ok(!Number.isNaN(Date.parse(auditDetails.at)), 'at 是合法时间戳');
     assert.ok(!JSON.stringify(loginAudits[0]).includes(password), '审计不含口令');
   } finally {
