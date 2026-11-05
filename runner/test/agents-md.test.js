@@ -461,24 +461,61 @@ test('F1：resolveAgentsMdChain 对不可用输入返回空数组（口径：没
 });
 
 // ---------------------------------------------------------------------------
-// 接线源码级锁（与 system-prompt.test.js 里那两条并列的第三条）：**采集必须在 try/catch 里**。
-// 变异（主 agent 验收会做）：把 try/catch 摘掉 ⇒ 这条必须红。
+// 接线源码级锁（与 system-prompt.test.js 里那两条并列的第三条）：**采集与渲染都在 startRun 函数体内，
+// 且被同一个 try/catch 包住**。
+// 变异（评审 M3 / m1 的判据，主 agent 验收会做）：
+//   ① 把采集整段（含 try/catch）移到模块顶层 ⇒ 这条与 system-prompt 锁① 必须红（旧锁看不见：它 `slice` 到**文件末尾**）；
+//   ② 只把 `renderAgentsMdSection(...)` 移出 try ⇒ 这条必须红（m1：旧锁 20/20 全绿，而注释承诺的是「采集与渲染各包一层」）。
 // ---------------------------------------------------------------------------
 
-test('接线锁③：worker.js 里 collectAgentsMd( 被 try { … } catch 包住，catch 里置空注入段 + 发 warn', () => {
-  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+/**
+ * #451 评审 M3：`startRun` 的**函数体边界**。定界口径：`startRun` 是 2 空格缩进的 `async function startRun(`，
+ * 函数体以**行首** `}` 收尾 ⇒ 从 `startRunAt` 找第一个 `\n}`。⚠ **不要用括号计数**：worker.js 里有模板字符串
+ * 与正则字面量，`(` `)` 数不干净。（与 system-prompt.test.js 的同名 helper 故意各留一份。）
+ */
+function startRunBodyRange(src) {
   const startRunAt = src.indexOf('async function startRun(');
   assert.notEqual(startRunAt, -1, 'worker.js 必须仍有 `async function startRun(`');
-  const body = src.slice(startRunAt);
-  const collectAt = body.indexOf('collectAgentsMd(');
-  assert.notEqual(collectAt, -1, 'startRun 里必须仍有采集调用');
-  const tryAt = body.lastIndexOf('try {', collectAt);
+  const rel = src.slice(startRunAt).search(/\n\}/);
+  assert.notEqual(rel, -1, 'startRun 必须以行首 `}` 收尾（找不到 = 缩进形态变了，这条锁要跟着改而不是放宽）');
+  return { startRunAt, endAt: startRunAt + rel };
+}
+
+function inStartRunBody(name, at, { startRunAt, endAt }) {
+  assert.ok(at > startRunAt && at < endAt,
+    `「${name}」必须落在 startRun **函数体内**（实际 index=${at}，体内区间=[${startRunAt}, ${endAt}]）：` +
+    'worker 进程会被 agentd 复用给下一个 run，搬到模块顶层 = 第二个 run 沿用第一个 run 的内容（或启动时的空快照）');
+}
+
+test('接线锁③：采集与渲染都在 startRun **函数体内**、且落在同一个 try 块里（catch 置空注入段 + 发 warn）', () => {
+  const src = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  const range = startRunBodyRange(src);
+  const collectAt = src.indexOf('collectAgentsMd(');
+  const renderAt = src.indexOf('renderAgentsMdSection(');
+  const systemAt = src.indexOf('system: SYSTEM_PROMPT + agentsMdSection');
+  assert.notEqual(collectAt, -1, '必须仍有采集调用');
+  assert.notEqual(renderAt, -1, '必须仍有渲染调用');
+  inStartRunBody('collectAgentsMd(', collectAt, range);
+  inStartRunBody('renderAgentsMdSection(', renderAt, range);
+  inStartRunBody('system: SYSTEM_PROMPT + agentsMdSection', systemAt, range);
+  // 语义锁（M3）：采集用的是本 run 的 cwd ⇒ 必须在解构 msg 之后
+  const msgAt = src.indexOf('const { task, cwd } = msg;');
+  assert.notEqual(msgAt, -1, 'startRun 必须仍从 msg 解构 `{ task, cwd }`：采集的 cwd 就来自这里');
+  assert.ok(collectAt > msgAt,
+    '采集必须在 `const { task, cwd } = msg;` **之后**：抢在解构之前就不可能拿到本 run 的 cwd（= 不是 per-run 的）');
+  // 采集与渲染必须在同一个 try 里（m1）
+  const tryAt = src.lastIndexOf('try {', collectAt);
   assert.notEqual(tryAt, -1,
     '采集前必须有 `try {`：本段在 runToolLoop 之前，抛出去就是 worker 进程死 → requeue → attempts exhausted');
-  const catchAt = body.indexOf('catch', collectAt);
+  assert.ok(tryAt > range.startRunAt, 'try 本身也必须在 startRun 体内（函数外的 try 兜不到函数内的局部变量）');
+  const catchAt = src.indexOf('catch', collectAt);
   assert.notEqual(catchAt, -1, '采集之后必须有 catch（只有 try 没有 catch 等于没兜）');
+  assert.ok(catchAt < range.endAt, 'catch 必须在 startRun 体内');
   assert.ok(catchAt - collectAt < 800, 'catch 必须紧跟着这段采集，不是文件后面某个无关的 catch');
-  const catchBlock = body.slice(catchAt, catchAt + 600);
+  assert.ok(tryAt < renderAt && renderAt < catchAt,
+    '渲染必须落在**同一个 try 块内**（try < render < catch）：renderAgentsMdSection 抛出去没人兜就是 worker 进程死，' +
+    '而 worker.js 那段注释承诺的是「采集/渲染整段再包一层 try/catch」');
+  const catchBlock = src.slice(catchAt, Math.min(catchAt + 600, range.endAt));
   assert.match(catchBlock, /agentsMdSection = ''/,
     'catch 里必须把注入段置空（否则可能带着半成品拼进 system）');
   assert.match(catchBlock, /MSG\.LOG[\s\S]{0,160}level: 'warn'/, 'catch 里必须发一条 MSG.LOG warn（不新增事件类型）');
