@@ -439,3 +439,5 @@ Traefik 求值顺序：**router 规则（含 `ClientIP`、`PathPrefix`）→ 中
 | 五条核心原理（本拓扑是原理一/二/四的落地） | [`principles.md`](principles.md) §1 |
 | 定稿原始依据（决策、证据、加固清单、影响面与落地顺序） | [issue #5](https://github.com/ErixWong/erix-station/issues/5) 两条定稿评论 |
 | 相关 issue | #6（L2 预览 cookie）、#7（D-6 文件投递）、#8（幂等/租约/barrier）、#9（per-allocation 路由 + outbox）、#10（L6 审批超时 `expired`）、#11、#12（token 哈希/轮换/吊销） |
+
+> **安全现状与风险清单（2026-11-05 真机实测）**：本文的加固清单里「`iptables-nft` 幂等 + fail-closed」那条（issue #233）**至今未落地**，其后果已实测成表——宿主 41 个 `0.0.0.0` 端口对全部 FDE 容器可达（含 sshd/Portainer/MSSQL/PostgreSQL/可用代理），而容器之间与「容器 → portal/DB/socket-proxy」跨 bridge 直连是被挡住的。完整矩阵、风险分级与建议方案见 [`security-posture-2026-11-05.md`](security-posture-2026-11-05.md)。
