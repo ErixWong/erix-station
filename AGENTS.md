@@ -97,6 +97,7 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 |---|---|
 | 80 / 443 | Traefik ingress（唯一对外；**生产值**——开发期本机 80/443 被 nginx 占用，按 env.md §0 用 8090/8443） |
 | 8080 | portal（backend 网络 + publish 仅 `127.0.0.1:8080` 回环，供 Traefik 反代/forwardAuth；开发期本机映射 `18080`，env.md §0） |
+| 9443 | **管理台入口**（Traefik entrypoint `adminsecure`，#450；host `admin.<伞域>`，TLS 走 `dynamic/tls.yml` 装载的证书）。⚠️ 端口在 `deploy/traefik/traefik.yml` 里**写死**（静态文件不插值）+ `deploy/.env` 的 `TRAEFIK_ADMIN_PORT`，**改端口要同时改两处并重启边缘**；`ADMIN_IP_ALLOWLIST` 空 = 放行全部（#233 防火墙未落地 ⇒ FDE 容器可达）。见 `docs/deploy/edge-routing.md` |
 | 4100 | **LLM 网关数据面/管理面**：`station-litellm`（`litellm` profile），默认 publish 到 `127.0.0.1:4100` 回环（`LITELLM_HOST_PORT` 可覆盖），Traefik 经 `LLM_GATEWAY_HOST` 访问；portal 经 backend 网络访问管理 API。见 §4.2 |
 | 5432 | DB（backend 网络内，不 publish） |
 
