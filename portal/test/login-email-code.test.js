@@ -377,10 +377,12 @@ test('#449⑦ 码过期 ⇒ 401 email_code_invalid（模块层 reason=expired）
 // ⑧ 发信失败：503，pending 保留，同一 token 重试成功
 // ---------------------------------------------------------------------------
 
-test('#449⑧ 发信失败 ⇒ 503 email_send_failed，且同一 pending_token 还能重试成功', async () => {
+test('#449⑧ 发信失败 ⇒ 503 email_send_failed，**立刻**重发即成功（不吃 60s 冷却）', async () => {
+  // ⚠ 本用例**不覆盖 `resendCooldownSeconds`**（生产默认 60s）：旧实现「先插码再发信」会让
+  // 503 之后的重试撞上自己插的那行的 created_at ⇒ 429，本用例当场红（评审返修 ①）。
   const { mailer, state } = fakeMailer();
   state.fail = true;
-  const s = await startServer({ users: [await makeUser()], mailer, loginEmailCodeOverrides: { resendCooldownSeconds: 0 } });
+  const s = await startServer({ users: [await makeUser()], mailer });
   try {
     const res = await login(s.base);
     assert.equal(res.status, 503);
@@ -395,19 +397,44 @@ test('#449⑧ 发信失败 ⇒ 503 email_send_failed，且同一 pending_token �
     assert.equal(s.pool.pending.length, 1, 'pending 必须保留（用户不必重输口令）');
     assert.equal(s.pool.pending[0].used_at, null);
     assert.equal(state.sent.length, 0);
+    // 顺序契约：发信失败时**库里一条码行都没有**（冷却起算点不该由「没收到的那封信」产生）
+    assert.equal(s.pool.emailCodes.length, 0, '发信失败不得留下码行（否则重试被自己的 created_at 卡 60s）');
     assert.ok(
       s.pool.audit.some((a) => a.action === 'auth.email_code_failed'),
       '发信失败要留审计',
     );
 
-    // 修好 SMTP 后重发同一 pending ⇒ 成功，且新码能用
+    // 修好 SMTP 后**立刻**重发同一 pending ⇒ 成功（生产默认 60s 冷却不适用于「首次发信的重试」）
     state.fail = false;
     const resent = await postJson(s.base, '/api/auth/login/email-code/resend', { pending_token: pendingToken });
     assert.equal(resent.status, 200, await resent.clone().text());
+    assert.equal(s.pool.emailCodes.length, 1, '重发成功后才落一行');
     const code = lastCode(state);
     const verified = await postJson(s.base, '/api/auth/login/email-code', { pending_token: pendingToken, code });
     assert.equal(verified.status, 200, await verified.clone().text());
     assert.ok(verified.headers.get('set-cookie'), '重试成功后发会话');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#449⑧b 初次发信也过发信限流（`email:<ip>` 同一把闸）：超限 ⇒ 429 且不发信', async () => {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser()], mailer });
+  try {
+    // 默认 20 次 / 15 分钟：第 21 次第一步必须被挡，且不产生第 21 封信 / 第 21 个 pending。
+    const attempts = 20;
+    for (let i = 0; i < attempts; i += 1) {
+      const ok = await login(s.base);
+      assert.equal(ok.status, 200, `第 ${i + 1} 次第一步应成功`);
+    }
+    const blocked = await login(s.base);
+    assert.equal(blocked.status, 429, '初次发信必须与重发共用同一把闸');
+    const body = await blocked.json();
+    assert.equal(body.error.code, 'rate_limited');
+    assert.ok(Number(blocked.headers.get('retry-after')) > 0, '429 必须带 Retry-After');
+    assert.equal(state.sent.length, attempts, '被挡的那次不发信');
+    assert.equal(s.pool.pending.length, attempts, '被挡的那次也不留 pending');
   } finally {
     await s.close();
   }
@@ -534,6 +561,59 @@ test('#449⑩ 审计 email_code_sent / verified / failed 在册，details 里搜
   } finally {
     await s.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// ⑬ 模块层重放保护：同一 pending + 同一码，第二次必须被拒（钉住成功分支 UPDATE 的谓词）
+// ---------------------------------------------------------------------------
+
+/**
+ * 模拟「两个请求都在消费前读到了同一行」：第一次 SELECT 的结果缓存下来，后续 SELECT 原样回放。
+ * 这样第二次 `verifyEmailCode` 一定会走到那条 `UPDATE … WHERE consumed_at IS NULL …`——
+ * 少了谓词它就会**再消费一次并返回 ok:true**，用例当场红（纯串行调用测不到这一点：
+ * 串行时第二次的 SELECT 已经查不到未消费行，走的是 `not_found` 短路）。
+ */
+class StaleReadPool extends FakePool {
+  constructor(options) {
+    super(options);
+    this.cachedLatest = null;
+    this.servedCache = 0;
+  }
+
+  async query(sql, params = []) {
+    const isLatestUnconsumed = sql.includes('FROM login_email_codes')
+      && sql.includes('pending_token_hash = $1 AND consumed_at IS NULL');
+    if (!isLatestUnconsumed) return super.query(sql, params);
+    if (this.cachedLatest) {
+      this.servedCache += 1;
+      return { rows: this.cachedLatest, rowCount: this.cachedLatest.length };
+    }
+    const result = await super.query(sql, params);
+    this.cachedLatest = result.rows;
+    return result;
+  }
+}
+
+test('#449⑬ 模块层重放保护：同一 pending + 同一码，第二次 verifyEmailCode 必须 ok:false', async () => {
+  const pendingTokenHash = 'a'.repeat(64);
+  const code = '123456';
+
+  // ① 串行（真实请求序列）：第二次连「未消费行」都查不到 ⇒ not_found。
+  const serial = new FakePool({});
+  await loginEmailCode.createEmailCode(serial, { pendingTokenHash, code, ttlSeconds: 600, maxAttempts: 5 });
+  assert.deepEqual(await loginEmailCode.verifyEmailCode(serial, { pendingTokenHash, code }), { ok: true });
+  const second = await loginEmailCode.verifyEmailCode(serial, { pendingTokenHash, code });
+  assert.equal(second.ok, false, '同一枚码只能消费一次');
+  assert.ok(serial.emailCodes[0].consumed_at, '第一次成功即写 consumed_at');
+
+  // ② 并发（两个请求都在消费前读到同一行）：靠 UPDATE 的 `AND consumed_at IS NULL` 只放行一个。
+  const racy = new StaleReadPool({});
+  await loginEmailCode.createEmailCode(racy, { pendingTokenHash, code, ttlSeconds: 600, maxAttempts: 5 });
+  const first = await loginEmailCode.verifyEmailCode(racy, { pendingTokenHash, code });
+  const replay = await loginEmailCode.verifyEmailCode(racy, { pendingTokenHash, code });
+  assert.equal(racy.servedCache >= 1, true, '第二次读必须走缓存回放（否则这条断言测不到 UPDATE 谓词）');
+  assert.deepEqual(first, { ok: true });
+  assert.deepEqual(replay, { ok: false, reason: 'not_found' }, '并发重放只能有一个成功（UPDATE 谓词）');
 });
 
 // ---------------------------------------------------------------------------

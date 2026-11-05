@@ -281,7 +281,7 @@
 | 401 | `invalid_credentials` | 用户名或口令错误（**不区分是哪种**，防用户枚举） |
 | 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第③分支）。**不会退回纯口令** |
 | 429 | `rate_limited` | 同一 login / IP 连续失败触发限流；响应带 `Retry-After` 头（秒） |
-| 503 | `email_send_failed` | 第②分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废 |
+| 503 | `email_send_failed` | 第②分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束） |
 
 ### 2.3 `POST /api/auth/login/totp`
 
@@ -351,7 +351,10 @@
 
 - **只存 `sha256(码)`**（`login_email_codes.code_hash`），绝不存明文；成功校验是一条原子 `UPDATE … WHERE consumed_at IS NULL AND expires_at > now AND code_hash = $h AND attempts < max_attempts … RETURNING id` ⇒ 并发/重放至多一次成功。
 - **码错不烧 `pending_token`**：只把该码的 `attempts + 1`（达到上限时同时作废该码），用户还能接着试/重发；`pending_token` 本身只在成功时被消费。
-- **限流**：按「账户 + IP」计**校验失败**（`emailcode:<userId>:<ip>`，默认 10 次 / 15 分钟窗口，超限 `429 rate_limited` + `Retry-After`）。换新 `pending_token` 不重置计数，防 6 位码爆破。
+- **码行在「发信成功之后」才落库**（评审返修 ①）：先 `send()`、`ok` 才 `INSERT login_email_codes`。发信失败时库里**一条码行都没有**，所以失败重试的冷却起算点不会由「一封用户没收到的信」产生（否则 503 之后立刻重发必撞 60s 冷却 ⇒ 429）。
+- **限流（两把闸，各自独立）**：
+  * **校验失败**按「账户 + IP」计（`emailcode:<userId>:<ip>`，默认 10 次 / 15 分钟窗口，超限 `429 rate_limited` + `Retry-After`）。换新 `pending_token` 不重置计数，防 6 位码爆破；
+  * **发信频率**按 IP 计（`email:<ip>`，默认 **20 次 / 15 分钟**窗口，共享出口 IP 的误伤空间）——**第一步的初次发信与 §2.3b 的重发共用同一把闸**（每次成功发信记一次），否则持有效口令的人可以反复调第一步把邮箱刷爆。
 
 错误：
 
@@ -364,7 +367,7 @@
 
 **SMTP 配置从哪来（决策者 2026-11-04/05 定稿）**：`mail_settings` 单行表（管理台维护，`GET/PUT` 留给下一片），运行时由 `portal/src/mail-provider.js` 读取并 60s 缓存。口令是**明文列** `smtp_password`——目标是内网 email relay，口令非高价值，与既有 `git_hosts.admin_key`（迁移 0011）同一口径；若将来换成公网 SMTP 再上加密列。**API / 审计 / 日志永不返回口令明文**（管理台只给 `hasPassword` 布尔，下一片）。
 
-**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整 ⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第④分支（纯口令 + 审计 `password_direct_no_second_factor`）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
+**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整（配了一半）⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第④分支（纯口令 + 审计 `password_direct_no_second_factor`）。**「未配置」「`transport='disabled'`」「运维急停」是正常状态，不告警**（评审返修 ④：否则 60s 缓存每过期一次就刷一行噪声）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
 
 审计（`audit_log`）：
 
@@ -394,8 +397,9 @@
 | `expires_in` | 新码的有效期（秒，`EMAIL_CODE_TTL_SECONDS`） |
 | `resend_after` | 下一次允许重发的冷却秒数（`EMAIL_CODE_RESEND_COOLDOWN_SECONDS`） |
 
-- **重发必须换新码并作废旧码**：先插新行（`resend_count = 上一条 + 1`），再把同一 `pending_token` 下其余未消费行 `consumed_at = now`。校验只认「最新一条未消费」，所以旧码从这一刻起必然被拒。
-- **按 IP 计发信频率**（`email:<ip>`，默认 10 次 / 15 分钟窗口）：被当成邮件放大器时最先撞这条。
+- **重发必须换新码并作废旧码**：先发信、成功后才插新行（`resend_count = 上一条 + 1`），再把同一 `pending_token` 下其余未消费行 `consumed_at = now`。校验只认「最新一条未消费」，所以旧码从这一刻起必然被拒。**发信失败时既不插新码、也不作废旧码**（用户手上的旧码仍然有效，且可立刻再试）。
+- **按 IP 计发信频率**（`email:<ip>`，默认 20 次 / 15 分钟窗口，与 §2.3a 的初次发信**共用同一把闸**）：被当成邮件放大器时最先撞这条。
+- **该 `pending_token` 下一条码行都没有 ⇒ 当「首次发信的重试」处理**：不查冷却、`resend_count` 从 0 起算，直接发新码（这是 §2.2 的 `503 email_send_failed` 之后「点重试」能立刻成功的机制）。`pending_token` 的有效性仍由 `findPendingUser` 判（无效 ⇒ `401 pending_expired`）。
 - 发信失败与 §2.3a 同口径：`503 email_send_failed`（`retryable: true`），`pending_token` 不作废。
 
 错误：
@@ -405,7 +409,7 @@
 | 400 | `validation_failed` | `pending_token` 缺失 |
 | 401 | `pending_expired` | `pending_token` 过期/不存在/已消费 |
 | 409 | `email_not_registered` | 该账号没有邮箱（第二因素做不成，找管理员补录） |
-| 429 | `rate_limited` | ① 冷却中（`Retry-After` = 剩余冷却秒数）；② 重发次数用尽（`Retry-After` 仍给出，但解法是重走第一步）；③ 按 IP 的发信频率超限 |
+| 429 | `rate_limited` | ① 冷却中（`Retry-After` = 剩余冷却秒数）；② 重发次数用尽（`Retry-After` 仍给出，但解法是重走第一步）；③ 按 IP 的发信频率超限（20 次 / 15 分钟，与初次发信共用） |
 | 503 | `email_send_failed` | SMTP 发不出去（`retryable: true`，可原样再试） |
 
 > §2.2 的 `503 email_send_failed` 是**第一次发信**就失败（此时客户端还没拿到过 `pending_token`），所以它的

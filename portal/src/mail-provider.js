@@ -94,7 +94,11 @@ export function createMailProvider({
       );
       return disabledMailer();
     }
-    if (result.reason && result.reason !== 'not_configured') {
+    // 只对**配置异常**告警（评审返修 ④）：
+    //   * `not_configured` / `transport_disabled` / `kill_switch` 都是正常状态（默认就没配），
+    //     60s 缓存每过期一次就 warn 一行只会把日志刷成噪声；
+    //   * `incomplete_settings`（配了一半：有 host 没 from）才是运维真的做错了事。
+    if (result.reason === 'incomplete_settings') {
       log?.warn?.(`[mail] email second factor disabled (${result.reason})`);
     }
     // 只有「读成功」才写缓存；读的这段时间里被 invalidate() 了就不回写（防旧配置盖住新配置）。
