@@ -165,3 +165,109 @@ test('PORTAL_INTERNAL_HOSTS：缺省为空，逗号分隔值 trim 并过滤空�
     ['100.100.0.3', 'internal.example.test'],
   );
 });
+
+// ---------------------------------------------------------------------------
+// issue #450 / feat-261105-01：管理台独立入口的配置面（host / 端口 / 来源白名单 / 对外 URL）。
+// 判据都能红：默认值、显式覆盖、非法形态回退、空清单不挂中间件。
+// ---------------------------------------------------------------------------
+
+const ADMIN_BASE = { ...DEV, FDE_IMAGE: 'traefik/whoami' };
+
+test('#450 adminHost：缺省 = admin.<BASE_DOMAIN>；ADMIN_PUBLIC_HOST 显式覆盖优先', () => {
+  assert.equal(loadConfig(ADMIN_BASE).adminHost, 'admin.localhost');
+  assert.equal(loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip' }).adminHost, 'admin.fde.erix.vip');
+  // 显式值优先（现网 admin.fde.erix.vip 就是这条路径）
+  assert.equal(
+    loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip', ADMIN_PUBLIC_HOST: 'ops-admin.fde.erix.vip' }).adminHost,
+    'ops-admin.fde.erix.vip',
+  );
+  // 空白字符串视为未设（compose 里 `ADMIN_PUBLIC_HOST: ${ADMIN_PUBLIC_HOST:-}` 注入的就是空串）
+  assert.equal(
+    loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip', ADMIN_PUBLIC_HOST: '   ' }).adminHost,
+    'admin.fde.erix.vip',
+  );
+});
+
+test('#450 adminHost：非法形态**回退默认值并 warn**（不新增错误码、不拦启动）', () => {
+  const bad = [
+    'ADMIN.fde.erix.vip',        // 大写：hostname grammar 不收（与预览域名同口径）
+    'admin_x.fde.erix.vip',      // 下划线
+    'admin..fde.erix.vip',       // 空标签
+    '-admin.fde.erix.vip',       // 标签以连字符开头
+    `${'a'.repeat(64)}.fde.erix.vip`, // 单标签 > 63
+    'admin.fde.erix.vip\nX-Injected: 1', // 换行（YAML 注入面）
+  ];
+  const origWarn = console.warn;
+  const warns = [];
+  console.warn = (msg) => warns.push(String(msg));
+  try {
+    for (const value of bad) {
+      const cfg = loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip', ADMIN_PUBLIC_HOST: value });
+      assert.equal(cfg.adminHost, 'admin.fde.erix.vip', `非法 ADMIN_PUBLIC_HOST=${JSON.stringify(value)} 必须回退默认`);
+    }
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(warns.some((m) => m.includes('ADMIN_PUBLIC_HOST')), '回退必须留下 warn（静默回退等于让人以为配置生效了）');
+});
+
+test('#450 adminPort：默认 9443，TRAEFIK_ADMIN_PORT 覆盖；非法值回退默认', () => {
+  assert.equal(loadConfig(ADMIN_BASE).adminPort, 9443);
+  assert.equal(loadConfig({ ...ADMIN_BASE, TRAEFIK_ADMIN_PORT: '8444' }).adminPort, 8444);
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    assert.equal(loadConfig({ ...ADMIN_BASE, TRAEFIK_ADMIN_PORT: '70000' }).adminPort, 9443);
+    assert.equal(loadConfig({ ...ADMIN_BASE, TRAEFIK_ADMIN_PORT: '0' }).adminPort, 9443);
+    assert.equal(loadConfig({ ...ADMIN_BASE, TRAEFIK_ADMIN_PORT: 'abc' }).adminPort, 9443);
+    assert.equal(loadConfig({ ...ADMIN_BASE, TRAEFIK_ADMIN_PORT: '' }).adminPort, 9443);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test('#450 adminIpAllowlist：空 = 空数组（不挂 ipAllowList）；非空 = trim 后的 CIDR 数组', () => {
+  assert.deepEqual(loadConfig(ADMIN_BASE).adminIpAllowlist, []);
+  assert.deepEqual(loadConfig({ ...ADMIN_BASE, ADMIN_IP_ALLOWLIST: '  ,  ' }).adminIpAllowlist, []);
+  assert.deepEqual(
+    loadConfig({ ...ADMIN_BASE, ADMIN_IP_ALLOWLIST: ' 100.64.0.0/10 , 10.0.0.0/8 ,, ' }).adminIpAllowlist,
+    ['100.64.0.0/10', '10.0.0.0/8'],
+  );
+});
+
+test('#450 adminIpAllowlist：单个非法条目被丢弃并 warn；全部非法 ⇒ 明确 warn「入口不再受限」', () => {
+  const origWarn = console.warn;
+  const warns = [];
+  console.warn = (msg) => warns.push(String(msg));
+  try {
+    assert.deepEqual(
+      loadConfig({ ...ADMIN_BASE, ADMIN_IP_ALLOWLIST: 'nope,10.1.0.0/16,300.0.0.0/8' }).adminIpAllowlist,
+      ['10.1.0.0/16'],
+    );
+    assert.ok(warns.some((m) => m.includes('nope')), '非法条目必须点名 warn');
+    assert.deepEqual(loadConfig({ ...ADMIN_BASE, ADMIN_IP_ALLOWLIST: 'nope' }).adminIpAllowlist, []);
+    assert.ok(
+      warns.some((m) => m.includes('不挂 ipAllowList')),
+      '全部条目非法时必须显式告知「管理台入口对任何来源放行」——这条的安全含义不能靠人推',
+    );
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test('#450 adminPublicBaseUrl：https + adminHost + 端口；443 时不带端口（与 websecure 同口径）', () => {
+  assert.equal(loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip' }).adminPublicBaseUrl, 'https://admin.fde.erix.vip:9443');
+  assert.equal(
+    loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip', TRAEFIK_ADMIN_PORT: '443' }).adminPublicBaseUrl,
+    'https://admin.fde.erix.vip',
+  );
+  // 管理台 URL 的推导**不得**污染用户面 URL（后者有字节快照钉着）
+  const cfg = loadConfig({ ...ADMIN_BASE, BASE_DOMAIN: 'fde.erix.vip', TRAEFIK_ENTRYPOINT: 'websecure', TRAEFIK_WEBSECURE_PORT: '8443' });
+  assert.equal(cfg.portalPublicBaseUrl, 'https://station.fde.erix.vip:8443');
+  assert.equal(cfg.adminPublicBaseUrl, 'https://admin.fde.erix.vip:9443');
+});
+
+test('#450 traefikAdminEntryPoint：默认 adminsecure，env 可覆盖', () => {
+  assert.equal(loadConfig(ADMIN_BASE).traefikAdminEntryPoint, 'adminsecure');
+  assert.equal(loadConfig({ ...ADMIN_BASE, TRAEFIK_ADMIN_ENTRYPOINT: 'adminx' }).traefikAdminEntryPoint, 'adminx');
+});
