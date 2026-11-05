@@ -26,6 +26,7 @@
 
 | 分类 | 方法 + 路径 | 说明 |
 |---|---|---|
+| 站点 | `GET /api/site` | **公开、零秘密**：两个入口的对外 URL（`userBaseUrl` / `adminBaseUrl`，§2.12；#450 A2）。无会话也 `200` |
 | 认证 | `POST /api/auth/login` | 第一步：口令校验 |
 | 认证 | `POST /api/auth/login/totp` | 第二步：TOTP 校验，发 cookie |
 | 认证 | `POST /api/auth/login/email-code` | 第二步：**邮箱验证码**校验，发 cookie（#449，§2.3a）|
@@ -843,6 +844,7 @@ station-portal user enable  --login <login>
 | `POST /api/auth/logout` | 登出永远可达：不想改密的人至少能换账号/退出；挡住它会把人钉在一个自己进不去的会话里 |
 | `POST /api/auth/login`、`POST /api/auth/login/totp`、`POST /api/auth/login/email-code`、`POST /api/auth/login/email-code/resend` | 登录的三个第二步与重发不得被挡（§2.2/§2.3/§2.3a/§2.3b）：第一步此刻还没有会话，本门对无会话请求本就无效；列进来是防「受限用户重新登录」被自己的旧会话形状误伤（受限账号的旧 cookie 会跟着新登录请求一起发出），也让清单与 §0.1 端点表对齐 |
 | `POST /api/login`、`POST /api/logout`（**旧路径**）| ⚠ **新旧两条都覆盖**：`POST /api/login → 307 → /api/auth/login`（§0.1）这对重写在本门**之后**，所以旧路径**确实会走到本门**（不是「到不了所以不用列」）。不列，一个还带着旧会话 cookie 的受限用户连「重新登录」「退出」这两个动作本身都会被 403 锁死 |
+| `GET /api/site` | #450 A2 的 host 信息端点（§2.12）**本身就是公开端点**（无会话也 200、只回两个对外 base URL），拿「欠不欠改密」去挡它不自洽；而它被挡的后果不是 403 而是**静默降级**——前端路由守卫把「site 不可用」当成 fail-open（不跨 host 跳），于是受限会话在错的 host 上照样渲染出一片 404 的页面 |
 | `* /api/forward-auth` | ⚠ **本单最大的雷**：Traefik forwardAuth 回调（§2.7）。`routes.js` 的 `authRequestHeaders` 白名单带 `Cookie` ⇒ 浏览器 cookie 会原样进这条回调；而它的语义是「这片预览该不该放行」，被门挡成 403 `password_change_required` 时 **Traefik 只把它当成认证失败** ⇒ 该用户 `*.fde.<base>` 名下**全部**预览端口一起挂，而他要改的只是口令 |
 | `* /api/internal/*`（前缀）| 容器 → portal（§9）：per-container Bearer token 鉴权、**不带登录 cookie**，改密状态与它无关（与 #234 的豁免同一批理由）|
 
@@ -864,6 +866,38 @@ station-portal user enable  --login <login>
 **⚠ 本单不含前端**：迁移默认值不回填 + `bootstrap-admin` 不置旗标 + `createUser`/`resetUserPassword` 才置 `true`，三件事合起来保证「已部署环境升级后不会有人被锁住」；但**被代设过口令的人一旦被门挡住，本单里唯一的出口是 `curl`/API 调用**（改密屏是后续前端工单）。残余风险见本条。
 
 **残余风险**：① 前端未交付 ⇒ 被代设口令的用户目前只能靠 API 自己改密（§2.6a），若忘了这一步会以为自己被锁死；② 门只覆盖 `/api/*`，**不覆盖**已经签出去的预览 ticket / 预览 cookie（§2.8）——受限用户手上已有的预览 cookie 在 TTL 内照样能用，这与「预览归预览、门户归门户」的既有口径一致，本单不收紧。
+
+### 2.12 `GET /api/site`（#450 A2：两个入口的对外 URL，**公开、零秘密**）
+
+**要治的是什么**：#450 的 A1 把**边缘**隔离做实了（用户入口 `/api/admin/*` ⇒ 404、管理台入口除白名单外的 `/api/*` ⇒ 404，见 [`../deploy/edge-routing.md`](../deploy/edge-routing.md) §2），但**前端还不知道自己在哪个 host 上**：SPA 是同一份、hash 路由不变，两个 host 都把它发下去。于是「在用户 host 上打开 `#/admin/users`」的观感是「页面在、API 全 404」。A2 只做一件事：**发现自己在错的 host 上就跳到对的 host**——而跳转落点必须先知道「两个 host 各自的对外 URL」，本端点就是那个唯一来源。
+
+**请求**：`GET /api/site`（无参数、无 body）。
+
+**响应** `200 application/json`：
+
+```json
+{
+  "userBaseUrl": "http://station.fde.erix.vip:8090",
+  "adminBaseUrl": "https://admin.fde.erix.vip:9443"
+}
+```
+
+| 字段 | 语义 | 来源（**不新增配置项**） |
+|---|---|---|
+| `userBaseUrl` | 用户面（`station.<伞域>`）的对外 base URL，`scheme://host[:port]` | `config.portalPublicBaseUrl`，即 `resolvePublicBaseUrl()` 的产物——**就是今天喂给 agentd 的 `ERIX_STATION_BASE_URL` 那一个**（§9），前端/容器/预览 URL 共用同一口径 |
+| `adminBaseUrl` | 管理台（`admin.<伞域>:9443`）的对外 base URL | `config.adminPublicBaseUrl`（A1 的 `resolveAdminPublicBaseUrl`：`https://<adminHost>[:<adminPort>]`，**443 时不带端口**，与 websecure 分支同口径） |
+
+**三条口径（都写进了单测）**：
+
+1. **公开**：无 session cookie 也 `200`。登录页在**跳转之前**就要用它（否则「在管理台 host 上不知道自己是管理台」= 死锁），所以它不可能要求会话。同理它也在 #255 受限会话门的放行清单里（§2.11a）：公开端点拿「欠不欠改密」去挡，既不自洽，后果又只是**静默降级**（前端 host 闸 fail-open）。
+2. **零秘密**：响应键集合**恰好两个**（`portal/test/http.test.js` 逐字钉住）。不回版本号、镜像、host 清单、`ADMIN_IP_ALLOWLIST` 或任何运维面信息——这个端点对匿名访问者可见，多一个字段就是多一条信息泄露面。
+3. **两个入口都可达**：用户入口由 portal 的 catch-all 直接命中；管理台入口由 `routes.js` 的 `admin-auth` 允许面（`/api/auth`、`/api/me`、`/api/site`）命中，并在 `admin-deny-api` 的排除列表里**逐条互补**（deny 优先级 300 > 允许 200，漏一条就是「deny 把允许的那条吃掉」）。`portal/test/routes.test.js` 用**规则求值器**（不是字符串匹配）断言「管理台入口上 `/api/site` 的赢家是 `admin-auth` 而非 `admin-deny-api`」。
+
+**错误**：非 `GET` ⇒ `405 method_not_allowed`（与 `/healthz` 同口径，**不新增错误码**）。其余情况下本端点不产生业务错误。
+
+**客户端口径（前端 `stores/site.ts` + `lib/hostGate.ts`）**：拿不到（网络 / 5xx / 超时 / 缺字段）⇒ **fail-open，不跳**（跳错方向比不跳更糟：管理台不可达时会把用户踢到死地址）；失败后缓存 30s 再重试，并发导航只发一次请求（单飞）。判据与落点见 `portal/frontend/src/lib/hostGate.ts`（纯函数，六行矩阵逐条单测）。
+
+---
 
 ---
 
