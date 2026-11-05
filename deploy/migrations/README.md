@@ -44,6 +44,9 @@
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
 - 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
+  `0026-login-email-codes.sql`（**#449 登录第二因素「邮箱验证码」**：`login_email_codes` 一行一枚码 +
+  `mail_settings` 单行邮件通道配置——SMTP 参数存 DB、口令明文，与 `git_hosts.admin_key` 同口径；
+  `docs/data/schema.sql` 冻结 baseline 一个字节未改，静态断言见 `portal/test/migrations.test.js`）至
   `0021-user-must-change-password.sql`（**#255 首登强制改密**：`users` 加
   **`must_change_password boolean NOT NULL DEFAULT false`** ——单条 `ADD COLUMN IF NOT EXISTS`（可整体重放，
   第二遍是零 DDL 空操作；PG 11+ 对常量 DEFAULT 不重写表），后置两个**纯读** DO 块：一个在「列缺失 / 不是

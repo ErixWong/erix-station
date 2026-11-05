@@ -37,6 +37,9 @@ import {
   isPreviewPortInPool,
 } from './previewpool.js';
 import { createRateLimiter, createSemaphore } from './ratelimit.js';
+import { maskEmail } from './mailer.js'; // #449：邮件通道端口（登录邮箱验证码）
+import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置的 DB 读取侧（60s 缓存）
+import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -329,6 +332,18 @@ export const RESTRICTED_SESSION_ALLOWLIST = Object.freeze([
     reason: '第二步（TOTP）同上：注册了 TOTP 的受限账号要能走完两步登录，否则连改密前的会话都拿不到。',
   }),
   Object.freeze({
+    method: 'POST',
+    path: '/api/auth/login/email-code',
+    reason: '第二步（邮箱验证码，issue #449）：与 TOTP 第二步同一理由——受限账号重新登录时旧会话 cookie 仍在，'
+      + '不列它就会被自己的旧会话形状挡成 403，连改密前的会话都拿不到。',
+  }),
+  Object.freeze({
+    method: 'POST',
+    path: '/api/auth/login/email-code/resend',
+    reason: '邮箱码重发（issue #449）：同属登录第二步的组成部分（没收到信的人必须能重发），'
+      + '与上一行同一批理由；它只对**未消费的 pending_token** 生效，不产生会话。',
+  }),
+  Object.freeze({
     method: '*',
     path: '/api/forward-auth',
     reason: '⚠ **本单最大的雷**：Traefik forwardAuth 回调（§2.7）。`routes.js` 的 `authRequestHeaders` 白名单里就带 '
@@ -537,7 +552,7 @@ export async function checkReady(pool, migrationsDir = migrate.defaultMigrations
   }
 }
 
-export function createServer({ pool, config, log = console, docker = null, llmGateway = null }) {
+export function createServer({ pool, config, log = console, docker = null, llmGateway = null, mailerProvider = null }) {
   const loginLimiter = createRateLimiter(config.loginRateLimit);
   // TOTP 失败限流按「账户 + IP」计数（防换新 pending_token 绕过）；单 token 尝试上限单独计。
   const totpLimiter = createRateLimiter({
@@ -563,8 +578,41 @@ export function createServer({ pool, config, log = console, docker = null, llmGa
     blockMs: 60 * 1000,
     maxEntries: 10000,
   });
+  // #449：邮箱验证码的两个限流器。
+  //   emailCodeLimiter：按「账户 + IP」计**校验失败**（换新 pending_token 不重置，防爆破 6 位码）；
+  //   emailSendLimiter：按 IP 计**发信频率**（限流器只有 recordFailure 一个计数入口，所以每次发信都记一次）。
+  const emailCodeLimiter = createRateLimiter({
+    maxFailures: config.emailCodeRateLimit?.maxFailures ?? 10,
+    windowMs: config.emailCodeRateLimit?.windowMs ?? 15 * 60 * 1000,
+    blockMs: config.emailCodeRateLimit?.blockMs ?? 15 * 60 * 1000,
+    maxEntries: config.emailCodeRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
+  const emailSendLimiter = createRateLimiter({
+    maxFailures: config.emailSendRateLimit?.maxFailures ?? 20,
+    windowMs: config.emailSendRateLimit?.windowMs ?? 15 * 60 * 1000,
+    blockMs: config.emailSendRateLimit?.blockMs ?? 15 * 60 * 1000,
+    maxEntries: config.emailSendRateLimit?.maxEntries ?? config.loginRateLimit?.maxEntries ?? 10000,
+  });
+  // #449：邮件通道读取侧（SMTP 参数存 DB，见 `mail-provider.js`）。`mailerProvider` 参数仅供测试注入 fake。
+  // 为什么不在启动时同步读一次：登录是热路径但启动不是；真正的「现在到底能不能发信」每次登录时由
+  // `ctx.mailerProvider.get()` 回答（60s 缓存 + 急停硬闸）。这里只在 `config.mail` 存在（= `loadConfig`
+  // 产物，即真实部署形态）时做一次异步探针，把「第二因素实际不生效」说在启动日志里。
+  const mailProvider = mailerProvider ?? createMailProvider({ pool, config, log });
+  if (config.mail) {
+    mailProvider
+      .get()
+      .then((m) => {
+        if (!m.enabled) {
+          log?.warn?.(
+            '[auth] email verification code disabled (mail settings unavailable or MAIL_TRANSPORT=disabled); accounts without TOTP log in with password only',
+          );
+        }
+      })
+      .catch(() => {}); // 探针永不拖垮启动（provider 自己已经把读取失败降级成 disabled）
+  }
   const ctx = {
-    pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter, docker,
+    pool, config, log, loginLimiter, totpLimiter, totpTokenLimiter, kdfSemaphore, previewTicketLimiter,
+    mailerProvider: mailProvider, emailCodeLimiter, emailSendLimiter, docker,
     llmGateway: llmGateway ?? createLlmGatewayClient({
       adminUrl: config.llmGatewayAdminUrl ?? 'http://station-litellm:4000',
       masterKey: config.llmGatewayMasterKey ?? '',
@@ -773,6 +821,15 @@ async function routeApi(req, res, ctx, url) {
 
   if (req.method === 'POST' && pathname === '/api/auth/login/totp') {
     return handleLoginTotp(req, res, ctx);
+  }
+
+  // #449：邮箱验证码的两条（第二步 + 重发）。与 TOTP 第二步同层：已在 `csrfGateFor` 之后。
+  if (req.method === 'POST' && pathname === '/api/auth/login/email-code') {
+    return handleLoginEmailCode(req, res, ctx);
+  }
+
+  if (req.method === 'POST' && pathname === '/api/auth/login/email-code/resend') {
+    return handleLoginEmailCodeResend(req, res, ctx);
   }
 
   if (req.method === 'POST' && pathname === '/api/auth/logout') {
@@ -2331,16 +2388,42 @@ async function handleLoginStep1(req, res, ctx) {
 
   ctx.loginLimiter.reset(rlKey);
 
-  // 未注册 TOTP（totp_secret 为空）→ 跳过第二因素，口令直通建会话。
+  // ---- 第二因素选择（issue #449 决策 2，纯函数在 login-email-code.js）----
+  //   ① 已注册 TOTP            → totp_required（现状一字不改）
+  //   ② 未注册 + 邮件通道启用 + 有邮箱 → email_code_required
+  //   ③ 未注册 + 邮件通道启用 + 无邮箱 → 409 email_not_registered（**绝不静默退回口令**）
+  //   ④ 邮件通道未启用（默认）  → 口令直通，但审计 method 标明「没有第二因素」
+  const secondFactor = loginEmailCode.chooseSecondFactor({
+    hasTotpEnrollment: await auth.hasTotpEnrollment(pool, result.user.id),
+    // 邮件通道是否启用 = DB 配置 + 急停开关的结果（`mail-provider.js`，60s 缓存）；读失败降级为 disabled。
+    mailEnabled: (await ctx.mailerProvider.get()).enabled,
+    email: result.email,
+  });
+
+  if (secondFactor === 'email_not_registered') {
+    // 邮件通道开着却没有邮箱 = 第二因素做不成。让人去找管理员补录，不给他「反正能进」的错觉。
+    throw new HttpError(
+      409,
+      'email_not_registered',
+      '当前账号未登记邮箱，无法接收登录验证码；请联系管理员补录邮箱后再登录',
+      { retryable: false },
+    );
+  }
+
+  if (secondFactor === 'email_code_required') {
+    return handleEmailCodeRequired(req, res, ctx, { user: result.user, email: result.email, ip });
+  }
+  // 未注册 TOTP（totp_secret 为空）且邮件通道未启用 → 跳过第二因素，口令直通建会话。
   // （偏离规格 §7.1「强制 TOTP」：NULL secret 原语义 = 第二步永远失败 = 永久锁死；
   //   现改为「未注册即跳过」，用户决策 2026-09-22，规格同步见 issue）
-  if (!(await auth.hasTotpEnrollment(pool, result.user.id))) {
+  if (secondFactor === 'password_direct_no_second_factor') {
     const session = await auth.createSession(pool, result.user.id, {
       ip,
       userAgent: req.headers['user-agent'] ?? null,
       ttlSeconds: config.sessionTtlSeconds,
     });
-    await auditLoginSuccess(pool, result.user, 'password_direct');
+    // #449：method 明确写出「这一层没做第二因素」（邮件通道未配置）——审计能区分「有两层」与「只有一层」。
+    await auditLoginSuccess(pool, result.user, 'password_direct_no_second_factor');
     return sendJson(res, 200, {
       status: 'authenticated',
       // #255（纯 additive）：登录时就告诉前端「这枚会话是受限的」，不必等它去碰第一个 403。
@@ -2362,6 +2445,326 @@ async function handleLoginStep1(req, res, ctx) {
     status: 'totp_required',
     pending_token: pending.token,
     expires_in: config.pendingTokenTtlSeconds,
+  });
+}
+
+/** 邮箱验证码参数的缺省值（测试/旧配置没带 `loginEmailCode` 段时仍可工作；口径同 config.js 默认）。 */
+const DEFAULT_EMAIL_CODE_POLICY = Object.freeze({
+  ttlSeconds: 600,
+  maxAttempts: 5,
+  resendCooldownSeconds: 60,
+  maxResends: 3,
+});
+
+function emailCodePolicy(config) {
+  const raw = config.loginEmailCode ?? {};
+  return {
+    ttlSeconds: Number(raw.ttlSeconds ?? DEFAULT_EMAIL_CODE_POLICY.ttlSeconds),
+    maxAttempts: Number(raw.maxAttempts ?? DEFAULT_EMAIL_CODE_POLICY.maxAttempts),
+    resendCooldownSeconds: Number(raw.resendCooldownSeconds ?? DEFAULT_EMAIL_CODE_POLICY.resendCooldownSeconds),
+    maxResends: Number(raw.maxResends ?? DEFAULT_EMAIL_CODE_POLICY.maxResends),
+  };
+}
+
+/** 邮箱码的邮件正文（**只在这里**拼入明文码；审计/日志绝不取这个字符串）。 */
+function emailCodeMessage(code, ttlSeconds) {
+  const minutes = Math.max(1, Math.round(ttlSeconds / 60));
+  return {
+    subject: 'FDE Station 登录验证码',
+    text: `你的登录验证码是 ${code}，${minutes} 分钟内有效。\n如非本人操作，请忽略本邮件并考虑联系管理员。`,
+  };
+}
+
+/**
+ * 决策 2 的第②分支：发一枚邮箱验证码（`status='email_code_required'`）。
+ * 发信失败 ⇒ `503 email_send_failed`（retryable），但 **pending_token 不作废**：用户点重发即可，不必重输口令。
+ *
+ * 顺序契约（评审返修 ①，issue #449）：**先发信、成功后才插码行**。
+ * 反过来（先插码再发信）会让失败重试被自己插的那行的 `created_at` 卡在 60s 冷却里——
+ * 用户看到的是「503 让我重试」紧接着「429 请稍后再试」，而 pending 只有 600s 寿命。
+ * 发信失败时库里**一条码行都没有**，所以 `recordResend` 的重试路径（无码行 ⇒ 当首次发信）成立。
+ *
+ * 发信限流（评审返修 ②）：与重发同一把闸（`email:<ip>`），否则持有效口令的人可以反复调第一步刷邮箱。
+ */
+async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
+  const { pool, config } = ctx;
+  // 这里再取一次（拿到的还是同一份 60s 缓存对象）；不用登录选择时那份是为了让本函数的依赖自己写清楚。
+  const mailer = await ctx.mailerProvider.get();
+  const policy = emailCodePolicy(config);
+
+  // 发信频率闸先于建 pending：被限流时连 pending 行都不该留下（客户端稍后重走第一步即可）。
+  const sendKey = `email:${ip}`;
+  const sendCheck = ctx.emailSendLimiter.check(sendKey);
+  if (!sendCheck.allowed) {
+    throw new HttpError(429, 'rate_limited', '发信过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(sendCheck.retryAfterSeconds) },
+    });
+  }
+
+  // 待决令牌的 TTL 取 max(口令步 TTL, 码 TTL)：否则码还没过期、令牌先过期，`expires_in` 就是一句谎。
+  const pendingTtlSeconds = Math.max(config.pendingTokenTtlSeconds ?? 120, policy.ttlSeconds);
+  const pending = await auth.createPendingToken(pool, user.id, {
+    ip,
+    userAgent: req.headers['user-agent'] ?? null,
+    ttlSeconds: pendingTtlSeconds,
+  });
+  const code = loginEmailCode.generateEmailCode();
+
+  const sent = await mailer.send({ to: email, ...emailCodeMessage(code, policy.ttlSeconds) });
+  if (!sent.ok) {
+    await auth.audit(pool, {
+      actorId: user.id,
+      action: 'auth.email_code_failed',
+      target: user.login,
+      details: { login: user.login, reason: sent.reason ?? 'send_failed', at: new Date().toISOString() },
+    }).catch(() => {});
+    // `details` 里带上 pending_token：发信失败时第一次响应就是 503（客户端还没拿到过令牌），
+    // 不带它「pending 不作废、用户点重试即可」在协议上就不成立（只能回去重输口令）。
+    throw new HttpError(503, 'email_send_failed', '验证码邮件发送失败，请稍后重试', {
+      retryable: true,
+      headers: { 'Retry-After': '5' },
+      details: {
+        pending_token: pending.token,
+        expires_in: pendingTtlSeconds,
+        email_hint: maskEmail(email),
+      },
+    });
+  }
+  ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
+
+  // 发信成功后才落库：这样「重发冷却」的起算点就是用户真的收到信的时刻。
+  const created = await loginEmailCode.createEmailCode(pool, {
+    pendingTokenHash: pending.tokenHash,
+    code,
+    ttlSeconds: policy.ttlSeconds,
+    maxAttempts: policy.maxAttempts,
+    ip,
+    userAgent: req.headers['user-agent'] ?? null,
+  });
+
+  // 审计只记脱敏收件人 + 码哈希前缀（12 位）+ 过期时刻；**绝不出现明文码**（portal.md §2.3a）。
+  await auth.audit(pool, {
+    actorId: user.id,
+    action: 'auth.email_code_sent',
+    target: user.login,
+    details: {
+      login: user.login,
+      email_hint: maskEmail(email),
+      code_hash_prefix: created.codeHash.slice(0, 12),
+      expires_at: created.expiresAt.toISOString(),
+      at: new Date().toISOString(),
+    },
+  }).catch(() => {});
+
+  return sendJson(res, 200, {
+    status: 'email_code_required',
+    pending_token: pending.token,
+    expires_in: pendingTtlSeconds,
+    email_hint: maskEmail(email),
+  });
+}
+
+/**
+ * `POST /api/auth/login/email-code`（portal.md §2.3a）：校验邮箱验证码 → 建会话。
+ * 失败一律 `401 email_code_invalid`（不区分「码错」与「码不存在」，防探测；`too_many_attempts` 同样映射，
+ * 只是 message 说明要重走第一步）；`pending_token` 无效/已用/过期 → 复用 `401 pending_expired`。
+ */
+async function handleLoginEmailCode(req, res, ctx) {
+  const { pool, config } = ctx;
+  requireJson(req);
+  const body = await readJsonBody(req, config.maxBodyBytes);
+  const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
+  const code = typeof body.code === 'string' ? body.code.trim() : '';
+  if (!pendingToken || !code) {
+    throw new HttpError(400, 'validation_failed', 'pending_token 与 code 均为必填');
+  }
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  // 非消费读取（码错可重试，不烧 pending）；成功才原子消费。
+  const userId = await auth.findPendingUser(pool, pendingToken);
+  if (!userId) {
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+  }
+
+  // 账户 + IP 失败计数（换新 pending_token 不重置，防 6 位码爆破）。
+  const limiterKey = `emailcode:${userId}:${ip}`;
+  const check = ctx.emailCodeLimiter.check(limiterKey);
+  if (!check.allowed) {
+    throw new HttpError(429, 'rate_limited', '尝试过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(check.retryAfterSeconds) },
+    });
+  }
+
+  const result = await loginEmailCode.verifyEmailCode(pool, {
+    pendingTokenHash: auth.hashToken(pendingToken),
+    code,
+    now: new Date(),
+  });
+  if (!result.ok) {
+    ctx.emailCodeLimiter.recordFailure(limiterKey);
+    const message = result.reason === 'too_many_attempts'
+      ? '验证码尝试次数已用尽，请重新登录获取新验证码'
+      : '验证码错误或已失效';
+    throw new HttpError(401, 'email_code_invalid', message);
+  }
+
+  const consumedUserId = await auth.consumePendingToken(pool, pendingToken);
+  if (!consumedUserId) {
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+  }
+  ctx.emailCodeLimiter.reset(limiterKey);
+
+  const loaded = await auth.loadActiveUser(pool, consumedUserId);
+  if (!loaded) {
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+  }
+
+  const session = await auth.createSession(pool, loaded.user.id, {
+    ip,
+    userAgent: req.headers['user-agent'] ?? null,
+    ttlSeconds: config.sessionTtlSeconds,
+  });
+  await auditLoginSuccess(pool, loaded.user, 'email_code');
+  await auth.audit(pool, {
+    actorId: loaded.user.id,
+    action: 'auth.email_code_verified',
+    target: loaded.user.login,
+    details: { login: loaded.user.login, method: 'email_code', at: new Date().toISOString() },
+  }).catch(() => {});
+
+  return sendJson(
+    res,
+    200,
+    // #255：与 §2.3（TOTP 第二步）逐字同口径——`password_change_required` 恒为布尔且必须出现。
+    { password_change_required: loaded.mustChangePassword === true, user: loaded.user },
+    { 'Set-Cookie': sessionCookieHeader(config.cookie, session.token) },
+  );
+}
+
+/**
+ * `POST /api/auth/login/email-code/resend`（portal.md §2.3b）：重发验证码。
+ * 重发**必须换新码并作废旧码**；冷却中/超次数 ⇒ `429 rate_limited` + `Retry-After`；
+ * pending 无效 ⇒ `401 pending_expired`。发信失败同 §2.3a：`503 email_send_failed`，pending 保留。
+ */
+async function handleLoginEmailCodeResend(req, res, ctx) {
+  const { pool, config } = ctx;
+  requireJson(req);
+  const body = await readJsonBody(req, config.maxBodyBytes);
+  const pendingToken = typeof body.pending_token === 'string' ? body.pending_token : '';
+  if (!pendingToken) {
+    throw new HttpError(400, 'validation_failed', 'pending_token 为必填');
+  }
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  const userId = await auth.findPendingUser(pool, pendingToken);
+  if (!userId) {
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+  }
+
+  // 按 IP 计发信频率（重发也计数：被当成邮件放大器时最先撞这条）。
+  const sendKey = `email:${ip}`;
+  const sendCheck = ctx.emailSendLimiter.check(sendKey);
+  if (!sendCheck.allowed) {
+    throw new HttpError(429, 'rate_limited', '发信过于频繁，请稍后再试', {
+      retryable: true,
+      headers: { 'Retry-After': String(sendCheck.retryAfterSeconds) },
+    });
+  }
+
+  const loaded = await auth.loadActiveUser(pool, userId);
+  if (!loaded) {
+    throw new HttpError(401, 'pending_expired', 'pending_token 过期或已使用，请重新登录');
+  }
+  if (!loaded.email) {
+    throw new HttpError(
+      409,
+      'email_not_registered',
+      '当前账号未登记邮箱，无法接收登录验证码；请联系管理员补录邮箱后再登录',
+      { retryable: false },
+    );
+  }
+
+  const policy = emailCodePolicy(config);
+  const now = new Date();
+  const pendingTokenHash = auth.hashToken(pendingToken);
+  // 发信端口：SMTP 配置存 DB，`get()` 是 60s 缓存后的结果（急停/未配置 ⇒ disabled）。
+  const mailer = await ctx.mailerProvider.get();
+  const gate = await loginEmailCode.recordResend(pool, {
+    pendingTokenHash,
+    cooldownSeconds: policy.resendCooldownSeconds,
+    maxResends: policy.maxResends,
+    now,
+  });
+  if (!gate.ok) {
+    // `recordResend` 不再有 `not_found`（该 pending 下一条码行都没有 = 首次发信失败后的重试，
+    // 语义上是「首次发信」而不是 401；pending 有效性上面已经由 `findPendingUser` 判过）。
+    ctx.emailSendLimiter.recordFailure(sendKey);
+    const retryAfter = Math.max(1, Number(gate.retryAfterSeconds ?? 0));
+    throw new HttpError(
+      429,
+      'rate_limited',
+      gate.reason === 'max_resends' ? '验证码重发次数已用尽，请重新登录' : '请稍后再试',
+      { retryable: true, headers: { 'Retry-After': String(retryAfter) } },
+    );
+  }
+
+  const code = loginEmailCode.generateEmailCode();
+  // 与首次发信同一顺序契约：**先发信、成功后才落库**。发信失败时既不插新码也不作废旧码
+  // ⇒ 用户手上的旧码仍然有效，且「立刻重试」不会被自己没收到的那封信的 created_at 卡 60s。
+  // （代价：若发信成功而 INSERT 失败——纯 DB 故障——用户拿到的码不在库里。那是 500 级故障，
+  //   与「发信失败被冷却卡 60s」这条**必然发生**的日常路径相比，取舍明确。）
+  const sent = await mailer.send({ to: loaded.email, ...emailCodeMessage(code, policy.ttlSeconds) });
+  if (!sent.ok) {
+    await auth.audit(pool, {
+      actorId: loaded.user.id,
+      action: 'auth.email_code_failed',
+      target: loaded.user.login,
+      details: { login: loaded.user.login, reason: sent.reason ?? 'send_failed', at: new Date().toISOString() },
+    }).catch(() => {});
+    throw new HttpError(503, 'email_send_failed', '验证码邮件发送失败，请稍后重试', {
+      retryable: true,
+      headers: { 'Retry-After': '5' },
+    });
+  }
+  ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
+
+  const created = await loginEmailCode.createEmailCode(pool, {
+    pendingTokenHash,
+    code,
+    ttlSeconds: policy.ttlSeconds,
+    maxAttempts: policy.maxAttempts,
+    resendCount: gate.resendCount,
+    ip,
+    userAgent: req.headers['user-agent'] ?? null,
+    now,
+  });
+  // 先插新码再作废旧码：插失败不会留下「一枚可用码都没有」的死状态；而校验只认「最新未消费」一条，
+  // 所以这段窗口里旧码本来也不会被接受（作废只是把它从「最新未消费」的位置上彻底摘掉）。
+  await loginEmailCode.invalidateOtherCodes(pool, {
+    pendingTokenHash,
+    keepCodeHash: created.codeHash,
+    now,
+  });
+
+  await auth.audit(pool, {
+    actorId: loaded.user.id,
+    action: 'auth.email_code_sent',
+    target: loaded.user.login,
+    details: {
+      login: loaded.user.login,
+      email_hint: maskEmail(loaded.email),
+      code_hash_prefix: created.codeHash.slice(0, 12),
+      expires_at: created.expiresAt.toISOString(),
+      resend_count: gate.resendCount,
+      at: new Date().toISOString(),
+    },
+  }).catch(() => {});
+
+  return sendJson(res, 200, {
+    expires_in: policy.ttlSeconds,
+    resend_after: policy.resendCooldownSeconds,
   });
 }
 
@@ -2438,9 +2841,10 @@ async function handleLoginTotp(req, res, ctx) {
 }
 
 /**
- * 成功登录审计（`audit_log.action='auth.login_success'`）：两个成功分支各写一条——
- * `password_direct`（未注册 TOTP，口令直通）与 `totp`（第二因素校验通过）。
- * details 只记 login / method / at，**不含口令、TOTP 码、session token 等敏感字段**。
+ * 成功登录审计（`audit_log.action='auth.login_success'`）：三个成功分支各写一条——
+ * `password_direct_no_second_factor`（未注册 TOTP 且邮件通道未启用，口令直通）、
+ * `totp`（TOTP 校验通过）、`email_code`（邮箱验证码校验通过，issue #449）。
+ * details 只记 login / method / at，**不含口令、TOTP 码、邮箱验证码、session token 等敏感字段**。
  * best-effort（同 §2.7 forward-auth 审计口径）：审计写失败不阻断已成功的登录。
  */
 async function auditLoginSuccess(pool, user, method) {
