@@ -165,8 +165,17 @@ export function hostGateDecision(input: HostGateInput): HostGateDecision {
     // 管理台 host 上的管理路径就地渲染（不跳）。① 的 origin 相等在「配置写成 :443 隐式、实际走 :9443」
     // 这类同 host 不同端口的形态下不成立，所以这里要显式判一次——否则管理台会把自己跳走。
     if (isAdminPath(toPath)) return { action: 'allow' };
-    // 其余（工作台、会话深链、未知路径）⇒ 回用户面。
-    const url = hashUrl(input.userBaseUrl, toPath);
+    // 其余（工作台、会话深链、未知路径）⇒ **同 host 改写**到管理台首页，**绝不跨 host**。
+    //
+    // ⚠ 2026-11-06 真机无限环（用户报「8443 和 9443 之间疯狂跳转」）的根因就在这一行原来写的是
+    // `hashUrl(userBaseUrl, toPath)`（跨 host 回用户面）：
+    //   两个 host 的登录 cookie 是 host-only ⇒ **它们可以是不同账号**（8443=admin、9443=eric 是真实状态）。
+    //   于是：8443 `/` ⇒(无工位 admin 改写 `/admin/users`)⇒ 9443 `/admin/users` ⇒(9443 的会话是 eric,
+    //   requiresRole 失败)⇒ 9443 `/` ⇒(管理台 host + 非 admin 路径 ⇒ 跳用户面)⇒ 8443 `/` ⇒ …
+    //   每一跳都"合理"，合起来是环 —— 而且两边的身份都自洽，任何单侧判据都看不出来。
+    // 修法：**管理台 host 只在自己家里改道**（`/` ⇒ `/admin/users`，未登录再由守卫送去 `/login`）。
+    // 用户想真的回工作台有显式链接（`<a href>` 整页导航，不走本闸），那条路仍然通。
+    const url = hashUrl(input.adminBaseUrl, '/admin/users');
     return url === null ? { action: 'allow' } : { action: 'redirect', url };
   }
 

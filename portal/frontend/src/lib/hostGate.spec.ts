@@ -43,11 +43,14 @@ describe('#450 A2 hostGate：矩阵六行（工单 §2 的表）', () => {
     expect(decide(CHANGE_PASSWORD_PATH, ADMIN_ORIGIN)).toEqual({ action: 'allow' });
   });
 
-  it('管理台 host + 其它（/、/session/*、未知路径）⇒ redirect 到 userBaseUrl#<toPath>', () => {
+  it('管理台 host + 其它（/、/session/*、未知路径）⇒ **同 host** 改写到 /admin/users（绝不跨 host）', () => {
+    // 2026-11-06：原来是 `${USER_ORIGIN}#${path}`（跨 host 回用户面），而两个 host 的会话可以是
+    // **不同账号** ⇒ 用户面又把 admin 路径送回来 ⇒ 无限环（真机标本）。现在一律同 host 改道，
+    // 用户想真的回工作台走顶栏那个显式 `<a href>`（整页导航，不过本闸）。
     for (const path of ['/', '/session/abc', '/whatever/else']) {
       expect(decide(path, ADMIN_ORIGIN)).toEqual({
         action: 'redirect',
-        url: `${USER_ORIGIN}#${path}`,
+        url: `${ADMIN_ORIGIN}#/admin/users`,
       });
     }
   });
@@ -103,8 +106,9 @@ describe('#450 A2 hostGate：端口 / 443 两形态（用 URL 比 origin，不�
       expect(hostGateDecision({ currentOrigin, userBaseUrl: USER_BASE, adminBaseUrl: base, toPath: '/admin/users' }))
         .toEqual({ action: 'allow' });
       // 反方向：443 管理台 host 上的会话深链 ⇒ 跳用户面（落点不带端口，与 base 同形）。
+      // 2026-11-06：管理台 host 的非 admin 路径**不再跨 host**（那是无限环的根因），同 host 改道。
       expect(hostGateDecision({ currentOrigin, userBaseUrl: USER_BASE, adminBaseUrl: base, toPath: '/session/x' }))
-        .toEqual({ action: 'redirect', url: `${USER_ORIGIN}#/session/x` });
+        .toEqual({ action: 'redirect', url: `${base.replace(/\/+$/, '')}#/admin/users` });
     }
   });
 
@@ -138,7 +142,7 @@ describe('#450 A2 hostGate：深链保真（toPath 原样进 hash）', () => {
   it('`/session/<id>` 与 query 都不丢、不重编码', () => {
     expect(decide('/session/8f1c-2b?tab=diff&x=1', ADMIN_ORIGIN)).toEqual({
       action: 'redirect',
-      url: `${USER_ORIGIN}#/session/8f1c-2b?tab=diff&x=1`,
+      url: `${ADMIN_ORIGIN}#/admin/users`,
     });
     expect(decide('/admin/users?q=%E5%BC%A0%E4%B8%89', USER_ORIGIN)).toEqual({
       action: 'redirect',
@@ -216,9 +220,9 @@ describe('#450 A2 hostGate：带 query 的 fullPath（真机死循环回归）',
   it('管理台 host + 其它带 query 的路径 ⇒ 仍回用户面（剥 query 只影响命中判定，不放宽矩阵）', () => {
     expect(decide('/session/abc?x=1', ADMIN_ORIGIN)).toEqual({
       action: 'redirect',
-      url: `${USER_BASE}#/session/abc?x=1`,
+      url: `${ADMIN_ORIGIN}#/admin/users`,
     });
-    expect(decide('/?tab=1', ADMIN_ORIGIN)).toEqual({ action: 'redirect', url: `${USER_BASE}#/?tab=1` });
+    expect(decide('/?tab=1', ADMIN_ORIGIN)).toEqual({ action: 'redirect', url: `${ADMIN_ORIGIN}#/admin/users` });
   });
 
   it('`pathOf` 剥 `?` 与 `#`，取最先出现的那个', () => {
@@ -254,7 +258,7 @@ describe('#450 A2 hostGate：同一 hostname 的不同端口/协议算同一个�
 
   it('管理台 host 上（无论哪个端口形态）判成管理台：`/admin*` allow、其它回用户面', () => {
     expect(decide('/admin/users', ADMIN_ORIGIN)).toEqual({ action: 'allow' });
-    expect(decide('/', ADMIN_ORIGIN)).toEqual({ action: 'redirect', url: `${USER_BASE}#/` });
+    expect(decide('/', ADMIN_ORIGIN)).toEqual({ action: 'redirect', url: `${ADMIN_ORIGIN}#/admin/users` });
   });
 
   it('陌生 hostname 仍 fail-open（不替用户换地址）', () => {
