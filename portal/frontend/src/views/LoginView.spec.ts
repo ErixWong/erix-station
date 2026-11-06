@@ -524,3 +524,51 @@ describe('LoginView 管理台入口拒绝非管理员（真机环回归）', () 
     expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(false);
   });
 });
+
+// 2026-11-06（真机蹦极，用户报「8443 登录进去在 admin console 来回跳」）：
+// **无工位管理员**（role=admin + fde_name 空）在用户面登录 ⇒ 他在这里没有任何可用功能（#332 会把
+// 每条工作台路径改写到管理台），而两个 host 的会话互不相通 ⇒ 让他登录成功再跳过去 = 登录两次 +
+// 两个入口之间来回。修法：直接说清「去管理台登录」并撤掉这个用不上的会话。
+describe('LoginView 用户面拒绝无工位管理员（真机蹦极回归）', () => {
+  const SITE = { userBaseUrl: 'http://station.fde.erix.vip:8090', adminBaseUrl: 'https://admin.fde.erix.vip:9443' };
+  const SEATLESS_ADMIN = { ...ADMIN_USER, fde_name: null };
+  const ADMIN_WITH_SEAT = { ...ADMIN_USER, fde_name: 'ops' };
+
+  async function withHostname<T>(hostname: string, fn: () => Promise<T>): Promise<T> {
+    const original = window.location;
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...original, hostname } });
+    try { return await fn(); } finally { Object.defineProperty(window, 'location', { configurable: true, value: original }); }
+  }
+
+  async function loginAs(user: AuthUser) {
+    vi.stubGlobal('fetch', fetchMock((url) => {
+      if (url.includes('/api/site')) return jsonResponse(200, SITE);
+      if (url.includes('/api/auth/login')) return jsonResponse(200, { status: 'authenticated', user });
+      if (url.includes('/api/auth/logout')) return jsonResponse(204, {});
+      return jsonResponse(404, {});
+    }));
+    return withHostname('station.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      await wrapper.find('#loginName').setValue(user.login);
+      await wrapper.find('#loginPass').setValue('pw');
+      await wrapper.find('form').trigger('submit.prevent');
+      await flushPromises();
+      return wrapper;
+    });
+  }
+
+  it('用户面 + 无工位管理员 ⇒ 提示 + 指向管理台的链接 + **不跳转**', async () => {
+    const wrapper = await loginAs(SEATLESS_ADMIN);
+    const err = wrapper.find('[data-test="login-entry-role-error"]');
+    expect(err.exists()).toBe(true);
+    expect(err.text()).toContain('没有工位');
+    expect(err.find('a').attributes('href')).toBe(SITE.adminBaseUrl);
+    expect(wrapper.find('#loginName').exists()).toBe(true); // 仍停在登录页
+  });
+
+  it('用户面 + **有工位**的管理员 ⇒ 不拦（他确实能用工位）', async () => {
+    const wrapper = await loginAs(ADMIN_WITH_SEAT);
+    expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(false);
+  });
+});

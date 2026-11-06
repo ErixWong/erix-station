@@ -113,7 +113,10 @@ describe('Admin console routing and layout', () => {
     expect(router.currentRoute.value.path).toBe('/admin/users');
     expect(wrapper.get('h1').text()).toBe('FDE Station 管理台');
     expect(wrapper.get('header').text()).toContain('root（admin）');
-    expect(wrapper.get('header').text()).toContain('返回工作台');
+    // 2026-11-06 变更（真机蹦极）：本夹具的 root 是**无工位**管理员（`fde_name: null`），
+    // 而「返回工作台」对没有工作台的人是个死链接（点过去 ⇒ #332 改写回管理台 ⇒ 跨 host 丢会话）。
+    // 所以这条从 `toContain` 翻成 `not.toContain`；有工位的情形由 AdminLayout.spec.ts 正向钉住。
+    expect(wrapper.get('header').text()).not.toContain('返回工作台');
     expect(wrapper.get('header').text()).toContain('登出');
     expect(wrapper.find('a[aria-current="page"]').text()).toBe('用户管理');
     wrapper.unmount();

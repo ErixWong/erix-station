@@ -18,6 +18,11 @@ const site = useSiteStore();
 // 拿不到 site 信息（fail-open）时退回相对 hash `#/`：同 origin 的 hash 链接，行为与改动前完全一致
 // （host 闸自己会在下一次导航里决定要不要换 host）。
 const backToWorkbenchHref = computed(() => hashUrl(site.info?.userBaseUrl, '/') ?? '#/');
+// 2026-11-06（真机蹦极）：**没有工位的管理员（#332 第①类人）不该看到这个链接**。
+// 他点过去 ⇒ 用户面 `#/` ⇒ workbenchGate 改写 `/admin/users` ⇒ 跨 host 送回管理台 ⇒
+// 而两个 host 的登录 cookie 互不相通（host-only，`#6`）⇒ 送回去就是登录页 ⇒ 登录完又只能点回来。
+// 「Back to workbench」对一个没有工作台的人本来就是空承诺。
+const hasWorkbench = computed(() => !!auth.user?.fde_name);
 
 const who = computed(() => {
   const user = auth.user;
@@ -52,7 +57,7 @@ async function onLogout() {
     <header class="flex items-center gap-3 border-b border-black/10 px-3 py-2">
       <h1 class="text-xl font-medium mb-0">{{ t('admin.title') }}</h1>
       <span class="flex-1 text-black/50 text-sm">{{ who }}</span>
-      <a data-test="back-to-workbench" :href="backToWorkbenchHref" class="text-sm underline">{{ t('admin.backToWorkbench') }}</a>
+      <a v-if="hasWorkbench" data-test="back-to-workbench" :href="backToWorkbenchHref" class="text-sm underline">{{ t('admin.backToWorkbench') }}</a>
       <button
         class="rounded-md border border-black/20 text-sm px-2.5 py-1 hover:bg-black/5"
         @click="onLogout"

@@ -32,6 +32,7 @@ const isAdminEntry = computed(() => {
   }
 });
 const userEntryUrl = computed(() => (typeof site.info?.userBaseUrl === 'string' ? site.info.userBaseUrl : null));
+const adminEntryUrl = computed(() => (typeof site.info?.adminBaseUrl === 'string' ? site.info.adminBaseUrl : null));
 void site.ensureSite();
 
 // 2026-11-06（真机环）：**管理台入口只接受管理员**。
@@ -40,12 +41,25 @@ void site.ensureSite();
 // 「登录成功却用不了」的来回重定向。这里直接拦住并说清楚，而不是把人送进那个环。
 const entryRoleError = ref('');
 async function guardEntryRole(): Promise<boolean> {
-  if (!isAdminEntry.value || !auth.user) return true;
-  if (auth.user.role === 'admin') return true;
-  const message = t('login.adminEntryFdeOnly');
-  await auth.logout();          // 清本地态（管理台 host 上那个会话对用户面无效，留着只会再触发跳转）
-  entryRoleError.value = message; // logout 之后设，免得被它清掉
-  return false;
+  if (!auth.user) return true;
+  // ① 管理台入口：只接受管理员（否则会话种在管理台 host，而 FDE 落地页在用户面 ⇒ 立刻 401 被踢回）。
+  if (isAdminEntry.value) {
+    if (auth.user.role === 'admin') return true;
+    const message = t('login.adminEntryFdeOnly');
+    await auth.logout();          // 清本地态（管理台 host 上那个会话对用户面无效，留着只会再触发跳转）
+    entryRoleError.value = message; // logout 之后设，免得被它清掉
+    return false;
+  }
+  // ② 用户面：**没有工位的管理员**在这里没有任何可用功能（#332 会把每条工作台路径都改写到管理台），
+  //   而两个 host 的会话互不相通 ⇒ 让他登录成功再跳过去，等于让他登录两次、还要在两个入口之间来回。
+  //   直接说清楚「去管理台登录」，并把这个用不上的会话撤掉。
+  if (auth.user.role === 'admin' && !auth.user.fde_name) {
+    const message = t('login.workbenchEntrySeatlessAdmin');
+    await auth.logout();
+    entryRoleError.value = message;
+    return false;
+  }
+  return true;
 }
 
 // 登录守卫携带的 redirect 回跳（如未登录访问 /session/<id> 深链）；仅允许站内路径。
@@ -151,7 +165,10 @@ onUnmounted(stopCooldownTicker);
           {{ t('login.adminEntryNotice') }}
           <a v-if="userEntryUrl" :href="userEntryUrl" class="underline hover:text-black">{{ t('login.adminEntryWorkbench') }}</a>
         </p>
-        <p v-if="entryRoleError" data-test="login-entry-role-error" class="syserr mb-3 text-xs" role="alert">{{ entryRoleError }}</p>
+        <p v-if="entryRoleError" data-test="login-entry-role-error" class="syserr mb-3 text-xs" role="alert">
+          {{ entryRoleError }}
+          <a v-if="!isAdminEntry && adminEntryUrl" :href="adminEntryUrl" class="underline">{{ t('login.goToAdminConsole') }}</a>
+        </p>
 
         <!-- 第一步：login + password -->
         <form v-if="!auth.pendingToken" @submit.prevent="onLoginSubmit">
