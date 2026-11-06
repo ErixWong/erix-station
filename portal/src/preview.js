@@ -339,7 +339,9 @@ export async function authorizeForwardAuth(pool, config, { hostname, hostHeader 
  * 签发一次性预览 ticket（portal.md §2.8）。返回 { ticket, url, expires_in } 或 { error }。
  * 可见性：private → owner/admin；org-visible/public → 任意已认证用户；他人资源 404（不泄露存在性）。
  */
-export async function issuePreviewTicket(pool, config, { allocationId, session, ip = null, ua = null, now = new Date() } = {}) {
+export async function issuePreviewTicket(pool, config, {
+  allocationId, session, ip = null, ua = null, now = new Date(), publicBaseUrl = null,
+} = {}) {
   const r = await pool.query(
     `SELECT id, fde_id, state, exposure, hostname, url FROM port_allocations WHERE id = $1`,
     [allocationId],
@@ -371,10 +373,15 @@ export async function issuePreviewTicket(pool, config, { allocationId, session, 
   );
 
   // 预览 URL 的 scheme/端口按**公开入口**派生（#57 阶段2，dev http:8090 / 生产 https 同一代码路径）：
-  // 有 hostname 时用 projects.previewUrl(hostname, { publicBaseUrl: config.portalPublicBaseUrl }) 生成；
+  // 有 hostname 时用 projects.previewUrl(hostname, { publicBaseUrl }) 生成；
   // 无 hostname（存量旧形 / 测试桩）时回退库内 url，行为与旧口径一致。
+  //
+  // `publicBaseUrl` 优先取**调用方按当前请求推导**的值（#450 用户面 HTTPS 8443）：用户面同时有
+  // `http://…:8090` 与 `https://…:8443`，而 `config.portalPublicBaseUrl` 只有一个。若 https 页面里
+  // 拿到 `http://…:8090` 的预览地址，浏览器会把页内 fetch 判成 mixed content 直接拦掉（顶层导航也会
+  // 掉进「不安全」页）。调用方没给（测试桩 / 无协议头）⇒ 退回配置，旧行为逐字不变。
   const base = allocation.hostname
-    ? projects.previewUrl(allocation.hostname, { publicBaseUrl: config?.portalPublicBaseUrl ?? null })
+    ? projects.previewUrl(allocation.hostname, { publicBaseUrl: publicBaseUrl ?? config?.portalPublicBaseUrl ?? null })
     : allocation.url;
 
   return {

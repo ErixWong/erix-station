@@ -3408,6 +3408,28 @@ async function handleForwardAuth(req, res, ctx) {
 }
 
 /** 签发一次性预览 ticket（portal.md §2.8）。 */
+/**
+ * 按**当前请求**推导「预览 URL 该用哪个 scheme/端口」（#450 用户面 HTTPS 8443）。
+ *
+ * 为什么必须跟随请求：用户面有两个入口（`web` 8090 http / `websecure` 8443 https），预览 host 也挂了
+ * 同一对入口。若 https 页面里拿到 `http://<host>:8090` 的预览地址，页内 fetch 会被浏览器按 mixed content
+ * 直接拦掉（顶层导航也会掉进「不安全」页）—— 那不是配错，是两个入口共用一个 `PUBLIC_BASE_URL` 的必然结果。
+ *
+ * 判据只用 Traefik 注入的头（`X-Forwarded-Proto` / `Host` 的端口部分）：
+ *  · 没有 `X-Forwarded-Proto`（直连 portal、测试桩）⇒ 返回 `null` ⇒ 调用方退回配置（旧行为逐字不变）；
+ *  · 端口缺失（生产 443/80 默认端口）⇒ 不带端口（`URL.port` 对默认端口本就返回空串，口径一致）。
+ */
+function previewPublicBaseFromRequest(req) {
+  const pick = (v) => (typeof v === 'string' ? v.split(',')[0].trim() : '');
+  const proto = pick(req.headers['x-forwarded-proto']);
+  if (proto !== 'http' && proto !== 'https') return null;
+  const host = pick(req.headers['x-forwarded-host']) || pick(req.headers.host);
+  const forwardedPort = pick(req.headers['x-forwarded-port']);
+  const hostPort = /:\d+$/.test(host) ? host.slice(host.lastIndexOf(':') + 1) : '';
+  const port = forwardedPort || hostPort;
+  return port ? `${proto}://preview.invalid:${port}` : `${proto}://preview.invalid`;
+}
+
 async function handlePreviewTicket(req, res, ctx, portId) {
   const session = await requireSession(req, ctx);
   requireJson(req);
@@ -3428,6 +3450,7 @@ async function handlePreviewTicket(req, res, ctx, portId) {
     session,
     ip,
     ua: req.headers['user-agent'] ?? null,
+    publicBaseUrl: previewPublicBaseFromRequest(req),
   });
   if (result.error) {
     const { status, code } = result.error;
@@ -3534,11 +3557,12 @@ async function handleBatchPreviewTickets(req, res, ctx) {
   // ④ 逐张签发（同一 `now` ⇒ 整批同一个 expires_at，响应里不用为每张票各算一次 TTL）。
   const now = new Date();
   const ua = req.headers['user-agent'] ?? null;
+  const publicBaseUrl = previewPublicBaseFromRequest(req);
   const issued = [];
   try {
     for (const target of targets) {
       const result = await preview.issuePreviewTicket(ctx.pool, ctx.config, {
-        allocationId: target.id, session, ip, ua, now,
+        allocationId: target.id, session, ip, ua, now, publicBaseUrl,
       });
       if (result.error) {
         const { status, code } = result.error;
