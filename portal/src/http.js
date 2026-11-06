@@ -1390,6 +1390,18 @@ async function handleAdminApi(req, res, ctx, url) {
     if (action === null && req.method === 'PATCH') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // 2026-11-06：打开「邮件验证码」开关前必须确认 SMTP 真能用。
+      // 全局 `transport` 不再是功能闸（per-user 开关说了算），所以「开关开着但发不出信」会变成
+      // 「这个人登不进去」——在保存这一刻拦住，比让他到登录页才发现便宜得多。
+      // 关掉开关 / 改别的字段不受影响（不碰 mailer，避免通道抖动时连资料都改不了）。
+      if (body && typeof body === 'object' && body.mail_otp_enabled === true) {
+        const mailer = await ctx.mailerProvider.get();
+        if (mailer.enabled !== true) {
+          throw new HttpError(400, 'validation_failed',
+            '邮件通道未配置或不可用，无法为该用户启用邮件验证码（请先在「邮件通道」里配置并测试）',
+            { details: { field: 'mail_otp_enabled' } });
+        }
+      }
       return sendJson(res, 200, await admin.updateUser(ctx.pool, userId, body, { actorId: session.user.id }));
     }
     if (action === null && req.method === 'DELETE') {
@@ -2832,12 +2844,20 @@ async function handleLoginStep1(req, res, ctx) {
   //   ② 未注册 + 邮件通道启用 + 有邮箱 → email_code_required
   //   ③ 未注册 + 邮件通道启用 + 无邮箱 → 409 email_not_registered（**绝不静默退回口令**）
   //   ④ 邮件通道未启用（默认）  → 口令直通，但审计 method 标明「没有第二因素」
+  const mailer = await ctx.mailerProvider.get();
   const secondFactor = loginEmailCode.chooseSecondFactor({
     hasTotpEnrollment: await auth.hasTotpEnrollment(pool, result.user.id),
-    // 邮件通道是否启用 = DB 配置 + 急停开关的结果（`mail-provider.js`，60s 缓存）；读失败降级为 disabled。
-    mailEnabled: (await ctx.mailerProvider.get()).enabled,
+    // 2026-11-06：**唯一**判据是 per-user 开关（迁移 0028）。全局 `transport` 只是 SMTP 连接配置，
+    // 不再一票否决 —— 否则「管理员打开了开关、界面显示已启用、实际永远走口令」是必然的死光纤。
+    mailOtpEnabled: result.mailOtpEnabled === true,
     email: result.email,
   });
+  // 开关开着但 SMTP 没配 / 不可用 ⇒ **明确报错，绝不静默降级到口令**（静默降级是安全洞：
+  // 用户以为自己过了第二因素，其实只是口令）。这是「全局 disabled 不再是功能闸」的代价，必须显式化。
+  if (secondFactor === 'email_code_required' && mailer.enabled !== true) {
+    throw new HttpError(503, 'email_channel_unavailable',
+      '该账号要求邮件验证码，但邮件通道未配置或不可用，请联系管理员', { retryable: false });
+  }
 
   if (secondFactor === 'email_not_registered') {
     // 邮件通道开着却没有邮箱 = 第二因素做不成。让人去找管理员补录，不给他「反正能进」的错觉。

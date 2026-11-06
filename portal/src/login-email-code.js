@@ -216,9 +216,15 @@ export async function invalidateOtherCodes(pool, { pendingTokenHash, keepCodeHas
  *   `email_not_registered`             未注册 TOTP + 邮件通道启用 + **无邮箱** ⇒ 409，绝不静默退回口令
  *   `password_direct_no_second_factor` 邮件通道未启用（默认形态）⇒ 口令直通（审计 method 标明没有第二因素）
  */
-export function chooseSecondFactor({ hasTotpEnrollment, mailEnabled, email } = {}) {
+export function chooseSecondFactor({ hasTotpEnrollment, mailOtpEnabled, email } = {}) {
+  // ① TOTP 最强，且现状如此：绑了就一定走它（per-user 邮件开关不影响这条）。
   if (hasTotpEnrollment === true) return 'totp_required';
-  if (mailEnabled !== true) return 'password_direct_no_second_factor';
+  // ② per-user 开关（迁移 0028，管理员在 Edit → Security 里设，默认 false = 不启用）。
+  //    **这是唯一的「用不用邮件码」判据**（2026-11-06 用户拍板）：全局 `transport` 只是 SMTP 连接配置，
+  //    不再是功能闸。原来的 `mailEnabled` 一票否决会让这个开关变成死光纤 —— 管理员打开它、
+  //    界面显示已启用、而实际永远走口令直通，没有任何信号。
+  if (mailOtpEnabled !== true) return 'password_direct_no_second_factor';
   if (typeof email === 'string' && email.trim() !== '') return 'email_code_required';
+  // ③ 开了开关却没邮箱：保存时已被 admin.js 的交叉防护拒掉；走到这里说明是历史数据 / 带外改库。
   return 'email_not_registered';
 }

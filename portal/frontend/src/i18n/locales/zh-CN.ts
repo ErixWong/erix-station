@@ -915,6 +915,15 @@ export const zhCN = {
     },
     // FDE 用户区（AdminView #fdeSection）
     fde: {
+    mailOtpSection: '邮件验证码',
+    mailOtpHint: '为该用户启用邮箱验证码作为第二因素。这是按用户的开关，与 TOTP 并列；邮件通道（SMTP）只决定「能不能发信」。',
+    mailOtpEnabledLabel: '登录时要求邮箱验证码',
+    mailOtpEnabledHint: '关闭时该用户只用口令登录（没有第二因素）。已绑定 TOTP 的账号始终走 TOTP，此项不生效。',
+    mailOtpHiddenByTotp: '该账号已绑定 TOTP —— 登录会走 TOTP，本开关不影响。',
+    mailOtpCurrentEmail: '验证码将发到：{email}',
+    mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
+    mailOtpSaved: '邮件验证码设置已保存。',
+    saveMailOtp: '保存邮件验证码设置',
       sectionTitle: 'FDE 用户',
       emptyUsers: '暂无用户。',
       noFdeName: '无 fde_name',
