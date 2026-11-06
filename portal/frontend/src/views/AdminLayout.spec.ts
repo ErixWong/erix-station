@@ -174,3 +174,34 @@ describe('AdminLayout「← 返回工作台」（#450 A2：跨 host 绝对地址
     expect(link().text()).toBe('← 返回工作台');
   });
 });
+
+// 2026-11-06（真机蹦极）：无工位管理员不该看到「Back to workbench」——点过去必被打回管理台，
+// 而两个 host 的登录 cookie 互不相通 ⇒ 只会让他登录两次、在两个入口之间来回。
+describe('AdminLayout：Back to workbench 只给**有工位**的人', () => {
+  async function mountWith(user: Record<string, unknown>) {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
+    const auth = useAuthStore();
+    auth.user = user as never;
+    auth.ready = true;
+    useSiteStore().info = {
+      userBaseUrl: 'http://station.example.test:8090',
+      adminBaseUrl: 'https://admin.example.test:9443',
+    };
+    const router = makeRouter();
+    router.push('/');
+    await router.isReady();
+    return mount(AdminLayout, { global: { plugins: [router, i18n] } });
+  }
+
+  it('无工位管理员（fde_name 空）⇒ 不渲染该链接', async () => {
+    const wrapper = await mountWith({ ...ADMIN_WITH_SEAT, fde_name: null });
+    expect(wrapper.find('[data-test="back-to-workbench"]').exists()).toBe(false);
+  });
+
+  it('有工位的管理员 ⇒ 渲染，且 href 是 userBaseUrl 的绝对地址（跨 host）', async () => {
+    const wrapper = await mountWith(ADMIN_WITH_SEAT);
+    const link = wrapper.find('[data-test="back-to-workbench"]');
+    expect(link.exists()).toBe(true);
+    expect(link.attributes('href')).toBe('http://station.example.test:8090#/');
+  });
+});

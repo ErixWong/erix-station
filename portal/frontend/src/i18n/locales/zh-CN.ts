@@ -46,6 +46,11 @@ export const zhCN = {
   // 登录页（views/LoginView.vue）——覆盖该视图全部用户可见文案。
   // 注意：登录失败/校验失败的提示来自服务端 error.message（auth store 原样透传），不在前端翻译范围内。
   login: {
+    workbenchEntrySeatlessAdmin: '这个账号是没有工位的平台管理员，工作台没有可用功能。请到管理台登录。',
+    goToAdminConsole: '前往管理台 →',
+    adminEntryFdeOnly: '当前账号不是管理员，不能在这里登录。请用上面的工作台链接到 FDE 工作台登录。',
+    adminEntryNotice: '这是管理台入口，仅供管理员使用。两个入口的登录状态互不相通（安全隔离），需要在各自入口分别登录。',
+    adminEntryWorkbench: '前往 FDE 工作台 →',
     title: 'FDE Station 登录',
     loginName: '登录名',
     password: '口令',

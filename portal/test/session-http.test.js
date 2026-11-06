@@ -102,7 +102,7 @@ class SessionSsePool extends FakePool {
   }
 }
 
-async function startServer() {
+async function startServer(configOverrides = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-sse-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   const config = {
@@ -120,6 +120,7 @@ async function startServer() {
     maxLoginLength: 128,
     maxPasswordLength: 256,
     staticDir,
+    ...configOverrides,
   };
   const pool = new SessionSsePool();
   const server = createServer({ pool, config });
@@ -401,6 +402,58 @@ test('#236 统一闸：同一放宽对其它 JSON 端点（POST /ai-title）同�
     // GET 从来不经过 requireJson（本次零改动）
     const me = await fetch(`${s.base}/api/me`, { headers: { Cookie: s.cookieHeader } });
     assert.equal(me.status, 200);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 2026-11-06（真机）：`/api/site` 的 `userBaseUrl` 必须**跟随请求入口**。
+// 病根：用户面有 `http://…:8090` 与 `https://…:8443` 两个入口，而配置里只有一个 PUBLIC_BASE_URL
+// ⇒ 从 https 进来却被告知「用户面在 http:8090」，于是「回工作台」把人从 https 送回 http。
+// 判据：① 用户面 host 上的请求 ⇒ 跟随；② 管理台 host 来问 ⇒ 仍报配置值（它不知道用户平时用哪个入口）；
+//      ③ 没有 X-Forwarded-Proto（直连/测试桩）⇒ 配置值（旧行为逐字不变）。
+// ⚠ 用 node:http 手工发（`fetch` 不允许设 `Host` 头 —— AGENTS §8.31 那条坑）。
+// ---------------------------------------------------------------------------
+function getSiteWithHeaders(base, headers) {
+  return new Promise((resolve, reject) => {
+    const u = new URL('/api/site', base);
+    const req = http.request(
+      { hostname: u.hostname, port: u.port, path: u.pathname, method: 'GET', headers },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('/api/site：userBaseUrl 跟随请求入口（用户面 host）／管理台 host 仍报配置', async () => {
+  const configured = 'http://station.fde.erix.vip:8090';
+  const admin = 'https://admin.fde.erix.vip:9443';
+  const s = await startServer({ portalPublicBaseUrl: configured, adminPublicBaseUrl: admin });
+  try {
+    const cfgHost = new URL(configured).hostname;
+
+    const viaHttps = await getSiteWithHeaders(s.base, { 'x-forwarded-proto': 'https', host: `${cfgHost}:8443` });
+    assert.equal(viaHttps.status, 200);
+    assert.equal(viaHttps.body.userBaseUrl, `https://${cfgHost}:8443`, 'https 入口 ⇒ 报 https（不再把人送回 http）');
+    assert.equal(viaHttps.body.adminBaseUrl, admin, '管理台地址不跟随');
+
+    const viaHttp = await getSiteWithHeaders(s.base, { 'x-forwarded-proto': 'http', host: `${cfgHost}:8090` });
+    assert.equal(viaHttp.body.userBaseUrl, `http://${cfgHost}:8090`, 'http 入口 ⇒ 旧行为不变');
+
+    const fromAdmin = await getSiteWithHeaders(s.base, { 'x-forwarded-proto': 'https', host: 'admin.fde.erix.vip:9443' });
+    assert.equal(fromAdmin.body.userBaseUrl, configured, '管理台 host 来问 ⇒ 报配置值（不拿管理台 host 去拼用户面 URL）');
+
+    const noProto = await getSiteWithHeaders(s.base, { host: `${cfgHost}:8090` });
+    assert.equal(noProto.body.userBaseUrl, configured, '无 X-Forwarded-Proto ⇒ 配置值（不猜）');
   } finally {
     await s.close();
   }

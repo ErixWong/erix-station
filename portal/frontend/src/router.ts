@@ -13,7 +13,7 @@ import { FORCE_PASSWORD_PATH, createRedirectBudget, restrictedNavigationDecision
 // #332：工作台准入闸（admin 且无 fde_name ⇒ 送管理台）。判据本体在 lib/workbenchGate.ts，这里只接线。
 import { workbenchGateDecision } from './lib/workbenchGate';
 // #450 A2：host 闸（在错的 host 上就跳到对的 host）。判据本体在 lib/hostGate.ts，这里只接线。
-import { hostGateDecision } from './lib/hostGate';
+import { hashUrl, hostGateDecision } from './lib/hostGate';
 import { setRestrictedSessionListener } from './lib/restrictedSession';
 
 // #255 强制改密屏的路径：唯一真相在 lib/forcePasswordGuard.ts（守卫判据与它同处）。
@@ -100,6 +100,60 @@ export interface RouterDeps {
   currentOrigin?: () => string;
 }
 
+/**
+ * 跨 host 跳转熔断（2026-11-06）。
+ *
+ * 为什么需要它：`hostGate` 的每一跳单看都合法，但**两个 host 的登录 cookie 是 host-only ⇒ 可以是不同账号**
+ * （8443=admin、9443=eric 是真实状态），于是「各自把自己认为不该在这里的路径送走」会互相撞成一个环。
+ * 根因已在 `hostGate.ts` 修掉（管理台 host 不再跨 host 跳转），这里是**与具体路径无关的上界**：
+ * 10 秒窗口内超过 3 次跨 host 跳转就停住 + console.error（诊断能截图给运维）。
+ *
+ * 存 `sessionStorage` 的理由：跨 host 是**整页导航**，内存变量会清零；而 sessionStorage 按 tab 保留。
+ * 拿不到（隐私模式 / 被禁）⇒ fail-open，不拦（宁可多跳，也不要因为存储不可用而白屏）。
+ */
+const HOST_HOP_KEY = 'station.hostGate.hops';
+const HOST_HOP_LIMIT = 3;
+const HOST_HOP_WINDOW_MS = 10_000;
+
+/** `scheme://host[:port]` 的 hostname（解析失败 ⇒ null）。判「我在哪个面」用它（与 hostGate 同口径）。 */
+function hostnameOf(value: string): string | null {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/** `url` 与 `origin` 是否同源（用 URL 解析比，不做字符串前缀比较——443 与显式端口是同一 origin）。 */
+function sameOriginAs(url: string, origin: string): boolean {
+  try {
+    return new URL(url).origin === new URL(origin).origin;
+  } catch {
+    return false;
+  }
+}
+
+function allowHostHop(now = Date.now()): boolean {
+  try {
+    const raw = sessionStorage.getItem(HOST_HOP_KEY);
+    const prev = raw ? JSON.parse(raw) : null;
+    const inWindow = prev && typeof prev.at === 'number' && now - prev.at < HOST_HOP_WINDOW_MS;
+    const n = inWindow ? prev.n + 1 : 1;
+    sessionStorage.setItem(HOST_HOP_KEY, JSON.stringify({ n, at: now }));
+    return n <= HOST_HOP_LIMIT;
+  } catch {
+    return true;
+  }
+}
+
+function resetHostHopBudget(): void {
+  try {
+    sessionStorage.removeItem(HOST_HOP_KEY);
+  } catch {
+    /* 存储不可用：本来就没计数，无需复位 */
+  }
+}
+
 export function createAppRouter(
   history: RouterHistory = createWebHashHistory(),
   deps: RouterDeps = {},
@@ -133,6 +187,18 @@ export function createAppRouter(
     //  · `ensureSite()` **永不抛**：拿不到 `/api/site` ⇒ null ⇒ 判据 fail-open（不跳）。
     //  · 命中 redirect 时用 `navigate`（= `window.location.replace`）换地址，并 **`return false` 终止本次导航**。
     //    ⚠ 绝不能 `return { path }`：那是「在**当前** origin 上继续导航」，而我们刚刚决定这个 origin 是错的。
+    // ⚠ 唯一例外：`/admin*` 的跨 host 决策**需要登录态**——「未登录 / 非管理员访管理台」应当**留在本 host**
+    // 处理（跨 host 登录必然丢会话：cookie host-only ⇒ 送过去、登进去、再被踢回来的环，2026-11-06 真机复现）。
+    // 只有这条路径值得多花一次 `/api/me`；其它路径仍保持「先判 host、不白跑」的既有口径。
+    const auth = useAuthStore();
+    const adminTarget = to.path.startsWith('/admin');
+    if (adminTarget && !auth.ready) {
+      try {
+        await auth.ensureMe();
+      } catch {
+        auth.user = null;
+      }
+    }
     const siteInfo = await useSiteStore().ensureSite();
     const hostGate = hostGateDecision({
       currentOrigin: currentOrigin(),
@@ -142,16 +208,70 @@ export function createAppRouter(
       toPath: to.fullPath,
     });
     if (hostGate.action === 'redirect') {
+      // 跨 host 跳转熔断（2026-11-06 真机「8443 ↔ 9443 疯狂跳转」的兜底）。
+      // 任何单侧判据都可能自洽却互相对撞（两个 host 的会话可以是不同账号），所以除了修根因，
+      // 还要有一条**与具体路径无关**的上界：10 秒内跨 host 跳转超过 3 次 ⇒ 停住并留诊断。
+      // 判据用 sessionStorage（同一 tab 内跨整页导航仍在），拿不到就 fail-open（不拦）。
+      if (!allowHostHop()) {
+        console.error('[router] host 闸跳转熔断：10s 内已跨 host 跳转 3 次，停在当前页', {
+          from: currentOrigin(),
+          to: hostGate.url,
+          path: to.fullPath,
+        });
+        return false;
+      }
+      // ① 未登录 + 目标是管理路径 ⇒ 就在**本 host** 登录（登录后是管理员再跨过去）。
+      if (adminTarget && !auth.user) return { path: '/login', query: { redirect: to.fullPath } };
+      // ② 已登录但**不是管理员** + 管理路径 ⇒ 回工作台（不把人送去一个他进不去的入口）。
+      if (adminTarget && auth.user && auth.user.role !== 'admin') return { path: '/' };
+      // 同 host 改道（如管理台 host 的 `/` ⇒ `/admin/users`）走 **hash 内导航**，不整页重载：
+      // 跨 host 才需要 `window.location.replace`（那是换 origin 的唯一办法）。
+      // 判据用 `new URL().origin`（443 与显式端口的等价性靠它，不靠字符串前缀）。
+      const sameHost = sameOriginAs(hostGate.url, currentOrigin());
+      if (sameHost) {
+        const target = new URL(hostGate.url);
+        return { path: target.hash.replace(/^#/, '') || '/' };
+      }
       navigate(hostGate.url);
       return false;
     }
-    const auth = useAuthStore();
+    resetHostHopBudget();
     if (!auth.ready) {
       try {
         await auth.ensureMe();
       } catch {
         // /api/me 网络级失败：按未登录处理（登录页内重试语义更清晰）。
         auth.user = null;
+      }
+    }
+    // 「身份 × 入口」不符 ⇒ **就地登出**（2026-11-06 真机无限环的第二个来源）。
+    //
+    // 两个 host 的登录 cookie 是 host-only ⇒ 它们可以是**不同账号**。管理台上挂着一个 FDE 会话时：
+    // 每条 `/admin*` 都被 requiresRole 踢回 `/`，而 `/` 又被 hostGate 改道回 `/admin/users` ⇒ 环；
+    // 用户面上挂着一个无工位 admin 会话同理（`/` ⇄ `/admin/users`）。这类会话在本入口**毫无用处**
+    // （管理台入口对非 admin 的所有 API 都是 403/404），留着只会让守卫把它推来推去。
+    // 登出后 `auth.user` 变 null，下一跳就是干净的登录页，环自然断掉。
+    if (siteInfo && auth.user) {
+      const hereHost = hostnameOf(currentOrigin());
+      const adminHost = hostnameOf(siteInfo.adminBaseUrl);
+      const userHost = hostnameOf(siteInfo.userBaseUrl);
+      const onAdmin = !!(hereHost && adminHost && hereHost === adminHost);
+      const onUser = !!(hereHost && userHost && hereHost === userHost);
+      // ① 管理台上挂着非管理员会话 ⇒ 登出，停在登录页（他在管理台没有目的地，任何跳转都会成环）。
+      if (onAdmin && auth.user.role !== 'admin') {
+        await auth.logout();
+        return { path: '/login' };
+      }
+      // ② 用户面上挂着**无工位管理员**会话 ⇒ 登出后送去管理台（他唯一的入口，目标明确）。
+      //    先登出是必须的：不清掉用户面这份会话，管理台那边若挂着别人又会互相送回。
+      if (onUser && auth.user.role === 'admin' && !auth.user.fde_name) {
+        await auth.logout();
+        const adminTarget = hashUrl(siteInfo.adminBaseUrl, '/admin/users');
+        if (adminTarget !== null) {
+          navigate(adminTarget);
+          return false;
+        }
+        return { path: '/login' };
       }
     }
     // 受限态（服务端旗标）：除改密屏本身，其余一律拦回去。判据本体在 lib/forcePasswordGuard.ts

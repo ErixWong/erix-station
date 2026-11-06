@@ -9,6 +9,7 @@ import {
   hashUrl,
   hostGateDecision,
   isAdminPath,
+  pathOf,
 } from './hostGate';
 import { FORCE_PASSWORD_PATH } from './forcePasswordGuard';
 import { ADMIN_CONSOLE_PATH } from './workbenchGate';
@@ -42,11 +43,14 @@ describe('#450 A2 hostGate：矩阵六行（工单 §2 的表）', () => {
     expect(decide(CHANGE_PASSWORD_PATH, ADMIN_ORIGIN)).toEqual({ action: 'allow' });
   });
 
-  it('管理台 host + 其它（/、/session/*、未知路径）⇒ redirect 到 userBaseUrl#<toPath>', () => {
+  it('管理台 host + 其它（/、/session/*、未知路径）⇒ **同 host** 改写到 /admin/users（绝不跨 host）', () => {
+    // 2026-11-06：原来是 `${USER_ORIGIN}#${path}`（跨 host 回用户面），而两个 host 的会话可以是
+    // **不同账号** ⇒ 用户面又把 admin 路径送回来 ⇒ 无限环（真机标本）。现在一律同 host 改道，
+    // 用户想真的回工作台走顶栏那个显式 `<a href>`（整页导航，不过本闸）。
     for (const path of ['/', '/session/abc', '/whatever/else']) {
       expect(decide(path, ADMIN_ORIGIN)).toEqual({
         action: 'redirect',
-        url: `${USER_ORIGIN}#${path}`,
+        url: `${ADMIN_ORIGIN}#/admin/users`,
       });
     }
   });
@@ -102,8 +106,9 @@ describe('#450 A2 hostGate：端口 / 443 两形态（用 URL 比 origin，不�
       expect(hostGateDecision({ currentOrigin, userBaseUrl: USER_BASE, adminBaseUrl: base, toPath: '/admin/users' }))
         .toEqual({ action: 'allow' });
       // 反方向：443 管理台 host 上的会话深链 ⇒ 跳用户面（落点不带端口，与 base 同形）。
+      // 2026-11-06：管理台 host 的非 admin 路径**不再跨 host**（那是无限环的根因），同 host 改道。
       expect(hostGateDecision({ currentOrigin, userBaseUrl: USER_BASE, adminBaseUrl: base, toPath: '/session/x' }))
-        .toEqual({ action: 'redirect', url: `${USER_ORIGIN}#/session/x` });
+        .toEqual({ action: 'redirect', url: `${base.replace(/\/+$/, '')}#/admin/users` });
     }
   });
 
@@ -122,11 +127,12 @@ describe('#450 A2 hostGate：端口 / 443 两形态（用 URL 比 origin，不�
     })).toEqual({ action: 'allow' });
   });
 
-  it('同 host 但**未配置**的端口（admin.x:443 ≠ 配置里的 :9443）⇒ 判不出我是谁 ⇒ allow', () => {
-    // 取舍（写进报告的「规格未覆盖」一条）：本闸只在能**肯定**「我在用户面 / 我在管理台」时才换地址。
-    // `admin.x:443` 既不是配置里的管理台入口（9443）也不是用户面 ⇒ 属于「陌生 origin」⇒ 不替用户换地址
-    // （与 fail-open 同源：443 今天被别的服务占着，跳过去只会得到一个死地址）。
-    // 反过来说：**不能**把「同 host 不同端口」当成同一个 host —— 那会让 9443 与 443 互相认亲。
+  it('同 host 不同端口：按 **hostname** 判「我是谁」（2026-11-06 改：原来按 origin 全等）', () => {
+    // 口径变更（真机回归驱动）：用户面同时有 `http://station.<伞域>:8090` 与 `https://station.<伞域>:8443`，
+    // 而 `/api/site` 只给一个 `userBaseUrl`。按 origin 全等 ⇒ 8443 被判成「陌生 host」⇒ fail-open ⇒
+    // **管理台页面在用户面渲染出来**（`https://station...:8443/#/admin/users` 显示 Admin Console）。
+    // 现在的规则：**同一个 hostname 的不同端口/协议是同一个面**；陌生 hostname 仍 fail-open。
+    // 结果与旧断言一致（都 allow），但理由从「判不出我是谁」变成「我确实是管理台 host 上的管理路径」。
     expect(decide('/admin/users', 'https://admin.fde.erix.vip')).toEqual({ action: 'allow' });
     expect(decide('/admin/users', 'https://admin.fde.erix.vip:443')).toEqual({ action: 'allow' });
   });
@@ -136,7 +142,7 @@ describe('#450 A2 hostGate：深链保真（toPath 原样进 hash）', () => {
   it('`/session/<id>` 与 query 都不丢、不重编码', () => {
     expect(decide('/session/8f1c-2b?tab=diff&x=1', ADMIN_ORIGIN)).toEqual({
       action: 'redirect',
-      url: `${USER_ORIGIN}#/session/8f1c-2b?tab=diff&x=1`,
+      url: `${ADMIN_ORIGIN}#/admin/users`,
     });
     expect(decide('/admin/users?q=%E5%BC%A0%E4%B8%89', USER_ORIGIN)).toEqual({
       action: 'redirect',
@@ -181,5 +187,81 @@ describe('#450 A2 hostGate：与既有常量的同值契约（防漂移）', () 
   it('改密屏路径必须等于 forcePasswordGuard 的 FORCE_PASSWORD_PATH；管理台根等于 workbenchGate 的 ADMIN_CONSOLE_PATH', () => {
     expect(CHANGE_PASSWORD_PATH).toBe(FORCE_PASSWORD_PATH);
     expect(isAdminPath(ADMIN_CONSOLE_PATH)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-11-06 真机 bug：`toPath` 是 `to.fullPath`（**含 query**），矩阵里的精确比较会漏。
+// 症状：管理台未登录 ⇒ 守卫跳 `/login?redirect=/admin/users` ⇒ 旧判据不认 `/login`（因为多了 query）
+// ⇒ 踢回用户面 ⇒ 用户面登录后 cookie 在用户面 host（host-only）⇒ 回跳管理台仍 401 ⇒ **死循环**。
+// ---------------------------------------------------------------------------
+describe('#450 A2 hostGate：带 query 的 fullPath（真机死循环回归）', () => {
+  it('管理台 host + `/login?redirect=/admin/users` ⇒ allow（**不许**踢回用户面）', () => {
+    expect(decide('/login?redirect=/admin/users', ADMIN_ORIGIN)).toEqual({ action: 'allow' });
+    expect(decide('/login?redirect=%2Fadmin%2Fusers', ADMIN_ORIGIN)).toEqual({ action: 'allow' });
+    expect(decide('/login', ADMIN_ORIGIN)).toEqual({ action: 'allow' });
+  });
+
+  it('管理台 host + `/change-password?x=1` ⇒ allow（同一条剥 query 口径）', () => {
+    expect(decide(`${CHANGE_PASSWORD_PATH}?from=forced`, ADMIN_ORIGIN)).toEqual({ action: 'allow' });
+  });
+
+  it('`isAdminPath` 剥 query：`/admin?x=1`、`/admin/users?page=2` 都算管理路径', () => {
+    expect(isAdminPath('/admin?x=1')).toBe(true);
+    expect(isAdminPath('/admin/users?page=2')).toBe(true);
+    expect(isAdminPath('/adminx?x=1')).toBe(false);
+    // 用户面访 `/admin/users?page=2` ⇒ 仍要送去管理台（query 必须原样带过去）。
+    expect(decide('/admin/users?page=2', USER_ORIGIN)).toEqual({
+      action: 'redirect',
+      url: `${ADMIN_BASE}#/admin/users?page=2`,
+    });
+  });
+
+  it('管理台 host + 其它带 query 的路径 ⇒ 仍回用户面（剥 query 只影响命中判定，不放宽矩阵）', () => {
+    expect(decide('/session/abc?x=1', ADMIN_ORIGIN)).toEqual({
+      action: 'redirect',
+      url: `${ADMIN_ORIGIN}#/admin/users`,
+    });
+    expect(decide('/?tab=1', ADMIN_ORIGIN)).toEqual({ action: 'redirect', url: `${ADMIN_ORIGIN}#/admin/users` });
+  });
+
+  it('`pathOf` 剥 `?` 与 `#`，取最先出现的那个', () => {
+    expect(pathOf('/login')).toBe('/login');
+    expect(pathOf('/login?a=1')).toBe('/login');
+    expect(pathOf('/login#frag')).toBe('/login');
+    expect(pathOf('/a?b=1#c')).toBe('/a');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-11-06 真机 bug：用户面有两个 origin（`http://station.<伞域>:8090` 与 `https://station.<伞域>:8443`），
+// 而 `/api/site` 的 `userBaseUrl` 只有一个。用 **origin 全等**判「我在哪个面」⇒ 8443 被当成陌生 host
+// ⇒ fail-open ⇒ **管理台页面在用户面渲染出来**（`https://station...:8443/#/admin/users` 显示 Admin Console）。
+// 修法：「我是谁」按 hostname 判；「要不要跳」仍按 origin（防环那步不变）。
+// ---------------------------------------------------------------------------
+describe('#450 A2 hostGate：同一 hostname 的不同端口/协议算同一个面（8443 回归）', () => {
+  const USER_HTTPS = 'https://station.fde.erix.vip:8443';
+
+  it('用户面 https:8443 + `/admin/users` ⇒ 必须送去管理台（**不许**就地渲染）', () => {
+    expect(decide('/admin/users', USER_HTTPS)).toEqual({
+      action: 'redirect',
+      url: `${ADMIN_BASE}#/admin/users`,
+    });
+    expect(decide('/admin', USER_HTTPS)).toEqual({ action: 'redirect', url: `${ADMIN_BASE}#/admin` });
+  });
+
+  it('用户面 https:8443 + 普通路径 ⇒ allow（不跳）', () => {
+    expect(decide('/', USER_HTTPS)).toEqual({ action: 'allow' });
+    expect(decide('/session/abc', USER_HTTPS)).toEqual({ action: 'allow' });
+    expect(decide('/login', USER_HTTPS)).toEqual({ action: 'allow' });
+  });
+
+  it('管理台 host 上（无论哪个端口形态）判成管理台：`/admin*` allow、其它回用户面', () => {
+    expect(decide('/admin/users', ADMIN_ORIGIN)).toEqual({ action: 'allow' });
+    expect(decide('/', ADMIN_ORIGIN)).toEqual({ action: 'redirect', url: `${ADMIN_ORIGIN}#/admin/users` });
+  });
+
+  it('陌生 hostname 仍 fail-open（不替用户换地址）', () => {
+    expect(decide('/admin/users', 'https://someone-else.example.com')).toEqual({ action: 'allow' });
   });
 });

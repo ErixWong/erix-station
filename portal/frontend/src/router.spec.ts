@@ -378,18 +378,44 @@ describe('#450 A2 host 闸的守卫接线', () => {
       `期望 NAVIGATION_ABORTED（跳完就停），实际：${String(failure)}`,
     ).toBe(true);
     expect(router.currentRoute.value.path).not.toBe('/admin/users');
-    // host 闸排在 ensureMe 之前：跳转发生前只该打 /api/site，一趟 /api/me 都不该发。
-    expect(calls).toEqual(['/api/site']);
+    // 2026-11-06 变更：`/admin*` 的跨 host 决策**需要登录态**（未登录 / 非管理员不该被送进管理台——
+    // 跨 host 登录必然丢会话，会形成「送过去、登进去、再被踢回来」的环）。所以这条路径会先打一次
+    // `/api/me`。**其它路径仍然只打 `/api/site`**（见下面那条「非 admin 路径不白跑」的用例）。
+    expect(calls).toEqual(['/api/me', '/api/site']);
   });
 
-  it('管理台 host 上打开 #/session/x?tab=diff ⇒ 跳回用户面，深链与 query 原样保住', async () => {
+  it('用户 host + **未登录** + #/admin/users ⇒ 留在本 host 登录（不跨 host，跨过去必丢会话）', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 401, body: { error: { code: 'unauthenticated' } } } });
+    const { router, navigations } = await freshHostRouter(USER_ORIGIN);
+
+    await router.push('/admin/users');
+
+    expect(navigations).toEqual([]); // 一次都没换 host
+    expect(router.currentRoute.value.path).toBe('/login');
+    expect(router.currentRoute.value.query.redirect).toBe('/admin/users');
+  });
+
+  it('用户 host + **FDE 账号** + #/admin/users ⇒ 回工作台（不把人送去他进不去的入口）', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
+    const { router, navigations } = await freshHostRouter(USER_ORIGIN);
+
+    await router.push('/admin/users');
+
+    expect(navigations).toEqual([]);
+    expect(router.currentRoute.value.path).toBe('/');
+  });
+
+  it('管理台 host 上打开 #/session/x ⇒ **同 host** 改道 /admin/users（不跨 host —— 那是无限环的根因）', async () => {
+    // 2026-11-06 真机「8443 ↔ 9443 疯狂跳转」：管理台 host 的非 admin 路径原来会跨 host 回用户面，
+    // 而用户面又把 admin 路径送回来（两个 host 的会话可以是不同账号）⇒ 环。
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
     const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
 
-    const failure = await router.push('/session/abc?tab=diff');
+    await router.push('/session/abc?tab=diff');
 
-    expect(navigations).toEqual([`${USER_ORIGIN}#/session/abc?tab=diff`]);
-    expect(isNavigationFailure(failure, NavigationFailureType.aborted)).toBe(true);
+    expect(navigations, '一次都不许换 host').toEqual([]);
+    // 管理台上挂着 FDE 会话 ⇒ 守卫把它**登出**并停在登录页（他在管理台没有目的地，任何跳转都会成环）。
+    expect(router.currentRoute.value.path).toBe('/login');
   });
 
   it('site 不可用（5xx）⇒ 不跳，原导航继续（fail-open）', async () => {
@@ -422,17 +448,18 @@ describe('#450 A2 host 闸的守卫接线', () => {
     const { router, navigations } = await freshHostRouter(USER_ORIGIN);
 
     await router.push('/');
-    // workbenchGate 先把它改写去管理台（#332），路由表把 `/admin` 解析成 `/admin/users`，
-    // 然后 host 闸把「用户 host 上的 /admin/users」换成管理台的绝对地址。
+    // 2026-11-06：用户面上挂着**无工位管理员**会话 ⇒ 守卫先把它登出（不清就会与另一侧的会话互相送回），
+    // 再送去管理台 —— 目标仍然明确（他唯一的入口）。
     expect(navigations).toEqual([`${ADMIN_ORIGIN}#/admin/users`]);
   });
 
-  it('管理台 host 上 FDE 用户登录成功（落地 /）⇒ 跳回用户面（管理台不给 FDE 用，判据仍是 afterLoginRoute + host 闸）', async () => {
+  it('管理台 host 上 FDE 用户登录成功（落地 /）⇒ **登出 + 停在登录页**（不跨 host：那是环的一半）', async () => {
     stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
     const { router, navigations } = await freshHostRouter(ADMIN_ORIGIN);
 
     // LoginView 的 `router.replace(loginRedirect())`：FDE 的 afterLoginRoute 是 `/`。
     await router.push('/');
-    expect(navigations).toEqual([`${USER_ORIGIN}#/`]);
+    expect(navigations, '不跨 host').toEqual([]);
+    expect(router.currentRoute.value.path).toBe('/login');
   });
 });
