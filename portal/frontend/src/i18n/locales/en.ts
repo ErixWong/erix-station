@@ -31,6 +31,8 @@ export const en = {
     en: 'English',
   },
   login: {
+    workbenchEntrySeatlessAdmin: 'This is a platform administrator without a workstation — the workbench has nothing for it. Please sign in at the admin console.',
+    goToAdminConsole: 'Go to the admin console →',
     adminEntryFdeOnly: 'This account is not an administrator and cannot sign in here. Use the workbench link above.',
     adminEntryNotice: 'This is the admin console entry (administrators only). Sign-in state is not shared between the two entries (by design), so each entry needs its own sign-in.',
     adminEntryWorkbench: 'Go to the FDE workbench →',
