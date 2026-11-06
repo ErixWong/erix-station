@@ -133,6 +133,18 @@ export function createAppRouter(
     //  · `ensureSite()` **永不抛**：拿不到 `/api/site` ⇒ null ⇒ 判据 fail-open（不跳）。
     //  · 命中 redirect 时用 `navigate`（= `window.location.replace`）换地址，并 **`return false` 终止本次导航**。
     //    ⚠ 绝不能 `return { path }`：那是「在**当前** origin 上继续导航」，而我们刚刚决定这个 origin 是错的。
+    // ⚠ 唯一例外：`/admin*` 的跨 host 决策**需要登录态**——「未登录 / 非管理员访管理台」应当**留在本 host**
+    // 处理（跨 host 登录必然丢会话：cookie host-only ⇒ 送过去、登进去、再被踢回来的环，2026-11-06 真机复现）。
+    // 只有这条路径值得多花一次 `/api/me`；其它路径仍保持「先判 host、不白跑」的既有口径。
+    const auth = useAuthStore();
+    const adminTarget = to.path.startsWith('/admin');
+    if (adminTarget && !auth.ready) {
+      try {
+        await auth.ensureMe();
+      } catch {
+        auth.user = null;
+      }
+    }
     const siteInfo = await useSiteStore().ensureSite();
     const hostGate = hostGateDecision({
       currentOrigin: currentOrigin(),
@@ -142,10 +154,13 @@ export function createAppRouter(
       toPath: to.fullPath,
     });
     if (hostGate.action === 'redirect') {
+      // ① 未登录 + 目标是管理路径 ⇒ 就在**本 host** 登录（登录后是管理员再跨过去）。
+      if (adminTarget && !auth.user) return { path: '/login', query: { redirect: to.fullPath } };
+      // ② 已登录但**不是管理员** + 管理路径 ⇒ 回工作台（不把人送去一个他进不去的入口）。
+      if (adminTarget && auth.user && auth.user.role !== 'admin') return { path: '/' };
       navigate(hostGate.url);
       return false;
     }
-    const auth = useAuthStore();
     if (!auth.ready) {
       try {
         await auth.ensureMe();

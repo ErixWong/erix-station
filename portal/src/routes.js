@@ -150,6 +150,13 @@ export function generateTraefikConfig({
   adminHost = null,
   adminEntryPoint = null,
   adminIpAllowlist = [],
+  // 2026-11-06：用户面（工作台 + 预览 host）加 HTTPS 入口。缺省 null ⇒ **不生成**，老部署的
+  // routes.yml 字节不变（既有字节快照继续成立）。生产路径由 config.js 按 `TRAEFIK_SECURE_ENTRYPOINT`
+  // 决定：设了才挂（本机是 `websecure` = :8443，因为 443 被本机 nginx 占着）。
+  // ⚠ 只挂 **用户面** 两类 router：`portal`（SPA + /api/*）与预览 host。`internal`（agentd 的
+  // `/api/internal`，容器内经 http 直连）与 LLM 路由（容器内 http://station-litellm:4000）**不挂**——
+  // 给它们加 `tls: {}` 会让容器里的 http 请求当场失败。
+  secureEntryPoint = null,
 }) {
   // F9：渲染边界严格校验，拒绝换行/控制字符/非法字符（DB 无 CHECK，代码层挡）。
   if (!isValidHostname(portalHost)) throw new Error(`invalid portal hostname: ${JSON.stringify(portalHost)}`);
@@ -165,6 +172,8 @@ export function generateTraefikConfig({
   // entryPoint 裸拼进 entryPoints flow list（不加引号），须命中安全 token 白名单（F5 注入面收口）。
   assertSafeToken(entryPoint, 'entryPoint');
   assertHttpUrl(portalBackendUrl, 'portalBackendUrl');
+  const secure = typeof secureEntryPoint === 'string' && secureEntryPoint !== '' ? secureEntryPoint : null;
+  if (secure !== null) assertSafeToken(secure, 'secureEntryPoint');
   // #450：管理台入口/白名单同一口径校验（fail-closed：非法 host/entrypoint/CIDR 直接拒渲染，不落半截配置）。
   const adminEnabled = adminHost != null && adminHost !== '';
   if (adminEnabled) {
@@ -181,6 +190,18 @@ export function generateTraefikConfig({
   lines.push(`      rule: ${yq(`Host(\`${portalHost}\`)`)}`);
   lines.push('      priority: 100');
   lines.push('      service: portal');
+  // ⚠ 必须是**两个独立 router**，不能写成「一个 router 挂两个 entrypoint + tls」——真机实测
+  // （traefik v3.7.13，2026-11-06）：router 一旦带 `tls: {}`，它在**非 TLS entrypoint 上就不再匹配**
+  // （`web:8090` 直接回 Traefik 自己的 `404 page not found`，连 forwardAuth 都不走）。
+  // 症状是「https 通了、http 全挂」，而 http 是当前 FDE 的唯一入口 ⇒ 必须分两份。
+  if (secure !== null) {
+    lines.push('    portal-secure:');
+    lines.push(`      entryPoints: [${secure}]`);
+    lines.push(`      rule: ${yq(`Host(\`${portalHost}\`)`)}`);
+    lines.push('      priority: 100');
+    lines.push('      service: portal');
+    lines.push('      tls: {}');
+  }
   lines.push('    internal:');
   lines.push(`      entryPoints: [${entryPoint}]`);
   const internalHostRule = portalInternalHosts.length === 0
@@ -268,6 +289,16 @@ export function generateTraefikConfig({
     lines.push('      priority: 200');
     lines.push('      middlewares: [fde-auth, strip-cookie]');
     lines.push(`      service: ${name}`);
+    if (secure !== null) {
+      // 同上：TLS 与非 TLS 必须两个 router（一个 router 带 tls 会从 web 上消失）。
+      lines.push(`    ${name}-secure:`);
+      lines.push(`      entryPoints: [${secure}]`);
+      lines.push(`      rule: ${yq(`Host(\`${a.hostname}\`)`)}`);
+      lines.push('      priority: 200');
+      lines.push('      middlewares: [fde-auth, strip-cookie]');
+      lines.push(`      service: ${name}`);
+      lines.push('      tls: {}');
+    }
   }
 
   lines.push('  middlewares:');
@@ -606,6 +637,7 @@ export async function rebuildRoutes(pool, config, { log = console } = {}) {
     portalInternalHosts: config.portalInternalHosts,
     portalBackendUrl: config.portalBackendUrl,
     entryPoint: config.traefikEntryPoint,
+    secureEntryPoint: config.traefikSecureEntryPoint ?? null,
     allocations: state.allocations,
     sourceRanges: state.sourceRanges,
     // #450：管理台入口（config.js 恒提供；直接调用本函数且不带 adminHost 的老测试保持单入口快照）。

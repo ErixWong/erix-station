@@ -60,6 +60,20 @@ export function hashUrl(baseUrl: string | null | undefined, toPath: string): str
   return `${origin}#${toPath}`;
 }
 
+/** `scheme://host[:port]` → **hostname**（不带端口/协议）。判「我在哪个面」用它，判「要不要跳」用 origin。 */
+function parseHostname(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
 /** `scheme://host[:port]` → 规范化 origin；空串 / 非 URL / 非 http(s) ⇒ null。 */
 function parseOrigin(value: string | null | undefined): string | null {
   if (typeof value !== 'string') return null;
@@ -75,9 +89,27 @@ function parseOrigin(value: string | null | undefined): string | null {
   return parsed.origin;
 }
 
+/**
+ * 取路径部分：`/login?redirect=/x` → `/login`。
+ *
+ * ⚠ 为什么必须剥 query（2026-11-06 真机 bug）：守卫传给本模块的是 `to.fullPath`（**含 query**），
+ * 而矩阵里的比较原来写成 `toPath === LOGIN_PATH` 精确等于。管理台上未登录时守卫跳的是
+ * `/login?redirect=/admin/users` ⇒ 不等于 `/login` ⇒ 落进「其余路径」分支 ⇒ **被踢回用户面**；
+ * 用户在用户面登录后 cookie 种在用户面 host（host-only），回跳管理台仍然 401 ⇒ **死循环**
+ * （`admin.<伞域>:9443/#/admin/users` ↔ `station.<伞域>/#/login?redirect=/admin/users`）。
+ * 同一处 `isAdminPath('/admin?x=1')` 也曾误判成「非管理路径」。
+ */
+export function pathOf(toPath: string): string {
+  const q = toPath.indexOf('?');
+  const h = toPath.indexOf('#');
+  const cut = [q, h].filter((i) => i >= 0).sort((a, b) => a - b)[0];
+  return cut === undefined ? toPath : toPath.slice(0, cut);
+}
+
 /** 管理台路径集合：`/admin` 与 `/admin/...`（`/adminx` 不算——本仓没有这条路由，别把无关路径送去管理台）。 */
 export function isAdminPath(toPath: string): boolean {
-  return toPath === ADMIN_CONSOLE_PATH || toPath.startsWith(`${ADMIN_CONSOLE_PATH}/`);
+  const path = pathOf(toPath);
+  return path === ADMIN_CONSOLE_PATH || path.startsWith(`${ADMIN_CONSOLE_PATH}/`);
 }
 
 /**
@@ -112,18 +144,36 @@ export function hostGateDecision(input: HostGateInput): HostGateDecision {
   // ① 防环：已经站在目标 host 上 ⇒ 立刻放行（**先于**任何其它判断，不依赖调用方记得）。
   if (targetOrigin === here) return { action: 'allow' };
 
-  // ② 判不出当前是谁（既非用户面也非管理台）⇒ 不替用户换地址。
-  if (here !== userOrigin && here !== adminOrigin) return { action: 'allow' };
+  // ② 判「我是谁」用 **hostname**，不用 origin —— 2026-11-06 真机 bug：用户面同时有
+  //   `http://station.<伞域>:8090` 与 `https://station.<伞域>:8443`，而 `/api/site` 的 `userBaseUrl`
+  //   只有一个（8090）。用 origin 比较 ⇒ 8443 被当成「认不出的 host」⇒ fail-open ⇒
+  //   **管理台页面直接在用户面渲染出来**（`https://station...:8443/#/admin/users` 显示 Admin Console）。
+  //   同一个 hostname 的不同端口/协议是**同一个面**；跳转目标仍用完整 origin（那是 ① 的事）。
+  const hereHost = parseHostname(input.currentOrigin);
+  const userHost = parseHostname(input.userBaseUrl);
+  const adminHost = parseHostname(input.adminBaseUrl);
+  if (hereHost === null || userHost === null || adminHost === null) return { action: 'allow' };
 
-  if (here === adminOrigin) {
+  // ③ 判不出当前是谁（既非用户面也非管理台）⇒ 不替用户换地址。
+  if (hereHost !== userHost && hereHost !== adminHost) return { action: 'allow' };
+
+  if (hereHost === adminHost) {
     // ③ 管理台 host：登录页与改密屏留在原地（管理台自己也要登录；受限会话的第一屏就是改密屏）。
-    if (toPath === LOGIN_PATH || toPath === CHANGE_PASSWORD_PATH) return { action: 'allow' };
+    //    比较用**剥掉 query 的路径**：`/login?redirect=/admin/users` 必须命中（见 `pathOf` 头注）。
+    const path = pathOf(toPath);
+    if (path === LOGIN_PATH || path === CHANGE_PASSWORD_PATH) return { action: 'allow' };
+    // 管理台 host 上的管理路径就地渲染（不跳）。① 的 origin 相等在「配置写成 :443 隐式、实际走 :9443」
+    // 这类同 host 不同端口的形态下不成立，所以这里要显式判一次——否则管理台会把自己跳走。
+    if (isAdminPath(toPath)) return { action: 'allow' };
     // 其余（工作台、会话深链、未知路径）⇒ 回用户面。
     const url = hashUrl(input.userBaseUrl, toPath);
     return url === null ? { action: 'allow' } : { action: 'redirect', url };
   }
 
-  // ④ 用户面：只有 `/admin*` 要去管理台，其余一律放行。
+  // ④ 用户面：**只有** `/admin*` 要去管理台，其余一律放行。
+  //   ⚠ 这里必须先判 isAdminPath：用户面可能不是「配置里那个 origin」（如 https:8443 vs 配置的 http:8090），
+  //   此时 ① 的 origin 相等不成立，若不判就会把普通路径也送去管理台（2026-11-06 真机回归）。
+  if (!isAdminPath(toPath)) return { action: 'allow' };
   const url = hashUrl(input.adminBaseUrl, toPath);
   return url === null ? { action: 'allow' } : { action: 'redirect', url };
 }
