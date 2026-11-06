@@ -32,6 +32,8 @@ const USERS = {
   items: [
     {
       id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
+      // 2026-11-06：email + per-user 邮件验证码开关（迁移 0028）
+      email: 'alice@example.test', mail_otp_enabled: false,
       status: 'active', totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
       onboarding: { state: 'failed', step: 'provision', error: 'Docker unavailable' },
     },
@@ -1644,5 +1646,43 @@ describe('AdminView · FDE 用户', () => {
     expect(wrapper.get('header').text()).toContain('← Back to workbench');
     expect(wrapper.find('a[aria-current="page"]').text()).toBe('User management');
     wrapper.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。
+// 为什么值得单独钉：这是「全局 transport 不再是功能闸」之后**唯一**的判据来源，
+// 而它同时有两条交叉防护（没邮箱不许开 / 开关开着不许清邮箱）—— 都在后端，这里钉界面这一侧。
+// ---------------------------------------------------------------------------
+describe('AdminView · 邮件验证码开关（per-user）', () => {
+  it('Security tab 有该 section；开关值来自 DTO；勾选后保存发 PATCH {mail_otp_enabled:true}', async () => {
+    const patches: Array<{ url: string; body: unknown }> = [];
+    const { wrapper } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users/u1' && init?.method === 'PATCH') {
+        patches.push({ url, body: JSON.parse(String(init.body)) });
+        return jsonResponse(200, { user: { ...USERS.items[0], mail_otp_enabled: true } });
+      }
+      return undefined;
+    });
+    const row = wrapper.findAll('[data-test="user-row"]').find((r) => r.text().includes('alice'));
+    if (!row) throw new Error('alice row not found');
+    await row.get('[data-test="edit-user"]').trigger('click');
+    await wrapper.get('[data-test="edit-tab-security"]').trigger('click');
+    await flushPromises();
+
+    const section = wrapper.get('[data-test="mail-otp-section"]');
+    // i18n 真的解析了（不是把键名打到界面上 —— 2026-11-06 就踩过这次：键插错层级）
+    expect(section.text()).not.toContain('admin.fde.mailOtp');
+    expect(section.text()).toContain('邮件验证码');
+
+    const checkbox = section.get('[data-test="mail-otp-enabled"]');
+    expect((checkbox.element as HTMLInputElement).checked).toBe(false); // DTO 里是 false
+
+    await checkbox.setValue(true);
+    await section.get('[data-test="save-mail-otp"]').trigger('click');
+    await flushPromises();
+
+    expect(patches).toHaveLength(1);
+    expect(patches[0].body).toEqual({ mail_otp_enabled: true });
   });
 });
