@@ -1305,12 +1305,15 @@ describe('AdminView · FDE 用户', () => {
 
     const profileForm = wrapper.get('[data-test="user-profile-form"]');
     await profileForm.findAll('input')[0].setValue('Alice Updated');
-    await profileForm.findAll('input')[1].setValue('alpha-renamed');
+    // 2026-11-06：email 输入框插在 role 之前 ⇒ **不能按位置取**（按位置会把工位名填进邮箱）。
+    // 用 `data-test` 精确选，顺带钉住「这个字段真的在表单里」。
+    await profileForm.get('[data-test="edit-email"]').setValue('alice@example.test');
+    await profileForm.findAll('input')[2].setValue('alpha-renamed');
     await profileForm.trigger('submit.prevent');
     await flushPromises();
     const patch = callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')[0];
     expect(JSON.parse(String(patch[1]?.body))).toEqual({
-      display_name: 'Alice Updated', role: 'fde', fde_name: 'alpha-renamed',
+      display_name: 'Alice Updated', email: 'alice@example.test', role: 'fde', fde_name: 'alpha-renamed',
     });
     expect(profileForm.text()).toContain('资料已更新');
 
