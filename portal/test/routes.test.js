@@ -1204,3 +1204,61 @@ test('#450 A2：允许面与 deny 排除列表**逐条互补**（结构不变量
   assert.deepEqual(excluded, allowed,
     '管理台入口的「允许面」与 deny 的排除列表必须逐条相等：少一条 = deny（300）把允许（200）吃掉');
 });
+
+// ---------------------------------------------------------------------------
+// 2026-11-06：用户面 HTTPS 入口（`TRAEFIK_SECURE_ENTRYPOINT=websecure` ⇒ 8443）。
+// 只挂用户面两类 router（portal + 预览 host）；`internal` 与 LLM 路由**不加**（容器内经 http 直连，
+// 给它们 `tls: {}` 会让容器请求当场失败）。
+// ---------------------------------------------------------------------------
+test('routes：secureEntryPoint 缺省 ⇒ 输出字节不变（老部署不受影响）', () => {
+  const base = {
+    portalHost: 'station.example.test',
+    portalBackendUrl: 'http://127.0.0.1:8080',
+    entryPoint: 'web',
+    allocations: [],
+    sourceRanges: ['10.0.0.0/8'],
+  };
+  assert.equal(generateTraefikConfig(base), generateTraefikConfig({ ...base, secureEntryPoint: null }));
+  assert.equal(generateTraefikConfig(base), generateTraefikConfig({ ...base, secureEntryPoint: '' }));
+  assert.match(generateTraefikConfig(base), /entryPoints: \[web\]/, '缺省只有一个入口');
+});
+
+test('routes：secureEntryPoint 设了 ⇒ portal 与预览 host **各生成两个独立 router**（TLS 与非 TLS 必须分开）', () => {
+  const text = generateTraefikConfig({
+    portalHost: 'station.example.test',
+    portalBackendUrl: 'http://127.0.0.1:8080',
+    entryPoint: 'web',
+    secureEntryPoint: 'websecure',
+    allocations: [
+      { hostname: 'eric-p-22000.example.test', backendUrl: 'http://10.0.0.5:22000' },
+    ],
+    sourceRanges: ['10.0.0.0/8'],
+  });
+  // 2026-11-06 真机教训：**不能**写成一个 router 挂 [web, websecure] + tls ——
+  // traefik v3.7.13 里带 `tls: {}` 的 router 在**非 TLS entrypoint 上直接不匹配**（回 Traefik 自己的 404），
+  // 症状是「https 通了、http 全挂」。所以 TLS 那份必须是独立 router。
+  assert.match(text, /    portal:\n      entryPoints: \[web\]\n/, 'portal 的非 TLS router 必须只挂 web');
+  assert.match(text, /    portal-secure:\n      entryPoints: \[websecure\]\n/, 'portal 的 TLS router 只挂 websecure');
+  assert.match(text, /    portal-secure:[\s\S]{0,200}      tls: \{\}/, 'portal-secure 必须带 tls');
+  const prevName = /    (fde-[a-z0-9-]+):\n      entryPoints: \[web\]\n/.exec(text);
+  assert.ok(prevName, '预览 router 必须只挂 web');
+  assert.match(text, new RegExp(`    ${prevName[1]}-secure:\\n      entryPoints: \\[websecure\\]`), '预览的 TLS router 必须存在');
+  assert.match(text, new RegExp(`    ${prevName[1]}-secure:[\\s\\S]{0,240}      tls: \\{\\}`), '预览 TLS router 必须带 tls');
+  // 不得再出现「一个 router 挂两个 entrypoint」的写法
+  assert.equal((text.match(/entryPoints: \[web, websecure\]/g) ?? []).length, 0, '禁止单 router 双入口（真机 404 的成因）');
+  // internal 不挂 secure
+  assert.match(text, /    internal:\n      entryPoints: \[web\]\n/, 'internal 不得挂 secure 入口');
+  // tls 段只出现在两份 secure router 上
+  assert.equal((text.match(/      tls: \{\}/g) ?? []).length, 2, 'tls 段只应出现在两份 secure router');
+});
+
+test('routes：secureEntryPoint 走同一个安全 token 白名单（注入面收口）', () => {
+  assert.throws(() => generateTraefikConfig({
+    portalHost: 'station.example.test',
+    portalBackendUrl: 'http://127.0.0.1:8080',
+    entryPoint: 'web',
+    secureEntryPoint: 'web, evil]',
+    allocations: [],
+    sourceRanges: ['10.0.0.0/8'],
+  }), /entryPoint|token/i);
+});

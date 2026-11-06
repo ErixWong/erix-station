@@ -9,12 +9,58 @@ import { ref, nextTick, computed, watch, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
 import { useAuthStore, afterLoginRoute } from '../stores/auth';
+import { useSiteStore } from '../stores/site';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 
 const { t } = useI18n();
 const router = useRouter();
 const route = useRoute();
 const auth = useAuthStore();
+const site = useSiteStore();
+
+// 2026-11-06：**入口提示**。管理台是独立 host（`admin.<伞域>:9443`），而登录 cookie 是 host-only 的
+// （`#6` 的隔离设计）⇒ 「在用户面登录了管理员账号」会被送到这里、且**还要再登录一次**。
+// 不解释一句，用户看到的就是「我明明刚登录过，怎么又让我登」。判据只读 `/api/site` 的两个公开 URL，
+// 拿不到就不显示（fail-open，与 host 闸同口径）。
+const isAdminEntry = computed(() => {
+  const base = site.info?.adminBaseUrl;
+  if (typeof base !== 'string') return false;
+  try {
+    return new URL(base).hostname.toLowerCase() === window.location.hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+});
+const userEntryUrl = computed(() => (typeof site.info?.userBaseUrl === 'string' ? site.info.userBaseUrl : null));
+const adminEntryUrl = computed(() => (typeof site.info?.adminBaseUrl === 'string' ? site.info.adminBaseUrl : null));
+void site.ensureSite();
+
+// 2026-11-06（真机环）：**管理台入口只接受管理员**。
+// 反例：在 `admin.<伞域>:9443` 用 FDE 账号登录 ⇒ 会话 cookie 种在**管理台 host**（host-only），
+// 而 FDE 的落地页是 `/`（用户面 `station.<伞域>`）⇒ 跳过去立刻 401 ⇒ 又回登录页 ⇒
+// 「登录成功却用不了」的来回重定向。这里直接拦住并说清楚，而不是把人送进那个环。
+const entryRoleError = ref('');
+async function guardEntryRole(): Promise<boolean> {
+  if (!auth.user) return true;
+  // ① 管理台入口：只接受管理员（否则会话种在管理台 host，而 FDE 落地页在用户面 ⇒ 立刻 401 被踢回）。
+  if (isAdminEntry.value) {
+    if (auth.user.role === 'admin') return true;
+    const message = t('login.adminEntryFdeOnly');
+    await auth.logout();          // 清本地态（管理台 host 上那个会话对用户面无效，留着只会再触发跳转）
+    entryRoleError.value = message; // logout 之后设，免得被它清掉
+    return false;
+  }
+  // ② 用户面：**没有工位的管理员**在这里没有任何可用功能（#332 会把每条工作台路径都改写到管理台），
+  //   而两个 host 的会话互不相通 ⇒ 让他登录成功再跳过去，等于让他登录两次、还要在两个入口之间来回。
+  //   直接说清楚「去管理台登录」，并把这个用不上的会话撤掉。
+  if (auth.user.role === 'admin' && !auth.user.fde_name) {
+    const message = t('login.workbenchEntrySeatlessAdmin');
+    await auth.logout();
+    entryRoleError.value = message;
+    return false;
+  }
+  return true;
+}
 
 // 登录守卫携带的 redirect 回跳（如未登录访问 /session/<id> 深链）；仅允许站内路径。
 function loginRedirect(): string {
@@ -32,6 +78,7 @@ const emailInput = ref<HTMLInputElement | null>(null);
 async function onLoginSubmit() {
   await auth.login(login.value, password.value);
   if (auth.user) {
+    if (!(await guardEntryRole())) return;
     router.replace(loginRedirect());
     return;
   }
@@ -45,13 +92,19 @@ async function onLoginSubmit() {
 
 async function onTotpSubmit() {
   await auth.submitTotp(code.value);
-  if (auth.user) router.replace(loginRedirect());
+  if (auth.user) {
+    if (!(await guardEntryRole())) return;
+    router.replace(loginRedirect());
+  }
 }
 
 // ---- issue #449：邮箱验证码第二步 ----
 async function onEmailSubmit() {
   await auth.submitEmailCode(emailCode.value);
-  if (auth.user) router.replace(loginRedirect());
+  if (auth.user) {
+    if (!(await guardEntryRole())) return;
+    router.replace(loginRedirect());
+  }
 }
 
 async function onEmailResend() {
@@ -106,6 +159,16 @@ onUnmounted(stopCooldownTicker);
           <h2 class="text-xl font-medium">{{ t('login.title') }}</h2>
           <LocaleSwitch />
         </div>
+
+        <!-- 入口提示（2026-11-06）：管理台入口 + 工作台入口是两个登录态，说清楚免得「刚登录又要登录」 -->
+        <p v-if="isAdminEntry" data-test="login-entry-notice" class="mb-3 rounded-md bg-black/[0.03] px-3 py-2 text-xs leading-relaxed text-black/60">
+          {{ t('login.adminEntryNotice') }}
+          <a v-if="userEntryUrl" :href="userEntryUrl" class="underline hover:text-black">{{ t('login.adminEntryWorkbench') }}</a>
+        </p>
+        <p v-if="entryRoleError" data-test="login-entry-role-error" class="syserr mb-3 text-xs" role="alert">
+          {{ entryRoleError }}
+          <a v-if="!isAdminEntry && adminEntryUrl" :href="adminEntryUrl" class="underline">{{ t('login.goToAdminConsole') }}</a>
+        </p>
 
         <!-- 第一步：login + password -->
         <form v-if="!auth.pendingToken" @submit.prevent="onLoginSubmit">

@@ -174,6 +174,10 @@ services:
       # issue #64 R1：run 终态产物持久卷（容器内路径；宿主路径经 ERIX_ARTIFACTS_ROOT_HOST 注入）。
       ERIX_ARTIFACTS_ROOT: /srv/erix/artifacts
       TRAEFIK_ENTRYPOINT: web
+      # 2026-11-06：用户面 HTTPS 入口（工作台 + 预览 host 同时挂 websecure + tls）。
+      # **缺省空 = 不挂**（老部署 routes.yml 字节不变）；本机设 `websecure`（:8443，443 被本机 nginx 占着）。
+      # `internal` 与 LLM 路由不挂（容器内经 http 直连，加 tls 会当场失败）。
+      TRAEFIK_SECURE_ENTRYPOINT: ${TRAEFIK_SECURE_ENTRYPOINT:-}
       # issue #450 / feat-261105-01：管理台入口（独立 host admin.<BASE_DOMAIN> + 独立端口 9443 + TLS）。
       # 端口**唯一真值**在 `deploy/.env`（本行插值），portal 用它推导管理台 URL 与展示；
       # ⚠ 但 Traefik 侧 listen 端口是静态文件里写死的 9443（`${VAR:default}` 在 `--configFile` 下不插值，实测），

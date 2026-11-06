@@ -393,3 +393,182 @@ describe('#449 TOTP 分支未被改动', () => {
     expect(loginViewSource).toContain(TOTP_STEP);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-11-06：**入口提示**。管理台是独立 host，登录 cookie host-only ⇒ 「在用户面登录管理员」会被送到
+// 管理台登录页并要求再登录一次。不解释一句，用户看到的就是「我明明刚登录过」。
+// ---------------------------------------------------------------------------
+describe('LoginView 入口提示（管理台 vs 工作台）', () => {
+  const SITE = { userBaseUrl: 'http://station.fde.erix.vip:8090', adminBaseUrl: 'https://admin.fde.erix.vip:9443' };
+
+  function stubSite() {
+    vi.stubGlobal('fetch', fetchMock((url) => (
+      url.includes('/api/site') ? jsonResponse(200, SITE) : jsonResponse(404, {})
+    )));
+  }
+
+  async function withHostname<T>(hostname: string, fn: () => Promise<T>): Promise<T> {
+    const original = window.location;
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...original, hostname },
+    });
+    try {
+      return await fn();
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: original });
+    }
+  }
+
+  it('管理台 host ⇒ 显示入口提示 + 工作台链接（href 就是 /api/site 的 userBaseUrl）', async () => {
+    stubSite();
+    const wrapper = await withHostname('admin.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      return wrapper;
+    });
+    const notice = wrapper.find('[data-test="login-entry-notice"]');
+    expect(notice.exists()).toBe(true);
+    expect(notice.text()).toContain('管理台入口');
+    expect(notice.text()).toContain('互不相通');
+    expect(notice.find('a').attributes('href')).toBe(SITE.userBaseUrl);
+  });
+
+  it('用户面 host ⇒ **不显示**入口提示（工作台登录页不该有这段话）', async () => {
+    stubSite();
+    const wrapper = await withHostname('station.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      return wrapper;
+    });
+    expect(wrapper.find('[data-test="login-entry-notice"]').exists()).toBe(false);
+  });
+
+  it('/api/site 拿不到 ⇒ 不显示提示（fail-open，与 host 闸同口径）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(500, {})));
+    const wrapper = await withHostname('admin.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      return wrapper;
+    });
+    expect(wrapper.find('[data-test="login-entry-notice"]').exists()).toBe(false);
+  });
+});
+
+// 2026-11-06（真机环）：管理台 host 上用 **FDE 账号** 登录 ⇒ 会话 cookie 种在管理台 host（host-only），
+// 而 FDE 落地页 `/` 在用户面 ⇒ 跳过去 401 ⇒ 回登录页 ⇒ 来回重定向。修法：登录页直接拦住 + 说清楚。
+describe('LoginView 管理台入口拒绝非管理员（真机环回归）', () => {
+  const SITE = { userBaseUrl: 'http://station.fde.erix.vip:8090', adminBaseUrl: 'https://admin.fde.erix.vip:9443' };
+
+  async function withHostname<T>(hostname: string, fn: () => Promise<T>): Promise<T> {
+    const original = window.location;
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...original, hostname } });
+    try { return await fn(); } finally { Object.defineProperty(window, 'location', { configurable: true, value: original }); }
+  }
+
+  it('管理台 host + FDE 账号登录成功 ⇒ 提示 + **不跳转**（会话被清掉，不再进入重定向环）', async () => {
+    vi.stubGlobal('fetch', fetchMock((url) => {
+      if (url.includes('/api/site')) return jsonResponse(200, SITE);
+      if (url.includes('/api/auth/login')) return jsonResponse(200, { status: 'authenticated', user: FDE_USER });
+      if (url.includes('/api/auth/logout')) return jsonResponse(204, {});
+      return jsonResponse(404, {});
+    }));
+    const wrapper = await withHostname('admin.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      return wrapper;
+    });
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('pw');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="login-entry-role-error"]').text()).toContain('不是管理员');
+    // 仍停在登录页（没有跳去 /）
+    expect(wrapper.find('#loginName').exists()).toBe(true);
+  });
+
+  it('管理台 host + **管理员**登录 ⇒ 正常跳转（不误伤）', async () => {
+    vi.stubGlobal('fetch', fetchMock((url) => {
+      if (url.includes('/api/site')) return jsonResponse(200, SITE);
+      if (url.includes('/api/auth/login')) return jsonResponse(200, { status: 'authenticated', user: ADMIN_USER });
+      return jsonResponse(404, {});
+    }));
+    const wrapper = await withHostname('admin.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      return wrapper;
+    });
+    await wrapper.find('#loginName').setValue('root');
+    await wrapper.find('#loginPass').setValue('pw');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(false);
+  });
+
+  it('用户面 host + FDE 账号 ⇒ 不拦（这条只针对管理台入口）', async () => {
+    vi.stubGlobal('fetch', fetchMock((url) => {
+      if (url.includes('/api/site')) return jsonResponse(200, SITE);
+      if (url.includes('/api/auth/login')) return jsonResponse(200, { status: 'authenticated', user: FDE_USER });
+      return jsonResponse(404, {});
+    }));
+    const wrapper = await withHostname('station.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      return wrapper;
+    });
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('pw');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(false);
+  });
+});
+
+// 2026-11-06（真机蹦极，用户报「8443 登录进去在 admin console 来回跳」）：
+// **无工位管理员**（role=admin + fde_name 空）在用户面登录 ⇒ 他在这里没有任何可用功能（#332 会把
+// 每条工作台路径改写到管理台），而两个 host 的会话互不相通 ⇒ 让他登录成功再跳过去 = 登录两次 +
+// 两个入口之间来回。修法：直接说清「去管理台登录」并撤掉这个用不上的会话。
+describe('LoginView 用户面拒绝无工位管理员（真机蹦极回归）', () => {
+  const SITE = { userBaseUrl: 'http://station.fde.erix.vip:8090', adminBaseUrl: 'https://admin.fde.erix.vip:9443' };
+  const SEATLESS_ADMIN = { ...ADMIN_USER, fde_name: null };
+  const ADMIN_WITH_SEAT = { ...ADMIN_USER, fde_name: 'ops' };
+
+  async function withHostname<T>(hostname: string, fn: () => Promise<T>): Promise<T> {
+    const original = window.location;
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...original, hostname } });
+    try { return await fn(); } finally { Object.defineProperty(window, 'location', { configurable: true, value: original }); }
+  }
+
+  async function loginAs(user: AuthUser) {
+    vi.stubGlobal('fetch', fetchMock((url) => {
+      if (url.includes('/api/site')) return jsonResponse(200, SITE);
+      if (url.includes('/api/auth/login')) return jsonResponse(200, { status: 'authenticated', user });
+      if (url.includes('/api/auth/logout')) return jsonResponse(204, {});
+      return jsonResponse(404, {});
+    }));
+    return withHostname('station.fde.erix.vip', async () => {
+      const { wrapper } = await mountLogin();
+      await flushPromises();
+      await wrapper.find('#loginName').setValue(user.login);
+      await wrapper.find('#loginPass').setValue('pw');
+      await wrapper.find('form').trigger('submit.prevent');
+      await flushPromises();
+      return wrapper;
+    });
+  }
+
+  it('用户面 + 无工位管理员 ⇒ 提示 + 指向管理台的链接 + **不跳转**', async () => {
+    const wrapper = await loginAs(SEATLESS_ADMIN);
+    const err = wrapper.find('[data-test="login-entry-role-error"]');
+    expect(err.exists()).toBe(true);
+    expect(err.text()).toContain('没有工位');
+    expect(err.find('a').attributes('href')).toBe(SITE.adminBaseUrl);
+    expect(wrapper.find('#loginName').exists()).toBe(true); // 仍停在登录页
+  });
+
+  it('用户面 + **有工位**的管理员 ⇒ 不拦（他确实能用工位）', async () => {
+    const wrapper = await loginAs(ADMIN_WITH_SEAT);
+    expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(false);
+  });
+});

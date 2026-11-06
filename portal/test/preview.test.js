@@ -821,3 +821,36 @@ test('#429 血缘缺失（迁移前存量/NULL）时兑换不炸，session 行�
   assert.equal(res.outcome, 'redirect');
   assert.equal(grants.find((x) => x.kind === 'session').login_session_id, null);
 });
+
+// ---------------------------------------------------------------------------
+// #450 用户面 HTTPS 8443：预览票里的 URL 必须**跟随当前请求的入口**。
+// 反例（真机）：https 工作台里拿到 `http://<host>:8090` 的预览地址 ⇒ 页内 fetch 被浏览器按
+// mixed content 直接拦掉（顶层导航也掉进「不安全」页）。而两个入口共用一个 `PUBLIC_BASE_URL`，
+// 所以只能按请求推导（推导在 http.js，签发处只认传进来的 publicBaseUrl）。
+// ---------------------------------------------------------------------------
+test('#450 票内 URL 跟随 publicBaseUrl：https:8443 / http:8090 / 缺省退回配置', async () => {
+  const https = await issuePreviewTicket(makePool().pool, config, {
+    allocationId: 'pa1',
+    session: { user: { id: 'u1', role: 'fde' } },
+    now: NOW,
+    publicBaseUrl: 'https://preview.invalid:8443',
+  });
+  assert.match(https.url, /^https:\/\/[^/]+:8443\?preview_ticket=pt_/, 'https 请求 ⇒ https + 8443');
+
+  const http = await issuePreviewTicket(makePool().pool, config, {
+    allocationId: 'pa1',
+    session: { user: { id: 'u1', role: 'fde' } },
+    now: NOW,
+    publicBaseUrl: 'http://preview.invalid:8090',
+  });
+  assert.match(http.url, /^http:\/\/[^/]+:8090\?preview_ticket=pt_/, 'http 请求 ⇒ http + 8090');
+
+  const fallback = await issuePreviewTicket(makePool().pool, config, {
+    allocationId: 'pa1',
+    session: { user: { id: 'u1', role: 'fde' } },
+    now: NOW,
+  });
+  // 未给 ⇒ 走 `config.portalPublicBaseUrl`（本文件 config 里没有这个键 ⇒ previewUrl 的保守形态：
+  // https、无端口）。判据只钉「是个绝对 URL 且带票」，不钉具体形态（那是 previewUrl 自己的用例）。
+  assert.match(fallback.url, /^https?:\/\/[^/]+\?preview_ticket=pt_/, '未给 publicBaseUrl ⇒ 退回配置（不猜）');
+});
