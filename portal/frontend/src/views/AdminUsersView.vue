@@ -30,7 +30,7 @@ type EditTab = 'profile' | 'security' | 'llm' | 'ports' | 'danger';
 const editTab = ref<EditTab>('profile');
 const deleteUserId = ref<string | null>(null);
 const returnToEditAfterDelete = ref(false);
-const editForm = reactive({ display_name: '', role: 'fde' as AdminUser['role'], fde_name: '' });
+const editForm = reactive({ display_name: '', email: '', role: 'fde' as AdminUser['role'], fde_name: '' });
 const resetPasswordValue = ref('');
 const deleteConfirmation = ref('');
 const copiedTotpValue = ref('');
@@ -294,6 +294,7 @@ function openEditModal(user: AdminUser) {
   portsPaneMounted.value = false;
   editModalOpen.value = true;
   editForm.display_name = user.display_name ?? '';
+  editForm.email = user.email ?? '';
   editForm.role = user.role;
   editForm.fde_name = user.fde_name ?? '';
   resetPasswordValue.value = '';
@@ -361,6 +362,8 @@ async function saveProfile() {
   try {
     const error = await admin.updateUser(user.id, {
       display_name: editForm.display_name.trim(),
+      // 留空 ⇒ 清空（`null`）。#449 的邮箱验证码通道需要它；清空后该账号只能走 TOTP 或口令。
+      email: editForm.email.trim() || null,
       role: editForm.role,
       fde_name: editForm.fde_name.trim() || null,
     });
@@ -1012,6 +1015,17 @@ onBeforeUnmount(() => {
           <label class="flex flex-col gap-1 text-xs text-black/55">
             {{ t('admin.fde.displayNameLabel') }}
             <input v-model="editForm.display_name" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black">
+          </label>
+          <label class="flex flex-col gap-1 text-xs text-black/55">
+            {{ t('admin.fde.emailLabel') }}
+            <input
+              v-model="editForm.email"
+              data-test="edit-email"
+              type="email"
+              autocomplete="off"
+              placeholder="user@example.com"
+              class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black"
+            >
           </label>
           <label class="flex flex-col gap-1 text-xs text-black/55">
             {{ t('admin.fde.colRole') }}

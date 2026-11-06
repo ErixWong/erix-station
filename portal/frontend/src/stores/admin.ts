@@ -87,6 +87,8 @@ export interface AdminUser {
   id: string;
   login: string;
   display_name: string | null;
+  /** 2026-11-06：管理员可维护（开户时必填、编辑时可改可清）。老响应没有这个键 ⇒ undefined。 */
+  email?: string | null;
   role: 'fde' | 'admin';
   fde_name: string | null;
   status: 'active' | 'disabled' | 'awaiting_credential';
@@ -198,7 +200,7 @@ export function testMailErrorText(err: unknown): string {
   return t('admin.errorPrefix') + message;
 }
 
-export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'role' | 'fde_name'>> & {
+export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'email' | 'role' | 'fde_name'>> & {
   status?: 'active' | 'disabled';
 };
 
