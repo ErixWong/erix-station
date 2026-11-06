@@ -378,8 +378,31 @@ describe('#450 A2 host 闸的守卫接线', () => {
       `期望 NAVIGATION_ABORTED（跳完就停），实际：${String(failure)}`,
     ).toBe(true);
     expect(router.currentRoute.value.path).not.toBe('/admin/users');
-    // host 闸排在 ensureMe 之前：跳转发生前只该打 /api/site，一趟 /api/me 都不该发。
-    expect(calls).toEqual(['/api/site']);
+    // 2026-11-06 变更：`/admin*` 的跨 host 决策**需要登录态**（未登录 / 非管理员不该被送进管理台——
+    // 跨 host 登录必然丢会话，会形成「送过去、登进去、再被踢回来」的环）。所以这条路径会先打一次
+    // `/api/me`。**其它路径仍然只打 `/api/site`**（见下面那条「非 admin 路径不白跑」的用例）。
+    expect(calls).toEqual(['/api/me', '/api/site']);
+  });
+
+  it('用户 host + **未登录** + #/admin/users ⇒ 留在本 host 登录（不跨 host，跨过去必丢会话）', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 401, body: { error: { code: 'unauthenticated' } } } });
+    const { router, navigations } = await freshHostRouter(USER_ORIGIN);
+
+    await router.push('/admin/users');
+
+    expect(navigations).toEqual([]); // 一次都没换 host
+    expect(router.currentRoute.value.path).toBe('/login');
+    expect(router.currentRoute.value.query.redirect).toBe('/admin/users');
+  });
+
+  it('用户 host + **FDE 账号** + #/admin/users ⇒ 回工作台（不把人送去他进不去的入口）', async () => {
+    stubApiByPath({ site: { status: 200, body: SITE_BODY }, me: { status: 200, body: { user: FDE_USER } } });
+    const { router, navigations } = await freshHostRouter(USER_ORIGIN);
+
+    await router.push('/admin/users');
+
+    expect(navigations).toEqual([]);
+    expect(router.currentRoute.value.path).toBe('/');
   });
 
   it('管理台 host 上打开 #/session/x?tab=diff ⇒ 跳回用户面，深链与 query 原样保住', async () => {

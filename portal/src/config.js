@@ -316,6 +316,10 @@ export function loadConfig(env = process.env) {
       .filter(Boolean),
     portalBackendUrl: env.PORTAL_BACKEND_URL || 'http://127.0.0.1:8080',
     traefikEntryPoint: env.TRAEFIK_ENTRYPOINT || 'web',
+    // 2026-11-06：用户面 HTTPS 入口。**缺省空 = 不挂**（老部署 routes.yml 字节不变）；
+    // 设成 `websecure` 就同时给 `portal` 与预览 host 加该入口 + `tls: {}`（证书是 file provider 装载的
+    // `certs/tls.{crt,key}`，那张 `*.fde.erix.vip` 已覆盖两个 host）。`internal` 与 LLM 路由不加。
+    traefikSecureEntryPoint: env.TRAEFIK_SECURE_ENTRYPOINT || '',
     // issue #450 D2：管理台入口（静态配置里的 entrypoint 名）。管理台路由挂它，用户入口挂 deny。
     traefikAdminEntryPoint: env.TRAEFIK_ADMIN_ENTRYPOINT || 'adminsecure',
     // issue #450 D1/D4：管理台 host / 端口 / 来源白名单 / 对外 URL。
