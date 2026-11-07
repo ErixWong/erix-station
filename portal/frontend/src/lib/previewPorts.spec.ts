@@ -201,7 +201,7 @@ describe('toPreviewApiError：错误码 / message / details.field 三面都不�
 // ---------------------------------------------------------------------------
 // 观测层 MVP 的纯判据（组件侧只留装配）。
 // ---------------------------------------------------------------------------
-import { duplicateObservedGroups, formatStartedAgo } from './previewPorts';
+import { duplicateObservedGroups, formatStartedAgo, groupByProject, listenerItemsForProject, unknownProjectItems } from './previewPorts';
 
 function item(port: number, cwd: string | null): PreviewPortItem {
   return {
@@ -220,6 +220,99 @@ describe('duplicateObservedGroups（同目录多实例 = 「两个分支各占�
       item(22002, null),
     ]);
     expect(groups).toEqual([{ cwd: '~/projects/shop', ports: [22000, 22005] }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #468：进程监听面板「跟随当前项目」+「未知项目单列」（D1/D2/D6）。
+// 这些判据全部放在纯函数层，组件只装配 ⇒ 这里钉住了就能挡住「换个徽章位置」的同型伪实现。
+// ---------------------------------------------------------------------------
+describe('#468 F1：unknownProjectItems（D2——反推不出项目的观测必须能挑出来，不许丢）', () => {
+  it('cwd 为 ~//tmp/null 都算未知；~/projects/shop 不算；无观测的行不算；组内 port ASC', () => {
+    const unknown = unknownProjectItems([
+      item(22010, '/tmp'),
+      item(22002, '~'),
+      item(22000, null),                       // 无观测（observed=null）⇒ 不是「未知项目」
+      item(22050, '~/projects/shop'),          // 能反推 ⇒ 不属本组
+      item(22007, '~/projects/shop/frontend'), // 子目录同样能反推
+      { ...item(22003, 'x'), observed: undefined }, // 旧后端：无 observed 键 ⇒ 同样不算未知项目
+      item(22001, '~/projects/other'),
+      item(22090, '/var/tmp/x'),
+    ]);
+    expect(unknown.map((i) => i.port)).toEqual([22002, 22010, 22090]);
+    expect(unknown.every((i) => Boolean(i.observed))).toBe(true);
+  });
+
+  it('逐字段：~ / /tmp / cwd=null 三条全收并按 port 升序；projectRootOf 反推得出的不进组；不改入参', () => {
+    const src = [
+      item(22050, '~/projects/shop'),
+      item(22002, '~'),
+      { ...item(22001, 'x'), observed: { pid: 1, cwd: null, cmd: null, branch: null, started_at: null, observed_at: null } },
+      item(8099, '/tmp'),
+      item(22000, null),
+    ];
+    const snapshot = src.map((i) => i.port);
+    expect(unknownProjectItems(src).map((i) => i.port)).toEqual([8099, 22001, 22002]);
+    expect(src.map((i) => i.port), '本函数不得原地排序入参').toEqual(snapshot);
+  });
+
+  it('groupByProject 保持现状：反推不出项目的行仍不进分组（未知组的职责在 unknownProjectItems）', () => {
+    expect(groupByProject([item(22002, '~'), item(8099, '/tmp'), item(22050, '~/projects/shop')])
+      .map((g) => g.root)).toEqual(['~/projects/shop']);
+  });
+});
+
+describe('#468 F2：listenerItemsForProject（D1——只显示当前项目 + 未知项目）', () => {
+  const SRC = [
+    item(22000, '~/projects/shop'),                    // 当前项目本体
+    item(22005, '~/projects/shop/frontend'),           // 当前项目的子目录
+    item(22001, '~/projects/other'),                   // 别的项目 ⇒ 必须被排除
+    item(22002, '~'),                                  // 未知项目 ⇒ 必须保留
+    item(8099, '/tmp'),                                // 未知项目 ⇒ 必须保留
+    { ...item(22003, 'x'), observed: { pid: 1, cwd: null, cmd: null, branch: null, started_at: null, observed_at: null } }, // 跳 uid ⇒ 未知
+    item(22004, null),                                 // 无观测（池内空口）⇒ 不进事实面板
+    item(22099, '~/projects/shopmate'),                // 前缀陷阱：不是 shop 的子目录
+  ];
+
+  it('currentCwd=~/projects/shop ⇒ 只留 shop（含子目录）+ 未知项目；排除 other 与 shopmate；无观测行不进；port ASC', () => {
+    expect(listenerItemsForProject(SRC, '~/projects/shop').map((i) => i.port))
+      .toEqual([8099, 22000, 22002, 22003, 22005]);
+  });
+
+  it('currentCwd 是绝对形（/home/erix/projects/shop）同样命中——与 observed.cwd 同一归一口径', () => {
+    expect(listenerItemsForProject(SRC, '/home/erix/projects/shop').map((i) => i.port))
+      .toEqual([8099, 22000, 22002, 22003, 22005]);
+  });
+
+  it('currentCwd 在项目根以下子目录（~/projects/shop/frontend）⇒ 仍按项目根筛，不只能精确匹配', () => {
+    expect(listenerItemsForProject(SRC, '~/projects/shop/frontend').map((i) => i.port))
+      .toEqual([8099, 22000, 22002, 22003, 22005]);
+  });
+
+  it('换当前项目（⇒ other）⇒ 行集真的跟着变（不是只换个徒章位置）', () => {
+    const asOther = listenerItemsForProject(SRC, '~/projects/other').map((i) => i.port);
+    expect(asOther).toEqual([8099, 22001, 22002, 22003]);
+    expect(asOther).not.toEqual(listenerItemsForProject(SRC, '~/projects/shop').map((i) => i.port));
+  });
+});
+
+describe('#468 F3：listenerItemsForProject 在「无法判定当前项目」时不过滤（D6）', () => {
+  const SRC = [
+    item(22000, '~/projects/shop'),
+    item(22001, '~/projects/other'),
+    item(22002, '~'),
+    item(22004, null),
+  ];
+
+  it('currentCwd = null（未选目录）⇒ 所有有观测的行都在，但无观测行仍不进（面板维度不变）', () => {
+    expect(listenerItemsForProject(SRC, null).map((i) => i.port)).toEqual([22000, 22001, 22002]);
+  });
+
+  it('currentCwd = "~"（反推不出项目）⇒ 同样不过滤；undefined / "" 同口径', () => {
+    for (const cwd of ['~', undefined, '', '/tmp', '/home']) {
+      expect(listenerItemsForProject(SRC, cwd).map((i) => i.port), String(cwd))
+        .toEqual([22000, 22001, 22002]);
+    }
   });
 });
 
