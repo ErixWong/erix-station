@@ -28,7 +28,7 @@ const UUID_22000 = 'aaaaaaaa-0000-4000-8000-000000002200';
 const UUID_22001 = 'aaaaaaaa-0000-4000-8000-000000002201';
 const UUID_22002 = 'aaaaaaaa-0000-4000-8000-000000002202';
 
-function portRow(id: string, port: number, state: string) {
+function portRow(id: string, port: number, state: string, cwd: string | null = null) {
   return {
     id,
     port,
@@ -38,13 +38,18 @@ function portRow(id: string, port: number, state: string) {
     scope: 'fde',
     role: 'spare',
     exposure: 'private',
+    // ⚠ 新后端恒带 `observed` 键（值可为 null）。#468 追加 A 后侧栏只剩进程监听面板，行得**带观测**才画得出来；
+    // cwd 取工作台当前项目（DIRS[0].cwd = ~/projects/demo），否则会被 #468 D1 的「只看当前项目」筛掉。
+    observed: cwd === null ? null : {
+      pid: 412, cwd, cmd: 'node vite', branch: null, started_at: null, observed_at: new Date().toISOString(),
+    },
   };
 }
 
 const THREE_PORTS = [
-  portRow(UUID_22000, 22000, 'allocated'),
-  portRow(UUID_22001, 22001, 'active'),
-  portRow(UUID_22002, 22002, 'active'),
+  portRow(UUID_22000, 22000, 'allocated', '~/projects/demo'),
+  portRow(UUID_22001, 22001, 'active', '~/projects/demo'),
+  portRow(UUID_22002, 22002, 'active', '~/projects/demo'),
 ];
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -89,8 +94,13 @@ function stubOpen() {
   return tabs;
 }
 
+/**
+ * 侧栏唯一的端口折叠条。⚠ #468 追加 A：原先这里是「端口池」折叠条 `preview-ports-toggle`，
+ * 那块面板已退役（用户裁定只保留折叠条上的「端口池 总量/空闲」两个数）⇒ 现在只有进程监听那一条。
+ * 行集也不再是「全量池行」而是「当前项目 + 未知项目的在用行」（#468 D1）。
+ */
 function toggle(wrapper: VueWrapper) {
-  return wrapper.get('[data-test="preview-ports-toggle"]');
+  return wrapper.get('[data-test="process-watch-toggle"]');
 }
 
 beforeEach(() => {
@@ -116,7 +126,9 @@ describe('工作台 · 预览端口区块', () => {
     try {
       expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/me/ports')).toHaveLength(1);
       const bar = toggle(wrapper);
-      expect(bar.text()).toContain('端口池（3 个）');
+      // #468 追加 A：折叠条只剩一条（进程监听），条数 + 池用量两个数都在它身上
+      expect(bar.text()).toContain('进程监听（3 个）');
+      expect(wrapper.get('[data-test="pool-usage"]').text()).toBe('端口池 3/0');
       expect(bar.attributes('aria-expanded')).toBe('false');
       // 防预取：整个面板只打过列表端点，一条 POST 都没有
       expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
@@ -219,15 +231,18 @@ describe('工作台 · 预览端口区块', () => {
     }
   });
 
-  it('列表为空（有工位但平台尚未分段）⇒ 折叠条不带条数，展开走空态而不是空白', async () => {
+  it('列表为空（有工位但平台尚未分段）⇒ 侧栏不再出现端口区块（池面板已退役，无观测也不谎报）', async () => {
     const { wrapper } = await mountWorkbench(ADMIN_WITH_SEAT, (url, init) =>
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: [] }) : undefined);
     try {
-      expect(toggle(wrapper).text()).toContain('端口池使用情况');
-      expect(toggle(wrapper).text()).not.toContain('（');
-      await toggle(wrapper).trigger('click');
+      // #468 追加 A：原本这里钉的是「折叠条不带条数 + 展开是空态而不是空白」。池面板退役后，
+      // 空列表 = 无池 = 没有任何可报事实 ⇒ 整段退场（**新后端也无从判断 null 的含义**）。
+      // 断言没删，只是换成新形态下同样承重的三件事：无折叠条 / 无假的池用量 / 不签票。
+      expect(wrapper.find('[data-test="process-watch-toggle"]').exists()).toBe(false);
+      expect(wrapper.find('[data-test="pool-usage"]').exists()).toBe(false);
+      expect(wrapper.find('[data-test="preview-ports-toggle"]').exists()).toBe(false); // 退役的钩子不许复活
       expect(wrapper.find('[data-test="preview-ports-table"]').exists()).toBe(false);
-      expect(wrapper.get('[data-test="preview-ports-empty"]').text()).toContain('你还没有预览端口');
+      expect(wrapper.text()).not.toContain('0/0');
     } finally {
       wrapper.unmount();
     }
@@ -244,7 +259,10 @@ describe('工作台 · 预览端口区块', () => {
     });
     try {
       expect(calls).toBe(1);
-      expect(toggle(wrapper).text()).toContain('端口池（加载失败）');
+      // #468 追加 A：折叠条文案不再自带「加载失败」（那是退役的池折叠条的口径），
+      // 但**折叠条必须在**且展开后必须给错误块 —— 否则侧栏对失败完全静默；池用量数字则必须缺席。
+      expect(toggle(wrapper).text()).toContain('进程监听');
+      expect(wrapper.find('[data-test="pool-usage"]').exists()).toBe(false);
       await toggle(wrapper).trigger('click');
       expect(wrapper.get('[data-test="preview-ports-error"]').text())
         .toBe('预览端口加载失败（db_unavailable）：数据库暂时不可用');
@@ -266,9 +284,11 @@ describe('工作台 · 预览端口段已搬进左栏（issue #308）', () => {
       url === '/api/me/ports' && !init?.method ? jsonResponse(200, { items: THREE_PORTS }) : undefined);
     try {
       const bar = toggle(wrapper);
-      // ① 标记契约：`preview-ports-toggle` 在工作台挂载时必须存在（#255 拿它当挂载标记，不许改名/删除）
-      expect(wrapper.find('[data-test="preview-ports-toggle"]').exists()).toBe(true);
-      expect(document.querySelectorAll('[data-test="preview-ports-toggle"]')).toHaveLength(1); // 搬完不留旧的一份
+      // ① 标记契约（#468 追加 A 换形）：侧栏恒有**且只有一条**端口折叠条 = `process-watch-toggle`；
+      //    退役的 `preview-ports-toggle` 必须彻底消失（不留第二份，也不许偷偷复活成别名）。
+      expect(wrapper.find('[data-test="process-watch-toggle"]').exists()).toBe(true);
+      expect(document.querySelectorAll('[data-test="process-watch-toggle"]')).toHaveLength(1);
+      expect(document.querySelectorAll('[data-test="preview-ports-toggle"]')).toHaveLength(0);
       // ② 位置：在 aside 内的底部堆叠区里（与目录树同栈）
       expect(bar.element.closest('aside')).not.toBeNull();
       expect(bar.element.closest('[data-test="sidebar-bottom-stack"]')).not.toBeNull();

@@ -6,8 +6,11 @@
 // 为什么必须挂 App 而不是 WorkbenchView：`WorkbenchView.spec.ts` / `WorkbenchPreviewPorts.spec.ts`
 // 那两类用例是**直接 mount 视图组件**的，全局守卫压根不参与 ⇒ 它们验不到「不挂载」。
 // 只有「真路由 + 真守卫 + 挂 App」这一条路径能证明「改写发生在挂载之前」。
-// 挂载与否的标记取 `[data-test="preview-ports-toggle"]`（WorkbenchView 模板里无条件渲染的那条折叠条，
-// `ForcePasswordChangeView.spec.ts` 也拿它当同一个「工作台是否挂载」的标记，#255 在用）。
+// 挂载与否的标记取侧栏根节点（WorkbenchView 挂载时恒在）。
+// ⚠ #468 追加 A：原先两条都用 `[data-test="preview-ports-toggle"]`，那条**端口池段已退役** ⇒ 与
+// `ForcePasswordChangeView.spec.ts` 同步换标记。这里选 `sidebar-aside` 而不是新折叠条
+// `process-watch-toggle`：后者带 `observationsAvailable || listError` 的闸，而本文件的桩把
+// /api/me/ports 回成 `{items: []}` ⇒ 折叠条本就不存在，拿它当挂载标记会**假红**（第 ② 类人的对照用例）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
@@ -30,7 +33,7 @@ const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
 } as AuthUser;
 
-const WORKBENCH_MARKER = '[data-test="preview-ports-toggle"]';
+const WORKBENCH_MARKER = '[data-test="sidebar-aside"]';
 /** 工单 §二.2 点名要省下的那三趟。 */
 const WORKBENCH_FETCHES = ['/api/dirs', '/api/sessions', '/api/me/ports'];
 
