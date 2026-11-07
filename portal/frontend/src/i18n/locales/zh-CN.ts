@@ -541,8 +541,10 @@ export const zhCN = {
     poolToggleFailed: '端口池（加载失败）',
     procToggle: '进程监听情况',
     procToggleCount: '进程监听（{count} 个）',
-    procEmpty: '项目里没有进程在监听。',
+    procEmpty: '当前项目里没有进程在监听。',
     spareGroup: '空闲（{count}）',
+    // #468 D2：反推不出项目（cwd 在 ~//tmp 等非项目目录，或跨 uid 读不到 cwd）的观测**单列一组**，不许丢弃。
+    unknownGroup: '未知项目（{count}）',
     currentBadge: '当前目录',
     colPort: '端口',
     colHostname: '预览域名',
@@ -576,6 +578,8 @@ export const zhCN = {
     // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
     observedTitle: '正在使用这个地址的程序',
     observedUptime: '已运行 {ago}',
+    // #468 D7：跨 uid（无 CAP_SYS_PTRACE + Yama）时 pid/cwd/cmd/branch 全读不到 ⇒ 行里给这句，不留空白行。
+    observedOpaque: '进程细节不可读（跨用户）',
     duplicateWarn: '⚠ {cwd} 同时在 {ports} 两个地址上开着——可能是新旧两个版本并存，先确认哪个才是你要看的（旧任务留下的程序不会自己关）。',
     unroutedNote: '这个程序还不能用预览地址打开——可让助理把它改到分配好的端口上。',
     stateHint: '「已放行过」只表示该端口首次凭证放行过，不代表容器里有应用在监听。',

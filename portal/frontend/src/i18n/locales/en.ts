@@ -509,8 +509,11 @@ export const en = {
     poolToggleFailed: 'Port pool (failed to load)',
     procToggle: 'Process listeners',
     procToggleCount: 'Listeners ({count})',
-    procEmpty: 'No project processes are listening.',
+    procEmpty: 'No processes are listening in the current project.',
     spareGroup: 'Spare ({count})',
+    // #468 D2: observations whose project root cannot be derived (cwd in ~ // /tmp, or unreadable across uids)
+    // get their own group instead of being dropped.
+    unknownGroup: 'Unknown project ({count})',
     currentBadge: 'Current',
     colPort: 'Port',
     colHostname: 'Preview host',
@@ -543,6 +546,9 @@ export const en = {
     // 观测层 MVP（迁移 0022）：真实运行注解；无注解的行不渲染任何反向文案（null ≠ 空闲）。
     observedTitle: 'Program using this address',
     observedUptime: 'up {ago}',
+    // #468 D7: no CAP_SYS_PTRACE + Yama ⇒ pid/cwd/cmd/branch are all unreadable across uids;
+    // the row says this instead of rendering blank.
+    observedOpaque: 'Process details unreadable (cross-user)',
     duplicateWarn: '⚠ {cwd} is open on both {ports} at the same time — likely two versions coexisting. Check which one you want (leftovers from ended tasks do not close themselves).',
     unroutedNote: 'This app cannot be opened at a preview address yet — ask your assistant to move it to an assigned port.',
     stateHint: '“Admitted once” only means the first credential was admitted; it does not mean an app is listening in the container.',

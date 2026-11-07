@@ -269,7 +269,7 @@ describe('#468 F2：listenerItemsForProject（D1——只显示当前项目 + �
     item(22001, '~/projects/other'),                   // 别的项目 ⇒ 必须被排除
     item(22002, '~'),                                  // 未知项目 ⇒ 必须保留
     item(8099, '/tmp'),                                // 未知项目 ⇒ 必须保留
-    { ...item(22003, 'x'), observed: { pid: 1, cwd: null, cmd: null, branch: null, started_at: null, observed_at: null } }, // 跳 uid ⇒ 未知
+    { ...item(22003, 'x'), observed: { pid: 1, cwd: null, cmd: null, branch: null, started_at: null, observed_at: null } }, // 跨 uid ⇒ 未知
     item(22004, null),                                 // 无观测（池内空口）⇒ 不进事实面板
     item(22099, '~/projects/shopmate'),                // 前缀陷阱：不是 shop 的子目录
   ];
