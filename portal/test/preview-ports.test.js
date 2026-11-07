@@ -820,7 +820,7 @@ test('listFdePreviewPorts：池外观测合成无地址行；#468 D4 后只排�
   assert.equal(byPort.get(8000).observed.cmd, 'uvicorn', '未 sanitize 的绝对路径形（/home/<u>/projects/）同样合成');
   assert.equal(byPort.get(4000), undefined, '平台自己的代码目录（/opt/erix）不进列表（#468 D4 保留的那一半）');
   // #468 B1：原期望是 `undefined`（旧判据把 cwd=null 砍掉），D4 放宽后它必须存在。
-  assert.ok(byPort.get(34107), '#468 D4/B1：cwd=null 的观测（跳 uid 读不到 cwd）现在合成成只读行，不再被丢弃');
+  assert.ok(byPort.get(34107), '#468 D4/B1：cwd=null 的观测（跨 uid 读不到 cwd）现在合成成只读行，不再被丢弃');
   assert.equal(byPort.get(34107).id, 'observed:34107');
   assert.equal(byPort.get(34107).state, 'observed');
   assert.equal(byPort.get(34107).url, null, '合成行无地址可开');

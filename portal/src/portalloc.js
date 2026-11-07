@@ -440,7 +440,7 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
   //
   // ⚠ **#468 D4：合成判据从「只看 cwd 像不像项目目录」放宽为「只排除平台自己的代码目录」**
   //（`/opt/erix` 及其子目录 = agentd/worker 运行时，它不是用户的任何项目）。
-  // 其余一律合成（**含 cwd 为 null 的跳 uid 观测、`~`/`/tmp` 这类反推不出项目的观测**）：
+  // 其余一律合成（**含 cwd 为 null 的跨 uid 观测、`~`/`/tmp` 这类反推不出项目的观测**）：
   // 用户裁定「反推不出项目的进程不许丢弃」，而「未知项目」的分组是**前端展示层**的裁定（#468 D2/D3），
   // DTO 不新增字段也不删行。⚠ Docker 内嵌 DNS（127.0.0.11）**不在这里**挡——它在采样侧就被摘掉
   //（#468 D5：runner/lib/listeners.js 按 /proc/net/tcp 地址段 0B00007F 排除），否则每台 FDE 都会多一条噪音。

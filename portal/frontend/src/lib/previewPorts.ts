@@ -238,7 +238,7 @@ export function retryAfterSeconds(error: PreviewApiError): number | null {
  */
 /**
  * 观测 cwd → 项目根（`~/projects/<name>`）：子目录里起的服务（frontend/、apps/web/）归到项目本身；
- * 非项目目录（`~`、`/tmp`、平台自己的 /opt 等，以及跳 uid 读不到 ⇒ null）返回 null——
+ * 非项目目录（`~`、`/tmp`、平台自己的 /opt 等，以及跨 uid 读不到 ⇒ null）返回 null——
  * 已知项目分组不收，#468 后由 `unknownProjectItems` 单列成「未知项目」组，**不再被丢弃**。
  * 未 sanitize 的绝对形（/home/<u>/projects/…）同样命中（与 portalloc 合成行同口径）。
  */
@@ -272,7 +272,7 @@ export function groupByProject(items: PreviewPortItem[]): Array<{ root: string; 
  *
  * 成立的两种形状（都是用户真实的服务，**不是**噪音）：
  *   - cwd 在 `~` / `/tmp` 这类非项目目录（现网实测：`python3 -m http.server` 起在家目录与 `/tmp`）；
- *   - 跳 uid 读不到 cwd（无 CAP_SYS_PTRACE + Yama ⇒ `cwd=null`）。
+ *   - 跨 uid 读不到 cwd（无 CAP_SYS_PTRACE + Yama ⇒ `cwd=null`）。
  * 用户裁定「反推不出项目不许丢弃」⇒ 本函数把它们挑出来给调用方单列一组（只靠 tooltip 提一句不算落地）。
  * ⚠ 无观测的行（`observed` 为 null/undefined）**不算**未知项目：null ≠ 空闲，也 ≠ 未知项目。
  * 组内 `port` ASC（与两个面板同一套排序）。
