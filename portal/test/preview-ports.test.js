@@ -784,8 +784,11 @@ test('listFdePreviewPorts：observed 只附新鲜观测行；陈旧（>45s 窗�
 });
 
 // 端口池外的真实监听（vite 5173 这类）：LEFT JOIN 不盖住 ⇒ 合成无地址只读行，
-// 否则「当前目录起了服务但面板说没有」。非项目目录（agentd 自己的 4000 等）不合成。
-test('listFdePreviewPorts：池外观测合成无地址行（~/projects 下）；非项目 cwd 与空 cwd 不合成', async () => {
+// 否则「当前目录起了服务但面板说没有」。
+// ⚠ **#468 D4** 把合成判据从「cwd 像不像项目目录」改成「只排除平台代码目录 /opt/erix」：
+// 所以 `cwd === null` 的观测**现在会**合成（原断言 `byPort.get(34107) === undefined` 按 D4 翻向）。
+// 既有的两条硬判据未放宽：池内无观测行的 `observed` 恒 null、合并后按 port 全局升序。
+test('listFdePreviewPorts：池外观测合成无地址行；#468 D4 后只排除 /opt/erix，cwd=null 也合成', async () => {
   const fresh = new Date().toISOString();
   let calls = 0;
   const pool = {
@@ -815,9 +818,61 @@ test('listFdePreviewPorts：池外观测合成无地址行（~/projects 下）�
   assert.equal(byPort.get(5173).state, 'observed');
   assert.equal(byPort.get(5173).observed.cmd, 'node vite');
   assert.equal(byPort.get(8000).observed.cmd, 'uvicorn', '未 sanitize 的绝对路径形（/home/<u>/projects/）同样合成');
-  assert.equal(byPort.get(4000), undefined, 'agentd 自己的内部口（非 ~/projects）不进列表');
-  assert.equal(byPort.get(34107), undefined, 'cwd 未知的观测不合成（不是用户的项目）');
-  assert.deepEqual([...byPort.keys()].sort((a, b) => a - b), [5173, 8000, 22001], '合并按 port 全局排序');
+  assert.equal(byPort.get(4000), undefined, '平台自己的代码目录（/opt/erix）不进列表（#468 D4 保留的那一半）');
+  // #468 B1：原期望是 `undefined`（旧判据把 cwd=null 砍掉），D4 放宽后它必须存在。
+  assert.ok(byPort.get(34107), '#468 D4/B1：cwd=null 的观测（跳 uid 读不到 cwd）现在合成成只读行，不再被丢弃');
+  assert.equal(byPort.get(34107).id, 'observed:34107');
+  assert.equal(byPort.get(34107).state, 'observed');
+  assert.equal(byPort.get(34107).url, null, '合成行无地址可开');
+  assert.deepEqual(byPort.get(34107).observed, { pid: 1, cwd: null, cmd: null, branch: null, started_at: null, observed_at: fresh },
+    'observed 逐字段原样下发（细节全不可读 ⇒ 四个字段全 null，前端据此写「进程细节不可读」并归「未知项目」组）');
+  assert.deepEqual([...items.map((i) => i.port)], [5173, 8000, 22001, 34107], '合并按 port 全局升序（#468 B4：新期望值钉死，不是集合相等）');
+});
+
+// #468 D4 的边界：平台代码目录只摘 `/opt/erix` 本身与其**子目录**（agentd/worker 运行时）。
+test('#468 B2：/opt/erix 与 /opt/erix/sub 都不进列表（平台代码目录的边界）', async () => {
+  const fresh = new Date().toISOString();
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM port_allocations')) return { rows: [] };
+      if (sql.includes('FROM port_observations')) {
+        return { rows: [
+          { port: 4000, pid: 7, cwd: '/opt/erix', cmd: 'node agentd.js', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 4001, pid: 8, cwd: '/opt/erix/sub', cmd: 'node worker.js', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 4002, pid: 9, cwd: '/opt/erixx', cmd: 'node other.js', branch: null, proc_started_at: fresh, observed_at: fresh },
+        ] };
+      }
+      throw new Error(`unexpected sql: ${sql}`);
+    },
+  };
+  const items = await listFdePreviewPorts(pool, { fdeId: 'u-alice' });
+  const ports = items.map((i) => i.port);
+  assert.deepEqual(ports, [4002], '只有 /opt/erix 与 /opt/erix/ 子目录被排除；/opt/erixx（不是子目录）照常合成');
+  assert.equal(items[0].id, 'observed:4002');
+});
+
+// #468 D2/D4 的后端一半：反推不出项目的观测（家目录本身、/tmp）必须照常下发，
+// 「未知项目」分组是前端展示层的裁定 ⇒ DTO 不删行、不新增字段。
+test('#468 B3：cwd="~" 与 cwd="/tmp" 的观测也合成（未知项目的后端一半）', async () => {
+  const fresh = new Date().toISOString();
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM port_allocations')) return { rows: [] };
+      if (sql.includes('FROM port_observations')) {
+        return { rows: [
+          { port: 22002, pid: 51, cwd: '~', cmd: 'python3 -m http.server', branch: null, proc_started_at: fresh, observed_at: fresh },
+          { port: 8099, pid: 52, cwd: '/tmp', cmd: 'python3 -m http.server', branch: null, proc_started_at: fresh, observed_at: fresh },
+        ] };
+      }
+      throw new Error(`unexpected sql: ${sql}`);
+    },
+  };
+  const items = await listFdePreviewPorts(pool, { fdeId: 'u-alice' });
+  const byPort = new Map(items.map((i) => [i.port, i]));
+  assert.deepEqual([...byPort.keys()], [8099, 22002], '两条都在（本例无活行 ⇒ 22002 也走合成路径），并按 port 升序');
+  assert.equal(byPort.get(22002).state, 'observed', 'cwd="~" 合成（实测：观测表里 cwd="~" 的行 DTO 必须有）');
+  assert.equal(byPort.get(8099).state, 'observed', 'cwd="/tmp" 合成（旧判据会整条砍掉）');
+  assert.equal(byPort.get(8099).observed.cwd, '/tmp', 'cwd 原文下发，前端靠 projectRootOf 归到「未知项目」');
 });
 
 test('listFdePreviewPorts：观测表读失败（旧部署无表）⇒ 降级为全 null，列表照常', async () => {

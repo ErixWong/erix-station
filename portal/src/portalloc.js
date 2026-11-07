@@ -437,12 +437,18 @@ export async function listFdePreviewPorts(clientOrPool, { fdeId }) {
   // 端口池外的真实监听（agent 起在 5173/8000 这类默认口上的 dev server）：以前只在 LEFT JOIN 里
   // 被丢弃 ⇒ 用户「当前目录明明起了服务，面板却说没有」。现在合成成**无地址的只读行**
   // （hostname/url=null，state='observed'）：不能开、没有票，但「有进程在用这个口」这件事可见。
-  // 只要 ~/projects/ 下的（agentd 自己的 4000、root 的内部口不算“用户的项目”，不进列表）。
+  //
+  // ⚠ **#468 D4：合成判据从「只看 cwd 像不像项目目录」放宽为「只排除平台自己的代码目录」**
+  //（`/opt/erix` 及其子目录 = agentd/worker 运行时，它不是用户的任何项目）。
+  // 其余一律合成（**含 cwd 为 null 的跳 uid 观测、`~`/`/tmp` 这类反推不出项目的观测**）：
+  // 用户裁定「反推不出项目的进程不许丢弃」，而「未知项目」的分组是**前端展示层**的裁定（#468 D2/D3），
+  // DTO 不新增字段也不删行。⚠ Docker 内嵌 DNS（127.0.0.11）**不在这里**挡——它在采样侧就被摘掉
+  //（#468 D5：runner/lib/listeners.js 按 /proc/net/tcp 地址段 0B00007F 排除），否则每台 FDE 都会多一条噪音。
   const poolPorts = new Set(items.map((i) => i.port));
-  const looksLikeProject = (cwd) => typeof cwd === 'string'
-    && (cwd.startsWith('~/projects/') || /^\/home\/[^/]+\/projects\//.test(cwd));
+  const isPlatformCodeDir = (cwd) => typeof cwd === 'string'
+    && (cwd === '/opt/erix' || cwd.startsWith('/opt/erix/'));
   for (const [port, obs] of observedByPort) {
-    if (poolPorts.has(port) || !looksLikeProject(obs.cwd)) continue;
+    if (poolPorts.has(port) || isPlatformCodeDir(obs.cwd)) continue;
     items.push({
       id: `observed:${port}`,
       port,
