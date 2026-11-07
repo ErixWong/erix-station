@@ -503,12 +503,14 @@ export const en = {
     adminTitle: 'Preview ports of {fde}',
     // workbench disclosure bar (issue #308: now at the bottom of the left sidebar, an independent
     // toggle next to the directory tree; the collapsed state must still convey something useful)
-    // 双面板拆分（用户裁定）：端口池=地址维度、进程监听=事实维度，各自按项目分组。
-    poolToggle: 'Port pool',
-    poolToggleCount: 'Port pool ({count})',
-    poolToggleFailed: 'Port pool (failed to load)',
+    // #468 addendum A: the port-pool panel is retired (the user only wants pool size / idle count on the
+    // listener toggle), so poolToggle / poolToggleCount / poolToggleFailed are gone with it.
     procToggle: 'Process listeners',
     procToggleCount: 'Listeners ({count})',
+    // #468 D8: pool usage on the disclosure bar — pool size first, idle second (user's example `10/8`).
+    // Not rendered while unloaded or on error, so there is deliberately no "failed" variant here.
+    poolUsage: 'Port pool {total}/{idle}',
+    poolUsageTitle: '{total} ports in the pool, {idle} of them idle (nothing is listening)',
     procEmpty: 'No processes are listening in the current project.',
     spareGroup: 'Spare ({count})',
     // #468 D2: observations whose project root cannot be derived (cwd in ~ // /tmp, or unreadable across uids)

@@ -6,7 +6,9 @@
 //   ② 会话列表段：flex-1 min-h-0 overflow-y-auto，独立内部滚动（空态文案「先创建目录」/
 //      「暂无会话」/平台管理员提示也放这里）——列表再长也不推挤头与树
 //   ③ 底部堆叠区（issue #308）：**一个**滚动容器（shrink-0 max-h-[50vh] overflow-y-auto）里装
-//      「预览端口段 + 目录树面板」，两段**各自一个折叠开关**（都默认折叠、不持久化、不共用总开关）。
+//      「进程监听段 + 目录树面板」，两段**各自一个折叠开关**（都默认折叠、不持久化、不共用总开关）。
+//      issue #468 追加 A：原本的「端口池面板」整块退役（用户裁定只要折叠条上的「端口池 总量/空闲」两个数），
+//      所以这个栈里只剩一段端口相关 UI（折叠条 data-test="process-watch-toggle"，用量文本 data-test="pool-usage"）。
 //      高度/滚动预算只留这一层：树与端口面板都不再自带 overflow/max-h，否则三层滚动会抢滚轮。
 //      底部栈恒在列表之下 ⇒ 任意会话数下端口段与目录树恒可达，而列表仍然独立可滚。
 // issue #94（评审裁决瘦身版）：SessionPickerModal（单次全量浏览）挂在本组件与 WorkbenchView。
@@ -27,7 +29,7 @@ import DirSelect from './DirSelect.vue';
 import DirectoryTree from './DirectoryTree.vue';
 import FilePreviewModal from './FilePreviewModal.vue';
 import NewDirectoryModal from './NewDirectoryModal.vue';
-import { groupByProject } from '../lib/previewPorts';
+import { listenerItemsForProject } from '../lib/previewPorts';
 import { hashUrl } from '../lib/hostGate';
 import { ADMIN_CONSOLE_PATH } from '../lib/workbenchGate';
 import PreviewPortsPanel from './PreviewPortsPanel.vue';
@@ -65,29 +67,47 @@ function onRefresh() {
 // #247 的批量签票同一条纪律：只在点「打开全部预览」时调 `openAllPreviews`（挂载不签、折叠不签）。
 // 折叠态是纯本地 ref，**不持久化**（不写 localStorage、不发后端），刷新后回到折叠。
 const ports = usePreviewPorts();
-// ---- 双面板拆分（用户裁定）：端口池（地址维度）与进程监听（事实维度）各自分组展示 ----
-const poolOpen = ref(false);
+// ---- #468 追加 A：侧栏只留**一个**端口相关面板（进程监听=事实维度）----
+// 端口池面板（地址维度）已整块退役：用户裁定「只要在 listener 上写一下端口池的数量和空闲数量就好了」
+// ⇒ 池的总量/空闲两个数字改挂在**进程监听折叠条**上（data-test="pool-usage"），不再单独开一块列表。
+// ⚠ 管理台的 FdePreviewPortsPane（variant='table'）不受影响（运维面仍要看全量明细）。
 const procOpen = ref(false);
 
-/** 面板①端口池：有地址的行（合成行不属于池）。 */
-const poolItems = computed(() => ports.items.value.filter((item) => item.url));
-/** 观测可用判据：DTO 无 observed 键 = 旧后端 ⇒ 进程面板整段退场（null ≠ 空闲，不谎报）。 */
+/**
+ * 池行（#468 追加 A）：只当「端口池 总量/空闲」两个数字的数据源（不再是面板）。
+ * `url` 非空 = 池内（`observed:<port>` 合成行 url=null ⇒ 天然不计入）。
+ */
+const poolRows = computed(() => ports.items.value.filter((item) => item.url));
+/** 观测可用判据：DTO 无 observed 键 = 旧后端 ⇒ 进程面板退场（null ≠ 空闲，不谎报）。 */
 const observationsAvailable = computed(() => ports.items.value.some((item) => 'observed' in item));
-/** 面板②进程监听：有观测且落在项目目录下的行（池内外都要）——分组逻辑复用 lib（组内 port ASC、组间字典序）。 */
-const procItems = computed(() => groupByProject(ports.items.value).flatMap((group) => group.items));
+/**
+ * 进程监听面板的行（#468 **D1**）：只显示**当前项目的进程 + 未知项目的进程**，
+ * 其它项目不显示（旧实现把 `groupByProject` 拍平当列表用 ⇒ 当前项目是 shop 时也能看到 probe-451 的口）。
+ * 判据在 `lib/previewPorts.listenerItemsForProject`（含 D6：`store.dirCwd` 反推不出项目时不过滤）。
+ */
+const procItems = computed(() => listenerItemsForProject(ports.items.value, store.dirCwd));
 
-const poolCount = computed(() => poolItems.value.length);
-const poolToggleLabel = computed(() => {
-  if (ports.listError.value !== null) return t('previewPorts.poolToggleFailed');
-  return poolCount.value > 0
-    ? t('previewPorts.poolToggleCount', { count: poolCount.value })
-    : t('previewPorts.poolToggle');
-});
 const procToggleLabel = computed(() =>
   procItems.value.length > 0
     ? t('previewPorts.procToggleCount', { count: procItems.value.length })
     : t('previewPorts.procToggle'),
 );
+
+/**
+ * 折叠条上的池用量（#468 追加 A D8）：`端口池 {total}/{idle}`（**池大小在前、空闲在后**，用户举的例子就这个顺序）。
+ *   - `total` = 池内行数（`poolRows`）；`idle` = 池内且**无观测**（「没人在听」）；
+ *   - ⚠ **不渲染的三个条件**（任一成立整段不出现，**绝不显示 `0/0`**）：
+ *     未 loaded / 加载中且未 loaded / `listError` 非空（失败时面板自己已有错误块，不再叠一个假数字）；
+ *   - `title` 与 `aria-label` 逐字相同（截断时完整口径仍可达，照 #308 那套纪律）。
+ */
+const poolUsage = computed(() => {
+  if (!ports.loaded.value || ports.listError.value !== null) return null;
+  const total = poolRows.value.length;
+  const idle = poolRows.value.filter((item) => !item.observed).length;
+  return { total, idle };
+});
+const poolUsageText = computed(() => (poolUsage.value === null ? '' : t('previewPorts.poolUsage', poolUsage.value)));
+const poolUsageTitle = computed(() => (poolUsage.value === null ? '' : t('previewPorts.poolUsageTitle', poolUsage.value)));
 
 // load() 自带 try/catch/finally（失败落 listError），不会产生未捕获拒绝（AGENTS §4 / #281）。
 onMounted(() => { void ports.load(); });
@@ -369,45 +389,17 @@ function messageCountSuffix(s: Session): string {
       </div>
     </div>
 
-    <!-- ③ 底部堆叠区（issue #308）：**唯一**的底部滚动容器——端口段 + 目录树都在里面，
-         两段各自折叠；max-h-[50vh] 是高度预算（1280×768 下：aside 内容高 ≈706px − 固定头 76/116px
+    <!-- ③ 底部堆叠区（issue #308）：**唯一**的底部滚动容器——#468 追加 A 后里面是
+         「进程监听段（带池用量）+ 目录树面板」，两段各自折叠（原本前面的端口池段已退役）；
+         max-h-[50vh] 是高度预算（1280×768 下：aside 内容高 ≈706px − 固定头 76/116px
          − 列表 mt-2 8px − 栈上限 384px ⇒ 列表仍有 ≈238/198px ≥ 120px 判据），overflow-y-auto 只这一层。
          子层（端口面板 / 目录树）一律不再自带 max-h/overflow ⇒ 不会出现嵌套滚动条抢滚轮。 -->
     <div data-test="sidebar-bottom-stack" class="mt-2 shrink-0 max-h-[50vh] overflow-y-auto">
-      <!-- ③-a 端口池段：地址维度——工位分到的预览地址按项目分组，谁在用一目了然；未用在收进「空闲」组 -->
-      <div class="mt-1 border-t border-black/10 pt-2">
-        <button
-          type="button"
-          data-test="preview-ports-toggle"
-          class="flex w-full items-center gap-1.5 rounded px-1 py-[3px] text-left text-[11px] font-semibold tracking-[0.05em] hover:bg-black/5"
-          :aria-expanded="poolOpen"
-          aria-controls="preview-ports-disclosure"
-          @click="poolOpen = !poolOpen"
-        >
-          <span aria-hidden="true">{{ poolOpen ? '▾' : '▸' }}</span>
-          <span>{{ poolToggleLabel }}</span>
-        </button>
-        <!-- v-show（非 v-if）：面板常驻 DOM（#246 语义：折叠只是不占位）；票仍然只在点击时签 -->
-        <div v-show="poolOpen" id="preview-ports-disclosure" class="mt-1 min-w-0">
-          <PreviewPortsPanel
-            variant="list"
-            group-by-project
-            :items="poolItems"
-            :current-cwd="store.dirCwd"
-            :loading="ports.loading.value"
-            :loaded="ports.loaded.value"
-            :error="ports.listError.value"
-            :ticket-busy-id="ports.ticketBusyId.value"
-            :ticket-error="ports.ticketError.value"
-            :popup-blocked-url="ports.popupBlockedUrl.value"
-            @open="(item) => void ports.openPreview(item)"
-          />
-        </div>
-      </div>
-
-      <!-- ③-a2 进程监听段：事实维度——容器里真有进程在听的端口（含池外口），按项目分组。
-           旧后端无观测（DTO 无 observed 键）⇒ 整段退场，不拿 null 谎报「没进程」。 -->
-      <div v-if="observationsAvailable" class="mt-1 border-t border-black/10 pt-2">
+      <!-- ③-a 进程监听段（#468 追加 A 后这是唯一的端口区块）：事实维度——容器里真有进程在听的端口（含池外口），
+           按项目分组且**只跟随当前项目**（+ 未知项目）。端口池面板已退役，池的总量/空闲只在本折叠条上给两个数。
+           旧后端无观测（DTO 无 observed 键）⇒ 面板退场（不拿 null 谎报「没进程」）；但**加载失败必须有个地方说错误**
+           ⇒ 闸多了 `|| listError`：否则 items 为空 ⇒ 旧闸把它挡掉 ⇒ 失败在侧栏里完全静默。 -->
+      <div v-if="observationsAvailable || ports.listError.value !== null" class="mt-1 border-t border-black/10 pt-2">
         <button
           type="button"
           data-test="process-watch-toggle"
@@ -418,8 +410,20 @@ function messageCountSuffix(s: Session): string {
         >
           <span aria-hidden="true">{{ procOpen ? '▾' : '▸' }}</span>
           <span>{{ procToggleLabel }}</span>
+          <!-- #468 追加 A D8：端口池面板退役后，池的总量/空闲就挂在这条折叠条上（池大小/空闲，用户举例 `10/8`）。
+               三个不渲染条件见 `poolUsage`（未 loaded / 加载中且未 loaded / listError）；title 与 aria-label 逐字相同。 -->
+          <span
+            v-if="poolUsage !== null"
+            data-test="pool-usage"
+            class="min-w-0 shrink truncate text-black/55"
+            :title="poolUsageTitle"
+            :aria-label="poolUsageTitle"
+          >{{ poolUsageText }}</span>
         </button>
         <div v-show="procOpen" id="process-watch-disclosure" class="mt-1 min-w-0">
+          <!-- v-show（非 v-if）：面板常驻 DOM（#246 语义：折叠只是不占位）；票仍然只在点击时签。
+               ⚠ `ticket-error` / `popup-blocked-url` 跟着退役的池面板**迁到这里**（#468 追加 A）：
+               现在全侧栏只有这一块有「打开预览」按钮，不接这两个 props 则签票失败与弹窗拦截会变成「点了没反应」。 -->
           <PreviewPortsPanel
             variant="list"
             group-by-project
@@ -429,6 +433,8 @@ function messageCountSuffix(s: Session): string {
             :loaded="ports.loaded.value"
             :error="ports.listError.value"
             :ticket-busy-id="ports.ticketBusyId.value"
+            :ticket-error="ports.ticketError.value"
+            :popup-blocked-url="ports.popupBlockedUrl.value"
             :empty-label="t('previewPorts.procEmpty')"
             @open="(item) => void ports.openPreview(item)"
           />

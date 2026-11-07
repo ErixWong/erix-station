@@ -535,12 +535,14 @@ export const zhCN = {
     title: '预览端口',
     adminTitle: '{fde} 的预览端口',
     // 工作台折叠条（issue #308 起在左侧栏底部，与目录树各自独立折叠；收起态也要给出可用信息）
-    // 双面板拆分（用户裁定）：端口池=地址维度、进程监听=事实维度，各自按项目分组。
-    poolToggle: '端口池使用情况',
-    poolToggleCount: '端口池（{count} 个）',
-    poolToggleFailed: '端口池（加载失败）',
+    // #468 追加 A：端口池面板退役（用户裁定只要「端口池 总量/空闲」两个数），所以只剩进程监听一个折叠条；
+    // poolToggle / poolToggleCount / poolToggleFailed 随池面板一起删除（零消费者，localeParity 守成对）。
     procToggle: '进程监听情况',
     procToggleCount: '进程监听（{count} 个）',
+    // #468 追加 A D8：折叠条上的池用量，顺序是**池大小/空闲**（用户举例 `10/8`）。
+    // 未 loaded 或有错误 ⇒ 整段不渲染（绝不显示 0/0），所以这里不需要「失败」版文案。
+    poolUsage: '端口池 {total}/{idle}',
+    poolUsageTitle: '端口池共 {total} 个，其中 {idle} 个空闲（没有进程在监听）',
     procEmpty: '当前项目里没有进程在监听。',
     spareGroup: '空闲（{count}）',
     // #468 D2：反推不出项目（cwd 在 ~//tmp 等非项目目录，或跨 uid 读不到 cwd）的观测**单列一组**，不许丢弃。
