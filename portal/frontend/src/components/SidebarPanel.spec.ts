@@ -991,6 +991,25 @@ describe('SidebarPanel · 端口区块与底部堆叠区（issue #308 + #468 追
       .toContain('预览端口加载失败（db_unavailable）：数据库暂时不可用');
   });
 
+  it('#468 S6b（追加 A，主 agent 补）：先成功再刷新失败 ⇒ 池用量立刻退场（此时 loaded 仍是 true，只有 listError 挡得住陈旧数字）', async () => {
+    // 前置：第一次加载成功 ⇒ loaded=true、数字是「端口池 10/8」
+    stubRoutes(Array.from({ length: 10 }, (_, n) => portRow(n, 'allocated', n < 2 ? obs('~/projects/a') : null)));
+    const wrapper = await mountPanel({ dirs: DIR });
+    await tick();
+    expect(wrapper.get('[data-test="pool-usage"]').text()).toBe('端口池 10/8');
+
+    // 之后一次刷新（轮询 / 回前台）失败：`usePreviewPorts.load()` 失败时**不清 loaded、也不清 items**
+    // ⇒ 只有 `listError` 这一条能让数字退场。少了它，界面上会出现「错误块 + 陈旧的 10/8」并存。
+    const after = stubRoutes(Array.from({ length: 10 }, (_, n) => portRow(n, 'allocated', n < 2 ? obs('~/projects/a') : null)), 503);
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await tick();
+
+    expect(portsCalls(after).length).toBeGreaterThanOrEqual(1); // 刷新真的发生了（不是空断言）
+    expect(wrapper.find('[data-test="pool-usage"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="preview-ports-error"]').text()).toContain('db_unavailable');
+  });
+
   it('进程监听折叠条与目录树互不影响（不共用总开关）：展开端口不动树，收起端口不影响已展开的树', async () => {
     const calls = stubRoutes();
     const wrapper = await mountPanel({ dirs: DIR });
