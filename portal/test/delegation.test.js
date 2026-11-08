@@ -281,11 +281,14 @@ test('B1 判据1 跨用户不可见：B 拿 A 的 sessionId ⇒ 404，且响应�
   } finally { h.cleanup(); }
 });
 
-test('B2 判据2 跨会话不可见：同用户的另一个 sessionId + 本会话的 parentRunId ⇒ 404', async () => {
+test('B2 判据2 跨会话不可见：同用户的**另一个** sessionId + 本会话的 parentRunId ⇒ 404', async () => {
   const h = await makeHarness({ roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1 })]] });
   try {
+    // 必须走 `callList`（它负 userId）：直接 `listDelegates({...h})` 会漏掉 userId，
+    // 于是 404 来自「会话不属你」而不是「父 run 不属该会话」——两者同一个 404，假绿得很难看。
+    // （实测：这一格写成直调时，摘掉 `SELECT 1 FROM runs` 那条归属查询**不会红**。）
     await expectDelegationError(
-      listDelegates({ ...h, sessionId: SESSION_A_OTHER }),
+      callList(h, { sessionId: SESSION_A_OTHER }),
       { code: 'not_found', httpStatus: 404 },
     );
     assert.deepEqual(h.fsSpy.calls, [], '父 run 不属于该会话 ⇒ 一个文件都不许读');
