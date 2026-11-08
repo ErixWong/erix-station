@@ -516,6 +516,8 @@ export const en = {
     // #468 D2: observations whose project root cannot be derived (cwd in ~ // /tmp, or unreadable across uids)
     // get their own group instead of being dropped.
     unknownGroup: 'Unknown project ({count})',
+    // #468: full wording behind the amber "!" on each row of the unknown-project group.
+    unknownMarkTitle: 'This process does not belong to the current project',
     currentBadge: 'Current',
     colPort: 'Port',
     colHostname: 'Preview host',
