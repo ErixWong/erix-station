@@ -80,6 +80,57 @@ export function prepareSessionNotesDir(home, sessionId, { workerUid, workerGid }
 }
 
 // ---------------------------------------------------------------------------
+// delegation（子 run）目录（issue delegation P1，2026-11-08）
+//
+//   <home>/delegation/roster/<parentRunId>/   名册（每父 run 一片 ⇒ 模型的 `list` 只看见自己的子）
+//   <home>/delegation/leases/                 子 run 并发租约（**每 FDE 共享 = 全局子配额**）
+//   <home>/delegation/transcripts/            子 run 账本（每子一份 JSONL，P2 门户从这里读）
+//
+// 为什么必须预建（而不是让 worker 自己建）：agentd 跑 UID 1001、worker 跑 1002（`agentd.js:52`、
+// `Dockerfile:35-36`），1001 建的目录默认 755 ⇒ 1002 写不进；`entrypoint.sh` 的 `umask 0002` 只对
+// **新建**生效，救不了已存在的属主。先例：notes 目录就是 agentd 用 `runAsWorker` 预建的
+// （本文件 `prepareSessionNotesDir` / `prepareRunDataDir`）。
+// 为什么不放在 `runs/<runId>/`：那条目录在 run 终态被 `archiveRunData` 整体搬走，而名册与子账本
+// 必须在 run 终态后**还活着**（UI 要回看、P2 门户要读）。代价：没 TTL 会累积，清理是 P2/P3 的活。
+// ---------------------------------------------------------------------------
+
+/** delegation 根目录（不预建，只算路）。 */
+export function delegationDir(home) {
+  return path.join(home, 'delegation');
+}
+
+/** 需要预建的三个子目录（与 `lib/delegation.js` 的布局逐字一致，改一处两边都要改）。 */
+export const DELEGATION_SUBDIRS = Object.freeze(['roster', 'leases', 'transcripts']);
+
+// 以 worker UID/GID 建三个子目录（存在则只 chmod，幂等）。属主不对的遗留目录走「复制 → 换名」
+// 而非 `chown`：容器里 worker 没 CAP_CHOWN 把自己建的目录转过来，notes 先例同口径。
+const DELEGATION_DIR_HELPER = `
+const fs = require('node:fs');
+const path = require('node:path');
+const [root, subs] = process.argv.slice(1);
+const ensure = (directory) => {
+  let stat = null;
+  try { stat = fs.lstatSync(directory); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (stat !== null && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error('delegation path is not a directory');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+};
+ensure(root);
+for (const sub of JSON.parse(subs)) ensure(path.join(root, sub));
+`;
+
+/**
+ * 备好 delegation 三个子目录（根目录 agentd 所有 775、叶子 worker 所有 700），返回下行的 delegation_dir。
+ * 抛错由调用方处置：delegation 是加分项，**只 warn 不 requeue**（同 notes 的降级口径）。
+ */
+export function prepareDelegationDirs(home, { workerUid, workerGid }) {
+  const dir = delegationDir(home);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o775 });
+  runAsWorker(DELEGATION_DIR_HELPER, [dir, JSON.stringify([...DELEGATION_SUBDIRS])], { workerUid, workerGid });
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
 // 目录移动 / 删除原语
 // ---------------------------------------------------------------------------
 

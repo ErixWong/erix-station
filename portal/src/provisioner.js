@@ -207,6 +207,15 @@ export function buildContainerConfig({
       // #114 起**默认关**（默认标题 = 首条消息截断 / 手工改名 / AI 改名），显式设 1 才开回；
       // 与 portal 侧 config.sessionAutoTitle 同口径。字符串开关（非数值），只透传 '0'/'1'。
       `ERIX_SESSION_AUTO_TITLE=${process.env.ERIX_SESSION_AUTO_TITLE === '1' ? '1' : '0'}`,
+      // delegation P1（2026-11-08）：子 run（`delegate` 工具）的四个下发面。**值一律来自 portal 自己的
+      // env**（不硬编码）：四个都下发 ⇒ FDE 容器内的 worker/agentd 是唯一的默认值执行点
+      // （`runner/lib/config.js` 钳位）。⚠ **三处同改**（compose → 这里 → `fde-proxy` 的 `ENV_KEY_ALLOW`）：
+      // §8.70 那个同型事故的形状就是「注入方加了键、放行方没加」⇒ 现网 `create_policy_denied`。
+      // 判据：`portal/test/deploy-env-delegate.test.js`。
+      `ERIX_DELEGATE_ENABLED=${process.env.ERIX_DELEGATE_ENABLED === '1' ? '1' : '0'}`,
+      `ERIX_DELEGATE_MAX=${Number(process.env.ERIX_DELEGATE_MAX) || 2}`,
+      `ERIX_DELEGATE_CHILD_ROUNDS=${Number(process.env.ERIX_DELEGATE_CHILD_ROUNDS) || 8}`,
+      `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${Number(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS) || 240000}`,
     ],
     Labels: { 'station.managed': 'true', 'fde.name': fdeName, 'station.stack': stackId, ...labels },
     HostConfig: {
