@@ -22,12 +22,19 @@
 // 设计红线：
 //   - **任何一步失败都不许 throw**——这是心跳的捎带数据，采样炸了只报空数组，绝不能拖死心跳链路；
 //   - procPath/home 可注入（单测用 fixture 目录，不碰真实 /proc，AGENTS.md §4 测试隔离约定）；
-//   - 条目数封顶（防 /proc 异常形状灌爆心跳体）。
+//   - 条目数封顶（防 /proc 异常形状灌爆心跳体）；
+//   - **Docker 内嵌 DNS（`127.0.0.11`）不进观测**（#468 D5）：那是**容器运行时自己的解析器**
+//     （每容器的 `/etc/resolv.conf` 都指向它，`uid 0` + Yama ⇒ cwd 永远读不到、`pid` 反查也永远反查不到），
+//     **永远不是用户的服务**。现网 4 台 FDE 各有一条这样的 `cwd IS NULL` 观测（实测逐条核对 `/proc/net/tcp`
+//     第 2 列 = `0B00007F:<port>`）⇒ 一旦后端放宽「池外行合成」的判据（#468 D4），每台都会多一条
+//     纯噪音的「未知项目」行。所以排除必须做在**采样侧**，让这条根本进不了 `port_observations`。
 import fs from 'node:fs';
 import path from 'node:path';
 
 const LISTEN_STATE = '0A';            // /proc/net/tcp 的 st 列（十六进制）：0A = TCP_LISTEN
 const CLK_TCK = 100;                  // Linux USER_HZ；/proc/<pid>/stat 的 starttime 以此为单位
+/** `127.0.0.11` 在 `/proc/net/tcp` 里的**地址段**（小端十六进制）——Docker 内嵌 DNS，见文件头红线。 */
+const DOCKER_EMBEDDED_DNS_ADDR = '0B00007F';
 export const MAX_LISTENERS = 64;      // 心跳载荷封顶（超出按端口升序截断）
 const CMD_MAX = 200;                  // cmdline 摘要截断长度
 const CWD_MAX = 512;
@@ -54,6 +61,11 @@ function bootTimeSec(procPath) {
  * 解析 net/tcp{,6} 的 LISTEN 行 → [{port, inode, uid}]。
  * uid（第 8 列）同时充当**跨 UID 可读性判据**：fd/cwd readlink 只有 owner 的 euid 读得动
  *（无 CAP_SYS_PTRACE + Yama 下），后续按 uid 分组 setuid 重扫。
+ *
+ * ⚠ **排除 Docker 内嵌 DNS `127.0.0.11`**（#468 D5，判据取第 2 列的**地址段** `0B00007F`，不是端口号——
+ * 那条解析器监听的端口每台容器都不一样）：它是容器运行时的解析器、`uid 0` 且 Yama ⇒ cwd 永远读不到，
+ * 在后端放宽合成判据（D4）后会变成每台 FDE 一条永久的「未知项目」噪音。⚠ **只对 v4 判**：
+ * v6 的 `::1`/`::` 形状与此无关，且 loopback 本身**不是**排除理由（`0.0.0.0`/`127.0.0.1` 上的用户服务照采）。
  */
 function listenSockets(procPath) {
   const out = [];
@@ -63,7 +75,8 @@ function listenSockets(procPath) {
     for (const line of text.split('\n').slice(1)) {
       const cols = line.trim().split(/\s+/);
       if (cols.length < 10 || cols[3] !== LISTEN_STATE) continue;
-      const portHex = (cols[1] || '').split(':')[1];
+      const [localAddr, portHex] = (cols[1] || '').split(':');
+      if (f === 'net/tcp' && (localAddr || '').toUpperCase() === DOCKER_EMBEDDED_DNS_ADDR) continue;
       const port = portHex ? parseInt(portHex, 16) : NaN;
       const inode = Number(cols[9]);
       const uid = Number(cols[7]);

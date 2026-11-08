@@ -457,20 +457,121 @@ describe('观测层注解（observed）', () => {
     expect(row.get('[data-test="preview-port-unrouted"]').text()).toContain('端口');
   });
 
-  it('双面板分工（用户裁定）：端口池面板只收 url 行；池外合成行归进程面板 ⇒ 池面板永不见「未知状态」', () => {
+  it('池外合成行（url=null）归进程面板：可识别在用，但无打开/复制按钮，只有说明句（#468 追加 A 后仍是这条分工）', () => {
     const all = [
       portItem('a', 22000, { observed: OBS_OTHER }),
       portItem('observed:5173', 5173, { hostname: null, url: null, state: 'observed', observed: OBS_SHOP }),
     ];
-    // 池面板：SidebarPanel 传的是 poolItems（url 非空）——这里模拟其子集
-    wrapper = mountPanel({ items: all.filter((i) => i.url), currentCwd: '~/projects/shop', variant: 'list', groupByProject: true });
-    expect(wrapper.text()).not.toContain('5173');
-    expect(wrapper.text()).not.toContain('未知状态');
-    // 进程面板：groupByProject 过滤后两行都在，各自归组；合成行仍无按钮只有说明句
+    // #468 追加 A：侧栏只剩「进程监听」这一个面板（端口池面板退役）⇒ 面板在侧栏的唯一用法就是有观测的行。
+    // 池外合成行仍然归它，且仍然没有按钮、只有说明句（不出现「未知状态」徽章）。
     wrapper = mountPanel({ items: all, currentCwd: '~/projects/shop', variant: 'list', groupByProject: true });
     const headers = wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text());
     expect(headers).toEqual(['shop当前目录', 'other']);
     const unrouted = wrapper.get('[data-test="preview-port-unrouted"]');
     expect(unrouted.text()).toContain('端口');
+    expect(wrapper.text()).not.toContain('未知状态');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #468 D2/D3/D7：反推不出项目的观测**单列成「未知项目（N）」组**（不丢、不只写在 tooltip 里），
+// 且行内细节全不可读时给「进程细节不可读（跨用户）」而不是空白行。
+// ---------------------------------------------------------------------------
+describe('#468 · 未知项目组与不可读细节', () => {
+  const OBS_SHOP = {
+    pid: 412, cwd: '~/projects/shop', cmd: 'node vite.js', branch: 'feat-x',
+    started_at: new Date(Date.now() - 3 * 3_600_000).toISOString(),
+    observed_at: new Date().toISOString(),
+  };
+  const OBS_OTHER = { ...OBS_SHOP, pid: 555, cwd: '~/projects/other', branch: null };
+  const OBS_HOME = {
+    pid: 611, cwd: '~', cmd: 'python3 -m http.server 22002', branch: null,
+    started_at: new Date(Date.now() - 2 * 3_600_000).toISOString(), observed_at: new Date().toISOString(),
+  };
+  const OBS_TMP = { ...OBS_HOME, pid: 612, cwd: '/tmp', cmd: 'python3 -m http.server' };
+  const OBS_SHOP_SUB = { ...OBS_SHOP, cwd: '~/projects/shop/apps/web', pid: 900 };
+  const OBS_CROSS_UID = { pid: null, cwd: null, cmd: null, branch: null, started_at: null, observed_at: new Date().toISOString() };
+
+  it('#468 P1（D2）：cwd="~" 的观测 ⇒ 出现 preview-port-group-unknown，组头点名「未知项目」与数量，行在 DOM 里', () => {
+    wrapper = mountPanel({
+      items: [
+        portItem('a', 22002, { hostname: null, url: null, state: 'observed', observed: OBS_HOME }),
+        portItem('b', 22000, { observed: OBS_SHOP }),
+      ],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    const unknown = wrapper.get('[data-test="preview-port-group-unknown"]');
+    expect(unknown.text()).toContain('未知项目');
+    expect(unknown.text()).toContain('1');
+    // 行本身必须在 DOM 上（不是只留一个组头），且带着那台 http.server
+    const rows = wrapper.findAll('[data-test="preview-port-row"]');
+    expect(rows).toHaveLength(2);
+    expect(wrapper.text()).toContain('22002');
+    expect(wrapper.text()).toContain('python3 -m http.server 22002');
+    // 未知组也是「分组头 + 行」的形态 ⇒ 通用钩子同样能数到它（组头共 2 个：shop + 未知项目）
+    expect(wrapper.findAll('[data-test="preview-port-group-header"]')).toHaveLength(2);
+  });
+
+  it('#468 P2（D2/D3）：组顺序 = 当前项目组 → 其它项目组 → **未知项目组** → 空闲组', () => {
+    wrapper = mountPanel({
+      items: [
+        portItem('spare', 22003, { observed: null }),                       // 池内未用 → 空闲组
+        portItem('home', 22002, { hostname: null, url: null, state: 'observed', observed: OBS_HOME }),
+        portItem('other', 22001, { observed: OBS_OTHER }),
+        portItem('shop-sub', 22005, { observed: OBS_SHOP_SUB }),            // 子目录 ⇒ 归 shop
+        portItem('tmp', 8099, { hostname: null, url: null, state: 'observed', observed: OBS_TMP }),
+        portItem('shop', 22000, { observed: OBS_SHOP }),
+      ],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    expect(wrapper.findAll('[data-test="preview-port-group-header"]').map((h) => h.text()))
+      .toEqual(['shop当前目录', 'other', '未知项目（2）', '空闲（1）']);
+    // 行序（组内 port ASC）：shop 22000/22005 → other 22001 → 未知 8099/22002 → 空闲 22003
+    expect(wrapper.findAll('[data-test="preview-port-value"]').map((v) => v.text()))
+      .toEqual(['22000', '22005', '22001', '8099', '22002', '22003']);
+    // 未知组不是「空闲」：两行都带观测文案，且组头数量 = 2（一条都不能少）
+    expect(wrapper.findAll('[data-test="preview-port-observed"]')).toHaveLength(5);
+  });
+
+  it('#468 P3（D7）：pid/cwd/cmd/branch 全 null 的观测 ⇒ 行文案是「进程细节不可读（跨用户）」，不是空白/undefined', () => {
+    wrapper = mountPanel({
+      items: [portItem('x', 34107, { hostname: null, url: null, state: 'observed', observed: OBS_CROSS_UID })],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    const line = wrapper.get('[data-test="preview-port-observed"]');
+    expect(line.text()).toBe('进程细节不可读（跨用户）');
+    expect(line.text()).not.toContain('undefined');
+    // 细节全不可读 ⇒ cwd 也读不到 ⇒ 这一行必然落进「未知项目」组（D2 与 D7 在这里是同一件事的两面）。
+    expect(wrapper.text()).toContain('未知项目（1）');
+    // 非分组/主区形态（else 支）同样不许空行
+    wrapper.unmount();
+    wrapper = mountPanel({ items: [portItem('y', 34108, { observed: OBS_CROSS_UID })] });
+    expect(wrapper.get('[data-test="preview-port-observed"]').text()).toBe('进程细节不可读（跨用户）');
+  });
+
+  it('#468 P3b（D7，从 erix 线搬来）：表格形态（管理台）同样给「进程细节不可读（跨用户）」，不留空格', () => {
+    // 管理台是 `variant='table'`：细节全 null 时同样不许空单元格（P3 只盖了 list / 平铺两种形态）。
+    wrapper = mountPanel({ items: [portItem('x', 34107, { observed: OBS_CROSS_UID })], variant: 'table' });
+    expect(wrapper.get('[data-test="preview-port-observed"]').text()).toBe('进程细节不可读（跨用户）');
+  });
+
+  it('#468 P4：旧后端（DTO 无 observed 键）⇒ 平铺、无组头、行序与排序权重逐字不变', () => {
+    wrapper = mountPanel({
+      // 三条**都没有** `observed` 键 = 未跑 0022 的旧后端 ⇒ observationsAvailable=false ⇒ 分组自动失效。
+      items: [portItem('a', 22000), portItem('b', 22001), portItem('c', 22002)],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,   // 即便要求分组，无观测可用 ⇒ 自动退回平铺（不出现任何组头）
+    });
+    expect(wrapper.findAll('[data-test="preview-port-group-header"]')).toHaveLength(0);
+    expect(wrapper.find('[data-test="preview-port-group-unknown"]').exists()).toBe(false);
+    // 无观测 ⇒ rank 全为 2 ⇒ 只按 port ASC（与改动前逐字相同，没有新组、没有新排序权重）
+    expect(wrapper.findAll('[data-test="preview-port-value"]').map((v) => v.text())).toEqual(['22000', '22001', '22002']);
   });
 });
