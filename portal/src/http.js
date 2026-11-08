@@ -42,6 +42,7 @@ import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置�
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
+import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -747,6 +748,12 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof delegation.DelegationError) {
+        // 子 run 读侧：只用既有错误码（not_found / validation_failed / payload_too_large / internal），
+        // httpStatus 自带在错误上 ⇒ 零新码、零新映射规则。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -1091,6 +1098,18 @@ async function routeApi(req, res, ctx, url) {
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/folded\/(\d+)$/.test(pathname)) {
     const foldedMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/folded\/(\d+)$/);
     return handleSessionFoldedPayload(req, res, ctx, decodeUuid(foldedMatch[1]), Number(foldedMatch[2]));
+  }
+  // 子 run（delegation）两个只读端点（docs/api/portal.md §4.4c、docs/design/delegation-2026-11-08.md §5）。
+  // 鉴权同 GET /api/sessions/:id（属主校验在 delegation.js 的 fetchSession 里，404 不泄露存在性）。
+  // 显式排在 `/events` 之前：路径不冲突，排序只为表达「只读快照」与「SSE 实时」是两条通路。
+  // ⚠ `runId` 是**必填** query 参数（名册按父 run 分片 ⇒ 没有父身份就不知道该读哪个目录）；
+  //   `childRunId` 走路径段，两个 id 的形态校验一律在 delegation.js 里（正则 + 前缀断言，P2 红线）。
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/delegates$/.test(pathname)) {
+    return handleSessionDelegates(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/delegates$/)[1]));
+  }
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/delegates\/([^/]+)$/.test(pathname)) {
+    const dMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/delegates\/([^/]+)$/);
+    return handleSessionDelegateTranscript(req, res, ctx, decodeUuid(dMatch[1]), decodeUuid(dMatch[2]));
   }
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events$/.test(pathname)) {
     return handleSessionStream(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
@@ -2628,6 +2647,58 @@ async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
   const session = await requireSession(req, ctx);
   const result = await sessions.getFoldedPayload(ctx.pool, { userId: session.user.id, sessionId, round });
   return sendJson(res, 200, result);
+}
+
+/**
+ * GET /api/sessions/:id/delegates?runId=<parentRunId> —— 某个父 run 的子 run 名册（只读，零审计）。
+ * 属主校验 / 父 run 归属 / 路径解析全在 `delegation.js`，与 `GET /api/sessions/:id` 同一个 404 口径。
+ */
+async function handleSessionDelegates(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://x');
+  const result = await delegation.listDelegates({
+    pool: ctx.pool,
+    sessionId,
+    userId: session.user.id,
+    parentRunId: requireDelegateRunId(url),
+    userSpaceRoot: ctx.config.userSpaceRoot,
+  });
+  return sendJson(res, 200, result);
+}
+
+/**
+ * GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=N —— 子 run 账本的只读投影。
+ * `tail` 缺省 100、硬上限 500（越界 400 `validation_failed`，`details.field='tail'`）。
+ * ⚠ `tail` 只做 `Number()`，**整数与范围不在这里判**：判据只有一份（`delegation.js`），
+ *    那里才带得出 `details.field`；此处重复一遍就等于埋下两把尺。
+ */
+async function handleSessionDelegateTranscript(req, res, ctx, sessionId, childRunId) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://x');
+  const tailRaw = url.searchParams.get('tail');
+  const result = await delegation.getDelegateTranscript({
+    pool: ctx.pool,
+    sessionId,
+    userId: session.user.id,
+    parentRunId: requireDelegateRunId(url),
+    childRunId,
+    tail: tailRaw == null || tailRaw === '' ? undefined : Number(tailRaw),
+    userSpaceRoot: ctx.config.userSpaceRoot,
+  });
+  return sendJson(res, 200, result);
+}
+
+/**
+ * `runId` 是**必填** query 参数（名册按父 run 分片 ⇒ 没有父身份就不知道该读哪个目录）。
+ * 缺席/空串 ⇒ 400；形状（uuid）交给 `delegation.js` 的单点校验（同一个 `details.field='runId'`）。
+ * `decodeUuid` 只为归一化小写：名册目录名是引擎写的小写值，拿大写串去拼目录会恒 miss。
+ */
+function requireDelegateRunId(url) {
+  const raw = url.searchParams.get('runId');
+  if (raw == null || raw === '') {
+    throw new HttpError(400, 'validation_failed', 'runId 必填（父 run id）', { details: { field: 'runId' } });
+  }
+  return decodeUuid(raw);
 }
 
 async function handleSessionEventsHistory(req, res, ctx, sessionId) {
