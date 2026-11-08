@@ -488,6 +488,32 @@ export const en = {
     empty: 'No sessions in this scope',
     staleListKept: '(previous list kept)',
   },
+  // Sub-run (delegation) read-only drawer + tool card (issue #delegate P3).
+  // Key set = the 7 `DELEGATE_ROSTER_STATES` values + `unknown` (missing/dirty state);
+  // badge grading lives in `delegateBadgeKind`, this file only holds copy. `viewerTitle` takes `{id}`.
+  delegate: {
+    openViewer: 'View sub-task',
+    closeViewer: 'Close sub-task',
+    viewerTitle: 'Sub-task {id}',
+    refresh: 'Refresh',
+    polling: 'Running, refreshing automatically',
+    truncated: 'Only the most recent entries are loaded; older records are not included',
+    viewer: {
+      starting: 'The sub-task is starting, no output yet',
+      empty: 'This sub-task left no output',
+      error: 'Failed to load the sub-task output',
+    },
+    state: {
+      queued: 'Queued',
+      running: 'Running',
+      completed: 'Completed',
+      failed: 'Failed',
+      aborted: 'Aborted',
+      timeout: 'Timed out',
+      interrupted: 'Interrupted',
+      unknown: 'Unknown state',
+    },
+  },
   preview: {
     title: 'Preview {path}',
     download: 'Download',

@@ -520,6 +520,32 @@ export const zhCN = {
     empty: '该范围暂无会话',
     staleListKept: '（旧列表已保留）',
   },
+  // 子 run（delegation）只读抽屉 + 工具卡（issue #delegate P3）。
+  // 状态键集 = `lib/delegate.ts#DELEGATE_ROSTER_STATES` 的 7 值 + `unknown`（脏值/缺位的中性态），
+  // 分级尺规在 `delegateBadgeKind`，这里只出文案；`viewerTitle` 带短码占位 `{id}`。
+  delegate: {
+    openViewer: '查看子任务',
+    closeViewer: '关闭子任务',
+    viewerTitle: '子任务 {id}',
+    refresh: '刷新',
+    polling: '运行中，自动刷新',
+    truncated: '只加载了最近一段，更早的记录未包含在内',
+    viewer: {
+      starting: '子任务正在启动，暂无输出',
+      empty: '这个子任务没有留下任何输出',
+      error: '读取子任务输出失败',
+    },
+    state: {
+      queued: '排队中',
+      running: '运行中',
+      completed: '已完成',
+      failed: '失败',
+      aborted: '已停止',
+      timeout: '超时',
+      interrupted: '已中断',
+      unknown: '状态未知',
+    },
+  },
   // 文件预览 modal（components/FilePreviewModal.vue）
   preview: {
     title: '预览 {path}',
