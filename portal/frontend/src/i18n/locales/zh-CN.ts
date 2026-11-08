@@ -547,6 +547,8 @@ export const zhCN = {
     spareGroup: '空闲（{count}）',
     // #468 D2：反推不出项目（cwd 在 ~//tmp 等非项目目录，或跨 uid 读不到 cwd）的观测**单列一组**，不许丢弃。
     unknownGroup: '未知项目（{count}）',
+    // #468：未知项目组里每行前面那个黄色叹号的完整口径（鼠标悬停 / 读屏用）
+    unknownMarkTitle: '这个进程不属于当前项目',
     currentBadge: '当前目录',
     colPort: '端口',
     colHostname: '预览域名',
