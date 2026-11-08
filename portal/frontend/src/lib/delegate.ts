@@ -148,3 +148,119 @@ export function delegateToolCallText(call: DelegateToolCall): string | null {
   const name = typeof call.name === 'string' && call.name !== '' ? call.name : '?';
   return `🔧 ${name} · ${args}`;
 }
+
+// ---------------------------------------------------------------------------
+// delegate 工具结果的解析（卡片摘要 / 分级 / 「查看子 run」按钮的闸门，工单 §2）。
+//
+// 为什么必须有**逐字段兜底**（2026-12 真机定位，刷新后按钮必消失）：加载/刷新路径卡片上的
+// `resultPreview` 是**上游截断到 400 字符**的预览串（末尾带 `…`），内容正是 delegate 结果 JSON 的
+// 前缀 —— 引号不闭合 ⇒ `JSON.parse` **必然抛** ⇒ 解析失败 ⇒ `runId` 为空 ⇒ 按钮不渲染。
+// 实时路径的 `card.out` 是完整 JSON（`✓ {json} (1.2s)` 包裹），所以实时一切正常，**只有刷新后坏**，
+// 而刷新是用户最常做的动作。前缀里 `ok`/`runId`/`state` 都在截断点之前 ⇒ 逐字段正则拿得到。
+//
+// 顺序（每一层失败才落到下一层，全程 try/catch，**绝不抛**）：
+//   ① 入参已是对象 ⇒ 直接取字段；
+//   ② 整串 `JSON.parse`；
+//   ③ 抠出 `{…}` 再 parse（实时路 `out` 的 `✓ {json} (1.2s)` 包裹，原 `StreamPanel` 的语义）；
+//   ④ **逐字段正则**各取一次（互不相关 ⇒ 与字段顺序无关，也不要求 JSON 完整）。
+//
+// 「不许返回空壳」的口径：④ 里 `runId` 与 `state` 一个都没拿到 ⇒ 返回 `null`（调用方退回既有
+// 摘要与 ✓/✗）；对象路径（①②③）只在**一个 delegate 字段都不认识**时才返回 `null` —— 拒单信封
+// `{ ok:false, reason:'capacity_full' }` 本来就没有 `runId`/`state`，那是**有效结果**不是空壳
+// （它要驱动「不出按钮且不谎报成功」的展示，`DelegateToolCard.spec.ts` 有对应用例）。
+// ---------------------------------------------------------------------------
+
+/** delegate 结果里 UI 真正消费的字段；字段缺位一律 `''`（`ok` 缺位是 `null`，与 `false` 可区分）。 */
+export interface DelegateResult {
+  ok: boolean | null;
+  runId: string;
+  state: string;
+  termination: string;
+  action: string;
+}
+
+/** ④ 的逐字段兜底：各字段一条正则，独立取用 ⇒ 前缀里出现顺序不影响结果。 */
+const DELEGATE_FIELD_RES = {
+  runId: /"runId"\s*:\s*"([^"]+)"/,
+  state: /"state"\s*:\s*"([^"]+)"/,
+  termination: /"termination"\s*:\s*"([^"]+)"/,
+  action: /"action"\s*:\s*"([^"]+)"/,
+} as const;
+const DELEGATE_OK_RE = /"ok"\s*:\s*(true|false)/;
+/** delegate 结果的字段名（判断「这个对象到底是不是 delegate 的结果」）。 */
+const DELEGATE_KEYS = ['ok', 'runId', 'state', 'termination', 'action'] as const;
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+/** 非对象 / 数组 / `null` ⇒ null。 */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+/**
+ * termination 上游给过字符串与 `{ reason }` 对象两种形状（#212）：只收敛成字符串，
+ * 形状不认识就当归不到（不拿「不认识」误升级成红色告警）。
+ */
+function terminationText(value: unknown): string {
+  return asString(value && typeof value === 'object' ? (value as { reason?: unknown }).reason : value);
+}
+
+function delegateResultFromObject(obj: Record<string, unknown>): DelegateResult {
+  return {
+    ok: obj.ok === true ? true : obj.ok === false ? false : null,
+    runId: asString(obj.runId),
+    state: asString(obj.state),
+    termination: terminationText(obj.termination),
+    action: asString(obj.action),
+  };
+}
+
+/** ④：从前缀里逐字段取一次；`runId` 与 `state` 都没取到 ⇒ null（不返回空壳）。 */
+function delegateResultFromPrefix(text: string): DelegateResult | null {
+  const pick = (re: RegExp): string => text.match(re)?.[1] ?? '';
+  const runId = pick(DELEGATE_FIELD_RES.runId);
+  const state = pick(DELEGATE_FIELD_RES.state);
+  if (runId === '' && state === '') return null;
+  const ok = text.match(DELEGATE_OK_RE)?.[1];
+  return {
+    ok: ok === 'true' ? true : ok === 'false' ? false : null,
+    runId,
+    state,
+    // 截断串里的 termination 只能按字符串取（对象形态 `{ reason }` 取不到 ⇒ 当没这个字段，同 #212 口径）。
+    termination: pick(DELEGATE_FIELD_RES.termination),
+    action: pick(DELEGATE_FIELD_RES.action),
+  };
+}
+
+/**
+ * 从工具结果文本里取 delegate 的结构化字段。先整体 `JSON.parse`；失败（被 400 字截断）则逐字段正则兜底。
+ *
+ * 入参 `unknown`：字符串（完整 JSON / `✓ {json} (1.2s)` 包裹 / 截断预览）、已经是对象、`null` 都收。
+ * 解不出任何 delegate 字段 ⇒ `null`，调用方**必须**退回既有展示；本函数**绝不抛**。
+ */
+export function parseDelegateResult(raw: unknown): DelegateResult | null {
+  try {
+    const direct = asRecord(raw);
+    if (direct) return DELEGATE_KEYS.some((key) => key in direct) ? delegateResultFromObject(direct) : null;
+    if (typeof raw !== 'string' || raw === '') return null;
+
+    const candidates = [raw];
+    // ③ 实时路 `out` 的包裹形状：`✓ {json} (1.2s)`。截断串没有闭合的 `}` ⇒ 抠不出，自然落到 ④。
+    const braced = raw.match(/\{[\s\S]*\}/);
+    if (braced && braced[0] !== raw) candidates.push(braced[0]);
+    for (const candidate of candidates) {
+      try {
+        const parsed = asRecord(JSON.parse(candidate));
+        if (parsed) return delegateResultFromObject(parsed);
+      } catch {
+        // 截断的预览在这一层必抛（引号不闭合）—— 它是**常态**，不是错误：继续下一个候选，最后落 ④。
+      }
+    }
+    return delegateResultFromPrefix(raw);
+  } catch {
+    // 截断的预览、工具给的非 JSON 文案、旧数据都是**正常情况**，不是错误（调用方退回既有展示）。
+    return null;
+  }
+}
