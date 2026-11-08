@@ -555,6 +555,12 @@ describe('#468 · 未知项目组与不可读细节', () => {
     expect(wrapper.get('[data-test="preview-port-observed"]').text()).toBe('进程细节不可读（跨用户）');
   });
 
+  it('#468 P3b（D7，从 erix 线搬来）：表格形态（管理台）同样给「进程细节不可读（跨用户）」，不留空格', () => {
+    // 管理台是 `variant='table'`：细节全 null 时同样不许空单元格（P3 只盖了 list / 平铺两种形态）。
+    wrapper = mountPanel({ items: [portItem('x', 34107, { observed: OBS_CROSS_UID })], variant: 'table' });
+    expect(wrapper.get('[data-test="preview-port-observed"]').text()).toBe('进程细节不可读（跨用户）');
+  });
+
   it('#468 P4：旧后端（DTO 无 observed 键）⇒ 平铺、无组头、行序与排序权重逐字不变', () => {
     wrapper = mountPanel({
       // 三条**都没有** `observed` 键 = 未跑 0022 的旧后端 ⇒ observationsAvailable=false ⇒ 分组自动失效。

@@ -248,6 +248,28 @@ describe('工作台 · 预览端口区块', () => {
     }
   });
 
+  it('#468 S5b（从 erix 线搬来）：池里有地址但没人在听 ⇒ 折叠条不带条数（只报「端口池 3/3」），展开是空态而不是空白', async () => {
+    // 与上一条不同的形状：**有池、有 observed 键、但值全 null** ⇒ 观测可用、行数=0。
+    // 侧栏现在只剩进程监听面板（D1：只收真有进程的行）⇒ 条数必须退场，但池用量照旧要报。
+    const { wrapper } = await mountWorkbench(FDE_USER, (url, init) =>
+      url === '/api/me/ports' && !init?.method
+        ? jsonResponse(200, { items: THREE_PORTS.map((r) => ({ ...r, observed: null })) })
+        : undefined);
+    try {
+      const bar = toggle(wrapper);
+      expect(bar.text()).toContain('进程监听情况');
+      expect(bar.text()).not.toContain('（'); // 无进程 ⇒ 不带「（N 个）」
+      expect(wrapper.get('[data-test="pool-usage"]').text()).toBe('端口池 3/3');
+      await bar.trigger('click');
+      await flushPromises();
+      // 一行进程都没有 ⇒ 空态文案说「当前项目里没有进程在监听」，不是空白
+      expect(wrapper.find('[data-test="preview-port-row"]').exists()).toBe(false);
+      expect(wrapper.get('[data-test="preview-ports-empty"]').text()).toContain('当前项目里没有进程在监听');
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
   it('列表加载失败：折叠条标出「加载失败」，展开显示错误码 + 原文（重试按钮已退场）', async () => {
     let calls = 0;
     const { wrapper } = await mountWorkbench(FDE_USER, (url, init) => {
