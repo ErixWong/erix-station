@@ -28,8 +28,10 @@ import DelegateChildDrawer from './DelegateChildDrawer.vue';
 import {
   DELEGATE_BADGE_CLASS,
   delegateBadgeKind,
+  parseDelegateResult,
   shortRunId,
   type DelegateBadgeKind,
+  type DelegateResult,
 } from '../lib/delegate';
 
 const { t, locale } = useI18n();
@@ -154,18 +156,12 @@ function cardOut(card: ToolCardState): string {
 // ---------------------------------------------------------------------------
 // issue #delegate：`delegate` 工具卡的专属展示（工单 §2/§3）。
 //
-// 数据源：卡片上的结果串（实时路 `out` = 带 ✓/耗时包裹的文案、刷新路 `resultPreview` = 上游预览）
-// 里嵌的 JSON `{ ok, runId, state, action, termination? }`。**解析失败一律退回既有展示，绝不抛**
-//（预览被 400 字截断 / 工具给了非 JSON 文案 / 旧数据都是正常情况，不是错误）。
+// 数据源：卡片上的结果串（实时路 `out` = 带 ✓/耗时包裹的文案、刷新路 `resultPreview` = 上游 400 字
+// 预览）里嵌的 JSON `{ ok, runId, state, action, termination? }`。**解析全在 `lib/delegate.ts`**
+// （`parseDelegateResult`：整体 parse 失败后逐字段正则兜底），解不出 ⇒ 整段退回既有展示与 ✓/✗。
+// 不在组件里重造解析：刷新路径的预览被截到 400 字，`JSON.parse` 必抛，只有 lib 里的兜底能拿到 runId
+//（实时看起来正常、**刷新后按钮消失**就是这里漏了兜底的那次真机回归）。
 // ---------------------------------------------------------------------------
-
-interface DelegatePayload {
-  ok: boolean;
-  runId: string;
-  state: string;
-  action: string;
-  termination: string;
-}
 
 /** 头行渲染所需的全部派生量（一次算完，模板里只插值不写业务）。 */
 interface DelegateView {
@@ -177,47 +173,15 @@ interface DelegateView {
   openable: boolean;
 }
 
-/** 从任意包裹串里取第一个 JSON 对象（实时路的 out 形状是 `✓ {json} (1.2s)`）；拿不到就 null。 */
-function jsonObjectFrom(text: unknown): Record<string, unknown> | null {
-  if (typeof text !== 'string' || text === '') return null;
-  const candidates = [text];
-  const braced = text.match(/\{[\s\S]*\}/);
-  if (braced && braced[0] !== text) candidates.push(braced[0]);
-  for (const candidate of candidates) {
-    try {
-      const parsed: unknown = JSON.parse(candidate);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-    } catch {
-      // 解不开就看下一个候选；全部失败 ⇒ null（调用方退回旧展示）。
-    }
-  }
-  return null;
-}
-
-const delegateCache = new WeakMap<ToolCardState, DelegatePayload | null>();
+const delegateCache = new WeakMap<ToolCardState, DelegateResult | null>();
 
 /** delegate 卡的结果载荷；非 delegate 卡 / 解不出 ⇒ null（整段退回既有摘要与 ✓/✗）。 */
-function delegatePayload(card: ToolCardState): DelegatePayload | null {
+function delegatePayload(card: ToolCardState): DelegateResult | null {
   if (card.name !== 'delegate') return null;
   const cached = delegateCache.get(card);
   if (cached !== undefined) return cached;
-  const raw = jsonObjectFrom(card.resultPreview) ?? jsonObjectFrom(card.out);
-  let view: DelegatePayload | null = null;
-  if (raw) {
-    // termination 上游给过字符串与 `{ reason }` 对象两种形状（#212）：只收敛成字符串，
-    // 形状不认识就当归不到（不拿「不认识」误升级成红色告警）。
-    const rawTerm = raw.termination;
-    const term = rawTerm && typeof rawTerm === 'object'
-      ? (rawTerm as { reason?: unknown }).reason
-      : rawTerm;
-    view = {
-      ok: raw.ok === true,
-      runId: typeof raw.runId === 'string' ? raw.runId : '',
-      state: typeof raw.state === 'string' ? raw.state : '',
-      action: typeof raw.action === 'string' ? raw.action : '',
-      termination: typeof term === 'string' ? term : '',
-    };
-  }
+  // 刷新路（完整或截断的预览）优先，实时路（`✓ {json} (1.2s)` 包裹）兜底。
+  const view = parseDelegateResult(card.resultPreview) ?? parseDelegateResult(card.out);
   delegateCache.set(card, view);
   return view;
 }
