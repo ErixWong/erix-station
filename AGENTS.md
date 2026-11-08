@@ -3988,3 +3988,68 @@ agentd `sse connected` + `sse ping received`。
    **全部白烧**（分支已丢弃，报告归档 `~/worker-reports-261105/462-duplicate-report.md`）。
    ⇒ **口径：派工前 `gh issue view <n> --comments` 看有没有人正在做 + `git fetch` 看 main 最近提交；
    issue 是我自己开的也不等于它还空着。** 这条与 §8.99 的「派工产物落点」同族：并行的不只是工作树，还有 issue 本身。
+
+### 8.103 delegation（子 run）接入 P1+P2+P3：宿主嵌套 `runToolLoop` / 门户只读两端点 / 卡片+抽屉（2026-11-09 凌晨，分支 `feat-261108-0{1,2,3,4}-delegate-*`）
+
+**决策前提**：三份独立评估（erix_run `judge_done` 96 轮 / pi worker / copilot 两次都因派单方材料缺口停）交叉对账后，主 agent 裁定**接最小片 + 默认关**。
+理由不是「在册理由过期」，而是「不接已是用户可见的错觉」（用户会问「station 有没有开 subagent」，本身就说明界面看不出它没有）；
+但对外**只声称「上下文隔离 + 读密集并行」**，不承诺写并行（D8 之后子共用父 cwd 会互踩）。
+
+**子 run 不是本站真 run**（两条 DDL 硬约束）：`runs.session_id NOT NULL`（`schema.sql:205`）+ `runs_one_active_per_session`（`:222-223`）
+⇒ 父在跑时同会话塞不进第二个活跃 run。所以子 = **同进程嵌套的第二个 `runToolLoop`**（引擎 `bin/delegation.js:20-24` 的 v1 形态）。
+
+**落盘布局（门户与 runner 同源，唯一真相）**：`<home>/delegation/{roster/<parentRunId>, leases, transcripts}`。
+roster 按父 run 分片（模型的 `list` 只看见自己的子）· leases 每 FDE 共享（`link(2)` ⇒ 跨进程真配额）· transcripts 扁平按子 runId。
+**不放在 `runs/<runId>/` 下**：`cleanupRunData` 会连名册一起删，而 UI 要回看。
+
+**三处只有真机才会炸的坑（都已在代码注释里）**
+1. **`termination` 只认字符串**（`tool.js:94-98`，对象 ⇒ 一律 `failed`）⇒ 本站判「正常收尾」的 `no_tool` / `continuation_exhausted` 必须**交给库之前**归一成 `end_turn`（原始 reason 只进日志，因为 `finishRun` 只搬白名单键）。
+2. **前台子的 `cancel` 恒 `not_owned`**（`owned` 只在后台分支登记，`tool.js:455`/`:547`），库自己的 `AbortController` 不接外层 ⇒ **中止只能靠宿主把父 signal 串进子的 `runToolLoop`**。erix 的评估在这里给错了方案（建议 `action=cancel` 级联），真机会静默失效。
+3. **子跑超过 300s watchdog 会把父 SIGKILL**（`agentd.js:68`）⇒ 子执行期必须发 `SHELL_LIVENESS.heartbeat`（复用既有通道，agentd 零改动，15s 节流）。
+
+**其它落点**：`deadlineMs` 是**时长**而引擎 `config.timing.deadlineMs` 是**绝对时刻**（换算只在 `delegation.js` 一处）·
+子工具面**显式构造**（文件工具 + shell，**不含** `delegate`/`note_*`/skills——notes 的 single-writer 不变量靠 `runs_one_active_per_session`，同进程两个 loop 它管不到）·
+子的 usage **并进父** `RUN_FINISHED.usage`（`usage_ledger_run_source_key UNIQUE (run_id, source)` + `ON CONFLICT DO NOTHING` ⇒ 另发一行会被静默吞掉）·
+名册目录由 **agentd 预建 + `runAsWorker` 改属主**（1001 建的 755 目录 1002 写不进）· env 三腿（compose → provisioner → `fde-proxy` 的 `ENV_KEY_ALLOW`，§8.70 同型坑）。
+
+**门户读侧（P2）**：`GET /api/sessions/:id/delegates?runId=` 与 `.../delegates/:childRunId?runId=&tail=`，只读、零 DDL、零新错误码。
+窄路径解析器（两个 id 正则锁死 + `path.resolve` + 前缀断言；**不复用** `dirs.js#resolveJailedFile`——它的 jail 根是 `projects/<name>`）。
+投影顺序固定 **`foldLedgerRecords`（本站超集镜像）→ `projectTranscriptForDisplay` → 才 `slice(-tail)`**；
+⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 导出面**（实测 `undefined`，深引被 `exports` 挡）。
+
+**前端（P3）**：照 pi-web 形态（`SubagentViewer.tsx` / `AgentSessionPanel.tsx:129-165` / `MessageView.tsx:1282-1295`）——
+工具卡右侧 32px 图标按钮 → 只读抽屉；抽屉**轮询 2s、单飞、可见性门控、终态即停**（`completed` 打开只拉一次，真机 18s 内 0 请求）。
+station 用**抽屉**而不是右栏 tab（无 tab 架构）。
+
+**真机验收（v0.1.57 前的集成镜像，主 agent 亲手）**
+- 派两个读密集子任务 ⇒ 名册 2 条 `completed`/`end_turn`、账本 24.7 KB / 30.0 KB、**`parentRunId` = 真 runId**（不是 sessionId）。
+- **usage 不双记**：`usage_ledger` 恰好 1 行、`run_id` = 父。
+- **中止级联**：父 stop ⇒ 子 `state=aborted`。
+- **看门狗**：子跑 **364 秒**（>300s）⇒ 父 `finished/judge_done`、`attempt_killed` **0 条**、agentd 无 kill 日志。
+- **UI**：卡片按钮 → 抽屉（`✓ Completed / Sub-task 62979dda` + 子 run 任务原文 / reasoning / 6 条工具调用 / 终稿）；刷新后按钮仍在。
+
+**变异验证（主 agent 亲跑，每条先证非空操作、跑完还原）**
+P1：不覆盖 `parentRunId` ⇒ D1 红 · `termination` 透传对象 ⇒ D2+D3×2 红 · `deadlineMs` 不换算 ⇒ D9 红 · 不串父 signal ⇒ D5 红 · 子工具面塞回 `note_*` ⇒ D8 红。
+P2：摘 `fetchSession` ⇒ B1 红 · 投影前不折叠 ⇒ C5+F1 红 · `hasTranscript` 恒 true ⇒ B10+B11 红 · 放宽 `childRunId` 正则 ⇒ A2 红 · 不查名册 ⇒ B9+C3+H1 红。
+P3：终态不停轮询 ⇒ 3 红 · 卡片分级忽略 `termination` ⇒ 1 红 · **摘掉截断串的第④层正则兜底 ⇒ 恰 1 红**。
+
+**⚠ 真机挖出并修掉的一个必现缺陷**：`delegate` 结果的 `resultPreview` / `result_digest` 被**截断到 400 字符**（末尾 `…`）⇒ `JSON.parse` 必然抛
+⇒ **刷新后「查看子 run」按钮消失**（实时路 `out` 也是截断串，所以两条路都坏）。修法 = `lib/delegate.ts#parseDelegateResult` 四层兜底
+（对象 → 整串 parse → 抠 `{…}` → **逐字段正则**），全程不抛；`runId`+`state` 都取不到才返回 `null`。
+
+**⚠ 两条纪律级教训（本单重复踩到）**
+1. **worker 报的「既有红」必须自己复算**：本次 `GitLightBadge.spec.ts` 被三个不同执行体各报一次「预存 3 红」，
+   而主 agent 在**未修改**状态下单跑恒 **18/18 绿**（全量 1192 也全绿）。这是本仓第 7 次同型「环境性红」（§8.63/§8.82/§8.88/§8.100）。
+   有个 worker 据此改了那份 spec，已被主 agent 回退。
+2. **同一 worktree 不许有两个执行体**：本单我 resume 了旧 worker 之后又新派了一个，结果三个同时写 `wt-del3`
+   （一个在跑变异、一个在建组件），出现「我的 spec 被别人追加用例」「未提交的变异残留」。
+   停止旧 run 后残留的那个变异（删掉 `setTimeout` 的变体）被我回退。**并行只允许不同 worktree。**
+
+**已知边界（不许当 bug 修）**
+- 子 run **不是会话**：刷新后要从工具卡的 `runId` 重新拉，不能靠「最近会话」。
+- 名册/账本**无 TTL**（会累积）；清理是后续片。
+- 子共用父 cwd ⇒ 写并行会互踩；对外只说读密集并行。
+- 子**不给** notes 工具（父子共用 `scopeRef=sessionId` 的同一批笔记，并发写破坏引擎 single-writer 约定）。
+- 抽屉的「单飞」纪律在**链式 `setTimeout` 排程**下**结构上不可证伪**（变异不红：上一发落定才排下一发 ⇒ 并发本就不可能）。
+  功能正确，但要让它成为真判据需改成 `setInterval` + `inFlight`（pi-web 形状）——记为后续，未做。
+- 名册目录的 TTL / 跨 FDE 统计 / 管理台视图均未做。
