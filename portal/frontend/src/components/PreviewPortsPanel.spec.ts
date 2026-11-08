@@ -561,6 +561,26 @@ describe('#468 · 未知项目组与不可读细节', () => {
     expect(wrapper.get('[data-test="preview-port-observed"]').text()).toBe('进程细节不可读（跨用户）');
   });
 
+  it('#468 P5：未知项目组里的行挂黄色叹号（含完整 title/aria-label），已知项目的行不挂', () => {
+    wrapper = mountPanel({
+      items: [
+        portItem('a', 22002, { hostname: null, url: null, state: 'observed', observed: OBS_HOME }),
+        portItem('b', 22000, { observed: OBS_SHOP }),
+      ],
+      currentCwd: '~/projects/shop',
+      variant: 'list',
+      groupByProject: true,
+    });
+    const marks = wrapper.findAll('[data-test="preview-port-unknown-mark"]');
+    expect(marks).toHaveLength(1); // 只有未知项目那一行
+    expect(marks[0].text()).toBe('!');
+    expect(marks[0].attributes('title')).toBe('这个进程不属于当前项目');
+    expect(marks[0].attributes('aria-label')).toBe('这个进程不属于当前项目');
+    // 已知项目那一行不许挂：叹号是「不是你的项目」的提示，不能变成每行装饰
+    const shopRow = wrapper.findAll('[data-test="preview-port-row"]').find((r) => r.text().includes('22000'));
+    expect(shopRow!.find('[data-test="preview-port-unknown-mark"]').exists()).toBe(false);
+  });
+
   it('#468 P4：旧后端（DTO 无 observed 键）⇒ 平铺、无组头、行序与排序权重逐字不变', () => {
     wrapper = mountPanel({
       // 三条**都没有** `observed` 键 = 未跑 0022 的旧后端 ⇒ observationsAvailable=false ⇒ 分组自动失效。

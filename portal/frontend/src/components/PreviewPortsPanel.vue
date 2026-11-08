@@ -382,6 +382,15 @@ onScopeDispose(() => clearTimeout(copiedTimer));
         >
           <div class="flex min-w-0 items-center gap-1.5">
             <span data-test="preview-port-value" class="shrink-0 text-[11px] font-medium leading-[1.4]">{{ item.port }}</span>
+            <!-- #468：未知项目组里的行挂一个黄色叹号 —— 一句话告诉人「这个进程不是你这个项目的」，
+                 但不另占一行、不重复组头那句话（title/aria-label 给完整口径）。 -->
+            <span
+              v-if="group.kind === 'unknown'"
+              data-test="preview-port-unknown-mark"
+              class="shrink-0 text-[11px] font-bold leading-none text-amber-600"
+              :title="t('previewPorts.unknownMarkTitle')"
+              :aria-label="t('previewPorts.unknownMarkTitle')"
+            >!</span>
             <span
               v-if="item.url"
               data-test="preview-port-state"
