@@ -525,3 +525,39 @@ test('D13 建装配的入参闸门：缺 parentRunId / delegationDir / childTool
   assert.throws(() => createStationDelegation({ parentRunId: 'r', childTools: [] }), TypeError);
   assert.throws(() => createStationDelegation({ parentRunId: 'r', delegationDir: '/tmp/x' }), TypeError);
 });
+
+// ---------------------------------------------------------------------------
+// 目录属主（决策者补充的第 4 条）：agentd 必须**预建并改属主**，worker 不能自己建
+// ---------------------------------------------------------------------------
+test('D14 agentd 预建 delegation 三目录（幂等、叶子属 worker）；worker 只认下行的 delegation_dir', async () => {
+  const { prepareDelegationDirs, DELEGATION_SUBDIRS } = await import('../lib/run-data.js');
+  const home = tmpDir('home');
+  const env = { workerUid: process.getuid?.() ?? 0, workerGid: process.getgid?.() ?? 0 };
+
+  const dir = prepareDelegationDirs(home, env);
+  assert.equal(dir, path.join(home, 'delegation'));
+  for (const sub of ['roster', 'leases', 'transcripts']) {
+    assert.ok(fs.statSync(path.join(dir, sub)).isDirectory(), `子目录 ${sub} 必须预建`);
+    assert.ok(DELEGATION_SUBDIRS.includes(sub), `三目录的清单与 run-data 不同源：${sub}`);
+  }
+  // 幂等：再跑一次不炸（run 重启 / requeue 会反复走到这一段）
+  assert.doesNotThrow(() => prepareDelegationDirs(home, env));
+
+  // 接线形状：agentd 只在开关开时建，并把路径下行；worker 只读 `msg.delegation_dir`
+  const agentd = fs.readFileSync(path.join(RUNNER_DIR, 'agentd.js'), 'utf8');
+  assert.match(agentd, /if \(isDelegateEnabled\(process\.env\.ERIX_DELEGATE_ENABLED\)\) \{[\s\S]{0,400}prepareDelegationDirs\(CFG\.home/, 
+    'agentd 必须在开关开时预建 delegation 目录（1001 建的 755 目录 1002 写不进）');
+  assert.match(agentd, /delegation_dir: ctx\.delegationDir/, '建好的路径必须下行（路径只有一个真相源）');
+  assert.doesNotMatch(agentd, /prepareDelegationDirs[\s\S]{0,200}releaseAndRequeue/,
+    'delegation 目录建不出来只 warn，**不许**因此 requeue（加分项不打死 run）');
+
+  const worker = fs.readFileSync(path.join(RUNNER_DIR, 'worker.js'), 'utf8');
+  assert.match(worker, /msg\.delegation_dir/, 'worker 必须读下行的 delegation_dir');
+});
+
+test('D15 worker 心跳接线：走 SHELL_LIVENESS.heartbeat（不走 emitEvent），command 带子的 runId', () => {
+  const worker = readWorkerSource();
+  assert.match(worker, /onChildLiveness:\s*\(childRunId\) => sendIpc\(process, \{\s*type: MSG\.SHELL_LIVENESS, run_id: runId, phase: 'heartbeat', command: 'delegate:' \+ childRunId,/,
+    '保活必须走 SHELL_LIVENESS heartbeat（走 emitEvent 会多一条用户可见事件）');
+  assert.match(worker, /parentSignal: abortController\.signal/, '中止级联：父的 abortController.signal 必须递进去');
+});
