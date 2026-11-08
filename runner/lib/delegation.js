@@ -174,6 +174,7 @@ function combineSignals(signals) {
  * @param {AbortSignal} [o.parentSignal] 父 run 的 abort signal（中止级联的唯一通路）
  * @param {(childRunId: string) => void} [o.onChildLiveness] 保活出口（内部节流 ≥ `livenessIntervalMs`）
  * @param {(level: string, msg: string, fields?: Object) => void} [o.logger]
+ * @param {Function} [o.runToolLoopImpl] 引擎入口（缺省 `erix-agent` 的 `runToolLoop`；只为判据可观察）
  * @param {() => number} [o.clock]      可注入时钟（判据 9 要注入定值）
  * @param {number} [o.livenessIntervalMs]
  */
@@ -206,6 +207,8 @@ export function createStationDelegation(o = {}) {
   const leaseDir = path.join(delegationDir, 'leases');
   const transcriptsDir = path.join(delegationDir, 'transcripts');
   const childStore = createFileTranscriptStore({ dir: transcriptsDir });
+  /** 引擎入口可注入（判据 8/9/10 要看子 run 真正拿到什么入参）；缺省就是引擎本体。 */
+  const runLoop = typeof o.runToolLoopImpl === 'function' ? o.runToolLoopImpl : runToolLoop;
 
   /** 子的 usage 累加器（`takeChildUsage()` 取走并清零；worker 把它并进 `RUN_FINISHED.usage`）。 */
   let childUsage = { input_tokens: 0, output_tokens: 0 };
@@ -244,15 +247,14 @@ export function createStationDelegation(o = {}) {
    * 不该因为子怎么结束而失败。
    */
   async function runChild(request) {
-    const childRunId = request.runId;
-    const childCwd = cwdFor(request.cwd);
+    const childRunId = request.runId;    const childCwd = cwdFor(request.cwd);
     const budgetMs = Number.isFinite(request.deadlineMs) && request.deadlineMs > 0
       ? request.deadlineMs
       : childDeadlineMs;
     const signal = combineSignals([request.signal, parentSignal]);
 
     try {
-      const result = await runToolLoop({
+      const result = await runLoop({
         provider,
         tools: childTools,
         executeTool,
