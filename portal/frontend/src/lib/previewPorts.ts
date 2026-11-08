@@ -238,7 +238,8 @@ export function retryAfterSeconds(error: PreviewApiError): number | null {
  */
 /**
  * 观测 cwd → 项目根（`~/projects/<name>`）：子目录里起的服务（frontend/、apps/web/）归到项目本身；
- * 非项目目录（agentd 自己的 /opt 等）返回 null——两个分组面板都不收。
+ * 非项目目录（`~`、`/tmp`、平台自己的 /opt 等，以及跨 uid 读不到 ⇒ null）返回 null——
+ * 已知项目分组不收，#468 后由 `unknownProjectItems` 单列成「未知项目」组，**不再被丢弃**。
  * 未 sanitize 的绝对形（/home/<u>/projects/…）同样命中（与 portalloc 合成行同口径）。
  */
 export function projectRootOf(cwd: string | null | undefined): string | null {
@@ -247,7 +248,11 @@ export function projectRootOf(cwd: string | null | undefined): string | null {
   return matched ? `~/projects/${matched[1]}` : null;
 }
 
-/** 按项目根分组（池内+池外一视同仁）；非项目观测丢弃，组内按 port ASC、组间按目录名字序。 */
+/**
+ * 按项目根分组（池内+池外一视同仁）；反推不出项目的观测不进本分组，组内按 port ASC、组间按目录名字序。
+ * ⚠ **#468 后保持现状**：它是「**已知项目**分组」的唯一实现（管理台面与面板的项目组都走它）；
+ * 「未知项目」那部分由下面的 `unknownProjectItems` 接手单列，**不再被丢弃**（原工单 D2）。
+ */
 export function groupByProject(items: PreviewPortItem[]): Array<{ root: string; items: PreviewPortItem[] }> {
   const byRoot = new Map<string, PreviewPortItem[]>();
   for (const item of items) {
@@ -260,6 +265,52 @@ export function groupByProject(items: PreviewPortItem[]): Array<{ root: string; 
   return [...byRoot.entries()]
     .map(([root, bucket]) => ({ root, items: bucket.sort((a, b) => a.port - b.port) }))
     .sort((a, b) => a.root.localeCompare(b.root));
+}
+
+/**
+ * 「未知项目」的行（#468 **D2 的落地处**）：有观测但 `projectRootOf(observed.cwd) === null`。
+ *
+ * 成立的两种形状（都是用户真实的服务，**不是**噪音）：
+ *   - cwd 在 `~` / `/tmp` 这类非项目目录（现网实测：`python3 -m http.server` 起在家目录与 `/tmp`）；
+ *   - 跨 uid 读不到 cwd（无 CAP_SYS_PTRACE + Yama ⇒ `cwd=null`）。
+ * 用户裁定「反推不出项目不许丢弃」⇒ 本函数把它们挑出来给调用方单列一组（只靠 tooltip 提一句不算落地）。
+ * ⚠ 无观测的行（`observed` 为 null/undefined）**不算**未知项目：null ≠ 空闲，也 ≠ 未知项目。
+ * 组内 `port` ASC（与两个面板同一套排序）。
+ */
+export function unknownProjectItems(items: readonly PreviewPortItem[]): PreviewPortItem[] {
+  return items
+    .filter((item) => Boolean(item.observed) && projectRootOf(item.observed?.cwd) === null)
+    .sort((a, b) => a.port - b.port);
+}
+
+/**
+ * 进程监听面板的行集（#468 **D1/D6 的落地处**）：只留**当前项目的进程 + 未知项目的进程**，
+ * 其它项目的进程不显示（原病根：侧栏把 `groupByProject` 拍平后直接当列表用 ⇒ 别的项目全涌进来）。
+ * 放在纯函数层而不放组件里：这条判据最容易做坏，装配层测不动。
+ *
+ * 三条口径：
+ *   1. 只收**有观测**的行。无观测不是「没进程」（旧 agentd / 未跑 0022 也是 null），
+ *      而是「本面板不回答这个问题」——地址维度由端口池面板（#468 追加 A 后改成折叠条上的用量数字）承担。
+ *   2. `currentCwd` 自己就反推不出项目（未选目录 ⇒ null，或选中的是 `~`/`/tmp` 这类非项目目录）
+ *      ⇒ **不过滤**（**D6**：连「当前项目」都判不出来，就没资格拿它当筛子），未知项目组照旧单列。
+ *   3. 否则保留「属于当前项目根（**含子目录**）」或「未知项目」的行。
+ *      ⚠ 用 `projectRootOf` 而不是 `startsWith`：后者会把 `~/projects/shopmate` 误当成 `~/projects/shop`。
+ *
+ * 返回按 `port` ASC 的新数组（不改入参）。
+ */
+export function listenerItemsForProject(
+  items: readonly PreviewPortItem[],
+  currentCwd: string | null | undefined,
+): PreviewPortItem[] {
+  const observed = items.filter((item) => Boolean(item.observed));
+  const currentRoot = projectRootOf(currentCwd ?? null);
+  const kept = currentRoot === null
+    ? observed
+    : observed.filter((item) => {
+      const root = projectRootOf(item.observed?.cwd);
+      return root === null || root === currentRoot;
+    });
+  return kept.sort((a, b) => a.port - b.port);
 }
 
 export function duplicateObservedGroups(items: PreviewPortItem[]): Array<{ cwd: string; ports: number[] }> {

@@ -111,8 +111,12 @@ async function mountApp(initialPath: string) {
   return { wrapper, router, auth: useAuthStore() };
 }
 
-// 工作台独有的标记（issue #246 的预览端口折叠条）：它在 ⇒ 工作台真的挂载了。
-const WORKBENCH_MARKER = '[data-test="preview-ports-toggle"]';
+// 工作台独有的标记：它在 ⇒ 工作台真的挂载了。
+// ⚠ #468 追加 A：原先用的是预览端口折叠条 `[data-test="preview-ports-toggle"]`，那条**端口池段已在 #468
+// 退役**（用户裁定：池的总量/空闲只挂在进程监听折叠条上）⇒ 标记换成侧栏根节点 `[data-test="sidebar-aside"]`。
+// 为什么不选另一条折叠条 `process-watch-toggle`：它带 `observationsAvailable || listError` 的闸，而本文件的
+// fetch 桩把 /api/me/ports 打成空列表 ⇒ 折叠条本来就不存在，拿它当「是否挂载」的标记会假红。
+const WORKBENCH_MARKER = '[data-test="sidebar-aside"]';
 const FORCE_SCREEN = '[data-test="force-password"]';
 
 beforeEach(() => {

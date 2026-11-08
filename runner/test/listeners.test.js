@@ -15,22 +15,24 @@ const BTIME = 1_700_000_000;            // /proc/stat btime（epoch 秒）
 const START_TICKS = 100_000;            // stat 第 22 列（USER_HZ=100 ⇒ +1000s）
 const EXPECTED_START_MS = (BTIME + 1000) * 1000;
 
-/** 造一棵最小 /proc fixture。ports: [{port, inode, pid?, owner=true, uid?=1000}] */
+/** 造一棵最小 /proc fixture。ports: [{port, inode, pid?, owner=true, uid?=1000, addr?='00000000'}] */
 function makeProc(t, { entries, home = null }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'proc-fix-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'net'));
   fs.writeFileSync(path.join(root, 'stat'), `cpu  1 2 3\nbtime ${BTIME}\n`);
 
-  const lines = ['  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'];
+  const lines = { tcp: ['  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'], tcp6: ['  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'] };
   for (const e of entries) {
     const hex = e.port.toString(16).toUpperCase().padStart(4, '0');
     // 其余列全填占位，字段位次与真 /proc/net/tcp 一致（inode 是第 10 列）。
+    // local_address 的**地址段**可注入（#468 D5：Docker 内嵌 DNS 的判据就在这一段），family 默认 v4。
+    const addr = e.addr ?? '00000000';
     const uid = e.uid ?? 1000;
-    lines.push(`   0: 00000000:${hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  ${String(uid).padStart(5)}        0   ${e.inode} 1 0000 100 0 0 10 0`);
+    lines[e.family === 'tcp6' ? 'tcp6' : 'tcp'].push(`   0: ${addr}:${hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  ${String(uid).padStart(5)}        0   ${e.inode} 1 0000 100 0 0 10 0`);
   }
-  fs.writeFileSync(path.join(root, 'net', 'tcp'), lines.join('\n') + '\n');
-  fs.writeFileSync(path.join(root, 'net', 'tcp6'), '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n');
+  fs.writeFileSync(path.join(root, 'net', 'tcp'), lines.tcp.join('\n') + '\n');
+  fs.writeFileSync(path.join(root, 'net', 'tcp6'), lines.tcp6.join('\n') + '\n');
 
   const homeDir = home ?? path.join(root, 'homeless');
   for (const e of entries) {
@@ -130,4 +132,37 @@ test('collectListeners：条目封顶（异常 /proc 形状灌不爆心跳）', 
   const out = collectListeners({ procPath: root, home: homeDir, setuid: NOOP_SETUID });
   assert.equal(out.length, 64);
   assert.equal(out[0].port, 20000, '截断按端口升序保留最小号');
+});
+
+// ---------------------------------------------------------------------------
+// #468 D5：Docker 内嵌 DNS（127.0.0.11）不是用户的服务 ⇒ 采样侧就不收它。
+// 现网取证：4 台 FDE 各有一条 cwd IS NULL 的观测（eric 39677 / tetris 37765 / todo 41251 / blind 40097），
+// 在容器内逐条核对 /proc/net/tcp 第 2 列全是 `0B00007F:<port>`（uid 0，Yama 下 cwd 永远读不到）。
+// 后端 #468 D4 放宽「池外行合成」判据后，这条会变成每台 FDE 一条永久的「未知项目」噪音 ⇒ 必须挡在这里。
+// ---------------------------------------------------------------------------
+test('#468 D5 R1：127.0.0.11（/proc/net/tcp 地址段 0B00007F）的 LISTEN 不进采样结果', (t) => {
+  const { root, homeDir } = makeProc(t, {
+    entries: [
+      { port: 22000, inode: 111, pid: 412, cwd: 'projects/shop', cmd: 'node vite.js' },
+      { port: 39677, inode: 900, uid: 0, addr: '0B00007F' },  // Docker 内嵌 DNS（现网实测端口形状）
+    ],
+  });
+  const out = collectListeners({ procPath: root, home: homeDir, setuid: NOOP_SETUID });
+  assert.deepEqual(out.map((e) => e.port), [22000], 'docker DNS 端口不出现在结果里（连「端口在听」都不报）');
+  assert.ok(!out.some((e) => e.port === 39677), '不许留下一条 cwd=null 的噪音条目');
+});
+
+test('#468 D5 R2：排除只针对 docker DNS，不是「排除 loopback」——0.0.0.0 与 127.0.0.1 上的服务照采', (t) => {
+  const { root, homeDir } = makeProc(t, {
+    entries: [
+      { port: 22000, inode: 111, pid: 412, cwd: 'projects/shop', cmd: 'node vite.js', addr: '00000000' },
+      { port: 5173, inode: 222, pid: 413, cwd: 'projects/vite', cmd: 'node vite', addr: '0100007F' }, // 127.0.0.1
+      { port: 39677, inode: 900, uid: 0, addr: '0B00007F' },                                          // 127.0.0.11
+      // v6 表里同样带 0B00007F 尾段（v4-mapped 形）的行**不得**被误排除：判据只对 net/tcp 生效。
+      { port: 8080, inode: 333, pid: 414, cwd: 'projects/api', cmd: 'uvicorn', family: 'tcp6', addr: '0000000000000000FFFF00000B00007F' },
+    ],
+  });
+  const out = collectListeners({ procPath: root, home: homeDir, setuid: NOOP_SETUID });
+  assert.deepEqual(out.map((e) => e.port), [5173, 8080, 22000], 'v4 loopback、v6 行都仍在（只是 docker DNS 被摘掉）');
+  assert.equal(out.find((e) => e.port === 5173).cwd, '~/projects/vite', 'loopback 服务的细节也照常富化');
 });

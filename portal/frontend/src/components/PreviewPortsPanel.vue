@@ -20,6 +20,7 @@ import {
   groupByProject,
   projectRootOf,
   retryAfterSeconds,
+  unknownProjectItems,
   type PreviewApiError,
   type PreviewObserved,
   type PreviewPortItem,
@@ -148,6 +149,12 @@ const observationsAvailable = computed(() => props.items.some((i) => 'observed' 
 const currentRoot = computed(() => projectRootOf(props.currentCwd ?? undefined));
 
 interface DisplayGroup {
+  /**
+   * 分组类型（#468）：`root === null` 不再单独表达「空闲」——未知项目组同样没有项目根，
+   * 只靠 root 分不开两者（文案与语义都不同），所以显式加 `kind`。
+   * `flat` = 非分组模式/旧后端的单平铺组（不出 header）。
+   */
+  kind: 'project' | 'unknown' | 'spare' | 'flat';
   root: string | null;
   showHeader: boolean;
   isCurrent: boolean;
@@ -155,27 +162,44 @@ interface DisplayGroup {
 }
 
 /**
- * 展示分组：分组模式（侧栏双面板）⇒ 在用目录组按项目根分桶，当前目录排最前挂徒章；
- * 池内未用（url 非空且无观测）收进尾部「空闲」组。非分组模式/旧后端 ⇒ 单平铺组（行为同前）。
+ * 展示分组：分组模式（侧栏面板）⇒ 在用目录组按项目根分桶（当前项目排最前挂徒章）
+ * → **未知项目组**（#468 D2：反推不出项目的观测单列，不丢）→ 池内未用（url 非空且无观测）收进尾部「空闲」组。
+ * 非分组模式/旧后端 ⇒ 单平铺组（行为与改动前逐字相同）。
  */
 const displayGroups = computed<DisplayGroup[]>(() => {
   const rank = (item: PreviewPortItem) => (observedHere(item) ? 0 : item.observed ? 1 : 2);
   const flat = [...props.items].sort((a, b) => rank(a) - rank(b) || a.port - b.port);
   if (props.variant !== 'list' || !props.groupByProject || !observationsAvailable.value) {
-    return [{ root: null, showHeader: false, isCurrent: false, items: flat }];
+    return [{ kind: 'flat' as const, root: null, showHeader: false, isCurrent: false, items: flat }];
   }
   const observed = props.items.filter((i) => i.observed);
   const spare = props.items.filter((i) => !i.observed && i.url);
-  const groups = groupByProject(observed).map((g) => ({
+  const groups: DisplayGroup[] = groupByProject(observed).map((g) => ({
+    kind: 'project' as const,
     root: g.root as string | null,
     showHeader: true,
     isCurrent: g.root === currentRoot.value,
     items: g.items,
   }));
   groups.sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || a.root!.localeCompare(b.root!));
-  if (spare.length > 0) groups.push({ root: null, showHeader: true, isCurrent: false, items: spare.sort((a, b) => a.port - b.port) });
+  // #468 D2：未知项目单列一组（不丢、不只写进 tooltip）。排在所有已知项目组之后、空闲组之前：
+  // 它同样是「真有进程在听」的事实，不许退到「空闲」那类地址语义后面。
+  const unknown = unknownProjectItems(observed);
+  if (unknown.length > 0) {
+    groups.push({ kind: 'unknown', root: null, showHeader: true, isCurrent: false, items: unknown });
+  }
+  if (spare.length > 0) {
+    groups.push({ kind: 'spare', root: null, showHeader: true, isCurrent: false, items: spare.sort((a, b) => a.port - b.port) });
+  }
   return groups;
 });
+
+/** 分组头文案（三类组各一套口径；组名只从 kind 分叉，不再拿 `root === null` 当「空闲」的同义词）。 */
+function groupHeaderLabel(group: DisplayGroup): string {
+  if (group.kind === 'unknown') return t('previewPorts.unknownGroup', { count: group.items.length });
+  if (group.kind === 'spare') return t('previewPorts.spareGroup', { count: group.items.length });
+  return group.root === null ? '' : dirName(group.root);
+}
 
 /** 行内观测文案：紧凑形态分组头已给目录，行内不重复报 cwd，只报 cmd/分支/已运行。 */
 function rowObservedText(item: PreviewPortItem): string {
@@ -193,10 +217,17 @@ function dirName(root: string): string {
  */
 const duplicateGroups = computed(() => duplicateObservedGroups(props.items));
 
+/**
+ * 观测行的行内文案。三个不可让的点：
+ *   - 紧凑形态的分组头已给了目录 ⇒ 行内不重复报 cwd，只报 cmd / 分支 / 已运行；
+ *   - **无内容也要有内容**（#468 **D7**）：跨 uid 时 pid/cwd/cmd/branch 四个全 null，
+ *     两支都必须兜到 `observedOpaque`（「进程细节不可读（跨用户）」）——空白行会被读成「面板坏了」；
+ *   - `started_at` 可读时仍追加「已运行」（它本身就是信息）。
+ */
 function observedText(obs: PreviewObserved, hereContext = false): string {
-  // 主区行（目录已定）：cmd 比 cwd 有信息量（vite 还是 uvicorn）；cwd 冗余就不重复报。
   const parts: string[] = [];
   if (hereContext) {
+    // 主区行（目录已定）：cmd 比 cwd 有信息量（vite 还是 uvicorn）；cwd 冗余就不重复报。
     if (obs.branch) parts.push(`@${obs.branch}`);
     if (obs.cmd) parts.push(obs.cmd);
     if (!parts.length) parts.push(obs.cwd ?? (obs.pid !== null ? `pid ${obs.pid}` : ''));
@@ -204,6 +235,8 @@ function observedText(obs: PreviewObserved, hereContext = false): string {
     parts.push(obs.cwd ?? (obs.pid !== null ? `pid ${obs.pid}` : ''));
     if (obs.branch) parts.push(`@${obs.branch}`);
   }
+  // 四个细节全不可读 ⇒ 上面两支只能交出空串：当场换成 D7 的口径，而不是让后面的 filter 默默吞掉整行。
+  if (parts.every((p) => !p)) parts.push(t('previewPorts.observedOpaque'));
   const ago = obs.started_at ? formatStartedAgo(obs.started_at) : null;
   if (ago) parts.push(t('previewPorts.observedUptime', { ago }));
   return parts.filter(Boolean).join(' ');
@@ -323,13 +356,18 @@ onScopeDispose(() => clearTimeout(copiedTimer));
            第二行 = 可截断 hostname（点击复制**完整 url**，title 里也是完整 url）。
            宽度纪律：每一层都带 min-w-0，hostname 是 block w-full truncate ⇒ 再长的域名也不会横向撑破面板。 -->
       <ul v-else data-test="preview-ports-list" class="min-w-0">
-        <template v-for="group in displayGroups" :key="group.root ?? (group.showHeader ? 'spare' : 'flat')">
+        <template v-for="group in displayGroups" :key="`${group.kind}:${group.root ?? ''}`">
         <li
           v-if="group.showHeader"
           data-test="preview-port-group-header"
           class="flex min-w-0 items-center gap-1 pb-0.5 pt-2 text-[10px] font-semibold tracking-[0.04em] text-black/55 first:pt-0"
         >
-          <span class="min-w-0 truncate" :title="group.root ?? undefined">{{ group.root === null ? t('previewPorts.spareGroup', { count: group.items.length }) : dirName(group.root) }}</span>
+          <!-- #468 D2：未知项目组额外挂一个自己的钩子（文案里同时点名「未知项目」与数量） -->
+          <span
+            class="min-w-0 truncate"
+            :data-test="group.kind === 'unknown' ? 'preview-port-group-unknown' : undefined"
+            :title="group.root ?? undefined"
+          >{{ groupHeaderLabel(group) }}</span>
           <span
             v-if="group.isCurrent"
             data-test="preview-port-group-current"
