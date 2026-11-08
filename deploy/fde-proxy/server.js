@@ -76,7 +76,7 @@ const RESTART_POLICY_NAMES = new Set(['unless-stopped']);
 // `create_policy_denied: Env key not allowed`（两个 FDE 容器已被删掉，短暂全停）。
 // 教训的形状：**注入方与放行方是两个模块，谁都没检查对方**——判据见 portal/test/provisioner.test.js
 // 的交叉核对（provisioner 可能注入的键 ⊆ proxy 白名单）。
-const ENV_KEY_ALLOW = new Set(['PATH', 'ERIX_STATION_TOKEN', 'ERIX_STATION_BASE_URL', 'ERIX_FDE_NAME', 'ERIX_AGENT_VERSION', 'ERIX_MAX_ROUNDS', 'ERIX_AGENTD_CAPACITY', 'ERIX_ARTIFACT_MAX_BYTES', 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS', 'ERIX_SHELL_TIMEOUT_MS', 'ERIX_SHELL_MAX_TIMEOUT_MS', 'ERIX_SHELL_OUTPUT_MAX_BYTES', 'ERIX_SESSION_AUTO_TITLE']); // issue #84 P5：agentd/worker 可调参数下发；issue #88 修订：worker 侧会话标题生成开关
+const ENV_KEY_ALLOW = new Set(['PATH', 'ERIX_STATION_TOKEN', 'ERIX_STATION_BASE_URL', 'ERIX_FDE_NAME', 'ERIX_AGENT_VERSION', 'ERIX_MAX_ROUNDS', 'ERIX_AGENTD_CAPACITY', 'ERIX_ARTIFACT_MAX_BYTES', 'ERIX_ARTIFACT_CAPTURE_BUDGET_MS', 'ERIX_SHELL_TIMEOUT_MS', 'ERIX_SHELL_MAX_TIMEOUT_MS', 'ERIX_SHELL_OUTPUT_MAX_BYTES', 'ERIX_SESSION_AUTO_TITLE', 'ERIX_DELEGATE_ENABLED', 'ERIX_DELEGATE_MAX', 'ERIX_DELEGATE_CHILD_ROUNDS', 'ERIX_DELEGATE_CHILD_TIMEOUT_MS']); // issue #84 P5：agentd/worker 可调参数下发；issue #88 修订：worker 侧会话标题生成开关；delegation P1：子 run 的四个旋钮下发
 // R4：任何层禁止的原型污染键。
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
