@@ -10,8 +10,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
-import path from 'node:path';
-import {
+import path from 'node:path';import {
   delegationRoot, rosterDir, transcriptPath, listDelegates, getDelegateTranscript,
   DelegationError, DELEGATE_TRANSCRIPT_MAX_BYTES, ROSTER_STATES,
 } from '../src/delegation.js';
@@ -311,12 +310,23 @@ test('B4 判据4 坏名册文件不 500：坏 JSON / 身份不符 / 非对象 �
 });
 
 test('B9 判据9 名册目录不存在 ⇒ { items: [], skipped: 0 }，200 语义且零 transcript 读', async () => {
-  const h = await makeHarness();
+  const h = await makeHarness({
+    roster: [[CHILD_1, rosterRecord({ childRunId: CHILD_1 })]],
+    transcripts: { [CHILD_1]: engineLedgerLines(CHILD_1) },
+  });
   try {
+    // 真把名册目录拿掉（不是「目录在但空」——那条路另有 B12 管）：从未派生子 run / 没开过
+    // ERIX_DELEGATE_ENABLED 的会话就是这一格，而 P1 只在开关开时才建 roster/<runId>/。
+    await fsp.rm(path.join(h.root, 'roster', PARENT_RUN), { recursive: true, force: true });
     const res = await callList(h);
     assert.deepEqual(res, { items: [], skipped: 0 });
     assert.deepEqual(transcriptReads(h.fsSpy.calls), [], '一条 transcript 都不许碰');
-    assert.deepEqual(h.fsSpy.calls.filter(([op]) => op === 'existsSync'), []);
+    assert.equal(h.fsSpy.calls.filter(([op]) => op === 'readdir').length, 1, '只 readdir 那一次');
+    assert.deepEqual(h.fsSpy.calls.filter(([op]) => op === 'existsSync'), [], '没子 run ⇒ 连 existsSync 都不该发');
+
+    // 账本入口同样不吃 500：名册目录整个不在 ⇒ 404 not_in_roster
+    await expectDelegationError(callTranscript(h, CHILD_1),
+      { code: 'not_found', httpStatus: 404, details: { reason: 'not_in_roster' } });
   } finally { h.cleanup(); }
 });
 
