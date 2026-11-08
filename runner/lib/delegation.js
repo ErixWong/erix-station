@@ -50,6 +50,11 @@ const USAGE_FIELDS = Object.freeze(['input_tokens', 'output_tokens', 'cacheRead'
  */
 export const STATION_OK_BUT_ENGINE_FAILED = Object.freeze(['no_tool', 'continuation_exhausted']);
 
+/** 本站的归一表（从上面那张派生，不要手写两份）：原始 reason → 交给库的 reason。 */
+export const DELEGATE_REASON_NORMALIZATIONS = Object.freeze(
+  Object.fromEntries(STATION_OK_BUT_ENGINE_FAILED.map((reason) => [reason, 'end_turn'])),
+);
+
 /** 子 run 的 system prompt（裁决 ②）。刻意短，且明说「没有 delegate 工具」。 */
 export const CHILD_SYSTEM_PROMPT = [
       '你是由父 run 派出的**子 run**：只做被交给你的这一件事，做完就汇报。',
@@ -76,7 +81,7 @@ export function terminationReasonOf(termination) {
 export function normalizeChildTermination(termination) {
   const reason = terminationReasonOf(termination);
   if (reason === undefined) return undefined;
-  return STATION_OK_BUT_ENGINE_FAILED.includes(reason) ? 'end_turn' : reason;
+  return DELEGATE_REASON_NORMALIZATIONS[reason] ?? reason;
 }
 
 /**
@@ -166,7 +171,9 @@ function combineSignals(signals) {
  * @param {Array} o.childTools          子的工具面（裁决 ①：文件工具 + shell 的 schemas，显式给出）
  * @param {Function} o.executeTool      父的 executeTool（子的 file/shell 执行走**同一个**实例 ⇒ 同一个 jail）
  * @param {string} [o.childSystemPrompt] 子的 system prompt（缺省 `CHILD_SYSTEM_PROMPT`）
- * @param {Object} [o.modelMetadata]    与父同源（`config.metadata.modelMetadata`）
+ * @param {Object} [o.engineModelMetadata] 本站的模型快照（snake_case：`context_window` / `max_output_tokens`），
+ *                                      与父同源；camelCase 映射在本文件（worker.js 的 #309 锁只允许一处）
+ * @param {Object} [o.modelMetadata]      直接覆盖 camelCase 元数据（测试/其它调用方）
  * @param {number} [o.maxTokens]        与父同源（`config.tuning.maxTokens`）
  * @param {number} [o.childMaxRounds]   子轮数预算
  * @param {number} [o.childDeadlineMs]  子时间预算（**时长**）
@@ -182,7 +189,7 @@ export function createStationDelegation(o = {}) {
   const {
     parentRunId, parentCwd, delegationDir,
     provider, childTools, executeTool, childSystemPrompt = CHILD_SYSTEM_PROMPT,
-    modelMetadata, maxTokens,
+    modelMetadata, maxTokens, engineModelMetadata,
     childMaxRounds = DEFAULT_CHILD_MAX_ROUNDS,
     childDeadlineMs = DEFAULT_CHILD_DEADLINE_MS,
     maxConcurrent = DEFAULT_MAX_CONCURRENT,
@@ -200,6 +207,19 @@ export function createStationDelegation(o = {}) {
   if (!Array.isArray(childTools)) {
     throw new TypeError('delegation: childTools 必须由调用方显式给出（文件工具 + shell 的 schemas 数组）');
   }
+
+  /**
+   * 子的模型元数据与 `maxTokens`：与父**同源**（本站只有 `engineModelMetadata` 这一份快照，
+   * camelCase 的映射点以 `#309` 的防漂移锁钉在 worker.js 的**一处**，所以本文件接 snake_case 快照
+   * 自己映射；`modelMetadata` / `maxTokens` 两个入参是测试与将来其它调用方的覆盖口）。
+   */
+  const childModelMetadata = modelMetadata ?? (engineModelMetadata
+    ? {
+      contextWindowTokens: engineModelMetadata.context_window,
+      maxOutputTokens: engineModelMetadata.max_output_tokens,
+    }
+    : undefined);
+  const childMaxTokens = maxTokens ?? engineModelMetadata?.max_output_tokens;
 
   // §3 落盘布局（唯一真相，门户 P2 按同一布局读）：roster 按父 run 分片、leases 每 FDE 共享、
   // transcripts 扁平按子 runId。
@@ -278,13 +298,13 @@ export function createStationDelegation(o = {}) {
             reflection: false,
             completion: false,
           },
-          ...(modelMetadata || maxTokens
+          ...(childModelMetadata || childMaxTokens
             ? {
               metadata: {
                 task: request.task,
-                ...(modelMetadata ? { modelMetadata } : {}),
+                ...(childModelMetadata ? { modelMetadata: childModelMetadata } : {}),
               },
-              tuning: { ...(maxTokens ? { maxTokens } : {}) },
+              tuning: { ...(childMaxTokens ? { maxTokens: childMaxTokens } : {}) },
             }
             : {}),
           folding: { context: { strategy: 'fold-llm', keepRounds: 6 } },

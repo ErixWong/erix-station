@@ -732,13 +732,10 @@ async function startRun(msg) {
         childTools: [...fileTools.schemas, ...shellTools.schemas],
         // 子的 file/shell 执行走**父的 executeTool** ⇒ 同一个 `registry` ⇒ 同一个 `jail`（只有一个沙箱）。
         executeTool,
-        ...(engineModelMetadata ? {
-          modelMetadata: {
-            contextWindowTokens: engineModelMetadata.context_window,
-            maxOutputTokens: engineModelMetadata.max_output_tokens,
-          },
-          maxTokens: engineModelMetadata.max_output_tokens,
-        } : {}),
+        // ⚠ **不在这里搭 camelCase 的 modelMetadata**：`contextWindowTokens` / `maxOutputTokens` /
+        // `maxTokens` 三键在 worker.js 里只允许出现一次（#309 的防漂移锁，`model-metadata.test.js`
+        // 「各只出现 1 次且全在 #309 装配段内」）⇒ 映射交给 `lib/delegation.js`，本行只递 snake_case 快照。
+        engineModelMetadata,
         childMaxRounds: delegateRounds.value,
         childDeadlineMs: delegateTimeout.value,
         maxConcurrent: delegateMax.value,
