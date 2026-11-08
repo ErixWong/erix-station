@@ -206,6 +206,27 @@ describe('DelegateChildDrawer 三态与分级', () => {
     wrapper.unmount();
   });
 
+  it('XSS：助手正文里的 `<img src=x onerror=…>` 只能当文本，DOM 里不得出现 img（工单 §5 判据 9）', async () => {
+    stubFetch(response({
+      body: {
+        ...OK_BODY,
+        state: 'completed',
+        messages: [
+          { id: 'x1', seq: 1, run_id: 'child-run-bbbb', created_at: 1, role: 'assistant', text: '<img src=x onerror=alert(1)>' },
+          { id: 'x2', seq: 2, run_id: 'child-run-bbbb', created_at: 2, role: 'user', text: '<img src=x onerror=alert(2)>' },
+        ],
+      },
+    }));
+    const wrapper = mountDrawer();
+    await tick(0);
+    // 助手正文走 renderMarkdown（先转义后格式化），用户正文走 `{{ }}` 插值（等价 textContent）
+    // ⇒ 两路都不可能凭空长出一个真 img。这里拿 DOM 说话，不比字符串（v-html 裸插会直接输出标签）。
+    expect(wrapper.findAll('img')).toHaveLength(0);
+    expect(wrapper.text()).toContain('<img src=x onerror=alert(1)>');
+    expect(wrapper.text()).toContain('<img src=x onerror=alert(2)>');
+    wrapper.unmount();
+  });
+
   it('分级：completed 绿 / running 蓝 / aborted 琥珀 / failed 红；completed + syserr termination ⇒ 红', async () => {
     const cases: Array<[Record<string, unknown>, string, string]> = [
       [{ state: 'completed' }, 'completed', 'text-green-600'],
