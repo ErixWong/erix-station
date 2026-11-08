@@ -300,12 +300,15 @@ test('B4 判据4 坏名册文件不 500：坏 JSON / 身份不符 / 非对象 �
     await fsp.writeFile(path.join(rosterAbs, `${CHILD_2}.json`), '{"oops"');
     await fsp.writeFile(path.join(rosterAbs, `${CHILD_NOT_ROSTERED}.json`),
       JSON.stringify({ runId: 'sub-ffffffff-ffff-4fff-8fff-ffffffffffff', state: 'completed', updatedAt: 5 }));
-    await fsp.writeFile(path.join(rosterAbs, 'not-a-child.json'), JSON.stringify({ state: 'completed' }));
+    await fsp.writeFile(path.join(rosterAbs, 'not-a-child.json'),
+      // 内容自身**完全合法**（runId 与文件名相符）：把它挡在外的唯一东西是「文件名就不是 sub-<uuid>」
+      // ⇒ 撤掉那一道形状判据就多得一条假子 run（而不是靠后面的身份比对兼平）。
+      JSON.stringify({ runId: 'not-a-child', state: 'completed', updatedAt: 9 }));
     await fsp.writeFile(path.join(rosterAbs, `${CHILD_1}.json.tmp-1-0`), '{"half');
     const res = await callList(h);
     assert.equal(res.items.length, 1, `只剩真件：${JSON.stringify(res.items)}`);
-    assert.equal(res.items[0].childRunId, CHILD_1);
-    assert.ok(res.skipped >= 3, `坏件要计数，实际 skipped=${res.skipped}`);
+    assert.deepEqual(res.items.map((i) => i.childRunId), [CHILD_1]);
+    assert.equal(res.skipped, 3, `坏件要逐件点名（坏 JSON / 身份不符 / 名字不是子 run 形状），实际 skipped=${res.skipped}`);
   } finally { h.cleanup(); }
 });
 
@@ -374,6 +377,10 @@ test('B11 DTO 白名单：roster record 不被原样下发；字段类型与 cre
   try {
     const res = await callList(h);
     assert.deepEqual(res.items.map((i) => i.childRunId), [CHILD_1, CHILD_2], 'createdAt 升序');
+    // 缺位的位不得臬造：CHILD_1 的名册件**没写** resultTruncated / errorMessage
+    assert.equal(res.items[0].resultTruncated, false, '缺位必须归一成 false（不是 true、不是 undefined）');
+    assert.equal(res.items[0].errorMessage, null);
+    assert.equal(res.items[0].termination, 'no_tool', '归一前的引擎 reason 照字符串下发（P1 已在写侧归一）');
     assert.deepEqual(Object.keys(res.items[0]).sort(), [
       'childRunId', 'createdAt', 'cwd', 'endedAt', 'errorMessage', 'hasTranscript', 'model',
       'resultTruncated', 'state', 'termination', 'updatedAt',
