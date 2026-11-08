@@ -8,7 +8,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import StreamPanel from './StreamPanel.vue';
 import DelegateChildDrawer from './DelegateChildDrawer.vue';
 import { useWorkbenchStore } from '../stores/workbench';
-import { shortRunId } from '../lib/delegate';
+import { parseDelegateResult, shortRunId } from '../lib/delegate';
 import { i18n, setLocale } from '../i18n';
 import { zhCN } from '../i18n/locales/zh-CN';
 
@@ -31,6 +31,34 @@ function driveDelegate(store: ReturnType<typeof useWorkbenchStore>, result: unkn
 
 function mountPanel() {
   return mount(StreamPanel, { global: { plugins: [i18n] } });
+}
+
+/**
+ * 真机形状：加载/刷新路径的 `toolCalls[].resultPreview` 是上游**截到 400 字**的结果预览（末尾 `…`）。
+ * 前缀里 `ok`/`runId`/`state`/`action` 都在截断点之前，但引号不闭合 ⇒ `JSON.parse` 必抛（下面有用例钉住）。
+ */
+const TRUNCATED_PREVIEW = [
+  '{',
+  '  "ok": true,',
+  '  "runId": "sub-6eda7fa1-03b2-4f36-b3f2-254662979dda",',
+  '  "state": "completed",',
+  '  "termination": "end_turn",',
+  '  "action": "dispatch",',
+  '  "text": "**结论：没有 .md 文件。**本轮只改了代码与测试，没有产出文档，改动清单见上面三个文件路径，其中两个是测试…',
+].join('\n');
+
+/** 刷新/加载路径建卡（与真机一致：卡片只有 400 字预览，没有实时 `out`），并补上宿主占位 entry。 */
+function driveLoadedDelegate(store: ReturnType<typeof useWorkbenchStore>, resultPreview: string, callId = 'c1') {
+  store.es.projectToolCard(`run-1:${callId}`, {
+    name: 'delegate',
+    argsSummary: 'task=做点事',
+    resultPreview,
+    isError: false,
+  }, { key: `run-1:${callId}`, runId: 'run-1', roundToken: '?', callId });
+  // 投影路径不产 entries ⇒ 宿主占位由 onToolCardCreated 负责，这里按同一键补一条（与实时路等价形状）。
+  if (!store.entries.some((en) => en.kind === 'tool' && en.callId === `run-1:${callId}`)) {
+    store.entries.push({ kind: 'tool', callId: `run-1:${callId}` });
+  }
 }
 
 beforeEach(() => {
@@ -108,16 +136,7 @@ describe('delegate 工具卡（接线到 DelegateChildDrawer）', () => {
 
   it('刷新/加载路径（projectToolCard）建的卡也带 runId ⇒ 抽屉照样打得开', async () => {
     const store = useWorkbenchStore();
-    store.es.projectToolCard('run-1:c1', {
-      name: 'delegate',
-      argsSummary: 'task=做点事',
-      resultPreview: JSON.stringify({ ok: true, runId: 'sub-child-cccc', state: 'completed', action: 'dispatch' }),
-      isError: false,
-    }, { key: 'run-1:c1', runId: 'run-1', roundToken: '?', callId: 'c1' });
-    // 投影路径不产 entries ⇒ 宿主占位由 onToolCardCreated 负责，这里按同一键补一条（与实时路等价形状）。
-    if (!store.entries.some((en) => en.kind === 'tool' && en.callId === 'run-1:c1')) {
-      store.entries.push({ kind: 'tool', callId: 'run-1:c1' });
-    }
+    driveLoadedDelegate(store, JSON.stringify({ ok: true, runId: 'sub-child-cccc', state: 'completed', action: 'dispatch' }), 'c1');
     expect(store.es.toolCards.get('run-1:c1')?.runId).toBe('run-1');
     const wrapper = mountPanel();
     const btn = wrapper.find('.delegate-open-viewer');
@@ -126,5 +145,37 @@ describe('delegate 工具卡（接线到 DelegateChildDrawer）', () => {
     const drawer = wrapper.findComponent(DelegateChildDrawer);
     expect(drawer.exists()).toBe(true);
     expect(drawer.props()).toMatchObject({ parentRunId: 'run-1', childRunId: 'sub-child-cccc' });
+  });
+
+  // 真机回归（2026-12）：刷新后的 resultPreview 是**截到 400 字**的前缀 ⇒ 整体 JSON.parse 必抛。
+  // 当时卡片走回退分支 ⇒ runId 为空 ⇒ 「查看子 run」按钮在刷新后整片消失（实时看起来却一切正常）。
+  it('resultPreview 被上游截到 400 字（JSON.parse 必抛）⇒ 刷新后仍出按钮且 runId 完整', async () => {
+    // 这条 fixture 必须真的是「截断到 parse 不回去」的形状，否则用例测的就不是那个 bug。
+    expect(() => JSON.parse(TRUNCATED_PREVIEW)).toThrow();
+    const store = useWorkbenchStore();
+    driveLoadedDelegate(store, TRUNCATED_PREVIEW, 'c1');
+    const wrapper = mountPanel();
+    const btn = wrapper.find('.delegate-open-viewer');
+    expect(btn.exists()).toBe(true);
+    // 摘要位与分级也得从同一个前缀里拿得到（action + 后 8 位短码；completed/end_turn ⇒ ✓ 绿）。
+    expect(wrapper.get('.delegate-summary').text()).toBe(`dispatch · ${shortRunId('sub-6eda7fa1-03b2-4f36-b3f2-254662979dda')}`);
+    expect(wrapper.get('.delegate-state').text()).toBe('✓');
+    await btn.trigger('click');
+    // 抽屉拿到的必须是**完整**的子 runId（不是截断串里的半截）。
+    expect(wrapper.findComponent(DelegateChildDrawer).props()).toMatchObject({
+      parentRunId: 'run-1',
+      childRunId: 'sub-6eda7fa1-03b2-4f36-b3f2-254662979dda',
+    });
+  });
+
+  it('结果串完全不是 JSON（`not json at all`）⇒ 不出按钮、不抛、退回既有展示', () => {
+    expect(parseDelegateResult('not json at all')).toBeNull();
+    const store = useWorkbenchStore();
+    driveLoadedDelegate(store, 'not json at all', 'c1');
+    const wrapper = mountPanel();
+    expect(wrapper.find('.delegate-open-viewer').exists()).toBe(false);
+    // 解不出 ⇒ delegate 专属的两段都不渲染（摘要/状态位回到既有通用展示）。
+    expect(wrapper.find('.delegate-summary').exists()).toBe(false);
+    expect(wrapper.find('.delegate-state').exists()).toBe(false);
   });
 });
