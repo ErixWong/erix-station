@@ -162,6 +162,11 @@ export interface ToolCardState {
   argsSummary?: string;
   resultPreview?: string;
   executionStatus?: string;
+  // issue #delegate（工单 §2.0）：这张卡属于哪个 run —— delegate 抽屉的 `parentRunId`（端点必填）。
+  // **两条建卡路径都填**（实时 `toolCard()` 与刷新/加载的 `projectToolCard()`）：只填实时那条，
+  // 刷新后历史 delegate 卡片就全都点不开抽屉，而刷新是用户最常做的动作。
+  // 缺失（脏值/旧数据）⇒ **不写这个键**（与 `dur`/`executionStatus` 的「不拿 undefined 占位」同口径）。
+  runId?: string;
 }
 
 /**
@@ -630,6 +635,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     const existing = toolCards.get(key);
     if (existing) return existing;
     const card: ToolCardState = { name: name ?? 'tool', dig: digText(input), args: '', ok: null, out: '' };
+    // issue #delegate（工单 §2.0）：实时路把 runId 归一后存进卡片（`runSegment` 脏值 ⇒ null ⇒ 不写键）。
+    const runSeg = runSegment(runId);
+    if (runSeg !== null) card.runId = runSeg;
     toolCards.set(key, card);
     // 索引只记录「这个 provider id 最新对应哪张卡」，供结果/投影关联用；它不参与身份计算。
     rememberCallAlias(callId, { key, runId: runSegment(runId), roundToken: roundTokenFor(runId) });
@@ -670,6 +678,8 @@ export function useEventStream(hooks: EventStreamHooks) {
     // issue #283：库里可能是 NULL（旧数据引擎当年就没发时长）⇒ 不收，也不拿 0 冒充有时长。
     const projectedDur = Number.isFinite(fields.durationMs) ? (fields.durationMs as number) : undefined;
     const mergeKey = alias && typeof alias.callId === 'string' ? cardByCallId.get(alias.callId) : undefined;
+    // issue #delegate：alias 里带的 run_id 归一（脏值 ⇒ null ⇒ 不写键），两条分支共用同一个归一值。
+    const aliasRun = runSegment(alias?.runId);
     const existing = toolCards.get(key) ?? mergeTargetByAlias(key, alias);
     if (existing) {
       // 归并到索引里那张时顺手收紧它的轮号（键不变）：否则同一 id 的下一次不同轮投影会继续误归并。
@@ -682,6 +692,9 @@ export function useEventStream(hooks: EventStreamHooks) {
       // issue #299：投影值现在可能来自**引擎自己**（0.20.0 起投影 `toolCalls[].durationMs`），也可能来自
       // 宿主 join 的回落值（`portal/src/session-view.js`）；前端不分辨来源，只看「有值才用」。
       if (projectedDur !== undefined && existing.dur == null) existing.dur = projectedDur;
+      // issue #delegate：同样「实时优先」——已有 runId 的卡**不被投影覆盖**，只给缺位的补上
+      //（实时路漏收 run_id 时，刷新后仍能把抽屉打开）。
+      if (existing.runId === undefined && aliasRun !== null) existing.runId = aliasRun;
       if (existing.ok === null && (fields.isError !== undefined || hasPreview || isSpecialExecutionStatus(fields.executionStatus))) {
         existing.ok = fields.isError !== true;
       }
@@ -699,6 +712,9 @@ export function useEventStream(hooks: EventStreamHooks) {
       argsSummary: fields.argsSummary,
       resultPreview,
     };
+    // issue #delegate（工单 §2.0 补条）：**刷新/加载路径新建的卡也要带 runId**，否则刷新后
+    // 所有历史 delegate 卡片都打不开抽屉。值来自 alias（宿主在 `workbench.ts` 传进来的 `ident.alias`）。
+    if (aliasRun !== null) card.runId = aliasRun;
     // 没有时长就**不写这个键**（不塞 `dur: undefined` 占位），与 M1 的「缺失保持 undefined」同口径。
     if (projectedDur !== undefined) card.dur = projectedDur;
     // #299 (c) 同口径：`executionStatus` 在 0.20.0 起**只在特殊状态下存在**，普通块上必须**也不写键**
