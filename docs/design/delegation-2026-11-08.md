@@ -76,7 +76,7 @@ createStationDelegation({
   parentCwd,
   home,               // /home/erix
   provider,           // 复用父的 provider 实例（同一凭据/超时口径）
-  tools,              // 父的工具面，装配时**剔掉 delegate**
+  fileTools, shellTools,   // 子工具面 = 这两组显式拼装（见下）
   modelMetadata, maxTokens,   // 与父同源（config.metadata / config.tuning）
   childMaxRounds,     // env ERIX_DELEGATE_CHILD_ROUNDS，默认 8
   childDeadlineMs,    // env ERIX_DELEGATE_CHILD_TIMEOUT_MS，默认 240_000（< watchdog 300_000）
@@ -88,6 +88,23 @@ createStationDelegation({
 ```
 
 内部：
+
+**子工具面是显式构造的，不是「父工具面剔 delegate」**：
+
+```js
+const childTools = [...fileTools.schemas, ...shellTools.schemas];
+```
+
+- 不含 `delegate`（v1 不递归）；
+- **不含 `note_*`**：父子共用 `scopeRef=sessionId` 的同一批笔记目录，而「单写者」不变量的依据
+  `runs_one_active_per_session`（`schema.sql:222-223`）**管不到同进程嵌套的两个 loop**
+  （`runner/worker.js:556-558` 的注释正是这么写的）⇒ 给子 notes 工具就是并发写同一批文件；
+- 不含 skills 工具（子只做「读 + 分析 + 返回文本」）。
+
+**子 run 的 system prompt 单独写一段短的**（不复用父的 `SYSTEM_PROMPT`：那段讲 `delegate` 用法、
+AGENTS.md 已注入、预览端口规则，对子全是噪音且会诱导它调不存在的工具）。建议 4-6 行：
+你是父 run 派出的子 run / 只做这一件事 / 工具只有文件工具与 shell / 没有派生子 run 的工具 /
+完成后用一段话汇报结论（父只会看到这段文本）。
 
 - `runChild(request)`：
   1. `signal = anySignal([request.signal, parentSignal])`（自己实现，Node 22 有 `AbortSignal.any`）
@@ -128,7 +145,18 @@ createStationDelegation({
    不需要 pgid，agentd 零改动）。
 6. **中止串联**：把 worker 自己的 `abortController.signal` 作为 `parentSignal` 传进去（已存在，`:992` 附近）。
 
-### 4.3 env（`runner/lib/config.js` + `docs/env.md` 登记）
+### 4.3 目录属主（真机才会炸的一条）
+
+`<home>/delegation/{roster,leases,transcripts}` **由 agentd 预建并 `runAsWorker` 改属主**，
+不能让 worker 在跑的时候自己建：agentd 是 UID 1001、worker 是 1002（`runner/agentd.js:52`、
+`runner/Dockerfile:35-36`），1001 建的目录默认 `755` ⇒ 1002 写不进；`runner/entrypoint.sh:11-12`
+的 `umask 0002` 只对**新建**生效，救不了已存在的属主。现成先例：notes 目录就是这么建的
+（`runner/lib/run-data.js:75-80`，调用点 `agentd.js:1305-1310`）。
+
+失败**只 warn 不 requeue**（delegation 是加分项，同 notes 的降级口径），并把 `delegation_dir`
+下行给 worker（照 `notes_dir` 的写法，`agentd.js:1347`）——路径只有一个真相源，测试也能注入临时目录。
+
+### 4.4 env（`runner/lib/config.js` + `docs/env.md` 登记）
 
 | env | 默认 | 说明 |
 |---|---|---|
@@ -137,7 +165,7 @@ createStationDelegation({
 | `ERIX_DELEGATE_CHILD_ROUNDS` | `8` | 子 run 轮数预算 |
 | `ERIX_DELEGATE_CHILD_TIMEOUT_MS` | `240000` | 子 run 时间预算（**必须 < 300000 watchdog**） |
 
-### 4.4 P1 明确不做
+### 4.5 P1 明确不做
 
 `notifyParent` 投递、UI、DDL、新事件类型、子独立 cwd、递归 delegate、跨进程 cancel、`tail` 接给模型、
 名册 TTL 清理。
@@ -161,8 +189,11 @@ GET /api/sessions/:sessionId/delegates/:childRunId?tail=100
 - **读 roster**：`<...>/home/delegation/roster/<parentRunId>/*.json`，逐条 `JSON.parse`，
   坏文件跳过（不 500）。
 - **读 transcript**：`<...>/home/delegation/transcripts/<childRunId>.jsonl`，逐行 `JSON.parse`
-  → `foldLedgerMessages`（引擎导出）→ `projectTranscriptForDisplay`（**与 `session-view.js:31` 同一个函数**）
+  → **`portal/src/transcript-fold.js#foldLedgerRecords`**（本站超集镜像，`runner/lib/store.js#load` 用的同一份）
+  → `projectTranscriptForDisplay`（`erix-agent` 包根导出，`session-view.js:31` 同一个函数）
   → 再套一层既有 DTO 适配（`id/seq/run_id/created_at` 这些宿主字段用 `childRunId` + 行号合成）。
+  ⚠ `foldLedgerMessages` / `foldMessageRows` **不在包导出面**（实测 `undefined`，深引被 `exports` 挡）
+  ⇒ 只能用本站镜像；那也正好是既有保证（两份 `SHARED-FOLD-CORE` 逐字节对拍，AGENTS §8.52）。
   `tail=N` 只投影最后 N 条逻辑消息（读侧先截断原始行会破坏折叠，**必须全量投影后再切**，
   与 `session-partial-output` 的成本口径同族：单文件有上限，超过 8MB 直接 413 并提示）。
 - **成本红线**：`tail` 默认 100，硬上限 500；文件读流式，不许整文件 `readFileSync` 进内存超过上限。
@@ -204,9 +235,10 @@ pi-web 的形态（`~/projects/github/pi-web`，已读源码）：
 - 展示：
   - 头行：`delegate` + action（`run/status/result/list/cancel/tail`）+ 子 runId 短码
   - 状态徽标：`running`（脉冲）/`completed`/`aborted`/`failed`/`timeout`/`interrupted`
-    —— **颜色映射必须过本站 `terminationReasons.ts` 的分级**，不许直接用名册 state 上色
-    （`no_tool`/`continuation_exhausted` 名册判 `failed` 但本站当正常收尾 ⇒ 后端 DTO 里要带
-    `termination` 原值，前端按 `RUN_TERMINATION_SYSERR_REASONS` 判红）。
+    —— **颜色映射必须过本站 `terminationReasons.ts` 的分级**，不许直接用名册 state 上色。
+    P1 已把 `no_tool` / `continuation_exhausted` 归一成 `end_turn`（名册 `completed`），
+    所以 DTO 的 `termination` 是**归一后**的字符串；前端仍按 `RUN_TERMINATION_SYSERR_REASONS` 判红
+    （`persistence_failed` / `final_guard_unverified` 等该红的照样红）。
   - 「查看子 run」按钮（仅 `run` 且 `ok:true` 时出现）
 - 展开区：子 run 的 `text`（截断提示照 `resultTruncated`）。
 
@@ -249,11 +281,14 @@ pi-web 的形态（`~/projects/github/pi-web`，已读源码）：
    变异：`leaseDir` 放 per-run ⇒ 第三个成功 ⇒ 红。
 5. **父停 ⇒ 子死**：父 `parentSignal` abort ⇒ 子 `runToolLoop` 收到 abort、名册 `aborted`。
    变异：不串 signal（只透传库给的 `request.signal`）⇒ 子跑完 ⇒ 红。
-6. **usage 不漏账**：子 usage 出现在父 `RUN_FINISHED.usage` 里（逐字段相加）。
-   变异：不累加 ⇒ 红。
+6. **usage 不漏账，也不双记**：子 usage 出现在父 `RUN_FINISHED.usage` 里（逐字段相加）；
+   **反向**：`usage_ledger` 只有一行且 `run_id` 是父（第二行会被
+   `usage_ledger_run_source_key UNIQUE (run_id, source)` + `ON CONFLICT DO NOTHING` 静默吞掉，
+   那正是「以为记了」的形状）。变异：不累加 ⇒ 红；为子另发一行 ⇒ 红。
 7. **默认关**：`ERIX_DELEGATE_ENABLED` 未设 ⇒ `tools` 与今天逐字相同（含 `delegate` 不在）。
    变异：默认开 ⇒ 红。
-8. **不递归**：子的 `tools` 里没有 `delegate`。变异：复用父工具面不剔 ⇒ 红。
+8. **不递归 + 工具面显式**：子的工具名集合 === 文件工具注册面 + `shell`（`delegate` / `note_*` / skills 全不在）。
+   变异：复用父工具面 ⇒ 红。另断言子的 file 工具 executor 与父是**同一个对象引用**（jail 边界不重建）。
 9. **`deadlineMs` 换算**：`config.timing.deadlineMs` 是 `Date.now()+budget`（不是 budget 本身）。
    变异：直接透传 ⇒ 红（断言 deadlineAt 与 now 的差 ≈ budget）。
 10. **保活**：子跑 4 分钟期间父 worker 至少发过 N 次 `SHELL_LIVENESS.heartbeat`。
