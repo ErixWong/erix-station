@@ -79,3 +79,90 @@ dialog 语义与焦点与滚动锁归还、短码标题与刷新按钮。
    任务描述还是短码。
 5. 后端契约按工单给的形状打桩：真实响应若把 `termination` 写成对象而非字符串，
    `delegateBadgeKind` 会**不当命中 syserr**（`lib/delegate.ts` 的既定口径），届时要看 P2 读侧归一化。
+
+---
+
+# P3 执行报告（接线轮）：把子 run 抽屉接到工具卡上
+
+## 取证边界
+
+* **本报告只覆盖**本轮三个交付：`useEventStream.ts` 的 `ToolCardState.runId`（两条建卡路径）、
+  `StreamPanel.vue` 的 delegate 工具卡 + 抽屉挂载点、新建 `DelegateToolCard.spec.ts`（5 例）。
+  **未改** `DelegateChildDrawer.vue` / `lib/delegate.ts` / i18n（`delegate.openViewer` 双语键上一轮已在）。
+* 按工单纪律**只读了 3 个既有文件的规定片段**：`StreamPanel.vue`（import 段 + 工具卡模板 + 卡片取数助手
+  `summaryText/statusMark/cardArgs/cardOut`）、`useEventStream.ts`（`ToolCardState` + `toolCard()` +
+  `projectToolCard()`）、`workbench.ts`（`StreamEntry`）；另外只 `grep` 取符号位置与少量定义体：
+  `lib/terminationReasons.ts`（红色集合定义）、`lib/delegate.ts`（`delegateBadgeKind/DELEGATE_BADGE_CLASS/shortRunId`）、
+  `lib/toolCardKey.ts`（`runSegment`）、`i18n/locales/*`（`openViewer` 键存在性）、`toolSummary.ts`（`getToolResultSummary`
+  对非字符串结果的归一形状）、`DelegateChildDrawer.spec.ts`/`StreamPanel.spec.ts`/`useRunMomentum.spec.ts`（测试装配口径）。
+  **未读** pi-web 源码（32px 按钮形状按工单文字 + 站内既有 `PreviewPortsPanel` 图标按钮风格落地）。
+* 所有「绿」的判据是**退出码**（见「自检结果」），不是散文。**未做真后端联调**：抽屉端点仍按 P2 契约打桩，
+  本轮没有起 portal 服务验证「真实 delegate 卡片 → 真实子 run 正文」端到端。
+
+## 交付 1：`ToolCardState.runId`（工单 §2.0 + 中途补条）
+
+* `ToolCardState` 增可选 `runId?: string`（= 卡片所属 run = 抽屉端点的 `parentRunId`）。
+* **两条建卡路径都填**：实时 `toolCard(key, callId, name, input, runId)` 用 `runSegment(runId)` 归一；
+  投影 `projectToolCard(key, fields, alias)` 用 `runSegment(alias?.runId)` 归一。脏值 ⇒ `null` ⇒ **不写这个键**
+  （与 `dur` / `executionStatus` 的「不拿 undefined 占位」同口径）。
+* 投影**归并到已有卡片**那一支只在 `existing.runId === undefined` 时补，不覆盖实时值（与 `dur` 的「实时优先」同口径）。
+* `cardIdentity` / `cardForCorrelation` / 事件集合**一字未改**。
+
+## 交付 2：`StreamPanel.vue` 的 delegate 工具卡
+
+* 只在 `card.name === 'delegate'` 且结果里能解出 JSON 对象时启用专属展示；解不开（预览被 400 字截断、
+  工具给了自由文本、旧数据）⇒ **整段退回既有 `summaryText` + ✓/✗/…**，解析全程 `try/catch`，**永不抛**。
+  实时路 `card.out` 是「✓ {json} (1.2s)」这种包裹串 ⇒ 先整体 `JSON.parse`，再退一步取首个 `{...}` 片段解析。
+* 摘要位：`action · <子runId 短码>`（短码走 `lib/delegate.shortRunId`，不重造口径）。
+* 状态位：`queued/running` ⇒ `svg.animate-spin` + `text-brand`；`completed` ⇒ ✓ 绿；`aborted` ⇒ ■ 琥珀；
+  `failed/timeout/interrupted` ⇒ ✗ 红。分级**唯一入口**是 `lib/delegate#delegateBadgeKind(state, termination)`
+  —— 它内部就是 `RUN_TERMINATION_SYSERR_REASONS` 那道闸且判序在 `completed` 之前 ⇒
+  **`completed` + `persistence_failed` 仍红**，组件里**没有第二份枚举**（这就是「从 terminationReasons 导入」的落地方式）。
+* 头行右侧图标按钮：`h-8 w-8` + `border-l border-black/10`、`aria-label`/`title` = `t('delegate.openViewer')`，
+  仅 `payload.ok === true && payload.runId !== ''` 时出现。它在折叠 `<button>` 的**外层 wrapper** 里
+  （HTML 不允许嵌套 button，故头行从「单个满宽 button」改成「flex wrapper = 折叠 button(flex-1) + 图标 button」）。
+* 抽屉挂载点**全组件一处**（`<template>` 底部 `v-if="delegateOpen"`）：`sessionId=store.sessionId ?? ''`、
+  `parentRunId=card.runId`、`childRunId=` 解析出的 runId、`label=card.name`、`@close` 置空；
+  另把解析到的 `termination` 递下去（抽屉自己端点不带它，而「completed + syserr 仍红」在抽屉里也得成立）。
+
+## 交付 3：`DelegateToolCard.spec.ts`（5 例，全绿）
+
+卡片一律用**真实入口**驱动（`store.es.handleEvent('tool_use'/'tool_result')`、`store.es.projectToolCard(...)`），
+不手搓窄类型卡片对象。
+
+1. `tool_result` = `{ok:true,runId,state:'completed'}` ⇒ `.delegate-open-viewer` 出现（`aria-label`/`title` 齐）+
+   摘要位 `dispatch · <短码>` + 状态位 ✓ 绿；
+2. 载荷 `{ok:false,reason:'capacity_full'}` ⇒ **无按钮**（闸看载荷 `ok`，不看卡片 `ok`；用例特意让
+   `tool_result.ok=true` 而载荷 `ok=false`，这样「看错字段」也会红）；
+3. `state:'failed'` ⇒ `text-red-600` + ✗；`state:'completed'` + `termination:'persistence_failed'` ⇒ **仍** `text-red-600` + ✗；
+4. 点按钮 ⇒ `findComponent(DelegateChildDrawer)` 存在、props 为
+   `{sessionId:'sess-1', parentRunId:'run-1', childRunId:'sub-child-aaaa', label:'delegate'}`、`close` 后卸载
+   （同一例顺带钉 `state:'running'` ⇒ `text-brand` + `svg.animate-spin`）；
+5. **刷新/加载路径**：`projectToolCard(key, {...delegate 结果...}, {key, runId:'run-1', roundToken:'?', callId:'c1'})`
+   建卡后 `toolCards.get(key).runId === 'run-1'`，且渲染出按钮、点击后抽屉 props 的 `parentRunId` 就是 `'run-1'`
+   —— 这条就是「不填投影路径 ⇒ 刷新后全部打不开」的反证。
+
+## 自检结果
+
+| 命令 | rc | 结果 |
+| --- | --- | --- |
+| `timeout 240 npm test -- src/components/DelegateToolCard.spec.ts` | **0** | 5 passed (5) |
+| `timeout 300 npm test -- src/components/StreamPanel.spec.ts`（**被改组件的既有回归**） | **0** | 66 passed (66) |
+| `timeout 300 npm test -- src/composables/useEventStream.spec.ts`（**被改 composable 的既有回归**） | **0** | 83 passed (83) |
+| `timeout 420 npm run typecheck`（`vue-tsc --noEmit`） | **0** | 无输出 |
+
+**未跑全量 `npm test`**（按工单纪律）；`GitLightBadge.spec.ts` 一字未动。
+
+## 遗留问题 / 需要关注
+
+* **工作区里有一条不属于本轮的未提交改动**：`DelegateChildDrawer.vue` 的 `schedule()` 被改成
+  `void poll()`（删掉了 `setTimeout(..., DELEGATE_POLL_MS)`）。若那是终稿，**活态轮询会退化成无间隔紧循环**
+  （纪律 ①「按拍」与 ③ 的排程语义都没了，且 `DELEGATE_POLL_MS` 变成未使用）。本轮**没有 stage 也没有改**那个文件；
+  本轮用例返回的是终态 `completed`，两种实现都只发一发，所以不掩盖该问题、也不被它影响。
+* 头行结构由「单个满宽 button」变成「wrapper + 折叠 button」：既有 66 例全绿（它们抓的是 `button[aria-expanded]`），
+  但任何**未跑到的**外部样式/E2E 若按「卡片第一个子元素就是 button」定位，需要跟着改（`.delegate-open-viewer` /
+  `.delegate-summary` / `.delegate-state` 三个类名是本轮新钉的稳定钩子）。
+* `card.runId` 缺失（旧数据、事件帧没带 `run_id`）时按钮**仍会出现**（工单把出现条件写成「载荷 ok && runId」），
+  此时抽屉会带 `runId=''` 去拉端点 ⇒ 展示为拉取失败，不抛。要更严可把按钮条件加上 `card.runId`，本轮按工单文字执行。
+* 载荷里 `state` 缺席/脏值（例如只有 `{ok:false,reason:'capacity_full'}`）时状态位**沿用既有 ✓/✗/…**、
+  不猜成红色（宁可不显示也不谎报）；工单「其余 ⇒ ✗ 红」按「已知的失败类 state」理解。
