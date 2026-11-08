@@ -97,7 +97,7 @@ test('#337 引擎取上下文与 run 作用域 legacy 端点**不折**（`intern
     + '端点再折一遍是页内折（跨页轮会漏），legacy run 作用域端点更不该动');
 });
 
-test('#337 折叠模块只有一个消费点（`session-view.js`），别处引用即红', () => {
+test('#337 折叠模块只有三个消费点（`session-view.js` / `transcript-store.js` / `delegation.js`），别处引用即红', () => {
   const files = fs.readdirSync(SRC).filter((name) => name.endsWith('.js'));
   // #351：模块自己的文件头现在要点名镜像 `runner/lib/transcript-fold.js`（两份尺的漂移说明），
   // 那是**注释**不是消费点 ⇒ 排除自身；否则「改一句注释」就把这条护栏咬红，护栏就变成了打字员。
@@ -107,8 +107,12 @@ test('#337 折叠模块只有一个消费点（`session-view.js`），别处引�
   // 允许清单在 0.25.0 从 1 个变 2 个：`transcript-store.js` 的 `load()` 现在也必须折
   //（上游 #458 的随包契约），口径必须与咽喉点**同一份** `planFold` —— 这正是「两处都用同一模块」
   // 的理由，不是「多一个消费点就违规」。名单外的新引用仍然红：折叠口径只许有一份。
-  assert.deepEqual(importers, ['session-view.js', 'transcript-store.js'],
-    `只允许这两个消费点引用 transcript-fold.js（口径只此一份），实际：${importers.join(', ')}`);
+  // delegation P2 把它从 2 个抬到 3 个：`delegation.js` 读的是**子 run 的账本文件**（不在 DB），
+  // 入口不同、规则同一份：它调 `foldLedgerRecords(records)`（文件记录），而咽喉点调
+  // `foldTranscriptRows(rows)`（DB 行），两者底下都是同一个 `planFold`。新增入口而不是另开一套
+  // 折叠，正是本护栏要的方向：口径漂移只在 `transcript-fold.js` 一处可能发生。
+  assert.deepEqual(importers, ['delegation.js', 'session-view.js', 'transcript-store.js'],
+    `只允许这三个消费点引用 transcript-fold.js（口径只此一份），实际：${importers.join(', ')}`);
 });
 
 test('#351 引擎面的折叠在 runner 侧（`runner/lib/store.js`），portal 端点面**不得**再折一遍', () => {
