@@ -33,7 +33,20 @@ export class FakePool {
     if (sql.includes('FROM users WHERE login')) {
       const login = params[0];
       const u = this.users.find((x) => x.login === login && x.status === 'active');
-      return { rows: u ? [u] : [] };
+      if (!u) return { rows: [] };
+      // **按 SQL 的列清单投影**（#449 回归）：真 PG 只回 SELECT 里点名的列，
+      // 而过去这里直接回整行 ⇒ 「SELECT 漏掉 mail_otp_enabled」这类 bug 在单测里永远看不见
+      // （生产上 `row.mail_otp_enabled` 恒 undefined ⇒ per-user 邮件验证码开关整条死掉）。
+      const m = /SELECT ([\s\S]*?) FROM users WHERE login/.exec(sql);
+      if (!m) return { rows: [u] };
+      const cols = m[1].split(',').map((c) => {
+        const t = c.trim();
+        const as = /\s+AS\s+(\w+)$/i.exec(t);
+        return as ? as[1] : t.split('.').pop();
+      });
+      const projected = {};
+      for (const c of cols) if (Object.hasOwn(u, c)) projected[c] = u[c];
+      return { rows: [projected] };
     }
 
     // hasTotpEnrollment：NULL 与空字符串均表示未注册。
