@@ -920,8 +920,12 @@ export const en = {
     mailOtpSection: 'Email verification code',
     mailOtpHint: 'Require an emailed code as the second factor for this user. This is a per-user switch, parallel to TOTP; the mail channel (SMTP) only decides whether mail can be sent at all.',
     mailOtpEnabledLabel: 'Require an emailed code at sign-in',
-    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor). Accounts with TOTP always use TOTP and ignore this.',
-    mailOtpHiddenByTotp: 'This account has TOTP enrolled — sign-in uses TOTP, so this switch has no effect.',
+    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor).',
+    // #449 second-factor choice (`second_factor_choice`): for accounts with TOTP enrolled this switch is no
+    // longer inert — it adds a second way in. The audit wording matters: the weaker path is logged as
+    // `email_code_alt`, so operators must be able to see that from this very row.
+    mailOtpEnabledLabelAlt: 'Email code (as an alternative to TOTP)',
+    mailOtpAltHint: 'This account has TOTP enrolled. Once enabled, sign-in accepts either TOTP or an emailed code; the email-code path is recorded in the audit log as email_code_alt.',
     mailOtpCurrentEmail: 'Codes will be sent to: {email}',
     mailOtpNeedsEmail: 'This user has no email yet — fill it in on the Profile tab first.',
     mailOtpSaved: 'Email-code setting saved.',
