@@ -127,6 +127,147 @@ export function writeTempFile(target, content, { mode = 0o644, uid = null, gid =
 }
 
 /**
+ * 流式写同目录 temp（issue #472 片 B）：与 `writeTempFile` **同一套 temp 纪律**
+ * （同目录命名 + `O_EXCL|O_NOFOLLOW` 独占创建 + `fchown` + `fchmod` + `fsync` + 失败清 temp），
+ * 唯一区别是内容来自**流**而不是 Buffer。
+ *
+ * ⚠ 为什么不把 body 读进内存（评审 blocker 5）：上限默认 32MiB，而 portal 与全站所有服务
+ * **共用同一个 Node 进程**（Traefik 单入口后面只有它）。并发十个上传各 buffer 一份就是 320MB 堆，
+ * portal OOM ⇒ 登录/预览/LLM 网关/事件流一起挂（全平台故障，不是「上传功能不可用」）。
+ * 逐 chunk `writeSync` 到 fd：内存占用只有一个 chunk，磁盘写不进得比网络快，天然背压。
+ *
+ * 失败路径一律「关 fd + unlink temp + 抛错」，**不留残骸**（评审 major 12：断流/超限必须可复用）。
+ * 超限（累计字节 > maxBytes）⇒ 抛 `code='upload_too_large'`（带 `bytes`/`maxBytes`）；
+ * 流的 `aborted` / `error` / 未 `end` 就 `close` ⇒ 抛 `code='upload_interrupted'`（带 `bytes`）。
+ * ⚠ 超限时**不 `stream.destroy()`**：只摘掉自己的监听器 ⇒ 请求流停止被消费，Node 在响应发完后
+ * 自己排空剩余 body。destroy 会 RST 掉连接，客户端可能连 413 响应都读不到。
+ *
+ * @returns {Promise<{tmp: string, bytes: number}>} 只落 temp，不提交（提交见 commitTempFile/NoClobber）
+ */
+export async function writeTempFileFromStream(target, stream, { maxBytes = null, mode = 0o660, uid = null, gid = null, root = null } = {}) {
+  if (root) assertSafePath(root, target);
+  const dir = path.dirname(target);
+  const tmp = path.join(dir, `${path.basename(target)}.${randomHex(4)}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
+
+  let bytes = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      let ended = false;
+      let settled = false;
+      const onData = (chunk) => {
+        bytes += chunk.length;
+        if (maxBytes !== null && bytes > maxBytes) {
+          // 先摘监听器（不再消费），再报错：不 destroy 的理由见函数头注释。
+          cleanup();
+          const err = new Error(`upload exceeds max bytes (${bytes} > ${maxBytes})`);
+          err.code = 'upload_too_large';
+          err.bytes = bytes;
+          err.maxBytes = maxBytes;
+          settled = true;
+          reject(err);
+          return;
+        }
+        try {
+          fs.writeSync(fd, chunk);
+        } catch (writeErr) {
+          cleanup();
+          settled = true;
+          reject(writeErr);
+        }
+      };
+      const onInterrupted = () => {
+        if (ended || settled) return;
+        cleanup();
+        const err = new Error('upload stream interrupted before completion');
+        err.code = 'upload_interrupted';
+        err.bytes = bytes;
+        settled = true;
+        reject(err);
+      };
+      const onEnd = () => {
+        ended = true;
+        cleanup();
+        settled = true;
+        resolve();
+      };
+      function cleanup() {
+        stream.off('data', onData);
+        stream.off('end', onEnd);
+        stream.off('aborted', onInterrupted);
+        stream.off('error', onInterrupted);
+        stream.off('close', onInterrupted);
+      }
+      stream.on('data', onData);
+      stream.once('end', onEnd);
+      // `aborted`：Node http 请求在客户端提前断开时发（deprecation 但仍是 http 的事实形状）；
+      // `error`：socket 复位（ECONNRESET）；`close`：流被关闭 —— 未 `end` 的 close 就是断流（onEnd 之后到來的 close 被 ended 拦住）。
+      stream.on('aborted', onInterrupted);
+      stream.on('error', onInterrupted);
+      stream.on('close', onInterrupted);
+    });
+
+    if (uid !== null || gid !== null) fs.fchownSync(fd, uid ?? -1, gid ?? -1);
+    fs.fchmodSync(fd, mode);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    return { tmp, bytes };
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
+}
+
+/**
+ * 提交 temp → target，**仅当 target 不存在**（issue #472 片 B 的唯一 no-clobber 保证）。
+ *
+ * ⚠ 为什么是 `linkSync` 而不是 `renameSync`（评审 blocker 4）：POSIX `rename(2)` **必然替换**已存在
+ * 目标，所以「先 lstat 再 rename」在两步之间被别的进程（FDE agent 就在同一个挂载目录里干活）创建出
+ * 目标时会被静默覆盖。`link(2)` 在目标已存在时返回 `EEXIST` ⇒ 同目录内原子的「仅当不存在才创建」，
+ * 零依赖零新 API。lstat 先查只是**快速路径**（省一次 temp 写入），不是安全依据。
+ *
+ * 返回 `false` 表示「目标已存在，没有提交」（**不抛错**，调用方转 409）；`true` 表示已提交。
+ * 两条路径都不留 temp：成功 ⇒ unlink temp；EEXIST ⇒ 也 unlink（否则每次 409 都留一份残骸）。
+ * ⚠ `true` 不复用 `fsyncDir` 的返回值：`fsyncDir` 的 `false` 意思是「已提交但目录持久性未确认」，
+ * 与「未提交」是两件事，混用会让调用方把已写好的文件报成 409。
+ */
+export function commitTempFileNoClobber(tmp, target, { root = null } = {}) {
+  if (root) assertSafePath(root, target);
+  try {
+    fs.linkSync(tmp, target);
+  } catch (err) {
+    if (err?.code === 'EEXIST') {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+      return false;
+    }
+    throw err;
+  }
+  try {
+    fs.unlinkSync(tmp);
+  } catch {}
+  fsyncDir(path.dirname(target));
+  return true;
+}
+
+/**
  * 提交 temp → target（rename 原子替换 + fsync 目录）。调用方负责失败时清理 temp。
  * 返回 boolean：rename 成功但目录 fsync 失败时返回 false（已提交但持久性未确认）；
  * 不抛错（rename 已提交，抛错会把「已提交」误报为失败，破坏调用方重试语义）。
