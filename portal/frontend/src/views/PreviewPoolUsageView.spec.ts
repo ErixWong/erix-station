@@ -12,9 +12,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { createMemoryHistory } from 'vue-router';
+import { createMemoryHistory, type Router } from 'vue-router';
 import App from '../App.vue';
 import { createAppRouter } from '../router';
+import { nextRouteLanding } from '../test-utils/navigation';
 import { useAdminStore } from '../stores/admin';
 import { i18n, setLocale } from '../i18n';
 import {
@@ -110,18 +111,27 @@ function usageCalls(fetchMock: ReturnType<typeof vi.fn>) {
 }
 
 /** 点管理台 tab（tab 是 AdminLayout 的 router-link，按名字找）。
- * 路由级组件是 `() => import(...)`：点完要等动态 import 解析完、视图真的挂上（
- * 用目标视图自己的锚点等，而不是数固定轮次的 flushPromises）。 */
-async function clickTab(wrapper: VueWrapper, label: string, awaitSelector?: string) {
+ * 路由级组件是 `() => import(...)`：点完要等动态 import 解析完、视图真的挂上。
+ *
+ * issue #473 family B 的同族残留（本文件最后一处墙钟）：这里原先写
+ * `await vi.waitFor(() => expect(wrapper.find(awaitSelector).exists()).toBe(true))`，
+ * 而 `vi.waitFor` 的**默认超时是 1000ms**，等的是懒加载组件挂载，本质仍是一根墙钟轮询：
+ * CPU 被抢时 jsdom 里这条路径实测要 2000ms+（主 agent 的 4 路并发全量配方 16 次里红 2 次，
+ * 用例耗时 2610ms / 2559ms）⇒ **假红**。改成零墙钟：先订阅 `router.afterEach`
+ * （vue-router 在导航完成前**已解析**懒加载组件），再点，再 await 落地，最后冲刷渲染。
+ * 组件没挂上 ⇒ 立刻以差异断言变红并点名选择器，不是一句 timeout。 */
+async function clickTab(router: Router, wrapper: VueWrapper, label: string, awaitSelector?: string) {
   const tab = wrapper.findAll('nav a').find((item) => item.text() === label);
   if (!tab) throw new Error(`管理台 tab「${label}」不存在`);
+  // A 类：导航由 RouterLink 点击触发 ⇒ **先订阅再点**（顺序反了会漏掉已发生的导航）。
+  const landed = nextRouteLanding(router);
   await tab.trigger('click');
-  await flushPromises();
+  await landed;                 // 导航落地（vue-router 在导航完成前已解析懒加载组件）
+  await flushPromises();        // 视图挂载（Vue 的渲染排队在微任务里，一次冲刷即完成）
   if (awaitSelector) {
-    await vi.waitFor(() => {
-      expect(wrapper.find(awaitSelector).exists()).toBe(true);
-    });
-    await flushPromises();
+    // 显式判据：组件没挂上就红，且错误信息点名选择器（不是一句 timeout）。
+    expect(wrapper.find(awaitSelector).exists(), `${awaitSelector} 未挂载（tab=${label}）`).toBe(true);
+    await flushPromises();      // 视图 onMounted 里的首个请求
   }
 }
 
@@ -160,12 +170,12 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe('issue #350 判据①：懒挂载 —— 进管理台不请求，切到该 tab 恰好 1 次', () => {
   it('判据①：/admin/users 落地时号池占用 0 次请求；点「号池占用」tab 后恰好 1 次 GET /api/admin/preview-ports/usage', async () => {
-    const { wrapper, fetchMock } = await mountAdmin((url) => (url.startsWith(PREVIEW_USAGE_PATH) ? jsonResponse(200, USAGE) : undefined));
+    const { wrapper, fetchMock, router } = await mountAdmin((url) => (url.startsWith(PREVIEW_USAGE_PATH) ? jsonResponse(200, USAGE) : undefined));
     try {
       expect(usageCalls(fetchMock)).toHaveLength(0);
       expect(wrapper.find('[data-test="preview-pool-usage"]').exists()).toBe(false);
 
-      await clickTab(wrapper, '号池占用', '[data-test="preview-pool-usage"]');
+      await clickTab(router, wrapper, '号池占用', '[data-test="preview-pool-usage"]');
       expect(usageCalls(fetchMock)).toHaveLength(1);
       // 无 query（缺省 limit 由服务端定，前端不复制默认值）
       expect(String(usageCalls(fetchMock)[0]![0])).toBe(PREVIEW_USAGE_PATH);
@@ -176,13 +186,13 @@ describe('issue #350 判据①：懒挂载 —— 进管理台不请求，切到
   });
 
   it('判据①：每次进入该 tab 恰好 1 次（离开再回来 = 第 2 次，且不会重复叠发）', async () => {
-    const { wrapper, fetchMock } = await mountAdmin((url) => (url.startsWith(PREVIEW_USAGE_PATH) ? jsonResponse(200, USAGE) : undefined));
+    const { wrapper, fetchMock, router } = await mountAdmin((url) => (url.startsWith(PREVIEW_USAGE_PATH) ? jsonResponse(200, USAGE) : undefined));
     try {
-      await clickTab(wrapper, '号池占用', '[data-test="preview-pool-usage"]');
+      await clickTab(router, wrapper, '号池占用', '[data-test="preview-pool-usage"]');
       expect(usageCalls(fetchMock)).toHaveLength(1);
-      await clickTab(wrapper, '用户管理', '[data-test="user-list"]');
+      await clickTab(router, wrapper, '用户管理', '[data-test="user-list"]');
       expect(usageCalls(fetchMock)).toHaveLength(1);
-      await clickTab(wrapper, '号池占用', '[data-test="preview-pool-usage"]');
+      await clickTab(router, wrapper, '号池占用', '[data-test="preview-pool-usage"]');
       expect(usageCalls(fetchMock)).toHaveLength(2);
     } finally {
       wrapper.unmount();
@@ -542,7 +552,7 @@ describe('issue #350 判据④：与改块流程接上（引用式 + 只读提�
   });
 
   it('判据④：看过总览后，改块输入框下方显示「这一段被谁占 / 整段空闲 / 不知道」', async () => {
-    const { wrapper, pinia } = await mountAdmin(
+    const { wrapper, pinia, router } = await mountAdmin(
       (url) => (url.startsWith(PREVIEW_USAGE_PATH) ? jsonResponse(200, USAGE) : undefined),
       '/admin/preview-pool',
     );
@@ -550,7 +560,7 @@ describe('issue #350 判据④：与改块流程接上（引用式 + 只读提�
       // 先真的看一次总览（缓存进 admin store），再回用户页开改块面板
       await flushPromises();
       expect(useAdminStore(pinia).previewUsageLoaded).toBe(true);
-      await clickTab(wrapper, '用户管理', '[data-test="user-list"]');
+      await clickTab(router, wrapper, '用户管理', '[data-test="user-list"]');
       await openPortsTab(wrapper, 'alice');
 
       const input = wrapper.get('[data-test="block-start-input"]');
@@ -580,7 +590,7 @@ describe('issue #350 判据④：与改块流程接上（引用式 + 只读提�
   });
 
   it('判据④红线：看到空闲段**绝不**自动改写 block_start_input 的值，也绝不自动提交（零 POST）', async () => {
-    const { wrapper, fetchMock } = await mountAdmin(
+    const { wrapper, fetchMock, router } = await mountAdmin(
       (url) => {
         if (url.startsWith(PREVIEW_USAGE_PATH)) return jsonResponse(200, USAGE);
         if (url === BLOCK_PATH) return jsonResponse(200, { changed: false });
@@ -589,7 +599,7 @@ describe('issue #350 判据④：与改块流程接上（引用式 + 只读提�
       '/admin/preview-pool',
     );
     try {
-      await clickTab(wrapper, '用户管理', '[data-test="user-list"]');
+      await clickTab(router, wrapper, '用户管理', '[data-test="user-list"]');
       await openPortsTab(wrapper, 'alice');
       const input = wrapper.get('[data-test="block-start-input"]');
       expect((input.element as HTMLInputElement).value).toBe('');
