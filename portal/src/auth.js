@@ -153,6 +153,9 @@ export async function authenticate(pool, login, password, { log } = {}) {
     mustChangePassword: row.must_change_password === true,
     // #449：第二因素选择规则（http.js `chooseSecondFactor`）要的邮箱；空串/NULL 一律按「未登记」。
     email: typeof row.email === 'string' && row.email.trim() !== '' ? row.email : null,
+    // 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。**放在 result 顶层**而不是 user 里：
+    // `user` 是登录响应会下发的 DTO，而这个开关只是宿主侧的判定输入（前端不需要知道）。
+    mailOtpEnabled: row.mail_otp_enabled === true,
   };
 }
 

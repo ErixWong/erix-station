@@ -72,6 +72,8 @@
 | 对话 | `POST /api/sessions/:id/messages` | 发消息（创建 run） |
 | 对话 | `GET /api/sessions/:id/events` | **SSE 事件流**（§5） |
 | 对话 | `GET /api/sessions/:id/folded/:round` | 折叠段「查看原文」（§4.4b，#189；**#375 改口径**：有 `foldedRoundRange` 就从账本重建） |
+| 子 run | `GET /api/sessions/:id/delegates?runId=` | **子 run 名册**（§4.4c，delegation P2：读 FDE 家目录的名册文件，零 DDL） |
+| 子 run | `GET /api/sessions/:id/delegates/:childRunId?runId=&tail=` | **子 run 账本投影**（§4.4c，与主对话同形的只读消息流） |
 | 对话 | `GET /api/sessions/:id/events/history` | run_events 展示类事件历史（§4.4a，刷新后重建卡片/面板；另含两类**响应期合成项** `partial_output` §4.4a-1 / `run_termination` §4.4a-2） |
 | 对话 | `POST /api/sessions/:id/stop` | 停止当前 run |
 | 对话 | `GET /api/runs/:id` | run 详情（状态 / termination / usage / error） |
@@ -1375,6 +1377,61 @@ run 对账」，不覆盖终态的历史回放。修法**不碰白名单**：在
 **口径为什么要改**（#375，背后可见上游 erix-agent#461）：erix-agent 0.25.0 之前 `record.foldedPayload` 是每次折叠从 `from:1` 重发的**全量副本**，所以“只读那一行归档”意外地等于“全部原文”；0.25.0 把它改成**本轮新增的有界差分**（会话级内容去重 + 默认 256 KiB 夹断）⇒ 只读归档只能给出残缺，去重全吸收时甚至是空，而旧口径一律 `404 folded_payload_not_found`、前端文案「原文已不可用（上游未保留折叠前载荷）」——那是假话，原文一直在各自的轮行里。上游契约也已写明：宿主不得把截断/缺失读成数据丢失，`foldedRoundRange` + `navigationRecord` 才是有界指针。
 
 **`404` 语义收窄**：`folded_payload_not_found` 现在只在「range 与归档**两条路**都拿不出任何正文」时才发（旧口径：那一行归档为空就发）。行顺序按 `round ASC, append_seq ASC`（与账本保序口径一致，#338 教训：不得只在页内取行）。
+
+### 4.4c `GET /api/sessions/:id/delegates[/:childRunId]`（delegation P2：子 run 名册与账本）
+
+子 run 在界面上**不是会话**（`docs/design/delegation-2026-11-08.md` §1：`runs.session_id NOT NULL` + `runs_one_active_per_session` 两条 DDL 挡死了「子 = 真 run」），所以上下文靠这两个只读端点从**文件**里读。零 DDL、零新事件类型、零新错误码、零审计（与 `GET /api/sessions/:id` 同口径）。
+
+数据源是 FDE 家目录里引擎自己写的两份文件（`<userSpaceRoot>/<fde>/home/delegation/`，容器内同一棵树挂在 `/home/erix/delegation/`）：名册 `roster/<parentRunId>/<childRunId>.json`（每父 run 一个目录）、账本 `transcripts/<childRunId>.jsonl`。**路径只能由两个 id 拼**：`runId` 必须是 uuid、`childRunId` 必须是 `sub-<uuid>`，两个正则锁死后 `path.resolve` + 前缀断言；调用方传不了任何路径片段（`portal/src/delegation.js`，不复用 `dirs.js#resolveJailedFile`——它的 jail 根是 `projects/<name>`，与本单不是同一棵树）。
+
+鉴权同 `GET /api/sessions/:id`（`fetchSession` 同一个 404，不泄露存在性），再叠两层：**`runId` 必须属于该会话**（查 `runs` 表）、**`childRunId` 必须出现在该 parent 的名册里**（形状合法不等于存在）。`runId` 是**必填** query 参数（名册按父 run 分片，没有父身份就不知道该读哪个目录）。
+
+```
+GET /api/sessions/:id/delegates?runId=<parentRunId>
+  → { "items": [ <DelegateItem> … ], "skipped": 0 }          // createdAt 升序
+GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=100
+  → { "childRunId": "sub-…", "state": "completed", "messages": [ … ], "truncated": false, "totalTurns": 3 }
+```
+
+**`items[]`（`DelegateItem`）是逐字段白名单**，不是名册记录原样下发（里面还有 `resultText` 整段子 run 终稿、`pid`、`statusPath`、`verification`、`taskDigest`、`budgetSource`，下发它们等于把 UI 没要的东西变成契约）：
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `childRunId` | string | 名册**文件名**（引擎同裁定：记录里的 `runId` 与文件名不符 = 损坏件） |
+| `state` | string | 名册七值枚举，见下；非字符串 ⇒ 该文件计进 `skipped` |
+| `cwd` / `model` | string \| null | 子的 cwd（P1 沿用父的）与模型；缺位 `null` |
+| `createdAt` / `endedAt` / `updatedAt` | number \| null | 毫秒 epoch（引擎 `updatedAt` 是单调水位） |
+| `termination` | string \| null | **引擎 reason 字符串**（见下方红线）；对象形态一律 `null` |
+| `errorMessage` | string \| null | 子 run 抛错时的错误文本（引擎侧截到 1000 字符） |
+| `resultTruncated` | boolean | `resultText` 被截断过（不下发正文本身，只要它） |
+| `hasTranscript` | boolean | 账本在不在——**只用 `existsSync` 填**，不为此读文件内容 |
+
+`skipped` = 被跳过的坏名册件数（JSON 解析失败 / 非对象 / `runId` 与文件名不符 / `state` 非字符串）。**一个坏文件不打成 500**：名册是普通 JSON 文件，而抽屉每 2s 轮询一次。名册目录不存在 ⇒ `{ "items": [], "skipped": 0 }`（**不是 404**：「还没派过子 run」与「刚点下 delegate、文件还没落」都是正常态）。原子写的临时件 `<id>.json.tmp-<pid>-<n>` 不算候选，也不计进 `skipped`。
+
+`messages[]` 是**与主对话同形**的 turn：上游 `projectTranscriptForDisplay` 的输出（`role`/`text`/`blocks`/`toolCalls`/`reasoning`/`round`/`ts`/`key`/`meta` 逐字透传，#95 红线）上叠四个宿主字段 `id`（`<childRunId>:<全量下标>`）/ `seq`（全量下标，所以向前翻页时同一条消息的 id 不漂移）/ `run_id`（= `childRunId`）/ `created_at`。⚠ `created_at` 是**轮行落盘时刻**（投影的 `ts` 读的是载体行），不是消息成型时刻，只当轮级时间戳用。
+
+**折叠与切尾的顺序（不得改）**：读全量行 → `portal/src/transcript-fold.js#foldLedgerRecords` → `projectTranscriptForDisplay` → **才** `slice(-tail)`。在原始行上切会把一轮切成半轮（`:msg:<round>:<seq>` 分片行与它的载体行分散在切界两侧），折叠拿到缺片的一轮 ⇒ 工具结果配不上对（#337 的老病根）。⚠ `foldLedgerMessages` / `foldMessageRows` **不在 `erix-agent` 的导出面**（实测 `undefined`，深引被包 `exports` 挡），所以用的是本站镜像——它正是 `runner/lib/store.js#load` 用的同一份口径（两份 `SHARED-FOLD-CORE` 逐字节对拍，AGENTS §8.52），也是上游读侧的**超集**（多一道 `partOf` 解链闸）。本站两条入口共用同一份 `planFold`：`session-view.js` 走 `foldTranscriptRows`（DB 行）、这里走 `foldLedgerRecords`（文件记录），不是两套规则。
+
+**参数与错误**
+
+| 情况 | 结果 |
+|---|---|
+| `runId` 缺席/空串 | `400 validation_failed`，`details.field='runId'` |
+| `runId` 不是 uuid（含 `runId=../../etc`） | `400 validation_failed`，`details.field='runId'`，**零文件读** |
+| `childRunId` 不是 `sub-<uuid>` | `400 validation_failed`，`details.field='childRunId'`，零文件读 |
+| `tail` 非 1..500 的整数（缺省 100） | `400 validation_failed`，`details.field='tail'` |
+| 会话不存在 / 不属本人 / 已归档 | `404 not_found`（`session not found`，与 §4.2 逐字相同） |
+| `runId` 不属于该会话 | `404 not_found`（`delegate not found`，不泄露 run 的存在性） |
+| `childRunId` 不在该 parent 的名册里 | `404 not_found`，`details.reason='not_in_roster'`（**不碰账本文件**） |
+| 账本文件不存在 | `404 not_found`，`details.reason='no_transcript'`（名册在、账本没落 ⇒ 前端给 `starting` / `no_transcript` 空态） |
+| 账本 > 8 MiB | `413 payload_too_large`，`details={size,max_bytes}`（**先 `stat` 再读**，超限一个字节都不进内存） |
+
+成本红线：`hasTranscript` 不读内容；名册目录不存在 ⇒ 零账本读；账本读取先 `stat` 判 8 MiB 上限（与 `session-partial-output` 的成本口径同族：单文件有上限，超了就 413 并提示）；账本里的坏行/空行（崩溃截断的最后一行是常态）跳过而不是 500。
+
+> **红线：`state` 是名册词汇（7 值：`queued` / `running` / `completed` / `failed` / `aborted` / `timeout` / `interrupted`），`termination` 才是引擎 reason。**
+> 引擎的 `TERMINATION_TO_STATE` 把未列出的一切判成 `failed`，而 P1 已把本站当正常收尾的 `no_tool` / `continuation_exhausted` 归一成 `end_turn` ⇒ 这类子在名册里是 `completed`。所以 **UI 分级以 `termination` 为准、过 `portal/frontend/src/lib/terminationReasons.ts`（`RUN_TERMINATION_SYSERR_REASONS`），不要只看 `state`**——只看 `state` 会把 `persistence_failed` / `final_guard_unverified` 这些该红的终态染成绿色。本模块只透传不归一（写侧的词汇封闭性是引擎的不变量，读侧拿它当过滤器只会藏掉真子 run）。
+
+另两条已知边界（不是 bug，设计 §9）：名册与账本无 TTL，会累积（清理是后续期）；子共用父 cwd ⇒ 写并行会互踩，对外只说「上下文隔离 + 读密集并行」。
 
 ### 4.5 `POST /api/sessions/:id/stop`
 

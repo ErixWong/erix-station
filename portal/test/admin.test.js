@@ -187,6 +187,15 @@ class AdminPool extends FakePool {
       row.last_error = null;
       return { rows: [{ state: row.state, steps: row.steps, last_error: row.last_error }] };
     }
+    // 2026-11-06：updateUser 的 email 唯一性预检（`lower(email) = lower($1) AND id <> $2`）。
+    // fake 必须按 SQL 说的做 —— 不模拟这一条，`email_conflict` 那条判据在单测里永远是绿的假象。
+    if (sql.includes('FROM users') && sql.includes('lower(email) = lower($1)')) {
+      const [email, excludeId] = params;
+      const needle = String(email ?? '').toLowerCase();
+      const hit = this.users.some((u) => u.id !== excludeId
+        && typeof u.email === 'string' && u.email.toLowerCase() === needle);
+      return { rows: hit ? [{ '?column?': 1 }] : [] };
+    }
     if (sql.includes('WITH updated AS') && sql.includes('UPDATE users SET')) {
       const user = this.users.find((u) => u.id === params[0]);
       if (user && sql.includes('NOT EXISTS (SELECT 1 FROM fde_offboarding')
@@ -198,7 +207,8 @@ class AdminPool extends FakePool {
         const match = sql.match(new RegExp(`${name} = \\$([0-9]+)`));
         return match ? params[Number(match[1]) - 1] : undefined;
       };
-      for (const name of ['display_name', 'role', 'fde_name']) {
+      // 2026-11-06：email 也在这条 SET 里（可改可清）；fake 按 SQL 的列清单走，不自己另写一套。
+      for (const name of ['display_name', 'email', 'role', 'fde_name']) {
         const value = field(name);
         if (value !== undefined) user[name] = value;
       }
@@ -212,9 +222,24 @@ class AdminPool extends FakePool {
           if (session.user_id === user.id && session.revoked_at === null) session.revoked_at = new Date();
         }
       }
+      // 唯一索引的模拟（真库是 `users_email_key`）：先查后写会漏并发，映射的是同一条约束。
+      const emailValue = field('email');
+      if (emailValue !== undefined && emailValue !== null) {
+        const clash = this.users.some((u) => u.id !== user.id
+          && typeof u.email === 'string' && u.email.toLowerCase() === String(emailValue).toLowerCase());
+        if (clash) {
+          const error = new Error('duplicate email');
+          error.code = '23505';
+          error.constraint = 'users_email_key';
+          throw error;
+        }
+      }
+      const retHasEmail = /RETURNING[^`]*\bemail\b/.test(sql);
       return {
         rows: [{
-          id: user.id, login: user.login, display_name: user.display_name, role: user.role,
+          id: user.id, login: user.login, display_name: user.display_name,
+          ...(retHasEmail ? { email: user.email ?? null } : {}),
+          role: user.role,
           fde_name: user.fde_name ?? null, auth_source: user.auth_source, status: user.status,
           created_at: user.created_at ?? new Date(), totp_enabled: user.totp_secret != null,
           last_login_at: null,
@@ -333,7 +358,9 @@ class AdminPool extends FakePool {
       }
       this.nextUser += 1;
       const row = {
-        id: `u-new-${this.nextUser}`, login: params[0], email: params[1], display_name: params[2],
+        // UUID 形态（真库 id 是 uuid；端点会校验，fake 用 `u-new-N` 会让 PATCH 一律 400 —— 假绿/假红都从这里来）。
+        id: `b0000000-0000-4000-8000-${String(this.nextUser).padStart(12, '0')}`,
+        login: params[0], email: params[1], display_name: params[2],
         role: 'fde', fde_name: params[5], auth_source: 'local', status: 'active',
         password_hash: params[3], totp_secret: params[4], created_at: new Date(),
         // #255：旗标按 SQL 说的做——INSERT 的列清单里有这一列且 VALUES 对应位是 true 才置；
@@ -341,12 +368,23 @@ class AdminPool extends FakePool {
         must_change_password: insertSetsMustChange(sql),
       };
       this.users.push(row);
-      return { rows: [{ id: row.id, login: row.login, display_name: row.display_name, role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status, created_at: row.created_at, totp_enabled: row.totp_secret !== null }] };
+      // 2026-11-06：RETURNING 里有 email 就回 email（fake 按 SQL 说的做，不自己另写一套形状）。
+      const returningHasEmail = /RETURNING[^`]*\bemail\b/.test(sql);
+      return {
+        rows: [{
+          id: row.id, login: row.login, display_name: row.display_name,
+          ...(returningHasEmail ? { email: row.email ?? null } : {}),
+          role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status,
+          created_at: row.created_at, totp_enabled: row.totp_secret !== null,
+        }],
+      };
     }
     // 用户列表
     if (sql.includes('FROM users') && sql.includes('LEFT JOIN')) {
+      const listHasEmail = /SELECT[^`]*users\.email/.test(sql);
       const rows = this.users.map((u) => ({
-        id: u.id, login: u.login, display_name: u.display_name, role: u.role,
+        id: u.id, login: u.login, display_name: u.display_name,
+        ...(listHasEmail ? { email: u.email ?? null } : {}), role: u.role,
         fde_name: u.fde_name ?? null, auth_source: u.auth_source, status: u.status, created_at: u.created_at ?? new Date(),
         totp_enabled: u.totp_secret != null,
         last_login_at: this.sessions
@@ -481,7 +519,9 @@ test('admin 用户管理：创建用户默认不启用 TOTP，响应与列表无
     assert.ok(!raw.includes('totp_secret'), '列表响应无 totp_secret 键');
     assert.ok(!raw.includes('password_hash'), '列表响应无口令哈希键');
     assert.ok(!raw.includes('secret-pass-1'), '任何响应不含明文口令');
-    assert.ok(!raw.includes('bob@example.test'), '用户列表不返回 email');
+    // 2026-11-06 口径变更：email **进**列表 DTO（管理台要能看/改；#449 邮件通道吃这一列）。
+    // 仍不许出现的是**秘密**：口令哈希与 TOTP secret（上面两条）。
+    assert.ok(raw.includes('bob@example.test'), '用户列表**要**返回 email（管理员可维护）');
     assert.deepEqual(bob.onboarding, {
       state: 'pending', step: 'provision', error: null, llm_binding: { state: 'pending', error: null },
     });
@@ -1329,5 +1369,81 @@ test('GET /admin 兼容跳转（P4）：一律 302 /#/admin；POST → 405；认
     assert.equal(post.status, 405);
   } finally {
     await close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 2026-11-06：email 进 DTO + 可编辑。
+// 此前 `listUsers` 不 SELECT 它、`updateUser` 的白名单也没有它 ⇒ 管理台**既看不到也改不了**邮箱，
+// 而 #449 的邮箱验证码通道吃这一列（`admin` / `eric` 至今没有邮箱，开 smtp 就会被 409 锁在门外）。
+// 判据走**真 HTTP 端点**（不是直接调 admin.js）：DTO 形状与 PATCH 校验都是端点契约的一部分。
+// ---------------------------------------------------------------------------
+test('email：列表 DTO 带它、PATCH 可改可清、格式错 400、与他人重复 409', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  const H = { cookie, 'content-type': 'application/json' };
+  try {
+    const created = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({
+        login: 'emailprobe', display_name: 'Email Probe', password: 'ProbePassw0rd!',
+        email: 'probe@example.test', fde_name: 'emailprobe',
+        git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    assert.equal(created.status, 201, `创建必须成功（否则后面全是空断言）：${created.status}`);
+    const createdUser = (await created.json()).user;
+    assert.equal(createdUser.email, 'probe@example.test', '创建响应就要带 email');
+    for (const key of ['password_hash', 'totp_secret']) {
+      assert.equal(Object.hasOwn(createdUser, key), false, `${key} 不许进 DTO`);
+    }
+
+    const list = await (await fetch(`${base}/api/admin/users`, { headers: H })).json();
+    const row = list.items.find((u) => u.login === 'emailprobe');
+    assert.ok(row, '列表里必须有它');
+    assert.equal(row.email, 'probe@example.test', '**列表 DTO 必须带 email**（这条是本次修复的主判据）');
+
+    // ① 改
+    const patched = await fetch(`${base}/api/admin/users/${createdUser.id}`, {
+      method: 'PATCH', headers: H, body: JSON.stringify({ email: 'renamed@example.test' }),
+    });
+    assert.equal(patched.status, 200, `PATCH email 失败：${patched.status} ${await patched.clone().text()}`);
+    assert.equal((await patched.json()).user.email, 'renamed@example.test');
+
+    // ② 格式错 ⇒ 400 + details.field
+    const bad = await fetch(`${base}/api/admin/users/${createdUser.id}`, {
+      method: 'PATCH', headers: H, body: JSON.stringify({ email: 'not-an-email' }),
+    });
+    assert.equal(bad.status, 400);
+    const badBody = await bad.json();
+    assert.equal(badBody.error.code, 'validation_failed');
+    assert.equal(badBody.error.details.field, 'email');
+
+    // ③ 与他人重复 ⇒ 409 email_conflict
+    const other = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({
+        login: 'emailprobe2', display_name: 'Email Probe 2', password: 'ProbePassw0rd!',
+        email: 'taken@example.test', fde_name: 'emailprobe2',
+        git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    assert.equal(other.status, 201);
+    const clash = await fetch(`${base}/api/admin/users/${createdUser.id}`, {
+      method: 'PATCH', headers: H, body: JSON.stringify({ email: 'taken@example.test' }),
+    });
+    assert.equal(clash.status, 409);
+    assert.equal((await clash.json()).error.code, 'email_conflict');
+
+    // ④ 清空
+    const cleared = await fetch(`${base}/api/admin/users/${createdUser.id}`, {
+      method: 'PATCH', headers: H, body: JSON.stringify({ email: null }),
+    });
+    assert.equal(cleared.status, 200);
+    assert.equal((await cleared.json()).user.email, null, 'null ⇒ 清空');
+  } finally {
+    await close();
+    void pool;
   }
 });

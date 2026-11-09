@@ -27,7 +27,11 @@ import {
 } from 'erix-agent';
 import { createToolRegistry, buildSkillTools } from 'erix-agent/tools';
 import { MSG, createReqIdGenerator, sendIpc, lastSendError } from './lib/ipc.js';
-import { parseMaxRounds } from './lib/config.js';
+import {
+  parseMaxRounds, isDelegateEnabled, parseDelegateMax,
+  parseDelegateChildRounds, parseDelegateChildTimeoutMs,
+} from './lib/config.js';
+import { createStationDelegation, mergeUsage } from './lib/delegation.js';
 import { resolveRunModel, resolveModelMetadata } from './lib/llm-models.js';
 import { resolveLlmTimeouts } from './lib/llm-timeouts.js';
 import { createJail, createStationFileTools } from './lib/file-tools.js';
@@ -204,6 +208,19 @@ function emitEvent(type, payload) {
     // eslint-disable-next-line no-console
     console.error(`[worker] ipc send failed, event dropped (total=${droppedEventCount}, type=${type})`);
   }
+}
+
+/**
+ * `delegate` 的执行上下文（`export` 仅为单测可见面，同 `loopEventPayload` 的先例）。
+ *
+ * ⚠ **父身份必须是本站真 runId，不是 sessionId**：库只从 `context.runId` 自取 `parentRunId`
+ * （`erix-agent` `src/tools/delegation/tool.js:330`），而引擎给的那个 `runId` 是
+ * `config.run.runId` = **transcriptKey = sessionId**（issue #81 P2）⇒ 不覆盖就会把 sessionId 当成
+ * 父身份写进名册，P2 的归属校验（「`parentRunId` 必须属于该 session」）就永远对不上。
+ * 判据：`runner/test/delegation.test.js` D1。
+ */
+export function buildDelegateContext(engineContext, runId) {
+  return { ...(engineContext ?? {}), runId };
 }
 
 /**
@@ -623,8 +640,10 @@ async function startRun(msg) {
     });
   }
   const skillToolNames = new Set(skillTools.tools.map((t) => t.name));
-  const tools = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
+  const baseToolSchemas = [...fileTools.schemas, ...shellTools.schemas, ...noteTools.schemas, ...skillTools.tools];
   const noteToolNames = new Set(noteTools.schemas.map((s) => s.name));
+  /** delegation 实例（开关关 ⇒ 恒 null；声明在 executeTool 之前，因为路由分支要读它）。 */
+  let delegation = null;
   // erix-agent 0.20.0（#285）：引擎对**四种返回形态真执行过的调用都写 `erix.durationMs`**（string /
   // number / `{content,metadata}` / 招异常），所以下面**不再包一层计时**。
   // issue #283 留下的 `wrapToolResultForDuration` 适配闸已撤（撤闸判据 = .work-orders/probe.md 探针 1：
@@ -632,6 +651,15 @@ async function startRun(msg) {
   // `runner/test/tool-result-envelope-contract.test.js` 的防回装断言红掉（`tool-duration.test.js` 已随撤闸删除）。本处只保留两件事：note_* 路由，以及
   // issue #211 的 abort signal 转交（下面注释）。引擎对抛异常自己 catch ⇒ 本处不 catch。
   const executeTool = async (options) => {
+    // delegation 路由（工单 §3-3）：**独立分支，不进 registry.executors**（registry 会先按它自己的
+    // schema 校验，形状不对）。`options.context` 必须原样递下去并**用本站真 runId 覆盖 `runId`**：
+    // 引擎的 `baseToolContext.runId` = `config.run.runId`，而本站那一格填的是 **transcriptKey(=sessionId)**
+    // （issue #81 P2，见上面 `run.runId` 的注释），库又只从 `context.runId` 自取父身份
+    // （`erix-agent` `src/tools/delegation/tool.js:330`）⇒ 不覆盖就会把 sessionId 当父身份写进名册。
+    // 判据：`runner/test/delegation.test.js` D1（摘掉 context 或不覆盖 ⇒ 名册 `parentRunId` 不对 ⇒ 红）。
+    if (delegation !== null && options?.name === 'delegate') {
+      return delegation.execute(options.input, buildDelegateContext(options.context, runId));
+    }
     if (noteTools.executeTool && noteToolNames.has(options.name)) {
       return noteTools.executeTool(options);
     }
@@ -653,6 +681,92 @@ async function startRun(msg) {
       signal: options.signal,
     });
   };
+
+  /* #delegate-p1:assembly:start */
+  // issue delegation P1（2026-11-08）：**默认关**的 `delegate` 工具（子 run = 同进程嵌套的第二个
+  // `runToolLoop`，不是本站 `runs` 表的一行——`runs.session_id NOT NULL` +
+  // `runs_one_active_per_session` 把「子 = 真 run」坦死，见
+  // `docs/design/delegation-2026-11-08.md` §1）。四个 env 的解析与钳位在 `lib/config.js`，
+  // 子 run 本体在 `lib/delegation.js`。
+  // 三件不可移动的事实：① **装配在 `runToolLoop` 之前**（子的 provider / 工具实例 / jail 全部复用
+  // 父的，重建就多一个可能与父漂移的边界）；② **工具面追加 `definition`**（关 ⇒ `tools` 与今天
+  // 逐字相同，2065 字节的 schema 一个字节都不多带）；③ **中止串 `abortController.signal`**
+  // （库自己的 `AbortController` 不接外层、前台子 `cancel` 恒 `not_owned` ⇒ 这是「用户点停止 ⇒ 子死」
+  // 的唯一通路）。
+  // `delegation_dir` 由 agentd 预建并 `runAsWorker` 改属主后下行（同 `notes_dir`）：agentd 跑 1001、
+  // worker 跑 1002，1001 建的 755 目录 1002 写不进 ⇒ **不要**在这里自己拼 `process.env.HOME`。
+  const delegateEnabled = isDelegateEnabled(process.env.ERIX_DELEGATE_ENABLED);
+  if (delegateEnabled) {
+    const delegateMax = parseDelegateMax(process.env.ERIX_DELEGATE_MAX);
+    const delegateRounds = parseDelegateChildRounds(process.env.ERIX_DELEGATE_CHILD_ROUNDS);
+    const delegateTimeout = parseDelegateChildTimeoutMs(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS);
+    for (const [name, parsed] of [
+      ['ERIX_DELEGATE_MAX', delegateMax],
+      ['ERIX_DELEGATE_CHILD_ROUNDS', delegateRounds],
+      ['ERIX_DELEGATE_CHILD_TIMEOUT_MS', delegateTimeout],
+    ]) {
+      if (parsed.clamped) {
+        sendIpc(process, {
+          type: MSG.LOG, run_id: runId, level: 'warn',
+          msg: `${name}=${process.env[name]} 越界 ⇒ 钳到 ${parsed.value}（子 run 的超时上限受 agentd watchdog 300s 约束）`,
+        });
+      }
+    }
+    const delegationDir = typeof msg.delegation_dir === 'string' && msg.delegation_dir.length > 0
+      ? msg.delegation_dir
+      : path.join(process.env.HOME || '/home/erix', 'delegation');
+    if (typeof msg.delegation_dir !== 'string' || msg.delegation_dir.length === 0) {
+      sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: 'delegation_dir missing from RUN_START (old agentd?), fallback to $HOME/delegation',
+      });
+    }
+    try {
+      delegation = createStationDelegation({
+        // **本站真 runId**，不是 transcriptKey（工单 §5 判据 1）。
+        parentRunId: runId,
+        parentCwd: cwd,
+        delegationDir,
+        provider,
+        // 子的工具面：文件 + shell 的 **父实例 schemas**（裁决 ①：不含 delegate / note_* / skills）。
+        childTools: [...fileTools.schemas, ...shellTools.schemas],
+        // 子的 file/shell 执行走**父的 executeTool** ⇒ 同一个 `registry` ⇒ 同一个 `jail`（只有一个沙箱）。
+        executeTool,
+        // ⚠ **不在这里搭 camelCase 的 modelMetadata**：`contextWindowTokens` / `maxOutputTokens` /
+        // `maxTokens` 三键在 worker.js 里只允许出现一次（#309 的防漂移锁，`model-metadata.test.js`
+        // 「各只出现 1 次且全在 #309 装配段内」）⇒ 映射交给 `lib/delegation.js`，本行只递 snake_case 快照。
+        engineModelMetadata,
+        childMaxRounds: delegateRounds.value,
+        childDeadlineMs: delegateTimeout.value,
+        maxConcurrent: delegateMax.value,
+        // 中止级联的唯一入口（父 abort ⇒ 子 signal aborted）。
+        parentSignal: abortController.signal,
+        // 保活：子 run 执行期父 worker 零 IPC（引擎侧没有 round/tool 回调），agentd 的 F6 watchdog
+        // 会把真在跑的子当死循环误杀（issue #288 同型）。走 `SHELL_LIVENESS.heartbeat` 只刷
+        // `lastIpcAt`，不需要 pgid、agentd 零改动；**绝不得走 emitEvent**（会多一条用户可见事件）。
+        // 节流（≥15s）在 `lib/delegation.js` 里做。
+        onChildLiveness: (childRunId) => sendIpc(process, {
+          type: MSG.SHELL_LIVENESS, run_id: runId, phase: 'heartbeat', command: 'delegate:' + childRunId,
+        }),
+        logger: (level, logMsg, fields = {}) => sendIpc(process, {
+          type: MSG.LOG, run_id: runId, level,
+          msg: `${logMsg}${fields.childRunId ? ` [child=${fields.childRunId}]` : ''}`
+            + `${fields.reason ? ` reason=${fields.reason}${fields.normalized ? `→${fields.normalized}` : ''}` : ''}`
+            + `${fields.err ? ` ${fields.err}` : ''}${fields.notification ? ` ${fields.notification}` : ''}`,
+        }),
+      });
+    } catch (err) {
+      // delegation 是加分项：装配失败只 warn，**不把 run 打死**（同 notes/skills 的降级口径）。
+      delegation = null;
+      sendIpc(process, {
+        type: MSG.LOG, run_id: runId, level: 'warn',
+        msg: `delegate unavailable, run continues without it: ${String(err?.message ?? err)}`,
+      });
+    }
+  }
+  // 工具面（工单 §3-2）：**关掉时逐字等于 `baseToolSchemas`**（判据 7），开了才多一个 `delegate`。
+  const tools = [...baseToolSchemas, ...(delegation !== null ? [delegation.definition] : [])];
+  /* #delegate-p1:assembly:end */
 
   /* #392:C-fold-notes:start */
   // issue #392（C 片）：折叠摘要投递成笔记。**A 片让折叠产出替代物，本行让它落地**——没有这一步，
@@ -1020,7 +1134,16 @@ async function startRun(msg) {
       run_id: runId,
       ok: true,
       termination: result.termination ?? { reason: 'end_turn' },
-      usage: result.usage ?? { input_tokens: 0, output_tokens: 0 },
+      /* #delegate-p1:usage:start */
+      // 子的 token 是**真花了的钱**，不并进父的终态就是漏账（工单 §5 判据 6）。⚠ **只改写发给
+      // portal 的那一份**（`mergeUsage` 返回新对象，不动 `result.usage` 本体——引擎那个对象的
+      // **身份**是契约，见 `orchestrator.js:1247` 的注释），且**不另发一条 ledger**：
+      // `usage_ledger_run_source_key UNIQUE (run_id, source)` + `ON CONFLICT DO NOTHING` 会把第二行
+      // **静默吞掉**（docs/data/schema.sql:464-465），那正是「以为记了」的形状。
+      usage: delegation !== null
+        ? mergeUsage(result.usage, delegation.takeChildUsage())
+        : (result.usage ?? { input_tokens: 0, output_tokens: 0 }),
+      /* #delegate-p1:usage:end */
       rounds: result.rounds ?? 0,
       final_text: result.finalText ?? '',
       // issue #442（erix-agent 0.30.0 / 上游 #476）：`result.finalTextFallback === true` ⇒ 上面那句终稿

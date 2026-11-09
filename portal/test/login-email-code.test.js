@@ -58,7 +58,7 @@ function fakeProvider(mailer) {
   return { get: async () => mailer, invalidate() {} };
 }
 
-async function makeUser({ email = 'alice@example.com', totpSecret = null } = {}) {
+async function makeUser({ email = 'alice@example.com', totpSecret = null, mailOtpEnabled = true } = {}) {
   return {
     id: 'u1',
     login: 'alice',
@@ -71,6 +71,9 @@ async function makeUser({ email = 'alice@example.com', totpSecret = null } = {})
     password_hash: await passwordHash(),
     totp_secret: totpSecret,
     last_totp_step: null,
+    // 2026-11-06：per-user 邮件验证码开关（迁移 0028）现在是**唯一**判据 ⇒ 夹具默认开，
+    // 否则这个文件里所有「走邮箱码」的用例都会退化成口令直通（那是夹具问题，不是产品行为）。
+    mail_otp_enabled: mailOtpEnabled,
   };
 }
 
@@ -233,9 +236,11 @@ test('#449③ 有邮件通道但账号无邮箱 ⇒ 409 email_not_registered，�
 // ④ 邮件通道未启用：现状 authenticated，审计 method 标明没有第二因素
 // ---------------------------------------------------------------------------
 
-test('#449④ 邮件通道未启用 ⇒ 现状 authenticated（口令直通），审计 method=password_direct_no_second_factor', async () => {
-  const { mailer, state } = fakeMailer({ enabled: false });
-  const s = await startServer({ users: [await makeUser()], mailer });
+// 2026-11-06 口径变更：判据从「全局 transport 开没开」变成「**per-user 开关**开没开」（迁移 0028）。
+// 全局 transport 退化成 SMTP 连接配置，不再是否决条件 —— 下面两条分别钉这两半。
+test('#449④ per-user 开关关闭 ⇒ 口令直通（审计 method=password_direct_no_second_factor）', async () => {
+  const { mailer, state } = fakeMailer({ enabled: true });
+  const s = await startServer({ users: [await makeUser({ mailOtpEnabled: false })], mailer });
   try {
     const res = await login(s.base);
     assert.equal(res.status, 200);
@@ -261,6 +266,24 @@ test('#449④ 邮件通道未启用 ⇒ 现状 authenticated（口令直通）�
 // ---------------------------------------------------------------------------
 // ⑤ 正确码建会话；同码重放 401
 // ---------------------------------------------------------------------------
+
+test('#449④b per-user 开关打开但邮件通道不可用 ⇒ 503 email_channel_unavailable（**绝不静默降级到口令**）', async () => {
+  // 这是「全局 transport 不再是功能闸」的代价：开关开着就必须能发信，发不了要明说，
+  // 不能让用户以为自己过了第二因素（静默降级是安全洞）。
+  const { mailer, state } = fakeMailer({ enabled: false });
+  const s = await startServer({ users: [await makeUser({ mailOtpEnabled: true })], mailer });
+  try {
+    const res = await login(s.base);
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.error.code, 'email_channel_unavailable');
+    assert.equal(state.sent.length, 0);
+    assert.equal(s.pool.emailCodes.length, 0, '没发信就不许留下码');
+    assert.equal(res.headers.get('set-cookie'), null, '更不许发会话 cookie');
+  } finally {
+    await s.close();
+  }
+});
 
 test('#449⑤ 正确码 ⇒ 200 + Set-Cookie + password_change_required（布尔）；同码重放 ⇒ 401', async () => {
   const { mailer, state } = fakeMailer();
@@ -647,9 +670,11 @@ test('#449⑪ 接线：ctx 里挂了 mailerProvider，登录/重发路径都经 
 // ⑫ 选择规则纯函数：四分支参数化
 // ---------------------------------------------------------------------------
 
-test('#449⑫ chooseSecondFactor：TOTP 优先 / 邮箱码 / 409 / 口令直通 四分支', () => {
+test('#449⑫ chooseSecondFactor：TOTP 优先 / 邮箱码 / 409 / 口令直通（判据是 per-user 开关）', () => {
+  // 2026-11-06 口径变更（用户拍板）：**唯一的「用不用邮件码」判据是 per-user 开关**（迁移 0028）。
+  // 全局 `transport` 只是 SMTP 连接配置，不再一票否决 —— 原来那一维会让开关变成死光纤。
   const cases = [
-    // [hasTotp, mailEnabled, email, 期望]
+    // [hasTotp, mailOtpEnabled, email, 期望]
     [true, true, 'alice@example.com', 'totp_required'],
     [true, false, 'alice@example.com', 'totp_required'],
     [true, true, null, 'totp_required'],
@@ -661,13 +686,19 @@ test('#449⑫ chooseSecondFactor：TOTP 优先 / 邮箱码 / 409 / 口令直通 
     [false, false, 'alice@example.com', 'password_direct_no_second_factor'],
     [false, false, null, 'password_direct_no_second_factor'],
   ];
-  for (const [hasTotpEnrollment, mailEnabled, email, expected] of cases) {
+  for (const [hasTotpEnrollment, mailOtpEnabled, email, expected] of cases) {
     assert.equal(
-      loginEmailCode.chooseSecondFactor({ hasTotpEnrollment, mailEnabled, email }),
+      loginEmailCode.chooseSecondFactor({ hasTotpEnrollment, mailOtpEnabled, email }),
       expected,
-      `hasTotp=${hasTotpEnrollment} mail=${mailEnabled} email=${JSON.stringify(email)}`,
+      `hasTotp=${hasTotpEnrollment} mailOtp=${mailOtpEnabled} email=${JSON.stringify(email)}`,
     );
   }
+  // 反向钉住：**传了 mailEnabled 也不该影响判定**（旧的全局维已经退场；留着它当判据就是死光纤）。
+  assert.equal(
+    loginEmailCode.chooseSecondFactor({ hasTotpEnrollment: false, mailOtpEnabled: true, mailEnabled: false, email: 'a@b.c' }),
+    'email_code_required',
+    '全局 transport 不再是否决条件',
+  );
 });
 
 test('#449⑫b 6 位码生成与 email_hint 脱敏口径', () => {

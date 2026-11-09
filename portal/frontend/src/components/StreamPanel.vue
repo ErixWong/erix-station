@@ -2,7 +2,7 @@
 // 消息流（旧 #stream 的渲染语义平移）：addMessage 三分（user/assistant/synthetic）、
 // 助手终稿 markdown（v-html，渲染器本身先转义后格式化，XSS 安全）、工具卡片、
 // roundsep/syserr 分隔行、流式增量气泡。自动跟随/「↓ 最新」由父级持有（scroll 容器也在父级）。
-import { computed, reactive, watch } from 'vue';
+import { computed, reactive, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore, type StreamEntry, type FoldedInfo, type FoldedOriginalState } from '../stores/workbench';
 import type { ToolCardState } from '../composables/useEventStream';
@@ -21,6 +21,18 @@ import { formatElapsed } from '../lib/runMomentum';
 import { useRunMomentum } from '../composables/useRunMomentum';
 // #451：会话头部「本会话压缩」累计行——层序/脏值归一化/可读单位都在 lib 里（纯函数），模板只做插值。
 import { compactionLayerSegments, formatSavedTokens, type SessionCompaction } from '../lib/compactionSummary';
+// issue #delegate：子 run 只读抽屉 + 分级尺规（尺规**不在组件里重造**：`lib/delegate.ts` 是
+// 唯一入口，红色集合由它从 `lib/terminationReasons.ts#RUN_TERMINATION_SYSERR_REASONS` 取，
+// 于是「`completed` + `persistence_failed` 仍要红」与抽屉/名册三处同源（判序在 lib 里已钉住）。
+import DelegateChildDrawer from './DelegateChildDrawer.vue';
+import {
+  DELEGATE_BADGE_CLASS,
+  delegateBadgeKind,
+  parseDelegateResult,
+  shortRunId,
+  type DelegateBadgeKind,
+  type DelegateResult,
+} from '../lib/delegate';
 
 const { t, locale } = useI18n();
 const store = useWorkbenchStore();
@@ -139,6 +151,77 @@ function cardOut(card: ToolCardState): string {
   // （`isSpecialExecutionStatus`）而不是看「在不在」：上游若哪天多写一个普通值，不会被我们当成状态渲进展开区。
   return [isSpecialExecutionStatus(card.executionStatus) ? card.executionStatus : '',
     getToolResultSummary(card.resultPreview)].filter((part) => !!part).join(' · ');
+}
+
+// ---------------------------------------------------------------------------
+// issue #delegate：`delegate` 工具卡的专属展示（工单 §2/§3）。
+//
+// 数据源：卡片上的结果串（实时路 `out` = 带 ✓/耗时包裹的文案、刷新路 `resultPreview` = 上游 400 字
+// 预览）里嵌的 JSON `{ ok, runId, state, action, termination? }`。**解析全在 `lib/delegate.ts`**
+// （`parseDelegateResult`：整体 parse 失败后逐字段正则兜底），解不出 ⇒ 整段退回既有展示与 ✓/✗。
+// 不在组件里重造解析：刷新路径的预览被截到 400 字，`JSON.parse` 必抛，只有 lib 里的兜底能拿到 runId
+//（实时看起来正常、**刷新后按钮消失**就是这里漏了兜底的那次真机回归）。
+// ---------------------------------------------------------------------------
+
+/** 头行渲染所需的全部派生量（一次算完，模板里只插值不写业务）。 */
+interface DelegateView {
+  summary: string;
+  kind: DelegateBadgeKind;
+  spinner: boolean;
+  mark: string;
+  color: string;
+  openable: boolean;
+}
+
+const delegateCache = new WeakMap<ToolCardState, DelegateResult | null>();
+
+/** delegate 卡的结果载荷；非 delegate 卡 / 解不出 ⇒ null（整段退回既有摘要与 ✓/✗）。 */
+function delegatePayload(card: ToolCardState): DelegateResult | null {
+  if (card.name !== 'delegate') return null;
+  const cached = delegateCache.get(card);
+  if (cached !== undefined) return cached;
+  // 刷新路（完整或截断的预览）优先，实时路（`✓ {json} (1.2s)` 包裹）兜底。
+  const view = parseDelegateResult(card.resultPreview) ?? parseDelegateResult(card.out);
+  delegateCache.set(card, view);
+  return view;
+}
+
+function delegateView(callId: string): DelegateView | null {
+  const card = store.es.toolCards.get(callId);
+  if (!card) return null;
+  const p = delegatePayload(card);
+  if (!p) return null;
+  // 分级单一入口（state + termination）；syserr 检查在 `completed` 之前，所以「completed + 落盘失败」仍红。
+  const kind = delegateBadgeKind(p.state, p.termination || undefined);
+  const summary = [p.action, shortRunId(p.runId)].filter((part) => part !== '').join(' · ');
+  // state 拿不到（脏值 / 只有 `{ok:false,reason}` 这种拒单）⇒ 不猜成红色，沿用既有 ✓/✗/…。
+  const known = kind !== 'unknown';
+  return {
+    summary: summary !== '' ? summary : summaryText(card),
+    kind,
+    spinner: kind === 'running',
+    mark: known
+      ? kind === 'completed' ? '✓' : kind === 'aborted' ? '■' : kind === 'failed' ? '✗' : ''
+      : statusMark(card),
+    color: known ? DELEGATE_BADGE_CLASS[kind] : (card.ok === false ? 'text-red-600' : 'text-black/50'),
+    // 抽屉要两个 id 才拉得到数据：子 runId 来自结果，父 runId 来自卡片（两条建卡路径都填了）。
+    openable: p.ok === true && p.runId !== '',
+  };
+}
+
+// 打开的子 run（整个组件一处，抽屉挂在模板底部单一位置）。
+const delegateOpen = ref<{ parentRunId: string; childRunId: string; label: string; termination?: string } | null>(null);
+
+function openDelegateDrawer(callId: string): void {
+  const card = store.es.toolCards.get(callId);
+  const p = card ? delegatePayload(card) : null;
+  if (!card || !p || p.runId === '') return;
+  delegateOpen.value = {
+    parentRunId: card.runId ?? '',
+    childRunId: p.runId,
+    label: card.name,
+    termination: p.termination === '' ? undefined : p.termination,
+  };
 }
 
 // issue #188：推理块展开态（组件内，默认收起）——与工具卡片同一按钮+chevron 交互风格，不新造一套。
@@ -518,28 +601,71 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       :class="store.es.toolCards.get(en.callId)!.ok === true ? 'border-l-green-600'
         : store.es.toolCards.get(en.callId)!.ok === false ? 'border-l-red-600' : 'border-l-neutral-500'"
     >
-      <button
-        type="button"
-        class="flex w-full min-w-0 items-center gap-2 text-left"
-        :aria-expanded="isExpanded(en.callId)"
-        @click="toggleCard(en.callId)"
-      >
-        <span
-          class="shrink-0 font-semibold"
-          :class="store.es.toolCards.get(en.callId)!.ok === false ? 'text-red-600' : ''"
-        >🔧 {{ store.es.toolCards.get(en.callId)!.name }}</span>
-        <span class="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-normal text-black/50">
-          {{ summaryText(store.es.toolCards.get(en.callId)!) }}
-        </span>
-        <span
-          class="shrink-0 font-normal"
-          :class="store.es.toolCards.get(en.callId)!.ok === false ? 'text-red-600' : 'text-black/50'"
-        >{{ statusMark(store.es.toolCards.get(en.callId)!) }}</span>
-        <span
-          class="shrink-0 text-black/50 transition-transform duration-150"
-          :class="{ 'rotate-180': isExpanded(en.callId) }"
-        >▾</span>
-      </button>
+      <div class="flex w-full min-w-0 items-center">
+        <button
+          type="button"
+          class="flex min-w-0 flex-1 items-center gap-2 text-left"
+          :aria-expanded="isExpanded(en.callId)"
+          @click="toggleCard(en.callId)"
+        >
+          <span
+            class="shrink-0 font-semibold"
+            :class="store.es.toolCards.get(en.callId)!.ok === false ? 'text-red-600' : ''"
+          >🔧 {{ store.es.toolCards.get(en.callId)!.name }}</span>
+          <!-- issue #delegate：delegate 卡的摘要位换成「action · 子runId 短码」（解不出就整段退回下行） -->
+          <span
+            v-if="delegateView(en.callId)"
+            class="delegate-summary min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-normal text-black/50"
+          >{{ delegateView(en.callId)!.summary }}</span>
+          <span
+            v-else
+            class="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-normal text-black/50"
+          >
+            {{ summaryText(store.es.toolCards.get(en.callId)!) }}
+          </span>
+          <!-- 状态位：spinner+蓝 / ✓ 绿 / ■ 琥珀 / ✗ 红（红色集含「completed + syserr termination」） -->
+          <span
+            v-if="delegateView(en.callId)"
+            class="delegate-state flex shrink-0 items-center font-normal"
+            :class="delegateView(en.callId)!.color"
+          >
+            <svg
+              v-if="delegateView(en.callId)!.spinner"
+              class="h-3 w-3 animate-spin"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-opacity="0.25" stroke-width="3" />
+              <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+            </svg>
+            <span v-else>{{ delegateView(en.callId)!.mark }}</span>
+          </span>
+          <span
+            v-else
+            class="shrink-0 font-normal"
+            :class="store.es.toolCards.get(en.callId)!.ok === false ? 'text-red-600' : 'text-black/50'"
+          >{{ statusMark(store.es.toolCards.get(en.callId)!) }}</span>
+          <span
+            class="shrink-0 text-black/50 transition-transform duration-150"
+            :class="{ 'rotate-180': isExpanded(en.callId) }"
+          >▾</span>
+        </button>
+        <!-- 只在「结果 ok 且拿到了子 runId」时出（pi-web 形状：32px 方块 + 左侧分隔线，在折叠按钮**外层**——HTML 不允许嵌套 button） -->
+        <button
+          v-if="delegateView(en.callId)?.openable"
+          type="button"
+          class="delegate-open-viewer flex h-8 w-8 shrink-0 items-center justify-center border-l border-black/10 text-black/50 hover:bg-black/5"
+          :aria-label="t('delegate.openViewer')"
+          :title="t('delegate.openViewer')"
+          @click="openDelegateDrawer(en.callId)"
+        >
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <rect x="3" y="4.5" width="18" height="15" rx="2" />
+            <path d="M14.5 4.5v15" />
+          </svg>
+        </button>
+      </div>
       <!-- 展开态：完整 args（pre 块永不溢出）+ 结果摘要行（tool_result 只带 digest，不虚构全文） -->
       <template v-if="isExpanded(en.callId)">
         <pre class="mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ cardArgs(store.es.toolCards.get(en.callId)!) }}</pre>
@@ -569,4 +695,17 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
       <pre v-if="isReasoningExpanded(en.id)" class="mt-1 overflow-auto whitespace-pre-wrap break-all font-normal text-black/70">{{ en.text }}</pre>
     </div>
   </template>
+
+  <!-- issue #delegate：子 run 只读抽屉（全组件**单一挂载点**，props 全部从卡片取，不在抽屉里重导状态）。
+       parentRunId = 卡片所属 run（实时与刷新两条建卡路径都填了）、childRunId = 结果里的 runId、
+       termination 一并递下去（抽屉自己的端点不带它，而「completed + syserr 仍红」这条红线在抽屉里也得成立）。 -->
+  <DelegateChildDrawer
+    v-if="delegateOpen"
+    :session-id="store.sessionId ?? ''"
+    :parent-run-id="delegateOpen.parentRunId"
+    :child-run-id="delegateOpen.childRunId"
+    :label="delegateOpen.label"
+    :termination="delegateOpen.termination"
+    @close="delegateOpen = null"
+  />
 </template>
