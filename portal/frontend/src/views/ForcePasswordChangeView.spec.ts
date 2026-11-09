@@ -1,8 +1,9 @@
 // #255 首登强制改密（前端 ①）单测：受限会话旗标的三个入口、强制改密屏的「关不掉」、改密成功链路。
 // 约定（照 LoginView.spec / WorkbenchView.spec 先例）：装配真实 i18n 单例，不 mock t()；
-// 每例 localStorage.clear() + setLocale('zh-CN')；导航落地用 vi.waitFor 轮询，不数 tick。
+// 每例 localStorage.clear() + setLocale('zh-CN')；导航落地用 nextRouteLanding 显式判据
+// （#473 family B：原先是 vi.waitFor 墙钟轮询，默认 1000ms，慢机上假红），不数 tick。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushPromises, mount } from '@vue/test-utils';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import App from '../App.vue';
@@ -12,6 +13,12 @@ import type { AuthUser } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
 import { en } from '../i18n/locales/en';
 import { zhCN } from '../i18n/locales/zh-CN';
+import { nextRouteLanding } from '../test-utils/navigation';
+
+// #473 family B：本文件挂的是整个 App，历史上 21 条用例 **0 次 unmount** ⇒ 上一例的 App/视图
+// 跨用例存活，其在途的 await 会落进**下一条**用例的 active pinia（实测串出 `expected "alice" to be "bob"`）。
+// enableAutoUnmount 另注册一个 afterEach，与下面已有的那个并存，顺序无关。
+enableAutoUnmount(afterEach);
 
 const CJK = /[\u4e00-\u9fff]/;
 
@@ -196,13 +203,15 @@ describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」�
 
     await wrapper.find('#loginName').setValue('alice');
     await wrapper.find('#loginPass').setValue('pw');
+    // A 类：导航由组件里的 router.replace 触发 ⇒ **先订阅**再触发（反了会漏掉已发生的导航）。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await tick();
 
     // 改密屏出现 + 落地路由被守卫改写到 /change-password
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(true);
     expect(wrapper.text()).toContain('请先修改初始口令');
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/change-password'));
+    expect(await landed).toBe('/change-password');
     // 工作台与会话视图**没挂载**：预览端口折叠条、顶栏、☰ 导航、登出按钮全都不存在
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
     expect(wrapper.find('header').exists()).toBe(false);
@@ -215,11 +224,13 @@ describe('#255 强制改密屏 · 闸门（挂 App 验「工作台没挂载」�
     const { wrapper, router } = await mountApp('/login');
     await wrapper.find('#loginName').setValue('bob');
     await wrapper.find('#loginPass').setValue('pw');
+    // A 类：先订阅（这一条就是 #473 复现到的那条假红：墙钟 1000ms < 实测导航 1195ms）。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await tick();
 
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(false);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     await vi.waitFor(() => expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(true));
   });
 
@@ -290,6 +301,8 @@ describe('#255 改密表单与成功链路', () => {
 
   it('成功链路：POST /api/me/password 三字段齐全 + Content-Type application/json ⇒ 先 GET /api/me 才进正常界面', async () => {
     const { wrapper, router, auth, calls } = await mountForce({ meFlag: true });
+    // A 类：导航由「改密成功 ⇒ 清旗标 ⇒ router.replace(落地页)」触发 ⇒ 在提交之前订阅。
+    const landed = nextRouteLanding(router);
     await fillAndSubmit(wrapper);
 
     const post = calls.find((c) => c.url === '/api/me/password');
@@ -309,7 +322,7 @@ describe('#255 改密表单与成功链路', () => {
     expect(auth.passwordChangeRequired).toBe(false);
 
     // 之后才进正常界面（工作台挂载、改密屏消失、落在工作台而不是登录页）
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(false);
     await vi.waitFor(() => expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(true));
     // §2.6a：当前会话保留 ⇒ 绝不能调登出把人踢回登录页
@@ -374,11 +387,13 @@ describe('#255 改密表单与成功链路', () => {
 
   it('登出出口可用（§2.11a 放行清单含 logout）：清会话后回到 /login', async () => {
     const { wrapper, router, auth } = await mountForce({ meFlag: true });
+    // A 类：登出走「清会话 + router.replace('/login')」⇒ 先订阅再点。
+    const landed = nextRouteLanding(router);
     await wrapper.findAll('button').find((b) => b.text().includes('换个账号'))!.trigger('click');
     await tick();
     expect(auth.user).toBeNull();
     expect(auth.passwordChangeRequired).toBe(false);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/login'));
+    expect(await landed).toBe('/login');
   });
 });
 

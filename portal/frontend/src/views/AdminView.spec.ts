@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushPromises, mount } from '@vue/test-utils';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import App from '../App.vue';
@@ -7,6 +7,11 @@ import { createAppRouter } from '../router';
 import { useAdminStore, type AdminUser } from '../stores/admin';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
+import { nextRouteLanding } from '../test-utils/navigation';
+
+// #473 family B：本文件多数用例自己 unmount，但存在提前失败而漏下活着 App 实例的路径
+// ⇒ 统一由 enableAutoUnmount 兜底。与下面已有的 afterEach 并存，顺序无关。
+enableAutoUnmount(afterEach);
 
 vi.mock('qrcode', () => ({
   default: { toDataURL: vi.fn(async () => 'data:image/png;base64,MOCKQR') },
@@ -127,8 +132,10 @@ describe('Admin console routing and layout', () => {
   it('tab links navigate to their routes and opening the saved URL restores the LLM tab', async () => {
     const { wrapper, router, pinia } = await mountAdmin();
     try {
+      // A 类：导航由 RouterLink 的点击触发 ⇒ 先订阅再点（#473 family B：替掉 vi.waitFor 的 1000ms 墙钟）。
+      const landed = nextRouteLanding(router);
       await wrapper.find('a[href="/admin/llm"]').trigger('click');
-      await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin/llm'));
+      expect(await landed).toBe('/admin/llm');
       await flushPromises();
       expect(wrapper.find('a[aria-current="page"]').text()).toBe('LLM 管理');
 

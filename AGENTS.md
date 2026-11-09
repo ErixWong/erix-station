@@ -4156,3 +4156,46 @@ delegate + #468 那几波推高，别再引旧数。）
 - **内核栈**（`journalctl -k` 的 hung task 报告）：`do_exit → cleanup_mnt → generic_shutdown_super → cgroup_writeback_umount → __flush_workqueue` —— 容器退出卸载 overlay 时等 writeback 工作队列，而 `inode_switch_wbs_work_fn` 在活锁（Ubuntu 6.8.0-147）。
 - **结局**：**21 小时后自解**，未重启（5 台 `fde-*` 最终都是 `Exited (0)` —— 即 stop 当时其实已成功，只是 dockerd 报不出退出事件）。用户态无法解除：D 状态进程杀不掉、`sync` 也挂。
 - **口径**：见到这个报错 + `kworker/*inode_switch_wbs` 高 CPU，**别再批量发 docker 命令**——每发一条就多堆一批卡住的 `runc`（实测 426→544，load 继续爬）；先看 `/proc/loadavg` 与 D 进程数判断是否在自愈，只能等或重启主机。
+
+### 8.107 前端假红（issue #473 family B）：`vi.waitFor` 的 1000ms 墙钟被 CPU 争抢饿死（2026-11-10）
+
+**症状**：4 路并发全量前端测试时随机红，红的都是路由断言（`expected '/login' to be '/'`、`expected '/admin/users' to be '/admin/llm'`），
+单跑必绿。此前 7 次被 worker 报成「预存红」，§8.63/§8.82/§8.88/§8.100 记的也是同一族。
+
+**根因（三步互证，不是推断）**：`await vi.waitFor(() => expect(router.currentRoute.value.path).toBe(X))` 的
+**默认超时是 1000ms**，本质是墙钟轮询；而守卫里有一跳 `await useSiteStore().ensureSite()`，CPU 被抢时 jsdom 里
+一次真实导航实测 **1195ms**（空闲 0–1ms）⇒ 超时。
+① 探针轨迹显示 `afterEach /login -> /` 正常发生，逻辑全对，只是晚于 1000ms；
+② 只把超时放大到 15000ms、逻辑一字不改 ⇒ 同负载 3/3 全绿；
+③ 旧写法单独放回一处，在 §3 配方下 3/8 红（1488/1646/2075ms），新写法 20/20 绿。
+
+**修法（零墙钟）**：新 `portal/frontend/src/test-utils/navigation.ts#nextRouteLanding(router)`——**先订阅 `router.afterEach`、
+再触发动作、再 await 落地**（顺序反了会漏掉已发生的导航）。已核对 vue-router 4.6：守卫 `return { path }` 走
+`NAVIGATION_GUARD_REDIRECT` 分支并 `return pushWithRedirect(...)` **提前返回**，中间层不触发 `afterEach` ⇒ 一条重定向链
+只在最终落地 fire 一次，「resolve 第一次落地」拿到的就是最终地址。
+**失败语义两条都必须显式**：落地到别处 ⇒ 立刻返回**实际** path，由 `expect` 给出差异（`expected '/login' to be '/'`）；
+压根没有导航 ⇒ promise 不 resolve ⇒ 用例超时变红（实测 5000ms，属可接受的显式红）。
+**19 处路由判据**（`ForcePasswordChangeView` 4 / `LoginView` 7 / `ForcePasswordErrors` 4 / `SeatlessAdminGate` 3 / `AdminView` 1）+
+`PreviewPoolUsageView` 的 `clickTab`（等懒加载组件挂载，同族最后一处）。**两处经实测判定为「不导航」**，
+改成直接断言当前路由（照抄订阅会必然超时）：`LoginView` 的平台管理员直通用例（`guardEntryRole()` 对无工位管理员
+**就地 logout + return false**，走不到 `router.replace`）、`ForcePasswordErrors` 的 `invalid_credentials` 用例（语义是「留在改密屏」）。
+5 个 spec 各加 `enableAutoUnmount(afterEach)`（历史上 `ForcePasswordChangeView.spec.ts` 21 个用例 0 次 unmount）。
+
+**红线**：禁止 `sleep` / 把 `vi.waitFor` 的 timeout 调大（那是换一个墙钟预算，不是判据）/ `setTimeout` 重试。
+判据只在**落地**这件事上，不在「机器够快」上。
+
+**验收（主 agent 亲跑，`NODE_ENV` 为空）**：`typecheck` rc=0；5+1 文件空闲单跑全 rc=0；14 burner 下 5 文件 ×5 = **25/25 rc=0**、
+`PreviewPoolUsageView` ×5 = 5/5 rc=0；**§3 原始配方 4 路并发全量 ×5 轮 = 20/20 rc=0**；全量空闲 rc=0（62 文件 / 1249 用例）。
+
+**变异（主 agent 亲跑，每条先 `git diff --numstat` 自证非空操作、跑完复原）**：落地改成 `/session/zzz` ⇒ 差异断言
+`expected '/session/zzz' to be '/'`；删掉 `router.replace(loginRedirect())` ⇒ 2 条 5000ms timeout（显式红）；
+`AdminView` 那一处退回 `vi.waitFor` ⇒ §3 配方 3/8 红；`awaitSelector` 改成不存在的选择器 ⇒ 1051ms 内
+`[data-test="__nope473__"] 未挂载（tab=号池占用）`（不是 timeout）。
+⚠ **`enableAutoUnmount` 变异不红**（去掉后 7 次全绿）⇒ 隔离是防御性改进，**不是**本次假红的判据，别记成「它修好了假红」。
+
+**残留风险（已实测存在，未在本单修）**：`AdminPreviewPorts.spec.ts` 偶发 `Test timed out in 5000ms`（**用例级**超时，
+不是断言级，属另一类；worker 环境见过 1/12，主 agent 20 次未复现）；`DirectoryTree.spec.ts` 有 **17 处**非路由
+`vi.waitFor`（等 DOM），`workbench.spec.ts` 3 处、`mermaidEnhance.spec.ts` 4 处——同一根墙钟，只是还没在并发下红过。
+`setRestrictedSessionListener` 是模块级单例（`lib/restrictedSession.ts`），陈旧 router 的回调会打到最新注册者，属同族隐患。
+
+**family A 不在本单**：`GitLightBadge.spec.ts` 的 `Target cannot be null` 在 4 路并发里复现 **0 次**，按工单要求一字未动。

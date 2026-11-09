@@ -1,9 +1,10 @@
 // #255 前端 ②：错误语义与兜底的**渲染侧**单测（挂整个 App，看人真正看到什么）。
 // 分工：「码 → 键」的映射本体在 lib/forcePasswordErrors.spec.ts，这里只验进 DOM 后的形状。
 // 装配风格照 ①（views/ForcePasswordChangeView.spec.ts）：真实 i18n 单例、不 mock t()、
-// 每例 localStorage.clear() + setLocale('zh-CN')、导航落地用 vi.waitFor 轮询而不数 tick。
+// 每例 localStorage.clear() + setLocale('zh-CN')、导航落地用 nextRouteLanding 显式判据（#473 family B：
+// 原先的 vi.waitFor 轮询默认 1000ms 是墙钟，慢机上假红）而不数 tick。
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushPromises, mount } from '@vue/test-utils';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import App from '../App.vue';
@@ -14,6 +15,12 @@ import { setLocale } from '../i18n';
 import { i18n } from '../i18n';
 import { en } from '../i18n/locales/en';
 import { zhCN } from '../i18n/locales/zh-CN';
+import { nextRouteLanding } from '../test-utils/navigation';
+
+// #473 family B：本文件已经有 closeApps() 自己跟踪挂载并逐个卸载（见上面的「挂载登记」），
+// 但还有**没走 mountApp() 登记**的裸 mount ⇒ 再统一加一层 enableAutoUnmount 兜底。
+// 它与已登记的重复卸载无害（closeApps 里的 unmount 包了 try）。
+enableAutoUnmount(afterEach);
 
 const RESTRICTED_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice',
@@ -274,7 +281,10 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     expect(text).toContain('invalid_credentials'); // 原始码始终附在句尾（报障要用）
     expect(text).not.toMatch('重新登录');
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(true);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/change-password'));
+    // B 类（原代码的 waitFor 在这里验的是「**没**发生导航」）：入屏导航由夹具的 push 触发，
+    // 而夹具已经 `await router.push(...)` + `await router.isReady()`（= 落地已完成）⇒ 直接断言。
+    // ⚠ 这里**不能**用 nextRouteLanding：失败提交根本不该导航，那个 promise 永远不会 resolve。
+    expect(router.currentRoute.value.path).toBe('/change-password');
   });
 
   it('validation_failed + details.field ⇒ 文案点名到具体输入框（new_password → 「新口令」）', async () => {
@@ -379,9 +389,11 @@ describe('#255 前端② 错误码 → 文案的渲染（每个码一条断言�
     const { wrapper, router, auth } = await enterForceScreen({
       changeResponse: { status: 401, body: { error: { code: 'unauthorized', message: 'unauthorized' } } },
     });
+    // A 类：导航由「401 ⇒ 登出 + router.replace('/login')」触发 ⇒ 在提交之前订阅。
+    const landed = nextRouteLanding(router);
     await submitWrongButWellFormed(wrapper);
 
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/login'));
+    expect(await landed).toBe('/login');
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(false);
     expect(auth.user).toBeNull();
     // 登录页必须能解释「为什么人被送回来」：只剩一个空表单会让人以为凭空掉线（#255 前端② 的可行动性要求）。
@@ -519,13 +531,16 @@ describe('#255 前端② 全局 403 password_change_required 兜底（不在视�
     expect(seen.some((u) => u.startsWith('/api/dirs')), '前置：工作台自己打过 /api/dirs').toBe(true);
 
     // 撞门：下一次任意请求（这里直接调 api()，代表任何一个视图的调用）返回该码。
+    // A 类：导航由「403 撞门 ⇒ restrictedSession 监听器 ⇒ router.replace(改密屏)」触发
+    // ⇒ 在**真正发出那一发会 403 的请求之前**订阅。
+    const landed = nextRouteLanding(router);
     gated = true;
     const { api } = await import('../api');
     await expect(api('/api/sessions')).rejects.toBeTruthy(); // 拒绝由本例接住，不许飘出去
     await tick(60);
 
     expect(auth.passwordChangeRequired, '兜底必须集中置旗标').toBe(true);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/change-password'));
+    expect(await landed).toBe('/change-password');
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(true);
 
     await closeApps(); // 卸载工作台，再冲刷一轮
@@ -621,9 +636,11 @@ describe('#255 前端② 改密成功瞬间不把同一个组件重挂一帧', (
 
   it('成功链路照旧：清旗标后被 router.replace 送到落地页，改密屏不再在场', async () => {
     const { wrapper, auth, router } = await enterForceScreen({});
+    // A 类：成功链路的导航由「清旗标 ⇒ router.replace(落地页)」触发 ⇒ 先订阅再提交。
+    const landed = nextRouteLanding(router);
     await submitWrongButWellFormed(wrapper);
     await vi.waitFor(() => expect(auth.passwordChangeRequired).toBe(false));
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(wrapper.find(FORCE_SCREEN).exists()).toBe(false);
   });
 });
