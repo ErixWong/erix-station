@@ -193,6 +193,19 @@ const URL_LINE_RE = /^\s*-\s*url:\s*"([^"\\]*(?:\\.[^"\\]*)*)"\s*$/;
 const HOST_RE = /Host\(`([^`]+)`\)/g;
 /** `ClientIP(\`<cidr>\`)`。 */
 const CLIENT_IP_RE = /ClientIP\(`([^`]+)`\)/g;
+/** ipAllowList 的 sourceRange flow list（生成器永远写成 `["a", "b"]`）。 */
+const SOURCE_RANGE_RE = /^\s*sourceRange:\s*\[([^\]]*)\]\s*$/;
+/** 中间件名行（`  middlewares:` 节下的四空格缩进键）。 */
+const MW_NAME_RE = /^    ([a-z0-9-]+):$/;
+/** `  middlewares:` / `  services:` 节切换。 */
+const SECTION_RE = /^  ([a-z]+):$/;
+/**
+ * 哪些 ipAllowList 中间件的 sourceRange 受 FDE 池约束：
+ *   · `internal-allow` —— 它的来源集 = 全部 FDE 网段，脏行会变成「谁都能打 `/api/internal`」（= 平台的
+ *     agentd 入口，带虚拟身份），所以必须同 `ClientIP()` 一样在池内；
+ *   · `admin-allow`（ADMIN_IP_ALLOWLIST）与 `admin-deny`（硬编码 192.0.2.0/24）**不受池限**（评审 F2 第 6 条）。
+ */
+const POOLED_SOURCE_RANGE_MIDDLEWARES = new Set(['internal-allow']);
 /** 未加引号的 `url:` 值（生成器总是加引号；不加引号 ⇒ 形态漂移，也要拦）。 */
 const URL_LINE_BARE_RE = /^\s*-\s*url:\s*(\S[^\n]*)$/;
 
@@ -200,9 +213,12 @@ function unquoteYamlDouble(s) {
   return s.replace(/\\(["\\])/g, '$1');
 }
 
-/** 池前缀的十进制首两段（`10.200` / `10.201`），从 POOLS 派生，不写死。 */
-function poolHostPrefixes(pools) {
-  return pools.map((p) => intToIp(parseCidr(p.cidr).base).split('.').slice(0, 2).join('\\.'));
+/** 池前缀的预览 host 子模式（每池一条：`10\.200\.\d{1,3}\.\d{1,3}`）；首两段从 POOLS 派生，不写死。 */
+function poolHostPatterns(pools) {
+  return pools.map((p) => {
+    const head = intToIp(parseCidr(p.cidr).base).split('.').slice(0, 2).join('\\.');
+    return `${head}\\.\\d{1,3}\\.\\d{1,3}`;
+  });
 }
 
 /**
@@ -244,8 +260,9 @@ function isPreviewBackendHost(host, pools) {
  * @returns {true}
  */
 export function assertRenderedRouteText({ text, llmText = null, config = {}, pools = FDE_IPAM_POOLS, file = 'routes.yml', llmFile = 'llm-routes.yml' }) {
-  const poolPrefixAlt = poolHostPrefixes(pools).join('|');
-  const previewUrlRe = new RegExp(`^http://(${poolPrefixAlt}\\.\\d{1,3}\\.\\d{1,3}):(\\d{1,5})$`);
+  // ⚠ 逐池成完整模式后再 join：早前写成「先 join 再接后缀」，`|` 优先级低 ⇒ 只有最后一条
+  // 带上了后两段，结果 `10.200.1.2` 这类止规地址反而不匹配（自测直接报「不在白名单」）。
+  const previewUrlRe = new RegExp(`^http://(${poolHostPatterns(pools).join('|')}):(\\d{1,5})$`);
   const reserved = reservedPlatformHosts(config);
   const baseDomain = typeof config.baseDomain === 'string' && config.baseDomain !== '' ? config.baseDomain : null;
 
@@ -310,6 +327,34 @@ export function assertRenderedRouteText({ text, llmText = null, config = {}, poo
         const e = new Error(`${name}: ClientIP subnet ${JSON.stringify(m[1])} is not an FDE pool subnet (${err.code ?? err.message})`);
         e.code = 'route_clientip_out_of_pool';
         throw e;
+      }
+    }
+    // ipAllowList 的 sourceRange：只有 `internal-allow` 受池约束（admin-allow / admin-deny 不受）。
+    let section = null;
+    let middleware = null;
+    for (const raw of body.split('\n')) {
+      const sec = SECTION_RE.exec(raw);
+      if (sec) {
+        section = sec[1];
+        middleware = null;
+        continue;
+      }
+      if (section === 'middlewares') {
+        const nm = MW_NAME_RE.exec(raw);
+        if (nm) middleware = nm[1];
+      }
+      const sr = SOURCE_RANGE_RE.exec(raw);
+      if (!sr || !POOLED_SOURCE_RANGE_MIDDLEWARES.has(middleware ?? '')) continue;
+      const items = sr[1].split(',').map((s) => s.trim()).filter((s) => s !== '');
+      for (const item of items) {
+        const value = item.replace(/^"|"$/g, '');
+        try {
+          assertFdeSubnet(value, { pools });
+        } catch (err) {
+          const e = new Error(`${name}: ${middleware} sourceRange ${JSON.stringify(value)} is not an FDE pool subnet (${err.code ?? err.message})`);
+          e.code = 'route_source_range_out_of_pool';
+          throw e;
+        }
       }
     }
   };
