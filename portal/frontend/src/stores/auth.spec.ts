@@ -628,3 +628,23 @@ describe('#449 second_factor_choice（二选一）', () => {
     expect(auth.emailUnavailable).toBe(false);
   });
 });
+
+describe('#449 二选一：email_sent 是邮箱通道的最终裁决', () => {
+  it('methods 仍给两条但 email_sent:false ⇒ choiceMethods 只剩 totp（前端不靠 methods 单独放行）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, {
+      status: 'second_factor_choice',
+      pending_token: 'ptok-choice',
+      expires_in: 600,
+      methods: ['totp', 'email_code'],
+      email_hint: 'e***@i***.com',
+      email_sent: false,
+      email_unavailable: true,
+    })));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    expect(auth.emailUnavailable).toBe(true);
+    expect(auth.choiceMethods).toEqual(['totp']);
+    auth.switchFactor('email');
+    expect(auth.factor, '切不进一条没有码的路').toBe('totp');
+  });
+});
