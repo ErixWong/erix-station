@@ -143,6 +143,34 @@ test('B-2 相对路径口径：path=<子目录> 时 DTO 的 path 带上前缀（
   assert.equal(fs.readFileSync(path.join(sub, 'a.txt'), 'utf8'), 'x');
 });
 
+// 复审 F1：分 chunk 的字节完整性（`writeTempFileFromStream` 的写法语义）
+// ⚠ 这条**不是**「短写」的直接判据 —— 普通文件 + ext4 上没法确定性地逼出一次短写
+// （所以 F1 的修法是把 API 换成内部循环写完的 `fs.writeFileSync(fd, …)`，与既有 `writeTempFile` 同一条路，
+// 见 fsutil 里的注释）。这里钉的是同一处代码的**另一半风险**：多个 chunk 必须**接在后面**，
+// 谁要是把每个 chunk 写到固定位置（或改成整块覆盖写），落盘就只有最后一块 ⇒ 这条红。
+// 内容用二进制（0x00/0xFF）+ 三段不等长，避免「恰好一样长所以看不出丢了几十字节」这种漏网。
+test('F1 分 chunk 落盘：三段不等长的字节全部接上（chunk 边界不吞不重），DTO.bytes = 收到总量', async (t) => {
+  const { root, proj } = fixture(t);
+  const parts = [
+    Buffer.from([0x00, 0x01, 0xfe, 0xff]),
+    Buffer.from('中文-第二段-多字节 utf8 — ', 'utf8'),
+    Buffer.from([0xff, 0x00, 0x7f]),
+  ];
+  const want = Buffer.concat(parts);
+  const ms = manualStream();
+  const settled = settle(receiveUpload({ ...BASE, userSpaceRoot: root, name: 'chunks.bin', stream: ms.stream }));
+  for (const part of parts) { ms.push(part); await ms.pump(); }
+  await ms.finish();
+
+  const { ok, error } = await settled;
+  assert.equal(error, undefined, `不该报错：${error?.code} ${error?.message}`);
+  assert.equal(ok.bytes, want.length, 'bytes 是「收到的字节数」');
+  const onDisk = fs.readFileSync(path.join(proj, 'chunks.bin'));
+  assert.deepEqual(Buffer.from(onDisk), want, `三段的顺序与内容必须都在盘上（实际 ${onDisk.length} 字节：${onDisk.toString('hex')}）`);
+  assert.equal(onDisk.length, want.length, '长度相等是「不截断」的最低要求，内容也必须逐字节对');
+  assert.deepEqual(remnants(proj), []);
+});
+
 test('B-10 零字节上传是合法文件 ⇒ 落一个 0 字节文件（不是 400，也不是不落盘）', async (t) => {
   const { root, proj } = fixture(t);
   const r = await receiveUpload({ ...BASE, userSpaceRoot: root, name: 'empty', stream: streamOf(Buffer.alloc(0)) });
@@ -276,6 +304,33 @@ test('B-12 竞态（overwrite 语义）：同样窗口里别人建了目标 ⇒ 
   assert.equal(fs.readFileSync(path.join(proj, 'race.txt'), 'utf8'), 'MINE',
     'overwrite=1 的语义就是「我要它变成我的」；这条与上一条一起构成「绝不静默替换」的两侧');
   assert.deepEqual(remnants(proj), []);
+});
+
+// 复审 F3：overwrite 分支的 rename 失败映射（目标在 await 期间变成**目录**）
+// 用户可触发：上传 X 的同时 agent 建了目录 X。`rename` 把普通文件换到目录上抛 EISDIR/ENOTEMPTY，
+// 不接住就是 500（把「目标被占了」报成服务端故障）。映射后与 c 的语义同一个码：409 file_exists。
+test('F3 overwrite 撞上「目标在传输期间变成目录」⇒ 409 file_exists（不是 500）+ 无 temp 残骸 + 目录没被碰', async (t) => {
+  const { root, proj } = fixture(t);
+  fs.writeFileSync(path.join(proj, 'note.txt'), 'OLD');   // 检查点：是个普通文件 ⇒ 允许覆盖
+  const ms = manualStream();
+  const settled = settle(receiveUpload({ ...BASE, userSpaceRoot: root, name: 'note.txt', stream: ms.stream, overwrite: true }));
+  ms.push(Buffer.from('MINE'));
+  await ms.pump();
+  // await 期间（整条 body 的传输时长）agent 把它换成了目录
+  fs.unlinkSync(path.join(proj, 'note.txt'));
+  fs.mkdirSync(path.join(proj, 'note.txt'));
+  fs.writeFileSync(path.join(proj, 'note.txt', 'inner.txt'), 'AGENT-DIR-INNER');
+  await ms.finish();
+
+  const { ok, error } = await settled;
+  assert.equal(ok, undefined, `必须报错而不是假装成功，实际 ${JSON.stringify(ok)}`);
+  assert.ok(error instanceof DirError, `必须是 DirError，实际 ${error?.constructor?.name}（${error?.code}）`);
+  assert.equal(error.code, 'file_exists', `必须是 file_exists，实际 ${error.code}：${error.message}`);
+  assert.equal(error.httpStatus, 409, `必须是 409（500 会把「目标被占」报成服务端故障），实际 ${error.httpStatus}`);
+  assert.equal(error.details?.reason, 'target_is_dir', `details 要说明为什么覆盖不了，实际 ${JSON.stringify(error.details)}`);
+  assert.equal(fs.readFileSync(path.join(proj, 'note.txt', 'inner.txt'), 'utf8'), 'AGENT-DIR-INNER',
+    '别人的目录及其内容必须一个字没动');
+  assert.deepEqual(remnants(proj), [], 'rename 失败的 temp 必须清掉（全函数不变量：任何失败路径不留 .tmp）');
 });
 
 test('B-12 fsutil.commitTempFileNoClobber：目标已存在 ⇒ 返回 false 且不抛、不留 temp、目标不变', (t) => {

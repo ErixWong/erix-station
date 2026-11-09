@@ -174,7 +174,7 @@
 | 404 | `tls_no_previous`（#456，§4.13）| **没有可回滚的上一代证书**（`<dynamic>/certs/prev/` 不存在或不完整——首次上传后立刻点回滚就是这一格）。`retryable:false` | 否 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
 | 403 | `upload_disabled`（#472 片 B，§4.14）| **这个账号没有「往自己磁盘上传文件」的能力**：`users.file_upload_enabled` 不是 `true`（片 A 的 per-user 开关，管理台 Edit → Security 里开）。**与 `forbidden` 的关键差别：判定发生在读请求体之前**——上传端点的 body 是几十 MiB 的字节流，先收完 body 再拒 ⇒ 未授权的人能把 portal 的内存与带宽当成压力测试工具，所以这里「无权」连带「不必听完你说什么」。`details = {action: 'enable_in_admin_console'}`（解法只有一个：让管理员开启，重试本请求不变）。**判据是 `=== true`**：缺键 = 不知道 = 不授权（前端 `v-if` 同口径，见 §4.14）| 否 |
-| 409 | `file_exists`（#472 片 B，§4.14）| **上传的目标文件已存在**且本次没带 `overwrite=1`。`details = {path}`（相对牢笼根的路径，与 `GET /api/files/tree` 同口径）。**两个落点同一个码**：进 body 前的快速检查（`lstat`）与提交点的竞态判据（`link` 失败）——调用方不必区分，前端拿到它就是「问用户要不要覆盖」的时机。⚠ 快速检查**不是** no-clobber 的依据（两步之间目标可被别人创建），真正的依据是提交点，见 §4.14 的 `link` 说明 | 否（要么覆盖要么换名）|
+| 409 | `file_exists`（#472 片 B，§4.14）| **上传的目标文件已存在**且本次没带 `overwrite=1`。`details = {path}`（相对牢笼根的路径，与 `GET /api/files/tree` 同口径）。**三个落点同一个码**：进 body 前的快速检查（`lstat`）、提交点 `link` 失败的竞态判据、以及 `overwrite=1` 时目标在传输期间**变成了目录**（`rename` 抛 `EISDIR`/`ENOTEMPTY`，`details.reason='target_is_dir'`——不映射就会变成 500，把「目标被占」报成服务端故障）——调用方不必区分，前端拿到它就是「问用户要不要覆盖」的时机（第三种的答案是「换名」）。⚠ 快速检查**不是** no-clobber 的依据（两步之间目标可被别人创建），真正的依据是提交点，见 §4.14 的 `link` 说明 | 否（要么覆盖要么换名）|
 | 400 | `upload_interrupted`（#472 片 B，§4.14）| **上传在传输完成前中断**（客户端 `destroy()`、网络断、页面被切走 ⇒ 请求流 `aborted`/`error`/提前 `close`）。`retryable: **是**`（本表里少数几个「重试就行」的 400：内容从头重传即可，且服务端已把半截 temp 删掉，不会留下半个文件）。`details = {bytes}`（已落盘的字节数，只用于排查，不代表任何已提交的内容）| 是 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
@@ -2590,7 +2590,9 @@ Cookie: <会话 cookie>
    `linkSync(temp, target)`：`EEXIST` ⇒ 清 temp + `409 file_exists`，这是唯一的硬判据；
    `lstat` 那条只是「早退」的快速路径（省掉一次几十 MiB 的传输），**不是**安全依据。
    `overwrite=1` 才走 `rename` 原子替换。目标是 symlink 时**无论 overwrite 一律 400**
-   （`rename` 替换的是链接本身 ⇒ 覆盖语义保不住 jail）。
+   （`rename` 替换的是链接本身 ⇒ 覆盖语义保不住 jail）。覆盖分支还有一个用户可触发的边界：目标在
+   传输期间被**换成目录** ⇒ `rename` 抛 `EISDIR`/`ENOTEMPTY`，服务端把它映射成 `409 file_exists`
+   （`details.reason='target_is_dir'`）而不是让它变成 500。
 
 #### 4.14-3 落盘属主与模式（不是可选项）
 
@@ -2605,10 +2607,10 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 |---|---|---|
 | `201` | `{path, bytes, overwritten: false}` | 新建成功 |
 | `200` | `{path, bytes, overwritten: true}` | `overwrite=1` 且提交掉了旧内容 |
-| `400` | `validation_failed` / `upload_interrupted` | 名字或 path 形态非法 / 目标是一个目录或是 symlink / 传输中断（可重试）|
+| `400` | `validation_failed` / `upload_interrupted` | 名字或 path 形态非法 / 目标（在**进 body 前**那一刻）是一个目录或是 symlink / 传输中断（可重试）。⚠ 目录这一格是**快速路径**的语义：如果是传输期间才变成目录，那是上面那行 409 |
 | `403` | `upload_disabled` | 能力位不为 `true`（**未收 body**）|
 | `404` | `not_found` | `cwd`/`path` 指向的目录不存在 |
-| `409` | `file_exists` | 目标已存在且没带 `overwrite=1`（快速路径或提交点竞态，同一个码）|
+| `409` | `file_exists` | 目标已存在且没带 `overwrite=1`（快速路径或提交点竞态，同一个码）；**或** `overwrite=1` 而目标在传输期间变成了目录（`details.reason='target_is_dir'`）|
 | `413` | `file_too_large` | 超过 `FILE_UPLOAD_MAX_BYTES`，`details = {max_bytes, bytes}` |
 
 `path` 是**相对牢笼根**的路径（与 `GET /api/files/tree`、预览端点同口径），不是绝对路径。

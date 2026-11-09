@@ -229,9 +229,19 @@ export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFou
 
 /**
  * 上传目标目录（issue #472 片 B）：与 `resolveJailedFile` **同一条红线**（同一份 `resolveJailedRoot`），
- * 差别只有两点——目标**必须是目录**，且 `path` 允许 `'.'`（上传到项目根）。最终 symlink 一律拒：
- * 逐段 lstat 已覆盖最后一段，这里再 `lstatSync` 一次是为了「校验之后、打开 temp 之前」这段窗口里
- * 被 agent 换成 symlink 的竞态也能挡住（写入方向的红线比读取更硬）。
+ * 差别只有两点——目标**必须是目录**，且 `path` 允许 `'.'`（上传到项目根）。
+ *
+ * ⚠ 下面那次**最终 `lstatSync` 不是竞态防线**（复审 F2 改正原注释的说法）：
+ *   - `resolveJailedRoot` 的逐段 `lstat` 循环**已经覆盖最后一段**，最终 symlink 在那一步就被拒；
+ *   - 而且这两次检查之间**没有 `await`** ⇒ 原注释讲的「校验之后、打开 temp 之前的窗口」在这里
+ *     **根本不存在**。实测：删掉 symlink 那三行，`file-upload` + `http-upload` 38 条全绿（B-7② 不红）。
+ * 保留它的理由是**纵深防御 + 便宜**（写入方向的红线比读取更硬，同一份字节自己再看一眼不亏），
+ * **不是**「它在挡一个窗口」。真正的竞态窗口在 `receiveUpload` 里 `await writeTempFileFromStream(...)`
+ * 那一段（时间尺度 = 整条 body 的传输时长），由**提交点**兜住：不覆盖走 `commitTempFileNoClobber`
+ * 的 `EEXIST` ⇒ 409；覆盖走 `rename`（只替换链接本身，不会顺链接写到 jail 外；目标在那段窗口里
+ * 变成目录的情形见下面的 `EISDIR`/`ENOTEMPTY` 映射）。
+ * 本函数实际承担的就两条语义：不存在 ⇒ 404、不是目录 ⇒ 400。
+ *
  * 返回 `{ dir, rel, root, project }`：`dir` 是可直接 `path.join(dir, name)` 的绝对目录。
  */
 export function resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath = '.', notFoundHint = 'directory' } = {}) {
@@ -295,8 +305,9 @@ export const UPLOAD_FILE_MODE = 0o660;
  *      jail 外的文件）；目录 ⇒ 400；存在且 `!overwrite` ⇒ 409 `file_exists`（**快速路径**，
  *      不是安全依据：真正的判据在 e）
  *   d. `writeTempFileFromStream`（逐 chunk 落 temp + 属主 + 0660 + fsync；超限/断流自己清 temp）
- *   e. 提交：`overwrite` ⇒ `commitTempFile`（rename，原子替换）；否则 `commitTempFileNoClobber`，
- *      返回 `false` ⇒ 409 `file_exists`（**这一条才是 no-clobber 的保证**）
+ *   e. 提交：`overwrite` ⇒ `commitTempFile`（rename，原子替换；目标在 d 期间变成目录时
+ *      `rename` 抛 `EISDIR`/`ENOTEMPTY` ⇒ 一并映射成 409 `file_exists`，不是 500，复审 F3）；
+ *      否则 `commitTempFileNoClobber`，返回 `false` ⇒ 409 `file_exists`（**这一条才是 no-clobber 的保证**）
  *   f. 返回 `{ path, bytes, overwritten }`（`path` 是相对 jail 根的路径，与 fileTree/预览同口径）
  *
  * 抛 `DirError`：`file_exists` 409 / `validation_failed` 400 / `not_found` 404 /
@@ -364,7 +375,23 @@ export async function receiveUpload({
   if (overwrite) {
     // rename 原子替换（目标是 symlink 已在 c 拒掉，不会替换成链接本身而逃逸）。
     // fsyncDir 失败（返回 false）不改响应：内容已提交，报失败会让用户重传覆盖掉自己的新内容。
-    commitTempFile(tmp, target, { root: dir });
+    // ⚠ 复审 F3：目标可能在 d 的 `await`（整条 body 的传输时长）里被**换成目录** ——
+    // 用户传 X 的同时 agent 建了目录 X，这是用户可触发的形状。`rename` 把普通文件换到目录上抛
+    // `EISDIR`（空目录另有 `ENOTEMPTY`），不接住就落到通用分支 ⇒ **500**，把「目标被占了」报成
+    // 服务端故障。这里映射成与 c 同一个语义 **409 `file_exists`**（前端的处理本来就是「问用户要不要
+    // 覆盖」，这里的答案是「覆盖不了，那是个目录」⇒ 换名）。temp 必须清掉：全函数不变量是
+    // 「任何失败路径不留 `.tmp`」。
+    try {
+      commitTempFile(tmp, target, { root: dir });
+    } catch (err) {
+      if (err?.code === 'EISDIR' || err?.code === 'ENOTEMPTY') {
+        try { fs.unlinkSync(tmp); } catch {}
+        throw new DirError('file_exists', '目标在传输期间变成了目录，无法覆盖', {
+          httpStatus: 409, details: { path: relPathOut, reason: 'target_is_dir' },
+        });
+      }
+      throw err;
+    }
     overwritten = true;
   } else if (!commitTempFileNoClobber(tmp, target, { root: dir })) {
     // d 与 e 之间目标被别人（agent / 另一个上传）创建了 ⇒ 与 c 同一个码，调用方不必区分。

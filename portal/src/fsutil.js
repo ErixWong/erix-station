@@ -134,7 +134,8 @@ export function writeTempFile(target, content, { mode = 0o644, uid = null, gid =
  * ⚠ 为什么不把 body 读进内存（评审 blocker 5）：上限默认 32MiB，而 portal 与全站所有服务
  * **共用同一个 Node 进程**（Traefik 单入口后面只有它）。并发十个上传各 buffer 一份就是 320MB 堆，
  * portal OOM ⇒ 登录/预览/LLM 网关/事件流一起挂（全平台故障，不是「上传功能不可用」）。
- * 逐 chunk `writeSync` 到 fd：内存占用只有一个 chunk，磁盘写不进得比网络快，天然背压。
+ * 逐 chunk `writeFileSync(fd, …)` 到 fd（**不是** `writeSync`：它会短写，见 onData 里的注释，复审 F1）：
+ * 内存占用只有一个 chunk，磁盘写不进得比网络快，天然背压。
  *
  * 失败路径一律「关 fd + unlink temp + 抛错」，**不留残骸**（评审 major 12：断流/超限必须可复用）。
  * 超限（累计字节 > maxBytes）⇒ 抛 `code='upload_too_large'`（带 `bytes`/`maxBytes`）；
@@ -180,7 +181,13 @@ export async function writeTempFileFromStream(target, stream, { maxBytes = null,
           return;
         }
         try {
-          fs.writeSync(fd, chunk);
+          // ⚠ **`writeFileSync(fd, …)` 而不是 `writeSync(fd, …)`**（主 agent 复审 F1）：
+          // `fs.writeSync` **返回实际写入的字节数，可能小于 chunk.length**（Node 文档明写；
+          // ENOSPC 边缘、信号中断、大 chunk 都能触发），不读返回值就是**静默截断** ——
+          // 后面照常 `fchmod`/`fsync`/提交，用户拿到一个「上传成功但内容少一截」的文件，
+          // 是比报错更难查的一类坏（报错什么都不留下）。`writeFileSync` 内部循环写完，
+          // 与本文件既有的 `writeTempFile`（同样是 `fs.writeFileSync(fd, content)`）语义一致。
+          fs.writeFileSync(fd, chunk);
         } catch (writeErr) {
           cleanup();
           settled = true;
