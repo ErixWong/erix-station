@@ -7,13 +7,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CWD_RE, validateSessionCwd } from './sessions.js';
+import { commitTempFile, commitTempFileNoClobber, writeTempFileFromStream } from './fsutil.js';
 
 export class DirError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, retryable = false } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #472：**默认 false ⇒ 既有全部 DirError 的响应逐字节不变**，而 `upload_interrupted` 需要
+    // 「重发即可」的语义。http.js 的 DirError 映射分支从硬编码 `false` 改成读这个字段（与 #261014
+    // 的 LlmError 同一先例）——**没加新映射分支**，只是让已有的分支能读错误自带的值。
+    this.retryable = retryable;
   }
 }
 
@@ -249,6 +254,125 @@ export function resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath = '.', n
     throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
   }
   return { dir: target, rel, root, project };
+}
+
+/**
+ * 上传名形态（issue #472 片 B）：复用 `isSafeDirName` 的口径（拒空 / . / .. / `/` / 控制符含 NUL），
+ * 再加一条 **UTF-8 字节数 ≤ 255**（不是字符数）：ext4 的单段上限是 255 **字节**，按字符数算会让
+ * 中文名（3 字节/字）在 86 字就撞 ENAMETOOLONG，而 300 个 ASCII 字符本应合法。超限 / 形态非法
+ * 一律 400 `validation_failed` + `details.field='name'`。
+ */
+function assertSafeUploadName(name) {
+  if (!isSafeDirName(name)) {
+    throw new DirError('validation_failed', 'name 不是合法文件名', { details: { field: 'name' } });
+  }
+  if (Buffer.byteLength(name, 'utf8') > UPLOAD_NAME_MAX_BYTES) {
+    throw new DirError('validation_failed', `name 超过 ${UPLOAD_NAME_MAX_BYTES} 字节`, {
+      details: { field: 'name', max_bytes: UPLOAD_NAME_MAX_BYTES },
+    });
+  }
+}
+
+/** 文件名单段字节上限（= ext4 的 NAME_MAX）。 */
+export const UPLOAD_NAME_MAX_BYTES = 255;
+
+/**
+ * 上传落盘的文件 mode（issue #472）：0660 = 属主可写 + **同组可写**。
+ * 口径来源：docs/design/user-space.md §6.2（组写位由属组 fdeGid + umask 达成，不靠 setgid）——
+ * 上传的文件必须能被容器内的 agent（uid=fdeUid，主组=fdeGid）继续改，所以**组写位不能缺**。
+ */
+export const UPLOAD_FILE_MODE = 0o660;
+
+/**
+ * 把请求流写成 jail 内的一个文件（issue #472 片 B 的入向通道）。**不把 body 读进内存**
+ * （评审 blocker 5：32MiB × 并发 = portal OOM = 全平台挂），也**不靠「先 lstat 再 rename」**
+ * （评审 blocker 4：两步之间目标可被 agent 创建 ⇒ 静默覆盖）。
+ *
+ * 顺序即判据（a→f，a–c 全在打开 temp 之前 ⇒ 无效请求不必先把 body 收完）：
+ *   a. `resolveJailedDir` → `dir`（目录不存在 404 / 越界 400 / symlink 段 400）
+ *   b. `name` 形态（见 `assertSafeUploadName`）
+ *   c. `target = dir/name` 的 `lstat`：symlink ⇒ 400（**无论 overwrite**，否则拿覆盖当借口改写
+ *      jail 外的文件）；目录 ⇒ 400；存在且 `!overwrite` ⇒ 409 `file_exists`（**快速路径**，
+ *      不是安全依据：真正的判据在 e）
+ *   d. `writeTempFileFromStream`（逐 chunk 落 temp + 属主 + 0660 + fsync；超限/断流自己清 temp）
+ *   e. 提交：`overwrite` ⇒ `commitTempFile`（rename，原子替换）；否则 `commitTempFileNoClobber`，
+ *      返回 `false` ⇒ 409 `file_exists`（**这一条才是 no-clobber 的保证**）
+ *   f. 返回 `{ path, bytes, overwritten }`（`path` 是相对 jail 根的路径，与 fileTree/预览同口径）
+ *
+ * 抛 `DirError`：`file_exists` 409 / `validation_failed` 400 / `not_found` 404 /
+ * `file_too_large` 413 / `upload_interrupted` 400（retryable）。任何失败路径都不留 `.tmp` 残骸。
+ * ⚠ `upload_disabled`（403）不在这里——那是能力位判定，属 handler（http.js）。
+ *
+ * @param uid/gid 落盘属主（portal 以 root 写，必须 chown 给 fdeUid/fdeGid，否则 agent 改不动）。
+ *        **两者都要传**：`fchown(fd, uid, -1)` 会留下 gid=0（root 组），见 fsutil.ensureDirSafe 的长注。
+ */
+export async function receiveUpload({
+  userSpaceRoot, fdeName, cwd, relPath = '.', name, stream, maxBytes, overwrite = false, uid = null, gid = null,
+} = {}) {
+  // a. 目录牢笼（先于一切：越界/不存在的目录不值得为此收 body）。
+  const { dir, rel } = resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath });
+  // b. 名字形态。
+  assertSafeUploadName(name);
+  const target = path.join(dir, name);
+  const relPathOut = rel ? path.join(rel, name) : name;
+
+  // c. 快速路径（**不是** no-clobber 的依据，见 e）。
+  let existing = null;
+  try {
+    existing = fs.lstatSync(target);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
+  if (existing) {
+    // 最终 symlink 一律拒，**与 overwrite 无关**：目标是 symlink 时 rename 换的是链接本身，
+    // 而 lstat 之后到写入之前它还可能被换成指向 jail 外的东西 ⇒ 覆盖语义保不住 jail。
+    if (existing.isSymbolicLink()) {
+      throw new DirError('validation_failed', '目标是符号链接，拒绝写入', { details: { field: 'name' } });
+    }
+    if (existing.isDirectory()) {
+      throw new DirError('validation_failed', '目标是一个目录，不能当文件写', { details: { field: 'name' } });
+    }
+    if (!overwrite) {
+      throw new DirError('file_exists', '目标文件已存在', { httpStatus: 409, details: { path: relPathOut } });
+    }
+  }
+
+  // d. 流式落 temp（属主/0660/fsync 全在 fsutil 里，与平台其余原子写同一口径）。
+  let tmp;
+  let bytes;
+  try {
+    ({ tmp, bytes } = await writeTempFileFromStream(target, stream, { maxBytes, mode: UPLOAD_FILE_MODE, uid, gid, root: dir }));
+  } catch (err) {
+    if (err?.code === 'upload_too_large') {
+      throw new DirError('file_too_large', `上传超过上限（${err.maxBytes} 字节）`, {
+        httpStatus: 413,
+        details: { max_bytes: err.maxBytes, bytes: err.bytes },
+      });
+    }
+    if (err?.code === 'upload_interrupted') {
+      throw new DirError('upload_interrupted', '上传在传输完成前中断', {
+        httpStatus: 400,
+        retryable: true,
+        details: { bytes: err.bytes },
+      });
+    }
+    throw err;
+  }
+
+  // e. 提交点。
+  let overwritten = false;
+  if (overwrite) {
+    // rename 原子替换（目标是 symlink 已在 c 拒掉，不会替换成链接本身而逃逸）。
+    // fsyncDir 失败（返回 false）不改响应：内容已提交，报失败会让用户重传覆盖掉自己的新内容。
+    commitTempFile(tmp, target, { root: dir });
+    overwritten = true;
+  } else if (!commitTempFileNoClobber(tmp, target, { root: dir })) {
+    // d 与 e 之间目标被别人（agent / 另一个上传）创建了 ⇒ 与 c 同一个码，调用方不必区分。
+    throw new DirError('file_exists', '目标文件已存在（提交点竞态）', { httpStatus: 409, details: { path: relPathOut } });
+  }
+
+  // f. DTO（docs/api/portal.md §4.14）。
+  return { path: relPathOut, bytes, overwritten };
 }
 
 /**

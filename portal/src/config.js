@@ -278,6 +278,12 @@ export function loadConfig(env = process.env) {
     kdfQueueTimeoutMs: intEnv(env, 'KDF_QUEUE_TIMEOUT_MS', 30 * 1000),
     // 请求体上限与字段上限（S3：防止超大 body/字段触发 scrypt 或打爆内存）
     maxBodyBytes: intEnv(env, 'MAX_BODY_BYTES', 64 * 1024),
+    // issue #472 片 B：单文件上传上限。**与 maxBodyBytes 是两个东西**：后者是 JSON 请求体（默认 64KiB，
+    // 上传走它则任何真文件都 413），本值由 `receiveUpload` 在流式写入里逐 chunk 兜。
+    // ⚠ 它是**单文件**上限、**不是并发上限**：32MiB × N 个并发上传不会进内存（流式），但会同时占磁盘写
+    // 与带宽；真正的总量闸门是配额（#472 R6：本版不做，见 docs/env.md）。
+    // ⚠ compose 的 portal service 用显式 environment 列表、**没有 env_file** ⇒ 运维改 .env 要这里也列一行才生效。
+    fileUploadMaxBytes: intEnv(env, 'FILE_UPLOAD_MAX_BYTES', 32 * 1024 * 1024),
     // issue #64 R1：run 终态产物（worktree bundle tar.gz）存储与上限。
     // 持久卷 bind mount（deploy-contract §2.2 ④）；上限默认 20MB，与 agentd 侧截断口径一致。
     artifactsRoot: env.ERIX_ARTIFACTS_ROOT || '/srv/erix/artifacts',
