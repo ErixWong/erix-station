@@ -180,6 +180,11 @@ user/pids/memory 受限、env 键白名单。**所以「portal 被攻破后起�
 - **影响**：宿主 2222/9000/4100 被搬到公网域名后面；预览流量可被劫持到攻击者容器（同域 cookie 风险）；可挂钓鱼页。
 - **现有缓解**：`api: false`（无 Traefik dashboard）；Traefik 对 dynamic 只读；`fde-proxy` 挡住"起 privileged 容器"。
 - **建议**：S2（后端白名单不变量）+ S3（漂移对账）。
+- **🟡 部分处置（#474 S2，2026-11-09，口径见 §10）**：从 2026-11-09 起，portal **经生成器**写出的路由已经不可能
+  指向白名单外的后端（构造期 + 发布前最终文本两道），`ClientIP(0.0.0.0/0)` 这类放大也拦在渲染边界。
+  **残余风险（说完全）**：本节描述的是「portal 这个进程能写那个目录」——S2 拦的是**我们自己的代码**生成不出坏路由，
+  被攻破的 portal **仍然可以直接 `writeFile` 一份自己拼的 YAML** 绕过生成器（它是 root、目录就在它手里）。
+  那一半只能靠 S3（被看见）+ 权限模型收敛（S6 那类）兜，**不要把 S2 当成已关掉 R3**。
 
 ### R4（高）portal 被攻破 ⇒ **TLS 私钥可被读出**
 
@@ -196,6 +201,9 @@ user/pids/memory 受限、env 键白名单。**所以「portal 被攻破后起�
 - **现状**：`routes.yml` 由 portal 在"路由变更/启动"时重写；两次变更之间若有人改盘上文件，Traefik `watch: true` 会**立即加载**，而系统无任何对账。
 - **影响**：与 R3 同后果，但入口是宿主 shell（已失守则无解），现实价值在于**误改/残留**也能被自愈。
 - **建议**：S3。
+- **🟡 部分处置（#474 S3 一期，2026-11-09，口径见 §10）**：每 60s + 启动一次重算期望态并与盘上比（字节 + mode + 属主 +
+  是否普通文件 + symlink），不一致 ⇒ **只告警 + 写审计，不写盘**。
+  所以本节的症状从「不会被发现」变成「会被发现并留痕，但**不会自愈**」——二期（自动覆盖）未完，前置条件见 §10.4。
 
 ### R6（中）用户面至今是明文 HTTP
 
@@ -229,8 +237,8 @@ user/pids/memory 受限、env 键白名单。**所以「portal 被攻破后起�
 | # | 方案 | 对应风险 | 成本 | 收益 | 状态 |
 |---|---|---|---|---|---|
 | **S1** | **`#233` 宿主防火墙收紧（收窄版）**：`DOCKER-USER` + `INPUT` 两条链都写；默认 DROP `{9000, 2201-2203, 19001, 2222, 7681, 8931-8936…}`，放行 `各 FDE /29 → 8090/8443/9443`，DB（5432/1433）**按登记表放行**；幂等 + fail-closed | R1、R2、R7 | 中（iptables 脚本 + 演练 + 回滚；**两条链缺一不可**） | **最高**：消灭"容器直连宿主控制面/出网/容器 SSH" | 独立 issue `#233`，未开工；范围按 2026-11-05 决策收窄（见 §9） |
-| **S2** | **路由后端白名单不变量**：只允许 `portalBackendUrl`（全等）、预览后端（**池内网段 + 该 FDE 的前缀 + 端口 22000–29999 + 主机 `.2`**）、`llmGatewayUrl`（全等）、`noop@internal`；另加 **hostname 保留集**（预览 host 不得等于/覆盖 `portalHost`/`adminHost`/`llmHost`）与 **CIDR 池归属**（`parseCidr` 只验语法，实测 `0.0.0.0/0` 放行）；两道校验（构造期 + 发布前最终文本） | R3 | 低（校验函数 + 用例） | 让"指向 `127.0.0.1:22` 的路由"「抢占平台 origin 的路由」「`ClientIP(0.0.0.0/0)` 放大 key 注入」在生成器层就生不出来 | **#474**（方案 v2 已过独立评审，`approve-with-changes`） |
-| **S3** | **路由文件漂移对账**（**分两期**）：一期 = 每 60s 重算并比对 **字节 + mode/属主/是否普通文件/symlink**，不一致 **只告警+审计、不写盘**；二期 = 自动覆盖（前置：跨写者锁 + last-known-good + 一期零误报）。只保护三份受管文件，`routes-lan.yml` 等手工文件**不纳管**（只告警） | R3、R5 | 低 | 手改/误改/权限漂移被看见并留痕 | **#474**（一期随 S2 交付；二期另开单） |
+| **S2** | **路由后端白名单不变量**：只允许 `portalBackendUrl`（全等）、预览后端（**池内网段 + 该 FDE 的前缀 + 端口 22000–29999 + 主机 `.2`**）、`llmGatewayUrl`（全等）、`noop@internal`；另加 **hostname 保留集**（预览 host 不得等于/覆盖 `portalHost`/`adminHost`/`llmHost`）与 **CIDR 池归属**（`parseCidr` 只验语法，实测 `0.0.0.0/0` 放行）；两道校验（构造期 + 发布前最终文本） | R3 | 低（校验函数 + 用例） | 让"指向 `127.0.0.1:22` 的路由"「抢占平台 origin 的路由」「`ClientIP(0.0.0.0/0)` 放大 key 注入」在生成器层就生不出来 | **#474 —— ✅ 已实现（一期，2026-11-09）**：判据与两道校验见 §10 落地记录 |
+| **S3** | **路由文件漂移对账**（**分两期**）：一期 = 每 60s 重算并比对 **字节 + mode/属主/是否普通文件/symlink**，不一致 **只告警+审计、不写盘**；二期 = 自动覆盖（前置：跨写者锁 + last-known-good + 一期零误报）。只保护三份受管文件，`routes-lan.yml` 等手工文件**不纳管**（只告警） | R3、R5 | 低 | 手改/误改/权限漂移被看见并留痕 | **#474 —— 一期 ✅ 已实现（2026-11-09，只监控不修复，见 §10）；二期（自动覆盖）未开工** |
 | **S4** | **私钥读取收窄**：`readTlsAssets` 用 `stat` 取 `mtimeMs`/大小（不读字节）；回滚用 `fs.copyFile` | R4 | 很低 | portal 读路径永不接触私钥字节（只有上传那一刻必须接收） | **✅ 已实现**（#462，2026-11-05；判据见 §2.5 落地记录） |
 | **S5** | 用户面上 HTTPS（复用现成 `*.fde.erix.vip` 证书） | R6 | 中 | 消灭明文口令/会话 | 未开工 |
 | S6 | 把"发布路由"拆成独立最小进程（只读 DB、只写一个文件，无 docker/DB 写权限） | R3/R4 的深层 | 高（重排启动与权限模型） | 结构性收敛 | 暂不建议 |
@@ -393,3 +401,82 @@ docker inspect station-edge   --format '{{range .Mounts}}{{.Source}} -> {{.Desti
 按代价排序：`DOCKER-USER 按来源放行`（已有机制）→ `DB 协议代理`（S7，工作量大但控制最强）→ `per-FDE 独立实例`（资源换隔离）。
 其中 **S7 是唯一能在"共享一个 DB"前提下同时做到 per-FDE 身份 + 限流 + 审计 + 单点关停的方案**，
 但它需要实现 DB 协议层（PG/MSSQL 的握手与查询流），因此列为**后期可选**，不在当前路线图内。
+
+---
+
+## 10. 落地记录：#474（S2 后端白名单 + S3 一期只读监控，2026-11-09）
+
+代码落点：`portal/src/routebackends.js`（判据 + 两道校验）、`portal/src/routes.js`（唯一构造点与发布三态）、
+`portal/src/routesdrift.js`（S3 一期对账）、`portal/src/cli.js`（monitor 起停）。测试：`portal/test/route-backends.test.js`、
+`portal/test/routes-drift.test.js`。
+
+### 10.1 S2：四类后端与两条附加不变量
+
+| 后端 | 判据 | 说明 |
+|---|---|---|
+| portal | 字符串**全等** `config.portalBackendUrl` | 不做「看起来像」的模糊匹配 |
+| 预览 | `http://<subnetBase+2>:<port>`，且网段 ∈ FDE IPAM 池（`10.200.0.0/16` / `10.201.0.0/16`）、前缀 = 该 FDE 登记前缀、端口整数 ∈ `[22000, 29999]`、主机**恰为** subnetBase+2 | ⚠ 是 `base+2` 不是「任何 `.2`」更不是「ip+1」；`.2` 由唯一构造点生成，**DB 里的 `backend_url` 不参与判定** |
+| LLM 网关 | 字符串**全等** `config.llmGatewayUrl` | — |
+| 内部哨兵 | 字面量 `noop@internal` | — |
+
+- **hostname 保留集**：预览 host 必须由 `fdeName + port + baseDomain` **逐字重算**并相等，且不得等于
+  `portalHost` / `adminHost` / `llmHost` / `portalInternalHosts` 中任何一个——否则一条预览 `Host()` 就能抢走平台 origin。
+- **CIDR 池归属（四判据）**：语法（`parseCidr`）+ **网络地址规范**（host bits 必须为 0）+ **池归属** + **与该 FDE 关联**。
+  只有语法是不够的：实测 `parseCidr('0.0.0.0/0')` 会放行，而 `ClientIP(0.0.0.0/0)` 正好把 per-FDE key 的注入面放大到全网。
+  **管理员 IP allowlist 不受池限制**（那是另一个信任域，管理员本来就能填任意网段）。
+
+### 10.2 两道校验与发布三态
+
+1. **构造期**：`buildPreviewBackendUrl` / `buildPreviewAllocation` / 各 `assert*`——坏值生不出对象。
+2. **发布前**：`assertRenderedRouteText()` 对**最终 YAML 文本**做结构断言。这一道防的是「绕过构造点直接塞字符串」
+   和「以后有人加第二条渲染路径」。⚠ 断的是**文本**不是 AST：**不引入 YAML parser**（红线），所以是「行/键结构 + 值必须命中白名单」的断言，不是解析。
+
+**三态**（严格分开，混起来就会误删路由）：
+
+- **合法空**（该 FDE 没有 LLM binding）⇒ 允许 `unlink llm-routes.yml`；
+- **有效** ⇒ 原子写（临时文件 + rename）；
+- **失败**（拿不到数据 / 校验不过）⇒ **保留 last-known-good**，绝不用半截配置盖掉已经在工作的那份。
+
+「空」和「拿不到」是两回事：前者该删文件，后者该什么都不做。
+
+### 10.3 S3 一期：只读对账的口径
+
+- 每 60s + 启动一次（周期写死在代码里，**不是** env 旋钮）；重入时等同一轮，不静默丢拍。
+- 期望态与发布面**同一份代码**（`readRouteDesiredState` + 两个生成器 + `renderTlsConfig()` + 第二道断言）⇒ 白名单改了这里自动跟上，不存在「第二份模板」。
+- 比对顺序：symlink / 是否普通文件 → mode（`routes.yml` 0644、`llm-routes.yml` **0600**、`tls.yml` 0644）→ 属主 → 字节。
+  **字节相同也要报**：`llm-routes.yml` 0600 被改成 0644 = per-FDE 虚拟 key 明文变成同组/他人可读。
+- 未纳管的 `*.yml`（含 `routes-lan.yml`）**只列出、不删不改**。
+- **输出字段白名单**：文件名 / kind / stage / 时间 / sha256 前 8 位 / 字节数 / mode / uid-gid / 失败阶段。
+  **日志与审计里绝不出现 YAML 正文、token、diff**（有用例拿 canary 明文盯这一条）。
+- 审计：`audit_log.action = 'routes.file_drift_detected'`，`details` 就是上面那组元数据（JSONB）；**零漂移一条都不写**（60s 一轮会灌满）。
+- **算不出来 ⇒ 整轮 skip + warn、零 finding**：不把「拿不到」当「应当不存在」——否则报的是假漂移，二期还会据此误删。
+
+### 10.4 二期（自动覆盖）的前置条件——不要跳过
+
+① 跨写者锁（运维/别的脚本也写这个目录）；② last-known-good 语义已具备（§10.2 ✅）；③ 一期观察期内**零误报**；
+④ `unlink` 需要目录写权限，而写目录 ⇒ 能把目录改名 ⇒ 得把属主 chown 回去。四条不齐就上自动覆盖，
+等于把「有人手改」变成「每 60 秒和运维打架一次」。
+
+### 10.5 运维怎么看（一期不会自愈）
+
+```bash
+docker logs station-portal 2>&1 | grep '\[routes-drift\]'
+```
+
+```sql
+SELECT created_at, action, details FROM audit_log
+ WHERE action = 'routes.file_drift_detected' ORDER BY id DESC LIMIT 20;
+```
+
+`details` 的样子（这就是全部信息量，没有正文）：
+
+```json
+{"file":"llm-routes.yml","kind":"metadata","stage":"mode",
+ "sha_before8":"1f2e3d4c","sha_after8":"1f2e3d4c","bytes":412,
+ "mode_expected":"600","mode_actual":"644"}
+```
+
+⇒ 两个 sha 相同 = 字节没动，只是权限被放宽。处理办法：改回生成器那份（重启 portal 重发布，或让 portal 下一次路由变更覆盖）。
+
+**边界（如实）**：白名单校验**不在模块 import 期**执行——config 坏时应该是一条可读的启动错误，不是进程在 `import` 里崩。
+本文写「S2 已实现」的范围是「portal **经生成器**写出的路由」；被攻破的 portal 直接 `writeFile` 仍绕过 S2（见 R3 的残余风险），那一半归 S3 看见 + 权限模型收敛。
