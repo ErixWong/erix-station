@@ -258,3 +258,36 @@ test('签名口径：字段固定且不含正文；同一形状在两台机器�
   assert.notEqual(driftSignature({ ...f, modeActual: '600' }), driftSignature(f), 'modeActual 必须在签名里（否则 mode 变了会被当成同一条）');
   assert.notEqual(driftSignature({ ...f, sha_after8: 'cccccccc' }), driftSignature(f), 'sha_after8 必须在签名里');
 });
+
+test('skip ≠ 干净：DB 抖一下不得把正在报警的漂移记成 cleared', async () => {
+  const dir = mkDir();
+  const pool = mkPool({ bindings: [BINDING], allocations: [ALLOC_ROW] });
+  const expected = await publishExpected(dir, pool, CFG);
+  const state = createDriftLatch();
+  const { lines, log } = captureLog();
+  const cfg = { ...CFG, traefikDynamicDir: dir };
+
+  fs.appendFileSync(path.join(dir, 'routes.yml'), '\n# hand edit\n');
+  await runDriftRound({ pool, config: cfg, log, state });
+  assert.equal(audits(pool, AUDIT_DRIFT).length, 1);
+
+  // DB 挂了：本轮算不出期望态 ⇒ 只能 skip，不能据此宣布「漂移好了」。
+  const broken = { async query() { throw new Error('db down (injected)'); }, sqlLog: pool.sqlLog };
+  const skipOut = await runDriftRound({ pool: broken, config: cfg, log, state });
+  assert.equal(skipOut.skipped, true);
+  assert.deepEqual(audits(pool, AUDIT_DRIFT_CLEARED), [], 'skip 轮记 cleared = 把「拿不到」当成「已恢复」');
+  const skipLines = lines.length;
+  await runDriftRound({ pool: broken, config: cfg, log, state });
+  assert.equal(lines.length, skipLines, '同一种 skip 也不该每轮刷一句');
+
+  // 修好之后仍然漂移 ⇒ 该条重新出现（skip 期间的锁存没被抹掉，所以不会重复写 detected）
+  await runDriftRound({ pool, config: cfg, log, state });
+  assert.equal(audits(pool, AUDIT_DRIFT).length, 1, 'skip 之后仍是同一条漂移 ⇒ 不加行');
+  assert.deepEqual(audits(pool, AUDIT_DRIFT_CLEARED), []);
+
+  // 真的改回来了才记 cleared
+  fs.writeFileSync(path.join(dir, 'routes.yml'), expected['routes.yml'].bytes, { mode: MANAGED_MODES['routes.yml'] });
+  await runDriftRound({ pool, config: cfg, log, state });
+  assert.equal(audits(pool, AUDIT_DRIFT_CLEARED).length, 1, '只有真的干净才配记 cleared');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
