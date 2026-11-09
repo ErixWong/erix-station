@@ -99,6 +99,12 @@ jobs:
       - name: '③ 启用 buildx（docker-container 驱动）'
         uses: docker/setup-buildx-action@v3
 
+      # ---- ③′ 构建时间戳（build-info.json 的 built_at 用）----
+      # 不拿 commit 时间冒充构建时间（tag 的 commit 可能是几天前），也不写死。
+      - name: '③′ 构建时间戳'
+        id: stamp
+        run: echo "iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       # ---- ④⑤⑥ 三镜像：单架构 linux/amd64，双标签 <version> + latest，provenance/sbom 关闭 ----
       # 关 attestations 的原因：否则推上去的 digest 是「attestation index」的 digest，与部署机
       # `docker image inspect --format '{{.Id}}'`（config blob digest）对不上；而我们拿
@@ -128,6 +134,13 @@ jobs:
           platforms: linux/amd64
           provenance: false
           sbom: false
+          # 三个 ARG 只影响 Dockerfile **末尾**的 build-info 层与 OCI label（前面各层缓存不受影响）：
+          #   STATION_VERSION / STATION_REVISION 进 LABEL，REVISION / BUILD_DATE 进 build-info.json。
+          # 不传它们 = `build-info.json` 里 revision/built_at 恒 `unknown`、label 恒空（v0.1.53 实测就是这样）。
+          build-args: |
+            STATION_VERSION=${{ steps.version.outputs.version }}
+            STATION_REVISION=${{ github.sha }}
+            STATION_BUILD_DATE=${{ steps.stamp.outputs.iso }}
           tags: |
             ${{ env.IMG_FDE }}:${{ steps.version.outputs.version }}
             ${{ env.IMG_FDE }}:latest
