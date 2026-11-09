@@ -23,6 +23,20 @@ export class FakePool {
     this.statements = [];
   }
 
+  /**
+   * #472 片 A：fake 的「按 SQL 说的做」（AGENTS §8.14）—— 只有 SELECT 里真的写了 `file_upload_enabled`
+   * 才回这一列。产品代码漏补列 ⇒ 行里拿不到它 ⇒ `=== true` 得 false ⇒ 用例会红，
+   * 而不是被 fake 好心兼平成假绿。
+   *
+   * ⚠ **必须覆盖成 `undefined` 而不是「不带这个键」**：这些分支的行是 `{ ...u }` 展开出来的，
+   * 而种子用户对象本身就有这个键 —— 只删不补的话，「SELECT 里漏了列」会被展开值兼平，
+   * 变异测试（把 `authenticate` 的 SELECT 补列删掉）实测绿着过 = 假绿。
+   * 值**不做布尔兼平**：`'f'` / `0` / `undefined` 这些形状留着，那正是 A-3 要钉的东西。
+   */
+  projectFileUpload(sql, user) {
+    return { file_upload_enabled: /\bfile_upload_enabled\b/.test(sql) ? user.file_upload_enabled : undefined };
+  }
+
   async query(sql, params = []) {
     this.statements.push({ sql, params });
     if (sql.includes('schema_migrations')) {
@@ -33,10 +47,15 @@ export class FakePool {
     if (sql.includes('FROM users WHERE login')) {
       const login = params[0];
       const u = this.users.find((x) => x.login === login && x.status === 'active');
+      // #472 合并注记：两边都在修同一类问题——**fake 必须按 SQL 的列清单回列**，不许用整行兼平。
+      // origin/main 那版（#449 回归）把投影做成通用的（从 SELECT 里解析列名），比本分支原来的
+      // 单列 `projectFileUpload` 更强 ⇒ 这里取通用版；`projectFileUpload` 仍服务另外三处分支
+      // （loadActiveUser / verifyTotpForUser / findSessionUser），那三处 origin/main 没动。
       if (!u) return { rows: [] };
       // **按 SQL 的列清单投影**（#449 回归）：真 PG 只回 SELECT 里点名的列，
       // 而过去这里直接回整行 ⇒ 「SELECT 漏掉 mail_otp_enabled」这类 bug 在单测里永远看不见
       // （生产上 `row.mail_otp_enabled` 恒 undefined ⇒ per-user 邮件验证码开关整条死掉）。
+      // 同理覆盖 #472 的 `file_upload_enabled`：漏选该列 ⇒ 行里没有它 ⇒ `=== true` 得 false ⇒ 用例红。
       const m = /SELECT ([\s\S]*?) FROM users WHERE login/.exec(sql);
       if (!m) return { rows: [u] };
       const cols = m[1].split(',').map((c) => {
@@ -73,6 +92,8 @@ export class FakePool {
           auth_source: u.auth_source,
           email: u.email ?? null,
           must_change_password: u.must_change_password === true,
+          // #472：同上（`loadActiveUser` 的 SELECT）。
+          ...this.projectFileUpload(sql, u),
         }],
       };
     }
@@ -81,7 +102,8 @@ export class FakePool {
     if (sql.includes('FROM users WHERE id') && sql.includes('totp_secret')) {
       const userId = params[0];
       const u = this.users.find((x) => x.id === userId && x.status === 'active');
-      return { rows: u ? [u] : [] };
+      // #472：同上（`verifyTotpForUser` 的 SELECT）。
+      return { rows: u ? [{ ...u, ...this.projectFileUpload(sql, u) }] : [] };
     }
 
     // createPendingToken
@@ -166,6 +188,8 @@ export class FakePool {
             session_id: s.id,
             expires_at: s.expires_at,
             last_seen_at: s.last_seen_at,
+            // #472：同上（`findSessionUser` 的 SELECT 里写的是 `u.file_upload_enabled`）。
+            ...this.projectFileUpload(sql, u),
           },
         ],
       };

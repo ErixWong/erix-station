@@ -58,6 +58,8 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | `password_hash` / `totp_secret` | 本地账号：argon2id 哈希 + **强制 TOTP**（规格 §7.1）；TOTP 种子只经 bootstrap 下发，不走公开 API（portal.md §2.1） |
 | `last_totp_step` | TOTP 单码防重放（portal.md §2.9.4）：最近成功校验的时间步长（`bigint`，`floor(unix_seconds/30)`）；同时间窗内同码（步长 ≤ 已记录值）拒绝，成功校验原子推进 |
 | `status` / `disabled_at` | `active` / `disabled` / `awaiting_credential`。per-FDE PAT host 开户后暂为 `awaiting_credential`；对应 Git 凭据成功写入后恢复 `active`；offboarding 停用（规格 §7.3） |
+| `mail_otp_enabled` | per-user「邮箱验证码」开关（迁移 `0028`，`NOT NULL DEFAULT false`）。**默认 false**：全局邮件通道开启不再自动要求所有人走邮箱码，需管理员逐个打开（portal.md §2.2）。只有 `PATCH /api/admin/users/:id` 能改（§12） |
+| `file_upload_enabled` | per-user「文件上传」开关（迁移 `0029`，`NOT NULL DEFAULT false`，issue #472）。**默认 false** 且**零回填**：上传是写用户磁盘的能力，与 TOTP / 邮件验证码同一口径，由管理员在管理台 Edit → Security 显式打开。谁能改：只有 `PATCH /api/admin/users/:id`（`createUser` 不接受该入参，开户一律 false）；**重新开户（同名 disabled 行再激活）会显式清零** ⇒ 不继承上一个任期的权限。消费方：上传端点的 403 闸（片 B）与 user DTO 下发（portal.md §2.6）；界面隐藏不是闸，服务端才是 |
 
 **状态机**：常规账号 `active → disabled`；Git 开户 `active → awaiting_credential → active`（必须写入指定 host 的 PAT）；offboarding 可从任一态转为 `disabled`。
 产生方：onboarding workflow / Git credential 管理 / 对账任务；消费方：登录、forward-auth、容器调度（仅 `active` 可运行）。

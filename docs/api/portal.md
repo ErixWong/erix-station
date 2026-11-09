@@ -32,7 +32,7 @@
 | 认证 | `POST /api/auth/login/email-code` | 第二步：**邮箱验证码**校验，发 cookie（#449，§2.3a）|
 | 认证 | `POST /api/auth/login/email-code/resend` | 重发邮箱验证码（#449，§2.3b）|
 | 认证 | `POST /api/auth/logout` | 登出 |
-| 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password`，§2.6）|
+| 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password` 与 `file_upload_enabled`，§2.6）|
 | 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
 | 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
@@ -543,7 +543,8 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
     "role": "fde",
     "fde_name": "alice",
     "auth_source": "local",
-    "must_change_password": true
+    "must_change_password": true,
+    "file_upload_enabled": false
   }
 }
 ```
@@ -554,6 +555,9 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 | `fde_name` | 该用户的 FDE 标识（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段），无容器时为 `null` |
 | `auth_source` | `local` \| `oidc`（P1 恒为 `local`） |
 | `must_change_password`（#255，纯 additive）| 当前会话是否**受限**（与 §2.2 登录响应的 `password_change_required` 同源同值，只是载体不同）。本端点在 §2.11a 的放行清单里，因此它是 **SPA 刷新后重建改密屏的唯一数据源**——挡住它，前端就只能看到一片 403 而不知道该把用户送去哪儿 |
+| `file_upload_enabled`（#472 片 A，纯 additive）| 该用户能不能用上传端点（`users.file_upload_enabled`，迁移 `0029`，`NOT NULL DEFAULT false`；**上传端点本体是片 B**，届时落在 §4.14）。服务端恒给**布尔**（库里给 `'f'` / `NULL` 等形状也收成 `false`），前端判据一律 `=== true`。**它只在这个 user DTO 里**，不在登录响应顶层（顶层那个位置是 `mail_otp_enabled`，属宿主判定输入）|
+
+**四条 user DTO 路径键集一致（#472 片 A，不是巧合而是约定）**：`POST /api/auth/login`（口令直通）、`POST /api/auth/login/totp`、邮箱码第二步、以及本端点，四处下发的 `user` 对象由**同一个构造函数**产出（`portal/src/auth.js` 的 `toSessionUser`）。原因：SPA 的 `login()` / `submitEmailCode()` 把**登录响应里的 `user`** 直接存进 store，且**不重拉 `/api/me`** ⇒ 只给本端点补字段会让新键在「刚登录的那整个会话」里不存在（按钮不出现，直到整页刷新）。唯一允许的额外键是本端点的 `must_change_password`（**会话态**，不属用户态），由 §2.11a 的受限会话门消费。
 
 ### 2.6a `POST /api/me/password`（#255：本人自助改密，受限会话的出口）
 
@@ -2737,6 +2741,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 2. SSE mock：按 §5.3 清单逐类型发事件，`id` 递增；模拟断线后带 `Last-Event-ID` 重连，验证补发不漏（P2 验收的前端半边）。
 3. `messages.synthetic: true` 的消息必须有独立视觉标记（规格 §9.2 红线）。
 4. 预览 URL 一律取 `PortAllocation.url` 字段，禁止拼接域名（规格 §8.1 同源原则）。
+5. **能力位字段的 mock 基线（#472 片 A）**：mock `GET /api/me` 与两个登录端点的 `user` 时，**四处形状必须一致**（同一个构造点，见 §2.6 的「四条 user DTO 路径键集一致」）；`file_upload_enabled` 要能造出**三种**响应：`true` / `false` / **缺键**（三态 UI 与片 B 的按钮显隐判据都靠这三格，只 mock 两态就验不到「未知」那一格）。
 
 ---
 
@@ -3619,7 +3624,9 @@ Reactivation starts a new provisioning pass for the retained identity, including
 
 ### `PATCH /api/admin/users/:id`
 
-Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
+Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `email`（可改可清，`null`/空串 = 清空）, `mail_otp_enabled`（布尔，打开前需已有邮箱且邮件通道可用）, `file_upload_enabled`（布尔，#472 片 A）, `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
+
+**`file_upload_enabled`（#472 片 A，issue #472）**：非布尔（`'true'` / `1` / `null`）⇒ `400 validation_failed` + `details.field: "file_upload_enabled"`。它**只能在这里打开**：`POST /api/admin/users`（开户）**不接受**该入参，开户一律 `false`（开户是批量/脚本路径，多一个可选参数就多一条「脚本写错把上传开给所有人」的路）。⚠ **重新开户 = 重新授权**：同名 disabled 行被重新开户时（§12 `POST /api/admin/users` 的 UPDATE 分支）本列被**显式清零**，不继承上一个任期的权限（否则「曾开过上传 → 停用 → 再开户」会静默保留写盘能力）。服务端下发的 user DTO 里该键恒为布尔；管理台对**缺键**（旧后端 / 读不到）显示「未知」并禁用保存，不折叠成「已关闭」。
 
 ### `DELETE /api/admin/users/:id`
 

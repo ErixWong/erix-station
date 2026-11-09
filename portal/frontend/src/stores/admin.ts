@@ -91,6 +91,13 @@ export interface AdminUser {
   email?: string | null;
   /** 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。默认 false；全局 transport=disabled 仍压过它。 */
   mail_otp_enabled?: boolean;
+  /**
+   * 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。默认 false。
+   * **可选是语义的一部分**：缺键 = 「这个账号的开关没能读取」（旧后端 / 部分响应），
+   * 管理台因此**三态**而非两态：不得把缺键折叠成 false（评审 blocker 3）。
+   * 消费方一律 `=== true`（未知与关都落在「不放开」那一侧，但界面要能说清是哪一种）。
+   */
+  file_upload_enabled?: boolean;
   role: 'fde' | 'admin';
   fde_name: string | null;
   status: 'active' | 'disabled' | 'awaiting_credential';
@@ -202,7 +209,7 @@ export function testMailErrorText(err: unknown): string {
   return t('admin.errorPrefix') + message;
 }
 
-export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'email' | 'mail_otp_enabled' | 'role' | 'fde_name'>> & {
+export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'email' | 'mail_otp_enabled' | 'file_upload_enabled' | 'role' | 'fde_name'>> & {
   status?: 'active' | 'disabled';
 };
 
