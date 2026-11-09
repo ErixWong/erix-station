@@ -257,15 +257,24 @@ export function generateTraefikConfig({
     lines.push(...adminMw);
     lines.push('      service: portal');
     lines.push('      tls: {}');
-    // 用户入口：挡掉 /api/admin/*（#450 D2/D6）。挂与 portal 同一 entrypoint（而不是硬写 web+websecure）：
-    // 用户面全部路由都由 config.traefikEntryPoint 决定，deny 跟着它走才不会在「把用户面切到另一个入口」
-    // 时留下一个洞。websecure 今天一条路由都不挂（8443 本来就是全 404），在那里加 deny 没有保护价值。
-    lines.push('    admin-deny-user:');
-    lines.push(`      entryPoints: [${entryPoint}]`);
-    lines.push(`      rule: ${yq(`Host(\`${portalHost}\`) && PathPrefix(\`/api/admin\`)`)}`);
-    lines.push('      priority: 300');
-    lines.push('      middlewares: [admin-deny]');
-    lines.push('      service: noop@internal');
+    // 用户入口：挡掉 /api/admin/*（#450 D2/D6）。**两个用户入口都要挂**（#450 A3，2026-11-09）：
+    // 用户面路由由 `entryPoint`（web）与 `secureEntryPoint`（websecure，2026-11-06 加的用户面 HTTPS）
+    // 共同决定，所以 deny 必须跟着**两者**走 —— 只挂一个，另一个入口上 `/api/admin/*` 就会直达 portal。
+    // ⚠ 这段注释原来写着「websecure 今天一条路由都不挂（8443 本来就是全 404），在那里加 deny 没有保护价值」：
+    // 那句话在用户面上 HTTPS 上线的那一刻就过期了，而 deny 没跟着加 ⇒ 8443 上 /api/admin/* 一直是
+    // 「无票 401 / FDE 403 / **管理员 200**」（2026-11-09 真机实测），一个洞挂了大半天没人发现。
+    // ⇒ 教训：**「某入口今天没有路由」不是「永远没有」**，凡按入口生成的安全规则都必须覆盖全部用户入口。
+    const denyUserEntries = [entryPoint, secureEntryPoint].filter((ep, i, arr) => (
+      typeof ep === 'string' && ep !== '' && arr.indexOf(ep) === i
+    ));
+    denyUserEntries.forEach((ep, idx) => {
+      lines.push(`    admin-deny-user${idx === 0 ? '' : `-${ep}`}:`);
+      lines.push(`      entryPoints: [${ep}]`);
+      lines.push(`      rule: ${yq(`Host(\`${portalHost}\`) && PathPrefix(\`/api/admin\`)`)}`);
+      lines.push('      priority: 300');
+      lines.push('      middlewares: [admin-deny]');
+      lines.push('      service: noop@internal');
+    });
     // 管理台入口：除白名单（`/api/admin`、`/api/auth`、`/api/me`、`/api/site`）外的所有 /api/* 也走同一个 deny
     // （「每个入口只够得到自己那套 API」）。
     // 用**显式排除规则**而不是「先匹配 catch-all 再靠顺序」：规则本身可读、可断言。
