@@ -34,6 +34,10 @@ const editForm = reactive({
   display_name: '', email: '', role: 'fde' as AdminUser['role'], fde_name: '',
   // 2026-11-06：per-user 邮件验证码开关（与 TOTP 对称，管理员在 Security 里设）。
   mail_otp_enabled: false,
+  // 2026-11-09（#472 片 A）：per-user「文件上传」开关。**三态**：`null` = 未知（DTO 缺键），
+  // 不是 false。未知 ⇒ 勾选框与保存都禁用并显示「未知」（评审 blocker 3：把缺键折叠成 false
+  // 会让管理员看到「已关闭」这个**服务端未曾证实的事实**，并在一次保存里替用户改掉它）。
+  file_upload_enabled: null as boolean | null,
 });
 const resetPasswordValue = ref('');
 const deleteConfirmation = ref('');
@@ -52,6 +56,22 @@ const passwordMessage = ref('');
 const totpError = ref('');
 const totpMessage = ref('');
 const deleteError = ref('');
+// #472 片 A：文件上传开关的独立 busy/反馈（照 mailOtp 那一套，不共用 profile 的），
+// 否则「保存失败」会串到基本资料那一格去。
+const fileUploadBusy = ref(false);
+const fileUploadError = ref('');
+const fileUploadMessage = ref('');
+/** 三态里的「未知」：DTO 缺键（既不是 true 也不是 false）⇒ 不拿一个猜的值去编辑。 */
+const fileUploadUnknown = computed(() => editForm.file_upload_enabled === null);
+/**
+ * 勾选框的写入面：底层 `editForm.file_upload_enabled` 是**三态**（`null` = 未知），
+ * 而 `<input type=checkbox>` 只能读写布尔 —— 所以下面把未知读成「未勾选」（配合 disabled 与「未知」文案，
+ * 不拿猜值去提交），上面把用户动作写回成真正的布尔（从此进入已知态）。
+ */
+const fileUploadDraft = computed<boolean>({
+  get: () => editForm.file_upload_enabled === true,
+  set: (value) => { editForm.file_upload_enabled = value === true; },
+});
 
 const editUser = computed(() =>
   admin.users.find((user) => user.id === editUserId.value) ?? null,
@@ -291,6 +311,8 @@ function clearSectionFeedback() {
   totpMessage.value = '';
   mailOtpError.value = '';
   mailOtpMessage.value = '';
+  fileUploadError.value = '';
+  fileUploadMessage.value = '';
 }
 
 function openEditModal(user: AdminUser) {
@@ -302,6 +324,9 @@ function openEditModal(user: AdminUser) {
   editForm.display_name = user.display_name ?? '';
   editForm.email = user.email ?? '';
   editForm.mail_otp_enabled = user.mail_otp_enabled === true;
+  // #472：三态读取 —— 只有拿到**布尔**才填 true/false，缺键（undefined）一律 `null` = 未知。
+  // 这里写 `user.file_upload_enabled === true ? true : false` 就是把「未知」当作「关」，正是评审 blocker 3。
+  editForm.file_upload_enabled = typeof user.file_upload_enabled === 'boolean' ? user.file_upload_enabled : null;
   editForm.role = user.role;
   editForm.fde_name = user.fde_name ?? '';
   resetPasswordValue.value = '';
@@ -430,6 +455,35 @@ async function saveMailOtp() {
     mailOtpMessage.value = t('admin.fde.mailOtpSaved');
   } finally {
     mailOtpBusy.value = false;
+  }
+}
+
+// 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。与上面两块对称：单独保存、单独反馈。
+async function saveFileUpload() {
+  const target = editUser.value;
+  if (!target || fileUploadBusy.value) return;
+  // 未知态不该能触发保存（按钮也已禁用），这里是第二道闸：把 `null` 发出去会被服务端 400，
+  // 但「把不知道的东西提交一次」本身就是错的动作，不该靠服务端兑。
+  if (fileUploadUnknown.value) return;
+  fileUploadError.value = '';
+  fileUploadMessage.value = '';
+  fileUploadBusy.value = true;
+  try {
+    // 载荷只带这一个字段（A-9）：夹带 display_name 等会把另一格的未保存编辑静默提交。
+    const error = await admin.updateUser(target.id, {
+      file_upload_enabled: editForm.file_upload_enabled === true,
+    });
+    if (error) {
+      fileUploadError.value = error;
+      return;
+    }
+    // 与 saveMailOtp 同理：`editUser` 是 computed（跟着 admin.users 走）⇒ 服务端回读后界面自动更新，
+    // 这里再对齐一次本地勾选框，避免「界面开了但服务端没改」的错觉（回读缺键 ⇒ 退回未知态）。
+    const fresh = admin.users.find((u) => u.id === target.id);
+    editForm.file_upload_enabled = typeof fresh?.file_upload_enabled === 'boolean' ? fresh.file_upload_enabled : null;
+    fileUploadMessage.value = t('admin.fde.fileUploadSaved');
+  } finally {
+    fileUploadBusy.value = false;
   }
 }
 
@@ -1205,6 +1259,41 @@ onBeforeUnmount(() => {
               class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
               @click="saveMailOtp"
             >{{ t('admin.fde.saveMailOtp') }}</button>
+          </div>
+        </section>
+
+        <!-- 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。与上面两块对称：单独保存、单独反馈。
+             **三态**：DTO 缺键 ⇒ 勾选框禁用 + 显示「未知」+ 保存禁用（不得折叠成「已关闭」，评审 blocker 3）。
+             服务端 403 才是真正的闸门（片 B）——这里只是入口与授权位。 -->
+        <section class="rounded-lg border border-black/10 p-3" data-test="file-upload-section">
+          <h3 class="font-semibold">{{ t('admin.fde.fileUploadSection') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.fileUploadHint') }}</p>
+          <label class="mt-3 flex items-start gap-2 text-sm">
+            <input
+              v-model="fileUploadDraft"
+              data-test="edit-file-upload"
+              type="checkbox"
+              class="mt-0.5"
+              :disabled="fileUploadUnknown || fileUploadBusy"
+            >
+            <span>
+              {{ t('admin.fde.fileUploadEnabledLabel') }}
+              <span class="block text-xs text-black/50">{{ t('admin.fde.fileUploadEnabledHint') }}</span>
+            </span>
+          </label>
+          <p v-if="fileUploadUnknown" class="mt-2 text-xs text-amber-700" role="status" data-test="file-upload-unknown">
+            {{ t('admin.fde.fileUploadUnknown') }}
+          </p>
+          <p v-if="fileUploadError" class="syserr mt-2" role="alert">{{ fileUploadError }}</p>
+          <p v-if="fileUploadMessage" class="mt-2 text-sm text-green-700" role="status">{{ fileUploadMessage }}</p>
+          <div class="mt-3 flex justify-end">
+            <button
+              type="button"
+              data-test="save-file-upload"
+              :disabled="fileUploadBusy || fileUploadUnknown"
+              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
+              @click="saveFileUpload"
+            >{{ t('admin.fde.saveFileUpload') }}</button>
           </div>
         </section>
       </section>
