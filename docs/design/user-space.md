@@ -416,6 +416,30 @@ materializer 所有写入路径**只能由 DB 白名单值派生**，并做符�
 
 ---
 
+### 6.4 入向通道：portal 代替用户往牢笼里写文件（issue #472 片 B）
+
+§5~§6 通篇是**出向**：materializer 从 DB 派生内容、往用户空间发布平台文件，「从不读回用户空间内容做决策」（§6.3 第 4 条）。
+`POST /api/files/upload` 是第一个**入向**通道：内容是用户递进来的字节，portal 以 **root** 落盘。
+它不复用 outbox/revision（那是「平台拥有的文件」的机制，上传的文件平台不拥有、也不重物化），但**权限与路径纪律完全继承本节**：
+
+| 规则 | 上传通道的落地 |
+|---|---|
+| §6.1 portal 写入身份是 root | **必须 `chown` 到 `fdeUid`/`fdeGid`（1000/1000）**。⚠ uid 和 gid **两个都要传**：`fchown(fd, uid, -1)` 会留下 `gid=0`（root 组），于是文件在用户自己的工位里、却属于 root 组，容器内的 agent（1000/1000）**改不动自己刚收到的东西** —— 这是「上传成功但后续写不进去」的成因，比直接报错难查 |
+| §6.2 组写位由属组 + umask 达成，不靠 setgid | 落盘模式固定 **`0660`**（`dirs.UPLOAD_FILE_MODE`）：属主可写 + 同组可写。`0600` 会把 worker（1002，同组 1000）挡在外面 |
+| §6.3 禁 symlink / traversal | 目录段复用 `resolveJailedRoot`（逐段 `lstat` 拒 symlink、越界 400）；**最终目标是 symlink 一律 400，与是否覆盖无关**（`rename` 替换的是链接本身 ⇒ 覆盖语义保不住 jail）。`name` 是单段名 + 255 **字节**上限（ext4 `NAME_MAX`）|
+| §5.1 原子写 | 逐 chunk 写同目录 temp → `fchmod`/`fchown` → `fsync` → 提交 temp 改名进位；**任何失败路径都不留 `.tmp`**（超限/断流/提交失败先 unlink）|
+| §6.3「不读回用户空间做决策」 | 仍然成立：上传只**写**，写之前只看目标的 `lstat` 形态（symlink/目录/存在性），从不把用户空间的内容当平台决策的输入 |
+
+**no-clobber 是这条通道独有的一条**：出向通道的文件由平台拥有，重物化时**理应**替换；入向的文件是用户的，
+静默覆盖 = 丢掉用户的东西。所以提交点用 `link()`（`EEXIST` ⇒ `409 file_exists`）而不是 `rename()`
+——`rename` **总是**替换目标，「先 `lstat` 再 rename」两步之间目标可被容器内的 agent 创建，
+那半截用户数据就在一次看起来成功的上传里没了。`overwrite=1` 是用户明确表过态以后的事。
+
+契约与错误码：`docs/api/portal.md` §4.14；上限旋钮：`docs/env.md` §10.1 的 `FILE_UPLOAD_MAX_BYTES`。
+
+
+---
+
 ## 7. 失败与重试状态机（DB commit → materializer → file revision → retry/backoff → alert）
 
 ### 7.1 物化链路（与 route outbox 同构，独立 outbox 表）

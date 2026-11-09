@@ -85,6 +85,7 @@
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 端口 | `POST /api/me/ports/batch-tickets` | **一键放行整组：一次请求签 N 张预览票**（#247，§4.7a：上限 = 号池块大小、越界 `404`、审计逐张、零新错误码） |
+| 文件 | `POST /api/files/upload?cwd=&path=&name=[&overwrite=1]` | **入向通道：上传一个文件**（#472 片 B，§4.14：**请求体是原始字节，不是 multipart**；per-user 能力位 `file_upload_enabled` 在**收 body 之前**判 ⇒ 未授权 `403 upload_disabled`；流式落盘不读进内存；同名 `409 file_exists`，`overwrite=1` 才替换）|
 | 文件 | `GET /api/file?mode=json\|stream\|download` | 单文件预览（缺省 `json` 行为不变）；`stream` 带 Range/MIME/Disposition，`download` 附件（#366 P0，§4.11） |
 | 文件 | `POST /api/preview-tickets` | 签一枚 `/pv/<code>` 预览能力码（#366 P2，§4.11） |
 | 文件 | `GET /pv/<code>/**` | kkFileView 反代网关（非 JSON API，浏览器 iframe 入口；#366 P2，§4.11） |
@@ -172,6 +173,9 @@
 | 400 | `tls_cert_domain_mismatch`（#456，§4.13）| **证书覆盖不到管理台域名**（`details = {adminHost, missing:[…], certDomains:[…]}`），或 `confirmDomains` 里有证书覆盖不到的名字（此时 `details.field='confirmDomains'`，`missing` 只列超出的那些）。**无 override**：不覆盖 `admin.<伞域>` 的证书装上去 = 刷新后进不了管理台，只能登服务器救 | 否 |
 | 404 | `tls_no_previous`（#456，§4.13）| **没有可回滚的上一代证书**（`<dynamic>/certs/prev/` 不存在或不完整——首次上传后立刻点回滚就是这一格）。`retryable:false` | 否 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
+| 403 | `upload_disabled`（#472 片 B，§4.14）| **这个账号没有「往自己磁盘上传文件」的能力**：`users.file_upload_enabled` 不是 `true`（片 A 的 per-user 开关，管理台 Edit → Security 里开）。**与 `forbidden` 的关键差别：判定发生在读请求体之前**——上传端点的 body 是几十 MiB 的字节流，先收完 body 再拒 ⇒ 未授权的人能把 portal 的内存与带宽当成压力测试工具，所以这里「无权」连带「不必听完你说什么」。`details = {action: 'enable_in_admin_console'}`（解法只有一个：让管理员开启，重试本请求不变）。**判据是 `=== true`**：缺键 = 不知道 = 不授权（前端 `v-if` 同口径，见 §4.14）| 否 |
+| 409 | `file_exists`（#472 片 B，§4.14）| **上传的目标文件已存在**且本次没带 `overwrite=1`。`details = {path}`（相对牢笼根的路径，与 `GET /api/files/tree` 同口径）。**两个落点同一个码**：进 body 前的快速检查（`lstat`）与提交点的竞态判据（`link` 失败）——调用方不必区分，前端拿到它就是「问用户要不要覆盖」的时机。⚠ 快速检查**不是** no-clobber 的依据（两步之间目标可被别人创建），真正的依据是提交点，见 §4.14 的 `link` 说明 | 否（要么覆盖要么换名）|
+| 400 | `upload_interrupted`（#472 片 B，§4.14）| **上传在传输完成前中断**（客户端 `destroy()`、网络断、页面被切走 ⇒ 请求流 `aborted`/`error`/提前 `close`）。`retryable: **是**`（本表里少数几个「重试就行」的 400：内容从头重传即可，且服务端已把半截 temp 删掉，不会留下半个文件）。`details = {bytes}`（已落盘的字节数，只用于排查，不代表任何已提交的内容）| 是 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
 | 503 | `email_send_failed`（#449）| **验证码邮件没发出去**（SMTP 超时/拒绝/未配置口令解不开等，`details` 不带正文）。`retryable: true`：**`pending_token` 不作废**，用户点「重发」（§2.3b）即可，不必重输口令。**管理台测试发信（§4.12）用同一个码但回 `502`**：那是管理员手点的一次探活请求，没有「待决登录」可保留，`details` 只有 `{reason}` 摘要 | 是 |
@@ -2535,6 +2539,96 @@ DB 写失败**不回滚已生效的证书**（盘是真相，回滚才是更坏�
   `atomicWriteFile(path, pem, {mode: 0o600, root: dynamicDir})` 天然满足。**绝不**用 `chmod 644` 绕。
 - **`tls.yml`**：私钥只以**路径**出现。
 - 单测 `portal/test/tls-api.test.js` 的 ②⑧ 在响应体与审计 `details` 里搜 PEM/私钥片段；⑨ 钉住键集白名单。
+
+---
+
+### 4.14 文件上传（`POST /api/files/upload`，issue #472 片 B）
+
+用户把本地文件放进自己的牢笼目录（`GET /api/files/tree` / `GET /api/file` 的**入向对偶**）。
+能力位本身（谁能传）是片 A 的 `users.file_upload_enabled`，管理台 Edit → Security 里开；本节只写端点。
+
+#### 4.14-1 请求
+
+```
+POST /api/files/upload?cwd=<项目cwd或%7E>&path=<相对目录，缺省 .>&name=<文件名>[&overwrite=1]
+Content-Type: application/octet-stream
+Cookie: <会话 cookie>
+
+<原始文件字节>
+```
+
+| 位置 | 参数 | 语义 |
+|---|---|---|
+| query | `cwd` | 与 `GET /api/files/tree` **同一个值**（`~`、`~/projects/x`…）。缺省 = 牢笼根 |
+| query | `path` | `cwd` 下的相对目录，缺省 `.`。逐段拒 symlink（同 §4.11 的 jail 口径）|
+| query | `name` | **单段**文件名（含 `.` `..` `/` 控制符在内一律 `400 validation_failed` + `details.field='name'`）；上限 **255 字节**（UTF-8 字节数，不是字符数 —— ext4 的 `NAME_MAX` 是字节，按字符算会让中文名在 86 字就 `ENAMETOOLONG`）|
+| query | `overwrite` | **只有字面量 `1`** 算覆盖；缺省/`0`/`true`/其它一律「不覆盖」|
+| body | 原始字节 | ⚠ **不是 multipart**，也不是 JSON/base64：门户要传的就是磁盘上那份字节，multipart 的边界解析、内存缓冲、文件名编码问题全部不要 |
+
+#### 4.14-2 闸门顺序（顺序本身是判据）
+
+```
+① requireSession                    → 401 unauthorized
+② session.user.fde_name 为空        → 400 fde_name_required（没工位 ⇒ 没有落点）
+③ file_upload_enabled !== true      → 403 upload_disabled      ← 必须在读 body 之前
+④ receiveUpload(...)                → jail/名字/目标检查 → 流式落 temp → 提交
+```
+
+三条各自成立的理由：
+
+1. **能力位在读 body 之前（③）**。②③ 都在打开 temp、消费请求流**之前**抛出。上传的 body 是几十 MiB，
+   先收完再拒 ⇒ 没开权限的账号能用一个请求把 portal 的磁盘与带宽打一遍，而 portal 是全平台单点。
+   单测的钉法不是「响应码对」而是**「答复那一刻 `req` 的 `data` 事件数为 0」**
+   （`portal/test/http-upload.test.js`；⚠ 答复**之后** Node 会用 `_dump` 把没人读的 body 排空，
+   所以累计计数必然 >0 —— 判据必须取答复前的快照，否则这条变异不死）。
+2. **流式落盘，不把 body 读进内存**。逐 chunk 写 temp（`fsutil.writeTempFileFromStream`）+ `fsync` +
+   超限时**主动 destroy 流**并删 temp。默认上限 `FILE_UPLOAD_MAX_BYTES=33554432`（32 MiB，`docs/env.md`）。
+   反过来说：门户共用的 `MAX_BODY_BYTES`（64 KiB）**不适用**在这里 —— 那是 JSON 请求体的口径，
+   拿它卡上传会把所有真实文件判成 413。
+3. **no-clobber 用 `link`，不用 `rename`**。`rename(2)` **总是替换**目标，所以「先 `lstat` 看存在、
+   再 rename」这两步之间 agent（或另一个上传）创建了同名文件时会被**静默覆盖**。提交点用
+   `linkSync(temp, target)`：`EEXIST` ⇒ 清 temp + `409 file_exists`，这是唯一的硬判据；
+   `lstat` 那条只是「早退」的快速路径（省掉一次几十 MiB 的传输），**不是**安全依据。
+   `overwrite=1` 才走 `rename` 原子替换。目标是 symlink 时**无论 overwrite 一律 400**
+   （`rename` 替换的是链接本身 ⇒ 覆盖语义保不住 jail）。
+
+#### 4.14-3 落盘属主与模式（不是可选项）
+
+portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1），所以**必须**同时 chown 到
+`ctx.config.fdeUid` **和** `fdeGid`（`0660`）：只 chown uid 会留下 `gid=0`（root 组），
+容器内的 agent（uid=1000，主组=1000）就**改不动自己工位里刚传上来的文件** ——
+上传成功但用户/agent 后续写不进去，是比报错更难查的那种坏。口径与 §6.2 一致（组写位靠属组 + umask，不靠 setgid）。
+
+#### 4.14-4 响应
+
+| HTTP | 体 | 何时 |
+|---|---|---|
+| `201` | `{path, bytes, overwritten: false}` | 新建成功 |
+| `200` | `{path, bytes, overwritten: true}` | `overwrite=1` 且提交掉了旧内容 |
+| `400` | `validation_failed` / `upload_interrupted` | 名字或 path 形态非法 / 目标是一个目录或是 symlink / 传输中断（可重试）|
+| `403` | `upload_disabled` | 能力位不为 `true`（**未收 body**）|
+| `404` | `not_found` | `cwd`/`path` 指向的目录不存在 |
+| `409` | `file_exists` | 目标已存在且没带 `overwrite=1`（快速路径或提交点竞态，同一个码）|
+| `413` | `file_too_large` | 超过 `FILE_UPLOAD_MAX_BYTES`，`details = {max_bytes, bytes}` |
+
+`path` 是**相对牢笼根**的路径（与 `GET /api/files/tree`、预览端点同口径），不是绝对路径。
+**任何失败路径都不留 `.tmp` 残骸**（超限、断流、提交失败都先 unlink temp）。
+
+#### 4.14-5 前端契约（三态 + 409）
+
+- 按钮渲染条件：`auth.user?.file_upload_enabled === true`。**不是 `!== false`**：缺键的含义是
+  「这个 DTO 没告诉我」（旧服务端/旧会话形状），此时给一个点了必 403 的按钮比不给更坏。
+- 409 ⇒ `window.confirm` 问「要不要覆盖」，**确认之前零请求**；确认了才**只对这一个文件**重发
+  `overwrite=1`（批量里其余文件各自判自己的 409）。选「不覆盖」= 静默跳过，不算失败。
+- 上传必须走 `api()`（`portal/frontend/src/api.ts`）而不是裸 `fetch`：裸 fetch 丢掉 `ApiError.code`、
+  #255 受限会话跳转与 `details`，前端会把 403/413/409 全糊成「请求失败」。
+- 成功后 `emit('files-changed')` ⇒ `WorkbenchView` 重判收工灯（新文件未跟踪 ⇒ 灯该变红，D9
+  「红是进度不是警报」）。不重判 = 灯在骗人。
+
+> 实现：`portal/src/http.js`（handler 与闸门）、`portal/src/dirs.js`（`receiveUpload`）、
+> `portal/src/fsutil.js`（`writeTempFileFromStream` / `commitTempFileNoClobber`）。
+> 单测：`portal/test/file-upload.test.js`（单元：jail/名字/属主/no-clobber/残骸）、
+> `portal/test/http-upload.test.js`（HTTP 级：零读取判据、线上 DTO、上限、断流、受限会话门）。
 
 ---
 
