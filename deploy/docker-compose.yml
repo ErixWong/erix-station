@@ -197,6 +197,11 @@ services:
       ERIX_MAX_ROUNDS: ${ERIX_MAX_ROUNDS:-16}
       ERIX_AGENTD_CAPACITY: ${ERIX_AGENTD_CAPACITY:-2}
       ERIX_ARTIFACT_MAX_BYTES: ${ERIX_ARTIFACT_MAX_BYTES:-104857600}
+      # issue #472 片 B：工作台「上传」的单文件字节上限。⚠ portal 的 environment 是**显式列表、无 env_file**
+      # ⇒ 不写这一行，运维在 deploy/.env 里改 FILE_UPLOAD_MAX_BYTES 根本不生效（评审 major 8）。
+      # 默认值与 `portal/src/config.js` 的 `fileUploadMaxBytes` 必须同值（32 * 1024 * 1024 = 33554432），
+      # 两头一致性由 `portal/test/deploy-env-defaults.test.js` 机器判据钉住。
+      FILE_UPLOAD_MAX_BYTES: ${FILE_UPLOAD_MAX_BYTES:-33554432}
       ERIX_ARTIFACT_CAPTURE_BUDGET_MS: ${ERIX_ARTIFACT_CAPTURE_BUDGET_MS:-60000}
       ERIX_SHELL_TIMEOUT_MS: ${ERIX_SHELL_TIMEOUT_MS:-60000}
       ERIX_SHELL_MAX_TIMEOUT_MS: ${ERIX_SHELL_MAX_TIMEOUT_MS:-600000}

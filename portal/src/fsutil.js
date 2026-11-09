@@ -147,7 +147,10 @@ export function writeTempFile(target, content, { mode = 0o644, uid = null, gid =
 export async function writeTempFileFromStream(target, stream, { maxBytes = null, mode = 0o660, uid = null, gid = null, root = null } = {}) {
   if (root) assertSafePath(root, target);
   const dir = path.dirname(target);
-  const tmp = path.join(dir, `${path.basename(target)}.${randomHex(4)}.tmp`);
+  // temp 名与 target 名**无关**（与 writeTempFile 的 `<name>.<hex>.tmp` 刻意不同）：目标名可以合法地长到
+  // 255 字节（NAME_MAX，B-6 的边界用例），往后缀会变成 255+14 字节 ⇒ `ENAMETOOLONG`，一个合法文件反而传不上去。
+  // `.upload-<hex>.tmp` 定长 20 字节，同时让「残留清扫」能用一个 glob 说清（判据里就按这个形状断）。
+  const tmp = path.join(dir, `.upload-${randomHex(6)}.tmp`);
   let fd;
   try {
     fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
