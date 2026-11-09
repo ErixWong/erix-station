@@ -18,6 +18,13 @@
 // 契约口径：心跳 body 里 `agent_version` = **erix-agent（引擎）版本**（`docs/api/portal.md` U4 就这么
 // 定义的），runner 自己的版本另放 `runner_version`，构建 revision 放 `build_revision`。
 
+// ⚠ revision / built_at 的来源：**构建期 ARG**（`STATION_REVISION` / `STATION_BUILD_DATE`），
+// 由 `.github/workflows/release.yml` 步骤⑤ 传入；CI 的 `ci.yml` 步骤⑤ 也传（值不同、形状相同）。
+// 2026-11-09 之前这两个 ARG **谁都没传** ⇒ 镜像里 `revision`/`built_at` 恒 `unknown`，
+// 两个 OCI label 也是空的（v0.1.53 实测）——「版本作为构建产物」当时只做到 station/engine 两格。
+// 检查点是 `ci.yml` 步骤 ⑤′：`docker run --entrypoint cat` 读回 build-info.json 后逐格断言
+// （station_version == 仓库 pin、revision == 本次 commit、engine_version 非 unknown、built_at 非 unknown）。
+
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
