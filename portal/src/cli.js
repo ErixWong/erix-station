@@ -12,6 +12,7 @@ import { startMaterializerLoop } from './materializer.js';
 import { startOnboardingLoop } from './onboarding.js';
 import { startOffboardingLoop } from './offboarding.js';
 import { startRoutesLoop } from './routes.js';
+import { startRouteDriftMonitor } from './routesdrift.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
 import {
   createDockerClient,
@@ -65,6 +66,8 @@ async function serve() {
   const onboardingLoop = startOnboardingLoop(pool, config);
   const offboardingLoop = startOffboardingLoop(pool, config);
   const routesLoop = startRoutesLoop(pool, config);
+  // issue #474 S3 一期：动态文件漂移**只读**对账（60s + 启动一次；只 warn + 审计，绝不写盘）。
+  const driftMonitor = startRouteDriftMonitor(pool, config);
   const provisionerLoop = startProvisionerLoop(pool, config);
   const reaperLoop = startReaperLoop(pool);
   server.listen(config.port, config.host, () => {
@@ -86,6 +89,7 @@ async function serve() {
     onboardingLoop.stop();
     offboardingLoop.stop();
     routesLoop.stop();
+    driftMonitor.stop();
     provisionerLoop.stop();
     reaperLoop.stop();
     server.close(() => process.exit(0));

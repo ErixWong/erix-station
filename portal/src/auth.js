@@ -147,7 +147,7 @@ export async function authenticate(pool, login, password, { log } = {}) {
   // 登录响应用的是顶层的 `password_change_required`（见 http.js），两条各自自己的口径。
   // #449：同理多读 `email`（只用于第二因素选择与发信，**不进 user DTO**）。
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, file_upload_enabled
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, mail_otp_enabled, file_upload_enabled
        FROM users WHERE login = $1 AND status = 'active'`,
     [login],
   );

@@ -54,6 +54,12 @@ export const en = {
     emailResendIn: 'Resend in {seconds}s',
     emailResendFailed: 'Send again',
     emailBackToPassword: '← Back to the previous step',
+    // issue #449 second-factor choice (`second_factor_choice`): the two switch links and the notice shown
+    // when the email channel is down. Wording matches the store: switching reuses the same pending_token,
+    // so do not promise a resend here.
+    useEmailCode: 'Use an email code instead',
+    useTotp: 'Use your authenticator app (TOTP) instead',
+    emailChannelUnavailable: 'Email is unavailable right now — please use your authenticator app.',
   },
   // #255 forced first-login password change (views/ForcePasswordChangeView.vue). Restricted session
   // escape hatch (portal.md §2.11a). No hard-coded port/host; no promise about a minimum length
@@ -914,8 +920,12 @@ export const en = {
     mailOtpSection: 'Email verification code',
     mailOtpHint: 'Require an emailed code as the second factor for this user. This is a per-user switch, parallel to TOTP; the mail channel (SMTP) only decides whether mail can be sent at all.',
     mailOtpEnabledLabel: 'Require an emailed code at sign-in',
-    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor). Accounts with TOTP always use TOTP and ignore this.',
-    mailOtpHiddenByTotp: 'This account has TOTP enrolled — sign-in uses TOTP, so this switch has no effect.',
+    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor).',
+    // #449 second-factor choice (`second_factor_choice`): for accounts with TOTP enrolled this switch is no
+    // longer inert — it adds a second way in. The audit wording matters: the weaker path is logged as
+    // `email_code_alt`, so operators must be able to see that from this very row.
+    mailOtpEnabledLabelAlt: 'Email code (as an alternative to TOTP)',
+    mailOtpAltHint: 'This account has TOTP enrolled. Once enabled, sign-in accepts either TOTP or an emailed code; the email-code path is recorded in the audit log as email_code_alt.',
     mailOtpCurrentEmail: 'Codes will be sent to: {email}',
     mailOtpNeedsEmail: 'This user has no email yet — fill it in on the Profile tab first.',
     mailOtpSaved: 'Email-code setting saved.',
