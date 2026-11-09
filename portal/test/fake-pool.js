@@ -23,6 +23,16 @@ export class FakePool {
     this.statements = [];
   }
 
+  /**
+   * #472 片 A：fake 的「按 SQL 说的做」（AGENTS §8.14）—— 只有 SELECT 里真的写了 `file_upload_enabled`
+   * 才回这一列。产品代码漏补列 ⇒ 行里拿不到它 ⇒ `=== true` 得 false ⇒ 用例会红，
+   * 而不是被 fake 好心兼平成假绿。值**不做布尔兼平**：`'f'` / `0` / `undefined` 这些形状留着，
+   * 那正是 A-3 要钉的东西。
+   */
+  projectFileUpload(sql, user) {
+    return /\bfile_upload_enabled\b/.test(sql) ? { file_upload_enabled: user.file_upload_enabled } : {};
+  }
+
   async query(sql, params = []) {
     this.statements.push({ sql, params });
     if (sql.includes('schema_migrations')) {
@@ -33,7 +43,8 @@ export class FakePool {
     if (sql.includes('FROM users WHERE login')) {
       const login = params[0];
       const u = this.users.find((x) => x.login === login && x.status === 'active');
-      return { rows: u ? [u] : [] };
+      // #472：SELECT 里没 `file_upload_enabled` 就不回这一列（fake 不兼平，见 `projectFileUpload`）。
+      return { rows: u ? [{ ...u, ...this.projectFileUpload(sql, u) }] : [] };
     }
 
     // hasTotpEnrollment：NULL 与空字符串均表示未注册。
@@ -60,6 +71,8 @@ export class FakePool {
           auth_source: u.auth_source,
           email: u.email ?? null,
           must_change_password: u.must_change_password === true,
+          // #472：同上（`loadActiveUser` 的 SELECT）。
+          ...this.projectFileUpload(sql, u),
         }],
       };
     }
@@ -68,7 +81,8 @@ export class FakePool {
     if (sql.includes('FROM users WHERE id') && sql.includes('totp_secret')) {
       const userId = params[0];
       const u = this.users.find((x) => x.id === userId && x.status === 'active');
-      return { rows: u ? [u] : [] };
+      // #472：同上（`verifyTotpForUser` 的 SELECT）。
+      return { rows: u ? [{ ...u, ...this.projectFileUpload(sql, u) }] : [] };
     }
 
     // createPendingToken
@@ -153,6 +167,8 @@ export class FakePool {
             session_id: s.id,
             expires_at: s.expires_at,
             last_seen_at: s.last_seen_at,
+            // #472：同上（`findSessionUser` 的 SELECT 里写的是 `u.file_upload_enabled`）。
+            ...this.projectFileUpload(sql, u),
           },
         ],
       };
