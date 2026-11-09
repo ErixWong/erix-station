@@ -176,7 +176,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 构建上下文/dockerfile 一律照抄仓库现状，**不传 proxy build args**：
+      # 构建上下文/dockerfile 一律照抄仓库现状，**不传 proxy build args**（FDE 另传三个版本 ARG，见步骤⑤）：
       # runner/Dockerfile:55-74 从 github.com / dl.gitea.io / gitlab.com 直连下载 gh/tea/glab，
       # 本机在墙内要 HTTP_PROXY/HTTPS_PROXY/NO_PROXY + --network=host（fde-image.mjs:26-40），
       # GitHub runner 直连可达；而 build args 参与 Docker 缓存键 ⇒ CI 恒不传，保持稳定。
@@ -195,7 +195,32 @@ jobs:
           set -euo pipefail
           docker buildx build --load \
             --tag "${IMG_FDE}:ci-${GITHUB_SHA::7}" \
+            --build-arg STATION_VERSION="$(node -p "require('./package.json').version")" \
+            --build-arg STATION_REVISION="$GITHUB_SHA" \
+            --build-arg STATION_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             runner/
+
+      # ---- ⑤′ build-info.json tripwire（issue #404 结案时留的第三问：「谁在检查」）----
+      # 只构建不检查 = 版本没烘进去也没人知道（v0.1.53 实测 build-info.json 的 revision/built_at 与两个
+      # OCI label 全是 unknown/空，就是因为 release.yml 从没传过这三个 ARG）。这里把它们变成红格：
+      # 三个 ARG 只影响 Dockerfile 末尾那一层（ARG 声明在末尾），所以这一步不额外增加构建成本。
+      - name: '构建校验：FDE 镜像的 build-info.json（版本/修订真烘进去了吗）'
+        if: needs.gate.outputs.build_fde == 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint cat "${IMG_FDE}:ci-${GITHUB_SHA::7}" /opt/erix/build-info.json > /tmp/build-info.json
+          cat /tmp/build-info.json
+          WANT_VERSION="$(node -p "require('./package.json').version")" WANT_REVISION="$GITHUB_SHA" node -e '
+            const fs = require("node:fs");
+            const j = JSON.parse(fs.readFileSync("/tmp/build-info.json", "utf8"));
+            const bad = [];
+            if (j.station_version !== process.env.WANT_VERSION) bad.push("station_version 期望 " + process.env.WANT_VERSION + "，实得 " + j.station_version);
+            if (j.revision !== process.env.WANT_REVISION) bad.push("revision 期望 " + process.env.WANT_REVISION + "，实得 " + j.revision);
+            if (!j.engine_version || j.engine_version === "unknown") bad.push("engine_version 是 unknown —— 引擎版本没烘进去");
+            if (!j.built_at || j.built_at === "unknown") bad.push("built_at 是 unknown —— 没传 STATION_BUILD_DATE");
+            if (bad.length) { console.error("::error::build-info.json 不合格：" + bad.join("；")); process.exit(1); }
+            console.log("build-info.json OK：" + j.station_version + " / engine " + j.engine_version + " / " + j.revision.slice(0, 7) + " / " + j.built_at);
+          '
 
       - name: '构建校验：fde-proxy 镜像（context = deploy/fde-proxy）'
         if: needs.gate.outputs.build_proxy == 'true'
