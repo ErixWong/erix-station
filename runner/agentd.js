@@ -24,7 +24,9 @@ import { MSG, normalizeRoundRecord, sendIpc } from './lib/ipc.js';
 import { readBuildInfo } from './lib/build-info.js';
 import { drainRuns } from './lib/drain.js';
 import { parseHeartbeatModels } from './lib/llm-models.js';
-import { archiveRunData, prepareRunDataDir, prepareSessionNotesDir, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
+// delegation P1：开关的**唯一解析口径**与 worker 侧同源（两面各自 `=== '1'` 就会分叉）。
+import { isDelegateEnabled } from './lib/config.js';
+import { archiveRunData, prepareRunDataDir, prepareSessionNotesDir, prepareDelegationDirs, sweepRunDataDir, touchRunDataDir } from './lib/run-data.js';
 import { captureAndUploadArtifact } from './lib/artifacts.js';
 // 端口呈现优化·观测层 MVP（迁移 0022）：/proc 采样当前真实监听，随 U4 heartbeat 捐带 `listeners`。
 // 只读展示用途，不做管控（#246 不变式）；采样失败只报空数组，绝不拖死心跳。
@@ -1314,6 +1316,23 @@ async function handleTicket(ticket) {
     }
   }
 
+  // delegation P1（2026-11-08）：**预建子 run 的名册 / 租约 / 账本三个目录**。
+  // 不能指望 worker 自己建：agentd 跑 1001、worker 跑 1002，agentd 建的 755 目录 worker 写不进
+  // （同 notes 目录的先例）。**只在开关开时建**（不开就别落三个没人用的空目录）。
+  // ⚠ 失败**只 warn、不 requeue**：delegation 是加分项，不能因此把 run 打死（同 notes 的降级口径），
+  // 情同 `session notes dir prep failed`。worker 拿到空 `delegation_dir` 会退回 `$HOME/delegation` 并 warn。
+  ctx.delegationDir = null;
+  if (isDelegateEnabled(process.env.ERIX_DELEGATE_ENABLED)) {
+    try {
+      ctx.delegationDir = prepareDelegationDirs(CFG.home, {
+        workerUid: CFG.workerUid, workerGid: CFG.workerGid,
+      });
+    } catch (err) {
+      log('warn', 'delegation dirs prep failed, delegate may fall back to an unwritable path',
+        { run_id: runId, err: String(err?.message ?? err) });
+    }
+  }
+
   // 先 PUT running（§6.1：准备就绪后）。worker 内部 runToolLoop 也会 markRunState('running')，幂等。
   try {
     await internalRequest('PUT', `/runs/${runId}/state`, { body: { state: 'running' }, claimToken: ctx.claimToken });
@@ -1345,6 +1364,9 @@ async function handleTicket(ticket) {
     // 无 session_id（无本子的工单/旧下行）⇒ 逐字退回旧的 run 级目录。会话目录备不出来时
     // **降级到 run 级 + warn**，不因此把 run 打死（笔记是加分项，`run_data_failed` 那种崩法不适用于它）。
     notes_dir: ctx.notesDir ?? path.join(ctx.runDataPath, 'notes'),
+    // delegation P1：**路径只有一个真相源**（agentd 预建并改属主 ⇒ 1002 的 worker 写得进去）。
+    // 不给下行面就不预建、只建不属主是同一个坑的两个面 ⇒ 这里与上面是**同一个判断**的两种说法。
+    ...(ctx.delegationDir ? { delegation_dir: ctx.delegationDir } : {}),
     config: { model_config_path: path.join(CFG.home, '.erix', 'config.json') },
     // issue #38 Phase B2：模型快照，run 边界生效——此处取的是 **run 启动瞬间**的 state.llmModels，
     // 之后心跳刷新 state.llmModels 不影响本 run（进行中 run 的模型名在其生命周期内锁定）。

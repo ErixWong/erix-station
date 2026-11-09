@@ -30,7 +30,11 @@ type EditTab = 'profile' | 'security' | 'llm' | 'ports' | 'danger';
 const editTab = ref<EditTab>('profile');
 const deleteUserId = ref<string | null>(null);
 const returnToEditAfterDelete = ref(false);
-const editForm = reactive({ display_name: '', role: 'fde' as AdminUser['role'], fde_name: '' });
+const editForm = reactive({
+  display_name: '', email: '', role: 'fde' as AdminUser['role'], fde_name: '',
+  // 2026-11-06：per-user 邮件验证码开关（与 TOTP 对称，管理员在 Security 里设）。
+  mail_otp_enabled: false,
+});
 const resetPasswordValue = ref('');
 const deleteConfirmation = ref('');
 const copiedTotpValue = ref('');
@@ -285,6 +289,8 @@ function clearSectionFeedback() {
   passwordMessage.value = '';
   totpError.value = '';
   totpMessage.value = '';
+  mailOtpError.value = '';
+  mailOtpMessage.value = '';
 }
 
 function openEditModal(user: AdminUser) {
@@ -294,6 +300,8 @@ function openEditModal(user: AdminUser) {
   portsPaneMounted.value = false;
   editModalOpen.value = true;
   editForm.display_name = user.display_name ?? '';
+  editForm.email = user.email ?? '';
+  editForm.mail_otp_enabled = user.mail_otp_enabled === true;
   editForm.role = user.role;
   editForm.fde_name = user.fde_name ?? '';
   resetPasswordValue.value = '';
@@ -361,6 +369,8 @@ async function saveProfile() {
   try {
     const error = await admin.updateUser(user.id, {
       display_name: editForm.display_name.trim(),
+      // 留空 ⇒ 清空（`null`）。#449 的邮箱验证码通道需要它；清空后该账号只能走 TOTP 或口令。
+      email: editForm.email.trim() || null,
       role: editForm.role,
       fde_name: editForm.fde_name.trim() || null,
     });
@@ -392,6 +402,34 @@ async function submitPasswordReset() {
     }
   } finally {
     passwordBusy.value = false;
+  }
+}
+
+// 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。与 TOTP 那块对称：单独保存、单独反馈。
+const mailOtpBusy = ref(false);
+const mailOtpError = ref('');
+const mailOtpMessage = ref('');
+async function saveMailOtp() {
+  const target = editUser.value;
+  if (!target) return;
+  mailOtpError.value = '';
+  mailOtpMessage.value = '';
+  mailOtpBusy.value = true;
+  try {
+    const error = await admin.updateUser(target.id, {
+      mail_otp_enabled: editForm.mail_otp_enabled,
+    });
+    if (error) {
+      mailOtpError.value = error;
+      return;
+    }
+    // `editUser` 是 computed（跟着 admin.users 走）⇒ 服务端回读后界面自动更新；
+    // 这里再把本地 checkbox 对齐一次，避免「界面开了但服务端没改」的错觉。
+    const fresh = admin.users.find((u) => u.id === target.id);
+    if (fresh) editForm.mail_otp_enabled = fresh.mail_otp_enabled === true;
+    mailOtpMessage.value = t('admin.fde.mailOtpSaved');
+  } finally {
+    mailOtpBusy.value = false;
   }
 }
 
@@ -1014,6 +1052,17 @@ onBeforeUnmount(() => {
             <input v-model="editForm.display_name" autocomplete="off" class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black">
           </label>
           <label class="flex flex-col gap-1 text-xs text-black/55">
+            {{ t('admin.fde.emailLabel') }}
+            <input
+              v-model="editForm.email"
+              data-test="edit-email"
+              type="email"
+              autocomplete="off"
+              placeholder="user@example.com"
+              class="rounded-md border border-black/20 px-2 py-1.5 text-sm text-black"
+            >
+          </label>
+          <label class="flex flex-col gap-1 text-xs text-black/55">
             {{ t('admin.fde.colRole') }}
             <select v-model="editForm.role" class="rounded-md border border-black/20 bg-white px-2 py-1.5 text-sm text-black">
               <option value="fde">{{ t('admin.fde.roleFde') }}</option>
@@ -1121,6 +1170,41 @@ onBeforeUnmount(() => {
               class="rounded-md bg-red-700 px-3 py-1.5 text-sm text-white hover:bg-red-800 disabled:opacity-50"
               @click="confirmTotpReset"
             >{{ t('admin.fde.confirmTotpReset') }}</button>
+          </div>
+        </section>
+
+        <!-- 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。与上面 TOTP 那块对称：
+             管理员显式打开后，该用户登录才走邮箱验证码；全局 transport=disabled 仍压过它。 -->
+        <section class="rounded-lg border border-black/10 p-3" data-test="mail-otp-section">
+          <h3 class="font-semibold">{{ t('admin.fde.mailOtpSection') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.mailOtpHint') }}</p>
+          <label class="mt-3 flex items-start gap-2 text-sm">
+            <input
+              v-model="editForm.mail_otp_enabled"
+              data-test="mail-otp-enabled"
+              type="checkbox"
+              class="mt-0.5"
+            >
+            <span>
+              {{ t('admin.fde.mailOtpEnabledLabel') }}
+              <span class="block text-xs text-black/50">{{ t('admin.fde.mailOtpEnabledHint') }}</span>
+            </span>
+          </label>
+          <p v-if="editUser.totp_enabled" class="mt-2 text-xs text-black/50">{{ t('admin.fde.mailOtpHiddenByTotp') }}</p>
+          <p v-if="editUser.email" class="mt-2 text-xs text-black/50">
+            {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
+          </p>
+          <p v-else class="mt-2 text-xs text-amber-700">{{ t('admin.fde.mailOtpNeedsEmail') }}</p>
+          <p v-if="mailOtpError" class="syserr mt-2" role="alert">{{ mailOtpError }}</p>
+          <p v-if="mailOtpMessage" class="mt-2 text-sm text-green-700" role="status">{{ mailOtpMessage }}</p>
+          <div class="mt-3 flex justify-end">
+            <button
+              type="button"
+              data-test="save-mail-otp"
+              :disabled="mailOtpBusy || (editForm.mail_otp_enabled && !editUser.email)"
+              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
+              @click="saveMailOtp"
+            >{{ t('admin.fde.saveMailOtp') }}</button>
           </div>
         </section>
       </section>

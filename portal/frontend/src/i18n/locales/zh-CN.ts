@@ -520,6 +520,32 @@ export const zhCN = {
     empty: '该范围暂无会话',
     staleListKept: '（旧列表已保留）',
   },
+  // 子 run（delegation）只读抽屉 + 工具卡（issue #delegate P3）。
+  // 状态键集 = `lib/delegate.ts#DELEGATE_ROSTER_STATES` 的 7 值 + `unknown`（脏值/缺位的中性态），
+  // 分级尺规在 `delegateBadgeKind`，这里只出文案；`viewerTitle` 带短码占位 `{id}`。
+  delegate: {
+    openViewer: '查看子任务',
+    closeViewer: '关闭子任务',
+    viewerTitle: '子任务 {id}',
+    refresh: '刷新',
+    polling: '运行中，自动刷新',
+    truncated: '只加载了最近一段，更早的记录未包含在内',
+    viewer: {
+      starting: '子任务正在启动，暂无输出',
+      empty: '这个子任务没有留下任何输出',
+      error: '读取子任务输出失败',
+    },
+    state: {
+      queued: '排队中',
+      running: '运行中',
+      completed: '已完成',
+      failed: '失败',
+      aborted: '已停止',
+      timeout: '超时',
+      interrupted: '已中断',
+      unknown: '状态未知',
+    },
+  },
   // 文件预览 modal（components/FilePreviewModal.vue）
   preview: {
     title: '预览 {path}',
@@ -923,6 +949,15 @@ export const zhCN = {
     },
     // FDE 用户区（AdminView #fdeSection）
     fde: {
+    mailOtpSection: '邮件验证码',
+    mailOtpHint: '为该用户启用邮箱验证码作为第二因素。这是按用户的开关，与 TOTP 并列；邮件通道（SMTP）只决定「能不能发信」。',
+    mailOtpEnabledLabel: '登录时要求邮箱验证码',
+    mailOtpEnabledHint: '关闭时该用户只用口令登录（没有第二因素）。已绑定 TOTP 的账号始终走 TOTP，此项不生效。',
+    mailOtpHiddenByTotp: '该账号已绑定 TOTP —— 登录会走 TOTP，本开关不影响。',
+    mailOtpCurrentEmail: '验证码将发到：{email}',
+    mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
+    mailOtpSaved: '邮件验证码设置已保存。',
+    saveMailOtp: '保存邮件验证码设置',
       sectionTitle: 'FDE 用户',
       emptyUsers: '暂无用户。',
       noFdeName: '无 fde_name',

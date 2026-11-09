@@ -488,6 +488,32 @@ export const en = {
     empty: 'No sessions in this scope',
     staleListKept: '(previous list kept)',
   },
+  // Sub-run (delegation) read-only drawer + tool card (issue #delegate P3).
+  // Key set = the 7 `DELEGATE_ROSTER_STATES` values + `unknown` (missing/dirty state);
+  // badge grading lives in `delegateBadgeKind`, this file only holds copy. `viewerTitle` takes `{id}`.
+  delegate: {
+    openViewer: 'View sub-task',
+    closeViewer: 'Close sub-task',
+    viewerTitle: 'Sub-task {id}',
+    refresh: 'Refresh',
+    polling: 'Running, refreshing automatically',
+    truncated: 'Only the most recent entries are loaded; older records are not included',
+    viewer: {
+      starting: 'The sub-task is starting, no output yet',
+      empty: 'This sub-task left no output',
+      error: 'Failed to load the sub-task output',
+    },
+    state: {
+      queued: 'Queued',
+      running: 'Running',
+      completed: 'Completed',
+      failed: 'Failed',
+      aborted: 'Aborted',
+      timeout: 'Timed out',
+      interrupted: 'Interrupted',
+      unknown: 'Unknown state',
+    },
+  },
   preview: {
     title: 'Preview {path}',
     download: 'Download',
@@ -885,6 +911,15 @@ export const en = {
       forceSave: 'No impact — force save',
     },
     fde: {
+    mailOtpSection: 'Email verification code',
+    mailOtpHint: 'Require an emailed code as the second factor for this user. This is a per-user switch, parallel to TOTP; the mail channel (SMTP) only decides whether mail can be sent at all.',
+    mailOtpEnabledLabel: 'Require an emailed code at sign-in',
+    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor). Accounts with TOTP always use TOTP and ignore this.',
+    mailOtpHiddenByTotp: 'This account has TOTP enrolled — sign-in uses TOTP, so this switch has no effect.',
+    mailOtpCurrentEmail: 'Codes will be sent to: {email}',
+    mailOtpNeedsEmail: 'This user has no email yet — fill it in on the Profile tab first.',
+    mailOtpSaved: 'Email-code setting saved.',
+    saveMailOtp: 'Save email-code setting',
       sectionTitle: 'FDE users',
       emptyUsers: 'No users yet.',
       noFdeName: 'no fde_name',

@@ -42,6 +42,7 @@ import { createMailProvider } from './mail-provider.js'; // #449：SMTP 配置�
 import * as mailSettings from './mail-settings.js'; // #449：管理台邮件通道配置（写侧 + 测试发信）
 import * as loginEmailCode from './login-email-code.js'; // #449：登录第二因素「邮箱验证码」
 import * as tlsCert from './tls-cert.js'; // #456：管理台证书生命周期（上传/校验/回滚）
+import * as delegation from './delegation.js'; // 子 run（delegation）读侧：名册 + 账本两个只读端点
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -747,6 +748,12 @@ export function createServer({
         sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
         return;
       }
+      if (err instanceof delegation.DelegationError) {
+        // 子 run 读侧：只用既有错误码（not_found / validation_failed / payload_too_large / internal），
+        // httpStatus 自带在错误上 ⇒ 零新码、零新映射规则。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        return;
+      }
       log.error?.('[portal] unhandled:', err);
       if (!res.headersSent) sendJson(res, 500, errorBody('internal', 'internal error'));
       else res.destroy();
@@ -1092,6 +1099,18 @@ async function routeApi(req, res, ctx, url) {
     const foldedMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/folded\/(\d+)$/);
     return handleSessionFoldedPayload(req, res, ctx, decodeUuid(foldedMatch[1]), Number(foldedMatch[2]));
   }
+  // 子 run（delegation）两个只读端点（docs/api/portal.md §4.4c、docs/design/delegation-2026-11-08.md §5）。
+  // 鉴权同 GET /api/sessions/:id（属主校验在 delegation.js 的 fetchSession 里，404 不泄露存在性）。
+  // 显式排在 `/events` 之前：路径不冲突，排序只为表达「只读快照」与「SSE 实时」是两条通路。
+  // ⚠ `runId` 是**必填** query 参数（名册按父 run 分片 ⇒ 没有父身份就不知道该读哪个目录）；
+  //   `childRunId` 走路径段，两个 id 的形态校验一律在 delegation.js 里（正则 + 前缀断言，P2 红线）。
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/delegates$/.test(pathname)) {
+    return handleSessionDelegates(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/delegates$/)[1]));
+  }
+  if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/delegates\/([^/]+)$/.test(pathname)) {
+    const dMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/delegates\/([^/]+)$/);
+    return handleSessionDelegateTranscript(req, res, ctx, decodeUuid(dMatch[1]), decodeUuid(dMatch[2]));
+  }
   if (req.method === 'GET' && /^\/api\/sessions\/([^/]+)\/events$/.test(pathname)) {
     return handleSessionStream(req, res, ctx, decodeUuid(pathname.match(/^\/api\/sessions\/([^/]+)\/events$/)[1]));
   }
@@ -1390,6 +1409,18 @@ async function handleAdminApi(req, res, ctx, url) {
     if (action === null && req.method === 'PATCH') {
       requireJson(req);
       const body = await readJsonBody(req, ctx.config.maxBodyBytes);
+      // 2026-11-06：打开「邮件验证码」开关前必须确认 SMTP 真能用。
+      // 全局 `transport` 不再是功能闸（per-user 开关说了算），所以「开关开着但发不出信」会变成
+      // 「这个人登不进去」——在保存这一刻拦住，比让他到登录页才发现便宜得多。
+      // 关掉开关 / 改别的字段不受影响（不碰 mailer，避免通道抖动时连资料都改不了）。
+      if (body && typeof body === 'object' && body.mail_otp_enabled === true) {
+        const mailer = await ctx.mailerProvider.get();
+        if (mailer.enabled !== true) {
+          throw new HttpError(400, 'validation_failed',
+            '邮件通道未配置或不可用，无法为该用户启用邮件验证码（请先在「邮件通道」里配置并测试）',
+            { details: { field: 'mail_otp_enabled' } });
+        }
+      }
       return sendJson(res, 200, await admin.updateUser(ctx.pool, userId, body, { actorId: session.user.id }));
     }
     if (action === null && req.method === 'DELETE') {
@@ -2618,6 +2649,58 @@ async function handleSessionFoldedPayload(req, res, ctx, sessionId, round) {
   return sendJson(res, 200, result);
 }
 
+/**
+ * GET /api/sessions/:id/delegates?runId=<parentRunId> —— 某个父 run 的子 run 名册（只读，零审计）。
+ * 属主校验 / 父 run 归属 / 路径解析全在 `delegation.js`，与 `GET /api/sessions/:id` 同一个 404 口径。
+ */
+async function handleSessionDelegates(req, res, ctx, sessionId) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://x');
+  const result = await delegation.listDelegates({
+    pool: ctx.pool,
+    sessionId,
+    userId: session.user.id,
+    parentRunId: requireDelegateRunId(url),
+    userSpaceRoot: ctx.config.userSpaceRoot,
+  });
+  return sendJson(res, 200, result);
+}
+
+/**
+ * GET /api/sessions/:id/delegates/:childRunId?runId=<parentRunId>&tail=N —— 子 run 账本的只读投影。
+ * `tail` 缺省 100、硬上限 500（越界 400 `validation_failed`，`details.field='tail'`）。
+ * ⚠ `tail` 只做 `Number()`，**整数与范围不在这里判**：判据只有一份（`delegation.js`），
+ *    那里才带得出 `details.field`；此处重复一遍就等于埋下两把尺。
+ */
+async function handleSessionDelegateTranscript(req, res, ctx, sessionId, childRunId) {
+  const session = await requireSession(req, ctx);
+  const url = new URL(req.url, 'http://x');
+  const tailRaw = url.searchParams.get('tail');
+  const result = await delegation.getDelegateTranscript({
+    pool: ctx.pool,
+    sessionId,
+    userId: session.user.id,
+    parentRunId: requireDelegateRunId(url),
+    childRunId,
+    tail: tailRaw == null || tailRaw === '' ? undefined : Number(tailRaw),
+    userSpaceRoot: ctx.config.userSpaceRoot,
+  });
+  return sendJson(res, 200, result);
+}
+
+/**
+ * `runId` 是**必填** query 参数（名册按父 run 分片 ⇒ 没有父身份就不知道该读哪个目录）。
+ * 缺席/空串 ⇒ 400；形状（uuid）交给 `delegation.js` 的单点校验（同一个 `details.field='runId'`）。
+ * `decodeUuid` 只为归一化小写：名册目录名是引擎写的小写值，拿大写串去拼目录会恒 miss。
+ */
+function requireDelegateRunId(url) {
+  const raw = url.searchParams.get('runId');
+  if (raw == null || raw === '') {
+    throw new HttpError(400, 'validation_failed', 'runId 必填（父 run id）', { details: { field: 'runId' } });
+  }
+  return decodeUuid(raw);
+}
+
 async function handleSessionEventsHistory(req, res, ctx, sessionId) {
   const session = await requireSession(req, ctx);
   const own = await ctx.pool.query(
@@ -2832,12 +2915,20 @@ async function handleLoginStep1(req, res, ctx) {
   //   ② 未注册 + 邮件通道启用 + 有邮箱 → email_code_required
   //   ③ 未注册 + 邮件通道启用 + 无邮箱 → 409 email_not_registered（**绝不静默退回口令**）
   //   ④ 邮件通道未启用（默认）  → 口令直通，但审计 method 标明「没有第二因素」
+  const mailer = await ctx.mailerProvider.get();
   const secondFactor = loginEmailCode.chooseSecondFactor({
     hasTotpEnrollment: await auth.hasTotpEnrollment(pool, result.user.id),
-    // 邮件通道是否启用 = DB 配置 + 急停开关的结果（`mail-provider.js`，60s 缓存）；读失败降级为 disabled。
-    mailEnabled: (await ctx.mailerProvider.get()).enabled,
+    // 2026-11-06：**唯一**判据是 per-user 开关（迁移 0028）。全局 `transport` 只是 SMTP 连接配置，
+    // 不再一票否决 —— 否则「管理员打开了开关、界面显示已启用、实际永远走口令」是必然的死光纤。
+    mailOtpEnabled: result.mailOtpEnabled === true,
     email: result.email,
   });
+  // 开关开着但 SMTP 没配 / 不可用 ⇒ **明确报错，绝不静默降级到口令**（静默降级是安全洞：
+  // 用户以为自己过了第二因素，其实只是口令）。这是「全局 disabled 不再是功能闸」的代价，必须显式化。
+  if (secondFactor === 'email_code_required' && mailer.enabled !== true) {
+    throw new HttpError(503, 'email_channel_unavailable',
+      '该账号要求邮件验证码，但邮件通道未配置或不可用，请联系管理员', { retryable: false });
+  }
 
   if (secondFactor === 'email_not_registered') {
     // 邮件通道开着却没有邮箱 = 第二因素做不成。让人去找管理员补录，不给他「反正能进」的错觉。

@@ -24,6 +24,14 @@ const safeUser = (row) => ({
   id: row.id,
   login: row.login,
   display_name: row.display_name,
+  // 2026-11-06：email 进 DTO。它**不是**秘密（管理员开户时就填过），而列表里看不到它导致
+  // 「管理台无法维护邮箱」——`admin` / `eric` 至今没有邮箱，一旦启用 `transport=smtp` 就会被
+  // 409 `email_not_registered` 锁在门外，而管理员连在哪儿补都不知道。
+  // 仍**不**进 DTO 的：`password_hash` / `totp_secret`（真正的秘密）。
+  email: row.email ?? null,
+  // 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。默认 false = 不启用，
+  // 由管理员在 Edit → Security 里显式打开（与 TOTP 对称）。全局 transport=disabled 仍压过它。
+  mail_otp_enabled: Boolean(row.mail_otp_enabled),
   role: row.role,
   fde_name: row.fde_name ?? null,
   git_host_id: row.git_host_id ?? null,
@@ -74,10 +82,11 @@ function recordAdminAudit(pool, actorId, action, target, details = {}) {
   ).catch(() => {});
 }
 
-/** 用户列表（无敏感字段：无 password_hash / totp_secret / email）。 */
+/** 用户列表（无**秘密**字段：无 password_hash / totp_secret；email 是管理员可维护的运维信息，已在 DTO 里）。 */
 export async function listUsers(pool) {
   const r = await pool.query(
-    `SELECT users.id, users.login, users.display_name, users.role, users.fde_name,
+    `SELECT users.id, users.login, users.display_name, users.email, users.mail_otp_enabled,
+            users.role, users.fde_name,
             users.auth_source, users.status, users.created_at,
             (users.totp_secret IS NOT NULL) AS totp_enabled,
             sessions.last_login_at,
@@ -282,7 +291,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
       r = await pool.query(
         `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name, must_change_password)
          VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6, true)
-         RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+         RETURNING id, login, display_name, email, mail_otp_enabled, role, fde_name, auth_source, status, created_at,
                    (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           trimmedLogin, trimmedEmail,
@@ -334,7 +343,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   if (fields.length === 0) {
     throw new AdminError('validation_failed', '至少提供一个可更新字段');
   }
-  const allowed = new Set(['display_name', 'role', 'fde_name', 'status']);
+  const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'role', 'fde_name', 'status']);
   for (const field of fields) {
     if (field === 'login') {
       throw new AdminError('validation_failed', 'login 不可修改', { details: { field: 'login' } });
@@ -344,6 +353,42 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     }
   }
 
+  // email 可改可清（`null` / 空串 ⇒ 清空）。校验口径与 createUser 同源（同一正则、同一长度上限）——
+  // #449 的邮箱验证码通道吃这一列，格式错了到登录时才炸，代价比这里拦下大得多。
+  let trimmedEmail = null;
+  if (Object.hasOwn(updates, 'email')) {
+    if (updates.email === null || (typeof updates.email === 'string' && updates.email.trim() === '')) {
+      trimmedEmail = null;
+    } else if (typeof updates.email !== 'string' || updates.email.trim().length > 320
+        || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(updates.email.trim())) {
+      throw new AdminError('validation_failed', 'email 必须是有效邮箱地址', { details: { field: 'email' } });
+    } else {
+      trimmedEmail = updates.email.trim();
+    }
+  }
+  if (Object.hasOwn(updates, 'mail_otp_enabled') && typeof updates.mail_otp_enabled !== 'boolean') {
+    throw new AdminError('validation_failed', 'mail_otp_enabled 必须是布尔值', { details: { field: 'mail_otp_enabled' } });
+  }
+  // 两条交叉防护（都在写库之前）：开了开关却没邮箱 / 清空邮箱却还开着开关 ⇒ 都会让人**登不进去**
+  // （`chooseSecondFactor` 走 `email_not_registered` 那条 409）。这里拒绝保存，而不是让它在登录时才炸。
+  if (Object.hasOwn(updates, 'mail_otp_enabled') || Object.hasOwn(updates, 'email')) {
+    const current = await pool.query(
+      `SELECT email, mail_otp_enabled FROM users WHERE id = $1`,
+      [userId],
+    );
+    const row = current.rows[0];
+    if (row) {
+      const nextEnabled = Object.hasOwn(updates, 'mail_otp_enabled')
+        ? updates.mail_otp_enabled
+        : Boolean(row.mail_otp_enabled);
+      const nextEmail = Object.hasOwn(updates, 'email') ? trimmedEmail : (row.email ?? null);
+      if (nextEnabled === true && (typeof nextEmail !== 'string' || nextEmail.trim() === '')) {
+        throw new AdminError('validation_failed', '启用邮件验证码前必须先填写邮箱', {
+          details: { field: 'mail_otp_enabled' },
+        });
+      }
+    }
+  }
   if (Object.hasOwn(updates, 'role') && !['fde', 'admin'].includes(updates.role)) {
     throw new AdminError('validation_failed', "role 只允许 'fde' 或 'admin'", { details: { field: 'role' } });
   }
@@ -384,6 +429,19 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     const value = updates.display_name.trim();
     setField('display_name', value || current.login);
   }
+  if (Object.hasOwn(updates, 'email')) {
+    if (trimmedEmail !== null) {
+      const duplicate = await pool.query(
+        `SELECT 1 FROM users WHERE lower(email) = lower($1) AND id <> $2`,
+        [trimmedEmail, userId],
+      );
+      if (duplicate.rows.length > 0) {
+        throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
+      }
+    }
+    setField('email', trimmedEmail);
+  }
+  if (Object.hasOwn(updates, 'mail_otp_enabled')) setField('mail_otp_enabled', updates.mail_otp_enabled);
   if (Object.hasOwn(updates, 'role')) setField('role', updates.role);
   if (Object.hasOwn(updates, 'fde_name')) setField('fde_name', updates.fde_name);
   if (Object.hasOwn(updates, 'status')) {
@@ -401,7 +459,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
           WHERE id = $1 ${offboardingGuard}
-          RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+          RETURNING id, login, display_name, email, mail_otp_enabled, role, fde_name, auth_source, status, created_at,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
          UPDATE login_sessions SET revoked_at = now()
@@ -416,6 +474,10 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   } catch (err) {
     if (err?.code === '23505' && err?.constraint === 'users_fde_name_key') {
       throw new AdminError('fde_name_conflict', `fde_name ${updates.fde_name} 已被占用`, { httpStatus: 409 });
+    }
+    // 并发下「先查后写」会漏（两个请求同时通过上面的 SELECT）⇒ 唯一索引是最后一道，映射成同一个错误码。
+    if (err?.code === '23505' && err?.constraint === 'users_email_key') {
+      throw new AdminError('email_conflict', `email ${trimmedEmail} 已被占用`, { httpStatus: 409 });
     }
     throw err;
   }
