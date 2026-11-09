@@ -706,7 +706,9 @@ export function createServer({
         return;
       }
       if (err instanceof dirs.DirError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        // issue #472：`retryable` 由错误自己带（既有 DirError 一律不带 ⇒ 恒 false，行为逐字不变），
+        // 只有 `upload_interrupted` 声明 true（客户端断流，重发即可）。**没加新映射分支**。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable === true, err.details));
         return;
       }
       if (err instanceof idempotency.IdempotencyError) {
@@ -1006,6 +1008,11 @@ async function routeApi(req, res, ctx, url) {
   }
   if (pathname === '/api/files/tree' && req.method === 'GET') {
     return handleFileTree(req, res, ctx, url);
+  }
+  // issue #472：文件上传（原始字节体，零 multipart 依赖）。写请求 ⇒ #234 同源门已在 routeApi 入口过；
+  // 本端点**不进** RESTRICTED_SESSION_ALLOWLIST（欠改密的会话不该能往用户磁盘写东西）。
+  if (pathname === '/api/files/upload' && req.method === 'POST') {
+    return handleFileUpload(req, res, ctx, url);
   }
   if (pathname === '/api/file' && req.method === 'GET') {
     return handleFilePreview(req, res, ctx, url);
@@ -3962,6 +3969,48 @@ async function handleFileTree(req, res, ctx, url) {
     relPath: url.searchParams.get('path') ?? '.',
   });
   return sendJson(res, 200, result);
+}
+
+/**
+ * POST /api/files/upload?cwd=&path=&name=[&overwrite=1] → 201/200 `{ path, bytes, overwritten }`
+ * （issue #472 片 B，契约与三条闸门顺序的理由见 docs/api/portal.md §4.14）。
+ *
+ * 顺序本身就是契约（评审 blocker 5 + major 12）：
+ *   1. 会话 → 2. 工位 → 3. **能力位 `file_upload_enabled`** → 4. jail/名字/存在性校验（在
+ *      `receiveUpload` 内部，全在打开 temp 之前）→ 5. 流式落盘 → 6. 提交。
+ * ⚠ 能力位必须在**读 body 之前**：否则一个没开上传的账号可以用一个 32MiB 的 PUT 把 portal 的
+ * 内存/带宽花掉才被拒（而 portal 与全站共用一个进程）。判据直接数请求体的 `data` 事件次数。
+ * ⚠ **不走 `readJsonBody`/`readRawBody`**：`MAX_BODY_BYTES` 默认 64KiB，走它任何真实上传都会 413；
+ *    上限由 `FILE_UPLOAD_MAX_BYTES` 在流式写入里逐 chunk 兜。
+ * 属主两个值都传（只传 uid 会留下 gid=0=root 组，agent 改不动），口径见 docs/design/user-space.md §6.2。
+ */
+async function handleFileUpload(req, res, ctx, url) {
+  const session = await requireSession(req, ctx);
+  const fdeName = session.user.fde_name;
+  if (!fdeName) {
+    throw new dirs.DirError('fde_name_required', '当前用户未分配工位，无处可上传', { httpStatus: 400 });
+  }
+  // 能力位（片 A 的 per-user 开关）。`=== true`：缺键 / `'true'` / 1 都算未开（与前端 v-if 同口径）。
+  if (session.user.file_upload_enabled !== true) {
+    throw new dirs.DirError('upload_disabled', '该账号未开启文件上传，请让管理员在管理台开启', {
+      httpStatus: 403,
+      details: { action: 'enable_in_admin_console' },
+    });
+  }
+  const result = await dirs.receiveUpload({
+    userSpaceRoot: ctx.config.userSpaceRoot,
+    fdeName,
+    cwd: url.searchParams.get('cwd'),
+    relPath: url.searchParams.get('path') ?? '.',
+    name: url.searchParams.get('name') ?? '',
+    stream: req,
+    maxBytes: ctx.config.fileUploadMaxBytes,
+    overwrite: url.searchParams.get('overwrite') === '1',
+    uid: ctx.config.fdeUid,
+    gid: ctx.config.fdeGid,
+  });
+  // 201 = 新建；200 = 覆盖（`overwrite=1` 且真的提交掉了旧内容）。DTO 见 §4.14。
+  return sendJson(res, result.overwritten ? 200 : 201, result);
 }
 
 /**
