@@ -25,6 +25,14 @@ export interface AuthUser {
    * 纯 additive：旧响应缺这个键按 `false` 处理（`=== true` 判定），存量部署与既有测试桩不因此改行为。
    */
   must_change_password?: boolean;
+  /**
+   * issue #472（portal.md §4.14）：这个账号有没有「往自己磁盘上传文件」的能力。
+   * 由管理员在管理台 Edit → Security 开（per-user，迁移 0029）。
+   * ⚠ **三态而不是两态**：`true` 才显示上传按钮；`false` 与**缺键**都不显示 —— 缺键的含义是
+   * 「这个 DTO 没告诉我」（旧服务端 / 旧会话形状），此时给一个点了必 403 的按钮比不给更坏。
+   * 服务端同口径（`http.js` 的判据是 `=== true`），后端还会再挡一次 403 `upload_disabled`。
+   */
+  file_upload_enabled?: boolean;
 }
 
 interface MeResponse {
