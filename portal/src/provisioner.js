@@ -154,6 +154,20 @@ export function containerHasPlatformGitBind(inspectData) {
  * 不变式：不 publish 端口（无 PortBindings）、不挂 docker.sock、bind mount 只允许本 FDE 用户空间。
  * @param user 容器内用户（erix）；user 兜底（--user）单独给。
  */
+/**
+ * delegation 开关下发值（**2026-11-09 决策者：默认开**）。
+ *
+ * 口径必须与 runner 侧 `isDelegateEnabled`（`runner/lib/config.js`）同源：
+ * **未设 / 空串 ⇒ `'1'`（开）**；显式值只有字符串 `'1'` 算开，其它（`'0'` / `'true'` / `'yes'`）一律折成 `'0'`。
+ * 与 `ERIX_SESSION_AUTO_TITLE` 那行的差别只在「未设」这一支（那个是默认关）——有意的不对称：
+ * delegation 的缺省语义是「能力在、模型可以不用」，而不是「默认就花 token」。
+ */
+function delegateEnvValue() {
+  const raw = process.env.ERIX_DELEGATE_ENABLED;
+  if (raw === undefined || raw === '') return '1';
+  return raw === '1' ? '1' : '0';
+}
+
 export function buildContainerConfig({
   fdeName,
   containerName,
@@ -212,7 +226,7 @@ export function buildContainerConfig({
       // （`runner/lib/config.js` 钳位）。⚠ **三处同改**（compose → 这里 → `fde-proxy` 的 `ENV_KEY_ALLOW`）：
       // §8.70 那个同型事故的形状就是「注入方加了键、放行方没加」⇒ 现网 `create_policy_denied`。
       // 判据：`portal/test/deploy-env-delegate.test.js`。
-      `ERIX_DELEGATE_ENABLED=${process.env.ERIX_DELEGATE_ENABLED === '1' ? '1' : '0'}`,
+      `ERIX_DELEGATE_ENABLED=${delegateEnvValue()}`,
       `ERIX_DELEGATE_MAX=${Number(process.env.ERIX_DELEGATE_MAX) || 2}`,
       `ERIX_DELEGATE_CHILD_ROUNDS=${Number(process.env.ERIX_DELEGATE_CHILD_ROUNDS) || 8}`,
       `ERIX_DELEGATE_CHILD_TIMEOUT_MS=${Number(process.env.ERIX_DELEGATE_CHILD_TIMEOUT_MS) || 240000}`,
