@@ -217,3 +217,29 @@ test('verifyTotpForUser：畸形 totp_secret（非法 base32）→ totp_invalid�
   assert.equal(r.ok, false);
   assert.equal(r.reason, 'totp_invalid');
 });
+
+test('authenticate：per-user 邮件验证码开关必须真的从库里读出来（#449 回归）', async () => {
+  // 生产事故形状：`SELECT` 漏掉 `mail_otp_enabled` ⇒ `row.mail_otp_enabled` 恒 undefined ⇒
+  // `chooseSecondFactor` 拿到的 `mailOtpEnabled` 恒 false ⇒ per-user 开关整条死掉（界面显示已启用、
+  // 实际永远走口令直通或 TOTP），且没有任何信号。FakePool 现在按 SQL 的列清单投影，所以这条会真的红。
+  const stored = await auth.hashPassword('pw-mailotp');
+  const base = {
+    id: 'u-mailotp',
+    login: 'mailotp',
+    display_name: 'Mail OTP',
+    role: 'fde',
+    fde_name: 'mailotp',
+    auth_source: 'local',
+    status: 'active',
+    must_change_password: false,
+    email: 'mailotp@example.test',
+    password_hash: stored,
+  };
+  const on = await auth.authenticate(new FakePool({ users: [{ ...base, mail_otp_enabled: true }] }), 'mailotp', 'pw-mailotp');
+  assert.equal(on.ok, true);
+  assert.equal(on.mailOtpEnabled, true, 'authenticate 必须把 mail_otp_enabled 透出来（SELECT 漏列即红）');
+  assert.equal(on.email, 'mailotp@example.test');
+
+  const off = await auth.authenticate(new FakePool({ users: [{ ...base, mail_otp_enabled: false }] }), 'mailotp', 'pw-mailotp');
+  assert.equal(off.mailOtpEnabled, false);
+});
