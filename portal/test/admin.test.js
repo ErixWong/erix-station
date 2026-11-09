@@ -1468,3 +1468,91 @@ test('email：列表 DTO 带它、PATCH 可改可清、格式错 400、与他人
     void pool;
   }
 });
+
+// ---------------------------------------------------------------------------
+// 2026-11-09（#472 片 A）：per-user「文件上传」开关 —— **端点级**证据（工单 A-1 / A-2 的 HTTP 半边）。
+// 单测（`user-file-upload-flag.test.js`）钉的是函数契约；这里钉的是「管理员点保存」那条真实链路：
+// PATCH 的载荷要能落到列里、错误要带 `details.field`（前端靠它标红那一格，§1.1 分支只能用 code+field）。
+// ---------------------------------------------------------------------------
+test('#472 管理台 PATCH file_upload_enabled ⇒ 200 且 DTO/库里都是 true；再关也落库', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  const patch = (body) => fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+    method: 'PATCH', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  try {
+    const on = await patch({ file_upload_enabled: true });
+    assert.equal(on.status, 200, await on.clone().text());
+    assert.equal((await on.json()).user.file_upload_enabled, true, 'DTO 必须回读 true');
+    assert.equal(pool.users.find((u) => u.id === FDE_USER.id).file_upload_enabled, true, '库里也要是 true');
+
+    // 列表也要带（前端表格与三态判据的输入；漏补列时这里会缺键而不是 false）
+    const list = await (await fetch(`${base}/api/admin/users`, { headers: { cookie } })).json();
+    assert.equal(list.items.find((u) => u.id === FDE_USER.id).file_upload_enabled, true);
+
+    const off = await patch({ file_upload_enabled: false });
+    assert.equal(off.status, 200);
+    assert.equal((await off.json()).user.file_upload_enabled, false);
+    assert.equal(pool.users.find((u) => u.id === FDE_USER.id).file_upload_enabled, false);
+  } finally {
+    await close();
+  }
+});
+
+test('#472 管理台 PATCH 非布尔 file_upload_enabled ⇒ 400 validation_failed + details.field', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  try {
+    for (const bad of ['true', 1, null]) {
+      const res = await fetch(`${base}/api/admin/users/${FDE_USER.id}`, {
+        method: 'PATCH', headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ file_upload_enabled: bad }),
+      });
+      assert.equal(res.status, 400, `${JSON.stringify(bad)} 必须 400`);
+      const body = await res.json();
+      assert.equal(body.error.code, 'validation_failed');
+      assert.equal(body.error.details.field, 'file_upload_enabled', '必须点名是哪一格');
+      assert.equal(pool.users.find((u) => u.id === FDE_USER.id).file_upload_enabled ?? false, false,
+        '被拒的载荷不许落库');
+    }
+  } finally {
+    await close();
+  }
+});
+
+test('#472 开户（POST /api/admin/users）不接受 file_upload_enabled：新建与重激活都回 false', async () => {
+  const { base, cookie, pool, close } = await startAdminServer();
+  try {
+    const res = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        login: 'erin', display_name: 'Erin', password: 'secret-pass-1',
+        email: 'erin@example.test', fde_name: 'erin', file_upload_enabled: true,
+        git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    assert.equal(res.status, 201, await res.clone().text());
+    const body = await res.json();
+    assert.equal(body.user.file_upload_enabled, false, '开户入参被忽略 ⇒ false');
+
+    // 停用 → 重新开户：曾开过的权限不许继承（评审 blocker 2 的端点半边）
+    await fetch(`${base}/api/admin/users/${body.user.id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'disabled' }),
+    });
+    pool.users.find((u) => u.id === body.user.id).file_upload_enabled = true;
+    const again = await fetch(`${base}/api/admin/users`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        login: 'erin', display_name: 'Erin', password: 'secret-pass-2',
+        email: 'erin@example.test', fde_name: 'erin',
+        git_host_id: TEST_GIT_HOST_ID, llm: TEST_LLM,
+      }),
+    });
+    assert.equal(again.status, 201, await again.clone().text());
+    const againBody = await again.json();
+    assert.equal(againBody.reactivated, true);
+    assert.equal(againBody.user.file_upload_enabled, false, 'DTO 必须报 false');
+    assert.equal(pool.users.find((u) => u.id === againBody.user.id).file_upload_enabled, false, '库里必须被清零');
+  } finally {
+    await close();
+  }
+});

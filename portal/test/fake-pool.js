@@ -26,11 +26,15 @@ export class FakePool {
   /**
    * #472 片 A：fake 的「按 SQL 说的做」（AGENTS §8.14）—— 只有 SELECT 里真的写了 `file_upload_enabled`
    * 才回这一列。产品代码漏补列 ⇒ 行里拿不到它 ⇒ `=== true` 得 false ⇒ 用例会红，
-   * 而不是被 fake 好心兼平成假绿。值**不做布尔兼平**：`'f'` / `0` / `undefined` 这些形状留着，
-   * 那正是 A-3 要钉的东西。
+   * 而不是被 fake 好心兼平成假绿。
+   *
+   * ⚠ **必须覆盖成 `undefined` 而不是「不带这个键」**：这些分支的行是 `{ ...u }` 展开出来的，
+   * 而种子用户对象本身就有这个键 —— 只删不补的话，「SELECT 里漏了列」会被展开值兼平，
+   * 变异测试（把 `authenticate` 的 SELECT 补列删掉）实测绿着过 = 假绿。
+   * 值**不做布尔兼平**：`'f'` / `0` / `undefined` 这些形状留着，那正是 A-3 要钉的东西。
    */
   projectFileUpload(sql, user) {
-    return /\bfile_upload_enabled\b/.test(sql) ? { file_upload_enabled: user.file_upload_enabled } : {};
+    return { file_upload_enabled: /\bfile_upload_enabled\b/.test(sql) ? user.file_upload_enabled : undefined };
   }
 
   async query(sql, params = []) {
