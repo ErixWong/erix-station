@@ -274,6 +274,11 @@ export function generateTraefikConfig({
       lines.push('      priority: 300');
       lines.push('      middlewares: [admin-deny]');
       lines.push('      service: noop@internal');
+      // ⚠ 安全入口上**必须带 `tls: {}`**：本仓的 websecure（:8443）没有全局 tls 配置，
+      // 是「逐 router 开 TLS」的形态（见 portal-secure / admin-* 三条）⇒ 不带 tls 的 router
+      // 只匹配该入口上的**明文**请求，HTTPS 请求根本不命中它（第一版就是这么错的：
+      // router 生成了、entryPoints 也对，但 8443 上 /api/admin/* 仍是 401/200）。
+      if (ep !== entryPoint) lines.push('      tls: {}');
     });
     // 管理台入口：除白名单（`/api/admin`、`/api/auth`、`/api/me`、`/api/site`）外的所有 /api/* 也走同一个 deny
     // （「每个入口只够得到自己那套 API」）。
