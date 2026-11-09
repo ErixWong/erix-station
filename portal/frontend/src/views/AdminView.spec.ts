@@ -1686,3 +1686,112 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     expect(patches[0].body).toEqual({ mail_otp_enabled: true });
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。
+// 钉的是**三态**（评审 blocker 3）：`true` / `false` 可编辑，**缺键 ⇒ 禁用 + 显示「未知」+ 保存禁用**；
+// 以及 A-9：保存只发一个 PATCH，载荷**只含该字段**（不夹带 display_name / email 等未保存的编辑）。
+// 为什么不复用邮件验证码那条用例的夹具：那一格的 DTO 恒有值，本单要的恰恰是「DTO 里没这个键」的形态。
+// ---------------------------------------------------------------------------
+describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
+  type Flag = boolean | undefined;
+
+  /** 造一个 `file_upload_enabled` 为 true / false / **缺键**的用户列表（缺键 = 未知那一态）。 */
+  function payloadFor(flag: Flag, overrides: Record<string, unknown> = {}) {
+    const alice = { ...(USERS.items[0] as unknown as Record<string, unknown>), ...overrides };
+    if (flag === undefined) delete alice.file_upload_enabled;
+    else alice.file_upload_enabled = flag;
+    return { items: [alice, USERS.items[1]] };
+  }
+
+  /** 打开 alice 的 Edit → Security，返回该节 + 全部 PATCH 载荷（body 已解析）。 */
+  async function openSecurity(flag: Flag) {
+    let current: unknown = payloadFor(flag);
+    const patches: Array<{ url: string; method: string | undefined; body: Record<string, unknown> }> = [];
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, current);
+      if (url === '/api/admin/users/u1' && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        patches.push({ url, method: init.method, body });
+        // 服务端语义：接受该字段 ⇒ 下一次 GET 回读就是新值（fake 因此照 PATCH 更新列表）。
+        current = {
+          items: (current as { items: Array<Record<string, unknown>> }).items.map((u) =>
+            u.id === 'u1' ? { ...u, ...body } : u),
+        };
+        return jsonResponse(200, { user: (current as { items: Array<Record<string, unknown>> }).items[0] });
+      }
+      return undefined;
+    });
+    const row = wrapper.findAll('[data-test="user-row"]').find((r) => r.text().includes('alice'));
+    if (!row) throw new Error('alice row not found');
+    await row.get('[data-test="edit-user"]').trigger('click');
+    await wrapper.get('[data-test="edit-tab-security"]').trigger('click');
+    await flushPromises();
+    return { wrapper, fetchFn, patches, section: () => wrapper.get('[data-test="file-upload-section"]') };
+  }
+
+  const isDisabled = (w: { element: Element }) => (w.element as HTMLButtonElement | HTMLInputElement).disabled;
+
+  it('DTO=true ⇒ 勾选且可编辑，无「未知」提示，保存可用（A-8 之一）', async () => {
+    const { wrapper, section } = await openSecurity(true);
+    const box = section().get('[data-test="edit-file-upload"]');
+    expect((box.element as HTMLInputElement).checked).toBe(true);
+    expect(isDisabled(box)).toBe(false);
+    expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(false);
+    expect(isDisabled(section().get('[data-test="save-file-upload"]'))).toBe(false);
+    // i18n 真的解析了（键插错层级的老事故：界面上直接出现键名）
+    expect(section().text()).not.toContain('admin.fde.fileUpload');
+    expect(section().text()).toContain('文件上传');
+    wrapper.unmount();
+  });
+
+  it('DTO=false ⇒ 未勾选但可编辑，无「未知」提示，保存可用（A-8 之二）', async () => {
+    const { wrapper, section } = await openSecurity(false);
+    const box = section().get('[data-test="edit-file-upload"]');
+    expect((box.element as HTMLInputElement).checked).toBe(false);
+    expect(isDisabled(box)).toBe(false);
+    expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(false);
+    expect(isDisabled(section().get('[data-test="save-file-upload"]'))).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('DTO 缺键 ⇒ 勾选框禁用 + 显示「未知」+ 保存禁用，且点保存**零请求**（A-8 之三，评审 blocker 3）', async () => {
+    const { wrapper, fetchFn, section } = await openSecurity(undefined);
+    const box = section().get('[data-test="edit-file-upload"]');
+    expect(isDisabled(box), '缺键时勾选框必须禁用（不许把未知当 false 让人编辑）').toBe(true);
+    expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(true);
+    expect(section().text()).toContain('未知');
+    const save = section().get('[data-test="save-file-upload"]');
+    expect(isDisabled(save), '缺键时保存必须禁用').toBe(true);
+    await save.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it('保存只发一个 PATCH，载荷只含 file_upload_enabled（A-9：不夹带 display_name / email）', async () => {
+    // 基本资料那一格故意留着未保存的编辑 ⇒ 若上传保存"顺手"把整个 editForm 发出去，这里就会红。
+    const { wrapper, fetchFn, patches, section } = await openSecurity(false);
+    await section().get('[data-test="edit-file-upload"]').setValue(true);
+    await section().get('[data-test="save-file-upload"]').trigger('click');
+    await flushPromises();
+
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')).toHaveLength(1);
+    expect(patches).toHaveLength(1);
+    expect(patches[0].body).toEqual({ file_upload_enabled: true });
+    // 服务端回读后勾选框对齐（不是只改本地）
+    expect((section().get('[data-test="edit-file-upload"]').element as HTMLInputElement).checked).toBe(true);
+    expect(section().text()).toContain('已保存');
+    wrapper.unmount();
+  });
+
+  it('关掉开关同样是单个 PATCH {file_upload_enabled:false}', async () => {
+    const { wrapper, patches, section } = await openSecurity(true);
+    await section().get('[data-test="edit-file-upload"]').setValue(false);
+    await section().get('[data-test="save-file-upload"]').trigger('click');
+    await flushPromises();
+    expect(patches).toHaveLength(1);
+    expect(patches[0].body).toEqual({ file_upload_enabled: false });
+    wrapper.unmount();
+  });
+});

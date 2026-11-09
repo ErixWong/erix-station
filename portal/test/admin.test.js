@@ -166,12 +166,17 @@ class AdminPool extends FakePool {
         totp_secret: totpSecret, last_totp_step: null, status: 'active', disabled_at: null,
         // #255：重新激活也是「管理员代设口令」⇒ 与新建同口径置 true（按 SQL 文本判定，不另写一套谓词）。
         must_change_password: assignsMustChange(sql, 'true'),
+        // #472 片 A：重激活的上传开关**同样按 SQL 文本落**（SQL 里没写 `file_upload_enabled = false`
+        // 就保持原值——即「没写零就会继承旧权限」这个缺陷在 fake 里是真的能重现的，不是被兼平了）。
+        ...(new RegExp(`file_upload_enabled\\s*=\\s*false\\b`).test(sql) ? { file_upload_enabled: false } : {}),
       });
       return {
         rows: [{
           id: user.id, login: user.login, display_name: user.display_name, role: user.role,
           fde_name: user.fde_name, auth_source: user.auth_source, status: user.status,
           created_at: user.created_at, totp_enabled: user.totp_secret != null,
+          //  RETURNING 里写了这一列才回（fake 不好心兼平，见 FakePool.projectFileUpload 同一口径）。
+          ...(/RETURNING[^)]*\bfile_upload_enabled\b/i.test(sql) ? { file_upload_enabled: user.file_upload_enabled === true } : {}),
         }],
       };
     }
@@ -208,7 +213,7 @@ class AdminPool extends FakePool {
         return match ? params[Number(match[1]) - 1] : undefined;
       };
       // 2026-11-06：email 也在这条 SET 里（可改可清）；fake 按 SQL 的列清单走，不自己另写一套。
-      for (const name of ['display_name', 'email', 'role', 'fde_name']) {
+      for (const name of ['display_name', 'email', 'role', 'fde_name', 'file_upload_enabled']) {
         const value = field(name);
         if (value !== undefined) user[name] = value;
       }
@@ -243,6 +248,10 @@ class AdminPool extends FakePool {
           fde_name: user.fde_name ?? null, auth_source: user.auth_source, status: user.status,
           created_at: user.created_at ?? new Date(), totp_enabled: user.totp_secret != null,
           last_login_at: null,
+          // #472：RETURNING 里写了这一列才回（否则产品代码漏补列时 DTO 会缺键，用例会红）。
+          ...(/RETURNING[^)]*\bfile_upload_enabled\b/i.test(sql)
+            ? { file_upload_enabled: user.file_upload_enabled === true }
+            : {}),
         }],
       };
     }
@@ -270,6 +279,10 @@ class AdminPool extends FakePool {
             id: user.id, login: user.login, display_name: user.display_name, role: user.role,
             fde_name: user.fde_name ?? null, auth_source: user.auth_source, status: user.status,
             created_at: user.created_at ?? new Date(), totp_enabled: true, last_login_at: null,
+            // #472：`enrollUserTotp` 的 RETURNING 里写了这一列才回。
+            ...(/RETURNING[^)]*\bfile_upload_enabled\b/i.test(sql)
+              ? { file_upload_enabled: user.file_upload_enabled === true }
+              : {}),
           }],
         };
       }
@@ -376,12 +389,18 @@ class AdminPool extends FakePool {
           ...(returningHasEmail ? { email: row.email ?? null } : {}),
           role: row.role, fde_name: row.fde_name, auth_source: row.auth_source, status: row.status,
           created_at: row.created_at, totp_enabled: row.totp_secret !== null,
+          // #472：INSERT 的列清单里没有 `file_upload_enabled` ⇒ 吃库默认值 false（与真库一致）；
+          // RETURNING 里写了这一列才回。
+          ...(/RETURNING[^)]*\bfile_upload_enabled\b/i.test(sql)
+            ? { file_upload_enabled: row.file_upload_enabled === true }
+            : {}),
         }],
       };
     }
     // 用户列表
     if (sql.includes('FROM users') && sql.includes('LEFT JOIN')) {
       const listHasEmail = /SELECT[^`]*users\.email/.test(sql);
+      const listHasFileUpload = /SELECT[^`]*users\.file_upload_enabled/.test(sql);
       const rows = this.users.map((u) => ({
         id: u.id, login: u.login, display_name: u.display_name,
         ...(listHasEmail ? { email: u.email ?? null } : {}), role: u.role,
@@ -400,6 +419,8 @@ class AdminPool extends FakePool {
         offboarding_steps: this.offboardings.find((entry) => entry.fde_id === u.id)?.steps ?? null,
         offboarding_error: this.offboardings.find((entry) => entry.fde_id === u.id)?.last_error ?? null,
         workspace_purge_after: this.offboardings.find((entry) => entry.fde_id === u.id)?.workspace_purge_after ?? null,
+        // #472：SELECT 里写了 `users.file_upload_enabled` 才回这一列。
+        ...(listHasFileUpload ? { file_upload_enabled: u.file_upload_enabled === true } : {}),
       }));
       return { rows };
     }
