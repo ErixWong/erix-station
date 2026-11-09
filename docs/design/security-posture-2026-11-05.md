@@ -448,7 +448,7 @@ docker inspect station-edge   --format '{{range .Mounts}}{{.Source}} -> {{.Desti
 - 未纳管的 `*.yml`（含 `routes-lan.yml`）**只列出、不删不改**。
 - **输出字段白名单**：文件名 / kind / stage / 时间 / sha256 前 8 位 / 字节数 / mode / uid-gid / 失败阶段。
   **日志与审计里绝不出现 YAML 正文、token、diff**（有用例拿 canary 明文盯这一条）。
-- 审计：`audit_log.action = 'routes.file_drift_detected'`，`details` 就是上面那组元数据（JSONB）；**零漂移一条都不写**（60s 一轮会灌满）。
+- 审计：`audit_log.action = 'admin.routes_drift_detected'`，`details` 就是上面那组元数据（JSONB）；**零漂移一条都不写**（60s 一轮会灌满）。
 - **算不出来 ⇒ 整轮 skip + warn、零 finding**：不把「拿不到」当「应当不存在」——否则报的是假漂移，二期还会据此误删。
 
 ### 10.4 二期（自动覆盖）的前置条件——不要跳过
@@ -465,7 +465,7 @@ docker logs station-portal 2>&1 | grep '\[routes-drift\]'
 
 ```sql
 SELECT created_at, action, details FROM audit_log
- WHERE action = 'routes.file_drift_detected' ORDER BY id DESC LIMIT 20;
+ WHERE action = 'admin.routes_drift_detected' ORDER BY id DESC LIMIT 20;
 ```
 
 `details` 的样子（这就是全部信息量，没有正文）：
