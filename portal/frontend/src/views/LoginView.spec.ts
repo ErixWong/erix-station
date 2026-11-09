@@ -750,3 +750,20 @@ describe('LoginView 二选一的双语文案（#449）', () => {
     setLocale('zh-CN');
   });
 });
+
+describe('#449 二选一：邮箱入口以 email_sent 为准（不信 methods 单独说话）', () => {
+  it('后端同时给 methods 两条 + email_sent:false ⇒ 仍只渲染 TOTP 入口', async () => {
+    const { wrapper } = await gotoChoiceStep({
+      status: 'second_factor_choice',
+      pending_token: 'ptok-choice',
+      expires_in: 600,
+      methods: ['totp', 'email_code'],
+      email_hint: 'e***@i***.com',
+      email_sent: false,
+      email_unavailable: true,
+    });
+    expect(wrapper.find('#totpCode').exists()).toBe(true);
+    expect(wrapper.find('#useEmailCode').exists(), '码没发出去就不许给邮箱入口').toBe(false);
+    expect(wrapper.find('#emailUnavailableNotice').exists()).toBe(true);
+  });
+});
