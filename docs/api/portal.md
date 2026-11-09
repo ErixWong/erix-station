@@ -161,7 +161,7 @@
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 409 | `email_not_registered`（#449）| **邮件通道已启用，但这个账号没有邮箱** ⇒ 第二因素做不成（`users.email` 为空）。`retryable: false`：重试一万次也不会长出邮箱，`message` 直接给出路「请联系管理员补录邮箱」。**关键语义：绝不静默退回纯口令**（否则「开了第二因素」只是控制台的错觉）。落点：§2.2 第一步与 §2.3b 重发 | 否 |
-| 409 | `mail_not_configured`（#449，管理台切片）| **测试发信时邮件通道未启用**（`mail_settings` 无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半 ⇒ 读取侧一律 `enabled:false`）。`retryable: false`：重试一万次也发不出去，`message` 直接给出路「先去管理台配 SMTP」。落点只有 `POST /api/admin/mail/test`（§4.12）——登录路径同一种状态**不是错误**（它按「没有第二因素」正常退回纯口令，§2.2 第④分支）| 否 |
+| 409 | `mail_not_configured`（#449，管理台切片）| **测试发信时邮件通道未启用**（`mail_settings` 无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半 ⇒ 读取侧一律 `enabled:false`）。`retryable: false`：重试一万次也发不出去，`message` 直接给出路「先去管理台配 SMTP」。落点只有 `POST /api/admin/mail/test`（§4.12）——登录路径同一种状态**不是错误**（它按「没有第二因素」正常退回纯口令，§2.2 第③分支）| 否 |
 | 409 | `llm_model_not_found`（#261014 切片 B2，工单 `fix-261014-05b2`）| **发消息预检 fail-fast**：`POST /api/sessions/:id/messages` 在建 run 之前发现「会话属主 active LiteLLM binding 里某个**已配置槽位**的 `model_info.id` 在网关 `/model/info` 里查不到」（模型被删除/重建 ⇒ **id 变**）。**与 `llm_not_configured` 的关键差别：后者是「压根没配」，本码是「配过，但那个模型已经不存在了」**。`details` = `{slot, model_id}`（`slot` 取值 `main` / `embedding` / `vision`）。**选 409 而不是 424**：请求本身合法且已认证，失败原因是「绑定配置与网关目录的状态互相矛盾」，与同端点既有的 `409 llm_not_configured` / `409 run_in_progress` 同族（424 Failed Dependency 语义是「依赖的前置请求失败」，这里没有任何前置请求，且 §4.3 全表无 424 先例）。**只在发消息路径拦**：心跳路径同判据仍只 `warn`（§9.5，`reason: 'unknown_model_id'`）；**网关不可达一律放行**（fail-open，不让网关抖动演成用户发不出消息）| 是（管理员改配后原样重试可成功；本预检零副作用、不写幂等台账，同 `Idempotency-Key` 重试会重新占位，§1.4。**盲目立即重试仍是同一码**——解法只有一个：改配） |
 | 400 | `tls_cert_invalid`（#456，§4.13）| **上传的证书 PEM 解析不出来**（`new X509Certificate()` 抛；空串/非 PEM/被截断都算）。`retryable:false`：同一份字节重试一万次也一样。`details` 不带任何 PEM 片段 | 否 |
 | 400 | `tls_key_invalid`（#456，§4.13）| **上传的私钥 PEM 解析不出来**（`createPrivateKey()` 抛）。与 `tls_key_mismatch` 的区别：这是「这根本不是一把钥匙」，那是「是钥匙但不是这张证书的」| 否 |
@@ -237,21 +237,25 @@
 
 ### 2.2 `POST /api/auth/login`
 
-第一步：校验口令。响应按「第二因素选择规则」（下表）分四种：`totp_required`（进入 §2.3）、`email_code_required`（进入 §2.3a）、`authenticated`（口令直通，直接建会话发 cookie）、或直接 `409 email_not_registered`。
+第一步：校验口令。响应按「第二因素选择规则」（下表）分五种：`totp_required`（进入 §2.3）、`email_code_required`（进入 §2.3a）、**`second_factor_choice`（#449 二选一：§2.3 与 §2.3a 两条任选其一都能过）**、`authenticated`（口令直通，直接建会话发 cookie）、或直接 `409 email_not_registered`。
 
 #### 第二因素选择规则（issue #449，实现为纯函数 `login-email-code.js#chooseSecondFactor`）
 
-按顺序取第一条命中的分支（**顺序就是优先级**，TOTP 永远优先——已注册 TOTP 的账号行为一字不改）：
+按顺序取第一条命中的分支（**顺序本身就是契约**，别调换）。#449 二选一之后共**五分支**：已注册 TOTP 且拿得出「第二条路」的账号不再只走 TOTP，而是两条并存、任一通过：
 
-| 已注册 TOTP | 邮件通道启用 | `users.email` 非空 | 结果 | 说明 |
-|---|---|---|---|---|
-| 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3 |
-| 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
-| 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
-| 否 | 否 | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末） |
+| # | 已注册 TOTP | `users.mail_otp_enabled`（per-user 开关，迁移 0028）| `users.email` 非空 | 结果 | 说明 |
+|---|---|---|---|---|---|
+| ① | 是 | 是 | 是 | `200 status='second_factor_choice'` | **#449 新增**：TOTP **或** 邮箱验证码任一通过（响应见下）|
+| ② | 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3。**含「开关开但没邮箱」**——绝不因为缺邮箱把已绑 TOTP 的人挡在门外 |
+| ③ | 否 | 非 `true` | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末）|
+| ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
+| ⑤ | 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
 
-- 「邮件通道启用」= `mail_settings.transport='smtp'` **且** `MAIL_TRANSPORT !== 'disabled'`（运维急停）**且** 配置能读出来（读取失败降级为未启用，见 §2.3a 的「fail-open」）。
+- ⚠ **① 必须排在 ② 之前**（写反就是本单要修的死开关）：已绑 TOTP 的账号打开 `mail_otp_enabled` 后，界面显示「已启用」而实际一封码都不发、也没有任何提示。
+
+- 「开关」= **按用户**的 `users.mail_otp_enabled`（迁移 0028，管理员在用户编辑 → 安全里设，默认 `false`）；全局 `mail_settings.transport` 只是 SMTP 连接配置，**不再是功能闸**（2026-11-06 口径：否则「管理员开了开关、界面显示已启用、实际永远走口令」是必然的死光纤）。它只决定**信发不发得出去**：④ 发不出去 ⇒ `503 email_channel_unavailable`（唯一第二因素发不出去就不能进）；① 发不出去 ⇒ **不报错**，只降级成仅 TOTP（见下方响应与 §1.2）。「读取失败 / 急停」的 fail-open 口径见 §2.3a 末尾。
 - 未启用时的口令直通**不是无声的**：启动日志会打一条 `level:'warn'`（`[auth] email verification code disabled (mail settings unavailable or MAIL_TRANSPORT=disabled); accounts without TOTP log in with password only`），且成功登录审计的 `method` 写的是 `password_direct_no_second_factor`（不是笼统的 `password_direct`）——「这一层没做第二因素」在日志与审计里都能被查到。
+- `auth.login_success` 的 `details.method` 是个**四值枚举**（运维拿它区分「走的哪条第二因素」）：`password_direct_no_second_factor`（口令直通）/ `totp`（TOTP 通过）/ `email_code`（邮箱码通过且**该账号没有** TOTP）/ **`email_code_alt`**（#449 新增：邮箱码通过、但**该账号同时有 TOTP** ⇒ 用户主动走了两条里较弱的那一条）。OR 语义让「第二因素强度 = 两者中较弱的」，这不是 bug（是决策者的选择），但**必须可审计**。
 
 请求：
 
@@ -297,6 +301,37 @@
 
 > 本响应同样**不带** `password_change_required`（#255）：还没发 cookie，谈不上受限会话；这一位在 §2.3a 的成功响应里给。
 
+响应 `200`（**#449 二选一：已注册 TOTP + 开关开 + 有邮箱**，进入可选的第二步；**此时尚未登录**）：
+
+```json
+{
+  "status": "second_factor_choice",
+  "pending_token": "pt_9f2c...",
+  "expires_in": 600,
+  "methods": ["totp", "email_code"],
+  "email_hint": "a***@e***.com",
+  "email_sent": true
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `methods` | 本次**真的能走**的通道。两条都发得出 ⇒ `["totp", "email_code"]`；邮件不可用 ⇒ `["totp"]`。**客户端一律以本字段为准**，不要自己补邮箱入口 |
+| `email_sent` | 码是否真的发出去了（`false` ⇒ 库里**没有**码行，想走邮箱那条得先调 §2.3b 重发）|
+| `email_unavailable` | 仅在邮件通道不可用时出现（`true`），与 `email_sent:false` / `methods:["totp"]` 同时出现；可附 `notice`（人可读的一句说明）|
+| `pending_token` / `expires_in` / `email_hint` | 与 §2.2 `email_code_required` 逐字同口径：`expires_in = max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`（默认 600）；两路共用这一枚令牌，取短的那头会让邮件码比 TOTP 窗口还短 |
+
+三条硬口径：
+
+1. **发信是尽力而为，绝不能挡住 TOTP**。SMTP 不可用 / 发信失败 / 撞发信频控 ⇒ 不是 `503`、不是 `500`，而是 `200` + `methods: ["totp"]` + `email_sent: false` + `email_unavailable: true`（+ `notice`）。TOTP 是离线可用的强因素，让它输于 SMTP 抖动比本单之前更糟。
+   ```json
+   { "status": "second_factor_choice", "pending_token": "pt_9f2c...", "expires_in": 600,
+     "methods": ["totp"], "email_hint": "a***@e***.com", "email_sent": false, "email_unavailable": true,
+     "notice": "邮件通道当前不可用，本次仅可用验证器应用（TOTP）" }
+   ```
+2. **不造新的令牌类型**：这枚 `pending_token` 能被 §2.3（`/login/totp`）与 §2.3a（`/login/email-code`）**两边消费**。谁先成功谁建会话；`login_pending` 是单次消费，所以成功后另一条路自然失效（再调 ⇒ `401 pending_expired`）。
+3. 审计能区分走了哪条：TOTP 成功 ⇒ `method='totp'`；邮箱码成功且**该账号有 TOTP** ⇒ `method='email_code_alt'`；邮箱码成功且无 TOTP（④ 分支）⇒ `method='email_code'`（§2.2 末的枚举）。
+
 | 字段 | 说明 |
 |---|---|
 | `password_change_required`（#255，工单 `feat-261013-03`，纯 additive）| `true` ⇒ 本次下发的会话是**受限会话**（`users.must_change_password=true`：口令由管理员开户/重置时代设，还没经过本人之手），除 §2.11a 放行清单外的 `/api/*` 一律 `403 password_change_required`（§1.2）。**前端应在拿到 cookie 的那一刻就把用户弹到改密屏**，而不是先碰一个 403 再猜。`false` 也必须**出现**（恒为布尔，不靠缺省省掉）。两个**发会话**的分支都有（本分支与 §2.3 第二步）；`totp_required` 中间响应与所有失败响应（401）**都不带**——还没会话的人谈不上受限，发了反而泄露「这个账号欠一次改密」 |
@@ -308,13 +343,16 @@
 | HTTP | code | 场景 |
 |---|---|---|
 | 401 | `invalid_credentials` | 用户名或口令错误（**不区分是哪种**，防用户枚举） |
-| 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第③分支）。**不会退回纯口令** |
+| 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第⑤分支）。**不会退回纯口令** |
 | 429 | `rate_limited` | 同一 login / IP 连续失败触发限流；响应带 `Retry-After` 头（秒） |
-| 503 | `email_send_failed` | 第②分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束） |
+| 503 | `email_send_failed` | 第④分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束）。⚠ **#449 二选一（① 分支）不适用**：那里发信失败不是错，只降级成仅 TOTP（`200`）|
+| 503 | `email_channel_unavailable` | 第④分支：`mail_otp_enabled` 开着但邮件通道整体不可用（未配置 / 急停 / 读不出）。**绝不静默降级到口令**（否则用户以为过了第二因素，其实只过了口令）。同样**不适用于 ① 分支**（那里降级成仅 TOTP，不报错）|
 
 ### 2.3 `POST /api/auth/login/totp`
 
 第二步：校验 TOTP，成功后建立会话。
+
+> **#449 二选一**：本端点同样接受 §2.2 ① `second_factor_choice` 签发的 `pending_token`（与 §2.3a/§2.3b 共用同一枚，单次消费）。走本端点成功一律记 `method='totp'`（现状值不改，不论令牌出自 ② 还是 ①）。
 
 请求：
 
@@ -349,7 +387,7 @@
 
 ### 2.3a `POST /api/auth/login/email-code`（issue #449：邮箱验证码第二步）
 
-第二步的另一条路：**未注册 TOTP 且邮件通道启用**的账号（§2.2 第二因素选择规则第②分支）在这里交验证码，成功后建立会话。
+第二步的另一条路：**未注册 TOTP 且开关打开**的账号（§2.2 第二因素选择规则第④分支）在这里交验证码，成功后建立会话。**本端点同样接受 ① `second_factor_choice` 签发的 `pending_token`**（#449 二选一：两路共用同一枚令牌、单次消费 ⇒ 谁先成功谁建会话，另一条自然失效）；走这条路且**该账号有 TOTP** 时，审计 `method` 记 `email_code_alt`。
 
 请求：
 
@@ -396,18 +434,20 @@
 
 **SMTP 配置从哪来（决策者 2026-11-04/05 定稿）**：`mail_settings` 单行表（管理台维护，`GET/PUT` 留给下一片），运行时由 `portal/src/mail-provider.js` 读取并 60s 缓存。口令是**明文列** `smtp_password`——目标是内网 email relay，口令非高价值，与既有 `git_hosts.admin_key`（迁移 0011）同一口径；若将来换成公网 SMTP 再上加密列。**API / 审计 / 日志永不返回口令明文**（管理台只给 `hasPassword` 布尔，下一片）。
 
-**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整（配了一半）⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第④分支（纯口令 + 审计 `password_direct_no_second_factor`）。**「未配置」「`transport='disabled'`」「运维急停」是正常状态，不告警**（评审返修 ④：否则 60s 缓存每过期一次就刷一行噪声）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
+**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整（配了一半）⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第③分支（纯口令 + 审计 `password_direct_no_second_factor`）。**「未配置」「`transport='disabled'`」「运维急停」是正常状态，不告警**（评审返修 ④：否则 60s 缓存每过期一次就刷一行噪声）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
 
 审计（`audit_log`）：
 
 | action | 时机 | `details` |
 |---|---|---|
 | `auth.email_code_sent` | 码发出去了 | `{login, email_hint, code_hash_prefix, expires_at, resend_count?, at}`——`code_hash_prefix` 是 `sha256(码)` 的**前 12 位**；**绝无明文码** |
-| `auth.email_code_failed` | 发信失败（`503`） | `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令） |
-| `auth.email_code_verified` | 校验通过并发了会话 | `{login, method:'email_code', at}`；另有一条 `auth.login_success`（`method='email_code'`） |
+| `auth.email_code_failed` | 发信失败（§2.2 第④分支的 `503`；**或** ① 二选一分支的降级，此时不报错只 `200`，并额外带 `second_factor_choice: true`）| `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令）|
+| `auth.email_code_verified` | 校验通过并发了会话 | `{login, method, at}`，`method` = `email_code`（该账号无 TOTP，§2.2 第④分支）或 **`email_code_alt`**（该账号**同时有 TOTP**，走的是 ① 分支里较弱的那一条，#449）；同时另有一条 `auth.login_success`，**两处 `method` 同值**（一次登录一个口径）|
 | `auth.email_code_invalid` | ——**不写** | 码错不落审计：这是可重试的日常动作，写了只会被爆破尝试刷成噪声；失败次数由限流器持有 |
 
 ### 2.3b `POST /api/auth/login/email-code/resend`（issue #449：重发验证码）
+
+**本端点同样接受 ① `second_factor_choice` 签发的 `pending_token`**（#449 二选一）：前端在第二步里从 TOTP 切到邮箱码**不算重发**（已发出的码不因切换作废）；用户主动点「重发」才调本端点。`email_sent:false` 的那次登录库里零码行，恰好走下面的「零行 = 首次发信重试」口径。
 
 请求：
 
