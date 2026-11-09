@@ -7,13 +7,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CWD_RE, validateSessionCwd } from './sessions.js';
+import { commitTempFile, commitTempFileNoClobber, writeTempFileFromStream } from './fsutil.js';
 
 export class DirError extends Error {
-  constructor(code, message, { httpStatus = 400, details } = {}) {
+  constructor(code, message, { httpStatus = 400, details, retryable = false } = {}) {
     super(message);
     this.code = code;
     this.httpStatus = httpStatus;
     this.details = details;
+    // issue #472：**默认 false ⇒ 既有全部 DirError 的响应逐字节不变**，而 `upload_interrupted` 需要
+    // 「重发即可」的语义。http.js 的 DirError 映射分支从硬编码 `false` 改成读这个字段（与 #261014
+    // 的 LlmError 同一先例）——**没加新映射分支**，只是让已有的分支能读错误自带的值。
+    this.retryable = retryable;
   }
 }
 
@@ -93,12 +98,24 @@ export async function listDirs(pool, { userId, userSpaceRoot, fdeName, log = con
 }
 
 /**
- * GET /api/files/tree?cwd=<相对cwd>&path=<相对路径> → 单层目录列表 { entries: [{ name, type }] }。
- * 根 = cwd（必须解析后落在 ~/projects/<name> 内）；path 默认 '.'，只向下展开一级（懒加载，P6 前
- * 点击不处理）。路径穿越防护：解析后必须仍位于 cwd root 内；任何已存在段不得为 symlink
- * （防 bind mount 内用户自建的 symlink 把列表泄漏到 jail 外）；目标本身为 symlink 也拒绝。
+ * 牢笼根解析（issue #472 片 B：从 `fileTree` / `resolveJailedFile` **纯搬迁**出来的共用三段）：
+ *   ① cwd 形态（`validateSessionCwd`）→ `root = <userSpaceRoot>/<fde>/projects/<name>`；
+ *   ② 根必须真实存在且**不是 symlink、必须是目录**（否则 404 `not_found`）；
+ *   ③ `path.resolve(root, relPath)` 之后的 containment（拒 `..` / 绝对路径逃逸）+ 逐段 `lstat`
+ *      拒 symlink（防 bind mount 内用户自建 symlink 把 jail 外的内容泄漏进来，或把写入送出 jail）。
+ *
+ * 返回 `{ root, target, rel, project }`。⚠ **不保证 target 存在、也不保证类型**——那两件事由调用方
+ * 按自己的语义决定（`fileTree` / `resolveJailedDir` 要目录，`resolveJailedFile` 要普通文件）。
+ *
+ * ⚠ 本函数是**评审 major 14 裁定「抽，不复制」**的产物，等价性的唯一判据：`portal/test/dirs.test.js`
+ *   既有用例**一条不改**且全绿。为此两条既有路径各自的特判留在参数上（`requireConcreteRelPath`），
+ *   而它们原本**不同的错误文案**用参数逐字保留（`notFoundHint` / `symlinkHint`）：
+ *   不为了统一而改变既有行为（决策者红线）。
  */
-export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = {}) {
+function resolveJailedRoot({
+  userSpaceRoot, fdeName, cwd, relPath,
+  notFoundHint = 'path', symlinkHint = '列出', requireConcreteRelPath = false,
+} = {}) {
   if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
   let safeCwd;
   try {
@@ -128,15 +145,19 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
     throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
   }
 
+  // `resolveJailedFile` 的特判（必须指向具体文件，不接受 '.' / 空）：位置与原实现逐字对齐（根校验之后）。
+  if (requireConcreteRelPath && (typeof relPath !== 'string' || relPath.length === 0 || relPath === '.')) {
+    throw new DirError('validation_failed', 'path 必须指向具体文件', { details: { field: 'path' } });
+  }
   const target = path.resolve(root, String(relPath ?? '.'));
   if (target !== root) {
-    const rel = path.relative(root, target);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    const relToRoot = path.relative(root, target);
+    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
       throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
     }
   }
 
-  // 逐段 lstat（不跟随 symlink）：根以下的已存在段任何一个是 symlink → 拒绝（防 jail 外泄漏）。
+  // 逐段 lstat（不跟随 symlink）：已存在段任何一个是 symlink → 拒绝（**含最后一段**，同两侧既有口径）。
   const rel = path.relative(root, target);
   let cur = root;
   if (rel) {
@@ -147,15 +168,28 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
         st = fs.lstatSync(cur);
       } catch (err) {
         if (err?.code === 'ENOENT') {
-          throw new DirError('not_found', 'path not found', { httpStatus: 404 });
+          throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
         }
         throw err;
       }
       if (st.isSymbolicLink()) {
-        throw new DirError('validation_failed', 'path 含符号链接，拒绝列出', { details: { field: 'path' } });
+        throw new DirError('validation_failed', `path 含符号链接，拒绝${symlinkHint}`, { details: { field: 'path' } });
       }
     }
   }
+  return { root, target, rel, project: name };
+}
+
+/**
+ * GET /api/files/tree?cwd=<相对cwd>&path=<相对路径> → 单层目录列表 { entries: [{ name, type }] }。
+ * 根 = cwd（必须解析后落在 ~/projects/<name> 内）；path 默认 '.'，只向下展开一级（懒加载，P6 前
+ * 点击不处理）。路径穿越 / symlink 红线见 `resolveJailedRoot`（与 resolveJailedFile 同一条）；
+ * 本函数只保留自己的语义：目标必须是目录，否则 400（文件点击是 P6 预览，不在树里）。
+ */
+export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = {}) {
+  const { target } = resolveJailedRoot({
+    userSpaceRoot, fdeName, cwd, relPath: relPath ?? '.', notFoundHint: 'path', symlinkHint: '列出',
+  });
 
   const st = fs.lstatSync(target);
   if (!st.isDirectory()) {
@@ -179,74 +213,193 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
 }
 
 /**
- * 牢笼解析（JSON 预览与流式通道共用，同一条安全红线只写一遍）：
- * cwd 形态 → root 真实目录且非 symlink → 解析后 containment 检查（拒 .. / 绝对路径逃逸）
- * → 逐段 lstat 拒 symlink（防 bind mount 内用户自建 symlink 把文件内容泄漏到 jail 外）
- * → 目标必须是非 symlink 的普通文件。命中即抛 DirError，成功返回 { target, rel, st, project }。
+ * 牢笼解析（JSON 预览与流式通道共用）：三段红线见 `resolveJailedRoot`，本函数只保留自己的语义——
+ * **目标必须是非 symlink 的普通文件**。命中即抛 DirError，成功返回 { target, rel, st, project }。
  */
 export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFoundHint = 'file' } = {}) {
-  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
-  let safeCwd;
-  try {
-    safeCwd = validateSessionCwd(cwd); // 400 validation_failed（形态不合法 / . / ..）
-  } catch (err) {
-    if (err instanceof DirError) throw err;
-    throw new DirError(err.code ?? 'validation_failed', err.message, {
-      httpStatus: err.httpStatus ?? 400,
-      details: err.details,
-    });
-  }
-  const name = CWD_RE.exec(safeCwd)[1];
-  const root = path.resolve(userSpaceRoot, fdeName, 'projects', name);
-
-  // 根必须真实存在且不是 symlink（与 fileTree 同口径）。
-  let rootSt;
-  try {
-    rootSt = fs.lstatSync(root);
-  } catch (err) {
-    if (err?.code === 'ENOENT') {
-      throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
-    }
-    throw err;
-  }
-  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) {
-    throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
-  }
-
-  if (typeof relPath !== 'string' || relPath.length === 0 || relPath === '.') {
-    throw new DirError('validation_failed', 'path 必须指向具体文件', { details: { field: 'path' } });
-  }
-  const target = path.resolve(root, relPath);
-  if (target !== root) {
-    const relToRoot = path.relative(root, target);
-    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
-      throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
-    }
-  }
-
-  // 逐段 lstat（不跟随 symlink）：任何已存在段是 symlink → 拒绝（同 fileTree）。
-  const rel = path.relative(root, target);
-  let cur = root;
-  for (const seg of rel.split(path.sep)) {
-    cur = path.join(cur, seg);
-    let st;
-    try {
-      st = fs.lstatSync(cur);
-    } catch (err) {
-      if (err?.code === 'ENOENT') {
-        throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
-      }
-      throw err;
-    }
-    if (st.isSymbolicLink()) {
-      throw new DirError('validation_failed', 'path 含符号链接，拒绝读取', { details: { field: 'path' } });
-    }
-  }
+  const { target, rel, project } = resolveJailedRoot({
+    userSpaceRoot, fdeName, cwd, relPath, notFoundHint, symlinkHint: '读取', requireConcreteRelPath: true,
+  });
   const st = fs.lstatSync(target);
   if (!st.isFile()) {
     throw new DirError('validation_failed', 'path 必须是文件', { details: { field: 'path' } });
   }
-  return { target, rel, st, project: name };
+  return { target, rel, st, project };
+}
+
+/**
+ * 上传目标目录（issue #472 片 B）：与 `resolveJailedFile` **同一条红线**（同一份 `resolveJailedRoot`），
+ * 差别只有两点——目标**必须是目录**，且 `path` 允许 `'.'`（上传到项目根）。
+ *
+ * ⚠ 下面那次**最终 `lstatSync` 不是竞态防线**（复审 F2 改正原注释的说法）：
+ *   - `resolveJailedRoot` 的逐段 `lstat` 循环**已经覆盖最后一段**，最终 symlink 在那一步就被拒；
+ *   - 而且这两次检查之间**没有 `await`** ⇒ 原注释讲的「校验之后、打开 temp 之前的窗口」在这里
+ *     **根本不存在**。实测：删掉 symlink 那三行，`file-upload` + `http-upload` 38 条全绿（B-7② 不红）。
+ * 保留它的理由是**纵深防御 + 便宜**（写入方向的红线比读取更硬，同一份字节自己再看一眼不亏），
+ * **不是**「它在挡一个窗口」。真正的竞态窗口在 `receiveUpload` 里 `await writeTempFileFromStream(...)`
+ * 那一段（时间尺度 = 整条 body 的传输时长），由**提交点**兜住：不覆盖走 `commitTempFileNoClobber`
+ * 的 `EEXIST` ⇒ 409；覆盖走 `rename`（只替换链接本身，不会顺链接写到 jail 外；目标在那段窗口里
+ * 变成目录的情形见下面的 `EISDIR`/`ENOTEMPTY` 映射）。
+ * 本函数实际承担的就两条语义：不存在 ⇒ 404、不是目录 ⇒ 400。
+ *
+ * 返回 `{ dir, rel, root, project }`：`dir` 是可直接 `path.join(dir, name)` 的绝对目录。
+ */
+export function resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath = '.', notFoundHint = 'directory' } = {}) {
+  const { root, target, rel, project } = resolveJailedRoot({
+    userSpaceRoot, fdeName, cwd, relPath, notFoundHint, symlinkHint: '写入',
+  });
+  let st;
+  try {
+    st = fs.lstatSync(target);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
+    }
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    throw new DirError('validation_failed', 'path 含符号链接，拒绝写入', { details: { field: 'path' } });
+  }
+  if (!st.isDirectory()) {
+    throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
+  }
+  return { dir: target, rel, root, project };
+}
+
+/**
+ * 上传名形态（issue #472 片 B）：复用 `isSafeDirName` 的口径（拒空 / . / .. / `/` / 控制符含 NUL），
+ * 再加一条 **UTF-8 字节数 ≤ 255**（不是字符数）：ext4 的单段上限是 255 **字节**，按字符数算会让
+ * 中文名（3 字节/字）在 86 字就撞 ENAMETOOLONG，而 300 个 ASCII 字符本应合法。超限 / 形态非法
+ * 一律 400 `validation_failed` + `details.field='name'`。
+ */
+function assertSafeUploadName(name) {
+  if (!isSafeDirName(name)) {
+    throw new DirError('validation_failed', 'name 不是合法文件名', { details: { field: 'name' } });
+  }
+  if (Buffer.byteLength(name, 'utf8') > UPLOAD_NAME_MAX_BYTES) {
+    throw new DirError('validation_failed', `name 超过 ${UPLOAD_NAME_MAX_BYTES} 字节`, {
+      details: { field: 'name', max_bytes: UPLOAD_NAME_MAX_BYTES },
+    });
+  }
+}
+
+/** 文件名单段字节上限（= ext4 的 NAME_MAX）。 */
+export const UPLOAD_NAME_MAX_BYTES = 255;
+
+/**
+ * 上传落盘的文件 mode（issue #472）：0660 = 属主可写 + **同组可写**。
+ * 口径来源：docs/design/user-space.md §6.2（组写位由属组 fdeGid + umask 达成，不靠 setgid）——
+ * 上传的文件必须能被容器内的 agent（uid=fdeUid，主组=fdeGid）继续改，所以**组写位不能缺**。
+ */
+export const UPLOAD_FILE_MODE = 0o660;
+
+/**
+ * 把请求流写成 jail 内的一个文件（issue #472 片 B 的入向通道）。**不把 body 读进内存**
+ * （评审 blocker 5：32MiB × 并发 = portal OOM = 全平台挂），也**不靠「先 lstat 再 rename」**
+ * （评审 blocker 4：两步之间目标可被 agent 创建 ⇒ 静默覆盖）。
+ *
+ * 顺序即判据（a→f，a–c 全在打开 temp 之前 ⇒ 无效请求不必先把 body 收完）：
+ *   a. `resolveJailedDir` → `dir`（目录不存在 404 / 越界 400 / symlink 段 400）
+ *   b. `name` 形态（见 `assertSafeUploadName`）
+ *   c. `target = dir/name` 的 `lstat`：symlink ⇒ 400（**无论 overwrite**，否则拿覆盖当借口改写
+ *      jail 外的文件）；目录 ⇒ 400；存在且 `!overwrite` ⇒ 409 `file_exists`（**快速路径**，
+ *      不是安全依据：真正的判据在 e）
+ *   d. `writeTempFileFromStream`（逐 chunk 落 temp + 属主 + 0660 + fsync；超限/断流自己清 temp）
+ *   e. 提交：`overwrite` ⇒ `commitTempFile`（rename，原子替换；目标在 d 期间变成目录时
+ *      `rename` 抛 `EISDIR`/`ENOTEMPTY` ⇒ 一并映射成 409 `file_exists`，不是 500，复审 F3）；
+ *      否则 `commitTempFileNoClobber`，返回 `false` ⇒ 409 `file_exists`（**这一条才是 no-clobber 的保证**）
+ *   f. 返回 `{ path, bytes, overwritten }`（`path` 是相对 jail 根的路径，与 fileTree/预览同口径）
+ *
+ * 抛 `DirError`：`file_exists` 409 / `validation_failed` 400 / `not_found` 404 /
+ * `file_too_large` 413 / `upload_interrupted` 400（retryable）。任何失败路径都不留 `.tmp` 残骸。
+ * ⚠ `upload_disabled`（403）不在这里——那是能力位判定，属 handler（http.js）。
+ *
+ * @param uid/gid 落盘属主（portal 以 root 写，必须 chown 给 fdeUid/fdeGid，否则 agent 改不动）。
+ *        **两者都要传**：`fchown(fd, uid, -1)` 会留下 gid=0（root 组），见 fsutil.ensureDirSafe 的长注。
+ */
+export async function receiveUpload({
+  userSpaceRoot, fdeName, cwd, relPath = '.', name, stream, maxBytes, overwrite = false, uid = null, gid = null,
+} = {}) {
+  // a. 目录牢笼（先于一切：越界/不存在的目录不值得为此收 body）。
+  const { dir, rel } = resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath });
+  // b. 名字形态。
+  assertSafeUploadName(name);
+  const target = path.join(dir, name);
+  const relPathOut = rel ? path.join(rel, name) : name;
+
+  // c. 快速路径（**不是** no-clobber 的依据，见 e）。
+  let existing = null;
+  try {
+    existing = fs.lstatSync(target);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+  }
+  if (existing) {
+    // 最终 symlink 一律拒，**与 overwrite 无关**：目标是 symlink 时 rename 换的是链接本身，
+    // 而 lstat 之后到写入之前它还可能被换成指向 jail 外的东西 ⇒ 覆盖语义保不住 jail。
+    if (existing.isSymbolicLink()) {
+      throw new DirError('validation_failed', '目标是符号链接，拒绝写入', { details: { field: 'name' } });
+    }
+    if (existing.isDirectory()) {
+      throw new DirError('validation_failed', '目标是一个目录，不能当文件写', { details: { field: 'name' } });
+    }
+    if (!overwrite) {
+      throw new DirError('file_exists', '目标文件已存在', { httpStatus: 409, details: { path: relPathOut } });
+    }
+  }
+
+  // d. 流式落 temp（属主/0660/fsync 全在 fsutil 里，与平台其余原子写同一口径）。
+  let tmp;
+  let bytes;
+  try {
+    ({ tmp, bytes } = await writeTempFileFromStream(target, stream, { maxBytes, mode: UPLOAD_FILE_MODE, uid, gid, root: dir }));
+  } catch (err) {
+    if (err?.code === 'upload_too_large') {
+      throw new DirError('file_too_large', `上传超过上限（${err.maxBytes} 字节）`, {
+        httpStatus: 413,
+        details: { max_bytes: err.maxBytes, bytes: err.bytes },
+      });
+    }
+    if (err?.code === 'upload_interrupted') {
+      throw new DirError('upload_interrupted', '上传在传输完成前中断', {
+        httpStatus: 400,
+        retryable: true,
+        details: { bytes: err.bytes },
+      });
+    }
+    throw err;
+  }
+
+  // e. 提交点。
+  let overwritten = false;
+  if (overwrite) {
+    // rename 原子替换（目标是 symlink 已在 c 拒掉，不会替换成链接本身而逃逸）。
+    // fsyncDir 失败（返回 false）不改响应：内容已提交，报失败会让用户重传覆盖掉自己的新内容。
+    // ⚠ 复审 F3：目标可能在 d 的 `await`（整条 body 的传输时长）里被**换成目录** ——
+    // 用户传 X 的同时 agent 建了目录 X，这是用户可触发的形状。`rename` 把普通文件换到目录上抛
+    // `EISDIR`（空目录另有 `ENOTEMPTY`），不接住就落到通用分支 ⇒ **500**，把「目标被占了」报成
+    // 服务端故障。这里映射成与 c 同一个语义 **409 `file_exists`**（前端的处理本来就是「问用户要不要
+    // 覆盖」，这里的答案是「覆盖不了，那是个目录」⇒ 换名）。temp 必须清掉：全函数不变量是
+    // 「任何失败路径不留 `.tmp`」。
+    try {
+      commitTempFile(tmp, target, { root: dir });
+    } catch (err) {
+      if (err?.code === 'EISDIR' || err?.code === 'ENOTEMPTY') {
+        try { fs.unlinkSync(tmp); } catch {}
+        throw new DirError('file_exists', '目标在传输期间变成了目录，无法覆盖', {
+          httpStatus: 409, details: { path: relPathOut, reason: 'target_is_dir' },
+        });
+      }
+      throw err;
+    }
+    overwritten = true;
+  } else if (!commitTempFileNoClobber(tmp, target, { root: dir })) {
+    // d 与 e 之间目标被别人（agent / 另一个上传）创建了 ⇒ 与 c 同一个码，调用方不必区分。
+    throw new DirError('file_exists', '目标文件已存在（提交点竞态）', { httpStatus: 409, details: { path: relPathOut } });
+  }
+
+  // f. DTO（docs/api/portal.md §4.14）。
+  return { path: relPathOut, bytes, overwritten };
 }
 
 /**
