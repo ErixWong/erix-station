@@ -2781,7 +2781,7 @@ UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字�
 
 **已知 nit（故意保留）**：新测试对 **Dockerfile 全文**禁 `8.0.<数字>` / `10.0.<数字>`（含注释），所以将来谁想在某条注释里写「实测 8.0.427 通过」会红。这是刻意的——官方 tag 浮动，把补丁号写进镜像会随官方推补丁漂移；要记实测版本请记在本台账或 issue 里，别记进 Dockerfile。
 
-**未做 / 待办**：① 发版 + **`docker rm -f` 全部 `fde-*` 让 reconcile 重建**（§8.17：不动镜像就还是只有 SDK 8）；② 本单**不碰** per-FDE / per-language 镜像（`FDE_IMAGE` 仍是全局单值，要改是另一个决策）；③ 不装 .NET 9、不改底座、不动 `FDE_MEMORY_LIMIT=4g`。
+**未做 / 待办**：① ~~发版 + `docker rm -f` 全部 `fde-*` 让 reconcile 重建~~ **已完成**（2026-11-09 现查）：随 **v0.1.45** 发布，并已随 v0.1.57 部署到 5 台 `fde-*` —— 容器内 `dotnet --list-sdks` = 8.0.427 + 10.0.403、`build-info.json` = station 0.1.57 / engine 0.31.0；② 本单**不碰** per-FDE / per-language 镜像（`FDE_IMAGE` 仍是全局单值，要改是另一个决策）；③ 不装 .NET 9、不改底座、不动 `FDE_MEMORY_LIMIT=4g`。
 
 ### 8.82 引擎升 pin 0.26.0 → **0.29.0**：扁平入参面被删，pin 与迁移必须同一次落地（2026-11-02，分支 `feat-261102-01-erix-agent-0.29.0`）
 
@@ -4106,3 +4106,10 @@ delegate + #468 那几波推高，别再引旧数。）
 **已知遗留**：`build-info.json` 的 `revision` / `built_at` 仍是 `unknown` —— §8.70 那两个 workflow 补丁
 （release 传 `STATION_REVISION`、CI 加 tripwire）因 `gh` token 缺 `workflow` scope 一直没推上去，
 所以「版本没烘进去」这件事至今**没有自动检查**（`station_version` / `engine_version` 是真值，它们从镜像内文件读）。
+
+### 8.105 运维事故：`docker stop` 触发内核 cgroup-writeback 活锁（2026-10-31，本机）
+
+- **现象**：`docker stop` 报 `tried to kill container, but did not receive an exit event`；随后 `docker exec` 全部 5–8s 超时（`timeout 2` 一律 rc=124）、所有容器健康检查失败、`sync` 挂死、load 84→634，`kworker/*+inode_switch_wbs` 持续 60%+ CPU。
+- **内核栈**（`journalctl -k` 的 hung task 报告）：`do_exit → cleanup_mnt → generic_shutdown_super → cgroup_writeback_umount → __flush_workqueue` —— 容器退出卸载 overlay 时等 writeback 工作队列，而 `inode_switch_wbs_work_fn` 在活锁（Ubuntu 6.8.0-147）。
+- **结局**：**21 小时后自解**，未重启（5 台 `fde-*` 最终都是 `Exited (0)` —— 即 stop 当时其实已成功，只是 dockerd 报不出退出事件）。用户态无法解除：D 状态进程杀不掉、`sync` 也挂。
+- **口径**：见到这个报错 + `kworker/*inode_switch_wbs` 高 CPU，**别再批量发 docker 命令**——每发一条就多堆一批卡住的 `runc`（实测 426→544，load 继续爬）；先看 `/proc/loadavg` 与 D 进程数判断是否在自愈，只能等或重启主机。
