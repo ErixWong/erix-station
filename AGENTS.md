@@ -4061,3 +4061,38 @@ P3：终态不停轮询 ⇒ 3 红 · 卡片分级忽略 `termination` ⇒ 1 红 
 `portal/src/provisioner.js#delegateEnvValue()`（未设 ⇒ `'1'`）；判据 `portal/test/deploy-env-delegate.test.js`
 （它把 compose 插值默认喂进 runner 的真函数比对，不是各钉各的）。
 ⚠ 常驻成本随之变成**默认**：开着时每次请求多带 `DELEGATE_DEFINITION` 的 2065 字节（≈516 token）。
+
+### 8.104 v0.1.57 发版与部署：把本地 hotfix 镜像换回发布物（邮箱可见可改 / per-user 邮件验证码 / #468 / delegation）（2026-11-09）
+
+**先记一条账实不符**：`b0b29da`（管理台可显示/修改用户邮箱）与 `45cf6c7`（per-user 邮件验证码开关）**从未走过 PR** ——
+它们提交在 main 上，随后被 delegate 那波的 `push origin main` 一起带上去了（`git branch -r --contains` 两条都指向
+`origin/main`）。⇒ 想「补一个 PR」时已经无 PR 可提（提交已是 main 祖先）。**口径重申**：改动型提交**不要**直接落在
+main 上等人来问「提了吗」——一旦被并行会话的 push 顺带带走，PR 评审这道闸就永久跳过了。以后同类改动走分支 + PR。
+
+**载荷**（自 v0.1.56）：`b0b29da` 邮箱可见可改 · `45cf6c7` per-user `mail_otp_enabled`（迁移 **0028**）· `#468` 端口面板
+跟随项目 + 未知项目分组 · delegation 接入（PR #471，§8.103）· 开关默认值翻向（未设 ⇒ 开）。
+
+**发版流程（照惯例，全部先绿再动手）**：`8c8faf2`（六文件 9 增 9 删）→ main CI `42555481846` **两个 job 全绿**
+（质量门禁 + 三镜像构建校验）→ tag `v0.1.57` → release `42555885220` success → 三镜像 **直连一次拉齐**（本机
+github.com 不通但 GHCR 通；`docker pull` 后 `image inspect .Id` 与清单 `imageId` **逐个一致**：portal `5bd39ae5…` /
+fde `cb8d031b…` / proxy `dccb48aa…`，`RepoDigests` 含清单 digest）→ `deploy/.env` 形态① pin **三项**
+（备份 `/tmp/deploy.env.bak-0157`）→ `up -d --no-build station-portal`（连带重建 `station-docker-proxy`；
+`IMAGE_ALLOWLIST` 由 `${FDE_IMAGE}` 派生，不需要单独改）→ portal 实跑 `5bd39ae5…`、经 Traefik `healthz=200` →
+**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认 `fde-workshop-db` 无标签被排除）
+→ reconcile 5 秒内全部重建在 `cb8d031b…`**，容器内 `build-info.json` = `station 0.1.57 / engine 0.31.0`、
+`ERIX_DELEGATE_ENABLED=1`、agentd `sse connected` + `sse ping received`。
+
+**基线（主 agent 亲跑，判绿 = 退出码）**：根 `npm test` **2001 / 1997 通过 / 0 失败 / 4 跳过**、`node --test runner/test/*.test.js`
+**505 / 505**、前端 `typecheck` rc=0 + **61 文件 / 1217 通过**。（台账里 §8.100/§8.102 的 1948 / 481 / 1171 已被
+delegate + #468 那几波推高，别再引旧数。）
+
+**真机验收（发布物，不是 hotfix 镜像）**：① 管理台 `GET /api/admin/users` 9 个用户，DTO 键含 `email` 与
+`mail_otp_enabled`（`admin` / `eric` 的邮箱已在）；② 迁移 0028 在位（`schema_migrations` 有 `0028-user-mail-otp`，
+列 `mail_otp_enabled boolean default=false`，存量 9 人全 `false`）；③ 端到端 run（eric，8443 登录 + TOTP）
+`1e987488…` ⇒ `finished / judge_done`、8 轮、usage 落库；④ 用户面 `https://station.fde.erix.vip:8443/` 200、
+管理台 `https://admin.fde.erix.vip:9443/` 200、`/api/site` 在 8443 上报 `userBaseUrl=https://…:8443`、
+预览票 URL 是 **`https://eric-p-22000.fde.erix.vip:8443?preview_ticket=…`**（#465 的 mixed content 修复在发布物上成立）。
+
+**已知遗留**：`build-info.json` 的 `revision` / `built_at` 仍是 `unknown` —— §8.70 那两个 workflow 补丁
+（release 传 `STATION_REVISION`、CI 加 tripwire）因 `gh` token 缺 `workflow` scope 一直没推上去，
+所以「版本没烘进去」这件事至今**没有自动检查**（`station_version` / `engine_version` 是真值，它们从镜像内文件读）。
