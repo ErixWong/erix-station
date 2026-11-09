@@ -1198,6 +1198,10 @@ test('#450 A3：用户面的**两个**入口都必须挂 /api/admin/* 的 deny�
     .map(([name]) => name);
   assert.deepEqual(byEntry('web'), ['admin-deny-user'], 'web（8090）必须有 deny');
   assert.deepEqual(byEntry('websecure'), ['admin-deny-user-websecure'], 'websecure（8443）也必须有一条 deny —— 漏了它等于用户入口不设防');
+  // ⚠ 安全入口上的 deny **必须带 `tls: {}`**：本仓 websecure 是「逐 router 开 TLS」的形态，
+  // 不带 tls 的 router 只匹配明文请求 ⇒ HTTPS 请求不命中 ⇒ deny 形同不存在（第一版真机 401/200 的根因）。
+  assert.deepEqual(http.routers['admin-deny-user-websecure'].tls, {}, 'websecure 的 deny 必须带 tls:{}，否则 HTTPS 请求不命中它');
+  assert.equal(http.routers['admin-deny-user'].tls, undefined, 'web（明文）入口不带 tls');
   // 两条 deny 的规则 / 优先级 / 中间件必须逐字一致（只有入口名不同）——避免「补了一条但补错了」。
   const a = http.routers['admin-deny-user'];
   const b = http.routers['admin-deny-user-websecure'];
