@@ -69,6 +69,11 @@ export const zhCN = {
     emailResendIn: '{seconds} 秒后可重发',
     emailResendFailed: '重新发送',
     emailBackToPassword: '← 返回上一步',
+    // issue #449 二选一（`second_factor_choice`）：TOTP 与邮箱码并存时的两条切换入口 + 降级说明。
+    // 口径：默认停在 TOTP；切换不重新登录也不重新发码，所以文案里不能许「重新发送」这种诺。
+    useEmailCode: '改用邮箱验证码',
+    useTotp: '改用验证器应用（TOTP）',
+    emailChannelUnavailable: '邮件通道当前不可用，请使用验证器应用。',
   },
   // #255 首登强制改密（views/ForcePasswordChangeView.vue）：受限会话（portal.md §2.11a）的唯一出口界面文案。
   // 约束：不硬编码端口/域名（部署形态可变、docs/api/portal.md §2.5 cookie 口径与 host 无关），

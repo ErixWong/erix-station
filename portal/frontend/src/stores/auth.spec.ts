@@ -532,3 +532,99 @@ describe('#449 换账号复位清第二步状态', () => {
     expect(auth.cooldownSeconds).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #449 二选一（`second_factor_choice`）：store 侧的通道解析与切换
+// ---------------------------------------------------------------------------
+
+describe('#449 second_factor_choice（二选一）', () => {
+  const CHOICE = {
+    status: 'second_factor_choice',
+    pending_token: 'ptok-choice',
+    expires_in: 600,
+    methods: ['totp', 'email_code'],
+    email_hint: 'e***@i***.com',
+    email_sent: true,
+  };
+
+  it('methods 两条 ⇒ factor=totp（默认走较强的那条）、choiceMethods 两条、hint 收下', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, CHOICE)));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    expect(auth.pendingToken).toBe('ptok-choice');
+    expect(auth.factor).toBe('totp');
+    expect(auth.choiceMethods).toEqual(['totp', 'email']);
+    expect(auth.emailUnavailable).toBe(false);
+    expect(auth.emailHint).toBe('e***@i***.com');
+  });
+
+  it('email_sent:false ⇒ 剥掉邮箱通道（前端不许自己补一个收不到信的入口）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() =>
+      jsonResponse(200, { ...CHOICE, methods: ['totp'], email_sent: false, email_unavailable: true })));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    expect(auth.emailUnavailable).toBe(true);
+    expect(auth.choiceMethods).toEqual(['totp']);
+  });
+
+  it('methods 缺失或含未知值 ⇒ 退回只认 totp（一切以服务端为准，不猜）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() =>
+      jsonResponse(200, { status: 'second_factor_choice', pending_token: 'ptok-choice', email_sent: true })));
+    const a = useAuthStore();
+    await a.login('alice', 'secret');
+    expect(a.choiceMethods).toEqual(['totp']);
+
+    vi.stubGlobal('fetch', fetchMock(() =>
+      jsonResponse(200, { ...CHOICE, methods: ['sms', 'email_code'] })));
+    const b = useAuthStore();
+    await b.login('alice', 'secret');
+    expect(b.choiceMethods, '未知值 sms 被丢弃，邮箱仍在').toEqual(['email']);
+  });
+
+  it('switchFactor：只改 factor；pendingToken / emailHint / 冷却一律不动（切换不重新登录、不重新发码）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, CHOICE)));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    auth.cooldownSeconds = 42;
+
+    auth.switchFactor('email');
+    expect(auth.factor).toBe('email');
+    expect(auth.pendingToken).toBe('ptok-choice');
+    expect(auth.emailHint).toBe('e***@i***.com');
+    expect(auth.cooldownSeconds, '切换不该重置或触发冷却').toBe(42);
+    expect(auth.error).toBeNull();
+
+    auth.switchFactor('totp'); // 可逆
+    expect(auth.factor).toBe('totp');
+    expect(auth.pendingToken).toBe('ptok-choice');
+  });
+
+  it('单一通道（totp_required / email_code_required）⇒ switchFactor 空操作（不把用户切进一条进不了的路）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() =>
+      jsonResponse(200, { status: 'totp_required', pending_token: 'ptok', expires_in: 120 })));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    expect(auth.choiceMethods).toEqual([]);
+    auth.switchFactor('email');
+    expect(auth.factor).toBe('totp');
+
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200,
+      { status: 'email_code_required', pending_token: 'ptok', expires_in: 600, email_hint: 'a***@e***.com' })));
+    const mail = useAuthStore();
+    await mail.login('alice', 'secret');
+    expect(mail.choiceMethods).toEqual([]);
+    mail.switchFactor('totp');
+    expect(mail.factor).toBe('email');
+  });
+
+  it('回第一步（backToLogin）把可选通道一并作废：choiceMethods/emailUnavailable 归零', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, CHOICE)));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    auth.switchFactor('email');
+    auth.backToLogin();
+    expect(auth.factor).toBeNull();
+    expect(auth.choiceMethods).toEqual([]);
+    expect(auth.emailUnavailable).toBe(false);
+  });
+});
