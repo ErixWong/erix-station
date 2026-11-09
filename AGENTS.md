@@ -4073,6 +4073,21 @@ P3：终态不停轮询 ⇒ 3 红 · 卡片分级忽略 `termination` ⇒ 1 红 
 （它把 compose 插值默认喂进 runner 的真函数比对，不是各钉各的）。
 ⚠ 常驻成本随之变成**默认**：开着时每次请求多带 `DELEGATE_DEFINITION` 的 2065 字节（≈516 token）。
 
+**发布物真机复验（v0.1.57，2026-11-09 中午，主 agent 亲手；这次**不是**热 patch，是 ghcr 上的发布镜像）**：
+`station-portal 0.1.57` + `fde-eric station 0.1.57 / engine 0.31.0`、容器 env `ERIX_DELEGATE_ENABLED=1`、
+`/home/erix/delegation` 由 agentd 自动预建 ⇒ 「默认开」在部署面真的生效了（不再是我 11-09 凌晨热 patch 的那个形状）。
+`~/worker-reports-261108/e2e-delegate.mjs` 重跑（父 run `c9f3ae7b…`，`finished/judge_done`）：
+2 个子 `completed/end_turn`、`parentRunId` = 真 runId、账本 21142 B/13 行 与 38813 B/24 行、
+`GET /delegates` 200 两项 `hasTranscript:true`、`GET /delegates/:id` 200 五条消息、
+`usage_ledger` **恰好 1 行**（79686/5143，与 `runs.usage` 逐字段相同）。
+**答案正确性也验了**（不只是"跑通了"）：子 A 报 3 个 `.md` / 15 行（我 `printf` 出来的确实是每份 5 行）、
+子 B 报 `config.json → alpha,beta` 与 `meta.json → name,version,tags`，逐项对得上。
+UI（真浏览器、**先 reload**）：两张 delegate 卡各带 `View sub-task` 按钮（**截断修复在发布物上成立**），
+点开抽屉 `✓ Completed / Sub-task 2145bfe9`、正文是子 run 的真实任务+reasoning+4 条工具调用+完整答案，
+**终态 9 秒内 0 次 `/delegates` 轮询**。截图 `~/worker-reports-261108/e2e-drawer-v0157-live.png`。
+⚠ 一条观察：`probe-delegate` 顶栏 git 灯是**红的**（"Not saved"）——因为我刚往里写了 5 个文件没提交，
+这是 D9 的正确呈现，不是缺陷。
+
 ### 8.104 v0.1.57 发版与部署：把本地 hotfix 镜像换回发布物（邮箱可见可改 / per-user 邮件验证码 / #468 / delegation）（2026-11-09）
 
 **先记一条账实不符**：`b0b29da`（管理台可显示/修改用户邮箱）与 `45cf6c7`（per-user 邮件验证码开关）**从未走过 PR** ——
