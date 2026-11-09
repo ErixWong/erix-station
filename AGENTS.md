@@ -2308,6 +2308,17 @@ provisioner 34/34、portal+root 全量绿。
   等有 `workflow` scope 的凭据（或本人）再推。**在它落地之前**：`revision` / OCI label 会是 `unknown`
   （`station_version` / `engine_version` 仍是真值，因为它们从镜像内文件读，不依赖 ARG），
   而"版本没烘进去"这件事暂时**没有自动检查**——就是上面反复强调的"第三问：谁在检查"仍然空着。
+- ✅ **已补（2026-11-09，`861d323`）**：两个 workflow 落进仓库了（`git push` 走的是 credential-store 里的
+  PAT，**有** `workflow` scope；当初拒推的是 `gh` 的 OAuth App token，两者不是同一个凭据——这条差别值得记住）。
+  `release.yml` 新增步骤 ③′ 取 UTC 时间戳 + 步骤 ⑤ 传三个 ARG（`STATION_VERSION` / `STATION_REVISION` /
+  `STATION_BUILD_DATE`）；`ci.yml` 步骤 ⑤ 同样传，并新增**步骤 ⑤′**：`docker run --rm --entrypoint cat`
+  读回 `build-info.json` 后逐格断言（`station_version` == 仓库 pin、`revision` == 本次 commit、
+  `engine_version` 非 `unknown`、`built_at` 非 `unknown`）。
+  **端到端已验**（main CI run `42573190051` 两个 job 全绿，日志逐字）：
+  `{"station_version":"0.1.57","engine_version":"0.31.0","revision":"861d3231b17d…","built_at":"2026-11-09T06:29:42Z"}`
+  ⇒ 修复前实测同一镜像族是 `{"station_version":"0.1.53",…,"revision":"unknown","built_at":"unknown"}`、两个 OCI
+  label 也是空串。⚠ 两个 ARG 声明在 Dockerfile **末尾** ⇒ 只让 build-info 层与 label 层缓存失效，不重跑 `npm ci`。
+  ⚠ 仍未做：**部署面读这列的人还没有**（`containers.agent_version` 的消费面，§8.70 末段已记）。
 
 ### 8.71 #412④：隔离跑的宿主写路径必须**逐条证明与共享栈不相等**，"有没有设"不是判据（2026-10-26，分支 `fix-261026-07-host-write-paths`）
 
