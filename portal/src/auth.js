@@ -111,6 +111,34 @@ function getDummyHash() {
 }
 
 /**
+ * user DTO 的**唯一**构造点（issue #472 片 A）。四条路径（`authenticate` / `verifyTotpForUser` /
+ * `loadActiveUser` / `findSessionUser`）共用：加一个键就必须一次到位，否则「登录能拿到、/api/me 拿不到」
+ * 这种半截 DTO 会让前端在首登路径上永远看不见能力位（评审 blocker 1 的现场：`stores/auth.ts` 的
+ * `login()` / `submitEmailCode()` 把登录响应里的 `user` 直接存进 store，且不重置 `ready`、不重拉
+ * `/api/me` ⇒ 只改 `findSessionUser` 的话，首登用户整个会话都看不到上传按钮，直到整页刷新）。
+ * 键集由 portal/test/user-file-upload-flag.test.js 的「四条 DTO 路径键集一致」用例钉住
+ * （新增键必须同时改那条用例）。
+ *
+ * ⚠ `must_change_password` **不在这里**——它是会话态（受限会话门的判据，#255），只在
+ * `findSessionUser` 的 `user` 里额外带；四条路径的其它三项（`mustChangePassword` / `email` /
+ * `mailOtpEnabled`）是登录流程内部的返回值，在 result 顶层，不进 user DTO。
+ */
+function toSessionUser(row) {
+  return {
+    id: row.id,
+    login: row.login,
+    display_name: row.display_name,
+    role: row.role,
+    fde_name: row.fde_name,
+    auth_source: row.auth_source,
+    // #472：per-user「文件上传」开关（迁移 0029）。**显式收成布尔**：fake/旧驱动可能给 `undefined` /
+    // `'f'` 等形状，而消费方（片 B 的 403 闸、前端按钮显隐）的判据是 `=== true` ⇒ 不能靠真值性。
+    // 它在 **user DTO 里**，不在登录响应顶层（顶层那个位置是 `mailOtpEnabled`，属宿主判定输入）。
+    file_upload_enabled: row.file_upload_enabled === true,
+  };
+}
+
+/**
  * 校验登录凭据（第一步：口令）。用户不存在时也跑一次 scrypt 拉平时序（防用户枚举）。
  * 返回 { ok, user } 或 { ok:false, reason: 'invalid_credentials' | 'malformed_hash' }。
  */
@@ -119,7 +147,7 @@ export async function authenticate(pool, login, password, { log } = {}) {
   // 登录响应用的是顶层的 `password_change_required`（见 http.js），两条各自自己的口径。
   // #449：同理多读 `email`（只用于第二因素选择与发信，**不进 user DTO**）。
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, mail_otp_enabled, file_upload_enabled
        FROM users WHERE login = $1 AND status = 'active'`,
     [login],
   );
@@ -141,14 +169,8 @@ export async function authenticate(pool, login, password, { log } = {}) {
   if (!valid) return { ok: false, reason: malformed ? 'malformed_hash' : 'invalid_credentials' };
   return {
     ok: true,
-    user: {
-      id: row.id,
-      login: row.login,
-      display_name: row.display_name,
-      role: row.role,
-      fde_name: row.fde_name,
-      auth_source: row.auth_source,
-    },
+    // #472：user DTO 的唯一构造点（见 `toSessionUser` 的注释）。四条路径共用，不在此处手写对象字面量。
+    user: toSessionUser(row),
     // #255：登录响应里的 `password_change_required` 就取这一位（收成显式布尔，理由同 findSessionUser）。
     mustChangePassword: row.must_change_password === true,
     // #449：第二因素选择规则（http.js `chooseSecondFactor`）要的邮箱；空串/NULL 一律按「未登记」。
@@ -224,7 +246,7 @@ export async function verifyTotpForUser(
   } = {},
 ) {
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, totp_secret, last_totp_step, must_change_password
+    `SELECT id, login, display_name, role, fde_name, auth_source, totp_secret, last_totp_step, must_change_password, file_upload_enabled
        FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
   );
@@ -258,14 +280,8 @@ export async function verifyTotpForUser(
   if (!upd.rows?.[0]) return { ok: false, reason: 'totp_replay' };
   return {
     ok: true,
-    user: {
-      id: row.id,
-      login: row.login,
-      display_name: row.display_name,
-      role: row.role,
-      fde_name: row.fde_name,
-      auth_source: row.auth_source,
-    },
+    // #472：与 `authenticate` 共用同一个构造点（第二步才是真正发会话的那一步，DTO 形状必须一致）。
+    user: toSessionUser(row),
     // #255：与 `authenticate` 同一口径——第二步才是真正发会话的那一步，所以受限旗标也要在这里带出去。
     mustChangePassword: row.must_change_password === true,
   };
@@ -288,21 +304,14 @@ export async function hasTotpEnrollment(pool, userId) {
  */
 export async function loadActiveUser(pool, userId) {
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password
+    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password, file_upload_enabled
        FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
   );
   const row = res.rows?.[0];
   if (!row) return null;
   return {
-    user: {
-      id: row.id,
-      login: row.login,
-      display_name: row.display_name,
-      role: row.role,
-      fde_name: row.fde_name,
-      auth_source: row.auth_source,
-    },
+    user: toSessionUser(row),
     mustChangePassword: row.must_change_password === true,
     email: typeof row.email === 'string' && row.email.trim() !== '' ? row.email : null,
   };
@@ -332,7 +341,7 @@ export async function findSessionUser(pool, token, { now = new Date() } = {}) {
   // 就坐在这条查表上，另开一条查表就是每个 API 请求多一次往返。
   const res = await pool.query(
     `SELECT u.id, u.login, u.display_name, u.role, u.fde_name, u.auth_source, u.status,
-            u.must_change_password, s.id AS session_id, s.expires_at, s.last_seen_at
+            u.must_change_password, u.file_upload_enabled, s.id AS session_id, s.expires_at, s.last_seen_at
        FROM login_sessions s
        JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = $1
@@ -345,14 +354,11 @@ export async function findSessionUser(pool, token, { now = new Date() } = {}) {
   if (!row) return null;
   return {
     user: {
-      id: row.id,
-      login: row.login,
-      display_name: row.display_name,
-      role: row.role,
-      fde_name: row.fde_name,
-      auth_source: row.auth_source,
+      // #472：六个公共键走 `toSessionUser`（与登录三条路径同一构造点）。
+      ...toSessionUser(row),
       // **显式收成布尔**：fake/旧驱动可能给 `undefined`、字符串 `'t'` 等形状，门的判据是 `=== true`，
       // 不能靠真值性（`'false'` 是真值）。additive：既有调用方只读上面几项，多一个字段不影响。
+      // ⚠ 它是**会话态**（#255 受限会话门），所以不进 `toSessionUser`，保持原位不动。
       must_change_password: row.must_change_password === true,
     },
     session: {

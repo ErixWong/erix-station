@@ -706,7 +706,9 @@ export function createServer({
         return;
       }
       if (err instanceof dirs.DirError) {
-        sendJson(res, err.httpStatus, errorBody(err.code, err.message, false, err.details));
+        // issue #472：`retryable` 由错误自己带（既有 DirError 一律不带 ⇒ 恒 false，行为逐字不变），
+        // 只有 `upload_interrupted` 声明 true（客户端断流，重发即可）。**没加新映射分支**。
+        sendJson(res, err.httpStatus, errorBody(err.code, err.message, err.retryable === true, err.details));
         return;
       }
       if (err instanceof idempotency.IdempotencyError) {
@@ -1006,6 +1008,11 @@ async function routeApi(req, res, ctx, url) {
   }
   if (pathname === '/api/files/tree' && req.method === 'GET') {
     return handleFileTree(req, res, ctx, url);
+  }
+  // issue #472：文件上传（原始字节体，零 multipart 依赖）。写请求 ⇒ #234 同源门已在 routeApi 入口过；
+  // 本端点**不进** RESTRICTED_SESSION_ALLOWLIST（欠改密的会话不该能往用户磁盘写东西）。
+  if (pathname === '/api/files/upload' && req.method === 'POST') {
+    return handleFileUpload(req, res, ctx, url);
   }
   if (pathname === '/api/file' && req.method === 'GET') {
     return handleFilePreview(req, res, ctx, url);
@@ -2923,6 +2930,17 @@ async function handleLoginStep1(req, res, ctx) {
     mailOtpEnabled: result.mailOtpEnabled === true,
     email: result.email,
   });
+  // ⑤（#449 二选一）已绑 TOTP + 开关开 + 有邮箱 ⇒ 两条路并存。**必须在这一条里自己处理 SMTP**：
+  //    下面那条 503 只属于 `email_code_required`（无 TOTP 时邮件码是唯一第二因素，发不出去就不能进）；
+  //    二选一分支里 TOTP 是离线可用的强因素，绝不能因为 SMTP 抖动把人锁在门外。
+  if (secondFactor === 'second_factor_choice') {
+    return handleSecondFactorChoice(req, res, ctx, {
+      user: result.user,
+      email: result.email,
+      ip,
+      mailer,
+    });
+  }
   // 开关开着但 SMTP 没配 / 不可用 ⇒ **明确报错，绝不静默降级到口令**（静默降级是安全洞：
   // 用户以为自己过了第二因素，其实只是口令）。这是「全局 disabled 不再是功能闸」的代价，必须显式化。
   if (secondFactor === 'email_code_required' && mailer.enabled !== true) {
@@ -3096,6 +3114,103 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
 }
 
 /**
+ * 二选一分支（issue #449，portal.md §2.2）：已绑 TOTP + `mail_otp_enabled` + 有邮箱 ⇒ 第一步同时给出
+ * **TOTP 与邮箱验证码两条路**，共用同一枚 `pending_token`（单次消费 ⇒ 谁先成功谁建会话，另一条自然失效）。
+ *
+ * 与 `handleEmailCodeRequired` 的关键差别：**发信是尽力而为**。
+ *   SMTP 不可用 / 被发信频控 / 发信失败 ⇒ `200` + `methods:["totp"]` + `email_sent:false` + `email_unavailable:true`，
+ *   **绝不 503**（TOTP 离线可用，让它输于 SMTP 抖动比现状更糟）；此时库里不落码行，用户可随时
+ *   `POST /api/auth/login/email-code/resend` 重试发信（`recordResend` 零行 = 首次发信重试）。
+ * `expires_in` 与邮件码路径同口径 `max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`：两路共用一枚
+ * pending，取短的那个会让先到的邮件码比 TOTP 窗口还短，没有理由这么于。
+ */
+async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer }) {
+  const { pool, config } = ctx;
+  const policy = emailCodePolicy(config);
+  const pendingTtlSeconds = Math.max(config.pendingTokenTtlSeconds ?? 120, policy.ttlSeconds);
+  const pending = await auth.createPendingToken(pool, user.id, {
+    ip,
+    userAgent: req.headers['user-agent'] ?? null,
+    ttlSeconds: pendingTtlSeconds,
+  });
+
+  // 先建 pending 再发信：pending 是两条路共同的入口，发信失败不能让人连 TOTP 都用不上。
+  const sendKey = `email:${ip}`;
+  const sendCheck = ctx.emailSendLimiter.check(sendKey);
+  let sent = { ok: false, reason: 'rate_limited' };
+  if (sendCheck.allowed) {
+    const code = loginEmailCode.generateEmailCode();
+    // 与 `handleEmailCodeRequired` 同一顺序契约：**先发信、成功后才落库**（发信失败不留库脏行、
+    // 也不给用户手上不存在的码）。
+    sent = await mailer.send({ to: email, ...emailCodeMessage(code, policy.ttlSeconds) });
+    if (sent.ok) {
+      ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
+      const now = new Date();
+      const created = await loginEmailCode.createEmailCode(pool, {
+        pendingTokenHash: pending.tokenHash,
+        code,
+        ttlSeconds: policy.ttlSeconds,
+        maxAttempts: policy.maxAttempts,
+        ip,
+        userAgent: req.headers['user-agent'] ?? null,
+        now,
+      });
+      await loginEmailCode.invalidateOtherCodes(pool, {
+        pendingTokenHash: pending.tokenHash,
+        keepCodeHash: created.codeHash,
+        now,
+      });
+      await auth.audit(pool, {
+        actorId: user.id,
+        action: 'auth.email_code_sent',
+        target: user.login,
+        details: {
+          login: user.login,
+          email_hint: maskEmail(email),
+          code_hash_prefix: created.codeHash.slice(0, 12),
+          expires_at: created.expiresAt.toISOString(),
+          at: now.toISOString(),
+        },
+      }).catch(() => {});
+    }
+  }
+
+  if (!sent.ok) {
+    // 审计留痕：邮件路不可用不是静默失败（运维能查到原因，但不影响登录）。
+    await auth.audit(pool, {
+      actorId: user.id,
+      action: 'auth.email_code_failed',
+      target: user.login,
+      details: {
+        login: user.login,
+        reason: sent.reason ?? 'send_failed',
+        second_factor_choice: true,
+        at: new Date().toISOString(),
+      },
+    }).catch(() => {});
+    return sendJson(res, 200, {
+      status: 'second_factor_choice',
+      pending_token: pending.token,
+      expires_in: pendingTtlSeconds,
+      methods: ['totp'],
+      email_hint: maskEmail(email),
+      email_sent: false,
+      email_unavailable: true,
+      notice: '邮件通道当前不可用，本次仅可用验证器应用（TOTP）',
+    });
+  }
+
+  return sendJson(res, 200, {
+    status: 'second_factor_choice',
+    pending_token: pending.token,
+    expires_in: pendingTtlSeconds,
+    methods: ['totp', 'email_code'],
+    email_hint: maskEmail(email),
+    email_sent: true,
+  });
+}
+
+/**
  * `POST /api/auth/login/email-code`（portal.md §2.3a）：校验邮箱验证码 → 建会话。
  * 失败一律 `401 email_code_invalid`（不区分「码错」与「码不存在」，防探测；`too_many_attempts` 同样映射，
  * 只是 message 说明要重走第一步）；`pending_token` 无效/已用/过期 → 复用 `401 pending_expired`。
@@ -3156,12 +3271,16 @@ async function handleLoginEmailCode(req, res, ctx) {
     userAgent: req.headers['user-agent'] ?? null,
     ttlSeconds: config.sessionTtlSeconds,
   });
-  await auditLoginSuccess(pool, loaded.user, 'email_code');
+  // 审计要能区分「走的是哪条」：同一枚 pending 可以是 `second_factor_choice` 签发的（该账号有 TOTP），
+  // 用户选了邮件码 = 主动走了较弱的那一条 ⇒ 记 `email_code_alt`（#449 OR 语义的可审计口径）。
+  // 无 TOTP 的账号（`email_code_required`）仍是 `email_code`（现状值不改）。
+  const loginMethod = (await auth.hasTotpEnrollment(pool, loaded.user.id)) ? 'email_code_alt' : 'email_code';
+  await auditLoginSuccess(pool, loaded.user, loginMethod);
   await auth.audit(pool, {
     actorId: loaded.user.id,
     action: 'auth.email_code_verified',
     target: loaded.user.login,
-    details: { login: loaded.user.login, method: 'email_code', at: new Date().toISOString() },
+    details: { login: loaded.user.login, method: loginMethod, at: new Date().toISOString() },
   }).catch(() => {});
 
   return sendJson(
@@ -3371,9 +3490,11 @@ async function handleLoginTotp(req, res, ctx) {
 }
 
 /**
- * 成功登录审计（`audit_log.action='auth.login_success'`）：三个成功分支各写一条——
+ * 成功登录审计（`audit_log.action='auth.login_success'`）：各成功分支各写一条，`method` 四值——
  * `password_direct_no_second_factor`（未注册 TOTP 且邮件通道未启用，口令直通）、
- * `totp`（TOTP 校验通过）、`email_code`（邮箱验证码校验通过，issue #449）。
+ * `totp`（TOTP 校验通过）、`email_code`（邮箱验证码校验通过且该账号无 TOTP，issue #449）、
+ * `email_code_alt`（邮箱验证码校验通过、但**该账号同时有 TOTP** ⇒ 用户走的是 `second_factor_choice`
+ * 里较弱的那一条，#449 二选一；运维拿这个值就能查出「本来有 TOTP 却用邮件码进来」）。
  * details 只记 login / method / at，**不含口令、TOTP 码、邮箱验证码、session token 等敏感字段**。
  * best-effort（同 §2.7 forward-auth 审计口径）：审计写失败不阻断已成功的登录。
  */
@@ -3848,6 +3969,48 @@ async function handleFileTree(req, res, ctx, url) {
     relPath: url.searchParams.get('path') ?? '.',
   });
   return sendJson(res, 200, result);
+}
+
+/**
+ * POST /api/files/upload?cwd=&path=&name=[&overwrite=1] → 201/200 `{ path, bytes, overwritten }`
+ * （issue #472 片 B，契约与三条闸门顺序的理由见 docs/api/portal.md §4.14）。
+ *
+ * 顺序本身就是契约（评审 blocker 5 + major 12）：
+ *   1. 会话 → 2. 工位 → 3. **能力位 `file_upload_enabled`** → 4. jail/名字/存在性校验（在
+ *      `receiveUpload` 内部，全在打开 temp 之前）→ 5. 流式落盘 → 6. 提交。
+ * ⚠ 能力位必须在**读 body 之前**：否则一个没开上传的账号可以用一个 32MiB 的 PUT 把 portal 的
+ * 内存/带宽花掉才被拒（而 portal 与全站共用一个进程）。判据直接数请求体的 `data` 事件次数。
+ * ⚠ **不走 `readJsonBody`/`readRawBody`**：`MAX_BODY_BYTES` 默认 64KiB，走它任何真实上传都会 413；
+ *    上限由 `FILE_UPLOAD_MAX_BYTES` 在流式写入里逐 chunk 兜。
+ * 属主两个值都传（只传 uid 会留下 gid=0=root 组，agent 改不动），口径见 docs/design/user-space.md §6.2。
+ */
+async function handleFileUpload(req, res, ctx, url) {
+  const session = await requireSession(req, ctx);
+  const fdeName = session.user.fde_name;
+  if (!fdeName) {
+    throw new dirs.DirError('fde_name_required', '当前用户未分配工位，无处可上传', { httpStatus: 400 });
+  }
+  // 能力位（片 A 的 per-user 开关）。`=== true`：缺键 / `'true'` / 1 都算未开（与前端 v-if 同口径）。
+  if (session.user.file_upload_enabled !== true) {
+    throw new dirs.DirError('upload_disabled', '该账号未开启文件上传，请让管理员在管理台开启', {
+      httpStatus: 403,
+      details: { action: 'enable_in_admin_console' },
+    });
+  }
+  const result = await dirs.receiveUpload({
+    userSpaceRoot: ctx.config.userSpaceRoot,
+    fdeName,
+    cwd: url.searchParams.get('cwd'),
+    relPath: url.searchParams.get('path') ?? '.',
+    name: url.searchParams.get('name') ?? '',
+    stream: req,
+    maxBytes: ctx.config.fileUploadMaxBytes,
+    overwrite: url.searchParams.get('overwrite') === '1',
+    uid: ctx.config.fdeUid,
+    gid: ctx.config.fdeGid,
+  });
+  // 201 = 新建；200 = 覆盖（`overwrite=1` 且真的提交掉了旧内容）。DTO 见 §4.14。
+  return sendJson(res, result.overwritten ? 200 : 201, result);
 }
 
 /**

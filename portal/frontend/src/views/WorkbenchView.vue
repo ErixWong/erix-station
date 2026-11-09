@@ -303,7 +303,9 @@ function jumpToLatest() {
           ? 'max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:shadow-lg'
           : 'max-md:hidden'"
       >
-        <SidebarPanel @select-session="onSelectSession" @new-session="onNewSession" />
+        <!-- issue #472：上传成功 ⇒ 重判收工灯（新文件未跟踪 ⇒ 灯该变红；D9「红是进度不是警报」）。
+             不重判就是骗人：磁盘上多了没跟踪的文件，灯还说「已收工」。 -->
+        <SidebarPanel @select-session="onSelectSession" @new-session="onNewSession" @files-changed="gitLight.load()" />
       </aside>
       <!-- issue #90：拖拽把手 = aside 右缘兄弟元素（aside 内 overflow-y-auto，不放内部避免与滚动条打架） -->
       <div

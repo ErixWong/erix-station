@@ -25,6 +25,14 @@ export interface AuthUser {
    * 纯 additive：旧响应缺这个键按 `false` 处理（`=== true` 判定），存量部署与既有测试桩不因此改行为。
    */
   must_change_password?: boolean;
+  /**
+   * issue #472（portal.md §4.14）：这个账号有没有「往自己磁盘上传文件」的能力。
+   * 由管理员在管理台 Edit → Security 开（per-user，迁移 0029）。
+   * ⚠ **三态而不是两态**：`true` 才显示上传按钮；`false` 与**缺键**都不显示 —— 缺键的含义是
+   * 「这个 DTO 没告诉我」（旧服务端 / 旧会话形状），此时给一个点了必 403 的按钮比不给更坏。
+   * 服务端同口径（`http.js` 的判据是 `=== true`），后端还会再挡一次 403 `upload_disabled`。
+   */
+  file_upload_enabled?: boolean;
 }
 
 interface MeResponse {
@@ -41,6 +49,15 @@ interface LoginResponse {
   expires_in?: number;
   /** #449（§2.2）：`email_code_required` 带的脱敏收件人（`a***@e***.com`），只用于「发到哪个邮箱了」。 */
   email_hint?: string;
+  /**
+   * #449 二选一（§2.2）：`second_factor_choice` 给的可选通道（后端只发 `totp` / `email_code`）。
+   * SMTP 不可用时后端已经把它剪成 `['totp']`——前端**不得**自己补上邮箱入口。
+   */
+  methods?: string[];
+  /** #449 二选一：`false` = 码没发出去（邮件通道不可用），本次只能走 TOTP。 */
+  email_sent?: boolean;
+  /** #449 二选一：与 `email_sent:false` 同时出现的服务端旗标（口径以后端为准）。 */
+  email_unavailable?: boolean;
   /**
    * #255（§2.2/§2.3）：本次下发的会话是否受限。**两个发会话的分支都带**（直通与 TOTP 第二步），
    * `totp_required` 中间响应与 401 失败响应都不带。后端保证「恒为布尔」，前端仍用 `=== true` 收口：
@@ -153,6 +170,14 @@ export const useAuthStore = defineStore('auth', {
      * （`/login/totp` 与 `/login/email-code` 是两个端点），所以所有清 pending 的地方都走 `resetPendingLogin()`。
      */
     factor: null as LoginSecondFactor | null,
+    /**
+     * #449 二选一：`second_factor_choice` 本次**真的提供**的通道（直接来自后端 `methods`，已映射成
+     * 本地的 `'totp' | 'email'`）。非空 = 第二步可以互切；空 = 单一通道（`totp_required` /
+     * `email_code_required`，现状形态）。与 `pendingToken` 同生共死（切换不换令牌，但换人整组作废）。
+     */
+    choiceMethods: [] as LoginSecondFactor[],
+    /** #449 二选一：邮件通道不可用（`email_sent:false`）⇒ 第二步只给 TOTP + 一句说明。 */
+    emailUnavailable: false,
     /** #449：脱敏收件人（`email_hint`），只用于「验证码发到哪个邮箱了」。 */
     emailHint: null as string | null,
     /** #449：发信失败（503 `email_send_failed`）——UI 把按钮换成「重新发送」，且不受冷却限制（服务端此时还没有码行）。 */
@@ -210,9 +235,10 @@ export const useAuthStore = defineStore('auth', {
     },
 
     /**
-     * 第一步：login + password（§2.2 的四种响应）。
+     * 第一步：login + password（§2.2 的五种响应）。
      * ① 直通 → user；② `totp_required` → 第二步（factor='totp'）；③ `email_code_required` → 第二步
-     * （factor='email'）；④ `409 email_not_registered` / `503 email_send_failed` 走 catch。
+     * （factor='email'）；④ `second_factor_choice` → 第二步（默认 TOTP，可切邮箱码）；
+     * ⑤ `409 email_not_registered` / `503 email_send_failed` 走 catch。
      */
     async login(login: string, password: string) {
       this.loading = true;
@@ -234,6 +260,22 @@ export const useAuthStore = defineStore('auth', {
           this.pendingToken = data.pending_token ?? null;
           this.factor = 'email';
           this.emailHint = data.email_hint ?? null;
+          this.passwordChangeRequired = false;
+        } else if (data.status === 'second_factor_choice') {
+          // #449 二选一：TOTP 与邮箱码并存，**共用这一枚 pending_token**。默认停在 TOTP（两者中较强的
+          // 那条）；切到邮箱码只改 `factor`（见 `switchFactor`）：不重新登录、不重新发码。
+          this.pendingToken = data.pending_token ?? null;
+          this.emailHint = data.email_hint ?? null;
+          // `methods` 一律以服务端为准（SMTP 不可用时后端已经只给 `['totp']`）；未知值一律丢弃。
+          const offered = Array.isArray(data.methods) ? data.methods : [];
+          const wanted: LoginSecondFactor[] = [];
+          if (offered.includes('totp')) wanted.push('totp');
+          if (offered.includes('email_code')) wanted.push('email');
+          this.choiceMethods = wanted.length > 0 ? wanted : ['totp'];
+          this.emailUnavailable = data.email_sent === false || data.email_unavailable === true;
+          // 没真的发出码 ⇒ 不给邮箱入口（否则用户对着一个收不到信的输入框）。
+          if (this.emailUnavailable) this.choiceMethods = this.choiceMethods.filter((m) => m !== 'email');
+          this.factor = 'totp';
           this.passwordChangeRequired = false;
         } else {
           // totp_required：进入第二步（旧版切 totpForm 显示）。本响应**不带**受限旗标（还没会话）。
@@ -366,6 +408,17 @@ export const useAuthStore = defineStore('auth', {
     },
 
     /**
+     * #449 二选一：在第二步的两条通道之间切换。**只改 `factor`**——`pendingToken` / `emailHint` /
+     * `cooldownSeconds` 一律不动：同一枚 pending 不需要重新登录，已经发出去的码也不因为切换而作废
+     * （要新码只能用户主动点「重发」）。单一通道（`choiceMethods` 为空）或本次没提供这条 ⇒ 空操作。
+     */
+    switchFactor(factor: LoginSecondFactor) {
+      if (!this.pendingToken || !this.choiceMethods.includes(factor) || this.factor === factor) return;
+      this.factor = factor;
+      this.error = null;
+    },
+
+    /**
      * #449：清掉「第二步」的全部本地态。**pending 是一个人的凭证**（#428/#431 的纪律）——
      * 换账号 / 登出 / 会话过期 / 回第一步 / 登录成功，五条路径都只走这里，不各清各的。
      */
@@ -375,6 +428,9 @@ export const useAuthStore = defineStore('auth', {
       this.emailHint = null;
       this.sendFailed = false;
       this.cooldownSeconds = 0;
+      // #449 二选一：可选通道也是「上一个人」的态，跟着 pending 一起作废。
+      this.choiceMethods = [];
+      this.emailUnavailable = false;
     },
 
     /**

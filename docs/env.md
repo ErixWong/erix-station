@@ -387,6 +387,7 @@ Portainer 与本平台的关系（平台规范固定，不随环境变化）：P
 | `FDE_MEMORY_LIMIT_MAX` / `FDE_PIDS_LIMIT_MAX` | FDE 容器资源限额上限（`0` = 不限；透传 station-docker-proxy） | `0` / `0` |
 | `FDE_DEV_MODE` | 显式开发模式（F12/F14 松约束；生产必须 `0` 或 `NODE_ENV=production`） | 开发 `1` / 生产 `0` |
 | `FDE_DEV_USER` | 开发期容器 `--user`（whoami 镜像无双 UID 用户时兑底） | `1001:1000` |
+| `FILE_UPLOAD_MAX_BYTES` | **单个上传文件**的字节上限（#472 片 B，portal 侧 `config.fileUploadMaxBytes`，`deploy/docker-compose.yml` 的 portal env 注入）。⚠ 与 `MAX_BODY_BYTES`（64 KiB，JSON 请求体口径）**是两个不同的旋钮**：拿后者卡上传会把所有真实文件判成 413。超限 ⇒ `413 file_too_large` 且服务端主动断流、不留 `.tmp`（契约见 `docs/api/portal.md` §4.14） | `33554432`（32 MiB）|
 
 ### 10.2 补登：agentd 容器侧环境变量（runner 运行时，2026-09-24 登记）
 

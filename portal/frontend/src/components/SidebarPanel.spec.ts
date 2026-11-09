@@ -13,6 +13,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import SidebarPanel from './SidebarPanel.vue';
 import SessionPickerModal from './SessionPickerModal.vue';
+import DirectoryTree from './DirectoryTree.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
 import { useSiteStore } from '../stores/site';
@@ -1218,5 +1219,28 @@ describe('SidebarPanel · 端口区块与底部堆叠区（issue #308 + #468 追
       await tick();
       expect(await visiblePorts(wrapper)).toEqual(['5173', '22000', '22001', '8098', '8099', '34107']);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #472 片 B：上传成功的事件链**中段**。
+//   组件侧（DirectoryTree.spec）钉「树 emit 了」，视图侧（WorkbenchView.spec）钉「灯被重判」，
+//   中间这一环（侧栏透传）没有自己的判据就会整条断掉而两侧全绿 —— 典型的「链上每环都有人以为
+//   别人钉过了」。顺带钉住「侧栏不自己拉灯」：git-light 的数据所有权在视图侧的 useGitLight。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · files-changed 透传（issue #472）', () => {
+  const DIR_A: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  it('目录树 emit files-changed ⇒ 侧栏原样向上 emit，且自己不发 /api/git-light', async () => {
+    const wrapper = await mountPanel({ dirs: DIR_A });
+    await flushPromises();
+    expect(wrapper.emitted('files-changed')).toBeUndefined();
+
+    wrapper.findComponent(DirectoryTree).vm.$emit('files-changed');
+    await flushPromises();
+
+    expect(wrapper.emitted('files-changed')).toHaveLength(1);
+    const urls = vi.mocked(fetch).mock.calls.map(([u]) => (typeof u === 'string' ? u : u instanceof URL ? u.href : u.url));
+    expect(urls.some((u) => u.startsWith('/api/git-light')), '侧栏不该越过视图去拉收工灯').toBe(false);
   });
 });

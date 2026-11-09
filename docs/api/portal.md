@@ -32,7 +32,7 @@
 | 认证 | `POST /api/auth/login/email-code` | 第二步：**邮箱验证码**校验，发 cookie（#449，§2.3a）|
 | 认证 | `POST /api/auth/login/email-code/resend` | 重发邮箱验证码（#449，§2.3b）|
 | 认证 | `POST /api/auth/logout` | 登出 |
-| 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password`，§2.6）|
+| 认证 | `GET /api/me` | 当前用户信息（含 `must_change_password` 与 `file_upload_enabled`，§2.6）|
 | 认证 | `POST /api/me/password` | **本人自助改密**（#255 首登强制改密的唯一出口，§2.6a）|
 | 边缘授权 | `GET /api/forward-auth` | Traefik forwardAuth 回调（非浏览器 API） |
 | 项目 | `GET /api/projects` | 项目列表（**留档只读**，P5 后表内无新行 ⇒ 正常返回空 `items`，§3.2/§3.3） |
@@ -85,6 +85,7 @@
 | 端口 | `PATCH /api/ports/:id` | 改可见级别（exposure）——⚠ **未交付**（无路由，实测 `404`；口径已裁决：预览不对外分享，见 principles §3 / #250）|
 | 端口 | `POST /api/ports/:id/preview-ticket` | 签发一次性预览 ticket（§2.8） |
 | 端口 | `POST /api/me/ports/batch-tickets` | **一键放行整组：一次请求签 N 张预览票**（#247，§4.7a：上限 = 号池块大小、越界 `404`、审计逐张、零新错误码） |
+| 文件 | `POST /api/files/upload?cwd=&path=&name=[&overwrite=1]` | **入向通道：上传一个文件**（#472 片 B，§4.14：**请求体是原始字节，不是 multipart**；per-user 能力位 `file_upload_enabled` 在**收 body 之前**判 ⇒ 未授权 `403 upload_disabled`；流式落盘不读进内存；同名 `409 file_exists`，`overwrite=1` 才替换）|
 | 文件 | `GET /api/file?mode=json\|stream\|download` | 单文件预览（缺省 `json` 行为不变）；`stream` 带 Range/MIME/Disposition，`download` 附件（#366 P0，§4.11） |
 | 文件 | `POST /api/preview-tickets` | 签一枚 `/pv/<code>` 预览能力码（#366 P2，§4.11） |
 | 文件 | `GET /pv/<code>/**` | kkFileView 反代网关（非 JSON API，浏览器 iframe 入口；#366 P2，§4.11） |
@@ -161,7 +162,7 @@
 | 400 | `validation_failed` 之外，开户链路还可能返回 `preview_port_block_invalid`（管理员显式指定的块起点未对齐/越界/装不下 N 个端口，`field='preview_block_start'`）。号池用尽时返回 `preview_port_pool_exhausted`（500 类，带 `used`/`total` 计数）——800 段号池，实测极难触发。**交付② 的改块端点不透 `preview_port_block_invalid`**：同一种非法在浏览器侧一律是 `validation_failed`（`details.field='block_start'`，§4.7a） | 否 |
 | 409 | `idempotency_conflict` | 同一 `Idempotency-Key` 的并发请求未收敛（先到先得）——该 key 的首次执行仍在进行中（`in_progress` 占位 < 5 分钟），或本请求的占位已被其它 owner 接管（`claim_token` fencing 失配，§1.4）；稍后重试即可拿到首次结果 | 是 |
 | 409 | `email_not_registered`（#449）| **邮件通道已启用，但这个账号没有邮箱** ⇒ 第二因素做不成（`users.email` 为空）。`retryable: false`：重试一万次也不会长出邮箱，`message` 直接给出路「请联系管理员补录邮箱」。**关键语义：绝不静默退回纯口令**（否则「开了第二因素」只是控制台的错觉）。落点：§2.2 第一步与 §2.3b 重发 | 否 |
-| 409 | `mail_not_configured`（#449，管理台切片）| **测试发信时邮件通道未启用**（`mail_settings` 无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半 ⇒ 读取侧一律 `enabled:false`）。`retryable: false`：重试一万次也发不出去，`message` 直接给出路「先去管理台配 SMTP」。落点只有 `POST /api/admin/mail/test`（§4.12）——登录路径同一种状态**不是错误**（它按「没有第二因素」正常退回纯口令，§2.2 第④分支）| 否 |
+| 409 | `mail_not_configured`（#449，管理台切片）| **测试发信时邮件通道未启用**（`mail_settings` 无行 / `transport='disabled'` / `MAIL_TRANSPORT=disabled` 急停 / 配置只配了一半 ⇒ 读取侧一律 `enabled:false`）。`retryable: false`：重试一万次也发不出去，`message` 直接给出路「先去管理台配 SMTP」。落点只有 `POST /api/admin/mail/test`（§4.12）——登录路径同一种状态**不是错误**（它按「没有第二因素」正常退回纯口令，§2.2 第③分支）| 否 |
 | 409 | `llm_model_not_found`（#261014 切片 B2，工单 `fix-261014-05b2`）| **发消息预检 fail-fast**：`POST /api/sessions/:id/messages` 在建 run 之前发现「会话属主 active LiteLLM binding 里某个**已配置槽位**的 `model_info.id` 在网关 `/model/info` 里查不到」（模型被删除/重建 ⇒ **id 变**）。**与 `llm_not_configured` 的关键差别：后者是「压根没配」，本码是「配过，但那个模型已经不存在了」**。`details` = `{slot, model_id}`（`slot` 取值 `main` / `embedding` / `vision`）。**选 409 而不是 424**：请求本身合法且已认证，失败原因是「绑定配置与网关目录的状态互相矛盾」，与同端点既有的 `409 llm_not_configured` / `409 run_in_progress` 同族（424 Failed Dependency 语义是「依赖的前置请求失败」，这里没有任何前置请求，且 §4.3 全表无 424 先例）。**只在发消息路径拦**：心跳路径同判据仍只 `warn`（§9.5，`reason: 'unknown_model_id'`）；**网关不可达一律放行**（fail-open，不让网关抖动演成用户发不出消息）| 是（管理员改配后原样重试可成功；本预检零副作用、不写幂等台账，同 `Idempotency-Key` 重试会重新占位，§1.4。**盲目立即重试仍是同一码**——解法只有一个：改配） |
 | 400 | `tls_cert_invalid`（#456，§4.13）| **上传的证书 PEM 解析不出来**（`new X509Certificate()` 抛；空串/非 PEM/被截断都算）。`retryable:false`：同一份字节重试一万次也一样。`details` 不带任何 PEM 片段 | 否 |
 | 400 | `tls_key_invalid`（#456，§4.13）| **上传的私钥 PEM 解析不出来**（`createPrivateKey()` 抛）。与 `tls_key_mismatch` 的区别：这是「这根本不是一把钥匙」，那是「是钥匙但不是这张证书的」| 否 |
@@ -172,6 +173,9 @@
 | 400 | `tls_cert_domain_mismatch`（#456，§4.13）| **证书覆盖不到管理台域名**（`details = {adminHost, missing:[…], certDomains:[…]}`），或 `confirmDomains` 里有证书覆盖不到的名字（此时 `details.field='confirmDomains'`，`missing` 只列超出的那些）。**无 override**：不覆盖 `admin.<伞域>` 的证书装上去 = 刷新后进不了管理台，只能登服务器救 | 否 |
 | 404 | `tls_no_previous`（#456，§4.13）| **没有可回滚的上一代证书**（`<dynamic>/certs/prev/` 不存在或不完整——首次上传后立刻点回滚就是这一格）。`retryable:false` | 否 |
 | 413 | `payload_too_large` | 请求体超过大小上限（`Content-Length` 或实际流式字节超限） | 否 |
+| 403 | `upload_disabled`（#472 片 B，§4.14）| **这个账号没有「往自己磁盘上传文件」的能力**：`users.file_upload_enabled` 不是 `true`（片 A 的 per-user 开关，管理台 Edit → Security 里开）。**与 `forbidden` 的关键差别：判定发生在读请求体之前**——上传端点的 body 是几十 MiB 的字节流，先收完 body 再拒 ⇒ 未授权的人能把 portal 的内存与带宽当成压力测试工具，所以这里「无权」连带「不必听完你说什么」。`details = {action: 'enable_in_admin_console'}`（解法只有一个：让管理员开启，重试本请求不变）。**判据是 `=== true`**：缺键 = 不知道 = 不授权（前端 `v-if` 同口径，见 §4.14）| 否 |
+| 409 | `file_exists`（#472 片 B，§4.14）| **上传的目标文件已存在**且本次没带 `overwrite=1`。`details = {path}`（相对牢笼根的路径，与 `GET /api/files/tree` 同口径）。**三个落点同一个码**：进 body 前的快速检查（`lstat`）、提交点 `link` 失败的竞态判据、以及 `overwrite=1` 时目标在传输期间**变成了目录**（`rename` 抛 `EISDIR`/`ENOTEMPTY`，`details.reason='target_is_dir'`——不映射就会变成 500，把「目标被占」报成服务端故障）——调用方不必区分，前端拿到它就是「问用户要不要覆盖」的时机（第三种的答案是「换名」）。⚠ 快速检查**不是** no-clobber 的依据（两步之间目标可被别人创建），真正的依据是提交点，见 §4.14 的 `link` 说明 | 否（要么覆盖要么换名）|
+| 400 | `upload_interrupted`（#472 片 B，§4.14）| **上传在传输完成前中断**（客户端 `destroy()`、网络断、页面被切走 ⇒ 请求流 `aborted`/`error`/提前 `close`）。`retryable: **是**`（本表里少数几个「重试就行」的 400：内容从头重传即可，且服务端已把半截 temp 删掉，不会留下半个文件）。`details = {bytes}`（已落盘的字节数，只用于排查，不代表任何已提交的内容）| 是 |
 | 429 | `rate_limited` | 限流（登录爆破、LLM 配额，见 §6.1） | 是（遵循 `Retry-After`） |
 | 503 | `container_unreachable` | ⚠️ 仅 push 下发模式（待决策者确认）FDE 容器不可达（见 §6.3）；拉模型（终态）不返回此码 | 是 |
 | 503 | `email_send_failed`（#449）| **验证码邮件没发出去**（SMTP 超时/拒绝/未配置口令解不开等，`details` 不带正文）。`retryable: true`：**`pending_token` 不作废**，用户点「重发」（§2.3b）即可，不必重输口令。**管理台测试发信（§4.12）用同一个码但回 `502`**：那是管理员手点的一次探活请求，没有「待决登录」可保留，`details` 只有 `{reason}` 摘要 | 是 |
@@ -237,21 +241,25 @@
 
 ### 2.2 `POST /api/auth/login`
 
-第一步：校验口令。响应按「第二因素选择规则」（下表）分四种：`totp_required`（进入 §2.3）、`email_code_required`（进入 §2.3a）、`authenticated`（口令直通，直接建会话发 cookie）、或直接 `409 email_not_registered`。
+第一步：校验口令。响应按「第二因素选择规则」（下表）分五种：`totp_required`（进入 §2.3）、`email_code_required`（进入 §2.3a）、**`second_factor_choice`（#449 二选一：§2.3 与 §2.3a 两条任选其一都能过）**、`authenticated`（口令直通，直接建会话发 cookie）、或直接 `409 email_not_registered`。
 
 #### 第二因素选择规则（issue #449，实现为纯函数 `login-email-code.js#chooseSecondFactor`）
 
-按顺序取第一条命中的分支（**顺序就是优先级**，TOTP 永远优先——已注册 TOTP 的账号行为一字不改）：
+按顺序取第一条命中的分支（**顺序本身就是契约**，别调换）。#449 二选一之后共**五分支**：已注册 TOTP 且拿得出「第二条路」的账号不再只走 TOTP，而是两条并存、任一通过：
 
-| 已注册 TOTP | 邮件通道启用 | `users.email` 非空 | 结果 | 说明 |
-|---|---|---|---|---|
-| 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3 |
-| 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
-| 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
-| 否 | 否 | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末） |
+| # | 已注册 TOTP | `users.mail_otp_enabled`（per-user 开关，迁移 0028）| `users.email` 非空 | 结果 | 说明 |
+|---|---|---|---|---|---|
+| ① | 是 | 是 | 是 | `200 status='second_factor_choice'` | **#449 新增**：TOTP **或** 邮箱验证码任一通过（响应见下）|
+| ② | 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3。**含「开关开但没邮箱」**——绝不因为缺邮箱把已绑 TOTP 的人挡在门外 |
+| ③ | 否 | 非 `true` | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末）|
+| ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
+| ⑤ | 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
 
-- 「邮件通道启用」= `mail_settings.transport='smtp'` **且** `MAIL_TRANSPORT !== 'disabled'`（运维急停）**且** 配置能读出来（读取失败降级为未启用，见 §2.3a 的「fail-open」）。
+- ⚠ **① 必须排在 ② 之前**（写反就是本单要修的死开关）：已绑 TOTP 的账号打开 `mail_otp_enabled` 后，界面显示「已启用」而实际一封码都不发、也没有任何提示。
+
+- 「开关」= **按用户**的 `users.mail_otp_enabled`（迁移 0028，管理员在用户编辑 → 安全里设，默认 `false`）；全局 `mail_settings.transport` 只是 SMTP 连接配置，**不再是功能闸**（2026-11-06 口径：否则「管理员开了开关、界面显示已启用、实际永远走口令」是必然的死光纤）。它只决定**信发不发得出去**：④ 发不出去 ⇒ `503 email_channel_unavailable`（唯一第二因素发不出去就不能进）；① 发不出去 ⇒ **不报错**，只降级成仅 TOTP（见下方响应与 §1.2）。「读取失败 / 急停」的 fail-open 口径见 §2.3a 末尾。
 - 未启用时的口令直通**不是无声的**：启动日志会打一条 `level:'warn'`（`[auth] email verification code disabled (mail settings unavailable or MAIL_TRANSPORT=disabled); accounts without TOTP log in with password only`），且成功登录审计的 `method` 写的是 `password_direct_no_second_factor`（不是笼统的 `password_direct`）——「这一层没做第二因素」在日志与审计里都能被查到。
+- `auth.login_success` 的 `details.method` 是个**四值枚举**（运维拿它区分「走的哪条第二因素」）：`password_direct_no_second_factor`（口令直通）/ `totp`（TOTP 通过）/ `email_code`（邮箱码通过且**该账号没有** TOTP）/ **`email_code_alt`**（#449 新增：邮箱码通过、但**该账号同时有 TOTP** ⇒ 用户主动走了两条里较弱的那一条）。OR 语义让「第二因素强度 = 两者中较弱的」，这不是 bug（是决策者的选择），但**必须可审计**。
 
 请求：
 
@@ -297,6 +305,37 @@
 
 > 本响应同样**不带** `password_change_required`（#255）：还没发 cookie，谈不上受限会话；这一位在 §2.3a 的成功响应里给。
 
+响应 `200`（**#449 二选一：已注册 TOTP + 开关开 + 有邮箱**，进入可选的第二步；**此时尚未登录**）：
+
+```json
+{
+  "status": "second_factor_choice",
+  "pending_token": "pt_9f2c...",
+  "expires_in": 600,
+  "methods": ["totp", "email_code"],
+  "email_hint": "a***@e***.com",
+  "email_sent": true
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `methods` | 本次**真的能走**的通道。两条都发得出 ⇒ `["totp", "email_code"]`；邮件不可用 ⇒ `["totp"]`。**客户端一律以本字段为准**，不要自己补邮箱入口 |
+| `email_sent` | 码是否真的发出去了（`false` ⇒ 库里**没有**码行，想走邮箱那条得先调 §2.3b 重发）|
+| `email_unavailable` | 仅在邮件通道不可用时出现（`true`），与 `email_sent:false` / `methods:["totp"]` 同时出现；可附 `notice`（人可读的一句说明）|
+| `pending_token` / `expires_in` / `email_hint` | 与 §2.2 `email_code_required` 逐字同口径：`expires_in = max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`（默认 600）；两路共用这一枚令牌，取短的那头会让邮件码比 TOTP 窗口还短 |
+
+三条硬口径：
+
+1. **发信是尽力而为，绝不能挡住 TOTP**。SMTP 不可用 / 发信失败 / 撞发信频控 ⇒ 不是 `503`、不是 `500`，而是 `200` + `methods: ["totp"]` + `email_sent: false` + `email_unavailable: true`（+ `notice`）。TOTP 是离线可用的强因素，让它输于 SMTP 抖动比本单之前更糟。
+   ```json
+   { "status": "second_factor_choice", "pending_token": "pt_9f2c...", "expires_in": 600,
+     "methods": ["totp"], "email_hint": "a***@e***.com", "email_sent": false, "email_unavailable": true,
+     "notice": "邮件通道当前不可用，本次仅可用验证器应用（TOTP）" }
+   ```
+2. **不造新的令牌类型**：这枚 `pending_token` 能被 §2.3（`/login/totp`）与 §2.3a（`/login/email-code`）**两边消费**。谁先成功谁建会话；`login_pending` 是单次消费，所以成功后另一条路自然失效（再调 ⇒ `401 pending_expired`）。
+3. 审计能区分走了哪条：TOTP 成功 ⇒ `method='totp'`；邮箱码成功且**该账号有 TOTP** ⇒ `method='email_code_alt'`；邮箱码成功且无 TOTP（④ 分支）⇒ `method='email_code'`（§2.2 末的枚举）。
+
 | 字段 | 说明 |
 |---|---|
 | `password_change_required`（#255，工单 `feat-261013-03`，纯 additive）| `true` ⇒ 本次下发的会话是**受限会话**（`users.must_change_password=true`：口令由管理员开户/重置时代设，还没经过本人之手），除 §2.11a 放行清单外的 `/api/*` 一律 `403 password_change_required`（§1.2）。**前端应在拿到 cookie 的那一刻就把用户弹到改密屏**，而不是先碰一个 403 再猜。`false` 也必须**出现**（恒为布尔，不靠缺省省掉）。两个**发会话**的分支都有（本分支与 §2.3 第二步）；`totp_required` 中间响应与所有失败响应（401）**都不带**——还没会话的人谈不上受限，发了反而泄露「这个账号欠一次改密」 |
@@ -308,13 +347,16 @@
 | HTTP | code | 场景 |
 |---|---|---|
 | 401 | `invalid_credentials` | 用户名或口令错误（**不区分是哪种**，防用户枚举） |
-| 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第③分支）。**不会退回纯口令** |
+| 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第⑤分支）。**不会退回纯口令** |
 | 429 | `rate_limited` | 同一 login / IP 连续失败触发限流；响应带 `Retry-After` 头（秒） |
-| 503 | `email_send_failed` | 第②分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束） |
+| 503 | `email_send_failed` | 第④分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束）。⚠ **#449 二选一（① 分支）不适用**：那里发信失败不是错，只降级成仅 TOTP（`200`）|
+| 503 | `email_channel_unavailable` | 第④分支：`mail_otp_enabled` 开着但邮件通道整体不可用（未配置 / 急停 / 读不出）。**绝不静默降级到口令**（否则用户以为过了第二因素，其实只过了口令）。同样**不适用于 ① 分支**（那里降级成仅 TOTP，不报错）|
 
 ### 2.3 `POST /api/auth/login/totp`
 
 第二步：校验 TOTP，成功后建立会话。
+
+> **#449 二选一**：本端点同样接受 §2.2 ① `second_factor_choice` 签发的 `pending_token`（与 §2.3a/§2.3b 共用同一枚，单次消费）。走本端点成功一律记 `method='totp'`（现状值不改，不论令牌出自 ② 还是 ①）。
 
 请求：
 
@@ -349,7 +391,7 @@
 
 ### 2.3a `POST /api/auth/login/email-code`（issue #449：邮箱验证码第二步）
 
-第二步的另一条路：**未注册 TOTP 且邮件通道启用**的账号（§2.2 第二因素选择规则第②分支）在这里交验证码，成功后建立会话。
+第二步的另一条路：**未注册 TOTP 且开关打开**的账号（§2.2 第二因素选择规则第④分支）在这里交验证码，成功后建立会话。**本端点同样接受 ① `second_factor_choice` 签发的 `pending_token`**（#449 二选一：两路共用同一枚令牌、单次消费 ⇒ 谁先成功谁建会话，另一条自然失效）；走这条路且**该账号有 TOTP** 时，审计 `method` 记 `email_code_alt`。
 
 请求：
 
@@ -396,18 +438,20 @@
 
 **SMTP 配置从哪来（决策者 2026-11-04/05 定稿）**：`mail_settings` 单行表（管理台维护，`GET/PUT` 留给下一片），运行时由 `portal/src/mail-provider.js` 读取并 60s 缓存。口令是**明文列** `smtp_password`——目标是内网 email relay，口令非高价值，与既有 `git_hosts.admin_key`（迁移 0011）同一口径；若将来换成公网 SMTP 再上加密列。**API / 审计 / 日志永不返回口令明文**（管理台只给 `hasPassword` 布尔，下一片）。
 
-**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整（配了一半）⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第④分支（纯口令 + 审计 `password_direct_no_second_factor`）。**「未配置」「`transport='disabled'`」「运维急停」是正常状态，不告警**（评审返修 ④：否则 60s 缓存每过期一次就刷一行噪声）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
+**fail-open 口径（D3b）**：`mail_settings` 读不到（迁移没跑 / DB 抖动）或配置不完整（配了一半）⇒ 邮件通道按**未启用**处理（`level:'warn'` 一条），登录退回 §2.2 第③分支（纯口令 + 审计 `password_direct_no_second_factor`）。**「未配置」「`transport='disabled'`」「运维急停」是正常状态，不告警**（评审返修 ④：否则 60s 缓存每过期一次就刷一行噪声）。**绝不 fail-closed 到「所有人登不进」**。运维急停用 `MAIL_TRANSPORT=disabled`：为真时无论 DB 怎么配都不发信（不读库、不看缓存）。
 
 审计（`audit_log`）：
 
 | action | 时机 | `details` |
 |---|---|---|
 | `auth.email_code_sent` | 码发出去了 | `{login, email_hint, code_hash_prefix, expires_at, resend_count?, at}`——`code_hash_prefix` 是 `sha256(码)` 的**前 12 位**；**绝无明文码** |
-| `auth.email_code_failed` | 发信失败（`503`） | `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令） |
-| `auth.email_code_verified` | 校验通过并发了会话 | `{login, method:'email_code', at}`；另有一条 `auth.login_success`（`method='email_code'`） |
+| `auth.email_code_failed` | 发信失败（§2.2 第④分支的 `503`；**或** ① 二选一分支的降级，此时不报错只 `200`，并额外带 `second_factor_choice: true`）| `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令）|
+| `auth.email_code_verified` | 校验通过并发了会话 | `{login, method, at}`，`method` = `email_code`（该账号无 TOTP，§2.2 第④分支）或 **`email_code_alt`**（该账号**同时有 TOTP**，走的是 ① 分支里较弱的那一条，#449）；同时另有一条 `auth.login_success`，**两处 `method` 同值**（一次登录一个口径）|
 | `auth.email_code_invalid` | ——**不写** | 码错不落审计：这是可重试的日常动作，写了只会被爆破尝试刷成噪声；失败次数由限流器持有 |
 
 ### 2.3b `POST /api/auth/login/email-code/resend`（issue #449：重发验证码）
+
+**本端点同样接受 ① `second_factor_choice` 签发的 `pending_token`**（#449 二选一）：前端在第二步里从 TOTP 切到邮箱码**不算重发**（已发出的码不因切换作废）；用户主动点「重发」才调本端点。`email_sent:false` 的那次登录库里零码行，恰好走下面的「零行 = 首次发信重试」口径。
 
 请求：
 
@@ -503,7 +547,8 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
     "role": "fde",
     "fde_name": "alice",
     "auth_source": "local",
-    "must_change_password": true
+    "must_change_password": true,
+    "file_upload_enabled": false
   }
 }
 ```
@@ -514,6 +559,9 @@ cookie 值为**不透明会话令牌**（无 `sub`/无结构）：服务端只�
 | `fde_name` | 该用户的 FDE 标识（= 容器名 `fde-<name>` 的 `<name>`、预览域名首段），无容器时为 `null` |
 | `auth_source` | `local` \| `oidc`（P1 恒为 `local`） |
 | `must_change_password`（#255，纯 additive）| 当前会话是否**受限**（与 §2.2 登录响应的 `password_change_required` 同源同值，只是载体不同）。本端点在 §2.11a 的放行清单里，因此它是 **SPA 刷新后重建改密屏的唯一数据源**——挡住它，前端就只能看到一片 403 而不知道该把用户送去哪儿 |
+| `file_upload_enabled`（#472 片 A，纯 additive）| 该用户能不能用上传端点（`users.file_upload_enabled`，迁移 `0029`，`NOT NULL DEFAULT false`；**上传端点本体是片 B**，届时落在 §4.14）。服务端恒给**布尔**（库里给 `'f'` / `NULL` 等形状也收成 `false`），前端判据一律 `=== true`。**它只在这个 user DTO 里**，不在登录响应顶层（顶层那个位置是 `mail_otp_enabled`，属宿主判定输入）|
+
+**四条 user DTO 路径键集一致（#472 片 A，不是巧合而是约定）**：`POST /api/auth/login`（口令直通）、`POST /api/auth/login/totp`、邮箱码第二步、以及本端点，四处下发的 `user` 对象由**同一个构造函数**产出（`portal/src/auth.js` 的 `toSessionUser`）。原因：SPA 的 `login()` / `submitEmailCode()` 把**登录响应里的 `user`** 直接存进 store，且**不重拉 `/api/me`** ⇒ 只给本端点补字段会让新键在「刚登录的那整个会话」里不存在（按钮不出现，直到整页刷新）。唯一允许的额外键是本端点的 `must_change_password`（**会话态**，不属用户态），由 §2.11a 的受限会话门消费。
 
 ### 2.6a `POST /api/me/password`（#255：本人自助改密，受限会话的出口）
 
@@ -2494,6 +2542,98 @@ DB 写失败**不回滚已生效的证书**（盘是真相，回滚才是更坏�
 
 ---
 
+### 4.14 文件上传（`POST /api/files/upload`，issue #472 片 B）
+
+用户把本地文件放进自己的牢笼目录（`GET /api/files/tree` / `GET /api/file` 的**入向对偶**）。
+能力位本身（谁能传）是片 A 的 `users.file_upload_enabled`，管理台 Edit → Security 里开；本节只写端点。
+
+#### 4.14-1 请求
+
+```
+POST /api/files/upload?cwd=<项目cwd或%7E>&path=<相对目录，缺省 .>&name=<文件名>[&overwrite=1]
+Content-Type: application/octet-stream
+Cookie: <会话 cookie>
+
+<原始文件字节>
+```
+
+| 位置 | 参数 | 语义 |
+|---|---|---|
+| query | `cwd` | 与 `GET /api/files/tree` **同一个值**（`~`、`~/projects/x`…）。缺省 = 牢笼根 |
+| query | `path` | `cwd` 下的相对目录，缺省 `.`。逐段拒 symlink（同 §4.11 的 jail 口径）|
+| query | `name` | **单段**文件名（含 `.` `..` `/` 控制符在内一律 `400 validation_failed` + `details.field='name'`）；上限 **255 字节**（UTF-8 字节数，不是字符数 —— ext4 的 `NAME_MAX` 是字节，按字符算会让中文名在 86 字就 `ENAMETOOLONG`）|
+| query | `overwrite` | **只有字面量 `1`** 算覆盖；缺省/`0`/`true`/其它一律「不覆盖」|
+| body | 原始字节 | ⚠ **不是 multipart**，也不是 JSON/base64：门户要传的就是磁盘上那份字节，multipart 的边界解析、内存缓冲、文件名编码问题全部不要 |
+
+#### 4.14-2 闸门顺序（顺序本身是判据）
+
+```
+① requireSession                    → 401 unauthorized
+② session.user.fde_name 为空        → 400 fde_name_required（没工位 ⇒ 没有落点）
+③ file_upload_enabled !== true      → 403 upload_disabled      ← 必须在读 body 之前
+④ receiveUpload(...)                → jail/名字/目标检查 → 流式落 temp → 提交
+```
+
+三条各自成立的理由：
+
+1. **能力位在读 body 之前（③）**。②③ 都在打开 temp、消费请求流**之前**抛出。上传的 body 是几十 MiB，
+   先收完再拒 ⇒ 没开权限的账号能用一个请求把 portal 的磁盘与带宽打一遍，而 portal 是全平台单点。
+   单测的钉法不是「响应码对」而是**「答复那一刻 `req` 的 `data` 事件数为 0」**
+   （`portal/test/http-upload.test.js`；⚠ 答复**之后** Node 会用 `_dump` 把没人读的 body 排空，
+   所以累计计数必然 >0 —— 判据必须取答复前的快照，否则这条变异不死）。
+2. **流式落盘，不把 body 读进内存**。逐 chunk 写 temp（`fsutil.writeTempFileFromStream`）+ `fsync` +
+   超限时**主动 destroy 流**并删 temp。默认上限 `FILE_UPLOAD_MAX_BYTES=33554432`（32 MiB，`docs/env.md`）。
+   反过来说：门户共用的 `MAX_BODY_BYTES`（64 KiB）**不适用**在这里 —— 那是 JSON 请求体的口径，
+   拿它卡上传会把所有真实文件判成 413。
+3. **no-clobber 用 `link`，不用 `rename`**。`rename(2)` **总是替换**目标，所以「先 `lstat` 看存在、
+   再 rename」这两步之间 agent（或另一个上传）创建了同名文件时会被**静默覆盖**。提交点用
+   `linkSync(temp, target)`：`EEXIST` ⇒ 清 temp + `409 file_exists`，这是唯一的硬判据；
+   `lstat` 那条只是「早退」的快速路径（省掉一次几十 MiB 的传输），**不是**安全依据。
+   `overwrite=1` 才走 `rename` 原子替换。目标是 symlink 时**无论 overwrite 一律 400**
+   （`rename` 替换的是链接本身 ⇒ 覆盖语义保不住 jail）。覆盖分支还有一个用户可触发的边界：目标在
+   传输期间被**换成目录** ⇒ `rename` 抛 `EISDIR`/`ENOTEMPTY`，服务端把它映射成 `409 file_exists`
+   （`details.reason='target_is_dir'`）而不是让它变成 500。
+
+#### 4.14-3 落盘属主与模式（不是可选项）
+
+portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1），所以**必须**同时 chown 到
+`ctx.config.fdeUid` **和** `fdeGid`（`0660`）：只 chown uid 会留下 `gid=0`（root 组），
+容器内的 agent（uid=1000，主组=1000）就**改不动自己工位里刚传上来的文件** ——
+上传成功但用户/agent 后续写不进去，是比报错更难查的那种坏。口径与 §6.2 一致（组写位靠属组 + umask，不靠 setgid）。
+
+#### 4.14-4 响应
+
+| HTTP | 体 | 何时 |
+|---|---|---|
+| `201` | `{path, bytes, overwritten: false}` | 新建成功 |
+| `200` | `{path, bytes, overwritten: true}` | `overwrite=1` 且提交掉了旧内容 |
+| `400` | `validation_failed` / `upload_interrupted` | 名字或 path 形态非法 / 目标（在**进 body 前**那一刻）是一个目录或是 symlink / 传输中断（可重试）。⚠ 目录这一格是**快速路径**的语义：如果是传输期间才变成目录，那是上面那行 409 |
+| `403` | `upload_disabled` | 能力位不为 `true`（**未收 body**）|
+| `404` | `not_found` | `cwd`/`path` 指向的目录不存在 |
+| `409` | `file_exists` | 目标已存在且没带 `overwrite=1`（快速路径或提交点竞态，同一个码）；**或** `overwrite=1` 而目标在传输期间变成了目录（`details.reason='target_is_dir'`）|
+| `413` | `file_too_large` | 超过 `FILE_UPLOAD_MAX_BYTES`，`details = {max_bytes, bytes}` |
+
+`path` 是**相对牢笼根**的路径（与 `GET /api/files/tree`、预览端点同口径），不是绝对路径。
+**任何失败路径都不留 `.tmp` 残骸**（超限、断流、提交失败都先 unlink temp）。
+
+#### 4.14-5 前端契约（三态 + 409）
+
+- 按钮渲染条件：`auth.user?.file_upload_enabled === true`。**不是 `!== false`**：缺键的含义是
+  「这个 DTO 没告诉我」（旧服务端/旧会话形状），此时给一个点了必 403 的按钮比不给更坏。
+- 409 ⇒ `window.confirm` 问「要不要覆盖」，**确认之前零请求**；确认了才**只对这一个文件**重发
+  `overwrite=1`（批量里其余文件各自判自己的 409）。选「不覆盖」= 静默跳过，不算失败。
+- 上传必须走 `api()`（`portal/frontend/src/api.ts`）而不是裸 `fetch`：裸 fetch 丢掉 `ApiError.code`、
+  #255 受限会话跳转与 `details`，前端会把 403/413/409 全糊成「请求失败」。
+- 成功后 `emit('files-changed')` ⇒ `WorkbenchView` 重判收工灯（新文件未跟踪 ⇒ 灯该变红，D9
+  「红是进度不是警报」）。不重判 = 灯在骗人。
+
+> 实现：`portal/src/http.js`（handler 与闸门）、`portal/src/dirs.js`（`receiveUpload`）、
+> `portal/src/fsutil.js`（`writeTempFileFromStream` / `commitTempFileNoClobber`）。
+> 单测：`portal/test/file-upload.test.js`（单元：jail/名字/属主/no-clobber/残骸）、
+> `portal/test/http-upload.test.js`（HTTP 级：零读取判据、线上 DTO、上限、断流、受限会话门）。
+
+---
+
 ## 5. SSE 事件流（`GET /api/sessions/:id/events`）
 
 ### 5.1 传输语义
@@ -2697,6 +2837,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 2. SSE mock：按 §5.3 清单逐类型发事件，`id` 递增；模拟断线后带 `Last-Event-ID` 重连，验证补发不漏（P2 验收的前端半边）。
 3. `messages.synthetic: true` 的消息必须有独立视觉标记（规格 §9.2 红线）。
 4. 预览 URL 一律取 `PortAllocation.url` 字段，禁止拼接域名（规格 §8.1 同源原则）。
+5. **能力位字段的 mock 基线（#472 片 A）**：mock `GET /api/me` 与两个登录端点的 `user` 时，**四处形状必须一致**（同一个构造点，见 §2.6 的「四条 user DTO 路径键集一致」）；`file_upload_enabled` 要能造出**三种**响应：`true` / `false` / **缺键**（三态 UI 与片 B 的按钮显隐判据都靠这三格，只 mock 两态就验不到「未知」那一格）。
 
 ---
 
@@ -3579,7 +3720,9 @@ Reactivation starts a new provisioning pass for the retained identity, including
 
 ### `PATCH /api/admin/users/:id`
 
-Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
+Accepts one or more of `display_name` (trimmed; blank falls back to `login`), `email`（可改可清，`null`/空串 = 清空）, `mail_otp_enabled`（布尔，打开前需已有邮箱且邮件通道可用）, `file_upload_enabled`（布尔，#472 片 A）, `role` (`fde` or `admin`), `fde_name` (valid FDE DNS label or `null`), and `status` (`active` or `disabled`). `login` is immutable. Empty updates, unknown fields, invalid values, or an invalid UUID return `400 validation_failed`; duplicate `fde_name` returns `409 fde_name_conflict`; a missing user returns `404 not_found`. Disabling sets `disabled_at` and atomically revokes every unrevoked login session; re-enabling clears `disabled_at`.
+
+**`file_upload_enabled`（#472 片 A，issue #472）**：非布尔（`'true'` / `1` / `null`）⇒ `400 validation_failed` + `details.field: "file_upload_enabled"`。它**只能在这里打开**：`POST /api/admin/users`（开户）**不接受**该入参，开户一律 `false`（开户是批量/脚本路径，多一个可选参数就多一条「脚本写错把上传开给所有人」的路）。⚠ **重新开户 = 重新授权**：同名 disabled 行被重新开户时（§12 `POST /api/admin/users` 的 UPDATE 分支）本列被**显式清零**，不继承上一个任期的权限（否则「曾开过上传 → 停用 → 再开户」会静默保留写盘能力）。服务端下发的 user DTO 里该键恒为布尔；管理台对**缺键**（旧后端 / 读不到）显示「未知」并禁用保存，不折叠成「已关闭」。
 
 ### `DELETE /api/admin/users/:id`
 

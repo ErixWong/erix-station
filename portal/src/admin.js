@@ -32,6 +32,11 @@ const safeUser = (row) => ({
   // 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。默认 false = 不启用，
   // 由管理员在 Edit → Security 里显式打开（与 TOTP 对称）。全局 transport=disabled 仍压过它。
   mail_otp_enabled: Boolean(row.mail_otp_enabled),
+  // 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。**必须 `=== true`，不是 `Boolean(...)`**：
+  // `Boolean('f') === true`（非空字符串都是真值），而 fake/旧驱动可能给 `'f'` / `0` / `undefined` 这些形状，
+  // 消费方（片 B 的 403 闸门、管理台三态）判据都是 `=== true` ⇒ 这里折叠成两态就是把陷阱留给下游。
+  // `mail_otp_enabled` 用 `Boolean()` 是既有形状，**不动**（改它会顺手改变既有行为）。
+  file_upload_enabled: row.file_upload_enabled === true,
   role: row.role,
   fde_name: row.fde_name ?? null,
   git_host_id: row.git_host_id ?? null,
@@ -86,6 +91,7 @@ function recordAdminAudit(pool, actorId, action, target, details = {}) {
 export async function listUsers(pool) {
   const r = await pool.query(
     `SELECT users.id, users.login, users.display_name, users.email, users.mail_otp_enabled,
+            users.file_upload_enabled,
             users.role, users.fde_name,
             users.auth_source, users.status, users.created_at,
             (users.totp_secret IS NOT NULL) AS totp_enabled,
@@ -258,6 +264,13 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
   // ⇒ 只治新建会漏掉「离职回来重新开户」那条路。
   // ⚠ 与 `cli.js bootstrap-admin` 的**不对称是刻意的**：bootstrap 的 INSERT 不写这一列（吃 DEFAULT false），
   //    否则 dev/CI 的 bootstrap 账号会一登录就被锁进改密屏（AGENTS §4.1）。默认值契约由迁移 0021 的守卫钉住。
+  //
+  // #472 片 A：重激活分支**显式 `file_upload_enabled = false`**（评审 blocker 2）。这条分支走的是 UPDATE，
+  // 列默认值根本碰不到它 ⇒ 不写零就会让「曾开过上传 → 被停用 → 重新开户」的账号**继承旧权限**。
+  // 口径：重新开户 = 重新授权，不许继承旧权限（与上面 must_change_password 置 true 同一个理由：
+  // 复用旧行不等于复用旧授权）。
+  // 新建分支不需要（INSERT 不带该列 ⇒ 吃 `DEFAULT false`），且 `createUser` **不接受** `file_upload_enabled`
+  // 入参：开户是批量/脚本路径，多一个可选参数就多一条「脚本写错把上传开给所有人」的路。
   let r;
   try {
     if (existing) {
@@ -265,9 +278,9 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
         `UPDATE users
             SET login = $2, email = $3, display_name = $4, password_hash = $5,
                 totp_secret = $6, last_totp_step = NULL, status = 'active', disabled_at = NULL,
-                must_change_password = true
+                must_change_password = true, file_upload_enabled = false
           WHERE id = $1 AND status = 'disabled'
-          RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+          RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at, file_upload_enabled,
                     (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           existing.id, trimmedLogin, trimmedEmail,
@@ -291,7 +304,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
       r = await pool.query(
         `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name, must_change_password)
          VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6, true)
-         RETURNING id, login, display_name, email, mail_otp_enabled, role, fde_name, auth_source, status, created_at,
+         RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, role, fde_name, auth_source, status, created_at,
                    (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           trimmedLogin, trimmedEmail,
@@ -343,7 +356,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   if (fields.length === 0) {
     throw new AdminError('validation_failed', '至少提供一个可更新字段');
   }
-  const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'role', 'fde_name', 'status']);
+  const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'file_upload_enabled', 'role', 'fde_name', 'status']);
   for (const field of fields) {
     if (field === 'login') {
       throw new AdminError('validation_failed', 'login 不可修改', { details: { field: 'login' } });
@@ -368,6 +381,11 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   }
   if (Object.hasOwn(updates, 'mail_otp_enabled') && typeof updates.mail_otp_enabled !== 'boolean') {
     throw new AdminError('validation_failed', 'mail_otp_enabled 必须是布尔值', { details: { field: 'mail_otp_enabled' } });
+  }
+  // #472 片 A：上传开关同样是布尔（照上面那条的形状）。`'true'` / `1` / `null` 都是「看起来像布尔但不是」，
+  // 放进 PG 的 boolean 列会在驱动层报 22P02（人不话），这里当场 400 并点名 field。
+  if (Object.hasOwn(updates, 'file_upload_enabled') && typeof updates.file_upload_enabled !== 'boolean') {
+    throw new AdminError('validation_failed', 'file_upload_enabled 必须是布尔值', { details: { field: 'file_upload_enabled' } });
   }
   // 两条交叉防护（都在写库之前）：开了开关却没邮箱 / 清空邮箱却还开着开关 ⇒ 都会让人**登不进去**
   // （`chooseSecondFactor` 走 `email_not_registered` 那条 409）。这里拒绝保存，而不是让它在登录时才炸。
@@ -442,6 +460,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
     setField('email', trimmedEmail);
   }
   if (Object.hasOwn(updates, 'mail_otp_enabled')) setField('mail_otp_enabled', updates.mail_otp_enabled);
+  if (Object.hasOwn(updates, 'file_upload_enabled')) setField('file_upload_enabled', updates.file_upload_enabled);
   if (Object.hasOwn(updates, 'role')) setField('role', updates.role);
   if (Object.hasOwn(updates, 'fde_name')) setField('fde_name', updates.fde_name);
   if (Object.hasOwn(updates, 'status')) {
@@ -459,7 +478,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
           WHERE id = $1 ${offboardingGuard}
-          RETURNING id, login, display_name, email, mail_otp_enabled, role, fde_name, auth_source, status, created_at,
+          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, role, fde_name, auth_source, status, created_at,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
          UPDATE login_sessions SET revoked_at = now()
@@ -723,7 +742,7 @@ export async function enrollUserTotp(pool, userId, { actorId = null, totpIssuer 
     `WITH target AS (
        UPDATE users SET totp_secret = $2, last_totp_step = NULL
         WHERE id = $1
-        RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at,
+        RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at, file_upload_enabled,
                   (totp_secret IS NOT NULL) AS totp_enabled
      ), revoked AS (
        UPDATE login_sessions SET revoked_at = now()

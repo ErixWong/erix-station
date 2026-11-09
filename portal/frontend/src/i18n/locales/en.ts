@@ -54,6 +54,12 @@ export const en = {
     emailResendIn: 'Resend in {seconds}s',
     emailResendFailed: 'Send again',
     emailBackToPassword: '← Back to the previous step',
+    // issue #449 second-factor choice (`second_factor_choice`): the two switch links and the notice shown
+    // when the email channel is down. Wording matches the store: switching reuses the same pending_token,
+    // so do not promise a resend here.
+    useEmailCode: 'Use an email code instead',
+    useTotp: 'Use your authenticator app (TOTP) instead',
+    emailChannelUnavailable: 'Email is unavailable right now — please use your authenticator app.',
   },
   // #255 forced first-login password change (views/ForcePasswordChangeView.vue). Restricted session
   // escape hatch (portal.md §2.11a). No hard-coded port/host; no promise about a minimum length
@@ -164,6 +170,20 @@ export const en = {
   tree: {
     title: 'Directory tree',
     selectDirFirst: 'Select a directory first',
+    // issue #472: upload (`POST /api/files/upload`). Same eight entries as zh-CN (locale parity is a test).
+    upload: {
+      button: 'Upload',
+      hint: 'Upload files into the current directory (an admin must enable “File upload” for this account)',
+      busy: 'Uploading…',
+      success: 'Uploaded {count} file(s)',
+      allSkipped: 'Nothing uploaded (declined to overwrite {count} existing file(s))',
+      overwriteConfirm: '“{name}” already exists. Overwrite it with the uploaded version? (Overwriting discards what is on disk)',
+      errDisabled: 'This account may not upload files: ask an admin to enable “File upload” in the user editor.',
+      errTooLarge: 'The file exceeds the per-file size limit (FILE_UPLOAD_MAX_BYTES).',
+      errInterrupted: 'The upload was interrupted (network or tab switched). Just retry.',
+      errNoDir: 'The target directory is gone: refresh the directory tree first.',
+      errGeneric: 'Upload failed (HTTP {status}).',
+    },
   },
   stream: {
     chooseOrNewSession: 'Select or create a session',
@@ -914,12 +934,24 @@ export const en = {
     mailOtpSection: 'Email verification code',
     mailOtpHint: 'Require an emailed code as the second factor for this user. This is a per-user switch, parallel to TOTP; the mail channel (SMTP) only decides whether mail can be sent at all.',
     mailOtpEnabledLabel: 'Require an emailed code at sign-in',
-    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor). Accounts with TOTP always use TOTP and ignore this.',
-    mailOtpHiddenByTotp: 'This account has TOTP enrolled — sign-in uses TOTP, so this switch has no effect.',
+    mailOtpEnabledHint: 'When off, this user signs in with the password only (no second factor).',
+    // #449 second-factor choice (`second_factor_choice`): for accounts with TOTP enrolled this switch is no
+    // longer inert — it adds a second way in. The audit wording matters: the weaker path is logged as
+    // `email_code_alt`, so operators must be able to see that from this very row.
+    mailOtpEnabledLabelAlt: 'Email code (as an alternative to TOTP)',
+    mailOtpAltHint: 'This account has TOTP enrolled. Once enabled, sign-in accepts either TOTP or an emailed code; the email-code path is recorded in the audit log as email_code_alt.',
     mailOtpCurrentEmail: 'Codes will be sent to: {email}',
     mailOtpNeedsEmail: 'This user has no email yet — fill it in on the Profile tab first.',
     mailOtpSaved: 'Email-code setting saved.',
     saveMailOtp: 'Save email-code setting',
+    // 2026-11-09 (#472 slice A): per-user "file upload" switch (migration 0029).
+    fileUploadSection: 'File upload',
+    fileUploadHint: 'Lets this user upload files into their own workspace from the workbench. Per-user switch, same pattern as TOTP / email codes: new accounts always start off and an admin has to turn it on here.',
+    fileUploadEnabledLabel: 'Allow file uploads',
+    fileUploadEnabledHint: 'When off, uploads are rejected server-side (403) and the workbench hides the upload entry. Re-creating a disabled account clears this switch, so it has to be enabled again.',
+    fileUploadUnknown: 'Unknown (this account\'s switch could not be read — reload and retry) — unknown is not "off", so saving stays disabled.',
+    fileUploadSaved: 'File upload setting saved.',
+    saveFileUpload: 'Save file upload setting',
       sectionTitle: 'FDE users',
       emptyUsers: 'No users yet.',
       noFdeName: 'no fde_name',
