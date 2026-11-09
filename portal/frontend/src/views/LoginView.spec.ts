@@ -2,7 +2,7 @@
 // issue #101 P1：装配真实 i18n（不 mock t()），默认注入 zh-CN，中文断言不变；新增切 en 的用例。
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest';
 import { nextTick } from 'vue';
-import { mount, flushPromises } from '@vue/test-utils';
+import { mount, flushPromises, enableAutoUnmount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import LoginView from './LoginView.vue';
@@ -11,6 +11,12 @@ import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
 import type { AuthUser } from '../stores/auth';
+import { nextRouteLanding } from '../test-utils/navigation';
+
+// #473 family B：本文件每条用例都 mount 一个 LoginView，但历史上 **0 次 unmount** ⇒ 上一例的
+// 登录处理器还在跑，其在途的 await 会落进下一条用例的 active pinia。enableAutoUnmount 另注册一个
+// afterEach，与下面已有的那个并存，顺序无关。
+enableAutoUnmount(afterEach);
 // #449 结构判据：同一份源码文本（vite `?raw` 构建期读盘，jsdom 下不依赖 node 内建）。
 import loginViewSource from './LoginView.vue?raw';
 
@@ -83,10 +89,12 @@ describe('LoginView 交互', () => {
     const { wrapper, router, auth } = await mountLogin();
     await wrapper.find('#loginName').setValue('alice');
     await wrapper.find('#loginPass').setValue('secret');
+    // A 类：导航由组件里的 router.replace(loginRedirect()) 触发 ⇒ **先订阅再触发**。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    // 懒加载组件解析 + 导航确认：轮询等待落地（避免数 tick 的脆弱写法）。
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    // 导航落地用显式判据（#473 family B：原 vi.waitFor 默认 1000ms 是墙钟，慢机上假红）。
+    expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
   });
 
@@ -111,10 +119,11 @@ describe('LoginView 交互', () => {
     expect(wrapper.text()).toContain('输入认证器 6 位码');
 
     await wrapper.find('#totpCode').setValue('123456');
+    // A 类：先订阅再提交（第二步成功后同样由 router.replace 落工作台）。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    // 懒加载组件解析 + 导航确认：轮询等待落地（避免数 tick 的脆弱写法）。
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
   });
 
@@ -162,8 +171,12 @@ describe('LoginView 交互', () => {
     await wrapper.find('#loginPass').setValue('secret');
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    // 懒加载组件解析 + 导航确认：轮询等待落地（避免数 tick 的脆弱写法）。
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin/users'));
+    // B 类（实测结论，不是投机）：本例的提交**根本不产生导航** —— 桩把每个 URL（含 /api/site）都回成
+    // 同一个 body ⇒ isAdminEntry 为假，而 ADMIN_USER 是无工位管理员 ⇒ LoginView 的 guardEntryRole()
+    // 就地 logout 并 return false，`router.replace(loginRedirect())` 那行走不到。而 /admin/users 早在
+    // 夹具那次**已 await** 的导航里就落地了（/login 已登录 ⇒ 守卫改写 / ⇒ #332 再改写 /admin/users）。
+    // ⇒ 拿 nextRouteLanding 订阅会永远等不到（实测 5000ms 超时），直接断言当前路由才是这里的显式判据。
+    expect(router.currentRoute.value.path).toBe('/admin/users');
   });
 
   it('语言切换到 English：登录页文案全量变英文并持久化', async () => {
@@ -268,12 +281,14 @@ describe('LoginView 邮箱验证码第二步（#449）', () => {
     await gotoEmailStep(wrapper);
 
     await wrapper.find('#emailCode').setValue('654321');
+    // A 类：先订阅再提交。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     const call = fetchFn.mock.calls.find(([url]) => String(url).includes('/api/auth/login/email-code') && !String(url).endsWith('/resend'));
     expect(call).toBeTruthy();
     expect(JSON.parse(String(call![1]?.body))).toEqual({ pending_token: 'ptok-mail', code: '654321' });
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
   });
 
@@ -635,11 +650,13 @@ describe('LoginView 二选一（#449 second_factor_choice）', () => {
     expect(loginCalls(fetchFn), '切换不得重新登录').toBe(1);
 
     await wrapper.find('#emailCode').setValue('654321');
+    // A 类：先订阅再提交。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     const call = fetchFn.mock.calls.find(([url]) => String(url).includes('/api/auth/login/email-code'));
     expect(JSON.parse(String(call?.[1]?.body))).toEqual({ pending_token: 'ptok-choice', code: '654321' });
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
   });
 
@@ -655,11 +672,13 @@ describe('LoginView 二选一（#449 second_factor_choice）', () => {
     expect(auth.pendingToken).toBe('ptok-choice');
 
     await wrapper.find('#totpCode').setValue('123456');
+    // A 类：先订阅再提交。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     const call = fetchFn.mock.calls.find(([url]) => String(url).includes('/api/auth/login/totp'));
     expect(JSON.parse(String(call?.[1]?.body))).toEqual({ pending_token: 'ptok-choice', code: '123456' });
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
   });
 
@@ -680,9 +699,11 @@ describe('LoginView 二选一（#449 second_factor_choice）', () => {
     expect(wrapper.find('#emailUnavailableNotice').text()).toContain('邮件通道当前不可用，请使用验证器应用');
 
     await wrapper.find('#totpCode').setValue('123456');
+    // A 类：先订阅再提交。
+    const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
     expect(loginCalls(fetchFn)).toBe(1);
   });

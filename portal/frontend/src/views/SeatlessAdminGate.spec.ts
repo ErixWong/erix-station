@@ -12,13 +12,17 @@
 // `process-watch-toggle`：后者带 `observationsAvailable || listError` 的闸，而本文件的桩把
 // /api/me/ports 回成 `{items: []}` ⇒ 折叠条本就不存在，拿它当挂载标记会**假红**（第 ② 类人的对照用例）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushPromises, mount } from '@vue/test-utils';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import App from '../App.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore, type AuthUser } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
+import { nextRouteLanding } from '../test-utils/navigation';
+
+// #473 family B：本文件的夹具挂整个 App，历史上用例里 **0 次 unmount** ⇒ 上一例的子树活到下一例。
+enableAutoUnmount(afterEach);
 
 /** 第 ③ 类人：`role='admin'` 且 `fde_name` 为 null ⇒ 没有工位。 */
 const SEATLESS_ADMIN = {
@@ -70,13 +74,16 @@ async function mountAppAt(initialPath: string, user: AuthUser) {
   auth.user = user;
   auth.ready = true; // 已探测过 ⇒ 守卫不再打 /api/me（本文件只数那三趟，多不多打 /api/me 无关）
   const router = createAppRouter(createMemoryHistory());
+  // A 类（夹具级订阅）：导航由**本夹具这一发 push** 触发 ⇒ 必须在 push **之前**订阅，
+  // 拿到的就是这一次导航的落地地址（#473 family B：原先用例里用 vi.waitFor 墙钟轮询，默认 1000ms）。
+  const landed = nextRouteLanding(router);
   router.push(initialPath);
   await router.isReady();
   const wrapper = mount(App, { global: { plugins: [pinia, router, i18n] } });
   await flushPromises();
   await new Promise((r) => setTimeout(r, 30));
   await flushPromises();
-  return { wrapper, router, urls };
+  return { wrapper, router, urls, landed };
 }
 
 const countOf = (urls: string[], prefix: string) => urls.filter((u) => u.startsWith(prefix)).length;
@@ -90,8 +97,8 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二.2 零空请求）', () => {
   it('访问 / ⇒ 落地就是 #/admin/users，工作台标记不存在，三趟各 0 条', async () => {
-    const { wrapper, router, urls } = await mountAppAt('/', SEATLESS_ADMIN);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin/users'));
+    const { wrapper, urls, landed } = await mountAppAt('/', SEATLESS_ADMIN);
+    expect(await landed).toBe('/admin/users');
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
     for (const path of WORKBENCH_FETCHES) {
       expect(countOf(urls, path), `${path} 被请求了 ${countOf(urls, path)} 次（应为 0）`).toBe(0);
@@ -99,8 +106,8 @@ describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二
   });
 
   it('深链 /session/:id（别人名下的会话）⇒ 同样落管理台，三趟各 0 条（§二.3 的新落点）', async () => {
-    const { wrapper, router, urls } = await mountAppAt('/session/alice-session-1', SEATLESS_ADMIN);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/admin/users'));
+    const { wrapper, urls, landed } = await mountAppAt('/session/alice-session-1', SEATLESS_ADMIN);
+    expect(await landed).toBe('/admin/users');
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
     for (const path of WORKBENCH_FETCHES) {
       expect(countOf(urls, path), `${path} 被请求了 ${countOf(urls, path)} 次（应为 0）`).toBe(0);
@@ -109,8 +116,8 @@ describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二
 
   // ↓↓ 反空操作对照：证明上面的「0 条」不是夹具坏了（fetch 桩没接上 / 标记选错也会得到 0）。
   it('对照：第 ② 类人（admin + 有工位）访 / ⇒ 工作台挂载，三趟各 ≥1 条', async () => {
-    const { wrapper, router, urls } = await mountAppAt('/', ADMIN_WITH_SEAT);
-    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    const { wrapper, urls, landed } = await mountAppAt('/', ADMIN_WITH_SEAT);
+    expect(await landed).toBe('/');
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(true);
     for (const path of WORKBENCH_FETCHES) {
       expect(countOf(urls, path), `${path} 一条都没打 ⇒ 对照失效（判据将失去意义）`).toBeGreaterThanOrEqual(1);
