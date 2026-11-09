@@ -14,6 +14,7 @@ import path from 'node:path';
 import { atomicWriteFile } from './fsutil.js';
 import { materializeTlsAssets } from './tlsassets.js';
 import { parseCidr } from './ipam.js';
+import { buildPreviewBackend, assertFdeSubnet, assertRenderedRouteText } from './routebackends.js';
 import { enqueueRouteChange } from './outbox.js';
 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
@@ -92,7 +93,7 @@ function ylist(items) {
 // 所有进 yml 的字符串值先过控制字符/换行拒绝（yq 不转义换行，防 YAML 注入；M3）。
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
 
-function assertSafeString(value, label) {
+export function assertSafeString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error(`${label} must be a non-empty string`);
   }
@@ -109,7 +110,7 @@ function assertSafeString(value, label) {
  */
 const SAFE_TOKEN_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 
-function assertSafeToken(value, label) {
+export function assertSafeToken(value, label) {
   assertSafeString(value, label);
   if (!SAFE_TOKEN_RE.test(value)) {
     throw new Error(`${label} must be a safe token (^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$): ${JSON.stringify(value)}`);
@@ -117,7 +118,7 @@ function assertSafeToken(value, label) {
   return value;
 }
 
-function assertHttpUrl(value, label) {
+export function assertHttpUrl(value, label) {
   assertSafeString(value, label);
   let u;
   try {
@@ -491,6 +492,14 @@ export function validateTraefikConfig(text, allocations) {
  * 从 DB 读取路由所需 desired state（active/allocated 网络 + 未释放 allocation → backend URL
  * + active LiteLLM binding → 发布事实：fde_name/subnet/virtual key）。
  * virtual key 明文只进返回值（渲染进 mode 600 文件），**绝不写日志/错误消息**（调用方同责）。
+ *
+ * issue #474 S2：本函数是「DB 行 → 边缘后端」的唯一咽喉，所以后端 URL / hostname / 网段
+ * 三样**全部在这里过白名单**（`routebackends.js`），不再是内联拼一个字符串：
+ *   · 预览后端走 `buildPreviewBackend()`（网段规范 + 池归属 + 前缀 + base+2 + 端口闭区间 + hostname 重算）；
+ *   · hostname 与「该 FDE 在 fde_networks 里那一行」做**交叉**判据（allocation.subnet 必须等于该 FDE
+ *     自己的分配网段）——单看 allocation 行自己，脏行与正行长得一样，必须换个来源比；
+ *   · LLM binding 的 subnet 同一判据（它进 `ClientIP()`，决定虚拟 key 的注入范围）。
+ * 任一不满足 ⇒ 抛错（调用方按「读取或校验失败」处理：保留 last-known-good，绝不写盘）。
  */
 export async function readRouteDesiredState(pool, config) {
   const networks = await pool.query(
@@ -510,33 +519,65 @@ export async function readRouteDesiredState(pool, config) {
       ORDER BY u.fde_name`,
   );
   const allocs = await pool.query(
-    `SELECT a.id, a.fde_id, a.hostname, a.port, n.subnet
+    `SELECT a.id, a.fde_id, a.hostname, a.port, n.subnet, u.fde_name
        FROM port_allocations a
        JOIN fde_networks n ON n.fde_id = a.fde_id AND n.state IN ('allocated', 'active')
+       JOIN users u ON u.id = a.fde_id
       WHERE a.state <> 'released'
       ORDER BY a.hostname`,
   );
+  // 每 FDE 自己的分配网段（hostname 重算与前缀的交叉判据来源；同一 fde 多行取首行，与 JOIN 语义一致）。
+  const subnetByFde = new Map();
+  const prefixByFde = new Map();
+  for (const n of networks.rows) {
+    if (!subnetByFde.has(n.fde_id)) {
+      subnetByFde.set(n.fde_id, n.subnet);
+      prefixByFde.set(n.fde_id, parseCidr(n.subnet).prefixLen);
+    }
+  }
   const allocations = allocs.rows.map((a) => {
-    const subnet = parseCidr(a.subnet);
-    // 后端 = FDE 主容器固定位 .2（topology §3/§4-L2）。
-    const backendIp = (subnet.base + 2) >>> 0;
-    const octets = [(backendIp >>> 24) & 255, (backendIp >>> 16) & 255, (backendIp >>> 8) & 255, backendIp & 255];
+    // FDE 关联（评审 F2 第 4 条）：allocation 关联到的网段必须就是该 FDE 自己那一行。
+    if (!subnetByFde.has(a.fde_id)) {
+      const err = new Error(`allocation ${a.id} references fde ${a.fde_id} without an allocated network`);
+      err.code = 'fde_subnet_association_missing';
+      throw err;
+    }
+    if (a.subnet !== subnetByFde.get(a.fde_id)) {
+      const err = new Error(
+        `allocation ${a.id} subnet ${JSON.stringify(a.subnet)} does not match fde ${a.fde_id} allocated subnet ${JSON.stringify(subnetByFde.get(a.fde_id))}`,
+      );
+      err.code = 'fde_subnet_association_mismatch';
+      throw err;
+    }
+    // 后端 = FDE 主容器固定位 .2（topology §3/§4-L2）；构造与校验同处（#474 S2）。
+    const backendUrl = buildPreviewBackend({
+      subnet: a.subnet,
+      prefix: prefixByFde.get(a.fde_id),
+      port: Number(a.port),
+      hostname: a.hostname,
+      fdeName: a.fde_name,
+      baseDomain: config.baseDomain,
+    });
     return {
       id: a.id,
       fde_id: a.fde_id,
       hostname: a.hostname,
       port: Number(a.port),
-      backendUrl: `http://${octets.join('.')}:${a.port}`,
+      backendUrl,
     };
   });
   return {
     allocations,
     sourceRanges: deriveSourceRanges(networks.rows),
-    llmBindings: llmRows.rows.map((r) => ({
-      fdeName: r.fde_name,
-      subnet: r.subnet,
-      apiKey: r.api_key ?? null,
-    })),
+    llmBindings: llmRows.rows.map((r) => {
+      // LLM binding 的 subnet 同一判据：它是 `ClientIP()` 的实参 = 虚拟 key 的注入范围（评审 F2 第 5 条）。
+      assertFdeSubnet(r.subnet, { expectedPrefix: prefixByFde.get(r.fde_id) ?? undefined });
+      return {
+        fdeName: r.fde_name,
+        subnet: r.subnet,
+        apiKey: r.api_key ?? null,
+      };
+    }),
   };
 }
 
