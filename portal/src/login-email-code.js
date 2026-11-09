@@ -210,21 +210,28 @@ export async function invalidateOtherCodes(pool, { pendingTokenHash, keepCodeHas
 }
 
 /**
- * 第二因素选择规则（纯函数，HTTP 层唯一的判据来源）。四分支：
- *   `totp_required`                    已注册 TOTP（现状一字不改）
+ * 第二因素选择规则（纯函数，HTTP 层唯一的判据来源）。五分支：
+ *   `second_factor_choice`             已注册 TOTP + 邮件通道启用 + 有邮箱 ⇒ **TOTP 或 邮箱码任一通过**
+ *                                      （issue #449 二选一：不清 TOTP 配置，两者并存）
+ *   `totp_required`                    已注册 TOTP 的其余情况（开关关 / 没邮箱）——现状一字不改
  *   `email_code_required`              未注册 TOTP + 邮件通道启用 + 有邮箱
  *   `email_not_registered`             未注册 TOTP + 邮件通道启用 + **无邮箱** ⇒ 409，绝不静默退回口令
  *   `password_direct_no_second_factor` 邮件通道未启用（默认形态）⇒ 口令直通（审计 method 标明没有第二因素）
  */
 export function chooseSecondFactor({ hasTotpEnrollment, mailOtpEnabled, email } = {}) {
-  // ① TOTP 最强，且现状如此：绑了就一定走它（per-user 邮件开关不影响这条）。
+  const hasEmail = typeof email === 'string' && email.trim() !== '';
+  // ①（#449 二选一）有 TOTP **且** 开关开 **且** 有邮箱 ⇒ 给两条路。**必须排在 ② 之前**：
+  //    否则已绑 TOTP 的账号打开 `mail_otp_enabled` 仍是死开关（界面显示已启用、实际永不发码）。
+  //    「有 TOTP 但没邮箱」不在这条（走 ②）：绝不能因为缺邮箱把已绑 TOTP 的人挡在门外。
+  if (hasTotpEnrollment === true && mailOtpEnabled === true && hasEmail) return 'second_factor_choice';
+  // ② TOTP 兜底：绑了且拿不出「第二条路」就一定走它（per-user 邮件开关不影响这条）。
   if (hasTotpEnrollment === true) return 'totp_required';
-  // ② per-user 开关（迁移 0028，管理员在 Edit → Security 里设，默认 false = 不启用）。
+  // ③ per-user 开关（迁移 0028，管理员在 Edit → Security 里设，默认 false = 不启用）。
   //    **这是唯一的「用不用邮件码」判据**（2026-11-06 用户拍板）：全局 `transport` 只是 SMTP 连接配置，
   //    不再是功能闸。原来的 `mailEnabled` 一票否决会让这个开关变成死光纤 —— 管理员打开它、
   //    界面显示已启用、而实际永远走口令直通，没有任何信号。
   if (mailOtpEnabled !== true) return 'password_direct_no_second_factor';
-  if (typeof email === 'string' && email.trim() !== '') return 'email_code_required';
-  // ③ 开了开关却没邮箱：保存时已被 admin.js 的交叉防护拒掉；走到这里说明是历史数据 / 带外改库。
+  if (hasEmail) return 'email_code_required';
+  // ④ 开了开关却没邮箱：保存时已被 admin.js 的交叉防护拒掉；走到这里说明是历史数据 / 带外改库。
   return 'email_not_registered';
 }
