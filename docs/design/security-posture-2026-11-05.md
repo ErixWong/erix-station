@@ -445,11 +445,17 @@ docker inspect station-edge   --format '{{range .Mounts}}{{.Source}} -> {{.Desti
 - 期望态与发布面**同一份代码**（`readRouteDesiredState` + 两个生成器 + `renderTlsConfig()` + 第二道断言）⇒ 白名单改了这里自动跟上，不存在「第二份模板」。
 - 比对顺序：symlink / 是否普通文件 → mode（`routes.yml` 0644、`llm-routes.yml` **0600**、`tls.yml` 0644）→ 属主 → 字节。
   **字节相同也要报**：`llm-routes.yml` 0600 被改成 0644 = per-FDE 虚拟 key 明文变成同组/他人可读。
-- 未纳管的 `*.yml`（含 `routes-lan.yml`）**只列出、不删不改**。
+- 未纳管的 `*.yml`（含 `routes-lan.yml`）**只列出、不删不改**（它是未纳管项、不是漂移 ⇒ **不写审计**，
+  且**只在集合变化时** warn：首次一份、变了再一份、消失也报一份——它在现网是常驻的，每轮一句会把 `docker logs` 刷满）。
 - **输出字段白名单**：文件名 / kind / stage / 时间 / sha256 前 8 位 / 字节数 / mode / uid-gid / 失败阶段。
   **日志与审计里绝不出现 YAML 正文、token、diff**（有用例拿 canary 明文盯这一条）。
-- 审计：`audit_log.action = 'admin.routes_drift_detected'`，`details` 就是上面那组元数据（JSONB）；**零漂移一条都不写**（60s 一轮会灌满）。
+- 审计（**记账口径 = 变化才记**）：动作名只有两个——`admin.routes_drift_detected`（首次发现 / 形状变了）与
+  `admin.routes_drift_cleared`（上一轮有、本轮干净）。锁存在 monitor 闭包里（`runDriftRound` 的可选 `state`，
+  `checkDynamicFileDrift` 仍是纯函数），签名 = `kind|stage|sha_before8|sha_after8|modeActual|ownerActual`（**不含正文**）。
+  ⇒ 同一份漂移连跑 N 轮 = **1 条 warn + 1 行审计**（否则 1440 行/天，而现网 `audit_log` 总共才两千行，
+  两天翻倍且真事件被淹）；干净轮**一条都不写**。
 - **算不出来 ⇒ 整轮 skip + warn、零 finding**：不把「拿不到」当「应当不存在」——否则报的是假漂移，二期还会据此误删。
+  skip 轮**不会**把正在报警的漂移记成 `cleared`（skip ≠ 干净），也不写审计。
 
 ### 10.4 二期（自动覆盖）的前置条件——不要跳过
 
@@ -464,11 +470,13 @@ docker logs station-portal 2>&1 | grep '\[routes-drift\]'
 ```
 
 ```sql
-SELECT created_at, action, details FROM audit_log
- WHERE action = 'admin.routes_drift_detected' ORDER BY id DESC LIMIT 20;
+-- 持续漂移不刷审计（变化才记），所以这个查询可以直接当「现在还有什么没恢复」用。
+SELECT created_at, action, target, details FROM audit_log
+ WHERE action IN ('admin.routes_drift_detected', 'admin.routes_drift_cleared')
+ ORDER BY id DESC LIMIT 20;
 ```
 
-`details` 的样子（这就是全部信息量，没有正文）：
+`detected` 的 `details` 的样子（这就是全部信息量，没有正文）：
 
 ```json
 {"file":"llm-routes.yml","kind":"metadata","stage":"mode",
@@ -477,6 +485,15 @@ SELECT created_at, action, details FROM audit_log
 ```
 
 ⇒ 两个 sha 相同 = 字节没动，只是权限被放宽。处理办法：改回生成器那份（重启 portal 重发布，或让 portal 下一次路由变更覆盖）。
+
+改回来之后会补**一行** `admin.routes_drift_cleared`（下一轮仍干净 ⇒ 零新增，不会每 60s 刷）：
+
+```json
+{"file":"llm-routes.yml","stage":"recovered","previous":{"kind":"metadata","sha_after8":"1f2e3d4c"}}
+```
+
+没它的话，日志里只能看到「一堆 detected 后来没了」，看不出**什么时候好的**。运维只需要记住一句：
+**`detected` 与 `cleared` 是配对的，只看 `detected` 会把已经恢复的事当成还在报警。**
 
 **边界（如实）**：白名单校验**不在模块 import 期**执行——config 坏时应该是一条可读的启动错误，不是进程在 `import` 里崩。
 本文写「S2 已实现」的范围是「portal **经生成器**写出的路由」；被攻破的 portal 直接 `writeFile` 仍绕过 S2（见 R3 的残余风险），那一半归 S3 看见 + 权限模型收敛。
