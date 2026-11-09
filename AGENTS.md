@@ -797,6 +797,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 **四个切片**（决策者定稿：1/4 上限 + 上游真值为源 + 非法值按 1/4 兜底 + **显式发 `max_tokens`** + **命名不许发散**）
 
 - **切片 0（数据，零代码）**：dev 6 条 deployment 的 `model_info.max_output_tokens` 与 `litellm_params.max_tokens` 都设 32768（各自 1/4 内）。**另一台服务器仍欠这一步**（那台 `litellm_params.max_tokens=131072` 是事故链另一半：`170393+131072 > 262144`）。
+  ⚠ **2026-11-09 复核：这条是运维账，不是本机待办**——那台部署在本仓**没有任何标识**（全仓 grep 只有「另一台」这类泛指，无主机名/IP/URL；`131072` 只存在于本文件这两句散文里），唯一实物证据是当初贴进会话的失败样本（LiteLLM 请求 id 前缀 `20261016`）。判「是不是本机」用**模型目录名**而不是数字：本机 dev 网关数据面 6 条（`kimi-for-coding` / `erix-deepseek-flash` / `glm-5.3-flash-awq` / `deepseek-v4-pro` / `k3` / `deepseek-flash`）**没有**事故那个 `qwen3.8-flash-next`，且 6 条 `max_output_tokens` 全为 32768、131072 命中 0 ⇒ 确为另一台。本仓对那台**没有远程下发 / 对账探针 / 版本闸**，它既不升级也不改数据，仓库侧无从影响 ⇒ 别再当本机待办引。
 - **切片 1（PR #311）**：门户 `max_output_tokens` 字段 + 硬上限 `≤ floor(context_window/4)` + `model_info`/`litellm_params.max_tokens` **绑死双写** + 心跳 `models.main` 两键（非 null 才带）。
 - **切片 1.5（PR #312）**：读侧**四级回退** `model_info.max_output_tokens ?? litellm_params.max_tokens ?? floor(正数 ctx/4) ?? null` ⇒ **缺元数据不再等于关压缩**（唯一还关着的是「连 `context_window` 都没配」，那时上游一次性告警就是它的告警）。**1/4 既是手填上限也是回退值** ⇒ 平台永远不会造出被自己校验拒的数（有专测）。决策者**否决**「区分配置值 vs 平台假定值」的字段拆分（原话：有个数字就行）⇒ 没有 `effective_`/`source`。命名统一到 `max_output_tokens`（前端拆掉 `Budget` 拼写，legacy 字段回 `colMaxTokens`），`portal.md` §4.9 加**一个数跨六层的别名对照表**。
 - **切片 2+2b（PR #313）**：`parseHeartbeatModels` 收两键（**只收正整数**，非法形态**整键不写**而非置 `undefined` ⇒ 无元数据时与改前**逐字节相同**）+ 纯函数 `resolveModelMetadata(models, {computeBudget})` 做钳制（判据必须能在纯函数层单测）+ worker **唯一一处**映射（`#309:engine-model-params` 标记包住）成 `modelMetadata.{contextWindowTokens,maxOutputTokens}` 与**显式 `maxTokens`（同一个数）**。
@@ -917,7 +918,7 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **验收**：根 **1262 → 1286**（1282 通过 / 0 失败 / 4 跳过；#318+#325 **+5**）、runner **320 不变**、前端 **582 → 585**（#314 **+3**）、typecheck 干净。**主 agent 亲跑变异 3 条全红在具名用例**：拆掉 `window < CONTEXT_WINDOW_MIN` ⇒ 2 条具名红；`model_info.context_window` 回写原值 ⇒ 恰 1 红；重设按钮改成顺手提交 ⇒ 恰 1 红（「PATCH 数为 0」那条）。
 
-**已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
+**已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，~~界面上不可见，未单开 UI~~ **2026-11-09 复核该半句已过期**：`model_metadata_missing` 三处承接面都在 ——`portal/src/http.js` 的 `HISTORY_EVENT_TYPES` 下发白名单、前端 `useEventStream.ts` 的 `EVENT_TYPES` 实时订阅、`HISTORY_REPLAY_TYPES` 回放与对应 `case` 分支——由 #420（§8.74）那波事件承接面关掉；「压缩关闭」这件事界面上现在看得见的就是这条事件行）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
 
 ### 8.32 v0.1.19 发版：#318 / #325 / #314 落地 + 真机复验（2026-10-20 晚）
