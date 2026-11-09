@@ -21,6 +21,16 @@
 // `llm-routes.yml` 正文里是 per-FDE 虚拟 key 的明文，所以这里连「期望与实际差多少字符」都不说，
 // 更不说差在哪一行——diff 一旦进日志，key 就进日志了。
 //
+// **记账口径 = 变化才记**（主 agent 复审补的缺陷：持续漂移会每 60s 刷一条，现网 `audit_log` 总共才两千行，
+// 两天就能翻倍，真安全事件会被淹）。锁存（latch）放在 `startRouteDriftMonitor` 的**闭包**里，由它持有
+// 一份 `createDriftLatch()` 并作为 `state` 传给 `runDriftRound`：
+//   · 同一份漂移连跑 N 轮 ⇒ 1 条 warn + 1 行审计（签名 = `kind|stage|sha_before8|sha_after8|modeActual|ownerActual`，
+//     **不含正文**）；形状变了（例如 mode 又从 644 改回 600）⇒ 再加 1 行；
+//   · 上一轮有、本轮干净 ⇒ 1 条 warn + 1 行 `admin.routes_drift_cleared`（下一轮仍干净 ⇒ 零新增）；
+//   · 未纳管 yml 的**集合**变了才 warn（首次一份、变了再一份、消失也报一份）；
+//   · `runDriftRound` **不传** `state` ⇒ 保持「单次调用语义」（每轮都报），monitor 永远传。
+// 审计动作名只有两个：`admin.routes_drift_detected` / `admin.routes_drift_cleared`。
+//
 // 只读的结构性保证：本模块**不 import** 任何写盘件（`atomicWriteFile` / `writeFile` / `unlink` /
 // `chmod` / `chown`），并有一条源码级测试守着（`portal/test/routes-drift.test.js`）。
 
@@ -41,8 +51,10 @@ export const MANAGED_MODES = {
   'tls.yml': 0o644,
 };
 
-/** 审计/warn 里出现的动作名（固定两个，便于 grep 与告警规则）。 */
+/** 审计/warn 里出现的动作名（**只有两个**，便于 grep 与告警规则）。 */
 export const AUDIT_DRIFT = 'admin.routes_drift_detected';
+/** 上一轮有漂移、本轮干净 ⇒ 记这一条（没有它就只能看到「一堆 detected 后来没了」，看不出何时好的）。 */
+export const AUDIT_DRIFT_CLEARED = 'admin.routes_drift_cleared';
 
 /** sha256 前 8 位（**只**给前 8 位：足够区分「不是同一份」，又不会让人反查内容）。 */
 export function sha8(buf) {
@@ -222,12 +234,20 @@ export async function checkDynamicFileDrift({ pool, config, log = console, fsImp
     : { uid: null, gid: null });
 
   let desired;
+  const items = [];
   try {
     desired = await computeDesiredDynamicFiles({ pool, config, fsImpl, assertText });
   } catch (err) {
     // 三态里的第三态：**跳过本轮**，绝不当「期望空」。warn 只有阶段与 code（没有正文、没有 key）。
-    log.warn?.(`[routes-drift] 期望态不可用（stage=read_desired_state reason=${err.code ?? 'unknown'}）⇒ 跳过本轮对账（不视为期望空）`);
-    return { skipped: true, findings: [], unknown: [], failed: err.code ?? 'desired_state_unavailable' };
+    const text = `[routes-drift] 期望态不可用（stage=read_desired_state reason=${err.code ?? 'unknown'}）⇒ 跳过本轮对账（不视为期望空）`;
+    log.warn?.(text);
+    return {
+      skipped: true,
+      findings: [],
+      unknown: [],
+      failed: err.code ?? 'desired_state_unavailable',
+      items: [{ kind: 'skip', signature: `skip|read_desired_state|${err.code ?? 'unknown'}`, text }],
+    };
   }
 
   const findings = [];
@@ -238,6 +258,8 @@ export async function checkDynamicFileDrift({ pool, config, log = console, fsImp
       log.warn?.(`[routes-drift] ${formatFinding(finding)}`);
     }
   }
+  // `items` 是给 `runDriftRound` 锁存用的「本轮想说的话」，带签名。**不影响本函数自己的行为**：
+  // 不传 state 的调用方看到的仍是「每轮都报」。
 
   // 未知 `*.yml`（如 `routes-lan.yml`）：**只列出来，不删**（它归运维/别的写入者，一期不动）。
   let unknown = [];
@@ -245,13 +267,60 @@ export async function checkDynamicFileDrift({ pool, config, log = console, fsImp
     const names = await fsImpl.readdir(dynamicDir);
     unknown = names.filter((n) => n.endsWith('.yml') && !(n in desired.expected)).sort();
   } catch (err) {
-    log.warn?.(`[routes-drift] 动态目录不可读（stage=list_dir reason=${err.code ?? 'unknown'}）`);
-    return { skipped: true, findings, unknown: [], failed: err.code ?? 'dynamic_dir_unreadable' };
+    const text = `[routes-drift] 动态目录不可读（stage=list_dir reason=${err.code ?? 'unknown'}）`;
+    log.warn?.(text);
+    return {
+      skipped: true,
+      findings,
+      unknown: [],
+      failed: err.code ?? 'dynamic_dir_unreadable',
+      items: [
+        ...findings.map((f) => ({ kind: 'drift', file: f.file, signature: driftSignature(f), text: `[routes-drift] ${formatFinding(f)}` })),
+        { kind: 'skip', signature: `skip|list_dir|${err.code ?? 'unknown'}`, text },
+      ],
+    };
   }
-  if (unknown.length > 0) {
-    log.warn?.(`[routes-drift] 动态目录里有未纳管的 yml（不改动）：${unknown.join(', ')}`);
-  }
-  return { skipped: false, findings, unknown };
+  const unknownText = unknown.length > 0
+    ? `[routes-drift] 动态目录里有未纳管的 yml（不改动）：${unknown.join(', ')}`
+    : null;
+  if (unknownText !== null) log.warn?.(unknownText);
+  return {
+    skipped: false,
+    findings,
+    unknown,
+    items: [
+      ...findings.map((f) => ({ kind: 'drift', file: f.file, signature: driftSignature(f), text: `[routes-drift] ${formatFinding(f)}` })),
+      ...(unknownText === null ? [] : [{ kind: 'unknown', signature: `unknown|${unknown.join(',')}`, text: unknownText }]),
+    ],
+  };
+}
+
+/**
+ * 漂移的**签名**（锁存的键）：字段固定，**绝不含正文**（含正文就等于把虚拟 key 写进内存里的键，
+ * 也等于「同一形状但内容变了」会被当成同一条）。
+ */
+export function driftSignature(f) {
+  return [
+    f.kind ?? '',
+    f.stage ?? '',
+    f.sha_before8 ?? '',
+    f.sha_after8 ?? '',
+    f.modeActual ?? '',
+    f.ownerActual ?? '',
+  ].join('|');
+}
+
+/**
+ * 一把空的锁存（`runDriftRound` 的 `state`）。
+ * 由**调用方持有**（monitor 在自己的闭包里 new 一把），所以 `checkDynamicFileDrift` 仍是纯函数。
+ */
+export function createDriftLatch() {
+  return {
+    /** @type {Map<string, {signature: string, kind: string, sha_after8: string|null}>} 上一轮每个文件的漂移形状 */
+    drifts: new Map(),
+    /** @type {Set<string>} 已经说过的 skip / unknown 类 notice 签名 */
+    notices: new Set(),
+  };
 }
 
 /** warn/审计用的单行摘要：**只有**元数据字段（工单 §3 的白名单）。 */
@@ -291,25 +360,96 @@ export function driftAuditDetails(f) {
 }
 
 /** best-effort 审计（失败不反串主流程）。 */
-async function auditDrift(pool, details) {
+async function auditDrift(pool, details, action = AUDIT_DRIFT) {
   try {
     await pool.query(
       `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, $2, $3, $4)`,
-      [null, AUDIT_DRIFT, details.file, JSON.stringify(details)],
+      [null, action, details.file, JSON.stringify(details)],
     );
   } catch {
     // 审计面不可用：本轮已经 warn 过，不重复告警。
   }
 }
 
+/** 只吃不牌的 logger：`runDriftRound` 拿着锁存自己决定哪条往外送。 */
+const SILENT_LOG = { log() {}, info() {}, warn() {}, error() {} };
+
 /**
  * 一轮对账 + 写审计（只读盘：不写、不覆盖、不删除任何动态文件）。
+ *
+ * `state`（可选，`createDriftLatch()` 的产物）= **记账锁存**，由**调用方持有**：
+ *   · 不传 ⇒ **单次调用语义**：每轮都 warn + 都写审计（monitor 以外的调用方、以及所有现有用例走这条路）；
+ *   · 传 ⇒ **只在签名变化时** warn + 审计；上一轮有、本轮干净 ⇒ 一条 `AUDIT_DRIFT_CLEARED`。
+ *     持续一份漂移不再每 60s 刷一行（现网 `audit_log` 才两千行，1440 行/天会莫掉真事件）。
+ * 锁存不放进 `checkDynamicFileDrift`：那个函数保持纯（同样输入同一输出，不携带跨轮记忆）。
  */
-export async function runDriftRound({ pool, config, log = console, fsImpl = fs.promises, owner, assertText }) {
-  const out = await checkDynamicFileDrift({ pool, config, log, fsImpl, owner, assertText });
-  for (const f of out.findings) {
-    await auditDrift(pool, driftAuditDetails(f));
+export async function runDriftRound({ pool, config, log = console, fsImpl = fs.promises, owner, assertText, state = null }) {
+  if (state === null || state === undefined) {
+    const out = await checkDynamicFileDrift({ pool, config, log, fsImpl, owner, assertText });
+    for (const f of out.findings) {
+      await auditDrift(pool, driftAuditDetails(f));
+    }
+    return out;
   }
+
+  const out = await checkDynamicFileDrift({ pool, config, log: SILENT_LOG, fsImpl, owner, assertText });
+
+  if (out.skipped) {
+    // skip 轮：不写审计（与既有判据一致），notice 只在签名变化时说；
+    // ⚠ **漂移锁存原样保留**：skip 不等于「干净」。否则 DB 抖一下就会把正在报警的漂移记成 recovered。
+    for (const it of out.items ?? []) {
+      if (state.notices.has(it.signature)) continue;
+      log.warn?.(it.text);
+      state.notices.add(it.signature);
+    }
+    return out;
+  }
+  // 能走到这里 = 期望态拿到了 ⇒ 之前的 skip 告警可以重新武装（下次再 skip 要再说一次）。
+  for (const key of [...state.notices]) {
+    if (key.startsWith('skip|')) state.notices.delete(key);
+  }
+
+  const seen = new Set();
+  for (const f of out.findings) {
+    const signature = driftSignature(f);
+    seen.add(f.file);
+    const before = state.drifts.get(f.file);
+    if (!before || before.signature !== signature) {
+      log.warn?.(`[routes-drift] ${formatFinding(f)}`);
+      await auditDrift(pool, driftAuditDetails(f), AUDIT_DRIFT);
+    }
+    state.drifts.set(f.file, { signature, kind: f.kind, sha_after8: f.sha_after8 });
+  }
+
+  // 上一轮有、本轮没有 ⇒ 恢复。只说一次（下一轮仍干净 ⇒ `state.drifts` 里已经没它了，零新增）。
+  for (const [file, before] of [...state.drifts]) {
+    if (seen.has(file)) continue;
+    state.drifts.delete(file);
+    log.warn?.(`[routes-drift] ${file} 漂移已消失（上一轮 kind=${before.kind} sha_actual=${before.sha_after8}）`);
+    await auditDrift(pool, {
+      file,
+      stage: 'recovered',
+      previous: { kind: before.kind, sha_after8: before.sha_after8 },
+    }, AUDIT_DRIFT_CLEARED);
+  }
+
+  // 未纳管的 yml：**集合**变了才说（首次一份、变了再一份、消失也报一份）。
+  const unknownSig = `unknown|${out.unknown.join(',')}`;
+  if (out.unknown.length > 0) {
+    const had = [...state.notices].filter((k) => k.startsWith('unknown|') && k !== unknownSig);
+    for (const key of had) state.notices.delete(key);
+    if (!state.notices.has(unknownSig)) {
+      log.warn?.(`[routes-drift] 动态目录里有未纳管的 yml（不改动）：${out.unknown.join(', ')}`);
+      state.notices.add(unknownSig);
+    }
+  } else {
+    const had = [...state.notices].some((k) => k.startsWith('unknown|'));
+    for (const key of [...state.notices]) {
+      if (key.startsWith('unknown|')) state.notices.delete(key);
+    }
+    if (had) log.warn?.('[routes-drift] 未纳管的 yml 已全部消失（仍不改盘）');
+  }
+
   return out;
 }
 
@@ -324,6 +464,9 @@ export function startRouteDriftMonitor(pool, config, { log = console, fsImpl = f
   let stopped = false;
   /** @type {Promise<object>|null} 正在进行的那一轮（去重靠它，不是靠「静默丢掉这一拍」）。 */
   let inflight = null;
+  // 锁存在**本闭包**里：monitor 自己持有，`checkDynamicFileDrift` 仍是纯函数。
+  // 不共享到模块级 ⇒ 两个 monitor（测试里常见）不会互相抹掉对方的锁存。
+  const driftLatch = createDriftLatch();
 
   const tick = async () => {
     if (stopped) return { skipped: true, findings: [], unknown: [], failed: 'stopped' };
@@ -332,7 +475,7 @@ export function startRouteDriftMonitor(pool, config, { log = console, fsImpl = f
     if (inflight) return inflight;
     const round = (async () => {
       try {
-        return await runDriftRound({ pool, config, log, fsImpl, owner });
+        return await runDriftRound({ pool, config, log, fsImpl, owner, state: driftLatch });
       } catch (err) {
         // 对账面自己的意外异常也不能把循环打死：只 warn，下一轮继续。
         log.warn?.(`[routes-drift] 对账轮异常（stage=round reason=${err.code ?? 'unknown'}）`);
