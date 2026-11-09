@@ -1187,6 +1187,32 @@ test('#450 A2：管理台入口上 /api/site 命中 admin-auth（不是 admin-de
   assert.equal(winningRouters(http, { host: 'station.fde.erix.vip', path: '/api/admin/users', entryPoint: 'web' })[0], 'admin-deny-user');
 });
 
+test('#450 A3：用户面的**两个**入口都必须挂 /api/admin/* 的 deny（8443 也不能漏）', () => {
+  // 病根（2026-11-09 真机实测）：deny 只按 `entryPoint`（web）生成，而用户面 HTTPS（websecure = 8443）
+  // 是后来加的 ⇒ 8443 上 `/api/admin/*` 直达 portal：无票 401 / FDE 403 / **管理员 200**。
+  // 这条判据钉的是「凡按入口生成的安全规则都必须覆盖全部用户入口」，不是某一条路径的具体行为。
+  const http = adminRoutesDoc({ secureEntryPoint: 'websecure' });
+  const byEntry = (ep) => Object.entries(http.routers)
+    .filter(([, r]) => r.rule.includes('PathPrefix(`/api/admin`)') && r.service === 'noop@internal'
+      && Array.isArray(r.entryPoints) && r.entryPoints.includes(ep))
+    .map(([name]) => name);
+  assert.deepEqual(byEntry('web'), ['admin-deny-user'], 'web（8090）必须有 deny');
+  assert.deepEqual(byEntry('websecure'), ['admin-deny-user-websecure'], 'websecure（8443）也必须有一条 deny —— 漏了它等于用户入口不设防');
+  // 两条 deny 的规则 / 优先级 / 中间件必须逐字一致（只有入口名不同）——避免「补了一条但补错了」。
+  const a = http.routers['admin-deny-user'];
+  const b = http.routers['admin-deny-user-websecure'];
+  assert.equal(b.rule, a.rule);
+  assert.equal(b.priority, a.priority);
+  assert.deepEqual(b.middlewares, a.middlewares);
+  assert.equal(b.service, 'noop@internal');
+  // 没有 secureEntryPoint 的老部署（单入口）：字节面不许多出路由（既有快照继续成立）。
+  const legacy = adminRoutesDoc();
+  assert.equal(legacy.routers['admin-deny-user-websecure'], undefined, '单入口部署不得凭空多一条 router');
+  // 两个入口同名时不得生成重复 router。
+  const same = adminRoutesDoc({ secureEntryPoint: 'web' });
+  assert.equal(Object.keys(same.routers).filter((n) => n.startsWith('admin-deny-user')).length, 1, 'entryPoint 与 secureEntryPoint 同名时只能一条');
+});
+
 test('#450 A2：允许面与 deny 排除列表**逐条互补**（结构不变量，不依赖某条路径的具体断言）', () => {
   const http = adminRoutesDoc();
   const adminHost = 'admin.fde.erix.vip';
