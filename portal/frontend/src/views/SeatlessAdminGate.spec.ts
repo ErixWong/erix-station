@@ -97,7 +97,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二.2 零空请求）', () => {
   it('访问 / ⇒ 落地就是 #/admin/users，工作台标记不存在，三趟各 0 条', async () => {
-    const { wrapper, router, urls, landed } = await mountAppAt('/', SEATLESS_ADMIN);
+    const { wrapper, urls, landed } = await mountAppAt('/', SEATLESS_ADMIN);
     expect(await landed).toBe('/admin/users');
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
     for (const path of WORKBENCH_FETCHES) {
@@ -106,7 +106,7 @@ describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二
   });
 
   it('深链 /session/:id（别人名下的会话）⇒ 同样落管理台，三趟各 0 条（§二.3 的新落点）', async () => {
-    const { wrapper, router, urls, landed } = await mountAppAt('/session/alice-session-1', SEATLESS_ADMIN);
+    const { wrapper, urls, landed } = await mountAppAt('/session/alice-session-1', SEATLESS_ADMIN);
     expect(await landed).toBe('/admin/users');
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(false);
     for (const path of WORKBENCH_FETCHES) {
@@ -116,7 +116,7 @@ describe('#332 无工位平台管理员：工作台整棵子树不挂载（§二
 
   // ↓↓ 反空操作对照：证明上面的「0 条」不是夹具坏了（fetch 桩没接上 / 标记选错也会得到 0）。
   it('对照：第 ② 类人（admin + 有工位）访 / ⇒ 工作台挂载，三趟各 ≥1 条', async () => {
-    const { wrapper, router, urls, landed } = await mountAppAt('/', ADMIN_WITH_SEAT);
+    const { wrapper, urls, landed } = await mountAppAt('/', ADMIN_WITH_SEAT);
     expect(await landed).toBe('/');
     expect(wrapper.find(WORKBENCH_MARKER).exists()).toBe(true);
     for (const path of WORKBENCH_FETCHES) {
