@@ -170,6 +170,20 @@ export const en = {
   tree: {
     title: 'Directory tree',
     selectDirFirst: 'Select a directory first',
+    // issue #472: upload (`POST /api/files/upload`). Same eight entries as zh-CN (locale parity is a test).
+    upload: {
+      button: 'Upload',
+      hint: 'Upload files into the current directory (an admin must enable “File upload” for this account)',
+      busy: 'Uploading…',
+      success: 'Uploaded {count} file(s)',
+      allSkipped: 'Nothing uploaded (declined to overwrite {count} existing file(s))',
+      overwriteConfirm: '“{name}” already exists. Overwrite it with the uploaded version? (Overwriting discards what is on disk)',
+      errDisabled: 'This account may not upload files: ask an admin to enable “File upload” in the user editor.',
+      errTooLarge: 'The file exceeds the per-file size limit (FILE_UPLOAD_MAX_BYTES).',
+      errInterrupted: 'The upload was interrupted (network or tab switched). Just retry.',
+      errNoDir: 'The target directory is gone: refresh the directory tree first.',
+      errGeneric: 'Upload failed (HTTP {status}).',
+    },
   },
   stream: {
     chooseOrNewSession: 'Select or create a session',
