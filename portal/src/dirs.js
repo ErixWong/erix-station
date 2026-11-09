@@ -93,12 +93,24 @@ export async function listDirs(pool, { userId, userSpaceRoot, fdeName, log = con
 }
 
 /**
- * GET /api/files/tree?cwd=<相对cwd>&path=<相对路径> → 单层目录列表 { entries: [{ name, type }] }。
- * 根 = cwd（必须解析后落在 ~/projects/<name> 内）；path 默认 '.'，只向下展开一级（懒加载，P6 前
- * 点击不处理）。路径穿越防护：解析后必须仍位于 cwd root 内；任何已存在段不得为 symlink
- * （防 bind mount 内用户自建的 symlink 把列表泄漏到 jail 外）；目标本身为 symlink 也拒绝。
+ * 牢笼根解析（issue #472 片 B：从 `fileTree` / `resolveJailedFile` **纯搬迁**出来的共用三段）：
+ *   ① cwd 形态（`validateSessionCwd`）→ `root = <userSpaceRoot>/<fde>/projects/<name>`；
+ *   ② 根必须真实存在且**不是 symlink、必须是目录**（否则 404 `not_found`）；
+ *   ③ `path.resolve(root, relPath)` 之后的 containment（拒 `..` / 绝对路径逃逸）+ 逐段 `lstat`
+ *      拒 symlink（防 bind mount 内用户自建 symlink 把 jail 外的内容泄漏进来，或把写入送出 jail）。
+ *
+ * 返回 `{ root, target, rel, project }`。⚠ **不保证 target 存在、也不保证类型**——那两件事由调用方
+ * 按自己的语义决定（`fileTree` / `resolveJailedDir` 要目录，`resolveJailedFile` 要普通文件）。
+ *
+ * ⚠ 本函数是**评审 major 14 裁定「抽，不复制」**的产物，等价性的唯一判据：`portal/test/dirs.test.js`
+ *   既有用例**一条不改**且全绿。为此两条既有路径各自的特判留在参数上（`requireConcreteRelPath`），
+ *   而它们原本**不同的错误文案**用参数逐字保留（`notFoundHint` / `symlinkHint`）：
+ *   不为了统一而改变既有行为（决策者红线）。
  */
-export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = {}) {
+function resolveJailedRoot({
+  userSpaceRoot, fdeName, cwd, relPath,
+  notFoundHint = 'path', symlinkHint = '列出', requireConcreteRelPath = false,
+} = {}) {
   if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
   let safeCwd;
   try {
@@ -128,15 +140,19 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
     throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
   }
 
+  // `resolveJailedFile` 的特判（必须指向具体文件，不接受 '.' / 空）：位置与原实现逐字对齐（根校验之后）。
+  if (requireConcreteRelPath && (typeof relPath !== 'string' || relPath.length === 0 || relPath === '.')) {
+    throw new DirError('validation_failed', 'path 必须指向具体文件', { details: { field: 'path' } });
+  }
   const target = path.resolve(root, String(relPath ?? '.'));
   if (target !== root) {
-    const rel = path.relative(root, target);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    const relToRoot = path.relative(root, target);
+    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
       throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
     }
   }
 
-  // 逐段 lstat（不跟随 symlink）：根以下的已存在段任何一个是 symlink → 拒绝（防 jail 外泄漏）。
+  // 逐段 lstat（不跟随 symlink）：已存在段任何一个是 symlink → 拒绝（**含最后一段**，同两侧既有口径）。
   const rel = path.relative(root, target);
   let cur = root;
   if (rel) {
@@ -147,15 +163,28 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
         st = fs.lstatSync(cur);
       } catch (err) {
         if (err?.code === 'ENOENT') {
-          throw new DirError('not_found', 'path not found', { httpStatus: 404 });
+          throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
         }
         throw err;
       }
       if (st.isSymbolicLink()) {
-        throw new DirError('validation_failed', 'path 含符号链接，拒绝列出', { details: { field: 'path' } });
+        throw new DirError('validation_failed', `path 含符号链接，拒绝${symlinkHint}`, { details: { field: 'path' } });
       }
     }
   }
+  return { root, target, rel, project: name };
+}
+
+/**
+ * GET /api/files/tree?cwd=<相对cwd>&path=<相对路径> → 单层目录列表 { entries: [{ name, type }] }。
+ * 根 = cwd（必须解析后落在 ~/projects/<name> 内）；path 默认 '.'，只向下展开一级（懒加载，P6 前
+ * 点击不处理）。路径穿越 / symlink 红线见 `resolveJailedRoot`（与 resolveJailedFile 同一条）；
+ * 本函数只保留自己的语义：目标必须是目录，否则 400（文件点击是 P6 预览，不在树里）。
+ */
+export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = {}) {
+  const { target } = resolveJailedRoot({
+    userSpaceRoot, fdeName, cwd, relPath: relPath ?? '.', notFoundHint: 'path', symlinkHint: '列出',
+  });
 
   const st = fs.lstatSync(target);
   if (!st.isDirectory()) {
@@ -179,74 +208,47 @@ export async function fileTree({ userSpaceRoot, fdeName, cwd, relPath = '.' } = 
 }
 
 /**
- * 牢笼解析（JSON 预览与流式通道共用，同一条安全红线只写一遍）：
- * cwd 形态 → root 真实目录且非 symlink → 解析后 containment 检查（拒 .. / 绝对路径逃逸）
- * → 逐段 lstat 拒 symlink（防 bind mount 内用户自建 symlink 把文件内容泄漏到 jail 外）
- * → 目标必须是非 symlink 的普通文件。命中即抛 DirError，成功返回 { target, rel, st, project }。
+ * 牢笼解析（JSON 预览与流式通道共用）：三段红线见 `resolveJailedRoot`，本函数只保留自己的语义——
+ * **目标必须是非 symlink 的普通文件**。命中即抛 DirError，成功返回 { target, rel, st, project }。
  */
 export function resolveJailedFile({ userSpaceRoot, fdeName, cwd, relPath, notFoundHint = 'file' } = {}) {
-  if (!userSpaceRoot || !fdeName) throw new DirError('internal', 'userSpaceRoot/fde_name 缺失', { httpStatus: 500 });
-  let safeCwd;
-  try {
-    safeCwd = validateSessionCwd(cwd); // 400 validation_failed（形态不合法 / . / ..）
-  } catch (err) {
-    if (err instanceof DirError) throw err;
-    throw new DirError(err.code ?? 'validation_failed', err.message, {
-      httpStatus: err.httpStatus ?? 400,
-      details: err.details,
-    });
-  }
-  const name = CWD_RE.exec(safeCwd)[1];
-  const root = path.resolve(userSpaceRoot, fdeName, 'projects', name);
-
-  // 根必须真实存在且不是 symlink（与 fileTree 同口径）。
-  let rootSt;
-  try {
-    rootSt = fs.lstatSync(root);
-  } catch (err) {
-    if (err?.code === 'ENOENT') {
-      throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
-    }
-    throw err;
-  }
-  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) {
-    throw new DirError('not_found', 'directory not found', { httpStatus: 404 });
-  }
-
-  if (typeof relPath !== 'string' || relPath.length === 0 || relPath === '.') {
-    throw new DirError('validation_failed', 'path 必须指向具体文件', { details: { field: 'path' } });
-  }
-  const target = path.resolve(root, relPath);
-  if (target !== root) {
-    const relToRoot = path.relative(root, target);
-    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
-      throw new DirError('validation_failed', 'path 不得逃逸目录根', { details: { field: 'path' } });
-    }
-  }
-
-  // 逐段 lstat（不跟随 symlink）：任何已存在段是 symlink → 拒绝（同 fileTree）。
-  const rel = path.relative(root, target);
-  let cur = root;
-  for (const seg of rel.split(path.sep)) {
-    cur = path.join(cur, seg);
-    let st;
-    try {
-      st = fs.lstatSync(cur);
-    } catch (err) {
-      if (err?.code === 'ENOENT') {
-        throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
-      }
-      throw err;
-    }
-    if (st.isSymbolicLink()) {
-      throw new DirError('validation_failed', 'path 含符号链接，拒绝读取', { details: { field: 'path' } });
-    }
-  }
+  const { target, rel, project } = resolveJailedRoot({
+    userSpaceRoot, fdeName, cwd, relPath, notFoundHint, symlinkHint: '读取', requireConcreteRelPath: true,
+  });
   const st = fs.lstatSync(target);
   if (!st.isFile()) {
     throw new DirError('validation_failed', 'path 必须是文件', { details: { field: 'path' } });
   }
-  return { target, rel, st, project: name };
+  return { target, rel, st, project };
+}
+
+/**
+ * 上传目标目录（issue #472 片 B）：与 `resolveJailedFile` **同一条红线**（同一份 `resolveJailedRoot`），
+ * 差别只有两点——目标**必须是目录**，且 `path` 允许 `'.'`（上传到项目根）。最终 symlink 一律拒：
+ * 逐段 lstat 已覆盖最后一段，这里再 `lstatSync` 一次是为了「校验之后、打开 temp 之前」这段窗口里
+ * 被 agent 换成 symlink 的竞态也能挡住（写入方向的红线比读取更硬）。
+ * 返回 `{ dir, rel, root, project }`：`dir` 是可直接 `path.join(dir, name)` 的绝对目录。
+ */
+export function resolveJailedDir({ userSpaceRoot, fdeName, cwd, relPath = '.', notFoundHint = 'directory' } = {}) {
+  const { root, target, rel, project } = resolveJailedRoot({
+    userSpaceRoot, fdeName, cwd, relPath, notFoundHint, symlinkHint: '写入',
+  });
+  let st;
+  try {
+    st = fs.lstatSync(target);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      throw new DirError('not_found', `${notFoundHint} not found`, { httpStatus: 404 });
+    }
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    throw new DirError('validation_failed', 'path 含符号链接，拒绝写入', { details: { field: 'path' } });
+  }
+  if (!st.isDirectory()) {
+    throw new DirError('validation_failed', 'path 必须是目录', { details: { field: 'path' } });
+  }
+  return { dir: target, rel, root, project };
 }
 
 /**
