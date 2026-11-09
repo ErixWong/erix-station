@@ -213,6 +213,14 @@ onUnmounted(stopCooldownTicker);
             class="w-full text-black/60 text-sm py-1.5 mt-1 underline"
             @click="auth.backToLogin()"
           >{{ t('login.emailBackToPassword') }}</button>
+          <!-- #449 二选一：切回 TOTP。只改 factor（同一枚 pending_token），不重新登录、不重新发码。 -->
+          <button
+            v-if="auth.choiceMethods.includes('totp')"
+            id="emailUseTotp"
+            type="button"
+            class="w-full text-black/60 text-sm py-1 underline"
+            @click="auth.switchFactor('totp')"
+          >{{ t('login.useTotp') }}</button>
         </form>
 
         <!-- 第二步：TOTP（pending_token 已换取） -->
@@ -234,6 +242,27 @@ onUnmounted(stopCooldownTicker);
             @click="auth.backToLogin()"
           >{{ t('login.backToLogin') }}</button>
         </form>
+
+        <!-- #449 二选一的切换入口与降级说明。**刻意放在 TOTP <form> 之外**：
+             「TOTP 第二步模板逐字未改」是 #449 已有的结构判据（见 LoginView.spec 的源码级用例），
+             而这两样东西只是面板下方的次要操作/说明，放进表单里会弄伤那条判据。
+             （因此两个都要再挂 `factor === 'totp'`：它们不在 `v-else` 里，不锁住就会在口令步 /
+             邮箱码步也冒出来。） -->
+        <button
+          v-if="auth.factor === 'totp' && auth.choiceMethods.includes('email')"
+          id="useEmailCode"
+          type="button"
+          class="w-full text-black/60 text-sm py-1.5 underline"
+          @click="auth.switchFactor('email')"
+        >{{ t('login.useEmailCode') }}</button>
+        <!-- #449：`email_sent:false` ⇒ 不给邮箱入口，换成一句「邮件通道当前不可用」的说明。 -->
+        <p
+          v-if="auth.factor === 'totp' && auth.emailUnavailable"
+          id="emailUnavailableNotice"
+          class="text-black/50 text-sm mt-2 mb-0"
+        >
+          {{ t('login.emailChannelUnavailable') }}
+        </p>
 
         <p class="text-red-600 text-sm mt-3 mb-0" role="alert">{{ auth.error }}</p>
       </div>

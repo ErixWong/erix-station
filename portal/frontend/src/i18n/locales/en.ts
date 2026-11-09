@@ -54,6 +54,12 @@ export const en = {
     emailResendIn: 'Resend in {seconds}s',
     emailResendFailed: 'Send again',
     emailBackToPassword: '← Back to the previous step',
+    // issue #449 second-factor choice (`second_factor_choice`): the two switch links and the notice shown
+    // when the email channel is down. Wording matches the store: switching reuses the same pending_token,
+    // so do not promise a resend here.
+    useEmailCode: 'Use an email code instead',
+    useTotp: 'Use your authenticator app (TOTP) instead',
+    emailChannelUnavailable: 'Email is unavailable right now — please use your authenticator app.',
   },
   // #255 forced first-login password change (views/ForcePasswordChangeView.vue). Restricted session
   // escape hatch (portal.md §2.11a). No hard-coded port/host; no promise about a minimum length
