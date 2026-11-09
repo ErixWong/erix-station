@@ -1186,11 +1186,13 @@ onBeforeUnmount(() => {
               class="mt-0.5"
             >
             <span>
-              {{ t('admin.fde.mailOtpEnabledLabel') }}
-              <span class="block text-xs text-black/50">{{ t('admin.fde.mailOtpEnabledHint') }}</span>
+              <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
+              {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
+              <span class="block text-xs text-black/50">
+                {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
+              </span>
             </span>
           </label>
-          <p v-if="editUser.totp_enabled" class="mt-2 text-xs text-black/50">{{ t('admin.fde.mailOtpHiddenByTotp') }}</p>
           <p v-if="editUser.email" class="mt-2 text-xs text-black/50">
             {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
           </p>
