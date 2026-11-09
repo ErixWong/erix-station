@@ -909,7 +909,9 @@ test('#255③ 端到端闭环：改完密门立即解锁（清旗标后同一会
 // ④ 登录响应增字段 `password_change_required`（提交 5，纯 additive）
 // ---------------------------------------------------------------------------
 
-const USER_DTO_KEYS = ['id', 'login', 'display_name', 'role', 'fde_name', 'auth_source'].sort();
+// #472 片 A：登录/会话的 user DTO 多一个 `file_upload_enabled`（四条路径共用的 `toSessionUser`）。
+// 这一行就是「新增键必须同时改这条用例」的那一处：删掉它 ⇒ 新用例（user-file-upload-flag.test.js）该红。
+const USER_DTO_KEYS = ['id', 'login', 'display_name', 'role', 'fde_name', 'auth_source', 'file_upload_enabled'].sort();
 
 test('#255④ 口令直通分支：flag 真 / 假两种用户的 password_change_required 各为 true / false', async () => {
   for (const mustChange of [true, false]) {

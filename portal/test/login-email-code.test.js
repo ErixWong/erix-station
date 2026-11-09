@@ -301,7 +301,9 @@ test('#449⑤ 正确码 ⇒ 200 + Set-Cookie + password_change_required（布尔
     const body = await step2.json();
     assert.equal(typeof body.password_change_required, 'boolean', '必须出现且是布尔（与 §2.3 同口径）');
     assert.equal(body.password_change_required, true, '受限账号的旗标要在发会话的那一刻带出去');
-    assert.deepEqual(Object.keys(body.user).sort(), ['auth_source', 'display_name', 'fde_name', 'id', 'login', 'role']);
+    // #472 片 A：登录响应的 user DTO 新增 `file_upload_enabled`（四条路径共用的构造点），
+    // 键集因此多一项 —— 这一行就是「新增键必须同时改这条用例」的那一处（方案 A3 的注释）。
+    assert.deepEqual(Object.keys(body.user).sort(), ['auth_source', 'display_name', 'fde_name', 'file_upload_enabled', 'id', 'login', 'role']);
 
     const token = setCookie.split(';')[0].split('=')[1];
     const me = await fetch(`${s.base}/api/me`, { headers: { cookie: `fde_session_dev=${token}` } });
