@@ -9,7 +9,7 @@
 让 FDE 里的 agent 能用 `delegate` 工具**在同一进程内嵌套第二个 `runToolLoop`** 派子 run，
 子 run 的账本落**本地 JSONL 文件**（引擎 `createFileTranscriptStore`），门户读那两份文件
 （名册 + 账本）把它投影成与主对话**同形**的 DTO，前端用既有组件渲染成「工具卡 + 只读子 run 抽屉」。
-默认关（`ERIX_DELEGATE_ENABLED`），开了才多带 2065 字节工具 schema。
+默认开（`ERIX_DELEGATE_ENABLED`，2026-11-09 决策者翻向：未设即开）；显式 `0` 才关，关掉时工具面逐字等于今天（2065 字节 schema 一个都不多带）。
 
 ## 1. 为什么不是「子 = 本站真 run」
 
@@ -160,7 +160,7 @@ AGENTS.md 已注入、预览端口规则，对子全是噪音且会诱导它调�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `ERIX_DELEGATE_ENABLED` | `0` | 开才注册工具 |
+| `ERIX_DELEGATE_ENABLED` | `1`（默认开；未设即开） | 显式 `0` 才不注册工具 |
 | `ERIX_DELEGATE_MAX` | `2` | 每 FDE 子 run 并发上限（跨进程共享 leases） |
 | `ERIX_DELEGATE_CHILD_ROUNDS` | `8` | 子 run 轮数预算 |
 | `ERIX_DELEGATE_CHILD_TIMEOUT_MS` | `240000` | 子 run 时间预算（**必须 < 300000 watchdog**） |
@@ -285,8 +285,8 @@ pi-web 的形态（`~/projects/github/pi-web`，已读源码）：
    **反向**：`usage_ledger` 只有一行且 `run_id` 是父（第二行会被
    `usage_ledger_run_source_key UNIQUE (run_id, source)` + `ON CONFLICT DO NOTHING` 静默吞掉，
    那正是「以为记了」的形状）。变异：不累加 ⇒ 红；为子另发一行 ⇒ 红。
-7. **默认关**：`ERIX_DELEGATE_ENABLED` 未设 ⇒ `tools` 与今天逐字相同（含 `delegate` 不在）。
-   变异：默认开 ⇒ 红。
+7. **默认开**（2026-11-09 决策者翻向）：未设 ⇒ 照常注册 `delegate`；显式 `ERIX_DELEGATE_ENABLED=0` ⇒ `tools` 与今天逐字相同（含 `delegate` 不在）。
+   变异：把「未设」这一支改回关 ⇒ 红（2026-11-09 翻向后的哨兵）。
 8. **不递归 + 工具面显式**：子的工具名集合 === 文件工具注册面 + `shell`（`delegate` / `note_*` / skills 全不在）。
    变异：复用父工具面 ⇒ 红。另断言子的 file 工具 executor 与父是**同一个对象引用**（jail 边界不重建）。
 9. **`deadlineMs` 换算**：`config.timing.deadlineMs` 是 `Date.now()+budget`（不是 budget 本身）。

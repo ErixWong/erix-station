@@ -29,8 +29,16 @@ export function parseMaxRounds(raw, { defaultValue = 16, min = 1, max = 200 } = 
 // 静默回退成 240000 与钳到 240000 结果相同，但钳住 + warn 能让人知道「你写的值没生效」。
 // ---------------------------------------------------------------------------
 
-/** 只有字符串 `'1'` 算开（与 `ERIX_SESSION_AUTO_TITLE` 同口径：写别的都算关）。 */
+/**
+ * delegation 总开关（**2026-11-09 决策者：默认开**）。
+ *
+ * 口径：**未设 / 空串 ⇒ 开**；显式值只有字符串 `'1'` 算开，其它（`'0'` / `'true'` / `'yes'` / 数字）一律关。
+ * 与 `ERIX_SESSION_AUTO_TITLE` 的差别只有一处：那个是「未设 ⇒ 关」，这个是「未设 ⇒ 开」——
+ * delegation 的缺省行为是「能力存在、模型可以不用」，不是「一上来就烧 token 的默认动作」。
+ * 显式值仍保持「只认 `'1'`」的严格性：写错字（`'true'` / `'yes'`）宁可关掉，也别让人以为自己开了。
+ */
 export function isDelegateEnabled(raw) {
+  if (raw === undefined || raw === null || raw === '') return true;
   return raw === '1';
 }
 

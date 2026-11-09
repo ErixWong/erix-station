@@ -58,7 +58,7 @@ function proxyAllowedKeys() {
 /** runner 侧的**代码默认值**（从 `runner/lib/config.js` 真函数取，不抄字面量）。 */
 function runnerDefaults() {
   return {
-    ERIX_DELEGATE_ENABLED: '0', // `isDelegateEnabled`：只有 '1' 算开 ⇒ 没配就是关
+    ERIX_DELEGATE_ENABLED: isDelegateEnabled(undefined) ? '1' : '0', // 从真函数取（2026-11-09 翻向：未设 ⇒ 开）
     ERIX_DELEGATE_MAX: String(parseDelegateMaxRef(undefined).value),
     ERIX_DELEGATE_CHILD_ROUNDS: String(parseDelegateChildRoundsRef(undefined).value),
     ERIX_DELEGATE_CHILD_TIMEOUT_MS: String(parseDelegateChildTimeoutMsRef(undefined).value),
@@ -106,12 +106,20 @@ test('腿③b：子 run 的超时上限必须小于 agentd 的 300s watchdog（�
   assert.ok(interpolationDefault(composePortalEnv().ERIX_DELEGATE_CHILD_TIMEOUT_MS) === '240000');
 });
 
-test('开关口径：只有字符串 1 算开（与 ERIX_SESSION_AUTO_TITLE 同族）', () => {
-  assert.equal(isDelegateEnabled(undefined), false);
-  assert.equal(isDelegateEnabled('0'), false);
+test('开关口径：未设 ⇒ 开；显式值只有字符串 1 算开（2026-11-09 决策者翻向）', () => {
+  // 未设 / 空串 ⇒ 开（这一支撑是 2026-11-09 翻的）
+  assert.equal(isDelegateEnabled(undefined), true);
+  assert.equal(isDelegateEnabled(''), true);
   assert.equal(isDelegateEnabled('1'), true);
-  // provisioner 自己也得把非 '1' 折成 '0'，别把垃圾值原样下发
+  // 显式值仍只认 '1'
+  assert.equal(isDelegateEnabled('0'), false);
+  assert.equal(isDelegateEnabled('true'), false);
+  // provisioner 自己也得把显式非 '1' 折成 '0'，且未设时必须下发 '1'，别把垃圾值原样下发
   const src = fs.readFileSync(PROVISIONER, 'utf8');
-  assert.match(src, /ERIX_DELEGATE_ENABLED=\$\{process\.env\.ERIX_DELEGATE_ENABLED === '1' \? '1' : '0'\}/,
-    'provisioner 的开关口径必须是 === \'1\'（与 runner 侧 isDelegateEnabled 同源）');
+  assert.match(src, /ERIX_DELEGATE_ENABLED=\$\{delegateEnvValue\(\)\}/,
+    'provisioner 必须走 delegateEnvValue()（未设 ⇒ 1 / 显式非 1 ⇒ 0），不要内联三元');
+  assert.match(src, /if \(raw === undefined \|\| raw === ''\) return '1';/,
+    '未设/空串必须下发 1（默认开）');
+  assert.match(src, /return raw === '1' \? '1' : '0';/,
+    '显式值仍只认 1');
 });

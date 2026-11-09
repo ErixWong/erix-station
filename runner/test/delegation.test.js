@@ -328,20 +328,32 @@ test('D6b 反向：子的 usage 只进父的 RUN_FINISHED，不另发一条 ledg
 });
 
 // ---------------------------------------------------------------------------
-// 判据 7 —— 默认关
+// 判据 7 —— 默认开（2026-11-09 决策者翻向：未设即开）
 // ---------------------------------------------------------------------------
-test('D7 默认关：ERIX_DELEGATE_ENABLED 未设 ⇒ 不装配、工具面逐字等于今天', () => {
-  for (const raw of [undefined, '', '0', 'true', 'yes', 1, '11']) {
-    assert.equal(isDelegateEnabled(raw), false, `${JSON.stringify(raw)} 不算开（只有字符串 '1' 算开）`);
+test('D7 默认开：ERIX_DELEGATE_ENABLED 未设 ⇒ 照常装配；显式非 1 才关', () => {
+  // 未设 / 空串 ⇒ 开（这是 2026-11-09 翻的那一支撑）
+  for (const raw of [undefined, null, '']) {
+    assert.equal(isDelegateEnabled(raw), true, `${JSON.stringify(raw)} 必须算开（默认开）`);
   }
   assert.equal(isDelegateEnabled('1'), true);
+  // 显式值仍只认 '1'：写错字宁可关掉，也别让人以为开了
+  for (const raw of ['0', 'true', 'yes', 1, '11']) {
+    assert.equal(isDelegateEnabled(raw), false, `${JSON.stringify(raw)} 不算开（显式值只有字符串 '1' 算开）`);
+  }
 
   const src = readWorkerSource();
   assert.match(src, /const delegateEnabled = isDelegateEnabled\(process\.env\.ERIX_DELEGATE_ENABLED\);/,
     '开关必须走 lib/config.js 的唯一口径（agentd 读的是同一个函数）');
   assert.match(src, /const tools = \[\.\.\.baseToolSchemas, \.\.\.\(delegation !== null \? \[delegation\.definition\] : \[\]\)\];/,
     '关掉时工具面必须逐字等于 baseToolSchemas（2065 字节的 schema 一个字节都不许多带）');
-  assert.match(src, /if \(delegateEnabled\) \{/, '装配必须整段被开关圈住（关 ⇒ 连目录都不碰）');
+  assert.match(src, /if \(delegateEnabled\) \{/, '装配必须整段被开关圈住（显式关 ⇒ 连目录都不碰）');
+});
+
+test('D7c 显式关：ERIX_DELEGATE_ENABLED=0 ⇒ 工具面逐字等于今天（2065 字节 schema 一个字节都不多带）', () => {
+  assert.equal(isDelegateEnabled('0'), false);
+  const src = readWorkerSource();
+  assert.match(src, /const tools = \[\.\.\.baseToolSchemas, \.\.\.\(delegation !== null \? \[delegation\.definition\] : \[\]\)\];/,
+    '关掉时工具面必须逐字等于 baseToolSchemas');
 });
 
 test('D7b env 边界：越界钳到边界并给出 clamped 标记（不静默回退）', () => {

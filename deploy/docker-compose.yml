@@ -207,7 +207,7 @@ services:
       # FDE 容器永远不开 delegate；而白名单漏一个键 ⇒ 现网 `create_policy_denied`（§8.70 的同型事故）。
       # 三者一致性（包括「compose 默认 == 代码默认」）的机器判据：`portal/test/deploy-env-delegate.test.js`。
       # ⚠ `ERIX_DELEGATE_CHILD_TIMEOUT_MS` 的上限必须 < agentd 的 300s watchdog（worker 侧钳位）。
-      ERIX_DELEGATE_ENABLED: ${ERIX_DELEGATE_ENABLED:-0}
+      ERIX_DELEGATE_ENABLED: ${ERIX_DELEGATE_ENABLED:-1}
       ERIX_DELEGATE_MAX: ${ERIX_DELEGATE_MAX:-2}
       ERIX_DELEGATE_CHILD_ROUNDS: ${ERIX_DELEGATE_CHILD_ROUNDS:-8}
       ERIX_DELEGATE_CHILD_TIMEOUT_MS: ${ERIX_DELEGATE_CHILD_TIMEOUT_MS:-240000}

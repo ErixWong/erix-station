@@ -3991,7 +3991,7 @@ agentd `sse connected` + `sse ping received`。
 
 ### 8.103 delegation（子 run）接入 P1+P2+P3：宿主嵌套 `runToolLoop` / 门户只读两端点 / 卡片+抽屉（2026-11-09 凌晨，分支 `feat-261108-0{1,2,3,4}-delegate-*`）
 
-**决策前提**：三份独立评估（erix_run `judge_done` 96 轮 / pi worker / copilot 两次都因派单方材料缺口停）交叉对账后，主 agent 裁定**接最小片 + 默认关**。
+**决策前提**：三份独立评估（erix_run `judge_done` 96 轮 / pi worker / copilot 两次都因派单方材料缺口停）交叉对账后，主 agent 裁定**接最小片**（初版默认关）。
 理由不是「在册理由过期」，而是「不接已是用户可见的错觉」（用户会问「station 有没有开 subagent」，本身就说明界面看不出它没有）；
 但对外**只声称「上下文隔离 + 读密集并行」**，不承诺写并行（D8 之后子共用父 cwd 会互踩）。
 
@@ -4053,3 +4053,11 @@ P3：终态不停轮询 ⇒ 3 红 · 卡片分级忽略 `termination` ⇒ 1 红 
 - 抽屉的「单飞」纪律在**链式 `setTimeout` 排程**下**结构上不可证伪**（变异不红：上一发落定才排下一发 ⇒ 并发本就不可能）。
   功能正确，但要让它成为真判据需改成 `setInterval` + `inFlight`（pi-web 形状）——记为后续，未做。
 - 名册目录的 TTL / 跨 FDE 统计 / 管理台视图均未做。
+
+**开关默认值翻向（2026-11-09，决策者：「ERIX_DELEGATE_ENABLED = 1 默认允许啊」）**：初版是「未设 ⇒ 关」，现改为
+**未设 / 空串 ⇒ 开**；显式值仍只认字符串 `1`（写 `true` / `yes` 反而关——写错字宁可关掉，也别让人以为开了）。
+三处默认值必须同源，任一处漏改就会出现「文档说开、容器里是关」那类两头说法：
+`runner/lib/config.js#isDelegateEnabled`（未设 ⇒ `true`）· `deploy/docker-compose.yml`（`:-1`）·
+`portal/src/provisioner.js#delegateEnvValue()`（未设 ⇒ `'1'`）；判据 `portal/test/deploy-env-delegate.test.js`
+（它把 compose 插值默认喂进 runner 的真函数比对，不是各钉各的）。
+⚠ 常驻成本随之变成**默认**：开着时每次请求多带 `DELEGATE_DEFINITION` 的 2065 字节（≈516 token）。
