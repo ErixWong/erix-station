@@ -10,6 +10,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import WorkbenchView from './WorkbenchView.vue';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
+import SidebarPanel from '../components/SidebarPanel.vue';
 import { createAppRouter } from '../router';
 import { setUserScopeResetListener } from '../lib/userScope';
 import { useAuthStore, type AuthUser } from '../stores/auth';
@@ -17,8 +18,11 @@ import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench'; // issue #281：断言消息流里的可见错误行要用 store
 import { i18n, setLocale } from '../i18n';
 
+// issue #472：`file_upload_enabled: true` 是**故意**给真的 —— `/api/me` 桩里若全都没有这个键，
+// 「上传按钮显示」这条分支就是零覆盖（B-13 的三态只有「隐藏」两态被测到，实现怎么写都绿）。
 const FDE_USER = {
   id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alice', auth_source: 'local',
+  file_upload_enabled: true,
 } as AuthUser;
 // issue #308（M3）：原夹具是「无工位管理员」（`admin` 且 `fde_name=null`）——#334 的准入闸
 // （lib/workbenchGate.ts）之后这个形状进不到工作台（会被改写到 /admin），拿它当夹具等于给不可达
@@ -554,5 +558,36 @@ describe('#428 换账号时的视图接线', () => {
       + '不关就是浏览器后台一直替别人的会话要事件流，挂到标签页关掉为止').toBe(true);
     expect(first.store.entries).toEqual([]);
     expect(first.store.sessionId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #472 片 B（B-15 的另一半）：上传成功 ⇒ 收工灯重判
+//   组件侧（DirectoryTree.spec）钉的是「emit files-changed」；这里钉的是「视图真的拿它去 load()」。
+//   两侧各钉一半：漏了 emit 组件侧红，漏了接线本文件红。
+//   为什么必须重判：上传落一个新文件 = 未跟踪 = 灯该从绿变红（D9「红是进度不是警报」）。
+//   不重判就是骗人——灯还说「已收工」，而磁盘上刚多了没跟踪的东西。
+// ---------------------------------------------------------------------------
+describe('WorkbenchView · 上传后重判收工灯（issue #472）', () => {
+  const gitLightCalls = () => vi.mocked(fetch).mock.calls
+    .map(([u]) => (typeof u === 'string' ? u : u instanceof URL ? u.href : u.url))
+    .filter((u) => u.startsWith('/api/git-light')).length;
+
+  it('侧栏 emit files-changed ⇒ 立刻再发一次 /api/git-light（不是等 30s 轮询）', async () => {
+    const wrapper = await mountWorkbench();
+    const before = gitLightCalls();
+    expect(before, '挂载时至少拉过一次灯').toBeGreaterThanOrEqual(1);
+
+    wrapper.findComponent(SidebarPanel).vm.$emit('files-changed');
+    await tick();
+
+    expect(gitLightCalls()).toBe(before + 1);
+  });
+
+  it('反向守卫：没有任何 files-changed 时，灯不会被凭空多发（判据不是「只要变多就算过」）', async () => {
+    await mountWorkbench();
+    const before = gitLightCalls();
+    await tick();
+    expect(gitLightCalls()).toBe(before);
   });
 });

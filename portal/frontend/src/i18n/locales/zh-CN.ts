@@ -184,6 +184,21 @@ export const zhCN = {
   tree: {
     title: '目录树',
     selectDirFirst: '先选择目录',
+    // issue #472：上传（`POST /api/files/upload`）。文案覆盖工单要求的八项：按钮 / 上传中 / 成功 /
+    // 失败 / 覆盖确认 / upload_disabled / 超限 / 断流。
+    upload: {
+      button: '上传',
+      hint: '上传文件到当前目录（需管理员为该账号开启「文件上传」）',
+      busy: '上传中…',
+      success: '已上传 {count} 个文件',
+      allSkipped: '未上传（{count} 个已存在的文件都选了不覆盖）',
+      overwriteConfirm: '「{name}」已经存在。要用上传的版本覆盖它吗？（覆盖会丢掉磁盘上的现有内容）',
+      errDisabled: '这个账号没有上传权限：请让管理员在管理台的用户编辑里开启「文件上传」。',
+      errTooLarge: '文件超过单文件大小上限（FILE_UPLOAD_MAX_BYTES）。',
+      errInterrupted: '上传中断了（网络或页面被切走），重试即可。',
+      errNoDir: '目标目录不存在了：先 ↻ 刷新目录树。',
+      errGeneric: '上传失败（HTTP {status}）。',
+    },
   },
   // 消息流（components/StreamPanel.vue）+ SSE 事件状态行（composables/useEventStream.ts）
   stream: {

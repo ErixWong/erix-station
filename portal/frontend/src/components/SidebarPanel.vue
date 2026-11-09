@@ -44,6 +44,9 @@ const site = useSiteStore();
 const emit = defineEmits<{
   (e: 'select-session', id: string): void;
   (e: 'new-session'): void;
+  // issue #472：目录树上传成功 ⇒ 磁盘上多了文件。本组件只做**透传**（判定的语义属树，动作的语义属视图：
+  // WorkbenchView 拿它重判收工灯）。不在这里自己调 git-light：灯的数据所有权在视图侧的 useGitLight。
+  (e: 'files-changed'): void;
 }>();
 
 // #450 A2：「管理台」入口是**跨 host** 链接（用户面 `station.<伞域>` → 管理台 `admin.<伞域>:9443`）。
@@ -444,7 +447,13 @@ function messageCountSuffix(s: Session): string {
       <!-- ③-b 目录树面板（默认收起，懒展开；文件点击 → P6 预览 modal）：与端口段同栈、恒在最后 -->
       <!-- issue #308：树自己那层 max-h-[40vh] overflow-y-auto 已撤（滚动预算只留底部栈一层），
            shrink-0 / mt-3 / border-t 的分隔与「不缩列表」语义保留。 -->
-      <DirectoryTree ref="treeRef" class="shrink-0" :cwd="store.dirCwd" @file-click="onFileClick" />
+      <DirectoryTree
+        ref="treeRef"
+        class="shrink-0"
+        :cwd="store.dirCwd"
+        @file-click="onFileClick"
+        @files-changed="emit('files-changed')"
+      />
     </div>
 
     <!-- issue #84 P6：文件预览 modal（v-if 挂载：打开才发 /api/file，关闭即卸载归还焦点） -->
