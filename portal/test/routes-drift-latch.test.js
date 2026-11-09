@@ -132,7 +132,13 @@ test('锁存：漂移形状变了（字节再变一次 / mode 再变一次）⇒
   assert.equal(audits(pool).length, 3, 'mode 从 644 变 600 是另一种形状（modeActual 在签名里）');
   assert.equal(audits(pool)[2].details.stage, 'mode');
   assert.equal(audits(pool)[2].details.mode_actual, '600');
-  assert.equal(lines.length, 3, `3 条 warn：${lines.join(' | ')}`);
+
+  // 同一 kind/stage、只有 modeActual 不同（600 → 755）：签名里没 modeActual 就会被当成同一条。
+  fs.chmodSync(target, 0o755);
+  await runDriftRound({ pool, config: { ...CFG, traefikDynamicDir: dir }, log, state });
+  assert.equal(audits(pool).length, 4, 'kind/stage 完全相同、只有 mode_actual 变了 ⇒ 也必须算新形状');
+  assert.equal(audits(pool)[3].details.mode_actual, '755');
+  assert.equal(lines.length, 4, `4 条 warn：${lines.join(' | ')}`);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
