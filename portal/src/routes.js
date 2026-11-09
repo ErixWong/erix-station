@@ -660,42 +660,131 @@ export async function enqueueFullRebuild(pool) {
 }
 
 /**
+ * issue #474 S2 失败语义（三态，绝不合并）：
+ *   · **合法空**——零 active LLM binding ⇒ `llmText === null`：这是**盘上不该有 llm-routes.yml** 的稳态，
+ *     所以允许（且必须）unlink；
+ *   · **有效配置**——两份文本都算出来且过了两道校验；
+ *   · **读取或校验失败**——抛错（带 `stage`），调用方**保留 last-known-good**：一个字节都不写、
+ *     也**绝不 unlink**（否则「DB 抖一下」就会把一份正在生效的含密配置抬成「无 LLM 可用」）。
+ * 本函数只做「算 + 校」，不碰盘：「失败不写盘」在结构上而不是靠异常路径写得巧。
+ */
+async function renderRouteFiles(pool, config, { assertText = assertRenderedRouteText } = {}) {
+  const state = await readRouteDesiredState(pool, config).catch((err) => {
+    err.stage = 'read_desired_state';
+    throw err;
+  });
+  let text;
+  let llmText;
+  try {
+    text = generateTraefikConfig({
+      portalHost: config.portalHost,
+      portalInternalHosts: config.portalInternalHosts,
+      portalBackendUrl: config.portalBackendUrl,
+      entryPoint: config.traefikEntryPoint,
+      secureEntryPoint: config.traefikSecureEntryPoint ?? null,
+      allocations: state.allocations,
+      sourceRanges: state.sourceRanges,
+      // #450：管理台入口（config.js 恒提供；直接调用本函数且不带 adminHost 的老测试保持单入口快照）。
+      adminHost: config.adminHost,
+      adminEntryPoint: config.traefikAdminEntryPoint,
+      adminIpAllowlist: config.adminIpAllowlist ?? [],
+    });
+    validateTraefikConfig(text, state.allocations);
+    llmText = generateLlmTraefikConfig({
+      entryPoint: config.traefikEntryPoint,
+      llmHost: config.llmHost,
+      llmGatewayUrl: config.llmGatewayUrl,
+      llmBindings: state.llmBindings,
+    });
+    validateLlmTraefikConfig(llmText, state.llmBindings);
+  } catch (err) {
+    err.stage = err.stage ?? 'render';
+    throw err;
+  }
+  // 第二道（#474 评审 §4.4）：对**最终文本**的结构断言。不引 YAML parser，用严格文本判据：
+  // 每个 `url:` 必命中「portal / LLM 网关 / 池内预览」三者的允许集合、每个 `Host()` 必在允许集合、
+  // 每个 `ClientIP()` 必在 FDE 池内。与第一道（构造期）独立实现，所以能抦住「第一道被改坏」。
+  try {
+    assertText({
+      text,
+      llmText,
+      config: {
+        baseDomain: config.baseDomain,
+        portalHost: config.portalHost,
+        portalInternalHosts: config.portalInternalHosts,
+        portalBackendUrl: config.portalBackendUrl,
+        adminHost: config.adminHost,
+        llmHost: config.llmHost,
+        llmGatewayUrl: config.llmGatewayUrl,
+      },
+      file: config.traefikDynamicFile ?? 'routes.yml',
+      llmFile: config.traefikLlmDynamicFile ?? 'llm-routes.yml',
+    });
+  } catch (err) {
+    err.stage = 'assert_final_text';
+    throw err;
+  }
+  return { text, llmText, state };
+}
+
+/**
+ * #474 审计（best-effort）：只允许 `{file, stage, reason, count}` 四个字段，**绝不记内容**。
+ * `reason` 取 `err.code`（没有则固定哨兵）而不是 `err.message`：消息可能携带配置字面值，
+ * 而红线只允许文件名 / kind / 时间 / sha8 / 字节数 / 失败阶段。审计自身失败不得拖垮主流程。
+ */
+async function auditGenerationRejected(pool, details) {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, $2, $3, $4)`,
+      [null, 'admin.routes_generation_rejected', details.file, JSON.stringify(details)],
+    );
+  } catch {
+    // 审计面不可用（DB 抖动的典型副产品）：不反串主流程的失败原因。
+  }
+}
+
+/**
  * 全量重生成 Traefik 动态配置并原子替换（启动/定时对账用，不依赖 outbox 行）。
- * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 virtual key 明文，**0600**，issue #38 Phase B1）。
- * 两份都先生成+校验再落盘：任一渲染失败则两份都不写（不落半截）。
+ * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 virtual key 明文，**0600**，#38 B1）。
  *
- * F3 发布语义（fail-closed 硬红线：任何失败都不允许让「已撤销/已停用」的 key 继续被 Traefik 使用）：
- *   1. 先发含密文件 llm-routes.yml（零 binding → unlink；有 binding → 写新内容 0600）；
+ * F3 发布语义（fail-closed 硬红线：任何失败都不允许让「已撤销/已停用」的 key 继续被 Traefik 使用）。发布顺序与回滚：
+ *   1. 先发含密文件 llm-routes.yml（**仅合法空** → unlink；有 binding → 写新内容 0600）；
  *   2. 再无密主文件 routes.yml（0644）——若第 2 步失败，主文件保持上一版不动，回滚删除
  *      llm-routes.yml（宁可不给 LLM 路由，也不让旧 key 在新主配置下继续生效），再抛错；
  *   3. 若第 1 步含密文件发布本身失败（写或 unlink）→ 主文件不动（保持上一版），并尽力摘除盘上
- *      旧含密文件；摘除失败属异常态，错误/日志必须明示「含密文件可能残留」，绝不静默。
+ *      旧含密文件；摘除失败属异常态，错误/日志必须明示「含密文件可能残留」，绡不静默。
+ *
+ * #474：在第 1 步**之前**还有一道「算+校」（`renderRouteFiles`）：它失败 ⇒ 上面三步**一步也不跑**
+ * （保留 last-known-good），并记 `admin.routes_generation_rejected` + warn（只记元数据）。
  */
-export async function rebuildRoutes(pool, config, { log = console } = {}) {
-  const state = await readRouteDesiredState(pool, config);
-  const text = generateTraefikConfig({
-    portalHost: config.portalHost,
-    portalInternalHosts: config.portalInternalHosts,
-    portalBackendUrl: config.portalBackendUrl,
-    entryPoint: config.traefikEntryPoint,
-    secureEntryPoint: config.traefikSecureEntryPoint ?? null,
-    allocations: state.allocations,
-    sourceRanges: state.sourceRanges,
-    // #450：管理台入口（config.js 恒提供；直接调用本函数且不带 adminHost 的老测试保持单入口快照）。
-    adminHost: config.adminHost,
-    adminEntryPoint: config.traefikAdminEntryPoint,
-    adminIpAllowlist: config.adminIpAllowlist ?? [],
-  });
-  validateTraefikConfig(text, state.allocations);
-  const llmText = generateLlmTraefikConfig({
-    entryPoint: config.traefikEntryPoint,
-    llmHost: config.llmHost,
-    llmGatewayUrl: config.llmGatewayUrl,
-    llmBindings: state.llmBindings,
-  });
-  validateLlmTraefikConfig(llmText, state.llmBindings);
+export async function rebuildRoutes(pool, config, { log = console, assertText = assertRenderedRouteText } = {}) {
   const target = path.join(config.traefikDynamicDir, config.traefikDynamicFile ?? 'routes.yml');
   const llmTarget = path.join(config.traefikDynamicDir, config.traefikLlmDynamicFile ?? 'llm-routes.yml');
+
+  // 第 0 步：算 + 两道校。失败 = **一个字节不写、一个文件不抹**（last-known-good）。
+  // `assertText` 是测试缝（不是旋钮：默认就是真断言，生产不传）——第二道在写盘前真的被调到，
+  // 需要一个能直接观察的入口，否则「删掉第二道」这种变异只能靠间接推。
+  let rendered;
+  try {
+    rendered = await renderRouteFiles(pool, config, { assertText });
+  } catch (err) {
+    const stage = err.stage ?? 'unknown';
+    const count = err.count ?? null;
+    await auditGenerationRejected(pool, {
+      file: stage === 'render' || stage === 'assert_final_text' ? path.basename(llmTarget) : path.basename(target),
+      stage,
+      reason: err.code ?? 'route_generation_rejected',
+      count,
+    });
+    // 红线：warn 只有阶段与 code，**没有 err.message**（消息可能带配置字面值）。
+    log.warn?.(`[routes] 路由生成被拒（stage=${stage} reason=${err.code ?? 'unknown'}）⇒ 保留 last-known-good，不写盘`);
+    // 向上**原样抱**原错（保留可诊断的 code/消息）但补上 stage；日志面自己负责不印正文。
+    // （生成器的消息口径：只 echo hostname / entryPoint / cidr / URL，**从不 echo apiKey**。）
+    err.stage = stage;
+    err.code = err.code ?? 'route_generation_rejected';
+    throw err;
+  }
+  const { text, llmText, state } = rendered;
 
   // 第 1 步：先发含密文件（零 binding → unlink；有 binding → 写新内容）。
   try {
