@@ -15,7 +15,11 @@
 //   ⑨ 重发冷却 ⇒ 429 + Retry-After；重发成功后旧码失效、新码可用
 //   ⑩ 审计三条在册，details 序列化后搜不到明文码（正向有 code_hash_prefix）
 //   ⑪ 接线判据：ctx 里有 mailerProvider，登录路径读 ctx.mailerProvider.get()（防 #331「没人读的光纤」）
-//   ⑫ 选择规则纯函数四分支参数化
+//   ⑫ 选择规则纯函数五分支参数化（#449 二选一）
+//   ⑬ 二选一的 HTTP 响应逐字段（status / methods / email_sent / email_hint / expires_in）
+//   ⑭ SMTP 不可用 ⇒ 200 降级仅 TOTP（绝不 503），且同一 pending_token 仍能过 /login/totp 建会话
+//   ⑮ 同一 pending_token 单次消费：任一路径先成功后，另一路径 401 pending_expired
+//   ⑯ 审计 method 三值各自可达且不串：totp / email_code / email_code_alt
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,6 +31,7 @@ import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import * as loginEmailCode from '../src/login-email-code.js';
 import { maskEmail } from '../src/mailer.js';
+import * as totp from '../src/totp.js';
 import { FakePool } from './fake-pool.js';
 
 const PASSWORD = 'correct horse battery staple';
@@ -672,14 +677,18 @@ test('#449⑪ 接线：ctx 里挂了 mailerProvider，登录/重发路径都经 
 // ⑫ 选择规则纯函数：四分支参数化
 // ---------------------------------------------------------------------------
 
-test('#449⑫ chooseSecondFactor：TOTP 优先 / 邮箱码 / 409 / 口令直通（判据是 per-user 开关）', () => {
+test('#449⑫ chooseSecondFactor：二选一 / TOTP 兼容 / 邮箱码 / 409 / 口令直通（判据是 per-user 开关）', () => {
   // 2026-11-06 口径变更（用户拍板）：**唯一的「用不用邮件码」判据是 per-user 开关**（迁移 0028）。
   // 全局 `transport` 只是 SMTP 连接配置，不再一票否决 —— 原来那一维会让开关变成死光纤。
   const cases = [
     // [hasTotp, mailOtpEnabled, email, 期望]
-    [true, true, 'alice@example.com', 'totp_required'],
+    // #449 二选一后首行变了：有 TOTP + 开关开 + 有邮箱 ⇒ `second_factor_choice`（不再是 totp_required）。
+    [true, true, 'alice@example.com', 'second_factor_choice'],
     [true, false, 'alice@example.com', 'totp_required'],
+    // 边界（工单 §六判据 1）：有 TOTP + 开关开但**没邮箱** ⇒ 仍走 totp_required，绝不挡在门外。
     [true, true, null, 'totp_required'],
+    [true, true, '', 'totp_required'],
+    [true, true, '   ', 'totp_required'],
     [false, true, 'alice@example.com', 'email_code_required'],
     [false, true, '  a@b.c  ', 'email_code_required'],
     [false, true, null, 'email_not_registered'],
@@ -714,4 +723,170 @@ test('#449⑫b 6 位码生成与 email_hint 脱敏口径', () => {
   assert.equal(maskEmail('bob@mail.example.co.uk'), 'b***@m***.example.co.uk');
   assert.equal(maskEmail('not-an-email'), '***');
   assert.equal(maskEmail(null), '***');
+});
+
+// ---------------------------------------------------------------------------
+// ⑬ 二选一（#449）：TOTP 与邮箱码并存 ⇒ status='second_factor_choice'，两路共用一枚 pending_token
+// ---------------------------------------------------------------------------
+
+test('#449⑬ 已绑 TOTP + 开关开 + 有邮箱 ⇒ second_factor_choice，响应逐字段', async () => {
+  const { mailer, state } = fakeMailer();
+  const secret = totp.generateSecret(20);
+  const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
+  try {
+    const res = await login(s.base);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(
+      Object.keys(body).sort(),
+      ['email_hint', 'email_sent', 'expires_in', 'methods', 'pending_token', 'status'],
+      '响应字段就是工单 §一.2 那一组（成功路径不带 email_unavailable/notice）',
+    );
+    assert.equal(body.status, 'second_factor_choice', '不再是 totp_required（否则开关是死开关）');
+    assert.deepEqual(body.methods, ['totp', 'email_code']);
+    assert.equal(body.email_sent, true);
+    assert.equal(body.email_hint, maskEmail('alice@example.com'), 'hint 走既有脱敏');
+    assert.ok(!JSON.stringify(body).includes('alice@example.com'), '响应不泄露完整邮箱');
+    assert.equal(body.expires_in, 600, 'expires_in = max(pendingTokenTtlSeconds 120, EMAIL_CODE_TTL 600)');
+    assert.ok(typeof body.pending_token === 'string' && body.pending_token.startsWith('pt_'));
+    assert.equal(state.sent.length, 1, '恰好发出一封码（开关真发信，不是死开关）');
+    assert.equal(s.pool.emailCodes.length, 1, '码行落库');
+    assert.equal(s.pool.sessions.length, 0, '第一步不建会话');
+    assert.ok(!res.headers.get('set-cookie'), '第一步不下发会话 cookie');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑭ SMTP 不可用 ⇒ 200 降级「仅 TOTP」，同一 pending_token 仍能靠 TOTP 进门（本单最重要判据）
+// ---------------------------------------------------------------------------
+
+async function choiceWithBrokenSmtp({ enabled }) {
+  const { mailer, state } = fakeMailer({ enabled });
+  // enabled=true 代「SMTP 配了但当下发不出去」（smtp_unreachable）；enabled=false 代「未配置 / 急停」。
+  if (enabled) state.fail = true;
+  const secret = totp.generateSecret(20);
+  const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
+  return { s, state, secret };
+}
+
+for (const [label, enabled] of [['SMTP 发信失败（smtp_unreachable）', true], ['SMTP 未配置（enabled=false）', false]]) {
+  test(`#449⑭ SMTP 不可用（${label}）⇒ 200 + methods:['totp'] + email_sent:false，TOTP 仍能登录`, async () => {
+    const { s, state, secret } = await choiceWithBrokenSmtp({ enabled });
+    try {
+      const res = await login(s.base);
+      assert.equal(res.status, 200, '绝不 503 / 500：TOTP 是离线可用的强因素');
+      const body = await res.json();
+      assert.equal(body.status, 'second_factor_choice');
+      assert.deepEqual(body.methods, ['totp'], '邮件路不可用 ⇒ methods 只剩 totp');
+      assert.equal(body.email_sent, false);
+      assert.equal(body.email_unavailable, true);
+      assert.ok(typeof body.notice === 'string' && body.notice.length > 0, '给人一句可读说明');
+      assert.equal(state.sent.length, 0);
+      assert.equal(s.pool.emailCodes.length, 0, '没发出去就不落码行（不给用户一枚库里不存在的码）');
+      assert.ok(s.pool.audit.some((a) => a.action === 'auth.email_code_failed'), '降级要留审计痕');
+
+      // 同一枚 pending_token 必须还能过 TOTP —— 这条挂了就是「SMTP 抖一下，人登不进去」。
+      const totpRes = await postJson(s.base, '/api/auth/login/totp', {
+        pending_token: body.pending_token,
+        code: totp.totp(secret),
+      });
+      assert.equal(totpRes.status, 200, 'SMTP 不可用不得影响 TOTP 第二步');
+      assert.ok((totpRes.headers.get('set-cookie') ?? '').includes('fde_session_dev'));
+      assert.equal(s.pool.sessions.length, 1);
+      const loginAudits = s.pool.audit.filter((a) => a.action === 'auth.login_success');
+      assert.equal(JSON.parse(loginAudits[0].details).method, 'totp');
+    } finally {
+      await s.close();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// ⑮ 单次消费：两路共用一枚 pending_token，谁先成功谁建会话，另一条自然失效
+// ---------------------------------------------------------------------------
+
+test('#449⑮ 同一 pending_token：先 TOTP 成功 ⇒ 邮件码 401 pending_expired；反向同理', async () => {
+  // 正向：TOTP 先成功。
+  {
+    const { mailer, state } = fakeMailer();
+    const secret = totp.generateSecret(20);
+    const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
+    try {
+      const body = await (await login(s.base)).json();
+      const code = lastCode(state);
+      const ok = await postJson(s.base, '/api/auth/login/totp', { pending_token: body.pending_token, code: totp.totp(secret) });
+      assert.equal(ok.status, 200);
+      const late = await postJson(s.base, '/api/auth/login/email-code', { pending_token: body.pending_token, code });
+      assert.equal(late.status, 401);
+      assert.equal((await late.json()).error.code, 'pending_expired');
+      assert.equal(s.pool.sessions.length, 1, '只建了一次会话');
+    } finally {
+      await s.close();
+    }
+  }
+  // 反向：邮件码先成功。
+  {
+    const { mailer, state } = fakeMailer();
+    const secret = totp.generateSecret(20);
+    const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
+    try {
+      const body = await (await login(s.base)).json();
+      const code = lastCode(state);
+      const ok = await postJson(s.base, '/api/auth/login/email-code', { pending_token: body.pending_token, code });
+      assert.equal(ok.status, 200);
+      const late = await postJson(s.base, '/api/auth/login/totp', { pending_token: body.pending_token, code: totp.totp(secret) });
+      assert.equal(late.status, 401);
+      assert.equal((await late.json()).error.code, 'pending_expired');
+      assert.equal(s.pool.sessions.length, 1);
+    } finally {
+      await s.close();
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑯ 审计 method 三值：totp / email_code / email_code_alt 各自可达且互不串
+// ---------------------------------------------------------------------------
+
+async function loginMethodOf({ totpSecret, use }) {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser({ totpSecret })], mailer });
+  try {
+    const body = await (await login(s.base)).json();
+    if (use === 'totp') {
+      const res = await postJson(s.base, '/api/auth/login/totp', {
+        pending_token: body.pending_token,
+        code: totp.totp(totpSecret),
+      });
+      assert.equal(res.status, 200);
+    } else {
+      const res = await postJson(s.base, '/api/auth/login/email-code', {
+        pending_token: body.pending_token,
+        code: lastCode(state),
+      });
+      assert.equal(res.status, 200);
+    }
+    const audits = s.pool.audit.filter((a) => a.action === 'auth.login_success');
+    assert.equal(audits.length, 1);
+    return { method: JSON.parse(audits[0].details).method, body };
+  } finally {
+    await s.close();
+  }
+}
+
+test('#449⑯ 审计 method：有 TOTP 走邮件码 = email_code_alt；无 TOTP 走邮件码 = email_code；走 TOTP = totp', async () => {
+  const secret = totp.generateSecret(20);
+
+  const alt = await loginMethodOf({ totpSecret: secret, use: 'email_code' });
+  assert.equal(alt.body.status, 'second_factor_choice');
+  assert.equal(alt.method, 'email_code_alt', '有 TOTP 却用邮件码 ⇒ 运维必须查得到这条弱因素路径');
+
+  const plain = await loginMethodOf({ totpSecret: null, use: 'email_code' });
+  assert.equal(plain.body.status, 'email_code_required', '无 TOTP 仍是现状分支（回归面）');
+  assert.equal(plain.method, 'email_code', '现状值不改');
+
+  const totpWay = await loginMethodOf({ totpSecret: secret, use: 'totp' });
+  assert.equal(totpWay.method, 'totp', '现状值不改');
 });

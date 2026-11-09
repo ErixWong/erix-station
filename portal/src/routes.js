@@ -14,6 +14,7 @@ import path from 'node:path';
 import { atomicWriteFile } from './fsutil.js';
 import { materializeTlsAssets } from './tlsassets.js';
 import { parseCidr } from './ipam.js';
+import { buildPreviewBackend, assertFdeSubnet, assertRenderedRouteText } from './routebackends.js';
 import { enqueueRouteChange } from './outbox.js';
 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
@@ -92,7 +93,7 @@ function ylist(items) {
 // 所有进 yml 的字符串值先过控制字符/换行拒绝（yq 不转义换行，防 YAML 注入；M3）。
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
 
-function assertSafeString(value, label) {
+export function assertSafeString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error(`${label} must be a non-empty string`);
   }
@@ -109,7 +110,7 @@ function assertSafeString(value, label) {
  */
 const SAFE_TOKEN_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 
-function assertSafeToken(value, label) {
+export function assertSafeToken(value, label) {
   assertSafeString(value, label);
   if (!SAFE_TOKEN_RE.test(value)) {
     throw new Error(`${label} must be a safe token (^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$): ${JSON.stringify(value)}`);
@@ -117,7 +118,7 @@ function assertSafeToken(value, label) {
   return value;
 }
 
-function assertHttpUrl(value, label) {
+export function assertHttpUrl(value, label) {
   assertSafeString(value, label);
   let u;
   try {
@@ -491,6 +492,14 @@ export function validateTraefikConfig(text, allocations) {
  * 从 DB 读取路由所需 desired state（active/allocated 网络 + 未释放 allocation → backend URL
  * + active LiteLLM binding → 发布事实：fde_name/subnet/virtual key）。
  * virtual key 明文只进返回值（渲染进 mode 600 文件），**绝不写日志/错误消息**（调用方同责）。
+ *
+ * issue #474 S2：本函数是「DB 行 → 边缘后端」的唯一咽喉，所以后端 URL / hostname / 网段
+ * 三样**全部在这里过白名单**（`routebackends.js`），不再是内联拼一个字符串：
+ *   · 预览后端走 `buildPreviewBackend()`（网段规范 + 池归属 + 前缀 + base+2 + 端口闭区间 + hostname 重算）；
+ *   · hostname 与「该 FDE 在 fde_networks 里那一行」做**交叉**判据（allocation.subnet 必须等于该 FDE
+ *     自己的分配网段）——单看 allocation 行自己，脏行与正行长得一样，必须换个来源比；
+ *   · LLM binding 的 subnet 同一判据（它进 `ClientIP()`，决定虚拟 key 的注入范围）。
+ * 任一不满足 ⇒ 抛错（调用方按「读取或校验失败」处理：保留 last-known-good，绝不写盘）。
  */
 export async function readRouteDesiredState(pool, config) {
   const networks = await pool.query(
@@ -510,33 +519,65 @@ export async function readRouteDesiredState(pool, config) {
       ORDER BY u.fde_name`,
   );
   const allocs = await pool.query(
-    `SELECT a.id, a.fde_id, a.hostname, a.port, n.subnet
+    `SELECT a.id, a.fde_id, a.hostname, a.port, n.subnet, u.fde_name
        FROM port_allocations a
        JOIN fde_networks n ON n.fde_id = a.fde_id AND n.state IN ('allocated', 'active')
+       JOIN users u ON u.id = a.fde_id
       WHERE a.state <> 'released'
       ORDER BY a.hostname`,
   );
+  // 每 FDE 自己的分配网段（hostname 重算与前缀的交叉判据来源；同一 fde 多行取首行，与 JOIN 语义一致）。
+  const subnetByFde = new Map();
+  const prefixByFde = new Map();
+  for (const n of networks.rows) {
+    if (!subnetByFde.has(n.fde_id)) {
+      subnetByFde.set(n.fde_id, n.subnet);
+      prefixByFde.set(n.fde_id, parseCidr(n.subnet).prefixLen);
+    }
+  }
   const allocations = allocs.rows.map((a) => {
-    const subnet = parseCidr(a.subnet);
-    // 后端 = FDE 主容器固定位 .2（topology §3/§4-L2）。
-    const backendIp = (subnet.base + 2) >>> 0;
-    const octets = [(backendIp >>> 24) & 255, (backendIp >>> 16) & 255, (backendIp >>> 8) & 255, backendIp & 255];
+    // FDE 关联（评审 F2 第 4 条）：allocation 关联到的网段必须就是该 FDE 自己那一行。
+    if (!subnetByFde.has(a.fde_id)) {
+      const err = new Error(`allocation ${a.id} references fde ${a.fde_id} without an allocated network`);
+      err.code = 'fde_subnet_association_missing';
+      throw err;
+    }
+    if (a.subnet !== subnetByFde.get(a.fde_id)) {
+      const err = new Error(
+        `allocation ${a.id} subnet ${JSON.stringify(a.subnet)} does not match fde ${a.fde_id} allocated subnet ${JSON.stringify(subnetByFde.get(a.fde_id))}`,
+      );
+      err.code = 'fde_subnet_association_mismatch';
+      throw err;
+    }
+    // 后端 = FDE 主容器固定位 .2（topology §3/§4-L2）；构造与校验同处（#474 S2）。
+    const backendUrl = buildPreviewBackend({
+      subnet: a.subnet,
+      prefix: prefixByFde.get(a.fde_id),
+      port: Number(a.port),
+      hostname: a.hostname,
+      fdeName: a.fde_name,
+      baseDomain: config.baseDomain,
+    });
     return {
       id: a.id,
       fde_id: a.fde_id,
       hostname: a.hostname,
       port: Number(a.port),
-      backendUrl: `http://${octets.join('.')}:${a.port}`,
+      backendUrl,
     };
   });
   return {
     allocations,
     sourceRanges: deriveSourceRanges(networks.rows),
-    llmBindings: llmRows.rows.map((r) => ({
-      fdeName: r.fde_name,
-      subnet: r.subnet,
-      apiKey: r.api_key ?? null,
-    })),
+    llmBindings: llmRows.rows.map((r) => {
+      // LLM binding 的 subnet 同一判据：它是 `ClientIP()` 的实参 = 虚拟 key 的注入范围（评审 F2 第 5 条）。
+      assertFdeSubnet(r.subnet, { expectedPrefix: prefixByFde.get(r.fde_id) ?? undefined });
+      return {
+        fdeName: r.fde_name,
+        subnet: r.subnet,
+        apiKey: r.api_key ?? null,
+      };
+    }),
   };
 }
 
@@ -619,42 +660,131 @@ export async function enqueueFullRebuild(pool) {
 }
 
 /**
+ * issue #474 S2 失败语义（三态，绝不合并）：
+ *   · **合法空**——零 active LLM binding ⇒ `llmText === null`：这是**盘上不该有 llm-routes.yml** 的稳态，
+ *     所以允许（且必须）unlink；
+ *   · **有效配置**——两份文本都算出来且过了两道校验；
+ *   · **读取或校验失败**——抛错（带 `stage`），调用方**保留 last-known-good**：一个字节都不写、
+ *     也**绝不 unlink**（否则「DB 抖一下」就会把一份正在生效的含密配置抬成「无 LLM 可用」）。
+ * 本函数只做「算 + 校」，不碰盘：「失败不写盘」在结构上而不是靠异常路径写得巧。
+ */
+async function renderRouteFiles(pool, config, { assertText = assertRenderedRouteText } = {}) {
+  const state = await readRouteDesiredState(pool, config).catch((err) => {
+    err.stage = 'read_desired_state';
+    throw err;
+  });
+  let text;
+  let llmText;
+  try {
+    text = generateTraefikConfig({
+      portalHost: config.portalHost,
+      portalInternalHosts: config.portalInternalHosts,
+      portalBackendUrl: config.portalBackendUrl,
+      entryPoint: config.traefikEntryPoint,
+      secureEntryPoint: config.traefikSecureEntryPoint ?? null,
+      allocations: state.allocations,
+      sourceRanges: state.sourceRanges,
+      // #450：管理台入口（config.js 恒提供；直接调用本函数且不带 adminHost 的老测试保持单入口快照）。
+      adminHost: config.adminHost,
+      adminEntryPoint: config.traefikAdminEntryPoint,
+      adminIpAllowlist: config.adminIpAllowlist ?? [],
+    });
+    validateTraefikConfig(text, state.allocations);
+    llmText = generateLlmTraefikConfig({
+      entryPoint: config.traefikEntryPoint,
+      llmHost: config.llmHost,
+      llmGatewayUrl: config.llmGatewayUrl,
+      llmBindings: state.llmBindings,
+    });
+    validateLlmTraefikConfig(llmText, state.llmBindings);
+  } catch (err) {
+    err.stage = err.stage ?? 'render';
+    throw err;
+  }
+  // 第二道（#474 评审 §4.4）：对**最终文本**的结构断言。不引 YAML parser，用严格文本判据：
+  // 每个 `url:` 必命中「portal / LLM 网关 / 池内预览」三者的允许集合、每个 `Host()` 必在允许集合、
+  // 每个 `ClientIP()` 必在 FDE 池内。与第一道（构造期）独立实现，所以能抦住「第一道被改坏」。
+  try {
+    assertText({
+      text,
+      llmText,
+      config: {
+        baseDomain: config.baseDomain,
+        portalHost: config.portalHost,
+        portalInternalHosts: config.portalInternalHosts,
+        portalBackendUrl: config.portalBackendUrl,
+        adminHost: config.adminHost,
+        llmHost: config.llmHost,
+        llmGatewayUrl: config.llmGatewayUrl,
+      },
+      file: config.traefikDynamicFile ?? 'routes.yml',
+      llmFile: config.traefikLlmDynamicFile ?? 'llm-routes.yml',
+    });
+  } catch (err) {
+    err.stage = 'assert_final_text';
+    throw err;
+  }
+  return { text, llmText, state };
+}
+
+/**
+ * #474 审计（best-effort）：只允许 `{file, stage, reason, count}` 四个字段，**绝不记内容**。
+ * `reason` 取 `err.code`（没有则固定哨兵）而不是 `err.message`：消息可能携带配置字面值，
+ * 而红线只允许文件名 / kind / 时间 / sha8 / 字节数 / 失败阶段。审计自身失败不得拖垮主流程。
+ */
+async function auditGenerationRejected(pool, details) {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, $2, $3, $4)`,
+      [null, 'admin.routes_generation_rejected', details.file, JSON.stringify(details)],
+    );
+  } catch {
+    // 审计面不可用（DB 抖动的典型副产品）：不反串主流程的失败原因。
+  }
+}
+
+/**
  * 全量重生成 Traefik 动态配置并原子替换（启动/定时对账用，不依赖 outbox 行）。
- * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 virtual key 明文，**0600**，issue #38 Phase B1）。
- * 两份都先生成+校验再落盘：任一渲染失败则两份都不写（不落半截）。
+ * 拆两份文件：routes.yml（无密钥，0644）+ llm-routes.yml（含 virtual key 明文，**0600**，#38 B1）。
  *
- * F3 发布语义（fail-closed 硬红线：任何失败都不允许让「已撤销/已停用」的 key 继续被 Traefik 使用）：
- *   1. 先发含密文件 llm-routes.yml（零 binding → unlink；有 binding → 写新内容 0600）；
+ * F3 发布语义（fail-closed 硬红线：任何失败都不允许让「已撤销/已停用」的 key 继续被 Traefik 使用）。发布顺序与回滚：
+ *   1. 先发含密文件 llm-routes.yml（**仅合法空** → unlink；有 binding → 写新内容 0600）；
  *   2. 再无密主文件 routes.yml（0644）——若第 2 步失败，主文件保持上一版不动，回滚删除
  *      llm-routes.yml（宁可不给 LLM 路由，也不让旧 key 在新主配置下继续生效），再抛错；
  *   3. 若第 1 步含密文件发布本身失败（写或 unlink）→ 主文件不动（保持上一版），并尽力摘除盘上
- *      旧含密文件；摘除失败属异常态，错误/日志必须明示「含密文件可能残留」，绝不静默。
+ *      旧含密文件；摘除失败属异常态，错误/日志必须明示「含密文件可能残留」，绡不静默。
+ *
+ * #474：在第 1 步**之前**还有一道「算+校」（`renderRouteFiles`）：它失败 ⇒ 上面三步**一步也不跑**
+ * （保留 last-known-good），并记 `admin.routes_generation_rejected` + warn（只记元数据）。
  */
-export async function rebuildRoutes(pool, config, { log = console } = {}) {
-  const state = await readRouteDesiredState(pool, config);
-  const text = generateTraefikConfig({
-    portalHost: config.portalHost,
-    portalInternalHosts: config.portalInternalHosts,
-    portalBackendUrl: config.portalBackendUrl,
-    entryPoint: config.traefikEntryPoint,
-    secureEntryPoint: config.traefikSecureEntryPoint ?? null,
-    allocations: state.allocations,
-    sourceRanges: state.sourceRanges,
-    // #450：管理台入口（config.js 恒提供；直接调用本函数且不带 adminHost 的老测试保持单入口快照）。
-    adminHost: config.adminHost,
-    adminEntryPoint: config.traefikAdminEntryPoint,
-    adminIpAllowlist: config.adminIpAllowlist ?? [],
-  });
-  validateTraefikConfig(text, state.allocations);
-  const llmText = generateLlmTraefikConfig({
-    entryPoint: config.traefikEntryPoint,
-    llmHost: config.llmHost,
-    llmGatewayUrl: config.llmGatewayUrl,
-    llmBindings: state.llmBindings,
-  });
-  validateLlmTraefikConfig(llmText, state.llmBindings);
+export async function rebuildRoutes(pool, config, { log = console, assertText = assertRenderedRouteText } = {}) {
   const target = path.join(config.traefikDynamicDir, config.traefikDynamicFile ?? 'routes.yml');
   const llmTarget = path.join(config.traefikDynamicDir, config.traefikLlmDynamicFile ?? 'llm-routes.yml');
+
+  // 第 0 步：算 + 两道校。失败 = **一个字节不写、一个文件不抹**（last-known-good）。
+  // `assertText` 是测试缝（不是旋钮：默认就是真断言，生产不传）——第二道在写盘前真的被调到，
+  // 需要一个能直接观察的入口，否则「删掉第二道」这种变异只能靠间接推。
+  let rendered;
+  try {
+    rendered = await renderRouteFiles(pool, config, { assertText });
+  } catch (err) {
+    const stage = err.stage ?? 'unknown';
+    const count = err.count ?? null;
+    await auditGenerationRejected(pool, {
+      file: stage === 'render' || stage === 'assert_final_text' ? path.basename(llmTarget) : path.basename(target),
+      stage,
+      reason: err.code ?? 'route_generation_rejected',
+      count,
+    });
+    // 红线：warn 只有阶段与 code，**没有 err.message**（消息可能带配置字面值）。
+    log.warn?.(`[routes] 路由生成被拒（stage=${stage} reason=${err.code ?? 'unknown'}）⇒ 保留 last-known-good，不写盘`);
+    // 向上**原样抱**原错（保留可诊断的 code/消息）但补上 stage；日志面自己负责不印正文。
+    // （生成器的消息口径：只 echo hostname / entryPoint / cidr / URL，**从不 echo apiKey**。）
+    err.stage = stage;
+    err.code = err.code ?? 'route_generation_rejected';
+    throw err;
+  }
+  const { text, llmText, state } = rendered;
 
   // 第 1 步：先发含密文件（零 binding → unlink；有 binding → 写新内容）。
   try {

@@ -69,6 +69,11 @@ export const zhCN = {
     emailResendIn: '{seconds} 秒后可重发',
     emailResendFailed: '重新发送',
     emailBackToPassword: '← 返回上一步',
+    // issue #449 二选一（`second_factor_choice`）：TOTP 与邮箱码并存时的两条切换入口 + 降级说明。
+    // 口径：默认停在 TOTP；切换不重新登录也不重新发码，所以文案里不能许「重新发送」这种诺。
+    useEmailCode: '改用邮箱验证码',
+    useTotp: '改用验证器应用（TOTP）',
+    emailChannelUnavailable: '邮件通道当前不可用，请使用验证器应用。',
   },
   // #255 首登强制改密（views/ForcePasswordChangeView.vue）：受限会话（portal.md §2.11a）的唯一出口界面文案。
   // 约束：不硬编码端口/域名（部署形态可变、docs/api/portal.md §2.5 cookie 口径与 host 无关），
@@ -952,8 +957,11 @@ export const zhCN = {
     mailOtpSection: '邮件验证码',
     mailOtpHint: '为该用户启用邮箱验证码作为第二因素。这是按用户的开关，与 TOTP 并列；邮件通道（SMTP）只决定「能不能发信」。',
     mailOtpEnabledLabel: '登录时要求邮箱验证码',
-    mailOtpEnabledHint: '关闭时该用户只用口令登录（没有第二因素）。已绑定 TOTP 的账号始终走 TOTP，此项不生效。',
-    mailOtpHiddenByTotp: '该账号已绑定 TOTP —— 登录会走 TOTP，本开关不影响。',
+    mailOtpEnabledHint: '关闭时该用户只用口令登录（没有第二因素）。',
+    // #449 二选一（`second_factor_choice`）：已绑 TOTP 的账号不再「本开关不生效」，而是多一条可走的路；
+    // 审计口径（较弱的那一条记 `email_code_alt`）必须写在这里，运维才不会以为开了就是强二因素。
+    mailOtpEnabledLabelAlt: '邮件验证码（作为 TOTP 的替代方式）',
+    mailOtpAltHint: '该账号已启用 TOTP。打开后，登录时可用 TOTP 或邮箱验证码任一通过；邮件码路径会在审计里记为 email_code_alt。',
     mailOtpCurrentEmail: '验证码将发到：{email}',
     mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
     mailOtpSaved: '邮件验证码设置已保存。',

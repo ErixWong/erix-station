@@ -47,8 +47,25 @@ export class FakePool {
     if (sql.includes('FROM users WHERE login')) {
       const login = params[0];
       const u = this.users.find((x) => x.login === login && x.status === 'active');
-      // #472：SELECT 里没 `file_upload_enabled` 就不回这一列（fake 不兼平，见 `projectFileUpload`）。
-      return { rows: u ? [{ ...u, ...this.projectFileUpload(sql, u) }] : [] };
+      // #472 合并注记：两边都在修同一类问题——**fake 必须按 SQL 的列清单回列**，不许用整行兼平。
+      // origin/main 那版（#449 回归）把投影做成通用的（从 SELECT 里解析列名），比本分支原来的
+      // 单列 `projectFileUpload` 更强 ⇒ 这里取通用版；`projectFileUpload` 仍服务另外三处分支
+      // （loadActiveUser / verifyTotpForUser / findSessionUser），那三处 origin/main 没动。
+      if (!u) return { rows: [] };
+      // **按 SQL 的列清单投影**（#449 回归）：真 PG 只回 SELECT 里点名的列，
+      // 而过去这里直接回整行 ⇒ 「SELECT 漏掉 mail_otp_enabled」这类 bug 在单测里永远看不见
+      // （生产上 `row.mail_otp_enabled` 恒 undefined ⇒ per-user 邮件验证码开关整条死掉）。
+      // 同理覆盖 #472 的 `file_upload_enabled`：漏选该列 ⇒ 行里没有它 ⇒ `=== true` 得 false ⇒ 用例红。
+      const m = /SELECT ([\s\S]*?) FROM users WHERE login/.exec(sql);
+      if (!m) return { rows: [u] };
+      const cols = m[1].split(',').map((c) => {
+        const t = c.trim();
+        const as = /\s+AS\s+(\w+)$/i.exec(t);
+        return as ? as[1] : t.split('.').pop();
+      });
+      const projected = {};
+      for (const c of cols) if (Object.hasOwn(u, c)) projected[c] = u[c];
+      return { rows: [projected] };
     }
 
     // hasTotpEnrollment：NULL 与空字符串均表示未注册。

@@ -129,7 +129,7 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree（**已修订**，见下方 D8 修订段）；D9 目录 git 状态 = 一颗红/黄/绿灯（见下方 D9 段，issue #359）
 
-## 7. D8 修订（2026-09-24，决策者拍板）：cwd 直达项目目录，拆除 worktree
+### 7.1 D8 修订（2026-09-24，决策者拍板）：cwd 直达项目目录，拆除 worktree
 
 D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录（cwd）**」：
 
@@ -144,7 +144,7 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   再按项目粒度加执行锁，不预支 worktree 复杂度。
 - **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
 
-## 7. D9（2026-10-24，决策者拍板，issue #359）：目录 git 状态只以「红/黄/绿」一颗灯呈现
+### 7.2 D9（2026-10-24，决策者拍板，issue #359）：目录 git 状态只以「红/黄/绿」一颗灯呈现
 
 - **语义**：灯 = **收工进度**，一句话给用户的判据是「**每天忙完之后要保证它是绿的**」。
   🔴 未落地（未提交 / 未跟踪 / 0 提交但有内容）→ 🟡 未推送（有提交未推 / 无远端 / 从未 fetch）
@@ -797,6 +797,7 @@ deny 的 403 又**不带 CORS 头**，于是浏览器报 `No 'Access-Control-All
 **四个切片**（决策者定稿：1/4 上限 + 上游真值为源 + 非法值按 1/4 兜底 + **显式发 `max_tokens`** + **命名不许发散**）
 
 - **切片 0（数据，零代码）**：dev 6 条 deployment 的 `model_info.max_output_tokens` 与 `litellm_params.max_tokens` 都设 32768（各自 1/4 内）。**另一台服务器仍欠这一步**（那台 `litellm_params.max_tokens=131072` 是事故链另一半：`170393+131072 > 262144`）。
+  ⚠ **2026-11-09 复核：这条是运维账，不是本机待办**——那台部署在本仓**没有任何标识**（全仓 grep 只有「另一台」这类泛指，无主机名/IP/URL；`131072` 只存在于本文件这两句散文里），唯一实物证据是当初贴进会话的失败样本（LiteLLM 请求 id 前缀 `20261016`）。判「是不是本机」用**模型目录名**而不是数字：本机 dev 网关数据面 6 条（`kimi-for-coding` / `erix-deepseek-flash` / `glm-5.3-flash-awq` / `deepseek-v4-pro` / `k3` / `deepseek-flash`）**没有**事故那个 `qwen3.8-flash-next`，且 6 条 `max_output_tokens` 全为 32768、131072 命中 0 ⇒ 确为另一台。本仓对那台**没有远程下发 / 对账探针 / 版本闸**，它既不升级也不改数据，仓库侧无从影响 ⇒ 别再当本机待办引。
 - **切片 1（PR #311）**：门户 `max_output_tokens` 字段 + 硬上限 `≤ floor(context_window/4)` + `model_info`/`litellm_params.max_tokens` **绑死双写** + 心跳 `models.main` 两键（非 null 才带）。
 - **切片 1.5（PR #312）**：读侧**四级回退** `model_info.max_output_tokens ?? litellm_params.max_tokens ?? floor(正数 ctx/4) ?? null` ⇒ **缺元数据不再等于关压缩**（唯一还关着的是「连 `context_window` 都没配」，那时上游一次性告警就是它的告警）。**1/4 既是手填上限也是回退值** ⇒ 平台永远不会造出被自己校验拒的数（有专测）。决策者**否决**「区分配置值 vs 平台假定值」的字段拆分（原话：有个数字就行）⇒ 没有 `effective_`/`source`。命名统一到 `max_output_tokens`（前端拆掉 `Budget` 拼写，legacy 字段回 `colMaxTokens`），`portal.md` §4.9 加**一个数跨六层的别名对照表**。
 - **切片 2+2b（PR #313）**：`parseHeartbeatModels` 收两键（**只收正整数**，非法形态**整键不写**而非置 `undefined` ⇒ 无元数据时与改前**逐字节相同**）+ 纯函数 `resolveModelMetadata(models, {computeBudget})` 做钳制（判据必须能在纯函数层单测）+ worker **唯一一处**映射（`#309:engine-model-params` 标记包住）成 `modelMetadata.{contextWindowTokens,maxOutputTokens}` 与**显式 `maxTokens`（同一个数）**。
@@ -917,7 +918,7 @@ worker 交付的**收尾纪律第三次发作**：终局文本停在「Now let m
 
 **验收**：根 **1262 → 1286**（1282 通过 / 0 失败 / 4 跳过；#318+#325 **+5**）、runner **320 不变**、前端 **582 → 585**（#314 **+3**）、typecheck 干净。**主 agent 亲跑变异 3 条全红在具名用例**：拆掉 `window < CONTEXT_WINDOW_MIN` ⇒ 2 条具名红；`model_info.context_window` 回写原值 ⇒ 恰 1 红；重设按钮改成顺手提交 ⇒ 恰 1 红（「PATCH 数为 0」那条）。
 
-**已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，界面上不可见，未单开 UI）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
+**已接受代价 / 遗留**：另一台服务器的切片 0 仍待它自己做（本版上线后 runner 显式发 `max_tokens`，那个 131072 不再影响平台流量，只咬**绕过平台直接调网关**的调用方）；wrap-up 归一化 judge **继承**宿主 `maxTokens`（`orchestrator.js:3115`，变严不是变松；round judge `:2319` 固定 1024 不受影响）；`context_window` 未配 ⇒ 压缩仍关（靠上游一次性事件告警，~~界面上不可见，未单开 UI~~ **2026-11-09 复核该半句已过期**：`model_metadata_missing` 三处承接面都在 ——`portal/src/http.js` 的 `HISTORY_EVENT_TYPES` 下发白名单、前端 `useEventStream.ts` 的 `EVENT_TYPES` 实时订阅、`HISTORY_REPLAY_TYPES` 回放与对应 `case` 分支——由 #420（§8.74）那波事件承接面关掉；「压缩关闭」这件事界面上现在看得见的就是这条事件行）；dev 残渣会话 `16261d57…`（`probe-309` + `big.txt` 200KB）**故意不清**——它是「钳制 + 压缩」两块的现成回放标本。
 
 
 ### 8.32 v0.1.19 发版：#318 / #325 / #314 落地 + 真机复验（2026-10-20 晚）
@@ -2307,6 +2308,17 @@ provisioner 34/34、portal+root 全量绿。
   等有 `workflow` scope 的凭据（或本人）再推。**在它落地之前**：`revision` / OCI label 会是 `unknown`
   （`station_version` / `engine_version` 仍是真值，因为它们从镜像内文件读，不依赖 ARG），
   而"版本没烘进去"这件事暂时**没有自动检查**——就是上面反复强调的"第三问：谁在检查"仍然空着。
+- ✅ **已补（2026-11-09，`861d323`）**：两个 workflow 落进仓库了（`git push` 走的是 credential-store 里的
+  PAT，**有** `workflow` scope；当初拒推的是 `gh` 的 OAuth App token，两者不是同一个凭据——这条差别值得记住）。
+  `release.yml` 新增步骤 ③′ 取 UTC 时间戳 + 步骤 ⑤ 传三个 ARG（`STATION_VERSION` / `STATION_REVISION` /
+  `STATION_BUILD_DATE`）；`ci.yml` 步骤 ⑤ 同样传，并新增**步骤 ⑤′**：`docker run --rm --entrypoint cat`
+  读回 `build-info.json` 后逐格断言（`station_version` == 仓库 pin、`revision` == 本次 commit、
+  `engine_version` 非 `unknown`、`built_at` 非 `unknown`）。
+  **端到端已验**（main CI run `42573190051` 两个 job 全绿，日志逐字）：
+  `{"station_version":"0.1.57","engine_version":"0.31.0","revision":"861d3231b17d…","built_at":"2026-11-09T06:29:42Z"}`
+  ⇒ 修复前实测同一镜像族是 `{"station_version":"0.1.53",…,"revision":"unknown","built_at":"unknown"}`、两个 OCI
+  label 也是空串。⚠ 两个 ARG 声明在 Dockerfile **末尾** ⇒ 只让 build-info 层与 label 层缓存失效，不重跑 `npm ci`。
+  ⚠ 仍未做：**部署面读这列的人还没有**（`containers.agent_version` 的消费面，§8.70 末段已记）。
 
 ### 8.71 #412④：隔离跑的宿主写路径必须**逐条证明与共享栈不相等**，"有没有设"不是判据（2026-10-26，分支 `fix-261026-07-host-write-paths`）
 
@@ -2735,7 +2747,12 @@ UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字�
 ③ mock 的字面值要**长得像真机的形状**（`pk-m1` / UUID 形态），`model_id: 'gpt-4o'` 这种"看着像人名"的
   mock 会让 UUID 泄漏在结构上测不出来。
 
-### 8.73 v0.1.44 发版与部署（含 #434 模型标签收口 + #429 登出回收预览凭证真机验收）（2026-10-30）
+### 8.106 v0.1.44 发版与部署（含 #434 模型标签收口 + #429 登出回收预览凭证真机验收）（2026-10-30）
+
+> ⚠ **编号更正（2026-11-09）**：本节**原误记为 §8.73**，与 §8.73「erix-agent #469 的宿主侧后续」重号。
+> 全仓 `§8.73` 的引用（`worker.js` / `engine-notices.js` / 各测试 / `.work-orders/*`）指向的都是**那一条**
+> （折叠策略、降级出口、"策略不是运维参数"口径），所以改的是本节号、不是那一条。本节按发现顺序排在 8.80 之后，
+> 但取号用**下一个空号**（8.106）而不是顺移 8.81–8.105 —— 顺移会让既有引用全部错位。
 
 **为什么这次一次发**：main 上积了 **21 个未发版提交**（#396 `node_modules` 解除跟踪 / #399 Git 凭据搬 ro bind / #420 事件承接面 / #425 状态条 / #428 换账号串号 / #429 登出回收预览凭证 / #431 登出收口 + #434 模型标签），而最新 tag 还是 `v0.1.43` ⇒ 现网落后两天。⇒ 合完 #434 直接发 **v0.1.44**。
 
@@ -2781,7 +2798,7 @@ UUID 退到括号里做排障引用，`details` 补 `model_name`，前端名字�
 
 **已知 nit（故意保留）**：新测试对 **Dockerfile 全文**禁 `8.0.<数字>` / `10.0.<数字>`（含注释），所以将来谁想在某条注释里写「实测 8.0.427 通过」会红。这是刻意的——官方 tag 浮动，把补丁号写进镜像会随官方推补丁漂移；要记实测版本请记在本台账或 issue 里，别记进 Dockerfile。
 
-**未做 / 待办**：① 发版 + **`docker rm -f` 全部 `fde-*` 让 reconcile 重建**（§8.17：不动镜像就还是只有 SDK 8）；② 本单**不碰** per-FDE / per-language 镜像（`FDE_IMAGE` 仍是全局单值，要改是另一个决策）；③ 不装 .NET 9、不改底座、不动 `FDE_MEMORY_LIMIT=4g`。
+**未做 / 待办**：① ~~发版 + `docker rm -f` 全部 `fde-*` 让 reconcile 重建~~ **已完成**（2026-11-09 现查）：随 **v0.1.45** 发布，并已随 v0.1.57 部署到 5 台 `fde-*` —— 容器内 `dotnet --list-sdks` = 8.0.427 + 10.0.403、`build-info.json` = station 0.1.57 / engine 0.31.0；② 本单**不碰** per-FDE / per-language 镜像（`FDE_IMAGE` 仍是全局单值，要改是另一个决策）；③ 不装 .NET 9、不改底座、不动 `FDE_MEMORY_LIMIT=4g`。
 
 ### 8.82 引擎升 pin 0.26.0 → **0.29.0**：扁平入参面被删，pin 与迁移必须同一次落地（2026-11-02，分支 `feat-261102-01-erix-agent-0.29.0`）
 
@@ -3694,6 +3711,16 @@ R9 预览端口段对容器可达（低，设计如此）。方案：S1 `#233` �
 S4 私钥读路径改 `stat` + 回滚改 `copyFile` · S5 用户面上 HTTPS · S6 独立发布者进程（暂不建议）。
 **建议顺序：S4（半天）→ S2+S3（一天）→ S1（单独设计+演练）→ S5。**
 
+**2026-11-05 追加（决策者口径，已落 §9 / §5 / §4 的 S7）**：
+① **数据库可以继续 `0.0.0.0` + 靠 DB 内部权限控制**（理由：「本来也是按数据库账号限制 access 的」）——但前提是
+per-FDE 账号 + 库级授权 + 与平台库凭据不同源 + 收紧 `public`；`unix socket 挂载`（不通用，MSSQL 无 socket）与
+`per-FDE 独立实例`（资源不够）**两个方案被否**；`DB 协议代理` 记为 **S7 补充方案，后期再考虑**。
+② **该口径只覆盖数据库**：`9000`(Portainer) / `2201-2203`(SSH 进容器) / `19001`(实测可用的出网代理) 与 DB 权限无关，仍须关
+⇒ **`#233` 收窄成「控制面 + 出网 + 容器 SSH」三类 + DB 按登记表放行**，不再是"一刀切关 41 个"。
+③ ⚠ **`#233` 必须同时写 `DOCKER-USER` 与 `INPUT` 两条链**（实测：41 个 `0.0.0.0` 端口里 **27 个是 docker publish**
+走 DNAT/FORWARD，**INPUT 规则管不到**；只有 11 个是宿主进程/host 网络容器）。只写 INPUT 会出现「INPUT 侧生效、
+27 个一个没挡」的假绿 —— 这是本单最容易做假的地方。
+
 ### 8.97 #456 M2：管理台「证书」页（状态卡 / 两步上传 / 真机校验 / 回滚）+ `inspect` 端点（2026-11-05）
 
 M1（§8.95）只给了四个端点，管理台里没有入口。M2 把它变成能用的页面，并补了**唯一允许的后端追加**：
@@ -4061,3 +4088,68 @@ P3：终态不停轮询 ⇒ 3 红 · 卡片分级忽略 `termination` ⇒ 1 红 
 `portal/src/provisioner.js#delegateEnvValue()`（未设 ⇒ `'1'`）；判据 `portal/test/deploy-env-delegate.test.js`
 （它把 compose 插值默认喂进 runner 的真函数比对，不是各钉各的）。
 ⚠ 常驻成本随之变成**默认**：开着时每次请求多带 `DELEGATE_DEFINITION` 的 2065 字节（≈516 token）。
+
+**发布物真机复验（v0.1.57，2026-11-09 中午，主 agent 亲手；这次**不是**热 patch，是 ghcr 上的发布镜像）**：
+`station-portal 0.1.57` + `fde-eric station 0.1.57 / engine 0.31.0`、容器 env `ERIX_DELEGATE_ENABLED=1`、
+`/home/erix/delegation` 由 agentd 自动预建 ⇒ 「默认开」在部署面真的生效了（不再是我 11-09 凌晨热 patch 的那个形状）。
+`~/worker-reports-261108/e2e-delegate.mjs` 重跑（父 run `c9f3ae7b…`，`finished/judge_done`）：
+2 个子 `completed/end_turn`、`parentRunId` = 真 runId、账本 21142 B/13 行 与 38813 B/24 行、
+`GET /delegates` 200 两项 `hasTranscript:true`、`GET /delegates/:id` 200 五条消息、
+`usage_ledger` **恰好 1 行**（79686/5143，与 `runs.usage` 逐字段相同）。
+**答案正确性也验了**（不只是"跑通了"）：子 A 报 3 个 `.md` / 15 行（我 `printf` 出来的确实是每份 5 行）、
+子 B 报 `config.json → alpha,beta` 与 `meta.json → name,version,tags`，逐项对得上。
+UI（真浏览器、**先 reload**）：两张 delegate 卡各带 `View sub-task` 按钮（**截断修复在发布物上成立**），
+点开抽屉 `✓ Completed / Sub-task 2145bfe9`、正文是子 run 的真实任务+reasoning+4 条工具调用+完整答案，
+**终态 9 秒内 0 次 `/delegates` 轮询**。截图 `~/worker-reports-261108/e2e-drawer-v0157-live.png`。
+⚠ 一条观察：`probe-delegate` 顶栏 git 灯是**红的**（"Not saved"）——因为我刚往里写了 5 个文件没提交，
+这是 D9 的正确呈现，不是缺陷。
+
+### 8.104 v0.1.57 发版与部署：把本地 hotfix 镜像换回发布物（邮箱可见可改 / per-user 邮件验证码 / #468 / delegation）（2026-11-09）
+
+**先记一条账实不符**：`b0b29da`（管理台可显示/修改用户邮箱）与 `45cf6c7`（per-user 邮件验证码开关）**从未走过 PR** ——
+它们提交在 main 上，随后被 delegate 那波的 `push origin main` 一起带上去了（`git branch -r --contains` 两条都指向
+`origin/main`）。⇒ 想「补一个 PR」时已经无 PR 可提（提交已是 main 祖先）。**口径重申**：改动型提交**不要**直接落在
+main 上等人来问「提了吗」——一旦被并行会话的 push 顺带带走，PR 评审这道闸就永久跳过了。以后同类改动走分支 + PR。
+
+**载荷**（自 v0.1.56）：`b0b29da` 邮箱可见可改 · `45cf6c7` per-user `mail_otp_enabled`（迁移 **0028**）· `#468` 端口面板
+跟随项目 + 未知项目分组 · delegation 接入（PR #471，§8.103）· 开关默认值翻向（未设 ⇒ 开）。
+
+**发版流程（照惯例，全部先绿再动手）**：`8c8faf2`（六文件 9 增 9 删）→ main CI `42555481846` **两个 job 全绿**
+（质量门禁 + 三镜像构建校验）→ tag `v0.1.57` → release `42555885220` success → 三镜像 **直连一次拉齐**（本机
+github.com 不通但 GHCR 通；`docker pull` 后 `image inspect .Id` 与清单 `imageId` **逐个一致**：portal `5bd39ae5…` /
+fde `cb8d031b…` / proxy `dccb48aa…`，`RepoDigests` 含清单 digest）→ `deploy/.env` 形态① pin **三项**
+（备份 `/tmp/deploy.env.bak-0157`）→ `up -d --no-build station-portal`（连带重建 `station-docker-proxy`；
+`IMAGE_ALLOWLIST` 由 `${FDE_IMAGE}` 派生，不需要单独改）→ portal 实跑 `5bd39ae5…`、经 Traefik `healthz=200` →
+**`docker rm -f` 五台 `fde-*`（双过滤 `label=station.stack=default` + `name=fde-`，对照确认 `fde-workshop-db` 无标签被排除）
+→ reconcile 5 秒内全部重建在 `cb8d031b…`**，容器内 `build-info.json` = `station 0.1.57 / engine 0.31.0`、
+`ERIX_DELEGATE_ENABLED=1`、agentd `sse connected` + `sse ping received`。
+
+**基线（主 agent 亲跑，判绿 = 退出码）**：根 `npm test` **2001 / 1997 通过 / 0 失败 / 4 跳过**、`node --test runner/test/*.test.js`
+**505 / 505**、前端 `typecheck` rc=0 + **61 文件 / 1217 通过**。（台账里 §8.100/§8.102 的 1948 / 481 / 1171 已被
+delegate + #468 那几波推高，别再引旧数。）
+
+**台账三处对齐（2026-11-09，`main@91e748a` 复跑同值）**：这组数此前只有本节对，另外两处台账各停在不同版本——
+`docs/ops/ci-release.md` §1 步骤② 写着 `1932 / 1928`、`:66` 写「当前 1460 里已含 runner 的 334 项」、步骤③ `473/473`、
+步骤④ `59 文件 / 1149`、步骤① 「142 个文件」；`.github/workflows/ci.yml` 步骤② 注释写 `1401 项基线`。
+已一次性对齐到「① **243** 个文件 / ② **2001·1997·0·4**（含 runner 505） / ③ **505·505** / ④ **61 文件·1217** + typecheck rc=0」，
+并在 ci-release §1 加了一个**「现价」权威块**：
+每步后面那一大段括号是**历史沿革**（逐单净增记录），**旧数字彼此矛盾，查现价只看那一块**。
+⚠ 别再零散改这三处：要么三处一起改，要么不改（分头改正是「文档说关、部署面开」那类两头说法的温床）。
+
+**真机验收（发布物，不是 hotfix 镜像）**：① 管理台 `GET /api/admin/users` 9 个用户，DTO 键含 `email` 与
+`mail_otp_enabled`（`admin` / `eric` 的邮箱已在）；② 迁移 0028 在位（`schema_migrations` 有 `0028-user-mail-otp`，
+列 `mail_otp_enabled boolean default=false`，存量 9 人全 `false`）；③ 端到端 run（eric，8443 登录 + TOTP）
+`1e987488…` ⇒ `finished / judge_done`、8 轮、usage 落库；④ 用户面 `https://station.fde.erix.vip:8443/` 200、
+管理台 `https://admin.fde.erix.vip:9443/` 200、`/api/site` 在 8443 上报 `userBaseUrl=https://…:8443`、
+预览票 URL 是 **`https://eric-p-22000.fde.erix.vip:8443?preview_ticket=…`**（#465 的 mixed content 修复在发布物上成立）。
+
+**已知遗留**：`build-info.json` 的 `revision` / `built_at` 仍是 `unknown` —— §8.70 那两个 workflow 补丁
+（release 传 `STATION_REVISION`、CI 加 tripwire）因 `gh` token 缺 `workflow` scope 一直没推上去，
+所以「版本没烘进去」这件事至今**没有自动检查**（`station_version` / `engine_version` 是真值，它们从镜像内文件读）。
+
+### 8.105 运维事故：`docker stop` 触发内核 cgroup-writeback 活锁（2026-10-31，本机）
+
+- **现象**：`docker stop` 报 `tried to kill container, but did not receive an exit event`；随后 `docker exec` 全部 5–8s 超时（`timeout 2` 一律 rc=124）、所有容器健康检查失败、`sync` 挂死、load 84→634，`kworker/*+inode_switch_wbs` 持续 60%+ CPU。
+- **内核栈**（`journalctl -k` 的 hung task 报告）：`do_exit → cleanup_mnt → generic_shutdown_super → cgroup_writeback_umount → __flush_workqueue` —— 容器退出卸载 overlay 时等 writeback 工作队列，而 `inode_switch_wbs_work_fn` 在活锁（Ubuntu 6.8.0-147）。
+- **结局**：**21 小时后自解**，未重启（5 台 `fde-*` 最终都是 `Exited (0)` —— 即 stop 当时其实已成功，只是 dockerd 报不出退出事件）。用户态无法解除：D 状态进程杀不掉、`sync` 也挂。
+- **口径**：见到这个报错 + `kworker/*inode_switch_wbs` 高 CPU，**别再批量发 docker 命令**——每发一条就多堆一批卡住的 `runc`（实测 426→544，load 继续爬）；先看 `/proc/loadavg` 与 D 进程数判断是否在自愈，只能等或重启主机。

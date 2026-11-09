@@ -572,3 +572,198 @@ describe('LoginView 用户面拒绝无工位管理员（真机蹦极回归）', 
     expect(wrapper.find('[data-test="login-entry-role-error"]').exists()).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #449 二选一（`second_factor_choice`）：第二步两条通道可互切，共用同一枚 pending_token
+// 判据（工单 §六 6）：两个入口都渲染 / `email_sent:false` 只剩 TOTP / 切换不重新登录
+// （无新增 `POST /api/auth/login`，`pending_token` 不变）/ 双语键由 localeParity 兜底。
+// ---------------------------------------------------------------------------
+
+const SECOND_FACTOR_CHOICE = {
+  status: 'second_factor_choice',
+  pending_token: 'ptok-choice',
+  expires_in: 600,
+  methods: ['totp', 'email_code'],
+  email_hint: 'e***@i***.com',
+  email_sent: true,
+};
+
+/** 二选一的 fetch 桩：第一步回 `choice`，两条第二步端点都回「登录成功」。 */
+function choiceFetch(choice: Record<string, unknown> = SECOND_FACTOR_CHOICE) {
+  return fetchMock((url) => {
+    if (url.includes('/api/auth/login/totp') || url.includes('/api/auth/login/email-code')) {
+      return jsonResponse(200, { password_change_required: false, user: FDE_USER });
+    }
+    return jsonResponse(200, choice);
+  });
+}
+
+/** 走完第一步，停在二选一的第二步（默认 TOTP）。 */
+async function gotoChoiceStep(choice?: Record<string, unknown>) {
+  const fetchFn = choiceFetch(choice);
+  vi.stubGlobal('fetch', fetchFn);
+  const ctx = await mountLogin();
+  await ctx.wrapper.find('#loginName').setValue('alice');
+  await ctx.wrapper.find('#loginPass').setValue('secret');
+  await ctx.wrapper.find('form').trigger('submit.prevent');
+  await flushPromises();
+  return { ...ctx, fetchFn };
+}
+
+/** 打过几次 `POST /api/auth/login`（切换必须一次都不新增）。 */
+function loginCalls(fetchFn: ReturnType<typeof choiceFetch>) {
+  return fetchFn.mock.calls.filter(([url]) => String(url) === '/api/auth/login').length;
+}
+
+describe('LoginView 二选一（#449 second_factor_choice）', () => {
+  it('默认 TOTP + 「改用邮箱验证码」；切过去不重新登录、pending_token 不变，提交用的还是同一枚', async () => {
+    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep();
+
+    expect(wrapper.find('#totpCode').exists(), '默认停在较强的 TOTP').toBe(true);
+    expect(wrapper.find('#emailCode').exists()).toBe(false);
+    expect(wrapper.find('#useEmailCode').text()).toBe('改用邮箱验证码');
+    expect(wrapper.find('#emailUnavailableNotice').exists()).toBe(false);
+    expect(auth.factor).toBe('totp');
+    expect(loginCalls(fetchFn)).toBe(1);
+
+    await wrapper.find('#useEmailCode').trigger('click');
+    expect(wrapper.find('#emailCode').exists(), '切换只换表单').toBe(true);
+    expect(wrapper.find('#totpCode').exists()).toBe(false);
+    expect(wrapper.text()).toContain('e***@i***.com');
+    expect(auth.factor).toBe('email');
+    expect(auth.pendingToken, '同一枚 pending_token').toBe('ptok-choice');
+    expect(loginCalls(fetchFn), '切换不得重新登录').toBe(1);
+
+    await wrapper.find('#emailCode').setValue('654321');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    const call = fetchFn.mock.calls.find(([url]) => String(url).includes('/api/auth/login/email-code'));
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ pending_token: 'ptok-choice', code: '654321' });
+    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(auth.user?.login).toBe('alice');
+  });
+
+  it('可切回 TOTP（双向）：TOTP 提交同样用这一枚 pending_token', async () => {
+    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep();
+
+    await wrapper.find('#useEmailCode').trigger('click');
+    expect(wrapper.find('#emailCode').exists()).toBe(true);
+    await wrapper.find('#emailUseTotp').trigger('click');
+    expect(wrapper.find('#totpCode').exists(), '切换必须可逆').toBe(true);
+    expect(wrapper.find('#emailCode').exists()).toBe(false);
+    expect(loginCalls(fetchFn)).toBe(1);
+    expect(auth.pendingToken).toBe('ptok-choice');
+
+    await wrapper.find('#totpCode').setValue('123456');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    const call = fetchFn.mock.calls.find(([url]) => String(url).includes('/api/auth/login/totp'));
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ pending_token: 'ptok-choice', code: '123456' });
+    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(auth.user?.login).toBe('alice');
+  });
+
+  it('email_sent:false ⇒ 不给邮箱入口，改为「邮件通道当前不可用」说明，TOTP 仍能登录', async () => {
+    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep({
+      status: 'second_factor_choice',
+      pending_token: 'ptok-choice',
+      expires_in: 600,
+      methods: ['totp'],
+      email_hint: 'e***@i***.com',
+      email_sent: false,
+      email_unavailable: true,
+      notice: '邮件通道当前不可用，本次仅可用验证器应用（TOTP）',
+    });
+
+    expect(wrapper.find('#totpCode').exists()).toBe(true);
+    expect(wrapper.find('#useEmailCode').exists(), 'SMTP 不可用时不得给出收不到信的入口').toBe(false);
+    expect(wrapper.find('#emailUnavailableNotice').text()).toContain('邮件通道当前不可用，请使用验证器应用');
+
+    await wrapper.find('#totpCode').setValue('123456');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/'));
+    expect(auth.user?.login).toBe('alice');
+    expect(loginCalls(fetchFn)).toBe(1);
+  });
+
+  it('切到邮箱码后仍可重发（复用既有 60s 冷却），且重发不换 pending_token', async () => {
+    vi.useFakeTimers();
+    const fetchFn = fetchMock((url) => {
+      if (url.includes('/api/auth/login/email-code/resend')) {
+        return jsonResponse(200, { expires_in: 600, resend_after: 60 });
+      }
+      return jsonResponse(200, SECOND_FACTOR_CHOICE);
+    });
+    vi.stubGlobal('fetch', fetchFn);
+    const { wrapper, auth } = await mountLogin();
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('secret');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    await wrapper.find('#useEmailCode').trigger('click');
+
+    await wrapper.find('#emailResend').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('#emailResend').text()).toBe('60 秒后可重发');
+    expect(auth.pendingToken).toBe('ptok-choice');
+    expect(loginCalls(fetchFn)).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it('回归：单一通道不给切换入口（totp_required 无邮箱入口 / email_code_required 无「改用验证器应用」）', async () => {
+    const totpOnly = await gotoChoiceStep({ status: 'totp_required', pending_token: 'ptok', expires_in: 120 });
+    expect(totpOnly.wrapper.find('#totpCode').exists()).toBe(true);
+    expect(totpOnly.wrapper.find('#useEmailCode').exists()).toBe(false);
+    expect(totpOnly.wrapper.find('#emailUnavailableNotice').exists()).toBe(false);
+    expect(totpOnly.auth.choiceMethods).toEqual([]);
+
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, EMAIL_CODE_REQUIRED)));
+    const { wrapper: mailWrapper } = await mountLogin();
+    await gotoEmailStep(mailWrapper);
+    expect(mailWrapper.find('#emailCode').exists()).toBe(true);
+    expect(mailWrapper.find('#emailUseTotp').exists(), '无 TOTP 的账号不该看到切回 TOTP').toBe(false);
+    expect(mailWrapper.find('#emailBack').exists()).toBe(true);
+  });
+});
+
+describe('LoginView 二选一的双语文案（#449）', () => {
+  it('en：两条切换入口与「邮件通道不可用」说明都有英文文案', async () => {
+    setLocale('en');
+    const { wrapper } = await gotoChoiceStep();
+    expect(wrapper.find('#useEmailCode').text()).toBe('Use an email code instead');
+
+    await wrapper.find('#useEmailCode').trigger('click');
+    expect(wrapper.find('#emailUseTotp').text()).toBe('Use your authenticator app (TOTP) instead');
+
+    const degraded = await gotoChoiceStep({
+      status: 'second_factor_choice',
+      pending_token: 'ptok-choice',
+      expires_in: 600,
+      methods: ['totp'],
+      email_hint: 'e***@i***.com',
+      email_sent: false,
+      email_unavailable: true,
+    });
+    expect(degraded.wrapper.find('#useEmailCode').exists()).toBe(false);
+    expect(degraded.wrapper.find('#emailUnavailableNotice').text()).toContain('Email is unavailable right now');
+    setLocale('zh-CN');
+  });
+});
+
+describe('#449 二选一：邮箱入口以 email_sent 为准（不信 methods 单独说话）', () => {
+  it('后端同时给 methods 两条 + email_sent:false ⇒ 仍只渲染 TOTP 入口', async () => {
+    const { wrapper } = await gotoChoiceStep({
+      status: 'second_factor_choice',
+      pending_token: 'ptok-choice',
+      expires_in: 600,
+      methods: ['totp', 'email_code'],
+      email_hint: 'e***@i***.com',
+      email_sent: false,
+      email_unavailable: true,
+    });
+    expect(wrapper.find('#totpCode').exists()).toBe(true);
+    expect(wrapper.find('#useEmailCode').exists(), '码没发出去就不许给邮箱入口').toBe(false);
+    expect(wrapper.find('#emailUnavailableNotice').exists()).toBe(true);
+  });
+});
