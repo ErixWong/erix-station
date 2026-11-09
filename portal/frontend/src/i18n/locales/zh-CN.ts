@@ -966,6 +966,15 @@ export const zhCN = {
     mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
     mailOtpSaved: '邮件验证码设置已保存。',
     saveMailOtp: '保存邮件验证码设置',
+    // 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029 / docs/api/portal.md）。
+    // 开关只决定「能不能传」，服务端 403 才是闸；界面把三态说清（开启 / 关闭 / 未知）。
+    fileUploadSection: '文件上传',
+    fileUploadHint: '允许该用户从工作台往自己的工位目录上传文件。这是按用户的开关，与 TOTP / 邮件验证码同一口径：新建账号一律关闭，需管理员在这里显式打开。',
+    fileUploadEnabledLabel: '允许上传文件',
+    fileUploadEnabledHint: '关闭时上传会被服务端拒（403），工作台上也不会出现上传入口。停用后重新开户的账号会被清零，需重新打开。',
+    fileUploadUnknown: '未知（该账号的开关未能读取，刷新后重试）—— 未知不等于已关闭，所以保存暂时禁用。',
+    fileUploadSaved: '文件上传设置已保存。',
+    saveFileUpload: '保存文件上传设置',
       sectionTitle: 'FDE 用户',
       emptyUsers: '暂无用户。',
       noFdeName: '无 fde_name',

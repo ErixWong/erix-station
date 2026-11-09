@@ -112,7 +112,10 @@ test('全新空库以超级用户跑全流程（issue #280 现场）：一路到
         [...expected].sort(),
         '台账 = baseline + 全部增量（0016 必须在内，正是原失败点）',
       );
-      assert.equal(ledger.rows.length, 22, '台账行数 = 22（baseline + 0001..0021）');
+      // 行数**从仓库里量**，不写常数：写死「22」的断言在 0022 落地那天就已经过期，
+      // 只是本文件无 TEST_DATABASE_URL 时整体 skip ⇒ 拖到 #472 才暴（常数 = 拖过的错话）。
+      assert.equal(ledger.rows.length, expected.length,
+        `台账行数 = baseline + 全部增量（当前 head=${expected[expected.length - 1]}）`);
 
       // 这颗雷本身：序列属主必须与表属主一致（PG process_owned_by 的硬要求）。
       const owners = await ownersOf(database);
@@ -125,6 +128,25 @@ test('全新空库以超级用户跑全流程（issue #280 现场）：一路到
       // RESET ROLE 钉桩：pool max=1 ⇒ 这里拿到的必定是迁移用过的那条连接，角色必须已还原。
       const now = await pool.query('SELECT current_user AS role');
       assert.equal(now.rows[0].role, LOGIN_ROLE, '迁移结束必须还原到连接登录角色');
+
+      // #472 片 A：**PostgreSQL 真的执行了 0029**（不是一段静态字符串里有 IF NOT EXISTS）——
+      // 列存在 + 类型/默认值/可空性与迁移文件一致，且对存量行生效（DEFAULT 在 ADD COLUMN 时写入）。
+      const col = await pool.query(
+        `SELECT column_name, data_type, is_nullable, column_default
+           FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'file_upload_enabled'`,
+      );
+      assert.equal(col.rows.length, 1, 'users.file_upload_enabled 必须存在于真库');
+      assert.equal(col.rows[0].data_type, 'boolean', '类型必须是 boolean');
+      assert.equal(col.rows[0].is_nullable, 'NO', 'NOT NULL');
+      assert.equal(String(col.rows[0].column_default), 'false', 'DEFAULT false');
+      // 重放幂等（单文件约定：可重放）：重跑一次 0029 本体必须不报错。
+      await pool.query(fs.readFileSync(path.join(HERE, '../../deploy/migrations/0029-user-file-upload.sql'), 'utf8'));
+      const dup = await pool.query(
+        `SELECT count(*)::int AS n FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'file_upload_enabled'`,
+      );
+      assert.equal(dup.rows[0].n, 1, '重放 0029 不得报错也不得多长一列（ADD COLUMN IF NOT EXISTS）');
     } finally {
       await pool.end();
     }
