@@ -211,27 +211,41 @@ export async function invalidateOtherCodes(pool, { pendingTokenHash, keepCodeHas
 
 /**
  * 第二因素选择规则（纯函数，HTTP 层唯一的判据来源）。五分支：
- *   `second_factor_choice`             已注册 TOTP + 邮件通道启用 + 有邮箱 ⇒ **TOTP 或 邮箱码任一通过**
+ *   `second_factor_choice`             允许 TOTP + 允许邮件码 + 有邮箱 ⇒ **TOTP 或 邮箱码任一通过**
  *                                      （issue #449 二选一：不清 TOTP 配置，两者并存）
- *   `totp_required`                    已注册 TOTP 的其余情况（开关关 / 没邮箱）——现状一字不改
- *   `email_code_required`              未注册 TOTP + 邮件通道启用 + 有邮箱
- *   `email_not_registered`             未注册 TOTP + 邮件通道启用 + **无邮箱** ⇒ 409，绝不静默退回口令
- *   `password_direct_no_second_factor` 邮件通道未启用（默认形态）⇒ 口令直通（审计 method 标明没有第二因素）
+ *   `totp_required`                    允许 TOTP 的其余情况（邮件码关 / 没邮箱）——现状一字不改
+ *   `email_code_required`              允许邮件码 + 有邮箱（**与 TOTP 绑没绑无关**，见下）
+ *   `email_not_registered`             允许邮件码 + **无邮箱** ⇒ 409，绝不静默退回口令
+ *   `password_direct_no_second_factor` 两条都不允许（默认形态）⇒ 口令直通（审计 method 标明没有第二因素）
+ *
+ * ⚠ feat-261110-02 新增了一维：`hasTotpEnrollment`（**绑过密钥**）与 `totpLoginEnabled`
+ * （**登录允许用它**，迁移 0030）是两件事。此前二者是同一位，于是「密钥留着、但登录只走邮箱码」
+ * 在界面上根本表达不出来（要嘛重绑、要嘛删密钥）。现在：
+ *   绑了 + 允许 + 邮件码开 ⇒ `second_factor_choice`；绑了 + 允许 + 邮件码关 ⇒ `totp_required`；
+ *   **绑了 + 不允许 + 邮件码开 ⇒ `email_code_required`（密钥原样保留，登录不碰它）**；
+ *   绑了 + 不允许 + 邮件码关 ⇒ `password_direct_no_second_factor`（只剩口令，管理台会红字警告）。
+ * `totpLoginEnabled` **缺参/缺键按 true**：迁移 0030 的列默认 true，「没读到」= 「没人关过」，
+ * 存量 TOTP 用户必须照旧能用 TOTP（漏传这一维的旧调用也保持现状语义）。
  */
-export function chooseSecondFactor({ hasTotpEnrollment, mailOtpEnabled, email } = {}) {
+export function chooseSecondFactor({ hasTotpEnrollment, totpLoginEnabled = true, mailOtpEnabled, email } = {}) {
   const hasEmail = typeof email === 'string' && email.trim() !== '';
-  // ①（#449 二选一）有 TOTP **且** 开关开 **且** 有邮箱 ⇒ 给两条路。**必须排在 ② 之前**：
+  // 「TOTP 这一条到底走不走得通」= 有密钥 **且** 管理员没关掉它。关掉**不清密钥**（`totp_secret` 一字不动），
+  // 所以这一位随时可以再打开，重绑/重置的语义也不受影响。
+  const totpUsable = hasTotpEnrollment === true && totpLoginEnabled !== false;
+  // ①（#449 二选一）TOTP 可用 **且** 邮件码允许 **且** 有邮箱 ⇒ 给两条路。**必须排在 ② 之前**：
   //    否则已绑 TOTP 的账号打开 `mail_otp_enabled` 仍是死开关（界面显示已启用、实际永不发码）。
-  //    「有 TOTP 但没邮箱」不在这条（走 ②）：绝不能因为缺邮箱把已绑 TOTP 的人挡在门外。
-  if (hasTotpEnrollment === true && mailOtpEnabled === true && hasEmail) return 'second_factor_choice';
-  // ② TOTP 兜底：绑了且拿不出「第二条路」就一定走它（per-user 邮件开关不影响这条）。
-  if (hasTotpEnrollment === true) return 'totp_required';
-  // ③ per-user 开关（迁移 0028，管理员在 Edit → Security 里设，默认 false = 不启用）。
+  //    「TOTP 可用但没邮箱」不在这条（走 ②）：绝不能因为缺邮箱把已绑 TOTP 的人挡在门外。
+  if (totpUsable && mailOtpEnabled === true && hasEmail) return 'second_factor_choice';
+  // ② TOTP 兜底：可用且拿不出「第二条路」就一定走它（per-user 邮件开关不影响这条）。
+  if (totpUsable) return 'totp_required';
+  // ③ per-user 邮件码开关（迁移 0028，管理员在 Edit → 二次验证 里设，默认 false = 不允许）。
   //    **这是唯一的「用不用邮件码」判据**（2026-11-06 用户拍板）：全局 `transport` 只是 SMTP 连接配置，
   //    不再是功能闸。原来的 `mailEnabled` 一票否决会让这个开关变成死光纤 —— 管理员打开它、
   //    界面显示已启用、而实际永远走口令直通，没有任何信号。
+  //    ⚠ 走到这里**不再问 TOTP 绑没绑**：上面那条 `totpUsable` 已经把「绑了但不允许」分流到这里，
+  //    这正是本单要能表达的那一格（密钥在、登录不用）。
   if (mailOtpEnabled !== true) return 'password_direct_no_second_factor';
   if (hasEmail) return 'email_code_required';
-  // ④ 开了开关却没邮箱：保存时已被 admin.js 的交叉防护拒掉；走到这里说明是历史数据 / 带外改库。
+  // ④ 允许了邮件码却没有邮箱：保存时已被 admin.js 的交叉防护拒掉；走到这里说明是历史数据 / 带外改库。
   return 'email_not_registered';
 }

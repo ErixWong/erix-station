@@ -958,6 +958,19 @@ export const en = {
     mailOtpCurrentEmail: 'Codes will be sent to: {email}',
     mailOtpNeedsEmail: 'This user has no email yet — fill it in on the Profile tab first.',
     mailOtpSaved: 'Email-code setting saved.',
+    // feat-261110-03: the two-factor tab became two checkboxes + expand-on-check.
+    // This is the red line shown when the account ends up with no second factor at all. The predicate is
+    // "no usable factor", not literally "neither box ticked": the server's `chooseSecondFactor` also
+    // requires an enrolled secret, so legacy accounts (migration 0030 defaults `totp_login_enabled` to
+    // true, nothing enrolled) still get the warning.
+    mailOtpSwitchWarning: 'This account will sign in with the password only (no second factor).',
+    // Short label on the checkbox row; the long sentences stay inside the expanded block.
+    mailOtpCheckboxLabel: 'Email verification code',
+    totpLoginEnabledLabel: 'Authenticator app (TOTP)',
+    totpEnrolledState: 'Enrolled',
+    totpNotEnrolled: 'Not enrolled',
+    saveMfaSettings: 'Save two-factor settings',
+    mfaSettingsSaved: 'Two-factor settings saved.',
     saveMailOtp: 'Save email-code setting',
     // 2026-11-09 (#472 slice A): per-user "file upload" switch (migration 0029).
     fileUploadSection: 'File upload',
@@ -1029,6 +1042,8 @@ export const en = {
       editUserTitle: 'Edit user profile',
       editTabProfile: 'Profile',
       editTabSecurity: 'Security',
+      // feat-261110-02: TOTP + email codes moved out of Security into their own tab.
+      editTabMfa: 'Two-factor',
       editTabLlm: 'LLM & Repository',
       editTabPorts: 'Preview ports',
       editTabDanger: 'Danger zone',

@@ -26,7 +26,7 @@ const userForm = reactive({
 
 const editUserId = ref<string | null>(null);
 const editModalOpen = ref(false);
-type EditTab = 'profile' | 'security' | 'llm' | 'ports' | 'danger';
+type EditTab = 'profile' | 'security' | 'mfa' | 'llm' | 'ports' | 'danger';
 const editTab = ref<EditTab>('profile');
 const deleteUserId = ref<string | null>(null);
 const returnToEditAfterDelete = ref(false);
@@ -34,6 +34,10 @@ const editForm = reactive({
   display_name: '', email: '', role: 'fde' as AdminUser['role'], fde_name: '',
   // 2026-11-06：per-user 邮件验证码开关（与 TOTP 对称，管理员在 Security 里设）。
   mail_otp_enabled: false,
+  // 工单 feat-261110-03（迁移 0030）：**允许用 TOTP 登录**，跟「绑过 TOTP」是两个维度；关掉
+  // **不清 `totp_secret`**，随时可以再打开。跟后端 `chooseSecondFactor` 同口径：两位独立，
+  // 可同时勾、可都不勾（都不勾 ⇒ 服务端走口令直通 `password_direct_no_second_factor`）。
+  totp_login_enabled: false,
   // 2026-11-09（#472 片 A）：per-user「文件上传」开关。**三态**：`null` = 未知（DTO 缺键），
   // 不是 false。未知 ⇒ 勾选框与保存都禁用并显示「未知」（评审 blocker 3：把缺键折叠成 false
   // 会让管理员看到「已关闭」这个**服务端未曾证实的事实**，并在一次保存里替用户改掉它）。
@@ -256,7 +260,8 @@ function closeTotp() {
   copiedTotpValue.value = '';
   totpCopyError.value = '';
   if (resumeEditAfterTotp.value && editUserId.value) {
-    editTab.value = 'security';
+    // feat-261110-02：TOTP 那一块已从「安全」搬进「二次验证」⇒ 这个跳转的目标块动了，跟着改目标。
+    editTab.value = 'mfa';
     void nextTick(() => {
       editModalOpen.value = true;
     });
@@ -311,6 +316,8 @@ function clearSectionFeedback() {
   totpMessage.value = '';
   mailOtpError.value = '';
   mailOtpMessage.value = '';
+  mfaError.value = '';
+  mfaMessage.value = '';
   fileUploadError.value = '';
   fileUploadMessage.value = '';
 }
@@ -324,6 +331,9 @@ function openEditModal(user: AdminUser) {
   editForm.display_name = user.display_name ?? '';
   editForm.email = user.email ?? '';
   editForm.mail_otp_enabled = user.mail_otp_enabled === true;
+  // 工单 feat-261110-03：与上一行同形。后端 `safeUser` 恒带这一键（缺键 = 旧后端/部分响应），
+  // 所以 `=== true` 把「没读到」落在「未勾」那一侧，呷不了「管理员真的关掉了」这个事实。
+  editForm.totp_login_enabled = user.totp_login_enabled === true;
   // #472：三态读取 —— 只有拿到**布尔**才填 true/false，缺键（undefined）一律 `null` = 未知。
   // 这里写 `user.file_upload_enabled === true ? true : false` 就是把「未知」当作「关」，正是评审 blocker 3。
   editForm.file_upload_enabled = typeof user.file_upload_enabled === 'boolean' ? user.file_upload_enabled : null;
@@ -434,6 +444,82 @@ async function submitPasswordReset() {
 const mailOtpBusy = ref(false);
 const mailOtpError = ref('');
 const mailOtpMessage = ref('');
+
+// 工单 feat-261110-03：「二次验证」那一档的两个勾选位（`totp_login_enabled` / `mail_otp_enabled`）
+// 的**共用**保存动作。为什么不是一个勾选框一个按钮：勾选框住在折叠块**外面**（否则「取消勾选」
+// 会把保存按钮一起收起 ⇒ 关掉这件事永远好不了），所以需要一个永远可见的出口。
+const mfaBusy = ref(false);
+const mfaError = ref('');
+const mfaMessage = ref('');
+
+/**
+ * 相对**服务端当前值**改了哪几位（没改的一位不带）。
+ * 不拿 `editForm` 整个发出去：夹带 display_name / email / fde_name 会把基本资料那一格的未保存
+ * 编辑静默提交（同 #472 A-9 的口径）。比较基准是 `editUser`（computed，跟着 admin.users 走），
+ * 所以保存成功后这一位自动清空。
+ */
+const mfaChanges = computed(() => {
+  const user = editUser.value;
+  const changes: { totp_login_enabled?: boolean; mail_otp_enabled?: boolean } = {};
+  if (!user) return changes;
+  if (editForm.totp_login_enabled !== (user.totp_login_enabled === true)) {
+    changes.totp_login_enabled = editForm.totp_login_enabled;
+  }
+  if (editForm.mail_otp_enabled !== (user.mail_otp_enabled === true)) {
+    changes.mail_otp_enabled = editForm.mail_otp_enabled;
+  }
+  return changes;
+});
+const mfaHasChanges = computed(() => Object.keys(mfaChanges.value).length > 0);
+/**
+ * 开了邮件码却没邮箱 ⇒ 服务端会 400（两条交叉防护之一）。这里只拦**本次要提交的那一位**：
+ * 邮箱开着但本次没改它（例如只动了 TOTP）就不该阻止保存。
+ */
+const mfaMailNeedsEmail = computed(() =>
+  Object.hasOwn(mfaChanges.value, 'mail_otp_enabled')
+  && mfaChanges.value.mail_otp_enabled === true
+  && !editUser.value?.email);
+/**
+ * 这个账号现在到底有没有第二因素（红字警告的判据）。口径拄 `chooseSecondFactor` 的 `totpUsable`：
+ * **绑过密钥且允许登录**，TOTP 这一条才走得通。所以「没绑但 `totp_login_enabled` 为 true」
+ * （迁移 0030 的列默认值，存量未绑账号就是这个形状）**仍然算没有第二因素**，红字照旧。
+ */
+const mfaHasSecondFactor = computed(() =>
+  editForm.mail_otp_enabled === true
+  || (editForm.totp_login_enabled === true && editUser.value?.totp_enabled === true));
+
+async function saveMfaSettings() {
+  const target = editUser.value;
+  if (!target || mfaBusy.value || mailOtpBusy.value) return;
+  const changes = mfaChanges.value;
+  // 没改动 ⇒ 不发请求（也是第二道闸：按钮已禁用，但「把一模一样的值再提交一次」本身就是错的动作）。
+  if (Object.keys(changes).length === 0) return;
+  if (mfaMailNeedsEmail.value) {
+    mfaError.value = t('admin.fde.mailOtpNeedsEmail');
+    return;
+  }
+  mfaError.value = '';
+  mfaMessage.value = '';
+  mfaBusy.value = true;
+  try {
+    const error = await admin.updateUser(target.id, changes);
+    if (error) {
+      mfaError.value = error;
+      return;
+    }
+    // 同 saveMailOtp：`editUser` 是 computed ⇒ 服务端回读后界面自动更新，这里再把本地勾选框对齐一次，
+    // 避免「界面开了但服务端没改」的错觉。
+    const fresh = admin.users.find((user) => user.id === target.id);
+    if (fresh) {
+      editForm.totp_login_enabled = fresh.totp_login_enabled === true;
+      editForm.mail_otp_enabled = fresh.mail_otp_enabled === true;
+    }
+    mfaMessage.value = t('admin.fde.mfaSettingsSaved');
+  } finally {
+    mfaBusy.value = false;
+  }
+}
+
 async function saveMailOtp() {
   const target = editUser.value;
   if (!target) return;
@@ -1055,6 +1141,17 @@ onBeforeUnmount(() => {
         @click="editTab = 'security'"
       >{{ t('admin.fde.editTabSecurity') }}</button>
       <button
+        id="edit-tab-mfa"
+        type="button"
+        role="tab"
+        data-test="edit-tab-mfa"
+        :aria-selected="editTab === 'mfa'"
+        aria-controls="edit-panel-mfa"
+        :class="editTab === 'mfa' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="editTab = 'mfa'"
+      >{{ t('admin.fde.editTabMfa') }}</button>
+      <button
         id="edit-tab-llm"
         type="button"
         role="tab"
@@ -1199,84 +1296,22 @@ onBeforeUnmount(() => {
           </form>
         </section>
 
-        <section class="rounded-lg border border-black/10 p-3">
-          <h3 class="font-semibold">{{ t('admin.fde.totpSection') }}</h3>
-          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.totpSectionHint') }}</p>
-          <p class="mt-2 text-sm text-black/65">
-            {{ editUser.totp_enabled ? t('admin.fde.reenrollTotpHint') : t('admin.fde.enrollTotpHint') }}
-          </p>
-          <p v-if="editUser.totp_enabled" class="mt-2 text-sm text-black/65">{{ t('admin.fde.resetTotpHint') }}</p>
-          <p v-if="totpError" class="syserr mt-2" role="alert">{{ totpError }}</p>
-          <p v-if="totpMessage" class="mt-2 text-sm text-green-700" role="status">{{ totpMessage }}</p>
-          <div class="mt-3 flex flex-wrap justify-end gap-2">
-            <button
-              type="button"
-              data-test="confirm-totp-enroll"
-              :disabled="totpBusy"
-              class="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
-              @click="confirmTotpEnroll"
-            >{{ editUser.totp_enabled ? t('admin.fde.reenrollTotp') : t('admin.fde.enrollTotp') }}</button>
-            <button
-              v-if="editUser.totp_enabled"
-              type="button"
-              data-test="confirm-totp-reset"
-              :disabled="totpBusy"
-              class="rounded-md bg-red-700 px-3 py-1.5 text-sm text-white hover:bg-red-800 disabled:opacity-50"
-              @click="confirmTotpReset"
-            >{{ t('admin.fde.confirmTotpReset') }}</button>
-          </div>
-        </section>
-
-        <!-- 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。与上面 TOTP 那块对称：
-             管理员显式打开后，该用户登录才走邮箱验证码；全局 transport=disabled 仍压过它。 -->
-        <section class="rounded-lg border border-black/10 p-3" data-test="mail-otp-section">
-          <h3 class="font-semibold">{{ t('admin.fde.mailOtpSection') }}</h3>
-          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.mailOtpHint') }}</p>
-          <label class="mt-3 flex items-start gap-2 text-sm">
-            <input
-              v-model="editForm.mail_otp_enabled"
-              data-test="mail-otp-enabled"
-              type="checkbox"
-              class="mt-0.5"
-            >
-            <span>
-              <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
-              {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
-              <span class="block text-xs text-black/50">
-                {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
-              </span>
-            </span>
-          </label>
-          <p v-if="editUser.email" class="mt-2 text-xs text-black/50">
-            {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
-          </p>
-          <p v-else class="mt-2 text-xs text-amber-700">{{ t('admin.fde.mailOtpNeedsEmail') }}</p>
-          <p v-if="mailOtpError" class="syserr mt-2" role="alert">{{ mailOtpError }}</p>
-          <p v-if="mailOtpMessage" class="mt-2 text-sm text-green-700" role="status">{{ mailOtpMessage }}</p>
-          <div class="mt-3 flex justify-end">
-            <button
-              type="button"
-              data-test="save-mail-otp"
-              :disabled="mailOtpBusy || (editForm.mail_otp_enabled && !editUser.email)"
-              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
-              @click="saveMailOtp"
-            >{{ t('admin.fde.saveMailOtp') }}</button>
-          </div>
-        </section>
-
         <!-- 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。与上面两块对称：单独保存、单独反馈。
              **三态**：DTO 缺键 ⇒ 勾选框禁用 + 显示「未知」+ 保存禁用（不得折叠成「已关闭」，评审 blocker 3）。
              服务端 403 才是真正的闸门（片 B）——这里只是入口与授权位。 -->
         <section class="rounded-lg border border-black/10 p-3" data-test="file-upload-section">
           <h3 class="font-semibold">{{ t('admin.fde.fileUploadSection') }}</h3>
           <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.fileUploadHint') }}</p>
+          <!-- 工单 feat-261110-03：控制件回到普通勾选框（用户的原话是「用checkbox吧，两个checkbox就行」）。
+               三态判据一字未改：缺键 ⇒ 勾选框禁用 + 「未知」文案 + 保存禁用（`fileUploadDraft` 那个写入面
+               把「未知」读成未勾选，配合 disabled 不拿猜值提交）。 -->
           <label class="mt-3 flex items-start gap-2 text-sm">
             <input
               v-model="fileUploadDraft"
-              data-test="edit-file-upload"
               type="checkbox"
-              class="mt-0.5"
+              data-test="edit-file-upload"
               :disabled="fileUploadUnknown || fileUploadBusy"
+              class="mt-0.5 rounded border-black/20"
             >
             <span>
               {{ t('admin.fde.fileUploadEnabledLabel') }}
@@ -1298,6 +1333,149 @@ onBeforeUnmount(() => {
             >{{ t('admin.fde.saveFileUpload') }}</button>
           </div>
         </section>
+      </section>
+
+      <!-- feat-261110-02：TOTP 与邮件验证码从「安全」里搬出来单独一档。
+           feat-261110-03：形态改成「两个勾选框 + 勾上才展开对应块」。语义没动：
+           `mail_otp_enabled` 仍是「TOTP 或邮箱验证码任一通过即可」，与 TOTP 不互斥、不清密钥。 -->
+      <section
+        id="edit-panel-mfa"
+        v-show="editTab === 'mfa'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-mfa"
+        aria-labelledby="edit-tab-mfa"
+        class="space-y-3"
+      >
+        <!-- 两个都没勾 ⇒ 服务端 `chooseSecondFactor` 走 `password_direct_no_second_factor`（口令直通）。
+             这是这一档里**唯一**能说「该账号现在没有第二因素」的地方，所以用 .syserr 红字而不是 muted。 -->
+        <p v-if="!mfaHasSecondFactor" class="syserr" role="alert" data-test="mfa-no-factor">
+          ⚠ {{ t('admin.fde.mailOtpSwitchWarning') }}
+        </p>
+
+        <!-- 勾选框行。刻意住在折叠块**外面**：若勾选框也在 v-if 里，「取消勾选」这个动作会把
+             自己与保存按钮一起收起 ⇒ 关掉这件事再也无法提交（上一版的同类陷阱）。 -->
+        <div class="grid gap-2 rounded-lg border border-black/10 p-3">
+          <div class="flex flex-wrap items-center gap-2" data-test="mfa-totp-row">
+            <label class="flex items-start gap-2 text-sm">
+              <input
+                v-model="editForm.totp_login_enabled"
+                type="checkbox"
+                data-test="mfa-totp-checkbox"
+                :disabled="!editUser.totp_enabled || mfaBusy"
+                class="mt-0.5 rounded border-black/20"
+              >
+              {{ t('admin.fde.totpLoginEnabledLabel') }}
+            </label>
+            <!-- 「允许登录」与「绑过密钥」是两件事（迁移 0030）⇒ 绑定状态必须就地可见。 -->
+            <span
+              class="text-xs"
+              :class="editUser.totp_enabled ? 'text-black/50' : 'text-red-700'"
+              data-test="mfa-totp-bound"
+            >{{ editUser.totp_enabled ? t('admin.fde.totpEnrolledState') : t('admin.fde.totpNotEnrolled') }}</span>
+            <!-- 未绑定时 TOTP 这一位根本走不通（`totpUsable` 还要看 `hasTotpEnrollment`），所以勾选框
+                 禁用，出口就是既有那个「绑定 TOTP」按钮——搬到这里，不新造按钮。 -->
+            <button
+              v-if="!editUser.totp_enabled"
+              type="button"
+              data-test="confirm-totp-enroll"
+              :disabled="totpBusy"
+              class="ml-auto rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
+              @click="confirmTotpEnroll"
+            >{{ t('admin.fde.enrollTotp') }}</button>
+          </div>
+          <label class="flex items-start gap-2 text-sm">
+            <input
+              v-model="editForm.mail_otp_enabled"
+              type="checkbox"
+              data-test="mail-otp-enabled"
+              :disabled="mailOtpBusy || mfaBusy"
+              class="mt-0.5 rounded border-black/20"
+            >
+            {{ t('admin.fde.mailOtpCheckboxLabel') }}
+          </label>
+          <!-- 保存必须永远可见（两个折叠块都收起时也得能提交「都关掉」）。 -->
+          <p v-if="mfaError" class="syserr" role="alert">{{ mfaError }}</p>
+          <p v-if="mfaMessage" class="text-sm text-green-700" role="status">{{ mfaMessage }}</p>
+          <div class="flex justify-end">
+            <button
+              type="button"
+              data-test="save-mfa-settings"
+              :disabled="mfaBusy || mailOtpBusy || !mfaHasChanges || mfaMailNeedsEmail"
+              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
+              @click="saveMfaSettings"
+            >{{ t('admin.fde.saveMfaSettings') }}</button>
+          </div>
+        </div>
+
+        <!-- 勾上才展开（v-if，不是 v-show：没启用就不该把一堆按钮留在 DOM 里）。原有整块原样搬进来。 -->
+        <section
+          v-if="editForm.totp_login_enabled"
+          class="rounded-lg border border-black/10 p-3"
+          data-test="totp-settings-section"
+        >
+          <h3 class="font-semibold">{{ t('admin.fde.totpSection') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.totpSectionHint') }}</p>
+          <p class="mt-2 text-sm text-black/65">
+            {{ editUser.totp_enabled ? t('admin.fde.reenrollTotpHint') : t('admin.fde.enrollTotpHint') }}
+          </p>
+          <p v-if="editUser.totp_enabled" class="mt-2 text-sm text-black/65">{{ t('admin.fde.resetTotpHint') }}</p>
+          <p v-if="totpError" class="syserr mt-2" role="alert">{{ totpError }}</p>
+          <p v-if="totpMessage" class="mt-2 text-sm text-green-700" role="status">{{ totpMessage }}</p>
+          <div class="mt-3 flex flex-wrap justify-end gap-2">
+            <!-- 已绑定时才在这一块里重绑（未绑定的「绑定 TOTP」在上面的勾选框行，两者不同时存在）。 -->
+            <button
+              v-if="editUser.totp_enabled"
+              type="button"
+              data-test="confirm-totp-enroll"
+              :disabled="totpBusy"
+              class="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-hover disabled:opacity-50"
+              @click="confirmTotpEnroll"
+            >{{ t('admin.fde.reenrollTotp') }}</button>
+            <button
+              v-if="editUser.totp_enabled"
+              type="button"
+              data-test="confirm-totp-reset"
+              :disabled="totpBusy"
+              class="rounded-md bg-red-700 px-3 py-1.5 text-sm text-white hover:bg-red-800 disabled:opacity-50"
+              @click="confirmTotpReset"
+            >{{ t('admin.fde.confirmTotpReset') }}</button>
+          </div>
+        </section>
+
+        <!-- 2026-11-06：per-user「邮件验证码」说明块（迁移 0028）；勾上才展开。
+             语义一字未动：仍是「TOTP 或邮箱验证码任一通过即可」，不是互斥、不清密钥。 -->
+        <section
+          v-if="editForm.mail_otp_enabled"
+          class="rounded-lg border border-black/10 p-3"
+          data-test="mail-otp-section"
+        >
+          <h3 class="font-semibold">{{ t('admin.fde.mailOtpSection') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.mailOtpHint') }}</p>
+          <p class="mt-2 text-sm text-black/65">
+            <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
+            {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
+            <span class="block text-xs text-black/50">
+              {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
+            </span>
+          </p>
+          <p v-if="editUser.email" class="mt-2 text-xs text-black/50">
+            {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
+          </p>
+          <p v-else class="mt-2 text-xs text-amber-700">{{ t('admin.fde.mailOtpNeedsEmail') }}</p>
+          <p v-if="mailOtpError" class="syserr mt-2" role="alert">{{ mailOtpError }}</p>
+          <p v-if="mailOtpMessage" class="mt-2 text-sm text-green-700" role="status">{{ mailOtpMessage }}</p>
+          <div class="mt-3 flex justify-end">
+            <button
+              type="button"
+              data-test="save-mail-otp"
+              :disabled="mailOtpBusy || (editForm.mail_otp_enabled && !editUser.email)"
+              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
+              @click="saveMailOtp"
+            >{{ t('admin.fde.saveMailOtp') }}</button>
+          </div>
+        </section>
+
       </section>
 
       <section
