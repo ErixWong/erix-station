@@ -1,13 +1,49 @@
 <script setup lang="ts">
 // composer（旧 #composer 平移）：发送/停止/禁用逻辑、Enter 发送（Shift+Enter 换行）。
 // 失败回填输入与 llm_not_configured 409 指引在 store.send() 内（逐行平移）。
+import { nextTick, onMounted, onUnmounted, useTemplateRef, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useWorkbenchStore } from '../stores/workbench';
+import { composerBudgetPx, composerHeightPx, parseRootFontPx, borderBoxExtraPx } from '../lib/composerHeight';
 
 // issue #101 P2：用户可见文案走 i18n（composer.*；占位符来自 store.inputPlaceholder）。
 const { t } = useI18n();
 const store = useWorkbenchStore();
 // issue #370：运行中说话（转向 / 排队）与队列条。空值提交由 store 兜底，按钮 disable 只是体验层。
+
+// issue #466：输入框按内容自适应高度（改动前是钉死的 `height: 3.2rem`，多行与长草稿被藏在两行窗口里）。
+// 算法在 lib/composerHeight.ts（纯函数，可用真数字钉）；这里只做「量一个数、写一个数」。
+const taEl = useTemplateRef<HTMLTextAreaElement>('taEl');
+
+function autosize() {
+  const ta = taEl.value;
+  if (!ta) return;
+  // 先松开高度再量：textarea 在固定高度下 scrollHeight 不含「被裁掉的部分」以外的收缩信息，
+  // 不松开就只涨不落（删掉两行文字后框子不会缩回去）。
+  ta.style.height = 'auto';
+  const budget = composerBudgetPx(window.innerHeight, parseRootFontPx(getComputedStyle(document.documentElement).fontSize));
+  // Tailwind preflight 全站 border-box ⇒ scrollHeight（内容+padding）还要补上下边框才是该写进去的值。
+  const natural = ta.scrollHeight + borderBoxExtraPx(getComputedStyle(ta));
+  const heightPx = composerHeightPx(natural, budget);
+  ta.style.height = `${heightPx}px`;
+  // 超出预算 ⇒ 让 textarea 自己滚（没这条就是「内容被裁且看不见滚动条」，本单最容易被漏的一格）。
+  ta.style.overflowY = natural > budget.maxPx ? 'auto' : 'hidden';
+}
+
+// ⚠ 判据在测试里（ComposerBar.spec）：长文本进输入框有四条路是**程序改值**而不是用户敲键盘
+// （发送失败回填 / 入队失败回填 / 切会话恢复草稿 / 多条拼接，见 workbench.ts:1350 / :1475 / :904 / :1513）。
+// 所以只监听 DOM `input` 事件会做成半截——必须 watch store 的值。
+watch(() => store.inputValue, () => {
+  // nextTick：等 textarea 的 value 真的进了 DOM 再量，否则量到的是上一版内容的高。
+  void nextTick(autosize);
+});
+
+onMounted(() => {
+  autosize();                       // 首帧也要走一次：min 兜底 + 挂载前就带着长草稿开页的情况
+  window.addEventListener('resize', autosize);   // 预算是视口比例 ⇒ 转屏 / 移动端键盘弹起要重算
+});
+onUnmounted(() => window.removeEventListener('resize', autosize));
+
 
 function onKeydown(e: KeyboardEvent) {
   if (e.key !== 'Enter') return;
@@ -34,8 +70,8 @@ function onKeydown(e: KeyboardEvent) {
   <div class="flex gap-2 p-2" :class="store.sessionId ? '' : 'border-t border-black/10'">
     <textarea
       v-model="store.inputValue"
-      class="flex-1 rounded-md border border-black/20 px-3 py-1.5 resize-none focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
-      style="height: 3.2rem"
+      class="flex-1 rounded-md border border-black/20 px-3 py-1.5 min-h-[3.2rem] resize-none overflow-x-hidden focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
+      ref="taEl"
       :placeholder="store.inputPlaceholder"
       :disabled="store.noDir"
       @keydown="onKeydown"
