@@ -1002,3 +1002,81 @@ describe('LoginView switch 的双语文案（feat-261110-01）', () => {
     }
   });
 });
+// ---- 2026-11-10：「验证码 10 分钟内有效」写到登录页上 ----
+// 判据不是「页面上有一句话」，而是「这句话的分钟数来自服务端 `email_code_ttl_seconds`」：
+// 前端写死 10 分钟会在 `EMAIL_CODE_TTL_SECONDS` 一改时变成谎话（后端 ⑱ 用 120s 覆盖钉住那一半）。
+describe('LoginView 邮箱码有效期提示', () => {
+  it('服务端给了 600s ⇒ 页面上写「10 分钟内有效」（中文）', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, { ...EMAIL_CODE_REQUIRED, email_code_ttl_seconds: 600 })));
+    const { wrapper } = await mountLogin();
+    await gotoEmailStep(wrapper);
+    const hint = wrapper.find('[data-test="emailCodeTtl"]');
+    expect(hint.exists()).toBe(true);
+    expect(hint.text()).toBe('验证码 10 分钟内有效。');
+    // 位置：在输入框之后、提交按钮之前（先填码，再看到「多久内有效」）。
+    const html = wrapper.html();
+    expect(html.indexOf('id="emailCode"')).toBeLessThan(html.indexOf('emailCodeTtl'));
+    const text = wrapper.text();
+    expect(text.indexOf('验证码 10 分钟内有效。')).toBeLessThan(text.indexOf('验证并登录'));
+  });
+
+  it('分钟数跟着服务端走（120s ⇒ 2 分钟），不是写死的 10', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, { ...EMAIL_CODE_REQUIRED, email_code_ttl_seconds: 120 })));
+    const { wrapper } = await mountLogin();
+    await gotoEmailStep(wrapper);
+    expect(wrapper.find('[data-test="emailCodeTtl"]').text()).toBe('验证码 2 分钟内有效。');
+  });
+
+  it('服务端没给（旧后端 / 脏值）⇒ 整句不渲染，不猜一个数字', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, EMAIL_CODE_REQUIRED)));
+    const { wrapper } = await mountLogin();
+    await gotoEmailStep(wrapper);
+    expect(wrapper.find('[data-test="emailCodeTtl"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('分钟内有效');
+
+    // 脏值（字符串 / 0 / 负数）同样当「不知道」，不许渲染成「0 分钟内有效」。
+    for (const dirty of ['600', 0, -5]) {
+      vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, { ...EMAIL_CODE_REQUIRED, email_code_ttl_seconds: dirty })));
+      const next = await mountLogin();
+      await gotoEmailStep(next.wrapper);
+      expect(next.wrapper.find('[data-test="emailCodeTtl"]').exists(), `脏值 ${String(dirty)}`).toBe(false);
+    }
+  });
+
+  it('二选一切到邮箱档后仍然显示（字段来自第一步响应，不因为换档丢掉）', async () => {
+    const fetchFn = fetchMock((url) => {
+      if (url.includes('/api/auth/login/email-code/resend')) {
+        return jsonResponse(200, { expires_in: 600, resend_after: 60, email_code_ttl_seconds: 600 });
+      }
+      return jsonResponse(200, {
+        status: 'second_factor_choice',
+        pending_token: 'ptok-choice',
+        expires_in: 600,
+        methods: ['totp', 'email_code'],
+        email_hint: 'e***@i***.com',
+        email_deferred: true,
+        email_code_ttl_seconds: 600,
+      });
+    });
+    vi.stubGlobal('fetch', fetchFn);
+    const { wrapper } = await mountLogin();
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('secret');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+    expect(wrapper.find('[data-test="emailCodeTtl"]').exists(), 'TOTP 档不显示这句').toBe(false);
+
+    await wrapper.find('[data-test="factor-option-email"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test="emailCodeTtl"]').text()).toBe('验证码 10 分钟内有效。');
+
+    // 英文界面同样有这句话（文案不写死在模板里）。
+    setLocale('en');
+    await nextTick(); // i18n 切语言是响应式的：等一次渲染再断言
+    try {
+      expect(wrapper.find('[data-test="emailCodeTtl"]').text()).toBe('The code is valid for 10 minutes.');
+    } finally {
+      setLocale('zh-CN');
+    }
+  });
+});

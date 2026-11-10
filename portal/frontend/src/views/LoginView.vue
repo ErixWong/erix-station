@@ -139,6 +139,17 @@ async function onPickFactor(factor: LoginSecondFactor): Promise<void> {
 }
 
 /**
+ * 邮箱码有效期（分钟，至少 1）：**只从服务端给的秒数换算**（`email_code_ttl_seconds`）。
+ * 服务端没给（旧后端 / 脏值）⇒ `0` ⇒ 那句话整句不渲染——宁可不写，也不写一个可能与
+ * `EMAIL_CODE_TTL_SECONDS` 不符的数字（默认 600s ⇒ 10 分钟）。
+ */
+const emailCodeTtlMinutes = computed(() => {
+  const secs = auth.emailCodeTtlSeconds;
+  if (typeof secs !== 'number' || !(secs > 0)) return 0;
+  return Math.max(1, Math.round(secs / 60));
+});
+
+/**
  * 重发按钮文案：发信失败 ⇒ 「重新发送」（且不受冷却限制，§2.3b 评审返修 ①：此时服务端还没有码行）；
  * 冷却中 ⇒ 「{n} 秒后可重发」；其余 ⇒ 「重发验证码」。
  */
@@ -267,6 +278,13 @@ onUnmounted(stopCooldownTicker);
               inputmode="numeric" maxlength="6" autocomplete="one-time-code"
               class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand disabled:opacity-60"
             >
+            <!-- 2026-11-10：有效期写在页面上（用户要求）。分钟数来自服务端，缺省整句不出。
+                 `-mt-2` 抵掉输入框自带的 `mb-3`，这样有/无这一行时下方按钮的位置不变。 -->
+            <p
+              v-if="emailCodeTtlMinutes > 0"
+              data-test="emailCodeTtl"
+              class="text-black/50 text-xs mb-3 -mt-2"
+            >{{ t('login.emailCodeTtl', { minutes: emailCodeTtlMinutes }) }}</p>
             <button
               type="submit" :disabled="auth.loading || auth.emailSending"
               class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
