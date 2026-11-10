@@ -175,3 +175,23 @@
    - 保留唯一一处便宜的顺手修：四处注入补 `meta.source` ⇒ erix-agent [#323](https://github.com/ErixWong/erix-agent/issues/323)。
    - **不在本轮范围**：TPS/tokens 动量指标、成本估算、状态栏完整版（属 [#282](https://github.com/ErixWong/erix-station/issues/282)）。
 4. **载体已建**：#322 / #323 / #321 三张 issue 已建（2026-10-20），`#284` 前提更正评论已发；代码仍一行未写，真机验收零。
+
+---
+
+## 11. 收尾（2026-11-10，本文所有待办已闭环，本 session 退役）
+
+**§10.1 拍板建的三张单全部 `closed / completed`**（现查 GitHub，非记忆）：
+
+| 单 | 状态 | 关闭时间（UTC） | 结论 |
+|---|---|---|---|
+| erix-agent [#322](https://github.com/ErixWong/erix-agent/issues/322) 达成意见回灌主模型 | closed / completed | 2026-10-20 04:15 | 落地为 `reflection.judgeDoneAdvisory`（默认关），真机已验（`AGENTS.md` §8.35） |
+| erix-agent [#323](https://github.com/ErixWong/erix-agent/issues/323) 四处控制文本补 `meta.source` | closed / completed | 2026-10-20 03:33 | 自增强回路堵住 |
+| erix-station [#321](https://github.com/ErixWong/erix-station/issues/321) 完成语义与文案 | closed / completed | 2026-10-23 14:53 | `executed ≠ 已完成`；终态只由 `run_end` 驱动 |
+
+**⇒ 本文 §3 / §5 / §9 的"待办"全部作废**：§5 的 P1–P5 已被 §10.1 的用户拍板覆盖，§9 的"上游单未建"已于 10-20 建单并当天/三天内关闭。**读本文请只取 §2（机制真相）、§10（勘误）、§11（本收尾），其余按历史材料读。**
+
+**试用问题七条的最终状态**：`#282` / `#283` / `#284` / `#285` / `#286` **全部 closed**（现查）。
+
+**本 session 退役说明（2026-11-10）**：写这份分析的 pi session 起于 2026-10-15、止于 2026-11-10，跨 26 天，中间经历多次上下文压缩 —— 退役前实测已发生一次「把 21 天前当今天」的失准（本 session 内）。⇒ **后续接手请起新 session**，入口是 `AGENTS.md` §8 台账 + `docs/README.md` 文档地图，**不要**依赖本 session 的记忆。
+
+退役时状态：`main` 与 `origin/main` 齐平；tag 最新 `v0.1.62`；现网 portal `0.1.62`（一致）；11 个 worktree 分支全部已合并、工作区干净，其内 19 份未跟踪工单报告已归档到 `~/worker-reports-261110/worktree-reports/`（17 份唯一内容，2 对重复）。
