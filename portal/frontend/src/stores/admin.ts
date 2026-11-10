@@ -92,6 +92,12 @@ export interface AdminUser {
   /** 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。默认 false；全局 transport=disabled 仍压过它。 */
   mail_otp_enabled?: boolean;
   /**
+   * 工单 feat-261110-03（迁移 0030）：**允许用 TOTP 登录**，与 `totp_enabled`（= 绑过密钥）是两件事。
+   * 关掉不清密钥 ⇒ `totp_enabled` 仍为 true，随时可以再打开。库里默认 true，所以
+   * 「缺键」（旧后端 / 部分响应）与「管理员关掉了」在界面上得区分开：消费方一律 `=== true`。
+   */
+  totp_login_enabled?: boolean;
+  /**
    * 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。默认 false。
    * **可选是语义的一部分**：缺键 = 「这个账号的开关没能读取」（旧后端 / 部分响应），
    * 管理台因此**三态**而非两态：不得把缺键折叠成 false（评审 blocker 3）。
@@ -209,7 +215,8 @@ export function testMailErrorText(err: unknown): string {
   return t('admin.errorPrefix') + message;
 }
 
-export type AdminUserUpdate = Partial<Pick<AdminUser, 'display_name' | 'email' | 'mail_otp_enabled' | 'file_upload_enabled' | 'role' | 'fde_name'>> & {
+export type AdminUserUpdate = Partial<Pick<AdminUser,
+  'display_name' | 'email' | 'mail_otp_enabled' | 'totp_login_enabled' | 'file_upload_enabled' | 'role' | 'fde_name'>> & {
   status?: 'active' | 'disabled';
 };
 

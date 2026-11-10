@@ -63,7 +63,10 @@ function fakeProvider(mailer) {
   return { get: async () => mailer, invalidate() {} };
 }
 
-async function makeUser({ id = 'u1', login = 'alice', email = 'alice@example.com', totpSecret = null, mailOtpEnabled = true } = {}) {
+async function makeUser({
+  id = 'u1', login = 'alice', email = 'alice@example.com', totpSecret = null,
+  mailOtpEnabled = true, totpLoginEnabled = true,
+} = {}) {
   return {
     id,
     login,
@@ -79,6 +82,9 @@ async function makeUser({ id = 'u1', login = 'alice', email = 'alice@example.com
     // 2026-11-06：per-user 邮件验证码开关（迁移 0028）现在是**唯一**判据 ⇒ 夹具默认开，
     // 否则这个文件里所有「走邮箱码」的用例都会退化成口令直通（那是夹具问题，不是产品行为）。
     mail_otp_enabled: mailOtpEnabled,
+    // feat-261110-02（迁移 0030）：「允许用 TOTP 登录」。默认 **true** = 该列的 DEFAULT，
+    // 于是这个文件里所有既有用例（都没声明这一位）跑的就是升级后的存量形态：绑了就能用。
+    totp_login_enabled: totpLoginEnabled,
   };
 }
 
@@ -750,6 +756,50 @@ test('#449⑫ chooseSecondFactor：二选一 / TOTP 兼容 / 邮箱码 / 409 / �
   );
 });
 
+// feat-261110-02：第二因素选择多了一维 —— `totp_login_enabled`（迁移 0030）。
+// 「**绑过 TOTP**」与「**登录允许用 TOTP**」以前是同一位，于是「密钥留着、登录只走邮箱码」
+// 在界面上根本表达不出来（想改只能重绑或删密钥）。这张表就是新语义的完整判据：
+// 六行逐行一条，且**每一行都必须与工单表一致**（少一行 = 有一格没人钉）。
+test('#449⑫c chooseSecondFactor：`totp_login_enabled` 那一维（迁移 0030，六行表逐行）', () => {
+  const E = 'alice@example.com';
+  const rows = [
+    // [TOTP 已绑定, 允许 TOTP, 允许邮件码, 邮箱, 期望, 这一行钉的是哪一格]
+    [false, undefined, false, E, 'password_direct_no_second_factor', '没绑、也没邮件码 ⇒ 口令直通（现状）'],
+    [false, undefined, true, E, 'email_code_required', '没绑 + 邮件码 ⇒ email_code_required（现状）'],
+    [true, true, false, E, 'totp_required', '绑了 + 允许 + 邮件码关 ⇒ totp_required（现状）'],
+    // ★ 本单的新语义：密钥在（`totp_secret` 一字未动），但登录不碰它。
+    [true, false, true, E, 'email_code_required', '绑了 + **不允许** + 邮件码开 ⇒ 邮箱码，密钥保留'],
+    [true, true, true, E, 'second_factor_choice', '绑了 + 允许 + 邮件码开 ⇒ 二选一（现状）'],
+    // ★ 另一格新语义：绑了 TOTP 却两条都不允许 ⇒ 真的只剩口令（管理台要红字警告的就是这一格）。
+    [true, false, false, E, 'password_direct_no_second_factor', '绑了 + 两条都不允许 ⇒ 只剩口令'],
+    // 边界：允许邮件码却没邮箱 ⇒ 409（与 TOTP 绑没绑无关，绝不静默退回口令）。
+    [true, false, true, null, 'email_not_registered', '不允许 TOTP + 允许邮件码 + 没邮箱 ⇒ 409，不静默降级'],
+    [true, false, true, '   ', 'email_not_registered', '空白邮箱同样算没登记'],
+    // 兼容位：**不传** `totpLoginEnabled`（旧调用 / 缺键的旧响应）必须完全等于今天的形状。
+    [true, undefined, false, E, 'totp_required', '缺参按 true ⇒ 存量 TOTP 用户行为一字不变'],
+    [true, undefined, true, E, 'second_factor_choice', '缺参按 true ⇒ 二选一照旧'],
+  ];
+  for (const [hasTotpEnrollment, totpLoginEnabled, mailOtpEnabled, email, expected, why] of rows) {
+    assert.equal(
+      loginEmailCode.chooseSecondFactor({ hasTotpEnrollment, totpLoginEnabled, mailOtpEnabled, email }),
+      expected,
+      why,
+    );
+  }
+  // `null` 也当「没读到」⇒ true（真库 NOT NULL，但 fake/旧 DTO 会给 null；这里不赌）
+  assert.equal(
+    loginEmailCode.chooseSecondFactor({ hasTotpEnrollment: true, totpLoginEnabled: null, mailOtpEnabled: false, email: E }),
+    'totp_required',
+    'null ≠ 被关掉',
+  );
+  // 只有**显式 false** 才算关掉（真值性折叠会把 `'f'` / `0` 当成关，那是另一种错）
+  assert.equal(
+    loginEmailCode.chooseSecondFactor({ hasTotpEnrollment: true, totpLoginEnabled: 'false', mailOtpEnabled: false, email: E }),
+    'totp_required',
+    '非布尔的假值不许当「管理员关掉了」',
+  );
+});
+
 test('#449⑫b 6 位码生成与 email_hint 脱敏口径', () => {
   assert.equal(loginEmailCode.generateEmailCode({ random: () => 0 }), '000000', '左补零');
   assert.equal(loginEmailCode.generateEmailCode({ random: () => 999_999 }), '999999');
@@ -990,9 +1040,12 @@ test('#449⑮ 同一 pending_token：先 TOTP 成功 ⇒ 邮件码 401 pending_e
 // ⑯ 审计 method 三值：totp / email_code / email_code_alt 各自可达且互不串
 // ---------------------------------------------------------------------------
 
-async function loginMethodOf({ totpSecret, use }) {
+async function loginMethodOf({ totpSecret, use, totpLoginEnabled = true, mailOtpEnabled = true }) {
   const { mailer, state } = fakeMailer();
-  const s = await startServer({ users: [await makeUser({ totpSecret })], mailer });
+  const s = await startServer({
+    users: [await makeUser({ totpSecret, totpLoginEnabled, mailOtpEnabled })],
+    mailer,
+  });
   try {
     const body = await (await login(s.base)).json();
     if (use === 'totp') {
@@ -1017,6 +1070,52 @@ async function loginMethodOf({ totpSecret, use }) {
     await s.close();
   }
 }
+
+// feat-261110-02：把六行表里最要紧的两格推到 HTTP 层 —— 纯函数对了不等于接线对了。
+// 只测纯函数的话，`http.js` 漏传 `totpLoginEnabled` 会绿着一片过去（前端勾了、服务端照旧走 TOTP，
+// 而界面上写着「已保存」），所以这一条必须走真端点。
+test('#449⑯b `totp_login_enabled:false` ⇒ 第一步真的给 email_code_required，审计记 email_code（不是 alt）', async () => {
+  const secret = totp.generateSecret(20);
+
+  // ① 绑了 TOTP 但不允许 ⇒ 第一步**不再**给二选一，也**不再**要 TOTP
+  const off = await loginMethodOf({ totpSecret: secret, use: 'email_code', totpLoginEnabled: false });
+  assert.equal(off.body.status, 'email_code_required',
+    '关掉之后走的是「唯一第二因素 = 邮箱码」那条，不是二选一');
+  assert.notEqual(off.body.status, 'second_factor_choice', '不许还给两条路（那等于勾选框没生效）');
+  assert.equal(off.method, 'email_code',
+    '这一格里邮件码是**唯一**被允许的第二因素，没有「放弃更强的那条」可言 ⇒ 不能记 alt');
+
+  // ② 允许（现状）⇒ 仍是二选一 + `email_code_alt`（上面 ⑯ 已钉，这里只补一句对照）
+  const on = await loginMethodOf({ totpSecret: secret, use: 'email_code', totpLoginEnabled: true });
+  assert.equal(on.body.status, 'second_factor_choice');
+  assert.equal(on.method, 'email_code_alt', '把 TOTP 留着可用时，口径一字不变');
+
+  // ③ 绑了 TOTP、两条都不允许 ⇒ 口令直通（红字警告对应的那一格）
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({
+    users: [await makeUser({ totpSecret: secret, totpLoginEnabled: false, mailOtpEnabled: false })],
+    mailer,
+  });
+  try {
+    const body = await (await login(s.base)).json();
+    assert.equal(body.status, 'authenticated', '两条都不允许 ⇒ 口令直通');
+    const audits = s.pool.audit.filter((a) => a.action === 'auth.login_success');
+    assert.equal(JSON.parse(audits[0].details).method, 'password_direct_no_second_factor',
+      '审计必须说「这次没有第二因素」，别让人以为过了 TOTP');
+    assert.equal(state.sent.length, 0, '口令直通不该发信');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#449⑯c 关掉 TOTP 登录**不清密钥**：`hasTotpEnrollment` 仍为真，再打开就回到二选一', async () => {
+  const secret = totp.generateSecret(20);
+  const u = await makeUser({ totpSecret: secret, totpLoginEnabled: false });
+  // 这一位只是「允许/不允许」，`totp_secret` 一个字节都没动 ⇒ 绑定状态照旧为真。
+  assert.equal(await auth.hasTotpEnrollment(new FakePool({ users: [u] }), u.id), true,
+    '关掉登录开关不得等于解绑（否则管理员一关就把用户的密钥丢了）');
+  assert.equal(u.totp_secret, secret, '夹具层面复核：密钥列原样');
+});
 
 test('#449⑯ 审计 method：有 TOTP 走邮件码 = email_code_alt；无 TOTP 走邮件码 = email_code；走 TOTP = totp', async () => {
   const secret = totp.generateSecret(20);

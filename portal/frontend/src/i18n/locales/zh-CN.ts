@@ -994,6 +994,18 @@ export const zhCN = {
     mailOtpCurrentEmail: '验证码将发到：{email}',
     mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
     mailOtpSaved: '邮件验证码设置已保存。',
+    // 工单 feat-261110-03：「二次验证」改成两个勾选框 + 勾上才展开。
+    // 这一句是**两个都没勾**时的红字。口径不是「两个 checkbox 都没勾」而是「这个账号现在拿不出
+    // 第二因素」：`chooseSecondFactor` 的 `totpUsable` 还要看「绑没绑密钥」，所以上线迁移 0030 后
+    // 「未绑定但 `totp_login_enabled` 为默认 true」的存量账号也算没有第二因素，红字照旧要出现。
+    mailOtpSwitchWarning: '该账号将只用口令登录（没有第二因素）。',
+    // 勾选框行上的短标签（长句说明仍在折叠块里的 mailOtpEnabled* / mailOtpAlt 那几条）。
+    mailOtpCheckboxLabel: '邮件验证码',
+    totpLoginEnabledLabel: '验证器应用（TOTP）',
+    totpEnrolledState: '已绑定',
+    totpNotEnrolled: '未绑定',
+    saveMfaSettings: '保存二次验证设置',
+    mfaSettingsSaved: '二次验证设置已保存。',
     saveMailOtp: '保存邮件验证码设置',
     // 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029 / docs/api/portal.md）。
     // 开关只决定「能不能传」，服务端 403 才是闸；界面把三态说清（开启 / 关闭 / 未知）。
@@ -1066,6 +1078,8 @@ export const zhCN = {
       editUserTitle: '编辑用户资料',
       editTabProfile: '资料',
       editTabSecurity: '安全',
+      // feat-261110-02：TOTP 与邮件验证码从「安全」里搬出来单独一档。
+      editTabMfa: '二次验证',
       editTabLlm: 'LLM 与仓库',
       editTabPorts: '预览端口',
       editTabDanger: '危险操作',

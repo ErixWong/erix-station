@@ -37,6 +37,13 @@ const safeUser = (row) => ({
   // 消费方（片 B 的 403 闸门、管理台三态）判据都是 `=== true` ⇒ 这里折叠成两态就是把陷阱留给下游。
   // `mail_otp_enabled` 用 `Boolean()` 是既有形状，**不动**（改它会顺手改变既有行为）。
   file_upload_enabled: row.file_upload_enabled === true,
+  // 工单 feat-261110-02（迁移 0030）：**允许用 TOTP 登录**，与「绑过 TOTP」（`totp_enabled`）是两件事。
+  // 关掉它**不清 `totp_secret`** ⇒ `totp_enabled` 仍为 true，随时可以再打开。
+  // 口径按要求用 `=== true`（不是 `Boolean()`）：fake/旧驱动给 `'f'` / `0` / `undefined` 时
+  // `Boolean()` 会把非空字符串折成 true，而下游判据全是 `=== true`。
+  // ⚠ 代价是「SELECT 漏列 ⇒ DTO 说 false」，所以五个 safeUser 生产点的列清单都必须带上这一列
+  //    （portal/test/user-totp-login-enabled.test.js 的 T-3 逐个钉）。
+  totp_login_enabled: row.totp_login_enabled === true,
   role: row.role,
   fde_name: row.fde_name ?? null,
   git_host_id: row.git_host_id ?? null,
@@ -91,7 +98,7 @@ function recordAdminAudit(pool, actorId, action, target, details = {}) {
 export async function listUsers(pool) {
   const r = await pool.query(
     `SELECT users.id, users.login, users.display_name, users.email, users.mail_otp_enabled,
-            users.file_upload_enabled,
+            users.file_upload_enabled, users.totp_login_enabled,
             users.role, users.fde_name,
             users.auth_source, users.status, users.created_at,
             (users.totp_secret IS NOT NULL) AS totp_enabled,
@@ -281,6 +288,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
                 must_change_password = true, file_upload_enabled = false
           WHERE id = $1 AND status = 'disabled'
           RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at, file_upload_enabled,
+                    totp_login_enabled,
                     (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           existing.id, trimmedLogin, trimmedEmail,
@@ -304,7 +312,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
       r = await pool.query(
         `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name, must_change_password)
          VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6, true)
-         RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, role, fde_name, auth_source, status, created_at,
+         RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at,
                    (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           trimmedLogin, trimmedEmail,
@@ -356,7 +364,8 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   if (fields.length === 0) {
     throw new AdminError('validation_failed', '至少提供一个可更新字段');
   }
-  const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'file_upload_enabled', 'role', 'fde_name', 'status']);
+  const allowed = new Set(['display_name', 'email', 'mail_otp_enabled', 'file_upload_enabled',
+    'totp_login_enabled', 'role', 'fde_name', 'status']);
   for (const field of fields) {
     if (field === 'login') {
       throw new AdminError('validation_failed', 'login 不可修改', { details: { field: 'login' } });
@@ -386,6 +395,12 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   // 放进 PG 的 boolean 列会在驱动层报 22P02（人不话），这里当场 400 并点名 field。
   if (Object.hasOwn(updates, 'file_upload_enabled') && typeof updates.file_upload_enabled !== 'boolean') {
     throw new AdminError('validation_failed', 'file_upload_enabled 必须是布尔值', { details: { field: 'file_upload_enabled' } });
+  }
+  // feat-261110-02：「允许用 TOTP 登录」同样是布尔（同一形状）。**没有**「必须已绑 TOTP」的交叉防护：
+  // 没绑时这一位本来就不起作用（`chooseSecondFactor` 的 `totpUsable` 还要看 `hasTotpEnrollment`），
+  // 拒绝一个无害的值只会把「先绑 TOTP 再打开」这个顺序变成两次往返。
+  if (Object.hasOwn(updates, 'totp_login_enabled') && typeof updates.totp_login_enabled !== 'boolean') {
+    throw new AdminError('validation_failed', 'totp_login_enabled 必须是布尔值', { details: { field: 'totp_login_enabled' } });
   }
   // 两条交叉防护（都在写库之前）：开了开关却没邮箱 / 清空邮箱却还开着开关 ⇒ 都会让人**登不进去**
   // （`chooseSecondFactor` 走 `email_not_registered` 那条 409）。这里拒绝保存，而不是让它在登录时才炸。
@@ -461,6 +476,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
   }
   if (Object.hasOwn(updates, 'mail_otp_enabled')) setField('mail_otp_enabled', updates.mail_otp_enabled);
   if (Object.hasOwn(updates, 'file_upload_enabled')) setField('file_upload_enabled', updates.file_upload_enabled);
+  if (Object.hasOwn(updates, 'totp_login_enabled')) setField('totp_login_enabled', updates.totp_login_enabled);
   if (Object.hasOwn(updates, 'role')) setField('role', updates.role);
   if (Object.hasOwn(updates, 'fde_name')) setField('fde_name', updates.fde_name);
   if (Object.hasOwn(updates, 'status')) {
@@ -478,7 +494,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
           WHERE id = $1 ${offboardingGuard}
-          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, role, fde_name, auth_source, status, created_at,
+          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
          UPDATE login_sessions SET revoked_at = now()
@@ -743,6 +759,7 @@ export async function enrollUserTotp(pool, userId, { actorId = null, totpIssuer 
        UPDATE users SET totp_secret = $2, last_totp_step = NULL
         WHERE id = $1
         RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at, file_upload_enabled,
+                  totp_login_enabled,
                   (totp_secret IS NOT NULL) AS totp_enabled
      ), revoked AS (
        UPDATE login_sessions SET revoked_at = now()

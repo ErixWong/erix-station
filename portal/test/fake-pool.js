@@ -37,6 +37,15 @@ export class FakePool {
     return { file_upload_enabled: /\bfile_upload_enabled\b/.test(sql) ? user.file_upload_enabled : undefined };
   }
 
+  /**
+   * feat-261110-02（迁移 0030）「允许用 TOTP 登录」这一列，同一条 fake 红线：SELECT 里点了名才回，
+   * 漏选 ⇒ 值恒 `undefined` ⇒ 产品侧 `!== false` 会得 true（存量默认），而 `=== true`（admin DTO）得 false
+   * ⇒ 漏补列在两侧都有用例会红，不是被 fake 兼平成假绿。同样**不做布尔兼平**。
+   */
+  projectTotpLogin(sql, user) {
+    return { totp_login_enabled: /\btotp_login_enabled\b/.test(sql) ? user.totp_login_enabled : undefined };
+  }
+
   async query(sql, params = []) {
     this.statements.push({ sql, params });
     if (sql.includes('schema_migrations')) {
@@ -94,6 +103,8 @@ export class FakePool {
           must_change_password: u.must_change_password === true,
           // #472：同上（`loadActiveUser` 的 SELECT）。
           ...this.projectFileUpload(sql, u),
+          // feat-261110-02：同理（第二步与审计要读这一位）。
+          ...this.projectTotpLogin(sql, u),
         }],
       };
     }
