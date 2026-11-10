@@ -27,7 +27,7 @@ const userForm = reactive({
 
 const editUserId = ref<string | null>(null);
 const editModalOpen = ref(false);
-type EditTab = 'profile' | 'security' | 'llm' | 'ports' | 'danger';
+type EditTab = 'profile' | 'security' | 'mfa' | 'llm' | 'ports' | 'danger';
 const editTab = ref<EditTab>('profile');
 const deleteUserId = ref<string | null>(null);
 const returnToEditAfterDelete = ref(false);
@@ -257,7 +257,8 @@ function closeTotp() {
   copiedTotpValue.value = '';
   totpCopyError.value = '';
   if (resumeEditAfterTotp.value && editUserId.value) {
-    editTab.value = 'security';
+    // feat-261110-02：TOTP 那一块已从「安全」搬进「二次验证」⇒ 这个跳转的目标块动了，跟着改目标。
+    editTab.value = 'mfa';
     void nextTick(() => {
       editModalOpen.value = true;
     });
@@ -1056,6 +1057,17 @@ onBeforeUnmount(() => {
         @click="editTab = 'security'"
       >{{ t('admin.fde.editTabSecurity') }}</button>
       <button
+        id="edit-tab-mfa"
+        type="button"
+        role="tab"
+        data-test="edit-tab-mfa"
+        :aria-selected="editTab === 'mfa'"
+        aria-controls="edit-panel-mfa"
+        :class="editTab === 'mfa' ? 'border-black/30 bg-black/5 font-medium' : 'border-transparent hover:bg-black/5'"
+        class="rounded-md border px-2.5 py-1.5 text-sm"
+        @click="editTab = 'mfa'"
+      >{{ t('admin.fde.editTabMfa') }}</button>
+      <button
         id="edit-tab-llm"
         type="button"
         role="tab"
@@ -1200,6 +1212,56 @@ onBeforeUnmount(() => {
           </form>
         </section>
 
+        <!-- 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。与上面两块对称：单独保存、单独反馈。
+             **三态**：DTO 缺键 ⇒ 勾选框禁用 + 显示「未知」+ 保存禁用（不得折叠成「已关闭」，评审 blocker 3）。
+             服务端 403 才是真正的闸门（片 B）——这里只是入口与授权位。 -->
+        <section class="rounded-lg border border-black/10 p-3" data-test="file-upload-section">
+          <h3 class="font-semibold">{{ t('admin.fde.fileUploadSection') }}</h3>
+          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.fileUploadHint') }}</p>
+          <!-- feat-261110-02：与邮件验证码同一控件、同一外观。三态判据一字未改：缺键 ⇒ 禁用 + 「未知」
+               文案 + 保存禁用（`fileUploadDraft` 那个写入面把「未知」读成未勾选，配合 disabled 不拿猜值提交）。 -->
+          <div class="mt-3 flex flex-wrap items-start gap-3">
+            <ToggleSwitch
+              v-model="fileUploadDraft"
+              :label="t('admin.fde.fileUploadEnabledLabel')"
+              :disabled="fileUploadUnknown || fileUploadBusy"
+              test-id="edit-file-upload"
+              class="mt-0.5"
+            />
+            <span class="text-sm">
+              {{ t('admin.fde.fileUploadEnabledLabel') }}
+              <span class="block text-xs text-black/50">{{ t('admin.fde.fileUploadEnabledHint') }}</span>
+            </span>
+          </div>
+          <p v-if="fileUploadUnknown" class="mt-2 text-xs text-amber-700" role="status" data-test="file-upload-unknown">
+            {{ t('admin.fde.fileUploadUnknown') }}
+          </p>
+          <p v-if="fileUploadError" class="syserr mt-2" role="alert">{{ fileUploadError }}</p>
+          <p v-if="fileUploadMessage" class="mt-2 text-sm text-green-700" role="status">{{ fileUploadMessage }}</p>
+          <div class="mt-3 flex justify-end">
+            <button
+              type="button"
+              data-test="save-file-upload"
+              :disabled="fileUploadBusy || fileUploadUnknown"
+              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
+              @click="saveFileUpload"
+            >{{ t('admin.fde.saveFileUpload') }}</button>
+          </div>
+        </section>
+      </section>
+
+      <!-- feat-261110-02：TOTP 与邮件验证码从「安全」里搬出来单独一档。搬的是**位置**，
+           两块的内容与逻辑一行未改（重绑/重置按钮、saveMailOtp、busy/error/message 全部原样）。
+           语义也没动：`mail_otp_enabled` 仍是「TOTP 或邮箱验证码任一通过即可」，不是互斥、不清密钥。 -->
+      <section
+        id="edit-panel-mfa"
+        v-show="editTab === 'mfa'"
+        role="tabpanel"
+        tabindex="0"
+        data-test="edit-panel-mfa"
+        aria-labelledby="edit-tab-mfa"
+        class="space-y-3"
+      >
         <section class="rounded-lg border border-black/10 p-3">
           <h3 class="font-semibold">{{ t('admin.fde.totpSection') }}</h3>
           <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.totpSectionHint') }}</p>
@@ -1276,42 +1338,6 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <!-- 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029）。与上面两块对称：单独保存、单独反馈。
-             **三态**：DTO 缺键 ⇒ 勾选框禁用 + 显示「未知」+ 保存禁用（不得折叠成「已关闭」，评审 blocker 3）。
-             服务端 403 才是真正的闸门（片 B）——这里只是入口与授权位。 -->
-        <section class="rounded-lg border border-black/10 p-3" data-test="file-upload-section">
-          <h3 class="font-semibold">{{ t('admin.fde.fileUploadSection') }}</h3>
-          <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.fileUploadHint') }}</p>
-          <!-- feat-261110-02：与邮件验证码同一控件、同一外观。三态判据一字未改：缺键 ⇒ 禁用 + 「未知」
-               文案 + 保存禁用（`fileUploadDraft` 那个写入面把「未知」读成未勾选，配合 disabled 不拿猜值提交）。 -->
-          <div class="mt-3 flex flex-wrap items-start gap-3">
-            <ToggleSwitch
-              v-model="fileUploadDraft"
-              :label="t('admin.fde.fileUploadEnabledLabel')"
-              :disabled="fileUploadUnknown || fileUploadBusy"
-              test-id="edit-file-upload"
-              class="mt-0.5"
-            />
-            <span class="text-sm">
-              {{ t('admin.fde.fileUploadEnabledLabel') }}
-              <span class="block text-xs text-black/50">{{ t('admin.fde.fileUploadEnabledHint') }}</span>
-            </span>
-          </div>
-          <p v-if="fileUploadUnknown" class="mt-2 text-xs text-amber-700" role="status" data-test="file-upload-unknown">
-            {{ t('admin.fde.fileUploadUnknown') }}
-          </p>
-          <p v-if="fileUploadError" class="syserr mt-2" role="alert">{{ fileUploadError }}</p>
-          <p v-if="fileUploadMessage" class="mt-2 text-sm text-green-700" role="status">{{ fileUploadMessage }}</p>
-          <div class="mt-3 flex justify-end">
-            <button
-              type="button"
-              data-test="save-file-upload"
-              :disabled="fileUploadBusy || fileUploadUnknown"
-              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
-              @click="saveFileUpload"
-            >{{ t('admin.fde.saveFileUpload') }}</button>
-          </div>
-        </section>
       </section>
 
       <section

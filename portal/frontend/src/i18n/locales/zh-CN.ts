@@ -1061,6 +1061,8 @@ export const zhCN = {
       editUserTitle: '编辑用户资料',
       editTabProfile: '资料',
       editTabSecurity: '安全',
+      // feat-261110-02：TOTP 与邮件验证码从「安全」里搬出来单独一档。
+      editTabMfa: '二次验证',
       editTabLlm: 'LLM 与仓库',
       editTabPorts: '预览端口',
       editTabDanger: '危险操作',

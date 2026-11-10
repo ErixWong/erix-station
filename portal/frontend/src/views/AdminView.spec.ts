@@ -1097,7 +1097,9 @@ describe('AdminView · FDE 用户', () => {
     await row.get('[data-test="edit-user"]').trigger('click');
 
     const editor = wrapper.get('[data-test="user-edit-modal"]');
-    const tabNames = ['profile', 'security', 'llm', 'danger'] as const;
+    // feat-261110-02：新增「二次验证」一档（在安全之后、LLM 之前）⇒ 循环名单跟着走，
+    // 否则新 tab 既没被选中过、也没被「其它 tab 选中时它必须不选中」兼顾到。
+    const tabNames = ['profile', 'security', 'mfa', 'llm', 'danger'] as const;
     expect(editor.get('[role="tablist"]').classes()).toContain('flex-wrap');
     expect(wrapper.find('[data-test="view-user"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="user-details-modal"]').exists()).toBe(false);
@@ -1107,6 +1109,7 @@ describe('AdminView · FDE 用户', () => {
     await flushPromises();
     expect(editor.get('[data-test="edit-tab-profile"]').text()).toBe('Profile');
     expect(editor.get('[data-test="edit-tab-security"]').text()).toBe('Security');
+    expect(editor.get('[data-test="edit-tab-mfa"]').text()).toBe('Two-factor');
     expect(editor.get('[data-test="edit-tab-llm"]').text()).toBe('LLM & Repository');
     expect(editor.get('[data-test="edit-tab-danger"]').text()).toBe('Danger zone');
     setLocale('zh-CN');
@@ -1124,7 +1127,14 @@ describe('AdminView · FDE 用户', () => {
       expect(panel.isVisible()).toBe(true);
       if (name === 'security') {
         expect(panel.text()).toContain('重置用户密码');
+        // feat-261110-02：TOTP 与邮件码已整块搬走 ⇒ 「安全」里不得再残留它们（同屏两份就是两套真相）。
+        expect(panel.text()).toContain('文件上传');
+        expect(panel.text()).not.toContain('TOTP 设置');
+        expect(panel.find('[data-test="mail-otp-section"]').exists()).toBe(false);
+      } else if (name === 'mfa') {
+        // 新 tab 必须**同时**含两块（一个 tab 只放一块就是把第二因素拆了两处）。
         expect(panel.text()).toContain('TOTP 设置');
+        expect(panel.find('[data-test="mail-otp-section"]').exists()).toBe(true);
       } else if (name === 'llm') {
         await panel.get('[data-test="provider-select"]').setValue('p2');
       }
@@ -1235,7 +1245,7 @@ describe('AdminView · FDE 用户', () => {
     if (!bobRow) throw new Error('bob row not found');
     await bobRow.get('[data-test="edit-user"]').trigger('click');
     const editor = wrapper.get('[data-test="user-edit-modal"]');
-    await editor.get('[data-test="edit-tab-security"]').trigger('click');
+    await editor.get('[data-test="edit-tab-mfa"]').trigger('click');
     expect(editor.text()).toContain('TOTP 设置');
     expect(editor.text()).toContain('绑定 TOTP');
     expect(editor.find('[data-test="confirm-totp-reset"]').exists()).toBe(false);
@@ -1258,15 +1268,16 @@ describe('AdminView · FDE 用户', () => {
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
     expect(wrapper.text()).not.toContain(enrolled.totp_secret);
     const resumedEditor = wrapper.get('[data-test="user-edit-modal"]');
-    expect(resumedEditor.get('[data-test="edit-tab-security"]').attributes('aria-selected')).toBe('true');
-    expect(resumedEditor.get('[data-test="edit-panel-security"]').isVisible()).toBe(true);
+    // feat-261110-02：TOTP 那一块已搬进「二次验证」⇒ 确认一次性密钥后回到的是那一档（目标块动了）。
+    expect(resumedEditor.get('[data-test="edit-tab-mfa"]').attributes('aria-selected')).toBe('true');
+    expect(resumedEditor.get('[data-test="edit-panel-mfa"]').isVisible()).toBe(true);
 
     const aliceRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('alice'));
     if (!aliceRow) throw new Error('alice row not found');
     await resumedEditor.get('[aria-label="关闭"]').trigger('click');
     await aliceRow.get('[data-test="edit-user"]').trigger('click');
     const aliceEditor = wrapper.get('[data-test="user-edit-modal"]');
-    await aliceEditor.get('[data-test="edit-tab-security"]').trigger('click');
+    await aliceEditor.get('[data-test="edit-tab-mfa"]').trigger('click');
     expect(aliceEditor.text()).toContain('重绑 TOTP（旧码作废）');
     expect(wrapper.find('[data-test="confirm-totp-reset"]').exists()).toBe(true);
     expect(callsTo(fetchFn, 'POST', '/api/admin/users/u2/totp-enroll')).toHaveLength(1);
@@ -1287,7 +1298,7 @@ describe('AdminView · FDE 用户', () => {
     if (!aliceRow) throw new Error('alice row not found');
     await aliceRow.get('[data-test="edit-user"]').trigger('click');
     const editor = wrapper.get('[data-test="user-edit-modal"]');
-    await editor.get('[data-test="edit-tab-security"]').trigger('click');
+    await editor.get('[data-test="edit-tab-mfa"]').trigger('click');
     expect(editor.text()).toContain('重绑 TOTP（旧码作废）');
     const reset = editor.get('[data-test="confirm-totp-reset"]');
     expect(reset.classes()).toContain('bg-red-700');
@@ -1662,7 +1673,7 @@ describe('AdminView · FDE 用户', () => {
 // 而它同时有两条交叉防护（没邮箱不许开 / 开关开着不许清邮箱）—— 都在后端，这里钉界面这一侧。
 // ---------------------------------------------------------------------------
 describe('AdminView · 邮件验证码开关（per-user）', () => {
-  it('Security tab 有该 section；开关值来自 DTO；勾选后保存发 PATCH {mail_otp_enabled:true}', async () => {
+  it('二次验证 tab 有该 section；开关值来自 DTO；拨上后保存发 PATCH {mail_otp_enabled:true}', async () => {
     const patches: Array<{ url: string; body: unknown }> = [];
     const { wrapper } = await mountAdmin('/admin/users', (url, init) => {
       if (url === '/api/admin/users/u1' && init?.method === 'PATCH') {
@@ -1674,10 +1685,13 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     const row = wrapper.findAll('[data-test="user-row"]').find((r) => r.text().includes('alice'));
     if (!row) throw new Error('alice row not found');
     await row.get('[data-test="edit-user"]').trigger('click');
-    await wrapper.get('[data-test="edit-tab-security"]').trigger('click');
+    // feat-261110-02：这一块已从「安全」搬进「二次验证」。面板是 v-show，选错 tab 也拿得到元素，
+    // 所以这里必须**真点那一档**并断可见，否则「它在哪个 tab」就没有任何用例钉着。
+    await wrapper.get('[data-test="edit-tab-mfa"]').trigger('click');
     await flushPromises();
 
     const section = wrapper.get('[data-test="mail-otp-section"]');
+    expect(section.isVisible(), '面板未展开就不算真看得到').toBe(true);
     // i18n 真的解析了（不是把键名打到界面上 —— 2026-11-06 就踩过这次：键插错层级）
     expect(section.text()).not.toContain('admin.fde.mailOtp');
     expect(section.text()).toContain('邮件验证码');

@@ -1023,6 +1023,8 @@ export const en = {
       editUserTitle: 'Edit user profile',
       editTabProfile: 'Profile',
       editTabSecurity: 'Security',
+      // feat-261110-02: TOTP + email codes moved out of Security into their own tab.
+      editTabMfa: 'Two-factor',
       editTabLlm: 'LLM & Repository',
       editTabPorts: 'Preview ports',
       editTabDanger: 'Danger zone',
