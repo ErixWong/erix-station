@@ -147,7 +147,7 @@ export async function authenticate(pool, login, password, { log } = {}) {
   // 登录响应用的是顶层的 `password_change_required`（见 http.js），两条各自自己的口径。
   // #449：同理多读 `email`（只用于第二因素选择与发信，**不进 user DTO**）。
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, mail_otp_enabled, file_upload_enabled
+    `SELECT id, login, display_name, role, fde_name, auth_source, status, password_hash, must_change_password, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled
        FROM users WHERE login = $1 AND status = 'active'`,
     [login],
   );
@@ -178,6 +178,12 @@ export async function authenticate(pool, login, password, { log } = {}) {
     // 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。**放在 result 顶层**而不是 user 里：
     // `user` 是登录响应会下发的 DTO，而这个开关只是宿主侧的判定输入（前端不需要知道）。
     mailOtpEnabled: row.mail_otp_enabled === true,
+    // 工单 feat-261110-02：「**允许用 TOTP 登录**」这一维（迁移 0030）。与 `mailOtpEnabled` 同一层：
+    // 它是 `chooseSecondFactor` 的判定输入，不是给前端的用户 DTO。
+    // ⚠ **缺键按 true**（`!== false`），与 `mailOtpEnabled` 的 `=== true` 相反：迁移 0030 的列默认就是
+    //    true，「没读到」的正确含义是「没被谁关掉过」⇒ 存量 TOTP 用户必须照旧能用 TOTP。
+    //    写成 `=== true` 就等于让一次漏选列把所有人打回口令直通。
+    totpLoginEnabled: row.totp_login_enabled !== false,
   };
 }
 
@@ -304,7 +310,7 @@ export async function hasTotpEnrollment(pool, userId) {
  */
 export async function loadActiveUser(pool, userId) {
   const res = await pool.query(
-    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password, file_upload_enabled
+    `SELECT id, login, display_name, role, fde_name, auth_source, email, must_change_password, file_upload_enabled, totp_login_enabled
        FROM users WHERE id = $1 AND status = 'active'`,
     [userId],
   );
@@ -314,6 +320,10 @@ export async function loadActiveUser(pool, userId) {
     user: toSessionUser(row),
     mustChangePassword: row.must_change_password === true,
     email: typeof row.email === 'string' && row.email.trim() !== '' ? row.email : null,
+    // feat-261110-02：邮箱码第二步与重发路径也要能看见「登录允不允许用 TOTP」——审计那一侧靠它区分
+    // `email_code`（唯一可用的一条）与 `email_code_alt`（明明有 TOTP 却走了较弱的那条）。
+    // 漏这一处就是「第一步判对了、第二步审计说胡话」。缺键按 true，理由同 `authenticate`。
+    totpLoginEnabled: row.totp_login_enabled !== false,
   };
 }
 

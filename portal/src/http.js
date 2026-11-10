@@ -2925,6 +2925,9 @@ async function handleLoginStep1(req, res, ctx) {
   const mailer = await ctx.mailerProvider.get();
   const secondFactor = loginEmailCode.chooseSecondFactor({
     hasTotpEnrollment: await auth.hasTotpEnrollment(pool, result.user.id),
+    // feat-261110-02：「绑过 TOTP」与「登录允许用 TOTP」分开传（迁移 0030）。这一位不传就等于
+    // 「所有人照旧」，于是管理台那个「允许 TOTP」的勾选框在界面上生效、在服务端是装饰。
+    totpLoginEnabled: result.totpLoginEnabled !== false,
     // 2026-11-06：**唯一**判据是 per-user 开关（迁移 0028）。全局 `transport` 只是 SMTP 连接配置，
     // 不再一票否决 —— 否则「管理员打开了开关、界面显示已启用、实际永远走口令」是必然的死光纤。
     mailOtpEnabled: result.mailOtpEnabled === true,
@@ -3254,7 +3257,12 @@ async function handleLoginEmailCode(req, res, ctx) {
   // 审计要能区分「走的是哪条」：同一枚 pending 可以是 `second_factor_choice` 签发的（该账号有 TOTP），
   // 用户选了邮件码 = 主动走了较弱的那一条 ⇒ 记 `email_code_alt`（#449 OR 语义的可审计口径）。
   // 无 TOTP 的账号（`email_code_required`）仍是 `email_code`（现状值不改）。
-  const loginMethod = (await auth.hasTotpEnrollment(pool, loaded.user.id)) ? 'email_code_alt' : 'email_code';
+  // feat-261110-02：`alt` 的语义是「**明明有可用的 TOTP 却选了较弱的那条**」。管理员把
+  // `totp_login_enabled` 关掉之后，邮件码是这个账号**唯一**被允许的第二因素，没有「放弃更强的一条」
+  // 这回事 ⇒ 记 `email_code`，否则审计会让人以为运维在两档里挑了弱的（而界面上根本没有第二档）。
+  const totpWasUsable = (await auth.hasTotpEnrollment(pool, loaded.user.id))
+    && loaded.totpLoginEnabled !== false;
+  const loginMethod = totpWasUsable ? 'email_code_alt' : 'email_code';
   await auditLoginSuccess(pool, loaded.user, loginMethod);
   await auth.audit(pool, {
     actorId: loaded.user.id,
