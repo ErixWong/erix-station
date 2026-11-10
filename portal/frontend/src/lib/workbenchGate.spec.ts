@@ -77,7 +77,7 @@ describe('#332 准入闸 workbenchGateDecision', () => {
     expect(workbenchGateDecision({ user: ADMIN_WITH_SEAT, toPath: '/session/s1' })).toEqual({ action: 'next' });
   });
 
-  it('FDE（含 fde_name 为空的畸形 fde）访问工作台 ⇒ 放行（服务端另有 403 写闸兜底）', () => {
+  it('FDE（含 fde_name 为空的畸形 fde）访问工作台 ⇒ 放行（服务端另有写闸：400 validation_failed + details.field=fde_name）', () => {
     expect(workbenchGateDecision({ user: FDE, toPath: '/' })).toEqual({ action: 'next' });
     expect(workbenchGateDecision({ user: { role: 'fde', fde_name: null }, toPath: '/' })).toEqual({ action: 'next' });
   });
