@@ -4470,3 +4470,57 @@ checkbox**（`data-test="mfa-totp-checkbox"` / `mail-otp-enabled`）：勾上才
 reconciliation` 判死，内存与系统日志无 OOM 痕迹），两次都**零提交**。⇒ 主 agent 第一次在死之前
 `git add -A` 把后端 WIP 落盘（`8da1286`，61/61 绿），第二次续跑才做完。**教训：执行体死掉时先看工作区有没有
 未提交的成果，`git add -A` + 一条 `wip(...)` 提交是最便宜的保险**（否则 30 分钟的活直接蒸发）。
+
+### 8.113 v0.1.66：验证码邮件双语 + 登录页写出「N 分钟内有效」（PR #491，2026-11-10）
+
+**两条用户要求**（2026-11-10，同一轮提出）：「验证码邮件请使用双语」+「然后 10 分钟有效这个写到 web 页面上」。
+
+**① 邮件双语**（`portal/src/http.js#emailCodeMessage`）：主题
+`FDE Station 登录验证码 / Sign-in verification code`；正文**中文一行 + 英文一行，两种语言各写一次同一个码与
+同一个有效期**，末尾两句安全提示同样双语。理由：收件人未必读得懂中文，而验证码邮件是登录的**唯一**凭据
+来源——看不懂就等于收不到。分钟数由 `ttlSeconds` 现算（`EMAIL_CODE_TTL_SECONDS` 可覆盖），**不写死 10**。
+
+**② 登录页写出有效期（服务端驱动）**：新字段 `email_code_ttl_seconds`（**码**的 TTL）四处统一下发——
+`email_code_required` / `second_factor_choice`（含降级形状）/ 其 `503 email_send_failed` 的 `details` /
+`resend`。⚠ **它与 `expires_in` 不是同一个数**：`expires_in` 是**待决令牌**的有效期
+（`max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`），拿它渲染「N 分钟内有效」在
+`PENDING_TOKEN_TTL_SECONDS > EMAIL_CODE_TTL_SECONDS` 时会直接说错。前端 `stores/auth.ts` 新增
+`emailCodeTtlSeconds`，四条来路收口 + `resetPendingLogin()` 一并作废；**只认正数**，缺席 / 字符串 / `0` /
+负数 = 「不知道」⇒ 那句话**整句不渲染**（不猜，也不退化成「0 分钟」）。`LoginView.vue` 把它渲染在
+**输入框与提交按钮之间**（`-mt-2` 抵掉输入框自带的 `mb-3` ⇒ 有/无这一行时按钮位置不变），两档之间切换不丢。
+
+**判据（+6）**：后端 ⑰ 邮件双语逐字（主题中英 + 两行各含同一个码与 `10 分钟` + 两句提示双语）；
+⑱ `email_code_ttl_seconds` 四处下发，且**覆盖 `EMAIL_CODE_TTL_SECONDS=120` ⇒ 字段与邮件正文一起变成 2 分钟**
+（这条就是「前端不许写死 10」的判据）；前端 4 条（600s ⇒ 「验证码 10 分钟内有效。」且位于输入框与按钮之间 /
+120s ⇒ 「2 分钟」/ 缺席与三种脏值 ⇒ 整句不渲染 / 二选一切档后仍在，中英各一次）。
+
+**基线**：根 **2134 / 2130 / 0 / 4 → 2136 / 2132 / 0 / 4**（+2）、runner **505 不变**（`runner/` 零字节）、
+前端 **63 文件 / 1311 → 1315**（+4）、`typecheck` rc=0。台账三处（本节 / `docs/ops/ci-release.md` §1 现价块 /
+`ci.yml` 步骤 ② 注释）同批刷新。
+
+**主 agent 亲跑 4 条变异**（每条先证 `git diff --numstat` 非空、跑完为空）：邮件去掉英文行 ⇒ 2 红；
+`second_factor_choice` 不下发 TTL ⇒ 2 红（响应键集那条 + ⑱）；前端写死 `return 10` ⇒ 2 红；
+`normalizeEmailCodeTtl` 改成接受字符串 ⇒ 1 红（脏值 `'600'`）。
+
+**发版与部署（v0.1.66）**：PR #491 → `chore(release): 0.1.66`（六文件 9 增 9 删）→ main CI 两个 job 全绿 →
+tag `v0.1.66` → release `42776650239` → 清单 portal `digest=ae90a9a6…` / `imageId=892a027c…`、proxy
+`digest=aa7a5b6d…` / `imageId=71bc1f3c…`，`docker pull` 后 `image inspect .Id` **逐个一致** → `deploy/.env`
+形态① pin 两行（备份 `/tmp/deploy.env.bak-0166`）→ `up -d --no-build station-portal`（连带重建
+`station-docker-proxy`）⇒ 容器内 `0.1.66`、经 Traefik `healthz=200`。**本版 `runner/` 零改动 ⇒ 五台 FDE
+容器故意不重建**（`FDE_IMAGE` 未动）。
+
+**真机验收（v0.1.66 发布物，主 agent 亲手）**：API `POST /api/auth/login`（eric）⇒
+`email_code_required` + `email_code_ttl_seconds: 600`；浏览器（`meeting_asr_app_playwright` + 临时 Host/Origin
+改写代理 `127.0.0.1:18099 → 8090`，验完已 kill）走到邮箱码第二步，DOM 里
+`[data-test="emailCodeTtl"]` 中英各读一次：`The code is valid for 10 minutes.` / `验证码 10 分钟内有效。`，
+位置在输入框之后、按钮之前；容器内 `grep` 确认 `/app/portal/src/http.js` 有双语主题行、
+`/app/portal/static/app/assets/api-*.js` 同时含中英两条 i18n 串。⚠ **vision relay 当时挂了**
+（`http_request_failed` 两次）⇒ 截图的看图复核没做，改以 DOM 断言为准（`/docker/meeting_asr_app_playwright/v0166-code-ttl-zh.png`）。
+
+**已知遗留 / 现场事实**：
+- 管理台「测试发信」（`mail_settings.buildTestMessage`）**仍是中文单语**：那是运维手点的探活信、不含验证码，
+  本单按字面范围没动（要双语另开一单）。
+- 验收时发现 `eric` 的 `totp_login_enabled = false`（`totp_secret` 仍在）⇒ 他现在走的是
+  `email_code_required`（邮箱码是唯一第二因素），两档 switch 对他是隐藏的。**不是本单改的**，
+  是管理台侧某次保存的结果；要恢复 TOTP 登录去「二次验证」tab 勾回来即可。
+- 本次验收真实发出了两封双语验证码邮件（curl 探针一封 + 浏览器一封，收件人 `ewang2@intevaproducts.com`）。
