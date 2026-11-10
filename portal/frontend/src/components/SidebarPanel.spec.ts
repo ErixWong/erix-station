@@ -642,6 +642,8 @@ describe('SidebarPanel · AI 改名（issue #114）', () => {
     const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
     const btn = wrapper.get('button[aria-label="AI 改名"]');
     expect(btn.attributes('title')).toBe('AI 改名');
+    // issue #488：三颗浮现按钮的几何必须同规格（宽度是硬约束，工单 §五.1）
+    expect(wrapper.get('[data-test="sidebar-hide"]').classes()).toContain('h-6');
     expect(btn.classes()).toContain('h-6'); // 24px 方块（与铅笔同规格）
     expect(btn.classes()).toContain('w-6');
     expect(btn.classes()).toContain('rounded-[5px]');
@@ -727,14 +729,16 @@ describe('SidebarPanel · AI 改名（issue #114）', () => {
     }
   });
 
-  it('编辑态下两个按钮都隐藏（铅笔 + AI 改名互斥）', async () => {
+  it('编辑态下三个按钮都隐藏（铅笔 + AI 改名 + 隐藏 互斥）', async () => {
     const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
     try {
       expect(wrapper.find('button[aria-label="AI 改名"]').exists()).toBe(true);
+      expect(wrapper.find('button[aria-label="隐藏"]').exists()).toBe(true);
       await wrapper.get('button[aria-label="重命名"]').trigger('click');
       await flushPromises();
       expect(wrapper.find('button[aria-label="重命名"]').exists()).toBe(false);
       expect(wrapper.find('button[aria-label="AI 改名"]').exists()).toBe(false);
+      expect(wrapper.find('button[aria-label="隐藏"]').exists()).toBe(false);
     } finally {
       wrapper.unmount();
     }
