@@ -16,12 +16,12 @@
 //   ⑩ 审计三条在册，details 序列化后搜不到明文码（正向有 code_hash_prefix）
 //   ⑪ 接线判据：ctx 里有 mailerProvider，登录路径读 ctx.mailerProvider.get()（防 #331「没人读的光纤」）
 //   ⑫ 选择规则纯函数五分支参数化（#449 二选一）
-//   ⑬ 二选一的 HTTP 响应逐字段（status / methods / email_sent / email_hint / expires_in）
-//   ⑭ SMTP 不可用 ⇒ 200 降级仅 TOTP（绝不 503），且同一 pending_token 仍能过 /login/totp 建会话
+//   ⑬ 二选一的 HTTP 响应逐字段 + 懒发信（status / methods / email_deferred / email_hint / expires_in；第一步零发信）
+//   ⑭ 邮件通道不可用（未启用 / 发信限流占满）⇒ 200 降级仅 TOTP（绝不 503），且同一 pending_token 仍能过 /login/totp 建会话
 //   ⑮ 同一 pending_token 单次消费：任一路径先成功后，另一路径 401 pending_expired
 //   ⑯ 审计 method 三值各自可达且不串：totp / email_code / email_code_alt
 
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -63,10 +63,10 @@ function fakeProvider(mailer) {
   return { get: async () => mailer, invalidate() {} };
 }
 
-async function makeUser({ email = 'alice@example.com', totpSecret = null, mailOtpEnabled = true } = {}) {
+async function makeUser({ id = 'u1', login = 'alice', email = 'alice@example.com', totpSecret = null, mailOtpEnabled = true } = {}) {
   return {
-    id: 'u1',
-    login: 'alice',
+    id,
+    login,
     display_name: 'Alice',
     role: 'fde',
     fde_name: 'alice',
@@ -82,7 +82,7 @@ async function makeUser({ email = 'alice@example.com', totpSecret = null, mailOt
   };
 }
 
-async function startServer({ users = [], mailer, loginEmailCodeOverrides = {} } = {}) {
+async function startServer({ users = [], mailer, loginEmailCodeOverrides = {}, emailSendRateLimit } = {}) {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'station-static-emailcode-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), 'SECRET_INDEX');
   fs.mkdirSync(path.join(staticDir, 'app'), { recursive: true });
@@ -117,20 +117,45 @@ async function startServer({ users = [], mailer, loginEmailCodeOverrides = {} } 
       maxResends: 3,
       ...loginEmailCodeOverrides,
     },
+    // #449 尾巴：「发信限流当下被占满」是二选一降级的那条预检判据，测试要能把这把闸单独调小。
+    ...(emailSendRateLimit ? { emailSendRateLimit } : {}),
   };
   const pool = new FakePool({ users });
   const provider = fakeProvider(mailer);
   const server = createServer({ pool, config, mailerProvider: provider });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  openServers.add(server); // 见上面的注册表注释：断言抛了也没人 close ⇒ 事件循环永不空
   const base = `http://127.0.0.1:${server.address().port}`;
   return {
     server,
     pool,
     config,
     base,
-    close: () => new Promise((resolve) => server.close(resolve)),
+    close: () => closeServer(server),
   };
 }
+
+/**
+ * 收摊一台服务器：先掐掉连接（含 fetch 的 keep-alive），否则 `close()` 会一直等不到回调。
+ * 幂等（重复调用 / 已关掉都不抛）。
+ */
+async function closeServer(server) {
+  openServers.delete(server);
+  server.closeAllConnections?.();
+  await new Promise((resolve) => server.close(() => resolve()));
+}
+
+/**
+ * **每个**开出来的 server 都登记在这里，`after` 一律收摊。
+ * 为什么必须有：`choiceWithDisabledSmtp` / `choiceWithSaturatedSendLimiter` 这类夹具 helper 是
+ * 「先开 server 再断言」的（夹具自己也要自证非空操作），而断言一抛就轮不到调用方的 `finally`
+ * ⇒ server 泄漏 ⇒ `node --test` 跑完全部用例后事件循环仍不空 ⇒ **进程挂到超时才被杀**
+ * （实测：变异把红打出来之后仍然挂满 300s，rc=124）。绿灯时看不出来，红灯时才要命。
+ */
+const openServers = new Set();
+after(async () => {
+  for (const server of [...openServers]) await closeServer(server);
+});
 
 function postJson(base, pathname, body, headers = {}) {
   return fetch(`${base}${pathname}`, {
@@ -151,6 +176,19 @@ function lastCode(state) {
   const match = String(mail.text).match(/\b(\d{6})\b/);
   assert.ok(match, `邮件正文里应有 6 位码：${mail.text}`);
   return match[1];
+}
+
+/**
+ * 懒发信（工单 feat-261110-01）之后的「拿一枚可用的码」：`second_factor_choice` 第一步**不发**，
+ * 第一封由 resend 端点发出（= 前端 `switchFactor('email')` 走的那一步）。
+ * 直发分支（`email_code_required`）第一步已经发过 ⇒ 不多调一次端点（否则白吃 60s 冷却）。
+ */
+async function emailCodeAt(base, body, state) {
+  if (body.email_deferred === true) {
+    const res = await postJson(base, '/api/auth/login/email-code/resend', { pending_token: body.pending_token });
+    assert.equal(res.status, 200, '切到邮箱档时第一封必须发得出去');
+  }
+  return lastCode(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -727,9 +765,10 @@ test('#449⑫b 6 位码生成与 email_hint 脱敏口径', () => {
 
 // ---------------------------------------------------------------------------
 // ⑬ 二选一（#449）：TOTP 与邮箱码并存 ⇒ status='second_factor_choice'，两路共用一枚 pending_token
+//    懒发信（工单 feat-261110-01）：第一步**一封都不发**，第一封由「切到邮箱档」时的 resend 端点发出。
 // ---------------------------------------------------------------------------
 
-test('#449⑬ 已绑 TOTP + 开关开 + 有邮箱 ⇒ second_factor_choice，响应逐字段', async () => {
+test('#449⑬ 已绑 TOTP + 开关开 + 有邮箱 ⇒ second_factor_choice，响应逐字段 + 第一步零发信', async () => {
   const { mailer, state } = fakeMailer();
   const secret = totp.generateSecret(20);
   const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
@@ -739,41 +778,107 @@ test('#449⑬ 已绑 TOTP + 开关开 + 有邮箱 ⇒ second_factor_choice，响
     const body = await res.json();
     assert.deepEqual(
       Object.keys(body).sort(),
-      ['email_hint', 'email_sent', 'expires_in', 'methods', 'pending_token', 'status'],
-      '响应字段就是工单 §一.2 那一组（成功路径不带 email_unavailable/notice）',
+      ['email_deferred', 'email_hint', 'expires_in', 'methods', 'pending_token', 'status'],
+      '响应字段就是懒发信那一组（不带 email_sent / email_unavailable / notice）',
     );
     assert.equal(body.status, 'second_factor_choice', '不再是 totp_required（否则开关是死开关）');
     assert.deepEqual(body.methods, ['totp', 'email_code']);
-    assert.equal(body.email_sent, true);
+    assert.equal(body.email_deferred, true, '明示「这条路可走，但码还没发」');
+    // 「还没发」用**缺席**表达，不许与「不可用」的 `email_sent:false` 混为一谈：前端的不可用判据是
+    // `email_sent === false || email_unavailable === true`，这里带上 `email_sent` 任意一个值都会让
+    // 邮箱档在第一步就被剥掉 ⇒ 二选一在界面上依旧不存在（正是本单要修的那个缺陷）。
+    assert.ok(!('email_sent' in body), '懒发信不得带 `email_sent` 键');
     assert.equal(body.email_hint, maskEmail('alice@example.com'), 'hint 走既有脱敏');
     assert.ok(!JSON.stringify(body).includes('alice@example.com'), '响应不泄露完整邮箱');
     assert.equal(body.expires_in, 600, 'expires_in = max(pendingTokenTtlSeconds 120, EMAIL_CODE_TTL 600)');
     assert.ok(typeof body.pending_token === 'string' && body.pending_token.startsWith('pt_'));
-    assert.equal(state.sent.length, 1, '恰好发出一封码（开关真发信，不是死开关）');
-    assert.equal(s.pool.emailCodes.length, 1, '码行落库');
+
+    // 本单第一判据：**第一步一封都不发**。
+    assert.equal(state.sent.length, 0, '懒发信：`mailer.send` 调用次数必须为 0');
+    assert.equal(s.pool.emailCodes.length, 0, '零发信 ⇒ 零码行（不给用户一枚库里不存在的码）');
+    assert.ok(
+      !s.pool.audit.some((a) => a.action === 'auth.email_code_sent'),
+      '没发信就不许写 auth.email_code_sent 审计',
+    );
+    assert.ok(
+      !s.pool.audit.some((a) => a.action === 'auth.email_code_failed'),
+      '什么都没尝试过 ⇒ 也不许写失败审计（假账）',
+    );
+    assert.equal(s.pool.pending.length, 1, '两条路共用一枚 pending：它照样要建');
     assert.equal(s.pool.sessions.length, 0, '第一步不建会话');
     assert.ok(!res.headers.get('set-cookie'), '第一步不下发会话 cookie');
+
+    // 懒发信的落地：切到邮箱档 ⇒ 调既有 resend 端点发**第一封**（零码行 = 首次发信，不吃 60s 冷却）。
+    const resent = await postJson(s.base, '/api/auth/login/email-code/resend', {
+      pending_token: body.pending_token,
+    });
+    assert.equal(resent.status, 200, await resent.clone().text());
+    assert.equal(state.sent.length, 1, '第一封由 resend 端点发出');
+    assert.equal(s.pool.emailCodes.length, 1, '切过来才落码行');
+    const verified = await postJson(s.base, '/api/auth/login/email-code', {
+      pending_token: body.pending_token,
+      code: lastCode(state),
+    });
+    assert.equal(verified.status, 200, '懒发出去的码必须能用');
+  } finally {
+    await s.close();
+  }
+});
+
+// ⑬b 回归锁：懒发信只改**二选一**分支。无 TOTP 的 `email_code_required`（邮件码是唯一第二因素）
+// 必须仍在第一步就发信，否则那个人根本拿不到码。
+test('#449⑬b 回归锁：无 TOTP 的 email_code_required 仍然第一步就发信', async () => {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser({ totpSecret: null })], mailer });
+  try {
+    const body = await (await login(s.base)).json();
+    assert.equal(body.status, 'email_code_required');
+    assert.equal(state.sent.length, 1, '这一条不是懒发信：第一步必须发信');
+    assert.equal(s.pool.emailCodes.length, 1);
+    assert.ok(s.pool.audit.some((a) => a.action === 'auth.email_code_sent'), '发信审计仍在册');
+    assert.ok(!('email_deferred' in body), '直发分支不沾 email_deferred');
   } finally {
     await s.close();
   }
 });
 
 // ---------------------------------------------------------------------------
-// ⑭ SMTP 不可用 ⇒ 200 降级「仅 TOTP」，同一 pending_token 仍能靠 TOTP 进门（本单最重要判据）
+// ⑭ 邮件通道当下不可用 ⇒ 200 降级「仅 TOTP」，同一 pending_token 仍能靠 TOTP 进门（本单最重要判据）
+// 懒发信之后，「不可用」只剩两个**能在第一步预判**的来源：SMTP 未启用 / 发信限流被占满。
 // ---------------------------------------------------------------------------
 
-async function choiceWithBrokenSmtp({ enabled }) {
-  const { mailer, state } = fakeMailer({ enabled });
-  // enabled=true 代「SMTP 配了但当下发不出去」（smtp_unreachable）；enabled=false 代「未配置 / 急停」。
-  if (enabled) state.fail = true;
+async function choiceWithDisabledSmtp() {
+  const { mailer, state } = fakeMailer({ enabled: false }); // 「未配置 / 急停」
   const secret = totp.generateSecret(20);
   const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
-  return { s, state, secret };
+  return { s, state, secret, sentBaseline: 0, codeRowsBaseline: 0 };
 }
 
-for (const [label, enabled] of [['SMTP 发信失败（smtp_unreachable）', true], ['SMTP 未配置（enabled=false）', false]]) {
-  test(`#449⑭ SMTP 不可用（${label}）⇒ 200 + methods:['totp'] + email_sent:false，TOTP 仍能登录`, async () => {
-    const { s, state, secret } = await choiceWithBrokenSmtp({ enabled });
+/** 发信限流被占满：把闸调到 1 次/窗口，再用一次**真发信**（无 TOTP 账号的 §2.3a）把它烧掉。 */
+async function choiceWithSaturatedSendLimiter() {
+  const { mailer, state } = fakeMailer();
+  const secret = totp.generateSecret(20);
+  const s = await startServer({
+    users: [
+      await makeUser({ totpSecret: secret }),
+      await makeUser({ id: 'u2', login: 'bob', totpSecret: null }),
+    ],
+    mailer,
+    emailSendRateLimit: { maxFailures: 1, windowMs: 15 * 60 * 1000, blockMs: 60 * 1000, maxEntries: 100 },
+  });
+  const bob = await login(s.base, { login: 'bob', password: PASSWORD });
+  assert.equal(bob.status, 200, '夹具：bob 走 §2.3a，第一步真发一封 ⇒ 烧掉那唯一的配额');
+  assert.equal(state.sent.length, 1, '夹具：那封信真的发出去了（才会 recordFailure）');
+  // 下面那条用例断言的是「alice 第一步的**增量**为零发信」，所以把夹具那封记成基线。
+  return { s, state, secret, sentBaseline: state.sent.length, codeRowsBaseline: s.pool.emailCodes.length };
+}
+
+for (const [label, make] of [
+  ['SMTP 未启用（enabled=false）', choiceWithDisabledSmtp],
+  ['发信限流被占满（email:<ip> 预检不允许）', choiceWithSaturatedSendLimiter],
+]) {
+  test(`#449⑭ 邮件通道不可用（${label}）⇒ 200 + methods:['totp'] + email_sent:false，TOTP 仍能登录`, async () => {
+    const { s, state, secret, sentBaseline, codeRowsBaseline } = await make();
     try {
       const res = await login(s.base);
       assert.equal(res.status, 200, '绝不 503 / 500：TOTP 是离线可用的强因素');
@@ -783,8 +888,9 @@ for (const [label, enabled] of [['SMTP 发信失败（smtp_unreachable）', true
       assert.equal(body.email_sent, false);
       assert.equal(body.email_unavailable, true);
       assert.ok(typeof body.notice === 'string' && body.notice.length > 0, '给人一句可读说明');
-      assert.equal(state.sent.length, 0);
-      assert.equal(s.pool.emailCodes.length, 0, '没发出去就不落码行（不给用户一枚库里不存在的码）');
+      assert.ok(!('email_deferred' in body), '不可用那条不沾 email_deferred（两者必须分得开）');
+      assert.equal(state.sent.length, sentBaseline, '懒发信：降级路径同样零发信（夹具那封不算）');
+      assert.equal(s.pool.emailCodes.length, codeRowsBaseline, '没发出去就不落码行（夹具那行不算）');
       assert.ok(s.pool.audit.some((a) => a.action === 'auth.email_code_failed'), '降级要留审计痕');
 
       // 同一枚 pending_token 必须还能过 TOTP —— 这条挂了就是「SMTP 抖一下，人登不进去」。
@@ -804,6 +910,40 @@ for (const [label, enabled] of [['SMTP 发信失败（smtp_unreachable）', true
 }
 
 // ---------------------------------------------------------------------------
+// ⑭b 懒发信的已知代价：「SMTP 配了但当下发不出去」在第一步**看不出来**（不再试发），所以那条
+// 仍给两条通道 + `email_deferred`，失败推迟到切过去发第一封时（503 email_send_failed）。
+// 本用例钉住这个取舍，别让后来人把「第一步不降级」当成回归。
+// ---------------------------------------------------------------------------
+
+test('#449⑭b SMTP 名义启用但当下发不出去 ⇒ 第一步仍给两条（deferred），切到邮箱档才暴露为 503', async () => {
+  const { mailer, state } = fakeMailer();
+  state.fail = true; // enabled=true + 当下发不出去（smtp_unreachable）
+  const secret = totp.generateSecret(20);
+  const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
+  try {
+    const body = await (await login(s.base)).json();
+    assert.deepEqual(body.methods, ['totp', 'email_code'], '第一步不试发 ⇒ 预检不出来，照旧给两条');
+    assert.equal(body.email_deferred, true);
+    assert.equal(state.sent.length, 0);
+
+    // 切到邮箱档 ⇒ resend 发第一封 ⇒ 此时才 503（pending 不作废，前端的「重新发送」路径接得住）。
+    const resend = await postJson(s.base, '/api/auth/login/email-code/resend', {
+      pending_token: body.pending_token,
+    });
+    assert.equal(resend.status, 503);
+    assert.equal((await resend.json()).error.code, 'email_send_failed');
+    // TOTP 完全不受影响（同一枚 pending）。
+    const totpRes = await postJson(s.base, '/api/auth/login/totp', {
+      pending_token: body.pending_token,
+      code: totp.totp(secret),
+    });
+    assert.equal(totpRes.status, 200, 'SMTP 当下坏了不得影响 TOTP 第二步');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ⑮ 单次消费：两路共用一枚 pending_token，谁先成功谁建会话，另一条自然失效
 // ---------------------------------------------------------------------------
 
@@ -815,7 +955,7 @@ test('#449⑮ 同一 pending_token：先 TOTP 成功 ⇒ 邮件码 401 pending_e
     const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
     try {
       const body = await (await login(s.base)).json();
-      const code = lastCode(state);
+      const code = await emailCodeAt(s.base, body, state);
       const ok = await postJson(s.base, '/api/auth/login/totp', { pending_token: body.pending_token, code: totp.totp(secret) });
       assert.equal(ok.status, 200);
       const late = await postJson(s.base, '/api/auth/login/email-code', { pending_token: body.pending_token, code });
@@ -833,7 +973,7 @@ test('#449⑮ 同一 pending_token：先 TOTP 成功 ⇒ 邮件码 401 pending_e
     const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
     try {
       const body = await (await login(s.base)).json();
-      const code = lastCode(state);
+      const code = await emailCodeAt(s.base, body, state);
       const ok = await postJson(s.base, '/api/auth/login/email-code', { pending_token: body.pending_token, code });
       assert.equal(ok.status, 200);
       const late = await postJson(s.base, '/api/auth/login/totp', { pending_token: body.pending_token, code: totp.totp(secret) });
@@ -862,9 +1002,11 @@ async function loginMethodOf({ totpSecret, use }) {
       });
       assert.equal(res.status, 200);
     } else {
+      // 懒发信（feat-261110-01）：二选一分支的码要「切到邮箱档」（resend）才发得出来。
+      const code = await emailCodeAt(s.base, body, state);
       const res = await postJson(s.base, '/api/auth/login/email-code', {
         pending_token: body.pending_token,
-        code: lastCode(state),
+        code,
       });
       assert.equal(res.status, 200);
     }
