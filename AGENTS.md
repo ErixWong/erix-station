@@ -4524,3 +4524,15 @@ tag `v0.1.66` → release `42776650239` → 清单 portal `digest=ae90a9a6…` /
   `email_code_required`（邮箱码是唯一第二因素），两档 switch 对他是隐藏的。**不是本单改的**，
   是管理台侧某次保存的结果；要恢复 TOTP 登录去「二次验证」tab 勾回来即可。
 - 本次验收真实发出了两封双语验证码邮件（curl 探针一封 + 浏览器一封，收件人 `ewang2@intevaproducts.com`）。
+
+**过程账（一次真的把别人的工作区搞脏了，已完整复原）**：我在 worktree `wt449h` 里为了做版本号 bump 跑了
+`git checkout -q main || git checkout -q -B main origin/main` —— 第一支因「`main` 已在主工作区检出」失败，
+**第二支的 `-B` 把共享的 `main` ref 直接重置到了 `origin/main`**，于是**主工作区的 HEAD 跟着跳了**
+（它的 index/工作树还停在旧提交）。后果：主工作区 `git status` 突然显示 37 个文件「已暂存」、3623 行删除，
+看起来像有人在乱改；真相是「HEAD 前进、index 没动」的假象，**里面还压着另一个 session 未提交的
+`docs/README.md` 一行 + 未跟踪的 `docs/design/event-platform/`**。
+复原：先备份 `docs/README.md` → `git reset --hard HEAD`（`--hard` 不动未跟踪文件）→ 把那一行原样插回 →
+`diff` 证明与复原前**逐字节相同**。
+⇒ **口径：worktree 里做版本号/发布提交，绝不 `git checkout -B <branch>`（或 `git branch -f`）一个「已在别的
+worktree 检出」的分支**——ref 一移动，别人的 HEAD 与 index 就分家了。正解：在**主工作区**做 bump 提交
+（它就是 main），或在本 worktree 里用**自己的分支名** `git reset --hard origin/main`。
