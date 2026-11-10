@@ -20,7 +20,7 @@ const MFA_FACTORS_BLOCK = adminUsersViewSource.slice(
 );
 /**
  * 邮件验证码设置那一块（从 section 开头到保存按钮）。
- * feat-261110-03：控制件从自实现的 `<ToggleSwitch test-id=…>` 回到原生勾选框
+ * feat-261110-03：控制件从上一版自实现的「轨道 + 滑块」开关（`role="switch"`）回到原生勾选框
  * `<input type="checkbox" data-test=…>`（用户原话「用checkbox吧，两个checkbox就行」），
  * 但**仍在同一档、同一语义**，断言语义一条没删。
  */
@@ -98,5 +98,33 @@ describe('#449 管理台：TOTP 账号的邮件验证码开关不再是死开关
     // 死开关时代的键彻底删掉（zh/en 同步删，localeParity 兜另一半）。
     expect(zhFde.mailOtpHiddenByTotp).toBeUndefined();
     expect(enFde.mailOtpHiddenByTotp).toBeUndefined();
+  });
+
+  // 工单 feat-261110-03 §2.7：键集对齐由 localeParity 兜，这里额外钉「警告文案真的两边都写了、
+  // 且说的确实是“没第二因素”」（否则红字会变成未翻译的键名，或把“没勾”误写成“没第二因素”）。
+  it('zh/en 都有 mailOtpSwitchWarning，且口径是「只用口令登录（无第二因素）」', () => {
+    const zhFde = zhCN.admin.fde as unknown as Record<string, string>;
+    const enFde = en.admin.fde as unknown as Record<string, string>;
+    for (const [locale, bag] of [['zh-CN', zhFde], ['en', enFde]] as const) {
+      expect(bag.mailOtpSwitchWarning, `${locale} 缺 mailOtpSwitchWarning`).toBeTruthy();
+      expect(bag.mailOtpSwitchWarning, `${locale} 空串`).not.toBe('');
+      expect(bag.mailOtpSwitchWarning, `${locale} 不得漏翻译（界面会把键名直接打出来）`)
+        .not.toMatch(/admin\.fde\.|mailOtpSwitchWarning/);
+      expect(bag.mailOtpSwitchWarning, `${locale} 必须说清没有第二因素`).toMatch(/口令|password/i);
+      expect(bag.mailOtpSwitchWarning, `${locale} 必须说清没有第二因素`).toMatch(/第二因素|second factor/i);
+      // 新增键必须成对（删一边、加一边会被 localeParity 抓，但漏两个都漏情能跟过那里）。
+      for (const key of ['totpLoginEnabledLabel', 'totpEnrolledState', 'totpNotEnrolled',
+        'saveMfaSettings', 'mfaSettingsSaved', 'mailOtpCheckboxLabel']) {
+        expect(bag[key], `${locale} 缺 admin.fde.${key}`).toBeTruthy();
+      }
+    }
+    expect(zhFde.totpNotEnrolled).toBe('未绑定');
+    expect(enFde.totpNotEnrolled).toBe('Not enrolled');
+    expect(zhFde.totpLoginEnabledLabel).toBe('验证器应用（TOTP）');
+    // 上一版为手搓 switch 加的左右档位文案已退场（控件形态变了，留着就是孤儿键）。
+    expect(zhFde.mailOtpSwitchOff).toBeUndefined();
+    expect(enFde.mailOtpSwitchOff).toBeUndefined();
+    expect(zhFde.mailOtpSwitchOn).toBeUndefined();
+    expect(enFde.mailOtpSwitchOn).toBeUndefined();
   });
 });

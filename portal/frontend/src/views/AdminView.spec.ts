@@ -1714,7 +1714,7 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     expect(section.text()).toContain('邮件验证码');
 
     const checkbox = section.get('[data-test="mail-otp-enabled"]');
-    // feat-261110-03：控制件是原生勾选框（上一版的 ToggleSwitch 已按用户要求退场）
+    // feat-261110-03：控制件是原生勾选框（上一版那个手搓的轨道+滑块开关已按用户要求退场）
     // ⇒ **只换驱动方式**（读 `.checked`、用 setValue 拨），断言语义一条没删。
     expect(checkbox.attributes('type'), '必须是原生 checkbox').toBe('checkbox');
     expect(checkbox.attributes('role'), '不得再是自实现的 switch').toBeUndefined();
@@ -1728,6 +1728,190 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
 
     expect(patches).toHaveLength(1);
     expect(patches[0].body).toEqual({ mail_otp_enabled: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 工单 feat-261110-03：「二次验证」那一档 = 两个勾选框 + 勾上才展开。
+// 钉的是四件容易做错的事：① 控制件形态（原生 checkbox，不是手搓 switch）；② 展开关系真的是
+// v-if（不是 v-show，也不是“只销颜色”）；③ 未绑定那一位的禁用与出口；④ 保存只带改动那一位。
+// ---------------------------------------------------------------------------
+describe('AdminView · 二次验证 tab（两个勾选框 + 勾选展开）', () => {
+  /** 把 `totp_login_enabled` / `mail_otp_enabled` 接成任意形状的用户（后端 DTO 恒带这两个键）。 */
+  function usersPayload(totpLogin: boolean, mailOtp: boolean) {
+    return { items: USERS.items.map((user) => ({ ...user, totp_login_enabled: totpLogin, mail_otp_enabled: mailOtp })) };
+  }
+
+  /** 打开 alice 的抽屉并切到「二次验证」；PATCH 按体回写到 GET（跟服务端同语义）。 */
+  async function openMfaTab(totpLogin = true, mailOtp = false, patchDelay = false) {
+    let current: unknown = usersPayload(totpLogin, mailOtp);
+    const patches: Array<Record<string, unknown>> = [];
+    const mounted = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, current);
+      if (url === '/api/admin/users/u1' && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        patches.push(body);
+        current = {
+          items: (current as { items: Array<Record<string, unknown>> }).items.map((user) =>
+            user.id === 'u1' ? { ...user, ...body } : user),
+        };
+        // 永不完结算 ⇒ `mfaBusy` 永远停着，用来钉「在途时保存禁用且不再发第二个请求」。
+        return patchDelay ? new Promise<Response>(() => {}) : jsonResponse(200, {
+          user: (current as { items: Array<Record<string, unknown>> }).items[0],
+        });
+      }
+      return undefined;
+    });
+    await mounted.wrapper.get('[data-test="edit-user"]').trigger('click');
+    await mounted.wrapper.get('[data-test="edit-tab-mfa"]').trigger('click');
+    await flushPromises();
+    return { ...mounted, patches, panel: () => mounted.wrapper.get('[data-test="edit-panel-mfa"]') };
+  }
+
+  it('两个勾选框都在且不是 switch；未勾的那一位不把自己的设置块留在 DOM 里', async () => {
+    const { wrapper, panel } = await openMfaTab(true, false);
+    const box = panel();
+    expect(box.isVisible(), '不在这档就不算看到').toBe(true);
+    expect(box.find('[role="switch"]').exists(), '本档不得有手搓 switch').toBe(false);
+    expect(wrapper.findAll('[data-test="user-edit-modal"] [role="switch"]'), '整个抽屉都不该有 switch')
+      .toHaveLength(0);
+
+    const totp = box.get('[data-test="mfa-totp-checkbox"]');
+    const mail = box.get('[data-test="mail-otp-enabled"]');
+    expect(totp.attributes('type')).toBe('checkbox');
+    expect(mail.attributes('type')).toBe('checkbox');
+    // 两个框互相独立：TOTP 已绑且允许 ⇒ 勾着；邮件码关着（同一屏上完全可以一勾一不勾）。
+    expect(isChecked(totp), 'DTO 里是 true').toBe(true);
+    expect(isChecked(mail), 'DTO 里是 false').toBe(false);
+    expect(box.text()).not.toContain('admin.fde.totp');
+    expect(box.find('[data-test="totp-settings-section"]').exists(), '勾着的位该展开自己的块').toBe(true);
+    expect(box.find('[data-test="mail-otp-section"]').exists(), '没勾的位不该把块留在 DOM 里').toBe(false);
+    wrapper.unmount();
+  });
+
+  it('勾 / 不勾 ⇒ 对应块的显与隐（v-if，不是颜感）；两位互不牵连', async () => {
+    const { wrapper, panel } = await openMfaTab(true, false);
+    const box = panel();
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(false);
+    expect(box.find('[data-test="totp-settings-section"]').exists(), '取消勾选 ⇒ TOTP 块消失').toBe(false);
+    expect(box.find('[data-test="mail-otp-section"]').exists(), '邮件码本来就没展开').toBe(false);
+
+    await box.get('[data-test="mail-otp-enabled"]').setValue(true);
+    expect(box.find('[data-test="mail-otp-section"]').exists(), '勾上邮件码 ⇒ 它的块出现').toBe(true);
+    expect(box.find('[data-test="totp-settings-section"]').exists(), 'TOTP 仍没勾').toBe(false);
+
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(true);
+    expect(box.find('[data-test="totp-settings-section"]').exists(), '两位可同时展开（不互斥）').toBe(true);
+    expect(box.find('[data-test="mail-otp-section"]').exists()).toBe(true);
+
+    await box.get('[data-test="mail-otp-enabled"]').setValue(false);
+    expect(box.find('[data-test="mail-otp-section"]').exists(), '邮件码取消不影响 TOTP 块').toBe(false);
+    expect(box.find('[data-test="totp-settings-section"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('拿不出第二因素 ⇒ tab 顶部红字；勾任一 ⇒ 红字消失（勾的是“有因素”，不是“有 DOM”）', async () => {
+    const { wrapper, panel } = await openMfaTab(false, false);
+    const box = panel();
+    const warning = box.get('[data-test="mfa-no-factor"]');
+    expect(warning.classes(), '红字用既有 .syserr 形态').toContain('syserr');
+    expect(warning.attributes('role')).toBe('alert');
+    expect(warning.text()).toContain('只用口令登录');
+    expect(warning.text()).not.toMatch(/undefined|admin\.fde\./);
+
+    await box.get('[data-test="mail-otp-enabled"]').setValue(true);
+    expect(box.find('[data-test="mfa-no-factor"]').exists(), '勾上邮件码 ⇒ 警告消失').toBe(false);
+    await box.get('[data-test="mail-otp-enabled"]').setValue(false);
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(true);
+    expect(box.find('[data-test="mfa-no-factor"]').exists(), '勾上验证器（已绑）⇒ 警告消失').toBe(false);
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(false);
+    expect(box.find('[data-test="mfa-no-factor"]').exists(), '两个都关掉 ⇒ 警告回来').toBe(true);
+    wrapper.unmount();
+  });
+
+  it('未绑定 TOTP ⇒ 那一位禁用 + 「未绑定」+ 既有绑定按钮在这一行；邮件码仍可勾', async () => {
+    // bob：`totp_enabled: false` 但 `totp_login_enabled: true`（迁移 0030 的列默认）。
+    const { wrapper, fetchFn } = await mountAdmin('/admin/users', (url, init) => {
+      if (url === '/api/admin/users' && !init?.method) {
+        return jsonResponse(200, { items: USERS.items.map((user) => ({ ...user, totp_login_enabled: true })) });
+      }
+      return undefined;
+    });
+    const bobRow = wrapper.findAll('[data-test="user-row"]').find((row) => row.text().includes('bob'));
+    if (!bobRow) throw new Error('bob row not found');
+    await bobRow.get('[data-test="edit-user"]').trigger('click');
+    await wrapper.get('[data-test="edit-tab-mfa"]').trigger('click');
+    await flushPromises();
+    const box = wrapper.get('[data-test="edit-panel-mfa"]');
+
+    const totp = box.get('[data-test="mfa-totp-checkbox"]');
+    expect((totp.element as HTMLInputElement).disabled, '未绑定 ⇒ 这一位拨不动').toBe(true);
+    expect(box.get('[data-test="mfa-totp-bound"]').text(), '必须说清是“没绑”而不是“已关”')
+      .toBe('未绑定');
+    const enroll = box.get('[data-test="confirm-totp-enroll"]');
+    expect(enroll.isVisible(), '禁用态的唯一出口就在这一行').toBe(true);
+    expect(enroll.text()).toBe('绑定 TOTP');
+    // 未绑定且没有邮件码 ⇒ 没有第二因素，红字照旧（迁移默认 true 不能假装“有因素”）。
+    expect(box.find('[data-test="mfa-no-factor"]').exists()).toBe(true);
+    // 邮件码那一位不受 TOTP 约制（#449 红线：不得因为 TOTP 把邮件码置灰）。
+    expect((box.get('[data-test="mail-otp-enabled"]').element as HTMLInputElement).disabled).toBe(false);
+    expect(box.find('[data-test="save-mail-otp"]').exists(), '未展开就没有块内按钮').toBe(false);
+    await box.get('[data-test="mail-otp-enabled"]').setValue(true);
+    expect(box.find('[data-test="mfa-no-factor"]').exists(), '勾上邮件码就有第二因素了').toBe(false);
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it('保存只带改动那一位（exact keys）；没改动时禁用且零请求', async () => {
+    const { wrapper, fetchFn, patches, panel } = await openMfaTab(true, false);
+    const box = panel();
+    const save = box.get('[data-test="save-mfa-settings"]');
+    expect((save.element as HTMLButtonElement).disabled, '刚打开时什么都没改 ⇒ 禁用').toBe(true);
+    await save.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')).toHaveLength(0);
+
+    // 只动 TOTP 那一位 ⇒ 只带 totp_login_enabled（不频带 mail_otp_enabled，也不夹带 display_name 等）。
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(false);
+    expect((save.element as HTMLButtonElement).disabled).toBe(false);
+    await save.trigger('click');
+    await flushPromises();
+    expect(patches).toEqual([{ totp_login_enabled: false }]);
+    expect(Object.keys(patches[0]).sort()).toEqual(['totp_login_enabled']);
+
+    // 只动邮件码 ⇒ 只带 mail_otp_enabled。
+    await box.get('[data-test="mail-otp-enabled"]').setValue(true);
+    await box.get('[data-test="save-mfa-settings"]').trigger('click');
+    await flushPromises();
+    expect(patches[1]).toEqual({ mail_otp_enabled: true });
+
+    // 两位一起改 ⇒ 两个键，仍然只有这两个键。
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(true);
+    await box.get('[data-test="mail-otp-enabled"]').setValue(false);
+    await box.get('[data-test="save-mfa-settings"]').trigger('click');
+    await flushPromises();
+    expect(Object.keys(patches[2]).sort()).toEqual(['mail_otp_enabled', 'totp_login_enabled']);
+    expect(patches).toHaveLength(3);
+    expect(box.text()).toContain('二次验证设置已保存');
+    wrapper.unmount();
+  });
+
+  it('保存请求在途 ⇒ 按钮禁用且再点不再发第二个请求（现有 mailOtpBusy 语义不回归）', async () => {
+    const { wrapper, fetchFn, panel } = await openMfaTab(true, false, true);
+    const box = panel();
+    await box.get('[data-test="mfa-totp-checkbox"]').setValue(false);
+    const save = box.get('[data-test="save-mfa-settings"]');
+    await save.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')).toHaveLength(1);
+    expect((save.element as HTMLButtonElement).disabled, '在途时必须禁用').toBe(true);
+    expect((box.get('[data-test="mfa-totp-checkbox"]').element as HTMLInputElement).disabled,
+      '在途时拨不动勾选框').toBe(true);
+    await save.trigger('click');
+    await box.get('[data-test="mfa-totp-checkbox"]').trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1'), '再点不排队').toHaveLength(1);
+    wrapper.unmount();
   });
 });
 
