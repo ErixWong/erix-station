@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
-import ToggleSwitch from '../components/ToggleSwitch.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
 import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
 import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider } from '../stores/admin';
@@ -1218,21 +1217,22 @@ onBeforeUnmount(() => {
         <section class="rounded-lg border border-black/10 p-3" data-test="file-upload-section">
           <h3 class="font-semibold">{{ t('admin.fde.fileUploadSection') }}</h3>
           <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.fileUploadHint') }}</p>
-          <!-- feat-261110-02：与邮件验证码同一控件、同一外观。三态判据一字未改：缺键 ⇒ 禁用 + 「未知」
-               文案 + 保存禁用（`fileUploadDraft` 那个写入面把「未知」读成未勾选，配合 disabled 不拿猜值提交）。 -->
-          <div class="mt-3 flex flex-wrap items-start gap-3">
-            <ToggleSwitch
+          <!-- 工单 feat-261110-03：控制件回到普通勾选框（用户的原话是「用checkbox吧，两个checkbox就行」）。
+               三态判据一字未改：缺键 ⇒ 勾选框禁用 + 「未知」文案 + 保存禁用（`fileUploadDraft` 那个写入面
+               把「未知」读成未勾选，配合 disabled 不拿猜值提交）。 -->
+          <label class="mt-3 flex items-start gap-2 text-sm">
+            <input
               v-model="fileUploadDraft"
-              :label="t('admin.fde.fileUploadEnabledLabel')"
+              type="checkbox"
+              data-test="edit-file-upload"
               :disabled="fileUploadUnknown || fileUploadBusy"
-              test-id="edit-file-upload"
-              class="mt-0.5"
-            />
-            <span class="text-sm">
+              class="mt-0.5 rounded border-black/20"
+            >
+            <span>
               {{ t('admin.fde.fileUploadEnabledLabel') }}
               <span class="block text-xs text-black/50">{{ t('admin.fde.fileUploadEnabledHint') }}</span>
             </span>
-          </div>
+          </label>
           <p v-if="fileUploadUnknown" class="mt-2 text-xs text-amber-700" role="status" data-test="file-upload-unknown">
             {{ t('admin.fde.fileUploadUnknown') }}
           </p>
@@ -1295,32 +1295,25 @@ onBeforeUnmount(() => {
         <section class="rounded-lg border border-black/10 p-3" data-test="mail-otp-section">
           <h3 class="font-semibold">{{ t('admin.fde.mailOtpSection') }}</h3>
           <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.mailOtpHint') }}</p>
-          <!-- feat-261110-02：开关从裸 `<input type=checkbox>` 换成 ToggleSwitch（用户的原话是「你这谁看了
-             会觉得自己这是在拨开关」）。左右各挂一句档位说明，并把**当前那一档**加粗、另一档压灰：
-             「现在是哪一档」不该靠颜色猜。**语义一字未动**——仍是「TOTP 或邮箱验证码任一通过即可」。 -->
-          <div class="mt-3 flex flex-wrap items-center gap-3">
-            <span
-              class="text-sm"
-              :class="editForm.mail_otp_enabled ? 'text-black/40' : 'font-medium text-black'"
-            >{{ t('admin.fde.mailOtpSwitchOff') }}</span>
-            <ToggleSwitch
+          <!-- 工单 feat-261110-03：这一格回到普通勾选框。**语义一字未动**——
+               仍是「TOTP 或邮箱验证码任一通过即可」，不是互斥、不清密钥。
+               #449 的红线仍在：`mailOtpBusy` 之外不得因 TOTP 置灰（置灰 = 死开关的旧形态）。 -->
+          <label class="mt-3 flex items-start gap-2 text-sm">
+            <input
               v-model="editForm.mail_otp_enabled"
-              :label="t('admin.fde.mailOtpSection')"
+              type="checkbox"
+              data-test="mail-otp-enabled"
               :disabled="mailOtpBusy"
-              test-id="mail-otp-enabled"
-            />
-            <span
-              class="text-sm"
-              :class="editForm.mail_otp_enabled ? 'font-medium text-black' : 'text-black/40'"
-            >{{ t('admin.fde.mailOtpSwitchOn') }}</span>
-          </div>
-          <p class="mt-2 text-sm text-black/65">
-            <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
-            {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
-            <span class="block text-xs text-black/50">
-              {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
+              class="mt-0.5 rounded border-black/20"
+            >
+            <span>
+              <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
+              {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
+              <span class="block text-xs text-black/50">
+                {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
+              </span>
             </span>
-          </p>
+          </label>
           <p v-if="editUser.email" class="mt-2 text-xs text-black/50">
             {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
           </p>

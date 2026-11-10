@@ -100,6 +100,11 @@ function callsTo(fetchFn: ReturnType<typeof fetchMock>, method: string, path: st
   return fetchFn.mock.calls.filter(([url, init]) => String(url) === path && init?.method === method);
 }
 
+/** feat-261110-03：控制件是原生勾选框 ⇒ 「有没有勾上」的事实住在 `.checked` 上。 */
+function isChecked(wrapper: { element: Element }): boolean {
+  return (wrapper.element as HTMLInputElement).checked;
+}
+
 beforeEach(() => {
   localStorage.clear();
   setLocale('zh-CN');
@@ -1697,13 +1702,14 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     expect(section.text()).toContain('邮件验证码');
 
     const checkbox = section.get('[data-test="mail-otp-enabled"]');
-    // feat-261110-02：这一格从裸 checkbox 换成了 ToggleSwitch（`<button role="switch">`）
-    // ⇒ **只换驱动方式**（读 aria-checked、用 click 拨档），断言语义一条没删。
-    expect(checkbox.attributes('role'), '开关本体必须是 switch').toBe('switch');
-    expect(checkbox.attributes('aria-checked'), 'DTO 里是 false').toBe('false');
+    // feat-261110-03：控制件是原生勾选框（上一版的 ToggleSwitch 已按用户要求退场）
+    // ⇒ **只换驱动方式**（读 `.checked`、用 setValue 拨），断言语义一条没删。
+    expect(checkbox.attributes('type'), '必须是原生 checkbox').toBe('checkbox');
+    expect(checkbox.attributes('role'), '不得再是自实现的 switch').toBeUndefined();
+    expect(isChecked(checkbox), 'DTO 里是 false').toBe(false);
 
-    await checkbox.trigger('click');
-    expect(checkbox.attributes('aria-checked'), '拨一下必须当场换档').toBe('true');
+    await checkbox.setValue(true);
+    expect(isChecked(checkbox), '勾上必须当场生效').toBe(true);
     await section.get('[data-test="save-mail-otp"]').trigger('click');
     await flushPromises();
 
@@ -1756,13 +1762,11 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
   }
 
   const isDisabled = (w: { element: Element }) => (w.element as HTMLButtonElement | HTMLInputElement).disabled;
-  /** feat-261110-02：开关换成 ToggleSwitch 后，「有没有勾上」的事实从 `.checked` 搬到 `aria-checked`。 */
-  const isOn = (w: { attributes: (name: string) => string | undefined }) => w.attributes('aria-checked') === 'true';
 
   it('DTO=true ⇒ 勾选且可编辑，无「未知」提示，保存可用（A-8 之一）', async () => {
     const { wrapper, section } = await openSecurity(true);
     const box = section().get('[data-test="edit-file-upload"]');
-    expect(isOn(box)).toBe(true);
+    expect(isChecked(box)).toBe(true);
     expect(isDisabled(box)).toBe(false);
     expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(false);
     expect(isDisabled(section().get('[data-test="save-file-upload"]'))).toBe(false);
@@ -1775,7 +1779,7 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
   it('DTO=false ⇒ 未勾选但可编辑，无「未知」提示，保存可用（A-8 之二）', async () => {
     const { wrapper, section } = await openSecurity(false);
     const box = section().get('[data-test="edit-file-upload"]');
-    expect(isOn(box)).toBe(false);
+    expect(isChecked(box)).toBe(false);
     expect(isDisabled(box)).toBe(false);
     expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(false);
     expect(isDisabled(section().get('[data-test="save-file-upload"]'))).toBe(false);
@@ -1807,7 +1811,7 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
     expect(patches).toHaveLength(1);
     expect(patches[0].body).toEqual({ file_upload_enabled: true });
     // 服务端回读后勾选框对齐（不是只改本地）
-    expect(isOn(section().get('[data-test="edit-file-upload"]'))).toBe(true);
+    expect(isChecked(section().get('[data-test="edit-file-upload"]'))).toBe(true);
     expect(section().text()).toContain('已保存');
     wrapper.unmount();
   });
