@@ -1,6 +1,6 @@
 # 会话状态模型：三层生命周期与 session-scoped transcript（issue #77）
 
-> 状态：**设计定稿待实施**（决策者 2026-09-24 授权，全权推进）。
+> 状态：**已实施**（2026-11-10 复核：`chat_sessions` + `transcript_rounds` 在生产库、`appendUserTurn` 在写侧、P1 的 `archiveRunData`/`sweepRunDataDir` 在 `runner/lib/run-data.js`）。**逐阶段状态看 §5 那张表**——那里是唯一真相（P2 已实施、P3 的 PR①②a②b③ 已完成、仅剩 ②c 残留数据收敛）。
 > 依据：`design/principles.md`（不变式 3「DB 是状态真相」、D8「隔离单元 = worktree」）、
 > `design/runner-integration.md`（erix-agent `runToolLoop`/`TranscriptStore` 锚点）、
 > issue #64（产物回收）/ #69（历史注入，过渡方案）/ #70（已合并的第一版注入）。
