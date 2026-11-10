@@ -7,8 +7,8 @@
 // 另覆盖：空态文案（「先创建目录」/「暂无会话」）、会话点击 emit 语义保持。
 // issue #332：这里原有「平台管理员提示 + 进入管理台链接」的空态分支已随**入口拦截**拆除（`admin && !fde_name` 的人被路由守卫送去 /admin，走不到工作台）；本文件里的 admin 夹具因此换成第 ② 类人（admin **且**有 fde_name）——他才是能站上工作台的管理员。
 // store 状态直填、fetch 桩掉（不碰真实后端）；路由用 memory-history 的真实 router（router-link 渲染需要）。
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushPromises, mount } from '@vue/test-utils';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory } from 'vue-router';
 import SidebarPanel from './SidebarPanel.vue';
@@ -20,6 +20,10 @@ import { useSiteStore } from '../stores/site';
 import { useWorkbenchStore } from '../stores/workbench';
 import type { DirInfo, Session } from '../stores/workbench';
 import { i18n, setLocale } from '../i18n';
+
+// issue #488：本文件新增的「隐藏」用例统一自动卸载（AGENTS §4 / #473：不留残留 wrapper）。
+// 既有用例里的 `finally { wrapper.unmount() }` 与它共存无害（重复卸载 Vue 只给一条告警）。
+enableAutoUnmount(afterEach);
 
 beforeEach(() => {
   // issue #101 P2：装配真实 i18n 单例（不 mock t()），每例重置为 zh-CN（既有中文断言逐字不变）。
@@ -1246,5 +1250,271 @@ describe('SidebarPanel · files-changed 透传（issue #472）', () => {
     expect(wrapper.emitted('files-changed')).toHaveLength(1);
     const urls = vi.mocked(fetch).mock.calls.map(([u]) => (typeof u === 'string' ? u : u instanceof URL ? u.href : u.url));
     expect(urls.some((u) => u.startsWith('/api/git-light')), '侧栏不该越过视图去拉收工灯').toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #488：会话行第三颗 hover 图标「隐藏」（调已存在的 DELETE /api/sessions/:id）。
+//   工单 §六 的七条判据在本文件里的落点（store 侧的 D4「旧结论被清」在 stores/workbench.spec.ts）：
+//     1 确认前 DELETE 数 = 0；确认后只发一发，且 URL 是被点那一行（+ 重复点确认不重发）
+//     2 成功后该行消失，且**不发** GET /api/sessions 整表刷新（成本红线）
+//     4 409 run_in_progress ⇒ 行不消失 + 母语提示点名出路
+//     5 其它失败（500）⇒ 行不消失 + 错误可见（不静默）
+//     6 确认态按行分槽（A 行确认中 ⇒ B 行不显示确认）
+//     7 界面文案里不出现「删除 / delete」（D1 的反向判据，双语各扫一遍）
+//   再加：与既有两颗同规格的几何约束（§五.1：shrink-0 + 标题仍 truncate）、@click.stop 不误触选中。
+// 后端本片零改动 ⇒ fetch 桩就是契约（成功 204 空体，**204 不能带 body**）。
+// ---------------------------------------------------------------------------
+describe('SidebarPanel · 会话隐藏（issue #488）', () => {
+  const DIR: DirInfo[] = [{ name: 'a', cwd: '~/projects/a', running_count: 0, queued_count: 0 }];
+
+  /**
+   * fetch 桩：DELETE 按给定结果回（204 走空体，否则 Response 构造函数直接报错），其余请求回空列表。
+   * 只记录 method/url —— 后面所有「请求数」判据都读 `calls`，不读 spy（计数形状要自己可控）。
+   */
+  function stubFetch(deleteResult: { status: number; body?: unknown } | (() => Promise<Response>)) {
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method });
+      if (method !== 'DELETE') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (typeof deleteResult === 'function') return deleteResult();
+      if (deleteResult.status === 204 || deleteResult.body === undefined) return new Response(null, { status: 204 });
+      return new Response(JSON.stringify(deleteResult.body), { status: deleteResult.status, headers: { 'Content-Type': 'application/json' } });
+    }));
+    return calls;
+  }
+
+  const rows = (wrapper: Awaited<ReturnType<typeof mountPanel>>) =>
+    Array.from(paneEls(wrapper).list.querySelectorAll<HTMLElement>('[data-session-row]'));
+  const rowByText = (wrapper: Awaited<ReturnType<typeof mountPanel>>, text: string) =>
+    rows(wrapper).find((r) => r.textContent?.includes(text));
+  const deleteCalls = (calls: Array<{ url: string; method: string }>) => calls.filter((c) => c.method === 'DELETE');
+
+  it('第三颗浮现图标：与既有两颗同规格（24px / 5px 圆角 / 细边框 / hover 浮现），图标是 eye-off 而不是垃圾桶', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const btn = wrapper.get('[data-test="sidebar-hide"]');
+    // 界面上只有「隐藏」：title / aria-label 逐字就是那两个字（D1）
+    expect(btn.attributes('title')).toBe('隐藏');
+    expect(btn.attributes('aria-label')).toBe('隐藏');
+    expect(btn.text()).toBe(''); // 纯图标，无文本
+    for (const cls of ['h-6', 'w-6', 'shrink-0', 'rounded-[5px]', 'border-black/15', 'bg-white', 'hover:bg-black/10']) {
+      expect(btn.classes(), cls).toContain(cls);
+    }
+    // 浮现逻辑与两颗既有按钮逐字一致（默认隐藏，hover / 键盘焦点才现）
+    expect(btn.classes()).toContain('opacity-0');
+    expect(btn.classes()).toContain('group-hover:opacity-100');
+    expect(btn.classes()).toContain('focus-visible:opacity-100');
+    const svg = btn.get('svg');
+    for (const [k, v] of Object.entries({ fill: 'none', stroke: 'currentColor', 'stroke-width': '2', viewBox: '0 0 24 24', 'aria-hidden': 'true' })) {
+      expect(svg.attributes(k), k).toBe(v);
+    }
+    // 三颗图标同在（宽度是硬约束 ⇒ 三颗都只能 shrink-0，标题继续 truncate）
+    expect(wrapper.findAll('[data-test="sidebar-hide"]')).toHaveLength(1);
+    const title = rowByText(wrapper, '旧名')!.querySelector('span.truncate')!;
+    expect(title.textContent).toBe('旧名');
+  });
+
+  it('点隐藏**只进确认态**：确认前 DELETE 请求数 = 0（D3），确认文案必须写明「找不回来」的后果（D2）', async () => {
+    const onSelectSession = vi.fn();
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] }, { onSelectSession });
+    const calls = stubFetch({ status: 204 });
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await flushPromises();
+
+    expect(deleteCalls(calls)).toHaveLength(0); // ← 本片最硬的时序判据：确认前一请求不发
+    expect(onSelectSession).not.toHaveBeenCalled(); // @click.stop：点隐藏不得误触「选中会话」
+    // 确认态在场，且 D2 的后果文案逐字可见
+    expect(wrapper.get('[data-test="sidebar-hide-question"]').text()).toBe('隐藏这个会话？');
+    const note = wrapper.get('[data-test="sidebar-hide-note"]').text();
+    expect(note).toContain('不会再出现在列表');
+    expect(note).toContain('找不回来');
+    expect(note).toContain('联系管理员');
+    // 确认态原地出现两颗小按钮（形态 (a)），而不是叠在旁边把行撑宽
+    const ok = wrapper.get('[data-test="sidebar-hide-confirm"]');
+    expect(ok.classes()).toContain('shrink-0');
+    expect(wrapper.find('[data-test="sidebar-hide-cancel"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="sidebar-hide"]').exists()).toBe(false);
+    expect(wrapper.find('button[aria-label="重命名"]').exists()).toBe(false);
+    expect(wrapper.find('button[aria-label="AI 改名"]').exists()).toBe(false);
+  });
+
+  it('确认后只发一发 DELETE（那一行）⇒ 行从列表消失，且**不发** GET /api/sessions 整表刷新', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '被隐藏的' }, { id: '8', title: '另一条' }] });
+    const store = useWorkbenchStore();
+    const calls = stubFetch({ status: 204 });
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+
+    expect(deleteCalls(calls)).toEqual([{ url: '/api/sessions/7', method: 'DELETE' }]); // 只有一发，URL = 被点那一行
+    expect(calls.filter((c) => c.method === 'GET' && c.url.startsWith('/api/sessions'))).toHaveLength(0); // 成本红线
+    expect(store.sessions.map((s) => s.id)).toEqual(['8']);
+    expect(rowByText(wrapper, '被隐藏的')).toBeUndefined(); // 行从列表消失
+    expect(rowByText(wrapper, '另一条')).toBeDefined(); // 其它行不受影响
+    expect(wrapper.text()).not.toContain('隐藏这个会话'); // 确认态已收起
+  });
+
+  it('确认按钮重复点击不重发请求（在飞期间禁用 + 守卫）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    let release!: (r: Response) => void;
+    stubFetch(() => new Promise<Response>((res) => { release = res; }));
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+    const okBtn = wrapper.get('[data-test="sidebar-hide-confirm"]').element as HTMLButtonElement;
+    expect(okBtn.disabled).toBe(true); // 在飞：禁用（也挡掉第二次点击）
+    expect(wrapper.get('[data-test="sidebar-hide-confirm"]').attributes('title')).toBe('隐藏中…');
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+
+    release(new Response(null, { status: 204 }));
+    await flushPromises();
+    const urls = vi.mocked(fetch).mock.calls.map(([u, i]) => `${String(u)} ${i?.method ?? 'GET'}`);
+    expect(urls.filter((u) => u.endsWith('DELETE'))).toEqual(['/api/sessions/7 DELETE']);
+  });
+
+  it('取消：不发任何 DELETE、退出确认态、行仍在（可重新来一遍）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    const calls = stubFetch({ status: 204 });
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await wrapper.get('[data-test="sidebar-hide-cancel"]').trigger('click');
+    await flushPromises();
+
+    expect(deleteCalls(calls)).toHaveLength(0);
+    expect(wrapper.find('[data-test="sidebar-hide-confirm"]').exists()).toBe(false);
+    expect(rowByText(wrapper, '旧名')).toBeDefined();
+    expect(store.sessions).toHaveLength(1);
+    // 收起后三颗图标回到原位（可重试）
+    expect(wrapper.find('[data-test="sidebar-hide"]').exists()).toBe(true);
+  });
+
+  it('确认态**按行分槽**：A 行确认中，B 行不许显示确认（也不许被禁用）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '甲会话' }, { id: '8', title: '乙会话' }] });
+    stubFetch({ status: 204 });
+
+    const rowA = () => rowByText(wrapper, '甲会话')!;
+    const rowB = () => rowByText(wrapper, '乙会话')!;
+    expect(rowA().querySelector('[data-test="sidebar-hide"]')).not.toBeNull();
+
+    // 只点 A 的隐藏
+    (rowA().querySelector('[data-test="sidebar-hide"]') as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flushPromises();
+
+    expect(rowA().querySelector('[data-test="sidebar-hide-confirm"]')).not.toBeNull();
+    expect(rowA().querySelector('[data-test="sidebar-hide-question"]')).not.toBeNull();
+    // B 行逐字不变：没确认按钮、没确认文案、自己的隐藏图标还在且没被禁用
+    expect(rowB().querySelector('[data-test="sidebar-hide-confirm"]')).toBeNull();
+    expect(rowB().querySelector('[data-test="sidebar-hide-question"]')).toBeNull();
+    const bHide = rowB().querySelector('[data-test="sidebar-hide"]') as HTMLButtonElement;
+    expect(bHide).not.toBeNull();
+    expect(bHide.disabled).toBe(false);
+
+    // 改确认 B：槽位跟过去，A 行退回普通态（全局单例布尔会把两行同时点亮）
+    (rowB().querySelector('[data-test="sidebar-hide"]') as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flushPromises();
+    expect(rowB().querySelector('[data-test="sidebar-hide-confirm"]')).not.toBeNull();
+    expect(rowA().querySelector('[data-test="sidebar-hide-confirm"]')).toBeNull();
+    expect(rowA().querySelector('[data-test="sidebar-hide"]')).not.toBeNull();
+  });
+
+  it('409 run_in_progress ⇒ 行不消失 + 母语提示点名出路（文案里带「停止」）（D5）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '还在跑的会话' }] });
+    const store = useWorkbenchStore();
+    const calls = stubFetch({ status: 409, body: { error: { code: 'run_in_progress', message: 'session has an active run' } } });
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+
+    expect(deleteCalls(calls)).toHaveLength(1);
+    expect(store.sessions).toHaveLength(1);
+    expect(rowByText(wrapper, '还在跑的会话')).toBeDefined(); // 行不消失（可原地重试）
+    const alert = wrapper.get('[role="alert"]');
+    expect(alert.classes()).toContain('syserr'); // 沿用既有行内错误形状，不新增 UI 结构
+    expect(alert.text()).toBe('这个会话还有任务在跑，先停止再隐藏。'); // 母语 + 点名出路
+    expect(wrapper.text()).not.toContain('session has an active run'); // 409 不把英文原文顶到脸上
+  });
+
+  it('其它失败（500）⇒ 行不消失 + 错误可见（本地化前缀 + 服务端 message 原样，不静默）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    const store = useWorkbenchStore();
+    stubFetch({ status: 500, body: { error: { code: 'internal', message: 'db down' } } });
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+
+    expect(store.sessions).toHaveLength(1);
+    expect(rowByText(wrapper, '旧名')).toBeDefined();
+    const alert = wrapper.get('[role="alert"]');
+    expect(alert.classes()).toContain('syserr');
+    expect(alert.text()).toBe('隐藏失败：db down');
+    // 脏值面：不许渗 undefined / [object Object] / NaN
+    expect(wrapper.text()).not.toMatch(/undefined|\[object Object\]|NaN/);
+  });
+
+  it('隐藏**当前会话**的接线：确认后 store.sessionId 归空（D4 在侧栏这一环真的接上了）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '正看着的' }] });
+    const store = useWorkbenchStore();
+    store.sessionId = '7';
+    stubFetch({ status: 204 });
+
+    await wrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+
+    expect(store.sessionId).toBeNull();
+    expect(wrapper.text()).not.toContain('正看着的');
+  });
+
+  it('D1 反向判据：整棵侧栏（zh / en 两态）的文本与 title/aria-label 里不出现「删除 / delete」', async () => {
+    const NO_DELETE = /删除|delet/i; // delete / deleted / deletion 全都算
+    const probe = (wrapper: Awaited<ReturnType<typeof mountPanel>>, where: string) => {
+      expect(wrapper.text(), where).not.toMatch(NO_DELETE);
+      const labels = wrapper.findAll('*')
+        .map((n) => `${n.attributes('title') ?? ''}|${n.attributes('aria-label') ?? ''}`)
+        .filter((s) => s !== '|');
+      expect(labels.filter((s) => NO_DELETE.test(s)), where).toEqual([]);
+    };
+
+    const zhWrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: '旧名' }] });
+    probe(zhWrapper, 'zh 常态');
+    await zhWrapper.get('[data-test="sidebar-hide"]').trigger('click');
+    await flushPromises();
+    probe(zhWrapper, 'zh 确认态');
+
+    setLocale('en');
+    await flushPromises();
+    probe(zhWrapper, 'en 确认态');
+    expect(zhWrapper.get('[data-test="sidebar-hide-cancel"]').attributes('aria-label')).toBe('Cancel');
+  });
+
+  it('i18n：切 English 后隐藏入口的 title/aria-label 与确认文案对译（无硬编码中文）', async () => {
+    const wrapper = await mountPanel({ dirs: DIR, sessions: [{ id: '7', title: 'old name' }] });
+    stubFetch({ status: 409, body: { error: { code: 'run_in_progress', message: 'session has an active run' } } });
+    setLocale('en');
+    await flushPromises();
+
+    const btn = wrapper.get('[data-test="sidebar-hide"]');
+    expect(btn.attributes('title')).toBe('Hide');
+    expect(btn.attributes('aria-label')).toBe('Hide');
+    await btn.trigger('click');
+    expect(wrapper.get('[data-test="sidebar-hide-question"]').text()).toBe('Hide this session?');
+    expect(wrapper.get('[data-test="sidebar-hide-note"]').text()).toContain('contact your administrator');
+
+    await wrapper.get('[data-test="sidebar-hide-confirm"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('[role="alert"]').text()).toBe('This session still has a run in progress — stop it first, then hide it.');
+    expect(wrapper.text()).not.toContain('这个会话');
   });
 });
