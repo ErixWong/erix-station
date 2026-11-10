@@ -3114,13 +3114,28 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
 }
 
 /**
- * 二选一分支（issue #449，portal.md §2.2）：已绑 TOTP + `mail_otp_enabled` + 有邮箱 ⇒ 第一步同时给出
- * **TOTP 与邮箱验证码两条路**，共用同一枚 `pending_token`（单次消费 ⇒ 谁先成功谁建会话，另一条自然失效）。
+ * 二选一分支（issue #449 + #449 尾巴「懒发信」，portal.md §2.2）：已绑 TOTP + `mail_otp_enabled` + 有邮箱
+ * ⇒ 第一步同时给出 **TOTP 与邮箱验证码两条路**，共用同一枚 `pending_token`（单次消费 ⇒ 谁先成功谁建会话，
+ * 另一条自然失效）。
  *
- * 与 `handleEmailCodeRequired` 的关键差别：**发信是尽力而为**。
- *   SMTP 不可用 / 被发信频控 / 发信失败 ⇒ `200` + `methods:["totp"]` + `email_sent:false` + `email_unavailable:true`，
- *   **绝不 503**（TOTP 离线可用，让它输于 SMTP 抖动比现状更糟）；此时库里不落码行，用户可随时
- *   `POST /api/auth/login/email-code/resend` 重试发信（`recordResend` 零行 = 首次发信重试）。
+ * **懒发信（2026-11-10 用户反馈）**：本分支**第一步一封邮件都不发**。旧行为是「口令一通过就发信」，
+ * 于是每次登录都寄一封没人要的验证码（用户两天收了 7 封）。现在码子的第一封由**前端切到邮箱档那一刻**
+ * 调 §2.3b 的 resend 端点发出 —— `recordResend` 本来就支持「该 pending 下零码行 ⇒ 当首次发信」且不套
+ * 60s 冷却，所以懒发信不需要新端点、也不改 `login-email-code.js` 一个字。
+ *
+ * 但第一步仍要**预判这条通道当下可用**，否则用户切过去才撞错：
+ *   ① `mailer.enabled !== true`（SMTP 未配置 / 急停）；② `email:<ip>` 的发信限流当下不允许。
+ * `check()` 是**非消费型**预检，真正计数仍在 resend 端点里的 `recordFailure`。
+ * 两种不可用都走 #449 既有的降级形状（不新造错误码）：`200` + `methods:["totp"]` + `email_sent:false` +
+ * `email_unavailable:true` + `notice`，**绝不 503**（TOTP 离线可用，让它输于 SMTP 抖动比现状更糟）。
+ *
+ * ⚠ 成功形状**不带 `email_sent`**：那条降级的判据是 `email_sent:false`，而「还没发」不等于「不可用」——
+ * 用**缺席**表达「还没发」，并用 `email_deferred:true` 明示「这条路可走，但码要等你切过来才发」。
+ * 既然什么都没尝试过，就**不写** `auth.email_code_failed` 审计（写失败审计是假账）；只有真的判定了
+ * 「邮件通道不可用」才留审计痕（运维要能查到为什么这个人只有一条路）。
+ *
+ * 与 `handleEmailCodeRequired` 的关键差别：那边邮件码是**唯一**第二因素 ⇒ 第一步就发信、发不出去就 503；
+ * 这边只是**多给一条路** ⇒ 不发信、且永不因邮件而失败。
  * `expires_in` 与邮件码路径同口径 `max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`：两路共用一枚
  * pending，取短的那个会让先到的邮件码比 TOTP 窗口还短，没有理由这么于。
  */
@@ -3128,62 +3143,26 @@ async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer
   const { pool, config } = ctx;
   const policy = emailCodePolicy(config);
   const pendingTtlSeconds = Math.max(config.pendingTokenTtlSeconds ?? 120, policy.ttlSeconds);
+  // pending 是两条路共同的入口：它建不成才是真错误（发信与它无关了）。
   const pending = await auth.createPendingToken(pool, user.id, {
     ip,
     userAgent: req.headers['user-agent'] ?? null,
     ttlSeconds: pendingTtlSeconds,
   });
 
-  // 先建 pending 再发信：pending 是两条路共同的入口，发信失败不能让人连 TOTP 都用不上。
+  // 非消费型预检（见函数头）：不占配额、不计数，只回答「现在切过去发得出信吗」。
   const sendKey = `email:${ip}`;
-  const sendCheck = ctx.emailSendLimiter.check(sendKey);
-  let sent = { ok: false, reason: 'rate_limited' };
-  if (sendCheck.allowed) {
-    const code = loginEmailCode.generateEmailCode();
-    // 与 `handleEmailCodeRequired` 同一顺序契约：**先发信、成功后才落库**（发信失败不留库脏行、
-    // 也不给用户手上不存在的码）。
-    sent = await mailer.send({ to: email, ...emailCodeMessage(code, policy.ttlSeconds) });
-    if (sent.ok) {
-      ctx.emailSendLimiter.recordFailure(sendKey); // 发信计数（限流器只有这一个计数入口）
-      const now = new Date();
-      const created = await loginEmailCode.createEmailCode(pool, {
-        pendingTokenHash: pending.tokenHash,
-        code,
-        ttlSeconds: policy.ttlSeconds,
-        maxAttempts: policy.maxAttempts,
-        ip,
-        userAgent: req.headers['user-agent'] ?? null,
-        now,
-      });
-      await loginEmailCode.invalidateOtherCodes(pool, {
-        pendingTokenHash: pending.tokenHash,
-        keepCodeHash: created.codeHash,
-        now,
-      });
-      await auth.audit(pool, {
-        actorId: user.id,
-        action: 'auth.email_code_sent',
-        target: user.login,
-        details: {
-          login: user.login,
-          email_hint: maskEmail(email),
-          code_hash_prefix: created.codeHash.slice(0, 12),
-          expires_at: created.expiresAt.toISOString(),
-          at: now.toISOString(),
-        },
-      }).catch(() => {});
-    }
-  }
-
-  if (!sent.ok) {
-    // 审计留痕：邮件路不可用不是静默失败（运维能查到原因，但不影响登录）。
+  const emailUnavailable = mailer.enabled !== true || !ctx.emailSendLimiter.check(sendKey).allowed;
+  if (emailUnavailable) {
+    const reason = mailer.enabled !== true ? 'email_channel_disabled' : 'rate_limited';
+    // 审计留痕：这条通道的不可用不是静默失败（运维能查到原因，但不影响登录）。
     await auth.audit(pool, {
       actorId: user.id,
       action: 'auth.email_code_failed',
       target: user.login,
       details: {
         login: user.login,
-        reason: sent.reason ?? 'send_failed',
+        reason,
         second_factor_choice: true,
         at: new Date().toISOString(),
       },
@@ -3200,13 +3179,14 @@ async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer
     });
   }
 
+  // 懒发信：这里**没有** `mailer.send`、没有码行、没有 `email_sent` 键（缺席 = 还没发）。
   return sendJson(res, 200, {
     status: 'second_factor_choice',
     pending_token: pending.token,
     expires_in: pendingTtlSeconds,
     methods: ['totp', 'email_code'],
     email_hint: maskEmail(email),
-    email_sent: true,
+    email_deferred: true,
   });
 }
 

@@ -2,6 +2,7 @@
 // 语义对照 portal/static/index.html renderLogin()/boot()。
 // issue #449：新增邮箱验证码通道（factor='email'，portal.md §2.2/§2.3a/§2.3b）的用例。
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest';
+import { nextTick } from 'vue';
 import { setActivePinia, createPinia } from 'pinia';
 import { useAuthStore, afterLoginRoute } from './auth';
 // issue #431：登出/会话过期必须触发「本轮用户结束」信号（收口三颗登出按钮）
@@ -582,7 +583,10 @@ describe('#449 second_factor_choice（二选一）', () => {
   });
 
   it('switchFactor：只改 factor；pendingToken / emailHint / 冷却一律不动（切换不重新登录、不重新发码）', async () => {
-    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, CHOICE)));
+    // 本用例故意用 `email_sent: true`（旧后端形状：第一步真发了信）⇒ `emailSent` 已是 true
+    // ⇒ 切换**不该**再发一封信（feat-261110-01：已发过就别为一次切换白寄）。懒发信另有一组用例。
+    const fetchFn = fetchMock(() => jsonResponse(200, CHOICE));
+    vi.stubGlobal('fetch', fetchFn);
     const auth = useAuthStore();
     await auth.login('alice', 'secret');
     auth.cooldownSeconds = 42;
@@ -597,6 +601,10 @@ describe('#449 second_factor_choice（二选一）', () => {
     auth.switchFactor('totp'); // 可逆
     expect(auth.factor).toBe('totp');
     expect(auth.pendingToken).toBe('ptok-choice');
+
+    const urls = fetchFn.mock.calls.map(([url]) => String(url));
+    expect(urls.filter((u) => u === '/api/auth/login'), '两个方向都不重新登录').toHaveLength(1);
+    expect(urls.filter((u) => u.includes('/email-code/resend')), '已有码 ⇒ 一个 resend 也不发').toHaveLength(0);
   });
 
   it('单一通道（totp_required / email_code_required）⇒ switchFactor 空操作（不把用户切进一条进不了的路）', async () => {
@@ -626,6 +634,222 @@ describe('#449 second_factor_choice（二选一）', () => {
     expect(auth.factor).toBeNull();
     expect(auth.choiceMethods).toEqual([]);
     expect(auth.emailUnavailable).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 工单 feat-261110-01：**懒发信**。第一步不发信 ⇒ `email_deferred` 那条**不得**被当成「邮箱不可用」，
+// 而第一封由「切到邮箱档」那一刻发出（走既有 §2.3b resend 端点，不复制第二份请求代码）。
+// ---------------------------------------------------------------------------
+
+describe('feat-261110-01 懒发信：切到邮箱档才发第一封', () => {
+  // 后端真实形状（M1）：**没有 `email_sent` 键**，只有 `email_deferred: true`。
+  const DEFERRED = {
+    status: 'second_factor_choice',
+    pending_token: 'ptok-choice',
+    expires_in: 600,
+    methods: ['totp', 'email_code'],
+    email_hint: 'e***@i***.com',
+    email_deferred: true,
+  };
+
+  /** 第一步回懒发信形状，并记录每个 URL（resend 次数是本组用例的主判据）。 */
+  function deferredFetch(resend: () => Response | Promise<Response> = () => jsonResponse(200, { expires_in: 600, resend_after: 60 })) {
+    const fetchFn = fetchMock((url) => (
+      url.includes('/api/auth/login/email-code/resend') ? resend() : jsonResponse(200, DEFERRED)
+    ));
+    vi.stubGlobal('fetch', fetchFn);
+    return fetchFn;
+  }
+
+  const resendCalls = (fetchFn: ReturnType<typeof deferredFetch>) =>
+    fetchFn.mock.calls.filter(([url]) => String(url).includes('/api/auth/login/email-code/resend'));
+
+  it('email_deferred 不得被误判成「不可用」：两条通道都在、emailSent=false、默认 totp', async () => {
+    deferredFetch();
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    expect(auth.emailUnavailable, '「还没发」不是「不可用」（判据仍是 email_sent===false || email_unavailable===true）').toBe(false);
+    expect(auth.choiceMethods).toEqual(['totp', 'email']);
+    expect(auth.factor).toBe('totp');
+    expect(auth.emailSent, '第一步没发信 ⇒ 手上没码').toBe(false);
+  });
+
+  it('第一步零发信：登录本身一个 resend 也不打', async () => {
+    const fetchFn = deferredFetch();
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    expect(resendCalls(fetchFn)).toHaveLength(0);
+  });
+
+  it('切到邮箱档 ⇒ 恰好一次 resend（带手上这枚 pending），成功后 emailSent=true 并落冷却', async () => {
+    const fetchFn = deferredFetch();
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+
+    auth.switchFactor('email');
+    await vi.waitFor(() => expect(auth.emailSent).toBe(true));
+
+    const calls = resendCalls(fetchFn);
+    expect(calls).toHaveLength(1);
+    expect(String(calls[0][0])).toBe('/api/auth/login/email-code/resend');
+    expect(JSON.parse(String(calls[0][1]?.body))).toEqual({ pending_token: 'ptok-choice' });
+    expect(auth.factor).toBe('email');
+    expect(auth.pendingToken, '第一封不换令牌').toBe('ptok-choice');
+    expect(auth.cooldownSeconds).toBe(60);
+    expect(auth.error).toBeNull();
+  });
+
+  it('切回 totp 零请求；再切回邮箱档也不再发（emailSent 已 true）', async () => {
+    const fetchFn = deferredFetch();
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+
+    auth.switchFactor('email');
+    await vi.waitFor(() => expect(auth.emailSent).toBe(true));
+    expect(resendCalls(fetchFn)).toHaveLength(1);
+
+    auth.switchFactor('totp');
+    await Promise.resolve();
+    expect(resendCalls(fetchFn), '切回 TOTP 绝不发信').toHaveLength(1);
+
+    auth.switchFactor('email');
+    await Promise.resolve();
+    expect(resendCalls(fetchFn), '已有码 ⇒ 反复切档不反复寄信').toHaveLength(1);
+    expect(auth.factor).toBe('email');
+  });
+
+  it('直接连续调 requestEmailCode 也只发一封（`emailSending` 这道重入门必须有主）', async () => {
+    // 为什么单独一条：从 `switchFactor` 走进来时，`switchFactor` 自己的 guard 已经先挡住第二次，
+    // 于是 `requestEmailCode` 里那半句 `|| this.emailSending` 在切档路径上**永远到不了**
+    //（变异实验实证：删掉它，全部用例照旧全绿）。只有直接调用才打得到它——而它挡的是
+    // 「将来任何直接调这个 action 的入口」，不能是一条没人测过的死代码。
+    let release: (() => void) | null = null;
+    const fetchFn = deferredFetch(() => new Promise<Response>((resolve) => {
+      release = () => resolve(jsonResponse(200, { expires_in: 600, resend_after: 60 }));
+    }));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+    auth.factor = 'email';
+
+    const first = auth.requestEmailCode();
+    const second = auth.requestEmailCode(); // 第一封还在飞 ⇒ 必须直接返回
+    expect(auth.emailSending).toBe(true);
+    release!(); // ⚠ 先放掉在飞的那一封再 await：反过来就是自己等自己（5s 超时）
+    await Promise.all([first, second]);
+
+    expect(resendCalls(fetchFn), '在飞期间的第二次调用不得再发一封').toHaveLength(1);
+    expect(auth.emailSent).toBe(true);
+  });
+
+  it('发信中重复切档不重入（switchFactor 与 requestEmailCode 两道门都算）', async () => {
+    let release: (() => void) | null = null;
+    const fetchFn = deferredFetch(() => new Promise<Response>((resolve) => {
+      release = () => resolve(jsonResponse(200, { expires_in: 600, resend_after: 60 }));
+    }));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+
+    auth.switchFactor('email');
+    await nextTick();
+    expect(auth.emailSending, '请求在飞 ⇒ 正在发信旗标置上（UI 据此禁用输入与 switch）').toBe(true);
+
+    auth.switchFactor('totp');
+    auth.switchFactor('email');
+    await nextTick();
+    expect(resendCalls(fetchFn), '在飞期间再切两次也不多发').toHaveLength(1);
+
+    release!();
+    await vi.waitFor(() => expect(auth.emailSending).toBe(false));
+    expect(auth.emailSent).toBe(true);
+  });
+
+  it('第一封失败后切回 TOTP ⇒ 零新增请求（「切回」这个方向本身永不发信）', async () => {
+    // 变异实验实证：把 `switchFactor` 里的 `factor === 'email'` 判据删掉（= 切回 TOTP 也去发信）
+    // 原本全绿——因为既有测试只在 `emailSent=true` 之后才切回，那时无论怎么写都发不出东西。
+    // 只有在**手上还没码**的时候切回，才分辨得出「只在切到邮箱档时发」与「随便切都发」。
+    const fetchFn = deferredFetch(() => jsonResponse(503, {
+      error: { code: 'email_send_failed', message: '验证码邮件发送失败，请稍后重试', retryable: true },
+    }, { 'Retry-After': '5' }));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+
+    auth.switchFactor('email');
+    await vi.waitFor(() => expect(auth.emailSending).toBe(false));
+    expect(auth.emailSent, '夹具：第一封失败了 ⇒ 手上仍然没码').toBe(false);
+    expect(resendCalls(fetchFn)).toHaveLength(1);
+
+    auth.switchFactor('totp');
+    await nextTick();
+    expect(resendCalls(fetchFn), '切回 TOTP 绝不发信（哪怕手上还没码）').toHaveLength(1);
+    expect(auth.factor).toBe('totp');
+  });
+
+  it('第一封发失败 ⇒ 留在邮箱档（不被静默切回 totp）+ sendFailed + 错误文案', async () => {
+    const fetchFn = deferredFetch(() => jsonResponse(503, {
+      error: { code: 'email_send_failed', message: '验证码邮件发送失败，请稍后重试', retryable: true },
+    }, { 'Retry-After': '5' }));
+    const auth = useAuthStore();
+    await auth.login('alice', 'secret');
+
+    auth.switchFactor('email');
+    await vi.waitFor(() => expect(auth.emailSending).toBe(false));
+
+    expect(auth.factor, '不强行切回 TOTP：让用户自己切').toBe('email');
+    expect(auth.emailSent).toBe(false);
+    expect(auth.sendFailed).toBe(true);
+    expect(auth.error).toBe(zhCN.errors.emailSendFailed);
+    expect(resendCalls(fetchFn)).toHaveLength(1);
+    // 失败后手上仍然没码 ⇒ 再点重发（而不是切档）才能重试：既有 `sendFailed` 路径口径不变。
+    expect(auth.pendingToken).toBe('ptok-choice');
+  });
+
+  it('emailSent 的三个置位点：email_code_required（第一步就发了）/ resend 成功 / 503 patch', async () => {
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, {
+      status: 'email_code_required', pending_token: 'ptok-mail', expires_in: 600, email_hint: 'a***@e***.com',
+    })));
+    const a = useAuthStore();
+    await a.login('alice', 'secret');
+    expect(a.emailSent, '无 TOTP 的直发分支：第一步已发 ⇒ true').toBe(true);
+
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(503, {
+      error: {
+        code: 'email_send_failed', message: '验证码邮件发送失败，请稍后重试', retryable: true,
+        details: { pending_token: 'ptok-mail', expires_in: 600, email_hint: 'a***@e***.com' },
+      },
+    })));
+    const b = useAuthStore();
+    await b.login('alice', 'secret');
+    expect(b.emailSent, '503 patch 路径：保持既有「用户自己点重新发送」的行为，不再偷发一封').toBe(true);
+    expect(b.sendFailed).toBe(true);
+
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, { expires_in: 600, resend_after: 60 })));
+    const c = useAuthStore();
+    c.resetPendingLogin(); // 上面两个子句用的是同一个 pinia 实例（同一个 store）⇒ 先清干净再断
+    c.pendingToken = 'ptok-mail';
+    c.factor = 'email';
+    expect(c.emailSent, 'resend 之前手上没码').toBe(false);
+    expect(await c.resendEmailCode()).toBe(true);
+    expect(c.emailSent).toBe(true);
+  });
+
+  it('requestEmailCode：已发过就是空操作（不复制第二份请求，也不许重复发信）', async () => {
+    const fetchFn = deferredFetch();
+    const auth = useAuthStore();
+    auth.pendingToken = 'ptok-choice';
+    auth.factor = 'email';
+    auth.emailSent = true;
+    await auth.requestEmailCode();
+    expect(resendCalls(fetchFn)).toHaveLength(0);
+  });
+
+  it('复位：emailSent / emailSending 跟着 pending 一起作废（换人不带着上一个人的码）', () => {
+    const auth = useAuthStore();
+    auth.pendingToken = 'ptok-choice';
+    auth.emailSent = true;
+    auth.backToLogin();
+    expect(auth.emailSent).toBe(false);
+    expect(auth.emailSending).toBe(false);
   });
 });
 

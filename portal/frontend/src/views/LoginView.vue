@@ -3,12 +3,15 @@
 // 两步切换）。字段/按钮文案/错误展示位置保持逐字等价。
 // issue #101 P1：用户可见文案走 i18n（login.*，zh-CN/en 逐字等价），卡片右上角挂语言切换菜单。
 // 注意：错误提示 auth.error 来自 auth store（P2 归 errors.*），本阶段保持原样。
-// issue #449：第二步现在按 `auth.factor` 分叉——`'totp'` 保持原样（一字不改），`'email'` 是邮箱验证码
-// （portal.md §2.3a/§2.3b：6 位码 + 重发 + 冷却倒计时 + 返回上一步）。
+// issue #449：第二步现在按 `auth.factor` 分叉——`'totp'` 与 `'email'`（邮箱验证码，口径见
+// portal.md §2.3a/§2.3b：6 位码 + 重发 + 冷却倒计时 + 返回上一步）。
+// 工单 feat-261110-01：二选一的入口从「TOTP 表单下面一行下划线小字」换成**真正的两档 switch**
+//（默认 TOTP，UI 随档位变）；邮箱码改成懒发信——切到邮箱档那一刻才发第一封（store 里
+// `switchFactor('email')` → `requestEmailCode()` → 既有的 §2.3b resend 端点）。
 import { ref, nextTick, computed, watch, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
-import { useAuthStore, afterLoginRoute } from '../stores/auth';
+import { useAuthStore, afterLoginRoute, type LoginSecondFactor } from '../stores/auth';
 import { useSiteStore } from '../stores/site';
 import LocaleSwitch from '../components/LocaleSwitch.vue';
 
@@ -113,6 +116,29 @@ async function onEmailResend() {
 }
 
 /**
+ * feat-261110-01：**只有两条通道时**才渲染 switch。
+ * `choiceMethods` 直接来自后端 `methods`（`email_sent:false` 那条已被 store 剥成只剩 `['totp']`），
+ * 而单一通道（`totp_required` / `email_code_required` / 降级）都是 1 条 ⇒ 不渲染，表单走原样。
+ */
+const showFactorSwitch = computed(() => auth.choiceMethods.length === 2);
+
+/**
+ * 选档。切换本身在 store 里（懒发信的第一封也在：`switchFactor('email')` → `requestEmailCode()`），
+ * 这里只补一句「把光标交给即将出现的那个输入框」。发送中不 focus：禁用中的输入框 focus 不进去，
+ * 而且会把光标从「正在发送…」上抢走。
+ */
+async function onPickFactor(factor: LoginSecondFactor): Promise<void> {
+  auth.switchFactor(factor);
+  if (auth.factor !== factor) return; // 单通道 / 这条不可用 ⇒ store 是空操作，别动焦点
+  await nextTick();
+  if (factor === 'email') {
+    if (!auth.emailSending) emailInput.value?.focus();
+  } else {
+    totpInput.value?.focus();
+  }
+}
+
+/**
  * 重发按钮文案：发信失败 ⇒ 「重新发送」（且不受冷却限制，§2.3b 评审返修 ①：此时服务端还没有码行）；
  * 冷却中 ⇒ 「{n} 秒后可重发」；其余 ⇒ 「重发验证码」。
  */
@@ -188,74 +214,102 @@ onUnmounted(stopCooldownTicker);
           >{{ t('login.next') }}</button>
         </form>
 
-        <!-- 第二步（#449）：邮箱验证码（pending_token 已换取，factor==='email'） -->
-        <form v-else-if="auth.factor === 'email'" @submit.prevent="onEmailSubmit">
-          <p class="text-sm mb-1">{{ t('login.emailStepTitle') }}</p>
-          <p class="text-black/50 text-sm mb-3">{{ t('login.emailStepHint', { email: auth.emailHint ?? '' }) }}</p>
-          <label class="block text-xs text-black/50 mb-1" for="emailCode">{{ t('login.emailCodeLabel') }}</label>
-          <input
-            id="emailCode" ref="emailInput" v-model="emailCode"
-            inputmode="numeric" maxlength="6" autocomplete="one-time-code"
-            class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
+        <!-- 第二步（#449）：两条通道共用一枚 pending_token ⇒ 上方放 switch，下方是当前档的表单。
+             整块挂在 `<template v-else>` 上：Vue 要求 `v-else` 与 `v-if` 紧邻，而 switch 必须排在
+             表单**上方** ⇒ 不能把 switch 插进旧的三段 `v-if / v-else-if / v-else` 链中间。 -->
+        <template v-else>
+          <!-- feat-261110-01：两档 switch（默认 TOTP）。可访问性：radiogroup + radio/aria-checked；
+               键盘直接用 `<button type="button">` 自带的 Tab 聚焦 + Enter/Space 触发，不自己重实现 tabindex 轮换。 -->
+          <div
+            v-if="showFactorSwitch"
+            data-test="factor-switch"
+            role="radiogroup"
+            :aria-label="t('login.factorSwitchLabel')"
+            class="mb-3 grid grid-cols-2 gap-1 rounded-md border border-black/15 bg-black/[0.03] p-1"
           >
-          <button
-            type="submit" :disabled="auth.loading"
-            class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
-          >{{ t('login.emailCodeSubmit') }}</button>
-          <button
-            id="emailResend" type="button"
-            :disabled="auth.loading || (!auth.sendFailed && auth.cooldownSeconds > 0)"
-            class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5 disabled:opacity-75"
-            @click="onEmailResend"
-          >{{ resendLabel }}</button>
-          <button
-            id="emailBack" type="button"
-            class="w-full text-black/60 text-sm py-1.5 mt-1 underline"
-            @click="auth.backToLogin()"
-          >{{ t('login.emailBackToPassword') }}</button>
-          <!-- #449 二选一：切回 TOTP。只改 factor（同一枚 pending_token），不重新登录、不重新发码。 -->
-          <button
-            v-if="auth.choiceMethods.includes('totp')"
-            id="emailUseTotp"
-            type="button"
-            class="w-full text-black/60 text-sm py-1 underline"
-            @click="auth.switchFactor('totp')"
-          >{{ t('login.useTotp') }}</button>
-        </form>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="auth.factor === 'totp'"
+              data-test="factor-option-totp"
+              :disabled="auth.emailSending"
+              :class="auth.factor === 'totp' ? 'bg-white text-black shadow-sm' : 'text-black/60 hover:bg-black/5'"
+              class="rounded px-2 py-1.5 text-sm font-medium disabled:opacity-75"
+              @click="onPickFactor('totp')"
+            >{{ t('login.factorTotp') }}</button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="auth.factor === 'email'"
+              data-test="factor-option-email"
+              :disabled="auth.emailSending"
+              :class="auth.factor === 'email' ? 'bg-white text-black shadow-sm' : 'text-black/60 hover:bg-black/5'"
+              class="rounded px-2 py-1.5 text-sm font-medium disabled:opacity-75"
+              @click="onPickFactor('email')"
+            >{{ t('login.factorEmail') }}</button>
+          </div>
 
-        <!-- 第二步：TOTP（pending_token 已换取） -->
-        <form v-else @submit.prevent="onTotpSubmit">
-          <p class="text-black/50 text-sm mb-3">{{ t('login.totpHint') }}</p>
-          <label class="block text-xs text-black/50 mb-1" for="totpCode">{{ t('login.totpLabel') }}</label>
-          <input
-            id="totpCode" ref="totpInput" v-model="code"
-            inputmode="numeric" maxlength="6" autocomplete="one-time-code"
-            class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
-          >
-          <button
-            type="submit" :disabled="auth.loading"
-            class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
-          >{{ t('login.totpSubmit') }}</button>
-          <button
-            type="button"
-            class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5"
-            @click="auth.backToLogin()"
-          >{{ t('login.backToLogin') }}</button>
-        </form>
+          <!-- 第二步：邮箱验证码（pending_token 已换取，factor==='email'） -->
+          <form v-if="auth.factor === 'email'" @submit.prevent="onEmailSubmit">
+            <p class="text-sm mb-1">{{ t('login.emailStepTitle') }}</p>
+            <!-- 懒发信的三个态：正在发 / 已发到。「已发到」直接复用既有的 emailStepHint（不另造键）；
+                 既没发也没在发（= 第一封失败了）就不写「已发」这种谎，错误走卡片底部那个 role="alert"。 -->
+            <p v-if="auth.emailSending" data-test="emailSendingHint" class="text-black/50 text-sm mb-3">
+              {{ t('login.emailSending') }}
+            </p>
+            <p v-else-if="auth.emailSent" data-test="emailSentHint" class="text-black/50 text-sm mb-3">
+              {{ t('login.emailStepHint', { email: auth.emailHint ?? '' }) }}
+            </p>
+            <label class="block text-xs text-black/50 mb-1" for="emailCode">{{ t('login.emailCodeLabel') }}</label>
+            <input
+              id="emailCode" ref="emailInput" v-model="emailCode"
+              :disabled="auth.emailSending"
+              inputmode="numeric" maxlength="6" autocomplete="one-time-code"
+              class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand disabled:opacity-60"
+            >
+            <button
+              type="submit" :disabled="auth.loading || auth.emailSending"
+              class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
+            >{{ t('login.emailCodeSubmit') }}</button>
+            <button
+              id="emailResend" type="button"
+              :disabled="auth.loading || auth.emailSending || (!auth.sendFailed && auth.cooldownSeconds > 0)"
+              class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5 disabled:opacity-75"
+              @click="onEmailResend"
+            >{{ resendLabel }}</button>
+            <button
+              id="emailBack" type="button"
+              class="w-full text-black/60 text-sm py-1.5 mt-1 underline"
+              @click="auth.backToLogin()"
+            >{{ t('login.emailBackToPassword') }}</button>
+            <!-- #449 旧版「改用验证器应用（TOTP）」小字链接已删：职责并入上面的 switch
+                 （单通道的 `email_code_required` 本来也不渲染它；「返回上一步」`#emailBack` 仍在）。 -->
+          </form>
 
-        <!-- #449 二选一的切换入口与降级说明。**刻意放在 TOTP <form> 之外**：
-             「TOTP 第二步模板逐字未改」是 #449 已有的结构判据（见 LoginView.spec 的源码级用例），
-             而这两样东西只是面板下方的次要操作/说明，放进表单里会弄伤那条判据。
-             （因此两个都要再挂 `factor === 'totp'`：它们不在 `v-else` 里，不锁住就会在口令步 /
-             邮箱码步也冒出来。） -->
-        <button
-          v-if="auth.factor === 'totp' && auth.choiceMethods.includes('email')"
-          id="useEmailCode"
-          type="button"
-          class="w-full text-black/60 text-sm py-1.5 underline"
-          @click="auth.switchFactor('email')"
-        >{{ t('login.useEmailCode') }}</button>
-        <!-- #449：`email_sent:false` ⇒ 不给邮箱入口，换成一句「邮件通道当前不可用」的说明。 -->
+          <!-- 第二步：TOTP（pending_token 已换取） -->
+          <form v-else @submit.prevent="onTotpSubmit">
+            <p class="text-black/50 text-sm mb-3">{{ t('login.totpHint') }}</p>
+            <label class="block text-xs text-black/50 mb-1" for="totpCode">{{ t('login.totpLabel') }}</label>
+            <input
+              id="totpCode" ref="totpInput" v-model="code"
+              inputmode="numeric" maxlength="6" autocomplete="one-time-code"
+              class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
+            >
+            <button
+              type="submit" :disabled="auth.loading"
+              class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
+            >{{ t('login.totpSubmit') }}</button>
+            <button
+              type="button"
+              class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5"
+              @click="auth.backToLogin()"
+            >{{ t('login.backToLogin') }}</button>
+          </form>
+        </template>
+
+        <!-- #449：`email_sent:false` ⇒ 不给邮箱入口，换成一句「邮件通道当前不可用」的说明。
+             旧版并列的「改用邮箱验证码」小字链接已由 switch 取代：降级时 store 已把 `choiceMethods`
+             剥成只剩 `['totp']` ⇒ switch 根本不渲染，这句话就是唯一的说明。 -->
         <p
           v-if="auth.factor === 'totp' && auth.emailUnavailable"
           id="emailUnavailableNotice"

@@ -10,6 +10,9 @@ import LocaleSwitch from '../components/LocaleSwitch.vue';
 import { createAppRouter } from '../router';
 import { useAuthStore } from '../stores/auth';
 import { i18n, setLocale } from '../i18n';
+// feat-261110-01：switch 的两档文案直接引用 locale（不手抄中英文），两边都改了才不会假绿。
+import { zhCN } from '../i18n/locales/zh-CN';
+import { en } from '../i18n/locales/en';
 import type { AuthUser } from '../stores/auth';
 import { nextRouteLanding } from '../test-utils/navigation';
 
@@ -385,27 +388,72 @@ describe('#449 TOTP 分支未被改动', () => {
     expect(wrapper.text()).toContain('输入认证器 6 位码');
   });
 
-  it('源码级：TOTP 第二步的模板片段逐字仍在（改一个字就红）', () => {
-    const TOTP_STEP = `        <!-- 第二步：TOTP（pending_token 已换取） -->
-        <form v-else @submit.prevent="onTotpSubmit">
-          <p class="text-black/50 text-sm mb-3">{{ t('login.totpHint') }}</p>
-          <label class="block text-xs text-black/50 mb-1" for="totpCode">{{ t('login.totpLabel') }}</label>
-          <input
-            id="totpCode" ref="totpInput" v-model="code"
-            inputmode="numeric" maxlength="6" autocomplete="one-time-code"
-            class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"
-          >
-          <button
-            type="submit" :disabled="auth.loading"
-            class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"
-          >{{ t('login.totpSubmit') }}</button>
-          <button
-            type="button"
-            class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5"
-            @click="auth.backToLogin()"
-          >{{ t('login.backToLogin') }}</button>
-        </form>`;
-    expect(loginViewSource).toContain(TOTP_STEP);
+  /**
+   * 源码级判据（#449 的验收要求，feat-261110-01 **按新结构改写**）。
+   *
+   * 为什么必须改写（工单 §2.2 预见了这条）：原判据钉的是「TOTP 第二步整段（从注释行到 `</form>`、
+   * 含缩进）逐字不动」。而本单把两行小字链接换成两档 switch 时，整块第二步必须挂进
+   * `<template v-else>`——Vue 要求 `v-else` 与 `v-if` 紧邻，switch 又必须排在表单**上方**，
+   * 插不进旧的三段 `v-if / v-else-if / v-else` 链中间 ⇒ 整块缩进 +2 ⇒ 旧判据必然红。
+   *
+   * 保留的意图原封不动，而且比原文更强：
+   *   ① TOTP 表单**内部**的每一行仍逐字比对（内容、顺序、增删行都会红）；唯一放宽的是**缩进**
+   *      ——那正是本次结构性改动本身，不是意图；
+   *   ② 负向：TOTP 块里出现任何 `email` 字样 ⇒ 红（原意：TOTP 表单里不许混进邮箱码的东西）；
+   *   ③ switch 必须在 TOTP 表单**外面**且在其**上方**（放进表单里会同时伤 ① 与 ②）。
+   */
+  it('源码级：TOTP 第二步表单内容逐行仍在（改一个字就红），且里面没混进邮箱码的东西', () => {
+    const OPEN = '<form v-else @submit.prevent="onTotpSubmit">';
+    const start = loginViewSource.indexOf(OPEN);
+    expect(start, 'TOTP 第二步仍以 `<form v-else @submit.prevent="onTotpSubmit">` 开头').toBeGreaterThan(-1);
+    const end = loginViewSource.indexOf('</form>', start);
+    const totpForm = loginViewSource.slice(start, end);
+
+    // ① 逐行比对表单内部（去掉行首缩进之后逐字相等，顺序也相等）。
+    const EXPECTED_INNER = [
+      '<p class="text-black/50 text-sm mb-3">{{ t(\'login.totpHint\') }}</p>',
+      '<label class="block text-xs text-black/50 mb-1" for="totpCode">{{ t(\'login.totpLabel\') }}</label>',
+      '<input',
+      'id="totpCode" ref="totpInput" v-model="code"',
+      'inputmode="numeric" maxlength="6" autocomplete="one-time-code"',
+      'class="w-full rounded-md border border-black/20 px-3 py-1.5 mb-3 focus:outline-none focus:ring-2 focus:ring-brand/40 focus:border-brand"',
+      '>',
+      '<button',
+      'type="submit" :disabled="auth.loading"',
+      'class="w-full rounded-md bg-brand hover:bg-brand-hover active:bg-brand-active text-white py-1.5 disabled:opacity-75"',
+      '>{{ t(\'login.totpSubmit\') }}</button>',
+      '<button',
+      'type="button"',
+      'class="w-full rounded-md border border-black/20 text-black/80 py-1.5 mt-2 hover:bg-black/5"',
+      '@click="auth.backToLogin()"',
+      '>{{ t(\'login.backToLogin\') }}</button>',
+    ];
+    const actualInner = totpForm
+      .split('\n')
+      .slice(1)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    expect(actualInner, 'TOTP 第二步表单的内部行变了').toEqual(EXPECTED_INNER);
+
+    // ② 负向：TOTP 表单里不许出现邮箱码的东西（这条判据的本意）。
+    expect(totpForm.toLowerCase(), 'TOTP 表单里混进了邮箱码的东西').not.toContain('email');
+    expect(totpForm).not.toContain('factor-switch');
+
+    // ③ switch 在表单外、且在表单上方（第二步的入口必须先于表单被看到）。
+    const switchAt = loginViewSource.indexOf('data-test="factor-switch"');
+    expect(switchAt, '两档 switch 必须在模板里').toBeGreaterThan(-1);
+    expect(switchAt, 'switch 必须排在 TOTP 表单上方').toBeLessThan(start);
+    expect(loginViewSource.indexOf('data-test="factor-option-email"')).toBeLessThan(start);
+  });
+
+  it('旧的两行小字链接确实被删了（`#useEmailCode` / `#emailUseTotp` 与它们的 i18n 键）', () => {
+    expect(loginViewSource).not.toContain('id="useEmailCode"');
+    expect(loginViewSource).not.toContain('id="emailUseTotp"');
+    expect(loginViewSource).not.toContain('login.useEmailCode');
+    expect(loginViewSource).not.toContain('login.useTotp');
+    // 由 switch 取代（两个选择器 + 两个档）。
+    expect(loginViewSource).toContain('data-test="factor-option-totp"');
+    expect(loginViewSource).toContain('data-test="factor-option-email"');
   });
 });
 
@@ -589,9 +637,13 @@ describe('LoginView 用户面拒绝无工位管理员（真机蹦极回归）', 
 });
 
 // ---------------------------------------------------------------------------
-// #449 二选一（`second_factor_choice`）：第二步两条通道可互切，共用同一枚 pending_token
-// 判据（工单 §六 6）：两个入口都渲染 / `email_sent:false` 只剩 TOTP / 切换不重新登录
-// （无新增 `POST /api/auth/login`，`pending_token` 不变）/ 双语键由 localeParity 兜底。
+// #449 二选一（`second_factor_choice`）+ 工单 feat-261110-01（两档 switch + 懒发信）
+// 切换入口已从「TOTP 表单下面两行下划线小字」换成**真正的 switch**；邮箱码改成**懒发信**：
+// 切到邮箱档那一刻才发第一封（走既有 §2.3b resend 端点，所以「发没发」在测试里就等价于
+// 「打了几次 resend」）。
+// 判据（工单 §3）：两条通道才渲染 switch / 默认选中 TOTP / 切到邮箱档**只发一次** resend /
+// 切回 TOTP 零请求、再切回也不再发 / 单通道不渲染 / resend 失败不静默 / 503 `email_send_failed`
+// 既有路径不回归 / 切换不重新登录（无新增 `POST /api/auth/login`，`pending_token` 不变）。
 // ---------------------------------------------------------------------------
 
 const SECOND_FACTOR_CHOICE = {
@@ -600,12 +652,19 @@ const SECOND_FACTOR_CHOICE = {
   expires_in: 600,
   methods: ['totp', 'email_code'],
   email_hint: 'e***@i***.com',
-  email_sent: true,
+  // 懒发信的真实形状（工单 §1.3）：**不带 `email_sent`**，只有 `email_deferred: true`。
+  // 「还没发」与「不可用」必须分得开 —— 前者的判据是 `email_sent === false`，混用就会把邮箱档
+  // 在第一步剥掉（正是本单要修的「二选一在界面上不存在」）。
+  email_deferred: true,
 };
 
-/** 二选一的 fetch 桩：第一步回 `choice`，两条第二步端点都回「登录成功」。 */
+/** resend 的响应体（§2.3b）：新码有效期 + 下一次允许重发的冷却秒数。 */
+const RESEND_OK = { expires_in: 600, resend_after: 60 };
+
+/** 二选一的 fetch 桩：第一步回 `choice`；两条第二步端点回「登录成功」；resend 回 §2.3b 形状。 */
 function choiceFetch(choice: Record<string, unknown> = SECOND_FACTOR_CHOICE) {
   return fetchMock((url) => {
+    if (url.includes('/api/auth/login/email-code/resend')) return jsonResponse(200, RESEND_OK);
     if (url.includes('/api/auth/login/totp') || url.includes('/api/auth/login/email-code')) {
       return jsonResponse(200, { password_change_required: false, user: FDE_USER });
     }
@@ -630,49 +689,180 @@ function loginCalls(fetchFn: ReturnType<typeof choiceFetch>) {
   return fetchFn.mock.calls.filter(([url]) => String(url) === '/api/auth/login').length;
 }
 
-describe('LoginView 二选一（#449 second_factor_choice）', () => {
-  it('默认 TOTP + 「改用邮箱验证码」；切过去不重新登录、pending_token 不变，提交用的还是同一枚', async () => {
-    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep();
+/** 打过几次 resend —— 懒发信唯一可观测的出口就是这一个端点。 */
+function resendCalls(fetchFn: ReturnType<typeof choiceFetch>) {
+  return fetchFn.mock.calls.filter(([url]) => String(url).includes('/api/auth/login/email-code/resend'));
+}
 
-    expect(wrapper.find('#totpCode').exists(), '默认停在较强的 TOTP').toBe(true);
+const SWITCH = '[data-test="factor-switch"]';
+const OPT_TOTP = '[data-test="factor-option-totp"]';
+const OPT_EMAIL = '[data-test="factor-option-email"]';
+
+describe('LoginView 二选一的 switch（feat-261110-01：两档 + 懒发信）', () => {
+  it('两条通道 ⇒ 渲染 switch：radiogroup + 两个 radio、默认选中 TOTP（aria-checked 对得上）', async () => {
+    const { wrapper, auth } = await gotoChoiceStep();
+
+    const group = wrapper.find(SWITCH);
+    expect(group.exists(), '两条通道必须给一个真的 switch（小字链接已被用户无视过）').toBe(true);
+    expect(group.attributes('role')).toBe('radiogroup');
+    expect(group.attributes('aria-label'), 'radiogroup 要有可读名字').toBe(zhCN.login.factorSwitchLabel);
+
+    const totp = group.find(OPT_TOTP);
+    const email = group.find(OPT_EMAIL);
+    expect(totp.attributes('role')).toBe('radio');
+    expect(email.attributes('role')).toBe('radio');
+    expect(totp.attributes('aria-checked'), '默认停在较强的 TOTP').toBe('true');
+    expect(email.attributes('aria-checked')).toBe('false');
+    expect(totp.text()).toBe(zhCN.login.factorTotp);
+    expect(email.text()).toBe(zhCN.login.factorEmail);
+    // 切档之后 aria-checked 必须**跟着换**：只在默认档上断过一次的话，把它写死成 `aria-checked="true"`
+    // 也能过（变异实验实证）。屏幕阅读器就靠这一对值念出「当前选中的是哪一档」。
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+    expect(wrapper.find(OPT_TOTP).attributes('aria-checked'), '选中的那档才是 true').toBe('false');
+    expect(wrapper.find(OPT_EMAIL).attributes('aria-checked')).toBe('true');
+    await wrapper.find(OPT_TOTP).trigger('click');
+    await flushPromises();
+    expect(wrapper.find(OPT_TOTP).attributes('aria-checked')).toBe('true');
+    expect(wrapper.find(OPT_EMAIL).attributes('aria-checked')).toBe('false');
+
+    // switch 是 `<button type="button">` ⇒ Tab 聚焦 + Enter/Space 原生可用（不必自己实现 tabindex 轮换）。
+    expect(totp.attributes('type')).toBe('button');
+    expect(email.attributes('type')).toBe('button');
+
+    // 表单随档位变：默认只有 TOTP 表单。
+    expect(wrapper.find('#totpCode').exists()).toBe(true);
     expect(wrapper.find('#emailCode').exists()).toBe(false);
-    expect(wrapper.find('#useEmailCode').text()).toBe('改用邮箱验证码');
-    expect(wrapper.find('#emailUnavailableNotice').exists()).toBe(false);
     expect(auth.factor).toBe('totp');
-    expect(loginCalls(fetchFn)).toBe(1);
+    // switch 在表单**上方**（用户第一眼就看到有两档）。
+    const html = wrapper.html();
+    expect(html.indexOf('factor-switch')).toBeLessThan(html.indexOf('id="totpCode"'));
+  });
 
-    await wrapper.find('#useEmailCode').trigger('click');
+  it('切到邮箱档 ⇒ 表单换掉、pending_token 不变、**只发一次 resend**（懒发信的第一封）', async () => {
+    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep();
+    expect(loginCalls(fetchFn)).toBe(1);
+    expect(resendCalls(fetchFn), '第一步不该有任何发信请求').toHaveLength(0);
+
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+
     expect(wrapper.find('#emailCode').exists(), '切换只换表单').toBe(true);
     expect(wrapper.find('#totpCode').exists()).toBe(false);
-    expect(wrapper.text()).toContain('e***@i***.com');
     expect(auth.factor).toBe('email');
     expect(auth.pendingToken, '同一枚 pending_token').toBe('ptok-choice');
     expect(loginCalls(fetchFn), '切换不得重新登录').toBe(1);
+    const calls = resendCalls(fetchFn);
+    expect(calls, '切过去恰好发一封，不多不少').toHaveLength(1);
+    expect(JSON.parse(String(calls[0][1]?.body))).toEqual({ pending_token: 'ptok-choice' });
+    // 发完之后：hint 说清发到哪了，并进入既有 60s 冷却。
+    expect(wrapper.find('[data-test="emailSentHint"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('e***@i***.com');
+    expect(wrapper.find('#emailResend').text()).toBe('60 秒后可重发');
 
+    // 提交用的还是同一枚 pending（切档没换令牌）。
     await wrapper.find('#emailCode').setValue('654321');
-    // A 类：先订阅再提交。
     const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
-    const call = fetchFn.mock.calls.find(([url]) => String(url).includes('/api/auth/login/email-code'));
+    const call = fetchFn.mock.calls.find(
+      ([url]) => String(url).includes('/api/auth/login/email-code') && !String(url).endsWith('/resend'),
+    );
     expect(JSON.parse(String(call?.[1]?.body))).toEqual({ pending_token: 'ptok-choice', code: '654321' });
     expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
   });
 
-  it('可切回 TOTP（双向）：TOTP 提交同样用这一枚 pending_token', async () => {
-    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep();
+  it('切回 TOTP 零请求；再切回邮箱档**不再发**（emailSent 已 true）', async () => {
+    const { wrapper, auth, fetchFn } = await gotoChoiceStep();
 
-    await wrapper.find('#useEmailCode').trigger('click');
-    expect(wrapper.find('#emailCode').exists()).toBe(true);
-    await wrapper.find('#emailUseTotp').trigger('click');
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+    expect(resendCalls(fetchFn)).toHaveLength(1);
+
+    await wrapper.find(OPT_TOTP).trigger('click');
+    await flushPromises();
     expect(wrapper.find('#totpCode').exists(), '切换必须可逆').toBe(true);
     expect(wrapper.find('#emailCode').exists()).toBe(false);
+    expect(resendCalls(fetchFn), '切回 TOTP 绝不发信').toHaveLength(1);
+
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+    expect(resendCalls(fetchFn), '已经有码 ⇒ 反复切档不反复寄信（本单原缺陷就是寄太多）').toHaveLength(1);
+    expect(auth.factor).toBe('email');
+    expect(loginCalls(fetchFn)).toBe(1);
+  });
+
+  it('发送中：显示「正在发送验证码…」并禁用输入框与 switch（不让人对着空信箱打字）', async () => {
+    let release: (() => void) | null = null;
+    const fetchFn = fetchMock((url) => {
+      if (url.includes('/api/auth/login/email-code/resend')) {
+        return new Promise<Response>((resolve) => {
+          release = () => resolve(jsonResponse(200, RESEND_OK));
+        });
+      }
+      return jsonResponse(200, SECOND_FACTOR_CHOICE);
+    });
+    vi.stubGlobal('fetch', fetchFn);
+    const { wrapper, auth } = await mountLogin();
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('secret');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await nextTick(); // resend 已在飞，但还没 release ⇒ 停在「发送中」
+
+    expect(auth.emailSending).toBe(true);
+    expect(wrapper.find('[data-test="emailSendingHint"]').text()).toContain('正在发送验证码');
+    expect(wrapper.find('[data-test="emailSentHint"]').exists(), '还没发成就别写「已发送」').toBe(false);
+    expect(wrapper.find('#emailCode').attributes('disabled'), '发送中输入框禁用').toBeDefined();
+    expect(wrapper.find(OPT_TOTP).attributes('disabled'), '发送中 switch 禁用').toBeDefined();
+
+    release!();
+    await flushPromises();
+    expect(auth.emailSending).toBe(false);
+    expect(wrapper.find('#emailCode').attributes('disabled')).toBeUndefined();
+    expect(wrapper.find('[data-test="emailSentHint"]').exists()).toBe(true);
+  });
+
+  it('resend 失败 ⇒ **留在邮箱档** + 显示错误文案（不静默、不偷偷切回 TOTP）', async () => {
+    const fetchFn = fetchMock((url) => {
+      if (url.includes('/api/auth/login/email-code/resend')) {
+        return jsonResponse(503, {
+          error: { code: 'email_send_failed', message: '验证码邮件发送失败，请稍后重试', retryable: true },
+        }, { 'Retry-After': '5' });
+      }
+      return jsonResponse(200, SECOND_FACTOR_CHOICE);
+    });
+    vi.stubGlobal('fetch', fetchFn);
+    const { wrapper, auth } = await mountLogin();
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('secret');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+
+    expect(auth.factor, '发信失败不得把人踢回 TOTP（那是替他做决定）').toBe('email');
+    expect(wrapper.find('#emailCode').exists()).toBe(true);
+    expect(wrapper.find('[role="alert"]').text(), '错误必须说出来，不许静默')
+      .toContain(zhCN.errors.emailSendFailed);
+    expect(wrapper.find('#emailResend').text()).toBe('重新发送'); // 不受冷却限制，可立刻再试
+  });
+
+  it('可切回 TOTP 提交：TOTP 用的还是同一枚 pending_token', async () => {
+    const { wrapper, router, auth, fetchFn } = await gotoChoiceStep();
+
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+    await wrapper.find(OPT_TOTP).trigger('click');
+    await flushPromises();
     expect(loginCalls(fetchFn)).toBe(1);
     expect(auth.pendingToken).toBe('ptok-choice');
 
     await wrapper.find('#totpCode').setValue('123456');
-    // A 类：先订阅再提交。
     const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
@@ -682,7 +872,7 @@ describe('LoginView 二选一（#449 second_factor_choice）', () => {
     expect(auth.user?.login).toBe('alice');
   });
 
-  it('email_sent:false ⇒ 不给邮箱入口，改为「邮件通道当前不可用」说明，TOTP 仍能登录', async () => {
+  it('email_sent:false（降级）⇒ **不渲染 switch**，只给「邮件通道当前不可用」说明，TOTP 仍能登录', async () => {
     const { wrapper, router, auth, fetchFn } = await gotoChoiceStep({
       status: 'second_factor_choice',
       pending_token: 'ptok-choice',
@@ -694,86 +884,21 @@ describe('LoginView 二选一（#449 second_factor_choice）', () => {
       notice: '邮件通道当前不可用，本次仅可用验证器应用（TOTP）',
     });
 
+    expect(wrapper.find(SWITCH).exists(), '只有一条通道就别摆个只有一档的 switch').toBe(false);
     expect(wrapper.find('#totpCode').exists()).toBe(true);
-    expect(wrapper.find('#useEmailCode').exists(), 'SMTP 不可用时不得给出收不到信的入口').toBe(false);
     expect(wrapper.find('#emailUnavailableNotice').text()).toContain('邮件通道当前不可用，请使用验证器应用');
 
     await wrapper.find('#totpCode').setValue('123456');
-    // A 类：先订阅再提交。
     const landed = nextRouteLanding(router);
     await wrapper.find('form').trigger('submit.prevent');
     await flushPromises();
     expect(await landed).toBe('/');
     expect(auth.user?.login).toBe('alice');
     expect(loginCalls(fetchFn)).toBe(1);
+    expect(resendCalls(fetchFn), '降级路径也不许偷发一封信').toHaveLength(0);
   });
 
-  it('切到邮箱码后仍可重发（复用既有 60s 冷却），且重发不换 pending_token', async () => {
-    vi.useFakeTimers();
-    const fetchFn = fetchMock((url) => {
-      if (url.includes('/api/auth/login/email-code/resend')) {
-        return jsonResponse(200, { expires_in: 600, resend_after: 60 });
-      }
-      return jsonResponse(200, SECOND_FACTOR_CHOICE);
-    });
-    vi.stubGlobal('fetch', fetchFn);
-    const { wrapper, auth } = await mountLogin();
-    await wrapper.find('#loginName').setValue('alice');
-    await wrapper.find('#loginPass').setValue('secret');
-    await wrapper.find('form').trigger('submit.prevent');
-    await flushPromises();
-    await wrapper.find('#useEmailCode').trigger('click');
-
-    await wrapper.find('#emailResend').trigger('click');
-    await flushPromises();
-    expect(wrapper.find('#emailResend').text()).toBe('60 秒后可重发');
-    expect(auth.pendingToken).toBe('ptok-choice');
-    expect(loginCalls(fetchFn)).toBe(1);
-    vi.useRealTimers();
-  });
-
-  it('回归：单一通道不给切换入口（totp_required 无邮箱入口 / email_code_required 无「改用验证器应用」）', async () => {
-    const totpOnly = await gotoChoiceStep({ status: 'totp_required', pending_token: 'ptok', expires_in: 120 });
-    expect(totpOnly.wrapper.find('#totpCode').exists()).toBe(true);
-    expect(totpOnly.wrapper.find('#useEmailCode').exists()).toBe(false);
-    expect(totpOnly.wrapper.find('#emailUnavailableNotice').exists()).toBe(false);
-    expect(totpOnly.auth.choiceMethods).toEqual([]);
-
-    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, EMAIL_CODE_REQUIRED)));
-    const { wrapper: mailWrapper } = await mountLogin();
-    await gotoEmailStep(mailWrapper);
-    expect(mailWrapper.find('#emailCode').exists()).toBe(true);
-    expect(mailWrapper.find('#emailUseTotp').exists(), '无 TOTP 的账号不该看到切回 TOTP').toBe(false);
-    expect(mailWrapper.find('#emailBack').exists()).toBe(true);
-  });
-});
-
-describe('LoginView 二选一的双语文案（#449）', () => {
-  it('en：两条切换入口与「邮件通道不可用」说明都有英文文案', async () => {
-    setLocale('en');
-    const { wrapper } = await gotoChoiceStep();
-    expect(wrapper.find('#useEmailCode').text()).toBe('Use an email code instead');
-
-    await wrapper.find('#useEmailCode').trigger('click');
-    expect(wrapper.find('#emailUseTotp').text()).toBe('Use your authenticator app (TOTP) instead');
-
-    const degraded = await gotoChoiceStep({
-      status: 'second_factor_choice',
-      pending_token: 'ptok-choice',
-      expires_in: 600,
-      methods: ['totp'],
-      email_hint: 'e***@i***.com',
-      email_sent: false,
-      email_unavailable: true,
-    });
-    expect(degraded.wrapper.find('#useEmailCode').exists()).toBe(false);
-    expect(degraded.wrapper.find('#emailUnavailableNotice').text()).toContain('Email is unavailable right now');
-    setLocale('zh-CN');
-  });
-});
-
-describe('#449 二选一：邮箱入口以 email_sent 为准（不信 methods 单独说话）', () => {
-  it('后端同时给 methods 两条 + email_sent:false ⇒ 仍只渲染 TOTP 入口', async () => {
+  it('后端同时给 methods 两条 + email_sent:false ⇒ 仍不渲染 switch（不信 methods 单独说话）', async () => {
     const { wrapper } = await gotoChoiceStep({
       status: 'second_factor_choice',
       pending_token: 'ptok-choice',
@@ -784,7 +909,96 @@ describe('#449 二选一：邮箱入口以 email_sent 为准（不信 methods �
       email_unavailable: true,
     });
     expect(wrapper.find('#totpCode').exists()).toBe(true);
-    expect(wrapper.find('#useEmailCode').exists(), '码没发出去就不许给邮箱入口').toBe(false);
+    expect(wrapper.find(SWITCH).exists(), '码没发出去就不许给邮箱档').toBe(false);
     expect(wrapper.find('#emailUnavailableNotice').exists()).toBe(true);
+  });
+
+  it('回归：单一通道（totp_required / email_code_required）都不渲染 switch，也无旧的小字链接', async () => {
+    const totpOnly = await gotoChoiceStep({ status: 'totp_required', pending_token: 'ptok', expires_in: 120 });
+    expect(totpOnly.wrapper.find('#totpCode').exists()).toBe(true);
+    expect(totpOnly.wrapper.find(SWITCH).exists()).toBe(false);
+    expect(totpOnly.wrapper.find('#emailUnavailableNotice').exists()).toBe(false);
+    expect(totpOnly.auth.choiceMethods).toEqual([]);
+
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(200, EMAIL_CODE_REQUIRED)));
+    const { wrapper: mailWrapper } = await mountLogin();
+    await gotoEmailStep(mailWrapper);
+    expect(mailWrapper.find('#emailCode').exists()).toBe(true);
+    expect(mailWrapper.find(SWITCH).exists(), '无 TOTP 的账号只有一条路 ⇒ 不该有 switch').toBe(false);
+    expect(mailWrapper.find('#emailBack').exists()).toBe(true);
+    // 旧的两行小字链接确实没了（它们由 switch 取代）。
+    expect(mailWrapper.find('#emailUseTotp').exists()).toBe(false);
+    expect(mailWrapper.find('#useEmailCode').exists()).toBe(false);
+  });
+
+  it('懒发信不回归 503 `email_send_failed`（第一步带 pending 的 patch 路径）', async () => {
+    // `email_code_required` 那条仍是「第一步就发信」，发不出去 ⇒ 503 + details 带 pending（#449 既有语义）。
+    vi.stubGlobal('fetch', fetchMock(() => jsonResponse(503, {
+      error: {
+        code: 'email_send_failed', message: '验证码邮件发送失败，请稍后重试', retryable: true,
+        details: { pending_token: 'ptok-mail', expires_in: 600, email_hint: 'a***@e***.com' },
+      },
+    }, { 'Retry-After': '5' })));
+    const { wrapper, auth } = await mountLogin();
+    await gotoEmailStep(wrapper);
+    expect(wrapper.find('#emailCode').exists()).toBe(true); // 没被踢回第一步
+    expect(auth.emailSent, '这条路径算「已发过」⇒ 不再由 switch 偷发一封').toBe(true);
+    expect(wrapper.find('#emailResend').text()).toBe('重新发送');
+    expect(wrapper.find(SWITCH).exists()).toBe(false);
+  });
+
+  it('切到邮箱档后仍可重发：懒发信吃 60s 冷却，冷却过后手动重发不换 pending_token', async () => {
+    vi.useFakeTimers();
+    const fetchFn = choiceFetch();
+    vi.stubGlobal('fetch', fetchFn);
+    const { wrapper, auth } = await mountLogin();
+    await wrapper.find('#loginName').setValue('alice');
+    await wrapper.find('#loginPass').setValue('secret');
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+
+    await wrapper.find(OPT_EMAIL).trigger('click');
+    await flushPromises();
+    expect(resendCalls(fetchFn)).toHaveLength(1);
+    expect(wrapper.find('#emailResend').text()).toBe('60 秒后可重发'); // 第一封也起算冷却（§2.3b）
+
+    vi.advanceTimersByTime(60_000);
+    await nextTick();
+    expect(wrapper.find('#emailResend').text()).toBe('重发验证码');
+    await wrapper.find('#emailResend').trigger('click');
+    await flushPromises();
+    expect(resendCalls(fetchFn), '手动重发走同一个端点').toHaveLength(2);
+    expect(auth.pendingToken).toBe('ptok-choice');
+    expect(loginCalls(fetchFn)).toBe(1);
+    vi.useRealTimers();
+    wrapper.unmount();
+  });
+});
+
+describe('LoginView switch 的双语文案（feat-261110-01）', () => {
+  it('en：switch 的两档、发送中、已发到 都有英文文案（不是中文交差）', async () => {
+    setLocale('en');
+    try {
+      const { wrapper } = await gotoChoiceStep();
+      const group = wrapper.find(SWITCH);
+      expect(group.attributes('aria-label')).toBe(en.login.factorSwitchLabel);
+      expect(group.find(OPT_TOTP).text()).toBe(en.login.factorTotp);
+      expect(group.find(OPT_EMAIL).text()).toBe(en.login.factorEmail);
+      expect(group.find(OPT_TOTP).attributes('aria-checked')).toBe('true');
+
+      const degraded = await gotoChoiceStep({
+        status: 'second_factor_choice',
+        pending_token: 'ptok-choice',
+        expires_in: 600,
+        methods: ['totp'],
+        email_hint: 'e***@i***.com',
+        email_sent: false,
+        email_unavailable: true,
+      });
+      expect(degraded.wrapper.find(SWITCH).exists()).toBe(false);
+      expect(degraded.wrapper.find('#emailUnavailableNotice').text()).toContain('Email is unavailable right now');
+    } finally {
+      setLocale('zh-CN');
+    }
   });
 });
