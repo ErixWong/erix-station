@@ -198,6 +198,49 @@ async function commitEdit() {
   if (error) editError.value = { id, text: t('errors.renameFailed', { message: error }) };
 }
 
+// ---- issue #488：会话「隐藏」（第三颗 hover 图标）----
+// 语义（**D1**）：后端 DELETE /api/sessions/:id 把 status 置 `archived`（账本一个字节不动），且全仓没有
+// unarchive 端点 ⇒ 界面上只能叫「隐藏」，不能叫「删除」，本组件也不出现那两个字（tooltip/aria-label/确认文案都算）。
+// 交互（形态 (a)，理由见报告 §4）：点隐藏 → **同一行原地**换成「确认隐藏 / 取消」两颗同款方块按钮
+// + 两行确认文案（D2 的「找不回来」后果必须在场）；确认后才发请求（**D3**：确认前 DELETE 数 = 0）。
+// 状态**按行分槽**（照上方 `editingId` / `editError` 的形状：存 id，不是全局布尔）⇒ 失败与确认态
+// 都只污染那一行（硬约束 §五.3：A 行确认中，B 行不许显示确认）。
+// 失败轻提示**复用** #107 已有的 `editError` 行（同一颗 `.syserr` `role="alert"` 元素，不新增 UI 结构，§五.4）。
+const hideConfirmId = ref<string | null>(null);
+const hideBusyId = ref<string | null>(null);
+
+/** 进入确认态：只改本行的渲染，**不发请求**（D3 的判据形状就是这一行没有 await）。 */
+function askHide(s: Session) {
+  editError.value = null; // 与重命名 / AI 改名共用同一提示行，先清掉上一次的残留
+  hideConfirmId.value = String(s.id);
+}
+
+function cancelHide() {
+  hideConfirmId.value = null;
+}
+
+/**
+ * 确认隐藏：DELETE /api/sessions/:id（走 store，保住 #255 受限会话重定向与错误信封）。
+ * 成功 ⇒ store 已把那一项从列表摘掉（行就地消失，**不整表刷新**）；若摘的正是当前会话，store 已调
+ * `resetSessionView()`（D4）。失败 ⇒ 行**不消失** + 行内可见提示：409 `run_in_progress` 给母语提示与出路
+ * （**D5**：沿用后端既有拒绝，不加错误码），其它失败把服务端 message 拼在本地化前缀后（服务端文案不译）。
+ */
+async function confirmHide(s: Session) {
+  const id = String(s.id);
+  if (hideBusyId.value != null) return; // 已有一发在飞：忽略重复点击（含跨行）
+  hideBusyId.value = id;
+  editError.value = null;
+  const { error, code } = await store.hideSession(id);
+  hideBusyId.value = null;
+  hideConfirmId.value = null;
+  if (error) {
+    editError.value = {
+      id,
+      text: code === 'run_in_progress' ? t('errors.hideRunInProgress') : t('errors.hideFailed', { message: error }),
+    };
+  }
+}
+
 // ---- issue #114：「AI 改名」按钮（铅笔旁同款 24px 浮现方块按钮）----
 // 点击 → 行内 loading（按钮禁用 + 转圈）→ POST /api/sessions/:id/ai-title → 成功原地更新 store 标题；
 // 失败走卡片内 `.syserr` 行内提示（沿用 #107 模式，无 toast 体系）。同一时刻只允许一个请求在飞。
@@ -313,8 +356,57 @@ function messageCountSuffix(s: Session): string {
               </div>
               <!-- 副行：11px / text-dim / marginTop 2；issue #197：尾部追加「 · N 条消息」（同字体克制灰字，缺失/0 不显示） -->
               <div class="mt-0.5 truncate text-[11px] leading-[1.4] text-black/50">{{ store.sessMeta(s) }}{{ messageCountSuffix(s) }}</div>
+              <!-- issue #488：确认态的两行文案（**只有那一行**在确认中才出现，D2：「找不回来」的后果必须在场）。
+                   字号/行高逐字照上面的副行（11px / leading-[1.4]），不新增视觉层级。 -->
+              <p v-if="hideConfirmId === String(s.id)" data-test="sidebar-hide-question" class="mt-0.5 text-[11px] leading-[1.4] text-black/70">{{ t('sidebar.hideConfirm') }}</p>
+              <p v-if="hideConfirmId === String(s.id)" data-test="sidebar-hide-note" class="mt-0.5 text-[11px] leading-[1.4] text-black/50">{{ t('sidebar.hideConfirmNote') }}</p>
               <p v-if="editError?.id === String(s.id)" class="syserr mt-0.5" role="alert">{{ editError.text }}</p>
             </div>
+            <!-- issue #488：确认态（形态 (a)）——**同一位置原地**换成「确认隐藏 / 取消」两颗同款方块按钮。
+                 与编辑态同理：确认中不叠着画另外两颗图标（宽度是硬约束 §五.1），所以整块按钮位在 v-if 上二选一。 -->
+            <template v-if="hideConfirmId === String(s.id)">
+              <button
+                type="button"
+                data-test="sidebar-hide-confirm"
+                :title="hideBusyId === String(s.id) ? t('sidebar.hideBusy') : t('sidebar.hideConfirmOk')"
+                :aria-label="t('sidebar.hideConfirmOk')"
+                :disabled="hideBusyId === String(s.id)"
+                class="flex h-6 shrink-0 items-center justify-center rounded-[5px] border border-brand bg-white px-1.5 text-black/70 hover:bg-black/10 disabled:opacity-50"
+                @click.stop="confirmHide(s)"
+                @keydown.escape.prevent="cancelHide()"
+              >
+                <!-- 可见文本只留两个字（**宽度是硬约束 §五.1**，完整口径在 title/aria-label；
+                     accessible name「确认隐藏」含可见文本「隐藏」⇒ 满足 label-in-name）。
+                     不带浮现类：确认态恒可见（鼠标已经在这行上，图标不该反而藏起来）。 -->
+                <span class="whitespace-nowrap text-[11px] leading-none">{{ t('sidebar.hide') }}</span>
+              </button>
+              <button
+                type="button"
+                data-test="sidebar-hide-cancel"
+                :title="t('common.cancel')"
+                :aria-label="t('common.cancel')"
+                :disabled="hideBusyId === String(s.id)"
+                class="flex h-6 w-6 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/50 hover:bg-black/10 disabled:opacity-50"
+                @click.stop="cancelHide()"
+                @keydown.escape.prevent="cancelHide()"
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            </template>
+            <template v-else>
             <!-- @click.stop：重命名入口不得误触「选中会话」 -->
             <!-- issue #114：「AI 改名」按钮——与铅笔同款 24px 浮现方块（点击才调一次 LLM），
                  行内 loading 时禁用 + 转圈（opacity 由动态类强制可见，不依赖 hover） -->
@@ -387,6 +479,37 @@ function messageCountSuffix(s: Session): string {
                 <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
               </svg>
             </button>
+            <!-- issue #488：第三颗浮现图标「隐藏」（与上面两颗同规格：24px 方块 / 5px 圆角 / 细边框 / hover 浮现）。
+                 图标 = lucide `eye-off`（**不是** 垃圾筒：垃圾桶在语义上说了谎，后端只归档不抹数据，D1）。
+                 @click.stop：点隐藏不得误触「选中会话」；点击**只进确认态**，不发请求（D3）。 -->
+            <button
+              type="button"
+              data-test="sidebar-hide"
+              :title="t('sidebar.hide')"
+              :aria-label="t('sidebar.hide')"
+              :disabled="hideBusyId === String(s.id)"
+              class="flex h-6 w-6 shrink-0 items-center justify-center rounded-[5px] border border-black/15 bg-white text-black/50 opacity-0 hover:bg-black/10 focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-50"
+              @click.stop="askHide(s)"
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M10.733 5.076a10.744 10.744 0 0 1 1.267-.124 10.446 10.446 0 0 1 7.59 3.4 13.606 13.606 0 0 1 1.506 1.58" />
+                <path d="M8.473 8.423a3 3 0 0 0 4.095 4.095" />
+                <path d="M17.9 17.135a10.45 10.45 0 0 1-5.9 1.865c-7 0-10-7-10-7a12.52 12.52 0 0 1 1.506-1.58" />
+                <path d="m2 2 20 20" />
+                <path d="M14.121 15.121A6 6 0 1 0 9.879 9.879" />
+              </svg>
+            </button>
+            </template>
           </template>
         </div>
       </div>
