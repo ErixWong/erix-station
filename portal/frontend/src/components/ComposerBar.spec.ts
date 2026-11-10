@@ -13,6 +13,8 @@ beforeEach(() => {
   setLocale('zh-CN');
   setActivePinia(createPinia());
   vi.stubGlobal('fetch', vi.fn(async () => new Response('{"items":[]}', { status: 200 })));
+  // issue #466：预算按视口高算比例，钉住 jsdom 的 768 不依赖它默认值（转屏/键盘弹起另说）。
+  vi.stubGlobal('innerHeight', 768);
 });
 
 function setup() {
@@ -119,6 +121,116 @@ describe('ComposerBar · i18n（issue #101 P2）', () => {
     setLocale('en');
     await flushPromises();
     expect(wrapper.get('textarea').attributes('placeholder')).toBe('Create a directory first');
+  });
+});
+
+// issue #466：composer 按内容自适应高度。
+//
+// ⚠ 本文件只验「算出来的高确实写进了 textarea 的 style」与「什么时候重算」；
+// 夹逼算法本身（min/max/NaN 兜底）在 lib/composerHeight.spec.ts 用真数字钉。
+//
+// ⚠⚠ 这里的 scrollHeight 必须**建模**，不能直接接 jsdom：jsdom 不做布局，不管填多少字它都恒为 0，
+// 不假造就只能测「恒等于最小高」这条恒真的废话。也不能图省事写成「固定返回 N」——那样就测不到
+// 本单真正的坑：`scrollHeight` 的语义是 **max(内容高, 当前可视高)**，所以量高之前必须先把
+// style.height 松开，否则框子只涨不落。下面这个模型就是按这条语义写的（不是随手编的数）。
+describe('ComposerBar · issue #466 输入框按内容自适应高度', () => {
+  const LINE_H = 20;   // px/行（模型参数，与真浏览器行高无关，只要自洽就能钉住行为）
+  const PAD_V = 12;    // 上下 padding（py-1.5 × 2）
+
+  /** 给 textarea 装一个最小的真实布局模型：scrollHeight = max(内容高, 当前盒高)。 */
+  function installLayoutModel(el: HTMLElement) {
+    Object.defineProperty(el, 'scrollHeight', {
+      configurable: true,
+      get: () => {
+        const lines = Math.max(1, (el as HTMLTextAreaElement).value.split('\n').length);
+        const content = lines * LINE_H + PAD_V;
+        const h = el.style.height;
+        const cur = !h || h === 'auto' ? 0 : Number.parseFloat(h) || 0;
+        return Math.max(content, cur);
+      },
+    });
+  }
+
+  const taStyle = (wrapper: ReturnType<typeof mount>) =>
+    (wrapper.get('textarea').element as HTMLElement).style;
+  const MIN_PX = 51.2;   // 3.2rem × 16px，= 改动前钉死的 `height: 3.2rem`
+
+  it('空内容 ⇒ 高度恰为改动前的 3.2rem（未输入时界面不跳）', async () => {
+    const { wrapper } = setup();
+    installLayoutModel(wrapper.get('textarea').element as HTMLElement);
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe(`${MIN_PX}px`);   // 内容高 32 < 51.2 ⇒ 夹到 min
+  });
+
+  it('内容变高 ⇒ 样式跟着变；超预算 ⇒ 钉在封顶并开纵向滚动', async () => {
+    const { store, wrapper } = setup();
+    installLayoutModel(wrapper.get('textarea').element as HTMLElement);
+    await flushPromises();
+
+    store.inputValue = Array(6).fill('行').join('\n');   // 6 行 → 132px
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe(`${6 * LINE_H + PAD_V}px`);
+    expect(taStyle(wrapper).overflowY).toBe('hidden');     // 未超预算不许带滚动条
+
+    store.inputValue = Array(200).fill('行').join('\n');  // 远超预算
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe('307.2px');        // = 768 × 40%，流区不被挤没
+    expect(taStyle(wrapper).overflowY).toBe('auto');        // 封顶后必须能滚，否则内容被裁且看不见
+  });
+
+  // 本单最关键的判据：长文本进输入框有四条路是**程序改值**（发送失败回填 / 入队失败回填 /
+  // 切会话恢复草稿 / 多条拼接，见 workbench.ts:1350 / :1475 / :904 / :1513）。
+  // 变异 M1：把 watch 换成只听 DOM `input` 事件 ⇒ 本条与上面两条一起红（已亲跑）。
+  it('只改 store 值（不触发 DOM input 事件）也重算——四条回填路的共同前提', async () => {
+    const { store, wrapper } = setup();
+    installLayoutModel(wrapper.get('textarea').element as HTMLElement);
+    await flushPromises();
+
+    store.inputValue = '发送失败后回填的原文\n第 2 行\n第 3 行';   // 全程不 trigger('input')
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe(`${3 * LINE_H + PAD_V}px`);
+  });
+
+  // 变异 M2：删掉 autosize 里 `ta.style.height = 'auto'` 那一行 ⇒ 本条必红（已亲跑）。
+  // 钉的是 textarea 自适应真正的坑：scrollHeight 不低于当前盒高，不先松开就只涨不落。
+  it('内容变短 / 清空 ⇒ 高度回落（发完长消息不许把空框一直撑在那）', async () => {
+    const { store, wrapper } = setup();
+    installLayoutModel(wrapper.get('textarea').element as HTMLElement);
+    await flushPromises();
+
+    store.inputValue = Array(11).fill('行').join('\n');   // 11 行 → 232px
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe(`${11 * LINE_H + PAD_V}px`);
+
+    store.inputValue = '';                                // 发完清空
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe(`${MIN_PX}px`);
+    expect(taStyle(wrapper).overflowY).toBe('hidden');
+  });
+
+  // 变异 M3：把封顶算成固定像素（不读视口）⇒ 第二段必红（已亲跑）。
+  it('视口变矮（转屏 / 移动端键盘弹起）⇒ 重算封顶，已撑开的高度跟着收', async () => {
+    const { store, wrapper } = setup();
+    const el = wrapper.get('textarea').element as HTMLElement;
+    installLayoutModel(el);
+    store.inputValue = Array(200).fill('行').join('\n');   // 先撑到封顶
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe('307.2px');
+
+    vi.stubGlobal('innerHeight', 400);   // 键盘弹起：视口从 768 塌到 400
+    window.dispatchEvent(new Event('resize'));
+    await flushPromises();
+    expect(taStyle(wrapper).height).toBe('160px');
+  });
+
+  // 结构锁：旧实现是内联 `style="height: 3.2rem"`，写死的值会永远压住 JS 算出来的高度
+  // （内联样式优先级高于组件后写的 class），自适应会被静默失效。
+  it('不再携带钉死的 height 内联样式（旧值会盖住自适应）', async () => {
+    const { wrapper } = setup();
+    await flushPromises();
+    const raw = wrapper.get('textarea').attributes('style') ?? '';
+    expect(raw).not.toContain('3.2rem');
+    expect(wrapper.get('textarea').classes()).toEqual(expect.arrayContaining(['min-h-[3.2rem]']));
   });
 });
 

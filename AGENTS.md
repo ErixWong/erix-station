@@ -3119,16 +3119,20 @@ DTO 立刻给出 `round=25 hasSummary=False src=llm trunc=True text=1278B range=
 ⇒ 读侧改动可以**只换 portal 镜像、不重跑 run、不动账本**验证，这条比「再造一个长会话」便宜一个数量级。
 
 **M2 = `folding.toolResultTtl=6` / `toolResultFoldMinTokens=8000`（引擎默认 `2 / 4000`）。**
-⚠ **本片没能用 A/B 证明收益，注释与台账都如实写「待验证的裁定」**（⚠ **下面这段的判据后来被证伪，见 §8.87**——「0 条 `compaction` 事件」不等于「TTL 层没触发」，TTL 层根本不发那个事件）：v0.1.46 真机基线（12 个 4971 token
+⚠ **本片没能用 A/B 证明收益，注释与台账都如实写「待验证的裁定」**（⚠ **这段的结论已被 §8.87 两次更正**——
+「0 条 `compaction` 事件」对**那次探针 run 是正确观察**（上下文最大 9 万 < 预算 46 万，确实没折），
+错的是把它推广成「死旋钮」；TTL 层**是**发 `compaction` 事件的）：v0.1.46 真机基线（12 个 4971 token
 文件、8 轮、budget≈460K）观测到 **0 条 `compaction` 事件**、`input_tokens` **单调递增**
 `4891→10639→18403→26962→43266→55463→68010→90263`（TTL 若折过必然回落）。引擎侧 `shouldSchedule`
-要求 `effectiveMaxRounds - budgetRounds > 2` **且** `lowBudgetPrompted !== true`
-（`src/compact/pipeline.js:21-26`）⇒ **多轮任务一旦开始催收尾，TTL 层就关了**，而这正是多轮任务的常态。
-⇒ 教训：**「引擎有这个旋钮」不等于「本站的场景会走到它」**；调参前先量「这一层到底触发没有」，
-否则调的是一个死旋钮（#331 死光纤的同族）。两行集中在 `#440:ttl-knobs` 标记里，回退 = 删两行。
+要求 `remaining > 2` **且** `lowBudgetPrompted !== true`（`src/compact/pipeline.js:21-27`）
+⇒ 这一层是**有条件**调度，不是「多轮任务必然关掉」（todo-multi 那 60 轮在第 50–57 轮折了 75 次，
+两个条件在那里是满足的 —— 见 §8.87）。
+⇒ 教训：**「引擎有这个旋钮」不等于「这一次的 run 会走到它」**；调参前先量「这一层到底触发没有」，
+否则你以为在调参、其实那次 run 根本没到那一层（#331 死光纤的同族）。两行集中在 `#440:ttl-knobs` 标记里，回退 = 删两行。
 另核实：引擎**不校验**这两个叶子的类型（`CONFIG_LEAF_VALUE_RULE_PATHS` 只有 `run.stream` /
-`continuity.handoff`；真链路实测 `'6'` / `-1` / `null` / `1.5` 全部正常收尾、不抛不告警，
+`continuity.handoff` / `metadata.modelMetadata`；真链路实测 `'6'` / `-1` / `null` / `1.5` 全部正常收尾、不抛不告警，
 静默退化成「TTL 折叠失效」）⇒ 本站补 `assertFoldingToolResultKnobs`（`0` 合法 = 关掉）。
+**该缺口已作为 erix-agent#718 提出**（2026-11-05，P2，取证与三段复现脚本在单里）。
 
 **基线**：根 **1727/1723/0/4 → 1736/1732/0/4**（+9）、runner **439 → 443**、前端 **53 文件 / 985 → 993**、
 `typecheck` rc=0。**主 agent 亲跑 6 条变异**全红在具名用例，其中 **M6（`foldedFactsByRound` 用数组下标
@@ -3211,27 +3215,40 @@ main CI `41577347490` 两个 job 全绿 → tag `v0.1.48` → release `415779232
 `runner/test/final-text-fallback.test.js` 与 `internal.test.js` 的落库/幂等用例；③ `budgetTokens` 显式预算未接
 （窗口派生够用，要接得先量差）；④ `verification.guardVerdict` / `deliverables` 结构上不产生，不接。
 
-### 8.87 更正 §8.85/§8.86 的「TTL 层未触发」：判据用错了落点，TTL 一直在工作（省 31.4 万 token）（2026-11-03）
+### 8.87 §8.85/§8.86 的「TTL 没作用」是错的（它省了 31.4 万 token）——但**这次纠错自己也编了一个假机制**，2026-11-10 二次更正
 
-**这不是新功能，是一次判据纠错。** 用户追问「TTL 是几轮后挪走对吧？为什么这是问题」时我回去查数据，
-发现**两版台账的核心结论是错的**。
+> **两轮错误，按时间顺序读**（别只看中间那段就以为是最终结论）：
+> **第一轮（§8.85/§8.86）**：8 轮探针 run 观测到 0 条 `compaction` 事件 ⇒ 结论写成「TTL 是死旋钮」。
+> **第二轮（本节 2026-11-03 原文）**：为纠正上一条，我编了一个机制——「TTL 层根本不发 `compaction` 事件，
+> 那条事件只由预算层发」。
+> **第三轮（2026-11-10 复核，本节现状）**：那个机制**是假的**，TTL 层**会**发 `compaction` 事件。
 
-**错在哪**：我把「`run_events` 里 `type='compaction'` 事件数 = 0」当成「TTL 层没触发」。而
-**TTL 层根本不发 `compaction` 事件**——那条事件是**预算层**（策略层 / `slidingWindow`）折叠时才发的。
-TTL 层走的是另一条路（`provider-runner.js:228-238`）：
+#### 现在成立的事实（2026-11-10 现查 0.31.0 源码 + 真库）
 
-```
-foldToolResultsForRequest(...) → ttlStats.foldedCount > 0
-  → ctx.recordCompactionLayer({layerId:'ttl', ...})
-  → orchestrator.js:2728 recordCompactionLayer → recordCompactionStat
-  → runToolLoop 返回值的 result.compactionStats[]（每轮一条）
-  → 引擎写进轮记录 transcript_rounds.record.compactionStats
-```
+**① TTL 层发 `compaction` 事件，而且一直在发。**
 
-而 `runner/worker.js` **从来没消费过 `result.compactionStats`**（只读 `termination`/`usage`/`rounds`/`finalText`/
-`finalTextFallback`）⇒ 这个事实**一直在轮记录里躺着，没人看**，所以我两次都读到了「0」。
+- 源码：`provider-runner.js:228-238` 在 `ttlStats.foldedCount > 0` 时调
+  `ctx.recordCompactionLayer({layerId:'ttl', …})`；`orchestrator.js` 的 `recordCompactionLayer` →
+  `recordCompactionStat`，而 `recordCompactionStat` **无条件**
+  `emitEvent({type:'compaction', round, compaction})`。0.30.0 与 0.31.0 逐字相同。
+- 真库：`run_events` 里 `type='compaction'` 且 `layers.ttl.triggered > 0` 的行存在——todo-multi 那三个 run
+  分别 **27 / 13 / 13** 条，逐条带 `layers.ttl.{triggered,tokensSaved}`。
 
-**真相（现查全库 82 条带 `compactionStats` 的轮记录）**：
+**② 所以 §8.85/§8.86 那次「0 条事件」不是判据用错落点，而是那次 run 真的没折。**
+
+12 个 4971 token 文件、8–11 轮、`input_tokens` 单调爬到 90 263，而预算 ≈460 K ⇒ 上下文从来没到过折叠线，
+`ttl` 层一次都没被调度。**0 是正确观察**，错的是把它推广成「死旋钮」。
+
+**③ `ttl` 层的调度条件是「有条件」，不是「多轮任务必然关掉」。**
+`compact/pipeline.js:21-27`：`remaining = effectiveMaxRounds − budgetRounds`，要求 `remaining > 2`
+**且** `lowBudgetPrompted !== true`。todo-multi 那 60 轮在第 50–57 轮折了 75 次 ⇒ 那两个条件在那里**是满足的**。
+所以「多轮任务一旦开始催收尾 TTL 就关」这句也是过度概括。
+
+**④ 仍然成立的观测缺口（→ #451 / §8.88）**：`runner/worker.js` **从不消费** `result.compactionStats`
+（只读 `termination`/`usage`/`rounds`/`finalText`/`finalTextFallback`），所以「这一层到底折了多少」
+在会话级界面上看不见。§8.88 的 `session.compaction` 就是补这个。
+
+**真相（现查全库 82 条带 `compactionStats` 的轮记录，2026-11-03 快照）**：
 
 | 层 | triggered | tokensSaved |
 |---|---|---|
@@ -3247,19 +3264,25 @@ foldToolResultsForRequest(...) → ttlStats.foldedCount > 0
 
 **所以 `toolResultTtl` 2 vs 6 的区别是真实的**：`ttl=2` 时第 N 轮的工具结果第 N+2 轮变占位符，`ttl=6` 时第 N+6 轮才变
 ⇒ 多保留 4 轮原文（好处是不用重读，代价是上下文更大、可能更早触发策略折叠）。**但 `ttl=6` 至今没有长会话数据**
-（v0.1.47 凌晨才部署，之后只跑过两个短 run）⇒ 6 是好是坏**仍未验证**，需要一次 60 轮量级的 A/B
-（基线就是 todo-multi 第 3 轮：60 轮 / 1.95M token / 75 次 TTL 折叠）。
+—— 2026-11-10 现查：TTL 折叠**最后一次发生在 11-02**，全是 v0.1.47 之前的 `ttl=2` 时代；v0.1.47 之后**一次都没折过**
+（因为没有再出现过 ≥30 轮的会话）。⇒ 6 是好是坏**仍未验证**，要验只能真跑一个 60 轮 ~2M token 的任务
+（基线 = todo-multi 第 3 轮：60 轮 / 1.95M token / 75 次 TTL 折叠）。**当前裁定：不做这个 A/B**
+（2M token 换一个配置值，而项目正在跑安全线）；等自然出现一个 ≥30 轮会话时样本免费到手。
 
-**教训（比结论值钱）**：**「引擎有这个层」≠「它在事件面可见」。** 判据必须落在**事实的落点**上：
-问「某层触发了没有」，就去读那一层自己写的地方（这里是 `compactionStats`），而不是读一个**看起来相关但只覆盖部分层**
-的观测面（`compaction` 事件只覆盖预算层）。同类形状：`foldSummary` 只在 `compaction` 事件里（§8.73）、
-`finalTextFallback` 只在 `runToolLoop` 返回值上（§8.86）——**每个事实都有自己的出口，猜出口就会得出反向结论**。
-⚠ 这条错误的代价不是返工，是**我差点建议用户撤掉一个正在省 31 万 token 的配置**（撤的依据是「它没作用」，
-而它其实在长会话里一直工作）。⇒ **撤一个东西之前，先证明它在自己的落点上确实没工作。**
+**教训（比结论值钱，两轮都适用）**：
 
-**修法**：观测面单开一片（工单 `.work-orders/compaction-stats-observability.md`）——读侧从
-`transcript_rounds.record.compactionStats` 聚合出 `session.compaction`（零 DDL、覆盖存量），前端在既有位置给一行
-「压缩：TTL 折 N 条（省 X token）· 窗口折 M 次」。这样「压缩有没有在工作」一眼可见，不必每次翻 SQL。
+- **「引擎有这个层」≠「它在事件面可见」** —— 这句话本身对，但它当时把我推向了「既然不可见，那它一定不发事件」
+  的**编造**。**不可见 ≠ 不存在**：先 `grep` 发射点，再下结论。
+- **一个 8 轮的探针 run 证明不了「某一层从来不工作」**。它只证明「这次没走到」。要推广到「死旋钮」
+  必须有跨会话样本（那次现查全库才拿到，而第二次我连这一步都省了）。
+- **每个事实都有自己的出口**：`foldSummary` 只在 `compaction` 事件里（§8.73）、`finalTextFallback` 只在
+  `runToolLoop` 返回值上（§8.86）、TTL 的计数**既发事件也落轮记录**。猜出口会得出反向结论。
+- ⚠ 代价不是返工：第一轮我差点建议用户**撤掉一个正在省 31 万 token 的配置**；第二轮又把这个配置的观测面描述错，
+  等于给下一个人埋了同一颗雷。⇒ **撤或改之前，先证明它在自己的落点上确实（没）工作。**
+
+**修法**（已完成，见 §8.88）：读侧从 `transcript_rounds.record.compactionStats` 聚合出 `session.compaction`
+（零 DDL、覆盖存量），前端在既有位置给一行「压缩：TTL 折 N 条（省 X token）· 窗口折 M 次」。
+这样「压缩有没有在工作」一眼可见，不必每次翻 SQL。
 
 ### 8.88 v0.1.49：`compactionStats` 观测面（#445）—— 压缩有没有在工作，界面上看得见（2026-11-03）
 
@@ -4131,6 +4154,11 @@ fde `cb8d031b…` / proxy `dccb48aa…`，`RepoDigests` 含清单 digest）→ `
 **505 / 505**、前端 `typecheck` rc=0 + **61 文件 / 1217 通过**。（台账里 §8.100/§8.102 的 1948 / 481 / 1171 已被
 delegate + #468 那几波推高，别再引旧数。）
 
+> ⚠ **2026-11-10 现价刷新**（`main@13be2ce` 实测，四步 rc 全 0）：根 **2120 / 2116 通过 / 0 失败 / 4 跳过**、
+> runner **505 / 505** 不变、`node --check` **252** 个文件、前端 **61 文件 / 1249 通过**。上段那组是 §8.104
+> 当时的快照（v0.1.57），此后 v0.1.58–v0.1.62 的 #472/#468/delegation 等把根 +119、前端 +32、文件 +9。
+> **三处台账（本节 / `docs/ops/ci-release.md` 现价块 / `ci.yml` 步骤 ② 注释）已同批改成这一组值。**
+
 **台账三处对齐（2026-11-09，`main@91e748a` 复跑同值）**：这组数此前只有本节对，另外两处台账各停在不同版本——
 `docs/ops/ci-release.md` §1 步骤② 写着 `1932 / 1928`、`:66` 写「当前 1460 里已含 runner 的 334 项」、步骤③ `473/473`、
 步骤④ `59 文件 / 1149`、步骤① 「142 个文件」；`.github/workflows/ci.yml` 步骤② 注释写 `1401 项基线`。
@@ -4236,3 +4264,50 @@ delegate + #468 那几波推高，别再引旧数。）
 **现状（2026-11-10 退役核对）**：`#472` CLOSED；本单代码在现网 **v0.1.62** 里完好（`upload_disabled` / `file_upload_enabled` / `resolveJailedRoot` 均在，`schema_migrations` head = `0029-user-file-upload`）。**开关现状（决策者 2026-11-10 拍板）**：`eric` 的 `file_upload_enabled = true` **有意保留**（验收时开启，`audit_log` `2026-11-09 08:56:36Z`、`target=eric`；其余用户全 `false` = 出厂默认）——**别再当「探针残留」去复原它**。
 
 **已知边界**：v1 **无配额**（任一用户可写满 userspace，影响所有容器）——**已开单 [#485](https://github.com/ErixWong/erix-station/issues/485) 承接**（① 单文件上限进管理台、DB 优先 env；② 每 FDE 目录总量上限走**文件系统配额**，判据是「容器里 `dd` 也必须失败」，不是「上传被拦」）；`MAX_BODY_BYTES` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。⚠ userspace 真实路径是 **`/srv/erix/users`**（`ERIX_USERSPACE_ROOT_HOST`），文档惯例写的 `/docker/erix/users` 在本机不存在，别照惯例 grep。
+
+### 8.109 composer 输入框按内容自适应高度（issue #466 / #467，2026-11-10 落地）
+
+**两张单是同一件事**（#467 是 #466 的重复单）。代码早在 2026-11-06 就写完了，落在
+`origin/feat-261106-01-466-composer-autosize` 的 `0a04369`，**但一直没合进 main**（分支 1 ahead / 50 behind），
+所以两张单挂着 open 而「代码未处理」这件事只有翻分支才看得见。本次是 **rebase 落地**，前端 4 文件逐字未改。
+
+**性质**：纯展示层。多行输入早就是既有能力（Shift+Enter，#370），长文本进框也有四条常态路
+（发送失败回填 `workbench.ts:1350` / 入队失败回填 `:1475` / 切会话恢复草稿 `:904` / 多条拼接 `:1513`），
+但 `ComposerBar.vue` 把 textarea 钉死 `style="height: 3.2rem"` + `resize-none` ⇒ 第 3 行之后被藏住。
+store 语义 / 三键语义 / 依赖全不动。
+
+**四条实现要点（缺一条就是半截）**：① 夹逼算法出纯函数 `lib/composerHeight.ts`（jsdom 不做布局、
+`scrollHeight` 恒 0，逻辑留在组件里只能断言恒真的废话）；② **`watch(store.inputValue)` 而不是 DOM `input`
+事件**（那四条回填路全是程序改值，只挂 DOM 事件正好把要修的场景测不到）；③ 量之前先 `height='auto'`
+（`scrollHeight` 是 `max(内容, 盒高)`，不松开就只涨不落——发完长消息空框一直撑在那）；④ 封顶是**预算**
+不是像素（min 沿用 3.2rem ⇒ 空输入视觉不变；max = 视口 40%，顶到预算 `overflowY:auto` 自己滚，
+并监听 `resize` 重算；`borderBoxExtraPx()` 补 border-box 下 `scrollHeight` 不含的上下边框）。
+
+**判据**（前端 62 文件 / 1249 → **63 文件 / 1266**，`typecheck` rc=0；根与 runner 零改动）：纯函数层 11 条
+（min/max/NaN/非 px 根字号/两位小数取齐）+ 组件层 6 条。组件层的 `scrollHeight` **不是假成常数**，而是按
+`max(行数×行高+padding, 当前盒高)` 建的最小布局模型——否则「内容变短要回落」那条测的是常数比常数。
+
+**主 agent 亲跑 6 条变异（每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原）**：
+删 `height='auto'` 复位 ⇒ 1 红（回落那条）· 删 `watch` ⇒ **4 红**（含「只改 store 值也重算」那条）·
+封顶比例 0.4→0.5 ⇒ 2 红 · 删 `overflowY` 切换 ⇒ 2 红 · `parseRootFontPx` 放宽成 `parseFloat` ⇒ 1 红 ·
+删 min 夹逼 ⇒ **4 红**（两层同时咬）。
+
+**真机浏览器验收（2026-11-10，1280×720，`erix_station_playwright`；手法 = 本地 `npm run build` 的 dist
+`docker cp` 进 `station-portal:/app/portal/static/app/`，验完 cp 回基线并核对入口文件名复原）**
+
+| 场景 | 实测 |
+|---|---|
+| 空输入（1 行） | inline `height: 62px`（= `scrollHeight 60` + 2px border），`min-h-[3.2rem]`=51.2 **不生效** |
+| 5 行 / 10 行 | 134px / 254px（逐行增长） |
+| 60 行 | **288px = 720×40%**，`overflowY: auto` ⇒ 封顶与滚动条都成立 |
+| 对话区高度 | 594px → 368px（60 行时）⇒ **没被挤没**，封顶就是为了这个 |
+| 程序改值（切走再切回会话，草稿由 store 恢复） | 62px → **254px** ⇒ 「watch store 而不是 DOM `input` 事件」在真浏览器上成立 |
+
+⚠ **一处口径更正（只有真浏览器给得出）**：本节初稿与提交信息都写「min 沿用 3.2rem ⇒ **空输入时视觉一字不变**」，
+**不成立**——真实行高下空 textarea 的 `scrollHeight` 已经是 60 > 51.2，`min` 根本不 bind，空框从改动前的
+51.2px 变成 **62px**。单测里那条「空内容 ⇒ 51.2px」是**布局模型参数**（20px/行）造成的，不是真机事实：
+夹逼函数本身没错，错的是「视觉不变」这句承诺。`min-h` 保留（根字号被调小时它才承重），承诺改成
+「空输入时高度 = 一行内容的自然高度（≈62px），不再是钉死的 3.2rem」。
+
+**已知边界（刻意）**：预算取视口 40%（不是固定像素）⇒ 极小窗口下 min 优先（`maxPx = max(minPx, vh×40%)`）；
+`overflow-x` 常关（textarea 默认软换行，长 URL 靠换行而非横向滚动）。
