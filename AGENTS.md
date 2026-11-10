@@ -4264,3 +4264,50 @@ delegate + #468 那几波推高，别再引旧数。）
 **现状（2026-11-10 退役核对）**：`#472` CLOSED；本单代码在现网 **v0.1.62** 里完好（`upload_disabled` / `file_upload_enabled` / `resolveJailedRoot` 均在，`schema_migrations` head = `0029-user-file-upload`）。**开关现状（决策者 2026-11-10 拍板）**：`eric` 的 `file_upload_enabled = true` **有意保留**（验收时开启，`audit_log` `2026-11-09 08:56:36Z`、`target=eric`；其余用户全 `false` = 出厂默认）——**别再当「探针残留」去复原它**。
 
 **已知边界**：v1 **无配额**（任一用户可写满 userspace，影响所有容器）——**已开单 [#485](https://github.com/ErixWong/erix-station/issues/485) 承接**（① 单文件上限进管理台、DB 优先 env；② 每 FDE 目录总量上限走**文件系统配额**，判据是「容器里 `dd` 也必须失败」，不是「上传被拦」）；`MAX_BODY_BYTES` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。⚠ userspace 真实路径是 **`/srv/erix/users`**（`ERIX_USERSPACE_ROOT_HOST`），文档惯例写的 `/docker/erix/users` 在本机不存在，别照惯例 grep。
+
+### 8.109 composer 输入框按内容自适应高度（issue #466 / #467，2026-11-10 落地）
+
+**两张单是同一件事**（#467 是 #466 的重复单）。代码早在 2026-11-06 就写完了，落在
+`origin/feat-261106-01-466-composer-autosize` 的 `0a04369`，**但一直没合进 main**（分支 1 ahead / 50 behind），
+所以两张单挂着 open 而「代码未处理」这件事只有翻分支才看得见。本次是 **rebase 落地**，前端 4 文件逐字未改。
+
+**性质**：纯展示层。多行输入早就是既有能力（Shift+Enter，#370），长文本进框也有四条常态路
+（发送失败回填 `workbench.ts:1350` / 入队失败回填 `:1475` / 切会话恢复草稿 `:904` / 多条拼接 `:1513`），
+但 `ComposerBar.vue` 把 textarea 钉死 `style="height: 3.2rem"` + `resize-none` ⇒ 第 3 行之后被藏住。
+store 语义 / 三键语义 / 依赖全不动。
+
+**四条实现要点（缺一条就是半截）**：① 夹逼算法出纯函数 `lib/composerHeight.ts`（jsdom 不做布局、
+`scrollHeight` 恒 0，逻辑留在组件里只能断言恒真的废话）；② **`watch(store.inputValue)` 而不是 DOM `input`
+事件**（那四条回填路全是程序改值，只挂 DOM 事件正好把要修的场景测不到）；③ 量之前先 `height='auto'`
+（`scrollHeight` 是 `max(内容, 盒高)`，不松开就只涨不落——发完长消息空框一直撑在那）；④ 封顶是**预算**
+不是像素（min 沿用 3.2rem ⇒ 空输入视觉不变；max = 视口 40%，顶到预算 `overflowY:auto` 自己滚，
+并监听 `resize` 重算；`borderBoxExtraPx()` 补 border-box 下 `scrollHeight` 不含的上下边框）。
+
+**判据**（前端 62 文件 / 1249 → **63 文件 / 1266**，`typecheck` rc=0；根与 runner 零改动）：纯函数层 11 条
+（min/max/NaN/非 px 根字号/两位小数取齐）+ 组件层 6 条。组件层的 `scrollHeight` **不是假成常数**，而是按
+`max(行数×行高+padding, 当前盒高)` 建的最小布局模型——否则「内容变短要回落」那条测的是常数比常数。
+
+**主 agent 亲跑 6 条变异（每条先 `git diff --numstat` 自证非空操作，跑完 `git checkout --` 复原）**：
+删 `height='auto'` 复位 ⇒ 1 红（回落那条）· 删 `watch` ⇒ **4 红**（含「只改 store 值也重算」那条）·
+封顶比例 0.4→0.5 ⇒ 2 红 · 删 `overflowY` 切换 ⇒ 2 红 · `parseRootFontPx` 放宽成 `parseFloat` ⇒ 1 红 ·
+删 min 夹逼 ⇒ **4 红**（两层同时咬）。
+
+**真机浏览器验收（2026-11-10，1280×720，`erix_station_playwright`；手法 = 本地 `npm run build` 的 dist
+`docker cp` 进 `station-portal:/app/portal/static/app/`，验完 cp 回基线并核对入口文件名复原）**
+
+| 场景 | 实测 |
+|---|---|
+| 空输入（1 行） | inline `height: 62px`（= `scrollHeight 60` + 2px border），`min-h-[3.2rem]`=51.2 **不生效** |
+| 5 行 / 10 行 | 134px / 254px（逐行增长） |
+| 60 行 | **288px = 720×40%**，`overflowY: auto` ⇒ 封顶与滚动条都成立 |
+| 对话区高度 | 594px → 368px（60 行时）⇒ **没被挤没**，封顶就是为了这个 |
+| 程序改值（切走再切回会话，草稿由 store 恢复） | 62px → **254px** ⇒ 「watch store 而不是 DOM `input` 事件」在真浏览器上成立 |
+
+⚠ **一处口径更正（只有真浏览器给得出）**：本节初稿与提交信息都写「min 沿用 3.2rem ⇒ **空输入时视觉一字不变**」，
+**不成立**——真实行高下空 textarea 的 `scrollHeight` 已经是 60 > 51.2，`min` 根本不 bind，空框从改动前的
+51.2px 变成 **62px**。单测里那条「空内容 ⇒ 51.2px」是**布局模型参数**（20px/行）造成的，不是真机事实：
+夹逼函数本身没错，错的是「视觉不变」这句承诺。`min-h` 保留（根字号被调小时它才承重），承诺改成
+「空输入时高度 = 一行内容的自然高度（≈62px），不再是钉死的 3.2rem」。
+
+**已知边界（刻意）**：预算取视口 40%（不是固定像素）⇒ 极小窗口下 min 优先（`maxPx = max(minPx, vh×40%)`）；
+`overflow-x` 常关（textarea 默认软换行，长 URL 靠换行而非横向滚动）。
