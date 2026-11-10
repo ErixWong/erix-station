@@ -4311,3 +4311,60 @@ store 语义 / 三键语义 / 依赖全不动。
 
 **已知边界（刻意）**：预算取视口 40%（不是固定像素）⇒ 极小窗口下 min 优先（`maxPx = max(minPx, vh×40%)`）；
 `overflow-x` 常关（textarea 默认软换行，长 URL 靠换行而非横向滚动）。
+
+### 8.110 v0.1.63：登录第二步改成真 switch + 邮件码懒发信（#449 尾巴，PR #487，2026-11-10）
+
+**用户反馈两条，都成立**：① `#449` 的「二选一」在界面上等于不存在——入口只是 TOTP 表单下面一行
+下划线小字「改用邮箱验证码」，没人看见，输完 TOTP 就进去了；② **每次登录都收到一封验证码邮件**——
+`handleSecondFactorChoice` 在口令一通过就发信，哪怕用户根本不用邮件码（两天 7 封）。
+
+**后端（`portal/src/http.js#handleSecondFactorChoice`）**：第一步**一封都不发**。删掉
+`mailer.send` / `createEmailCode` / `invalidateOtherCodes` / `auth.email_code_sent` 审计 /
+`emailSendLimiter.recordFailure`；保留 `createPendingToken`（两路共用一枚）。成功形状改成
+`email_deferred: true` 且**不带 `email_sent`**——前端不可用判据是
+`email_sent === false || email_unavailable === true`，「还没发」必须与「不可用」分得开，
+否则邮箱档在第一步就被剥掉（正是要修的那个缺陷）。仍做**非消费型预检**：`mailer.enabled !== true`
+或 `email:<ip>` 限流不允许 ⇒ 走既有降级形状（`methods:['totp']` + `email_unavailable` +
+`notice`，错误码与文案零改动，绝不 503）。无 TOTP 账号（`email_code_required`）**仍第一步就发**，
+加了回归锁。**零新端点**：第一封由前端切档时调既有 §2.3b resend 端点发出——
+`recordResend` 的「该 pending 下零码行 ⇒ 当首次发信、不套 60s 冷却」本来就是为这条路径准备的。
+
+**前端**：第二步表单**上方**两档 switch（`role="radiogroup"` + 两档 `role="radio"` + `aria-checked`，
+默认 TOTP），表单随档位切换；`choiceMethods.length < 2`（单通道 / 降级）**不渲染 switch**。
+store 新增 `emailSent`（手上有没有码）与 `emailSending`（重入闸 + UI 禁用）；`requestEmailCode()`
+**复用** `resendEmailCode()`（后者改成返回布尔，additive），不复制第二份请求代码；
+`switchFactor('email')` 触发一次，**切回 totp 零请求**，已发过再切回不再发；发信失败**不**强行切回 TOTP。
+i18n 新增 `factorSwitchLabel` / `factorTotp` / `factorEmail` / `emailSending`，删掉 `useEmailCode` / `useTotp`。
+
+**判据**（主 agent 亲跑，判绿=退出码）：根 **2122 / 2118 通过 / 0 失败 / 4 跳过**（基线 2120/2116）、
+`npm run typecheck` rc=0、前端 **63 文件 / 1283 通过**（基线 62/1249）。**主 agent 自己的 3 条变异**：
+`email_deferred`→`email_sent` ⇒ 后端 4 条具名红；`showFactorSwitch` 放宽成 `length >= 1` ⇒ 前端 3 红；
+`switchFactor` 去掉 `factor === 'email'` ⇒ 恰 1 红（「切回 TOTP 零请求」）。执行体另跑 A–I 共 9 条全红，
+并**自曝 3 处自家假绿**（`emailSending` 重入门在切档路径打不到、`aria-checked` 只在默认档断过、
+「切回 TOTP 不发信」只在 `emailSent=true` 后断过）——三处都补了用例，这正是「变异不红先自证非空操作」的收益。
+
+**真机验收（v0.1.63 发布物，主 agent 亲手，真浏览器）**：`eric` + 口令 ⇒ 第二步出现
+`radiogroup "Second factor method"` + 两个 radio，默认 `Authenticator app` 选中，而**库里的码行/发信审计
+停在 10/10 一动不动**（懒发信成立）；点「Email code」⇒ 表单当场换成邮箱码（「A code was sent to
+e***@i***.com」+ 重发冷却 57s）且计数变 **11/11**（**恰好一封**）；切回 TOTP 再切回邮箱 ⇒ 仍是 **11/11**
+（不重复发）；随后用 TOTP 完成登录 ⇒ 落 `#/`，审计 `auth.login_success method=totp`。
+截图 `/docker/erix_station_playwright/v0163-switch-totp.png`。
+
+**过程账（三条，都比代码值钱）**
+1. **执行体撞 30 分钟硬顶**（`1800000ms` 是上限）：M1 落地后被掐，M2/M3 未做。用户选「续跑同一执行体」，
+   续跑后三个里程碑全绿。⇒ 派工给宽活时**里程碑必须各自 commit**（这次 M1 的 commit 让续跑不用重做）。
+2. **变异脚本自己坏了**：`/tmp/mut.py` 对 B–F 全抛 `KeyError`（字典没那些键），而外层循环打印的 `rc=0`
+   是 **shell 的退出码**⇒ 6 条变异里 5 条是空操作。若不拦，结论会变成「测试覆盖不足」。
+   ⇒ **口径：变异脚本必须先打印键名 + 每条变异用 `git diff --numstat` 自证改了字节**。
+3. **测试泄漏让每条变异白等 5 分钟**：helper **先开 server 再断言**，断言一抛 server 没人 `close()`，
+   事件循环永不空 ⇒ 跑完 24 条 ok 也不退出。修法：断言移出 helper（调用方本来有 `try/finally`），
+   或模块级 `after()` 统一收摊。判据：单文件应 **4 秒内退出**（实测 3.9s）。
+
+**已知边界**：① 懒发信之后「SMTP 配了但当下发不出去」**第一步看不出来了**（不试发就不知道），
+失败推迟到切档发第一封时（`503 email_send_failed`，pending 不作废，可切回 TOTP）——这是「先拨才发」的
+必然代价，已用 ⑭b 钉住；② `emailSent = data.email_sent === true` 是**新前端 + 旧后端**的兼容位
+（旧后端第一步真发了信就不为一次切换白寄）；③ 「二选一」**没有功能旗标 env**（§8.73 口径），
+要全站关掉就关管理台的 Mail channel（⚠ 那会让「无 TOTP + 开关开」的账号登不进去）。
+
+**部署**：本版只 pin **portal**（`474a62ed…` / imageId `751b6807…`）；`runner/` 的改动来自并行 session 的
+`#486`（`compact-knobs.js`），**故意没重建 5 台 FDE**——那批改动等它自己的发版窗口。
