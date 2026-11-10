@@ -4426,3 +4426,47 @@ portal 实跑 `47b83d49…`、`healthz=200`、浏览器 bundle = `index-BsJZeRng
 ⇒ **口径：纯前端/纯 portal 的可见变更，合完就顺手发版**（只 pin portal 一个镜像、不重建 FDE、几分钟），
 别把「等窗口」用在「用户马上要看的按钮」上。截图 `/docker/erix_station_playwright/488-hide-button-live.png`
 （会话行 hover 后右侧第三颗 = 眼睛带斜线，前两颗仍是 ✨ AI 改名 / ✏️ 重命名）。
+
+### 8.112 v0.1.65：管理台「二次验证」tab + 两个 checkbox + 后端 `totp_login_enabled` 一维（PR #490，2026-11-10）
+
+**用户三轮反馈收口**：① 管理台里找不到「二选一」（埋在 `安全` tab、是个原始勾选框）；②「你这谁看了会觉得
+这是 switch？」；③「把邮件和 TOTP 这两个放到单独的 tabpage」「用 checkbox 就行，check 了就显示相关控件」。
+
+**UI**：用户编辑抽屉新增 **`二次验证`** tab（`资料 / 安全 / 二次验证 / LLM 与仓库 / 预览端口 / 危险操作`），
+`TOTP 设置` 与 `邮件验证码` 从 `安全` 搬进去（`安全` 只留 `重置密码` + `文件上传`）。里面是**两个独立
+checkbox**（`data-test="mfa-totp-checkbox"` / `mail-otp-enabled`）：勾上才 `v-if` 展开对应块；TOTP **未绑定**
+⇒ 该框禁用 + 显示「未绑定」+ 绑定按钮就在这一行；**两个都不勾** ⇒ tab 顶部 `.syserr` 红字
+「该账号将只用口令登录（无第二因素）」（决策者 2026-11-10 拍板：**允许**，但必须警告）。
+保存按钮 `save-mfa-settings` **只提交改动过的那一位**（PATCH body exact keys），且**永远可见**
+——勾选框与保存按钮刻意住在折叠块**外面**，否则「取消勾选」会把自己和保存按钮一起收起，关掉这件事就再也提交不了。
+
+**后端新增一维 `users.totp_login_enabled`（迁移 `0030`，默认 `true`）**：此前「绑过 TOTP」
+（`totp_secret IS NOT NULL`）与「允许用 TOTP 登录」是**同一位**，于是「密钥留着、但登录只走邮箱验证码」
+在界面上根本表达不出来（要嘛重绑、要嘛删密钥）。现在 `chooseSecondFactor` 的判据变成
+`totpUsable = 绑过 && totpLoginEnabled !== false`，五分支表见 `docs/api/portal.md` §2.2。
+**关掉不清密钥**（`totp_secret` 一字不动）；默认 `true` ⇒ 存量用户升级后行为**一字不变**；
+`totpLoginEnabled` **缺参/缺键按 true**（「没读到」= 「没人关过」）。`auth.js` 两处 SELECT 都要带这一列
+（漏一处就是「登录后和刷新后不一样」）。
+
+**判据**（主 agent 亲跑，判绿=退出码）：根 **2134 / 2130 通过 / 0 失败 / 4 跳过**、`npm run typecheck` rc=0、
+前端 **63 文件 / 1311 通过**。**主 agent 自己的 2 条变异**：红字 `v-if` 改 `false` ⇒ 2 条具名红；
+`mfaChanges` 改成永远提交 `mail_otp_enabled` ⇒ 恰 1 红（「保存只带改动那一位（exact keys）」）。
+执行体另跑 5 条变异全红（含「TOTP 框未绑定时不禁用」「TOTP 块 `v-if` 改 `v-show`」
+「邮件码框被 `totp_enabled` 连带置灰 = #449 红线回归」）。
+
+**真机验收（v0.1.65 发布物，主 agent 亲手，真浏览器）**：tab 列表第 3 项是 `Two-factor`；
+`eric` 两个框都勾着、两块都展开、保存按钮 `disabled`（无改动）；**取消 TOTP** ⇒ TOTP 块消失、
+邮件块仍在、无红字；**两个都取消** ⇒ 两块都消失 + `.syserr` 红字
+「⚠ This account will sign in with the password only (no second factor).」；再勾回来 ⇒ 恢复原状、
+保存按钮回到 `disabled`。**全程没点保存**：事后 `users` 表 `eric` 仍是
+`mail_otp_enabled=t / totp_login_enabled=t / totp_enrolled=t`，`admin.user_updated` 30 分钟内 **0 行**
+（证明「切换 → 不保存 ⇒ 库里一个字节没动」）。截图 `/docker/erix_station_playwright/v0165-mfa-tab.png`。
+
+**已知遗留（下一单可收）**：邮件码块里**还留着旧的「保存邮件码设置」按钮**（`data-test="save-mail-otp"`），
+与新的 `save-mfa-settings` 并存 —— 功能上都对（都只提交 `mail_otp_enabled`），但同一个字段两个保存入口
+是冗余。去掉它要同步改 `AdminView.spec.ts` 的几条用例，本单没做。
+
+**过程账**：这块前端切片连折两个执行体——一次撞 30 分钟硬顶、一次**进程直接消失**（`stale-run
+reconciliation` 判死，内存与系统日志无 OOM 痕迹），两次都**零提交**。⇒ 主 agent 第一次在死之前
+`git add -A` 把后端 WIP 落盘（`8da1286`，61/61 绿），第二次续跑才做完。**教训：执行体死掉时先看工作区有没有
+未提交的成果，`git add -A` + 一条 `wip(...)` 提交是最便宜的保险**（否则 30 分钟的活直接蒸发）。
