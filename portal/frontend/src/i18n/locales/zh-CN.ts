@@ -64,6 +64,9 @@ export const zhCN = {
     emailStepTitle: '输入邮箱验证码',
     emailStepHint: '验证码已发送到 {email}（第二因素）。没收到可以重发。',
     emailCodeLabel: '验证码',
+    // 2026-11-10 用户要求「10 分钟有效这个写到 web 页面上」：分钟数来自服务端 `email_code_ttl_seconds`
+    // （`EMAIL_CODE_TTL_SECONDS` 可覆盖），**前端不写死 10**；服务端没给 ⇒ 整句不渲染。
+    emailCodeTtl: '验证码 {minutes} 分钟内有效。',
     emailCodeSubmit: '验证并登录',
     emailResend: '重发验证码',
     emailResendIn: '{seconds} 秒后可重发',
