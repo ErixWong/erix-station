@@ -4199,3 +4199,40 @@ delegate + #468 那几波推高，别再引旧数。）
 `setRestrictedSessionListener` 是模块级单例（`lib/restrictedSession.ts`），陈旧 router 的回调会打到最新注册者，属同族隐患。
 
 **family A 不在本单**：`GitLightBadge.spec.ts` 的 `Target cannot be null` 在 4 路并发里复现 **0 次**，按工单要求一字未动。
+
+### 8.108 v0.1.60：文件浏览区「上传」按钮 + 管理台按用户开关（`file_upload_enabled`）（issue #472，2026-11-09）
+
+**需求**：工作台目录树里能直接把本地文件传进 FDE 项目目录；谁能传由管理台按用户开关控制（默认关）。
+
+**两片串行**（A 先合，B 在其上）：A = 开关全链（迁移 + 管理台三态 + 会话 DTO），PR **#478**（`fb1e610`）；B = 上传端点 + 按钮，PR **#479**（`810d949`）；发布 PR **#480**（`6e8f000`）→ tag **`v0.1.60`**（release run `42591423435`）。
+
+**只 pin portal 一个镜像**（`runner/` 零改动）：`/srv/erix/users` 是 portal 与 FDE 容器**共享的 RW bind mount** ⇒ 上传完全落在宿主文件系统上，**不需要重建 FDE 镜像/容器、不需要改 `deploy/fde-proxy` 的 `IMAGE_ALLOWLIST`**。这是本单最省的一处设计判断（对照 §8.70 那个「只改一边 ⇒ `create_policy_denied`」的坑：本单压根没有 env 下发面）。
+
+**上传契约**（`docs/api/portal.md` §4.14）：`POST /api/files/upload`，`Content-Type: application/octet-stream`，query `cwd` / `path` / `name` / `overwrite=1`；成功 `201`（覆盖时 `200`）`{path, bytes, overwritten}`。**零 multipart 依赖**（portal 是零依赖 Node ESM，`readRawBody` 那套模式直接复用）。
+
+**六条硬口径（都有判据，别改回去）**
+
+1. **403 `upload_disabled` 在读 body 之前**（`requireSession` → `fde_name` 400 → `file_upload_enabled !== true` ⇒ 403 `details.action='enable_in_admin_console'`）。判据不是「响应码是 403」，而是 **response `finish` 时刻的 `data` 事件数为 0**——否则「先读完再拒」也能过码面判据（这也是 B-1 那 9 条红最初失败的原因：Node 的 `_dump()` 会在响应后继续抽干 body，计数必须在 `finish` 时快照）。
+2. **不覆盖是默认**：目标存在 ⇒ `409 file_exists`（`details.path`）；`overwrite=1` 才覆盖。`rename` 的 `EISDIR`/`ENOTEMPTY` 映射成 `409 file_exists` + `details.reason='target_is_dir'`（否则是 500 裸错误）。
+3. **no-clobber 只有 `linkSync` 是保证**：`renameSync` **恒覆盖**（它就是覆盖语义），`lstat` 快路径是**优化不是安全保证**。实现 = 流式写 `.upload-*.tmp`（`O_CREAT|O_EXCL|O_NOFOLLOW`、`0600`）→ `fchown(fdeUid, fdeGid)` → `fchmod 0660` → `fsync` → `linkSync`（`EEXIST` ⇒ `false` ⇒ 409）。abort / 超限 ⇒ `unlink` 临时文件，**不留残留、不留半截文件**。
+4. **portal 以 root 跑 ⇒ 必须 `fchown` 同时给 uid 与 gid**：只给 uid 会留 `gid=0`（§8.71 同族），FDE 里的 agent（uid 1002 / 主组 1000）就改不动收到的文件。真机实测 `-rw-rw---- 1 eric eric` 逐条对过。
+5. **上限 32 MiB 独立于 `MAX_BODY_BYTES`**（`FILE_UPLOAD_MAX_BYTES`，`413 file_too_large` + `details.max_bytes`）。⚠ **compose 必须显式写 `environment`**——portal 服务**没有 `env_file`**，只在 `deploy/.env` 里加变量不生效（`deploy-env-defaults` 那族判据盯的就是这种两头说法）。
+6. **`=== true` 全站，不许 `Boolean()`**：`Boolean('f') === true` 会让 `"false"` 字符串变成「已开启」。开关三处（`admin.js#safeUser`、`auth.js#toSessionUser`、前端 `stores/auth.ts`）全部 `=== true`；**前端缺键 = 未知 = 不显示按钮**（与 #390-A「键缺席不是 false」同一纪律）。
+
+**开关全链（片 A）**：迁移 **`0029-user-file-upload.sql`**（`ADD COLUMN IF NOT EXISTS … boolean NOT NULL DEFAULT false`，`schema.sql` 一字节未改）；`toSessionUser(row)` 是**唯一 DTO 构造器**（`authenticate` / `verifyTotp` / `loadActiveUser` / `findSessionUser` 四处共用，四处 SELECT 都必须带列——漏一处就是「登录后没按钮、刷新后有」）；`createUser` 的**复活分支显式 `file_upload_enabled = false`**（重新启用 = 重新授权，不继承旧权限）；管理台**三态**（缺键 = 未知 ⇒ 禁用保存，且保存只提交该字段，不顺手回写别的）。
+
+**前端（片 B）**：`DirectoryTree.vue` 的 `v-if="canUpload"` 按钮 + 隐藏多选 `input`；上传走 `api()`（保住 #255 受限会话重定向与错误信封）；409 ⇒ `window.confirm`（**确认前零请求**，真机实测网络序列 `201 → 409 → overwrite=1 200`）；成功后 `emit('files-changed')` ⇒ `WorkbenchView` 转给 `gitLight.load()`（D9 的灯必须当场变红——新文件是未跟踪 = 零兜底）。
+
+**门禁与变异**（主 agent 亲跑，判绿 = 退出码）：根 **2119 / 2115 通过 / 0 失败 / 4 跳过**、runner **505/505**、`vue-tsc` rc=0、前端 **62 文件 / 1249**。4 条变异：去掉 255 字节名上限 ⇒ B-6 红；去掉「目标是目录」判据 ⇒ B-9 红；去掉 `emit('files-changed')` ⇒ B-15 红；**去掉 `resolveJailedDir` 的终态 `lstat` ⇒ 40/40 全绿** ⇒ 先自证非空操作后**定性为冗余守卫**（真正的 TOCTOU 窗口在 `await writeTempFileFromStream(...)` 期间，不在提交点），按「纵深防御」保留并把注释改成真话——这类「变异不红」必须如实写进台账，别当测试缺口去补。
+
+**真机验收（本地构建镜像 + 发布物各跑一轮，主 agent 亲手）**：登录 DTO 带 `upload`；`201` 落盘属主/权限/字节逐条对；重复上传 `409` 且原文件未变；`overwrite=1` `200` 内容替换；0 字节 `201`；`path=../../etc` / `a%2Fb` / 目标是目录 ⇒ `400 validation_failed` 三条文案各对；33 MiB ⇒ `413` 且**无 `.tmp` 残留**；Playwright 真浏览器上传 + 覆盖确认框 + 预览可见；管理台关闸后端点 `403`、**真刷新**后按钮与 input 计数归 0。
+
+**三条过程账（都比代码值钱）**
+
+1. **worker 报的「既有 3 红」是 `NODE_ENV=production`**，不是并发负载：`GitLightBadge.spec.ts` 那 3 条用 `w.emitted()`，而 `@vue/test-utils@2.5.1` 的 `emitted()` 靠 Vue devtools hook ⇒ 生产构建不发事件 ⇒ 必红。三组对照（未设 / `production` / `test` ⇒ 18/18 / 3 红 / 18/18）已写进 §4；归因错误的代价是**执行体会去「修」一个不存在的 bug**（#473 里发生过一次，已被回退）。
+2. **`git worktree remove` 会连 `.work-orders/*.md` 报告一起删**：片 A 的 294 行报告在清理 worktree 时丢了（未跟踪文件不进对象库、`git fsck --unreachable` 也捞不回）。⇒ **口径：删 worktree 前先把 `.work-orders/*` 归档到 `~/worker-reports-<日期>/`**（片 B 报告已按此归档，片 A 只有本节的转述）。
+3. **开工前必须 `git fetch` + 看 main**：本单从计划到发布跨了几小时，期间别的 session 合了 `df15e7c`（片 A 因此需要一次 merge 解冲突）；退役前的最终核对也发现本地落后 origin/main 13 个提交、现网已被另一个 session 部署到 **v0.1.62**。⇒ **「我这单发版了」不等于「现网跑的是我这版」**，报告部署结论前先现查容器版本。
+
+**现状（2026-11-09 退役核对）**：`#472` CLOSED；本单代码在现网 **v0.1.62** 里完好（`upload_disabled` / `file_upload_enabled` / `resolveJailedRoot` 均在，`schema_migrations` head = `0029-user-file-upload`）。⚠ **残留**：`eric` 的 `file_upload_enabled = true` 是验收时开的（`audit_log` `2026-11-09 08:56:36Z`、`target=eric`），**未复原**——是否给这个账号保留上传权限属产品决定，别当默认值看。
+
+**已知边界**：v1 **无配额**（任一用户可写满 `/docker/erix/users`，影响所有容器；已登记为接受风险，要做另开单）；`MAX_BODY_BYTES` 与上传上限是两套数，改一个不影响另一个；上传只落到 `~/projects/<project>` 内（沿用 `dirs.js` 同一个 jail 谓词，`resolveJailedRoot` 是从那里**抽出来的**，不是复制的第二份）。
