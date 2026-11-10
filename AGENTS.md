@@ -4413,3 +4413,16 @@ stop it first, then hide it」，Stop 后再点即成功。
 
 **已知边界**：不做找回 / 不做批量隐藏 / 不做撤销 toast；`SessionPickerModal` 走同一个 active 列表 ⇒ 隐藏后那里也看不到
 （一致，不是漏做）；隐藏不删 run / transcript / messages / notes，LLM 用量账仍计入该用户。
+
+**发版与部署（v0.1.64，2026-11-10）**：`6e0d4ae`（六文件 9 增 9 删）→ main CI `42767596000` 系两个 job 全绿
+（含三镜像构建校验）→ tag `v0.1.64` → release `42767714882` success → 清单 portal `digest=89694378…` /
+`imageId=47b83d49…`，`docker pull` 后 `docker image inspect .Id` **逐位一致** → `deploy/.env` 形态① pin
+**只 pin portal**（`git diff v0.1.63..v0.1.64 -- runner/` 去掉版本文件后为空 ⇒ `FDE_IMAGE` 仍 v0.1.63 摘要、
+**5 台 FDE 容器故意没重建**；备份 `/tmp/deploy.env.bak-0164`）→ `up -d --no-build station-portal` ⇒
+portal 实跑 `47b83d49…`、`healthz=200`、浏览器 bundle = `index-BsJZeRng.js`（与本地构建同名）。
+
+⚠ **一条交付节奏的教训（决策者当场催过一次）**：「代码已合进 main」不等于「用户能用」——纯前端切片尤其容易犯：
+本片合完 PR 后我按惯例「等发版窗口」，而决策者看到的是**界面上根本没有那颗按钮**（现网仍 v0.1.63）。
+⇒ **口径：纯前端/纯 portal 的可见变更，合完就顺手发版**（只 pin portal 一个镜像、不重建 FDE、几分钟），
+别把「等窗口」用在「用户马上要看的按钮」上。截图 `/docker/erix_station_playwright/488-hide-button-live.png`
+（会话行 hover 后右侧第三颗 = 眼睛带斜线，前两颗仍是 ✨ AI 改名 / ✏️ 重命名）。
