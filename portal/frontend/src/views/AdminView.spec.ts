@@ -39,11 +39,17 @@ const USERS = {
       id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
       // 2026-11-06：email + per-user 邮件验证码开关（迁移 0028）
       email: 'alice@example.test', mail_otp_enabled: false,
+      // 工单 feat-261110-03（迁移 0030）：`safeUser` 现在**恒带** `totp_login_enabled`，库里默认 true
+      // ⇒ 流水账号的 DTO 就得写 true（不写就是把「旧形状」当现状，界面上会变成「未勾」）。
+      totp_login_enabled: true,
       status: 'active', totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
       onboarding: { state: 'failed', step: 'provision', error: 'Docker unavailable' },
     },
     {
       id: 'u2', login: 'bob', display_name: 'Bob', role: 'fde', fde_name: null,
+      // bob 未绑定 TOTP（`totp_enabled: false`）但这一位仍是 true —— 这正是迁移 0030 后存量账号的形状，
+      // 「允许登录」与「绑过密钥」两个维度因此得以在界面上分开（勾选框禁用 + 「未绑定」）。
+      totp_login_enabled: true,
       status: 'active', totp_enabled: false, last_login_at: null,
       onboarding: { state: 'done', step: null, error: null },
     },
@@ -1137,7 +1143,11 @@ describe('AdminView · FDE 用户', () => {
         expect(panel.text()).not.toContain('TOTP 设置');
         expect(panel.find('[data-test="mail-otp-section"]').exists()).toBe(false);
       } else if (name === 'mfa') {
-        // 新 tab 必须**同时**含两块（一个 tab 只放一块就是把第二因素拆了两处）。
+        // feat-261110-03：这一档现在是「两个勾选框 + 勾上才展开」⇒ 先各自勾上（驱动方式），
+        // 再断「mfa 必须**同时**含两块」（一个 tab 只放一块就是把第二因素拆了两处）。
+        expect(panel.find('[data-test="totp-settings-section"]').exists(), 'TOTP 那一位的勾选框初值来自 DTO')
+          .toBe(true);
+        await panel.get('[data-test="mail-otp-enabled"]').setValue(true);
         expect(panel.text()).toContain('TOTP 设置');
         expect(panel.find('[data-test="mail-otp-section"]').exists()).toBe(true);
       } else if (name === 'llm') {
@@ -1695,7 +1705,9 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     await wrapper.get('[data-test="edit-tab-mfa"]').trigger('click');
     await flushPromises();
 
-    const section = wrapper.get('[data-test="mail-otp-section"]');
+    const section = wrapper.get('[data-test="user-edit-modal"]');
+    // feat-261110-03：勾选框从折叠块里搬到了顶部的勾选框行（勾上才展开邮件码那块），
+    // 所以这里取**整个抽屉**；断言一条没删。
     expect(section.isVisible(), '面板未展开就不算真看得到').toBe(true);
     // i18n 真的解析了（不是把键名打到界面上 —— 2026-11-06 就踩过这次：键插错层级）
     expect(section.text()).not.toContain('admin.fde.mailOtp');
@@ -1710,6 +1722,7 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
 
     await checkbox.setValue(true);
     expect(isChecked(checkbox), '勾上必须当场生效').toBe(true);
+    expect(wrapper.get('[data-test="mail-otp-section"]').isVisible(), '勾上才展开对应块').toBe(true);
     await section.get('[data-test="save-mail-otp"]').trigger('click');
     await flushPromises();
 
