@@ -49,6 +49,9 @@ export const en = {
     emailStepTitle: 'Enter your email code',
     emailStepHint: 'A code was sent to {email} (second factor). If it does not arrive, you can resend it.',
     emailCodeLabel: 'Verification code',
+    // 2026-11-10: the validity window is shown on the login page; the number comes from the server
+    // (`email_code_ttl_seconds`, overridable via `EMAIL_CODE_TTL_SECONDS`) — never hard-code 10 here.
+    emailCodeTtl: 'The code is valid for {minutes} minutes.',
     emailCodeSubmit: 'Verify & sign in',
     emailResend: 'Resend code',
     emailResendIn: 'Resend in {seconds}s',

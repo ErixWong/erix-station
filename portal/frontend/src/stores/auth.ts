@@ -59,6 +59,12 @@ interface LoginResponse {
   /** #449 二选一：与 `email_sent:false` 同时出现的服务端旗标（口径以后端为准）。 */
   email_unavailable?: boolean;
   /**
+   * #449（2026-11-10）：邮箱验证码的有效期（秒）。登录页要写「N 分钟内有效」——
+   * TTL 由后端 `EMAIL_CODE_TTL_SECONDS` 决定（默认 600s）⇒ **前端不许写死 10 分钟**。
+   * 缺席（旧后端）⇒ 整句不渲染：宁可不写，也不写一个可能与配置不符的数字。
+   */
+  email_code_ttl_seconds?: number;
+  /**
    * 工单 feat-261110-01（懒发信）：`true` = 邮箱档**可用，但码还没发**（第一步一封都不发）。
    * 本 store **不读它做判据**：「还没发」本地就是 `emailSent === false`，而「不可用」仍是
    * `email_sent === false || email_unavailable === true`——两边不能合三为一，否则邮箱档会在
@@ -77,6 +83,8 @@ interface LoginResponse {
 interface ResendEmailCodeResponse {
   expires_in?: number;
   resend_after?: number;
+  /** 与 `LoginResponse.email_code_ttl_seconds` 同源（重发时刷新一次，TTL 不会变但口径只有一个）。 */
+  email_code_ttl_seconds?: number;
 }
 
 /**
@@ -126,7 +134,9 @@ function isEmailSendFailed(err: unknown): boolean {
  *
  * 没有 `pending_token` 时返回 `null`：没有令牌就进不了第二步，只能按普通错误展示。
  */
-function emailSendFailurePatch(err: unknown): { pendingToken: string; emailHint: string | null } | null {
+function emailSendFailurePatch(
+  err: unknown,
+): { pendingToken: string; emailHint: string | null; ttlSeconds: number | null } | null {
   if (!isEmailSendFailed(err)) return null;
   const details = (err as ApiError).details ?? {};
   const token = typeof details.pending_token === 'string' ? details.pending_token : '';
@@ -134,7 +144,16 @@ function emailSendFailurePatch(err: unknown): { pendingToken: string; emailHint:
   return {
     pendingToken: token,
     emailHint: typeof details.email_hint === 'string' ? details.email_hint : null,
+    ttlSeconds: normalizeEmailCodeTtl(details.email_code_ttl_seconds),
   };
+}
+
+/**
+ * 邮箱码有效期的形状收口：**只认正数**（秒）。缺席 / 0 / 负数 / 字符串 / NaN 一律 `null`
+ * = 「不知道」⇒ 界面上那句「N 分钟内有效」不渲染（不猜、也不退化成 0 分钟）。
+ */
+function normalizeEmailCodeTtl(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /** 自助改密响应（§2.6a）。`password_change_required` 固定 false，但本单**不拿它做放行依据**（见 changeOwnPassword）。 */
@@ -187,6 +206,11 @@ export const useAuthStore = defineStore('auth', {
     emailUnavailable: false,
     /** #449：脱敏收件人（`email_hint`），只用于「验证码发到哪个邮箱了」。 */
     emailHint: null as string | null,
+    /**
+     * 邮箱码有效期（秒），登录页据此渲染「N 分钟内有效」。`null` = 服务端没给（旧后端 / 脏值）
+     * ⇒ 那句话整句不渲染（见 `LoginResponse.email_code_ttl_seconds` 的口径）。与 `pendingToken` 同生共死。
+     */
+    emailCodeTtlSeconds: null as number | null,
     /**
      * 工单 feat-261110-01：**手上到底有一枚发出去的码没有**。懒发信之后这事必须本地记着：
      * 第一步不再发信 ⇒ 切到邮箱档那一刻才发第一封；而已经发过就不该因为反复切档反复寄信。
@@ -276,6 +300,7 @@ export const useAuthStore = defineStore('auth', {
           this.pendingToken = data.pending_token ?? null;
           this.factor = 'email';
           this.emailHint = data.email_hint ?? null;
+          this.emailCodeTtlSeconds = normalizeEmailCodeTtl(data.email_code_ttl_seconds);
           // 懒发信**不改这一条**：邮件码是这个账号唯一的第二因素，第一步就发了信（后端 ⑱b 钉着）。
           this.emailSent = true;
           this.passwordChangeRequired = false;
@@ -284,6 +309,7 @@ export const useAuthStore = defineStore('auth', {
           // 那条）；切到邮箱码只改 `factor`（见 `switchFactor`）：不重新登录、不重新发码。
           this.pendingToken = data.pending_token ?? null;
           this.emailHint = data.email_hint ?? null;
+          this.emailCodeTtlSeconds = normalizeEmailCodeTtl(data.email_code_ttl_seconds);
           // `methods` 一律以服务端为准（SMTP 不可用时后端已经只给 `['totp']`）；未知值一律丢弃。
           const offered = Array.isArray(data.methods) ? data.methods : [];
           const wanted: LoginSecondFactor[] = [];
@@ -313,6 +339,7 @@ export const useAuthStore = defineStore('auth', {
         if (patch) {
           this.pendingToken = patch.pendingToken;
           this.emailHint = patch.emailHint;
+          this.emailCodeTtlSeconds = patch.ttlSeconds;
           this.factor = 'email';
           this.sendFailed = true;
           // 算「已经发过了」：这条路径的出口是用户主动点「重新发送」（#449 既有行为），
@@ -402,6 +429,8 @@ export const useAuthStore = defineStore('auth', {
         });
         this.sendFailed = false;
         this.cooldownSeconds = typeof body.resend_after === 'number' ? Math.max(0, body.resend_after) : 0;
+        // 重发也带同一字段：旧后端缺席 ⇒ 保留已知值（`null` 仍然是 `null`，不会把已知的 600 抹掉）。
+        this.emailCodeTtlSeconds = normalizeEmailCodeTtl(body.email_code_ttl_seconds) ?? this.emailCodeTtlSeconds;
         // 懒发信的落点：这一封**可能就是第一封**（零码行 = 首次发信）。
         this.emailSent = true;
         return true;
@@ -484,6 +513,7 @@ export const useAuthStore = defineStore('auth', {
       this.pendingToken = null;
       this.factor = null;
       this.emailHint = null;
+      this.emailCodeTtlSeconds = null;
       this.sendFailed = false;
       this.cooldownSeconds = 0;
       // #449 二选一：可选通道也是「上一个人」的态，跟着 pending 一起作废。
