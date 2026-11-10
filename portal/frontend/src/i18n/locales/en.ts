@@ -54,11 +54,15 @@ export const en = {
     emailResendIn: 'Resend in {seconds}s',
     emailResendFailed: 'Send again',
     emailBackToPassword: '← Back to the previous step',
-    // issue #449 second-factor choice (`second_factor_choice`): the two switch links and the notice shown
-    // when the email channel is down. Wording matches the store: switching reuses the same pending_token,
-    // so do not promise a resend here.
-    useEmailCode: 'Use an email code instead',
-    useTotp: 'Use your authenticator app (TOTP) instead',
+    // issue #449 second-factor choice (`second_factor_choice`): the switch, and the notice shown when the
+    // email channel is down. feat-261110-01 dropped the two inline links (`useEmailCode` / `useTotp`) in
+    // favour of a real two-option switch. Wording: name the channel only (no strength claims), and reuse
+    // `emailStepHint` for “a code was sent” rather than inventing a near-duplicate key.
+    factorSwitchLabel: 'Second factor method',
+    factorTotp: 'Authenticator app',
+    factorEmail: 'Email code',
+    // Lazy send (feat-261110-01): the first code goes out only when this tab is picked, so say what the wait is.
+    emailSending: 'Sending a code…',
     emailChannelUnavailable: 'Email is unavailable right now — please use your authenticator app.',
   },
   // #255 forced first-login password change (views/ForcePasswordChangeView.vue). Restricted session
