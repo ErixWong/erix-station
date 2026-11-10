@@ -183,6 +183,16 @@ export const zhCN = {
     aiRenaming: 'AI 命名中…',
     // issue #197：会话列表项副行的每会话消息数（口径同头部状态行：全量 messages 行含 synthetic）
     messageCount: '{count} 条消息',
+    // issue #488：会话「隐藏」。**D1：界面一律用「隐藏」，不许出现「删除/delete」字样**
+    //（tooltip、aria-label、确认文案、键名全算）——后端 DELETE /api/sessions/:id 写的是 status='archived'，
+    // 账本（transcript / runs / messages / run_events）一个字节都不动，叫「删除」就是在撒谎。
+    hide: '隐藏',
+    hideBusy: '隐藏中…',
+    hideConfirm: '隐藏这个会话？',
+    hideConfirmOk: '确认隐藏',
+    // **D2 的唯一补救提示，不是装饰**：全仓没有 unarchive 端点、listSessions 也不带 include_archived
+    // ⇒ 隐藏后界面上找不回来。这句话必须出现在确认态里，否则用户会以为能从哪儿 Undo。
+    hideConfirmNote: '隐藏后它不会再出现在列表里，界面上找不回来；如需找回请联系管理员。',
   },
   // 目录树面板（components/DirectoryTree.vue）
   tree: {
@@ -1195,6 +1205,11 @@ export const zhCN = {
     renameFailed: '重命名失败：{message}',
     // issue #114：AI 改名失败（message 为服务端文案：409 未配置 LLM / 502 上游失败）
     aiRenameFailed: 'AI 改名失败：{message}',
+    // issue #488：隐藏会话失败。409 `run_in_progress` 沿用后端既有拒绝（**D5：不改契约、不加错误码**），
+    // 界面只负责给母语提示 + **点名出路**（先停止再隐藏）；其它失败把服务端 message 拼在本地化前缀后
+    //（服务端透传的 error.message 不译，沿用 stores/admin.ts 既有口径）。
+    hideFailed: '隐藏失败：{message}',
+    hideRunInProgress: '这个会话还有任务在跑，先停止再隐藏。',
     // issue #449：邮箱验证码这条链路的错误码文案（码 → 可行动文案，映射见 stores/auth.ts 的
     // EMAIL_LOGIN_ERROR_KEYS）。只写「下一步做什么」；不承诺「重试必成功」，也不写强度口径。
     emailCodeInvalid: '验证码不对或已失效：可以点「重发验证码」换一枚，或返回上一步重新登录。',

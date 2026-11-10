@@ -4368,3 +4368,61 @@ e***@i***.com」+ 重发冷却 57s）且计数变 **11/11**（**恰好一封**�
 
 **部署**：本版只 pin **portal**（`474a62ed…` / imageId `751b6807…`）；`runner/` 的改动来自并行 session 的
 `#486`（`compact-knobs.js`），**故意没重建 5 台 FDE**——那批改动等它自己的发版窗口。
+
+### 8.111 会话「隐藏」入口进侧栏（issue #488，2026-11-10，分支 `feat-261110-03-488-hide-session`，**纯前端**）
+
+**需求是决策者一句口述**：「fde 界面的 session，加一个删除按钮，也就是隐藏掉。」关键在**后半句**——要的是
+从列表里消失，账本一个字节都不动。取证结论是**后端早就全做完了，缺的只有界面上那颗按钮**：
+`chat_sessions.status` 的 CHECK 从 baseline 起就是 `('active','archived')`（`docs/data/schema.sql:194-195`）、
+`DELETE /api/sessions/:id` 早已实现（`sessions.js:490` `archiveSession`）并进了契约（`portal.md:71`/`:1121`）、
+`listSessions` 的 where 里**硬过滤** `status='active'`（`sessions.js:158`）、`fetchSession` 对非 active 会话直接 404
+（`:120`，不泄露存在性）⇒ 本片 `portal/src/**`、`runner/`、`schema.sql`、`deploy/migrations/`、lockfile **零字节**，
+生效只需换 portal 镜像（不重建 FDE）。
+
+**五条决策（决策者 2026-11-10 采纳默认值，逐条有判据）**：**D1 界面只说「隐藏」**，不许出现「删除/delete」
+（图标用 lucide `eye-off` 而**不是垃圾桶**——垃圾桶在语义上撒谎：后端只归档）；**D2 本片不做找回**（全仓没有
+unarchive 端点、`listSessions` 无 `include_archived`）⇒ 隐藏后界面上永久找不回，**这条后果必须写在确认态里**
+（`sidebar.hideConfirmNote`，它是唯一的补救提示不是装饰）；**D3 确认前 `DELETE` 请求数 = 0**（`askHide()` 里没有
+`await`）；**D4 隐藏当前会话 ⇒ 回首页 + 清空对话窗口**（摘项后 `resetSessionView()`，它内部既有
+`workbenchHooks.onClearRoute?.()` ⇒ `WorkbenchView:60` 的 `router.replace('/')`）；**D5 有活跃 run 沿用后端既有
+`409 run_in_progress`，不改契约、不加错误码**，界面只给母语提示 + 点名出路。
+
+**交互形态 = (a) 同一行原地确认**（点隐藏 → 该行换成「隐藏 / ✕」两颗同款方块 + 两行确认文案），不是
+`window.confirm`：后者阻塞渲染且样式不可控，而**原地确认让「确认态按行分槽」结构上成立**（A 行确认中 B 行不受影响），
+不靠标志位维持。
+
+**四件套（主 agent 亲手复跑）**：根 **2122 / 2118 通过 / 0 失败 / 4 跳过**、runner **505/505**、前端 **63 文件 / 1302**、
+`typecheck` rc=0。⚠ **根计数与 `origin/main` 逐数相同**（在 detach 的 `origin/main` worktree 上实测同值）——
+因为本片非前端文件零改动；**同时纠正 §8.104 记的「根 2120/2116、前端 61 文件/1249」是 `main@13be2ce` 时代的现价**，
+main 已前进到 `83bf230`。
+
+**变异 11 条全红在具名用例**（worker 6 条 + 主 agent 5 条，每条先 `git diff --numstat` 自证非空操作、跑完复原）：
+主 agent 那 5 条 = 不复位详情区 / 复位条件放宽成无条件 / D2 后果提示置空 / `aria-label` 塞「删除」/ 去掉在飞守卫。
+
+**真机三条全过**（本地构建镜像顶 pin，验完还原；bundle 先断言 = `index-BsJZeRng.js`，与镜像内同名）：
+① 点隐藏只进确认态，**确认前 network 里 DELETE = 0**，全页确认按钮数 = 1（分槽），整页 `delete|删除` 命中 0；
+② 确认后 **恰 1 发 204**、行消失、**URL 从 `#/session/…` 变 `#/`**、`.msg` 归 0、**没有**后续整表 `GET /api/sessions`；
+③ **硬刷新后该行不出现** 且 DB `status='archived'` ⇒ 真归档不是前端本地摘项；
+④ **409 支路真机跑通**：起一条 `sleep 120` 的 run 后点隐藏 ⇒ 行不消失 + 行内 `.syserr`「still has a run in progress —
+stop it first, then hide it」，Stop 后再点即成功。
+
+**过程账（本单是「worker 撞硬顶但交付完整」的一次）**：worker 撞 30 分钟硬顶（76 轮 / ↑10.6M / ↓115k），
+**两个 commit 与全部测试都已落地、工作树干净、6 条变异全红**，只差终局报告 ⇒ 主 agent 没有重烧也没有换执行体，
+直接接手验收（复跑四件套 + 5 条自己的变异 + 真机）+ 补报告（`~/worker-reports-261110/488-report.md`）。
+⇒ **口径：硬顶后先看现场再决定，`git log` 里有没有 commit 比「它有没有写完报告」重要**；「报告缺失」不等于「活没干」。
+
+**已知边界**：不做找回 / 不做批量隐藏 / 不做撤销 toast；`SessionPickerModal` 走同一个 active 列表 ⇒ 隐藏后那里也看不到
+（一致，不是漏做）；隐藏不删 run / transcript / messages / notes，LLM 用量账仍计入该用户。
+
+**发版与部署（v0.1.64，2026-11-10）**：`6e0d4ae`（六文件 9 增 9 删）→ main CI `42767596000` 系两个 job 全绿
+（含三镜像构建校验）→ tag `v0.1.64` → release `42767714882` success → 清单 portal `digest=89694378…` /
+`imageId=47b83d49…`，`docker pull` 后 `docker image inspect .Id` **逐位一致** → `deploy/.env` 形态① pin
+**只 pin portal**（`git diff v0.1.63..v0.1.64 -- runner/` 去掉版本文件后为空 ⇒ `FDE_IMAGE` 仍 v0.1.63 摘要、
+**5 台 FDE 容器故意没重建**；备份 `/tmp/deploy.env.bak-0164`）→ `up -d --no-build station-portal` ⇒
+portal 实跑 `47b83d49…`、`healthz=200`、浏览器 bundle = `index-BsJZeRng.js`（与本地构建同名）。
+
+⚠ **一条交付节奏的教训（决策者当场催过一次）**：「代码已合进 main」不等于「用户能用」——纯前端切片尤其容易犯：
+本片合完 PR 后我按惯例「等发版窗口」，而决策者看到的是**界面上根本没有那颗按钮**（现网仍 v0.1.63）。
+⇒ **口径：纯前端/纯 portal 的可见变更，合完就顺手发版**（只 pin portal 一个镜像、不重建 FDE、几分钟），
+别把「等窗口」用在「用户马上要看的按钮」上。截图 `/docker/erix_station_playwright/488-hide-button-live.png`
+（会话行 hover 后右侧第三颗 = 眼睛带斜线，前两颗仍是 ✨ AI 改名 / ✏️ 重命名）。

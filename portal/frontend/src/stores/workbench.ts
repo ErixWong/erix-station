@@ -1149,6 +1149,36 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
 
+  /**
+   * issue #488：「隐藏」会话——DELETE /api/sessions/:id（后端把 status 置 `archived`，**不删任何数据**），
+   * 成功后**原地**把那一项从 `sessions` 里摘掉（同 renameSession 的「原地更新、不整表刷新」先例：
+   * `listSessions` 的 where 里硬过滤 `status='active'` ⇒ 服务端下一轮也只会少这一条，整表重拉是白花一次请求）。
+   *
+   * - **界面词只有「隐藏」**（决策 D1）：后端语义是归档，账本一个字节不动，且本片不做找回（D2），
+   *   所以这里不出现 delete/删除字样，函数名也照界面词走 `hideSession`。
+   * - 摘掉的正是当前 `sessionId` ⇒ 调 `resetSessionView()`（决策 D4：回工作台首页 + 清空对话窗口）。
+   * - 有活跃 run 沿用后端既有 **409 `run_in_progress`**（决策 D5）：不改契约、不加错误码，
+   *   把 `code` 一起交回调用方，由侧栏出母语提示；失败**不动** store（行必须还在，可原地重试）。
+   * @returns `error=null` 成功；否则 `error` 为展示文案、`code` 为服务端错误码（调用方按 `run_in_progress` 分岔）。
+   */
+  async function hideSession(id: string): Promise<{ error: string | null; code: string | null }> {
+    try {
+      await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch (e) {
+      // 失败绝不静默、也绝不动列表：文案与错误码一并交回（409 run_in_progress 要靠 code 认出来）。
+      return {
+        error: toDisplayText(e instanceof Error ? e.message : e),
+        code: e instanceof ApiError ? e.code ?? null : null,
+      };
+    }
+    const at = sessions.value.findIndex((s) => String(s.id) === String(id));
+    if (at >= 0) sessions.value.splice(at, 1);
+    // D4：隐藏的是眼前正看着的会话 ⇒ 详情区必须整体复位（sessionId 归空 + entries 清空 + 清深链）。
+    // 判空必须留：`sessionId` 为 null 时 String(null)==='null'，可能撞上字面量 id。
+    if (sessionId.value != null && String(sessionId.value) === String(id)) resetSessionView();
+    return { error: null, code: null };
+  }
+
   /** 深链解析（旧 resolveHashSession；跨项目切项目由调用方决定路由写回）。 */
   async function resolveRouteSession(sid: string): Promise<void> {
     if (sessions.value.some((s) => String(s.id) === String(sid))) {
@@ -1599,6 +1629,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // actions
     initWorkspace, updateAvailability, loadDirs, refreshDirs, loadSessions, selectDir, openSession,
     createSession, createDir, resolveRouteSession, resetSessionView, renameSession, aiRenameSession,
+    // issue #488：隐藏会话（DELETE /api/sessions/:id ⇒ 归档；成功原地摘项，当前会话则复位详情区）
+    hideSession,
     saveDraft, addMessage, addPartialOutput, addRunTermination, send, stop, refreshSession,
     // issue #370：运行中说话（steer / follow_up 入队）与整队取回
     sendQueued, recallQueue, applyQueueSnapshot, adoptDeliveredRun,

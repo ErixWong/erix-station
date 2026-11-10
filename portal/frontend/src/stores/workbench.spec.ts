@@ -1006,6 +1006,157 @@ describe('workbench store · renameSession（issue #107）', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// issue #488：隐藏会话（hideSession → DELETE /api/sessions/:id）。
+// 后端语义是**归档**（status → archived，`listSessions` 硬过滤掉）而非抹数据 ⇒ 界面词叫「隐藏」。
+// 本片判据里属于 store 的那几条：
+//   · 只发一发 DELETE（URL 是被隐藏那一行）；**成功不整表 loadSessions**（成本红线）；
+//   · 成功 ⇒ 原地摘掉那一项，其它项逐字不动；
+//   · 摘的正是当前会话 ⇒ resetSessionView()：sessionId 归空 **且 entries 被清空**（D4）；
+//     ⚠ §8.56：必须断到「旧结论被清掉」，只看最后一次请求 URL 看不见这个。
+//   · 409 run_in_progress / 其它失败 ⇒ **store 一点不动**（行不消失，可原地重试），错误码交回调用方。
+// ---------------------------------------------------------------------------
+describe('workbench store · hideSession（issue #488）', () => {
+  let calls: Array<{ url: string; method: string }> = [];
+
+  /**
+   * 本套件自带的 fetch 桩（不用文件里的 `mockFetch`：它无条件 `new Response(JSON.stringify(body), …)`，
+   * 而 **204 不允许带 body**（Response 构造函数直接报错）。后端 DELETE /api/sessions/:id 成功就是
+   * 204 空体（`docs/api/portal.md` §4.2），所以上线形态必须照搬：204 ⇒ `new Response(null, {status:204})`。
+   * 全部请求都记下来（用于断言「无整表刷新」「只发一发」）。
+   */
+  function mockDeleteFetch(result: { status: number; body?: unknown }) {
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, method: init?.method ?? 'GET' });
+      if (init?.method !== 'DELETE') return jsonResponse(200, { items: [] });
+      if (result.status === 204 || result.body === undefined) return new Response(null, { status: result.status });
+      return jsonResponse(result.status, result.body);
+    }));
+  }
+
+  /** 往详情区塞一条「上一个会话的旧结论」——D4 用例要的就是它能被清掉。 */
+  function seedOldConclusion(store: ReturnType<typeof useWorkbenchStore>) {
+    store.entries.push({
+      kind: 'msg', id: 'm-old', role: 'assistant', synthetic: false,
+      text: '上一个会话的旧结论', html: null, sessionId: 's1',
+    });
+  }
+
+  beforeEach(() => {
+    calls = [];
+  });
+
+  it('成功（204 空体）：只发一发 DELETE /api/sessions/<id> ⇒ 原地摘掉那一项，**不发** GET 整表刷新', async () => {
+    mockDeleteFetch({ status: 204 });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '要隐藏的' }, { id: 's2', title: '别的会话' }];
+
+    const { error, code } = await store.hideSession('s1');
+    expect(error).toBeNull();
+    expect(code).toBeNull();
+    expect(calls).toEqual([{ url: '/api/sessions/s1', method: 'DELETE' }]); // 恰好一发，且 URL 是被点那一行
+    expect(store.sessions.map((s) => s.id)).toEqual(['s2']); // 原地摘项（不是整表重拉）
+    expect(store.sessions[0].title).toBe('别的会话'); // 其它项逐字不动
+  });
+
+  it('id 走 encodeURIComponent（脏 id 不得拼进 URL 结构）', async () => {
+    mockDeleteFetch({ status: 204 });
+    const store = useWorkbenchStore();
+    store.sessions = [];
+    await store.hideSession('a/b?c');
+    expect(calls).toEqual([{ url: '/api/sessions/a%2Fb%3Fc', method: 'DELETE' }]);
+  });
+
+  it('隐藏的不是当前会话 ⇒ sessionId 与详情区**不受牵连**（不得把别人的会话复位）', async () => {
+    mockDeleteFetch({ status: 204 });
+    const clearRoute = vi.fn();
+    setWorkbenchHooks({ onClearRoute: clearRoute });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '要隐藏的' }, { id: 's2', title: '正看着的' }];
+    store.sessionId = 's2';
+    seedOldConclusion(store);
+
+    await store.hideSession('s1');
+    expect(store.sessions.map((s) => s.id)).toEqual(['s2']);
+    expect(store.sessionId).toBe('s2'); // 当前会话没动
+    expect(store.entries).toHaveLength(1); // 详情区不得被清（清了就等于把用户从正看着的会话里踢出去）
+    expect(clearRoute).not.toHaveBeenCalled();
+  });
+
+  it('隐藏**当前正看着的**会话 ⇒ resetSessionView()：sessionId 归空 **且旧 entries 被清掉** + 清深链（D4）', async () => {
+    mockDeleteFetch({ status: 204 });
+    const clearRoute = vi.fn();
+    setWorkbenchHooks({ onClearRoute: clearRoute });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '正看着的' }, { id: 's2', title: '别的' }];
+    store.sessionId = 's1';
+    seedOldConclusion(store);
+    expect(store.entries).toHaveLength(1); // 前置自证：旧结论真的在（否则下面的 0 是空断言）
+
+    const { error } = await store.hideSession('s1');
+    expect(error).toBeNull();
+    expect(store.sessions.map((s) => s.id)).toEqual(['s2']); // 行从列表消失
+    expect(store.sessionId).toBeNull(); // 归工作台首页（路由由 onClearRoute 清）
+    expect(store.entries).toHaveLength(0); // **旧结论被清掉**——不只看最后一次请求 URL
+    expect(clearRoute).toHaveBeenCalledTimes(1);
+  });
+
+  it('409 run_in_progress ⇒ 返回 code 供界面出母语提示；store 一点不动（行不消失、详情区不被动）（D5）', async () => {
+    mockDeleteFetch({ status: 409, body: { error: { code: 'run_in_progress', message: 'session has an active run' } } });
+    const clearRoute = vi.fn();
+    setWorkbenchHooks({ onClearRoute: clearRoute });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '还在跑任务的' }];
+    store.sessionId = 's1';
+    seedOldConclusion(store);
+
+    const { error, code } = await store.hideSession('s1');
+    expect(code).toBe('run_in_progress'); // 界面靠它分岔到「先停止再隐藏」
+    expect(error).toBe('session has an active run'); // 服务端 message 原样（不在前端翻译）
+    expect(store.sessions.map((s) => s.id)).toEqual(['s1']); // 行不消失
+    expect(store.sessionId).toBe('s1'); // 失败不得把人从当前会话踢出去
+    expect(store.entries).toHaveLength(1);
+    expect(clearRoute).not.toHaveBeenCalled();
+  });
+
+  it('其它失败（500）⇒ 行不消失 + 有错误文案；code 非 run_in_progress（界面走通用失败提示）', async () => {
+    mockDeleteFetch({ status: 500, body: { error: { code: 'internal', message: '数据库炸了' } } });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '要隐藏的' }];
+
+    const { error, code } = await store.hideSession('s1');
+    expect(error).toBe('数据库炸了');
+    expect(code).toBe('internal');
+    expect(store.sessions).toHaveLength(1);
+  });
+
+  it('会话不在当前列表（跨目录/已被别处隐藏）：DELETE 照发，成功不抛错也不凭空造项', async () => {
+    mockDeleteFetch({ status: 204 });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 's1', title: '列表里的会话' }];
+
+    const { error } = await store.hideSession('ghost');
+    expect(error).toBeNull();
+    expect(calls).toEqual([{ url: '/api/sessions/ghost', method: 'DELETE' }]);
+    expect(store.sessions.map((s) => s.id)).toEqual(['s1']); // 没被误摘、也没多出占位项
+  });
+
+  it('未选中会话（sessionId=null）时隐藏：不去调 resetSessionView（String(null) 不得误撞字面量 id）', async () => {
+    mockDeleteFetch({ status: 204 });
+    const clearRoute = vi.fn();
+    setWorkbenchHooks({ onClearRoute: clearRoute });
+    const store = useWorkbenchStore();
+    store.sessions = [{ id: 'null', title: '字面量 id 就是 null 的会话' }];
+    store.sessionId = null;
+    seedOldConclusion(store);
+
+    await store.hideSession('null');
+    expect(store.sessions).toHaveLength(0);
+    expect(store.entries).toHaveLength(1); // 未被复位（只摘列表项）
+    expect(clearRoute).not.toHaveBeenCalled();
+  });
+});
+
 describe('issue #188：DTO 投影字段（toolCalls/reasoning/blocks）加载路径渲染', () => {
   it('仅凭 DTO（无事件）也能渲染工具卡片与推理块；toolCalls 排在正文气泡前', async () => {
     mockFetch((url) => {
