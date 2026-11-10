@@ -1683,9 +1683,13 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     expect(section.text()).toContain('邮件验证码');
 
     const checkbox = section.get('[data-test="mail-otp-enabled"]');
-    expect((checkbox.element as HTMLInputElement).checked).toBe(false); // DTO 里是 false
+    // feat-261110-02：这一格从裸 checkbox 换成了 ToggleSwitch（`<button role="switch">`）
+    // ⇒ **只换驱动方式**（读 aria-checked、用 click 拨档），断言语义一条没删。
+    expect(checkbox.attributes('role'), '开关本体必须是 switch').toBe('switch');
+    expect(checkbox.attributes('aria-checked'), 'DTO 里是 false').toBe('false');
 
-    await checkbox.setValue(true);
+    await checkbox.trigger('click');
+    expect(checkbox.attributes('aria-checked'), '拨一下必须当场换档').toBe('true');
     await section.get('[data-test="save-mail-otp"]').trigger('click');
     await flushPromises();
 
@@ -1738,11 +1742,13 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
   }
 
   const isDisabled = (w: { element: Element }) => (w.element as HTMLButtonElement | HTMLInputElement).disabled;
+  /** feat-261110-02：开关换成 ToggleSwitch 后，「有没有勾上」的事实从 `.checked` 搬到 `aria-checked`。 */
+  const isOn = (w: { attributes: (name: string) => string | undefined }) => w.attributes('aria-checked') === 'true';
 
   it('DTO=true ⇒ 勾选且可编辑，无「未知」提示，保存可用（A-8 之一）', async () => {
     const { wrapper, section } = await openSecurity(true);
     const box = section().get('[data-test="edit-file-upload"]');
-    expect((box.element as HTMLInputElement).checked).toBe(true);
+    expect(isOn(box)).toBe(true);
     expect(isDisabled(box)).toBe(false);
     expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(false);
     expect(isDisabled(section().get('[data-test="save-file-upload"]'))).toBe(false);
@@ -1755,7 +1761,7 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
   it('DTO=false ⇒ 未勾选但可编辑，无「未知」提示，保存可用（A-8 之二）', async () => {
     const { wrapper, section } = await openSecurity(false);
     const box = section().get('[data-test="edit-file-upload"]');
-    expect((box.element as HTMLInputElement).checked).toBe(false);
+    expect(isOn(box)).toBe(false);
     expect(isDisabled(box)).toBe(false);
     expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(false);
     expect(isDisabled(section().get('[data-test="save-file-upload"]'))).toBe(false);
@@ -1765,7 +1771,7 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
   it('DTO 缺键 ⇒ 勾选框禁用 + 显示「未知」+ 保存禁用，且点保存**零请求**（A-8 之三，评审 blocker 3）', async () => {
     const { wrapper, fetchFn, section } = await openSecurity(undefined);
     const box = section().get('[data-test="edit-file-upload"]');
-    expect(isDisabled(box), '缺键时勾选框必须禁用（不许把未知当 false 让人编辑）').toBe(true);
+    expect(isDisabled(box), '缺键时开关必须禁用（不许把未知当 false 让人编辑）').toBe(true);
     expect(section().find('[data-test="file-upload-unknown"]').exists()).toBe(true);
     expect(section().text()).toContain('未知');
     const save = section().get('[data-test="save-file-upload"]');
@@ -1779,7 +1785,7 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
   it('保存只发一个 PATCH，载荷只含 file_upload_enabled（A-9：不夹带 display_name / email）', async () => {
     // 基本资料那一格故意留着未保存的编辑 ⇒ 若上传保存"顺手"把整个 editForm 发出去，这里就会红。
     const { wrapper, fetchFn, patches, section } = await openSecurity(false);
-    await section().get('[data-test="edit-file-upload"]').setValue(true);
+    await section().get('[data-test="edit-file-upload"]').trigger('click');
     await section().get('[data-test="save-file-upload"]').trigger('click');
     await flushPromises();
 
@@ -1787,14 +1793,14 @@ describe('AdminView · 文件上传开关（per-user，#472 片 A）', () => {
     expect(patches).toHaveLength(1);
     expect(patches[0].body).toEqual({ file_upload_enabled: true });
     // 服务端回读后勾选框对齐（不是只改本地）
-    expect((section().get('[data-test="edit-file-upload"]').element as HTMLInputElement).checked).toBe(true);
+    expect(isOn(section().get('[data-test="edit-file-upload"]'))).toBe(true);
     expect(section().text()).toContain('已保存');
     wrapper.unmount();
   });
 
   it('关掉开关同样是单个 PATCH {file_upload_enabled:false}', async () => {
     const { wrapper, patches, section } = await openSecurity(true);
-    await section().get('[data-test="edit-file-upload"]').setValue(false);
+    await section().get('[data-test="edit-file-upload"]').trigger('click');
     await section().get('[data-test="save-file-upload"]').trigger('click');
     await flushPromises();
     expect(patches).toHaveLength(1);

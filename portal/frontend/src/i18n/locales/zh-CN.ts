@@ -984,6 +984,11 @@ export const zhCN = {
     mailOtpCurrentEmail: '验证码将发到：{email}',
     mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
     mailOtpSaved: '邮件验证码设置已保存。',
+    // feat-261110-02：开关换成 ToggleSwitch 后，左右各钉一句档位语义（左=关的语义、右=开的语义），
+    // 让「这是 switch、现在停在哪一档」不用猜。措辞对两种账号都得成立：未绑 TOTP 的账号「已绑验证器」
+    // 就是空集（只剩口令），已绑的账号就是口令 + TOTP。长句说明仍在 mailOtpEnabled* 那两条里。
+    mailOtpSwitchOff: '只用口令与已绑的验证器',
+    mailOtpSwitchOn: 'TOTP 或邮箱验证码，任一通过即可',
     saveMailOtp: '保存邮件验证码设置',
     // 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029 / docs/api/portal.md）。
     // 开关只决定「能不能传」，服务端 403 才是闸；界面把三态说清（开启 / 关闭 / 未知）。

@@ -9,19 +9,29 @@ import adminUsersViewSource from './AdminUsersView.vue?raw';
 import { zhCN } from '../i18n/locales/zh-CN';
 import { en } from '../i18n/locales/en';
 
-/** 邮件验证码开关那一块（从 checkbox 到保存按钮）。 */
+/**
+ * 邮件验证码开关那一块（从 section 开头到保存按钮）。
+ * feat-261110-02：控制件从 `<input type=checkbox data-test=…>` 换成了 `<ToggleSwitch test-id=…>`
+ * ⇒ 锚点从 checkbox 本体改到 section 开头（取的是原来那块的一个超集），**断言语义一条没删**。
+ */
 const MAIL_OTP_BLOCK = adminUsersViewSource.slice(
-  adminUsersViewSource.indexOf('data-test="mail-otp-enabled"'),
+  adminUsersViewSource.indexOf('data-test="mail-otp-section"'),
   adminUsersViewSource.indexOf('data-test="save-mail-otp"'),
 );
+/** 开关本体那一个标签（`<ToggleSwitch … />`）。 */
+const SWITCH_TAG = MAIL_OTP_BLOCK.match(/<ToggleSwitch[\s\S]*?\/>/)?.[0] ?? '';
 
 describe('#449 管理台：TOTP 账号的邮件验证码开关不再是死开关', () => {
   it('开关本体没有被置灰（TOTP 账号也能真打开它）', () => {
     expect(MAIL_OTP_BLOCK, '找不到邮件验证码开关那一块').not.toBe('');
-    const checkbox = MAIL_OTP_BLOCK.slice(0, MAIL_OTP_BLOCK.indexOf('>', MAIL_OTP_BLOCK.indexOf('type="checkbox"')));
-    expect(checkbox).toContain('data-test="mail-otp-enabled"');
-    expect(checkbox, 'checkbox 上不得出现 disabled 绑定（置灰 = 死开关的旧形态）')
-      .not.toMatch(/:disabled|(^|\s)disabled(\s|=)/);
+    expect(SWITCH_TAG, '找不到开关本体').not.toBe('');
+    expect(SWITCH_TAG, 'test id 必须还在开关上（旧用例的选择器靠它）').toContain('test-id="mail-otp-enabled"');
+    expect(MAIL_OTP_BLOCK, '旧的裸勾选框必须退场，否则「醒目 switch」根本没落地').not.toContain('type="checkbox"');
+    // 旧的「死开关」形态 = 因 `totp_enabled` 而置灰。换成 ToggleSwitch 后它仍可以因「请求在途」禁用，
+    // 所以断言从「一个 :disabled 也不能有」改成「:disabled 的取值里不得出现 TOTP」——语义更窄且不失原意。
+    const disabledBinding = SWITCH_TAG.match(/:disabled="([^"]*)"/)?.[1] ?? '';
+    expect(disabledBinding, '禁用不得因 TOTP 而起（置灰 = 死开关的旧形态）').not.toMatch(/totp|editUser/i);
+    expect(disabledBinding, '禁用只应来自请求在途').toContain('mailOtpBusy');
   });
 
   it('标签与说明按 `totp_enabled` 分叉：TOTP 用户看到「作为 TOTP 的替代方式」+ 审计口径说明', () => {
