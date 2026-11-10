@@ -11,36 +11,59 @@ import { zhCN } from '../i18n/locales/zh-CN';
 import { en } from '../i18n/locales/en';
 
 /**
- * 邮件验证码开关那一块（从 section 开头到保存按钮）。
+ * 「二次验证」那一档里两个勾选框所在的那一块（feat-261110-03）。
+ * 勾选框刻意住在折叠块**外面**：否则「取消勾选」会把自己和保存按钮一起 v-if 掉 ⇒ 关掉无法提交。
+ */
+const MFA_FACTORS_BLOCK = adminUsersViewSource.slice(
+  adminUsersViewSource.indexOf('data-test="mfa-totp-row"'),
+  adminUsersViewSource.indexOf('data-test="totp-settings-section"'),
+);
+/**
+ * 邮件验证码设置那一块（从 section 开头到保存按钮）。
  * feat-261110-03：控制件从自实现的 `<ToggleSwitch test-id=…>` 回到原生勾选框
- * `<input type="checkbox" data-test=…>`（用户原话「用checkbox吧，两个checkbox就行」）
- * ⇒ 锚点改钉勾选框本体，**断言语义一条没删**。
+ * `<input type="checkbox" data-test=…>`（用户原话「用checkbox吧，两个checkbox就行」），
+ * 但**仍在同一档、同一语义**，断言语义一条没删。
  */
 const MAIL_OTP_BLOCK = adminUsersViewSource.slice(
   adminUsersViewSource.indexOf('data-test="mail-otp-section"'),
   adminUsersViewSource.indexOf('data-test="save-mail-otp"'),
 );
-/** 勾选框本体那一个标签。 */
-const CHECKBOX_TAG = MAIL_OTP_BLOCK.match(/<input[\s\S]*?data-test="mail-otp-enabled"[\s\S]*?>/)?.[0] ?? '';
+/** 邮件码勾选框本体那一个标签（`[^>]*` 而不是 `[\s\S]*?`：否则会从 TOTP 那个 input 一路贴过来，
+ * 把两个标签的 `:disabled` 当成一个读）。 */
+const MAIL_CHECKBOX_TAG = MFA_FACTORS_BLOCK.match(/<input[^>]*data-test="mail-otp-enabled"[^>]*>/)?.[0] ?? '';
+const TOTP_CHECKBOX_TAG = MFA_FACTORS_BLOCK.match(/<input[^>]*data-test="mfa-totp-checkbox"[^>]*>/)?.[0] ?? '';
 
 describe('#449 管理台：TOTP 账号的邮件验证码开关不再是死开关', () => {
   it('开关本体没有被置灰（TOTP 账号也能真打开它）', () => {
-    expect(MAIL_OTP_BLOCK, '找不到邮件验证码开关那一块').not.toBe('');
-    expect(CHECKBOX_TAG, '找不到勾选框本体').not.toBe('');
-    expect(CHECKBOX_TAG, 'test id 必须还在开关上（旧用例的选择器靠它）').toContain('data-test="mail-otp-enabled"');
-    expect(CHECKBOX_TAG, '必须是原生勾选框').toContain('type="checkbox"');
+    expect(MAIL_OTP_BLOCK, '找不到邮件验证码设置那一块').not.toBe('');
+    expect(MAIL_CHECKBOX_TAG, '找不到邮件码勾选框本体').not.toBe('');
+    expect(MAIL_CHECKBOX_TAG, 'test id 必须还在开关上（旧用例的选择器靠它）').toContain('data-test="mail-otp-enabled"');
+    expect(MAIL_CHECKBOX_TAG, '必须是原生勾选框').toContain('type="checkbox"');
     // 旧的「死开关」形态 = 因 `totp_enabled` 而置灰。勾选框仍可以因「请求在途」禁用，
     // 所以断言从「一个 :disabled 也不能有」改成「:disabled 的取值里不得出现 TOTP」——语义更窄且不失原意。
-    const disabledBinding = CHECKBOX_TAG.match(/:disabled="([^"]*)"/)?.[1] ?? '';
+    const disabledBinding = MAIL_CHECKBOX_TAG.match(/:disabled="([^"]*)"/)?.[1] ?? '';
     expect(disabledBinding, '禁用不得因 TOTP 而起（置灰 = 死开关的旧形态）').not.toMatch(/totp|editUser/i);
     expect(disabledBinding, '禁用只应来自请求在途').toContain('mailOtpBusy');
+  });
+
+  it('未绑定 TOTP ⇒ 那一位的勾选框禁用并说「未绑定」（而不是让人勾一个走不通的因素）', () => {
+    expect(TOTP_CHECKBOX_TAG, '找不到 TOTP 勾选框本体').not.toBe('');
+    expect(TOTP_CHECKBOX_TAG.match(/:disabled="([^"]*)"/)?.[1] ?? '',
+      '禁用必须来自「有没有绑密钥」').toContain('editUser.totp_enabled');
+    expect(TOTP_CHECKBOX_TAG, '勾的值必须是 totp_login_enabled（不是 totp_enabled）')
+      .toContain('v-model="editForm.totp_login_enabled"');
+    expect(MFA_FACTORS_BLOCK, '「未绑定」文案必须挂在同一行')
+      .toContain("t('admin.fde.totpNotEnrolled')");
+    expect(MFA_FACTORS_BLOCK, '绑定按钮必须在这一行上（未绑定时它是唯一出口，不新造按钮）')
+      .toMatch(/v-if="!editUser\.totp_enabled"[\s\S]*?data-test="confirm-totp-enroll"/);
   });
 
   it('勾选框取代了自实现的 switch：整视不得再有 role="switch" / aria-checked 的手搓开关', () => {
     expect(adminUsersViewSource, '本视图不得再出现自实现的 switch').not.toContain('role="switch"');
     expect(adminUsersViewSource, '本视图不得再有手搓 switch 的 aria-checked').not.toMatch(/<button[\s\S]*?aria-checked/);
-    // 上一版「旧的裸勾选框必须退场」的锚点已随用户改口径而反转：勾选框才是这一版的交付形态。
-    expect(MAIL_OTP_BLOCK).toContain('type="checkbox"');
+    // 上一版「旧的裸勾选框必须退场」的锚点已随用户改口径而反转：勾选框才是这一版的交付形态，
+    // 而且这一档恰好两个（TOTP / 邮件码）。
+    expect(MFA_FACTORS_BLOCK.match(/type="checkbox"/g), '两个勾选框都得是原生 checkbox').toHaveLength(2);
   });
 
   it('标签与说明按 `totp_enabled` 分叉：TOTP 用户看到「作为 TOTP 的替代方式」+ 审计口径说明', () => {
