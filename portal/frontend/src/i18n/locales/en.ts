@@ -947,6 +947,11 @@ export const en = {
     mailOtpCurrentEmail: 'Codes will be sent to: {email}',
     mailOtpNeedsEmail: 'This user has no email yet — fill it in on the Profile tab first.',
     mailOtpSaved: 'Email-code setting saved.',
+    // feat-261110-02: the switch got a state sentence on each side (left = what "off" means, right = what
+    // "on" means) so "this is a switch, here is its position" is visible without guessing. Worded so both
+    // account shapes hold: without an enrolled TOTP "enrolled authenticator" is simply the empty set.
+    mailOtpSwitchOff: 'Password and any enrolled authenticator only',
+    mailOtpSwitchOn: 'TOTP or an emailed code — either one passes',
     saveMailOtp: 'Save email-code setting',
     // 2026-11-09 (#472 slice A): per-user "file upload" switch (migration 0029).
     fileUploadSection: 'File upload',

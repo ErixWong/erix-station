@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import ModalShell from '../components/ModalShell.vue';
+import ToggleSwitch from '../components/ToggleSwitch.vue';
 import UserLlmPane from '../components/UserLlmPane.vue';
 import FdePreviewPortsPane from '../components/FdePreviewPortsPane.vue';
 import { useAdminStore, type LlmModel, type AdminUser, type LlmProvider } from '../stores/admin';
@@ -1232,21 +1233,32 @@ onBeforeUnmount(() => {
         <section class="rounded-lg border border-black/10 p-3" data-test="mail-otp-section">
           <h3 class="font-semibold">{{ t('admin.fde.mailOtpSection') }}</h3>
           <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.mailOtpHint') }}</p>
-          <label class="mt-3 flex items-start gap-2 text-sm">
-            <input
+          <!-- feat-261110-02：开关从裸 `<input type=checkbox>` 换成 ToggleSwitch（用户的原话是「你这谁看了
+             会觉得自己这是在拨开关」）。左右各挂一句档位说明，并把**当前那一档**加粗、另一档压灰：
+             「现在是哪一档」不该靠颜色猜。**语义一字未动**——仍是「TOTP 或邮箱验证码任一通过即可」。 -->
+          <div class="mt-3 flex flex-wrap items-center gap-3">
+            <span
+              class="text-sm"
+              :class="editForm.mail_otp_enabled ? 'text-black/40' : 'font-medium text-black'"
+            >{{ t('admin.fde.mailOtpSwitchOff') }}</span>
+            <ToggleSwitch
               v-model="editForm.mail_otp_enabled"
-              data-test="mail-otp-enabled"
-              type="checkbox"
-              class="mt-0.5"
-            >
-            <span>
-              <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
-              {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
-              <span class="block text-xs text-black/50">
-                {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
-              </span>
+              :label="t('admin.fde.mailOtpSection')"
+              :disabled="mailOtpBusy"
+              test-id="mail-otp-enabled"
+            />
+            <span
+              class="text-sm"
+              :class="editForm.mail_otp_enabled ? 'font-medium text-black' : 'text-black/40'"
+            >{{ t('admin.fde.mailOtpSwitchOn') }}</span>
+          </div>
+          <p class="mt-2 text-sm text-black/65">
+            <!-- #449 二选一：已绑 TOTP 的账号不是「开关不生效」，而是多一条可选的路 ⇒ 标签与说明跟着分叉。 -->
+            {{ editUser.totp_enabled ? t('admin.fde.mailOtpEnabledLabelAlt') : t('admin.fde.mailOtpEnabledLabel') }}
+            <span class="block text-xs text-black/50">
+              {{ editUser.totp_enabled ? t('admin.fde.mailOtpAltHint') : t('admin.fde.mailOtpEnabledHint') }}
             </span>
-          </label>
+          </p>
           <p v-if="editUser.email" class="mt-2 text-xs text-black/50">
             {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
           </p>
@@ -1270,19 +1282,21 @@ onBeforeUnmount(() => {
         <section class="rounded-lg border border-black/10 p-3" data-test="file-upload-section">
           <h3 class="font-semibold">{{ t('admin.fde.fileUploadSection') }}</h3>
           <p class="mt-1 text-sm text-black/65">{{ t('admin.fde.fileUploadHint') }}</p>
-          <label class="mt-3 flex items-start gap-2 text-sm">
-            <input
+          <!-- feat-261110-02：与邮件验证码同一控件、同一外观。三态判据一字未改：缺键 ⇒ 禁用 + 「未知」
+               文案 + 保存禁用（`fileUploadDraft` 那个写入面把「未知」读成未勾选，配合 disabled 不拿猜值提交）。 -->
+          <div class="mt-3 flex flex-wrap items-start gap-3">
+            <ToggleSwitch
               v-model="fileUploadDraft"
-              data-test="edit-file-upload"
-              type="checkbox"
-              class="mt-0.5"
+              :label="t('admin.fde.fileUploadEnabledLabel')"
               :disabled="fileUploadUnknown || fileUploadBusy"
-            >
-            <span>
+              test-id="edit-file-upload"
+              class="mt-0.5"
+            />
+            <span class="text-sm">
               {{ t('admin.fde.fileUploadEnabledLabel') }}
               <span class="block text-xs text-black/50">{{ t('admin.fde.fileUploadEnabledHint') }}</span>
             </span>
-          </label>
+          </div>
           <p v-if="fileUploadUnknown" class="mt-2 text-xs text-amber-700" role="status" data-test="file-upload-unknown">
             {{ t('admin.fde.fileUploadUnknown') }}
           </p>
