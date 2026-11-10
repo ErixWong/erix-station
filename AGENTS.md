@@ -112,6 +112,8 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - 提交信息：conventional commits + 中文摘要
 - **不提交任何密钥**；凭据一律环境变量 / 凭据文件注入
 - **CI / 发布（issue #235）**：`.github/workflows/ci.yml` = PR/main 质量门禁 + main 上按路径过滤的三镜像构建校验（只 `ubuntu-latest`，**禁止 matrix**）；`.github/workflows/release.yml` = tag `v*` → GHCR 三镜像（镜像名全小写、`--provenance=false --sbom=false`）+ `images-digest.json` digest 清单。口径、分钟预算语义（超额**是停跑不是扣费、且没有红灯**）、发布→部署的 digest pin（`deploy/.env` 两形态门 + 换 FDE 镜像必须重建容器）、e2e 为何不进 CI，一律见 [`docs/ops/ci-release.md`](docs/ops/ci-release.md)。
+- **一单一账写 `docs/maintenance/task-ledger.md`**（编号续用 `8.N`，全局唯一、不重排），
+  **别写进本页**：本页随每次 agent run 全额注入，261110 实测 675 KB 里 92.5% 就是这么长出来的
 - **发布前置**：`package.json` 的 `version` 必须等于去掉 `v` 的 tag（`runner/package.json` 建议一并对齐），否则 `release.yml` 直接失败——现状 tag `v0.1.1` vs `package.json` `0.1.0` 就会被拦（ci-release.md §7）。
 
 ### 6.1 代码 PR 评审要求（2026-09-23 起简化：取消双模型评审门禁，省 premium 额度）
@@ -169,12 +171,18 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
   「灯长期红/黄、而没人负责让它变绿」。
 
-## 8. erix-agent 依赖与升级（当前 pin：**0.29.0**，2026-11-02 由 `feat-261102-01-erix-agent-0.29.0` 从 0.26.0 升上（0.27.0 从未发布）；历史 0.14–0.26 记录见下。⚠ 本标题曾长期停在 0.20.0，与实际 pin 不符，§8.65 那次一并修正）
+## 8. erix-agent 依赖与升级
+
+- **pin 以 `package.json` 的 `erix-agent` 字段现读为准，本页不写死版本号**：这个数曾在标题里三次
+  写歪（长期停在 0.20.0；停在 0.29.0 而 `package.json` 已是 0.31.0）⇒ 261110 起数字从标题里拿掉。
+- 沿革（原先挤在 §8 标题里，261110 搬下来）：2026-11-02 由 `feat-261102-01-erix-agent-0.29.0` 从
+  0.26.0 升上（0.27.0 从未发布）；§8.65 那次修过一次标题漂移；逐版迁移记录见下方 `### 8.N` 台账
+  （**新账一律写 `docs/maintenance/task-ledger.md`**，见 §6）
 
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
 - runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
 
-### 0.14.0 当前宿主契约
+### 0.14.0 宿主契约快照（**已过时**：现契约以 `erix-llm-kit` 的 `docs/host-consumer-contract.md` 为准）
 
 - `TranscriptStore` **必需仅** `appendRound` + `load`；`saveRunSnapshot` / `loadLatestRunSnapshot`（latest-only crash snapshot）及 `saveRunState` / `loadRunState` / `markRunState` 为可选能力。快照方法已由 `saveCheckpoint` / `loadLatestCheckpoint` 更名；不要再把旧名暴露给引擎。station 仍把内部 HTTP 路径 `/checkpoint` 保留作传输实现细节。
 - `saveRunState` 保存 deterministic/semantic run-state 数据，不写顶层 `state`；`markRunState` 写独立状态通道。宿主读 `loadRunStateStatus` 不属于引擎能力校验；上游实际 store 契约返回状态字符串，portal 响应记录由 adapter 读取 `status?.status`。旧 JSONB 快照里的 `state` 仍可回退读取，不需要数据回填。
