@@ -3017,12 +3017,24 @@ function emailCodePolicy(config) {
   };
 }
 
-/** 邮箱码的邮件正文（**只在这里**拼入明文码；审计/日志绝不取这个字符串）。 */
+/**
+ * 邮箱码的邮件正文（**只在这里**拼入明文码；审计/日志绝不取这个字符串）。
+ *
+ * 双语（2026-11-10 用户要求「验证码邮件请使用双语」）：中文在前、英文紧随其后，两种语言各写一次
+ * 有效期——收件人未必读得懂中文，而验证码邮件是登录的**唯一**凭据来源，看不懂就等于收不到。
+ * 有效期分钟数从 `ttlSeconds` 现算（`EMAIL_CODE_TTL_SECONDS` 可覆盖），**不写死 10**。
+ */
 function emailCodeMessage(code, ttlSeconds) {
   const minutes = Math.max(1, Math.round(ttlSeconds / 60));
   return {
-    subject: 'FDE Station 登录验证码',
-    text: `你的登录验证码是 ${code}，${minutes} 分钟内有效。\n如非本人操作，请忽略本邮件并考虑联系管理员。`,
+    subject: 'FDE Station 登录验证码 / Sign-in verification code',
+    text: [
+      `你的登录验证码是 ${code}，${minutes} 分钟内有效。`,
+      `Your sign-in verification code is ${code}. It is valid for ${minutes} minutes.`,
+      '',
+      '如非本人操作，请忽略本邮件并考虑联系管理员。',
+      "If you didn't try to sign in, you can ignore this email — consider telling your administrator.",
+    ].join('\n'),
   };
 }
 
@@ -3079,6 +3091,7 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
         pending_token: pending.token,
         expires_in: pendingTtlSeconds,
         email_hint: maskEmail(email),
+        email_code_ttl_seconds: policy.ttlSeconds,
       },
     });
   }
@@ -3113,6 +3126,9 @@ async function handleEmailCodeRequired(req, res, ctx, { user, email, ip }) {
     pending_token: pending.token,
     expires_in: pendingTtlSeconds,
     email_hint: maskEmail(email),
+    // 登录页要写「N 分钟内有效」：TTL 由 `EMAIL_CODE_TTL_SECONDS` 决定（默认 600s），
+    // 前端不许自己写死 10 分钟 —— 配置一改就是一句谎。
+    email_code_ttl_seconds: policy.ttlSeconds,
   });
 }
 
@@ -3176,6 +3192,7 @@ async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer
       expires_in: pendingTtlSeconds,
       methods: ['totp'],
       email_hint: maskEmail(email),
+      email_code_ttl_seconds: policy.ttlSeconds,
       email_sent: false,
       email_unavailable: true,
       notice: '邮件通道当前不可用，本次仅可用验证器应用（TOTP）',
@@ -3189,6 +3206,7 @@ async function handleSecondFactorChoice(req, res, ctx, { user, email, ip, mailer
     expires_in: pendingTtlSeconds,
     methods: ['totp', 'email_code'],
     email_hint: maskEmail(email),
+    email_code_ttl_seconds: policy.ttlSeconds,
     email_deferred: true,
   });
 }
@@ -3402,6 +3420,8 @@ async function handleLoginEmailCodeResend(req, res, ctx) {
   return sendJson(res, 200, {
     expires_in: policy.ttlSeconds,
     resend_after: policy.resendCooldownSeconds,
+    // 与第一步两个分支同名的字段：登录页的「N 分钟内有效」只有一个来源。
+    email_code_ttl_seconds: policy.ttlSeconds,
   });
 }
 

@@ -828,7 +828,8 @@ test('#449⑬ 已绑 TOTP + 开关开 + 有邮箱 ⇒ second_factor_choice，响
     const body = await res.json();
     assert.deepEqual(
       Object.keys(body).sort(),
-      ['email_deferred', 'email_hint', 'expires_in', 'methods', 'pending_token', 'status'],
+      // 2026-11-10 新增 `email_code_ttl_seconds`（登录页「N 分钟内有效」的唯一来源）。
+      ['email_code_ttl_seconds', 'email_deferred', 'email_hint', 'expires_in', 'methods', 'pending_token', 'status'],
       '响应字段就是懒发信那一组（不带 email_sent / email_unavailable / notice）',
     );
     assert.equal(body.status, 'second_factor_choice', '不再是 totp_required（否则开关是死开关）');
@@ -1130,4 +1131,98 @@ test('#449⑯ 审计 method：有 TOTP 走邮件码 = email_code_alt；无 TOTP 
 
   const totpWay = await loginMethodOf({ totpSecret: secret, use: 'totp' });
   assert.equal(totpWay.method, 'totp', '现状值不改');
+});
+
+// ---------------------------------------------------------------------------
+// ⑰⑱ 2026-11-10 用户要求：「验证码邮件请使用双语」+「10 分钟有效这个写到 web 页面上」。
+// 两条都是**显示面**的判据，但落点不同：⑰ 在邮件正文（服务端拼串），⑱ 在登录页（前端渲染，
+// 数字来自服务端的 `email_code_ttl_seconds`——前端写死 10 分钟会在 `EMAIL_CODE_TTL_SECONDS` 一改时变成谎话）。
+// ---------------------------------------------------------------------------
+
+test('#449⑰ 验证码邮件双语：中英各写一次同一个码与同一个有效期', async () => {
+  const { mailer, state } = fakeMailer();
+  const s = await startServer({ users: [await makeUser()], mailer });
+  try {
+    const res = await login(s.base);
+    assert.equal(res.status, 200);
+    await res.json();
+    assert.equal(state.sent.length, 1);
+    const mail = state.sent[0];
+    const code = lastCode(state);
+
+    assert.match(String(mail.subject), /登录验证码/, '主题里要有中文');
+    assert.match(String(mail.subject), /Sign-in verification code/, '主题里要有英文（收件人未必读中文）');
+
+    const text = String(mail.text);
+    assert.ok(text.includes(`你的登录验证码是 ${code}，10 分钟内有效。`), `中文行缺码或有效期：${text}`);
+    assert.ok(
+      text.includes(`Your sign-in verification code is ${code}. It is valid for 10 minutes.`),
+      `英文行缺码或有效期：${text}`,
+    );
+    // 两段安全提示也要双语：只有中文的「如非本人操作」对英文收件人是零信息。
+    assert.ok(text.includes('如非本人操作'), '中文提示在');
+    assert.ok(text.includes("If you didn't try to sign in"), '英文提示在');
+  } finally {
+    await s.close();
+  }
+});
+
+test('#449⑱ email_code_ttl_seconds 随第一步下发，分钟数跟着 EMAIL_CODE_TTL_SECONDS 走（不写死 10）', async () => {
+  // 默认 600s ⇒ 10 分钟。
+  {
+    const { mailer, state } = fakeMailer();
+    const s = await startServer({ users: [await makeUser()], mailer });
+    try {
+      const body = await (await login(s.base)).json();
+      assert.equal(body.status, 'email_code_required');
+      assert.equal(body.email_code_ttl_seconds, 600, '登录页靠这个字段渲染「N 分钟内有效」');
+      assert.match(String(state.sent[0].text), /10 分钟内有效/, '邮件正文与字段同源');
+    } finally {
+      await s.close();
+    }
+  }
+  // 覆盖成 120s ⇒ 字段与邮件正文一起变成 2 分钟（这条就是「前端不许写死 10」的判据）。
+  {
+    const { mailer, state } = fakeMailer();
+    const s = await startServer({
+      users: [await makeUser()],
+      mailer,
+      loginEmailCodeOverrides: { ttlSeconds: 120 },
+    });
+    try {
+      const body = await (await login(s.base)).json();
+      assert.equal(body.email_code_ttl_seconds, 120);
+      assert.match(String(state.sent[0].text), /2 分钟内有效/, '邮件正文跟着配置走');
+      assert.match(String(state.sent[0].text), /valid for 2 minutes/, '英文行同样跟着配置走');
+    } finally {
+      await s.close();
+    }
+  }
+  // 二选一分支（有 TOTP + 邮件开关）同样要带这个字段：登录页在两档之间切换时不能丢掉有效期。
+  {
+    const secret = totp.generateSecret(20);
+    const { mailer } = fakeMailer();
+    const s = await startServer({ users: [await makeUser({ totpSecret: secret })], mailer });
+    try {
+      const body = await (await login(s.base)).json();
+      assert.equal(body.status, 'second_factor_choice');
+      assert.equal(body.email_code_ttl_seconds, 600, '二选一也要带，否则切到邮箱档就没有那句话');
+    } finally {
+      await s.close();
+    }
+  }
+  // 503（发信失败但 pending 已建）的 details 也要带：前端收下 pending 直接进第二步，同样要能写出有效期。
+  {
+    const { mailer, state } = fakeMailer();
+    state.fail = true;
+    const s = await startServer({ users: [await makeUser()], mailer });
+    try {
+      const res = await login(s.base);
+      assert.equal(res.status, 503);
+      const body = await res.json();
+      assert.equal(body.error.details.email_code_ttl_seconds, 600);
+    } finally {
+      await s.close();
+    }
+  }
 });
