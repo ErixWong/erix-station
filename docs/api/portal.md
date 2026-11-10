@@ -299,7 +299,7 @@
 响应 `200`（**口令正确、未注册 TOTP、邮件通道已启用、账号有邮箱**：进入邮箱验证码第二步；**此时尚未登录**）：
 
 ```json
-{ "status": "email_code_required", "pending_token": "pt_9f2c...", "expires_in": 600, "email_hint": "a***@e***.com" }
+{ "status": "email_code_required", "pending_token": "pt_9f2c...", "expires_in": 600, "email_hint": "a***@e***.com", "email_code_ttl_seconds": 600 }
 ```
 
 | 字段 | 说明 |
@@ -307,6 +307,7 @@
 | `pending_token` | 一次性待决令牌，仅可用于 §2.3a/§2.3b；服务端只存其 `sha256`（`login_pending.token_hash`） |
 | `expires_in` | 该令牌的实际有效期（秒）= `max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`，默认 `600`。**为什么不直接用 120**：码的有效期是 600s，令牌 120s 就会让「码还没过期、令牌先死」成为常态，这个字段也就成了谎 |
 | `email_hint` | 脱敏收件人：本地部分保留首字符 + `***`；域名首段保留首字符 + `***`，TLD 及后续标签原样 ⇒ `alice@example.com` → `a***@e***.com`。**只用于「发到哪个邮箱了」的确认**，不含完整地址 |
+| `email_code_ttl_seconds` | **码**的有效期（秒）= `EMAIL_CODE_TTL_SECONDS`（默认 `600`）。登录页据此渲染「验证码 N 分钟内有效」——**客户端不得写死 10 分钟**，配置一改就是一句谎；与 `expires_in`（**令牌**有效期）不是同一个数，不要互相顶替 |
 
 > 本响应同样**不带** `password_change_required`（#255）：还没发 cookie，谈不上受限会话；这一位在 §2.3a 的成功响应里给。
 
@@ -319,7 +320,8 @@
   "expires_in": 600,
   "methods": ["totp", "email_code"],
   "email_hint": "a***@e***.com",
-  "email_deferred": true
+  "email_deferred": true,
+  "email_code_ttl_seconds": 600
 }
 ```
 
@@ -336,7 +338,7 @@
 | `email_deferred` | `true` = 邮箱这条**可用，但码还没发**（懒发信的明示）。此时响应里**没有** `email_sent` 键：「还没发」用**缺席**表达，不许写成 `email_sent: false`——后者的含义是「**不可用**」（下一行），两者混成一个客户端就会把邮箱档在第一步剥掉（正是本单修的「二选一在界面上不存在」）。用户切到邮箱档时客户端调 §2.3b 发第一封 |
 | `email_sent` | **仅在邮件通道不可用时出现**（`false`）：库里**没有**码行且当下也发不出去，本次只能走 TOTP。可用（懒发信）那条**不带**这个键 |
 | `email_unavailable` | 仅在邮件通道不可用时出现（`true`），与 `email_sent:false` / `methods:["totp"]` 同时出现；可附 `notice`（人可读的一句说明）|
-| `pending_token` / `expires_in` / `email_hint` | 与 §2.2 `email_code_required` 逐字同口径：`expires_in = max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`（默认 600）；两路共用这一枚令牌，取短的那头会让邮件码比 TOTP 窗口还短 |
+| `pending_token` / `expires_in` / `email_hint` / `email_code_ttl_seconds` | 与 §2.2 `email_code_required` 逐字同口径：`expires_in = max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`（默认 600），`email_code_ttl_seconds` 是**码**的 TTL；两路共用这一枚令牌，取短的那头会让邮件码比 TOTP 窗口还短。降级响应（`methods:["totp"]`）也带 `email_code_ttl_seconds`（字段恒在，省得客户端两套形状） |
 
 三条硬口径：
 
@@ -371,7 +373,7 @@
 | 401 | `invalid_credentials` | 用户名或口令错误（**不区分是哪种**，防用户枚举） |
 | 409 | `email_not_registered` | 口令正确、未注册 TOTP、邮件通道启用，但该账号**没有邮箱**（§1.2 / §2.2 选择规则第⑤分支）。**不会退回纯口令** |
 | 429 | `rate_limited` | 同一 login / IP 连续失败触发限流；响应带 `Retry-After` 头（秒） |
-| 503 | `email_send_failed` | 第④分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束）。⚠ **#449 二选一（① 分支）不适用**：那里发信失败不是错，只降级成仅 TOTP（`200`）|
+| 503 | `email_send_failed` | 第④分支发信失败（SMTP 超时/拒绝/配置读不到）。`retryable: true`，`error.details` = `{pending_token, expires_in, email_hint, email_code_ttl_seconds}`（第一次响应就失败，客户端还没拿到过令牌，不带它就无法「点重试」；`email_code_ttl_seconds` 让收下令牌直接进第二步的客户端仍能写出有效期）；`pending_token` 不作废，且**库里没有码行** ⇒ 立刻调 §2.3b 重发即可（不受 60s 冷却约束）。⚠ **#449 二选一（① 分支）不适用**：那里发信失败不是错，只降级成仅 TOTP（`200`）|
 | 503 | `email_channel_unavailable` | 第④分支：`mail_otp_enabled` 开着但邮件通道整体不可用（未配置 / 急停 / 读不出）。**绝不静默降级到口令**（否则用户以为过了第二因素，其实只过了口令）。同样**不适用于 ① 分支**（那里降级成仅 TOTP，不报错）|
 
 ### 2.3 `POST /api/auth/login/totp`
@@ -442,6 +444,10 @@
 | 重发冷却 | 60s | `EMAIL_CODE_RESEND_COOLDOWN_SECONDS` |
 | 单 `pending_token` 最多重发 | 3 次 | `EMAIL_CODE_MAX_RESENDS` |
 
+- **邮件本身是双语的**（2026-11-10 用户要求）：主题 `FDE Station 登录验证码 / Sign-in verification code`，
+  正文中文一行 + 英文一行（两种语言各写一次同一个码与同一个有效期），末尾两句安全提示同样双语。
+  理由：收件人未必读得懂中文，而验证码邮件是登录的**唯一**凭据来源——看不懂就等于收不到。
+  有效期分钟数由 `EMAIL_CODE_TTL_SECONDS` 现算（默认 600s ⇒ 10 分钟），正文与响应字段 `email_code_ttl_seconds` 同源。
 - **只存 `sha256(码)`**（`login_email_codes.code_hash`），绝不存明文；成功校验是一条原子 `UPDATE … WHERE consumed_at IS NULL AND expires_at > now AND code_hash = $h AND attempts < max_attempts … RETURNING id` ⇒ 并发/重放至多一次成功。
 - **码错不烧 `pending_token`**：只把该码的 `attempts + 1`（达到上限时同时作废该码），用户还能接着试/重发；`pending_token` 本身只在成功时被消费。
 - **码行在「发信成功之后」才落库**（评审返修 ①）：先 `send()`、`ok` 才 `INSERT login_email_codes`。发信失败时库里**一条码行都没有**，所以失败重试的冷却起算点不会由「一封用户没收到的信」产生（否则 503 之后立刻重发必撞 60s 冷却 ⇒ 429）。
@@ -484,13 +490,14 @@
 响应 `200`：
 
 ```json
-{ "expires_in": 600, "resend_after": 60 }
+{ "expires_in": 600, "resend_after": 60, "email_code_ttl_seconds": 600 }
 ```
 
 | 字段 | 说明 |
 |---|---|
 | `expires_in` | 新码的有效期（秒，`EMAIL_CODE_TTL_SECONDS`） |
 | `resend_after` | 下一次允许重发的冷却秒数（`EMAIL_CODE_RESEND_COOLDOWN_SECONDS`） |
+| `email_code_ttl_seconds` | 与 `expires_in` **同值**，只是名字与 §2.2 两个登录响应统一：登录页的「验证码 N 分钟内有效」只认这一个字段名，不必按端点分两套读法 |
 
 - **重发必须换新码并作废旧码**：先发信、成功后才插新行（`resend_count = 上一条 + 1`），再把同一 `pending_token` 下其余未消费行 `consumed_at = now`。校验只认「最新一条未消费」，所以旧码从这一刻起必然被拒。**发信失败时既不插新码、也不作废旧码**（用户手上的旧码仍然有效，且可立刻再试）。
 - **按 IP 计发信频率**（`email:<ip>`，默认 20 次 / 15 分钟窗口，与 §2.3a 的初次发信**共用同一把闸**）：被当成邮件放大器时最先撞这条。
@@ -508,8 +515,8 @@
 | 503 | `email_send_failed` | SMTP 发不出去（`retryable: true`，可原样再试） |
 
 > §2.2 的 `503 email_send_failed` 是**第一次发信**就失败（此时客户端还没拿到过 `pending_token`），所以它的
-> `error.details` 里带上 `{pending_token, expires_in, email_hint}`——否则「pending 不作废、点重试即可」在协议上
-> 不成立（用户只能回去重输口令）。§2.3b 的 503 不带（客户端本来就有 token）。
+> `error.details` 里带上 `{pending_token, expires_in, email_hint, email_code_ttl_seconds}`——否则「pending 不作废、
+> 点重试即可」在协议上不成立（用户只能回去重输口令）。§2.3b 的 503 不带（客户端本来就有 token）。
 
 ### 2.4 `POST /api/auth/logout`
 
