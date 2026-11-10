@@ -249,7 +249,7 @@
 
 | # | 已注册 TOTP | `users.mail_otp_enabled`（per-user 开关，迁移 0028）| `users.email` 非空 | 结果 | 说明 |
 |---|---|---|---|---|---|
-| ① | 是 | 是 | 是 | `200 status='second_factor_choice'` | **#449 新增**：TOTP **或** 邮箱验证码任一通过（响应见下）|
+| ① | 是 | 是 | 是 | `200 status='second_factor_choice'` | **#449 新增**：TOTP **或** 邮箱验证码任一通过。**第一步不发信**（懒发信，feat-261110-01）：码的第一封由客户端切到邮箱档时调 §2.3b 发出。响应见下 |
 | ② | 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3。**含「开关开但没邮箱」**——绝不因为缺邮箱把已绑 TOTP 的人挡在门外 |
 | ③ | 否 | 非 `true` | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末）|
 | ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
@@ -257,7 +257,7 @@
 
 - ⚠ **① 必须排在 ② 之前**（写反就是本单要修的死开关）：已绑 TOTP 的账号打开 `mail_otp_enabled` 后，界面显示「已启用」而实际一封码都不发、也没有任何提示。
 
-- 「开关」= **按用户**的 `users.mail_otp_enabled`（迁移 0028，管理员在用户编辑 → 安全里设，默认 `false`）；全局 `mail_settings.transport` 只是 SMTP 连接配置，**不再是功能闸**（2026-11-06 口径：否则「管理员开了开关、界面显示已启用、实际永远走口令」是必然的死光纤）。它只决定**信发不发得出去**：④ 发不出去 ⇒ `503 email_channel_unavailable`（唯一第二因素发不出去就不能进）；① 发不出去 ⇒ **不报错**，只降级成仅 TOTP（见下方响应与 §1.2）。「读取失败 / 急停」的 fail-open 口径见 §2.3a 末尾。
+- 「开关」= **按用户**的 `users.mail_otp_enabled`（迁移 0028，管理员在用户编辑 → 安全里设，默认 `false`）；全局 `mail_settings.transport` 只是 SMTP 连接配置，**不再是功能闸**（2026-11-06 口径：否则「管理员开了开关、界面显示已启用、实际永远走口令」是必然的死光纤）。它只决定**信发不发得出去**：④ 发不出去 ⇒ `503 email_channel_unavailable`（唯一第二因素发不出去就不能进）；① 在**未启用 / 发信限流**这两种可预判的情况下降级成仅 TOTP（**不报错**，见下方响应与 §1.2），而「配了但当下发不出去」在第一步看不出来（懒发信不试发），推迟到 §2.3b 发第一封时才暴成 `503`。「读取失败 / 急停」的 fail-open 口径见 §2.3a 末尾。
 - 未启用时的口令直通**不是无声的**：启动日志会打一条 `level:'warn'`（`[auth] email verification code disabled (mail settings unavailable or MAIL_TRANSPORT=disabled); accounts without TOTP log in with password only`），且成功登录审计的 `method` 写的是 `password_direct_no_second_factor`（不是笼统的 `password_direct`）——「这一层没做第二因素」在日志与审计里都能被查到。
 - `auth.login_success` 的 `details.method` 是个**四值枚举**（运维拿它区分「走的哪条第二因素」）：`password_direct_no_second_factor`（口令直通）/ `totp`（TOTP 通过）/ `email_code`（邮箱码通过且**该账号没有** TOTP）/ **`email_code_alt`**（#449 新增：邮箱码通过、但**该账号同时有 TOTP** ⇒ 用户主动走了两条里较弱的那一条）。OR 语义让「第二因素强度 = 两者中较弱的」，这不是 bug（是决策者的选择），但**必须可审计**。
 
@@ -314,27 +314,44 @@
   "expires_in": 600,
   "methods": ["totp", "email_code"],
   "email_hint": "a***@e***.com",
-  "email_sent": true
+  "email_deferred": true
 }
 ```
 
+> **懒发信（工单 feat-261110-01，2026-11-10）**：本分支**第一步一封邮件都不发**。
+> 旧行为是「口令一通过就发信」，于是每次登录都寄一封没人要的验证码（用户两天收 7 封）。
+> 现在码子的**第一封**由客户端**切到邮箱验证码那一档**时调 §2.3b 的 `resend` 端点发出 ——
+> 该端点本来就支持「该 pending 下零码行 ⇒ 当首次发信、不套 60s 冷却」（§2.3b），
+> 所以懒发信**没有新端点**，也不改 `login-email-code.js` 一个函数。
+> 走 TOTP 的人（默认档）从此**一封也不收**。
+
 | 字段 | 说明 |
 |---|---|
-| `methods` | 本次**真的能走**的通道。两条都发得出 ⇒ `["totp", "email_code"]`；邮件不可用 ⇒ `["totp"]`。**客户端一律以本字段为准**，不要自己补邮箱入口 |
-| `email_sent` | 码是否真的发出去了（`false` ⇒ 库里**没有**码行，想走邮箱那条得先调 §2.3b 重发）|
+| `methods` | 本次**真的能走**的通道。两条都可用 ⇒ `["totp", "email_code"]`；邮件不可用 ⇒ `["totp"]`。**客户端一律以本字段为准**，不要自己补邮箱入口 |
+| `email_deferred` | `true` = 邮箱这条**可用，但码还没发**（懒发信的明示）。此时响应里**没有** `email_sent` 键：「还没发」用**缺席**表达，不许写成 `email_sent: false`——后者的含义是「**不可用**」（下一行），两者混成一个客户端就会把邮箱档在第一步剥掉（正是本单修的「二选一在界面上不存在」）。用户切到邮箱档时客户端调 §2.3b 发第一封 |
+| `email_sent` | **仅在邮件通道不可用时出现**（`false`）：库里**没有**码行且当下也发不出去，本次只能走 TOTP。可用（懒发信）那条**不带**这个键 |
 | `email_unavailable` | 仅在邮件通道不可用时出现（`true`），与 `email_sent:false` / `methods:["totp"]` 同时出现；可附 `notice`（人可读的一句说明）|
 | `pending_token` / `expires_in` / `email_hint` | 与 §2.2 `email_code_required` 逐字同口径：`expires_in = max(PENDING_TOKEN_TTL_SECONDS, EMAIL_CODE_TTL_SECONDS)`（默认 600）；两路共用这一枚令牌，取短的那头会让邮件码比 TOTP 窗口还短 |
 
 三条硬口径：
 
-1. **发信是尽力而为，绝不能挡住 TOTP**。SMTP 不可用 / 发信失败 / 撞发信频控 ⇒ 不是 `503`、不是 `500`，而是 `200` + `methods: ["totp"]` + `email_sent: false` + `email_unavailable: true`（+ `notice`）。TOTP 是离线可用的强因素，让它输于 SMTP 抖动比本单之前更糟。
+1. **邮件绝不能挡住 TOTP**。第一步不试发，只做两件**非消费型**预检：`mailer.enabled !== true`（SMTP 未配置 /
+   急停 / 读配置失败）与 `email:<ip>` 的发信限流不允许（`check()` 不计数，真正计数仍在 §2.3b 的
+   `recordFailure`）。两者任一命中 ⇒ 不是 `503`、不是 `500`，而是 `200` + `methods: ["totp"]` +
+   `email_sent: false` + `email_unavailable: true`（+ `notice`）。TOTP 是离线可用的强因素，让它输于
+   SMTP 抖动比本单之前更糟。
    ```json
    { "status": "second_factor_choice", "pending_token": "pt_9f2c...", "expires_in": 600,
      "methods": ["totp"], "email_hint": "a***@e***.com", "email_sent": false, "email_unavailable": true,
      "notice": "邮件通道当前不可用，本次仅可用验证器应用（TOTP）" }
    ```
+   ⚠ **懒发信的已知代价**：「SMTP 配了但当下发不出去」（上游抖动、凭据失效）**在第一步看不出来**
+   ——不试发就无从知道，所以那条照旧给两条通道 + `email_deferred`，失败推迟到用户切到邮箱档
+   发第一封时，以 §2.3b 的 `503 email_send_failed` 暴露（`pending_token` 不作废，客户端切回
+   「重新发送」路径即可，TOTP 全程不受影响）。这是把「每次登录都寄一封」换成「切过去才知道发不出去」
+   的自觉取舍，不是回归。
 2. **不造新的令牌类型**：这枚 `pending_token` 能被 §2.3（`/login/totp`）与 §2.3a（`/login/email-code`）**两边消费**。谁先成功谁建会话；`login_pending` 是单次消费，所以成功后另一条路自然失效（再调 ⇒ `401 pending_expired`）。
-3. 审计能区分走了哪条：TOTP 成功 ⇒ `method='totp'`；邮箱码成功且**该账号有 TOTP** ⇒ `method='email_code_alt'`；邮箱码成功且无 TOTP（④ 分支）⇒ `method='email_code'`（§2.2 末的枚举）。
+3. 审计能区分走了哪条：TOTP 成功 ⇒ `method='totp'`；邮箱码成功且**该账号有 TOTP** ⇒ `method='email_code_alt'`；邮箱码成功且无 TOTP（④ 分支）⇒ `method='email_code'`（§2.2 末的枚举）。**懒发信不新增任何审计动作**：第一步什么都没尝试过就**不写**发信审计（写失败审计是假账）；`auth.email_code_sent` / `auth.email_code_failed` 改由 §2.3a 与 §2.3b 产生（§2.3a 末尾的审计表）。
 
 | 字段 | 说明 |
 |---|---|
@@ -425,7 +442,7 @@
 - **码行在「发信成功之后」才落库**（评审返修 ①）：先 `send()`、`ok` 才 `INSERT login_email_codes`。发信失败时库里**一条码行都没有**，所以失败重试的冷却起算点不会由「一封用户没收到的信」产生（否则 503 之后立刻重发必撞 60s 冷却 ⇒ 429）。
 - **限流（两把闸，各自独立）**：
   * **校验失败**按「账户 + IP」计（`emailcode:<userId>:<ip>`，默认 10 次 / 15 分钟窗口，超限 `429 rate_limited` + `Retry-After`）。换新 `pending_token` 不重置计数，防 6 位码爆破；
-  * **发信频率**按 IP 计（`email:<ip>`，默认 **20 次 / 15 分钟**窗口，共享出口 IP 的误伤空间）——**第一步的初次发信与 §2.3b 的重发共用同一把闸**（每次成功发信记一次），否则持有效口令的人可以反复调第一步把邮箱刷爆。
+  * **发信频率**按 IP 计（`email:<ip>`，默认 **20 次 / 15 分钟**窗口，共享出口 IP 的误伤空间）——**§2.2 第④分支第一步的初次发信与 §2.3b 的重发（含 ① 懒发信的第一封）共用同一把闸**（每次成功发信记一次），否则持有效口令的人可以反复调第一步把邮箱刷爆。⚠ ① 分支的**第一步不再计入这把闸**（feat-261110-01：它已经不发信了），它只做一次**非消费型** `check()` 预检来决定要不要摆出邮箱那条 ⇒ 反复走第一步的① 账号既刷不爆邮箱，也烧不掉配额。
 
 错误：
 
@@ -445,13 +462,13 @@
 | action | 时机 | `details` |
 |---|---|---|
 | `auth.email_code_sent` | 码发出去了 | `{login, email_hint, code_hash_prefix, expires_at, resend_count?, at}`——`code_hash_prefix` 是 `sha256(码)` 的**前 12 位**；**绝无明文码** |
-| `auth.email_code_failed` | 发信失败（§2.2 第④分支的 `503`；**或** ① 二选一分支的降级，此时不报错只 `200`，并额外带 `second_factor_choice: true`）| `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令）|
+| `auth.email_code_failed` | 发信失败（§2.2 第④分支的 `503`；§2.3b 的重发失败；**或** ① 二选一分支的降级，此时不报错只 `200`，并额外带 `second_factor_choice: true`）| `{login, reason, at}`——`reason` 是 SMTP 错误的摘要（不含正文/口令）。① 分支的降级不是「发了一封没成功」而是**当下判定发不出去**，所以 `reason` 是通道事实：`email_channel_disabled`（SMTP 未启用 / 急停）或 `rate_limited`（`email:<ip>` 预检不允许）。懒发信的可用那条**不写任何发信审计** |
 | `auth.email_code_verified` | 校验通过并发了会话 | `{login, method, at}`，`method` = `email_code`（该账号无 TOTP，§2.2 第④分支）或 **`email_code_alt`**（该账号**同时有 TOTP**，走的是 ① 分支里较弱的那一条，#449）；同时另有一条 `auth.login_success`，**两处 `method` 同值**（一次登录一个口径）|
 | `auth.email_code_invalid` | ——**不写** | 码错不落审计：这是可重试的日常动作，写了只会被爆破尝试刷成噪声；失败次数由限流器持有 |
 
 ### 2.3b `POST /api/auth/login/email-code/resend`（issue #449：重发验证码）
 
-**本端点同样接受 ① `second_factor_choice` 签发的 `pending_token`**（#449 二选一）：前端在第二步里从 TOTP 切到邮箱码**不算重发**（已发出的码不因切换作废）；用户主动点「重发」才调本端点。`email_sent:false` 的那次登录库里零码行，恰好走下面的「零行 = 首次发信重试」口径。
+**本端点同样接受 ① `second_factor_choice` 签发的 `pending_token`**（#449 二选一），并且从工单 feat-261110-01 起**兼任首次发信**：二选一分支第一步不发信，客户端在用户**切到邮箱验证码那一档**时调本端点发出第一封 —— 库里零码行 ⇒ `recordResend` 的「零行 = 首次发信」语义，**不套 60s 冷却**（懒发信不需要新端点，也不改 `login-email-code.js`）。已经发过就不因为反复切档而反复发信（客户端拿 `emailSent` 防重复）；用户主动点「重发」同样走本端点，那时才是语义上的重发（作废旧码 + 换新码 + 起 60s 冷却）。
 
 请求：
 
