@@ -170,6 +170,17 @@ export const en = {
     aiRenaming: 'Naming with AI…',
     // issue #197: per-session message count in the sidebar list sub-line (same counting rule as the session header stats line: all message rows incl. synthetic)
     messageCount: '{count} messages',
+    // issue #488: hide a session. **D1: the UI only ever says "hide" — no "delete" wording** (button
+    // tooltip, aria-label, confirm copy and the key names all count): the backend DELETE
+    // /api/sessions/:id only sets status='archived' and no ledger row is touched, so "delete" would lie.
+    hide: 'Hide',
+    hideBusy: 'Hiding…',
+    hideConfirm: 'Hide this session?',
+    hideConfirmOk: 'Confirm hide',
+    // **D2: this is the only recovery hint, not decoration** — there is no unarchive endpoint in the
+    // whole repo and listSessions has no include_archived, so a hidden session cannot be brought back
+    // from the UI. That consequence has to be readable before the request goes out.
+    hideConfirmNote: 'Once hidden it stops showing up in this list and cannot be brought back here; contact your administrator to restore it.',
   },
   tree: {
     title: 'Directory tree',
@@ -1141,6 +1152,11 @@ export const en = {
     renameFailed: 'Rename failed: {message}',
     // issue #114：AI rename failure (message comes from the server: 409 no LLM configured / 502 upstream)
     aiRenameFailed: 'AI rename failed: {message}',
+    // issue #488: hiding a session failed. 409 `run_in_progress` keeps the existing backend rejection
+    // (**D5: no new contract, no new error code**) and only gets a localized hint that names the way out;
+    // other failures keep the server `error.message` untranslated behind a localized prefix.
+    hideFailed: 'Failed to hide: {message}',
+    hideRunInProgress: 'This session still has a run in progress — stop it first, then hide it.',
     // issue #449: email-code login error codes (code → actionable text; mapping in stores/auth.ts
     // EMAIL_LOGIN_ERROR_KEYS). Only “what to do next” — no promise that a retry will succeed.
     emailCodeInvalid:
