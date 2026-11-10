@@ -245,19 +245,24 @@
 
 #### 第二因素选择规则（issue #449，实现为纯函数 `login-email-code.js#chooseSecondFactor`）
 
-按顺序取第一条命中的分支（**顺序本身就是契约**，别调换）。#449 二选一之后共**五分支**：已注册 TOTP 且拿得出「第二条路」的账号不再只走 TOTP，而是两条并存、任一通过：
+按顺序取第一条命中的分支（**顺序本身就是契约**，别调换）。共**五分支**。
 
-| # | 已注册 TOTP | `users.mail_otp_enabled`（per-user 开关，迁移 0028）| `users.email` 非空 | 结果 | 说明 |
+判据里的「TOTP 走不走得通」= **绑过密钥**（`users.totp_secret IS NOT NULL`，DTO 里的 `totp_enabled`）**且**
+**管理员没关掉「允许用 TOTP 登录」**（`users.totp_login_enabled`，迁移 `0030`，默认 `true`）。
+⚠ 这两件事在 2026-11-10 之前是**同一位**，于是「密钥留着、但登录只走邮箱验证码」在界面上根本表达不出来
+（要嘛重绑、要嘛删密钥）。现在拆开：**关掉 `totp_login_enabled` 不清密钥**，随时可以再打开。
+
+| # | TOTP 走不走得通（绑过 **且** 允许） | `users.mail_otp_enabled`（per-user 开关，迁移 0028）| `users.email` 非空 | 结果 | 说明 |
 |---|---|---|---|---|---|
 | ① | 是 | 是 | 是 | `200 status='second_factor_choice'` | **#449 新增**：TOTP **或** 邮箱验证码任一通过。**第一步不发信**（懒发信，feat-261110-01）：码的第一封由客户端切到邮箱档时调 §2.3b 发出。响应见下 |
-| ② | 是 | — | — | `200 status='totp_required'` | 现状不变：进入 §2.3。**含「开关开但没邮箱」**——绝不因为缺邮箱把已绑 TOTP 的人挡在门外 |
-| ③ | 否 | 非 `true` | — | `200 status='authenticated'` | 现状：口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末）|
-| ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录** |
+| ② | 是 | — | — | `200 status='totp_required'` | 进入 §2.3。**含「开关开但没邮箱」**——绝不因为缺邮箱把已绑 TOTP 的人挡在门外 |
+| ③ | 否 | 非 `true` | — | `200 status='authenticated'` | 口令直通（审计 `method='password_direct_no_second_factor'`，§2.2 末）。**含「绑过 TOTP 但管理员把两条都关了」**——管理台会红字警告，见 §2.2 末 |
+| ④ | 否 | 是 | 是 | `200 status='email_code_required'` | 发一枚邮箱验证码（§2.3a），**此时尚未登录**。**含「绑过 TOTP 但只允许邮件码」**（密钥原样保留，登录不碰它）|
 | ⑤ | 否 | 是 | 否 | `409 email_not_registered` | **绝不静默退回纯口令**；`message` 给出路「请联系管理员补录邮箱」 |
 
 - ⚠ **① 必须排在 ② 之前**（写反就是本单要修的死开关）：已绑 TOTP 的账号打开 `mail_otp_enabled` 后，界面显示「已启用」而实际一封码都不发、也没有任何提示。
 
-- 「开关」= **按用户**的 `users.mail_otp_enabled`（迁移 0028，管理员在用户编辑 → 安全里设，默认 `false`）；全局 `mail_settings.transport` 只是 SMTP 连接配置，**不再是功能闸**（2026-11-06 口径：否则「管理员开了开关、界面显示已启用、实际永远走口令」是必然的死光纤）。它只决定**信发不发得出去**：④ 发不出去 ⇒ `503 email_channel_unavailable`（唯一第二因素发不出去就不能进）；① 在**未启用 / 发信限流**这两种可预判的情况下降级成仅 TOTP（**不报错**，见下方响应与 §1.2），而「配了但当下发不出去」在第一步看不出来（懒发信不试发），推迟到 §2.3b 发第一封时才暴成 `503`。「读取失败 / 急停」的 fail-open 口径见 §2.3a 末尾。
+- 两个「允许」都是**按用户**的：`users.mail_otp_enabled`（迁移 0028，默认 `false`）与 `users.totp_login_enabled`（迁移 `0030`，默认 `true`）。管理员在用户编辑 → **二次验证** tab 里是两个**独立勾选框**（可同时勾、也可都不勾；都不勾 = 只剩口令，界面上有红字警告）。全局 `mail_settings.transport` 只是 SMTP 连接配置，**不再是功能闸**（2026-11-06 口径：否则「管理员开了开关、界面显示已启用、实际永远走口令」是必然的死光纤）。它只决定**信发不发得出去**：④ 发不出去 ⇒ `503 email_channel_unavailable`（唯一第二因素发不出去就不能进）；① 在**未启用 / 发信限流**这两种可预判的情况下降级成仅 TOTP（**不报错**，见下方响应与 §1.2），而「配了但当下发不出去」在第一步看不出来（懒发信不试发），推迟到 §2.3b 发第一封时才暴成 `503`。「读取失败 / 急停」的 fail-open 口径见 §2.3a 末尾。
 - 未启用时的口令直通**不是无声的**：启动日志会打一条 `level:'warn'`（`[auth] email verification code disabled (mail settings unavailable or MAIL_TRANSPORT=disabled); accounts without TOTP log in with password only`），且成功登录审计的 `method` 写的是 `password_direct_no_second_factor`（不是笼统的 `password_direct`）——「这一层没做第二因素」在日志与审计里都能被查到。
 - `auth.login_success` 的 `details.method` 是个**四值枚举**（运维拿它区分「走的哪条第二因素」）：`password_direct_no_second_factor`（口令直通）/ `totp`（TOTP 通过）/ `email_code`（邮箱码通过且**该账号没有** TOTP）/ **`email_code_alt`**（#449 新增：邮箱码通过、但**该账号同时有 TOTP** ⇒ 用户主动走了两条里较弱的那一条）。OR 语义让「第二因素强度 = 两者中较弱的」，这不是 bug（是决策者的选择），但**必须可审计**。
 
