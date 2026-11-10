@@ -61,7 +61,11 @@ export function collectCompactContextProblems(context) {
       problems.push(`unknown context option ${JSON.stringify(key)} (engine reads it only via a name on this list; a typo = silently ignored on the direct runToolLoop path)`);
       continue;
     }
-    // `keepRounds: 0` 是合法值（折掉除最后一轮以外的全部），所以这里不能用「> 0 才算给」。
+    // `keepRounds: 0` 是**合法值**（引擎 `selectFoldedRounds` 用 `Math.max(0, …)` 明确为它留了口子），
+    // 所以这里不能用「> 0 才算给」。
+    // ⚠ 别在这里给它写语义：折几轮还取决于 `protectedMessage` / `workingSetRecentRounds`。
+    //   2026-11-10 实测裸调 `selectFoldedRounds(8 轮, 0)` = 折 8 保留 0，与本节旧注释
+    //   「折掉除最后一轮以外的全部」**不符** ⇒ 语义归折叠策略那侧，这里只管值域。
     if (POSITIVE_INT_SET.has(key) && key !== 'keepRounds') {
       if (value === undefined) continue;                       // 省略 = 用引擎默认
       if (!Number.isSafeInteger(value) || value <= 0) {
@@ -70,7 +74,7 @@ export function collectCompactContextProblems(context) {
     }
     if (key === 'keepRounds' && value !== undefined
       && (!Number.isSafeInteger(value) || value < 0)) {
-      // `keepRounds: 0` 合法（含义是「折掉除最后一轮以外的全部」），负数没意义。
+      // `keepRounds: 0` 合法（语义归折叠策略那侧，见上方注释），负数没意义。
       problems.push(`keepRounds must be a non-negative integer, got ${JSON.stringify(value)}`);
     }
   }

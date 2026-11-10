@@ -2,7 +2,7 @@
 
 > 2026-11-08。设计者：主 agent。依据：两份独立评估（`~/eval-delegate-261108/{erix,pi}/repo/EVAL-REPORT.md`）
 > + 主 agent 亲验的 8 条源码事实。**实现一律派 worker，主 agent 只验收**（`~/projects/AGENTS.md` §3.0）。
-> 状态：待实现。
+> 状态：**已实现并真机验收**（v0.1.57，2026-11-09；口径、已知边界与四个真机坑见 `AGENTS.md` §8.103）。
 
 ## 0. 一句话
 
