@@ -59,6 +59,13 @@ interface LoginResponse {
   /** #449 二选一：与 `email_sent:false` 同时出现的服务端旗标（口径以后端为准）。 */
   email_unavailable?: boolean;
   /**
+   * 工单 feat-261110-01（懒发信）：`true` = 邮箱档**可用，但码还没发**（第一步一封都不发）。
+   * 本 store **不读它做判据**：「还没发」本地就是 `emailSent === false`，而「不可用」仍是
+   * `email_sent === false || email_unavailable === true`——两边不能合三为一，否则邮箱档会在
+   * 第一步就被剥掉（就是本单要修的那个「二选一在界面上不存在」）。它存在的意义是让协议与日志可读。
+   */
+  email_deferred?: boolean;
+  /**
    * #255（§2.2/§2.3）：本次下发的会话是否受限。**两个发会话的分支都带**（直通与 TOTP 第二步），
    * `totp_required` 中间响应与 401 失败响应都不带。后端保证「恒为布尔」，前端仍用 `=== true` 收口：
    * 缺字段 ⇒ false ⇒ 不会把所有人误挡在门外（前后端缺省同为「不受限」）。
@@ -180,6 +187,15 @@ export const useAuthStore = defineStore('auth', {
     emailUnavailable: false,
     /** #449：脱敏收件人（`email_hint`），只用于「验证码发到哪个邮箱了」。 */
     emailHint: null as string | null,
+    /**
+     * 工单 feat-261110-01：**手上到底有一枚发出去的码没有**。懒发信之后这事必须本地记着：
+     * 第一步不再发信 ⇒ 切到邮箱档那一刻才发第一封；而已经发过就不该因为反复切档反复寄信。
+     * 置 `true` 的三条路：`email_code_required`（第一步就发了）、resend 成功、`email_send_failed`
+     * 的 patch 路径（用户已有码或可立刻重试，保持 #449 既有行为）。与 `pendingToken` 同生共死。
+     */
+    emailSent: false,
+    /** 懒发信/重发**正在请求中**：UI 据此禁用输入框与 switch，`requestEmailCode()` 据此不重入。 */
+    emailSending: false,
     /** #449：发信失败（503 `email_send_failed`）——UI 把按钮换成「重新发送」，且不受冷却限制（服务端此时还没有码行）。 */
     sendFailed: false,
     /**
@@ -260,6 +276,8 @@ export const useAuthStore = defineStore('auth', {
           this.pendingToken = data.pending_token ?? null;
           this.factor = 'email';
           this.emailHint = data.email_hint ?? null;
+          // 懒发信**不改这一条**：邮件码是这个账号唯一的第二因素，第一步就发了信（后端 ⑱b 钉着）。
+          this.emailSent = true;
           this.passwordChangeRequired = false;
         } else if (data.status === 'second_factor_choice') {
           // #449 二选一：TOTP 与邮箱码并存，**共用这一枚 pending_token**。默认停在 TOTP（两者中较强的
@@ -275,6 +293,11 @@ export const useAuthStore = defineStore('auth', {
           this.emailUnavailable = data.email_sent === false || data.email_unavailable === true;
           // 没真的发出码 ⇒ 不给邮箱入口（否则用户对着一个收不到信的输入框）。
           if (this.emailUnavailable) this.choiceMethods = this.choiceMethods.filter((m) => m !== 'email');
+          // 懒发信（feat-261110-01）：新后端在这条路上**不带 `email_sent`**（只有 `email_deferred`）
+          // ⇒ `emailSent` 保持 false，等用户切到邮箱档才发第一封。
+          // 写成 `=== true` 而不是直接 false，是为了兼容「新前端 + 旧后端」（旧后端第一步真发了信，
+          // 那就别为一次切换白寄一封）；判据只认服务端真的说了「已发出」。
+          this.emailSent = data.email_sent === true;
           this.factor = 'totp';
           this.passwordChangeRequired = false;
         } else {
@@ -292,6 +315,9 @@ export const useAuthStore = defineStore('auth', {
           this.emailHint = patch.emailHint;
           this.factor = 'email';
           this.sendFailed = true;
+          // 算「已经发过了」：这条路径的出口是用户主动点「重新发送」（#449 既有行为），
+          // 不是 `requestEmailCode()` 再偷发一封——否则 503 会直接变成第二个并发请求。
+          this.emailSent = true;
           // 服务端此时**一条码行都没有**（§2.3b 的评审返修 ①）⇒ 没有冷却可言，重发不该被卡。
           this.cooldownSeconds = 0;
           this.error = i18n.global.t('errors.emailSendFailed');
@@ -357,11 +383,16 @@ export const useAuthStore = defineStore('auth', {
     },
 
     /**
-     * 重发验证码（#449 §2.3b）：成功 ⇒ `resend_after` 落成冷却秒数；
+     * 重发验证码（#449 §2.3b）：成功 ⇒ `resend_after` 落成冷却秒数，并记「手上有一枚码了」（`emailSent`）；
      * `429 rate_limited`（冷却中/超次数/按 IP 的发信频率）⇒ 用 `Retry-After` 覆盖冷却；
      * `503 email_send_failed` ⇒ 标记 `sendFailed`（按钮回「重新发送」且**不受冷却限制**，§2.3b 评审返修 ①）。
+     *
+     * 懒发信（feat-261110-01）之后它兼任**首次发信**的通道（`recordResend`：该 pending 下零码行
+     * = 当首次发信、不套 60s 冷却）⇒ `requestEmailCode()` 直接复用本函数，不复制第二份请求代码。
+     *
+     * @returns 服务端是否真的发出了新的一枚码（只有 `true` 才该把 `emailSent` 算成已发）
      */
-    async resendEmailCode() {
+    async resendEmailCode(): Promise<boolean> {
       this.loading = true;
       this.error = null;
       try {
@@ -371,11 +402,14 @@ export const useAuthStore = defineStore('auth', {
         });
         this.sendFailed = false;
         this.cooldownSeconds = typeof body.resend_after === 'number' ? Math.max(0, body.resend_after) : 0;
+        // 懒发信的落点：这一封**可能就是第一封**（零码行 = 首次发信）。
+        this.emailSent = true;
+        return true;
       } catch (err) {
         if (isPendingExpired(err)) {
           this.resetPendingLogin();
           this.error = i18n.global.t('errors.pendingExpired');
-          return;
+          return false;
         }
         if (isEmailSendFailed(err)) {
           // §2.3b 的 503 **不带** details（令牌本来就在手上）：不作废 pending、不设冷却，等用户再点。
@@ -386,8 +420,25 @@ export const useAuthStore = defineStore('auth', {
           this.adoptRetryAfter(err);
         }
         this.error = loginErrorText(err);
+        return false;
       } finally {
         this.loading = false;
+      }
+    },
+
+    /**
+     * 懒发信（工单 feat-261110-01）：**切到邮箱档那一刻**才发第一封码。
+     * 全部请求细节（冷却、`sendFailed`、pending 过期的收摊）都在既有的 `resendEmailCode()` 里，
+     * 本函数只加三件事：**不重入**（已发过 / 正在发 ⇒ 直接返回）、`emailSending` 给 UI 禁用用、
+     * 失败时**不**把 `factor` 强切回 TOTP（用户自己切，界面上有明确的错误文案）。
+     */
+    async requestEmailCode(): Promise<void> {
+      if (this.emailSent || this.emailSending) return;
+      this.emailSending = true;
+      try {
+        await this.resendEmailCode();
+      } finally {
+        this.emailSending = false;
       }
     },
 
@@ -411,11 +462,18 @@ export const useAuthStore = defineStore('auth', {
      * #449 二选一：在第二步的两条通道之间切换。**只改 `factor`**——`pendingToken` / `emailHint` /
      * `cooldownSeconds` 一律不动：同一枚 pending 不需要重新登录，已经发出去的码也不因为切换而作废
      * （要新码只能用户主动点「重发」）。单一通道（`choiceMethods` 为空）或本次没提供这条 ⇒ 空操作。
+     *
+     * 懒发信（feat-261110-01）：切到 `'email'` 且手上还没码 ⇒ 调一次 `requestEmailCode()`（第一封由这里发）。
+     * 切回 `'totp'` **绠不发信**（下面只在 `factor === 'email'` 时触发）；已在请求中也不重入。
+     * 不 `await`：切换的视觉反馈不依赖发信成败（发不出去也得让人看见表单与错误，而不是转圈）。
      */
     switchFactor(factor: LoginSecondFactor) {
       if (!this.pendingToken || !this.choiceMethods.includes(factor) || this.factor === factor) return;
       this.factor = factor;
       this.error = null;
+      if (factor === 'email' && this.emailSent !== true && this.emailSending !== true) {
+        void this.requestEmailCode();
+      }
     },
 
     /**
@@ -431,6 +489,9 @@ export const useAuthStore = defineStore('auth', {
       // #449 二选一：可选通道也是「上一个人」的态，跟着 pending 一起作废。
       this.choiceMethods = [];
       this.emailUnavailable = false;
+      // 懒发信：「手上有没有码」也是上一个人的账（新的一次登录必须从「还没发」重新开始）。
+      this.emailSent = false;
+      this.emailSending = false;
     },
 
     /**
