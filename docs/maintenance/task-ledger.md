@@ -90,3 +90,27 @@ http://10.41.24.146:18099` 在本机根本不存在**；实测 `10.41.24.146:180
 机器态断言（`http.https://github.com/.proxy` 「已注入」、`v0.1.1` vs `0.1.0`）。
 `§8.N` 引用面 581 → 586：只增加（搬走的段落在新家继续带指针），**没有任何一条被改号或删掉**
 （`AGENTS.md` 内被引用的编号集合与改前逐条相同）。
+
+### 8.115 管理台 MFA 保存入口收敛 + 探活信双语（PR #492，2026-11-11，v0.1.67）
+
+- **删掉冗余的「保存邮件码设置」按钮**（`saveMailOtp()` / `data-test="save-mail-otp"`）：它的载荷
+  `{mail_otp_enabled}` **严格是** `save-mfa-settings` 的 `mfaChanges`（exact-keys 两字段 diff）的子集，
+  「没邮箱不许开」那条守卫 `saveMfaSettings` 也已有两处（`:disabled` 的 `mfaMailNeedsEmail` + 函数体第二道闸）
+  ⇒ 零能力损失。随之退场：`mailOtpBusy` / `mailOtpError` / `mailOtpMessage` 三个 ref 与两条反馈行、i18n
+  `admin.fde.saveMailOtp` / `admin.fde.mailOtpSaved`（两边成对删）。
+- **探活信改双语**（`mail-settings.js#buildTestMessage`）：主题、正文的「这是测试信」「这不是验证码」、
+  时间戳行**各写两种语言**；仍纯函数、仍不含验证码。
+- **一条原先无覆盖的判据被补上**：「勾上邮件码但账号没邮箱 ⇒ 不许保存」的两道闸各自钉住。
+  关键取证：jsdom 里禁用按钮的 `element.click()` / VTU `trigger('click')` **根本不派发** ⇒ 只点按钮
+  永远验不到函数体那道闸，必须**把 `disabled` 摘掉再硬点**。
+- **一处假绿风险被消灭**：`AdminUsersView.spec.ts` 的 `MAIL_OTP_BLOCK` 结束锚点原来是
+  `indexOf('data-test="save-mail-otp"')` —— 按钮删掉后 `indexOf` 返回 `-1`，`slice(start, -1)`
+  **不报错也不切空**，而是静默胖到文件末尾。改成仍然存在的 `id="edit-panel-llm"`，并补两条
+  `not.toContain` 把「没越界」钉住（变异 B 证明它有牙）。
+- 门禁：根 **2136 / 2132 / 0 失败 / 4 跳过**、前端 **63 文件 / 1316**、`typecheck` rc=0、后端单文件 14/14。
+- 主 agent 亲跑 4 条变异（与 worker 的 4 条不重叠）：i18n 文案改空串 / 结束锚点改回已删的 id /
+  勾选框 `:disabled` 加 `totp_login_enabled` 条件 / 主题去掉中文 —— 各红在具名用例。
+  ⚠ 第一条**第一次跑错文件**（跑了 `AdminUsersView.spec.ts`，而新用例在 `AdminView.spec.ts`）⇒ 6/6 绿，
+  差点误判成覆盖缺口；换对文件后红在具名用例。**「变异不红」先核对「跑的是不是那条用例所在的文件」。**
+- 台账同步：`AGENTS.md` §8.112 / §8.113 里那两句「还留着该按钮」「测试发信仍是中文单语」已按本单改掉
+  （热层不保留已失效的现状断言）。
