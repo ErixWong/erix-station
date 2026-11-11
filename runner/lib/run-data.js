@@ -1,5 +1,5 @@
 // run 数据目录生命周期（issue #46 选项 A + issue #64 R1 配套归档修正，conversation-state.md §5 P1）：
-// notes 等 logical-run 作用域数据的落点，两层目录、两种语义：
+// run 级目录的落点与两条 sweep（notes 已在 #392 B 片抬到会话作用域，见本文件 :45 起）：
 //
 //   <home>/runs/<runId>/         活跃层：claim 后创建（0775 & umask 0002，worker UID 1002 同 GID 组可写），
 //                                跨 attempt 保留（resume 可读前序 attempt 的 notes）。崩溃/异常退出残留
