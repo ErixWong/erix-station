@@ -19,7 +19,8 @@
     "test:integration:db": "node --test portal/integration/db-integration.mjs",
     "start": "node portal/src/cli.js serve",
     "db:migrate": "node portal/src/cli.js migrate",
-    "healthcheck": "node portal/src/cli.js healthcheck"
+    "healthcheck": "node portal/src/cli.js healthcheck",
+    "check:agents-hotlayer": "node scripts/agents-hotlayer-budget.mjs"
   },
   "dependencies": {
     "erix-agent": "0.31.0",
