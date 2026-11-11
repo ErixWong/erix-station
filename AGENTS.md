@@ -4493,9 +4493,7 @@ checkbox**（`data-test="mfa-totp-checkbox"` / `mail-otp-enabled`）：勾上才
 `mail_otp_enabled=t / totp_login_enabled=t / totp_enrolled=t`，`admin.user_updated` 30 分钟内 **0 行**
 （证明「切换 → 不保存 ⇒ 库里一个字节没动」）。截图 `/docker/erix_station_playwright/v0165-mfa-tab.png`。
 
-**已知遗留（下一单可收）**：邮件码块里**还留着旧的「保存邮件码设置」按钮**（`data-test="save-mail-otp"`），
-与新的 `save-mfa-settings` 并存 —— 功能上都对（都只提交 `mail_otp_enabled`），但同一个字段两个保存入口
-是冗余。去掉它要同步改 `AdminView.spec.ts` 的几条用例，本单没做。
+（那个与 `save-mfa-settings` 并存的冗余「保存邮件码设置」按钮已于 v0.1.67 删除，见台账 §8.115。）
 
 **过程账**：这块前端切片连折两个执行体——一次撞 30 分钟硬顶、一次**进程直接消失**（`stale-run
 reconciliation` 判死，内存与系统日志无 OOM 痕迹），两次都**零提交**。⇒ 主 agent 第一次在死之前
@@ -4549,8 +4547,6 @@ tag `v0.1.66` → release `42776650239` → 清单 portal `digest=ae90a9a6…` /
 （`http_request_failed` 两次）⇒ 截图的看图复核没做，改以 DOM 断言为准（`/docker/meeting_asr_app_playwright/v0166-code-ttl-zh.png`）。
 
 **已知遗留 / 现场事实**：
-- 管理台「测试发信」（`mail_settings.buildTestMessage`）**仍是中文单语**：那是运维手点的探活信、不含验证码，
-  本单按字面范围没动（要双语另开一单）。
 - 验收时发现 `eric` 的 `totp_login_enabled = false`（`totp_secret` 仍在）⇒ 他现在走的是
   `email_code_required`（邮箱码是唯一第二因素），两档 switch 对他是隐藏的。**不是本单改的**，
   是管理台侧某次保存的结果；要恢复 TOTP 登录去「二次验证」tab 勾回来即可。
