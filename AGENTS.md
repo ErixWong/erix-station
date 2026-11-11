@@ -4451,6 +4451,13 @@ portal 实跑 `47b83d49…`、`healthz=200`、浏览器 bundle = `index-BsJZeRng
 别把「等窗口」用在「用户马上要看的按钮」上。截图 `/docker/erix_station_playwright/488-hide-button-live.png`
 （会话行 hover 后右侧第三颗 = 眼睛带斜线，前两颗仍是 ✨ AI 改名 / ✏️ 重命名）。
 
+⚠ **现网已被后续版本覆盖（2026-11-10 现查）**：我发的是 `v0.1.64`，但随后并行的 session 又发了 `v0.1.65` / `v0.1.66`
+（§8.112 / §8.113），现网 `station-portal` 实跑 `892a027c…` = v0.1.66 的 imageId。**代码没丢**：
+`git merge-base --is-ancestor dd8c937 v0.1.66` = 真，且容器内 bundle 实测仍含 `sidebar-hide` / `hideSession` /
+`hideConfirmNote` 与中英双语确认文案 ⇒ 按钮在现网上活着。⇒ 引用本节时**别把「现网 = v0.1.64」当事实**，
+它是「本片发版那一刻」的记录。
+
+
 ### 8.112 v0.1.65：管理台「二次验证」tab + 两个 checkbox + 后端 `totp_login_enabled` 一维（PR #490，2026-11-10）
 
 **用户三轮反馈收口**：① 管理台里找不到「二选一」（埋在 `安全` tab、是个原始勾选框）；②「你这谁看了会觉得
