@@ -114,3 +114,17 @@ http://10.41.24.146:18099` 在本机根本不存在**；实测 `10.41.24.146:180
   差点误判成覆盖缺口；换对文件后红在具名用例。**「变异不红」先核对「跑的是不是那条用例所在的文件」。**
 - 台账同步：`AGENTS.md` §8.112 / §8.113 里那两句「还留着该按钮」「测试发信仍是中文单语」已按本单改掉
   （热层不保留已失效的现状断言）。
+- **发版与部署（v0.1.67）**：PR #492 质量门禁绿 → merge `c9017a2` → 版本 bump `bd227e2`（六文件 9 增 9 删）
+  → main CI `42942166678` 两个 job 全绿（质量门禁 + 三镜像构建校验）→ tag `v0.1.67` → release `42942776168`
+  → 清单 `imageId` 与部署机 `docker image inspect .Id` **逐个一致**（portal `98a6fbcd…` / digest `69b8848b…`；
+  proxy `8966720e…` / digest `1b79e28a…`）→ `deploy/.env` 形态① pin **只两个**
+  （`git diff --name-only v0.1.66..v0.1.67 -- runner/` 去掉 package 文件后为空 ⇒ `FDE_IMAGE` 故意留在 v0.1.66 摘要、
+  **5 台 FDE 容器没重建**；备份 `/tmp/deploy.env.bak-0167`）→ `up -d --no-build station-portal`（连带重建
+  `station-docker-proxy`）⇒ portal 实跑 `98a6fbcd…`、`0.1.67`、healthy、用户面 `healthz=200`、管理台 `9443/api/site` 200。
+- **发布物取证**：容器内 `buildTestMessage` 实跑输出双语（主题 + 两件事 + 时间戳行各两份）；
+  前端 bundle `index-DR-moTu5.js` 里 `save-mail-otp` / `saveMailOtp` / `mailOtpSaved` **各 0 命中**、
+  `save-mfa-settings` 1 命中。
+- ⚠ **浏览器面本轮未取证（如实记）**：本机可用的 playwright MCP 实例解析不了 `*.fde.erix.vip`
+  （`ERR_NAME_NOT_RESOLVED`，项目级 `playwright` server 被项目审批挡住），所以「二次验证 tab 里那个按钮真的没了」
+  的证据是「部署产物字节 + 组件层用例」，不是 DOM 断言。要在浏览器上补验，得先让 playwright 实例带
+  `--host-resolver-rules=MAP * 100.100.0.3`。
