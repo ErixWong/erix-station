@@ -266,18 +266,22 @@ export async function updateMailSettings({ pool, actorId = null, fields } = {}) 
 /**
  * 测试发信的正文（**不含验证码**：这是运维手点的一封探活信，正文只有「这是测试信 + 时间戳」）。
  * 收件人/时间戳由调用方给，本函数保持纯函数（单测好钉）。
+ * feat-261111-01：改成中英双语（同一件事两种语言各写一次，不是只翻译标题）——收件人可能是
+ * 非中文运维，而探活信也是「通道可用」的证据，得让两边的人都看得懂它不是验证码。
  */
 export function buildTestMessage({ to, at }) {
   const stamp = at instanceof Date ? at.toISOString() : String(at ?? new Date().toISOString());
   return {
     to,
-    subject: 'FDE Station 邮件通道测试',
+    subject: 'FDE Station 邮件通道测试 / Mail channel test',
     text: [
       '这是一封来自 FDE Station 管理台的测试邮件，用于确认邮件通道（SMTP）配置可用。',
+      'This is a test email from the FDE Station admin console, used to check that the mail channel (SMTP) is configured correctly.',
       '',
-      `发送时间：${stamp}`,
+      `发送时间 / Sent at: ${stamp}`,
       '',
       '这不是登录验证码，无需任何操作。',
+      'This is not a sign-in verification code — no action is needed.',
     ].join('\n'),
   };
 }

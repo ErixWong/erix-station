@@ -19,14 +19,19 @@ const MFA_FACTORS_BLOCK = adminUsersViewSource.slice(
   adminUsersViewSource.indexOf('data-test="totp-settings-section"'),
 );
 /**
- * 邮件验证码设置那一块（从 section 开头到保存按钮）。
+ * 邮件验证码设置那一块（从 section 开头到下一档「LLM」面板的开头）。
  * feat-261110-03：控制件从上一版自实现的「轨道 + 滑块」开关（`role="switch"`）回到原生勾选框
  * `<input type="checkbox" data-test=…>`（用户原话「用checkbox吧，两个checkbox就行」），
  * 但**仍在同一档、同一语义**，断言语义一条没删。
+ * feat-261111-01：块内那个「保存邮件码设置」按钮（`data-test="save-mail-otp"`）已删 ⇒ 它不能再当
+ * 结束锚点（锚点被删时 `indexOf` 返回 -1，`slice(start, -1)` 会**静默变形而不报错** = 假绿风险）。
+ * 改钉仍然存在的下一档开头 `id="edit-panel-llm"`（邮件码块是「二次验证」那一档的最后一块，下一块就是 LLM 面板）：
+ * 起点锚点失配 ⇒ 切片为空，下面第一条 `not.toBe('')` 当场红；终点锚点失配 ⇒ 切片不空而是默默胖到文件末尾，
+ * 靠下面两条 `not.toContain` 拦（已实测：把锚点改名，那两条就红）。
  */
 const MAIL_OTP_BLOCK = adminUsersViewSource.slice(
   adminUsersViewSource.indexOf('data-test="mail-otp-section"'),
-  adminUsersViewSource.indexOf('data-test="save-mail-otp"'),
+  adminUsersViewSource.indexOf('id="edit-panel-llm"'),
 );
 /** 邮件码勾选框本体那一个标签（`[^>]*` 而不是 `[\s\S]*?`：否则会从 TOTP 那个 input 一路贴过来，
  * 把两个标签的 `:disabled` 当成一个读）。 */
@@ -36,6 +41,12 @@ const TOTP_CHECKBOX_TAG = MFA_FACTORS_BLOCK.match(/<input[^>]*data-test="mfa-tot
 describe('#449 管理台：TOTP 账号的邮件验证码开关不再是死开关', () => {
   it('开关本体没有被置灰（TOTP 账号也能真打开它）', () => {
     expect(MAIL_OTP_BLOCK, '找不到邮件验证码设置那一块').not.toBe('');
+    // 但「非空」不够：结束锚点失配时 `indexOf` 返回 -1，`slice(start, -1)` **不报错也不切空**，而是切到
+    // 「文件末尾前一字符」⇒ 切片悄悄变胖（实测从 ~1.3KB 胖到整份文件）而下面的 toContain 照绿。
+    // 所以还得钉「没越界」：下一档（LLM 面板）的东西一律不得出现在这一块里。
+    // （这条本身也有牙：把 `id="edit-panel-llm"` 改名跑一下，这里就红。）
+    expect(MAIL_OTP_BLOCK, '结束锚点失效：切片已越界到下一档').not.toContain('id="edit-panel-llm"');
+    expect(MAIL_OTP_BLOCK, '结束锚点失效：切片里出现了 LLM 面板本体').not.toContain('UserLlmPane');
     expect(MAIL_CHECKBOX_TAG, '找不到邮件码勾选框本体').not.toBe('');
     expect(MAIL_CHECKBOX_TAG, 'test id 必须还在开关上（旧用例的选择器靠它）').toContain('data-test="mail-otp-enabled"');
     expect(MAIL_CHECKBOX_TAG, '必须是原生勾选框').toContain('type="checkbox"');
@@ -43,7 +54,9 @@ describe('#449 管理台：TOTP 账号的邮件验证码开关不再是死开关
     // 所以断言从「一个 :disabled 也不能有」改成「:disabled 的取值里不得出现 TOTP」——语义更窄且不失原意。
     const disabledBinding = MAIL_CHECKBOX_TAG.match(/:disabled="([^"]*)"/)?.[1] ?? '';
     expect(disabledBinding, '禁用不得因 TOTP 而起（置灰 = 死开关的旧形态）').not.toMatch(/totp|editUser/i);
-    expect(disabledBinding, '禁用只应来自请求在途').toContain('mailOtpBusy');
+    // feat-261111-01：在途闸从旧的 `mailOtpBusy`（块内那个单独保存按钮专用）换成共用保存动作的 `mfaBusy`。
+    // 语义一字未动：「禁用只应来自请求在途」——只是那个已退场的 ref 不能再当字面锚点。
+    expect(disabledBinding, '禁用只应来自请求在途').toContain('mfaBusy');
   });
 
   it('未绑定 TOTP ⇒ 那一位的勾选框禁用并说「未绑定」（而不是让人勾一个走不通的因素）', () => {

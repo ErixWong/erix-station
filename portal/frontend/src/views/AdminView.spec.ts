@@ -1723,7 +1723,10 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
     await checkbox.setValue(true);
     expect(isChecked(checkbox), '勾上必须当场生效').toBe(true);
     expect(wrapper.get('[data-test="mail-otp-section"]').isVisible(), '勾上才展开对应块').toBe(true);
-    await section.get('[data-test="save-mail-otp"]').trigger('click');
+    // feat-261111-01：块内那个「保存邮件码设置」按钮已删（它的载荷严格是下面那一份 diff 的子集），
+    // 保存的唯一出口改成勾选框行上的 `save-mfa-settings` —— **下面那两条断言一字没动**，它们钉的正是
+    // 「只带改动那一位（exact keys）」：这一位改了就只有 `mail_otp_enabled` 一个键。
+    await section.get('[data-test="save-mfa-settings"]').trigger('click');
     await flushPromises();
 
     expect(patches).toHaveLength(1);
@@ -1738,13 +1741,13 @@ describe('AdminView · 邮件验证码开关（per-user）', () => {
 // ---------------------------------------------------------------------------
 describe('AdminView · 二次验证 tab（两个勾选框 + 勾选展开）', () => {
   /** 把 `totp_login_enabled` / `mail_otp_enabled` 接成任意形状的用户（后端 DTO 恒带这两个键）。 */
-  function usersPayload(totpLogin: boolean, mailOtp: boolean) {
-    return { items: USERS.items.map((user) => ({ ...user, totp_login_enabled: totpLogin, mail_otp_enabled: mailOtp })) };
+  function usersPayload(totpLogin: boolean, mailOtp: boolean, overrides: Record<string, unknown> = {}) {
+    return { items: USERS.items.map((user) => ({ ...user, totp_login_enabled: totpLogin, mail_otp_enabled: mailOtp, ...overrides })) };
   }
 
   /** 打开 alice 的抽屉并切到「二次验证」；PATCH 按体回写到 GET（跟服务端同语义）。 */
-  async function openMfaTab(totpLogin = true, mailOtp = false, patchDelay = false) {
-    let current: unknown = usersPayload(totpLogin, mailOtp);
+  async function openMfaTab(totpLogin = true, mailOtp = false, patchDelay = false, overrides: Record<string, unknown> = {}) {
+    let current: unknown = usersPayload(totpLogin, mailOtp, overrides);
     const patches: Array<Record<string, unknown>> = [];
     const mounted = await mountAdmin('/admin/users', (url, init) => {
       if (url === '/api/admin/users' && !init?.method) return jsonResponse(200, current);
@@ -1855,7 +1858,10 @@ describe('AdminView · 二次验证 tab（两个勾选框 + 勾选展开）', ()
     expect(box.find('[data-test="mfa-no-factor"]').exists()).toBe(true);
     // 邮件码那一位不受 TOTP 约制（#449 红线：不得因为 TOTP 把邮件码置灰）。
     expect((box.get('[data-test="mail-otp-enabled"]').element as HTMLInputElement).disabled).toBe(false);
-    expect(box.find('[data-test="save-mail-otp"]').exists(), '未展开就没有块内按钮').toBe(false);
+    // feat-261111-01：这里原来钉的是块内那个「保存邮件码设置」按钮（`save-mail-otp`），它随按钮本体一起删了。
+    // 钉的东西不变——**v-if 不是 v-show**：没勾上就连块本身都不该在 DOM 里 ⇒ 直接钉 section 本体，比钉
+    // 「块里某个按钮」更直接（同一强度，不是放宽）。
+    expect(box.find('[data-test="mail-otp-section"]').exists(), '未勾选就没有邮件码块').toBe(false);
     await box.get('[data-test="mail-otp-enabled"]').setValue(true);
     expect(box.find('[data-test="mfa-no-factor"]').exists(), '勾上邮件码就有第二因素了').toBe(false);
     expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1')).toHaveLength(0);
@@ -1896,7 +1902,40 @@ describe('AdminView · 二次验证 tab（两个勾选框 + 勾选展开）', ()
     wrapper.unmount();
   });
 
-  it('保存请求在途 ⇒ 按钮禁用且再点不再发第二个请求（现有 mailOtpBusy 语义不回归）', async () => {
+  // feat-261111-01：删掉块内那个「保存邮件码设置」按钮后，「没邮箱不许启用邮件码」这条交叉防护
+  // **只剩 `save-mfa-settings` 一个出口**，而它有两道闸（两道都得钉）：
+  //   闸一 = 按钮 `:disabled` 里的 `mfaMailNeedsEmail`（用户点不动）；
+  //   闸二 = `saveMfaSettings()` 函数体里那句 `if (mfaMailNeedsEmail.value) { mfaError = …; return; }`。
+  // ⚠ 闸二只能靠**绕过闸一**才能验到：本机实测 jsdom 里「禁用按钮 + element.click() / VTU trigger('click')」
+  // 根本不会把事件递到 @click（spy 调用数恒为 0，而裸 `dispatchEvent(new MouseEvent('click'))` 会）
+  // ⇒ 所以下面把 disabled 摘掉再硬点一次：删了闸二 ⇒ 这一步会真发 PATCH，本用例当场红。
+  it('没邮箱 ⇒ 保存禁用；绕过禁用硬点也不发 PATCH，并回一句「还没有邮箱」（两道闸各自钉住）', async () => {
+    const { wrapper, fetchFn, panel } = await openMfaTab(true, false, false, { email: null });
+    const box = panel();
+    await box.get('[data-test="mail-otp-enabled"]').setValue(true);
+    const save = box.get('[data-test="save-mfa-settings"]');
+
+    // 闸一：按钮禁用，普通点击不排队。
+    expect((save.element as HTMLButtonElement).disabled, '本次要提交邮件码而账号没邮箱 ⇒ 必须禁用').toBe(true);
+    await save.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1'), '禁用态点击不发请求').toHaveLength(0);
+
+    // 闸二：把禁用摘掉⇒事件真的能递到 @click，函数体必须自己拦下来。
+    (save.element as HTMLButtonElement).disabled = false;
+    await save.trigger('click');
+    await flushPromises();
+    expect(callsTo(fetchFn, 'PATCH', '/api/admin/users/u1'), '函数体第二道闸必须也拦得住').toHaveLength(0);
+    expect(box.findAll('.syserr').map((node) => node.text()).join(' '),
+      '拦下来要留下一句能看的说明（不是静默失败）').toContain('该用户还没有邮箱');
+
+    // 同一位上那句背景提示也得在（块内 `v-else` 那一行），而且不能把键名直接打到界面上。
+    expect(box.get('[data-test="mail-otp-section"]').text()).toContain('该用户还没有邮箱');
+    expect(box.text()).not.toContain('admin.fde.mailOtpNeedsEmail');
+    wrapper.unmount();
+  });
+
+  it('保存请求在途 ⇒ 按钮禁用且再点不再发第二个请求（现有 mfaBusy 语义不回归）', async () => {
     const { wrapper, fetchFn, panel } = await openMfaTab(true, false, true);
     const box = panel();
     await box.get('[data-test="mfa-totp-checkbox"]').setValue(false);
