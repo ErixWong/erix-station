@@ -4662,3 +4662,46 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 **状态**：本批**不排期、未开发**（`docs/design/event-platform/` 只是可研），
 六个待决策项在 `10-first-macros.md` §7 / `12-surfaces.md` §7（模板是代码常量还是可编辑数据）/
 `13-macro-panel.md` §9.2。
+
+### 8.119 open issue 全量对账：关 5 条 / 拆 4 条（261111，主 agent，**零代码改动**）
+
+用户问「哪些已经做完了但没关」。判据用**当前树的 file:line**，不用 `ISSUES.md` 里 10-30 那份
+分层表（二手事实，它自己那批建议已执行掉 9 条：#404/#356/#395/#371/#378/#233/#274/#163/#440 已关）。
+
+**关掉 5 条**（结案评论逐条点到位置）：**#392**（五片全在：`runner/worker.js:933-938` A /
+`:575-581`+`:569` B / `:771-789`+`:1094-1103` C / `StreamPanel.vue:342` D /
+`runner/test/fold-notes-e2e.test.js` E；D 片暴露的横幅缺口另开的 #440 已关）·
+**#359**（P0a `gitlight.js:352`+`http.js:1031` / P0b `GitLightBadge.vue` / P0c `AGENTS.md` §7.2；
+唯一未裁的「partial 压红」拆 #494）· **#366**（PR #372 `aaf8294` + `deploy/README.md:60` +
+`docs/env.md:332-334`；部署面拆 #493）· **#412**（③④ 已修，①② 拆 #495）·
+**#473**（family B = PR #483 `309f9a9`；family A 拆 #496）。open 数 20 → **19**。
+
+**新开 4 条**：**#493** kkFileView 镜像 push GHCR + digest 钉 + profile 起起来并真机验收 ·
+**#494** 「没扫完」不该把已证实的红压成灰（三候选 + 代价，`needs-product-decision`，**等拍**）·
+**#495** wp3b 的 ①②（起跑前预检 `--env-file`；把 EACCES 与「没物化」分开报）·
+**#496** 3 个 spec / 6 处 `w.emitted(...)` 换 DOM/请求桩。
+
+**本批新测出来的事实（原单里都没记）**
+
+1. family A 的环境地板**不止 `GitLightBadge`**：`NODE_ENV=production` 跑三个 spec ⇒ **rc=1 / 4 红**
+   （`GitLightBadge` 3 + **`SidebarPanel.spec.ts` 1**），同一批 `env -u NODE_ENV` ⇒ **97/97 rc=0**。
+   全仓还剩 3 个 spec / 6 处 `.emitted(`（`DelegateChildDrawer.spec.ts` 那处在此环境下仍绿）。
+2. **#366 之前被当成「已交付」，但部署面三条判据全空**（现验）：`ghcr.io/erix-station/kkfileview:5.0.3`
+   ⇒ `manifest unknown`；`docker ps -a | grep -i kk` ⇒ 无；`grep -c KKFILEVIEW deploy/.env` ⇒ 0
+   ⇒ **现网点 `.docx` 其实没有预览**。
+3. **#412 的 ③ 早被修成工单要的「映射」而非加挂载**（`deploy/fde-proxy/server.js:9`+`:278`），
+   ④ 由 `portal/integration/lib/isolated-env.mjs:195`+`:220`（判据是「与共享 `.env` 逐条不相等」）承住；
+   ①② 原样未动（`wp3b-e2e.mjs:83` 固定 `--env-file`、`:480` 仍 `fs.existsSync`）。
+4. **#367 现验**：点名的会话 `9e0c8a17…` 在本机 `chat_sessions` 命中 **0**（全库 136 会话）
+   ⇒ 那条 open 是**别台部署的存量**，不是本机待办。**#341**：引擎 0.31.0 读侧仍「`partOf` 只认首片」
+   （`node_modules/erix-agent/src/store/message-rows.js:284-296`）⇒ 站内解链闸不许拆。
+   **#303**：回退 `runner/worker.js:285` 仍在承重（盘上 34 行旧记录）。
+
+**坑（我第一遍就踩了）**：数「还有没有 `w.emitted()`」**不能用 `grep -c 'emitted()'`** ——
+实际写法是 `w.emitted('prefill')` 带实参，括号里非空 ⇒ 计数 0 ⇒ 我当场把 family A 误判成「已修」。
+判据要按**调用形状**写（`grep -rn '\.emitted('`），并且任何「这条已交付」的结论最后都得落到
+**跑一次退出码**（本批就是 `NODE_ENV=production` 那一跑把范围测全的）。
+
+**剩下的 19 条 open 分桶**：真待做 #387 / #259 / #231 / #243 / #485 / #270 / #227（第 4 项）·
+等拍 #348 / #346 / #331 / **#494** · 上游与别台 #341 / #367 / #426 · 挂账 #303 · 外部 #135 ·
+新拆 #493 / #495 / #496。**「open 数」不是进度**：本批 20→19 只动了 1 格，但五张半开的单被拆清了。
