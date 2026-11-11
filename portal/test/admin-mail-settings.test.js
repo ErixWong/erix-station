@@ -473,9 +473,21 @@ test('#449管理台⑧-1 测试发信成功 ⇒ 200 {ok,to,at} + 审计 admin.ma
     assert.equal(srv.state.sent.length, 1);
     const message = srv.state.sent[0];
     assert.equal(message.to, 'ops@example.com');
-    assert.equal(message.subject, 'FDE Station 邮件通道测试');
+    // feat-261111-01：探活信改双语。钉的不是「有英文单词」而是**同一件事两种语言各写一次**：
+    // 主题、正文的「这是测试信」与「这不是验证码」、以及时间戳那一行都得两边成对。
+    assert.match(message.subject, /邮件通道测试/, '主题：中文');
+    assert.match(message.subject, /mail channel test/i, '主题：英文（与中文同一件事）');
     assert.ok(message.text.includes(res.body.at), '正文带本次时间戳');
-    assert.match(message.text, /测试邮件/, '正文说明这是测试信');
+    assert.match(message.text, /测试邮件/, '正文说明这是测试信（中文）');
+    assert.match(message.text, /test email/i, '正文说明这是测试信（英文）');
+    assert.match(message.text, /不是登录验证码/, '正文说清这不是验证码（中文）');
+    assert.match(message.text, /not a sign-in verification code/i, '正文说清这不是验证码（英文）');
+    // 时间戳那一行：必须**同一行**双语，不能只在正文里某处漂一句英文。
+    const stampLine = message.text.split('\n').find((line) => line.includes(res.body.at)) ?? '';
+    assert.ok(stampLine, '时间戳单独占一行');
+    assert.match(stampLine, /发送时间/, '时间戳行：中文标签');
+    assert.match(stampLine, /Sent at/, '时间戳行：英文标签');
+    // 这条口径**不许放宽**：探活信不是验证码信，正文里不得出现 6 位码。
     assert.ok(!/\b\d{6}\b/.test(message.text), '测试信正文不含验证码');
     assert.ok(!res.text.includes(PASSWORD), '响应里没有口令');
 
