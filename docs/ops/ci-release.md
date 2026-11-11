@@ -270,10 +270,12 @@ userspace/端口下发对账 → 预览签票链路 → 去置备 + offboarding 
 
 ---
 
-## 7. 首次发布前置：版本对齐（**现状会被拦住，属预期**）
+## 7. 发布前置：版本对齐（**每次发布现验，别抄本文写过的数**）
 
-- 现状：`package.json = 0.1.0`、`runner/package.json = 0.1.0`，但 git tag 已到 **`v0.1.1`**（历史遗留不一致）。
-  ⇒ 直接拿 `v0.1.1` 跑 `release.yml` 会在步骤 ① **失败**（同时打印两者当前值）。本工单**没改**版本号。
+- **先现验再下结论**（261110 实测：`package.json` 与最新 tag 都是 **0.1.66**，本节曾写的「`0.1.0` vs
+  `v0.1.1`」已不成立）：`git tag --sort=-creatordate | head -1` 与
+  `node -p "require('./package.json').version"`。两者不等 ⇒ 拿该 tag 跑 `release.yml` 会在步骤 ①
+  **失败**（同时打印两者当前值）。
 - 发布前动作（一次改齐，别只改一个）：
   1. `package.json` 的 `version` = 目标版本（**这是硬门**）；
   2. `runner/package.json`（FDE 镜像与宿主引擎同源，`release.yml` 只警告不阻断）；

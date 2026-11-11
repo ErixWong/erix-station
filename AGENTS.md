@@ -48,20 +48,43 @@ docs/       # 文档地图（docs/README.md）+ design/ + api/ data/（已建）
 
 测试隔离约定：涉及用户配置/容器网络的测试必须注入路径参数，不碰真实环境。
 
-派工环境约定（2026-10-08 实证）：git worktree **不含未跟踪的 `node_modules`**，worker 进去后测试一律跑不起来；补装极便宜（`npm ci --prefer-offline` 热缓存 ~1.4s），所以派单红线应写「不改依赖版本、不提交 lockfile 变动」，而不是「禁止安装依赖」。
+派工环境约定：git worktree **不含未跟踪的 `node_modules`**，worker 进去后测试跑不起来；补装极便宜
+（`npm ci --prefer-offline` 热缓存 ~1.4s）。所以派单红线写「不改依赖版本、不提交 lockfile 变动」，
+**不是**「禁止安装依赖」。
 
-⚠ **前端跑单条用例的形式（2026-10-14 一晚上连续两次踩同一坑）**：**`npx vitest run <文件>` 在本机会永久挂死**（实测主 agent 900s 零输出被 timeout 杀、worker 又拿同一形式占满 300s 无输出），而项目脚本 **3.4 秒**跑完 21 条。口径：只跑一个文件用 **`cd portal/frontend && timeout 240 npm test -- src/xxx.spec.ts`**（`test` 脚本本身就是 `vitest run`，`--` 后直接跟文件），类型检查用 **`npm run typecheck`**；**不要用 `npx vitest` / `npx vue-tsc`**。给 worker 的工单里写测试命令时**一律带 `timeout 240`**：否则一条挂死的命令看起来既不像成功也不像失败，会一直占着会话（attention 信号也只会被当成「命令开得久」）。
+⚠ **前端只跑一个文件的形式**：**`npx vitest run <文件>` 在本机永久挂死**（`npx vue-tsc` 同），而项目
+脚本 3.4 秒跑完 21 条。口径：**`cd portal/frontend && timeout 240 npm test -- src/xxx.spec.ts`**
+（`test` 脚本本身就是 `vitest run`，`--` 后直接跟文件）+ **`npm run typecheck`**；工单里写测试命令
+**一律带 `timeout 240`**——挂死的命令既不像成功也不像失败，会一直占着会话。
 
-⚠ **主工作区 `node_modules` 会被别的 worktree 掏空（同一晚第三次复发）**：症状是 `npm test` 从 1022 项掉到 **510 项 + 34 失败**，且 `node_modules/erix-agent` 不存在——**不是代码回归**，先 `ls -d node_modules/erix-agent` 再下结论，`npm ci --prefer-offline` 重装即回基线。推论：**发版/验收前必须先重装一次并复跑拿到基线数**，别拿一个依赖不完整的树当验收基点。
+⚠ **每个 worktree 自备 `node_modules`**（`npm ci --offline` 热缓存 ~0.5s）。历史上 `node_modules` 曾被
+当文件提交过（mode 120000 符号链接指向绝对路径；`.gitignore` 写的是 `node_modules/`，**带斜杠只匹配目录**），
+一棵树被十几个 worktree 共享 ⇒ 任何一处 `npm install` 顺链接剪别处的依赖。形态已由 #396（`679519a`）
+消除，判据 `test/repo-hygiene.test.js`（H1 跟踪必须为空，并带「删规则必须看得见」的反向自证）。
 
-> **这一族症状的根因已于 #396（`679519a`）消除，但上面那条重装仪式继续有效。** 根因不是「worktree 不拷依赖」，是 `node_modules` 曾被**当文件提交过**（mode 120000 的符号链接，内容是一个**绝对路径**；`.gitignore` 只有 `node_modules/`，**带斜杠只匹配目录**，所以 `git add -A` 把链接扫了进来）。后果是行为而不是观感：一棵依赖树被十几个 worktree 共享，任何一处 `npm install` 都顺链接剪别处的依赖（2026-10-27 实测：一次 `npm install --omit=dev` 把共享树清成空目录，另一个 worktree 的折叠那一族测整片红）；而各分支钉的 `erix-agent` 版本不同（今天就是 main 侧要求 0.26.0、共享树里是 0.25.0），共享树根本无法同时服务。**现在的口径：每个 worktree 自备 `node_modules`**（`npm ci --offline` 热缓存约 0.5s）；旧 worktree 里遗留的链接现在是**未跟踪**文件，`ls -ld node_modules` 看出形态后 `rm` 掉再装即可。判据：`test/repo-hygiene.test.js`（H1 跟踪必须为空；H2 真造一个符号链接复现旧症状，并带「把规则删掉必须看得见」的反向自证）。
+**验收 / 发版前先重装一次并复跑拿到基线数**——别拿依赖不完整的树当验收基点（症状：项数从 1022 掉到
+510 + 34 失败、`node_modules/erix-agent` 不存在，而代码没回归）。旧 worktree 里遗留的链接现在是未跟踪
+文件，`ls -ld node_modules` 看出形态后 `rm` 掉再装。
 
-⚠ **前端判绿只能看退出码，不能 grep 摘要行（2026-10-14 主 agent 自己犯的错，代价是一次返工重打 tag）**：vitest 在存在**未捕获拒绝**时照样打印 `Test Files 33 passed (33) / Tests 488 passed (488)`，**但进程以 rc=1 退出**。我当晚用 `npm test 2>&1 | grep -E "Test Files|Tests "` 连跑 3 次都读到「全绿」，实际每一次都是 rc=1、4 条 `Unhandled Rejection` —— 于是把红灯当绿灯合进了 main，直到 CI 步骤 ④ 红才发现。口径：**判绿 = 退出码 0**；要么直接 `npm test; echo rc=$?`，要么 `npm test && echo GREEN`。附带两条：① 这类泄漏的常见成因是 `onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的 Promise），产品侧实例见 issue #281；② 有 worker 把它归因成「本机 `NODE_ENV=production` ⇒ Vue 生产构建吞掉拒绝」，**该说法在本机已被主 agent 实测否证**（`production` 与 `NODE_ENV=test` 两种模式跑原始文件都是 rc=1）——别拿未在自己机器上复现的成因当结论。
+⚠ **判绿只看退出码**：存在未捕获拒绝时 vitest 照样打印 `Test Files 33 passed (33) / Tests 488 passed
+(488)`，**但进程以 rc=1 退出** ⇒ `npm test; echo rc=$?` 或 `npm test && echo GREEN`，**别 grep 摘要行**。
+这类泄漏的常见成因：`onMounted` 里 `await` 一个会失败的请求且没 catch（Vue 不等 `onMounted` 返回的
+Promise）；产品实例 issue #281。
 
-⚠ **`NODE_ENV=production` 会让前端测试假红——这不是并发负载（2026-11-09 亲手三组对照，推翻此前 7 次归因）**：`portal/frontend` 的 `src/components/GitLightBadge.spec.ts` 有 3 条用 `w.emitted()` 断言事件，而 `@vue/test-utils@2.5.1` 的 `emitted()` 靠 **Vue devtools hook** 捕获事件，生产构建不发 devtools 事件 ⇒ 捕获恒空 ⇒ 3 条必红。同一台机器、同一份未改代码实测：`NODE_ENV` **未设** ⇒ 18/18 绿、`NODE_ENV=production` ⇒ 3 红、`NODE_ENV=test` ⇒ 18/18 绿。机制最小复现：一个只 `emit('refresh')` 的 `defineComponent`，默认 env 下 `w.emitted()` 返回 `{}`。
-⇒ **口径**：① 跑前端测试**不要设 `NODE_ENV=production`**（本仓 shell 默认未设；设了就是自找假红）；② 以后见到这 3 条红，先 `echo $NODE_ENV`，**不要**再归因成「worker 环境/并发负载」——此前 §8.63 / §8.82 / §8.88 / §8.100 / §8.103 那几句「worker 报基线红、主 agent 空载恒绿」的成因写错了（观察没错，归因错：主 agent 的 shell 里 `NODE_ENV` 是空的）；③ 写新前端用例**别用 `w.emitted()`**（改用 DOM / 请求桩断言），否则它在任何 `NODE_ENV=production` 的环境里都会假红。
+⚠ **`NODE_ENV=production` 让前端测试假红**：`@vue/test-utils@2.5.1` 的 `emitted()` 靠 Vue devtools
+hook 捕获事件，生产构建不发 devtools 事件 ⇒ `w.emitted()` 恒空。同一台机器同一份未改代码实测：未设
+18/18 绿、`production` 3 红、`NODE_ENV=test` 18/18 绿。口径：① 跑前端测试**不要设 `NODE_ENV=production`**
+（本仓 shell 默认未设）；② 见 `GitLightBadge.spec.ts` 那 3 条红先 `echo $NODE_ENV`，不是并发负载也不是
+「worker 环境」；③ 新前端用例**别用 `w.emitted()`**，改用 DOM / 请求桩断言。
 
-⚠ **GitHub 连不上先怀疑本机 DNS，别反复重试 git（2026-10-24 实证）**：内网 DNS（`10.56.16.16`）把 `github.com` 钉到 `140.82.121.4`、`api.github.com` 钉到 `140.82.121.6`，这两个地址半死不活（TCP 连得上、TLS 握得手、HTTP 不回话）。**间歇性**，同一条命令可能连挂十几分钟再突然通。本机配置：`git` 已按域名注入 `git config --global http.https://github.com/.proxy = http://10.41.24.146:18099`（本机用户在 `10.41.24.146` 自建的代理，另有 SOCKS5 `:18098`），**仅作用于 github.com**；**`gh` 不读 git 配置**，得自己带：`HTTPS_PROXY=http://10.41.24.146:18099 gh …`。⚠ **不要在全局 env 里设 `HTTP(S)_PROXY`**：曾为此跑过一个本地 `127.0.0.1:18443` CONNECT 代理（含 cron 看门狗），结果把 pi 的中转请求（`api.ai.erix.vip`，直连 1s 即通）也代理掉并造成卡死，2026-10-24 已彻底删除——**代理加在本来就通的链上是负收益**。容器内的 `127.0.0.1` 不是宿主，也不继承本机代理（实测 erix agent 容器 DNS 拿到的是好 IP，200/0.6s）。判据：`timeout 8 curl -s -o /dev/null -w "%{http_code}\n" -x http://10.41.24.146:18099 https://api.github.com` 通了就只是本机 DNS 问题；要临时绕开代理用 `git -c http.https://github.com/.proxy= …`。别改 `/etc/hosts`（无 sudo）。最新口径见 `~/projects/AGENTS.md`。
+⚠ **GitHub 连不上先怀疑本机 DNS / 代理，别反复重试 git**：内网 DNS（`10.56.16.16`）会把 `github.com`
+钉到半死不活的地址（TCP 连得上、TLS 握得手、HTTP 不回话），且是**间歇性**的。先现验本机配置，别信文档：
+`git config --global --get-regexp '^http\.'`（261110 本机实测只有 `http.https://git.erix.vip/.proxy`，
+**github.com 那条根本没配**，所以直连 `direct=000` 超时、显式代理 1.1s 通）。不通时显式带：
+`git -c http.proxy=http://172.20.0.35:19001 -c https.proxy=http://172.20.0.35:19001 push origin <ref>`；
+**`gh` 不读 git 配置**，得自己带 `HTTPS_PROXY=… gh …`。**别在全局 env 设 `HTTP(S)_PROXY`**——把本来就通
+的链代理掉是负收益（曾因此把 `api.ai.erix.vip` 的中转请求代理到卡死）。容器内的 `127.0.0.1` 不是宿主，
+也不继承本机代理。别改 `/etc/hosts`（无 sudo）。最新口径见 `~/projects/AGENTS.md`。
 
 ### 4.1 dev 栈测试账号（仅本地 dev 环境，勿用于生产）
 
@@ -114,19 +137,25 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - **CI / 发布（issue #235）**：`.github/workflows/ci.yml` = PR/main 质量门禁 + main 上按路径过滤的三镜像构建校验（只 `ubuntu-latest`，**禁止 matrix**）；`.github/workflows/release.yml` = tag `v*` → GHCR 三镜像（镜像名全小写、`--provenance=false --sbom=false`）+ `images-digest.json` digest 清单。口径、分钟预算语义（超额**是停跑不是扣费、且没有红灯**）、发布→部署的 digest pin（`deploy/.env` 两形态门 + 换 FDE 镜像必须重建容器）、e2e 为何不进 CI，一律见 [`docs/ops/ci-release.md`](docs/ops/ci-release.md)。
 - **一单一账写 `docs/maintenance/task-ledger.md`**（编号续用 `8.N`，全局唯一、不重排），
   **别写进本页**：本页随每次 agent run 全额注入，261110 实测 675 KB 里 92.5% 就是这么长出来的
-- **发布前置**：`package.json` 的 `version` 必须等于去掉 `v` 的 tag（`runner/package.json` 建议一并对齐），否则 `release.yml` 直接失败——现状 tag `v0.1.1` vs `package.json` `0.1.0` 就会被拦（ci-release.md §7）。
+- **发布前置**：`package.json` 的 `version` 必须等于去掉 `v` 的 tag（`runner/package.json` 建议一并对齐），
+  否则 `release.yml` 直接失败。**这条现在是否成立要现验**（`git tag --sort=-creatordate | head -1` 与
+  `node -p "require('./package.json').version"`），别抄本文里写过的数（261110 实测两边都是 `0.1.66`，
+  而本页曾长期写着「tag v0.1.1 vs package.json 0.1.0，会被拦」）。细则见 `docs/ops/ci-release.md` §7。
 
-### 6.1 代码 PR 评审要求（2026-09-23 起简化：取消双模型评审门禁，省 premium 额度）
+### 6.1 代码 PR 评审要求
 
 **代码 PR 合并前主 agent 必须亲自完成**（文档 PR 不强制；不再要求外部模型评审）：
 
 1. **亲审 diff**：逐文件读改动，不照单全收 worker/评审员结论，属实才修，不属实记录裁决理由。
 2. **亲自复跑全部验证**：单测全绿 + 相关 e2e 全绿 + 关键探针亲手复现（别人跑过不算）。
-3. **每条修复带验证**；修复引入的回归用 e2e 抓（PR #20 实例：F4 修复曾劫持崩溃恢复路径）。
+3. **每条修复带验证**；修复引入的回归用 e2e 抓（评审史与实例见 `docs/maintenance/task-ledger.md`）。
 4. **合并后收尾**：merge-commit + 删分支。
-5. **stacked PR 的 base 分支不要先删**（2026-10-05 实证）：上层 PR 的 base 指向下层分支时，下层 PR 合并**并删分支**会让 GitHub **直接关闭**上层 PR（不是自动 retarget），且 base 分支已删后 `reopen` 报错、`--base` 也改不动 → 只能同分支重开新 PR（实例：#144 被关，#145 重开）。做法二选一：① 下层合并后**先别删分支**，把上层 PR 的 base 改成 main 再删；② 上层 PR 一开始就 `--base main`（diff 里会含下层提交，下层合并后自动收敛）。
+5. **stacked PR 的 base 分支不要先删**：下层 PR 合并**并删分支**会让 GitHub **直接关闭**上层 PR
+   （不是自动 retarget），且 base 已删后 `reopen` 报错、`--base` 也改不动。二选一：① 下层合并后
+   **先别删分支**，把上层 base 改成 main 再删；② 上层一开始就 `--base main`（diff 含下层提交，
+   下层合并后自动收敛）。
 
-历史参考：双模型评审在 PR #16–#20 曾抓出 ~25 个实质问题（认证绕过、跨 FDE 删除、forward-auth 放行、事件重试风暴等），做法存档于 git 历史/issue #13；需要第二意见时按需调 copilot_cli 复核（用法一律按全局 `~/projects/AGENTS.md` §2.7，本项目无特殊定义）。
+需要第二意见时按需调 copilot_cli 复核（用法按全局 `~/projects/AGENTS.md`，本项目无特殊定义）。
 
 ## 7. 已定架构决策（详见 docs/design/fde-platform.md 附录 A）
 
@@ -134,29 +163,23 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - D4 不 publish FDE 端口；D5 端口由平台分配（DB 为真相）；D6 LLM 走唯一出口网关（「改不了 endpoint」依赖安全团队网络层出口策略，非平台交付物——issue #3）
 - D7 事件落 DB、portal 供 SSE；D8 隔离单元 = worktree（**已修订**，见下方 D8 修订段）；D9 目录 git 状态 = 一颗红/黄/绿灯（见下方 D9 段，issue #359）
 
-### 7.1 D8 修订（2026-09-24，决策者拍板）：cwd 直达项目目录，拆除 worktree
+### 7.1 D8 修订：cwd 直达项目目录，拆除 worktree
 
 D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录（cwd）**」：
 
-- **理由**：FDE 是开发者本人的工位容器（非服务端牲口场），交付物应天然持久于 `~/projects/<project>`；
-  worktree 的临时性（run 终态即焚）与神秘容器路径一直在泄漏复杂度给用户和模型（真机反复实证：
-  俄罗斯方块手动抢救、hello.sh 报 worktree 路径）。隔离收益实际拿不到：agentd `capacity=1`
-  串行执行 + 每 session 单活跃 run，并行碰撞在当前形态不存在。
-- **新语义**：worker cwd = `~/projects/<project>`（jail 可写边界不变，就是这个目录）；
-  `prepareWorktree`/`cleanupWorktree` 拆除；产物捕获（f402a11）目标改项目目录；
-  run 数据目录归档（P1）不变；非 git 项目不再需要 mkdir 兜底。
-- **代价与边界**：agent 弄脏项目由用户 git 自治（工位语义本就如此）；将来真要并行同项目，
-  再按项目粒度加执行锁，不预支 worktree 复杂度。
-- **实施**：见 #81 P2.5；参照系 pi（agent 直接在项目目录工作）。
+- **新语义**：worker cwd = `~/projects/<project>`（jail 可写边界不变）；`prepareWorktree` /
+  `cleanupWorktree` 已拆除，产物捕获目标改项目目录，非 git 项目不再需要 mkdir 兜底。
+- **边界**：agent 弄脏项目由用户 git 自治（工位语义本就如此）；真要并行跑同一项目，再按项目粒度加
+  执行锁，**不预支 worktree 复杂度**。
+- 决策理由与实证过程见 `docs/design/fde-platform.md` 附录 A。
 
-### 7.2 D9（2026-10-24，决策者拍板，issue #359）：目录 git 状态只以「红/黄/绿」一颗灯呈现
+### 7.2 D9（issue #359）：目录 git 状态只以「红/黄/绿」一颗灯呈现
 
 - **语义**：灯 = **收工进度**，一句话给用户的判据是「**每天忙完之后要保证它是绿的**」。
   🔴 未落地（未提交 / 未跟踪 / 0 提交但有内容）→ 🟡 未推送（有提交未推 / 无远端 / 从未 fetch）
   → 🟢 已收工；⚪ 读不到或未查完——**⚪ 不得渲染成绿**（绿是承诺，没扫完就没资格承诺）。
-- **理由**：git 细节对专业人士是噪音（他自己会问 AI），对非专业人士是噪音加噪音。界面只承载
-  「这个目录的工作有没有被 git 兜住」这一件事。**未跟踪与未提交同罪**（都是零兜底），故同归于红；
-  红是进度不是警报（agent 一改就红，直到收工），所以措辞用状态词、不给 `⚠` 与告警底色。
+- **渲染规则**：**未跟踪与未提交同罪**（都是零兜底）⇒ 同归于红；红是**进度不是警报**（agent 一改就
+  红，直到收工）⇒ 措辞用状态词、不给 `⚠` 与告警底色。
 - **边界**：portal **零 git 写操作**（不 init / 不 commit / 不 push / 不 checkout / 不代 clone，
   与 D-「平台不 clone」同口径），写一律走 run = 界面上的「让 AI 收尾」（只**预填**输入框不自动发：
   发 run 占 capacity 且花 token）。搞不清就「问 AI」——**每个态都留这条兜底**，这是闭环的最后一环。
@@ -166,10 +189,8 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
   ⚠ **不得用 `-uno`**（实测它让 0 提交的根仓库对三个脏子仓库报空输出、rc=0，自认干净 ⇒ 直接撒谎）。
   成本上界靠 `.gitignore` 剪枝 + stdout 流式数到 50 即 kill + 2s 超时（超时落 ⚪）。
 - **不做什么**：分支列表/分支数、detached、worktree/子模块结构、最后提交时刻、↑N/↓N、diff 内容、
-  inotify 事件源——全不做（理由与实测记录在 issue #359 正文与附录）。
-- **告知面先行**：D9 的**产品闭环**要求容器里的 agent 真会「收工即提交」，而它看不见灯 ⇒
-  要求必须先写进它读的 `~/AGENTS.md`（已交付，见 §8.53），灯（P0a/P0b）后上。顺序反了就是
-  「灯长期红/黄、而没人负责让它变绿」。
+  inotify 事件源——全不做（决策理由、交付过程与实测记录在 `docs/design/fde-platform.md` 附录 A.2
+  与 issue #359；**注意附录 A 的 `D9` 是「认证放边缘」，与本页这条 `D9` 编号撞车，引用要带 issue 号**）。
 
 ## 8. erix-agent 依赖与升级
 

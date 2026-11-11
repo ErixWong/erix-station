@@ -836,3 +836,31 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 | D8 | 隔离单元 = **worktree**（`agent/<runId>` 分支） | 同仓库并发多 agent 不冲突；回流走 fork/PR |
 | D9 | **认证放边缘**，dev server 与 agent 不感知认证 | 安全设施对 agent 工具链透明；应用零改造 |
 | D10 | 仓库名 `erix-station`，展示名 **FDE Station** | 标识短（天天打）、展示名说清语义 |
+
+### A.1 修订记录
+
+| # | 修订 | 时间 / 决策者 | 理由与实证 |
+|---|---|---|---|
+| D8 | 隔离单元由 **worktree**（`agent/<runId>` 分支）改为 **项目目录（cwd）**，实施 #81 P2.5 | 2026-09-24 | FDE 是开发者本人的工位容器（非服务端牲口场），交付物应天然持久于 `~/projects/<project>`；worktree 的临时性（run 终态即焚）与神秘容器路径一直在泄漏复杂度给用户和模型（真机反复实证：俄罗斯方块手动抢救、`hello.sh` 报 worktree 路径）。隔离收益实际拿不到：`agentd` `capacity=1` 串行执行 + 每 session 单活跃 run，并行碰撞在当前形态不存在。落地：`prepareWorktree` / `cleanupWorktree` 拆除、产物捕获（`f402a11`）目标改项目目录、`run` 数据目录归档（P1）不变、非 git 项目不再需要 mkdir 兜底；参照系 pi（agent 直接在项目目录工作）。代价与边界：agent 弄脏项目由用户 git 自治（工位语义本就如此）；将来真要并行跑同一项目，再按项目粒度加执行锁，**不预支** worktree 复杂度 |
+
+### A.2 补充决策：#359「收工灯」（`AGENTS.md` 里被叫作 `D9`）
+
+- **理由**：界面只承载「这个目录的工作有没有被 git 兜住」这一件事——git 细节对专业人士是噪音
+  （他自己会问 AI），对非专业人士是噪音加噪音。**未跟踪与未提交同罪**（都是零兜底），故同归于红；
+  红是**进度不是警报**（agent 一改就红，直到收工），所以措辞用状态词、不给 `⚠` 与告警底色。
+- **告知面先行**：产品闭环要求容器里的 agent 真会「收工即提交」，而它看不见灯 ⇒ 要求必须先写进它读的
+  `~/AGENTS.md`（已交付，见 `AGENTS.md` §8.53），灯（P0a/P0b）后上。顺序反了就是「灯长期红/黄、
+  而没人负责让它变绿」。
+- **实现坐标**（261110 现验，`git ls-files`）：判定与聚合 `portal/src/gitlight.js`（判据测试
+  `portal/test/gitlight.test.js`）；前端 `portal/frontend/src/lib/gitLight.ts`、
+  `composables/useGitLight.ts`、`components/GitLightBadge.vue`（各带同名 `.spec.ts`）；
+  API `GET /api/git-light?cwd=`（`docs/api/portal.md`）。
+- **不做什么**（防范围蔓延）：分支列表/分支数、detached、worktree/子模块结构、最后提交时刻、↑N/↓N、
+  diff 内容、inotify 事件源——全不做（实测记录在 issue #359 正文与附录）。
+
+### A.3 编号说明：本表的 `D9` 与 `AGENTS.md` 的 `D9` 不是同一件事
+
+本表 `D8` = worktree（修订见 A.1）、`D9` = **认证放边缘**；而 `AGENTS.md` §7 与 portal 代码里的 `D9`
+是 A.2 那条（2026-10-24 拍板，issue #359）。两边编号各自已被引用（261110 实测：全仓 `*.md` 里 `D8`
+30 处、`D9` 24 处，含 `docs/api/portal.md` 与在飞的 `docs/design/event-platform/*.md`），
+**没有做重排**。引用 `D9` 时必须同时给出 issue 号（#359）或本表决策名，否则坐标不唯一。
