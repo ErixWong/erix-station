@@ -1,0 +1,8 @@
+{
+  "hotBytesBudget": 19456,
+  "refFloor": 596,
+  "measuredHotBytes": 18371,
+  "measuredTotalBytes": 19994,
+  "measuredRefs": 596,
+  "note": "派生量：只有 `npm run check:agents-hotlayer -- --sync` 能写；手改视为伪造读数"
+}
