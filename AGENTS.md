@@ -173,16 +173,11 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 
 ## 8. erix-agent 依赖与升级
 
-- **pin 以 `package.json` 的 `erix-agent` 字段现读为准，本页不写死版本号**：这个数曾在标题里三次
-  写歪（长期停在 0.20.0；停在 0.29.0 而 `package.json` 已是 0.31.0）⇒ 261110 起数字从标题里拿掉。
-- 沿革（原先挤在 §8 标题里，261110 搬下来）：2026-11-02 由 `feat-261102-01-erix-agent-0.29.0` 从
-  0.26.0 升上（0.27.0 从未发布）；§8.65 那次修过一次标题漂移；逐版迁移记录见下方 `### 8.N` 台账
-  （**新账一律写 `docs/maintenance/task-ledger.md`**，见 §6）
-
+- **pin 以 `package.json` 的 `erix-agent` 字段现读为准，本页不写死版本号**
 - **源仓库**：`~/projects/erix-llm-kit`（npm 包名 `erix-agent`）。升级依据以该仓库 `docs/host-consumer-contract.md`、对应版本 host-upgrade-guide 和实际源码为准。
 - runner 与 portal（根 package.json，运行时依赖）**两处 pin 同步**：自 P3 前置起 portal 也 pin（写侧预写改走引擎 `appendUserTurn`，见 §8.4；0.16.0 见 §8.5；0.17.0 见 §8.6；0.18.0 见 §8.8）。升级仍走分支 + PR + §6.1 评审。
 
-### 0.14.0 宿主契约快照（**已过时**：现契约以 `erix-llm-kit` 的 `docs/host-consumer-contract.md` 为准）
+### 0.14.0 宿主契约快照
 
 - `TranscriptStore` **必需仅** `appendRound` + `load`；`saveRunSnapshot` / `loadLatestRunSnapshot`（latest-only crash snapshot）及 `saveRunState` / `loadRunState` / `markRunState` 为可选能力。快照方法已由 `saveCheckpoint` / `loadLatestCheckpoint` 更名；不要再把旧名暴露给引擎。station 仍把内部 HTTP 路径 `/checkpoint` 保留作传输实现细节。
 - `saveRunState` 保存 deterministic/semantic run-state 数据，不写顶层 `state`；`markRunState` 写独立状态通道。宿主读 `loadRunStateStatus` 不属于引擎能力校验；上游实际 store 契约返回状态字符串，portal 响应记录由 adapter 读取 `status?.status`。旧 JSONB 快照里的 `state` 仍可回退读取，不需要数据回填。
