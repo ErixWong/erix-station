@@ -996,7 +996,6 @@ export const zhCN = {
     mailOtpAltHint: '该账号已启用 TOTP。打开后，登录时可用 TOTP 或邮箱验证码任一通过；邮件码路径会在审计里记为 email_code_alt。',
     mailOtpCurrentEmail: '验证码将发到：{email}',
     mailOtpNeedsEmail: '该用户还没有邮箱 —— 请先在「基本资料」里填写，否则无法启用。',
-    mailOtpSaved: '邮件验证码设置已保存。',
     // 工单 feat-261110-03：「二次验证」改成两个勾选框 + 勾上才展开。
     // 这一句是**两个都没勾**时的红字。口径不是「两个 checkbox 都没勾」而是「这个账号现在拿不出
     // 第二因素」：`chooseSecondFactor` 的 `totpUsable` 还要看「绑没绑密钥」，所以上线迁移 0030 后
@@ -1009,7 +1008,6 @@ export const zhCN = {
     totpNotEnrolled: '未绑定',
     saveMfaSettings: '保存二次验证设置',
     mfaSettingsSaved: '二次验证设置已保存。',
-    saveMailOtp: '保存邮件验证码设置',
     // 2026-11-09（#472 片 A）：per-user「文件上传」开关（迁移 0029 / docs/api/portal.md）。
     // 开关只决定「能不能传」，服务端 403 才是闸；界面把三态说清（开启 / 关闭 / 未知）。
     fileUploadSection: '文件上传',
