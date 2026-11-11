@@ -314,8 +314,6 @@ function clearSectionFeedback() {
   passwordMessage.value = '';
   totpError.value = '';
   totpMessage.value = '';
-  mailOtpError.value = '';
-  mailOtpMessage.value = '';
   mfaError.value = '';
   mfaMessage.value = '';
   fileUploadError.value = '';
@@ -440,11 +438,6 @@ async function submitPasswordReset() {
   }
 }
 
-// 2026-11-06：per-user「邮件验证码」开关（迁移 0028）。与 TOTP 那块对称：单独保存、单独反馈。
-const mailOtpBusy = ref(false);
-const mailOtpError = ref('');
-const mailOtpMessage = ref('');
-
 // 工单 feat-261110-03：「二次验证」那一档的两个勾选位（`totp_login_enabled` / `mail_otp_enabled`）
 // 的**共用**保存动作。为什么不是一个勾选框一个按钮：勾选框住在折叠块**外面**（否则「取消勾选」
 // 会把保存按钮一起收起 ⇒ 关掉这件事永远好不了），所以需要一个永远可见的出口。
@@ -490,7 +483,7 @@ const mfaHasSecondFactor = computed(() =>
 
 async function saveMfaSettings() {
   const target = editUser.value;
-  if (!target || mfaBusy.value || mailOtpBusy.value) return;
+  if (!target || mfaBusy.value) return;
   const changes = mfaChanges.value;
   // 没改动 ⇒ 不发请求（也是第二道闸：按钮已禁用，但「把一模一样的值再提交一次」本身就是错的动作）。
   if (Object.keys(changes).length === 0) return;
@@ -507,7 +500,7 @@ async function saveMfaSettings() {
       mfaError.value = error;
       return;
     }
-    // 同 saveMailOtp：`editUser` 是 computed ⇒ 服务端回读后界面自动更新，这里再把本地勾选框对齐一次，
+    // `editUser` 是 computed ⇒ 服务端回读后界面自动更新，这里再把本地勾选框对齐一次，
     // 避免「界面开了但服务端没改」的错觉。
     const fresh = admin.users.find((user) => user.id === target.id);
     if (fresh) {
@@ -517,30 +510,6 @@ async function saveMfaSettings() {
     mfaMessage.value = t('admin.fde.mfaSettingsSaved');
   } finally {
     mfaBusy.value = false;
-  }
-}
-
-async function saveMailOtp() {
-  const target = editUser.value;
-  if (!target) return;
-  mailOtpError.value = '';
-  mailOtpMessage.value = '';
-  mailOtpBusy.value = true;
-  try {
-    const error = await admin.updateUser(target.id, {
-      mail_otp_enabled: editForm.mail_otp_enabled,
-    });
-    if (error) {
-      mailOtpError.value = error;
-      return;
-    }
-    // `editUser` 是 computed（跟着 admin.users 走）⇒ 服务端回读后界面自动更新；
-    // 这里再把本地 checkbox 对齐一次，避免「界面开了但服务端没改」的错觉。
-    const fresh = admin.users.find((u) => u.id === target.id);
-    if (fresh) editForm.mail_otp_enabled = fresh.mail_otp_enabled === true;
-    mailOtpMessage.value = t('admin.fde.mailOtpSaved');
-  } finally {
-    mailOtpBusy.value = false;
   }
 }
 
@@ -563,7 +532,7 @@ async function saveFileUpload() {
       fileUploadError.value = error;
       return;
     }
-    // 与 saveMailOtp 同理：`editUser` 是 computed（跟着 admin.users 走）⇒ 服务端回读后界面自动更新，
+    // 与 saveMfaSettings 同理：`editUser` 是 computed（跟着 admin.users 走）⇒ 服务端回读后界面自动更新，
     // 这里再对齐一次本地勾选框，避免「界面开了但服务端没改」的错觉（回读缺键 ⇒ 退回未知态）。
     const fresh = admin.users.find((u) => u.id === target.id);
     editForm.file_upload_enabled = typeof fresh?.file_upload_enabled === 'boolean' ? fresh.file_upload_enabled : null;
@@ -1389,7 +1358,7 @@ onBeforeUnmount(() => {
               v-model="editForm.mail_otp_enabled"
               type="checkbox"
               data-test="mail-otp-enabled"
-              :disabled="mailOtpBusy || mfaBusy"
+              :disabled="mfaBusy"
               class="mt-0.5 rounded border-black/20"
             >
             {{ t('admin.fde.mailOtpCheckboxLabel') }}
@@ -1401,7 +1370,7 @@ onBeforeUnmount(() => {
             <button
               type="button"
               data-test="save-mfa-settings"
-              :disabled="mfaBusy || mailOtpBusy || !mfaHasChanges || mfaMailNeedsEmail"
+              :disabled="mfaBusy || !mfaHasChanges || mfaMailNeedsEmail"
               class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
               @click="saveMfaSettings"
             >{{ t('admin.fde.saveMfaSettings') }}</button>
@@ -1463,17 +1432,10 @@ onBeforeUnmount(() => {
             {{ t('admin.fde.mailOtpCurrentEmail', { email: editUser.email }) }}
           </p>
           <p v-else class="mt-2 text-xs text-amber-700">{{ t('admin.fde.mailOtpNeedsEmail') }}</p>
-          <p v-if="mailOtpError" class="syserr mt-2" role="alert">{{ mailOtpError }}</p>
-          <p v-if="mailOtpMessage" class="mt-2 text-sm text-green-700" role="status">{{ mailOtpMessage }}</p>
-          <div class="mt-3 flex justify-end">
-            <button
-              type="button"
-              data-test="save-mail-otp"
-              :disabled="mailOtpBusy || (editForm.mail_otp_enabled && !editUser.email)"
-              class="rounded-md border border-black/20 px-3 py-1.5 text-sm hover:bg-black/5 disabled:opacity-50"
-              @click="saveMailOtp"
-            >{{ t('admin.fde.saveMailOtp') }}</button>
-          </div>
+          <!-- feat-261111-01：这一块里原来的「保存邮件码设置」按钮（`save-mail-otp` + `saveMailOtp()`）已删：
+               它的载荷 `{mail_otp_enabled}` 严格是上面 `save-mfa-settings` 那一份 diff 的子集，「没邮箱不许开」
+               它也已有 `:disabled` 一份平行实现 ⇒ 留着只是第二个入口，不携带任何独有能力。保存的唯一出口是
+               勾选框行上那个永远可见的 `save-mfa-settings`，块内的保存后反馈也随之退场。 -->
         </section>
 
       </section>
