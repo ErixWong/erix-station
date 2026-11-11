@@ -598,7 +598,18 @@ worker 侧的 `TranscriptStore` 实现 = **IPC client**（`store_request` → ag
 > **`load()` 的折叠语义（issue #351）**：上游 0.23.0「一条消息一落盘」之后，**读侧折叠属于 store**（`host-consumer-contract.md:2405-2409`：`foldMessageRows` 由 file/memory 两个内置 store 的 `load()` 调用；:2442：宿主读账本必须经 `load()`）。引擎 `resume-manager` 只调 `foldLedgerMessages`（把 `partOf` 分片接回原消息），**不做载体折叠**，且它的 `seq` 播种（`resume-manager.js:239-241`）面向的就是「折叠过的输出」。本站 adapter 过去直通原始行⇒ `:input:` 行可以插在 `tool_use` 与它迟到的 `tool_result` 之间（真标本 `index 56`）、链式 `partOf` 把聚合结果劈成两条（`index 81`）⇒ 会话**永久** `invalid_messages`。⇒ 折叠接在 `runner/lib/store.js#load`，**且必须接在全量拉齐之后**（agentd 已聚合游标翻页）：接在 portal 分页端点的页内会在「一轮跨两页」时漏折（#338 同根）。口径与展示面那份同源，两边 `SHARED-FOLD-CORE` 区间由 `runner/test/store-load-fold.test.js` 逐字节钉住。
 > **run-state 双通道**：`saveRunState` 只存快照数据；`markRunState` 写独立状态记录，不触碰宿主 `runs.status`（唯一权威仍由 U2 终态收敛，不变式 3）。旧 `state` 不回填，status reader 缺新记录时兼容读取。
 > **recall（0.8.0 退役）**：引擎不再调用 `store.recall`，worker 也不再注册 recall 工具（档案取回归 note 工作流：note_list → note_read）；U7 端点与 adapter 方法保留（既有断言面与只读兼容，非孤儿）。
-> **notes 落盘位置（issue #46，0.10.0 起）**：NotesStore 不再落 run 工作区（D8 修订前为 run worktree），迁 **run 数据目录** `<home>/runs/<runId>/notes/`（logical-run 作用域，跨 attempt 保留——resume 不丢 notes；agentd RUN_START 下行 `notes_dir`，终态后由 agentd 清理，attempt 间绝不删）。详见 AGENTS.md §8.2。
+> **notes 落盘位置（issue #46 → **#392 B 片**）**：NotesStore 不再落 run 工作区（D8 修订前为 run worktree）。
+> **0.10.0 起**迁 run 数据目录 `<home>/runs/<runId>/notes/`（logical-run 作用域，跨 attempt 保留）；
+> **#392 B 片起作用域再抬一层到会话**：`<home>/sessions/<safeSessionScope(sessionId)>/notes`
+> （`runner/lib/run-data.js:75`），同一会话的**每个** run 看到同一个 notes 目录 + 同一个 `scopeRef`
+> ⇒ 跨 run 可见（旧语义下「一条用户消息就是一个 run」⇒ 笔记天然无效）。
+> 目录由 agentd 在 RUN_START 前用 `prepareSessionNotesDir` 预建（agentd 跑 1001 / worker 跑 1002，
+> 1001 建的 755 目录 worker 写不进），经 `notes_dir` 下行；**终态不清理**（清理它就把跨 run 语义杀了），
+> 也**不在** `runs/` 24h 与 `runs-archive/` 168h 两条 sweep 的覆盖里 —— 回收归**会话生命周期**
+> （portal 删会话时连带删目录），不要接在 run sweep 上。
+> `sessionId` 落盘前过白名单（`[A-Za-z0-9._-]{1,128}` 且无 `..`），否则退化为 `sess-h-<sha256 前24>`。
+> 降级：无 `session_id` 或预建失败 ⇒ 退回 `<home>/runs/<runId>/notes`（run 作用域，旧语义）+ warn。
+> 详见台账 §8.2（0.10.0 迁移）与 #392 B 片。
 
 > `saveCheckpoint` / `loadLatestCheckpoint` 是 0.13.0 前的旧名；Station adapter 只向 0.14.0 引擎暴露 `saveRunSnapshot` / `loadLatestRunSnapshot`，内部 `/checkpoint` HTTP 路径沿用作协议细节。
 
