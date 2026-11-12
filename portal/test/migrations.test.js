@@ -935,4 +935,20 @@ test('迁移 0031-user-last-activity-at：可空无默认列幂等、回填只�
   // 口径必须落到文档（不是只写在 SQL 的注释里）
   const modelDoc = fs.readFileSync(path.join(HERE, '../../docs/data/model.md'), 'utf8');
   assert.ok(modelDoc.includes('last_activity_at'), 'docs/data/model.md §1.1 必须写这一列的口径');
+  // 消费点必须与列同名：拼错列名在单测里会静默地「永远 null」（= 每个人都被显示成「从未活动」），
+  // 真库里则是一条 42703 把整条发送路炸掉。三个读写方逐个钉（M2 的后端面；前端 store 在 M3 的 spec 里钉）。
+  for (const [file, label] of [
+    ['../src/sessions.js', '写入点①：唯一发送路'],
+    ['../src/queued-inputs.js', '写入点②：运行中入队'],
+    ['../src/admin.js', '读侧：user DTO（safeUser / listUsers / 两条 CTE）'],
+  ]) {
+    const codeSrc = fs.readFileSync(path.join(HERE, file), 'utf8');
+    assert.ok(codeSrc.includes('last_activity_at'), `${label}（${file}）必须读写这一列`);
+  }
+  // 写入点的字面形状也要在这里钉一道：迁移与写入点是同一份契约的两半（不节流、不带值、无 RETURNING）
+  for (const file of ['../src/sessions.js', '../src/queued-inputs.js']) {
+    const codeSrc = fs.readFileSync(path.join(HERE, file), 'utf8');
+    assert.match(codeSrc, /UPDATE users SET last_activity_at = now\(\) WHERE id = \$1/,
+      `${file} 必须用「now() + 只按 id」这一句（节流或带值 = 偷偷换口径）`);
+  }
 });
