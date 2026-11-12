@@ -11,6 +11,7 @@ import {
   enqueueQueuedInput, recallQueuedInputs, drainQueuedInputs, drainAfterRunTerminal,
   validateQueuedKind, toSnapshot, MAX_QUEUED_INPUTS_PER_SESSION,
 } from '../src/queued-inputs.js';
+import { createUserActivityWorld } from './fake-user-activity.js';
 
 // ---------------------------------------------------------------------------
 // 内存世界
@@ -31,8 +32,11 @@ function world(overrides = {}) {
     steers: [],          // steer_request 推送
     runEnqueues: [],     // notifyRunEnqueued
     now: 0,
+    // issue #497：入队那一刻的用户活动位（写入点之二）。`activity.writes` 是「写了几次 / 写给了谁」的判据面。
+    users: [{ id: 'u1', last_activity_at: new Date(0) }],
     ...overrides,
   };
+  w.activity = createUserActivityWorld({ users: w.users });
   let seq = 0;
   const pool = {
     async connect() {
@@ -123,6 +127,11 @@ function world(overrides = {}) {
       const row = w.queued.find((q) => q.id === params[0]);
       if (row) row.status = 'discarded';
       return { rows: [] };
+    }
+    // --- issue #497：用户活动位（入队即活动；同事务，见 queued-inputs.js 的注释）---
+    {
+      const hit = w.activity.query(sql, params);
+      if (hit) return hit;
     }
     if (/SET status = 'delivered'/.test(sql)) {
       const row = w.queued.find((q) => q.id === params[0] && q.status === 'delivering');
