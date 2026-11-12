@@ -4705,3 +4705,87 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 **剩下的 19 条 open 分桶**：真待做 #387 / #259 / #231 / #243 / #485 / #270 / #227（第 4 项）·
 等拍 #348 / #346 / #331 / **#494** · 上游与别台 #341 / #367 / #426 · 挂账 #303 · 外部 #135 ·
 新拆 #493 / #495 / #496。**「open 数」不是进度**：本批 20→19 只动了 1 格，但五张半开的单被拆清了。
+
+### 8.120 用户「最后活动」列：一个语义缺口、两处写入点、八次变异（issue #497 / 工单 feat-261112-01，2026-11-12，worker 四个里程碑 + 主 agent 复验）
+
+> **挑号**：落笔前现查 `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3` ⇒ 最大号 **8.119**，本条取 **8.120**。
+> 结论性口径**不在本节**：字段语义在 `docs/data/model.md` §1.1，API 面在 `docs/api/portal.md` §12，
+> 迁移自证在 `deploy/migrations/0031-user-last-activity-at.sql` 的文件头注释。本节只留过程与读数。
+
+**治的是什么**：管理台此前只有 `last_login_at`（= `login_sessions` 里最新的 `created_at`，语义是「最近一次把门推开」）。
+它答不出管理员真正想问的那句「**这个人还在用吗**」——页面刷新/重开会写它、自动续期会写它、一句话没说的人可以天天「登录」。
+所以「活跃度」这一维此前是**缺的**，不是不准。人已拍板口径 **A3**：`users.last_activity_at` = 该用户
+**按下发送那一刻**；刻意**不加第三处**写入点。**四个里程碑 · 六个提交**（分支 `feat-261112-01-user-last-activity-at`，写本节时未 push）：
+`b7bc2c8` 迁移 0031 · `eab7216` model.md §1.1 · `70a8ab7` 后端两处写入点 + 15 条测试 ·
+`05beaf8` 管理台那一格 + DOM/源码断言 · `e8e7326` 删孤儿键 `admin.fde.lastLogin` ·
+**本节所在的那一枚文档提交**（含 §12 与 §1.1）——它的哈希写不进它自己，现读 `git log -1 --oneline`；
+该提交在本地 `--amend` 过几轮（补变异读数计数、拿掉写不进自己的那个哈希——不写死计数，这类自指每改一次就漂一次），**全程未 push**，所以 amend 不伤人。
+
+**写入点全仓两处（现读坐标，M4 复核一字未动）**：`portal/src/sessions.js:597`（`postMessage`，本站唯一发送路）
+与 `portal/src/queued-inputs.js:156`（`enqueueQueuedInput`）。两处都是同一句
+`UPDATE users SET last_activity_at = now() WHERE id = $1`，都**在既有事务里用既有 `client`**（红线：消息回滚了活动位不许前进），
+都**不节流**（人已拍板「一次输入写一次」）。管理台那一格：`AdminUsersView.vue` 第 8 格两行
+（主行 `data-test="user-activity-main"` = 活动，副行 `user-login-sub` = `登录于 {time}`），**列数与列宽一字未动**（colgroup 9 / th 9 / 行内 td 9）。
+
+**四个「看着该写、其实不许写」**（M2 变异 B 逐条钉死，见下表）：run 生命周期与终态、会话改名、归档、**登录本身**。
+最后一条是这一列的立身之本：它**允许比 `last_login_at` 旧**——M4 现验 dev 库 9 个用户里**真有 2 个是这个形状**
+（`last_activity_at < MAX(login_sessions.created_at)`）。读侧与界面都不许把这种「倒挂」当脏数据去「修正」。
+
+**四个陷阱（全是实测，不是设想）**
+
+1. **「一次输入恰好写一次」不显然**：`enqueueQueuedInput` 的直发分岔（`!activeRunId`，`queued-inputs.js:111`）
+   **先 COMMIT 再转 `postMessage`**，所以它**不写**第 156 行那一处——两条分岔合起来恰好一次。
+   断言必须按「**恰好一次**」写（`W-5`），只写「写过」就永远抓不到双写。
+2. **源码级断言要先剥整行注释**：M2 变异 A 第一次跑**假绿**——把写入语句 `//` 掉之后，未剥注释的实现文本仍匹配得上。
+   补上「剥掉整行 `//` 注释再匹配」才红。同理 M3 那条「那一格无硬编码中文」也要先剥 `<!-- -->` / `/* */` / 整行 `//`，
+   否则中文注释会被当成硬编码文案。
+3. **`node --test` 会收 `portal/test/` 下所有 `.js`**：共享桩文件（`portal/test/fake-user-activity.js`）里一旦写 `test(...)`
+   就会被每个 importer 重复执行（同一批用例跑好几遍，读数全歪）。helper **只导出函数**，用例住在 `*.test.js` 里。
+4. **删 i18n 键会顺手带走相邻的活键**（M4 本单实际踩的）：删 `admin.fde.lastLogin` 时把下一行 `neverLoggedIn`
+   一起删了 ⇒ 前端 `npm test` rc=1（1 红）+ `npm run typecheck` rc=2（`TS2339: Property 'neverLoggedIn' does not exist` ×3）。
+   两道门禁各抓一次，没有靠人眼。相邻两键一起删是这类清理的默认风险。
+
+**真库核对（dev `station-db` / DB `station`，表在 `public` 而非同名 schema；M4 现验）**
+
+- `information_schema.columns`：`nullable=YES` / `timestamp with time zone` / `default=(none)` ⇒ 可空与无默认值都是**现况**不是愿望。
+- `pg_indexes`（`users`）只有 `users_pkey` + 4 枚 unique key ⇒ 本列**确实没有索引**（契约是「只作返回列」）。
+- `schema_migrations`：`0031-user-last-activity-at` = `sha256:522c8c232228ed3cbc15c48c39e0f5d67c6ef015abc8a68830280842a286601b`，
+  与盘上 `sha256sum deploy/migrations/0031-user-last-activity-at.sql` **逐字相同** ⇒ M3/M4 没偷偷回改已应用的迁移。
+- 计数：`total=9 / 非空=5 / NULL=4`，与 M1 首次回填的读数一致（`NULL` 是真话，不是没跑回填）。
+- 重放：把回填那条 UPDATE 放进 `BEGIN … ROLLBACK` 再跑一遍 ⇒ **`UPDATE 0`**（只动 `IS NULL` 的行，本迁移自己可重放）。
+- 冻结 baseline `docs/data/schema.sql`：`git diff main..HEAD` **为空**（一字节未改；sha256 `461a35ee…de25a` 留作坐标）。
+
+**变异实验（「断言可失败」的唯一证据；共 8 次 = 我的 6 次 + 主 agent 独立 2 次，全部已复原）**
+
+| 片 | 变异 | 读数 |
+|---|---|---|
+| M2-A | 注释掉两处写入点 | rc=1：`W-0b W-5 W-1 W-1b W-1c W-2 W-2b` **7 红**，四个反例 `W-3*` 仍绿 |
+| M2-B | 在改名/归档/登录/run 状态四处**加写** | rc=1：`W-3 W-3b W-3c W-3d W-5` **5 红** |
+| M3-C | 第 8 格退回旧单行 `formatLastLogin(last_login_at)` | rc=1：**3 红 / 71 绿**（2 条 DOM + 1 条源码锚） |
+| M3-D | 只把表头键退回 `lastLogin` | rc=1：**4 红**（表头/列数锚 + 2 条 DOM） |
+| M3-E | 空值渲染成「今天」 | rc=1：**3 红**（分层锚 + 2 条 DOM） |
+| M3-类型 | 从夹具摘掉 `last_activity_at` | typecheck rc=2：`TS2741 … required in type 'AdminUser'` |
+| 主 agent MUT-Y | `v-if="user.last_login_at"` → `v-if="true"` | rc=1：**恰好 3 红 / 71 绿** |
+| 主 agent MUT-Z | 空值分支改成渲染 `new Date()` | rc=1：**恰好 3 红 / 71 绿** |
+
+⚠ **方法学（主 agent 上的一条，我认）**：「红得多」不等于「钉得牢」。MUT-Y 第一次手滑把 `v-if` 换成 HTML 注释
+塞进标签属性区 ⇒ 模板语法坏掉，**36 红雪崩**，那读数什么也不证明。只有「恰好 3 红 / 71 绿」这种**定向**读数才算证据。
+
+**门禁读数（最终树，M4 跑一次）**：仓库根 `npm test` rc=**0**（`tests 2155 / pass 2151 / fail 0 / skipped 4`）·
+`portal/frontend` `timeout 300 npm test` rc=**0**（`Test Files 63 / Tests 1322`）· `timeout 300 npm run typecheck` rc=**0** ·
+改动过的 js 逐个 `node --check` rc=**0**。前端门槛请一律 `env -u NODE_ENV`：这台 shell 的 `NODE_ENV=production` 是脏的
+（不是项目设的），带着它 vitest 会走 production 分支、失败信号变钝（同一现象在 §8.119 也测到过）。
+`npm run build` 本地不必跑：**质量门禁 job** 只有 ① `node --check` ② 根 `npm test` ③ runner `node --test`
+④ 前端 `typecheck + vitest`（`.github/workflows/ci.yml:37`，④ 还显式 `NODE_ENV=development npm ci`），
+生产构建由**镜像构建校验** job 覆盖（`portal/Dockerfile:9 RUN npm run build`）。
+
+**遗留（交棒面）**
+
+- **未 push、未开 PR**：push（带显式代理）、开 PR、真机 e2e（playwright + vision 看管理台那一格）、
+  按 §6.1 亲审全量 diff 后合并，都由主 agent 做。分支 `feat-261112-01-user-last-activity-at`（`main@9f7b3c5` 上 5 个提交）。
+- 孤儿键 `admin.fde.lastLogin` 已在 `e8e7326` **zh/en 成对删**；`AdminUsersView.spec.ts:174` 那条**反向**断言保留
+  （键不存在时它照样成立，而且更严）。`neverLoggedIn` 保留——副行与清退日期两格仍在读它。
+- **「入队即活动」是拍板口径，不是自然律**：若将来改成「投递成功才算」，那是**契约改动**
+  （要动 `queued-inputs.js:156` 与 `W-2` / `W-2b` 两条断言），别顺手改。
+- `admin.js#createUser` 的 RETURNING 里带 `last_activity_at` 是 M2 的**读侧诚实** additions（重激活旧行时界面要显示真实值），
+  比工单原句多做了一点，主 agent 已收下（`git diff main..HEAD` 里可见）。
