@@ -1166,6 +1166,24 @@ describe('AdminView · FDE 用户', () => {
     expect(ghost.find('[data-test="user-login-sub"]').exists()).toBe(false);
     expect(ghost.text()).toBe('从未活动');
 
+    // ④ **hover 全文**（M5 补的回归：真机 e2e 里副行被列宽截断成「登录于 2026/11/12,…」，
+    //    而旧版是 `<td :title=…>` 整格能看全文 ⇒ 两行化之后这个既有能力丢了，本 PR 必须自己补回）。
+    //    判据写成「title == 那一行被截断前的全文」，两行各自成立；时间源也必须各归各的。
+    const spokeMain = spoke.get('[data-test="user-activity-main"]');
+    const spokeSub = spoke.get('[data-test="user-login-sub"]');
+    expect(spokeMain.attributes('title')).toBe(zh('2026-11-11T01:32:38.000Z'));
+    expect(spokeSub.attributes('title')).toBe(`登录于 ${zh('2026-10-03T12:00:00.000Z')}`);
+    expect(spokeMain.attributes('title')).toBe(spokeMain.text());
+    expect(spokeSub.attributes('title')).toBe(spokeSub.text());
+    // 副行那条 title 必须来自**登录**这一侧：不许拿活动时刻去填（两行各说各话，hover 也一样）
+    expect(spokeSub.attributes('title')).not.toContain(zh('2026-11-11T01:32:38.000Z'));
+
+    // 空值那一格 hover 也得说话：主行 title = 「从未活动」，副行仍是完整登录时刻
+    expect(lurker.get('[data-test="user-activity-main"]').attributes('title')).toBe('从未活动');
+    expect(lurker.get('[data-test="user-login-sub"]').attributes('title'))
+      .toBe(`登录于 ${zh('2026-11-11T09:00:00.000Z')}`);
+    expect(ghost.get('[data-test="user-activity-main"]').attributes('title')).toBe('从未活动');
+
     // 红线：任何一格都不许把空值渲染成「今天」/空串（没数据就没资格承诺）
     for (const cell of [spoke, lurker, ghost]) {
       const main = cell.get('[data-test="user-activity-main"]').text();

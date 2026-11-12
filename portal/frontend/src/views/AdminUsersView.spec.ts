@@ -183,6 +183,19 @@ describe('issue #497：第 8 格的两行结构（列数不变、无硬编码中
     expect(subTag, '找不到副行的 span 标签本体').not.toBe('');
     expect(subTag).toMatch(/text-xs/);
     expect(subTag).toMatch(/v-if="user\.last_login_at"/);
+    // M5 回归锚（真机 e2e 抓到的）：**两行都必须带 `:title`**。旧版是整格 `<td :title>`，
+    // 两行化后主行自己带了、副行漏了 ⇒ 被列宽截断的那一行 hover 不出全文，既有能力丢了。
+    // 注意切片的起点：`activityCell` 是从主行的 `data-test` **那一刻**开始切的，`<span` 在切片之前，
+    // 所以主行的标签本体要去整份源码里取（这个 data-test 全文件唯一）。
+    const mainTag = /<span[^>]*data-test="user-activity-main"[^>]*>/.exec(adminUsersViewSource)?.[0] ?? '';
+    expect(mainTag, '找不到主行的 span 标签本体').not.toBe('');
+    expect(mainTag).toMatch(/:title="formatLastActivity\(user\.last_activity_at\)"/);
+    expect(subTag).toMatch(/:title="t\('admin\.fde\.loginAt', \{ time: formatLastLogin\(user\.last_login_at\) \}\)"/);
+    // 副行的 title 与显示文本必须是**同一个模板调用**（两处各写一遍同一句），
+    // 只有一个来源时它们迟早会漂（title 说一个时刻、显示另一个时刻）。
+    const subRest = activityCell.slice(activityCell.indexOf('data-test="user-login-sub"'));
+    expect(subRest.match(/t\('admin\.fde\.loginAt'/g) ?? [], '副行的 title 与文本必须同形两处')
+      .toHaveLength(2);
     // 副行取的是 last_login_at（另一条时间线），主行取的是 last_activity_at —— 两行不许读同一个值
     expect(activityCell).toContain('formatLastLogin(user.last_login_at)');
     expect(activityCell.match(/last_activity_at/g) ?? [], '主行必须读 last_activity_at').not.toHaveLength(0);

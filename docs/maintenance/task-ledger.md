@@ -4706,7 +4706,7 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 等拍 #348 / #346 / #331 / **#494** · 上游与别台 #341 / #367 / #426 · 挂账 #303 · 外部 #135 ·
 新拆 #493 / #495 / #496。**「open 数」不是进度**：本批 20→19 只动了 1 格，但五张半开的单被拆清了。
 
-### 8.120 用户「最后活动」列：一个语义缺口、两处写入点、八次变异（issue #497 / 工单 feat-261112-01，2026-11-12，worker 四个里程碑 + 主 agent 复验）
+### 8.120 用户「最后活动」列：一个语义缺口、两处写入点、十次变异（issue #497 / 工单 feat-261112-01，2026-11-12，worker 五个里程碑 + 主 agent 复验）
 
 > **挑号**：落笔前现查 `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3` ⇒ 最大号 **8.119**，本条取 **8.120**。
 > 结论性口径**不在本节**：字段语义在 `docs/data/model.md` §1.1，API 面在 `docs/api/portal.md` §12，
@@ -4715,11 +4715,12 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 **治的是什么**：管理台此前只有 `last_login_at`（= `login_sessions` 里最新的 `created_at`，语义是「最近一次把门推开」）。
 它答不出管理员真正想问的那句「**这个人还在用吗**」——页面刷新/重开会写它、自动续期会写它、一句话没说的人可以天天「登录」。
 所以「活跃度」这一维此前是**缺的**，不是不准。人已拍板口径 **A3**：`users.last_activity_at` = 该用户
-**按下发送那一刻**；刻意**不加第三处**写入点。**四个里程碑 · 六个提交**（分支 `feat-261112-01-user-last-activity-at`，写本节时未 push）：
+**按下发送那一刻**；刻意**不加第三处**写入点。**五个里程碑 · 七个提交**（分支 `feat-261112-01-user-last-activity-at`，写本节时未 push）：
 `b7bc2c8` 迁移 0031 · `eab7216` model.md §1.1 · `70a8ab7` 后端两处写入点 + 15 条测试 ·
 `05beaf8` 管理台那一格 + DOM/源码断言 · `e8e7326` 删孤儿键 `admin.fde.lastLogin` ·
-**本节所在的那一枚文档提交**（含 §12 与 §1.1）——它的哈希写不进它自己，现读 `git log -1 --oneline`；
-该提交在本地 `--amend` 过几轮（补变异读数计数、拿掉写不进自己的那个哈希——不写死计数，这类自指每改一次就漂一次），**全程未 push**，所以 amend 不伤人。
+`05beaf8` 之后的文档提交（§12 + §1.1 + 本段）与 **M5 那一枚**（补 e2e 抓到的副行 `:title` 回归 + 本段 M5 小节）
+——它们的哈希写不进自己，现读 `git log --oneline main..HEAD`；
+其中文档提交在本地 `--amend` 过几轮（补变异读数计数、拿掉写不进自己的那个哈希——不写死计数，这类自指每改一次就漂一次），**全程未 push**，所以 amend 不伤人。
 
 **写入点全仓两处（现读坐标，M4 复核一字未动）**：`portal/src/sessions.js:597`（`postMessage`，本站唯一发送路）
 与 `portal/src/queued-inputs.js:156`（`enqueueQueuedInput`）。两处都是同一句
@@ -4755,7 +4756,7 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 - 重放：把回填那条 UPDATE 放进 `BEGIN … ROLLBACK` 再跑一遍 ⇒ **`UPDATE 0`**（只动 `IS NULL` 的行，本迁移自己可重放）。
 - 冻结 baseline `docs/data/schema.sql`：`git diff main..HEAD` **为空**（一字节未改；sha256 `461a35ee…de25a` 留作坐标）。
 
-**变异实验（「断言可失败」的唯一证据；共 8 次 = 我的 6 次 + 主 agent 独立 2 次，全部已复原）**
+**变异实验（「断言可失败」的唯一证据；M1–M4 期间 8 次 = 我的 6 次 + 主 agent 独立 2 次；M5 另加 2 次见下一张小表；全部已复原）**
 
 | 片 | 变异 | 读数 |
 |---|---|---|
@@ -4770,6 +4771,35 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 
 ⚠ **方法学（主 agent 上的一条，我认）**：「红得多」不等于「钉得牢」。MUT-Y 第一次手滑把 `v-if` 换成 HTML 注释
 塞进标签属性区 ⇒ 模板语法坏掉，**36 红雪崩**，那读数什么也不证明。只有「恰好 3 红 / 71 绿」这种**定向**读数才算证据。
+
+**M5：真机 e2e 抓到一处本 PR 自己弄丢的回归（副行丢了 hover 全文）**
+
+主 agent 换本地镜像 + playwright 真浏览器打 `#/admin/users`（console errors 0）看那一格，三种形态全在、
+读数与库里逐字一致（`blind` 的活动 `10/12 3:57 PM` 确实比登录 `10/12 5:04 PM` **旧**，倒挂在真数据里成立）。
+但截图里副行被列宽截断成 `Signed in 11/12/2026,…` 而 **hover 什么也给不出**：
+旧形态是 `<td class="truncate …" :title="formatLastLogin(user.last_login_at)">` **整格有 title**，
+M3 拆成两行时 `<td>` 的 title 随单元格重写一起消失了——主行 `span` 自己补了 `:title`，**副行漏了**。
+⇒ 「看全文」是**既有能力**，被本 PR 丢掉就得由本 PR 补回（不是「既有瑕疵」，别当存量留着）。
+
+- 修法：副行 `data-test="user-login-sub"` 那个 span 加
+  `:title="t('admin.fde.loginAt', { time: formatLastLogin(user.last_login_at) })"` —— 与它自己显示的那句
+  **同一个 `t()` 调用、同一个时间源 `last_login_at`**（不许拿活动时刻填，也不许只填裸时间让 hover 文案与显示文案漂）。
+- 断言落点：DOM 层在 `portal/frontend/src/views/AdminView.spec.ts` 那条 `issue #497：第 8 格两行…` 用例里加 ④ 段
+  —— 两行各自 `attributes('title')` 与**完整期望串**相等、且 `title === 该 span 自己的 text`（这就是「看全文」的定义），
+  外加「副行 title 不许含活动时刻」；源码层在 `AdminUsersView.spec.ts` 的「两行结构」锚里钉
+  「**两行都必须带 `:title`**」+「副行的 `t('admin.fde.loginAt'` 必须出现**两处**（title 与文本同形，不会各漂各的）」。
+- 追加两次变异（**定向**，各 2 红 / 72 绿，不是雪崩）：
+
+| 片 | 变异 | 读数 |
+|---|---|---|
+| M5-F | 去掉副行的 `:title`（正是 e2e 抓到的那个形状） | rc=1：**恰好 2 红 / 72 绿**（DOM `issue #497：第 8 格两行…` + 源码锚「两行结构」） |
+| M5-G | 副行 `:title` 改拿**活动**时刻填 | rc=1：**恰好 2 红 / 72 绿**（`登录于 2026-11-11 09:32:38` ≠ `登录于 2026-10-3 20:00:00`） |
+
+- M5 门禁：`env -u NODE_ENV timeout 300 npm test` rc=**0**（63 文件 / **1322** 例）、`timeout 300 npm run typecheck` rc=**0**；
+  后端与文档未动。前端生产构建由主 agent 那次 `docker compose build` 顺带补上（`vite build ✓ built in 2.54s`）。
+- ⚠ **教训（要落成判据，别只记在心里）**：把「一格」拆成「两行」时，**挂在外层元素上的 hover / 可访问性属性不会自己搬到子元素**。
+  这类丢失 DOM 值断言看不见（文本还是对的），只有**真机看那一格**才暴露 ⇒ 改呈现形态的 PR，交付前要么真机看一眼，
+  要么在断言里把「旧的 `title` / `aria-*` 还在不在」一起钉上（本单两种都做了）。
 
 **门禁读数（最终树，M4 跑一次）**：仓库根 `npm test` rc=**0**（`tests 2155 / pass 2151 / fail 0 / skipped 4`）·
 `portal/frontend` `timeout 300 npm test` rc=**0**（`Test Files 63 / Tests 1322`）· `timeout 300 npm run typecheck` rc=**0** ·
