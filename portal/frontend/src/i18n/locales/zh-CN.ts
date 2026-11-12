@@ -1091,6 +1091,12 @@ export const zhCN = {
       totpSectionHint: '管理该用户的 TOTP 注册状态；重新注册会立即使旧密钥失效。',
       lastLogin: '最近登录',
       neverLoggedIn: '从未登录',
+      // issue #497（迁移 0031）：「最后活动」= 最近一次用户输入，与「最近登录」是两个维度。
+      // ⚠ 措辞红线：「从未活动」/「从未登录」两个词必须分开，且都不许写成「今天」或留空
+      //（空值渲染成「今天」= 没数据却做出承诺）。副行的「登录于 …」在从未登录时整行不渲染。
+      lastActivity: '最后活动',
+      neverActive: '从未活动',
+      loginAt: '登录于 {time}',
       updateProfile: '保存资料',
       profileUpdated: '资料已更新。',
       statusUpdated: '用户状态已更新。',

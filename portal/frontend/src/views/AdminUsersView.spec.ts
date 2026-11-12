@@ -141,3 +141,102 @@ describe('#449 管理台：TOTP 账号的邮件验证码开关不再是死开关
     expect(enFde.mailOtpSwitchOn).toBeUndefined();
   });
 });
+
+// issue #497（工单 feat-261112-01，迁移 0031）：用户列表第 8 格从「最近登录」换成「最后活动 + 登录于 …」两行。
+// 沿用本文件的**源码级结构判据**手法（DOM 断言在 `AdminView.spec.ts`，那边是真 mount）。
+// 这里钉的是「形状不许漂」：列数、两行结构、副行的 v-if、无硬编码中文、空值措辞分开。
+describe('issue #497：第 8 格的两行结构（列数不变、无硬编码中文、两个「从未」分开）', () => {
+  const CJK = /[\u4e00-\u9fff]/;
+  /** 活动格本体：主行锚点开头 → 最近的一个 `</td>`（锚点失配 ⇒ 切片为空，第一条断言当场红）。 */
+  const activityCell = (() => {
+    const start = adminUsersViewSource.indexOf('data-test="user-activity-main"');
+    if (start === -1) return '';
+    const end = adminUsersViewSource.indexOf('</td>', start);
+    return end === -1 ? adminUsersViewSource.slice(start) : adminUsersViewSource.slice(start, end);
+  })();
+  /** 表头那一格（第 8 个 `<th scope="col">`）。 */
+  const headerCells = [...adminUsersViewSource.matchAll(/<th scope="col"[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1]);
+  /**
+   * 剥掉**注释**（HTML 注释、块注释、整行 `//` 注释），只留会真的渲染/执行的部分。
+   * 中文注释是给人读的，不算硬编码；但整行注释以外的中文（模板文本、字符串字面量）算。
+   */
+  const noComments = (text: string) => text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/[^\n]*$/gm, '');
+
+  it('列数与列宽一字未改：9 个 col / 9 个 th / 行内 9 个 td（不许新增列把 th[8] 往后挤）', () => {
+    expect(adminUsersViewSource.match(/<col /g) ?? [], 'colgroup 列数').toHaveLength(9);
+    expect(adminUsersViewSource.match(/<th scope="col"/g) ?? [], '表头列数').toHaveLength(9);
+    // 第 8 格（下标 7）的语义已换成「最后活动」，且旧键 `lastLogin` 不再出现在表头里
+    expect(headerCells[7] ?? '').toContain("t('admin.fde.lastActivity')");
+    expect(adminUsersViewSource, '旧表头键必须退场（没换语义 = 这格还在说登录）')
+      .not.toMatch(/<th[^>]*>\{\{ t\('admin\.fde\.lastLogin'\) \}\}<\/th>/);
+  });
+
+  it('两行结构：主行 = 活动，副行小字 = 登录于 …，且副行在从未登录时整行不渲染', () => {
+    expect(activityCell, '找不到活动格（锚点 data-test="user-activity-main" 被改名了？）').not.toBe('');
+    expect(activityCell).toContain("formatLastActivity(user.last_activity_at)");
+    expect(activityCell).toContain('data-test="user-login-sub"');
+    // 副行必须是**小字**（「副行」是设计判据）且带 v-if —— 没有 v-if 就会渲染出「登录于 从未登录」这种病句
+    const subTag = /<span[^>]*data-test="user-login-sub"[^>]*>/.exec(activityCell)?.[0] ?? '';
+    expect(subTag, '找不到副行的 span 标签本体').not.toBe('');
+    expect(subTag).toMatch(/text-xs/);
+    expect(subTag).toMatch(/v-if="user\.last_login_at"/);
+    // 副行取的是 last_login_at（另一条时间线），主行取的是 last_activity_at —— 两行不许读同一个值
+    expect(activityCell).toContain('formatLastLogin(user.last_login_at)');
+    expect(activityCell.match(/last_activity_at/g) ?? [], '主行必须读 last_activity_at').not.toHaveLength(0);
+  });
+
+  it('那一格没有硬编码中文（文案全部走 t()；注释里的中文不算）', () => {
+    const rendered = noComments(activityCell);
+    expect(rendered, `活动格里出现硬编码文案：${rendered}`).not.toMatch(CJK);
+    // 组件任何地方都不许把这四个词当**文案**写死（写在注释里不算，见 noComments）。
+    // 只查模板文本与字符串字面量：先剥注释，再要求四个词一个都不出现。
+    for (const word of ['从未活动', '从未登录', '最后活动', '登录于']) {
+      expect(noComments(adminUsersViewSource), `组件里不许硬编码「${word}」`)
+        .not.toContain(word);
+    }
+  });
+
+  it('空值措辞两个词分开，且都不许写成「今天」/空串；副行是带占位的模板', () => {
+    const zhFde = zhCN.admin.fde as unknown as Record<string, string>;
+    const enFde = en.admin.fde as unknown as Record<string, string>;
+    // 成对存在（漏一边 localeParity 也会抓，这里点名是为了失败信息可操作）
+    for (const [locale, bag] of [['zh-CN', zhFde], ['en', enFde]] as const) {
+      for (const key of ['lastActivity', 'neverActive', 'loginAt']) {
+        expect(bag[key], `${locale} 缺 admin.fde.${key}`).toBeTruthy();
+        expect(bag[key], `${locale} admin.fde.${key} 不许空串`).not.toBe('');
+        expect(bag[key], `${locale} admin.fde.${key} 不许漏翻译（界面会打键名）`)
+          .not.toMatch(/admin\.fde\./);
+      }
+      // 红线：空值承诺。活动/登录的「从未」文案都不许带「今天/昨天/today/now」这种相对时间口气
+      expect(bag.neverActive, `${locale} neverActive 不许承诺相对时间`).not.toMatch(/今天|昨天|现在|today|yesterday|now/i);
+      expect(bag.neverLoggedIn, `${locale} neverLoggedIn 同上`).not.toMatch(/今天|昨天|现在|today|yesterday|now/i);
+      // 副行必须是「登录于 {time}」这种占位模板：没有 {time} 就说明时间被丢了（或写死在组件里）
+      expect(bag.loginAt, `${locale} loginAt 必须带 {time} 占位`).toContain('{time}');
+    }
+    // 两个「从未」必须是两个不同的词（同一个词 = 界面上分不开「没说过话」和「没进过门」）
+    expect(zhCN.admin.fde.neverActive).toBe('从未活动');
+    expect(zhCN.admin.fde.neverLoggedIn).toBe('从未登录');
+    expect(zhCN.admin.fde.neverActive).not.toBe(zhCN.admin.fde.neverLoggedIn);
+    expect(en.admin.fde.neverActive).toBe('Never active');
+    expect(en.admin.fde.neverActive).not.toBe(en.admin.fde.neverLoggedIn);
+    expect(en.admin.fde.lastActivity).toBe('Last activity');
+    expect(en.admin.fde.lastActivity).not.toBe(zhCN.admin.fde.lastActivity);
+  });
+
+  it('格式化函数按语义分层：空值措辞各管各的（活动那一格不许回落到「从未登录」）', () => {
+    const src = adminUsersViewSource;
+    const activityFn = /function formatLastActivity[\s\S]*?\n\}/.exec(src)?.[0] ?? '';
+    const loginFn = /function formatLastLogin[\s\S]*?\n\}/.exec(src)?.[0] ?? '';
+    expect(activityFn, 'formatLastActivity 退场了？').not.toBe('');
+    expect(activityFn).toContain("t('admin.fde.neverActive')");
+    expect(activityFn, '活动那一格不许说「从未登录」').not.toContain('neverLoggedIn');
+    expect(loginFn).toContain("t('admin.fde.neverLoggedIn')");
+    expect(loginFn).not.toContain('neverActive');
+    // 不解析出合法时间戳时原样回显（旧行为）——不许发明「今天」这类兜底
+    expect(/function formatMoment[\s\S]*?Number\.isNaN\(timestamp\) \? value/.test(src),
+      '时间点格式化必须原样回显不可解析的值，而不是造一个兜底词').toBe(true);
+  });
+});

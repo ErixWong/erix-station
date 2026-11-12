@@ -109,6 +109,16 @@ export interface AdminUser {
   status: 'active' | 'disabled' | 'awaiting_credential';
   totp_enabled: boolean;
   last_login_at: string | null;
+  /**
+   * issue #497（迁移 0031）：最近一次**用户输入**（按下发送那一刻）。与 `last_login_at`（最近一次登录）
+   * 是**两条独立时间线**：后端只有两处写它（发送路 `postMessage` 与运行中入队 `enqueueQueuedInput`），
+   * 登录本身、agent 跑完一个 run、改名、归档都不写 ⇒ 它**允许比 `last_login_at` 旧**
+   * （登录了但一句话没说），那不是脏数据，别在界面上「修正」它。
+   * `null` = 从未活动（新开户，或从没说过话）。
+   * ⚠ 渲染红线：`null` 必须显示成「从未活动」——**绝不许**退化成「今天」或空字符串
+   *（没扫到就没资格承诺，口径同收工灯的 ⚪ 不得渲染成绿）。
+   */
+  last_activity_at: string | null;
   git_host_id?: string | null;
   onboarding: {
     state: 'pending' | 'running' | 'awaiting_credential' | 'done' | 'failed';

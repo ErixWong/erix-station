@@ -43,6 +43,9 @@ const USERS = {
       // ⇒ 流水账号的 DTO 就得写 true（不写就是把「旧形状」当现状，界面上会变成「未勾」）。
       totp_login_enabled: true,
       status: 'active', totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+      // issue #497（迁移 0031）： alice 说过话，且**最后活动比那次登录新**（她登录后确实讲了话）。
+      // 两行都该渲染，主行是活动、副行是登录——这就是本文件那一格的主判据形状。
+      last_activity_at: '2026-10-04T08:30:00.000Z',
       onboarding: { state: 'failed', step: 'provision', error: 'Docker unavailable' },
     },
     {
@@ -51,6 +54,9 @@ const USERS = {
       // 「允许登录」与「绑过密钥」两个维度因此得以在界面上分开（勾选框禁用 + 「未绑定」）。
       totp_login_enabled: true,
       status: 'active', totp_enabled: false, last_login_at: null,
+      // issue #497：bob 从没登录过也从没说过话 ⇒ 两行都该是「从未」，
+      // 而「从未登录」那一行**整行不渲染**（不许出现「登录于 从未登录」）。
+      last_activity_at: null,
       onboarding: { state: 'done', step: null, error: null },
     },
   ],
@@ -1033,14 +1039,29 @@ describe('AdminView · FDE 用户', () => {
     expect(list.text()).toContain('✓');
     expect(list.findAll('thead th')).toHaveLength(9);
     expect(list.findAll('thead th')[6].text()).toBe('开户 / 下线');
-    expect(list.findAll('thead th')[7].text()).toBe('最近登录');
+    // issue #497：第 8 列的语义从「最近登录」换成「最后活动」（列数与列宽都没动，仍是第 8 格）。
+    expect(list.findAll('thead th')).toHaveLength(9);
+    expect(list.findAll('thead th')[7].text()).toBe('最后活动');
     const rows = list.findAll('[data-test="user-row"]');
     expect(rows[0].findAll('td')).toHaveLength(9);
     expect(rows[0].findAll('td')[6].text()).toContain('失败');
     expect(rows[0].findAll('td')[6].find('span').attributes('title')).toBe('Docker unavailable');
-    expect(rows[0].findAll('td')[7].text())
-      .toBe(new Date('2026-10-03T12:00:00.000Z').toLocaleString('zh-CN'));
-    expect(rows[1].findAll('td')[7].text()).toBe('从未登录');
+    // —— 第 8 格（issue #497）：两行同格，值与顺序都由**精确等值**钉死（不是 toContain / not.toBe）——
+    const activityAlice = rows[0].findAll('td')[7];
+    const mainAlice = activityAlice.get('[data-test="user-activity-main"]').text();
+    const subAlice = activityAlice.get('[data-test="user-login-sub"]').text();
+    expect(mainAlice).toBe(new Date('2026-10-04T08:30:00.000Z').toLocaleString('zh-CN'));
+    expect(subAlice).toBe(`登录于 ${new Date('2026-10-03T12:00:00.000Z').toLocaleString('zh-CN')}`);
+    // 整格文本 = 主行 + 副行，一字不多：一次同时钉住「两行都在」「活动在前」「没有第三行偷进来」
+    expect(activityAlice.text()).toBe(`${mainAlice}${subAlice}`);
+    // 副行是小字（「副行」是设计判据，不是随便两个 span）
+    expect(activityAlice.get('[data-test="user-login-sub"]').attributes('class')).toContain('text-xs');
+
+    const activityBob = rows[1].findAll('td')[7];
+    expect(activityBob.get('[data-test="user-activity-main"]').text()).toBe('从未活动');
+    expect(activityBob.find('[data-test="user-login-sub"]').exists()).toBe(false);
+    // 红线：空值既不是「今天」也不是空串，而且**整格**就只有这两个字
+    expect(activityBob.text()).toBe('从未活动');
     expect(rows[0].findAll('button')).toHaveLength(3);
     expect(list.find('[data-test="user-menu-button"]').exists()).toBe(false);
     expect(rows[0].attributes('tabindex')).toBeUndefined();
@@ -1095,6 +1116,62 @@ describe('AdminView · FDE 用户', () => {
     expect(totp.find('[data-test="copy-totp-secret"]').exists()).toBe(true);
     await wrapper.get('[data-test="totp-saved"]').trigger('click');
     expect(wrapper.find('[data-test="totp-box"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  // issue #497（迁移 0031）：「最后活动」与「最近登录」是两条时间线，管理台必须分得开。
+  // 三格逐个钉（每格都是**可失败**的精确等值：改回旧实现、或把 null 渲染成「今天」/空串，都会红）。
+  it('issue #497：第 8 格两行——活动时刻、从未活动、以及「有登录但从未活动」的第三种形状', async () => {
+    const zh = (iso: string) => new Date(iso).toLocaleString('zh-CN');
+    const mk = (over: Record<string, unknown>) => ({
+      id: `u-${String(over.login)}`, display_name: null, role: 'fde' as const, fde_name: null,
+      status: 'active' as const, totp_enabled: false, git_host_id: null,
+      onboarding: null, offboarding: undefined,
+      last_login_at: null, last_activity_at: null,
+      ...over,
+    });
+    const { wrapper } = await mountAdmin('/admin/users', (url, init) => url === '/api/admin/users' && !init?.method
+      ? jsonResponse(200, {
+        items: [
+          mk({ login: 'spoke', last_activity_at: '2026-11-11T01:32:38.000Z', last_login_at: '2026-10-03T12:00:00.000Z' }),
+          mk({ login: 'lurker', last_activity_at: null, last_login_at: '2026-11-11T09:00:00.000Z' }),
+          mk({ login: 'ghost', last_activity_at: null, last_login_at: null }),
+        ],
+      })
+      : undefined);
+
+    const cellOf = (login: string) => {
+      const row = wrapper.findAll('[data-test="user-row"]').find((r) => r.get('td').text().includes(login));
+      if (!row) throw new Error(`没有 ${login} 这一行（判据会空转）`);
+      return row.findAll('td')[7];
+    };
+
+    // ① 说过话，而且**活动比登录新** ⇒ 两行都在，主行是活动、副行是登录
+    const spoke = cellOf('spoke');
+    expect(spoke.get('[data-test="user-activity-main"]').text()).toBe(zh('2026-11-11T01:32:38.000Z'));
+    expect(spoke.get('[data-test="user-login-sub"]').text()).toBe(`登录于 ${zh('2026-10-03T12:00:00.000Z')}`);
+    expect(spoke.text()).toBe(`${zh('2026-11-11T01:32:38.000Z')}登录于 ${zh('2026-10-03T12:00:00.000Z')}`);
+
+    // ② 只登录没说话（**这一格才是本单存在的理由**：旧形态在这里显示登录时刻，等于把「挂机」读成「还在用」）
+    const lurker = cellOf('lurker');
+    expect(lurker.get('[data-test="user-activity-main"]').text()).toBe('从未活动');
+    expect(lurker.get('[data-test="user-login-sub"]').text()).toBe(`登录于 ${zh('2026-11-11T09:00:00.000Z')}`);
+    expect(lurker.text()).toBe(`从未活动登录于 ${zh('2026-11-11T09:00:00.000Z')}`);
+    // 活动那一行**没有**被登录时刻污染（旧实现就是拿 last_login_at 填这一格）
+    expect(lurker.get('[data-test="user-activity-main"]').text()).not.toContain(zh('2026-11-11T09:00:00.000Z'));
+
+    // ③ 两个都没有 ⇒ 只有主行「从未活动」，副行整行不渲染（不是「登录于 从未登录」）
+    const ghost = cellOf('ghost');
+    expect(ghost.get('[data-test="user-activity-main"]').text()).toBe('从未活动');
+    expect(ghost.find('[data-test="user-login-sub"]').exists()).toBe(false);
+    expect(ghost.text()).toBe('从未活动');
+
+    // 红线：任何一格都不许把空值渲染成「今天」/空串（没数据就没资格承诺）
+    for (const cell of [spoke, lurker, ghost]) {
+      const main = cell.get('[data-test="user-activity-main"]').text();
+      expect(main).not.toBe('');
+      expect(main).not.toMatch(/今天|昨天|now|today/i);
+    }
     wrapper.unmount();
   });
 
@@ -1560,7 +1637,7 @@ describe('AdminView · FDE 用户', () => {
   it('整体开户已完成但 LLM 绑定失败时仍显示错误并可重试', async () => {
     let users: AdminUser[] = [{
       id: 'u-llm', login: 'llm-user', display_name: 'LLM User', role: 'fde', fde_name: 'llm-user',
-      status: 'awaiting_credential', totp_enabled: false, last_login_at: null,
+      status: 'awaiting_credential', totp_enabled: false, last_login_at: null, last_activity_at: null,
       onboarding: {
         state: 'awaiting_credential', step: null, error: null,
         llm_binding: { state: 'failed', error: 'LiteLLM virtual-key setup failed (HTTP 502)' },
@@ -1597,7 +1674,7 @@ describe('AdminView · FDE 用户', () => {
     let users: AdminUser[] = [{
       id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
       status: 'active',
-      totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+      totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z', last_activity_at: null,
       onboarding: null,
       offboarding: null,
     }];
@@ -1636,7 +1713,7 @@ describe('AdminView · FDE 用户', () => {
     let users: AdminUser[] = [{
       id: 'u1', login: 'alice', display_name: 'Alice', role: 'fde', fde_name: 'alpha-fde',
       status: 'disabled',
-      totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z',
+      totp_enabled: true, last_login_at: '2026-10-03T12:00:00.000Z', last_activity_at: null,
       onboarding: null,
       offboarding: {
         state: 'failed', step: 'stop-container', error: 'Docker unavailable',

@@ -1055,6 +1055,11 @@ export const en = {
       totpSectionHint: 'Manage this user’s TOTP registration; re-enrolling immediately invalidates the old secret.',
       lastLogin: 'Last login',
       neverLoggedIn: 'Never',
+      // issue #497（迁移 0031）：activity = 最近一次用户输入，与 login 是两个维度；
+      // 两个「从未」必须分得开，且都不许渲染成 "Today" 或空串。
+      lastActivity: 'Last activity',
+      neverActive: 'Never active',
+      loginAt: 'Signed in {time}',
       updateProfile: 'Save profile',
       profileUpdated: 'Profile updated.',
       statusUpdated: 'User status updated.',
