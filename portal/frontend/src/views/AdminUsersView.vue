@@ -837,10 +837,15 @@ onBeforeUnmount(() => {
                       :title="formatLastActivity(user.last_activity_at)"
                     >{{ formatLastActivity(user.last_activity_at) }}</span>
                     <!-- 从未登录 ⇒ 整行不渲染（而不是显示「登录于 从未登录」这种病句）。 -->
+                    <!-- ⚠ `:title` 是**真机 e2e 抓到的回归**补回来的（M5）：旧形态整格带 title，两行化之后
+                         副行被列宽截断成「登录于 2026/11/12,…」而 hover 什么也给不出 ⇒ 「看全文」这个既有能力
+                         丢了。title 与显示文本**同一个 t() 调用同一时间源**（`last_login_at`），
+                         所以 hover 出来的就是被截断的那一行全文，不会跟显示值漂（也不许拿活动时间去填）。 -->
                     <span
                       v-if="user.last_login_at"
                       data-test="user-login-sub"
                       class="block truncate text-xs text-black/45"
+                      :title="t('admin.fde.loginAt', { time: formatLastLogin(user.last_login_at) })"
                     >{{ t('admin.fde.loginAt', { time: formatLastLogin(user.last_login_at) }) }}</span>
                   </div>
                 </td>
