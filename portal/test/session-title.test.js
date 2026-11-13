@@ -13,6 +13,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { createUserActivityWorld } from './fake-user-activity.js';
 import {
   AUTO_TITLE_MAX_LEN,
   shouldRefreshTitle,
@@ -215,6 +216,8 @@ function postMessageClient({
     })),
     transcriptInsertAttempts: 0,
   };
+  // issue #497：发送路的用户活动位（共用仿真件，按 SQL 真改行；`activity.writes` 是「写了几次」的判据面）
+  const activity = createUserActivityWorld({ users: [{ id: 'u1', last_activity_at: null }] });
   const order = [];
   const client = {
     async query(sql, params = []) {
@@ -281,11 +284,14 @@ function postMessageClient({
       if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
       if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
       if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
+      // issue #497：发送路的用户活动位（共用仿真件；不接管未知语句）
+      const activityHit = activity.query(sql, params);
+      if (activityHit) return activityHit;
       throw new Error(`unexpected SQL: ${sql}`);
     },
     release() {},
   };
-  return { pool: { connect: async () => client }, order, state };
+  return { pool: { connect: async () => client }, order, state, activity };
 }
 
 /** 从 SQL 日志里取「默认标题落库」语句（无则 undefined）。 */

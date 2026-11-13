@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { stopSession, postMessage, SessionError } from '../src/sessions.js';
 import { validateTransition, setRunState, claimRun } from '../src/internal.js';
 import { seedClaimable } from './fake-internal-pool.js';
+import { createUserActivityWorld } from './fake-user-activity.js';
 import { fakeTranscriptRounds } from './fake-transcript-rounds.js';
 
 const UID = '00000000-0000-4000-8000-0000000000a1';
@@ -39,6 +40,8 @@ class StopPool {
       claimed_at: run.claimed_at ?? null }] : [];
     this.messages = [];
     this.transcript = [];
+    // issue #497：postMessage 事务里的用户活动位写入（共用仿真件，按 SQL 真改行）。
+    this.activity = createUserActivityWorld({ users: [{ id: UID, last_activity_at: new Date('2026-11-01T00:00:00Z') }] });
     this.events = []; // run_events（#277-A2 返修 2：合成 run_end 的判据面）
     this.sqlJournal = []; // 按执行顺序记录原始 SQL（事务边界/同事务断言用）
     this.commits = 0;
@@ -215,6 +218,12 @@ class StopPool {
     if (s.includes('FROM containers')) return { rows: [{ id: CID }], rowCount: 1 };
     if (s.includes('SELECT fde_name FROM users')) return { rows: [{ fde_name: 'alice' }], rowCount: 1 };
     if (s.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+
+    // --- issue #497：postMessage 事务里的用户活动位（共用仿真件，按 SQL 真改 users 行）---
+    {
+      const hit = this.activity.query(sql, params);
+      if (hit) return hit;
+    }
 
     throw new Error(`StopPool：未预期的 SQL\n${sql}`);
   }

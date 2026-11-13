@@ -4705,3 +4705,179 @@ logical-run 作用域，与 `runner/worker.js:553-557` 的现行代码不符（*
 **剩下的 19 条 open 分桶**：真待做 #387 / #259 / #231 / #243 / #485 / #270 / #227（第 4 项）·
 等拍 #348 / #346 / #331 / **#494** · 上游与别台 #341 / #367 / #426 · 挂账 #303 · 外部 #135 ·
 新拆 #493 / #495 / #496。**「open 数」不是进度**：本批 20→19 只动了 1 格，但五张半开的单被拆清了。
+
+### 8.120 用户「最后活动」列：一个语义缺口、两处写入点、十次变异（issue #497 / 工单 feat-261112-01，2026-11-12，worker 五个里程碑 + 主 agent 复验）
+
+> **挑号**：落笔前现查 `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3` ⇒ 最大号 **8.119**，本条取 **8.120**。
+> 结论性口径**不在本节**：字段语义在 `docs/data/model.md` §1.1，API 面在 `docs/api/portal.md` §12，
+> 迁移自证在 `deploy/migrations/0031-user-last-activity-at.sql` 的文件头注释。本节只留过程与读数。
+
+**治的是什么**：管理台此前只有 `last_login_at`（= `login_sessions` 里最新的 `created_at`，语义是「最近一次把门推开」）。
+它答不出管理员真正想问的那句「**这个人还在用吗**」——页面刷新/重开会写它、自动续期会写它、一句话没说的人可以天天「登录」。
+所以「活跃度」这一维此前是**缺的**，不是不准。人已拍板口径 **A3**：`users.last_activity_at` = 该用户
+**按下发送那一刻**；刻意**不加第三处**写入点。**五个里程碑 · 七个提交**（分支 `feat-261112-01-user-last-activity-at`，写本节时未 push）：
+`b7bc2c8` 迁移 0031 · `eab7216` model.md §1.1 · `70a8ab7` 后端两处写入点 + 15 条测试 ·
+`05beaf8` 管理台那一格 + DOM/源码断言 · `e8e7326` 删孤儿键 `admin.fde.lastLogin` ·
+`05beaf8` 之后的文档提交（§12 + §1.1 + 本段）与 **M5 那一枚**（补 e2e 抓到的副行 `:title` 回归 + 本段 M5 小节）
+——它们的哈希写不进自己，现读 `git log --oneline main..HEAD`；
+其中文档提交在本地 `--amend` 过几轮（补变异读数计数、拿掉写不进自己的那个哈希——不写死计数，这类自指每改一次就漂一次），**全程未 push**，所以 amend 不伤人。
+
+**写入点全仓两处（现读坐标，M4 复核一字未动）**：`portal/src/sessions.js:597`（`postMessage`，本站唯一发送路）
+与 `portal/src/queued-inputs.js:156`（`enqueueQueuedInput`）。两处都是同一句
+`UPDATE users SET last_activity_at = now() WHERE id = $1`，都**在既有事务里用既有 `client`**（红线：消息回滚了活动位不许前进），
+都**不节流**（人已拍板「一次输入写一次」）。管理台那一格：`AdminUsersView.vue` 第 8 格两行
+（主行 `data-test="user-activity-main"` = 活动，副行 `user-login-sub` = `登录于 {time}`），**列数与列宽一字未动**（colgroup 9 / th 9 / 行内 td 9）。
+
+**四个「看着该写、其实不许写」**（M2 变异 B 逐条钉死，见下表）：run 生命周期与终态、会话改名、归档、**登录本身**。
+最后一条是这一列的立身之本：它**允许比 `last_login_at` 旧**——M4 现验 dev 库 9 个用户里**真有 2 个是这个形状**
+（`last_activity_at < MAX(login_sessions.created_at)`）。读侧与界面都不许把这种「倒挂」当脏数据去「修正」。
+
+**四个陷阱（全是实测，不是设想）**
+
+1. **「一次输入恰好写一次」不显然**：`enqueueQueuedInput` 的直发分岔（`!activeRunId`，`queued-inputs.js:111`）
+   **先 COMMIT 再转 `postMessage`**，所以它**不写**第 156 行那一处——两条分岔合起来恰好一次。
+   断言必须按「**恰好一次**」写（`W-5`），只写「写过」就永远抓不到双写。
+2. **源码级断言要先剥整行注释**：M2 变异 A 第一次跑**假绿**——把写入语句 `//` 掉之后，未剥注释的实现文本仍匹配得上。
+   补上「剥掉整行 `//` 注释再匹配」才红。同理 M3 那条「那一格无硬编码中文」也要先剥 `<!-- -->` / `/* */` / 整行 `//`，
+   否则中文注释会被当成硬编码文案。
+3. **`node --test` 会收 `portal/test/` 下所有 `.js`**：共享桩文件（`portal/test/fake-user-activity.js`）里一旦写 `test(...)`
+   就会被每个 importer 重复执行（同一批用例跑好几遍，读数全歪）。helper **只导出函数**，用例住在 `*.test.js` 里。
+4. **删 i18n 键会顺手带走相邻的活键**（M4 本单实际踩的）：删 `admin.fde.lastLogin` 时把下一行 `neverLoggedIn`
+   一起删了 ⇒ 前端 `npm test` rc=1（1 红）+ `npm run typecheck` rc=2（`TS2339: Property 'neverLoggedIn' does not exist` ×3）。
+   两道门禁各抓一次，没有靠人眼。相邻两键一起删是这类清理的默认风险。
+
+**真库核对（dev `station-db` / DB `station`，表在 `public` 而非同名 schema；M4 现验）**
+
+- `information_schema.columns`：`nullable=YES` / `timestamp with time zone` / `default=(none)` ⇒ 可空与无默认值都是**现况**不是愿望。
+- `pg_indexes`（`users`）只有 `users_pkey` + 4 枚 unique key ⇒ 本列**确实没有索引**（契约是「只作返回列」）。
+- `schema_migrations`：`0031-user-last-activity-at` = `sha256:522c8c232228ed3cbc15c48c39e0f5d67c6ef015abc8a68830280842a286601b`，
+  与盘上 `sha256sum deploy/migrations/0031-user-last-activity-at.sql` **逐字相同** ⇒ M3/M4 没偷偷回改已应用的迁移。
+- 计数：`total=9 / 非空=5 / NULL=4`，与 M1 首次回填的读数一致（`NULL` 是真话，不是没跑回填）。
+- 重放：把回填那条 UPDATE 放进 `BEGIN … ROLLBACK` 再跑一遍 ⇒ **`UPDATE 0`**（只动 `IS NULL` 的行，本迁移自己可重放）。
+- 冻结 baseline `docs/data/schema.sql`：`git diff main..HEAD` **为空**（一字节未改；sha256 `461a35ee…de25a` 留作坐标）。
+
+**变异实验（「断言可失败」的唯一证据；M1–M4 期间 8 次 = 我的 6 次 + 主 agent 独立 2 次；M5 另加 2 次见下一张小表；全部已复原）**
+
+| 片 | 变异 | 读数 |
+|---|---|---|
+| M2-A | 注释掉两处写入点 | rc=1：`W-0b W-5 W-1 W-1b W-1c W-2 W-2b` **7 红**，四个反例 `W-3*` 仍绿 |
+| M2-B | 在改名/归档/登录/run 状态四处**加写** | rc=1：`W-3 W-3b W-3c W-3d W-5` **5 红** |
+| M3-C | 第 8 格退回旧单行 `formatLastLogin(last_login_at)` | rc=1：**3 红 / 71 绿**（2 条 DOM + 1 条源码锚） |
+| M3-D | 只把表头键退回 `lastLogin` | rc=1：**4 红**（表头/列数锚 + 2 条 DOM） |
+| M3-E | 空值渲染成「今天」 | rc=1：**3 红**（分层锚 + 2 条 DOM） |
+| M3-类型 | 从夹具摘掉 `last_activity_at` | typecheck rc=2：`TS2741 … required in type 'AdminUser'` |
+| 主 agent MUT-Y | `v-if="user.last_login_at"` → `v-if="true"` | rc=1：**恰好 3 红 / 71 绿** |
+| 主 agent MUT-Z | 空值分支改成渲染 `new Date()` | rc=1：**恰好 3 红 / 71 绿** |
+
+⚠ **方法学（主 agent 上的一条，我认）**：「红得多」不等于「钉得牢」。MUT-Y 第一次手滑把 `v-if` 换成 HTML 注释
+塞进标签属性区 ⇒ 模板语法坏掉，**36 红雪崩**，那读数什么也不证明。只有「恰好 3 红 / 71 绿」这种**定向**读数才算证据。
+
+**M5：真机 e2e 抓到一处本 PR 自己弄丢的回归（副行丢了 hover 全文）**
+
+主 agent 换本地镜像 + playwright 真浏览器打 `#/admin/users`（console errors 0）看那一格，三种形态全在、
+读数与库里逐字一致（`blind` 的活动 `10/12 3:57 PM` 确实比登录 `10/12 5:04 PM` **旧**，倒挂在真数据里成立）。
+但截图里副行被列宽截断成 `Signed in 11/12/2026,…` 而 **hover 什么也给不出**：
+旧形态是 `<td class="truncate …" :title="formatLastLogin(user.last_login_at)">` **整格有 title**，
+M3 拆成两行时 `<td>` 的 title 随单元格重写一起消失了——主行 `span` 自己补了 `:title`，**副行漏了**。
+⇒ 「看全文」是**既有能力**，被本 PR 丢掉就得由本 PR 补回（不是「既有瑕疵」，别当存量留着）。
+
+- 修法：副行 `data-test="user-login-sub"` 那个 span 加
+  `:title="t('admin.fde.loginAt', { time: formatLastLogin(user.last_login_at) })"` —— 与它自己显示的那句
+  **同一个 `t()` 调用、同一个时间源 `last_login_at`**（不许拿活动时刻填，也不许只填裸时间让 hover 文案与显示文案漂）。
+- 断言落点：DOM 层在 `portal/frontend/src/views/AdminView.spec.ts` 那条 `issue #497：第 8 格两行…` 用例里加 ④ 段
+  —— 两行各自 `attributes('title')` 与**完整期望串**相等、且 `title === 该 span 自己的 text`（这就是「看全文」的定义），
+  外加「副行 title 不许含活动时刻」；源码层在 `AdminUsersView.spec.ts` 的「两行结构」锚里钉
+  「**两行都必须带 `:title`**」+「副行的 `t('admin.fde.loginAt'` 必须出现**两处**（title 与文本同形，不会各漂各的）」。
+- 追加两次变异（**定向**，各 2 红 / 72 绿，不是雪崩）：
+
+| 片 | 变异 | 读数 |
+|---|---|---|
+| M5-F | 去掉副行的 `:title`（正是 e2e 抓到的那个形状） | rc=1：**恰好 2 红 / 72 绿**（DOM `issue #497：第 8 格两行…` + 源码锚「两行结构」） |
+| M5-G | 副行 `:title` 改拿**活动**时刻填 | rc=1：**恰好 2 红 / 72 绿**（`登录于 2026-11-11 09:32:38` ≠ `登录于 2026-10-3 20:00:00`） |
+
+- M5 门禁：`env -u NODE_ENV timeout 300 npm test` rc=**0**（63 文件 / **1322** 例）、`timeout 300 npm run typecheck` rc=**0**；
+  后端与文档未动。前端生产构建由主 agent 那次 `docker compose build` 顺带补上（`vite build ✓ built in 2.54s`）。
+- ⚠ **教训（要落成判据，别只记在心里）**：把「一格」拆成「两行」时，**挂在外层元素上的 hover / 可访问性属性不会自己搬到子元素**。
+  这类丢失 DOM 值断言看不见（文本还是对的），只有**真机看那一格**才暴露 ⇒ 改呈现形态的 PR，交付前要么真机看一眼，
+  要么在断言里把「旧的 `title` / `aria-*` 还在不在」一起钉上（本单两种都做了）。
+
+**门禁读数（最终树，M4 跑一次）**：仓库根 `npm test` rc=**0**（`tests 2155 / pass 2151 / fail 0 / skipped 4`）·
+`portal/frontend` `timeout 300 npm test` rc=**0**（`Test Files 63 / Tests 1322`）· `timeout 300 npm run typecheck` rc=**0** ·
+改动过的 js 逐个 `node --check` rc=**0**。前端门槛请一律 `env -u NODE_ENV`：这台 shell 的 `NODE_ENV=production` 是脏的
+（不是项目设的），带着它 vitest 会走 production 分支、失败信号变钝（同一现象在 §8.119 也测到过）。
+`npm run build` 本地不必跑：**质量门禁 job** 只有 ① `node --check` ② 根 `npm test` ③ runner `node --test`
+④ 前端 `typecheck + vitest`（`.github/workflows/ci.yml:37`，④ 还显式 `NODE_ENV=development npm ci`），
+生产构建由**镜像构建校验** job 覆盖（`portal/Dockerfile:9 RUN npm run build`）。
+
+**遗留（交棒面）**
+
+- **未 push、未开 PR**：push（带显式代理）、开 PR、真机 e2e（playwright + vision 看管理台那一格）、
+  按 §6.1 亲审全量 diff 后合并，都由主 agent 做。分支 `feat-261112-01-user-last-activity-at`（`main@9f7b3c5` 上 5 个提交）。
+- 孤儿键 `admin.fde.lastLogin` 已在 `e8e7326` **zh/en 成对删**；`AdminUsersView.spec.ts:174` 那条**反向**断言保留
+  （键不存在时它照样成立，而且更严）。`neverLoggedIn` 保留——副行与清退日期两格仍在读它。
+- **「入队即活动」是拍板口径，不是自然律**：若将来改成「投递成功才算」，那是**契约改动**
+  （要动 `queued-inputs.js:156` 与 `W-2` / `W-2b` 两条断言），别顺手改。
+- `admin.js#createUser` 的 RETURNING 里带 `last_activity_at` 是 M2 的**读侧诚实** additions（重激活旧行时界面要显示真实值），
+  比工单原句多做了一点，主 agent 已收下（`git diff main..HEAD` 里可见）。
+
+### 8.121 热层引用闸自己在 CI 连红：计数漏了「只数 git 跟踪的文件」（PR #498 附带修，2026-11-12，主 agent 定位根因 + worker 落地）
+
+**现象**：PR #498 的 CI 红一条 `ledger-ref-floor: §8.N 引用 528 处 / 31 个文件，地板 596`。
+**但它不是 #497（用户最后活动那一单）造成的**：`main` 上同一条已经连红三次（run 495 / 496 / 497，
+`9f7b3c5` 那次读数是 **527 / 31**）。起点是 `07f9198`「逐单台账整体搬出热层 + 上热层预算闸」——
+**闸上线那天，地板就是在脏树上量的**。
+
+**根因（一句话）**：`scripts/agents-hotlayer-budget.mjs` 的 `countRefs()` / `refFiles()` 用
+`grep -r --include=*.md .` 从仓库根往下数 ⇒ **被 `.gitignore` 忽略的本地过程产物也数了进去**
+（`.gitignore:14` 的 `.work-orders/`、`:17` 的 `tasks/`，理论上还包括 `node_modules` 里的 md，
+grep 不认识 `.gitignore`）。本机实测三种口径：
+
+| 口径 | 引用 / 文件 |
+|---|---|
+| 脏树 `grep -r`（旧口径，本地 `npm test` 吃的就是它） | **610 / 53** ⇒ 本地**假绿** |
+| 只数 git 跟踪的 `.md`（新口径） | **528 / 31** |
+| CI 干净 checkout（同新口径） | **528 / 31** ⇒ 与上一行**逐字相同** |
+
+差额来源可指到具体目录：`.work-orders/` 里 22 个含引用的 md 白送 **82 处**。而地板 596 是当年
+`--sync` **在脏树上**写进 `scripts/agents-hotlayer-budget.json` 的 ⇒ 干净 checkout 上**永不满足**。
+
+**教训（本片真正的产出）**：**闸自己变成了假绿发生器**。它数的是「我这台机器上此刻有什么」，
+CI 数的是「仓库里有什么」；两者一旦不等，本地越跑越安心、CI 越跑越红，而且红得像是新 PR 的错
+（#497 就是这么被牵连的）。所以：**判据口径必须来自跟踪态（`git ls-files`），不是「从仓库根 grep 一切」**；
+并且**不许 hardcode 屏蔽目录名**——今天屏蔽 `.work-orders/`，明天冒出别的目录照样骗过去，
+跟踪态则是一个不会腐烂的定义。
+
+**改了什么**（`fix(hotlayer-gate)`，只动这条计数与它的重基线，其余检查项一字未动）
+
+- `countRefs()` 与 `refFiles()` 合并成一次 `scanRefs()`：文件清单来自 `git ls-files -z -- '*.md'`（**索引/跟踪态**），
+  内容按工作区读 ⇒ 改号/删引用当场可见，未跟踪与被忽略的一律不进读数；两个读数出自同一次扫描，不可能再各走一套口径。
+- 那一行现在自带**测量口径**，并把排除掉的东西说出来：
+  `…（口径：只数 git 跟踪的 .md；未跟踪/被忽略的 .md 里还有 22 个含引用、本来会白送 82 处，**没算进来**）`
+  ——CI 干净树上是 0，尾巴自动消失；本地脏树才会露出来（这就是「遮丑当场可见」）。
+- 新增 **`--rebaseline="<理由>"`**：只有它能**降**地板，理由（≥10 字）必填，没理由 rc=1 且**不碰登记表**；
+  登记字段 `refFloorReason` / `refFloorMeasuredWith`（口径字符串）/ `refFloorTreeHead` / `refFloorTreeDirty`。
+  `--sync` 仍然 `Math.max` ——**引用面只升不降**这条纪律没废；也正因如此别指望 sync 降历史高地板
+  （实测：sync 把 596 原样保住，这就是「闸的红没法用脚本来收拾」的那一步）。sync 现在会保住重基线的原因与口径。
+- 本次重基线：**596 → `529`**（`measuredRefs` 也是 529；`hotBytesBudget` 保持 19456 不动——重基线只管地板这一件事），理由是「旧地板在脏树上量得、含 82 处未跟踪引用；新值按 `git ls-files '*.md'` 现算」。
+
+**反向自证（`test/agents-hotlayer.test.js`；夹具是 `/tmp` 下独立 `git init` 的小仓库，不动真树）**
+
+1. 夹具基线 4 处 / 2 个文件；塞进一个**未跟踪** md（5 处）与一个 **gitignore 目录**里的 md（3 处）
+   ⇒ 读数必须**一字不变**，且那一行必须说出「本来会白送 3 处」。**脏树不得遮丑**。
+2. 删掉**跟踪** md 里的一处引用 ⇒ 读数 4→3、那一行 `RED`、rc≠0（**地板真拦得住改号/删引用**）；
+   顺带钉：`--sync` 不降地板、`--rebaseline=`（空理由/一句话打发）被拒且不写文件、带理由才按现值重置
+   并登记理由/口径/HEAD/脏净、重基线之后 sync 仍只抬不降且不许抹掉原因。
+3. 另加一条**真树对账**：闸的读数必须等于测试自己用 `git ls-files` 独立重算的值，且那一行必须写着口径
+   ——口径再漂一次就当场红。
+   ⚠ 夹具必须跑**副本**脚本：`ROOT` 是从脚本自己的位置推出来的，跑仓库那份再改 `cwd` 也没用
+   （worker 第一版就是这么错的：夹具数到真仓库的 528，两条夹具断言一起红，红得很像实现错了）。
+
+**CI 等价证明（本片的真判据，不是「本地跑过就好」）**：`git clone` 本仓到 `/tmp` 下一个干净副本（**不在仓库里面**）
+检出本分支跑 `node scripts/agents-hotlayer-budget.mjs` ⇒ `VERDICT ok`，读数
+**`§8.N 引用 529 处 / 31 个文件，地板 529（口径：只数 git 跟踪的 .md）`**——干净树上没有脏文件，
+所以那一行**不带**「本来会白送 N 处」的尾巴；主读数与本地「只数跟踪文件」的结果逐字相同
+（本地脏树跑出来的同一行只多一句「还有 22 个含引用、本来会白送 82 处，**没算进来**」——
+两种树的主读数一致、脏的部分被说出来而不是被算进去，这才是这条闸应有的样子）。
+
+**门禁**：仓库根 `npm test` rc=**0**；`node scripts/agents-hotlayer-budget.mjs` 在**脏本地树**与**干净 clone** 两种树上各跑一次都 ok；
+`git diff --check` 干净。前端本轮未动（没改任何被前端断言读的 md 引用）。

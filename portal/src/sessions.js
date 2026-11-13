@@ -584,6 +584,17 @@ export async function postMessage(pool, {
       [s.id],
     );
     const seq = Number(seqRes.rows[0].last_seq);
+    // issue #497（工单 feat-261112-01，方案 A3）：`users.last_activity_at` = 该用户**按下发送那一刻**。
+    // 本处与 `queued-inputs.js#enqueueQueuedInput` 是全仓**唯二**的两个写入点（口径见 `docs/data/model.md` §1.1）。
+    // 三条红线：
+    //  ① **同一个 `client`、同一事务**（就贴在上面那条 seq 分配旁边）——本列的语义是「这句话真的说出去了」。
+    //    把它挪到 COMMIT 之后、或另开一次 `pool.query`（= 自开连接、自带事务），就会出现
+    //    「消息因 409 / 幂等冲突 / ROLLBACK 没落库，但活动位已经前进」——那是说谎的时间戳。
+    //  ② **不节流**（人已拍板）：每发一条写一次，不时间窗、不「比当前值新才写」。
+    //    节流会把「12:00:03 他说过一句」抹成「12:00:00 他说过话」，而这一列存在的唯一理由就是「他什么时候说的这句话」。
+    //  ③ **登录 / run 生命周期 / 改名 / 归档都不写它** ⇒ 它**允许比 `last_login_at` 旧**
+    //    （登录了但一句话没说）。那是设计意图，别「顺手」在别处补写。
+    await client.query(`UPDATE users SET last_activity_at = now() WHERE id = $1`, [userId]);
     // P3 PR②b B2（docs/design/conversation-state.md §6）：**停止正文双写**——`messages` 降级为纯锚点行。
     // `content` 恒写空串：用户输入的文本真相已由下方 `appendUserInputTurn` 落在 `transcript_rounds`，
     // 读侧（`session-view.js` / `session-text.js`）一律从官方投影取文，本列对**新行**不再有语义。

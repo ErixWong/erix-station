@@ -51,6 +51,14 @@ const safeUser = (row) => ({
   status: row.status,
   totp_enabled: Boolean(row.totp_enabled),
   last_login_at: row.last_login_at instanceof Date ? row.last_login_at.toISOString() : row.last_login_at ?? null,
+  // issue #497（工单 feat-261112-01，迁移 0031）：「最近一次用户输入」——与 `last_login_at`（最近一次登录）
+  // 是**两条独立时间线**：本列只由 `sessions.js#postMessage` 与 `queued-inputs.js#enqueueQueuedInput` 写，
+  // 所以它**允许比 `last_login_at` 旧**（登录了但一句话没说）。形状与上一行刻意同形：两侧都可能是
+  // `Date`（真驱动）/ ISO 串（旧驱动与 fake）/ `null`（从未活动）——新开户与从未发言的账号就该是 `null`，
+  // 界面上「从未活动」与「从未登录」是两个措辞（`docs/api/portal.md` §12）。
+  last_activity_at: row.last_activity_at instanceof Date
+    ? row.last_activity_at.toISOString()
+    : row.last_activity_at ?? null,
   created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
   onboarding: row.onboarding_state
     ? onboardingStatus({
@@ -102,6 +110,8 @@ export async function listUsers(pool) {
             users.role, users.fde_name,
             users.auth_source, users.status, users.created_at,
             (users.totp_secret IS NOT NULL) AS totp_enabled,
+            -- issue #497：本列就在 users 表上，直接选它（不像 last_login_at 那样要从 login_sessions 聚合）
+            users.last_activity_at,
             sessions.last_login_at,
             (SELECT git_host_id FROM fde_git_accounts a WHERE a.fde_id = users.id) AS git_host_id,
             onboarding.state AS onboarding_state, onboarding.steps AS onboarding_steps,
@@ -288,7 +298,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
                 must_change_password = true, file_upload_enabled = false
           WHERE id = $1 AND status = 'disabled'
           RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at, file_upload_enabled,
-                    totp_login_enabled,
+                    totp_login_enabled, last_activity_at,
                     (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           existing.id, trimmedLogin, trimmedEmail,
@@ -312,7 +322,7 @@ export async function createUser(pool, { actorId = null, login, display_name, pa
       r = await pool.query(
         `INSERT INTO users (login, email, display_name, role, auth_source, status, password_hash, totp_secret, fde_name, must_change_password)
          VALUES ($1, $2, $3, 'fde', 'local', 'active', $4, $5, $6, true)
-         RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at,
+         RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at, last_activity_at,
                    (totp_secret IS NOT NULL) AS totp_enabled`,
         [
           trimmedLogin, trimmedEmail,
@@ -494,7 +504,7 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
       `WITH updated AS (
          UPDATE users SET ${assignments.join(', ')}
           WHERE id = $1 ${offboardingGuard}
-          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at,
+          RETURNING id, login, display_name, email, mail_otp_enabled, file_upload_enabled, totp_login_enabled, role, fde_name, auth_source, status, created_at, last_activity_at,
                     (totp_secret IS NOT NULL) AS totp_enabled
        ), revoked AS (
          UPDATE login_sessions SET revoked_at = now()
@@ -503,6 +513,10 @@ export async function updateUser(pool, userId, updates, { actorId = null } = {})
             AND EXISTS (SELECT 1 FROM updated WHERE status = 'disabled')
           RETURNING id
        )
+       -- issue #497：last_activity_at 已在上面 RETURNING 的列清单里（它是 users 的真列 ⇒ 拿真实值）。
+       -- 这里不许再补 NULL::timestamptz AS last_activity_at：同名列会赢过真值
+       --   （node-pg 里重复列名后者覆盖前者）⇒ DTO 永远报「从未活动」，而库里明明存着时刻。
+       --   last_login_at 必须继续写 NULL：它不是列，是 listUsers 里从 login_sessions 聚合出来的派生量。
        SELECT updated.*, NULL::timestamptz AS last_login_at FROM updated`,
       params,
     );
@@ -759,7 +773,7 @@ export async function enrollUserTotp(pool, userId, { actorId = null, totpIssuer 
        UPDATE users SET totp_secret = $2, last_totp_step = NULL
         WHERE id = $1
         RETURNING id, login, display_name, role, fde_name, auth_source, status, created_at, file_upload_enabled,
-                  totp_login_enabled,
+                  totp_login_enabled, last_activity_at,
                   (totp_secret IS NOT NULL) AS totp_enabled
      ), revoked AS (
        UPDATE login_sessions SET revoked_at = now()
@@ -767,6 +781,8 @@ export async function enrollUserTotp(pool, userId, { actorId = null, totpIssuer 
           AND revoked_at IS NULL
         RETURNING id
      )
+     -- issue #497：同 updateUser——真列在 RETURNING 里拿，NULL 补位只留给派生量 last_login_at。
+     -- 写成 NULL::timestamptz AS last_activity_at 会把真值覆盖成「从未活动」（重绑不该改活动时间）。
      SELECT target.*, NULL::timestamptz AS last_login_at FROM target`,
     [userId, totpSecret],
   );
