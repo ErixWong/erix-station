@@ -38,7 +38,7 @@ DDL 全局约定（schema.sql 头部亦有注）：
 | 用量与审计 | `usage_ledger` / `audit_log` | 规格 §11.4 / §14 |
 | 任务队列 | `run_queue`（含租约字段） | runner-integration §4.2/§6（拉模型，claim 长轮询） |
 | 网络与 IPAM | `fde_networks` | topology.md §3（H-B D-10） |
-| LLM 配置 | `fde_llm_bindings`（模型目录与上游凭据归 LiteLLM；旧 `llm_providers` / `llm_models` 于 migration 0010 改名为 `_retired`） | issue #117 phase 2 |
+| LLM 配置 | `fde_llm_bindings`（模型目录与上游凭据归 LiteLLM；旧 `llm_providers` / `llm_models` 于 migration 0010 改名为 `_retired`，**已由 migration 0032 撤除**——库里不再有这两张表，旧目录只能从 dump 恢复） | issue #117 phase 2 / #503 |
 | Git host 配置 | `git_hosts` / `fde_git_accounts`（migration 0011） | issue #118（多 Git host、按 host 能力选择代铸或逐 FDE 凭据） |
 | 用户下线 | `fde_offboarding`（migration 0013） | 规格 §7.3 / issue #110 |
 | 用户空间物化 | `materialize_outbox` / `materialize_revisions` | user-space.md §7.1（A7 定稿） |
@@ -256,7 +256,9 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 | `main_model_id` / `embedding_model_id` / `vision_model_id` | LiteLLM `model_info.id` 字符串（`text`，无外键）；`main` 必须是未 block、支持 `tool_calling` 的文本模型，由应用层校验 |
 | `main_model_name` / `embedding_model_name` / `vision_model_name` | 对应 LiteLLM `model_name`（数据面请求体使用的别名）；与 `model_info.id` 分开保存，因为二者不是同一标识 |
 
-**凭据边界（issue #117 phase 2）**：上游 API key 与 `api_base` 由 LiteLLM credential 管理；Station 只存 LiteLLM 虚拟 key，不把上游明文复制进自身 DB。虚拟 key 只由 portal 用于 Traefik 动态配置（文件 mode 600），容器不持有；管理 API 回显掩码，日志/审计/错误信息不含 key。`llm_providers` 与 `llm_models` 在 migration 0010 中改名为 `llm_providers_retired` / `llm_models_retired` 留作回滚与人工核对；待所有部署不再读取旧表后，由后续迁移 DROP。
+**凭据边界（issue #117 phase 2）**：上游 API key 与 `api_base` 由 LiteLLM credential 管理；Station 只存 LiteLLM 虚拟 key，不把上游明文复制进自身 DB。虚拟 key 只由 portal 用于 Traefik 动态配置（文件 mode 600），容器不持有；管理 API 回显掩码，日志/审计/错误信息不含 key。`llm_providers` 与 `llm_models` 在 migration 0010 中改名为 `llm_providers_retired` / `llm_models_retired` 留作回滚与人工核对；**这两张退役表已由 migration `0032` 撤除（issue #503）**，口径见下一段。
+
+**已撤的退役表（migration `0032`，issue #503）**：`llm_models_retired` / `llm_providers_retired`（0002 建为 `llm_models` / `llm_providers`，0010 改名保留）与 `transcript_rounds_shape4_bak_20261027`（2026-10-27 shape4 修数据的手工备份夹具，**不在任何迁移里**，见 `docs/ops/transcript-ledger-inspection.md` §7）三张表已由 `0032-drop-retired-tables.sql` 撤除。**代码零引用**（`grep -rn "llm_providers_retired\|llm_models_retired\|shape4_bak" portal runner scripts` 只命中 `portal/test/migrations.test.js` 里断言 **0010 文件文本** 的两条）+ **DB 零访问**（PG 自己记的 `last_idx_scan` 停在 0010 改名那天）两条判据都成立才撤；后者是**每库自己的**统计，其它部署撤前自己跑一遍（SQL 在迁移头注释里）。⚠ **这是单向门**：撤后「重放 0010 那条 `RENAME` 把旧目录要回来」这条路就没了，旧供应商行 / 模型目录行 / shape4 那次的 `record_before` 原件**只能从 dump 恢复** ⇒ 撤前必须 `pg_dump` 这三张表并落到部署记录。读侧无影响：模型目录的真相在 LiteLLM，本表只存 `model_info.id` / `model_name` / 虚拟 key（无外键）。
 
 **运行中变更守卫**：`PUT /api/admin/fdes/:name/llm` 在活跃 run（queued/running/cancelling）期间若改变 credential 或任一模型槽（该槽变化会轮换 LiteLLM key 白名单），返回 `409 active_run_conflict`；管理员显式传 `force: true` 才放行。相同 binding 为幂等重试，不重复铸 key 或写 outbox。上游 API key 不能经 FDE binding API 提交，需在 LiteLLM credential 管理入口更新。
 
