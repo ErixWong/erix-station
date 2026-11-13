@@ -142,10 +142,17 @@ test('STORE_METHODS：0.14.0 必需/可选契约与 status 读接口在 IPC 白�
 });
 
 // 上游契约套件（transcriptStoreContract 会注册多个 node:test 用例）。
+// 第三个参数是**诚实申报**（erix-agent 0.30.0 上游 #739 把「可选」做实，#499 升级片把本站的申报补齐）：
+//   · `runSnapshot`（`saveRunSnapshot` + `loadLatestRunSnapshot`）、`runState`（`saveRunState` +
+//     `loadRunState` + `markRunState`）、`runStateStatus`（`loadRunStateStatus`）——本站这三组**真实现**
+//     （`runner/lib/store.js` + peer 桩后的 portal internal 端点），所以申报出来：实现被删时套件当场红，
+//     而不是被成对守卫当「宿主本来就没选这个能力」静默跳过；
+//   · `rawRows`（`loadRawRows`）与 `fastPathProbes`（`loadByDedupKey` + `loadMaxRound`）**本站没有**
+//     ⇒ 一个都不报（报半组会被「声明了却没整组实现」当场判红，见 #501：补上 `loadRawRows` 那天再加）。
 transcriptStoreContract('station-ipc-store', async () => {
   const peer = createFakeAgentdPeer();
   return makeStore('contract-run', { request: (method, args) => peer.handle(method, args) });
-});
+}, { optionalCapabilities: ['runSnapshot', 'runState', 'runStateStatus'] });
 
 test('station-ipc-store：agentd 写入失败向上抛（IPC error 透传，fail-closed 语义）', async () => {
   const peer = createFakeAgentdPeer();
