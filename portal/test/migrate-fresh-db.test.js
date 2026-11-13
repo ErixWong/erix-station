@@ -267,3 +267,93 @@ test('迁移角色无权限承担 DDL 属主 ⇒ fail fast 报可操作错误（
     }
   });
 });
+
+// issue #503 / 工单 fix-261113-01：迁移 0032 撤三张退役/备份表（`llm_models_retired`、`llm_providers_retired`、
+// `transcript_rounds_shape4_bak_20261027`）。静态断言（migrations.test.js）只看文件写了什么；**只有真库能证明
+// 下面这四件事**，所以它们全在这里：
+//   ① 全新库（baseline → 全部增量）**跑得到 head**——第三张表是 261027 手工建的夹具、不在任何迁移里，
+//      全新库里根本没有它 ⇒ 谁把 `IF EXISTS` 写成裸 `DROP TABLE`，新库首次起栈就当场炸（`MIGRATE_ON_START=1`）；
+//   ② 三张表**撤完确实不存在**（不是「以为撤了」）；
+//   ③ **重放 rc=0**：在已经撤过表的库上把 0032 整文件再跑一遍必须不报错——这是 `IF EXISTS` 的语义证明，
+//      不是形式（README「单文件约定」要求每个迁移可整体重放）；
+//   ④ **外键那颗雷是真的**：照 0002 + 0010 复现一次改名现场 ⇒ 约束名仍是 `llm_models_provider_id_fkey`
+//      （PG 改名不连带重命名约束），且**先撤父表**必然 2BP01、**先撤子表**才过得去。
+//      ⇒ 「`llm_models_retired` 必须排在 `llm_providers_retired` 之前」不是洁癖，是顺序错了就红。
+test('0032 撤退役/备份表：全新库跑到 head、三张表确实不在、重放 rc=0、外键顺序反过来会炸（2BP01）', { skip: SKIP }, async () => {
+  const MIG0032 = fs.readFileSync(
+    path.join(HERE, '../../deploy/migrations/0032-drop-retired-tables.sql'), 'utf8');
+  const RETIRED = ['llm_models_retired', 'llm_providers_retired', 'transcript_rounds_shape4_bak_20261027'];
+
+  await withFreshDatabase(async (database) => {
+    const pool = createPool(dbUrl(database), { max: 1 });
+    try {
+      // ① 全新库一路到 head（含 0032）。第三张表不存在 ⇒ 这一步本身就是「IF EXISTS 有没有漏」的判据。
+      await migrate(pool, { env: { DATABASE_URL: dbUrl(database) }, log: { log: () => {} } });
+      const ledger = await pool.query(`SELECT version FROM schema_migrations ORDER BY version`);
+      assert.ok(
+        ledger.rows.some((r) => r.version === '0032-drop-retired-tables'),
+        '台账必须有 0032（迁移 runner 真的应用了它，而不是只躺在目录里）',
+      );
+      assert.equal(ledger.rows.length, computeExpectedVersions().length, '台账 = baseline + 全部增量，head 就是最后一个文件');
+
+      // ② 三张表都不在（用 to_regclass：不存在返回 NULL，不会因缺表而报错）。
+      for (const t of RETIRED) {
+        const r = await pool.query('SELECT to_regclass($1) AS reg', [t]);
+        assert.equal(r.rows[0].reg, null, `0032 之后 ${t} 必须已不存在（全新库里也一样撤得掉/本来就没有）`);
+      }
+
+      // ③ 重放：库已经撤干净，再整文件跑一遍必须 rc=0（不报错 = IF EXISTS 生效）。
+      await pool.query(MIG0032);
+      for (const t of RETIRED) {
+        const r = await pool.query('SELECT to_regclass($1) AS reg', [t]);
+        assert.equal(r.rows[0].reg, null, `重放 0032 不得报错，也不得凭空长出 ${t}`);
+      }
+
+      // ③′ 反向自证：同样的第三句去掉 IF EXISTS，在**全新库**上必须炸（42P01）。
+      //     这条就是「为什么不许写裸 DROP」的读数，而不是留在注释里的一句相信。
+      const bare = await pool
+        .query('DROP TABLE transcript_rounds_shape4_bak_20261027')
+        .then(() => null, (e) => e);
+      assert.ok(bare, '裸 DROP 一张不存在的表必须报错（否则 ③′ 什么都没证明）');
+      assert.equal(bare.code, '42P01', `裸 DROP 缺表应是 42P01，实得 ${bare.code}`);
+
+      // ④ 复现 0010 的改名现场：0002 的两张原始表 + 0010 的两条 RENAME（逐字取自那两个迁移文件）。
+      const m0002 = fs.readFileSync(path.join(HERE, '../../deploy/migrations/0002-llm-config.sql'), 'utf8');
+      const m0010 = fs.readFileSync(path.join(HERE, '../../deploy/migrations/0010-litellm-bindings.sql'), 'utf8');
+      const stmtOf = (sql, re, label) => {
+        const m = re.exec(sql);
+        assert.ok(m, `迁移文件里应能找到 ${label}`);
+        return m[0];
+      };
+      await pool.query(stmtOf(m0002, /CREATE TABLE IF NOT EXISTS llm_providers \([\s\S]*?\n\);/, '0002 建 llm_providers'));
+      await pool.query(stmtOf(m0002, /CREATE TABLE IF NOT EXISTS llm_models \([\s\S]*?\n\);/, '0002 建 llm_models'));
+      await pool.query(stmtOf(m0010, /ALTER TABLE IF EXISTS llm_providers RENAME TO llm_providers_retired;/, '0010 改名 providers'));
+      await pool.query(stmtOf(m0010, /ALTER TABLE IF EXISTS llm_models RENAME TO llm_models_retired;/, '0010 改名 models'));
+
+      // 约束名跟着 child 的**旧表名**（PG 的 RENAME TABLE 不重命名约束）⇒ 0032 头注释里点的那个名字是事实。
+      const fk = await pool.query(
+        `SELECT con.conname, child.relname AS child, parent.relname AS parent
+           FROM pg_constraint con
+           JOIN pg_class child  ON child.oid  = con.conrelid
+           JOIN pg_class parent ON parent.oid = con.confrelid
+          WHERE con.contype = 'f' AND child.relname = 'llm_models_retired'`,
+      );
+      assert.equal(fk.rows.length, 1, '改名后外键必须还在（它才是决定删除顺序的那个对象）');
+      assert.equal(fk.rows[0].conname, 'llm_models_provider_id_fkey', '约束名仍是旧表名那一套（0032 头注释点名的就是它）');
+      assert.equal(fk.rows[0].parent, 'llm_providers_retired', 'parent 是 llm_providers_retired ⇒ 它必须后撤');
+
+      // 反着来：先撤父表 ⇒ 必然被依赖挡住（2BP01）。这就是 migrations.test.js 那条 indexOf 顺序断言的真库依据。
+      const wrong = await pool.query('DROP TABLE IF EXISTS llm_providers_retired').then(() => null, (e) => e);
+      assert.ok(wrong, '先撤父表必须失败（否则删除顺序这条断言是空的）');
+      assert.equal(wrong.code, '2BP01', `先撤父表应是 dependent_objects_still_exist（2BP01），实得 ${wrong.code}`);
+
+      // 顺着来：子表先撤，然后父表，两句都过得去 ⇒ 0032 的语句顺序在真库里成立。
+      await pool.query('DROP TABLE IF EXISTS llm_models_retired');
+      await pool.query('DROP TABLE IF EXISTS llm_providers_retired');
+      // 整文件重放仍然 rc=0（此刻三张表都不在）。
+      await pool.query(MIG0032);
+    } finally {
+      await pool.end();
+    }
+  });
+});
