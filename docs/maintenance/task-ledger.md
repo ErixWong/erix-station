@@ -4979,3 +4979,57 @@ dev 实测停在 0010 改名那天：`llm_models_retired 2026-10-03 09:53` / `ll
 2. **用户可见变化**：每条 run 的时间线会固定多 **2 条** `persistence_capability_degraded`
    （`clearRecoveryRows` + `appendRecoveryRow`，本站没实现恢复行三件套 ⇒ A/B 实测 0.31 是 0 条）。
    消解在 **#500**；#500 做完这 2 条应归零，那一单可以拿这个当收尾判据。
+
+### 8.124 数据库形态审计：9,467 万事务服务 251 条事件，另四条形态债并进 #502（261113，主 agent 现查 + 用户同意按建议处理）
+
+**触发**：用户问「还有什么表结构或用法是**这样荒诞**」（指 #502 那种「一个 token 一行」）。
+判据：**每条必须带当下读数 + 代码 `file:line`**，凭印象的一律标「待核」。全文落
+`.work-orders/db-shape-audit-261113.md`（含 §0 底座事实表）。
+
+**底座**：全库 513 MB；`pg_stat_database.xact_commit` = **94,676,544**（统计窗口 = postmaster
+启动至今 **4 天 09:57** ⇒ 均值 236 事务/秒）。**空闲态我自己开了 30s 窗口实测**（没开浏览器、
+没跑 run）：**24.1 事务/秒、77.2 次表读/秒**，其中 `materialize_outbox` 19.7 次/秒、
+`materialize_revisions` 19.7、`route_outbox` 19.5、`users` 4.0、`route_revisions` 3.9、
+`containers` 2.8、`fde_networks` 2.0。
+
+**单开一条 = #506（250 ms 空转轮询）**：`routes.js:943` / `materializer.js:711` 都固定
+`sleep(250)` 且**空闲不退避**（`BACKOFF_MS` 只服务异常分支）；每 tick 无条件跑
+`recover*Orphans()` + `claim*Rows()`（`BEGIN`/2×`UPDATE`/`COMMIT`）。
+`route_outbox` idx_scan **69,059,872** + seq_scan **14,176,695**，而它**一生只插入过 251 行**；
+`route_revisions` seq_scan **12,115,607** / idx_scan **353**（join 没走索引）；
+`materialize_outbox` `seq_tup_read` **1,140,747,071**。全库**无 `LISTEN`/`NOTIFY`**。
+⚠ 那 4.0 次/秒的 `users`、2.8 次/秒的 `containers` 我**没定位到语句**（只排除了 agentd
+heartbeat：`ERIX_HEARTBEAT_MS` 默认 15000）⇒ 写进单里当**开工第一步**，不许直接优化没定位的东西。
+
+**四条并进 #502（不单开迁移）**：① 幂等 `SELECT`+`INSERT` 同一唯一约束查两遍
+（`internal.js:947` → `:951`，该索引 idx_scan 1,774,021）；② `run_events` 5 个索引里 3 个
+基本没人读（`id uuid` 主键 35 MB / **5 次**、`session_id_seq_key` 63 MB / **383 次**）
+= **98 MB 为几乎不发生的查询常付写代价**；③ `client_event_id` **884,163/884,163** 行的前缀
+都等于同行 `run_id::text`（平均 43.2 B/行 vs 同行 uuid 16 B）⇒ 换键=改唯一约束=迁移，
+必须与清 delta **同一张迁移**定形；④ 体积闸扩到 `run_checkpoints`（85 行 / 4,536 kB =
+**53 kB/行**，快照整包 JSONB ⇒ 0.32 的瘦身只减新写键，旧行不动）。
+**顺序写死**：先停 delta 落库 → 清存量 → `VACUUM` 前后对账 → **然后**才谈换键/删索引。
+
+**撤回自己一条**：我先前说「`messages.content` 两处写入语义不一致」**是错的**——
+`docs/data/model.md:134` 早就写明本表降级为纯锚点行、`content` 只服务 `synthetic=true`
+注入行与 0015 前 legacy 老行。现查反而**印证**了该口径（297/391 空，非空 94 行全在
+09-21…09-25，10-08 之后一律空串）。但量出一条**未证事实**并已写进 model.md：
+`synthetic = true` 的行在本 dev 库 **0 行** ⇒ 「注入行正文只能落本列」这半条**从未被真机数据
+证明**，改写入点/改 UI 前不许当已验证前提。
+
+**防过火的反查（值得记）**：`idx_scan = 0` **不等于**废索引 —— `tool_calls_pkey`（88 kB / 0 次）
+被 `approvals_run_id_tool_call_id_fkey` 引用，FK 检查要用被引用表的唯一索引，
+0 只说明写审批极少。⇒ 动索引前必须逐条查 `pg_constraint.confrelid`，只看 `idx_scan` 会误杀。
+
+**同日 git 实况**：#504（迁移 0032）与 #505（引擎 0.32.0）都已 merge-commit 进 main 并删远端分支；
+main CI 两个 merge commit 都 success。dev 库现查 `schema_migrations` 仍停在 `0031`（0032 随
+portal 换新镜像时自动应用，**没有手工补跑**）；**未打 tag、未重打镜像、未动 `fde-*`** ——
+发版窗口留给用户，命令面已给出。
+
+**踩到并已复现的一条口径（本次新实例）**：合并后在**主树**跑门禁，先 `fail 7` → 重装后 `fail 4` →
+两处都重装才 `fail 0`。成因不是回归，是 `node_modules` 里还装着 **0.31.0**：
+根 `node_modules/erix-agent` 与 **`runner/node_modules/erix-agent` 是两份独立安装**，
+只重装根的那份，runner 侧那 4 条（`llm-timeouts` 的 ②③）照红。⇒ 引擎 pin 一升级，
+主树必须**根与 runner 各重装一次**再谈基线数（`node -p "require('./runner/node_modules/erix-agent/package.json').version"`
+现查，别看 `package.json`）。重装后主树基线：根 `2164 tests / 2159 pass / 0 fail / 5 skipped` rc=0、
+runner `507 / 507` rc=0、前端 `1322 passed` rc=0 + `vue-tsc` rc=0。
