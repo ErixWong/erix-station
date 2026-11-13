@@ -4934,3 +4934,48 @@ dev 实测停在 0010 改名那天：`llm_models_retired 2026-10-03 09:53` / `ll
 **遗留**：① 本机的 dev 库 `station-db` **还没撤**（本单只交迁移，不改现存库——`MIGRATE_ON_START=1` 会在下次起 portal 时应用）；
 ② `deploy/migrations/README.md` 末尾「现状：增量迁移已包含 0001 至 …」那段本来就漂着（停在 0026，后面还倒叙回 0021），
 本单没碰它——那是另一条口径（README 的迁移摘要该不该改成「只写最新一条 + 指回目录」），别顺手改。
+### 8.123 引擎 0.31.0 → 0.32.0：三处版本线闸八度核 + 第 28 类事件的决定（issue #499 / 工单 feat-261113-01，2026-11-13，worker 落地 + 主 agent 接手收尾并独立复验）
+
+**先记一条我自己的错**：`#499` 开单时写着「npm 没发（latest=0.31.0 / `@0.32.0` E404 / 无 tag）」，
+那是 **11-12 17:41 的现查**，而上游 14:10 才合并发布 PR、**17:45 才回写发布态**、publish 在那之后十几分钟。
+错不在查错，在于**跨轮把昨天的读数当今天的事实**用了。11-13 现查：`dist-tags.latest = 0.32.0`、
+上游 tag `v0.32.0` = `3e56565`、发布包 sha256 `d246604b…92bf2` 与我做 A/B 探针用的那份包
+**`diff -rq` 零差异** ⇒ 探针的全部实测对发布包直接成立，不必重跑。
+
+**流程实况**：worker 那次 run **撞了 30 分钟超时**被判 failed，但活基本落完（15 个文件改动、
+两处 pin 已是 `0.32.0`、常量已追号、事件决定已写），只差**没 commit、没写本条台账**。
+接手前我先 `git status` + 现查三处常量，确认不是「半截状态」才继续 —— **超时 ≠ 活没干完，别急着重跑**。
+
+**复核（主 agent 自己独立跑，不抄 worker 的注释）**：
+
+| 判据 | 我实测的 |
+|---|---|
+| `diff -u` 两份包的 `src/loop/termination.js` | **无输出**（逐字节相同）⇒ `termination.reason` 值域零变化 |
+| `diff -rq` 两份包的 `src/providers` | 只差 **4 个文件**（`openai.js` / `openai.d.ts` / `payload.js` / `payload.d.ts`） |
+| `diff -q` `timeout.js` / `errors.js` / `anthropic.js` | 三个都 **rc=0**（逐字节相同）⇒ 四相超时语义、可重试码面一字未变 |
+| `resolveProviderTimeouts` 函数体两版对拼 | **无输出** ⇒ 本版 providers 的改动全是 #785 的 `sentRequestParams` 观测加法 |
+| 导出面（在**装着的** 0.32.0 上运行时实测） | `.` 入口 **96**、`./tools` **46**；新增的 11 个全是事件分级/run 终态面 |
+| 16 个零消费者名字在场情况 | 抽查 6 个：只有 `createOpenAIProvider` 在场，而它**不在这 16 个名单里** ⇒ Z3「一个都不在」照旧成立 |
+
+**两处决定**：① 第 28 类 `host_steer_injected`（0.32.0 唯一新增的 `LoopEvent`，27→28、删 0）
+**订得到、不刷行、不回放** —— 引擎只在 `capabilities.hooks.nextUserTurn` 是函数时才发它
+（`orchestrator.js:3253` 早退），本站不传那个钩子（`grep -rn "hooks\s*:" portal runner` = 0 命中）
+⇒ 结构上不产生；理由写进 `portal/test/event-surface-contract.test.js` 的豁免表（只加前端
+`EVENT_TYPES` 不写决定，S2 就是为治这个而存在）。② 契约申报诚实化：
+`runner/test/store-contract.test.js:155` 补 `optionalCapabilities: ['runSnapshot','runState','runStateStatus']`
+—— 本站只这三组真实现，`rawRows` / `fastPathProbes` **没实现就不声明**。
+
+**门禁（主 agent 在本 worktree 亲跑，只看退出码）**：根 `npm test` rc=**0**
+（`2162 tests / 2158 pass / 0 fail / 4 skipped`）；`node --test 'runner/test/*.test.js'` rc=**0**
+（`507 / 507`）；前端 `npm test` rc=**0**（`1322 passed`）+ `npm run typecheck`（`vue-tsc --noEmit`）rc=**0**；
+`npm run check:agents-hotlayer` 在**主树**跑 ok（18633/19456、引用 529、地板 529、台账 121 条无重号）。
+
+**遗留（两条都承重）**：
+
+1. **发版红线**：引擎 pin 变 ⇒ `runner/package-lock.json` 变 ⇒ **FDE 镜像变** ⇒ 合并后必须重打 tag、
+   改 `deploy/.env` 三 pin、**`docker rm -f` 全部 `fde-*`** 让 reconcile 重建，并在容器内现查
+   `build-info.json` 的 `engine_version` == `0.32.0`。「`git diff -- runner/**/*.js` 为空」
+   **不代表**镜像没变（§8.90 那条坑，本次最容易再踩一次）。
+2. **用户可见变化**：每条 run 的时间线会固定多 **2 条** `persistence_capability_degraded`
+   （`clearRecoveryRows` + `appendRecoveryRow`，本站没实现恢复行三件套 ⇒ A/B 实测 0.31 是 0 条）。
+   消解在 **#500**；#500 做完这 2 条应归零，那一单可以拿这个当收尾判据。

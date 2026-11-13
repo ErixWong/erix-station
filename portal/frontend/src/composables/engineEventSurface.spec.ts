@@ -29,11 +29,15 @@ const DIAGNOSTIC_EVENTS = [
  * `portal/test/event-surface-contract.test.js` 的豁免表里；这里只钉「决定真的被执行了」（订了 + 不刷行）。
  * #442 把 0.30.0 新增的 5 类（`tool_output_aggregate` / `continuity_written` /
  * `continuity_write_failed` / `final_guard_extend` / `context_unknown_option`）也钉进这张表。
+ * #499（0.32.0，27 类 → 28 类）把唯一的新类型 `host_steer_injected` 钉进来：本站不传
+ * `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生，订得到但不刷行也不回放。
  */
 const EXEMPT_EVENTS = [
   'run_outcome', 'config_override_conflict', 'continuity_injection_skipped',
   'tool_output_aggregate', 'continuity_written', 'continuity_write_failed',
   'final_guard_extend', 'context_unknown_option',
+  // issue #499（erix-agent 0.32.0）：运行中注入 user 轮的事实（载荷 `round` / `chars`）。
+  'host_steer_injected',
 ];
 
 class FakeEventSource {

@@ -13,6 +13,10 @@
 // 写入侧不过白名单（`internal.js` 直接 `INSERT INTO run_events`），所以「库里没这条」永远不是借口：
 // 漏接的事件只是躺在表里没人读。
 //
+// ⚠ 0.32.0（#499）：`LoopEvent` 联合类型 **27 类 → 28 类**（只多 `host_steer_injected`，删 0）。
+// 它的逐类决定在下面的 `EXEMPT_FROM_TIMELINE` 里（订得到、不刷行、不回放）——只加前端 `EVENT_TYPES`
+// 不在这里写决定，S2 就是为治这个而存在的。
+//
 // ⚠ #438 切片 B 改的是**这份清单的来源**：`ENGINE_PROMISED_EVENTS` 不再手抄（手抄清单就是本片
 // 要治的病灶 —— 0.29.0 把联合类型从 16 类长到 19 类，手抄那份**不会自己红**），而是从**已安装引擎
 // 源码**里解析 `LoopEvent` 的 `@property` 联合类型。解析不到 ⇒ `t.skip` 并写明原因（不许退化成
@@ -126,6 +130,14 @@ const ENGINE_UNPROMISED_EVENTS = [];
  *   载荷带 `action` / `reason` / `budgetTokens` / `inlineTokens` / `projectedTokens`）。**不刷行**的理由：
  *   被归档/stub 化的结果**正文本身就在工具卡片里可见**（模型看到的就是那段 stub 文字），时间线再加一行
  *   是同一件事说两遍；而它每轮可以多条 ⇒ 重型 run 会刷屏。账在 runner 的 info LOG。
+ * · `host_steer_injected`（0.32.0 新增，#499）：运行中「转向」被注入成一条 user 轮的事实
+ *   （载荷 `round` / `chars`，发射点 0.32.0 `orchestrator.js:3300`）。本站不传
+ *   `capabilities.hooks.nextUserTurn`（现查：`grep -rn "hooks\s*:" portal runner | grep -v node_modules`
+ *   = 0 命中，唯一命中的是 `useEventStream.ts:510` 那个同名前端参数），而引擎在钩子不是函数时
+ *   直接早退（`orchestrator.js:3253`）⇒ **结构上不产生该事件**，同 `run_outcome` /
+ *   `continuity_injection_skipped` 先例：订得到（水位线与 `hooks.onEvent` 观察面拿得到），
+ *   但不进回放、不进后端下发。真开了 `nextUserTurn` 那天要重看这条决定（用户可见的反馈已在
+ *   `queue_update`（#370）与注入后的正文里，所以即使真响了也不刷行仍是可接受口径）。
  */
 const EXEMPT_FROM_TIMELINE = {
   run_outcome: '与 run_end 语义重叠且今天无读者；0.29/0.30 下重叠关系未变（见上）',
@@ -136,6 +148,8 @@ const EXEMPT_FROM_TIMELINE = {
   final_guard_extend: 'guard 专属（两个发射点都在 guard 裁决后的扩轮路径）；本站不传 finalGuard ⇒ 结构上不产生',
   context_unknown_option: '唯一发射点在 createAssemblyPort，本站从不走装配口 ⇒ 结构上不产生；账在 runner warn LOG',
   tool_output_aggregate: 'stub 正文已在工具卡片里可见（重复），且每轮可多条 ⇒ 不刷行；账在 runner info LOG',
+  // issue #499（erix-agent 0.32.0）：本站不传 nextUserTurn 钩子 ⇒ 结构上不产生（上面那段是完整版理由）。
+  host_steer_injected: '本站不传 capabilities.hooks.nextUserTurn（引擎钩子不是函数就早退）⇒ 结构上不产生；不进回放也不下发',
 };
 
 /** 引擎真发、本站**故意不订**的事件（不进 `EVENT_TYPES`）。0.30.0 起**为空**。 */

@@ -155,6 +155,22 @@ test('runner 运行时镜像与前端码集、文档 §6.4 锚点逐项一致；
 });
 
 test('引擎源码交叉核对（升级 erix-agent 时的 tripwire）', async () => {
+  // 本文件**自己不带版本常量**：版本单一真相是 `terminationReasons.ts` 的
+  // `ENGINE_VERSION_FOR_TERMINATION_REASONS`（下面第一句断言就是把它与装着的包、两处 pin 对账）。
+  // 0.31.0 → **0.32.0**（#499 升级片）抬号时的复核现场（2026-11-13 本 worktree 现跑，两份包都是
+  // `npm pack` 解包 `/tmp/ea31/package` / `/tmp/ea32/package`）：
+  //   · `diff -u <0.31>/src/loop/termination.js <0.32>/src/loop/termination.js` **无输出**（rc=0）；
+  //   · 两份包各自取 `src/loop/termination.js` 的 reason 字面值（`grep -oE '\"(aborted|end_turn|failed|…)\"' | sort -u`）
+  //     两侧逐字相同（十个值）；
+  //   · 两份包的 `src/loop/orchestrator.js` 各跑一次本文件的 typedef 抽取正则：两侧都是同一组九值、
+  //     同一声明顺序（`end_turn,no_tool,stall,max_rounds_cap,judge_done,continuation_exhausted,
+  //     final_guard_unverified,aborted,failed`）；
+  //   · `diff -rq <0.31>/src/providers <0.32>/src/providers` 报四个文件，但 `timeout.js` / `errors.js` /
+  //     `anthropic.js` 逐字节相同，新增只有 #785 的实发参数观测（`payload.js` +74/-0 的
+  //     `observeSentReasoningParams` + `openai.js` 给响应挂 `sentRequestParams`）⇒ timeout / 可重试码零变更。
+  // ⇒ 本文件引用的**文档锚全部无需改动**：`docs/data/model.md` §1.7 与 `docs/api/portal.md` §4.1/§5.3
+  //   的 `<!-- DRIFT:termination-reason -->` 枚举（十值）、§6.4 的 `run-retryable-error-code` 枚举（五值）
+  //   在 0.32.0 上逐项仍与常量一致（由上面两条文档断言当场跑绿，不是口头承诺）。
   const engineEntry = import.meta.resolve('erix-agent'); // …/erix-agent/src/index.js
   const engineRoot = path.resolve(fileURLToPath(engineEntry), '..', '..');
   const pkg = JSON.parse(fs.readFileSync(path.join(engineRoot, 'package.json'), 'utf8'));
@@ -182,7 +198,9 @@ test('引擎源码交叉核对（升级 erix-agent 时的 tripwire）', async ()
   assert.match(orchestrator, /const reason = signal\?\.aborted/, 'fail() 的 reason 判定形状变了？复核透传口径');
   assert.match(orchestrator, /operation:\s*persistenceFailure\.operation/, '引擎不再挂 operation/phase/sideEffect？复核透传');
 
-  // 上游可重试码集（provider 层）
+  // 上游可重试码集（provider 层）。⚠ 0.32.0 复核（#499 升级片，2026-11-13 现查两份 `npm pack` 解包）：
+  // `diff -q <0.31>/src/providers/errors.js <0.32>/src/providers/errors.js` **rc=0**（逐字节相同）
+  // ⇒ `RETRYABLE_CODES` 仍是 `timeout` / `rate_limited` / `server` / `disconnect`，本断言一字未改。
   const errors = fs.readFileSync(path.join(engineRoot, 'src/providers/errors.js'), 'utf8');
   const upstream = /RETRYABLE_CODES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(errors);
   assert.ok(upstream, '上游 RETRYABLE_CODES 形状变了：复核 runner 的 retryable 判据');

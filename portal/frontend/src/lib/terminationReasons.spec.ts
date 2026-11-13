@@ -71,7 +71,17 @@ describe('termination reason 单一常量（issue #212）', () => {
     // 对 0.30.0 **无任何输出**（逐字节相同，比 0.30 那次更强）；`orchestrator.js` 的 typedef 仍是同一组
     // 九值、同一顺序；`src/providers/` 只有 `anthropic.js` 一行 `@deprecated` 注释差异 +
     // `anthropic.d.ts` 消失（工厂不再导出，实现仍在）⇒ 下面九值断言一字未改。
-    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.31.0');
+    // 0.31.0 → 0.32.0（#499 升级片）**八度核**，按 0.32.0 现查（2026-11-13 本 worktree，两份
+    // `npm pack` 解包逐字对比：`/tmp/ea31/package` vs `/tmp/ea32/package`）：
+    // `diff -u` 对 `src/loop/termination.js` 两侧**仍无任何输出**（rc=0）；reason 字面值集合
+    // `grep -oE … | sort -u` 两侧都是那十个值；`orchestrator.js` 的 typedef 取到的仍是同一组九值
+    // 同一顺序（`portal/test/termination-contract.test.js` 在装着的 0.32.0 上把它跑绿）；
+    // `src/providers/` 报四个文件（`payload.js` +74/-0 = #785 新增 `observeSentReasoningParams`，
+    // `payload.d.ts` +45/-0，`openai.js` +25/-1 = 给响应挂 `sentRequestParams`，`openai.d.ts` +2/-5 =
+    // 返回类型注记放宽），而 `timeout.js` / `errors.js` / `anthropic.js` `diff -q` **全部 rc=0**
+    // ⇒ 本版 providers 面只有「实发参数观测」这一族加法，零 timeout / 零可重试码变更
+    // ⇒ 下面九值断言一字未改（不放宽任何断言，§8.27 先例）。
+    expect(ENGINE_VERSION_FOR_TERMINATION_REASONS).toBe('0.32.0');
     for (const legacy of LEGACY_TERMINATION_REASONS) expect(TERMINATION_REASON_SET.has(legacy)).toBe(false);
   });
 
