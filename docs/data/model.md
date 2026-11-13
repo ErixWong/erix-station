@@ -133,6 +133,13 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 
 > **`content` 列语义（P3 PR②b B2，conversation-state.md §6）**：本表已降级为**纯锚点行**——两个写入点（POST 用户行 / 终态 assistant 行）的 `content` 恒写空串（列仍是 `text NOT NULL`，baseline `schema.sql` 冻结不改），正文单一来源是 `transcript_rounds.record`（UI 文本由官方展示投影派生）。因此 `content` **只对两类行有意义**：`synthetic = true` 的宿主注入行（judge/wrapup，transcript 里无对应轮次，正文只能落在本列）与迁移 0015/B2 之前的 **legacy 老行**（仅供 `portal/src/session-text.js` 的 legacy 兜底读）。上表「内容」列描述的仍是**人读层的语义归属**（本行代表哪段对话），而非正文的物理存储位置。
 
+> ⚠ **261113 现查补一条未证事实**（DB 形态审计，见 `#506` 与台账 §8.124）：本库 `messages`
+> 391 行里 `content` 空串 **297 行**，且**非空的 94 行全部落在 2026-09-21…09-25**，
+> 10-08 之后写入的行**一律空串** —— 与本段口径一致（正文在 `transcript_rounds.record`）。
+> 但 **`synthetic = true` 的行在本 dev 库 0 行**，所以「宿主注入行正文只能落本列」这半条
+> **至今没有任何真机数据证明它成立**。改写入点或改 UI 前别把它当已验证前提：要么补一条
+> 覆盖注入行的用例，要么在真机跑出一条 judge/wrapup 注入行再下结论。
+
 ### 1.9 `port_allocations` — 端口分配（DB 是真相，规格 §8.1）
 
 | 关键字段 | 语义 |
