@@ -19,7 +19,7 @@ import { hashToken } from './auth.js';
 import { enqueueRouteChange } from './outbox.js';
 import { provisionFdePreviewPorts } from './portalloc.js';
 import { allocSeq } from './seq.js';
-import { broadcastRevoke, drainQueueAfterRun } from './internal.js';
+import { broadcastRevoke, drainQueueAfterRun, insertPartialOutputRow } from './internal.js';
 import { revokeFdeLlmConfigTx, syncFdeLlmBindingOnOnboard } from './llm.js';
 import { removeGitCredentialFile, setGitCredential, platformCredentialPresent, migrateLegacyCredential } from './git-credential.js';
 import { mintGitAccount } from './git-mint.js';
@@ -1028,6 +1028,11 @@ async function terminateActiveRuns(pool, { userId, log = console } = {}) {
          ON CONFLICT (run_id, client_event_id) DO NOTHING`,
         [e.run_id, e.session_id, seq, `${e.run_id}:final:run_end`, JSON.stringify(payload)],
       );
+      // issue #502 D-3：**与合成 `run_end` 同一个小事务**补那一行碎片正文。offboard 的 run 完全可能
+      // 已经流式过一段正文（用户拔容器 / 管理员吊销时它正在回答），而这条路径从不写 assistant 锚点
+      // ⇒ 不接上它，界面就只剩一条「已中止」分隔行（§8.34 那条不许空白的红线）。
+      // 放这里而不是另开事务：本事务已经锁了 `chat_sessions` 那一行，`allocSeq` 零新增锁面。
+      await insertPartialOutputRow(c2, { runId: e.run_id, sessionId: e.session_id, runEndSeq: seq, log });
       await c2.query('COMMIT');
       events.push({ session_id: e.session_id, run_id: e.run_id, seq, payload });
     } catch (err) {

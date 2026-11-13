@@ -39,6 +39,13 @@ export const EVENT_TYPES = [
   // （不报错、不警告，只是界面上始织不会提“没重放”）；与下面的 HISTORY_REPLAY_TYPES 是**两个坑**。
   'tool_replay_decision_required',
   'tool_call_delta', 'judge', 'compaction', 'final_guard', 'forced_final',
+  // issue #502 D-6：`partial_output` **必须进本数组**，否则 EventSource 根本不订它 ⇒ D-5 那条
+  // 快照通路（断线重连补发的那段未完稿正文）实时永远收不到（本数组是 `addEventListener` 的唯一来源，
+  // #288/#371-A/#421 同一颗坑，已经踩过四次）。
+  // 它与 `run_end`/`session_updated` 不同类：它是**展示类**且**只覆盖正文气泡**，不驱动运行态状态机。
+  // 它**不进** `HISTORY_REPLAY_TYPES`：那一行由 `GET /events/history` 走 `addPartialOutput` 出
+  // 中性气泡（#300 既有通路），再进回放就是「刷新后两条正文」。
+  'partial_output',
   'run_end', 'session_updated', 'ping', 'resync', // issue #88：session_updated = 自动标题刷新（live-only，不落 run_events）
   // issue #371-A：引擎落盘失败告警（erix-agent#461 起带 `fatal`）。本数组是 EventSource 逐类型
   // `addEventListener` 的唯一来源，漏加就是**实时一条都收不到**（不报错不警告）；与下面
@@ -106,7 +113,18 @@ export { RUN_FAIL_REASONS };
 // 与后端 GET /api/sessions/:id/events/history 的下发白名单一致。运行态语义事件（run_end/usage/
 // 增量流等）不在其列：历史回放绝不驱动运行态状态机（停止按钮/run 状态/终态刷新）。
 const HISTORY_REPLAY_TYPES = new Set([
-  'tool_use', 'tool_result', 'tool_call_delta', 'judge',
+  // issue #502 D-6：`tool_call_delta` 从**回放集合**摘掉（三个碎片类型的处理逐个写在这里）：
+  //   ① `tool_call_delta`：本来在册，现摘。后端 `http.js` 的 `HISTORY_EVENT_TYPES` 同步摘掉它
+  //     （S4 要求两个集合逐项相等，只摘一边就红），而它也不再落库 ⇒ 留着是一个永不命中的分支。
+  //     **不丢信息**：工具入参的成型副本在 `tool_use.input`，卡片入参本来就取自那里
+  //     （#279：实时增量与后来的 `tool_use` 归并成同一张卡，摘掉回放不会少一张卡、也不会少入参）。
+  //   ② `assistant_delta`：**本来就不在册**（#300 起就不下发，避免与正文锚点重复），本单无需改动；
+  //     它的碎片现在也不落库了。
+  //   ③ `reasoning_delta`：同样**本来就不在册**；推理正文的成型副本在 `messages` 的 `reasoning`
+  //     投影字段（#188 的加载/刷新路径），不靠碎片回放。
+  // 三条的共同点：碎片是「成型副本的逐字前缀」，成型副本各有 durable 落点（`tool_use` /
+  // `round_end` / `messages` 锚点）⇒ 刷新后重建界面不欠它一条（这正是引擎把它判成 `stream` 档的意思）。
+  'tool_use', 'tool_result', 'judge',
   'round', 'round_start', 'round_end', 'attempt', 'recovering', 'recovered',
   'compaction', 'final_guard', 'forced_final',
   // issue #288（缺陷 B）：宿主在 release-requeue 分支合成的「attempt 被杀并重排」事件；
@@ -928,6 +946,26 @@ export function useEventStream(hooks: EventStreamHooks) {
         hooks.onSep(t('stream.event.recovering', { attempt: d.attempt, max: d.maxAttempts }));
         return;
       case 'recovered': hooks.onSep(t('stream.event.recovered')); return;
+      case 'partial_output': {
+        // issue #502 D-6：**覆盖式**赋值（不是 `+=`）。这一帧的语义是「当前这段未完稿正文的全量」，
+        // 而碎片 `assistant_delta` 的语义是「一片」。两个方向都必须成立（判据 4）：
+        //   · 重连后客户端已有半截 + 服务端快照更全 ⇒ 覆盖 ⇒ **不重复**；
+        //   · 断线期间流式过、客户端气泡已被 round_start/run_end 清空 ⇒ 覆盖 ⇒ **不空洞**。
+        // 前端只有**一个**流式气泡（`deltaText`，`round_start` 置 null）⇒ 覆盖与界面形状是一致的。
+        // 脏快照（`text` 缺键/不是字符串）不当成正文：清掉气泡直接返回（项目惯例：
+        // 脏数据不许渲染成 `[object Object]` / `undefined`，也不许把气泡撑成一个空格）。
+        const text = typeof d.text === 'string' ? d.text : null;
+        if (text === null) { deltaText.value = null; return; }
+        if (d.placeholder === true || text === '') {
+          // #278 底线：内存与库里都拿不到正文时不许留空白 ⇒ 清掉半截气泡，出一行**中性**提示
+          //（不是红色 `.syserr`：「正文没能恢复」不是错误；终态原因仍由 `run_end` 那条分隔行负责）。
+          deltaText.value = null;
+          hooks.onSep(t('stream.event.partialOutputLost'));
+          return;
+        }
+        deltaText.value = text;
+        return;
+      }
       case 'assistant_delta':
         if (deltaText.value === null) deltaText.value = '';
         deltaText.value += d.text ?? '';

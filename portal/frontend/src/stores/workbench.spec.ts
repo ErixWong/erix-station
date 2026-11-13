@@ -1780,6 +1780,23 @@ describe('issue #300：partial_output 归并成 kind:partial', () => {
     expect(en.sessionId).toBe('s1');
   });
 
+  it('#502 D-6：同一 run 的 partial 再进一次是**覆盖**（快照帧 → 历史那一行），不是第二条气泡', async () => {
+    // #502 之后同一 run 的「未完稿正文」有两个来源：SSE 快照帧（截到 `uptoSeq` 为止）与
+    // `GET /events/history` 的那一行（终态全量）。旧实现在 `renderedIds` 里已登记就直接 return
+    // ⇒ 后到的更完整那一份被丢掉，界面永远停在截断的那半截。现在按 `partial:<run_id>` 覆盖，条目数恒为 1。
+    mockFetch(partialHandler([]));
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.addPartialOutput(partialEvent({ text: '快照里的半截', chunks: 12, truncated: false }));
+    store.addPartialOutput(partialEvent({ text: '快照里的半截＋历史里的后半截', chunks: 40, truncated: true }));
+    const parts = store.entries.filter((e) => e.kind === 'partial');
+    expect(parts).toHaveLength(1);
+    const en = parts[0] as Extract<StreamEntry, { kind: 'partial' }>;
+    expect(en.id).toBe('partial:r-abort');
+    expect(en.text).toBe('快照里的半截＋历史里的后半截');
+    expect(en.truncated).toBe(true);
+  });
+
   it('红线：partial_output 绝不喂 es.replayEvent（喂了就是「实时一条 + 历史一条」重复）', async () => {
     mockFetch(partialHandler([partialEvent({ text: '半截', chunks: 3, truncated: true })]));
     const store = useWorkbenchStore();

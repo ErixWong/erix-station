@@ -289,6 +289,10 @@ export const en = {
     event: {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',
+      // issue #502 D-6: placeholder row shown when the reconnect snapshot could not recover the
+      // in-flight text (backend frame carries `source:'none'` + `placeholder:true`). Neutral separator,
+      // not an error: the terminal reason still comes from the `run_end` separator.
+      partialOutputLost: 'The streamed text from that disconnected stretch could not be recovered (no copy left server-side); the terminal state follows below.',
       attempt: 'round {round} · attempt {attempt}/{max}',
       // issue #288 (defect B): the worker was killed by the host and re-queued. Before this the user
       // only saw the same tool card light up 3 times and then a reason-less "attempts exhausted".
