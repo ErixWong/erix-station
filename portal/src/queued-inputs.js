@@ -145,6 +145,15 @@ export async function enqueueQueuedInput(pool, {
       [s.id, userId, safeKind, safeContent, JSON.stringify(safeAttachments ?? []),
         safeKind === 'steer' ? activeRunId : null],
     );
+    // issue #497（工单 feat-261112-01）：第二个写入点（全仓共两个，另一个是
+    // `sessions.js#postMessage`）。**运行中按回车那一刻就是活动**：这句话此刻已经落进 `queued_inputs`，
+    // 与它「稍后才被投递」无关——投递失败会把行退回 `pending` 等下次终态（见 `drainQueuedInputs`），
+    // 那也不是「他没说」（话已经说了，只是平台没能替他说完）。按「入队即活动」判，比「投递成功才算」诚实。
+    // 同事务、同一个 `client`（红线与 `postMessage` 一字一样：入队回滚了活动位不许前进）。
+    // ⚠ **不节流**（人已拍板）。
+    // 直发路（上面 `!activeRunId` 分支）**不写这里**：它先 COMMIT 再转 `postMessage`，由那一处写
+    // ⇒ 无论走哪条分岔，一条用户输入恰好写一次活动位。
+    await client.query(`UPDATE users SET last_activity_at = now() WHERE id = $1`, [userId]);
     if (safeKind === 'steer') {
       // 只打停止意图的时间戳，**不动 status**（见函数头 ⚠）。
       await client.query(

@@ -1053,8 +1053,14 @@ export const en = {
       dangerSection: 'Danger zone',
       totpSection: 'TOTP settings',
       totpSectionHint: 'Manage this user’s TOTP registration; re-enrolling immediately invalidates the old secret.',
-      lastLogin: 'Last login',
+      // issue #497（迁移 0031）：activity = 最近一次用户输入，与 login 是两个维度；
+      // 旧键 `lastLogin` 已删（第 8 格换语义后零引用）。**只删这一个键**：`neverLoggedIn` 仍在用
+      //（副行与清退日期两格都读它）。
       neverLoggedIn: 'Never',
+      // 两个「从未」必须分得开，且都不许渲染成 "Today" 或空串。
+      lastActivity: 'Last activity',
+      neverActive: 'Never active',
+      loginAt: 'Signed in {time}',
       updateProfile: 'Save profile',
       profileUpdated: 'Profile updated.',
       statusUpdated: 'User status updated.',

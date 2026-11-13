@@ -3711,7 +3711,17 @@ All user-management routes require `requireAdmin`: no session returns `401 unaut
 
 ### `GET /api/admin/users`
 
-Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), `last_login_at` (the newest `login_sessions.created_at`, or `null`), and `offboarding` (`null` or `{ "state", "step", "error", "workspace_purge_after" }`). Offboarding `state` is `pending`, `running`, `done`, or `failed`; `step` identifies the current/failed workflow step and is `null` when complete. Revoked sessions remain part of login history.
+Returns `{ "items": [...] }`. Each item contains `id`, `login`, `display_name`, `role`, `fde_name`, `git_host_id`, `auth_source`, `status`, `created_at`, `totp_enabled` (boolean), `last_login_at` (the newest `login_sessions.created_at`, or `null`), `last_activity_at` (the newest real user input, or `null`; see the note below), and `offboarding` (`null` or `{ "state", "step", "error", "workspace_purge_after" }`). Offboarding `state` is `pending`, `running`, `done`, or `failed`; `step` identifies the current/failed workflow step and is `null` when complete. Revoked sessions remain part of login history.
+
+**`last_activity_at`（issue #497，工单 `feat-261112-01`，迁移 `0031`）**：该用户**最近一次亲口说话**的时刻 = **按下发送那一刻**（`timestamptz`，DTO 里是 ISO 串）。它补的是一个**此前缺失**的维度：`last_login_at` 只回答「最近一次把门推开」，页面刷新、自动续期、以及一句话没说的天天登录都会写它，所以它答不出管理员真正想问的「**这个人还在用吗**」。
+
+- **写入点只有两处**（刻意不加第三处）：`portal/src/sessions.js#postMessage`（本站唯一发送路，直发与队列投递都走它）与 `portal/src/queued-inputs.js#enqueueQueuedInput`（run 正在跑时按回车那一刻就是活动——那句话此刻已落进 `queued_inputs`，与「稍后被投递」无关；投递失败退回待投也不把它收回）。两处都在**既有事务内用同一个 `client`** 写 ⇒ 不会出现「消息回滚了而活动位前进了」。**无节流**：一次输入写一次。
+- **不算活动**：agent 跑完一个 run（run 生命周期与终态）、页面刷新/重开、会话改名与归档、预览访问、程序化 `api_tokens` 调用，以及**登录本身**。⇒ 它与 `last_login_at` 是**两条独立时间线**，**允许比 `last_login_at` 旧**（登录了但一句话没说；dev 库现验 9 个用户里就有 2 个是这个形状）。读侧与界面都**不许**把这种「倒挂」当脏数据修正，也不许在登录路径「顺手」补写——那会把它退回成第二个 `last_login_at`。
+- **可空 = 契约**：`null` = 从未活动（新开户，或从没说过话）。列**无默认值**（`DEFAULT now()` 会让每个新账号凭空得到一次活动，而那一刻它什么都还没说）、**无索引**（只作返回列，不参与过滤/排序，口径同 `last_login_at`）。DTO **恒带该键**：`null` 是「从未活动」，不是缺键。
+- ⚠ **重新开户不清零**：同名 `disabled` 行被重新激活时本列**保留原值**，与本节 `file_upload_enabled` 的**显式清零相反**——权限清零是因为权限不继承任期，而这一列是**事实**，事实不需要被抹掉。
+- 历史数据由迁移 `0031` 一次性回填：只动 `last_activity_at IS NULL` 的行，取 `messages` 里 `role='user' AND synthetic=false` 的 `MAX(created_at)`（`synthetic=false` 是口径的一部分——宿主注入的合成行不是人说的话），join `chat_sessions` 拿 `user_id`。回填后仍没有用户消息的账号**保持 `NULL`**，不拿 `last_login_at` / `created_at` 冒充。第二遍重放必为 0 行（dev 库现验 `UPDATE 0`）。
+- **只在管理台这一侧**：本节 `GET /api/admin/users` 的 item，以及 `POST /api/admin/users`、`PATCH`、TOTP 重绑三条返回的 `<safe user>` 里恒有该键。`GET /api/me` 与两个登录端点的 user DTO（§2.6）**不带**它——别按「四条 user DTO 路径键集一致」去预期（那条纪律管的是 §2.6 那四条）。
+- 消费面：管理台用户列表**第 8 格**（`AdminUsersView.vue`）——主行是最后活动，副行小字是 `登录于 …`（从未登录时副行整行不渲染，不拼成「登录于 从未登录」）；表头「最近登录」→「最后活动」，**列数不变**。空值渲染成「从未活动」，**绝不**渲染成「今天」或空串（没数据就没资格承诺）。
 
 ### `POST /api/admin/users`
 

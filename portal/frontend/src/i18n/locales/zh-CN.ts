@@ -1089,8 +1089,17 @@ export const zhCN = {
       dangerSection: '危险操作',
       totpSection: 'TOTP 设置',
       totpSectionHint: '管理该用户的 TOTP 注册状态；重新注册会立即使旧密钥失效。',
-      lastLogin: '最近登录',
+      // issue #497（迁移 0031）：「最后活动」= 最近一次用户输入，与「最近登录」是两个维度。
+      // ⚠ 旧键 `lastLogin`（'最近登录'）已删：第 8 格换了语义之后它**零引用**（现验
+      //   `grep -rn "fde\.lastLogin'" portal/frontend/src` 只剩 spec 里的反向断言），
+      //   留着会让后来人以为那一格还是登录列。**只删这一个键**：下面 `neverLoggedIn` 仍在用
+      //   （副行「登录于 …」与清退日期两格都读它）——相邻两键一起删是本单实际踩过一次的坑。
       neverLoggedIn: '从未登录',
+      // ⚠ 措辞红线：「从未活动」/「从未登录」两个词必须分开，且都不许写成「今天」或留空
+      //（空值渲染成「今天」= 没数据却做出承诺）。副行的「登录于 …」在从未登录时整行不渲染。
+      lastActivity: '最后活动',
+      neverActive: '从未活动',
+      loginAt: '登录于 {time}',
       updateProfile: '保存资料',
       profileUpdated: '资料已更新。',
       statusUpdated: '用户状态已更新。',

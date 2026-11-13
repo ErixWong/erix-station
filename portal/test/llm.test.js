@@ -36,6 +36,7 @@ import { cookieSettings } from '../src/config.js';
 import { runOnboardingOnce } from '../src/onboarding.js';
 import * as auth from '../src/auth.js';
 import { FakePool } from './fake-pool.js';
+import { createUserActivityWorld } from './fake-user-activity.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -649,6 +650,8 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
   const sessionId = '11111111-1111-4111-8111-111111111111';
   // #333 M2：`transcript_rounds` 走共用仿真件（真库部分唯一索引 + ON CONFLICT 跳过 + 撞键读回真存的行）。
   const rounds = fakeTranscriptRounds({});
+  // issue #497：postMessage 事务里的 `UPDATE users SET last_activity_at = now()`（本单唯一新增语句）。
+  const userActivity = createUserActivityWorld({ users: [{ id: 'u1', last_activity_at: null }] });
   const client = {
     async query(sql, params = []) {
       order.push({ sql, params });
@@ -671,6 +674,9 @@ test('postMessage lock order remains chat_sessions → llm-binding → container
       if (s.startsWith('INSERT INTO runs')) return { rows: [{ id: 'r1', status: 'queued' }] };
       if (s.startsWith('INSERT INTO run_queue')) return { rows: [] };
       if (s.startsWith('UPDATE messages SET run_id')) return { rows: [] };
+      // issue #497：发送路的用户活动位（共用仿真件；不接管未知语句）
+      const activityHit = userActivity.query(sql, params);
+      if (activityHit) return activityHit;
       throw new Error(`unexpected SQL: ${sql}`);
     },
     release() {},
