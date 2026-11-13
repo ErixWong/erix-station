@@ -1,8 +1,12 @@
 {
   "hotBytesBudget": 19456,
-  "refFloor": 596,
-  "measuredHotBytes": 18371,
-  "measuredTotalBytes": 19994,
-  "measuredRefs": 596,
-  "note": "派生量：只有 `npm run check:agents-hotlayer -- --sync` 能写；手改视为伪造读数"
+  "refFloor": 529,
+  "measuredHotBytes": 18633,
+  "measuredTotalBytes": 20256,
+  "measuredRefs": 529,
+  "note": "派生量：只有 `--sync`（抬预算/抬地板）或 `--rebaseline=\"<理由>\"`（显式重基线地板）能写；手改视为伪造读数",
+  "refFloorMeasuredWith": "git ls-files '*.md' + /§8\\.[0-9]+/g 现算（只数 git 跟踪的 .md）",
+  "refFloorReason": "旧地板 596 是脏树上 --sync 写的，含 .work-orders/ 白送的 82 处未跟踪引用；新值按 git ls-files 的跟踪口径现算，见 §8.121",
+  "refFloorTreeHead": "e81b3a5",
+  "refFloorTreeDirty": true
 }

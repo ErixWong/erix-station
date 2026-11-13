@@ -47,4 +47,3 @@ export function createUserActivityWorld({ users = [], baseMs = Date.UTC(2026, 10
   };
   return world;
 }
-

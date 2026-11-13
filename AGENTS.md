@@ -138,7 +138,9 @@ FDE 容器内的端口由平台分配（见设计文档 §8），不对宿主机
 - **一单一账写 `docs/maintenance/task-ledger.md`**（编号续用 `8.N`，全局唯一、不重排；挑号前先
   `grep -n '^### 8\.' docs/maintenance/task-ledger.md | tail -3`——并行 session 会撞号，见台账 §8.116），
   **别写进本页**：本页随每次 agent run 全额注入（261111 已把逐单台账搬走，见 §8 末指针）。
-  闸：`npm run check:agents-hotlayer`（热层字节预算 + 台账不许多处 + 禁手抄当下数字；`--sync` 才改预算）
+  闸：`npm run check:agents-hotlayer`（热层字节预算 + 台账不许多处 + 禁手抄当下数字；`--sync` 才改预算。
+  引用面只数 **git 跟踪的** `.md`（脏文件不进读数，PR #498 的 CI 红就是这个口径漏的，见 §8.121）；
+  地板只升不降，要**降**必须 `--rebaseline="<理由>"`（理由会登记进 `scripts/agents-hotlayer-budget.json`））
 - **发布前置**：`package.json` 的 `version` 必须等于去掉 `v` 的 tag（`runner/package.json` 建议一并对齐），
   否则 `release.yml` 直接失败。**这条现在是否成立要现验**（`git tag --sort=-creatordate | head -1` 与
   `node -p "require('./package.json').version"`），别抄本文里写过的数（261110 实测两边都是 `0.1.66`，
