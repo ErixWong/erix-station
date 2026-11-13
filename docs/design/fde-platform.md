@@ -832,7 +832,7 @@ runner 那道上游闸（#309 切片 2b）——**带外配置根本不经过门
 | D4 | **不 publish 任何 FDE 端口** | 堵死绕过 ingress 的第二条路；所有 auth 生效的前提 |
 | D5 | dev 端口由**平台分配**，DB 为真相 + `.erix/ports.json` 为派生副本（单向） | 防冲突/URL 漂移；agent 不自己挑端口 |
 | D6 | LLM 走**模式 C：唯一可达的网关出口**；其中「FDE 改不了 endpoint」**依赖网络层出口策略（安全团队职责），平台不负实施责任**；策略未实施时降级为审计+告警，须管理层书面知情（决策者 2026-09，issue #3） | 「FDE 改不了 endpoint」只能靠网络强制，不能靠文件权限 |
-| D7 | 事件/transcript 落中心 DB，portal 从 DB 读并发 SSE | portal 重启不杀任务；断线可按 Last-Event-ID 补发 |
+| D7 | 事件/transcript 落中心 DB，portal 从 DB 读并发 SSE；**只有 durable 档落库**（issue #502：stream 档碎片只转发不落库、不占 `seq`，未完稿正文终态落一行 `partial_output`，断线补发优先用 portal 进程内累加器） | portal 重启不杀任务；断线可按 Last-Event-ID 补发。碎片入库的代价是「一次事务 + 五个索引更新」换 3.82 个字符（实测），且不落库也不丢内容——碎片可重生，终稿在 `messages`/`transcript_rounds` |
 | D8 | 隔离单元 = **worktree**（`agent/<runId>` 分支） | 同仓库并发多 agent 不冲突；回流走 fork/PR |
 | D9 | **认证放边缘**，dev server 与 agent 不感知认证 | 安全设施对 agent 工具链透明；应用零改造 |
 | D10 | 仓库名 `erix-station`，展示名 **FDE Station** | 标识短（天天打）、展示名说清语义 |

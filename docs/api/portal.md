@@ -1322,7 +1322,7 @@ station-portal user enable  --login <login>
 刷新后前端重建工具卡片 / judge 面板的**只读历史通路**（对齐 pi-web「转录即真相」：历史与实时走同一渲染入口）。
 
 - **与 SSE 的关系**：独立 REST 通路，不影响 §5.2.3 首连不补发 / 断线重连补发语义。
-- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `tool_call_delta` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；**第 28 类 `host_steer_injected`（erix-agent 0.32.0 唯一新增的 LoopEvent，#499）同样显式不进**——本站不传 `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生该事件，订得到（水位线推进）但不刷行、不回放、不下发（理由同 `run_outcome`，钉在同一份对账测的豁免表，只加前端 `EVENT_TYPES` 不写决定会被它的 S2 判红）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。
+- **白名单**：只返回展示类事件（`tool_use` / `tool_result` / `judge` / `round*`（round_start/round_end/attempt/recovering/recovered）/ `compaction` / `final_guard` / `forced_final` / `model_metadata_missing`（erix-agent 0.18.0 新增的诊断事件，上游 #182；前端 `useEventStream.ts` 对未知/诊断类型走 `default` 中性忽略，不会渲染成错误）/ **`attempt_killed`**（#288：portal 自己合成的宿主事件——实时经 session SSE 推，不进白名单就会「实时有、刷新后没了」，正是本白名单要消灭的两种可见性不一致）/ **`tool_replay_decision_required`**（#288 缺陷 C：崩溃恢复时挂起工具**未被重放**，引擎 additive LoopEvent 经 runner U3 上报——它出现的时机正是用户刷新页面来看「我这条 run 怎么了」的时刻，不可回放比不推更坑） / **`persistence_error`**（#371-A：引擎落盘失败告警，走 `diagnostics.error` 而**不是** `onEvent`——本站此前没传 `diagnostics`，真机全库该类型 **0 行**，非致命降级因此彻底隐形；前端只把 `fatal === false` 刷成中性分隔行，致命那条仍由 `run_end` 的 `persistence_failed` 负责）；**第 18~21 类（issue #421）**`compaction_strategy_fallback` / `persistence_capability_degraded` / `resume_journal_skipped`（`model_metadata_missing` 早在 #182 时就已列入）——引擎承诺、本站以前订不到那一族，不进则又是「实时没有、刷新后也没有」；而 **`run_outcome`（第 22 类）是写明了理由的显式不进**（与 `run_end` 重叠且无读者，对账测：`portal/test/event-surface-contract.test.js`）；**第 28 类 `host_steer_injected`（erix-agent 0.32.0 唯一新增的 LoopEvent，#499）同样显式不进**——本站不传 `capabilities.hooks.nextUserTurn` ⇒ 结构上不产生该事件，订得到（水位线推进）但不刷行、不回放、不下发（理由同 `run_outcome`，钉在同一份对账测的豁免表，只加前端 `EVENT_TYPES` 不写决定会被它的 S2 判红）；运行态语义事件（`run_end` / `usage` / `checkpoint` / `assistant_delta` / `reasoning_delta` / `tool_call_delta` / `heartbeat` 等）一律不下发——历史回放不得驱动前端运行态状态机。**#502 的补充**：三个碎片型自本单起**根本不落库**，「不下发」对它们是双重成立（表里没有 + 白名单不列）；`tool_call_delta` 是本单唯一**从白名单里摘掉**的类型（它以前在，摘它的理由是「行没了」，成形参数在 `tool_use.input`），摘除理由必须写——前端 `HISTORY_REPLAY_TYPES` 与它逐项对齐，由 `portal/test/event-surface-contract.test.js` 对账。**#425 的消费侧补充（零后端变更）**：白名单里的 `round_end` 载荷带 `usage`（本 run 累计真值），前端动量状态机**只**吃它的 `usage` 与 `context_window` 两个展示量（并把登记的 run 直接标成已结束），其余字段与所有其它历史帧仍一律不驱动运行态 ⇒ 硬刷新后「上次 run 用了多少 token / 窗口多大」仍在，而轮号、时长、速率、相位照旧不重建。
 - **分页**（§1.3 keyset）：默认取最新 `limit` 条（升序返回，`limit` 默认 500、上限 2000）；`before=<seq>` 取更早一批；`next_cursor` 非 null 表示还有更早批次。
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
@@ -1331,7 +1331,7 @@ station-portal user enable  --login <login>
 
 缺陷：`runner/worker.js` 的 catch 固定 `final_text: ''` ⇒ 被停止 / 失败的 run 在 `messages` 里**零助手
 锚点**，而对话正文本来就从锚点渲染 ⇒ 界面上这次 run **正文区一片空白**（工具卡片在、正文没）。它
-**已经说出口的话**其实全在 `run_events` 的 `assistant_delta` 里（逐 chunk 落库），所以下发时在
+**已经说出口的话**过去全在 `run_events` 的 `assistant_delta` 里（逐 chunk 落库），所以下发时在
 **响应期**把它们聚合回来。纯宿主侧只读重建：不动 `runner/`、不消费 `err.finalText`、不写 `messages`。
 
 **存在性判据（三条同时成立才出现，一条 run 至多一条合成项）**：
@@ -1346,18 +1346,26 @@ station-portal user enable  --login <login>
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
-| `seq` | number | = 该 run **最后一条 `assistant_delta` 的 `seq`**（**不是新分配的 seq**，不改 seq 语义；也不占 `chat_sessions.last_seq`） |
+| `seq` | number | #502 之前 = 该 run **最后一条 `assistant_delta` 的 `seq`**；**现在 = 库里那一行 `partial_output` 自己的 `seq`**（终态事务里排在合成 `run_end` 之后分配 ⇒ 仍然落在该 run 内容末尾，位置语义不变；不占 `chat_sessions.last_seq`） |
 | `run_id` | string | 所属 run |
 | `type` | string | 固定 `partial_output`（**合成类型，`run_events` 表里查不到这一行**） |
 | `payload.text` | string | 已生成的正文，按 delta 的 `seq` **升序**拼接（与插入顺序无关）；脏片段（`text` 缺键 / 非字符串）**整条跳过**，不拼成 `[object Object]` |
-| `payload.chunks` | number | **实际拼进正文的片段数**（脏片段不计 ⇒ 它≤ 该 run 的 `assistant_delta` 总条数；口径就这一句，将来要改成「总条数」得同时改测试） |
+| `payload.chunks` | number | **实际拼进正文的片段数**（写入侧累加，脏片段不计 ⇒ 它 ≤ 当初该 run 的 `assistant_delta` 总条数；口径就这一句，将来要改成「总条数」得同时改测试） |
 | `payload.truncated` | boolean | 仅在正文被上限截过时为 `true` |
 
 - **上限**：`PARTIAL_OUTPUT_TEXT_CAP = 2000`（沿用本节既有 2000 字符防护的先例）。超限截到 2000 字符并置 `truncated: true`；**载荷里不塞 `…（已截断）` 文本**，截断标记由前端出——这是与上面「大小防护」的**刻意差别**（合成项要给前端一个可判定的布尔）。
 - **聚合范围 = 整个 run**，**不受 `before` 分页窗口影响**（窗口外的碎片也是这次 run 说过的话；分页只决定本次响应里出现哪些真实事件）。
 - **`reasoning_delta` 不参与**（thinking 文本不在本单面上）。
 - **分页与排序**：合成项**参与升序排序**（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**（那两个仍只由白名单真实事件决定）。
-- **不落库 / 不进 SSE / 不进前端集合**：`partial_output` 只在**本端点的响应**里存在 ⇒ 前端 `EVENT_TYPES`（实时具名监听）与 `HISTORY_REPLAY_TYPES`（回放集合）**都不加它**（加进去就会出现「实时一条 + 历史一条」重复）；`assistant_delta` 也**不得**加进上面的下发白名单（否则同一段正文来两遍）。前端的落点是 `StreamEntry` 的新 `kind: 'partial'`（中性助手气泡 + 「已中止 · 部分输出」标签，**不是**红色错误行）。
+- **落库形态变了（#502 D-3），界面落点没变**：以前它**只在响应期存在**；现在它是 `run_events` 里真实的
+  **一行**（终态事务内写入，`client_event_id = <run_id>:final:partial_output`，部分唯一索引
+  `run_events_run_partial_key` ⇒ 一个 run 至多一行），载荷多出 `uptoSeq` / `source`（`'terminal'`；
+  补发帧用 `'memory'` / `'db'` / `'none'`）。**它仍然不进 §4.4a 的下发白名单**（下发时按那一行原样取回，
+  不重放），也**不进** SSE 的重放 SQL —— 补发时它由快照通路单独发一帧。
+  前端 `EVENT_TYPES` **加了它**（#502 D-6：订不到就永远空白），`HISTORY_REPLAY_TYPES` **仍不加**
+  ⇒ 「实时一条 + 历史一条」的重复红线仍然成立，只是防法从「不订」变成「覆盖式赋值」
+  （`deltaText` 被快照帧整体覆盖，不追加；`workbench.addPartialOutput` 同 run 覆盖不追加）。
+  `assistant_delta` 仍然**不得**进下发白名单。前端的落点是 `StreamEntry` 的新 `kind: 'partial'`（中性助手气泡 + 「已中止 · 部分输出」标签，**不是**红色错误行）。
 - **成本**：候选判定顺序 = 窗口 `run_id` 去重（无 run ⇒ 整段跳过）→ **一条**查终态与锚点存在性的查询 → **只对「终态且无锚点」的 run** 聚合（`run_id = ANY(...)` + `type = 'assistant_delta'`，走既有 `run_events_run_idx (run_id, seq)`）。**零 DDL、零新索引**；dev 实测 134 条 run 里只有 4 条需要它。
 
 - **已接受边界：刚停止的那一刻不会立刻出现**。合成项只在 `GET /events/history` 响应里存 而该响应只在 `openSession`（打开会话 / 刷新 / 重进会话）时拉；run 终态后的 `refreshSession` 只重取 `/api/sessions/:id`，**不重拉 history** ⇒ 点「停止」当下界面只有 `run_end` 分隔行，**部分正文要刷新一次才出现**（流式那半截气泡在 `run_end` 时被移除）。不是 bug，是落点选择；要即时可见得让 refresh 也重拉一次 history（多一个请求），已单独登记为产品小单。
@@ -2669,6 +2677,20 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 
 - **SSE 而非 WebSocket**（规格 §10.2）：事件单向，输入走 `POST .../messages`。
 - **事件先落 DB，portal 从 DB 读并推流**（规格 §10.2 / D7）：portal 重启不杀正在跑的 run；`seq` 由宿主在落库事务内**逐事件原子 +1 分配**（`UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`，`UNIQUE(session_id, seq)` 兜底），**每个 session 内严格单调递增、无空洞**——不存在「并发落库产生合法间隙」的情况（runner §7.3）。
+  > **实现注记（issue #502，#25 裁决的续集）**：**「无空洞」自本单起彻底不成立**——① stream 档碎片
+  > （`assistant_delta` / `reasoning_delta` / `tool_call_delta`）**不分配 `seq`**（只转发，见 §5.3 表里那三行），
+  > ② U3 写循环去掉了「先 `SELECT` 查重」的预检，重复投递会先烧掉 `seq` 再由 `ON CONFLICT DO NOTHING` 丢掉。
+  > 结论对客户端不变、但更强：**跳号不是丢事件**，`chat_sessions.last_seq` 仍单调、`UNIQUE(session_id, seq)` 仍兜底。
+  > 下面 #25 那段关于「空洞」的措辞保留在原文里（它讲的是 messages/run_events 共用分配器那半边，仍然成立）。
+  > **补发不再只依赖 DB**：断线重连时「已经流出去、但按定义不落库」的那段正文由 portal **进程内累加器**
+  > （`portal/src/run-partial-buffer.js`）补出，内存没有则退回库里那一行 `partial_output`（终态写入），
+  > 两处都没有 ⇒ 发一帧 `source:'none'` 的占位帧（前端出中性提示，不留空白）。补发顺序是
+  > **「库里已定稿的事件 → 未完稿快照」**，快照帧**不带 `id:`**（不进 `Last-Event-ID`，否则下一次重连会拿一个
+  > 不存在的 seq 当游标）；`payload.uptoSeq <= Last-Event-ID` ⇒ 客户端已看全，**不发**（这是「重连不重复」的闸）。
+  > 首次连接（无 `Last-Event-ID`）仍然一条历史都不补发（下面第 3 条不变）。
+  > **`partial_output` 从此是 `run_events` 里真实的一行**（`client_event_id = <run_id>:final:partial_output`，
+  > 部分唯一索引 `run_events_run_partial_key` 保证一个 run 至多一行，迁移 `0033`），但**不进 SSE 重放 SQL**
+  > （它是合成物，重放它 = 「重放一行 + 快照一行」重复），也不进 §4.4a 的下发白名单。
   > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 - 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
@@ -2689,7 +2711,10 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 ### 5.2 `Last-Event-ID` 断线续传语义
 
 1. 客户端（浏览器 `EventSource` 自动）重连时带 `Last-Event-ID: <seq>` 头。
-2. portal 从 DB 补发该 session 中 **`seq` 大于该值**的全部历史事件，再切到实时流。
+2. portal 从 DB 补发该 session 中 **`seq` 大于该值**的全部历史事件（重放 SQL 里**排除** `partial_output`，
+   它是合成物不是可重放事件），**然后**追加一帧未完稿快照（`event: partial_output`，见 §5.1 那条注记：
+   来源优先级 = 进程内累加器 → 库里那一行 → `source:'none'` 占位；不带 `id:`；`uptoSeq <= Last-Event-ID` ⇒ 不发），
+   再切到实时流。
 3. 无 `Last-Event-ID`（首次连接）：**不补发历史**，只推连接之后的新事件——历史消息/状态由 `GET /api/sessions/:id`（含 `last_seq` 与消息列表）获取；前端如需从某点重放，可显式带 `Last-Event-ID` 或查询参数 `?last_event_id=<seq>`（两者等价，查询参数供非 `EventSource` 客户端使用）。
 4. `Last-Event-ID` 大于当前 `last_seq`（如 session 已删）→ `404 not_found`；小于最小保留 seq（事件归档后）→ `410 Gone` + `{"error":{"code":"replay_unavailable", ...}}`，前端应回退到 `GET /api/sessions/:id` 全量拉取。
 
@@ -2721,9 +2746,9 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 | 6 | `tool_use` | 同上 | `tool_call_id: string`，`name: string`，`input: object` |
 | 7 | `tool_result` | 同上 | `tool_call_id: string`，`name: string`，`result_digest: string`，`duration_ms: number \| null`，`ok: boolean`（**issue #283 → #299**：`duration_ms` 可为 `null`。erix-agent **0.20.0** 起引擎把时长写进 `tool_result.erix.durationMs`，**真执行过的四种返回形态（string / number / `{content,metadata}` / 抛异常）都会给值** ⇒ 本站 #283 那层装配期临时计时闸（`runner/lib/tool-duration.js`）已撤。仍没有值的只剩三种状态：judge 拦截、unsafe 重放被中止、executor 未 settle 就被中止（上游 `TOOL_RESULT_CONTRACT.engine.fields.durationMs`）。runner 映射读 `erix.durationMs`，**旧记录**（一代内）回退顶层 `duration`；两者都缺一律 `null`，**不伪装成 0**，前端据此不渲染时长） |
 | 8 | `round_end` | 同上 | `round: number` |
-| 9 | `assistant_delta` | `onDelta` | `text: string`（增量文本片段） |
-| 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段） |
-| 11 | `tool_call_delta` | `onToolCall`（参数增量） | `tool_call_id: string`，`name?: string`（仅首帧），`arguments_delta: string`（JSON 文本片段，前端按序拼接得完整入参） |
+| 9 | `assistant_delta` | `onDelta` | `text: string`（增量文本片段）。**#502：不落库、不占 `seq`**（SSE 帧不带 `id:`），dev 实测平均 2.09 字符/片 |
+| 10 | `reasoning_delta` | `onReasoningDelta` | `text: string`（推理增量片段）。**#502：不落库、不占 `seq`**（前端 P1 本来就不展示推理增量） |
+| 11 | `tool_call_delta` | `onToolCall`（参数增量）。**#502：不落库、不占 `seq`**，并已从 §4.4a 下发白名单摘掉（成形后的参数在 `tool_use.input` 里，历史侧本来就该看那条） | `tool_call_id: string`，`name?: string`（仅首帧），`arguments_delta: string`（JSON 文本片段，前端按序拼接得完整入参） |
 | 12 | `judge` | `onJudge` | `kind: "round"\|"intercept"`，`action: "judge_done"\|"nudge"\|"continue"\|"executed"\|"blocked"\|"degraded"`，`decision: {done, confidence, reason, evidence} \| null`，可选 `error: "timeout"\|"error"\|"parse"`，可选 `tool: {id?, name?, input?}`（依据：erix-agent v0.3.5 `src/loop.js:545-552` JudgeEvent typedef；对应 `judge_decisions` 表） |
 | 13 | `run_end` | portal 由 U2 终态**合成**（数据源 = `runToolLoop` 返回值经 U2 终态载荷上报，worker 不再经 U3 发 `run_end`，runner §7.6） | `termination: { reason, detail? }`（**对象**，`reason` 取值集合见 §4.1；`persistence_failed` 另带 `operation`/`phase`/`sideEffect`——runner 自 0.17.0 起原样透传引擎挂在错误上的 termination，见 §5.3 注与 issue #212；**0.18.0 起** `reason === "failed"` 的终局另带引擎 additive 字段 `errorCode`（上游 #176，值域由引擎定义，宿主不解释）），`usage: { input_tokens, output_tokens }`（整 run 汇总），`attempt`（第几次尝试，runner §7.6）；失败时附加 `error: { code, message, retryable }`（见 §6）；**attempts 耗尽那条**（`error.code = max_attempts_exceeded`，§9.11）**issue #288 起 additive 另带** `last_reason: string` / `last_silent_ms: number`（release 上报过 kill 信息时出现，没上报就**没有这两个键**） |
 | 14 | `attempt_killed` | **portal 合成，两条产出路径**（不是引擎事件、不经 U3、不进 `run_queue`）：① **U12 release 的 requeue 分支**（`releaseRun`，issue #288 缺陷 B：agentd 还活着并 additive 上报 `killed_by`，§9.11）② **run 租约 reaper 的 requeue 分支**（`reapExpiredRuns`，issue #292：上报者自己已死、根本没有 release，由 portal 自己合成，§9.11 注记） | `attempt: number`（死掉的那次尝试，1-based = `run_queue.attempts`），`max_attempts: number`，`reason: string`（**开放值、无枚举白名单**：release 路径 = agentd 上报的 reason 原文，如 `watchdog_silent` / `worker_crashed`；**reaper 路径固定 `lease_expired`**），`killed_by: "watchdog" | "crash"`（`watchdog` = F6 执行期静默被判死；`crash` = worker 非预期退出；**reaper 路径固定 `crash`**——它无从区分看门狗与真崩，保守取值），可选 `silent_ms: number`（判死前的静默时长 = **最后一次 IPC 上报之后**算了多久，只有活着的 agentd 报得出来；**只在可信时出现，绝不写 0/null 冒充「有」⇒ reaper 形态固定不带**），可选 `next_retry_in_ms: number`（预留：portal 侧支持，当前 agentd 不发；reaper 也不发） |
