@@ -2,7 +2,11 @@
 // `runToolLoop`**，不是本站 `runs` 表的一行）。
 //
 // 依据：`docs/design/delegation-2026-11-08.md` §2（引擎事实清单，已逐条验证，本文件不重新推导）
-// 与 `P1-WORKORDER.md` §2。库侧边界（`erix-agent` 0.31.0 `src/tools/delegation/tool.js`）：
+// 与 `P1-WORKORDER.md` §2。库侧边界（`erix-agent` 0.32.0 `src/tools/delegation/tool.js`）：
+//   ⚠ 版本号从 0.31.0 追到 0.32.0（#499 升级片）时**边界本身重跑过对账**：对两份 `npm pack` 解包
+//   （`/tmp/ea31/package` / `/tmp/ea32/package`）跑 `diff -u …/src/tools/delegation/tool.js` **无任何输出**
+//   （rc=0）⇒ 下面六条逐字仍成立，一个行号都没改。上游仓库侧同结论：
+//   `git diff --stat v0.31.0..v0.32.0 -- src/tools/delegation/tool.js` 为空（#499 正文现查）。
 //   · 库不 fork / 不 spawn / 不 import child_process —— **子 run 怎么跑起来归宿主**（`runChild`）；
 //   · 父身份 `parentRunId` 由库从执行上下文 `context.runId` 自取，模型不可填（`tool.js:330`）；
 //   · `termination` 只认**字符串**，给对象一律落 `failed`（`tool.js:94-98`）；

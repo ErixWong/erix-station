@@ -29,7 +29,7 @@ const t = i18n.global.t;
 // ⚠ 本数组是 EventSource 逐类型 `addEventListener` 的**唯一来源**，三处集合（本数组 /
 // HISTORY_REPLAY_TYPES / 后端 `http.js` 的 HISTORY_EVENT_TYPES）各自独立存亡（#288）。
 // 引擎承诺面（`LoopEvent` 联合类型）与本数组的对账**不再靠手抄清单**：`portal/test/event-surface-contract.test.js`
-// 从**已安装引擎源码**里解析那个联合类型（27 类，0.30.0），逐类要求「订得到」，并要求「进回放 / 显式豁免（写理由）」二选一。
+// 从**已安装引擎源码**里解析那个联合类型（28 类，0.32.0），逐类要求「订得到」，并要求「进回放 / 显式豁免（写理由）」二选一。
 export const EVENT_TYPES = [
   'round_start', 'round_end', 'attempt', 'attempt_killed', 'recovering', 'recovered', 'usage',
   'tool_use', 'tool_result', 'assistant_delta', 'reasoning_delta',
@@ -81,6 +81,15 @@ export const EVENT_TYPES = [
   //     本站不传 finalGuard / 本站从不走装配口）。账在 runner 的 LOG（`runner/lib/engine-notices.js`）。
   'tool_output_aggregate', 'continuity_written', 'continuity_write_failed',
   'final_guard_extend', 'context_unknown_option', 'user_turn_guard_unrecoverable',
+  // issue #499（erix-agent 0.31.0 → 0.32.0）：`LoopEvent` 联合类型从 **27 类涨到 28 类**（+1，无一移除）。
+  // `host_steer_injected`（载荷 `round` / `chars`，发射点 0.32.0 `orchestrator.js:3300`）是运行中「转向」
+  // 注入了一条 user 轮的事实。**本站决定：订得到、不刷行、不回放**——引擎只在
+  // `capabilities.hooks.nextUserTurn` 是个函数时才发它（`orchestrator.js:3253` 早退），而本站不传那个钩子
+  // （`grep -rn "hooks\s*:" portal runner | grep -v node_modules` = 0 命中）⇒ 结构上不产生该事件。
+  // 用户看得见的转向反馈已在 `queue_update`（§4.3a）与注入后的正文里 ⇒ 不进回放、不进历史下发，
+  // 同 `run_outcome` / `continuity_injection_skipped` 先例（决定与理由钉在
+  // `portal/test/event-surface-contract.test.js` 的豁免表；只加本数组不写决定会被 S2 判红）。
+  'host_steer_injected',
   // issue #370：输入队列快照（steer / follow_up 待发送）。**live-only、不落 run_events**
   // ⇒ 只进本数组，**绝不进** HISTORY_REPLAY_TYPES（它没有 seq、也没有历史行可回放；刷新后由
   // `GET /api/sessions/:id` 的 `session.queued_messages` 快照补齐）。漏加本数组 = 实时永远收不到。
