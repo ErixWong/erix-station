@@ -5033,3 +5033,65 @@ portal 换新镜像时自动应用，**没有手工补跑**）；**未打 tag、
 主树必须**根与 runner 各重装一次**再谈基线数（`node -p "require('./runner/node_modules/erix-agent/package.json').version"`
 现查，别看 `package.json`）。重装后主树基线：根 `2164 tests / 2159 pass / 0 fail / 5 skipped` rc=0、
 runner `507 / 507` rc=0、前端 `1322 passed` rc=0 + `vue-tsc` rc=0。
+
+### 8.125 stream 档碎片不落库：88 万行里 87.7 万行是两个字符一句话（issue #502 / 工单 feat-261113-02，2026-11-13，worker 落地 + 一次性真库自证）
+
+**要治的是什么**：dev 真库 `station` 现查 `run_events` = **884,163 行 / 472 MB**，其中三型
+`assistant_delta`(102,027) + `reasoning_delta`(454,689) + `tool_call_delta`(320,439) = **877,155 行（99.2 %）**；
+`avg(length(payload->>'text'))` 在 `assistant_delta` 上是 **2.09 个字符**（工单正文里的 3.82 没复现，以现查为准）。
+即：每说一句「好」都要付一次事务 + 五条索引更新 + 一个 `seq`。全库 537 MB 里这一张表占 472 MB。
+顺带纠正本账本与 `docs/data/model.md` §4 多年的口径错误：膨胀排序写成「`transcript_rounds.messages`（单 run 可达 MB 级）
+> `run_events`」——实测 `transcript_rounds` 只有 **12 MB / 2,231 行**，排序是**反的**；膨胀机制不是「行大」而是「行多」。
+
+**落地面（四步，各自一笔提交）**：
+1. **写侧**（`portal/src/internal.js`）：判据用引擎的表，**不手抄类型清单**——`eventTierOf(ev.type) === EVENT_TIER_STREAM`
+   （`erix-agent` 导出，`node_modules/erix-agent/src/loop/event-tiers.js` 里恰好三型；未知类型返回 `undefined` ⇒
+   上游 additive 的新碎片型自动继承，未知型一律按 durable 处理，宁落库不丢）。碎片 **不 INSERT、不 `allocSeq`**，
+   SSE 帧**不带 `id:`**（不带 seq 的帧若塞了 `id:`，浏览器下次重连就把一个不存在的 seq 当游标）。
+   顺手把「先 `SELECT 1` 查重再 INSERT」的预检删了（`ON CONFLICT DO NOTHING` 本来就是权威）——每事件少一次往返。
+2. **进程内累加器**（`portal/src/run-partial-buffer.js`，新增）：`observe/snapshot/drop/sessionRuns`，按 session 索引、
+   按 run 分片、`maxEntries=256` + `textCap=2000`。**跨轮累加**（前端只有一个流式气泡，`round_start` 才清），
+   `tool_call_delta` 的载荷是工具参数 ⇒ **不进正文**，`uptoSeq` 只取**已落库**事件的最大 seq。
+   at-least-once 去重靠 `client_event_id` 的 per-attempt 计数高水位（碎片不落库 ⇒ **没有 DB 约束可依赖**，
+   这是全新义务；形状对不上时按「新事件」处理，宁重不漏）。
+3. **终态那一行**（`insertPartialOutputRow`）：无 assistant 锚点 ⇒ 与合成 `run_end` **同事务**写**一行**
+   `type='partial_output'`（`client_event_id = <run_id>:final:partial_output`，`seq` 排在 `run_end` 之后，
+   正文为空则**不写**）。四个合成 `run_end` 的落点全接：`finishRun` / release 中止分支 / reaper 的 cancelling 与
+   max_attempts / `provisioner` 的 offboard；`sessions.js` 的「排队即取消」两处**故意不接**（没有 U3 碎片、
+   缓冲区必空，硬写只留一行空正文并白占唯一索引名额），理由写在现场注释。
+4. **补发与读侧**：SSE 重连 = 「库里已定稿的事件 → 未完稿快照（内存 → 库里那一行 → `source:'none'` 占位）」，
+   `uptoSeq <= Last-Event-ID` ⇒ 不发；重放 SQL 与历史白名单都摘掉 `partial_output`（合成物被重放 = 同一段正文两遍），
+   历史白名单另摘 `tool_call_delta`（行没了，成形参数在 `tool_use.input`）。前端 `EVENT_TYPES` **加** `partial_output`
+   （订不到就永远空白）、`HISTORY_REPLAY_TYPES` **摘**三个碎片型（表里没有了），快照帧**覆盖式**赋值，
+   `workbench.addPartialOutput` 由「`renderedIds` 命中就跳过」改成按 `partial:<run_id>` **覆盖**。
+
+**踩到的雷（都留了注释/断言）**：
+- 模板字符串里的 `\d` 被 JS 降级成字母 `d`：累加器的去重正则第一次写成 `` `${runId}:\\d+:(\\d+)` ``，
+  匹配的是字面 `d+` ⇒ 去重静默失效（单测直接抓到）。
+- 前端 `i18n` 两个 locale 各少一个尾逗号 ⇒ vite `oxc` **parse 失败**，一次炸掉 50 个测试文件
+  （症状是 `Test Files 50 failed` 但 `Tests 204 passed`，别看错层）。
+- `NODE_ENV=production` 会让 `@vue/test-utils` 的 `w.emitted()` **假红**（`GitLightBadge`/`SidebarPanel` 那 4 条
+  与我无关的红就是这么来的）；`unset NODE_ENV` 后全绿。
+- 真库 seed：`users/containers/projects/chat_sessions/runs/run_queue` 的 id **全是 uuid**，拿人类可读串当 id 会得到
+  `inconsistent types deduced for parameter $1` 和 `invalid input syntax for type uuid`；`projects.name` 还有
+  `^[a-z0-9][a-z0-9-]*$` 的 CHECK。⇒ 看到这两种报错先查 seed，别怀疑产品代码。
+- `VACUUM` **不能进迁移文件**：迁移 runner 每支迁移跑在单事务里，PG 直接拒（`cannot run inside a transaction`）。
+  所以「清存量」在迁移里、空间回收在真库那条手工命令里，中间隔着一道事务边界；测试里有用例钉着这条事实。
+- 每行字节上界在**行数太少**时是假的：36 行 / 147 KB 得到 4096 B/行（5 个索引的页粒度）⇒ 体积闸必须先喂够行数。
+- `seq` 从此**允许跳号**（碎片不占号 + 重复投递烧号）：`portal/test/internal.test.js` 那条「seq 单调、无空洞」
+  改判据为「单调但允许空洞」，`docs/api/portal.md` §5.1 与 `docs/data/model.md` §1.12 同步改了口径。
+
+**门禁（最终树，只看 rc）**：根 `npm test` `2190 tests / 2181 pass / 0 fail / 9 skipped` rc=0
+（基线 2164/2159/0/5，新增 26 条用例、4 条 env-gated 真库用例在无 PG 时计入 skip）；
+runner `node --test 'runner/test/*.test.js'` `507 / 507` rc=0；
+前端 `unset NODE_ENV && timeout 240 npm test` `63 files / 1328 passed` rc=0（基线 63/1322）；
+`npm run typecheck`（`vue-tsc --noEmit`）rc=0；`npm run check:agents-hotlayer` rc=0。
+真库面另跑一次性 `postgres:16.15`（`127.0.0.1:15499`，`TEST_DATABASE_URL` 环境门）：
+`portal/test/delta-not-persisted-db.test.js` `5 / 5` rc=0 —— 形状闸是**等式**：3 轮 × 10 片 与 3 轮 × 1000 片
+的 run 落库行数**完全相等**（类型分布逐字对：`round_start/tool_use/tool_result/round_end` 各 3 + `run_end` + `partial_output`）；
+第二行 `partial_output` 被 `run_events_run_partial_key` 顶回 23505；5 万行存量清干净且第二遍重放 rc=0；
+`VACUUM FULL` 前后 `pg_total_relation_size('run_events')` 掉一半以上。
+
+**真库待办（合并后由主 agent 执行，本单没碰 `station-db`）**：见 `.task-502-report.md` 的「真库待办」——
+迁移 `0033` 由 `migrate.js` 自动应用，存量清理随迁移发生，之后需要在低峰期手工
+`VACUUM (FULL, ANALYZE) run_events;` 才真的把 472 MB 里的绝大部分还给磁盘。
