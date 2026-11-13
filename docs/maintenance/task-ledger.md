@@ -4881,3 +4881,56 @@ CI 数的是「仓库里有什么」；两者一旦不等，本地越跑越安�
 
 **门禁**：仓库根 `npm test` rc=**0**；`node scripts/agents-hotlayer-budget.mjs` 在**脏本地树**与**干净 clone** 两种树上各跑一次都 ok；
 `git diff --check` 干净。前端本轮未动（没改任何被前端断言读的 md 引用）。
+
+### 8.122 撤三张退役/备份表：一条「撤东西」的迁移，雷在外键顺序与 IF EXISTS（issue #503 / 工单 fix-261113-01，2026-11-13，worker 落地 + 真库自证）
+
+**做了什么**：新增 `deploy/migrations/0032-drop-retired-tables.sql`，撤掉三张代码零引用的表
+（`llm_models_retired`、`llm_providers_retired`、`transcript_rounds_shape4_bak_20261027`）+ 静态断言 + 真库用例 + 文档口径。
+`0010` 与冻结 baseline `docs/data/schema.sql` **一个字节都没动**（`git status --short deploy docs/data/schema.sql`
+只列出新增的 0032；`0010` 现为 `sha256:6f96ef72…`，与它进仓库那天相同）。
+
+**为什么这条单值得单独一账**：以前的迁移全是「加东西」，本单是**撤东西**——判据形状整个换了。三条会炸的：
+
+| 雷 | 为什么会炸 | 机器锁（不是注释） | 真库读数 |
+|---|---|---|---|
+| 第三张表全新库不存在（261027 手工建的夹具，**不在任何迁移文件里**）| 写成裸 `DROP TABLE` ⇒ 新库首次起栈就炸（`MIGRATE_ON_START=1`，portal 在监听端口前应用）| `migrations.test.js` 的「三句全带 `IF EXISTS`、`DROP TABLE` 恰好三条」+ `migrate-fresh-db.test.js` 全新库跑到 head | 把第三句改成裸 DROP ⇒ `42P01 table "transcript_rounds_shape4_bak_20261027" does not exist`，**四步真库用例全红** |
+| **删除顺序**：子表 `llm_models_retired` 必须先撤 | 外键 `llm_models_provider_id_fkey`（0002:31 的 `REFERENCES` 建的；0010 只 RENAME 表，**PG 不连带重命名约束**）⇒ 先撤父表被依赖挡住 | 同一处 `indexOf` 比大小；另加一条「0002 里那条 `REFERENCES` 还在」把依赖的出处也钉住 | 两句换序 ⇒ `2BP01 cannot drop table llm_providers_retired because other objects depend on it`；`pg_constraint` 实测 `llm_models_provider_id_fkey : llm_models_retired -> llm_providers_retired`（**约束名确实是旧表名那一套**，这条以前只是推断）|
+| `CASCADE` 省事 | 顺序已经解决依赖，CASCADE 会把**没预料到的**依赖一起带走（静默多撤比顺序写错更难查）| `doesNotMatch(/CASCADE/)` | 加 `CASCADE` ⇒ 静态用例红 |
+
+**假绿面（本单最容易过的关其实是这个）**：`migrations.test.js` 里写死「当前最后迁移」的断言有
+**18 处 `slice(0, 4)), 31` + 3 处 `Array.from({ length: 31 })`**，全部追到 32。
+反向自证：把其中**任意一处**留成 31 ⇒ `not ok 3 - 迁移 0008-deprojectize … expected: 31, actual: 32`
+（不是静默通过，是真红）⇒ 这批常数虽然是复制粘贴出来的，但**确实咬得住**。
+
+**issue #503 正文里那句「撤掉 `migrations.test.js:130-131` 两条断言」是错的**（工单已改口，这里再记一次防复发）：
+那两条断言读的是 **0010 那个文件的文本**，而 0010 字节不变 ⇒ 撤表后**照样成立**。
+撤断言等于为了改一个不存在的红去删一条真锁。
+
+**「撤之前它们真的存在」不能省**：全新库跑完 0032 后三张表都不在，这既可能是「撤掉了」也可能是「本来就没有」。
+⇒ 真库用例里另建一条库只跑到 **0031**（软链 0001..0031 进临时目录，`migrate({migrationsDir})`）再量一次，
+并且直接把 0002 的两条 `CREATE TABLE` + 0010 的两条 `RENAME` 在库里复现一遍，
+让「撤的是曾经存在的东西」这句话有读数（`llm_providers_retired` / `llm_models_retired` 都在，
+`transcript_rounds_shape4_bak_20261027` 不在——正是 `IF EXISTS` 的那个形状）。
+
+**重放证据（不是形式）**：同一个库上连跑两遍 `psql -1 -f 0032.sql` ⇒ 两次 `rc=0`；
+第 1 遍 `DROP TABLE` ×3 + `NOTICE: table "…shape4…" does not exist, skipping`，
+第 2 遍三条全 `skipping`、末行观测 DO 打同一句 NOTICE。撤后 `pg_tables` 里三个名字 0 行，
+`fde_llm_bindings` 的约束数仍是 3（没被 CASCADE 之类的顺手带走）。
+
+**单向门写进交付物本体**（不是只写在 PR 描述）：撤后「重放 0010 的 RENAME 要回旧目录」这条路不再可用，
+旧供应商行 / 模型目录行 / shape4 那次的 `record_before` 原件**只能从 dump 恢复**
+⇒ 头注释要求撤前 `pg_dump -t … -t … -t …` 落到部署记录；`docs/ops/transcript-ledger-inspection.md` §7.4 的回滚 SQL
+在已应用 0032 的库上会 `42P01`（那段 261027 的过程叙事一字未改，只追加现状）。
+
+**给其它部署的撤前判据**（SQL 在 0032 头注释里）：`pg_stat_user_tables` 的 `last_seq_scan` / `last_idx_scan`。
+⚠ 那是**每库自己的**统计，且 `pg_stat_reset()` 会清成 NULL ⇒ 「全 NULL」有两种读法，分不清就先 dump。
+dev 实测停在 0010 改名那天：`llm_models_retired 2026-10-03 09:53` / `llm_providers_retired 09:52`。
+
+**门禁读数**：`node --check portal/test/migrations.test.js` rc=0；`node --test portal/test/migrations.test.js` **28/28** rc=0；
+`npm test` rc=**0**（2160 tests / 0 fail / 5 skip——4 条真库 + 1 条 LiteLLM live，env 门，不假通过）；
+真库闸 `TEST_DATABASE_URL=… postgres:16 node --test portal/test/migrate-fresh-db.test.js` **4/4** rc=0
+（一次性容器 `127.0.0.1:15499`，跑完即删，未连真实 dev 库 `station-db`）。
+
+**遗留**：① 本机的 dev 库 `station-db` **还没撤**（本单只交迁移，不改现存库——`MIGRATE_ON_START=1` 会在下次起 portal 时应用）；
+② `deploy/migrations/README.md` 末尾「现状：增量迁移已包含 0001 至 …」那段本来就漂着（停在 0026，后面还倒叙回 0021），
+本单没碰它——那是另一条口径（README 的迁移摘要该不该改成「只写最新一条 + 指回目录」），别顺手改。
