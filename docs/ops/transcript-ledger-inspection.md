@@ -542,6 +542,13 @@ COMMIT;
 | 真机复活 | 两个会话各发一条消息 ⇒ `finished / judge_done`（`1ead0b1a…` 是 10-23 起连砖 4 次的那个标本） |
 | 回滚 | `UPDATE transcript_rounds SET record = b.record_before FROM transcript_rounds_shape4_bak_20261027 b WHERE b.dedup_key = transcript_rounds.dedup_key`（本次未用） |
 
+> **现状（2026-11-13，issue #503 / 迁移 `0032`）——只补现状，上面那段过程叙事一字未改**：
+> 本节的备份夹具 `transcript_rounds_shape4_bak_20261027` **已由 `deploy/migrations/0032-drop-retired-tables.sql` 撤除**
+> （同批撤掉 0010 改名留下的 `llm_providers_retired` / `llm_models_retired`）。⇒ 上面那条**回滚 SQL 在已应用 0032 的库上会直接 `42P01`**：
+> 要回滚就得先把表导回来——按迁移头注释的要求取那份**撤前 `pg_dump`**（落在各部署的部署记录里）`psql -1 -f` 回去再跑。
+> 两个附带事实：这张表**不在任何迁移文件里**（手工建的），所以**全新库里本来就没有它**（⇒ `0032` 里那句 `DROP TABLE` 必须带 `IF EXISTS`）；
+> 而真正的修数据结论不依赖它（§7.1 复跑 0 行 + 真机复活已成立），探不到表 ≠ 没修过。
+
 ### 7.5 「代码已兜住」与「必须修数据」的边界（别修多，也别修少）
 
 - **§5 的 `:input:` 插队：现在有代码兜底，巡检计数 > 0 不等于会话坏**。2026-10-27 在 v0.1.43 上现跑
