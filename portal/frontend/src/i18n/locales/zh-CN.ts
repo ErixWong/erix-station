@@ -315,6 +315,9 @@ export const zhCN = {
     event: {
       resync: '事件流需重同步（{why}），正在重连补发…',
       resyncBufferOverflow: '服务端缓冲溢出',
+      // issue #502 D-6：断线补发拿不到那段未完稿正文时的占位行（后端帧 `source:'none'` +
+      // `placeholder:true`）。中性分隔行，不是错误行：终态原因仍由 `run_end` 那条分隔行负责。
+      partialOutputLost: '断线期间这段流式正文没能恢复（服务端已无副本），下面按终态继续。',
       attempt: 'round {round} · 尝试 {attempt}/{max}',
       // issue #288（缺陷 B）：worker 被宿主杀掉并重排（之前用户只看到同一个工具卡片亮 3 次，
       // 最后拿一句没原因的 attempts exhausted）。载荷是 portal 在 release-requeue 分支合成的：

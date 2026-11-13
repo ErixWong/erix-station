@@ -1219,18 +1219,76 @@ describe('#288 tool_replay_decision_required（挂起工具未重放）', () => 
 // 前端两个集合都**不许**加它：加了 `EVENT_TYPES` ⇒ 实时多挂一个监听（同一 run 变成「实时一条 +
 // 历史一条」的起点）；加了 `HISTORY_REPLAY_TYPES` ⇒ 它会流进展示层状态机（本单要的是中性 entry，
 // 由 store 自己分流，见 stores/workbench.ts 的 addPartialOutput）。
-describe('#300 partial_output 不进 EVENT_TYPES / HISTORY_REPLAY_TYPES', () => {
-  it('实时：EventSource 没有为 partial_output 挂监听（加进 EVENT_TYPES 就红）', () => {
+describe('#300/#502 partial_output：只订不回放的展示项', () => {
+  // 这条 describe 在 #300 时叫「partial_output 不进 EVENT_TYPES / HISTORY_REPLAY_TYPES」。
+  // **issue #502 D-6 把前半句反过来了**（不是删断言，是换判据）：那一行/那一帧现在是补发通路的一部分，
+  // EventSource **必须**订得到它 ⇒ 断言从 `false` 改成 `true`，标题也改成「只订不回放的展示项」。
+  // 后半句（不进 HISTORY_REPLAY_TYPES）原样保留，它仍是 #300 那条「刷新后别出两条正文」的红线。
+  it('#502：实时必须订得到 partial_output（漏进 EVENT_TYPES 就红：补发帧一条都收不到）', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
     s.connect('sess-1');
-    expect(lastES().listeners.has('partial_output')).toBe(false);
-    // 顺手钉住它也不是 assistant_delta 的别名：正文增量仍只有 assistant_delta 一条通路
+    expect(lastES().listeners.has('partial_output')).toBe(true);
+    // 顺手钉住它不是 assistant_delta 的别名：碎片增量与快照覆盖是**两条**通路，都在册。
     expect(lastES().listeners.has('assistant_delta')).toBe(true);
     expect(s.lastSeq.value).toBe(0);
   });
 
-  it('回放：replayEvent 收到 partial_output 时零副作用（未进 HISTORY_REPLAY_TYPES）', () => {
+  it('#502 判据 4（不重复的方向）：快照帧**覆盖**已有半截正文，不是追加', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 5, text: '半' });
+    lastES().emit('assistant_delta', { seq: 6, text: '截' });
+    expect(s.deltaText.value).toBe('半截');
+    // 重连补发的快照帧（无 `seq`、无 `id:`）：客户端已有「半截」，服务端给的是全量
+    lastES().emit('partial_output', { run_id: 'r1', text: '半截正文没说完', uptoSeq: 9, chunks: 42, source: 'memory' });
+    expect(s.deltaText.value).toBe('半截正文没说完');
+    expect(s.deltaText.value).not.toContain('半截半截');
+  });
+
+  it('#502 判据 4（不空洞的方向）：气泡被 run_end/round_start 清空后，快照帧把正文放回来', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 5, text: '断线前的半句' });
+    lastES().emit('round_start', { seq: 6, round: 2 }); // 界面上那段被清空
+    expect(s.deltaText.value).toBe(null);
+    lastES().emit('partial_output', { run_id: 'r1', text: '断线前的半句＋断线期间的那半句', uptoSeq: 7, chunks: 80, source: 'db' });
+    expect(s.deltaText.value).toBe('断线前的半句＋断线期间的那半句');
+  });
+
+  it('#502 D-5 占位：source=none 的占位帧不许留空白（清气泡 + 出一行中性提示）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { seq: 5, text: '残留的半截' });
+    lastES().emit('partial_output', { run_id: 'r1', text: '', uptoSeq: null, chunks: 0, truncated: false, source: 'none', placeholder: true });
+    expect(s.deltaText.value, '半截气泡必须清掉（挂着半截比清空更坑）').toBe(null);
+    expect(hooks.onSep).toHaveBeenCalledTimes(1);
+    expect(String(hooks.onSep.mock.calls[0][0])).toContain('没能恢复');
+    expect(hooks.onSysErr).not.toHaveBeenCalled(); // 中性提示，不是红色错误行
+  });
+
+  it('#502：快照帧没有 seq ⇒ 不推进本地水位线（不污染重连游标）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('partial_output', { run_id: 'r1', text: '正文', uptoSeq: 12, source: 'memory' });
+    expect(s.deltaText.value).toBe('正文');
+    expect(s.lastSeq.value, '帧里没有 seq ⇒ 水位线一步都不许动').toBe(0);
+  });
+
+  it('#502：脏快照（text 不是字符串）不当成正文，也不炸', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    lastES().emit('partial_output', { run_id: 'r1', text: 42, source: 'db' });
+    expect(s.deltaText.value).toBe(null);
+    expect(hooks.onSep).not.toHaveBeenCalled();
+  });
+
+  it('#300 仍在：回放（replayEvent）收到 partial_output 时零副作用（未进 HISTORY_REPLAY_TYPES）', () => {
     const hooks = makeHooks();
     const s = useEventStream(hooks);
     s.replayEvent({ seq: 41, run_id: 'r1', type: 'partial_output', payload: { text: '半截', chunks: 3, truncated: false } });

@@ -1,7 +1,18 @@
 // issue #300：GET /api/sessions/:id/events/history 的**合成项** `partial_output`（只读重建）。
 // 缺陷：runner 的 catch 固定 `final_text:''` ⇒ 被停止/失败的 run 在 messages 里**零助手锚点**，
-// 而正文区只从锚点渲染 ⇒ 界面上这次 run 一片空白。修法：本**只读**端点把该 run 的 `assistant_delta`
-// 按 seq 聚合成**一条**合成项下发（**不落库、不进 SSE**）。
+// 而正文区只从锚点渲染 ⇒ 界面上这次 run 一片空白。修法：本**只读**端点给该 run 下发**一条**
+// 合成项 `partial_output`。
+//
+// **issue #502 D-7 改了取数来源，本文件的夹具跟着改（每处理由写在改动点旁边）**：
+//   * 来源从「聚合该 run 全部 `assistant_delta`」改成「读终态事务写下的那一行 `type='partial_output'`」
+//     （碎片已不再落库：`internal.js` 写入侧按引擎 `eventTierOf` 拦住，存量由迁移 0033 清掉）。
+//   * 于是 `seedAbortedRun` 的 `deltas: [...]` 参数**语义变了但名字留着**：它现在写的是那一行的
+//     `payload.text`（拼接这些片段）与 `chunks`（片段条数）——原来那些"几片拼成一句"的断言
+//     因此仍然承重，只是断的是「写侧拼好、读侧原样取回」而不是「读侧自己拼」。
+//   * 「不落库」这条旧断言**反过来**了（D-3 之后那一行就是库里的行），改成断「它不在下发白名单里，
+//     所以仍只以合成项出现一次」——原断言的**意图**（不许出现两条正文）保留，换了一种钉法。
+//   * 成本红线两条的 SQL 正则从 `assistant_delta` 改成 `partial_output`：不改就成了**恒真**的空断言
+//     （regex 永不命中 ⇒ 「零额外查询」看着绿其实没测）。
 // 判据三条（缺一不合成）：① 该 run 出现在本次响应窗口里；② runs.status IN ('finished','failed')
 // 且该 run 零助手锚点（含 synthetic 行）；③ 聚合出非空文本。
 // 隔离约定（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB。
@@ -104,7 +115,42 @@ class PartialOutputPool extends FakePool {
       };
     }
 
-    // 聚合：SELECT run_id, seq, payload FROM run_events WHERE run_id = ANY($1) AND type='assistant_delta' ORDER BY run_id, seq
+    // #502 D-7 的取数：SELECT run_id, seq, payload FROM run_events WHERE run_id = ANY($1) AND type='partial_output' ORDER BY run_id, seq
+    if (flat.includes('run_events') && flat.includes("type = 'partial_output'")) {
+      const ids = params[0] ?? [];
+      // 「每 run 至多一行」在真库里由迁移 0033 的部分唯一索引兜，这里照真库**允许**多行返回
+      // （代码若真的拿到两行，必须自己挑一条而不是静默拼起来 ⇒ 下面故意不去重）。
+      const rows = this.runEvents.filter((e) => ids.includes(e.run_id) && e.type === 'partial_output');
+      // **夹具兼容折算**（不是「好心兼平」，是把真写路径补上）：本文件是 HTTP 读侧用例，跑不到
+      // `finishRun`/`insertPartialOutputRow`，而 #502 之前的老夹具只播 `assistant_delta` 行。
+      // 这里按**真写路径的形状**把那些 delta 折算成终态那一行（拼接顺序 = seq 升序、脏值整条跳过、
+      // `chunks` 只数真正参与拼接的、`seq` 取最后一条 delta 的 seq），读侧断言的原意一条不少：
+      // 「whole-run 口径」「每批至多一条」「脏值不拼进正文」「合成项不占 limit」全都照旧承重。
+      for (const id of ids) {
+        if (rows.some((r) => r.run_id === id)) continue;
+        const deltas = this.runEvents
+          .filter((e) => e.run_id === id && e.type === 'assistant_delta')
+          .sort((a, b) => a.seq - b.seq);
+        const parts = deltas.filter((e) => typeof e.payload?.text === 'string' && e.payload.text !== '');
+        if (parts.length === 0) continue;
+        rows.push({
+          run_id: id,
+          seq: deltas[deltas.length - 1].seq,
+          type: 'partial_output',
+          payload: {
+            text: parts.map((e) => e.payload.text).join(''),
+            reasoning: '', uptoSeq: deltas[deltas.length - 1].seq,
+            chunks: parts.length, truncated: false, source: 'legacy',
+          },
+        });
+      }
+      const ordered = /ORDER BY run_id, seq/.test(flat);
+      if (ordered) rows.sort((a, b) => (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : a.seq - b.seq));
+      return { rows };
+    }
+
+    // 旧口径（#502 之前）：聚合整 run 的 assistant_delta。留着这条分支只为**变异测试**服务：
+    // 产品代码若退回聚合 delta，它照样拿得到行，而合成项的 seq/chunks 形状会与新断言不符 ⇒ 用例红。
     if (flat.includes('run_events') && flat.includes("type = 'assistant_delta'")) {
       const ids = params[0] ?? [];
       const rows = this.runEvents.filter((e) => ids.includes(e.run_id) && e.type === 'assistant_delta');
@@ -176,13 +222,22 @@ async function startServer() {
   };
 }
 
-/** 造一个「被停在半路」的 run：终态 + 零锚点 + N 条 assistant_delta。 */
+/**
+ * 造一个「被停在半路」的 run：终态 + 零锚点 + **那一行 `partial_output`**（#502 D-3 的形状）。
+ * `deltas` 参数的语义（改动点，理由见文件头）：这些片段模拟**写侧**累加器当初拼出来的正文，
+ * 本函数把它们拼成 `payload.text`、把条数写成 `payload.chunks`——读侧只是原样取回，
+ * 「拼了几片」仍是可断言的面（可观测性字段本来就是为了核对这个）。
+ */
 function seedAbortedRun(pool, { runId = 'r-partial', status = 'failed', deltas = [], anchor = null, startSeq = 1, extraEvents = [] }) {
   pool.seedRun(runId, status);
   let seq = startSeq;
   pool.seedEvent({ seq: seq++, runId, type: 'round_start', payload: { round: 1 } });
-  for (const [i, text] of deltas.entries()) {
-    pool.seedEvent({ seq: seq++, runId, type: 'assistant_delta', payload: typeof text === 'object' && text !== null ? text : { text } });
+  const parts = deltas.filter((t) => typeof t === 'string' && t !== '');
+  if (parts.length > 0) {
+    pool.seedEvent({
+      seq: seq++, runId, type: 'partial_output',
+      payload: { text: parts.join(''), reasoning: '', uptoSeq: seq - 1, chunks: parts.length, truncated: false, source: 'terminal' },
+    });
   }
   for (const extra of extraEvents) pool.seedEvent({ seq: seq++, runId, ...extra });
   if (anchor) pool.seedMessage({ id: `${runId}-msg`, runId, ...anchor });
@@ -213,11 +268,17 @@ test('#300 终态+零锚点+有 delta ⇒ 恰一条 partial_output，seq=最后�
     const body = await s.history();
     const parts = partialsOf(body);
     assert.equal(parts.length, 1, `一条 run 至多一条合成项（body=${JSON.stringify(body)}）`);
+    // issue #502 D-7：合成项的 `payload` 现在**原样取自那一行**，不再由读侧自己拼 ⇒ 载荷形状跟着写侧走：
+    // 多出 `reasoning`/`uptoSeq`/`source`（additive，前端只读 `text`/`truncated`）。
+    // `seq` 仍是「这条合成项在升序序列里的位置」，只是来源从「最后一条 delta 的 seq」换成「那一行自己的 seq」
+    //（终态写入时它排在 `run_end` 之后 ⇒ 依旧落在历史末尾，#300 的位置语义没变）。
     assert.deepEqual(parts[0], {
-      seq: 7, // = 最后一条 assistant_delta 的 seq（不是新分配的 seq）
+      seq: 7,
       run_id: 'r-partial',
       type: 'partial_output',
-      payload: { text: '你好世界', chunks: 2, truncated: false }, // 按 seq 6→7 升序，reasoning_delta 不参与
+      // `source: 'legacy'` 是本文件 fake 的折算标记（见文件头「夹具兼容折算」）；真库写侧写的是 `'terminal'`
+      // 读侧只把它认识的键交给前端（`reasoning` 在载荷里但不外泄：前端只吃 text/chunks/truncated + 新增的 uptoSeq/source）
+      payload: { text: '你好世界', uptoSeq: 7, chunks: 2, truncated: false, source: 'legacy' },
     });
     assert.deepEqual(
       body.events.map((e) => [e.seq, e.type]),
@@ -225,8 +286,12 @@ test('#300 终态+零锚点+有 delta ⇒ 恰一条 partial_output，seq=最后�
       '合成项参与升序排序（排在 round_start 之后）；run_end 仍不下发，终态行改为从 runs 投影（#236）',
     );
     assert.equal(body.next_cursor, null);
-    // **不落库**：run_events 里不得出现 partial_output 行
-    assert.equal(s.pool.runEvents.filter((e) => e.type === 'partial_output').length, 0);
+    // #502 之前这条钉的是「合成项**不落库**」；#502 D-3 之后它落库了 ⇒ 断言换成「读侧不新增行」：
+    // 本文件的夹具只播 delta 老行（折算只发生在 fake 的返回里，见文件头注释），
+    // 真库那一行的存在性/唯一性由 `delta-not-persisted-db.test.js` 与
+    // `internal-delta-not-persisted.test.js` 承重。
+    assert.equal(s.pool.runEvents.filter((e) => e.type === 'partial_output').length, 0,
+      '读侧不得往 run_events 里补写行（读路径只读不写）');
   } finally {
     await s.close();
   }

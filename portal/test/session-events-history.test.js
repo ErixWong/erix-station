@@ -357,15 +357,17 @@ test('#371-A 白名单含 persistence_error：落盘失败事件刷新后必须�
 test('payload 大小防护：字符串叶值截 2000 字符 + 标记（JSON 形状保持合法）', async () => {
   const s = await startServer();
   try {
+    // issue #502 D-7：`tool_call_delta` 不再落库，也不再进白名单 ⇒ 它**不该出现在响应里**。
+    // 本条用例的载荷大小防护原意保留：截断断言搬到仍在册的 `tool_use` 上（一条同样长的叶值），
+    // `tool_call_delta` 这条种子留着，改成断言「它被白名单挡掉了」——这是 #502 新增的那半边事实。
     s.pool.seed(ev(1, 'tool_call_delta', { tool_call_id: 'c1', name: 'write', arguments_delta: 'x'.repeat(5000) }));
     s.pool.seed(ev(2, 'tool_use', { tool_call_id: 'c2', name: 'write', input: { content: 'y'.repeat(3000), meta: { note: '短' } } }));
 
     const body = await (await fetch(`${s.base}/api/sessions/${SESSION_ID}/events/history`, {
       headers: { Cookie: s.cookieHeader },
     })).json();
-    const d = body.events.find((e) => e.type === 'tool_call_delta').payload.arguments_delta;
-    assert.equal(d.length, 2000 + '…（已截断）'.length);
-    assert.ok(d.endsWith('…（已截断）'));
+    assert.equal(body.events.find((e) => e.type === 'tool_call_delta'), undefined,
+      '#502：`tool_call_delta` 不落库也不下发（白名单里已摘）');
     const input = body.events.find((e) => e.type === 'tool_use').payload.input;
     assert.equal(input.content.length, 2000 + '…（已截断）'.length);
     assert.equal(input.meta.note, '短', '短字符串不动');

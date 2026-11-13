@@ -594,13 +594,22 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function addPartialOutput(ev: RunHistoryEvent) {
     const runId = typeof ev.run_id === 'string' && ev.run_id !== '' ? ev.run_id : 'unknown';
     const id = `partial:${runId}`;
-    if (renderedIds.value) {
-      if (renderedIds.value.has(id)) return;
-      renderedIds.value.add(id);
-    }
     const text = partialText(ev.payload);
-    if (text === '') return;
-    entries.value.push({ kind: 'partial', id, text, truncated: partialTruncated(ev.payload), sessionId: sessionId.value });
+    if (text === '') return; // 脏载荷只有脏片段 ⇒ 界面不出现空气泡（既有口径）
+    const truncated = partialTruncated(ev.payload);
+    const at = entries.value.findIndex((e) => e.kind === 'partial' && e.id === id);
+    if (at >= 0) {
+      // **覆盖而非跳过**（#502 D-6）：同一 run 的 partial 现在可能先从 SSE 快照帧来（截到 `uptoSeq`
+      // 为止），再从 `GET /events/history` 那一行来（终态全量）⇒ 后者是更完整的那一份，必须盖掉它。
+      entries.value[at] = { kind: 'partial', id, text, truncated, sessionId: sessionId.value };
+    } else {
+      if (renderedIds.value) renderedIds.value.add(id);
+      entries.value.push({ kind: 'partial', id, text, truncated, sessionId: sessionId.value });
+    }
+    // 实时流式气泡与这条中性气泡是**同一份文本的两种存在方式**：中性气泡已就位 ⇒ 撤掉那份，
+    // 否则界面上同一段正文出现两遍（实时气泡 + 中性气泡）。只在**文本相同**时撤，
+    // 不跨 run 误伤（别的 run 正在流式时 `deltaText` 是它自己的那段，文本不会等）。
+    if (es.deltaText.value === text) es.deltaText.value = null;
   }
 
   function addMessage(m: ChatMessage) {
