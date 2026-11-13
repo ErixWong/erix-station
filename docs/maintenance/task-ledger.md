@@ -5081,11 +5081,14 @@ runner `507 / 507` rc=0、前端 `1322 passed` rc=0 + `vue-tsc` rc=0。
 - `seq` 从此**允许跳号**（碎片不占号 + 重复投递烧号）：`portal/test/internal.test.js` 那条「seq 单调、无空洞」
   改判据为「单调但允许空洞」，`docs/api/portal.md` §5.1 与 `docs/data/model.md` §1.12 同步改了口径。
 
-**门禁（最终树，只看 rc）**：根 `npm test` `2190 tests / 2181 pass / 0 fail / 9 skipped` rc=0
-（基线 2164/2159/0/5，新增 26 条用例、4 条 env-gated 真库用例在无 PG 时计入 skip）；
+**门禁（最终树，只看 rc）**：根 `npm test` `2197 tests / 2188 pass / 0 fail / 9 skipped` rc=0
+（基线 2164/2159/0/5 ⇒ 新增 33 条用例，其中 4 条 env-gated 真库用例在无 PG 时计入 skip）；
 runner `node --test 'runner/test/*.test.js'` `507 / 507` rc=0；
 前端 `unset NODE_ENV && timeout 240 npm test` `63 files / 1328 passed` rc=0（基线 63/1322）；
 `npm run typecheck`（`vue-tsc --noEmit`）rc=0；`npm run check:agents-hotlayer` rc=0。
+补发通路（判据 4/5）的**后端**一半在 `portal/test/session-partial-snapshot.test.js`（7 条：内存帧不带 `id:`、
+`uptoSeq <= Last-Event-ID` 不发、库里那一行回落 + 截断、内存优先只发一份、占位帧 `source:'none'`、
+有锚点不占位、首连不补发），前端一半在 `useEventStream.spec.ts` + `workbench.spec.ts`。
 真库面另跑一次性 `postgres:16.15`（`127.0.0.1:15499`，`TEST_DATABASE_URL` 环境门）：
 `portal/test/delta-not-persisted-db.test.js` `5 / 5` rc=0 —— 形状闸是**等式**：3 轮 × 10 片 与 3 轮 × 1000 片
 的 run 落库行数**完全相等**（类型分布逐字对：`round_start/tool_use/tool_result/round_end` 各 3 + `run_end` + `partial_output`）；
