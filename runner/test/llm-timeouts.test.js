@@ -63,7 +63,23 @@ const REPO_ROOT = path.join(RUNNER_DIR, '..');
 // `anthropic.js` 的 diff **只有一行注释**（`@deprecated issue #429: removed in 0.30` → `in 0.31`），
 // 工厂本体没删。`payload.js` / `timeout.js` / `errors.js` / `openai.js` **逐字节相同**
 // ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s 一字未变，仍然只追版本号（§8.27 先例）。
-const ENGINE_VERSION_PINNED = '0.31.0';
+// 0.31.0 → **0.32.0** 复核结果（#499 升级片，2026-11-13 本 worktree 现跑，两份包都是 `npm pack` 解包：
+// `/tmp/ea31/package` 与 `/tmp/ea32/package`；`sha256sum /tmp/erix-agent-0.32.0.tgz` =
+// `d246604b7b31d01bd9ee54e9fa94a13f144d19396333a78ab109dd60a7f92bf2`，与 #499 正文用的那份同一条）：
+// · `diff -rq <0.31>/src/providers <0.32>/src/providers` 报**四个文件**（`openai.js` / `openai.d.ts` /
+//   `payload.js` / `payload.d.ts`），`git diff --no-index --numstat` 逐文件是
+//   `payload.js +74/-0`、`payload.d.ts +45/-0`、`openai.js +25/-1`、`openai.d.ts +2/-5`；
+// · **本版 timeout 面只有加法**：`payload.js` 那 74 行是 erix-agent #785 P1 ② 的新函数
+//   `observeSentReasoningParams`（把「宿主给的 reasoning effort」与「最终写进 body 的值」分开记一笔，
+//   由 `openai.js` 在 `chat` / `chatStream` 两条路径挂到响应的 `sentRequestParams` 上）——
+//   `resolveProviderTimeouts` 的**函数体**从两版里各截一份对拼（`diff -u`）**无输出**；
+//   `openai.js` 删掉的那一行 `return openAIResponseToCanonical(value);` 被同一处的三行替换
+//   （给响应补 `sentRequestParams`），`openai.d.ts` 的 `-5/+2` 是返回类型注记放宽成
+//   `Record<string, any>`（#460 的先例），两者都不碰超时；
+// · `diff -q` 对 `timeout.js` / `errors.js` / `anthropic.js` **全部 rc=0**（逐字节相同）
+//   ⇒ 四相超时语义、legacy 120s 总闸、streamTotal 默认 300s、provider 可重试码面一字未变，
+//   仍然只追版本号（§8.27 先例），下面所有断言一字未改。
+const ENGINE_VERSION_PINNED = '0.32.0';
 
 // 决策者定稿的四相默认值（工单 /tmp/TICKET-261.md）——本文件里**唯一**的期望值来源是 helper，
 // 数值本身在 ① 里逐键钉一次，改数值必须同时改 docs/env.md §10.4（⑤ 会盯）。

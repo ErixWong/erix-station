@@ -12,7 +12,8 @@
 //      「写进注释里提醒自己」是文档，不是依赖——本文件自己的注释里就写着 `createAnthropicProvider`。
 //      ⚠ **上游删了也不许撤这一条**：将来上游把某个名字加回来时，Z1 是第一道（也是唯一一道）防线。
 //   ② **导出面硬判据**（0.31.0 起）：这 16 个名字在 `.` 与 `./tools` 两个入口上**必须一个都不在**。
-//      快照常量 `SURFACE_SNAPSHOT_0_31_0` 两个入口都是 `[]`（0.31.0 实测），现算结果与它逐名相等；
+//      快照常量 `SURFACE_SNAPSHOT_0_32_0` 两个入口都是 `[]`（0.31.0 实测，0.32.0 重新量过仍是 `[]`），
+//      现算结果与它逐名相等；
 //      `ENGINE_VERSION_MEASURED` 给快照盖版本章，升 pin 时强制重新量一遍。
 //
 // ⚠ **② 在 0.30.0 上是「快照对账」而不是「必须不在」**，因为**已发布的 0.30.0 一个都没删**：
@@ -33,6 +34,24 @@
 //   · `src/index.js` 与 `src/tools/index.js` 的 diff 只有**删行**（再导出表里那 17 行）；
 //   · 另外 9 个定义文件的 diff 只有 `@deprecated issue #429: removed in 0.30 → in 0.31` 这一行注释
 //     ⇒ 删的是**导出**，不是实现（指南 §2 的承诺在 0.31.0 才成立）。
+//
+// 0.32.0 重量（#499 升级片，2026-11-13 本 worktree 现查；对照面 = `npm pack` 解包的
+// `/tmp/ea31/package` 与 `/tmp/ea32/package`，后者 `sha256sum` = 发布包
+// `d246604b7b31d01bd9ee54e9fa94a13f144d19396333a78ab109dd60a7f92bf2`）：
+//   · 入口再导出表的**名字总数**（`src/index.js` / `src/tools/index.js` 扁平解析，= 本文件
+//     `exportedNames` 的口径）：`.` **85 → 96**（+11 / **删 0**），`./tools` **46 → 46**（一字未变）。
+//     新增的 11 个全是事件分级与 run 终态集合（`EVENT_TIERS` / `eventTierOf` / `EVENT_TIER_VALUES` /
+//     `EVENT_TIER_FACT` / `EVENT_TIER_STREAM` / `EVENT_TIER_DERIVED` / `HOST_SIDE_EVENT_TYPE_NAMES` /
+//     `canonicalEventTypeName` / `RUN_TERMINAL_STATUSES` / `RUN_CLEANUP_SAFE_STATUSES` /
+//     `streamCleanupEligible`），**这 16 个名字一个都不在其中**。
+//   · 本 worktree 装着的 0.32.0 上现算：`zeroPresent` 两个入口都是 `[]`；运行时
+//     `Object.keys(await import('erix-agent'))` = 96、`…('erix-agent/tools')` = 46，里面同样**一个都不在**
+//     ⇒ 快照两个入口仍都是 `[]`，Z3 继续钉「不在场」。
+//   · 反向补一条口径（免得下一个读者把「不在导出面」读成「实现被删」）：顺着再导出表**递归**
+//     展开整个可达闭包（同一套正则），0.31 与 0.32 两侧结果逐字相同：`.` 入口可达 229 个名字里
+//     还含这 16 个中的 9 个、`./tools` 入口可达 66 个里还含 4 个（`NOTE_VALUE_MAX_CHARS` /
+//     `removeRecord` / `resolveFileReadMaxBytes` / `setNotesClock`）⇒ 与 0.31 的结论一致：
+//     **删的是导出表那几行，不是实现**。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -82,16 +101,17 @@ const ZERO_CONSUMER_EXPORTS = [
 ];
 
 /** 快照盖的版本章：这一份「导出面上有谁」是在哪个引擎版本上量的。 */
-const ENGINE_VERSION_MEASURED = '0.31.0';
+const ENGINE_VERSION_MEASURED = '0.32.0';
 
 /**
- * **0.31.0 实测快照**：这 16 个名字里，哪些真的出现在导出面上（按入口分组）。
- * 0.31.0 起**两个入口都是空数组**——删除真的落地了（见文件头「0.31.0 实测」）。
- * 现算结果与它不等 ⇒ 红：少了不可能（已经空了），所以红的只有一种情况——**上游把名字加回来了**，
- * 那时本站在这些名字上的「零消费者」结论要重新评估（Z1 是闸门）。
+ * **0.32.0 实测快照**：这 16 个名字里，哪些真的出现在导出面上（按入口分组）。
+ * 0.31.0 起**两个入口都是空数组**（删除真落地），0.32.0 在本 worktree 重新量过**仍是两个空数组**
+ * 同一批实测证据见文件头「0.32.0 重量」那节（`.` 入口 85→96 全部是事件分级/run 终态面的加法，
+ * `./tools` 46→46 不变）。现算结果与它不等 ⇒ 红：少了不可能（已经空了），所以红的只有一种情况——
+ * **上游把名字加回来了**，那时本站在这些名字上的「零消费者」结论要重新评估（Z1 是闸门）。
  * 改这一格 = 重新评估，不是「修测试」。
  */
-const SURFACE_SNAPSHOT_0_31_0 = {
+const SURFACE_SNAPSHOT_0_32_0 = {
   '.': [],
   './tools': [],
 };
@@ -252,11 +272,14 @@ test('Z1 这 16 个零消费者导出：本站源码里一个都不 import / 不
 test('Z2 导出面快照盖的是**当前装着的**引擎版本（升 pin 后必须重新量一遍）', () => {
   assert.equal(engineVersion, ENGINE_VERSION_MEASURED,
     `引擎已从 ${ENGINE_VERSION_MEASURED} 升到 ${engineVersion}：`
-    + '`SURFACE_SNAPSHOT_0_31_0` 与 `ENGINE_VERSION_MEASURED` 必须在新版本上**重新量**，'
+    + '`SURFACE_SNAPSHOT_0_32_0` 与 `ENGINE_VERSION_MEASURED` 必须在新版本上**重新量**，'
     + '并重新决定这 16 个名字是「仍然已删（继续钉不在场）」还是「被加回来了（重评 Z1）」。');
 });
 
 test('Z3 这 16 个名字必须**一个都不在**导出面上（0.31.0 起是硬判据，不是快照对账）', () => {
+  // 0.32.0 复核（#499）：本断言的**语义与实现一字未改**，只是快照在 0.32.0 上重新量过（仍是两个 `[]`）。
+  // 上面那条 `>= 20` 故意不抄当下总数（0.32.0 实测是 `.` 96 / `./tools` 46，见文件头），
+  // 否则下次上游加导出就要跟着改断言；在这里它只负责「解析姿势没坏」。
   for (const entry of ['.', './tools']) {
     assert.ok(surface[entry].size >= 20,
       `从 ${entry} 入口只解析到 ${surface[entry].size} 个导出名，解析姿势可疑（入口文件形态变了？）`);
@@ -264,10 +287,10 @@ test('Z3 这 16 个名字必须**一个都不在**导出面上（0.31.0 起是�
       .filter((item) => item.entries.includes(entry))
       .map((item) => item.name);
     const measured = names.filter((name) => surface[entry].has(name)).sort();
-    assert.deepEqual(measured, SURFACE_SNAPSHOT_0_31_0[entry],
-      `${entry} 入口上这 16 个名字的**在场情况**与 0.31.0 实测快照（应为空）不一致：\n`
+    assert.deepEqual(measured, SURFACE_SNAPSHOT_0_32_0[entry],
+      `${entry} 入口上这 16 个名字的**在场情况**与 0.32.0 实测快照（应为空）不一致：\n`
       + `  现算 = ${JSON.stringify(measured)}\n`
-      + `  快照 = ${JSON.stringify(SURFACE_SNAPSHOT_0_31_0[entry])}\n`
+      + `  快照 = ${JSON.stringify(SURFACE_SNAPSHOT_0_32_0[entry])}\n`
       + '上游把名字加回来了 ⇒ 本站在这些名字上的「零消费者」结论要重新评估（Z1 是闸门）：\n'
       + '要么把新用途登记进 AGENTS.md 并重开一张工单，要么把调用点改掉；\n'
       + '⚠ 不许为了让它变绿把 Z3 改回去/删掉——它是「这 16 个名字不许出现在导出面」的唯一可执行断言。');
@@ -292,7 +315,7 @@ test('Z4 名单自身自洽：16 个名字、无重复、入口只有 `.` / `./t
   assert.deepEqual(twoEntry.map((item) => item.name), ['NOTE_VALUE_MAX_CHARS'],
     '两入口名字有且只有 NOTE_VALUE_MAX_CHARS 一个');
   assert.deepEqual(twoEntry[0].entries, ['.', './tools']);
-  assert.deepEqual(Object.keys(SURFACE_SNAPSHOT_0_31_0).sort(), ['.', './tools']);
-  assert.deepEqual(SURFACE_SNAPSHOT_0_31_0['.'], []);
-  assert.deepEqual(SURFACE_SNAPSHOT_0_31_0['./tools'], []);
+  assert.deepEqual(Object.keys(SURFACE_SNAPSHOT_0_32_0).sort(), ['.', './tools']);
+  assert.deepEqual(SURFACE_SNAPSHOT_0_32_0['.'], []);
+  assert.deepEqual(SURFACE_SNAPSHOT_0_32_0['./tools'], []);
 });

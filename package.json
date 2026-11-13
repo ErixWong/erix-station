@@ -23,7 +23,7 @@
     "check:agents-hotlayer": "node scripts/agents-hotlayer-budget.mjs"
   },
   "dependencies": {
-    "erix-agent": "0.31.0",
+    "erix-agent": "0.32.0",
     "nodemailer": "10.3.1",
     "pg": "^8.23.0",
     "yaml": "2.9.1"
