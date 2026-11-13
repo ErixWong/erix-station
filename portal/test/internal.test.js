@@ -502,7 +502,12 @@ test('setRunState：终态收敛（finished）合成 run_end + usage_ledger + as
   assert.equal(assistant.run_id, runId);
 });
 
-test('postEvents：seq 单调、无空洞；重复 client_event_id 幂等命中不耗 seq', async () => {
+test('postEvents：seq 单调；重复 client_event_id 幂等不第二行（issue #502 D-8 后：**允许跳号**）', async () => {
+  // 本用例在 #502 前叫「seq 单调、无空洞；重复 client_event_id 幂等命中不耗 seq」，改了两处，各自理由：
+  //   ① 事件类型从 `assistant_delta` 换成 `round_start`：D-1 之后碎片**不落库**，本用例要测的
+  //      「seq 分配与幂等」只在 durable 档发生 ⇒ 拿碎片测它已经测不到东西（不是删断言）。
+  //   ② 断言从「无空洞」改成「跳号合法」：D-8 删掉了逐事件 `SELECT 1` 预查，重投因此白耗一个 seq。
+  //      这是**有意的语义变更**（docs/api/portal.md §7.3 同步改写），不是回归。
   const { pool, userId, containerId, runId } = seedClaimable();
   const container = { id: containerId, user_id: userId };
   const user = { id: userId, login: 'alice' };
@@ -510,20 +515,22 @@ test('postEvents：seq 单调、无空洞；重复 client_event_id 幂等命中�
   const claimToken = ticket.claim_token;
   await setRunState(pool, { container, user, runId, claimToken, body: { state: 'running' } });
 
-  const ev = (n) => ({ client_event_id: `run1:1:${n}`, type: 'assistant_delta', ts: null, payload: { text: `t${n}` } });
+  const ev = (n) => ({ client_event_id: `run1:1:${n}`, type: 'round_start', ts: null, payload: { round: n + 1 } });
   const r1 = await postEvents(pool, { container, user, runId, claimToken, body: { batch_id: 'b1', events: [ev(0), ev(1), ev(2)] } });
   assert.deepEqual([r1.stored, r1.seq_first, r1.seq_last], [3, 1, 3]);
 
-  // 重复批次：全幂等命中，不消耗 seq
+  // 重复批次：全幂等命中，不产生第二行（但**会**白耗 seq ⇒ 下面的跳号断言）
   const r2 = await postEvents(pool, { container, user, runId, claimToken, body: { batch_id: 'b1', events: [ev(0), ev(1), ev(2)] } });
   assert.deepEqual([r2.stored, r2.seq_first, r2.seq_last], [0, null, null]);
 
-  // 新批次：seq 从 4 继续（无空洞）
+  // 新批次：seq 从 7 继续（3 个号被重投白耗）
   const r3 = await postEvents(pool, { container, user, runId, claimToken, body: { batch_id: 'b2', events: [ev(3)] } });
-  assert.deepEqual([r3.stored, r3.seq_first, r3.seq_last], [1, 4, 4]);
+  assert.equal(r3.stored, 1);
+  assert.equal(r3.seq_first, 7, '重投白耗三个 seq ⇒ 第四条落库事件从 7 起（§7.3：跳号合法）');
 
   const seqs = pool.events.map((e) => e.seq).sort((a, b) => a - b);
-  assert.deepEqual(seqs, [1, 2, 3, 4]);
+  assert.deepEqual(seqs, [1, 2, 3, 7], '库里只有四行，seq 之间允许有空洞');
+  assert.equal(pool.sessions[0].last_seq, 7, 'last_seq 仍单调递增 = 已分配的最大号');
 });
 
 test('releaseRun：attempts < max → requeue（runs.status 不回跳 A5/B、attempts 不变）；re-claim 后 attempt 递增', async () => {

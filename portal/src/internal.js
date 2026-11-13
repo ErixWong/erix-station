@@ -7,6 +7,7 @@
 // http.js 负责路由/鉴权头解析/响应序列化（SSE 头与事件写入的薄封装由本模块导出）。
 
 import crypto from 'node:crypto';
+import { EVENT_TIER_STREAM, eventTierOf } from 'erix-agent'; // issue #502：碎片档的**唯一**判据来自引擎分级表
 import { hashToken, audit } from './auth.js';
 import { purgeExpired } from './idempotency.js';
 import { allocSeq } from './seq.js';
@@ -15,6 +16,7 @@ import { getFdeLlmHeartbeatModels } from './llm.js';
 import { scheduleAutoTitle } from './session-title.js';
 import { fetchInputTextByMessageId, fetchRunAssistantText } from './session-text.js';
 import { samePayload, dedupConflictDetails } from './transcript-payload.js';
+import { partialOutputs } from './run-partial-buffer.js'; // issue #502 D-4：stream 档正文的进程内缓冲
 import { enqueueMaterializeChange } from './outbox.js';
 
 const LEASE_SECONDS = 90; // ⚠️ runner §4.2（待决策者确认）
@@ -480,14 +482,28 @@ export function registerSessionClient(sessionId, res) {
   return rec;
 }
 
+/**
+ * issue #502 D-2：seq-less 帧（stream 档碎片、`partial_output` 快照）的水位线口径。
+ *
+ * 两条都不显然，所以各自钉了具名用例（`portal/test/internal-delta-not-persisted.test.js`）：
+ *   ① **不得被 `ev.seq <= sinceSeq` 过滤掉**：碎片的 `seq` 是 `null`，而 JS 里 `null <= 7` 是 **true**
+ *      （null 被强制成 0）⇒ 不加守卫就是「补发期间到的碎片整批丢」；
+ *   ② **不得推进 `rec.lastSeq`**：把 `lastSeq` 写成 `null` 会让后面那些「只有碎片比得过来」的
+ *      durable 事件从「已补发」变成「未补发」（或反过来说，拿一个不存在的 seq 当水位线就是拿脏值兼平）。
+ */
+function advanceLastSeq(rec, ev) {
+  if (ev.seq != null) rec.lastSeq = ev.seq;
+}
+
 /** 补发完成后调用：把缓冲中的事件（seq > sinceSeq）写给该客户端，随后转 live。 */
 export function sessionClientGoLive(sessionId, rec, sinceSeq = null) {
   if (rec.resync) return; // 已判定需重同步（缓冲溢出）：连接已 end，不再 flush
   const events = rec.buffer.splice(0, rec.buffer.length);
   for (const ev of events) {
-    if (sinceSeq != null && ev.seq <= sinceSeq) continue; // 补发已含
+    // `ev.seq != null` 是前提（#502 D-2 ①）：seq-less 碎片不参与「补发已含」判定，它必须发出去。
+    if (sinceSeq != null && ev.seq != null && ev.seq <= sinceSeq) continue; // 补发已含
     writeSessionEvent(rec.res, ev, sessionId);
-    rec.lastSeq = ev.seq;
+    advanceLastSeq(rec, ev); // #502 D-2 ②：碎片不动水位线
   }
   rec.live = true;
 }
@@ -533,9 +549,11 @@ export function notifySessionEvents(sessionId, events) {
     for (const rec of [...set]) { // 复制：溢出路径会在迭代中从 set 移除 rec
       if (rec.resync) continue; // 已判定需重同步，等待连接关闭/清理
       if (!rec.live) {
+        // 缓冲溢出按**条数**判（#502 D-2：碎片不落库但仍进缓冲，上限仍就是 SESSION_CLIENT_BUFFER_MAX 条；
+        // 改成按字节或只数 durable 事件就是引入第二个阈值，本单不动它）。
         if (rec.buffer.length < SESSION_CLIENT_BUFFER_MAX) {
           rec.buffer.push(ev);
-          rec.lastSeq = ev.seq;
+          advanceLastSeq(rec, ev);
           continue;
         }
         // 缓冲已满：不再静默丢事件，改判重同步（§5.1：seq 无空洞 → 丢一条即需补发收敛）
@@ -543,7 +561,7 @@ export function notifySessionEvents(sessionId, events) {
         continue;
       }
       writeSessionEvent(rec.res, ev, sessionId);
-      rec.lastSeq = ev.seq;
+      advanceLastSeq(rec, ev); // #502 D-2 ②：碎片不动水位线
     }
   }
 }
@@ -743,6 +761,58 @@ async function terminalPayloadMatches(pool, run, body) {
   return canonicalHash(stored) === canonicalHash(incoming);
 }
 
+/**
+ * issue #502 D-3：终态时把「只剩半截的正文」落成**一行** `type='partial_output'`。
+ *
+ * 为什么需要这一行：#300 的「中止后还能看到那段正文」此前靠**聚合上千行 `assistant_delta`** 做到，
+ * 而 issue #502 把碎片停在不落库之后，那个来源就没了 ⇒ 必须有一个 durable 落点，否则
+ * §8.34 那条红线（中止态界面不许空白）会直接退回去。一行一个 run，不是一轮上千行。
+ *
+ * 硬口径（`portal/test/session-partial-output.test.js` 逐条钉）：
+ *   * **与 `run_end` 同一事务**：拆两个事务就出现「run 已终态但正文行还没写」的窗口，
+ *     而补发与 `GET /events/history` 都拿「终态」当取数前提（先例：#292「合成 run_end 不许挑到 COMMIT 之后」）。
+ *   * **只在该 run 没有 assistant 锚点时写**：锚点的判据与 `finishRun` 建锚点用的是**同一条**
+ *     （`typeof final_text === 'string' && length > 0`）。有锚点 ⇒ 正文的 durable 副本在
+ *     `transcript_rounds`/投影里，再落一份就是「两份正文」（#300 头号坑：重复正文）。
+ *   * `text` 空 ⇒ **不写行**（被停在 `sleep` 上的 run 本来就无正文可给）。
+ *   * `seq` 走 `allocSeq` 且排在 `run_end` 之后 ⇒ 它恰好是该 run 的最后一条，历史合成项与
+ *     `run_termination` 的排序位置天然正确。
+ *   * 幂等键 `${runId}:final:partial_output` + `ON CONFLICT DO NOTHING`；迁移 0033 另加部分唯一索引
+ *     `(run_id) WHERE type='partial_output'`，把「一个 run 只有一行」从代码约定抬成库面约束。
+ *   * `uptoSeq` 至少含本次 `run_end` 的 seq：补发侧拿它判「客户端的水位线有没有盖住这段正文」
+ *     （`X >= uptoSeq` ⇒ 它已经看到 run_end，界面已交给锚点/历史项，不该再发一帧）。
+ *
+ * @returns {Promise<boolean>} 是否写了行（写了才推 SSE）
+ */
+export async function insertPartialOutputRow(client, {
+  runId, sessionId, runEndSeq = null, hasAssistantAnchor = false, buffer = partialOutputs, log = console,
+}) {
+  if (hasAssistantAnchor) return false; // 有锚点 ⇒ 一份正文就够，绝不再落第二份
+  const snap = buffer.snapshot(runId);
+  if (!snap || snap.text === '') return false; // 空正文没什么可说的（也不写空行）
+  const seq = await allocSeq(client, sessionId);
+  const payload = {
+    text: snap.text,
+    reasoning: snap.reasoning,
+    uptoSeq: Number.isFinite(Number(runEndSeq))
+      ? Math.max(Number(snap.uptoSeq ?? 0), Number(runEndSeq))
+      : snap.uptoSeq,
+    chunks: snap.chunks,
+    truncated: snap.truncated,
+    source: 'terminal',
+  };
+  await client.query(
+    `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
+     VALUES ($1, $2, $3, $4, 'partial_output', $5, now())
+     ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+    [runId, sessionId, seq, `${runId}:final:partial_output`, JSON.stringify(payload)],
+  );
+  // 写完即丢弃内存缓冲：那一行已是 durable 副本，补发侧会回落读它（内存只服务「还没终态的那段」）。
+  buffer.drop(runId);
+  void log;
+  return true;
+}
+
 /** 终态收敛事务（runner §7.6 加锁顺序：锁 run → 校验租约 → 写终态 → queue 收敛 → messages/usage/run_end）。 */
 async function finishRun(pool, { user, runId, claimToken, state, body, config, log = console }) {
   const termination = body.termination;
@@ -860,6 +930,11 @@ async function finishRun(pool, { user, runId, claimToken, state, body, config, l
        ON CONFLICT (run_id, client_event_id) DO NOTHING`,
       [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(payload)],
     );
+    // issue #502 D-3：**同事务**补那一行 `partial_output`（上面刚写过锚点 ⇒ 锚点判据就是那一条）。
+    await insertPartialOutputRow(client, {
+      runId, sessionId: r.session_id, runEndSeq,
+      hasAssistantAnchor: typeof finalText === 'string' && finalText.length > 0,
+    });
 
     await client.query('COMMIT');
     // 浏览器侧 SSE 推送（终态 run_end 也必须实时可见）
@@ -939,13 +1014,34 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     }
 
     let stored = 0;
+    // issue #502 D-1：stream 档（逐字碎片）**不入库、不 allocSeq**，但仍然转浏览器 SSE。
+    // `stream_forwarded` 是 **additive** 计数（只数被转发的碎片），`stored` 的语义不变 = 真落库行数；
+    // runner 侧只把它当 debug 日志读数（`runner/agentd.js:725`），协议形状零改动。
+    let streamForwarded = 0;
     let seqFirst = null;
     let seqLast = null;
     const committedEvents = []; // 提交后推浏览器侧 SSE（D7）
     for (const ev of events) {
-      // 先查重再分配 seq：重复事件不消耗 seq（§7.3 严格递增、无空洞）。
-      const dup = await client.query(`SELECT 1 FROM run_events WHERE run_id = $1 AND client_event_id = $2`, [runId, ev.client_event_id]);
-      if (dup.rows.length > 0) continue;
+      // issue #502 判据 2：**名单不在这张纸上**——哪些类型属于碎片档只问 `erix-agent` 的
+      // `eventTierOf`/`EVENT_TIER_STREAM`（写入侧不得再手抄三个串）。命中的事件不 INSERT、不 allocSeq
+      //（那 877,155 行就是这里没拦住），但**照旧转 SSE**：打字机是实时通路，
+      // 不落库不等于不显示（`seq = null` ⇒ 帧不带 `id:`，不污染浏览器 Last-Event-ID，
+      // 也不会把补发水位线推到一条不存在的行上）。
+      if (eventTierOf(ev.type) === EVENT_TIER_STREAM) {
+        streamForwarded += 1;
+        // 缓冲是终态那一行 `partial_output` 与断线补发的**唯一**正文来源（#502 D-4）。
+        partialOutputs.observe(runId, { ...ev, session_id: r.session_id });
+        committedEvents.push({
+          seq: null, ts: (ev.ts ?? new Date().toISOString()),
+          run_id: runId, type: ev.type, payload: ev.payload ?? {},
+        });
+        continue;
+      }
+      // issue #502 D-8（排在「delta 不落库」之后做，口径见 docs/api/portal.md §7.3）：
+      // **只靠** `ON CONFLICT (run_id, client_event_id) DO NOTHING` 一条 SQL 幂等，不再先打一条
+      // `SELECT 1` 预查。代价是**重投会白耗一个 seq**（跳号），而 §7.3 原来的「无空洞」口径
+      // 本来就是「跳号合法、客户端不得拿它当重连判据」（#288/#292/#277 已三处先例），
+      // `chat_sessions.last_seq` 仍单调。收益：每事件少一次 DB 往返（预查是真库上每条事件都要打的一枪）。
       const seq = await allocSeq(client, r.session_id);
       const ins = await client.query(
         `INSERT INTO run_events (run_id, session_id, seq, client_event_id, type, payload, ts)
@@ -956,6 +1052,9 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
       );
       if (ins.rows.length > 0) {
         stored += 1;
+        // durable 事件落库成功才推进缓冲的 `uptoSeq`（#502 D-4 口径③：那是「已落库事件的最大 seq」，
+        // 幂等重投白耗的 seq 没有对应行，拿它当水位线会把该发的补发帧误判成「客户端已看到」）。
+        partialOutputs.observe(runId, { ...ev, seq, session_id: r.session_id });
         committedEvents.push({
           seq, ts: (ev.ts ?? new Date().toISOString()),
           run_id: runId, type: ev.type, payload: ev.payload ?? {},
@@ -1018,7 +1117,7 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
     try {
       if (committedEvents.length > 0) notifySessionEvents(r.session_id, committedEvents);
     } catch { /* 尽力推送 */ }
-    return { stored, seq_first: seqFirst, seq_last: seqLast };
+    return { stored, seq_first: seqFirst, seq_last: seqLast, stream_forwarded: streamForwarded };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -1913,6 +2012,9 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
          ON CONFLICT (run_id, client_event_id) DO NOTHING`,
         [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
       );
+      // issue #502 D-3：这条路径不写 assistant 锚点（worker 没报过终态 ⇒ `messages` 里零助手行），
+      // 所以 `hasAssistantAnchor` 取默认的 false；**同事务**落那一行碎片正文。
+      await insertPartialOutputRow(client, { runId, sessionId: r.session_id, runEndSeq });
       committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
     } else if (Number(qrow.attempts) < Number(qrow.max_attempts)) {
       // A5（决策者 2026-10-08 选 B：实现随文档）：attempt 级失败**不回写 runs.status、不回跳**。
@@ -1979,6 +2081,7 @@ export async function releaseRun(pool, { container, user, runId, claimToken, bod
          ON CONFLICT (run_id, client_event_id) DO NOTHING`,
         [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
       );
+      await insertPartialOutputRow(client, { runId, sessionId: r.session_id, runEndSeq }); // #502 D-3（同上：无锚点）
       committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
     }
 
@@ -2099,6 +2202,7 @@ export async function reapExpiredRuns(pool) {
            ON CONFLICT (run_id, client_event_id) DO NOTHING`,
           [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
         );
+        await insertPartialOutputRow(client, { runId, sessionId: r.session_id, runEndSeq }); // #502 D-3（回收路径同样无锚点）
         committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
         results.push({ run_id: runId, outcome: 'cancelled', run_status: 'finished' });
       } else if (Number(qrow.attempts) >= Number(qrow.max_attempts)) {
@@ -2120,6 +2224,7 @@ export async function reapExpiredRuns(pool) {
            ON CONFLICT (run_id, client_event_id) DO NOTHING`,
           [runId, r.session_id, runEndSeq, `${runId}:final:run_end`, JSON.stringify(runEndPayload)],
         );
+        await insertPartialOutputRow(client, { runId, sessionId: r.session_id, runEndSeq }); // #502 D-3（同上）
         committedRunEnd = { session_id: r.session_id, seq: runEndSeq, payload: runEndPayload };
         results.push({ run_id: runId, outcome: 'failed_max_attempts', run_status: 'failed' });
       } else {
