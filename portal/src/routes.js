@@ -1053,10 +1053,29 @@ export function startRoutesLoop(pool, config, {
       }
     }
   })();
+  // issue #506 评审③：`done` 是裸 async IIFE 的 Promise，`cli.js` 过去不消费它 ⇒ 循环里
+  // `onPause` / `log.warn` / 注入的 `sleep` 在异常分支抛错时，`done` 变 rejected 且无人 catch
+  // = **未捕获拒绝**（本仓已知陷阱：测试摘要全绿，进程却 rc=1）。所以启动时**立刻**挂处理器。
+  // 语义没动：`done` 仍是同一个 promise（await 它照样看到 resolve/reject），`settled` 是
+  // 「永不拒绝」的那份，给只想等退出、不关心失败细节的调用方用。
+  let loopFailure = null;
+  const settled = done.catch((err) => {
+    loopFailure = err;
+    try {
+      log.warn?.(`[routes] 消费循环异常退出（已就地接住，未成为未捕获拒绝）：${err?.message ?? err}`);
+    } catch {
+      // 日志面自己坏了（注入的 log.warn 抛错）不许再制造第二条未捕获拒绝
+    }
+  });
   return {
     stop() {
       abort.abort(); // 可中断：退避等待中的那一拍必须立刻断开，否则关闭最多白等 idleBackoffMaxMs
     },
-    done, // 循环真正退出时 resolve（优雅关闭与单测可 await）
+    done, // 循环真正退出时 resolve（优雅关闭与单测可 await；拒绝也照原样冒给 await 它的人）
+    // #506 评审③：已挂拒绝处理器的版本（永不拒绝）。优雅关闭走 `stopLoopsAndWait` 用它也行，
+    // 单测想断言「没有未捕获拒绝」时 await 这一份，不会自己把拒绝吃掉又漏掉别的。
+    settled,
+    /** #506 评审③：循环异常退出时的那个错误（正常退出为 null）。 */
+    failure: () => loopFailure,
   };
 }
