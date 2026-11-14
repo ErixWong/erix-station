@@ -697,11 +697,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //   · A 档（`deltaEntry.runId === null` + 具体 `laterOwner`）⇒ `claimedLater` 真 ⇒ 不撤（保守，可能两遍）；
     //   · B 档（`deltaEntry.runId === 'unknown'` + 具体 `laterOwner`）⇒ `deltaEntry.runId == null` **假**
     //     ⇒ `claimedLater` 假，而 `sameRun` 因 `'unknown'` 通配为真 ⇒ **撤掉别人的气泡**（这条是真风险）。
-    // 现在两边同一个 `isUnknownOwner`，B 档落进 A 档那一侧。**策略（定死，别再改回去）**：partial 自己的
-    // `runId` 是 `'unknown'`（服务端没给 `run_id`）时，任何**具体** `laterOwner` 都不等于它 ⇒ 一律保守**不撤**。
-    // **代价**：这种载荷下同一段正文可能在界面上出现两遍（delta 气泡 + 中性气泡）。
-    // **理由**：身份缺失时前端分不出「同一份正文的两种存在方式」与「两份恰好同文的正文」，而撤错的代价
-    //（用户正在看的那段字凭空消失）比多一行的代价大 —— 多一行刷新即回，撤错的那段字看不见。
+    // 现在两边同一个 `isUnknownOwner`，B 档落进 A 档那一侧。**策略（定死，别再改回去）—— 精确版，
+    // 别写成「未知就一律不撤」（那是错的，见下面第三档）**：
+    //   ① 气泡出生身份**未知** + 链路上出现过**具体**身份 + 那个具体身份**不是**这条 partial 的 run
+    //      ⇒ **不撤**（身份矛盾已知，撤错代价 > 多一行）；
+    //   ② 气泡出生身份**未知** + 出现过的具体身份**正是**这条 partial 的 run ⇒ **撤**
+    //      （补认领与归属一致，撤掉的就是它自己那一份）；
+    //   ③ 链路上**一个具体身份都没出现过**（`laterOwner` 也是未知 / 压根没有 delta 条目）⇒ 退回
+    //      **只比文本**的旧兼容口径，**照旧撤**。这一档**必须**保留：否则真·旧后端（帧里从不带
+    //      `run_id`）下同文两遍会全回来，那是 #502 判据 4 的红线。
+    // **①档的代价**：同一段正文可能在界面上出现两遍（delta 气泡 + 中性气泡）——多一行刷新即回，
+    // 撤错的那段字看不见，所以这一档宁可多一行。
     const laterOwner = es.deltaRunId.value ?? null;
     // 三个条件缺一就退化成撤错：气泡身份**未知** + 后来出现了**具体**身份 + 那个具体身份**不是**这条 partial 的 run。
     const claimedLater = deltaEntry !== null && isUnknownOwner(deltaEntry.runId)
