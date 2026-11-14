@@ -14,7 +14,7 @@ import { computed, ref, watch } from 'vue';
 import { api, ApiError, patchSessionTitle, postSessionAiTitle, toDisplayText } from '../api';
 import { projectionRoundToken, runSegment, toolCardKey as buildToolCardKey } from '../lib/toolCardKey';
 import { i18n } from '../i18n';
-import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
+import { useEventStream, RUN_FAIL_REASONS, type CardAlias, type ReplayMode, type RunEndPayload, type RunHistoryEvent } from '../composables/useEventStream';
 // issue #282：会话页动量状态条的状态机（SSE 逐帧喂；组件只读派生视图，见 components/RunStatusBar.vue）。
 import { createRunMomentumFeed } from '../composables/useRunMomentum';
 import { renderMarkdown } from '../lib/markdown';
@@ -602,7 +602,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const id = `partial:${runId}`;
     const text = partialText(ev.payload);
     // 只认真字面量 `true`（与 `partialTruncated` 同一口径）：缺键/脏值一律不当占位。
-    const placeholder = (ev.payload as Record<string, unknown> | undefined)?.placeholder === true;
+    //
+    // 审计第 7 条：**占位只在「真的没正文」时才成立** —— `text === ''` 且服务端确实说了「拿不到」。
+    // 原来这里只拿 `placeholder === true` 就直接带下去，而 `StreamPanel.vue` 是
+    // `v-if="en.placeholder"` 渲染占位文案（`v-else` 才渲染正文）⇒ 一项「有正文 + placeholder:true」
+    // 的载荷会把正文遮蔽掉（界面只剩一句「内容没留住」，而它就在下面）。**非空正文优先**。
+    const placeholder
+      = text === ''
+      && (ev.payload as Record<string, unknown> | undefined)?.placeholder === true;
     if (text === '' && !placeholder) return; // 脏载荷只有脏片段 ⇒ 界面不出现空气泡（既有口径）
     const truncated = partialTruncated(ev.payload);
     const at = entries.value.findIndex((e) => e.kind === 'partial' && e.id === id);
@@ -618,7 +625,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // 实时流式气泡与这条中性气泡是**同一份文本的两种存在方式**：中性气泡已就位 ⇒ 撤掉那份，
     // 否则界面上同一段正文出现两遍（实时气泡 + 中性气泡）。只在**文本相同**时撤，
     // 不跨 run 误伤（别的 run 正在流式时 `deltaText` 是它自己的那段，文本不会等）。
-    if (es.deltaText.value === text) es.deltaText.value = null;
+    //
+    // ⚠ 审计第 5 条：**顺序承重 —— 先 `removeDeltaEntry()` 再清 `deltaText`**。
+    // `watch(es.deltaText)` 在 `v === null` 时只把模块变量 `deltaEntry = null` 就 return，
+    // **不会从 `entries` 里摘掉那条已渲染的 `kind:'delta'`** ⇒ 原来只写
+    // `es.deltaText.value = null` 的话：界面上旧的 delta 气泡还在，旁边又多一条 `kind:'partial'`
+    // ⇒ 同一段正文两遍。`removeDeltaEntry()` 是靠 `deltaEntry` 找下标的，所以必须在它被 watcher
+    // 清空**之前**调（反了就找不到 entry， splice 不进去）。
+    if (es.deltaText.value === text) {
+      removeDeltaEntry();
+      es.deltaText.value = null;
+    }
   }
 
   function addMessage(m: ChatMessage) {
@@ -670,13 +687,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
    * 不进 SSE），既不进 EVENT_TYPES 也不进 HISTORY_REPLAY_TYPES ⇒ 自己推 entry；
    * **不喂 replayEvent**（它拿不到这个 type，自然不产工具卡片/分隔行，也不会「实时一条 + 历史一条」）。
    */
-  function replayMergedBatch(merged: Array<{ seq: number; msg?: ChatMessage; ev?: RunHistoryEvent }>) {
+  function replayMergedBatch(
+    merged: Array<{ seq: number; msg?: ChatMessage; ev?: RunHistoryEvent }>,
+    mode: ReplayMode = 'initial',
+  ) {
     for (const item of merged) {
       if (item.msg) addMessage(item.msg);
       else if (item.ev && item.ev.type === 'partial_output') addPartialOutput(item.ev);
       // issue #236：终态分隔条的响应期合成项（同一种存在方式：不落库、不进 SSE、不进两个集合）。
       else if (item.ev && item.ev.type === RUN_TERMINATION_TYPE) addRunTermination(item.ev);
-      else if (item.ev) es.replayEvent(item.ev);
+      // 审计第 4 条：`mode` 一路透传下去（旧页回放不得清实时气泡 / 不得回退轮水位）。
+      else if (item.ev) es.replayEvent(item.ev, mode);
     }
   }
 
@@ -1029,7 +1050,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       ];
       merged.sort((a, b) => a.seq - b.seq);
       const anchor = entries.value.length;
-      replayMergedBatch(merged);
+      // 审计第 4 条：**旧页回放口径**（与 openSession 的首屏历史重建区分开）——旧页不得清正在
+      // 流的实时气泡、不得把本轮的轮水位回退到旧页那一轮（否则当前轮快照被双闸误杀，正文打死）。
+      replayMergedBatch(merged, 'older-page');
       if (entries.value.length > anchor) {
         // 只搬「本批回放新产出」的那一段（anchor→尾）到头部；实时路/旧批次位置相对不动。
         entries.value.unshift(...entries.value.splice(anchor));

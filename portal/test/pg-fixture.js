@@ -90,12 +90,24 @@ export async function acquireBootstrapLock({
  * @param {(ctx: {database: string, url: string, pool: object|null, dbUrl: Function, adminPool: object}) => any} fn
  * @param {{prefix?: string, migrate?: boolean, poolMax?: number, log?: Function}} [opts]
  *        `migrate: false` ⇒ 只建库不迁移（`migrate-fresh-db.test.js` 要自己控制迁移身份/多次跑）
+ * @param {{prefix?: string, lockFile?: string,
+ *   createDatabase?: (name: string) => Promise<unknown>,
+ *   dropDatabase?: (name: string) => Promise<unknown>}} [options]
+ *   后两个钩子是**审计第 8 条留的注入点**：不注入就只能靠「库名非法」这种隔山打牛的方式去测
+ *   「建库失败会不会泄锁」。`lockFile` 让夹具测试用自己那个锁文件 —— 默认那个是与真库用例共用的，
+ *   `npm test` 并发跑时去碰它就是自找竞态。
  */
-export function createPgFixture(adminUrl, { prefix = 'wfx' } = {}) {
+export function createPgFixture(adminUrl, {
+  prefix = 'wfx', lockFile = LOCK_FILE, createDatabase = null, dropDatabase = null,
+} = {}) {
   const adminPool = adminUrl ? createPool(adminUrl, { max: 2 }) : null;
   const admin = adminUrl ? new URL(adminUrl) : null;
   const loginRole = admin ? decodeURIComponent(admin.username) : '';
   const loginPw = admin ? decodeURIComponent(admin.password || '') : '';
+
+  /** 建库 / 删库（默认真打注入的那台实例；测试可注入一个报错的钩子）。 */
+  const createDb = createDatabase ?? ((name) => adminPool.query(`CREATE DATABASE ${name}`));
+  const dropDb = dropDatabase ?? ((name) => adminPool.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`));
 
   /** 在注入的实例上换库 / 换登录角色拼连接串（只碰注入的那台，§2.2.4）。 */
   function dbUrl(database, user = loginRole, pw = loginPw) {
@@ -111,11 +123,20 @@ export function createPgFixture(adminUrl, { prefix = 'wfx' } = {}) {
     const name = `${prefix}_${crypto.randomBytes(4).toString('hex')}`;
     // 锁覆盖「CREATE DATABASE → bootstrap/migrate → 用例体 → DROP DATABASE」整段：
     // 要串的正是集群级角色 DDL，而用例体里也可能再发（migrate-fresh 的 ALTER/CREATE ROLE）。
-    const release = await acquireBootstrapLock();
-    await adminPool.query(`CREATE DATABASE ${name}`);
+    //
+    // ⚠ **审计第 8 条（真 bug）：锁一拿到就必须包进 `try/finally`**。原形状是
+    //   `const release = await acquireBootstrapLock();`
+    //   `await adminPool.query('CREATE DATABASE …');`   ← **在 try 之外**
+    //   `try { … } finally { … release(); }`
+    // ⇒ 建库报错（名字撞 / 实例满 / 连接掉）时 `release()` **永不执行**，锁文件留在那裡
+    // 直到 stale 阈值（默认 10 分钟）才被抢 ⇒ 同一次 `npm test` 里后面那些真库用例全卡在锁上
+    //（症状是「套件突然慢十分钟」而不是「一条红」，所以一直没人报）。
+    // 下面把 acquire 与建库一并放进同一个 `try`，**任何异常都释放**。
+    const release = await acquireBootstrapLock({ file: lockFile });
     const url = dbUrl(name);
     let pool = null;
     try {
+      await createDb(name); // ← 原来这一行在 `try` **外面**（锁泄就泄在这里）
       if (runMigrate) {
         // baseline(schema.sql) → bootstrap.sql → 全部增量。
         pool = createPool(url, { max: poolMax });
@@ -124,12 +145,12 @@ export function createPgFixture(adminUrl, { prefix = 'wfx' } = {}) {
       return await fn({ database: name, url, pool, dbUrl, adminPool });
     } finally {
       if (pool) await pool.end().catch(() => {});
-      await adminPool.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`).catch(() => {});
+      await dropDb(name).catch(() => {});
       release();
     }
   }
 
-  return { adminPool, adminUrl, loginRole, loginPw, dbUrl, withFreshDatabase };
+  return { adminPool, adminUrl, loginRole, loginPw, dbUrl, withFreshDatabase, lockFile };
 }
 
 /** 用例侧的 env 门口径（两处共用同一句话，别再抄出第三种说法）。 */

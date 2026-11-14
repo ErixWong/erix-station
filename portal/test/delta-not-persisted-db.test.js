@@ -28,7 +28,7 @@ import { hashToken } from '../src/auth.js'; // createPool/migrate 已随夹具�
 // `pg_authid` 同一行），而 `migrate.js` 的 advisory lock 作用域带 database OID ⇒ 两个新建库
 // 互相看不见 ⇒ `npm test` 带 TEST_DATABASE_URL 并发跑时偶发 `tuple concurrently updated`(XX000)。
 import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
-import { claimRun, setRunState, postEvents } from '../src/internal.js';
+import { claimRun, setRunState, postEvents, putCheckpoint } from '../src/internal.js';
 import { partialOutputs } from '../src/run-partial-buffer.js';
 // issue #502 形态 M 绊线用例要拿 runner 的**真映射**造 `round_end` 载荷（不手抄字段名）。
 // `loopEventPayload` 是导出的纯函数（`runner/worker.js:232`，导出理由就写在它的注释里）；
@@ -455,7 +455,7 @@ test('#502 迁移 0033：分批清存量可重放（第二遍 0 行 rc=0）、�
   });
 });
 
-test('#502 体积闸：清理后 `run_events` / `run_checkpoints` 各自的每行字节上界 + 碎片占比 < 5 %', { skip: SKIP }, async () => {
+test('#502 体积闸：`run_events` 每行字节上界 + 碎片占比 < 5 %；`run_checkpoints` 每行 / 总行数 / 总字节三条上界（样本必须非空）', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     // 先造一份**清理之后**的真实形状（空库量出来的每行字节是页常数，什么都不是；行数太少时
     // 每行字节由 5 个索引的页粒度决定 ⇒ 必须喂够行数再量，这条上界才有意义）。
@@ -487,14 +487,45 @@ test('#502 体积闸：清理后 `run_events` / `run_checkpoints` 各自的每�
     }
     // run_checkpoints：本单不动它（清它属于 issue 里另开的账），但给出上界并说明来历 ——
     // 它的每行体积是「整份引擎 run state」，dev 实测 85 行 / 4,644,864 B ≈ 53 KB/行。
+    //
+    // ⚠ **审计第 9 条：这一段的样本原来是空的**。全新库里 `run_checkpoints` 是 **0 行**（本用例
+    // 只往 `run_events` 插行），于是 `if (cn > 0)` 永不进入，剩下那句 `assert.ok(cb >= 0)`
+    // 是个**恒真**的空断言（`pg_total_relation_size` 返回空表那几个页的常数，也 >= 0）。
+    // 「闸看起来在，其实没验」——本单把它修成「先种真行，再断三条」。
+    //
+    // 种行走**产品写入口** `putCheckpoint`（U8），不是自己 INSERT：那样才连 `ON CONFLICT (run_id)`
+    // + revision CAS 一起验了（自己 INSERT 就只能验「页常数没超标」）。
+    // `run_checkpoints.run_id` 是主键且外键指 `runs` ⇒ 每条 checkpoint 要挂在一个真 run 上。
+    const CP_ROWS = 10;          // 种 10 行（与 dev 库的 85 行同量级下界，够把每行字节从页常数里分出来）
+    const CP_ROWS_CAP = 20;      // 总行数上界：夹具只种 10 条 ⇒ 任何「顺带多写」（每轮一行 / 每事件一行）都会顶到
+    const CP_TOTAL_BYTES_CAP = 4 * 1024 * 1024; // 10 行 × 53 KB ≈ 0.5 MB 实占 ⇒ 4 MB 是 8 倍余量；行数翻十倍同时破两条
+    // ⚠ 每个 checkpoint 要**自己的一套 scene**：`seedRunScene` 里每个 id 都是 uuid，
+    // 拿已经种过的 `volScene` 再种一遍就是 `duplicate key value ... "users_pkey"`（真踩过）。
+    const cpScenes = [];
+    for (let i = 0; i < CP_ROWS; i++) cpScenes.push(ids(`cp${i}`));
+    // 快照载荷尺寸照 dev 量级（每行 ≈ 53 KB）；走 U8 真入口需要每个 run 已领起。
+    for (const [i, scene] of cpScenes.entries()) {
+      const live = await claimAndStart(pool, scene);
+      await putCheckpoint(pool, {
+        container: live.container, user: live.user, runId: scene.runId, claimToken: live.claimToken,
+        // `snapshot` 必须是对象（`putCheckpoint` 会验）；给一个 ≈ 53 KB 的引擎 state 形状
+        body: { revision: 1, snapshot: { round: i + 1, messages: 'x'.repeat(53_000) } },
+      });
+    }
     const cp = await pool.query(
       `SELECT count(*)::int AS n, pg_total_relation_size('run_checkpoints') AS sz FROM run_checkpoints`,
     );
     const cn = cp.rows[0].n;
     const cb = Number(cp.rows[0].sz);
-    if (cn > 0) {
-      assert.ok(cb / cn < 512 * 1024, `run_checkpoints 每行字节上界破了：${Math.round(cb / cn)} B/行`);
-    }
+    // **反向自证（空样本不得静默通过）**：种了多少行就必须拿到多少行。
+    // 拿不到（0 行 / 少于预期）就是**本用例红**，而不是「跳过断言继续绿」——那正是审计第 9 条的形状。
+    assert.equal(cn, CP_ROWS,
+      `样本必须是 ${CP_ROWS} 行（审计第 9 条：0 行时旧写法会把恒真的「cb >= 0」当成读数）：实拿 ${cn} 行`);
+    assert.ok(cb / cn < 512 * 1024, `run_checkpoints 每行字节上界破了：${Math.round(cb / cn)} B/行（${cn} 行 / ${cb} B）`);
+    assert.ok(cn <= CP_ROWS_CAP,
+      `run_checkpoints 总行数上界破了（新增，防「行数翻十倍但每行不变」这种复长）：${cn} > ${CP_ROWS_CAP}`);
+    assert.ok(cb <= CP_TOTAL_BYTES_CAP,
+      `run_checkpoints 总字节上界破了（新增）：${cb} B > ${CP_TOTAL_BYTES_CAP} B（${cn} 行 × 约 ${Math.round(cb / cn)} B/行）`);
     assert.ok(cb >= 0, '两张表都要各自给出读数（体积闸不许只量一张）');
   });
 });
@@ -505,7 +536,7 @@ test('#502 环境门自证：没有 TEST_DATABASE_URL 时上面那些真库用�
     '#502 判据 1 真库形状闸：喂 10 条与 1000 条 delta 的 run，落库行数**完全相同**',
     '#502 判据 3 真库：终态无锚点 ⇒ 半截正文并进那一行 run_end 的 payload（无新行、无新索引）',
     '#502 迁移 0033：分批清存量可重放（第二遍 0 行 rc=0）、锁窗口有界、VACUUM 不能进迁移文件',
-    '#502 体积闸：清理后 `run_events` / `run_checkpoints` 各自的每行字节上界 + 碎片占比 < 5 %',
+    '#502 体积闸：`run_events` 每行字节上界 + 碎片占比 < 5 %；`run_checkpoints` 每行 / 总行数 / 总字节三条上界（样本必须非空）',
     // 绊线用例也在门后面 ⇒ 它也必须在名单里：无 PG 时它是 skip（**不是** pass），
     // 根 `npm test`（不带 TEST_DATABASE_URL）里它计入 `# skipped`，不是 `# pass`。
     '#502 绊线：库里 round_end.payload.final_text 与 run_end.payload.partial_text 两个键必须在（形态 M 判据 3 的 durable 源）',

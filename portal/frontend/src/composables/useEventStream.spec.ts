@@ -1727,3 +1727,92 @@ describe('#371-A persistence_error（落盘失败告警）', () => {
     expect([...lastES().listeners.keys()]).toContain('persistence_error');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 审计第 4 / 6 条（261114-05）：旧页回放与脏快照
+// ---------------------------------------------------------------------------
+describe('审计第 4 条：旧页回放（?before= 拉到的更早一页）不得打死正在流的正文', () => {
+  it('活跃 run 正在流 ⇒ 回放一条**更旧**的 round_start：deltaText 不变、轮水位不回退、当前轮快照仍被接受', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.activeRunId.value = 'r-current';
+    s.connect('sess-1');
+    // 当前轮：round_start 自己在 seq 50，正文已经开始流
+    lastES().emit('round_start', { seq: 50, round: 4, run_id: 'r-current' });
+    lastES().emit('assistant_delta', { run_id: 'r-current', text: '正在打字' });
+    expect(s.deltaText.value).toBe('正在打字');
+    const sepBefore = hooks.onSep.mock.calls.length;
+
+    // 用户往上滚 ⇒ 更早一页（另一个 run 的更旧一轮，seq 比当前轮小得多）
+    s.replayEvent({ seq: 7, run_id: 'r-old', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    expect(s.deltaText.value, '旧页不得清实时气泡（清了就是正在流的正文消失）').toBe('正在打字');
+    expect(hooks.onSep.mock.calls.length, '展示面照旧：旧页的分隔行仍然要画').toBe(sepBefore + 1);
+    expect(s.lastSeq.value, 'history 模式红线不变：旧页不推进水位线').toBe(50);
+
+    // 轮水位没回退 ⇒ 随后到达的**当前轮**快照仍过得了双闸（改前轮号被写成旧页那个 run 的号，
+    // 而这里更常见的是同一 run 的轮号被写回旧轮 ⇒ 帧整条丢弃 ⇒ 正文再也补不回来）
+    lastES().emit('partial_output', { run_id: 'r-current', roundSeq: 50, text: '正在打字打完的那句', chunks: 6, source: 'memory' });
+    expect(s.deltaText.value).toBe('正在打字打完的那句');
+  });
+
+  it('同一个 run 的旧页 round_start：轮水位只进不退（改前会被写成更旧的 seq ⇒ 当前轮快照被双闸误杀）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    lastES().emit('assistant_delta', { run_id: 'r1', text: '第三轮的正文' });
+    // 旧页里同一个 run 的**第一轮**（seq 更小）
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    expect(s.deltaText.value).toBe('第三轮的正文');
+    // 用「号只对得上第四轮」的帧探水位实际停在哪：第三轮（40）的号还在 ⇒ 40 的帧被接受
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 40, text: '还是第三轮', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value, '轮水位必须仍是 40（改前这里会被回退成 4，于是整帧丢弃）').toBe('还是第三轮');
+    // 脏 seq（旧页那行没带可用 seq）也不得把好水位镀成 null
+    s.replayEvent({ seq: 3, run_id: 'r1', type: 'round_start', payload: { round: 0 } }, 'older-page');
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 40, text: '仍是第三轮', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value).toBe('仍是第三轮');
+  });
+
+  it('反向自证：**首屏历史重建（默认 mode）口径一个字没变** —— round_start 照旧清气泡', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('assistant_delta', { run_id: 'r1', text: '上一段残留' });
+    expect(s.deltaText.value).toBe('上一段残留');
+    // 同一条事件走 `'initial'`（缺省）⇒ 仍是 #502 形态 M 的口径
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } });
+    expect(s.deltaText.value, '首屏重建没有"正在流的那一段"要护 ⇒ 照旧清（本单不得顺手改这条）').toBe(null);
+  });
+
+  it('没有活跃 run 时旧页照旧写轮水位（那时它就是初始重建面，有号比没号好）', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.connect('sess-1');
+    s.replayEvent({ seq: 9, run_id: 'r-x', type: 'round_start', payload: { round: 2 } }, 'older-page');
+    // 没观测过 ⇒ 写得进去（用 roundSeq=9 的帧验：被接受就说明水位是 9）
+    lastES().emit('partial_output', { run_id: 'r-x', roundSeq: 9, text: '写进去了', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value).toBe('写进去了');
+  });
+});
+
+describe('审计第 6 条：脏快照只忽略，不动任何状态', () => {
+  it('已有合法正文 + 来一帧 text 不是字符串 ⇒ deltaText 一个字都不变', () => {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 12, round: 1, run_id: 'r1' });
+    lastES().emit('assistant_delta', { run_id: 'r1', text: '合法的那段正文' });
+    // 脏帧：`text` 是数字，而且**轮号也对不上**（改前它先清了气泡才走双闸）
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 999, text: 42, source: 'db' });
+    expect(s.deltaText.value, '脏帧不得清掉当前合法正文').toBe('合法的那段正文');
+    // 连「轮号对得上」的脏帧也不许清（那是另一种脏数据，不是「服务端说这段结束了」）
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 12, text: {}, source: 'db' });
+    expect(s.deltaText.value).toBe('合法的那段正文');
+    // 真·空串仍然是「清空」（那条口径没被本单改坏）
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 12, text: '', source: 'memory' });
+    expect(s.deltaText.value).toBe(null);
+  });
+});
