@@ -29,18 +29,21 @@
 > ⚠ 上面四个数是**那个 commit 的历史基线**，不是现价；别拿它们对今天的报告。旧行留着是因为它带着日期与
 > 当时的口径（逐项净增的起点），**不要删**。
 >
-> **当前基线（2026-11-14 在 `main@e006d45`（#508）上实测；根测与步骤 ① 是本单在 worktree 里亲手跑的，
-> runner / 前端取自台账 §8.126 的门禁读数）四步 rc 全 0**：
-> ① `node --check` **264** 个文件（`git ls-files -- '*.js' '*.mjs'` 现数 263 + 本单新增的手工 e2e 脚本
-> `portal/integration/stream-typing-check.mjs` = **264**，本单已逐文件跑过 rc=0）· ② 根 `npm test`
-> **2220 tests / 2210 pass / 0 fail / 10 skipped**（无
-> `TEST_DATABASE_URL` ⇒ **9 条真库用例整体 skip**（剩下那一条 skip 是 LiteLLM live smoke，与 DB 无关），
-> 口径见 `docs/testing.md` §2.2）·
-> ③ runner **507 / 507** · ④ 前端 **63 文件 / 1336 通过** + `typecheck` 干净（本支净增 8 条）。
-> ⚠ 下面每一步里那一大段括号是**历史沿革**（逐单净增记录），旧数字彼此矛盾——**查现价只看上面「当前基线」那块**。
-> 三处台账（本节 / `.github/workflows/ci.yml` 步骤 ② 注释 / `AGENTS.md` §8.104）自本日起同值。
-> 261111 实况：那三处如今只剩**本节**写数字——ci.yml 步骤 ② 的注释已压成指向本节的指针
-> （261110-04），`§8.104` 随台账整体搬入 `docs/maintenance/task-ledger.md`（261111-02）。
+> **当前基线（2026-11-14 在 `fix-261114-04-doc-drift-followup`（基点 `main@98e5dc3`）上实测；
+> 四个数都是 261114-04 本单在那棵树上亲手跑的，四步 rc 全 0**）：
+> ① `node --check` **265** 个文件（`git ls-files -- '*.js' '*.mjs'` 现数 265，逐文件跑过 rc=0。
+> ⚠ 旧行那个 **264** 是「`main@e006d45` 锈点 + 本单新增脚本」凑出来的：`e006d45` 的树里只有 **263** 个，
+> 而 `aa78c6b`（迁移 `0034` + `portal/test/prune-checkpoints-db.test.js`）与 `5c7fc2c`（手工 e2e 脚本
+> `portal/integration/stream-typing-check.mjs`）**各加了一个** ⇒ 自 `98e5dc3` 起真值是 265）·
+> ② 根 `npm test` **2226 tests / 2212 pass / 0 fail / 14 skipped**（无 `TEST_DATABASE_URL` ⇒
+> **13 条真库用例整体 skip** = `delta-not-persisted-db` 5 + `migrate-fresh-db` 4 + `prune-checkpoints-db` 4；
+> 剩下 **那 1 条**是 LiteLLM live smoke，与 DB 无关；另有两个文件里各一条「环境门自证」用例**不设 skip**，
+> 所以它们不在那 13 里。带 PG 单独跑这三个文件：**15 tests / 15 pass / 0 skip**（一次性 postgres:16，
+> rc=0，口径见 `docs/testing.md` §2.2.1））·
+> ③ runner **507 / 507**（`cd runner && node --test`）· ④ 前端 **63 文件 / 1336 通过** + `typecheck` 干净。
+> ⚠ 下面每一步里那一大段括号是**历史沿革**（逐单净增记录），旧数字彼此矛盾——**查现价只看上面「当前基线」那块**：
+> 三处台账里如今只有**本节写数字**（`.github/workflows/ci.yml` 步骤 ② 的注释已压成指向本节的指针，261110-04；
+> `AGENTS.md` §8.104 随台账整体搬入 `docs/maintenance/task-ledger.md`，261111-02），⇒ **本节是那份读数的单一来源**。
 
 1. （步骤 ①）`node --check` 扫全部 git 跟踪的 `*.js` / `*.mjs`（当前 **252** 个文件，2026-11-10 实测；按 `git ls-files -- '*.js' '*.mjs'` 数；
    仓库 `type: module`，`node --check` 会按 `package.json` 的 type 解析，ESM 文件实测 rc=0）。
