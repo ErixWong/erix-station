@@ -1042,6 +1042,18 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 旧分支在这里发 `stream.event.partialOutputLost` 分隔行，但后端形态 M 的快照帧**根本不发空帧**
         //（`http.js` `buildPartialSnapshotFrames` 对空缓冲直接 `return`），那条行在这里再也响不响。
         if (text === '') { deltaText.value = null; return; }
+        // copilot 独立验收 #513 的 **E2**：同轮内正文**只增不减**——快照是被 `textCap` 夹过的那一份，
+        // 不得把已经送达的后缀抹掉。为什么「覆盖式」还需要这条单调规则：
+        //   · 快照帧的 `text` 来自进程内正文缓冲，那里被 `PARTIAL_TEXT_CAP_DEFAULT = 16384`
+        //     夹过（`run-partial-buffer.js#append`，越界只置 `truncated` 不追长尾）；
+        //   · 而 #513 把顺序改成「先 flush hub 缓冲、后发快照」，flush 出去的是**原始未截断**的碎片帧
+        //     （`internal.js` 的 `rec.buffer` 按**条数**限，不按字节）；
+        //   ⇒ 正文超过 16,384 时，flush 刚把**完整**正文送到客户端，紧随其后的快照只有**前 16,384 个
+        //     字符**，覆盖式赋值就把刚送达的后缀**永久吃掉**（直到 round_end/历史刷新才补得回来）。
+        // 判据用「快照是当前正文的**严格前缀**」而不是「`truncated:true`」：截断位是两路共用的观测位
+        //（`run-partial-buffer.js` 的 `truncatedByCap`，reasoning 截尾也置它），而前缀关系本身就是
+        // 「它是同一段的较短那份」的直接证据。不是前缀 ⇒ 快照仍然权威覆盖（判据 4 两个方向不许改坏）。
+        if (deltaText.value && text.length < deltaText.value.length && deltaText.value.startsWith(text)) return;
         deltaText.value = text;
         return;
       }

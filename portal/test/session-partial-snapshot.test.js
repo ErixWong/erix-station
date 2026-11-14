@@ -144,14 +144,20 @@ const partialFrames = (raw) => framesOf(raw).filter((f) => f.event === 'partial_
  * 所以重复不是「两个帧看起来一样」，而是「快照已含全文后，同一批碎片又被当增量追了一遍」。
  * 轮闸（`roundSeq`）按本连接已观测到的轮号解开（= 前端对上了），不拿它掩盖顺序 bug。
  */
-function assembleClientText(raw, { roundSeq } = {}) {
-  let text = '';
+function assembleClientText(raw, { roundSeq, clientHas = '' } = {}) {
+  let text = clientHas; // E2：断线**之前**客户端已有的那一段（默认空 = 原有语义不变）
   for (const f of framesOf(raw)) {
     if (f.event === 'assistant_delta') text += f.data?.text ?? '';
     else if (f.event === 'partial_output') {
       const frameSeq = typeof f.data?.roundSeq === 'number' ? f.data.roundSeq : null;
       if (roundSeq !== undefined && frameSeq !== roundSeq) continue; // 轮对不上 ⇒ 整帧丢弃
-      text = f.data?.text ?? text;
+      const snap = f.data?.text ?? '';
+      // **镜像前端的单调规则**（copilot 验收 E2，`useEventStream.ts` 的 `case 'partial_output'`）：
+      // 快照是当前正文的严格前缀 ⇒ 那是被 `textCap` 夹过的旧快照，忽略它，别把后缀盖掉。
+      // 前端那条规则本体由 `useEventStream.spec.ts` 具名用例承重；这里镜像它，是为了让本文件能量
+      // 「界面上那一段正文」而不是「帧序列」。两处必须一起改。
+      if (text && snap.length < text.length && text.startsWith(snap)) continue;
+      text = snap;
     }
   }
   return text;
@@ -344,6 +350,69 @@ test('审计第 1 条：注册后、**补发窗口内**到达的同轮碎片不�
       `快照帧必须排在碎片之后（覆盖式不能排在追加式前面）：顺序=${JSON.stringify(evs)}`);
     // 碎片本身仍然发了（D-2 ① 那条红线没被这次修复弄回去：碎片**不许**被 sinceSeq 过滤掉）
     assert.equal(partialFrames(raw).length, 1, '快照仍只有一条（本轮就一段未完稿正文）');
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **E2** 条（261115-01）：正文**超过 `textCap`** 时，重连拼装后的正文
+// 不得比 flush 送达的那一份更短（后缀被快照吃掉）。
+//
+// 上面 A 用例（审计第 1 条）量的是**未截断**那一侧：「同一段碎片不得出现两遍」。这里补的是
+// **超上限**那一侧，形状相反：
+//   · 快照帧的 `text` 来自进程内正文缓冲，被 `PARTIAL_TEXT_CAP_DEFAULT = 16384` 夹过
+//     （`run-partial-buffer.js#append`：越界只置 `truncated`，**不追长尾**）；
+//   · 而 #513 改成「先 flush hub 缓冲、后发快照」之后，flush 出去的是**原始未截断**的碎片帧
+//     （`internal.js` 的 `rec.buffer` 按**条数**限，不按字节）；
+//   ⇒ 覆盖式的 `partial_output` 排在追加式的 `assistant_delta` **之后**（这正是审计第 1 条要的
+//     顺序），却带着**更短**的那一份 ⇒ 把刚送达的后缀盖掉。
+// 承重面分两处，各自会红：
+//   · **前端**那条规则（`useEventStream.ts` 的「同轮内正文只增不减」）由
+//     `useEventStream.spec.ts` 的具名用例承重（把那条 `startsWith` 守卫删掉就红）；
+//   · **本用例**钉的是「这个形状真的存在」：快照确实被夹到 16,384 且 `truncated:true`，
+//     而 flush 那一份是**完整**的 —— 也就是「快照比客户端手上的短」不是假设。
+//     谁哪天把正文缓冲的上限改掉/把快照改成不截断，本用例第一条断言就会红，提醒去重看这条口径。
+// ---------------------------------------------------------------------------
+test('copilot 验收 E2：正文超 textCap 的重连 ⇒ 快照是被截过的那一份，客户端拼装后不得比 flush 短', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    const head = '开'.repeat(10_000);   // 断线前已经流出去的 1 万字符
+    const tail = '尾'.repeat(10_000);   // **补发窗口内**到达的 1 万字符（同时进正文缓冲与 hub 缓冲）
+    feedDeltas(RUN_ID, [head]);
+    s.pool.onReplayQuery = async () => {
+      partialOutputs.observe(RUN_ID, {
+        session_id: SESSION_ID, run_id: RUN_ID, type: 'assistant_delta',
+        client_event_id: `${RUN_ID}:1:99`, seq: null, payload: { text: tail },
+      });
+      notifySessionEvents(SESSION_ID, [{
+        seq: null, ts: new Date().toISOString(), run_id: RUN_ID, type: 'assistant_delta',
+        payload: { text: tail },
+      }]);
+    };
+    const raw = await s.stream({ lastEventId: 1 });
+    const parts = partialFrames(raw);
+    assert.equal(parts.length, 1);
+
+    const full = head + tail;                       // 客户端断线前 + flush 之后手上的那一份
+    const snapText = parts[0].data.text;
+    // ① 夹具前提（承重）：正文确实**超了上限**，快照是被夹过的那一份，而 flush 那一份是完整的。
+    assert.ok(full.length > 16_384, `夹具本身要超 textCap 才测得到这条：${full.length}`);
+    assert.equal(snapText.length, 16_384, `快照正文必须恰是被夹过的 16,384 字符：实拿 ${snapText.length}`);
+    assert.equal(parts[0].data.truncated, true, '夹过 ⇒ 帧必须自报 truncated:true（观测位不许静默）');
+    assert.ok(full.startsWith(snapText), '快照是完整正文的前缀（E2 的形状；换成不截断就该重新看这条口径）');
+    const deltas = framesOf(raw).filter((f) => f.event === 'assistant_delta').map((f) => f.data?.text ?? '');
+    assert.ok(deltas.includes(tail), `flush 必须把完整的后 1 万字符原样送达（它不受 textCap 约束）：${JSON.stringify(deltas.map((t) => t.length))}`);
+
+    // ② 拼装面：客户端按 shipped 规则拼完之后，正文**不短于** flush 送达的那一份，后缀还在。
+    // 客户端断线**前**手上只有前 1 万字符（后 1 万是这次重连的 flush 才送达的），拼装面 =
+    // `clientHas: head` + flush 的碎片 + 那条被夹过的快照。
+    const got = assembleClientText(raw, { roundSeq: 2, clientHas: head });
+    assert.ok(got.length >= full.length, `后缀被快照吃掉了：拼出 ${got.length} 字符 < flush 送达的 ${full.length} 字符`);
+    assert.ok(got.endsWith(tail.slice(-200)), `后缀（最后 200 个字符）必须还在：${JSON.stringify(got.slice(-40))}`);
+    assert.equal(got, full, '拼装结果必须逐字等于完整正文（既不少后缀也不多一遗）');
   } finally {
     reset();
     await s.close();
