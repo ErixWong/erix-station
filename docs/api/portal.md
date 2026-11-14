@@ -1327,59 +1327,87 @@ station-portal user enable  --login <login>
 - **大小防护**：payload 字符串叶值统一截 2000 字符（`tool_use.input` / `tool_call_delta.arguments_delta` 可能很大），JSON 形状保持合法。
 - **鉴权**：同 `GET /api/sessions/:id`（session cookie；非属主 / 不存在 → `404 not_found`，不泄露存在性）。
 
-#### 4.4a-1 合成项 `partial_output`（issue #300：中止 / 失败 run 的部分正文）
+#### 4.4a-1 合成项 `partial_output`（issue #300 / 形态 M #502：中止 / 失败 run 的部分正文）
 
-缺陷：`runner/worker.js` 的 catch 固定 `final_text: ''` ⇒ 被停止 / 失败的 run 在 `messages` 里**零助手
-锚点**，而对话正文本来就从锚点渲染 ⇒ 界面上这次 run **正文区一片空白**（工具卡片在、正文没）。它
-**已经说出口的话**过去全在 `run_events` 的 `assistant_delta` 里（逐 chunk 落库），所以下发时在
-**响应期**把它们聚合回来。纯宿主侧只读重建：不动 `runner/`、不消费 `err.finalText`、不写 `messages`。
+缺陷：`runner/worker.js:1182` 的 catch 固定 `final_text: ''` ⇒ 被停止 / 失败的 run 在 `messages` 里**零助手
+锚点**，而对话正文本来就从锚点渲染 ⇒ 界面上这次 run **正文区一片空白**（工具卡片在、正文没）。
+它**已经说出口的话**必须从别处找回来，且**不许**为此新造一种落库行 —— 形态 M 的结论就是这一句。
+纯宿主侧只读重建：不动 `runner/`、不消费 `err.finalText`、不写 `messages`。
 
-**存在性判据（三条同时成立才出现，一条 run 至多一条合成项）**：
+**正文来源只有两处（都是已经存在的 durable 事实，形态 M 的核心）**：
+
+| # | 来源 | 覆盖哪一段 | 谁写的 |
+|---|---|---|---|
+| 1 | `run_events` 里 `type='round_end'` 的 `payload.final_text` | **已经跑完的每一轮**的终稿，按 `seq` **升序**拼接 | 引擎事实档，写入侧一直在写（`internal.js` 的 U3 落库通路） |
+| 2 | `run_events` 里 `type='run_end'` 的 `payload.partial_text` | **被停住的那半轮**（还没产出 `round_end` 的那段） | portal 在**合成 `run_end` 的同一条 INSERT** 里并键写入（`internal.js#runEndPartialKeys`，六个终态点共用；判据见 §5.4） |
+
+两处都没有 ⇒ **不再退回**「去把碎片行捞回来聚合」（碎片已不落库，见 `docs/data/model.md` 的 #502 小节），
+而是给一条**占位合成项**（下面「存在性判据」第 3 条）。
+
+**存在性判据（一条 run 至多一条合成项）**：
 
 | # | 条件 | 为什么 |
 |---|---|---|
 | 1 | 该 run 出现在**本次响应窗口**里（窗口行的 `run_id` 去重） | 窗口里没这个 run ⇒ 连候选判定查询都不发 |
-| 2 | `runs.status IN ('finished','failed')` **且**该 run **零助手锚点**（`messages` 里 `role='assistant'` 的任意行，**含 `synthetic = true`**） | `queued`/`running`/`cancelling` 不是终态——「还在跑就标已中止」是新造的误导；**有锚点的 run 绝不能再渲染一遍**（重复正文就是这个坑） |
-| 3 | 聚合出**非空**文本 | 被停在 `sleep` 上的 run 本来就无正文可给，不要空气泡 |
+| 2 | `runs.status IN ('finished','failed')` **且**该 run **零助手锚点**（`messages` 里 `role='assistant'` 的任意行，**含 `synthetic = true`**） | `queued`/`running`/`cancelling` 不是终态——「还在跑就标已中止」是新造的误导；**有锚点的 run 绝不能再渲染一遍**（重复正文就是这个坑，也正是 `partial_text` 只在**无锚点**时才写的原因，两处判据逐字同构） |
+| 3 | 两处来源拼出**非空**文本 ⇒ 正文项；**都空** ⇒ **占位项**（`text: ''` + `placeholder: true`） | 占位是 #278「不许留空白」的落点：这次 run 一个字都没留住时，界面仍要有一行中性提示，而不是空气泡。**注意占位只在这里发**，SSE 补发通路**不发**占位帧 |
 
 字段（与既有事件项**同形**，前端不需要分支去认「新形状」）：
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
-| `seq` | number | #502 之前 = 该 run **最后一条 `assistant_delta` 的 `seq`**；**现在 = 库里那一行 `partial_output` 自己的 `seq`**（终态事务里排在合成 `run_end` 之后分配 ⇒ 仍然落在该 run 内容末尾，位置语义不变；不占 `chat_sessions.last_seq`） |
+| `seq` | number | 该 run 在**窗口行里的 `MAX(seq)`**（**不新分配**、不占 `chat_sessions.last_seq`）⇒ 位置仍然落在该 run 内容末尾 |
 | `run_id` | string | 所属 run |
-| `type` | string | 固定 `partial_output`（**合成类型，`run_events` 表里查不到这一行**） |
-| `payload.text` | string | 已生成的正文，按 delta 的 `seq` **升序**拼接（与插入顺序无关）；脏片段（`text` 缺键 / 非字符串）**整条跳过**，不拼成 `[object Object]` |
-| `payload.chunks` | number | **实际拼进正文的片段数**（写入侧累加，脏片段不计 ⇒ 它 ≤ 当初该 run 的 `assistant_delta` 总条数；口径就这一句，将来要改成「总条数」得同时改测试） |
-| `payload.truncated` | boolean | 仅在正文被上限截过时为 `true` |
+| `type` | string | 固定 `partial_output`（**合成类型，`run_events` 表里查不到这一行**——表里只有 `round_end` / `run_end` 那些真实行） |
+| `payload.text` | string | 来源 1 按 `seq` 升序拼接 + 来源 2 追加；脏值（`final_text` / `partial_text` 不是字符串）整条跳过，不拼成 `[object Object]` |
+| `payload.chunks` | number | **拼进正文的已完成轮次数**（= 来源 1 的 `round_end` 条数，**不含**那半轮）。⚠ 口径在形态 M 变了：#502 之前是「拼进来的碎片行数」，碎片不落库之后那个数就没有来源了 |
+| `payload.truncated` | boolean | 正文超上限被截时为 `true`（**载荷里不塞 `…（已截断）` 文本**，截断标记由前端出——与 §4.4 的「大小防护」刻意不同：合成项要给前端一个可判定的布尔） |
+| `payload.placeholder` | boolean | 占位项才有（只认真字面量 `true`）；**这是 #278 不空白红线在形态 M 之后的唯一落点** |
+| `payload.source` | string | 人工排障用：`round_end` / `run_end` / `round_end+run_end` / `none`（占位）。前端不读 |
 
-- **上限**：`PARTIAL_OUTPUT_TEXT_CAP = 2000`（沿用本节既有 2000 字符防护的先例）。超限截到 2000 字符并置 `truncated: true`；**载荷里不塞 `…（已截断）` 文本**，截断标记由前端出——这是与上面「大小防护」的**刻意差别**（合成项要给前端一个可判定的布尔）。
-- **聚合范围 = 整个 run**，**不受 `before` 分页窗口影响**（窗口外的碎片也是这次 run 说过的话；分页只决定本次响应里出现哪些真实事件）。
-- **`reasoning_delta` 不参与**（thinking 文本不在本单面上）。
-- **分页与排序**：合成项**参与升序排序**（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**（那两个仍只由白名单真实事件决定）。
-- **落库形态变了（#502 D-3），界面落点没变**：以前它**只在响应期存在**；现在它是 `run_events` 里真实的
-  **一行**（终态事务内写入，`client_event_id = <run_id>:final:partial_output`，部分唯一索引
-  `run_events_run_partial_key` ⇒ 一个 run 至多一行），载荷多出 `uptoSeq` / `source`（`'terminal'`；
-  补发帧用 `'memory'` / `'db'` / `'none'`）。**它仍然不进 §4.4a 的下发白名单**（下发时按那一行原样取回，
-  不重放），也**不进** SSE 的重放 SQL —— 补发时它由快照通路单独发一帧。
-  前端 `EVENT_TYPES` **加了它**（#502 D-6：订不到就永远空白），`HISTORY_REPLAY_TYPES` **仍不加**
-  ⇒ 「实时一条 + 历史一条」的重复红线仍然成立，只是防法从「不订」变成「覆盖式赋值」
-  （`deltaText` 被快照帧整体覆盖，不追加；`workbench.addPartialOutput` 同 run 覆盖不追加）。
-  `assistant_delta` 仍然**不得**进下发白名单。前端的落点是 `StreamEntry` 的新 `kind: 'partial'`（中性助手气泡 + 「已中止 · 部分输出」标签，**不是**红色错误行）。
-- **成本**：候选判定顺序 = 窗口 `run_id` 去重（无 run ⇒ 整段跳过）→ **一条**查终态与锚点存在性的查询 → **只对「终态且无锚点」的 run** 聚合（`run_id = ANY(...)` + `type = 'assistant_delta'`，走既有 `run_events_run_idx (run_id, seq)`）。**零 DDL、零新索引**；dev 实测 134 条 run 里只有 4 条需要它。
-
-- **已接受边界：刚停止的那一刻不会立刻出现**。合成项只在 `GET /events/history` 响应里存 而该响应只在 `openSession`（打开会话 / 刷新 / 重进会话）时拉；run 终态后的 `refreshSession` 只重取 `/api/sessions/:id`，**不重拉 history** ⇒ 点「停止」当下界面只有 `run_end` 分隔行，**部分正文要刷新一次才出现**（流式那半截气泡在 `run_end` 时被移除）。不是 bug，是落点选择；要即时可见得让 refresh 也重拉一次 history（多一个请求），已单独登记为产品小单。
-- **已接受边界：聚合把候选 run 的全部 delta 行拉回 JS 再截 2000 字**。dev 标本 37–133 字符 / 百余片，无所谓；一个输出几十万字的 run 会把那个量级的 jsonb 读进内存。更省的写法是 SQL 侧 `LIMIT` 前 N 片，但那样 `chunks` 就得从「拼了多少片」改成「看了多少片」——是一次口径决定，不是实现细节（见上表）。
+- **上限**：`PARTIAL_PROJECTION_TEXT_CAP = 65536`。#502 之前是 2000，**它咬掉了判据 3**：真库现查单轮
+  `round_end.final_text` 最长 **31,707** 字符 ⇒ 一个输出正常长文的中止 run 会被截掉大半，
+  「刷新后正文逐字完整」当场不成立。65536 是「现查最大值约两倍」向上取整到 2 的幂。
+- **一次查询**：候选 run 确定后，**一条** `run_id = ANY($1) AND type IN ('round_end','run_end')` 的有界查询
+  （走既有 `run_events_run_idx (run_id, seq)`）拿完两处来源。**零 DDL、零新索引**（形态 M 明确不新增
+  也不删除任何索引，理由见 `docs/maintenance/task-ledger.md` §8.125）。
+- **分页（形态 M 修的第四条审计）**：合成项**只在它 `seq` 所属的那一页出现**——`before` 已经切过它的
+  `seq` 就不给（`buildHistorySynthItems(pool, rows, { before })`）。它 `seq = MAX(seq)` 不受窗口约束，
+  不加这道闸就是「往上翻一页，同一段正文再重演一遍」。同一条闸同时管 `run_termination`（§4.4a-2），
+  两类合成项共用。
+- **排序 / limit**：合成项参与升序排序（按 `seq`），但**不占 `limit`、不参与 `next_cursor` / `hasOlder` 判定**
+  （那两个仍只由白名单真实事件决定）。
+- **`reasoning_delta` 不参与**（thinking 文本不在本单面上；内存快照里的 `reasoning` 也只给 SSE 帧，不落库）。
+- **前端落点**：`StreamEntry` 的 `kind: 'partial'`（中性助手气泡 + 「已中止 · 部分输出」标签，**不是**红色
+  错误行）；`placeholder` 条目渲染成一行中性提示（`stream.partialOutput.placeholder`，zh/en 成对）。
+  `assistant_delta` 仍然**不得**进下发白名单。
+- **已接受边界：刚停止的那一刻不会立刻出现**。合成项只在 `GET /events/history` 响应里存在，而该响应只在
+  `openSession`（打开会话 / 刷新 / 重进会话）时拉；run 终态后的 `refreshSession` 只重取 `/api/sessions/:id`
+  ⇒ 点「停止」当下界面只有 `run_end` 分隔行，**部分正文要刷新一次才出现**。不是 bug，是落点选择。
+- **已接受边界：单副本**。`partial_text` 是**写侧进程内**累加器算出来的（§5.1），而 `round_end.final_text`
+  是 durable 的 ⇒ 多副本部署时「那半轮」会丢（丢成什么样：正文只剩已完成轮次，**不是**脏数据）。
 
 响应里多出来的那一项（与真实事件混在同一 `events` 数组里）：
 
 ```jsonc
 {
-  "seq": 168,               // = 该 run 最后一条 assistant_delta 的 seq
+  "seq": 168,               // = 该 run 在窗口行里的 MAX(seq)，不新分配
   "run_id": "9d3b2f1e-...",
   "type": "partial_output", // 合成项：不落库、不进 SSE
-  "payload": { "text": "已经生成出来的正文", "chunks": 352, "truncated": false }
+  "payload": {
+    "text": "已经生成出来的正文",       // 已完成轮次的 round_end.final_text + run_end.partial_text
+    "chunks": 3,                       // 拼进来的**已完成轮次数**（形态 M 口径）
+    "truncated": false,
+    "source": "round_end+run_end"
+  }
 }
+```
+
+一个字都没留住时（占位项，`#278` 底线）：
+
+```jsonc
+{ "seq": 168, "run_id": "9d3b2f1e-...", "type": "partial_output",
+  "payload": { "text": "", "chunks": 0, "truncated": false, "placeholder": true, "source": "none" } }
 ```
 
 响应 `200`：
@@ -1394,7 +1422,8 @@ station-portal user enable  --login <login>
 ```
 
 > `events` 里可能多出两类**响应期合成项**：`partial_output`（中止 / 失败 run 的部分正文，§4.4a-1）与
-> `run_termination`（run 的**终态分隔条**，§4.4a-2）。两者都不是 `run_events` 的行，也不占 `limit`。
+> `run_termination`（run 的**终态分隔条**，§4.4a-2）。两者都不是 `run_events` 的行，也不占 `limit`，
+> 并且**都只在它 `seq` 所属的那一页出现**。
 
 #### 4.4a-2 合成项 `run_termination`（issue #236：刷新后终态分隔条仍在）
 
@@ -2682,15 +2711,38 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
   > ② U3 写循环去掉了「先 `SELECT` 查重」的预检，重复投递会先烧掉 `seq` 再由 `ON CONFLICT DO NOTHING` 丢掉。
   > 结论对客户端不变、但更强：**跳号不是丢事件**，`chat_sessions.last_seq` 仍单调、`UNIQUE(session_id, seq)` 仍兜底。
   > 下面 #25 那段关于「空洞」的措辞保留在原文里（它讲的是 messages/run_events 共用分配器那半边，仍然成立）。
-  > **补发不再只依赖 DB**：断线重连时「已经流出去、但按定义不落库」的那段正文由 portal **进程内累加器**
-  > （`portal/src/run-partial-buffer.js`）补出，内存没有则退回库里那一行 `partial_output`（终态写入），
-  > 两处都没有 ⇒ 发一帧 `source:'none'` 的占位帧（前端出中性提示，不留空白）。补发顺序是
-  > **「库里已定稿的事件 → 未完稿快照」**，快照帧**不带 `id:`**（不进 `Last-Event-ID`，否则下一次重连会拿一个
-  > 不存在的 seq 当游标）；`payload.uptoSeq <= Last-Event-ID` ⇒ 客户端已看全，**不发**（这是「重连不重复」的闸）。
-  > 首次连接（无 `Last-Event-ID`）仍然一条历史都不补发（下面第 3 条不变）。
-  > **`partial_output` 从此是 `run_events` 里真实的一行**（`client_event_id = <run_id>:final:partial_output`，
-  > 部分唯一索引 `run_events_run_partial_key` 保证一个 run 至多一行，迁移 `0033`），但**不进 SSE 重放 SQL**
-  > （它是合成物，重放它 = 「重放一行 + 快照一行」重复），也不进 §4.4a 的下发白名单。
+  > **补发不再只依赖 DB，但也只看内存（形态 M）**：断线重连时「已经流出去、但按定义不落库」的那段
+  > **当前轮**正文由 portal **进程内累加器**（`portal/src/run-partial-buffer.js`）补出。
+  > **没有 DB 回落**（#502 之前那层「退回库里那一行 `partial_output`」已随该种行一起删除）：
+  > 已完成轮次的正文是 `round_end.final_text`、那半轮是 `run_end.payload.partial_text`，两者都在
+  > §4.4a-1 的**历史投影**里；补发通路只负责**还在流的那一轮**，越界去库里拼一份「看起来像流式」的正文
+  > 就是拿已完成轮次的终稿冒充未定稿。**内存没有 ⇒ 一帧都不发**（也不发空帧去清气泡）。
+  > **也没有占位帧**：`source:'none'` 那类占位现在只在历史投影里出（§4.4a-1 判据 3）。
+  > 补发顺序仍是**「库里已定稿的事件 → 未完稿快照」**，快照帧**不带 `id:`**（碎片没有 seq 坐标系，
+  > 进了 `Last-Event-ID` 就等于下一次重连拿一个不存在的 seq 当游标）。
+  > **形态 M 删掉了 `uptoSeq` 闸门**：碎片不落库 ⇒ 它没有 seq，而 `Last-Event-ID` 是 seq ⇒ 两套坐标硬比，
+  > 比赢就漏发（少一段还没写完的正文，刷新即回）、比输就重发（把已有正文再盖一遍）。替代判据是
+  > **两端对同一个事实**：快照帧带 `roundSeq` = 服务端那一轮 `round_start` 的 seq（事实档，本来就有 seq），
+  > 前端记下**自己观测到的**该 run 当前轮起点 seq，**两个都匹配（run + roundSeq）才覆盖气泡，否则整帧丢弃**。
+  > 服务端因此**不再猜水位线**（`lastEventId` 再大也照发，重复由前端丢弃兜住）。
+  > 首次连接（无 `Last-Event-ID`）仍然一条历史都不补发（下面第 3 条不变）；已标终态的 run 也不再出快照
+  > （它的内容已经在 DB 里，走历史投影）。
+  > 快照帧的字段（`event: partial_output`，**无 `id:` 行**）：
+  >
+  > ```jsonc
+  > { "session_id": "s_3kd9", "run_id": "9d3b2f1e-...",
+  >   "roundSeq": 143,          // 服务端那一轮 round_start 的 seq；没观测到就是 null（前端据此整帧丢弃）
+  >   "round": 2,               // 轮号（展示用，对账只用 roundSeq）
+  >   "text": "还在流的那段正文", // 只含**当前这一轮**；换轮就重置（不跨轮拼成一句界面上没出现过的话）
+  >   "reasoning": "…",         // 独立累加，不随轮重置；前端今天不展示，人工排障用
+  >   "chunks": 42,             // 本轮正文片数（不是 reasoning 的片数）
+  >   "truncated": false,        // 本轮正文超过缓冲上限 16384 才 true
+  >   "source": "memory",        // 形态 M 之后恒为 memory：没有 'db' 回落，也没有 'none' 占位
+  >   "ts": "2026-11-13T09:00:02.130Z", "type": "partial_output" }
+  > ```
+  > **单副本前提（形态 M 明确接受的限制）**：累加器与 SSE hub 都是 **per-process** 的 ⇒ 本节的补发能力
+  > 假设 portal 单副本部署。多副本时「断在另一个副本上」必然看不到那段正文（表现 = 少一段未定稿，
+  > 不是脏数据），要跨副本补发得先把累加器换成共享存储（登记在 §8.125 的后续里）。
   > **实现注记（issue #25 裁决）**：「无空洞」只对 **`messages ∪ run_events` 联合序列**成立（两表共用 `chat_sessions.last_seq` 分配器，schema.sql §3）；SSE 只推 `run_events`，故**事件流单独看存在合法空洞**（user 消息、assistant 回写各占一个 seq）。因此客户端**不得**以「seq 跳号」作为重连触发条件（会把合法空洞误判为丢事件，重放后仍跳号 → 无限重连风暴，实测复现）。丢失恢复路径：① 服务端 `resync` 控制帧（缓冲溢出，见下）；② 浏览器 `EventSource` 自动重连天然携带 `Last-Event-ID`（§5.2 补发 `seq > lastEventId`）。前端仅在收到 `resync` 时主动 `close()` + 以 `?last_event_id=<本地已知最大 seq>` 重连。
 - 响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 - 每 15s 发送注释行心跳（`: ping\n\n`），防止中间层断连。心跳不是事件，不占 seq。
@@ -2711,10 +2763,11 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 ### 5.2 `Last-Event-ID` 断线续传语义
 
 1. 客户端（浏览器 `EventSource` 自动）重连时带 `Last-Event-ID: <seq>` 头。
-2. portal 从 DB 补发该 session 中 **`seq` 大于该值**的全部历史事件（重放 SQL 里**排除** `partial_output`，
-   它是合成物不是可重放事件），**然后**追加一帧未完稿快照（`event: partial_output`，见 §5.1 那条注记：
-   来源优先级 = 进程内累加器 → 库里那一行 → `source:'none'` 占位；不带 `id:`；`uptoSeq <= Last-Event-ID` ⇒ 不发），
-   再切到实时流。
+2. portal 从 DB 补发该 session 中 **`seq` 大于该值**的全部历史事件（重放 SQL 里带着
+   `type <> 'partial_output'`——形态 M 之后新代码不再产生这种行，这句是**防御性保留**，
+   防的是迁移还没跑、库里残留旧行的窗口），**然后**按 run 追加未完稿快照帧（`event: partial_output`，
+   见 §5.1 那条注记：**只读进程内累加器**、每个「有正文且未终态」的 run 一帧、`source:'memory'` +
+   `roundSeq`、**不带 `id:`**、**不与 `Last-Event-ID` 比较**），再切到实时流。
 3. 无 `Last-Event-ID`（首次连接）：**不补发历史**，只推连接之后的新事件——历史消息/状态由 `GET /api/sessions/:id`（含 `last_seq` 与消息列表）获取；前端如需从某点重放，可显式带 `Last-Event-ID` 或查询参数 `?last_event_id=<seq>`（两者等价，查询参数供非 `EventSource` 客户端使用）。
 4. `Last-Event-ID` 大于当前 `last_seq`（如 session 已删）→ `404 not_found`；小于最小保留 seq（事件归档后）→ `410 Gone` + `{"error":{"code":"replay_unavailable", ...}}`，前端应回退到 `GET /api/sessions/:id` 全量拉取。
 
@@ -3040,7 +3093,7 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `batch_id` | string，≤ 128 字符，可省略 | 批次标识（agentd 生成，供日志/排障关联）；**幂等键是逐事件的 `client_event_id`，不是 `batch_id`** |
 | `events` | array，`0 ≤ length ≤ 200` | 事件数组；**空数组合法**（portal 按 no-op 处理，见下）。单批总字节上限 **256KB** ⚠️（runner §7.2）；条数或字节超限 → `400 validation_failed`，agentd 切多批顺序重发 |
 | `events[].client_event_id` | string，格式 `run_id + ":" + attempt + ":" + 计数` | 客户端幂等键（worker 生成，**带 attempt 前缀**，runner §7.3）；`attempt` = claim ticket 的 `run.attempt`（§9.3），`计数` = 该 attempt 内从 0 单调递增。portal 端 `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING` |
-| `events[].type` | string | 事件类型，清单同 §5.3（portal 原样透传落 `run_events`）；未知类型（上游 additive）原样透传、不报错 |
+| `events[].type` | string | 事件类型，清单同 §5.3（portal 原样透传落 `run_events`）；未知类型（上游 additive）原样透传、不报错。**两个例外**：① **stream 档碎片不落库**（`assistant_delta` / `reasoning_delta` / `tool_call_delta`，按引擎导出的 `EVENT_TIERS` / `eventTierOf` 判定而不是抄名单，见 §9.4a）；② **portal 自造的类型容器不许上报**：`run_end` / `partial_output` / `attempt_killed` 是 portal 在终态事务里自己合成的名字，容器发来就是「宿主写出来的事实被容器冒充了一遍」⇒ `400 validation_failed`（`details.field='events[i].type'`，`PORTAL_RESERVED_EVENT_TYPES`）。引擎**将来**新增的 additive 类型不在这一小撮里，照旧透传 |
 | `events[].ts` | string（ISO 8601 UTC） | **宿主落库时间**（与 §5.3 信封、schema `DEFAULT now()` 同口径；worker 上报的产生时刻仅作展示参考，不参与 seq 排序/对账，env §11.3） |
 | `events[].payload` | **object（必为 JSON 对象）** | 类型特有字段（对应 §5.3 信封内层）。portal 不校验内部字段语义，但要求 `payload` 为对象——非对象 → `400 validation_failed`。**payload union**：已知类型按 §5.3 字段形状填充，未知类型原样透传 |
 
@@ -3060,6 +3113,29 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 | `seq_first` / `seq_last` | 本批**新插入**事件分配到的 seq 区间（`seq_first ≤ seq_last`）。**当 `stored == 0`（空批次 或 全重复批次）时两者均为 `null`**——这是「没有新事件落库」的明确信号，agentd 不应据此推进任何游标（本来也没有新 seq）。seq 由 portal 在**同一事务**内 `chat_sessions.last_seq` 逐条 +1 分配（`UNIQUE(session_id, seq)` 兜底）；**seq 只在 portal 产生，worker/agentd 永不自造** |
 
 幂等与重试（runner §7.3）：**at-least-once**——agentd 只有收到 `200` 才确认删除；任何失败重试**整批**，重复批次安全。
+
+#### 9.4a 写入侧的档位与事务边界（issue #502 形态 M）
+
+**判定用引擎导出的档位，不在本站抄名单**：`erix-agent` 导出 `EVENT_TIERS` / `eventTierOf`，
+portal 只问「这条事件是不是 stream 档」。现查（本机已安装引擎）：stream 档含 `assistant_delta`、
+`reasoning_delta`、`tool_call_delta`、`delta`、`tool_call`；事实档含 `round_start`、`round_end`、
+`tool_use`、`tool_result`。抄名单的坑是引擎 additive 加一类碎片时本站会**静默漏网**（又开始落库）。
+
+- **stream 档**：**不 INSERT、不 `allocSeq`**（一个 seq 都不烧），只 ① 喂进程内累加器 ② 转发浏览器 SSE
+  （帧**不带 `id:`**）。⇒ 判据「体积掉下来」的来源就在这里，不在任何索引上。
+- **重复投递的转发去重（审计 M-6①）**：碎片不落库 ⇒ `ON CONFLICT` 那条 durable 幂等闸对它不存在，
+  而 U3 是 at-least-once ⇒ 整批重投时若照旧「每条都推一次 SSE」，界面会把同一段正文**加两遍**。
+  现在由累加器**首次观测才转发**：`bufferTx.observe(...)` 返回 `true` 才计入 `stored`/推 SSE，
+  返回 `false`（重复）就整条跳过，`stream_forwarded` 因此是 0。这是**唯一**剩下的碎片级去重信号
+  （`client_event_id` 计数器），所以累加器的 `counters` 必须有上界（`PARTIAL_MAX_COUNTERS_DEFAULT = 8`，
+  按 attempt 保留、丢最老）。
+- **缓冲变更只在 COMMIT 之后生效（审计 M-6②）**：写循环里对累加器的所有变更走 `stage()` 出来的事务视图，
+  `COMMIT` 成功后才 `commit()`；回滚 ⇒ 直接丢弃。否则会出现「内存里有正文、库里那一轮根本没落」这种
+  **只有内存知道**的假事实（它会经补发帧被当成已定稿正文渲染出去）。终态侧同理：
+  `retirePartialBuffer` 只在真的写了 `run_end` 且 COMMIT 之后调（没写成就什么都别收，重试腿再来一次）。
+- **`round_start` 是累加器的轮次边界**：它属于事实档、照常落库并占 `seq`；portal 顺手把它的 `seq`
+  记进累加器当作**本轮的身份**（`roundSeq`）。**这就是 §5.1 那条「两端对同一个事实」的另一半**——
+  前端在 `case 'round_start'` 里记同一个数，快照帧带同一个数，两边一比对才知道该不该覆盖气泡。
 
 **派生写入：同一事务里的 `tool_calls`（issue #283）**
 

@@ -5036,6 +5036,11 @@ runner `507 / 507` rc=0、前端 `1322 passed` rc=0 + `vue-tsc` rc=0。
 
 ### 8.125 stream 档碎片不落库：88 万行里 87.7 万行是两个字符一句话（issue #502 / 工单 feat-261113-02，2026-11-13，worker 落地 + 一次性真库自证）
 
+> ⚠ **本节第 3、4 步的落库形态已被 §8.126 取代**（同一张工单内换了设计，不是返工）：
+> 「新增一行 `partial_output` + 部分唯一索引 + `uptoSeq` 水位线」整条放弃，终态正文改**并进既有
+> `run_end` 的载荷**、补发改**只看内存**、对账改 `roundSeq`。第 1、2 步（碎片不落库、不占 `seq`、
+> 用引擎的档位表判定）与所有「踩到的雷」**仍然成立**，读形态看 §8.126。
+
 **要治的是什么**：dev 真库 `station` 现查 `run_events` = **884,163 行 / 472 MB**，其中三型
 `assistant_delta`(102,027) + `reasoning_delta`(454,689) + `tool_call_delta`(320,439) = **877,155 行（99.2 %）**；
 `avg(length(payload->>'text'))` 在 `assistant_delta` 上是 **2.09 个字符**（工单正文里的 3.82 没复现，以现查为准）。
@@ -5098,3 +5103,84 @@ runner `node --test 'runner/test/*.test.js'` `507 / 507` rc=0；
 **真库待办（合并后由主 agent 执行，本单没碰 `station-db`）**：见 `.task-502-report.md` 的「真库待办」——
 迁移 `0033` 由 `migrate.js` 自动应用，存量清理随迁移发生，之后需要在低峰期手工
 `VACUUM (FULL, ANALYZE) run_events;` 才真的把 472 MB 里的绝大部分还给磁盘。
+
+### 8.126 issue #502 换形态：终态正文并进 `run_end`，`uptoSeq` 换成 `roundSeq`，另修夹具并发（形态 M / 工单 feat-261113-02 续，2026-11-13，worker 落地）
+
+**为什么放弃自己刚落地那一版（不是它不工作，是它多要了一样东西）**：§8.125 第 3 步为「一个 run 的
+未完稿正文」新增了一种事件行 `partial_output`、一个新的 `allocSeq` 消费者、一个新的幂等键
+`<run_id>:final:partial_output` 与一条部分唯一索引 `run_events_run_partial_key`。而**「一个 run 至多一条
+终态事件」这条约束本来就有人付过了**——`run_events_run_end_key (run_id) WHERE type='run_end'` 早就在，
+`run_end` 每个 run 必写、且就在那条终态事务里。于是同一件事付两遍：多一种类型要养（白名单、
+幂等键、索引、迁移 0033 的 DDL 与它的观测语句），换来的只是把两个键挪进行载荷。**形态 M：把
+`partial_text` / `partial_round` 并进 `run_end.payload` ⇒ 零新类型、零新索引、零新幂等键，
+`0033` 退化成纯清理。**
+- 判据与 `run_end` 的锚点判据**逐字同构**：只在「**无** assistant 锚点 **且** 缓冲里有正文」时并键，
+  否则**载荷一字不多**（有锚点时再落一份正文就是重复正文那个坑本身）。
+- 六个合成 `run_end` 的落点全部复用同一个 helper（`internal.js#runEndPartialKeys` / `withPartialRunEnd` /
+  `retirePartialBuffer`）：`finishRun`、`releaseRun` 的中止与 max_attempts 两支、`reapExpiredRuns` 的同两支、
+  `provisioner.js#terminateActiveRuns`；`sessions.js#stopSession` 的两支**仍然故意不写**（那条分支 run
+  从未开始 ⇒ 缓冲必空 ⇒ helper 自然返回空对象，载荷与今天逐字相同；将来若有「queued 但已流式过」的
+  落点，接同一个 helper 就行）。
+- durable 侧的正文来源从此只有两处，历史投影按此读：**已完成轮次** = `round_end.payload.final_text`
+  按 `seq` 升序拼接；**被停住那半轮** = `run_end.payload.partial_text`。两处都空 ⇒ **占位合成项**
+  （`placeholder: true`）——#278「不许留空白」的**唯一**落点（旧版还有一条 SSE 占位帧兜底，已删）。
+
+**`uptoSeq` 为什么整条删掉（不是改名，是量错了东西）**：它拿「已落库事件的最大 seq」当水位线，
+可碎片**按定义没有 seq** ⇒ 服务端在拿两套坐标系硬比 `Last-Event-ID`。比赢 ⇒ 漏发（少一段还没写完的
+正文，刷新即回），比输 ⇒ 重发（把已有正文再盖一遍，正是 #300 那颗头号坑）。形态 M 把判据换成
+**两端对同一个事实**：`round_start` 是事实档、本来就有 seq ⇒ 服务端在快照帧里带 `roundSeq`（它那一轮的
+轮起点），前端在 `case 'round_start'` 里记下**自己观测到的**同一个数，**run 与 roundSeq 两条都匹配才覆盖
+气泡，任一不中整帧丢弃**。服务端不再猜水位线（`lastEventId` 再大也照发），重复由前端丢弃兜住。
+配套：补发**只看内存**（没有 DB 回落——越界去库里拼一份「看起来像流式」的正文，就是拿已完成轮次的
+终稿冒充未定稿），**不发占位帧**，已标终态的 run 不再出快照。
+
+**两个上限的算术（都不是拍脑袋）**：
+- 投影上限 `PARTIAL_OUTPUT_TEXT_CAP = 2000` → **`PARTIAL_PROJECTION_TEXT_CAP = 65536`**：真库现查单轮
+  `round_end.final_text` 最长 **31,707** 字符 ⇒ 旧的 2000 会咬掉「刷新后正文逐字完整」这条判据
+  （一个正常输出长文的中止 run 被截掉大半）。65536 = 现查最大值约两倍，向上取整到 2 的幂；
+  超限只置 `truncated: true`，**不往载荷里塞省略号文本**。
+- 缓冲 `textCap` 2000 → **16384**，`maxEntries` 256 → **32**：32 × 64 KB ≈ **2 MB** 常驻，而 256 条会到
+  16 MB。上限之间的耦合必须写死在测试里（旧那条「默认上限必须仍是 2000」的断言把红线钉反了，已反转）。
+  另补 `PARTIAL_MAX_COUNTERS_DEFAULT = 8`（去重计数器原先无界增长：一个长 run 每片一个键，
+  而它服务的只是 at-least-once 去重 ⇒ 按 attempt 保留、丢最老）。
+- LRU **优先逐已终态的 run**，且**全活跃时逐出必须计数 + 出声**：逐掉一个还在流的 run 的后果是它终态
+  写不出 `partial_text` = **静默丢正文**，界面上永远不会出现，所以那条路不许无声。
+
+**并入的四条审计（各有具名用例）**：① 整批重投不许把碎片再转一次 SSE——碎片不落库 ⇒ `ON CONFLICT`
+那条 durable 幂等闸对它不存在，于是**累加器首次观测才转发**（`observe()` 的返回值是**唯一**剩下的
+碎片级去重信号）；② 缓冲变更**只在 COMMIT 之后**生效（`stage()`/`commit()` 事务视图；否则会出现
+「内存里有正文、库里那一轮根本没落」这种只有内存知道的假事实），终态侧同理：`retirePartialBuffer`
+只在真写了 `run_end` 且 COMMIT 之后调；③ U3 拒绝容器上报 portal 自造的三类
+`run_end` / `partial_output` / `attempt_killed`（`400 validation_failed`）——引擎将来新增的 additive
+类型不在这一小撮里，照旧透传；④ **历史合成项只在它 `seq` 所属的那一页出现**（两类合成项共用同一道
+出口闸）：它的 `seq` 是 `MAX(seq)` 不受 `before` 约束，不加这道闸就是「往上翻一页，同一段正文重演一遍」。
+第 5 条是文档条目：内存槽与 SSE hub 都是 **per-process** ⇒ **portal 单副本部署前提**（写进 portal.md §5.1；
+多副本时那段未定稿会丢，丢成「只剩已完成轮次」而不是脏数据）。
+
+**F-1：真库夹具的并发冲突（这条与形态无关，是测试自己的缺陷）**：带 `TEST_DATABASE_URL` 的全量
+`npm test` 偶发红一条 `error: 'tuple concurrently updated'`(XX000)。根因现查：`docs/data/bootstrap.sql:37-38`
+每次 bootstrap 都发 `ALTER ROLE station_platform/station_portal …`（写**集群目录** `pg_authid` 同一行），
+而 `delta-not-persisted-db.test.js` 与 `migrate-fresh-db.test.js` **各带一份复制夹具**、各自
+`CREATE DATABASE` ⇒ 两条连接在两个不同的新建库里同时改那一行；`migrate.js:251` 的 `pg_advisory_lock`
+**挡不住**（advisory lock 的作用域带 database OID，两个持锁者在不同库 ⇒ 互相看不见）。生产只有一个库
+一条迁移通路，**没有这个形状** ⇒ 修在夹具层：新增 `portal/test/pg-fixture.js`（建库/迁移/`WITH (FORCE)`
+删库 + **跨进程文件锁** `/tmp/station-test-bootstrap.lock`，两个文件都改用它并删掉复制版）。
+Node 没有 `flock(2)` 绑定 ⇒ `open 'wx'` 原子创建 + 锁内记 `{pid,token,at}`：pid 不存在立刻抢、
+活着但超 `STALE_MS`(10min) 也抢、等不到 `TIMEOUT_MS`(15min) **抛错而不是无限等**（宁可红一条不挂死整条
+`npm test`）、释放只认自己那个 token（超时那条腿不许删别人的锁）。
+**锁不是摆设有实测**：`STATION_TEST_LOCK_TIMEOUT_MS=1` 时两个文件的 4 个用例全报「拿不到夹具文件锁」
+⇒ 临界区确实重叠；手工塞 pid=999999 的脏锁进去照样 9/9 通过且用完清干净 ⇒ 抢得动、不死锁。
+独立复现根因：两条连接同时发那句 `ALTER ROLE station_portal …`，**第 1 轮**就 `XX000 tuple concurrently updated`。
+
+**门禁（最终树，只看 rc）**：根 `npm test` `2218 tests / 2209 pass / 0 fail / 9 skipped` rc=0（形态 M 净增
+21 条用例）；runner `507 / 507` rc=0；前端 `63 files / 1336 passed` rc=0（本支净增 8 条）+ `npm run typecheck` rc=0；
+`npm run check:agents-hotlayer` rc=0。真库面（一次性 `postgres:16.15`，`POSTGRES_HOST_AUTH_METHOD=trust`，
+用完 `docker rm -f`）：两个 DB 文件单跑两遍 `9 / 9` rc=0；**带 `TEST_DATABASE_URL` 的全量 `npm test`
+两遍都是 `# pass 2218 / # fail 0` rc=0**；同一台上旧夹具（HEAD 的 worktree）全量第 1 遍 `# fail 1`
++ 同一条 XX000、第 2 遍干净 ⇒ 这正是「偶发」的形状。
+
+**没验 / 待办**：真库 `station-db` 一次都没连（只读红线）⇒ 0033 在真 dev 库上的删除行数、耗时、
+`VACUUM FULL run_events` 前后的 `pg_total_relation_size` 差值全部未测；**部署顺序是硬约束**：
+0033 的残留观测已是 `RAISE EXCEPTION` ⇒ **必须先上代码、再跑迁移**（顺序反了迁移会失败而不是带病通过；
+失败可重放，不是死局）。前端「断线重连后 `roundSeq` 对不上就不覆盖气泡」的真机观感未验（本单只到单测）。
+

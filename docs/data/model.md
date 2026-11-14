@@ -182,12 +182,26 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 > `assistant_delta` 的 `payload.text` 平均 **2.09 个字符**（`SELECT avg(length(payload->>'text'))
 > WHERE type='assistant_delta'` 现查；工单 #502 正文里那个 3.82 是同一条 SQL 的旧读数，本次没复现出来，
 > 以现查为准）——即「一次事务 + 五次索引更新」换两个字符。
-> 碎片的**内容**去向：① 进程内累加器（portal 重启即失，只服务断线补发）；② 终态若无 assistant 锚点，
-> 落 **一行** `type='partial_output'`（`client_event_id = run_id:final:partial_output`，与合成 `run_end`
-> 同事务、`seq` 排在它之后）。部分唯一索引 `run_events_run_partial_key (run_id) WHERE type='partial_output'`
-> （迁移 `0033`）把「一个 run 至多一行」升级成库面约束。**B/C 的索引与键都保留**：`(run_id, client_event_id)`
-> 的幂等键对 durable 档仍然承重（at-least-once 重投照旧顶回），五条索引服务的是仍在落库的那些行——
-> 碎片不落库不等于索引可以为碎片让路。存量清理由同一支迁移分批完成（`FOR UPDATE SKIP LOCKED` + `lock_timeout`）。
+> 碎片的**内容**去向只有两条（形态 M 的落点，**零新类型、零新索引**）：
+> ① **进程内累加器**（`portal/src/run-partial-buffer.js`，per-process ⇒ 重启即失、多副本不共享）只服务
+>    断线补发，且**只存当前那一轮**（`round_start` 一到就换槽，正文按轮重置、`reasoning` 独立累加）；
+> ② 终态时若这次 run **没有 assistant 锚点**，那段未定稿正文**并进既有 `run_end` 的载荷**：
+>    `payload.partial_text` + `payload.partial_round`（与合成 `run_end` 的**同一条 INSERT**，
+>    `internal.js#runEndPartialKeys`，六个终态点共用一个 helper）。**没有新增事件行**，也没有
+>    「一个 run 至多一行部分正文」的库面约束——那条约束本来就由**既有**的
+>    `run_events_run_end_key (run_id) WHERE type='run_end'` 提供（一个 run 至多一条 `run_end`），
+>    形态 M 因此**不新增也不删除任何索引**；曾经计划的部分唯一索引 `run_events_run_partial_key`
+>    随它服务的那个行类型一起放弃（成本与理由见 task-ledger §8.125）。
+> ⇒ 「这次 run 说过的话」的 durable 来源只有两处：已完成轮次的 `round_end.payload.final_text`
+>    + 被停住那半轮的 `run_end.payload.partial_text`；历史投影（portal.md §4.4a-1）只读这两处拼正文，
+>    两处都空则给一条**占位合成项**（`placeholder: true`，#278 不空白红线的唯一落点）。
+> **B/C 的索引与键都保留**：`(run_id, client_event_id)` 的幂等键对 durable 档仍然承重（at-least-once
+> 重投照旧顶回），五条索引服务的是仍在落库的那些行——碎片不落库不等于索引可以为碎片让路。
+> 存量清理由迁移 `0033` 分批完成（`FOR UPDATE SKIP LOCKED` + `SET LOCAL lock_timeout/statement_timeout`，
+> **纯清理：语句区零 CREATE/DROP/ALTER**）。
+> **部署顺序是硬约束**：`0033` 把「残留 stream 档碎片」的观测从 `RAISE WARNING` 改成了 **`RAISE EXCEPTION`**
+> ⇒ **必须先上代码、再跑迁移**；顺序反了（旧版 portal 还在往库里写碎片）迁移会失败而不是带病通过
+> ——失败可重放，不是死局，但会把起栈卡住。
 
 **`run_end` 唯一性与来源（A4 定稿）**：`type='run_end'` 是 portal 在 U2 终态事务内**合成**的 run 内最后一条事件（worker 不再经 U3 发 `run_end`，runner-integration §7.6），其 `client_event_id` 为确定性值 `run_id:final:run_end`。schema 额外有部分唯一索引 `UNIQUE (run_id) WHERE type='run_end'`（`run_events_run_end_key`），保证**即使 client_event_id 不同，每个 run 也至多一条 `run_end`**；U2 终态重试用 `ON CONFLICT (run_id, client_event_id) DO NOTHING` 去重（同载荷幂等）。
 
@@ -698,7 +712,8 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
-| `run_events` | **热保留，当前不删除**（针对**已落库的 durable 档**）。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记。**#502 的两条例外**：① stream 档碎片自迁移 `0033` 起**不再产生**（旧存量由同一支迁移分批清掉）；② 每个 run 的未完稿正文只留**一行** `partial_output`（部分唯一索引兜底）。 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
+| `run_events` | **热保留，当前不删除**（针对**已落库的 durable 档**）。~~到期导出 JSONL 冷存后 DELETE~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**：事件无限期热保留；将来可选项（保留 N 天后导出 JSONL 冷存、再 `DELETE`）留作分析，见下方运维注记。**#502 的两条例外**：① stream 档碎片自迁移 `0033` 起**不再产生**（旧存量由同一支迁移分批清掉）；② 每个 run 的未完稿正文只占**既有 `run_end` 载荷里的两个键**（`partial_text` / `partial_round`，
+>    形态 M ⇒ 不新增行、不新增索引）。 事件的唯一消费是实时推送与断线补发。补发窗口有限的契约语义（过期后 SSE 返回 `410 replay_unavailable`，前端回退全量拉取，portal.md §5.2-4）**保留定义但因当前不删事件而不会触发**——两处口径已对齐（portal.md §5.2 注） |
 | `transcript_rounds` | **不删**（resume 源 + 审计），膨胀靠 jsonb 自动 TOAST 压缩吸收。~~session 归档后可整体导出冷存~~ → **暂不考虑（P1/P2 不实施**，决策者 2026-09，issue #3 评论**）**；活跃 session 永不归档 | 规格 §9.2「fold 只影响视图，档案完整」；resume 只可能发生在活跃 session 上 |
 | `run_checkpoints` | **每 transcript key 单行**（覆盖写，见 §1.11），无历史 seq 概念；随 run/transcript 同生命周期保留 | 上游 `loadLatestRunSnapshot` 只读最新（唯一消费者），覆盖写天然无积累 |
 | `messages` | 永久保留 | 人读层，行小（content + 摘要），是 FDE「关掉明天再打开会话还在」期待的承载（原理三） |
