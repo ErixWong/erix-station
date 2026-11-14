@@ -5,7 +5,9 @@
 //   判据 2 的后端那一半（前端打字机由真机 e2e 负责）→ 碎片不落库但仍逐条转 SSE，帧不带 `id:`
 //   判据 8 「幂等一条 SQL」→ 同 `client_event_id` 重投：不第二行、不 5xx、seq 允许跳号、last_seq 仍递增
 //   D-2 → seq-less 帧既不被 `ev.seq <= sinceSeq` 过滤，也不推进 `rec.lastSeq`；溢出仍按条数
-//   D-4 → 写入侧接线（碎片喂缓冲、落库事件推进 `uptoSeq`）；模块本体见 `run-partial-buffer.test.js`
+//   D-4 → 写入侧接线（碎片喂缓冲、`round_start` 开新槽并带出 `roundSeq`）；模块本体见 `run-partial-buffer.test.js`
+//   形态 M（审计四条）→ M-6① 重投不重复转发、M-6② 缓冲变更排在 COMMIT 之后、M-6③ U3 拒绝
+//   portal 自造的事件类型；M-6④（历史合成项分页）在 `session-partial-output.test.js` 承重
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -292,10 +294,10 @@ test('#502 D-2：缓冲溢出仍按**条数**判（碎片进缓冲，但不引�
 });
 
 // ---------------------------------------------------------------------------
-// D-4 写入侧接线：碎片喂缓冲、落库事件推进 uptoSeq
+// D-4 写入侧接线：碎片喂缓冲、`round_start` 开新槽（形态 M：不再是「落库事件推进 uptoSeq」）
 // ---------------------------------------------------------------------------
 
-test('#502 D-4 接线：U3 落库后缓冲里有正文，且 uptoSeq = 最后一条落库事件的 seq', async () => {
+test('#502 D-4 接线：U3 落库后缓冲里有正文，且 roundSeq = 当前轮 round_start 的 seq', async () => {
   const c = await live({ sessionId: 's502', runId: 'r502' });
   assert.equal(partialOutputs.snapshot('r502'), null, '开跑前没有缓冲');
   await postEvents(c.pool, {
@@ -312,8 +314,41 @@ test('#502 D-4 接线：U3 落库后缓冲里有正文，且 uptoSeq = 最后一
   assert.ok(snap, '碎片必须进缓冲');
   assert.equal(snap.text, '半截');
   assert.equal(snap.reasoning, '因为');
-  assert.equal(snap.uptoSeq, 2, '两条落库事件（seq 1、2）⇒ uptoSeq = 2');
+  // 改写的旧断言：`uptoSeq: 2` ⇒ `roundSeq: 1`。形态 M 删了 `uptoSeq`：碎片不落库就没有 seq 坐标系，
+  // 「已落库事件的最大 seq」与客户端 `Last-Event-ID` 是两套坐标，拿它当闸门会漏发/重发（审计 B-2/B-3）；
+  // 现在只带「当前轮轮起点自己的 seq」，前端拿同一个事实对账（`round_start` 是事实档，两边同一个数）。
+  assert.equal(snap.roundSeq, 1, 'round_start 自己落在 seq 1 ⇒ roundSeq = 1');
+  assert.equal(snap.round, 1, '轮号取自 round_start.payload.round ⇒ 终态写 `run_end.partial_round` 用的就是它');
+  assert.ok(!('uptoSeq' in snap), '快照里不许再有 uptoSeq（那套坐标已整体删除）');
   assert.equal(snap.sessionId, 's502', '补发侧要按会话找候选 run');
+});
+
+test('#502 形态 M 口径②：round_start 重置正文槽（不许跨轮累加），reasoning 独立累加', async () => {
+  const c = await live({ sessionId: 's502r', runId: 'r502r' });
+  const send = (events) => postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502r', claimToken: c.claimToken,
+    body: { batch_id: 'b', events },
+  });
+  await send([
+    uplink('r502r', 0, 'round_start', { round: 1 }),
+    uplink('r502r', 1, 'assistant_delta', { text: '第一轮' }),
+    uplink('r502r', 2, 'reasoning_delta', { text: 'A' }),
+  ]);
+  assert.equal(partialOutputs.snapshot('r502r').text, '第一轮');
+  await send([
+    uplink('r502r', 3, 'round_start', { round: 2 }),
+    uplink('r502r', 4, 'assistant_delta', { text: '第二轮' }),
+    uplink('r502r', 5, 'reasoning_delta', { text: 'B' }),
+  ]);
+  const snap = partialOutputs.snapshot('r502r');
+  // 旧版是「按 run 累加」⇒ 这里会拼出 `第一轮第二轮`，而界面的流式气泡本来就在 `round_start` 置 null
+  //（`useEventStream.ts`）⇒ 缓冲里那段话界面上**从来没出现过**，拿它写终态正文就是造了一份没人见过的
+  // 历史（审计 B-1）。跨轮累加的另一半代价更大：`run_end.partial_text` 会带上前几轮的终稿，
+  // 与 `round_end.final_text`（历史投影读的那一份）**重复**。
+  assert.equal(snap.text, '第二轮', '新一轮开始 ⇒ 正文槽清空');
+  assert.equal(snap.reasoning, 'AB', 'reasoning 不在轮边界清空，也不与正文混写（它不落库，只是观测面）');
+  assert.equal(snap.round, 2);
+  assert.equal(snap.roundSeq, 2, '只有 round_start 占号（碎片不 allocSeq）⇒ 第二条 round_start 落在 seq 2 = 当前轮起点');
 });
 
 test('#502 D-4 接线：整批重投不把正文拼两遍（stream 档没有库面可依赖）', async () => {
@@ -334,4 +369,156 @@ test('#502 D-4：单例与工厂是两套实例（测试清的是单例，不影
   partialOutputs.clear();
   assert.ok(mine.snapshot('x'), '工厂实例独立');
   assert.equal(partialOutputs.snapshot('x'), null, '单例已被清');
+});
+
+// ---------------------------------------------------------------------------
+// 形态 M-2：终态那半截正文**并进既有 `run_end` 行的 payload**（不新增事件行类型）
+// ---------------------------------------------------------------------------
+
+/** 取该 run 的合成 `run_end` 载荷（fake 里 payload 存的是字符串，同 `internal-attempt-killed.test.js`）。 */
+function runEndOf(pool, runId) {
+  const row = pool.events.filter((e) => e.type === 'run_end' && e.run_id === runId).pop();
+  assert.ok(row, `没有合成 run_end：${pool.events.map((e) => e.type).join(',')}`);
+  return { row, payload: typeof row.payload === 'string' ? JSON.parse(row.payload) : (row.payload ?? {}) };
+}
+
+test('#502 形态 M-2：停止时那半截正文进 `run_end.payload.partial_text`/`partial_round`，且**不新增事件行**', async () => {
+  const c = await live({ sessionId: 's502t', runId: 'r502t' });
+  await postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502t', claimToken: c.claimToken,
+    body: { batch_id: 'b1', events: [
+      uplink('r502t', 0, 'round_start', { round: 3 }),
+      uplink('r502t', 1, 'assistant_delta', { text: '说到' }),
+      uplink('r502t', 2, 'assistant_delta', { text: '一半' }),
+    ] },
+  });
+  // runner 的 catch 固定 `final_text: ''`（`runner/worker.js:1182`，本单红线不得改）⇒ 无 assistant 锚点
+  await setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502t', claimToken: c.claimToken,
+    body: { state: 'finished', termination: { reason: 'aborted' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 3, final_text: '' },
+  });
+  const { payload } = runEndOf(c.pool, 'r502t');
+  assert.equal(payload.partial_text, '说到一半', '#300 那条「中止后还能看到那段正文」现在靠这两个键承重');
+  assert.equal(payload.partial_round, 3, '轮号取自 round_start ⇒ 排障时能定位是哪一轮断的');
+  // **零新行类型**：上一版会多出一条 `type='partial_output'` 的行，形态 M 里它根本不存在
+  assert.equal(c.pool.events.filter((e) => e.type === 'partial_output').length, 0,
+    '不得再写 partial_output 行（那是被删掉的旧通道）');
+  assert.equal(c.pool.events.filter((e) => e.type === 'run_end').length, 1, '一个 run 仍只有一条 run_end');
+  // 既有键一个不少（additive：并进两个键不得动 termination/usage/rounds/attempt 的形状）
+  assert.equal(payload.termination.reason, 'aborted');
+  assert.deepEqual(payload.usage, { input_tokens: 1, output_tokens: 1 });
+  assert.equal(payload.rounds, 3);
+  // 缓冲在 COMMIT 之后收尾 ⇒ 补发侧不再对它发帧（正文的 durable 副本已在库里）
+  assert.equal(partialOutputs.snapshot('r502t'), null, '终态后缓冲必须让位（否则刷新后历史一份 + 补发一份）');
+});
+
+test('#502 形态 M-2：有 assistant 锚点 ⇒ run_end 载荷**逐字**不多键（两份正文就是 #300 那个坑）', async () => {
+  const c = await live({ sessionId: 's502a', runId: 'r502a' });
+  await postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502a', claimToken: c.claimToken,
+    body: { batch_id: 'b1', events: [
+      uplink('r502a', 0, 'round_start', { round: 1 }),
+      uplink('r502a', 1, 'assistant_delta', { text: '流式的半截' }),
+    ] },
+  });
+  await setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502a', claimToken: c.claimToken,
+    body: { state: 'finished', termination: { reason: 'end_turn' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 1, final_text: '完整终稿' },
+  });
+  const { payload } = runEndOf(c.pool, 'r502a');
+  assert.equal(Object.hasOwn(payload, 'partial_text'), false, '有锚点 ⇒ 正文的 durable 副本在 transcript/投影那条路上');
+  assert.equal(Object.hasOwn(payload, 'partial_round'), false);
+  assert.equal(c.pool.messages.some((m) => m.role === 'assistant'), true, '前置：这条路径确实建了锚点');
+});
+
+test('#502 形态 M-2：缓冲里没有正文（停在 sleep 上）⇒ run_end 载荷与今天逐字相同', async () => {
+  const c = await live({ sessionId: 's502e', runId: 'r502e' });
+  await setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502e', claimToken: c.claimToken,
+    body: { state: 'finished', termination: { reason: 'aborted' }, usage: { input_tokens: 0, output_tokens: 0 }, rounds: 0, final_text: '' },
+  });
+  const { payload } = runEndOf(c.pool, 'r502e');
+  assert.deepEqual(Object.keys(payload).sort(), ['attempt', 'rounds', 'termination', 'usage'],
+    '空正文不许凭空多两个键（也不写空串：空键会让读侧把「没有」读成「正文是空」）');
+});
+
+// ---------------------------------------------------------------------------
+// 形态 M / 审计四条（M-6）的写入侧三条：①重投不重转 ②变更排在 COMMIT 后 ③保留类型 400
+// ---------------------------------------------------------------------------
+
+test('#502 M-6①：整批重投不把碎片**再转一次 SSE**（observe 的返回值必须用起来）', async () => {
+  const c = await live({ sessionId: 's502d', runId: 'r502d' });
+  const res = fakeSseRes();
+  const rec = registerSessionClient('s502d', res);
+  sessionClientGoLive('s502d', rec);
+  const events = [
+    uplink('r502d', 0, 'round_start', { round: 1 }),
+    uplink('r502d', 1, 'assistant_delta', { text: 'AB' }),
+    uplink('r502d', 2, 'assistant_delta', { text: 'CD' }),
+  ];
+  const body = { batch_id: 'b1', events };
+  const first = await postEvents(c.pool, { container: c.container, user: c.user, runId: 'r502d', claimToken: c.claimToken, body });
+  const framesAfterFirst = res.written.length;
+  assert.equal(first.stream_forwarded, 2, '首投：两条碎片都转发');
+  // U3 是 at-least-once：`runner/agentd.js` 的可重试路径会把**整批**放回队首再发一遍
+  const second = await postEvents(c.pool, { container: c.container, user: c.user, runId: 'r502d', claimToken: c.claimToken, body });
+  assert.equal(second.stream_forwarded, 0,
+    '重投的碎片必须**不再转发**：浏览器已经收过一次，再发就是打字机上重复正文（#300 头号坑），'
+    + '而 stream 档不落库 ⇒ 库里没有判据，唯一判据就是缓冲里那份 client_event_id 计数');
+  assert.equal(res.written.length, framesAfterFirst,
+    '一条帧都不许多发（round_start 重投被 ON CONFLICT 挡下，碎片被 observe 判为重投）');
+  assert.equal(partialOutputs.snapshot('r502d').text, 'ABCD', '正文也只拼一遍');
+  assert.equal(second.stored, 0, 'round_start 的幂等仍靠 ON CONFLICT（不得回归）');
+  try { unregisterSessionClient('s502d', rec); } catch { /* 收尾 */ }
+});
+
+test('#502 M-6②：COMMIT 失败 ⇒ 缓冲一个字都不改（不许留下「内存有、库里无」的假象）', async () => {
+  const c = await live({ sessionId: 's502c', runId: 'r502c' });
+  c.pool.failCommitOnce = true; // fake 提供：下一次 COMMIT 抛错（模拟提交失败/连接掉线）
+  await assert.rejects(() => postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502c', claimToken: c.claimToken,
+    body: { batch_id: 'b1', events: [
+      uplink('r502c', 0, 'round_start', { round: 1 }),
+      uplink('r502c', 1, 'assistant_delta', { text: '这段没提交成功' }),
+    ] },
+  }));
+  // 旧版在事务里直接 observe ⇒ 这里缓冲里会留着「这段没提交成功」：
+  // 补发侧会把它发给浏览器，终态时还会写进 `run_end.partial_text` ⇒ 用户看见一段库里没有的正文。
+  const snap = partialOutputs.snapshot('r502c');
+  assert.ok(snap === null || snap.text === '', `回滚后缓冲里不许有正文：${JSON.stringify(snap)}`);
+  assert.equal(c.pool.events.length, 0, '前置：库里确实一行没写');
+});
+
+test('#502 M-6③：portal 自造的三类事件从 U3 上来 ⇒ 400 validation_failed（其余 additive 类型照收）', async () => {
+  const c = await live({ sessionId: 's502v', runId: 'r502v' });
+  for (const type of ['run_end', 'partial_output', 'attempt_killed']) {
+    await assert.rejects(
+      () => postEvents(c.pool, {
+        container: c.container, user: c.user, runId: 'r502v', claimToken: c.claimToken,
+        body: { batch_id: 'b', events: [uplink('r502v', 1, type, {})] },
+      }),
+      (e) => e.status === 400 && e.code === 'validation_failed' && /portal 自造/.test(e.message),
+      `${type} 必须被拒（portal 在终态/回收事务里自己写它，容器再递一条就是第二把笔写同一个名字）`,
+    );
+  }
+  assert.equal(c.pool.events.length, 0, '400 发生在进事务之前 ⇒ 零写入');
+  // 反面：上游新增的 additive 类型（`eventTierOf` 认不出 = 事实档）照旧透传，本闸不得顺手拒掉
+  const r = await postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502v', claimToken: c.claimToken,
+    body: { batch_id: 'b2', events: [uplink('r502v', 2, 'some_future_event', { hello: 'world' })] },
+  });
+  assert.equal(r.stored, 1, '引擎将来新增的类型仍照旧落库（闸只认本站自造那三个名字）');
+});
+
+test('#502 M-2 helper：runEndPartialKeys 的三条判据（锚点 / 空正文 / 正常正文）', async () => {
+  const { runEndPartialKeys } = await import('../src/internal.js');
+  const b = createPartialBuffer();
+  assert.deepEqual(runEndPartialKeys('r1', { buffer: b }), {}, '没有这个 run ⇒ 空对象');
+  b.observe('r1', { client_event_id: 'r1:1:0', type: 'round_start', payload: { round: 2 }, seq: 4, session_id: 's' });
+  b.observe('r1', { client_event_id: 'r1:1:1', type: 'assistant_delta', payload: { text: '半截' }, session_id: 's' });
+  assert.deepEqual(runEndPartialKeys('r1', { hasAssistantAnchor: true, buffer: b }), {},
+    '有锚点 ⇒ 空对象：判据与 finishRun 建锚点用的是同一条表达式');
+  assert.deepEqual(runEndPartialKeys('r1', { buffer: b }), { partial_text: '半截', partial_round: 2 });
+  // 缓冲只读：算键这个动作本身不得把 run 标掉/丢掉（终态点要在 COMMIT 之后才收尾）
+  assert.ok(b.snapshot('r1'), 'helper 只读缓冲（M-6②：变更排在 COMMIT 之后）');
 });

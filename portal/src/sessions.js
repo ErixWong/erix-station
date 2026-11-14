@@ -809,12 +809,12 @@ export async function stopSession(pool, { userId, sessionId, notify }) {
          ON CONFLICT (run_id, client_event_id) DO NOTHING`,
         [row.id, s.id, seq, `${row.id}:final:run_end`, JSON.stringify(payload)],
       );
-      // issue #502 D-3 在这里**故意不落** `partial_output` 行，不是漏接：
+      // issue #502 形态 M 在这里**故意不写** `run_end.payload.partial_text`，不是漏接：
       // 本分支的 run 从未开始（`runs.status` 仍是 `queued`，worker 先报 U1 `running` 才会开跑），
-      // 而碎片只可能从 U3 上来 ⇒ 此时 #502 的进程内缓冲必然是空的，`insertPartialOutputRow` 会直接
-      // 返回 false。写一行空正文反而违背 D-3 自己的「text 空 ⇒ 不写行」口径（空行还会占住
-      // 0033 那条 `(run_id) WHERE type='partial_output'` 部分唯一索引的位置）。
-      // 因此本处不调它；将来若有「queued 但已流式过」的终态点，接 `insertPartialOutputRow` 即可。
+      // 而碎片只可能从 U3 上来 ⇒ 此时进程内缓冲必然是空的，`internal.js#runEndPartialKeys` 会直接
+      // 返回空对象（= 载荷逐字不变）。所以这里**不调它也没有任何缺口**，而留着这段理由是必要的：
+      // 将来若有「queued 但已流式过」的终态点，接 `runEndPartialKeys(runId)` 并开载荷即可
+      //（别又开一条事件行 —— 形态 M 的落点是既有的 `run_end`，理由见那处注释）。
       runEnds.push({ run_id: row.id, seq, payload });
     }
 
