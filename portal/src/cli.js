@@ -14,6 +14,7 @@ import { startOffboardingLoop } from './offboarding.js';
 import { startRoutesLoop } from './routes.js';
 import { startRouteDriftMonitor } from './routesdrift.js';
 import { startReaperLoop, notifySessionEvents } from './internal.js';
+import { gracefulShutdown, SHUTDOWN_LOOPS_MS_DEFAULT } from './shutdown.js';
 import {
   createDockerClient,
   onboardFde,
@@ -36,6 +37,11 @@ function usage() {
       '  cli.js healthcheck',
   );
 }
+
+const SHUTDOWN_WAIT_MS = SHUTDOWN_LOOPS_MS_DEFAULT; // 等循环收尾的上限（只管循环那一段）
+// **整个关闭流程**的总上限（#506 复审①）：compose / k8s 默认只给 10s 宽限期，超了就是 SIGKILL。
+// 8s = 循环收尾 5s + server 关闭 3s，另留 ~2s 给 process.exit 与调度器。见 ./shutdown.js 的 gracefulShutdown。
+const SHUTDOWN_TOTAL_MS = 8000;
 
 async function serve() {
   const config = loadConfig();
@@ -83,19 +89,47 @@ async function serve() {
     console.log('[portal] onboarding loop started');
     console.log('[portal] offboarding loop started');
   });
-  // 进程退出时停循环（优雅关闭）。
-  const shutdown = () => {
-    materializerLoop.stop();
-    onboardingLoop.stop();
-    offboardingLoop.stop();
-    routesLoop.stop();
-    driftMonitor.stop();
-    provisionerLoop.stop();
-    reaperLoop.stop();
-    server.close(() => process.exit(0));
+  // 进程退出时停循环 + 关 HTTP（优雅关闭）。
+  //
+  // issue #506 评审②：旧代码只同步调 7 个 `stop()` 就 `server.close(() => process.exit(0))`，
+  // 而 `stop()` **不中断在途的 `claim*Rows()` 事务**，也没人 await `done` ⇒ 进程可能切在事务中间
+  // （回滚白干一轮，或已提交却没 mark*Published ⇒ processing 行带 60s 租约等孤儿回收）。
+  // issue #506 复审①：修完②之后顺序变成「先等 5s 循环、**再** server.close」，那 5s 里 server 还在
+  // listen ⇒ 仍在接新请求；且 `server.close` 只停接新连接、要等既有连接（SSE = keep-alive）自己结束
+  // ⇒ 5s 只是循环那一段的上限，不是整个流程的上限。现在：**先 close 再等循环**，且给整个流程一个
+  // 总上限 `SHUTDOWN_TOTAL_MS`，到点无论收没收完都 exit(0) 并点名还没退的循环。细节见 ./shutdown.js。
+  const loops = [
+    { name: 'materializer', ...materializerLoop },
+    { name: 'onboarding', ...onboardingLoop },
+    { name: 'offboarding', ...offboardingLoop },
+    { name: 'routes', ...routesLoop },
+    { name: 'routes-drift', ...driftMonitor },
+    { name: 'provisioner', ...provisionerLoop },
+    { name: 'reaper', ...reaperLoop },
+  ];
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return; // 重入保护：重复信号不许重复 stop / 重复 close
+    shuttingDown = true;
+    // 顺序与总上限都在 gracefulShutdown 里（可注入 server / exit / stopLoops ⇒ 可单测）：
+    // server.close() 发起即返回 → await 循环收尾（SHUTDOWN_WAIT_MS）→ 在剩余总预算里等 server 关完 → exit(0)。
+    await gracefulShutdown({
+      server,
+      loops,
+      loopTimeoutMs: SHUTDOWN_WAIT_MS,
+      totalTimeoutMs: SHUTDOWN_TOTAL_MS,
+    });
   };
-  process.once('SIGTERM', shutdown);
-  process.once('SIGINT', shutdown);
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.once(signal, () => {
+      // shutdown 是 async：拒绝必须在这里接住，否则就是一条未捕获拒绝（本仓已知「摘要全绿但 rc=1」陷阱）。
+      shutdown().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[portal] 优雅关闭自身异常，直接退出：', err?.message ?? err);
+        process.exit(1);
+      });
+    });
+  }
 }
 
 async function runMigrate() {

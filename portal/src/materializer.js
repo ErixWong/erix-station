@@ -514,8 +514,95 @@ function removeStaleFiles(prevFiles, desiredContainerPaths, root, fdeName, log) 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MAX_ATTEMPTS = 5;
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// issue #506（空闲退避）：与 routes.js 同一形状、同一价。旧代码固定 `sleep(250)` 且 `BACKOFF_MS`
+// 只服务异常分支 ⇒ 平台完全空闲时两个循环仍各 4 拍/秒，每拍 4~5 条语句（2026-11-14 实测：
+// 空闲态 26.4 事务/秒、64.2 次表扫/秒）。本循环的 `runMaterializerOnce` **本来就**返回
+// `{ processed, claimed }`，所以这里的退避信号直接用 `claimed`（= 本次认领了几行）。
+// 旋钮：MATERIALIZE_IDLE_BACKOFF_MAX_MS（默认 2000）/ MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS（默认 10000）。
+// 没动（红线）：认领 SQL 语义、`lease_until` 租约、revision head / latest-wins 与失败重试状态机。
+const IDLE_TICK_MS = 250;
+const IDLE_BACKOFF_MAX_MS_DEFAULT = 2000;
+const ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT = 10000;
+
+// issue #506 评审（copilot 验收意见①）：与 routes.js 同一处修法——退避时长最终交给 `setTimeout`，
+// 而 Node 的 timer 只吃 **32 位有符号整数**（现查 v22.23.2：`setTimeout(()=>{}, 3e9)` 打印
+// `Timeout duration was set to 1.`）⇒ 把 `MATERIALIZE_IDLE_BACKOFF_MAX_MS` 配成 3e9 不是「退避变长」，
+// 而是**退化成 1ms 空转**，比 #506 要修的 250ms 空转更糟。故旋钮带安全上限，越界**回落默认 + warn**。
+const NODE_TIMER_MAX_MS = 2147483647;
+// 业务上限：空闲退避超过 60s 对 outbox 消费没意义（用户改一次配置要等一分钟才落到盘上）。
+export const MAX_BACKOFF_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 60_000);
+// 孤儿回收间隔 = 崩溃恢复的最长延迟，10min 内可接受，但同样不许越 Node timer 上限。
+const ORPHAN_RECOVERY_INTERVAL_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 600_000);
+
+// 严格正整数：**trim 后整串**必须全是十进制数字（copilot 第四轮复审③）。
+// 改前用 `parseInt(raw, 10)`（前缀匹配），它吃的是**前缀**⇒ `'1e4'` → **1**、`'10000abc'` → **10000**，两种都**静默**：
+//   · `*_ORPHAN_RECOVERY_INTERVAL_MS=1e4`（运维习惯把 10000 写成 `1e4`）的真实后果是回收间隔变成 **1ms**
+//     ⇒ 那条与有没有活无关的回收**每拍都跑**，把 #506 刚省下来的空闲开销原样吐回去；
+//   · `'10000abc'` 则是「配了一个垃圾值，却按 10000 生效」——比直接不认更难查。
+// 口径：**先 trim 再整串匹配**——前后空格算合法（compose / env-file 里带空格很常见，与既有 `.trim()` 一致），
+// 但 `+10000` / `1_0000` / `0x10` / `1e4` / `10000abc` 一律不认 ⇒ 回落默认 + warn（与越界同一口径）。
+const STRICT_POSITIVE_INT_RE = /^\d+$/;
+
+
+/**
+ * 正整数 env（issue #506 评审①）。非法值 / 越界一律**回落默认并 warn**（越界绝不静默夹取——
+ * 夹取会让运维以为配置生效了，而真实后果是 Node 把 3e9 截成 1ms 空转）。没配（空串）静默用默认。
+ * 「非法」的判定在第四轮复审③ 收紧为**整串严格匹配**：`parseInt('1e4', 10) === 1` 这类前缀误读
+ * 会把孤儿回收间隔变成 1ms（每拍跑），宁可不认并 warn，也不要静默按一个谁都没写的值跑。
+ * @param {string} name @param {number} fallback @param {{max?: number, log?: object}} [opts]
+ */
+function envInt(name, fallback, { max = MAX_BACKOFF_MS_SAFE, log = console } = {}) {
+  const raw = String(process.env[name] ?? '').trim();
+  if (raw === '') return fallback;
+  // 不认前缀匹配：整串不是纯数字就当 NaN，与「非法值」走同一条回落分支（copilot 第四轮复审③）。
+  const n = STRICT_POSITIVE_INT_RE.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    log.warn?.(`[env] ${name}=${raw} 不是严格正整数（trim 后整串必须是十进制数字；'1e4' / '10000abc' 这类科数或带尾巴的值不认）`
+      + ` ⇒ 回落默认 ${fallback}ms（这行配置没生效）`);
+    return fallback;
+  }
+  if (n > max) {
+    log.warn?.(`[env] ${name}=${n} 超过安全上限 ${max}ms ⇒ 回落默认 ${fallback}ms`
+      + `（不夹取：夹取会让人以为这行配置生效了）`);
+    return fallback;
+  }
+  return n;
+}
+
+/**
+ * issue #506：第 `idleTicks` 个**连续空闲拍**该等多久。`idleTicks = 0` 表示上一拍认领到了活
+ * ⇒ 回基准 250ms；否则 250 起指数翻倍、夹在 `maxMs`（默认 2000）封顶。
+ * 导出的理由：判据是「退避真的发生」，阶梯必须能被直接读出而不是靠间接推。
+ *
+ * issue #506 评审①：这里**自己也夹一次**（不假定调用方已经过 `envInt`）——直接调用方传 3e9 就会
+ * 造出 1ms 空转。返回值恒在 `[IDLE_TICK_MS, MAX_BACKOFF_MS_SAFE]`。
+ */
+export function idleDelayMs(idleTicks, maxMs = IDLE_BACKOFF_MAX_MS_DEFAULT) {
+  if (!(idleTicks > 0)) return IDLE_TICK_MS;
+  const cap = Number.isFinite(maxMs) && maxMs > 0
+    ? Math.min(Math.max(IDLE_TICK_MS, maxMs), MAX_BACKOFF_MS_SAFE) // 下限：配置不许把基准节拍压低
+    : IDLE_BACKOFF_MAX_MS_DEFAULT;                                 // NaN / Infinity / 负数 ⇒ 生产默认
+  return Math.min(IDLE_TICK_MS * 2 ** (idleTicks - 1), cap);
+}
+
+/**
+ * issue #506：可中断 sleep —— `stop()` 不许再等满一个退避窗口（旧代码退避到 2s 时，优雅关闭
+ * 最多要白等 2s，测试里也会挂住）。resolve(true)=睡满了，resolve(false)=被 abort。
+ * @param {number} ms @param {AbortSignal} [signal]
+ */
+export function sleepCancellable(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve(false);
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 async function readFdeDesiredState(pool, fdeId, config) {
@@ -693,34 +780,72 @@ export async function rebuildAllFdes(pool, config, { log = console } = {}) {
 }
 
 /** 启动一个常驻消费循环（由 cli serve 调用）。 */
-export function startMaterializerLoop(pool, config, { log = console, workerId = 'materializer-1', onPause } = {}) {
-  let stopped = false;
+export function startMaterializerLoop(pool, config, {
+  log = console,
+  workerId = 'materializer-1',
+  onPause,
+  // issue #506 旋钮与可测缝：生产不传 ⇒ 真 setTimeout / Date.now / env 默认值。
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+  // #506 评审①：旋钮带上安全上限；越界/非法 ⇒ 回落默认 + warn（`log` 在同一参数列表里已先绑定）。
+  idleBackoffMaxMs = envInt('MATERIALIZE_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+  orphanRecoveryIntervalMs = envInt('MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS', ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT, { max: ORPHAN_RECOVERY_INTERVAL_MS_SAFE, log }),
+} = {}) {
   let consecutiveFailures = 0;
-  (async () => {
+  let idleTicks = 0;                                 // 连续认领 0 行的拍数；认领到活就清 0
+  let lastOrphanRecoveryAt = Number.NEGATIVE_INFINITY; // 首拍必跑（保留原语义：启动就回收孤儿）
+  const abort = new AbortController();
+  const done = (async () => {
     // 启动全量重物化（幂等：内容不变不重写，user-space §8.1）。
     try {
       await rebuildAllFdes(pool, config, { log });
     } catch (err) {
       log.warn?.(`[materializer] startup rebuild failed: ${err.message}`);
     }
-    while (!stopped) {
+    while (!abort.signal.aborted) {
       try {
-        await recoverMaterializeOrphans(pool);
-        await runMaterializerOnce(pool, config, { log, workerId });
+        // #506：孤儿回收是一条与「本轮有没有活」无关的 UPDATE ⇒ 独立节拍（默认 10s）。
+        const tickAt = now();
+        if (tickAt - lastOrphanRecoveryAt >= orphanRecoveryIntervalMs) {
+          await recoverMaterializeOrphans(pool);
+          lastOrphanRecoveryAt = tickAt;
+        }
+        const { claimed = 0 } = await runMaterializerOnce(pool, config, { log, workerId });
         consecutiveFailures = 0;
-        await sleep(250);
+        idleTicks = claimed > 0 ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, idleBackoffMaxMs), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[materializer] loop error: ${err.message}`);
         onPause?.('materializer', err);
         const backoff = BACKOFF_MS[Math.min(consecutiveFailures - 1, BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
+  // issue #506 评审③：`done` 是裸 async IIFE 的 Promise，`cli.js` 过去不消费它 ⇒ 循环里
+  // `onPause` / `log.warn` / 注入的 `sleep` 在异常分支抛错时，`done` 变 rejected 且无人 catch
+  // = **未捕获拒绝**（本仓已知陷阱：测试摘要全绿，进程却 rc=1）。所以启动时**立刻**挂处理器。
+  // 语义没动：`done` 仍是同一个 promise（await 它照样看到 resolve/reject），`settled` 是
+  // 「永不拒绝」的那份，给只想等退出、不关心失败细节的调用方用。
+  let loopFailure = null;
+  const settled = done.catch((err) => {
+    loopFailure = err;
+    try {
+      log.warn?.(`[materializer] 消费循环异常退出（已就地接住，未成为未捕获拒绝）：${err?.message ?? err}`);
+    } catch {
+      // 日志面自己坏了（注入的 log.warn 抛错）不许再制造第二条未捕获拒绝
+    }
+  });
   return {
     stop() {
-      stopped = true;
+      abort.abort(); // 可中断：否则退避到 2000ms 时优雅关闭要白等 2s
     },
+    done, // 循环真正退出时 resolve（优雅关闭与单测可 await；拒绝也照原样冒给 await 它的人）
+    // #506 评审③：已挂拒绝处理器的版本（永不拒绝）。优雅关闭走 `stopLoopsAndWait` 用它也行，
+    // 单测想断言「没有未捕获拒绝」时 await 这一份，不会自己把拒绝吃掉又漏掉别的。
+    settled,
+    /** #506 评审③：循环异常退出时的那个错误（正常退出为 null）。 */
+    failure: () => loopFailure,
   };
 }
