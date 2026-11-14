@@ -108,3 +108,152 @@ export async function stopLoopsAndWait(loops, { timeoutMs = 5000, log = console 
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// 整个关闭流程的编排（issue #506 copilot 第二轮复审①）
+// ---------------------------------------------------------------------------
+//
+// 缺陷形状（改前 `cli.js` 的 shutdown）：先 `await stopLoopsAndWait(...)`（最多 5s），**之后**才
+// `server.close(() => process.exit(0))`。两个后果：
+//   1. 那 5s 里 server 还在 listen ⇒ 仍在接新请求（新 SSE / 新事务在停机窗口里被创建，永远收不了尾）；
+//   2. `server.close` **只停止接受新连接，然后等既有连接自己结束**——SSE 是 keep-alive，它的结束
+//      依赖循环/心跳清理，于是 close 的回调可能很久不来。⇒ 5s 只是「等循环」的上限，
+//      **不是整个关闭流程的上限**：5s + server 关闭可以轻易超过 compose/k8s 默认 10s 宽限期，
+//      超了就是 SIGKILL（连 warn 都来不及看，比有超时更糟）。
+//
+// 于是顺序改成：**先 `server.close()`（发起即返回，不等回调）→ 等循环收尾 → 在剩余总预算里等
+// server 关完 → `exit(0)`**，并给**整个流程**一个总上限 `SHUTDOWN_TOTAL_MS`（默认 8000，留 2s 给
+// exit 与 compose 宽限期）。到点无论收没收完都退出，并 warn 点名还没退的循环。
+// `server.close` 不放第一位的话，那 5s 就白等；总上限不覆盖 server.close 的话，第 2 条照旧。
+
+/** 等循环收尾的默认上限（旧的那个 5s，语义不变）。 */
+export const SHUTDOWN_LOOPS_MS_DEFAULT = 5000;
+/** 整个关闭流程的总上限：5s 循环 + 3s server 关闭，另留 ~2s 给 exit（compose 默认 10s 宽限期）。 */
+export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
+
+/**
+ * 编排一次优雅关闭：停接新连接 → 等循环收尾 → 等 server 关完 → 退出。**始终在总上限内返回/退出**。
+ * @param {object} opts
+ * @param {{ close: (cb: (err?: Error | null) => void) => unknown }} [opts.server] HTTP server（假对象可注入）
+ * @param {Array} [opts.loops] 循环句柄，原样转交 `stopLoops`
+ * @param {number} [opts.loopTimeoutMs] 等循环收尾的上限（默认 `SHUTDOWN_LOOPS_MS_DEFAULT`）
+ * @param {number} [opts.totalTimeoutMs] **整个关闭流程**的总上限（默认 `SHUTDOWN_TOTAL_MS_DEFAULT`）
+ * @param {object} [opts.log]
+ * @param {(code: number) => void} [opts.exit] 默认 `process.exit`（测试注入 spy，否则用例自己被杀掉）
+ * @param {(loops: Array, o: object) => Promise<object>} [opts.stopLoops] 默认 `stopLoopsAndWait`
+ * @returns {Promise<{sequence: string[], elapsedMs: number, timedOut: boolean, exitCode: number,
+ *                    loops: object | null, pendingLoops: string[], serverCloseStarted: boolean,
+ *                    serverClosed: boolean, totalTimeoutMs: number, loopTimeoutMs: number}>}
+ */
+export async function gracefulShutdown({
+  server,
+  loops = [],
+  loopTimeoutMs = SHUTDOWN_LOOPS_MS_DEFAULT,
+  totalTimeoutMs = SHUTDOWN_TOTAL_MS_DEFAULT,
+  log = console,
+  exit = (code) => process.exit(code),
+  stopLoops = stopLoopsAndWait,
+} = {}) {
+  const warn = (msg) => { try { log?.warn?.(msg); } catch { /* 日志不是控制流 */ } };
+  const startedAt = Date.now();
+  const sequence = [];
+  const list = (Array.isArray(loops) ? loops : [loops]).filter((l) => l && typeof l === 'object');
+  const nameOf = (l, i) => (typeof l?.name === 'string' && l.name ? l.name : `loop#${i}`);
+
+  // 先给每个 done 挂上就地记账的观察器：总上限到点时要能**点名**还没退的循环，
+  // 而那份账在 stopLoops 那边（它可能自己也永不返回）不一定拿得到。顺手吃掉拒绝。
+  const state = list.map(() => 'no-done');
+  list.forEach((loop, i) => {
+    if (!loop.done || typeof loop.done.then !== 'function') return;
+    state[i] = 'pending';
+    loop.done.then(
+      () => { state[i] = 'resolved'; },
+      () => { state[i] = 'rejected'; }, // 不冒泡：关闭流程不许制造未捕获拒绝
+    );
+  });
+  const pendingNames = () => list.map((l, i) => (state[i] === 'pending' ? nameOf(l, i) : null)).filter(Boolean);
+
+  const loopBudgetMs = safeTimeoutMs(loopTimeoutMs);
+  const totalBudgetMs = safeTimeoutMs(totalTimeoutMs);
+
+  // 第 1 步：**立刻**停止接受新连接（只发起，不等回调——回调要等既有连接自己结束，那是第 3 步的事）
+  let serverCloseStarted = false;
+  let serverClosed = false;
+  const serverClosedP = new Promise((resolve) => {
+    if (!server || typeof server.close !== 'function') { serverClosed = true; resolve(); return; }
+    sequence.push('server.close');
+    serverCloseStarted = true;
+    try {
+      server.close((err) => {
+        serverClosed = true;
+        if (err) warn(`[shutdown] server.close 带错误返回（忽略，照样退出）：${err?.message ?? err}`);
+        resolve();
+      });
+    } catch (err) {
+      // close 自己抛错（例如从没 listen 过）⇒ 当成已关闭，不许挡住后面的循环收尾
+      serverClosed = true;
+      warn(`[shutdown] server.close 抛错（忽略，照样收尾退出）：${err?.message ?? err}`);
+      resolve();
+    }
+  });
+
+  // 第 2 步：停循环并等它们收尾（helper 自己有上限；它自己炸了也不许挡住退出）。
+  // 结果同时存一仳 `loopsReport`：**总上限到点时不能再 await 它**（注入的假 helper 可以永不 resolve，
+  // 那 await 就把「到点强退」本身拖死了）。
+  sequence.push('stopLoopsAndWait');
+  let loopsReport = null;
+  const loopsSettled = (async () => stopLoops(list, { timeoutMs: loopBudgetMs, log }))()
+    .then((r) => { loopsReport = r ?? null; return r; })
+    .catch((err) => {
+      warn(`[shutdown] 收尾 helper 自身抛错（忽略，继续关 server 并退出）：${err?.message ?? err}`);
+      return null;
+    });
+
+  // 第 3 步：**整个流程**一个总上限（不是只给循环）。到点就退——超过 compose/k8s 的宽限期是 SIGKILL。
+  let timer = null;
+  const everything = loopsSettled.then(() => serverClosedP).then(() => 'settled');
+  const deadline = new Promise((resolve) => {
+    const left = Math.max(0, totalBudgetMs - (Date.now() - startedAt));
+    // 同 stopLoopsAndWait：故意不 unref，否则「只剩它在等」时 await 会被跳过
+    timer = setTimeout(() => resolve('timeout'), left);
+  });
+  const outcome = await Promise.race([everything, deadline]);
+  if (timer) clearTimeout(timer);
+
+  const elapsedMs = Date.now() - startedAt;
+  const timedOut = outcome === 'timeout';
+  const pendingLoops = pendingNames();
+  const report = {
+    sequence,
+    elapsedMs,
+    timedOut,
+    exitCode: 0,
+    loops: loopsReport, // 取「已落定的那份账」；race 之后**不再 await 任何东西**，否则「到点强退」自己会被拖死
+    pendingLoops,
+    serverCloseStarted,
+    serverClosed,
+    loopTimeoutMs: loopBudgetMs,
+    totalTimeoutMs: totalBudgetMs,
+  };
+
+  if (timedOut) {
+    warn(`[shutdown] 关闭流程超过总上限 ${totalBudgetMs}ms（已用 ${elapsedMs}ms）仍没收尾：`
+      + `还没退的循环 ${pendingLoops.join(', ') || '（无：要么都退了，要么本来就不带 done）'}`
+      + (serverClosed ? '' : '；HTTP server 也没关完（SSE 是 keep-alive，close 只停接新连接、要等既有连接自己结束）')
+      + '。直接 process.exit(0)——再等下去就撞上 compose/k8s 默认 10s 宽限期 ⇒ SIGKILL。');
+  }
+  const loopWaited = loopsReport?.waited ?? 0;
+  const loopSkipped = loopsReport?.skipped ?? 0;
+  try {
+    // eslint-disable-next-line no-console
+    log?.log?.(`[portal] 关闭收尾：先 server.close（${serverClosed ? '已关完' : '已停接新连接，未等关完'}）`
+      + ` → 循环等了 ${loopWaited} 个（跳过 ${loopSkipped} 个无 done 的）`
+      + (loopsReport?.timedOut ? ` ⇒ 循环收尾超时 ${loopBudgetMs}ms` : '')
+      + (loopsReport?.rejected ? `，${loopsReport.rejected} 个带错误退出` : '')
+      + ` ⇒ 用时 ${elapsedMs}ms / 总上限 ${totalBudgetMs}ms${timedOut ? '（到点强退）' : ''}`);
+  } catch { /* 日志坏了也要退 */ }
+
+  // 第 4 步：无论收没收完都退（`exit` 默认就是 `process.exit` ⇒ 后面那行 return 在生产里执行不到）
+  exit(report.exitCode);
+  return report;
+}

@@ -172,20 +172,31 @@ test('#506b 收尾用的限时 timer 必须被 clearTimeout（否则“等循环
 });
 
 // ---------------------------------------------------------------------------
-// 接线：cli.js 真的 await 了这个 helper（helper 绿不代表 serve 用了它）
+// 接线：cli.js 真的走了这个 helper（helper 绿不代表 serve 用了它）
 // ---------------------------------------------------------------------------
 
-test('#506b cli.js 的 shutdown 必须 await stopLoopsAndWait 并接住 rejection', () => {
+test('#506b cli.js 的 shutdown 必须走 gracefulShutdown（先 close、带总上限）并接住 rejection', () => {
   const cli = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/cli.js'), 'utf8');
-  assert.match(cli, /import \{ stopLoopsAndWait \} from '\.\/shutdown\.js'/, 'cli.js 要用 helper，别自己重抄一遍');
-  assert.match(cli, /const shutdown = async \(\) => \{[\s\S]{0,400}?await stopLoopsAndWait\(/,
-    'shutdown 必须是 async 并 await 收尾（旧行为：同步 stop 完就 server.close ⇒ 事务中途 process.exit）');
+  assert.match(cli, /import \{[^}]*gracefulShutdown[^}]*\} from '\.\/shutdown\.js'/,
+    'cli.js 要用编排 helper，别自己重抄一遍关闭顺序');
   const shutdownBody = /const shutdown = async \(\) => \{([\s\S]*?)\n  \};/.exec(cli);
   assert.ok(shutdownBody, 'cli.js 里找得到 `const shutdown = async () => { ... }` 的函数体');
-  const waitAt = shutdownBody[1].search(/await stopLoopsAndWait\(/);
-  const closeAt = shutdownBody[1].search(/server\.close\(\(\) => process\.exit\(0\)\)/);
-  assert.ok(waitAt >= 0 && closeAt > waitAt,
-    'shutdown 体内必须先等收尾再 close/exit（顺序反了等于没等，就是旧行为）');
+  // 注释里会提到旧形状（那是解释，不是代码），判据只看真代码
+  const strip = (t) => t.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  const body = strip(shutdownBody[1]);
+  const code = strip(cli);
+  assert.match(body, /await gracefulShutdown\(/, 'shutdown 必须 async 并 await 关闭编排（否则拒绝没人接）');
+  assert.match(body, /\bserver,/, '必须把 server 交给编排（否则没人停接新连接）');
+  assert.match(body, /\bloops,/, '必须把七个循环交给编排');
+  assert.match(body, /loopTimeoutMs: SHUTDOWN_WAIT_MS/, '等循环的上限仍由 cli 显式传入');
+  assert.match(body, /totalTimeoutMs: SHUTDOWN_TOTAL_MS/, '**整个关闭流程**的总上限必须由 cli 传入');
+  assert.match(code, /const SHUTDOWN_TOTAL_MS = 8000;/,
+    '总上限取 8000ms：compose / k8s 默认只给 10s 宽限期，超了就是 SIGKILL');
+  // 复审①：cli 自己不许再「等完循环才 close」——那 5s 里仍在接新请求，而 close 之后又要等连接自己结束
+  assert.doesNotMatch(body, /server\.close\(/, 'server.close 必须在 gracefulShutdown 里发起（第 1 步），不许留在 cli 里');
+  assert.doesNotMatch(code, /server\.close\(\(\) => process\.exit\(0\)\)/,
+    '旧形状 `server.close(() => process.exit(0))` 不许回来（它把关闭上限变成了“看连接脸色”）');
+  assert.match(body, /if \(shuttingDown\) return;/, '信号重入保护不许丢');
   assert.match(cli, /shutdown\(\)\.catch\(/, 'process.once 的回调要接住 shutdown 的拒绝（否则未捕获拒绝 ⇒ rc=1）');
   // 七个循环一个都不能丢（旧代码是七个 stop）
   for (const n of ['materializer', 'onboarding', 'offboarding', 'routes', 'routes-drift', 'provisioner', 'reaper']) {
