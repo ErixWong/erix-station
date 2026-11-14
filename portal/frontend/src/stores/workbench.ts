@@ -647,8 +647,24 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //   · 已知且**不等于**这条 partial 的 run ⇒ 那是别人的气泡，一个字都不许动。
     // `removeDeltaEntry()` 的幂等性不变（它仍只靠 `deltaEntry` 单指针找下标，这里只是在**调它之前**
     // 多问一句身份；不该调的时候一次都不调）。
-    const deltaOwner = deltaEntry?.runId ?? es.deltaRunId.value ?? null;
-    const sameRun = deltaOwner === null || deltaOwner === 'unknown' || runId === 'unknown' || deltaOwner === runId;
+    //
+    // copilot 复审 261115-01 的 **①**（中）：`deltaEntry?.runId ?? es.deltaRunId.value` 那句把
+    // 「**没有 delta 条目**」与「**有条目但出生时身份未知（`runId === null`**）」混成了同一种 ——
+    // `??` 见 `null` 就当「没有」，于是**已钉成未知**的出生身份会被**后来**的 `es.deltaRunId` 补认领成
+    // 另一个 run（`partial_output` 帧每收一帧都无条件写 `deltaRunId`，见 `useEventStream.ts`）。
+    // 补认领之后 `sameRun` 就拿「后来的 run == 这条 partial 的 run」当「同 run」的证据 ⇒ E 条要修的
+    // **跨 run 误删**换了个触发路径回来（气泡其实属于那个「身份未知」的旧段）。
+    // 现在两档分开：条目在 ⇒ 身份**只认它出生那一刻钉的值**（未知就是未知，永不覆盖）；条目不在 ⇒
+    // 才退回读 `es.deltaRunId`（今天行为）。
+    const deltaOwner = deltaEntry ? (deltaEntry.runId ?? null) : (es.deltaRunId.value ?? null);
+    // 「未知身份」的兼容口径（只比文本）也有一条**下界**：链路上后来**出现过**别的 run 身份时，
+    // 那个身份**不属于**这个气泡（身份在出生时就定了，见 `useEventStream` 的 `deltaRunId` 口径），
+    // 拿它去坐实「同 run」就是循环论证 ⇒ 宁可不撤（代价 = 界面上同一段正文可能两遍，刷新即回），
+    // 也不能撤错（代价 = 用户正在看的那段字凭空消失）。只有「整条链路一个 run 身份都没拿到」
+    //（真·旧后端，既有那条「身份未知 ⇒ 照旧撤」用例钉的就是这一档）才退回只比文本。
+    const claimedLater = deltaEntry !== null && deltaEntry.runId == null && (es.deltaRunId.value ?? null) !== null;
+    const sameRun = !claimedLater
+      && (deltaOwner === null || deltaOwner === 'unknown' || runId === 'unknown' || deltaOwner === runId);
     if (sameRun && es.deltaText.value === text) {
       removeDeltaEntry();
       es.deltaText.value = null;
