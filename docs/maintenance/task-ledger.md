@@ -5347,3 +5347,11 @@ TYPING_CHECK verdict=PASS reason=strictly_increasing
 `tls-fixtures.js`、`preview-grant-checks.js`。⇒ **真实用例 pass ≈ 根 `npm test` 的 `# pass` − 8**
 （基线 2212 里含这 8 条；本单新增用例后涨到 2237，真实用例数是 2229）。核对办法：
 `grep -oE "^ok [0-9]+ - portal/test/[a-z0-9._-]+\.js$" <npm test 输出>` —— 一条真库用例都没有的文件才会以**文件路径**当用例名出现。
+
+**未做 / 后续指针（261114-06 契约同步时补一句，不另开条目）**：本轮显式留下、已开单的三项 ——
+**#514**（只写 `run_end` 的终态 = `queued` 未开始就被取消，落在历史窗口外 ⇒ 既无 `run_termination` 也无占位，
+正文区空白；它是 #502 显影的既有形状）、**#515**（缓冲 LRU 在上限 32 已满且全是活跃 run 时逐掉仍在流的 run
+⇒ 终态写不出 `partial_text`；口径已写进 `docs/api/portal.md` §5.1 的「已接受损失」并**标为潜伏项**，
+等三选一裁决：绑定 active-run 硬上限 / 逐出时发可观测信号 / 显式接受）、**#516**（`messages(run_id)` 无索引，
+history 窗口的 `EXISTS` 走顺序扫；现规模不必加，触发条件写在 issue 里）。另：迁移 `0034` 之后「终态 run 的
+run-keyed checkpoint 读不到」（返回空、不是错）已补进 `docs/data/model.md` §1.11 的时间边界那条。
