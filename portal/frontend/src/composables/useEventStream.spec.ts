@@ -1816,3 +1816,81 @@ describe('审计第 6 条：脏快照只忽略，不动任何状态', () => {
     expect(s.deltaText.value).toBe(null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 E2 条（261115-01）：**长正文重连时，被 textCap 截过的快照不得吃掉后缀**
+//
+// 事实链（三条都在产品里，不是假设）：
+//   · 快照帧的 `text` 来自进程内正文缓冲，那里被 `PARTIAL_TEXT_CAP_DEFAULT = 16384` 夹过
+//     （`portal/src/run-partial-buffer.js#append`：越界只置 `truncated`，**不追长尾**）；
+//   · #513 把重连顺序改成「先 flush hub 缓冲、后发快照」，而 flush 的是**原始未截断**的碎片帧
+//     （`portal/src/internal.js` 的 `rec.buffer` 按**条数**限，不按字节）；
+//   · 前端 `partial_output` 是**覆盖式**赋值 ⇒ 正文超 16,384 时，flush 刚把完整正文送到，
+//     紧随其后的那条**只有前 16,384 字符**的快照把后缀**永久盖掉**（要等 round_end/历史刷新才回）。
+// 修法：同轮内正文**只增不减**——快照严格短于当前正文且是它的**前缀** ⇒ 忽略那条快照。
+// 三条用例一起承重：前缀 ⇒ 忽略（新口径）；更长 ⇒ 照旧覆盖（判据 4「不重复」的方向）；
+// 不是前缀 ⇒ 照旧覆盖（快照权威，别把这次修复写成「快照一律不信」）。
+// ---------------------------------------------------------------------------
+describe('copilot 验收 E2：被 textCap 截过的快照不得把 flush 已送达的后缀抹掉', () => {
+  const CAP = 16_384; // `run-partial-buffer.js` 的 PARTIAL_TEXT_CAP_DEFAULT
+
+  /** 起一个「当前轮正在流」的连接：轮起点 seq=7，活跃 run=r1，气泡里已有 `text`。 */
+  function streaming(text: string) {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 7, round: 1, run_id: 'r1' });
+    lastES().emit('assistant_delta', { run_id: 'r1', text });
+    expect(s.deltaText.value).toBe(text);
+    return { s, hooks };
+  }
+
+  it('正文 20,000 字符 + 来一条 16,384 字符的**前缀**快照 ⇒ 正文仍是 20,000 字符（后缀没被吃掉）', () => {
+    const full = '长'.repeat(20_000);
+    const { s } = streaming(full);
+    // 服务端快照：同一轮，但正文被 textCap 夹过 ⇒ 恰好是前 16,384 个字符 + truncated:true
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: full.slice(0, CAP), chunks: 400, truncated: true, source: 'memory',
+    });
+    expect(s.deltaText.value?.length, '覆盖式赋值把后缀盖掉了 ⇒ 客户端正文变短（E2 本体）')
+      .toBe(full.length);
+    expect(s.deltaText.value).toBe(full);
+  });
+
+  it('反例（修复能力不许丢）：正文 5,000 字符 + 快照 16,384 字符**更长** ⇒ 照旧覆盖', () => {
+    const local = '甲'.repeat(5_000);
+    const { s } = streaming(local);
+    const snap = local + '乙'.repeat(CAP - 5_000); // 前缀 + 更多 ⇒ 更长
+    expect(snap.length).toBe(CAP);
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: snap, chunks: 90, truncated: false, source: 'memory',
+    });
+    expect(s.deltaText.value, '断线期间流式过一段 ⇒ 更全的快照必须盖进来（#502 判据 4「不空洞」）')
+      .toBe(snap);
+  });
+
+  it('反例（快照仍权威）：正文与快照**不是前缀关系** ⇒ 照旧覆盖', () => {
+    const local = '断线前的半句';
+    const { s } = streaming(local);
+    // 快照比本地短，但**不是**本地正文的前缀 ⇒ 它不是「同一段被截过的那一份」，照旧以快照为准。
+    //（代价口径：若快照恰好是前缀**又不是**因为 textCap（上游真的把这段话改短了），这里会选择不盖——
+    // 两个形状在前端**无法区分**（帧里没有「客户端已有几个字」这一说），而吃后缀是**永久**丢字，
+    // 少盖一次刷新即回 ⇒ 宁可少盖。）
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: '半句', chunks: 3, truncated: false, source: 'memory',
+    });
+    expect(s.deltaText.value).toBe('半句');
+  });
+
+  it('口径边界：空串快照**不算**「较短前缀」⇒ 照旧清气泡（E2 那条规则不得把它吞掉）', () => {
+    // `'abc'.startsWith('')` 是 true、`0 < 3` 也成立 ⇒ 规则若排在空串分支**前面**，本用例立刻红。
+    const { s, hooks } = streaming('已经流出的一段正文');
+    const sepBefore = hooks.onSep.mock.calls.length;
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: '', chunks: 0, truncated: false, source: 'memory',
+    });
+    expect(s.deltaText.value, 'text 为空 = 服务端说这段没正文 ⇒ 清空，不是「忽略」').toBe(null);
+    expect(hooks.onSep.mock.calls.length).toBe(sepBefore);
+  });
+});
