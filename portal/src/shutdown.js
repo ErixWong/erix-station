@@ -15,6 +15,24 @@
 //     `stop()`，且用的是**不可中断**的 `sleep(5000)` / `sleep(15000)`）直接跳过——await 它们
 //     会让每次关闭都白等满 timeout（比原来更糟）。给它们补可中断 `done` 不在本单范围。
 
+// Node 的 `setTimeout` 把延迟存成 **32 位有符号整数**：实测 Node v22.23.2 `setTimeout(fn, 3e9)` 打印
+//   `TimeoutOverflowWarning: 3000000000 does not fit into a 32-bit signed integer.`
+//   `Timeout duration was set to 1.`
+// ⇒ `timeoutMs: 3e9` 的真实后果**不是**「等很久」，而是 **1ms 就判超时**——过早放弃收尾，正好把
+//   这个文件存在的理由（等在途那一拍）原样放回去。所以进 timer 前必须夹一次。
+// 注意与 `routes.js` / `materializer.js` 的 `MAX_BACKOFF_MS_SAFE`（60s）区分：那是**空闲退避的业务上限**，
+// 「退避超过 60s 没意义」这条判断对关闭超时不成立（关闭上限只受 timer 表示范围约束），两者各自常量。
+const NODE_TIMER_MAX_MS = 2147483647;
+
+/** 关闭类超时的硬夹取点：任何要进 `setTimeout` 的关闭上限都先过它（越界 ⇒ Node 折成 1ms ⇒ 过早超时）。 */
+export const MAX_SHUTDOWN_TIMEOUT_MS = NODE_TIMER_MAX_MS;
+
+/** 脏值 → 安全毫秒数：非有限数 / ≤0 一律 0（=「不等」，关闭路径上最不该出现「等死」），越界夹到 timer 上限。 */
+function safeTimeoutMs(value) {
+  const ms = Number.isFinite(value) && value > 0 ? value : 0;
+  return Math.min(ms, MAX_SHUTDOWN_TIMEOUT_MS);
+}
+
 /**
  * @typedef {object} LoopHandle
  * @property {() => void} [stop] 停循环（要求幂等；抛错被接住，不影响其余循环）
@@ -66,12 +84,15 @@ export async function stopLoopsAndWait(loops, { timeoutMs = 5000, log = console 
 
   // 第 4 步：有上限地等。超时分支**不再等**剩下的（那可能永远不 resolve），直接记一条 warn 继续退。
   let timer = null;
+  // 进 timer 前夹一次（`3e9` 不夹会被 Node 折成 **1ms** ⇒ 过早超时），日志也只报**实际生效**的那个数。
+  const effectiveTimeoutMs = safeTimeoutMs(timeoutMs);
   const deadline = new Promise((resolve) => {
-    const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0;
+    // 改前（#506 copilot 复审①-b）这里是 `Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0`，
+    // 即**不夹**上限 ⇒ `timeoutMs: 3e9` 原样进 setTimeout。夹取理由见上面 `MAX_SHUTDOWN_TIMEOUT_MS`。
     // 故意**不 unref**：unref 的 deadline 在「只剩它在等」时会被 Node 当成事件循环已空
     // （实测 node:test 报 `Promise resolution is still pending but the event loop has already resolved`），
     // 那等于 await 被跳过。它是有限长的 timer，落定后立刻 clearTimeout（下面），不会拖住退出。
-    timer = setTimeout(() => resolve('timeout'), ms);
+    timer = setTimeout(() => resolve('timeout'), effectiveTimeoutMs);
   });
   const outcome = await Promise.race([Promise.allSettled(tracked).then(() => 'settled'), deadline]);
   // clearTimeout 是必须的：正常收尾路径上不许留一个还在等的 timer（否则它才是新的“拖住退出”的东西）
@@ -81,7 +102,7 @@ export async function stopLoopsAndWait(loops, { timeoutMs = 5000, log = console 
   if (outcome === 'timeout') {
     result.timedOut = true;
     result.pending = entries.filter((_, i) => state[i] === 'pending').map((e) => e.name);
-    warn(`[shutdown] 等循环收尾超时（${timeoutMs}ms）：${result.pending.length}/${entries.length} 个没退`
+    warn(`[shutdown] 等循环收尾超时（${effectiveTimeoutMs}ms${effectiveTimeoutMs !== timeoutMs ? `，原配置 ${timeoutMs}ms 已夹到 timer 上限` : ''}）：${result.pending.length}/${entries.length} 个没退`
       + `（${result.pending.join(', ') || '无名'}）。继续退出——它们未提交的事务会回滚，`
       + '已认领的行会带着 lease_until 租约等下一轮孤儿回收。');
   }
