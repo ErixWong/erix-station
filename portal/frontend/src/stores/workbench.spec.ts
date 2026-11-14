@@ -2850,3 +2850,95 @@ describe('审计第 4 条（store 接线）：loadOlderMessages 走的是"旧页
     expect(store.es.deltaText).toBe('正在流的那段＋快照');
   });
 });
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **E 条**（261114-05 → 261115-01）：同文本**跨 run** 不得误删正在流的气泡
+//
+// `addPartialOutput` 原来那句是 `if (es.deltaText.value === text) { removeDeltaEntry(); ... }`
+// —— 只比文本、不比 run。会话里 run A 正在流「同样的话」，而 history 归并来一条 run B 的
+// partial_output 且文本恰好一字不差（重试后重跑同一句、两句短答复撞车、旧 run 那半截与当前这段
+// 同文）⇒ A 的实时气泡被删掉，用户正在打的那段字凭空消失，界面上换成 B 的终稿。
+// 修法：delta 条目带上**来源 run**（`useEventStream` 的 `deltaRunId` 与 `deltaText` 同生共死），
+// 移除时两把尺一起核对。下面三条把「跨 run 不删 / 同 run 照删 / 身份未知退回旧口径」钉住。
+// ---------------------------------------------------------------------------
+describe('copilot 验收 E：delta 气泡带来源 run，同文本跨 run 不得误删', () => {
+  beforeEach(() => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: 'r-A' }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+  });
+
+  /** 走**真实事件路径**让 run A 流起来（`assistant_delta` → composable 写 deltaText+deltaRunId → watcher 建条目）。 */
+  async function streamRunA(store: ReturnType<typeof useWorkbenchStore>, text: string) {
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = 'r-A';
+    es.emit('assistant_delta', { run_id: 'r-A', text });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    const bubble = store.entries.filter((e) => e.kind === 'delta') as Array<{ kind: 'delta'; text: string; runId?: string | null }>;
+    expect(bubble.length, '前置：delta 条目必须是 watcher 建出来的（不是自己 push 的假条目）').toBe(1);
+    expect(bubble[0].text).toBe(text);
+    expect(bubble[0].runId, '前置：身份必须真的落在条目上（否则本用例什么都没测）').toBe('r-A');
+  }
+
+  it('run A 正在流 + run B 的 partial **同文本** ⇒ A 的 kind:delta 还在，B 的 kind:partial 也在', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await streamRunA(store, '同样的话');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-B', type: 'partial_output',
+      payload: { text: '同样的话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+
+    const kinds = store.entries.map((e) => e.kind);
+    expect(store.entries.filter((e) => e.kind === 'delta').length,
+      `跨 run 误删：run A 正在打的那段被 B 的 partial 抹了（${JSON.stringify(kinds)}）`).toBe(1);
+    expect(store.entries.filter((e) => e.kind === 'partial').map((e) => (e as { id: string }).id))
+      .toEqual(['partial:r-B']);
+    expect(store.es.deltaText, 'A 的流式状态也不许被 B 的清掉').toBe('同样的话');
+  });
+
+  it('同 run 同文本 ⇒ 照旧撤掉 delta（#502 判据 4「同一段正文只出现一次」不许被这条修复改坏）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await streamRunA(store, '同样的话');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-A', type: 'partial_output',
+      payload: { text: '同样的话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+
+    const kinds = store.entries.map((e) => e.kind);
+    expect(kinds.filter((k) => k === 'delta'), `同一段正文两遍：${JSON.stringify(kinds)}`).toEqual([]);
+    expect(kinds.filter((k) => k === 'partial')).toEqual(['partial']);
+    expect(store.es.deltaText).toBe(null);
+  });
+
+  it('身份未知（旧后端帧不带 run_id）⇒ 退回旧口径「只比文本」，重复气泡仍撤得掉（不许永远挂在界面上）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null; // 活跃 run 也不知道 ⇒ 两把尺都拿不到身份
+    es.emit('assistant_delta', { text: '没有 run_id 的一段' });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(store.entries.filter((e) => e.kind === 'delta').length).toBe(1);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-B', type: 'partial_output',
+      payload: { text: '没有 run_id 的一段', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(store.entries.map((e) => e.kind).filter((k) => k === 'delta'),
+      '身份未知时不得反过来把「撤重复气泡」这条能力弄丢').toEqual([]);
+  });
+});

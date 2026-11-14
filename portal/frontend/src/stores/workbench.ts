@@ -222,7 +222,10 @@ export type StreamEntry =
   | { kind: 'syserr'; text: string }
   | { kind: 'tool'; callId: string }
   | { kind: 'reasoning'; id: string; text: string }
-  | { kind: 'delta'; text: string }
+  // copilot 独立验收 #513 的 E 条：`runId` = **这段流式正文属于哪个 run**（`null` = 未知，旧后端
+  // 帧不带 `run_id`）。撤掉这份气泡时它是必核对的第二把尺——只比文本会跨 run 误删（见 store 里
+  // `deltaIdentity` 旁那段）。写成可选是为了不让一个新增字段去动既有 UI/测试的字面量形状。
+  | { kind: 'delta'; text: string; runId?: string | null }
   // issue #300：被停止/失败的 run **零助手锚点**（runner 的 catch 固定 final_text:''），而正文区
   // 本来就只从 messages 锚点渲染 ⇒ 界面上这次 run 一片空白。历史端点把它的 assistant_delta 按 seq
   // 聚合成一条合成项 partial_output（**不落库、不进 SSE**），本 kind 就是它在展示层的落点：
@@ -632,7 +635,21 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // `es.deltaText.value = null` 的话：界面上旧的 delta 气泡还在，旁边又多一条 `kind:'partial'`
     // ⇒ 同一段正文两遍。`removeDeltaEntry()` 是靠 `deltaEntry` 找下标的，所以必须在它被 watcher
     // 清空**之前**调（反了就找不到 entry， splice 不进去）。
-    if (es.deltaText.value === text) {
+    // copilot 独立验收 #513 的 **E 条**（真缺陷）：原来这一条**只比文本、不比 run** ⇒ 会话里
+    // run A 正在流「同样的话」，而 history 归并来一条 run B 的 partial 且文本恰好一字不差
+    //（重试后重跑同一句、两句短答复撞车、旧 run 的半截正文与当前这段同文）⇒ A 的实时气泡被删，
+    // 用户正在打的那段字凭空消失，界面上换成 B 那份终稿。文本相同**不是**「同一段正文」的充分条件。
+    //
+    // 身份口径（两把尺：文本 + run）：
+    //   · `deltaEntry.runId` 是这段气泡出生时那一帧的 `run_id`（watcher 里钉的，见 `deltaEntry` 旁）；
+    //   · 未知（`null`，旧后端帧没有 `run_id`）⇒ 退回旧口径「只比文本」，不拿未知去否定已知——
+    //     否则旧后端下重复气泡再也撤不掉（同一段正文两遍，那是 #502 判据 4 的红线）；
+    //   · 已知且**不等于**这条 partial 的 run ⇒ 那是别人的气泡，一个字都不许动。
+    // `removeDeltaEntry()` 的幂等性不变（它仍只靠 `deltaEntry` 单指针找下标，这里只是在**调它之前**
+    // 多问一句身份；不该调的时候一次都不调）。
+    const deltaOwner = deltaEntry?.runId ?? es.deltaRunId.value ?? null;
+    const sameRun = deltaOwner === null || deltaOwner === 'unknown' || runId === 'unknown' || deltaOwner === runId;
+    if (sameRun && es.deltaText.value === text) {
       removeDeltaEntry();
       es.deltaText.value = null;
     }
@@ -786,7 +803,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   watch(es.deltaText, (v, old) => {
     if (v === null) { deltaEntry = null; return; }
     if (old === null) {
-      deltaEntry = { kind: 'delta', text: '' };
+      // E 条：这段气泡的身份在**它诞生那一刻**就定下来（composable 那边 `deltaRunId` 与 `deltaText`
+      // 同生共死）；这里兜一层 `activeRunId` 是给「不经过事件面直接写 deltaText」的调用方
+      // （既有单测/旧后端）留的旧口径，不至于因为身份未知就永远撤不掉重复气泡。
+      deltaEntry = { kind: 'delta', text: '', runId: es.deltaRunId.value ?? es.activeRunId.value ?? null };
       entries.value.push(deltaEntry);
       // ⚠️ 必须改回读数组里的 reactive proxy：数组内部存的是 raw 对象，直接 mutate push 前的
       // raw 引用不经过 proxy set 陷阱 → 不触发渲染（打字机效果丢失，文字要等下一次
