@@ -522,3 +522,32 @@ test('#502 M-2 helper：runEndPartialKeys 的三条判据（锚点 / 空正文 /
   // 缓冲只读：算键这个动作本身不得把 run 标掉/丢掉（终态点要在 COMMIT 之后才收尾）
   assert.ok(b.snapshot('r1'), 'helper 只读缓冲（M-6②：变更排在 COMMIT 之后）');
 });
+
+test('#502 M-6②：终态事务提交失败 ⇒ 缓冲**不收尾**（drop/markTerminal 也排在 COMMIT 之后）', async () => {
+  const c = await live({ sessionId: 's502f', runId: 'r502f' });
+  await postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502f', claimToken: c.claimToken,
+    body: { batch_id: 'b1', events: [
+      uplink('r502f', 0, 'round_start', { round: 1 }),
+      uplink('r502f', 1, 'assistant_delta', { text: '这段还得留着' }),
+    ] },
+  });
+  const before = partialOutputs.snapshot('r502f');
+  assert.equal(before.text, '这段还得留着', '前置：正文在缓冲里');
+  c.pool.failCommitOnce = true; // 终态收敛事务提交失败（连接掉线 / 死锁重试）
+  await assert.rejects(() => setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502f', claimToken: c.claimToken,
+    body: { state: 'finished', termination: { reason: 'aborted' }, rounds: 1, final_text: '' },
+  }));
+  const after = partialOutputs.snapshot('r502f');
+  // 提交失败 ⇒ `run_end` 那一行没落库 ⇒ 那段正文**仍然只有内存这一份**。
+  // 若在这里就 drop/markTerminal，worker 重投终态时内存已空 ⇒ 界面上那段话永久消失
+  //（历史投影两处正文都没有，只剩一个占位）。
+  assert.equal(after?.text, '这段还得留着', '终态写失败 ⇒ 缓冲必须原样保留，等下一次重试');
+  assert.equal(after?.terminal, false, '也不许标终态：标了就会被 LRU 优先逐掉，等于换个方式丢正文');
+  assert.equal(c.pool.events.filter((e) => e.type === 'run_end').length, 0, '前置：run_end 确实没落库');
+  // 「提交成功 ⇒ 这时才收尾」的正面对照在上一条 M-2 用例里（那里断终态后 `snapshot` 变 null）：
+  // 这里不再补一条重试腿，因为 fake 的撤销日志不回滚 `run_queue.status` ⇒ 第二次 `setRunState`
+  // 会走 F5 幂等重放分支直接返回，走不到终态写入那段（真库 ROLLBACK 会连队列行一起回滚）。
+  // 「重试那一次照样把正文落下来」这件事由真库闸 `delta-not-persisted-db.test.js` 承重。
+});

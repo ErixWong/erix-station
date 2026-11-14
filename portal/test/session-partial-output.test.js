@@ -462,6 +462,10 @@ test('#502 M-6④：合成项只在它 seq 所属的那一页出现（before 分
     assert.deepEqual(partialsOf(older), [],
       '同一 run 的合成项不得在上一页再给一份：它的 seq(=5) 属于更新的那一页（#502 审计第 4 条 —— '
       + '`last_seq` 是 MAX(seq)，不受 before 约束，不拦就是往上翻一页正文重演一遍）');
+    // **同一道闸对两类合成项都成立**（`run_termination` 的 seq 也取 MAX(seq)）：分隔条跨页重演
+    // 和正文跨页重演是同一个 bug 的两个面孔，闸在 `buildHistorySynthItems` 的出口，一处拦两类。
+    assert.deepEqual(older.events.filter((e) => e.type === 'run_termination'), [],
+      '终态分隔条同样不得跨页重复（同一个闸，两类合成项共用）');
   } finally {
     await s.close();
   }
