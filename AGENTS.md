@@ -7,7 +7,8 @@
 
 **FDE Station** —— 给 FDE 用的开发工位平台（宿主平台）。
 
-- **每 FDE 一台容器小电脑**：容器内 `~/projects/<project>` 一个项目，`~/worktrees/<project>-<runId>` 一个 agent 运行
+- **每 FDE 一台容器小电脑**：容器内 `~/projects/<project>` 一个项目，**worker 的 cwd 直达该项目目录**
+  （D8 已修订：隔离单元 = 项目目录，worktree 已拆除，见 §7.1）
 - **erix-agent 是引擎**：本项目不实现 agent 逻辑，只做「谁在用 / 在哪跑 / 怎么访问 / 花多少」——即宿主侧
 - **统一入口**：Traefik 单入口 + 泛域名，认证在边缘，应用不感知
 - **边界**：agent 不内置安全（erix ADR-009），**牢笼由本项目提供**
@@ -208,7 +209,8 @@ D8 原文「隔离单元 = worktree」修订为「**隔离单元 = 项目目录�
 > 本页从此只到这里为止：**逐单历史不是每轮要注入的判据**（搬走 652,581 字节）。
 >
 > - **查某一单**：`grep -n '^### 8\.42 ' docs/maintenance/task-ledger.md`（编号 = 全局坐标）
-> - **写新账**：续用 `8.114` 起的编号，写在那同一个文件（规矩见 §6）
+> - **写新账**：写前按 §6 查 `docs/maintenance/task-ledger.md` 末尾再续号（当前已在 §8.126.1 之后），
+>   写在那同一个文件
 > - **不许改号、不许重排**：`§8.N` 是全仓解析坐标；引用面由 `npm run check:agents-hotlayer` 现算
 >   并设地板（只升不降，掉了就是有人改号或删引用）
 > - **现契约**不在这里：以 `erix-llm-kit` 的 `docs/host-consumer-contract.md` 与对应版本

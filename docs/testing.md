@@ -107,7 +107,7 @@ PATH=~/.local/node24/bin:$PATH npm test     # 若测试用到 await using（Node
 |---|---|---|---|---|
 | P2-1 | 预览 ticket/cookie 全分支 | §3.2 B1–B9 | 401/403/404 各分支 + 不泄露 portal cookie | 逐条匹配（§3.2 B） |
 | P2-2 | FDE A 无法访问 FDE B | §3.1 N4（多 FDE 真机） | 拒 | topology §7 |
-| P2-3 | 断线重连不漏事件 | §3.7.2 | `Last-Event-ID` 补发、seq 无空洞 | §3.7.2 |
+| P2-3 | 断线重连不漏事件 | §3.7.2 | `Last-Event-ID` 补发、seq **单调递增**（⚠ **#502 起允许跳号**，不得拿跳号当丢事件） | §3.7.2 |
 | P2-4 | 路由发布端到端 | §3.5 T1–T3 | 生成 router+service、原子替换、失败保留上一版 | §3.5 |
 | P2-5 | 工具审批 + 超时 `expired` | §3.6.2 U10/U11 | 审批决定 / 10min 超时 / 迟到决定 `409` | §3.6.2 |
 | P2-6 | 账号生命周期 workflow | onboarding/offboarding 脚本（规格 §7.2/§7.3） | 建子网/起容器/分配端口/物化 + 停容器/吊销 | 脚本走通 |
@@ -157,6 +157,25 @@ sg docker -c "docker exec $DB_NAME pg_isready -U station -d station_test -t 15"
 ```
 
 判定：`pg_isready` 在 15s 内 `accepting connections`，否则集成测试不启动。
+
+##### 真库用例的两个口径（`TEST_DATABASE_URL` 与夹具串行化）——跑全量前先看这两条
+
+- **`TEST_DATABASE_URL` 是「真库用例」的总开关**：它指向一个**一次性** postgres:16（上面 §2.2.1 那台，
+  绝不指向真库 `station-db`）。**未设置 ⇒ 整个真库文件 `skip`，不是「假通过」**：入口文案由
+  `portal/test/pg-fixture.js` 的 `SKIP_WITHOUT_PG` 单点持有（「TEST_DATABASE_URL 未设置：真库用例需一次性
+  postgres:16（docs/testing.md §2.2.1），无 PG 时整体跳过」），两处真库文件共用同一句话，**不要再抄出第三种说法**。
+  ⇒ 看门禁报告时，**「N skipped」不是失败也不是绿**：要真验迁移/夹具链路，必须带 `TEST_DATABASE_URL` 跑一遍全量
+  （`npm test` 本身会自动包含它们；CI 无 PG 就是 skip）。
+- **夹具自己串行化，不要手工串行、也不要手工删锁**：`portal/test/pg-fixture.js` 用一把**跨进程文件锁**
+  （缺省 `os.tmpdir()` 下的 `station-test-bootstrap.lock`，即 `/tmp/station-test-bootstrap.lock`）盖住「**建库 → baseline/bootstrap/增量迁移 → 用例体 → 删库**」整段。
+  为什么要锁（现查，不是猜）：两个真库文件都在注入的实例上跑 `bootstrap.sql` 的**集群级**角色 DDL
+  （`ALTER ROLE … LOGIN/PASSWORD`、`CREATE ROLE`），写的是 `pg_authid` 的同一行 ⇒ 两条连接在两个**不同**的新库里
+  同时改 ⇒ `tuple concurrently updated`（XX000）；而 `migrate.js` 的 `pg_advisory_lock` **挡不住**它
+  （advisory lock 作用域带 database OID，两个持锁者在两个新库里 ⇒ 互看不见）⇒ 锁必须在**库外**。
+  Node 没有 `flock(2)` 绑定，故用 `open(…,'wx')` 原子创建 + **pid 活性探测 + mtime 兜底**做等价语义
+  （持有者崩了不会把后面的套件钉死）；**释放只认自己那个 token**（超时那条腿已放手时绝不删别人的锁）。
+  ⇒ 带 PG 跑全量 `npm test` **不需要**人工拆文件跑，也不要把锁当残留去 `rm`（`STATION_TEST_LOCK_TIMEOUT_MS`
+  缺省 900s，拿不到锁宁可红一条也不吊死整条 `npm test`）。
 
 #### 2.2.2 schema.sql 空库可执行性（D3 验收锚点，集成层）
 
@@ -325,7 +344,7 @@ SQL
 | R2 kill worker | 仅 kill worker 进程（agentd 存活） | agentd `release`（`worker_crashed`）→ 立即 re-claim（`attempts++`、`resume:true`）（runner §6.4） | 同上，但 release 由 agentd 发起 |
 | R3 容器重启（整容器） | `docker restart fde-alice` | 新 agentd 扫描 spool → 重传未 ack → re-claim 续跑（runner §7.5/§6.4） | spool 不丢（在 HOME bind mount 持久卷）+ 事件不重不漏 |
 | R4 重复 batch（同 `client_event_id`） | 重发同一 U3 批次 | `INSERT ... ON CONFLICT (run_id, client_event_id) DO NOTHING`，响应 `stored < 请求条数`、`200`，不产生重复事件（schema.sql §5 + portal §9.4） | `run_events` 中该 `client_event_id` 恰一条 |
-| R5 乱序 batch | 乱序重发 attempt N 与 N+1 的批次 | 逐事件幂等去重；`seq` 按到达顺序分配、严格递增无空洞；run 内逻辑顺序由 `client_event_id` 的 `(attempt,计数)` 编码（runner §7.3） | 无重复行 + seq 连续 |
+| R5 乱序 batch | 乱序重发 attempt N 与 N+1 的批次 | 逐事件幂等去重；`seq` 按到达顺序分配、**单调递增**（#502 起**允许跳号**：stream 档不占号 + 重复投递烧号）；run 内逻辑顺序由 `client_event_id` 的 `(attempt,计数)` 编码（runner §7.3） | 无重复行 + `seq` 单调递增（**不要求连续**） |
 | R6 checkpoint 旧 revision 被拒（CAS） | U8 提交 `revision <= 当前` | `409 checkpoint_stale`；agentd 不重试（runner §9.5 + portal §9.8） | DB 内 snapshot 未被旧值覆盖 |
 | R7 lease 过期回收 + `claim_token` fencing | 让租约过期（不续租）→ 另一 agentd re-claim → 旧 agentd 写 | reaper 回收租约；旧 `claim_token` 任何写 → `409 lease_lost` / 心跳 `lease_lost`（runner §4.2/§6.4） | 旧写被拒、不污染 DB |
 | R8 spool 写满 | 塞满 spool 配额（每 run 256MB / 每容器 1GB ⚠️）且内存队列也满 | 事件不静默丢，run 显式 `spool_full`（retryable）（runner §7.5 + portal §6.4） | run 失败码 = `spool_full` |
@@ -464,11 +483,15 @@ curl -s -o /dev/null -w '%{http_code}' -H 'Last-Event-ID: 999999999' .../events
 ① playwright 打开对话页，用 browser_evaluate 创建一个 EventSource('/api/sessions/<sid>/events')，
    收集收到的 seq 到 window.__seqs
 ② 用 browser_evaluate 断开 EventSource（close()），等 1s 后重建（EventSource 自动带 Last-Event-ID）
-③ browser_evaluate 返回 window.__seqs，断言：重建后无跳号（seq 连续）、无重复
+③ browser_evaluate 返回 window.__seqs，断言：无重复、**重建后不丢已确认的 seq**（重连后收到的 seq
+   均 > 断开前的最大值）。⚠ **不得断言「无跳号 / seq 连续」**——#502 起跳号合法（stream 档不占号 +
+   重复投递烧号），拿连续当判据就是一条假红（口径见 `docs/data/model.md` §1.12 与 portal.md §5.1）。
 ④ 截图 + vision 确认「对话气泡完整、无缺段」
 ```
 
-判定：seq 无空洞（`UNIQUE(session_id, seq)` 兜底）、补发不漏（重连后从断点之后连续）、无重复。
+判定：`seq` **单调递增且 `UNIQUE(session_id, seq)` 兜底**（**不要求无空洞**，跳号不是丢事件）、补发不漏
+（重连后从断点之后继续，且不漏已落库的事件）、无重复。**客户端不得拿跳号当重连触发条件**（portal.md §5.1
+的 #25 裁决；#502 之后更是硬事实：否则每次含流式输出的 run 都会误判为丢事件→重连风暴）。
 
 ---
 
