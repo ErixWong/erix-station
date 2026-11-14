@@ -19,7 +19,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
-import { stopLoopsAndWait, gracefulShutdown, SHUTDOWN_LOOPS_MS_DEFAULT, SHUTDOWN_TOTAL_MS_DEFAULT } from '../src/shutdown.js';
+import { stopLoopsAndWait, gracefulShutdown, SHUTDOWN_LOOPS_MS_DEFAULT, SHUTDOWN_TOTAL_MS_DEFAULT, FLUSH_LOGS_TIMEOUT_MS_DEFAULT } from '../src/shutdown.js';
 
 const NODE_TIMER_MAX_MS = 2147483647;
 
@@ -105,8 +105,8 @@ test('#506c 顺序：server.close 必须在 stopLoopsAndWait 之前被调用（�
   assert.equal(closeAt, 0, `server.close 必须是关闭流程的第一个动作（时间线 ${JSON.stringify(events)}）`);
   assert.ok(waitAt > closeAt,
     `close(${closeAt}) 必须在 stopLoopsAndWait(${waitAt}) 之前——旧顺序里那 5s 循环等待期间 server 仍在 listen、仍在接新请求`);
-  assert.deepEqual(report.sequence, ['server.close', 'stopLoopsAndWait'],
-    'helper 自己也要把这两步的顺序记账出来（运维与回归都看这个）');
+  assert.deepEqual(report.sequence, ['server.close', 'stopLoopsAndWait', 'flushLogs'],
+    'helper 自己也要把这几步的顺序记账出来（运维与回归都看这个；flushLogs 必须在最后——exit 前）');
   // 每个循环被 stop 的那一刻，server 必须已经不再接新连接
   for (const name of ['materializer', 'routes']) {
     assert.ok(events.includes(`${name}:serverListening=false`),
@@ -324,12 +324,15 @@ test('#506c 总上限与循环上限都要夹到 Node timer 边界（3e9 不许�
       totalTimeoutMs: 3e9,
     });
     assert.ok(captured.length >= 2, `循环上限与总上限各要一个 deadline timer（实测 ${JSON.stringify(captured)}）`);
-    assert.equal(Math.max(...captured), NODE_TIMER_MAX_MS,
-      `两个上限都必须落在夹住后的 ${NODE_TIMER_MAX_MS} 上（实测 ${JSON.stringify(captured)}；原样 3e9 会被 Node 折成 1ms ⇒ 关闭刚发起就自杀）`);
-    assert.ok(captured.every((ms) => ms <= NODE_TIMER_MAX_MS), `没有 timer 越界（实测 ${JSON.stringify(captured)}）`);
+    // #506d 之后这条路径上还会多**两个刷日志的 timer**（每条流一个，默认 250ms）：它们不是「收尾预算」
+    // timer，按**精确值**剔掉（剔不掉的 flush 回归会被下面那条「没 timer 越界」断言抓住）。
+    const budgetTimers = captured.filter((ms) => ms !== FLUSH_LOGS_TIMEOUT_MS_DEFAULT);
+    assert.equal(Math.max(...budgetTimers), NODE_TIMER_MAX_MS,
+      `两个上限都必须落在夹住后的 ${NODE_TIMER_MAX_MS} 上（实测 ${JSON.stringify(budgetTimers)}；原样 3e9 会被 Node 折成 1ms ⇒ 关闭刚发起就自杀）`);
+    assert.ok(budgetTimers.every((ms) => ms <= NODE_TIMER_MAX_MS), `没有 timer 越界（实测 ${JSON.stringify(budgetTimers)}）`);
     // 总上限那一条是「剩余预算」（= 总上限 - 已用时），所以允许比上限小 1~2ms；但绝不允许被折成个位数
-    assert.ok(Math.min(...captured) > NODE_TIMER_MAX_MS - 1000,
-      `没有任何一个收尾 timer 被截短（实测 ${JSON.stringify(captured)}）`);
+    assert.ok(Math.min(...budgetTimers) > NODE_TIMER_MAX_MS - 1000,
+      `没有任何一个收尾 timer 被截短（实测 ${JSON.stringify(budgetTimers)}）`);
     assert.equal(report.totalTimeoutMs, NODE_TIMER_MAX_MS);
     assert.equal(report.loopTimeoutMs, NODE_TIMER_MAX_MS);
   } finally {
