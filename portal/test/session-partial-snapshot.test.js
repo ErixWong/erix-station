@@ -28,6 +28,7 @@ import { createServer } from '../src/http.js';
 import { cookieSettings } from '../src/config.js';
 import * as auth from '../src/auth.js';
 import { partialOutputs } from '../src/run-partial-buffer.js';
+import { notifySessionEvents } from '../src/internal.js';
 import { FakePool } from './fake-pool.js';
 
 const USER = {
@@ -51,13 +52,19 @@ class SnapshotPool extends FakePool {
     };
     this.replayRows = [];   // 补发查询（durable 档）返回的行
     this.sqlLog = [];       // 断言「重放 SQL 排除 partial_output」这类文本级事实
+    // 审计第 1 条用得到的钩子：补发查询**跑的那一刻**回调（那正是「已注册、尚未转 live」的窗口）。
+    this.onReplayQuery = null;
   }
 
   async query(sql, params = []) {
     const flat = String(sql).replace(/\s+/g, ' ').trim();
     this.sqlLog.push(flat);
     if (flat.includes('FROM chat_sessions s')) return { rows: [this.sessionRow] };
-    if (flat.includes('FROM run_events') && flat.includes('seq >')) return { rows: this.replayRows };
+    if (flat.includes('FROM run_events') && flat.includes('seq >')) {
+      // 钩子在返回行**之前**跑：模拟「补发查询进行中，另一批事件落库并推给了这个尚未 live 的客户端」。
+      if (this.onReplayQuery) await this.onReplayQuery();
+      return { rows: this.replayRows };
+    }
     if (flat.includes('FROM runs r')) return { rows: [] };
     if (flat.includes('FROM messages')) return { rows: [] };
     if (flat.includes('FROM runs')) return { rows: [] };
@@ -128,6 +135,27 @@ function framesOf(raw) {
   });
 }
 const partialFrames = (raw) => framesOf(raw).filter((f) => f.event === 'partial_output');
+
+/**
+ * **客户端拼装的仿真**（审计第 1 条的尺）：按**到达顺序**把帧拼成界面上那一段正文。
+ *
+ * 两个语义不能舍：`assistant_delta` 是**追加**，`partial_output` 是**覆盖**（`useEventStream.ts`
+ * 的 `case 'partial_output'` 写得很明白：「这一帧的语义是当前这段未完稿正文的全量」）。
+ * 所以重复不是「两个帧看起来一样」，而是「快照已含全文后，同一批碎片又被当增量追了一遍」。
+ * 轮闸（`roundSeq`）按本连接已观测到的轮号解开（= 前端对上了），不拿它掩盖顺序 bug。
+ */
+function assembleClientText(raw, { roundSeq } = {}) {
+  let text = '';
+  for (const f of framesOf(raw)) {
+    if (f.event === 'assistant_delta') text += f.data?.text ?? '';
+    else if (f.event === 'partial_output') {
+      const frameSeq = typeof f.data?.roundSeq === 'number' ? f.data.roundSeq : null;
+      if (roundSeq !== undefined && frameSeq !== roundSeq) continue; // 轮对不上 ⇒ 整帧丢弃
+      text = f.data?.text ?? text;
+    }
+  }
+  return text;
+}
 
 /**
  * 往进程内缓冲里喂碎片（真写路径的同一入口，`internal.js` 的写循环调的就是它）。
@@ -261,6 +289,61 @@ test('#502：首连（无 Last-Event-ID）仍然一条历史都不补发 —— 
     const raw = await s.stream({ lastEventId: null });
     assert.deepEqual(partialFrames(raw), [], '首连不补发是 §5.2.3 的红线，#502 没动它');
     assert.ok(raw.includes(': connected'), '首连只有 `connected` 注释 + ping');
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 审计第 1 条（261114-05）：**重连时正文会重复一遍** —— 快照帧与 hub flush 的顺序承重。
+//
+// 复现的形状（这就是五组审计里那条【高】）：客户端断开后重连，`registerSessionClient` 先注册
+// （此后落库/转发的事件进 `rec.buffer`），然后跑补发查询。**补发窗口内**到达的同轮碎片会：
+//   ① 进进程内正文缓冲（`partialOutputs` 是它的写手）⇒ 于是**快照帧里已经有它**；
+//   ② 同时进 `rec.buffer`，而 `sessionClientGoLive` 过滤 seq-less 帧的条件是
+//      `ev.seq != null && ev.seq <= sinceSeq`（`internal.js` D-2 ①，碎片 `seq=null` 永不为真）
+//      ⇒ **它照样被 flush 出去**。
+// 于是「快照先、flush 后」= 界面上先把全量盖进气泡、再把同一批碎片当增量追一遍 ⇒ 重复一遗。
+// 旧顺序在本用例里会红（拼出来是 `…补发期间到的补发期间到的`）；改后（先 flush、后快照）不红。
+// ---------------------------------------------------------------------------
+test('审计第 1 条：注册后、**补发窗口内**到达的同轮碎片不得把正文重复一遍（快照必须在 flush 之后）', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    // 断线之前已经流过的半句（轮起点 seq = 2 ⇒ 客户端观测到的也是同一个 2）
+    feedDeltas(RUN_ID, ['断线前']);
+    const late = {
+      session_id: SESSION_ID, run_id: RUN_ID, type: 'assistant_delta',
+      client_event_id: `${RUN_ID}:1:99`, seq: null, payload: { text: '补发期间到的' },
+    };
+    // 钩子跑在「已注册、尚未 goLive」那个窗口里：这条碎片**同时**进正文缓冲与 hub 的 rec.buffer
+    //（与 U3 写侧同一条顺序：先 `bufferTx.commit()` 再 `notifySessionEvents`）。
+    s.pool.onReplayQuery = async () => {
+      partialOutputs.observe(RUN_ID, late);
+      notifySessionEvents(SESSION_ID, [{
+        seq: null, ts: new Date().toISOString(), run_id: RUN_ID, type: 'assistant_delta', payload: { text: '补发期间到的' },
+      }]);
+    };
+    const raw = await s.stream({ lastEventId: 1 });
+
+    // ① 拼装面：同一段文字**只出现一次**（这就是「界面上看见的那一段」）
+    const got = assembleClientText(raw, { roundSeq: 2 });
+    assert.equal(got, '断线前补发期间到的',
+      `客户端拼出来的正文（重复就是快照先、碎片后）：${JSON.stringify(got)}`);
+    const fragCount = got.split('补发期间到的').length - 1;
+    assert.equal(fragCount, 1, `那段碎片出现了 ${fragCount} 次（应为 1）：${JSON.stringify(got)}`);
+
+    // ② 结构面：**所有** `partial_output` 帧都排在**最后一条** `assistant_delta` 之后
+    //（覆盖式语义只能排在追加式之后；反过来就是这一条 bug 的形状）。
+    const evs = framesOf(raw).map((f) => f.event);
+    const lastDelta = evs.lastIndexOf('assistant_delta');
+    const firstPartial = evs.indexOf('partial_output');
+    assert.ok(lastDelta >= 0 && firstPartial >= 0, `夹具没跑起来：${JSON.stringify(evs)}`);
+    assert.ok(firstPartial > lastDelta,
+      `快照帧必须排在碎片之后（覆盖式不能排在追加式前面）：顺序=${JSON.stringify(evs)}`);
+    // 碎片本身仍然发了（D-2 ① 那条红线没被这次修复弄回去：碎片**不许**被 sinceSeq 过滤掉）
+    assert.equal(partialFrames(raw).length, 1, '快照仍只有一条（本轮就一段未完稿正文）');
   } finally {
     reset();
     await s.close();

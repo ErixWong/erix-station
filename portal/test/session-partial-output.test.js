@@ -218,7 +218,7 @@ async function startServer() {
  * `partial` = `run_end.payload.partial_text`（停止时那半轮，同一行里带 `termination`）。
  */
 function seedAbortedRun(pool, {
-  runId = 'r-partial', status = 'failed', deltas = [], partial = null,
+  runId = 'r-partial', status = 'failed', deltas = [], partial = null, partialTruncated = undefined,
   anchor = null, startSeq = 1, extraEvents = [], termination = { reason: 'aborted' },
 }) {
   pool.seedRun(runId, status, termination);
@@ -230,6 +230,9 @@ function seedAbortedRun(pool, {
   for (const extra of extraEvents) pool.seedEvent({ seq: seq++, runId, ...extra });
   const runEndPayload = { termination };
   if (typeof partial === 'string' && partial !== '') runEndPayload.partial_text = partial;
+  // 审计第 3 条：写入侧现在会多带一个 `partial_truncated`（**只有 `undefined` 时不写键**，
+  // 那才是「旧库里那行根本没有这个键」的形状）。
+  if (partialTruncated !== undefined) runEndPayload.partial_truncated = partialTruncated;
   pool.seedEvent({ seq: seq++, runId, type: 'run_end', payload: runEndPayload });
   if (anchor) pool.seedMessage({ id: `${runId}-msg`, runId, ...anchor });
   return { pool, lastSeq: seq - 1 };
@@ -664,6 +667,95 @@ test('#502 M-6④：一条 run 的事件分散在多个窗口批次 ⇒ **只有
     assert.equal(partialsOf(p1).length, 1, 'page1（含 seq 3）给正文');
     assert.equal(partialsOf(p1)[0].payload.text, '一二', '正文仍是 whole-run 口径');
     assert.equal(partialsOf(p2).length, 0, 'page2 不再重复给同一个 run 的合成项');
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7. 审计第 3 条（261114-05）：**投影的 `truncated` 是两个来源的合并**
+//    ① 本端点聚合超 65,536（一直就有）；② 写入侧看到的「正文已被 16,384 夹尾」（新增）。
+// ---------------------------------------------------------------------------
+test('审计第 3 条：`run_end.partial_truncated=true` ⇒ 投影 truncated=true（正文短得没超 65,536 也必须说实话）', async () => {
+  const s = await startServer();
+  try {
+    // 形状取自真机：正文在内存里被 `textCap`(16,384) 夹过尾 ⇒ 库里存的就是被截过的那一份，
+    // 但它的长度远小于投影自己的上限 65,536 ⇒ 只看投影自己那把尺就会把它说成「完整」（谎报）。
+    seedAbortedRun(s.pool, {
+      runId: 'r-capped', status: 'failed', deltas: [],
+      partial: 'x'.repeat(16384), partialTruncated: true,
+    });
+    const parts = partialsOf(await s.history());
+    assert.equal(parts.length, 1);
+    assert.equal(parts[0].payload.text.length, 16384, '本端点自己没切长度（前置）');
+    assert.equal(parts[0].payload.truncated, true,
+      '「库里这份是被截过的」也是事实 —— 改前这个键根本没人读，界面上写的是「完整」');
+  } finally {
+    await s.close();
+  }
+});
+
+test('审计第 3 条（反面）：没有 partial_truncated（旧行）/ 值是 false 或脏值 ⇒ truncated=false，不许谎报', async () => {
+  const s = await startServer();
+  try {
+    seedAbortedRun(s.pool, { runId: 'r-legacy', status: 'failed', deltas: [], partial: '说到一半' }); // 旧库：键不存在
+    seedAbortedRun(s.pool, { runId: 'r-false', status: 'failed', deltas: [], partial: '说到一半', partialTruncated: false });
+    seedAbortedRun(s.pool, { runId: 'r-dirty', status: 'failed', deltas: [], partial: '说到一半', partialTruncated: 'yes' });
+    const parts = partialsOf(await s.history());
+    assert.equal(parts.length, 3, `三条 run 各一条（body=${JSON.stringify(parts.map((p) => p.run_id))}）`);
+    const byId = Object.fromEntries(parts.map((p) => [p.run_id, p.payload.truncated]));
+    assert.deepEqual(byId, { 'r-legacy': false, 'r-false': false, 'r-dirty': false },
+      '缺键 / false / 脏值一律当「没截」（只认真字面量 true，与 placeholder 同一口径）');
+  } finally {
+    await s.close();
+  }
+});
+
+test('审计第 3 条（两闸合并）：既被夹过尾、投影又超 65,536 ⇒ 仍只报一次 truncated=true（两个来源取或）', async () => {
+  const s = await startServer();
+  try {
+    seedAbortedRun(s.pool, {
+      runId: 'r-both', status: 'failed',
+      deltas: ['a'.repeat(40_000), 'b'.repeat(40_000)], // 聚合 80,000 + 半轮 ⇒ 超 65,536
+      partial: 'x'.repeat(16384), partialTruncated: true,
+    });
+    const parts = partialsOf(await s.history());
+    assert.equal(parts[0].payload.text.length, 65536, '超上限照样截到 65,536（① 那条闸没被削弱）');
+    assert.equal(parts[0].payload.truncated, true);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 8. 审计第 2 条（261114-05）的**投影面**：已完成那一轮在拼出来的正文里只出现一次。
+//    写入侧那一半在 `internal-delta-not-persisted.test.js`（round_end 关掉正文槽）；
+//    这里钉的是「投影是纯拼接 ⇒ 写入侧多写一份，界面就重复一轮」这个耦合。
+// ---------------------------------------------------------------------------
+test('审计第 2 条（投影面）：一轮 round_end 终稿 + 无 partial_text ⇒ 该轮正文恰出现一次', async () => {
+  const s = await startServer();
+  try {
+    seedAbortedRun(s.pool, { runId: 'r-once', status: 'failed', deltas: ['这一轮说完了。'], partial: null });
+    const parts = partialsOf(await s.history());
+    assert.equal(parts.length, 1);
+    assert.equal(parts[0].payload.text, '这一轮说完了。');
+    assert.equal(parts[0].payload.text.split('这一轮说完了。').length - 1, 1, '同一轮正文只许出现一次');
+    assert.equal(parts[0].payload.source, 'round_end', '来源面也得说清只有 round_end 那一份');
+  } finally {
+    await s.close();
+  }
+});
+
+test('审计第 2 条（反向自证）：写入侧若把已完成那轮再写进 partial_text ⇒ 投影就重复一轮（本单修的正是这个上游）', async () => {
+  const s = await startServer();
+  try {
+    // 投影是**字符串级拼接**（它没有、也不该有「去重」的能力）⇒ 写入侧多写一份就必然重复。
+    // 这条用例存在的目的：证明「只出现一次」不是投影层顺手兜住的，而是写入侧（round_end 关槽）挣来的。
+    seedAbortedRun(s.pool, { runId: 'r-twice', status: 'failed', deltas: ['这一轮说完了。'], partial: '这一轮说完了。' });
+    const parts = partialsOf(await s.history());
+    assert.equal(parts[0].payload.text, '这一轮说完了。这一轮说完了。');
+    assert.equal(parts[0].payload.text.split('这一轮说完了。').length - 1, 2,
+      '前置自证：两处都写就是两遍 ⇒ 修复必须（也确实）落在写入侧');
   } finally {
     await s.close();
   }
