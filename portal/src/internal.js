@@ -800,7 +800,7 @@ async function terminalPayloadMatches(pool, run, body) {
  *   * **缓冲本身**的变更（`drop`/`markTerminal`）必须留在 **COMMIT 之后**（审计 B-4，见
  *     `run-partial-buffer.js` 口径④）：本函数**只读**缓冲，不改它。
  *
- * @returns {Record<string, string|number>} 要并进 `run_end` payload 的键（可能为空对象 = 逐字不变）
+ * @returns {Record<string, string|number|boolean>} 要并进 `run_end` payload 的键（可能为空对象 = 逐字不变）
  */
 export function runEndPartialKeys(runId, {
   hasAssistantAnchor = false, buffer = partialOutputs,
@@ -811,6 +811,12 @@ export function runEndPartialKeys(runId, {
   return {
     partial_text: snap.text,
     partial_round: Number.isFinite(Number(snap.round)) ? Number(snap.round) : 0,
+    // 审计第 3 条（additive）：**正文自己被截了就要说实话**。此前缓冲在 `textCap` 截尾这个事实
+    // 只活在内存里，终态之后没人知道 ⇒ 历史投影只能拿自己聚合超 65,536 当唯一截断信号，
+    // 于是一段被夹到 16,384 的正文在界面上被说成「完整」（谎报，不是少报）。
+    // ⚠ 取的是 `textTruncated` 而不是 `truncated`：后者是正文/推理**两路共用**的观测位，
+    //   拿它写库就会把「推理截了但正文没截」谎报成正文被截。
+    partial_truncated: snap.textTruncated === true,
   };
 }
 
@@ -1103,6 +1109,13 @@ export async function postEvents(pool, { container, user, runId, claimToken, bod
         // 需要嗂给缓冲（带它自己的 `seq` ⇒ 补发帧才能自证「我是哪一轮的」）。
         // 其余事实档与这个槽无关（碎片的累加不靠它们，旧 `uptoSeq` 语义已删）。
         if (ev.type === 'round_start') bufferTx.observe(runId, { ...ev, seq, session_id: r.session_id });
+        // 审计第 2 条：**durable `round_end` 插入成功 ⇒ 关掉这一轮的正文槽**（与上面同一个「COMMIT
+        // 才生效」通道，不在事务里直接改真相）。
+        // 为什么承重：这一轮的正文从这一刻起 durable 在 `round_end.payload.final_text` 里，而历史投影
+        // 读的是 **`round_end.final_text` 拼 `run_end.partial_text`**（`http.js#projectPartialOutputItems`）。
+        // 槽不关，「`round_end` 之后、下一轮 `round_start` 之前」被 reaper / offboard / 取消终态化时，
+        // `runEndPartialKeys` 会把**已完成那一轮**的正文再写一遍进 `partial_text` ⇒ 界面重复一轮。
+        else if (ev.type === 'round_end') bufferTx.closeRound(runId);
         committedEvents.push({
           seq, ts: (ev.ts ?? new Date().toISOString()),
           run_id: runId, type: ev.type, payload: ev.payload ?? {},

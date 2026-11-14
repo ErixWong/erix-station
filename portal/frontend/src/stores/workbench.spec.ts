@@ -2705,3 +2705,148 @@ describe('#431 迟到写回的三条守卫（createDir / recallQueue / stop）',
     expect(store.entries, '「已请求停止」是上一账号那条流的事，不得插进新账号的消息流').toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 审计第 4 / 5 / 7 条（261114-05）—— store 这一半
+// ---------------------------------------------------------------------------
+describe('审计第 5 条：addPartialOutput 撤实时气泡必须把 delta entry 一起摘掉', () => {
+  /** 走**真实 watcher 路径**把 delta entry 送进 entries（不是自己 push 一条假的）。 */
+  async function streamABubble(store: ReturnType<typeof useWorkbenchStore>, text: string) {
+    // ⚠ `store.es.*` 经 Pinia 的 reactive 代理会**解包 ref**（既有测试 `store.es.lastSeq` 同一口径），
+    // 所以这里赋值不带 `.value`。真实写点是 `useEventStream` 的 `case 'assistant_delta'` /
+    // `case 'partial_output'`（都写同一个 ref），watcher 在 `workbench.ts` 里盯的就是它。
+    store.es.activeRunId = 'r-partial';
+    store.es.deltaText = text;
+    const { nextTick } = await import('vue');
+    await nextTick();                      // watch(es.deltaText) 的回调：建 `kind:'delta'` 条目
+  }
+
+  it('delta 气泡已在 entries ⇒ addPartialOutput(同文本) 后只剩一条 kind:partial，kind:delta 消失', async () => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await streamABubble(store, '说到一半的正文');
+    // 前置（必须真成立，否则本用例什么都没测）：走 watcher 出来的 delta 条目在 entries 里
+    expect(store.entries.filter((e) => e.kind === 'delta').length).toBe(1);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-partial', type: 'partial_output',
+      payload: { text: '说到一半的正文', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+
+    const kinds = store.entries.map((e) => e.kind);
+    expect(kinds.filter((k) => k === 'delta'), `同一段正文在界面上两遍：${JSON.stringify(kinds)}`).toEqual([]);
+    expect(kinds.filter((k) => k === 'partial')).toEqual(['partial']);
+    expect(store.es.deltaText).toBe(null);
+  });
+
+  it('反向自证：别的 run 正在流（文本不等）⇒ 不得误伤它的气泡', async () => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await streamABubble(store, '另一个 run 正在打字');
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-partial', type: 'partial_output',
+      payload: { text: '已经落库的那段', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(store.entries.some((e) => e.kind === 'delta'), '跨 run 误伤就是把别人正在打的字弄没了').toBe(true);
+    expect(store.es.deltaText).toBe('另一个 run 正在打字');
+  });
+});
+
+describe('审计第 7 条：placeholder 且文本非空 ⇒ 正文优先（占位文案不许遮蔽正文）', () => {
+  beforeEach(() => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+  });
+
+  it('{text:"有正文", placeholder:true} ⇒ entry 的 placeholder 被归一成 false（StreamPanel 走 v-else 渲染正文）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.addPartialOutput({
+      seq: 3, run_id: 'r-shadow', type: 'partial_output',
+      payload: { text: '有正文', chunks: 1, truncated: false, placeholder: true, source: 'round_end' },
+    });
+    const en = store.entries.find((e) => e.kind === 'partial') as
+      | { kind: 'partial'; text: string; placeholder?: boolean } | undefined;
+    expect(en).toBeTruthy();
+    expect(en!.text).toBe('有正文');
+    expect(en!.placeholder, '非空正文优先：占位只在真的没正文时才成立').toBeFalsy();
+  });
+
+  it('文本为空 + placeholder:true ⇒ 占位照旧成立（#278 那条底线不许被这次修复弄回去）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    store.addPartialOutput({
+      seq: 3, run_id: 'r-empty', type: 'partial_output',
+      payload: { text: '', chunks: 0, truncated: false, placeholder: true, source: 'none' },
+    });
+    const en = store.entries.find((e) => e.kind === 'partial') as
+      | { kind: 'partial'; text: string; placeholder?: boolean } | undefined;
+    expect(en?.placeholder).toBe(true);
+    expect(en?.text).toBe('');
+  });
+});
+
+describe('审计第 4 条（store 接线）：loadOlderMessages 走的是"旧页"口径，openSession 首屏仍是"重建"口径', () => {
+  it('活跃 run 正在流 ⇒ 滚上去拉更早一页（含更旧的 round_start）后，实时气泡与当前轮快照都还在', async () => {
+    mockFetch((url) => {
+      if (url.includes('/events/history')) {
+        if (url.includes('before=')) {
+          return {
+            status: 200,
+            body: {
+              events: [{ seq: 6, run_id: 'r-old', type: 'round_start', payload: { round: 1 } }],
+              next_cursor: null,
+            },
+          };
+        }
+        return { status: 200, body: { events: [], next_cursor: 20 } };
+      }
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        if (url.includes('cursor=')) {
+          return { status: 200, body: { session: { id: 's1', active_run_id: 'r-current' }, messages: [], last_seq: 60, next_cursor: null } };
+        }
+        return { status: 200, body: { session: { id: 's1', active_run_id: 'r-current' }, messages: [], last_seq: 60, next_cursor: 30 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    // 当前轮正在流：轮起点 seq=60（实时帧），已有一段正文
+    es.emit('round_start', { seq: 60, round: 4, run_id: 'r-current' });
+    es.emit('assistant_delta', { run_id: 'r-current', text: '正在流的那段' });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(store.es.deltaText).toBe('正在流的那段');
+
+    expect(await store.loadOlderMessages()).toBe(true);
+    expect(store.es.deltaText, '旧页把正在流的正文清了（审计第 4 条那个真缺陷）').toBe('正在流的那段');
+
+    // 轮水位没回退 ⇒ 当前轮的快照仍被双闸接受
+    es.emit('partial_output', { run_id: 'r-current', roundSeq: 60, text: '正在流的那段＋快照', chunks: 5, source: 'memory' });
+    expect(store.es.deltaText).toBe('正在流的那段＋快照');
+  });
+});

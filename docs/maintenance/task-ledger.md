@@ -5303,3 +5303,47 @@ TYPING_CHECK verdict=PASS reason=strictly_increasing
   真实所在的那棵树」，不能写「我记账时看到的 HEAD」**。
 - 三个真库文件里有**两份**同样的 skip 文案（一份导出、一份字面量）。泛化成「所有真库文件」只是让文档不再漂，
   **代码侧那份重复还在**（`pg-fixture.js:136` 与 `migrate-fresh-db.test.js:27-29`），本单不动测试文件，留给后续。
+
+#### 8.126.4 五组独立审计查出的 9 条真缺陷：重连重复 / 重复一轮 / 截断谎报 / 旧页打死流式正文 …（261114-05，2026-11-14，worker 落地）
+
+**编号说明**：工单写的是「新增 §8.126.3」，但 `grep -n '^#### 8\.126\.'` 现查 §8.126.3 已被 261114-04 占了
+（`### 8.` 那一层只到 8.126，工单的 grep 口径看不到四级子标题）⇒ 按「不撞号」这条更高优先级的规矩续到 **8.126.4**。
+
+**分工与判定（五组各自独立跑，主 agent 逐条亲自复核后才开单；9 条全属实，无误报）**
+
+| 审计组 | 看的面 | 判定 |
+|---|---|---|
+| 写侧（事件落库 / 终态正文） | `internal.js` 的 U3 写循环 + 终态收敛事务 + `run-partial-buffer.js` | 2 条真缺陷（已完成轮次被并进 `partial_text`；截断状态没持久化） |
+| 读侧 SSE（重连补发） | `http.js#handleSessionStream` + `internal.js` 的 session hub | 1 条**高**（重连时正文重复一遍） |
+| 前端（store / 流式气泡） | `workbench.ts` + `useEventStream.ts` + `StreamPanel.vue` | 4 条（旧页打死流式正文 / 同一段正文两遍 / 脏快照清正文 / 占位遮蔽正文） |
+| 迁移安全 | `0033` / `0034` 的头注释与谓词 | 2 条口径错误（**只能记文档**：两支的 sha256 已落 `schema_migrations`，改字节 = 现存库全部拒启）⇒ 见 `deploy/migrations/README.md` 新增那节 |
+| 测试完整性 | 夹具与体积闸 | 2 条（夹具泄锁是真 bug；checkpoint 体积闸是空样本） |
+
+**九条逐条**（三个提交：`e74560c` 后端 / `fe8cd57` 前端 / `ef0dddb` 测试基建）
+
+1. 【高】重连正文重复一遍 —— 快照帧原来在 `sessionClientGoLive` **之前**发，而 goLive 对 seq-less 帧的过滤条件 `ev.seq != null && …` 对碎片**永不为真** ⇒ 补发窗口内到达的同轮碎片既在快照里、又被当增量追加。改成「先 flush 转 live、后发快照」（覆盖式只能排在追加式之后），协议零改动 → `portal/src/http.js`
+2. 【中】已完成轮次被并进 `partial_text` ⇒ 历史投影重复一轮 —— durable `round_end` 插入成功后**关掉正文槽**（走 `stage().closeRound`，与 `observe` 同一条「COMMIT 才生效」口径）→ `portal/src/run-partial-buffer.js` + `portal/src/internal.js`
+3. 【中】截断状态没持久化，历史把「被截断」说成「完整」—— 缓冲加**正文自己的**截断位（不能复用两路共用的 `truncated`：推理截了会谎报），`runEndPartialKeys` 出 additive 键 `partial_truncated`，投影把它与 65,536 **取或** → 同上三个文件
+4. 【中】滚上去加载更早的历史页会打死正在流的正文 —— 加**显式** `ReplayMode = 'initial' | 'older-page'`（不靠猜）：旧页不清实时气泡、轮水位**只进不退**（口径：seq 会话内单调 ⇒ 同 run 上更大 seq 就是更新的 `round_start`；没观测过则照旧写，首屏重建口径一个字没改）→ `portal/frontend/src/composables/useEventStream.ts` + `stores/workbench.ts`
+5. 【中】同一段正文在界面上出现两遍 —— `addPartialOutput` 撤气泡时**先** `removeDeltaEntry()` **再**清 `deltaText`（`watch` 在 `null` 时只置模块变量、不从 `entries` 摘条目，反了 splice 不进去）→ `portal/frontend/src/stores/workbench.ts`
+6. 【低】脏快照在 run/round 双闸**之前**就清了正文 —— 脏文本只忽略、不动任何状态 → `portal/frontend/src/composables/useEventStream.ts`
+7. 【低】`placeholder:true` 且文本非空时占位文案遮蔽正文 —— 只在 `text === ''` 时接受占位标记（非空正文优先）→ 同上 store（`StreamPanel.vue` 是 `v-if/v-else`，不用改）
+8. 【中·真 bug】`pg-fixture.js` 泄锁 —— `acquireBootstrapLock()` 之后紧跟 `CREATE DATABASE`，而 `try/finally` 在其**后**才开 ⇒ 建库抛错时 `release()` 永不执行，锁留到 10 分钟 stale（症状是「套件突然慢十分钟」而不是红一条，所以一直没人报）。建库移进同一个 `try` → `portal/test/pg-fixture.js` + 新建 `portal/test/pg-fixture-lock.test.js`
+9. 【中】`run_checkpoints` 体积闸是**空样本** —— 全新库里它是 0 行 ⇒ `if (cn > 0)` 永不进入，剩下 `assert.ok(cb >= 0)` **恒真**。改成走产品写入口 `putCheckpoint`（U8）种 10 行真 checkpoint，再断三条（每行字节 / 总行数 / 总字节，后两条是新的，防「行数翻十倍但每行不变」）+ 一条「种不到 10 行就红」的反向自证 → `portal/test/delta-not-persisted-db.test.js`
+
+**本轮最有价值的结论：**「闸看起来在、其实没验」**这一类**。它的共同形状是**断言写对了，取样取错了**，
+所以它永远绿，永远不报：
+
+| 实例 | 空转的形状 | 同类风险 |
+|---|---|---|
+| `run_checkpoints` 体积闸（第 9 条） | `if (cn > 0) { 断每行字节 }` —— 而样本**恒为 0 行**，剩下那句 `cb >= 0` 是恒真 | 任何「有行才断」的体积/形状闸都要问一句：这个库里到底有没有行？ |
+| **每行均值**抓不到总量 | `bytes / n < 上界` 对「行数翻十倍、每行不变」**完全无感**（均值一个字没动） | 体积类闸必须**同时**有总量上界（行数 + 字节），只有均值/比率的都算半成品 |
+| **fake 自证**唯一约束与回滚 | fake pool 按 SQL 文本裁决：它不会因为 partial unique 索引没建就收两行，也不会因为事务回滚就抹掉已写的内存 ⇒ 「幂等」「回滚不脏内存」这类判据在 fake 上是**假绿**，只有真库那条算数 | 凡是「库面事实」的判据（唯一索引 / CAS / 回滚 / `RETURNING`）都要有一条真库用例；fake 只能裁决 SQL 文本级形状 |
+| 前端 spec **直接调 action** | `store.addPartialOutput(...)` 直接调过去，跳过了「谁订阅了什么、什么时候被触发」这条真实链路 ⇒ watcher 没摘条目（第 5 条）、旧页清实时气泡（第 4 条）这类**只有真实订阅路径才会出现**的缺陷，spec 里永远看不见 | 第 5 条的用例被明确要求「走真实 watcher 路径，别直接 push」；写流式相关用例时先问：我这条断言经过 SSE/store watcher 了吗？ |
+
+**计数口径（读基线数必须知道）**：`node --test` 会把 `portal/test/` 下**没有一条 `test(...)` 的 helper 文件**
+当测试文件跑，每个贡献 1 个**文件级 pass** —— 现查恰 **8 个**：`fake-internal-pool.js`、`fake-pool.js`、
+`fake-session-text.js`、`fake-transcript-rounds.js`、`fake-user-activity.js`、`pg-fixture.js`、
+`tls-fixtures.js`、`preview-grant-checks.js`。⇒ **真实用例 pass ≈ 根 `npm test` 的 `# pass` − 8**
+（基线 2212 里含这 8 条；本单新增用例后涨到 2237，真实用例数是 2229）。核对办法：
+`grep -oE "^ok [0-9]+ - portal/test/[a-z0-9._-]+\.js$" <npm test 输出>` —— 一条真库用例都没有的文件才会以**文件路径**当用例名出现。

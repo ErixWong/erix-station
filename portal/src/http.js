@@ -2410,6 +2410,8 @@ async function handleSessionStream(req, res, ctx, sessionId) {
   res.on('close', cleanup);
 
   let replayedSeq = null;
+  /** 快照帧（**先算后发**：算在本块里，发在 goLive 之后——顺序承重，见下面那段注）。 */
+  let snapshotFrames = [];
   if (lastEventId != null) {
     const replay = await ctx.pool.query(
       // #502：**碎片（`assistant_delta`/`reasoning_delta`/`tool_call_delta`）不再从库里补发**（已不落库），
@@ -2436,22 +2438,35 @@ async function handleSessionStream(req, res, ctx, sessionId) {
     }
     // issue #502 D-5（形态 M）：碎片不落库之后，「断线期间流式过的那段正文」只有一个来源：
     // **本进程的缓冲**（已终态的那半截不在这里：它已进 `run_end.partial_text`，刷新时走历史投影）。
-    if (!rec.resync && !cleaned) {
-      const frames = buildPartialSnapshotFrames({ sessionId });
-      for (const f of frames) {
-        if (rec.resync) break;
-        if (cleaned) return;
-        // **不带 id**：快照帧不是库里的一行（内存帧根本没有 seq），让它污染浏览器 Last-Event-ID
-        // 就会把补发游标推进到一个不存在的 seq 上（下一轮重连反而丢事件）。
-        internal.writeSseEvent(res, PARTIAL_OUTPUT_TYPE, JSON.stringify(f), null);
-      }
-    }
+    //
+    // ⚠ **审计第 1 条：快照帧必须在 `sessionClientGoLive` **之后**发**（原来在它之前 ⇒ 正文会重复一遗）。
+    // 机制：补发窗口内到达的同轮碎片既进了正文缓冲（它是 `partialOutputs` 写手），也进了 hub 的
+    // `rec.buffer`；而 goLive 对 seq-less 帧的过滤条件是 `ev.seq != null && ev.seq <= sinceSeq`
+    //（`internal.js` D-2 ①：碎片 `seq=null` **永不被过滤**，那是故意修的另一个 bug）。于是「快照先、
+    // flush 后」就是：快照已含全文 → 再把同一批碎片当**增量**追在快照后面 ⇒ 界面上同一段正文两遗
+    //（前端 `partial_output` 是覆盖式、`assistant_delta` 是追加，两个语义不能倒这个序）。
+    // 先 flush 后快照就把顺序理顺了：碎片先落进气泡，快照随后**盖**上去（覆盖式，且它带的是全量）。
+    // 代价是「flush 之后、快照之前」这个同进程窗口里直接转 SSE 的新碎片会排在快照之前——不坑：
+    // U3 写侧是 `bufferTx.commit()` 在前、`notifySessionEvents` 在后 ⇒ 快照读到的总是已转发的超集，
+    // 而覆盖式赋值对超集就是正确的。
+    // 这里只把帧的生成留在补发块里（`lastEventId != null` 才发，首连不补发是 §5.2.3 的红线），
+    // 真正的写推到 goLive 之后。
+    snapshotFrames = rec.resync || cleaned ? [] : buildPartialSnapshotFrames({ sessionId });
   } else {
     internal.writeSseComment(res, 'connected'); // 首连不补发历史（§5.2.3 红线不变 ⇒ 也不发快照）
   }
   if (cleaned) return; // 补发期间断开：连接已关，不再 goLive（rec 已摘除）/不再起心跳
   internal.sessionClientGoLive(sessionId, rec, replayedSeq);
-  if (rec.resync) return; // 已判定需重同步（res.end 已调用）：跳过 ping 与心跳循环
+  if (rec.resync) return; // 已判定需重同步（res.end 已调用）：跳过快照、ping 与心跳循环
+  // **顺序承重**：快照帧必须在上面的 flush **之后**（见上面那段注），否则同一段正文会发两遗。
+  for (const f of snapshotFrames) {
+    if (rec.resync) break;
+    if (cleaned) return; // 转 live 之后断开：rec 已摘除，不再写
+    // **不带 id**：快照帧不是库里的一行（内存帧根本没有 seq），让它污染浏览器 Last-Event-ID
+    // 就会把补发游标推进到一个不存在的 seq 上（下一轮重连反而丢事件）。
+    internal.writeSseEvent(res, PARTIAL_OUTPUT_TYPE, JSON.stringify(f), null);
+  }
+  if (cleaned) return;
   internal.writeSseEvent(res, 'ping', { ts: new Date().toISOString() });
 
   pingTimer = setInterval(() => {
@@ -2703,11 +2718,12 @@ async function projectPartialOutputItems(pool, candidates) {
     [ids],
   );
   /** @type {Map<string, {rounds: string[], partial: string|null, seqSum: number}>} */
+  /** @type {Map<string, {rounds: string[], partial: string|null, partialTruncated: boolean}>} */
   const acc = new Map();
   for (const row of r.rows ?? []) {
     const runId = row.run_id ?? null;
     if (runId == null) continue;
-    if (!acc.has(runId)) acc.set(runId, { rounds: [], partial: null });
+    if (!acc.has(runId)) acc.set(runId, { rounds: [], partial: null, partialTruncated: false });
     const slot = acc.get(runId);
     const p = row.payload && typeof row.payload === 'object' ? row.payload : {};
     if (row.type === 'round_end') {
@@ -2716,6 +2732,10 @@ async function projectPartialOutputItems(pool, candidates) {
     } else if (row.type === 'run_end' && typeof p.partial_text === 'string' && p.partial_text !== '') {
       // 那一行受 `run_events_run_end_key` 部分唯一索引保护 ⇒ 至多一条，不需要「取最后一条」的合并。
       slot.partial = p.partial_text;
+      // 审计第 3 条：写入侧在缓冲里就看到的「正文已被 `textCap`（16,384）夹尾」那个事实
+      //（`internal.js#runEndPartialKeys` 写的 `partial_truncated`）。**只认真字面量 `true`**：
+      // 缺键（旧库里的行本来就不可能有这个键）与脏值都当「没截」，不拿脏值谎报。
+      slot.partialTruncated = p.partial_truncated === true;
     }
   }
   for (const c of candidates ?? []) {
@@ -2723,7 +2743,7 @@ async function projectPartialOutputItems(pool, candidates) {
     if (runId == null) continue;
     const seq = Number(c.last_seq);
     if (!Number.isFinite(seq)) continue; // 无任何事件行 ⇒ 合成项无处安放
-    const slot = acc.get(runId) ?? { rounds: [], partial: null };
+    const slot = acc.get(runId) ?? { rounds: [], partial: null, partialTruncated: false };
     const full = slot.rounds.join('') + (slot.partial ?? '');
     if (full === '') {
       // 占位（#278 底线）：这次 run 无锚点、两处正文都没有 ⇒ 界面仍要有一行话说「内容没留住」。
@@ -2733,14 +2753,20 @@ async function projectPartialOutputItems(pool, candidates) {
       });
       continue;
     }
+    // 审计第 3 条：`truncated` 是**两个来源取或**：
+    //   ① 本端点自己聚合后超 `PARTIAL_PROJECTION_TEXT_CAP`（65,536）——一直就有；
+    //   ② 写入侧在缓冲里就看到的「正文已被 16,384 夹尾」（`run_end.partial_truncated`）。
+    // 不取 ② 就是把一段被夹到 16,384 的正文说成「完整」（谎报）：投影自己没切长度是事实，
+    // 但「库里存的那份已经是被截过的」也是事实，两个都得进读数。
+    const overCap = full.length > PARTIAL_PROJECTION_TEXT_CAP;
     items.push({
       seq, // 该 run 的最大 seq（**不新分配**，也不推进 `chat_sessions.last_seq`）⇒ 排在本次 run 内容之后
       run_id: runId,
       type: PARTIAL_OUTPUT_TYPE,
       payload: {
-        text: full.length > PARTIAL_PROJECTION_TEXT_CAP ? full.slice(0, PARTIAL_PROJECTION_TEXT_CAP) : full,
+        text: overCap ? full.slice(0, PARTIAL_PROJECTION_TEXT_CAP) : full,
         chunks: slot.rounds.length, // 可观测性：能核对「拼了几轮的终稿」（碎片级计数已随 #502 消失）
-        truncated: full.length > PARTIAL_PROJECTION_TEXT_CAP,
+        truncated: overCap || slot.partialTruncated === true,
         // #502 additive 透传（前端今天不读，但人工排查看得到）：这一份是从哪里来的。
         source: slot.partial ? (slot.rounds.length > 0 ? 'round_end+run_end' : 'run_end') : 'round_end',
       },

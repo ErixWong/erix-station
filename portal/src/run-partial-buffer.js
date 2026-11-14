@@ -61,12 +61,14 @@ function isRoundStart(type) {
  *   stage: () => {
  *     observe: (runId: string, ev: object) => boolean,
  *     markTerminal: (runId: string) => void,
+ *     closeRound: (runId: string) => void,
  *     drop: (runId: string) => void,
  *     snapshot: (runId: string) => object | null,
  *     commit: () => void,
  *   },
  *   snapshot: (runId: string) => object | null,
  *   drop: (runId: string) => boolean,
+ *   closeRound: (runId: string) => boolean,
  *   markTerminal: (runId: string) => boolean,
  *   clear: () => number,
  *   sessionRuns: (sessionId: string) => string[],
@@ -93,6 +95,10 @@ export function createPartialBuffer({
     reasoning: '',
     chunks: 0,
     truncatedByCap: false,
+    // **只有正文**被夹到上限时才置它（审计第 3 条）。`truncatedByCap` 是两路**共用**的观测位
+    //（reasoning 截尾也会置它），所以终态那半截正文到底「有没有被截」必须另开一位：
+    // 复用 `truncatedByCap` 会把「推理截了、正文没截」谎报成「正文被截」。
+    textTruncated: false,
     counters: new Map(), // attempt → 已观测的最大 `client_event_id` 计数（at-least-once 去重）
     terminal: false,
   });
@@ -108,9 +114,11 @@ export function createPartialBuffer({
     const room = textCap - entry[field].length;
     if (room <= 0) {
       entry.truncatedByCap = true; // 上限之后还有内容 ⇒ 这段确实丢了尾巴
+      if (field === 'text') entry.textTruncated = true;
       return;
     }
     if (chunk.length > room) entry.truncatedByCap = true;
+    if (chunk.length > room && field === 'text') entry.textTruncated = true;
     entry[field] += chunk.slice(0, room);
   }
 
@@ -145,6 +153,29 @@ export function createPartialBuffer({
   }
 
   /**
+   * 「这一轮的正文已经 durable 了」（审计第 2 条）：durable `round_end` **插入成功且 COMMIT 之后**
+   * 调（`internal.js` 的写入侧走 `stage().closeRound`，与 `observe` 同一条 COMMIT-后生效口径）。
+   *
+   * 为什么必须清：本槽此后的用途只有一个 —— 终态时写 `run_end.partial_text`，而历史投影读的是
+   * **`round_end.final_text` 拼 `run_end.partial_text`**（`http.js#projectPartialOutputItems`）。
+   * 已完成那一轮的正文此刻**已经在** `round_end.final_text` 里，槽不清空就会在
+   * 「`round_end` 之后、下一轮 `round_start` 之前」被 reaper / offboard / 取消终态化时**再写一遍**
+   * ⇒ 界面上同一轮正文出现两遍（历史投影拼出来就是重复一轮）。
+   *
+   * 清的是**正文**（`text` / `chunks` / 两个截断位），**留着** `round` / `roundSeq` / `reasoning`：
+   *   · 轮号与轮起点 seq 仍是「当前轮」的（下一轮 `round_start` 才会换），补发帧的对账凭据不能瞎；
+   *   · `reasoning` 本来就不按轮清（口径②），也不落库，与本槽的 durable 判据无关。
+   * 清空**不是**「关闭这个 run」：此后到的碎片继续累加（那是 `round_end` **之后**新说的一半，
+   * 库里没有它，正是 `partial_text` 该装的东西），也不会再触发重复。
+   */
+  function closeRoundText(entry) {
+    entry.text = '';
+    entry.chunks = 0;
+    entry.truncatedByCap = false;
+    entry.textTruncated = false;
+  }
+
+  /**
    * 把一条事件的效果**应用到给定 entry**（`observe` 与 `stage().observe` 共用同一份语义——
    * 两份实现就会有两种行为，这是本模块唯一的重用点）。
    * @returns {boolean} 是否**首次观察**（重投 ⇒ false ⇒ 调用方不得再转 SSE，见 M-6①）
@@ -159,6 +190,7 @@ export function createPartialBuffer({
       entry.text = '';
       entry.chunks = 0;
       entry.truncatedByCap = false;
+      entry.textTruncated = false;
     } else {
       const payload = ev.payload && typeof ev.payload === 'object' ? ev.payload : {};
       // `assistant_delta` 与 `reasoning_delta` 的载荷键都由 runner 固定为 `text`
@@ -209,6 +241,8 @@ export function createPartialBuffer({
     roundSeq: entry.roundSeq,
     chunks: entry.chunks,
     truncated: entry.truncatedByCap,
+    // 审计第 3 条：**正文自己的**截断位（`truncated` 是两路共用的观测位，不能拿它写终态）。
+    textTruncated: entry.textTruncated === true,
     sessionId: entry.sessionId,
     terminal: entry.terminal === true,
   });
@@ -270,6 +304,16 @@ export function createPartialBuffer({
         entry.terminal = true;
         staged.set(runId, entry);
       },
+      /** 审计第 2 条：durable `round_end` 之后清正文槽（同样**在 COMMIT 之后**才并进真相）。 */
+      closeRound(runId) {
+        if (typeof runId !== 'string' || runId === '') return;
+        const known = readStaged(runId);
+        if (known === null) return; // 本事务已 drop 它 ⇒ 无槽可清
+        const entry = known ?? (entries.has(runId) ? clone(entries.get(runId)) : null);
+        if (entry === null) return;  // 本 run 根本没进过缓冲 ⇒ 不为此造槽（内存不白涨）
+        closeRoundText(entry);
+        staged.set(runId, entry);
+      },
       drop(runId) {
         if (!entries.has(runId) && !staged.has(runId)) return;
         staged.set(runId, DROPPED);
@@ -296,6 +340,18 @@ export function createPartialBuffer({
   /** 主动丢弃（测试 / 「这段已经不再需要」）。返回是否真删了东西。 */
   function drop(runId) {
     return entries.delete(runId);
+  }
+
+  /**
+   * 立即版的「轮正文已 durable」（与 `stage().closeRound` 同一语义，只是不等 COMMIT）。
+   * 写入侧走的是 `stage()`；这条给测试与「已经确定在事务外」的调用方用。
+   */
+  function closeRound(runId) {
+    const e = entries.get(runId);
+    if (!e) return false;
+    closeRoundText(e);
+    touch(runId, e);
+    return true;
   }
 
   /** 标终态：LRU 优先逐它（`internal.js` 的终态点在 **COMMIT 之后**调）。 */
@@ -329,6 +385,7 @@ export function createPartialBuffer({
     stage,
     snapshot,
     drop,
+    closeRound,
     markTerminal,
     clear,
     sessionRuns,
