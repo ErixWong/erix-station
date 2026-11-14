@@ -261,7 +261,7 @@ export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
  *   `loopsBudgetMs` = 收尾 race 实际拿到的预算 = `总预算 - flushReserveMs`（下限 0）；
  *   `flushReserveConfiguredMs` = 预留的**配置口径**（与 `flushReserveMs` 同值），
  *   `flushReserveEffectiveMs` = **实际切出去**的那一块 = `min(总预算, 配置值)`——两者只在
- *   `预留 >= 总预算` 的退化情形分离（此时日志/对账一律看 effective））
+ *   `预留 > 总预算` 的退化情形分离（相等时两者同值；此时日志/对账一律看 effective））
  */
 export async function gracefulShutdown({
   server,
