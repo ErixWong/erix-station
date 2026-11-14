@@ -1894,3 +1894,108 @@ describe('copilot 验收 E2：被 textCap 截过的快照不得把 flush 已送�
     expect(hooks.onSep.mock.calls.length).toBe(sepBefore);
   });
 });
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **D 条**（261115-01）：旧页回放同样不得回退**轮号**水位
+//
+// 审计第 4 条（261114-05）只给 `observeRoundSeq`（轮**起点 seq**）加了 `olderPage` 保护，
+// 而 `observeRound`（轮**号** → `roundTokenByRun` → `cardIdentity`）仍是无条件写，
+// `case 'round_start'` 又先调它再调 seq 那个 ⇒ 用户往上滚加载更早一页时：
+//   旧页那轮的 `round_start` 把 `roundTokenByRun` 改回**旧轮** ⇒ 之后所有工具卡片
+//   （`cardIdentity` → `roundTokenFor`）都拿错轮号当身份 ⇒ #279 那把身份尺整段失效
+//   （新调用被归到旧轮那张卡上 / 同一轮的两次调用被拆成两种键形状）。
+// 另修一处口径糊账：`observeRoundSeq` 原来把「从未观测」（Map 里没有 = `undefined`）与
+// 「已观测但轮起点未知」（值是 `null`）当成同一种 ⇒ 旧页的有限 seq 能盖掉 `null`，
+// 与它自己注释里「记 null ⇒ 谁都不许盖，宁缺不错」直接矛盾。
+// 观测面：轮号从 `toolCards` 的**键**看（`cardIdentity` 就是那把尺，不测私有 Map）。
+// ---------------------------------------------------------------------------
+describe('copilot 验收 D：旧页回放不得回退轮号水位（roundTokenByRun），且 null ≠ undefined', () => {
+  it('旧页回放同 run 更旧的 round_start ⇒ 卡片身份的轮号段不变（改前会被写成旧页那一轮）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']); // 前置：轮号段确实是 3
+
+    // 用户往上滚 ⇒ 更早一页里同一个 run 的**第一轮**
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 42, run_id: 'r1', tool_call_id: 'c2', name: 'edit', input: {} });
+    expect([...s.toolCards.keys()], '旧页把轮号写回 1 ⇒ 新调用被挂到「第 1 轮」那张卡上')
+      .toEqual(['r1:3:c1', 'r1:3:c2']);
+  });
+
+  it('首屏历史重建（initial）同一情形 ⇒ 轮号照旧被写进去（别把首屏也改坏）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']);
+
+    // 同一条事件走缺省 `'initial'` = 首屏重建面：那时没有「正在流的一段」要护，照旧照单写
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } });
+    lastES().emit('tool_use', { seq: 42, run_id: 'r1', tool_call_id: 'c2', name: 'edit', input: {} });
+    expect([...s.toolCards.keys()], '首屏口径一个字都不许被 D 条改掉').toEqual(['r1:3:c1', 'r1:1:c2']);
+  });
+
+  it('旧页里含**更新**的同 run round_start（seq 与轮号都更大）⇒ 照旧接受（不能一刀切拒绝）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    // 旧页里居然有一条更新的（例如本页跨到了下一轮，或实时漏收过一条 round_start）
+    s.replayEvent({ seq: 50, run_id: 'r1', type: 'round_start', payload: { round: 5 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 51, run_id: 'r1', tool_call_id: 'c9', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()], '轮号必须跟到 5（D 条只挡「更旧 / 脏」，不是「旧页一律不要」）')
+      .toEqual(['r1:5:c9']);
+    // 轮**起点 seq** 水位同步跟上 ⇒ 第 5 轮的快照仍被双闸接受
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 50, text: '第五轮的正文', chunks: 2, source: 'memory' });
+    expect(s.deltaText.value).toBe('第五轮的正文');
+  });
+
+  it('轮起点 seq 记成 null 时旧页的有限 seq **不得写**（已观测但未知 = 谁都不许盖）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { round: 2, run_id: 'r1' }); // 脏帧：没有 seq ⇒ 记 null
+    lastES().emit('assistant_delta', { run_id: 'r1', text: '当前这段正文' });
+    // 旧页拿来一条**有限**的 seq：改前 `cur !== null && cur !== undefined` 把 null 当成「没水位」放行
+    s.replayEvent({ seq: 9, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 9, text: '拿旧页的号来硬对', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value, 'null 是「谁都不许盖」，不是「随便谁来填」').toBe('当前这段正文');
+  });
+
+  it('该 run 从未观测（undefined）⇒ 旧页的有限 seq 照旧写得进去（初始重建面）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r-never';
+    s.connect('sess-1');
+    s.replayEvent({ seq: 9, run_id: 'r-never', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('partial_output', { run_id: 'r-never', roundSeq: 9, text: '写得进去', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value).toBe('写得进去');
+    // 轮号同理：从未观测 ⇒ 旧页的轮号也写得进去（卡片身份拿得到轮号总比 `?` 好）
+    lastES().emit('tool_use', { seq: 10, run_id: 'r-never', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r-never:1:c1']);
+  });
+
+  it('轮号已观测但未知（`?`）⇒ 旧页的有限轮号**不得写**（与 seq 的 null 同一口径）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, run_id: 'r1' }); // 有 seq、没 round ⇒ 轮号记 `?`
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()], '已观测过这个 run ⇒ 旧页那个 1 多半是更旧的一轮，宁缺不错')
+      .toEqual(['r1:c1']);
+  });
+
+  it('`attempt` 也在旧页回放里 ⇒ 同一口径（不得把轮号写成旧页那一轮的）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    s.replayEvent({ seq: 5, run_id: 'r1', type: 'attempt', payload: { round: 1, attempt: 2, maxAttempts: 3 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']);
+  });
+});
