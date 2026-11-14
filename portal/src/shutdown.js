@@ -33,6 +33,61 @@ function safeTimeoutMs(value) {
   return Math.min(ms, MAX_SHUTDOWN_TIMEOUT_MS);
 }
 
+// ---------------------------------------------------------------------------
+// 退出前把日志刷下去（issue #506 copilot **第三轮复审①**）
+// ---------------------------------------------------------------------------
+//
+// 缺陷形状：`gracefulShutdown` 在「总 deadline 获胜且仍有循环 pending」时，记完 warn 与汇总就
+// `exit(0)`。两个后果：
+//   1. `process.exit()` **不保证**已经排队的 stdout/stderr 写入落到 fd 上。生产里 stdout/stderr
+//      是**管道**（compose / k8s 的日志驱动），管道上的写入是异步的 ⇒ 恰好在最需要看日志的那一次，
+//      那条 warn 与汇总行可能被截断。
+//   2. 同一条路径上在途的 DB 事务被强断 ⇒ 整笔回滚，或留下带 `lease_until` 的 `processing` 行。
+//
+// 修法只有一件事：**exit 前先刷一次**（对每个 stream `write('', cb)` 等回调，带超时；**超时也照样
+// 退**）。第 2 条不在这里治：**预算就是预算**，超了就不再等——残留的 `processing` 行由 `lease_until`
+// 到期后的**既有**孤儿回收接管（那是仓库里早就有的机制，不是这条修改新增的承诺）。改成「为了等事务
+// 而延长 deadline / 给 exit 加长超时」会把 #506 最初的缺陷（关闭没有上限）原样放回去。
+
+/** 刷日志的默认上限：够把已排队的几行推到 fd（实测本机管道上 `write('', cb)` ≈2ms），又不至于拖住退出。 */
+export const FLUSH_LOGS_TIMEOUT_MS_DEFAULT = 250;
+
+/**
+ * 对每个流写一个**空 chunk**（不产生任何输出，只是把该流上已排队的写入推到 fd）并等回调；
+ * 每个流各自带超时，**超时/抛错都算刷过**（日志是尽力而为，不是控制流）。
+ * @param {{ timeoutMs?: number, streams?: Array<{ write: (chunk: string, cb: () => void) => unknown }> }} [opts]
+ * @returns {Promise<{attempted: number, flushed: number, stuck: number, elapsedMs: number}>} 给日志与单测看的账
+ */
+export function flushLogs({
+  timeoutMs = FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
+  streams = [process.stdout, process.stderr],
+} = {}) {
+  const list = (Array.isArray(streams) ? streams : [streams]).filter((s) => s && typeof s.write === 'function');
+  const limit = safeTimeoutMs(timeoutMs);
+  const startedAt = Date.now();
+  const one = (stream) => new Promise((resolve) => {
+    let done = false;
+    let timer = null;
+    const finish = (flushed) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer); // 刷日志的 timer 不许反过来拖住退出（与收尾 timer 同一口径，故意不 unref）
+      resolve(flushed);
+    };
+    // timer **先建**再 write：注入的假 stream 会**同步**回调，先 write 就会留下一个清不掉的悬空 timer。
+    timer = setTimeout(() => finish(false), limit);
+    try {
+      stream.write('', () => finish(true));
+    } catch {
+      finish(false); // 流自己坏了（EPIPE、已 destroy）⇒ 认了，不许挡住 exit
+    }
+  });
+  return Promise.all(list.map(one)).then((flags) => {
+    const flushed = flags.filter(Boolean).length;
+    return { attempted: list.length, flushed, stuck: flags.length - flushed, elapsedMs: Date.now() - startedAt };
+  });
+}
+
 /**
  * @typedef {object} LoopHandle
  * @property {() => void} [stop] 停循环（要求幂等；抛错被接住，不影响其余循环）
@@ -122,17 +177,18 @@ export async function stopLoopsAndWait(loops, { timeoutMs = 5000, log = console 
 //      超了就是 SIGKILL（连 warn 都来不及看，比有超时更糟）。
 //
 // 于是顺序改成：**先 `server.close()`（发起即返回，不等回调）→ 等循环收尾 → 在剩余总预算里等
-// server 关完 → `exit(0)`**，并给**整个流程**一个总上限 `SHUTDOWN_TOTAL_MS`（默认 8000，留 2s 给
-// exit 与 compose 宽限期）。到点无论收没收完都退出，并 warn 点名还没退的循环。
+// server 关完 → 刷日志 → `exit(0)`**，并给**整个流程**一个总上限 `SHUTDOWN_TOTAL_MS`（默认 8000，剩下
+// ~2s 给刷日志、exit 与 compose 宽限期）。到点无论收没收完都退出，并 warn 点名还没退的循环。
 // `server.close` 不放第一位的话，那 5s 就白等；总上限不覆盖 server.close 的话，第 2 条照旧。
 
 /** 等循环收尾的默认上限（旧的那个 5s，语义不变）。 */
 export const SHUTDOWN_LOOPS_MS_DEFAULT = 5000;
-/** 整个关闭流程的总上限：5s 循环 + 3s server 关闭，另留 ~2s 给 exit（compose 默认 10s 宽限期）。 */
+/** 整个关闭流程的总上限：5s 循环 + 3s server 关闭，另留 ~2s 给刷日志与 exit（compose 默认 10s 宽限期）。 */
 export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
 
 /**
- * 编排一次优雅关闭：停接新连接 → 等循环收尾 → 等 server 关完 → 退出。**始终在总上限内返回/退出**。
+ * 编排一次优雅关闭：停接新连接 → 等循环收尾 → 等 server 关完 → **刷日志** → 退出。**始终在总上限内返回/退出**
+ * （刷日志用的是留给 exit 的那部分余量，不延长总上限）。
  * @param {object} opts
  * @param {{ close: (cb: (err?: Error | null) => void) => unknown }} [opts.server] HTTP server（假对象可注入）
  * @param {Array} [opts.loops] 循环句柄，原样转交 `stopLoops`
@@ -141,9 +197,13 @@ export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
  * @param {object} [opts.log]
  * @param {(code: number) => void} [opts.exit] 默认 `process.exit`（测试注入 spy，否则用例自己被杀掉）
  * @param {(loops: Array, o: object) => Promise<object>} [opts.stopLoops] 默认 `stopLoopsAndWait`
+ * @param {(o: object) => Promise<object>} [opts.flush] 默认 `flushLogs`：exit 前把已排队的日志推到 fd（第三轮复审①）
+ * @param {number} [opts.flushTimeoutMs] 刷日志的上限（默认 `FLUSH_LOGS_TIMEOUT_MS_DEFAULT`；超时也照样 exit）
+ * @param {Array} [opts.logStreams] 注入点：要刷的流（缺省交给 `flushLogs` 自己取 stdout/stderr）
  * @returns {Promise<{sequence: string[], elapsedMs: number, timedOut: boolean, exitCode: number,
  *                    loops: object | null, pendingLoops: string[], serverCloseStarted: boolean,
- *                    serverClosed: boolean, totalTimeoutMs: number, loopTimeoutMs: number}>}
+ *                    serverClosed: boolean, totalTimeoutMs: number, loopTimeoutMs: number,
+ *                    flush: object | null}>}
  */
 export async function gracefulShutdown({
   server,
@@ -153,6 +213,9 @@ export async function gracefulShutdown({
   log = console,
   exit = (code) => process.exit(code),
   stopLoops = stopLoopsAndWait,
+  flush = flushLogs,
+  flushTimeoutMs = FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
+  logStreams,
 } = {}) {
   const warn = (msg) => { try { log?.warn?.(msg); } catch { /* 日志不是控制流 */ } };
   const startedAt = Date.now();
@@ -237,10 +300,14 @@ export async function gracefulShutdown({
   };
 
   if (timedOut) {
+    // 残留是**显式接受**的，不是漏掉了：到点就不再等（预算就是预算），剩下的在途事务随进程退出回滚，
+    // 已认领的 `processing` 行带着 `lease_until` 躺在那儿，由**既有的**孤儿回收（租约到期后接管）捞回。
+    // 另：下面 exit 前会先 `flushLogs`，否则这条 warn 在管道上自己被截断（第三轮复审① 的第一半）。
     warn(`[shutdown] 关闭流程超过总上限 ${totalBudgetMs}ms（已用 ${elapsedMs}ms）仍没收尾：`
-      + `还没退的循环 ${pendingLoops.join(', ') || '（无：要么都退了，要么本来就不带 done）'}`
+      + `还有 ${pendingLoops.length} 个循环没退（${pendingLoops.join(', ') || '无名'}）`
       + (serverClosed ? '' : '；HTTP server 也没关完（SSE 是 keep-alive，close 只停接新连接、要等既有连接自己结束）')
-      + '。直接 process.exit(0)——再等下去就撞上 compose/k8s 默认 10s 宽限期 ⇒ SIGKILL。');
+      + '。不再等，直接 process.exit(0)——再等下去就撞上 compose/k8s 默认 10s 宽限期 ⇒ SIGKILL。'
+      + '残留已知：在途事务会回滚，已认领的行会带着 lease_until 租约等着，由既有的孤儿回收（租约到期后）接管。');
   }
   const loopWaited = loopsReport?.waited ?? 0;
   const loopSkipped = loopsReport?.skipped ?? 0;
@@ -253,7 +320,21 @@ export async function gracefulShutdown({
       + ` ⇒ 用时 ${elapsedMs}ms / 总上限 ${totalBudgetMs}ms${timedOut ? '（到点强退）' : ''}`);
   } catch { /* 日志坏了也要退 */ }
 
-  // 第 4 步：无论收没收完都退（`exit` 默认就是 `process.exit` ⇒ 后面那行 return 在生产里执行不到）
+  // 第 4 步：**先刷日志，再 exit**（copilot 第三轮复审①）。
+  // 为何必须：`process.exit()` 不等已经排队的 stdout/stderr 写入落盘，而生产里它们就是**管道**
+  // ⇒ 上面那条 warn（以及汇总行）可能在到点强退那一次里被截断。deadline 路径与正常路径**都**走这里。
+  // 它用的是留给 exit 的那 ~2s 余量的一小段（默认 250ms），**不是**把总上限延长；刷不到也照样退。
+  sequence.push('flushLogs');
+  let flushReport = null;
+  try {
+    flushReport = await flush({ timeoutMs: flushTimeoutMs, ...(logStreams ? { streams: logStreams } : {}) });
+  } catch (err) {
+    // 刷日志自己炸了不许把 exit 挡掉（日志不是控制流）
+    warn(`[shutdown] 退出前刷日志失败（忽略，照样 exit）：${err?.message ?? err}`);
+  }
+  report.flush = flushReport;
+
+  // 第 5 步：无论收没收完都退（`exit` 默认就是 `process.exit` ⇒ 后面那行 return 在生产里执行不到）
   exit(report.exitCode);
   return report;
 }
