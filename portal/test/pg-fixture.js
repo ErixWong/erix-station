@@ -88,7 +88,7 @@ export async function acquireBootstrapLock({
  *
  * @param {string} adminUrl 注入的 `TEST_DATABASE_URL`（超级用户）
  * @param {(ctx: {database: string, url: string, pool: object|null, dbUrl: Function, adminPool: object}) => any} fn
- * @param {{prefix?: string, migrate?: boolean, poolMax?: number, log?: Function}} [opts]
+ * @param {{prefix?: string, migrate?: boolean, migrateImpl?: Function, poolMax?: number, log?: Function}} [opts]
  *        `migrate: false` ⇒ 只建库不迁移（`migrate-fresh-db.test.js` 要自己控制迁移身份/多次跑）
  * @param {{prefix?: string, lockFile?: string,
  *   createDatabase?: (name: string) => Promise<unknown>,
@@ -119,7 +119,11 @@ export function createPgFixture(adminUrl, {
   }
 
   async function withFreshDatabase(fn, opts = {}) {
-    const { migrate: runMigrate = true, poolMax = 2, log = () => {} } = opts;
+    // copilot 验收 #513 的 **H 条**：`migrateImpl` 是**迁移的注入点**（与 `createDatabase` /
+    // `dropDatabase` 同一类用途）。存在的唯一理由：`migrate` 原来只有「跑 or 不跑」两个值，
+    // 于是夹具测试里那条标题写着「migrate 抛错」的用例其实传的是 `{ migrate: false }` ——
+    // 迁移失败路径**一次都没测过**。给了注入点才能真喂一个会抛的迁移。
+    const { migrate: runMigrate = true, migrateImpl = migrate, poolMax = 2, log = () => {} } = opts;
     const name = `${prefix}_${crypto.randomBytes(4).toString('hex')}`;
     // 锁覆盖「CREATE DATABASE → bootstrap/migrate → 用例体 → DROP DATABASE」整段：
     // 要串的正是集群级角色 DDL，而用例体里也可能再发（migrate-fresh 的 ALTER/CREATE ROLE）。
@@ -140,13 +144,26 @@ export function createPgFixture(adminUrl, {
       if (runMigrate) {
         // baseline(schema.sql) → bootstrap.sql → 全部增量。
         pool = createPool(url, { max: poolMax });
-        await migrate(pool, { env: { DATABASE_URL: url }, log: { log } });
+        await migrateImpl(pool, { env: { DATABASE_URL: url }, log: { log } });
       }
       return await fn({ database: name, url, pool, dbUrl, adminPool });
     } finally {
-      if (pool) await pool.end().catch(() => {});
-      await dropDb(name).catch(() => {});
-      release();
+      // copilot 独立验收 #513 的 **H 条**：`dropDb` 是**注入点**，而 `fn.catch` 只能接住
+      // **返回 Promise 的拒绝** —— 注入一个**同步抛错**（或返回非 Promise 又在其后炸）的实现时，
+      // 异常在 `.catch` 挂上之前就离开这条 async 链 ⇒ `release()` 被跳过 ⇒ 泄锁（症状还是那个
+      // 「后面所有真库用例卡在锁上十分钟」）。所以清理三步各自独立 `try/catch`，
+      // 并把 `release()` 兜在**最外层 finally**：上面两条腿无论怎么炸（同步抛 / 异步拒 / 连
+      // `.catch` 自己抛）它都必然执行。
+      try {
+        try {
+          if (pool) await pool.end();
+        } catch { /* 池子关不掉也要往下删库 */ }
+        try {
+          await dropDb(name);
+        } catch { /* 删库失败也不能吃掉释放 */ }
+      } finally {
+        release();
+      }
     }
   }
 
