@@ -297,6 +297,23 @@ function partialTruncated(payload: Record<string, unknown> | undefined): boolean
 }
 
 /**
+ * copilot 最终验收 261115-01 第三轮的 **①**：**「这段正文的 run 身份未知」只有一个判据**。
+ *
+ * 这条链路上「不知道正文属于哪个 run」有**两种字面写法**，两者语义相同、值不同：
+ *   · `null` —— 帧里根本没带 `run_id`（`useEventStream` 的归一化：`typeof d.run_id === 'string' && d.run_id !== '' ? … : null`）；
+ *   · `'unknown'` —— `addPartialOutput` 的哨兵（`run_id` 缺失/脏值时条目 `id` 退化成 `partial:unknown`），
+ *     它会经 `es.deltaRunId`／`es.activeRunId` 落到 `deltaEntry.runId` 上（服务端真发了一帧 `run_id:'unknown'` 就够）。
+ *
+ * 改前两处判据**各拿一把尺**：`claimedLater` 只认 `null`（`deltaEntry.runId == null`），`sameRun` 却把
+ * `'unknown'` 当通配（`deltaOwner === 'unknown'`）⇒ 「出生身份 = `'unknown'`」这种**已知的未知**从
+ * `claimedLater` 漏下去、又被 `sameRun` 的通配放行 ⇒ **可能撤掉别人的气泡**（#513 E 条要防的形状，
+ * 换了个哨兵值回来）。现在两边共用这一个判据，**不再出现 `=== null` / `=== 'unknown'` 混用**。
+ */
+function isUnknownOwner(v: unknown): boolean {
+  return v == null || v === 'unknown';
+}
+
+/**
  * 试用台账 #10：分页游标消毒——只认正安全整数，其余（缺失/null/脏值/非整数）一律 null
  * （= 按「没有更早」处理，宁可少一个入口按钮，不拿脏值去发必然 400 的 cursor 请求）。
  */
@@ -642,7 +659,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //
     // 身份口径（两把尺：文本 + run）：
     //   · `deltaEntry.runId` 是这段气泡出生时那一帧的 `run_id`（watcher 里钉的，见 `deltaEntry` 旁）；
-    //   · 未知（`null`，旧后端帧没有 `run_id`）⇒ 退回旧口径「只比文本」，不拿未知去否定已知——
+    //   · **未知**（`null` 或 `'unknown'` 哨兵 ⇒ 见 `isUnknownOwner`）⇒ 退回旧口径「只比文本」，不拿未知去否定已知——
     //     否则旧后端下重复气泡再也撤不掉（同一段正文两遍，那是 #502 判据 4 的红线）；
     //   · 已知且**不等于**这条 partial 的 run ⇒ 那是别人的气泡，一个字都不许动。
     // `removeDeltaEntry()` 的幂等性不变（它仍只靠 `deltaEntry` 单指针找下标，这里只是在**调它之前**
@@ -674,11 +691,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //     一致，撤掉的就是它自己那一份，不存在把别人的气泡抹掉的风险；
     //   · 整条链路**一个 run 身份都没拿到**（真·旧后端，既有那条「身份未知 ⇒ 照旧撤」用例钉的
     //     就是这一档）⇒ 退回只比文本。
+    //
+    // copilot 第三轮**最终验收**的 **①**（小·语义定死，紧接上面那条之后）：上面这三档原来**只认 `null`**，
+    // 而 `sameRun` 认的是 `null` **和** `'unknown'` ⇒ `'unknown'` 这个哨兵一身二职、两条判据读成两样：
+    //   · A 档（`deltaEntry.runId === null` + 具体 `laterOwner`）⇒ `claimedLater` 真 ⇒ 不撤（保守，可能两遍）；
+    //   · B 档（`deltaEntry.runId === 'unknown'` + 具体 `laterOwner`）⇒ `deltaEntry.runId == null` **假**
+    //     ⇒ `claimedLater` 假，而 `sameRun` 因 `'unknown'` 通配为真 ⇒ **撤掉别人的气泡**（这条是真风险）。
+    // 现在两边同一个 `isUnknownOwner`，B 档落进 A 档那一侧。**策略（定死，别再改回去）**：partial 自己的
+    // `runId` 是 `'unknown'`（服务端没给 `run_id`）时，任何**具体** `laterOwner` 都不等于它 ⇒ 一律保守**不撤**。
+    // **代价**：这种载荷下同一段正文可能在界面上出现两遍（delta 气泡 + 中性气泡）。
+    // **理由**：身份缺失时前端分不出「同一份正文的两种存在方式」与「两份恰好同文的正文」，而撤错的代价
+    //（用户正在看的那段字凭空消失）比多一行的代价大 —— 多一行刷新即回，撤错的那段字看不见。
     const laterOwner = es.deltaRunId.value ?? null;
-    const claimedLater = deltaEntry !== null && deltaEntry.runId == null
-      && laterOwner !== null && laterOwner !== runId;
+    // 三个条件缺一就退化成撤错：气泡身份**未知** + 后来出现了**具体**身份 + 那个具体身份**不是**这条 partial 的 run。
+    const claimedLater = deltaEntry !== null && isUnknownOwner(deltaEntry.runId)
+      && laterOwner !== null && !isUnknownOwner(laterOwner) && laterOwner !== runId;
     const sameRun = !claimedLater
-      && (deltaOwner === null || deltaOwner === 'unknown' || runId === 'unknown' || deltaOwner === runId);
+      && (isUnknownOwner(deltaOwner) || isUnknownOwner(runId) || deltaOwner === runId);
     if (sameRun && es.deltaText.value === text) {
       removeDeltaEntry();
       es.deltaText.value = null;
