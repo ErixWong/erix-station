@@ -455,6 +455,27 @@ test('#502 迁移 0033：分批清存量可重放（第二遍 0 行 rc=0）、�
   });
 });
 
+/**
+ * 难压缩的**确定性**伪随机正文（copilot 验收 #513 的 I 条）。
+ *
+ * 为什么必须是「难压缩」：`run_checkpoints.snapshot` 是 jsonb ⇒ 大值走 TOAST 并默认压缩，
+ * 于是 `'x'.repeat(53_000)` 这种「字符数很多、信息量几乎没有」的种子在磁盘上只有几 KB，
+ * 「每行字节 / 总字节」两条上界量的根本不是同一件事（实测见体积闸那条用例的注释）。
+ * 为什么必须**确定性**：这条闸的数字要能被复算（`Math.random()` 让每次量出来的上界都不同，
+ * 下次红了没人知道是该信还是该改阈值）。
+ * 形状：`sha256(<行号>:<块号>)` 的 base64 串接（64 字母表 ≈ 每字符 6 bit 信息量，pglz/lz4
+ * 都压不动），截到目标长度。同一行号永远得到同一个串。
+ */
+function hardCompressible(rowIndex, targetChars = 53_000) {
+  let out = '';
+  let block = 0;
+  while (out.length < targetChars) {
+    out += crypto.createHash('sha256').update(`${rowIndex}:${block}`).digest('base64');
+    block += 1;
+  }
+  return out.slice(0, targetChars);
+}
+
 test('#502 体积闸：`run_events` 每行字节上界 + 碎片占比 < 5 %；`run_checkpoints` 每行 / 总行数 / 总字节三条上界（样本必须非空）', { skip: SKIP }, async () => {
   await withFreshDb(async (pool) => {
     // 先造一份**清理之后**的真实形状（空库量出来的每行字节是页常数，什么都不是；行数太少时
@@ -497,8 +518,25 @@ test('#502 体积闸：`run_events` 每行字节上界 + 碎片占比 < 5 %；`r
     // + revision CAS 一起验了（自己 INSERT 就只能验「页常数没超标」）。
     // `run_checkpoints.run_id` 是主键且外键指 `runs` ⇒ 每条 checkpoint 要挂在一个真 run 上。
     const CP_ROWS = 10;          // 种 10 行（与 dev 库的 85 行同量级下界，够把每行字节从页常数里分出来）
-    const CP_ROWS_CAP = 20;      // 总行数上界：夹具只种 10 条 ⇒ 任何「顺带多写」（每轮一行 / 每事件一行）都会顶到
-    const CP_TOTAL_BYTES_CAP = 4 * 1024 * 1024; // 10 行 × 53 KB ≈ 0.5 MB 实占 ⇒ 4 MB 是 8 倍余量；行数翻十倍同时破两条
+    // ---- 三条上界全部**先量后定**（copilot 验收 #513 的 I 条；上一版是拍脑袋的 4 MiB）----
+    // 实测（本文件这条用例，一次性 postgres:16.15 容器，`hardCompressible` 种子，10 行）：
+    //     n=10  total=630,784 B  per_row=63,078 B
+    //  同一套夹具把种子换回 `'x'.repeat(53_000)` ⇒ total=**40,960 B**（4,096 B/行；jsonb 走 TOAST
+    //  压缩，压缩比 ≈13:1。主 agent 在裸表上另量到 32,768 B，同一件事的两个读数，差异在表自身的
+    //  索引/页布局，不影响结论）。于是旧那两条上界与「10 行 ≈ 0.5 MB」那句注释：
+    //    · 每行 512 KiB 对上 4,096 B/行 = **128 倍**余量；对上现在这个 63,078 B/行也还有 8.3 倍；
+    //    · 总量 4 MiB 对上 40,960 B = **102 倍**余量；对上现在这个 630,784 B 也还有 6.6 倍；
+    //  ⇒ 旧闸在**任何**种子下都抓不到「复长」（行数翻十倍、每行翻倍都没事），这就是 I 条。
+    // 上界取实测的 ~1.9 倍：既留出走形变动的余量（引擎 state 本来就会漂），又不至于
+    // 「行数翻十倍也没人看见」。改种子 = 改数字，注释里这两行数字必须一起改。
+    const CP_ROWS_CAP = 20;             // 总行数上界 = 种行数 × 2：夹具只种 10 条 ⇒ 「顺带多写」立刻顶到
+    const CP_ROW_BYTES_CAP = 120_000;   // 每行上界 ≈ 实测 63,078 B × 1.9
+    const CP_TOTAL_BYTES_CAP = 1_200_000; // 总字节上界 ≈ 实测 630,784 B × 1.9
+    // **种子自证（新增，也是这条闸的「别把上界静默改松」保险）**：总量必须 ≥ 实测的 ~0.7 倍。
+    // 为什么单独要一条：上面三条都是「别太大」，谁都没有问「样本够不够大」。有人（有意或顺手）
+    // 把种子换回 `'x'.repeat(53_000)` 时，实占会从 630 KB 掉回 40 KB ⇒ 三条上界**全都不会红**，
+    // 闸只是悄悄变松。这一条会**先红**，并且红话说清「是种子退化，不是数据复长」。
+    const CP_TOTAL_BYTES_FLOOR = 450_000; // 实测 630,784 B × 0.7 ≈ 441 KB（取整）
     // ⚠ 每个 checkpoint 要**自己的一套 scene**：`seedRunScene` 里每个 id 都是 uuid，
     // 拿已经种过的 `volScene` 再种一遍就是 `duplicate key value ... "users_pkey"`（真踩过）。
     const cpScenes = [];
@@ -508,8 +546,13 @@ test('#502 体积闸：`run_events` 每行字节上界 + 碎片占比 < 5 %；`r
       const live = await claimAndStart(pool, scene);
       await putCheckpoint(pool, {
         container: live.container, user: live.user, runId: scene.runId, claimToken: live.claimToken,
-        // `snapshot` 必须是对象（`putCheckpoint` 会验）；给一个 ≈ 53 KB 的引擎 state 形状
-        body: { revision: 1, snapshot: { round: i + 1, messages: 'x'.repeat(53_000) } },
+        // `snapshot` 必须是对象（`putCheckpoint` 会验）；给一个 ≈ 53 KB 的引擎 state 形状。
+        // copilot 独立验收 #513 的 **I 条**（261115-01）：种子原来是 `'x'.repeat(53_000)`，而
+        // `snapshot` 是 **jsonb** ⇒ 走 TOAST 压缩 ⇒ 10 行实际只占 **32 KB**（实测见下面注释），
+        // 于是「10 行 ≈ 0.5 MB」与 4 MiB 的上界**松了约 130 倍**，这条闸抓不到任何复长。
+        // 换成**难压缩的确定性伪随机**内容（sha256-base64 串接，按行号派生 ⇒ 可复现，
+        // 不用 `Math.random()`，失败重跑量出来的数字还是同一个）。
+        body: { revision: 1, snapshot: { round: i + 1, messages: hardCompressible(i) } },
       });
     }
     const cp = await pool.query(
@@ -517,15 +560,28 @@ test('#502 体积闸：`run_events` 每行字节上界 + 碎片占比 < 5 %；`r
     );
     const cn = cp.rows[0].n;
     const cb = Number(cp.rows[0].sz);
+    // 复量开关：`STATION_MEASURE_CP=1 node --test portal/test/delta-not-persisted-db.test.js`
+    // ⇒ 把这次量到的读数打到 stderr。上面那三条上界就是这么定下来的（**先量后定**），
+    // 以后改种子/改形状也用它重量一遍再改数字，别拿新的拍脑袋值替换旧的拍脑袋值。
+    if (process.env.STATION_MEASURE_CP) {
+      console.error(`MEASURE_CP n=${cn} total=${cb} per_row=${Math.round(cb / Math.max(cn, 1))}`);
+    }
     // **反向自证（空样本不得静默通过）**：种了多少行就必须拿到多少行。
     // 拿不到（0 行 / 少于预期）就是**本用例红**，而不是「跳过断言继续绿」——那正是审计第 9 条的形状。
     assert.equal(cn, CP_ROWS,
       `样本必须是 ${CP_ROWS} 行（审计第 9 条：0 行时旧写法会把恒真的「cb >= 0」当成读数）：实拿 ${cn} 行`);
-    assert.ok(cb / cn < 512 * 1024, `run_checkpoints 每行字节上界破了：${Math.round(cb / cn)} B/行（${cn} 行 / ${cb} B）`);
+    assert.ok(cb / cn < CP_ROW_BYTES_CAP,
+      `run_checkpoints 每行字节上界破了：${Math.round(cb / cn)} B/行 > ${CP_ROW_BYTES_CAP}（${cn} 行 / ${cb} B）`
+      + ' —— 引擎 state 走形或快照没折叠都会先撞这里；数字来历见上面的实测注释');
     assert.ok(cn <= CP_ROWS_CAP,
       `run_checkpoints 总行数上界破了（新增，防「行数翻十倍但每行不变」这种复长）：${cn} > ${CP_ROWS_CAP}`);
     assert.ok(cb <= CP_TOTAL_BYTES_CAP,
       `run_checkpoints 总字节上界破了（新增）：${cb} B > ${CP_TOTAL_BYTES_CAP} B（${cn} 行 × 约 ${Math.round(cb / cn)} B/行）`);
+    // 种子自证（见上面的 `CP_TOTAL_BYTES_FLOOR`）：**先红的是这条，不是上面那三条**。
+    assert.ok(cb >= CP_TOTAL_BYTES_FLOOR,
+      `种子不够大了：10 行 checkpoint 只占 ${cb} B（阈值 ${CP_TOTAL_BYTES_FLOOR} B，实测形状 ≈ 630,784 B）。`
+      + '要么种子被换回了可压缩内容（`repeat(x)` 这类，TOAST 一压就没了 ⇒ 上面三条上界全部静默变松），'
+      + '要么 jsonb/TOAST 口径变了 —— 两种都得改代码，不能只把这条阈值调小。');
     assert.ok(cb >= 0, '两张表都要各自给出读数（体积闸不许只量一张）');
   });
 });
