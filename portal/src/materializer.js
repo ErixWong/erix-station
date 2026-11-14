@@ -514,8 +514,50 @@ function removeStaleFiles(prevFiles, desiredContainerPaths, root, fdeName, log) 
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MAX_ATTEMPTS = 5;
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// issue #506（空闲退避）：与 routes.js 同一形状、同一价。旧代码固定 `sleep(250)` 且 `BACKOFF_MS`
+// 只服务异常分支 ⇒ 平台完全空闲时两个循环仍各 4 拍/秒，每拍 4~5 条语句（2026-11-14 实测：
+// 空闲态 26.4 事务/秒、64.2 次表扫/秒）。本循环的 `runMaterializerOnce` **本来就**返回
+// `{ processed, claimed }`，所以这里的退避信号直接用 `claimed`（= 本次认领了几行）。
+// 旋钮：MATERIALIZE_IDLE_BACKOFF_MAX_MS（默认 2000）/ MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS（默认 10000）。
+// 没动（红线）：认领 SQL 语义、`lease_until` 租约、revision head / latest-wins 与失败重试状态机。
+const IDLE_TICK_MS = 250;
+const IDLE_BACKOFF_MAX_MS_DEFAULT = 2000;
+const ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT = 10000;
+
+/** 正整数 env（非法值回落默认——旋钮写错不许把 reconciler 打挂）。 */
+function envInt(name, fallback) {
+  const n = Number.parseInt(String(process.env[name] ?? '').trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * issue #506：第 `idleTicks` 个**连续空闲拍**该等多久。`idleTicks = 0` 表示上一拍认领到了活
+ * ⇒ 回基准 250ms；否则 250 起指数翻倍、夹在 `maxMs`（默认 2000）。
+ * 导出的理由：判据是「退避真的发生」，阶梯必须能被直接读出而不是靠间接推。
+ */
+export function idleDelayMs(idleTicks, maxMs = IDLE_BACKOFF_MAX_MS_DEFAULT) {
+  if (!(idleTicks > 0)) return IDLE_TICK_MS;
+  return Math.min(IDLE_TICK_MS * 2 ** (idleTicks - 1), Math.max(IDLE_TICK_MS, maxMs));
+}
+
+/**
+ * issue #506：可中断 sleep —— `stop()` 不许再等满一个退避窗口（旧代码退避到 2s 时，优雅关闭
+ * 最多要白等 2s，测试里也会挂住）。resolve(true)=睡满了，resolve(false)=被 abort。
+ * @param {number} ms @param {AbortSignal} [signal]
+ */
+export function sleepCancellable(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve(false);
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 async function readFdeDesiredState(pool, fdeId, config) {
@@ -693,34 +735,52 @@ export async function rebuildAllFdes(pool, config, { log = console } = {}) {
 }
 
 /** 启动一个常驻消费循环（由 cli serve 调用）。 */
-export function startMaterializerLoop(pool, config, { log = console, workerId = 'materializer-1', onPause } = {}) {
-  let stopped = false;
+export function startMaterializerLoop(pool, config, {
+  log = console,
+  workerId = 'materializer-1',
+  onPause,
+  // issue #506 旋钮与可测缝：生产不传 ⇒ 真 setTimeout / Date.now / env 默认值。
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+  idleBackoffMaxMs = envInt('MATERIALIZE_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT),
+  orphanRecoveryIntervalMs = envInt('MATERIALIZE_ORPHAN_RECOVERY_INTERVAL_MS', ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT),
+} = {}) {
   let consecutiveFailures = 0;
-  (async () => {
+  let idleTicks = 0;                                 // 连续认领 0 行的拍数；认领到活就清 0
+  let lastOrphanRecoveryAt = Number.NEGATIVE_INFINITY; // 首拍必跑（保留原语义：启动就回收孤儿）
+  const abort = new AbortController();
+  const done = (async () => {
     // 启动全量重物化（幂等：内容不变不重写，user-space §8.1）。
     try {
       await rebuildAllFdes(pool, config, { log });
     } catch (err) {
       log.warn?.(`[materializer] startup rebuild failed: ${err.message}`);
     }
-    while (!stopped) {
+    while (!abort.signal.aborted) {
       try {
-        await recoverMaterializeOrphans(pool);
-        await runMaterializerOnce(pool, config, { log, workerId });
+        // #506：孤儿回收是一条与「本轮有没有活」无关的 UPDATE ⇒ 独立节拍（默认 10s）。
+        const tickAt = now();
+        if (tickAt - lastOrphanRecoveryAt >= orphanRecoveryIntervalMs) {
+          await recoverMaterializeOrphans(pool);
+          lastOrphanRecoveryAt = tickAt;
+        }
+        const { claimed = 0 } = await runMaterializerOnce(pool, config, { log, workerId });
         consecutiveFailures = 0;
-        await sleep(250);
+        idleTicks = claimed > 0 ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, idleBackoffMaxMs), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[materializer] loop error: ${err.message}`);
         onPause?.('materializer', err);
         const backoff = BACKOFF_MS[Math.min(consecutiveFailures - 1, BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
   return {
     stop() {
-      stopped = true;
+      abort.abort(); // 可中断：否则退避到 2000ms 时优雅关闭要白等 2s
     },
+    done, // 循环真正退出时 resolve（优雅关闭与单测可 await）
   };
 }
