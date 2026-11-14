@@ -5184,3 +5184,49 @@ Node 没有 `flock(2)` 绑定 ⇒ `open 'wx'` 原子创建 + 锁内记 `{pid,tok
 0033 的残留观测已是 `RAISE EXCEPTION` ⇒ **必须先上代码、再跑迁移**（顺序反了迁移会失败而不是带病通过；
 失败可重放，不是死局）。前端「断线重连后 `roundSeq` 对不上就不覆盖气泡」的真机观感未验（本单只到单测）。
 
+
+#### 8.126.1 真库清存量与真机 e2e 实测（261114 主 agent 亲手跑，把上节的「未测」全部落地）
+
+**合并与部署**：PR #507 合并（merge commit `cd469f2`，分支已删）。按「先上代码、再跑迁移」的硬约束，
+`docker compose build station-portal && up -d` 起新代码（`MIGRATE_ON_START=1` 让迁移在监听端口前自动跑完），
+日志确认 `applying 0032-drop-retired-tables` → `applying 0033-delta-events-not-persisted` → `[migrate] ok`。
+
+**清存量与空间回收（判据是实测差值，不是 `DELETE rc=0`）**：
+
+| 时点 | `run_events` 行数 | `pg_total_relation_size` | 表体 / 索引 | 全库 `pg_database_size` |
+|---|---|---|---|---|
+| 迁移前（基线） | 884,163 | 494,960,640 B（472.0 MB） | 190,840,832 / 304,119,808 | 537,975,831 B（513.0 MB） |
+| 迁移后、VACUUM 前 | **7,008** | **494,960,640 B（一点没动）** | 190,840,832 / 304,119,808 | 537,771,031 B |
+| `VACUUM (FULL, ANALYZE) run_events` 后 | 7,008 | **5,578,752 B（5.3 MB）** | 4,096,000 / 1,482,752 | **48,389,143 B（46.1 MB）** |
+
+- **`run_events` 回收 489,381,888 B = 466.7 MB（−98.9%）**；**全库回收 489,586,688 B = 466.9 MB（−91.0%）**。
+- **中间那一行是本节的第二个实证**：`DELETE` 跑完（877,155 行清零）而体积**一个字节没变**——「删了不还磁盘」
+  不是理论，`VACUUM FULL` 才是回收动作。它耗时 **0.495 s**（7 千行 + 1.4 MB 索引），`ACCESS EXCLUSIVE` 窗口可忽略。
+- 碎片行此后保持 **0**；每行字节 **802 B**（5 条索引全留，与 §8.125 的「B/C 全部保留、不换键」表态一致）；
+  `schema_migrations` 头 = `0033-delta-events-not-persisted`。
+
+**真机 e2e（判据 2「打字机不退化」+ 判据 3「#278 红线」，playwright 容器 + 截图逐张看）**：
+
+1. **打字机**：SSE 直读 10 秒内收到 **491 条 `assistant_delta`** + 209 `reasoning_delta` + 58 `tool_call_delta`；
+   **碎片帧 758 条，带 `id:` 的 0 条**；事实类帧 7 条**全部带 `id:`** ⇒ 「碎片不占 seq」在线上成立。
+   浏览器连拍三张（间隔 1.5/2/2.5 s）量流式气泡正文：**72 → 759 → 1186 字符**，状态栏 `running · generating ·
+   3.3 KB · ~73.9 tok/s` ⇒ 一格一格在长，**没有退化**。
+2. **判据 3**：发一条长提问、等 12 s 让正文吐出、再 `POST /api/sessions/:id/stop`。结果：
+   `runs.termination = {reason:"aborted", partial:true, detail:"This operation was aborted"}`；
+   `run_end.payload` 键集合 = `usage,rounds,attempt,termination,**partial_text,partial_round**`；
+   `partial_text` **456 字符**、`partial_round=1`；该 run 的碎片行 **0**。
+   **刷新后**（`GET /events/history`）拿到合成项 `partial_output`：`text_len=456`、`truncated=false`、
+   `source=run_end`，并同 seq 带 `run_termination` ⇒ **正文不比停止前少、且带终态标记**。
+3. 形状闸线上复核：一个两轮 run 只落 **13 行事实类事件**（`round_start/attempt/usage/tool_use/tool_result/
+   round_end/judge/run_outcome/run_end`），**碎片 0 行**——对照迁移前每 run 3,987 行。
+
+**部署形态的一处本地漂移（记下来免得后人踩）**：`deploy/.env` 里 `STATION_PORTAL_IMAGE` 原是 GHCR digest pin，
+而 `docker compose build` **拒绝给 digest 引用打 tag**（`refusing to create a tag with a digest reference`）⇒
+本地构建部署必须先注释掉该行（本机已注释并留说明）。**留着 pin 时 `docker compose up` 会拉回发布版旧代码**，
+那会绕过「先上代码」的顺序约束，注意别混用。
+
+**环境清理**：测试用的 4 个会话已 `DELETE`（204）；`users.mail_otp_enabled` 为登录 e2e 临时置 false，
+**已恢复为 true**（`eric` 现为 `mail_otp_enabled=t`）；一次性 PG 容器与 `w502*` 容器全部删除；
+迁移前的备份在 `~/backups/station-pre502-261114-1721.sql.gz`（39 MB）。
+
+**仍未做**：多副本 portal 下的补发行为（形态 M 明确假设单副本）；`run_checkpoints`（85 行 / 4.6 MB）本单未动。
