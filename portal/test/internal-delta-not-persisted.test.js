@@ -518,7 +518,9 @@ test('#502 M-2 helper：runEndPartialKeys 的三条判据（锚点 / 空正文 /
   b.observe('r1', { client_event_id: 'r1:1:1', type: 'assistant_delta', payload: { text: '半截' }, session_id: 's' });
   assert.deepEqual(runEndPartialKeys('r1', { hasAssistantAnchor: true, buffer: b }), {},
     '有锚点 ⇒ 空对象：判据与 finishRun 建锚点用的是同一条表达式');
-  assert.deepEqual(runEndPartialKeys('r1', { buffer: b }), { partial_text: '半截', partial_round: 2 });
+  assert.deepEqual(runEndPartialKeys('r1', { buffer: b }),
+    { partial_text: '半截', partial_round: 2, partial_truncated: false },
+    '审计第 3 条：additive 键 `partial_truncated` 必须跟着出（没截就是 false，不是缺键）');
   // 缓冲只读：算键这个动作本身不得把 run 标掉/丢掉（终态点要在 COMMIT 之后才收尾）
   assert.ok(b.snapshot('r1'), 'helper 只读缓冲（M-6②：变更排在 COMMIT 之后）');
 });
@@ -550,4 +552,121 @@ test('#502 M-6②：终态事务提交失败 ⇒ 缓冲**不收尾**（drop/mark
   // 这里不再补一条重试腿，因为 fake 的撤销日志不回滚 `run_queue.status` ⇒ 第二次 `setRunState`
   // 会走 F5 幂等重放分支直接返回，走不到终态写入那段（真库 ROLLBACK 会连队列行一起回滚）。
   // 「重试那一次照样把正文落下来」这件事由真库闸 `delta-not-persisted-db.test.js` 承重。
+});
+
+// ---------------------------------------------------------------------------
+// 审计第 2 条（261114-05）：**durable `round_end` 必须关掉正文槽**
+//
+// 形状：跑完一轮（`round_end` 带 `final_text`）⇒ 那一轮的正文**已经在库里**（`round_end.payload.final_text`）。
+// 而历史投影读的是 **`round_end.final_text` 拼 `run_end.partial_text`**（`http.js#projectPartialOutputItems`）
+// ⇒ 若槽不关，「`round_end` 之后、下一轮 `round_start` 之前」被 reaper / offboard / 取消终态化时，
+// `runEndPartialKeys` 会把**已完成那一轮**的正文再写一遍进 `partial_text` ⇒ 界面重复一轮。
+// ---------------------------------------------------------------------------
+test('审计第 2 条：完整一轮的 `round_end` 落库 ⇒ 正文槽关掉，无锚点终态不再把该轮写进 partial_text', async () => {
+  const c = await live({ sessionId: 's502re', runId: 'r502re' });
+  await postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502re', claimToken: c.claimToken,
+    body: { batch_id: 'b1', events: [
+      uplink('r502re', 0, 'round_start', { round: 1 }),
+      uplink('r502re', 1, 'assistant_delta', { text: '第一轮' }),
+      uplink('r502re', 2, 'assistant_delta', { text: '说完了' }),
+      uplink('r502re', 3, 'round_end', { round: 1, final_text: '第一轮说完了' }), // durable 落点
+    ] },
+  });
+  // 改前这里会是 `第一轮说完了`（槽没关）⇒ 下一步会把它再写一遍进 `partial_text`。
+  const mid = partialOutputs.snapshot('r502re');
+  assert.equal(mid.text, '', 'round_end 落库后正文槽必须为空（那一轮的正文已在 round_end.final_text 里）');
+  assert.equal(mid.round, 1, '轮号/轮起点 seq 不清：下一轮 round_start 才换（补发帧的对账凭据不能瞎）');
+  assert.equal(mid.roundSeq, 1, '同上 —— roundSeq 仍是本轮轮起点的 seq');
+
+  // 「无锚点终态」：runner 的 catch 固定 final_text:'' ⇒ 不建 assistant 锚点
+  await setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502re', claimToken: c.claimToken,
+    body: { state: 'failed', termination: { reason: 'aborted' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 1, final_text: '' },
+  });
+  const { payload } = runEndOf(c.pool, 'r502re');
+  assert.equal(Object.hasOwn(payload, 'partial_text'), false,
+    '已完成那一轮不得再写进 partial_text —— 写了就是历史投影里的「重复一轮」');
+  // 前置自证：那一轮的终稿确实 durable 在 `round_end` 行里（fake 里 payload 存的是字符串，同 `runEndOf`）。
+  // **不这样钉的话，「槽被清空」与「正文根本丢了」两件事在断言上长得一样。**
+  const roundEnds = c.pool.events.filter((e) => e.type === 'round_end').map((e) => (
+    typeof e.payload === 'string' ? JSON.parse(e.payload) : (e.payload ?? {})
+  ));
+  assert.deepEqual(roundEnds.map((p) => p.final_text), ['第一轮说完了'],
+    'round_end 行必须真的带着那一轮的终稿（正文没丢，只是不再重复）');
+});
+
+test('审计第 2 条（另一半）：round_end **之后**新说的半轮仍然写进 partial_text（关掉的是那一轮，不是整个 run）', async () => {
+  const c = await live({ sessionId: 's502rf', runId: 'r502rf' });
+  const send = (events) => postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502rf', claimToken: c.claimToken,
+    body: { batch_id: 'b', events },
+  });
+  await send([
+    uplink('r502rf', 0, 'round_start', { round: 1 }),
+    uplink('r502rf', 1, 'assistant_delta', { text: '第一轮说完了' }),
+    uplink('r502rf', 2, 'round_end', { round: 1, final_text: '第一轮说完了' }),
+    // 下一轮开始了又说了两句被停止（引擎先发 round_start，所以槽是正常开的）
+    uplink('r502rf', 3, 'round_start', { round: 2 }),
+    uplink('r502rf', 4, 'assistant_delta', { text: '第二轮说到' }),
+  ]);
+  await setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502rf', claimToken: c.claimToken,
+    body: { state: 'failed', termination: { reason: 'aborted' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 2, final_text: '' },
+  });
+  const { payload } = runEndOf(c.pool, 'r502rf');
+  assert.equal(payload.partial_text, '第二轮说到', 'partial_text 只装「库里没有的那半轮」——历史投影拼出来正好一遍');
+  assert.equal(payload.partial_round, 2);
+  // 投影面（拼出口径在 http.js）：两处合起来 = 第一轮 + 第二轮那半句，各出现一次
+  const joined = '第一轮说完了' + (payload.partial_text ?? '');
+  assert.equal(joined, '第一轮说完了第二轮说到');
+  assert.equal(joined.split('第一轮说完了').length - 1, 1, '已完成那一轮在拼出来的正文里只出现一次');
+});
+
+// ---------------------------------------------------------------------------
+// 审计第 3 条（261114-05）：**截断状态没持久化，历史把「被截断」说成「完整」**
+// ---------------------------------------------------------------------------
+test('审计第 3 条：正文超 textCap ⇒ runEndPartialKeys 带 partial_truncated=true（未超是 false，不是缺键）', async () => {
+  const { runEndPartialKeys } = await import('../src/internal.js');
+  const b = createPartialBuffer({ textCap: 20 });
+  const feed = (text, n) => b.observe('r1', {
+    client_event_id: `r1:1:${n}`, type: 'assistant_delta', session_id: 's', payload: { text },
+  });
+  b.observe('r1', { client_event_id: 'r1:1:0', type: 'round_start', payload: { round: 1 }, seq: 1, session_id: 's' });
+  assert.deepEqual(runEndPartialKeys('r1', { buffer: b }), {},
+    '一轮还没说话 ⇒ 一个键都不加（既有口径：空正文不许凭空多键，也不写空串）');
+  feed('一二三四五六七八九十', 1);
+  assert.equal(runEndPartialKeys('r1', { buffer: b }).partial_truncated, false, '恰好夹到上限（没丢内容）⇒ 不算截断');
+  feed('尾巴丢了尾巴丢了尾巴丢了', 2); // 再来 12 字，只剩 10 个位子 ⇒ 真的掉尾巴了
+  const keys = runEndPartialKeys('r1', { buffer: b });
+  assert.equal(keys.partial_text.length, 20, `前置：正文确实被夹到 20（实拿 ${keys.partial_text?.length}）`);
+  assert.equal(keys.partial_truncated, true, '被夹尾就要说实话（改前这个键根本不存在 ⇒ 历史谎报「完整」）');
+  // 反过来也必须成立：**只有推理被截**时不得谎报正文被截（这就是不能复用 `snap.truncated` 的理由）
+  const onlyReasoning = createPartialBuffer({ textCap: 10 });
+  onlyReasoning.observe('r2', { client_event_id: 'r2:1:0', type: 'round_start', payload: { round: 1 }, seq: 1, session_id: 's' });
+  onlyReasoning.observe('r2', { client_event_id: 'r2:1:1', type: 'assistant_delta', payload: { text: '正文没截' }, session_id: 's' });
+  onlyReasoning.observe('r2', { client_event_id: 'r2:1:2', type: 'reasoning_delta', payload: { text: '推理很长推理很长推理很长' }, session_id: 's' });
+  assert.equal(onlyReasoning.snapshot('r2').truncated, true, '前置：两路共用的观测位确实被推理置上了');
+  assert.equal(runEndPartialKeys('r2', { buffer: onlyReasoning }).partial_truncated, false,
+    '推理截了 ≠ 正文截了：写进库的必须是正文自己的那一位');
+});
+
+test('审计第 3 条（端到端）：> textCap 的正文经终态落库 ⇒ run_end 行里带 partial_truncated=true', async () => {
+  const c = await live({ sessionId: 's502tc', runId: 'r502tc' });
+  await postEvents(c.pool, {
+    container: c.container, user: c.user, runId: 'r502tc', claimToken: c.claimToken,
+    body: { batch_id: 'b1', events: [
+      uplink('r502tc', 0, 'round_start', { round: 1 }),
+      // 默认 textCap = 16,384：喂 20,000 字符（> 上限）⇒ 尾巴必被夹掉
+      uplink('r502tc', 1, 'assistant_delta', { text: 'x'.repeat(20_000) }),
+    ] },
+  });
+  assert.equal(partialOutputs.snapshot('r502tc').text.length, 16_384, '前置：缓冲确实夹到 16,384');
+  await setRunState(c.pool, {
+    container: c.container, user: c.user, runId: 'r502tc', claimToken: c.claimToken,
+    body: { state: 'failed', termination: { reason: 'aborted' }, usage: { input_tokens: 1, output_tokens: 1 }, rounds: 1, final_text: '' },
+  });
+  const { payload } = runEndOf(c.pool, 'r502tc');
+  assert.equal(payload.partial_text.length, 16_384, '库里存的就是被截过的那一份');
+  assert.equal(payload.partial_truncated, true, '「这一份是被截过的」必须跟着落库（改前只活在内存里）');
 });
