@@ -72,13 +72,18 @@ test('锁：跨进程互斥 —— 另一个进程持锁时 acquire 必须等（
     process.stdout.write('HELD\\n');
     setTimeout(() => { release(); process.stdout.write('RELEASED\\n'); }, 1200);
   `, '--input-type=module'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  // ⚠ `exit` 必须**一开始就订阅**并包成一个 promise。事后才 `child.on('exit', r)` 的话，
+  // 子进程已经退出时这个事件**再也不会发** ⇒ `await` 永久悬着，整条测试文件会红在
+  // 「Promise resolution is still pending but the event loop has already resolved」
+  //（本单第一次带 `TEST_DATABASE_URL` 跑 `npm test` 就是这么炸的：单跑能过，拼上去就挂）。
+  const exited = new Promise((resolve) => child.once('exit', (code) => resolve(code)));
   let out = '';
-  const done = new Promise((resolve, reject) => {
+  const held = new Promise((resolve, reject) => {
     child.stdout.on('data', (b) => { out += b.toString(); if (out.includes('HELD')) resolve(); });
-    child.on('exit', (code) => { if (!out.includes('HELD')) reject(new Error(`子进程没拿上锁：rc=${code}`)); });
+    exited.then((code) => { if (!out.includes('HELD')) reject(new Error(`子进程没拿上锁：rc=${code} stdout=${JSON.stringify(out)}`)); });
   });
   try {
-    await done;
+    await held;
     assert.equal(fs.existsSync(file), true, '子进程持锁期间锁文件必须在');
     // 等不到 ⇒ 必须**抛错**，而不是插队进临界区
     await assert.rejects(
@@ -90,8 +95,8 @@ test('锁：跨进程互斥 —— 另一个进程持锁时 acquire 必须等（
     const release = await acquireBootstrapLock({ file, timeoutMs: 5_000, staleMs: 600_000 });
     release();
   } finally {
-    child.kill();
-    await new Promise((r) => child.on('exit', r));
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await exited;   // 已在创建时订阅 ⇒ 退过了就是已 resolve，不会再悬
     fs.rmSync(path.dirname(file), { recursive: true, force: true });
   }
 });
