@@ -660,7 +660,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // 身份口径（两把尺：文本 + run）：
     //   · `deltaEntry.runId` 是这段气泡出生时那一帧的 `run_id`（watcher 里钉的，见 `deltaEntry` 旁）；
     //   · **未知**（`null` 或 `'unknown'` 哨兵 ⇒ 见 `isUnknownOwner`）⇒ 退回旧口径「只比文本」，不拿未知去否定已知——
-    //     否则旧后端下重复气泡再也撤不掉（同一段正文两遍，那是 #502 判据 4 的红线）；
+    //     否则旧后端下重复气泡再也撤不掉（同一段正文两遍，那是 #502 判据 4 的红线）。
+    //     **例外**：`claimedLater` 成立时**不撤**（未知身份 + 链路上后来出现过**别的**具体 run ⇒ 宁可不撤，见下面那两条判据）；
     //   · 已知且**不等于**这条 partial 的 run ⇒ 那是别人的气泡，一个字都不许动。
     // `removeDeltaEntry()` 的幂等性不变（它仍只靠 `deltaEntry` 单指针找下标，这里只是在**调它之前**
     // 多问一句身份；不该调的时候一次都不调）。
@@ -703,9 +704,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //      ⇒ **不撤**（身份矛盾已知，撤错代价 > 多一行）；
     //   ② 气泡出生身份**未知** + 出现过的具体身份**正是**这条 partial 的 run ⇒ **撤**
     //      （补认领与归属一致，撤掉的就是它自己那一份）；
-    //   ③ 链路上**一个具体身份都没出现过**（`laterOwner` 也是未知 / 压根没有 delta 条目）⇒ 退回
-    //      **只比文本**的旧兼容口径，**照旧撤**。这一档**必须**保留：否则真·旧后端（帧里从不带
-    //      `run_id`）下同文两遍会全回来，那是 #502 判据 4 的红线。
+    //   ③ `laterOwner` **未知**（`null` 或 `'unknown'` ⇒ 见 `isUnknownOwner`，即整条链路一个具体身份都没
+    //      拿到）⇒ 退回**只比文本**的旧兼容口径，**照旧撤**。这一档**必须**保留：否则真·旧后端（帧里从
+    //      不带 `run_id`）下同文两遍会全回来，那是 #502 判据 4 的红线。
+    //      ⚠ **别把「压根没有 delta 条目」并进这一档**（copilot 第四轮 ①，纯注释精确化，行为一字未动）：
+    //      `deltaEntry === null` 时 `deltaOwner` 取的是 `es.deltaRunId`（见上面那行），它若是个**具体** run
+    //      ⇒ `sameRun` 仍按 run 身份比较，**不是**无条件只比文本；只是此时 `removeDeltaEntry()` 本来也无
+    //      条目可撤（它只认 `deltaEntry` 那根单指针），撤与不撤在界面上等价。
     // **①档的代价**：同一段正文可能在界面上出现两遍（delta 气泡 + 中性气泡）——多一行刷新即回，
     // 撤错的那段字看不见，所以这一档宁可多一行。
     const laterOwner = es.deltaRunId.value ?? null;

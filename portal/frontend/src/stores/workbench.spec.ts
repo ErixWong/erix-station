@@ -3078,12 +3078,18 @@ describe('copilot 复审 ①：出生身份未知的 delta 条目只不得被「
 // `'unknown'` 与 `null` 一律算**已知的未知**，从此不得再出现 `=== null` / `=== 'unknown'` 混用。
 //
 // 四条必补用例的方向（A/C/D 是**策略钉住**：改前后都该绿，改坏了立刻红；B 是**本单核心**：改前红）：
-//   · A 气泡 `null` + laterOwner `run-B` + partial **缺 run_id** ⇒ 不撤（身份缺失时一律保守）；
+//   · A 气泡 `null` + laterOwner `run-B` + partial **缺 run_id** ⇒ 不撤（**只测①那一档**：未知身份 +
+//     链路上出现过的具体身份与这条 partial 的 run 矛盾；**不是**「身份缺失一律不撤」，后三档见 C/D/E）；
 //   · B 气泡 `'unknown'` + laterOwner `run-C`（别的 run）+ partial `run-B` ⇒ **不撤**（改前会撤）；
 //   · C 气泡 `'unknown'` + laterOwner `run-B`（正是这条 partial 的 run）+ partial `run-B` ⇒ **撤**；
 //   · D 真·旧后端（`deltaRunId` 至今 `null`）⇒ **照旧撤**（#502 判据 4 的兼容口径）。
 // 另补 E 钉住 `claimedLater` 里那句 `!isUnknownOwner(laterOwner)`（四条都没覆盖它）：
 //   · E 后来那一帧的 `run_id` 自己就是哨兵 `'unknown'` ⇒ **不算具体身份** ⇒ 下界不触发 ⇒ 照旧撤。
+// 再补 F（copilot 第四轮 ① 的行为侧）：
+//   · F **压根没有 delta 条目**（`deltaEntry === null`）而 `es.deltaRunId` 是个**具体** run ⇒ 这一档**不是**
+//     「无条件退回只比文本」（`deltaOwner` 取的是那个具体身份 ⇒ `sameRun` 照旧按 run 身份判），
+//     而撤与不撤在这里**行为等价**（`removeDeltaEntry()` 无条目可撤）⇒ 本条钉「不抛错 / 不造不删 /
+//     partial 照画」（与 A/C/D 同类：策略钉住，改前后都该绿，改坏了立刻红）。
 // 五条全走**真实 watcher 路径**（`assistant_delta` → composable 写 `deltaText`/`deltaRunId` →
 // `watch(es.deltaText)` 建条目），并把前置断言写死（条目的 `runId` 到底是 `null` 还是 `'unknown'`、
 // `es.deltaRunId` 后来变成了什么），否则等于什么都没测。
@@ -3133,7 +3139,7 @@ describe('copilot 最终验收 ①：未知身份只有一个判据，`unknown` 
     expect(store.es.deltaRunId, `前置：composable 侧的身份已被补成 ${claimRunId}（补认领真的发生了）`).toBe(claimRunId);
   }
 
-  it('A｜气泡 runId=null + laterOwner=run-B + partial **缺 run_id** ⇒ 不撤（身份缺失一律保守，代价=可能两遍）', async () => {
+  it('A｜气泡 runId=null + laterOwner=run-B（具体）+ partial **缺 run_id** ⇒ 不撤（①那一档：未知 + 具体身份矛盾，代价=可能两遍）', async () => {
     const store = useWorkbenchStore();
     await store.openSession('s1');
     const es = FakeEventSource.instances.at(-1)!;
@@ -3243,5 +3249,50 @@ describe('copilot 最终验收 ①：未知身份只有一个判据，`unknown` 
     expect(deltas(store).length,
       '那个「后来的身份」自己也是未知 ⇒ 拿它去否定就是「用未知否定未知」，同一段正文两遍（#502 判据 4）').toBe(0);
     expect(store.es.deltaText).toBe(null);
+  });
+
+  // copilot 第四轮 ① 的**行为侧兜底**（与 `workbench.ts` 第三档注释的精确化配套）：
+  // 「**没有 delta 条目**」不并入第三档（「退回只比文本」）—— `deltaEntry === null` 时 `deltaOwner` 取的是
+  // `es.deltaRunId`，它若是个**具体** run ⇒ `sameRun` 照旧按 run 身份比较。而这一档**行为上**撤与不撤等价
+  //（`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针，本无条目可撤），所以本条钉的是**不许出的乱子**：
+  // 不抛错、不凭空造 delta、不误删别的条目、partial 照常画（同 A/C/D：策略钉住，改前后都该绿）。
+  // 而且这个状态**不是假设**，是撤掉气泡之后的真实现场：`addPartialOutput` 只清 `deltaText`、**不清** `deltaRunId`。
+  it('F｜无 delta 条目（已被 run-A 的 partial 撤掉）+ `es.deltaRunId` 仍是具体 run-A ⇒ 再来的 run-B 同文本 partial：不抛错、不造不删 delta、partial 照常加', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    const { nextTick } = await import('vue');
+    store.es.activeRunId = null;
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-A' });
+    es.emit('assistant_delta', { run_id: 'run-A', text: '同样的一段话' }); // 带身份出生（真实 watcher 路）
+    await nextTick();
+    expect(deltas(store).length, '前置：条目是 watcher 建出来的（不是自己 push 的假条目）').toBe(1);
+    expect(deltas(store)[0].runId, '前置：出生身份是具体 run-A').toBe('run-A');
+
+    // 同 run 同文本的那条 partial 合法地撤掉它（C 档那条判据），而它**只清 `deltaText`**。
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-A', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length, '前置：界面上再无 delta 条目（`deltaEntry` 已空）').toBe(0);
+    expect(store.es.deltaText, '前置：流式状态也跟着清了').toBe(null);
+    expect(store.es.deltaRunId,
+      '前置：`es.deltaRunId` **没被清** ⇒ 它就是本条要测的那个「无条目时仍在的具体身份」').toBe('run-A');
+
+    // 本条要测的一步：`deltaEntry === null` + `deltaOwner` 读到具体 run-A + 来一条**别的 run** 的同文本 partial。
+    expect(() => store.addPartialOutput({
+      seq: 10, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    })).not.toThrow();
+    await nextTick();
+    expect(deltas(store).length,
+      '本来就没有 delta 条目 ⇒ 既不许凭空造一条，也不许拿别的条目当成它删掉').toBe(0);
+    expect(store.es.deltaText, '无条目可撤 ⇒ 也不许顺手把流式状态改写成别的值').toBe(null);
+    expect(partialIds(store), '两条 partial 各画各的（run-A 那条不许被 run-B 那条顶掉）')
+      .toEqual(['partial:run-A', 'partial:run-B']);
+    expect(store.entries.map((e) => e.kind),
+      '整条时间线只多这一条 partial，其余条目一个不少').toEqual(['sep', 'partial', 'partial']);
+    expect(store.es.deltaRunId, '无关 run 的 partial 不改写这段正文的归属').toBe('run-A');
   });
 });
