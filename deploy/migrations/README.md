@@ -43,7 +43,8 @@
   （= `migrate.js` 的 `defaultMigrationsDir()`）。
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
-- 现状：增量迁移已包含 `0001-idempotency-keys.sql`（写操作幂等台账）至
+- 现状（**下面这段只写到 0026，是 2026-11-06 的读数**；0027–0033 见下面「增量迁移清单」一节）：增量迁移已包含
+  `0001-idempotency-keys.sql`（写操作幂等台账）至
   `0026-login-email-codes.sql`（**#449 登录第二因素「邮箱验证码」**：`login_email_codes` 一行一枚码 +
   `mail_settings` 单行邮件通道配置——SMTP 参数存 DB、口令明文，与 `git_hosts.admin_key` 同口径；
   `docs/data/schema.sql` 冻结 baseline 一个字节未改，静态断言见 `portal/test/migrations.test.js`）至
@@ -86,14 +87,47 @@
 > 迁移身份 = `station_platform`（DDL，表 owner）；运行时身份 = `station_portal`（最小 DML）。
 > 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。**为什么这是硬约束而不是建议，见下节。**
 
+## 增量迁移清单（0027–0033）
+
+> 上面「现状」段那句「已包含 `0001` 至 `0026`」停在 2026-11-06，**清单以本节为准**（`ls deploy/migrations/*.sql` 现查可复核）。
+> 一句话用途 + 关联 issue；细节在各自文件头注释里（那里才是取证的地方），旧条目（0001–0026）的来历见「镜像与执行」段。
+
+| 文件 | 一句话用途 | 关联 issue |
+|---|---|---|
+| `0027-tls-certificates.sql` | 管理台证书生命周期的**审计/历史**表 `tls_certificates`（一行一次装证/回滚；**盘上文件才是真相源**，本表只答「谁在什么时候装了什么」） | #456 |
+| `0028-user-mail-otp.sql` | `users.mail_otp_enabled`：per-user「邮件验证码」开关（默认 `false` ⇒ 开了全局邮件通道不再自动要求所有人） | #449 |
+| `0029-user-file-upload.sql` | `users.file_upload_enabled`：per-user「文件上传」开关（默认 `false`，管理员显式打开） | #472 |
+| `0030-user-totp-login-enabled.sql` | `users.totp_login_enabled`：把「绑过 TOTP」与「登录允许用 TOTP」拆成两位（默认 `true` ⇒ 存量行为零变化） | 工单 feat-261110-02（台账 §8.112） |
+| `0031-user-last-activity-at.sql` | `users.last_activity_at`：该用户最近一次**亲口说话**（按下发送）的时刻，可空、无默认、不建索引 | #497 |
+| `0032-drop-retired-tables.sql` | 撤三张退役/备份表（`llm_models_retired`、`llm_providers_retired`、`transcript_rounds_shape4_bak_20261027`）；**撤前每个部署自己跑一遍访问账判据** | #503 |
+| `0033-delta-events-not-persisted.sql` | 清 `assistant_delta` / `reasoning_delta` / `tool_call_delta` 的历史存量（**形态 M：纯清理、零 DDL**，分批 `FOR UPDATE SKIP LOCKED`） | #502 |
+
+⚠ `0033` 有**部署顺序**要求，见下一节——它不是「又是一条 DELETE」那么轻。
+
+## 部署顺序：`0033` 必须**先部署新代码、再跑迁移**（issue #502）
+
+- **`0033` 是纯清理迁移**（语句区只有 `DELETE` 与观测，零 `CREATE/DROP/ALTER`），但它清完之后会**量一遍残留**：
+  仍有 stream 档碎片 ⇒ **`RAISE EXCEPTION`**（不是 `WARNING`）。带残留记成功 = `schema_migrations` 落下
+  「已清完」这一行、表里却还躺着几十万行碎片，而迁移的可观测面只有 rc 与 NOTICE，`WARNING` 挡不住 COMMIT。
+- **量到残留的真实原因只有一个：部署顺序倒了。**拦住碎片写入的代码（`portal/src/internal.js` 的 U3 写循环问
+  引擎 `eventTierOf`）与这支迁移在**同一个 commit**里 ⇒ 旧版 portal 还在上报碎片时跑迁移，必然一边清一边写。
+  所以：**先把新 portal 镜像部署起来，再让迁移跑**（compose 路径 `MIGRATE_ON_START: "1"` 下，起新镜像本身就是
+  在跑新迁移，顺序天然成立；手工/救灾路径分开跑这两步时才需要记住它）。
+- **失败可重放，不是死局**：新代码上线后重跑 `0033` 即可（第二遍清 0 行、rc=0）。
+- **磁盘回收不在迁移里，要手工跑**：`VACUUM` 不能跑在事务块里（25001），而迁移 runner 是单事务 ⇒ 写进迁移文件
+  就是整个迁移失败、portal 拒启。`DELETE` 跑完体积**一个字节都不动**（实测：877,155 行删完仍是
+  494,960,640 B），只有 `VACUUM (FULL, ANALYZE) run_events` 才回收（实测降到 5,578,752 B）。它拿
+  `ACCESS EXCLUSIVE` ⇒ **在迁移事务之外、低峰期手工跑**，读数与耗时见 `docs/maintenance/task-ledger.md` §8.126.1。
+
 ## 迁移身份：增量迁移**必须**由平台库角色执行（issue #280）
 
 **口径**：跑 `deploy/migrations/*` 的连接必须是**平台库角色**（`deploy/.env` 的 `PLATFORM_DB_USER`，
 缺省 `station_platform`）——即 `MIGRATE_DATABASE_URL` 的用户。只设 `DATABASE_URL` 的走法见下文。
 
 **为什么**（不是洁癖，是 PG 的硬约束）：
-- `docs/data/bootstrap.sql:52-56` 把 `public` 下表与序列的属主**归正给平台库角色**，并声明前提
-  「后续 `deploy/migrations/*` 由其执行」。
+- `docs/data/bootstrap.sql:50-62` 那个 DO 块把 `public` 下表与序列的属主**归正给平台库角色**
+  （`ALTER TABLE … OWNER TO station_platform` 在 `:57`、`ALTER SEQUENCE … OWNER TO` 在 `:60`），并在 `:51`
+  声明前提「后续 `deploy/migrations/*` 由其执行」。
 - PG 的 `ALTER SEQUENCE … OWNED BY <table>.<col>` 要求**序列与表同属主**（`routine=process_owned_by`，
   SQLSTATE 55000）；`CREATE SEQUENCE` 把新序列给**当前连接角色**。两者一撞：迁移角色 ≠ 表属主 ⇒
   **整个迁移在 `0016-transcript-append-seq.sql` 失败**（报 `sequence must have same owner as table it is linked to`）。

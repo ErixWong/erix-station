@@ -16,7 +16,7 @@
 | [`design/fde-platform.md`](design/fde-platform.md) | **主规格**：拓扑、网络与隔离、访问控制、账号生命周期、端口分配、数据模型、事件流、LLM 接入、容器模板、部署、分期、决策 D1~D10 | ✅ |
 | [`design/topology.md`](design/topology.md) | **H-B 网络与访问拓扑定稿（单一事实来源）**：拓扑、IPAM、链路 L1–L10、路由模型、加固清单、连通矩阵、reconciler 职责、实测证据（决策者 2026-09，issue #5） | ✅ |
 | [`design/principles.md`](design/principles.md) | **设计原理**：五条核心原理、规则对照、被否决方案、未决问题决策框架、实现者硬约束 | ✅ |
-| [`design/runner-integration.md`](design/runner-integration.md) | **runner 集成契约（WP3b）**：agentd/worker 职责、IPC 信封、租约/心跳/事件批、终态收敛、erix-agent `runToolLoop`/`TranscriptStore` 锚点（v0.9.0，§9.1 八方法） | ✅ |
+| [`design/runner-integration.md`](design/runner-integration.md) | **runner 集成契约（WP3b）**：agentd/worker 职责、IPC 信封、租约/心跳/事件批、终态收敛、erix-agent `runToolLoop`/`TranscriptStore` 锚点（锚点版本 **v0.9.0 是历史锚点**，不是现价；**当前 pin 现查 `package.json` 与 `runner/package.json` 的 `erix-agent` 字段**，2026-11-14 现查 = 0.32.0，§9.1 八方法） | ✅ |
 | [`design/conversation-state.md`](design/conversation-state.md) | **会话状态模型（issue #77）**：三层生命周期（执行/会话/工作区）、session-scoped transcript 目标态、引擎现状源码核对、pi 参照系、P0–P3 分阶段实施、红线与验收口径 | ✅（设计定稿待实施） |
 | [`design/directory-as-project.md`](design/directory-as-project.md) | **去项目化：目录即项目（P5）+ 文件面板（P6）**：sessions.cwd 化、端口去项目化（`eric-p-<port>`）、同项目并行放行（pi 对齐不锁）、UI 定稿布局、materializer 退役、迁移与部署序 | ✅（设计定稿待实施） |
 | [`design/security-posture-2026-11-05.md`](design/security-posture-2026-11-05.md) | **安全现状与风险清单（2026-11-05 真机实测）**：容器间/容器到宿主的可达性矩阵（每 FDE 一个独立 `/29`、跨 bridge 实测被挡、宿主 41 个 `0.0.0.0` 端口全可达）、谁能写 Traefik 规则（FDE 容器不能；portal 能）、证书私钥读写路径、R1–R9 风险与 S1–S6 方案（含已接受项与未验证边界） | ✅ |

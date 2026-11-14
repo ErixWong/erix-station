@@ -1356,7 +1356,7 @@ station-portal user enable  --login <login>
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
-| `seq` | number | 该 run 在**窗口行里的 `MAX(seq)`**（**不新分配**、不占 `chat_sessions.last_seq`）⇒ 位置仍然落在该 run 内容末尾 |
+| `seq` | number | 该 run 的**全局** `MAX(e.seq)`（`SELECT MAX(e.seq) FROM run_events e WHERE e.run_id = r.id`，**不受 `before` 分页窗口约束**；**不新分配**、不占 `chat_sessions.last_seq`）⇒ 位置落在该 run 内容**末尾**，分页窗口外的行也算得进来。⚠ 副作用：一个跨好几页的 run，它的全局最大 seq 比任何更早页的 `before` 都大 ⇒ **合成项会在每一页重演一遍**，所以入口按 `seq < before` 只留「属于本页那一页」的那一份（`http.js#buildHistorySynthItems`，#502 审计 M-6④；只卡上界，不卡下界） |
 | `run_id` | string | 所属 run |
 | `type` | string | 固定 `partial_output`（**合成类型，`run_events` 表里查不到这一行**——表里只有 `round_end` / `run_end` 那些真实行） |
 | `payload.text` | string | 来源 1 按 `seq` 升序拼接 + 来源 2 追加；脏值（`final_text` / `partial_text` 不是字符串）整条跳过，不拼成 `[object Object]` |
@@ -2706,6 +2706,8 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 
 - **SSE 而非 WebSocket**（规格 §10.2）：事件单向，输入走 `POST .../messages`。
 - **事件先落 DB，portal 从 DB 读并推流**（规格 §10.2 / D7）：portal 重启不杀正在跑的 run；`seq` 由宿主在落库事务内**逐事件原子 +1 分配**（`UPDATE chat_sessions SET last_seq = last_seq + 1 ... RETURNING`，`UNIQUE(session_id, seq)` 兜底），**每个 session 内严格单调递增、无空洞**——不存在「并发落库产生合法间隙」的情况（runner §7.3）。
+  （⚠ 本句写于 #502 之前：「**无空洞**」这一半已作废，跳号自 #502 起合法，口径见紧下面那条实现注记与
+  `docs/data/model.md` §1.12；「严格单调递增」与「不是并发造成的间隙」两半仍然成立。）
   > **实现注记（issue #502，#25 裁决的续集）**：**「无空洞」自本单起彻底不成立**——① stream 档碎片
   > （`assistant_delta` / `reasoning_delta` / `tool_call_delta`）**不分配 `seq`**（只转发，见 §5.3 表里那三行），
   > ② U3 写循环去掉了「先 `SELECT` 查重」的预检，重复投递会先烧掉 `seq` 再由 `ON CONFLICT DO NOTHING` 丢掉。
@@ -2749,16 +2751,32 @@ portal 容器以 **root** 写用户空间（`docs/design/user-space.md` §6.1）
 - 响应建议携带 `retry: 3000`，指导浏览器断线重连间隔。
 - **`resync` 控制帧**（宿主侧帧，**不属** §5.3 事件类型清单、不带 `seq`/`id`）：服务端补发前的缓冲溢出（上限 1000 条）时，portal 不再静默丢事件——向该连接写 `event: resync` + `data: {"reason":"buffer_overflow"}` 后 `res.end()`。该帧**不带** `last_seq`：重连游标由客户端用自己的本地水位线（已收到的最大 `seq`，含 `messages` 与 `run_events` 共用分配器造成的跳号）维护，服务端缓冲区里的最大 seq 不构成可靠游标（补发/写回窗口内可能漏）。客户端应立刻 `close()` 并以 `?last_event_id=<本地已知最大 seq>` 重连，由补发路径收敛（§5.2）。这是客户端唯一的主动重连触发条件（未知类型忽略原则仍适用于 §5.3 之外的其它扩展类型）。
 
-每条事件的 wire 格式：
+每条事件的 wire 格式（**两档两个形状**，#502）：
+
+**durable 档（落库、占 `seq`）**——带 `id:`，`id` 恒等于 envelope 的 `seq`，这是 `Last-Event-ID` 的依据：
 
 ```
 id: 129
-event: assistant_delta
-data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":"9d3b2f1e-...","type":"assistant_delta","text":"好的"}
+event: round_end
+data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":"9d3b2f1e-...","type":"round_end","round":2}
 
 ```
 
-`id` 字段恒等于 envelope 的 `seq`——这是 `Last-Event-ID` 的依据。
+**stream 档（不落库、不占 `seq`）**——**不带 `id:` 行**，envelope 里的 `seq` 是 **`null`**（键在、值为 null，
+不是 0，也不是「没这个键」——现查 `internal.js#writeSessionEvent` 直接序列化 `ev.seq`）：
+
+```
+event: assistant_delta
+data: {"seq":null,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":"9d3b2f1e-...","type":"assistant_delta","text":"好的"}
+
+```
+
+为什么不写 `id:`（#502）：`assistant_delta` / `reasoning_delta` / `tool_call_delta` 三类碎片只转发不入库
+⇒ 它们根本没有 `seq` 坐标系；给上 `id:` 就等于把浏览器 `Last-Event-ID` 推到一个不存在的 seq 上，
+下次重连从错误游标补发（钉在 `portal/test/internal-delta-not-persisted.test.js` 判据 ④）。
+同样不带 `id:` 的还有补发快照帧 `partial_output`（§5.1 注记）与宿主控制帧 `resync`（见下）。
+**前端判据**：不得假定「帧都有可用的 `seq`」（`null` 不是 0），也不得拿「有没有 `id:`」当错误信号；
+只有带 `id:` 的帧参与 `Last-Event-ID` 游标（§5.2）。
 
 ### 5.2 `Last-Event-ID` 断线续传语义
 
@@ -2781,7 +2799,7 @@ data: {"seq":129,"ts":"2026-09-12T09:00:02.130Z","session_id":"s_3kd9","run_id":
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `seq` | number | 宿主落库时分配，session 内单调递增 |
+| `seq` | number \| null | 宿主落库时分配，session 内**单调递增**（允许跳号，见 §5.1 注记）。**只有 durable 档才有值**：stream 档碎片不落库 ⇒ `seq` 为 **`null`**（帧也不带 `id:`）；portal 合成的状态类事件（如第 17 类 `queue_update`）同样是 `null`。**前端不得把 `null` 当 0** |
 | `ts` | string | ISO 8601 UTC，宿主落库时间 |
 | `session_id` | string | — |
 | `run_id` | string | 产生该事件的 run |
@@ -3104,13 +3122,14 @@ portal 自身限流（登录爆破等，§2）也用 `429 rate_limited`，统一
 响应 `200`：
 
 ```json
-{ "stored": 98, "seq_first": 1001, "seq_last": 1098 }
+{ "stored": 98, "seq_first": 1001, "seq_last": 1098, "stream_forwarded": 41 }
 ```
 
 | 字段 | 说明 |
 |---|---|
-| `stored` | **实际插入**条数。批次中已存在（重复）的 `client_event_id` 被跳过、不计入——**部分重复时响应仍为 `200`，`stored` 小于请求条数属正常幂等命中，不是错误**；agentd 收到 `200` 即确认整批、从缓冲删除 |
-| `seq_first` / `seq_last` | 本批**新插入**事件分配到的 seq 区间（`seq_first ≤ seq_last`）。**当 `stored == 0`（空批次 或 全重复批次）时两者均为 `null`**——这是「没有新事件落库」的明确信号，agentd 不应据此推进任何游标（本来也没有新 seq）。seq 由 portal 在**同一事务**内 `chat_sessions.last_seq` 逐条 +1 分配（`UNIQUE(session_id, seq)` 兜底）；**seq 只在 portal 产生，worker/agentd 永不自造** |
+| `stored` | **实际插入**条数（= 真落库行数）。批次中已存在（重复）的 `client_event_id` 被跳过、不计入——**部分重复时响应仍为 `200`，`stored` 小于请求条数属正常，不是错误**；agentd 收到 `200` 即确认整批、从缓冲删除。⚠ **#502 起 `stored < 条数` 有两种原因，不能只读成幂等命中**：① 真的重复投递（durable 档被 `ON CONFLICT DO NOTHING` 跳过）；② **本批里有 stream 档碎片**——它们**成功转发也不计入 `stored`**（根本不 INSERT），一个全是碎片的批可以 `stored: 0` 且完全正常。⇒ 单看 `stored` 分不出这两种，**要分开就读下面那个 additive 计数** |
+| `seq_first` / `seq_last` | 本批**新插入**事件分配到的 seq 区间（`seq_first ≤ seq_last`）。**当 `stored == 0`（空批次 / 全重复批次 / 整批都是 stream 档）时两者均为 `null`**——这是「没有新事件落库」的明确信号，agentd 不应据此推进任何游标（本来也没有新 seq）。seq 由 portal 在**同一事务**内 `chat_sessions.last_seq` 逐条 +1 分配（`UNIQUE(session_id, seq)` 兜底）；**seq 只在 portal 产生，worker/agentd 永不自造**；**跳号合法**（§5.1 注记） |
+| `stream_forwarded` | **#502 起 additive**：本批**真的被转发到浏览器**的 stream 档条数（没转发就不计：重复投递的碎片会被累加器的「首次观测才转发」挡掉 ⇒ 重投那一整批它是 `0`）。它是碎片不落库之后**唯一**剩下的碎片级去重信号（§9.4a）。**runner 今天不读它**（`runner/agentd.js:725` 那条 debug 日志只报 `stored` 与 `count`），旧 agentd 不读它也照旧工作 ⇒ **协议形状零改动**；写它只为把「为什么 `stored` 比条数小」在排障时能直接看出来 |
 
 幂等与重试（runner §7.3）：**at-least-once**——agentd 只有收到 `200` 才确认删除；任何失败重试**整批**，重复批次安全。
 

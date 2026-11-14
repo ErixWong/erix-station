@@ -177,11 +177,18 @@ cookie 令牌的**哈希**存储（`token_hash` 唯一），可单条吊销（`r
 > **只有 durable 档落库（issue #502）**：引擎给每个事件类型标了档位（`erix-agent` 的
 > `eventTierOf` / `EVENT_TIER_STREAM`），stream 档三型 `assistant_delta` / `reasoning_delta` /
 > `tool_call_delta` 在 U3 写循环里**既不 INSERT 也不分配 `seq`**，只转发给浏览器。判据是引擎的表，
-> 本站不再手抄类型清单（上游 additive 新碎片类型自动继承同一命运）。dev 真库实测（2026-11-13 现查）：
+> 本站不再手抄类型清单（上游 additive 新碎片类型自动继承同一命运）。
+> **下面那组体积读数是「`0033` 迁移前」的历史基线**（dev 真库 2026-11-13 现查，清存量与 VACUUM 都还没跑）：
 > `run_events` 884,163 行里 **877,155 行是这三型**（99.2 %），表体 472 MB；平均每行 ≈ 560 B、
 > `assistant_delta` 的 `payload.text` 平均 **2.09 个字符**（`SELECT avg(length(payload->>'text'))
 > WHERE type='assistant_delta'` 现查；工单 #502 正文里那个 3.82 是同一条 SQL 的旧读数，本次没复现出来，
-> 以现查为准）——即「一次事务 + 五次索引更新」换两个字符。
+> 以现查为准）——即「一次事务 + 五次索引更新」换两个字符。**别拿它们当现在的量级。**
+> **迁移后实测（2026-11-14：`0033` 跑完 + `VACUUM (FULL, ANALYZE) run_events` 之后；出处
+> `docs/maintenance/task-ledger.md` §8.126.1）**：`run_events` **7,008 行**、`pg_total_relation_size`
+> **5,578,752 B（5.3 MB）**、每行 **802 B**（五条索引全留）、全库 `pg_database_size`
+> **48,389,143 B（46.1 MB）**，碎片行此后保持 **0**。
+> ⇒ 每行字节反而**变大**（802 vs 560）是预期的：被删掉的正好是**最短**的那批行，留下的 durable 行本就更大
+> ⇒ **不要**拿「每行字节」当「修法没生效」的证据，**行数与表体才是**。
 > 碎片的**内容**去向只有两条（形态 M 的落点，**零新类型、零新索引**）：
 > ① **进程内累加器**（`portal/src/run-partial-buffer.js`，per-process ⇒ 重启即失、多副本不共享）只服务
 >    断线补发，且**只存当前那一轮**（`round_start` 一到就换槽，正文按轮重置、`reasoning` 独立累加）；
@@ -703,12 +710,18 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 ## 4. 归档与膨胀策略
 
-**膨胀来源排序（dev 真库 `station` 现查，2026-11-13，issue #502 修正）**：
+**膨胀来源排序（dev 真库 `station` 现查，2026-11-13，issue #502 修正；⚠ 那一列是 **`0033` 迁移前**的历史读数）**：
 `run_events` **472 MB** ≫ `transcript_rounds` **12 MB** > `run_checkpoints` 4.6 MB > 其余表。
 本表原先写的是「`transcript_rounds.messages`（单 run 可达 MB 级）> `run_events.payload`」——**排序反了**：
 `transcript_rounds` 实测 12 MB / 2,231 行（单 run MB 级那一档远没出现），而 `run_events` 靠 stream 档碎片的
 **行数**堆到 472 MB / 884,163 行。膨胀机制不是「行大」而是「行多且每行都要走一次事务 + 索引」，这是当初写下
 「单 run 可达 MB 级」时没料到的方向。修法见 §1.12 的 stream 档那条（碎片不落库）。
+
+> **迁移后的当前量级（2026-11-14 实测：`0033` + `VACUUM (FULL, ANALYZE)` 之后；出处
+> `docs/maintenance/task-ledger.md` §8.126.1）**：`run_events` **7,008 行 / 5,578,752 B（5.3 MB）/
+> 每行 802 B**，全库 **48,389,143 B（46.1 MB）** ⇒ 上面那条排序里 `run_events` 已从「472 MB」降到全库零头，
+> 现下的榜首是 `transcript_rounds`（那个排序只在迁移前成立）。
+> ⚠ 另一处没动的膨胀源：`run_checkpoints`（85 行 / 4.6 MB）本单未动。
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
