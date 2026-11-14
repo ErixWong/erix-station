@@ -153,11 +153,16 @@ test('#506c 总上限：循环永不 resolve + close 永不回调 ⇒ 仍要在 
     loops,
     loopTimeoutMs: 400, // 故意远大于总上限：能退出就证明起作用的是**总上限**，不是循环那一段
     totalTimeoutMs: 120,
+    // 506f：总预算里要给退出前刷日志留一块（默认 250ms > 本条的 120ms ⇒ race 预算会被压到 0）。
+    // 本条要证的是「总上限到点才退」，所以把预留收到 20ms：race 预算 = 100ms，下面的下限判据仍然有意义
+    // （「给 flush 留时间」的判据在 shutdown-flush-budget-506e.test.js 的 506f 一节，不在这里）。
+    flushReserveMs: 20,
     stopLoops: spyStopLoops(events),
   });
 
   assert.deepEqual(exits, [0], `到点必须 exit(0)（实测 ${JSON.stringify(exits)}）——旧代码这里根本没上限`);
   assert.equal(report.timedOut, true, '必须如实报「走到总上限」');
+  assert.equal(report.loopsBudgetMs, 100, `race 预算 = 总上限 - 预留（实测 ${report.loopsBudgetMs}）——预留是从总预算里切的，不是加在外面`);
   assert.ok(ms < 400, `总上限（120ms）起作用 ⇒ 不该等到循环那一段的上限（实测 ${ms}ms）`);
   assert.ok(ms >= 90, `总上限到点才退，不该提前跑（实测 ${ms}ms）`);
   assert.equal(report.loops, null, '循环 helper 还没返回就被总上限切掉（这条断言本身证明总上限在管整个流程）');
@@ -174,6 +179,7 @@ test('#506c 总上限也要覆盖 server.close 那一段：循环全收工、clo
     loops,
     loopTimeoutMs: 50,
     totalTimeoutMs: 200,
+    flushReserveMs: 20, // 同上一条：506f 之后总预算含 flush 预留，本条要证的仍是「等 close 等到预算用尽」
     stopLoops: spyStopLoops(events),
   });
 
