@@ -144,14 +144,20 @@ const partialFrames = (raw) => framesOf(raw).filter((f) => f.event === 'partial_
  * 所以重复不是「两个帧看起来一样」，而是「快照已含全文后，同一批碎片又被当增量追了一遍」。
  * 轮闸（`roundSeq`）按本连接已观测到的轮号解开（= 前端对上了），不拿它掩盖顺序 bug。
  */
-function assembleClientText(raw, { roundSeq } = {}) {
-  let text = '';
+function assembleClientText(raw, { roundSeq, clientHas = '' } = {}) {
+  let text = clientHas; // E2：断线**之前**客户端已有的那一段（默认空 = 原有语义不变）
   for (const f of framesOf(raw)) {
     if (f.event === 'assistant_delta') text += f.data?.text ?? '';
     else if (f.event === 'partial_output') {
       const frameSeq = typeof f.data?.roundSeq === 'number' ? f.data.roundSeq : null;
       if (roundSeq !== undefined && frameSeq !== roundSeq) continue; // 轮对不上 ⇒ 整帧丢弃
-      text = f.data?.text ?? text;
+      const snap = f.data?.text ?? '';
+      // **镜像前端的单调规则**（copilot 验收 E2，`useEventStream.ts` 的 `case 'partial_output'`）：
+      // 快照是当前正文的严格前缀 ⇒ 那是被 `textCap` 夹过的旧快照，忽略它，别把后缀盖掉。
+      // 前端那条规则本体由 `useEventStream.spec.ts` 具名用例承重；这里镜像它，是为了让本文件能量
+      // 「界面上那一段正文」而不是「帧序列」。两处必须一起改。
+      if (text && snap.length < text.length && text.startsWith(snap)) continue;
+      text = snap;
     }
   }
   return text;
@@ -198,6 +204,74 @@ test('#502 D-5：重连时内存里有未完稿正文 ⇒ 发一帧 source=memor
     // 与旧版完全一致，只是它防的对象从「两条活通路」变成「活通路 + 存量脏行」。
     const replaySql = s.pool.sqlLog.find((q) => q.includes('FROM run_events') && q.includes('seq >'));
     assert.match(replaySql, /type <> 'partial_output'/, `重放 SQL 未排除那一行：${replaySql}`);
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// copilot 复审 261115-01 的 **②**（**补发帧**这一半）：帧里真的带上了代际号 `textSegment`。
+// 前端拿它分「新一段（哪怕更短、哪怕恰是前缀）」与「同一段被 textCap 截过的那一份」；
+// `run-partial-buffer.test.js` 验的是缓冲那一半，这里验 `http.js#buildPartialSnapshotFrames` 真把
+// 它透到了帧里，并钉住 `chunks`/`roundSeq`/`truncated` 的语义**一个字没动**（additive 键）。
+// ---------------------------------------------------------------------------
+/** 直接喂一条事件（带**递增**的 `client_event_id` 计数：同一个号会被 at-least-once 判重整条丢掉）。 */
+function feed(runId, n, type, payload, seq) {
+  partialOutputs.observe(runId, {
+    session_id: SESSION_ID, run_id: runId, type,
+    client_event_id: `${runId}:1:${n}`, seq, payload,
+  });
+}
+
+test('copilot 复审②：快照帧带 textSegment（round_start / closeRound 各 +1），且既有键语义不变', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    feed(RUN_ID, 0, 'round_start', { round: 1 }, 2);
+    feed(RUN_ID, 1, 'assistant_delta', { text: '第一段说得很长' }, null);
+    assert.equal(partialOutputs.snapshot(RUN_ID).textSegment, 1, 'round_start ⇒ 代际 1');
+    partialOutputs.closeRound(RUN_ID);   // = durable round_end 的写入侧效果
+    assert.equal(partialOutputs.snapshot(RUN_ID).textSegment, 2, 'closeRound ⇒ 代际 2');
+    feed(RUN_ID, 2, 'round_start', { round: 2 }, 7);
+    feed(RUN_ID, 3, 'assistant_delta', { text: '第二段' }, null);
+    const raw = await s.stream({ lastEventId: 1 });
+    const parts = partialFrames(raw);
+    assert.equal(parts.length, 1, `只发还在写的这一段：${raw.slice(0, 200)}`);
+    const d = parts[0].data;
+    assert.equal(d.textSegment, 3, '代际透到了帧里（与缓冲读数同源，不留第二把尺）');
+    assert.equal(d.text, '第二段', '正文仍是当前那一段');
+    assert.equal(d.chunks, 1, '`chunks` 仍是「本轮正文片数」（跟着轮边界归零），没被代际改动');
+    assert.equal(d.roundSeq, 7, '`roundSeq` 仍是当前轮 round_start 自己的 seq');
+    assert.equal(d.round, 2);
+    assert.equal(d.truncated, false, '`truncated` 语义不变');
+    assert.equal(d.source, 'memory');
+    assert.ok(!('uptoSeq' in d), '代际不是第二个水位线，旧键也没被顺手复活');
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
+test('copilot 复审②：代际是 per-run 的 —— 两个 run 同时在流时各自带自己的号（互不污染）', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    const other = 'r-502-other';
+    feed(RUN_ID, 0, 'round_start', { round: 1 }, 2);
+    feed(RUN_ID, 1, 'assistant_delta', { text: '甲 run 的一段' }, null);
+    partialOutputs.closeRound(RUN_ID);
+    feed(RUN_ID, 2, 'round_start', { round: 2 }, 7);
+    feed(RUN_ID, 3, 'assistant_delta', { text: '甲 run 的第二段' }, null);   // 代际 3
+    feed(other, 0, 'round_start', { round: 1 }, 30);
+    feed(other, 1, 'assistant_delta', { text: '乙 run 的一段' }, null);      // 代际 1
+    const raw = await s.stream({ lastEventId: 1 });
+    const byId = Object.fromEntries(partialFrames(raw).map((f) => [f.data.run_id, f.data]));
+    assert.equal(Object.keys(byId).length, 2, `两个 run 各一帧：${raw.slice(0, 300)}`);
+    assert.equal(byId[RUN_ID].textSegment, 3, '甲 run 数自己的段');
+    assert.equal(byId[other].textSegment, 1, '乙 run 从自己的 1 起，不被甲 run 污染');
+    assert.notEqual(byId[RUN_ID].textSegment, byId[other].textSegment,
+      '两个 run 的代际读成同一个数 ⇒ 前端按 run 记账就白做了');
   } finally {
     reset();
     await s.close();
@@ -344,6 +418,69 @@ test('审计第 1 条：注册后、**补发窗口内**到达的同轮碎片不�
       `快照帧必须排在碎片之后（覆盖式不能排在追加式前面）：顺序=${JSON.stringify(evs)}`);
     // 碎片本身仍然发了（D-2 ① 那条红线没被这次修复弄回去：碎片**不许**被 sinceSeq 过滤掉）
     assert.equal(partialFrames(raw).length, 1, '快照仍只有一条（本轮就一段未完稿正文）');
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **E2** 条（261115-01）：正文**超过 `textCap`** 时，重连拼装后的正文
+// 不得比 flush 送达的那一份更短（后缀被快照吃掉）。
+//
+// 上面 A 用例（审计第 1 条）量的是**未截断**那一侧：「同一段碎片不得出现两遍」。这里补的是
+// **超上限**那一侧，形状相反：
+//   · 快照帧的 `text` 来自进程内正文缓冲，被 `PARTIAL_TEXT_CAP_DEFAULT = 16384` 夹过
+//     （`run-partial-buffer.js#append`：越界只置 `truncated`，**不追长尾**）；
+//   · 而 #513 改成「先 flush hub 缓冲、后发快照」之后，flush 出去的是**原始未截断**的碎片帧
+//     （`internal.js` 的 `rec.buffer` 按**条数**限，不按字节）；
+//   ⇒ 覆盖式的 `partial_output` 排在追加式的 `assistant_delta` **之后**（这正是审计第 1 条要的
+//     顺序），却带着**更短**的那一份 ⇒ 把刚送达的后缀盖掉。
+// 承重面分两处，各自会红：
+//   · **前端**那条规则（`useEventStream.ts` 的「同轮内正文只增不减」）由
+//     `useEventStream.spec.ts` 的具名用例承重（把那条 `startsWith` 守卫删掉就红）；
+//   · **本用例**钉的是「这个形状真的存在」：快照确实被夹到 16,384 且 `truncated:true`，
+//     而 flush 那一份是**完整**的 —— 也就是「快照比客户端手上的短」不是假设。
+//     谁哪天把正文缓冲的上限改掉/把快照改成不截断，本用例第一条断言就会红，提醒去重看这条口径。
+// ---------------------------------------------------------------------------
+test('copilot 验收 E2：正文超 textCap 的重连 ⇒ 快照是被截过的那一份，客户端拼装后不得比 flush 短', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    const head = '开'.repeat(10_000);   // 断线前已经流出去的 1 万字符
+    const tail = '尾'.repeat(10_000);   // **补发窗口内**到达的 1 万字符（同时进正文缓冲与 hub 缓冲）
+    feedDeltas(RUN_ID, [head]);
+    s.pool.onReplayQuery = async () => {
+      partialOutputs.observe(RUN_ID, {
+        session_id: SESSION_ID, run_id: RUN_ID, type: 'assistant_delta',
+        client_event_id: `${RUN_ID}:1:99`, seq: null, payload: { text: tail },
+      });
+      notifySessionEvents(SESSION_ID, [{
+        seq: null, ts: new Date().toISOString(), run_id: RUN_ID, type: 'assistant_delta',
+        payload: { text: tail },
+      }]);
+    };
+    const raw = await s.stream({ lastEventId: 1 });
+    const parts = partialFrames(raw);
+    assert.equal(parts.length, 1);
+
+    const full = head + tail;                       // 客户端断线前 + flush 之后手上的那一份
+    const snapText = parts[0].data.text;
+    // ① 夹具前提（承重）：正文确实**超了上限**，快照是被夹过的那一份，而 flush 那一份是完整的。
+    assert.ok(full.length > 16_384, `夹具本身要超 textCap 才测得到这条：${full.length}`);
+    assert.equal(snapText.length, 16_384, `快照正文必须恰是被夹过的 16,384 字符：实拿 ${snapText.length}`);
+    assert.equal(parts[0].data.truncated, true, '夹过 ⇒ 帧必须自报 truncated:true（观测位不许静默）');
+    assert.ok(full.startsWith(snapText), '快照是完整正文的前缀（E2 的形状；换成不截断就该重新看这条口径）');
+    const deltas = framesOf(raw).filter((f) => f.event === 'assistant_delta').map((f) => f.data?.text ?? '');
+    assert.ok(deltas.includes(tail), `flush 必须把完整的后 1 万字符原样送达（它不受 textCap 约束）：${JSON.stringify(deltas.map((t) => t.length))}`);
+
+    // ② 拼装面：客户端按 shipped 规则拼完之后，正文**不短于** flush 送达的那一份，后缀还在。
+    // 客户端断线**前**手上只有前 1 万字符（后 1 万是这次重连的 flush 才送达的），拼装面 =
+    // `clientHas: head` + flush 的碎片 + 那条被夹过的快照。
+    const got = assembleClientText(raw, { roundSeq: 2, clientHas: head });
+    assert.ok(got.length >= full.length, `后缀被快照吃掉了：拼出 ${got.length} 字符 < flush 送达的 ${full.length} 字符`);
+    assert.ok(got.endsWith(tail.slice(-200)), `后缀（最后 200 个字符）必须还在：${JSON.stringify(got.slice(-40))}`);
+    assert.equal(got, full, '拼装结果必须逐字等于完整正文（既不少后缀也不多一遗）');
   } finally {
     reset();
     await s.close();

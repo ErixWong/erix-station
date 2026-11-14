@@ -222,7 +222,10 @@ export type StreamEntry =
   | { kind: 'syserr'; text: string }
   | { kind: 'tool'; callId: string }
   | { kind: 'reasoning'; id: string; text: string }
-  | { kind: 'delta'; text: string }
+  // copilot 独立验收 #513 的 E 条：`runId` = **这段流式正文属于哪个 run**（`null` = 未知，旧后端
+  // 帧不带 `run_id`）。撤掉这份气泡时它是必核对的第二把尺——只比文本会跨 run 误删（见 store 里
+  // `deltaIdentity` 旁那段）。写成可选是为了不让一个新增字段去动既有 UI/测试的字面量形状。
+  | { kind: 'delta'; text: string; runId?: string | null }
   // issue #300：被停止/失败的 run **零助手锚点**（runner 的 catch 固定 final_text:''），而正文区
   // 本来就只从 messages 锚点渲染 ⇒ 界面上这次 run 一片空白。历史端点把它的 assistant_delta 按 seq
   // 聚合成一条合成项 partial_output（**不落库、不进 SSE**），本 kind 就是它在展示层的落点：
@@ -291,6 +294,23 @@ function partialText(payload: Record<string, unknown> | undefined): string {
 /** 同上：`truncated` 只认**真字面量 true**（缺键/脏值一律当「没截断」，不拿脏值冒充提示）。 */
 function partialTruncated(payload: Record<string, unknown> | undefined): boolean {
   return payload?.truncated === true;
+}
+
+/**
+ * copilot 最终验收 261115-01 第三轮的 **①**：**「这段正文的 run 身份未知」只有一个判据**。
+ *
+ * 这条链路上「不知道正文属于哪个 run」有**两种字面写法**，两者语义相同、值不同：
+ *   · `null` —— 帧里根本没带 `run_id`（`useEventStream` 的归一化：`typeof d.run_id === 'string' && d.run_id !== '' ? … : null`）；
+ *   · `'unknown'` —— `addPartialOutput` 的哨兵（`run_id` 缺失/脏值时条目 `id` 退化成 `partial:unknown`），
+ *     它会经 `es.deltaRunId`／`es.activeRunId` 落到 `deltaEntry.runId` 上（服务端真发了一帧 `run_id:'unknown'` 就够）。
+ *
+ * 改前两处判据**各拿一把尺**：`claimedLater` 只认 `null`（`deltaEntry.runId == null`），`sameRun` 却把
+ * `'unknown'` 当通配（`deltaOwner === 'unknown'`）⇒ 「出生身份 = `'unknown'`」这种**已知的未知**从
+ * `claimedLater` 漏下去、又被 `sameRun` 的通配放行 ⇒ **可能撤掉别人的气泡**（#513 E 条要防的形状，
+ * 换了个哨兵值回来）。现在两边共用这一个判据，**不再出现 `=== null` / `=== 'unknown'` 混用**。
+ */
+function isUnknownOwner(v: unknown): boolean {
+  return v == null || v === 'unknown';
 }
 
 /**
@@ -632,7 +652,77 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     // `es.deltaText.value = null` 的话：界面上旧的 delta 气泡还在，旁边又多一条 `kind:'partial'`
     // ⇒ 同一段正文两遍。`removeDeltaEntry()` 是靠 `deltaEntry` 找下标的，所以必须在它被 watcher
     // 清空**之前**调（反了就找不到 entry， splice 不进去）。
-    if (es.deltaText.value === text) {
+    // copilot 独立验收 #513 的 **E 条**（真缺陷）：原来这一条**只比文本、不比 run** ⇒ 会话里
+    // run A 正在流「同样的话」，而 history 归并来一条 run B 的 partial 且文本恰好一字不差
+    //（重试后重跑同一句、两句短答复撞车、旧 run 的半截正文与当前这段同文）⇒ A 的实时气泡被删，
+    // 用户正在打的那段字凭空消失，界面上换成 B 那份终稿。文本相同**不是**「同一段正文」的充分条件。
+    //
+    // 身份口径（两把尺：文本 + run）：
+    //   · `deltaEntry.runId` 是这段气泡出生时那一帧的 `run_id`（watcher 里钉的，见 `deltaEntry` 旁）；
+    //   · **未知**（`null` 或 `'unknown'` 哨兵 ⇒ 见 `isUnknownOwner`）⇒ 退回旧口径「只比文本」，不拿未知去否定已知——
+    //     否则旧后端下重复气泡再也撤不掉（同一段正文两遍，那是 #502 判据 4 的红线）。
+    //     **例外**：`claimedLater` 成立时**不撤**（未知身份 + 链路上后来出现过**别的**具体 run ⇒ 宁可不撤，见下面那两条判据）；
+    //   · 已知且**不等于**这条 partial 的 run ⇒ 那是别人的气泡，一个字都不许动。
+    // `removeDeltaEntry()` 的幂等性不变（它仍只靠 `deltaEntry` 单指针找下标，这里只是在**调它之前**
+    // 多问一句身份；不该调的时候一次都不调）。
+    //
+    // copilot 复审 261115-01 的 **①**（中）：`deltaEntry?.runId ?? es.deltaRunId.value` 那句把
+    // 「**没有 delta 条目**」与「**有条目但出生时身份未知（`runId === null`**）」混成了同一种 ——
+    // `??` 见 `null` 就当「没有」，于是**已钉成未知**的出生身份会被**后来**的 `es.deltaRunId` 补认领成
+    // 另一个 run（`partial_output` 帧每收一帧都无条件写 `deltaRunId`，见 `useEventStream.ts`）。
+    // 补认领之后 `sameRun` 就拿「后来的 run == 这条 partial 的 run」当「同 run」的证据 ⇒ E 条要修的
+    // **跨 run 误删**换了个触发路径回来（气泡其实属于那个「身份未知」的旧段）。
+    // 现在两档分开：条目在 ⇒ 身份**只认它出生那一刻钉的值**（未知就是未知，永不覆盖）；条目不在 ⇒
+    // 才退回读 `es.deltaRunId`（今天行为）。
+    const deltaOwner = deltaEntry ? (deltaEntry.runId ?? null) : (es.deltaRunId.value ?? null);
+    // 「未知身份」的兼容口径（只比文本）也有一条**下界**：链路上后来**出现过** run 身份时，
+    // 那个身份在**出生时**并不属于这个气泡（身份在出生那一刻就定了，见 `useEventStream` 的
+    // `deltaRunId` 口径），拿它去坐实「同 run」就是循环论证 ⇒ 宁可不撤，也不能撤错
+    //（撤错的代价 = 用户正在看的那段字凭空消失）。
+    //
+    // copilot 复审 261115-01 第三轮的 **①**（中·真实回归）：这条下界原来写的是「后来出现过**任何**
+    // run 身份 ⇒ 不撤」，**它没有比对「后来那个身份」与「这条 partial 自己的 `runId`」**。
+    // 于是这条本来**就属于 run-B** 的 delta 气泡 —— 它那几帧 `assistant_delta` 因竞态没带 `run_id`
+    // ⇒ 出生身份钉成 `null` —— 后来被 `partial_output` 帧把 `es.deltaRunId` 补成 `'run-B'` 之后，
+    // 来一条 `run_id='run-B'` 的同文本 partial 也照样**不撤** ⇒ **界面上同一段正文出现两遍**
+    //（#502 判据 4 的红线），而上面注释里「代价 = 可能两遍，刷新即回」这个代价**本来就消得掉**。
+    // 精确口径（只多加一个条件）：
+    //   · 后来出现的是**别的** run（`laterOwner !== runId`）⇒ **不撤**（未知不能当已知用，E 条）；
+    //   · 后来出现的**正是**这条 partial 的那个 run ⇒ 允许撤 —— 「补认领」与这条 partial 的归属
+    //     一致，撤掉的就是它自己那一份，不存在把别人的气泡抹掉的风险；
+    //   · 当时**没有**任何 run 身份可比（`laterOwner` 当前是未知 ⇒ 真·旧后端那一档，既有那条「身份未知 ⇒ 照旧撤」
+    //     用例钉的就是这一档）⇒ 退回只比文本。
+    //
+    // copilot 第三轮**最终验收**的 **①**（小·语义定死，紧接上面那条之后）：上面这三档原来**只认 `null`**，
+    // 而 `sameRun` 认的是 `null` **和** `'unknown'` ⇒ `'unknown'` 这个哨兵一身二职、两条判据读成两样：
+    //   · A 档（`deltaEntry.runId === null` + 具体 `laterOwner`）⇒ `claimedLater` 真 ⇒ 不撤（保守，可能两遍）；
+    //   · B 档（`deltaEntry.runId === 'unknown'` + 具体 `laterOwner`）⇒ `deltaEntry.runId == null` **假**
+    //     ⇒ `claimedLater` 假，而 `sameRun` 因 `'unknown'` 通配为真 ⇒ **撤掉别人的气泡**（这条是真风险）。
+    // 现在两边同一个 `isUnknownOwner`，B 档落进 A 档那一侧。**策略（定死，别再改回去）—— 精确版，
+    // 别写成「未知就一律不撤」（那是错的，见下面第三档）**：
+    //   ① 气泡出生身份**未知** + 链路上出现过**具体**身份 + 那个具体身份**不是**这条 partial 的 run
+    //      ⇒ **不撤**（身份矛盾已知，撤错代价 > 多一行）；
+    //   ② 气泡出生身份**未知** + 出现过的具体身份**正是**这条 partial 的 run ⇒ **撤**
+    //      （补认领与归属一致，撤掉的就是它自己那一份）；
+    //   ③ `laterOwner` **当前**未知（`null` 或 `'unknown'` ⇒ 见 `isUnknownOwner`）⇒ 退回**只比文本**的旧兼容
+    //      口径，**照旧撤**。这一档**必须**保留：否则真·旧后端（帧里从不带 `run_id`）下同文两遍会全回来，
+    //      那是 #502 判据 4 的红线。
+    //      ⚠ 口径只到「当前值」：这一档读的是**此刻**的 `es.deltaRunId`，它证明不了这条链路**历史上**
+    //      一个具体身份都没出现过（后续被接受的快照帧会再次赋值它，见 `useEventStream.ts:1169-1171`）
+    //      ⇒ 这里**不许**写成「整条链路/历史上一律」那类强断言。
+    //      ⚠ **别把「压根没有 delta 条目」并进这一档**（copilot 第四轮 ①，纯注释精确化，行为一字未动）：
+    //      `deltaEntry === null` 时 `deltaOwner` 取的是 `es.deltaRunId`（见上面那行），它若是个**具体** run
+    //      ⇒ `sameRun` 仍按 run 身份比较，**不是**无条件只比文本；只是此时 `removeDeltaEntry()` 本来也无
+    //      条目可撤（它只认 `deltaEntry` 那根单指针），撤与不撤在界面上等价。
+    // **①档的代价**：同一段正文可能在界面上出现两遍（delta 气泡 + 中性气泡）——多一行刷新即回，
+    // 撤错的那段字看不见，所以这一档宁可多一行。
+    const laterOwner = es.deltaRunId.value ?? null;
+    // 三个条件缺一就退化成撤错：气泡身份**未知** + 后来出现了**具体**身份 + 那个具体身份**不是**这条 partial 的 run。
+    const claimedLater = deltaEntry !== null && isUnknownOwner(deltaEntry.runId)
+      && laterOwner !== null && !isUnknownOwner(laterOwner) && laterOwner !== runId;
+    const sameRun = !claimedLater
+      && (isUnknownOwner(deltaOwner) || isUnknownOwner(runId) || deltaOwner === runId);
+    if (sameRun && es.deltaText.value === text) {
       removeDeltaEntry();
       es.deltaText.value = null;
     }
@@ -786,7 +876,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   watch(es.deltaText, (v, old) => {
     if (v === null) { deltaEntry = null; return; }
     if (old === null) {
-      deltaEntry = { kind: 'delta', text: '' };
+      // E 条：这段气泡的身份在**它诞生那一刻**就定下来（composable 那边 `deltaRunId` 与 `deltaText`
+      // 同生共死）；这里兜一层 `activeRunId` 是给「不经过事件面直接写 deltaText」的调用方
+      // （既有单测/旧后端）留的旧口径，不至于因为身份未知就永远撤不掉重复气泡。
+      deltaEntry = { kind: 'delta', text: '', runId: es.deltaRunId.value ?? es.activeRunId.value ?? null };
       entries.value.push(deltaEntry);
       // ⚠️ 必须改回读数组里的 reactive proxy：数组内部存的是 raw 对象，直接 mutate push 前的
       // raw 引用不经过 proxy set 陷阱 → 不触发渲染（打字机效果丢失，文字要等下一次
@@ -798,6 +891,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (deltaEntry) deltaEntry.text = v;
   });
   // 当前 run_end 移除活动增量占位（旧 S.deltaBuf.remove()）。
+  // ⚠ `if (!deltaEntry) return;` 是**不可达但承重**的早退（copilot 第五轮 ②）：`deltaText` 非空时 watcher 必已
+  // 建好/留住那条条目，而清空这根指针的三处调用点**都同时**把 `deltaText` 置 `null`（`onCurrentRunEnd`、
+  // `applyServerRunState`、本函数末尾那一步）⇒ 「无条目但 `deltaText` 与这条 partial 同文」在真实路径上凑不出来。
+  // **不许在这里做任何「顺手清理」**（尤其不许在这里删 `kind:'partial'`：partial 的归属与撤不撤 delta 气泡无关，
+  // 删错了就是用户正看的正文凭空消失）。防这个变异的用例是源码钉（`workbench.spec.ts` 里名字带「源码钉」那条），
+  // 理由同上：运行时走不到这个分支，运行时用例钉不住它。
   function removeDeltaEntry() {
     if (!deltaEntry) return;
     const i = entries.value.indexOf(deltaEntry);

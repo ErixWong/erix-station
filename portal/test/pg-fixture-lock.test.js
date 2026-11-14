@@ -49,13 +49,77 @@ test('审计第 8 条：CREATE DATABASE 抛错 ⇒ 锁**当场释放**（后续 
   fs.rmSync(path.dirname(file), { recursive: true, force: true });
 });
 
-test('夹具（反向自证）：用例体抛错 / migrate 抛错也照样释放；正常路径也释放', async () => {
+// copilot 独立验收 #513 的 **H 条**（261115-01）：下面三条把「finally 那一段会不会泄锁」钉死。
+// 原来这里第二条的**标题写着「migrate 抛错」，实际传的是 `{ migrate: false }`** ⇒ 迁移失败路径
+// 一次都没跑过（名不副实的用例比没有用例更坑：它让人以为那条已经绿了）。同时 `finally` 里的
+// `await dropDb(name).catch(() => {})` 只能接住**返回 Promise 的拒绝**：`dropDb` 是注入点，
+// 注入一个**同步抛错**的实现时异常在 `.catch` 挂上之前就离开这条 async 链 ⇒ `release()` 被跳过。
+// 三条都断「下一次 acquire **不用等**」（时间差才是锁释放的直接证据；单看 `existsSync` 会被
+// 「文件在但内容是别人的」骗过去，所以下面既看时间也看 token，不只是 existsSync）。
+const releasedNow = async (file, why) => {
+  const t0 = Date.now();
+  const release = await acquireBootstrapLock({ file, timeoutMs: 2_000, staleMs: 600_000 });
+  assert.ok(Date.now() - t0 < 1_000, `${why}：acquire 等了 ${Date.now() - t0}ms ⇒ 上一把没当场释放（是等 stale 才赢的）`);
+  const held = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(held.pid, process.pid, `${why}：拿到的必须是自己的新锁（不是别人的残留）`);
+  release();
+};
+
+test('夹具：migrate **真的抛错**（注入一个会抛的 migrateImpl）⇒ 锁当场释放', async () => {
+  const file = tmpLock('migrate-throws');
+  const ok = fakeFixture(file, async () => ({ rows: [] }));
+  // 迁移失败**之前**建库已经成功 ⇒ 这一条测的是 `try` 体后半段（原来那条传 `{ migrate: false }`
+  // 恰好把这段整个绕开，等于没测）。断言拒绝原因来自注入的那个错，别退化成「别的什么错」。
+  await assert.rejects(
+    () => ok.withFreshDatabase(
+      () => assert.fail('迁移都没过去，用例体一次都不该跑'),
+      { migrateImpl: async () => { throw new Error('migrate blew up'); } },
+    ),
+    /migrate blew up/,
+  );
+  await releasedNow(file, 'migrate 抛错');
+  fs.rmSync(path.dirname(file), { recursive: true, force: true });
+});
+
+test('夹具：dropDb **同步抛错**（注入的实现不是 async 也不是 Promise）⇒ 锁仍然释放', async () => {
+  const file = tmpLock('drop-sync');
+  // `dropDatabase` 直接 throw（不是 return Promise.reject）：这正是 `.catch(() => {})` 接不住的形状
+  const fx = createPgFixture('postgres://u:p@127.0.0.1:1/none', {
+    prefix: 'lktest',
+    lockFile: file,
+    createDatabase: async () => ({ rows: [] }),
+    dropDatabase: () => { throw new Error('drop sync boom'); },
+  });
+  let ran = false;
+  // 用例体正常跑完，错出在 finally 的删库那一腿上 ⇒ `withFreshDatabase` 本身仍算成功
+  await fx.withFreshDatabase(() => { ran = true; }, { migrate: false });
+  assert.equal(ran, true, '前置：用例体确实跑了（错只该出在清理腿）');
+  await releasedNow(file, 'dropDb 同步抛错');
+  fs.rmSync(path.dirname(file), { recursive: true, force: true });
+});
+
+test('夹具：dropDb 返回的不是 Promise（脏注入）⇒ 锁仍然释放，且用例体的返回值照旧透出', async () => {
+  const file = tmpLock('drop-nonpromise');
+  const fx = createPgFixture('postgres://u:p@127.0.0.1:1/none', {
+    prefix: 'lktest',
+    lockFile: file,
+    createDatabase: async () => ({ rows: [] }),
+    dropDatabase: () => undefined, // 没有 .catch 可用：老写法 `dropDb(name).catch(...)` 会 TypeError
+  });
+  const got = await fx.withFreshDatabase(() => 'BODY-OK', { migrate: false });
+  assert.equal(got, 'BODY-OK', 'finally 那条腿炸了不许吃掉用例体的返回值');
+  await releasedNow(file, 'dropDb 返回非 Promise');
+  fs.rmSync(path.dirname(file), { recursive: true, force: true });
+});
+
+test('夹具（反向自证）：用例体抛错 / 正常路径都释放；正常路径的返回值照旧透出', async () => {
   const file = tmpLock('body');
   const ok = fakeFixture(file, async () => ({ rows: [] }));
-  // 用例体抛错
-  await assert.rejects(() => ok.withFreshDatabase(() => { throw new Error('用例体炸了'); }, { migrate: false }));
+  await assert.rejects(
+    () => ok.withFreshDatabase(() => { throw new Error('用例体炸了'); }, { migrate: false }),
+    /用例体炸了/,
+  );
   assert.equal(fs.existsSync(file), false, '用例体抛错也必须释放');
-  // 正常路径
   let ran = false;
   await ok.withFreshDatabase(() => { ran = true; }, { migrate: false });
   assert.equal(ran, true, '前置：正常路径确实跑了');

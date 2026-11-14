@@ -2605,6 +2605,11 @@ function buildPartialSnapshotFrames({ sessionId }) {
       round: snap.round,
       text: snap.text, reasoning: snap.reasoning,
       chunks: snap.chunks, truncated: snap.truncated,
+      // copilot 复审 261115-01 的 **②**（**additive 键**：`chunks`/`roundSeq`/`truncated` 语义不动）：
+      // 正文段的**代际号**（`run-partial-buffer.js`，只在 `round_start`/`closeRound` 两处 +1）。
+      // 前端拿它分「新的一段（哪怕更短、哪怕恰是前缀）」与「同一段被截过的那一份」；
+      // 旧前端不读这个键 ⇒ 多发一个键不破任何既有口径。
+      textSegment: snap.textSegment,
       source: 'memory',
     });
   }

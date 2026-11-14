@@ -543,6 +543,16 @@ export interface EventStreamHooks {
   onEvent?: (type: string, payload: Record<string, any>, history: boolean) => void;
 }
 
+/**
+ * 轮号段 → 可比较的数字（copilot 验收 #513 D 条：旧页「只进不退」要比大小，而水位存的是**串**）。
+ * `UNKNOWN_ROUND_TOKEN`（`?`）与非数字串 ⇒ null（= 不可比较）。**0 是合法轮号**，所以用
+ * `Number.isFinite` 分类而不是拿 truthy 当判据（与 `lib/toolCardKey.ts` 的 `roundNumberToken` 同口径）。
+ */
+function roundTokenNumber(token: string): number | null {
+  if (token === UNKNOWN_ROUND_TOKEN || token === '') return null;
+  return Number.isFinite(Number(token)) ? Number(token) : null;
+}
+
 // dig 摘要：对象 → JSON 截 120 字；其余 → String 截 120（旧 toolCard 原样）。
 function digText(input: unknown): string {
   return (typeof input === 'object' ? JSON.stringify(input ?? {}) : String(input ?? '')).slice(0, 120);
@@ -556,6 +566,21 @@ export function useEventStream(hooks: EventStreamHooks) {
   // 流式增量气泡文本（旧 S.deltaBuf 指向的 DOM 的 textContent；null = 无活动气泡）。
   // round_start 只置 null（旧版不 remove 元素——半截增量留在流里）；当前 run_end 才移除。
   const deltaText = ref<string | null>(null);
+  /**
+   * **这一段流式正文属于哪个 run**（copilot 独立验收 #513 的 E 条，261115-01）。
+   *
+   * 存在的理由：`workbench#addPartialOutput` 原来在「中性气泡的文本 == 流式气泡的文本」时**只比文本
+   * 不比 run** 就撤掉那份实时气泡 ⇒ 旧 run 的历史 partial 与当前活跃 run 正在流的正文**恰好同文本**
+   * 时，当前 run 的气泡被删（同一段话由两个 run 各说一遍是常态：重试、或两句短答复撞车）。
+   * 文本不足以当身份 ⇒ 需要一个与 `deltaText` 同生共死的 run 身份。口径：
+   *   · 值 = **这段气泡起点那一帧**的 `run_id`（`assistant_delta` / `partial_output` 两个真实写点）；
+   *     脏值/缺位 ⇒ `null` = 身份未知（旧后端帧不带 `run_id`）——宿主侧对「未知」按旧口径处理，
+   *     不拿未知去否定已知（否则旧后端就再也撤不掉重复气泡，同一段正文在界面上两遍）；
+   *   · 气泡已存在时**不改写**它：这段正文的归属由「谁起这段」决定，中途换 run 的帧不偷身份；
+   *   · `deltaText` 被置 null 的每一处（`round_start` 非旧页 / 空快照 / 当前 run 的 `run_end` /
+   *     `resetStreamState`）**同步**置 null —— 留着旧值就是给下一段气泡挂上上一段的主。
+   */
+  const deltaRunId = ref<string | null>(null);
   // 工具卡片状态（旧 S.toolCards）。issue #279：**键不再是裸 provider `tool_call_id`**，而是含轮号的
   // 组合键（`<run>:<轮号>:<callId>`，缺位的段不拼；尺规在 `lib/toolCardKey.ts`，三条路径共用）。
   // 会话级 Map、只在 resetStreamState 清空 ⇒ 把 run 写进键顺带修掉「同会话两个 run 共用 `c1` 串台」。
@@ -575,6 +600,19 @@ export function useEventStream(hooks: EventStreamHooks) {
    * 值只可能是有限整数或 `null`（事件没带可用 seq ⇒ 记 null，后续帧一律不覆盖，宁少盖不错盖）。
    */
   const roundSeqByRun = new Map<string, number | null>();
+  /**
+   * copilot 复审 261115-01 的 **②**：本连接**已接受的**「该 run 的正文段代际号」（= 服务端
+   * `run-partial-buffer.js` 的 `textSegment`，只在 `round_start` / `closeRound` 两处 +1）。
+   *
+   * 为什么需要它（旧的 E2 前缀守卫缺的就是这个信号）：同轮内正文**合法地**重新变短是可能的
+   *（`round_end` 之后下一段开写，而 `round_start` 木有到 / 新段恰好是旧段的前缀），前缀规则
+   * 分不出「同一段被 textCap 截过的那一份」（该忽略）与「新一段恰好更短」（该接受），
+   * 于是过期正文被**永久**保留（不是刷新即回那种）。
+   * 为什么不能拿 `chunks` 当代际信号：它在 `round_start` 与 `closeRound` 都会**归零**，新段也从 0 起。
+   * 生命周期：与 `roundSeqByRun` 同（只在 `resetStreamState` 清）；条目数 = 本会话观测到的 run 数。
+   * 读法三档与 `observeRoundSeq` 同一口径：`undefined` = 从未观测，有限数 = 已知水位。
+   */
+  const deltaSegmentByRun = new Map<string, number>();
   // issue #279 关联索引：provider `callId` → **最新一张**卡片的身份键 + 它的 run + 它已知的最细轮号。
   // 只用于「结果/投影找到已有那张卡」，**不得当身份**（同一个 id 跨轮时身份是两张卡、索引只指向
   // 最新那张——具名用例钉住）。存结构体而不是只存 key：归并时要能判「跨 run 不许归并」「两侧轮号都
@@ -613,11 +651,37 @@ export function useEventStream(hooks: EventStreamHooks) {
     connect(id, lastSeq.value);
   }
 
-  /** 轮号观测（仅由带轮号的事件写入；载荷脏 ⇒ 记为未知，不拿旧轮号冒充）。 */
-  function observeRound(runId: unknown, round: unknown): void {
+  /**
+   * 轮号观测（仅由带轮号的事件写入；载荷脏 ⇒ 记为未知，不拿旧轮号冒充）。
+   *
+   * copilot 独立验收 #513 的 **D 条**（261115-01）：`observeRoundSeq` 有 `olderPage` 保护而它没有
+   * ⇒ `case 'round_start'` 先调这个、再调那个，用户往上滚加载更早一页时，旧页那轮的 `round_start`
+   * 会把 `roundTokenByRun` **改回旧轮** ⇒ 后续工具卡片身份（`cardIdentity` → `roundTokenFor`）用错
+   * token（新调用被归到旧轮那张卡上，#279 那套身份尺就白做了）。现在两个观测面同一个口径，
+   * `roundTokenByRun` 里三档读法逐字分开：
+   *   · `undefined`（Map 里根本没这个 run）= **从未观测** ⇒ 旧页可以写（那时它就是初始重建面）；
+   *   · `UNKNOWN_ROUND_TOKEN`（`?`）= **已观测但轮号未知** ⇒ 旧页**不得写**（与 `roundSeqByRun` 的
+   *     `null` 同一口径：这个 run 我们已经见过了，只是拿不到轮号；旧页那个号多半比当前轮更旧，
+   *     写进去就是把卡片身份错挂到旧轮上，宁缺不错）；
+   *   · 有限轮号 = **可比较的水位** ⇒ 旧页只进不退（`<=` 一律不写；旧页拿来的是脏值也不许盖掉好值）。
+   * 首轮号从 0 起是合法值（与 `lib/toolCardKey.ts` 的 `roundNumberToken` 同一口径），所以下面用
+   * `Number.isFinite` 而不是「truthy」分类。
+   */
+  function observeRound(runId: unknown, round: unknown, olderPage = false): void {
     if (typeof runId !== 'string' || runId === '') return;
-    roundTokenByRun.set(runId, eventRoundToken(round));
+    const incoming = eventRoundToken(round);
+    if (olderPage) {
+      const cur = roundTokenByRun.get(runId);
+      if (cur !== undefined) {
+        const curNum = roundTokenNumber(cur);
+        const incomingNum = roundTokenNumber(incoming);
+        // 已观测但轮号未知（`?`）⇒ 谁都不许盖；已知有限轮号 ⇒ 只进不退（脏值也挡掉）。
+        if (curNum === null || incomingNum === null || incomingNum <= curNum) return;
+      }
+    }
+    roundTokenByRun.set(runId, incoming);
   }
+
 
   /**
    * issue #502 形态 M：记「这个 run 当前轮的轮起点 seq」（只从 `case 'round_start'` 来）。
@@ -635,14 +699,23 @@ export function useEventStream(hooks: EventStreamHooks) {
    *     旧页拿来的不大于它 ⇒ 那是更旧（或脏）的一轮，不写；
    *   · **没观测过就照旧写**（含写 null）：那时它就是首屏历史重建面，轮水位只能靠它，
    *     #502 形态 M 的原口径一个字没变。
+   *
+   * copilot 独立验收 #513 的 **D 条**补上原来糊在一起的那两档：`Map.get()` 返回
+   *   · `undefined` = **该 run 从未观测** ⇒ 旧页的有限 seq **可以写**；
+   *   · `null` = **已观测但轮起点未知** ⇒ 旧页的有限 seq **不得写**（保持 #502 自己定的「谁都不许
+   *     盖」：写进去就是把一个更旧轮的起点号当成当前轮，而下一帧快照会拿着它错盖正文）。
+   * 旧写法 `cur !== null && cur !== undefined && …` 把两档归成「都可以写」，与它自己注释里的
+   * 「宁缺不错」直接矛盾 ⇒ 现在逐档分开。
    */
   function observeRoundSeq(runId: unknown, seq: unknown, olderPage = false): void {
     if (typeof runId !== 'string' || runId === '') return;
     const finite = typeof seq === 'number' && Number.isFinite(seq) ? seq : null;
     if (olderPage) {
       const cur = roundSeqByRun.get(runId);
-      // 「该 run 已有更新的 round_start」⇒ 旧页那一行不得写（既不回退，也不拿脏值盖掉好值）。
-      if (cur !== null && cur !== undefined && (finite === null || finite <= cur)) return;
+      if (cur !== undefined) {
+        // 已观测过这个 run：`null` ⇒ 谁都不许盖；有限数 ⇒ 只进不退（旧页的脏值也不许盖好值）。
+        if (cur === null || finite === null || finite <= cur) return;
+      }
     }
     // 只认**数字**（不用 `Number(seq)` 把 null/'' 镀成 0：那会把「未知」当成「第 0 轮」，
     // 而 seq 从 1 起 ⇒ 看起来永远对不上，但下面的帧侧一旦碰上 seq=0 的脏值就会错盖）。
@@ -859,16 +932,20 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'round_start':
         // 审计第 4 条：**旧页回放不得清实时气泡**（旧页那一轮早就说完了，与「当前正在流的这一
         // 段」无关；清了就是用户滚一下滚动条把正在打字的气泡弄没了）。首屏历史重建照旧清。
-        if (!olderPage && deltaText.value) { deltaText.value = null; }
+        if (!olderPage && deltaText.value) { deltaText.value = null; deltaRunId.value = null; }
         // issue #279：本 run 的轮号水位线（卡片身份的唯一轮号来源；实时与历史回放都走这里）。
-        observeRound(d.run_id, d.round);
+        // copilot 验收 #513 D 条：`olderPage` 一并转下去 ⇒ 旧页**也不得回退轮号**（原来只有下面
+        // 那个 seq 观测面有保护，于是旧页会把卡片身份的轮号改回旧轮）。
+        observeRound(d.run_id, d.round, olderPage);
         // issue #502 形态 M：同一处顺手记「本轮的轮起点 seq」⇒ `partial_output` 快照帧拿它对账
         //（实时帧与历史回放行都带 `seq`，`replayEvent` 把 `raw.seq` 放进 `d` ⇒ 两路同一个号）。
         // `olderPage` 转下去 ⇒ 旧页只进不退（审计第 4 条）。
         observeRoundSeq(d.run_id, d.seq, olderPage);
         hooks.onSep(`round ${d.round}`); return;
       case 'attempt':
-        observeRound(d.run_id, d.round); // 重试仍在同一轮内（#279：round_start 漏收时的补点）
+        // 重试仍在同一轮内（#279：round_start 漏收时的补点）。copilot 验收 #513 D 条：`attempt` 也在
+        // 历史回放白名单里 ⇒ 旧页那一页的 attempt 同样是「更旧的一轮」，口径与 round_start 一致。
+        observeRound(d.run_id, d.round, olderPage);
         hooks.onSep(t('stream.event.attempt', { round: d.round, attempt: d.attempt, max: d.maxAttempts }));
         return;
       case 'attempt_killed': {
@@ -1010,7 +1087,7 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 账在 runner 的 LOG（`runner/lib/engine-notices.js`）——只读日志的人也看得见。
         return;
       case 'recovering':
-        observeRound(d.run_id, d.round); // 同 attempt：轮内重试，轮号仍是当前轮（#279）
+        observeRound(d.run_id, d.round, olderPage); // 同 attempt：轮内重试，轮号仍是当前轮（#279）
         hooks.onSep(t('stream.event.recovering', { attempt: d.attempt, max: d.maxAttempts }));
         return;
       case 'recovered': hooks.onSep(t('stream.event.recovered')); return;
@@ -1041,12 +1118,65 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 空正文 ⇒ 清气泡但**不拆占位行**：占位的家已搬进历史投影（`workbench#addPartialOutput`）。
         // 旧分支在这里发 `stream.event.partialOutputLost` 分隔行，但后端形态 M 的快照帧**根本不发空帧**
         //（`http.js` `buildPartialSnapshotFrames` 对空缓冲直接 `return`），那条行在这里再也响不响。
-        if (text === '') { deltaText.value = null; return; }
+        //
+        // ⚠ **顺序承重（copilot 独立验收 #513 的 E2 条）**：这条空串分支必须在下面那条「只增不减」
+        // **之前**。`'abc'.startsWith('')` 是 **true**，而 `0 < 3` 也成立 ⇒ 空串**落不进**「天然不成立」
+        // 那一类（工单里写的那句判断在 JS 里不成立，实测）：把它放到空串分支前面，`text:''` 就从
+        // 「清空气泡」退化成「整帧忽略」，下面那条既有的「真·空串仍然清空」用例立刻红。
+        if (text === '') { deltaText.value = null; deltaRunId.value = null; return; }
+        // copilot 独立验收 #513 的 **E2**：同轮内正文**只增不减**——快照是被 `textCap` 夹过的那一份，
+        // 不得把已经送达的后缀抹掉。为什么「覆盖式」还需要这条单调规则：
+        //   · 快照帧的 `text` 来自进程内正文缓冲，那里被 `PARTIAL_TEXT_CAP_DEFAULT = 16384`
+        //     夹过（`run-partial-buffer.js#append`，越界只置 `truncated` 不追长尾）；
+        //   · 而 #513 把顺序改成「先 flush hub 缓冲、后发快照」，flush 出去的是**原始未截断**的碎片帧
+        //     （`internal.js` 的 `rec.buffer` 按**条数**限，不按字节）；
+        //   ⇒ 正文超过 16,384 时，flush 刚把**完整**正文送到客户端，紧随其后的快照只有**前 16,384 个
+        //     字符**，覆盖式赋值就把刚送达的后缀**永久吃掉**（直到 round_end/历史刷新才补得回来）。
+        // 判据用「快照是当前正文的**严格前缀**」而不是「`truncated:true`」：截断位是两路共用的观测位
+        //（`run-partial-buffer.js` 的 `truncatedByCap`，reasoning 截尾也置它），而前缀关系本身就是
+        // 「它是同一段的较短那份」的直接证据。不是前缀 ⇒ 快照仍然权威覆盖（判据 4 两个方向不许改坏）。
+        //
+        // ⚠ **copilot 复审 261115-01 的 ②：光有前缀规则不够 —— 它缺一个「代际」信号**。
+        // 「较短且是前缀」有两种读数，前端拿文本形状分不出：
+        //   · (a) 同一段被 `textCap` 截过的那一份 ⇒ **该忽略**（否则刚送达的后缀被永久吃掉）；
+        //   · (b) 同轮内正文**合法地**重新变短（新一段的内容恰是旧一段的前缀）⇒ **该接受**，
+        //     旧规则把它当 (a) ⇒ 过期正文被**永久**保留（刷新前再也不会被任何后续快照修正，
+        //     因为新快照只会更长、而它已经等于当前值）。
+        // 服务端因此额外带一个**单调不减**的代际号 `textSegment`（只在正文段边界 +1），规则**三条**：
+        //   1. `textSegment > 本连接已记录的` ⇒ **接受**（新的一段，哪怕更短、哪怕恰是前缀）并更新记录；
+        //   2. `textSegment === 已记录的` 且快照是当前正文的**严格前缀** ⇒ **忽略**（就是上面那条 E2
+        //      截断保护，仍然必要，本单一字不改它的行为）；
+        //   3. `textSegment < 已记录的` ⇒ **忽略**（过期快照；不更新记录，否则水位线会倒退）。
+        // 两个兜底档（都不是新规则，是把「不知道」归到保守那一侧）：
+        //   · 帧里**没有** `textSegment`（旧后端）⇒ 退回上面那条前缀规则，不报错（additive 键的兼容口径）；
+        //   · 本连接**从未**见过该 run 的代际号（刚重连）⇒ 也走前缀规则（拿不到代际就不知道它是
+        //     (a) 还是 (b)，按「宁可少盖一次，刷新即回」取舍；同时把代际记下来，之后的 +1 就能接上）。
+        // 记录只在帧过了上面 run/轮双闸**之后**才写（整帧丢弃的帧不配推水位线），且只进不退。
+        const frameSegment = typeof d.textSegment === 'number' && Number.isFinite(d.textSegment)
+          ? d.textSegment : null; // 缺键/脏值 ⇒ null = 旧后端（或脏帧），走前缀规则
+        const seenSegment = deltaSegmentByRun.get(d.run_id as string); // undefined = 本连接从未观测
+        const hasSegment = frameSegment !== null && seenSegment !== undefined;
+        const strictPrefix = !!deltaText.value && text.length < deltaText.value.length
+          && deltaText.value.startsWith(text);
+        // 水位线**先推再判**（推的是代际，不是正文）：「从未观测 + 恰是前缀」那一档也会 return，
+        // 不先推就把基线永遥建不起来，下一次 +1 的帧照样被当前缀规则吞掉。
+        // 只进不退：比基线旧的帧（规则 3）不得把水位拉回去；代际是**事实**，与本帧正文盖不盖无关。
+        if (frameSegment !== null && (seenSegment === undefined || frameSegment > seenSegment)) {
+          deltaSegmentByRun.set(d.run_id as string, frameSegment);
+        }
+        if (hasSegment && frameSegment < seenSegment) return;                 // 规则 3：过期一代
+        if (!(hasSegment && frameSegment > seenSegment) && strictPrefix) return; // 规则 2 / 两个兜底档
         deltaText.value = text;
+        // E 条：这段快照正文的归属（上面 `runOk` 已保证 `d.run_id` 是非空字符串，不重复守卫）。
+        deltaRunId.value = d.run_id as string;
         return;
       }
       case 'assistant_delta':
-        if (deltaText.value === null) deltaText.value = '';
+        if (deltaText.value === null) {
+          deltaText.value = '';
+          // E 条：气泡**起点**那一帧的 run 就是这段正文的身份（后续帧不改写它）。
+          deltaRunId.value = typeof d.run_id === 'string' && d.run_id !== '' ? d.run_id : null;
+        }
         deltaText.value += d.text ?? '';
         return;
       case 'reasoning_delta': return; // 推理增量 P1 不展示
@@ -1135,7 +1265,7 @@ export function useEventStream(hooks: EventStreamHooks) {
         const isCurrent = d.run_id === activeRunId.value;
         if (isCurrent) {
           // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）。
-          if (deltaText.value !== null) deltaText.value = null;
+          if (deltaText.value !== null) { deltaText.value = null; deltaRunId.value = null; }
           const reason = d.termination?.reason ?? '';
           const usage = d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : '';
           // issue #42 / #212 / #236：终止原因分级——异常集合红色告警，正常收尾灰色中性。
@@ -1174,18 +1304,22 @@ export function useEventStream(hooks: EventStreamHooks) {
     lastSeq.value = 0;
     activeRunId.value = null;
     deltaText.value = null;
+    deltaRunId.value = null; // E 条：身份与正文同生命周期
     toolCards.clear();
     // issue #279：轮号观测面与关联索引同生命周期（都得跟着卡片清，不然跨会话串轮号/串卡）。
     roundTokenByRun.clear();
     // issue #502 形态 M：轮起点 seq 同生命周期 —— 不清会让下一个会话的第一条快照帧拿去比
     // **上一个会话某个 run** 的号（run_id 不同 ⇒ 实际是 miss，但语义上这里必须是空的）。
     roundSeqByRun.clear();
+    // copilot 复审 ②：代际号同生命周期（不清就会拿**上一个会话**某个 run 的代际去比新会话的 run，
+    // 尺对不上 ⇒ 新段被当旧帧丢掉）。
+    deltaSegmentByRun.clear();
     cardByCallId.clear();
     esSessionId.value = null;
   }
 
   return {
-    lastSeq, esSessionId, activeRunId, deltaText, toolCards,
+    lastSeq, esSessionId, activeRunId, deltaText, deltaRunId, toolCards,
     connect, closeEs, resetStreamState,
     // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）；
     // replayEvent 供 openSession 历史归并回放驱动（issue #89）；projectToolCard 供 DTO 投影路径（#188）。

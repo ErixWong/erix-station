@@ -6,6 +6,9 @@ import { createPinia, setActivePinia } from 'pinia';
 import { setWorkbenchHooks, useWorkbenchStore, type StreamEntry } from './workbench';
 import type { RunHistoryEvent } from '../composables/useEventStream';
 import { setLocale } from '../i18n';
+// 源码钉用的**同一份**源码文本（vite `?raw` 构建期读盘，不用 `node:fs`——jsdom 下会被 externalize，#349 的坑）。
+// 先例：`lib/terminationReasons.spec.ts`、`views/LoginView.spec.ts`。
+import workbenchSource from './workbench.ts?raw';
 // issue #431：断言复位连模块级展开记忆一起清（它不属于 store，只能从外部函数看）
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 
@@ -2848,5 +2851,530 @@ describe('审计第 4 条（store 接线）：loadOlderMessages 走的是"旧页
     // 轮水位没回退 ⇒ 当前轮的快照仍被双闸接受
     es.emit('partial_output', { run_id: 'r-current', roundSeq: 60, text: '正在流的那段＋快照', chunks: 5, source: 'memory' });
     expect(store.es.deltaText).toBe('正在流的那段＋快照');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **E 条**（261114-05 → 261115-01）：同文本**跨 run** 不得误删正在流的气泡
+//
+// `addPartialOutput` 原来那句是 `if (es.deltaText.value === text) { removeDeltaEntry(); ... }`
+// —— 只比文本、不比 run。会话里 run A 正在流「同样的话」，而 history 归并来一条 run B 的
+// partial_output 且文本恰好一字不差（重试后重跑同一句、两句短答复撞车、旧 run 那半截与当前这段
+// 同文）⇒ A 的实时气泡被删掉，用户正在打的那段字凭空消失，界面上换成 B 的终稿。
+// 修法：delta 条目带上**来源 run**（`useEventStream` 的 `deltaRunId` 与 `deltaText` 同生共死），
+// 移除时两把尺一起核对。下面三条把「跨 run 不删 / 同 run 照删 / 身份未知退回旧口径」钉住。
+// ---------------------------------------------------------------------------
+describe('copilot 验收 E：delta 气泡带来源 run，同文本跨 run 不得误删', () => {
+  beforeEach(() => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: 'r-A' }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+  });
+
+  /** 走**真实事件路径**让 run A 流起来（`assistant_delta` → composable 写 deltaText+deltaRunId → watcher 建条目）。 */
+  async function streamRunA(store: ReturnType<typeof useWorkbenchStore>, text: string) {
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = 'r-A';
+    es.emit('assistant_delta', { run_id: 'r-A', text });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    const bubble = store.entries.filter((e) => e.kind === 'delta') as Array<{ kind: 'delta'; text: string; runId?: string | null }>;
+    expect(bubble.length, '前置：delta 条目必须是 watcher 建出来的（不是自己 push 的假条目）').toBe(1);
+    expect(bubble[0].text).toBe(text);
+    expect(bubble[0].runId, '前置：身份必须真的落在条目上（否则本用例什么都没测）').toBe('r-A');
+  }
+
+  it('run A 正在流 + run B 的 partial **同文本** ⇒ A 的 kind:delta 还在，B 的 kind:partial 也在', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await streamRunA(store, '同样的话');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-B', type: 'partial_output',
+      payload: { text: '同样的话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+
+    const kinds = store.entries.map((e) => e.kind);
+    expect(store.entries.filter((e) => e.kind === 'delta').length,
+      `跨 run 误删：run A 正在打的那段被 B 的 partial 抹了（${JSON.stringify(kinds)}）`).toBe(1);
+    expect(store.entries.filter((e) => e.kind === 'partial').map((e) => (e as { id: string }).id))
+      .toEqual(['partial:r-B']);
+    expect(store.es.deltaText, 'A 的流式状态也不许被 B 的清掉').toBe('同样的话');
+  });
+
+  it('同 run 同文本 ⇒ 照旧撤掉 delta（#502 判据 4「同一段正文只出现一次」不许被这条修复改坏）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    await streamRunA(store, '同样的话');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-A', type: 'partial_output',
+      payload: { text: '同样的话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+
+    const kinds = store.entries.map((e) => e.kind);
+    expect(kinds.filter((k) => k === 'delta'), `同一段正文两遍：${JSON.stringify(kinds)}`).toEqual([]);
+    expect(kinds.filter((k) => k === 'partial')).toEqual(['partial']);
+    expect(store.es.deltaText).toBe(null);
+  });
+
+  it('身份未知（旧后端帧不带 run_id）⇒ 退回旧口径「只比文本」，重复气泡仍撤得掉（不许永远挂在界面上）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null; // 活跃 run 也不知道 ⇒ 两把尺都拿不到身份
+    es.emit('assistant_delta', { text: '没有 run_id 的一段' });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(store.entries.filter((e) => e.kind === 'delta').length).toBe(1);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'r-B', type: 'partial_output',
+      payload: { text: '没有 run_id 的一段', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(store.entries.map((e) => e.kind).filter((k) => k === 'delta'),
+      '身份未知时不得反过来把「撤重复气泡」这条能力弄丢').toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// copilot 复审 261115-01 的 **①**（中）：`deltaEntry.runId === null` 不得被**后来的别的 run** 顶掉
+//
+// 改前那句 `deltaEntry?.runId ?? es.deltaRunId.value ?? null` 用 `??` 把两档读成同一种：
+//   · 「没有 delta 条目」（`deltaEntry === null`）与
+//   · 「有条目、但出生时 `run_id` 未知 ⇒ 身份已被**钉成** `null`」。
+// `??` 见 `null` 就当「没有」⇒ 已钉成未知的出生身份会被**后来**的 `es.deltaRunId` 顶掉（
+// `case 'partial_output'` 每收一帧都无条件写 `deltaRunId`）⇒ E 条要修的**跨 run 误删**换个路径回来。
+// 第一版修法把「后来出现过任何 run 身份」一律当「不是这个气泡」拦下（见下面的 run-C 用例），
+// **第三轮复审又报出它的代价**：那条本来**就属于 run-B** 的段因竞态以 `runId = null` 出生、
+// 后来 `es.deltaRunId` 补成 `'run-B'` ⇒ 来一条 `run_id='run-B'` 的同文本 partial 也不撤
+// ⇒ **同一段正文两遍**（#502 判据 4 的红线）。现在口径是「后来那个身份**确实不是**这条 partial
+// 的 run 才拦」（见 `run-C` 与 `run-B` 两条方向相反的用例）。
+//
+// 三条用例一起承重（方向互补，缺一边就写得过窄）：
+//   · 未知身份 + 后来出现的**正是**这条 partial 的 run ⇒ **撤**（否则同一段正文两遍）；
+//   · 未知身份 + 后来出现的是**别的** run ⇒ **不撤**（未知不能当已知用，E 条）；
+//   · 未知身份 + 整条链路一个 run 身份都没拿到 ⇒ **照旧撤**（旧后端的兼容口径，#502 判据 4）。
+// 三条都走**真实 watcher 路径**（`assistant_delta` → composable → `watch(es.deltaText)` 建条目），
+// 并各自把前置断言写死（`bubble.runId === null` / `deltaRunId === null`），否则等于什么都没测。
+// ---------------------------------------------------------------------------
+describe('copilot 复审 ①：出生身份未知的 delta 条目只不得被「后来的**别的** run」顶掉', () => {
+  beforeEach(() => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+  });
+
+  const deltas = (store: ReturnType<typeof useWorkbenchStore>) =>
+    store.entries.filter((e) => e.kind === 'delta') as Array<{ kind: 'delta'; text: string; runId?: string | null }>;
+
+  it('气泡以 runId=null 诞生 + 之后 deltaRunId 补成 run-C（**别的** run）⇒ 同文本的 run-B partial **不得撤**它', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null; // 出生时两把尺都拿不到 ⇒ 身份钉成 null
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-C' }); // 先立 run-C 的轮起点，下面那帧才过得了轮闸
+    es.emit('assistant_delta', { text: '同样的一段话' });           // 无 run_id ⇒ 身份未知
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length, '前置：条目必须是 watcher 建出来的').toBe(1);
+    expect(deltas(store)[0].runId, '前置：出生身份必须真的被钉成 null').toBe(null);
+
+    // **后来**的一帧快照把 `es.deltaRunId` 写成了 **run-C**（同文本 ⇒ `deltaText` 值不变 ⇒ watcher
+    // 不重跑 ⇒ 条目的 `runId` 仍是 `null`）。这就是「补认领」的发生现场。
+    es.emit('partial_output', {
+      run_id: 'run-C', roundSeq: 7, text: '同样的一段话', chunks: 1, truncated: false, source: 'memory',
+    });
+    await nextTick();
+    expect(store.es.deltaRunId, '前置：composable 侧的身份已变成 run-C（补认领真的发生了）').toBe('run-C');
+    expect(deltas(store)[0].runId, '前置：条目自己的身份仍是未知（出生那一刻定的）').toBe(null);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length,
+      '身份未知被当成「已知 = run-C」用了：那个后来才出现的 run **不是**这条 partial 的 run ⇒ 不得撤').toBe(1);
+    expect(store.es.deltaText, '流式状态也不许被它清掉').toBe('同样的一段话');
+  });
+
+  // 第三轮复审的 ①（本次修的核心）：「后来出现过身份」不再等于「不是这个气泡」——
+  // 那个身份**正是**这条 partial 的 run 时，拦下来就是拿同一段正文渲染两遍。
+  // 改前会红的就是这一条（改前 `claimedLater` 不看 `laterOwner !== runId` ⇒ 不撤 ⇒ 下面断言 0 变 1）。
+  it('气泡以 runId=null 诞生 + 之后 deltaRunId 补成 run-B（**正是**这条 partial 的 run）⇒ 同文本 ⇒ **撤**（不得两遍）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null; // 出生时拿不到身份（竞态那半：delta 帧没带 run_id）
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-B' });
+    es.emit('assistant_delta', { text: '同样的一段话' });           // 无 run_id ⇒ 身份未知
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length, '前置：条目必须是 watcher 建出来的').toBe(1);
+    expect(deltas(store)[0].runId, '前置：出生身份必须真的被钉成 null').toBe(null);
+
+    // 这一帧本身就是 run-B 的快照 ⇒ 「后来出现的身份」与「下面那条 partial 的 run」是**同一个**。
+    es.emit('partial_output', {
+      run_id: 'run-B', roundSeq: 7, text: '同样的一段话', chunks: 1, truncated: false, source: 'memory',
+    });
+    await nextTick();
+    expect(store.es.deltaRunId, '前置：composable 侧的身份是 run-B').toBe('run-B');
+    expect(deltas(store)[0].runId, '前置：条目自己的身份仍是未知（出生那一刻定的）').toBe(null);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length,
+      '后来那个身份正是这条 partial 自己的 run ⇒ 拦下来就是把同一段正文渲染两遍（#502 判据 4）').toBe(0);
+    expect(store.entries.filter((e) => e.kind === 'partial').map((e) => (e as { id: string }).id))
+      .toEqual(['partial:run-B']);
+    expect(store.es.deltaText, '撤掉气泡就要连流式状态一起清（否则下一帧又把它建回来）').toBe(null);
+  });
+
+  it('同一条链路里一个 run 身份都没拿到 ⇒ 未知身份照旧按「只比文本」撤（兼容口径不许改坏）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null;
+    es.emit('assistant_delta', { text: '旧后端的一段话' }); // 无 run_id ⇒ 身份未知
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store)[0].runId, '前置：出生身份未知').toBe(null);
+    expect(store.es.deltaRunId, '前置：链路上至今没拿到任何 run 身份').toBe(null);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '旧后端的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length, '旧后端下「同一段正文两遍」是 #502 判据 4 的红线 ⇒ 必须撤掉').toBe(0);
+    expect(store.es.deltaText).toBe(null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// copilot 第三轮**最终验收**的 **①**：`'unknown'` 这个哨兵不得一身二职
+//
+// 「这段正文的 run 身份未知」在同一条链路上有两种字面值：`null`（帧没带 `run_id`，composable 的
+// 归一化）与 `'unknown'`（`addPartialOutput` 的哨兵；服务端真发一帧 `run_id:'unknown'` 就能落到
+// `deltaEntry.runId` 上）。改前两条判据各拿一把尺：
+//   · `claimedLater` 只认 `deltaEntry.runId == null` ⇒ `'unknown'` 从这条**漏下去**；
+//   · `sameRun` 却把 `'unknown'` 当**通配**（`deltaOwner === 'unknown'`）⇒ 又把它当「同 run」放行。
+// 于是「出生身份 = `'unknown'`」的气泡遇上**别的** run 的同文本 partial 会被**撤掉**（#513 E 条的
+// 跨 run 误删，换个哨兵值回来）。修法：两边共用同一个 `isUnknownOwner`（`workbench.ts` 模块级），
+// `'unknown'` 与 `null` 一律算**已知的未知**，从此不得再出现 `=== null` / `=== 'unknown'` 混用。
+//
+// 四条必补用例的方向（A/C/D 是**策略钉住**：改前后都该绿，改坏了立刻红；B 是**本单核心**：改前红）：
+//   · A 气泡 `null` + laterOwner `run-B` + partial **缺 run_id** ⇒ 不撤（**只测①那一档**：未知身份 +
+//     链路上出现过的具体身份与这条 partial 的 run 矛盾；**不是**「身份缺失一律不撤」，后三档见 C/D/E）；
+//   · B 气泡 `'unknown'` + laterOwner `run-C`（别的 run）+ partial `run-B` ⇒ **不撤**（改前会撤）；
+//   · C 气泡 `'unknown'` + laterOwner `run-B`（正是这条 partial 的 run）+ partial `run-B` ⇒ **撤**；
+//   · D 真·旧后端（`deltaRunId` 至今 `null`）⇒ **照旧撤**（#502 判据 4 的兼容口径）。
+// 另补 E 钉住 `claimedLater` 里那句 `!isUnknownOwner(laterOwner)`（四条都没覆盖它）：
+//   · E 后来那一帧的 `run_id` 自己就是哨兵 `'unknown'` ⇒ **不算具体身份** ⇒ 下界不触发 ⇒ 照旧撤。
+// 再补 F（copilot 第四轮 ① 的行为侧）：
+//   · F **压根没有 delta 条目**（`deltaEntry === null`）而 `es.deltaRunId` 是个**具体** run ⇒ 这一档**不是**
+//     「无条件退回只比文本」（`deltaOwner` 取的是那个具体身份 ⇒ `sameRun` 照旧按 run 身份判），
+//     而撤与不撤在这里**行为等价**（`removeDeltaEntry()` 无条目可撤）⇒ 本条钉「不抛错 / 不造不删 /
+//     partial 照画」（与 A/C/D 同类：策略钉住，改前后都该绿，改坏了立刻红）。
+// 五条全走**真实 watcher 路径**（`assistant_delta` → composable 写 `deltaText`/`deltaRunId` →
+// `watch(es.deltaText)` 建条目），并把前置断言写死（条目的 `runId` 到底是 `null` 还是 `'unknown'`、
+// `es.deltaRunId` 后来变成了什么），否则等于什么都没测。
+// ---------------------------------------------------------------------------
+describe('copilot 最终验收 ①：未知身份只有一个判据，`unknown` 哨兵不得当通配用', () => {
+  beforeEach(() => {
+    mockFetch((url) => {
+      if (url.endsWith('/events/history')) return { status: 200, body: { events: [] } };
+      if (url.split('?')[0] === '/api/sessions/s1') {
+        return { status: 200, body: { session: { id: 's1', active_run_id: null }, messages: [], last_seq: 0 } };
+      }
+      return { status: 200, body: { items: [] } };
+    });
+  });
+
+  const deltas = (store: ReturnType<typeof useWorkbenchStore>) =>
+    store.entries.filter((e) => e.kind === 'delta') as Array<{ kind: 'delta'; text: string; runId?: string | null }>;
+  const partialIds = (store: ReturnType<typeof useWorkbenchStore>) =>
+    store.entries.filter((e) => e.kind === 'partial').map((e) => (e as { id: string }).id);
+
+  /**
+   * 让气泡**带着指定身份**出生（`'unknown'` = 服务端真发了一帧 `run_id:'unknown'`；`null` = 帧里没带）。
+   * `claimRunId` 的 `round_start` 必须**在** delta **之前**发（`round_start` 会把已有气泡清掉），它同时把
+   * 那个 run 的轮起点 seq 记成 7 ⇒ 下面那帧 `partial_output` 才过得了轮闸（轮闸按 run 分开，所以
+   * 「要补认领成哪个 run」就先得有那个 run 的轮起点）。
+   */
+  async function bornWith(es: FakeEventSource, store: ReturnType<typeof useWorkbenchStore>,
+    birthRunId: 'unknown' | null, claimRunId: string, text: string) {
+    store.es.activeRunId = null; // 活跃 run 未知 ⇒ 快照帧的 run 闸不拦（补认领才发生得了）
+    es.emit('round_start', { seq: 7, round: 1, run_id: claimRunId });
+    // delta 帧不带轮闸：`run_id:'unknown'` 会原样落进 `es.deltaRunId`（非空字符串 ⇒ 通过归一化判断）
+    es.emit('assistant_delta', birthRunId === null ? { text } : { run_id: birthRunId, text });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length, '前置：条目必须是 watcher 建出来的（不是自己 push 的假条目）').toBe(1);
+    expect(deltas(store)[0].runId, `前置：出生身份必须真的钉成 ${birthRunId === null ? 'null' : "'unknown'"}`).toBe(birthRunId);
+  }
+
+  /** 事后一帧**别的 run** 的快照把 `es.deltaRunId` 改成 `claimRunId`（同文本 ⇒ `deltaText` 值不变 ⇒ watcher 不重跑 ⇒ 条目身份仍是出生那一刻的值）。 */
+  async function claimLaterAs(es: FakeEventSource, store: ReturnType<typeof useWorkbenchStore>,
+    claimRunId: string, text: string) {
+    es.emit('partial_output', {
+      run_id: claimRunId, roundSeq: 7, text, chunks: 1, truncated: false, source: 'memory',
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(store.es.deltaRunId, `前置：composable 侧的身份已被补成 ${claimRunId}（补认领真的发生了）`).toBe(claimRunId);
+  }
+
+  it('A｜气泡 runId=null + laterOwner=run-B（具体）+ partial **缺 run_id** ⇒ 不撤（①那一档：未知 + 具体身份矛盾，代价=可能两遍）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    await bornWith(es, store, null, 'run-B', '同样的一段话');
+    await claimLaterAs(es, store, 'run-B', '同样的一段话');
+    expect(deltas(store)[0].runId, '前置：条目自己的身份仍是未知（出生那一刻定的）').toBe(null);
+
+    store.addPartialOutput({
+      seq: 9, run_id: null, type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length,
+      'partial 自己是 `unknown` 时任何具体 laterOwner 都不等于它 ⇒ 一律保守不撤（撤错的代价 = 用户正在看的字消失）').toBe(1);
+    expect(store.es.deltaText, '不撤就不许顺手把流式状态清了').toBe('同样的一段话');
+    expect(partialIds(store), '这条 partial 自己照画出条目（id 退化成 partial:unknown）').toEqual(['partial:unknown']);
+  });
+
+  // **本单核心**：改前这一条**必红**（`deltaEntry.runId == null` 为假 ⇒ `claimedLater` 假 ⇒
+  // `sameRun` 因 `deltaOwner === 'unknown'` 通配为真 ⇒ 文本相同 ⇒ run-C 的气泡被 run-B 的 partial 撤掉）。
+  it('B｜气泡 runId=\'unknown\' + laterOwner=run-C（**别的** run）+ partial run-B ⇒ **不撤**（改前会撤掉别人的气泡）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    await bornWith(es, store, 'unknown', 'run-C', '同样的一段话');
+    await claimLaterAs(es, store, 'run-C', '同样的一段话');
+    expect(deltas(store)[0].runId, '前置：条目自己的身份是字面 \'unknown\'（不是 null —— 这正是改前漏下去的那一档）').toBe('unknown');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length,
+      '`\'unknown\'` 被当成通配用了：那段气泡的归属未知，而后来那个具体身份是 **run-C**、这条 partial 是 **run-B** ⇒ 谁都不是它 ⇒ 不得撤').toBe(1);
+    expect(store.es.deltaText, 'A 段还在流 ⇒ 流式状态也不许被别的 run 的清掉').toBe('同样的一段话');
+    expect(partialIds(store)).toEqual(['partial:run-B']);
+  });
+
+  it('C｜气泡 runId=\'unknown\' + laterOwner=run-B（**正是**这条 partial 的 run）+ partial run-B ⇒ **撤**（补认领要允许，否则同文两遍）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    await bornWith(es, store, 'unknown', 'run-B', '同样的一段话');
+    await claimLaterAs(es, store, 'run-B', '同样的一段话');
+    expect(deltas(store)[0].runId, '前置：条目自己的身份仍是 \'unknown\'').toBe('unknown');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store).length,
+      '后来那个具体身份与这条 partial 的 run **一致** ⇒ 撤掉的就是它自己那一份，拦下来就是把同一段正文渲染两遍').toBe(0);
+    expect(partialIds(store)).toEqual(['partial:run-B']);
+    expect(store.es.deltaText, '撤掉气泡就要连流式状态一起清（否则下一帧又把它建回来）').toBe(null);
+  });
+
+  it('D｜真·旧后端（deltaRunId 至今是 null）⇒ 未知身份照旧按「只比文本」撤（统一判据不许弄丢兼容口径）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null;
+    es.emit('assistant_delta', { text: '旧后端的一段话' }); // 帧里没带 run_id，链路上也再没出现过任何身份
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store)[0].runId, '前置：出生身份未知').toBe(null);
+    expect(store.es.deltaRunId, '前置：整条链路至今没拿到任何 run 身份').toBe(null);
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '旧后端的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length, '真旧后端下「同一段正文两遍」是 #502 判据 4 的红线 ⇒ 必须撤掉').toBe(0);
+    expect(store.es.deltaText).toBe(null);
+  });
+
+  // 钉住 `claimedLater` 里那句 `!isUnknownOwner(laterOwner)`：「后来出现的那个身份」**自己**就是哨兵时，
+  // 它不构成「这段气泡其实属于另一个**已知** run」的证据 ⇒ 下界不触发，D 那条兼容口径必须保住。
+  // 回退方向（把 `!isUnknownOwner(laterOwner)` 删掉 ⇒ 拿字面 `'unknown'` 去否定）会红在这一条。
+  it('E｜后来那一帧的 run_id 自己就是哨兵 `unknown`（不是具体身份）⇒ 下界不触发 ⇒ 照旧撤（A 的反面）', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    store.es.activeRunId = null;
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'unknown' }); // 哨兵 run 的轮起点（下面那帧才过得了轮闸）
+    es.emit('assistant_delta', { text: '同样的一段话' }); // 没带 run_id ⇒ 气泡以 null 出生
+    const { nextTick } = await import('vue');
+    await nextTick();
+    expect(deltas(store)[0].runId, '前置：出生身份未知').toBe(null);
+
+    es.emit('partial_output', {
+      run_id: 'unknown', roundSeq: 7, text: '同样的一段话', chunks: 1, truncated: false, source: 'memory',
+    });
+    await nextTick();
+    expect(store.es.deltaRunId, '前置：链路上后来出现的那个身份就是哨兵 `unknown`').toBe('unknown');
+
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length,
+      '那个「后来的身份」自己也是未知 ⇒ 拿它去否定就是「用未知否定未知」，同一段正文两遍（#502 判据 4）').toBe(0);
+    expect(store.es.deltaText).toBe(null);
+  });
+
+  // copilot 第四轮 ① 的**行为侧兜底**（与 `workbench.ts` 第三档注释的精确化配套）：
+  // 「**没有 delta 条目**」不并入第三档（「退回只比文本」）—— `deltaEntry === null` 时 `deltaOwner` 取的是
+  // `es.deltaRunId`，它若是个**具体** run ⇒ `sameRun` 照旧按 run 身份比较。而这一档**行为上**撤与不撤等价
+  //（`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针，本无条目可撤），所以本条钉的是**不许出的乱子**：
+  // 不抛错、不凭空造 delta、不误删别的条目、partial 照常画（同 A/C/D：策略钉住，改前后都该绿）。
+  // 而且这个状态**不是假设**，是撤掉气泡之后的真实现场：`addPartialOutput` 只清 `deltaText`、**不清** `deltaRunId`。
+  // ⚠ 本条**钉不住**「把 `removeDeltaEntry()` 的无条目早退改成去删 `kind:'partial'`」这个变异（copilot 第五轮 ②）：
+  // 到这一步 `deltaText` 已被上一条 partial 清成 `null`、而 `text` 非空 ⇒ `es.deltaText.value === text` 不成立
+  // ⇒ 那个分支**根本没被走到**。那条变异由下面那条**源码钉**守（运行时该分支不可达，理由写在那条里）。
+  it('F｜无 delta 条目（已被 run-A 的 partial 撤掉）+ `es.deltaRunId` 仍是具体 run-A ⇒ 再来的 run-B 同文本 partial：不抛错、不造不删 delta、partial 照常加', async () => {
+    const store = useWorkbenchStore();
+    await store.openSession('s1');
+    const es = FakeEventSource.instances.at(-1)!;
+    const { nextTick } = await import('vue');
+    store.es.activeRunId = null;
+    es.emit('round_start', { seq: 7, round: 1, run_id: 'run-A' });
+    es.emit('assistant_delta', { run_id: 'run-A', text: '同样的一段话' }); // 带身份出生（真实 watcher 路）
+    await nextTick();
+    expect(deltas(store).length, '前置：条目是 watcher 建出来的（不是自己 push 的假条目）').toBe(1);
+    expect(deltas(store)[0].runId, '前置：出生身份是具体 run-A').toBe('run-A');
+
+    // 同 run 同文本的那条 partial 合法地撤掉它（C 档那条判据），而它**只清 `deltaText`**。
+    store.addPartialOutput({
+      seq: 9, run_id: 'run-A', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    });
+    await nextTick();
+    expect(deltas(store).length, '前置：界面上再无 delta 条目（`deltaEntry` 已空）').toBe(0);
+    expect(store.es.deltaText, '前置：流式状态也跟着清了').toBe(null);
+    expect(store.es.deltaRunId,
+      '前置：`es.deltaRunId` **没被清** ⇒ 它就是本条要测的那个「无条目时仍在的具体身份」').toBe('run-A');
+
+    // 本条要测的一步：`deltaEntry === null` + `deltaOwner` 读到具体 run-A + 来一条**别的 run** 的同文本 partial。
+    expect(() => store.addPartialOutput({
+      seq: 10, run_id: 'run-B', type: 'partial_output',
+      payload: { text: '同样的一段话', chunks: 1, truncated: false, source: 'run_end' },
+    })).not.toThrow();
+    await nextTick();
+    expect(deltas(store).length,
+      '本来就没有 delta 条目 ⇒ 既不许凭空造一条，也不许拿别的条目当成它删掉').toBe(0);
+    expect(store.es.deltaText, '无条目可撤 ⇒ 也不许顺手把流式状态改写成别的值').toBe(null);
+    expect(partialIds(store), '两条 partial 各画各的（run-A 那条不许被 run-B 那条顶掉）')
+      .toEqual(['partial:run-A', 'partial:run-B']);
+    expect(store.entries.map((e) => e.kind),
+      '整条时间线只多这一条 partial，其余条目一个不少').toEqual(['sep', 'partial', 'partial']);
+    expect(store.es.deltaRunId, '无关 run 的 partial 不改写这段正文的归属').toBe('run-A');
+  });
+
+  // copilot 第五轮 ②：上面 F 那条**钉不住**「把 `removeDeltaEntry()` 的无条目早退改成去删 `kind:'partial'`」
+  // 这个变异（实测：只加这个变异时全套 132 条照绿、含 F；只有本条红）。
+  //
+  // **可达性判定：`deltaEntry === null && es.deltaText.value === text`（`text` 非空）在真实路径上不可达。**
+  // 依据（现查源码，不是推测）：
+  //   · `deltaEntry` 变 `null` 只有两个来源 —— watcher 的 `if (v === null) { deltaEntry = null; return; }`
+  //     （那一支 `deltaText` 本身就是 `null`），以及 `removeDeltaEntry()` 自己；
+  //   · 后者的三个调用点**都同时**把 `es.deltaText` 置 `null`：`onCurrentRunEnd`（composable 的 `run_end`
+  //     分支先 `deltaText.value = null`，再到 store 的 hook）、`applyServerRunState`（先置 null 再调）、
+  //     `addPartialOutput`（调完立刻置 null）⇒ 拿不出「条目没了但正文还在」的稳定现场；
+  //   · 反向：`watch(es.deltaText)` 在 `v !== null` 时要么建条目（`old === null`）要么把文本写进现有条目
+  //     ⇒ 「正文非空而条目为空」只剩**同一个 tick 内先写 `deltaText`、立刻调 `addPartialOutput`** 这一扇
+  //     窗（watcher 是 `'pre'` 异步刷），而真实事件面里 delta 帧与 partial 帧各是一个任务（SSE 帧、
+  //     `GET /events/history` 的响应期），中间必有微任务刷 ⇒ 这个窗口产品路拿不到；
+  //   · 清 `entries` 的四处（`selectDir` / `createDir` / `resetSessionView` / `openSession`）全部先跑
+  //     `es.resetStreamState()`（内含 `deltaText = null`）⇒ 也造不出这个组合。
+  // ⇒ **不为了测试去造一份产品路不存在的假状态**（那测的是测试自己），改成钉源码：
+  //   谁要往这个早退里塞「顺手删 partial」，这条用例就红。运行时该分支不可达，所以只能这么钉。
+  it('源码钉｜`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针（早退 → indexOf(deltaEntry) → splice(i, 1) → 置空，按序钉死；体内不得藏 `partial`）', () => {
+    const src = workbenchSource;
+    const def = src.match(/\n  function removeDeltaEntry\(\) \{[\s\S]*?\n  \}/);
+    // 用 throw 而不是 expect(...).not.toBeNull()：既给类型收窄，也在函数改名/换写法时给出可读的红文案。
+    if (!def) throw new Error('`removeDeltaEntry()` 的定义必须能在源码里定位到（改名/换写法时本条先红，提醒重新评估这条锁）');
+    // 只钉代码，不钉注释：两种注释都剥（早退上方那段「不可达但承重」的注释里**提到过** partial，
+    // 只剥 `//` 的话块注释里的 `partial` 会误红、块注释里的代码样文本又可能造成假绿）。
+    // 先块后行：块注释里常出现 `//`（URL、缩进示例），先剥行注释会把块注释的收尾 `*/` 一起吞掉。
+    const body = def[0]
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '');
+    // 剥不干净（未配对的块注释定界符、或残留的 `//`）⇒ 说明「只剥注释」的退化正则在这个函数上失灵了，
+    // 那就**不许静默放过**：当场报错要求人工看这条锁，而不是拿一份可能混了注释文本的 body 去比对。
+    if (/\/\*|\*\/|\/\//.test(body)) {
+      throw new Error('`removeDeltaEntry()` 体内有剥不干净的注释（未配对的块注释或残留 `//`）：'
+        + '本条钉靠纯文本比对，剥不干净就分不清钉的是代码还是注释 ⇒ 请人工复核这条锁（不要放宽断言）');
+    }
+    // 反面先断（红文案要直指那个变异本身）：体内出现任何「partial」字样就是往早退里塞了顺手清理。
+    expect(/partial/i.test(body),
+      '`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针：无条目时它什么都不删，'
+      + '尤其不许删 `kind:\'partial\'`（partial 的归属与撤不撤 delta 气泡无关，删错了就是用户正看的正文消失）').toBe(false);
+    expect(body, '不许在体内遍历 entries 找别的条目').not.toMatch(/findIndex|filter|forEach|for \(/);
+    // **有序**子串断言：每一段都只在上一次命中之后继续找 ⇒ 命中位置天然单调递增，写法顺序就是语义顺序。
+    // 这修的是原来那对假闸断言：「只有一次 `splice(`」+「体内出现 `indexOf(deltaEntry)`」各自成立，
+    // 却拦不住 `entries.value.splice(0, 1)` 配一个孤立的 `indexOf(deltaEntry)` —— 下标必须真的来自那次 indexOf。
+    // 不按括号深度解析函数体（缩进切法遇到同缩进闭括号可能提前截断）：一旦提前截断，
+    // 下面的链就找不到 ⇒ 当场红，是**响的失败**，不会假绿。
+    let cursor = 0;
+    const expectOrdered = (step: string, needle: RegExp, hint: string) => {
+      const at = body.slice(cursor).search(needle);
+      if (at === -1) {
+        throw new Error(`源码钉｜「${step}」没在预期位置出现（顺序不对、写法不对，或函数体被提前截断）：${hint}`);
+      }
+      const pos = cursor + at;
+      cursor = pos + 1;
+      return pos;
+    };
+    // 1) 无条目早退必须在最前（它挡的是「`deltaEntry` 为空时 `indexOf(null)` 找不到、`splice` 无从下手」那一步）。
+    const pGuard = expectOrdered('无条目早退', /if \(!deltaEntry\) return;/,
+      '`deltaEntry` 为空时必须直接 return，不许改成「没条目就去删别的条目」');
+    // 2) 下标必须**绑定到** `entries.value.indexOf(deltaEntry)` 的结果。
+    const pIndex = expectOrdered('下标来源', /const\s+i\s*=\s*entries\.value\.indexOf\(\s*deltaEntry\s*\)/,
+      '下标只能来自 `entries.value.indexOf(deltaEntry)`');
+    // 3) splice 的下标参数必须是那个 `i`、删除条数必须是 1（不是 `0`、不是任何别的字面量）。
+    const pSplice = expectOrdered('splice(i, 1)', /\.splice\(\s*i\s*,\s*1\s*\)/,
+      '`splice` 删的必须是 `indexOf(deltaEntry)` 拿到的那一条');
+    // 4) 指针置空必须在删之后（顺序反了就是把还在体内的条目当没了）。
+    const pNull = expectOrdered('指针置空', /deltaEntry = null;/,
+      '`deltaEntry` 必须在删除之后置空');
+    // 位置单调递增：显式再写一遍，让「顺序」这件事在断言里可见（而不是只依赖游标实现）。
+    expect([pGuard, pIndex, pSplice, pNull], '早退 → indexOf → splice(i, 1) → 置空 必须按这个顺序出现')
+      .toEqual([pGuard, pIndex, pSplice, pNull].slice().sort((a, b) => a - b));
+    expect([pGuard, pIndex, pSplice, pNull].filter((v, i, a) => a.indexOf(v) === i),
+      '四段各只出现一次且互不重合').toHaveLength(4);
+    // 全函数**只有一处** splice（链之外再塞一次 splice 就是偷偷多删了一条）。
+    expect(body.match(/splice\(/g) ?? [], '只许一次 splice，且删的必须是 `deltaEntry` 那一条').toHaveLength(1);
   });
 });

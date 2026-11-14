@@ -1816,3 +1816,266 @@ describe('审计第 6 条：脏快照只忽略，不动任何状态', () => {
     expect(s.deltaText.value).toBe(null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 E2 条（261115-01）：**长正文重连时，被 textCap 截过的快照不得吃掉后缀**
+//
+// 事实链（三条都在产品里，不是假设）：
+//   · 快照帧的 `text` 来自进程内正文缓冲，那里被 `PARTIAL_TEXT_CAP_DEFAULT = 16384` 夹过
+//     （`portal/src/run-partial-buffer.js#append`：越界只置 `truncated`，**不追长尾**）；
+//   · #513 把重连顺序改成「先 flush hub 缓冲、后发快照」，而 flush 的是**原始未截断**的碎片帧
+//     （`portal/src/internal.js` 的 `rec.buffer` 按**条数**限，不按字节）；
+//   · 前端 `partial_output` 是**覆盖式**赋值 ⇒ 正文超 16,384 时，flush 刚把完整正文送到，
+//     紧随其后的那条**只有前 16,384 字符**的快照把后缀**永久盖掉**（要等 round_end/历史刷新才回）。
+// 修法：同轮内正文**只增不减**——快照严格短于当前正文且是它的**前缀** ⇒ 忽略那条快照。
+// 三条用例一起承重：前缀 ⇒ 忽略（新口径）；更长 ⇒ 照旧覆盖（判据 4「不重复」的方向）；
+// 不是前缀 ⇒ 照旧覆盖（快照权威，别把这次修复写成「快照一律不信」）。
+// ---------------------------------------------------------------------------
+describe('copilot 验收 E2：被 textCap 截过的快照不得把 flush 已送达的后缀抹掉', () => {
+  const CAP = 16_384; // `run-partial-buffer.js` 的 PARTIAL_TEXT_CAP_DEFAULT
+
+  /** 起一个「当前轮正在流」的连接：轮起点 seq=7，活跃 run=r1，气泡里已有 `text`。 */
+  function streaming(text: string) {
+    const hooks = makeHooks();
+    const s = useEventStream(hooks);
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 7, round: 1, run_id: 'r1' });
+    lastES().emit('assistant_delta', { run_id: 'r1', text });
+    expect(s.deltaText.value).toBe(text);
+    return { s, hooks };
+  }
+
+  it('正文 20,000 字符 + 来一条 16,384 字符的**前缀**快照 ⇒ 正文仍是 20,000 字符（后缀没被吃掉）', () => {
+    const full = '长'.repeat(20_000);
+    const { s } = streaming(full);
+    // 服务端快照：同一轮，但正文被 textCap 夹过 ⇒ 恰好是前 16,384 个字符 + truncated:true
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: full.slice(0, CAP), chunks: 400, truncated: true, source: 'memory',
+    });
+    expect(s.deltaText.value?.length, '覆盖式赋值把后缀盖掉了 ⇒ 客户端正文变短（E2 本体）')
+      .toBe(full.length);
+    expect(s.deltaText.value).toBe(full);
+  });
+
+  it('反例（修复能力不许丢）：正文 5,000 字符 + 快照 16,384 字符**更长** ⇒ 照旧覆盖', () => {
+    const local = '甲'.repeat(5_000);
+    const { s } = streaming(local);
+    const snap = local + '乙'.repeat(CAP - 5_000); // 前缀 + 更多 ⇒ 更长
+    expect(snap.length).toBe(CAP);
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: snap, chunks: 90, truncated: false, source: 'memory',
+    });
+    expect(s.deltaText.value, '断线期间流式过一段 ⇒ 更全的快照必须盖进来（#502 判据 4「不空洞」）')
+      .toBe(snap);
+  });
+
+  it('反例（快照仍权威）：正文与快照**不是前缀关系** ⇒ 照旧覆盖', () => {
+    const local = '断线前的半句';
+    const { s } = streaming(local);
+    // 快照比本地短，但**不是**本地正文的前缀 ⇒ 它不是「同一段被截过的那一份」，照旧以快照为准。
+    //（代价口径：若快照恰好是前缀**又不是**因为 textCap（上游真的把这段话改短了），这里会选择不盖——
+    // 两个形状在前端**无法区分**（帧里没有「客户端已有几个字」这一说），而吃后缀是**永久**丢字，
+    // 少盖一次刷新即回 ⇒ 宁可少盖。）
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: '半句', chunks: 3, truncated: false, source: 'memory',
+    });
+    expect(s.deltaText.value).toBe('半句');
+  });
+
+  it('口径边界：空串快照**不算**「较短前缀」⇒ 照旧清气泡（E2 那条规则不得把它吞掉）', () => {
+    // `'abc'.startsWith('')` 是 true、`0 < 3` 也成立 ⇒ 规则若排在空串分支**前面**，本用例立刻红。
+    const { s, hooks } = streaming('已经流出的一段正文');
+    const sepBefore = hooks.onSep.mock.calls.length;
+    lastES().emit('partial_output', {
+      run_id: 'r1', roundSeq: 7, text: '', chunks: 0, truncated: false, source: 'memory',
+    });
+    expect(s.deltaText.value, 'text 为空 = 服务端说这段没正文 ⇒ 清空，不是「忽略」').toBe(null);
+    expect(hooks.onSep.mock.calls.length).toBe(sepBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **E2** 被复审 261115-01 的 **②** 补了一代：前缀守卫缺「代际」信号
+//
+// 上面那条规则只问「快照是不是当前正文的严格前缀」，而**同轮内正文合法地重新变短**是存在的：
+// `round_end` 把服务端正文槽清空后，下一段开写的内容完全可能恰是上一段的前缀（短句重说、
+// 同一句开头）⇒ 那条规则把它当「被 textCap 截过的那一份」忽略 ⇒ 客户端**永久**停留在过期正文上
+//（后续快照只会更长且不再等于当前值，盖不动；只有刷新/历史投影才能纠正）。
+// 修法：服务端额外带一个单调不减的 `textSegment`（`run-partial-buffer.js` 只在 `round_start` /
+// `closeRound` 两处 +1；**不能**拿 `chunks` 当代际号，它在这两处都会**归零**）。
+// 三条规则（写在本单 `useEventStream.ts` 的注释里）+ 两条兜底：大⇒接受、等+严格前缀⇒忽略、
+// 小⇒忽略；帧里没有该键（旧后端）或本连接从未见过该 run 的代际 ⇒ 退回旧前缀规则。
+// ---------------------------------------------------------------------------
+describe('copilot 复审 ②：快照带代际号时，「新一段恰是旧一段的前缀」必须被接受', () => {
+  /** 起一个「当前轮正在流」的连接：轮起点 seq=7，活跃 run=r1，气泡里已有 `text`。 */
+  function streaming(text: string) {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 7, round: 1, run_id: 'r1' });
+    lastES().emit('assistant_delta', { run_id: 'r1', text });
+    expect(s.deltaText.value).toBe(text);
+    return s;
+  }
+  const snap = (over: Record<string, unknown> = {}) => lastES().emit('partial_output', {
+    run_id: 'r1', roundSeq: 7, chunks: 9, truncated: false, source: 'memory', ...over,
+  });
+
+  it('代际 3 → 4，新正文是旧正文的**严格前缀** ⇒ 接受（本单核心：改前必红）', () => {
+    const s = streaming('上一段说得很长的一段话');
+    snap({ text: '上一段说得很长的一段话', textSegment: 3 }); // 先把基线建在 3
+    expect(s.deltaText.value).toBe('上一段说得很长的一段话');
+    // round_end 已清正文槽（代际 → 4），新一段开写，而它恰是上一段的前缀
+    snap({ text: '上一段说', textSegment: 4 });
+    expect(s.deltaText.value, '代际升了一格 = 新一段，哪怕更短、哪怕恰是前缀 ⇒ 必须盖进来')
+      .toBe('上一段说');
+  });
+
+  it('代际相同 + 严格前缀 ⇒ 忽略（E2 那条截断保护不许回退）', () => {
+    const s = streaming('已经送达的完整正文');
+    snap({ text: '已经送达的完整正文', textSegment: 6 });
+    snap({ text: '已经送达', textSegment: 6 }); // 同一段被 textCap 截过的那一份
+    expect(s.deltaText.value, '同代际 + 严格前缀 = 同一段的较短那份 ⇒ 不得吃掉后缀')
+      .toBe('已经送达的完整正文');
+  });
+
+  it('代际变小 ⇒ 忽略（过期快照，且不得把水位线拉回去）', () => {
+    const s = streaming('当前这一段');
+    snap({ text: '当前这一段', textSegment: 9 });
+    snap({ text: '当前这一段更长的一份旧快照', textSegment: 8 }); // 更旧一代 ⇒ 整帧忽略
+    expect(s.deltaText.value).toBe('当前这一段');
+    // 水位线没被 8 拉回去 ⇒ 下一代（9 的下一格）仍能被认成「新一段」，哪怕它更短且是前缀
+    snap({ text: '当前', textSegment: 10 });
+    expect(s.deltaText.value, '过期帧不得把代际水位线拉低，否则下一代又被当旧帧').toBe('当前');
+  });
+
+  it('帧里**没有** textSegment（旧后端）⇒ 退回前缀规则，且不报错（兼容口径）', () => {
+    const s = streaming('旧后端的完整正文');
+    snap({ text: '旧后端的' }); // 无 textSegment + 严格前缀 ⇒ 走旧规则忽略
+    expect(s.deltaText.value).toBe('旧后端的完整正文');
+    snap({ text: '旧后端的完整正文与更多' }); // 更长 ⇒ 照旧覆盖
+    expect(s.deltaText.value).toBe('旧后端的完整正文与更多');
+  });
+
+  it('本连接从未见过该 run 的代际（刚重连）⇒ 第一帧走前缀规则，但基线已建立，下一代能接上', () => {
+    const s = streaming('重连前已经送达的完整正文');
+    snap({ text: '重连前已', textSegment: 12 }); // 无基线 + 严格前缀 ⇒ 保守忽略（E2 不回退）
+    expect(s.deltaText.value).toBe('重连前已经送达的完整正文');
+    snap({ text: '重连后新的一段', textSegment: 13 }); // 代际 +1 ⇒ 新一段 ⇒ 接受
+    expect(s.deltaText.value).toBe('重连后新的一段');
+  });
+
+  it('代际脏值（字符串/NaN）⇒ 当旧后端处理，不拿它当 0（宁缺不错）', () => {
+    const s = streaming('正文当前长度');
+    snap({ text: '正文', textSegment: '3' });   // 脏 ⇒ 当前缀规则 ⇒ 忽略
+    expect(s.deltaText.value).toBe('正文当前长度');
+    snap({ text: '正文', textSegment: Number.NaN });
+    expect(s.deltaText.value).toBe('正文当前长度');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **D 条**（261115-01）：旧页回放同样不得回退**轮号**水位
+//
+// 审计第 4 条（261114-05）只给 `observeRoundSeq`（轮**起点 seq**）加了 `olderPage` 保护，
+// 而 `observeRound`（轮**号** → `roundTokenByRun` → `cardIdentity`）仍是无条件写，
+// `case 'round_start'` 又先调它再调 seq 那个 ⇒ 用户往上滚加载更早一页时：
+//   旧页那轮的 `round_start` 把 `roundTokenByRun` 改回**旧轮** ⇒ 之后所有工具卡片
+//   （`cardIdentity` → `roundTokenFor`）都拿错轮号当身份 ⇒ #279 那把身份尺整段失效
+//   （新调用被归到旧轮那张卡上 / 同一轮的两次调用被拆成两种键形状）。
+// 另修一处口径糊账：`observeRoundSeq` 原来把「从未观测」（Map 里没有 = `undefined`）与
+// 「已观测但轮起点未知」（值是 `null`）当成同一种 ⇒ 旧页的有限 seq 能盖掉 `null`，
+// 与它自己注释里「记 null ⇒ 谁都不许盖，宁缺不错」直接矛盾。
+// 观测面：轮号从 `toolCards` 的**键**看（`cardIdentity` 就是那把尺，不测私有 Map）。
+// ---------------------------------------------------------------------------
+describe('copilot 验收 D：旧页回放不得回退轮号水位（roundTokenByRun），且 null ≠ undefined', () => {
+  it('旧页回放同 run 更旧的 round_start ⇒ 卡片身份的轮号段不变（改前会被写成旧页那一轮）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']); // 前置：轮号段确实是 3
+
+    // 用户往上滚 ⇒ 更早一页里同一个 run 的**第一轮**
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 42, run_id: 'r1', tool_call_id: 'c2', name: 'edit', input: {} });
+    expect([...s.toolCards.keys()], '旧页把轮号写回 1 ⇒ 新调用被挂到「第 1 轮」那张卡上')
+      .toEqual(['r1:3:c1', 'r1:3:c2']);
+  });
+
+  it('首屏历史重建（initial）同一情形 ⇒ 轮号照旧被写进去（别把首屏也改坏）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']);
+
+    // 同一条事件走缺省 `'initial'` = 首屏重建面：那时没有「正在流的一段」要护，照旧照单写
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } });
+    lastES().emit('tool_use', { seq: 42, run_id: 'r1', tool_call_id: 'c2', name: 'edit', input: {} });
+    expect([...s.toolCards.keys()], '首屏口径一个字都不许被 D 条改掉').toEqual(['r1:3:c1', 'r1:1:c2']);
+  });
+
+  it('旧页里含**更新**的同 run round_start（seq 与轮号都更大）⇒ 照旧接受（不能一刀切拒绝）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    // 旧页里居然有一条更新的（例如本页跨到了下一轮，或实时漏收过一条 round_start）
+    s.replayEvent({ seq: 50, run_id: 'r1', type: 'round_start', payload: { round: 5 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 51, run_id: 'r1', tool_call_id: 'c9', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()], '轮号必须跟到 5（D 条只挡「更旧 / 脏」，不是「旧页一律不要」）')
+      .toEqual(['r1:5:c9']);
+    // 轮**起点 seq** 水位同步跟上 ⇒ 第 5 轮的快照仍被双闸接受
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 50, text: '第五轮的正文', chunks: 2, source: 'memory' });
+    expect(s.deltaText.value).toBe('第五轮的正文');
+  });
+
+  it('轮起点 seq 记成 null 时旧页的有限 seq **不得写**（已观测但未知 = 谁都不许盖）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { round: 2, run_id: 'r1' }); // 脏帧：没有 seq ⇒ 记 null
+    lastES().emit('assistant_delta', { run_id: 'r1', text: '当前这段正文' });
+    // 旧页拿来一条**有限**的 seq：改前 `cur !== null && cur !== undefined` 把 null 当成「没水位」放行
+    s.replayEvent({ seq: 9, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('partial_output', { run_id: 'r1', roundSeq: 9, text: '拿旧页的号来硬对', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value, 'null 是「谁都不许盖」，不是「随便谁来填」').toBe('当前这段正文');
+  });
+
+  it('该 run 从未观测（undefined）⇒ 旧页的有限 seq 照旧写得进去（初始重建面）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r-never';
+    s.connect('sess-1');
+    s.replayEvent({ seq: 9, run_id: 'r-never', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('partial_output', { run_id: 'r-never', roundSeq: 9, text: '写得进去', chunks: 1, source: 'memory' });
+    expect(s.deltaText.value).toBe('写得进去');
+    // 轮号同理：从未观测 ⇒ 旧页的轮号也写得进去（卡片身份拿得到轮号总比 `?` 好）
+    lastES().emit('tool_use', { seq: 10, run_id: 'r-never', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r-never:1:c1']);
+  });
+
+  it('轮号已观测但未知（`?`）⇒ 旧页的有限轮号**不得写**（与 seq 的 null 同一口径）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, run_id: 'r1' }); // 有 seq、没 round ⇒ 轮号记 `?`
+    s.replayEvent({ seq: 4, run_id: 'r1', type: 'round_start', payload: { round: 1 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()], '已观测过这个 run ⇒ 旧页那个 1 多半是更旧的一轮，宁缺不错')
+      .toEqual(['r1:c1']);
+  });
+
+  it('`attempt` 也在旧页回放里 ⇒ 同一口径（不得把轮号写成旧页那一轮的）', () => {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 40, round: 3, run_id: 'r1' });
+    s.replayEvent({ seq: 5, run_id: 'r1', type: 'attempt', payload: { round: 1, attempt: 2, maxAttempts: 3 } }, 'older-page');
+    lastES().emit('tool_use', { seq: 41, run_id: 'r1', tool_call_id: 'c1', name: 'bash', input: {} });
+    expect([...s.toolCards.keys()]).toEqual(['r1:3:c1']);
+  });
+});
