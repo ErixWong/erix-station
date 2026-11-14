@@ -566,6 +566,21 @@ export function useEventStream(hooks: EventStreamHooks) {
   // 流式增量气泡文本（旧 S.deltaBuf 指向的 DOM 的 textContent；null = 无活动气泡）。
   // round_start 只置 null（旧版不 remove 元素——半截增量留在流里）；当前 run_end 才移除。
   const deltaText = ref<string | null>(null);
+  /**
+   * **这一段流式正文属于哪个 run**（copilot 独立验收 #513 的 E 条，261115-01）。
+   *
+   * 存在的理由：`workbench#addPartialOutput` 原来在「中性气泡的文本 == 流式气泡的文本」时**只比文本
+   * 不比 run** 就撤掉那份实时气泡 ⇒ 旧 run 的历史 partial 与当前活跃 run 正在流的正文**恰好同文本**
+   * 时，当前 run 的气泡被删（同一段话由两个 run 各说一遍是常态：重试、或两句短答复撞车）。
+   * 文本不足以当身份 ⇒ 需要一个与 `deltaText` 同生共死的 run 身份。口径：
+   *   · 值 = **这段气泡起点那一帧**的 `run_id`（`assistant_delta` / `partial_output` 两个真实写点）；
+   *     脏值/缺位 ⇒ `null` = 身份未知（旧后端帧不带 `run_id`）——宿主侧对「未知」按旧口径处理，
+   *     不拿未知去否定已知（否则旧后端就再也撤不掉重复气泡，同一段正文在界面上两遍）；
+   *   · 气泡已存在时**不改写**它：这段正文的归属由「谁起这段」决定，中途换 run 的帧不偷身份；
+   *   · `deltaText` 被置 null 的每一处（`round_start` 非旧页 / 空快照 / 当前 run 的 `run_end` /
+   *     `resetStreamState`）**同步**置 null —— 留着旧值就是给下一段气泡挂上上一段的主。
+   */
+  const deltaRunId = ref<string | null>(null);
   // 工具卡片状态（旧 S.toolCards）。issue #279：**键不再是裸 provider `tool_call_id`**，而是含轮号的
   // 组合键（`<run>:<轮号>:<callId>`，缺位的段不拼；尺规在 `lib/toolCardKey.ts`，三条路径共用）。
   // 会话级 Map、只在 resetStreamState 清空 ⇒ 把 run 写进键顺带修掉「同会话两个 run 共用 `c1` 串台」。
@@ -904,7 +919,7 @@ export function useEventStream(hooks: EventStreamHooks) {
       case 'round_start':
         // 审计第 4 条：**旧页回放不得清实时气泡**（旧页那一轮早就说完了，与「当前正在流的这一
         // 段」无关；清了就是用户滚一下滚动条把正在打字的气泡弄没了）。首屏历史重建照旧清。
-        if (!olderPage && deltaText.value) { deltaText.value = null; }
+        if (!olderPage && deltaText.value) { deltaText.value = null; deltaRunId.value = null; }
         // issue #279：本 run 的轮号水位线（卡片身份的唯一轮号来源；实时与历史回放都走这里）。
         // copilot 验收 #513 D 条：`olderPage` 一并转下去 ⇒ 旧页**也不得回退轮号**（原来只有下面
         // 那个 seq 观测面有保护，于是旧页会把卡片身份的轮号改回旧轮）。
@@ -1095,7 +1110,7 @@ export function useEventStream(hooks: EventStreamHooks) {
         // **之前**。`'abc'.startsWith('')` 是 **true**，而 `0 < 3` 也成立 ⇒ 空串**落不进**「天然不成立」
         // 那一类（工单里写的那句判断在 JS 里不成立，实测）：把它放到空串分支前面，`text:''` 就从
         // 「清空气泡」退化成「整帧忽略」，下面那条既有的「真·空串仍然清空」用例立刻红。
-        if (text === '') { deltaText.value = null; return; }
+        if (text === '') { deltaText.value = null; deltaRunId.value = null; return; }
         // copilot 独立验收 #513 的 **E2**：同轮内正文**只增不减**——快照是被 `textCap` 夹过的那一份，
         // 不得把已经送达的后缀抹掉。为什么「覆盖式」还需要这条单调规则：
         //   · 快照帧的 `text` 来自进程内正文缓冲，那里被 `PARTIAL_TEXT_CAP_DEFAULT = 16384`
@@ -1109,10 +1124,16 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 「它是同一段的较短那份」的直接证据。不是前缀 ⇒ 快照仍然权威覆盖（判据 4 两个方向不许改坏）。
         if (deltaText.value && text.length < deltaText.value.length && deltaText.value.startsWith(text)) return;
         deltaText.value = text;
+        // E 条：这段快照正文的归属（上面 `runOk` 已保证 `d.run_id` 是非空字符串，不重复守卫）。
+        deltaRunId.value = d.run_id as string;
         return;
       }
       case 'assistant_delta':
-        if (deltaText.value === null) deltaText.value = '';
+        if (deltaText.value === null) {
+          deltaText.value = '';
+          // E 条：气泡**起点**那一帧的 run 就是这段正文的身份（后续帧不改写它）。
+          deltaRunId.value = typeof d.run_id === 'string' && d.run_id !== '' ? d.run_id : null;
+        }
         deltaText.value += d.text ?? '';
         return;
       case 'reasoning_delta': return; // 推理增量 P1 不展示
@@ -1201,7 +1222,7 @@ export function useEventStream(hooks: EventStreamHooks) {
         const isCurrent = d.run_id === activeRunId.value;
         if (isCurrent) {
           // 移除流式增量气泡（终稿由 refreshSession 回写，防双份）。
-          if (deltaText.value !== null) deltaText.value = null;
+          if (deltaText.value !== null) { deltaText.value = null; deltaRunId.value = null; }
           const reason = d.termination?.reason ?? '';
           const usage = d.usage ? ` · tokens ${d.usage.input_tokens ?? 0}+${d.usage.output_tokens ?? 0}` : '';
           // issue #42 / #212 / #236：终止原因分级——异常集合红色告警，正常收尾灰色中性。
@@ -1240,6 +1261,7 @@ export function useEventStream(hooks: EventStreamHooks) {
     lastSeq.value = 0;
     activeRunId.value = null;
     deltaText.value = null;
+    deltaRunId.value = null; // E 条：身份与正文同生命周期
     toolCards.clear();
     // issue #279：轮号观测面与关联索引同生命周期（都得跟着卡片清，不然跨会话串轮号/串卡）。
     roundTokenByRun.clear();
@@ -1251,7 +1273,7 @@ export function useEventStream(hooks: EventStreamHooks) {
   }
 
   return {
-    lastSeq, esSessionId, activeRunId, deltaText, toolCards,
+    lastSeq, esSessionId, activeRunId, deltaText, deltaRunId, toolCards,
     connect, closeEs, resetStreamState,
     // handleEvent/toolCard 导出仅为单测驱动（旧版 static-client.test.js 的 vm 直驱等价）；
     // replayEvent 供 openSession 历史归并回放驱动（issue #89）；projectToolCard 供 DTO 投影路径（#188）。
