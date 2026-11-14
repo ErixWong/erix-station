@@ -22,40 +22,32 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { createPool } from '../src/db.js';
-import { migrate } from '../src/migrate.js';
-import { hashToken } from '../src/auth.js';
+import { hashToken } from '../src/auth.js'; // createPool/migrate 已随夹具搬进 pg-fixture.js
+// issue #502 F-1：夹具从本文件**搬进** `pg-fixture.js`（与 `migrate-fresh-db.test.js` 共用一份）。
+// 原副本的毛病：两个文件各跑一遍 `bootstrap.sql` 的集群级 `ALTER ROLE`（bootstrap.sql:37-38 写
+// `pg_authid` 同一行），而 `migrate.js` 的 advisory lock 作用域带 database OID ⇒ 两个新建库
+// 互相看不见 ⇒ `npm test` 带 TEST_DATABASE_URL 并发跑时偶发 `tuple concurrently updated`(XX000)。
+import { createPgFixture, SKIP_WITHOUT_PG } from './pg-fixture.js';
 import { claimRun, setRunState, postEvents } from '../src/internal.js';
 import { partialOutputs } from '../src/run-partial-buffer.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION = path.join(HERE, '../../deploy/migrations/0033-delta-events-not-persisted.sql');
 const URL_VALUE = (process.env.TEST_DATABASE_URL || '').trim();
-const SKIP = URL_VALUE
-  ? false
-  : 'TEST_DATABASE_URL 未设置：真库用例需一次性 postgres:16.15（docs/testing.md §2.2.1），无 PG 时整体跳过';
-const adminPool = URL_VALUE ? createPool(URL_VALUE, { max: 2 }) : null;
+// env 门口径不变：未设 ⇒ 整文件 skip（`SKIP_WITHOUT_PG` 那句话与另一份夹具共用，不再各写一份）。
+const SKIP = URL_VALUE ? false : SKIP_WITHOUT_PG;
 
 const TOKEN = 'tok-502-runner';
-const suffix = () => crypto.randomBytes(4).toString('hex');
 
-async function withFreshDb(fn) {
-  const name = `w502_${suffix()}`;
-  await adminPool.query(`CREATE DATABASE ${name}`);
-  const u = new URL(URL_VALUE);
-  u.pathname = `/${name}`;
-  const url = u.toString();
-  const pool = createPool(url, { max: 2 });
-  try {
-    // baseline(schema.sql) → bootstrap.sql → 全部增量（含 0033）。迁移身份/属主那颗雷由
-    // `migrate-fresh-db.test.js` 负责，这里只保证「表结构是今天的真形状」。
-    await migrate(pool, { env: { DATABASE_URL: url }, log: { log: () => {} } });
-    return await fn(pool, name);
-  } finally {
-    await pool.end().catch(() => {});
-    await adminPool.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`).catch(() => {});
-  }
-}
+// `w502_` 前缀保留（排障时 `\l` 一眼能认出是哪个文件的库）；迁移日志静音（原样）。
+const fixture = URL_VALUE ? createPgFixture(URL_VALUE, { prefix: 'w502' }) : null;
+const adminPool = fixture ? fixture.adminPool : null;
+
+/** 与旧签名的差异只有「多包一层夹具」：fn(pool, dbName) 原样。 */
+const withFreshDb = (fn) => fixture.withFreshDatabase(
+  ({ database, pool }) => fn(pool, database),
+  { poolMax: 2, log: () => {} }, // baseline → bootstrap → 全部增量（含 0033）
+);
 
 /**
  * 一套真库里可认领的现场（用户 / 目录 / 容器 / 会话 / run / 队列）。
