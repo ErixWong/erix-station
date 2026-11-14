@@ -534,17 +534,31 @@ export const MAX_BACKOFF_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 60_000);
 // 孤儿回收间隔 = 崩溃恢复的最长延迟，10min 内可接受，但同样不许越 Node timer 上限。
 const ORPHAN_RECOVERY_INTERVAL_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 600_000);
 
+// 严格正整数：**trim 后整串**必须全是十进制数字（copilot 第四轮复审③）。
+// 改前用 `parseInt(raw, 10)`（前缀匹配），它吃的是**前缀**⇒ `'1e4'` → **1**、`'10000abc'` → **10000**，两种都**静默**：
+//   · `*_ORPHAN_RECOVERY_INTERVAL_MS=1e4`（运维习惯把 10000 写成 `1e4`）的真实后果是回收间隔变成 **1ms**
+//     ⇒ 那条与有没有活无关的回收**每拍都跑**，把 #506 刚省下来的空闲开销原样吐回去；
+//   · `'10000abc'` 则是「配了一个垃圾值，却按 10000 生效」——比直接不认更难查。
+// 口径：**先 trim 再整串匹配**——前后空格算合法（compose / env-file 里带空格很常见，与既有 `.trim()` 一致），
+// 但 `+10000` / `1_0000` / `0x10` / `1e4` / `10000abc` 一律不认 ⇒ 回落默认 + warn（与越界同一口径）。
+const STRICT_POSITIVE_INT_RE = /^\d+$/;
+
+
 /**
  * 正整数 env（issue #506 评审①）。非法值 / 越界一律**回落默认并 warn**（越界绝不静默夹取——
  * 夹取会让运维以为配置生效了，而真实后果是 Node 把 3e9 截成 1ms 空转）。没配（空串）静默用默认。
+ * 「非法」的判定在第四轮复审③ 收紧为**整串严格匹配**：`parseInt('1e4', 10) === 1` 这类前缀误读
+ * 会把孤儿回收间隔变成 1ms（每拍跑），宁可不认并 warn，也不要静默按一个谁都没写的值跑。
  * @param {string} name @param {number} fallback @param {{max?: number, log?: object}} [opts]
  */
 function envInt(name, fallback, { max = MAX_BACKOFF_MS_SAFE, log = console } = {}) {
   const raw = String(process.env[name] ?? '').trim();
   if (raw === '') return fallback;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) {
-    log.warn?.(`[env] ${name}=${raw} 不是正整数 ⇒ 回落默认 ${fallback}ms（这行配置没生效）`);
+  // 不认前缀匹配：整串不是纯数字就当 NaN，与「非法值」走同一条回落分支（copilot 第四轮复审③）。
+  const n = STRICT_POSITIVE_INT_RE.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    log.warn?.(`[env] ${name}=${raw} 不是严格正整数（trim 后整串必须是十进制数字；'1e4' / '10000abc' 这类科数或带尾巴的值不认）`
+      + ` ⇒ 回落默认 ${fallback}ms（这行配置没生效）`);
     return fallback;
   }
   if (n > max) {
