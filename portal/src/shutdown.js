@@ -255,9 +255,13 @@ export const SHUTDOWN_TOTAL_MS_DEFAULT = 8000;
  *                    loops: object | null, pendingLoops: string[], serverCloseStarted: boolean,
  *                    serverClosed: boolean, totalTimeoutMs: number, loopTimeoutMs: number,
  *                    loopsBudgetMs: number, flushReserveMs: number,
+ *                    flushReserveConfiguredMs: number, flushReserveEffectiveMs: number,
  *                    flush: object | null, flushTimeoutMs: number}>}
  *   （`elapsedMs` **含**退出前刷日志那一段；`flushTimeoutMs` 是实际生效的刷日志上限；
- *   `loopsBudgetMs` = 收尾 race 实际拿到的预算 = `总预算 - flushReserveMs`（下限 0））
+ *   `loopsBudgetMs` = 收尾 race 实际拿到的预算 = `总预算 - flushReserveMs`（下限 0）；
+ *   `flushReserveConfiguredMs` = 预留的**配置口径**（与 `flushReserveMs` 同值），
+ *   `flushReserveEffectiveMs` = **实际切出去**的那一块 = `min(总预算, 配置值)`——两者只在
+ *   `预留 >= 总预算` 的退化情形分离（此时日志/对账一律看 effective））
  */
 export async function gracefulShutdown({
   server,
@@ -361,14 +365,24 @@ export async function gracefulShutdown({
     loopTimeoutMs: loopBudgetMs,
     totalTimeoutMs: totalBudgetMs,
     loopsBudgetMs, // 收尾 race 实际拿到的预算（= 总预算 - 预留，下限 0）
-    flushReserveMs, // 从总预算里切给 flush 的那一块（账目里要能看见，否则运维对不上「为什么不等到 8s」）
+    // **两个口径并存（copilot 最后一轮复审，LOW）**：配置值 ≠ 实际切出去的那一块。
+    //   · `flushReserveConfiguredMs`：调用方传进来的预留（已过 `safeTimeoutMs`）=「想让 flush 拿多少」；
+    //   · `flushReserveEffectiveMs`：**实际**从总预算里切出去的那一块 = `min(总预算, 配置值)`。
+    // 为何必须分开报：`totalTimeoutMs=100 / flushReserveMs=250` 时配置值是 250，但总预算只有 100
+    // ⇒ 实际最多只能切出 100（`loopsBudgetMs` 已被夹到 0）。只报 250 ⇒ 账面比实际多一段，运维按 250
+    // 去对「为什么 100ms 就退了」永远对不上。旧字段 `flushReserveMs` 保留 = 配置口径的别名（既有账目
+    // 与用例读它，不断）；**日志一律用 effective**（日志要反映实际，不是反映配置意图）。
+    flushReserveMs, // 兼容别名 = flushReserveConfiguredMs（配置口径）
+    flushReserveConfiguredMs: flushReserveMs,
+    flushReserveEffectiveMs: Math.min(totalBudgetMs, flushReserveMs),
   };
 
   if (timedOut) {
     // 残留是**显式接受**的，不是漏掉了：到点就不再等（预算就是预算），剩下的在途事务随进程退出回滚，
     // 已认领的 `processing` 行带着 `lease_until` 躺在那儿，由**既有的**孤儿回收（租约到期后接管）捞回。
     // 另：下面 exit 前会先 `flushLogs`，否则这条 warn 在管道上自己被截断（第三轮复审① 的第一半）。
-    warn(`[shutdown] 关闭流程超过收尾预算 ${loopsBudgetMs}ms（总上限 ${totalBudgetMs}ms，其中 ${flushReserveMs}ms 是给退出前刷日志预留的；已用 ${elapsedMs}ms）仍没收尾：`
+    warn(`[shutdown] 关闭流程超过收尾预算 ${loopsBudgetMs}ms（总上限 ${totalBudgetMs}ms，其中实际给退出前刷日志预留 ${report.flushReserveEffectiveMs}ms`
+      + `（配置值 ${flushReserveMs}ms${report.flushReserveEffectiveMs === flushReserveMs ? '' : `，已被总上限截到 ${report.flushReserveEffectiveMs}ms`}）；已用 ${elapsedMs}ms）仍没收尾：`
       + `还有 ${pendingLoops.length} 个循环没退（${pendingLoops.join(', ') || '无名'}）`
       + (serverClosed ? '' : '；HTTP server 也没关完（SSE 是 keep-alive，close 只停接新连接、要等既有连接自己结束）')
       + '。不再等，直接 process.exit(0)——再等下去就撞上 compose/k8s 默认 10s 宽限期 ⇒ SIGKILL。'
@@ -384,7 +398,7 @@ export async function gracefulShutdown({
       + (loopsReport?.rejected ? `，${loopsReport.rejected} 个带错误退出` : '')
       // 「刷日志前」三个字是**故意**的：汇总行必须**在 flush 之前**记（否则它自己就不会被刷），
       // 所以这里的数字天然不含 flush；含 flush 的最终耗时看返回账目 `report.elapsedMs`。
-      + ` ⇒ 用时 ${elapsedMs}ms（刷日志前）/ 总上限 ${totalBudgetMs}ms（内含刷日志预留 ${flushReserveMs}ms）${timedOut ? '（到点强退）' : ''}`);
+      + ` ⇒ 用时 ${elapsedMs}ms（刷日志前）/ 总上限 ${totalBudgetMs}ms（内含实际刷日志预留 ${report.flushReserveEffectiveMs}ms）${timedOut ? '（到点强退）' : ''}`);
   } catch { /* 日志坏了也要退 */ }
 
   // 第 4 步：**先刷日志，再 exit**（copilot 第三轮复审①）。
