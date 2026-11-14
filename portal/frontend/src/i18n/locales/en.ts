@@ -279,6 +279,10 @@ export const en = {
     partialOutput: {
       label: 'Aborted · partial output',
       truncated: 'Output was not finished before the run stopped (truncated)',
+      // issue #502 form M (#278 floor): this run kept **no text at all** (no assistant anchor, both
+      // `round_end.final_text` and `run_end.partial_text` empty) ⇒ the history projection emits a
+      // placeholder item and the UI shows one **neutral** line instead of an empty bubble.
+      placeholder: 'The text of this output was not retained (not persisted when the run stopped); the terminal state follows below.',
     },
     // Mermaid diagram blocks (see pi-web MermaidBlock): preview/source toggle & render-failure note
     mermaid: {
@@ -289,10 +293,10 @@ export const en = {
     event: {
       resync: 'Event stream needs resync ({why}); reconnecting to catch up…',
       resyncBufferOverflow: 'server buffer overflow',
-      // issue #502 D-6: placeholder row shown when the reconnect snapshot could not recover the
-      // in-flight text (backend frame carries `source:'none'` + `placeholder:true`). Neutral separator,
-      // not an error: the terminal reason still comes from the `run_end` separator.
-      partialOutputLost: 'The streamed text from that disconnected stretch could not be recovered (no copy left server-side); the terminal state follows below.',
+      // issue #502 form M: the key `partialOutputLost` here was **deleted on purpose**. The SSE
+      // snapshot frame no longer carries placeholders (the backend emits no frame at all when the
+      // buffer is empty), so that separator row could never fire again; the "text was not retained"
+      // line now comes from the history projection → `stream.partialOutput.placeholder`.
       attempt: 'round {round} · attempt {attempt}/{max}',
       // issue #288 (defect B): the worker was killed by the host and re-queued. Before this the user
       // only saw the same tool card light up 3 times and then a reason-less "attempts exhausted".

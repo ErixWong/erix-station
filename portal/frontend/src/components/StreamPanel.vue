@@ -494,7 +494,12 @@ function msgClass(en: Extract<StreamEntry, { kind: 'msg' }>): string {
          修饰类做视觉区分——**不新增颜色语义**，更不进红色 .syserr（半截正文不是错误）。 -->
     <div v-else-if="en.kind === 'partial'" class="msg assistant md partial">
       <div class="partial-label mb-0.5 text-xs text-black/45">{{ t('stream.partialOutput.label') }}</div>
-      <div v-mermaid v-html="partialHtml(en.text)"></div>
+      <!-- issue #502 形态 M：占位（无锦点且两处正文源都空）⇒ **不渲染空气泡**，只留上面那行中性
+           标签 + 一句提示。不是红色 .syserr（「正文没留住」不是故障），也不塑一个空 `div.md`。
+           旧版这条提示走 SSE 分隔行（`stream.event.partialOutputLost`），形态 M 把占位收进
+           历史投影后就走这里（占位只有历史那一条入口）。 -->
+      <div v-if="en.placeholder" class="partial-placeholder text-black/45">{{ t('stream.partialOutput.placeholder') }}</div>
+      <div v-else v-mermaid v-html="partialHtml(en.text)"></div>
       <div v-if="en.truncated" class="partial-truncated mt-0.5 text-xs text-black/45">{{ t('stream.partialOutput.truncated') }}</div>
     </div>
     <!-- issue #189：折叠横幅（**独立视觉**：非 .msg 气泡，琥珀色左边框 + 虚线分隔条，绑定助手消息 id，
