@@ -1896,6 +1896,86 @@ describe('copilot 验收 E2：被 textCap 截过的快照不得把 flush 已送�
 });
 
 // ---------------------------------------------------------------------------
+// copilot 独立验收 #513 的 **E2** 被复审 261115-01 的 **②** 补了一代：前缀守卫缺「代际」信号
+//
+// 上面那条规则只问「快照是不是当前正文的严格前缀」，而**同轮内正文合法地重新变短**是存在的：
+// `round_end` 把服务端正文槽清空后，下一段开写的内容完全可能恰是上一段的前缀（短句重说、
+// 同一句开头）⇒ 那条规则把它当「被 textCap 截过的那一份」忽略 ⇒ 客户端**永久**停留在过期正文上
+//（后续快照只会更长且不再等于当前值，盖不动；只有刷新/历史投影才能纠正）。
+// 修法：服务端额外带一个单调不减的 `textSegment`（`run-partial-buffer.js` 只在 `round_start` /
+// `closeRound` 两处 +1；**不能**拿 `chunks` 当代际号，它在这两处都会**归零**）。
+// 三条规则（写在本单 `useEventStream.ts` 的注释里）+ 两条兜底：大⇒接受、等+严格前缀⇒忽略、
+// 小⇒忽略；帧里没有该键（旧后端）或本连接从未见过该 run 的代际 ⇒ 退回旧前缀规则。
+// ---------------------------------------------------------------------------
+describe('copilot 复审 ②：快照带代际号时，「新一段恰是旧一段的前缀」必须被接受', () => {
+  /** 起一个「当前轮正在流」的连接：轮起点 seq=7，活跃 run=r1，气泡里已有 `text`。 */
+  function streaming(text: string) {
+    const s = useEventStream(makeHooks());
+    s.activeRunId.value = 'r1';
+    s.connect('sess-1');
+    lastES().emit('round_start', { seq: 7, round: 1, run_id: 'r1' });
+    lastES().emit('assistant_delta', { run_id: 'r1', text });
+    expect(s.deltaText.value).toBe(text);
+    return s;
+  }
+  const snap = (over: Record<string, unknown> = {}) => lastES().emit('partial_output', {
+    run_id: 'r1', roundSeq: 7, chunks: 9, truncated: false, source: 'memory', ...over,
+  });
+
+  it('代际 3 → 4，新正文是旧正文的**严格前缀** ⇒ 接受（本单核心：改前必红）', () => {
+    const s = streaming('上一段说得很长的一段话');
+    snap({ text: '上一段说得很长的一段话', textSegment: 3 }); // 先把基线建在 3
+    expect(s.deltaText.value).toBe('上一段说得很长的一段话');
+    // round_end 已清正文槽（代际 → 4），新一段开写，而它恰是上一段的前缀
+    snap({ text: '上一段说', textSegment: 4 });
+    expect(s.deltaText.value, '代际升了一格 = 新一段，哪怕更短、哪怕恰是前缀 ⇒ 必须盖进来')
+      .toBe('上一段说');
+  });
+
+  it('代际相同 + 严格前缀 ⇒ 忽略（E2 那条截断保护不许回退）', () => {
+    const s = streaming('已经送达的完整正文');
+    snap({ text: '已经送达的完整正文', textSegment: 6 });
+    snap({ text: '已经送达', textSegment: 6 }); // 同一段被 textCap 截过的那一份
+    expect(s.deltaText.value, '同代际 + 严格前缀 = 同一段的较短那份 ⇒ 不得吃掉后缀')
+      .toBe('已经送达的完整正文');
+  });
+
+  it('代际变小 ⇒ 忽略（过期快照，且不得把水位线拉回去）', () => {
+    const s = streaming('当前这一段');
+    snap({ text: '当前这一段', textSegment: 9 });
+    snap({ text: '当前这一段更长的一份旧快照', textSegment: 8 }); // 更旧一代 ⇒ 整帧忽略
+    expect(s.deltaText.value).toBe('当前这一段');
+    // 水位线没被 8 拉回去 ⇒ 下一代（9 的下一格）仍能被认成「新一段」，哪怕它更短且是前缀
+    snap({ text: '当前', textSegment: 10 });
+    expect(s.deltaText.value, '过期帧不得把代际水位线拉低，否则下一代又被当旧帧').toBe('当前');
+  });
+
+  it('帧里**没有** textSegment（旧后端）⇒ 退回前缀规则，且不报错（兼容口径）', () => {
+    const s = streaming('旧后端的完整正文');
+    snap({ text: '旧后端的' }); // 无 textSegment + 严格前缀 ⇒ 走旧规则忽略
+    expect(s.deltaText.value).toBe('旧后端的完整正文');
+    snap({ text: '旧后端的完整正文与更多' }); // 更长 ⇒ 照旧覆盖
+    expect(s.deltaText.value).toBe('旧后端的完整正文与更多');
+  });
+
+  it('本连接从未见过该 run 的代际（刚重连）⇒ 第一帧走前缀规则，但基线已建立，下一代能接上', () => {
+    const s = streaming('重连前已经送达的完整正文');
+    snap({ text: '重连前已', textSegment: 12 }); // 无基线 + 严格前缀 ⇒ 保守忽略（E2 不回退）
+    expect(s.deltaText.value).toBe('重连前已经送达的完整正文');
+    snap({ text: '重连后新的一段', textSegment: 13 }); // 代际 +1 ⇒ 新一段 ⇒ 接受
+    expect(s.deltaText.value).toBe('重连后新的一段');
+  });
+
+  it('代际脏值（字符串/NaN）⇒ 当旧后端处理，不拿它当 0（宁缺不错）', () => {
+    const s = streaming('正文当前长度');
+    snap({ text: '正文', textSegment: '3' });   // 脏 ⇒ 当前缀规则 ⇒ 忽略
+    expect(s.deltaText.value).toBe('正文当前长度');
+    snap({ text: '正文', textSegment: Number.NaN });
+    expect(s.deltaText.value).toBe('正文当前长度');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // copilot 独立验收 #513 的 **D 条**（261115-01）：旧页回放同样不得回退**轮号**水位
 //
 // 审计第 4 条（261114-05）只给 `observeRoundSeq`（轮**起点 seq**）加了 `olderPage` 保护，

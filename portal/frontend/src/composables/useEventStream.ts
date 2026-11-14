@@ -600,6 +600,19 @@ export function useEventStream(hooks: EventStreamHooks) {
    * 值只可能是有限整数或 `null`（事件没带可用 seq ⇒ 记 null，后续帧一律不覆盖，宁少盖不错盖）。
    */
   const roundSeqByRun = new Map<string, number | null>();
+  /**
+   * copilot 复审 261115-01 的 **②**：本连接**已接受的**「该 run 的正文段代际号」（= 服务端
+   * `run-partial-buffer.js` 的 `textSegment`，只在 `round_start` / `closeRound` 两处 +1）。
+   *
+   * 为什么需要它（旧的 E2 前缀守卫缺的就是这个信号）：同轮内正文**合法地**重新变短是可能的
+   *（`round_end` 之后下一段开写，而 `round_start` 木有到 / 新段恰好是旧段的前缀），前缀规则
+   * 分不出「同一段被 textCap 截过的那一份」（该忽略）与「新一段恰好更短」（该接受），
+   * 于是过期正文被**永久**保留（不是刷新即回那种）。
+   * 为什么不能拿 `chunks` 当代际信号：它在 `round_start` 与 `closeRound` 都会**归零**，新段也从 0 起。
+   * 生命周期：与 `roundSeqByRun` 同（只在 `resetStreamState` 清）；条目数 = 本会话观测到的 run 数。
+   * 读法三档与 `observeRoundSeq` 同一口径：`undefined` = 从未观测，有限数 = 已知水位。
+   */
+  const deltaSegmentByRun = new Map<string, number>();
   // issue #279 关联索引：provider `callId` → **最新一张**卡片的身份键 + 它的 run + 它已知的最细轮号。
   // 只用于「结果/投影找到已有那张卡」，**不得当身份**（同一个 id 跨轮时身份是两张卡、索引只指向
   // 最新那张——具名用例钉住）。存结构体而不是只存 key：归并时要能判「跨 run 不许归并」「两侧轮号都
@@ -1122,7 +1135,37 @@ export function useEventStream(hooks: EventStreamHooks) {
         // 判据用「快照是当前正文的**严格前缀**」而不是「`truncated:true`」：截断位是两路共用的观测位
         //（`run-partial-buffer.js` 的 `truncatedByCap`，reasoning 截尾也置它），而前缀关系本身就是
         // 「它是同一段的较短那份」的直接证据。不是前缀 ⇒ 快照仍然权威覆盖（判据 4 两个方向不许改坏）。
-        if (deltaText.value && text.length < deltaText.value.length && deltaText.value.startsWith(text)) return;
+        //
+        // ⚠ **copilot 复审 261115-01 的 ②：光有前缀规则不够 —— 它缺一个「代际」信号**。
+        // 「较短且是前缀」有两种读数，前端拿文本形状分不出：
+        //   · (a) 同一段被 `textCap` 截过的那一份 ⇒ **该忽略**（否则刚送达的后缀被永久吃掉）；
+        //   · (b) 同轮内正文**合法地**重新变短（新一段的内容恰是旧一段的前缀）⇒ **该接受**，
+        //     旧规则把它当 (a) ⇒ 过期正文被**永久**保留（刷新前再也不会被任何后续快照修正，
+        //     因为新快照只会更长、而它已经等于当前值）。
+        // 服务端因此额外带一个**单调不减**的代际号 `textSegment`（只在正文段边界 +1），规则**三条**：
+        //   1. `textSegment > 本连接已记录的` ⇒ **接受**（新的一段，哪怕更短、哪怕恰是前缀）并更新记录；
+        //   2. `textSegment === 已记录的` 且快照是当前正文的**严格前缀** ⇒ **忽略**（就是上面那条 E2
+        //      截断保护，仍然必要，本单一字不改它的行为）；
+        //   3. `textSegment < 已记录的` ⇒ **忽略**（过期快照；不更新记录，否则水位线会倒退）。
+        // 两个兜底档（都不是新规则，是把「不知道」归到保守那一侧）：
+        //   · 帧里**没有** `textSegment`（旧后端）⇒ 退回上面那条前缀规则，不报错（additive 键的兼容口径）；
+        //   · 本连接**从未**见过该 run 的代际号（刚重连）⇒ 也走前缀规则（拿不到代际就不知道它是
+        //     (a) 还是 (b)，按「宁可少盖一次，刷新即回」取舍；同时把代际记下来，之后的 +1 就能接上）。
+        // 记录只在帧过了上面 run/轮双闸**之后**才写（整帧丢弃的帧不配推水位线），且只进不退。
+        const frameSegment = typeof d.textSegment === 'number' && Number.isFinite(d.textSegment)
+          ? d.textSegment : null; // 缺键/脏值 ⇒ null = 旧后端（或脏帧），走前缀规则
+        const seenSegment = deltaSegmentByRun.get(d.run_id as string); // undefined = 本连接从未观测
+        const hasSegment = frameSegment !== null && seenSegment !== undefined;
+        const strictPrefix = !!deltaText.value && text.length < deltaText.value.length
+          && deltaText.value.startsWith(text);
+        // 水位线**先推再判**（推的是代际，不是正文）：「从未观测 + 恰是前缀」那一档也会 return，
+        // 不先推就把基线永遥建不起来，下一次 +1 的帧照样被当前缀规则吞掉。
+        // 只进不退：比基线旧的帧（规则 3）不得把水位拉回去；代际是**事实**，与本帧正文盖不盖无关。
+        if (frameSegment !== null && (seenSegment === undefined || frameSegment > seenSegment)) {
+          deltaSegmentByRun.set(d.run_id as string, frameSegment);
+        }
+        if (hasSegment && frameSegment < seenSegment) return;                 // 规则 3：过期一代
+        if (!(hasSegment && frameSegment > seenSegment) && strictPrefix) return; // 规则 2 / 两个兜底档
         deltaText.value = text;
         // E 条：这段快照正文的归属（上面 `runOk` 已保证 `d.run_id` 是非空字符串，不重复守卫）。
         deltaRunId.value = d.run_id as string;
@@ -1268,6 +1311,9 @@ export function useEventStream(hooks: EventStreamHooks) {
     // issue #502 形态 M：轮起点 seq 同生命周期 —— 不清会让下一个会话的第一条快照帧拿去比
     // **上一个会话某个 run** 的号（run_id 不同 ⇒ 实际是 miss，但语义上这里必须是空的）。
     roundSeqByRun.clear();
+    // copilot 复审 ②：代际号同生命周期（不清就会拿**上一个会话**某个 run 的代际去比新会话的 run，
+    // 尺对不上 ⇒ 新段被当旧帧丢掉）。
+    deltaSegmentByRun.clear();
     cardByCallId.clear();
     esSessionId.value = null;
   }

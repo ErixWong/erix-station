@@ -259,6 +259,73 @@ test('D-4：脏输入一律不进缓冲（不拿脏值冒充正文）', () => {
   assert.equal(s.chunks, 0);
 });
 
+test('copilot 复审②：textSegment = 正文段代际号（只在 round_start / closeRound 各 +1，单调不减，跨 run 互不影响）', () => {
+  const b = createPartialBuffer();
+  b.observe('r1', ev(0, 'assistant_delta', { text: '还没轮起点的半句' }));
+  assert.equal(b.snapshot('r1').textSegment, 0, '开局 = 0（不是 null/undefined：前端要能直接比大小）');
+  b.observe('r1', roundStart(1, 1, 7));
+  assert.equal(b.snapshot('r1').textSegment, 1, 'round_start = 正文段边界 ⇒ +1');
+  b.observe('r1', ev(2, 'assistant_delta', { text: '第一段' }));
+  assert.equal(b.snapshot('r1').textSegment, 1, '碎片**不**推代际（否则每片都算新一代，那条守卫等于没有）');
+  b.closeRound('r1');   // = durable `round_end` 的写入侧效果（`internal.js` 走 stage().closeRound）
+  assert.equal(b.snapshot('r1').textSegment, 2, 'closeRound = 另一个正文段边界 ⇒ +1');
+  assert.equal(b.snapshot('r1').chunks, 0, '同时 `chunks` 归零 —— 这正是它**不能**当代际号的现场');
+
+  // 单调不减：随轮推进只进不退（每轮都采一次读数，含正文已空的时刻）
+  // ⚠ `client_event_id` 的计数必须**全程递增**：`isRedelivery` 拿「同一 attempt 的计数高水位」判重投，
+  //   拿比它小的号回去就是「重投」⇒ 那条事件被整条丢弃，本用例采不到代际。
+  const seen = [b.snapshot('r1').textSegment];
+  let n = 40;
+  for (let round = 2; round <= 4; round++) {
+    b.observe('r1', roundStart(n++, round, 20 + round));
+    b.observe('r1', ev(n++, 'assistant_delta', { text: `第${round}轮` }));
+    b.closeRound('r1');
+    seen.push(b.snapshot('r1').textSegment);
+  }
+  assert.ok(seen.every((v, i) => i === 0 || v > seen[i - 1]), `代际必须严格递增：${JSON.stringify(seen)}`);
+  // 既有字段语义一个字不许动（本单只加键）
+  const snap = b.snapshot('r1');
+  assert.equal(snap.chunks, 0, '`chunks` 仍是「本轮正文片数」（跟着轮边界归零），没被代际污染');
+  assert.equal(snap.roundSeq, 24, '`roundSeq` 仍是当前轮 `round_start` 的 seq（没被代际改动）');
+  assert.equal(snap.truncated, false, '`truncated` 语义不变');
+  assert.ok(!('uptoSeq' in snap), '不加水位线类旧键（additive 只加 textSegment）');
+
+  // 跨 run 互不影响
+  b.observe('r2', ev(0, 'assistant_delta', { text: '另一个 run' }));
+  assert.equal(b.snapshot('r2').textSegment, 0, '新 run 从 0 起（代际是 per-run 的，不是全局计数器）');
+  assert.equal(b.snapshot('r1').textSegment, seen.at(-1), 'r1 的水位不因观测了 r2 而变');
+  b.observe('r2', roundStart(1, 1, 3));
+  assert.equal(b.snapshot('r2').textSegment, 1);
+  assert.ok(b.snapshot('r2').textSegment < b.snapshot('r1').textSegment,
+    '两个 run 各自数自己的段 ⇒ 前端必须按 run 记账（拿 A 的代际比 B 的帧会整帧丢）');
+
+  // 重投去重不得重复推代际（`applyTo` 在 `isRedelivery` 判重**之后**才动槽）
+  // ⚠ `client_event_id` 必须带**本 run 的 id** 前缀（`isRedelivery` 的正则拿 runId 拼），否则它根本
+  //   不进判重通道（`ev()` 那个 helper 硬编码了 `r1:` 前缀，对 r2 不适用）。
+  const before = b.snapshot('r2').textSegment;
+  const rs = { client_event_id: 'r2:1:9', type: 'round_start', payload: { round: 2 }, session_id: 's1', seq: 11 };
+  assert.equal(b.observe('r2', rs), true, '首次观察');
+  assert.equal(b.snapshot('r2').textSegment, before + 1, '真的新一轮 ⇒ +1');
+  assert.equal(b.observe('r2', rs), false, '同计数重投 ⇒ 判重');
+  assert.equal(b.snapshot('r2').textSegment, before + 1, '重投的那条不得把代际多推一格');
+});
+
+test('copilot 复审②：stage()/commit 通道里代际同样只在 COMMIT 后生效（没 commit 就不留痕）', () => {
+  const b = createPartialBuffer();
+  b.observe('r1', roundStart(0, 1, 5));
+  assert.equal(b.snapshot('r1').textSegment, 1);
+  const tx = b.stage();
+  tx.observe('r1', roundStart(1, 2, 9));
+  tx.closeRound('r1');
+  assert.equal(tx.snapshot('r1').textSegment, 3, '事务**视图**看到本事务的两格');
+  assert.equal(b.snapshot('r1').textSegment, 1, '未 COMMIT ⇒ 真相不动（口径④）');
+  tx.commit();
+  assert.equal(b.snapshot('r1').textSegment, 3, 'COMMIT 之后才并进真相');
+  const tx2 = b.stage();
+  tx2.observe('r1', roundStart(2, 3, 15));
+  assert.equal(b.snapshot('r1').textSegment, 3, '没 commit 的事务不留痕（回滚 = 不推代际）');
+});
+
 test('D-4：单例导出可用（写入侧与补发侧共用一份）', () => {
   partialOutputs.clear();
   partialOutputs.observe('rr', { client_event_id: 'rr:1:0', type: 'assistant_delta', payload: { text: 'hi' }, session_id: 'ss' });
