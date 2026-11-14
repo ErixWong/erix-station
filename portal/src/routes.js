@@ -35,26 +35,61 @@ const IDLE_TICK_MS = 250;
 const IDLE_BACKOFF_MAX_MS_DEFAULT = 2000;
 const ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT = 10000;
 
+// issue #506 评审（copilot 验收意见①）：**光校验「正整数」不够**——退避时长最终是交给 `setTimeout`
+// 的，而 Node 的 timer 只吃 **32 位有符号整数**：现查 Node v22.23.2 跑 `setTimeout(()=>{}, 3e9)`
+// 直接打印 `Timeout duration was set to 1.`，即 `ROUTE_IDLE_BACKOFF_MAX_MS=3000000000` 的后果不是
+// 「退避变长」，而是**退化成 1ms 空转**——比本单要修的 250ms 空转还严重 250 倍。所以旋钮必须带
+// **安全上限**，且越界时**回落默认 + warn**（不静默夹取：夹取会让运维以为那行配置真的生效了）。
+const NODE_TIMER_MAX_MS = 2147483647;
+// 业务上限：空闲退避超过 60s 对 outbox 消费已经没意义（人手工入队的一条变更要等一分钟才生效，
+// 不如直接重启）。取 `min(Node timer 上限, 60s)`；要放宽请连同这条理由一起改。
+export const MAX_BACKOFF_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 60_000);
+// 孤儿回收间隔不是退避而是「崩溃恢复的最长延迟」，放大到 10min 仍可接受，但同样不许越 Node timer 上限。
+const ORPHAN_RECOVERY_INTERVAL_MS_SAFE = Math.min(NODE_TIMER_MAX_MS, 600_000);
+
 // F3'（Round B 评审）：route_revisions / route_outbox 的 aggregate_id 是 uuid NOT NULL
 //（schema.sql §9），非 UUID 字符串在真实 DB 上会报 invalid input syntax for type uuid。
 // full_rebuild 的 outbox 行只是「触发一次全量重建」的信号、不对应真实聚合行，用固定 nil UUID 哨兵：
 // 满足 uuid 类型约束，且多次重试复用同一聚合 → 复用既有 revision head / 租约 / 重试链路。
 export const FULL_REBUILD_AGGREGATE_ID = '00000000-0000-0000-0000-000000000000';
 
-/** 正整数 env（非法值回落默认——旋钮写错不许把 reconciler 打挂）。 */
-function envInt(name, fallback) {
-  const n = Number.parseInt(String(process.env[name] ?? '').trim(), 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+/**
+ * 正整数 env（issue #506 评审①）。三种情形一律**回落默认并 warn 一句**，绝不静默：
+ *   · 非法值（`abc` / `-1` / `0`）——旧行为是静默回落，本单改成看得见；
+ *   · 越界（> `max`）——`max` 的存在理由见上面 `NODE_TIMER_MAX_MS` 的实测注释；
+ *   · 没配（空串）——静默用默认（这不是错误，不该每次启动都刷一条噪声）。
+ * @param {string} name @param {number} fallback @param {{max?: number, log?: object}} [opts]
+ */
+function envInt(name, fallback, { max = MAX_BACKOFF_MS_SAFE, log = console } = {}) {
+  const raw = String(process.env[name] ?? '').trim();
+  if (raw === '') return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    log.warn?.(`[env] ${name}=${raw} 不是正整数 ⇒ 回落默认 ${fallback}ms（这行配置没生效）`);
+    return fallback;
+  }
+  if (n > max) {
+    log.warn?.(`[env] ${name}=${n} 超过安全上限 ${max}ms ⇒ 回落默认 ${fallback}ms`
+      + `（不夹取：夹取会让人以为这行配置生效了）`);
+    return fallback;
+  }
+  return n;
 }
 
 /**
  * issue #506：第 `idleTicks` 个**连续空闲拍**该等多久。`idleTicks = 0` 表示上一拍认领到了活
- * ⇒ 回基准 250ms；否则 250 起指数翻倍、夹在 `maxMs`（默认 2000）。
+ * ⇒ 回基准 250ms；否则 250 起指数翻倍、夹在 `maxMs`（默认 2000）封顶。
  * 导出的理由：判据是「退避真的发生」，阶梯必须能被直接读出而不是靠间接推。
+ *
+ * issue #506 评审①：这里**自己也夹一次**（不假定调用方已经过 `envInt`）——直接调用方传 3e9 就会
+ * 造出 1ms 空转。返回值恒在 `[IDLE_TICK_MS, MAX_BACKOFF_MS_SAFE]`。
  */
 export function idleDelayMs(idleTicks, maxMs = IDLE_BACKOFF_MAX_MS_DEFAULT) {
   if (!(idleTicks > 0)) return IDLE_TICK_MS;
-  return Math.min(IDLE_TICK_MS * 2 ** (idleTicks - 1), Math.max(IDLE_TICK_MS, maxMs));
+  const cap = Number.isFinite(maxMs) && maxMs > 0
+    ? Math.min(Math.max(IDLE_TICK_MS, maxMs), MAX_BACKOFF_MS_SAFE) // 下限：配置不许把基准节拍压低
+    : IDLE_BACKOFF_MAX_MS_DEFAULT;                                 // NaN / Infinity / 负数 ⇒ 生产默认
+  return Math.min(IDLE_TICK_MS * 2 ** (idleTicks - 1), cap);
 }
 
 /**
@@ -958,8 +993,9 @@ export function startRoutesLoop(pool, config, {
   // 单测注入假时钟与假 sleep（判据是「退避真的发生」，不是「代码里有 sleep」）。
   sleep = sleepCancellable,
   now = () => Date.now(),
-  idleBackoffMaxMs = envInt('ROUTE_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT),
-  orphanRecoveryIntervalMs = envInt('ROUTE_ORPHAN_RECOVERY_INTERVAL_MS', ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT),
+  // #506 评审①：旋钮带上安全上限；越界/非法 ⇒ 回落默认 + warn（`log` 在同一参数列表里已先绑定）。
+  idleBackoffMaxMs = envInt('ROUTE_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT, { max: MAX_BACKOFF_MS_SAFE, log }),
+  orphanRecoveryIntervalMs = envInt('ROUTE_ORPHAN_RECOVERY_INTERVAL_MS', ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT, { max: ORPHAN_RECOVERY_INTERVAL_MS_SAFE, log }),
 } = {}) {
   let consecutiveFailures = 0;
   // #506：连续空闲拍数（认领到活就清 0）与孤儿回收上次跑的时刻。
