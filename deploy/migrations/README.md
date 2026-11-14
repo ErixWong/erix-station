@@ -43,7 +43,7 @@
   （= `migrate.js` 的 `defaultMigrationsDir()`）。
 - 执行方：`node portal/src/cli.js migrate`（或 `MIGRATE_ON_START=1`，portal 在**监听端口前**应用），
   身份 `station_platform`（`MIGRATE_DATABASE_URL`，DDL），见 deploy-contract §3.1。
-- 现状（**下面这段只写到 0026，是 2026-11-06 的读数**；0027–0033 见下面「增量迁移清单」一节）：增量迁移已包含
+- 现状（**下面这段只写到 0026，是 2026-11-06 的读数**；0027–0034 见下面「增量迁移清单」一节）：增量迁移已包含
   `0001-idempotency-keys.sql`（写操作幂等台账）至
   `0026-login-email-codes.sql`（**#449 登录第二因素「邮箱验证码」**：`login_email_codes` 一行一枚码 +
   `mail_settings` 单行邮件通道配置——SMTP 参数存 DB、口令明文，与 `git_hosts.admin_key` 同口径；
@@ -87,7 +87,7 @@
 > 迁移身份 = `station_platform`（DDL，表 owner）；运行时身份 = `station_portal`（最小 DML）。
 > 见 `docs/design/deploy-contract.md` §2.4/§3 与 `docs/env.md` §10。**为什么这是硬约束而不是建议，见下节。**
 
-## 增量迁移清单（0027–0033）
+## 增量迁移清单（0027–0034）
 
 > 上面「现状」段那句「已包含 `0001` 至 `0026`」停在 2026-11-06，**清单以本节为准**（`ls deploy/migrations/*.sql` 现查可复核）。
 > 一句话用途 + 关联 issue；细节在各自文件头注释里（那里才是取证的地方），旧条目（0001–0026）的来历见「镜像与执行」段。
@@ -101,8 +101,14 @@
 | `0031-user-last-activity-at.sql` | `users.last_activity_at`：该用户最近一次**亲口说话**（按下发送）的时刻，可空、无默认、不建索引 | #497 |
 | `0032-drop-retired-tables.sql` | 撤三张退役/备份表（`llm_models_retired`、`llm_providers_retired`、`transcript_rounds_shape4_bak_20261027`）；**撤前每个部署自己跑一遍访问账判据** | #503 |
 | `0033-delta-events-not-persisted.sql` | 清 `assistant_delta` / `reasoning_delta` / `tool_call_delta` 的历史存量（**形态 M：纯清理、零 DDL**，分批 `FOR UPDATE SKIP LOCKED`） | #502 |
+| `0034-prune-stale-run-checkpoints.sql` | 清 `run_checkpoints` 里**永不再被读**的两类快照（(a) run 作用域且那个 run 已终态、(b) session 作用域且会话已归档或 14 天没动；**纯清理、零 DDL**，分批 `ctid` + `FOR UPDATE SKIP LOCKED`，只留活跃会话每 key 一行） | #502 的遗留账（工单 261114-03，PR #509） |
 
 ⚠ `0033` 有**部署顺序**要求，见下一节——它不是「又是一条 DELETE」那么轻。
+⚠ `0034` 同病：**迁移清完磁盘也不会自己缩**——它只清行（dev 实测清掉 70/87 行后
+`pg_total_relation_size` 从 4,644,864 B 只动到 4,628,480 B，−0.35%），要回收磁盘必须在部署后手工跑
+**`VACUUM (FULL, ANALYZE) run_checkpoints;`**（不能写进迁移文件：`VACUUM` 不在事务块里跑，同下面 `0033` 那条），
+实测 **4.64 MB → 565 KB**（565,248 B，−87.8%，`VACUUM FULL` 耗时 0.179 s）；出处
+`docs/maintenance/task-ledger.md` §8.126.2（那里还有「删行≠还磁盘」的逐时点读数表）。
 
 ## 部署顺序：`0033` 必须**先部署新代码、再跑迁移**（issue #502）
 

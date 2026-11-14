@@ -712,6 +712,8 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 
 **膨胀来源排序（dev 真库 `station` 现查，2026-11-13，issue #502 修正；⚠ 那一列是 **`0033` 迁移前**的历史读数）**：
 `run_events` **472 MB** ≫ `transcript_rounds` **12 MB** > `run_checkpoints` 4.6 MB > 其余表。
+（⚠ 行尾那个 `run_checkpoints` 4.6 MB 是 **`0034` 迁移前**的读数；`0034` + `VACUUM FULL` 后它是
+17 行 / 565,248 B，见下面「迁移后的当前量级」那条与台账 §8.126.2。）
 本表原先写的是「`transcript_rounds.messages`（单 run 可达 MB 级）> `run_events.payload`」——**排序反了**：
 `transcript_rounds` 实测 12 MB / 2,231 行（单 run MB 级那一档远没出现），而 `run_events` 靠 stream 档碎片的
 **行数**堆到 472 MB / 884,163 行。膨胀机制不是「行大」而是「行多且每行都要走一次事务 + 索引」，这是当初写下
@@ -721,7 +723,16 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
 > `docs/maintenance/task-ledger.md` §8.126.1）**：`run_events` **7,008 行 / 5,578,752 B（5.3 MB）/
 > 每行 802 B**，全库 **48,389,143 B（46.1 MB）** ⇒ 上面那条排序里 `run_events` 已从「472 MB」降到全库零头，
 > 现下的榜首是 `transcript_rounds`（那个排序只在迁移前成立）。
-> ⚠ 另一处没动的膨胀源：`run_checkpoints`（85 行 / 4.6 MB）本单未动。
+> ⚠ 另一处没动的膨胀源：`run_checkpoints`（85 行 / 4.6 MB）本单未动——**但自迁移 `0034`（PR #509）起它也不成立了**，
+> 时间边界（真库 `station` 实测，出处 `docs/maintenance/task-ledger.md` §8.126.2）：
+> **`0034` 之前 87 行 / 4,644,864 B**（台账记的拆分：heap 81,920 / 索引 32,768 / TOAST 4,227,072，
+> 那一组不逐字相加——它没含 TOAST 自己的索引与 FSM/VM 那几块），
+> **`0034` + `VACUUM (FULL, ANALYZE)` 后 17 行 / 565,248 B**（heap 8,192 + 索引 32,768 + TOAST 本体 507,904；
+> `pg_total_relation_size` 里的 TOAST 那一块算上 TOAST 自己的索引是 524,288 B，三者相加才等于 565,248）
+> ——回收 4,079,616 B = −87.8%，全库 −3.88 MB（−8.4%）。
+> 上面那句 85 行 / 4.6 MB 与本节那个排序同属**旧时点读数**（那是 `0033` 前甚至 `0034` 前的一次现查），
+> 留着是取证当时的排序，不是现价；现价的量法（行数 / `pg_total_relation_size` / heap·idx·TOAST 拆开）见 §8.126.2。
+> 另：`0034` 只清行，**磁盘要部署侧手工 `VACUUM (FULL, ANALYZE) run_checkpoints` 才回收**（同下面 `0033` 那条运维注记的理由）。
 
 | 表 | 策略 | 理由 / 依据 |
 |---|---|---|
@@ -743,7 +754,12 @@ TOTP 是 opt-in（`users.totp_secret` 为空即跳过第二因素），而现网
   这一步**没有**放进迁移文件——迁移 runner 每个文件跑在单事务里，`VACUUM` 不能在事务块中执行
   （`portal/test/delta-not-persisted-db.test.js` 里有用例钉着这条事实）。
 - 每行字节上界（清理后）：`run_events` 每行 < 4 KB（含 5 个索引的摊销）、`run_checkpoints` 每行 < 512 KB
-  （dev 实测 85 行 / 4,644,864 B ≈ 53 KB/行，本单不动它）。两条都在真库用例里断言，不是文档口头承诺。
+  （**时间边界**：`0034` 前 dev 实测 85 行 / 4,644,864 B ≈ 53 KB/行；`0034` + `VACUUM (FULL, ANALYZE)` 后
+  **17 行 / 565,248 B ≈ 33 KB/行**；2026-11-14 真库现查，出处台账 §8.126.2）。
+  两条上界都在真库用例里断言（`portal/test/delta-not-persisted-db.test.js` 的「体积闸」那条），不是文档口头承诺；
+  ⚠ 它断的是 `pg_total_relation_size / count(*)` 的**均值**，不是单行最大值——现查单行最大
+  `length(snapshot::text)` = **429,617 B**（一行的正文就吃掉那个 512 KB 上界的 **82 %**）⇒ 均值口径下很宽，
+  单行口径下余量只剩 ~18 %，快照再大一档要先把这条判据改成按单行量。
 - 量级粗估：单 FDE 日 20 runs × 100 事件/run × 2 KB ≈ 4 MB/日/FDE → 个位数 FDE 规模下即使**不删除**、长期热保留，增长亦平缓（年量级 GB），对 275 G 可用磁盘（env §8.1）无压力；transcript 的在线积累是主要增长项，需纳入看板。
 
 ---
