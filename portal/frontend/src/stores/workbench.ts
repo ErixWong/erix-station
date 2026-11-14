@@ -690,8 +690,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //   · 后来出现的是**别的** run（`laterOwner !== runId`）⇒ **不撤**（未知不能当已知用，E 条）；
     //   · 后来出现的**正是**这条 partial 的那个 run ⇒ 允许撤 —— 「补认领」与这条 partial 的归属
     //     一致，撤掉的就是它自己那一份，不存在把别人的气泡抹掉的风险；
-    //   · 整条链路**一个 run 身份都没拿到**（真·旧后端，既有那条「身份未知 ⇒ 照旧撤」用例钉的
-    //     就是这一档）⇒ 退回只比文本。
+    //   · 当时**没有**任何 run 身份可比（`laterOwner` 当前是未知 ⇒ 真·旧后端那一档，既有那条「身份未知 ⇒ 照旧撤」
+    //     用例钉的就是这一档）⇒ 退回只比文本。
     //
     // copilot 第三轮**最终验收**的 **①**（小·语义定死，紧接上面那条之后）：上面这三档原来**只认 `null`**，
     // 而 `sameRun` 认的是 `null` **和** `'unknown'` ⇒ `'unknown'` 这个哨兵一身二职、两条判据读成两样：
@@ -704,9 +704,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     //      ⇒ **不撤**（身份矛盾已知，撤错代价 > 多一行）；
     //   ② 气泡出生身份**未知** + 出现过的具体身份**正是**这条 partial 的 run ⇒ **撤**
     //      （补认领与归属一致，撤掉的就是它自己那一份）；
-    //   ③ `laterOwner` **未知**（`null` 或 `'unknown'` ⇒ 见 `isUnknownOwner`，即整条链路一个具体身份都没
-    //      拿到）⇒ 退回**只比文本**的旧兼容口径，**照旧撤**。这一档**必须**保留：否则真·旧后端（帧里从
-    //      不带 `run_id`）下同文两遍会全回来，那是 #502 判据 4 的红线。
+    //   ③ `laterOwner` **当前**未知（`null` 或 `'unknown'` ⇒ 见 `isUnknownOwner`）⇒ 退回**只比文本**的旧兼容
+    //      口径，**照旧撤**。这一档**必须**保留：否则真·旧后端（帧里从不带 `run_id`）下同文两遍会全回来，
+    //      那是 #502 判据 4 的红线。
+    //      ⚠ 口径只到「当前值」：这一档读的是**此刻**的 `es.deltaRunId`，它证明不了这条链路**历史上**
+    //      一个具体身份都没出现过（后续被接受的快照帧会再次赋值它，见 `useEventStream.ts:1169-1171`）
+    //      ⇒ 这里**不许**写成「整条链路/历史上一律」那类强断言。
     //      ⚠ **别把「压根没有 delta 条目」并进这一档**（copilot 第四轮 ①，纯注释精确化，行为一字未动）：
     //      `deltaEntry === null` 时 `deltaOwner` 取的是 `es.deltaRunId`（见上面那行），它若是个**具体** run
     //      ⇒ `sameRun` 仍按 run 身份比较，**不是**无条件只比文本；只是此时 `removeDeltaEntry()` 本来也无
@@ -888,6 +891,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (deltaEntry) deltaEntry.text = v;
   });
   // 当前 run_end 移除活动增量占位（旧 S.deltaBuf.remove()）。
+  // ⚠ `if (!deltaEntry) return;` 是**不可达但承重**的早退（copilot 第五轮 ②）：`deltaText` 非空时 watcher 必已
+  // 建好/留住那条条目，而清空这根指针的三处调用点**都同时**把 `deltaText` 置 `null`（`onCurrentRunEnd`、
+  // `applyServerRunState`、本函数末尾那一步）⇒ 「无条目但 `deltaText` 与这条 partial 同文」在真实路径上凑不出来。
+  // **不许在这里做任何「顺手清理」**（尤其不许在这里删 `kind:'partial'`：partial 的归属与撤不撤 delta 气泡无关，
+  // 删错了就是用户正看的正文凭空消失）。防这个变异的用例是源码钉（`workbench.spec.ts` 里名字带「源码钉」那条），
+  // 理由同上：运行时走不到这个分支，运行时用例钉不住它。
   function removeDeltaEntry() {
     if (!deltaEntry) return;
     const i = entries.value.indexOf(deltaEntry);
