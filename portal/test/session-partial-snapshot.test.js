@@ -1,9 +1,21 @@
-// issue #502 D-5：断线重连时「未完稿正文」的补发通路（SSE 侧的后端那一半）。
+// issue #502 D-5（**形态 M**）：断线重连时「未完稿正文」的补发通路（SSE 侧的后端那一半）。
 //
 // 为什么单开一个文件：判据 4/5（补发衔接两个方向 + 内存丢失）的**前端**那一半在
-// `portal/frontend/src/composables/useEventStream.spec.ts`（覆盖式赋值 / 占位提示 / 不推水位线），
-// **后端**那一半在这里：帧到底发不发、发的是内存还是库里那一行、有没有污染 `Last-Event-ID`。
+// `portal/frontend/src/composables/useEventStream.spec.ts`（覆盖式赋值 / `roundSeq` 对账），
+// **后端**那一半在这里：帧到底发不发、带不带 `roundSeq`、有没有污染 `Last-Event-ID`。
 // 两侧分开承重是有意的：前端改了 dispatch 分支不会让这里的 gate 变绿，反之亦然。
+//
+// **形态 M 改了本文件的三条口径（每处理由写在改动点旁边）**：
+//   ① **只有内存这一个来源**。旧版有「库里 `partial_output` 那一行」的回落（`source:'db'`），
+//      形态 M 把终态正文写进了**既有的** `run_end.payload.partial_text` ⇒ 那一行不存在了，
+//      回落分支连同它的行数上界一起删掉 ⇒ 原来断 `source:'db'` / 断「内存与库里都有 ⇒ 只发内存」
+//      两条用例的**对象消失了**，改成断「内存空 ⇒ 一帧都不发（正文的事归历史投影）」。
+//   ② **`uptoSeq` 闸门整条删除**（审计 B-2/B-3：碎片不落库就没有 seq 坐标系，拿已落库事件的最大
+//      seq 与客户端 `Last-Event-ID` 硬比 = 两套坐标比大小，比赢漏发、比输重发）。判据从「服务端猜
+//      水位线」换成「帧自带 `roundSeq`，前端拿自己观测到的 `round_start.seq` 对账」⇒ 原来那条
+//      「`uptoSeq <= Last-Event-ID` ⇒ 不发」的用例**反转**成「水位线再高也照发，由前端判」。
+//   ③ **占位帧搬到历史投影**（`session-partial-output.test.js`）：SSE 重连时前端本来就会重拉
+//      history，两条通道各说一句就是同一件事说两遍 ⇒ 这里改成断「SSE 不再发占位」。
 //
 // 隔离（docs/testing.md §2.1）：注入内存 fake pool，不碰真实 DB。
 import test from 'node:test';
@@ -38,8 +50,6 @@ class SnapshotPool extends FakePool {
       status: 'active', last_seq: 9, project_name: 'proj1',
     };
     this.replayRows = [];   // 补发查询（durable 档）返回的行
-    this.partialRows = [];  // `type = 'partial_output'` 那一行
-    this.windowRuns = [];   // `loadWindowRuns` 的返回（占位判据用）
     this.sqlLog = [];       // 断言「重放 SQL 排除 partial_output」这类文本级事实
   }
 
@@ -47,12 +57,8 @@ class SnapshotPool extends FakePool {
     const flat = String(sql).replace(/\s+/g, ' ').trim();
     this.sqlLog.push(flat);
     if (flat.includes('FROM chat_sessions s')) return { rows: [this.sessionRow] };
-    // ⚠ 顺序要紧：`partial_output` 那条查询里也有 `FROM run_events`，先分派它。
-    if (flat.includes('FROM run_events') && flat.includes("type = 'partial_output'")) {
-      return { rows: this.partialRows };
-    }
     if (flat.includes('FROM run_events') && flat.includes('seq >')) return { rows: this.replayRows };
-    if (flat.includes('FROM runs r')) return { rows: this.windowRuns };
+    if (flat.includes('FROM runs r')) return { rows: [] };
     if (flat.includes('FROM messages')) return { rows: [] };
     if (flat.includes('FROM runs')) return { rows: [] };
     return super.query(sql, params);
@@ -123,26 +129,29 @@ function framesOf(raw) {
 }
 const partialFrames = (raw) => framesOf(raw).filter((f) => f.event === 'partial_output');
 
-/** 往进程内累加器里喂碎片（真写路径的同一入口，`internal.js` 的写循环调的就是它）。 */
-function feedDeltas(runId, texts, { startSeq = 3 } = {}) {
+/**
+ * 往进程内缓冲里喂碎片（真写路径的同一入口，`internal.js` 的写循环调的就是它）。
+ * **形态 M 的改动**：先喂一条 `round_start`（带 `seq`）——正文槽位是按轮的，没有轮起点就没有
+ * `roundSeq`，而 `roundSeq` 正是这一路唯一的对账凭据（不是旧版的 `uptoSeq`，见文件头 ②）。
+ */
+function feedDeltas(runId, texts, { startSeq = 3, round = 1 } = {}) {
+  partialOutputs.observe(runId, {
+    session_id: SESSION_ID, run_id: runId, type: 'round_start',
+    client_event_id: `${runId}:1:0`, seq: startSeq - 1, payload: { round },
+  });
   texts.forEach((text, i) => partialOutputs.observe(runId, {
     session_id: SESSION_ID, run_id: runId, type: 'assistant_delta',
     client_event_id: `${runId}:1:${startSeq + i}`, seq: null, payload: { text },
   }));
-  //  durable 事件（`round_end`）推进 `uptoSeq`：快照的「已看到哪里」只认落库的那些
-  partialOutputs.observe(runId, {
-    session_id: SESSION_ID, run_id: runId, type: 'round_end',
-    client_event_id: `${runId}:1:900`, seq: startSeq + texts.length, payload: { round: 1 },
-  });
 }
 
 const reset = () => partialOutputs.clear();
 
-test('#502 D-5：重连时内存里有未完稿正文 ⇒ 发一帧 source=memory，且**不带 id:**（不污染 Last-Event-ID）', async () => {
+test('#502 D-5：重连时内存里有未完稿正文 ⇒ 发一帧 source=memory 带 roundSeq，且**不带 id:**（不污染 Last-Event-ID）', async () => {
   const s = await startServer();
   try {
     reset();
-    feedDeltas(RUN_ID, ['断线前', '流过的', '那半句']);
+    feedDeltas(RUN_ID, ['断线前', '流过的', '那半句']); // round_start 的 seq = 2
     const raw = await s.stream({ lastEventId: 1 });
     const parts = partialFrames(raw);
     assert.equal(parts.length, 1, `补发段应恰一条快照帧：${raw.slice(0, 300)}`);
@@ -150,9 +159,15 @@ test('#502 D-5：重连时内存里有未完稿正文 ⇒ 发一帧 source=memor
     assert.equal(parts[0].data.source, 'memory');
     assert.equal(parts[0].data.text, '断线前流过的那半句', '全量正文，不是增量');
     assert.equal(parts[0].data.run_id, RUN_ID);
-    assert.equal(parts[0].data.uptoSeq, 6, '`uptoSeq` = 已落库事件的最大 seq（碎片自己不占号）');
+    // 改写的旧断言：`uptoSeq: 6` ⇒ `roundSeq: 2`（形态 M 删了 uptoSeq，见文件头 ②；
+    // 换断 `roundSeq` = 当前轮 `round_start` 自己的 seq，前端拿它与自己观测到的轮起点对账）。
+    assert.equal(parts[0].data.roundSeq, 2, '`roundSeq` = 当前轮 `round_start` 的 seq（碎片自己不占号，所以只能带轮起点的号）');
+    assert.equal(parts[0].data.round, 1);
     assert.equal(parts[0].data.chunks, 3);
-    // 重放 SQL 必须把那一行排除掉（否则「重放一行 + 快照一行」= 同一段正文两个帧）
+    assert.ok(!('uptoSeq' in parts[0].data), `帧里不许再有 uptoSeq（那套坐标已删）：${JSON.stringify(parts[0].data)}`);
+    // 重放 SQL 必须仍把那一行排除掉（形态 M 之后是**防御性**的：新代码不写它，但旧库有存量行，
+    // 不排掉就是「一行真事件 + 一份快照」两套正文同屏 ⇒ 这条断言的**意图**（同一段正文只出现一次）
+    // 与旧版完全一致，只是它防的对象从「两条活通路」变成「活通路 + 存量脏行」。
     const replaySql = s.pool.sqlLog.find((q) => q.includes('FROM run_events') && q.includes('seq >'));
     assert.match(replaySql, /type <> 'partial_output'/, `重放 SQL 未排除那一行：${replaySql}`);
   } finally {
@@ -161,95 +176,77 @@ test('#502 D-5：重连时内存里有未完稿正文 ⇒ 发一帧 source=memor
   }
 });
 
-test('#502 判据 4（不重复的方向）：uptoSeq <= Last-Event-ID ⇒ 客户端已看全，一条快照都不发', async () => {
+test('#502 M-4：Last-Event-ID 再高也照发 —— 闸门交给前端的 roundSeq 对账（不再由服务端猜水位线）', async () => {
   const s = await startServer();
   try {
     reset();
-    feedDeltas(RUN_ID, ['早就说完的一句']);
-    const upto = partialOutputs.snapshot(RUN_ID).uptoSeq; // = 4
-    const raw = await s.stream({ lastEventId: upto });
-    assert.deepEqual(partialFrames(raw), [], `水位线已到 ⇒ 再发一遍就是重复：${raw.slice(0, 300)}`);
+    feedDeltas(RUN_ID, ['还在写的一句']);
+    // 旧版这里断的是「`uptoSeq <= Last-Event-ID` ⇒ 一条都不发」。形态 M 反过来：
+    // 服务端**没有**可靠水位线可用（碎片不落库 ⇒ 没有 seq 坐标系），猜出来的水位线要么漏发
+    // 要么重发；把「是不是我已经有了」交给唯一知道答案的一端（前端拿 roundSeq 对）。
+    // 少发一帧的代价 = 界面上少一段还没写完的正文（刷新即回）；错发一帧的代价 = 重复正文（#300 头号坑），
+    // 而后者现在由前端 roundSeq 不匹配 ⇒ 整帧丢弃来兜住（`useEventStream.spec.ts` 判据 4 承重）。
+    // 9 = 夹具里会话的 `last_seq`（再大就 404 `last_event_id beyond session`，那是另一条口径）
+    // ⇒ 水位线已经盖住整个会话，本帧照样发。
+    const raw = await s.stream({ lastEventId: 9 });
+    assert.equal(partialFrames(raw).length, 1, '内存里有未完稿正文就发，判据不在服务端');
   } finally {
     reset();
     await s.close();
   }
 });
 
-test('#502 判据 5（内存丢失）：内存空、库里有那一行 ⇒ source=db 回落（并按展示窗口截断）', async () => {
+test('#502 判据 5（内存丢失）：内存空 ⇒ SSE 一帧都不发（终态正文归历史投影，不再回落读库）', async () => {
   const s = await startServer();
   try {
-    reset(); // 模拟 portal 重启：累加器空了
-    s.pool.partialRows = [{
-      run_id: RUN_ID, seq: 8,
-      payload: { text: 'x'.repeat(2500), reasoning: '', uptoSeq: 8, chunks: 60, truncated: false, source: 'terminal' },
-    }];
+    reset(); // 模拟 portal 重启：缓冲空了
+    // 旧版这里播 `partialRows`（库里那一行）并断 `source:'db'` + 截到 2000。形态 M 里
+    // **那一行根本不存在**（终态正文在 `run_end.payload.partial_text`，已完成轮次在
+    // `round_end.payload.final_text`，两者都由 `GET /events/history` 的投影取回，
+    // 见 `session-partial-output.test.js` 的「两处都读」用例）⇒ 断的是「本通路不越界去库里拼一份
+    // 看起来像流式的正文」：那会拿**已完成轮次的终稿**冒充「还在流的那一轮」。
     const raw = await s.stream({ lastEventId: 1 });
-    const parts = partialFrames(raw);
-    assert.equal(parts.length, 1);
-    assert.equal(parts[0].data.source, 'db');
-    assert.equal(parts[0].data.text.length, 2000, '库里那一行可能比展示窗口长 ⇒ 截断仍由读侧统一拿笔');
-    assert.equal(parts[0].data.truncated, true, '截断过就必须谎报得了：truncated 要置真');
-    assert.equal(parts[0].id, null);
+    assert.deepEqual(partialFrames(raw), [], `内存没东西就不许发帧（读库那一半归历史投影）：${raw.slice(0, 300)}`);
+    assert.deepEqual(
+      s.pool.sqlLog.filter((q) => q.includes('FROM run_events') && q.includes("type = 'partial_output'")),
+      [], '补发通路不许再打「读那一行」的查询（回落分支已删 ⇒ 一次查询都不许多发）',
+    );
   } finally {
     reset();
     await s.close();
   }
 });
 
-test('#502：同一 run 内存与库里都有 ⇒ 只发内存那一份（两份正文是同一段，发两遍就是重复）', async () => {
+test('#502 M-4：已标终态的 run 不再发快照（正文已进 run_end.payload，再发一份就是重复正文）', async () => {
   const s = await startServer();
   try {
     reset();
-    feedDeltas(RUN_ID, ['内存里的更新一份']);
-    s.pool.partialRows = [{
-      run_id: RUN_ID, seq: 8,
-      payload: { text: '库里那份旧一点的', reasoning: '', uptoSeq: 8, chunks: 2, truncated: false, source: 'terminal' },
-    }];
+    feedDeltas(RUN_ID, ['刚说完的半轮']);
+    partialOutputs.markTerminal(RUN_ID); // 终态点的**唯一**缓冲动作（`internal.js#retirePartialBuffer`）
     const raw = await s.stream({ lastEventId: 1 });
-    const parts = partialFrames(raw);
-    assert.equal(parts.length, 1, `同一 run 至多一帧：${JSON.stringify(parts.map((p) => p.data.source))}`);
-    assert.equal(parts[0].data.source, 'memory');
-    assert.equal(parts[0].data.text, '内存里的更新一份');
+    assert.deepEqual(partialFrames(raw), [], '终态 run 的候选资格必须收掉：否则刷新后历史一份 + 补发一份 = 两段正文');
   } finally {
     reset();
     await s.close();
   }
 });
 
-test('#502 判据 5 的另一半 + #278 底线：内存与库都没有 ⇒ 出**占位帧**，不是空白', async () => {
+test('#502 M-4：SSE 不再发占位帧（占位搬到历史投影，两条通道不各说一句）', async () => {
   const s = await startServer();
   try {
     reset();
-    // 断线窗口里那个 run 终态了（补发里有 `run_end`），且没有 assistant 锚点
+    // 断线窗口里那个 run 终态了（补发里有 `run_end`）；旧版这里出 `source:'none'` + `placeholder:true` 帧。
     s.pool.replayRows = [{
       seq: 5, run_id: RUN_ID, type: 'run_end',
       payload: { termination: { reason: 'aborted' } }, ts: new Date(),
     }];
-    s.pool.windowRuns = [{ run_id: RUN_ID, status: 'failed', has_anchor: false, last_seq: 5 }];
     const raw = await s.stream({ lastEventId: 1 });
-    const parts = partialFrames(raw);
-    assert.equal(parts.length, 1);
-    assert.equal(parts[0].data.source, 'none');
-    assert.equal(parts[0].data.placeholder, true, '占位标记必须给（前端据此出中性提示，而不是挂一个空气泡）');
-    assert.equal(parts[0].data.text, '');
-    assert.equal(parts[0].data.uptoSeq, null);
+    assert.deepEqual(partialFrames(raw), [], '占位改由 GET /events/history 的投影给（#278 那条红线没动，只是换了通路）');
     // 补发的 `run_end` 帧自己带 id（可重放事件照旧进水位线）
     const end = framesOf(raw).find((f) => f.event === 'run_end');
     assert.equal(end.id, '5');
-  } finally {
-    reset();
-    await s.close();
-  }
-});
-
-test('#502：有 assistant 锚点 ⇒ 不出占位（正文在 messages 那条路上，再出一行就是重复正文）', async () => {
-  const s = await startServer();
-  try {
-    reset();
-    s.pool.replayRows = [{ seq: 5, run_id: RUN_ID, type: 'run_end', payload: {}, ts: new Date() }];
-    s.pool.windowRuns = [{ run_id: RUN_ID, status: 'finished', has_anchor: true, last_seq: 5 }];
-    const raw = await s.stream({ lastEventId: 1 });
-    assert.deepEqual(partialFrames(raw), []);
+    // 占位不再需要锚点判据 ⇒ 补发通路也不许再打 `loadWindowRuns` 那条 runs 查询（省一次查询是净删）
+    assert.deepEqual(s.pool.sqlLog.filter((q) => q.includes('FROM runs r')), [], '占位通路已删 ⇒ 不该再有 runs 窗口查询');
   } finally {
     reset();
     await s.close();
