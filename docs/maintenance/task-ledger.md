@@ -5230,3 +5230,35 @@ Node 没有 `flock(2)` 绑定 ⇒ `open 'wx'` 原子创建 + 锁内记 `{pid,tok
 迁移前的备份在 `~/backups/station-pre502-261114-1721.sql.gz`（39 MB）。
 
 **仍未做**：多副本 portal 下的补发行为（形态 M 明确假设单副本）；`run_checkpoints`（85 行 / 4.6 MB）本单未动。
+
+#### 8.126.2 `run_checkpoints` 清存量实测（261114 主 agent 亲手跑，PR #509）
+
+**为什么它值得单独一笔**：这张表只有 87 行，却占 4.6 MB —— 体积**几乎全在 TOAST**（`snapshot` 是整包 JSONB），
+而 `pg_stat_user_tables` 上 `n_tup_upd + n_tup_hot_upd = 5,924` 对 87 活行 ⇒ **覆盖写放大 ~68 倍**，
+每次 revision 覆盖都在 TOAST 链上留一版死元组。「行少」不等于「不涨」。
+
+**迁移 `0034` 的两条谓词**（`deploy/migrations/0034-prune-stale-run-checkpoints.sql`）：
+- **(a)** `transcript_key IS NULL` ∧ run 已终态 —— `IS NULL` 不能省：session-keyed 行的 `run_id` 存的是
+  **writer run**，那个 run 多半也早已终态，少了它会把活跃会话的快照一起删掉。
+- **(b)** `transcript_key::uuid` 属于「`status <> 'active'` 或 `updated_at < now() - interval '14 days'`」的会话
+  —— `::uuid` 显式转换不能省（`chat_sessions.id` 是 uuid、`transcript_key` 是 text，PG 不做隐式转换）。
+- `v_cutoff := now()` 贯穿删除谓词与末尾残留检查（否则迁移期间新终态的 run 会被数成残留 ⇒ 误炸）；
+  残留 ⇒ `RAISE EXCEPTION`；**语句区刻意不出现 `VACUUM`**（`migrations.test.js` 的最严闸钉住）。
+
+**实测（判据是差值）**：
+
+| 时点 | 行数 | `pg_total_relation_size` | heap / idx / TOAST | 全库 |
+|---|---|---|---|---|
+| 迁移前 | 87 | 4,644,864 B | 81,920 / 32,768 / **4,227,072** | 48,659,479 B |
+| 迁移后、VACUUM 前 | **17** | 4,628,480 B（几乎没动） | 65,536 / 32,768 / 4,227,072 | — |
+| `VACUUM (FULL, ANALYZE)` 后 | 17 | **565,248 B** | 8,192 / 32,768 / **507,904** | **44,588,055 B** |
+
+- **回收 4,079,616 B = 3.89 MB（−87.8%）**，全库 −3.88 MB（−8.4%），VACUUM FULL 耗时 **0.179 s**。
+- 删掉的行数 **70**（= 预测的 14 run-keyed + 56 死会话 session-keyed），留下 **17 行 = 活跃会话每 key 一行**，
+  `run_keyed_left = 0` ⇒ **与迁移前算出的预测逐个对上**，不是"删了挺多"。
+- 再次印证「删行 ≠ 还磁盘」：迁移后 `total` 只从 4,644,864 掉到 4,628,480（−0.35%），
+  真正回来的是 `VACUUM FULL` 那一步。
+
+**部署路径（记下来）**：`npm run db:migrate` 在**宿主上跑不通**（`password authentication failed for user "station"`
+——CLI 读的是进程环境，不是 `deploy/.env`）。正解是**重建镜像后重启容器**，让 `MIGRATE_ON_START=1` 在监听前
+应用迁移；镜像必须重建，因为迁移文件是 `COPY deploy/migrations/` 打进镜像的（旧镜像里只有到 `0033`）。
