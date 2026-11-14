@@ -179,7 +179,11 @@ test('#506d 流自己抛错 / flush 不是函数 ⇒ 照样 exit(0)，日志失�
   }));
   assert.deepEqual(bad.exits, [0], '流抛错（EPIPE / 已 destroy）不许挡住退出');
   assert.equal(bad.report.flush.flushed, 0);
-  assert.equal(bad.report.flush.stuck, 1);
+  // 506e② 改了记账口径：`write` **当场抛**与「回调带 err」同一类（都是「并没刷到」），
+  // 从 `stuck`（它的含义是「到超时回调还没来」）拆到 `failed`。旧断言 `stuck === 1` 把两种不同的坑挤成一个数。
+  assert.equal(bad.report.flush.failed, 1, `write 抛错要计入 failed（实测 ${JSON.stringify(bad.report.flush)}）`);
+  assert.equal(bad.report.flush.stuck, 0, '抛错不是「卡住」，不许伪装成超时');
+  assert.match(bad.report.flush.errors.join('|'), /EPIPE/, '错误详情要能点名');
 
   const broken = await run({
     server: fakeServer([]),
@@ -304,9 +308,10 @@ test('#506d 源码钉：刷日志在 exit 之前，且没给 exit 加长超时 /
   const exitAt = s.search(/exit\(report\.exitCode\)/);
   assert.ok(flushAt >= 0 && exitAt >= 0 && flushAt < exitAt,
     'gracefulShutdown 里必须是「先 await flush 再 exit」的顺序（第三轮复审① 的修法本体）');
-  assert.match(s, /stream\.write\('', \(\) => finish\(true\)\)/, '刷日志用空 chunk + 回调（只推已排队的写入，不产生新输出）');
-  assert.match(s, /timer = setTimeout\(\(\) => finish\(false\), limit\)/, '每条流各自带超时：刷不到也照样退');
-  assert.ok(s.indexOf('timer = setTimeout(() => finish(false), limit)') < s.indexOf("stream.write('', () => finish(true))"),
+  assert.match(s, /stream\.write\('', \(err\) => finish\(err \? 'failed' : 'flushed', err \?\? null\)\)/,
+    '刷日志用空 chunk + 回调，且**回调必须收 err**（第四轮复审②：已 destroy / EPIPE 的流是以回调错误返回的）');
+  assert.match(s, /timer = setTimeout\(\(\) => finish\('stuck'\), limit\)/, '每条流各自带超时：刷不到也照样退');
+  assert.ok(s.indexOf("timer = setTimeout(() => finish('stuck'), limit)") < s.indexOf("stream.write('', (err) => finish(err ? 'failed' : 'flushed'"),
     'timer 必须**先建**再 write：假流会同步回调，先 write 就留下清不掉的悬空 timer');
   assert.doesNotMatch(s, /exit\(report\.exitCode\)[\s\S]{0,80}await flush\(/, 'exit 之后不许再有 flush（那行永远执行不到）');
   assert.doesNotMatch(s, /flushTimeoutMs = (Infinity|Number\.POSITIVE_INFINITY|\d{6,})/, '刷日志的默认值不许是无限/巨大值');
