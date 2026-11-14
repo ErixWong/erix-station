@@ -879,6 +879,34 @@ describe('issue #300：partial entry 渲染（中性助手气泡 + 双语标签�
     setLocale('zh-CN');
   });
 
+  // 审计第 7 条（261114-05）：`placeholder:true` 但正文非空 ⇒ **占位文案不得遮蔽正文**。
+  // 渲染面本来就是 `v-if="en.placeholder"` 占位 / `v-else` 正文（互斥），所以缺陷的形状是
+  // 「有一句真正文，界面上却只写着『正文没能留存』」。修法在 store（`addPartialOutput` 只在
+  // `text === ''` 时才接受占位标记），这里钉**渲染结果**：走真实 store 入口建条目再挂载。
+  it('审计第 7 条：{text:"有正文", placeholder:true} ⇒ 渲染正文，不渲染占位文案', () => {
+    const store = useWorkbenchStore();
+    store.renderedIds = new Set();
+    store.entries.length = 0;
+    store.addPartialOutput({
+      seq: 3, run_id: 'r-shadow', type: 'partial_output',
+      payload: { text: '有正文', chunks: 1, truncated: false, placeholder: true, source: 'round_end' },
+    });
+    const wrapper = mountPanel();
+    const node = wrapper.get('.msg.assistant.partial');
+    expect(node.text()).toContain('有正文');
+    expect(node.find('.partial-placeholder').exists(), '占位文案把真正文遮住了').toBe(false);
+    // 反向（既有口径不得被这次修复弄回去）：文本为空 + 占位 ⇒ 仍渲染那一行提示
+    store.entries.length = 0;
+    store.renderedIds = new Set();
+    store.addPartialOutput({
+      seq: 4, run_id: 'r-empty', type: 'partial_output',
+      payload: { text: '', chunks: 0, truncated: false, placeholder: true, source: 'none' },
+    });
+    const empty = mountPanel();
+    expect(empty.find('.partial-placeholder').exists()).toBe(true);
+    expect(empty.find('.partial-placeholder').text()).toContain('没能留存');
+  });
+
   it('正文与标签分离：标签不得混进 markdown 正文', () => {
     const { wrapper } = seedPartial('第一行\n第二行');
     const body = wrapper.get('.msg.assistant.partial').html();
