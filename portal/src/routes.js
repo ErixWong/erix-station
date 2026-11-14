@@ -20,14 +20,61 @@ import { enqueueRouteChange } from './outbox.js';
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 const MAX_ATTEMPTS = 5;
 
+// issue #506（空闲退避）：**旧行为**是两条与「有没有活」无关的固定节拍——每 250ms 一拍跑
+// `recoverRouteOrphans()`（一条 UPDATE）+ `claimRouteRows()`（BEGIN / 2×UPDATE / COMMIT），
+// `BACKOFF_MS` 只服务异常分支。平台完全空闲时实测 **26.4 事务/秒、64.2 次表扫/秒**
+//（2026-11-14 主 agent 现测，30s 窗口，无浏览器无 run）——全是空转。
+//
+// 新行为：节拍由**认领结果**驱动。
+//   · 认领 0 行 ⇒ 250 → 500 → 1000 → `ROUTE_IDLE_BACKOFF_MAX_MS`（默认 2000）封顶；
+//   · 认领 >0 行 ⇒ 立刻回 250ms（有积压时吞吐一秒不让）；
+//   · 孤儿回收与「有没有活」无关，改**独立节拍**（`ROUTE_ORPHAN_RECOVERY_INTERVAL_MS`，默认 10s），
+//     否则那条 UPDATE 每拍照跑，退避收益直接被吃掉一半以上。
+// 没动的东西（红线）：认领 SQL 的语义、`lease_until` 租约逻辑、失败重试状态机（`BACKOFF_MS`）。
+const IDLE_TICK_MS = 250;
+const IDLE_BACKOFF_MAX_MS_DEFAULT = 2000;
+const ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT = 10000;
+
 // F3'（Round B 评审）：route_revisions / route_outbox 的 aggregate_id 是 uuid NOT NULL
 //（schema.sql §9），非 UUID 字符串在真实 DB 上会报 invalid input syntax for type uuid。
 // full_rebuild 的 outbox 行只是「触发一次全量重建」的信号、不对应真实聚合行，用固定 nil UUID 哨兵：
 // 满足 uuid 类型约束，且多次重试复用同一聚合 → 复用既有 revision head / 租约 / 重试链路。
 export const FULL_REBUILD_AGGREGATE_ID = '00000000-0000-0000-0000-000000000000';
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+/** 正整数 env（非法值回落默认——旋钮写错不许把 reconciler 打挂）。 */
+function envInt(name, fallback) {
+  const n = Number.parseInt(String(process.env[name] ?? '').trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * issue #506：第 `idleTicks` 个**连续空闲拍**该等多久。`idleTicks = 0` 表示上一拍认领到了活
+ * ⇒ 回基准 250ms；否则 250 起指数翻倍、夹在 `maxMs`（默认 2000）。
+ * 导出的理由：判据是「退避真的发生」，阶梯必须能被直接读出而不是靠间接推。
+ */
+export function idleDelayMs(idleTicks, maxMs = IDLE_BACKOFF_MAX_MS_DEFAULT) {
+  if (!(idleTicks > 0)) return IDLE_TICK_MS;
+  return Math.min(IDLE_TICK_MS * 2 ** (idleTicks - 1), Math.max(IDLE_TICK_MS, maxMs));
+}
+
+/**
+ * issue #506：可中断 sleep —— `stop()` 不许再等满一个退避窗口（旧代码退避到 2s 时，优雅关闭
+ * 最多要白等 2s，测试里也会挂住）。resolve(true)=睡满了，resolve(false)=被 abort。
+ * @param {number} ms @param {AbortSignal} [signal]
+ */
+export function sleepCancellable(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve(false);
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 // DNS label：小写字母数字，不以 - 开头/结尾（hostname grammar，fde-platform §8.5）。
@@ -879,11 +926,13 @@ export async function rebuildRoutes(pool, config, { log = console, assertText = 
 /** 消费一轮 route_outbox：全量重生成一份 Traefik 动态配置并原子替换。 */
 export async function runRoutesOnce(pool, config, { log = console, workerId = 'routes-1' } = {}) {
   const rows = await claimRouteRows(pool, workerId);
-  if (rows.length === 0) return { processed: 0 };
+  // #506：`claimed` 是给消费循环看的**退避信号**（本次认领了几行）。与 `processed` 分开是有意的：
+  // 发布失败时 processed=0 而 claimed>0，那种情行由异常分支的 BACKOFF_MS 接管，不该走空闲退避。
+  if (rows.length === 0) return { processed: 0, claimed: 0 };
   try {
     const out = await rebuildRoutes(pool, config, { log });
     for (const row of rows) await markRoutePublished(pool, row.id);
-    return { processed: rows.length, target: out.target };
+    return { processed: rows.length, claimed: rows.length, target: out.target };
   } catch (err) {
     log.warn?.(`[routes] publish failed: ${err.message}`);
     for (const row of rows) await markRouteFailed(pool, row.id, err);
@@ -901,15 +950,27 @@ export async function recoverRouteOrphans(pool) {
 }
 
 /** 启动常驻消费循环（由 cli serve 调用）。 */
-export function startRoutesLoop(pool, config, { log = console, workerId = 'routes-1', onPause } = {}) {
-  let stopped = false;
+export function startRoutesLoop(pool, config, {
+  log = console,
+  workerId = 'routes-1',
+  onPause,
+  // issue #506 旋钮与可测缝：生产不传 ⇒ 真 setTimeout / Date.now / env 默认值；
+  // 单测注入假时钟与假 sleep（判据是「退避真的发生」，不是「代码里有 sleep」）。
+  sleep = sleepCancellable,
+  now = () => Date.now(),
+  idleBackoffMaxMs = envInt('ROUTE_IDLE_BACKOFF_MAX_MS', IDLE_BACKOFF_MAX_MS_DEFAULT),
+  orphanRecoveryIntervalMs = envInt('ROUTE_ORPHAN_RECOVERY_INTERVAL_MS', ORPHAN_RECOVERY_INTERVAL_MS_DEFAULT),
+} = {}) {
   let consecutiveFailures = 0;
+  // #506：连续空闲拍数（认领到活就清 0）与孤儿回收上次跑的时刻。
+  let idleTicks = 0;
+  let lastOrphanRecoveryAt = Number.NEGATIVE_INFINITY; // 首拍必跑一次（保留原语义：启动就回收孤儿）
+  const abort = new AbortController();
   // N5（Round C 评审）：启动重建失败且 full_rebuild 入队**也**失败（如 DB 抖动）时，旧代码只 warn——
   // DB 恢复后不会再有任何全量重建触发。保留内存标记 needsFullRebuild：此后每次循环迭代
-  // （消费 outbox 之前）重试入队，成功即清位。复用既有 250ms 循环节奏（正常路径零成本空转），
-  // 不新增高频轮询/新时间轮；进程重启后由启动路径的 enqueueFullRebuild 重新尝试。
+  // （消费 outbox 之前）重试入队，成功即清位。退避只拉长**等待**，不改变这条重试与消费顺序。
   let needsFullRebuild = false;
-  (async () => {
+  const done = (async () => {
     // 启动全量重建（portal/Traefik 重启后从 DB 重建缺失状态，topology §8）。
     try {
       await rebuildRoutes(pool, config, { log });
@@ -925,7 +986,7 @@ export function startRoutesLoop(pool, config, { log = console, workerId = 'route
         log.warn?.(`[routes] enqueue full_rebuild row failed: ${e2.message}；已置 needsFullRebuild 标记，循环内将持续重试入队`);
       }
     }
-    while (!stopped) {
+    while (!abort.signal.aborted) {
       try {
         // N5：标记为真 → 消费 outbox 之前先重试入队（成功清位；失败保持标记，下轮继续）。
         if (needsFullRebuild) {
@@ -937,18 +998,29 @@ export function startRoutesLoop(pool, config, { log = console, workerId = 'route
             log.warn?.(`[routes] full_rebuild 入队重试仍失败: ${e2.message}（needsFullRebuild 保持，下轮继续）`);
           }
         }
-        await recoverRouteOrphans(pool);
-        await runRoutesOnce(pool, config, { log, workerId });
+        // #506：孤儿回收是一条 UPDATE，与「本轮有没有活」无关 ⇒ 独立节拍，不每拍跑。
+        const tickAt = now();
+        if (tickAt - lastOrphanRecoveryAt >= orphanRecoveryIntervalMs) {
+          await recoverRouteOrphans(pool);
+          lastOrphanRecoveryAt = tickAt;
+        }
+        const { claimed = 0 } = await runRoutesOnce(pool, config, { log, workerId });
         consecutiveFailures = 0;
-        await sleep(250);
+        idleTicks = claimed > 0 ? 0 : idleTicks + 1;
+        if (!(await sleep(idleDelayMs(idleTicks, idleBackoffMaxMs), abort.signal))) break;
       } catch (err) {
         consecutiveFailures += 1;
         log.warn?.(`[routes] loop error: ${err.message}`);
         onPause?.('routes', err);
         const backoff = BACKOFF_MS[Math.min(consecutiveFailures - 1, BACKOFF_MS.length - 1)];
-        await sleep(backoff);
+        if (!(await sleep(backoff, abort.signal))) break;
       }
     }
   })();
-  return { stop() { stopped = true; } };
+  return {
+    stop() {
+      abort.abort(); // 可中断：退避等待中的那一拍必须立刻断开，否则关闭最多白等 idleBackoffMaxMs
+    },
+    done, // 循环真正退出时 resolve（优雅关闭与单测可 await）
+  };
 }
