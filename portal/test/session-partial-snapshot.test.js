@@ -210,6 +210,74 @@ test('#502 D-5：重连时内存里有未完稿正文 ⇒ 发一帧 source=memor
   }
 });
 
+// ---------------------------------------------------------------------------
+// copilot 复审 261115-01 的 **②**（**补发帧**这一半）：帧里真的带上了代际号 `textSegment`。
+// 前端拿它分「新一段（哪怕更短、哪怕恰是前缀）」与「同一段被 textCap 截过的那一份」；
+// `run-partial-buffer.test.js` 验的是缓冲那一半，这里验 `http.js#buildPartialSnapshotFrames` 真把
+// 它透到了帧里，并钉住 `chunks`/`roundSeq`/`truncated` 的语义**一个字没动**（additive 键）。
+// ---------------------------------------------------------------------------
+/** 直接喂一条事件（带**递增**的 `client_event_id` 计数：同一个号会被 at-least-once 判重整条丢掉）。 */
+function feed(runId, n, type, payload, seq) {
+  partialOutputs.observe(runId, {
+    session_id: SESSION_ID, run_id: runId, type,
+    client_event_id: `${runId}:1:${n}`, seq, payload,
+  });
+}
+
+test('copilot 复审②：快照帧带 textSegment（round_start / closeRound 各 +1），且既有键语义不变', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    feed(RUN_ID, 0, 'round_start', { round: 1 }, 2);
+    feed(RUN_ID, 1, 'assistant_delta', { text: '第一段说得很长' }, null);
+    assert.equal(partialOutputs.snapshot(RUN_ID).textSegment, 1, 'round_start ⇒ 代际 1');
+    partialOutputs.closeRound(RUN_ID);   // = durable round_end 的写入侧效果
+    assert.equal(partialOutputs.snapshot(RUN_ID).textSegment, 2, 'closeRound ⇒ 代际 2');
+    feed(RUN_ID, 2, 'round_start', { round: 2 }, 7);
+    feed(RUN_ID, 3, 'assistant_delta', { text: '第二段' }, null);
+    const raw = await s.stream({ lastEventId: 1 });
+    const parts = partialFrames(raw);
+    assert.equal(parts.length, 1, `只发还在写的这一段：${raw.slice(0, 200)}`);
+    const d = parts[0].data;
+    assert.equal(d.textSegment, 3, '代际透到了帧里（与缓冲读数同源，不留第二把尺）');
+    assert.equal(d.text, '第二段', '正文仍是当前那一段');
+    assert.equal(d.chunks, 1, '`chunks` 仍是「本轮正文片数」（跟着轮边界归零），没被代际改动');
+    assert.equal(d.roundSeq, 7, '`roundSeq` 仍是当前轮 round_start 自己的 seq');
+    assert.equal(d.round, 2);
+    assert.equal(d.truncated, false, '`truncated` 语义不变');
+    assert.equal(d.source, 'memory');
+    assert.ok(!('uptoSeq' in d), '代际不是第二个水位线，旧键也没被顺手复活');
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
+test('copilot 复审②：代际是 per-run 的 —— 两个 run 同时在流时各自带自己的号（互不污染）', async () => {
+  const s = await startServer();
+  try {
+    reset();
+    const other = 'r-502-other';
+    feed(RUN_ID, 0, 'round_start', { round: 1 }, 2);
+    feed(RUN_ID, 1, 'assistant_delta', { text: '甲 run 的一段' }, null);
+    partialOutputs.closeRound(RUN_ID);
+    feed(RUN_ID, 2, 'round_start', { round: 2 }, 7);
+    feed(RUN_ID, 3, 'assistant_delta', { text: '甲 run 的第二段' }, null);   // 代际 3
+    feed(other, 0, 'round_start', { round: 1 }, 30);
+    feed(other, 1, 'assistant_delta', { text: '乙 run 的一段' }, null);      // 代际 1
+    const raw = await s.stream({ lastEventId: 1 });
+    const byId = Object.fromEntries(partialFrames(raw).map((f) => [f.data.run_id, f.data]));
+    assert.equal(Object.keys(byId).length, 2, `两个 run 各一帧：${raw.slice(0, 300)}`);
+    assert.equal(byId[RUN_ID].textSegment, 3, '甲 run 数自己的段');
+    assert.equal(byId[other].textSegment, 1, '乙 run 从自己的 1 起，不被甲 run 污染');
+    assert.notEqual(byId[RUN_ID].textSegment, byId[other].textSegment,
+      '两个 run 的代际读成同一个数 ⇒ 前端按 run 记账就白做了');
+  } finally {
+    reset();
+    await s.close();
+  }
+});
+
 test('#502 M-4：Last-Event-ID 再高也照发 —— 闸门交给前端的 roundSeq 对账（不再由服务端猜水位线）', async () => {
   const s = await startServer();
   try {
