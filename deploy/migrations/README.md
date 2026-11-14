@@ -165,6 +165,30 @@ compose 路径显式设 `MIGRATE_DATABASE_URL=station_platform`（`deploy/docker
 **测试口径**：这条真实顺序（空库 → baseline → bootstrap → 全部增量，且故意以非属主角色跑）的唯一
 真库覆盖是 `portal/test/migrate-fresh-db.test.js`；`TEST_DATABASE_URL` 未设置时整体 skip（无 PG 不假通过）。
 
+## 已应用的迁移**文件内容不可改**（`0033` / `0034` 的两条口径补充）
+
+`schema_migrations.checksum` 存的是**每个已应用迁移文件的 sha256**（`portal/src/migrate.js` 逐文件比对），
+失配就是 `checksum mismatch` ⇒ **现存库全部拒绝启动**（见下面「排障」那条）。所以下面两条**只能写在本文里**，
+**不能回改到迁移文件的头注释里**——改一个字就等于改了 checksum：
+
+- **`0033` 头注释那句「让并发写侧最多等一批的时间」是错的**（原文第 43-45 行，字节已冻结）。事实是：
+  迁移由 runner 在**单事务**里执行（约定「本文件自己不写 BEGIN/COMMIT，runner 负责」，见上「单文件约定」），
+  而 `FOR UPDATE` 拿到的**行锁持有到 COMMIT**，不是语句结束 ⇒ 被这些行挡住的写侧要等的是
+  **整支事务**，不是「一批」。分批真正的收益只有：单条语句的时长与 `lock_timeout` 等待窗口被切小
+  （同一节自己写的「分批**不**缩短事务，也不减少累计持有的行锁」才是准的）。
+  ⇒ **要在维护窗外跑，就别指望这个文件自动温和**：照文件里的谓词**手工分批 + 每批单独 COMMIT**
+  （脚本见台账 §8.125），本文件只保证「第二遍 0 行」这条可重放性。
+- **`0034` 的 14 天谓词没有排除「名下仍有活 run 的会话」**。分支 (b) 的谓词是
+  `rc.updated_at < v_cutoff AND transcript_key::uuid IN (SELECT id FROM chat_sessions WHERE status <> 'active' OR updated_at < now() - interval '14 days')`
+  —— 判据全在**会话**的时间戳上，`runs.status` 一个都没看。dev 真库现查**受影响 0 行**，所以今天不是缺陷；
+  但若将来出现「会话 14 天没动、名下却还挂着 `queued`/`running` 的 run」，那支会把它连同那份快照一起清掉。
+  **最坏影响有上界**：那个 run 失去 snapshot 兜底 = 崩溃接力这一项 optional 能力（会话正文仍在
+  `transcript_rounds`，刷新看得见，不丢正文）。⇒ **未来的清理迁移应补上这条排除条件**（新增编号，别改 `0034`）。
+
+**同一句红线在别处也有**（不是本节新增）：「不能改 `0016-*.sql` 的内容——runner 按 sha256 比对 checksum，
+改字节 = 现存库全部拒启」写在下面「迁移身份」一节末尾。本节只是把同一把尺**显式推广到 `0033`/`0034`**，
+因为这两支是最新写的、最容易被人当成「注释而已，顺手改改」。
+
 ## 排障
 
 - **`sequence must have same owner as table it is linked to`（`routine=process_owned_by`，典型在 0016）**：
