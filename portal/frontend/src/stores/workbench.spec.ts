@@ -6,6 +6,9 @@ import { createPinia, setActivePinia } from 'pinia';
 import { setWorkbenchHooks, useWorkbenchStore, type StreamEntry } from './workbench';
 import type { RunHistoryEvent } from '../composables/useEventStream';
 import { setLocale } from '../i18n';
+// 源码钉用的**同一份**源码文本（vite `?raw` 构建期读盘，不用 `node:fs`——jsdom 下会被 externalize，#349 的坑）。
+// 先例：`lib/terminationReasons.spec.ts`、`views/LoginView.spec.ts`。
+import workbenchSource from './workbench.ts?raw';
 // issue #431：断言复位连模块级展开记忆一起清（它不属于 store，只能从外部函数看）
 import { isToolCallExpanded, setToolCallExpanded } from '../lib/toolCallExpansion';
 
@@ -3257,6 +3260,9 @@ describe('copilot 最终验收 ①：未知身份只有一个判据，`unknown` 
   //（`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针，本无条目可撤），所以本条钉的是**不许出的乱子**：
   // 不抛错、不凭空造 delta、不误删别的条目、partial 照常画（同 A/C/D：策略钉住，改前后都该绿）。
   // 而且这个状态**不是假设**，是撤掉气泡之后的真实现场：`addPartialOutput` 只清 `deltaText`、**不清** `deltaRunId`。
+  // ⚠ 本条**钉不住**「把 `removeDeltaEntry()` 的无条目早退改成去删 `kind:'partial'`」这个变异（copilot 第五轮 ②）：
+  // 到这一步 `deltaText` 已被上一条 partial 清成 `null`、而 `text` 非空 ⇒ `es.deltaText.value === text` 不成立
+  // ⇒ 那个分支**根本没被走到**。那条变异由下面那条**源码钉**守（运行时该分支不可达，理由写在那条里）。
   it('F｜无 delta 条目（已被 run-A 的 partial 撤掉）+ `es.deltaRunId` 仍是具体 run-A ⇒ 再来的 run-B 同文本 partial：不抛错、不造不删 delta、partial 照常加', async () => {
     const store = useWorkbenchStore();
     await store.openSession('s1');
@@ -3294,5 +3300,42 @@ describe('copilot 最终验收 ①：未知身份只有一个判据，`unknown` 
     expect(store.entries.map((e) => e.kind),
       '整条时间线只多这一条 partial，其余条目一个不少').toEqual(['sep', 'partial', 'partial']);
     expect(store.es.deltaRunId, '无关 run 的 partial 不改写这段正文的归属').toBe('run-A');
+  });
+
+  // copilot 第五轮 ②：上面 F 那条**钉不住**「把 `removeDeltaEntry()` 的无条目早退改成去删 `kind:'partial'`」
+  // 这个变异（实测：只加这个变异时全套 132 条照绿、含 F；只有本条红）。
+  //
+  // **可达性判定：`deltaEntry === null && es.deltaText.value === text`（`text` 非空）在真实路径上不可达。**
+  // 依据（现查源码，不是推测）：
+  //   · `deltaEntry` 变 `null` 只有两个来源 —— watcher 的 `if (v === null) { deltaEntry = null; return; }`
+  //     （那一支 `deltaText` 本身就是 `null`），以及 `removeDeltaEntry()` 自己；
+  //   · 后者的三个调用点**都同时**把 `es.deltaText` 置 `null`：`onCurrentRunEnd`（composable 的 `run_end`
+  //     分支先 `deltaText.value = null`，再到 store 的 hook）、`applyServerRunState`（先置 null 再调）、
+  //     `addPartialOutput`（调完立刻置 null）⇒ 拿不出「条目没了但正文还在」的稳定现场；
+  //   · 反向：`watch(es.deltaText)` 在 `v !== null` 时要么建条目（`old === null`）要么把文本写进现有条目
+  //     ⇒ 「正文非空而条目为空」只剩**同一个 tick 内先写 `deltaText`、立刻调 `addPartialOutput`** 这一扇
+  //     窗（watcher 是 `'pre'` 异步刷），而真实事件面里 delta 帧与 partial 帧各是一个任务（SSE 帧、
+  //     `GET /events/history` 的响应期），中间必有微任务刷 ⇒ 这个窗口产品路拿不到；
+  //   · 清 `entries` 的四处（`selectDir` / `createDir` / `resetSessionView` / `openSession`）全部先跑
+  //     `es.resetStreamState()`（内含 `deltaText = null`）⇒ 也造不出这个组合。
+  // ⇒ **不为了测试去造一份产品路不存在的假状态**（那测的是测试自己），改成钉源码：
+  //   谁要往这个早退里塞「顺手删 partial」，这条用例就红。运行时该分支不可达，所以只能这么钉。
+  it('源码钉｜`removeDeltaEntry()` 的无条目早退里不得藏任何删 `partial` 的逻辑（运行时分支不可达 ⇒ 只能钉源码）', () => {
+    const src = workbenchSource;
+    const def = src.match(/\n  function removeDeltaEntry\(\) \{[\s\S]*?\n  \}/);
+    // 用 throw 而不是 expect(...).not.toBeNull()：既给类型收窄，也在函数改名/换写法时给出可读的红文案。
+    if (!def) throw new Error('`removeDeltaEntry()` 的定义必须能在源码里定位到（改名/换写法时本条先红，提醒重新评估这条锁）');
+    // 只钉代码，不钉注释：把行注释剥掉后再断言（早退上方那段「不可达但承重」的注释里**提到过** partial）。
+    const body = def[0].replace(/\/\/[^\n]*/g, '');
+    // 反面先断（红文案要直指那个变异本身）：体内出现任何「partial」字样就是往早退里塞了顺手清理。
+    expect(/partial/i.test(body),
+      '`removeDeltaEntry()` 只认 `deltaEntry` 那根单指针：无条目时它什么都不删，'
+      + '尤其不许删 `kind:\'partial\'`（partial 的归属与撤不撤 delta 气泡无关，删错了就是用户正看的正文消失）').toBe(false);
+    expect(body, '不许在体内遍历 entries 找别的条目').not.toMatch(/findIndex|filter|forEach|for \(/);
+    // 早退本身必须在（它挡的是「`deltaEntry` 为空时 `indexOf(null)` 找不到、`splice` 无从下手」那一步）。
+    expect(body).toContain('if (!deltaEntry) return;');
+    // 全函数**只有一处** splice，且下标必须来自 `indexOf(deltaEntry)` —— 它只认那根单指针。
+    expect(body.match(/splice\(/g) ?? [], '只许一次 splice，且删的必须是 `deltaEntry` 那一条').toHaveLength(1);
+    expect(body).toMatch(/indexOf\(\s*deltaEntry\s*\)/);
   });
 });
