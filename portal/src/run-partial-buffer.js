@@ -99,6 +99,11 @@ export function createPartialBuffer({
     //（reasoning 截尾也会置它），所以终态那半截正文到底「有没有被截」必须另开一位：
     // 复用 `truncatedByCap` 会把「推理截了、正文没截」谎报成「正文被截」。
     textTruncated: false,
+    // copilot 复审 261115-01 的 **②**：正文段的**代际号**（只在「正文段边界」+1：`round_start` 与
+    // `closeRound`），其余一律不清零、不回退。存在的理由：`chunks` 在这两处都会**归零**，
+    // 新段也从 0 起 ⇒ 它当代际信号就是一只漏气的那把尺（旧段 5 片、新段 2 片 ⇒ 前端会拿新帧
+    // 当「更旧的快照」丢掉）。本字段**只加不改**：`chunks` / `roundSeq` / `truncated` 的语义一字未动。
+    textSegment: 0,
     counters: new Map(), // attempt → 已观测的最大 `client_event_id` 计数（at-least-once 去重）
     terminal: false,
   });
@@ -165,6 +170,7 @@ export function createPartialBuffer({
    * 清的是**正文**（`text` / `chunks` / 两个截断位），**留着** `round` / `roundSeq` / `reasoning`：
    *   · 轮号与轮起点 seq 仍是「当前轮」的（下一轮 `round_start` 才会换），补发帧的对账凭据不能瞎；
    *   · `reasoning` 本来就不按轮清（口径②），也不落库，与本槽的 durable 判据无关。
+   * 另：`textSegment` 在本函数 **+1**（正文段边界），既不清零也不回退 —— 它是给前端分代际用的。
    * 清空**不是**「关闭这个 run」：此后到的碎片继续累加（那是 `round_end` **之后**新说的一半，
    * 库里没有它，正是 `partial_text` 该装的东西），也不会再触发重复。
    */
@@ -173,6 +179,7 @@ export function createPartialBuffer({
     entry.chunks = 0;
     entry.truncatedByCap = false;
     entry.textTruncated = false;
+    entry.textSegment += 1;   // 正文段边界 ⇒ 代际只进不退（口径见 `blank()` 里那个键的注）
   }
 
   /**
@@ -191,6 +198,7 @@ export function createPartialBuffer({
       entry.chunks = 0;
       entry.truncatedByCap = false;
       entry.textTruncated = false;
+      entry.textSegment += 1;  // 正文段边界（另一个 +1 点在 `closeRoundText`）
     } else {
       const payload = ev.payload && typeof ev.payload === 'object' ? ev.payload : {};
       // `assistant_delta` 与 `reasoning_delta` 的载荷键都由 runner 固定为 `text`
@@ -243,6 +251,8 @@ export function createPartialBuffer({
     truncated: entry.truncatedByCap,
     // 审计第 3 条：**正文自己的**截断位（`truncated` 是两路共用的观测位，不能拿它写终态）。
     textTruncated: entry.textTruncated === true,
+    // copilot 复审 ②：单调不减的代际号（additive 键）。前端拿它分「新的一段」与「同一段的较短那份」。
+    textSegment: entry.textSegment,
     sessionId: entry.sessionId,
     terminal: entry.terminal === true,
   });
