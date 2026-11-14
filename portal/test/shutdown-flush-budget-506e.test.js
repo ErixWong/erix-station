@@ -1,7 +1,10 @@
 // 单测：issue #506 的 copilot **第四轮（最终验收）复审① + ②**（都在 `portal/src/shutdown.js` 的
-// 「退出前刷日志那一步」）：
+//   退出前刷日志那一步）：
 //   ① flush 排在总预算**之外**，于是「整个关闭流程 ≤ totalTimeoutMs」这条承诺其实是假的；
 //   ② `write(chunk, cb)` 的回调**不看 err**，于是已 destroy / EPIPE 的流会被记成「刷到了」。
+// 以及 **第五轮复审（506f）**：① 的修法留下一个尾巴——总 deadline 获胜时剩余预算恒为 0
+//   ⇒ flush 退化成 `setTimeout(0)` ⇒ 到点强退那条 warn **仍可能**被截断；修法是**从总预算里**
+//   给 flush 切一块预留（见下面 ⑤ 节）。
 //
 // 缺陷形状（现查 `portal/src/shutdown.js`，改前的第 4 步）：
 //   const outcome = await Promise.race([everything, deadline]);
@@ -30,6 +33,7 @@ import {
   gracefulShutdown,
   flushLogs,
   FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
+  FLUSH_RESERVE_MS_DEFAULT,
 } from '../src/shutdown.js';
 
 function recordingLog() {
@@ -290,7 +294,9 @@ test('#506e② 源码钉：刷日志的账目里有 failed / errors 两个口径
 test('#506e 源码钉：flush 的超时取剩余预算，elapsedMs 在 flush 之后结算', () => {
   const s = fs.readFileSync(new URL('../src/shutdown.js', import.meta.url), 'utf8');
   const remainingAt = s.search(/const remainingMs = Math\.max\(0, totalBudgetMs - \(Date\.now\(\) - startedAt\)\)/);
-  const budgetAt = s.search(/const flushBudgetMs = Math\.min\(flushRequestedMs, remainingMs\)/);
+  // 506f 把取小写成 `Math.min(flushRequestedMs, Math.max(remainingMs, 0))`（防 deadline timer 晚触发压成负数）
+  // ⇒ 两种写法都认：本条要钉的是「取小」这个口径，不是括号多一层。
+  const budgetAt = s.search(/const flushBudgetMs = Math\.min\(flushRequestedMs, (?:Math\.max\(remainingMs, 0\)|remainingMs)\)/);
   const flushAt = s.search(/flushReport = await flush\(\{ timeoutMs: flushBudgetMs/);
   const exitAt = s.search(/exit\(report\.exitCode\)/);
   const settleAt = s.search(/report\.elapsedMs = Date\.now\(\) - startedAt/);
@@ -301,4 +307,149 @@ test('#506e 源码钉：flush 的超时取剩余预算，elapsedMs 在 flush 之
   assert.ok(settleAt >= 0 && settleAt > flushAt, 'report.elapsedMs 必须在 flush **之后**重算（含那一段）');
   assert.doesNotMatch(s, /await flush\(\{ timeoutMs: flushTimeoutMs/, '不许再把未夹取剩余预算的请求值直接喂给 flush');
   assert.match(s, /flush 在总预算之内，不是额外赠送的 250ms/, '注释要写清这条预算口径');
+});
+
+// ---------------------------------------------------------------------------
+// ⑤ 第五轮复审（506f）：总 deadline 获胜时，flush 手上必须还剩**正**预算
+// ---------------------------------------------------------------------------
+//
+// 缺陷形状（第四轮那个修法留下的尾巴，现查 `portal/src/shutdown.js`）：
+//   race 的 deadline 用的就是 `totalBudgetMs` 本身 ⇒ 它获胜的那一刻 `Date.now() - startedAt`
+//   已经贴着总预算 ⇒ 第 4 步现算的 `remainingMs = 0` ⇒ `flushBudgetMs = min(请求值, 0) = 0`
+//   ⇒ `flushLogs` 走 `setTimeout(0)` 那一支，**先于**流的 write 回调触发
+//   ⇒ 「到点强退」那条 warn 与汇总行**仍然可能被截断**——而这恰恰是最需要看日志的那一次。
+//   等于把第三轮（`3d27606`）「退出前刷日志」的修复，在最需要它的那条路径上抵消掉。
+//
+// 修法（也是本节的判据）：给 flush **预留**一块正等待时间，且这块是**从总预算里切出来的**
+// （race 的 deadline 改成 `总预算 - 预留`），**不是额外赠送** ⇒ 总耗时上限一字不改。
+// 红线：`exit` 注入 spy；三条都用短数值（不真等 8s）。
+
+test('#506f 到点强退路径：flush 拿到的是「预留」那一块（不再是 0），总耗时仍 ≤ totalTimeoutMs + 小余量', async () => {
+  const TOTAL = 300;
+  const RESERVE = 100;
+  const seen = [];
+  // 循环永不 resolve + close 永不回调 + 流**永不回调** ⇒ 唯一的出口是总 deadline，
+  // 而 flush 手上剩多少，直接决定那条 warn 有没有机会落盘。
+  const { report, exits, ms } = await run((ev) => ({
+    server: fakeServer(ev, { neverCallback: true }),
+    loops: [{ name: 'routes', stop() {}, done: forever() }],
+    loopTimeoutMs: 4000, // 故意远大于总上限：起作用的是总预算，不是循环那一段
+    totalTimeoutMs: TOTAL,
+    flushReserveMs: RESERVE,
+    logStreams: [fakeStream(ev, { neverCallback: true })],
+    flushTimeoutMs: 1500, // 请求值远大于预留 ⇒ 生效值必然是「剩余预算」
+  }));
+  assert.equal(report.timedOut, true, '本条必须走总 deadline 分支（否则测不到复审报的那条路径）');
+  assert.deepEqual(exits, [0], '照样 exit(0)');
+  assert.equal(report.loopsBudgetMs, TOTAL - RESERVE,
+    `race 的预算必须是「总预算 - 预留」（实测 ${report.loopsBudgetMs}）——预留是从总预算里**切**出来的`);
+  assert.equal(report.flushReserveMs, RESERVE, `预留要落进账目（实测 ${report.flushReserveMs}）`);
+  // 核心判据：flush 的预算不再退化成 0。容差是给 timer 溢出留的：deadline 会比预算**晚** 1~3ms
+  // （CI 负载下几十 ms）触发，那一点溢出正好从 remaining 里扣掉。改前这里是**恰好 0**，容差不影响判别。
+  assert.ok(report.flushTimeoutMs > 0,
+    `到点强退时 flush 的预算不许再是 0（实测 ${report.flushTimeoutMs}ms）——0 ⇒ setTimeout(0) 抢在 write 回调前 ⇒ warn 照样被截断`);
+  assert.ok(report.flushTimeoutMs >= RESERVE - 40,
+    `flush 要拿到≈预留那么多（实测 ${report.flushTimeoutMs}ms / 预留 ${RESERVE}ms，容差 40ms 给 deadline timer 溢出）`);
+  assert.ok(ms <= TOTAL + 120,
+    `总耗时仍要贴着总上限（实测 ${ms}ms / 总上限 ${TOTAL}ms）——预留不是额外赠送，8s 不许变成 8.25s`);
+  assert.ok(report.elapsedMs <= TOTAL + 120,
+    `上报账目同样含 flush 且不超总上限（上报 ${report.elapsedMs}ms / 总上限 ${TOTAL}ms）`);
+  assert.ok(report.elapsedMs >= TOTAL - RESERVE,
+    `deadline 仍要在自己的那份预算（${TOTAL - RESERVE}ms）用完才获胜（上报 ${report.elapsedMs}ms）——修法是给 flush 留时间，不是让循环提前不等`);
+  assert.equal(report.flush.attempted, 1);
+  assert.equal(report.flush.stuck, 1, '永不回调的流要如实记 stuck（刷不到就认，不假称成功）');
+  // flush 拿到的入参也要能看见（账目与真实入参不一致就是假账）
+  const spyRun = await run((ev) => ({
+    server: fakeServer(ev, { neverCallback: true }),
+    loops: [{ name: 'routes', stop() {}, done: forever() }],
+    loopTimeoutMs: 4000,
+    totalTimeoutMs: TOTAL,
+    flushReserveMs: RESERVE,
+    flushTimeoutMs: 1500,
+    flush: async (o) => {
+      seen.push(o.timeoutMs);
+      return { attempted: 1, flushed: 0, stuck: 1, failed: 0, errors: [], elapsedMs: 0 };
+    },
+  }));
+  assert.ok(seen[0] >= RESERVE - 40, `传给 flush 的实参就是那份预留（实测 ${seen[0]}ms）`);
+  assert.equal(spyRun.report.flushTimeoutMs, seen[0], '账目里的上限 = 实际传给 flush 的那个数');
+});
+
+test('#506f 退化：flushReserveMs >= totalTimeoutMs ⇒ 收尾预算为 0（不挂死），flush 仍拿到正预算，总耗时仍 ≤ 总上限', async () => {
+  const TOTAL = 100;
+  const RESERVE = 250; // 比总上限还大 ⇒ 全部预算归 flush，循环那一段完全不等
+  const { report, exits, ms } = await run((ev) => ({
+    server: fakeServer(ev, { neverCallback: true }),
+    loops: [{ name: 'materializer', stop() {}, done: forever() }],
+    loopTimeoutMs: 4000,
+    totalTimeoutMs: TOTAL,
+    flushReserveMs: RESERVE,
+    logStreams: [fakeStream(ev, { neverCallback: true })],
+    flushTimeoutMs: 1500,
+  }));
+  assert.equal(report.loopsBudgetMs, 0, `race 预算夹到下限 0（实测 ${report.loopsBudgetMs}）——不许出现负数延迟`);
+  assert.equal(report.timedOut, true, '预算为 0 ⇒ 立刻判超时（这不是挂死，是本条要证的事）');
+  assert.deepEqual(exits, [0], '退化路径照样 exit(0)');
+  assert.ok(report.flushTimeoutMs > 0 && report.flushTimeoutMs <= TOTAL,
+    `flush 仍要拿到正预算、且不超过总上限（实测 ${report.flushTimeoutMs}ms / 总上限 ${TOTAL}ms）`);
+  assert.ok(ms <= TOTAL + 120, `总耗时仍 ≤ 总上限 + 小余量（实测 ${ms}ms）——预留把整块预算让给 flush，不是加在外面`);
+  assert.ok(report.elapsedMs <= TOTAL + 120, `上报账目同理（实测 ${report.elapsedMs}ms）`);
+  assert.deepEqual(report.pendingLoops, ['materializer'], '没退的循环仍要被点名（不等 ≠ 忘记记）');
+});
+
+test('#506f 正常路径不受影响：循环立即收尾 ⇒ flush 用满 flushTimeoutMs 请求值', async () => {
+  const seen = [];
+  const flushSpy = async (o) => {
+    seen.push(o.timeoutMs);
+    return { attempted: 1, flushed: 1, stuck: 0, failed: 0, errors: [], elapsedMs: 0 };
+  };
+  const t0 = Date.now();
+  const { report, exits, ms } = await run((ev) => ({
+    server: fakeServer(ev), // close 回调正常来
+    loops: [{ name: 'routes', stop() {}, done: settled() }], // 循环立即收尾
+    loopTimeoutMs: 200,
+    totalTimeoutMs: 5000,
+    flush: flushSpy, // A) spy：看实参
+  }));
+  assert.deepEqual(exits, [0]);
+  assert.equal(report.timedOut, false, '正常路径不许被预留搅成超时');
+  assert.equal(report.loopsBudgetMs, 5000 - FLUSH_RESERVE_MS_DEFAULT,
+    `race 预算 = 总预算 - 默认预留（实测 ${report.loopsBudgetMs}）`);
+  assert.equal(report.flushReserveMs, FLUSH_RESERVE_MS_DEFAULT, '默认预留要落进账目');
+  assert.equal(seen[0], FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
+    `预算充足时 flush 照旧用满请求值（实测 ${seen[0]}ms）——预留只影响 deadline 的位置，不砍正常路径的刷日志预算`);
+  assert.ok(ms < 300, `正常路径不该因为预留而多等（实测 ${ms}ms）`);
+  // B) 真流：既有用例的「刷到底」不许退化（506d 那条判据的同款）
+  const b = await run((ev) => ({
+    server: fakeServer(ev),
+    loops: [{ name: 'routes', stop() {}, done: settled() }],
+    loopTimeoutMs: 200,
+    totalTimeoutMs: 5000,
+    logStreams: [fakeStream(ev), fakeStream(ev)],
+    flushTimeoutMs: FLUSH_LOGS_TIMEOUT_MS_DEFAULT,
+  }));
+  assert.equal(b.report.flush.attempted, 2);
+  assert.equal(b.report.flush.flushed, 2, `正常路径两条流都要刷到底（实测 ${JSON.stringify(b.report.flush)}）`);
+  assert.equal(b.report.flushTimeoutMs, FLUSH_LOGS_TIMEOUT_MS_DEFAULT);
+  assert.ok(Date.now() - t0 < 800, `整个正常路径是毫秒级的（实测 ${Date.now() - t0}ms）`);
+});
+
+test('#506f 源码钉：race 的 deadline 用「总预算 - 预留」，且预留是切出来的不是加在外面', () => {
+  const s = fs.readFileSync(new URL('../src/shutdown.js', import.meta.url), 'utf8');
+  assert.match(s, /export const FLUSH_RESERVE_MS_DEFAULT = /, '预留要是一个**导出的具名常量**（默认值可查、可钉）');
+  assert.match(s, /flushReserveMs: flushReserveMsRaw = FLUSH_RESERVE_MS_DEFAULT/, '可注入 flushReserveMs，默认取那个常量');
+  assert.match(s, /const flushReserveMs = safeTimeoutMs\(flushReserveMsRaw\)/, '脏值（3e9 / 负数 / NaN）先夹取，不许放大成无限');
+  const reserveAt = s.search(/const loopsBudgetMs = Math\.max\(0, totalBudgetMs - flushReserveMs\)/);
+  const deadlineAt = s.search(/const left = Math\.max\(0, loopsBudgetMs - \(Date\.now\(\) - startedAt\)\)/);
+  const flushAt = s.search(/flushReport = await flush\(\{ timeoutMs: flushBudgetMs/);
+  assert.ok(reserveAt >= 0, '必须有「总预算 - 预留」这一步（下限 0）');
+  assert.ok(deadlineAt >= 0 && deadlineAt > reserveAt, '总 deadline 必须用减过预留的那个数');
+  assert.ok(flushAt > deadlineAt, '顺序仍是 race → flush → exit');
+  assert.doesNotMatch(s, /const left = Math\.max\(0, totalBudgetMs - \(Date\.now\(\) - startedAt\)\)/,
+    'race 的 deadline 不许回退成「总预算本身」（那正是剩余预算退化成 0 的根因）');
+  assert.match(s, /const remainingMs = Math\.max\(0, totalBudgetMs - \(Date\.now\(\) - startedAt\)\)/,
+    'flush 的剩余预算仍按**总预算**算（预留的那一块就在这里落地）');
+  assert.doesNotMatch(s, /totalBudgetMs \+ flushReserve|SHUTDOWN_TOTAL_MS_DEFAULT \+ /,
+    '预留不许被写成加在总预算**之外**（那会把 8s 变成 8.25s，突破第四轮的硬承诺）');
+  assert.match(s, /从总预算里切出来/, '注释要写清预留的口径：切出来的，不是额外赠送');
 });
